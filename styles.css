@@ -68,8 +68,8 @@ h2 {
 }
 
 .menu-header {
-  display: flex;
-  justify-content: space-between;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
   gap: 18px;
   align-items: center;
 }
@@ -187,14 +187,22 @@ h2 {
 }
 
 .topbar {
+  position: relative;
   min-height: 104px;
   padding: 18px 24px;
   display: grid;
-  grid-template-columns: auto 1fr auto;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 18px;
   background: white;
   border-bottom: 1px solid var(--line);
+}
+
+.topbar-language {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  justify-self: center;
 }
 
 .topbar-actions,
@@ -203,6 +211,10 @@ h2 {
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+.topbar-actions {
+  justify-self: end;
 }
 
 .back-button,
@@ -333,6 +345,10 @@ h2 {
   padding: 24px;
 }
 
+.vendor-layout.single-column {
+  grid-template-columns: 1fr;
+}
+
 .po-focus-layout {
   grid-template-columns: 260px minmax(420px, 1fr);
 }
@@ -373,6 +389,34 @@ h2 {
   align-self: start;
   display: grid;
   gap: 14px;
+}
+
+.po-list-panel {
+  grid-template-columns: 1fr;
+}
+
+.po-search-sticky {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) minmax(260px, 420px);
+  gap: 14px;
+  padding: 16px 24px;
+  align-items: start;
+  background: var(--paper);
+  border-bottom: 2px solid var(--line);
+}
+
+.po-autocomplete {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(180px, 1fr));
+  gap: 10px;
+}
+
+.po-card.compact {
+  min-height: 66px;
 }
 
 .lookup-panel.wide {
@@ -468,9 +512,15 @@ h2 {
 .pallet-return-layout {
   padding: 28px;
   display: grid;
-  grid-template-columns: minmax(420px, 1fr) 360px;
+  grid-template-columns: 1fr;
   gap: 18px;
   align-items: start;
+}
+
+.pallet-so-row {
+  display: grid;
+  grid-template-columns: minmax(360px, 1fr) 360px;
+  gap: 18px;
 }
 
 .simple-form label {
@@ -815,7 +865,13 @@ h2 {
   .vendor-layout,
   .po-focus-layout,
   .scanner-layout,
-  .pallet-return-layout {
+  .pallet-return-layout,
+  .pallet-so-row,
+  .po-search-sticky {
+    grid-template-columns: 1fr;
+  }
+
+  .po-autocomplete {
     grid-template-columns: 1fr;
   }
 
@@ -839,6 +895,12 @@ h2 {
 
   .topbar {
     grid-template-columns: 1fr;
+  }
+
+  .topbar-language {
+    position: static;
+    transform: none;
+    justify-self: stretch;
   }
 
   .menu-header {

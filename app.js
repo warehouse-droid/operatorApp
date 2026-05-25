@@ -55,6 +55,17 @@ const I18N = {
     poSearchHint: "The PO search and number pad will show here.",
     findPo: "Find PO",
     poNumber: "PO number",
+    searchPo: "Search PO",
+    searchPoTop: "Search PO number",
+    poSearchTopHint: "Search any open PO first. Selecting a PO opens it directly.",
+    categories: "Categories",
+    aggregate: "Aggregate",
+    interlocking: "Interlocking",
+    naturalStone: "Natural stone",
+    accessory: "Accessory",
+    chooseCategory: "Choose material type, then vendor.",
+    chooseVendor: "Choose vendor",
+    openPo: "Open POs",
     noMatch: "No match",
     scanPaperPo: "Use the pad or scan the paper PO.",
     scanPoBarcode: "Scan PO barcode",
@@ -87,6 +98,7 @@ const I18N = {
     changeDate: "Change the date filter to see other orders.",
     progress: "Progress",
     required: "Required",
+    ordered: "Ordered",
     status: "Status",
     open: "Open",
     ready: "Ready",
@@ -109,6 +121,7 @@ const I18N = {
     fulfillmentNumber: "Fulfillment number",
     backToMenu: "Back to menu",
     cannotOver: "Cannot fulfill more than the order quantity.",
+    cannotReturnMore: "Cannot return more than ordered.",
     manualLoaded: "Manual entry loaded.",
     lineConfirmed: "Line confirmed.",
     itemStillOpen: "item line still open.",
@@ -161,6 +174,17 @@ const I18N = {
     poSearchHint: "采购单搜索和数字键盘会显示在这里。",
     findPo: "查找采购单",
     poNumber: "采购单号",
+    searchPo: "搜索采购单",
+    searchPoTop: "搜索采购单号",
+    poSearchTopHint: "先搜索任何未收货采购单，选择后直接打开。",
+    categories: "分类",
+    aggregate: "骨料",
+    interlocking: "联锁砖",
+    naturalStone: "天然石材",
+    accessory: "配件",
+    chooseCategory: "先选择物料类型，再选择供应商。",
+    chooseVendor: "选择供应商",
+    openPo: "未收货采购单",
     noMatch: "没有匹配",
     scanPaperPo: "使用键盘或扫描纸质采购单。",
     scanPoBarcode: "扫描采购单条码",
@@ -193,6 +217,7 @@ const I18N = {
     changeDate: "更改日期筛选查看其他订单。",
     progress: "进度",
     required: "需求",
+    ordered: "已订购",
     status: "状态",
     open: "未完成",
     ready: "就绪",
@@ -215,6 +240,7 @@ const I18N = {
     fulfillmentNumber: "履约编号",
     backToMenu: "返回菜单",
     cannotOver: "不能超过订单数量。",
+    cannotReturnMore: "不能超过已订购数量。",
     manualLoaded: "手动输入已加载。",
     lineConfirmed: "行已确认。",
     itemStillOpen: "个商品行未完成。",
@@ -267,6 +293,17 @@ const I18N = {
     poSearchHint: "採購單搜尋和數字鍵盤會顯示在這裡。",
     findPo: "查找採購單",
     poNumber: "採購單號",
+    searchPo: "搜尋採購單",
+    searchPoTop: "搜尋採購單號",
+    poSearchTopHint: "先搜尋任何未收貨採購單，選擇後直接開啟。",
+    categories: "分類",
+    aggregate: "骨料",
+    interlocking: "連鎖磚",
+    naturalStone: "天然石材",
+    accessory: "配件",
+    chooseCategory: "先選擇物料類型，再選擇供應商。",
+    chooseVendor: "選擇供應商",
+    openPo: "未收貨採購單",
     noMatch: "沒有符合",
     scanPaperPo: "使用鍵盤或掃描紙本採購單。",
     scanPoBarcode: "掃描採購單條碼",
@@ -299,6 +336,7 @@ const I18N = {
     changeDate: "更改日期篩選查看其他訂單。",
     progress: "進度",
     required: "需求",
+    ordered: "已訂購",
     status: "狀態",
     open: "未完成",
     ready: "就緒",
@@ -321,6 +359,7 @@ const I18N = {
     fulfillmentNumber: "履約編號",
     backToMenu: "返回選單",
     cannotOver: "不能超過訂單數量。",
+    cannotReturnMore: "不能超過已訂購數量。",
     manualLoaded: "手動輸入已載入。",
     lineConfirmed: "行已確認。",
     itemStillOpen: "個商品行未完成。",
@@ -438,22 +477,24 @@ deliveryOrders[0].skus.push(
 );
 
 const vendors = [
-  { name: "Apex Foods", code: "V-1001", pos: ["45128", "45142", "45155"] },
-  { name: "Bright Cold Chain", code: "V-1002", pos: ["77201", "77204"] },
-  { name: "Cedar Beverage", code: "V-1003", pos: ["66018", "66031"] },
-  { name: "Delta Harvest", code: "V-1004", pos: ["88300", "88319"] },
-  { name: "Evergreen Snacks", code: "V-1005", pos: ["51290", "51302"] },
-  { name: "Freshline Dairy", code: "V-1006", pos: ["34110", "34122"] },
-  { name: "Golden Mill", code: "V-1007", pos: ["71930", "71944"] },
-  { name: "Harbor Produce", code: "V-1008", pos: ["90412", "90413"] },
-  { name: "Ironwood Supply", code: "V-1009", pos: ["22570", "22581"] },
-  { name: "Jade Market", code: "V-1010", pos: ["11840", "11866"] },
-  { name: "Keystone Grocery", code: "V-1011", pos: ["63820", "63821"] },
-  { name: "Luma Brands", code: "V-1012", pos: ["30319", "30320"] },
-  { name: "Metro Fresh", code: "V-1013", pos: ["49110", "49111"] },
-  { name: "Northstar Trading", code: "V-1014", pos: ["55510", "55598"] },
-  { name: "Orchard Road", code: "V-1015", pos: ["24680", "24681"] }
+  { name: "Apex Aggregates", code: "V-1001", category: "aggregate", pos: ["45128", "45142", "45155"] },
+  { name: "Bright Stone Supply", code: "V-1002", category: "naturalStone", pos: ["77201", "77204"] },
+  { name: "Cedar Interlock", code: "V-1003", category: "interlocking", pos: ["66018", "66031"] },
+  { name: "Delta Landscape", code: "V-1004", category: "accessory", pos: ["88300", "88319"] },
+  { name: "Evergreen Aggregates", code: "V-1005", category: "aggregate", pos: ["51290", "51302"] },
+  { name: "Freshline Accessories", code: "V-1006", category: "accessory", pos: ["34110", "34122"] },
+  { name: "Golden Natural Stone", code: "V-1007", category: "naturalStone", pos: ["71930", "71944"] },
+  { name: "Harbor Interlocking", code: "V-1008", category: "interlocking", pos: ["90412", "90413"] },
+  { name: "Ironwood Aggregates", code: "V-1009", category: "aggregate", pos: ["22570", "22581"] },
+  { name: "Jade Stone Market", code: "V-1010", category: "naturalStone", pos: ["11840", "11866"] },
+  { name: "Keystone Pavers", code: "V-1011", category: "interlocking", pos: ["63820", "63821"] },
+  { name: "Luma Yard Accessories", code: "V-1012", category: "accessory", pos: ["30319", "30320"] },
+  { name: "Metro Aggregate", code: "V-1013", category: "aggregate", pos: ["49110", "49111"] },
+  { name: "Northstar Stone", code: "V-1014", category: "naturalStone", pos: ["55510", "55598"] },
+  { name: "Orchard Road Pavers", code: "V-1015", category: "interlocking", pos: ["24680", "24681"] }
 ];
+
+const inboundCategories = ["aggregate", "interlocking", "naturalStone", "accessory"];
 
 const customers = [
   { name: "Northbay Retail DC", code: "CUS-1048", salesOrders: ["SO-70018", "SO-70035"] },
@@ -479,6 +520,7 @@ let activeMode = "outbound";
 let activeOrder = prepareOrder(orders.outbound[0], "outbound");
 let selectedSkuIndex = 0;
 let selectedVendor = null;
+let selectedInboundCategory = null;
 let poSearch = "";
 let deliveryDate = "2026-05-22";
 let lastResult = null;
@@ -573,7 +615,8 @@ function renderShell(title, subtitle, body, actions = "") {
           <h1>${title}</h1>
           <p class="subtle">${subtitle}</p>
         </div>
-        <div class="topbar-actions">${actions}${languageSwitcher()}</div>
+        <div class="topbar-language">${languageSwitcher()}</div>
+        <div class="topbar-actions">${actions}</div>
       </header>
       ${body}
     </section>
@@ -598,6 +641,7 @@ function renderMenu() {
           </div>
         </div>
         ${languageSwitcher()}
+        <div></div>
       </div>
       <div class="menu-grid">
         ${menuItems.map((item) => `
@@ -620,6 +664,13 @@ function renderScanner(mode, title, subtitle) {
       <input id="manualOrderInput" class="search-input" value="OUT-10482" placeholder="OUT-10482" />
       <button class="primary-button" data-action="manual-outbound" type="button">${t("openOrder")}</button>
     </aside>
+  ` : mode === "productReturn" ? `
+    <aside class="manual-scan-panel">
+      <p class="eyebrow">${t("scannerNotWorking")}</p>
+      <h2>${t("scanSoNumber")}</h2>
+      <input id="manualProductReturnInput" class="search-input" value="SO-70018" placeholder="SO-70018" />
+      <button class="primary-button" data-action="manual-product-return" type="button">${t("openOrder")}</button>
+    </aside>
   ` : "";
 
   renderShell(title, subtitle, `
@@ -638,9 +689,11 @@ function renderScanner(mode, title, subtitle) {
 }
 
 function renderInboundVendors() {
+  const searchPanel = renderInboundPoSearch();
   if (selectedVendor !== null) {
     const vendor = vendors[selectedVendor];
     renderShell(t("inbound"), t("vendorSelected"), `
+      ${searchPanel}
       <section class="po-focus-layout">
         <div class="selected-vendor-card">
           <span class="eyebrow">${t("vendor")}</span>
@@ -648,29 +701,77 @@ function renderInboundVendors() {
           <span>${vendor.code}</span>
           <button class="secondary-button" data-action="reselect-vendor" type="button">${t("reselectVendor")}</button>
         </div>
-        <aside class="lookup-panel wide">
-          ${renderPoLookup()}
+        <aside class="lookup-panel po-list-panel">
+          <p class="eyebrow">${t("openPo")}</p>
+          <h2>${vendor.name}</h2>
+          <div class="po-list">
+            ${vendor.pos.map((po) => `
+              <button class="po-card" data-po="${po}" type="button">
+                <strong>PO ${po}</strong>
+                <span>${vendor.code}</span>
+              </button>
+            `).join("")}
+          </div>
         </aside>
       </section>
     `);
     return;
   }
 
-  renderShell(t("inbound"), t("selectVendorFirst"), `
-    <section class="vendor-layout">
-      <div class="vendor-list">
-        ${vendors.map((vendor, index) => `
-          <button class="list-card ${selectedVendor === index ? "active" : ""}" data-vendor="${index}" type="button">
-            <strong>${vendor.name}</strong>
-            <span>${vendor.code} - ${vendor.pos.length} open POs</span>
+  const categoryBody = selectedInboundCategory === null
+    ? `<section class="choice-grid inbound-category-grid">
+        ${inboundCategories.map((category) => `
+          <button class="choice-card" data-inbound-category="${category}" type="button">
+            <strong>${t(category)}</strong>
+            <span>${vendors.filter((vendor) => vendor.category === category).length} ${t("vendor")}</span>
           </button>
         `).join("")}
-      </div>
-      <aside class="lookup-panel">
-        ${selectedVendor === null ? renderEmptyLookup() : renderPoLookup()}
-      </aside>
-    </section>
+      </section>`
+    : `<section class="vendor-layout single-column">
+        <div class="section-title"><span>${t(selectedInboundCategory)}</span><span>${t("chooseVendor")}</span></div>
+        <div class="vendor-list">
+          ${vendors.map((vendor, index) => ({ vendor, index })).filter((item) => item.vendor.category === selectedInboundCategory).map(({ vendor, index }) => `
+            <button class="list-card" data-vendor="${index}" type="button">
+              <strong>${vendor.name}</strong>
+              <span>${vendor.code} - ${vendor.pos.length} ${t("openPo")}</span>
+            </button>
+          `).join("")}
+        </div>
+      </section>`;
+
+  renderShell(t("inbound"), t("chooseCategory"), `
+    ${searchPanel}
+    ${categoryBody}
   `);
+}
+
+function renderInboundPoSearch() {
+  const matches = poSearch
+    ? vendors.flatMap((vendor, vendorIndex) => vendor.pos
+        .filter((po) => po.includes(poSearch))
+        .map((po) => ({ po, vendor, vendorIndex })))
+    : [];
+
+  return `
+    <section class="po-search-sticky">
+      <div>
+        <p class="eyebrow">${t("searchPo")}</p>
+        <h2>${t("searchPoTop")}</h2>
+        <p class="subtle">${t("poSearchTopHint")}</p>
+      </div>
+      <input class="search-input" id="poSearch" value="${poSearch}" placeholder="${t("poNumber")}" inputmode="numeric" />
+      ${poSearch ? `
+        <div class="po-autocomplete">
+          ${matches.map(({ po, vendor }) => `
+            <button class="po-card compact" data-po="${po}" type="button">
+              <strong>PO ${po}</strong>
+              <span>${vendor.name} - ${vendor.code}</span>
+            </button>
+          `).join("") || `<div class="empty-state small"><strong>${t("noMatch")}</strong><span>${t("scanPaperPo")}</span></div>`}
+        </div>
+      ` : ""}
+    </section>
+  `;
 }
 
 function renderEmptyLookup() {
@@ -707,9 +808,10 @@ function renderPoLookup() {
 }
 
 function makeInboundOrder(po) {
+  const vendor = vendors[selectedVendor] || vendors.find((item) => item.pos.includes(po)) || vendors[0];
   return prepareOrder({
     id: `PO-${po}`,
-    customer: vendors[selectedVendor].name,
+    customer: vendor.name,
     dock: "Receiving",
     due: "Open",
     skus: structuredClone(poLines[po] || poLines.default)
@@ -753,6 +855,20 @@ function renderPalletReturn() {
 
     renderShell(t("palletReturn"), t("selectCustomerFirst"), `
       <section class="pallet-return-layout">
+        <div class="pallet-so-row">
+          <div class="scanner-frame">
+            <div class="scan-corners"></div>
+            <strong>${t("scanSoNumber")}</strong>
+            <span>${t("cameraArea")}</span>
+          </div>
+          <aside class="manual-scan-panel">
+            <p class="eyebrow">${t("salesOrderScanner")}</p>
+            <h2>${t("scanSoNumber")}</h2>
+            <input id="salesOrderInput" class="search-input" placeholder="SO-70018" />
+            <button class="primary-button" data-action="scan-sales-order" type="button">${t("fakeScanSo")}</button>
+            <button class="secondary-button" data-action="find-sales-order" type="button">${t("findBySo")}</button>
+          </aside>
+        </div>
         <div class="customer-select-panel">
           <label>
             <span>${t("customerNameCode")}</span>
@@ -767,14 +883,6 @@ function renderPalletReturn() {
             `).join("") || `<div class="empty-state small"><strong>${t("noCustomerFound")}</strong><span>${t("tryCustomerCode")}</span></div>`}
           </div>
         </div>
-        <aside class="manual-scan-panel">
-          <p class="eyebrow">${t("salesOrderScanner")}</p>
-          <h2>${t("scanSoNumber")}</h2>
-          <div class="mini-scanner">SO</div>
-          <input id="salesOrderInput" class="search-input" placeholder="SO-70018" />
-          <button class="primary-button" data-action="scan-sales-order" type="button">${t("fakeScanSo")}</button>
-          <button class="secondary-button" data-action="find-sales-order" type="button">${t("findBySo")}</button>
-        </aside>
       </section>
     `);
     return;
@@ -843,12 +951,16 @@ function renderWork() {
   const totalLoaded = activeOrder.skus.reduce((sum, sku) => sum + loadedQty(sku), 0);
   const confirmed = activeOrder.skus.filter((sku) => sku.confirmed).length;
   const sku = activeOrder.skus[selectedSkuIndex];
-  const diff = isFulfillMode ? requiredLayers(sku) - currentLayers(sku) : loadedQty(sku) - sku.required;
+  const diff = isFulfillMode
+    ? requiredLayers(sku) - currentLayers(sku)
+    : activeMode === "productReturn"
+      ? sku.required - loadedQty(sku)
+      : loadedQty(sku) - sku.required;
 
   renderShell(config.label, `${activeOrder.id} - ${activeOrder.customer}`, `
     <section class="summary-strip">
       <div><span class="metric-label">${t("progress")}</span><strong>${confirmed} / ${activeOrder.skus.length}</strong></div>
-      <div><span class="metric-label">${t("required")}</span><strong>${formatQty(totalRequired)} plt</strong></div>
+      <div><span class="metric-label">${activeMode === "productReturn" ? t("ordered") : t("required")}</span><strong>${formatQty(totalRequired)} plt</strong></div>
       <div><span class="metric-label">${config.unit}</span><strong>${formatQty(totalLoaded)} plt</strong></div>
       <div><span class="metric-label">${t("status")}</span><strong>${confirmed === activeOrder.skus.length ? t("ready") : t("open")}</strong></div>
     </section>
@@ -858,8 +970,18 @@ function renderWork() {
         <div class="sku-list">
           ${activeOrder.skus.map((item, index) => {
             const itemLeftover = requiredLayers(item) - currentLayers(item);
-            const itemDiff = isFulfillMode ? itemLeftover : loadedQty(item) - item.required;
+            const itemDiff = isFulfillMode
+              ? itemLeftover
+              : activeMode === "productReturn"
+                ? item.required - loadedQty(item)
+                : loadedQty(item) - item.required;
             const status = lineStatus(item);
+            const useThreeMeasureLayout = isFulfillMode || activeMode === "productReturn";
+            const firstLabel = activeMode === "productReturn" ? t("ordered") : t("required");
+            const thirdLabel = isFulfillMode ? t("leftover") : activeMode === "productReturn" ? t("leftover") : "Diff";
+            const thirdValue = isFulfillMode
+              ? formatPalletLayer(itemLeftover, item.layerPerPallet)
+              : `${itemDiff > 0 && activeMode !== "productReturn" ? "+" : ""}${formatQty(itemDiff)} plt`;
             return `
               <button class="sku-card ${index === selectedSkuIndex ? "active" : ""} ${item.confirmed ? "confirmed" : ""}" data-sku="${index}" type="button">
                 <div class="sku-main">
@@ -869,11 +991,11 @@ function renderWork() {
                   </div>
                   <span class="status-pill ${status.cls}">${status.text}</span>
                 </div>
-                <div class="sku-measures ${isFulfillMode ? "fulfill-measures" : ""}">
-                  <div class="measure"><span class="metric-label">${t("required")}</span><b>${isFulfillMode ? formatSkuQty(item, activeMode, requiredLayers(item)) : `${formatQty(item.required)} plt`}</b></div>
+                <div class="sku-measures ${useThreeMeasureLayout ? "fulfill-measures" : ""}">
+                  <div class="measure"><span class="metric-label">${firstLabel}</span><b>${isFulfillMode ? formatSkuQty(item, activeMode, requiredLayers(item)) : `${formatQty(item.required)} plt`}</b></div>
                   <div class="measure"><span class="metric-label">${config.unit}</span><b>${formatSkuQty(item, activeMode)}</b></div>
-                  ${isFulfillMode ? "" : `<div class="measure"><span class="metric-label">${t("details")}</span><b>${item.units.pallets}P ${item.units.layers}L ${item.units.cases}C</b></div>`}
-                  <div class="measure"><span class="metric-label">${isFulfillMode ? t("leftover") : "Diff"}</span><b>${isFulfillMode ? formatPalletLayer(itemLeftover, item.layerPerPallet) : `${itemDiff > 0 ? "+" : ""}${formatQty(itemDiff)} plt`}</b></div>
+                  ${useThreeMeasureLayout ? "" : `<div class="measure"><span class="metric-label">${t("details")}</span><b>${item.units.pallets}P ${item.units.layers}L ${item.units.cases}C</b></div>`}
+                  <div class="measure"><span class="metric-label">${thirdLabel}</span><b>${thirdValue}</b></div>
                 </div>
               </button>
             `;
@@ -894,9 +1016,9 @@ function renderWork() {
           ${isFulfillMode ? "" : renderStepper("cases", "Cases", sku.units.cases)}
         </div>
         <div class="conversion-card">
-          <div><span class="metric-label">${t("required")}</span><strong>${isFulfillMode ? formatPalletLayer(requiredLayers(sku), sku.layerPerPallet) : `${formatQty(sku.required)} pallets`}</strong></div>
+          <div><span class="metric-label">${activeMode === "productReturn" ? t("ordered") : t("required")}</span><strong>${isFulfillMode ? formatPalletLayer(requiredLayers(sku), sku.layerPerPallet) : `${formatQty(sku.required)} pallets`}</strong></div>
           <div><span class="metric-label">${config.selected}</span><strong>${isFulfillMode ? formatPalletLayer(currentLayers(sku), sku.layerPerPallet) : `${formatQty(loadedQty(sku))} pallets`}</strong></div>
-          <div><span class="metric-label">${isFulfillMode ? t("leftover") : "Difference"}</span><strong class="${diff === 0 ? "ok-text" : diff < 0 ? "danger-text" : "warn-text"}">${isFulfillMode ? formatPalletLayer(diff, sku.layerPerPallet) : `${diff > 0 ? "+" : ""}${formatQty(diff)} pallets`}</strong></div>
+          <div><span class="metric-label">${isFulfillMode || activeMode === "productReturn" ? t("leftover") : "Difference"}</span><strong class="${diff === 0 ? "ok-text" : diff < 0 ? "danger-text" : "warn-text"}">${isFulfillMode ? formatPalletLayer(diff, sku.layerPerPallet) : `${diff > 0 && activeMode !== "productReturn" ? "+" : ""}${formatQty(diff)} pallets`}</strong></div>
         </div>
         <div class="action-grid">
           <button class="primary-button" data-action="confirm-line" type="button">${t("confirmLine")}</button>
@@ -938,6 +1060,21 @@ function updateUnit(field, value) {
       layers: layerTotal % sku.layerPerPallet,
       cases: 0
     };
+  } else if (activeMode === "productReturn") {
+    const draft = { ...sku.units, [field]: next };
+    let caseTotal = draft.pallets * sku.layerPerPallet * sku.casePerLayer + draft.layers * sku.casePerLayer + draft.cases;
+    const maxCases = sku.required * sku.layerPerPallet * sku.casePerLayer;
+    if (caseTotal > maxCases) {
+      caseTotal = maxCases;
+      showToast(t("cannotReturnMore"));
+    }
+    const pallets = Math.floor(caseTotal / (sku.layerPerPallet * sku.casePerLayer));
+    const afterPalletCases = caseTotal % (sku.layerPerPallet * sku.casePerLayer);
+    sku.units = {
+      pallets,
+      layers: Math.floor(afterPalletCases / sku.casePerLayer),
+      cases: afterPalletCases % sku.casePerLayer
+    };
   } else {
     sku.units[field] = next;
   }
@@ -973,6 +1110,7 @@ document.addEventListener("click", (event) => {
   if (target.dataset.menu === "inbound") {
     screen = "inbound";
     selectedVendor = null;
+    selectedInboundCategory = null;
     poSearch = "";
     return render();
   }
@@ -985,9 +1123,13 @@ document.addEventListener("click", (event) => {
     return render();
   }
   if (target.dataset.scan) return fakeScan(target.dataset.scan);
+  if (target.dataset.inboundCategory) {
+    selectedInboundCategory = target.dataset.inboundCategory;
+    selectedVendor = null;
+    return render();
+  }
   if (target.dataset.vendor) {
     selectedVendor = Number(target.dataset.vendor);
-    poSearch = "";
     return render();
   }
   if (target.dataset.pad) {
@@ -998,6 +1140,8 @@ document.addEventListener("click", (event) => {
   }
   if (target.dataset.po) {
     activeMode = "inbound";
+    const vendorIndex = vendors.findIndex((vendor) => vendor.pos.includes(target.dataset.po));
+    if (vendorIndex >= 0) selectedVendor = vendorIndex;
     activeOrder = makeInboundOrder(target.dataset.po);
     selectedSkuIndex = 0;
     screen = "work";
@@ -1005,7 +1149,6 @@ document.addEventListener("click", (event) => {
   }
   if (target.dataset.action === "reselect-vendor") {
     selectedVendor = null;
-    poSearch = "";
     return render();
   }
   if (target.dataset.delivery) {
@@ -1072,6 +1215,15 @@ document.addEventListener("click", (event) => {
     render();
     return showToast(`${t("manualLoaded")} ${orderNumber}`);
   }
+  if (target.dataset.action === "manual-product-return") {
+    const soNumber = document.getElementById("manualProductReturnInput").value.trim() || "SO-70018";
+    activeMode = "productReturn";
+    activeOrder = prepareOrder({ ...orders.productReturn[0], id: soNumber }, "productReturn");
+    selectedSkuIndex = 0;
+    screen = "work";
+    render();
+    return showToast(`${t("manualLoaded")} ${soNumber}`);
+  }
   if (target.dataset.customer) {
     selectedPalletCustomer = customers.find((customer) => customer.code === target.dataset.customer);
     palletCustomerQuery = selectedPalletCustomer.name;
@@ -1134,6 +1286,15 @@ document.addEventListener("input", (event) => {
     palletCustomerQuery = event.target.value;
     render();
     const input = document.getElementById("customerSearch");
+    if (input) {
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+    }
+  }
+  if (event.target.id === "poSearch") {
+    poSearch = event.target.value.replace(/\D/g, "");
+    render();
+    const input = document.getElementById("poSearch");
     if (input) {
       input.focus();
       input.setSelectionRange(input.value.length, input.value.length);
