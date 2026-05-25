@@ -512,15 +512,18 @@ h2 {
 .pallet-return-layout {
   padding: 28px;
   display: grid;
-  grid-template-columns: 1fr;
+  grid-template-columns: minmax(420px, 1fr) 380px;
   gap: 18px;
   align-items: start;
 }
 
-.pallet-so-row {
-  display: grid;
-  grid-template-columns: minmax(360px, 1fr) 360px;
-  gap: 18px;
+.sales-order-panel {
+  align-self: start;
+}
+
+.embedded-scanner {
+  aspect-ratio: 1.35;
+  min-height: 210px;
 }
 
 .simple-form label {
@@ -866,7 +869,6 @@ h2 {
   .po-focus-layout,
   .scanner-layout,
   .pallet-return-layout,
-  .pallet-so-row,
   .po-search-sticky {
     grid-template-columns: 1fr;
   }

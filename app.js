@@ -855,20 +855,6 @@ function renderPalletReturn() {
 
     renderShell(t("palletReturn"), t("selectCustomerFirst"), `
       <section class="pallet-return-layout">
-        <div class="pallet-so-row">
-          <div class="scanner-frame">
-            <div class="scan-corners"></div>
-            <strong>${t("scanSoNumber")}</strong>
-            <span>${t("cameraArea")}</span>
-          </div>
-          <aside class="manual-scan-panel">
-            <p class="eyebrow">${t("salesOrderScanner")}</p>
-            <h2>${t("scanSoNumber")}</h2>
-            <input id="salesOrderInput" class="search-input" placeholder="SO-70018" />
-            <button class="primary-button" data-action="scan-sales-order" type="button">${t("fakeScanSo")}</button>
-            <button class="secondary-button" data-action="find-sales-order" type="button">${t("findBySo")}</button>
-          </aside>
-        </div>
         <div class="customer-select-panel">
           <label>
             <span>${t("customerNameCode")}</span>
@@ -883,6 +869,18 @@ function renderPalletReturn() {
             `).join("") || `<div class="empty-state small"><strong>${t("noCustomerFound")}</strong><span>${t("tryCustomerCode")}</span></div>`}
           </div>
         </div>
+        <aside class="manual-scan-panel sales-order-panel">
+          <p class="eyebrow">${t("salesOrderScanner")}</p>
+          <h2>${t("scanSoNumber")}</h2>
+          <div class="scanner-frame embedded-scanner">
+            <div class="scan-corners"></div>
+            <strong>${t("scanSoNumber")}</strong>
+            <span>${t("cameraArea")}</span>
+          </div>
+          <input id="salesOrderInput" class="search-input" placeholder="SO-70018" />
+          <button class="primary-button" data-action="scan-sales-order" type="button">${t("fakeScanSo")}</button>
+          <button class="secondary-button" data-action="find-sales-order" type="button">${t("findBySo")}</button>
+        </aside>
       </section>
     `);
     return;
