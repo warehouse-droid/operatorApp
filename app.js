@@ -148,6 +148,9 @@ const I18N = {
     countQty: "Count quantity",
     submitCount: "Submit count",
     submitDamage: "Submit damage",
+    reviewSummary: "Review summary",
+    confirmSubmit: "Confirm submit",
+    confirmedLines: "Confirmed lines",
     previous: "Previous",
     next: "Next",
     cannotOver: "Cannot fulfill more than the order quantity.",
@@ -295,6 +298,9 @@ const I18N = {
     countQty: "盘点数量",
     submitCount: "提交盘点",
     submitDamage: "提交损坏",
+    reviewSummary: "查看汇总",
+    confirmSubmit: "确认提交",
+    confirmedLines: "已确认行",
     previous: "上一页",
     next: "下一页",
     cannotOver: "不能超过订单数量。",
@@ -442,6 +448,9 @@ const I18N = {
     countQty: "盤點數量",
     submitCount: "提交盤點",
     submitDamage: "提交損壞",
+    reviewSummary: "查看彙總",
+    confirmSubmit: "確認提交",
+    confirmedLines: "已確認行",
     previous: "上一頁",
     next: "下一頁",
     cannotOver: "不能超過訂單數量。",
@@ -623,8 +632,9 @@ let cycleProductType = null;
 let cycleVendor = null;
 let cycleSeriesChoice = null;
 let cyclePage = 0;
+let cycleDraft = null;
 const PAGE_SIZE = 3;
-const CYCLE_PAGE_SIZE = 5;
+const CYCLE_PAGE_SIZE = 4;
 let toastTimer;
 
 const app = document.getElementById("app");
@@ -1239,18 +1249,44 @@ function renderPaginatedCycleRows(skus, isDamage) {
       <strong>${cyclePage + 1} / ${pageCount}</strong>
       <button class="secondary-button" data-action="cycle-page-next" type="button" ${cyclePage >= pageCount - 1 ? "disabled" : ""}>${t("next")}</button>
     </div>
+    <div class="cycle-submit-row">
+      <strong>${cycleDraft ? cycleDraft.lines.length : 0} ${t("done")}</strong>
+      <button class="primary-button" data-action="review-cycle-batch" type="button">${t("reviewSummary")}</button>
+    </div>
   `;
 }
 
 function renderCycleCountRow(sku, isDamage) {
+  const saved = cycleDraft?.lines.find((line) => line.code === sku.code);
   return `
-    <div class="cycle-row">
+    <div class="cycle-row ${saved ? "confirmed" : ""}" data-cycle-sku="${sku.code}" data-cycle-name="${sku.name}">
       <div><strong>${sku.code}</strong><span>${sku.name}</span></div>
-      <label><span>${unitLabel("pallet")}</span><input type="number" min="0" value="0" inputmode="numeric" /></label>
-      <label><span>${unitLabel("layer")}</span><input type="number" min="0" value="0" inputmode="numeric" /></label>
-      <button class="primary-button" data-action="submit-cycle" type="button">${isDamage ? t("submitDamage") : t("submitCount")}</button>
+      <label><span>${unitLabel("pallet")}</span><input data-cycle-unit="pallets" type="number" min="0" value="${saved?.pallets || 0}" inputmode="numeric" /></label>
+      <label><span>${unitLabel("layer")}</span><input data-cycle-unit="layers" type="number" min="0" value="${saved?.layers || 0}" inputmode="numeric" /></label>
+      <button class="primary-button" data-action="confirm-cycle-line" type="button">${t("confirmLine")}</button>
     </div>
   `;
+}
+
+function renderCycleSummary() {
+  const isDamage = cycleDraft?.mode === "damage";
+  const title = isDamage ? t("damageStock") : t("selfRaisedCycleCount");
+  renderShell(title, t("reviewSummary"), `
+    <section class="result-screen">
+      <span class="eyebrow">${t("confirmedLines")}</span>
+      <strong>${cycleDraft?.lines.length || 0}</strong>
+      <div class="result-lines">
+        ${(cycleDraft?.lines || []).map((line) => `
+          <div class="result-line">
+            <span>${line.code} - ${line.name}</span>
+            <b>${line.pallets}P ${line.layers}L</b>
+          </div>
+        `).join("") || `<div class="empty-state small"><strong>0</strong><span>${t("confirmedLines")}</span></div>`}
+      </div>
+      <button class="secondary-button" data-action="cycle-summary-back" type="button">${t("edit")}</button>
+      <button class="primary-button" data-action="submit-cycle-batch" type="button">${t("confirmSubmit")}</button>
+    </section>
+  `);
 }
 
 function lineStatus(sku) {
@@ -1425,6 +1461,7 @@ function render() {
   if (screen === "history") renderHistory();
   if (screen === "historyView") renderHistoryView();
   if (screen === "cycleCount") renderCycleCount();
+  if (screen === "cycleSummary") renderCycleSummary();
   if (screen === "result") renderResult();
 }
 
@@ -1467,6 +1504,7 @@ document.addEventListener("click", (event) => {
     cycleVendor = null;
     cycleSeriesChoice = null;
     cyclePage = 0;
+    cycleDraft = null;
     return render();
   }
   if (target.dataset.scan) return fakeScan(target.dataset.scan);
@@ -1581,6 +1619,21 @@ document.addEventListener("click", (event) => {
   if (target.dataset.action === "edit-record") {
     const record = lastResult?.record || viewingRecord;
     if (!record) return;
+    if (record.mode === "cycleCount" && record.inventoryType !== "damage") return;
+    if (record.mode === "cycleCount" && record.inventoryType === "damage") {
+      cycleMode = "damage";
+      cycleProductType = "aggregate";
+      cycleVendor = record.order.customer;
+      cycleSeriesChoice = "Granite";
+      cycleDraft = {
+        id: `${record.id}-EDIT`,
+        mode: "damage",
+        lines: structuredClone(record.order.skus || [])
+      };
+      editingRecordId = record.id;
+      screen = "cycleCount";
+      return render();
+    }
     editingRecordId = record.id;
     activeMode = record.mode;
     activeOrder = structuredClone(record.order);
@@ -1600,6 +1653,11 @@ document.addEventListener("click", (event) => {
     cycleVendor = null;
     cycleSeriesChoice = null;
     cyclePage = 0;
+    cycleDraft = {
+      id: `${cycleMode === "damage" ? "DMG" : "CC"}-TEMP-${Math.floor(1000 + Math.random() * 9000)}`,
+      mode: target.dataset.cycleMode,
+      lines: []
+    };
     return render();
   }
   if (target.dataset.cycleProduct) {
@@ -1633,6 +1691,7 @@ document.addEventListener("click", (event) => {
     cycleVendor = null;
     cycleSeriesChoice = null;
     cyclePage = 0;
+    cycleDraft = null;
     return render();
   }
   if (target.dataset.action === "cycle-back-vendor") {
@@ -1654,11 +1713,50 @@ document.addEventListener("click", (event) => {
     cyclePage += 1;
     return render();
   }
-  if (target.dataset.action === "submit-cycle") {
+  if (target.dataset.action === "review-cycle-batch") {
+    screen = "cycleSummary";
+    return render();
+  }
+  if (target.dataset.action === "cycle-summary-back") {
+    screen = "cycleCount";
+    return render();
+  }
+  if (target.dataset.action === "confirm-cycle-line") {
     const isDamage = cycleMode === "damage";
-    const record = createCompletionRecord("cycleCount", { id: isDamage ? "DAMAGE" : "CYCLE", customer: cycleVendor || "Assigned", skus: [] });
+    if (!cycleDraft) cycleDraft = { id: `${isDamage ? "DMG" : "CC"}-TEMP`, mode: cycleMode, lines: [] };
+    const row = target.closest(".cycle-row");
+    const line = {
+      code: row.dataset.cycleSku,
+      name: row.dataset.cycleName,
+      pallets: Number(row.querySelector('[data-cycle-unit="pallets"]').value) || 0,
+      layers: Number(row.querySelector('[data-cycle-unit="layers"]').value) || 0
+    };
+    const index = cycleDraft.lines.findIndex((item) => item.code === line.code);
+    if (index >= 0) cycleDraft.lines[index] = line;
+    else cycleDraft.lines.push(line);
+    showToast(t("lineConfirmed"));
+    return render();
+  }
+  if (target.dataset.action === "submit-cycle-batch") {
+    const isDamage = cycleMode === "damage";
+    const record = createCompletionRecord("cycleCount", {
+      id: isDamage ? "DAMAGE" : "CYCLE",
+      customer: cycleVendor || "Assigned",
+      skus: structuredClone(cycleDraft?.lines || [])
+    });
     record.id = `${isDamage ? "DMG" : "CC"}-${Math.floor(100000 + Math.random() * 900000)}`;
-    historyRecords.unshift(record);
+    record.inventoryType = isDamage ? "damage" : "cycle";
+    record.canEdit = isDamage;
+    if (editingRecordId) {
+      record.id = editingRecordId;
+      const index = historyRecords.findIndex((item) => item.id === editingRecordId);
+      if (index >= 0) historyRecords[index] = record;
+      else historyRecords.unshift(record);
+      editingRecordId = null;
+    } else {
+      historyRecords.unshift(record);
+    }
+    cycleDraft = null;
     showToast(`${record.id} ${t("done")}`);
     screen = "menu";
     return render();
@@ -1773,20 +1871,21 @@ document.addEventListener("input", (event) => {
 function renderResult() {
   const order = lastResult.order;
   const mode = lastResult.mode;
+  const lines = order.skus || [];
   renderShell(mode === "delivery" ? t("deliveryPrepared") : t("shipmentComplete"), t("showFulfillment"), `
     <section class="result-screen">
       <span class="eyebrow">${t("fulfillmentNumber")}</span>
       <strong>${lastResult.number}</strong>
       <p>${order.id} - ${order.customer}</p>
       <div class="result-lines">
-        ${order.skus.map((sku) => `
+        ${lines.map((sku) => `
           <div class="result-line">
             <span>${sku.code} - ${sku.name}</span>
-            <b>${formatPalletLayer(currentLayers(sku), sku.layerPerPallet)}</b>
+            <b>${sku.layerPerPallet ? formatPalletLayer(currentLayers(sku), sku.layerPerPallet) : `${sku.pallets || 0}P ${sku.layers || 0}L`}</b>
           </div>
         `).join("")}
       </div>
-      <button class="secondary-button" data-action="edit-record" type="button">${t("edit")}</button>
+      ${lastResult.record?.canEdit !== false ? `<button class="secondary-button" data-action="edit-record" type="button">${t("edit")}</button>` : ""}
       <button class="primary-button" data-action="menu" type="button">${t("backToMenu")}</button>
     </section>
   `);

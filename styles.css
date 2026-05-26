@@ -588,7 +588,8 @@ h2 {
   grid-template-columns: 1fr auto 1fr;
   align-items: center;
   gap: 10px;
-  margin-top: 12px;
+  margin-top: auto;
+  flex: 0 0 auto;
 }
 
 .pagination-row strong {
@@ -601,6 +602,12 @@ h2 {
   padding: 28px;
   display: grid;
   gap: 16px;
+}
+
+.cycle-list {
+  min-height: calc(100vh - 160px);
+  display: flex;
+  flex-direction: column;
 }
 
 .photo-capture-screen {
@@ -654,6 +661,11 @@ h2 {
   align-items: center;
 }
 
+.cycle-row.confirmed {
+  border-color: var(--ok);
+  box-shadow: inset 7px 0 0 var(--ok);
+}
+
 .cycle-row div,
 .cycle-row label {
   display: grid;
@@ -674,6 +686,17 @@ h2 {
   padding: 0 12px;
   font-weight: 900;
   font-size: 22px;
+}
+
+.cycle-submit-row {
+  background: white;
+  border: 2px solid var(--line);
+  border-radius: 8px;
+  padding: 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
 }
 
 .cycle-step-actions {
@@ -772,6 +795,7 @@ h2 {
 .sku-list {
   display: grid;
   gap: 10px;
+  flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
   padding-right: 8px;
