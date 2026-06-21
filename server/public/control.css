@@ -1,0 +1,329 @@
+:root {
+  font-family: Inter, Arial, sans-serif;
+  color: #0b1115;
+  background: #f4f6f4;
+  --line: #aebbc2;
+  --accent: #006f6b;
+  --danger: #a40000;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+button,
+input,
+select {
+  min-height: 42px;
+  border: 2px solid var(--line);
+  border-radius: 8px;
+  padding: 0 12px;
+  font: inherit;
+  font-weight: 800;
+}
+
+button {
+  cursor: pointer;
+  background: white;
+}
+
+.primary {
+  border-color: transparent;
+  background: var(--accent);
+  color: white;
+}
+
+.danger {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.shell {
+  min-height: 100vh;
+  padding: 22px;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+
+h1,
+h2,
+p {
+  margin: 0;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: 380px minmax(0, 1fr);
+  gap: 16px;
+}
+
+.control-layout {
+  display: grid;
+  grid-template-columns: 270px minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.control-menu {
+  border: 2px solid var(--line);
+  border-radius: 8px;
+  background: white;
+  padding: 10px;
+  display: grid;
+  gap: 8px;
+  position: sticky;
+  top: 16px;
+}
+
+.menu-button {
+  width: 100%;
+  min-height: 76px;
+  padding: 10px 12px;
+  display: grid;
+  gap: 4px;
+  text-align: left;
+  align-content: center;
+}
+
+.menu-button.active {
+  border-color: var(--accent);
+  box-shadow: inset 7px 0 0 var(--accent);
+  background: #f0fbf8;
+}
+
+.menu-button strong {
+  font-size: 17px;
+}
+
+.menu-button span {
+  color: #46545c;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.control-content {
+  min-width: 0;
+  display: grid;
+  gap: 16px;
+}
+
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.metric-card {
+  min-height: 120px;
+  padding: 16px;
+  display: grid;
+  gap: 5px;
+  align-content: center;
+  text-align: left;
+  border-color: var(--accent);
+}
+
+.metric-card span {
+  color: #46545c;
+  font-weight: 900;
+}
+
+.metric-card strong {
+  font-size: 34px;
+}
+
+.metric-card em {
+  color: #46545c;
+  font-style: normal;
+  font-weight: 800;
+}
+
+.panel {
+  border: 2px solid var(--line);
+  border-radius: 8px;
+  background: white;
+  padding: 16px;
+  display: grid;
+  gap: 12px;
+}
+
+.section-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.form-grid {
+  display: grid;
+  gap: 10px;
+}
+
+label {
+  display: grid;
+  gap: 5px;
+  font-weight: 900;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  background: white;
+}
+
+th,
+td {
+  border-bottom: 1px solid #d7dee2;
+  padding: 9px;
+  text-align: left;
+  vertical-align: top;
+}
+
+th {
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.muted {
+  color: #46545c;
+  font-weight: 700;
+}
+
+.notice {
+  padding: 10px 12px;
+  border: 2px solid #e3b100;
+  border-radius: 8px;
+  background: #fff8d7;
+  font-weight: 800;
+}
+
+.login {
+  width: min(460px, calc(100% - 32px));
+  margin: 10vh auto;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.password-reset-form {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.password-reset-form input,
+.password-reset-form button {
+  min-height: 38px;
+}
+
+pre {
+  white-space: pre-wrap;
+  margin: 0;
+  max-width: 520px;
+}
+
+.spreadsheet-wrap {
+  max-height: 460px;
+  overflow: auto;
+  border: 1px solid #d7dee2;
+  border-radius: 8px;
+}
+
+.spreadsheet-wrap.small {
+  max-height: 320px;
+}
+
+.spreadsheet-table {
+  min-width: 1180px;
+}
+
+.spreadsheet-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: #eef4f5;
+}
+
+.spreadsheet-table td {
+  background: white;
+}
+
+.spreadsheet-table input {
+  width: 150px;
+  min-height: 36px;
+  border-width: 1px;
+  font-weight: 800;
+}
+
+.cycle-review-list {
+  display: grid;
+  gap: 10px;
+}
+
+.fulfillment-review-list {
+  display: grid;
+  gap: 10px;
+}
+
+.review-record {
+  border: 1px solid #d7dee2;
+  border-radius: 8px;
+  background: white;
+  overflow: hidden;
+}
+
+.review-record summary {
+  min-height: 56px;
+  padding: 10px 12px;
+  display: grid;
+  grid-template-columns: 90px 1fr 190px 90px 130px;
+  gap: 10px;
+  align-items: center;
+  cursor: pointer;
+  font-weight: 800;
+}
+
+.fulfillment-review-list .review-record summary {
+  grid-template-columns: 120px 1fr 150px 150px 190px;
+}
+
+.fulfillment-review-list .review-record pre {
+  max-width: none;
+  margin: 0 12px 12px;
+  padding: 10px;
+  border: 1px solid #d7dee2;
+  border-radius: 8px;
+  background: white;
+  max-height: 420px;
+  overflow: auto;
+}
+
+.fulfillment-review-list .review-record:not([open]) pre {
+  display: none;
+}
+
+.cycle-review-table {
+  min-width: 1250px;
+}
+
+.bad {
+  color: #a40000;
+}
+
+.warn {
+  color: #9a4d00;
+}
