@@ -3,20 +3,32 @@ import crypto from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { config } from "./config.js";
-import { buildAuthorizationUrl, exchangeCodeForToken, fetchDeliveryOrdersFromNetSuite, fetchDeliveryOrderFromNetSuite, fetchDeliveryOrderDetailsFromNetSuite, fetchInventoryBalanceForItemFromNetSuite, fetchInventoryBalancesFromNetSuite, fetchItemFulfillmentFromNetSuite, transformSalesOrderToItemFulfillment } from "./netsuite.js";
+import { buildAuthorizationUrl, exchangeCodeForToken, fetchDeliveryOrdersFromNetSuite, fetchDeliveryOrderFromNetSuite, fetchDeliveryOrderDetailsFromNetSuite, fetchTransferDeliveryOrdersFromNetSuite, fetchTransferDeliveryOrderFromNetSuite, fetchTransferOrderDetailsFromNetSuite, fetchPurchaseOrdersFromNetSuite, fetchPurchaseOrderFromNetSuite, fetchPurchaseOrderDetailsFromNetSuite, fetchTransferReceivingOrdersFromNetSuite, fetchTransferReceivingOrderFromNetSuite, fetchInventoryBalanceForItemFromNetSuite, fetchInventoryBalancesFromNetSuite, fetchItemFulfillmentFromNetSuite, fetchItemReceiptFromNetSuite, transformSalesOrderToItemFulfillment, transformTransferOrderToItemFulfillment, transformPurchaseOrderToItemReceipt, transformTransferOrderToItemReceipt } from "./netsuite.js";
 import { upsertDeliveryOrders, upsertDeliveryOrderLines, markMissingDeliveryOrderLines, listExistingDeliveryOrderIds, markDeliveryOrderMissing, listDeliveryOrders, getDeliveryOrder, getFulfillableDeliveryOrder, buildItemFulfillmentPayload, markDeliveryPrepared, updateDeliveryStatus, confirmDeliveryLine, setDeliveryLinePackedQuantity, unpackDeliveryLine, unpackDeliveryOrder, recordDeliveryFulfillment, recordDeliveryFulfillmentFailure, listDeliveryFulfillments, resetDeliveryFulfillmentState } from "./delivery-repository.js";
 import { createOperator, getOperatorByToken, hasOperators, listAudit, listOperators, loginOperator, logoutToken, setOperatorActive, updateOperatorPassword, writeAudit } from "./auth-repository.js";
 import { confirmCycleCountLine, getCycleCountDraft, listCycleCountRecords, listInventoryClassifications, listInventoryFacets, listInventoryItems, submitCycleCount, updateInventoryClassification, upsertInventoryBalances } from "./inventory-repository.js";
+import { upsertReceivingOrders, upsertReceivingOrderLines, markMissingReceivingOrders, markMissingReceivingOrderLines, listExistingReceivingOrderIds, listReceivingVendors, listReceivingSources, listReceivingOrders, getReceivingOrder, searchReceivingItems, confirmReceivingLine, getReceivableReceivingOrder, buildItemReceiptPayload, recordReceivingReceipt, recordReceivingReceiptFailure, listReceivingReceipts } from "./receiving-repository.js";
+import { listOperatorHistory, listRecordWarnings, reportOperatorRecordError, resolveRecordWarning } from "./history-repository.js";
 
 const app = express();
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.resolve(dirname, "../public");
-const deliveryLocations = [1, 13];
+const deliveryLocations = [1, 13, 15];
 const fulfillmentJobs = new Map();
+const receivingJobs = new Map();
 
 function updateFulfillmentJob(jobId, patch) {
   const current = fulfillmentJobs.get(jobId) || { id: jobId };
   fulfillmentJobs.set(jobId, {
+    ...current,
+    ...patch,
+    updatedAt: new Date().toISOString()
+  });
+}
+
+function updateReceivingJob(jobId, patch) {
+  const current = receivingJobs.get(jobId) || { id: jobId };
+  receivingJobs.set(jobId, {
     ...current,
     ...patch,
     updatedAt: new Date().toISOString()
@@ -62,11 +74,18 @@ async function withTimeout(promise, ms) {
   return result;
 }
 
-async function syncDeliveryLocation(locationId, { includeDetails = true } = {}) {
-  const discoveredOrders = await fetchDeliveryOrdersFromNetSuite(locationId);
+function normalizeOrderType(value) {
+  return value === "transfer_order" || value === "transfer" ? "transfer_order" : "sales_order";
+}
+
+async function syncDeliveryLocation(locationId, { includeDetails = true, orderType = "sales_order" } = {}) {
+  const normalizedOrderType = normalizeOrderType(orderType);
+  const discoveredOrders = normalizedOrderType === "transfer_order"
+    ? await fetchTransferDeliveryOrdersFromNetSuite(locationId)
+    : await fetchDeliveryOrdersFromNetSuite(locationId);
   await upsertDeliveryOrders(discoveredOrders);
 
-  const existingIds = await listExistingDeliveryOrderIds({ locationId });
+  const existingIds = await listExistingDeliveryOrderIds({ locationId, orderType: normalizedOrderType });
   const orderIds = [...new Set([
     ...discoveredOrders.map((order) => String(order.id)),
     ...existingIds.map((id) => String(id))
@@ -76,7 +95,9 @@ async function syncDeliveryLocation(locationId, { includeDetails = true } = {}) 
   let detailCount = 0;
   let missingCount = 0;
   for (const orderId of orderIds) {
-    const trackedOrder = await fetchDeliveryOrderFromNetSuite(orderId, locationId);
+    const trackedOrder = normalizedOrderType === "transfer_order"
+      ? await fetchTransferDeliveryOrderFromNetSuite(orderId, locationId)
+      : await fetchDeliveryOrderFromNetSuite(orderId, locationId);
     if (!trackedOrder) {
       await markDeliveryOrderMissing(orderId);
       await writeAudit({
@@ -94,7 +115,9 @@ async function syncDeliveryLocation(locationId, { includeDetails = true } = {}) 
     if (!discoveredOrders.some((order) => String(order.id) === String(orderId))) orderCount += 1;
 
     if (includeDetails) {
-      const lines = await fetchDeliveryOrderDetailsFromNetSuite(orderId, locationId);
+      const lines = normalizedOrderType === "transfer_order"
+        ? await fetchTransferOrderDetailsFromNetSuite(orderId, locationId)
+        : await fetchDeliveryOrderDetailsFromNetSuite(orderId, locationId);
       await upsertDeliveryOrderLines(orderId, lines);
       await markMissingDeliveryOrderLines(orderId, lines.map((line) => line.line_id));
       detailCount += lines.length;
@@ -105,7 +128,7 @@ async function syncDeliveryLocation(locationId, { includeDetails = true } = {}) 
     actorType: "system",
     source: "netsuite",
     action: "netsuite.delivery.sync",
-    details: { locationId, discovered: discoveredOrders.length, tracked: orderCount, missing: missingCount, lines: detailCount }
+    details: { locationId, orderType: normalizedOrderType, discovered: discoveredOrders.length, tracked: orderCount, missing: missingCount, lines: detailCount }
   });
 
   return { discovered: discoveredOrders.length, tracked: orderCount, missing: missingCount, lines: detailCount };
@@ -117,13 +140,107 @@ async function syncAllDeliveryLocations() {
   syncRunning = true;
   try {
     for (const locationId of deliveryLocations) {
-      await syncDeliveryLocation(locationId);
+      await syncDeliveryLocation(locationId, { orderType: "sales_order" });
+      await syncDeliveryLocation(locationId, { orderType: "transfer_order" });
     }
   } catch (error) {
     console.error("Delivery auto-sync failed:", error.message);
   } finally {
     syncRunning = false;
   }
+}
+
+async function syncPurchaseReceiving({ locationId = 1, includeDetails = true } = {}) {
+  const discoveredOrders = await fetchPurchaseOrdersFromNetSuite(locationId);
+  await upsertReceivingOrders(discoveredOrders);
+  const existingIds = await listExistingReceivingOrderIds({ orderType: "purchase_order", destinationLocationId: locationId });
+  const orderIds = [...new Set([
+    ...discoveredOrders.map((order) => String(order.id)),
+    ...existingIds.map((id) => String(id))
+  ])];
+  let detailCount = 0;
+  for (const orderId of orderIds) {
+    const trackedOrder = await fetchPurchaseOrderFromNetSuite(orderId, locationId);
+    if (!trackedOrder) continue;
+    await upsertReceivingOrders([trackedOrder]);
+    if (includeDetails) {
+      const lines = await fetchPurchaseOrderDetailsFromNetSuite(orderId, locationId);
+      await upsertReceivingOrderLines(orderId, lines);
+      await markMissingReceivingOrderLines(orderId, lines.map((line) => line.line_id));
+      detailCount += lines.length;
+    }
+  }
+  await markMissingReceivingOrders({ orderType: "purchase_order", activeOrderIds: discoveredOrders.map((order) => order.id), destinationLocationId: locationId });
+  await writeAudit({
+    actorType: "system",
+    source: "netsuite",
+    action: "netsuite.receiving.purchase_order.sync",
+    details: { locationId, discovered: discoveredOrders.length, tracked: orderIds.length, lines: detailCount }
+  });
+  return { discovered: discoveredOrders.length, tracked: orderIds.length, lines: detailCount };
+}
+
+async function syncTransferReceiving({ sourceLocationId = null, destinationLocationId = null, includeDetails = true } = {}) {
+  const discoveredOrders = await fetchTransferReceivingOrdersFromNetSuite({ sourceLocationId, destinationLocationId });
+  await upsertReceivingOrders(discoveredOrders);
+  const existingIds = await listExistingReceivingOrderIds({ orderType: "transfer_order", sourceLocationId, destinationLocationId });
+  const orderIds = [...new Set([
+    ...discoveredOrders.map((order) => String(order.id)),
+    ...existingIds.map((id) => String(id))
+  ])];
+  let detailCount = 0;
+  for (const orderId of orderIds) {
+    const trackedOrder = await fetchTransferReceivingOrderFromNetSuite(orderId);
+    if (!trackedOrder) continue;
+    await upsertReceivingOrders([trackedOrder]);
+    if (includeDetails) {
+      const lines = await fetchTransferOrderDetailsFromNetSuite(orderId, destinationLocationId || null, { direction: "destination" });
+      await upsertReceivingOrderLines(orderId, lines);
+      await markMissingReceivingOrderLines(orderId, lines.map((line) => line.line_id));
+      detailCount += lines.length;
+    }
+  }
+  await markMissingReceivingOrders({
+    orderType: "transfer_order",
+    activeOrderIds: discoveredOrders.map((order) => order.id),
+    sourceLocationId,
+    destinationLocationId
+  });
+  await writeAudit({
+    actorType: "system",
+    source: "netsuite",
+    action: "netsuite.receiving.transfer_order.sync",
+    details: { sourceLocationId, destinationLocationId, discovered: discoveredOrders.length, tracked: orderIds.length, lines: detailCount }
+  });
+  return { discovered: discoveredOrders.length, tracked: orderIds.length, lines: detailCount };
+}
+
+async function syncReceivingOrderDetails(orderId, { orderType = null, locationId = null, sourceLocationId = null } = {}) {
+  const existing = await getReceivingOrder(orderId);
+  const normalizedOrderType = orderType || existing?.order_type || "purchase_order";
+  if (normalizedOrderType === "transfer_order") {
+    const effectiveDestinationLocationId = locationId || existing?.destination_location_id || null;
+    const storedSourceLocationId = existing?.source_location_id && String(existing.source_location_id) !== String(effectiveDestinationLocationId)
+      ? existing.source_location_id
+      : null;
+    const effectiveSourceLocationId = sourceLocationId || storedSourceLocationId;
+    const order = await fetchTransferReceivingOrderFromNetSuite(orderId, effectiveSourceLocationId);
+    if (!order) return { order: false, lines: 0 };
+    await upsertReceivingOrders([order]);
+    const lines = await fetchTransferOrderDetailsFromNetSuite(orderId, effectiveDestinationLocationId || order.destination_location_id, { direction: "destination" });
+    await upsertReceivingOrderLines(orderId, lines);
+    await markMissingReceivingOrderLines(orderId, lines.map((line) => line.line_id));
+    return { order: true, orderType: "transfer_order", lines: lines.length };
+  }
+
+  const effectiveLocationId = locationId || existing?.destination_location_id || null;
+  const order = await fetchPurchaseOrderFromNetSuite(orderId, effectiveLocationId);
+  if (!order) return { order: false, lines: 0 };
+  await upsertReceivingOrders([order]);
+  const lines = await fetchPurchaseOrderDetailsFromNetSuite(orderId, effectiveLocationId);
+  await upsertReceivingOrderLines(orderId, lines);
+  await markMissingReceivingOrderLines(orderId, lines.map((line) => line.line_id));
+  return { order: true, orderType: "purchase_order", lines: lines.length };
 }
 
 app.use(express.json({ limit: "25mb" }));
@@ -367,6 +484,53 @@ app.get("/api/delivery/fulfillments", requireOperator, requireAdmin, async (req,
   }
 });
 
+app.get("/api/operator/history", requireOperator, async (req, res, next) => {
+  try {
+    res.json(await listOperatorHistory({
+      operatorId: req.operator.id,
+      date: req.query.date || "",
+      limit: req.query.limit || 100
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/operator/history/report-error", requireOperator, async (req, res, next) => {
+  try {
+    res.json(await reportOperatorRecordError({
+      operatorId: req.operator.id,
+      recordId: req.body?.recordId,
+      reason: req.body?.reason
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/control/record-warnings", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    res.json(await listRecordWarnings({
+      status: req.query.status || "",
+      limit: req.query.limit || 100
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/control/record-warnings/:id/resolve", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    res.json(await resolveRecordWarning({
+      warningId: req.params.id,
+      handledBy: req.operator.id,
+      resolution: req.body?.resolution
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/auth/netsuite/start", (req, res, next) => {
   try {
     const { url } = buildAuthorizationUrl();
@@ -389,18 +553,20 @@ app.get("/api/auth/netsuite/callback", async (req, res, next) => {
 });
 
 app.use("/api/delivery", requireOperator);
+app.use("/api/receiving", requireOperator);
 app.use("/api/inventory", requireOperator);
 app.use("/api/cycle-count", requireOperator);
 
 app.post("/api/delivery/sync", async (req, res, next) => {
   try {
     const locationId = Number(req.body?.locationId || req.query.locationId || 1);
-    const synced = await syncDeliveryLocation(locationId);
+    const orderType = normalizeOrderType(req.body?.orderType || req.query.orderType);
+    const synced = await syncDeliveryLocation(locationId, { orderType });
     await writeAudit({
       actorOperatorId: req.operator.id,
       source: "delivery",
       action: "operator.manual_sync",
-      details: { locationId, synced }
+      details: { locationId, orderType, synced }
     });
     res.json({ synced });
   } catch (error) {
@@ -411,10 +577,15 @@ app.post("/api/delivery/sync", async (req, res, next) => {
 app.post("/api/delivery/orders/:id/sync", async (req, res, next) => {
   try {
     const locationId = req.body?.locationId || req.query.locationId;
-    const order = await fetchDeliveryOrderFromNetSuite(req.params.id, locationId);
+    const orderType = normalizeOrderType(req.body?.orderType || req.query.orderType);
+    const order = orderType === "transfer_order"
+      ? await fetchTransferDeliveryOrderFromNetSuite(req.params.id, locationId)
+      : await fetchDeliveryOrderFromNetSuite(req.params.id, locationId);
     if (order) await upsertDeliveryOrders([order]);
     else await markDeliveryOrderMissing(req.params.id);
-    const lines = await fetchDeliveryOrderDetailsFromNetSuite(req.params.id, locationId);
+    const lines = orderType === "transfer_order"
+      ? await fetchTransferOrderDetailsFromNetSuite(req.params.id, locationId)
+      : await fetchDeliveryOrderDetailsFromNetSuite(req.params.id, locationId);
     await upsertDeliveryOrderLines(req.params.id, lines);
     await markMissingDeliveryOrderLines(req.params.id, lines.map((line) => line.line_id));
     await writeAudit({
@@ -422,7 +593,7 @@ app.post("/api/delivery/orders/:id/sync", async (req, res, next) => {
       source: "delivery",
       action: "operator.manual_order_sync",
       orderId: req.params.id,
-      details: { locationId, order: Boolean(order), lines: lines.length }
+      details: { locationId, orderType, order: Boolean(order), lines: lines.length }
     });
     res.json({ order: Boolean(order), synced: lines.length });
   } catch (error) {
@@ -434,7 +605,8 @@ app.get("/api/delivery/orders", async (req, res, next) => {
   try {
     res.json(await listDeliveryOrders({
       locationId: req.query.locationId,
-      status: req.query.status
+      status: req.query.status,
+      orderType: normalizeOrderType(req.query.orderType)
     }));
   } catch (error) {
     next(error);
@@ -446,6 +618,163 @@ app.get("/api/delivery/orders/:id", async (req, res, next) => {
     const order = await getDeliveryOrder(req.params.id);
     if (!order) return res.status(404).json({ error: "Delivery order not found" });
     res.json(order);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/receiving/sync", async (req, res, next) => {
+  try {
+    const orderType = req.body?.orderType === "transfer_order" ? "transfer_order" : "purchase_order";
+    const synced = orderType === "transfer_order"
+      ? await syncTransferReceiving({
+          sourceLocationId: req.body?.sourceLocationId || null,
+          destinationLocationId: req.body?.destinationLocationId || req.body?.locationId || null
+        })
+      : await syncPurchaseReceiving({ locationId: req.body?.destinationLocationId || req.body?.locationId || 1 });
+    await writeAudit({
+      actorOperatorId: req.operator.id,
+      source: "receiving",
+      action: "operator.receiving_sync",
+      details: { orderType, synced }
+    });
+    res.json({ synced });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/receiving/vendors", async (req, res, next) => {
+  try {
+    res.json(await listReceivingVendors({ destinationLocationId: req.query.destinationLocationId || req.query.locationId || null }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/receiving/sources", async (req, res, next) => {
+  try {
+    res.json(await listReceivingSources({ destinationLocationId: req.query.destinationLocationId || req.query.locationId || null }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/receiving/orders", async (req, res, next) => {
+  try {
+    const orderType = req.query.orderType === "transfer_order" ? "transfer_order" : "purchase_order";
+    res.json(await listReceivingOrders({
+      orderType,
+      vendor: req.query.vendor || null,
+      sourceLocationId: req.query.sourceLocationId || null,
+      destinationLocationId: req.query.destinationLocationId || req.query.locationId || null,
+      search: req.query.search || null,
+      itemSearch: req.query.itemSearch || null
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/receiving/items", async (req, res, next) => {
+  try {
+    const orderType = req.query.orderType === "transfer_order" ? "transfer_order" : "purchase_order";
+    res.json(await searchReceivingItems({
+      orderType,
+      vendor: req.query.vendor || null,
+      sourceLocationId: req.query.sourceLocationId || null,
+      destinationLocationId: req.query.destinationLocationId || req.query.locationId || null,
+      search: req.query.search || ""
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/receiving/orders/:id/sync", async (req, res, next) => {
+  try {
+    const synced = await syncReceivingOrderDetails(req.params.id, {
+      orderType: req.body?.orderType || req.query.orderType || null,
+      locationId: req.body?.locationId || req.query.locationId || req.body?.destinationLocationId || req.query.destinationLocationId || null,
+      sourceLocationId: req.body?.sourceLocationId || req.query.sourceLocationId || null
+    });
+    await writeAudit({
+      actorOperatorId: req.operator.id,
+      source: "receiving",
+      action: "operator.receiving_order_sync",
+      details: { receivingOrderId: req.params.id, synced }
+    });
+    res.json({ synced });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/receiving/orders/:id", async (req, res, next) => {
+  try {
+    const order = await getReceivingOrder(req.params.id);
+    if (!order) return res.status(404).json({ error: "Receiving order not found" });
+    res.json(order);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/receiving/orders/:id/lines/:lineId/confirm", async (req, res, next) => {
+  try {
+    res.json(await confirmReceivingLine(req.params.id, req.params.lineId, req.body || {}, operatorId(req)));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/receiving/orders/:id/receive", async (req, res, next) => {
+  try {
+    const jobId = crypto.randomUUID();
+    receivingJobs.set(jobId, {
+      id: jobId,
+      status: "running",
+      orderId: req.params.id,
+      stage: "queued",
+      message: "Receiving request received.",
+      startedAt: new Date().toISOString()
+    });
+    res.json({ jobId, status: "running" });
+    Promise.resolve().then(async () => {
+      const result = await runReceivingReceipt(req.params.id, req.body || {}, operatorId(req), jobId);
+      updateReceivingJob(jobId, {
+        status: "complete",
+        stage: "complete",
+        message: result.itemReceiptTranid ? `Created ${result.itemReceiptTranid}.` : "Item Receipt created.",
+        result,
+        completedAt: new Date().toISOString()
+      });
+    }).catch(async (error) => {
+      const job = receivingJobs.get(jobId);
+      await recordReceivingReceiptFailure(req.params.id, operatorId(req), {
+        photoDataUrls: req.body?.photoDataUrls,
+        payload: job?.payload,
+        error,
+        stage: job?.stage
+      });
+      updateReceivingJob(jobId, {
+        status: "error",
+        stage: "error",
+        message: error.message,
+        error: error.message,
+        completedAt: new Date().toISOString()
+      });
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/receiving/receipt-jobs/:jobId", async (req, res, next) => {
+  try {
+    const job = receivingJobs.get(req.params.jobId);
+    if (!job) return res.status(404).json({ error: "Receiving job not found" });
+    res.json(job);
   } catch (error) {
     next(error);
   }
@@ -557,6 +886,70 @@ app.get("/api/delivery/fulfillment-jobs/:jobId", async (req, res, next) => {
   }
 });
 
+async function runReceivingReceipt(orderId, body, currentOperatorId, jobId) {
+  updateReceivingJob(jobId, { stage: "sync", message: "Checking latest received quantity from NetSuite." });
+  await syncReceivingOrderDetails(orderId, {
+    orderType: body?.orderType || null,
+    locationId: body?.locationId || body?.destinationLocationId || null,
+    sourceLocationId: body?.sourceLocationId || null
+  });
+  updateReceivingJob(jobId, { stage: "validating", message: "Checking confirmed receiving lines." });
+  const order = await getReceivableReceivingOrder(orderId);
+  updateReceivingJob(jobId, {
+    stage: "payload",
+    message: `Building item receipt for ${order.receivableLines.length} confirmed line(s).`
+  });
+  const payload = buildItemReceiptPayload(order, order.receivableLines);
+  updateReceivingJob(jobId, {
+    stage: "netsuite_post",
+    message: "Posting Item Receipt to NetSuite.",
+    payload,
+    payloadSummary: {
+      receiveLines: payload.item.items.filter((item) => item.itemReceive !== false).length,
+      skipLines: payload.item.items.filter((item) => item.itemReceive === false).length
+    }
+  });
+  const netSuiteResult = order.order_type === "transfer_order"
+    ? await transformTransferOrderToItemReceipt(orderId, payload)
+    : await transformPurchaseOrderToItemReceipt(orderId, payload);
+  updateReceivingJob(jobId, {
+    stage: "netsuite_read",
+    message: "Reading IR number from NetSuite.",
+    itemReceiptId: netSuiteResult.id
+  });
+  const receipt = netSuiteResult.id ? await fetchItemReceiptFromNetSuite(netSuiteResult.id) : null;
+  const itemReceiptTranid = receipt?.tranId || receipt?.tranid || receipt?.id || null;
+  updateReceivingJob(jobId, {
+    stage: "recording",
+    message: itemReceiptTranid ? `Recording ${itemReceiptTranid} locally.` : "Recording item receipt locally.",
+    itemReceiptId: netSuiteResult.id,
+    itemReceiptTranid
+  });
+  const record = await recordReceivingReceipt(orderId, currentOperatorId, {
+    photoDataUrls: body?.photoDataUrls,
+    payload,
+    response: { netSuiteResult, receipt },
+    itemReceiptId: netSuiteResult.id,
+    itemReceiptTranid
+  });
+  updateReceivingJob(jobId, {
+    stage: "sync_deferred",
+    message: "Receipt recorded. Order sync is continuing in background.",
+    itemReceiptId: record.itemReceiptId,
+    itemReceiptTranid: record.itemReceiptTranid
+  });
+  Promise.resolve().then(async () => {
+    await syncReceivingOrderDetails(orderId, {
+      orderType: order.order_type,
+      locationId: order.destination_location_id,
+      sourceLocationId: order.source_location_id
+    });
+  }).catch((error) => {
+    console.error("Receiving follow-up sync failed:", error.message);
+  });
+  return record;
+}
+
 async function runDeliveryFulfillment(orderId, body, currentOperatorId, jobId) {
     updateFulfillmentJob(jobId, { stage: "validating", message: "Checking packed lines." });
     let order;
@@ -591,11 +984,13 @@ async function runDeliveryFulfillment(orderId, body, currentOperatorId, jobId) {
       message: "Posting Item Fulfillment to NetSuite.",
       payload,
       payloadSummary: {
-        receiveLines: payload.item.items.filter((item) => item.itemreceive !== false).length,
-        skipLines: payload.item.items.filter((item) => item.itemreceive === false).length
+        receiveLines: payload.item.items.filter((item) => item.itemReceive !== false && item.itemreceive !== false).length,
+        skipLines: payload.item.items.filter((item) => item.itemReceive === false || item.itemreceive === false).length
       }
     });
-    const netSuiteResult = await transformSalesOrderToItemFulfillment(orderId, payload);
+    const netSuiteResult = order.order_type === "transfer_order"
+      ? await transformTransferOrderToItemFulfillment(orderId, payload)
+      : await transformSalesOrderToItemFulfillment(orderId, payload);
     updateFulfillmentJob(jobId, {
       stage: "netsuite_read",
       message: "Reading IF number from NetSuite.",
@@ -624,10 +1019,14 @@ async function runDeliveryFulfillment(orderId, body, currentOperatorId, jobId) {
       itemFulfillmentTranid: record.itemFulfillmentTranid
     });
     Promise.resolve().then(async () => {
-      const syncedOrder = await fetchDeliveryOrderFromNetSuite(orderId, locationId);
+      const syncedOrder = order.order_type === "transfer_order"
+        ? await fetchTransferDeliveryOrderFromNetSuite(orderId, locationId)
+        : await fetchDeliveryOrderFromNetSuite(orderId, locationId);
       if (syncedOrder) await upsertDeliveryOrders([syncedOrder]);
       else await markDeliveryOrderMissing(orderId);
-      const syncedLines = await fetchDeliveryOrderDetailsFromNetSuite(orderId, locationId);
+      const syncedLines = order.order_type === "transfer_order"
+        ? await fetchTransferOrderDetailsFromNetSuite(orderId, locationId)
+        : await fetchDeliveryOrderDetailsFromNetSuite(orderId, locationId);
       await upsertDeliveryOrderLines(orderId, syncedLines);
       await markMissingDeliveryOrderLines(orderId, syncedLines.map((line) => line.line_id));
     }).catch((error) => {

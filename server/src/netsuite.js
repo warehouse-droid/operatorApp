@@ -50,6 +50,127 @@ ORDER BY t.trandate DESC
 `;
 }
 
+function purchaseOrderListQuery(locationId = 1) {
+  const id = Number(locationId);
+  if (!Number.isInteger(id) || id <= 0) {
+    throw new Error("A valid numeric NetSuite location ID is required.");
+  }
+  return `
+SELECT DISTINCT
+  t.id,
+  t.tranid,
+  t.trandate,
+  t.entity AS vendor_id,
+  BUILTIN.DF(t.entity) AS vendor,
+  t.status,
+  BUILTIN.DF(t.status) AS status_text,
+  t.foreigntotal,
+  tl.location AS destination_location_id,
+  BUILTIN.DF(tl.location) AS destination_location
+FROM transaction t
+INNER JOIN transactionline tl ON tl.transaction = t.id
+WHERE t.type = 'PurchOrd'
+  AND tl.item IS NOT NULL
+  AND tl.location = ${id}
+  AND tl.mainline = 'F'
+  AND (tl.taxline = 'F' OR tl.taxline IS NULL)
+  AND t.status = 'B'
+ORDER BY t.trandate DESC, t.tranid DESC
+`;
+}
+
+function transferOrderListQuery({ statusText, sourceLocationId = null, destinationLocationId = null, lineLocationId = null } = {}) {
+  const sourceFilter = sourceLocationId ? `AND t.location = ${Number(sourceLocationId)}` : "";
+  const destinationFilter = destinationLocationId ? `AND t.transferlocation = ${Number(destinationLocationId)}` : "";
+  const lineLocationFilter = lineLocationId ? `AND tl.location = ${Number(lineLocationId)}` : "";
+  return `
+SELECT DISTINCT
+  t.id,
+  t.tranid,
+  t.trandate,
+  t.status,
+  BUILTIN.DF(t.status) AS status_text,
+  t.location AS source_location_id,
+  BUILTIN.DF(t.location) AS source_location,
+  tl.location AS line_location_id,
+  BUILTIN.DF(tl.location) AS line_location,
+  t.transferlocation AS destination_location_id,
+  BUILTIN.DF(t.transferlocation) AS destination_location
+FROM transaction t
+INNER JOIN transactionline tl ON tl.transaction = t.id
+WHERE t.type = 'TrnfrOrd'
+  AND tl.item IS NOT NULL
+  AND tl.quantity < 0
+  AND tl.mainline = 'F'
+  AND tl.taxline = 'F'
+  AND BUILTIN.DF(t.status) LIKE '%${statusText}%'
+  ${sourceFilter}
+  ${destinationFilter}
+  ${lineLocationFilter}
+ORDER BY t.trandate DESC, t.tranid DESC
+`;
+}
+
+function toNumber(value) {
+  if (value === null || value === undefined || value === "") return 0;
+  return Math.abs(Number(String(value).replaceAll(",", ""))) || 0;
+}
+
+function derivePackQuantitiesFromConversion(line) {
+  if (toNumber(line.pallet_qty) || toNumber(line.layer_qty) || toNumber(line.section_qty) || toNumber(line.piece_qty)) {
+    return line;
+  }
+  let remaining = toNumber(line.quantity);
+  const next = { ...line };
+  const conversions = [
+    ["pallet_qty", "to_plt"],
+    ["layer_qty", "to_lyr"],
+    ["section_qty", "to_sec"],
+    ["piece_qty", "to_pcs"]
+  ];
+  for (const [qtyField, conversionField] of conversions) {
+    const conversion = toNumber(line[conversionField]);
+    if (!conversion || remaining <= 0) continue;
+    const units = Math.floor((remaining / conversion) + 0.000001);
+    if (units > 0) {
+      next[qtyField] = units;
+      remaining = Number((remaining - (units * conversion)).toFixed(6));
+    }
+  }
+  if (!toNumber(next.pallet_qty) && !toNumber(next.layer_qty) && !toNumber(next.section_qty) && !toNumber(next.piece_qty)) {
+    next.piece_qty = toNumber(line.quantity);
+  }
+  return next;
+}
+
+function normalizeTransferDetailLines(lines, { sourceLocationId = null, destinationLocationId = null } = {}) {
+  const filtered = lines.filter((line) => {
+    const quantity = Number(String(line.quantity || 0).replaceAll(",", ""));
+    if (sourceLocationId && String(line.location_id) === String(sourceLocationId)) return quantity < 0;
+    if (destinationLocationId && String(line.location_id) === String(destinationLocationId)) return quantity > 0;
+    return true;
+  });
+  const seen = new Set();
+  return filtered
+    .map((line) => ({ ...line, quantity: toNumber(line.quantity) }))
+    .filter((line) => {
+      const key = [
+        line.item_id,
+        line.location_id,
+        line.quantity,
+        line.item_description || "",
+        line.pallet_qty || "",
+        line.layer_qty || "",
+        line.section_qty || "",
+        line.piece_qty || ""
+      ].join("|");
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .map(derivePackQuantitiesFromConversion);
+}
+
 export function buildAuthorizationUrl() {
   requireConfig([
     "netsuite.clientId",
@@ -189,7 +310,7 @@ async function netsuiteRest(path, { method = "GET", body = null, headers = {} } 
       throw lastError;
     }
     const location = response.headers.get("location") || "";
-    const idMatch = location.match(/\/itemFulfillment\/(\d+)/i);
+    const idMatch = location.match(/\/(?:itemFulfillment|itemReceipt)\/(\d+)/i);
     return { status: response.status, location, id: idMatch ? Number(idMatch[1]) : null, data };
   }
   throw lastError;
@@ -209,11 +330,65 @@ export async function transformSalesOrderToItemFulfillment(orderId, payload) {
   return result;
 }
 
+export async function transformTransferOrderToItemFulfillment(orderId, payload) {
+  const id = Number(orderId);
+  if (!Number.isInteger(id) || id <= 0) {
+    throw new Error("A valid numeric NetSuite transfer order ID is required.");
+  }
+  const run = () => netsuiteRest(`/record/v1/transferorder/${id}/!transform/itemfulfillment`, {
+    method: "POST",
+    body: payload
+  });
+  const result = restMutationQueue.then(run, run);
+  restMutationQueue = result.catch(() => {});
+  return result;
+}
+
+export async function transformPurchaseOrderToItemReceipt(orderId, payload) {
+  const id = Number(orderId);
+  if (!Number.isInteger(id) || id <= 0) {
+    throw new Error("A valid numeric NetSuite purchase order ID is required.");
+  }
+  const run = () => netsuiteRest(`/record/v1/purchaseorder/${id}/!transform/itemreceipt`, {
+    method: "POST",
+    body: payload
+  });
+  const result = restMutationQueue.then(run, run);
+  restMutationQueue = result.catch(() => {});
+  return result;
+}
+
+export async function transformTransferOrderToItemReceipt(orderId, payload) {
+  const id = Number(orderId);
+  if (!Number.isInteger(id) || id <= 0) {
+    throw new Error("A valid numeric NetSuite transfer order ID is required.");
+  }
+  const run = () => netsuiteRest(`/record/v1/transferorder/${id}/!transform/itemreceipt`, {
+    method: "POST",
+    body: payload
+  });
+  const result = restMutationQueue.then(run, run);
+  restMutationQueue = result.catch(() => {});
+  return result;
+}
+
 export async function fetchItemFulfillmentFromNetSuite(itemFulfillmentId) {
   const id = Number(itemFulfillmentId);
   if (!Number.isInteger(id) || id <= 0) return null;
   try {
     const result = await netsuiteRest(`/record/v1/itemFulfillment/${id}`, { method: "GET" });
+    return result.data || null;
+  } catch (error) {
+    if (String(error.message).includes("NetSuite REST failed: 404")) return null;
+    throw error;
+  }
+}
+
+export async function fetchItemReceiptFromNetSuite(itemReceiptId) {
+  const id = Number(itemReceiptId);
+  if (!Number.isInteger(id) || id <= 0) return null;
+  try {
+    const result = await netsuiteRest(`/record/v1/itemReceipt/${id}`, { method: "GET" });
     return result.data || null;
   } catch (error) {
     if (String(error.message).includes("NetSuite REST failed: 404")) return null;
@@ -274,6 +449,24 @@ export async function fetchDeliveryOrdersFromNetSuite(locationId = 1) {
   return result.items || [];
 }
 
+export async function fetchTransferDeliveryOrdersFromNetSuite(locationId = 1) {
+  const result = await suiteql(transferOrderListQuery({ statusText: "Pending Fulfillment", lineLocationId: locationId }));
+  return (result.items || []).map((order) => ({
+    ...order,
+    order_type: "transfer_order",
+    customer_id: order.destination_location_id,
+    customer: `Transfer to ${order.destination_location || ""}`.trim(),
+    order_location_id: order.destination_location_id,
+    order_location: order.destination_location,
+    source_location_id: order.line_location_id || order.source_location_id,
+    source_location: order.line_location || order.source_location,
+    outbound_location_id: order.line_location_id || order.source_location_id,
+    outbound_location: order.line_location || order.source_location,
+    delivery_method_id: null,
+    delivery_method: "Transfer Order"
+  }));
+}
+
 export async function fetchDeliveryOrderFromNetSuite(orderId, locationId = null) {
   const id = Number(orderId);
   if (!Number.isInteger(id) || id <= 0) {
@@ -311,6 +504,53 @@ export async function fetchDeliveryOrderFromNetSuite(orderId, locationId = null)
   return result.items?.[0] || null;
 }
 
+export async function fetchTransferDeliveryOrderFromNetSuite(orderId, locationId = null) {
+  const id = Number(orderId);
+  if (!Number.isInteger(id) || id <= 0) {
+    throw new Error("A valid numeric NetSuite transfer order ID is required.");
+  }
+  const locationFilter = locationId ? `AND tl.location = ${Number(locationId)}` : "";
+  const result = await suiteql(`
+    SELECT DISTINCT
+      t.id,
+      t.tranid,
+      t.trandate,
+      t.status,
+      BUILTIN.DF(t.status) AS status_text,
+      t.location AS source_location_id,
+      BUILTIN.DF(t.location) AS source_location,
+      tl.location AS line_location_id,
+      BUILTIN.DF(tl.location) AS line_location,
+      t.transferlocation AS destination_location_id,
+      BUILTIN.DF(t.transferlocation) AS destination_location
+    FROM transaction t
+    INNER JOIN transactionline tl ON tl.transaction = t.id
+    WHERE t.id = ${id}
+      AND t.type = 'TrnfrOrd'
+      AND tl.item IS NOT NULL
+      AND tl.mainline = 'F'
+      AND tl.taxline = 'F'
+      ${locationFilter}
+    ORDER BY t.trandate DESC
+  `);
+  const order = result.items?.[0];
+  if (!order) return null;
+  return {
+    ...order,
+    order_type: "transfer_order",
+    customer_id: order.destination_location_id,
+    customer: `Transfer to ${order.destination_location || ""}`.trim(),
+    order_location_id: order.destination_location_id,
+    order_location: order.destination_location,
+    source_location_id: order.line_location_id || order.source_location_id,
+    source_location: order.line_location || order.source_location,
+    outbound_location_id: order.line_location_id || order.source_location_id,
+    outbound_location: order.line_location || order.source_location,
+    delivery_method_id: null,
+    delivery_method: "Transfer Order"
+  };
+}
+
 export async function fetchDeliveryOrderDetailsFromNetSuite(orderId, locationId = null) {
   const id = Number(orderId);
   if (!Number.isInteger(id) || id <= 0) {
@@ -327,6 +567,7 @@ export async function fetchDeliveryOrderDetailsFromNetSuite(orderId, locationId 
       BUILTIN.DF(i.itemtype) AS item_type_text,
       tl.memo AS item_description,
       tl.quantity,
+      tl.quantityshiprecv AS netsuite_received_qty,
       BUILTIN.DF(tl.units) AS unit,
       tl.location AS location_id,
       BUILTIN.DF(tl.location) AS location,
@@ -350,6 +591,183 @@ export async function fetchDeliveryOrderDetailsFromNetSuite(orderId, locationId 
 
   const result = await suiteql(detailQuery);
   return result.items || [];
+}
+
+export async function fetchTransferOrderDetailsFromNetSuite(orderId, locationId = null, { direction = "source" } = {}) {
+  const id = Number(orderId);
+  if (!Number.isInteger(id) || id <= 0) {
+    throw new Error("A valid numeric NetSuite transfer order ID is required.");
+  }
+  const locationFilter = locationId ? `AND tl.location = ${Number(locationId)}` : "";
+
+  const result = await suiteql(`
+    SELECT
+      tl.id AS line_id,
+      tl.item AS item_id,
+      BUILTIN.DF(tl.item) AS item_name,
+      i.itemtype AS item_type,
+      BUILTIN.DF(i.itemtype) AS item_type_text,
+      tl.memo AS item_description,
+      tl.quantity,
+      tl.quantityshiprecv AS netsuite_received_qty,
+      BUILTIN.DF(tl.units) AS unit,
+      tl.location AS location_id,
+      BUILTIN.DF(tl.location) AS location,
+      tl.custcol_plt AS pallet_qty,
+      tl.custcol_lyr AS layer_qty,
+      tl.custcol_pcs AS piece_qty,
+      tl.custcol_sec AS section_qty,
+      i.custitem_toplt AS to_plt,
+      i.custitem_tolyr AS to_lyr,
+      i.custitem_tosec AS to_sec,
+      i.custitem_topcs AS to_pcs
+    FROM transactionline tl
+    LEFT JOIN item i ON i.id = tl.item
+    WHERE tl.transaction = ${id}
+      AND tl.item IS NOT NULL
+      AND tl.mainline = 'F'
+      AND tl.taxline = 'F'
+      ${locationFilter}
+    ORDER BY tl.id
+  `);
+  return normalizeTransferDetailLines(result.items || [], direction === "destination"
+    ? { destinationLocationId: locationId }
+    : { sourceLocationId: locationId });
+}
+
+export async function fetchPurchaseOrdersFromNetSuite(locationId = 1) {
+  const result = await suiteql(purchaseOrderListQuery(locationId));
+  return (result.items || []).map((order) => ({ ...order, order_type: "purchase_order" }));
+}
+
+export async function fetchPurchaseOrderFromNetSuite(orderId, locationId = null) {
+  const id = Number(orderId);
+  if (!Number.isInteger(id) || id <= 0) {
+    throw new Error("A valid numeric NetSuite purchase order ID is required.");
+  }
+  const locationFilter = locationId ? `AND tl.location = ${Number(locationId)}` : "";
+  const result = await suiteql(`
+    SELECT DISTINCT
+      t.id,
+      t.tranid,
+      t.trandate,
+      t.entity AS vendor_id,
+      BUILTIN.DF(t.entity) AS vendor,
+      t.status,
+      BUILTIN.DF(t.status) AS status_text,
+      t.foreigntotal,
+      tl.location AS destination_location_id,
+      BUILTIN.DF(tl.location) AS destination_location
+    FROM transaction t
+    INNER JOIN transactionline tl ON tl.transaction = t.id
+    WHERE t.id = ${id}
+      AND t.type = 'PurchOrd'
+      AND tl.item IS NOT NULL
+      AND tl.mainline = 'F'
+      AND (tl.taxline = 'F' OR tl.taxline IS NULL)
+      ${locationFilter}
+    ORDER BY t.trandate DESC
+  `);
+  const order = result.items?.[0];
+  return order ? { ...order, order_type: "purchase_order" } : null;
+}
+
+export async function fetchPurchaseOrderDetailsFromNetSuite(orderId, locationId = null) {
+  const id = Number(orderId);
+  if (!Number.isInteger(id) || id <= 0) {
+    throw new Error("A valid numeric NetSuite purchase order ID is required.");
+  }
+  const locationFilter = locationId ? `AND tl.location = ${Number(locationId)}` : "";
+  const result = await suiteql(`
+    SELECT
+      tl.id AS line_id,
+      tl.item AS item_id,
+      BUILTIN.DF(tl.item) AS item_name,
+      i.itemtype AS item_type,
+      BUILTIN.DF(i.itemtype) AS item_type_text,
+      tl.memo AS item_description,
+      tl.quantity,
+      tl.quantityshiprecv AS netsuite_received_qty,
+      BUILTIN.DF(tl.units) AS unit,
+      tl.location AS location_id,
+      BUILTIN.DF(tl.location) AS location,
+      tl.custcol_plt AS pallet_qty,
+      tl.custcol_lyr AS layer_qty,
+      tl.custcol_pcs AS piece_qty,
+      tl.custcol_sec AS section_qty,
+      i.custitem_toplt AS to_plt,
+      i.custitem_tolyr AS to_lyr,
+      i.custitem_tosec AS to_sec,
+      i.custitem_topcs AS to_pcs
+    FROM transactionline tl
+    LEFT JOIN item i ON i.id = tl.item
+    WHERE tl.transaction = ${id}
+      AND tl.item IS NOT NULL
+      AND tl.mainline = 'F'
+      AND (tl.taxline = 'F' OR tl.taxline IS NULL)
+      ${locationFilter}
+    ORDER BY tl.id
+  `);
+  return result.items || [];
+}
+
+export async function fetchTransferReceivingOrdersFromNetSuite({ sourceLocationId = null, destinationLocationId = null } = {}) {
+  const result = await suiteql(transferOrderListQuery({
+    statusText: "Pending Receipt",
+    sourceLocationId,
+    destinationLocationId,
+    lineLocationId: sourceLocationId || null
+  }));
+  return (result.items || []).map((order) => ({
+    ...order,
+    order_type: "transfer_order",
+    source_location_id: order.line_location_id || order.source_location_id,
+    source_location: order.line_location || order.source_location,
+    vendor_id: order.line_location_id || order.source_location_id,
+    vendor: order.line_location || order.source_location
+  }));
+}
+
+export async function fetchTransferReceivingOrderFromNetSuite(orderId, sourceLocationId = null) {
+  const id = Number(orderId);
+  if (!Number.isInteger(id) || id <= 0) {
+    throw new Error("A valid numeric NetSuite transfer order ID is required.");
+  }
+  const sourceFilter = sourceLocationId ? `AND tl.location = ${Number(sourceLocationId)}` : "";
+  const result = await suiteql(`
+    SELECT DISTINCT
+      t.id,
+      t.tranid,
+      t.trandate,
+      t.status,
+      BUILTIN.DF(t.status) AS status_text,
+      t.location AS source_location_id,
+      BUILTIN.DF(t.location) AS source_location,
+      tl.location AS line_location_id,
+      BUILTIN.DF(tl.location) AS line_location,
+      t.transferlocation AS destination_location_id,
+      BUILTIN.DF(t.transferlocation) AS destination_location
+    FROM transaction t
+    INNER JOIN transactionline tl ON tl.transaction = t.id
+    WHERE t.id = ${id}
+      AND t.type = 'TrnfrOrd'
+      AND tl.item IS NOT NULL
+      AND tl.quantity < 0
+      AND tl.mainline = 'F'
+      AND tl.taxline = 'F'
+      ${sourceFilter}
+    ORDER BY t.trandate DESC
+  `);
+  const order = result.items?.[0];
+  if (!order) return null;
+  return {
+    ...order,
+    order_type: "transfer_order",
+    source_location_id: order.line_location_id || order.source_location_id,
+    source_location: order.line_location || order.source_location,
+    vendor_id: order.line_location_id || order.source_location_id,
+    vendor: order.line_location || order.source_location
+  };
 }
 
 export async function fetchInventoryBalancesFromNetSuite(locationIds = [1, 13]) {

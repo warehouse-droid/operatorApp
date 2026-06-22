@@ -1,10 +1,12 @@
 const LOCATIONS = [
   { id: 1, text: "3445" },
-  { id: 13, text: "2967" }
+  { id: 13, text: "2967" },
+  { id: 15, text: "12441" }
 ];
 
 const ORDER_PAGE_SIZE = 4;
 const LINE_PAGE_SIZE = 3;
+const HISTORY_PAGE_SIZE = 5;
 const PICKABLE_ITEM_TYPES = new Set(["InvtPart", "NonInvtPart"]);
 
 const app = document.getElementById("app");
@@ -17,6 +19,7 @@ let operator = null;
 let locationId = Number(localStorage.getItem("mbbs.operator.locationId") || localStorage.getItem("mbbs.delivery.locationId") || 0);
 let currentModule = "menu";
 let viewMode = "active";
+let deliveryOrderType = localStorage.getItem("mbbs.operator.deliveryOrderType") || "sales_order";
 let orders = [];
 let selectedId = null;
 let selectedOrder = null;
@@ -47,6 +50,38 @@ let cyclePage = 0;
 let activeCycleUnit = "";
 let cycleValues = {};
 let cycleConfirming = false;
+
+let receivingStep = "type";
+let receivingOrderType = "purchase_order";
+let receivingVendors = [];
+let receivingSources = [];
+let receivingOrders = [];
+let receivingSelectedVendor = "";
+let receivingSelectedSourceId = "";
+let receivingSelectedId = null;
+let receivingSelectedOrder = null;
+let receivingSearch = "";
+let receivingItemSearch = "";
+let receivingItemSuggestions = [];
+let receivingOrderPage = 0;
+let receivingLinePage = 0;
+let receivingSelectedLineId = null;
+let receiptOrder = null;
+let receiptPhotoDataUrls = [];
+let receiptActivePhotoSlot = 0;
+let receiptSubmitting = false;
+let receiptResult = null;
+let receiptCameraStream = null;
+let receiptCameraActive = false;
+let receiptStatusText = "";
+let receiptJobStage = "";
+let receiptStartedAt = 0;
+let receiptProgressTimer = null;
+let personalHistory = [];
+let personalHistoryDate = new Date().toISOString().slice(0, 10);
+let selectedHistoryId = "";
+let historyReportReason = "";
+let historyPage = 0;
 
 function showToast(message) {
   toast.textContent = message;
@@ -127,6 +162,15 @@ function orderStatusClass(order) {
 function formatDate(value) {
   if (!value) return "";
   return new Date(value).toLocaleDateString();
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
 }
 
 function qty(value) {
@@ -251,7 +295,29 @@ function panelValue(line, unit) {
 }
 
 function panelLimit(line, unit) {
+  if (currentModule === "receiving") return receivingRemainingValue(line, unit);
   return viewMode === "packed" ? requiredValue(line, unit) : remainingValue(line, unit);
+}
+
+function receivingRemainingSalesQty(line) {
+  return Math.max(0, qty(line.quantity) - qty(line.netsuite_received_qty));
+}
+
+function receivingRemainingValue(line, unit) {
+  const remainingSales = receivingRemainingSalesQty(line);
+  if (unit === "sales") return remainingSales;
+  const required = requiredValue(line, unit);
+  const conversion = unit === "pallets" ? qty(line.to_plt)
+    : unit === "layers" ? qty(line.to_lyr)
+    : unit === "sections" ? qty(line.to_sec)
+    : unit === "pieces" ? qty(line.to_pcs) || 1
+    : 0;
+  if (!conversion) return required;
+  return Math.max(0, Math.min(required, Math.floor((remainingSales / conversion) + 0.000001)));
+}
+
+function hasReceivingRemainingQty(line) {
+  return receivingRemainingSalesQty(line) > 0;
 }
 
 function currentOrderBlocksMove() {
@@ -337,10 +403,15 @@ function render() {
   if (!locationId) return renderLocationSelect();
   if (currentModule === "menu") return renderMenu();
   if (currentModule === "cycle-count") return renderCycleCount();
+  if (currentModule === "delivery-select") return renderDeliverySelect();
+  if (currentModule === "receiving") return renderReceiving();
+  if (currentModule === "receiving-receipt") return renderReceiptScreen();
+  if (currentModule === "return-select") return renderReturnSelect();
+  if (currentModule === "personal-history") return renderPersonalHistory();
   if (currentModule === "delivery-fulfill") return renderFulfillmentScreen();
 
   const title = viewMode === "packed" ? "Packed Orders" : "Delivery Prep";
-  const subtitle = `Location ${currentLocation()?.text || locationId}`;
+  const subtitle = `${deliveryOrderType === "transfer_order" ? "Transfer Order" : "Sales Order"} | Location ${currentLocation()?.text || locationId}`;
   const topWarnings = viewMode === "packed" ? warningOrders() : [];
   const actions = `
     ${topWarnings.length ? `<button class="top-warning-button" data-action="open-warning-order" data-order="${topWarnings[0].netsuite_id}" type="button">Warning ${topWarnings.length}</button>` : ""}
@@ -382,13 +453,13 @@ function renderMenu() {
         <strong>Delivery Prep</strong>
         <span>Pack delivery orders for drivers.</span>
       </button>
-      <button class="module-tile" data-action="open-module" data-module="pallet-return" type="button">
-        <strong>Pallet Return</strong>
-        <span>Record returned pallets.</span>
+      <button class="module-tile" data-action="open-module" data-module="return" type="button">
+        <strong>Return</strong>
+        <span>Pallet return or stock return.</span>
       </button>
-      <button class="module-tile" data-action="open-module" data-module="stock-return" type="button">
-        <strong>Stock Return</strong>
-        <span>Return stock by sales order.</span>
+      <button class="module-tile" data-action="open-module" data-module="personal-history" type="button">
+        <strong>Personal History</strong>
+        <span>Review your submitted IF, IR and count records.</span>
       </button>
     </section>
   `, `
@@ -396,6 +467,251 @@ function renderMenu() {
     <button class="secondary-button" data-action="change-location" type="button">Location</button>
     <button class="secondary-button" data-action="logout" type="button">${operator.display_name}</button>
   `);
+}
+
+function renderReturnSelect() {
+  shell("Return", `Location ${currentLocation()?.text || locationId}`, `
+    <section class="module-menu two-up">
+      <button class="module-tile" data-action="open-module" data-module="pallet-return" type="button">
+        <strong>Pallet Return</strong>
+        <span>Record returned pallets from customer.</span>
+      </button>
+      <button class="module-tile" data-action="open-module" data-module="stock-return" type="button">
+        <strong>Stock Return</strong>
+        <span>Return stock by sales order.</span>
+      </button>
+    </section>
+  `, `
+    <button class="secondary-button" data-action="main-menu" type="button">Menu</button>
+    <button class="secondary-button" data-action="logout" type="button">${operator.display_name}</button>
+  `);
+}
+
+function renderDeliverySelect() {
+  shell("Delivery Prep", `Location ${currentLocation()?.text || locationId}`, `
+    <section class="module-menu two-up">
+      <button class="module-tile" data-action="select-delivery-type" data-order-type="sales_order" type="button">
+        <strong>Sales Order</strong>
+        <span>Prepare customer delivery orders.</span>
+      </button>
+      <button class="module-tile" data-action="select-delivery-type" data-order-type="transfer_order" type="button">
+        <strong>Transfer Order</strong>
+        <span>Prepare stock transfer to another yard.</span>
+      </button>
+    </section>
+  `, `
+    <button class="secondary-button" data-action="main-menu" type="button">Menu</button>
+    <button class="secondary-button" data-action="logout" type="button">${operator.display_name}</button>
+  `);
+}
+
+function receivingTypeLabel() {
+  return receivingOrderType === "transfer_order" ? "Transfer Order" : "Purchase Order";
+}
+
+function renderReceiving() {
+  shell("Receiving", `${receivingTypeLabel()} | Location ${currentLocation()?.text || locationId}`, `
+    <section class="receiving-shell">
+      <div class="receiving-toolbar">
+        <button class="secondary-button" data-action="main-menu" type="button">Menu</button>
+        <button class="secondary-button" data-action="receiving-back" type="button">Back</button>
+        <label class="receiving-search">
+          <span>Search PO / TO number</span>
+          <input id="receivingSearch" value="${receivingSearch}" placeholder="Tap keypad or type order number..." />
+        </label>
+        <label class="receiving-search receiving-search-with-dropdown">
+          <span>Search product</span>
+          <input id="receivingItemSearch" value="${receivingItemSearch}" placeholder="Item autocomplete..." />
+          ${receivingItemSuggestions.length ? `
+            <div class="autocomplete-dropdown">
+              ${receivingItemSuggestions.map((item) => `
+                <button data-action="receiving-pick-item" data-item="${item.item_name}" type="button">
+                  <strong>${item.item_name}</strong>
+                  <span>${item.order_count} PO/TO</span>
+                </button>
+              `).join("")}
+            </div>
+          ` : ""}
+        </label>
+        <button class="primary-button" data-action="sync-receiving" type="button">Sync</button>
+      </div>
+      ${renderReceivingMain()}
+    </section>
+  `, `
+    <button class="secondary-button" data-action="logout" type="button">${operator.display_name}</button>
+  `);
+}
+
+function renderReceivingMain() {
+  if (receivingStep === "type") {
+    return `
+      <section class="module-menu two-up compact-menu">
+        <button class="module-tile" data-action="select-receiving-type" data-order-type="purchase_order" type="button">
+          <strong>Purchase Order</strong>
+          <span>Receive vendor purchase orders.</span>
+        </button>
+        <button class="module-tile" data-action="select-receiving-type" data-order-type="transfer_order" type="button">
+          <strong>Transfer Order</strong>
+          <span>Receive stock sent from another yard.</span>
+        </button>
+      </section>
+    `;
+  }
+  if (receivingStep === "vendor") {
+    const list = receivingOrderType === "transfer_order"
+      ? receivingSources.filter((item) => String(item.source_location_id) !== String(locationId))
+      : receivingVendors;
+    return `
+      <section class="receiving-option-grid">
+        ${list.map((item) => `
+          <button class="module-tile compact" data-action="${receivingOrderType === "transfer_order" ? "select-receiving-source" : "select-receiving-vendor"}" data-value="${receivingOrderType === "transfer_order" ? item.source_location_id : item.vendor}" type="button">
+            <strong>${receivingOrderType === "transfer_order" ? `From ${item.source_location}` : item.vendor}</strong>
+            <span>${item.order_count} open order</span>
+          </button>
+        `).join("") || `<div class="empty-state"><strong>No open orders</strong><span>Tap Sync to retrieve from NetSuite.</span></div>`}
+      </section>
+    `;
+  }
+  return renderReceivingOrders();
+}
+
+function renderReceivingOrders() {
+  const count = pageCount(receivingOrders, ORDER_PAGE_SIZE);
+  receivingOrderPage = Math.min(receivingOrderPage, count - 1);
+  const visible = pageItems(receivingOrders, receivingOrderPage, ORDER_PAGE_SIZE);
+  return `
+    <section class="receiving-grid">
+      <aside class="order-panel">
+        <div class="panel-title">
+          <div>
+            <span>${receivingSearch.trim() || receivingItemSearch.trim() ? "Orders" : receivingOrderType === "transfer_order" ? "Source" : "Vendor"}</span>
+            <strong>${receivingSearch.trim() || receivingItemSearch.trim()
+              ? "Search results"
+              : receivingOrderType === "transfer_order"
+                ? `From ${sourceLocationText(receivingSelectedSourceId)}`
+                : receivingSelectedVendor}</strong>
+          </div>
+          <strong>${receivingOrders.length}</strong>
+        </div>
+        <div class="number-pad compact-pad">
+          ${["1","2","3","4","5","6","7","8","9","Clear","0","Back"].map((key) => `
+            <button data-action="receiving-key" data-key="${key}" type="button">${key}</button>
+          `).join("")}
+        </div>
+        <div class="order-list">
+          ${visible.map((order) => `
+            <button class="order-card ${String(order.netsuite_id) === String(receivingSelectedId) ? "active" : ""}" data-receiving-order="${order.netsuite_id}" type="button">
+              <strong>${order.tranid}</strong>
+              <span class="muted">${formatDate(order.trandate)} | ${order.line_count || 0} line</span>
+              <span class="status-pill open">${order.status_text || "Pending Receipt"}</span>
+            </button>
+          `).join("") || `<div class="empty-state small"><strong>No order found</strong><span>Try another number or product.</span></div>`}
+        </div>
+        <div class="pagination-row">
+          <button class="secondary-button" data-action="receiving-order-prev" ${receivingOrderPage === 0 ? "disabled" : ""} type="button">Previous</button>
+          <strong>${receivingOrderPage + 1} / ${count}</strong>
+          <button class="secondary-button" data-action="receiving-order-next" ${receivingOrderPage >= count - 1 ? "disabled" : ""} type="button">Next</button>
+        </div>
+      </aside>
+      <section class="detail-panel">
+        ${receivingSelectedOrder ? renderReceivingDetail(receivingSelectedOrder) : `<div class="empty-state"><strong>Select order</strong><span>Tap an open receiving order.</span></div>`}
+      </section>
+    </section>
+  `;
+}
+
+function sourceLocationText(id) {
+  return LOCATIONS.find((location) => String(location.id) === String(id))?.text || "";
+}
+
+function renderReceivingDetail(order) {
+  const lines = (order.lines || []).filter((line) => isPickableLine(line) && hasReceivingRemainingQty(line));
+  if (!receivingSelectedLineId || !lines.some((line) => String(line.id) === String(receivingSelectedLineId))) {
+    receivingSelectedLineId = lines[0]?.id || null;
+  }
+  const selectedLine = lines.find((line) => String(line.id) === String(receivingSelectedLineId));
+  const count = pageCount(lines, LINE_PAGE_SIZE);
+  receivingLinePage = Math.min(receivingLinePage, count - 1);
+  const visible = pageItems(lines, receivingLinePage, LINE_PAGE_SIZE);
+  const confirmedLines = lines.filter((line) => hasReceivedQty(line) && hasReceivingRemainingQty(line));
+  return `
+    <div class="detail-header">
+      <div>
+        <h2>${order.tranid}</h2>
+        <p class="muted">${receivingOrderType === "transfer_order" ? `From ${order.source_location} to ${order.destination_location}` : order.vendor}</p>
+        <p class="muted">${formatDate(order.trandate)} | ${order.status_text}</p>
+      </div>
+      <button class="primary-button" data-action="start-receive" ${confirmedLines.length ? "" : "disabled"} type="button">Receive</button>
+    </div>
+    <div class="receiving-detail-grid">
+      <div class="line-column receiving-lines">
+        <div class="line-list">
+          ${visible.map((line) => renderReceivingLine(line)).join("") || `<div class="empty-state small"><strong>No item line</strong><span>This order has no receivable item line.</span></div>`}
+        </div>
+        <div class="pagination-row">
+          <button class="secondary-button" data-action="receiving-line-prev" ${receivingLinePage === 0 ? "disabled" : ""} type="button">Previous</button>
+          <strong>${receivingLinePage + 1} / ${count}</strong>
+          <button class="secondary-button" data-action="receiving-line-next" ${receivingLinePage >= count - 1 ? "disabled" : ""} type="button">Next</button>
+        </div>
+      </div>
+      ${selectedLine ? renderReceivingSelectedLinePanel(selectedLine) : `<aside class="selected-panel"><div class="empty-state small"><strong>Select line</strong></div></aside>`}
+    </div>
+  `;
+}
+
+function renderReceivingLine(line) {
+  const variable = lineVariableUnit(line);
+  return `
+    <button class="line-card ${String(receivingSelectedLineId) === String(line.id) ? "active" : ""} ${hasReceivedQty(line) ? "confirmed" : ""}" data-action="select-receiving-line" data-line="${line.id}" type="button">
+      <div class="line-info">
+        <strong>${line.sku || line.item_name}</strong>
+        <span>${line.item_description || ""}</span>
+        ${hasReceivedQty(line) ? `<em class="underpack-note">Confirmed</em>` : ""}
+      </div>
+      <div class="required-measures">
+        <div class="measure"><span>Open PLT</span><b>${displayQty(receivingRemainingValue(line, "pallets"))}</b></div>
+        ${variable ? `<div class="measure"><span>Open ${variable.label}</span><b>${displayQty(receivingRemainingValue(line, variable.packedKey))}</b></div>` : ""}
+      </div>
+    </button>
+  `;
+}
+
+function hasReceivedQty(line) {
+  return qty(line.received_pallet_qty) > 0
+    || qty(line.received_section_qty) > 0
+    || qty(line.received_layer_qty) > 0
+    || qty(line.received_piece_qty) > 0;
+}
+
+function receivingPanelValue(line, unit) {
+  if (unit === "pallets") return qty(line.received_pallet_qty) || receivingRemainingValue(line, "pallets");
+  if (unit === "sections") return qty(line.received_section_qty) || receivingRemainingValue(line, "sections");
+  if (unit === "layers") return qty(line.received_layer_qty) || receivingRemainingValue(line, "layers");
+  if (unit === "pieces") return qty(line.received_piece_qty) || receivingRemainingValue(line, "pieces");
+  if (unit === "sales") return qty(line.received_piece_qty) || receivingRemainingValue(line, "sales");
+  return 0;
+}
+
+function renderReceivingSelectedLinePanel(line) {
+  const variable = lineVariableUnit(line);
+  return `
+    <aside class="selected-panel" data-receiving-selected-line="${line.id}">
+      <div class="selected-header">
+        <span>Selected item</span>
+        <strong>${line.sku || line.item_name}</strong>
+        <p>${line.item_description || ""}</p>
+      </div>
+      <div class="selected-measures">
+        <div class="measure"><span>Open PLT</span><b>${displayQty(receivingRemainingValue(line, "pallets"))}</b></div>
+        ${variable ? `<div class="measure"><span>Open ${variable.label}</span><b>${displayQty(receivingRemainingValue(line, variable.packedKey))}</b></div>` : ""}
+      </div>
+      ${renderStepper("pallets", "Receive PLT", receivingPanelValue(line, "pallets"))}
+      ${variable?.packedKey ? renderStepper(variable.packedKey, `Receive ${variable.label}`, receivingPanelValue(line, variable.packedKey)) : ""}
+      <div class="selected-actions">
+        <button class="primary-button" data-action="confirm-receiving-line" data-line="${line.id}" type="button">Confirm line</button>
+      </div>
+    </aside>
+  `;
 }
 
 function cycleStepTitle() {
@@ -442,6 +758,14 @@ function renderCycleCount() {
 
 function focusCycleSearch() {
   const input = document.getElementById("cycleSearch");
+  if (!input) return;
+  input.focus();
+  const end = input.value.length;
+  input.setSelectionRange(end, end);
+}
+
+function focusReceivingInput(id) {
+  const input = document.getElementById(id);
   if (!input) return;
   input.focus();
   const end = input.value.length;
@@ -679,7 +1003,7 @@ function renderFulfillmentScreen() {
         <div class="fulfillment-card success">
           <span>Item Fulfillment</span>
           <strong>${fulfillmentResult.itemFulfillmentTranid || fulfillmentResult.itemFulfillmentId || "Created"}</strong>
-          <p>${fulfillmentResult.fulfillmentStatus === "partial_fulfilled" ? "Partial fulfilled. Remaining open qty will stay in Active." : "Fulfilled. This order will leave delivery prep."}</p>
+          <p>Fulfillment posted to NetSuite.</p>
         </div>
         <div class="selected-actions">
           <button class="primary-button" data-action="finish-fulfill" type="button">Back to Delivery</button>
@@ -789,7 +1113,7 @@ function renderStepper(unit, label, value) {
 
 async function loadOrders(options = {}) {
   const status = viewMode === "packed" ? "packed" : "active";
-  orders = await api(`/api/delivery/orders?locationId=${locationId}&status=${status}`);
+  orders = await api(`/api/delivery/orders?locationId=${locationId}&status=${status}&orderType=${deliveryOrderType}`);
   const preparing = preparingOrderId();
   if (viewMode === "active" && preparing) selectedId = preparing;
   else if (!options.keepSelection) selectedId = orders[0]?.netsuite_id || null;
@@ -799,6 +1123,103 @@ async function loadOrders(options = {}) {
   selectedOrder = null;
   if (selectedId) await loadDetail(selectedId, { silentRender: true });
   render();
+}
+
+async function loadReceivingOptions() {
+  if (receivingOrderType === "transfer_order") {
+    receivingSources = await api(`/api/receiving/sources?destinationLocationId=${locationId}`);
+    receivingVendors = [];
+  } else {
+    receivingVendors = await api(`/api/receiving/vendors?destinationLocationId=${locationId}`);
+    receivingSources = [];
+  }
+}
+
+function receivingOrderUrl() {
+  const url = new URL("/api/receiving/orders", window.location.origin);
+  url.searchParams.set("orderType", receivingOrderType);
+  const isSearching = receivingSearch.trim() || receivingItemSearch.trim();
+  if (receivingOrderType === "transfer_order") {
+    if (receivingSelectedSourceId && !isSearching) url.searchParams.set("sourceLocationId", receivingSelectedSourceId);
+    url.searchParams.set("destinationLocationId", locationId);
+  } else if (receivingSelectedVendor && !isSearching) {
+    url.searchParams.set("vendor", receivingSelectedVendor);
+  }
+  if (receivingOrderType === "purchase_order") url.searchParams.set("destinationLocationId", locationId);
+  if (receivingSearch.trim()) url.searchParams.set("search", receivingSearch.trim());
+  if (receivingItemSearch.trim()) url.searchParams.set("itemSearch", receivingItemSearch.trim());
+  return url.pathname + url.search;
+}
+
+async function loadReceivingOrders(options = {}) {
+  if (receivingSearch.trim() || receivingItemSearch.trim()) receivingStep = "orders";
+  receivingOrders = await api(receivingOrderUrl());
+  if (!options.keepSelection) receivingSelectedId = receivingOrders[0]?.netsuite_id || null;
+  if (receivingSelectedId && !receivingOrders.some((order) => String(order.netsuite_id) === String(receivingSelectedId))) {
+    receivingSelectedId = receivingOrders[0]?.netsuite_id || null;
+  }
+  receivingSelectedOrder = null;
+  if (receivingSelectedId) await loadReceivingDetail(receivingSelectedId, { silentRender: true });
+  render();
+}
+
+async function loadReceivingDetail(id, options = {}) {
+  receivingSelectedId = id;
+  await api(`/api/receiving/orders/${id}/sync`, {
+    method: "POST",
+    body: JSON.stringify({
+      orderType: receivingOrderType,
+      locationId,
+      destinationLocationId: locationId,
+      sourceLocationId: receivingSelectedSourceId || null
+    })
+  });
+  receivingSelectedOrder = await api(`/api/receiving/orders/${id}`);
+  if (!options.silentRender) render();
+}
+
+async function loadReceivingItemSuggestions() {
+  if (receivingItemSearch.trim().length < 2) {
+    receivingItemSuggestions = [];
+    return;
+  }
+  const url = new URL("/api/receiving/items", window.location.origin);
+  url.searchParams.set("orderType", receivingOrderType);
+  url.searchParams.set("search", receivingItemSearch.trim());
+  if (receivingOrderType === "transfer_order") {
+    url.searchParams.set("destinationLocationId", locationId);
+  }
+  if (receivingOrderType === "purchase_order") url.searchParams.set("destinationLocationId", locationId);
+  receivingItemSuggestions = await api(url.pathname + url.search);
+}
+
+async function syncReceiving() {
+  await api("/api/receiving/sync", {
+    method: "POST",
+    body: JSON.stringify({
+      orderType: receivingOrderType,
+      sourceLocationId: receivingSelectedSourceId || null,
+      locationId,
+      destinationLocationId: locationId
+    })
+  });
+  showToast("Receiving synced");
+  await loadReceivingOptions();
+  if (receivingStep === "orders") return loadReceivingOrders({ keepSelection: true });
+  render();
+}
+
+function pressReceivingKey(key) {
+  if (key === "Clear") receivingSearch = "";
+  else if (key === "Back") receivingSearch = receivingSearch.slice(0, -1);
+  else receivingSearch = `${receivingSearch}${key}`;
+  receivingOrderPage = 0;
+  if (receivingSearch.trim()) {
+    receivingStep = "orders";
+    receivingSelectedVendor = "";
+    receivingSelectedSourceId = "";
+  }
+  loadReceivingOrders().catch((error) => showToast(error.message));
 }
 
 async function loadDetail(id, options = {}) {
@@ -1010,8 +1431,378 @@ async function finishFulfillment() {
   await loadOrders();
 }
 
+function renderReceiptScreen() {
+  const order = receiptOrder || receivingSelectedOrder;
+  if (!order) {
+    currentModule = "receiving";
+    return render();
+  }
+  const confirmedLines = (order.lines || []).filter((line) => hasReceivedQty(line));
+  if (receiptResult) {
+    return shell("Receiving Complete", `Order ${order.tranid}`, `
+      <section class="fulfillment-screen">
+        <div class="fulfillment-card success">
+          <span>Item Receipt</span>
+          <strong>${receiptResult.itemReceiptTranid || receiptResult.itemReceiptId || "Created"}</strong>
+          <p>Receiving posted to NetSuite.</p>
+        </div>
+        <div class="selected-actions">
+          <button class="primary-button" data-action="finish-receive" type="button">Back to Receiving</button>
+        </div>
+      </section>
+    `, `<button class="secondary-button" data-action="finish-receive" type="button">Receiving</button>`);
+  }
+  return shell("Receive Order", `${order.tranid} | Location ${currentLocation()?.text || ""}`, `
+    <section class="fulfillment-screen">
+      <div class="fulfillment-card">
+        <span>Photo proof</span>
+        <strong>Truck photos</strong>
+        <div class="camera-actions">
+          <button class="primary-button" data-action="start-receipt-camera" type="button">${receiptCameraActive ? "Restart camera" : "Open camera"}</button>
+          <button class="secondary-button" data-action="choose-receipt-photo-file" type="button">Choose file</button>
+          <input id="receiptPhoto" accept="image/*" capture="environment" type="file" />
+        </div>
+        <div class="photo-slot-row">
+          ${[0, 1].map((slot) => `
+            <button class="${receiptActivePhotoSlot === slot ? "active" : ""}" data-action="select-receipt-photo-slot" data-slot="${slot}" type="button">
+              <strong>Photo ${slot + 1}</strong>
+              <span>${receiptPhotoDataUrls[slot] ? "Ready" : "Needed"}</span>
+            </button>
+          `).join("")}
+        </div>
+        ${receiptCameraActive ? `
+          <video class="camera-preview" id="receiptCamera" autoplay muted playsinline></video>
+          <button class="primary-button" data-action="capture-receipt-photo" type="button">Capture photo ${receiptActivePhotoSlot + 1}</button>
+        ` : receiptPhotoDataUrls[receiptActivePhotoSlot] ? `<img class="photo-preview" src="${receiptPhotoDataUrls[receiptActivePhotoSlot]}" alt="Receiving proof" />` : `<div class="photo-placeholder">Take 2 truck photos before receiving.</div>`}
+      </div>
+      <div class="fulfillment-card">
+        <span>Confirmed qty to receive</span>
+        <strong>${confirmedLines.length} line</strong>
+        <div class="fulfillment-lines">
+          ${confirmedLines.map((line) => `
+            <div>
+              <b>${line.sku || line.item_name}</b>
+              <span>${displayQty(line.received_pallet_qty)} PLT / ${displayQty(line.received_section_qty)} SEC / ${displayQty(line.received_layer_qty)} LYR / ${displayQty(line.received_piece_qty)} PCS</span>
+            </div>
+          `).join("") || `<p class="muted">No confirmed qty.</p>`}
+        </div>
+      </div>
+      <div class="selected-actions">
+        ${receiptSubmitting ? `<div class="sync-alert"><strong>${receiptJobStage || "Posting to NetSuite"}</strong><span>${receiptStatusText || "Creating Item Receipt..."}${receiptStartedAt ? ` (${Math.max(1, Math.round((Date.now() - receiptStartedAt) / 1000))}s)` : ""}</span></div>` : ""}
+        ${!receiptSubmitting && receiptJobStage === "Receiving failed" ? `<div class="sync-alert danger"><strong>Receiving failed</strong><span>${receiptStatusText}</span></div>` : ""}
+        <button class="primary-button" data-action="confirm-receive" ${receiptPhotoDataUrls.filter(Boolean).length >= 2 && !receiptSubmitting ? "" : "disabled"} type="button">${receiptSubmitting ? "Receiving..." : "Receive"}</button>
+      </div>
+    </section>
+  `, `
+    <button class="secondary-button" data-action="cancel-receive" type="button">Back</button>
+    <button class="secondary-button" data-action="logout" type="button">${operator.display_name}</button>
+  `);
+}
+
+async function confirmReceivingLine(lineId) {
+  const row = app.querySelector(`[data-receiving-selected-line="${lineId}"]`);
+  if (!row || !receivingSelectedId) return;
+  const body = {
+    pallets: row.querySelector('[data-pack="pallets"]')?.value || 0,
+    layers: row.querySelector('[data-pack="layers"]')?.value || 0,
+    pieces: row.querySelector('[data-pack="sales"]')?.value || row.querySelector('[data-pack="pieces"]')?.value || 0,
+    sections: row.querySelector('[data-pack="sections"]')?.value || 0
+  };
+  receivingSelectedOrder = await api(`/api/receiving/orders/${receivingSelectedId}/lines/${lineId}/confirm`, {
+    method: "POST",
+    body: JSON.stringify(body)
+  });
+  showToast("Receiving line confirmed");
+  render();
+}
+
+function startReceipt() {
+  if (!receivingSelectedOrder) return;
+  receiptOrder = receivingSelectedOrder;
+  receiptPhotoDataUrls = [];
+  receiptActivePhotoSlot = 0;
+  receiptSubmitting = false;
+  receiptResult = null;
+  receiptStatusText = "";
+  receiptJobStage = "";
+  receiptStartedAt = 0;
+  currentModule = "receiving-receipt";
+  render();
+}
+
+function stopReceiptCamera() {
+  if (receiptCameraStream) receiptCameraStream.getTracks().forEach((track) => track.stop());
+  receiptCameraStream = null;
+  receiptCameraActive = false;
+}
+
+function attachReceiptCamera() {
+  const video = document.getElementById("receiptCamera");
+  if (!video || !receiptCameraStream) return;
+  video.srcObject = receiptCameraStream;
+  video.play().catch(() => {});
+}
+
+async function startReceiptCamera() {
+  if (!navigator.mediaDevices?.getUserMedia) return showToast("Camera is not available in this browser.");
+  stopReceiptCamera();
+  receiptCameraStream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: { ideal: "environment" } },
+    audio: false
+  });
+  receiptCameraActive = true;
+  render();
+  window.requestAnimationFrame(attachReceiptCamera);
+}
+
+function captureReceiptPhoto() {
+  const video = document.getElementById("receiptCamera");
+  if (!video || !video.videoWidth || !video.videoHeight) return showToast("Camera preview is not ready yet.");
+  const canvas = document.createElement("canvas");
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
+  receiptPhotoDataUrls[receiptActivePhotoSlot] = canvas.toDataURL("image/jpeg", 0.82);
+  receiptActivePhotoSlot = Math.min(1, receiptActivePhotoSlot + 1);
+  stopReceiptCamera();
+  render();
+}
+
+async function confirmReceipt() {
+  if (!receiptOrder || receiptPhotoDataUrls.filter(Boolean).length < 2 || receiptSubmitting) return;
+  receiptSubmitting = true;
+  receiptStartedAt = Date.now();
+  receiptJobStage = "Uploading proof";
+  receiptStatusText = "Uploading receiving proof to server...";
+  window.clearInterval(receiptProgressTimer);
+  receiptProgressTimer = window.setInterval(() => {
+    if (receiptSubmitting) render();
+  }, 1000);
+  render();
+  try {
+    const started = await api(`/api/receiving/orders/${receiptOrder.netsuite_id}/receive`, {
+      method: "POST",
+      body: JSON.stringify({
+        photoDataUrls: receiptPhotoDataUrls,
+        locationId,
+        destinationLocationId: locationId,
+        orderType: receiptOrder.order_type || receivingOrderType,
+        sourceLocationId: receiptOrder.source_location_id || receivingSelectedSourceId || null
+      })
+    });
+    receiptJobStage = "Queued";
+    receiptStatusText = "Waiting for NetSuite IR number...";
+    render();
+    receiptResult = await pollReceiptJob(started.jobId);
+    showToast("Receiving posted to NetSuite");
+  } catch (error) {
+    receiptJobStage = "Receiving failed";
+    receiptStatusText = error.message;
+    showToast(error.message);
+  } finally {
+    window.clearInterval(receiptProgressTimer);
+    receiptProgressTimer = null;
+    receiptSubmitting = false;
+    render();
+  }
+}
+
+async function pollReceiptJob(jobId) {
+  if (!jobId) throw new Error("Receiving job was not started.");
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    const job = await api(`/api/receiving/receipt-jobs/${jobId}`);
+    if (job.status === "complete") return job.result;
+    if (job.status === "error") throw new Error(job.error || "NetSuite receiving failed.");
+    receiptJobStage = job.stage || "Posting";
+    receiptStatusText = job.message || `Still posting... ${attempt + 1}s`;
+    render();
+  }
+  throw new Error("NetSuite receiving is still running. Please check control panel.");
+}
+
+async function finishReceipt() {
+  stopReceiptCamera();
+  currentModule = "receiving";
+  receiptOrder = null;
+  receiptPhotoDataUrls = [];
+  receiptResult = null;
+  receiptStatusText = "";
+  receiptJobStage = "";
+  receiptStartedAt = 0;
+  await loadReceivingOrders({ keepSelection: false });
+}
+
+async function loadPersonalHistory() {
+  const params = new URLSearchParams({ limit: "100" });
+  if (personalHistoryDate) params.set("date", personalHistoryDate);
+  personalHistory = await api(`/api/operator/history?${params.toString()}`);
+  historyPage = Math.min(historyPage, pageCount(personalHistory, HISTORY_PAGE_SIZE) - 1);
+  if (!personalHistory.some((item) => item.id === selectedHistoryId)) {
+    selectedHistoryId = personalHistory[0]?.id || "";
+    historyPage = 0;
+  }
+  render();
+}
+
+function historyTypeLabel(type) {
+  return {
+    confirm_line: "Confirm Line",
+    item_receipt: "IR",
+    item_fulfillment: "IF",
+    cycle_count: "Cycle",
+    customer_return: "Customer Return"
+  }[type] || type || "Record";
+}
+
+function renderHistoryPhotos(record) {
+  const photos = (record?.photos || []).filter(Boolean);
+  if (!photos.length) return "";
+  return `
+    <div class="history-photo-grid">
+      ${photos.map((photo, index) => `<img class="photo-preview" src="${photo}" alt="Record photo ${index + 1}" />`).join("")}
+    </div>
+  `;
+}
+
+function historyLineUnits(line) {
+  const unitDefs = [
+    { label: "PLT", key: line.countedPallets !== undefined ? "countedPallets" : "pallets" },
+    { label: "LYR", key: line.countedLayers !== undefined ? "countedLayers" : "layers" },
+    { label: "SEC", key: line.countedSections !== undefined ? "countedSections" : "sections" },
+    { label: "PCS", key: line.countedPieces !== undefined ? "countedPieces" : "pieces" }
+  ];
+  const units = unitDefs
+    .filter((unit) => qty(line?.[unit.key]) !== 0)
+    .map((unit) => ({ ...unit, value: displayQty(line?.[unit.key]) }));
+  const salesKey = line.countedTotal !== undefined ? "countedTotal" : "salesQuantity";
+  units.push({ label: "Sales", key: salesKey, value: displayQty(line?.[salesKey]) });
+  return units;
+}
+
+function renderHistoryLineDetails(record) {
+  const lines = record?.details?.lines || [];
+  if (!lines.length) return "";
+  return `
+    <div class="history-lines-table">
+      ${lines.map((line) => {
+        const units = historyLineUnits(line);
+        return `
+        <div style="--history-unit-count: ${Math.max(units.length, 1)}">
+          <div class="history-line-name">
+            <strong>${escapeHtml(line.itemName || "")}</strong>
+            ${line.description ? `<span>${escapeHtml(line.description)}</span>` : ""}
+          </div>
+          ${units.map((unit) => `<span>${unit.label} ${unit.value}</span>`).join("")}
+        </div>
+      `;
+      }).join("")}
+    </div>
+  `;
+}
+
+function renderHistoryDetail(record) {
+  if (!record) {
+    return `<div class="empty-state small"><strong>Select a record</strong><span>Tap one history record to view details.</span></div>`;
+  }
+  return `
+    <div class="history-detail-card">
+      <div class="detail-header">
+        <div>
+          <h2>${escapeHtml(record.tranid || record.reference || historyTypeLabel(record.type))}</h2>
+          <p>${escapeHtml(historyTypeLabel(record.type))} | ${new Date(record.createdAt).toLocaleString()}</p>
+        </div>
+        ${record.status ? `<span class="status-pill open">${escapeHtml(record.status)}</span>` : ""}
+      </div>
+      <div class="progress-strip history-meta">
+        <div><span>Reference</span><strong>${escapeHtml(record.reference || "-")}</strong></div>
+        <div><span>Action</span><strong>${escapeHtml(record.action || "-")}</strong></div>
+        <div><span>Order</span><strong>${escapeHtml(record.orderId || "-")}</strong></div>
+      </div>
+      ${renderHistoryPhotos(record)}
+      ${renderHistoryLineDetails(record)}
+      <div class="history-report-box">
+        <strong>Report record problem</strong>
+        <textarea id="historyReportReason" placeholder="Describe what is wrong for supervisor review.">${escapeHtml(historyReportReason)}</textarea>
+        <button class="danger-button" data-action="report-history-error" data-record="${record.id}" type="button">Report Error</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderPersonalHistory() {
+  const selected = personalHistory.find((item) => item.id === selectedHistoryId) || null;
+  const visibleHistory = pageItems(personalHistory, historyPage, HISTORY_PAGE_SIZE);
+  shell("Personal History", operator?.display_name || "", `
+    <section class="history-shell">
+      <div class="history-toolbar">
+        <label>
+          <span>Date</span>
+          <input id="historyDate" type="date" value="${escapeHtml(personalHistoryDate)}" />
+        </label>
+      </div>
+      <div class="history-work-area">
+        <div class="history-list-column">
+          <div class="fulfillment-lines history-list">
+            ${visibleHistory.map((item) => `
+              <button class="history-record ${item.id === selectedHistoryId ? "active" : ""}" data-action="select-history" data-record="${item.id}" type="button">
+                <span>${historyTypeLabel(item.type)}</span>
+                <b>${escapeHtml(item.tranid || item.orderId || item.type)}</b>
+                <em>${new Date(item.createdAt).toLocaleString()}</em>
+                ${item.reference ? `<strong>${escapeHtml(item.reference)}</strong>` : ""}
+                ${item.status ? `<i>${escapeHtml(item.status)}</i>` : ""}
+              </button>
+            `).join("") || `<div class="empty-state small"><strong>No history</strong><span>No operator records for this date.</span></div>`}
+          </div>
+          <div class="pagination-row">
+            <button class="secondary-button" data-action="history-prev" ${historyPage <= 0 ? "disabled" : ""} type="button">Back</button>
+            <strong>${personalHistory.length ? `${historyPage + 1} / ${pageCount(personalHistory, HISTORY_PAGE_SIZE)}` : "0 / 0"}</strong>
+            <button class="secondary-button" data-action="history-next" ${historyPage >= pageCount(personalHistory, HISTORY_PAGE_SIZE) - 1 ? "disabled" : ""} type="button">Next</button>
+          </div>
+        </div>
+        <div class="history-detail">
+          ${renderHistoryDetail(selected)}
+        </div>
+      </div>
+    </section>
+  `, `
+    <button class="secondary-button" data-action="main-menu" type="button">Menu</button>
+    <button class="primary-button" data-action="refresh-history" type="button">Refresh</button>
+    <button class="secondary-button" data-action="logout" type="button">${operator.display_name}</button>
+  `);
+}
+
 async function openModule(moduleName) {
   if (moduleName === "delivery") {
+    currentModule = "delivery-select";
+    return render();
+  }
+  if (moduleName === "personal-history") {
+    currentModule = "personal-history";
+    personalHistory = [];
+    return loadPersonalHistory();
+  }
+  if (moduleName === "return") {
+    currentModule = "return-select";
+    return render();
+  }
+  if (moduleName === "receiving") {
+    currentModule = "receiving";
+    receivingStep = "type";
+    receivingOrderType = "purchase_order";
+    receivingSelectedVendor = "";
+    receivingSelectedSourceId = "";
+    receivingSearch = "";
+    receivingItemSearch = "";
+    receivingItemSuggestions = [];
+    receivingOrders = [];
+    receivingSelectedOrder = null;
+    receivingSelectedId = null;
+    receivingOrderPage = 0;
+    await loadReceivingOptions().catch(() => {});
+    return render();
+  }
+  if (moduleName === "delivery-run") {
     currentModule = "delivery";
     viewMode = "active";
     orderPage = 0;
@@ -1183,7 +1974,9 @@ function stepQty(unit, delta) {
   const input = app.querySelector(`.selected-panel [data-pack="${unit}"]`);
   if (!input) return;
   const selectedLine = selectedOrder?.lines?.find((line) => String(line.id) === String(selectedLineId));
-  const max = unit.startsWith("cycle-") ? Number.POSITIVE_INFINITY : selectedLine ? panelLimit(selectedLine, unit) : Number.POSITIVE_INFINITY;
+  const receivingLine = receivingSelectedOrder?.lines?.find((line) => String(line.id) === String(receivingSelectedLineId));
+  const activeLine = currentModule === "receiving" ? receivingLine : selectedLine;
+  const max = unit.startsWith("cycle-") ? Number.POSITIVE_INFINITY : activeLine ? panelLimit(activeLine, unit) : Number.POSITIVE_INFINITY;
   input.value = Math.min(max, Math.max(0, qty(input.value) + Number(delta)));
   if (unit.startsWith("cycle-")) updateCycleVariancePreview();
 }
@@ -1262,6 +2055,7 @@ app.addEventListener("click", async (event) => {
     }
     if (button.dataset.action === "main-menu") {
       stopFulfillmentCamera();
+      stopReceiptCamera();
       currentModule = "menu";
       selectedId = null;
       selectedOrder = null;
@@ -1269,6 +2063,110 @@ app.addEventListener("click", async (event) => {
       return render();
     }
     if (button.dataset.action === "open-module") return openModule(button.dataset.module);
+    if (button.dataset.action === "select-delivery-type") {
+      deliveryOrderType = button.dataset.orderType || "sales_order";
+      localStorage.setItem("mbbs.operator.deliveryOrderType", deliveryOrderType);
+      return openModule("delivery-run");
+    }
+    if (button.dataset.action === "select-receiving-type") {
+      receivingOrderType = button.dataset.orderType || "purchase_order";
+      receivingStep = "vendor";
+      receivingSelectedVendor = "";
+      receivingSelectedSourceId = "";
+      receivingSearch = "";
+      receivingItemSearch = "";
+      receivingItemSuggestions = [];
+      receivingOrders = [];
+      receivingSelectedOrder = null;
+      receivingSelectedId = null;
+      await loadReceivingOptions();
+      return render();
+    }
+    if (button.dataset.action === "receiving-back") {
+      if (receivingStep === "orders") {
+        receivingStep = receivingSearch.trim() || receivingItemSearch.trim() ? "type" : "vendor";
+        receivingSearch = "";
+        receivingItemSearch = "";
+        receivingItemSuggestions = [];
+        receivingSelectedId = null;
+        receivingSelectedOrder = null;
+        receivingOrders = [];
+      } else if (receivingStep === "vendor") {
+        receivingStep = "type";
+        receivingSelectedVendor = "";
+        receivingSelectedSourceId = "";
+      } else {
+        currentModule = "menu";
+      }
+      return render();
+    }
+    if (button.dataset.action === "select-receiving-vendor") {
+      receivingSelectedVendor = button.dataset.value || "";
+      receivingStep = "orders";
+      receivingOrderPage = 0;
+      return loadReceivingOrders();
+    }
+    if (button.dataset.action === "select-receiving-source") {
+      receivingSelectedSourceId = button.dataset.value || "";
+      receivingStep = "orders";
+      receivingOrderPage = 0;
+      return loadReceivingOrders();
+    }
+    if (button.dataset.action === "sync-receiving") return syncReceiving();
+    if (button.dataset.action === "receiving-key") return pressReceivingKey(button.dataset.key);
+    if (button.dataset.action === "receiving-pick-item") {
+      receivingItemSearch = button.dataset.item || "";
+      receivingItemSuggestions = [];
+      receivingStep = "orders";
+      receivingSelectedVendor = "";
+      receivingSelectedSourceId = "";
+      receivingOrderPage = 0;
+      return loadReceivingOrders();
+    }
+    if (button.dataset.action === "receiving-order-prev") {
+      receivingOrderPage = Math.max(0, receivingOrderPage - 1);
+      return render();
+    }
+    if (button.dataset.action === "receiving-order-next") {
+      receivingOrderPage = Math.min(pageCount(receivingOrders, ORDER_PAGE_SIZE) - 1, receivingOrderPage + 1);
+      return render();
+    }
+    if (button.dataset.action === "receiving-line-prev") {
+      receivingLinePage = Math.max(0, receivingLinePage - 1);
+      return render();
+    }
+    if (button.dataset.action === "receiving-line-next") {
+      const lines = (receivingSelectedOrder?.lines || []).filter((line) => isPickableLine(line));
+      receivingLinePage = Math.min(pageCount(lines, LINE_PAGE_SIZE) - 1, receivingLinePage + 1);
+      return render();
+    }
+    if (button.dataset.action === "select-receiving-line") {
+      receivingSelectedLineId = button.dataset.line;
+      return render();
+    }
+    if (button.dataset.action === "confirm-receiving-line") return confirmReceivingLine(button.dataset.line);
+    if (button.dataset.action === "start-receive") return startReceipt();
+    if (button.dataset.action === "cancel-receive") {
+      stopReceiptCamera();
+      currentModule = "receiving";
+      receiptOrder = null;
+      receiptPhotoDataUrls = [];
+      receiptResult = null;
+      receiptStatusText = "";
+      receiptJobStage = "";
+      receiptStartedAt = 0;
+      return render();
+    }
+    if (button.dataset.action === "select-receipt-photo-slot") {
+      receiptActivePhotoSlot = Number(button.dataset.slot) || 0;
+      return render();
+    }
+    if (button.dataset.action === "start-receipt-camera") return startReceiptCamera();
+    if (button.dataset.action === "capture-receipt-photo") return captureReceiptPhoto();
+    if (button.dataset.action === "choose-receipt-photo-file") return document.getElementById("receiptPhoto")?.click();
+    if (button.dataset.action === "confirm-receive") return confirmReceipt();
+    if (button.dataset.action === "finish-receive") return finishReceipt();
+    if (button.dataset.action === "refresh-history") return loadPersonalHistory();
     if (button.dataset.action === "cycle-back") return cycleBack();
     if (button.dataset.action === "sync-inventory") return syncInventory();
     if (button.dataset.action === "cycle-select") return selectCycleValue(button.dataset.value);
@@ -1327,7 +2225,7 @@ app.addEventListener("click", async (event) => {
     if (button.dataset.action === "sync") {
       await api("/api/delivery/sync", {
         method: "POST",
-        body: JSON.stringify({ locationId })
+        body: JSON.stringify({ locationId, orderType: deliveryOrderType })
       });
       showToast("Synced from NetSuite");
       return loadOrders({ keepSelection: true });
@@ -1383,6 +2281,33 @@ app.addEventListener("click", async (event) => {
     if (button.dataset.action === "start-camera") return startFulfillmentCamera();
     if (button.dataset.action === "capture-photo") return captureFulfillmentPhoto();
     if (button.dataset.action === "choose-photo-file") return document.getElementById("fulfillmentPhoto")?.click();
+    if (button.dataset.action === "select-history") {
+      selectedHistoryId = button.dataset.record;
+      historyReportReason = "";
+      return render();
+    }
+    if (button.dataset.action === "history-prev") {
+      historyPage = Math.max(0, historyPage - 1);
+      selectedHistoryId = pageItems(personalHistory, historyPage, HISTORY_PAGE_SIZE)[0]?.id || selectedHistoryId;
+      historyReportReason = "";
+      return render();
+    }
+    if (button.dataset.action === "history-next") {
+      historyPage = Math.min(pageCount(personalHistory, HISTORY_PAGE_SIZE) - 1, historyPage + 1);
+      selectedHistoryId = pageItems(personalHistory, historyPage, HISTORY_PAGE_SIZE)[0]?.id || selectedHistoryId;
+      historyReportReason = "";
+      return render();
+    }
+    if (button.dataset.action === "report-history-error") {
+      historyReportReason = document.getElementById("historyReportReason")?.value || "";
+      await api("/api/operator/history/report-error", {
+        method: "POST",
+        body: JSON.stringify({ recordId: button.dataset.record, reason: historyReportReason })
+      });
+      historyReportReason = "";
+      showToast("Reported to supervisor");
+      return loadPersonalHistory();
+    }
     if (button.dataset.action === "confirm-line") return confirmLine(button.dataset.line);
     if (button.dataset.action === "unpack-line") return unpackLine(button.dataset.line);
     if (button.dataset.action === "update-packed-line") return updatePackedLine(button.dataset.line);
@@ -1396,6 +2321,10 @@ app.addEventListener("click", async (event) => {
       selectedLineId = null;
       return loadDetail(button.dataset.order);
     }
+    if (button.dataset.receivingOrder) {
+      receivingLinePage = 0;
+      return loadReceivingDetail(button.dataset.receivingOrder);
+    }
     if (button.dataset.line) {
       selectedLineId = button.dataset.line;
       return render();
@@ -1406,6 +2335,62 @@ app.addEventListener("click", async (event) => {
 });
 
 app.addEventListener("input", async (event) => {
+  if (event.target?.id === "historyReportReason") {
+    historyReportReason = event.target.value;
+    return;
+  }
+  if (event.target?.id === "receivingSearch") {
+    receivingSearch = event.target.value;
+    receivingOrderPage = 0;
+    window.clearTimeout(app.receivingSearchTimer);
+    app.receivingSearchTimer = window.setTimeout(async () => {
+      try {
+        if (receivingSearch.trim()) {
+          receivingStep = "orders";
+          receivingSelectedVendor = "";
+          receivingSelectedSourceId = "";
+          await loadReceivingOrders({ keepSelection: false });
+          window.requestAnimationFrame(() => focusReceivingInput("receivingSearch"));
+        } else {
+          receivingSelectedId = null;
+          receivingSelectedOrder = null;
+          receivingOrders = [];
+          render();
+          window.requestAnimationFrame(() => focusReceivingInput("receivingSearch"));
+        }
+      } catch (error) {
+        showToast(error.message);
+      }
+    }, 250);
+    return;
+  }
+  if (event.target?.id === "receivingItemSearch") {
+    receivingItemSearch = event.target.value;
+    receivingOrderPage = 0;
+    window.clearTimeout(app.receivingItemTimer);
+    app.receivingItemTimer = window.setTimeout(async () => {
+      try {
+        await loadReceivingItemSuggestions();
+        if (receivingItemSearch.trim()) {
+          receivingStep = "orders";
+          receivingSelectedVendor = "";
+          receivingSelectedSourceId = "";
+          await loadReceivingOrders({ keepSelection: false });
+          window.requestAnimationFrame(() => focusReceivingInput("receivingItemSearch"));
+        } else {
+          receivingItemSuggestions = [];
+          receivingSelectedId = null;
+          receivingSelectedOrder = null;
+          receivingOrders = [];
+          render();
+          window.requestAnimationFrame(() => focusReceivingInput("receivingItemSearch"));
+        }
+      } catch (error) {
+        showToast(error.message);
+      }
+    }, 250);
+    return;
+  }
   if (event.target?.id !== "cycleSearch") return;
   cycleSearch = event.target.value;
   cyclePage = 0;
@@ -1423,12 +2408,25 @@ app.addEventListener("input", async (event) => {
 });
 
 app.addEventListener("change", async (event) => {
-  if (event.target?.id !== "fulfillmentPhoto") return;
+  if (event.target?.id === "historyDate") {
+    personalHistoryDate = event.target.value || "";
+    selectedHistoryId = "";
+    historyReportReason = "";
+    historyPage = 0;
+    return loadPersonalHistory();
+  }
+  if (event.target?.id !== "fulfillmentPhoto" && event.target?.id !== "receiptPhoto") return;
   const file = event.target.files?.[0];
   if (!file) return;
   try {
-    stopFulfillmentCamera();
-    fulfillmentPhotoDataUrl = await readPhotoFile(file);
+    if (event.target.id === "fulfillmentPhoto") {
+      stopFulfillmentCamera();
+      fulfillmentPhotoDataUrl = await readPhotoFile(file);
+    } else {
+      stopReceiptCamera();
+      receiptPhotoDataUrls[receiptActivePhotoSlot] = await readPhotoFile(file);
+      receiptActivePhotoSlot = Math.min(1, receiptActivePhotoSlot + 1);
+    }
     render();
   } catch (error) {
     showToast(error.message);

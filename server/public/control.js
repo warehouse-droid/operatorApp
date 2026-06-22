@@ -8,6 +8,7 @@ let audit = [];
 let classifications = [];
 let cycleRecords = [];
 let fulfillmentRecords = [];
+let recordWarnings = [];
 let classificationSearch = "";
 let bootstrapNeeded = false;
 let activeSection = localStorage.getItem("mbbs.control.section") || "dashboard";
@@ -31,6 +32,15 @@ async function request(path, options = {}) {
 function formatDate(value) {
   if (!value) return "";
   return new Date(value).toLocaleString();
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
 }
 
 function renderLogin(message = "") {
@@ -80,6 +90,7 @@ function render() {
           ${renderMenuButton("dashboard", "Dashboard", "Quick status and shortcuts")}
           ${renderMenuButton("operators", "Operators", "Register and manage accounts")}
           ${renderMenuButton("classification", "Item Classification", "Maintain type, brand, series")}
+          ${renderMenuButton("warnings", "Operator Warnings", "Handle reported record problems")}
           ${renderMenuButton("cycle-count", "Cycle Count Review", "Review submitted blind counts")}
           ${renderMenuButton("fulfillment", "Delivery Fulfillment", "Review IF posting records")}
           ${renderMenuButton("audit", "Audit Log", "Trace operator and sync actions")}
@@ -104,6 +115,7 @@ function renderMenuButton(section, title, subtitle) {
 function renderActiveSection() {
   if (activeSection === "operators") return renderOperatorsSection();
   if (activeSection === "classification") return renderClassificationSection();
+  if (activeSection === "warnings") return renderWarningsSection();
   if (activeSection === "cycle-count") return renderCycleCountSection();
   if (activeSection === "fulfillment") return renderFulfillmentSection();
   if (activeSection === "audit") return renderAuditSection();
@@ -113,6 +125,7 @@ function renderActiveSection() {
 function renderDashboardSection() {
   const activeOperators = operators.filter((item) => item.active).length;
   const classified = classifications.filter((item) => item.product_type || item.brand || item.series).length;
+  const openWarnings = recordWarnings.filter((item) => item.status === "open").length;
   return `
     <div class="dashboard-grid">
       <button class="metric-card" data-action="control-section" data-section="operators" type="button">
@@ -129,6 +142,11 @@ function renderDashboardSection() {
         <span>Audit Log</span>
         <strong>${audit.length}</strong>
         <em>latest records loaded</em>
+      </button>
+      <button class="metric-card ${openWarnings ? "warning" : ""}" data-action="control-section" data-section="warnings" type="button">
+        <span>Operator Warnings</span>
+        <strong>${openWarnings}</strong>
+        <em>open reports</em>
       </button>
       <button class="metric-card" data-action="control-section" data-section="cycle-count" type="button">
         <span>Cycle Count</span>
@@ -147,6 +165,63 @@ function renderDashboardSection() {
       <div class="actions">
         <button class="primary" data-action="sync-inventory">Sync Inventory</button>
         <button data-action="refresh">Refresh All</button>
+      </div>
+    </section>
+`;
+}
+
+function warningTypeLabel(type) {
+  return {
+    confirm_line: "Confirm Line",
+    item_receipt: "IR",
+    item_fulfillment: "IF",
+    cycle_count: "Cycle",
+    customer_return: "Customer Return"
+  }[type] || type || "Record";
+}
+
+function renderWarningPhotos(warning) {
+  const photos = warning.details?.photos || [];
+  if (!photos.length) return "";
+  return `
+    <div class="warning-photo-grid">
+      ${photos.filter(Boolean).map((photo, index) => `<img src="${photo}" alt="Warning photo ${index + 1}" />`).join("")}
+    </div>
+  `;
+}
+
+function renderWarningsSection() {
+  return `
+    <section class="panel">
+      <div class="section-heading">
+        <div>
+          <h2>Operator Warnings</h2>
+          <p class="muted">Records reported by operators for supervisor review.</p>
+        </div>
+        <button data-action="refresh">Refresh</button>
+      </div>
+      <div class="warning-review-list">
+        ${recordWarnings.map((warning) => `
+          <details class="review-record warning-record ${warning.status}">
+            <summary>
+              <strong>${warning.status === "open" ? "Open" : "Resolved"}</strong>
+              <span>${escapeHtml(warningTypeLabel(warning.record_type))}</span>
+              <span>${escapeHtml(warning.reference || warning.record_id)}</span>
+              <span>${escapeHtml(warning.operator_name || warning.operator_username || "")}</span>
+              <span>${formatDate(warning.created_at)}</span>
+            </summary>
+            <div class="warning-body">
+              <div class="notice warning-note"><strong>Reported issue</strong><span>${escapeHtml(warning.reason)}</span></div>
+              ${renderWarningPhotos(warning)}
+              <pre>${escapeHtml(JSON.stringify(warning.details || {}, null, 2))}</pre>
+              ${warning.status === "open" ? `
+                <button class="primary" data-action="resolve-warning" data-id="${warning.id}" type="button">Mark Handled</button>
+              ` : `
+                <div class="notice"><strong>Handled by ${escapeHtml(warning.handled_by_name || "")}</strong><span>${escapeHtml(warning.resolution || "")}</span></div>
+              `}
+            </div>
+          </details>
+        `).join("") || `<p class="muted">No operator warnings.</p>`}
       </div>
     </section>
   `;
@@ -392,6 +467,7 @@ async function loadControlData() {
   classifications = await request(`/api/inventory/classifications?limit=300${classificationSearch ? `&search=${encodeURIComponent(classificationSearch)}` : ""}`);
   cycleRecords = await request("/api/cycle-count/records?limit=50");
   fulfillmentRecords = await request("/api/delivery/fulfillments?limit=100");
+  recordWarnings = await request("/api/control/record-warnings?limit=100");
   render();
 }
 
@@ -483,6 +559,15 @@ app.addEventListener("click", async (event) => {
           brand: row.querySelector('[data-field="brand"]').value,
           series: row.querySelector('[data-field="series"]').value
         })
+      });
+      return loadControlData();
+    }
+    if (button.dataset.action === "resolve-warning") {
+      const resolution = prompt("Resolution note for this warning:");
+      if (!resolution) return;
+      await request(`/api/control/record-warnings/${button.dataset.id}/resolve`, {
+        method: "POST",
+        body: JSON.stringify({ resolution })
       });
       return loadControlData();
     }

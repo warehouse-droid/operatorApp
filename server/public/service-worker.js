@@ -1,9 +1,9 @@
-const CACHE_NAME = "mbbs-yard-operator-v1";
+const CACHE_NAME = "mbbs-yard-operator-v6";
 const APP_SHELL = [
   "/operator",
   "/operator.html",
-  "/operator.css",
-  "/operator.js",
+  "/operator.css?v=20260622-history-units",
+  "/operator.js?v=20260622-history-units",
   "/manifest.webmanifest",
   "/icons/mbbs-yard-192.png",
   "/icons/mbbs-yard-512.png",

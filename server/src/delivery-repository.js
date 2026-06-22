@@ -85,12 +85,18 @@ export async function upsertDeliveryOrders(orders) {
       outbound_location_id: order.outbound_location_id,
       outbound_location: order.outbound_location,
       delivery_method_id: order.delivery_method_id,
-      delivery_method: order.delivery_method
+      delivery_method: order.delivery_method,
+      order_type: order.order_type || "sales_order",
+      source_location_id: order.source_location_id,
+      source_location: order.source_location,
+      destination_location_id: order.destination_location_id,
+      destination_location: order.destination_location
     };
     const existing = await query(
       `SELECT tranid, trandate, customer_id, customer, status, status_text,
               foreign_total, order_location_id, order_location, outbound_location_id,
-              outbound_location, delivery_method_id, delivery_method
+              outbound_location, delivery_method_id, delivery_method, order_type,
+              source_location_id, source_location, destination_location_id, destination_location
        FROM delivery_orders
        WHERE netsuite_id = $1`,
       [normalized.netsuite_id]
@@ -100,11 +106,13 @@ export async function upsertDeliveryOrders(orders) {
       `INSERT INTO delivery_orders (
         netsuite_id, tranid, trandate, customer_id, customer, status, status_text,
         foreign_total, order_location_id, order_location, outbound_location_id,
-        outbound_location, delivery_method_id, delivery_method, netsuite_active, netsuite_missing_at, synced_at
+        outbound_location, delivery_method_id, delivery_method, order_type,
+        source_location_id, source_location, destination_location_id, destination_location,
+        netsuite_active, netsuite_missing_at, synced_at
       ) VALUES (
         $1, $2, $3, $4, $5, $6, $7,
         $8, $9, $10, $11,
-        $12, $13, $14, true, null, now()
+        $12, $13, $14, $15, $16, $17, $18, $19, true, null, now()
       )
       ON CONFLICT (netsuite_id) DO UPDATE SET
         tranid = EXCLUDED.tranid,
@@ -120,6 +128,11 @@ export async function upsertDeliveryOrders(orders) {
         outbound_location = EXCLUDED.outbound_location,
         delivery_method_id = EXCLUDED.delivery_method_id,
         delivery_method = EXCLUDED.delivery_method,
+        order_type = EXCLUDED.order_type,
+        source_location_id = EXCLUDED.source_location_id,
+        source_location = EXCLUDED.source_location,
+        destination_location_id = EXCLUDED.destination_location_id,
+        destination_location = EXCLUDED.destination_location,
         netsuite_active = true,
         netsuite_missing_at = null,
         synced_at = now()`,
@@ -137,14 +150,20 @@ export async function upsertDeliveryOrders(orders) {
         normalized.outbound_location_id,
         normalized.outbound_location,
         normalized.delivery_method_id,
-        normalized.delivery_method
+        normalized.delivery_method,
+        normalized.order_type,
+        normalized.source_location_id,
+        normalized.source_location,
+        normalized.destination_location_id,
+        normalized.destination_location
       ]
     );
 
     const fields = [
       "tranid", "trandate", "customer_id", "customer", "status", "status_text",
       "foreign_total", "order_location_id", "order_location", "outbound_location_id",
-      "outbound_location", "delivery_method_id", "delivery_method"
+      "outbound_location", "delivery_method_id", "delivery_method", "order_type",
+      "source_location_id", "source_location", "destination_location_id", "destination_location"
     ];
     const changes = existing.rowCount ? changedFields(existing.rows[0], normalized, fields) : {};
     if (!existing.rowCount || Object.keys(changes).length) {
@@ -172,18 +191,22 @@ export async function markMissingDeliveryOrders(locationId, activeOrderIds) {
   );
 }
 
-export async function listExistingDeliveryOrderIds({ locationId = null } = {}) {
+export async function listExistingDeliveryOrderIds({ locationId = null, orderType = null } = {}) {
   const params = [];
-  let locationClause = "";
+  const clauses = [];
   if (locationId) {
     params.push(locationId);
-    locationClause = `WHERE outbound_location_id = $${params.length}`;
+    clauses.push(`outbound_location_id = $${params.length}`);
+  }
+  if (orderType) {
+    params.push(orderType);
+    clauses.push(`order_type = $${params.length}`);
   }
 
   const result = await query(
     `SELECT netsuite_id
      FROM delivery_orders
-     ${locationClause}
+     ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
      ORDER BY synced_at ASC, netsuite_id`,
     params
   );
@@ -236,7 +259,7 @@ function parseStatusFilter(status) {
   return String(status).split(",").map((item) => item.trim()).filter(Boolean);
 }
 
-export async function listDeliveryOrders({ locationId = null, status = "active" } = {}) {
+export async function listDeliveryOrders({ locationId = null, status = "active", orderType = "sales_order" } = {}) {
   const statuses = parseStatusFilter(status);
   const params = [];
   let locationClause = "";
@@ -306,6 +329,7 @@ export async function listDeliveryOrders({ locationId = null, status = "active" 
         OR (operator_status = 'packed' AND (${underpackCountSql}) > 0)
       )`;
   if (status !== "packed") params.push(statuses);
+  params.push(orderType || "sales_order");
 
   const result = await query(
     `SELECT delivery_orders.*,
@@ -325,8 +349,12 @@ export async function listDeliveryOrders({ locationId = null, status = "active" 
      FROM delivery_orders
      WHERE ${statusClause}
        ${locationClause}
+        AND order_type = $${params.length}
         AND netsuite_active = true
-        AND (status = 'B' OR fulfillment_status = 'partial_fulfilled')
+        AND (
+          (order_type = 'sales_order' AND (status = 'B' OR fulfillment_status = 'partial_fulfilled'))
+          OR (order_type = 'transfer_order' AND (status_text ILIKE '%Pending Fulfillment%' OR fulfillment_status = 'partial_fulfilled'))
+        )
         AND fulfillment_status <> 'fulfilled'
      ORDER BY warning_count DESC, underpack_count DESC, trandate DESC, tranid DESC`
     ,
@@ -407,30 +435,51 @@ export async function getFulfillableDeliveryOrder(orderId) {
 }
 
 export function buildItemFulfillmentPayload(order, lines) {
+  const isTransferOrder = order.order_type === "transfer_order";
   const items = lines.map((line) => {
     const packedQuantity = fulfillmentLineQuantity(line);
-    return {
+    const item = {
       orderLine: Number(line.line_id),
-      location: Number(line.location_id || order.outbound_location_id),
       quantity: packedQuantity,
-      itemreceive: true
+      itemReceive: true
     };
+    if (isTransferOrder) {
+      item.orderLine += 1;
+    } else {
+      item.location = Number(line.location_id || order.outbound_location_id);
+    }
+    return item;
   });
 
   const fulfilledLineIds = new Set(lines.map((line) => Number(line.line_id)));
   for (const line of order.lines || []) {
     if (!line.netsuite_active || !["InvtPart", "NonInvtPart"].includes(line.item_type || "")) continue;
     if (fulfilledLineIds.has(Number(line.line_id))) continue;
-    items.push({
+    const item = {
       orderLine: Number(line.line_id),
-      location: Number(line.location_id || order.outbound_location_id),
-      itemreceive: false
-    });
+      itemReceive: false
+    };
+    if (isTransferOrder) {
+      item.orderLine += 1;
+    } else {
+      item.location = Number(line.location_id || order.outbound_location_id);
+    }
+    items.push(item);
   }
 
   return {
     item: { items }
   };
+}
+
+function fulfilledPayloadLineId(order, item) {
+  const orderLine = Number(item.orderLine);
+  if (!Number.isInteger(orderLine)) return null;
+  return order.order_type === "transfer_order" ? orderLine - 1 : orderLine;
+}
+
+function payloadItemReceive(item) {
+  return item.itemReceive !== false && item.itemreceive !== false;
 }
 
 function fulfillmentLineQuantity(line) {
@@ -501,8 +550,8 @@ export async function recordDeliveryFulfillment(orderId, operatorId, { photoData
     [
       orderId,
       (payload?.item?.items || [])
-        .filter((item) => item.itemreceive !== false && positiveQuantity(item.quantity) > 0)
-        .map((item) => Number(item.orderLine))
+        .filter((item) => payloadItemReceive(item) && positiveQuantity(item.quantity) > 0)
+        .map((item) => fulfilledPayloadLineId(order, item))
         .filter((id) => Number.isInteger(id))
     ]
   );

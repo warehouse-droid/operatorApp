@@ -17,7 +17,8 @@ body {
 
 button,
 input,
-select {
+select,
+textarea {
   min-height: 42px;
   border: 2px solid var(--line);
   border-radius: 8px;
@@ -131,6 +132,11 @@ p {
   align-content: center;
   text-align: left;
   border-color: var(--accent);
+}
+
+.metric-card.warning {
+  border-color: var(--danger);
+  background: #fff4f4;
 }
 
 .metric-card span {
@@ -279,6 +285,11 @@ pre {
   gap: 10px;
 }
 
+.warning-review-list {
+  display: grid;
+  gap: 10px;
+}
+
 .review-record {
   border: 1px solid #d7dee2;
   border-radius: 8px;
@@ -299,6 +310,48 @@ pre {
 
 .fulfillment-review-list .review-record summary {
   grid-template-columns: 120px 1fr 150px 150px 190px;
+}
+
+.warning-record summary {
+  grid-template-columns: 90px 130px 1fr 160px 190px;
+}
+
+.warning-record.open {
+  border-color: var(--danger);
+}
+
+.warning-body {
+  padding: 0 12px 12px;
+  display: grid;
+  gap: 10px;
+}
+
+.warning-note {
+  display: grid;
+  gap: 4px;
+  color: var(--danger);
+  background: #fff4f4;
+  border-color: var(--danger);
+}
+
+.warning-photo-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 240px));
+  gap: 10px;
+}
+
+.warning-photo-grid img {
+  width: 100%;
+  height: 160px;
+  object-fit: cover;
+  border: 1px solid #d7dee2;
+  border-radius: 8px;
+}
+
+.warning-body pre {
+  max-width: none;
+  max-height: 320px;
+  overflow: auto;
 }
 
 .fulfillment-review-list .review-record pre {
