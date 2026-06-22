@@ -246,6 +246,12 @@ async function syncReceivingOrderDetails(orderId, { orderType = null, locationId
 app.use(express.json({ limit: "25mb" }));
 app.use(express.static(publicDir));
 
+app.get("/api/dispatch/config", (req, res) => {
+  res.json({
+    googleMapsApiKey: config.googleMapsApiKey
+  });
+});
+
 app.get("/delivery", (req, res) => {
   res.redirect("/operator");
 });
@@ -256,6 +262,14 @@ app.get("/operator", (req, res) => {
 
 app.get("/control", (req, res) => {
   res.sendFile(path.join(publicDir, "control.html"));
+});
+
+app.get("/dispatch", (req, res) => {
+  res.sendFile(path.join(publicDir, "dispatch.html"));
+});
+
+app.get("/dispatch/setup", (req, res) => {
+  res.sendFile(path.join(publicDir, "dispatch-setup.html"));
 });
 
 app.get("/", (req, res) => {

@@ -24,6 +24,7 @@ The tablet app should call this server. This server calls NetSuite and stores op
    - `NETSUITE_AUTH_URL`
    - `NETSUITE_TOKEN_URL`
    - `NETSUITE_REST_BASE_URL`
+   - `GOOGLE_MAPS_API_KEY` for dispatch route preview maps
 
 4. Create the PostgreSQL database:
 
@@ -114,6 +115,7 @@ GET /api/delivery/orders?locationId=13&status=packed
 
 - Keep `.env` private.
 - Do not put NetSuite credentials into tablet code.
+- Restrict the Google Maps browser key in Google Cloud by HTTP referrer, for example `https://your-domain.example/*` and `http://localhost:3000/*` during testing.
 - Delivery APIs require operator login. Send `Authorization: Bearer <token>` from the PWA.
 - Operator updates and NetSuite sync summaries are written to `delivery_audit_log`.
 - If tablets are not on the same network, do not rely on a LAN IP. Use a stable HTTPS URL.

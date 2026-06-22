@@ -6,6 +6,7 @@ export const config = {
   port: Number(process.env.PORT || 3000),
   appBaseUrl: process.env.APP_BASE_URL || "http://localhost:3000",
   databaseUrl: process.env.DATABASE_URL,
+  googleMapsApiKey: process.env.GOOGLE_MAPS_API_KEY || "",
   netsuite: {
     accountId: process.env.NETSUITE_ACCOUNT_ID,
     clientId: process.env.NETSUITE_CLIENT_ID,
