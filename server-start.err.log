@@ -1,0 +1,22 @@
+Delivery auto-sync failed: NetSuite SuiteQL failed: 500 {"type":"https://www.rfc-editor.org/rfc/rfc9110.html#section-15.6.1","title":"Internal Server Error","status":500,"o:errorDetails":[{"detail":"An unexpected error occurred. Error ID: mqsnubcxoudhqfbizz6v","o:errorCode":"UNEXPECTED_ERROR"}]}
+
+Delivery auto-sync failed: NetSuite SuiteQL failed: 500 {"type":"https://www.rfc-editor.org/rfc/rfc9110.html#section-15.6.1","title":"Internal Server Error","status":500,"o:errorDetails":[{"detail":"An unexpected error occurred. Error ID: mqsnvlhh9waoha9jkcdd","o:errorCode":"UNEXPECTED_ERROR"}]}
+
+Delivery auto-sync failed: NetSuite SuiteQL failed: 500 {"type":"https://www.rfc-editor.org/rfc/rfc9110.html#section-15.6.1","title":"Internal Server Error","status":500,"o:errorDetails":[{"detail":"An unexpected error occurred. Error ID: mqsnwvsj1pzrvgmxdnq9v","o:errorCode":"UNEXPECTED_ERROR"}]}
+
+Delivery auto-sync failed: NetSuite SuiteQL failed: 500 {"type":"https://www.rfc-editor.org/rfc/rfc9110.html#section-15.6.1","title":"Internal Server Error","status":500,"o:errorDetails":[{"detail":"An unexpected error occurred. Error ID: mqsny653179a5hhpgl2ko","o:errorCode":"UNEXPECTED_ERROR"}]}
+
+Delivery auto-sync failed: NetSuite SuiteQL failed: 500 {"type":"https://www.rfc-editor.org/rfc/rfc9110.html#section-15.6.1","title":"Internal Server Error","status":500,"o:errorDetails":[{"detail":"An unexpected error occurred. Error ID: mqsnzgeay8052934v1ur","o:errorCode":"UNEXPECTED_ERROR"}]}
+
+Delivery auto-sync failed: NetSuite SuiteQL failed: 500 {"type":"https://www.rfc-editor.org/rfc/rfc9110.html#section-15.6.1","title":"Internal Server Error","status":500,"o:errorDetails":[{"detail":"An unexpected error occurred. Error ID: mqso0qvj106sanj9qvwfx","o:errorCode":"UNEXPECTED_ERROR"}]}
+
+Delivery auto-sync failed: NetSuite SuiteQL failed: 500 {"type":"https://www.rfc-editor.org/rfc/rfc9110.html#section-15.6.1","title":"Internal Server Error","status":500,"o:errorDetails":[{"detail":"An unexpected error occurred. Error ID: mqso20yt1jelcgnmkxp5e","o:errorCode":"UNEXPECTED_ERROR"}]}
+
+Error: NetSuite SuiteQL failed: 500 {"type":"https://www.rfc-editor.org/rfc/rfc9110.html#section-15.6.1","title":"Internal Server Error","status":500,"o:errorDetails":[{"detail":"An unexpected error occurred. Error ID: mqso2530x3578rgiukme","o:errorCode":"UNEXPECTED_ERROR"}]}
+
+    at runSuiteql (file:///C:/Users/wareh/Documents/Codex/2026-05-22/help-me-to-create-screens-that/server/src/netsuite.js:452:11)
+    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+Delivery auto-sync failed: NetSuite SuiteQL failed: 500 {"type":"https://www.rfc-editor.org/rfc/rfc9110.html#section-15.6.1","title":"Internal Server Error","status":500,"o:errorDetails":[{"detail":"An unexpected error occurred. Error ID: mqso3bww1otsspyuc9p9q","o:errorCode":"UNEXPECTED_ERROR"}]}
+
+Delivery auto-sync failed: NetSuite SuiteQL failed: 500 {"type":"https://www.rfc-editor.org/rfc/rfc9110.html#section-15.6.1","title":"Internal Server Error","status":500,"o:errorDetails":[{"detail":"An unexpected error occurred. Error ID: mqso4lmo1blaltnv96x6r","o:errorCode":"UNEXPECTED_ERROR"}]}
+

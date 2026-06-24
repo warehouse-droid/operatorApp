@@ -21,6 +21,7 @@ let currentModule = "menu";
 let viewMode = "active";
 let deliveryOrderType = localStorage.getItem("mbbs.operator.deliveryOrderType") || "sales_order";
 let orders = [];
+let operatorRequests = [];
 let selectedId = null;
 let selectedOrder = null;
 let selectedLineId = null;
@@ -82,6 +83,8 @@ let personalHistoryDate = new Date().toISOString().slice(0, 10);
 let selectedHistoryId = "";
 let historyReportReason = "";
 let historyPage = 0;
+let eventSource = null;
+let eventRefreshTimer = null;
 
 function showToast(message) {
   toast.textContent = message;
@@ -126,6 +129,73 @@ async function publicApi(path, options = {}) {
   return response.json();
 }
 
+function connectEvents() {
+  if (!authToken || eventSource) return;
+  eventSource = new EventSource(`/api/events?client=operator&token=${encodeURIComponent(authToken)}`);
+  eventSource.addEventListener("app-event", (message) => {
+    let event;
+    try {
+      event = JSON.parse(message.data || "{}");
+    } catch {
+      return;
+    }
+    if (event.type === "connected" || !operator || !locationId) return;
+    const deliveryEvents = [
+      "dispatch.plan.confirmed",
+      "dispatch.operator_request.created",
+      "delivery.order.updated",
+      "delivery.line.confirmed",
+      "delivery.line.updated",
+      "delivery.order.unpacked",
+      "delivery.order.loaded",
+      "dispatch.orders.updated"
+    ];
+    const receivingEvents = [
+      "dispatch.co.updated",
+      "receiving.line.confirmed",
+      "receiving.order.received",
+      "dispatch.vendor_yard.updated",
+      "dispatch.orders.updated"
+    ];
+    const needsDelivery = deliveryEvents.includes(event.type);
+    const needsReceiving = receivingEvents.includes(event.type);
+    if (!needsDelivery && !needsReceiving) return;
+    window.clearTimeout(eventRefreshTimer);
+    eventRefreshTimer = window.setTimeout(async () => {
+      try {
+        if (needsDelivery && currentModule === "delivery-select" && !fulfillmentSubmitting) {
+          await loadOrders({ keepSelection: true });
+          showToast("Orders updated");
+          return;
+        }
+        if (needsReceiving && currentModule === "receiving" && !receiptSubmitting) {
+          await loadReceivingOptions();
+          if (receivingStep === "orders") await loadReceivingOrders({ keepSelection: true });
+          else render();
+          showToast("Receiving updated");
+          return;
+        }
+        if (event.type === "dispatch.operator_request.created") {
+          showToast("Dispatch request received");
+        }
+      } catch (error) {
+        showToast(error.message);
+      }
+    }, 500);
+  });
+  eventSource.onerror = () => {
+    eventSource?.close();
+    eventSource = null;
+    if (authToken) window.setTimeout(connectEvents, 3000);
+  };
+}
+
+function disconnectEvents() {
+  window.clearTimeout(eventRefreshTimer);
+  eventSource?.close();
+  eventSource = null;
+}
+
 function currentLocation() {
   return LOCATIONS.find((location) => location.id === Number(locationId));
 }
@@ -135,7 +205,8 @@ function statusText(status) {
     open: "Open",
     preparing: "Preparing",
     packed: "Packed",
-    fulfilled: "Fulfilled"
+    fulfilled: "Fulfilled",
+    loaded: "Loaded"
   }[status] || "Open";
 }
 
@@ -148,12 +219,14 @@ function orderUnderpackCount(order) {
 }
 
 function orderStatusText(order) {
+  if (order?.local_yard_order_status === "Loaded") return "Loaded";
   if (orderWarningCount(order)) return "Warning";
   if (orderUnderpackCount(order) && order?.operator_status === "packed") return "Underpack";
   return statusText(order?.operator_status);
 }
 
 function orderStatusClass(order) {
+  if (order?.local_yard_order_status === "Loaded") return "loaded";
   if (orderWarningCount(order)) return "warning";
   if (orderUnderpackCount(order) && order?.operator_status === "packed") return "underpack";
   return order?.operator_status || "open";
@@ -506,6 +579,7 @@ function renderDeliverySelect() {
 }
 
 function receivingTypeLabel() {
+  if (receivingOrderType === "co_order") return "Transit CO";
   return receivingOrderType === "transfer_order" ? "Transfer Order" : "Purchase Order";
 }
 
@@ -554,18 +628,22 @@ function renderReceivingMain() {
           <strong>Transfer Order</strong>
           <span>Receive stock sent from another yard.</span>
         </button>
+        <button class="module-tile" data-action="select-receiving-type" data-order-type="co_order" type="button">
+          <strong>Transit CO</strong>
+          <span>Receive local transit depot stock.</span>
+        </button>
       </section>
     `;
   }
   if (receivingStep === "vendor") {
-    const list = receivingOrderType === "transfer_order"
+    const list = (receivingOrderType === "transfer_order" || receivingOrderType === "co_order")
       ? receivingSources.filter((item) => String(item.source_location_id) !== String(locationId))
       : receivingVendors;
     return `
       <section class="receiving-option-grid">
         ${list.map((item) => `
-          <button class="module-tile compact" data-action="${receivingOrderType === "transfer_order" ? "select-receiving-source" : "select-receiving-vendor"}" data-value="${receivingOrderType === "transfer_order" ? item.source_location_id : item.vendor}" type="button">
-            <strong>${receivingOrderType === "transfer_order" ? `From ${item.source_location}` : item.vendor}</strong>
+          <button class="module-tile compact" data-action="${receivingOrderType === "purchase_order" ? "select-receiving-vendor" : "select-receiving-source"}" data-value="${receivingOrderType === "purchase_order" ? item.vendor : item.source_location_id}" type="button">
+            <strong>${receivingOrderType === "purchase_order" ? item.vendor : `From ${item.source_location}`}</strong>
             <span>${item.order_count} open order</span>
           </button>
         `).join("") || `<div class="empty-state"><strong>No open orders</strong><span>Tap Sync to retrieve from NetSuite.</span></div>`}
@@ -584,12 +662,12 @@ function renderReceivingOrders() {
       <aside class="order-panel">
         <div class="panel-title">
           <div>
-            <span>${receivingSearch.trim() || receivingItemSearch.trim() ? "Orders" : receivingOrderType === "transfer_order" ? "Source" : "Vendor"}</span>
+            <span>${receivingSearch.trim() || receivingItemSearch.trim() ? "Orders" : receivingOrderType === "purchase_order" ? "Vendor" : "Source"}</span>
             <strong>${receivingSearch.trim() || receivingItemSearch.trim()
               ? "Search results"
-              : receivingOrderType === "transfer_order"
-                ? `From ${sourceLocationText(receivingSelectedSourceId)}`
-                : receivingSelectedVendor}</strong>
+              : receivingOrderType === "purchase_order"
+                ? receivingSelectedVendor
+                : `From ${sourceLocationText(receivingSelectedSourceId)}`}</strong>
           </div>
           <strong>${receivingOrders.length}</strong>
         </div>
@@ -638,7 +716,7 @@ function renderReceivingDetail(order) {
     <div class="detail-header">
       <div>
         <h2>${order.tranid}</h2>
-        <p class="muted">${receivingOrderType === "transfer_order" ? `From ${order.source_location} to ${order.destination_location}` : order.vendor}</p>
+        <p class="muted">${receivingOrderType === "purchase_order" ? order.vendor : `From ${order.source_location} to ${order.destination_location}`}</p>
         <p class="muted">${formatDate(order.trandate)} | ${order.status_text}</p>
       </div>
       <button class="primary-button" data-action="start-receive" ${confirmedLines.length ? "" : "disabled"} type="button">Receive</button>
@@ -897,20 +975,47 @@ function renderOrderPanel() {
       <strong>${orders.length}</strong>
     </div>
     ${renderPackedWarningNotice()}
+    ${renderOperatorRequestNotice()}
     <div class="order-list">
-      ${visible.map((order) => `
-        <button class="order-card ${String(order.netsuite_id) === String(selectedId) ? "active" : ""} ${orderWarningCount(order) ? "warning" : ""} ${orderUnderpackCount(order) && order.operator_status === "packed" ? "underpack" : ""}" data-order="${order.netsuite_id}" type="button">
+      ${visible.map((order) => {
+        const request = operatorRequestForOrder(order);
+        return `
+        <button class="order-card ${String(order.netsuite_id) === String(selectedId) ? "active" : ""} ${orderWarningCount(order) ? "warning" : ""} ${orderUnderpackCount(order) && order.operator_status === "packed" ? "underpack" : ""} ${request ? "request" : ""}" data-order="${order.netsuite_id}" type="button">
           <strong>${order.tranid}</strong>
           <span class="muted">${formatDate(order.trandate)} | ${order.outbound_location || ""}</span>
+          ${order.dispatch_planned ? `<span class="planned-line">Planned ${escapeHtml(order.dispatch_truck_plate || "")} ${escapeHtml(order.dispatch_load_name || "")}${order.dispatch_parking_spot ? ` | Spot ${escapeHtml(order.dispatch_parking_spot)}` : ""}</span>` : ""}
+          ${request ? `<span class="request-line">Dispatch asks to unpack for split</span>` : ""}
           <span class="status-pill ${orderStatusClass(order)}">${orderStatusText(order)}</span>
         </button>
-      `).join("") || `<div class="empty-state small"><strong>No orders</strong><span>Sync from NetSuite.</span></div>`}
+      `; }).join("") || `<div class="empty-state small"><strong>No orders</strong><span>Sync from NetSuite.</span></div>`}
     </div>
     <div class="pagination-row">
       <button class="secondary-button" data-action="order-prev" ${orderPage === 0 ? "disabled" : ""} type="button">Previous</button>
       <strong>${orderPage + 1} / ${count}</strong>
       <button class="secondary-button" data-action="order-next" ${orderPage >= count - 1 ? "disabled" : ""} type="button">Next</button>
     </div>
+  `;
+}
+
+function operatorRequestForOrder(order) {
+  return (operatorRequests || []).find((request) => {
+    if (request.request_type !== "unpack_for_split") return false;
+    return String(request.netsuite_id || "") === String(order.netsuite_id)
+      || String(request.tranid || "") === String(order.tranid)
+      || String(request.order_ref || "") === String(order.tranid)
+      || String(request.order_ref || "") === String(order.netsuite_id);
+  });
+}
+
+function renderOperatorRequestNotice() {
+  const requests = (operatorRequests || []).filter((request) => request.request_type === "unpack_for_split");
+  if (!requests.length) return "";
+  const target = requests.find((request) => request.netsuite_id) || requests[0];
+  return `
+    <button class="operator-request-notice" data-action="open-operator-request" data-order="${target.netsuite_id || ""}" type="button">
+      <strong>Dispatch Request</strong>
+      <span>${requests.length} unpack request${requests.length > 1 ? "s" : ""} for split. Tap to handle.</span>
+    </button>
   `;
 }
 
@@ -954,11 +1059,12 @@ function renderDetailPanel(order) {
         </div>
         <p class="muted">${order.customer || ""}</p>
         <p class="muted">${formatDate(order.trandate)} | ${order.delivery_method || ""}</p>
+        ${order.dispatch_planned ? `<p class="dispatch-plan-note">Planned: ${escapeHtml(order.dispatch_truck_plate || "")} ${escapeHtml(order.dispatch_load_name || "")}${order.dispatch_parking_spot ? ` | Parking spot ${escapeHtml(order.dispatch_parking_spot)}` : ""}</p>` : ""}
       </div>
       <div class="status-actions">
         <span class="status-pill ${orderStatusClass(order)}">${orderStatusText(order)}</span>
         ${viewMode === "packed"
-          ? `<button class="primary-button" data-action="start-fulfill" type="button">Fulfill</button>`
+          ? `<button class="primary-button" data-action="start-fulfill" type="button">Load</button>`
           : `<button class="secondary-button" data-action="set-preparing" type="button">Preparing</button>
              <button class="primary-button" data-action="set-packed" type="button">Packed</button>`}
       </div>
@@ -998,12 +1104,12 @@ function renderFulfillmentScreen() {
   }
   const packedLines = visibleLines(order).filter((line) => hasPackedQty(line));
   if (fulfillmentResult) {
-    return shell("Fulfillment Complete", `Order ${order.tranid}`, `
+    return shell("Load Complete", `Order ${order.tranid}`, `
       <section class="fulfillment-screen">
         <div class="fulfillment-card success">
-          <span>Item Fulfillment</span>
-          <strong>${fulfillmentResult.itemFulfillmentTranid || fulfillmentResult.itemFulfillmentId || "Created"}</strong>
-          <p>Fulfillment posted to NetSuite.</p>
+          <span>Local Yard Status</span>
+          <strong>${fulfillmentResult.localYardOrderStatus || "Loaded"}</strong>
+          <p>Photo proof saved. This order is hidden from the operator list.</p>
         </div>
         <div class="selected-actions">
           <button class="primary-button" data-action="finish-fulfill" type="button">Back to Delivery</button>
@@ -1011,7 +1117,7 @@ function renderFulfillmentScreen() {
       </section>
     `, `<button class="secondary-button" data-action="finish-fulfill" type="button">Delivery</button>`);
   }
-  return shell("Fulfill Order", `${order.tranid} | Location ${currentLocation()?.text || ""}`, `
+  return shell("Load Order", `${order.tranid} | Location ${currentLocation()?.text || ""}`, `
     <section class="fulfillment-screen">
       <div class="fulfillment-card">
         <span>Photo proof</span>
@@ -1024,10 +1130,10 @@ function renderFulfillmentScreen() {
         ${fulfillmentCameraActive ? `
           <video class="camera-preview" id="fulfillmentCamera" autoplay muted playsinline></video>
           <button class="primary-button" data-action="capture-photo" type="button">Capture photo</button>
-        ` : fulfillmentPhotoDataUrl ? `<img class="photo-preview" src="${fulfillmentPhotoDataUrl}" alt="Truck loading proof" />` : `<div class="photo-placeholder">Open camera and take 1 photo before confirming fulfillment.</div>`}
+        ` : fulfillmentPhotoDataUrl ? `<img class="photo-preview" src="${fulfillmentPhotoDataUrl}" alt="Truck loading proof" />` : `<div class="photo-placeholder">Open camera and take 1 photo before confirming load.</div>`}
       </div>
       <div class="fulfillment-card">
-        <span>Packed qty to send</span>
+        <span>Packed qty to load</span>
         <strong>${packedLines.length} line</strong>
         <div class="fulfillment-lines">
           ${packedLines.map((line) => `
@@ -1039,9 +1145,9 @@ function renderFulfillmentScreen() {
         </div>
       </div>
       <div class="selected-actions">
-        ${fulfillmentSubmitting ? `<div class="sync-alert"><strong>${fulfillmentJobStage || "Posting to NetSuite"}</strong><span>${fulfillmentStatusText || "Creating Item Fulfillment..."}${fulfillmentStartedAt ? ` (${Math.max(1, Math.round((Date.now() - fulfillmentStartedAt) / 1000))}s)` : ""}</span></div>` : ""}
-        ${!fulfillmentSubmitting && fulfillmentJobStage === "Fulfillment failed" ? `<div class="sync-alert danger"><strong>Fulfillment failed</strong><span>${fulfillmentStatusText}</span></div>` : ""}
-        <button class="primary-button" data-action="confirm-fulfill" ${fulfillmentPhotoDataUrl && !fulfillmentSubmitting ? "" : "disabled"} type="button">${fulfillmentSubmitting ? "Fulfilling..." : "Confirm Fulfill"}</button>
+        ${fulfillmentSubmitting ? `<div class="sync-alert"><strong>${fulfillmentJobStage || "Saving load proof"}</strong><span>${fulfillmentStatusText || "Saving local yard status..."}${fulfillmentStartedAt ? ` (${Math.max(1, Math.round((Date.now() - fulfillmentStartedAt) / 1000))}s)` : ""}</span></div>` : ""}
+        ${!fulfillmentSubmitting && fulfillmentJobStage === "Load failed" ? `<div class="sync-alert danger"><strong>Load failed</strong><span>${fulfillmentStatusText}</span></div>` : ""}
+        <button class="primary-button" data-action="confirm-fulfill" ${fulfillmentPhotoDataUrl && !fulfillmentSubmitting ? "" : "disabled"} type="button">${fulfillmentSubmitting ? "Loading..." : "Load"}</button>
       </div>
     </section>
   `, `
@@ -1114,6 +1220,7 @@ function renderStepper(unit, label, value) {
 async function loadOrders(options = {}) {
   const status = viewMode === "packed" ? "packed" : "active";
   orders = await api(`/api/delivery/orders?locationId=${locationId}&status=${status}&orderType=${deliveryOrderType}`);
+  operatorRequests = await api(`/api/operator/requests?locationId=${locationId}&orderType=${deliveryOrderType}&status=open`).catch(() => []);
   const preparing = preparingOrderId();
   if (viewMode === "active" && preparing) selectedId = preparing;
   else if (!options.keepSelection) selectedId = orders[0]?.netsuite_id || null;
@@ -1126,8 +1233,8 @@ async function loadOrders(options = {}) {
 }
 
 async function loadReceivingOptions() {
-  if (receivingOrderType === "transfer_order") {
-    receivingSources = await api(`/api/receiving/sources?destinationLocationId=${locationId}`);
+  if (receivingOrderType === "transfer_order" || receivingOrderType === "co_order") {
+    receivingSources = await api(`/api/receiving/sources?destinationLocationId=${locationId}&orderType=${receivingOrderType}`);
     receivingVendors = [];
   } else {
     receivingVendors = await api(`/api/receiving/vendors?destinationLocationId=${locationId}`);
@@ -1139,7 +1246,7 @@ function receivingOrderUrl() {
   const url = new URL("/api/receiving/orders", window.location.origin);
   url.searchParams.set("orderType", receivingOrderType);
   const isSearching = receivingSearch.trim() || receivingItemSearch.trim();
-  if (receivingOrderType === "transfer_order") {
+  if (receivingOrderType === "transfer_order" || receivingOrderType === "co_order") {
     if (receivingSelectedSourceId && !isSearching) url.searchParams.set("sourceLocationId", receivingSelectedSourceId);
     url.searchParams.set("destinationLocationId", locationId);
   } else if (receivingSelectedVendor && !isSearching) {
@@ -1165,15 +1272,17 @@ async function loadReceivingOrders(options = {}) {
 
 async function loadReceivingDetail(id, options = {}) {
   receivingSelectedId = id;
-  await api(`/api/receiving/orders/${id}/sync`, {
-    method: "POST",
-    body: JSON.stringify({
-      orderType: receivingOrderType,
-      locationId,
-      destinationLocationId: locationId,
-      sourceLocationId: receivingSelectedSourceId || null
-    })
-  });
+  if (receivingOrderType !== "co_order") {
+    await api(`/api/receiving/orders/${id}/sync`, {
+      method: "POST",
+      body: JSON.stringify({
+        orderType: receivingOrderType,
+        locationId,
+        destinationLocationId: locationId,
+        sourceLocationId: receivingSelectedSourceId || null
+      })
+    });
+  }
   receivingSelectedOrder = await api(`/api/receiving/orders/${id}`);
   if (!options.silentRender) render();
 }
@@ -1186,7 +1295,7 @@ async function loadReceivingItemSuggestions() {
   const url = new URL("/api/receiving/items", window.location.origin);
   url.searchParams.set("orderType", receivingOrderType);
   url.searchParams.set("search", receivingItemSearch.trim());
-  if (receivingOrderType === "transfer_order") {
+  if (receivingOrderType === "transfer_order" || receivingOrderType === "co_order") {
     url.searchParams.set("destinationLocationId", locationId);
   }
   if (receivingOrderType === "purchase_order") url.searchParams.set("destinationLocationId", locationId);
@@ -1375,25 +1484,21 @@ async function confirmFulfillment() {
   if (!fulfillmentOrder || !fulfillmentPhotoDataUrl || fulfillmentSubmitting) return;
   fulfillmentSubmitting = true;
   fulfillmentStartedAt = Date.now();
-  fulfillmentJobStage = "Uploading proof";
-  fulfillmentStatusText = "Uploading photo proof to server...";
+  fulfillmentJobStage = "Saving proof";
+  fulfillmentStatusText = "Saving photo proof and local loaded status...";
   window.clearInterval(fulfillmentProgressTimer);
   fulfillmentProgressTimer = window.setInterval(() => {
     if (fulfillmentSubmitting) render();
   }, 1000);
   render();
   try {
-    const started = await api(`/api/delivery/orders/${fulfillmentOrder.netsuite_id}/fulfill`, {
+    fulfillmentResult = await api(`/api/delivery/orders/${fulfillmentOrder.netsuite_id}/load`, {
       method: "POST",
       body: JSON.stringify({ photoDataUrl: fulfillmentPhotoDataUrl, locationId })
     });
-    fulfillmentJobStage = "Queued";
-    fulfillmentStatusText = "Waiting for NetSuite IF number...";
-    render();
-    fulfillmentResult = await pollFulfillmentJob(started.jobId);
-    showToast("Fulfillment posted to NetSuite");
+    showToast("Order loaded");
   } catch (error) {
-    fulfillmentJobStage = "Fulfillment failed";
+    fulfillmentJobStage = "Load failed";
     fulfillmentStatusText = error.message;
     showToast(error.message);
   } finally {
@@ -1439,12 +1544,13 @@ function renderReceiptScreen() {
   }
   const confirmedLines = (order.lines || []).filter((line) => hasReceivedQty(line));
   if (receiptResult) {
+    const isLocalCo = (receiptOrder?.order_type || receivingOrderType) === "co_order";
     return shell("Receiving Complete", `Order ${order.tranid}`, `
       <section class="fulfillment-screen">
         <div class="fulfillment-card success">
-          <span>Item Receipt</span>
+          <span>${isLocalCo ? "Local CO Received" : "Item Receipt"}</span>
           <strong>${receiptResult.itemReceiptTranid || receiptResult.itemReceiptId || "Created"}</strong>
-          <p>Receiving posted to NetSuite.</p>
+          <p>${isLocalCo ? "CO is now available in Delivery Prep packed orders for loading." : "Receiving posted to NetSuite."}</p>
         </div>
         <div class="selected-actions">
           <button class="primary-button" data-action="finish-receive" type="button">Back to Receiving</button>
@@ -1590,6 +1696,11 @@ async function confirmReceipt() {
         sourceLocationId: receiptOrder.source_location_id || receivingSelectedSourceId || null
       })
     });
+    if (started.status === "complete" && started.result) {
+      receiptResult = started.result;
+      showToast(receivingOrderType === "co_order" ? "CO received and moved to packed list" : "Receiving posted to NetSuite");
+      return;
+    }
     receiptJobStage = "Queued";
     receiptStatusText = "Waiting for NetSuite IR number...";
     render();
@@ -1623,6 +1734,7 @@ async function pollReceiptJob(jobId) {
 
 async function finishReceipt() {
   stopReceiptCamera();
+  const wasLocalCo = (receiptOrder?.order_type || receivingOrderType) === "co_order";
   currentModule = "receiving";
   receiptOrder = null;
   receiptPhotoDataUrls = [];
@@ -1630,6 +1742,14 @@ async function finishReceipt() {
   receiptStatusText = "";
   receiptJobStage = "";
   receiptStartedAt = 0;
+  if (wasLocalCo) {
+    currentModule = "delivery";
+    deliveryOrderType = "transfer_order";
+    localStorage.setItem("mbbs.operator.deliveryOrderType", deliveryOrderType);
+    viewMode = "packed";
+    selectedId = null;
+    return loadOrders();
+  }
   await loadReceivingOrders({ keepSelection: false });
 }
 
@@ -2051,6 +2171,7 @@ app.addEventListener("click", async (event) => {
       authToken = "";
       operator = null;
       localStorage.removeItem(TOKEN_KEY);
+      disconnectEvents();
       return renderLogin();
     }
     if (button.dataset.action === "main-menu") {
@@ -2238,6 +2359,15 @@ app.addEventListener("click", async (event) => {
       const index = orders.findIndex((order) => String(order.netsuite_id) === String(selectedId));
       if (index >= 0) orderPage = Math.floor(index / ORDER_PAGE_SIZE);
       return loadDetail(selectedId);
+    }
+    if (button.dataset.action === "open-operator-request") {
+      if (!button.dataset.order) return showToast("Requested order is not in this list.");
+      viewMode = "packed";
+      selectedId = button.dataset.order;
+      await loadOrders({ keepSelection: true });
+      const index = orders.findIndex((order) => String(order.netsuite_id) === String(selectedId));
+      if (index >= 0) orderPage = Math.floor(index / ORDER_PAGE_SIZE);
+      return render();
     }
     if (button.dataset.action === "order-prev") {
       if (currentOrderBlocksMove()) return showToast("Pack current order before moving on.");
@@ -2448,6 +2578,7 @@ app.addEventListener("submit", async (event) => {
     authToken = result.token;
     operator = result.operator;
     localStorage.setItem(TOKEN_KEY, authToken);
+    connectEvents();
     showToast(`Welcome ${operator.display_name}`);
     render();
   } catch (error) {
@@ -2463,8 +2594,10 @@ async function boot() {
   try {
     const result = await api("/api/auth/me");
     operator = result.operator;
+    connectEvents();
     render();
   } catch (error) {
+    disconnectEvents();
     renderLogin("Please login to continue.");
   }
 }

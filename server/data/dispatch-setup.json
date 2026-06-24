@@ -1,0 +1,55 @@
+{
+  "drivers": [
+    {
+      "name": "Alex Wong",
+      "license": "AZ",
+      "number": "A90211",
+      "login": "alex",
+      "password": "123456",
+      "ownYardFixedMinutes": 20,
+      "outsideFixedMinutes": 30,
+      "minutesPerPallet": 1,
+      "loadMinutes": 20,
+      "unloadMinutes": 30
+    },
+    {
+      "name": "Jenny Lee",
+      "license": "DZ",
+      "number": "D18870",
+      "login": "jenny",
+      "ownYardFixedMinutes": 50,
+      "outsideFixedMinutes": 80,
+      "minutesPerPallet": 1.5,
+      "loadMinutes": 50,
+      "unloadMinutes": 80
+    }
+  ],
+  "trucks": [
+    {
+      "plate": "MBBS-101",
+      "capacityLbs": 78000
+    },
+    {
+      "plate": "MBBS-205",
+      "capacityLbs": 83000
+    },
+    {
+      "plate": "MBBS-318",
+      "capacityLbs": 80000
+    },
+    {
+      "plate": "ABCD1234",
+      "capacityLbs": 78000
+    }
+  ],
+  "sync": {
+    "mode": "manual",
+    "intervalSeconds": 60,
+    "running": false,
+    "lastStartedAt": "2026-06-24T22:58:01.023Z",
+    "lastFinishedAt": "2026-06-24T23:02:00.463Z",
+    "lastSource": "dispatch_manual",
+    "lastStatus": "success",
+    "lastError": ""
+  }
+}

@@ -734,6 +734,28 @@ label span {
   box-shadow: inset 7px 0 0 var(--warn);
 }
 
+.order-card.request {
+  border-color: var(--warn);
+  box-shadow: inset 7px 0 0 var(--warn);
+  background: #fff9e8;
+}
+
+.planned-line {
+  color: var(--ok);
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.request-line {
+  width: fit-content;
+  padding: 3px 6px;
+  border-radius: 6px;
+  background: #8a5b00;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 900;
+}
+
 .order-card strong {
   font-size: 20px;
 }
@@ -756,6 +778,29 @@ label span {
 }
 
 .order-warning-notice span {
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.operator-request-notice {
+  flex: 0 0 auto;
+  margin: 10px 10px 0;
+  min-height: 58px;
+  padding: 8px 10px;
+  border: 2px solid var(--warn);
+  border-radius: 8px;
+  background: #fff4d6;
+  color: #4b3000;
+  display: grid;
+  gap: 2px;
+  text-align: left;
+}
+
+.operator-request-notice strong {
+  font-size: 18px;
+}
+
+.operator-request-notice span {
   font-size: 13px;
   font-weight: 900;
 }
@@ -790,6 +835,18 @@ label span {
 .status-pill.underpack {
   background: #ffe2b8;
   color: var(--warn);
+}
+
+.status-pill.loaded {
+  background: #dfe7ff;
+  color: var(--blue);
+}
+
+.dispatch-plan-note {
+  margin: 2px 0 0;
+  color: var(--ok);
+  font-size: 14px;
+  font-weight: 900;
 }
 
 .detail-panel {

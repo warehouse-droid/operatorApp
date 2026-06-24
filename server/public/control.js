@@ -9,6 +9,7 @@ let classifications = [];
 let cycleRecords = [];
 let fulfillmentRecords = [];
 let recordWarnings = [];
+let syncSettings = { mode: "manual", running: false, lastStatus: "idle" };
 let classificationSearch = "";
 let bootstrapNeeded = false;
 let activeSection = localStorage.getItem("mbbs.control.section") || "dashboard";
@@ -88,8 +89,9 @@ function render() {
       <div class="control-layout">
         <nav class="control-menu">
           ${renderMenuButton("dashboard", "Dashboard", "Quick status and shortcuts")}
-          ${renderMenuButton("operators", "Operators", "Register and manage accounts")}
+          ${renderMenuButton("operators", "Account Management", "Register and manage accounts")}
           ${renderMenuButton("classification", "Item Classification", "Maintain type, brand, series")}
+          ${renderMenuButton("sync", "Sync Settings", "Auto or manual NetSuite sync")}
           ${renderMenuButton("warnings", "Operator Warnings", "Handle reported record problems")}
           ${renderMenuButton("cycle-count", "Cycle Count Review", "Review submitted blind counts")}
           ${renderMenuButton("fulfillment", "Delivery Fulfillment", "Review IF posting records")}
@@ -115,6 +117,7 @@ function renderMenuButton(section, title, subtitle) {
 function renderActiveSection() {
   if (activeSection === "operators") return renderOperatorsSection();
   if (activeSection === "classification") return renderClassificationSection();
+  if (activeSection === "sync") return renderSyncSection();
   if (activeSection === "warnings") return renderWarningsSection();
   if (activeSection === "cycle-count") return renderCycleCountSection();
   if (activeSection === "fulfillment") return renderFulfillmentSection();
@@ -129,7 +132,7 @@ function renderDashboardSection() {
   return `
     <div class="dashboard-grid">
       <button class="metric-card" data-action="control-section" data-section="operators" type="button">
-        <span>Operators</span>
+        <span>Accounts</span>
         <strong>${activeOperators} / ${operators.length}</strong>
         <em>active accounts</em>
       </button>
@@ -142,6 +145,11 @@ function renderDashboardSection() {
         <span>Audit Log</span>
         <strong>${audit.length}</strong>
         <em>latest records loaded</em>
+      </button>
+      <button class="metric-card" data-action="control-section" data-section="sync" type="button">
+        <span>NetSuite Sync</span>
+        <strong>${syncSettings.mode === "auto" ? "Auto" : "Manual"}</strong>
+        <em>${syncSettings.running ? "sync running" : syncSettings.lastStatus || "idle"}</em>
       </button>
       <button class="metric-card ${openWarnings ? "warning" : ""}" data-action="control-section" data-section="warnings" type="button">
         <span>Operator Warnings</span>
@@ -168,6 +176,44 @@ function renderDashboardSection() {
       </div>
     </section>
 `;
+}
+
+function renderSyncSection() {
+  const isAuto = syncSettings.mode === "auto";
+  return `
+    <section class="panel">
+      <div class="section-heading">
+        <div>
+          <h2>NetSuite Sync Settings</h2>
+          <p class="muted">Control whether the server syncs SO, TO, and PO data automatically or only when requested.</p>
+        </div>
+        <button data-action="refresh">Refresh</button>
+      </div>
+      <div class="sync-mode-grid">
+        <button class="sync-mode-card ${isAuto ? "active" : ""}" data-action="set-sync-mode" data-mode="auto" type="button">
+          <strong>Auto Sync</strong>
+          <span>Server syncs NetSuite order feed every minute.</span>
+        </button>
+        <button class="sync-mode-card ${!isAuto ? "active" : ""}" data-action="set-sync-mode" data-mode="manual" type="button">
+          <strong>Manual Sync</strong>
+          <span>Server syncs only when an admin or dispatcher starts it.</span>
+        </button>
+      </div>
+      <div class="sync-status-grid">
+        <div><span>Mode</span><strong>${isAuto ? "Auto" : "Manual"}</strong></div>
+        <div><span>Running</span><strong>${syncSettings.running ? "Yes" : "No"}</strong></div>
+        <div><span>Last Status</span><strong>${escapeHtml(syncSettings.lastStatus || "idle")}</strong></div>
+        <div><span>Last Source</span><strong>${escapeHtml(syncSettings.lastSource || "")}</strong></div>
+        <div><span>Last Started</span><strong>${formatDate(syncSettings.lastStartedAt)}</strong></div>
+        <div><span>Last Finished</span><strong>${formatDate(syncSettings.lastFinishedAt)}</strong></div>
+      </div>
+      ${syncSettings.lastError ? `<div class="notice sync-error">${escapeHtml(syncSettings.lastError)}</div>` : ""}
+      <div class="actions">
+        <button class="primary" data-action="run-sync-now" type="button" ${syncSettings.running ? "disabled" : ""}>Run Sync Now</button>
+        <button data-action="refresh" type="button">Refresh Status</button>
+      </div>
+    </section>
+  `;
 }
 
 function warningTypeLabel(type) {
@@ -231,7 +277,7 @@ function renderOperatorsSection() {
   return `
     <div class="grid">
       <section class="panel">
-        <h2>Register Operator</h2>
+        <h2>Register Account</h2>
         <form class="form-grid" data-form="create-operator">
           <label><span>Username</span><input id="newUsername" required /></label>
           <label><span>Display name</span><input id="newDisplayName" required /></label>
@@ -240,6 +286,7 @@ function renderOperatorsSection() {
             <span>Role</span>
             <select id="newRole">
               <option value="operator">Operator</option>
+              <option value="dispatcher">Dispatcher</option>
               <option value="admin">Admin</option>
             </select>
           </label>
@@ -247,7 +294,7 @@ function renderOperatorsSection() {
         </form>
       </section>
       <section class="panel">
-        <h2>Operators</h2>
+        <h2>Accounts</h2>
         ${renderOperators()}
       </section>
     </div>
@@ -468,6 +515,7 @@ async function loadControlData() {
   cycleRecords = await request("/api/cycle-count/records?limit=50");
   fulfillmentRecords = await request("/api/delivery/fulfillments?limit=100");
   recordWarnings = await request("/api/control/record-warnings?limit=100");
+  syncSettings = await request("/api/control/sync-settings");
   render();
 }
 
@@ -548,6 +596,19 @@ app.addEventListener("click", async (event) => {
         method: "POST",
         body: JSON.stringify({ locationIds: [1, 13] })
       });
+      return loadControlData();
+    }
+    if (button.dataset.action === "set-sync-mode") {
+      syncSettings = await request("/api/control/sync-settings", {
+        method: "PUT",
+        body: JSON.stringify({ mode: button.dataset.mode })
+      });
+      return loadControlData();
+    }
+    if (button.dataset.action === "run-sync-now") {
+      button.disabled = true;
+      button.textContent = "Syncing...";
+      await request("/api/control/sync-now", { method: "POST" });
       return loadControlData();
     }
     if (button.dataset.action === "save-classification") {

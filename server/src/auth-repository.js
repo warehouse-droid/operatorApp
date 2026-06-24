@@ -45,7 +45,7 @@ export async function createOperator({ username, displayName, password, role = "
   if (!cleanUsername) throw new Error("Username is required.");
   if (!cleanDisplayName) throw new Error("Display name is required.");
   if (!password || String(password).length < 6) throw new Error("Password must be at least 6 characters.");
-  if (!["operator", "admin"].includes(role)) throw new Error("Invalid operator role.");
+  if (!["operator", "dispatcher", "admin"].includes(role)) throw new Error("Invalid operator role.");
 
   const { salt, hash } = await hashPassword(String(password));
   const id = crypto.randomUUID();

@@ -11,6 +11,28 @@ function nullableNumber(value) {
   return Number(String(value).replaceAll(",", ""));
 }
 
+function ruleBasedClassification(itemName = "") {
+  const name = String(itemName || "").trim();
+  const [prefix = "", series = ""] = name.split("-");
+  const key = prefix.toUpperCase();
+  const rules = {
+    UNI: { productType: "Interlocking", brand: "Unilock" },
+    BWS: { productType: "Interlocking", brand: "BWS" },
+    PER: { productType: "Interlocking", brand: "Per" },
+    BC: { productType: "Interlocking", brand: "Browns" },
+    ARCH: { productType: "Natural Stone", brand: "Stone Arch" },
+    BNS: { productType: "Natural Stone", brand: "Banas" },
+    OAK: { productType: "Natural Stone", brand: "Oakville" }
+  };
+  const rule = rules[key];
+  if (!rule) return { productType: null, brand: null, series: null };
+  return {
+    productType: rule.productType,
+    brand: rule.brand,
+    series: series || null
+  };
+}
+
 export async function upsertInventoryBalances(rows) {
   let itemCount = 0;
   let balanceCount = 0;
@@ -19,12 +41,13 @@ export async function upsertInventoryBalances(rows) {
     const itemId = Number(row.item_id);
     const locationId = Number(row.location_id);
     if (!Number.isInteger(itemId) || !Number.isInteger(locationId)) continue;
+    const classification = ruleBasedClassification(row.item_name || row.display_name || "");
 
     await query(
       `INSERT INTO inventory_items (
          item_id, item_name, display_name, item_description, item_type, item_type_text,
-         stock_unit, to_plt, to_lyr, to_sec, to_pcs, raw, synced_at
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, now())
+         stock_unit, to_plt, to_lyr, to_sec, to_pcs, product_type, brand, series, raw, synced_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, now())
        ON CONFLICT (item_id) DO UPDATE SET
          item_name = EXCLUDED.item_name,
          display_name = EXCLUDED.display_name,
@@ -36,6 +59,9 @@ export async function upsertInventoryBalances(rows) {
          to_lyr = EXCLUDED.to_lyr,
          to_sec = EXCLUDED.to_sec,
          to_pcs = EXCLUDED.to_pcs,
+         product_type = CASE WHEN inventory_items.classification_updated_by IS NULL THEN EXCLUDED.product_type ELSE inventory_items.product_type END,
+         brand = CASE WHEN inventory_items.classification_updated_by IS NULL THEN EXCLUDED.brand ELSE inventory_items.brand END,
+         series = CASE WHEN inventory_items.classification_updated_by IS NULL THEN EXCLUDED.series ELSE inventory_items.series END,
          raw = EXCLUDED.raw,
          synced_at = now()`,
       [
@@ -50,6 +76,9 @@ export async function upsertInventoryBalances(rows) {
         nullableNumber(row.to_lyr),
         nullableNumber(row.to_sec),
         nullableNumber(row.to_pcs),
+        classification.productType,
+        classification.brand,
+        classification.series,
         JSON.stringify(row)
       ]
     );
@@ -76,6 +105,30 @@ export async function upsertInventoryBalances(rows) {
   }
 
   return { items: itemCount, balances: balanceCount };
+}
+
+export async function applyInventoryClassificationRules() {
+  const result = await query(
+    `SELECT item_id, item_name, display_name
+     FROM inventory_items
+     WHERE classification_updated_by IS NULL`
+  );
+  let updated = 0;
+  for (const item of result.rows) {
+    const classification = ruleBasedClassification(item.item_name || item.display_name || "");
+    if (!classification.productType && !classification.brand && !classification.series) continue;
+    await query(
+      `UPDATE inventory_items
+       SET product_type = $2,
+           brand = $3,
+           series = $4
+       WHERE item_id = $1
+         AND classification_updated_by IS NULL`,
+      [item.item_id, classification.productType, classification.brand, classification.series]
+    );
+    updated += 1;
+  }
+  return { scanned: result.rowCount, updated };
 }
 
 export async function listInventoryClassifications({ search = null, limit = 300 } = {}) {

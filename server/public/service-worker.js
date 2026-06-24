@@ -1,10 +1,15 @@
-const CACHE_NAME = "mbbs-yard-operator-v6";
+const CACHE_NAME = "mbbs-yard-operator-v15";
 const APP_SHELL = [
   "/operator",
   "/operator.html",
   "/operator.css?v=20260622-history-units",
-  "/operator.js?v=20260622-history-units",
+  "/operator.js?v=20260624-events",
+  "/driver",
+  "/driver.html",
+  "/driver.css?v=20260624-driver-9",
+  "/driver.js?v=20260624-driver-9",
   "/manifest.webmanifest",
+  "/driver-manifest.webmanifest",
   "/icons/mbbs-yard-192.png",
   "/icons/mbbs-yard-512.png",
   "/icons/mbbs-yard.svg"
@@ -35,6 +40,6 @@ self.addEventListener("fetch", (event) => {
         caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
         return response;
       })
-      .catch(() => caches.match(event.request).then((cached) => cached || caches.match("/operator")))
+      .catch(() => caches.match(event.request).then((cached) => cached || caches.match(url.pathname.startsWith("/driver") ? "/driver" : "/operator")))
   );
 });

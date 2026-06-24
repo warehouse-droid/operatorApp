@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MBBS Dispatch</title>
+    <link rel="stylesheet" href="/dispatch.css" />
+  </head>
+  <body>
+    <main class="dispatch-shell dispatch-menu-shell" id="dispatchMenuApp"></main>
+    <script src="/dispatch-auth.js"></script>
+    <script>
+      requireDispatchLogin({
+        mount: document.getElementById("dispatchMenuApp"),
+        onReady(operator) {
+          document.getElementById("dispatchMenuApp").innerHTML = `
+            <header class="dispatch-topbar">
+              <div>
+                <p>MBBS Transportation</p>
+                <h1>Dispatch</h1>
+              </div>
+              <div></div>
+              <div class="topbar-actions">
+                <span class="dispatch-user">${operator.display_name || operator.username}</span>
+                <button onclick="dispatchLogout()" type="button">Logout</button>
+              </div>
+            </header>
+            <section class="dispatch-menu-page">
+              <div class="dispatch-menu-heading">
+                <h2>Dispatch Menu</h2>
+                <p>Open planning or dispatch setup.</p>
+              </div>
+              <div class="dispatch-menu-grid two-up">
+                <button class="dispatch-menu-card primary-card" onclick="location.href='/dispatch/planning'" type="button">
+                  <strong>Planning</strong>
+                  <span>Build daily truck loads, routes, CO transit moves, and stop sequences.</span>
+                </button>
+                <button class="dispatch-menu-card" onclick="location.href='/dispatch/setup'" type="button">
+                  <strong>Setup</strong>
+                  <span>Drivers, trucks, vendor hours, parser rules, and dispatch action log.</span>
+                </button>
+              </div>
+            </section>
+          `;
+        }
+      });
+    </script>
+  </body>
+</html>

@@ -1,5 +1,6 @@
 import { query } from "./db.js";
 import { writeAudit } from "./auth-repository.js";
+import { enrichSalesOrderDispatch, enrichTransferDispatch } from "./dispatch-enrichment.js";
 
 function normalizeNetSuiteDate(value) {
   if (!value) return null;
@@ -71,6 +72,9 @@ function changedFields(before, after, fields) {
 
 export async function upsertDeliveryOrders(orders) {
   for (const order of orders) {
+    const dispatch = order.order_type === "transfer_order"
+      ? enrichTransferDispatch(order)
+      : await enrichSalesOrderDispatch(order);
     const normalized = {
       netsuite_id: order.id,
       tranid: order.tranid,
@@ -79,6 +83,7 @@ export async function upsertDeliveryOrders(orders) {
       customer: order.customer,
       status: order.status,
       status_text: order.status_text,
+      expected_delivery_date: normalizeNetSuiteDate(order.expected_delivery_date),
       foreign_total: normalizeNumber(order.foreigntotal),
       order_location_id: order.order_location_id,
       order_location: order.order_location,
@@ -86,33 +91,51 @@ export async function upsertDeliveryOrders(orders) {
       outbound_location: order.outbound_location,
       delivery_method_id: order.delivery_method_id,
       delivery_method: order.delivery_method,
+      memo: order.memo,
       order_type: order.order_type || "sales_order",
       source_location_id: order.source_location_id,
       source_location: order.source_location,
       destination_location_id: order.destination_location_id,
-      destination_location: order.destination_location
+      destination_location: order.destination_location,
+      ...dispatch
     };
     const existing = await query(
       `SELECT tranid, trandate, customer_id, customer, status, status_text,
-              foreign_total, order_location_id, order_location, outbound_location_id,
+              expected_delivery_date, foreign_total, order_location_id, order_location, outbound_location_id,
               outbound_location, delivery_method_id, delivery_method, order_type,
-              source_location_id, source_location, destination_location_id, destination_location
+              source_location_id, source_location, destination_location_id, destination_location,
+              memo, dispatch_address, dispatch_window_start, dispatch_window_end,
+              dispatch_instructions, dispatch_parse_source, dispatch_note_hash
        FROM delivery_orders
        WHERE netsuite_id = $1`,
       [normalized.netsuite_id]
     );
+    const previous = existing.rows[0];
+    if (
+      previous?.dispatch_parse_source === "manual-dispatch-details"
+      && previous.dispatch_note_hash === normalized.dispatch_note_hash
+    ) {
+      normalized.dispatch_address = previous.dispatch_address;
+      normalized.dispatch_window_start = previous.dispatch_window_start;
+      normalized.dispatch_window_end = previous.dispatch_window_end;
+      normalized.dispatch_instructions = previous.dispatch_instructions;
+      normalized.dispatch_parse_source = previous.dispatch_parse_source;
+    }
 
     await query(
       `INSERT INTO delivery_orders (
         netsuite_id, tranid, trandate, customer_id, customer, status, status_text,
-        foreign_total, order_location_id, order_location, outbound_location_id,
+        expected_delivery_date, foreign_total, order_location_id, order_location, outbound_location_id,
         outbound_location, delivery_method_id, delivery_method, order_type,
         source_location_id, source_location, destination_location_id, destination_location,
+        memo, dispatch_address, dispatch_window_start, dispatch_window_end,
+        dispatch_instructions, dispatch_parse_source, dispatch_note_hash, dispatch_parsed_at,
         netsuite_active, netsuite_missing_at, synced_at
       ) VALUES (
         $1, $2, $3, $4, $5, $6, $7,
-        $8, $9, $10, $11,
-        $12, $13, $14, $15, $16, $17, $18, $19, true, null, now()
+        $8, $9, $10, $11, $12,
+        $13, $14, $15, $16, $17, $18, $19, $20,
+        $21, $22, $23, $24, $25, $26, $27, now(), true, null, now()
       )
       ON CONFLICT (netsuite_id) DO UPDATE SET
         tranid = EXCLUDED.tranid,
@@ -121,6 +144,7 @@ export async function upsertDeliveryOrders(orders) {
         customer = EXCLUDED.customer,
         status = EXCLUDED.status,
         status_text = EXCLUDED.status_text,
+        expected_delivery_date = EXCLUDED.expected_delivery_date,
         foreign_total = EXCLUDED.foreign_total,
         order_location_id = EXCLUDED.order_location_id,
         order_location = EXCLUDED.order_location,
@@ -133,6 +157,17 @@ export async function upsertDeliveryOrders(orders) {
         source_location = EXCLUDED.source_location,
         destination_location_id = EXCLUDED.destination_location_id,
         destination_location = EXCLUDED.destination_location,
+        memo = EXCLUDED.memo,
+        dispatch_address = EXCLUDED.dispatch_address,
+        dispatch_window_start = EXCLUDED.dispatch_window_start,
+        dispatch_window_end = EXCLUDED.dispatch_window_end,
+        dispatch_instructions = EXCLUDED.dispatch_instructions,
+        dispatch_parse_source = EXCLUDED.dispatch_parse_source,
+        dispatch_note_hash = EXCLUDED.dispatch_note_hash,
+        dispatch_parsed_at = CASE
+          WHEN delivery_orders.dispatch_note_hash IS DISTINCT FROM EXCLUDED.dispatch_note_hash THEN now()
+          ELSE delivery_orders.dispatch_parsed_at
+        END,
         netsuite_active = true,
         netsuite_missing_at = null,
         synced_at = now()`,
@@ -144,6 +179,7 @@ export async function upsertDeliveryOrders(orders) {
         normalized.customer,
         normalized.status,
         normalized.status_text,
+        normalized.expected_delivery_date,
         normalized.foreign_total,
         normalized.order_location_id,
         normalized.order_location,
@@ -155,15 +191,24 @@ export async function upsertDeliveryOrders(orders) {
         normalized.source_location_id,
         normalized.source_location,
         normalized.destination_location_id,
-        normalized.destination_location
+        normalized.destination_location,
+        normalized.memo,
+        normalized.dispatch_address,
+        normalized.dispatch_window_start,
+        normalized.dispatch_window_end,
+        normalized.dispatch_instructions,
+        normalized.dispatch_parse_source,
+        normalized.dispatch_note_hash
       ]
     );
 
     const fields = [
       "tranid", "trandate", "customer_id", "customer", "status", "status_text",
-      "foreign_total", "order_location_id", "order_location", "outbound_location_id",
+      "expected_delivery_date", "foreign_total", "order_location_id", "order_location", "outbound_location_id",
       "outbound_location", "delivery_method_id", "delivery_method", "order_type",
-      "source_location_id", "source_location", "destination_location_id", "destination_location"
+      "source_location_id", "source_location", "destination_location_id", "destination_location",
+      "memo", "dispatch_address", "dispatch_window_start", "dispatch_window_end",
+      "dispatch_instructions", "dispatch_parse_source", "dispatch_note_hash"
     ];
     const changes = existing.rowCount ? changedFields(existing.rows[0], normalized, fields) : {};
     if (!existing.rowCount || Object.keys(changes).length) {
@@ -350,13 +395,14 @@ export async function listDeliveryOrders({ locationId = null, status = "active",
      WHERE ${statusClause}
        ${locationClause}
         AND order_type = $${params.length}
+        AND COALESCE(local_yard_order_status, 'Open') <> 'Loaded'
         AND netsuite_active = true
         AND (
           (order_type = 'sales_order' AND (status = 'B' OR fulfillment_status = 'partial_fulfilled'))
           OR (order_type = 'transfer_order' AND (status_text ILIKE '%Pending Fulfillment%' OR fulfillment_status = 'partial_fulfilled'))
         )
         AND fulfillment_status <> 'fulfilled'
-     ORDER BY warning_count DESC, underpack_count DESC, trandate DESC, tranid DESC`
+     ORDER BY dispatch_planned DESC, warning_count DESC, underpack_count DESC, trandate DESC, tranid DESC`
     ,
     params
   );
@@ -418,6 +464,64 @@ export async function getDeliveryOrder(id) {
   );
 
   return { ...order.rows[0], lines: lines.rows };
+}
+
+export async function applyConfirmedDispatchPlanToDelivery(plan) {
+  if (!plan?.planDate || !Array.isArray(plan.trucks)) return { planned: 0 };
+  await query(
+    `UPDATE delivery_orders
+        SET dispatch_planned = false,
+            dispatch_plan_date = null,
+            dispatch_truck_plate = null,
+            dispatch_load_name = null,
+            dispatch_parking_spot = null,
+            dispatch_planned_at = null
+      WHERE dispatch_plan_date = $1`,
+    [plan.planDate]
+  );
+
+  const plannedRows = [];
+  for (const truck of plan.trucks || []) {
+    for (const load of truck.loads || []) {
+      if (load.returnOnly) continue;
+      for (const stop of load.stops || []) {
+        if (stop.type !== "drop" || !stop.orderId) continue;
+        const order = (plan.orders || []).find((item) => item.id === stop.orderId);
+        if (!["SO", "TO"].includes(order?.type)) continue;
+        plannedRows.push({
+          tranid: order.id,
+          truckPlate: truck.plate || "",
+          loadName: load.name || "",
+          parkingSpot: truck.parkingSpot || "",
+          planDate: plan.planDate
+        });
+      }
+    }
+  }
+
+  for (const row of plannedRows) {
+    await query(
+      `UPDATE delivery_orders
+          SET dispatch_planned = true,
+              dispatch_plan_date = $2,
+              dispatch_truck_plate = $3,
+              dispatch_load_name = $4,
+              dispatch_parking_spot = $5,
+              dispatch_planned_at = now()
+        WHERE tranid = $1
+          AND order_type IN ('sales_order', 'transfer_order')
+          AND COALESCE(local_yard_order_status, 'Open') <> 'Loaded'`,
+      [row.tranid, row.planDate, row.truckPlate, row.loadName, row.parkingSpot]
+    );
+  }
+
+  await writeAudit({
+    actorType: "system",
+    source: "dispatch",
+    action: "dispatch.plan.operator_flags_applied",
+    details: { planDate: plan.planDate, plannedCount: plannedRows.length }
+  });
+  return { planned: plannedRows.length };
 }
 
 export async function getFulfillableDeliveryOrder(orderId) {
@@ -603,6 +707,75 @@ export async function recordDeliveryFulfillment(orderId, operatorId, { photoData
   });
 
   return { fulfillmentStatus, itemFulfillmentId, itemFulfillmentTranid };
+}
+
+export async function recordDeliveryLoad(orderId, operatorId, { photoDataUrl }) {
+  if (!photoDataUrl || !String(photoDataUrl).startsWith("data:image/")) {
+    throw new Error("Photo proof is required.");
+  }
+  const order = await getDeliveryOrder(orderId);
+  if (!order) throw new Error("Delivery order not found.");
+  if (!["packed", "loaded"].includes(order.operator_status)) {
+    throw new Error("Order must be packed before loading.");
+  }
+
+  await query(
+    `INSERT INTO delivery_fulfillment_records (
+       order_id, operator_id, item_fulfillment_id, item_fulfillment_tranid,
+       fulfillment_status, photo_data_url, payload, response
+     ) VALUES ($1, $2, null, null, 'loaded', $3, '{}'::jsonb, $4::jsonb)`,
+    [
+      orderId,
+      operatorId || null,
+      photoDataUrl,
+      JSON.stringify({
+        localYardOrderStatus: "Loaded",
+        dispatchPlanDate: order.dispatch_plan_date,
+        dispatchTruckPlate: order.dispatch_truck_plate,
+        dispatchLoadName: order.dispatch_load_name,
+        dispatchParkingSpot: order.dispatch_parking_spot
+      })
+    ]
+  );
+
+  await query(
+    `UPDATE delivery_orders
+        SET local_yard_order_status = 'Loaded',
+            operator_status = 'loaded',
+            status_updated_at = now()
+      WHERE netsuite_id = $1`,
+    [orderId]
+  );
+
+  await query(
+    `UPDATE local_co_orders
+        SET status = 'loaded',
+            loaded_at = now(),
+            updated_at = now()
+      WHERE delivery_order_id = $1`,
+    [orderId]
+  );
+
+  await writeAudit({
+    actorOperatorId: operatorId,
+    action: "delivery.order.load",
+    orderId,
+    details: {
+      localYardOrderStatus: "Loaded",
+      dispatchPlanDate: order.dispatch_plan_date,
+      dispatchTruckPlate: order.dispatch_truck_plate,
+      dispatchLoadName: order.dispatch_load_name,
+      dispatchParkingSpot: order.dispatch_parking_spot
+    }
+  });
+
+  return {
+    localYardOrderStatus: "Loaded",
+    dispatchPlanDate: order.dispatch_plan_date,
+    dispatchTruckPlate: order.dispatch_truck_plate,
+    dispatchLoadName: order.dispatch_load_name,
+    dispatchParkingSpot: order.dispatch_parking_spot
+  };
 }
 
 export async function recordDeliveryFulfillmentFailure(orderId, operatorId, { photoDataUrl, payload, error, stage }) {
@@ -972,6 +1145,18 @@ export async function unpackDeliveryLine(orderId, lineId, values, operatorId) {
     [orderId]
   );
 
+  await query(
+    `UPDATE dispatch_operator_requests
+        SET status = 'resolved',
+            resolved_by = $2,
+            resolved_at = now()
+      WHERE status = 'open'
+        AND (order_ref = $1 OR order_ref IN (
+          SELECT tranid FROM delivery_orders WHERE netsuite_id::text = $1
+        ))`,
+    [String(orderId), operatorId || null]
+  );
+
   await writeAudit({
     actorOperatorId: operatorId,
     action: "delivery.line.unpack",
@@ -1009,6 +1194,18 @@ export async function unpackDeliveryOrder(orderId, operatorId) {
          status_updated_at = now()
      WHERE netsuite_id = $1`,
     [orderId]
+  );
+
+  await query(
+    `UPDATE dispatch_operator_requests
+        SET status = 'resolved',
+            resolved_by = $2,
+            resolved_at = now()
+      WHERE status = 'open'
+        AND (order_ref = $1 OR order_ref IN (
+          SELECT tranid FROM delivery_orders WHERE netsuite_id::text = $1
+        ))`,
+    [String(orderId), operatorId || null]
   );
 
   await writeAudit({

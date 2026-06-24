@@ -213,6 +213,69 @@ th {
   font-weight: 800;
 }
 
+.sync-mode-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.sync-mode-card {
+  min-height: 118px;
+  padding: 16px;
+  display: grid;
+  gap: 8px;
+  align-content: center;
+  text-align: left;
+}
+
+.sync-mode-card.active {
+  border-color: var(--accent);
+  background: #f0fbf8;
+  box-shadow: inset 0 0 0 3px rgba(0, 111, 107, 0.14);
+}
+
+.sync-mode-card strong {
+  font-size: 20px;
+}
+
+.sync-mode-card span {
+  color: #46545c;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.sync-status-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.sync-status-grid div {
+  border: 1px solid #d7dee2;
+  border-radius: 8px;
+  padding: 10px;
+  display: grid;
+  gap: 4px;
+}
+
+.sync-status-grid span {
+  color: #46545c;
+  font-size: 12px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.sync-status-grid strong {
+  min-height: 20px;
+  word-break: break-word;
+}
+
+.sync-error {
+  border-color: var(--danger);
+  background: #fff4f4;
+  color: var(--danger);
+}
+
 .login {
   width: min(460px, calc(100% - 32px));
   margin: 10vh auto;

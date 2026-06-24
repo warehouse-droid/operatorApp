@@ -15,21 +15,35 @@ function isConcurrencyLimit(status, text) {
     || /CONCURRENT_REQUEST_LIMIT_EXCEEDED|concurrent limit|exceeded.*request/i.test(text || "");
 }
 
+function isoDateDaysAgo(days = 0) {
+  const date = new Date();
+  date.setDate(date.getDate() - days);
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0")
+  ].join("-");
+}
+
 function deliveryOrderListQuery(locationId = 1) {
   const id = Number(locationId);
   if (!Number.isInteger(id) || id <= 0) {
     throw new Error("A valid numeric NetSuite location ID is required.");
   }
+  const createdFrom = isoDateDaysAgo(1);
 
   return `
 SELECT DISTINCT
   t.id,
   t.tranid,
   t.trandate,
+  t.createddate AS datecreated,
   t.entity AS customer_id,
   BUILTIN.DF(t.entity) AS customer,
   t.status,
   BUILTIN.DF(t.status) AS status_text,
+  t.custbody7 AS memo,
+  t.custbody4 AS expected_delivery_date,
   t.foreigntotal,
   t.location AS order_location_id,
   BUILTIN.DF(t.location) AS order_location,
@@ -46,7 +60,8 @@ WHERE t.type = 'SalesOrd'
   AND tl.taxline = 'F'
   AND t.status = 'B'
   AND t.custbody3 = 2
-ORDER BY t.trandate DESC
+  AND t.createddate >= TO_DATE('${createdFrom}', 'YYYY-MM-DD')
+ORDER BY t.createddate DESC, t.tranid DESC
 `;
 }
 
@@ -60,10 +75,12 @@ SELECT DISTINCT
   t.id,
   t.tranid,
   t.trandate,
+  t.createddate AS datecreated,
   t.entity AS vendor_id,
   BUILTIN.DF(t.entity) AS vendor,
   t.status,
   BUILTIN.DF(t.status) AS status_text,
+  t.memo,
   t.foreigntotal,
   tl.location AS destination_location_id,
   BUILTIN.DF(tl.location) AS destination_location
@@ -83,13 +100,18 @@ function transferOrderListQuery({ statusText, sourceLocationId = null, destinati
   const sourceFilter = sourceLocationId ? `AND t.location = ${Number(sourceLocationId)}` : "";
   const destinationFilter = destinationLocationId ? `AND t.transferlocation = ${Number(destinationLocationId)}` : "";
   const lineLocationFilter = lineLocationId ? `AND tl.location = ${Number(lineLocationId)}` : "";
+  const statusFilter = statusText === "Pending Fulfillment"
+    ? "AND t.status = 'B'"
+    : `AND BUILTIN.DF(t.status) LIKE '%${statusText}%'`;
   return `
 SELECT DISTINCT
   t.id,
   t.tranid,
   t.trandate,
+  t.createddate AS datecreated,
   t.status,
   BUILTIN.DF(t.status) AS status_text,
+  t.custbody7 AS memo,
   t.location AS source_location_id,
   BUILTIN.DF(t.location) AS source_location,
   tl.location AS line_location_id,
@@ -103,7 +125,7 @@ WHERE t.type = 'TrnfrOrd'
   AND tl.quantity < 0
   AND tl.mainline = 'F'
   AND tl.taxline = 'F'
-  AND BUILTIN.DF(t.status) LIKE '%${statusText}%'
+  ${statusFilter}
   ${sourceFilter}
   ${destinationFilter}
   ${lineLocationFilter}
@@ -483,6 +505,8 @@ export async function fetchDeliveryOrderFromNetSuite(orderId, locationId = null)
       BUILTIN.DF(t.entity) AS customer,
       t.status,
       BUILTIN.DF(t.status) AS status_text,
+      t.custbody7 AS memo,
+      t.custbody4 AS expected_delivery_date,
       t.foreigntotal,
       t.location AS order_location_id,
       BUILTIN.DF(t.location) AS order_location,
@@ -517,6 +541,7 @@ export async function fetchTransferDeliveryOrderFromNetSuite(orderId, locationId
       t.trandate,
       t.status,
       BUILTIN.DF(t.status) AS status_text,
+      t.memo,
       t.location AS source_location_id,
       BUILTIN.DF(t.location) AS source_location,
       tl.location AS line_location_id,
@@ -655,6 +680,7 @@ export async function fetchPurchaseOrderFromNetSuite(orderId, locationId = null)
       BUILTIN.DF(t.entity) AS vendor,
       t.status,
       BUILTIN.DF(t.status) AS status_text,
+      t.memo,
       t.foreigntotal,
       tl.location AS destination_location_id,
       BUILTIN.DF(tl.location) AS destination_location
@@ -741,6 +767,7 @@ export async function fetchTransferReceivingOrderFromNetSuite(orderId, sourceLoc
       t.trandate,
       t.status,
       BUILTIN.DF(t.status) AS status_text,
+      t.custbody7 AS memo,
       t.location AS source_location_id,
       BUILTIN.DF(t.location) AS source_location,
       tl.location AS line_location_id,
