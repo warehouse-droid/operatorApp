@@ -1,3 +1,5 @@
 server/.env
-server/.env.old
+server/.env.*
+!server/.env.example
+server/data/env-selection.json
 server/node_modules/

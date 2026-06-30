@@ -3,19 +3,26 @@ const setupApp = document.getElementById("dispatchSetupApp");
 let setupTab = "drivers";
 let selectedSetupIndex = null;
 let drivers = [
-  { name: "Alex Wong", license: "AZ", number: "A90211", login: "alex", ownYardFixedMinutes: 42, outsideFixedMinutes: 36, minutesPerPallet: 1, loadMinutes: 42, unloadMinutes: 36 },
-  { name: "Jenny Lee", license: "DZ", number: "D18870", login: "jenny", ownYardFixedMinutes: 38, outsideFixedMinutes: 32, minutesPerPallet: 1, loadMinutes: 38, unloadMinutes: 32 }
+  { name: "Alex Wong", license: "AZ", number: "A90211", login: "alex", ownYardFixedMinutes: 42, vendorFixedMinutes: 36, deliveryFixedMinutes: 36, outsideFixedMinutes: 36, minutesPerPallet: 1, loadMinutes: 42, unloadMinutes: 36 },
+  { name: "Jenny Lee", license: "DZ", number: "D18870", login: "jenny", ownYardFixedMinutes: 38, vendorFixedMinutes: 32, deliveryFixedMinutes: 32, outsideFixedMinutes: 32, minutesPerPallet: 1, loadMinutes: 38, unloadMinutes: 32 }
 ];
 let trucks = [
   { plate: "MBBS-101", capacityLbs: 48000 },
   { plate: "MBBS-205", capacityLbs: 44000 },
   { plate: "MBBS-318", capacityLbs: 52000 }
 ];
+let ownYards = [
+  { code: "3445", name: "3445", address: "3445 Kennedy Road, Toronto, ON", lat: 43.8204306, lng: -79.3053423 },
+  { code: "2967", name: "2967", address: "2967 Kennedy Road, Toronto, ON", lat: 43.806119, lng: -79.2986377 },
+  { code: "12441", name: "12441", address: "12441 Woodbine Avenue, Whitchurch-Stouffville, ON", lat: 43.948694, lng: -79.3727582 }
+];
 let vendorYards = [];
 let parserRules = [];
 let ollamaAudit = [];
 let dispatchAudit = [];
 let setupNotice = "";
+let samsaraTestResult = null;
+let samsaraSettings = { dvirAuthorId: "1868723" };
 let selectedVendor = "";
 let selectedYard = "";
 let vendorAddMode = false;
@@ -52,6 +59,8 @@ async function loadDispatchSetup() {
     const setup = await api("/api/dispatch/setup");
     if (Array.isArray(setup.drivers)) drivers = setup.drivers;
     if (Array.isArray(setup.trucks)) trucks = setup.trucks;
+    if (Array.isArray(setup.ownYards)) ownYards = setup.ownYards;
+    if (setup.samsara) samsaraSettings = { ...samsaraSettings, ...setup.samsara };
   } catch (error) {
     setupNotice = `Dispatch setup failed to load: ${error.message}`;
   }
@@ -60,10 +69,12 @@ async function loadDispatchSetup() {
 async function saveDispatchSetup() {
   const saved = await api("/api/dispatch/setup", {
     method: "PUT",
-    body: JSON.stringify({ drivers, trucks })
+    body: JSON.stringify({ drivers, trucks, ownYards, samsara: samsaraSettings })
   });
   if (Array.isArray(saved.drivers)) drivers = saved.drivers;
   if (Array.isArray(saved.trucks)) trucks = saved.trucks;
+  if (Array.isArray(saved.ownYards)) ownYards = saved.ownYards;
+  if (saved.samsara) samsaraSettings = { ...samsaraSettings, ...saved.samsara };
 }
 
 async function loadParserRules() {
@@ -149,11 +160,28 @@ function ownYardFixedMinutesFor(driver) {
 }
 
 function outsideFixedMinutesFor(driver) {
-  return Number(driver?.outsideFixedMinutes || driver?.unloadMinutes || 35);
+  return deliveryFixedMinutesFor(driver);
+}
+
+function vendorFixedMinutesFor(driver) {
+  return Number(driver?.vendorFixedMinutes || driver?.outsideFixedMinutes || driver?.unloadMinutes || 35);
+}
+
+function deliveryFixedMinutesFor(driver) {
+  return Number(driver?.deliveryFixedMinutes || driver?.outsideFixedMinutes || driver?.unloadMinutes || 35);
 }
 
 function minutesPerPalletFor(driver) {
   return Number(driver?.minutesPerPallet || 1);
+}
+
+function samsaraLoginSummary(driver) {
+  const primary = String(driver?.samsaraPrimaryLogin || "").trim();
+  const secondary = String(driver?.samsaraSecondaryLogin || "").trim();
+  const parts = [];
+  if (primary) parts.push(`Primary username ${primary}`);
+  if (secondary) parts.push(`Secondary username ${secondary}`);
+  return parts.join(" | ");
 }
 
 function displayTime24(value) {
@@ -223,7 +251,9 @@ function renderSetup() {
           <div class="setup-menu">
             <button class="${setupTab === "drivers" ? "active" : ""}" data-tab="drivers" type="button">Drivers</button>
             <button class="${setupTab === "trucks" ? "active" : ""}" data-tab="trucks" type="button">Trucks</button>
+            <button class="${setupTab === "own-yards" ? "active" : ""}" data-tab="own-yards" type="button">Own Yards</button>
             <button class="${setupTab === "vendors" ? "active" : ""}" data-tab="vendors" type="button">Vendor Hours</button>
+            <button class="${setupTab === "samsara" ? "active" : ""}" data-tab="samsara" type="button">Samsara</button>
             <button class="${setupTab === "parser" ? "active" : ""}" data-tab="parser" type="button">Parser Rules</button>
             <button class="${setupTab === "dispatch-log" ? "active" : ""}" data-tab="dispatch-log" type="button">Dispatch Log</button>
             <button class="${setupTab === "audit" ? "active" : ""}" data-tab="audit" type="button">Ollama Audit</button>
@@ -231,14 +261,26 @@ function renderSetup() {
         </section>
         <section class="panel">
           <div class="panel-header">
-            <h2>${setupTab === "drivers" ? "Driver Registration" : setupTab === "trucks" ? "Truck Registration" : setupTab === "vendors" ? "Vendor Address & Hours" : setupTab === "parser" ? "Label Parser Rules" : setupTab === "dispatch-log" ? "Dispatch Action Log" : "Ollama Input & Output Audit"}</h2>
-            <p>${setupTab === "drivers" ? "Driver login, license, and service speed." : setupTab === "trucks" ? "Vehicle plate and weight capacity." : setupTab === "vendors" ? "Used to match PO vendor yards and plan pickup windows." : setupTab === "parser" ? "Maintain address/time labels and default meanings such as PM or whole day." : setupTab === "dispatch-log" ? "Review planner updates, drag/drop actions, load changes, and manual edits." : "Review parser prompts, model responses, and parsed results."}</p>
+            <h2>${setupTab === "drivers" ? "Driver Registration" : setupTab === "trucks" ? "Truck Registration" : setupTab === "own-yards" ? "Own Yard Addresses" : setupTab === "vendors" ? "Vendor Address & Hours" : setupTab === "samsara" ? "Samsara Settings" : setupTab === "parser" ? "Label Parser Rules" : setupTab === "dispatch-log" ? "Dispatch Action Log" : "Ollama Input & Output Audit"}</h2>
+            <p>${setupTab === "drivers" ? "Driver login, license, and service speed." : setupTab === "trucks" ? "Vehicle plate and weight capacity." : setupTab === "own-yards" ? "Used to route yard pickup, return, transfer, and truck reposition stops." : setupTab === "vendors" ? "Used to match PO vendor yards and plan pickup windows." : setupTab === "samsara" ? "Configure Samsara DVIR author and connection checks." : setupTab === "parser" ? "Maintain address/time labels and default meanings such as PM or whole day." : setupTab === "dispatch-log" ? "Review planner updates, drag/drop actions, load changes, and manual edits." : "Review parser prompts, model responses, and parsed results."}</p>
           </div>
           ${setupNotice ? `<div class="setup-notice">${escapeHtml(setupNotice)}</div>` : ""}
-          ${setupTab === "drivers" ? renderDrivers() : setupTab === "trucks" ? renderTrucks() : setupTab === "vendors" ? renderVendorYards() : setupTab === "parser" ? renderParserRules() : setupTab === "dispatch-log" ? renderDispatchAudit() : renderOllamaAudit()}
+          ${setupTab === "drivers" && samsaraTestResult ? renderSamsaraTestResult() : ""}
+          ${setupTab === "drivers" ? renderDrivers() : setupTab === "trucks" ? renderTrucks() : setupTab === "own-yards" ? renderOwnYards() : setupTab === "vendors" ? renderVendorYards() : setupTab === "samsara" ? renderSamsaraSettings() : setupTab === "parser" ? renderParserRules() : setupTab === "dispatch-log" ? renderDispatchAudit() : renderOllamaAudit()}
         </section>
       </div>
     </section>
+  `;
+}
+
+function renderSamsaraTestResult() {
+  const matches = samsaraTestResult.truckMatches || [];
+  return `
+    <div class="setup-notice samsara-test-result">
+      <strong>Samsara API OK</strong>
+      <span>${Number(samsaraTestResult.vehicleCount || 0)} vehicles found.</span>
+      ${matches.length ? `<span>${matches.filter((item) => item.matched).length}/${matches.length} local trucks matched by plate.</span>` : ""}
+    </div>
   `;
 }
 
@@ -256,13 +298,19 @@ function renderDrivers() {
           <button class="registration-card ${selectedSetupIndex === index ? "selected" : ""}" data-action="select-setup-record" data-index="${index}" type="button">
             <strong>${escapeHtml(driver.name)} | ${driver.license}</strong>
             <span class="muted">License ${escapeHtml(driver.number)} | Login ${escapeHtml(driver.login)}</span>
-            <span class="muted">Own yard fixed ${ownYardFixedMinutesFor(driver)}m | Outside fixed ${outsideFixedMinutesFor(driver)}m | ${minutesPerPalletFor(driver)}m/PLT</span>
+            ${samsaraLoginSummary(driver) ? `<span class="muted">Samsara ${escapeHtml(samsaraLoginSummary(driver))}</span>` : ""}
+            <span class="muted">Own yard ${ownYardFixedMinutesFor(driver)}m | Vendor ${vendorFixedMinutesFor(driver)}m | Delivery ${deliveryFixedMinutesFor(driver)}m + ${minutesPerPalletFor(driver)}m/PLT</span>
           </button>
         `).join("")}
         </div>
       </div>
       <form class="registration-form setup-form" data-form="driver">
         <h3>${selected ? "Update Driver" : "Register Driver"}</h3>
+        <div class="form-action-row">
+          <button data-action="test-samsara-api" type="button">Test Samsara API</button>
+          ${selected ? `<button data-action="test-samsara-login" data-account="primary" type="button">Find Primary Driver</button>` : ""}
+          ${selected ? `<button data-action="test-samsara-login" data-account="secondary" type="button">Find Secondary Driver</button>` : ""}
+        </div>
         <label><span>Driver name</span><input name="name" value="${escapeHtml(selected?.name || "")}" required /></label>
         <label><span>License class</span><select name="license">
           <option ${selected?.license === "AZ" ? "selected" : ""}>AZ</option>
@@ -271,9 +319,12 @@ function renderDrivers() {
         <label><span>License number</span><input name="number" value="${escapeHtml(selected?.number || "")}" required /></label>
         <label><span>Login</span><input name="login" value="${escapeHtml(selected?.login || "")}" required /></label>
         <label><span>${selected ? "New password optional" : "Password"}</span><input name="password" type="password" ${selected ? "" : "required"} /></label>
+        <label><span>Samsara primary username</span><input name="samsaraPrimaryLogin" autocomplete="off" value="${escapeHtml(selected?.samsaraPrimaryLogin || "")}" /></label>
+        <label><span>Samsara secondary username</span><input name="samsaraSecondaryLogin" autocomplete="off" value="${escapeHtml(selected?.samsaraSecondaryLogin || "")}" /></label>
         <label><span>Fixed stop time in own yard</span><input name="ownYardFixedMinutes" type="number" value="${ownYardFixedMinutesFor(selected)}" required /></label>
-        <label><span>Fixed stop time in vendor yard / delivery</span><input name="outsideFixedMinutes" type="number" value="${outsideFixedMinutesFor(selected)}" required /></label>
-        <label><span>Minutes per pallet</span><input name="minutesPerPallet" type="number" step="0.1" value="${minutesPerPalletFor(selected)}" required /></label>
+        <label><span>Fixed stop time in vendor yard</span><input name="vendorFixedMinutes" type="number" value="${vendorFixedMinutesFor(selected)}" required /></label>
+        <label><span>Fixed stop time in delivery</span><input name="deliveryFixedMinutes" type="number" value="${deliveryFixedMinutesFor(selected)}" required /></label>
+        <label><span>Delivery minutes per pallet</span><input name="minutesPerPallet" type="number" step="0.1" value="${minutesPerPalletFor(selected)}" required /></label>
         <button class="primary" type="submit">${selected ? "Update Driver" : "Register Driver"}</button>
       </form>
     </div>
@@ -305,6 +356,58 @@ function renderTrucks() {
         <button class="primary" type="submit">${selected ? "Update Truck" : "Register Truck"}</button>
       </form>
     </div>
+  `;
+}
+
+function renderOwnYards() {
+  const selected = Number.isInteger(selectedSetupIndex) ? ownYards[selectedSetupIndex] : null;
+  return `
+    <div class="setup-content">
+      <div class="setup-list-column">
+        <div class="section-heading-row">
+          <strong>Current Yards</strong>
+          <button data-action="new-setup-record" type="button">New</button>
+        </div>
+        <div class="registration-list setup-list">
+        ${ownYards.map((yard, index) => `
+          <button class="registration-card ${selectedSetupIndex === index ? "selected" : ""}" data-action="select-setup-record" data-index="${index}" type="button">
+            <strong>${escapeHtml(yard.code || yard.name)}</strong>
+            <span class="muted">${escapeHtml(yard.name || yard.code || "")}</span>
+            <span class="muted">${escapeHtml(yard.address || "No address")}</span>
+          </button>
+        `).join("")}
+        </div>
+      </div>
+      <form class="registration-form setup-form" data-form="own-yard">
+        <h3>${selected ? "Update Yard" : "Add Yard"}</h3>
+        <label><span>Yard code</span><input name="code" value="${escapeHtml(selected?.code || "")}" placeholder="3445" required /></label>
+        <label><span>Display name</span><input name="name" value="${escapeHtml(selected?.name || selected?.code || "")}" placeholder="3445" /></label>
+        <label><span>Address</span><input name="address" value="${escapeHtml(selected?.address || "")}" placeholder="3445 Kennedy Road, Toronto, ON" required /></label>
+        <label><span>Latitude optional</span><input name="lat" type="number" step="0.000001" value="${escapeHtml(selected?.lat ?? "")}" /></label>
+        <label><span>Longitude optional</span><input name="lng" type="number" step="0.000001" value="${escapeHtml(selected?.lng ?? "")}" /></label>
+        <button class="primary" type="submit">${selected ? "Update Yard" : "Add Yard"}</button>
+      </form>
+    </div>
+  `;
+}
+
+function renderSamsaraSettings() {
+  return `
+    <form class="registration-form setup-form" data-form="samsara-settings">
+      <h3>Samsara DVIR</h3>
+      <div class="form-action-row">
+        <button data-action="test-samsara-api" type="button">Test Samsara API</button>
+      </div>
+      <label>
+        <span>DVIR author user ID</span>
+        <input name="dvirAuthorId" value="${escapeHtml(samsaraSettings.dvirAuthorId || "")}" placeholder="1868723" required />
+      </label>
+      <label>
+        <span>Author</span>
+        <input value="warehouse MBBS | warehouse@mrbininc.com" disabled />
+      </label>
+      <button class="primary" type="submit">Save Samsara Settings</button>
+    </form>
   `;
 }
 
@@ -549,6 +652,44 @@ setupApp.addEventListener("click", (event) => {
     });
     return;
   }
+  const samsaraApiButton = event.target.closest("[data-action='test-samsara-api']");
+  if (samsaraApiButton) {
+    samsaraApiButton.disabled = true;
+    samsaraApiButton.textContent = "Testing...";
+    api("/api/dispatch/samsara/test").then((result) => {
+      samsaraTestResult = result;
+      setupNotice = "Samsara API token works.";
+      renderSetup();
+    }).catch((error) => {
+      setupNotice = `Samsara API test failed: ${error.message}`;
+      samsaraTestResult = null;
+      renderSetup();
+    });
+    return;
+  }
+  const samsaraLoginButton = event.target.closest("[data-action='test-samsara-login']");
+  if (samsaraLoginButton) {
+    const selected = Number.isInteger(selectedSetupIndex) ? drivers[selectedSetupIndex] : null;
+    if (!selected?.login) {
+      setupNotice = "Select and save a driver before testing Samsara login.";
+      renderSetup();
+      return;
+    }
+    const account = samsaraLoginButton.dataset.account === "secondary" ? "secondary" : "primary";
+    samsaraLoginButton.disabled = true;
+    samsaraLoginButton.textContent = "Testing...";
+    api("/api/dispatch/samsara/driver-login-test", {
+      method: "POST",
+      body: JSON.stringify({ driverLogin: selected.login, account })
+    }).then((result) => {
+      setupNotice = `Samsara ${account} driver found: ${result.samsaraDriver?.name || result.username} (${result.samsaraDriver?.id || "-"})`;
+      renderSetup();
+    }).catch((error) => {
+      setupNotice = `Samsara ${account} driver lookup failed: ${error.message}`;
+      renderSetup();
+    });
+    return;
+  }
   if (!tabButton) return;
   renderSetup();
 });
@@ -610,6 +751,49 @@ setupApp.addEventListener("submit", (event) => {
     });
     return;
   }
+  if (form.dataset.form === "samsara-settings") {
+    samsaraSettings = {
+      ...samsaraSettings,
+      dvirAuthorId: String(data.dvirAuthorId || "").trim()
+    };
+    saveDispatchSetup().then(() => {
+      setupNotice = "Samsara settings saved.";
+      renderSetup();
+    }).catch((error) => {
+      setupNotice = `Samsara settings save failed: ${error.message}`;
+      renderSetup();
+    });
+    return;
+  }
+  if (form.dataset.form === "own-yard") {
+    const code = String(data.code || "").trim();
+    const address = String(data.address || "").trim();
+    if (!code || !address) {
+      setupNotice = "Yard code and address are required.";
+      renderSetup();
+      return;
+    }
+    const yard = {
+      code,
+      name: String(data.name || code).trim(),
+      address,
+      lat: data.lat === "" ? null : Number(data.lat),
+      lng: data.lng === "" ? null : Number(data.lng)
+    };
+    if (Number.isInteger(selectedSetupIndex)) ownYards[selectedSetupIndex] = yard;
+    else {
+      ownYards.push(yard);
+      selectedSetupIndex = ownYards.length - 1;
+    }
+    saveDispatchSetup().then(() => {
+      setupNotice = "Own yard address saved.";
+      renderSetup();
+    }).catch((error) => {
+      setupNotice = `Own yard save failed: ${error.message}`;
+      renderSetup();
+    });
+    return;
+  }
   if (form.dataset.form === "driver") {
     const existingDriver = Number.isInteger(selectedSetupIndex) ? drivers[selectedSetupIndex] : null;
     const driver = {
@@ -618,11 +802,15 @@ setupApp.addEventListener("submit", (event) => {
       number: data.number,
       login: data.login,
       password: data.password || existingDriver?.password || "",
+      samsaraPrimaryLogin: String(data.samsaraPrimaryLogin || "").trim(),
+      samsaraSecondaryLogin: String(data.samsaraSecondaryLogin || "").trim(),
       ownYardFixedMinutes: Number(data.ownYardFixedMinutes || data.loadMinutes || 40),
-      outsideFixedMinutes: Number(data.outsideFixedMinutes || data.unloadMinutes || 35),
+      vendorFixedMinutes: Number(data.vendorFixedMinutes || data.outsideFixedMinutes || data.unloadMinutes || 35),
+      deliveryFixedMinutes: Number(data.deliveryFixedMinutes || data.outsideFixedMinutes || data.unloadMinutes || 35),
+      outsideFixedMinutes: Number(data.deliveryFixedMinutes || data.outsideFixedMinutes || data.unloadMinutes || 35),
       minutesPerPallet: Number(data.minutesPerPallet || 1),
       loadMinutes: Number(data.ownYardFixedMinutes || data.loadMinutes || 40),
-      unloadMinutes: Number(data.outsideFixedMinutes || data.unloadMinutes || 35)
+      unloadMinutes: Number(data.deliveryFixedMinutes || data.outsideFixedMinutes || data.unloadMinutes || 35)
     };
     if (Number.isInteger(selectedSetupIndex)) drivers[selectedSetupIndex] = driver;
     else {

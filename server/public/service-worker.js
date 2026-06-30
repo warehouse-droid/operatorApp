@@ -1,13 +1,13 @@
-const CACHE_NAME = "mbbs-yard-operator-v15";
+const CACHE_NAME = "mbbs-yard-operator-v37";
 const APP_SHELL = [
   "/operator",
   "/operator.html",
-  "/operator.css?v=20260622-history-units",
-  "/operator.js?v=20260624-events",
+  "/operator.css?v=20260630-pickup-no-unpack",
+  "/operator.js?v=20260630-pickup-no-unpack",
   "/driver",
   "/driver.html",
-  "/driver.css?v=20260624-driver-9",
-  "/driver.js?v=20260624-driver-9",
+  "/driver.css?v=20260627-samsara-location",
+  "/driver.js?v=20260627-samsara-location",
   "/manifest.webmanifest",
   "/driver-manifest.webmanifest",
   "/icons/mbbs-yard-192.png",

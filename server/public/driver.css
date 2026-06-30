@@ -277,6 +277,70 @@ button:disabled {
   text-decoration: none;
 }
 
+.location-check {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-left: 6px solid #8d9aa0;
+  border-radius: 10px;
+  background: #f7faf8;
+  padding: 8px;
+}
+
+.location-check.ok {
+  border-left-color: var(--ok);
+  background: #eefbf3;
+}
+
+.location-check.warning {
+  border-left-color: var(--danger);
+  background: #fff0f0;
+}
+
+.location-check.checking {
+  border-left-color: var(--warn);
+  background: #fff7e8;
+}
+
+.location-check strong,
+.location-check span,
+.location-check small {
+  display: block;
+}
+
+.location-check strong {
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.location-check span {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+  line-height: 1.25;
+}
+
+.location-check small {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.2;
+}
+
+.location-actions {
+  display: grid;
+  gap: 6px;
+}
+
+.danger-button {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
 .order-card {
   display: grid;
   gap: 8px;
@@ -431,6 +495,20 @@ button:disabled {
 .photo-grid {
   display: grid;
   gap: 8px;
+}
+
+.dvir-panel {
+  min-height: calc(100dvh - 24px);
+  align-content: start;
+}
+
+.dvir-photo-grid {
+  min-height: 0;
+  overflow: auto;
+}
+
+.dvir-photo-slot .photo-preview {
+  min-height: 66px;
 }
 
 .photo-slot {

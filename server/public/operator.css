@@ -227,6 +227,10 @@ label span {
   overflow: hidden;
 }
 
+.delivery-grid.single-detail {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .module-menu {
   flex: 1 1 auto;
   min-height: 0;
@@ -1098,6 +1102,31 @@ label span {
   color: var(--danger);
   font-size: 13px;
   font-weight: 900;
+}
+
+.validation-lines {
+  display: grid;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.validation-lines > div {
+  display: grid;
+  gap: 2px;
+  padding-top: 6px;
+  border-top: 1px solid #f0b7b7;
+}
+
+.validation-lines b {
+  font-size: 14px;
+  color: var(--ink);
+}
+
+.validation-lines em {
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 900;
+  color: var(--danger);
 }
 
 .stepper-field {

@@ -46,8 +46,8 @@ export async function upsertInventoryBalances(rows) {
     await query(
       `INSERT INTO inventory_items (
          item_id, item_name, display_name, item_description, item_type, item_type_text,
-         stock_unit, to_plt, to_lyr, to_sec, to_pcs, product_type, brand, series, raw, synced_at
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, now())
+         stock_unit, item_weight, to_plt, to_lyr, to_sec, to_pcs, product_type, brand, series, raw, synced_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb, now())
        ON CONFLICT (item_id) DO UPDATE SET
          item_name = EXCLUDED.item_name,
          display_name = EXCLUDED.display_name,
@@ -55,6 +55,7 @@ export async function upsertInventoryBalances(rows) {
          item_type = EXCLUDED.item_type,
          item_type_text = EXCLUDED.item_type_text,
          stock_unit = EXCLUDED.stock_unit,
+         item_weight = EXCLUDED.item_weight,
          to_plt = EXCLUDED.to_plt,
          to_lyr = EXCLUDED.to_lyr,
          to_sec = EXCLUDED.to_sec,
@@ -72,6 +73,7 @@ export async function upsertInventoryBalances(rows) {
         row.item_type || null,
         row.item_type_text || null,
         row.stock_unit || null,
+        nullableNumber(row.item_weight),
         nullableNumber(row.to_plt),
         nullableNumber(row.to_lyr),
         nullableNumber(row.to_sec),

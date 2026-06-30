@@ -13,20 +13,50 @@ const app = document.getElementById("app");
 const toast = document.getElementById("toast");
 
 const TOKEN_KEY = "mbbs.operator.token";
+const STATE_KEY = "mbbs.operator.state";
+const RESTORABLE_MODULES = new Set([
+  "menu",
+  "delivery-select",
+  "delivery",
+  "receiving",
+  "return-select",
+  "cycle-count",
+  "personal-history",
+  "customer-pickup-scan",
+  "customer-pickup"
+]);
+
+function readOperatorState() {
+  try {
+    return JSON.parse(localStorage.getItem(STATE_KEY) || "{}") || {};
+  } catch {
+    return {};
+  }
+}
+
+function restorableModule(value) {
+  const module = value === "delivery-fulfill" ? "delivery"
+    : value === "customer-pickup-load" ? "customer-pickup"
+      : value === "receiving-receipt" ? "receiving"
+        : value;
+  return RESTORABLE_MODULES.has(module) ? module : "menu";
+}
+
+const initialOperatorState = readOperatorState();
 let authToken = localStorage.getItem(TOKEN_KEY) || "";
 let operator = null;
 
-let locationId = Number(localStorage.getItem("mbbs.operator.locationId") || localStorage.getItem("mbbs.delivery.locationId") || 0);
-let currentModule = "menu";
-let viewMode = "active";
-let deliveryOrderType = localStorage.getItem("mbbs.operator.deliveryOrderType") || "sales_order";
+let locationId = Number(initialOperatorState.locationId || localStorage.getItem("mbbs.operator.locationId") || localStorage.getItem("mbbs.delivery.locationId") || 0);
+let currentModule = restorableModule(initialOperatorState.currentModule || "menu");
+let viewMode = initialOperatorState.viewMode === "packed" ? "packed" : "active";
+let deliveryOrderType = initialOperatorState.deliveryOrderType || localStorage.getItem("mbbs.operator.deliveryOrderType") || "sales_order";
 let orders = [];
 let operatorRequests = [];
-let selectedId = null;
+let selectedId = initialOperatorState.selectedId || null;
 let selectedOrder = null;
-let selectedLineId = null;
-let orderPage = 0;
-let linePage = 0;
+let selectedLineId = initialOperatorState.selectedLineId || null;
+let orderPage = Number(initialOperatorState.orderPage || 0);
+let linePage = Number(initialOperatorState.linePage || 0);
 let installPromptEvent = null;
 let appInstalled = window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true;
 let fulfillmentOrder = null;
@@ -39,34 +69,42 @@ let fulfillmentStatusText = "";
 let fulfillmentJobStage = "";
 let fulfillmentStartedAt = 0;
 let fulfillmentProgressTimer = null;
+let fulfillmentValidation = null;
+let customerPickupScan = initialOperatorState.customerPickupScan || "";
+let customerPickupMessage = "";
+let pickupScannerStream = null;
+let pickupScannerActive = false;
+let pickupScanTimer = null;
+let pickupQrScanner = null;
 
-let cycleStep = "type";
-let cycleSelection = { productType: "", brand: "", series: "" };
-let cycleSearch = "";
+let cycleStep = initialOperatorState.cycleStep || "type";
+let cycleSelection = initialOperatorState.cycleSelection || { productType: "", brand: "", series: "" };
+let cycleSearch = initialOperatorState.cycleSearch || "";
 let cycleFacets = { productTypes: [], brands: [], series: [] };
 let inventoryItems = [];
 let selectedInventoryItem = null;
+let restoredInventoryItemId = initialOperatorState.selectedInventoryItemId || "";
 let cycleDraft = null;
-let cyclePage = 0;
-let activeCycleUnit = "";
+let cyclePage = Number(initialOperatorState.cyclePage || 0);
+let activeCycleUnit = initialOperatorState.activeCycleUnit || "";
 let cycleValues = {};
 let cycleConfirming = false;
 
-let receivingStep = "type";
-let receivingOrderType = "purchase_order";
+let receivingStep = initialOperatorState.receivingStep || "type";
+let receivingOrderType = initialOperatorState.receivingOrderType || "purchase_order";
 let receivingVendors = [];
 let receivingSources = [];
 let receivingOrders = [];
-let receivingSelectedVendor = "";
-let receivingSelectedSourceId = "";
-let receivingSelectedId = null;
+let receivingSelectedVendor = initialOperatorState.receivingSelectedVendor || "";
+let receivingSelectedSourceId = initialOperatorState.receivingSelectedSourceId || "";
+let receivingSelectedId = initialOperatorState.receivingSelectedId || null;
 let receivingSelectedOrder = null;
-let receivingSearch = "";
-let receivingItemSearch = "";
+let receivingSearch = initialOperatorState.receivingSearch || "";
+let receivingItemSearch = initialOperatorState.receivingItemSearch || "";
 let receivingItemSuggestions = [];
-let receivingOrderPage = 0;
-let receivingLinePage = 0;
-let receivingSelectedLineId = null;
+let receivingOrderPage = Number(initialOperatorState.receivingOrderPage || 0);
+let receivingLinePage = Number(initialOperatorState.receivingLinePage || 0);
+let receivingSelectedLineId = initialOperatorState.receivingSelectedLineId || null;
 let receiptOrder = null;
 let receiptPhotoDataUrls = [];
 let receiptActivePhotoSlot = 0;
@@ -79,10 +117,10 @@ let receiptJobStage = "";
 let receiptStartedAt = 0;
 let receiptProgressTimer = null;
 let personalHistory = [];
-let personalHistoryDate = new Date().toISOString().slice(0, 10);
-let selectedHistoryId = "";
+let personalHistoryDate = initialOperatorState.personalHistoryDate || new Date().toISOString().slice(0, 10);
+let selectedHistoryId = initialOperatorState.selectedHistoryId || "";
 let historyReportReason = "";
-let historyPage = 0;
+let historyPage = Number(initialOperatorState.historyPage || 0);
 let eventSource = null;
 let eventRefreshTimer = null;
 
@@ -113,10 +151,23 @@ async function api(path, options = {}) {
     authToken = "";
     operator = null;
     localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(STATE_KEY);
     renderLogin("Login expired. Please login again.");
     throw new Error("Login required");
   }
-  if (!response.ok) throw new Error(await response.text());
+  if (!response.ok) {
+    const text = await response.text();
+    let payload = null;
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = null;
+    }
+    const error = new Error(payload?.error || text || "Request failed.");
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
+  }
   return response.json();
 }
 
@@ -206,7 +257,8 @@ function statusText(status) {
     preparing: "Preparing",
     packed: "Packed",
     fulfilled: "Fulfilled",
-    loaded: "Loaded"
+    loaded: "Loaded",
+    partial_loaded: "Partial Loaded"
   }[status] || "Open";
 }
 
@@ -219,16 +271,18 @@ function orderUnderpackCount(order) {
 }
 
 function orderStatusText(order) {
-  if (order?.local_yard_order_status === "Loaded") return "Loaded";
   if (orderWarningCount(order)) return "Warning";
-  if (orderUnderpackCount(order) && order?.operator_status === "packed") return "Underpack";
+  if (orderUnderpackCount(order)) return "Underpack";
+  if (order?.operator_status === "partial_loaded" || order?.local_yard_order_status === "Partial Loaded") return "Underpack";
+  if (order?.local_yard_order_status === "Loaded") return "Loaded";
   return statusText(order?.operator_status);
 }
 
 function orderStatusClass(order) {
-  if (order?.local_yard_order_status === "Loaded") return "loaded";
   if (orderWarningCount(order)) return "warning";
-  if (orderUnderpackCount(order) && order?.operator_status === "packed") return "underpack";
+  if (orderUnderpackCount(order)) return "underpack";
+  if (order?.operator_status === "partial_loaded" || order?.local_yard_order_status === "Partial Loaded") return "underpack";
+  if (order?.local_yard_order_status === "Loaded") return "loaded";
   return order?.operator_status || "open";
 }
 
@@ -273,6 +327,104 @@ function itemCountUnits(item) {
   return [{ key: "cycle-default", bodyKey: "pieces", label: item.stock_unit || "Qty", conversion: 1 }];
 }
 
+function isCustomerPickupMode() {
+  return currentModule === "customer-pickup" || currentModule === "customer-pickup-load";
+}
+
+function lineHasConversion(line) {
+  return qty(line.to_plt) > 0 || qty(line.to_lyr) > 0 || qty(line.to_sec) > 0 || qty(line.to_pcs) > 0;
+}
+
+function shouldUseSalesQuantity(line) {
+  return !lineHasConversion(line) && qty(line.quantity) > 0;
+}
+
+function lineUnitsToSalesQty(line, values) {
+  if (!lineHasConversion(line)) return qty(values.pieces) || qty(values.sections) || qty(values.layers) || qty(values.pallets);
+  return (qty(values.pallets) * qty(line.to_plt))
+    + (qty(values.layers) * qty(line.to_lyr))
+    + (qty(values.sections) * qty(line.to_sec))
+    + (qty(values.pieces) * qty(line.to_pcs));
+}
+
+function lineRequiredSalesQty(line) {
+  return qty(line.quantity) || lineUnitsToSalesQty(line, {
+    pallets: line.pallet_qty,
+    layers: line.layer_qty,
+    sections: line.section_qty,
+    pieces: line.piece_qty
+  });
+}
+
+function unitConversion(line, unit) {
+  if (unit === "pallets") return qty(line.to_plt);
+  if (unit === "layers") return qty(line.to_lyr);
+  if (unit === "sections") return qty(line.to_sec);
+  if (unit === "pieces") return qty(line.to_pcs);
+  return 0;
+}
+
+function explicitUnitQty(line, unit) {
+  if (unit === "pallets") return qty(line.pallet_qty);
+  if (unit === "layers") return qty(line.layer_qty);
+  if (unit === "sections") return qty(line.section_qty);
+  if (unit === "pieces") return qty(line.piece_qty);
+  return 0;
+}
+
+function unitRequiredLimit(line, unit) {
+  if (unit === "sales") return qty(line.quantity);
+  const conversion = unitConversion(line, unit);
+  if (!conversion) return 0;
+  const explicit = explicitUnitQty(line, unit);
+  if (explicit > 0) return explicit;
+  return !hasCustomPackQty(line) ? Math.floor((lineRequiredSalesQty(line) / conversion) + 0.000001) : 0;
+}
+
+function loadedUnits(line) {
+  const loadedSales = qty(line.loaded_qty);
+  if (!loadedSales) return { pallets: 0, layers: 0, sections: 0, pieces: 0, sales: 0 };
+  if (shouldUseSalesQuantity(line)) {
+    return { pallets: 0, layers: 0, sections: 0, pieces: 0, sales: loadedSales };
+  }
+  let remainingLoaded = loadedSales;
+  const consume = (required, conversion) => {
+    if (!required || !conversion || remainingLoaded <= 0) return 0;
+    const value = Math.min(required, Math.floor((remainingLoaded / conversion) + 0.000001));
+    remainingLoaded = Math.max(0, remainingLoaded - (value * conversion));
+    return value;
+  };
+  return {
+    pallets: consume(unitRequiredLimit(line, "pallets"), qty(line.to_plt)),
+    layers: consume(unitRequiredLimit(line, "layers"), qty(line.to_lyr)),
+    sections: consume(unitRequiredLimit(line, "sections"), qty(line.to_sec)),
+    pieces: consume(unitRequiredLimit(line, "pieces"), qty(line.to_pcs)),
+    sales: loadedSales
+  };
+}
+
+function pickupLoadedUnits(line) {
+  return loadedUnits(line);
+}
+
+function loadedValue(line, unit) {
+  const loaded = loadedUnits(line);
+  if (unit === "pallets") return loaded.pallets;
+  if (unit === "sections") return loaded.sections;
+  if (unit === "layers") return loaded.layers;
+  if (unit === "pieces") return loaded.pieces;
+  if (unit === "sales") return loaded.sales;
+  return 0;
+}
+
+function pickupLoadedValue(line, unit) {
+  return loadedValue(line, unit);
+}
+
+function hasCustomerPickupDraft(order = selectedOrder) {
+  return (order?.lines || []).some(hasPackedQty);
+}
+
 function exceptionText(line) {
   if (line.sync_exception === "line_deleted") {
     return "Line removed in NetSuite. Unpack this line and repack the order.";
@@ -300,8 +452,45 @@ function visibleLines(order) {
   return (order?.lines || []).filter((line) => {
     if (line.sync_exception && hasPackedQty(line)) return viewMode === "packed";
     if (!isPickableLine(line)) return false;
+    if (isCustomerPickupMode()) return hasPackedQty(line) || hasRemainingQty(line);
     return viewMode === "packed" ? hasPackedQty(line) : hasRemainingQty(line);
   });
+}
+
+function customerPickupVisibleLines(order) {
+  return (order?.lines || []).filter((line) => {
+    if (!isPickableLine(line)) return false;
+    return hasPackedQty(line) || hasRemainingQty(line);
+  });
+}
+
+function customerPickupUnavailableMessage(order) {
+  const orderNo = order?.tranid || "This pickup order";
+  const lines = order?.lines || [];
+  if (!lines.length) {
+    return `${orderNo} was found, but no item lines are synced locally. Please ask admin to sync this sales order detail.`;
+  }
+
+  const pickable = lines.filter(isPickableLine);
+  if (!pickable.length) {
+    const lineTypes = [...new Set(lines.map((line) => line.item_type_text || line.item_type || "Unknown").filter(Boolean))].join(", ");
+    return `${orderNo} has no loadable item lines. Found only non-loadable line types: ${lineTypes || "Unknown"}.`;
+  }
+
+  const blocked = pickable.filter((line) => line.sync_exception);
+  if (blocked.length === pickable.length) {
+    return `${orderNo} has NetSuite line changes that need review before pickup. Please ask admin to refresh/check the order.`;
+  }
+
+  const requiredTotal = pickable.reduce((sum, line) => sum + lineRequiredSalesQty(line), 0);
+  const loadedTotal = pickable.reduce((sum, line) => sum + qty(line.loaded_qty), 0);
+  const uoms = [...new Set(pickable.map((line) => line.unit || "").filter(Boolean))];
+  const uom = uoms.length === 1 ? ` ${uoms[0]}` : "";
+  if (requiredTotal > 0 && loadedTotal >= requiredTotal) {
+    return `${orderNo} is fully loaded locally. Loaded ${displayQty(loadedTotal)}${uom} of ${displayQty(requiredTotal)}${uom}; no remaining pickup quantity.`;
+  }
+
+  return `${orderNo} has no remaining loadable pickup lines. Please ask admin to check item type, quantity, and local loaded quantity.`;
 }
 
 function hasValue(value) {
@@ -320,11 +509,12 @@ function hasPackedQty(line) {
 }
 
 function hasRemainingQty(line) {
+  if (shouldUseSalesQuantity(line)) return remainingValue(line, "sales") > 0;
   return remainingValue(line, "pallets") > 0
     || remainingValue(line, "sections") > 0
     || remainingValue(line, "layers") > 0
     || remainingValue(line, "pieces") > 0
-    || (!hasCustomPackQty(line) && remainingValue(line, "sales") > 0);
+    || (!lineHasConversion(line) && remainingValue(line, "sales") > 0);
 }
 
 function isUnderPacked(line) {
@@ -332,18 +522,16 @@ function isUnderPacked(line) {
 }
 
 function lineVariableUnit(line) {
-  if (hasValue(line.section_qty)) return { key: "sections", label: "SEC", required: line.section_qty, packedKey: "sections" };
-  if (hasValue(line.layer_qty)) return { key: "layers", label: "LYR", required: line.layer_qty, packedKey: "layers" };
-  if (hasValue(line.piece_qty)) return { key: "pieces", label: "PCS", required: line.piece_qty, packedKey: "pieces" };
-  if (!hasCustomPackQty(line)) return { key: "sales", label: line.unit || "Qty", required: line.quantity, packedKey: "sales" };
+  if (shouldUseSalesQuantity(line)) return { key: "sales", label: line.unit || "Qty", required: line.quantity, packedKey: "sales" };
+  if (unitRequiredLimit(line, "sections") > 0 || packedValue(line, "sections") > 0) return { key: "sections", label: "SEC", required: unitRequiredLimit(line, "sections"), packedKey: "sections" };
+  if (unitRequiredLimit(line, "layers") > 0 || packedValue(line, "layers") > 0) return { key: "layers", label: "LYR", required: unitRequiredLimit(line, "layers"), packedKey: "layers" };
+  if (unitRequiredLimit(line, "pieces") > 0 || packedValue(line, "pieces") > 0) return { key: "pieces", label: "PCS", required: unitRequiredLimit(line, "pieces"), packedKey: "pieces" };
+  if (!lineHasConversion(line)) return { key: "sales", label: line.unit || "Qty", required: line.quantity, packedKey: "sales" };
   return null;
 }
 
 function requiredValue(line, unit) {
-  if (unit === "pallets") return qty(line.pallet_qty);
-  if (unit === "sections") return qty(line.section_qty);
-  if (unit === "layers") return qty(line.layer_qty);
-  if (unit === "pieces") return qty(line.piece_qty);
+  if (unit === "pallets" || unit === "sections" || unit === "layers" || unit === "pieces") return unitRequiredLimit(line, unit);
   if (unit === "sales") return qty(line.quantity);
   return 0;
 }
@@ -360,7 +548,8 @@ function packedValue(line, unit) {
 }
 
 function remainingValue(line, unit) {
-  return Math.max(0, requiredValue(line, unit) - packedValue(line, unit));
+  const loaded = loadedValue(line, unit);
+  return Math.max(0, requiredValue(line, unit) - loaded - packedValue(line, unit));
 }
 
 function panelValue(line, unit) {
@@ -369,6 +558,7 @@ function panelValue(line, unit) {
 
 function panelLimit(line, unit) {
   if (currentModule === "receiving") return receivingRemainingValue(line, unit);
+  if (isCustomerPickupMode()) return Math.max(0, requiredValue(line, unit) - pickupLoadedValue(line, unit));
   return viewMode === "packed" ? requiredValue(line, unit) : remainingValue(line, unit);
 }
 
@@ -383,14 +573,29 @@ function receivingRemainingValue(line, unit) {
   const conversion = unit === "pallets" ? qty(line.to_plt)
     : unit === "layers" ? qty(line.to_lyr)
     : unit === "sections" ? qty(line.to_sec)
-    : unit === "pieces" ? qty(line.to_pcs) || 1
+    : unit === "pieces" ? qty(line.to_pcs)
     : 0;
-  if (!conversion) return required;
+  if (!conversion) return 0;
   return Math.max(0, Math.min(required, Math.floor((remainingSales / conversion) + 0.000001)));
 }
 
 function hasReceivingRemainingQty(line) {
   return receivingRemainingSalesQty(line) > 0;
+}
+
+function receivingLineUnits(line) {
+  const units = [];
+  if (receivingRemainingValue(line, "pallets") > 0 || qty(line.received_pallet_qty) > 0) {
+    units.push({ key: "pallets", label: "PLT" });
+  }
+  const variable = lineVariableUnit(line);
+  if (variable && variable.packedKey !== "pallets") {
+    units.push({ key: variable.packedKey, label: variable.label });
+  }
+  if (!units.length) {
+    units.push({ key: "sales", label: line.unit || "Qty" });
+  }
+  return units;
 }
 
 function currentOrderBlocksMove() {
@@ -455,6 +660,88 @@ function renderLogin(message = "") {
   `;
 }
 
+function saveOperatorState() {
+  if (!operator) return;
+  const module = restorableModule(currentModule);
+  localStorage.setItem(STATE_KEY, JSON.stringify({
+    locationId,
+    currentModule: module,
+    viewMode,
+    deliveryOrderType,
+    selectedId,
+    selectedLineId,
+    orderPage,
+    linePage,
+    customerPickupScan,
+    receivingStep,
+    receivingOrderType,
+    receivingSelectedVendor,
+    receivingSelectedSourceId,
+    receivingSelectedId,
+    receivingSearch,
+    receivingItemSearch,
+    receivingOrderPage,
+    receivingLinePage,
+    receivingSelectedLineId,
+    cycleStep,
+    cycleSelection,
+    cycleSearch,
+    selectedInventoryItemId: selectedInventoryItem?.item_id || restoredInventoryItemId || "",
+    cyclePage,
+    activeCycleUnit,
+    personalHistoryDate,
+    selectedHistoryId,
+    historyPage
+  }));
+}
+
+async function restoreOperatorView() {
+  if (!operator) return renderLogin();
+  if (!locationId) return renderLocationSelect();
+  currentModule = restorableModule(currentModule);
+  try {
+    if (currentModule === "delivery") {
+      await loadOrders({ keepSelection: true });
+      return;
+    }
+    if (currentModule === "customer-pickup") {
+      if (selectedId) {
+        await loadDetail(selectedId, { silentRender: true });
+      }
+      if (!selectedOrder) currentModule = "customer-pickup-scan";
+      render();
+      return;
+    }
+    if (currentModule === "receiving") {
+      await loadReceivingOptions();
+      if (receivingItemSearch.trim()) await loadReceivingItemSuggestions();
+      if (receivingStep === "orders") {
+        await loadReceivingOrders({ keepSelection: true });
+      } else {
+        render();
+      }
+      return;
+    }
+    if (currentModule === "cycle-count") {
+      await loadCycleData();
+      if (restoredInventoryItemId) {
+        selectedInventoryItem = inventoryItems.find((item) => String(item.item_id) === String(restoredInventoryItemId)) || null;
+        restoredInventoryItemId = "";
+      }
+      if (selectedInventoryItem && !activeCycleUnit) activeCycleUnit = itemCountUnits(selectedInventoryItem)[0]?.key || "";
+      render();
+      return;
+    }
+    if (currentModule === "personal-history") {
+      await loadPersonalHistory();
+      return;
+    }
+  } catch (error) {
+    showToast(error.message);
+  }
+  render();
+}
+
 function renderLocationSelect() {
   app.innerHTML = `
     <section class="location-screen">
@@ -474,14 +761,18 @@ function renderLocationSelect() {
 function render() {
   if (!operator) return renderLogin();
   if (!locationId) return renderLocationSelect();
+  saveOperatorState();
   if (currentModule === "menu") return renderMenu();
   if (currentModule === "cycle-count") return renderCycleCount();
+  if (currentModule === "customer-pickup-scan") return renderCustomerPickupScan();
+  if (currentModule === "customer-pickup") return renderCustomerPickupOrder();
   if (currentModule === "delivery-select") return renderDeliverySelect();
   if (currentModule === "receiving") return renderReceiving();
   if (currentModule === "receiving-receipt") return renderReceiptScreen();
   if (currentModule === "return-select") return renderReturnSelect();
   if (currentModule === "personal-history") return renderPersonalHistory();
   if (currentModule === "delivery-fulfill") return renderFulfillmentScreen();
+  if (currentModule === "customer-pickup-load") return renderFulfillmentScreen();
 
   const title = viewMode === "packed" ? "Packed Orders" : "Delivery Prep";
   const subtitle = `${deliveryOrderType === "transfer_order" ? "Transfer Order" : "Sales Order"} | Location ${currentLocation()?.text || locationId}`;
@@ -490,8 +781,7 @@ function render() {
     ${topWarnings.length ? `<button class="top-warning-button" data-action="open-warning-order" data-order="${topWarnings[0].netsuite_id}" type="button">Warning ${topWarnings.length}</button>` : ""}
     <button class="secondary-button" data-action="main-menu" type="button">Menu</button>
     ${renderInstallButton()}
-    <button class="primary-button" data-action="sync" type="button">Sync</button>
-    <button class="secondary-button" data-action="refresh" type="button">Refresh</button>
+    <button class="secondary-button" data-action="refresh" type="button">Refresh Orders</button>
     <button class="secondary-button" data-action="logout" type="button">${operator.display_name}</button>
   `;
 
@@ -578,6 +868,55 @@ function renderDeliverySelect() {
   `);
 }
 
+function renderCustomerPickupScan() {
+  shell("Customer Pickup", `Location ${currentLocation()?.text || locationId}`, `
+    <section class="fulfillment-screen">
+      <div class="fulfillment-card">
+        <span>Scan sales order</span>
+        <strong>Customer pickup only</strong>
+        <div class="camera-actions">
+          <button class="primary-button" data-action="start-pickup-scanner" type="button">${pickupScannerActive ? "Restart camera" : "Open camera"}</button>
+        </div>
+        ${pickupScannerActive ? `<video class="camera-preview" id="pickupScannerCamera" autoplay muted playsinline></video>` : `<div class="photo-placeholder">Use the Zebra scanner, camera scanner, or type the sales order number.</div>`}
+      </div>
+      <div class="fulfillment-card">
+        <span>Manual / Zebra input</span>
+        <strong>Order number</strong>
+        <label class="stepper-field">
+          <span>Scan or type and press Enter</span>
+          <input id="customerPickupScan" value="${escapeHtml(customerPickupScan)}" placeholder="SOB104325" autocomplete="off" autofocus />
+        </label>
+        ${customerPickupMessage ? `<div class="sync-alert danger"><strong>Notice</strong><span>${escapeHtml(customerPickupMessage)}</span></div>` : ""}
+        <div class="selected-actions">
+          <button class="primary-button" data-action="lookup-customer-pickup" type="button">Find Order</button>
+        </div>
+      </div>
+    </section>
+  `, `
+    <button class="secondary-button" data-action="main-menu" type="button">Menu</button>
+    <button class="secondary-button" data-action="logout" type="button">${operator.display_name}</button>
+  `);
+  window.requestAnimationFrame(() => {
+    const input = document.getElementById("customerPickupScan");
+    input?.focus();
+    attachPickupScannerCamera();
+  });
+}
+
+function renderCustomerPickupOrder() {
+  shell("Customer Pickup", selectedOrder ? `${selectedOrder.tranid} | ${selectedOrder.customer || ""}` : `Location ${currentLocation()?.text || locationId}`, `
+    <section class="delivery-grid single-detail">
+      <section class="detail-panel">
+        ${selectedOrder ? renderDetailPanel(selectedOrder) : renderEmptyDetail()}
+      </section>
+    </section>
+  `, `
+    <button class="secondary-button" data-action="customer-pickup-back" type="button">Back to Scan</button>
+    <button class="secondary-button" data-action="main-menu" type="button">Menu</button>
+    <button class="secondary-button" data-action="logout" type="button">${operator.display_name}</button>
+  `);
+}
+
 function receivingTypeLabel() {
   if (receivingOrderType === "co_order") return "Transit CO";
   return receivingOrderType === "transfer_order" ? "Transfer Order" : "Purchase Order";
@@ -607,7 +946,7 @@ function renderReceiving() {
             </div>
           ` : ""}
         </label>
-        <button class="primary-button" data-action="sync-receiving" type="button">Sync</button>
+        <button class="secondary-button" data-action="refresh-receiving" type="button">Refresh Orders</button>
       </div>
       ${renderReceivingMain()}
     </section>
@@ -646,7 +985,7 @@ function renderReceivingMain() {
             <strong>${receivingOrderType === "purchase_order" ? item.vendor : `From ${item.source_location}`}</strong>
             <span>${item.order_count} open order</span>
           </button>
-        `).join("") || `<div class="empty-state"><strong>No open orders</strong><span>Tap Sync to retrieve from NetSuite.</span></div>`}
+        `).join("") || `<div class="empty-state"><strong>No open orders</strong><span>Ask admin to sync if the order is missing.</span></div>`}
       </section>
     `;
   }
@@ -738,7 +1077,7 @@ function renderReceivingDetail(order) {
 }
 
 function renderReceivingLine(line) {
-  const variable = lineVariableUnit(line);
+  const units = receivingLineUnits(line);
   return `
     <button class="line-card ${String(receivingSelectedLineId) === String(line.id) ? "active" : ""} ${hasReceivedQty(line) ? "confirmed" : ""}" data-action="select-receiving-line" data-line="${line.id}" type="button">
       <div class="line-info">
@@ -747,8 +1086,7 @@ function renderReceivingLine(line) {
         ${hasReceivedQty(line) ? `<em class="underpack-note">Confirmed</em>` : ""}
       </div>
       <div class="required-measures">
-        <div class="measure"><span>Open PLT</span><b>${displayQty(receivingRemainingValue(line, "pallets"))}</b></div>
-        ${variable ? `<div class="measure"><span>Open ${variable.label}</span><b>${displayQty(receivingRemainingValue(line, variable.packedKey))}</b></div>` : ""}
+        ${units.map((unit) => `<div class="measure"><span>Open ${unit.label}</span><b>${displayQty(receivingRemainingValue(line, unit.key))}</b></div>`).join("")}
       </div>
     </button>
   `;
@@ -771,7 +1109,7 @@ function receivingPanelValue(line, unit) {
 }
 
 function renderReceivingSelectedLinePanel(line) {
-  const variable = lineVariableUnit(line);
+  const units = receivingLineUnits(line);
   return `
     <aside class="selected-panel" data-receiving-selected-line="${line.id}">
       <div class="selected-header">
@@ -780,11 +1118,9 @@ function renderReceivingSelectedLinePanel(line) {
         <p>${line.item_description || ""}</p>
       </div>
       <div class="selected-measures">
-        <div class="measure"><span>Open PLT</span><b>${displayQty(receivingRemainingValue(line, "pallets"))}</b></div>
-        ${variable ? `<div class="measure"><span>Open ${variable.label}</span><b>${displayQty(receivingRemainingValue(line, variable.packedKey))}</b></div>` : ""}
+        ${units.map((unit) => `<div class="measure"><span>Open ${unit.label}</span><b>${displayQty(receivingRemainingValue(line, unit.key))}</b></div>`).join("")}
       </div>
-      ${renderStepper("pallets", "Receive PLT", receivingPanelValue(line, "pallets"))}
-      ${variable?.packedKey ? renderStepper(variable.packedKey, `Receive ${variable.label}`, receivingPanelValue(line, variable.packedKey)) : ""}
+      ${units.map((unit) => renderStepper(unit.key, `Receive ${unit.label}`, receivingPanelValue(line, unit.key))).join("")}
       <div class="selected-actions">
         <button class="primary-button" data-action="confirm-receiving-line" data-line="${line.id}" type="button">Confirm line</button>
       </div>
@@ -987,7 +1323,7 @@ function renderOrderPanel() {
           ${request ? `<span class="request-line">Dispatch asks to unpack for split</span>` : ""}
           <span class="status-pill ${orderStatusClass(order)}">${orderStatusText(order)}</span>
         </button>
-      `; }).join("") || `<div class="empty-state small"><strong>No orders</strong><span>Sync from NetSuite.</span></div>`}
+      `; }).join("") || `<div class="empty-state small"><strong>No orders</strong><span>Ask admin to sync if the order is missing.</span></div>`}
     </div>
     <div class="pagination-row">
       <button class="secondary-button" data-action="order-prev" ${orderPage === 0 ? "disabled" : ""} type="button">Previous</button>
@@ -1040,8 +1376,28 @@ function renderEmptyDetail() {
   `;
 }
 
+function renderLoadValidation(validation) {
+  const issues = validation?.issues || [];
+  if (!issues.length) return "";
+  return `
+    <div class="sync-alert danger load-validation-alert">
+      <strong>${issues.length} line cannot load</strong>
+      <span>NetSuite changed after packing. Correct these packed quantities first.</span>
+      <div class="validation-lines">
+        ${issues.map((issue) => `
+          <div>
+            <b>${escapeHtml(issue.itemName || "Line")}</b>
+            <span>${escapeHtml(issue.message || "Update this packed line.")}</span>
+            <em>Packed: ${escapeHtml(issue.packedText || "0")} | Required now: ${escapeHtml(issue.requiredText || "0")}</em>
+          </div>
+        `).join("")}
+      </div>
+    </div>
+  `;
+}
+
 function renderDetailPanel(order) {
-  const lines = visibleLines(order);
+  const lines = isCustomerPickupMode() ? customerPickupVisibleLines(order) : visibleLines(order);
   const exceptions = exceptionLines(order);
   const count = pageCount(lines, LINE_PAGE_SIZE);
   linePage = Math.min(linePage, count - 1);
@@ -1049,28 +1405,32 @@ function renderDetailPanel(order) {
   const confirmed = lines.filter((line) => line.confirmed).length;
   const selectedLine = lines.find((line) => String(line.id) === String(selectedLineId)) || visible[0] || lines[0];
   if (selectedLine && String(selectedLineId) !== String(selectedLine.id)) selectedLineId = selectedLine.id;
+  const customerPickupNotice = isCustomerPickupMode() && !lines.length ? customerPickupUnavailableMessage(order) : "";
 
   return `
     <div class="detail-header">
       <div>
         <div class="order-title-row">
           <h2>${order.tranid}</h2>
-          ${viewMode === "packed" ? `<button class="secondary-button danger-button compact-action" data-action="unpack-order" type="button">Unpack whole order</button>` : ""}
+          ${viewMode === "packed" && !isCustomerPickupMode() ? `<button class="secondary-button danger-button compact-action" data-action="unpack-order" type="button">Unpack whole order</button>` : ""}
         </div>
         <p class="muted">${order.customer || ""}</p>
         <p class="muted">${formatDate(order.trandate)} | ${order.delivery_method || ""}</p>
         ${order.dispatch_planned ? `<p class="dispatch-plan-note">Planned: ${escapeHtml(order.dispatch_truck_plate || "")} ${escapeHtml(order.dispatch_load_name || "")}${order.dispatch_parking_spot ? ` | Parking spot ${escapeHtml(order.dispatch_parking_spot)}` : ""}</p>` : ""}
+        ${order.dispatch_instructions ? `<p class="dispatch-plan-note">${escapeHtml(order.dispatch_instructions)}</p>` : ""}
       </div>
       <div class="status-actions">
         <span class="status-pill ${orderStatusClass(order)}">${orderStatusText(order)}</span>
-        ${viewMode === "packed"
+        ${isCustomerPickupMode()
+          ? `<button class="primary-button" data-action="start-fulfill" type="button" ${hasCustomerPickupDraft(order) ? "" : "disabled"}>Load</button>`
+          : viewMode === "packed"
           ? `<button class="primary-button" data-action="start-fulfill" type="button">Load</button>`
           : `<button class="secondary-button" data-action="set-preparing" type="button">Preparing</button>
              <button class="primary-button" data-action="set-packed" type="button">Packed</button>`}
       </div>
     </div>
     <div class="progress-strip">
-      <div><span>${viewMode === "packed" ? "Packed lines" : "Open lines"}</span><strong>${confirmed} / ${lines.length}</strong></div>
+      <div><span>${isCustomerPickupMode() ? "Pickup lines" : viewMode === "packed" ? "Packed lines" : "Open lines"}</span><strong>${confirmed} / ${lines.length}</strong></div>
       <div><span>Location</span><strong>${currentLocation()?.text}</strong></div>
       <div><span>Status</span><strong>${orderStatusText(order)}</strong></div>
     </div>
@@ -1080,10 +1440,16 @@ function renderDetailPanel(order) {
         <span>NetSuite changed after packing. Unpack the affected line, then pack again with the latest required qty.</span>
       </div>
     ` : ""}
+    ${customerPickupNotice ? `
+      <div class="sync-alert danger">
+        <strong>Pickup unavailable</strong>
+        <span>${escapeHtml(customerPickupNotice)}</span>
+      </div>
+    ` : ""}
     <div class="work-area">
       <div class="line-column">
         <div class="line-list">
-          ${visible.map((line) => renderLine(line)).join("") || `<div class="empty-state small"><strong>No lines</strong><span>Sync details for this order.</span></div>`}
+          ${visible.map((line) => renderLine(line)).join("") || `<div class="empty-state small"><strong>${isCustomerPickupMode() ? "No pickup quantity" : "No lines"}</strong><span>${escapeHtml(customerPickupNotice || "Ask admin to sync if details are missing.")}</span></div>`}
         </div>
         <div class="pagination-row">
           <button class="secondary-button" data-action="line-prev" ${linePage === 0 ? "disabled" : ""} type="button">Previous</button>
@@ -1091,7 +1457,7 @@ function renderDetailPanel(order) {
           <button class="secondary-button" data-action="line-next" ${linePage >= count - 1 ? "disabled" : ""} type="button">Next</button>
         </div>
       </div>
-      ${selectedLine ? renderSelectedLinePanel(selectedLine) : renderEmptyDetail()}
+      ${selectedLine ? renderSelectedLinePanel(selectedLine) : customerPickupNotice ? `<aside class="selected-panel"><div class="empty-state"><strong>Pickup unavailable</strong><span>${escapeHtml(customerPickupNotice)}</span></div></aside>` : renderEmptyDetail()}
     </div>
   `;
 }
@@ -1104,15 +1470,16 @@ function renderFulfillmentScreen() {
   }
   const packedLines = visibleLines(order).filter((line) => hasPackedQty(line));
   if (fulfillmentResult) {
+    const isPickupLoad = currentModule === "customer-pickup-load";
     return shell("Load Complete", `Order ${order.tranid}`, `
       <section class="fulfillment-screen">
         <div class="fulfillment-card success">
-          <span>Local Yard Status</span>
-          <strong>${fulfillmentResult.localYardOrderStatus || "Loaded"}</strong>
-          <p>Photo proof saved. This order is hidden from the operator list.</p>
+          <span>${isPickupLoad ? "Pickup Status" : "Local Yard Status"}</span>
+          <strong>${isPickupLoad ? (fulfillmentResult.pickupStatus === "partial_loaded" ? "Partial Loaded" : "Loaded") : (fulfillmentResult.localYardOrderStatus || "Loaded")}</strong>
+          <p>${isPickupLoad ? `Photo proof saved. Remaining line count: ${fulfillmentResult.remainingLines || 0}.` : "Photo proof saved. This order is hidden from the operator list."}</p>
         </div>
         <div class="selected-actions">
-          <button class="primary-button" data-action="finish-fulfill" type="button">Back to Delivery</button>
+          <button class="primary-button" data-action="finish-fulfill" type="button">${isPickupLoad ? "Back to Scan" : "Back to Delivery"}</button>
         </div>
       </section>
     `, `<button class="secondary-button" data-action="finish-fulfill" type="button">Delivery</button>`);
@@ -1147,6 +1514,7 @@ function renderFulfillmentScreen() {
       <div class="selected-actions">
         ${fulfillmentSubmitting ? `<div class="sync-alert"><strong>${fulfillmentJobStage || "Saving load proof"}</strong><span>${fulfillmentStatusText || "Saving local yard status..."}${fulfillmentStartedAt ? ` (${Math.max(1, Math.round((Date.now() - fulfillmentStartedAt) / 1000))}s)` : ""}</span></div>` : ""}
         ${!fulfillmentSubmitting && fulfillmentJobStage === "Load failed" ? `<div class="sync-alert danger"><strong>Load failed</strong><span>${fulfillmentStatusText}</span></div>` : ""}
+        ${renderLoadValidation(fulfillmentValidation)}
         <button class="primary-button" data-action="confirm-fulfill" ${fulfillmentPhotoDataUrl && !fulfillmentSubmitting ? "" : "disabled"} type="button">${fulfillmentSubmitting ? "Loading..." : "Load"}</button>
       </div>
     </section>
@@ -1191,8 +1559,8 @@ function renderSelectedLinePanel(line) {
         <p>${line.item_description || ""}</p>
       </div>
       <div class="selected-measures">
-        <div class="measure"><span>Required PLT</span><b>${displayQty(line.pallet_qty)}</b></div>
-        ${variable ? `<div class="measure"><span>Required ${variable.label}</span><b>${displayQty(variable.required)}</b></div>` : ""}
+        <div class="measure"><span>${isCustomerPickupMode() ? "Remaining" : "Required"} PLT</span><b>${displayQty(isCustomerPickupMode() ? Math.max(0, qty(line.pallet_qty) - pickupLoadedValue(line, "pallets")) : line.pallet_qty)}</b></div>
+        ${variable ? `<div class="measure"><span>${isCustomerPickupMode() ? "Remaining" : "Required"} ${variable.label}</span><b>${displayQty(isCustomerPickupMode() ? Math.max(0, requiredValue(line, variable.packedKey) - pickupLoadedValue(line, variable.packedKey)) : variable.required)}</b></div>` : ""}
       </div>
       ${notice ? `<div class="line-alert"><strong>Repack needed</strong><span>${notice}</span></div>` : ""}
       ${notice ? "" : renderStepper("pallets", `${viewMode === "packed" ? "Packed" : "Pack"} PLT`, panelValue(line, "pallets"))}
@@ -1272,17 +1640,6 @@ async function loadReceivingOrders(options = {}) {
 
 async function loadReceivingDetail(id, options = {}) {
   receivingSelectedId = id;
-  if (receivingOrderType !== "co_order") {
-    await api(`/api/receiving/orders/${id}/sync`, {
-      method: "POST",
-      body: JSON.stringify({
-        orderType: receivingOrderType,
-        locationId,
-        destinationLocationId: locationId,
-        sourceLocationId: receivingSelectedSourceId || null
-      })
-    });
-  }
   receivingSelectedOrder = await api(`/api/receiving/orders/${id}`);
   if (!options.silentRender) render();
 }
@@ -1302,20 +1659,125 @@ async function loadReceivingItemSuggestions() {
   receivingItemSuggestions = await api(url.pathname + url.search);
 }
 
-async function syncReceiving() {
-  await api("/api/receiving/sync", {
-    method: "POST",
-    body: JSON.stringify({
-      orderType: receivingOrderType,
-      sourceLocationId: receivingSelectedSourceId || null,
-      locationId,
-      destinationLocationId: locationId
-    })
-  });
-  showToast("Receiving synced");
+async function refreshReceiving() {
   await loadReceivingOptions();
-  if (receivingStep === "orders") return loadReceivingOrders({ keepSelection: true });
-  render();
+  if (receivingStep === "orders") {
+    await loadReceivingOrders({ keepSelection: true });
+  } else {
+    render();
+  }
+  showToast("Receiving refreshed from local DB");
+}
+
+async function refreshDeliveryOrders() {
+  await loadOrders({ keepSelection: true });
+  showToast("Orders refreshed from local DB");
+}
+
+async function lookupCustomerPickup() {
+  const code = (document.getElementById("customerPickupScan")?.value || customerPickupScan).trim();
+  customerPickupScan = code;
+  customerPickupMessage = "";
+  if (!code) {
+    customerPickupMessage = "Scan or enter a sales order number.";
+    return render();
+  }
+  try {
+    const order = await api("/api/customer-pickup/lookup", {
+      method: "POST",
+      body: JSON.stringify({ code, locationId })
+    });
+    stopPickupScannerCamera();
+    const pickupLines = customerPickupVisibleLines(order);
+    if (!pickupLines.length) {
+      selectedOrder = null;
+      selectedId = null;
+      selectedLineId = null;
+      customerPickupMessage = customerPickupUnavailableMessage(order);
+      currentModule = "customer-pickup-scan";
+      return render();
+    }
+    selectedOrder = order;
+    selectedId = order.netsuite_id;
+    selectedLineId = pickupLines[0]?.id || null;
+    linePage = 0;
+    currentModule = "customer-pickup";
+    render();
+  } catch (error) {
+    customerPickupMessage = error.message;
+    render();
+  }
+}
+
+async function confirmDiscardCustomerPickupDraft() {
+  if (!isCustomerPickupMode() || !selectedId || !hasCustomerPickupDraft()) return true;
+  if (!confirm("All the confirmed line for this order will be erased. Confirm?")) return false;
+  selectedOrder = await api(`/api/customer-pickup/orders/${selectedId}/clear-draft`, { method: "POST" });
+  return true;
+}
+
+function stopPickupScannerCamera() {
+  window.clearInterval(pickupScanTimer);
+  pickupScanTimer = null;
+  if (pickupQrScanner) {
+    pickupQrScanner.stop();
+    pickupQrScanner.destroy();
+  }
+  pickupQrScanner = null;
+  if (pickupScannerStream) pickupScannerStream.getTracks().forEach((track) => track.stop());
+  pickupScannerStream = null;
+  pickupScannerActive = false;
+}
+
+function attachPickupScannerCamera() {
+  const video = document.getElementById("pickupScannerCamera");
+  if (!video || !pickupScannerStream) return;
+  video.srcObject = pickupScannerStream;
+  video.play().catch(() => {});
+}
+
+async function startPickupScannerCamera() {
+  stopPickupScannerCamera();
+  try {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      customerPickupMessage = "Camera is not available in this browser. Use Zebra scanner or manual input.";
+      return render();
+    }
+    pickupScannerActive = true;
+    customerPickupMessage = "Starting QR camera scanner...";
+    render();
+    await new Promise((resolve) => window.requestAnimationFrame(resolve));
+    const video = document.getElementById("pickupScannerCamera");
+    if (!video) throw new Error("Camera preview is not ready.");
+    const { default: QrScanner } = await import("/vendor/qr-scanner/qr-scanner.min.js");
+    if (!(await QrScanner.hasCamera())) {
+      customerPickupMessage = "No camera was found. Use Zebra scanner or manual input.";
+      stopPickupScannerCamera();
+      return render();
+    }
+    pickupQrScanner = new QrScanner(video, async (result) => {
+      const value = String(result?.data || result || "").trim();
+      if (!value) return;
+      customerPickupScan = value;
+      stopPickupScannerCamera();
+      await lookupCustomerPickup();
+    }, {
+      preferredCamera: "environment",
+      maxScansPerSecond: 6,
+      returnDetailedScanResult: true,
+      highlightScanRegion: true,
+      highlightCodeOutline: true
+    });
+    await pickupQrScanner.start();
+    customerPickupMessage = "";
+    document.querySelector(".fulfillment-screen .sync-alert")?.remove();
+  } catch (error) {
+    customerPickupMessage = error.name === "NotAllowedError"
+      ? "Camera permission was blocked. Allow camera access, or use Zebra scanner/manual input."
+      : error.message || "Camera scanner failed.";
+    stopPickupScannerCamera();
+    render();
+  }
 }
 
 function pressReceivingKey(key) {
@@ -1363,11 +1825,18 @@ async function confirmLine(lineId) {
     pieces: row.querySelector('[data-pack="sales"]')?.value || pieces,
     sections: row.querySelector('[data-pack="sections"]')?.value || 0
   };
-  await api(`/api/delivery/orders/${selectedId}/lines/${lineId}/confirm`, {
+  const path = isCustomerPickupMode()
+    ? `/api/customer-pickup/orders/${selectedId}/lines/${lineId}/confirm`
+    : `/api/delivery/orders/${selectedId}/lines/${lineId}/confirm`;
+  await api(path, {
     method: "POST",
     body: JSON.stringify(body)
   });
   showToast("Line confirmed");
+  if (isCustomerPickupMode()) {
+    selectedOrder = await api(`/api/delivery/orders/${selectedId}`);
+    return render();
+  }
   await loadDetail(selectedId);
 }
 
@@ -1420,7 +1889,8 @@ async function startFulfillment() {
   fulfillmentStatusText = "";
   fulfillmentJobStage = "";
   fulfillmentStartedAt = 0;
-  currentModule = "delivery-fulfill";
+  fulfillmentValidation = null;
+  currentModule = isCustomerPickupMode() ? "customer-pickup-load" : "delivery-fulfill";
   render();
 }
 
@@ -1486,20 +1956,27 @@ async function confirmFulfillment() {
   fulfillmentStartedAt = Date.now();
   fulfillmentJobStage = "Saving proof";
   fulfillmentStatusText = "Saving photo proof and local loaded status...";
+  fulfillmentValidation = null;
   window.clearInterval(fulfillmentProgressTimer);
   fulfillmentProgressTimer = window.setInterval(() => {
     if (fulfillmentSubmitting) render();
   }, 1000);
   render();
   try {
-    fulfillmentResult = await api(`/api/delivery/orders/${fulfillmentOrder.netsuite_id}/load`, {
+    const path = currentModule === "customer-pickup-load"
+      ? `/api/customer-pickup/orders/${fulfillmentOrder.netsuite_id}/load`
+      : `/api/delivery/orders/${fulfillmentOrder.netsuite_id}/load`;
+    fulfillmentResult = await api(path, {
       method: "POST",
       body: JSON.stringify({ photoDataUrl: fulfillmentPhotoDataUrl, locationId })
     });
     showToast("Order loaded");
   } catch (error) {
     fulfillmentJobStage = "Load failed";
-    fulfillmentStatusText = error.message;
+    fulfillmentValidation = error.payload?.validation || null;
+    fulfillmentStatusText = fulfillmentValidation
+      ? "Correct the listed packed lines before loading."
+      : error.message;
     showToast(error.message);
   } finally {
     window.clearInterval(fulfillmentProgressTimer);
@@ -1525,14 +2002,22 @@ async function pollFulfillmentJob(jobId) {
 
 async function finishFulfillment() {
   stopFulfillmentCamera();
-  currentModule = "delivery";
+  const wasPickup = fulfillmentOrder && currentModule === "customer-pickup-load";
+  currentModule = wasPickup ? "customer-pickup-scan" : "delivery";
   fulfillmentOrder = null;
   fulfillmentPhotoDataUrl = "";
   fulfillmentResult = null;
   fulfillmentStatusText = "";
   fulfillmentJobStage = "";
+  fulfillmentValidation = null;
   fulfillmentStartedAt = 0;
   viewMode = "active";
+  if (wasPickup) {
+    selectedId = null;
+    selectedOrder = null;
+    customerPickupScan = "";
+    return render();
+  }
   await loadOrders();
 }
 
@@ -1893,6 +2378,16 @@ function renderPersonalHistory() {
 }
 
 async function openModule(moduleName) {
+  if (moduleName === "customer-pickup") {
+    currentModule = "customer-pickup-scan";
+    customerPickupScan = "";
+    customerPickupMessage = "";
+    selectedId = null;
+    selectedOrder = null;
+    selectedLineId = null;
+    linePage = 0;
+    return render();
+  }
   if (moduleName === "delivery") {
     currentModule = "delivery-select";
     return render();
@@ -2171,12 +2666,15 @@ app.addEventListener("click", async (event) => {
       authToken = "";
       operator = null;
       localStorage.removeItem(TOKEN_KEY);
+      localStorage.removeItem(STATE_KEY);
       disconnectEvents();
       return renderLogin();
     }
     if (button.dataset.action === "main-menu") {
+      if (!(await confirmDiscardCustomerPickupDraft())) return;
       stopFulfillmentCamera();
       stopReceiptCamera();
+      stopPickupScannerCamera();
       currentModule = "menu";
       selectedId = null;
       selectedOrder = null;
@@ -2184,6 +2682,16 @@ app.addEventListener("click", async (event) => {
       return render();
     }
     if (button.dataset.action === "open-module") return openModule(button.dataset.module);
+    if (button.dataset.action === "lookup-customer-pickup") return lookupCustomerPickup();
+    if (button.dataset.action === "start-pickup-scanner") return startPickupScannerCamera();
+    if (button.dataset.action === "customer-pickup-back") {
+      if (!(await confirmDiscardCustomerPickupDraft())) return;
+      selectedId = null;
+      selectedOrder = null;
+      selectedLineId = null;
+      currentModule = "customer-pickup-scan";
+      return render();
+    }
     if (button.dataset.action === "select-delivery-type") {
       deliveryOrderType = button.dataset.orderType || "sales_order";
       localStorage.setItem("mbbs.operator.deliveryOrderType", deliveryOrderType);
@@ -2233,7 +2741,7 @@ app.addEventListener("click", async (event) => {
       receivingOrderPage = 0;
       return loadReceivingOrders();
     }
-    if (button.dataset.action === "sync-receiving") return syncReceiving();
+    if (button.dataset.action === "refresh-receiving") return refreshReceiving();
     if (button.dataset.action === "receiving-key") return pressReceivingKey(button.dataset.key);
     if (button.dataset.action === "receiving-pick-item") {
       receivingItemSearch = button.dataset.item || "";
@@ -2325,6 +2833,7 @@ app.addEventListener("click", async (event) => {
     }
     if (button.dataset.action === "change-location") {
       localStorage.removeItem("mbbs.operator.locationId");
+      localStorage.removeItem(STATE_KEY);
       locationId = 0;
       selectedId = null;
       selectedOrder = null;
@@ -2344,14 +2853,9 @@ app.addEventListener("click", async (event) => {
       return loadOrders();
     }
     if (button.dataset.action === "sync") {
-      await api("/api/delivery/sync", {
-        method: "POST",
-        body: JSON.stringify({ locationId, orderType: deliveryOrderType })
-      });
-      showToast("Synced from NetSuite");
-      return loadOrders({ keepSelection: true });
+      return refreshDeliveryOrders();
     }
-    if (button.dataset.action === "refresh") return loadOrders({ keepSelection: true });
+    if (button.dataset.action === "refresh") return refreshDeliveryOrders();
     if (button.dataset.action === "open-warning-order") {
       selectedId = button.dataset.order;
       linePage = 0;
@@ -2397,7 +2901,7 @@ app.addEventListener("click", async (event) => {
     if (button.dataset.action === "start-fulfill") return startFulfillment();
     if (button.dataset.action === "cancel-fulfill") {
       stopFulfillmentCamera();
-      currentModule = "delivery";
+      currentModule = currentModule === "customer-pickup-load" ? "customer-pickup" : "delivery";
       fulfillmentOrder = null;
       fulfillmentPhotoDataUrl = "";
       fulfillmentResult = null;
@@ -2441,7 +2945,10 @@ app.addEventListener("click", async (event) => {
     if (button.dataset.action === "confirm-line") return confirmLine(button.dataset.line);
     if (button.dataset.action === "unpack-line") return unpackLine(button.dataset.line);
     if (button.dataset.action === "update-packed-line") return updatePackedLine(button.dataset.line);
-    if (button.dataset.action === "unpack-order") return unpackOrder();
+    if (button.dataset.action === "unpack-order") {
+      if (isCustomerPickupMode()) return showToast("Whole-order unpack is not available for customer pickup.");
+      return unpackOrder();
+    }
     if (button.dataset.order) {
       const preparing = preparingOrderId();
       if (preparing && String(button.dataset.order) !== String(preparing)) {
@@ -2465,6 +2972,11 @@ app.addEventListener("click", async (event) => {
 });
 
 app.addEventListener("input", async (event) => {
+  if (event.target?.id === "customerPickupScan") {
+    customerPickupScan = event.target.value;
+    customerPickupMessage = "";
+    return;
+  }
   if (event.target?.id === "historyReportReason") {
     historyReportReason = event.target.value;
     return;
@@ -2537,6 +3049,13 @@ app.addEventListener("input", async (event) => {
   }, 250);
 });
 
+app.addEventListener("keydown", async (event) => {
+  if (event.target?.id === "customerPickupScan" && event.key === "Enter") {
+    event.preventDefault();
+    await lookupCustomerPickup();
+  }
+});
+
 app.addEventListener("change", async (event) => {
   if (event.target?.id === "historyDate") {
     personalHistoryDate = event.target.value || "";
@@ -2580,7 +3099,7 @@ app.addEventListener("submit", async (event) => {
     localStorage.setItem(TOKEN_KEY, authToken);
     connectEvents();
     showToast(`Welcome ${operator.display_name}`);
-    render();
+    await restoreOperatorView();
   } catch (error) {
     renderLogin("Invalid username or password.");
   }
@@ -2595,7 +3114,7 @@ async function boot() {
     const result = await api("/api/auth/me");
     operator = result.operator;
     connectEvents();
-    render();
+    await restoreOperatorView();
   } catch (error) {
     disconnectEvents();
     renderLogin("Please login to continue.");

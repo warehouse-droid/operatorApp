@@ -4,13 +4,45 @@ const dispatchSessionId = localStorage.getItem(DISPATCH_SESSION_KEY) || `dispatc
 localStorage.setItem(DISPATCH_SESSION_KEY, dispatchSessionId);
 
 const HUBS = {
-  "3445": { x: 48, y: 40, lat: 43.7046, lng: -79.2767, address: "3445 Kennedy Road, Toronto, ON" },
-  "2967": { x: 62, y: 52, lat: 43.8183, lng: -79.3062, address: "2967 Kennedy Road, Toronto, ON" },
-  "12441": { x: 40, y: 66, lat: 43.9445, lng: -79.3740, address: "12441 Woodbine Avenue, Whitchurch-Stouffville, ON" },
+  "3445": { x: 48, y: 40, lat: 43.8204306, lng: -79.3053423, address: "3445 Kennedy Road, Toronto, ON" },
+  "2967": { x: 62, y: 52, lat: 43.806119, lng: -79.2986377, address: "2967 Kennedy Road, Toronto, ON" },
+  "12441": { x: 40, y: 66, lat: 43.948694, lng: -79.3727582, address: "12441 Woodbine Avenue, Whitchurch-Stouffville, ON" },
   "Vendor": { x: 28, y: 22, lat: 43.857, lng: -79.521 }
 };
 
 const MAP_CENTER = { lat: 43.700, lng: -79.650 };
+
+let ownYards = Object.entries(HUBS)
+  .filter(([code]) => code !== "Vendor")
+  .map(([code, hub]) => ({ code, name: code, address: hub.address || code, lat: hub.lat, lng: hub.lng, x: hub.x, y: hub.y }));
+
+function applyOwnYards(nextYards = []) {
+  if (Array.isArray(nextYards) && nextYards.length) {
+    ownYards = nextYards
+      .map((yard) => ({
+        code: String(yard.code || yard.name || "").trim(),
+        name: String(yard.name || yard.code || "").trim(),
+        address: String(yard.address || "").trim(),
+        lat: yard.lat === "" || yard.lat == null ? Number.NaN : Number(yard.lat),
+        lng: yard.lng === "" || yard.lng == null ? Number.NaN : Number(yard.lng),
+        x: yard.x === "" || yard.x == null ? Number.NaN : Number(yard.x),
+        y: yard.y === "" || yard.y == null ? Number.NaN : Number(yard.y)
+      }))
+      .filter((yard) => yard.code);
+  }
+  for (const yard of ownYards) {
+    const existing = HUBS[yard.code] || {};
+    HUBS[yard.code] = {
+      ...existing,
+      x: Number.isFinite(yard.x) ? yard.x : (existing.x ?? 50),
+      y: Number.isFinite(yard.y) ? yard.y : (existing.y ?? 50),
+      lat: Number.isFinite(yard.lat) ? yard.lat : (existing.lat ?? MAP_CENTER.lat),
+      lng: Number.isFinite(yard.lng) ? yard.lng : (existing.lng ?? MAP_CENTER.lng),
+      address: yard.address || existing.address || yard.code,
+      name: yard.name || existing.name || yard.code
+    };
+  }
+}
 
 const sampleOrders = [
   {
@@ -297,8 +329,8 @@ const sampleOrders = [
 let orderCatalog = [];
 let orders = orderCatalog.map((order) => ({ ...order, assigned: false }));
 let drivers = [
-  { name: "Alex Wong", license: "AZ", number: "A90211", login: "alex", ownYardFixedMinutes: 42, outsideFixedMinutes: 36, minutesPerPallet: 1, loadMinutes: 42, unloadMinutes: 36 },
-  { name: "Jenny Lee", license: "DZ", number: "D18870", login: "jenny", ownYardFixedMinutes: 38, outsideFixedMinutes: 32, minutesPerPallet: 1, loadMinutes: 38, unloadMinutes: 32 }
+  { name: "Alex Wong", license: "AZ", number: "A90211", login: "alex", ownYardFixedMinutes: 42, vendorFixedMinutes: 36, deliveryFixedMinutes: 36, outsideFixedMinutes: 36, minutesPerPallet: 1, loadMinutes: 42, unloadMinutes: 36 },
+  { name: "Jenny Lee", license: "DZ", number: "D18870", login: "jenny", ownYardFixedMinutes: 38, vendorFixedMinutes: 32, deliveryFixedMinutes: 32, outsideFixedMinutes: 32, minutesPerPallet: 1, loadMinutes: 38, unloadMinutes: 32 }
 ];
 
 let fleet = [
@@ -319,6 +351,8 @@ let modalOrderId = "";
 let modalLoadId = "";
 let splitParts = 2;
 let splitDraft = { orderId: "", parts: 0, items: {} };
+let poAllocationOptions = null;
+let poAllocationLoading = false;
 let selectedOrderIds = new Set([selectedOrderId]);
 let loadPreviewOpen = false;
 let sequenceCollapsed = false;
@@ -331,6 +365,7 @@ let driverJobStatuses = [];
 let googleMapsPromise = null;
 let routeEstimates = {};
 let routeCache = {};
+let geocodeCache = {};
 let orderListScrollTop = 0;
 let loadPreviewWidth = Number(localStorage.getItem("mbbs.dispatch.previewWidth") || 520);
 let isResizingPreview = false;
@@ -340,6 +375,13 @@ let isApplyingRemotePlan = false;
 let eventSource = null;
 let remoteRefreshTimer = null;
 let orderClickTimer = null;
+let undoStack = [];
+let redoStack = [];
+let historyCurrentState = "";
+let historyCurrentSnapshot = null;
+let historyReady = false;
+let isApplyingHistory = false;
+const HISTORY_LIMIT = 80;
 const DISPATCH_PLAN_KEY = "mbbs.dispatch.plan";
 const DISPATCH_PLAN_DATE_KEY = "mbbs.dispatch.planDate";
 let currentPlanDate = localStorage.getItem(DISPATCH_PLAN_DATE_KEY) || todayLocalDate();
@@ -430,7 +472,15 @@ function ownYardFixedMinutesFor(driver, truck = {}) {
 }
 
 function outsideFixedMinutesFor(driver, truck = {}) {
-  return Number(driver?.outsideFixedMinutes || driver?.unloadMinutes || truck?.outsideFixedMinutes || truck?.unloadMinutes || 35);
+  return deliveryFixedMinutesFor(driver, truck);
+}
+
+function vendorFixedMinutesFor(driver, truck = {}) {
+  return Number(driver?.vendorFixedMinutes || truck?.vendorFixedMinutes || driver?.outsideFixedMinutes || driver?.unloadMinutes || truck?.outsideFixedMinutes || truck?.unloadMinutes || 35);
+}
+
+function deliveryFixedMinutesFor(driver, truck = {}) {
+  return Number(driver?.deliveryFixedMinutes || truck?.deliveryFixedMinutes || driver?.outsideFixedMinutes || driver?.unloadMinutes || truck?.outsideFixedMinutes || truck?.unloadMinutes || 35);
 }
 
 function minutesPerPalletFor(driver, truck = {}) {
@@ -443,8 +493,17 @@ function truckOwnYardFixedMinutes(truck) {
 }
 
 function truckOutsideFixedMinutes(truck) {
+  return truckDeliveryFixedMinutes(truck);
+}
+
+function truckVendorFixedMinutes(truck) {
   const driver = truckDriver(truck);
-  return outsideFixedMinutesFor(driver, truck);
+  return vendorFixedMinutesFor(driver, truck);
+}
+
+function truckDeliveryFixedMinutes(truck) {
+  const driver = truckDriver(truck);
+  return deliveryFixedMinutesFor(driver, truck);
 }
 
 function truckMinutesPerPallet(truck) {
@@ -452,9 +511,11 @@ function truckMinutesPerPallet(truck) {
   return minutesPerPalletFor(driver, truck);
 }
 
-function truckStopMinutes(truck, isOwnYard, palletCount = 0) {
-  const fixedMinutes = isOwnYard ? truckOwnYardFixedMinutes(truck) : truckOutsideFixedMinutes(truck);
-  return Math.round(fixedMinutes + (Number(palletCount || 0) * truckMinutesPerPallet(truck)));
+function truckStopMinutes(truck, stopType = "delivery", palletCount = 0) {
+  const type = stopType === true ? "own" : stopType === false ? "delivery" : String(stopType || "delivery");
+  if (type === "own") return Math.round(truckOwnYardFixedMinutes(truck));
+  if (type === "vendor") return Math.round(truckVendorFixedMinutes(truck));
+  return Math.round(truckDeliveryFixedMinutes(truck) + (Number(palletCount || 0) * truckMinutesPerPallet(truck)));
 }
 
 function truckLoadMinutes(truck) {
@@ -482,10 +543,12 @@ function applyDriverToTruck(truck, driver) {
   truck.driver = driver?.name || "Unassigned";
   truck.license = driver?.license || "-";
   truck.ownYardFixedMinutes = ownYardFixedMinutesFor(driver, truck);
-  truck.outsideFixedMinutes = outsideFixedMinutesFor(driver, truck);
+  truck.vendorFixedMinutes = vendorFixedMinutesFor(driver, truck);
+  truck.deliveryFixedMinutes = deliveryFixedMinutesFor(driver, truck);
+  truck.outsideFixedMinutes = truck.deliveryFixedMinutes;
   truck.minutesPerPallet = minutesPerPalletFor(driver, truck);
   truck.loadMinutes = truck.ownYardFixedMinutes;
-  truck.unloadMinutes = truck.outsideFixedMinutes;
+  truck.unloadMinutes = truck.deliveryFixedMinutes;
 }
 
 function makeTruckFromFleet(vehicle, index, saved = {}) {
@@ -503,10 +566,12 @@ function makeTruckFromFleet(vehicle, index, saved = {}) {
     parkingSpot: saved.parkingSpot || vehicle.parkingSpot || "",
     start: saved.start || timeText(7 * 60 + (index * 30)),
     ownYardFixedMinutes: Number(saved.ownYardFixedMinutes || saved.loadMinutes || driver.ownYardFixedMinutes || driver.loadMinutes || 40),
-    outsideFixedMinutes: Number(saved.outsideFixedMinutes || saved.unloadMinutes || driver.outsideFixedMinutes || driver.unloadMinutes || 35),
+    vendorFixedMinutes: Number(saved.vendorFixedMinutes || driver.vendorFixedMinutes || saved.outsideFixedMinutes || saved.unloadMinutes || driver.outsideFixedMinutes || driver.unloadMinutes || 35),
+    deliveryFixedMinutes: Number(saved.deliveryFixedMinutes || driver.deliveryFixedMinutes || saved.outsideFixedMinutes || saved.unloadMinutes || driver.outsideFixedMinutes || driver.unloadMinutes || 35),
+    outsideFixedMinutes: Number(saved.deliveryFixedMinutes || driver.deliveryFixedMinutes || saved.outsideFixedMinutes || saved.unloadMinutes || driver.outsideFixedMinutes || driver.unloadMinutes || 35),
     minutesPerPallet: Number(saved.minutesPerPallet || driver.minutesPerPallet || 1),
     loadMinutes: Number(saved.ownYardFixedMinutes || saved.loadMinutes || driver.ownYardFixedMinutes || driver.loadMinutes || 40),
-    unloadMinutes: Number(saved.outsideFixedMinutes || saved.unloadMinutes || driver.outsideFixedMinutes || driver.unloadMinutes || 35),
+    unloadMinutes: Number(saved.deliveryFixedMinutes || driver.deliveryFixedMinutes || saved.outsideFixedMinutes || saved.unloadMinutes || driver.outsideFixedMinutes || driver.unloadMinutes || 35),
     loads: saved.loads?.length ? saved.loads : [{ id: `${id}-L1`, name: "Load 1", stops: [] }]
   };
 }
@@ -555,6 +620,87 @@ function packedUnitText(order) {
   return parts.join(" ");
 }
 
+function qtyText(value) {
+  const number = Number(value || 0);
+  return Number.isInteger(number) ? String(number) : number.toLocaleString(undefined, { maximumFractionDigits: 2 });
+}
+
+function itemQtyText(item = {}) {
+  const parts = [
+    ["PLT", item.pallets],
+    ["LYR", item.layers],
+    ["SEC", item.sections],
+    ["PCS", item.pieces]
+  ].filter(([, value]) => Number(value || 0) > 0)
+    .map(([label, value]) => `${qtyText(value)} ${label}`);
+  if (!parts.length && Number(item.quantity || item.salesQty || 0) > 0) parts.push(`${qtyText(item.quantity || item.salesQty)} ${item.unit || "Qty"}`);
+  return parts.join(" ") || "0";
+}
+
+function positiveBalance(value, allocated) {
+  return Math.max(Number(value || 0) - Number(allocated || 0), 0);
+}
+
+function isOwnYardCode(value) {
+  return Boolean(ownYardForLocation(value));
+}
+
+function itemForPickupLocation(item = {}, pickupLocation = "") {
+  const location = String(pickupLocation || "").trim();
+  if (!location) return item;
+  if (isOwnYardCode(location)) {
+    return {
+      ...item,
+      pallets: positiveBalance(item.pallets, item.poAllocatedPallets),
+      layers: positiveBalance(item.layers, item.poAllocatedLayers),
+      sections: positiveBalance(item.sections, item.poAllocatedSections),
+      pieces: positiveBalance(item.pieces, item.poAllocatedPieces),
+      quantity: positiveBalance(item.quantity || item.salesQty, item.poAllocatedSalesQty),
+      salesQty: positiveBalance(item.salesQty || item.quantity, item.poAllocatedSalesQty)
+    };
+  }
+  return {
+    ...item,
+    pallets: Number(item.poAllocatedPallets || 0),
+    layers: Number(item.poAllocatedLayers || 0),
+    sections: Number(item.poAllocatedSections || 0),
+    pieces: Number(item.poAllocatedPieces || 0),
+    quantity: Number(item.poAllocatedSalesQty || 0),
+    salesQty: Number(item.poAllocatedSalesQty || 0)
+  };
+}
+
+function itemHasQuantity(item = {}) {
+  return Number(item.pallets || 0)
+    || Number(item.layers || 0)
+    || Number(item.sections || 0)
+    || Number(item.pieces || 0)
+    || Number(item.quantity || item.salesQty || 0);
+}
+
+function tooltipItemsForOrder(order, { pickupLocation = "" } = {}) {
+  return (order.items || [])
+    .map((item) => pickupLocation ? itemForPickupLocation(item, pickupLocation) : item)
+    .filter(itemHasQuantity);
+}
+
+function availableUnitsForLine(line = {}) {
+  const available = line.available || {};
+  const units = [
+    ["pallets", "PLT", available.pallets],
+    ["layers", "LYR", available.layers],
+    ["sections", "SEC", available.sections],
+    ["pieces", "PCS", available.pieces]
+  ].filter(([, , value]) => Number(value || 0) > 0);
+  if (units.length) return units;
+  if (Number(available.salesQty || 0) > 0) return [["salesQty", line.required?.unit || "Qty", available.salesQty]];
+  return [];
+}
+
+function availableQtyTextForLine(line = {}) {
+  return itemQtyText({ ...(line.available || {}), unit: line.required?.unit || "Qty" });
+}
+
 function movementText(order) {
   if (order.type === "PO") return `${order.sourceYard || "Vendor yard"} to ${order.destinationYard || order.pickupLocations?.[0] || "our yard"}`;
   if (order.type === "TO") return `${order.sourceYard || order.pickupLocations?.[0] || "source yard"} to ${order.destinationYard || "destination yard"}`;
@@ -575,6 +721,76 @@ function splitBlockReason(order) {
 
 function normalizeText(value) {
   return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function normalizedPlaceKey(value) {
+  return normalizeText(value).replace(/\s+/g, " ");
+}
+
+function ownYardForLocation(location = "") {
+  const key = normalizedPlaceKey(location);
+  if (!key) return null;
+  if (HUBS[String(location)] && String(location) !== "Vendor") {
+    const hub = HUBS[String(location)];
+    return { code: String(location), name: hub.name || String(location), address: hub.address || String(location), lat: hub.lat, lng: hub.lng };
+  }
+  return ownYards.find((yard) => {
+    const code = normalizedPlaceKey(yard.code);
+    const name = normalizedPlaceKey(yard.name);
+    const address = normalizedPlaceKey(yard.address);
+    return key === code || key === name || key === address;
+  }) || null;
+}
+
+function vendorYardForLocation(location = "", order = null) {
+  return vendorYardsForLocation(location, order)[0] || null;
+}
+
+function vendorYardsForLocation(location = "", order = null) {
+  const key = normalizedPlaceKey(location);
+  if (!key) return [];
+  const rows = dispatchVendorYards.filter((row) => String(row.address || "").trim());
+  const exact = rows.filter((row) => normalizedPlaceKey(row.yard) === key);
+  if (exact.length) return exact;
+  const vendorFiltered = order
+    ? rows.filter((row) => vendorMatchesOrder(row, order))
+    : rows;
+  const fuzzyVendorRows = vendorFiltered.filter((row) => {
+    const yard = normalizedPlaceKey(row.yard);
+    const vendor = normalizedPlaceKey(row.vendor);
+    return yard && (key.includes(yard) || yard.includes(key) || (vendor && key.includes(vendor)));
+  });
+  if (fuzzyVendorRows.length) return fuzzyVendorRows;
+  return rows.filter((row) => {
+    const yard = normalizedPlaceKey(row.yard);
+    return yard && (key.includes(yard) || yard.includes(key));
+  });
+}
+
+function placeForLocation(location = "", order = null) {
+  const ownYard = ownYardForLocation(location);
+  if (ownYard) {
+    return {
+      kind: "own",
+      key: ownYard.code || ownYard.name || location,
+      label: ownYard.name || ownYard.code || location,
+      address: ownYard.address || ownYard.code || location,
+      lat: Number(ownYard.lat),
+      lng: Number(ownYard.lng)
+    };
+  }
+  const vendorYard = vendorYardForLocation(location, order);
+  if (vendorYard) {
+    return {
+      kind: "vendor",
+      key: vendorYard.yard || location,
+      label: vendorYard.yard || vendorYard.vendor || location,
+      address: vendorYard.address || location,
+      lat: Number(vendorYard.lat),
+      lng: Number(vendorYard.lng)
+    };
+  }
+  return null;
 }
 
 function vendorMatchesOrder(row, order) {
@@ -690,8 +906,55 @@ function timeValidationMessage(start, end) {
   return "";
 }
 
+function planWeekdayName(planDate = currentPlanDate) {
+  const text = String(planDate || "").slice(0, 10);
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(text) ? new Date(`${text}T12:00:00`) : new Date();
+  return date.toLocaleDateString("en-US", { weekday: "long" });
+}
+
+function dayLabelMatchesPlan(dayLabel = "", planDate = currentPlanDate) {
+  const label = normalizeText(dayLabel);
+  if (!label) return false;
+  const weekday = planWeekdayName(planDate);
+  const day = normalizeText(weekday);
+  if (label === day) return true;
+  const weekdayIndex = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"].indexOf(day);
+  if (label.includes("mon fri") || label.includes("monday friday")) return weekdayIndex >= 1 && weekdayIndex <= 5;
+  if (label.includes("mon thu") || label.includes("monday thursday")) return weekdayIndex >= 1 && weekdayIndex <= 4;
+  if (label.includes("sat sun") || label.includes("weekend")) return weekdayIndex === 0 || weekdayIndex === 6;
+  return false;
+}
+
+function dayLabelIsExactPlanDay(dayLabel = "", planDate = currentPlanDate) {
+  return normalizeText(dayLabel) === normalizeText(planWeekdayName(planDate));
+}
+
+function vendorWindowForLocation(location = "", order = null) {
+  const rows = vendorYardsForLocation(location, order);
+  if (!rows.length) return { start: "", end: "", label: "" };
+  const matchingDay = rows.find((row) => dayLabelIsExactPlanDay(row.dayLabel))
+    || rows.find((row) => dayLabelMatchesPlan(row.dayLabel));
+  const fallbackActive = rows.find((row) => row.active !== false && row.windowStart && row.windowEnd);
+  const row = matchingDay || fallbackActive || rows[0];
+  if (matchingDay && matchingDay.active === false) {
+    return { start: "", end: "", label: matchingDay.dayLabel || planWeekdayName(), closed: true };
+  }
+  return {
+    start: row?.active === false ? "" : (row?.windowStart || ""),
+    end: row?.active === false ? "" : (row?.windowEnd || ""),
+    label: row?.dayLabel || ""
+  };
+}
+
 function setEditFormStatus(form, message = "", tone = "info") {
   const status = form?.querySelector("[data-edit-status]");
+  if (!status) return;
+  status.textContent = message;
+  status.className = `modal-status ${tone}`;
+}
+
+function setModalFormStatus(form, message = "", tone = "info") {
+  const status = form?.querySelector("[data-modal-status]");
   if (!status) return;
   status.textContent = message;
   status.className = `modal-status ${tone}`;
@@ -723,6 +986,7 @@ async function loadDispatchSetup() {
     if (!response.ok) return;
     const setup = await response.json();
     if (Array.isArray(setup.drivers)) drivers = setup.drivers;
+    if (Array.isArray(setup.ownYards)) applyOwnYards(setup.ownYards);
     if (Array.isArray(setup.trucks) && setup.trucks.length) {
       fleet = setup.trucks;
       trucks = fleet.map((vehicle, index) => makeTruckFromFleet(vehicle, index));
@@ -753,12 +1017,25 @@ async function loadDispatchOrders({ sync = false } = {}) {
     if (!response.ok) throw new Error(await response.text());
     const payload = await response.json();
     applyDispatchOrderFeed(sync ? payload.orders : payload);
-    routeNotice = sync ? "Orders synced from NetSuite and local DB." : routeNotice;
+    routeNotice = sync ? "Orders refreshed from local DB." : routeNotice;
     return true;
   } catch (error) {
-    routeNotice = sync ? `Order sync failed: ${error.message}` : routeNotice;
+    routeNotice = sync ? `Order refresh failed: ${error.message}` : routeNotice;
     applyDispatchOrderFeed(orderCatalog);
     return false;
+  }
+}
+
+async function loadPoAllocationOptions(orderId) {
+  poAllocationLoading = true;
+  poAllocationOptions = null;
+  render({ save: false });
+  try {
+    const response = await fetch(`/api/dispatch/orders/${encodeURIComponent(orderId)}/po-allocations`);
+    if (!response.ok) throw new Error(await response.text());
+    poAllocationOptions = await response.json();
+  } finally {
+    poAllocationLoading = false;
   }
 }
 
@@ -1112,6 +1389,125 @@ function queueServerSave(payload) {
   saveTimer = setTimeout(() => savePlanToServer(payload), 250);
 }
 
+function cloneHistoryValue(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function historySnapshot() {
+  return {
+    orders: cloneHistoryValue(orders),
+    trucks: cloneHistoryValue(trucks),
+    selectedOrderId,
+    selectedOrderIds: [...selectedOrderIds],
+    selectedLoadId,
+    loadPreviewOpen,
+    activeOrderType
+  };
+}
+
+function serializeHistorySnapshot(snapshot = historySnapshot()) {
+  return JSON.stringify({
+    orders: snapshot.orders,
+    trucks: snapshot.trucks
+  });
+}
+
+function resetUndoHistory() {
+  undoStack = [];
+  redoStack = [];
+  historyCurrentState = "";
+  historyCurrentSnapshot = null;
+  historyReady = false;
+}
+
+function applyHistorySnapshot(snapshot) {
+  if (!snapshot) return;
+  orders = (snapshot.orders || []).map(normalizeOrder);
+  trucks = cloneHistoryValue(snapshot.trucks || []);
+  selectedOrderId = orders.find((order) => order.id === snapshot.selectedOrderId)?.id || orders[0]?.id || "";
+  selectedOrderIds = new Set((snapshot.selectedOrderIds || []).filter((id) => orders.some((order) => order.id === id)));
+  if (!selectedOrderIds.size && selectedOrderId) selectedOrderIds.add(selectedOrderId);
+  selectedLoadId = trucks.flatMap((truck) => truck.loads || []).find((load) => load.id === snapshot.selectedLoadId)?.id
+    || trucks[0]?.loads?.[0]?.id
+    || "";
+  loadPreviewOpen = Boolean(snapshot.loadPreviewOpen && selectedLoadId);
+  activeOrderType = snapshot.activeOrderType || activeOrderType;
+  modalType = "";
+  modalOrderId = "";
+  modalLoadId = "";
+  poAllocationOptions = null;
+  poAllocationLoading = false;
+  routeCache = {};
+  routeEstimates = {};
+}
+
+function captureUndoPointIfNeeded(save) {
+  const snapshot = historySnapshot();
+  const serialized = serializeHistorySnapshot(snapshot);
+  if (!historyReady) {
+    historyCurrentState = serialized;
+    historyCurrentSnapshot = cloneHistoryValue(snapshot);
+    historyReady = true;
+    return;
+  }
+  if (serialized === historyCurrentState) return;
+  if (save && !isApplyingHistory && !isApplyingRemotePlan) {
+    undoStack.push(cloneHistoryValue(historyCurrentSnapshot || snapshot));
+    if (undoStack.length > HISTORY_LIMIT) undoStack.shift();
+    redoStack = [];
+  }
+  historyCurrentState = serialized;
+  historyCurrentSnapshot = cloneHistoryValue(snapshot);
+}
+
+function undoDispatchChange() {
+  if (!undoStack.length) return false;
+  const current = historySnapshot();
+  const previousState = undoStack.pop();
+  redoStack.push(current);
+  if (redoStack.length > HISTORY_LIMIT) redoStack.shift();
+  isApplyingHistory = true;
+  applyHistorySnapshot(previousState);
+  routeNotice = "Undo applied.";
+  historyCurrentState = serializeHistorySnapshot(previousState);
+  historyCurrentSnapshot = cloneHistoryValue(previousState);
+  logDispatchAudit({
+    action: "dispatch_plan_undo",
+    entityType: "plan",
+    entityId: currentPlan?.id || currentPlanDate,
+    before: { orders: current.orders.length, trucks: current.trucks.length },
+    after: { orders: previousState.orders?.length || 0, trucks: previousState.trucks?.length || 0 },
+    details: { planDate: currentPlanDate }
+  });
+  render();
+  isApplyingHistory = false;
+  return true;
+}
+
+function redoDispatchChange() {
+  if (!redoStack.length) return false;
+  const current = historySnapshot();
+  const nextState = redoStack.pop();
+  undoStack.push(current);
+  if (undoStack.length > HISTORY_LIMIT) undoStack.shift();
+  isApplyingHistory = true;
+  applyHistorySnapshot(nextState);
+  routeNotice = "Redo applied.";
+  historyCurrentState = serializeHistorySnapshot(nextState);
+  historyCurrentSnapshot = cloneHistoryValue(nextState);
+  logDispatchAudit({
+    action: "dispatch_plan_redo",
+    entityType: "plan",
+    entityId: currentPlan?.id || currentPlanDate,
+    before: { orders: current.orders.length, trucks: current.trucks.length },
+    after: { orders: nextState.orders?.length || 0, trucks: nextState.trucks?.length || 0 },
+    details: { planDate: currentPlanDate }
+  });
+  render();
+  isApplyingHistory = false;
+  return true;
+}
+
 function autoSavePlan() {
   const savedAt = new Date();
   lastSavedAt = savedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
@@ -1194,12 +1590,14 @@ async function loadPlanForDate(planDate = currentPlanDate, { createIfMissing = t
     applySavedPlan(currentPlan);
     lastServerSavedAt = currentPlan.savedAt || currentPlan.updatedAt || lastServerSavedAt;
     await loadDriverJobStatuses();
+    resetUndoHistory();
     return { loaded: true, created, hasSnapshot: true };
   }
   if (currentPlan?.id) {
     resetPlanningBoard();
     lastServerSavedAt = currentPlan.savedAt || currentPlan.updatedAt || lastServerSavedAt;
     await loadDriverJobStatuses();
+    resetUndoHistory();
     return { loaded: true, created, hasSnapshot: false };
   }
   return { loaded: false, created, hasSnapshot: false };
@@ -1216,6 +1614,7 @@ async function loadPlanById(planId) {
   lastServerSavedAt = plan.savedAt || plan.updatedAt || lastServerSavedAt;
   await loadPlanHistory();
   await loadDriverJobStatuses();
+  resetUndoHistory();
   return plan;
 }
 
@@ -1232,6 +1631,7 @@ async function restoreServerPlan() {
     currentPlanDate = saved.planDate || currentPlanDate;
     const applied = applySavedPlan(saved);
     await loadDriverJobStatuses();
+    if (applied) resetUndoHistory();
     isApplyingRemotePlan = false;
     return applied;
   } catch {
@@ -1368,6 +1768,17 @@ function stopOrder(stop) {
   return orderById(stop.orderId);
 }
 
+function stopById(stopId) {
+  const id = String(stopId || "");
+  for (const truck of trucks) {
+    for (const load of truck.loads || []) {
+      const found = (load.stops || []).find((stop) => String(stop.id) === id);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
 function requiredPickupLocations(order) {
   return order?.pickupLocations?.length ? order.pickupLocations : ["3445"];
 }
@@ -1424,6 +1835,24 @@ function pickupFootprintForLocation(load, location) {
   return total;
 }
 
+function routeLegMinutesForLoad(load) {
+  const estimate = routeEstimates[load?.id];
+  return Array.isArray(estimate?.legMinutes) ? estimate.legMinutes : [];
+}
+
+function fallbackTravelMinutesBetweenStops(previousStop, currentStop, previousOrder, currentOrder) {
+  if (!previousStop) return 0;
+  const previousLocation = previousStop.type === "pick"
+    ? previousStop.location
+    : previousOrder?.destinationYard || previousOrder?.address || "";
+  const currentLocation = currentStop.type === "pick"
+    ? currentStop.location
+    : currentOrder?.destinationYard || currentOrder?.address || "";
+  if (HUBS[previousLocation] && HUBS[currentLocation]) return yardTravelMinutes(previousLocation, currentLocation);
+  if (currentStop.type === "drop") return Number(currentOrder?.travelMinutes || 30);
+  return Number(previousOrder?.travelMinutes || currentOrder?.travelMinutes || 30);
+}
+
 function loadStats(truck, load) {
   const start = loadStartMinutes(truck, load);
   if (load.returnOnly) {
@@ -1446,7 +1875,15 @@ function loadStats(truck, load) {
   }
   let current = start;
   const startTravel = startTravelForLoad(truck, load);
-  if (startTravel) current += startTravel.minutes;
+  let resolvedStartTravel = startTravel;
+  const routeLegMinutes = routeLegMinutesForLoad(load);
+  let routeLegIndex = 0;
+  if (startTravel) {
+    const startTravelMinutes = Number(routeLegMinutes[routeLegIndex] ?? startTravel.minutes);
+    resolvedStartTravel = { ...startTravel, minutes: startTravelMinutes };
+    current += startTravelMinutes;
+    routeLegIndex += 1;
+  }
   const rows = [];
   let palletTotal = 0;
   let footprintTotal = 0;
@@ -1463,7 +1900,7 @@ function loadStats(truck, load) {
   const explicitPickCount = load.stops.filter((stop) => stop.type === "pick").length;
   if (!explicitPickCount) {
     for (const location of uniquePickupLocations(load, truck)) {
-      current += truckStopMinutes(truck, Boolean(HUBS[location]), pickupFootprintForLocation(load, location));
+      current += truckStopMinutes(truck, HUBS[location] ? "own" : "vendor", pickupFootprintForLocation(load, location));
     }
     for (const stop of load.stops) {
       if (stop.type !== "drop" || onboardOrderIds.has(stop.orderId)) continue;
@@ -1475,9 +1912,15 @@ function loadStats(truck, load) {
     peakWeightLbs = currentWeightLbs;
   }
 
+  let previousStop = null;
+  let previousOrder = null;
   for (const stop of load.stops) {
     const order = stopOrder(stop);
     if (!order) continue;
+    if (previousStop) {
+      current += Number(routeLegMinutes[routeLegIndex] ?? fallbackTravelMinutesBetweenStops(previousStop, stop, previousOrder, order));
+      routeLegIndex += 1;
+    }
     if (stop.type === "pick") {
       pickedLocations.add(String(stop.location));
       let pickedFootprint = 0;
@@ -1492,14 +1935,25 @@ function loadStats(truck, load) {
         peakWeightLbs = Math.max(peakWeightLbs, currentWeightLbs);
       }
       const arrival = current;
-      current += truckStopMinutes(truck, stopIsOwnYard(stop, order), pickedFootprint);
-      rows.push({ stop, order, arrival, depart: current, warning: false });
+      current += truckStopMinutes(truck, stopServiceType(stop, order), pickedFootprint);
+      let warningReason = "";
+      const window = stopTimeWindow(stop, order);
+      const hasTimeWindow = Boolean(window.start && window.end);
+      if (window.closed) warningReason = `${stop.location} closed on ${window.label || planWeekdayName()}.`;
+      else if (hasTimeWindow && arrival > minutes(window.end)) warningReason = `Pickup ${stop.location} late: arrives ${timeText(arrival)}, window ends ${window.end}`;
+      else if (hasTimeWindow && arrival < minutes(window.start)) warningReason = `Pickup ${stop.location} early: arrives ${timeText(arrival)}, window starts ${window.start}`;
+      if (warningReason) {
+        warningCount += 1;
+        warnings.push(warningReason);
+      }
+      rows.push({ stop, order, arrival, depart: current, warning: Boolean(warningReason), warningReason });
+      previousStop = stop;
+      previousOrder = order;
       continue;
     }
     const missingPickupLocations = requiredPickupLocations(order).filter((location) => !pickedLocations.has(String(location)));
-    current += order.travelMinutes;
     const arrival = current;
-    current += truckStopMinutes(truck, stopIsOwnYard(stop, order), orderFootprintPallets(order));
+    current += truckStopMinutes(truck, stopServiceType(stop, order), orderFootprintPallets(order));
     palletTotal += Number(order.pallets || 0);
     footprintTotal += orderFootprintPallets(order);
     processedWeightLbs += orderWeightLbs(order);
@@ -1508,17 +1962,21 @@ function loadStats(truck, load) {
       onboardOrderIds.delete(order.id);
       droppedOrderIds.add(order.id);
     }
-    travelTotal += Number(order.travelMinutes || 0);
+    travelTotal += Number(routeLegMinutes[Math.max(routeLegIndex - 1, 0)] ?? order.travelMinutes ?? 0);
     let warningReason = "";
-    const hasTimeWindow = Boolean(order.windowStart && order.windowEnd);
+    const window = stopTimeWindow(stop, order);
+    const hasTimeWindow = Boolean(window.start && window.end);
     if (missingPickupLocations.length) warningReason = `${order.id}: pickup ${missingPickupLocations.join(", ")} before drop.`;
-    else if (hasTimeWindow && arrival > minutes(order.windowEnd)) warningReason = `${order.id} late: arrives ${timeText(arrival)}, window ends ${order.windowEnd}`;
-    else if (hasTimeWindow && arrival < minutes(order.windowStart) - 45) warningReason = `${order.id} early: arrives ${timeText(arrival)}, window starts ${order.windowStart}`;
+    else if (window.closed) warningReason = `${order.id} ${stop.type} location closed on ${window.label || planWeekdayName()}.`;
+    else if (hasTimeWindow && arrival > minutes(window.end)) warningReason = `${order.id} ${stop.type} late: arrives ${timeText(arrival)}, window ends ${window.end}`;
+    else if (hasTimeWindow && arrival < minutes(window.start) - 45) warningReason = `${order.id} ${stop.type} early: arrives ${timeText(arrival)}, window starts ${window.start}`;
     if (warningReason) {
       warningCount += 1;
       warnings.push(warningReason);
     }
     rows.push({ stop, order, arrival, depart: current, warning: Boolean(warningReason), warningReason });
+    previousStop = stop;
+    previousOrder = order;
   }
   for (const warning of sequenceWarnings) {
     if (!warnings.includes(warning)) {
@@ -1536,7 +1994,7 @@ function loadStats(truck, load) {
     warningCount += 1;
     warnings.push(`Over capacity: ${formatLbs(weightTotalLbs)} peak onboard, truck capacity ${formatLbs(capacityLbs)}`);
   }
-  return { rows, startTravel, palletTotal, footprintTotal, weightTotalLbs, processedWeightLbs, capacityLbs, start, finish: current, returnTrip, warningCount, warnings, capacityWarning, fullLoad };
+  return { rows, startTravel: resolvedStartTravel, palletTotal, footprintTotal, weightTotalLbs, processedWeightLbs, capacityLbs, start, finish: current, returnTrip, warningCount, warnings, capacityWarning, fullLoad };
 }
 
 function boardStats() {
@@ -1683,27 +2141,31 @@ function startPointAfterLoad(truck, load) {
   if (!load) return null;
   if (load.returnOnly) {
     const yard = load.returnYard || "12441";
+    const place = placeForLocation(yard);
     return {
       label: yard,
-      address: hubAddress(yard),
-      routeLocation: hubPosition(yard),
-      isHub: true
+      address: place?.address || hubAddress(yard),
+      position: placePosition(place) || hubPosition(yard),
+      routeLocation: place?.address || hubAddress(yard),
+      isHub: Boolean(place?.kind === "own")
     };
   }
   const stop = lastRoutedStop(load);
   const order = stop ? stopOrder(stop) : null;
   if (!stop) return null;
-  const address = stopAddress(stop, order);
+  const place = resolveStopPlace(stop, order);
   return {
     label: stop.type === "pick" ? String(stop.location || "") : (order?.id || "Previous stop"),
-    address,
-    routeLocation: stopPosition(stop, order),
-    isHub: stop.type === "pick" && Boolean(HUBS[stop.location])
+    address: place.address,
+    position: { lat: place.lat, lng: place.lng },
+    routeLocation: place.routeLocation,
+    isHub: place.kind === "own"
   };
 }
 
 function travelMinutesBetweenPoints(from, toYard) {
-  if (from?.isHub && from.label && HUBS[toYard]) return yardTravelMinutes(from.label, toYard);
+  const toPlace = placeForLocation(toYard);
+  if (from?.isHub && from.label && toPlace?.kind === "own") return yardTravelMinutes(from.label, toPlace.key);
   return 30;
 }
 
@@ -1714,11 +2176,13 @@ function startTravelForLoad(truck, load) {
   const index = loadIndexInTruck(truck, load);
   if (index <= 0) {
     if (!truck?.base || String(truck.base) === String(firstPickup.location)) return null;
+    const basePlace = placeForLocation(truck.base);
     return {
       from: truck.base,
       to: firstPickup.location,
-      address: hubAddress(truck.base),
-      routeLocation: hubPosition(truck.base),
+      address: basePlace?.address || hubAddress(truck.base),
+      position: placePosition(basePlace) || hubPosition(truck.base),
+      routeLocation: basePlace?.address || hubAddress(truck.base),
       minutes: yardTravelMinutes(truck.base, firstPickup.location)
     };
   }
@@ -1729,13 +2193,23 @@ function startTravelForLoad(truck, load) {
     from: from.label || from.address || "Previous stop",
     to: firstPickup.location,
     address: from.address,
+    position: from.position,
     routeLocation: from.routeLocation,
     minutes: travelMinutesBetweenPoints(from, firstPickup.location)
   };
 }
 
 function yardOptions(selected = "12441") {
-  return ["12441", "3445", "2967"].map((yard) => `<option value="${yard}" ${String(selected || "12441") === yard ? "selected" : ""}>${yard}</option>`).join("");
+  const selectedValue = String(selected || "12441");
+  const yards = ownYards.length ? ownYards : [{ code: "12441" }, { code: "3445" }, { code: "2967" }];
+  return yards
+    .map((yard) => {
+      const code = String(yard.code || yard.name || "").trim();
+      if (!code) return "";
+      const label = yard.name && yard.name !== code ? `${code} - ${yard.name}` : code;
+      return `<option value="${escapeHtml(code)}" ${selectedValue === code ? "selected" : ""}>${escapeHtml(label)}</option>`;
+    })
+    .join("");
 }
 
 function previousLoadFor(loadId) {
@@ -1784,7 +2258,8 @@ function mapPins() {
     const order = stopOrder(stop);
     if (!order) return;
     if (stop.type === "pick") {
-      const hub = HUBS[stop.location] || HUBS[truck?.base] || { x: 50, y: 50 };
+      const place = placeForLocation(stop.location, order);
+      const hub = HUBS[place?.key] || HUBS[truck?.base] || { x: 50, y: 50 };
       pins.push({ label: String(index + 1), className: "pick", x: hub.x, y: hub.y });
     } else {
       pins.push({ label: `${index + 1}`, className: "", x: order.x, y: order.y });
@@ -1794,12 +2269,14 @@ function mapPins() {
 }
 
 function hubPosition(location) {
+  const place = placeForLocation(location);
+  if (placePosition(place)) return placePosition(place);
   const hub = HUBS[location] || HUBS["3445"];
   return { lat: hub.lat, lng: hub.lng };
 }
 
 function hubAddress(location) {
-  return HUBS[location]?.address || location;
+  return placeForLocation(location)?.address || HUBS[location]?.address || location;
 }
 
 function orderPosition(order) {
@@ -1812,30 +2289,113 @@ function orderPosition(order) {
   };
 }
 
+function placePosition(place) {
+  if (!place) return null;
+  const lat = Number(place.lat);
+  const lng = Number(place.lng);
+  return Number.isFinite(lat) && Number.isFinite(lng) ? { lat, lng } : null;
+}
+
+function fallbackPositionForAddress(address, order) {
+  const text = normalizedPlaceKey(address);
+  if (text && text === normalizedPlaceKey(order?.address)) return orderPosition(order);
+  return MAP_CENTER;
+}
+
+function resolveStopPlace(stop, order) {
+  if (!stop) {
+    return {
+      kind: "unknown",
+      key: "unknown",
+      label: "Unknown stop",
+      address: "",
+      routeLocation: MAP_CENTER,
+      lat: MAP_CENTER.lat,
+      lng: MAP_CENTER.lng
+    };
+  }
+  if (stop.type === "return") {
+    const place = placeForLocation(stop.location) || placeForLocation("12441");
+    const position = placePosition(place) || MAP_CENTER;
+    return {
+      kind: place?.kind || "own",
+      key: place?.key || stop.location || "12441",
+      label: place?.label || stop.location || "12441",
+      address: place?.address || String(stop.location || ""),
+      routeLocation: place?.address || position,
+      lat: position.lat,
+      lng: position.lng
+    };
+  }
+  if (stop.type === "pick") {
+    const place = placeForLocation(stop.location, order);
+    const address = place?.address
+      || order?.sourceAddress
+      || (order?.type === "PO" ? order?.address : "")
+      || String(stop.location || "");
+    const position = placePosition(place) || fallbackPositionForAddress(address, order);
+    return {
+      kind: place?.kind || "pickup",
+      key: place?.key || String(stop.location || address || ""),
+      label: place?.label || String(stop.location || "Pickup"),
+      address,
+      routeLocation: address || position,
+      lat: position.lat,
+      lng: position.lng
+    };
+  }
+  const destinationPlace = order?.destinationYard ? placeForLocation(order.destinationYard, order) : null;
+  const address = destinationPlace?.address || order?.address || hubAddress("3445");
+  const position = placePosition(destinationPlace) || fallbackPositionForAddress(address, order);
+  return {
+    kind: destinationPlace?.kind || "delivery",
+    key: destinationPlace?.key || order?.id || address,
+    label: destinationPlace?.label || order?.id || "Drop off",
+    address,
+    routeLocation: address || position,
+    lat: position.lat,
+    lng: position.lng
+  };
+}
+
 function stopIsOwnYard(stop, order) {
-  if (stop.type === "pick") return Boolean(HUBS[stop.location]);
-  return Boolean(order?.destinationYard && HUBS[order.destinationYard]);
+  if (stop.type === "pick") return placeForLocation(stop.location, order)?.kind === "own";
+  return Boolean(order?.destinationYard && placeForLocation(order.destinationYard, order)?.kind === "own");
+}
+
+function stopServiceType(stop, order) {
+  if (stopIsOwnYard(stop, order)) return "own";
+  if (stop.type === "pick") return "vendor";
+  return "delivery";
+}
+
+function stopTimeWindow(stop, order) {
+  if (!stop || !order || stopIsOwnYard(stop, order)) return { start: "", end: "" };
+  if (stop.type === "pick") return vendorWindowForLocation(stop.location, order);
+  if (stop.type === "drop") return { start: order.windowStart || "", end: order.windowEnd || "" };
+  return { start: "", end: "" };
 }
 
 function stopStayMinutes(stop, order, truck) {
-  return truckStopMinutes(truck, stopIsOwnYard(stop, order), orderFootprintPallets(order));
+  return truckStopMinutes(truck, stopServiceType(stop, order), orderFootprintPallets(order));
 }
 
 function stopPosition(stop, order) {
-  if (stop.type === "pick") return HUBS[stop.location] ? hubPosition(stop.location) : MAP_CENTER;
-  if (order?.destinationYard && HUBS[order.destinationYard]) return hubPosition(order.destinationYard);
-  return orderPosition(order);
+  const place = resolveStopPlace(stop, order);
+  return { lat: place.lat, lng: place.lng };
 }
 
 function stopAddress(stop, order) {
-  if (stop.type === "pick") return HUBS[stop.location] ? hubAddress(stop.location) : (order?.sourceAddress || stop.location);
-  if (stop.type === "return") return hubAddress(stop.location);
-  if (order?.destinationYard && HUBS[order.destinationYard]) return hubAddress(order.destinationYard);
-  return order?.address || hubAddress("3445");
+  return resolveStopPlace(stop, order).address;
 }
 
 function stopRouteLocation(stop) {
   return stop.routeLocation || { lat: stop.lat, lng: stop.lng };
+}
+
+function routeLocationForStop(stop, order, position, address) {
+  const place = resolveStopPlace(stop, order);
+  return place.routeLocation || address || position;
 }
 
 function mapStopsForLoad(load, truck) {
@@ -1850,7 +2410,7 @@ function mapStopsForLoad(load, truck) {
       {
         ...startPosition,
         address: startAddress,
-        routeLocation: startPosition,
+        routeLocation: startAddress || startPosition,
         label: "1",
         title: "Start return",
         type: "drop",
@@ -1860,22 +2420,22 @@ function mapStopsForLoad(load, truck) {
       {
         ...hubPosition(returnYard),
         address: hubAddress(returnYard),
-        routeLocation: hubPosition(returnYard),
+        routeLocation: hubAddress(returnYard),
         label: "2",
         title: `Return ${returnYard}`,
         type: "pick",
-        stayMinutes: truckStopMinutes(truck, true, 0),
+        stayMinutes: truckStopMinutes(truck, "own", 0),
         orderId: ""
       }
     ];
   }
   const startTravel = startTravelForLoad(truck, load);
-  const startPoint = startTravel?.routeLocation || (HUBS[startTravel?.from] ? hubPosition(startTravel.from) : MAP_CENTER);
+  const startPoint = startTravel?.position || (HUBS[startTravel?.from] ? hubPosition(startTravel.from) : MAP_CENTER);
   const startStops = startTravel ? [{
     lat: startPoint.lat,
     lng: startPoint.lng,
     address: startTravel.address || hubAddress(startTravel.from),
-    routeLocation: startPoint,
+    routeLocation: startTravel.routeLocation || startTravel.address || startPoint,
     label: "S",
     title: `Start ${startTravel.from}`,
     type: "pick",
@@ -1891,12 +2451,12 @@ function mapStopsForLoad(load, truck) {
     return {
       ...position,
       address,
-      routeLocation: HUBS[stop.location] || (stop.type !== "pick" && order?.destinationYard && HUBS[order.destinationYard]) ? position : address,
+      routeLocation: routeLocationForStop(stop, order, position, address),
       label: String(sequence),
       title: stop.type === "pick" ? `${sequence}. Pickup ${stop.location}` : `${sequence}. Drop ${order.id}`,
       type: stop.type,
       stayMinutes: stop.type === "pick"
-        ? truckStopMinutes(truck, stopIsOwnYard(stop, order), pickupFootprintForLocation(load, stop.location))
+        ? truckStopMinutes(truck, stopServiceType(stop, order), pickupFootprintForLocation(load, stop.location))
         : stopStayMinutes(stop, order, truck),
       orderId: order.id
     };
@@ -1909,6 +2469,9 @@ function routeSignature(stops) {
     stop.type,
     stop.orderId,
     stop.address,
+    typeof stop.routeLocation === "string"
+      ? stop.routeLocation
+      : `${Number(stop.routeLocation?.lat || stop.lat || 0).toFixed(6)},${Number(stop.routeLocation?.lng || stop.lng || 0).toFixed(6)}`,
     stop.title,
     stop.stayMinutes
   ].join("|")).join(">");
@@ -1992,6 +2555,30 @@ function spreadOverlappingMarkers(markerStops) {
   return spread;
 }
 
+function geocodeAddress(address) {
+  const key = normalizedPlaceKey(address);
+  if (!key || !window.google?.maps?.Geocoder) return Promise.resolve(null);
+  if (geocodeCache[key]) return Promise.resolve(geocodeCache[key]);
+  const geocoder = new google.maps.Geocoder();
+  return new Promise((resolve) => {
+    geocoder.geocode({ address }, (results, status) => {
+      if (status !== "OK" || !results?.[0]?.geometry?.location) return resolve(null);
+      const location = results[0].geometry.location;
+      const point = { lat: location.lat(), lng: location.lng() };
+      geocodeCache[key] = point;
+      resolve(point);
+    });
+  });
+}
+
+async function geocodeMarkerStops(markerStops = []) {
+  return Promise.all(markerStops.map(async (stop) => {
+    if (typeof stop.routeLocation !== "string") return stop;
+    const point = await geocodeAddress(stop.routeLocation);
+    return point ? { ...stop, ...point } : stop;
+  }));
+}
+
 async function renderGoogleMapPreview() {
   const canvas = document.getElementById("googleMapPreview");
   if (!canvas) return;
@@ -2064,12 +2651,23 @@ async function renderGoogleMapPreview() {
     }, (result, status) => {
       if (status !== "OK" || !result) {
         if (routeSummary) routeSummary.textContent = `Google route unavailable (${status}).`;
-        drawStopMarkers(stops);
+        geocodeMarkerStops(stops).then((markerStops) => {
+          drawStopMarkers(markerStops);
+          new google.maps.Polyline({
+            path: markerStops.map((stop) => ({ lat: stop.lat, lng: stop.lng })),
+            geodesic: true,
+            strokeColor: "#006f6b",
+            strokeOpacity: 0.55,
+            strokeWeight: 4,
+            map
+          });
+        });
         return;
       }
       directionsRenderer.setDirections(result);
       const legs = result.routes?.[0]?.legs || [];
       const routeMarkerStops = stops.map((stop, index) => {
+        if (typeof stop.routeLocation !== "string") return stop;
         const routePoint = index === 0
           ? legs[0]?.start_location
           : legs[index - 1]?.end_location;
@@ -2078,19 +2676,21 @@ async function renderGoogleMapPreview() {
       drawStopMarkers(routeMarkerStops);
       const driveSeconds = legs.reduce((sum, leg) => sum + Number((leg.duration_in_traffic || leg.duration)?.value || 0), 0);
       const driveMinutes = Math.round(driveSeconds / 60);
+      const legMinutes = legs.map((leg) => Math.max(1, Math.round(Number((leg.duration_in_traffic || leg.duration)?.value || 0) / 60)));
       const stayMinutes = stops.reduce((sum, stop) => sum + Number(stop.stayMinutes || 0), 0);
       const totalMinutes = driveMinutes + stayMinutes;
-      routeEstimates[load.id] = { driveMinutes, stayMinutes, totalMinutes };
+      routeEstimates[load.id] = { driveMinutes, stayMinutes, totalMinutes, legMinutes };
       routeCache[load.id] = { signature, result, markerStops: routeMarkerStops };
       if (routeSummary) {
         routeSummary.innerHTML = `<strong>${durationText(totalMinutes)} total</strong><span>${durationText(driveMinutes)} drive + ${durationText(stayMinutes)} stop time</span>`;
       }
-      if (load.returnOnly && selectedLoadId === load.id) setTimeout(() => render(), 0);
+      if (selectedLoadId === load.id) setTimeout(() => render({ save: false }), 0);
     });
   } else if (stops.length > 1) {
-    drawStopMarkers(stops);
+    const markerStops = await geocodeMarkerStops(stops);
+    drawStopMarkers(markerStops);
     new google.maps.Polyline({
-      path: stops.map((stop) => ({ lat: stop.lat, lng: stop.lng })),
+      path: markerStops.map((stop) => ({ lat: stop.lat, lng: stop.lng })),
       geodesic: true,
       strokeColor: "#006f6b",
       strokeOpacity: 0.9,
@@ -2100,7 +2700,7 @@ async function renderGoogleMapPreview() {
     const stayMinutes = stops.reduce((sum, stop) => sum + Number(stop.stayMinutes || 0), 0);
     if (routeSummary) routeSummary.innerHTML = `<strong>${stayMinutes} min stay</strong><span>Add more stops for Google travel estimate.</span>`;
   } else {
-    drawStopMarkers(stops);
+    drawStopMarkers(await geocodeMarkerStops(stops));
   }
 }
 
@@ -2113,12 +2713,66 @@ function planCanEditConfirmed() {
   return Boolean(currentPlan?.id && currentPlan.status === "confirmed");
 }
 
+function cssAttr(value) {
+  return String(value || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function selectorForElement(element) {
+  if (!element || !app.contains(element)) return "";
+  if (element.id) return `#${cssAttr(element.id)}`;
+  const tag = element.tagName.toLowerCase();
+  const attrs = [
+    "data-action",
+    "data-load",
+    "data-load-card",
+    "data-stop",
+    "data-order",
+    "data-truck",
+    "data-truck-driver",
+    "data-truck-start",
+    "data-truck-parking",
+    "data-return-yard"
+  ].filter((name) => element.hasAttribute(name));
+  if (attrs.length) return `${tag}${attrs.map((name) => `[${name}="${cssAttr(element.getAttribute(name))}"]`).join("")}`;
+  const dataParent = element.closest("[data-action], [data-load-card], [data-stop], [data-order]");
+  return dataParent && dataParent !== element ? selectorForElement(dataParent) : "";
+}
+
+function captureRenderUiState() {
+  const active = document.activeElement;
+  return {
+    focusSelector: selectorForElement(active),
+    scrolls: [...app.querySelectorAll(".order-list, .truck-board, .load-preview-body, .preview-stop-list, .stop-list")]
+      .map((element) => ({
+        selector: selectorForElement(element) || `.${[...element.classList].join(".")}`,
+        top: element.scrollTop,
+        left: element.scrollLeft
+      }))
+      .filter((item) => item.selector)
+  };
+}
+
+function restoreRenderUiState(state = {}) {
+  for (const item of state.scrolls || []) {
+    const element = app.querySelector(item.selector);
+    if (!element) continue;
+    element.scrollTop = item.top || 0;
+    element.scrollLeft = item.left || 0;
+  }
+  if (state.focusSelector) {
+    const element = app.querySelector(state.focusSelector);
+    if (element && typeof element.focus === "function") element.focus({ preventScroll: true });
+  }
+}
+
 function render(options = {}) {
   const { save = true } = options;
+  const uiState = captureRenderUiState();
   orderListScrollTop = app.querySelector(".order-list")?.scrollTop ?? orderListScrollTop;
   cleanupOrphanPickupStops();
   syncPickupStops();
   syncReturnLoads();
+  captureUndoPointIfNeeded(save);
   if (save) autoSavePlan();
   const stats = boardStats();
   app.innerHTML = `
@@ -2134,6 +2788,8 @@ function render(options = {}) {
         </div>
         <div class="topbar-actions">
           <button onclick="location.href='/dispatch'" type="button">Menu</button>
+          <button data-action="undo-plan" ${undoStack.length ? "" : "disabled"} title="Undo (Ctrl+Z)" type="button">Undo</button>
+          <button data-action="redo-plan" ${redoStack.length ? "" : "disabled"} title="Redo (Ctrl+Y)" type="button">Redo</button>
           <button data-action="export-shipped-csv" ${currentPlan?.id ? "" : "disabled"} type="button">Export Shipped CSV</button>
           <button class="primary" data-action="confirm-plan" ${currentPlan?.id ? "" : "disabled"} type="button">Confirm Plan</button>
           <button data-action="refresh-orders" type="button">Refresh Orders</button>
@@ -2163,6 +2819,7 @@ function render(options = {}) {
   `;
   const orderList = app.querySelector(".order-list");
   if (orderList) orderList.scrollTop = orderListScrollTop;
+  restoreRenderUiState(uiState);
   renderGoogleMapPreview();
 }
 
@@ -2219,6 +2876,7 @@ function renderSelectedOrderActions() {
       <span>${escapeHtml(label)}</span>
       ${groupedCount ? `<button data-action="ungroup-order" data-order="${order.id}" type="button">Ungroup</button>` : selected.length > 1 ? `<button data-action="open-group-modal" data-order="${order.id}" type="button">Group</button>` : ""}
       ${order.type === "PO" ? `<button data-action="open-po-yard-modal" data-order="${order.id}" type="button">Set Yard</button>` : ""}
+      ${order.type === "SO" ? `<button data-action="open-po-link-modal" data-order="${order.id}" type="button">Link PO</button>` : ""}
       ${order.type !== "CO" ? `<button data-action="open-split-modal" data-order="${order.id}" type="button">Split</button>` : ""}
       ${canConsolidatePick(order) ? `<button data-action="open-consolidate-modal" data-order="${order.id}" type="button">Consolidate Pick</button>` : ""}
     </div>
@@ -2251,6 +2909,7 @@ function renderOrderCard(order) {
         ${missingAddress ? `<span class="chip warn">Update address</span>` : ""}
         ${order.netsuiteFeedMissing ? `<span class="chip warn">NetSuite status changed</span>` : ""}
         ${order.transitCo ? `<span class="chip ${transitBlocked ? "warn" : ""}">CO ${escapeHtml(order.transitCo.id)}</span>` : ""}
+        ${(order.items || []).some((item) => Number(item.poAllocatedSalesQty || 0) > 0) ? `<span class="chip">PO linked</span>` : ""}
         ${order.type === "CO" ? `<span class="chip">For ${escapeHtml(order.sourceOrderId || order.relatedSoId || "SO")}</span>` : ""}
         ${groupedCount ? `<span class="chip">Grouped ${groupedCount}</span>` : ""}
         ${splitWarning ? `<span class="chip warn">Split suggested</span>` : ""}
@@ -2576,6 +3235,78 @@ function renderTransitCoEditor(order) {
   `;
 }
 
+function renderPoLinkModal(order) {
+  const options = poAllocationOptions;
+  const salesLines = options?.salesLines || [];
+  const poLines = options?.poLines || [];
+  const allocations = options?.allocations || [];
+  const poRefs = [...new Map(poLines.map((line) => [line.poRef, line])).values()];
+  return `
+    <div class="modal-backdrop show">
+      <section class="dispatch-modal wide-modal">
+        <div class="modal-header">
+          <div>
+            <h2>Link PO Pickup</h2>
+            <p>${order.id} | vendor pickup quantity will be removed from yard packing</p>
+          </div>
+          <button data-action="close-modal" type="button">Close</button>
+        </div>
+        <div class="modal-body">
+          ${poAllocationLoading ? `<div class="empty-drop">Loading matching PO lines...</div>` : ""}
+          ${allocations.length ? `
+            <div class="allocation-list">
+              <strong>Active linked PO quantity</strong>
+              ${allocations.map((item) => `
+                <div class="allocation-card">
+                  <span>${escapeHtml(item.sku || item.itemName)} | ${escapeHtml(item.poOrderRef)} ${escapeHtml(item.poVendorYard || item.poVendor || "")}</span>
+                  <b>${itemQtyText(item)}</b>
+                  <button class="danger-text" data-action="cancel-po-link" data-allocation="${item.id}" type="button">Cancel</button>
+                </div>
+              `).join("")}
+            </div>
+          ` : ""}
+          <form class="po-link-form" data-form="po-link">
+            <label class="split-field">
+              <span>Purchase order</span>
+              <input name="poRef" list="poLinkPoOptions" placeholder="Type PO number" autocomplete="off" required />
+              <datalist id="poLinkPoOptions">
+                ${poRefs.map((line) => `
+                  <option value="${escapeHtml(line.poRef)}">${escapeHtml(line.vendorYard || line.vendor)} | ${escapeHtml(line.address || "")}</option>
+                `).join("")}
+              </datalist>
+            </label>
+            <div class="po-link-lines">
+              ${salesLines.map((line) => {
+                const units = availableUnitsForLine(line);
+                return `
+                <section class="po-link-line" data-sales-line="${line.id}">
+                  <div>
+                    <strong>${escapeHtml(line.sku || line.itemName)}</strong>
+                    <span>${escapeHtml(line.description || "")}</span>
+                    <em>Open ${availableQtyTextForLine(line)}</em>
+                  </div>
+                  ${units.map(([field, label, max]) => `
+                    <label><span>${escapeHtml(label)}</span><input data-po-link-qty="${field}" type="number" min="0" max="${Number(max || 0)}" step="1" value="0" /></label>
+                  `).join("") || `<span class="muted">No available quantity</span>`}
+                </section>
+              `; }).join("")}
+            </div>
+            <div class="warning-detail">
+              The PO number is free input with autocomplete. On submit, each SO item with quantity will be matched to the same item in that PO and reserved locally.
+            </div>
+            <div class="modal-status" data-modal-status></div>
+            <div class="modal-footer">
+              <button data-action="close-modal" type="button">Cancel</button>
+              <button class="primary" ${salesLines.length ? "" : "disabled"} type="submit">Connect PO Quantity</button>
+            </div>
+          </form>
+          ${!poAllocationLoading && !salesLines.length ? `<div class="empty-drop">No SO item line was found.</div>` : ""}
+        </div>
+      </section>
+    </div>
+  `;
+}
+
 function renderModal() {
   if (!modalType) return "";
   if (modalType === "plan-history") {
@@ -2650,6 +3381,9 @@ function renderModal() {
         </section>
       </div>
     `;
+  }
+  if (modalType === "po-link") {
+    return renderPoLinkModal(order);
   }
   if (modalType === "group") {
     const selected = selectedOrders();
@@ -2874,7 +3608,7 @@ function renderSupport() {
           <div class="registration-card">
             <strong>${escapeHtml(item.name)} | ${item.license}</strong>
             <span class="muted">License ${escapeHtml(item.number)} | Login ${escapeHtml(item.login)}</span>
-            <span class="muted">Own yard fixed ${ownYardFixedMinutesFor(item)}m | Outside fixed ${outsideFixedMinutesFor(item)}m | ${minutesPerPalletFor(item)}m/PLT</span>
+            <span class="muted">Own yard ${ownYardFixedMinutesFor(item)}m | Vendor ${vendorFixedMinutesFor(item)}m | Delivery ${deliveryFixedMinutesFor(item)}m + ${minutesPerPalletFor(item)}m/PLT</span>
           </div>
         ` : `
           <div class="registration-card">
@@ -2898,8 +3632,9 @@ function renderRegistrationForm() {
         <input name="login" placeholder="Login" required />
         <input name="password" placeholder="Password" type="password" required />
         <input name="ownYardFixedMinutes" placeholder="Own yard fixed min" type="number" value="40" required />
-        <input name="outsideFixedMinutes" placeholder="Outside fixed min" type="number" value="35" required />
-        <input name="minutesPerPallet" placeholder="Min / PLT" type="number" value="1" step="0.1" required />
+        <input name="vendorFixedMinutes" placeholder="Vendor fixed min" type="number" value="35" required />
+        <input name="deliveryFixedMinutes" placeholder="Delivery fixed min" type="number" value="35" required />
+        <input name="minutesPerPallet" placeholder="Delivery min / PLT" type="number" value="1" step="0.1" required />
         <button class="primary" type="submit">Register Driver</button>
       </form>
     `;
@@ -3467,6 +4202,30 @@ window.addEventListener("mousemove", movePreviewResize);
 window.addEventListener("pointerup", stopPreviewResize);
 window.addEventListener("mouseup", stopPreviewResize);
 
+function isEditingTextField(target) {
+  const element = target instanceof HTMLElement ? target : null;
+  if (!element) return false;
+  return Boolean(element.closest("input, textarea, select, [contenteditable='true']"));
+}
+
+window.addEventListener("keydown", (event) => {
+  if (!event.ctrlKey || event.metaKey || event.altKey || isEditingTextField(event.target)) return;
+  const key = String(event.key || "").toLowerCase();
+  if (key === "z") {
+    event.preventDefault();
+    if (!undoDispatchChange()) {
+      routeNotice = "Nothing to undo.";
+      render({ save: false });
+    }
+  } else if (key === "y") {
+    event.preventDefault();
+    if (!redoDispatchChange()) {
+      routeNotice = "Nothing to redo.";
+      render({ save: false });
+    }
+  }
+});
+
 app.addEventListener("dragover", (event) => {
   const list = event.target.closest(".stop-list, .preview-stop-list");
   const stopCard = event.target.closest(".stop-card, .preview-stop");
@@ -3591,6 +4350,8 @@ app.addEventListener("click", (event) => {
     modalType = "";
     modalOrderId = "";
     modalLoadId = "";
+    poAllocationOptions = null;
+    poAllocationLoading = false;
     return render();
   }
   const button = event.target.closest("button");
@@ -3620,6 +4381,20 @@ app.addEventListener("click", (event) => {
   if (!button) return;
   const action = button.dataset.action;
   if (!action) return;
+  if (action === "undo-plan") {
+    if (!undoDispatchChange()) {
+      routeNotice = "Nothing to undo.";
+      render({ save: false });
+    }
+    return;
+  }
+  if (action === "redo-plan") {
+    if (!redoDispatchChange()) {
+      routeNotice = "Nothing to redo.";
+      render({ save: false });
+    }
+    return;
+  }
   if (button.dataset.order) {
     selectedOrderId = button.dataset.order;
     if (!selectedOrderIds.has(button.dataset.order)) selectedOrderIds = new Set([button.dataset.order]);
@@ -3646,6 +4421,17 @@ app.addEventListener("click", (event) => {
   if (action === "open-po-yard-modal") {
     modalType = "po-yard";
     modalOrderId = button.dataset.order;
+  }
+  if (action === "open-po-link-modal") {
+    modalType = "po-link";
+    modalOrderId = button.dataset.order;
+    loadPoAllocationOptions(button.dataset.order).then(() => render({ save: false })).catch((error) => {
+      poAllocationLoading = false;
+      routeNotice = `PO link options failed: ${error.message}`;
+      render({ save: false });
+    });
+    render({ save: false });
+    return;
   }
   if (action === "order-type-tab") {
     activeOrderType = button.dataset.type;
@@ -3841,6 +4627,23 @@ app.addEventListener("click", (event) => {
     });
     return;
   }
+  if (action === "cancel-po-link") {
+    fetch(`/api/dispatch/po-allocations/${encodeURIComponent(button.dataset.allocation)}?sessionId=${encodeURIComponent(dispatchSessionId)}`, {
+      method: "DELETE"
+    }).then((response) => {
+      if (!response.ok) return response.text().then((text) => Promise.reject(new Error(text)));
+      return response.json();
+    }).then((payload) => {
+      poAllocationOptions = payload.options;
+      applyDispatchOrderFeed(payload.orders || []);
+      routeNotice = "PO link cancelled.";
+      render();
+    }).catch((error) => {
+      routeNotice = `Cancel PO link failed: ${error.message}`;
+      render({ save: false });
+    });
+    return;
+  }
   if (action === "delete-load") {
     const { load } = findLoad(button.dataset.load);
     if (!load) return render();
@@ -3976,7 +4779,7 @@ app.addEventListener("click", (event) => {
   if (action === "support-tab") supportTab = button.dataset.tab;
   if (action === "refresh-orders") {
     searchText = "";
-    loadDispatchOrders({ sync: true }).then(() => restoreServerPlan()).then((applied) => {
+    loadDispatchOrders().then(() => restoreServerPlan()).then((applied) => {
       if (applied) render({ save: false });
       else render();
     });
@@ -4163,15 +4966,19 @@ function showOrderTooltip(event) {
   tooltip.className = "tooltip";
   tooltip.style.left = `${Math.min(event.clientX + 16, window.innerWidth - 330)}px`;
   tooltip.style.top = `${Math.min(event.clientY + 16, window.innerHeight - 180)}px`;
-  const itemRows = (order.items || []).map((item) => `
+  const stopCard = event.target.closest("[data-stop]");
+  const stop = stopCard ? stopById(stopCard.dataset.stop) : null;
+  const pickupLocation = stop?.type === "pick" ? stop.location : "";
+  const itemRows = tooltipItemsForOrder(order, { pickupLocation }).map((item) => `
     <div>
       <b>${escapeHtml(item.sku)}</b>
-      <span>${item.pallets ? `${item.pallets} PLT` : ""}${item.layers ? ` ${item.layers} LYR` : ""}</span>
+      <span>${escapeHtml(itemQtyText(item))}</span>
     </div>
   `).join("");
   tooltip.innerHTML = `
     <strong>${order.id} | ${escapeHtml(order.customer)}</strong>
     <span>${escapeHtml(order.address)}</span>
+    ${pickupLocation ? `<span>Pickup content: ${escapeHtml(pickupLocation)}</span>` : ""}
     <span>${order.expectedDeliveryDate ? `${order.expectedDeliveryDate} | ` : ""}${orderUnitText(order)} | ${orderFootprintPallets(order)} pos | ${formatLbs(orderWeightLbs(order))} | ${order.windowStart || "--"}-${order.windowEnd || "--"}</span>
     ${order.consolidation ? `<span>Consolidate ${order.consolidation.shortageQty} from ${order.consolidation.sourceYard} to ${order.consolidation.targetYard}</span>` : ""}
     ${order.transitCo ? `<span>Requires ${order.transitCo.id}: ${order.transitCo.fromYard} to ${order.transitCo.toYard}</span>` : ""}
@@ -4236,6 +5043,59 @@ app.addEventListener("submit", (event) => {
   if (form.dataset.form === "dispatch-login") return;
   event.preventDefault();
   const data = Object.fromEntries(new FormData(form).entries());
+  if (form.dataset.form === "po-link") {
+    const order = orderById(modalOrderId);
+    if (!order) return;
+    const poRef = String(data.poRef || "").trim();
+    const lines = [...form.querySelectorAll(".po-link-line")].map((row) => ({
+      salesLineId: row.dataset.salesLine,
+      quantities: {
+        pallets: row.querySelector('[data-po-link-qty="pallets"]')?.value || 0,
+        layers: row.querySelector('[data-po-link-qty="layers"]')?.value || 0,
+        sections: row.querySelector('[data-po-link-qty="sections"]')?.value || 0,
+        pieces: row.querySelector('[data-po-link-qty="pieces"]')?.value || 0,
+        salesQty: row.querySelector('[data-po-link-qty="salesQty"]')?.value || 0
+      }
+    })).filter((line) => Object.values(line.quantities).some((value) => Number(value || 0) > 0));
+    if (!poRef) {
+      setModalFormStatus(form, "Enter a PO number before connecting.", "error");
+      return;
+    }
+    if (!lines.length) {
+      setModalFormStatus(form, "Enter quantity for at least one SO item.", "error");
+      return;
+    }
+    const submitButton = form.querySelector("button[type='submit']");
+    if (submitButton) {
+      submitButton.disabled = true;
+      submitButton.textContent = "Connecting...";
+    }
+    setModalFormStatus(form, "Checking PO available quantity...", "info");
+    fetch(`/api/dispatch/orders/${encodeURIComponent(order.id)}/po-allocations`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        poRef,
+        lines,
+        audit: { sessionId: dispatchSessionId }
+      })
+    }).then((response) => {
+      if (!response.ok) return response.text().then((text) => Promise.reject(new Error(text)));
+      return response.json();
+    }).then((payload) => {
+      poAllocationOptions = payload.options;
+      if (Array.isArray(payload.orders)) applyDispatchOrderFeed(payload.orders);
+      routeNotice = `${payload.allocations?.length || 0} PO item line(s) connected to sales order.`;
+      render();
+    }).catch((error) => {
+      setModalFormStatus(form, `PO link failed: ${error.message}`, "error");
+      if (submitButton) {
+        submitButton.disabled = false;
+        submitButton.textContent = "Connect PO Quantity";
+      }
+    });
+    return;
+  }
   if (form.dataset.form === "edit-order-details") {
     const order = orderById(modalOrderId);
     if (!order) return;
@@ -4317,10 +5177,12 @@ app.addEventListener("submit", (event) => {
       number: data.number,
       login: data.login,
       ownYardFixedMinutes: Number(data.ownYardFixedMinutes || data.loadMinutes || 40),
-      outsideFixedMinutes: Number(data.outsideFixedMinutes || data.unloadMinutes || 35),
+      vendorFixedMinutes: Number(data.vendorFixedMinutes || data.outsideFixedMinutes || data.unloadMinutes || 35),
+      deliveryFixedMinutes: Number(data.deliveryFixedMinutes || data.outsideFixedMinutes || data.unloadMinutes || 35),
+      outsideFixedMinutes: Number(data.deliveryFixedMinutes || data.outsideFixedMinutes || data.unloadMinutes || 35),
       minutesPerPallet: Number(data.minutesPerPallet || 1),
       loadMinutes: Number(data.ownYardFixedMinutes || data.loadMinutes || 40),
-      unloadMinutes: Number(data.outsideFixedMinutes || data.unloadMinutes || 35)
+      unloadMinutes: Number(data.deliveryFixedMinutes || data.outsideFixedMinutes || data.unloadMinutes || 35)
     });
   } else if (form.dataset.form === "truck") {
     const vehicle = { plate: data.plate, capacityLbs: Number(data.capacityLbs || 48000) };

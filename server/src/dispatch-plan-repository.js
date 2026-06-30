@@ -1,5 +1,7 @@
 import { query } from "./db.js";
 
+const CUSTOMER_PICKUP_DELIVERY_METHOD = "Pick-Up";
+
 function todayDate() {
   return new Date().toISOString().slice(0, 10);
 }
@@ -23,6 +25,60 @@ function planRow(row) {
     orders: row.orders || [],
     trucks: row.trucks || [],
     summary: row.summary || {}
+  };
+}
+
+function collectPlanOrderRefs(plan) {
+  const refs = new Set();
+  for (const order of plan?.orders || []) {
+    const id = String(order?.id || "").trim();
+    if (id) refs.add(id);
+  }
+  for (const truck of plan?.trucks || []) {
+    for (const load of truck?.loads || []) {
+      for (const stop of load?.stops || []) {
+        const id = String(stop?.orderId || "").trim();
+        if (id) refs.add(id);
+      }
+    }
+  }
+  return [...refs];
+}
+
+async function pickupSalesOrderRefs(plan) {
+  const refs = collectPlanOrderRefs(plan);
+  if (!refs.length) return new Set();
+  const result = await query(
+    `SELECT tranid
+       FROM sales_orders
+      WHERE sales_order_type = $1
+        AND tranid = ANY($2::text[])`,
+    [CUSTOMER_PICKUP_DELIVERY_METHOD, refs]
+  );
+  return new Set(result.rows.map((row) => String(row.tranid || "")));
+}
+
+async function sanitizeDispatchPlan(plan) {
+  if (!plan) return null;
+  const pickupRefs = await pickupSalesOrderRefs(plan);
+  if (!pickupRefs.size) return plan;
+
+  return {
+    ...plan,
+    orders: (plan.orders || []).filter((order) => !pickupRefs.has(String(order?.id || ""))),
+    trucks: (plan.trucks || []).map((truck) => ({
+      ...truck,
+      loads: (truck.loads || []).map((load) => ({
+        ...load,
+        stops: (load.stops || []).filter((stop) => !pickupRefs.has(String(stop?.orderId || "")))
+      }))
+    })),
+    summary: {
+      ...(plan.summary || {}),
+      removedPickupOrderRefs: [
+        ...new Set([...(plan.summary?.removedPickupOrderRefs || []), ...pickupRefs])
+      ]
+    }
   };
 }
 
@@ -67,7 +123,7 @@ export async function getDispatchPlan(planId) {
       WHERE p.id = $1`,
     [planId]
   );
-  return planRow(result.rows[0]);
+  return sanitizeDispatchPlan(planRow(result.rows[0]));
 }
 
 export async function getCurrentDispatchPlan({ planDate } = {}) {
@@ -80,7 +136,7 @@ export async function getCurrentDispatchPlan({ planDate } = {}) {
       LIMIT 1`,
     [cleanDate]
   );
-  return planRow(result.rows[0]);
+  return sanitizeDispatchPlan(planRow(result.rows[0]));
 }
 
 export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [], summary = {} } = {}) {
@@ -92,6 +148,12 @@ export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [
     [planId]
   );
   if (!result.rows[0]) throw new Error("Dispatch plan not found.");
+  const cleanPlan = await sanitizeDispatchPlan({
+    id: String(planId),
+    orders: Array.isArray(orders) ? orders : [],
+    trucks: Array.isArray(trucks) ? trucks : [],
+    summary: summary || {}
+  });
   await query(
     `INSERT INTO dispatch_plan_snapshots (plan_id, orders, trucks, summary, saved_at)
      VALUES ($1, $2::jsonb, $3::jsonb, $4::jsonb, now())
@@ -100,7 +162,7 @@ export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [
            trucks = EXCLUDED.trucks,
            summary = EXCLUDED.summary,
            saved_at = now()`,
-    [planId, JSON.stringify(orders), JSON.stringify(trucks), JSON.stringify(summary || {})]
+    [planId, JSON.stringify(cleanPlan.orders), JSON.stringify(cleanPlan.trucks), JSON.stringify(cleanPlan.summary || {})]
   );
   return getDispatchPlan(planId);
 }

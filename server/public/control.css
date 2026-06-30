@@ -250,7 +250,8 @@ th {
   gap: 10px;
 }
 
-.sync-status-grid div {
+.sync-status-grid div,
+.sync-status-grid label {
   border: 1px solid #d7dee2;
   border-radius: 8px;
   padding: 10px;
@@ -268,6 +269,10 @@ th {
 .sync-status-grid strong {
   min-height: 20px;
   word-break: break-word;
+}
+
+.sync-status-grid input {
+  min-height: 38px;
 }
 
 .sync-error {

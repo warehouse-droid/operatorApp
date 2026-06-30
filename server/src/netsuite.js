@@ -9,6 +9,19 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function netsuiteFetch(url, options = {}) {
+  const timeoutMs = Number(config.netsuite.requestTimeoutMs || 120000);
+  const signal = options.signal || (AbortSignal.timeout ? AbortSignal.timeout(timeoutMs) : undefined);
+  try {
+    return await fetch(url, { ...options, signal });
+  } catch (error) {
+    if (error.name === "AbortError" || error.name === "TimeoutError") {
+      throw new Error(`NetSuite request timed out after ${Math.round(timeoutMs / 1000)} seconds.`);
+    }
+    throw error;
+  }
+}
+
 function isConcurrencyLimit(status, text) {
   return status === 429
     || status === 503
@@ -25,12 +38,25 @@ function isoDateDaysAgo(days = 0) {
   ].join("-");
 }
 
-function deliveryOrderListQuery(locationId = 1) {
+function normalizeSuiteqlDate(value) {
+  const text = String(value || "").trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : isoDateDaysAgo(1);
+}
+
+function openLineQuantitySql(alias = "tl") {
+  return `(ABS(NVL(${alias}.quantity, 0)) - ABS(NVL(${alias}.quantityshiprecv, 0)))`;
+}
+
+function openLineFilterSql(alias = "tl") {
+  return `${openLineQuantitySql(alias)} > 0.000001`;
+}
+
+function deliveryOrderListQuery(locationId = 1, { createdFrom = "" } = {}) {
   const id = Number(locationId);
   if (!Number.isInteger(id) || id <= 0) {
     throw new Error("A valid numeric NetSuite location ID is required.");
   }
-  const createdFrom = isoDateDaysAgo(1);
+  const orderCreatedFrom = normalizeSuiteqlDate(createdFrom);
 
   return `
 SELECT DISTINCT
@@ -58,9 +84,12 @@ WHERE t.type = 'SalesOrd'
   AND tl.location = ${id}
   AND tl.mainline = 'F'
   AND tl.taxline = 'F'
-  AND t.status = 'B'
+  AND (
+    (t.status = 'B' AND t.createddate >= TO_DATE('${orderCreatedFrom}', 'YYYY-MM-DD'))
+    OR BUILTIN.DF(t.status) LIKE '%Partially Fulfilled%'
+  )
+  AND ${openLineFilterSql("tl")}
   AND t.custbody3 = 2
-  AND t.createddate >= TO_DATE('${createdFrom}', 'YYYY-MM-DD')
 ORDER BY t.createddate DESC, t.tranid DESC
 `;
 }
@@ -91,18 +120,20 @@ WHERE t.type = 'PurchOrd'
   AND tl.location = ${id}
   AND tl.mainline = 'F'
   AND (tl.taxline = 'F' OR tl.taxline IS NULL)
-  AND t.status = 'B'
+  AND (t.status = 'B' OR BUILTIN.DF(t.status) LIKE '%Partially Received%')
+  AND ${openLineFilterSql("tl")}
 ORDER BY t.trandate DESC, t.tranid DESC
 `;
 }
 
-function transferOrderListQuery({ statusText, sourceLocationId = null, destinationLocationId = null, lineLocationId = null } = {}) {
+function transferOrderListQuery({ statusText, sourceLocationId = null, destinationLocationId = null, lineLocationId = null, lineDirection = "source" } = {}) {
   const sourceFilter = sourceLocationId ? `AND t.location = ${Number(sourceLocationId)}` : "";
   const destinationFilter = destinationLocationId ? `AND t.transferlocation = ${Number(destinationLocationId)}` : "";
   const lineLocationFilter = lineLocationId ? `AND tl.location = ${Number(lineLocationId)}` : "";
   const statusFilter = statusText === "Pending Fulfillment"
-    ? "AND t.status = 'B'"
-    : `AND BUILTIN.DF(t.status) LIKE '%${statusText}%'`;
+    ? "AND (t.status = 'B' OR BUILTIN.DF(t.status) LIKE '%Partially Fulfilled%')"
+    : `AND (BUILTIN.DF(t.status) LIKE '%${statusText}%' OR BUILTIN.DF(t.status) LIKE '%Partially Received%')`;
+  const lineSignFilter = lineDirection === "destination" ? "AND tl.quantity > 0" : "AND tl.quantity < 0";
   return `
 SELECT DISTINCT
   t.id,
@@ -122,10 +153,11 @@ FROM transaction t
 INNER JOIN transactionline tl ON tl.transaction = t.id
 WHERE t.type = 'TrnfrOrd'
   AND tl.item IS NOT NULL
-  AND tl.quantity < 0
+  ${lineSignFilter}
   AND tl.mainline = 'F'
   AND tl.taxline = 'F'
   ${statusFilter}
+  AND ${openLineFilterSql("tl")}
   ${sourceFilter}
   ${destinationFilter}
   ${lineLocationFilter}
@@ -165,6 +197,34 @@ function derivePackQuantitiesFromConversion(line) {
   return next;
 }
 
+function hasConversion(line) {
+  return toNumber(line.to_plt) > 0
+    || toNumber(line.to_lyr) > 0
+    || toNumber(line.to_sec) > 0
+    || toNumber(line.to_pcs) > 0;
+}
+
+function deriveQuantitiesFromSalesQuantity(line, quantity) {
+  const next = {
+    ...line,
+    quantity,
+    pallet_qty: 0,
+    layer_qty: 0,
+    section_qty: 0,
+    piece_qty: 0
+  };
+  if (!hasConversion(next)) return next;
+  return derivePackQuantitiesFromConversion(next);
+}
+
+function normalizeOpenDeliveryLine(line) {
+  const orderedQuantity = toNumber(line.quantity);
+  const processedQuantity = toNumber(line.netsuite_received_qty);
+  const remainingQuantity = Math.max(orderedQuantity - processedQuantity, 0);
+  if (processedQuantity <= 0) return line;
+  return deriveQuantitiesFromSalesQuantity(line, remainingQuantity);
+}
+
 function normalizeTransferDetailLines(lines, { sourceLocationId = null, destinationLocationId = null } = {}) {
   const filtered = lines.filter((line) => {
     const quantity = Number(String(line.quantity || 0).replaceAll(",", ""));
@@ -175,6 +235,7 @@ function normalizeTransferDetailLines(lines, { sourceLocationId = null, destinat
   const seen = new Set();
   return filtered
     .map((line) => ({ ...line, quantity: toNumber(line.quantity) }))
+    .map((line) => (sourceLocationId ? normalizeOpenDeliveryLine(line) : line))
     .filter((line) => {
       const key = [
         line.item_id,
@@ -224,7 +285,7 @@ export async function exchangeCodeForToken(code) {
     redirect_uri: config.netsuite.redirectUri
   });
 
-  const response = await fetch(config.netsuite.tokenUrl, {
+  const response = await netsuiteFetch(config.netsuite.tokenUrl, {
     method: "POST",
     headers: {
       "Authorization": basicAuth(),
@@ -248,7 +309,7 @@ async function refreshAccessToken(refreshToken) {
     refresh_token: refreshToken
   });
 
-  const response = await fetch(config.netsuite.tokenUrl, {
+  const response = await netsuiteFetch(config.netsuite.tokenUrl, {
     method: "POST",
     headers: {
       "Authorization": basicAuth(),
@@ -307,7 +368,7 @@ async function netsuiteRest(path, { method = "GET", body = null, headers = {} } 
   let lastError;
   for (let attempt = 0; attempt < 4; attempt += 1) {
     const accessToken = await getAccessToken();
-    const response = await fetch(`${config.netsuite.restBaseUrl}${path}`, {
+    const response = await netsuiteFetch(`${config.netsuite.restBaseUrl}${path}`, {
       method,
       headers: {
         "Authorization": `Bearer ${accessToken}`,
@@ -434,7 +495,7 @@ async function runSuiteql(q, params = [], options = {}) {
   if (options.offset) url.searchParams.set("offset", String(options.offset));
   let response;
   for (let attempt = 0; attempt < 4; attempt += 1) {
-    response = await fetch(url, {
+    response = await netsuiteFetch(url, {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${accessToken}`,
@@ -466,8 +527,8 @@ export async function suiteqlAll(q, params = [], { pageSize = 1000 } = {}) {
   }
 }
 
-export async function fetchDeliveryOrdersFromNetSuite(locationId = 1) {
-  const result = await suiteql(deliveryOrderListQuery(locationId));
+export async function fetchDeliveryOrdersFromNetSuite(locationId = 1, { createdFrom = "" } = {}) {
+  const result = await suiteql(deliveryOrderListQuery(locationId, { createdFrom }));
   return result.items || [];
 }
 
@@ -525,6 +586,69 @@ export async function fetchDeliveryOrderFromNetSuite(orderId, locationId = null)
     ORDER BY t.trandate DESC
   `);
 
+  return result.items?.[0] || null;
+}
+
+export async function fetchCustomerPickupOrderFromNetSuite(code, locationId = null) {
+  const text = String(code || "").trim();
+  if (!text) throw new Error("Sales order number is required.");
+  const locationFilter = locationId ? `AND tl.location = ${Number(locationId)}` : "";
+  const orderFilter = /^\d+$/.test(text)
+    ? `t.id = ${Number(text)}`
+    : `UPPER(t.tranid) = '${text.replaceAll("'", "''").toUpperCase()}'`;
+
+  const result = await suiteql(`
+    SELECT DISTINCT
+      t.id,
+      t.tranid,
+      t.trandate,
+      t.createddate AS datecreated,
+      t.entity AS customer_id,
+      BUILTIN.DF(t.entity) AS customer,
+      t.status,
+      BUILTIN.DF(t.status) AS status_text,
+      t.custbody7 AS memo,
+      t.custbody4 AS expected_delivery_date,
+      t.foreigntotal,
+      t.location AS order_location_id,
+      BUILTIN.DF(t.location) AS order_location,
+      tl.location AS outbound_location_id,
+      BUILTIN.DF(tl.location) AS outbound_location,
+      t.custbody3 AS delivery_method_id,
+      BUILTIN.DF(t.custbody3) AS delivery_method
+    FROM transaction t
+    INNER JOIN transactionline tl ON tl.transaction = t.id
+    WHERE ${orderFilter}
+      AND t.type = 'SalesOrd'
+      AND tl.item IS NOT NULL
+      AND tl.mainline = 'F'
+      AND tl.taxline = 'F'
+      ${locationFilter}
+      AND BUILTIN.DF(t.custbody3) = 'Pick-Up'
+      AND ${openLineFilterSql("tl")}
+    ORDER BY t.createddate DESC, t.tranid DESC
+  `);
+  return result.items?.[0] ? { ...result.items[0], order_type: "sales_order" } : null;
+}
+
+export async function fetchTransactionStatusFromNetSuite(orderId, recordType = "SalesOrd") {
+  const id = Number(orderId);
+  if (!Number.isInteger(id) || id <= 0) {
+    throw new Error("A valid numeric NetSuite transaction ID is required.");
+  }
+  const allowed = new Set(["SalesOrd", "PurchOrd", "TrnfrOrd"]);
+  const type = allowed.has(recordType) ? recordType : "SalesOrd";
+  const result = await suiteql(`
+    SELECT
+      t.id,
+      t.tranid,
+      t.status,
+      BUILTIN.DF(t.status) AS status_text,
+      t.lastmodifieddate
+    FROM transaction t
+    WHERE t.id = ${id}
+      AND t.type = '${type}'
+  `);
   return result.items?.[0] || null;
 }
 
@@ -594,6 +718,7 @@ export async function fetchDeliveryOrderDetailsFromNetSuite(orderId, locationId 
       tl.quantity,
       tl.quantityshiprecv AS netsuite_received_qty,
       BUILTIN.DF(tl.units) AS unit,
+      i.weight AS item_weight,
       tl.location AS location_id,
       BUILTIN.DF(tl.location) AS location,
       tl.custcol_plt AS pallet_qty,
@@ -615,7 +740,7 @@ export async function fetchDeliveryOrderDetailsFromNetSuite(orderId, locationId 
   `;
 
   const result = await suiteql(detailQuery);
-  return result.items || [];
+  return (result.items || []).map(normalizeOpenDeliveryLine);
 }
 
 export async function fetchTransferOrderDetailsFromNetSuite(orderId, locationId = null, { direction = "source" } = {}) {
@@ -636,6 +761,7 @@ export async function fetchTransferOrderDetailsFromNetSuite(orderId, locationId 
       tl.quantity,
       tl.quantityshiprecv AS netsuite_received_qty,
       BUILTIN.DF(tl.units) AS unit,
+      i.weight AS item_weight,
       tl.location AS location_id,
       BUILTIN.DF(tl.location) AS location,
       tl.custcol_plt AS pallet_qty,
@@ -715,6 +841,7 @@ export async function fetchPurchaseOrderDetailsFromNetSuite(orderId, locationId 
       tl.quantity,
       tl.quantityshiprecv AS netsuite_received_qty,
       BUILTIN.DF(tl.units) AS unit,
+      i.weight AS item_weight,
       tl.location AS location_id,
       BUILTIN.DF(tl.location) AS location,
       tl.custcol_plt AS pallet_qty,
@@ -742,15 +869,16 @@ export async function fetchTransferReceivingOrdersFromNetSuite({ sourceLocationI
     statusText: "Pending Receipt",
     sourceLocationId,
     destinationLocationId,
-    lineLocationId: sourceLocationId || null
+    lineLocationId: destinationLocationId || null,
+    lineDirection: "destination"
   }));
   return (result.items || []).map((order) => ({
     ...order,
     order_type: "transfer_order",
-    source_location_id: order.line_location_id || order.source_location_id,
-    source_location: order.line_location || order.source_location,
-    vendor_id: order.line_location_id || order.source_location_id,
-    vendor: order.line_location || order.source_location
+    source_location_id: order.source_location_id,
+    source_location: order.source_location,
+    vendor_id: order.source_location_id,
+    vendor: order.source_location
   }));
 }
 
@@ -759,7 +887,7 @@ export async function fetchTransferReceivingOrderFromNetSuite(orderId, sourceLoc
   if (!Number.isInteger(id) || id <= 0) {
     throw new Error("A valid numeric NetSuite transfer order ID is required.");
   }
-  const sourceFilter = sourceLocationId ? `AND tl.location = ${Number(sourceLocationId)}` : "";
+  const sourceFilter = sourceLocationId ? `AND t.location = ${Number(sourceLocationId)}` : "";
   const result = await suiteql(`
     SELECT DISTINCT
       t.id,
@@ -779,7 +907,7 @@ export async function fetchTransferReceivingOrderFromNetSuite(orderId, sourceLoc
     WHERE t.id = ${id}
       AND t.type = 'TrnfrOrd'
       AND tl.item IS NOT NULL
-      AND tl.quantity < 0
+      AND tl.quantity > 0
       AND tl.mainline = 'F'
       AND tl.taxline = 'F'
       ${sourceFilter}
@@ -790,10 +918,10 @@ export async function fetchTransferReceivingOrderFromNetSuite(orderId, sourceLoc
   return {
     ...order,
     order_type: "transfer_order",
-    source_location_id: order.line_location_id || order.source_location_id,
-    source_location: order.line_location || order.source_location,
-    vendor_id: order.line_location_id || order.source_location_id,
-    vendor: order.line_location || order.source_location
+    source_location_id: order.source_location_id,
+    source_location: order.source_location,
+    vendor_id: order.source_location_id,
+    vendor: order.source_location
   };
 }
 
@@ -812,6 +940,7 @@ export async function fetchInventoryBalancesFromNetSuite(locationIds = [1, 13]) 
       i.itemtype AS item_type,
       BUILTIN.DF(i.itemtype) AS item_type_text,
       BUILTIN.DF(i.stockunit) AS stock_unit,
+      i.weight AS item_weight,
       i.custitem_toplt AS to_plt,
       i.custitem_tolyr AS to_lyr,
       i.custitem_tosec AS to_sec,
@@ -844,6 +973,7 @@ export async function fetchInventoryBalanceForItemFromNetSuite(itemId, locationI
       i.itemtype AS item_type,
       BUILTIN.DF(i.itemtype) AS item_type_text,
       BUILTIN.DF(i.stockunit) AS stock_unit,
+      i.weight AS item_weight,
       i.custitem_toplt AS to_plt,
       i.custitem_tolyr AS to_lyr,
       i.custitem_tosec AS to_sec,

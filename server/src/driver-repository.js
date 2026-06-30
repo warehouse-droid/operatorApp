@@ -1,10 +1,13 @@
 import { query } from "./db.js";
+import { config } from "./config.js";
+import { createSamsaraDriverVehicleAssignment, createSamsaraMechanicDvir, findSamsaraDvirForVehicle, setSamsaraDriverDutyStatus } from "./samsara.js";
 
 const YARD_ADDRESSES = {
   "3445": "3445 Kennedy Road, Toronto, ON",
   "2967": "2967 Kennedy Road, Toronto, ON",
   "12441": "12441 Woodbine Avenue, Whitchurch-Stouffville, ON"
 };
+const OWN_YARD_CODES = new Set(Object.keys(YARD_ADDRESSES));
 
 function driverKey(value) {
   return String(value || "").trim().toLowerCase();
@@ -12,6 +15,17 @@ function driverKey(value) {
 
 function planDateValue(value) {
   return value instanceof Date ? value.toISOString().slice(0, 10) : String(value || "").slice(0, 10);
+}
+
+function todayLocalDate() {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Toronto",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(new Date());
+  const byType = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${byType.year}-${byType.month}-${byType.day}`;
 }
 
 function requiredPickupLocations(order) {
@@ -39,11 +53,46 @@ function sortedPlans(rows) {
 }
 
 function orderByRef(plan, ref) {
-  return (plan.orders || []).find((order) => String(order.id) === String(ref)) || null;
+  const direct = (plan.orders || []).find((order) => String(order.id) === String(ref));
+  if (direct) return direct;
+  for (const order of plan.orders || []) {
+    const child = (order.childOrderDetails || []).find((item) => String(item.id) === String(ref));
+    if (child) return child;
+  }
+  return null;
+}
+
+function expandOrderRefs(plan, refs) {
+  const expanded = [];
+  const seen = new Set();
+  const append = (ref) => {
+    const id = String(ref || "").trim();
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    expanded.push(id);
+  };
+  refs.forEach((ref) => {
+    const order = orderByRef(plan, ref);
+    const children = Array.isArray(order?.childOrders) ? order.childOrders : [];
+    if (children.length) {
+      children.forEach(append);
+      return;
+    }
+    append(ref);
+  });
+  return expanded;
 }
 
 function yardAddress(value) {
   return YARD_ADDRESSES[String(value || "")] || value || "";
+}
+
+function numberValue(value) {
+  return Number(value || 0) || 0;
+}
+
+function positiveBalance(value, allocated) {
+  return Math.max(numberValue(value) - numberValue(allocated), 0);
 }
 
 async function locationAddress(value) {
@@ -109,8 +158,9 @@ function buildTravelJob(plan, truck, load, truckIndex, loadIndex) {
 function buildJob(plan, truck, load, stop, truckIndex, loadIndex, stopIndex) {
   const isPickup = stop.type === "pick";
   const relatedStops = isPickup ? dropStopsForPickup(plan, load, stop.location) : [stop];
-  const orderRefs = [...new Set(relatedStops.map((item) => String(item.orderId || "")).filter(Boolean))];
-  const firstOrder = orderByRef(plan, orderRefs[0]) || {};
+  const stopOrderRefs = [...new Set(relatedStops.map((item) => String(item.orderId || "")).filter(Boolean))];
+  const orderRefs = expandOrderRefs(plan, stopOrderRefs);
+  const firstOrder = orderByRef(plan, stopOrderRefs[0]) || orderByRef(plan, orderRefs[0]) || {};
   return {
     jobId: jobId(plan, truck, load, stop),
     planId: plan.id,
@@ -174,36 +224,513 @@ async function confirmedPlans() {
   return sortedPlans(result.rows);
 }
 
-async function detailsFromDelivery(orderRef, typeHint = "") {
+function planJobsForTruck(plan, truck, truckIndex) {
+  const jobs = [];
+  (truck.loads || []).forEach((load, loadIndex) => {
+    if (load.returnOnly) return;
+    const travelJob = buildTravelJob(plan, truck, load, truckIndex, loadIndex);
+    if (travelJob) jobs.push(travelJob);
+    (load.stops || []).forEach((stop, stopIndex) => {
+      if (!["pick", "drop"].includes(stop.type)) return;
+      jobs.push(buildJob(plan, truck, load, stop, truckIndex, loadIndex, stopIndex));
+    });
+  });
+  return jobs;
+}
+
+async function activeDriverAssignment(driverLogin) {
+  const login = driverKey(driverLogin);
+  const today = todayLocalDate();
+  const matches = [];
+  for (const plan of await confirmedPlans()) {
+    if (plan.planDate < today) continue;
+    (plan.trucks || []).forEach((truck, truckIndex) => {
+      if (driverKey(truck.driverLogin || truck.driver) !== login) return;
+      matches.push({ plan, truck, truckIndex });
+    });
+  }
+  if (!matches.length) return null;
+  return matches[0];
+}
+
+function dvirStatus(row, type) {
+  if (!row) return "required";
+  return type === "post"
+    ? row.post_dvir_completed_at ? "complete" : "required"
+    : row.pre_dvir_completed_at ? "complete" : "required";
+}
+
+function normalizedPlate(value) {
+  return String(value || "").replace(/\s+/g, "").toUpperCase();
+}
+
+function isSamsaraOnDutyConfirmed(row) {
+  const response = row?.samsara_on_duty_response || {};
+  const clock = response.clock || {};
+  return Boolean(
+    row?.on_duty_at
+    && response.responseStatus === 200
+    && clock.currentDutyStatus?.hosStatusType === "onDuty"
+    && clock.currentVehicle?.id
+  );
+}
+
+function isSamsaraDvirConfirmed(row, type = "pre") {
+  const key = type === "post" ? "samsara_off_duty_response" : "samsara_on_duty_response";
+  const response = row?.[key] || {};
+  const dvir = response.dvir || response.verifiedDvir || {};
+  const dvirVehicleId = String(dvir.vehicle?.id || "");
+  const dvirPlate = normalizedPlate(dvir.licensePlate || dvir.vehicle?.licensePlate || response.dvir?.licensePlate || "");
+  const currentPlate = normalizedPlate(row?.truck_plate || "");
+  if (!(dvir.id || response.dvirId)) return false;
+  if (currentPlate && dvirPlate !== currentPlate) return false;
+  if (row?.samsara_vehicle_id && dvirVehicleId && dvirVehicleId !== String(row.samsara_vehicle_id)) return false;
+  return true;
+}
+
+function isSamsaraOffDutyConfirmed(row) {
+  const response = row?.samsara_off_duty_response || {};
+  const clock = response.clock || {};
+  return Boolean(
+    row?.off_duty_at
+    && response.responseStatus === 200
+    && clock.currentDutyStatus?.hosStatusType === "offDuty"
+  );
+}
+
+async function upsertDriverDayBase({ driverLogin, plan, truck, samsaraUsername = "" }) {
+  const login = driverKey(driverLogin);
+  const planDate = plan?.planDate || todayLocalDate();
+  const existing = await query(
+    `SELECT *
+       FROM driver_day_records
+      WHERE driver_login = $1
+        AND plan_date = $2::date
+      LIMIT 1`,
+    [login, planDate]
+  );
+  const existingRow = existing.rows[0] || null;
+  const truckChanged = existingRow && (
+    String(existingRow.truck_id || "") !== String(truck?.id || "")
+    || String(existingRow.truck_plate || "") !== String(truck?.plate || "")
+    || String(existingRow.plan_id || "") !== String(plan?.id || "")
+  );
+  const result = await query(
+    `INSERT INTO driver_day_records (
+       driver_login, plan_id, plan_date, truck_id, truck_plate, samsara_username
+     ) VALUES ($1, $2, $3::date, $4, $5, $6)
+     ON CONFLICT (driver_login, plan_date) DO UPDATE SET
+       plan_id = EXCLUDED.plan_id,
+       truck_id = EXCLUDED.truck_id,
+       truck_plate = EXCLUDED.truck_plate,
+       samsara_username = COALESCE(NULLIF(EXCLUDED.samsara_username, ''), driver_day_records.samsara_username),
+       pre_dvir_photo_data_urls = CASE WHEN $7 = true THEN '[]'::jsonb ELSE driver_day_records.pre_dvir_photo_data_urls END,
+       post_dvir_photo_data_urls = CASE WHEN $7 = true THEN '[]'::jsonb ELSE driver_day_records.post_dvir_photo_data_urls END,
+       pre_dvir_completed_at = CASE WHEN $7 = true THEN NULL ELSE driver_day_records.pre_dvir_completed_at END,
+       post_dvir_completed_at = CASE WHEN $7 = true THEN NULL ELSE driver_day_records.post_dvir_completed_at END,
+       on_duty_at = CASE WHEN $7 = true THEN NULL ELSE driver_day_records.on_duty_at END,
+       off_duty_at = CASE WHEN $7 = true THEN NULL ELSE driver_day_records.off_duty_at END,
+       samsara_driver_id = CASE WHEN $7 = true THEN NULL ELSE driver_day_records.samsara_driver_id END,
+       samsara_vehicle_id = CASE WHEN $7 = true THEN NULL ELSE driver_day_records.samsara_vehicle_id END,
+       samsara_assignment_response = CASE WHEN $7 = true THEN '{}'::jsonb ELSE driver_day_records.samsara_assignment_response END,
+       samsara_on_duty_response = CASE WHEN $7 = true THEN '{}'::jsonb ELSE driver_day_records.samsara_on_duty_response END,
+       samsara_off_duty_response = CASE WHEN $7 = true THEN '{}'::jsonb ELSE driver_day_records.samsara_off_duty_response END,
+       updated_at = now()
+     RETURNING *`,
+    [
+      login,
+      plan?.id || null,
+      planDate,
+      truck?.id || "",
+      truck?.plate || "",
+      samsaraUsername || "",
+      Boolean(truckChanged)
+    ]
+  );
+  return result.rows[0];
+}
+
+async function clearUnconfirmedDvirIfNeeded(row) {
+  const clearPre = Boolean(row?.pre_dvir_completed_at && !isSamsaraDvirConfirmed(row, "pre"));
+  const clearPost = Boolean(row?.post_dvir_completed_at && !isSamsaraDvirConfirmed(row, "post"));
+  if (!clearPre && !clearPost) return row;
+  const result = await query(
+    `UPDATE driver_day_records
+        SET pre_dvir_photo_data_urls = CASE WHEN $2 = true THEN '[]'::jsonb ELSE pre_dvir_photo_data_urls END,
+            pre_dvir_completed_at = CASE WHEN $2 = true THEN NULL ELSE pre_dvir_completed_at END,
+            on_duty_at = CASE WHEN $2 = true THEN NULL ELSE on_duty_at END,
+            samsara_driver_id = CASE WHEN $2 = true THEN NULL ELSE samsara_driver_id END,
+            samsara_vehicle_id = CASE WHEN $2 = true THEN NULL ELSE samsara_vehicle_id END,
+            samsara_assignment_response = CASE WHEN $2 = true THEN '{}'::jsonb ELSE samsara_assignment_response END,
+            samsara_on_duty_response = CASE WHEN $2 = true THEN '{}'::jsonb ELSE samsara_on_duty_response END,
+            post_dvir_photo_data_urls = CASE WHEN $3 = true THEN '[]'::jsonb ELSE post_dvir_photo_data_urls END,
+            post_dvir_completed_at = CASE WHEN $3 = true THEN NULL ELSE post_dvir_completed_at END,
+            off_duty_at = CASE WHEN $3 = true THEN NULL ELSE off_duty_at END,
+            samsara_off_duty_response = CASE WHEN $3 = true THEN '{}'::jsonb ELSE samsara_off_duty_response END,
+            updated_at = now()
+      WHERE id = $1
+      RETURNING *`,
+    [row.id, clearPre, clearPost || clearPre]
+  );
+  return result.rows[0] || row;
+}
+
+export async function getDriverDayState(driverLogin, { samsaraUsername = "" } = {}) {
+  const assignment = await activeDriverAssignment(driverLogin);
+  const plan = assignment?.plan || { id: null, planDate: todayLocalDate() };
+  const truck = assignment?.truck || {};
+  let row = await upsertDriverDayBase({ driverLogin, plan, truck, samsaraUsername });
+  row = await clearUnconfirmedDvirIfNeeded(row);
+  const jobs = assignment ? planJobsForTruck(plan, truck, assignment.truckIndex) : [];
+  const jobIds = jobs.map((job) => job.jobId);
+  const completed = await completedJobIds(jobIds);
+  const allJobsComplete = jobs.length > 0 && jobs.every((job) => completed.has(job.jobId));
+  return {
+    planId: plan?.id || null,
+    planDate: plan?.planDate || todayLocalDate(),
+    truckId: truck?.id || "",
+    truckPlate: truck?.plate || "",
+    parkingSpot: truck?.parkingSpot || "",
+    samsaraUsername: row.samsara_username || samsaraUsername || "",
+    preDvirStatus: dvirStatus(row, "pre") === "complete" && isSamsaraDvirConfirmed(row, "pre") ? "complete" : "required",
+    postDvirStatus: dvirStatus(row, "post") === "complete" && isSamsaraDvirConfirmed(row, "post") ? "complete" : "required",
+    preDvirCompletedAt: row.pre_dvir_completed_at || null,
+    postDvirCompletedAt: row.post_dvir_completed_at || null,
+    onDutyAt: row.on_duty_at || null,
+    offDutyAt: row.off_duty_at || null,
+    samsaraOnDutyConfirmed: isSamsaraOnDutyConfirmed(row),
+    samsaraOffDutyConfirmed: isSamsaraOffDutyConfirmed(row),
+    samsaraPreDvirConfirmed: isSamsaraDvirConfirmed(row, "pre"),
+    samsaraPostDvirConfirmed: isSamsaraDvirConfirmed(row, "post"),
+    samsaraOnDutyError: row.samsara_on_duty_response?.error || row.samsara_on_duty_response?.clockError || "",
+    samsaraOffDutyError: row.samsara_off_duty_response?.error || row.samsara_off_duty_response?.clockError || "",
+    allJobsComplete,
+    jobCount: jobs.length,
+    completedJobCount: completed.size
+  };
+}
+
+export async function submitDriverDvir(driverLogin, { type = "pre", photoDataUrls = [], samsaraUsername = "", samsaraDvirAuthorId = "" } = {}) {
+  const assignment = await activeDriverAssignment(driverLogin);
+  const plan = assignment?.plan || { id: null, planDate: todayLocalDate() };
+  const truck = assignment?.truck || {};
+  if (!truck?.plate) throw new Error("No assigned truck was found in the confirmed dispatch plan.");
+  let row = await upsertDriverDayBase({ driverLogin, plan, truck, samsaraUsername });
+  const photos = Array.isArray(photoDataUrls) ? photoDataUrls.filter(Boolean) : [];
+  if (photos.length < 4) throw new Error("4 inspection photos are required.");
+  let samsaraAssignment = null;
+  let samsaraDuty = null;
+  let samsaraDvir = null;
+  let verifiedDvir = null;
+  let samsaraError = "";
+  try {
+    if (type === "pre" && samsaraUsername) {
+      samsaraAssignment = await createSamsaraDriverVehicleAssignment({
+        username: samsaraUsername,
+        vehiclePlate: truck.plate
+      });
+      samsaraDuty = await setSamsaraDriverDutyStatus({
+        username: samsaraUsername,
+        vehicleId: samsaraAssignment.vehicle?.id || "",
+        dutyStatus: "ON_DUTY",
+        remark: `MBBS pre-DVIR complete with ${truck.plate}`
+      });
+      samsaraDvir = await createSamsaraMechanicDvir({
+        authorId: samsaraDvirAuthorId || config.samsara.dvirAuthorId || "",
+        vehicleId: samsaraAssignment.vehicle?.id || "",
+        licensePlate: truck.plate,
+        location: truck.base || truck.parkingSpot || "",
+        safetyStatus: "safe",
+        mechanicNotes: `MBBS pre-trip inspection submitted from Driver PWA by ${samsaraUsername}. Four photos are stored in MBBS.`
+      });
+      verifiedDvir = await findSamsaraDvirForVehicle({
+        vehicleId: samsaraAssignment.vehicle?.id || "",
+        sinceTime: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
+        type: "mechanic"
+      });
+      if (!verifiedDvir && !samsaraDvir?.dvir?.id) {
+        throw new Error("Samsara DVIR was not found after submission. Please redo the inspection in MBBS.");
+      }
+    }
+    if (type === "post" && samsaraUsername) {
+      samsaraDuty = await setSamsaraDriverDutyStatus({
+        username: samsaraUsername,
+        dutyStatus: "OFF_DUTY",
+        remark: `MBBS post-DVIR complete with ${truck.plate}`
+      });
+      const vehicleId = row.samsara_vehicle_id || "";
+      samsaraDvir = await createSamsaraMechanicDvir({
+        authorId: samsaraDvirAuthorId || config.samsara.dvirAuthorId || "",
+        vehicleId,
+        licensePlate: truck.plate,
+        location: truck.base || truck.parkingSpot || "",
+        safetyStatus: "safe",
+        mechanicNotes: `MBBS post-trip inspection submitted from Driver PWA by ${samsaraUsername}. Four photos are stored in MBBS.`
+      });
+      verifiedDvir = await findSamsaraDvirForVehicle({
+        vehicleId,
+        sinceTime: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
+        type: "mechanic"
+      });
+      if (!verifiedDvir && !samsaraDvir?.dvir?.id) {
+        throw new Error("Samsara DVIR was not found after submission. Please redo the inspection in MBBS.");
+      }
+    }
+  } catch (error) {
+    samsaraError = error.message;
+  }
+  const samsaraConfirmed = Boolean(samsaraDuty && !samsaraError && (verifiedDvir || samsaraDvir?.dvir?.id));
+  const dvirPayload = {
+    ...(samsaraDuty || {}),
+    ...(samsaraError ? { error: samsaraError } : {}),
+    dvir: samsaraDvir?.dvir || null,
+    dvirId: samsaraDvir?.dvir?.id || verifiedDvir?.id || "",
+    verifiedDvir: verifiedDvir || null
+  };
+  const result = await query(
+    type === "post"
+      ? `UPDATE driver_day_records
+            SET post_dvir_photo_data_urls = CASE WHEN $4 = true THEN $2::jsonb ELSE post_dvir_photo_data_urls END,
+                post_dvir_completed_at = CASE WHEN $4 = true THEN now() ELSE post_dvir_completed_at END,
+                off_duty_at = CASE WHEN $4 = true THEN now() ELSE off_duty_at END,
+                samsara_off_duty_response = $3::jsonb,
+                updated_at = now()
+          WHERE id = $1
+          RETURNING *`
+      : `UPDATE driver_day_records
+            SET pre_dvir_photo_data_urls = CASE WHEN $7 = true THEN $2::jsonb ELSE '[]'::jsonb END,
+                pre_dvir_completed_at = CASE WHEN $7 = true THEN now() ELSE NULL END,
+                on_duty_at = CASE WHEN $7 = true THEN now() ELSE NULL END,
+                samsara_driver_id = COALESCE(NULLIF($4, ''), samsara_driver_id),
+                samsara_vehicle_id = COALESCE(NULLIF($5, ''), samsara_vehicle_id),
+                samsara_assignment_response = $6::jsonb,
+                samsara_on_duty_response = $3::jsonb,
+                updated_at = now()
+          WHERE id = $1
+          RETURNING *`,
+    type === "post"
+      ? [
+          row.id,
+          JSON.stringify(photos),
+          JSON.stringify(dvirPayload),
+          samsaraConfirmed
+        ]
+      : [
+          row.id,
+          JSON.stringify(photos),
+          JSON.stringify(dvirPayload),
+          samsaraAssignment?.driver?.id || "",
+          samsaraAssignment?.vehicle?.id || "",
+          JSON.stringify(samsaraAssignment || (samsaraError ? { error: samsaraError } : {})),
+          samsaraConfirmed
+        ]
+  );
+  row = result.rows[0];
+  return {
+    state: await getDriverDayState(driverLogin, { samsaraUsername }),
+    samsaraError,
+    samsaraAssignment,
+    samsaraDuty,
+    samsaraDvir,
+    verifiedDvir,
+    recordId: row.id
+  };
+}
+
+export async function skipDriverDvirForTesting(driverLogin, { type = "pre", samsaraUsername = "" } = {}) {
+  const assignment = await activeDriverAssignment(driverLogin);
+  const plan = assignment?.plan || { id: null, planDate: todayLocalDate() };
+  const truck = assignment?.truck || {};
+  if (!truck?.plate) throw new Error("No assigned truck was found in the confirmed dispatch plan.");
+  const row = await upsertDriverDayBase({ driverLogin, plan, truck, samsaraUsername });
+  const fakeDvir = {
+    responseStatus: 200,
+    skippedForTesting: true,
+    dvirId: `MBBS-SKIP-${type}-${Date.now()}`,
+    dvir: {
+      id: `MBBS-SKIP-${type}-${Date.now()}`,
+      licensePlate: truck.plate,
+      vehicle: {
+        id: "mbbs-test-skip",
+        licensePlate: truck.plate
+      }
+    },
+    verifiedDvir: {
+      id: `MBBS-SKIP-${type}-${Date.now()}`,
+      licensePlate: truck.plate,
+      vehicle: {
+        id: "mbbs-test-skip",
+        licensePlate: truck.plate
+      }
+    },
+    clock: {
+      currentDutyStatus: {
+        hosStatusType: type === "post" ? "offDuty" : "onDuty"
+      },
+      currentVehicle: {
+        id: "mbbs-test-skip"
+      }
+    }
+  };
+  const photos = JSON.stringify([]);
+  const result = type === "post"
+    ? await query(
+        `UPDATE driver_day_records
+            SET samsara_username = COALESCE(NULLIF($2, ''), samsara_username),
+                post_dvir_photo_data_urls = $3::jsonb,
+                post_dvir_completed_at = now(),
+                off_duty_at = now(),
+                samsara_vehicle_id = 'mbbs-test-skip',
+                samsara_off_duty_response = $4::jsonb,
+                updated_at = now()
+          WHERE id = $1
+          RETURNING *`,
+        [row.id, samsaraUsername || "", photos, JSON.stringify(fakeDvir)]
+      )
+    : await query(
+        `UPDATE driver_day_records
+            SET samsara_username = COALESCE(NULLIF($2, ''), samsara_username),
+                pre_dvir_photo_data_urls = $3::jsonb,
+                pre_dvir_completed_at = now(),
+                on_duty_at = now(),
+                samsara_driver_id = COALESCE(samsara_driver_id, 'mbbs-test-skip'),
+                samsara_vehicle_id = 'mbbs-test-skip',
+                samsara_assignment_response = $4::jsonb,
+                samsara_on_duty_response = $4::jsonb,
+                updated_at = now()
+          WHERE id = $1
+          RETURNING *`,
+        [row.id, samsaraUsername || "", photos, JSON.stringify(fakeDvir)]
+      );
+  return {
+    state: await getDriverDayState(driverLogin, { samsaraUsername }),
+    recordId: result.rows[0]?.id || row.id,
+    skippedForTesting: true
+  };
+}
+
+async function detailsFromDelivery(orderRef, typeHint = "", context = {}) {
   const typeClause = typeHint === "TO" ? "AND o.order_type = 'transfer_order'" : typeHint === "SO" ? "AND o.order_type = 'sales_order'" : "";
   const order = await query(
-    `SELECT o.netsuite_id, o.tranid, o.order_type, o.customer AS party,
-            o.dispatch_address, o.dispatch_window_start, o.dispatch_window_end, o.destination_location
-       FROM delivery_orders o
+    `WITH delivery_order_source AS (
+       SELECT netsuite_id, tranid, 'sales_order'::text AS order_type, customer AS party,
+              dispatch_address, dispatch_window_start, dispatch_window_end,
+              NULL::text AS destination_location, outbound_location, synced_at
+       FROM sales_orders
+       UNION ALL
+       SELECT netsuite_id, tranid, 'transfer_order'::text AS order_type, to_location AS party,
+              dispatch_address, dispatch_window_start, dispatch_window_end,
+              to_location AS destination_location, from_location AS outbound_location, synced_at
+       FROM transfer_orders
+       WHERE from_location_id IS NOT NULL
+     )
+     SELECT o.netsuite_id, o.tranid, o.order_type, o.party,
+            o.dispatch_address, o.dispatch_window_start, o.dispatch_window_end, o.destination_location,
+            o.outbound_location
+       FROM delivery_order_source o
       WHERE o.tranid = $1 ${typeClause}
       ORDER BY o.synced_at DESC
       LIMIT 1`,
     [orderRef]
   );
   if (!order.rowCount) return null;
+  const pickupLocation = String(context.pickupLocation || "").trim();
   const lines = await query(
-    `SELECT item_name, sku, item_description, item_type, quantity, unit,
-            pallet_qty, layer_qty, section_qty, piece_qty
-       FROM delivery_order_lines
+    `WITH alloc_total AS (
+       SELECT sales_line_id,
+              SUM(allocated_pallet_qty) AS allocated_pallet_qty,
+              SUM(allocated_layer_qty) AS allocated_layer_qty,
+              SUM(allocated_section_qty) AS allocated_section_qty,
+              SUM(allocated_piece_qty) AS allocated_piece_qty,
+              SUM(allocated_sales_qty) AS allocated_sales_qty
+         FROM dispatch_so_po_allocations
+        WHERE status = 'active'
+        GROUP BY sales_line_id
+     ),
+     alloc_location AS (
+       SELECT a.sales_line_id,
+              SUM(a.allocated_pallet_qty) AS allocated_pallet_qty,
+              SUM(a.allocated_layer_qty) AS allocated_layer_qty,
+              SUM(a.allocated_section_qty) AS allocated_section_qty,
+              SUM(a.allocated_piece_qty) AS allocated_piece_qty,
+              SUM(a.allocated_sales_qty) AS allocated_sales_qty
+         FROM dispatch_so_po_allocations a
+         JOIN purchase_orders po ON po.netsuite_id = a.po_order_id
+        WHERE a.status = 'active'
+          AND $2 <> ''
+          AND LOWER(COALESCE(NULLIF(po.dispatch_vendor_yard, ''), NULLIF(po.source_location, ''), NULLIF(po.vendor, ''))) = LOWER($2)
+        GROUP BY a.sales_line_id
+     )
+     SELECT l.item_name, l.sku, l.item_description, l.item_type, l.quantity, l.unit,
+            l.pallet_qty, l.layer_qty, l.section_qty, l.piece_qty,
+            COALESCE(at.allocated_pallet_qty, 0) AS total_allocated_pallet_qty,
+            COALESCE(at.allocated_layer_qty, 0) AS total_allocated_layer_qty,
+            COALESCE(at.allocated_section_qty, 0) AS total_allocated_section_qty,
+            COALESCE(at.allocated_piece_qty, 0) AS total_allocated_piece_qty,
+            COALESCE(at.allocated_sales_qty, 0) AS total_allocated_sales_qty,
+            COALESCE(al.allocated_pallet_qty, 0) AS location_allocated_pallet_qty,
+            COALESCE(al.allocated_layer_qty, 0) AS location_allocated_layer_qty,
+            COALESCE(al.allocated_section_qty, 0) AS location_allocated_section_qty,
+            COALESCE(al.allocated_piece_qty, 0) AS location_allocated_piece_qty,
+            COALESCE(al.allocated_sales_qty, 0) AS location_allocated_sales_qty
+       FROM (
+         SELECT sales_order_id AS order_id, id, line_id, item_name, sku, item_description, item_type,
+                quantity, unit, pallet_qty, layer_qty, section_qty, piece_qty, netsuite_active
+         FROM sales_order_lines
+         UNION ALL
+         SELECT transfer_order_id AS order_id, id, line_id, item_name, sku, item_description, item_type,
+                quantity, unit, pallet_qty, layer_qty, section_qty, piece_qty, netsuite_active
+         FROM transfer_order_lines
+         WHERE line_stage = 'outbound'
+       ) l
+       LEFT JOIN alloc_total at ON at.sales_line_id = l.id
+       LEFT JOIN alloc_location al ON al.sales_line_id = l.id
       WHERE order_id = $1
         AND netsuite_active = true
       ORDER BY line_id NULLS LAST, id`,
-    [order.rows[0].netsuite_id]
+    [order.rows[0].netsuite_id, pickupLocation]
   );
-  return { ...order.rows[0], source: "delivery", lines: lines.rows };
+  if (context.stopType !== "pickup" || order.rows[0].order_type !== "sales_order") {
+    return { ...order.rows[0], source: "delivery", lines: lines.rows };
+  }
+  const ownPickup = !pickupLocation || OWN_YARD_CODES.has(pickupLocation) || String(order.rows[0].outbound_location || "") === pickupLocation;
+  const adjustedLines = lines.rows.map((line) => ownPickup
+    ? {
+        ...line,
+        pallet_qty: positiveBalance(line.pallet_qty, line.total_allocated_pallet_qty),
+        layer_qty: positiveBalance(line.layer_qty, line.total_allocated_layer_qty),
+        section_qty: positiveBalance(line.section_qty, line.total_allocated_section_qty),
+        piece_qty: positiveBalance(line.piece_qty, line.total_allocated_piece_qty),
+        quantity: positiveBalance(line.quantity, line.total_allocated_sales_qty)
+      }
+    : {
+        ...line,
+        pallet_qty: numberValue(line.location_allocated_pallet_qty),
+        layer_qty: numberValue(line.location_allocated_layer_qty),
+        section_qty: numberValue(line.location_allocated_section_qty),
+        piece_qty: numberValue(line.location_allocated_piece_qty),
+        quantity: numberValue(line.location_allocated_sales_qty)
+      })
+    .filter((line) => numberValue(line.pallet_qty) || numberValue(line.layer_qty) || numberValue(line.section_qty) || numberValue(line.piece_qty) || numberValue(line.quantity));
+  return { ...order.rows[0], source: "delivery", lines: adjustedLines };
 }
 
 async function detailsFromReceiving(orderRef, typeHint = "") {
   const typeClause = typeHint === "TO" ? "AND o.order_type = 'transfer_order'" : typeHint === "PO" ? "AND o.order_type = 'purchase_order'" : "";
   const order = await query(
-    `SELECT o.netsuite_id, o.tranid, o.order_type, o.vendor AS party,
+    `WITH receiving_order_source AS (
+       SELECT netsuite_id, tranid, 'purchase_order'::text AS order_type, vendor AS party,
+              dispatch_address, dispatch_window_start, dispatch_window_end, destination_location, synced_at
+       FROM purchase_orders
+       UNION ALL
+       SELECT netsuite_id, tranid, 'transfer_order'::text AS order_type, from_location AS party,
+              dispatch_address, dispatch_window_start, dispatch_window_end, to_location AS destination_location, synced_at
+       FROM transfer_orders
+       WHERE to_location_id IS NOT NULL
+     )
+     SELECT o.netsuite_id, o.tranid, o.order_type, o.party,
             o.dispatch_address, o.dispatch_window_start, o.dispatch_window_end, o.destination_location
-       FROM receiving_orders o
+       FROM receiving_order_source o
       WHERE o.tranid = $1 ${typeClause}
       ORDER BY o.synced_at DESC
       LIMIT 1`,
@@ -213,7 +740,16 @@ async function detailsFromReceiving(orderRef, typeHint = "") {
   const lines = await query(
     `SELECT item_name, sku, item_description, item_type, quantity, unit,
             pallet_qty, layer_qty, section_qty, piece_qty
-       FROM receiving_order_lines
+       FROM (
+         SELECT purchase_order_id AS order_id, line_id, id, item_name, sku, item_description, item_type,
+                quantity, unit, pallet_qty, layer_qty, section_qty, piece_qty, netsuite_active
+         FROM purchase_order_lines
+         UNION ALL
+         SELECT transfer_order_id AS order_id, line_id, id, item_name, sku, item_description, item_type,
+                quantity, unit, pallet_qty, layer_qty, section_qty, piece_qty, netsuite_active
+         FROM transfer_order_lines
+         WHERE line_stage = 'receiving'
+       ) receiving_lines
       WHERE order_id = $1
         AND netsuite_active = true
       ORDER BY line_id NULLS LAST, id`,
@@ -228,7 +764,7 @@ async function detailsFromLocalCo(orderRef) {
             COALESCE(details->>'customer', 'Transit Depot') AS party,
             details->>'notes' AS dispatch_instructions,
             to_location AS destination_location
-       FROM local_co_orders
+       FROM co_orders
       WHERE co_ref = $1
       LIMIT 1`,
     [orderRef]
@@ -237,7 +773,7 @@ async function detailsFromLocalCo(orderRef) {
   const lines = await query(
     `SELECT item_name, sku, item_description, item_type, quantity, unit,
             pallet_qty, layer_qty, section_qty, piece_qty
-       FROM local_co_order_lines
+       FROM co_order_lines
       WHERE co_id = $1
       ORDER BY line_id NULLS LAST, id`,
     [order.rows[0].id]
@@ -256,56 +792,102 @@ function visibleUnits(line) {
   return [{ unit: line.unit || "UOM", value: Number(line.quantity || 0), fallback: true }];
 }
 
+function visibleUnitsFromPlanItem(item) {
+  const values = [
+    ["PLT", item.pallets ?? item.pallet_qty],
+    ["LYR", item.layers ?? item.layer_qty],
+    ["SEC", item.sections ?? item.section_qty],
+    ["PCS", item.pieces ?? item.piece_qty]
+  ].filter(([, value]) => Number(value || 0) > 0);
+  if (values.length) return values.map(([unit, value]) => ({ unit, value: Number(value) }));
+  return [{ unit: item.unit || "UOM", value: Number(item.quantity || item.salesQty || 0), fallback: true }];
+}
+
+function planItemForPickup(item, context = {}) {
+  if (context.stopType !== "pickup") return item;
+  const pickupLocation = String(context.pickupLocation || "").trim();
+  const ownPickup = !pickupLocation || OWN_YARD_CODES.has(pickupLocation);
+  if (ownPickup) {
+    return {
+      ...item,
+      pallets: positiveBalance(item.pallets, item.poAllocatedPallets),
+      layers: positiveBalance(item.layers, item.poAllocatedLayers),
+      sections: positiveBalance(item.sections, item.poAllocatedSections),
+      pieces: positiveBalance(item.pieces, item.poAllocatedPieces),
+      quantity: positiveBalance(item.quantity ?? item.salesQty, item.poAllocatedSalesQty),
+      salesQty: positiveBalance(item.salesQty ?? item.quantity, item.poAllocatedSalesQty)
+    };
+  }
+  return {
+    ...item,
+    pallets: numberValue(item.poAllocatedPallets),
+    layers: numberValue(item.poAllocatedLayers),
+    sections: numberValue(item.poAllocatedSections),
+    pieces: numberValue(item.poAllocatedPieces),
+    quantity: numberValue(item.poAllocatedSalesQty),
+    salesQty: numberValue(item.poAllocatedSalesQty)
+  };
+}
+
+function planItemHasQuantity(item) {
+  return numberValue(item.pallets ?? item.pallet_qty)
+    || numberValue(item.layers ?? item.layer_qty)
+    || numberValue(item.sections ?? item.section_qty)
+    || numberValue(item.pieces ?? item.piece_qty)
+    || numberValue(item.quantity || item.salesQty);
+}
+
 function isMaterialLine(line) {
   const itemType = String(line.item_type || "").trim();
   if (!itemType) return true;
   return ["InvtPart", "NonInvtPart"].includes(itemType);
 }
 
-async function orderDetails(orderRef, typeHint = "") {
+function orderDetailsFromPlan(orderRef, planOrder = null, context = {}) {
+  const items = (planOrder?.items || [])
+    .map((item) => planItemForPickup(item, context))
+    .filter(planItemHasQuantity);
+  return {
+    orderRef,
+    party: planOrder?.customer || planOrder?.vendor || planOrder?.party || "",
+    source: "dispatch_plan",
+    items: items.map((item) => ({
+      itemName: item.itemName || item.name || item.sku || "",
+      sku: item.sku || item.itemName || item.name || "",
+      description: item.description || item.itemDescription || "",
+      units: visibleUnitsFromPlanItem(item)
+    }))
+  };
+}
+
+async function orderDetails(orderRef, typeHint = "", planOrder = null, context = {}) {
   const detail = typeHint === "PO"
     ? await detailsFromReceiving(orderRef, "PO")
     : typeHint === "CO"
       ? await detailsFromLocalCo(orderRef)
       : typeHint === "TO"
-        ? await detailsFromDelivery(orderRef, "TO") || await detailsFromReceiving(orderRef, "TO")
-        : await detailsFromDelivery(orderRef, "SO") || await detailsFromReceiving(orderRef) || await detailsFromLocalCo(orderRef);
-  if (!detail) return {
-    orderRef,
-    party: "",
-    items: []
-  };
+        ? await detailsFromDelivery(orderRef, "TO", context) || await detailsFromReceiving(orderRef, "TO")
+        : await detailsFromDelivery(orderRef, "SO", context) || await detailsFromReceiving(orderRef) || await detailsFromLocalCo(orderRef);
+  if (!detail) return orderDetailsFromPlan(orderRef, planOrder, context);
+  const items = (detail.lines || []).filter(isMaterialLine).map((line) => ({
+    itemName: line.item_name || line.sku || "",
+    sku: line.sku || line.item_name || "",
+    description: line.item_description || "",
+    units: visibleUnits(line)
+  }));
+  if (!items.length && planOrder?.items?.length) return orderDetailsFromPlan(orderRef, planOrder, context);
   return {
     orderRef,
     party: detail.party || "",
     source: detail.source,
-    items: (detail.lines || []).filter(isMaterialLine).map((line) => ({
-      itemName: line.item_name || line.sku || "",
-      sku: line.sku || line.item_name || "",
-      description: line.item_description || "",
-      units: visibleUnits(line)
-    }))
+    items
   };
 }
 
 export async function getNextDriverJob(driverLogin) {
-  const login = driverKey(driverLogin);
-  const plans = await confirmedPlans();
-  const jobs = [];
-  for (const plan of plans) {
-    (plan.trucks || []).forEach((truck, truckIndex) => {
-      if (driverKey(truck.driverLogin || truck.driver) !== login) return;
-      (truck.loads || []).forEach((load, loadIndex) => {
-        if (load.returnOnly) return;
-        const travelJob = buildTravelJob(plan, truck, load, truckIndex, loadIndex);
-        if (travelJob) jobs.push(travelJob);
-        (load.stops || []).forEach((stop, stopIndex) => {
-          if (!["pick", "drop"].includes(stop.type)) return;
-          jobs.push(buildJob(plan, truck, load, stop, truckIndex, loadIndex, stopIndex));
-        });
-      });
-    });
-  }
+  const assignment = await activeDriverAssignment(driverLogin);
+  if (!assignment) return null;
+  const jobs = planJobsForTruck(assignment.plan, assignment.truck, assignment.truckIndex);
   const jobIds = jobs.map((job) => job.jobId);
   const completed = await completedJobIds(jobIds);
   const statuses = await jobStatusMap(jobIds);
@@ -323,7 +905,10 @@ export async function getNextDriverJob(driverLogin) {
   }
   const details = await Promise.all(next.orderRefs.map((ref) => {
     const hint = next.orderTypes.length === 1 ? next.orderTypes[0] : "";
-    return orderDetails(ref, hint);
+    return orderDetails(ref, hint, orderByRef(assignment.plan, ref), {
+      stopType: next.stopType,
+      pickupLocation: next.stopType === "pickup" ? next.location : ""
+    });
   }));
   return { ...next, orders: details };
 }

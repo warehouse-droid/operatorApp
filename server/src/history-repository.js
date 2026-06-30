@@ -36,7 +36,33 @@ export async function listOperatorHistory({ operatorId, date = "", limit = 100 }
   const auditParams = [operatorId, HISTORY_ACTIONS];
   const auditDate = dateClause("a", date, auditParams);
   const audit = await query(
-    `SELECT ('audit-' || a.id) AS id,
+    `WITH delivery_order_lookup AS (
+       SELECT netsuite_id, tranid FROM sales_orders
+       UNION ALL
+       SELECT netsuite_id, tranid FROM transfer_orders
+     ),
+     receiving_order_lookup AS (
+       SELECT netsuite_id, tranid FROM purchase_orders
+       UNION ALL
+       SELECT netsuite_id, tranid FROM transfer_orders
+     ),
+     delivery_line_lookup AS (
+       SELECT id, item_name, item_description, to_plt, to_lyr, to_sec, to_pcs
+       FROM sales_order_lines
+       UNION ALL
+       SELECT id, item_name, item_description, to_plt, to_lyr, to_sec, to_pcs
+       FROM transfer_order_lines
+       WHERE line_stage = 'outbound'
+     ),
+     receiving_line_lookup AS (
+       SELECT purchase_order_id AS order_id, line_id, item_name, item_description, to_plt, to_lyr, to_sec, to_pcs
+       FROM purchase_order_lines
+       UNION ALL
+       SELECT transfer_order_id AS order_id, line_id, item_name, item_description, to_plt, to_lyr, to_sec, to_pcs
+       FROM transfer_order_lines
+       WHERE line_stage = 'receiving'
+     )
+     SELECT ('audit-' || a.id) AS id,
             CASE WHEN a.source = 'receiving' THEN 'confirm_line' ELSE 'confirm_line' END AS type,
             a.action,
             CASE WHEN a.action = 'receiving.line.confirm' THEN 'Receiving confirm line' ELSE 'Delivery confirm line' END AS title,
@@ -93,10 +119,10 @@ export async function listOperatorHistory({ operatorId, date = "", limit = 100 }
             ) AS details,
             '[]'::jsonb AS photos
      FROM delivery_audit_log a
-     LEFT JOIN delivery_orders dord ON dord.netsuite_id = a.order_id
-     LEFT JOIN receiving_orders ro ON ro.netsuite_id = NULLIF(a.details->>'receivingOrderId', '')::bigint
-     LEFT JOIN delivery_order_lines dl ON dl.id = a.line_id AND a.action = 'delivery.line.confirm'
-     LEFT JOIN receiving_order_lines rl ON rl.order_id = ro.netsuite_id AND rl.line_id = a.line_id AND a.action = 'receiving.line.confirm'
+     LEFT JOIN delivery_order_lookup dord ON dord.netsuite_id = a.order_id
+     LEFT JOIN receiving_order_lookup ro ON ro.netsuite_id = NULLIF(a.details->>'receivingOrderId', '')::bigint
+     LEFT JOIN delivery_line_lookup dl ON dl.id = a.line_id AND a.action = 'delivery.line.confirm'
+     LEFT JOIN receiving_line_lookup rl ON rl.order_id = ro.netsuite_id AND rl.line_id = a.line_id AND a.action = 'receiving.line.confirm'
      WHERE a.actor_operator_id = $1
        AND a.action = ANY($2::text[])
        ${auditDate}
@@ -106,62 +132,84 @@ export async function listOperatorHistory({ operatorId, date = "", limit = 100 }
   );
   records.push(...audit.rows.map(normalizeRecord));
 
-  const fulfillmentParams = [operatorId];
-  const fulfillmentDate = dateClause("f", date, fulfillmentParams);
-  const fulfillments = await query(
-    `SELECT ('fulfillment-' || f.id) AS id,
-            'item_fulfillment' AS type,
-            'delivery.order.fulfill' AS action,
-            'Item Fulfillment' AS title,
-            f.order_id,
-            o.tranid,
-            COALESCE(f.item_fulfillment_tranid, f.item_fulfillment_id::text, '') AS reference,
-            f.fulfillment_status AS status,
-            f.created_at,
+  const loadParams = [operatorId];
+  const loadDate = dateClause("l", date, loadParams);
+  const loads = await query(
+    `SELECT ('load-' || l.id) AS id,
+            l.load_type AS type,
+            CASE
+              WHEN l.load_type = 'customer_pickup_load' THEN 'customer_pickup.order.load'
+              ELSE 'delivery.order.load'
+            END AS action,
+            CASE
+              WHEN l.load_type = 'customer_pickup_load' THEN 'Customer Pickup Load'
+              WHEN l.order_family = 'transfer_order' THEN 'Transfer Order Load'
+              ELSE 'Delivery Load'
+            END AS title,
+            l.order_id,
+            COALESCE(l.order_ref, so.tranid, tr.tranid, l.order_id::text) AS tranid,
+            COALESCE(l.loaded_uom, '') AS reference,
+            COALESCE(l.response->>'pickupStatus', l.response->>'localYardOrderStatus', 'loaded') AS status,
+            l.created_at,
             jsonb_build_object(
-              'recordId', f.id,
-              'itemFulfillmentId', f.item_fulfillment_id,
-              'itemFulfillmentTranid', f.item_fulfillment_tranid,
-              'orderType', o.order_type,
-              'lines', COALESCE(fulfilled_lines.lines, '[]'::jsonb),
-              'payload', f.payload,
-              'response', f.response
+              'recordId', l.id,
+              'loadType', l.load_type,
+              'orderFamily', l.order_family,
+              'loadedQty', l.loaded_qty,
+              'loadedUom', l.loaded_uom,
+              'lines', COALESCE(load_lines.lines, '[]'::jsonb),
+              'payload', jsonb_build_object(
+                'loadedQty', l.loaded_qty,
+                'loadedUom', l.loaded_uom,
+                'sourceTable', l.source_table,
+                'sourceRecordId', l.source_record_id
+              ),
+              'response', l.response
             ) AS details,
-            CASE WHEN f.photo_data_url <> '' THEN jsonb_build_array(f.photo_data_url) ELSE '[]'::jsonb END AS photos
-     FROM delivery_fulfillment_records f
-     LEFT JOIN delivery_orders o ON o.netsuite_id = f.order_id
+            CASE WHEN l.photo_data_url <> '' THEN jsonb_build_array(l.photo_data_url) ELSE '[]'::jsonb END AS photos
+     FROM operator_load_records l
+     LEFT JOIN sales_orders so ON so.netsuite_id = l.order_id AND l.order_family = 'sales_order'
+     LEFT JOIN transfer_orders tr ON tr.netsuite_id = l.order_id AND l.order_family = 'transfer_order'
      LEFT JOIN LATERAL (
        SELECT jsonb_agg(jsonb_build_object(
-         'itemName', l.item_name,
-         'description', l.item_description,
-         'pallets', l.packed_pallet_qty,
-         'layers', l.packed_layer_qty,
-         'sections', l.packed_section_qty,
-         'pieces', l.packed_piece_qty,
-         'salesQuantity', NULLIF(item.value->>'quantity', '')::numeric
-       ) ORDER BY l.line_id NULLS LAST, l.id) AS lines
-       FROM jsonb_array_elements(COALESCE(f.payload->'item'->'items', '[]'::jsonb)) item(value)
-       LEFT JOIN delivery_order_lines l
-         ON l.order_id = f.order_id
-        AND l.line_id = CASE
-          WHEN o.order_type = 'transfer_order' THEN NULLIF(item.value->>'orderLine', '')::bigint - 1
-          ELSE NULLIF(item.value->>'orderLine', '')::bigint
-        END
-       WHERE item.value->>'itemReceive' IS DISTINCT FROM 'false'
-         AND NULLIF(item.value->>'quantity', '') IS NOT NULL
-     ) fulfilled_lines ON true
-     WHERE f.operator_id = $1
-       ${fulfillmentDate}
-     ORDER BY f.created_at DESC, f.id DESC
+         'itemName', line.value->>'itemName',
+         'description', line.value->>'description',
+         'pallets', line.value->>'packedPallets',
+         'layers', line.value->>'packedLayers',
+         'sections', line.value->>'packedSections',
+         'pieces', line.value->>'packedPieces',
+         'salesQuantity', NULLIF(line.value->>'loadedQty', '')::numeric,
+         'unit', line.value->>'loadedUom'
+       )) AS lines
+       FROM jsonb_array_elements(COALESCE(l.line_snapshot, '[]'::jsonb)) line(value)
+     ) load_lines ON true
+     WHERE l.operator_id = $1
+       ${loadDate}
+     ORDER BY l.created_at DESC, l.id DESC
      LIMIT ${safeLimit}`,
-    fulfillmentParams
+    loadParams
   );
-  records.push(...fulfillments.rows.map(normalizeRecord));
+  records.push(...loads.rows.map(normalizeRecord));
 
   const receiptParams = [operatorId];
   const receiptDate = dateClause("r", date, receiptParams);
   const receipts = await query(
-    `SELECT ('receipt-' || r.id) AS id,
+    `WITH receiving_order_lookup AS (
+       SELECT netsuite_id, tranid, 'purchase_order'::text AS order_type FROM purchase_orders
+       UNION ALL
+       SELECT netsuite_id, tranid, 'transfer_order'::text AS order_type FROM transfer_orders
+     ),
+     receiving_line_lookup AS (
+       SELECT purchase_order_id AS order_id, line_id, id, item_name, item_description,
+              received_pallet_qty, received_layer_qty, received_section_qty, received_piece_qty
+       FROM purchase_order_lines
+       UNION ALL
+       SELECT transfer_order_id AS order_id, line_id, id, item_name, item_description,
+              received_pallet_qty, received_layer_qty, received_section_qty, received_piece_qty
+       FROM transfer_order_lines
+       WHERE line_stage = 'receiving'
+     )
+     SELECT ('receipt-' || r.id) AS id,
             'item_receipt' AS type,
             'receiving.order.receive' AS action,
             'Item Receipt' AS title,
@@ -181,7 +229,7 @@ export async function listOperatorHistory({ operatorId, date = "", limit = 100 }
             ) AS details,
             r.photo_data_urls AS photos
      FROM receiving_receipt_records r
-     LEFT JOIN receiving_orders o ON o.netsuite_id = r.order_id
+     LEFT JOIN receiving_order_lookup o ON o.netsuite_id = r.order_id
      LEFT JOIN LATERAL (
        SELECT jsonb_agg(jsonb_build_object(
          'itemName', l.item_name,
@@ -193,7 +241,7 @@ export async function listOperatorHistory({ operatorId, date = "", limit = 100 }
          'salesQuantity', NULLIF(item.value->>'quantity', '')::numeric
        ) ORDER BY l.line_id NULLS LAST, l.id) AS lines
        FROM jsonb_array_elements(COALESCE(r.payload->'item'->'items', '[]'::jsonb)) item(value)
-       LEFT JOIN receiving_order_lines l
+       LEFT JOIN receiving_line_lookup l
          ON l.order_id = r.order_id
         AND l.line_id = NULLIF(item.value->>'orderLine', '')::bigint
        WHERE item.value->>'itemReceive' IS DISTINCT FROM 'false'

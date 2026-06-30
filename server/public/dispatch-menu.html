@@ -28,12 +28,20 @@
             <section class="dispatch-menu-page">
               <div class="dispatch-menu-heading">
                 <h2>Dispatch Menu</h2>
-                <p>Open planning or dispatch setup.</p>
+                <p>Open planning, setup, or driver inspection photo review.</p>
               </div>
-              <div class="dispatch-menu-grid two-up">
+              <div class="dispatch-menu-grid">
                 <button class="dispatch-menu-card primary-card" onclick="location.href='/dispatch/planning'" type="button">
                   <strong>Planning</strong>
                   <span>Build daily truck loads, routes, CO transit moves, and stop sequences.</span>
+                </button>
+                <button class="dispatch-menu-card" onclick="location.href='/dispatch/monitor'" type="button">
+                  <strong>Monitor</strong>
+                  <span>Watch Samsara truck locations, active loads, and yard reference points.</span>
+                </button>
+                <button class="dispatch-menu-card" onclick="location.href='/dispatch/dvir'" type="button">
+                  <strong>DVIR Photos</strong>
+                  <span>Review pre-trip and post-trip photos captured in the MBBS driver PWA.</span>
                 </button>
                 <button class="dispatch-menu-card" onclick="location.href='/dispatch/setup'" type="button">
                   <strong>Setup</strong>
