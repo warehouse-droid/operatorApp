@@ -1,11 +1,11 @@
-const CACHE_NAME = "mbbs-yard-operator-v66-accumulated-event-alerts";
+const CACHE_NAME = "mbbs-yard-operator-v69-live-notification-events";
 const APP_SHELL = [
   "/operator",
   "/operator.html",
-  "/operator.css?v=20260702-urgent-delivery-v8",
+  "/operator.css?v=20260702-urgent-delivery-v11",
   "/i18n.css?v=20260701-i18n-v2",
   "/i18n.js?v=20260702-yard150-v1",
-  "/operator.js?v=20260702-urgent-delivery-v8",
+  "/operator.js?v=20260702-urgent-delivery-v11",
   "/driver",
   "/driver.html",
   "/driver.css?v=20260702-camera-v3",

@@ -2246,11 +2246,22 @@ app.put("/api/dispatch/plan", async (req, res, next) => {
     const planDate = req.body?.planDate || req.body?.date || new Date().toISOString().slice(0, 10);
     let plan = req.body?.planId ? await getDispatchPlan(req.body.planId) : await getCurrentDispatchPlan({ planDate });
     if (!plan) plan = await createDispatchPlan({ planDate });
+    const previousPlan = plan;
     const savedPlan = await saveDispatchPlanSnapshot(plan.id, {
       orders: payload.orders,
       trucks: payload.trucks,
       summary: req.body?.summary || {}
     });
+    const explicitOperatorAlertRefs = Array.isArray(req.body?.audit?.details?.operatorAlertRefs)
+      ? req.body.audit.details.operatorAlertRefs.map((ref) => String(ref || "").trim()).filter(Boolean)
+      : [];
+    const changedOperatorRefs = [
+      ...new Set([...changedDispatchOperatorRefs(previousPlan || {}, savedPlan), ...explicitOperatorAlertRefs])
+    ];
+    let operatorFlags = null;
+    if (savedPlan.status === "confirmed") {
+      operatorFlags = await applyConfirmedDispatchPlanToDelivery(savedPlan, { forceOrderRefs: changedOperatorRefs });
+    }
     await fs.mkdir(dataDir, { recursive: true });
     await fs.writeFile(dispatchPlanPath, JSON.stringify(payload, null, 2));
     if (req.body?.audit) {
@@ -2264,12 +2275,13 @@ app.put("/api/dispatch/plan", async (req, res, next) => {
         details: {
           ...(req.body.audit.details || {}),
           orderCount: payload.orders.length,
-          truckCount: payload.trucks.length
+          truckCount: payload.trucks.length,
+          operatorFlags
         }
       }).catch(() => null);
     }
-    emitAppEvent("dispatch.plan.saved", { planId: savedPlan.id, planDate: savedPlan.planDate, savedAt: savedPlan.savedAt, sourceSessionId: req.body?.audit?.sessionId });
-    res.json(savedPlan);
+    emitAppEvent("dispatch.plan.saved", { planId: savedPlan.id, planDate: savedPlan.planDate, savedAt: savedPlan.savedAt, sourceSessionId: req.body?.audit?.sessionId, operatorFlags, changedOperatorRefs });
+    res.json({ ...savedPlan, operatorFlags });
   } catch (error) {
     next(error);
   }

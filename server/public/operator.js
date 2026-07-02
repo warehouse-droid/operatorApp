@@ -132,6 +132,8 @@ let historyPage = Number(initialOperatorState.historyPage || 0);
 let eventSource = null;
 let eventRefreshTimer = null;
 let pendingDeliveryEventAlertRefs = new Set();
+let deliveryNotificationState = new Map();
+let deliveryNotificationStateReady = false;
 let cameraFacingMode = localStorage.getItem(CAMERA_FACING_KEY) === "user" ? "user" : "environment";
 let lastCameraDeviceId = "";
 let pickupScannerBuffer = "";
@@ -354,6 +356,7 @@ function renderNotificationButton() {
 async function api(path, options = {}) {
   const response = await fetch(path, {
     headers: { "Content-Type": "application/json", ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}) },
+    cache: "no-store",
     ...options
   });
   if (response.status === 401) {
@@ -475,6 +478,7 @@ function connectEvents() {
     } catch {
       return;
     }
+    const payload = event.payload || {};
     if (event.type === "connected" || !operator || !locationId) return;
     const deliveryEvents = [
       "dispatch.plan.saved",
@@ -497,8 +501,8 @@ function connectEvents() {
     const needsDelivery = deliveryEvents.includes(event.type);
     const needsReceiving = receivingEvents.includes(event.type);
     if (!needsDelivery && !needsReceiving) return;
-    if (needsDelivery && Array.isArray(event.changedOperatorRefs)) {
-      event.changedOperatorRefs.forEach((ref) => {
+    if (needsDelivery && Array.isArray(payload.changedOperatorRefs)) {
+      payload.changedOperatorRefs.forEach((ref) => {
         const cleanRef = String(ref || "").trim();
         if (cleanRef) pendingDeliveryEventAlertRefs.add(cleanRef);
       });
@@ -703,6 +707,22 @@ function isRecentPlannedDeliveryNotification(item) {
   return Date.now() - plannedAt <= 30 * 60 * 1000;
 }
 
+function updateDeliveryNotificationState(items) {
+  deliveryNotificationState = new Map(items.map((item) => [deliveryNotificationBaseKey(item), deliveryNotificationKey(item)]));
+  deliveryNotificationStateReady = true;
+}
+
+function changedDeliveryNotificationItems(items) {
+  return items.filter((item) => {
+    const base = deliveryNotificationBaseKey(item);
+    const key = deliveryNotificationKey(item);
+    if (!base || base.endsWith(":") || !key || key.endsWith(":")) return false;
+    const previous = deliveryNotificationState.get(base);
+    if (!previous) return deliveryNotificationStateReady && Boolean(item?.dispatchPlanned);
+    return previous !== key;
+  });
+}
+
 function urgentDeliveryTitle(items = []) {
   if (items.length === 1) return t("operator.newUrgentDelivery", "New urgent delivery order");
   return `${items.length} ${t("operator.newUrgentDeliveries", "new urgent delivery orders")}`;
@@ -780,7 +800,18 @@ async function showBrowserDeliveryNotification(items) {
 
 function showUrgentDeliveryAlert(items) {
   if (!items.length) return;
-  urgentDeliveryAlert = { items, createdAt: Date.now() };
+  const existingItems = urgentDeliveryAlert?.items || [];
+  const merged = [...items, ...existingItems].reduce((list, item) => {
+    const key = deliveryNotificationBaseKey(item);
+    if (!key || list.some((existing) => deliveryNotificationBaseKey(existing) === key)) return list;
+    list.push(item);
+    return list;
+  }, []);
+  urgentDeliveryAlert = {
+    items: merged,
+    createdAt: urgentDeliveryAlert?.createdAt || Date.now(),
+    updatedAt: Date.now()
+  };
   playDeliveryDing();
   if (document.visibilityState !== "visible") {
     showBrowserDeliveryNotification(items).catch(() => {});
@@ -793,6 +824,9 @@ function renderUrgentDeliveryAlert() {
   if (!items.length) return "";
   const permission = "Notification" in window ? Notification.permission : "unsupported";
   const first = items[0] || {};
+  const alertTime = urgentDeliveryAlert?.updatedAt
+    ? new Date(urgentDeliveryAlert.updatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })
+    : "";
   return `
     <aside class="urgent-delivery-alert" role="status" aria-live="polite">
       <button class="urgent-delivery-main" data-action="open-urgent-delivery-alert" type="button">
@@ -804,7 +838,7 @@ function renderUrgentDeliveryAlert() {
         ${permission === "default" ? `<button class="secondary-button" data-action="enable-delivery-notifications" type="button">${t("common.enableNotifications", "Enable notifications")}</button>` : ""}
         <button class="secondary-button" data-action="dismiss-urgent-delivery-alert" type="button">${t("common.dismiss", "Dismiss")}</button>
       </div>
-      <small>${first.expectedDeliveryDate || first.dispatchPlanDate || t("common.today", "Today")}</small>
+      <small>${[first.expectedDeliveryDate || first.dispatchPlanDate || t("common.today", "Today"), alertTime].filter(Boolean).join(" | ")}</small>
     </aside>
   `;
 }
@@ -2219,7 +2253,10 @@ async function loadDeliveryNotifications(options = {}) {
     alertItems = items.filter((item) => alertRefs.has(String(item.tranid || "")) || alertRefs.has(String(item.orderId || "")));
   } else if (options.alertRecent) {
     alertItems = items.filter(isRecentPlannedDeliveryNotification);
+  } else {
+    alertItems = changedDeliveryNotificationItems(items);
   }
+  updateDeliveryNotificationState(items);
   if (alertItems.length) {
     showUrgentDeliveryAlert(alertItems);
   }
@@ -3896,6 +3933,11 @@ setInterval(() => {
       .catch((error) => showToast(error.message));
   }
 }, 60000);
+
+setInterval(() => {
+  if (!operator || !locationId) return;
+  loadDeliveryNotifications().catch(() => {});
+}, 10000);
 
 if ("serviceWorker" in navigator) {
   let serviceWorkerRefreshing = false;
