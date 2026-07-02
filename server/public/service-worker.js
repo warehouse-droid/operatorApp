@@ -1,13 +1,15 @@
-const CACHE_NAME = "mbbs-yard-operator-v37";
+const CACHE_NAME = "mbbs-yard-operator-v66-accumulated-event-alerts";
 const APP_SHELL = [
   "/operator",
   "/operator.html",
-  "/operator.css?v=20260630-pickup-no-unpack",
-  "/operator.js?v=20260630-pickup-no-unpack",
+  "/operator.css?v=20260702-urgent-delivery-v8",
+  "/i18n.css?v=20260701-i18n-v2",
+  "/i18n.js?v=20260702-yard150-v1",
+  "/operator.js?v=20260702-urgent-delivery-v8",
   "/driver",
   "/driver.html",
-  "/driver.css?v=20260627-samsara-location",
-  "/driver.js?v=20260627-samsara-location",
+  "/driver.css?v=20260702-camera-v3",
+  "/driver.js?v=20260702-camera-v3",
   "/manifest.webmanifest",
   "/driver-manifest.webmanifest",
   "/icons/mbbs-yard-192.png",
@@ -21,12 +23,47 @@ self.addEventListener("install", (event) => {
 });
 
 self.addEventListener("activate", (event) => {
-  event.waitUntil(
-    caches.keys().then((names) => Promise.all(
-      names.filter((name) => name !== CACHE_NAME).map((name) => caches.delete(name))
-    ))
-  );
-  self.clients.claim();
+  event.waitUntil((async () => {
+    const names = await caches.keys();
+    await Promise.all(names.filter((name) => name !== CACHE_NAME).map((name) => caches.delete(name)));
+    await self.clients.claim();
+    const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+    await Promise.all(windows.map((client) => {
+      const url = new URL(client.url);
+      if (!["/operator", "/driver"].includes(url.pathname)) return Promise.resolve();
+      return client.navigate(client.url).catch(() => {});
+    }));
+  })());
+});
+
+self.addEventListener("message", (event) => {
+  if (event.data?.type === "SKIP_WAITING") self.skipWaiting();
+  if (event.data?.type === "SHOW_NOTIFICATION") {
+    event.waitUntil(self.registration.showNotification(
+      event.data.title || "Delivery Prep",
+      event.data.options || {}
+    ));
+  }
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const targetUrl = event.notification.data?.url || "/operator";
+  event.waitUntil((async () => {
+    const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+    const existing = windows.find((client) => {
+      try {
+        return new URL(client.url).pathname === targetUrl;
+      } catch {
+        return false;
+      }
+    });
+    if (existing) {
+      existing.postMessage({ type: "OPEN_URGENT_DELIVERY_ALERT" });
+      return existing.focus();
+    }
+    return self.clients.openWindow(targetUrl);
+  })());
 });
 
 self.addEventListener("fetch", (event) => {

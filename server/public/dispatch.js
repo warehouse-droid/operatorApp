@@ -1,4 +1,6 @@
 const app = document.getElementById("dispatchApp");
+const t = (key, fallback) => window.MBBS_I18N?.t(key, fallback) || fallback;
+const languageToggle = () => window.MBBS_I18N?.toggleHtml() || "";
 const DISPATCH_SESSION_KEY = "mbbs.dispatch.sessionId";
 const dispatchSessionId = localStorage.getItem(DISPATCH_SESSION_KEY) || `dispatch-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 localStorage.setItem(DISPATCH_SESSION_KEY, dispatchSessionId);
@@ -7,6 +9,7 @@ const HUBS = {
   "3445": { x: 48, y: 40, lat: 43.8204306, lng: -79.3053423, address: "3445 Kennedy Road, Toronto, ON" },
   "2967": { x: 62, y: 52, lat: 43.806119, lng: -79.2986377, address: "2967 Kennedy Road, Toronto, ON" },
   "12441": { x: 40, y: 66, lat: 43.948694, lng: -79.3727582, address: "12441 Woodbine Avenue, Whitchurch-Stouffville, ON" },
+  "150": { x: 54, y: 58, address: "150 Clark Blvd, Brampton, ON L6T 4Y8, Canada" },
   "Vendor": { x: 28, y: 22, lat: 43.857, lng: -79.521 }
 };
 
@@ -22,6 +25,7 @@ function applyOwnYards(nextYards = []) {
       .map((yard) => ({
         code: String(yard.code || yard.name || "").trim(),
         name: String(yard.name || yard.code || "").trim(),
+        locationId: yard.locationId === "" || yard.locationId == null ? null : Number(yard.locationId),
         address: String(yard.address || "").trim(),
         lat: yard.lat === "" || yard.lat == null ? Number.NaN : Number(yard.lat),
         lng: yard.lng === "" || yard.lng == null ? Number.NaN : Number(yard.lng),
@@ -381,6 +385,7 @@ let historyCurrentState = "";
 let historyCurrentSnapshot = null;
 let historyReady = false;
 let isApplyingHistory = false;
+let pendingOperatorAlertRefs = new Set();
 const HISTORY_LIMIT = 80;
 const DISPATCH_PLAN_KEY = "mbbs.dispatch.plan";
 const DISPATCH_PLAN_DATE_KEY = "mbbs.dispatch.planDate";
@@ -577,7 +582,7 @@ function makeTruckFromFleet(vehicle, index, saved = {}) {
 }
 
 function orderWeightLbs(order) {
-  return Math.round(Number(order?.weight || 0) * 1000);
+  return Math.round(Number(order?.weight || 0));
 }
 
 function orderFootprintPallets(order) {
@@ -858,7 +863,7 @@ function normalizeOrder(order) {
     pallets: Number(order.pallets || 0),
     layers: Number(order.layers || 0),
     salesQty: Number(order.salesQty || 0),
-    weight: Number(order.weight || 0) || Math.max(1, Number(order.pallets || 0)),
+    weight: Number(order.weight || 0),
     pickupLocations,
     groupKey: order.groupKey || id,
     unloadMinutes: Number(order.unloadMinutes || 35),
@@ -1361,6 +1366,7 @@ async function savePlanToServer(payload) {
     if (!currentPlan?.id) {
       currentPlan = await createPlanForDate(currentPlanDate);
     }
+    const operatorAlertRefs = [...pendingOperatorAlertRefs];
     const response = await fetch(`/api/dispatch/plans/${encodeURIComponent(currentPlan.id)}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
@@ -1370,7 +1376,7 @@ async function savePlanToServer(payload) {
         audit: {
           sessionId: dispatchSessionId,
           action: "dispatch_plan_autosaved",
-          details: { planDate: currentPlanDate, status: currentPlan?.status }
+          details: { planDate: currentPlanDate, status: currentPlan?.status, operatorAlertRefs }
         }
       })
     });
@@ -1378,6 +1384,7 @@ async function savePlanToServer(payload) {
     const result = await response.json();
     currentPlan = result;
     lastServerSavedAt = result.savedAt || payload.savedAt;
+    operatorAlertRefs.forEach((ref) => pendingOperatorAlertRefs.delete(ref));
   } catch {
     // Local storage keeps the latest draft if the server is temporarily unavailable.
   }
@@ -1574,6 +1581,28 @@ function resetPlanningBoard() {
   routeEstimates = {};
 }
 
+async function resetDispatchAfterOrderDataClear() {
+  clearTimeout(saveTimer);
+  clearTimeout(remoteRefreshTimer);
+  localStorage.removeItem(DISPATCH_PLAN_KEY);
+  currentPlan = null;
+  lastSavedAt = "";
+  lastServerSavedAt = "";
+  selectedLoadId = "";
+  selectedOrderId = "";
+  selectedOrderIds = new Set();
+  activeGroupOrderId = "";
+  splitOrderId = "";
+  coEditOrderId = "";
+  poLinkOrderId = "";
+  await loadDispatchOrders();
+  await loadDriverJobStatuses();
+  resetPlanningBoard();
+  resetUndoHistory();
+  routeNotice = "Operational order data was cleared. Dispatch board reset.";
+  render({ save: false });
+}
+
 async function loadPlanForDate(planDate = currentPlanDate, { createIfMissing = true } = {}) {
   const response = await fetch(`/api/dispatch/plans/current?date=${encodeURIComponent(planDate)}`);
   if (!response.ok) throw new Error(await response.text());
@@ -1675,6 +1704,14 @@ function connectEvents() {
     if (event.type === "connected") return;
     const payload = event.payload || {};
     if (payload.sourceSessionId && payload.sourceSessionId === dispatchSessionId) return;
+
+    if ((event.type === "dispatch.orders.updated" && payload.change === "order_data_clear") || event.type === "dispatch.plan.cleared") {
+      resetDispatchAfterOrderDataClear().catch((error) => {
+        routeNotice = `Dispatch reset failed: ${error.message}`;
+        render({ save: false });
+      });
+      return;
+    }
 
     if (["dispatch.plan.saved", "dispatch.plan.confirmed", "dispatch.plan.reopened"].includes(event.type)) {
       if (payload.planDate && payload.planDate !== currentPlanDate) return;
@@ -2778,22 +2815,25 @@ function render(options = {}) {
   app.innerHTML = `
     <section class="dispatch-shell">
       <header class="dispatch-topbar">
-        <div>
-          <p>MBBS Transportation</p>
-          <h1>Dispatch Planning</h1>
+        <div class="topbar-main">
+          <div>
+            <p>${t("app.transportation", "MBBS Transportation")}</p>
+            <h1>${t("dispatch.planning", "Dispatch Planning")}</h1>
+          </div>
+          <div class="topbar-controls">
+            <input id="planDateInput" type="date" value="${escapeHtml(currentPlanDate)}" />
+            <span class="autosave-pill plan-status-pill">${escapeHtml(planBadgeText())}</span>
+          </div>
         </div>
-        <div class="topbar-controls">
-          <input id="planDateInput" type="date" value="${escapeHtml(currentPlanDate)}" />
-          <span class="autosave-pill plan-status-pill">${escapeHtml(planBadgeText())}</span>
-        </div>
+        <div class="topbar-language">${languageToggle()}</div>
         <div class="topbar-actions">
-          <button onclick="location.href='/dispatch'" type="button">Menu</button>
-          <button data-action="undo-plan" ${undoStack.length ? "" : "disabled"} title="Undo (Ctrl+Z)" type="button">Undo</button>
-          <button data-action="redo-plan" ${redoStack.length ? "" : "disabled"} title="Redo (Ctrl+Y)" type="button">Redo</button>
-          <button data-action="export-shipped-csv" ${currentPlan?.id ? "" : "disabled"} type="button">Export Shipped CSV</button>
-          <button class="primary" data-action="confirm-plan" ${currentPlan?.id ? "" : "disabled"} type="button">Confirm Plan</button>
-          <button data-action="refresh-orders" type="button">Refresh Orders</button>
-          <span class="autosave-pill">Saved ${lastSavedAt}</span>
+          <button onclick="location.href='/dispatch'" type="button">${t("common.menu", "Menu")}</button>
+          <button data-action="undo-plan" ${undoStack.length ? "" : "disabled"} title="Undo (Ctrl+Z)" type="button">${t("dispatch.undo", "Undo")}</button>
+          <button data-action="redo-plan" ${redoStack.length ? "" : "disabled"} title="Redo (Ctrl+Y)" type="button">${t("dispatch.redo", "Redo")}</button>
+          <button data-action="export-shipped-csv" ${currentPlan?.id ? "" : "disabled"} type="button">${t("dispatch.exportShippedCsv", "Export Shipped CSV")}</button>
+          <button class="primary" data-action="confirm-plan" ${currentPlan?.id ? "" : "disabled"} type="button">${t("dispatch.confirmPlan", "Confirm Plan")}</button>
+          <button data-action="refresh-orders" type="button">${t("dispatch.refreshOrders", "Refresh Orders")}</button>
+          <span class="autosave-pill">${t("dispatch.saved", "Saved")} ${lastSavedAt}</span>
         </div>
       </header>
       ${routeNotice ? `<div class="route-notice"><span>${escapeHtml(routeNotice)}</span><button data-action="close-route-notice" type="button">x</button></div>` : ""}
@@ -2801,11 +2841,11 @@ function render(options = {}) {
         ${renderOrderPool()}
         <section class="planner-panel">
           <div class="kpi-strip">
-            <div class="kpi"><span>Open Orders</span><strong>${stats.open}</strong></div>
-            <div class="kpi"><span>Planned Drops</span><strong>${stats.planned}</strong></div>
-            <div class="kpi"><span>Total Stops</span><strong>${stats.stops}</strong></div>
-            <div class="kpi"><span>Warnings</span><strong>${stats.warnings}</strong></div>
-            <div class="kpi"><span>Trucks</span><strong>${trucks.length}</strong></div>
+            <div class="kpi"><span>${t("dispatch.openOrders", "Open Orders")}</span><strong>${stats.open}</strong></div>
+            <div class="kpi"><span>${t("dispatch.plannedDrops", "Planned Drops")}</span><strong>${stats.planned}</strong></div>
+            <div class="kpi"><span>${t("dispatch.totalStops", "Total Stops")}</span><strong>${stats.stops}</strong></div>
+            <div class="kpi"><span>${t("dispatch.warnings", "Warnings")}</span><strong>${stats.warnings}</strong></div>
+            <div class="kpi"><span>${t("dispatch.trucks", "Trucks")}</span><strong>${trucks.length}</strong></div>
           </div>
           <div class="truck-board">
             ${trucks.map(renderTruck).join("")}
@@ -2829,7 +2869,7 @@ function renderOrderPool() {
     <section class="panel">
       <div class="panel-header">
         <div>
-          <h2>Order Pool</h2>
+          <h2>${t("dispatch.orderPool", "Order Pool")}</h2>
           <p>${searching ? "Search results across SO, PO, TO, and CO." : `${orderTypeLabel(activeOrderType)} list`}</p>
         </div>
         <div class="order-tools">
@@ -3688,6 +3728,7 @@ function addOrderToLoad(orderId, loadId, type = "drop", location = "", insertInd
   if (type === "drop") {
     const addedPickups = ensurePickupStops(load, order, cleanInsertIndex);
     if (Number.isInteger(cleanInsertIndex)) cleanInsertIndex += addedPickups;
+    if (["SO", "TO"].includes(order.type)) pendingOperatorAlertRefs.add(order.id);
   }
   const stopLocation = location || order.pickupLocations[0] || "3445";
   const existing = pullExistingStop(orderId, type, stopLocation);
@@ -5207,6 +5248,10 @@ async function initDispatch() {
   connectEvents();
   setInterval(pollServerPlan, 5000);
 }
+
+window.addEventListener("mbbs-language-changed", () => {
+  render({ save: false });
+});
 
 requireDispatchLogin({
   mount: app,

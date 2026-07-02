@@ -1,7 +1,8 @@
 const LOCATIONS = [
   { id: 1, text: "3445" },
   { id: 13, text: "2967" },
-  { id: 15, text: "12441" }
+  { id: 15, text: "12441" },
+  { id: 26, text: "150" }
 ];
 
 const ORDER_PAGE_SIZE = 4;
@@ -11,9 +12,12 @@ const PICKABLE_ITEM_TYPES = new Set(["InvtPart", "NonInvtPart"]);
 
 const app = document.getElementById("app");
 const toast = document.getElementById("toast");
+const t = (key, fallback) => window.MBBS_I18N?.t(key, fallback) || fallback;
+const languageToggle = () => window.MBBS_I18N?.toggleHtml() || "";
 
 const TOKEN_KEY = "mbbs.operator.token";
 const STATE_KEY = "mbbs.operator.state";
+const CAMERA_FACING_KEY = "mbbs.camera.facingMode";
 const RESTORABLE_MODULES = new Set([
   "menu",
   "delivery-select",
@@ -48,9 +52,13 @@ let operator = null;
 
 let locationId = Number(initialOperatorState.locationId || localStorage.getItem("mbbs.operator.locationId") || localStorage.getItem("mbbs.delivery.locationId") || 0);
 let currentModule = restorableModule(initialOperatorState.currentModule || "menu");
+let locationDropdownOpen = false;
 let viewMode = initialOperatorState.viewMode === "packed" ? "packed" : "active";
 let deliveryOrderType = initialOperatorState.deliveryOrderType || localStorage.getItem("mbbs.operator.deliveryOrderType") || "sales_order";
+let deliveryBatchFilter = initialOperatorState.deliveryBatchFilter || localStorage.getItem("mbbs.operator.deliveryBatchFilter") || "batch_a";
 let orders = [];
+let deliveryNotifications = { total: 0, salesOrder: { dueToday: 0 }, transferOrder: { dueToday: 0 }, items: [] };
+let urgentDeliveryAlert = null;
 let operatorRequests = [];
 let selectedId = initialOperatorState.selectedId || null;
 let selectedOrder = null;
@@ -123,6 +131,118 @@ let historyReportReason = "";
 let historyPage = Number(initialOperatorState.historyPage || 0);
 let eventSource = null;
 let eventRefreshTimer = null;
+let pendingDeliveryEventAlertRefs = new Set();
+let cameraFacingMode = localStorage.getItem(CAMERA_FACING_KEY) === "user" ? "user" : "environment";
+let lastCameraDeviceId = "";
+let pickupScannerBuffer = "";
+let pickupScannerLastKeyAt = 0;
+let pickupFocusTimer = null;
+
+function cameraFacingLabel() {
+  return cameraFacingMode === "user"
+    ? t("common.frontCamera", "Front")
+    : t("common.backCamera", "Back");
+}
+
+function cameraCaptureMode() {
+  return cameraFacingMode === "user" ? "user" : "environment";
+}
+
+function cameraMediaConstraints() {
+  return {
+    video: { facingMode: { ideal: cameraCaptureMode() } },
+    audio: false
+  };
+}
+
+function cameraLabelMatchesFacing(device, facingMode) {
+  const label = String(device?.label || "").toLowerCase();
+  if (!label) return false;
+  if (facingMode === "user") return /front|user|face|selfie|前|前置/.test(label);
+  return /back|rear|environment|world|外|后|後|背/.test(label);
+}
+
+async function listVideoInputDevices() {
+  if (!navigator.mediaDevices?.enumerateDevices) return [];
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  return devices.filter((device) => device.kind === "videoinput");
+}
+
+function pickCameraDevice(devices, facingMode, currentDeviceId = "") {
+  const candidates = (devices || []).filter((device) => device.deviceId || device.id);
+  if (!candidates.length) return "";
+  const idOf = (device) => device.deviceId || device.id || "";
+  const preferred = candidates.find((device) => cameraLabelMatchesFacing(device, facingMode) && idOf(device) !== currentDeviceId);
+  if (preferred) return idOf(preferred);
+  const anyFacing = candidates.find((device) => cameraLabelMatchesFacing(device, facingMode));
+  if (anyFacing) return idOf(anyFacing);
+  const other = currentDeviceId ? candidates.find((device) => idOf(device) !== currentDeviceId) : null;
+  if (other) return idOf(other);
+  return idOf(candidates[0]);
+}
+
+function rememberCameraStream(stream) {
+  const track = stream?.getVideoTracks?.()[0];
+  const deviceId = track?.getSettings?.().deviceId;
+  if (deviceId) lastCameraDeviceId = deviceId;
+}
+
+async function openCameraStream() {
+  const facing = cameraCaptureMode();
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { exact: facing } },
+      audio: false
+    });
+    rememberCameraStream(stream);
+    return stream;
+  } catch {
+    // Some browsers reject exact facingMode even when the camera exists.
+  }
+  const deviceId = pickCameraDevice(await listVideoInputDevices(), facing, lastCameraDeviceId);
+  if (deviceId) {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { deviceId: { exact: deviceId } },
+        audio: false
+      });
+      rememberCameraStream(stream);
+      return stream;
+    } catch {
+      // Fall through to facingMode / generic camera fallback.
+    }
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia(cameraMediaConstraints());
+    rememberCameraStream(stream);
+    return stream;
+  } catch (error) {
+    if (error?.name === "NotFoundError" || error?.name === "OverconstrainedError") {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      rememberCameraStream(stream);
+      return stream;
+    }
+    throw error;
+  }
+}
+
+async function preferredQrScannerCamera(QrScanner) {
+  try {
+    const cameras = await QrScanner.listCameras(true);
+    return pickCameraDevice(cameras, cameraCaptureMode(), lastCameraDeviceId) || cameraCaptureMode();
+  } catch {
+    return cameraCaptureMode();
+  }
+}
+
+function switchCameraFacing() {
+  cameraFacingMode = cameraFacingMode === "environment" ? "user" : "environment";
+  localStorage.setItem(CAMERA_FACING_KEY, cameraFacingMode);
+}
+
+function renderCameraSwitchButton(action) {
+  return `<button class="secondary-button compact-camera-button" data-action="${action}" type="button">${t("common.switchCamera", "Switch camera")} (${cameraFacingLabel()})</button>`;
+}
 
 function showToast(message) {
   toast.textContent = message;
@@ -131,15 +251,104 @@ function showToast(message) {
   showToast.timer = window.setTimeout(() => toast.classList.remove("show"), 1800);
 }
 
+function customerPickupScanActive() {
+  return currentModule === "customer-pickup-scan" && Boolean(authToken);
+}
+
+function focusCustomerPickupScanInput({ select = false } = {}) {
+  if (!customerPickupScanActive()) return;
+  const input = document.getElementById("customerPickupScan");
+  if (!input) return;
+  input.focus({ preventScroll: true });
+  if (select) input.select();
+}
+
+function scheduleCustomerPickupFocus() {
+  window.clearInterval(pickupFocusTimer);
+  pickupFocusTimer = null;
+  if (!customerPickupScanActive()) return;
+  focusCustomerPickupScanInput();
+  pickupFocusTimer = window.setInterval(() => {
+    if (!customerPickupScanActive()) {
+      window.clearInterval(pickupFocusTimer);
+      pickupFocusTimer = null;
+      return;
+    }
+    const active = document.activeElement;
+    const canRefocus = !active
+      || active === document.body
+      || active.id === "customerPickupScan"
+      || active.closest?.(".customer-pickup-scan-card");
+    if (canRefocus) focusCustomerPickupScanInput();
+  }, 1200);
+}
+
+async function submitCustomerPickupScanValue(value) {
+  const code = String(value || "").trim();
+  if (!code) return;
+  customerPickupScan = code;
+  const input = document.getElementById("customerPickupScan");
+  if (input) input.value = code;
+  await lookupCustomerPickup();
+}
+
+async function handleCustomerPickupScannerKey(event) {
+  if (!customerPickupScanActive() || event.defaultPrevented) return false;
+  if (event.ctrlKey || event.altKey || event.metaKey) return false;
+  const target = event.target;
+  const targetIsScanInput = target?.id === "customerPickupScan";
+  if (targetIsScanInput) return false;
+  if (target?.closest?.("input, textarea, select, [contenteditable='true']")) return false;
+
+  const now = Date.now();
+  if (now - pickupScannerLastKeyAt > 120) pickupScannerBuffer = "";
+  pickupScannerLastKeyAt = now;
+
+  if (event.key === "Enter" || event.key === "Tab") {
+    const code = pickupScannerBuffer.trim();
+    pickupScannerBuffer = "";
+    if (!code) return false;
+    event.preventDefault();
+    await submitCustomerPickupScanValue(code);
+    return true;
+  }
+
+  if (event.key === "Backspace") {
+    pickupScannerBuffer = pickupScannerBuffer.slice(0, -1);
+    event.preventDefault();
+    return true;
+  }
+
+  if (event.key?.length === 1) {
+    pickupScannerBuffer += event.key;
+    event.preventDefault();
+    return true;
+  }
+
+  return false;
+}
+
 function installLabel() {
-  if (appInstalled) return "App mode";
+  if (appInstalled) return t("operator.appMode", "App mode");
   if (installPromptEvent) return "Install app";
   return "Use browser install";
 }
 
 function renderInstallButton() {
-  if (appInstalled) return `<span class="install-status">App mode</span>`;
+  if (appInstalled) return `<span class="install-status">${t("operator.appMode", "App mode")}</span>`;
   return `<button class="secondary-button install-button" data-action="install-app" type="button">${installLabel()}</button>`;
+}
+
+function notificationPermissionState() {
+  if (!("Notification" in window)) return "unsupported";
+  return Notification.permission || "default";
+}
+
+function renderNotificationButton() {
+  const permission = notificationPermissionState();
+  if (permission === "granted") return "";
+  if (permission === "denied") return `<span class="install-status warning">${t("operator.notificationsBlocked", "Notifications blocked")}</span>`;
+  return `<button class="secondary-button notification-button" data-action="enable-delivery-notifications" type="button">${t("common.enableNotifications", "Enable notifications")}</button>`;
 }
 
 async function api(path, options = {}) {
@@ -171,6 +380,82 @@ async function api(path, options = {}) {
   return response.json();
 }
 
+function dataUrlToFile(dataUrl, filename = "photo.jpg") {
+  const [header, body] = String(dataUrl || "").split(",");
+  const mime = header.match(/data:([^;]+)/)?.[1] || "image/jpeg";
+  const binary = atob(body || "");
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return new File([bytes], filename, { type: mime });
+}
+
+function photoSrc(value) {
+  const text = String(value || "");
+  if (!text.startsWith("r2://")) return text;
+  return `/api/photo-upload/preview?ref=${encodeURIComponent(text)}&token=${encodeURIComponent(authToken || "")}`;
+}
+
+function photoImgSrc(value) {
+  return escapeHtml(photoSrc(value));
+}
+
+function openPhotoLightbox(photoRef, label = "Photo preview") {
+  const ref = String(photoRef || "");
+  if (!ref) return;
+  const existing = document.querySelector(".photo-lightbox");
+  if (existing) existing.remove();
+  const modal = document.createElement("div");
+  modal.className = "photo-lightbox";
+  modal.innerHTML = `
+    <div class="photo-lightbox-panel" role="dialog" aria-modal="true" aria-label="${escapeHtml(label)}">
+      <button class="photo-lightbox-close" type="button">×</button>
+      <img src="${photoImgSrc(ref)}" alt="${escapeHtml(label)}" />
+    </div>
+  `;
+  modal.addEventListener("click", (event) => {
+    if (event.target === modal || event.target.closest(".photo-lightbox-close")) modal.remove();
+  });
+  document.body.appendChild(modal);
+}
+
+async function uploadOperatorPhoto(photo, context = {}) {
+  if (!photo || String(photo).startsWith("r2://")) return photo;
+  if (!String(photo).startsWith("data:image/")) return photo;
+  const ticket = await api("/api/operator/photo-upload-token", {
+    method: "POST",
+    body: JSON.stringify(context)
+  });
+  const file = dataUrlToFile(photo, context.filename || `${context.recordType || "operator-photo"}.jpg`);
+  const formData = new FormData();
+  formData.append("file", file);
+  const response = await fetch(ticket.uploadUrl, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${ticket.token}` },
+    body: formData
+  });
+  const text = await response.text();
+  let payload = null;
+  try {
+    payload = text ? JSON.parse(text) : null;
+  } catch {
+    payload = null;
+  }
+  if (!response.ok) throw new Error(payload?.error || text || "Photo upload failed.");
+  if (!payload?.key) throw new Error("Photo upload did not return an R2 key.");
+  return `r2://${payload.key}`;
+}
+
+async function uploadOperatorPhotos(photos, context = {}) {
+  const uploaded = [];
+  for (let index = 0; index < photos.length; index += 1) {
+    uploaded.push(await uploadOperatorPhoto(photos[index], {
+      ...context,
+      filename: `${context.recordType || "operator-photo"}-${index + 1}.jpg`
+    }));
+  }
+  return uploaded;
+}
+
 async function publicApi(path, options = {}) {
   const response = await fetch(path, {
     headers: { "Content-Type": "application/json" },
@@ -192,6 +477,7 @@ function connectEvents() {
     }
     if (event.type === "connected" || !operator || !locationId) return;
     const deliveryEvents = [
+      "dispatch.plan.saved",
       "dispatch.plan.confirmed",
       "dispatch.operator_request.created",
       "delivery.order.updated",
@@ -211,10 +497,25 @@ function connectEvents() {
     const needsDelivery = deliveryEvents.includes(event.type);
     const needsReceiving = receivingEvents.includes(event.type);
     if (!needsDelivery && !needsReceiving) return;
+    if (needsDelivery && Array.isArray(event.changedOperatorRefs)) {
+      event.changedOperatorRefs.forEach((ref) => {
+        const cleanRef = String(ref || "").trim();
+        if (cleanRef) pendingDeliveryEventAlertRefs.add(cleanRef);
+      });
+    }
     window.clearTimeout(eventRefreshTimer);
     eventRefreshTimer = window.setTimeout(async () => {
       try {
+        const alertRefs = [...pendingDeliveryEventAlertRefs];
+        pendingDeliveryEventAlertRefs.clear();
+        if (needsDelivery) await loadDeliveryNotifications({
+          alertRefs
+        });
         if (needsDelivery && currentModule === "delivery-select" && !fulfillmentSubmitting) {
+          render();
+          return;
+        }
+        if (needsDelivery && currentModule === "delivery" && !fulfillmentSubmitting) {
           await loadOrders({ keepSelection: true });
           showToast("Orders updated");
           return;
@@ -228,6 +529,8 @@ function connectEvents() {
         }
         if (event.type === "dispatch.operator_request.created") {
           showToast("Dispatch request received");
+        } else if (needsDelivery && currentModule === "menu") {
+          render();
         }
       } catch (error) {
         showToast(error.message);
@@ -273,7 +576,6 @@ function orderUnderpackCount(order) {
 function orderStatusText(order) {
   if (orderWarningCount(order)) return "Warning";
   if (orderUnderpackCount(order)) return "Underpack";
-  if (order?.operator_status === "partial_loaded" || order?.local_yard_order_status === "Partial Loaded") return "Underpack";
   if (order?.local_yard_order_status === "Loaded") return "Loaded";
   return statusText(order?.operator_status);
 }
@@ -281,14 +583,230 @@ function orderStatusText(order) {
 function orderStatusClass(order) {
   if (orderWarningCount(order)) return "warning";
   if (orderUnderpackCount(order)) return "underpack";
-  if (order?.operator_status === "partial_loaded" || order?.local_yard_order_status === "Partial Loaded") return "underpack";
   if (order?.local_yard_order_status === "Loaded") return "loaded";
   return order?.operator_status || "open";
 }
 
 function formatDate(value) {
   if (!value) return "";
+  if (typeof value === "string") {
+    const match = value.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (match) return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3])).toLocaleDateString();
+  }
   return new Date(value).toLocaleDateString();
+}
+
+function localDateKey(value) {
+  if (!value) return "";
+  if (typeof value === "string") {
+    const match = value.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (match) return `${match[1]}-${match[2]}-${match[3]}`;
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function addDaysKey(days) {
+  const date = new Date();
+  date.setHours(0, 0, 0, 0);
+  date.setDate(date.getDate() + days);
+  return localDateKey(date);
+}
+
+function timeToMinutes(value) {
+  const text = String(value || "").replace(/[^0-9]/g, "");
+  if (!text) return null;
+  const padded = text.length <= 2 ? `${text}00` : text.padStart(4, "0").slice(0, 4);
+  const hours = Number(padded.slice(0, 2));
+  const minutes = Number(padded.slice(2, 4));
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes) || hours > 23 || minutes > 59) return null;
+  return (hours * 60) + minutes;
+}
+
+function beforeNoonWindow(order) {
+  const start = timeToMinutes(order?.dispatch_window_start);
+  const end = timeToMinutes(order?.dispatch_window_end);
+  if (end !== null) return end <= 12 * 60;
+  if (start !== null) return start < 12 * 60;
+  return false;
+}
+
+function hasDeliveryWindow(order) {
+  return timeToMinutes(order?.dispatch_window_start) !== null || timeToMinutes(order?.dispatch_window_end) !== null;
+}
+
+function isTomorrowNoWindow(order) {
+  return localDateKey(order?.expected_delivery_date) === addDaysKey(1) && !hasDeliveryWindow(order);
+}
+
+function isBatchAOrder(order) {
+  if (order?.dispatch_planned) return false;
+  const expected = localDateKey(order?.expected_delivery_date);
+  if (!expected) return false;
+  const today = addDaysKey(0);
+  const tomorrow = addDaysKey(1);
+  return expected <= today || (expected === tomorrow && (beforeNoonWindow(order) || !hasDeliveryWindow(order)));
+}
+
+function orderMatchesDeliveryBatch(order, filter = deliveryBatchFilter) {
+  if (deliveryOrderType !== "sales_order" || viewMode !== "active") return true;
+  if (filter === "planned") return Boolean(order?.dispatch_planned);
+  if (filter === "batch_b") return !order?.dispatch_planned && !isBatchAOrder(order);
+  return isBatchAOrder(order);
+}
+
+function filteredDeliveryOrders() {
+  const filtered = orders.filter((order) => orderMatchesDeliveryBatch(order));
+  if (deliveryOrderType === "sales_order" && viewMode === "active" && deliveryBatchFilter === "batch_a") {
+    filtered.sort((a, b) => Number(isTomorrowNoWindow(a)) - Number(isTomorrowNoWindow(b)));
+  }
+  const lockedId = preparingOrderId();
+  if (lockedId && !filtered.some((order) => String(order.netsuite_id) === String(lockedId))) {
+    const lockedOrder = orders.find((order) => String(order.netsuite_id) === String(lockedId));
+    if (lockedOrder) return [lockedOrder, ...filtered];
+  }
+  return filtered;
+}
+
+function deliveryBatchCounts() {
+  return {
+    planned: orders.filter((order) => orderMatchesDeliveryBatch(order, "planned")).length,
+    batch_a: orders.filter((order) => orderMatchesDeliveryBatch(order, "batch_a")).length,
+    batch_b: orders.filter((order) => orderMatchesDeliveryBatch(order, "batch_b")).length
+  };
+}
+
+function deliveryNotificationItems() {
+  return Array.isArray(deliveryNotifications?.items) ? deliveryNotifications.items : [];
+}
+
+function deliveryNotificationBaseKey(item) {
+  return `${item?.type || "order"}:${item?.orderId || item?.tranid || ""}`;
+}
+
+function deliveryNotificationKey(item) {
+  const base = deliveryNotificationBaseKey(item);
+  const reason = item?.dispatchPlanned
+    ? `planned:${item?.dispatchPlanDate || ""}:${item?.dispatchPlannedAt || ""}:${item?.truck || ""}:${item?.load || ""}:${item?.parkingSpot || ""}`
+    : `due:${item?.expectedDeliveryDate || item?.dispatchPlanDate || ""}`;
+  return `${base}:${reason}`;
+}
+
+function isRecentPlannedDeliveryNotification(item) {
+  if (!item?.dispatchPlanned || !item?.dispatchPlannedAt) return false;
+  const plannedAt = new Date(item.dispatchPlannedAt).getTime();
+  if (!Number.isFinite(plannedAt)) return false;
+  return Date.now() - plannedAt <= 30 * 60 * 1000;
+}
+
+function urgentDeliveryTitle(items = []) {
+  if (items.length === 1) return t("operator.newUrgentDelivery", "New urgent delivery order");
+  return `${items.length} ${t("operator.newUrgentDeliveries", "new urgent delivery orders")}`;
+}
+
+function urgentDeliveryBody(items = []) {
+  const first = items[0] || {};
+  const orderType = first.type === "transfer_order" ? t("operator.transferOrder", "Transfer Order") : t("operator.salesOrder", "Sales Order");
+  const parts = [first.tranid, orderType, first.parkingSpot ? `${t("operator.parkingSpot", "Parking spot")} ${first.parkingSpot}` : ""].filter(Boolean);
+  return parts.join(" | ");
+}
+
+function playDeliveryDing() {
+  try {
+    const AudioContext = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContext) return;
+    const context = new AudioContext();
+    context.resume?.().catch(() => {});
+    const master = context.createGain();
+    master.gain.setValueAtTime(1, context.currentTime);
+    master.connect(context.destination);
+
+    const bell = (start, frequency, duration) => {
+      const oscillator = context.createOscillator();
+      const gain = context.createGain();
+      oscillator.type = "triangle";
+      oscillator.frequency.setValueAtTime(frequency, context.currentTime + start);
+      oscillator.frequency.exponentialRampToValueAtTime(frequency * 1.18, context.currentTime + start + 0.08);
+      gain.gain.setValueAtTime(0.0001, context.currentTime + start);
+      gain.gain.exponentialRampToValueAtTime(1, context.currentTime + start + 0.018);
+      gain.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + start + duration);
+      oscillator.connect(gain);
+      gain.connect(master);
+      oscillator.start(context.currentTime + start);
+      oscillator.stop(context.currentTime + start + duration + 0.03);
+    };
+
+    bell(0, 1046.5, 0.34);
+    bell(0.18, 1568, 0.52);
+    bell(0.28, 2093, 0.36);
+    window.setTimeout(() => context.close().catch(() => {}), 1100);
+  } catch {
+    // Browser audio can be blocked until the operator has interacted with the app.
+  }
+}
+
+async function showBrowserDeliveryNotification(items) {
+  if (!("Notification" in window) || !items.length) return;
+  if (Notification.permission !== "granted") return;
+  const title = urgentDeliveryTitle(items);
+  const noticeTag = deliveryNotificationKey(items[0] || {}).replace(/[^a-zA-Z0-9_-]+/g, "-").slice(0, 120);
+  const options = {
+    body: urgentDeliveryBody(items),
+    tag: `delivery-prep-${locationId || "yard"}-${noticeTag || Date.now()}`,
+    renotify: true,
+    icon: "/icons/mbbs-yard-192.png",
+    badge: "/icons/mbbs-yard-192.png",
+    silent: true,
+    requireInteraction: true,
+    timestamp: Date.now(),
+    data: { url: "/operator", notice: "delivery-prep" }
+  };
+  const registration = await navigator.serviceWorker?.ready?.catch(() => null);
+  if (registration?.showNotification) {
+    await registration.showNotification(title, options).catch(() => {});
+    return;
+  }
+  const notification = new Notification(title, options);
+  notification.onclick = () => {
+    window.focus();
+    openUrgentDeliveryAlert();
+    notification.close();
+  };
+}
+
+function showUrgentDeliveryAlert(items) {
+  if (!items.length) return;
+  urgentDeliveryAlert = { items, createdAt: Date.now() };
+  playDeliveryDing();
+  if (document.visibilityState !== "visible") {
+    showBrowserDeliveryNotification(items).catch(() => {});
+  }
+  render();
+}
+
+function renderUrgentDeliveryAlert() {
+  const items = urgentDeliveryAlert?.items || [];
+  if (!items.length) return "";
+  const permission = "Notification" in window ? Notification.permission : "unsupported";
+  const first = items[0] || {};
+  return `
+    <aside class="urgent-delivery-alert" role="status" aria-live="polite">
+      <button class="urgent-delivery-main" data-action="open-urgent-delivery-alert" type="button">
+        <b>${urgentDeliveryTitle(items)}</b>
+        <span>${escapeHtml(urgentDeliveryBody(items))}</span>
+        ${items.length > 1 ? `<em>${escapeHtml(items.slice(0, 3).map((item) => item.tranid).filter(Boolean).join(" / "))}</em>` : ""}
+      </button>
+      <div>
+        ${permission === "default" ? `<button class="secondary-button" data-action="enable-delivery-notifications" type="button">${t("common.enableNotifications", "Enable notifications")}</button>` : ""}
+        <button class="secondary-button" data-action="dismiss-urgent-delivery-alert" type="button">${t("common.dismiss", "Dismiss")}</button>
+      </div>
+      <small>${first.expectedDeliveryDate || first.dispatchPlanDate || t("common.today", "Today")}</small>
+    </aside>
+  `;
 }
 
 function escapeHtml(value) {
@@ -298,6 +816,33 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
+}
+
+function compactTime(value) {
+  const minutes = timeToMinutes(value);
+  if (minutes === null) return "";
+  const hours = String(Math.floor(minutes / 60)).padStart(2, "0");
+  const mins = String(minutes % 60).padStart(2, "0");
+  return `${hours}${mins}`;
+}
+
+function deliveryWindowText(order) {
+  const start = compactTime(order?.dispatch_window_start);
+  const end = compactTime(order?.dispatch_window_end);
+  if (start && end) return `${start}-${end}`;
+  if (start) return `After ${start}`;
+  if (end) return `Before ${end}`;
+  return "All day";
+}
+
+function deliveryScheduleText(order) {
+  const expected = order?.expected_delivery_date;
+  if (!expected) return "No delivery date";
+  return `Delivery ${formatDate(expected)} | ${deliveryWindowText(order)}`;
+}
+
+function shouldShowDeliverySchedule() {
+  return currentModule === "delivery" && deliveryOrderType === "sales_order";
 }
 
 function qty(value) {
@@ -453,6 +998,7 @@ function visibleLines(order) {
     if (line.sync_exception && hasPackedQty(line)) return viewMode === "packed";
     if (!isPickableLine(line)) return false;
     if (isCustomerPickupMode()) return hasPackedQty(line) || hasRemainingQty(line);
+    if (viewMode !== "packed" && orderLocksCurrentOperator(order)) return hasPackedQty(line) || hasRemainingQty(line);
     return viewMode === "packed" ? hasPackedQty(line) : hasRemainingQty(line);
   });
 }
@@ -508,6 +1054,14 @@ function hasPackedQty(line) {
     || qty(line.packed_piece_qty) > 0;
 }
 
+function hasDraftPackedQty(order) {
+  return (order?.lines || []).some((line) => isPickableLine(line) && hasPackedQty(line));
+}
+
+function canMarkPacked(order = selectedOrder) {
+  return hasDraftPackedQty(order);
+}
+
 function hasRemainingQty(line) {
   if (shouldUseSalesQuantity(line)) return remainingValue(line, "sales") > 0;
   return remainingValue(line, "pallets") > 0
@@ -552,13 +1106,23 @@ function remainingValue(line, unit) {
   return Math.max(0, requiredValue(line, unit) - loaded - packedValue(line, unit));
 }
 
+function isActiveDraftPackedLine(line, order = selectedOrder) {
+  return currentModule === "delivery" && viewMode !== "packed" && orderLocksCurrentOperator(order) && hasPackedQty(line);
+}
+
+function activeDraftLimit(line, unit) {
+  return Math.max(0, requiredValue(line, unit) - loadedValue(line, unit));
+}
+
 function panelValue(line, unit) {
+  if (isActiveDraftPackedLine(line)) return packedValue(line, unit);
   return viewMode === "packed" ? packedValue(line, unit) : remainingValue(line, unit);
 }
 
 function panelLimit(line, unit) {
   if (currentModule === "receiving") return receivingRemainingValue(line, unit);
   if (isCustomerPickupMode()) return Math.max(0, requiredValue(line, unit) - pickupLoadedValue(line, unit));
+  if (isActiveDraftPackedLine(line)) return activeDraftLimit(line, unit);
   return viewMode === "packed" ? requiredValue(line, unit) : remainingValue(line, unit);
 }
 
@@ -598,12 +1162,21 @@ function receivingLineUnits(line) {
   return units;
 }
 
-function currentOrderBlocksMove() {
-  return viewMode === "active" && orders.some((order) => order.operator_status === "preparing" && order.preparing_operator_id === operator?.id);
+function orderLocksCurrentOperator(order) {
+  if (!order) return false;
+  const ownedByCurrentOperator = order.preparing_operator_id && String(order.preparing_operator_id) === String(operator?.id);
+  if (hasDraftPackedQty(order)) return Boolean(ownedByCurrentOperator);
+  return order.operator_status === "preparing" && Boolean(ownedByCurrentOperator);
 }
 
 function preparingOrderId() {
-  return orders.find((order) => order.operator_status === "preparing" && order.preparing_operator_id === operator?.id)?.netsuite_id || null;
+  if (viewMode !== "active") return null;
+  if (orderLocksCurrentOperator(selectedOrder)) return selectedOrder.netsuite_id || null;
+  return orders.find((order) => orderLocksCurrentOperator(order))?.netsuite_id || null;
+}
+
+function currentOrderBlocksMove() {
+  return Boolean(preparingOrderId());
 }
 
 function pageCount(items, size) {
@@ -623,14 +1196,25 @@ function locationOptions() {
 function shell(title, subtitle, body, actions = "") {
   app.innerHTML = `
     <header class="topbar">
-      <button class="secondary-button" data-action="change-location" type="button">${currentLocation()?.text || "Location"}</button>
+      <div class="topbar-location">
+        <button class="secondary-button location-button" data-action="toggle-location-dropdown" type="button">${t("common.location", "Location")} ${currentLocation()?.text || locationId || ""}</button>
+        ${locationDropdownOpen ? `
+          <div class="location-dropdown">
+            ${LOCATIONS.map((location) => `
+              <button class="${Number(location.id) === Number(locationId) ? "active" : ""}" data-action="set-location-dropdown" data-location-id="${location.id}" type="button">${location.text}</button>
+            `).join("")}
+          </div>
+        ` : ""}
+      </div>
       <div class="topbar-title">
-        <p>MBBS Yard Operator Application</p>
+        <p>${t("app.operator", "MBBS Yard Operator Application")}</p>
         <h1>${title}</h1>
         <span>${subtitle}</span>
       </div>
-      <div class="topbar-actions">${actions}</div>
+      <div class="topbar-language">${languageToggle()}</div>
+      <div class="topbar-actions">${operator ? renderNotificationButton() : ""}${actions}</div>
     </header>
+    ${renderUrgentDeliveryAlert()}
     ${body}
   `;
 }
@@ -639,22 +1223,22 @@ function renderLogin(message = "") {
   app.innerHTML = `
     <section class="location-screen">
       <form class="location-panel login-panel" data-form="login">
-        <p>MBBS Yard Operator Application</p>
-        <h1>Operator login</h1>
+        <p>${t("app.operator", "MBBS Yard Operator Application")}</p>
+        <h1>${t("operator.loginTitle", "Operator login")}</h1>
         ${message ? `<div class="login-message">${message}</div>` : ""}
         <div class="install-hint">
           <strong>${installLabel()}</strong>
           <span>${installPromptEvent ? "Tap Install app to open as a standalone tablet app." : "If this still opens like a browser, use Chrome or Edge on Android/Windows and install from a trusted HTTPS URL."}</span>
         </div>
         <label>
-          <span>Username</span>
+          <span>${t("common.username", "Username")}</span>
           <input id="loginUsername" autocomplete="username" required />
         </label>
         <label>
-          <span>Password</span>
+          <span>${t("common.password", "Password")}</span>
           <input id="loginPassword" type="password" autocomplete="current-password" required />
         </label>
-        <button class="primary-button" type="submit">Login</button>
+        <button class="primary-button" type="submit">${t("common.login", "Login")}</button>
       </form>
     </section>
   `;
@@ -668,6 +1252,7 @@ function saveOperatorState() {
     currentModule: module,
     viewMode,
     deliveryOrderType,
+    deliveryBatchFilter,
     selectedId,
     selectedLineId,
     orderPage,
@@ -698,6 +1283,7 @@ function saveOperatorState() {
 async function restoreOperatorView() {
   if (!operator) return renderLogin();
   if (!locationId) return renderLocationSelect();
+  await loadDeliveryNotifications({ alertRecent: true });
   currentModule = restorableModule(currentModule);
   try {
     if (currentModule === "delivery") {
@@ -746,13 +1332,13 @@ function renderLocationSelect() {
   app.innerHTML = `
     <section class="location-screen">
       <div class="location-panel">
-        <p>MBBS Yard Operator Application</p>
-        <h1>Select working location</h1>
+        <p>${t("app.operator", "MBBS Yard Operator Application")}</p>
+        <h1>${t("operator.selectLocation", "Select working location")}</h1>
         <label>
-          <span>Location</span>
+          <span>${t("common.location", "Location")}</span>
           <select id="locationSelect">${locationOptions()}</select>
         </label>
-        <button class="primary-button" data-action="save-location" type="button">Continue</button>
+        <button class="primary-button" data-action="save-location" type="button">${t("common.continue", "Continue")}</button>
       </div>
     </section>
   `;
@@ -774,14 +1360,14 @@ function render() {
   if (currentModule === "delivery-fulfill") return renderFulfillmentScreen();
   if (currentModule === "customer-pickup-load") return renderFulfillmentScreen();
 
-  const title = viewMode === "packed" ? "Packed Orders" : "Delivery Prep";
-  const subtitle = `${deliveryOrderType === "transfer_order" ? "Transfer Order" : "Sales Order"} | Location ${currentLocation()?.text || locationId}`;
+  const title = viewMode === "packed" ? t("operator.packedOrders", "Packed Orders") : t("operator.deliveryPrep", "Delivery Prep");
+  const subtitle = `${deliveryOrderType === "transfer_order" ? t("operator.transferOrder", "Transfer Order") : t("operator.salesOrder", "Sales Order")} | ${t("common.location", "Location")} ${currentLocation()?.text || locationId}`;
   const topWarnings = viewMode === "packed" ? warningOrders() : [];
   const actions = `
-    ${topWarnings.length ? `<button class="top-warning-button" data-action="open-warning-order" data-order="${topWarnings[0].netsuite_id}" type="button">Warning ${topWarnings.length}</button>` : ""}
-    <button class="secondary-button" data-action="main-menu" type="button">Menu</button>
+    ${topWarnings.length ? `<button class="top-warning-button" data-action="open-warning-order" data-order="${topWarnings[0].netsuite_id}" type="button">${t("operator.warning", "Warning")} ${topWarnings.length}</button>` : ""}
+    <button class="secondary-button" data-action="main-menu" type="button">${t("common.menu", "Menu")}</button>
     ${renderInstallButton()}
-    <button class="secondary-button" data-action="refresh" type="button">Refresh Orders</button>
+    <button class="secondary-button" data-action="refresh" type="button">${t("common.refreshOrders", "Refresh Orders")}</button>
     <button class="secondary-button" data-action="logout" type="button">${operator.display_name}</button>
   `;
 
@@ -798,143 +1384,146 @@ function render() {
 }
 
 function renderMenu() {
-  shell("Operator Menu", `Location ${currentLocation()?.text || locationId}`, `
+  shell(t("operator.menuTitle", "Operator Menu"), `${t("common.location", "Location")} ${currentLocation()?.text || locationId}`, `
     <section class="module-menu">
       <button class="module-tile" data-action="open-module" data-module="customer-pickup" type="button">
-        <strong>Customer Pickup</strong>
-        <span>Prepare order for customer pickup.</span>
+        <strong>${t("operator.customerPickup", "Customer Pickup")}</strong>
+        <span>${t("operator.customerPickupDesc", "Prepare order for customer pickup.")}</span>
       </button>
       <button class="module-tile" data-action="open-module" data-module="receiving" type="button">
-        <strong>Receiving</strong>
-        <span>Receive PO and yard stock.</span>
+        <strong>${t("operator.receiving", "Receiving")}</strong>
+        <span>${t("operator.receivingDesc", "Receive PO and yard stock.")}</span>
       </button>
       <button class="module-tile" data-action="open-module" data-module="cycle-count" type="button">
-        <strong>Cycle Count</strong>
-        <span>Check inventory by product, brand, series and SKU.</span>
+        <strong>${t("operator.cycleCount", "Cycle Count")}</strong>
+        <span>${t("operator.cycleCountDesc", "Check inventory by product, brand, series and SKU.")}</span>
       </button>
       <button class="module-tile" data-action="open-module" data-module="delivery" type="button">
-        <strong>Delivery Prep</strong>
-        <span>Pack delivery orders for drivers.</span>
+        <strong>${t("operator.deliveryPrep", "Delivery Prep")}</strong>
+        <span>${t("operator.deliveryPrepDesc", "Pack delivery orders for drivers.")}</span>
       </button>
       <button class="module-tile" data-action="open-module" data-module="return" type="button">
-        <strong>Return</strong>
-        <span>Pallet return or stock return.</span>
+        <strong>${t("operator.return", "Return")}</strong>
+        <span>${t("operator.returnDesc", "Pallet return or stock return.")}</span>
       </button>
       <button class="module-tile" data-action="open-module" data-module="personal-history" type="button">
-        <strong>Personal History</strong>
-        <span>Review your submitted IF, IR and count records.</span>
+        <strong>${t("operator.personalHistory", "Personal History")}</strong>
+        <span>${t("operator.personalHistoryDesc", "Review your submitted IF, IR and count records.")}</span>
       </button>
     </section>
   `, `
     ${renderInstallButton()}
-    <button class="secondary-button" data-action="change-location" type="button">Location</button>
     <button class="secondary-button" data-action="logout" type="button">${operator.display_name}</button>
   `);
 }
 
 function renderReturnSelect() {
-  shell("Return", `Location ${currentLocation()?.text || locationId}`, `
+  shell(t("operator.return", "Return"), `${t("common.location", "Location")} ${currentLocation()?.text || locationId}`, `
     <section class="module-menu two-up">
       <button class="module-tile" data-action="open-module" data-module="pallet-return" type="button">
-        <strong>Pallet Return</strong>
-        <span>Record returned pallets from customer.</span>
+        <strong>${t("operator.palletReturn", "Pallet Return")}</strong>
+        <span>${t("operator.palletReturnDesc", "Record returned pallets from customer.")}</span>
       </button>
       <button class="module-tile" data-action="open-module" data-module="stock-return" type="button">
-        <strong>Stock Return</strong>
-        <span>Return stock by sales order.</span>
+        <strong>${t("operator.stockReturn", "Stock Return")}</strong>
+        <span>${t("operator.stockReturnDesc", "Return stock by sales order.")}</span>
       </button>
     </section>
   `, `
-    <button class="secondary-button" data-action="main-menu" type="button">Menu</button>
+    <button class="secondary-button" data-action="main-menu" type="button">${t("common.menu", "Menu")}</button>
     <button class="secondary-button" data-action="logout" type="button">${operator.display_name}</button>
   `);
 }
 
 function renderDeliverySelect() {
-  shell("Delivery Prep", `Location ${currentLocation()?.text || locationId}`, `
+  shell(t("operator.deliveryPrep", "Delivery Prep"), `${t("common.location", "Location")} ${currentLocation()?.text || locationId}`, `
     <section class="module-menu two-up">
       <button class="module-tile" data-action="select-delivery-type" data-order-type="sales_order" type="button">
-        <strong>Sales Order</strong>
-        <span>Prepare customer delivery orders.</span>
+        <strong>${t("operator.salesOrder", "Sales Order")}</strong>
+        <span>${t("operator.salesOrderDesc", "Prepare customer delivery orders.")}</span>
       </button>
       <button class="module-tile" data-action="select-delivery-type" data-order-type="transfer_order" type="button">
-        <strong>Transfer Order</strong>
-        <span>Prepare stock transfer to another yard.</span>
+        <strong>${t("operator.transferOrder", "Transfer Order")}</strong>
+        <span>${t("operator.transferOrderDesc", "Prepare stock transfer to another yard.")}</span>
       </button>
     </section>
   `, `
-    <button class="secondary-button" data-action="main-menu" type="button">Menu</button>
+    <button class="secondary-button" data-action="main-menu" type="button">${t("common.menu", "Menu")}</button>
     <button class="secondary-button" data-action="logout" type="button">${operator.display_name}</button>
   `);
 }
 
 function renderCustomerPickupScan() {
-  shell("Customer Pickup", `Location ${currentLocation()?.text || locationId}`, `
+  shell(t("operator.customerPickup", "Customer Pickup"), `${t("common.location", "Location")} ${currentLocation()?.text || locationId}`, `
     <section class="fulfillment-screen">
-      <div class="fulfillment-card">
-        <span>Scan sales order</span>
-        <strong>Customer pickup only</strong>
-        <div class="camera-actions">
-          <button class="primary-button" data-action="start-pickup-scanner" type="button">${pickupScannerActive ? "Restart camera" : "Open camera"}</button>
+      <div class="fulfillment-card customer-pickup-scan-card">
+        <span>${t("operator.scanSalesOrder", "Scan sales order")}</span>
+        <strong>${t("operator.customerPickupOnly", "Customer pickup only")}</strong>
+        <div class="scanner-ready-banner">
+          <b>${t("operator.scannerReady", "Scanner ready")}</b>
+          <span>${t("operator.scannerReadyHelp", "Scan the sales order with Zebra scanner. The order will open automatically.")}</span>
         </div>
-        ${pickupScannerActive ? `<video class="camera-preview" id="pickupScannerCamera" autoplay muted playsinline></video>` : `<div class="photo-placeholder">Use the Zebra scanner, camera scanner, or type the sales order number.</div>`}
+        <div class="camera-actions">
+          <button class="primary-button" data-action="start-pickup-scanner" type="button">${pickupScannerActive ? t("common.restartCamera", "Restart camera") : t("common.openCamera", "Open camera")}</button>
+          ${renderCameraSwitchButton("switch-pickup-camera")}
+        </div>
+        ${pickupScannerActive ? `<video class="camera-preview" id="pickupScannerCamera" autoplay muted playsinline></video>` : `<div class="photo-placeholder">${t("operator.scannerHelp", "Use the Zebra scanner, camera scanner, or type the sales order number.")}</div>`}
       </div>
       <div class="fulfillment-card">
-        <span>Manual / Zebra input</span>
-        <strong>Order number</strong>
+        <span>${t("operator.manualInput", "Manual / Zebra input")}</span>
+        <strong>${t("operator.orderNumber", "Order number")}</strong>
         <label class="stepper-field">
-          <span>Scan or type and press Enter</span>
+          <span>${t("operator.scanOrType", "Scan or type and press Enter")}</span>
           <input id="customerPickupScan" value="${escapeHtml(customerPickupScan)}" placeholder="SOB104325" autocomplete="off" autofocus />
         </label>
-        ${customerPickupMessage ? `<div class="sync-alert danger"><strong>Notice</strong><span>${escapeHtml(customerPickupMessage)}</span></div>` : ""}
+        ${customerPickupMessage ? `<div class="sync-alert danger"><strong>${t("common.notice", "Notice")}</strong><span>${escapeHtml(customerPickupMessage)}</span></div>` : ""}
         <div class="selected-actions">
-          <button class="primary-button" data-action="lookup-customer-pickup" type="button">Find Order</button>
+          <button class="primary-button" data-action="lookup-customer-pickup" type="button">${t("operator.findOrder", "Find Order")}</button>
         </div>
       </div>
     </section>
   `, `
-    <button class="secondary-button" data-action="main-menu" type="button">Menu</button>
+    <button class="secondary-button" data-action="main-menu" type="button">${t("common.menu", "Menu")}</button>
     <button class="secondary-button" data-action="logout" type="button">${operator.display_name}</button>
   `);
   window.requestAnimationFrame(() => {
-    const input = document.getElementById("customerPickupScan");
-    input?.focus();
+    scheduleCustomerPickupFocus();
     attachPickupScannerCamera();
   });
 }
 
 function renderCustomerPickupOrder() {
-  shell("Customer Pickup", selectedOrder ? `${selectedOrder.tranid} | ${selectedOrder.customer || ""}` : `Location ${currentLocation()?.text || locationId}`, `
+  shell(t("operator.customerPickup", "Customer Pickup"), selectedOrder ? `${selectedOrder.tranid} | ${selectedOrder.customer || ""}` : `${t("common.location", "Location")} ${currentLocation()?.text || locationId}`, `
     <section class="delivery-grid single-detail">
       <section class="detail-panel">
         ${selectedOrder ? renderDetailPanel(selectedOrder) : renderEmptyDetail()}
       </section>
     </section>
   `, `
-    <button class="secondary-button" data-action="customer-pickup-back" type="button">Back to Scan</button>
-    <button class="secondary-button" data-action="main-menu" type="button">Menu</button>
+    <button class="secondary-button" data-action="customer-pickup-back" type="button">${t("operator.backToScan", "Back to Scan")}</button>
+    <button class="secondary-button" data-action="main-menu" type="button">${t("common.menu", "Menu")}</button>
     <button class="secondary-button" data-action="logout" type="button">${operator.display_name}</button>
   `);
 }
 
 function receivingTypeLabel() {
-  if (receivingOrderType === "co_order") return "Transit CO";
-  return receivingOrderType === "transfer_order" ? "Transfer Order" : "Purchase Order";
+  if (receivingOrderType === "co_order") return t("operator.transitCo", "Transit CO");
+  return receivingOrderType === "transfer_order" ? t("operator.transferOrder", "Transfer Order") : t("operator.purchaseOrder", "Purchase Order");
 }
 
 function renderReceiving() {
-  shell("Receiving", `${receivingTypeLabel()} | Location ${currentLocation()?.text || locationId}`, `
+  shell(t("operator.receiving", "Receiving"), `${receivingTypeLabel()} | ${t("common.location", "Location")} ${currentLocation()?.text || locationId}`, `
     <section class="receiving-shell">
       <div class="receiving-toolbar">
-        <button class="secondary-button" data-action="main-menu" type="button">Menu</button>
-        <button class="secondary-button" data-action="receiving-back" type="button">Back</button>
+        <button class="secondary-button" data-action="main-menu" type="button">${t("common.menu", "Menu")}</button>
+        <button class="secondary-button" data-action="receiving-back" type="button">${t("common.back", "Back")}</button>
         <label class="receiving-search">
-          <span>Search PO / TO number</span>
-          <input id="receivingSearch" value="${receivingSearch}" placeholder="Tap keypad or type order number..." />
+          <span>${t("operator.searchOrderNumber", "Search PO / TO number")}</span>
+          <input id="receivingSearch" value="${receivingSearch}" placeholder="${t("operator.scanOrType", "Scan or type and press Enter")}" />
         </label>
         <label class="receiving-search receiving-search-with-dropdown">
-          <span>Search product</span>
-          <input id="receivingItemSearch" value="${receivingItemSearch}" placeholder="Item autocomplete..." />
+          <span>${t("operator.searchProduct", "Search product")}</span>
+          <input id="receivingItemSearch" value="${receivingItemSearch}" placeholder="${t("operator.searchProduct", "Search product")}" />
           ${receivingItemSuggestions.length ? `
             <div class="autocomplete-dropdown">
               ${receivingItemSuggestions.map((item) => `
@@ -946,7 +1535,7 @@ function renderReceiving() {
             </div>
           ` : ""}
         </label>
-        <button class="secondary-button" data-action="refresh-receiving" type="button">Refresh Orders</button>
+        <button class="secondary-button" data-action="refresh-receiving" type="button">${t("common.refreshOrders", "Refresh Orders")}</button>
       </div>
       ${renderReceivingMain()}
     </section>
@@ -959,17 +1548,17 @@ function renderReceivingMain() {
   if (receivingStep === "type") {
     return `
       <section class="module-menu two-up compact-menu">
-        <button class="module-tile" data-action="select-receiving-type" data-order-type="purchase_order" type="button">
-          <strong>Purchase Order</strong>
-          <span>Receive vendor purchase orders.</span>
-        </button>
-        <button class="module-tile" data-action="select-receiving-type" data-order-type="transfer_order" type="button">
-          <strong>Transfer Order</strong>
-          <span>Receive stock sent from another yard.</span>
-        </button>
-        <button class="module-tile" data-action="select-receiving-type" data-order-type="co_order" type="button">
-          <strong>Transit CO</strong>
-          <span>Receive local transit depot stock.</span>
+      <button class="module-tile" data-action="select-receiving-type" data-order-type="purchase_order" type="button">
+        <strong>${t("operator.purchaseOrder", "Purchase Order")}</strong>
+        <span>${t("operator.purchaseOrderDesc", "Receive vendor purchase orders.")}</span>
+      </button>
+      <button class="module-tile" data-action="select-receiving-type" data-order-type="transfer_order" type="button">
+        <strong>${t("operator.transferOrder", "Transfer Order")}</strong>
+        <span>${t("operator.transferOrderReceiveDesc", "Receive stock sent from another yard.")}</span>
+      </button>
+      <button class="module-tile" data-action="select-receiving-type" data-order-type="co_order" type="button">
+        <strong>${t("operator.transitCo", "Transit CO")}</strong>
+        <span>${t("operator.transitCoDesc", "Receive local transit depot stock.")}</span>
         </button>
       </section>
     `;
@@ -985,7 +1574,7 @@ function renderReceivingMain() {
             <strong>${receivingOrderType === "purchase_order" ? item.vendor : `From ${item.source_location}`}</strong>
             <span>${item.order_count} open order</span>
           </button>
-        `).join("") || `<div class="empty-state"><strong>No open orders</strong><span>Ask admin to sync if the order is missing.</span></div>`}
+        `).join("") || `<div class="empty-state"><strong>${t("operator.noOpenOrders", "No open orders")}</strong><span>${t("operator.noOpenOrdersHelp", "Ask admin to sync if the order is missing.")}</span></div>`}
       </section>
     `;
   }
@@ -1022,16 +1611,16 @@ function renderReceivingOrders() {
               <span class="muted">${formatDate(order.trandate)} | ${order.line_count || 0} line</span>
               <span class="status-pill open">${order.status_text || "Pending Receipt"}</span>
             </button>
-          `).join("") || `<div class="empty-state small"><strong>No order found</strong><span>Try another number or product.</span></div>`}
+          `).join("") || `<div class="empty-state small"><strong>${t("operator.noOrderFound", "No order found")}</strong><span>${t("operator.noOrderFoundHelp", "Try another number or product.")}</span></div>`}
         </div>
         <div class="pagination-row">
-          <button class="secondary-button" data-action="receiving-order-prev" ${receivingOrderPage === 0 ? "disabled" : ""} type="button">Previous</button>
+          <button class="secondary-button" data-action="receiving-order-prev" ${receivingOrderPage === 0 ? "disabled" : ""} type="button">${t("common.previous", "Previous")}</button>
           <strong>${receivingOrderPage + 1} / ${count}</strong>
-          <button class="secondary-button" data-action="receiving-order-next" ${receivingOrderPage >= count - 1 ? "disabled" : ""} type="button">Next</button>
+          <button class="secondary-button" data-action="receiving-order-next" ${receivingOrderPage >= count - 1 ? "disabled" : ""} type="button">${t("common.next", "Next")}</button>
         </div>
       </aside>
       <section class="detail-panel">
-        ${receivingSelectedOrder ? renderReceivingDetail(receivingSelectedOrder) : `<div class="empty-state"><strong>Select order</strong><span>Tap an open receiving order.</span></div>`}
+        ${receivingSelectedOrder ? renderReceivingDetail(receivingSelectedOrder) : `<div class="empty-state"><strong>${t("operator.selectOrder", "Select order")}</strong><span>${t("operator.selectOrderHelp", "Tap an open receiving order.")}</span></div>`}
       </section>
     </section>
   `;
@@ -1058,20 +1647,20 @@ function renderReceivingDetail(order) {
         <p class="muted">${receivingOrderType === "purchase_order" ? order.vendor : `From ${order.source_location} to ${order.destination_location}`}</p>
         <p class="muted">${formatDate(order.trandate)} | ${order.status_text}</p>
       </div>
-      <button class="primary-button" data-action="start-receive" ${confirmedLines.length ? "" : "disabled"} type="button">Receive</button>
+      <button class="primary-button" data-action="start-receive" ${confirmedLines.length ? "" : "disabled"} type="button">${t("operator.receive", "Receive")}</button>
     </div>
     <div class="receiving-detail-grid">
       <div class="line-column receiving-lines">
         <div class="line-list">
-          ${visible.map((line) => renderReceivingLine(line)).join("") || `<div class="empty-state small"><strong>No item line</strong><span>This order has no receivable item line.</span></div>`}
+          ${visible.map((line) => renderReceivingLine(line)).join("") || `<div class="empty-state small"><strong>${t("operator.noItemLine", "No item line")}</strong><span>${t("operator.noItemLineHelp", "This order has no receivable item line.")}</span></div>`}
         </div>
         <div class="pagination-row">
-          <button class="secondary-button" data-action="receiving-line-prev" ${receivingLinePage === 0 ? "disabled" : ""} type="button">Previous</button>
+          <button class="secondary-button" data-action="receiving-line-prev" ${receivingLinePage === 0 ? "disabled" : ""} type="button">${t("common.previous", "Previous")}</button>
           <strong>${receivingLinePage + 1} / ${count}</strong>
-          <button class="secondary-button" data-action="receiving-line-next" ${receivingLinePage >= count - 1 ? "disabled" : ""} type="button">Next</button>
+          <button class="secondary-button" data-action="receiving-line-next" ${receivingLinePage >= count - 1 ? "disabled" : ""} type="button">${t("common.next", "Next")}</button>
         </div>
       </div>
-      ${selectedLine ? renderReceivingSelectedLinePanel(selectedLine) : `<aside class="selected-panel"><div class="empty-state small"><strong>Select line</strong></div></aside>`}
+      ${selectedLine ? renderReceivingSelectedLinePanel(selectedLine) : `<aside class="selected-panel"><div class="empty-state small"><strong>${t("operator.selectLine", "Select line")}</strong></div></aside>`}
     </div>
   `;
 }
@@ -1083,10 +1672,10 @@ function renderReceivingLine(line) {
       <div class="line-info">
         <strong>${line.sku || line.item_name}</strong>
         <span>${line.item_description || ""}</span>
-        ${hasReceivedQty(line) ? `<em class="underpack-note">Confirmed</em>` : ""}
+        ${hasReceivedQty(line) ? `<em class="underpack-note">${t("operator.confirmed", "Confirmed")}</em>` : ""}
       </div>
       <div class="required-measures">
-        ${units.map((unit) => `<div class="measure"><span>Open ${unit.label}</span><b>${displayQty(receivingRemainingValue(line, unit.key))}</b></div>`).join("")}
+        ${units.map((unit) => `<div class="measure"><span>${t("operator.open", "Open")} ${unit.label}</span><b>${displayQty(receivingRemainingValue(line, unit.key))}</b></div>`).join("")}
       </div>
     </button>
   `;
@@ -1113,44 +1702,44 @@ function renderReceivingSelectedLinePanel(line) {
   return `
     <aside class="selected-panel" data-receiving-selected-line="${line.id}">
       <div class="selected-header">
-        <span>Selected item</span>
+        <span>${t("operator.selectedItem", "Selected item")}</span>
         <strong>${line.sku || line.item_name}</strong>
         <p>${line.item_description || ""}</p>
       </div>
       <div class="selected-measures">
-        ${units.map((unit) => `<div class="measure"><span>Open ${unit.label}</span><b>${displayQty(receivingRemainingValue(line, unit.key))}</b></div>`).join("")}
+        ${units.map((unit) => `<div class="measure"><span>${t("operator.open", "Open")} ${unit.label}</span><b>${displayQty(receivingRemainingValue(line, unit.key))}</b></div>`).join("")}
       </div>
       ${units.map((unit) => renderStepper(unit.key, `Receive ${unit.label}`, receivingPanelValue(line, unit.key))).join("")}
       <div class="selected-actions">
-        <button class="primary-button" data-action="confirm-receiving-line" data-line="${line.id}" type="button">Confirm line</button>
+        <button class="primary-button" data-action="confirm-receiving-line" data-line="${line.id}" type="button">${t("operator.confirmLine", "Confirm line")}</button>
       </div>
     </aside>
   `;
 }
 
 function cycleStepTitle() {
-  if (cycleSearch.trim()) return "Search Results";
-  if (cycleStep === "type") return "Select Product Type";
-  if (cycleStep === "brand") return "Select Brand";
-  if (cycleStep === "series") return "Select Series";
-  return "Select SKU";
+  if (cycleSearch.trim()) return t("operator.searchResults", "Search Results");
+  if (cycleStep === "type") return t("operator.selectProductType", "Select Product Type");
+  if (cycleStep === "brand") return t("operator.selectBrand", "Select Brand");
+  if (cycleStep === "series") return t("operator.selectSeries", "Select Series");
+  return t("operator.selectSku", "Select SKU");
 }
 
 function renderCycleCount() {
-  shell("Cycle Count", `Location ${currentLocation()?.text || locationId}`, `
+  shell(t("operator.cycleCount", "Cycle Count"), `${t("common.location", "Location")} ${currentLocation()?.text || locationId}`, `
     <section class="cycle-shell">
       <div class="cycle-toolbar">
-        <button class="secondary-button" data-action="main-menu" type="button">Menu</button>
-        <button class="secondary-button" data-action="cycle-back" type="button">Back</button>
+        <button class="secondary-button" data-action="main-menu" type="button">${t("common.menu", "Menu")}</button>
+        <button class="secondary-button" data-action="cycle-back" type="button">${t("common.back", "Back")}</button>
         <label class="cycle-search">
-          <span>Search SKU</span>
-          <input id="cycleSearch" value="${cycleSearch}" placeholder="Search item, brand, series..." />
+          <span>${t("operator.searchSku", "Search SKU")}</span>
+          <input id="cycleSearch" value="${cycleSearch}" placeholder="${t("operator.searchSku", "Search SKU")}" />
         </label>
       </div>
       <div class="cycle-crumbs">
-        <span>${cycleSelection.productType || "Type"}</span>
-        <span>${cycleSelection.brand || "Brand"}</span>
-        <span>${cycleSelection.series || "Series"}</span>
+        <span>${cycleSelection.productType || t("common.type", "Type")}</span>
+        <span>${cycleSelection.brand || t("control.brand", "Brand")}</span>
+        <span>${cycleSelection.series || t("control.series", "Series")}</span>
       </div>
       <div class="cycle-grid">
         <section class="cycle-list-panel">
@@ -1200,10 +1789,10 @@ function renderCycleMain() {
     <div class="cycle-option-grid">
       ${options.map((option) => `
         <button class="module-tile compact" data-action="cycle-select" data-value="${option.value}" type="button">
-          <strong>${option.value || "Unassigned"}</strong>
+          <strong>${option.value || t("operator.unassigned", "Unassigned")}</strong>
           <span>${option.count} SKU</span>
         </button>
-      `).join("") || `<div class="empty-state small"><strong>No options</strong><span>Sync inventory first.</span></div>`}
+      `).join("") || `<div class="empty-state small"><strong>${t("operator.noOptions", "No options")}</strong><span>${t("operator.syncInventoryFirst", "Sync inventory first.")}</span></div>`}
     </div>
   `;
 }
@@ -1222,16 +1811,16 @@ function renderInventorySkuList() {
             <em class="underpack-note">${item.product_type || ""} | ${item.brand || ""} | ${item.series || ""}</em>
           </div>
           <div class="required-measures">
-            <div class="measure"><span>UOM</span><b>${item.stock_unit || "-"}</b></div>
-            <div class="measure"><span>Count</span><b>Blind</b></div>
+            <div class="measure"><span>${t("operator.uom", "UOM")}</span><b>${item.stock_unit || "-"}</b></div>
+            <div class="measure"><span>${t("operator.count", "Count")}</span><b>${t("operator.blind", "Blind")}</b></div>
           </div>
         </button>
-      `).join("") || `<div class="empty-state small"><strong>No SKU</strong><span>Try search or sync inventory.</span></div>`}
+      `).join("") || `<div class="empty-state small"><strong>${t("operator.noSku", "No SKU")}</strong><span>${t("operator.trySearchInventory", "Try search or sync inventory.")}</span></div>`}
     </div>
     <div class="pagination-row">
-      <button class="secondary-button" data-action="cycle-prev" ${cyclePage === 0 ? "disabled" : ""} type="button">Previous</button>
+      <button class="secondary-button" data-action="cycle-prev" ${cyclePage === 0 ? "disabled" : ""} type="button">${t("common.previous", "Previous")}</button>
       <strong>${cyclePage + 1} / ${count}</strong>
-      <button class="secondary-button" data-action="cycle-next" ${cyclePage >= count - 1 ? "disabled" : ""} type="button">Next</button>
+      <button class="secondary-button" data-action="cycle-next" ${cyclePage >= count - 1 ? "disabled" : ""} type="button">${t("common.next", "Next")}</button>
     </div>
   `;
 }
@@ -1241,7 +1830,7 @@ function renderCycleCountPanel(item) {
   if (!countUnits.some((unit) => unit.key === activeCycleUnit)) activeCycleUnit = countUnits[0]?.key || "";
   return `
     <div class="selected-header cycle-selected-header">
-      <span>Selected SKU</span>
+      <span>${t("operator.selectedSku", "Selected SKU")}</span>
       <strong>${item.item_name}</strong>
       <p>${item.item_description || item.display_name || ""}</p>
     </div>
@@ -1251,7 +1840,7 @@ function renderCycleCountPanel(item) {
     <div class="cycle-count-fields">
       ${countUnits.map((unit) => `
         <button class="cycle-count-field ${activeCycleUnit === unit.key ? "active" : ""}" data-action="select-cycle-unit" data-unit="${unit.key}" type="button">
-          <span>Counted ${unit.label}</span>
+          <span>${t("operator.counted", "Counted")} ${unit.label}</span>
           <strong data-cycle-display="${unit.key}">${cycleValues[unit.key] || 0}</strong>
         </button>
       `).join("")}
@@ -1262,11 +1851,11 @@ function renderCycleCountPanel(item) {
       `).join("")}
     </div>
     <div class="cycle-variance" data-cycle-variance>
-      <div><span>Counted total</span><strong>0</strong></div>
-      <div><span>Mode</span><strong>Blind</strong></div>
+      <div><span>${t("operator.countedTotal", "Counted total")}</span><strong>0</strong></div>
+      <div><span>${t("operator.mode", "Mode")}</span><strong>${t("operator.blind", "Blind")}</strong></div>
     </div>
     <div class="selected-actions">
-      <button class="primary-button" data-action="confirm-cycle-line" ${cycleConfirming ? "disabled" : ""} type="button">${cycleConfirming ? "Confirming..." : "Confirm line"}</button>
+      <button class="primary-button" data-action="confirm-cycle-line" ${cycleConfirming ? "disabled" : ""} type="button">${cycleConfirming ? t("operator.confirming", "Confirming...") : t("operator.confirmLine", "Confirm line")}</button>
     </div>
   `;
 }
@@ -1275,41 +1864,51 @@ function renderCycleSummary() {
   const lines = cycleDraft?.lines || [];
   return `
     <div class="selected-header">
-      <span>Current count</span>
-      <strong>${lines.length} confirmed line</strong>
-      <p>Confirmed lines stay in this draft until Submit.</p>
+      <span>${t("operator.currentCount", "Current count")}</span>
+      <strong>${lines.length} ${t("operator.confirmedLine", "confirmed line")}</strong>
+      <p>${t("operator.confirmedDraftHelp", "Confirmed lines stay in this draft until Submit.")}</p>
     </div>
     <div class="cycle-summary">
       ${lines.slice(0, 6).map((line) => `
         <button class="${selectedInventoryItem?.item_id === line.item_id ? "active" : ""}" data-action="edit-cycle-line" data-line="${line.id}" type="button">
           <strong>${line.item_name}</strong>
           <span>${displayQty(line.counted_pallet_qty)} PLT / ${displayQty(line.counted_layer_qty)} LYR / ${displayQty(line.counted_section_qty)} SEC / ${displayQty(line.counted_piece_qty)} PCS</span>
-          <span>Total ${displayQty(line.counted_total_qty)} | Var ${displaySignedQty(line.variance_qty)}</span>
+          <span>${t("operator.total", "Total")} ${displayQty(line.counted_total_qty)} | ${t("control.variance", "Var")} ${displaySignedQty(line.variance_qty)}</span>
         </button>
-      `).join("") || `<span class="muted">No lines confirmed yet.</span>`}
+      `).join("") || `<span class="muted">${t("operator.noLinesConfirmed", "No lines confirmed yet.")}</span>`}
     </div>
     <div class="selected-actions">
-      <button class="primary-button" data-action="submit-cycle-count" ${lines.length ? "" : "disabled"} type="button">Submit</button>
+      <button class="primary-button" data-action="submit-cycle-count" ${lines.length ? "" : "disabled"} type="button">${t("operator.submit", "Submit")}</button>
     </div>
   `;
 }
 
 function renderOrderPanel() {
-  const count = pageCount(orders, ORDER_PAGE_SIZE);
+  const panelOrders = filteredDeliveryOrders();
+  const count = pageCount(panelOrders, ORDER_PAGE_SIZE);
   orderPage = Math.min(orderPage, count - 1);
-  const visible = pageItems(orders, orderPage, ORDER_PAGE_SIZE);
+  const visible = pageItems(panelOrders, orderPage, ORDER_PAGE_SIZE);
+  const counts = deliveryBatchCounts();
+  const showBatchFilter = deliveryOrderType === "sales_order" && viewMode === "active";
 
   return `
     <div class="panel-title">
       <div class="order-panel-title">
-        <span>${viewMode === "packed" ? "Packed" : "Not packed"}</span>
+        <span>${viewMode === "packed" ? t("operator.packed", "Packed") : t("operator.notPacked", "Not packed")}</span>
         <div class="panel-segment">
-          <button class="${viewMode === "active" ? "active" : ""}" data-action="view-active" type="button">Active</button>
-          <button class="${viewMode === "packed" ? "active" : ""}" data-action="view-packed" type="button">Packed</button>
+          <button class="${viewMode === "active" ? "active" : ""}" data-action="view-active" type="button">${t("operator.active", "Active")}</button>
+          <button class="${viewMode === "packed" ? "active" : ""}" data-action="view-packed" type="button">${t("operator.packed", "Packed")}</button>
         </div>
       </div>
-      <strong>${orders.length}</strong>
+      <strong>${panelOrders.length}</strong>
     </div>
+    ${showBatchFilter ? `
+      <div class="batch-segment">
+        <button class="${deliveryBatchFilter === "planned" ? "active" : ""}" data-action="delivery-batch-filter" data-filter="planned" type="button">${t("operator.planned", "Planned")} <b>${counts.planned}</b></button>
+        <button class="${deliveryBatchFilter === "batch_a" ? "active" : ""}" data-action="delivery-batch-filter" data-filter="batch_a" type="button">${t("operator.batchA", "Batch A")} <b>${counts.batch_a}</b></button>
+        <button class="${deliveryBatchFilter === "batch_b" ? "active" : ""}" data-action="delivery-batch-filter" data-filter="batch_b" type="button">${t("operator.batchB", "Batch B")} <b>${counts.batch_b}</b></button>
+      </div>
+    ` : ""}
     ${renderPackedWarningNotice()}
     ${renderOperatorRequestNotice()}
     <div class="order-list">
@@ -1318,17 +1917,17 @@ function renderOrderPanel() {
         return `
         <button class="order-card ${String(order.netsuite_id) === String(selectedId) ? "active" : ""} ${orderWarningCount(order) ? "warning" : ""} ${orderUnderpackCount(order) && order.operator_status === "packed" ? "underpack" : ""} ${request ? "request" : ""}" data-order="${order.netsuite_id}" type="button">
           <strong>${order.tranid}</strong>
-          <span class="muted">${formatDate(order.trandate)} | ${order.outbound_location || ""}</span>
-          ${order.dispatch_planned ? `<span class="planned-line">Planned ${escapeHtml(order.dispatch_truck_plate || "")} ${escapeHtml(order.dispatch_load_name || "")}${order.dispatch_parking_spot ? ` | Spot ${escapeHtml(order.dispatch_parking_spot)}` : ""}</span>` : ""}
-          ${request ? `<span class="request-line">Dispatch asks to unpack for split</span>` : ""}
+          <span class="muted">${shouldShowDeliverySchedule() ? deliveryScheduleText(order) : formatDate(order.trandate)} | ${order.outbound_location || ""}</span>
+          ${order.dispatch_planned ? `<span class="planned-line">${t("operator.planned", "Planned")} ${escapeHtml(order.dispatch_truck_plate || "")} ${escapeHtml(order.dispatch_load_name || "")}${order.dispatch_parking_spot ? ` | ${t("operator.spot", "Spot")} ${escapeHtml(order.dispatch_parking_spot)}` : ""}</span>` : ""}
+          ${request ? `<span class="request-line">${t("operator.dispatchUnpackRequest", "Dispatch asks to unpack for split")}</span>` : ""}
           <span class="status-pill ${orderStatusClass(order)}">${orderStatusText(order)}</span>
         </button>
-      `; }).join("") || `<div class="empty-state small"><strong>No orders</strong><span>Ask admin to sync if the order is missing.</span></div>`}
+      `; }).join("") || `<div class="empty-state small"><strong>${t("operator.noOrders", "No orders")}</strong><span>${showBatchFilter ? t("operator.tryBatch", "Try another batch filter.") : t("operator.noOpenOrdersHelp", "Ask admin to sync if the order is missing.")}</span></div>`}
     </div>
     <div class="pagination-row">
-      <button class="secondary-button" data-action="order-prev" ${orderPage === 0 ? "disabled" : ""} type="button">Previous</button>
+      <button class="secondary-button" data-action="order-prev" ${orderPage === 0 ? "disabled" : ""} type="button">${t("common.previous", "Previous")}</button>
       <strong>${orderPage + 1} / ${count}</strong>
-      <button class="secondary-button" data-action="order-next" ${orderPage >= count - 1 ? "disabled" : ""} type="button">Next</button>
+      <button class="secondary-button" data-action="order-next" ${orderPage >= count - 1 ? "disabled" : ""} type="button">${t("common.next", "Next")}</button>
     </div>
   `;
 }
@@ -1349,7 +1948,7 @@ function renderOperatorRequestNotice() {
   const target = requests.find((request) => request.netsuite_id) || requests[0];
   return `
     <button class="operator-request-notice" data-action="open-operator-request" data-order="${target.netsuite_id || ""}" type="button">
-      <strong>Dispatch Request</strong>
+      <strong>${t("operator.dispatchRequest", "Dispatch Request")}</strong>
       <span>${requests.length} unpack request${requests.length > 1 ? "s" : ""} for split. Tap to handle.</span>
     </button>
   `;
@@ -1361,7 +1960,7 @@ function renderPackedWarningNotice() {
   const lines = warnings.reduce((total, order) => total + orderWarningCount(order), 0);
   return `
     <button class="order-warning-notice" data-action="open-warning-order" data-order="${warnings[0].netsuite_id}" type="button">
-      <strong>Warning</strong>
+      <strong>${t("operator.warning", "Warning")}</strong>
       <span>${warnings.length} order / ${lines} line needs adjustment</span>
     </button>
   `;
@@ -1370,8 +1969,8 @@ function renderPackedWarningNotice() {
 function renderEmptyDetail() {
   return `
     <div class="empty-state">
-      <strong>Select delivery order</strong>
-      <span>Tap an order on the left to load details.</span>
+      <strong>${t("operator.selectDeliveryOrder", "Select delivery order")}</strong>
+      <span>${t("operator.selectDeliveryOrderHelp", "Tap an order on the left to load details.")}</span>
     </div>
   `;
 }
@@ -1382,13 +1981,13 @@ function renderLoadValidation(validation) {
   return `
     <div class="sync-alert danger load-validation-alert">
       <strong>${issues.length} line cannot load</strong>
-      <span>NetSuite changed after packing. Correct these packed quantities first.</span>
+      <span>${t("operator.netsuiteChangedFix", "NetSuite changed after packing. Correct these packed quantities first.")}</span>
       <div class="validation-lines">
         ${issues.map((issue) => `
           <div>
             <b>${escapeHtml(issue.itemName || "Line")}</b>
             <span>${escapeHtml(issue.message || "Update this packed line.")}</span>
-            <em>Packed: ${escapeHtml(issue.packedText || "0")} | Required now: ${escapeHtml(issue.requiredText || "0")}</em>
+            <em>${t("operator.packedRequiredNow", "Packed: {packed} | Required now: {required}").replace("{packed}", escapeHtml(issue.packedText || "0")).replace("{required}", escapeHtml(issue.requiredText || "0"))}</em>
           </div>
         `).join("")}
       </div>
@@ -1412,37 +2011,37 @@ function renderDetailPanel(order) {
       <div>
         <div class="order-title-row">
           <h2>${order.tranid}</h2>
-          ${viewMode === "packed" && !isCustomerPickupMode() ? `<button class="secondary-button danger-button compact-action" data-action="unpack-order" type="button">Unpack whole order</button>` : ""}
+          ${viewMode === "packed" && !isCustomerPickupMode() ? `<button class="secondary-button danger-button compact-action" data-action="unpack-order" type="button">${t("operator.unpackWholeOrder", "Unpack whole order")}</button>` : ""}
         </div>
         <p class="muted">${order.customer || ""}</p>
-        <p class="muted">${formatDate(order.trandate)} | ${order.delivery_method || ""}</p>
-        ${order.dispatch_planned ? `<p class="dispatch-plan-note">Planned: ${escapeHtml(order.dispatch_truck_plate || "")} ${escapeHtml(order.dispatch_load_name || "")}${order.dispatch_parking_spot ? ` | Parking spot ${escapeHtml(order.dispatch_parking_spot)}` : ""}</p>` : ""}
+        <p class="muted">${shouldShowDeliverySchedule() ? deliveryScheduleText(order) : formatDate(order.trandate)} | ${order.delivery_method || ""}</p>
+        ${order.dispatch_planned ? `<p class="dispatch-plan-note">${t("operator.planned", "Planned")}: ${escapeHtml(order.dispatch_truck_plate || "")} ${escapeHtml(order.dispatch_load_name || "")}${order.dispatch_parking_spot ? ` | ${t("operator.spot", "Parking spot")} ${escapeHtml(order.dispatch_parking_spot)}` : ""}</p>` : ""}
         ${order.dispatch_instructions ? `<p class="dispatch-plan-note">${escapeHtml(order.dispatch_instructions)}</p>` : ""}
       </div>
       <div class="status-actions">
         <span class="status-pill ${orderStatusClass(order)}">${orderStatusText(order)}</span>
         ${isCustomerPickupMode()
-          ? `<button class="primary-button" data-action="start-fulfill" type="button" ${hasCustomerPickupDraft(order) ? "" : "disabled"}>Load</button>`
+          ? `<button class="primary-button" data-action="start-fulfill" type="button" ${hasCustomerPickupDraft(order) ? "" : "disabled"}>${t("common.load", "Load")}</button>`
           : viewMode === "packed"
-          ? `<button class="primary-button" data-action="start-fulfill" type="button">Load</button>`
-          : `<button class="secondary-button" data-action="set-preparing" type="button">Preparing</button>
-             <button class="primary-button" data-action="set-packed" type="button">Packed</button>`}
+          ? `<button class="primary-button" data-action="start-fulfill" type="button">${t("common.load", "Load")}</button>`
+          : `<button class="secondary-button" data-action="set-preparing" type="button">${t("operator.preparing", "Preparing")}</button>
+             <button class="primary-button" data-action="set-packed" type="button" ${canMarkPacked(order) ? "" : "disabled"}>${t("operator.packed", "Packed")}</button>`}
       </div>
     </div>
     <div class="progress-strip">
-      <div><span>${isCustomerPickupMode() ? "Pickup lines" : viewMode === "packed" ? "Packed lines" : "Open lines"}</span><strong>${confirmed} / ${lines.length}</strong></div>
-      <div><span>Location</span><strong>${currentLocation()?.text}</strong></div>
-      <div><span>Status</span><strong>${orderStatusText(order)}</strong></div>
+      <div><span>${isCustomerPickupMode() ? "Pickup lines" : viewMode === "packed" ? t("operator.packedLines", "Packed lines") : t("operator.openLines", "Open lines")}</span><strong>${confirmed} / ${lines.length}</strong></div>
+      <div><span>${t("common.location", "Location")}</span><strong>${currentLocation()?.text}</strong></div>
+      <div><span>${t("operator.status", "Status")}</span><strong>${orderStatusText(order)}</strong></div>
     </div>
     ${exceptions.length ? `
       <div class="sync-alert">
         <strong>${exceptions.length} line needs repack</strong>
-        <span>NetSuite changed after packing. Unpack the affected line, then pack again with the latest required qty.</span>
+        <span>${t("operator.netsuiteChangedRepack", "NetSuite changed after packing. Unpack the affected line, then pack again with the latest required qty.")}</span>
       </div>
     ` : ""}
     ${customerPickupNotice ? `
       <div class="sync-alert danger">
-        <strong>Pickup unavailable</strong>
+        <strong>${t("operator.pickupUnavailable", "Pickup unavailable")}</strong>
         <span>${escapeHtml(customerPickupNotice)}</span>
       </div>
     ` : ""}
@@ -1452,12 +2051,12 @@ function renderDetailPanel(order) {
           ${visible.map((line) => renderLine(line)).join("") || `<div class="empty-state small"><strong>${isCustomerPickupMode() ? "No pickup quantity" : "No lines"}</strong><span>${escapeHtml(customerPickupNotice || "Ask admin to sync if details are missing.")}</span></div>`}
         </div>
         <div class="pagination-row">
-          <button class="secondary-button" data-action="line-prev" ${linePage === 0 ? "disabled" : ""} type="button">Previous</button>
+          <button class="secondary-button" data-action="line-prev" ${linePage === 0 ? "disabled" : ""} type="button">${t("common.previous", "Previous")}</button>
           <strong>${linePage + 1} / ${count}</strong>
-          <button class="secondary-button" data-action="line-next" ${linePage >= count - 1 ? "disabled" : ""} type="button">Next</button>
+          <button class="secondary-button" data-action="line-next" ${linePage >= count - 1 ? "disabled" : ""} type="button">${t("common.next", "Next")}</button>
         </div>
       </div>
-      ${selectedLine ? renderSelectedLinePanel(selectedLine) : customerPickupNotice ? `<aside class="selected-panel"><div class="empty-state"><strong>Pickup unavailable</strong><span>${escapeHtml(customerPickupNotice)}</span></div></aside>` : renderEmptyDetail()}
+      ${selectedLine ? renderSelectedLinePanel(selectedLine) : customerPickupNotice ? `<aside class="selected-panel"><div class="empty-state"><strong>${t("operator.pickupUnavailable", "Pickup unavailable")}</strong><span>${escapeHtml(customerPickupNotice)}</span></div></aside>` : renderEmptyDetail()}
     </div>
   `;
 }
@@ -1482,25 +2081,24 @@ function renderFulfillmentScreen() {
           <button class="primary-button" data-action="finish-fulfill" type="button">${isPickupLoad ? "Back to Scan" : "Back to Delivery"}</button>
         </div>
       </section>
-    `, `<button class="secondary-button" data-action="finish-fulfill" type="button">Delivery</button>`);
+    `, `<button class="secondary-button" data-action="finish-fulfill" type="button">${t("operator.deliveryPrep", "Delivery")}</button>`);
   }
   return shell("Load Order", `${order.tranid} | Location ${currentLocation()?.text || ""}`, `
     <section class="fulfillment-screen">
       <div class="fulfillment-card">
-        <span>Photo proof</span>
-        <strong>Loaded on truck</strong>
+        <span>${t("operator.photoProof", "Photo proof")}</span>
+        <strong>${t("operator.loadedOnTruck", "Loaded on truck")}</strong>
         <div class="camera-actions">
           <button class="primary-button" data-action="start-camera" type="button">${fulfillmentCameraActive ? "Restart camera" : "Open camera"}</button>
-          <button class="secondary-button" data-action="choose-photo-file" type="button">Choose file</button>
-          <input id="fulfillmentPhoto" accept="image/*" capture="environment" type="file" />
+          ${renderCameraSwitchButton("switch-fulfillment-camera")}
         </div>
         ${fulfillmentCameraActive ? `
           <video class="camera-preview" id="fulfillmentCamera" autoplay muted playsinline></video>
-          <button class="primary-button" data-action="capture-photo" type="button">Capture photo</button>
-        ` : fulfillmentPhotoDataUrl ? `<img class="photo-preview" src="${fulfillmentPhotoDataUrl}" alt="Truck loading proof" />` : `<div class="photo-placeholder">Open camera and take 1 photo before confirming load.</div>`}
+          <button class="primary-button" data-action="capture-photo" type="button">${t("operator.capturePhoto", "Capture photo")}</button>
+        ` : fulfillmentPhotoDataUrl ? `<img class="photo-preview" src="${fulfillmentPhotoDataUrl}" alt="Truck loading proof" />` : `<div class="photo-placeholder">${t("operator.loadPhotoHelp", "Open camera and take 1 photo before confirming load.")}</div>`}
       </div>
       <div class="fulfillment-card">
-        <span>Packed qty to load</span>
+        <span>${t("operator.packedQtyToLoad", "Packed qty to load")}</span>
         <strong>${packedLines.length} line</strong>
         <div class="fulfillment-lines">
           ${packedLines.map((line) => `
@@ -1508,18 +2106,18 @@ function renderFulfillmentScreen() {
               <b>${line.sku || line.item_name}</b>
               <span>${displayQty(line.packed_pallet_qty)} PLT / ${displayQty(line.packed_section_qty)} SEC / ${displayQty(line.packed_layer_qty)} LYR / ${displayQty(line.packed_piece_qty)} PCS</span>
             </div>
-          `).join("") || `<p class="muted">No packed qty.</p>`}
+          `).join("") || `<p class="muted">${t("operator.noPackedQty", "No packed qty.")}</p>`}
         </div>
       </div>
       <div class="selected-actions">
         ${fulfillmentSubmitting ? `<div class="sync-alert"><strong>${fulfillmentJobStage || "Saving load proof"}</strong><span>${fulfillmentStatusText || "Saving local yard status..."}${fulfillmentStartedAt ? ` (${Math.max(1, Math.round((Date.now() - fulfillmentStartedAt) / 1000))}s)` : ""}</span></div>` : ""}
-        ${!fulfillmentSubmitting && fulfillmentJobStage === "Load failed" ? `<div class="sync-alert danger"><strong>Load failed</strong><span>${fulfillmentStatusText}</span></div>` : ""}
+        ${!fulfillmentSubmitting && fulfillmentJobStage === "Load failed" ? `<div class="sync-alert danger"><strong>${t("operator.loadFailed", "Load failed")}</strong><span>${fulfillmentStatusText}</span></div>` : ""}
         ${renderLoadValidation(fulfillmentValidation)}
         <button class="primary-button" data-action="confirm-fulfill" ${fulfillmentPhotoDataUrl && !fulfillmentSubmitting ? "" : "disabled"} type="button">${fulfillmentSubmitting ? "Loading..." : "Load"}</button>
       </div>
     </section>
   `, `
-    <button class="secondary-button" data-action="cancel-fulfill" type="button">Back</button>
+    <button class="secondary-button" data-action="cancel-fulfill" type="button">${t("common.back", "Back")}</button>
     <button class="secondary-button" data-action="logout" type="button">${operator.display_name}</button>
   `);
 }
@@ -1528,17 +2126,20 @@ function renderLine(line) {
   const variable = lineVariableUnit(line);
   const notice = exceptionText(line);
   const underPacked = isUnderPacked(line);
+  const draftConfirmed = isActiveDraftPackedLine(line);
+  const valueLabel = isActiveDraftPackedLine(line) ? "Confirmed" : viewMode === "packed" ? "Packed" : "Open";
   return `
     <button class="line-card ${String(selectedLineId) === String(line.id) ? "active" : ""} ${line.confirmed ? "confirmed" : ""} ${underPacked ? "underpacked" : ""} ${notice ? "exception" : ""}" data-line="${line.id}" type="button">
       <div class="line-info">
         <strong>${line.sku || line.item_name}</strong>
         <span>${line.item_description || ""}</span>
+        ${draftConfirmed ? `<em class="confirmed-note">${t("operator.confirmedAdjust", "Confirmed - can still adjust before Packed")}</em>` : ""}
         ${notice ? `<em>${notice}</em>` : ""}
-        ${underPacked ? `<em class="underpack-note">Still has open qty</em>` : ""}
+        ${underPacked ? `<em class="underpack-note">${t("operator.stillOpenQty", "Still has open qty")}</em>` : ""}
       </div>
       <div class="required-measures">
-        <div class="measure"><span>${viewMode === "packed" ? "Packed" : "Open"} PLT</span><b>${displayQty(panelValue(line, "pallets"))}</b></div>
-        ${variable ? `<div class="measure"><span>${viewMode === "packed" ? "Packed" : "Open"} ${variable.label}</span><b>${displayQty(panelValue(line, variable.packedKey))}</b></div>` : ""}
+        <div class="measure"><span>${valueLabel} PLT</span><b>${displayQty(panelValue(line, "pallets"))}</b></div>
+        ${variable ? `<div class="measure"><span>${valueLabel} ${variable.label}</span><b>${displayQty(panelValue(line, variable.packedKey))}</b></div>` : ""}
       </div>
     </button>
   `;
@@ -1548,13 +2149,13 @@ function renderSelectedLinePanel(line) {
   const variable = lineVariableUnit(line);
   const notice = exceptionText(line);
   const packedActions = notice
-    ? `<button class="secondary-button danger-button" data-action="unpack-line" data-line="${line.id}" type="button">Unpack packed qty</button>`
-    : `<button class="primary-button" data-action="update-packed-line" data-line="${line.id}" type="button">Update packed qty</button>
-       <button class="secondary-button danger-button" data-action="unpack-line" data-line="${line.id}" type="button">Unpack packed qty</button>`;
+    ? `<button class="secondary-button danger-button" data-action="unpack-line" data-line="${line.id}" type="button">${t("operator.unpackPackedQty", "Unpack packed qty")}</button>`
+    : `<button class="primary-button" data-action="update-packed-line" data-line="${line.id}" type="button">${t("operator.updatePackedQty", "Update packed qty")}</button>
+       <button class="secondary-button danger-button" data-action="unpack-line" data-line="${line.id}" type="button">${t("operator.unpackPackedQty", "Unpack packed qty")}</button>`;
   return `
     <aside class="selected-panel" data-selected-line="${line.id}">
       <div class="selected-header">
-        <span>Selected item</span>
+        <span>${t("operator.selectedItem", "Selected item")}</span>
         <strong>${line.sku || line.item_name}</strong>
         <p>${line.item_description || ""}</p>
       </div>
@@ -1562,12 +2163,12 @@ function renderSelectedLinePanel(line) {
         <div class="measure"><span>${isCustomerPickupMode() ? "Remaining" : "Required"} PLT</span><b>${displayQty(isCustomerPickupMode() ? Math.max(0, qty(line.pallet_qty) - pickupLoadedValue(line, "pallets")) : line.pallet_qty)}</b></div>
         ${variable ? `<div class="measure"><span>${isCustomerPickupMode() ? "Remaining" : "Required"} ${variable.label}</span><b>${displayQty(isCustomerPickupMode() ? Math.max(0, requiredValue(line, variable.packedKey) - pickupLoadedValue(line, variable.packedKey)) : variable.required)}</b></div>` : ""}
       </div>
-      ${notice ? `<div class="line-alert"><strong>Repack needed</strong><span>${notice}</span></div>` : ""}
+      ${notice ? `<div class="line-alert"><strong>${t("operator.repackNeeded", "Repack needed")}</strong><span>${notice}</span></div>` : ""}
       ${notice ? "" : renderStepper("pallets", `${viewMode === "packed" ? "Packed" : "Pack"} PLT`, panelValue(line, "pallets"))}
       ${!notice && variable?.packedKey ? renderStepper(variable.packedKey, `${viewMode === "packed" ? "Packed" : "Pack"} ${variable.label}`, panelValue(line, variable.packedKey)) : ""}
       ${viewMode === "packed"
         ? `<div class="selected-actions">${packedActions}</div>`
-        : `<div class="selected-actions"><button class="primary-button" data-action="confirm-line" data-line="${line.id}" type="button">Confirm line</button></div>`}
+        : `<div class="selected-actions"><button class="primary-button" data-action="confirm-line" data-line="${line.id}" type="button">${t("operator.confirmLine", "Confirm line")}</button></div>`}
     </aside>
   `;
 }
@@ -1587,17 +2188,56 @@ function renderStepper(unit, label, value) {
 
 async function loadOrders(options = {}) {
   const status = viewMode === "packed" ? "packed" : "active";
+  await loadDeliveryNotifications();
   orders = await api(`/api/delivery/orders?locationId=${locationId}&status=${status}&orderType=${deliveryOrderType}`);
   operatorRequests = await api(`/api/operator/requests?locationId=${locationId}&orderType=${deliveryOrderType}&status=open`).catch(() => []);
   const preparing = preparingOrderId();
+  const panelOrders = filteredDeliveryOrders();
   if (viewMode === "active" && preparing) selectedId = preparing;
-  else if (!options.keepSelection) selectedId = orders[0]?.netsuite_id || null;
-  if (selectedId && !orders.some((order) => String(order.netsuite_id) === String(selectedId))) {
-    selectedId = orders[0]?.netsuite_id || null;
+  else if (!options.keepSelection) selectedId = panelOrders[0]?.netsuite_id || null;
+  if (selectedId && !panelOrders.some((order) => String(order.netsuite_id) === String(selectedId))) {
+    selectedId = panelOrders[0]?.netsuite_id || null;
   }
   selectedOrder = null;
   if (selectedId) await loadDetail(selectedId, { silentRender: true });
   render();
+}
+
+async function loadDeliveryNotifications(options = {}) {
+  if (!locationId) {
+    deliveryNotifications = { total: 0, salesOrder: { dueToday: 0 }, transferOrder: { dueToday: 0 }, items: [] };
+    return deliveryNotifications;
+  }
+  const previous = deliveryNotifications;
+  deliveryNotifications = await api(`/api/delivery/notifications?locationId=${locationId}`).catch(() => (
+    previous || { total: 0, salesOrder: { dueToday: 0 }, transferOrder: { dueToday: 0 }, items: [] }
+  ));
+  const items = deliveryNotificationItems();
+  const alertRefs = new Set((options.alertRefs || []).map((ref) => String(ref || "").trim()).filter(Boolean));
+  let alertItems = [];
+  if (alertRefs.size) {
+    alertItems = items.filter((item) => alertRefs.has(String(item.tranid || "")) || alertRefs.has(String(item.orderId || "")));
+  } else if (options.alertRecent) {
+    alertItems = items.filter(isRecentPlannedDeliveryNotification);
+  }
+  if (alertItems.length) {
+    showUrgentDeliveryAlert(alertItems);
+  }
+  return deliveryNotifications;
+}
+
+async function openUrgentDeliveryAlert() {
+  const first = urgentDeliveryAlert?.items?.[0] || deliveryNotificationItems()[0];
+  if (!first) return;
+  urgentDeliveryAlert = null;
+  deliveryOrderType = first.type === "transfer_order" ? "transfer_order" : "sales_order";
+  viewMode = "active";
+  if (deliveryOrderType === "sales_order") deliveryBatchFilter = first.dispatchPlanned ? "planned" : "batch_a";
+  localStorage.setItem("mbbs.operator.deliveryOrderType", deliveryOrderType);
+  localStorage.setItem("mbbs.operator.deliveryBatchFilter", deliveryBatchFilter);
+  currentModule = "delivery";
+  selectedId = first.orderId || null;
+  await loadOrders({ keepSelection: true });
 }
 
 async function loadReceivingOptions() {
@@ -1755,6 +2395,7 @@ async function startPickupScannerCamera() {
       stopPickupScannerCamera();
       return render();
     }
+    const preferredCamera = await preferredQrScannerCamera(QrScanner);
     pickupQrScanner = new QrScanner(video, async (result) => {
       const value = String(result?.data || result || "").trim();
       if (!value) return;
@@ -1762,7 +2403,7 @@ async function startPickupScannerCamera() {
       stopPickupScannerCamera();
       await lookupCustomerPickup();
     }, {
-      preferredCamera: "environment",
+      preferredCamera,
       maxScansPerSecond: 6,
       returnDetailedScanResult: true,
       highlightScanRegion: true,
@@ -1778,6 +2419,13 @@ async function startPickupScannerCamera() {
     stopPickupScannerCamera();
     render();
   }
+}
+
+async function switchPickupScannerCamera() {
+  const wasActive = pickupScannerActive;
+  switchCameraFacing();
+  if (wasActive) return startPickupScannerCamera();
+  render();
 }
 
 function pressReceivingKey(key) {
@@ -1806,6 +2454,9 @@ async function loadDetail(id, options = {}) {
 
 async function setOrderStatus(status) {
   if (!selectedId) return;
+  if (status === "packed" && !canMarkPacked(selectedOrder)) {
+    return showToast("Confirm at least one order line before marking Packed.");
+  }
   await api(`/api/delivery/orders/${selectedId}/status`, {
     method: "POST",
     body: JSON.stringify({ status })
@@ -1816,6 +2467,7 @@ async function setOrderStatus(status) {
 
 async function confirmLine(lineId) {
   const row = app.querySelector(`[data-selected-line="${lineId}"]`);
+  const line = selectedOrder?.lines?.find((item) => String(item.id) === String(lineId));
   const pallets = row.querySelector('[data-pack="pallets"]')?.value || 0;
   const layers = row.querySelector('[data-pack="layers"]')?.value || 0;
   const pieces = row.querySelector('[data-pack="pieces"]')?.value || 0;
@@ -1827,6 +2479,8 @@ async function confirmLine(lineId) {
   };
   const path = isCustomerPickupMode()
     ? `/api/customer-pickup/orders/${selectedId}/lines/${lineId}/confirm`
+    : isActiveDraftPackedLine(line)
+      ? `/api/delivery/orders/${selectedId}/lines/${lineId}/packed-quantity`
     : `/api/delivery/orders/${selectedId}/lines/${lineId}/confirm`;
   await api(path, {
     method: "POST",
@@ -1915,14 +2569,18 @@ async function startFulfillmentCamera() {
     return;
   }
   stopFulfillmentCamera();
-  fulfillmentCameraStream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode: { ideal: "environment" } },
-    audio: false
-  });
+  fulfillmentCameraStream = await openCameraStream();
   fulfillmentCameraActive = true;
   fulfillmentPhotoDataUrl = "";
   render();
   window.requestAnimationFrame(attachFulfillmentCamera);
+}
+
+async function switchFulfillmentCamera() {
+  const wasActive = fulfillmentCameraActive;
+  switchCameraFacing();
+  if (wasActive) return startFulfillmentCamera();
+  render();
 }
 
 function captureFulfillmentPhoto() {
@@ -1963,12 +2621,21 @@ async function confirmFulfillment() {
   }, 1000);
   render();
   try {
+    fulfillmentStatusText = "Uploading photo proof to R2...";
+    render();
+    const uploadedPhotoRef = await uploadOperatorPhoto(fulfillmentPhotoDataUrl, {
+      recordType: currentModule === "customer-pickup-load" ? "operator-customer-pickup-photo" : "operator-load-photo",
+      orderType: fulfillmentOrder.order_type || deliveryOrderType,
+      orderId: fulfillmentOrder.netsuite_id,
+      orderRef: fulfillmentOrder.tranid
+    });
     const path = currentModule === "customer-pickup-load"
       ? `/api/customer-pickup/orders/${fulfillmentOrder.netsuite_id}/load`
       : `/api/delivery/orders/${fulfillmentOrder.netsuite_id}/load`;
+    fulfillmentStatusText = "Saving local loaded status...";
     fulfillmentResult = await api(path, {
       method: "POST",
-      body: JSON.stringify({ photoDataUrl: fulfillmentPhotoDataUrl, locationId })
+      body: JSON.stringify({ photoDataUrl: uploadedPhotoRef, locationId })
     });
     showToast("Order loaded");
   } catch (error) {
@@ -2038,36 +2705,35 @@ function renderReceiptScreen() {
           <p>${isLocalCo ? "CO is now available in Delivery Prep packed orders for loading." : "Receiving posted to NetSuite."}</p>
         </div>
         <div class="selected-actions">
-          <button class="primary-button" data-action="finish-receive" type="button">Back to Receiving</button>
+          <button class="primary-button" data-action="finish-receive" type="button">${t("operator.backToReceiving", "Back to Receiving")}</button>
         </div>
       </section>
-    `, `<button class="secondary-button" data-action="finish-receive" type="button">Receiving</button>`);
+    `, `<button class="secondary-button" data-action="finish-receive" type="button">${t("operator.receiving", "Receiving")}</button>`);
   }
   return shell("Receive Order", `${order.tranid} | Location ${currentLocation()?.text || ""}`, `
     <section class="fulfillment-screen">
       <div class="fulfillment-card">
-        <span>Photo proof</span>
-        <strong>Truck photos</strong>
+        <span>${t("operator.photoProof", "Photo proof")}</span>
+        <strong>${t("operator.truckPhotos", "Truck photos")}</strong>
         <div class="camera-actions">
           <button class="primary-button" data-action="start-receipt-camera" type="button">${receiptCameraActive ? "Restart camera" : "Open camera"}</button>
-          <button class="secondary-button" data-action="choose-receipt-photo-file" type="button">Choose file</button>
-          <input id="receiptPhoto" accept="image/*" capture="environment" type="file" />
+          ${renderCameraSwitchButton("switch-receipt-camera")}
         </div>
         <div class="photo-slot-row">
           ${[0, 1].map((slot) => `
             <button class="${receiptActivePhotoSlot === slot ? "active" : ""}" data-action="select-receipt-photo-slot" data-slot="${slot}" type="button">
-              <strong>Photo ${slot + 1}</strong>
+              <strong>${t("common.photos", "Photo")} ${slot + 1}</strong>
               <span>${receiptPhotoDataUrls[slot] ? "Ready" : "Needed"}</span>
             </button>
           `).join("")}
         </div>
         ${receiptCameraActive ? `
           <video class="camera-preview" id="receiptCamera" autoplay muted playsinline></video>
-          <button class="primary-button" data-action="capture-receipt-photo" type="button">Capture photo ${receiptActivePhotoSlot + 1}</button>
-        ` : receiptPhotoDataUrls[receiptActivePhotoSlot] ? `<img class="photo-preview" src="${receiptPhotoDataUrls[receiptActivePhotoSlot]}" alt="Receiving proof" />` : `<div class="photo-placeholder">Take 2 truck photos before receiving.</div>`}
+          <button class="primary-button" data-action="capture-receipt-photo" type="button">${t("operator.capturePhoto", "Capture photo")} ${receiptActivePhotoSlot + 1}</button>
+        ` : receiptPhotoDataUrls[receiptActivePhotoSlot] ? `<img class="photo-preview" src="${receiptPhotoDataUrls[receiptActivePhotoSlot]}" alt="Receiving proof" />` : `<div class="photo-placeholder">${t("operator.receivePhotoHelp", "Take 2 truck photos before receiving.")}</div>`}
       </div>
       <div class="fulfillment-card">
-        <span>Confirmed qty to receive</span>
+        <span>${t("operator.confirmedQtyToReceive", "Confirmed qty to receive")}</span>
         <strong>${confirmedLines.length} line</strong>
         <div class="fulfillment-lines">
           ${confirmedLines.map((line) => `
@@ -2075,17 +2741,17 @@ function renderReceiptScreen() {
               <b>${line.sku || line.item_name}</b>
               <span>${displayQty(line.received_pallet_qty)} PLT / ${displayQty(line.received_section_qty)} SEC / ${displayQty(line.received_layer_qty)} LYR / ${displayQty(line.received_piece_qty)} PCS</span>
             </div>
-          `).join("") || `<p class="muted">No confirmed qty.</p>`}
+          `).join("") || `<p class="muted">${t("operator.noConfirmedQty", "No confirmed qty.")}</p>`}
         </div>
       </div>
       <div class="selected-actions">
         ${receiptSubmitting ? `<div class="sync-alert"><strong>${receiptJobStage || "Posting to NetSuite"}</strong><span>${receiptStatusText || "Creating Item Receipt..."}${receiptStartedAt ? ` (${Math.max(1, Math.round((Date.now() - receiptStartedAt) / 1000))}s)` : ""}</span></div>` : ""}
-        ${!receiptSubmitting && receiptJobStage === "Receiving failed" ? `<div class="sync-alert danger"><strong>Receiving failed</strong><span>${receiptStatusText}</span></div>` : ""}
+        ${!receiptSubmitting && receiptJobStage === "Receiving failed" ? `<div class="sync-alert danger"><strong>${t("operator.receivingFailed", "Receiving failed")}</strong><span>${receiptStatusText}</span></div>` : ""}
         <button class="primary-button" data-action="confirm-receive" ${receiptPhotoDataUrls.filter(Boolean).length >= 2 && !receiptSubmitting ? "" : "disabled"} type="button">${receiptSubmitting ? "Receiving..." : "Receive"}</button>
       </div>
     </section>
   `, `
-    <button class="secondary-button" data-action="cancel-receive" type="button">Back</button>
+    <button class="secondary-button" data-action="cancel-receive" type="button">${t("common.back", "Back")}</button>
     <button class="secondary-button" data-action="logout" type="button">${operator.display_name}</button>
   `);
 }
@@ -2137,13 +2803,17 @@ function attachReceiptCamera() {
 async function startReceiptCamera() {
   if (!navigator.mediaDevices?.getUserMedia) return showToast("Camera is not available in this browser.");
   stopReceiptCamera();
-  receiptCameraStream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode: { ideal: "environment" } },
-    audio: false
-  });
+  receiptCameraStream = await openCameraStream();
   receiptCameraActive = true;
   render();
   window.requestAnimationFrame(attachReceiptCamera);
+}
+
+async function switchReceiptCamera() {
+  const wasActive = receiptCameraActive;
+  switchCameraFacing();
+  if (wasActive) return startReceiptCamera();
+  render();
 }
 
 function captureReceiptPhoto() {
@@ -2171,10 +2841,18 @@ async function confirmReceipt() {
   }, 1000);
   render();
   try {
+    receiptStatusText = "Uploading receiving photos to R2...";
+    render();
+    const uploadedPhotoRefs = await uploadOperatorPhotos(receiptPhotoDataUrls.filter(Boolean), {
+      recordType: receivingOrderType === "co_order" ? "operator-co-receiving-photo" : "operator-receiving-photo",
+      orderType: receiptOrder.order_type || receivingOrderType,
+      orderId: receiptOrder.netsuite_id,
+      orderRef: receiptOrder.tranid
+    });
     const started = await api(`/api/receiving/orders/${receiptOrder.netsuite_id}/receive`, {
       method: "POST",
       body: JSON.stringify({
-        photoDataUrls: receiptPhotoDataUrls,
+        photoDataUrls: uploadedPhotoRefs,
         locationId,
         destinationLocationId: locationId,
         orderType: receiptOrder.order_type || receivingOrderType,
@@ -2265,7 +2943,11 @@ function renderHistoryPhotos(record) {
   if (!photos.length) return "";
   return `
     <div class="history-photo-grid">
-      ${photos.map((photo, index) => `<img class="photo-preview" src="${photo}" alt="Record photo ${index + 1}" />`).join("")}
+      ${photos.map((photo, index) => `
+        <button class="history-photo-button" data-action="open-history-photo" data-photo-ref="${escapeHtml(photo)}" data-photo-label="Record photo ${index + 1}" type="button">
+          <img src="${photoImgSrc(photo)}" alt="Record photo ${index + 1}" />
+        </button>
+      `).join("")}
     </div>
   `;
 }
@@ -2308,7 +2990,7 @@ function renderHistoryLineDetails(record) {
 
 function renderHistoryDetail(record) {
   if (!record) {
-    return `<div class="empty-state small"><strong>Select a record</strong><span>Tap one history record to view details.</span></div>`;
+    return `<div class="empty-state small"><strong>${t("operator.selectRecord", "Select a record")}</strong><span>${t("operator.selectRecordHelp", "Tap one history record to view details.")}</span></div>`;
   }
   return `
     <div class="history-detail-card">
@@ -2320,16 +3002,16 @@ function renderHistoryDetail(record) {
         ${record.status ? `<span class="status-pill open">${escapeHtml(record.status)}</span>` : ""}
       </div>
       <div class="progress-strip history-meta">
-        <div><span>Reference</span><strong>${escapeHtml(record.reference || "-")}</strong></div>
-        <div><span>Action</span><strong>${escapeHtml(record.action || "-")}</strong></div>
-        <div><span>Order</span><strong>${escapeHtml(record.orderId || "-")}</strong></div>
+        <div><span>${t("operator.reference", "Reference")}</span><strong>${escapeHtml(record.reference || "-")}</strong></div>
+        <div><span>${t("operator.action", "Action")}</span><strong>${escapeHtml(record.action || "-")}</strong></div>
+        <div><span>${t("common.order", "Order")}</span><strong>${escapeHtml(record.orderId || "-")}</strong></div>
       </div>
       ${renderHistoryPhotos(record)}
       ${renderHistoryLineDetails(record)}
       <div class="history-report-box">
-        <strong>Report record problem</strong>
-        <textarea id="historyReportReason" placeholder="Describe what is wrong for supervisor review.">${escapeHtml(historyReportReason)}</textarea>
-        <button class="danger-button" data-action="report-history-error" data-record="${record.id}" type="button">Report Error</button>
+        <strong>${t("operator.reportProblem", "Report record problem")}</strong>
+        <textarea id="historyReportReason" placeholder="${t("operator.reportProblemHelp", "Describe what is wrong for supervisor review.")}">${escapeHtml(historyReportReason)}</textarea>
+        <button class="danger-button" data-action="report-history-error" data-record="${record.id}" type="button">${t("operator.reportError", "Report Error")}</button>
       </div>
     </div>
   `;
@@ -2342,7 +3024,7 @@ function renderPersonalHistory() {
     <section class="history-shell">
       <div class="history-toolbar">
         <label>
-          <span>Date</span>
+          <span>${t("operator.date", "Date")}</span>
           <input id="historyDate" type="date" value="${escapeHtml(personalHistoryDate)}" />
         </label>
       </div>
@@ -2357,12 +3039,12 @@ function renderPersonalHistory() {
                 ${item.reference ? `<strong>${escapeHtml(item.reference)}</strong>` : ""}
                 ${item.status ? `<i>${escapeHtml(item.status)}</i>` : ""}
               </button>
-            `).join("") || `<div class="empty-state small"><strong>No history</strong><span>No operator records for this date.</span></div>`}
+            `).join("") || `<div class="empty-state small"><strong>${t("operator.noHistory", "No history")}</strong><span>${t("operator.noHistoryHelp", "No operator records for this date.")}</span></div>`}
           </div>
           <div class="pagination-row">
-            <button class="secondary-button" data-action="history-prev" ${historyPage <= 0 ? "disabled" : ""} type="button">Back</button>
+            <button class="secondary-button" data-action="history-prev" ${historyPage <= 0 ? "disabled" : ""} type="button">${t("common.back", "Back")}</button>
             <strong>${personalHistory.length ? `${historyPage + 1} / ${pageCount(personalHistory, HISTORY_PAGE_SIZE)}` : "0 / 0"}</strong>
-            <button class="secondary-button" data-action="history-next" ${historyPage >= pageCount(personalHistory, HISTORY_PAGE_SIZE) - 1 ? "disabled" : ""} type="button">Next</button>
+            <button class="secondary-button" data-action="history-next" ${historyPage >= pageCount(personalHistory, HISTORY_PAGE_SIZE) - 1 ? "disabled" : ""} type="button">${t("common.next", "Next")}</button>
           </div>
         </div>
         <div class="history-detail">
@@ -2371,8 +3053,8 @@ function renderPersonalHistory() {
       </div>
     </section>
   `, `
-    <button class="secondary-button" data-action="main-menu" type="button">Menu</button>
-    <button class="primary-button" data-action="refresh-history" type="button">Refresh</button>
+    <button class="secondary-button" data-action="main-menu" type="button">${t("common.menu", "Menu")}</button>
+    <button class="primary-button" data-action="refresh-history" type="button">${t("common.refresh", "Refresh")}</button>
     <button class="secondary-button" data-action="logout" type="button">${operator.display_name}</button>
   `);
 }
@@ -2670,7 +3352,34 @@ app.addEventListener("click", async (event) => {
       disconnectEvents();
       return renderLogin();
     }
+    if (button.dataset.action === "toggle-location-dropdown") {
+      locationDropdownOpen = !locationDropdownOpen;
+      return render();
+    }
+    if (button.dataset.action === "set-location-dropdown") {
+      const value = Number(button.dataset.locationId || 0);
+      if (!value || Number(locationId) === value) {
+        locationDropdownOpen = false;
+        return render();
+      }
+      if (currentOrderBlocksMove()) return showToast("Pack current order before changing location.");
+      if (!(await confirmDiscardCustomerPickupDraft())) return;
+      stopFulfillmentCamera();
+      stopReceiptCamera();
+      stopPickupScannerCamera();
+      locationId = value;
+      locationDropdownOpen = false;
+      localStorage.setItem("mbbs.operator.locationId", String(value));
+      localStorage.removeItem(STATE_KEY);
+      selectedId = null;
+      selectedOrder = null;
+      selectedLineId = null;
+      currentModule = "menu";
+      await loadDeliveryNotifications();
+      return render();
+    }
     if (button.dataset.action === "main-menu") {
+      locationDropdownOpen = false;
       if (!(await confirmDiscardCustomerPickupDraft())) return;
       stopFulfillmentCamera();
       stopReceiptCamera();
@@ -2682,8 +3391,37 @@ app.addEventListener("click", async (event) => {
       return render();
     }
     if (button.dataset.action === "open-module") return openModule(button.dataset.module);
+    if (button.dataset.action === "open-urgent-delivery-alert") return openUrgentDeliveryAlert();
+    if (button.dataset.action === "dismiss-urgent-delivery-alert") {
+      urgentDeliveryAlert = null;
+      return render();
+    }
+    if (button.dataset.action === "enable-delivery-notifications") {
+      if (!("Notification" in window)) {
+        showToast("This browser does not support notifications.");
+        return render();
+      }
+      const permission = await Notification.requestPermission().catch(() => "default");
+      if (permission === "granted") {
+        playDeliveryDing();
+        const registration = await navigator.serviceWorker?.ready?.catch(() => null);
+        await registration?.showNotification?.(t("operator.notificationsEnabled", "MBBS notifications enabled"), {
+          body: t("operator.notificationsEnabledBody", "Urgent delivery prep alerts will appear here."),
+          tag: "operator-notification-ready",
+          icon: "/icons/mbbs-yard-192.png",
+          badge: "/icons/mbbs-yard-192.png",
+          silent: true,
+          data: { url: "/operator", notice: "notification-ready" }
+        }).catch(() => {});
+        showToast("Notifications enabled");
+      } else if (permission === "denied") {
+        showToast("Notifications are blocked in browser settings.");
+      }
+      return render();
+    }
     if (button.dataset.action === "lookup-customer-pickup") return lookupCustomerPickup();
     if (button.dataset.action === "start-pickup-scanner") return startPickupScannerCamera();
+    if (button.dataset.action === "switch-pickup-camera") return switchPickupScannerCamera();
     if (button.dataset.action === "customer-pickup-back") {
       if (!(await confirmDiscardCustomerPickupDraft())) return;
       selectedId = null;
@@ -2791,8 +3529,8 @@ app.addEventListener("click", async (event) => {
       return render();
     }
     if (button.dataset.action === "start-receipt-camera") return startReceiptCamera();
+    if (button.dataset.action === "switch-receipt-camera") return switchReceiptCamera();
     if (button.dataset.action === "capture-receipt-photo") return captureReceiptPhoto();
-    if (button.dataset.action === "choose-receipt-photo-file") return document.getElementById("receiptPhoto")?.click();
     if (button.dataset.action === "confirm-receive") return confirmReceipt();
     if (button.dataset.action === "finish-receive") return finishReceipt();
     if (button.dataset.action === "refresh-history") return loadPersonalHistory();
@@ -2825,6 +3563,7 @@ app.addEventListener("click", async (event) => {
     if (button.dataset.action === "save-location") {
       const value = Number(document.getElementById("locationSelect").value);
       locationId = value;
+      locationDropdownOpen = false;
       localStorage.setItem("mbbs.operator.locationId", String(value));
       orderPage = 0;
       linePage = 0;
@@ -2835,6 +3574,7 @@ app.addEventListener("click", async (event) => {
       localStorage.removeItem("mbbs.operator.locationId");
       localStorage.removeItem(STATE_KEY);
       locationId = 0;
+      locationDropdownOpen = false;
       selectedId = null;
       selectedOrder = null;
       return render();
@@ -2850,6 +3590,15 @@ app.addEventListener("click", async (event) => {
       viewMode = "packed";
       orderPage = 0;
       selectedId = null;
+      return loadOrders();
+    }
+    if (button.dataset.action === "delivery-batch-filter") {
+      if (currentOrderBlocksMove()) return showToast("Pack current order before moving on.");
+      deliveryBatchFilter = button.dataset.filter || "batch_a";
+      localStorage.setItem("mbbs.operator.deliveryBatchFilter", deliveryBatchFilter);
+      orderPage = 0;
+      selectedId = null;
+      selectedOrder = null;
       return loadOrders();
     }
     if (button.dataset.action === "sync") {
@@ -2880,7 +3629,7 @@ app.addEventListener("click", async (event) => {
     }
     if (button.dataset.action === "order-next") {
       if (currentOrderBlocksMove()) return showToast("Pack current order before moving on.");
-      orderPage = Math.min(pageCount(orders, ORDER_PAGE_SIZE) - 1, orderPage + 1);
+      orderPage = Math.min(pageCount(filteredDeliveryOrders(), ORDER_PAGE_SIZE) - 1, orderPage + 1);
       return render();
     }
     if (button.dataset.action === "line-prev") {
@@ -2913,12 +3662,16 @@ app.addEventListener("click", async (event) => {
     if (button.dataset.action === "confirm-fulfill") return confirmFulfillment();
     if (button.dataset.action === "finish-fulfill") return finishFulfillment();
     if (button.dataset.action === "start-camera") return startFulfillmentCamera();
+    if (button.dataset.action === "switch-fulfillment-camera") return switchFulfillmentCamera();
     if (button.dataset.action === "capture-photo") return captureFulfillmentPhoto();
-    if (button.dataset.action === "choose-photo-file") return document.getElementById("fulfillmentPhoto")?.click();
     if (button.dataset.action === "select-history") {
       selectedHistoryId = button.dataset.record;
       historyReportReason = "";
       return render();
+    }
+    if (button.dataset.action === "open-history-photo") {
+      openPhotoLightbox(button.dataset.photoRef, button.dataset.photoLabel || "Record photo");
+      return;
     }
     if (button.dataset.action === "history-prev") {
       historyPage = Math.max(0, historyPage - 1);
@@ -3052,9 +3805,18 @@ app.addEventListener("input", async (event) => {
 app.addEventListener("keydown", async (event) => {
   if (event.target?.id === "customerPickupScan" && event.key === "Enter") {
     event.preventDefault();
-    await lookupCustomerPickup();
+    await submitCustomerPickupScanValue(event.target.value);
   }
 });
+
+window.addEventListener("keydown", async (event) => {
+  try {
+    await handleCustomerPickupScannerKey(event);
+  } catch (error) {
+    customerPickupMessage = error.message;
+    render();
+  }
+}, true);
 
 app.addEventListener("change", async (event) => {
   if (event.target?.id === "historyDate") {
@@ -3123,12 +3885,44 @@ async function boot() {
 
 boot();
 setInterval(() => {
-  if (operator && locationId && currentModule === "delivery") loadOrders({ keepSelection: true }).catch((error) => showToast(error.message));
+  if (!operator || !locationId) return;
+  if (currentModule === "delivery") {
+    loadOrders({ keepSelection: true }).catch((error) => showToast(error.message));
+  } else {
+    loadDeliveryNotifications()
+      .then(() => {
+        if (currentModule === "menu" || currentModule === "delivery-select") render();
+      })
+      .catch((error) => showToast(error.message));
+  }
 }, 60000);
 
 if ("serviceWorker" in navigator) {
+  let serviceWorkerRefreshing = false;
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (serviceWorkerRefreshing) return;
+    serviceWorkerRefreshing = true;
+    window.location.reload();
+  });
   window.addEventListener("load", () => {
-    navigator.serviceWorker.register("/service-worker.js").catch(() => {});
+    navigator.serviceWorker.register("/service-worker.js").then((registration) => {
+      registration.update().catch(() => {});
+      if (registration.waiting) registration.waiting.postMessage({ type: "SKIP_WAITING" });
+      registration.addEventListener("updatefound", () => {
+        const worker = registration.installing;
+        if (!worker) return;
+        worker.addEventListener("statechange", () => {
+          if (worker.state === "installed" && navigator.serviceWorker.controller) {
+            worker.postMessage({ type: "SKIP_WAITING" });
+          }
+        });
+      });
+    }).catch(() => {});
+  });
+  navigator.serviceWorker.addEventListener("message", (event) => {
+    if (event.data?.type === "OPEN_URGENT_DELIVERY_ALERT") {
+      openUrgentDeliveryAlert().catch((error) => showToast(error.message));
+    }
   });
 }
 
@@ -3142,5 +3936,9 @@ window.addEventListener("appinstalled", () => {
   appInstalled = true;
   installPromptEvent = null;
   showToast("App installed");
+  render();
+});
+
+window.addEventListener("mbbs-language-changed", () => {
   render();
 });

@@ -1,6 +1,9 @@
 const app = document.getElementById("driverApp");
 const toast = document.getElementById("driverToast");
 const TOKEN_KEY = "mbbs.driver.token";
+const CAMERA_FACING_KEY = "mbbs.camera.facingMode";
+const t = (key, fallback) => window.MBBS_I18N?.t(key, fallback) || fallback;
+const languageToggle = () => window.MBBS_I18N?.toggleHtml() || "";
 
 let authToken = localStorage.getItem(TOKEN_KEY) || "";
 let driver = null;
@@ -15,8 +18,38 @@ let eventSource = null;
 let locationCheck = null;
 let locationOverrideAccepted = false;
 let countdownTimer = null;
+let activeView = "job";
+let driverHistory = [];
+let selectedHistoryId = "";
+let historyDate = localDate();
+let cameraFacingMode = localStorage.getItem(CAMERA_FACING_KEY) === "user" ? "user" : "environment";
 const ITEMS_PER_PAGE = 5;
 const COMPLETE_DELAY_MS = 10000;
+
+function cameraFacingLabel() {
+  return cameraFacingMode === "user"
+    ? t("common.frontCamera", "Front")
+    : t("common.backCamera", "Back");
+}
+
+function cameraCaptureMode() {
+  return cameraFacingMode === "user" ? "user" : "environment";
+}
+
+function switchCameraFacing() {
+  cameraFacingMode = cameraFacingMode === "environment" ? "user" : "environment";
+  localStorage.setItem(CAMERA_FACING_KEY, cameraFacingMode);
+}
+
+function renderCameraSwitchButton() {
+  return `<button class="secondary compact camera-mode-button" data-action="switch-camera" type="button">${t("common.switchCamera", "Switch camera")} (${cameraFacingLabel()})</button>`;
+}
+
+function localDate() {
+  const date = new Date();
+  const offset = date.getTimezoneOffset();
+  return new Date(date.getTime() - offset * 60000).toISOString().slice(0, 10);
+}
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -115,25 +148,101 @@ async function request(path, options = {}) {
   return data;
 }
 
+function dataUrlToFile(dataUrl, filename = "photo.jpg") {
+  const [header, body] = String(dataUrl || "").split(",");
+  const mime = header.match(/data:([^;]+)/)?.[1] || "image/jpeg";
+  const binary = atob(body || "");
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return new File([bytes], filename, { type: mime });
+}
+
+async function uploadDriverPhoto(photo, context = {}) {
+  if (!photo || String(photo).startsWith("r2://")) return photo;
+  if (!String(photo).startsWith("data:image/")) return photo;
+  const ticket = await request("/api/driver/photo-upload-token", {
+    method: "POST",
+    body: JSON.stringify(context)
+  });
+  const file = dataUrlToFile(photo, context.filename || `${context.recordType || "driver-photo"}.jpg`);
+  const formData = new FormData();
+  formData.append("file", file);
+  const response = await fetch(ticket.uploadUrl, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${ticket.token}` },
+    body: formData
+  });
+  const text = await response.text();
+  let payload = null;
+  try {
+    payload = text ? JSON.parse(text) : null;
+  } catch {
+    payload = null;
+  }
+  if (!response.ok) throw new Error(payload?.error || text || "Photo upload failed.");
+  if (!payload?.key) throw new Error("Photo upload did not return an R2 key.");
+  return `r2://${payload.key}`;
+}
+
+async function uploadDriverPhotos(photoValues, context = {}) {
+  const uploaded = [];
+  for (let index = 0; index < photoValues.length; index += 1) {
+    uploaded.push(await uploadDriverPhoto(photoValues[index], {
+      ...context,
+      filename: `${context.recordType || "driver-photo"}-${index + 1}.jpg`
+    }));
+  }
+  return uploaded;
+}
+
+function photoSrc(value) {
+  const text = String(value || "");
+  if (!text.startsWith("r2://")) return text;
+  return `/api/photo-upload/preview?ref=${encodeURIComponent(text)}&token=${encodeURIComponent(authToken || "")}`;
+}
+
+function photoImgSrc(value) {
+  return escapeHtml(photoSrc(value));
+}
+
+function openPhotoLightbox(photoRef, label = "Photo preview") {
+  const ref = String(photoRef || "");
+  if (!ref) return;
+  document.querySelector(".photo-lightbox")?.remove();
+  const modal = document.createElement("div");
+  modal.className = "photo-lightbox";
+  modal.innerHTML = `
+    <div class="photo-lightbox-panel" role="dialog" aria-modal="true" aria-label="${escapeHtml(label)}">
+      <button class="photo-lightbox-close" type="button">×</button>
+      <img src="${photoImgSrc(ref)}" alt="${escapeHtml(label)}" />
+    </div>
+  `;
+  modal.addEventListener("click", (event) => {
+    if (event.target === modal || event.target.closest(".photo-lightbox-close")) modal.remove();
+  });
+  document.body.appendChild(modal);
+}
+
 function renderLogin(message = "") {
   app.innerHTML = `
     <section class="driver-shell">
+      <div class="driver-language">${languageToggle()}</div>
       <div class="driver-content">
         <form class="login-panel" data-form="login">
           <div>
-            <p>MBBS Driver</p>
-            <h1>Driver Login</h1>
+            <p>${t("app.driver", "MBBS Driver")}</p>
+            <h1>${t("driver.loginTitle", "Driver Login")}</h1>
           </div>
           ${message ? `<div class="message">${escapeHtml(message)}</div>` : ""}
           <label>
-            <span>Login</span>
+            <span>${t("common.login", "Login")}</span>
             <input id="driverLogin" autocomplete="username" required />
           </label>
           <label>
-            <span>Password</span>
+            <span>${t("common.password", "Password")}</span>
             <input id="driverPassword" type="password" autocomplete="current-password" />
           </label>
-          <button class="primary" type="submit">Login</button>
+          <button class="primary" type="submit">${t("common.login", "Login")}</button>
         </form>
       </div>
     </section>
@@ -143,6 +252,7 @@ function renderLogin(message = "") {
 function shell(content) {
   app.innerHTML = `
     <section class="driver-shell">
+      <div class="driver-language">${languageToggle()}</div>
       <div class="driver-content">${content}</div>
     </section>
   `;
@@ -152,9 +262,12 @@ function renderNoJob() {
   clearCountdownTimer();
   shell(`
     <section class="empty-panel">
-      <h2>No assigned job</h2>
+      <h2>${t("driver.noJob", "No assigned job")}</h2>
       <p>No pending stop was found for your login in the confirmed dispatch plans.</p>
-      <button class="primary" data-action="refresh" type="button">Refresh</button>
+      <div class="empty-actions">
+        <button class="primary" data-action="refresh" type="button">${t("common.refresh", "Refresh")}</button>
+        <button class="secondary" data-action="open-history" type="button">${t("common.history", "History")}</button>
+      </div>
     </section>
   `);
 }
@@ -185,17 +298,19 @@ function renderDvir(type = "pre", message = "") {
       ${message ? `<div class="message">${escapeHtml(message)}</div>` : ""}
       <div class="photo-grid dvir-photo-grid">
         ${labels.map((label, index) => `
-          <label class="photo-slot dvir-photo-slot">
-            <input data-dvir-photo-index="${index}" type="file" accept="image/*" capture="environment" />
+          <div class="photo-slot dvir-photo-slot">
+            <input data-dvir-photo-index="${index}" type="file" accept="image/*" capture="${cameraCaptureMode()}" />
             <div class="photo-preview">${dvirPhotos[index] ? `<img src="${dvirPhotos[index]}" alt="${escapeHtml(label)}" />` : escapeHtml(label)}</div>
             <button data-action="take-dvir-photo" data-dvir-photo-index="${index}" type="button">Camera</button>
-          </label>
+          </div>
         `).join("")}
       </div>
       <div class="job-actions">
         <button class="primary" data-action="submit-dvir" ${dvirPhotos.filter(Boolean).length >= 4 ? "" : "disabled"} type="button">${isPost ? "Submit Post-Trip" : "Submit Pre-Trip"}</button>
+        ${renderCameraSwitchButton()}
         <button class="secondary compact" data-action="skip-dvir" type="button">Skip DVIR Test</button>
         <button class="secondary compact" data-action="refresh" type="button">Refresh</button>
+        <button class="secondary compact" data-action="open-history" type="button">History</button>
       </div>
     </section>
   `);
@@ -289,15 +404,16 @@ function renderPhotoSlots(job) {
       <section class="photo-panel">
         <div class="photo-head">
           <h3>${job.requiredPhotos} photo${job.requiredPhotos > 1 ? "s" : ""} required</h3>
+          ${renderCameraSwitchButton()}
           <button class="icon-button" data-action="close-photo" type="button">X</button>
         </div>
         <div class="photo-grid">
           ${photos.map((photo, index) => `
-            <label class="photo-slot">
-              <input data-photo-index="${index}" type="file" accept="image/*" capture="environment" />
+            <div class="photo-slot">
+              <input data-photo-index="${index}" type="file" accept="image/*" capture="${cameraCaptureMode()}" />
               <div class="photo-preview">${photo ? `<img src="${photo}" alt="Photo ${index + 1}" />` : `Photo ${index + 1}`}</div>
               <button data-action="take-photo" data-photo-index="${index}" type="button">Camera</button>
-            </label>
+            </div>
           `).join("")}
         </div>
         <button class="primary" data-action="complete-job" ${photos.filter(Boolean).length >= job.requiredPhotos && canConfirmCurrentJob(job) ? "" : "disabled"} type="button">${completeWaitSeconds(job) > 0 ? `Wait ${completeWaitSeconds(job)}s` : "Complete Stop"}</button>
@@ -312,7 +428,7 @@ function renderJob() {
   const isPickup = job.stopType === "pickup";
   const isTravel = job.stopType === "travel";
   const isStarted = job.status === "in_progress";
-  const typeText = isTravel ? "Travel" : isPickup ? "Pickup" : "Drop Off";
+  const typeText = isTravel ? t("driver.travel", "Travel") : isPickup ? t("driver.pickup", "Pickup") : t("driver.dropoff", "Drop Off");
   const titleText = isTravel ? job.location : (job.location || job.address || "Stop");
   const navigationUrl = mapsUrl(job);
   const waitSeconds = completeWaitSeconds(job);
@@ -338,7 +454,7 @@ function renderJob() {
             <strong>${escapeHtml(job.address || job.location || "")}</strong>
             ${isTravel && job.fromAddress ? `<em>Start: ${escapeHtml(job.fromAddress)}</em>` : ""}
           </div>
-          ${navigationUrl ? `<a class="map-button" href="${navigationUrl}" target="_blank" rel="noopener">Maps</a>` : ""}
+          ${navigationUrl ? `<a class="map-button" href="${navigationUrl}" target="_blank" rel="noopener">${t("driver.maps", "Maps")}</a>` : ""}
         </div>
       </div>
       ${renderLocationCheck(job)}
@@ -346,15 +462,97 @@ function renderJob() {
       <div class="job-actions">
         ${isStarted
           ? `<button class="primary" data-action="${job.requiredPhotos ? "show-photo" : "complete-job"}" ${confirmDisabled ? "disabled" : ""} type="button">${waitSeconds > 0 ? `Wait ${waitSeconds}s` : "Confirm"}</button>`
-          : `<button class="primary" data-action="start-job" type="button">Start</button>`}
-        <button class="secondary compact" data-action="refresh" type="button">Refresh</button>
+          : `<button class="primary" data-action="start-job" type="button">${t("common.start", "Start")}</button>`}
+        <button class="secondary compact" data-action="refresh" type="button">${t("common.refresh", "Refresh")}</button>
+        <button class="secondary compact" data-action="open-history" type="button">${t("common.history", "History")}</button>
       </div>
       ${photoPromptOpen ? renderPhotoSlots(job) : ""}
     </section>
   `);
 }
 
+async function loadDriverHistory({ keepSelection = false } = {}) {
+  activeView = "history";
+  clearCountdownTimer();
+  const params = new URLSearchParams({ limit: "100" });
+  if (historyDate) params.set("date", historyDate);
+  const result = await request(`/api/driver/history?${params.toString()}`);
+  driverHistory = result.records || [];
+  if (!keepSelection || !driverHistory.some((item) => String(item.id) === String(selectedHistoryId))) {
+    selectedHistoryId = driverHistory[0]?.id || "";
+  }
+  renderDriverHistory();
+}
+
+function historyTypeText(record) {
+  if (!record) return "Record";
+  if (record.type === "pre_dvir") return "Pre-Trip";
+  if (record.type === "post_dvir") return "Post-Trip";
+  return record.title || "Stop";
+}
+
+function selectedHistoryRecord() {
+  return driverHistory.find((record) => String(record.id) === String(selectedHistoryId)) || driverHistory[0] || null;
+}
+
+function renderHistoryPhotos(record) {
+  const photos = (record?.photos || []).filter(Boolean);
+  if (!photos.length) return `<div class="history-empty small">No photos saved for this record.</div>`;
+  return `
+    <div class="history-photo-grid">
+      ${photos.map((photo, index) => `
+        <button class="history-photo-button" data-action="open-history-photo" data-photo-ref="${escapeHtml(photo)}" data-photo-label="${escapeHtml(historyTypeText(record))} photo ${index + 1}" type="button">
+          <img src="${photoImgSrc(photo)}" alt="${escapeHtml(historyTypeText(record))} photo ${index + 1}" />
+        </button>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderDriverHistory() {
+  const selected = selectedHistoryRecord();
+  shell(`
+    <section class="history-panel">
+      <div class="history-head">
+        <div>
+          <p>${escapeHtml(driver?.name || "Driver")}</p>
+          <h2>Personal History</h2>
+        </div>
+        <button class="secondary compact" data-action="back-job" type="button">Back</button>
+      </div>
+      <div class="history-filter">
+        <input id="driverHistoryDate" type="date" value="${escapeHtml(historyDate)}" />
+        <button class="secondary compact" data-action="refresh-history" type="button">Refresh</button>
+      </div>
+      <div class="history-list">
+        ${driverHistory.map((record) => `
+          <button class="history-record ${String(record.id) === String(selectedHistoryId) ? "active" : ""}" data-action="select-history" data-record="${escapeHtml(record.id)}" type="button">
+            <strong>${escapeHtml(historyTypeText(record))}</strong>
+            <span>${escapeHtml(record.reference || record.truckPlate || "-")}</span>
+            <em>${record.createdAt ? new Date(record.createdAt).toLocaleString() : ""}</em>
+          </button>
+        `).join("") || `<div class="history-empty">No history for this date.</div>`}
+      </div>
+      <div class="history-detail">
+        ${selected ? `
+          <div class="history-detail-title">
+            <strong>${escapeHtml(historyTypeText(selected))}</strong>
+            <span>${escapeHtml(selected.status || "")}</span>
+          </div>
+          <div class="history-meta">
+            <span>${escapeHtml(selected.planDate || "")}</span>
+            <span>${escapeHtml(selected.truckPlate || "")}</span>
+            <span>${escapeHtml(selected.details?.loadName || selected.details?.samsaraDvirId || "")}</span>
+          </div>
+          ${renderHistoryPhotos(selected)}
+        ` : `<div class="history-empty">Select one record.</div>`}
+      </div>
+    </section>
+  `);
+}
+
 async function loadNextJob() {
+  activeView = "job";
   const stateResult = await request("/api/driver/day-state");
   dayState = stateResult.state;
   if (dayState?.truckPlate && (dayState.preDvirStatus !== "complete" || !dayState.samsaraOnDutyConfirmed || !dayState.samsaraPreDvirConfirmed)) {
@@ -413,6 +611,10 @@ function connectEvents() {
     if (!relevant || !driver) return;
     if (photoPromptOpen || photos.some(Boolean)) {
       showToast("Job updated. Finish or close photos to refresh.");
+      return;
+    }
+    if (activeView === "history") {
+      await loadDriverHistory({ keepSelection: true }).catch((error) => showToast(error.message));
       return;
     }
     const beforeJobId = currentJob?.jobId || "";
@@ -475,6 +677,36 @@ app.addEventListener("click", async (event) => {
       showToast(error.message);
     }
   }
+  if (action === "open-history") {
+    try {
+      await loadDriverHistory();
+    } catch (error) {
+      showToast(error.message);
+    }
+  }
+  if (action === "back-job") {
+    try {
+      await loadNextJob();
+    } catch (error) {
+      showToast(error.message);
+    }
+  }
+  if (action === "refresh-history") {
+    historyDate = document.getElementById("driverHistoryDate")?.value || historyDate;
+    try {
+      await loadDriverHistory({ keepSelection: true });
+    } catch (error) {
+      showToast(error.message);
+    }
+  }
+  if (action === "select-history") {
+    selectedHistoryId = button.dataset.record || "";
+    return renderDriverHistory();
+  }
+  if (action === "open-history-photo") {
+    openPhotoLightbox(button.dataset.photoRef, button.dataset.photoLabel || "History photo");
+    return;
+  }
   if (action === "order-page") {
     orderPages[button.dataset.orderKey] = Number(button.dataset.page || 0);
     return renderJob();
@@ -496,6 +728,11 @@ app.addEventListener("click", async (event) => {
     photoPromptOpen = false;
     return renderJob();
   }
+  if (action === "switch-camera") {
+    switchCameraFacing();
+    if (dvirMode) return renderDvir(dvirMode);
+    return renderJob();
+  }
   if (action === "take-photo") {
     const input = app.querySelector(`input[data-photo-index="${button.dataset.photoIndex}"]`);
     input?.click();
@@ -506,11 +743,17 @@ app.addEventListener("click", async (event) => {
   }
   if (action === "submit-dvir") {
     button.disabled = true;
-    button.textContent = "Saving...";
+    button.textContent = "Uploading...";
     try {
+      const type = dvirMode || "pre";
+      const uploadedPhotos = await uploadDriverPhotos(dvirPhotos.filter(Boolean), {
+        recordType: type === "post" ? "driver-dvir-post-photo" : "driver-dvir-pre-photo",
+        dvirType: type
+      });
+      button.textContent = "Saving...";
       const result = await request("/api/driver/dvir", {
         method: "POST",
-        body: JSON.stringify({ type: dvirMode || "pre", photoDataUrls: dvirPhotos.filter(Boolean) })
+        body: JSON.stringify({ type, photoDataUrls: uploadedPhotos })
       });
       dayState = result.state;
       const warning = result.samsaraError ? `Samsara did not receive it: ${result.samsaraError}` : "MBBS inspection saved. Samsara confirmed.";
@@ -567,17 +810,28 @@ app.addEventListener("click", async (event) => {
       return renderJob();
     }
     button.disabled = true;
-    button.textContent = "Saving...";
+    button.textContent = "Uploading...";
     try {
       if (!locationCheck && !locationOverrideAccepted) await checkCurrentJobLocation({ render: false });
       if (locationCheckBlocksComplete()) {
         showToast("Recheck location or confirm override first.");
         return renderJob();
       }
+      const uploadedPhotos = await uploadDriverPhotos(photos.filter(Boolean), {
+        recordType: currentJob.stopType === "pickup" ? "driver-pickup-photo"
+          : currentJob.stopType === "dropoff" ? "driver-dropoff-photo"
+            : "driver-stop-photo",
+        jobId: currentJob.jobId,
+        stopId: currentJob.stopId,
+        planId: currentJob.planId,
+        loadId: currentJob.loadId,
+        orderRef: (currentJob.orderRefs || []).join(",")
+      });
+      button.textContent = "Saving...";
       const result = await request(`/api/driver/jobs/${encodeURIComponent(currentJob.jobId)}/photos`, {
         method: "POST",
         body: JSON.stringify({
-          photoDataUrls: photos.filter(Boolean),
+          photoDataUrls: uploadedPhotos,
           locationOverride: locationOverrideAccepted
         })
       });
@@ -598,6 +852,10 @@ app.addEventListener("click", async (event) => {
 });
 
 app.addEventListener("change", async (event) => {
+  if (event.target?.id === "driverHistoryDate") {
+    historyDate = event.target.value || localDate();
+    return loadDriverHistory();
+  }
   const input = event.target.closest("input[type='file'][data-photo-index]");
   const dvirInput = event.target.closest("input[type='file'][data-dvir-photo-index]");
   if (!input && !dvirInput) return;
@@ -653,6 +911,13 @@ async function init() {
     renderLogin("Please login to continue.");
   }
 }
+
+window.addEventListener("mbbs-language-changed", () => {
+  if (!authToken) return renderLogin();
+  if (activeView === "history") return renderDriverHistory();
+  if (dvirMode) return renderDvir(dvirMode);
+  return renderJob();
+});
 
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/service-worker.js").catch(() => {});

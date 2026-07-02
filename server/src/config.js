@@ -35,6 +35,15 @@ function buildConfig(env) {
       apiToken: env.SAMSARA_API_TOKEN || env.SAMSARA_API_KEY || "",
       dvirAuthorId: env.SAMSARA_DVIR_AUTHOR_ID || ""
     },
+    photoUpload: {
+      provider: env.PHOTO_UPLOAD_PROVIDER || "local_data_url",
+      workerUrl: env.PHOTO_UPLOAD_WORKER_URL || "",
+      tokenSecret: env.PHOTO_UPLOAD_TOKEN_SECRET || "",
+      tokenTtlMinutes: Number(env.PHOTO_UPLOAD_TOKEN_TTL_MINUTES || 45),
+      maxMb: Number(env.PHOTO_UPLOAD_MAX_MB || 10),
+      allowedOrigins: env.PHOTO_UPLOAD_ALLOWED_ORIGINS || "",
+      publicBaseUrl: env.PHOTO_UPLOAD_PUBLIC_BASE_URL || ""
+    },
     netsuite: {
       accountId: env.NETSUITE_ACCOUNT_ID,
       clientId: env.NETSUITE_CLIENT_ID,
@@ -56,6 +65,7 @@ function replaceConfig(target, next) {
   target.databaseUrl = next.databaseUrl;
   target.googleMapsApiKey = next.googleMapsApiKey;
   target.samsara = { ...next.samsara };
+  target.photoUpload = { ...next.photoUpload };
   target.netsuite = { ...next.netsuite };
 }
 

@@ -1014,3 +1014,116 @@ export async function listDriverJobStatuses({ planId = null, planDate = null } =
   );
   return result.rows;
 }
+
+export async function listDriverHistory(driverLogin, { date = "", limit = 100 } = {}) {
+  const safeLimit = Math.min(Math.max(Number(limit) || 100, 1), 200);
+  const login = driverKey(driverLogin);
+  const records = [];
+
+  const dayParams = [login];
+  const dayDateClause = date ? " AND plan_date = $2::date" : "";
+  if (date) dayParams.push(String(date).slice(0, 10));
+  const dayResult = await query(
+    `SELECT id, driver_login, plan_id, plan_date::text AS plan_date,
+            truck_id, truck_plate, samsara_username,
+            COALESCE(pre_dvir_photo_data_urls, '[]'::jsonb) AS pre_photos,
+            COALESCE(post_dvir_photo_data_urls, '[]'::jsonb) AS post_photos,
+            pre_dvir_completed_at, post_dvir_completed_at,
+            COALESCE(samsara_on_duty_response, '{}'::jsonb) AS samsara_on_response,
+            COALESCE(samsara_off_duty_response, '{}'::jsonb) AS samsara_off_response,
+            updated_at
+       FROM driver_day_records
+      WHERE driver_login = $1
+        ${dayDateClause}
+      ORDER BY COALESCE(post_dvir_completed_at, pre_dvir_completed_at, updated_at) DESC
+      LIMIT ${safeLimit}`,
+    dayParams
+  );
+  for (const row of dayResult.rows) {
+    const prePhotos = Array.isArray(row.pre_photos) ? row.pre_photos.filter(Boolean) : [];
+    if (row.pre_dvir_completed_at || prePhotos.length) {
+      records.push({
+        id: `dvir-pre-${row.id}`,
+        type: "pre_dvir",
+        title: "Pre-Trip DVIR",
+        reference: row.truck_plate || "",
+        planDate: row.plan_date || "",
+        truckPlate: row.truck_plate || "",
+        status: row.pre_dvir_completed_at ? "complete" : "photos saved",
+        createdAt: row.pre_dvir_completed_at || row.updated_at,
+        photos: prePhotos,
+        details: {
+          planId: row.plan_id,
+          samsaraUsername: row.samsara_username,
+          samsaraDvirId: row.samsara_on_response?.dvirId || row.samsara_on_response?.dvir?.id || row.samsara_on_response?.verifiedDvir?.id || "",
+          samsaraError: row.samsara_on_response?.error || row.samsara_on_response?.clockError || ""
+        }
+      });
+    }
+    const postPhotos = Array.isArray(row.post_photos) ? row.post_photos.filter(Boolean) : [];
+    if (row.post_dvir_completed_at || postPhotos.length) {
+      records.push({
+        id: `dvir-post-${row.id}`,
+        type: "post_dvir",
+        title: "Post-Trip DVIR",
+        reference: row.truck_plate || "",
+        planDate: row.plan_date || "",
+        truckPlate: row.truck_plate || "",
+        status: row.post_dvir_completed_at ? "complete" : "photos saved",
+        createdAt: row.post_dvir_completed_at || row.updated_at,
+        photos: postPhotos,
+        details: {
+          planId: row.plan_id,
+          samsaraUsername: row.samsara_username,
+          samsaraDvirId: row.samsara_off_response?.dvirId || row.samsara_off_response?.dvir?.id || row.samsara_off_response?.verifiedDvir?.id || "",
+          samsaraError: row.samsara_off_response?.error || row.samsara_off_response?.clockError || ""
+        }
+      });
+    }
+  }
+
+  const jobParams = [login];
+  const jobDateClause = date ? " AND plan_date = $2::date" : "";
+  if (date) jobParams.push(String(date).slice(0, 10));
+  const jobResult = await query(
+    `SELECT id, job_id, plan_id, plan_date::text AS plan_date,
+            truck_id, truck_plate, load_id, load_name, stop_id, stop_type,
+            COALESCE(order_refs, '[]'::jsonb) AS order_refs,
+            COALESCE(photo_data_urls, '[]'::jsonb) AS photos,
+            status, started_at, completed_at, created_at
+       FROM driver_job_records
+      WHERE driver_login = $1
+        AND (status = 'complete' OR photo_data_urls::text LIKE '%r2://%')
+        ${jobDateClause}
+      ORDER BY COALESCE(completed_at, started_at, created_at) DESC, id DESC
+      LIMIT ${safeLimit}`,
+    jobParams
+  );
+  for (const row of jobResult.rows) {
+    const photos = Array.isArray(row.photos) ? row.photos.filter(Boolean) : [];
+    records.push({
+      id: `job-${row.id}`,
+      type: "stop",
+      title: row.stop_type === "pickup" ? "Pickup Stop" : row.stop_type === "dropoff" ? "Drop Off Stop" : "Travel Stop",
+      reference: Array.isArray(row.order_refs) ? row.order_refs.join(", ") : "",
+      planDate: row.plan_date || "",
+      truckPlate: row.truck_plate || "",
+      status: row.status || "",
+      createdAt: row.completed_at || row.started_at || row.created_at,
+      photos,
+      details: {
+        jobId: row.job_id,
+        planId: row.plan_id,
+        loadName: row.load_name,
+        stopType: row.stop_type,
+        orderRefs: row.order_refs || [],
+        startedAt: row.started_at,
+        completedAt: row.completed_at
+      }
+    });
+  }
+
+  return records
+    .sort((left, right) => new Date(right.createdAt || 0) - new Date(left.createdAt || 0))
+    .slice(0, safeLimit);
+}

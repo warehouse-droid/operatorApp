@@ -1,4 +1,9 @@
 const dvirApp = document.getElementById("dispatchDvirApp");
+const t = (key, fallback) => window.MBBS_I18N?.t(key, fallback) || fallback;
+const languageToggle = () => window.MBBS_I18N?.toggleHtml() || "";
+const DISPATCH_TOKEN_KEY = "mbbs.dispatch.token";
+const CONTROL_TOKEN_KEY = "mbbs.control.token";
+const OPERATOR_TOKEN_KEY = "mbbs.operator.token";
 
 let dvirOperator = null;
 let dvirDate = localDate();
@@ -21,6 +26,38 @@ function escapeHtml(value) {
     "\"": "&quot;",
     "'": "&#39;"
   }[char]));
+}
+
+function authToken() {
+  return localStorage.getItem(DISPATCH_TOKEN_KEY) || localStorage.getItem(CONTROL_TOKEN_KEY) || localStorage.getItem(OPERATOR_TOKEN_KEY) || "";
+}
+
+function photoSrc(value) {
+  const text = String(value || "");
+  if (!text.startsWith("r2://")) return text;
+  return `/api/photo-upload/preview?ref=${encodeURIComponent(text)}&token=${encodeURIComponent(authToken())}`;
+}
+
+function photoImgSrc(value) {
+  return escapeHtml(photoSrc(value));
+}
+
+function openPhotoLightbox(photoRef, label = "Photo preview") {
+  const ref = String(photoRef || "");
+  if (!ref) return;
+  document.querySelector(".photo-lightbox")?.remove();
+  const modal = document.createElement("div");
+  modal.className = "photo-lightbox";
+  modal.innerHTML = `
+    <div class="photo-lightbox-panel" role="dialog" aria-modal="true" aria-label="${escapeHtml(label)}">
+      <button class="photo-lightbox-close" type="button">×</button>
+      <img src="${photoImgSrc(ref)}" alt="${escapeHtml(label)}" />
+    </div>
+  `;
+  modal.addEventListener("click", (event) => {
+    if (event.target === modal || event.target.closest(".photo-lightbox-close")) modal.remove();
+  });
+  document.body.appendChild(modal);
 }
 
 function formatTime(value) {
@@ -98,7 +135,9 @@ function renderPhotoGrid(photos, label) {
     <div class="dvir-photo-grid">
       ${photos.map((photo, index) => `
         <figure class="dvir-photo">
-          <img src="${photo}" alt="${escapeHtml(label)} photo ${index + 1}" />
+          <button class="dvir-photo-button" data-action="open-dvir-photo" data-photo-ref="${escapeHtml(photo)}" data-photo-label="${escapeHtml(label)} photo ${index + 1}" type="button">
+            <img src="${photoImgSrc(photo)}" alt="${escapeHtml(label)} photo ${index + 1}" />
+          </button>
           <figcaption>${escapeHtml(label)} ${index + 1}</figcaption>
         </figure>
       `).join("")}
@@ -153,14 +192,15 @@ function renderDvirApp() {
   dvirApp.innerHTML = `
     <header class="dispatch-topbar">
       <div>
-        <p>MBBS Transportation</p>
-        <h1>DVIR Photos</h1>
+        <p>${t("app.transportation", "MBBS Transportation")}</p>
+        <h1>${t("dispatch.dvirPhotos", "DVIR Photos")}</h1>
       </div>
       <div class="topbar-controls">
         <input id="dvirDate" type="date" value="${escapeHtml(dvirDate)}" />
         <button class="primary" data-action="refresh-dvir" type="button">Refresh</button>
       </div>
       <div class="topbar-actions">
+        ${languageToggle()}
         <button onclick="location.href='/dispatch'" type="button">Menu</button>
         <span class="dispatch-user">${escapeHtml(dvirOperator?.display_name || dvirOperator?.username || "")}</span>
         <button onclick="dispatchLogout()" type="button">Logout</button>
@@ -194,12 +234,20 @@ dvirApp.addEventListener("click", (event) => {
     if (value) dvirDate = value;
     loadDvirRecords({ keepSelection: true });
   }
+  if (action === "open-dvir-photo") {
+    const button = event.target.closest("[data-action='open-dvir-photo']");
+    openPhotoLightbox(button?.dataset.photoRef, button?.dataset.photoLabel || "DVIR photo");
+  }
 });
 
 dvirApp.addEventListener("change", (event) => {
   if (event.target?.id !== "dvirDate") return;
   dvirDate = event.target.value || localDate();
   loadDvirRecords();
+});
+
+window.addEventListener("mbbs-language-changed", () => {
+  renderDvirApp();
 });
 
 requireDispatchLogin({

@@ -58,15 +58,89 @@ async function pickupSalesOrderRefs(plan) {
   return new Set(result.rows.map((row) => String(row.tranid || "")));
 }
 
+function numberValue(value) {
+  const number = Number(value ?? 0);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function collectPlanItemIds(plan) {
+  const ids = new Set();
+  const visitOrder = (order) => {
+    for (const item of order?.items || []) {
+      const itemId = Number(item?.itemId ?? item?.item_id);
+      if (Number.isInteger(itemId) && itemId > 0) ids.add(itemId);
+    }
+    for (const child of order?.childOrderDetails || []) visitOrder(child);
+  };
+  for (const order of plan?.orders || []) visitOrder(order);
+  return [...ids];
+}
+
+async function inventoryWeightLookup(itemIds) {
+  if (!itemIds.length) return new Map();
+  const result = await query(
+    `SELECT item_id, item_weight, to_plt, to_lyr, to_sec, to_pcs
+       FROM inventory_items
+      WHERE item_id = ANY($1::bigint[])`,
+    [itemIds]
+  );
+  return new Map(result.rows.map((row) => [Number(row.item_id), row]));
+}
+
+function enrichOrderWeights(order, inventoryByItemId) {
+  if (!order) return order;
+  const items = (order.items || []).map((item) => {
+    const itemId = Number(item.itemId ?? item.item_id);
+    const inventory = inventoryByItemId.get(itemId);
+    const itemWeight = numberValue(item.itemWeight ?? item.item_weight) || numberValue(inventory?.item_weight);
+    const quantity = numberValue(item.quantity ?? item.salesQty);
+    const lineWeight = itemWeight && quantity ? quantity * itemWeight : numberValue(item.lineWeight);
+    return {
+      ...item,
+      itemWeight,
+      lineWeight,
+      toPlt: item.toPlt ?? item.to_plt ?? inventory?.to_plt ?? null,
+      toLyr: item.toLyr ?? item.to_lyr ?? inventory?.to_lyr ?? null,
+      toSec: item.toSec ?? item.to_sec ?? inventory?.to_sec ?? null,
+      toPcs: item.toPcs ?? item.to_pcs ?? inventory?.to_pcs ?? null
+    };
+  });
+  const calculatedWeight = items.reduce((sum, item) => sum + numberValue(item.lineWeight), 0);
+  const childOrderDetails = (order.childOrderDetails || []).map((child) => enrichOrderWeights(child, inventoryByItemId));
+  const raw = order.raw ? {
+    ...order.raw,
+    items: Array.isArray(order.raw.items) ? items : order.raw.items,
+    total_weight_lbs: calculatedWeight > 0 ? String(calculatedWeight) : order.raw.total_weight_lbs
+  } : order.raw;
+  return {
+    ...order,
+    items,
+    raw,
+    childOrderDetails,
+    weight: calculatedWeight > 0 ? calculatedWeight : numberValue(order.weight)
+  };
+}
+
+async function enrichDispatchPlanWeights(plan) {
+  if (!plan) return null;
+  const inventoryByItemId = await inventoryWeightLookup(collectPlanItemIds(plan));
+  if (!inventoryByItemId.size) return plan;
+  return {
+    ...plan,
+    orders: (plan.orders || []).map((order) => enrichOrderWeights(order, inventoryByItemId))
+  };
+}
+
 async function sanitizeDispatchPlan(plan) {
   if (!plan) return null;
   const pickupRefs = await pickupSalesOrderRefs(plan);
-  if (!pickupRefs.size) return plan;
+  const enrichedPlan = await enrichDispatchPlanWeights(plan);
+  if (!pickupRefs.size) return enrichedPlan;
 
   return {
-    ...plan,
-    orders: (plan.orders || []).filter((order) => !pickupRefs.has(String(order?.id || ""))),
-    trucks: (plan.trucks || []).map((truck) => ({
+    ...enrichedPlan,
+    orders: (enrichedPlan.orders || []).filter((order) => !pickupRefs.has(String(order?.id || ""))),
+    trucks: (enrichedPlan.trucks || []).map((truck) => ({
       ...truck,
       loads: (truck.loads || []).map((load) => ({
         ...load,
@@ -74,9 +148,9 @@ async function sanitizeDispatchPlan(plan) {
       }))
     })),
     summary: {
-      ...(plan.summary || {}),
+      ...(enrichedPlan.summary || {}),
       removedPickupOrderRefs: [
-        ...new Set([...(plan.summary?.removedPickupOrderRefs || []), ...pickupRefs])
+        ...new Set([...(enrichedPlan.summary?.removedPickupOrderRefs || []), ...pickupRefs])
       ]
     }
   };

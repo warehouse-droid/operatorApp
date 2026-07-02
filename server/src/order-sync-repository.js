@@ -16,6 +16,16 @@ function normalizeNumber(value) {
   return Number(String(value).replaceAll(",", ""));
 }
 
+function normalizeBigintId(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const text = String(value).replaceAll(",", "").trim();
+  if (/^-?\d+$/.test(text)) return Number(text);
+  if (/^-?\d+\.\d+$/.test(text)) {
+    return Number(text.replace(".", ""));
+  }
+  return null;
+}
+
 function normalizeQuantity(value) {
   const number = normalizeNumber(value);
   return number === null ? null : Math.abs(number);
@@ -88,8 +98,8 @@ function normalizeReceivingOrder(order, orderType) {
 
 function normalizeLine(line) {
   return {
-    line_id: line.line_id,
-    item_id: line.item_id,
+    line_id: normalizeBigintId(line.uniquekey ?? line.line_unique_key ?? line.lineUniqueKey ?? line.line_id),
+    item_id: normalizeBigintId(line.item_id),
     item_name: line.item_name,
     item_type: line.item_type,
     item_type_text: line.item_type_text,
@@ -99,7 +109,7 @@ function normalizeLine(line) {
     netsuite_received_qty: normalizeQuantity(line.netsuite_received_qty),
     unit: line.unit,
     item_weight: normalizeNumber(line.item_weight),
-    location_id: line.location_id,
+    location_id: normalizeBigintId(line.location_id),
     location: line.location,
     pallet_qty: normalizeQuantity(line.pallet_qty),
     layer_qty: normalizeQuantity(line.layer_qty),
@@ -124,6 +134,95 @@ async function auditSyncChange({ action, orderId = null, lineId = null, existing
     lineId,
     details: existing ? { changes } : { [detailsKey]: normalized }
   });
+}
+
+async function rekeyLineIfSingleCandidate({ table, orderColumn, orderId, normalized, stage = null }) {
+  if (!normalized.line_id || !normalized.item_id) return null;
+  const params = [orderId, normalized.line_id, normalized.item_id, normalized.location_id ?? null];
+  const stageClause = stage ? "AND line_stage = $5" : "";
+  if (stage) params.push(stage);
+  const candidates = await query(
+    `SELECT *
+       FROM ${table}
+      WHERE ${orderColumn} = $1
+        ${stageClause}
+        AND line_id IS DISTINCT FROM $2
+        AND item_id = $3
+        AND ($4::bigint IS NULL OR location_id = $4)
+        AND netsuite_active = true
+      ORDER BY synced_at DESC NULLS LAST, id DESC
+      LIMIT 2`,
+    params
+  );
+  if (candidates.rows.length !== 1) return null;
+
+  const previous = candidates.rows[0];
+  const updated = await query(
+    `UPDATE ${table}
+        SET line_id = $2,
+            synced_at = now()
+      WHERE id = $1
+      RETURNING *`,
+    [previous.id, normalized.line_id]
+  );
+  const row = updated.rows[0] || null;
+  if (row) {
+    await writeAudit({
+      actorType: "system",
+      source: "netsuite",
+      action: "netsuite.line.rekey",
+      orderId,
+      lineId: normalized.line_id,
+      details: {
+        table,
+        previousLineId: previous.line_id,
+        lineId: normalized.line_id,
+        itemId: normalized.item_id,
+        locationId: normalized.location_id
+      }
+    });
+  }
+  return row;
+}
+
+async function upsertInventoryItemFromLine(normalized) {
+  if (!normalized.item_id) return;
+  await query(
+    `INSERT INTO inventory_items (
+       item_id, item_name, display_name, item_description, item_type,
+       item_type_text, stock_unit, item_weight, to_plt, to_lyr, to_sec,
+       to_pcs, raw, synced_at
+     ) VALUES (
+       $1, $2, null, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, now()
+     )
+     ON CONFLICT (item_id) DO UPDATE SET
+       item_name = COALESCE(NULLIF(EXCLUDED.item_name, ''), inventory_items.item_name),
+       item_description = COALESCE(NULLIF(EXCLUDED.item_description, ''), inventory_items.item_description),
+       item_type = COALESCE(NULLIF(EXCLUDED.item_type, ''), inventory_items.item_type),
+       item_type_text = COALESCE(NULLIF(EXCLUDED.item_type_text, ''), inventory_items.item_type_text),
+       stock_unit = COALESCE(NULLIF(EXCLUDED.stock_unit, ''), inventory_items.stock_unit),
+       item_weight = COALESCE(EXCLUDED.item_weight, inventory_items.item_weight),
+       to_plt = COALESCE(EXCLUDED.to_plt, inventory_items.to_plt),
+       to_lyr = COALESCE(EXCLUDED.to_lyr, inventory_items.to_lyr),
+       to_sec = COALESCE(EXCLUDED.to_sec, inventory_items.to_sec),
+       to_pcs = COALESCE(EXCLUDED.to_pcs, inventory_items.to_pcs),
+       raw = inventory_items.raw || EXCLUDED.raw,
+       synced_at = now()`,
+    [
+      normalized.item_id,
+      normalized.item_name || normalized.sku || String(normalized.item_id),
+      normalized.item_description,
+      normalized.item_type,
+      normalized.item_type_text,
+      normalized.unit,
+      normalized.item_weight,
+      normalized.to_plt,
+      normalized.to_lyr,
+      normalized.to_sec,
+      normalized.to_pcs,
+      JSON.stringify({ orderLine: normalized.raw || normalized })
+    ]
+  );
 }
 
 export async function upsertSalesOrders(orders = []) {
@@ -346,13 +445,22 @@ export async function upsertOutboundTransferOrders(orders = []) {
 export async function upsertSalesOrderLines(orderId, lines = []) {
   for (const line of lines || []) {
     const normalized = normalizeLine(line);
-    const existing = await query(
+    let existing = await query(
       `SELECT *
          FROM sales_order_lines
         WHERE sales_order_id = $1
           AND line_id = $2`,
       [orderId, normalized.line_id]
     );
+    if (!existing.rows[0]) {
+      const rekeyed = await rekeyLineIfSingleCandidate({
+        table: "sales_order_lines",
+        orderColumn: "sales_order_id",
+        orderId,
+        normalized
+      });
+      if (rekeyed) existing = { rows: [rekeyed] };
+    }
     await query(
       `INSERT INTO sales_order_lines (
          sales_order_id, line_id, item_id, item_name, item_type, item_type_text,
@@ -434,6 +542,7 @@ export async function upsertSalesOrderLines(orderId, lines = []) {
         normalized.to_pcs
       ]
     );
+    await upsertInventoryItemFromLine(normalized);
     await auditSyncChange({
       action: "netsuite.line",
       orderId,
@@ -458,7 +567,7 @@ export async function upsertOutboundTransferOrderLines(orderId, lines = []) {
 async function upsertTransferOrderLines(orderId, lines = [], stage) {
   for (const line of lines || []) {
     const normalized = normalizeLine(line);
-    const existing = await query(
+    let existing = await query(
       `SELECT *
          FROM transfer_order_lines
         WHERE transfer_order_id = $1
@@ -466,6 +575,16 @@ async function upsertTransferOrderLines(orderId, lines = [], stage) {
           AND line_id = $3`,
       [orderId, stage, normalized.line_id]
     );
+    if (!existing.rows[0]) {
+      const rekeyed = await rekeyLineIfSingleCandidate({
+        table: "transfer_order_lines",
+        orderColumn: "transfer_order_id",
+        orderId,
+        normalized,
+        stage
+      });
+      if (rekeyed) existing = { rows: [rekeyed] };
+    }
     const existingId = existing.rows[0]?.id || null;
     await query(
       `INSERT INTO transfer_order_lines (
@@ -479,8 +598,8 @@ async function upsertTransferOrderLines(orderId, lines = [], stage) {
          $1, COALESCE($2::bigint, nextval('canonical_order_line_id_seq')),
          $3, $4, $5, $6, $7, $8, $9, $10,
          $11, $12, $13, $14, $15, $16, $17, $18,
-         $19, $20, $21, COALESCE($22, 0), $23, true,
-         null, null, $24::jsonb, now(), $25, $26, COALESCE($27, 0)
+         $19, $20, $21, COALESCE($22::numeric, 0), $23, true,
+         null, null, $24::jsonb, now(), $25, $26, COALESCE($27::numeric, 0)
        )
        ON CONFLICT (line_stage, id) DO UPDATE SET
          transfer_order_id = EXCLUDED.transfer_order_id,
@@ -561,6 +680,7 @@ async function upsertTransferOrderLines(orderId, lines = [], stage) {
         normalized.netsuite_received_qty
       ]
     );
+    await upsertInventoryItemFromLine(normalized);
     await auditSyncChange({
       action: stage === "receiving" ? "netsuite.receiving_line" : "netsuite.line",
       orderId,
@@ -596,22 +716,51 @@ export async function listExistingOutboundOrderIds({ locationId = null, orderFam
   return result.rows.map((row) => row.netsuite_id);
 }
 
-export async function markOutboundOrderMissing(orderId) {
+export async function markOutboundOrderMissing(orderId, { orderFamily = "sales_order" } = {}) {
+  if (orderFamily === "transfer_order") {
+    await query(
+      `UPDATE transfer_order_lines
+          SET netsuite_active = false,
+              sync_exception = CASE WHEN (
+                COALESCE(packed_pallet_qty, 0)
+                + COALESCE(packed_layer_qty, 0)
+                + COALESCE(packed_section_qty, 0)
+                + COALESCE(packed_piece_qty, 0)
+              ) > 0 THEN 'line_deleted' ELSE sync_exception END,
+              sync_exception_at = CASE WHEN (
+                COALESCE(packed_pallet_qty, 0)
+                + COALESCE(packed_layer_qty, 0)
+                + COALESCE(packed_section_qty, 0)
+                + COALESCE(packed_piece_qty, 0)
+              ) > 0 THEN now() ELSE sync_exception_at END,
+              synced_at = now()
+        WHERE transfer_order_id = $1
+          AND line_stage = 'outbound'
+          AND netsuite_active = true`,
+      [orderId]
+    );
+    await query(
+      `UPDATE transfer_orders
+          SET netsuite_active = false,
+              netsuite_missing_at = now(),
+              synced_at = now()
+        WHERE netsuite_id = $1
+          AND NOT EXISTS (
+            SELECT 1
+              FROM transfer_order_lines l
+             WHERE l.transfer_order_id = transfer_orders.netsuite_id
+               AND l.netsuite_active = true
+          )`,
+      [orderId]
+    );
+    return;
+  }
   await query(
     `UPDATE sales_orders
         SET netsuite_active = false,
             netsuite_missing_at = now(),
             synced_at = now()
       WHERE netsuite_id = $1`,
-    [orderId]
-  );
-  await query(
-    `UPDATE transfer_orders
-        SET netsuite_active = false,
-            netsuite_missing_at = now(),
-            synced_at = now()
-      WHERE netsuite_id = $1
-        AND outbound_operator_status IS NOT NULL`,
     [orderId]
   );
 }
@@ -668,6 +817,25 @@ export async function markMissingOutboundOrderLines(orderId, activeLineIds = [])
 export async function updateSalesOrderNetSuiteStatus(orderId, patch = {}) {
   const result = await query(
     `UPDATE sales_orders
+        SET status = COALESCE($2, status),
+            status_text = COALESCE($3, status_text),
+            status_updated_at = CASE
+              WHEN status IS DISTINCT FROM COALESCE($2, status)
+                OR status_text IS DISTINCT FROM COALESCE($3, status_text)
+              THEN now()
+              ELSE status_updated_at
+            END,
+            synced_at = now()
+      WHERE netsuite_id = $1
+      RETURNING netsuite_id, tranid, status, status_text`,
+    [orderId, patch.status || null, patch.statusText || patch.status_text || null]
+  );
+  return result.rows[0] || null;
+}
+
+export async function updatePurchaseOrderNetSuiteStatus(orderId, patch = {}) {
+  const result = await query(
+    `UPDATE purchase_orders
         SET status = COALESCE($2, status),
             status_text = COALESCE($3, status_text),
             status_updated_at = CASE
@@ -791,13 +959,22 @@ export async function upsertPurchaseOrders(orders = []) {
 export async function upsertPurchaseOrderLines(orderId, lines = []) {
   for (const line of lines || []) {
     const normalized = normalizeLine(line);
-    const existing = await query(
+    let existing = await query(
       `SELECT *
          FROM purchase_order_lines
         WHERE purchase_order_id = $1
           AND line_id = $2`,
       [orderId, normalized.line_id]
     );
+    if (!existing.rows[0]) {
+      const rekeyed = await rekeyLineIfSingleCandidate({
+        table: "purchase_order_lines",
+        orderColumn: "purchase_order_id",
+        orderId,
+        normalized
+      });
+      if (rekeyed) existing = { rows: [rekeyed] };
+    }
     await query(
       `INSERT INTO purchase_order_lines (
          purchase_order_id, line_id, item_id, item_name, item_type,
@@ -808,7 +985,7 @@ export async function upsertPurchaseOrderLines(orderId, lines = []) {
          sync_exception_at, raw, synced_at
        ) VALUES (
          $1, $2, $3, $4, $5, $6, $7, $8,
-         $9, COALESCE($10, 0), $11, $12, $13, $14, $15,
+         $9, COALESCE($10::numeric, 0), $11, $12, $13, $14, $15,
          $16, $17, $18, $19, $20, $21, $22, true, null,
          null, $23::jsonb, now()
        )
@@ -864,6 +1041,7 @@ export async function upsertPurchaseOrderLines(orderId, lines = []) {
         JSON.stringify(normalized.raw || {})
       ]
     );
+    await upsertInventoryItemFromLine(normalized);
     await auditSyncChange({
       action: "netsuite.receiving_line",
       existing: existing.rows[0] || null,
@@ -1025,12 +1203,56 @@ export async function markMissingInboundOrders({ orderFamily, activeOrderIds = [
     params.push(destinationLocationId);
     clauses.push(`destination_location_id = $${params.length}`);
   }
+  if (!isTransfer) {
+    await query(
+      `UPDATE purchase_orders
+          SET netsuite_active = false,
+              netsuite_missing_at = now(),
+              synced_at = now()
+        WHERE ${clauses.join(" AND ")}`,
+      params
+    );
+    return;
+  }
+
   await query(
-    `UPDATE ${isTransfer ? "transfer_orders" : "purchase_orders"}
+    `UPDATE transfer_order_lines
+        SET netsuite_active = false,
+            sync_exception = CASE WHEN (
+              COALESCE(received_pallet_qty, 0)
+              + COALESCE(received_layer_qty, 0)
+              + COALESCE(received_section_qty, 0)
+              + COALESCE(received_piece_qty, 0)
+            ) > 0 THEN 'line_deleted' ELSE sync_exception END,
+            sync_exception_at = CASE WHEN (
+              COALESCE(received_pallet_qty, 0)
+              + COALESCE(received_layer_qty, 0)
+              + COALESCE(received_section_qty, 0)
+              + COALESCE(received_piece_qty, 0)
+            ) > 0 THEN now() ELSE sync_exception_at END,
+            synced_at = now()
+      WHERE line_stage = 'receiving'
+        AND transfer_order_id IN (
+          SELECT netsuite_id
+            FROM transfer_orders
+           WHERE ${clauses.join(" AND ")}
+        )
+        AND netsuite_active = true`,
+    params
+  );
+
+  await query(
+    `UPDATE transfer_orders
         SET netsuite_active = false,
             netsuite_missing_at = now(),
             synced_at = now()
-      WHERE ${clauses.join(" AND ")}`,
+      WHERE ${clauses.join(" AND ")}
+        AND NOT EXISTS (
+          SELECT 1
+            FROM transfer_order_lines l
+           WHERE l.transfer_order_id = transfer_orders.netsuite_id
+             AND l.netsuite_active = true
+        )`,
     params
   );
 }

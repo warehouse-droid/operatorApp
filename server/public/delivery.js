@@ -1,6 +1,8 @@
 const LOCATIONS = [
   { id: 1, text: "3445" },
-  { id: 13, text: "2967" }
+  { id: 13, text: "2967" },
+  { id: 15, text: "12441" },
+  { id: 26, text: "150" }
 ];
 
 const ORDER_PAGE_SIZE = 4;

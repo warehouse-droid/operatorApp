@@ -28,21 +28,6 @@ function isConcurrencyLimit(status, text) {
     || /CONCURRENT_REQUEST_LIMIT_EXCEEDED|concurrent limit|exceeded.*request/i.test(text || "");
 }
 
-function isoDateDaysAgo(days = 0) {
-  const date = new Date();
-  date.setDate(date.getDate() - days);
-  return [
-    date.getFullYear(),
-    String(date.getMonth() + 1).padStart(2, "0"),
-    String(date.getDate()).padStart(2, "0")
-  ].join("-");
-}
-
-function normalizeSuiteqlDate(value) {
-  const text = String(value || "").trim();
-  return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : isoDateDaysAgo(1);
-}
-
 function openLineQuantitySql(alias = "tl") {
   return `(ABS(NVL(${alias}.quantity, 0)) - ABS(NVL(${alias}.quantityshiprecv, 0)))`;
 }
@@ -51,12 +36,31 @@ function openLineFilterSql(alias = "tl") {
   return `${openLineQuantitySql(alias)} > 0.000001`;
 }
 
-function deliveryOrderListQuery(locationId = 1, { createdFrom = "" } = {}) {
+const EXCLUDED_SALES_ORDER_PREFIXES = ["SOV", "SOT"];
+
+function excludedSalesOrderPrefixSql(alias = "t") {
+  return EXCLUDED_SALES_ORDER_PREFIXES
+    .map((prefix) => `AND UPPER(${alias}.tranid) NOT LIKE '${prefix}%'`)
+    .join("\n  ");
+}
+
+function outboundStatusFilterSql(alias = "t") {
+  return `(${alias}.status = 'B' OR BUILTIN.DF(${alias}.status) LIKE '%Pending Fulfillment%' OR BUILTIN.DF(${alias}.status) LIKE '%Partially Fulfilled%')`;
+}
+
+function receivingStatusFilterSql(alias = "t") {
+  return `(BUILTIN.DF(${alias}.status) LIKE '%Pending Receipt%' OR BUILTIN.DF(${alias}.status) LIKE '%Partially Received%')`;
+}
+
+function purchaseReceivingStatusFilterSql(alias = "t") {
+  return `(${alias}.status = 'B' OR ${receivingStatusFilterSql(alias)})`;
+}
+
+function deliveryOrderListQuery(locationId = 1) {
   const id = Number(locationId);
   if (!Number.isInteger(id) || id <= 0) {
     throw new Error("A valid numeric NetSuite location ID is required.");
   }
-  const orderCreatedFrom = normalizeSuiteqlDate(createdFrom);
 
   return `
 SELECT DISTINCT
@@ -80,14 +84,12 @@ SELECT DISTINCT
 FROM transaction t
 INNER JOIN transactionline tl ON tl.transaction = t.id
 WHERE t.type = 'SalesOrd'
+  ${excludedSalesOrderPrefixSql("t")}
   AND tl.item IS NOT NULL
   AND tl.location = ${id}
   AND tl.mainline = 'F'
   AND tl.taxline = 'F'
-  AND (
-    (t.status = 'B' AND t.createddate >= TO_DATE('${orderCreatedFrom}', 'YYYY-MM-DD'))
-    OR BUILTIN.DF(t.status) LIKE '%Partially Fulfilled%'
-  )
+  AND ${outboundStatusFilterSql("t")}
   AND ${openLineFilterSql("tl")}
   AND t.custbody3 = 2
 ORDER BY t.createddate DESC, t.tranid DESC
@@ -120,7 +122,7 @@ WHERE t.type = 'PurchOrd'
   AND tl.location = ${id}
   AND tl.mainline = 'F'
   AND (tl.taxline = 'F' OR tl.taxline IS NULL)
-  AND (t.status = 'B' OR BUILTIN.DF(t.status) LIKE '%Partially Received%')
+  AND ${purchaseReceivingStatusFilterSql("t")}
   AND ${openLineFilterSql("tl")}
 ORDER BY t.trandate DESC, t.tranid DESC
 `;
@@ -131,8 +133,8 @@ function transferOrderListQuery({ statusText, sourceLocationId = null, destinati
   const destinationFilter = destinationLocationId ? `AND t.transferlocation = ${Number(destinationLocationId)}` : "";
   const lineLocationFilter = lineLocationId ? `AND tl.location = ${Number(lineLocationId)}` : "";
   const statusFilter = statusText === "Pending Fulfillment"
-    ? "AND (t.status = 'B' OR BUILTIN.DF(t.status) LIKE '%Partially Fulfilled%')"
-    : `AND (BUILTIN.DF(t.status) LIKE '%${statusText}%' OR BUILTIN.DF(t.status) LIKE '%Partially Received%')`;
+    ? `AND ${outboundStatusFilterSql("t")}`
+    : `AND ${receivingStatusFilterSql("t")}`;
   const lineSignFilter = lineDirection === "destination" ? "AND tl.quantity > 0" : "AND tl.quantity < 0";
   return `
 SELECT DISTINCT
@@ -235,7 +237,7 @@ function normalizeTransferDetailLines(lines, { sourceLocationId = null, destinat
   const seen = new Set();
   return filtered
     .map((line) => ({ ...line, quantity: toNumber(line.quantity) }))
-    .map((line) => (sourceLocationId ? normalizeOpenDeliveryLine(line) : line))
+    .map(normalizeOpenDeliveryLine)
     .filter((line) => {
       const key = [
         line.item_id,
@@ -527,14 +529,13 @@ export async function suiteqlAll(q, params = [], { pageSize = 1000 } = {}) {
   }
 }
 
-export async function fetchDeliveryOrdersFromNetSuite(locationId = 1, { createdFrom = "" } = {}) {
-  const result = await suiteql(deliveryOrderListQuery(locationId, { createdFrom }));
-  return result.items || [];
+export async function fetchDeliveryOrdersFromNetSuite(locationId = 1) {
+  return suiteqlAll(deliveryOrderListQuery(locationId));
 }
 
 export async function fetchTransferDeliveryOrdersFromNetSuite(locationId = 1) {
-  const result = await suiteql(transferOrderListQuery({ statusText: "Pending Fulfillment", lineLocationId: locationId }));
-  return (result.items || []).map((order) => ({
+  const result = await suiteqlAll(transferOrderListQuery({ statusText: "Pending Fulfillment", lineLocationId: locationId }));
+  return result.map((order) => ({
     ...order,
     order_type: "transfer_order",
     customer_id: order.destination_location_id,
@@ -579,9 +580,12 @@ export async function fetchDeliveryOrderFromNetSuite(orderId, locationId = null)
     INNER JOIN transactionline tl ON tl.transaction = t.id
     WHERE t.id = ${id}
       AND t.type = 'SalesOrd'
+      ${excludedSalesOrderPrefixSql("t")}
       AND tl.item IS NOT NULL
       AND tl.mainline = 'F'
       AND tl.taxline = 'F'
+      AND ${outboundStatusFilterSql("t")}
+      AND ${openLineFilterSql("tl")}
       ${locationFilter}
     ORDER BY t.trandate DESC
   `);
@@ -620,6 +624,7 @@ export async function fetchCustomerPickupOrderFromNetSuite(code, locationId = nu
     INNER JOIN transactionline tl ON tl.transaction = t.id
     WHERE ${orderFilter}
       AND t.type = 'SalesOrd'
+      ${excludedSalesOrderPrefixSql("t")}
       AND tl.item IS NOT NULL
       AND tl.mainline = 'F'
       AND tl.taxline = 'F'
@@ -677,8 +682,11 @@ export async function fetchTransferDeliveryOrderFromNetSuite(orderId, locationId
     WHERE t.id = ${id}
       AND t.type = 'TrnfrOrd'
       AND tl.item IS NOT NULL
+      AND tl.quantity < 0
       AND tl.mainline = 'F'
       AND tl.taxline = 'F'
+      AND ${outboundStatusFilterSql("t")}
+      AND ${openLineFilterSql("tl")}
       ${locationFilter}
     ORDER BY t.trandate DESC
   `);
@@ -709,7 +717,7 @@ export async function fetchDeliveryOrderDetailsFromNetSuite(orderId, locationId 
 
   const detailQuery = `
     SELECT
-      tl.id AS line_id,
+      tl.uniquekey AS line_id,
       tl.item AS item_id,
       BUILTIN.DF(tl.item) AS item_name,
       i.itemtype AS item_type,
@@ -732,11 +740,19 @@ export async function fetchDeliveryOrderDetailsFromNetSuite(orderId, locationId 
     FROM transactionline tl
     LEFT JOIN item i ON i.id = tl.item
     WHERE tl.transaction = ${id}
+      AND EXISTS (
+        SELECT 1
+          FROM transaction t
+         WHERE t.id = tl.transaction
+           AND t.type = 'SalesOrd'
+           ${excludedSalesOrderPrefixSql("t")}
+      )
       AND tl.item IS NOT NULL
       AND tl.mainline = 'F'
       AND tl.taxline = 'F'
+      AND ${openLineFilterSql("tl")}
       ${locationFilter}
-    ORDER BY tl.id
+    ORDER BY tl.uniquekey
   `;
 
   const result = await suiteql(detailQuery);
@@ -752,7 +768,7 @@ export async function fetchTransferOrderDetailsFromNetSuite(orderId, locationId 
 
   const result = await suiteql(`
     SELECT
-      tl.id AS line_id,
+      tl.uniquekey AS line_id,
       tl.item AS item_id,
       BUILTIN.DF(tl.item) AS item_name,
       i.itemtype AS item_type,
@@ -778,8 +794,9 @@ export async function fetchTransferOrderDetailsFromNetSuite(orderId, locationId 
       AND tl.item IS NOT NULL
       AND tl.mainline = 'F'
       AND tl.taxline = 'F'
+      AND ${openLineFilterSql("tl")}
       ${locationFilter}
-    ORDER BY tl.id
+    ORDER BY tl.uniquekey
   `);
   return normalizeTransferDetailLines(result.items || [], direction === "destination"
     ? { destinationLocationId: locationId }
@@ -787,8 +804,8 @@ export async function fetchTransferOrderDetailsFromNetSuite(orderId, locationId 
 }
 
 export async function fetchPurchaseOrdersFromNetSuite(locationId = 1) {
-  const result = await suiteql(purchaseOrderListQuery(locationId));
-  return (result.items || []).map((order) => ({ ...order, order_type: "purchase_order" }));
+  const result = await suiteqlAll(purchaseOrderListQuery(locationId));
+  return result.map((order) => ({ ...order, order_type: "purchase_order" }));
 }
 
 export async function fetchPurchaseOrderFromNetSuite(orderId, locationId = null) {
@@ -817,6 +834,8 @@ export async function fetchPurchaseOrderFromNetSuite(orderId, locationId = null)
       AND tl.item IS NOT NULL
       AND tl.mainline = 'F'
       AND (tl.taxline = 'F' OR tl.taxline IS NULL)
+      AND ${purchaseReceivingStatusFilterSql("t")}
+      AND ${openLineFilterSql("tl")}
       ${locationFilter}
     ORDER BY t.trandate DESC
   `);
@@ -832,7 +851,7 @@ export async function fetchPurchaseOrderDetailsFromNetSuite(orderId, locationId 
   const locationFilter = locationId ? `AND tl.location = ${Number(locationId)}` : "";
   const result = await suiteql(`
     SELECT
-      tl.id AS line_id,
+      tl.uniquekey AS line_id,
       tl.item AS item_id,
       BUILTIN.DF(tl.item) AS item_name,
       i.itemtype AS item_type,
@@ -858,21 +877,22 @@ export async function fetchPurchaseOrderDetailsFromNetSuite(orderId, locationId 
       AND tl.item IS NOT NULL
       AND tl.mainline = 'F'
       AND (tl.taxline = 'F' OR tl.taxline IS NULL)
+      AND ${openLineFilterSql("tl")}
       ${locationFilter}
-    ORDER BY tl.id
+    ORDER BY tl.uniquekey
   `);
-  return result.items || [];
+  return (result.items || []).map(normalizeOpenDeliveryLine);
 }
 
 export async function fetchTransferReceivingOrdersFromNetSuite({ sourceLocationId = null, destinationLocationId = null } = {}) {
-  const result = await suiteql(transferOrderListQuery({
+  const result = await suiteqlAll(transferOrderListQuery({
     statusText: "Pending Receipt",
     sourceLocationId,
     destinationLocationId,
     lineLocationId: destinationLocationId || null,
     lineDirection: "destination"
   }));
-  return (result.items || []).map((order) => ({
+  return result.map((order) => ({
     ...order,
     order_type: "transfer_order",
     source_location_id: order.source_location_id,
@@ -910,6 +930,8 @@ export async function fetchTransferReceivingOrderFromNetSuite(orderId, sourceLoc
       AND tl.quantity > 0
       AND tl.mainline = 'F'
       AND tl.taxline = 'F'
+      AND ${receivingStatusFilterSql("t")}
+      AND ${openLineFilterSql("tl")}
       ${sourceFilter}
     ORDER BY t.trandate DESC
   `);
@@ -925,7 +947,7 @@ export async function fetchTransferReceivingOrderFromNetSuite(orderId, sourceLoc
   };
 }
 
-export async function fetchInventoryBalancesFromNetSuite(locationIds = [1, 13]) {
+export async function fetchInventoryBalancesFromNetSuite(locationIds = [1, 13, 15, 26]) {
   const ids = locationIds
     .map((id) => Number(id))
     .filter((id) => Number.isInteger(id) && id > 0);

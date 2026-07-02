@@ -1,4 +1,6 @@
 const setupApp = document.getElementById("dispatchSetupApp");
+const t = (key, fallback) => window.MBBS_I18N?.t(key, fallback) || fallback;
+const languageToggle = () => window.MBBS_I18N?.toggleHtml() || "";
 
 let setupTab = "drivers";
 let selectedSetupIndex = null;
@@ -12,9 +14,10 @@ let trucks = [
   { plate: "MBBS-318", capacityLbs: 52000 }
 ];
 let ownYards = [
-  { code: "3445", name: "3445", address: "3445 Kennedy Road, Toronto, ON", lat: 43.8204306, lng: -79.3053423 },
-  { code: "2967", name: "2967", address: "2967 Kennedy Road, Toronto, ON", lat: 43.806119, lng: -79.2986377 },
-  { code: "12441", name: "12441", address: "12441 Woodbine Avenue, Whitchurch-Stouffville, ON", lat: 43.948694, lng: -79.3727582 }
+  { code: "3445", name: "3445", locationId: 1, address: "3445 Kennedy Road, Toronto, ON", lat: 43.8204306, lng: -79.3053423 },
+  { code: "2967", name: "2967", locationId: 13, address: "2967 Kennedy Road, Toronto, ON", lat: 43.806119, lng: -79.2986377 },
+  { code: "12441", name: "12441", locationId: 15, address: "12441 Woodbine Avenue, Whitchurch-Stouffville, ON", lat: 43.948694, lng: -79.3727582 },
+  { code: "150", name: "150", locationId: 26, address: "150 Clark Blvd, Brampton, ON L6T 4Y8, Canada" }
 ];
 let vendorYards = [];
 let parserRules = [];
@@ -232,10 +235,10 @@ function renderSetup() {
     <section class="dispatch-shell setup-shell">
       <header class="dispatch-topbar">
         <div>
-          <p>MBBS Transportation</p>
-          <h1>Dispatch Setup</h1>
+          <p>${t("app.transportation", "MBBS Transportation")}</p>
+          <h1>${t("dispatch.setup", "Dispatch Setup")}</h1>
         </div>
-        <div></div>
+        <div class="topbar-language">${languageToggle()}</div>
         <div class="topbar-actions">
           <button onclick="location.href='/dispatch'" type="button">Dispatch Menu</button>
           <button onclick="location.href='/dispatch/planning'" type="button">Back to Planner</button>
@@ -382,6 +385,7 @@ function renderOwnYards() {
         <h3>${selected ? "Update Yard" : "Add Yard"}</h3>
         <label><span>Yard code</span><input name="code" value="${escapeHtml(selected?.code || "")}" placeholder="3445" required /></label>
         <label><span>Display name</span><input name="name" value="${escapeHtml(selected?.name || selected?.code || "")}" placeholder="3445" /></label>
+        <label><span>NetSuite internal ID</span><input name="locationId" type="number" value="${escapeHtml(selected?.locationId ?? "")}" placeholder="1" /></label>
         <label><span>Address</span><input name="address" value="${escapeHtml(selected?.address || "")}" placeholder="3445 Kennedy Road, Toronto, ON" required /></label>
         <label><span>Latitude optional</span><input name="lat" type="number" step="0.000001" value="${escapeHtml(selected?.lat ?? "")}" /></label>
         <label><span>Longitude optional</span><input name="lng" type="number" step="0.000001" value="${escapeHtml(selected?.lng ?? "")}" /></label>
@@ -776,6 +780,7 @@ setupApp.addEventListener("submit", (event) => {
     const yard = {
       code,
       name: String(data.name || code).trim(),
+      locationId: data.locationId === "" ? null : Number(data.locationId),
       address,
       lat: data.lat === "" ? null : Number(data.lat),
       lng: data.lng === "" ? null : Number(data.lng)
@@ -861,6 +866,10 @@ async function initDispatchSetup() {
   connectEvents();
   renderSetup();
 }
+
+window.addEventListener("mbbs-language-changed", () => {
+  renderSetup();
+});
 
 requireDispatchLogin({
   mount: setupApp,

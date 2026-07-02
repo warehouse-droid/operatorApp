@@ -4,7 +4,8 @@ import { query } from "./db.js";
 const YARD_ADDRESSES = {
   "3445": "3445 Kennedy Road, Toronto, ON",
   "2967": "2967 Kennedy Road, Toronto, ON",
-  "12441": "12441 Woodbine Avenue, Whitchurch-Stouffville, ON"
+  "12441": "12441 Woodbine Avenue, Whitchurch-Stouffville, ON",
+  "150": "150 Clark Blvd, Brampton, ON L6T 4Y8, Canada"
 };
 
 const VENDOR_YARDS = [

@@ -16,6 +16,11 @@ function positiveQuantity(value) {
   return number === null ? 0 : Math.max(number, 0);
 }
 
+function isPhotoReference(value) {
+  const text = String(value || "");
+  return text.startsWith("data:image/") || text.startsWith("r2://");
+}
+
 function roundQuantity(value) {
   return Math.round((Number(value) || 0) * 1000000) / 1000000;
 }
@@ -694,7 +699,7 @@ export async function confirmLocalCoReceivingLine(coRefOrId, lineRowId, values, 
 }
 
 export async function receiveLocalCoOrder(coRefOrId, operatorId, { photoDataUrls = [] } = {}) {
-  const photos = Array.isArray(photoDataUrls) ? photoDataUrls.filter((item) => String(item || "").startsWith("data:image/")) : [];
+  const photos = Array.isArray(photoDataUrls) ? photoDataUrls.filter(isPhotoReference) : [];
   if (photos.length < 2) throw new Error("Two receiving photos are required.");
   const co = await getLocalCoReceivingOrder(coRefOrId);
   if (!co) throw new Error("Local CO not found.");
@@ -922,7 +927,7 @@ export async function receiveLocalCoOrder(coRefOrId, operatorId, { photoDataUrls
 }
 
 export async function recordReceivingReceipt(orderId, operatorId, { photoDataUrls, payload, response, itemReceiptId, itemReceiptTranid }) {
-  const photos = Array.isArray(photoDataUrls) ? photoDataUrls.filter((item) => String(item || "").startsWith("data:image/")) : [];
+  const photos = Array.isArray(photoDataUrls) ? photoDataUrls.filter(isPhotoReference) : [];
   if (photos.length < 2) throw new Error("Two receiving photos are required.");
   const order = await getReceivingOrder(orderId);
   if (!order) throw new Error("Receiving order not found.");

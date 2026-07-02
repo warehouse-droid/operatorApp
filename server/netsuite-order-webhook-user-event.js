@@ -13,9 +13,12 @@
  */
 define(["N/https", "N/log", "N/record", "N/runtime", "N/search"], (https, log, record, runtime, search) => {
   const PARAM_URLS = [
+    "custscriptmbbs_webhook_url",
     "custscript_mbbs_webhook_url"
   ];
   const PARAM_SECRETS = [
+    "custscriptwh_webhook_secret_i",
+    "custscript_mbbs_webhook_secret",
     "custscript_webhook_secret_id"
   ];
 
@@ -145,8 +148,8 @@ define(["N/https", "N/log", "N/record", "N/runtime", "N/search"], (https, log, r
       if (!itemId) continue;
       if (!cache[itemId]) cache[itemId] = itemDetails(itemId);
       const item = cache[itemId] || {};
-      const lineId = getLineValueSafe(rec, line, "line")
-        || getLineValueSafe(rec, line, "lineuniquekey")
+      const lineId = getLineValueSafe(rec, line, "lineuniquekey")
+        || getLineValueSafe(rec, line, "line")
         || line + 1;
       const lineLocationId = getLineValueSafe(rec, line, "location") || getValueSafe(rec, "location");
       const lineLocationText = getLineTextSafe(rec, line, "location") || getTextSafe(rec, "location");
@@ -156,6 +159,7 @@ define(["N/https", "N/log", "N/record", "N/runtime", "N/search"], (https, log, r
         || "";
       lines.push({
         lineId,
+        lineUniqueKey: lineId,
         itemId,
         itemName: item.itemName || getLineTextSafe(rec, line, "item"),
         itemType: getLineValueSafe(rec, line, "itemtype"),

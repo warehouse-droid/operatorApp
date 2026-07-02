@@ -6,19 +6,21 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { config, listEnvFiles, selectEnvFile } from "./config.js";
 import { beginRollbackContext, pool, query, withTransaction } from "./db.js";
 import { buildAuthorizationUrl, exchangeCodeForToken, fetchDeliveryOrdersFromNetSuite, fetchDeliveryOrderFromNetSuite, fetchCustomerPickupOrderFromNetSuite, fetchDeliveryOrderDetailsFromNetSuite, fetchTransferDeliveryOrdersFromNetSuite, fetchTransferDeliveryOrderFromNetSuite, fetchTransferOrderDetailsFromNetSuite, fetchPurchaseOrdersFromNetSuite, fetchPurchaseOrderFromNetSuite, fetchPurchaseOrderDetailsFromNetSuite, fetchTransferReceivingOrdersFromNetSuite, fetchTransferReceivingOrderFromNetSuite, fetchInventoryBalanceForItemFromNetSuite, fetchInventoryBalancesFromNetSuite, fetchItemFulfillmentFromNetSuite, fetchItemReceiptFromNetSuite, fetchTransactionStatusFromNetSuite, transformSalesOrderToItemFulfillment, transformTransferOrderToItemFulfillment, transformPurchaseOrderToItemReceipt, transformTransferOrderToItemReceipt } from "./netsuite.js";
-import { listDeliveryOrders, getDeliveryOrder, getFulfillableDeliveryOrder, buildItemFulfillmentPayload, markDeliveryPrepared, updateDeliveryStatus, confirmDeliveryLine, setDeliveryLinePackedQuantity, unpackDeliveryLine, unpackDeliveryOrder, recordDeliveryFulfillment, recordDeliveryFulfillmentFailure, recordDeliveryLoad, listDeliveryFulfillments, resetDeliveryFulfillmentState, applyConfirmedDispatchPlanToDelivery } from "./delivery-repository.js";
+import { listDeliveryOrders, getDeliveryOrder, getFulfillableDeliveryOrder, buildItemFulfillmentPayload, markDeliveryPrepared, updateDeliveryStatus, confirmDeliveryLine, setDeliveryLinePackedQuantity, unpackDeliveryLine, unpackDeliveryOrder, recordDeliveryFulfillment, recordDeliveryFulfillmentFailure, recordDeliveryLoad, listDeliveryFulfillments, listControlLoadedOrders, getControlLoadedOrderDetail, listControlLoadedOrderCsvRows, getDeliveryPrepNotifications, resetDeliveryFulfillmentState, applyConfirmedDispatchPlanToDelivery } from "./delivery-repository.js";
 import { clearCustomerPickupDraft, confirmCustomerPickupLine, findCustomerPickupOrder, isPendingApprovalStatus, isPickupDeliveryMethod, recordCustomerPickupLoad } from "./customer-pickup-repository.js";
 import { createOperator, getOperatorByToken, hasOperators, listAudit, listOperators, loginOperator, logoutToken, setOperatorActive, updateOperatorPassword, writeAudit } from "./auth-repository.js";
 import { applyInventoryClassificationRules, confirmCycleCountLine, getCycleCountDraft, listCycleCountRecords, listInventoryClassifications, listInventoryFacets, listInventoryItems, submitCycleCount, updateInventoryClassification, upsertInventoryBalances } from "./inventory-repository.js";
 import { listReceivingVendors, listReceivingSources, listReceivingOrders, getReceivingOrder, searchReceivingItems, confirmReceivingLine, getReceivableReceivingOrder, buildItemReceiptPayload, recordReceivingReceipt, recordReceivingReceiptFailure, listReceivingReceipts, listLocalCoSources, listLocalCoReceivingOrders, searchLocalCoItems, getLocalCoReceivingOrder, confirmLocalCoReceivingLine, receiveLocalCoOrder } from "./receiving-repository.js";
-import { listExistingInboundOrderIds, listExistingOutboundOrderIds, markMissingInboundOrderLines, markMissingInboundOrders, markMissingOutboundOrderLines, markOutboundOrderMissing, updateSalesOrderNetSuiteStatus, upsertInboundTransferOrderLines, upsertInboundTransferOrders, upsertOutboundTransferOrderLines, upsertOutboundTransferOrders, upsertPurchaseOrderLines, upsertPurchaseOrders, upsertSalesOrderLines, upsertSalesOrders } from "./order-sync-repository.js";
+import { listExistingInboundOrderIds, listExistingOutboundOrderIds, markMissingInboundOrderLines, markMissingInboundOrders, markMissingOutboundOrderLines, markOutboundOrderMissing, updatePurchaseOrderNetSuiteStatus, updateSalesOrderNetSuiteStatus, upsertInboundTransferOrderLines, upsertInboundTransferOrders, upsertOutboundTransferOrderLines, upsertOutboundTransferOrders, upsertPurchaseOrderLines, upsertPurchaseOrders, upsertSalesOrderLines, upsertSalesOrders } from "./order-sync-repository.js";
 import { listOperatorHistory, listRecordWarnings, reportOperatorRecordError, resolveRecordWarning } from "./history-repository.js";
 import { listDispatchOrders, refreshDispatchEnrichment, setPurchaseOrderVendorYard, updateDispatchOrderDetails, getSalesOrderPoAllocationOptions, createSalesOrderPoAllocation, createSalesOrderPoAllocations, cancelSalesOrderPoAllocation, createDispatchOperatorRequest, upsertLocalCoOrder, cancelLocalCoOrder, listDispatchOperatorRequests, resolveDispatchOperatorRequestsForOrder } from "./dispatch-repository.js";
 import { listDispatchVendorYards, updateDispatchVendorYard, upsertDispatchVendorYard, listDispatchParserRules, updateDispatchParserRule, listOllamaAudit } from "./dispatch-enrichment.js";
 import { listDispatchAudit, writeDispatchAudit } from "./dispatch-audit-repository.js";
 import { confirmDispatchPlan, createDispatchPlan, getCurrentDispatchPlan, getDispatchPlan, listDispatchPlans, reopenDispatchPlan, saveDispatchPlanSnapshot } from "./dispatch-plan-repository.js";
-import { getDriverDayState, getNextDriverJob, listDriverJobStatuses, recordDriverJobPhotos, skipDriverDvirForTesting, startDriverJob, submitDriverDvir } from "./driver-repository.js";
+import { getDispatchStatistics } from "./dispatch-statistics-repository.js";
+import { getDriverDayState, getNextDriverJob, listDriverHistory, listDriverJobStatuses, recordDriverJobPhotos, skipDriverDvirForTesting, startDriverJob, submitDriverDvir } from "./driver-repository.js";
 import { createSamsaraDriverAuthToken, createSamsaraDriverVehicleAssignment, findSamsaraDriverByUsername, listSamsaraVehicleLocations, setSamsaraDriverDutyStatus, testSamsaraConnection } from "./samsara.js";
+import { createPhotoReadToken, createPhotoUploadToken, isR2PhotoReference, publicPhotoUploadConfig } from "./photo-upload.js";
 
 const app = express();
 const dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -27,24 +29,14 @@ const qrScannerDir = path.resolve(dirname, "../node_modules/qr-scanner");
 const dataDir = path.resolve(dirname, "../data");
 const dispatchPlanPath = path.join(dataDir, "dispatch-plan.json");
 const dispatchSetupPath = path.join(dataDir, "dispatch-setup.json");
-const deliveryLocations = [1, 13, 15];
+const deliveryLocations = [1, 13, 15, 26];
 const fulfillmentJobs = new Map();
 const receivingJobs = new Map();
 const driverSessions = new Map();
 const eventClients = new Set();
-const delayedSalesOrderStatusRefreshes = new Map();
+const delayedTransactionStatusRefreshes = new Map();
 const driverGeocodeCache = new Map();
 let eventSeq = 0;
-
-function localDateDaysAgo(days = 0) {
-  const date = new Date();
-  date.setDate(date.getDate() - days);
-  return [
-    date.getFullYear(),
-    String(date.getMonth() + 1).padStart(2, "0"),
-    String(date.getDate()).padStart(2, "0")
-  ].join("-");
-}
 
 const defaultDispatchSetup = {
   drivers: [
@@ -57,15 +49,15 @@ const defaultDispatchSetup = {
     { plate: "MBBS-318", capacityLbs: 52000 }
   ],
   ownYards: [
-    { code: "3445", name: "3445", address: "3445 Kennedy Road, Toronto, ON", lat: 43.8204306, lng: -79.3053423 },
-    { code: "2967", name: "2967", address: "2967 Kennedy Road, Toronto, ON", lat: 43.806119, lng: -79.2986377 },
-    { code: "12441", name: "12441", address: "12441 Woodbine Avenue, Whitchurch-Stouffville, ON", lat: 43.948694, lng: -79.3727582 }
+    { code: "3445", name: "3445", locationId: 1, address: "3445 Kennedy Road, Toronto, ON", lat: 43.8204306, lng: -79.3053423 },
+    { code: "2967", name: "2967", locationId: 13, address: "2967 Kennedy Road, Toronto, ON", lat: 43.806119, lng: -79.2986377 },
+    { code: "12441", name: "12441", locationId: 15, address: "12441 Woodbine Avenue, Whitchurch-Stouffville, ON", lat: 43.948694, lng: -79.3727582 },
+    { code: "150", name: "150", locationId: 26, address: "150 Clark Blvd, Brampton, ON L6T 4Y8, Canada" }
   ],
   sync: {
     mode: "manual",
     intervalSeconds: 60,
     maxRunSeconds: 900,
-    salesOrderCreatedFrom: localDateDaysAgo(1),
     running: false,
     lastStartedAt: "",
     lastFinishedAt: "",
@@ -90,6 +82,40 @@ function orderTransactionType(orderRef, order = {}) {
     TO: "Transfer Order",
     PO: "Purchase Order"
   }[type] || "Sales Order";
+}
+
+function dispatchOperatorAssignmentMap(plan = {}) {
+  const orderById = new Map((plan.orders || []).map((order) => [String(order?.id || ""), order]));
+  const assignments = new Map();
+  for (const truck of plan.trucks || []) {
+    for (const load of truck.loads || []) {
+      if (load.returnOnly) continue;
+      for (const stop of load.stops || []) {
+        if (stop?.type !== "drop" || !stop.orderId) continue;
+        const order = orderById.get(String(stop.orderId || ""));
+        if (!["SO", "TO"].includes(order?.type)) continue;
+        const orderRef = String(order.id || stop.orderId || "");
+        assignments.set(orderRef, [
+          order.type,
+          plan.planDate || "",
+          truck.plate || "",
+          load.name || "",
+          truck.parkingSpot || ""
+        ].join("|"));
+      }
+    }
+  }
+  return assignments;
+}
+
+function changedDispatchOperatorRefs(beforePlan = {}, afterPlan = {}) {
+  const before = dispatchOperatorAssignmentMap(beforePlan);
+  const after = dispatchOperatorAssignmentMap(afterPlan);
+  const changed = [];
+  for (const [orderRef, signature] of after.entries()) {
+    if (before.get(orderRef) !== signature) changed.push(orderRef);
+  }
+  return changed;
 }
 
 function dispatchPlanStopIds(plan) {
@@ -585,6 +611,40 @@ async function requireDriver(req, res, next) {
   }
 }
 
+async function photoPreviewViewer(req) {
+  const token = bearerToken(req);
+  const operator = await getOperatorByToken(token);
+  if (operator) {
+    return {
+      id: operator.id,
+      username: operator.username,
+      role: operator.role,
+      source: ["dispatcher", "admin"].includes(operator.role) ? "dispatch" : "operator"
+    };
+  }
+  const session = driverSessions.get(token);
+  if (session) {
+    return {
+      id: session.login,
+      login: session.login,
+      role: "driver",
+      source: "driver"
+    };
+  }
+  return null;
+}
+
+async function requirePhotoPreviewViewer(req, res, next) {
+  try {
+    const viewer = await photoPreviewViewer(req);
+    if (!viewer) return res.status(401).json({ error: "Login required" });
+    req.photoViewer = viewer;
+    next();
+  } catch (error) {
+    next(error);
+  }
+}
+
 async function requireOperator(req, res, next) {
   try {
     const operator = await getOperatorByToken(bearerToken(req));
@@ -641,19 +701,17 @@ async function readDispatchSetup() {
 }
 
 function normalizeSyncSettings(sync = {}) {
-  const mode = sync.mode === "auto" ? "auto" : "manual";
-  const intervalSeconds = Number(sync.intervalSeconds || defaultDispatchSetup.sync.intervalSeconds);
-  const maxRunSeconds = Number(sync.maxRunSeconds || defaultDispatchSetup.sync.maxRunSeconds);
-  const salesOrderCreatedFrom = /^\d{4}-\d{2}-\d{2}$/.test(String(sync.salesOrderCreatedFrom || ""))
-    ? String(sync.salesOrderCreatedFrom)
-    : defaultDispatchSetup.sync.salesOrderCreatedFrom;
+  const cleanSync = { ...(sync || {}) };
+  delete cleanSync.salesOrderCreatedFrom;
+  const mode = cleanSync.mode === "auto" ? "auto" : "manual";
+  const intervalSeconds = Number(cleanSync.intervalSeconds || defaultDispatchSetup.sync.intervalSeconds);
+  const maxRunSeconds = Number(cleanSync.maxRunSeconds || defaultDispatchSetup.sync.maxRunSeconds);
   return {
     ...defaultDispatchSetup.sync,
-    ...sync,
+    ...cleanSync,
     mode,
     intervalSeconds: Number.isFinite(intervalSeconds) && intervalSeconds >= 30 ? Math.round(intervalSeconds) : defaultDispatchSetup.sync.intervalSeconds,
     maxRunSeconds: Number.isFinite(maxRunSeconds) && maxRunSeconds >= 60 ? Math.round(maxRunSeconds) : defaultDispatchSetup.sync.maxRunSeconds,
-    salesOrderCreatedFrom,
     running: Boolean(sync.running)
   };
 }
@@ -676,12 +734,12 @@ function normalizeOrderType(value) {
   return value === "transfer_order" || value === "transfer" ? "transfer_order" : "sales_order";
 }
 
-async function syncDeliveryLocation(locationId, { includeDetails = true, orderType = "sales_order", salesOrderCreatedFrom = "" } = {}) {
+async function syncDeliveryLocation(locationId, { includeDetails = true, orderType = "sales_order" } = {}) {
   assertDispatchSyncCanContinue("delivery list");
   const normalizedOrderType = normalizeOrderType(orderType);
   const discoveredOrders = normalizedOrderType === "transfer_order"
     ? await fetchTransferDeliveryOrdersFromNetSuite(locationId)
-    : await fetchDeliveryOrdersFromNetSuite(locationId, { createdFrom: salesOrderCreatedFrom });
+    : await fetchDeliveryOrdersFromNetSuite(locationId);
   assertDispatchSyncCanContinue("delivery list");
   if (normalizedOrderType === "transfer_order") await upsertOutboundTransferOrders(discoveredOrders);
   else await upsertSalesOrders(discoveredOrders);
@@ -702,7 +760,7 @@ async function syncDeliveryLocation(locationId, { includeDetails = true, orderTy
       : await fetchDeliveryOrderFromNetSuite(orderId, locationId);
     assertDispatchSyncCanContinue(`delivery order ${orderId}`);
     if (!trackedOrder) {
-      await markOutboundOrderMissing(orderId);
+      await markOutboundOrderMissing(orderId, { orderFamily: normalizedOrderType });
       await writeAudit({
         actorType: "system",
         source: "netsuite",
@@ -735,7 +793,7 @@ async function syncDeliveryLocation(locationId, { includeDetails = true, orderTy
     actorType: "system",
     source: "netsuite",
     action: "netsuite.delivery.sync",
-    details: { locationId, orderType: normalizedOrderType, salesOrderCreatedFrom: normalizedOrderType === "sales_order" ? salesOrderCreatedFrom : "", discovered: discoveredOrders.length, tracked: orderCount, missing: missingCount, lines: detailCount }
+    details: { locationId, orderType: normalizedOrderType, discovered: discoveredOrders.length, tracked: orderCount, missing: missingCount, lines: detailCount }
   });
 
   return { discovered: discoveredOrders.length, tracked: orderCount, missing: missingCount, lines: detailCount };
@@ -791,7 +849,7 @@ async function runDispatchSync({ source = "manual", actorOperatorId = null } = {
   });
   try {
     assertDispatchSyncCanContinue("start");
-    const synced = await syncDispatchOrderFeed({ salesOrderCreatedFrom: settings.salesOrderCreatedFrom });
+    const synced = await syncDispatchOrderFeed();
     assertDispatchSyncCanContinue("enrichment");
     const enriched = await refreshDispatchEnrichment();
     const finishedAt = new Date().toISOString();
@@ -878,6 +936,8 @@ async function clearOperationalOrderData({ actorOperatorId = null } = {}) {
     "driver_job_records",
     "driver_day_records",
     "local_co_receipt_records",
+    "co_order_lines",
+    "co_orders",
     "local_co_order_lines",
     "local_co_orders",
     "dispatch_plan_snapshots",
@@ -909,6 +969,8 @@ async function clearOperationalOrderData({ actorOperatorId = null } = {}) {
     action: "order_data.clear",
     details: { tables, counts }
   });
+  await fs.rm(dispatchPlanPath, { force: true }).catch(() => {});
+  emitAppEvent("dispatch.plan.cleared", { change: "order_data_clear" });
   emitAppEvent("dispatch.orders.updated", { change: "order_data_clear" });
   emitAppEvent("delivery.order.updated", { change: "order_data_clear" });
   emitAppEvent("receiving.order.updated", { change: "order_data_clear" });
@@ -938,7 +1000,7 @@ async function recoverInterruptedSyncState() {
   });
 }
 
-async function syncDispatchOrderFeed({ salesOrderCreatedFrom = "" } = {}) {
+async function syncDispatchOrderFeed() {
   const deliveryResults = [];
   const receivingResults = [];
   for (const locationId of deliveryLocations) {
@@ -946,7 +1008,7 @@ async function syncDispatchOrderFeed({ salesOrderCreatedFrom = "" } = {}) {
     deliveryResults.push({
       locationId,
       orderType: "sales_order",
-      synced: await syncDeliveryLocation(locationId, { orderType: "sales_order", salesOrderCreatedFrom })
+      synced: await syncDeliveryLocation(locationId, { orderType: "sales_order" })
     });
     assertDispatchSyncCanContinue(`location ${locationId} transfer delivery orders`);
     deliveryResults.push({
@@ -1094,6 +1156,7 @@ function webhookLocationText(value) {
   if (text === "1") return "3445";
   if (text === "13") return "2967";
   if (text === "15") return "12441";
+  if (text === "26") return "150";
   return text;
 }
 
@@ -1103,6 +1166,13 @@ function webhookRecordType(value) {
   if (["purchaseorder", "purchord", "purchase_order", "po"].includes(text)) return "purchase_order";
   if (["transferorder", "trnfrord", "transfer_order", "to"].includes(text)) return "transfer_order";
   return "";
+}
+
+const EXCLUDED_SALES_ORDER_PREFIXES = ["SOV", "SOT"];
+
+function isExcludedSalesOrderRef(value) {
+  const text = webhookString(value).toUpperCase();
+  return EXCLUDED_SALES_ORDER_PREFIXES.some((prefix) => text.startsWith(prefix));
 }
 
 function webhookLineHasConversion(line) {
@@ -1161,7 +1231,7 @@ function normalizeWebhookLine(line, { locationId = null, locationText = "", proc
     };
 
   return {
-    line_id: line.line_id ?? line.lineId ?? line.id,
+    line_id: line.uniquekey ?? line.uniqueKey ?? line.lineUniqueKey ?? line.line_unique_key ?? line.line_id ?? line.lineId ?? line.id,
     item_id: line.item_id ?? line.itemId,
     item_name: line.item_name ?? line.itemName ?? line.sku,
     item_type: line.item_type ?? line.itemType,
@@ -1232,26 +1302,41 @@ function normalizeWebhookReceivingOrder(payload, { type, locationId, locationTex
   };
 }
 
-function scheduleSalesOrderStatusRefresh(orderId, { tranid = "", delayMs = 10000 } = {}) {
+const DELAYED_STATUS_REFRESH_CONFIG = {
+  sales_order: {
+    netsuiteType: "SalesOrd",
+    updateStatus: updateSalesOrderNetSuiteStatus,
+    events: ["dispatch.orders.updated", "delivery.order.updated"]
+  },
+  purchase_order: {
+    netsuiteType: "PurchOrd",
+    updateStatus: updatePurchaseOrderNetSuiteStatus,
+    events: ["dispatch.orders.updated", "receiving.order.updated"]
+  }
+};
+
+function scheduleTransactionStatusRefresh(orderType, orderId, { tranid = "", delayMs = 10000 } = {}) {
+  const config = DELAYED_STATUS_REFRESH_CONFIG[orderType];
+  if (!config) return;
   const id = Number(orderId);
   if (!Number.isInteger(id) || id <= 0) return;
-  const key = String(id);
-  const existing = delayedSalesOrderStatusRefreshes.get(key);
+  const key = `${orderType}:${id}`;
+  const existing = delayedTransactionStatusRefreshes.get(key);
   if (existing) clearTimeout(existing);
   const timer = setTimeout(async () => {
-    delayedSalesOrderStatusRefreshes.delete(key);
+    delayedTransactionStatusRefreshes.delete(key);
     try {
-      const status = await fetchTransactionStatusFromNetSuite(id, "SalesOrd");
+      const status = await fetchTransactionStatusFromNetSuite(id, config.netsuiteType);
       if (!status) {
         await writeAudit({
           actorType: "system",
           source: "netsuite-webhook",
           action: "netsuite.webhook.delayed_status_missing",
-          details: { netsuiteOrderId: id, tranid }
+          details: { netsuiteOrderId: id, orderType, tranid }
         });
         return;
       }
-      const updated = await updateSalesOrderNetSuiteStatus(id, {
+      const updated = await config.updateStatus(id, {
         status: status.status,
         statusText: status.status_text
       });
@@ -1261,30 +1346,60 @@ function scheduleSalesOrderStatusRefresh(orderId, { tranid = "", delayMs = 10000
         action: "netsuite.webhook.delayed_status_refresh",
         details: {
           netsuiteOrderId: id,
+          orderType,
           tranid: status.tranid || tranid,
           status: status.status,
           statusText: status.status_text,
           updated: Boolean(updated)
         }
       });
-      emitAppEvent("dispatch.orders.updated", { orderId: id, tranid: status.tranid || tranid, source: "netsuite-webhook-delayed-status" });
-      emitAppEvent("delivery.order.updated", { orderId: id, tranid: status.tranid || tranid, source: "netsuite-webhook-delayed-status" });
+      for (const eventName of config.events) {
+        emitAppEvent(eventName, { orderId: id, tranid: status.tranid || tranid, orderType, source: "netsuite-webhook-delayed-status" });
+      }
     } catch (error) {
       await writeAudit({
         actorType: "system",
         source: "netsuite-webhook",
         action: "netsuite.webhook.delayed_status_failed",
-        details: { netsuiteOrderId: id, tranid, error: error.message }
+        details: { netsuiteOrderId: id, orderType, tranid, error: error.message }
       }).catch(() => {});
     }
   }, delayMs);
-  delayedSalesOrderStatusRefreshes.set(key, timer);
+  delayedTransactionStatusRefreshes.set(key, timer);
+}
+
+function scheduleSalesOrderStatusRefresh(orderId, options = {}) {
+  scheduleTransactionStatusRefresh("sales_order", orderId, options);
+}
+
+function schedulePurchaseOrderStatusRefresh(orderId, options = {}) {
+  scheduleTransactionStatusRefresh("purchase_order", orderId, options);
 }
 
 export async function processNetSuiteOrderWebhook(payload = {}, { scheduleDelayedStatus = true } = {}) {
   const type = webhookRecordType(payload.recordType || payload.type || payload.orderType);
   if (!type) throw new Error("Unsupported NetSuite webhook record type.");
   if (!payload.id || !payload.tranid) throw new Error("Webhook payload requires id and tranid.");
+  if (type === "sales_order" && isExcludedSalesOrderRef(payload.tranid)) {
+    await writeAudit({
+      actorType: "system",
+      source: "netsuite-webhook",
+      action: "netsuite.webhook.sales_order_ignored_prefix",
+      details: {
+        netsuiteOrderId: payload.id,
+        tranid: payload.tranid,
+        excludedPrefixes: EXCLUDED_SALES_ORDER_PREFIXES
+      }
+    });
+    return {
+      ok: true,
+      ignored: true,
+      reason: "excluded_sales_order_prefix",
+      orderId: payload.id,
+      tranid: payload.tranid,
+      recordType: type
+    };
+  }
   const lines = Array.isArray(payload.lines) ? payload.lines : [];
   const results = [];
 
@@ -1316,6 +1431,7 @@ export async function processNetSuiteOrderWebhook(payload = {}, { scheduleDelaye
     await upsertPurchaseOrderLines(order.id, normalizedLines);
     await markMissingInboundOrderLines(order.id, normalizedLines.map((line) => line.line_id));
     results.push({ target: "purchase_orders", orderType: type, lines: normalizedLines.length });
+    if (scheduleDelayedStatus) schedulePurchaseOrderStatusRefresh(payload.id, { tranid: payload.tranid });
   } else if (type === "transfer_order") {
     const sourceLocationId = payload.sourceLocationId || payload.locationId;
     const sourceLocationText = payload.sourceLocationText || payload.locationText || webhookLocationText(sourceLocationId);
@@ -1522,7 +1638,7 @@ app.get("/api/dispatch/monitor", async (req, res, next) => {
   }
 });
 
-app.get("/api/dispatch/dvir-records", async (req, res, next) => {
+app.get("/api/dispatch/dvir-records", requireOperator, requireDispatcher, async (req, res, next) => {
   try {
     const date = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.date || ""))
       ? String(req.query.date)
@@ -1570,6 +1686,18 @@ app.get("/api/dispatch/dvir-records", async (req, res, next) => {
       };
     });
     res.json({ date, records });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/dispatch/statistics", requireOperator, requireDispatcher, async (req, res, next) => {
+  try {
+    res.json(await getDispatchStatistics({
+      from: req.query.from || "",
+      to: req.query.to || "",
+      driver: req.query.driver || ""
+    }));
   } catch (error) {
     next(error);
   }
@@ -1642,12 +1770,25 @@ app.get("/api/dispatch/plans/:id", async (req, res, next) => {
 
 app.put("/api/dispatch/plans/:id", async (req, res, next) => {
   try {
+    const previousPlan = await getDispatchPlan(req.params.id);
     const cleanOrders = sanitizeDispatchPlanOrders(Array.isArray(req.body?.orders) ? req.body.orders : []);
     const plan = await saveDispatchPlanSnapshot(req.params.id, {
       orders: cleanOrders,
       trucks: Array.isArray(req.body?.trucks) ? req.body.trucks : [],
       summary: req.body?.summary || {}
     });
+    const explicitOperatorAlertRefs = Array.isArray(req.body?.audit?.details?.operatorAlertRefs)
+      ? req.body.audit.details.operatorAlertRefs.map((ref) => String(ref || "").trim()).filter(Boolean)
+      : [];
+    const changedOperatorRefs = [
+      ...new Set([...changedDispatchOperatorRefs(previousPlan || {}, plan), ...explicitOperatorAlertRefs])
+    ];
+    let operatorFlags = null;
+    if (plan.status === "confirmed") {
+      operatorFlags = await applyConfirmedDispatchPlanToDelivery(plan, {
+        forceOrderRefs: changedOperatorRefs
+      });
+    }
     if (req.body?.audit) {
       await writeDispatchAudit({
         ...req.body.audit,
@@ -1659,12 +1800,13 @@ app.put("/api/dispatch/plans/:id", async (req, res, next) => {
         details: {
           ...(req.body.audit.details || {}),
           orderCount: plan.orders.length,
-          truckCount: plan.trucks.length
+          truckCount: plan.trucks.length,
+          operatorFlags
         }
       }).catch(() => null);
     }
-    emitAppEvent("dispatch.plan.saved", { planId: plan.id, planDate: plan.planDate, savedAt: plan.savedAt, sourceSessionId: req.body?.audit?.sessionId });
-    res.json(plan);
+    emitAppEvent("dispatch.plan.saved", { planId: plan.id, planDate: plan.planDate, savedAt: plan.savedAt, sourceSessionId: req.body?.audit?.sessionId, operatorFlags, changedOperatorRefs });
+    res.json({ ...plan, operatorFlags });
   } catch (error) {
     next(error);
   }
@@ -1673,7 +1815,8 @@ app.put("/api/dispatch/plans/:id", async (req, res, next) => {
 app.post("/api/dispatch/plans/:id/confirm", async (req, res, next) => {
   try {
     const plan = await confirmDispatchPlan(req.params.id, { note: req.body?.note || "" });
-    const operatorFlags = await applyConfirmedDispatchPlanToDelivery(plan);
+    const changedOperatorRefs = [...dispatchOperatorAssignmentMap(plan).keys()];
+    const operatorFlags = await applyConfirmedDispatchPlanToDelivery(plan, { forceOrderRefs: changedOperatorRefs });
     await writeDispatchAudit({
       action: "dispatch_plan_confirmed",
       entityType: "plan",
@@ -1684,7 +1827,7 @@ app.post("/api/dispatch/plans/:id/confirm", async (req, res, next) => {
       after: plan,
       details: { status: plan.status, operatorFlags }
     }).catch(() => null);
-    emitAppEvent("dispatch.plan.confirmed", { planId: plan.id, planDate: plan.planDate, sourceSessionId: req.body?.audit?.sessionId, operatorFlags });
+    emitAppEvent("dispatch.plan.confirmed", { planId: plan.id, planDate: plan.planDate, sourceSessionId: req.body?.audit?.sessionId, operatorFlags, changedOperatorRefs });
     res.json({ ...plan, operatorFlags });
   } catch (error) {
     next(error);
@@ -2168,6 +2311,10 @@ app.get("/dispatch/monitor", (req, res) => {
   res.sendFile(path.join(publicDir, "dispatch-monitor.html"));
 });
 
+app.get("/dispatch/statistics", (req, res) => {
+  res.sendFile(path.join(publicDir, "dispatch-statistics.html"));
+});
+
 app.get("/", (req, res) => {
   res.type("html").send(`
     <!doctype html>
@@ -2305,6 +2452,100 @@ app.post("/api/auth/logout", requireOperator, async (req, res, next) => {
   }
 });
 
+app.get("/api/photo-upload/config", requireOperator, (req, res) => {
+  res.json(publicPhotoUploadConfig());
+});
+
+app.get("/api/photo-upload/preview", requirePhotoPreviewViewer, async (req, res, next) => {
+  try {
+    const ref = String(req.query.ref || req.query.key || "");
+    if (!isR2PhotoReference(ref) && !String(req.query.key || "")) {
+      return res.status(400).json({ error: "R2 photo reference is required." });
+    }
+    const readTicket = createPhotoReadToken({
+      actor: req.photoViewer,
+      key: ref || req.query.key
+    });
+    const response = await fetch(readTicket.objectUrl, {
+      headers: { Authorization: `Bearer ${readTicket.token}` }
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      return res.status(response.status).json({ error: text || "R2 photo preview failed." });
+    }
+    res.status(response.status);
+    for (const [key, value] of response.headers.entries()) {
+      if (["content-type", "content-length", "cache-control", "etag"].includes(key.toLowerCase())) {
+        res.setHeader(key, value);
+      }
+    }
+    res.setHeader("Cache-Control", "private, max-age=300");
+    const buffer = Buffer.from(await response.arrayBuffer());
+    res.send(buffer);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/photo-upload/token", requireOperator, async (req, res, next) => {
+  try {
+    const body = req.body || {};
+    const token = createPhotoUploadToken({
+      actor: {
+        id: req.operator.id,
+        username: req.operator.username,
+        role: req.operator.role,
+        operatorId: req.operator.id
+      },
+      source: body.source || "operator",
+      recordType: body.recordType || "operator-load-photo",
+      metadata: {
+        orderType: body.orderType,
+        orderId: body.orderId,
+        orderRef: body.orderRef,
+        lineId: body.lineId,
+        stopId: body.stopId,
+        planId: body.planId,
+        loadId: body.loadId,
+        jobId: body.jobId,
+        dvirType: body.dvirType
+      }
+    });
+    res.json(token);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/operator/photo-upload-token", requireOperator, async (req, res, next) => {
+  try {
+    const body = req.body || {};
+    res.json(createPhotoUploadToken({
+      actor: {
+        id: req.operator.id,
+        username: req.operator.username,
+        role: req.operator.role,
+        operatorId: req.operator.id
+      },
+      source: "operator",
+      recordType: body.recordType || "operator-load-photo",
+      metadata: {
+        orderType: body.orderType,
+        orderId: body.orderId,
+        orderRef: body.orderRef,
+        lineId: body.lineId,
+        stopId: body.stopId,
+        planId: body.planId,
+        loadId: body.loadId,
+        jobId: body.jobId,
+        dvirType: body.dvirType
+      }
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/driver/login", async (req, res, next) => {
   try {
     const login = String(req.body?.username || req.body?.login || "").trim().toLowerCase();
@@ -2327,11 +2568,53 @@ app.get("/api/driver/me", requireDriver, (req, res) => {
   res.json({ driver: publicDriver(req.driver) });
 });
 
+app.post("/api/driver/photo-upload-token", requireDriver, async (req, res, next) => {
+  try {
+    const body = req.body || {};
+    res.json(createPhotoUploadToken({
+      actor: {
+        id: req.driverLogin,
+        login: req.driverLogin,
+        driverId: req.driverLogin,
+        role: "driver"
+      },
+      source: "driver",
+      recordType: body.recordType || "driver-stop-photo",
+      metadata: {
+        orderType: body.orderType,
+        orderId: body.orderId,
+        orderRef: body.orderRef,
+        lineId: body.lineId,
+        stopId: body.stopId,
+        planId: body.planId,
+        loadId: body.loadId,
+        jobId: body.jobId,
+        dvirType: body.dvirType
+      }
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/driver/day-state", requireDriver, async (req, res, next) => {
   try {
     res.json({
       state: await getDriverDayState(req.driverLogin, {
         samsaraUsername: samsaraUsernameForDriver(req.driver, "primary")
+      })
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/driver/history", requireDriver, async (req, res, next) => {
+  try {
+    res.json({
+      records: await listDriverHistory(req.driverLogin, {
+        date: req.query.date || "",
+        limit: req.query.limit || 100
       })
     });
   } catch (error) {
@@ -2646,6 +2929,184 @@ app.post("/api/operators/:id/password", requireOperator, requireAdmin, async (re
   }
 });
 
+async function listOperatorOrderLocks() {
+  const result = await query(
+    `WITH lock_source AS (
+       SELECT 'sales_order'::text AS order_type,
+              o.netsuite_id,
+              o.tranid,
+              o.operator_status AS operator_status,
+              o.local_yard_order_status,
+              o.outbound_location,
+              o.preparing_operator_id,
+              o.preparing_started_at,
+              op.username,
+              op.display_name,
+              (
+                SELECT COUNT(*)::int
+                  FROM sales_order_lines l
+                 WHERE l.sales_order_id = o.netsuite_id
+                   AND COALESCE(l.item_type, '') IN ('InvtPart', 'NonInvtPart')
+                   AND (
+                     COALESCE(l.packed_pallet_qty, 0) > 0
+                     OR COALESCE(l.packed_layer_qty, 0) > 0
+                     OR COALESCE(l.packed_section_qty, 0) > 0
+                     OR COALESCE(l.packed_piece_qty, 0) > 0
+                   )
+              ) AS draft_line_count
+         FROM sales_orders o
+         LEFT JOIN operators op ON op.id::text = o.preparing_operator_id::text
+        WHERE o.preparing_operator_id IS NOT NULL
+       UNION ALL
+       SELECT 'transfer_order'::text AS order_type,
+              o.netsuite_id,
+              o.tranid,
+              o.outbound_operator_status AS operator_status,
+              o.local_yard_order_status,
+              o.from_location AS outbound_location,
+              o.preparing_operator_id,
+              o.preparing_started_at,
+              op.username,
+              op.display_name,
+              (
+                SELECT COUNT(*)::int
+                  FROM transfer_order_lines l
+                 WHERE l.transfer_order_id = o.netsuite_id
+                   AND l.line_stage = 'outbound'
+                   AND COALESCE(l.item_type, '') IN ('InvtPart', 'NonInvtPart')
+                   AND (
+                     COALESCE(l.packed_pallet_qty, 0) > 0
+                     OR COALESCE(l.packed_layer_qty, 0) > 0
+                     OR COALESCE(l.packed_section_qty, 0) > 0
+                     OR COALESCE(l.packed_piece_qty, 0) > 0
+                   )
+              ) AS draft_line_count
+         FROM transfer_orders o
+         LEFT JOIN operators op ON op.id::text = o.preparing_operator_id::text
+        WHERE o.preparing_operator_id IS NOT NULL
+     )
+     SELECT *
+       FROM lock_source
+      ORDER BY preparing_started_at DESC NULLS LAST, tranid`
+  );
+  return result.rows;
+}
+
+async function releaseOperatorOrderLock({ orderType, orderId, actorOperatorId }) {
+  const isTransfer = orderType === "transfer_order";
+  const targetTable = isTransfer ? "transfer_orders" : "sales_orders";
+  const result = await query(
+    `UPDATE ${targetTable}
+        SET preparing_operator_id = null,
+            preparing_started_at = null,
+            status_updated_at = now()
+      WHERE netsuite_id = $1
+        AND preparing_operator_id IS NOT NULL
+      RETURNING netsuite_id, tranid`,
+    [orderId]
+  );
+  if (!result.rowCount) return null;
+  await writeAudit({
+    actorOperatorId,
+    source: "control",
+    action: "operator.order_lock.release",
+    orderId,
+    details: {
+      orderType: isTransfer ? "transfer_order" : "sales_order",
+      tranid: result.rows[0].tranid
+    }
+  });
+  emitAppEvent("delivery.order.updated", { orderId, source: "control-lock-release" });
+  return result.rows[0];
+}
+
+app.get("/api/control/order-locks", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    res.json(await listOperatorOrderLocks());
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/control/order-locks/release", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    const releaseAll = Boolean(req.body?.all);
+    const locks = releaseAll
+      ? await listOperatorOrderLocks()
+      : [{
+          order_type: req.body?.orderType === "transfer_order" ? "transfer_order" : "sales_order",
+          netsuite_id: req.body?.orderId
+        }];
+    const released = [];
+    for (const lock of locks) {
+      if (!lock.netsuite_id) continue;
+      const row = await releaseOperatorOrderLock({
+        orderType: lock.order_type,
+        orderId: lock.netsuite_id,
+        actorOperatorId: req.operator.id
+      });
+      if (row) released.push({ ...row, order_type: lock.order_type });
+    }
+    res.json({ released, locks: await listOperatorOrderLocks() });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/control/loaded-orders", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    res.json(await listControlLoadedOrders({
+      from: req.query.from,
+      to: req.query.to,
+      yard: req.query.yard,
+      search: req.query.search
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/control/loaded-orders/detail", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    const detail = await getControlLoadedOrderDetail({
+      orderType: req.query.orderType,
+      orderId: req.query.orderId,
+      from: req.query.from,
+      to: req.query.to
+    });
+    if (!detail) return res.status(404).json({ error: "Loaded order not found." });
+    res.json(detail);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/control/loaded-orders/export.csv", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    const rows = await listControlLoadedOrderCsvRows({
+      from: req.query.from,
+      to: req.query.to,
+      yard: req.query.yard,
+      search: req.query.search
+    });
+    const csv = [
+      ["order", "item Name", "sales quantity", "sales UOM", "location"].map(csvCell).join(","),
+      ...rows.map((row) => [
+        row.order_ref,
+        row.item_name,
+        row.loaded_qty,
+        row.loaded_uom,
+        row.location
+      ].map(csvCell).join(","))
+    ].join("\r\n");
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="loaded-orders-${req.query.from || "from"}-${req.query.to || "to"}.csv"`);
+    res.send(csv);
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/control/sync-settings", requireOperator, requireAdmin, async (req, res, next) => {
   try {
     const setup = await readDispatchSetup();
@@ -2692,9 +3153,6 @@ app.put("/api/control/sync-settings", requireOperator, requireAdmin, async (req,
   try {
     const mode = req.body?.mode === "auto" ? "auto" : "manual";
     const syncPatch = { mode };
-    if (Object.hasOwn(req.body || {}, "salesOrderCreatedFrom")) {
-      syncPatch.salesOrderCreatedFrom = req.body.salesOrderCreatedFrom;
-    }
     if (Object.hasOwn(req.body || {}, "maxRunSeconds")) {
       syncPatch.maxRunSeconds = req.body.maxRunSeconds;
     }
@@ -2705,7 +3163,7 @@ app.put("/api/control/sync-settings", requireOperator, requireAdmin, async (req,
       action: "sync.mode_update",
       details: syncPatch
     });
-    emitAppEvent("dispatch.sync.settings.updated", { mode, salesOrderCreatedFrom: setup.sync.salesOrderCreatedFrom });
+    emitAppEvent("dispatch.sync.settings.updated", { mode });
     res.json(setup.sync);
   } catch (error) {
     next(error);
@@ -2984,6 +3442,16 @@ app.get("/api/delivery/orders", async (req, res, next) => {
       locationId: req.query.locationId,
       status: req.query.status,
       orderType: normalizeOrderType(req.query.orderType)
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/delivery/notifications", async (req, res, next) => {
+  try {
+    res.json(await getDeliveryPrepNotifications({
+      locationId: req.query.locationId
     }));
   } catch (error) {
     next(error);
@@ -3469,7 +3937,7 @@ async function runDeliveryFulfillment(orderId, body, currentOperatorId, jobId) {
       if (syncedOrder) {
         if (order.order_type === "transfer_order") await upsertOutboundTransferOrders([syncedOrder]);
         else await upsertSalesOrders([syncedOrder]);
-      } else await markOutboundOrderMissing(orderId);
+      } else await markOutboundOrderMissing(orderId, { orderFamily: order.order_type });
       const syncedLines = order.order_type === "transfer_order"
         ? await fetchTransferOrderDetailsFromNetSuite(orderId, locationId)
         : await fetchDeliveryOrderDetailsFromNetSuite(orderId, locationId);
@@ -3614,7 +4082,7 @@ app.post("/api/cycle-count/submit", async (req, res, next) => {
 
 app.use((error, req, res, next) => {
   console.error(error);
-  res.status(500).json({ error: error.message });
+  res.status(error.status || 500).json({ error: error.message });
 });
 
 export { app };

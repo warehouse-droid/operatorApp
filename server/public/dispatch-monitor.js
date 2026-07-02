@@ -1,4 +1,6 @@
 const monitorApp = document.getElementById("dispatchMonitorApp");
+const t = (key, fallback) => window.MBBS_I18N?.t(key, fallback) || fallback;
+const languageToggle = () => window.MBBS_I18N?.toggleHtml() || "";
 const MAP_CENTER = { lat: 43.82, lng: -79.45 };
 const LAST_KNOWN_FALLBACK_MS = 10 * 60 * 1000;
 const TRUCK_COLORS = [
@@ -489,14 +491,15 @@ function renderMonitorApp() {
   monitorApp.innerHTML = `
     <header class="dispatch-topbar">
       <div>
-        <p>MBBS Transportation</p>
-        <h1>Monitor</h1>
+        <p>${t("app.transportation", "MBBS Transportation")}</p>
+        <h1>${t("dispatch.monitor", "Monitor")}</h1>
       </div>
       <div class="topbar-controls">
         <span class="autosave-pill" data-monitor-refresh>Auto ${Number(monitorData.refreshSeconds || 10)}s</span>
         <button class="primary" data-action="refresh-monitor" type="button">Refresh</button>
       </div>
       <div class="topbar-actions">
+        ${languageToggle()}
         <button onclick="location.href='/dispatch'" type="button">Menu</button>
         <span class="dispatch-user">${escapeHtml(monitorOperator?.display_name || monitorOperator?.username || "")}</span>
         <button onclick="dispatchLogout()" type="button">Logout</button>
@@ -540,6 +543,10 @@ monitorApp.addEventListener("keydown", (event) => {
   selectedTruckPlate = truckCard.dataset.truckPlate || "";
   updateMonitorUi();
   focusTruckOnMap(selectedTruckPlate);
+});
+
+window.addEventListener("mbbs-language-changed", () => {
+  renderMonitorApp();
 });
 
 requireDispatchLogin({
