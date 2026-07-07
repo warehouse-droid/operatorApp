@@ -3,9 +3,10 @@ import { query } from "./db.js";
 import { enrichPurchaseOrderDispatch, enrichSalesOrderDispatch, enrichTransferDispatch } from "./dispatch-enrichment.js";
 
 function normalizeNetSuiteDate(value) {
-  if (!value) return null;
-  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
-  const match = String(value).match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return text;
+  const match = text.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
   if (!match) return value;
   const [, month, day, year] = match;
   return `${year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`;
@@ -123,6 +124,44 @@ function normalizeLine(line) {
   };
 }
 
+function normalizeOrderDates(order) {
+  return {
+    ...order,
+    trandate: normalizeNetSuiteDate(order.trandate),
+    expected_delivery_date: normalizeNetSuiteDate(order.expected_delivery_date)
+  };
+}
+
+async function hydrateLineFromInventory(normalized) {
+  if (!normalized?.item_id) return normalized;
+  const needsInventoryFallback = [
+    "item_weight",
+    "to_plt",
+    "to_lyr",
+    "to_sec",
+    "to_pcs"
+  ].some((field) => normalized[field] === null || normalized[field] === undefined);
+  if (!needsInventoryFallback) return normalized;
+
+  const inventory = await query(
+    `SELECT item_weight, to_plt, to_lyr, to_sec, to_pcs
+       FROM inventory_items
+      WHERE item_id = $1
+      LIMIT 1`,
+    [normalized.item_id]
+  );
+  const item = inventory.rows[0];
+  if (!item) return normalized;
+  return {
+    ...normalized,
+    item_weight: normalized.item_weight ?? normalizeNumber(item.item_weight),
+    to_plt: normalized.to_plt ?? normalizeNumber(item.to_plt),
+    to_lyr: normalized.to_lyr ?? normalizeNumber(item.to_lyr),
+    to_sec: normalized.to_sec ?? normalizeNumber(item.to_sec),
+    to_pcs: normalized.to_pcs ?? normalizeNumber(item.to_pcs)
+  };
+}
+
 async function auditSyncChange({ action, orderId = null, lineId = null, existing, normalized, fields, detailsKey }) {
   const changes = existing ? changedFields(existing, normalized, fields) : {};
   if (existing && !Object.keys(changes).length) return;
@@ -228,7 +267,12 @@ async function upsertInventoryItemFromLine(normalized) {
 export async function upsertSalesOrders(orders = []) {
   for (const order of orders || []) {
     const dispatch = await enrichSalesOrderDispatch(order);
-    const normalized = { ...normalizeOutboundOrder(order, "sales_order"), ...dispatch };
+    const outbound = normalizeOutboundOrder(order, "sales_order");
+    const normalized = normalizeOrderDates({
+      ...outbound,
+      ...dispatch,
+      expected_delivery_date: outbound.expected_delivery_date || dispatch.expected_delivery_date
+    });
     const existing = await query(
       `SELECT tranid, trandate, customer_id, customer, status, status_text,
               expected_delivery_date, foreign_total, order_location_id, order_location,
@@ -349,7 +393,7 @@ export async function upsertSalesOrders(orders = []) {
 export async function upsertOutboundTransferOrders(orders = []) {
   for (const order of orders || []) {
     const dispatch = enrichTransferDispatch(order);
-    const normalized = { ...normalizeOutboundOrder(order, "transfer_order"), ...dispatch };
+    const normalized = normalizeOrderDates({ ...normalizeOutboundOrder(order, "transfer_order"), ...dispatch });
     const existing = await query(
       `SELECT tranid, trandate, status, status_text, from_location_id AS source_location_id,
               from_location AS source_location, to_location_id AS destination_location_id,
@@ -444,7 +488,7 @@ export async function upsertOutboundTransferOrders(orders = []) {
 
 export async function upsertSalesOrderLines(orderId, lines = []) {
   for (const line of lines || []) {
-    const normalized = normalizeLine(line);
+    const normalized = await hydrateLineFromInventory(normalizeLine(line));
     let existing = await query(
       `SELECT *
          FROM sales_order_lines
@@ -466,12 +510,12 @@ export async function upsertSalesOrderLines(orderId, lines = []) {
          sales_order_id, line_id, item_id, item_name, item_type, item_type_text,
          item_description, sku, quantity, unit, item_weight, location_id,
          location, pallet_qty, layer_qty, piece_qty, section_qty, to_plt,
-         to_lyr, to_sec, to_pcs, netsuite_active, sync_exception,
+         to_lyr, to_sec, to_pcs, loaded_qty, loaded_uom, netsuite_active, sync_exception,
          sync_exception_at, synced_at
        ) VALUES (
          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
          $11, $12, $13, $14, $15, $16, $17, $18, $19,
-         $20, $21, true, null, null, now()
+         $20, $21, COALESCE($22::numeric, 0), $23, true, null, null, now()
        )
        ON CONFLICT (sales_order_id, line_id) DO UPDATE SET
          item_id = EXCLUDED.item_id,
@@ -485,8 +529,9 @@ export async function upsertSalesOrderLines(orderId, lines = []) {
          item_weight = EXCLUDED.item_weight,
          location_id = EXCLUDED.location_id,
          location = EXCLUDED.location,
+         loaded_qty = GREATEST(COALESCE(sales_order_lines.loaded_qty, 0), COALESCE(EXCLUDED.loaded_qty, 0)),
          loaded_uom = CASE
-           WHEN COALESCE(sales_order_lines.loaded_qty, 0) > 0
+           WHEN GREATEST(COALESCE(sales_order_lines.loaded_qty, 0), COALESCE(EXCLUDED.loaded_qty, 0)) > 0
            THEN COALESCE(NULLIF(sales_order_lines.loaded_uom, ''), EXCLUDED.unit)
            ELSE sales_order_lines.loaded_uom
          END,
@@ -539,7 +584,9 @@ export async function upsertSalesOrderLines(orderId, lines = []) {
         normalized.to_plt,
         normalized.to_lyr,
         normalized.to_sec,
-        normalized.to_pcs
+        normalized.to_pcs,
+        normalized.netsuite_received_qty,
+        normalized.unit
       ]
     );
     await upsertInventoryItemFromLine(normalized);
@@ -566,7 +613,7 @@ export async function upsertOutboundTransferOrderLines(orderId, lines = []) {
 
 async function upsertTransferOrderLines(orderId, lines = [], stage) {
   for (const line of lines || []) {
-    const normalized = normalizeLine(line);
+    const normalized = await hydrateLineFromInventory(normalizeLine(line));
     let existing = await query(
       `SELECT *
          FROM transfer_order_lines
@@ -621,8 +668,13 @@ async function upsertTransferOrderLines(orderId, lines = [], stage) {
          to_lyr = EXCLUDED.to_lyr,
          to_sec = EXCLUDED.to_sec,
          to_pcs = EXCLUDED.to_pcs,
+         loaded_qty = CASE
+           WHEN EXCLUDED.line_stage = 'outbound'
+           THEN GREATEST(COALESCE(transfer_order_lines.loaded_qty, 0), COALESCE(EXCLUDED.loaded_qty, 0))
+           ELSE transfer_order_lines.loaded_qty
+         END,
          loaded_uom = CASE
-           WHEN COALESCE(transfer_order_lines.loaded_qty, 0) > 0
+           WHEN GREATEST(COALESCE(transfer_order_lines.loaded_qty, 0), COALESCE(EXCLUDED.loaded_qty, 0)) > 0
            THEN COALESCE(NULLIF(transfer_order_lines.loaded_uom, ''), EXCLUDED.unit)
            ELSE transfer_order_lines.loaded_uom
          END,
@@ -672,7 +724,7 @@ async function upsertTransferOrderLines(orderId, lines = [], stage) {
         normalized.to_lyr,
         normalized.to_sec,
         normalized.to_pcs,
-        stage === "receiving" ? normalized.netsuite_received_qty : 0,
+        stage === "outbound" ? normalized.netsuite_received_qty : 0,
         normalized.unit,
         JSON.stringify(normalized.raw || {}),
         normalized.item_type,
@@ -709,7 +761,8 @@ export async function listExistingOutboundOrderIds({ locationId = null, orderFam
   const result = await query(
     `SELECT netsuite_id
        FROM ${isTransfer ? "transfer_orders" : "sales_orders"}
-      ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
+      WHERE netsuite_id > 0
+      ${clauses.length ? `AND ${clauses.join(" AND ")}` : ""}
       ORDER BY synced_at ASC, netsuite_id`,
     params
   );
@@ -815,10 +868,12 @@ export async function markMissingOutboundOrderLines(orderId, activeLineIds = [])
 }
 
 export async function updateSalesOrderNetSuiteStatus(orderId, patch = {}) {
+  const expectedDeliveryDate = normalizeNetSuiteDate(patch.expectedDeliveryDate || patch.expected_delivery_date);
   const result = await query(
     `UPDATE sales_orders
         SET status = COALESCE($2, status),
             status_text = COALESCE($3, status_text),
+            expected_delivery_date = COALESCE($4::date, expected_delivery_date),
             status_updated_at = CASE
               WHEN status IS DISTINCT FROM COALESCE($2, status)
                 OR status_text IS DISTINCT FROM COALESCE($3, status_text)
@@ -827,8 +882,8 @@ export async function updateSalesOrderNetSuiteStatus(orderId, patch = {}) {
             END,
             synced_at = now()
       WHERE netsuite_id = $1
-      RETURNING netsuite_id, tranid, status, status_text`,
-    [orderId, patch.status || null, patch.statusText || patch.status_text || null]
+      RETURNING netsuite_id, tranid, status, status_text, expected_delivery_date`,
+    [orderId, patch.status || null, patch.statusText || patch.status_text || null, expectedDeliveryDate]
   );
   return result.rows[0] || null;
 }
@@ -855,7 +910,7 @@ export async function updatePurchaseOrderNetSuiteStatus(orderId, patch = {}) {
 export async function upsertPurchaseOrders(orders = []) {
   for (const order of orders || []) {
     const dispatch = await enrichPurchaseOrderDispatch(order);
-    const normalized = { ...normalizeReceivingOrder(order, "purchase_order"), ...dispatch };
+    const normalized = normalizeOrderDates({ ...normalizeReceivingOrder(order, "purchase_order"), ...dispatch });
     const existing = await query(
       `SELECT tranid, trandate, vendor_id, vendor, status, status_text,
               foreign_total, source_location_id, source_location, destination_location_id,
@@ -958,7 +1013,7 @@ export async function upsertPurchaseOrders(orders = []) {
 
 export async function upsertPurchaseOrderLines(orderId, lines = []) {
   for (const line of lines || []) {
-    const normalized = normalizeLine(line);
+    const normalized = await hydrateLineFromInventory(normalizeLine(line));
     let existing = await query(
       `SELECT *
          FROM purchase_order_lines
@@ -1060,7 +1115,7 @@ export async function upsertPurchaseOrderLines(orderId, lines = []) {
 export async function upsertInboundTransferOrders(orders = []) {
   for (const order of orders || []) {
     const dispatch = enrichTransferDispatch(order);
-    const normalized = { ...normalizeReceivingOrder(order, "transfer_order"), ...dispatch };
+    const normalized = normalizeOrderDates({ ...normalizeReceivingOrder(order, "transfer_order"), ...dispatch });
     const existing = await query(
       `SELECT tranid, trandate, status, status_text, from_location_id AS source_location_id,
               from_location AS source_location, to_location_id AS destination_location_id,
@@ -1177,7 +1232,8 @@ export async function listExistingInboundOrderIds({ orderFamily, sourceLocationI
   const result = await query(
     `SELECT netsuite_id
        FROM ${isTransfer ? "transfer_orders" : "purchase_orders"}
-      ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
+      WHERE netsuite_id > 0
+      ${clauses.length ? `AND ${clauses.join(" AND ")}` : ""}
       ORDER BY synced_at ASC, netsuite_id`,
     params
   );
@@ -1188,7 +1244,7 @@ export async function markMissingInboundOrders({ orderFamily, activeOrderIds = [
   const ids = activeOrderIds.map((id) => Number(id)).filter((id) => Number.isInteger(id));
   const isTransfer = orderFamily === "transfer_order";
   const params = [ids];
-  const clauses = ["NOT (netsuite_id = ANY($1::bigint[]))"];
+  const clauses = ["netsuite_id > 0", "NOT (netsuite_id = ANY($1::bigint[]))"];
   if (isTransfer) {
     clauses.push("receiving_status IS NOT NULL");
     if (sourceLocationId) {

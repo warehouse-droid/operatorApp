@@ -56,9 +56,11 @@ function durationText(value) {
 
 function dateTimeText(value) {
   if (!value) return "--";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "--";
-  return date.toLocaleString([], { month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+  return window.MBBS_I18N?.displayDateTime(value) || "--";
+}
+
+function dateText(value) {
+  return window.MBBS_I18N?.displayDate(value) || "";
 }
 
 async function api(path) {
@@ -215,7 +217,7 @@ function renderRecentStops() {
           <article class="stats-stop-card ${row.status === "in_progress" ? "in-progress" : ""}">
             <div>
               <strong>${escapeHtml(row.driverLogin || "--")} | ${escapeHtml(row.truckPlate || "--")}</strong>
-              <span>${escapeHtml(row.planDate || "")} ${escapeHtml(row.loadName || "")}</span>
+              <span>${escapeHtml(dateText(row.planDate))} ${escapeHtml(row.loadName || "")}</span>
             </div>
             <div>
               <strong>${escapeHtml(row.stopClassLabel || row.stopType)}</strong>

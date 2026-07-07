@@ -1,11 +1,11 @@
-const CACHE_NAME = "mbbs-yard-operator-v69-live-notification-events";
+const CACHE_NAME = "mbbs-yard-operator-v94-co-packed-list";
 const APP_SHELL = [
   "/operator",
   "/operator.html",
-  "/operator.css?v=20260702-urgent-delivery-v11",
+  "/operator.css?v=20260706-star-bottom-v1",
   "/i18n.css?v=20260701-i18n-v2",
-  "/i18n.js?v=20260702-yard150-v1",
-  "/operator.js?v=20260702-urgent-delivery-v11",
+  "/i18n.js?v=20260706-delivery-menu-i18n-v1",
+  "/operator.js?v=20260707-co-packed-list-v1",
   "/driver",
   "/driver.html",
   "/driver.css?v=20260702-camera-v3",
@@ -27,12 +27,6 @@ self.addEventListener("activate", (event) => {
     const names = await caches.keys();
     await Promise.all(names.filter((name) => name !== CACHE_NAME).map((name) => caches.delete(name)));
     await self.clients.claim();
-    const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
-    await Promise.all(windows.map((client) => {
-      const url = new URL(client.url);
-      if (!["/operator", "/driver"].includes(url.pathname)) return Promise.resolve();
-      return client.navigate(client.url).catch(() => {});
-    }));
   })());
 });
 

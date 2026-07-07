@@ -1,6 +1,7 @@
 const monitorApp = document.getElementById("dispatchMonitorApp");
 const t = (key, fallback) => window.MBBS_I18N?.t(key, fallback) || fallback;
 const languageToggle = () => window.MBBS_I18N?.toggleHtml() || "";
+const displayDate = (value) => window.MBBS_I18N?.displayDate(value) || "";
 const MAP_CENTER = { lat: 43.82, lng: -79.45 };
 const LAST_KNOWN_FALLBACK_MS = 10 * 60 * 1000;
 const TRUCK_COLORS = [
@@ -471,7 +472,7 @@ function updateMonitorUi() {
   const planText = document.querySelector("[data-monitor-plan]");
   if (planText) {
     planText.textContent = monitorData.plan
-      ? `Plan ${monitorData.plan.planDate} | ${monitorData.plan.status}`
+      ? `Plan ${displayDate(monitorData.plan.planDate)} | ${monitorData.plan.status}`
       : "No active plan";
   }
   const refreshText = document.querySelector("[data-monitor-refresh]");
@@ -513,7 +514,7 @@ function renderMonitorApp() {
       <aside class="panel monitor-side">
         <div class="panel-header">
           <h2>Truck Status</h2>
-          <p data-monitor-plan>${monitorData.plan ? `Plan ${escapeHtml(monitorData.plan.planDate)} | ${escapeHtml(monitorData.plan.status)}` : "No active plan"}</p>
+          <p data-monitor-plan>${monitorData.plan ? `Plan ${escapeHtml(displayDate(monitorData.plan.planDate))} | ${escapeHtml(monitorData.plan.status)}` : "No active plan"}</p>
         </div>
         <div class="monitor-list">
           ${renderTruckList()}

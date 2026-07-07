@@ -168,7 +168,16 @@ export async function writeAudit({
   );
 }
 
-export async function listAudit({ limit = 100, orderId = null, operatorId = null } = {}) {
+export async function listAudit({
+  limit = 100,
+  orderId = null,
+  operatorId = null,
+  from = null,
+  to = null,
+  actor = "",
+  action = "",
+  tranid = ""
+} = {}) {
   const params = [];
   const clauses = [];
   if (orderId) {
@@ -179,18 +188,128 @@ export async function listAudit({ limit = 100, orderId = null, operatorId = null
     params.push(operatorId);
     clauses.push(`a.actor_operator_id = $${params.length}`);
   }
+  if (from) {
+    params.push(from);
+    clauses.push(`a.created_at >= $${params.length}::timestamptz`);
+  }
+  if (to) {
+    params.push(to);
+    clauses.push(`a.created_at <= $${params.length}::timestamptz`);
+  }
+  if (actor) {
+    params.push(`%${String(actor).trim()}%`);
+    clauses.push(`(
+      COALESCE(o.display_name, '') ILIKE $${params.length}
+      OR COALESCE(o.username, '') ILIKE $${params.length}
+      OR COALESCE(a.actor_type, '') ILIKE $${params.length}
+      OR COALESCE(a.actor_operator_id, '') ILIKE $${params.length}
+    )`);
+  }
+  if (action) {
+    params.push(`%${String(action).trim()}%`);
+    clauses.push(`a.action ILIKE $${params.length}`);
+  }
+  if (tranid) {
+    params.push(`%${String(tranid).trim()}%`);
+    clauses.push(`COALESCE(
+      so.tranid,
+      tr.tranid,
+      po.tranid,
+      co.co_ref,
+      a.details->>'tranid',
+      a.details->>'coRef',
+      a.details->>'sourceOrderRef',
+      a.details->>'orderRef',
+      a.details->>'receivingOrderId',
+      a.details->>'deliveryOrderId',
+      a.order_id::text
+    ) ILIKE $${params.length}`);
+  }
   params.push(Math.min(Math.max(Number(limit) || 100, 1), 500));
 
   const result = await query(
     `SELECT a.*,
             o.username,
-            o.display_name
+            o.display_name,
+            COALESCE(
+              so.tranid,
+              tr.tranid,
+              po.tranid,
+              co.co_ref,
+              a.details->>'tranid',
+              a.details->>'coRef',
+              a.details->>'sourceOrderRef',
+              a.details->>'orderRef',
+              a.details->>'receivingOrderId',
+              a.details->>'deliveryOrderId',
+              a.order_id::text
+            ) AS tranid
      FROM delivery_audit_log a
      LEFT JOIN operators o ON o.id = a.actor_operator_id
+     LEFT JOIN sales_orders so ON so.netsuite_id = a.order_id
+     LEFT JOIN transfer_orders tr ON tr.netsuite_id = a.order_id
+     LEFT JOIN purchase_orders po ON po.netsuite_id = a.order_id
+     LEFT JOIN local_co_orders co ON co.delivery_order_id = a.order_id
      ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
      ORDER BY a.created_at DESC, a.id DESC
      LIMIT $${params.length}`,
     params
   );
   return result.rows;
+}
+
+export async function listAuditOptions({
+  from = null,
+  to = null,
+  tranid = ""
+} = {}) {
+  const params = [];
+  const clauses = [];
+  if (from) {
+    params.push(from);
+    clauses.push(`a.created_at >= $${params.length}::timestamptz`);
+  }
+  if (to) {
+    params.push(to);
+    clauses.push(`a.created_at <= $${params.length}::timestamptz`);
+  }
+  if (tranid) {
+    params.push(`%${String(tranid).trim()}%`);
+    clauses.push(`COALESCE(
+      so.tranid,
+      tr.tranid,
+      po.tranid,
+      co.co_ref,
+      a.details->>'tranid',
+      a.details->>'coRef',
+      a.details->>'sourceOrderRef',
+      a.details->>'orderRef',
+      a.details->>'receivingOrderId',
+      a.details->>'deliveryOrderId',
+      a.order_id::text
+    ) ILIKE $${params.length}`);
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+  const result = await query(
+    `WITH filtered AS (
+       SELECT a.action,
+              NULLIF(COALESCE(o.display_name, o.username, a.actor_type, a.actor_operator_id), '') AS actor
+       FROM delivery_audit_log a
+       LEFT JOIN operators o ON o.id = a.actor_operator_id
+       LEFT JOIN sales_orders so ON so.netsuite_id = a.order_id
+       LEFT JOIN transfer_orders tr ON tr.netsuite_id = a.order_id
+       LEFT JOIN purchase_orders po ON po.netsuite_id = a.order_id
+       LEFT JOIN local_co_orders co ON co.delivery_order_id = a.order_id
+       ${where}
+     )
+     SELECT
+       COALESCE(jsonb_agg(DISTINCT actor ORDER BY actor) FILTER (WHERE actor IS NOT NULL), '[]'::jsonb) AS actors,
+       COALESCE(jsonb_agg(DISTINCT action ORDER BY action) FILTER (WHERE action IS NOT NULL), '[]'::jsonb) AS actions
+     FROM filtered`,
+    params
+  );
+  return {
+    actors: result.rows[0]?.actors || [],
+    actions: result.rows[0]?.actions || []
+  };
 }

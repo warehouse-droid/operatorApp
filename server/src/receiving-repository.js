@@ -520,7 +520,7 @@ function remainingSalesQuantity(line) {
 function locationTextFromId(value) {
   const text = String(value || "").trim();
   if (text === "1") return "3445";
-  if (text === "13") return "2967";
+  if (text === "13" || text === "28") return "2967";
   if (text === "15") return "12441";
   return text;
 }
@@ -718,16 +718,31 @@ export async function receiveLocalCoOrder(coRefOrId, operatorId, { photoDataUrls
       LIMIT 1`,
     [co.source_order_ref]
   );
+  const sourceTransfer = await query(
+    `SELECT *
+       FROM transfer_orders
+      WHERE tranid = $1
+      LIMIT 1`,
+    [co.source_order_ref]
+  );
   const sourceOrder = sourceDelivery.rows[0] || null;
+  const sourceTransferOrder = sourceTransfer.rows[0] || null;
   const receiveAsSourceSo = Boolean(sourceOrder);
-  const deliveryOrderId = receiveAsSourceSo ? Number(sourceOrder.netsuite_id) : Number(co.netsuite_id);
+  const receiveAsSourceTransfer = !receiveAsSourceSo && Boolean(sourceTransferOrder);
+  const deliveryOrderId = receiveAsSourceSo
+    ? Number(sourceOrder.netsuite_id)
+    : receiveAsSourceTransfer
+      ? Number(sourceTransferOrder.netsuite_id)
+      : Number(co.netsuite_id);
   const coRemark = `${co.tranid}: received transit stock from ${co.source_location} for ${co.source_order_ref}.`;
-  const existingMemo = receiveAsSourceSo ? String(sourceOrder.memo || "").trim() : "";
-  const existingInstructions = receiveAsSourceSo ? String(sourceOrder.dispatch_instructions || "").trim() : "";
-  const deliveryMemo = receiveAsSourceSo
+  const sourceForMemo = sourceOrder || sourceTransferOrder || {};
+  const receiveAsSourceOrder = receiveAsSourceSo || receiveAsSourceTransfer;
+  const existingMemo = receiveAsSourceOrder ? String(sourceForMemo.memo || "").trim() : "";
+  const existingInstructions = receiveAsSourceOrder ? String(sourceForMemo.dispatch_instructions || "").trim() : "";
+  const deliveryMemo = receiveAsSourceOrder
     ? (existingMemo.includes(co.tranid) ? existingMemo : `${coRemark}${existingMemo ? ` ${existingMemo}` : ""}`)
     : `Local CO received for ${co.source_order_ref}`;
-  const deliveryInstructions = receiveAsSourceSo
+  const deliveryInstructions = receiveAsSourceOrder
     ? (existingInstructions.includes(co.tranid) ? existingInstructions : `${coRemark}${existingInstructions ? ` ${existingInstructions}` : ""}`)
     : `Local CO ${co.tranid} received from ${co.source_location}.`;
   const today = new Date().toISOString().slice(0, 10);
@@ -741,6 +756,38 @@ export async function receiveLocalCoOrder(coRefOrId, operatorId, { photoDataUrls
               dispatch_instructions = $6,
               netsuite_active = true,
               operator_status = 'packed',
+              status_updated_at = now(),
+              local_yard_order_status = 'Open',
+              dispatch_planned = true,
+              dispatch_plan_date = $7::date,
+              dispatch_truck_plate = $8,
+              dispatch_load_name = $9,
+              dispatch_parking_spot = $10,
+              dispatch_planned_at = now()
+        WHERE netsuite_id = $1`,
+      [
+        deliveryOrderId,
+        co.destination_location_id,
+        co.destination_location,
+        deliveryMemo,
+        `${locationTextFromId(co.destination_location_id)} yard`,
+        deliveryInstructions,
+        co.dispatch_plan_date || null,
+        co.dispatch_truck_plate || "",
+        co.dispatch_load_name || "",
+        co.dispatch_parking_spot || ""
+      ]
+    );
+  } else if (receiveAsSourceTransfer) {
+    await query(
+      `UPDATE transfer_orders
+          SET from_location_id = $2,
+              from_location = $3,
+              memo = $4,
+              dispatch_address = $5,
+              dispatch_instructions = $6,
+              netsuite_active = true,
+              outbound_operator_status = 'packed',
               status_updated_at = now(),
               local_yard_order_status = 'Open',
               dispatch_planned = true,
@@ -916,7 +963,14 @@ export async function receiveLocalCoOrder(coRefOrId, operatorId, { photoDataUrls
     source: "receiving",
     action: "local_co.order.receive",
     orderId: deliveryOrderId,
-    details: { coRef: co.tranid, sourceOrderRef: co.source_order_ref, deliveryOrderId, revivedSourceSalesOrder: receiveAsSourceSo, lines: confirmedLines.length }
+    details: {
+      coRef: co.tranid,
+      sourceOrderRef: co.source_order_ref,
+      deliveryOrderId,
+      revivedSourceSalesOrder: receiveAsSourceSo,
+      revivedSourceTransferOrder: receiveAsSourceTransfer,
+      lines: confirmedLines.length
+    }
   });
   return {
     receiptStatus: "local_co_received",

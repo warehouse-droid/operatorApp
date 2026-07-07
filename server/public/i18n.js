@@ -4,6 +4,18 @@
   const ZH = "zh-CN";
 
   const dictionary = {
+    "operator.confirmPage": "\u786e\u8ba4\u672c\u9875",
+    "operator.batchView": "\u6279\u6b21",
+    "operator.batchViewDesc": "\u5728\u540c\u4e00\u5217\u8868\u67e5\u770b\u5df2\u8ba1\u5212\u3001\u6279\u6b21 A\u3001\u6279\u6b21 B \u548c TO\u3002",
+    "operator.savedOrders": "\u5df2\u4fdd\u5b58\u8ba2\u5355",
+    "operator.savedOrdersDesc": "\u67e5\u770b\u64cd\u4f5c\u5458\u5df2\u4fdd\u5b58\u7684 SO \u548c TO\u3002",
+    "operator.perLoadView": "\u6309\u8f66\u6b21\u67e5\u770b",
+    "operator.perLoadViewDesc": "\u9009\u62e9\u65e5\u671f\u548c\u8f66\u8f86\uff0c\u6309\u8f66\u6b21\u987a\u5e8f\u5907\u8d27\u3002",
+    "operator.salesTransferOrders": "\u9500\u552e\u8ba2\u5355 + \u8c03\u62e8\u8ba2\u5355",
+    "operator.allTrucks": "\u5168\u90e8\u8f66\u8f86",
+    "operator.truck": "\u8f66\u8f86",
+    "operator.selectTruck": "\u9009\u62e9\u8f66\u8f86",
+    "operator.transferShort": "TO",
     "app.operator": "MBBS 堆场操作员应用",
     "app.transportation": "MBBS 运输",
     "app.control": "MBBS 堆场服务器",
@@ -194,6 +206,9 @@
     "operator.packedRequiredNow": "已打包：{packed} | 当前需求：{required}",
     "operator.confirmedAdjust": "已确认 - 打包前仍可调整",
     "operator.stillOpenQty": "仍有未完成数量",
+    "operator.normal": "标准",
+    "operator.compact": "简洁",
+    "operator.releaseDraft": "释放",
 
     "dispatch.dispatch": "调度",
     "dispatch.planning": "调度计划",
@@ -441,6 +456,32 @@
     window.dispatchEvent(new CustomEvent("mbbs-language-changed", { detail: { language: normalized } }));
   }
 
+  const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+  function parseDisplayDate(value) {
+    if (!value) return null;
+    if (typeof value === "string") {
+      const iso = value.match(/^(\d{4})-(\d{2})-(\d{2})/);
+      if (iso) return new Date(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3]));
+    }
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+
+  function displayDate(value) {
+    const date = parseDisplayDate(value);
+    if (!date) return "";
+    return `${String(date.getDate()).padStart(2, "0")}-${MONTHS[date.getMonth()]}`;
+  }
+
+  function displayDateTime(value) {
+    if (!value) return "";
+    const date = new Date(value);
+    if (!date) return "";
+    if (Number.isNaN(date.getTime())) return "";
+    return `${displayDate(value)} ${date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+  }
+
   document.documentElement.lang = language();
 
   document.addEventListener("click", (event) => {
@@ -453,6 +494,8 @@
     language,
     setLanguage,
     t,
-    toggleHtml
+    toggleHtml,
+    displayDate,
+    displayDateTime
   };
 })();

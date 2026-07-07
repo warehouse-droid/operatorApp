@@ -70,8 +70,11 @@ function showToast(message) {
 function planDateText(value) {
   const text = String(value || "").slice(0, 10);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return "Plan date not set";
-  const [year, month, day] = text.split("-");
-  return `${month}/${day}/${year}`;
+  return window.MBBS_I18N?.displayDate(text) || "Plan date not set";
+}
+
+function dateTimeText(value) {
+  return window.MBBS_I18N?.displayDateTime(value) || "";
 }
 
 function mapsUrl(job) {
@@ -529,7 +532,7 @@ function renderDriverHistory() {
           <button class="history-record ${String(record.id) === String(selectedHistoryId) ? "active" : ""}" data-action="select-history" data-record="${escapeHtml(record.id)}" type="button">
             <strong>${escapeHtml(historyTypeText(record))}</strong>
             <span>${escapeHtml(record.reference || record.truckPlate || "-")}</span>
-            <em>${record.createdAt ? new Date(record.createdAt).toLocaleString() : ""}</em>
+            <em>${dateTimeText(record.createdAt)}</em>
           </button>
         `).join("") || `<div class="history-empty">No history for this date.</div>`}
       </div>
@@ -540,7 +543,7 @@ function renderDriverHistory() {
             <span>${escapeHtml(selected.status || "")}</span>
           </div>
           <div class="history-meta">
-            <span>${escapeHtml(selected.planDate || "")}</span>
+            <span>${escapeHtml(planDateText(selected.planDate))}</span>
             <span>${escapeHtml(selected.truckPlate || "")}</span>
             <span>${escapeHtml(selected.details?.loadName || selected.details?.samsaraDvirId || "")}</span>
           </div>

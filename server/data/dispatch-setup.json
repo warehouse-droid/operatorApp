@@ -2,17 +2,19 @@
   "drivers": [
     {
       "name": "Alex Wong",
-      "license": "AZ",
-      "number": "A90211",
+      "license": "DZ",
+      "number": "123",
       "login": "alex",
       "password": "123456",
-      "ownYardFixedMinutes": 20,
+      "samsaraPrimaryLogin": "",
+      "samsaraSecondaryLogin": "",
+      "ownYardFixedMinutes": 30,
       "vendorFixedMinutes": 30,
-      "deliveryFixedMinutes": 30,
-      "outsideFixedMinutes": 30,
-      "minutesPerPallet": 1,
-      "loadMinutes": 20,
-      "unloadMinutes": 30
+      "deliveryFixedMinutes": 15,
+      "outsideFixedMinutes": 15,
+      "minutesPerPallet": 1.5,
+      "loadMinutes": 30,
+      "unloadMinutes": 15
     },
     {
       "name": "Jenny Lee",
@@ -61,24 +63,138 @@
       "minutesPerPallet": 1,
       "loadMinutes": 40,
       "unloadMinutes": 35
+    },
+    {
+      "name": "Aurther",
+      "license": "DZ",
+      "number": "123",
+      "login": "Aurther",
+      "password": "MBT@3445",
+      "samsaraPrimaryLogin": "",
+      "samsaraSecondaryLogin": "",
+      "ownYardFixedMinutes": 40,
+      "vendorFixedMinutes": 45,
+      "deliveryFixedMinutes": 20,
+      "outsideFixedMinutes": 20,
+      "minutesPerPallet": 3,
+      "loadMinutes": 40,
+      "unloadMinutes": 20
+    },
+    {
+      "name": "Dao",
+      "license": "AZ",
+      "number": "1234",
+      "login": "Dao",
+      "password": "MBT@3445",
+      "samsaraPrimaryLogin": "",
+      "samsaraSecondaryLogin": "",
+      "ownYardFixedMinutes": 45,
+      "vendorFixedMinutes": 30,
+      "deliveryFixedMinutes": 10,
+      "outsideFixedMinutes": 10,
+      "minutesPerPallet": 1,
+      "loadMinutes": 45,
+      "unloadMinutes": 10
+    },
+    {
+      "name": "Li",
+      "license": "AZ",
+      "number": "223",
+      "login": "Li",
+      "password": "MBT@3445",
+      "samsaraPrimaryLogin": "",
+      "samsaraSecondaryLogin": "",
+      "ownYardFixedMinutes": 45,
+      "vendorFixedMinutes": 70,
+      "deliveryFixedMinutes": 20,
+      "outsideFixedMinutes": 20,
+      "minutesPerPallet": 3,
+      "loadMinutes": 45,
+      "unloadMinutes": 20
+    },
+    {
+      "name": "Sety",
+      "license": "AZ",
+      "number": "344",
+      "login": "Sety",
+      "password": "MBT@3445",
+      "samsaraPrimaryLogin": "",
+      "samsaraSecondaryLogin": "",
+      "ownYardFixedMinutes": 30,
+      "vendorFixedMinutes": 80,
+      "deliveryFixedMinutes": 10,
+      "outsideFixedMinutes": 10,
+      "minutesPerPallet": 1,
+      "loadMinutes": 30,
+      "unloadMinutes": 10
+    },
+    {
+      "name": "Jason",
+      "license": "AZ",
+      "number": "234",
+      "login": "jason",
+      "password": "jason",
+      "samsaraPrimaryLogin": "",
+      "samsaraSecondaryLogin": "",
+      "ownYardFixedMinutes": 40,
+      "vendorFixedMinutes": 70,
+      "deliveryFixedMinutes": 30,
+      "outsideFixedMinutes": 30,
+      "minutesPerPallet": 1.5,
+      "loadMinutes": 40,
+      "unloadMinutes": 30
+    },
+    {
+      "name": "Mike",
+      "license": "AZ",
+      "number": "345",
+      "login": "mike",
+      "password": "mike",
+      "samsaraPrimaryLogin": "",
+      "samsaraSecondaryLogin": "",
+      "ownYardFixedMinutes": 40,
+      "vendorFixedMinutes": 35,
+      "deliveryFixedMinutes": 35,
+      "outsideFixedMinutes": 35,
+      "minutesPerPallet": 2,
+      "loadMinutes": 40,
+      "unloadMinutes": 35
     }
   ],
   "trucks": [
     {
+      "plate": "BL27129",
+      "capacityLbs": 40000,
+      "travelTimePercent": 60
+    },
+    {
+      "plate": "BC71838",
+      "capacityLbs": 80000,
+      "travelTimePercent": 30
+    },
+    {
+      "plate": "CE94489",
+      "capacityLbs": 83000,
+      "travelTimePercent": 30
+    },
+    {
       "plate": "CC46868",
-      "capacityLbs": 78000
+      "capacityLbs": 78000,
+      "travelTimePercent": 30
     },
     {
       "plate": "CA54629",
       "capacityLbs": 83000
     },
     {
-      "plate": "BC71838",
-      "capacityLbs": 80000
+      "plate": "CE94487",
+      "capacityLbs": 83000,
+      "travelTimePercent": 30
     },
     {
-      "plate": "BL27129",
-      "capacityLbs": 78000
+      "plate": "BD98773",
+      "capacityLbs": 40000,
+      "travelTimePercent": 30
     }
   ],
   "ownYards": [
@@ -93,7 +209,7 @@
     {
       "code": "2967",
       "name": "2967",
-      "locationId": 13,
+      "locationId": 28,
       "address": "2967 Kennedy Road, Toronto, ON",
       "lat": 43.806119,
       "lng": -79.2986377
@@ -118,8 +234,8 @@
     "intervalSeconds": 60,
     "maxRunSeconds": 900,
     "running": false,
-    "lastStartedAt": "2026-07-02T19:45:31.412Z",
-    "lastFinishedAt": "2026-07-02T19:51:08.999Z",
+    "lastStartedAt": "2026-07-07T15:30:20.763Z",
+    "lastFinishedAt": "2026-07-07T15:44:47.152Z",
     "lastSource": "control_manual",
     "lastStatus": "success",
     "lastError": ""

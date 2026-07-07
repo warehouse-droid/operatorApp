@@ -5,18 +5,18 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { config, listEnvFiles, selectEnvFile } from "./config.js";
 import { beginRollbackContext, pool, query, withTransaction } from "./db.js";
-import { buildAuthorizationUrl, exchangeCodeForToken, fetchDeliveryOrdersFromNetSuite, fetchDeliveryOrderFromNetSuite, fetchCustomerPickupOrderFromNetSuite, fetchDeliveryOrderDetailsFromNetSuite, fetchTransferDeliveryOrdersFromNetSuite, fetchTransferDeliveryOrderFromNetSuite, fetchTransferOrderDetailsFromNetSuite, fetchPurchaseOrdersFromNetSuite, fetchPurchaseOrderFromNetSuite, fetchPurchaseOrderDetailsFromNetSuite, fetchTransferReceivingOrdersFromNetSuite, fetchTransferReceivingOrderFromNetSuite, fetchInventoryBalanceForItemFromNetSuite, fetchInventoryBalancesFromNetSuite, fetchItemFulfillmentFromNetSuite, fetchItemReceiptFromNetSuite, fetchTransactionStatusFromNetSuite, transformSalesOrderToItemFulfillment, transformTransferOrderToItemFulfillment, transformPurchaseOrderToItemReceipt, transformTransferOrderToItemReceipt } from "./netsuite.js";
-import { listDeliveryOrders, getDeliveryOrder, getFulfillableDeliveryOrder, buildItemFulfillmentPayload, markDeliveryPrepared, updateDeliveryStatus, confirmDeliveryLine, setDeliveryLinePackedQuantity, unpackDeliveryLine, unpackDeliveryOrder, recordDeliveryFulfillment, recordDeliveryFulfillmentFailure, recordDeliveryLoad, listDeliveryFulfillments, listControlLoadedOrders, getControlLoadedOrderDetail, listControlLoadedOrderCsvRows, getDeliveryPrepNotifications, resetDeliveryFulfillmentState, applyConfirmedDispatchPlanToDelivery } from "./delivery-repository.js";
+import { buildAuthorizationUrl, exchangeCodeForToken, fetchDeliveryOrdersFromNetSuite, fetchDeliveryOrderFromNetSuite, fetchCustomerPickupOrderFromNetSuite, fetchDeliveryOrderDetailsFromNetSuite, fetchTransferDeliveryOrdersFromNetSuite, fetchTransferDeliveryOrderFromNetSuite, fetchTransferOrderDetailsFromNetSuite, fetchPurchaseOrdersFromNetSuite, fetchPurchaseOrderFromNetSuite, fetchPurchaseOrderDetailsFromNetSuite, fetchTransferReceivingOrdersFromNetSuite, fetchTransferReceivingOrderFromNetSuite, fetchInventoryBalanceForItemFromNetSuite, fetchInventoryBalancesFromNetSuite, fetchItemFulfillmentFromNetSuite, fetchItemReceiptFromNetSuite, fetchTransactionProgressFromNetSuite, fetchTransactionStatusFromNetSuite, transformSalesOrderToItemFulfillment, transformTransferOrderToItemFulfillment, transformPurchaseOrderToItemReceipt, transformTransferOrderToItemReceipt } from "./netsuite.js";
+import { listDeliveryOrders, getDeliveryOrder, getFulfillableDeliveryOrder, buildItemFulfillmentPayload, markDeliveryPrepared, updateDeliveryStatus, confirmDeliveryLine, confirmDeliveryLines, setDeliveryLinePackedQuantity, unpackDeliveryLine, unpackDeliveryOrder, recordDeliveryFulfillment, recordDeliveryFulfillmentFailure, recordDeliveryLoad, listDeliveryFulfillments, listControlLoadedOrders, getControlLoadedOrderDetail, listControlLoadedOrderCsvRows, getDeliveryPrepNotifications, resetDeliveryFulfillmentState, applyConfirmedDispatchPlanToDelivery, deactivateUnplannedDispatchSplitOrders, getNextDispatchSplitSuffix, getCurrentOperatorDeliveryDraft, releaseCurrentDeliveryDraft, listSavedDeliveryOrdersForOperator, listSavedDeliveryOrderKeysForOperator, saveDeliveryOrderForOperator, removeSavedDeliveryOrderForOperator, listDeliveryLoadTrucks, listDeliveryLoadOrders } from "./delivery-repository.js";
 import { clearCustomerPickupDraft, confirmCustomerPickupLine, findCustomerPickupOrder, isPendingApprovalStatus, isPickupDeliveryMethod, recordCustomerPickupLoad } from "./customer-pickup-repository.js";
-import { createOperator, getOperatorByToken, hasOperators, listAudit, listOperators, loginOperator, logoutToken, setOperatorActive, updateOperatorPassword, writeAudit } from "./auth-repository.js";
+import { createOperator, getOperatorByToken, hasOperators, listAudit, listAuditOptions, listOperators, loginOperator, logoutToken, setOperatorActive, updateOperatorPassword, writeAudit } from "./auth-repository.js";
 import { applyInventoryClassificationRules, confirmCycleCountLine, getCycleCountDraft, listCycleCountRecords, listInventoryClassifications, listInventoryFacets, listInventoryItems, submitCycleCount, updateInventoryClassification, upsertInventoryBalances } from "./inventory-repository.js";
 import { listReceivingVendors, listReceivingSources, listReceivingOrders, getReceivingOrder, searchReceivingItems, confirmReceivingLine, getReceivableReceivingOrder, buildItemReceiptPayload, recordReceivingReceipt, recordReceivingReceiptFailure, listReceivingReceipts, listLocalCoSources, listLocalCoReceivingOrders, searchLocalCoItems, getLocalCoReceivingOrder, confirmLocalCoReceivingLine, receiveLocalCoOrder } from "./receiving-repository.js";
 import { listExistingInboundOrderIds, listExistingOutboundOrderIds, markMissingInboundOrderLines, markMissingInboundOrders, markMissingOutboundOrderLines, markOutboundOrderMissing, updatePurchaseOrderNetSuiteStatus, updateSalesOrderNetSuiteStatus, upsertInboundTransferOrderLines, upsertInboundTransferOrders, upsertOutboundTransferOrderLines, upsertOutboundTransferOrders, upsertPurchaseOrderLines, upsertPurchaseOrders, upsertSalesOrderLines, upsertSalesOrders } from "./order-sync-repository.js";
 import { listOperatorHistory, listRecordWarnings, reportOperatorRecordError, resolveRecordWarning } from "./history-repository.js";
-import { listDispatchOrders, refreshDispatchEnrichment, setPurchaseOrderVendorYard, updateDispatchOrderDetails, getSalesOrderPoAllocationOptions, createSalesOrderPoAllocation, createSalesOrderPoAllocations, cancelSalesOrderPoAllocation, createDispatchOperatorRequest, upsertLocalCoOrder, cancelLocalCoOrder, listDispatchOperatorRequests, resolveDispatchOperatorRequestsForOrder } from "./dispatch-repository.js";
+import { listDispatchOrders, refreshDispatchEnrichment, reparseMissingSalesOrderDispatch, setPurchaseOrderVendorYard, updateDispatchOrderDetails, getSalesOrderPoAllocationOptions, createSalesOrderPoAllocation, createSalesOrderPoAllocations, cancelSalesOrderPoAllocation, createDispatchOperatorRequest, upsertLocalCoOrder, cancelLocalCoOrder, listDispatchOperatorRequests, resolveDispatchOperatorRequestsForOrder } from "./dispatch-repository.js";
 import { listDispatchVendorYards, updateDispatchVendorYard, upsertDispatchVendorYard, listDispatchParserRules, updateDispatchParserRule, listOllamaAudit } from "./dispatch-enrichment.js";
 import { listDispatchAudit, writeDispatchAudit } from "./dispatch-audit-repository.js";
-import { confirmDispatchPlan, createDispatchPlan, getCurrentDispatchPlan, getDispatchPlan, listDispatchPlans, reopenDispatchPlan, saveDispatchPlanSnapshot } from "./dispatch-plan-repository.js";
+import { StaleDispatchPlanSaveError, confirmDispatchPlan, createDispatchPlan, getCurrentDispatchPlan, getDispatchPlan, listDispatchPlans, reopenDispatchPlan, saveDispatchPlanSnapshot } from "./dispatch-plan-repository.js";
 import { getDispatchStatistics } from "./dispatch-statistics-repository.js";
 import { getDriverDayState, getNextDriverJob, listDriverHistory, listDriverJobStatuses, recordDriverJobPhotos, skipDriverDvirForTesting, startDriverJob, submitDriverDvir } from "./driver-repository.js";
 import { createSamsaraDriverAuthToken, createSamsaraDriverVehicleAssignment, findSamsaraDriverByUsername, listSamsaraVehicleLocations, setSamsaraDriverDutyStatus, testSamsaraConnection } from "./samsara.js";
@@ -29,7 +29,7 @@ const qrScannerDir = path.resolve(dirname, "../node_modules/qr-scanner");
 const dataDir = path.resolve(dirname, "../data");
 const dispatchPlanPath = path.join(dataDir, "dispatch-plan.json");
 const dispatchSetupPath = path.join(dataDir, "dispatch-setup.json");
-const deliveryLocations = [1, 13, 15, 26];
+const deliveryLocations = [1, 28, 15, 26];
 const fulfillmentJobs = new Map();
 const receivingJobs = new Map();
 const driverSessions = new Map();
@@ -44,13 +44,13 @@ const defaultDispatchSetup = {
     { name: "Jenny Lee", license: "DZ", number: "D18870", login: "jenny", ownYardFixedMinutes: 38, vendorFixedMinutes: 32, deliveryFixedMinutes: 32, outsideFixedMinutes: 32, minutesPerPallet: 1, loadMinutes: 38, unloadMinutes: 32 }
   ],
   trucks: [
-    { plate: "MBBS-101", capacityLbs: 48000 },
-    { plate: "MBBS-205", capacityLbs: 44000 },
-    { plate: "MBBS-318", capacityLbs: 52000 }
+    { plate: "MBBS-101", capacityLbs: 48000, travelTimePercent: 0 },
+    { plate: "MBBS-205", capacityLbs: 44000, travelTimePercent: 0 },
+    { plate: "MBBS-318", capacityLbs: 52000, travelTimePercent: 0 }
   ],
   ownYards: [
     { code: "3445", name: "3445", locationId: 1, address: "3445 Kennedy Road, Toronto, ON", lat: 43.8204306, lng: -79.3053423 },
-    { code: "2967", name: "2967", locationId: 13, address: "2967 Kennedy Road, Toronto, ON", lat: 43.806119, lng: -79.2986377 },
+    { code: "2967", name: "2967", locationId: 28, address: "2967 Kennedy Road, Toronto, ON", lat: 43.806119, lng: -79.2986377 },
     { code: "12441", name: "12441", locationId: 15, address: "12441 Woodbine Avenue, Whitchurch-Stouffville, ON", lat: 43.948694, lng: -79.3727582 },
     { code: "150", name: "150", locationId: 26, address: "150 Clark Blvd, Brampton, ON L6T 4Y8, Canada" }
   ],
@@ -118,6 +118,493 @@ function changedDispatchOperatorRefs(beforePlan = {}, afterPlan = {}) {
   return changed;
 }
 
+function dispatchOperatorImpactSignature(plan = {}) {
+  const assignmentEntries = [...dispatchOperatorAssignmentMap(plan).entries()].sort(([a], [b]) => a.localeCompare(b));
+  const operatorOrders = (plan.orders || [])
+    .filter((order) => ["SO", "TO", "CO"].includes(order?.type) || order?.originalOrderId || order?.transitCo)
+    .map((order) => ({
+      id: order.id || "",
+      type: order.type || "",
+      originalOrderId: order.originalOrderId || "",
+      sourceYard: order.sourceYard || "",
+      destinationYard: order.destinationYard || "",
+      pickupLocations: order.pickupLocations || [],
+      transitCo: order.transitCo
+        ? {
+            id: order.transitCo.id || "",
+            fromYard: order.transitCo.fromYard || "",
+            toYard: order.transitCo.toYard || ""
+          }
+        : null,
+      childOrders: order.childOrders || [],
+      items: (order.items || []).map((item) => ({
+        id: item.id || item.lineRowId || item.lineId || item.sku || item.itemName || "",
+        sku: item.sku || item.itemName || "",
+        quantity: item.quantity ?? item.salesQty ?? "",
+        pallets: item.pallets ?? item.pallet_qty ?? "",
+        layers: item.layers ?? item.layer_qty ?? "",
+        sections: item.sections ?? item.section_qty ?? "",
+        pieces: item.pieces ?? item.piece_qty ?? "",
+        splitQty: item.splitQty ?? "",
+        splitParts: item.splitParts || null
+      }))
+    }))
+    .sort((a, b) => String(a.id).localeCompare(String(b.id)));
+  return JSON.stringify({
+    planDate: plan.planDate || "",
+    assignments: assignmentEntries,
+    orders: operatorOrders
+  });
+}
+
+function dispatchOperatorImpactChanged(beforePlan = {}, afterPlan = {}) {
+  return dispatchOperatorImpactSignature(beforePlan || {}) !== dispatchOperatorImpactSignature(afterPlan || {});
+}
+
+function stableJsonValue(value) {
+  if (Array.isArray(value)) return value.map(stableJsonValue);
+  if (!value || typeof value !== "object") return value;
+  return Object.keys(value)
+    .sort()
+    .reduce((memo, key) => {
+      memo[key] = stableJsonValue(value[key]);
+      return memo;
+    }, {});
+}
+
+function dispatchPlanDataSignature({ orders = [], trucks = [] } = {}) {
+  return JSON.stringify(stableJsonValue({ orders, trucks }));
+}
+
+function dispatchPlanDataChanged(previousPlan = {}, nextPlan = {}) {
+  return dispatchPlanDataSignature(previousPlan || {}) !== dispatchPlanDataSignature(nextPlan || {});
+}
+
+function dispatchPlanSaveMode(body = {}) {
+  return String(body?.saveMode || body?.audit?.details?.saveMode || "").trim();
+}
+
+function dispatchTruckDriverKey(truck = {}) {
+  const key = String(truck.driverLogin || truck.driver_login || truck.driver || "").trim().toLowerCase();
+  return key && key !== "unassigned" ? key : "";
+}
+
+function dispatchDuplicateDriverAssignments(trucks = []) {
+  const seen = new Map();
+  const duplicates = [];
+  for (const truck of trucks || []) {
+    const key = dispatchTruckDriverKey(truck);
+    if (!key) continue;
+    const assignment = {
+      driver: truck.driver || truck.driverLogin || key,
+      driverLogin: truck.driverLogin || truck.driver_login || "",
+      truckId: truck.id || "",
+      truckPlate: truck.plate || ""
+    };
+    if (seen.has(key)) {
+      duplicates.push({ driverKey: key, trucks: [seen.get(key), assignment] });
+      continue;
+    }
+    seen.set(key, assignment);
+  }
+  return duplicates;
+}
+
+function sendDispatchDuplicateDriverResponse(res, duplicates = []) {
+  const preview = duplicates
+    .slice(0, 3)
+    .map((item) => `${item.driverKey}: ${item.trucks.map((truck) => truck.truckPlate || truck.truckId).filter(Boolean).join(", ")}`)
+    .join("; ");
+  res.status(409).json({
+    code: "DISPATCH_DRIVER_DUPLICATE",
+    error: `One driver can only be assigned to one truck${preview ? `: ${preview}` : "."}`,
+    duplicates
+  });
+}
+
+function dispatchTruckSequenceKey(truck = {}) {
+  return String(truck.id || truck.plate || "").trim();
+}
+
+function mergeDispatchTruckSequence(latestTrucks = [], requestedTrucks = []) {
+  const latestByKey = new Map((latestTrucks || [])
+    .map((truck) => [dispatchTruckSequenceKey(truck), truck])
+    .filter(([key]) => key));
+  const requestedByKey = new Map((requestedTrucks || [])
+    .map((truck) => [dispatchTruckSequenceKey(truck), truck])
+    .filter(([key]) => key));
+  const seen = new Set();
+  const merged = [];
+  for (const requested of requestedTrucks || []) {
+    const key = dispatchTruckSequenceKey(requested);
+    if (!key || seen.has(key)) continue;
+    merged.push(latestByKey.get(key) || requested);
+    seen.add(key);
+  }
+  for (const latest of latestTrucks || []) {
+    const key = dispatchTruckSequenceKey(latest);
+    if (!key || seen.has(key)) continue;
+    merged.push(latest);
+    seen.add(key);
+  }
+  for (const requested of requestedTrucks || []) {
+    const key = dispatchTruckSequenceKey(requested);
+    if (!key || seen.has(key) || latestByKey.has(key)) continue;
+    merged.push(requestedByKey.get(key) || requested);
+    seen.add(key);
+  }
+  return merged;
+}
+
+function dispatchPlannedOrderRefs(plan = {}) {
+  const orderById = new Map((plan.orders || []).map((order) => [String(order?.id || ""), order]));
+  const refs = new Set();
+  const addRef = (value) => {
+    const ref = String(value || "").trim();
+    if (ref) refs.add(ref);
+  };
+  const addOrderRefs = (orderId) => {
+    addRef(orderId);
+    const order = orderById.get(String(orderId || ""));
+    if (!order || order.type === "CO") return;
+    addRef(order.originalOrderId);
+    for (const childId of order.childOrders || []) addRef(childId);
+    for (const child of order.childOrderDetails || []) {
+      addRef(child?.id);
+      addRef(child?.originalOrderId);
+    }
+  };
+  for (const truck of plan.trucks || []) {
+    for (const load of truck.loads || []) {
+      if (load.returnOnly) continue;
+      for (const stop of load.stops || []) {
+        if (stop?.type !== "drop" || !stop.orderId) continue;
+        addOrderRefs(stop.orderId);
+      }
+    }
+  }
+  return refs;
+}
+
+function dispatchPlannedAssignmentMap(plan = {}) {
+  const orderById = new Map((plan.orders || []).map((order) => [String(order?.id || ""), order]));
+  const assignments = new Map();
+  const addRef = (value, details) => {
+    const ref = String(value || "").trim();
+    if (ref && !assignments.has(ref)) assignments.set(ref, details);
+  };
+  const addOrderRefs = (orderId, details) => {
+    addRef(orderId, details);
+    const order = orderById.get(String(orderId || ""));
+    if (!order || order.type === "CO") return;
+    addRef(order.originalOrderId, details);
+    for (const childId of order.childOrders || []) addRef(childId, details);
+    for (const child of order.childOrderDetails || []) {
+      addRef(child?.id, details);
+      addRef(child?.originalOrderId, details);
+    }
+  };
+  for (const truck of plan.trucks || []) {
+    for (const load of truck.loads || []) {
+      if (load.returnOnly) continue;
+      for (const stop of load.stops || []) {
+        if (stop?.type !== "drop" || !stop.orderId) continue;
+        addOrderRefs(stop.orderId, {
+          dispatchPlanned: true,
+          dispatchPlanId: plan.id ? String(plan.id) : "",
+          dispatchPlanDate: String(plan.planDate || "").slice(0, 10),
+          dispatchTruckPlate: truck.plate || "",
+          dispatchLoadName: load.name || "",
+          dispatchParkingSpot: truck.parkingSpot || ""
+        });
+      }
+    }
+  }
+  return assignments;
+}
+
+async function dispatchPlannedAssignmentsFromSnapshots() {
+  const result = await query(
+    `SELECT p.id, p.plan_date::text AS plan_date, p.status, s.orders, s.trucks
+       FROM dispatch_plans p
+       JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+      WHERE p.status <> 'cancelled'
+      ORDER BY p.plan_date DESC, p.updated_at DESC`
+  );
+  const assignments = new Map();
+  for (const row of result.rows) {
+    const planAssignments = dispatchPlannedAssignmentMap({
+      id: row.id,
+      planDate: row.plan_date,
+      orders: row.orders || [],
+      trucks: row.trucks || []
+    });
+    for (const [ref, details] of planAssignments.entries()) {
+      if (!assignments.has(ref)) assignments.set(ref, details);
+    }
+  }
+  await removeStaleCoPlannedAssignments(assignments);
+  return assignments;
+}
+
+async function removeStaleCoPlannedAssignments(assignments) {
+  const coRefs = [...assignments.keys()].filter((ref) => String(ref || "").startsWith("CO-"));
+  if (!coRefs.length) return;
+  const result = await query(
+    `SELECT co_ref,
+            dispatch_plan_id::text AS dispatch_plan_id,
+            dispatch_plan_date::date::text AS dispatch_plan_date
+       FROM co_orders
+      WHERE co_ref = ANY($1)`,
+    [coRefs]
+  );
+  const activeCo = new Map(result.rows.map((row) => [String(row.co_ref || ""), row]));
+  for (const coRef of coRefs) {
+    const row = activeCo.get(coRef);
+    const details = assignments.get(coRef);
+    const rowPlanId = String(row?.dispatch_plan_id || "");
+    const rowPlanDate = String(row?.dispatch_plan_date || "").slice(0, 10);
+    const assignmentPlanId = String(details?.dispatchPlanId || "");
+    const assignmentPlanDate = String(details?.dispatchPlanDate || "").slice(0, 10);
+    const matchesPlanId = rowPlanId && assignmentPlanId && rowPlanId === assignmentPlanId;
+    const matchesPlanDate = rowPlanDate && assignmentPlanDate && rowPlanDate === assignmentPlanDate;
+    if (!row || (!matchesPlanId && !matchesPlanDate)) assignments.delete(coRef);
+  }
+}
+
+async function enrichDispatchOrdersWithPlanAssignments(orders = []) {
+  const plannedAssignments = await dispatchPlannedAssignmentsFromSnapshots();
+  return (orders || []).map((order) => {
+    const planned = plannedAssignments.get(String(order.id || ""));
+    if (!planned) return order;
+    return {
+      ...order,
+      dispatchPlanned: true,
+      dispatchPlanId: planned.dispatchPlanId || order.dispatchPlanId || "",
+      dispatchPlanDate: planned.dispatchPlanDate || order.dispatchPlanDate || "",
+      dispatchTruckPlate: planned.dispatchTruckPlate || order.dispatchTruckPlate || "",
+      dispatchLoadName: planned.dispatchLoadName || order.dispatchLoadName || "",
+      dispatchParkingSpot: planned.dispatchParkingSpot || order.dispatchParkingSpot || ""
+    };
+  });
+}
+
+async function listDispatchPlannedAssignments() {
+  const plannedAssignments = await dispatchPlannedAssignmentsFromSnapshots();
+  return [...plannedAssignments.entries()]
+    .map(([orderRef, details]) => ({ orderRef, ...details }))
+    .sort((a, b) => String(a.orderRef).localeCompare(String(b.orderRef)));
+}
+
+async function findDispatchPlanDateConflicts({ planId, planDate, orders = [], trucks = [] } = {}) {
+  const currentRefs = dispatchPlannedOrderRefs({ orders, trucks });
+  if (!currentRefs.size) return [];
+  const result = await query(
+    `SELECT p.id, p.plan_date::text AS plan_date, p.status, s.orders, s.trucks
+       FROM dispatch_plans p
+       JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+      WHERE p.id <> $1
+        AND p.status <> 'cancelled'
+        AND p.plan_date <> $2::date`,
+    [planId, planDate]
+  );
+  const conflicts = [];
+  for (const row of result.rows) {
+    const otherRefs = dispatchPlannedOrderRefs({ orders: row.orders || [], trucks: row.trucks || [] });
+    for (const ref of currentRefs) {
+      if (!otherRefs.has(ref)) continue;
+      conflicts.push({
+        orderRef: ref,
+        planId: String(row.id),
+        planDate: row.plan_date,
+        status: row.status || ""
+      });
+    }
+  }
+  return conflicts.sort((a, b) => `${a.planDate}|${a.orderRef}`.localeCompare(`${b.planDate}|${b.orderRef}`));
+}
+
+function dispatchPlanDateConflictKey(conflict = {}) {
+  return [
+    String(conflict.orderRef || ""),
+    String(conflict.planId || ""),
+    String(conflict.planDate || "")
+  ].join("|");
+}
+
+async function findNewDispatchPlanDateConflicts(previousPlan = {}, nextPlan = {}) {
+  const previousConflicts = await findDispatchPlanDateConflicts({
+    planId: previousPlan.id || nextPlan.id,
+    planDate: previousPlan.planDate || nextPlan.planDate,
+    orders: previousPlan.orders || [],
+    trucks: previousPlan.trucks || []
+  });
+  const previousKeys = new Set(previousConflicts.map(dispatchPlanDateConflictKey));
+  const nextConflicts = await findDispatchPlanDateConflicts({
+    planId: nextPlan.id || previousPlan.id,
+    planDate: nextPlan.planDate || previousPlan.planDate,
+    orders: nextPlan.orders || [],
+    trucks: nextPlan.trucks || []
+  });
+  return nextConflicts.filter((conflict) => !previousKeys.has(dispatchPlanDateConflictKey(conflict)));
+}
+
+function dispatchDateCompare(a, b) {
+  const left = String(a || "").slice(0, 10);
+  const right = String(b || "").slice(0, 10);
+  if (!left || !right || left === right) return 0;
+  return left < right ? -1 : 1;
+}
+
+function dispatchTimingNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function dispatchOrderDropOccurrences(plan = {}, orderRef = "") {
+  const target = String(orderRef || "");
+  const occurrences = [];
+  for (const truck of plan.trucks || []) {
+    for (const load of truck.loads || []) {
+      for (const stop of load.stops || []) {
+        if (stop?.type !== "drop" || String(stop?.orderId || "") !== target) continue;
+        occurrences.push({ truck, load, stop });
+      }
+    }
+  }
+  return occurrences;
+}
+
+function dispatchSourcePickupMinute(occurrence = {}) {
+  const load = occurrence.load || {};
+  const orderRef = String(occurrence.stop?.orderId || "");
+  const pickup = (load.stops || []).find((stop) =>
+    stop?.type === "pick" && String(stop?.orderId || "") === orderRef
+  );
+  return dispatchTimingNumber(pickup?.timing?.arrival) ?? dispatchTimingNumber(load.timing?.start);
+}
+
+function dispatchCoFinishMinute(occurrence = {}) {
+  return dispatchTimingNumber(occurrence.load?.timing?.finish)
+    ?? dispatchTimingNumber(occurrence.stop?.timing?.depart);
+}
+
+async function dispatchPlansForCoValidation(nextPlan = {}) {
+  const result = await query(
+    `SELECT p.id, p.plan_date::text AS plan_date, p.status, s.orders, s.trucks
+       FROM dispatch_plans p
+       JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+      WHERE p.status <> 'cancelled'
+        AND p.id <> $1`,
+    [nextPlan.id || 0]
+  );
+  return [
+    nextPlan,
+    ...result.rows.map((row) => ({
+      id: String(row.id || ""),
+      planDate: row.plan_date,
+      orders: row.orders || [],
+      trucks: row.trucks || []
+    }))
+  ];
+}
+
+async function findDispatchCoSequenceConflicts(nextPlan = {}) {
+  const sourcePlanDate = String(nextPlan.planDate || "").slice(0, 10);
+  const candidatePlans = await dispatchPlansForCoValidation(nextPlan);
+  const coOccurrences = new Map();
+  for (const plan of candidatePlans) {
+    const planDate = String(plan.planDate || "").slice(0, 10);
+    const coRefs = new Set((plan.orders || [])
+      .filter((order) => order?.type === "CO")
+      .map((order) => String(order?.id || ""))
+      .filter(Boolean));
+    for (const truck of plan.trucks || []) {
+      for (const load of truck.loads || []) {
+        for (const stop of load.stops || []) {
+          const ref = String(stop?.orderId || "");
+          if (stop?.type === "drop" && ref.startsWith("CO-")) coRefs.add(ref);
+        }
+      }
+    }
+    for (const coRef of coRefs) {
+      const occurrence = dispatchOrderDropOccurrences(plan, coRef)[0];
+      if (!occurrence) continue;
+      const finish = dispatchCoFinishMinute(occurrence);
+      const current = coOccurrences.get(coRef);
+      if (!current || dispatchDateCompare(planDate, current.planDate) < 0) {
+        coOccurrences.set(coRef, { coRef, planDate, finish });
+      }
+    }
+  }
+
+  const conflicts = [];
+  for (const source of nextPlan.orders || []) {
+    const sourceRef = String(source?.id || "");
+    const coRef = String(source?.transitCo?.id || "");
+    if (!sourceRef || !coRef || source?.type === "CO") continue;
+    const sourceOccurrences = dispatchOrderDropOccurrences(nextPlan, sourceRef);
+    if (!sourceOccurrences.length) continue;
+    const co = coOccurrences.get(coRef);
+    if (!co) {
+      conflicts.push({ orderRef: sourceRef, coRef, reason: `${sourceRef} requires ${coRef} to be planned first.` });
+      continue;
+    }
+    const dateCompare = dispatchDateCompare(co.planDate, sourcePlanDate);
+    if (dateCompare > 0) {
+      conflicts.push({ orderRef: sourceRef, coRef, coPlanDate: co.planDate, sourcePlanDate, reason: `${coRef} is planned after ${sourceRef}.` });
+      continue;
+    }
+    if (dateCompare < 0) continue;
+    const sourcePickup = dispatchSourcePickupMinute(sourceOccurrences[0]);
+    if (!Number.isFinite(Number(co.finish)) || !Number.isFinite(Number(sourcePickup))) {
+      continue;
+    }
+    if (Number(co.finish) > Number(sourcePickup)) {
+      conflicts.push({
+        orderRef: sourceRef,
+        coRef,
+        coPlanDate: co.planDate,
+        sourcePlanDate,
+        coFinish: Number(co.finish),
+        sourcePickup: Number(sourcePickup),
+        reason: `${coRef} must finish before ${sourceRef} pickup.`
+      });
+    }
+  }
+  return conflicts;
+}
+
+function sendDispatchPlanDateConflictResponse(res, conflicts = []) {
+  const preview = conflicts.slice(0, 5).map((item) => `${item.orderRef} on ${item.planDate}`).join(", ");
+  res.status(409).json({
+    code: "DISPATCH_ORDER_ALREADY_PLANNED",
+    error: `Some orders are already planned on another date${preview ? `: ${preview}` : "."}`,
+    conflicts
+  });
+}
+
+function sendDispatchCoSequenceConflictResponse(res, conflicts = []) {
+  const preview = conflicts.slice(0, 3).map((item) => item.reason).join(" ");
+  res.status(409).json({
+    code: "DISPATCH_CO_SEQUENCE_INVALID",
+    error: preview || "CO must be planned before the original order pickup.",
+    conflicts
+  });
+}
+
+async function sendStaleDispatchPlanResponse(res, error) {
+  const latest = await getDispatchPlan(error.planId).catch(() => null);
+  res.status(409).json({
+    error: error.message,
+    code: error.code,
+    planId: String(error.planId || ""),
+    expectedRevision: error.expectedRevision,
+    currentRevision: error.currentRevision,
+    plan: latest
+  });
+}
+
 function dispatchPlanStopIds(plan) {
   return new Set((plan?.trucks || []).flatMap((truck) =>
     (truck.loads || []).flatMap((load) => (load.stops || []).map((stop) => String(stop.id || "")))
@@ -126,12 +613,86 @@ function dispatchPlanStopIds(plan) {
 
 function sanitizeDispatchPlanOrders(orders = []) {
   const groupedChildren = new Set();
+  const splitParents = new Set();
   for (const order of orders || []) {
     for (const childId of order?.childOrders || []) {
       if (childId) groupedChildren.add(String(childId));
     }
+    const originalOrderId = String(order?.originalOrderId || "").trim();
+    if (originalOrderId) splitParents.add(originalOrderId);
   }
-  return (orders || []).filter((order) => !groupedChildren.has(String(order?.id || "")));
+  return (orders || []).filter((order) => {
+    const id = String(order?.id || "");
+    return !groupedChildren.has(id) && !splitParents.has(id);
+  });
+}
+
+function dispatchCoAssignments(plan = {}) {
+  const assignments = new Map();
+  for (const truck of plan.trucks || []) {
+    for (const load of truck.loads || []) {
+      if (load.returnOnly) continue;
+      for (const stop of load.stops || []) {
+        if (stop?.type !== "drop") continue;
+        const coRef = String(stop.orderId || "").trim();
+        if (!coRef.startsWith("CO-")) continue;
+        assignments.set(coRef, {
+          coRef,
+          planId: plan.id || null,
+          planDate: String(plan.planDate || "").slice(0, 10),
+          truckPlate: truck.plate || "",
+          loadName: load.name || "",
+          parkingSpot: truck.parkingSpot || ""
+        });
+      }
+    }
+  }
+  return assignments;
+}
+
+async function applyDispatchPlanCoAssignments(plan = {}) {
+  if (!plan?.id || !plan?.planDate) return { planned: 0, cleared: 0 };
+  const assignments = dispatchCoAssignments(plan);
+  const refs = [...assignments.keys()];
+  const cleared = await query(
+    `UPDATE local_co_orders
+        SET dispatch_plan_id = NULL,
+            dispatch_plan_date = NULL,
+            dispatch_truck_plate = '',
+            dispatch_load_name = '',
+            dispatch_parking_spot = '',
+            updated_at = now()
+      WHERE status NOT IN ('received', 'loaded')
+        AND (
+          dispatch_plan_id = $1
+          OR dispatch_plan_date = $2::date
+        )
+        AND NOT (co_ref = ANY($3::text[]))
+      RETURNING co_ref`,
+    [plan.id, plan.planDate, refs]
+  );
+  for (const assignment of assignments.values()) {
+    await query(
+      `UPDATE local_co_orders
+          SET dispatch_plan_id = $2,
+              dispatch_plan_date = $3::date,
+              dispatch_truck_plate = $4,
+              dispatch_load_name = $5,
+              dispatch_parking_spot = $6,
+              updated_at = now()
+        WHERE co_ref = $1
+          AND status NOT IN ('received', 'loaded')`,
+      [
+        assignment.coRef,
+        assignment.planId,
+        assignment.planDate || null,
+        assignment.truckPlate,
+        assignment.loadName,
+        assignment.parkingSpot
+      ]
+    );
+  }
+  return { planned: refs.length, cleared: cleared.rowCount };
 }
 
 function shippedDispatchCsv(plan, driverJobStatuses = []) {
@@ -553,6 +1114,11 @@ function operatorId(req) {
   return req.operator?.id || "";
 }
 
+function auditOrderId(value) {
+  const text = String(value ?? "").trim();
+  return /^\d+$/.test(text) ? text : null;
+}
+
 function publicDriver(driver) {
   if (!driver) return null;
   return {
@@ -716,6 +1282,22 @@ function normalizeSyncSettings(sync = {}) {
   };
 }
 
+function validateDispatchSetupDrivers(drivers = []) {
+  const seen = new Map();
+  for (const driver of drivers || []) {
+    const login = String(driver?.login || "").trim();
+    if (!login) continue;
+    const key = login.toLowerCase();
+    const previous = seen.get(key);
+    if (previous) {
+      const error = new Error(`Driver login must be unique. "${login}" is used by both ${previous} and ${driver?.name || login}.`);
+      error.status = 400;
+      throw error;
+    }
+    seen.set(key, driver?.name || login);
+  }
+}
+
 async function writeDispatchSetup(patch = {}) {
   const current = await readDispatchSetup();
   const payload = {
@@ -725,6 +1307,7 @@ async function writeDispatchSetup(patch = {}) {
     sync: patch.sync ? normalizeSyncSettings({ ...current.sync, ...patch.sync }) : current.sync,
     samsara: patch.samsara ? { ...current.samsara, ...patch.samsara } : current.samsara
   };
+  validateDispatchSetupDrivers(payload.drivers);
   await fs.mkdir(dataDir, { recursive: true });
   await fs.writeFile(dispatchSetupPath, JSON.stringify(payload, null, 2));
   return payload;
@@ -977,6 +1560,548 @@ async function clearOperationalOrderData({ actorOperatorId = null } = {}) {
   return { tables, counts };
 }
 
+function progressNumber(value) {
+  if (value === null || value === undefined || value === "") return 0;
+  const number = Number(String(value).replaceAll(",", ""));
+  return Number.isFinite(number) ? Math.abs(number) : 0;
+}
+
+function roundProgressQuantity(value) {
+  return Math.round((Number(value) || 0) * 1000000) / 1000000;
+}
+
+function progressHasConversion(line) {
+  return progressNumber(line.to_plt) > 0
+    || progressNumber(line.to_lyr) > 0
+    || progressNumber(line.to_sec) > 0
+    || progressNumber(line.to_pcs) > 0;
+}
+
+function deriveProgressUnits(line, salesQuantity) {
+  const quantity = progressNumber(salesQuantity);
+  if (!progressHasConversion(line)) {
+    return { pallet_qty: 0, layer_qty: 0, section_qty: 0, piece_qty: quantity };
+  }
+  const explicit = {
+    pallet_qty: progressNumber(line.pallet_qty),
+    layer_qty: progressNumber(line.layer_qty),
+    section_qty: progressNumber(line.section_qty),
+    piece_qty: progressNumber(line.piece_qty)
+  };
+  if (progressNumber(line.quantity) === quantity && Object.values(explicit).some((item) => item > 0)) {
+    return explicit;
+  }
+  let remaining = quantity;
+  const next = { pallet_qty: 0, layer_qty: 0, section_qty: 0, piece_qty: 0 };
+  const conversions = [
+    ["pallet_qty", "to_plt"],
+    ["layer_qty", "to_lyr"],
+    ["section_qty", "to_sec"],
+    ["piece_qty", "to_pcs"]
+  ];
+  for (const [qtyField, conversionField] of conversions) {
+    const conversion = progressNumber(line[conversionField]);
+    if (!conversion || remaining <= 0) continue;
+    const units = Math.floor((remaining / conversion) + 0.000001);
+    next[qtyField] = units;
+    remaining = roundProgressQuantity(remaining - (units * conversion));
+  }
+  return next;
+}
+
+function progressLinePatch(line) {
+  const orderedQty = progressNumber(line.quantity);
+  const processedQty = Math.min(progressNumber(line.netsuite_received_qty), orderedQty);
+  const totalUnits = deriveProgressUnits(line, orderedQty);
+  const processedUnits = deriveProgressUnits(line, processedQty);
+  return {
+    orderedQty,
+    processedQty,
+    totalUnits,
+    processedUnits,
+    unit: line.unit || "",
+    itemWeight: progressNumber(line.item_weight) || null,
+    locationId: line.location_id || null,
+    location: line.location || "",
+    toPlt: line.to_plt || null,
+    toLyr: line.to_lyr || null,
+    toSec: line.to_sec || null,
+    toPcs: line.to_pcs || null
+  };
+}
+
+function progressSummary(lines = []) {
+  return lines.reduce((sum, line) => {
+    const ordered = progressNumber(line.quantity);
+    const processed = Math.min(progressNumber(line.netsuite_received_qty), ordered);
+    return {
+      total: sum.total + ordered,
+      processed: sum.processed + processed,
+      open: sum.open + Math.max(ordered - processed, 0)
+    };
+  }, { total: 0, processed: 0, open: 0 });
+}
+
+function isPickableProgressLine(line) {
+  return ["InvtPart", "NonInvtPart"].includes(String(line.item_type || ""));
+}
+
+function statusTextIsComplete(statusText = "", orderType = "sales_order") {
+  const text = String(statusText || "").toLowerCase();
+  if (orderType === "purchase_order") return text.includes("received") || text.includes("billed");
+  return text.includes("fulfilled") || text.includes("pending billing") || text.includes("billed");
+}
+
+async function updateSalesOrderLineFromProgress(orderId, line) {
+  const patch = progressLinePatch(line);
+  await query(
+    `UPDATE sales_order_lines
+        SET quantity = $3,
+            unit = COALESCE(NULLIF($4, ''), unit),
+            item_weight = COALESCE($5, item_weight),
+            location_id = COALESCE($6::bigint, location_id),
+            location = COALESCE(NULLIF($7, ''), location),
+            pallet_qty = $8,
+            layer_qty = $9,
+            piece_qty = $10,
+            section_qty = $11,
+            to_plt = COALESCE($12::numeric, to_plt),
+            to_lyr = COALESCE($13::numeric, to_lyr),
+            to_sec = COALESCE($14::numeric, to_sec),
+            to_pcs = COALESCE($15::numeric, to_pcs),
+            loaded_qty = $16,
+            loaded_uom = COALESCE(NULLIF($4, ''), loaded_uom),
+            packed_pallet_qty = 0,
+            packed_layer_qty = 0,
+            packed_piece_qty = 0,
+            packed_section_qty = 0,
+            fulfilled_pallet_qty = $17,
+            fulfilled_layer_qty = $18,
+            fulfilled_piece_qty = $19,
+            fulfilled_section_qty = $20,
+            confirmed = false,
+            confirmed_at = null,
+            netsuite_active = true,
+            sync_exception = null,
+            sync_exception_at = null,
+            synced_at = now()
+      WHERE sales_order_id = $1
+        AND line_id = $2`,
+    [
+      orderId,
+      line.line_id,
+      patch.orderedQty,
+      patch.unit,
+      patch.itemWeight,
+      patch.locationId,
+      patch.location,
+      patch.totalUnits.pallet_qty,
+      patch.totalUnits.layer_qty,
+      patch.totalUnits.piece_qty,
+      patch.totalUnits.section_qty,
+      patch.toPlt,
+      patch.toLyr,
+      patch.toSec,
+      patch.toPcs,
+      patch.processedQty,
+      patch.processedUnits.pallet_qty,
+      patch.processedUnits.layer_qty,
+      patch.processedUnits.piece_qty,
+      patch.processedUnits.section_qty
+    ]
+  );
+  return patch;
+}
+
+async function updateTransferOrderLineFromProgress(orderId, line, stage) {
+  const patch = progressLinePatch(line);
+  const isOutbound = stage === "outbound";
+  await query(
+    `UPDATE transfer_order_lines
+        SET quantity = $4,
+            unit = COALESCE(NULLIF($5, ''), unit),
+            item_weight = COALESCE($6, item_weight),
+            location_id = COALESCE($7::bigint, location_id),
+            location = COALESCE(NULLIF($8, ''), location),
+            pallet_qty = $9,
+            layer_qty = $10,
+            piece_qty = $11,
+            section_qty = $12,
+            to_plt = COALESCE($13::numeric, to_plt),
+            to_lyr = COALESCE($14::numeric, to_lyr),
+            to_sec = COALESCE($15::numeric, to_sec),
+            to_pcs = COALESCE($16::numeric, to_pcs),
+            loaded_qty = CASE WHEN $17::boolean THEN $18 ELSE loaded_qty END,
+            loaded_uom = CASE WHEN $17::boolean THEN COALESCE(NULLIF($5, ''), loaded_uom) ELSE loaded_uom END,
+            packed_pallet_qty = CASE WHEN $17::boolean THEN 0 ELSE packed_pallet_qty END,
+            packed_layer_qty = CASE WHEN $17::boolean THEN 0 ELSE packed_layer_qty END,
+            packed_piece_qty = CASE WHEN $17::boolean THEN 0 ELSE packed_piece_qty END,
+            packed_section_qty = CASE WHEN $17::boolean THEN 0 ELSE packed_section_qty END,
+            fulfilled_pallet_qty = CASE WHEN $17::boolean THEN $19 ELSE fulfilled_pallet_qty END,
+            fulfilled_layer_qty = CASE WHEN $17::boolean THEN $20 ELSE fulfilled_layer_qty END,
+            fulfilled_piece_qty = CASE WHEN $17::boolean THEN $21 ELSE fulfilled_piece_qty END,
+            fulfilled_section_qty = CASE WHEN $17::boolean THEN $22 ELSE fulfilled_section_qty END,
+            netsuite_received_qty = CASE WHEN $17::boolean THEN netsuite_received_qty ELSE $18 END,
+            received_pallet_qty = CASE WHEN $17::boolean THEN received_pallet_qty ELSE 0 END,
+            received_layer_qty = CASE WHEN $17::boolean THEN received_layer_qty ELSE 0 END,
+            received_piece_qty = CASE WHEN $17::boolean THEN received_piece_qty ELSE 0 END,
+            received_section_qty = CASE WHEN $17::boolean THEN received_section_qty ELSE 0 END,
+            confirmed = false,
+            confirmed_at = null,
+            netsuite_active = true,
+            sync_exception = null,
+            sync_exception_at = null,
+            synced_at = now()
+      WHERE transfer_order_id = $1
+        AND line_stage = $2
+        AND line_id = $3`,
+    [
+      orderId,
+      stage,
+      line.line_id,
+      patch.orderedQty,
+      patch.unit,
+      patch.itemWeight,
+      patch.locationId,
+      patch.location,
+      patch.totalUnits.pallet_qty,
+      patch.totalUnits.layer_qty,
+      patch.totalUnits.piece_qty,
+      patch.totalUnits.section_qty,
+      patch.toPlt,
+      patch.toLyr,
+      patch.toSec,
+      patch.toPcs,
+      isOutbound,
+      patch.processedQty,
+      patch.processedUnits.pallet_qty,
+      patch.processedUnits.layer_qty,
+      patch.processedUnits.piece_qty,
+      patch.processedUnits.section_qty
+    ]
+  );
+  return patch;
+}
+
+async function updatePurchaseOrderLineFromProgress(orderId, line) {
+  const patch = progressLinePatch(line);
+  await query(
+    `UPDATE purchase_order_lines
+        SET quantity = $3,
+            unit = COALESCE(NULLIF($4, ''), unit),
+            item_weight = COALESCE($5, item_weight),
+            location_id = COALESCE($6::bigint, location_id),
+            location = COALESCE(NULLIF($7, ''), location),
+            pallet_qty = $8,
+            layer_qty = $9,
+            piece_qty = $10,
+            section_qty = $11,
+            to_plt = COALESCE($12::numeric, to_plt),
+            to_lyr = COALESCE($13::numeric, to_lyr),
+            to_sec = COALESCE($14::numeric, to_sec),
+            to_pcs = COALESCE($15::numeric, to_pcs),
+            netsuite_received_qty = $16,
+            received_pallet_qty = 0,
+            received_layer_qty = 0,
+            received_piece_qty = 0,
+            received_section_qty = 0,
+            netsuite_active = true,
+            sync_exception = null,
+            sync_exception_at = null,
+            synced_at = now()
+      WHERE purchase_order_id = $1
+        AND line_id = $2`,
+    [
+      orderId,
+      line.line_id,
+      patch.orderedQty,
+      patch.unit,
+      patch.itemWeight,
+      patch.locationId,
+      patch.location,
+      patch.totalUnits.pallet_qty,
+      patch.totalUnits.layer_qty,
+      patch.totalUnits.piece_qty,
+      patch.totalUnits.section_qty,
+      patch.toPlt,
+      patch.toLyr,
+      patch.toSec,
+      patch.toPcs,
+      patch.processedQty
+    ]
+  );
+  return patch;
+}
+
+function localOutboundStatusFromSummary(summary, statusText) {
+  if (summary.processed <= 0 && !statusTextIsComplete(statusText, "sales_order")) {
+    return { operatorStatus: "open", yardStatus: "Open", fulfillmentStatus: "not_fulfilled" };
+  }
+  if (summary.open <= 0.000001 || statusTextIsComplete(statusText, "sales_order")) {
+    return { operatorStatus: "loaded", yardStatus: "Loaded", fulfillmentStatus: "fulfilled" };
+  }
+  return { operatorStatus: "partial_loaded", yardStatus: "Partial Loaded", fulfillmentStatus: "partial_fulfilled" };
+}
+
+function localReceiptStatusFromSummary(summary, statusText, orderType) {
+  if (summary.processed <= 0 && !statusTextIsComplete(statusText, orderType)) return "not_received";
+  if (summary.open <= 0.000001 || statusTextIsComplete(statusText, orderType)) return "received";
+  return "partial_received";
+}
+
+function transferProgressLineKey(line) {
+  return [
+    line.item_id || "",
+    line.location_id || "",
+    progressNumber(line.quantity),
+    line.item_description || "",
+    progressNumber(line.pallet_qty),
+    progressNumber(line.layer_qty),
+    progressNumber(line.section_qty),
+    progressNumber(line.piece_qty)
+  ].join("|");
+}
+
+function dedupeTransferProgressLines(lines = []) {
+  const best = new Map();
+  for (const line of lines || []) {
+    const key = transferProgressLineKey(line);
+    const current = best.get(key);
+    if (!current || progressNumber(line.netsuite_received_qty) >= progressNumber(current.netsuite_received_qty)) {
+      best.set(key, line);
+    }
+  }
+  return [...best.values()];
+}
+
+function transferProgressLinesForStage(progress, stage) {
+  const locationId = stage === "outbound" ? progress.source_location_id : progress.destination_location_id;
+  const lines = (progress.lines || []).filter(isPickableProgressLine);
+  if (!locationId && stage === "outbound" && progress.destination_location_id) {
+    return dedupeTransferProgressLines(lines.filter((line) => String(line.location_id || "") !== String(progress.destination_location_id)));
+  }
+  if (!locationId) return dedupeTransferProgressLines(lines);
+  return dedupeTransferProgressLines(lines.filter((line) => String(line.location_id || "") === String(locationId)));
+}
+
+async function reconcileSalesOrderProgress(progress) {
+  const lines = (progress.lines || []).filter(isPickableProgressLine);
+  for (const line of lines) await updateSalesOrderLineFromProgress(progress.id, line);
+  const summary = progressSummary(lines);
+  const status = localOutboundStatusFromSummary(summary, progress.status_text);
+  await query(
+    `UPDATE sales_orders
+        SET status = COALESCE($2, status),
+            status_text = COALESCE($3, status_text),
+            operator_status = $4,
+            local_yard_order_status = $5,
+            fulfillment_status = $6,
+            fulfilled_at = CASE WHEN $6 IN ('fulfilled', 'partial_fulfilled') THEN COALESCE(fulfilled_at, now()) ELSE fulfilled_at END,
+            status_updated_at = now(),
+            synced_at = now()
+      WHERE netsuite_id = $1`,
+    [progress.id, progress.status || null, progress.status_text || null, status.operatorStatus, status.yardStatus, status.fulfillmentStatus]
+  );
+  return { lines: lines.length, ...summary, ...status };
+}
+
+async function reconcilePurchaseOrderProgress(progress) {
+  const lines = (progress.lines || []).filter(isPickableProgressLine);
+  for (const line of lines) await updatePurchaseOrderLineFromProgress(progress.id, line);
+  const summary = progressSummary(lines);
+  const receiptStatus = localReceiptStatusFromSummary(summary, progress.status_text, "purchase_order");
+  await query(
+    `UPDATE purchase_orders
+        SET status = COALESCE($2, status),
+            status_text = COALESCE($3, status_text),
+            receipt_status = $4,
+            received_at = CASE WHEN $4 IN ('received', 'partial_received') THEN COALESCE(received_at, now()) ELSE received_at END,
+            status_updated_at = now(),
+            synced_at = now()
+      WHERE netsuite_id = $1`,
+    [progress.id, progress.status || null, progress.status_text || null, receiptStatus]
+  );
+  return { lines: lines.length, ...summary, receiptStatus };
+}
+
+async function reconcileTransferOrderProgress(progress) {
+  const outboundLines = transferProgressLinesForStage(progress, "outbound");
+  const receivingLines = transferProgressLinesForStage(progress, "receiving");
+  for (const line of outboundLines) await updateTransferOrderLineFromProgress(progress.id, line, "outbound");
+  for (const line of receivingLines) await updateTransferOrderLineFromProgress(progress.id, line, "receiving");
+  const outboundSummary = progressSummary(outboundLines);
+  const receivingSummary = progressSummary(receivingLines);
+  const outboundStatus = localOutboundStatusFromSummary(outboundSummary, progress.status_text);
+  const receiptStatus = localReceiptStatusFromSummary(receivingSummary, progress.status_text, "purchase_order");
+  await query(
+    `UPDATE transfer_orders
+        SET status = COALESCE($2, status),
+            status_text = COALESCE($3, status_text),
+            outbound_operator_status = $4,
+            local_yard_order_status = $5,
+            fulfillment_status = $6,
+            receiving_status = $7,
+            fulfilled_at = CASE WHEN $6 IN ('fulfilled', 'partial_fulfilled') THEN COALESCE(fulfilled_at, now()) ELSE fulfilled_at END,
+            received_at = CASE WHEN $7 IN ('received', 'partial_received') THEN COALESCE(received_at, now()) ELSE received_at END,
+            status_updated_at = now(),
+            synced_at = now()
+      WHERE netsuite_id = $1`,
+    [
+      progress.id,
+      progress.status || null,
+      progress.status_text || null,
+      outboundStatus.operatorStatus,
+      outboundStatus.yardStatus,
+      outboundStatus.fulfillmentStatus,
+      receiptStatus
+    ]
+  );
+  return {
+    outbound: { lines: outboundLines.length, ...outboundSummary, ...outboundStatus },
+    receiving: { lines: receivingLines.length, ...receivingSummary, receiptStatus }
+  };
+}
+
+async function reconcileNetSuiteProgress({ actorOperatorId = null } = {}) {
+  const summary = {
+    salesOrders: { checked: 0, updated: 0, failed: 0 },
+    purchaseOrders: { checked: 0, updated: 0, failed: 0 },
+    transferOrders: { checked: 0, updated: 0, failed: 0 },
+    failures: []
+  };
+  const targets = [
+    {
+      key: "salesOrders",
+      table: "sales_orders",
+      recordType: "SalesOrd",
+      apply: reconcileSalesOrderProgress,
+      where: `
+        netsuite_id > 0
+        AND tranid NOT LIKE '%-S%'
+        AND NOT EXISTS (
+          SELECT 1
+            FROM sales_orders split_child
+           WHERE split_child.tranid LIKE sales_orders.tranid || '-S%'
+             AND split_child.netsuite_active = true
+        )`
+    },
+    {
+      key: "purchaseOrders",
+      table: "purchase_orders",
+      recordType: "PurchOrd",
+      apply: reconcilePurchaseOrderProgress,
+      where: "netsuite_id > 0"
+    },
+    {
+      key: "transferOrders",
+      table: "transfer_orders",
+      recordType: "TrnfrOrd",
+      apply: reconcileTransferOrderProgress,
+      where: `
+        netsuite_id > 0
+        AND tranid NOT LIKE '%-S%'
+        AND NOT EXISTS (
+          SELECT 1
+            FROM transfer_orders split_child
+           WHERE split_child.tranid LIKE transfer_orders.tranid || '-S%'
+             AND split_child.netsuite_active = true
+        )`
+    }
+  ];
+  for (const target of targets) {
+    const ids = await query(`SELECT netsuite_id, tranid FROM ${target.table} WHERE ${target.where} ORDER BY synced_at ASC NULLS FIRST, netsuite_id`);
+    for (const row of ids.rows) {
+      assertDispatchSyncCanContinue(`progress reconcile ${row.tranid || row.netsuite_id}`);
+      summary[target.key].checked += 1;
+      try {
+        const progress = await fetchTransactionProgressFromNetSuite(row.netsuite_id, target.recordType);
+        if (!progress) continue;
+        const result = await target.apply(progress);
+        summary[target.key].updated += 1;
+        await writeAudit({
+          actorType: actorOperatorId ? "operator" : "system",
+          actorOperatorId,
+          source: "netsuite",
+          action: "netsuite.progress_reconcile.order",
+          orderId: row.netsuite_id,
+          details: { table: target.table, tranid: row.tranid, result }
+        });
+      } catch (error) {
+        summary[target.key].failed += 1;
+        summary.failures.push({ orderType: target.key, netsuiteId: row.netsuite_id, tranid: row.tranid, error: error.message });
+      }
+    }
+  }
+  await writeAudit({
+    actorType: actorOperatorId ? "operator" : "system",
+    actorOperatorId,
+    source: "netsuite",
+    action: "netsuite.progress_reconcile",
+    details: summary
+  });
+  emitAppEvent("dispatch.orders.updated", { source: "netsuite-progress-reconcile" });
+  emitAppEvent("delivery.order.updated", { source: "netsuite-progress-reconcile" });
+  emitAppEvent("receiving.order.updated", { source: "netsuite-progress-reconcile" });
+  return summary;
+}
+
+async function runNetSuiteProgressReconcile({ source = "control_reconcile", actorOperatorId = null } = {}) {
+  if (syncRunning) return { skipped: true, reason: "sync_running" };
+  syncRunning = true;
+  const runId = crypto.randomUUID();
+  const settings = (await readDispatchSetup()).sync;
+  const maxRunSeconds = Number(settings.maxRunSeconds || defaultDispatchSetup.sync.maxRunSeconds);
+  activeSyncRun = {
+    id: runId,
+    source,
+    maxRunSeconds,
+    deadlineAt: Date.now() + (maxRunSeconds * 1000),
+    cancelRequested: false,
+    cancelReason: ""
+  };
+  const startedAt = new Date().toISOString();
+  await writeDispatchSetup({
+    sync: {
+      running: true,
+      lastStartedAt: startedAt,
+      lastSource: source,
+      lastStatus: "running",
+      lastError: ""
+    }
+  });
+  try {
+    const reconciled = await reconcileNetSuiteProgress({ actorOperatorId });
+    const finishedAt = new Date().toISOString();
+    await writeDispatchSetup({
+      sync: {
+        running: false,
+        lastFinishedAt: finishedAt,
+        lastSource: source,
+        lastStatus: reconciled.failures.length ? "warning" : "success",
+        lastError: reconciled.failures.length ? `${reconciled.failures.length} order(s) could not be reconciled. Check audit log.` : ""
+      }
+    });
+    return { reconciled, startedAt, finishedAt };
+  } catch (error) {
+    const finishedAt = new Date().toISOString();
+    const stopped = error instanceof DispatchSyncStoppedError;
+    await writeDispatchSetup({
+      sync: {
+        running: false,
+        lastFinishedAt: finishedAt,
+        lastSource: source,
+        lastStatus: stopped ? "stopped" : "failed",
+        lastError: error.message
+      }
+    });
+    if (stopped) return { stopped: true, startedAt, finishedAt, error: error.message };
+    throw error;
+  } finally {
+    if (activeSyncRun?.id === runId) activeSyncRun = null;
+    syncRunning = false;
+  }
+}
+
 async function autoSyncTick() {
   try {
     const setup = await readDispatchSetup();
@@ -1142,19 +2267,32 @@ function webhookNumber(value) {
   return Math.abs(Number(String(value).replaceAll(",", ""))) || 0;
 }
 
+function webhookSignedNumber(value) {
+  if (value === null || value === undefined || value === "") return 0;
+  const number = Number(String(value).replaceAll(",", ""));
+  return Number.isFinite(number) ? number : 0;
+}
+
 function webhookString(value) {
   return String(value ?? "").trim();
 }
 
 function webhookDate(value) {
   const text = webhookString(value);
-  return text ? text.slice(0, 10) : null;
+  if (!text) return null;
+  const iso = text.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
+  const slash = text.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (slash) return `${slash[3]}-${slash[1].padStart(2, "0")}-${slash[2].padStart(2, "0")}`;
+  const parsed = new Date(text);
+  if (!Number.isNaN(parsed.getTime())) return parsed.toISOString().slice(0, 10);
+  return text;
 }
 
 function webhookLocationText(value) {
   const text = webhookString(value);
   if (text === "1") return "3445";
-  if (text === "13") return "2967";
+  if (text === "13" || text === "28") return "2967";
   if (text === "15") return "12441";
   if (text === "26") return "150";
   return text;
@@ -1168,7 +2306,7 @@ function webhookRecordType(value) {
   return "";
 }
 
-const EXCLUDED_SALES_ORDER_PREFIXES = ["SOV", "SOT"];
+const EXCLUDED_SALES_ORDER_PREFIXES = ["SOT"];
 
 function isExcludedSalesOrderRef(value) {
   const text = webhookString(value).toUpperCase();
@@ -1176,10 +2314,10 @@ function isExcludedSalesOrderRef(value) {
 }
 
 function webhookLineHasConversion(line) {
-  return webhookNumber(line.to_plt ?? line.toPlt) > 0
-    || webhookNumber(line.to_lyr ?? line.toLyr) > 0
-    || webhookNumber(line.to_sec ?? line.toSec) > 0
-    || webhookNumber(line.to_pcs ?? line.toPcs) > 0;
+  return webhookNumber(line.to_plt ?? line.toPlt ?? line.custitem_toplt) > 0
+    || webhookNumber(line.to_lyr ?? line.toLyr ?? line.custitem_tolyr) > 0
+    || webhookNumber(line.to_sec ?? line.toSec ?? line.custitem_tosec) > 0
+    || webhookNumber(line.to_pcs ?? line.toPcs ?? line.custitem_topcs) > 0;
 }
 
 function deriveWebhookQuantitiesFromSales(line, quantity) {
@@ -1201,13 +2339,13 @@ function deriveWebhookQuantitiesFromSales(line, quantity) {
     quantity
   };
   const conversions = [
-    ["pallet_qty", "to_plt", "toPlt"],
-    ["layer_qty", "to_lyr", "toLyr"],
-    ["section_qty", "to_sec", "toSec"],
-    ["piece_qty", "to_pcs", "toPcs"]
+    ["pallet_qty", "to_plt", "toPlt", "custitem_toplt"],
+    ["layer_qty", "to_lyr", "toLyr", "custitem_tolyr"],
+    ["section_qty", "to_sec", "toSec", "custitem_tosec"],
+    ["piece_qty", "to_pcs", "toPcs", "custitem_topcs"]
   ];
-  for (const [qtyField, snake, camel] of conversions) {
-    const conversion = webhookNumber(line[snake] ?? line[camel]);
+  for (const [qtyField, snake, camel, netsuiteField] of conversions) {
+    const conversion = webhookNumber(line[snake] ?? line[camel] ?? line[netsuiteField]);
     if (!conversion || remaining <= 0) continue;
     const units = Math.floor((remaining / conversion) + 0.000001);
     next[qtyField] = units;
@@ -1216,9 +2354,75 @@ function deriveWebhookQuantitiesFromSales(line, quantity) {
   return next;
 }
 
+function webhookLineLocationId(line, fallback = null) {
+  const value = line.location_id ?? line.locationId ?? fallback;
+  return value === null || value === undefined || value === "" ? "" : String(value);
+}
+
+function webhookProcessedQuantity(line, preferred = null, { fallbackOnZero = false } = {}) {
+  const preferredNumber = webhookNumber(preferred);
+  if (preferred !== null && preferred !== undefined && preferred !== "" && (preferredNumber > 0 || !fallbackOnZero)) {
+    return preferredNumber;
+  }
+  return webhookNumber(
+    line.netsuite_received_qty
+    ?? line.quantityShipRecv
+    ?? line.quantityshiprecv
+    ?? line.quantityFulfilled
+    ?? line.quantityReceived
+    ?? line.quantityreceived
+  );
+}
+
+function webhookLineSignedQuantity(line) {
+  const signed = webhookSignedNumber(line.signedQuantity ?? line.signed_quantity ?? line.quantitySigned ?? line.quantity_signed);
+  if (signed) return signed;
+  return webhookSignedNumber(line.quantity);
+}
+
+function webhookLineDuplicateKey(line, fallbackLocationId = null) {
+  return [
+    line.item_id ?? line.itemId ?? "",
+    webhookLineLocationId(line, fallbackLocationId),
+    webhookNumber(line.quantity),
+    line.item_description ?? line.itemDescription ?? line.description ?? "",
+    webhookNumber(line.pallet_qty ?? line.pallets ?? line.custcol_plt ?? line.plt),
+    webhookNumber(line.layer_qty ?? line.layers ?? line.custcol_lyr ?? line.lyr),
+    webhookNumber(line.section_qty ?? line.sections ?? line.custcol_sec ?? line.sec),
+    webhookNumber(line.piece_qty ?? line.pieces ?? line.custcol_pcs ?? line.pcs)
+  ].join("|");
+}
+
+function dedupeWebhookTransferLines(lines, { locationId = null, direction = "source", processedField = null } = {}) {
+  const targetLocation = locationId === null || locationId === undefined || locationId === "" ? "" : String(locationId);
+  const filtered = lines.filter((line) => {
+    const lineLocation = webhookLineLocationId(line);
+    if (targetLocation && lineLocation) return lineLocation === targetLocation;
+    if (targetLocation && !lineLocation) return true;
+    const signedQuantity = webhookLineSignedQuantity(line);
+    if (direction === "source") return signedQuantity < 0;
+    if (direction === "destination") return signedQuantity > 0;
+    return true;
+  });
+
+  const bestByDuplicateKey = new Map();
+  for (const line of filtered) {
+    const key = webhookLineDuplicateKey(line, locationId);
+    const current = bestByDuplicateKey.get(key);
+    if (
+      !current
+      || webhookProcessedQuantity(line, line[processedField], { fallbackOnZero: true })
+        > webhookProcessedQuantity(current, current[processedField], { fallbackOnZero: true })
+    ) {
+      bestByDuplicateKey.set(key, line);
+    }
+  }
+  return [...bestByDuplicateKey.values()];
+}
+
 function normalizeWebhookLine(line, { locationId = null, locationText = "", processedQuantity = null, remainingForDelivery = false } = {}) {
   const quantity = webhookNumber(line.quantity);
-  const processed = webhookNumber(processedQuantity ?? line.netsuite_received_qty ?? line.quantityShipRecv ?? line.quantityshiprecv);
+  const processed = webhookProcessedQuantity(line, processedQuantity);
   const remainingQuantity = Math.max(quantity - processed, 0);
   const derived = remainingForDelivery && processed > 0
     ? deriveWebhookQuantitiesFromSales(line, remainingQuantity)
@@ -1247,10 +2451,10 @@ function normalizeWebhookLine(line, { locationId = null, locationText = "", proc
     layer_qty: derived.layer_qty,
     piece_qty: derived.piece_qty,
     section_qty: derived.section_qty,
-    to_plt: line.to_plt ?? line.toPlt,
-    to_lyr: line.to_lyr ?? line.toLyr,
-    to_sec: line.to_sec ?? line.toSec,
-    to_pcs: line.to_pcs ?? line.toPcs,
+    to_plt: line.to_plt ?? line.toPlt ?? line.custitem_toplt,
+    to_lyr: line.to_lyr ?? line.toLyr ?? line.custitem_tolyr,
+    to_sec: line.to_sec ?? line.toSec ?? line.custitem_tosec,
+    to_pcs: line.to_pcs ?? line.toPcs ?? line.custitem_topcs,
     raw: line
   };
 }
@@ -1438,23 +2642,32 @@ export async function processNetSuiteOrderWebhook(payload = {}, { scheduleDelaye
     const destinationLocationId = payload.destinationLocationId || payload.transferLocationId;
     const destinationLocationText = payload.destinationLocationText || payload.transferLocationText || webhookLocationText(destinationLocationId);
     const deliveryOrder = normalizeWebhookDeliveryOrder(payload, { type, locationId: sourceLocationId, locationText: sourceLocationText });
-    const deliveryLines = lines.map((line) => normalizeWebhookLine(line, {
+    const deliveryLines = dedupeWebhookTransferLines(lines, {
+      locationId: sourceLocationId,
+      direction: "source",
+      processedField: "quantityShipRecv"
+    }).map((line) => normalizeWebhookLine(line, {
       locationId: sourceLocationId,
       locationText: sourceLocationText,
-      processedQuantity: line.quantityFulfilled ?? line.quantityShipRecv,
+      processedQuantity: line.quantityShipRecv ?? line.quantityFulfilled,
       remainingForDelivery: true
-    }));
+    })).filter((line) => webhookNumber(line.quantity) > 0);
     await upsertOutboundTransferOrders([deliveryOrder]);
     await upsertOutboundTransferOrderLines(deliveryOrder.id, deliveryLines);
     await markMissingOutboundOrderLines(deliveryOrder.id, deliveryLines.map((line) => line.line_id));
     results.push({ target: "transfer_orders.outbound", orderType: type, lines: deliveryLines.length });
 
     const receivingOrder = normalizeWebhookReceivingOrder(payload, { type, locationId: destinationLocationId, locationText: destinationLocationText });
-    const receivingLines = lines.map((line) => normalizeWebhookLine(line, {
+    const receivingLines = dedupeWebhookTransferLines(lines, {
+      locationId: destinationLocationId,
+      direction: "destination",
+      processedField: "quantityShipRecv"
+    }).map((line) => normalizeWebhookLine(line, {
       locationId: destinationLocationId,
       locationText: destinationLocationText,
-      processedQuantity: line.quantityReceived ?? line.quantityShipRecv
-    }));
+      processedQuantity: line.quantityReceived ?? line.quantityShipRecv,
+      remainingForDelivery: true
+    })).filter((line) => webhookNumber(line.quantity) > 0);
     await upsertInboundTransferOrders([receivingOrder]);
     await upsertInboundTransferOrderLines(receivingOrder.id, receivingLines);
     await markMissingInboundOrderLines(receivingOrder.id, receivingLines.map((line) => line.line_id));
@@ -1513,6 +2726,18 @@ app.post("/api/webhooks/netsuite/order", async (req, res, next) => {
     }
     res.json(await processNetSuiteOrderWebhook(req.body));
   } catch (error) {
+    await writeAudit({
+      actorType: "system",
+      source: "netsuite-webhook",
+      action: "netsuite.webhook.failed",
+      details: {
+        error: error.message,
+        netsuiteOrderId: req.body?.id || null,
+        tranid: req.body?.tranid || "",
+        recordType: req.body?.recordType || req.body?.type || req.body?.orderType || "",
+        eventType: req.body?.eventType || ""
+      }
+    }).catch(() => {});
     next(error);
   }
 });
@@ -1771,20 +2996,59 @@ app.get("/api/dispatch/plans/:id", async (req, res, next) => {
 app.put("/api/dispatch/plans/:id", async (req, res, next) => {
   try {
     const previousPlan = await getDispatchPlan(req.params.id);
-    const cleanOrders = sanitizeDispatchPlanOrders(Array.isArray(req.body?.orders) ? req.body.orders : []);
-    const plan = await saveDispatchPlanSnapshot(req.params.id, {
-      orders: cleanOrders,
-      trucks: Array.isArray(req.body?.trucks) ? req.body.trucks : [],
-      summary: req.body?.summary || {}
-    });
+    const saveMode = dispatchPlanSaveMode(req.body);
+    const requestedOrders = sanitizeDispatchPlanOrders(Array.isArray(req.body?.orders) ? req.body.orders : []);
+    const requestedTrucks = Array.isArray(req.body?.trucks) ? req.body.trucks : [];
+    const cleanOrders = saveMode === "truck_sequence" && previousPlan
+      ? sanitizeDispatchPlanOrders(previousPlan.orders || [])
+      : requestedOrders;
+    const cleanTrucks = saveMode === "truck_sequence" && previousPlan
+      ? mergeDispatchTruckSequence(previousPlan.trucks || [], requestedTrucks)
+      : requestedTrucks;
+    const duplicateDrivers = dispatchDuplicateDriverAssignments(cleanTrucks);
+    if (duplicateDrivers.length) return sendDispatchDuplicateDriverResponse(res, duplicateDrivers);
     const explicitOperatorAlertRefs = Array.isArray(req.body?.audit?.details?.operatorAlertRefs)
       ? req.body.audit.details.operatorAlertRefs.map((ref) => String(ref || "").trim()).filter(Boolean)
       : [];
+    const refreshOrderPool = req.body?.audit?.details?.refreshOrderPool === true;
+    if (
+      previousPlan
+      && !explicitOperatorAlertRefs.length
+      && !dispatchPlanDataChanged(
+        { orders: previousPlan.orders || [], trucks: previousPlan.trucks || [] },
+        { orders: cleanOrders, trucks: cleanTrucks }
+      )
+    ) {
+      return res.json({ ...previousPlan, operatorFlags: null, noChange: true });
+    }
+    const dateConflicts = await findNewDispatchPlanDateConflicts(previousPlan || {}, {
+      id: req.params.id,
+      planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date,
+      orders: cleanOrders,
+      trucks: cleanTrucks
+    });
+    if (dateConflicts.length) return sendDispatchPlanDateConflictResponse(res, dateConflicts);
+    const coSequenceConflicts = await findDispatchCoSequenceConflicts({
+      id: req.params.id,
+      planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date,
+      orders: cleanOrders,
+      trucks: cleanTrucks
+    });
+    if (coSequenceConflicts.length) return sendDispatchCoSequenceConflictResponse(res, coSequenceConflicts);
+    const plan = await saveDispatchPlanSnapshot(req.params.id, {
+      orders: cleanOrders,
+      trucks: cleanTrucks,
+      summary: req.body?.summary || {},
+      baseRevision: saveMode === "truck_sequence" ? null : req.body?.baseRevision
+    });
+    const coAssignments = await applyDispatchPlanCoAssignments(plan);
     const changedOperatorRefs = [
       ...new Set([...changedDispatchOperatorRefs(previousPlan || {}, plan), ...explicitOperatorAlertRefs])
     ];
     let operatorFlags = null;
-    if (plan.status === "confirmed") {
+    const shouldApplyOperatorFlags = plan.status === "confirmed"
+      && (changedOperatorRefs.length > 0 || dispatchOperatorImpactChanged(previousPlan || {}, plan));
+    if (shouldApplyOperatorFlags) {
       operatorFlags = await applyConfirmedDispatchPlanToDelivery(plan, {
         forceOrderRefs: changedOperatorRefs
       });
@@ -1801,20 +3065,28 @@ app.put("/api/dispatch/plans/:id", async (req, res, next) => {
           ...(req.body.audit.details || {}),
           orderCount: plan.orders.length,
           truckCount: plan.trucks.length,
-          operatorFlags
+          saveMode,
+          coAssignments,
+          operatorFlags,
+          operatorFlagsSkipped: plan.status === "confirmed" && !shouldApplyOperatorFlags
         }
       }).catch(() => null);
     }
-    emitAppEvent("dispatch.plan.saved", { planId: plan.id, planDate: plan.planDate, savedAt: plan.savedAt, sourceSessionId: req.body?.audit?.sessionId, operatorFlags, changedOperatorRefs });
+    emitAppEvent("dispatch.plan.saved", { planId: plan.id, planDate: plan.planDate, savedAt: plan.savedAt, sourceSessionId: req.body?.audit?.sessionId, operatorFlags, changedOperatorRefs, refreshOrderPool });
     res.json({ ...plan, operatorFlags });
   } catch (error) {
+    if (error instanceof StaleDispatchPlanSaveError) return sendStaleDispatchPlanResponse(res, error);
     next(error);
   }
 });
 
 app.post("/api/dispatch/plans/:id/confirm", async (req, res, next) => {
   try {
+    const currentPlan = await getDispatchPlan(req.params.id);
+    const duplicateDrivers = dispatchDuplicateDriverAssignments(currentPlan?.trucks || []);
+    if (duplicateDrivers.length) return sendDispatchDuplicateDriverResponse(res, duplicateDrivers);
     const plan = await confirmDispatchPlan(req.params.id, { note: req.body?.note || "" });
+    const coAssignments = await applyDispatchPlanCoAssignments(plan);
     const changedOperatorRefs = [...dispatchOperatorAssignmentMap(plan).keys()];
     const operatorFlags = await applyConfirmedDispatchPlanToDelivery(plan, { forceOrderRefs: changedOperatorRefs });
     await writeDispatchAudit({
@@ -1825,9 +3097,9 @@ app.post("/api/dispatch/plans/:id/confirm", async (req, res, next) => {
       planDate: plan.planDate,
       sessionId: req.body?.audit?.sessionId,
       after: plan,
-      details: { status: plan.status, operatorFlags }
+      details: { status: plan.status, coAssignments, operatorFlags }
     }).catch(() => null);
-    emitAppEvent("dispatch.plan.confirmed", { planId: plan.id, planDate: plan.planDate, sourceSessionId: req.body?.audit?.sessionId, operatorFlags, changedOperatorRefs });
+    emitAppEvent("dispatch.plan.confirmed", { planId: plan.id, planDate: plan.planDate, sourceSessionId: req.body?.audit?.sessionId, operatorFlags, changedOperatorRefs, refreshOrderPool: true });
     res.json({ ...plan, operatorFlags });
   } catch (error) {
     next(error);
@@ -1847,7 +3119,7 @@ app.post("/api/dispatch/plans/:id/reopen", async (req, res, next) => {
       after: plan,
       details: { status: plan.status }
     }).catch(() => null);
-    emitAppEvent("dispatch.plan.reopened", { planId: plan.id, planDate: plan.planDate, sourceSessionId: req.body?.audit?.sessionId });
+    emitAppEvent("dispatch.plan.reopened", { planId: plan.id, planDate: plan.planDate, sourceSessionId: req.body?.audit?.sessionId, refreshOrderPool: true });
     res.json(plan);
   } catch (error) {
     next(error);
@@ -1931,7 +3203,26 @@ app.post("/api/dispatch/samsara/driver-login-test", async (req, res, next) => {
 app.get("/api/dispatch/orders", async (req, res, next) => {
   try {
     const type = req.query.type ? String(req.query.type).toUpperCase() : null;
-    res.json(await listDispatchOrders({ type }));
+    res.json(await enrichDispatchOrdersWithPlanAssignments(await listDispatchOrders({ type })));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/dispatch/planned-assignments", async (req, res, next) => {
+  try {
+    res.json(await listDispatchPlannedAssignments());
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/dispatch/orders/:id/split-seed", async (req, res, next) => {
+  try {
+    res.json(await getNextDispatchSplitSuffix({
+      originalOrderId: req.params.id,
+      orderType: req.query.type
+    }));
   } catch (error) {
     next(error);
   }
@@ -1944,7 +3235,7 @@ app.post("/api/dispatch/sync", async (req, res, next) => {
       localOnly: true,
       skipped: true,
       reason: "NetSuite order sync is admin-only. Dispatcher refresh reads local DB.",
-      orders: await listDispatchOrders({ type })
+      orders: await enrichDispatchOrdersWithPlanAssignments(await listDispatchOrders({ type }))
     });
   } catch (error) {
     next(error);
@@ -1955,7 +3246,7 @@ app.post("/api/dispatch/enrich", async (req, res, next) => {
   try {
     const enriched = await refreshDispatchEnrichment({ force: req.body?.force === true || req.query.force === "true" });
     emitAppEvent("dispatch.orders.updated", { source: "enrich", type: req.query.type ? String(req.query.type).toUpperCase() : null });
-    res.json({ enriched, orders: await listDispatchOrders({ type: req.query.type ? String(req.query.type).toUpperCase() : null }) });
+    res.json({ enriched, orders: await enrichDispatchOrdersWithPlanAssignments(await listDispatchOrders({ type: req.query.type ? String(req.query.type).toUpperCase() : null })) });
   } catch (error) {
     next(error);
   }
@@ -1984,6 +3275,43 @@ app.put("/api/dispatch/parser-rules/:key", async (req, res, next) => {
     emitAppEvent("dispatch.setup.updated", { parserRule: req.params.key });
     res.json({ updated });
   } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/dispatch/reparse-missing-delivery-time", async (req, res, next) => {
+  try {
+    const dryRun = req.body?.dryRun === true || req.query.dryRun === "true";
+    const scope = req.body?.scope || req.query.scope || "missing";
+    const result = await reparseMissingSalesOrderDispatch({
+      limit: req.body?.limit || req.query.limit || 200,
+      dryRun,
+      scope
+    });
+    const allNonShipped = result.scope === "non_shipped";
+    await writeDispatchAudit({
+      action: dryRun
+        ? (allNonShipped ? "dry_run_reparse_non_shipped_delivery_orders" : "dry_run_reparse_missing_delivery_time")
+        : (allNonShipped ? "reparse_non_shipped_delivery_orders" : "reparse_missing_delivery_time"),
+      entityType: "sales_orders",
+      entityId: allNonShipped ? "non-shipped-sales-delivery-orders" : "missing-dispatch-parser-fields",
+      source: "dispatch-setup",
+      after: {
+        matched: result.matched,
+        updated: result.updated,
+        failed: result.failed,
+        resolvedTime: result.resolvedTime,
+        resolvedAddress: result.resolvedAddress
+      },
+      details: {
+        limit: result.limit,
+        dryRun
+      }
+    });
+    if (!dryRun) emitAppEvent("dispatch.orders.updated", { source: allNonShipped ? "reparse-non-shipped-delivery-orders" : "reparse-missing-delivery-time", result });
+    res.json(result);
+  } catch (error) {
+    if (error instanceof StaleDispatchPlanSaveError) return sendStaleDispatchPlanResponse(res, error);
     next(error);
   }
 });
@@ -2056,7 +3384,7 @@ app.put("/api/dispatch/orders/:id/vendor-yard", async (req, res, next) => {
       details: { vendorYardId: req.body?.vendorYardId }
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { orderId: req.params.id, type: "PO", change: "vendor_yard", sourceSessionId: req.body?.audit?.sessionId });
-    res.json({ updated, orders: await listDispatchOrders({ type: "PO" }) });
+    res.json({ updated, orders: await enrichDispatchOrdersWithPlanAssignments(await listDispatchOrders({ type: "PO" })) });
   } catch (error) {
     next(error);
   }
@@ -2083,7 +3411,7 @@ app.put("/api/dispatch/orders/:id/details", async (req, res, next) => {
       }
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { orderId: req.params.id, change: "details", sourceSessionId: req.body?.audit?.sessionId });
-    res.json({ updated, orders: await listDispatchOrders() });
+    res.json({ updated, orders: await enrichDispatchOrdersWithPlanAssignments(await listDispatchOrders()) });
   } catch (error) {
     next(error);
   }
@@ -2131,7 +3459,7 @@ app.post("/api/dispatch/orders/:id/po-allocations", async (req, res, next) => {
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { orderId: req.params.id, change: "so_po_allocation", sourceSessionId: req.body?.audit?.sessionId });
     emitAppEvent("delivery.order.updated", { orderRef: req.params.id, change: "so_po_allocation", sourceSessionId: req.body?.audit?.sessionId });
-    res.json({ allocations, allocation: allocations[0] || null, options: await getSalesOrderPoAllocationOptions(req.params.id), orders: await listDispatchOrders() });
+    res.json({ allocations, allocation: allocations[0] || null, options: await getSalesOrderPoAllocationOptions(req.params.id), orders: await enrichDispatchOrdersWithPlanAssignments(await listDispatchOrders()) });
   } catch (error) {
     next(error);
   }
@@ -2151,7 +3479,39 @@ app.delete("/api/dispatch/po-allocations/:allocationId", async (req, res, next) 
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { orderId: cancelled.salesOrderRef, change: "so_po_allocation_cancelled", sourceSessionId: req.query.sessionId });
     emitAppEvent("delivery.order.updated", { orderRef: cancelled.salesOrderRef, change: "so_po_allocation_cancelled", sourceSessionId: req.query.sessionId });
-    res.json({ cancelled, options: await getSalesOrderPoAllocationOptions(cancelled.salesOrderRef), orders: await listDispatchOrders() });
+    res.json({ cancelled, options: await getSalesOrderPoAllocationOptions(cancelled.salesOrderRef), orders: await enrichDispatchOrdersWithPlanAssignments(await listDispatchOrders()) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/dispatch/split-orders/unsplit", async (req, res, next) => {
+  try {
+    const result = await deactivateUnplannedDispatchSplitOrders({
+      originalOrderId: req.body?.originalOrderId,
+      orderType: req.body?.orderType,
+      splitOrderIds: req.body?.splitOrderIds
+    });
+    await writeDispatchAudit({
+      action: "dispatch_split_orders_deactivated",
+      entityType: "order",
+      entityId: req.body?.originalOrderId || "",
+      orderId: req.body?.originalOrderId || "",
+      sessionId: req.body?.audit?.sessionId,
+      after: result,
+      details: {
+        originalOrderId: req.body?.originalOrderId || "",
+        orderType: req.body?.orderType || "",
+        splitOrderIds: req.body?.splitOrderIds || []
+      }
+    }).catch(() => null);
+    emitAppEvent("dispatch.orders.updated", {
+      orderId: req.body?.originalOrderId || "",
+      change: "order_unsplit",
+      sourceSessionId: req.body?.audit?.sessionId,
+      refreshOrderPool: true
+    });
+    res.json(result);
   } catch (error) {
     next(error);
   }
@@ -2184,7 +3544,7 @@ app.post("/api/dispatch/co-orders", async (req, res, next) => {
     }).catch(() => null);
     emitAppEvent("dispatch.co.updated", { coRef: co.co_ref, sourceOrderRef: co.source_order_ref, sourceSessionId: req.body?.audit?.sessionId });
     emitAppEvent("delivery.order.updated", { orderRef: co.source_order_ref, coRef: co.co_ref, source: "dispatch-co" });
-    res.json({ co, orders: await listDispatchOrders() });
+    res.json({ co });
   } catch (error) {
     next(error);
   }
@@ -2204,7 +3564,7 @@ app.delete("/api/dispatch/co-orders/:coRef", async (req, res, next) => {
     }).catch(() => null);
     emitAppEvent("dispatch.co.updated", { coRef: req.params.coRef, cancelled: true, sourceSessionId: req.query.sessionId });
     emitAppEvent("delivery.order.updated", { coRef: req.params.coRef, cancelled: true, source: "dispatch-co" });
-    res.json({ cancelled, orders: await listDispatchOrders() });
+    res.json({ cancelled, orders: await enrichDispatchOrdersWithPlanAssignments(await listDispatchOrders()) });
   } catch (error) {
     next(error);
   }
@@ -2237,29 +3597,68 @@ app.post("/api/dispatch/operator-requests", async (req, res, next) => {
 
 app.put("/api/dispatch/plan", async (req, res, next) => {
   try {
-    const cleanOrders = sanitizeDispatchPlanOrders(Array.isArray(req.body?.orders) ? req.body.orders : []);
-    const payload = {
-      savedAt: new Date().toISOString(),
-      orders: cleanOrders,
-      trucks: Array.isArray(req.body?.trucks) ? req.body.trucks : []
-    };
+    const saveMode = dispatchPlanSaveMode(req.body);
+    const requestedOrders = sanitizeDispatchPlanOrders(Array.isArray(req.body?.orders) ? req.body.orders : []);
+    const requestedTrucks = Array.isArray(req.body?.trucks) ? req.body.trucks : [];
     const planDate = req.body?.planDate || req.body?.date || new Date().toISOString().slice(0, 10);
     let plan = req.body?.planId ? await getDispatchPlan(req.body.planId) : await getCurrentDispatchPlan({ planDate });
     if (!plan) plan = await createDispatchPlan({ planDate });
     const previousPlan = plan;
-    const savedPlan = await saveDispatchPlanSnapshot(plan.id, {
-      orders: payload.orders,
-      trucks: payload.trucks,
-      summary: req.body?.summary || {}
-    });
+    const cleanOrders = saveMode === "truck_sequence" && previousPlan
+      ? sanitizeDispatchPlanOrders(previousPlan.orders || [])
+      : requestedOrders;
+    const cleanTrucks = saveMode === "truck_sequence" && previousPlan
+      ? mergeDispatchTruckSequence(previousPlan.trucks || [], requestedTrucks)
+      : requestedTrucks;
+    const duplicateDrivers = dispatchDuplicateDriverAssignments(cleanTrucks);
+    if (duplicateDrivers.length) return sendDispatchDuplicateDriverResponse(res, duplicateDrivers);
+    const payload = {
+      savedAt: new Date().toISOString(),
+      orders: cleanOrders,
+      trucks: cleanTrucks
+    };
     const explicitOperatorAlertRefs = Array.isArray(req.body?.audit?.details?.operatorAlertRefs)
       ? req.body.audit.details.operatorAlertRefs.map((ref) => String(ref || "").trim()).filter(Boolean)
       : [];
+    const refreshOrderPool = req.body?.audit?.details?.refreshOrderPool === true;
+    if (
+      previousPlan
+      && !explicitOperatorAlertRefs.length
+      && !dispatchPlanDataChanged(
+        { orders: previousPlan.orders || [], trucks: previousPlan.trucks || [] },
+        { orders: payload.orders, trucks: payload.trucks }
+      )
+    ) {
+      return res.json({ ...previousPlan, operatorFlags: null, noChange: true });
+    }
+    const dateConflicts = await findNewDispatchPlanDateConflicts(previousPlan || {}, {
+      id: plan.id,
+      planDate: plan.planDate || planDate,
+      orders: payload.orders,
+      trucks: payload.trucks
+    });
+    if (dateConflicts.length) return sendDispatchPlanDateConflictResponse(res, dateConflicts);
+    const coSequenceConflicts = await findDispatchCoSequenceConflicts({
+      id: plan.id,
+      planDate: plan.planDate || planDate,
+      orders: payload.orders,
+      trucks: payload.trucks
+    });
+    if (coSequenceConflicts.length) return sendDispatchCoSequenceConflictResponse(res, coSequenceConflicts);
+    const savedPlan = await saveDispatchPlanSnapshot(plan.id, {
+      orders: payload.orders,
+      trucks: payload.trucks,
+      summary: req.body?.summary || {},
+      baseRevision: saveMode === "truck_sequence" ? null : req.body?.baseRevision
+    });
+    const coAssignments = await applyDispatchPlanCoAssignments(savedPlan);
     const changedOperatorRefs = [
       ...new Set([...changedDispatchOperatorRefs(previousPlan || {}, savedPlan), ...explicitOperatorAlertRefs])
     ];
     let operatorFlags = null;
-    if (savedPlan.status === "confirmed") {
+    const shouldApplyOperatorFlags = savedPlan.status === "confirmed"
+      && (changedOperatorRefs.length > 0 || dispatchOperatorImpactChanged(previousPlan || {}, savedPlan));
+    if (shouldApplyOperatorFlags) {
       operatorFlags = await applyConfirmedDispatchPlanToDelivery(savedPlan, { forceOrderRefs: changedOperatorRefs });
     }
     await fs.mkdir(dataDir, { recursive: true });
@@ -2276,13 +3675,17 @@ app.put("/api/dispatch/plan", async (req, res, next) => {
           ...(req.body.audit.details || {}),
           orderCount: payload.orders.length,
           truckCount: payload.trucks.length,
-          operatorFlags
+          saveMode,
+          coAssignments,
+          operatorFlags,
+          operatorFlagsSkipped: savedPlan.status === "confirmed" && !shouldApplyOperatorFlags
         }
       }).catch(() => null);
     }
-    emitAppEvent("dispatch.plan.saved", { planId: savedPlan.id, planDate: savedPlan.planDate, savedAt: savedPlan.savedAt, sourceSessionId: req.body?.audit?.sessionId, operatorFlags, changedOperatorRefs });
+    emitAppEvent("dispatch.plan.saved", { planId: savedPlan.id, planDate: savedPlan.planDate, savedAt: savedPlan.savedAt, sourceSessionId: req.body?.audit?.sessionId, operatorFlags, changedOperatorRefs, refreshOrderPool });
     res.json({ ...savedPlan, operatorFlags });
   } catch (error) {
+    if (error instanceof StaleDispatchPlanSaveError) return sendStaleDispatchPlanResponse(res, error);
     next(error);
   }
 });
@@ -3215,6 +4618,39 @@ app.post("/api/control/sync-now", requireOperator, requireAdmin, async (req, res
   }
 });
 
+app.post("/api/control/netsuite-progress/reconcile", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    if (syncRunning || activeSyncRun) {
+      return res.status(202).json({
+        started: false,
+        skipped: true,
+        reason: "sync_running",
+        settings: (await readDispatchSetup()).sync
+      });
+    }
+    const startedAt = new Date().toISOString();
+    const runner = runNetSuiteProgressReconcile({ source: "control_progress_reconcile", actorOperatorId: req.operator.id });
+    runner.catch((error) => {
+      console.error("Background NetSuite progress reconcile failed:", error);
+    });
+    res.status(202).json({
+      started: true,
+      background: true,
+      message: "NetSuite progress reconcile started.",
+      settings: {
+        ...(await readDispatchSetup()).sync,
+        running: true,
+        lastStartedAt: startedAt,
+        lastSource: "control_progress_reconcile",
+        lastStatus: "running",
+        lastError: ""
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/control/sync-stop", requireOperator, requireAdmin, async (req, res, next) => {
   try {
     const settings = await stopDispatchSync({ actorOperatorId: req.operator.id });
@@ -3242,7 +4678,24 @@ app.get("/api/delivery/audit", requireOperator, requireAdmin, async (req, res, n
     res.json(await listAudit({
       limit: req.query.limit,
       orderId: req.query.orderId,
-      operatorId: req.query.operatorId
+      operatorId: req.query.operatorId,
+      from: req.query.from,
+      to: req.query.to,
+      actor: req.query.actor,
+      action: req.query.action,
+      tranid: req.query.tranid
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/delivery/audit/options", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    res.json(await listAuditOptions({
+      from: req.query.from,
+      to: req.query.to,
+      tranid: req.query.tranid
     }));
   } catch (error) {
     next(error);
@@ -3439,8 +4892,8 @@ app.post("/api/delivery/orders/:id/sync", async (req, res, next) => {
       actorOperatorId: req.operator.id,
       source: "delivery",
       action: "operator.local_order_detail_refresh",
-      orderId: req.params.id,
-      details: { orderType, found: Boolean(order), lines: order?.lines?.length || 0 }
+      orderId: auditOrderId(req.params.id),
+      details: { orderRef: req.params.id, orderType, found: Boolean(order), lines: order?.lines?.length || 0 }
     });
     res.json({ localOnly: true, order: Boolean(order), synced: 0, lines: order?.lines?.length || 0 });
   } catch (error) {
@@ -3460,9 +4913,85 @@ app.get("/api/delivery/orders", async (req, res, next) => {
   }
 });
 
+app.get("/api/delivery/load-trucks", async (req, res, next) => {
+  try {
+    res.json(await listDeliveryLoadTrucks({
+      locationId: req.query.locationId,
+      planDate: req.query.planDate
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/delivery/load-orders", async (req, res, next) => {
+  try {
+    res.json(await listDeliveryLoadOrders({
+      locationId: req.query.locationId,
+      status: req.query.status,
+      planDate: req.query.planDate,
+      truckPlate: req.query.truckPlate
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/delivery/saved-orders", async (req, res, next) => {
+  try {
+    res.json(await listSavedDeliveryOrdersForOperator(operatorId(req), {
+      locationId: req.query.locationId
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/delivery/saved-order-keys", async (req, res, next) => {
+  try {
+    res.json(await listSavedDeliveryOrderKeysForOperator(operatorId(req), {
+      locationId: req.query.locationId
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/delivery/saved-orders", async (req, res, next) => {
+  try {
+    res.json(await saveDeliveryOrderForOperator(operatorId(req), {
+      locationId: req.body?.locationId || req.query.locationId,
+      orderId: req.body?.orderId
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete("/api/delivery/saved-orders/:id", async (req, res, next) => {
+  try {
+    res.json(await removeSavedDeliveryOrderForOperator(operatorId(req), {
+      locationId: req.query.locationId || req.body?.locationId,
+      orderId: req.params.id
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/delivery/notifications", async (req, res, next) => {
   try {
     res.json(await getDeliveryPrepNotifications({
+      locationId: req.query.locationId
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/delivery/current-draft", async (req, res, next) => {
+  try {
+    res.json(await getCurrentOperatorDeliveryDraft(operatorId(req), {
       locationId: req.query.locationId
     }));
   } catch (error) {
@@ -3695,11 +5224,36 @@ app.post("/api/delivery/orders/:id/status", async (req, res, next) => {
   }
 });
 
+app.post("/api/delivery/orders/:id/release-draft", async (req, res, next) => {
+  try {
+    const order = await releaseCurrentDeliveryDraft(req.params.id, operatorId(req));
+    emitAppEvent("delivery.order.updated", {
+      orderId: req.params.id,
+      status: order?.operator_status || null,
+      change: "draft_released",
+      operatorId: operatorId(req)
+    });
+    res.json({ ok: true, order });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/delivery/orders/:id/lines/:lineId/confirm", async (req, res, next) => {
   try {
     await confirmDeliveryLine(req.params.id, req.params.lineId, req.body || {}, operatorId(req));
     emitAppEvent("delivery.line.confirmed", { orderId: req.params.id, lineId: req.params.lineId, operatorId: operatorId(req) });
     res.json({ ok: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/delivery/orders/:id/lines/confirm-page", async (req, res, next) => {
+  try {
+    const result = await confirmDeliveryLines(req.params.id, req.body?.lines || [], operatorId(req));
+    emitAppEvent("delivery.line.confirmed", { orderId: req.params.id, count: result.confirmed, operatorId: operatorId(req), bulk: true });
+    res.json({ ok: true, ...result });
   } catch (error) {
     next(error);
   }

@@ -41,6 +41,15 @@ let loadedSearchTerm = localStorage.getItem("mbbs.control.loaded.search") || "";
 let loadedSearchTimer = null;
 let loadedSearchSeq = 0;
 let loadedSearchLoading = false;
+let auditFilters = {
+  from: localStorage.getItem("mbbs.control.audit.from") || "",
+  to: localStorage.getItem("mbbs.control.audit.to") || "",
+  actor: localStorage.getItem("mbbs.control.audit.actor") || "",
+  action: localStorage.getItem("mbbs.control.audit.action") || "",
+  tranid: localStorage.getItem("mbbs.control.audit.tranid") || "",
+  limit: localStorage.getItem("mbbs.control.audit.limit") || "200"
+};
+let auditOptions = { actors: [], actions: [] };
 
 async function request(path, options = {}) {
   const response = await fetch(path, {
@@ -60,7 +69,7 @@ async function request(path, options = {}) {
 
 function formatDate(value) {
   if (!value) return "";
-  return new Date(value).toLocaleString();
+  return window.MBBS_I18N?.displayDateTime(value) || "";
 }
 
 function escapeHtml(value) {
@@ -80,6 +89,40 @@ function photoSrc(value) {
 
 function photoImgSrc(value) {
   return escapeHtml(photoSrc(value));
+}
+
+function saveAuditFilters() {
+  for (const [key, value] of Object.entries(auditFilters)) {
+    localStorage.setItem(`mbbs.control.audit.${key}`, value || "");
+  }
+}
+
+function auditQueryString() {
+  const url = new URL("/api/delivery/audit", window.location.origin);
+  for (const [key, value] of Object.entries(auditFilters)) {
+    const text = String(value || "").trim();
+    if (text) url.searchParams.set(key, text);
+  }
+  if (!url.searchParams.has("limit")) url.searchParams.set("limit", "200");
+  return url.pathname + url.search;
+}
+
+function auditOptionsQueryString() {
+  const url = new URL("/api/delivery/audit/options", window.location.origin);
+  for (const key of ["from", "to", "tranid"]) {
+    const text = String(auditFilters[key] || "").trim();
+    if (text) url.searchParams.set(key, text);
+  }
+  return url.pathname + url.search;
+}
+
+function renderAuditSelectOptions(values, selectedValue, allLabel) {
+  const selected = String(selectedValue || "");
+  const allValues = [...new Set([selected, ...(values || [])].filter(Boolean))].sort((a, b) => String(a).localeCompare(String(b)));
+  return `
+    <option value="">${escapeHtml(allLabel)}</option>
+    ${allValues.map((value) => `<option value="${escapeHtml(value)}" ${String(value) === selected ? "selected" : ""}>${escapeHtml(value)}</option>`).join("")}
+  `;
 }
 
 function openPhotoLightbox(photoRef, label = "Photo preview") {
@@ -513,7 +556,7 @@ function renderLoadedExportSection() {
                 <select id="loadedYard">
                   <option value="all" ${loadedFilters.yard === "all" ? "selected" : ""}>${t("common.all", "All")}</option>
                   <option value="1" ${loadedFilters.yard === "1" ? "selected" : ""}>3445</option>
-                  <option value="13" ${loadedFilters.yard === "13" ? "selected" : ""}>2967</option>
+                  <option value="28" ${loadedFilters.yard === "28" ? "selected" : ""}>2967</option>
                   <option value="15" ${loadedFilters.yard === "15" ? "selected" : ""}>12441</option>
                   <option value="26" ${loadedFilters.yard === "26" ? "selected" : ""}>150</option>
                 </select>
@@ -638,6 +681,7 @@ function renderSyncSection() {
         <button class="primary" data-action="connect-netsuite" type="button">${t("control.connectNetsuite", "Connect NetSuite")}</button>
         <button data-action="save-sync-settings" type="button">${t("control.saveSyncSettings", "Save Sync Settings")}</button>
         <button class="primary" data-action="run-sync-now" type="button" ${syncSettings.running ? "disabled" : ""}>${t("control.runSyncNow", "Run Sync Now")}</button>
+        <button data-action="reconcile-netsuite-progress" type="button" ${syncSettings.running ? "disabled" : ""}>${t("control.reconcileProgress", "Reconcile NetSuite Progress")}</button>
         <button class="danger" data-action="stop-sync" type="button">${t("control.stopSync", "Stop / Clear Sync")}</button>
         <button data-action="refresh" type="button">${t("control.refreshStatus", "Refresh Status")}</button>
       </div>
@@ -768,7 +812,45 @@ function renderAuditSection() {
           <h2>${t("control.auditLog", "Audit Log")}</h2>
           <p class="muted">${t("control.latest", "Latest")} ${audit.length} ${t("control.records", "records")}</p>
         </div>
-        <button data-action="refresh">${t("common.refresh", "Refresh")}</button>
+        <button data-action="load-audit">${t("common.refresh", "Refresh")}</button>
+      </div>
+      <div class="audit-filter-card">
+        <div class="audit-filter-row">
+          <label>
+            <span>${t("control.from", "From")}</span>
+            <input data-audit-filter="from" type="datetime-local" value="${escapeHtml(auditFilters.from)}" />
+          </label>
+          <label>
+            <span>${t("control.to", "To")}</span>
+            <input data-audit-filter="to" type="datetime-local" value="${escapeHtml(auditFilters.to)}" />
+          </label>
+          <label>
+            <span>${t("control.actor", "Actor")}</span>
+            <select data-audit-filter="actor">
+              ${renderAuditSelectOptions(auditOptions.actors, auditFilters.actor, t("control.allActors", "All actors"))}
+            </select>
+          </label>
+          <label>
+            <span>${t("control.action", "Action")}</span>
+            <select data-audit-filter="action">
+              ${renderAuditSelectOptions(auditOptions.actions, auditFilters.action, t("control.allActions", "All actions"))}
+            </select>
+          </label>
+          <label>
+            <span>${t("control.tranid", "TranID")}</span>
+            <input data-audit-filter="tranid" placeholder="SO / TO / PO / CO" value="${escapeHtml(auditFilters.tranid)}" />
+          </label>
+          <label>
+            <span>${t("control.limit", "Limit")}</span>
+            <select data-audit-filter="limit">
+              ${["100", "200", "300", "500"].map((value) => `<option value="${value}" ${String(auditFilters.limit) === value ? "selected" : ""}>${value}</option>`).join("")}
+            </select>
+          </label>
+          <div class="audit-filter-actions">
+            <button class="primary" data-action="apply-audit-filters" type="button">${t("common.apply", "Apply")}</button>
+            <button data-action="reset-audit-filters" type="button">${t("common.reset", "Reset")}</button>
+          </div>
+        </div>
       </div>
       ${renderAudit()}
     </section>
@@ -932,25 +1014,37 @@ function renderOperators() {
 function renderAudit() {
   return `
     <table>
-      <thead><tr><th>${t("control.time", "Time")}</th><th>${t("control.actor", "Actor")}</th><th>${t("control.action", "Action")}</th><th>${t("common.order", "Order")}</th><th>${t("control.details", "Details")}</th></tr></thead>
+      <thead><tr><th>${t("control.time", "Time")}</th><th>${t("control.actor", "Actor")}</th><th>${t("control.action", "Action")}</th><th>${t("control.tranid", "TranID")}</th><th>${t("common.order", "Order")}</th><th>${t("control.details", "Details")}</th></tr></thead>
       <tbody>
         ${audit.map((row) => `
           <tr>
             <td>${formatDate(row.created_at)}</td>
             <td>${row.display_name || row.actor_type}</td>
             <td><strong>${row.action}</strong><br><span class="muted">${row.source}</span></td>
+            <td><strong>${escapeHtml(row.tranid || "")}</strong></td>
             <td>${row.order_id || ""}${row.line_id ? `<br><span class="muted">${t("control.line", "Line")} ${row.line_id}</span>` : ""}</td>
             <td><pre>${JSON.stringify(row.details || {}, null, 2)}</pre></td>
           </tr>
-        `).join("")}
+        `).join("") || `<tr><td colspan="6" class="muted">${t("control.noAuditRows", "No audit rows match the filters.")}</td></tr>`}
       </tbody>
     </table>
   `;
 }
 
+async function loadAudit() {
+  audit = await request(auditQueryString());
+  return audit;
+}
+
+async function loadAuditOptions() {
+  auditOptions = await request(auditOptionsQueryString());
+  return auditOptions;
+}
+
 async function loadControlData() {
   operators = await request("/api/operators");
-  audit = await request("/api/delivery/audit?limit=100");
+  await loadAuditOptions();
+  await loadAudit();
   classifications = await request(`/api/inventory/classifications?limit=300${classificationSearch ? `&search=${encodeURIComponent(classificationSearch)}` : ""}`);
   cycleRecords = await request("/api/cycle-count/records?limit=50");
   fulfillmentRecords = await request("/api/delivery/fulfillments?limit=100");
@@ -1031,6 +1125,27 @@ app.addEventListener("click", async (event) => {
       return render();
     }
     if (button.dataset.action === "refresh") return loadControlData();
+    if (button.dataset.action === "load-audit") {
+      await loadAuditOptions();
+      await loadAudit();
+      return render();
+    }
+    if (button.dataset.action === "apply-audit-filters") {
+      app.querySelectorAll("[data-audit-filter]").forEach((input) => {
+        auditFilters[input.dataset.auditFilter] = input.value || "";
+      });
+      saveAuditFilters();
+      await loadAuditOptions();
+      await loadAudit();
+      return render();
+    }
+    if (button.dataset.action === "reset-audit-filters") {
+      auditFilters = { from: "", to: "", actor: "", action: "", tranid: "", limit: "200" };
+      saveAuditFilters();
+      await loadAuditOptions();
+      await loadAudit();
+      return render();
+    }
     if (button.dataset.action === "open-photo-lightbox") {
       openPhotoLightbox(button.dataset.photoRef, button.dataset.photoLabel || "Photo preview");
       return;
@@ -1100,7 +1215,7 @@ app.addEventListener("click", async (event) => {
     if (button.dataset.action === "sync-inventory") {
       await request("/api/inventory/sync", {
         method: "POST",
-        body: JSON.stringify({ locationIds: [1, 13, 15, 26] })
+        body: JSON.stringify({ locationIds: [1, 28, 15, 26] })
       });
       return loadControlData();
     }
@@ -1147,6 +1262,17 @@ app.addEventListener("click", async (event) => {
       render();
       scheduleSyncPoll();
       alert(result.skipped ? "Sync is already running." : "NetSuite sync started in the background.");
+      return;
+    }
+    if (button.dataset.action === "reconcile-netsuite-progress") {
+      if (!confirm("Reconcile SO fulfilled, PO received, and TO fulfilled/received progress from current NetSuite records into local order progress? Run a normal sync first when possible.")) return;
+      button.disabled = true;
+      button.textContent = "Starting...";
+      const result = await request("/api/control/netsuite-progress/reconcile", { method: "POST" });
+      syncSettings = result.settings || await request("/api/control/sync-settings");
+      render();
+      scheduleSyncPoll();
+      alert(result.skipped ? "Sync/reconcile is already running." : "NetSuite progress reconcile started in the background.");
       return;
     }
     if (button.dataset.action === "stop-sync") {

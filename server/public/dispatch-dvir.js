@@ -67,6 +67,10 @@ function formatTime(value) {
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
+function formatDate(value) {
+  return window.MBBS_I18N?.displayDate(value) || "";
+}
+
 function statusPill(done, error = "") {
   if (error) return `<span class="dvir-pill danger">Issue</span>`;
   return done ? `<span class="dvir-pill ok">Done</span>` : `<span class="dvir-pill muted">Missing</span>`;
@@ -159,7 +163,7 @@ function renderPhotoPanel() {
       <div class="panel-header dvir-detail-header">
         <div>
           <h2>${escapeHtml(record.driverLogin || "Driver")} ${escapeHtml(record.truckPlate || "")}</h2>
-          <p>${escapeHtml(record.planDate || dvirDate)} · Samsara ${escapeHtml(record.samsaraUsername || "-")}</p>
+          <p>${escapeHtml(formatDate(record.planDate || dvirDate))} · Samsara ${escapeHtml(record.samsaraUsername || "-")}</p>
         </div>
         <div class="dvir-detail-status">
           ${statusPill(Boolean(record.preCompletedAt), record.preError)}

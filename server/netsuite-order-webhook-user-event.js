@@ -52,6 +52,11 @@ define(["N/https", "N/log", "N/record", "N/runtime", "N/search"], (https, log, r
     return Number.isFinite(number) ? Math.abs(number) : 0;
   }
 
+  function signedNumberValue(value) {
+    const number = Number(String(value == null ? "" : value).replace(/,/g, ""));
+    return Number.isFinite(number) ? number : 0;
+  }
+
   function scalarLookup(value) {
     if (Array.isArray(value)) return value[0]?.text || value[0]?.value || "";
     if (value && typeof value === "object") return value.text || value.value || "";
@@ -117,7 +122,11 @@ define(["N/https", "N/log", "N/record", "N/runtime", "N/search"], (https, log, r
         toPlt: numberValue(scalarLookup(fields.custitem_toplt)),
         toLyr: numberValue(scalarLookup(fields.custitem_tolyr)),
         toSec: numberValue(scalarLookup(fields.custitem_tosec)),
-        toPcs: numberValue(scalarLookup(fields.custitem_topcs))
+        toPcs: numberValue(scalarLookup(fields.custitem_topcs)),
+        custitem_toplt: numberValue(scalarLookup(fields.custitem_toplt)),
+        custitem_tolyr: numberValue(scalarLookup(fields.custitem_tolyr)),
+        custitem_tosec: numberValue(scalarLookup(fields.custitem_tosec)),
+        custitem_topcs: numberValue(scalarLookup(fields.custitem_topcs))
       };
     } catch (error) {
       log.debug("MBBS item lookup skipped", { itemId, message: error.message });
@@ -166,6 +175,7 @@ define(["N/https", "N/log", "N/record", "N/runtime", "N/search"], (https, log, r
         itemTypeText: item.itemTypeText || getLineTextSafe(rec, line, "itemtype"),
         itemDescription: description,
         quantity: numberValue(getLineValueSafe(rec, line, "quantity")),
+        signedQuantity: signedNumberValue(getLineValueSafe(rec, line, "quantity")),
         quantityShipRecv: numberValue(getLineValueSafe(rec, line, "quantityshiprecv")),
         quantityFulfilled: numberValue(getLineValueSafe(rec, line, "quantityfulfilled")),
         quantityReceived: numberValue(getLineValueSafe(rec, line, "quantityreceived")),
@@ -177,10 +187,18 @@ define(["N/https", "N/log", "N/record", "N/runtime", "N/search"], (https, log, r
         custcol_lyr: numberValue(getLineValueSafe(rec, line, "custcol_lyr")),
         custcol_sec: numberValue(getLineValueSafe(rec, line, "custcol_sec")),
         custcol_pcs: numberValue(getLineValueSafe(rec, line, "custcol_pcs")),
+        to_plt: item.toPlt,
+        to_lyr: item.toLyr,
+        to_sec: item.toSec,
+        to_pcs: item.toPcs,
         toPlt: item.toPlt,
         toLyr: item.toLyr,
         toSec: item.toSec,
-        toPcs: item.toPcs
+        toPcs: item.toPcs,
+        custitem_toplt: item.custitem_toplt,
+        custitem_tolyr: item.custitem_tolyr,
+        custitem_tosec: item.custitem_tosec,
+        custitem_topcs: item.custitem_topcs
       });
     }
     return lines;

@@ -1,6 +1,8 @@
 const setupApp = document.getElementById("dispatchSetupApp");
 const t = (key, fallback) => window.MBBS_I18N?.t(key, fallback) || fallback;
 const languageToggle = () => window.MBBS_I18N?.toggleHtml() || "";
+const displayDate = (value) => window.MBBS_I18N?.displayDate(value) || "";
+const displayDateTime = (value) => window.MBBS_I18N?.displayDateTime(value) || "";
 
 let setupTab = "drivers";
 let selectedSetupIndex = null;
@@ -9,13 +11,13 @@ let drivers = [
   { name: "Jenny Lee", license: "DZ", number: "D18870", login: "jenny", ownYardFixedMinutes: 38, vendorFixedMinutes: 32, deliveryFixedMinutes: 32, outsideFixedMinutes: 32, minutesPerPallet: 1, loadMinutes: 38, unloadMinutes: 32 }
 ];
 let trucks = [
-  { plate: "MBBS-101", capacityLbs: 48000 },
-  { plate: "MBBS-205", capacityLbs: 44000 },
-  { plate: "MBBS-318", capacityLbs: 52000 }
+  { plate: "MBBS-101", capacityLbs: 48000, travelTimePercent: 0 },
+  { plate: "MBBS-205", capacityLbs: 44000, travelTimePercent: 0 },
+  { plate: "MBBS-318", capacityLbs: 52000, travelTimePercent: 0 }
 ];
 let ownYards = [
   { code: "3445", name: "3445", locationId: 1, address: "3445 Kennedy Road, Toronto, ON", lat: 43.8204306, lng: -79.3053423 },
-  { code: "2967", name: "2967", locationId: 13, address: "2967 Kennedy Road, Toronto, ON", lat: 43.806119, lng: -79.2986377 },
+  { code: "2967", name: "2967", locationId: 28, address: "2967 Kennedy Road, Toronto, ON", lat: 43.806119, lng: -79.2986377 },
   { code: "12441", name: "12441", locationId: 15, address: "12441 Woodbine Avenue, Whitchurch-Stouffville, ON", lat: 43.948694, lng: -79.3727582 },
   { code: "150", name: "150", locationId: 26, address: "150 Clark Blvd, Brampton, ON L6T 4Y8, Canada" }
 ];
@@ -23,6 +25,7 @@ let vendorYards = [];
 let parserRules = [];
 let ollamaAudit = [];
 let dispatchAudit = [];
+let parserReparseResult = null;
 let setupNotice = "";
 let samsaraTestResult = null;
 let samsaraSettings = { dvirAuthorId: "1868723" };
@@ -33,6 +36,7 @@ let expandedAuditId = "";
 let expandedDispatchAuditId = "";
 let eventSource = null;
 let setupRefreshTimer = null;
+let draggedTruckSetupIndex = null;
 const WEEK_DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
 
 async function api(path, options = {}) {
@@ -69,7 +73,20 @@ async function loadDispatchSetup() {
   }
 }
 
+function validateUniqueDriverLogins() {
+  const seen = new Map();
+  for (const driver of drivers || []) {
+    const login = String(driver?.login || "").trim();
+    if (!login) continue;
+    const key = login.toLowerCase();
+    const previous = seen.get(key);
+    if (previous) throw new Error(`Driver login must be unique. "${login}" is used by both ${previous} and ${driver.name || login}.`);
+    seen.set(key, driver.name || login);
+  }
+}
+
 async function saveDispatchSetup() {
+  validateUniqueDriverLogins();
   const saved = await api("/api/dispatch/setup", {
     method: "PUT",
     body: JSON.stringify({ drivers, trucks, ownYards, samsara: samsaraSettings })
@@ -156,6 +173,11 @@ function formatLbs(value) {
 
 function truckCapacityLbs(truck) {
   return Number(truck?.capacityLbs || 0) || Number(truck?.capacity || 0) * 2000 || 48000;
+}
+
+function truckTravelTimePercent(truck) {
+  const value = Number(truck?.travelTimePercent ?? truck?.travelPercent ?? 0);
+  return Number.isFinite(value) ? value : 0;
 }
 
 function ownYardFixedMinutesFor(driver) {
@@ -340,14 +362,18 @@ function renderTrucks() {
     <div class="setup-content">
       <div class="setup-list-column">
         <div class="section-heading-row">
-          <strong>Current Trucks</strong>
+          <div>
+            <strong>Current Trucks</strong>
+            <span class="muted">Drag to set the default planning sequence.</span>
+          </div>
           <button data-action="new-setup-record" type="button">New</button>
         </div>
         <div class="registration-list setup-list">
         ${trucks.map((truck, index) => `
-          <button class="registration-card ${selectedSetupIndex === index ? "selected" : ""}" data-action="select-setup-record" data-index="${index}" type="button">
+          <button class="registration-card truck-setup-card ${selectedSetupIndex === index ? "selected" : ""}" data-action="select-setup-record" data-index="${index}" data-truck-index="${index}" draggable="true" type="button">
             <strong>${escapeHtml(truck.plate)}</strong>
             <span class="muted">Capacity ${formatLbs(truckCapacityLbs(truck))}</span>
+            <span class="muted">Google travel time +${truckTravelTimePercent(truck)}%</span>
           </button>
         `).join("")}
         </div>
@@ -356,10 +382,24 @@ function renderTrucks() {
         <h3>${selected ? "Update Truck" : "Register Truck"}</h3>
         <label><span>Vehicle plate number</span><input name="plate" value="${escapeHtml(selected?.plate || "")}" required /></label>
         <label><span>Load capacity (lb)</span><input name="capacityLbs" type="number" value="${truckCapacityLbs(selected)}" required /></label>
+        <label><span>Google travel time + %</span><input name="travelTimePercent" type="number" min="0" max="300" step="1" value="${truckTravelTimePercent(selected)}" required /></label>
         <button class="primary" type="submit">${selected ? "Update Truck" : "Register Truck"}</button>
       </form>
     </div>
   `;
+}
+
+function moveSetupTruck(fromIndex, toIndex) {
+  if (!Number.isInteger(fromIndex) || !Number.isInteger(toIndex)) return false;
+  if (fromIndex < 0 || fromIndex >= trucks.length || toIndex < 0 || toIndex >= trucks.length || fromIndex === toIndex) return false;
+  const [truck] = trucks.splice(fromIndex, 1);
+  trucks.splice(toIndex, 0, truck);
+  if (selectedSetupIndex === fromIndex) selectedSetupIndex = toIndex;
+  else if (Number.isInteger(selectedSetupIndex)) {
+    if (fromIndex < selectedSetupIndex && toIndex >= selectedSetupIndex) selectedSetupIndex -= 1;
+    else if (fromIndex > selectedSetupIndex && toIndex <= selectedSetupIndex) selectedSetupIndex += 1;
+  }
+  return true;
 }
 
 function renderOwnYards() {
@@ -472,6 +512,7 @@ function renderVendorYards() {
 function renderParserRules() {
   const help = {
     address_labels: "Words that mean delivery address, separated by comma.",
+    date_labels: "Words that mean delivery date. Example Date: 07-03 means July 3.",
     time_labels: "Words that mean delivery time window, separated by comma.",
     instruction_labels: "Words that mean placement or drop-off instruction.",
     am_terms: "Terms that mean morning.",
@@ -499,6 +540,37 @@ function renderParserRules() {
         <button class="primary" type="submit">Save Parser Rules</button>
       </div>
     </form>
+    <section class="setup-panel parser-maintenance-panel">
+      <div>
+        <h3>Re-parse Missing Delivery Time</h3>
+        <p class="muted">Re-run the current parser rules on active sales delivery orders that have no delivery address or time window.</p>
+      </div>
+      <div class="inline-footer">
+        <button class="secondary-button" data-action="dry-run-reparse-missing-delivery-time" type="button">Preview Count</button>
+        <button class="primary" data-action="reparse-missing-delivery-time" type="button">Re-parse Orders</button>
+        <button class="danger-button" data-action="reparse-non-shipped-delivery-orders" type="button">Re-parse All Non-Shipped</button>
+      </div>
+      ${parserReparseResult ? `
+        <div class="reparse-result">
+          <strong>${parserReparseResult.dryRun ? "Preview" : "Updated"}:</strong>
+          ${Number(parserReparseResult.matched || 0)} matched,
+          ${Number(parserReparseResult.updated || 0)} saved,
+          ${Number(parserReparseResult.resolvedTime || 0)} time windows found,
+          ${Number(parserReparseResult.resolvedAddress || 0)} addresses found,
+          ${Number(parserReparseResult.failed || 0)} failed.
+          ${Array.isArray(parserReparseResult.details) && parserReparseResult.details.length ? `
+            <div class="reparse-detail-list">
+              ${parserReparseResult.details.slice(0, 8).map((row) => `
+                <span>
+                  <b>${escapeHtml(row.tranid || row.netsuiteId || "")}</b>
+                  ${row.error ? `Error: ${escapeHtml(row.error)}` : `${escapeHtml(displayDate(row.after?.expectedDeliveryDate) || "No date")} | ${escapeHtml(row.after?.windowStart || "-")} - ${escapeHtml(row.after?.windowEnd || "-")} | ${escapeHtml(row.after?.address || "No address")}`}
+                </span>
+              `).join("")}
+            </div>
+          ` : ""}
+        </div>
+      ` : ""}
+    </section>
   `;
 }
 
@@ -517,7 +589,7 @@ function renderOllamaAudit() {
               <span class="audit-summary">
                 <strong>${escapeHtml(row.sourceRef || "No source")}</strong>
                 <em>${escapeHtml(row.parserType || "")}</em>
-                <small>${row.createdAt ? new Date(row.createdAt).toLocaleString() : ""}</small>
+                <small>${displayDateTime(row.createdAt)}</small>
                 ${row.error ? `<b class="audit-error">Error</b>` : `<b>OK</b>`}
               </span>
             </button>
@@ -555,7 +627,7 @@ function renderDispatchAudit() {
               <span class="audit-summary dispatch-audit-summary">
                 <strong>${escapeHtml(titleCaseAction(row.action))}</strong>
                 <em>${escapeHtml(target || "-")}</em>
-                <small>${row.createdAt ? new Date(row.createdAt).toLocaleString() : ""}</small>
+                <small>${displayDateTime(row.createdAt)}</small>
                 <b>${escapeHtml(row.operatorName || row.sessionId || "System")}</b>
               </span>
               ${details ? `<span class="audit-subline">${escapeHtml(details)}</span>` : ""}
@@ -591,6 +663,51 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
+setupApp.addEventListener("dragstart", (event) => {
+  const truckCard = event.target.closest("[data-truck-index]");
+  if (!truckCard || setupTab !== "trucks") return;
+  draggedTruckSetupIndex = Number(truckCard.dataset.truckIndex);
+  event.dataTransfer.effectAllowed = "move";
+  event.dataTransfer.setData("text/plain", String(draggedTruckSetupIndex));
+  truckCard.classList.add("dragging");
+});
+
+setupApp.addEventListener("dragover", (event) => {
+  const truckCard = event.target.closest("[data-truck-index]");
+  if (!truckCard || setupTab !== "trucks" || draggedTruckSetupIndex === null) return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect = "move";
+  document.querySelectorAll(".truck-setup-card.drag-over").forEach((card) => card.classList.remove("drag-over"));
+  truckCard.classList.add("drag-over");
+});
+
+setupApp.addEventListener("dragleave", (event) => {
+  event.target.closest(".truck-setup-card")?.classList.remove("drag-over");
+});
+
+setupApp.addEventListener("dragend", () => {
+  draggedTruckSetupIndex = null;
+  document.querySelectorAll(".truck-setup-card.dragging, .truck-setup-card.drag-over").forEach((card) => card.classList.remove("dragging", "drag-over"));
+});
+
+setupApp.addEventListener("drop", (event) => {
+  const truckCard = event.target.closest("[data-truck-index]");
+  if (!truckCard || setupTab !== "trucks" || draggedTruckSetupIndex === null) return;
+  event.preventDefault();
+  const fromIndex = draggedTruckSetupIndex;
+  const toIndex = Number(truckCard.dataset.truckIndex);
+  draggedTruckSetupIndex = null;
+  document.querySelectorAll(".truck-setup-card.dragging, .truck-setup-card.drag-over").forEach((card) => card.classList.remove("dragging", "drag-over"));
+  if (!moveSetupTruck(fromIndex, toIndex)) return renderSetup();
+  saveDispatchSetup().then(() => {
+    setupNotice = "Truck default sequence saved.";
+    renderSetup();
+  }).catch((error) => {
+    setupNotice = `Truck sequence save failed: ${error.message}`;
+    renderSetup();
+  });
+});
+
 setupApp.addEventListener("click", (event) => {
   const tabButton = event.target.closest("[data-tab]");
   if (tabButton) {
@@ -624,6 +741,30 @@ setupApp.addEventListener("click", (event) => {
   const refreshAuditButton = event.target.closest("[data-action='refresh-audit']");
   if (refreshAuditButton) {
     loadOllamaAudit().finally(renderSetup);
+    return;
+  }
+  const reparseButton = event.target.closest("[data-action='reparse-missing-delivery-time'], [data-action='dry-run-reparse-missing-delivery-time'], [data-action='reparse-non-shipped-delivery-orders']");
+  if (reparseButton) {
+    const dryRun = reparseButton.dataset.action === "dry-run-reparse-missing-delivery-time";
+    const allNonShipped = reparseButton.dataset.action === "reparse-non-shipped-delivery-orders";
+    reparseButton.disabled = true;
+    reparseButton.textContent = dryRun ? "Checking..." : allNonShipped ? "Re-parsing all..." : "Re-parsing...";
+    api(`/api/dispatch/reparse-missing-delivery-time${dryRun ? "?dryRun=true" : ""}`, {
+      method: "POST",
+      body: JSON.stringify({ limit: allNonShipped ? 1000 : 300, dryRun, scope: allNonShipped ? "non_shipped" : "missing" })
+    }).then(async (result) => {
+      parserReparseResult = result;
+      setupNotice = dryRun
+        ? `Preview found ${Number(result.matched || 0)} delivery orders with missing parser fields.`
+        : allNonShipped
+          ? `Re-parsed ${Number(result.updated || 0)} non-shipped delivery orders.`
+          : `Re-parsed ${Number(result.updated || 0)} delivery orders.`;
+      await loadOllamaAudit();
+      renderSetup();
+    }).catch((error) => {
+      setupNotice = `Re-parse failed: ${error.message}`;
+      renderSetup();
+    });
     return;
   }
   const refreshDispatchAuditButton = event.target.closest("[data-action='refresh-dispatch-audit']");
@@ -832,7 +973,11 @@ setupApp.addEventListener("submit", (event) => {
     return;
   }
   if (form.dataset.form === "truck") {
-    const truck = { plate: data.plate, capacityLbs: Number(data.capacityLbs || 48000) };
+    const truck = {
+      plate: data.plate,
+      capacityLbs: Number(data.capacityLbs || 48000),
+      travelTimePercent: Math.max(0, Number(data.travelTimePercent || 0))
+    };
     if (Number.isInteger(selectedSetupIndex)) trucks[selectedSetupIndex] = truck;
     else {
       trucks.push(truck);

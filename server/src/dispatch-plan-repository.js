@@ -1,4 +1,4 @@
-import { query } from "./db.js";
+import { query, withTransaction } from "./db.js";
 
 const CUSTOMER_PICKUP_DELIVERY_METHOD = "Pick-Up";
 
@@ -15,6 +15,7 @@ function planRow(row) {
   if (!row) return null;
   return {
     id: row.id,
+    revision: Number(row.revision || 0),
     planDate: row.plan_date instanceof Date ? row.plan_date.toISOString().slice(0, 10) : String(row.plan_date || "").slice(0, 10),
     status: row.status,
     note: row.note || "",
@@ -26,6 +27,18 @@ function planRow(row) {
     trucks: row.trucks || [],
     summary: row.summary || {}
   };
+}
+
+export class StaleDispatchPlanSaveError extends Error {
+  constructor({ planId, expectedRevision, currentRevision }) {
+    super("Dispatch plan changed on the server before this save completed.");
+    this.name = "StaleDispatchPlanSaveError";
+    this.code = "STALE_DISPATCH_PLAN";
+    this.planId = planId;
+    this.expectedRevision = expectedRevision;
+    this.currentRevision = currentRevision;
+    this.status = 409;
+  }
 }
 
 function collectPlanOrderRefs(plan) {
@@ -213,32 +226,58 @@ export async function getCurrentDispatchPlan({ planDate } = {}) {
   return sanitizeDispatchPlan(planRow(result.rows[0]));
 }
 
-export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [], summary = {} } = {}) {
-  const result = await query(
-    `UPDATE dispatch_plans
-        SET updated_at = now()
-      WHERE id = $1
-      RETURNING *`,
-    [planId]
-  );
-  if (!result.rows[0]) throw new Error("Dispatch plan not found.");
-  const cleanPlan = await sanitizeDispatchPlan({
-    id: String(planId),
-    orders: Array.isArray(orders) ? orders : [],
-    trucks: Array.isArray(trucks) ? trucks : [],
-    summary: summary || {}
+export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [], summary = {}, baseRevision = null } = {}) {
+  return withTransaction(async () => {
+    const hasBaseRevision = baseRevision !== null && baseRevision !== undefined && baseRevision !== "";
+    const expectedRevision = Number(baseRevision);
+    const result = hasBaseRevision && Number.isFinite(expectedRevision)
+      ? await query(
+          `UPDATE dispatch_plans
+              SET updated_at = now(),
+                  revision = revision + 1
+            WHERE id = $1
+              AND revision = $2
+            RETURNING *`,
+          [planId, expectedRevision]
+        )
+      : await query(
+          `UPDATE dispatch_plans
+              SET updated_at = now(),
+                  revision = revision + 1
+            WHERE id = $1
+            RETURNING *`,
+          [planId]
+        );
+    if (!result.rows[0]) {
+      const current = await query("SELECT revision FROM dispatch_plans WHERE id = $1", [planId]);
+      if (current.rows[0] && hasBaseRevision) {
+        throw new StaleDispatchPlanSaveError({
+          planId,
+          expectedRevision,
+          currentRevision: Number(current.rows[0].revision || 0)
+        });
+      }
+      throw new Error("Dispatch plan not found.");
+    }
+    const cleanPlan = await sanitizeDispatchPlan({
+      id: String(planId),
+      revision: Number(result.rows[0].revision || 0),
+      orders: Array.isArray(orders) ? orders : [],
+      trucks: Array.isArray(trucks) ? trucks : [],
+      summary: summary || {}
+    });
+    await query(
+      `INSERT INTO dispatch_plan_snapshots (plan_id, orders, trucks, summary, saved_at)
+       VALUES ($1, $2::jsonb, $3::jsonb, $4::jsonb, now())
+       ON CONFLICT (plan_id) DO UPDATE
+         SET orders = EXCLUDED.orders,
+             trucks = EXCLUDED.trucks,
+             summary = EXCLUDED.summary,
+             saved_at = now()`,
+      [planId, JSON.stringify(cleanPlan.orders), JSON.stringify(cleanPlan.trucks), JSON.stringify(cleanPlan.summary || {})]
+    );
+    return getDispatchPlan(planId);
   });
-  await query(
-    `INSERT INTO dispatch_plan_snapshots (plan_id, orders, trucks, summary, saved_at)
-     VALUES ($1, $2::jsonb, $3::jsonb, $4::jsonb, now())
-     ON CONFLICT (plan_id) DO UPDATE
-       SET orders = EXCLUDED.orders,
-           trucks = EXCLUDED.trucks,
-           summary = EXCLUDED.summary,
-           saved_at = now()`,
-    [planId, JSON.stringify(cleanPlan.orders), JSON.stringify(cleanPlan.trucks), JSON.stringify(cleanPlan.summary || {})]
-  );
-  return getDispatchPlan(planId);
 }
 
 export async function confirmDispatchPlan(planId, { note = "" } = {}) {
@@ -247,6 +286,7 @@ export async function confirmDispatchPlan(planId, { note = "" } = {}) {
         SET status = 'confirmed',
             note = COALESCE(NULLIF($2, ''), note),
             confirmed_at = COALESCE(confirmed_at, now()),
+            revision = revision + 1,
             updated_at = now()
       WHERE id = $1
       RETURNING *`,
@@ -262,6 +302,7 @@ export async function reopenDispatchPlan(planId, { note = "" } = {}) {
         SET status = 'draft',
             note = COALESCE(NULLIF($2, ''), note),
             confirmed_at = NULL,
+            revision = revision + 1,
             updated_at = now()
       WHERE id = $1
       RETURNING *`,

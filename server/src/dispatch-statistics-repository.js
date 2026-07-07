@@ -1,6 +1,6 @@
 import { query } from "./db.js";
 
-const OWN_YARD_CODES = new Set(["3445", "2967", "12441"]);
+const OWN_YARD_CODES = new Set(["3445", "2967", "12441", "150"]);
 
 function todayLocalDate() {
   const parts = new Intl.DateTimeFormat("en-CA", {

@@ -1,6 +1,6 @@
 const LOCATIONS = [
   { id: 1, text: "3445" },
-  { id: 13, text: "2967" },
+  { id: 28, text: "2967" },
   { id: 15, text: "12441" },
   { id: 26, text: "150" }
 ];
@@ -110,7 +110,7 @@ function orderStatusClass(order) {
 
 function formatDate(value) {
   if (!value) return "";
-  return new Date(value).toLocaleDateString();
+  return window.MBBS_I18N?.displayDate(value) || "";
 }
 
 function qty(value) {

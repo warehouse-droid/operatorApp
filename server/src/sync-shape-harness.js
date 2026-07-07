@@ -365,7 +365,7 @@ async function runWebhookSimulation(checks) {
     statusText: "Pending Receipt",
     memo: "Uxbridge yard - BWS",
     foreignTotal: "654.00",
-    locationId: 13,
+    locationId: 28,
     locationText: "2967",
     lines: [{
       lineId: 51,
@@ -378,7 +378,7 @@ async function runWebhookSimulation(checks) {
       quantityReceived: 10,
       unitText: "EA",
       itemWeight: 1.5,
-      locationId: 13,
+      locationId: 28,
       locationText: "2967",
       custcol_plt: 2,
       custcol_lyr: 1,
@@ -388,7 +388,7 @@ async function runWebhookSimulation(checks) {
   }, { scheduleDelayedStatus: false });
   await assertPurchaseOrder(ids.webhookPurchase, {
     vendor: "BWS Uxbridge",
-    destination_location_id: 13,
+    destination_location_id: 28,
     memo: "Uxbridge yard - BWS",
     line_id: 51,
     item_name: "BWS-AR-COP-UB",

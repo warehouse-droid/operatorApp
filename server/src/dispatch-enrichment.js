@@ -32,6 +32,69 @@ const VENDOR_YARDS = [
   { vendor: "MA-CO", yard: "Ma-Co Clay Products", aliases: ["ma-co", "maco", "bright", "oxford"], windowStart: "07:00", windowEnd: "16:30", instructions: "", address: "896474 Oxford County Rd. 3, Bright, ON N0J1B0" }
 ];
 
+const MONTH_INDEX = {
+  jan: 1,
+  january: 1,
+  feb: 2,
+  february: 2,
+  mar: 3,
+  march: 3,
+  apr: 4,
+  april: 4,
+  may: 5,
+  jun: 6,
+  june: 6,
+  jul: 7,
+  july: 7,
+  aug: 8,
+  august: 8,
+  sep: 9,
+  sept: 9,
+  september: 9,
+  oct: 10,
+  october: 10,
+  nov: 11,
+  november: 11,
+  dec: 12,
+  december: 12
+};
+
+const DEFAULT_DATE_LABELS = [
+  "Delivery Date",
+  "Delivery Day",
+  "Date",
+  "Schedule Date",
+  "\u9001\u8d27\u65e5\u671f",
+  "\u9001\u8d27\u65f6\u95f4",
+  "\u65e5\u671f",
+  "\u65f6\u95f4"
+];
+const DEFAULT_ADDRESS_LABELS = [
+  "Delivery Address",
+  "Address",
+  "Ship to",
+  "Deliver to",
+  "Add",
+  "\u9001\u8d27\u5730\u5740",
+  "\u5730\u5740"
+];
+const DEFAULT_TIME_LABELS = [
+  "Delivery Time",
+  "Delivery Window",
+  "Time",
+  "\u9001\u8d27\u65f6\u95f4",
+  "\u65f6\u95f4"
+];
+const DEFAULT_INSTRUCTION_LABELS = [
+  "Drop-off Loc",
+  "Drop off",
+  "Drop-off",
+  "\u7816\u7684\u653e\u7f6e",
+  "\u653e\u7f6e",
+  "\u6446\u653e\u4f4d\u7f6e",
+  "\u6446\u653e\u7684\u4f4d\u7f6e"
+];
+
 function rowToVendorYard(row) {
   return {
     id: row.id,
@@ -60,6 +123,16 @@ function parseWindowValue(value, fallback) {
 }
 
 export async function listDispatchParserRules() {
+  await query(
+    `INSERT INTO dispatch_parser_rules (rule_key, rule_value, description)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (rule_key) DO NOTHING`,
+    [
+      "date_labels",
+      DEFAULT_DATE_LABELS.join(","),
+      "Comma separated labels that mean delivery date. Example: Delivery Date: 07-03"
+    ]
+  );
   const result = await query(
     `SELECT rule_key, rule_value, description
        FROM dispatch_parser_rules
@@ -77,9 +150,10 @@ async function parserConfig() {
     const rows = await listDispatchParserRules();
     const rules = Object.fromEntries(rows.map((row) => [row.key, row.value]));
     return {
-      addressLabels: csv(rules.address_labels || "Delivery Address,Address,Ship to,Deliver to,Add,送货地址"),
-      timeLabels: csv(rules.time_labels || "Delivery Time,Delivery Window,送货时间"),
-      instructionLabels: csv(rules.instruction_labels || "Drop-off Loc,Drop off,Drop-off,砖的放置,放置"),
+      dateLabels: csv(rules.date_labels || DEFAULT_DATE_LABELS.join(",")),
+      addressLabels: csv(rules.address_labels || DEFAULT_ADDRESS_LABELS.join(",")),
+      timeLabels: csv(rules.time_labels || DEFAULT_TIME_LABELS.join(",")),
+      instructionLabels: csv(rules.instruction_labels || DEFAULT_INSTRUCTION_LABELS.join(",")),
       amTerms: csv(rules.am_terms || "AM,上午"),
       pmTerms: csv(rules.pm_terms || "PM,下午"),
       noonTerms: csv(rules.noon_terms || "noon,中午"),
@@ -90,9 +164,10 @@ async function parserConfig() {
     };
   } catch {
     return {
-      addressLabels: ["Delivery Address", "Address", "Ship to", "Deliver to", "Add", "送货地址"],
-      timeLabels: ["Delivery Time", "Delivery Window", "送货时间"],
-      instructionLabels: ["Drop-off Loc", "Drop off", "Drop-off", "砖的放置", "放置"],
+      dateLabels: DEFAULT_DATE_LABELS,
+      addressLabels: DEFAULT_ADDRESS_LABELS,
+      timeLabels: DEFAULT_TIME_LABELS,
+      instructionLabels: DEFAULT_INSTRUCTION_LABELS,
       amTerms: ["AM", "上午"],
       pmTerms: ["PM", "下午"],
       noonTerms: ["noon", "中午"],
@@ -312,6 +387,119 @@ function hasDateLikeText(value) {
   return /\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?|\d{1,2}\s*月\s*\d{1,2}\s*日/i.test(String(value || ""));
 }
 
+function hasAnyDateLikeText(value) {
+  const monthNames = Object.keys(MONTH_INDEX).sort((a, b) => b.length - a.length).join("|");
+  return new RegExp(`\\d{1,2}[/-]\\d{1,2}(?:[/-]\\d{2,4})?|\\d{1,2}\\s*[\\u6708.]\\s*\\d{1,2}\\s*[\\u65e5.]?|\\b(?:${monthNames})\\.?\\s+\\d{1,2}(?:st|nd|rd|th)?\\b|\\b\\d{1,2}(?:st|nd|rd|th)?\\s+(?:${monthNames})\\.?\\b`, "i").test(String(value || ""));
+}
+
+function dateOnly(year, month, day) {
+  const candidate = new Date(Date.UTC(year, month - 1, day, 12, 0, 0));
+  if (
+    candidate.getUTCFullYear() !== year
+    || candidate.getUTCMonth() !== month - 1
+    || candidate.getUTCDate() !== day
+  ) return "";
+  const today = new Date();
+  const todayUtc = new Date(Date.UTC(today.getFullYear(), today.getMonth(), today.getDate(), 12, 0, 0));
+  const daysBehind = (todayUtc.getTime() - candidate.getTime()) / 86400000;
+  if (daysBehind > 180) candidate.setUTCFullYear(candidate.getUTCFullYear() + 1);
+  return candidate.toISOString().slice(0, 10);
+}
+
+function parseDeliveryDate(value) {
+  const text = String(value || "");
+  const iso = text.match(/\b(20\d{2})[/-](\d{1,2})[/-](\d{1,2})\b/);
+  if (iso) return dateOnly(Number(iso[1]), Number(iso[2]), Number(iso[3]));
+
+  const monthNames = Object.keys(MONTH_INDEX).sort((a, b) => b.length - a.length).join("|");
+  const monthFirst = text.match(new RegExp(`\\b(${monthNames})\\.?\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:,?\\s+(20\\d{2}|\\d{2}))?\\b`, "i"));
+  if (monthFirst) {
+    const rawYear = monthFirst[3] ? Number(monthFirst[3]) : new Date().getFullYear();
+    const year = rawYear < 100 ? 2000 + rawYear : rawYear;
+    return dateOnly(year, MONTH_INDEX[monthFirst[1].toLowerCase()], Number(monthFirst[2]));
+  }
+
+  const dayFirst = text.match(new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+(${monthNames})\\.?\\s*(?:,?\\s+(20\\d{2}|\\d{2}))?\\b`, "i"));
+  if (dayFirst) {
+    const rawYear = dayFirst[3] ? Number(dayFirst[3]) : new Date().getFullYear();
+    const year = rawYear < 100 ? 2000 + rawYear : rawYear;
+    return dateOnly(year, MONTH_INDEX[dayFirst[2].toLowerCase()], Number(dayFirst[1]));
+  }
+
+  const numeric = text.match(/\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b/);
+  if (numeric) {
+    const first = Number(numeric[1]);
+    const second = Number(numeric[2]);
+    const rawYear = numeric[3] ? Number(numeric[3]) : new Date().getFullYear();
+    const year = rawYear < 100 ? 2000 + rawYear : rawYear;
+    const month = first > 12 && second <= 12 ? second : first;
+    const day = first > 12 && second <= 12 ? first : second;
+    return dateOnly(year, month, day);
+  }
+
+  const chinese = text.match(/(\d{1,2})\s*.\s*(\d{1,2})\s*./);
+  if (chinese) return dateOnly(new Date().getFullYear(), Number(chinese[1]), Number(chinese[2]));
+
+  return "";
+}
+
+function parseMonthNameDeliveryDate(value) {
+  const text = String(value || "");
+  const monthNames = Object.keys(MONTH_INDEX).sort((a, b) => b.length - a.length).join("|");
+  const monthFirst = text.match(new RegExp(`\\b(${monthNames})\\.?\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:,?\\s+(20\\d{2}|\\d{2}))?\\b`, "i"));
+  if (monthFirst) {
+    const rawYear = monthFirst[3] ? Number(monthFirst[3]) : new Date().getFullYear();
+    const year = rawYear < 100 ? 2000 + rawYear : rawYear;
+    return dateOnly(year, MONTH_INDEX[monthFirst[1].toLowerCase()], Number(monthFirst[2]));
+  }
+  const dayFirst = text.match(new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+(${monthNames})\\.?\\s*(?:,?\\s+(20\\d{2}|\\d{2}))?\\b`, "i"));
+  if (dayFirst) {
+    const rawYear = dayFirst[3] ? Number(dayFirst[3]) : new Date().getFullYear();
+    const year = rawYear < 100 ? 2000 + rawYear : rawYear;
+    return dateOnly(year, MONTH_INDEX[dayFirst[2].toLowerCase()], Number(dayFirst[1]));
+  }
+  return "";
+}
+
+function parseBaseDate(value) {
+  const text = String(value || "").trim();
+  if (!text) return null;
+  const iso = text.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) return new Date(Date.UTC(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3]), 12, 0, 0));
+  const slash = text.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (slash) return new Date(Date.UTC(Number(slash[3]), Number(slash[1]) - 1, Number(slash[2]), 12, 0, 0));
+  const parsed = new Date(text);
+  if (!Number.isNaN(parsed.getTime())) {
+    return new Date(Date.UTC(parsed.getUTCFullYear(), parsed.getUTCMonth(), parsed.getUTCDate(), 12, 0, 0));
+  }
+  return null;
+}
+
+function parseRelativeDeliveryDate(value, baseDateValue) {
+  const text = String(value || "");
+  const base = parseBaseDate(baseDateValue) || new Date();
+  const baseUtc = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth(), base.getUTCDate(), 12, 0, 0));
+  const weekdayMap = {
+    "\u4e00": 1,
+    "\u4e8c": 2,
+    "\u4e09": 3,
+    "\u56db": 4,
+    "\u4e94": 5,
+    "\u516d": 6,
+    "\u65e5": 0,
+    "\u5929": 0
+  };
+  const nextWeek = text.match(/(?:\u4e0b\u5468|\u4e0b\u661f\u671f|\u4e0b\u79ae\u62dc|\u4e0b\u793c\u62dc)([\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u65e5\u5929])/);
+  if (!nextWeek) return "";
+  const target = weekdayMap[nextWeek[1]];
+  if (target === undefined) return "";
+  const current = baseUtc.getUTCDay();
+  let days = target - current + 7;
+  if (days <= 0) days += 7;
+  const date = new Date(baseUtc.getTime() + days * 86400000);
+  return date.toISOString().slice(0, 10);
+}
+
 function windowFromLabel(value, config) {
   const text = String(value || "").toLowerCase();
   const range = extractRangeWindow(text);
@@ -319,19 +507,21 @@ function windowFromLabel(value, config) {
   if (hasTerm(text, config.pmTerms)) return { windowStart: config.pmWindow.start, windowEnd: config.pmWindow.end };
   if (hasTerm(text, config.amTerms)) return { windowStart: config.amWindow.start, windowEnd: config.amWindow.end };
   if (hasTerm(text, config.noonTerms)) return { windowStart: config.noonWindow.start, windowEnd: config.noonWindow.end };
-  if (hasDateLikeText(text)) return { windowStart: config.wholeDayWindow.start, windowEnd: config.wholeDayWindow.end };
+  if (hasAnyDateLikeText(text)) return { windowStart: config.wholeDayWindow.start, windowEnd: config.wholeDayWindow.end };
   return {};
 }
 
 function extractLabeledDispatchFields(text, config) {
   const deliveryAddress = cleanupAddress(extractLabelValue(text, config.addressLabels));
   const timeText = extractLabelValue(text, config.timeLabels);
-  const timeWindow = windowFromLabel(timeText, config);
+  const dateText = extractLabelValue(text, config.dateLabels) || timeText;
+  const timeWindow = windowFromLabel(timeText || dateText, config);
   const instructions = [];
   const drop = extractLabelValue(text, config.instructionLabels);
   if (drop) instructions.push(drop);
   return {
     deliveryAddress,
+    deliveryDate: parseDeliveryDate(dateText) || parseDeliveryDate(timeText) || parseMonthNameDeliveryDate(text),
     windowStart: timeWindow.windowStart || "",
     windowEnd: timeWindow.windowEnd || "",
     instructions: instructions.join(" | ")
@@ -361,13 +551,14 @@ async function parseSalesOrderWithOllama(note, { sourceRef = "" } = {}) {
         prompt: `You extract dispatch data from messy sales-order notes for a yard delivery planner.
 
 Return strict JSON only:
-{"deliveryAddress":"","windowStart":"","windowEnd":"","instructions":""}
+{"deliveryAddress":"","deliveryDate":"","windowStart":"","windowEnd":"","instructions":""}
 
 Rules:
 1. deliveryAddress must be the actual delivery destination only. Never copy the whole note.
 2. English labels:
    - "Add:", "Address:", "Delivery Address:", "Ship to:" mean deliveryAddress.
-   - "Delivery Time:" means delivery time window.
+   - "Delivery Date:", "Delivery Day:", "Date:", and "Schedule Date:" mean deliveryDate.
+   - "Delivery Time:" means delivery time window, and may also contain deliveryDate.
    - "Drop-off Loc:" and similar placement notes go to instructions, not address.
    - "Tel:", "Phone:", PO number, account terms, and contact info are not address.
 3. Chinese labels:
@@ -387,7 +578,7 @@ Tel: (416) 841-2217
 Delivery Time: 11/14/2025 PM
 Drop-off Loc: On Grass
 JSON:
-{"deliveryAddress":"92 Chaplin Crescent, Toronto, ON M5P 1A5","windowStart":"12:00","windowEnd":"17:00","instructions":"Drop-off Loc: On Grass"}
+{"deliveryAddress":"92 Chaplin Crescent, Toronto, ON M5P 1A5","deliveryDate":"2025-11-14","windowStart":"12:00","windowEnd":"17:00","instructions":"Drop-off Loc: On Grass"}
 
 Note:
 送货地址：18 Stanwood Crescent, North York, ON M9M 1Z9
@@ -460,19 +651,24 @@ export async function enrichSalesOrderDispatch(order) {
   const memo = order.memo || order.note || order.notes || "";
   const config = await parserConfig();
   const labeled = extractLabeledDispatchFields(memo, config);
+  const relativeDate = parseRelativeDeliveryDate(memo, order.trandate || order.datecreated || order.createddate);
+  const fallbackAddress = labeled.deliveryAddress || extractAddress(memo);
   const fallback = {
-    dispatch_address: labeled.deliveryAddress || "",
+    dispatch_address: fallbackAddress || "",
+    expected_delivery_date: labeled.deliveryDate || relativeDate || "",
     dispatch_window_start: labeled.windowStart || "",
     dispatch_window_end: labeled.windowEnd || "",
     dispatch_instructions: labeled.instructions || memo,
-    dispatch_parse_source: labeled.deliveryAddress || labeled.windowStart || labeled.instructions ? "label-parser" : "ollama-unparsed",
+    dispatch_parse_source: fallbackAddress || labeled.deliveryDate || relativeDate || labeled.windowStart || labeled.instructions ? "label-parser" : "ollama-unparsed",
     dispatch_note_hash: hashText(memo)
   };
-  if (labeled.deliveryAddress || labeled.windowStart || labeled.windowEnd) return fallback;
+  if (labeled.deliveryAddress || labeled.deliveryDate || labeled.windowStart || labeled.windowEnd) return fallback;
   const parsed = await parseSalesOrderWithOllama(memo, { sourceRef: order.tranid || order.id || "" });
   if (!parsed) return fallback;
+  const parsedDate = hasAnyDateLikeText(memo) ? parseDeliveryDate(parsed.deliveryDate || parsed.date) : "";
   return {
     dispatch_address: parsed.deliveryAddress || parsed.address || "",
+    expected_delivery_date: fallback.expected_delivery_date || parsedDate,
     dispatch_window_start: parsed.windowStart || fallback.dispatch_window_start,
     dispatch_window_end: parsed.windowEnd || fallback.dispatch_window_end,
     dispatch_instructions: parsed.instructions || fallback.dispatch_instructions,

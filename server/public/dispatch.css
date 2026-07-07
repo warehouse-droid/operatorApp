@@ -1122,13 +1122,6 @@ select {
   cursor: grab;
 }
 
-.order-card.planned {
-  cursor: pointer;
-  border-color: #b69bff;
-  border-style: dashed;
-  background: #f3efff;
-}
-
 .order-card-actions {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1170,6 +1163,28 @@ select {
 
 .order-card.status-complete span {
   color: #34444e;
+}
+
+.order-card.planned,
+.order-card.planned-elsewhere {
+  border-color: #b69bff;
+  border-style: dashed;
+  background: #f3efff;
+}
+
+.order-card.planned-elsewhere {
+  cursor: not-allowed;
+}
+
+.order-card.review-only {
+  border-color: #84919a;
+  background: #eef2f4;
+  color: #27343d;
+  cursor: default;
+}
+
+.order-card.review-only span {
+  color: #3d4b54;
 }
 
 .order-card strong,
@@ -1382,6 +1397,19 @@ select {
   display: grid;
   gap: 3px;
   cursor: grab;
+}
+
+.stop-card.rest-stop,
+.preview-stop.rest {
+  border-color: #cbd5e1;
+  background: #f8fafc;
+  color: #334155;
+  cursor: default;
+}
+
+.stop-card.rest-stop .stop-main strong,
+.preview-stop.rest .stop-main strong {
+  color: #475569;
 }
 
 .stop-card.pickup {
@@ -1637,10 +1665,36 @@ select {
 .truck-row {
   min-width: 980px;
   display: grid;
-  grid-template-columns: 158px minmax(760px, 1fr);
+  grid-template-columns: 34px 158px minmax(760px, 1fr);
   gap: 8px;
   margin-bottom: 9px;
   align-items: stretch;
+}
+
+.truck-sequence-controls {
+  position: sticky;
+  left: 0;
+  z-index: 3;
+  min-height: 116px;
+  display: grid;
+  gap: 5px;
+  align-content: center;
+}
+
+.truck-sequence-controls button {
+  min-height: 34px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #ffffff;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 1000;
+}
+
+.truck-sequence-controls button:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
 }
 
 .truck-row.driver-missing .truck-label {
@@ -1654,7 +1708,7 @@ select {
 
 .truck-label {
   position: sticky;
-  left: 0;
+  left: 42px;
   z-index: 2;
   min-height: 116px;
   border: 1px solid var(--line);
@@ -2462,7 +2516,7 @@ select {
 
 .split-row {
   display: grid;
-  grid-template-columns: minmax(180px, 1.3fr) 100px repeat(var(--split-cols, 2), minmax(76px, 1fr));
+  grid-template-columns: minmax(180px, 1.2fr) minmax(130px, 0.9fr) repeat(var(--split-cols, 2), minmax(96px, 1fr));
   gap: 6px;
   align-items: center;
   border: 1px solid var(--line);
@@ -2477,6 +2531,29 @@ select {
 .split-row input {
   min-height: 34px;
   text-align: center;
+}
+
+.split-unit-stack {
+  display: grid;
+  gap: 5px;
+}
+
+.split-unit-input {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr);
+  align-items: center;
+  gap: 5px;
+}
+
+.split-unit-input span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.split-unit-input input {
+  width: 100%;
+  min-width: 0;
 }
 
 .transit-co-editor {
@@ -2576,8 +2653,27 @@ select {
   border-bottom: 1px solid var(--line);
 }
 
+.section-heading-row > div {
+  display: grid;
+  gap: 2px;
+}
+
 .setup-list {
   padding: 12px;
+}
+
+.truck-setup-card {
+  cursor: grab;
+}
+
+.truck-setup-card.dragging {
+  opacity: 0.55;
+}
+
+.truck-setup-card.drag-over {
+  border-color: var(--accent);
+  box-shadow: inset 5px 0 0 var(--accent);
+  background: #edfdf8;
 }
 
 .setup-form {
@@ -3124,6 +3220,33 @@ select {
   color: var(--ink-soft);
   font-size: 12px;
   font-weight: 800;
+}
+
+.route-option-row {
+  margin: 0 9px 9px;
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  align-items: center;
+  gap: 8px;
+}
+
+.route-option-row button {
+  min-height: 30px;
+  padding: 0 10px;
+  border-radius: 7px;
+  font-size: 12px;
+}
+
+.route-option-row button.active {
+  border-color: #00766f;
+  background: #e7f8f5;
+  color: #005a55;
+}
+
+.route-option-row span {
+  color: var(--ink-soft);
+  font-size: 11px;
+  font-weight: 850;
 }
 
 .fallback-map-preview {

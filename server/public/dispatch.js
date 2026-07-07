@@ -1,6 +1,8 @@
 const app = document.getElementById("dispatchApp");
 const t = (key, fallback) => window.MBBS_I18N?.t(key, fallback) || fallback;
 const languageToggle = () => window.MBBS_I18N?.toggleHtml() || "";
+const displayDate = (value) => window.MBBS_I18N?.displayDate(value) || "";
+const displayDateTime = (value) => window.MBBS_I18N?.displayDateTime(value) || "";
 const DISPATCH_SESSION_KEY = "mbbs.dispatch.sessionId";
 const dispatchSessionId = localStorage.getItem(DISPATCH_SESSION_KEY) || `dispatch-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 localStorage.setItem(DISPATCH_SESSION_KEY, dispatchSessionId);
@@ -376,6 +378,9 @@ let isResizingPreview = false;
 let lastServerSavedAt = "";
 let saveTimer = null;
 let isApplyingRemotePlan = false;
+let localPlanDirty = false;
+let lastLocalPlanEditAt = "";
+let blockedRemotePlanUpdate = false;
 let eventSource = null;
 let remoteRefreshTimer = null;
 let orderClickTimer = null;
@@ -386,6 +391,9 @@ let historyCurrentSnapshot = null;
 let historyReady = false;
 let isApplyingHistory = false;
 let pendingOperatorAlertRefs = new Set();
+let nextSaveNeedsOrderPoolRefresh = false;
+let nextPlanSaveMode = "";
+let plannedAssignmentRefs = new Set();
 const HISTORY_LIMIT = 80;
 const DISPATCH_PLAN_KEY = "mbbs.dispatch.plan";
 const DISPATCH_PLAN_DATE_KEY = "mbbs.dispatch.planDate";
@@ -433,6 +441,23 @@ function formatLbs(value) {
 
 function truckCapacityLbs(truck) {
   return Number(truck?.capacityLbs || 0) || Number(truck?.capacity || 0) * 2000 || 48000;
+}
+
+function truckTravelTimePercent(truck) {
+  const value = Number(truck?.travelTimePercent ?? truck?.travelPercent ?? 0);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function adjustedTravelMinutesForTruck(truck, value) {
+  const baseMinutes = Number(value || 0);
+  if (!Number.isFinite(baseMinutes) || baseMinutes <= 0) return 0;
+  const percent = Math.max(0, truckTravelTimePercent(truck));
+  return Math.max(1, Math.round(baseMinutes * (1 + (percent / 100))));
+}
+
+function travelAdjustmentText(truck) {
+  const percent = truckTravelTimePercent(truck);
+  return percent > 0 ? `+${percent}% travel` : "Google travel";
 }
 
 function driverKey(driver) {
@@ -534,8 +559,11 @@ function truckUnloadMinutes(truck) {
 function driverOptions(selectedKey = "", truckId = "") {
   const current = String(selectedKey || "").trim();
   const options = [`<option value="">Unassigned</option>`];
+  const renderedKeys = new Set();
   for (const driver of drivers) {
     const key = driverKey(driver);
+    if (!key || renderedKeys.has(key)) continue;
+    renderedKeys.add(key);
     const assignedElsewhere = key !== current && driverAssignedToOtherTruck(key, truckId);
     const suffix = assignedElsewhere ? (current ? " | swap" : " | on other truck") : "";
     options.push(`<option value="${escapeHtml(key)}" ${key === current ? "selected" : ""}>${escapeHtml(driver.name)} | ${escapeHtml(driver.license || "-")}${suffix}</option>`);
@@ -556,17 +584,32 @@ function applyDriverToTruck(truck, driver) {
   truck.unloadMinutes = truck.deliveryFixedMinutes;
 }
 
+function normalizeUniqueTruckDrivers(nextTrucks = []) {
+  const used = new Set();
+  for (const truck of nextTrucks || []) {
+    const key = driverKey(truckDriver(truck)) || String(truck?.driverLogin || "").trim();
+    if (!key) continue;
+    if (used.has(key)) {
+      applyDriverToTruck(truck, null);
+      continue;
+    }
+    used.add(key);
+  }
+  return nextTrucks;
+}
+
 function makeTruckFromFleet(vehicle, index, saved = {}) {
-  const driver = drivers[index] || {};
-  const savedDriverKey = saved.driverLogin || saved.driver_login || driverKey(driverByKey(saved.driver)) || driverKey(driver);
+  const defaultDriver = drivers[index] || {};
+  const savedDriverKey = saved.driverLogin || saved.driver_login || driverKey(driverByKey(saved.driver)) || driverKey(defaultDriver);
+  const driver = driverByKey(savedDriverKey) || defaultDriver;
   const id = saved.id || `T${index + 1}`;
   return {
     id,
     plate: vehicle.plate,
     capacityLbs: truckCapacityLbs(vehicle),
     driverLogin: savedDriverKey || "",
-    driver: saved.driver || driver.name || "Unassigned",
-    license: saved.license || driver.license || "-",
+    driver: driver.name || saved.driver || "Unassigned",
+    license: driver.license || saved.license || "-",
     base: saved.base || "12441",
     parkingSpot: saved.parkingSpot || vehicle.parkingSpot || "",
     start: saved.start || timeText(7 * 60 + (index * 30)),
@@ -575,10 +618,56 @@ function makeTruckFromFleet(vehicle, index, saved = {}) {
     deliveryFixedMinutes: Number(saved.deliveryFixedMinutes || driver.deliveryFixedMinutes || saved.outsideFixedMinutes || saved.unloadMinutes || driver.outsideFixedMinutes || driver.unloadMinutes || 35),
     outsideFixedMinutes: Number(saved.deliveryFixedMinutes || driver.deliveryFixedMinutes || saved.outsideFixedMinutes || saved.unloadMinutes || driver.outsideFixedMinutes || driver.unloadMinutes || 35),
     minutesPerPallet: Number(saved.minutesPerPallet || driver.minutesPerPallet || 1),
+    travelTimePercent: vehicle.travelTimePercent !== undefined || vehicle.travelPercent !== undefined
+      ? truckTravelTimePercent(vehicle)
+      : truckTravelTimePercent(saved),
     loadMinutes: Number(saved.ownYardFixedMinutes || saved.loadMinutes || driver.ownYardFixedMinutes || driver.loadMinutes || 40),
     unloadMinutes: Number(saved.deliveryFixedMinutes || driver.deliveryFixedMinutes || saved.outsideFixedMinutes || saved.unloadMinutes || driver.outsideFixedMinutes || driver.unloadMinutes || 35),
     loads: saved.loads?.length ? saved.loads : [{ id: `${id}-L1`, name: "Load 1", stops: [] }]
   };
+}
+
+function trucksFromFleetAndSavedPlan(savedTrucks = []) {
+  const savedList = Array.isArray(savedTrucks) ? savedTrucks : [];
+  const fleetByPlate = new Map(fleet.map((vehicle) => [String(vehicle.plate || ""), vehicle]));
+  const savedByPlate = new Map(savedList.map((truck) => [String(truck.plate || ""), truck]));
+  const orderedVehicles = [];
+  const seen = new Set();
+  for (const savedTruck of savedList) {
+    const plate = String(savedTruck.plate || "");
+    const vehicle = fleetByPlate.get(plate) || { plate, capacityLbs: truckCapacityLbs(savedTruck), travelTimePercent: truckTravelTimePercent(savedTruck) };
+    if (!vehicle.plate || seen.has(String(vehicle.plate))) continue;
+    orderedVehicles.push(vehicle);
+    seen.add(String(vehicle.plate));
+  }
+  for (const vehicle of fleet) {
+    const plate = String(vehicle.plate || "");
+    if (!plate || seen.has(plate)) continue;
+    orderedVehicles.push(vehicle);
+    seen.add(plate);
+  }
+  return normalizeUniqueTruckDrivers(orderedVehicles.map((vehicle, index) => makeTruckFromFleet(vehicle, index, savedByPlate.get(String(vehicle.plate || "")))));
+}
+
+function moveTruckInPlan(truckId, delta) {
+  const index = trucks.findIndex((truck) => truck.id === truckId);
+  if (index < 0) return false;
+  const next = index + delta;
+  if (next < 0 || next >= trucks.length) return false;
+  const before = trucks.map((truck) => truck.plate);
+  const [truck] = trucks.splice(index, 1);
+  trucks.splice(next, 0, truck);
+  selectedLoadId = truck.loads?.[0]?.id || selectedLoadId;
+  logDispatchAudit({
+    action: "truck_display_sequence_updated",
+    entityType: "truck",
+    entityId: truck.id,
+    truckId: truck.id,
+    before,
+    after: trucks.map((item) => item.plate),
+    details: { planDate: currentPlanDate, fromIndex: index, toIndex: next }
+  });
+  return true;
 }
 
 function orderWeightLbs(order) {
@@ -601,7 +690,114 @@ function yardTravelMinutes(from, to) {
 }
 
 function itemFootprint(item) {
-  return Number(item?.splitQty ?? item?.pallets ?? 0) + (Number(item?.layers || 0) > 0 ? 1 : 0);
+  if (item?.splitQty !== undefined) return Number(item.splitQty || 0);
+  return Number(item?.pallets || item?.layers || item?.sections || item?.pieces || item?.quantity || 0);
+}
+
+function splitItemKey(item = {}, index = 0) {
+  return String(item.lineRowId || item.id || item.lineId || item.line_id || item.sku || item.itemName || `item-${index}`);
+}
+
+function conversionNumber(item = {}, key) {
+  const fieldMap = {
+    pallets: ["toPlt", "to_plt"],
+    layers: ["toLyr", "to_lyr"],
+    sections: ["toSec", "to_sec"],
+    pieces: ["toPcs", "to_pcs"]
+  };
+  return Number((fieldMap[key] || []).map((field) => item[field]).find((value) => Number(value || 0) > 0) || 0);
+}
+
+function splitQuantityValue(value) {
+  const number = Number(value || 0);
+  return Number.isFinite(number) ? Math.max(0, number) : 0;
+}
+
+function splitNumberAcrossParts(total, parts, step = 1) {
+  const cleanTotal = splitQuantityValue(total);
+  const cleanParts = Math.max(1, Number(parts) || 1);
+  if (step >= 1 && Number.isInteger(cleanTotal)) {
+    const base = Math.floor(cleanTotal / cleanParts);
+    const remainder = cleanTotal % cleanParts;
+    return Array.from({ length: cleanParts }).map((_, index) => base + (index < remainder ? 1 : 0));
+  }
+  const base = Math.floor((cleanTotal / cleanParts) * 1000000) / 1000000;
+  let remaining = cleanTotal;
+  return Array.from({ length: cleanParts }).map((_, index) => {
+    if (index === cleanParts - 1) return Math.round(remaining * 1000000) / 1000000;
+    remaining -= base;
+    return base;
+  });
+}
+
+function splitUnitDefinitions(item = {}) {
+  const convertedUnits = [
+    { key: "pallets", label: "PLT", total: Number(item.pallets || item.pallet_qty || 0), conversion: conversionNumber(item, "pallets"), step: 1 },
+    { key: "layers", label: "LYR", total: Number(item.layers || item.layer_qty || 0), conversion: conversionNumber(item, "layers"), step: 1 },
+    { key: "sections", label: "SEC", total: Number(item.sections || item.section_qty || 0), conversion: conversionNumber(item, "sections"), step: 1 },
+    { key: "pieces", label: "PCS", total: Number(item.pieces || item.piece_qty || 0), conversion: conversionNumber(item, "pieces"), step: 1 }
+  ].filter((unit) => unit.conversion > 0);
+  const unitsWithRequiredQty = convertedUnits.filter((unit) => unit.total > 0);
+  if (unitsWithRequiredQty.length) return unitsWithRequiredQty;
+  if (convertedUnits.length && Number(item.quantity || item.salesQty || 0) > 0) {
+    let remaining = Number(item.quantity || item.salesQty || 0);
+    const derivedUnits = convertedUnits
+      .sort((a, b) => b.conversion - a.conversion)
+      .map((unit) => {
+        const total = Math.floor((remaining / unit.conversion) + 0.000001);
+        remaining -= total * unit.conversion;
+        return { ...unit, total };
+      })
+      .filter((unit) => unit.total > 0);
+    if (derivedUnits.length) return derivedUnits;
+  }
+  const unitLabel = item.unit || item.salesUom || item.sales_uom || "QTY";
+  return [{ key: "quantity", label: unitLabel, total: Number(item.quantity || item.salesQty || 0), conversion: 1, step: 0.01 }];
+}
+
+function splitPartTemplate(item = {}) {
+  return splitUnitDefinitions(item).reduce((part, unit) => {
+    part[unit.key] = 0;
+    return part;
+  }, {});
+}
+
+function normalizeSplitPartValue(item = {}, value) {
+  const template = splitPartTemplate(item);
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    for (const key of Object.keys(template)) template[key] = splitQuantityValue(value[key]);
+    return template;
+  }
+  const firstUnit = splitUnitDefinitions(item)[0]?.key || "quantity";
+  template[firstUnit] = splitQuantityValue(value);
+  return template;
+}
+
+function splitPartSalesQuantity(item = {}, part = {}) {
+  const units = splitUnitDefinitions(item);
+  const hasConversion = units.some((unit) => unit.key !== "quantity");
+  if (!hasConversion) return splitQuantityValue(part.quantity);
+  const converted = units.reduce((sum, unit) => {
+    if (unit.key === "quantity") return sum;
+    return sum + (splitQuantityValue(part[unit.key]) * conversionNumber(item, unit.key));
+  }, 0);
+  return Math.round(converted * 1000000) / 1000000;
+}
+
+function splitPartLabel(item = {}, part = {}) {
+  return splitUnitDefinitions(item)
+    .map((unit) => {
+      const value = splitQuantityValue(part[unit.key]);
+      return value > 0 ? `${qtyText(value)} ${unit.label}` : "";
+    })
+    .filter(Boolean)
+    .join(" ");
+}
+
+function splitItemTotalLabel(item = {}) {
+  return splitUnitDefinitions(item)
+    .map((unit) => `${qtyText(unit.total)} ${unit.label}`)
+    .join(" ");
 }
 
 function orderUnitText(order) {
@@ -711,6 +907,26 @@ function movementText(order) {
   if (order.type === "TO") return `${order.sourceYard || order.pickupLocations?.[0] || "source yard"} to ${order.destinationYard || "destination yard"}`;
   if (order.type === "CO") return `${order.sourceYard || order.pickupLocations?.[0] || "source yard"} to ${order.destinationYard || "transit depot"}`;
   return order.address;
+}
+
+function isReviewOnlyOrder(order = {}) {
+  const localStatus = String(order.localYardOrderStatus || "").toLowerCase();
+  const operatorStatus = String(order.operatorStatus || "").toLowerCase();
+  const fulfillmentStatus = String(order.fulfillmentStatus || order.raw?.fulfillment_status || "").toLowerCase();
+  const statusText = String(order.netsuiteStatusText || order.raw?.status_text || "").toLowerCase();
+  if (["loaded", "shipped", "received"].includes(localStatus)) return true;
+  if (["loaded", "shipped", "received"].includes(operatorStatus)) return true;
+  if (["fulfilled", "shipped", "received", "billed"].includes(fulfillmentStatus)) return true;
+  return statusText.includes("pending billing")
+    || statusText.includes("billed")
+    || statusText.includes("fulfilled")
+    || statusText.includes("received");
+}
+
+function reviewOnlyText(order = {}) {
+  const localStatus = String(order.localYardOrderStatus || order.operatorStatus || "").trim();
+  const statusText = String(order.netsuiteStatusText || order.raw?.status_text || "").replace(/^(Sales Order|Transfer Order|Purchase Order)\s*:\s*/i, "").trim();
+  return localStatus || statusText || "Review only";
 }
 
 function orderTypeLabel(type) {
@@ -837,9 +1053,22 @@ function orderById(id) {
   return orders.find((order) => order.id === id);
 }
 
+function canonicalDispatchOrderType(value, id = "") {
+  const text = String(value || "").trim().toUpperCase().replace(/[\s-]+/g, "_");
+  if (["SO", "SALES_ORDER", "SALESORDER", "SALES_ORD"].includes(text)) return "SO";
+  if (["PO", "PURCHASE_ORDER", "PURCHASEORDER", "PURCH_ORD"].includes(text)) return "PO";
+  if (["TO", "TRANSFER_ORDER", "TRANSFERORDER", "TRNFR_ORD"].includes(text)) return "TO";
+  if (["CO", "CO_ORDER", "LOCAL_CO", "LOCAL_CO_ORDER"].includes(text)) return "CO";
+  const orderId = String(id || "").toUpperCase();
+  if (orderId.startsWith("PO")) return "PO";
+  if (orderId.startsWith("TO")) return "TO";
+  if (orderId.startsWith("CO-")) return "CO";
+  return "SO";
+}
+
 function normalizeOrder(order) {
   const id = String(order.id || "");
-  const type = order.type || (id.startsWith("PO") ? "PO" : id.startsWith("TO") ? "TO" : id.startsWith("CO-") ? "CO" : "SO");
+  const type = canonicalDispatchOrderType(order.type, id);
   const items = Array.isArray(order.items) ? order.items : [];
   const basePickupLocations = Array.isArray(order.pickupLocations) && order.pickupLocations.length
     ? order.pickupLocations
@@ -884,12 +1113,67 @@ function relatedTransitCo(order) {
 
 function isTransitCoPlanned(order) {
   if (!order?.transitCo?.id) return true;
-  return allAssignedOrderIds().has(order.transitCo.id);
+  const coOrder = relatedTransitCo(order);
+  return allAssignedOrderIds().has(order.transitCo.id) || Boolean(coOrder?.dispatchPlanned);
 }
 
 function transitBlockMessage(order) {
   if (!order?.transitCo?.id || isTransitCoPlanned(order)) return "";
   return `${order.id} requires ${order.transitCo.id} to be planned first.`;
+}
+
+function comparePlanDate(a, b) {
+  const left = String(a || "").slice(0, 10);
+  const right = String(b || "").slice(0, 10);
+  if (!left || !right || left === right) return 0;
+  return left < right ? -1 : 1;
+}
+
+function orderDropAssignment(orderId) {
+  const target = String(orderId || "");
+  for (const truck of trucks) {
+    for (const load of truck.loads || []) {
+      if ((load.stops || []).some((stop) => stop.type === "drop" && String(stop.orderId || "") === target)) {
+        return { truck, load };
+      }
+    }
+  }
+  return {};
+}
+
+function orderLoadFinishMinutes(orderId) {
+  const { truck, load } = orderDropAssignment(orderId);
+  if (!truck || !load) return null;
+  return loadStats(truck, load).finish;
+}
+
+function orderPickupArrivalMinutes(orderId) {
+  const { truck, load } = orderDropAssignment(orderId);
+  if (!truck || !load) return null;
+  const stats = loadStats(truck, load);
+  const pickup = (stats.rows || []).find((row) => row.stop?.type === "pick" && String(row.stop?.orderId || "") === String(orderId || ""));
+  return Number.isFinite(Number(pickup?.arrival)) ? Number(pickup.arrival) : stats.start;
+}
+
+function coTimingViolation(order) {
+  if (!order?.transitCo?.id) return "";
+  const coId = order.transitCo.id;
+  const coOrder = relatedTransitCo(order);
+  const coInCurrentPlan = isOrderAssignedInCurrentPlan(coId);
+  const coPlannedDate = coInCurrentPlan ? currentPlanDate : String(coOrder?.dispatchPlanDate || "").slice(0, 10);
+  if (!coPlannedDate) return `${order.id} requires ${coId} to be planned first.`;
+  const dateCompare = comparePlanDate(coPlannedDate, currentPlanDate);
+  if (dateCompare < 0) return "";
+  if (dateCompare > 0) return `${coId} is planned on ${coPlannedDate}, after ${order.id} on ${currentPlanDate}. Plan the CO before this order.`;
+  const coFinish = orderLoadFinishMinutes(coId);
+  const sourcePickup = orderPickupArrivalMinutes(order.id);
+  if (!Number.isFinite(Number(coFinish)) || !Number.isFinite(Number(sourcePickup))) {
+    return "";
+  }
+  if (Number(coFinish) > Number(sourcePickup)) {
+    return `${coId} must finish before ${order.id} pickup. CO finishes ${timeText(coFinish)}, target pickup starts ${timeText(sourcePickup)}.`;
+  }
+  return "";
 }
 
 function modalTimeValue(value) {
@@ -1011,9 +1295,36 @@ function applyDispatchOrderFeed(feed) {
     ...orderCatalog.map((order) => normalizeOrder({ ...(byId.get(order.id) || {}), ...order })),
     ...localOrders.filter((order) => !nextIds.has(order.id)).map(normalizeOrder)
   ];
+  reconcileTransitCoSourceOrders();
   selectedOrderId = orders.find((order) => order.id === selectedOrderId)?.id || orders[0]?.id || "";
   selectedOrderIds = new Set([...selectedOrderIds].filter((id) => orders.some((order) => order.id === id)));
   if (!selectedOrderIds.size && selectedOrderId) selectedOrderIds.add(selectedOrderId);
+}
+
+function applyPlannedAssignments(assignments = []) {
+  plannedAssignmentRefs = new Set((assignments || []).map((assignment) => String(assignment.orderRef || "")).filter(Boolean));
+  const byOrderRef = new Map((assignments || []).map((assignment) => [String(assignment.orderRef || ""), assignment]));
+  const applyToOrder = (order) => {
+    const assignment = byOrderRef.get(String(order.id || ""));
+    return normalizeOrder({
+      ...order,
+      dispatchPlanned: Boolean(assignment),
+      dispatchPlanId: assignment?.dispatchPlanId || "",
+      dispatchPlanDate: assignment?.dispatchPlanDate || "",
+      dispatchTruckPlate: assignment?.dispatchTruckPlate || "",
+      dispatchLoadName: assignment?.dispatchLoadName || "",
+      dispatchParkingSpot: assignment?.dispatchParkingSpot || "",
+      childOrderDetails: (order.childOrderDetails || []).map(applyToOrder)
+    });
+  };
+  orders = orders.map(applyToOrder);
+  orderCatalog = orderCatalog.map(applyToOrder);
+}
+
+async function refreshPlannedAssignments() {
+  const response = await fetch("/api/dispatch/planned-assignments");
+  if (!response.ok) throw new Error(await response.text());
+  applyPlannedAssignments(await response.json());
 }
 
 async function loadDispatchOrders({ sync = false } = {}) {
@@ -1169,19 +1480,63 @@ function loadGoogleMaps() {
 
 function planPayload(savedAt = new Date()) {
   const assignedIds = assignedOrderIdsForTrucks(trucks);
-  const groupedChildren = groupedChildOrderIds();
+  const hiddenOrderIds = new Set([
+    ...groupedChildOrderIds(),
+    ...splitParentOrderIds()
+  ]);
   return {
     planId: currentPlan?.id || null,
     planDate: currentPlanDate,
+    baseRevision: nextPlanSaveMode === "truck_sequence" ? null : (currentPlan?.revision ?? 0),
+    saveMode: nextPlanSaveMode || "",
     savedAt: savedAt.toISOString(),
+    refreshOrderPool: Boolean(nextSaveNeedsOrderPoolRefresh),
     orders: orders
-      .filter((order) => !groupedChildren.has(order.id))
+      .filter((order) => !hiddenOrderIds.has(order.id))
       .map((order) => ({
         ...order,
         localDispatchStatus: assignedIds.has(order.id) ? "planned" : "open"
       })),
-    trucks
+    trucks: trucksWithTimingMetadata()
   };
+}
+
+function trucksWithTimingMetadata() {
+  return trucks.map((truck) => ({
+    ...truck,
+    loads: (truck.loads || []).map((load) => {
+      const stats = loadStats(truck, load);
+      const rowsByStopId = new Map((stats.rows || []).map((row) => [String(row.stop?.id || ""), row]));
+      return {
+        ...load,
+        timing: {
+          start: stats.start,
+          finish: stats.finish,
+          scheduledStart: stats.scheduledStart,
+          previousFinish: stats.previousFinish,
+          restBefore: stats.restBefore,
+          startClamped: stats.startClamped
+        },
+        stops: (load.stops || []).map((stop) => {
+          const row = rowsByStopId.get(String(stop.id || ""));
+          return {
+            ...stop,
+            timing: row
+              ? { arrival: row.arrival, depart: row.depart }
+              : { arrival: stats.start, depart: stats.start }
+          };
+        })
+      };
+    })
+  }));
+}
+
+function requestOrderPoolRefreshOnNextSave() {
+  nextSaveNeedsOrderPoolRefresh = true;
+}
+
+function requestTruckSequenceSaveOnNextSave() {
+  nextPlanSaveMode = "truck_sequence";
 }
 
 function planSummary() {
@@ -1230,6 +1585,7 @@ function summarizeLoad(load) {
     name: load.name,
     returnOnly: Boolean(load.returnOnly),
     manual: Boolean(load.manual),
+    allowTolls: Boolean(load.allowTolls),
     returnYard: load.returnYard,
     start: load.start,
     stops: (load.stops || []).map(summarizeStop)
@@ -1274,12 +1630,83 @@ function isLocalDispatchOrder(order) {
   return order?.type === "CO"
     || id.startsWith("CO-")
     || id.startsWith("GRP-")
+    || /^G[A-Z]+-/i.test(id)
     || id.startsWith("TO-DRAFT-")
     || Boolean(order?.originalOrderId);
 }
 
 function isNetSuiteDispatchOrder(order) {
   return ["SO", "PO", "TO"].includes(order?.type) && !isLocalDispatchOrder(order);
+}
+
+function supportsTransitCoForOrder(order) {
+  if (!order) return false;
+  if (["SO", "TO"].includes(order.type)) return true;
+  return (order.childOrderDetails || []).some((child) => ["SO", "TO"].includes(canonicalDispatchOrderType(child?.type, child?.id)));
+}
+
+function transitSourceOrderType(order) {
+  if (["SO", "TO"].includes(order?.type)) return order.type;
+  const child = (order?.childOrderDetails || []).find((item) => ["SO", "TO"].includes(canonicalDispatchOrderType(item?.type, item?.id)));
+  return child ? canonicalDispatchOrderType(child.type, child.id) : "";
+}
+
+function transitCoSourceRef(coOrder) {
+  const id = String(coOrder?.id || "");
+  return coOrder?.sourceOrderId
+    || coOrder?.relatedSoId
+    || coOrder?.relatedToId
+    || coOrder?.transitCo?.sourceOrderId
+    || (id.startsWith("CO-") ? id.slice(3) : "");
+}
+
+function applyTransitPickupToOrder(order, { coId, fromYard, toYard, createdAt } = {}) {
+  if (!order || !fromYard || !toYard) return order;
+  const originalPickupLocations = order.transitOriginalPickupLocations?.length
+    ? order.transitOriginalPickupLocations
+    : (order.pickupLocations || []).filter((location) => String(location) !== String(toYard));
+  order.transitOriginalPickupLocations = originalPickupLocations.length ? originalPickupLocations : [fromYard];
+  if (order.transitOriginalSourceYard === undefined) order.transitOriginalSourceYard = order.sourceYard || fromYard;
+  order.transitCo = {
+    ...(order.transitCo || {}),
+    id: coId || order.transitCo?.id || `CO-${order.id}`,
+    fromYard,
+    toYard,
+    sourceOrderId: order.id,
+    createdAt: createdAt || order.transitCo?.createdAt || new Date().toISOString()
+  };
+  order.pickupLocations = [toYard];
+  order.sourceYard = toYard;
+  order.childOrderDetails = (order.childOrderDetails || []).map((child) => {
+    const next = normalizeOrder({ ...child });
+    applyTransitPickupToOrder(next, {
+      coId: order.transitCo.id,
+      fromYard,
+      toYard,
+      createdAt: order.transitCo.createdAt
+    });
+    return next;
+  });
+  return order;
+}
+
+function reconcileTransitCoSourceOrders() {
+  for (const coOrder of orders.filter((order) => order.type === "CO")) {
+    const sourceRef = transitCoSourceRef(coOrder);
+    const sourceOrder = orderById(sourceRef);
+    if (!sourceOrder) continue;
+    const fromYard = coOrder.sourceYard || coOrder.pickupLocations?.[0] || coOrder.transitCo?.fromYard || sourceOrder.pickupLocations?.[0] || "";
+    const toYard = coOrder.destinationYard || coOrder.transitCo?.toYard || sourceOrder.transitCo?.toYard || "";
+    if (!fromYard || !toYard) continue;
+    applyTransitPickupToOrder(sourceOrder, {
+      coId: coOrder.id,
+      fromYard,
+      toYard,
+      createdAt: sourceOrder.transitCo?.createdAt || coOrder.createdAt
+    });
+    coOrder.sourceOrderId = sourceOrder.id;
+    coOrder.sourceOrderType = transitSourceOrderType(sourceOrder) || coOrder.sourceOrderType || "";
+  }
 }
 
 function shouldPreserveDuringFeedRefresh(order) {
@@ -1309,6 +1736,29 @@ function groupedChildOrderIds(orderList = orders) {
     }
   }
   return ids;
+}
+
+function splitParentOrderIds(orderList = orders) {
+  return new Set((orderList || [])
+    .map((order) => String(order?.originalOrderId || "").trim())
+    .filter(Boolean));
+}
+
+function splitSiblingsForOrder(order = {}) {
+  const originalOrderId = String(order?.originalOrderId || "").trim();
+  if (!originalOrderId) return [];
+  return orders.filter((item) => String(item?.originalOrderId || "").trim() === originalOrderId);
+}
+
+function splitOrderPlanningBlock(splits = []) {
+  const planned = (splits || []).filter((split) =>
+    isOrderAssignedInCurrentPlan(split.id)
+    || isOrderPlannedOutsideCurrentPlan(split)
+    || split.localDispatchStatus === "planned"
+    || Boolean(split.dispatchPlanned)
+  );
+  if (!planned.length) return "";
+  return `Unsplit blocked. Unplan these split orders first: ${planned.map((split) => split.id).join(", ")}.`;
 }
 
 function applySavedPlan(saved) {
@@ -1344,14 +1794,19 @@ function applySavedPlan(saved) {
     };
     return [order.id, normalizeOrder(merged)];
   }));
-  const groupedChildren = groupedChildOrderIds([...savedById.values()]);
+  const hiddenOrderIds = new Set([
+    ...groupedChildOrderIds([...savedById.values()]),
+    ...splitParentOrderIds([...savedById.values()])
+  ]);
   for (const order of orderCatalog) {
-    if (groupedChildren.has(order.id)) continue;
+    if (hiddenOrderIds.has(order.id)) continue;
     if (!savedById.has(order.id)) savedById.set(order.id, normalizeOrder(order));
   }
-  orders = [...savedById.values()];
-  const savedTruckByPlate = new Map(saved.trucks.map((truck) => [truck.plate, truck]));
-  trucks = fleet.map((vehicle, index) => makeTruckFromFleet(vehicle, index, savedTruckByPlate.get(vehicle.plate)));
+  orders = [...savedById.values()].filter((order) => !hiddenOrderIds.has(order.id));
+  trucks = trucksFromFleetAndSavedPlan(saved.trucks);
+  reconcileTransitCoSourceOrders();
+  syncPickupStops();
+  cleanupOrphanPickupStops();
   selectedOrderId = orders.find((order) => order.id === selectedOrderId)?.id || orders[0]?.id || "";
   selectedLoadId = trucks.flatMap((truck) => truck.loads).find((load) => load.id === selectedLoadId)?.id || trucks[0]?.loads[0]?.id || "";
   selectedOrderIds = new Set(selectedOrderId ? [selectedOrderId] : []);
@@ -1367,6 +1822,8 @@ async function savePlanToServer(payload) {
       currentPlan = await createPlanForDate(currentPlanDate);
     }
     const operatorAlertRefs = [...pendingOperatorAlertRefs];
+    const refreshOrderPool = Boolean(payload.refreshOrderPool);
+    const saveMode = payload.saveMode || "";
     const response = await fetch(`/api/dispatch/plans/${encodeURIComponent(currentPlan.id)}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
@@ -1375,15 +1832,71 @@ async function savePlanToServer(payload) {
         summary: planSummary(),
         audit: {
           sessionId: dispatchSessionId,
-          action: "dispatch_plan_autosaved",
-          details: { planDate: currentPlanDate, status: currentPlan?.status, operatorAlertRefs }
+          action: saveMode === "truck_sequence" ? "dispatch_plan_truck_sequence_saved" : "dispatch_plan_autosaved",
+          details: { planDate: currentPlanDate, status: currentPlan?.status, operatorAlertRefs, refreshOrderPool, saveMode }
         }
       })
     });
+    if (response.status === 409) {
+      const conflict = await response.json().catch(() => ({}));
+      if (conflict.code === "DISPATCH_ORDER_ALREADY_PLANNED") {
+        if (conflict.currentRevision !== undefined && currentPlan) {
+          currentPlan = {
+            ...currentPlan,
+            revision: Number(conflict.currentRevision || 0)
+          };
+        }
+        const details = (conflict.conflicts || [])
+          .slice(0, 4)
+          .map((item) => `${item.orderRef} on ${displayDate(item.planDate)}`)
+          .join(", ");
+        localPlanDirty = true;
+        routeNotice = `Cannot save: order already planned on another date${details ? ` (${details})` : "."}`;
+        render({ save: false });
+        return;
+      }
+      if (conflict.code === "DISPATCH_CO_SEQUENCE_INVALID") {
+        localPlanDirty = true;
+        routeNotice = conflict.error || "CO must be planned before the original order pickup.";
+        render({ save: false });
+        return;
+      }
+      if (conflict.currentRevision !== undefined && currentPlan) {
+        currentPlan = {
+          ...currentPlan,
+          revision: Number(conflict.currentRevision || 0)
+        };
+      }
+      localPlanDirty = true;
+      blockedRemotePlanUpdate = true;
+      routeNotice = "Plan changed on another screen. Your current changes are still visible but were not saved. Review before continuing.";
+      render({ save: false });
+      return;
+    }
     if (!response.ok) return;
     const result = await response.json();
     currentPlan = result;
     lastServerSavedAt = result.savedAt || payload.savedAt;
+    if (result.noChange) {
+      if (refreshOrderPool) nextSaveNeedsOrderPoolRefresh = false;
+      if (saveMode === "truck_sequence") nextPlanSaveMode = "";
+      clearLocalPlanDirty(payload.savedAt);
+      return;
+    }
+    const refreshAfterSave = saveMode === "truck_sequence"
+      ? Promise.resolve().then(() => {
+          isApplyingRemotePlan = true;
+          applySavedPlan(result);
+          resetUndoHistory();
+          isApplyingRemotePlan = false;
+        })
+      : refreshOrderPool
+        ? loadDispatchOrders().then(() => restoreServerPlan())
+        : refreshPlannedAssignments();
+    refreshAfterSave.then(() => render({ save: false })).catch(() => null);
+    if (refreshOrderPool) nextSaveNeedsOrderPoolRefresh = false;
+    if (saveMode === "truck_sequence") nextPlanSaveMode = "";
+    clearLocalPlanDirty(payload.savedAt);
     operatorAlertRefs.forEach((ref) => pendingOperatorAlertRefs.delete(ref));
   } catch {
     // Local storage keeps the latest draft if the server is temporarily unavailable.
@@ -1455,9 +1968,9 @@ function captureUndoPointIfNeeded(save) {
     historyCurrentState = serialized;
     historyCurrentSnapshot = cloneHistoryValue(snapshot);
     historyReady = true;
-    return;
+    return false;
   }
-  if (serialized === historyCurrentState) return;
+  if (serialized === historyCurrentState) return false;
   if (save && !isApplyingHistory && !isApplyingRemotePlan) {
     undoStack.push(cloneHistoryValue(historyCurrentSnapshot || snapshot));
     if (undoStack.length > HISTORY_LIMIT) undoStack.shift();
@@ -1465,6 +1978,29 @@ function captureUndoPointIfNeeded(save) {
   }
   historyCurrentState = serialized;
   historyCurrentSnapshot = cloneHistoryValue(snapshot);
+  return true;
+}
+
+function markLocalPlanDirty() {
+  if (isApplyingHistory || isApplyingRemotePlan) return;
+  localPlanDirty = true;
+  lastLocalPlanEditAt = new Date().toISOString();
+}
+
+function clearLocalPlanDirty(savedAt = "") {
+  if (savedAt && lastLocalPlanEditAt && new Date(savedAt) < new Date(lastLocalPlanEditAt)) return;
+  localPlanDirty = false;
+  lastLocalPlanEditAt = "";
+  if (blockedRemotePlanUpdate) {
+    routeNotice = "Your changes were saved. A remote plan update was held back while you were editing.";
+    blockedRemotePlanUpdate = false;
+  }
+}
+
+function resetLocalPlanDirty() {
+  localPlanDirty = false;
+  lastLocalPlanEditAt = "";
+  blockedRemotePlanUpdate = false;
 }
 
 function undoDispatchChange() {
@@ -1588,6 +2124,7 @@ async function resetDispatchAfterOrderDataClear() {
   currentPlan = null;
   lastSavedAt = "";
   lastServerSavedAt = "";
+  resetLocalPlanDirty();
   selectedLoadId = "";
   selectedOrderId = "";
   selectedOrderIds = new Set();
@@ -1620,6 +2157,7 @@ async function loadPlanForDate(planDate = currentPlanDate, { createIfMissing = t
     lastServerSavedAt = currentPlan.savedAt || currentPlan.updatedAt || lastServerSavedAt;
     await loadDriverJobStatuses();
     resetUndoHistory();
+    resetLocalPlanDirty();
     return { loaded: true, created, hasSnapshot: true };
   }
   if (currentPlan?.id) {
@@ -1627,6 +2165,7 @@ async function loadPlanForDate(planDate = currentPlanDate, { createIfMissing = t
     lastServerSavedAt = currentPlan.savedAt || currentPlan.updatedAt || lastServerSavedAt;
     await loadDriverJobStatuses();
     resetUndoHistory();
+    resetLocalPlanDirty();
     return { loaded: true, created, hasSnapshot: false };
   }
   return { loaded: false, created, hasSnapshot: false };
@@ -1644,12 +2183,18 @@ async function loadPlanById(planId) {
   await loadPlanHistory();
   await loadDriverJobStatuses();
   resetUndoHistory();
+  resetLocalPlanDirty();
   return plan;
 }
 
 async function restoreServerPlan() {
   try {
     if (!currentPlan?.id) return false;
+    if (localPlanDirty) {
+      blockedRemotePlanUpdate = true;
+      routeNotice = "Plan updated on another screen. Your unsaved changes were kept.";
+      return false;
+    }
     const response = await fetch(`/api/dispatch/plans/${encodeURIComponent(currentPlan?.id || "")}`);
     if (!response.ok) return false;
     const saved = await response.json();
@@ -1674,13 +2219,13 @@ async function pollServerPlan() {
   if (applied) render({ save: false });
 }
 
-function queueRemoteRefresh(reason = "Plan updated from another screen.") {
+function queueRemoteRefresh(reason = "Plan updated from another screen.", { reloadOrders = true } = {}) {
   window.clearTimeout(remoteRefreshTimer);
   remoteRefreshTimer = window.setTimeout(async () => {
     try {
-      await loadDispatchOrders();
-      await loadDriverJobStatuses();
+      if (reloadOrders) await loadDispatchOrders();
       const applied = await restoreServerPlan();
+      if (!reloadOrders) await refreshPlannedAssignments();
       if (reason) routeNotice = reason;
       render({ save: false });
       if (applied && reason) routeNotice = reason;
@@ -1715,7 +2260,31 @@ function connectEvents() {
 
     if (["dispatch.plan.saved", "dispatch.plan.confirmed", "dispatch.plan.reopened"].includes(event.type)) {
       if (payload.planDate && payload.planDate !== currentPlanDate) return;
-      queueRemoteRefresh("Dispatch plan updated.");
+      if (localPlanDirty) {
+        blockedRemotePlanUpdate = true;
+        routeNotice = "Plan updated on another screen. Your unsaved changes were kept.";
+        render({ save: false });
+        return;
+      }
+      queueRemoteRefresh("Dispatch plan updated.", { reloadOrders: payload.refreshOrderPool === true });
+      return;
+    }
+
+    if (event.type === "dispatch.setup.updated") {
+      window.clearTimeout(remoteRefreshTimer);
+      remoteRefreshTimer = window.setTimeout(async () => {
+        try {
+          await loadDispatchSetup();
+          if (currentPlan?.orders?.length && currentPlan?.trucks?.length) applySavedPlan(currentPlan);
+          routeCache = {};
+          routeEstimates = {};
+          routeNotice = "Dispatch setup updated.";
+          render({ save: false });
+        } catch (error) {
+          routeNotice = `Setup refresh failed: ${error.message}`;
+          render({ save: false });
+        }
+      }, 350);
       return;
     }
 
@@ -1755,23 +2324,85 @@ function allAssignedOrderIds() {
 }
 
 function orderAssignment(orderId) {
+  const target = String(orderId || "");
+  const matchesOrderRef = (order) => {
+    if (!order || !target) return false;
+    if (String(order.id || "") === target) return true;
+    if (String(order.originalOrderId || "") === target) return true;
+    if ((order.childOrders || []).map(String).includes(target)) return true;
+    return (order.childOrderDetails || []).some((child) =>
+      String(child?.id || "") === target || String(child?.originalOrderId || "") === target
+    );
+  };
   for (const truck of trucks) {
     for (const load of truck.loads || []) {
-      if ((load.stops || []).some((stop) => stop.orderId === orderId)) {
-        return { truck, load };
+      for (const stop of load.stops || []) {
+        const order = orderById(stop.orderId);
+        if (String(stop.orderId || "") === target || matchesOrderRef(order)) {
+          return { truck, load, orderId: stop.orderId };
+        }
       }
     }
   }
   return {};
 }
 
+function isOrderAssignedInCurrentPlan(orderId) {
+  return allAssignedOrderIds().has(String(orderId || ""));
+}
+
+function isOrderPlannedOnAnotherDate(order = {}) {
+  if (!order?.dispatchPlanned) return false;
+  if (isOrderAssignedInCurrentPlan(order.id)) return false;
+  const plannedDate = String(order.dispatchPlanDate || "").slice(0, 10);
+  return plannedDate && plannedDate !== String(currentPlanDate || "").slice(0, 10);
+}
+
+function isOrderPlannedOutsideCurrentPlan(order = {}) {
+  return Boolean(order?.dispatchPlanned && !isOrderAssignedInCurrentPlan(order.id));
+}
+
+function orderPlannedElsewhereText(order = {}) {
+  const parts = [
+    order.dispatchPlanDate ? `planned on ${order.dispatchPlanDate}` : "already planned",
+    [order.dispatchTruckPlate, order.dispatchLoadName].filter(Boolean).join(" ")
+  ].filter(Boolean);
+  return parts.join(" | ");
+}
+
+async function jumpToPlannedOrder(orderId) {
+  const order = orderById(orderId);
+  const targetDate = String(order?.dispatchPlanDate || "").slice(0, 10);
+  if (!order || !targetDate) return false;
+  routeNotice = `Loading ${targetDate} plan for ${order.id}...`;
+  render({ save: false });
+  await loadPlanForDate(targetDate, { createIfMissing: false });
+  const assignment = orderAssignment(order.id);
+  if (!assignment.load) {
+    routeNotice = `${order.id} is marked planned on ${targetDate}, but the load was not found.`;
+    render({ save: false });
+    return false;
+  }
+  selectedOrderId = assignment.orderId || order.id;
+  selectedOrderIds = new Set([selectedOrderId]);
+  selectedLoadId = assignment.load.id;
+  loadPreviewOpen = true;
+  routeNotice = `${order.id} is planned on ${assignment.truck?.plate || "truck"} ${assignment.load.name}.`;
+  render({ save: false });
+  return true;
+}
+
 function openOrders() {
   const assigned = allAssignedOrderIds();
-  const groupedChildren = groupedChildOrderIds();
+  const hiddenOrderIds = new Set([
+    ...groupedChildOrderIds(),
+    ...splitParentOrderIds()
+  ]);
   const term = searchText.trim();
   return orders.filter((order) => {
-    if (groupedChildren.has(order.id)) return false;
+    if (hiddenOrderIds.has(order.id)) return false;
     if (!term && assigned.has(order.id)) return false;
+    if (!term && isOrderPlannedOutsideCurrentPlan(order)) return false;
     if (!matchesSearch(order)) return false;
     if (dispatchDateFilter && order.type === "SO" && order.expectedDeliveryDate !== dispatchDateFilter) return false;
     return term ? true : order.type === activeOrderType;
@@ -1877,7 +2508,7 @@ function routeLegMinutesForLoad(load) {
   return Array.isArray(estimate?.legMinutes) ? estimate.legMinutes : [];
 }
 
-function fallbackTravelMinutesBetweenStops(previousStop, currentStop, previousOrder, currentOrder) {
+function fallbackTravelMinutesBetweenStops(truck, previousStop, currentStop, previousOrder, currentOrder) {
   if (!previousStop) return 0;
   const previousLocation = previousStop.type === "pick"
     ? previousStop.location
@@ -1885,16 +2516,23 @@ function fallbackTravelMinutesBetweenStops(previousStop, currentStop, previousOr
   const currentLocation = currentStop.type === "pick"
     ? currentStop.location
     : currentOrder?.destinationYard || currentOrder?.address || "";
-  if (HUBS[previousLocation] && HUBS[currentLocation]) return yardTravelMinutes(previousLocation, currentLocation);
-  if (currentStop.type === "drop") return Number(currentOrder?.travelMinutes || 30);
-  return Number(previousOrder?.travelMinutes || currentOrder?.travelMinutes || 30);
+  let value = 30;
+  if (HUBS[previousLocation] && HUBS[currentLocation]) value = yardTravelMinutes(previousLocation, currentLocation);
+  else if (currentStop.type === "drop") value = Number(currentOrder?.travelMinutes || 30);
+  else value = Number(previousOrder?.travelMinutes || currentOrder?.travelMinutes || 30);
+  return adjustedTravelMinutesForTruck(truck, value);
 }
 
 function loadStats(truck, load) {
-  const start = loadStartMinutes(truck, load);
+  const startInfo = loadStartInfo(truck, load);
+  const start = startInfo.start;
+  const startWarnings = [];
+  if (startInfo.startClamped) {
+    startWarnings.push(`Load start ${timeText(startInfo.scheduledStart)} is before previous load finishes ${timeText(startInfo.previousFinish)}. Start was moved to ${timeText(start)}.`);
+  }
   if (load.returnOnly) {
     const estimate = routeEstimates[load.id];
-    const totalMinutes = Number(estimate?.totalMinutes || load.returnMinutes || 30);
+    const totalMinutes = Number(estimate?.totalMinutes || adjustedTravelMinutesForTruck(truck, load.returnMinutes || 30));
     return {
       rows: [],
       palletTotal: 0,
@@ -1904,10 +2542,14 @@ function loadStats(truck, load) {
       start,
       finish: start + totalMinutes,
       returnTrip: totalMinutes,
-      warningCount: 0,
-      warnings: [],
+      warningCount: startWarnings.length,
+      warnings: startWarnings,
       capacityWarning: false,
-      fullLoad: false
+      fullLoad: false,
+      restBefore: startInfo.restBefore,
+      previousFinish: startInfo.previousFinish,
+      scheduledStart: startInfo.scheduledStart,
+      startClamped: startInfo.startClamped
     };
   }
   let current = start;
@@ -1916,7 +2558,7 @@ function loadStats(truck, load) {
   const routeLegMinutes = routeLegMinutesForLoad(load);
   let routeLegIndex = 0;
   if (startTravel) {
-    const startTravelMinutes = Number(routeLegMinutes[routeLegIndex] ?? startTravel.minutes);
+    const startTravelMinutes = Number(routeLegMinutes[routeLegIndex] ?? adjustedTravelMinutesForTruck(truck, startTravel.minutes));
     resolvedStartTravel = { ...startTravel, minutes: startTravelMinutes };
     current += startTravelMinutes;
     routeLegIndex += 1;
@@ -1928,8 +2570,8 @@ function loadStats(truck, load) {
   let currentWeightLbs = 0;
   let peakWeightLbs = 0;
   let travelTotal = 0;
-  let warningCount = 0;
-  const warnings = [];
+  let warningCount = startWarnings.length;
+  const warnings = [...startWarnings];
   const sequenceWarnings = sequenceWarningsForStops(load.stops);
   const pickedLocations = new Set();
   const onboardOrderIds = new Set();
@@ -1955,7 +2597,7 @@ function loadStats(truck, load) {
     const order = stopOrder(stop);
     if (!order) continue;
     if (previousStop) {
-      current += Number(routeLegMinutes[routeLegIndex] ?? fallbackTravelMinutesBetweenStops(previousStop, stop, previousOrder, order));
+      current += Number(routeLegMinutes[routeLegIndex] ?? fallbackTravelMinutesBetweenStops(truck, previousStop, stop, previousOrder, order));
       routeLegIndex += 1;
     }
     if (stop.type === "pick") {
@@ -2031,7 +2673,26 @@ function loadStats(truck, load) {
     warningCount += 1;
     warnings.push(`Over capacity: ${formatLbs(weightTotalLbs)} peak onboard, truck capacity ${formatLbs(capacityLbs)}`);
   }
-  return { rows, startTravel: resolvedStartTravel, palletTotal, footprintTotal, weightTotalLbs, processedWeightLbs, capacityLbs, start, finish: current, returnTrip, warningCount, warnings, capacityWarning, fullLoad };
+  return {
+    rows,
+    startTravel: resolvedStartTravel,
+    palletTotal,
+    footprintTotal,
+    weightTotalLbs,
+    processedWeightLbs,
+    capacityLbs,
+    start,
+    finish: current,
+    returnTrip,
+    warningCount,
+    warnings,
+    capacityWarning,
+    fullLoad,
+    restBefore: startInfo.restBefore,
+    previousFinish: startInfo.previousFinish,
+    scheduledStart: startInfo.scheduledStart,
+    startClamped: startInfo.startClamped
+  };
 }
 
 function boardStats() {
@@ -2168,10 +2829,27 @@ function addReturnLoadToTruck(truck, insertIndex = truck?.loads?.length || 0) {
 }
 
 function loadStartMinutes(truck, load) {
+  return loadStartInfo(truck, load).start;
+}
+
+function loadStartInfo(truck, load) {
   const index = loadIndexInTruck(truck, load);
-  if (index <= 0) return minutes(load?.start || truck?.start || "08:00");
+  if (index <= 0) {
+    const start = minutes(load?.start || truck?.start || "08:00");
+    return { start, scheduledStart: start, previousFinish: null, restBefore: 0, startClamped: false };
+  }
   const previous = truck.loads[index - 1];
-  return loadStats(truck, previous).finish;
+  const previousFinish = loadStats(truck, previous).finish;
+  const hasManualStart = Boolean(String(load?.start || "").trim());
+  const scheduledStart = hasManualStart ? minutes(load.start) : previousFinish;
+  const start = Math.max(previousFinish, scheduledStart);
+  return {
+    start,
+    scheduledStart,
+    previousFinish,
+    restBefore: Math.max(0, scheduledStart - previousFinish),
+    startClamped: hasManualStart && scheduledStart < previousFinish
+  };
 }
 
 function startPointAfterLoad(truck, load) {
@@ -2616,6 +3294,35 @@ async function geocodeMarkerStops(markerStops = []) {
   }));
 }
 
+function routeEstimateFromGoogleLegs(load, stops, legs = [], truck = {}) {
+  const rawLegMinutes = legs.map((leg) => Math.max(1, Math.round(Number((leg.duration_in_traffic || leg.duration)?.value || 0) / 60)));
+  const legMinutes = rawLegMinutes.map((value) => adjustedTravelMinutesForTruck(truck, value));
+  const rawDriveMinutes = rawLegMinutes.reduce((sum, value) => sum + value, 0);
+  const driveMinutes = legMinutes.reduce((sum, value) => sum + value, 0);
+  const stayMinutes = stops.reduce((sum, stop) => sum + Number(stop.stayMinutes || 0), 0);
+  const totalMinutes = driveMinutes + stayMinutes;
+  const estimate = {
+    rawDriveMinutes,
+    driveMinutes,
+    stayMinutes,
+    totalMinutes,
+    legMinutes,
+    rawLegMinutes,
+    allowTolls: Boolean(load?.allowTolls),
+    travelTimePercent: truckTravelTimePercent(truck)
+  };
+  routeEstimates[load.id] = estimate;
+  return estimate;
+}
+
+function routeEstimateSummaryHtml(estimate, truck, suffix = "") {
+  const adjustment = truckTravelTimePercent(truck) > 0
+    ? ` | Google ${durationText(estimate.rawDriveMinutes)} +${truckTravelTimePercent(truck)}%`
+    : "";
+  const tollText = estimate.allowTolls ? " | tolls allowed" : " | avoiding tolls";
+  return `<strong>${durationText(estimate.totalMinutes)} total</strong><span>${durationText(estimate.driveMinutes)} drive + ${durationText(estimate.stayMinutes)} stop time${adjustment}${tollText}${suffix}</span>`;
+}
+
 async function renderGoogleMapPreview() {
   const canvas = document.getElementById("googleMapPreview");
   if (!canvas) return;
@@ -2627,7 +3334,8 @@ async function renderGoogleMapPreview() {
   const { truck, load } = selectedLoad();
   const stops = mapStopsForLoad(load, truck);
   const loadStart = loadStats(truck, load).start;
-  const signature = `${routeSignature(stops)}@${loadStart}`;
+  const allowTolls = Boolean(load?.allowTolls);
+  const signature = `${routeSignature(stops)}@${loadStart}@tolls:${allowTolls ? "allow" : "avoid"}`;
   const map = new google.maps.Map(canvas, {
     center: stops[0] || MAP_CENTER,
     zoom: 9,
@@ -2668,9 +3376,19 @@ async function renderGoogleMapPreview() {
     if (cached?.signature === signature && cached.result) {
       directionsRenderer.setDirections(cached.result);
       drawStopMarkers(cached.markerStops || stops);
-      if (routeSummary && routeEstimates[load.id]) {
-        const estimate = routeEstimates[load.id];
-        routeSummary.innerHTML = `<strong>${durationText(estimate.totalMinutes)} total</strong><span>${durationText(estimate.driveMinutes)} drive + ${durationText(estimate.stayMinutes)} stop time | cached route</span>`;
+      const legs = cached.result.routes?.[0]?.legs || [];
+      const previousEstimate = routeEstimates[load.id];
+      const estimate = routeEstimateFromGoogleLegs(load, stops, legs, truck);
+      if (routeSummary) {
+        routeSummary.innerHTML = routeEstimateSummaryHtml(estimate, truck, " | cached route");
+      }
+      if (
+        selectedLoadId === load.id
+        && (!previousEstimate
+          || previousEstimate.totalMinutes !== estimate.totalMinutes
+          || previousEstimate.travelTimePercent !== estimate.travelTimePercent)
+      ) {
+        setTimeout(() => render({ save: false }), 0);
       }
       return;
     }
@@ -2680,6 +3398,7 @@ async function renderGoogleMapPreview() {
       destination: stopRouteLocation(stops[stops.length - 1]),
       waypoints: stops.slice(1, -1).map((stop) => ({ location: stopRouteLocation(stop), stopover: true })),
       travelMode: google.maps.TravelMode.DRIVING,
+      avoidTolls: !allowTolls,
       optimizeWaypoints: false,
       drivingOptions: {
         departureTime: plannedDepartureDate(loadStart),
@@ -2711,15 +3430,10 @@ async function renderGoogleMapPreview() {
         return routePoint ? { ...stop, lat: routePoint.lat(), lng: routePoint.lng() } : stop;
       });
       drawStopMarkers(routeMarkerStops);
-      const driveSeconds = legs.reduce((sum, leg) => sum + Number((leg.duration_in_traffic || leg.duration)?.value || 0), 0);
-      const driveMinutes = Math.round(driveSeconds / 60);
-      const legMinutes = legs.map((leg) => Math.max(1, Math.round(Number((leg.duration_in_traffic || leg.duration)?.value || 0) / 60)));
-      const stayMinutes = stops.reduce((sum, stop) => sum + Number(stop.stayMinutes || 0), 0);
-      const totalMinutes = driveMinutes + stayMinutes;
-      routeEstimates[load.id] = { driveMinutes, stayMinutes, totalMinutes, legMinutes };
+      const estimate = routeEstimateFromGoogleLegs(load, stops, legs, truck);
       routeCache[load.id] = { signature, result, markerStops: routeMarkerStops };
       if (routeSummary) {
-        routeSummary.innerHTML = `<strong>${durationText(totalMinutes)} total</strong><span>${durationText(driveMinutes)} drive + ${durationText(stayMinutes)} stop time</span>`;
+        routeSummary.innerHTML = routeEstimateSummaryHtml(estimate, truck);
       }
       if (selectedLoadId === load.id) setTimeout(() => render({ save: false }), 0);
     });
@@ -2809,8 +3523,11 @@ function render(options = {}) {
   cleanupOrphanPickupStops();
   syncPickupStops();
   syncReturnLoads();
-  captureUndoPointIfNeeded(save);
-  if (save) autoSavePlan();
+  const planChanged = captureUndoPointIfNeeded(save);
+  if (save && planChanged) {
+    markLocalPlanDirty();
+    autoSavePlan();
+  }
   const stats = boardStats();
   app.innerHTML = `
     <section class="dispatch-shell">
@@ -2833,7 +3550,7 @@ function render(options = {}) {
           <button data-action="export-shipped-csv" ${currentPlan?.id ? "" : "disabled"} type="button">${t("dispatch.exportShippedCsv", "Export Shipped CSV")}</button>
           <button class="primary" data-action="confirm-plan" ${currentPlan?.id ? "" : "disabled"} type="button">${t("dispatch.confirmPlan", "Confirm Plan")}</button>
           <button data-action="refresh-orders" type="button">${t("dispatch.refreshOrders", "Refresh Orders")}</button>
-          <span class="autosave-pill">${t("dispatch.saved", "Saved")} ${lastSavedAt}</span>
+          <span class="autosave-pill">${localPlanDirty ? "Saving..." : t("dispatch.saved", "Saved")} ${lastSavedAt}</span>
         </div>
       </header>
       ${routeNotice ? `<div class="route-notice"><span>${escapeHtml(routeNotice)}</span><button data-action="close-route-notice" type="button">x</button></div>` : ""}
@@ -2902,7 +3619,6 @@ function refreshOrderPoolForSearch() {
   if (subtitle) subtitle.textContent = searching ? "Search results across SO, PO, TO, and CO." : `${orderTypeLabel(activeOrderType)} list`;
   tabs?.forEach((button) => button.classList.toggle("active", !searching && activeOrderType === button.dataset.type));
   if (list) list.innerHTML = renderOrderList();
-  autoSavePlan();
 }
 
 function renderSelectedOrderActions() {
@@ -2911,14 +3627,18 @@ function renderSelectedOrderActions() {
   const selected = selectedOrders();
   const label = selected.length > 1 ? `${selected.length} selected` : order.id;
   const groupedCount = order.childOrders?.length || 0;
+  const reviewOnly = selected.some((item) => isReviewOnlyOrder(item));
+  const blockedUngroup = groupedCount && groupedOrderTransitCoId(order);
   return `
     <div class="selected-order-actions">
       <span>${escapeHtml(label)}</span>
-      ${groupedCount ? `<button data-action="ungroup-order" data-order="${order.id}" type="button">Ungroup</button>` : selected.length > 1 ? `<button data-action="open-group-modal" data-order="${order.id}" type="button">Group</button>` : ""}
-      ${order.type === "PO" ? `<button data-action="open-po-yard-modal" data-order="${order.id}" type="button">Set Yard</button>` : ""}
-      ${order.type === "SO" ? `<button data-action="open-po-link-modal" data-order="${order.id}" type="button">Link PO</button>` : ""}
-      ${order.type !== "CO" ? `<button data-action="open-split-modal" data-order="${order.id}" type="button">Split</button>` : ""}
-      ${canConsolidatePick(order) ? `<button data-action="open-consolidate-modal" data-order="${order.id}" type="button">Consolidate Pick</button>` : ""}
+      ${reviewOnly ? `<span>Loaded/shipped history</span>` : groupedCount ? `<button data-action="ungroup-order" data-order="${order.id}" ${blockedUngroup ? `disabled title="Cancel ${escapeHtml(blockedUngroup)} before ungrouping"` : ""} type="button">Ungroup</button>` : selected.length > 1 ? `<button data-action="open-group-modal" data-order="${order.id}" type="button">Group</button>` : ""}
+      ${blockedUngroup ? `<span>Cancel ${escapeHtml(blockedUngroup)} before ungrouping</span>` : ""}
+      ${!reviewOnly && order.type === "PO" ? `<button data-action="open-po-yard-modal" data-order="${order.id}" type="button">Set Yard</button>` : ""}
+      ${!reviewOnly && order.type === "SO" ? `<button data-action="open-po-link-modal" data-order="${order.id}" type="button">Link PO</button>` : ""}
+      ${!reviewOnly && order.type !== "CO" && !order.originalOrderId ? `<button data-action="open-split-modal" data-order="${order.id}" type="button">Split</button>` : ""}
+      ${!reviewOnly && order.originalOrderId ? `<button data-action="unsplit-order" data-order="${order.id}" type="button">Unsplit</button>` : ""}
+      ${!reviewOnly && canConsolidatePick(order) ? `<button data-action="open-consolidate-modal" data-order="${order.id}" type="button">Consolidate Pick</button>` : ""}
     </div>
   `;
 }
@@ -2930,22 +3650,29 @@ function renderOrderCard(order) {
   const missingAddress = !hasUsableDispatchAddress(order);
   const transitMessage = transitBlockMessage(order);
   const transitBlocked = Boolean(transitMessage);
-  const dateText = order.expectedDeliveryDate ? `${order.expectedDeliveryDate} | ` : "";
+  const dateText = order.expectedDeliveryDate ? `${displayDate(order.expectedDeliveryDate)} | ` : "";
   const assignment = orderAssignment(order.id);
   const planned = Boolean(assignment.load);
+  const plannedElsewhere = isOrderPlannedOutsideCurrentPlan(order);
+  const anyPlanned = planned || plannedElsewhere;
+  const reviewOnly = isReviewOnlyOrder(order);
   const packedText = packedUnitText(order);
   const executionStatus = orderExecutionStatus(order.id);
+  const plannedText = planned
+    ? `${assignment.truck?.plate || ""} ${assignment.load?.name || "Planned"}`
+    : orderPlannedElsewhereText(order);
   return `
-    <article class="order-card status-${executionStatus} ${selectedOrderIds.has(order.id) ? "selected" : ""} ${planned ? "planned" : ""} ${missingAddress || transitBlocked ? "warning" : ""}" draggable="${planned ? "false" : "true"}" data-order="${order.id}" data-planned="${planned ? "true" : "false"}">
+    <article class="order-card status-${executionStatus} ${selectedOrderIds.has(order.id) ? "selected" : ""} ${planned ? "planned" : ""} ${plannedElsewhere ? "planned-elsewhere" : ""} ${reviewOnly ? "review-only" : ""} ${missingAddress || transitBlocked ? "warning" : ""}" draggable="${anyPlanned ? "false" : "true"}" data-order="${order.id}" data-planned="${anyPlanned ? "true" : "false"}" data-review-only="${reviewOnly ? "true" : "false"}" data-planned-elsewhere="${plannedElsewhere ? "true" : "false"}">
       <strong>${order.id} | ${escapeHtml(order.customer)}</strong>
-      <span>${missingAddress ? "Missing delivery address" : transitBlocked ? escapeHtml(transitMessage) : escapeHtml(movementText(order))}</span>
+      <span>${plannedElsewhere ? escapeHtml(orderPlannedElsewhereText(order)) : missingAddress ? "Missing delivery address" : transitBlocked ? escapeHtml(transitMessage) : escapeHtml(movementText(order))}</span>
       <span class="order-compact-line">Pickup ${escapeHtml(orderPickupText(order))} | ${dateText}${order.windowStart || "--"}-${order.windowEnd || "--"}</span>
       <span class="order-compact-line">${orderUnitText(order)} | ${orderFootprintPallets(order)} pos | ${formatLbs(orderWeightLbs(order))}${packedText ? ` | Packed ${escapeHtml(packedText)}` : ""}</span>
       ${groupedCount ? `<span>Includes ${order.childOrders.join(", ")}</span>` : ""}
       <div class="chip-row">
         <span class="chip">${order.type}</span>
         ${executionStatus === "complete" ? `<span class="chip complete-chip">Completed</span>` : executionStatus === "in_progress" ? `<span class="chip progress-chip">In progress</span>` : ""}
-        ${planned ? `<span class="chip planned-chip">${escapeHtml(assignment.truck?.plate || "")} ${escapeHtml(assignment.load?.name || "Planned")}</span>` : ""}
+        ${reviewOnly ? `<span class="chip complete-chip">${escapeHtml(reviewOnlyText(order))}</span>` : ""}
+        ${anyPlanned ? `<span class="chip planned-chip">${escapeHtml(plannedText)}</span>` : ""}
         ${missingAddress ? `<span class="chip warn">Update address</span>` : ""}
         ${order.netsuiteFeedMissing ? `<span class="chip warn">NetSuite status changed</span>` : ""}
         ${order.transitCo ? `<span class="chip ${transitBlocked ? "warn" : ""}">CO ${escapeHtml(order.transitCo.id)}</span>` : ""}
@@ -2961,17 +3688,21 @@ function renderOrderCard(order) {
   `;
 }
 
-function renderTruck(truck) {
+function renderTruck(truck, index = 0) {
   const selectedDriver = truckDriver(truck);
   const hasDriver = truckHasDriver(truck);
   const selectedOnTruck = truck.loads.some((load) => load.id === selectedLoadId);
   const insertText = selectedOnTruck ? "Insert after selected load" : "Add to end";
   return `
     <article class="truck-row ${hasDriver ? "" : "driver-missing"}">
+      <div class="truck-sequence-controls">
+        <button data-action="move-truck-up" data-truck="${truck.id}" ${index <= 0 ? "disabled" : ""} title="Move truck up" type="button">▲</button>
+        <button data-action="move-truck-down" data-truck="${truck.id}" ${index >= trucks.length - 1 ? "disabled" : ""} title="Move truck down" type="button">▼</button>
+      </div>
       <div class="truck-label">
         <div>
           <strong>${truck.plate}</strong>
-          <span>${formatLbs(truckCapacityLbs(truck))} cap.</span>
+          <span>${formatLbs(truckCapacityLbs(truck))} cap. | ${escapeHtml(travelAdjustmentText(truck))}</span>
           <label class="truck-start-yard">
             <span>Driver</span>
             <select data-truck-driver="${truck.id}">${driverOptions(driverKey(selectedDriver) || truck.driverLogin || "", truck.id)}</select>
@@ -3020,7 +3751,10 @@ function renderLoad(truck, load) {
             <select data-return-yard="${load.id}">${yardOptions(load.returnYard || "12441")}</select>
           </label>
         </div>
-        <div class="stop-list"><div class="empty-drop return-helper">Return from previous load last stop</div></div>
+        <div class="stop-list">
+          ${renderRestStop(stats)}
+          <div class="empty-drop return-helper">Return from previous load last stop</div>
+        </div>
       </section>
     `;
   }
@@ -3039,10 +3773,24 @@ function renderLoad(truck, load) {
         </div>
       </div>
       <div class="stop-list" data-load="${load.id}">
+        ${renderRestStop(stats)}
         ${renderStartTravelStop(truck, load, stats.startTravel, stats.start)}
         ${load.stops.map((stop, index) => renderStop(truck, load, stop, index, stats.rows[index])).join("") || `<div class="empty-drop">Drop order here</div>`}
       </div>
     </section>
+  `;
+}
+
+function renderRestStop(stats) {
+  if (!Number(stats?.restBefore || 0)) return "";
+  return `
+    <article class="stop-card compact rest-stop">
+      <div class="stop-main">
+        <strong>Rest / Wait</strong>
+        <span>Gap before next load</span>
+      </div>
+      <div class="stop-time"><span>${timeText(stats.previousFinish)}</span><span>${durationText(stats.restBefore)}</span></div>
+    </article>
   `;
 }
 
@@ -3084,11 +3832,16 @@ function renderLoadPreview() {
   const { truck, load } = selectedLoad();
   if (!truck || !load) return "";
   const stats = loadStats(truck, load);
-  const isFirstLoad = loadIndexInTruck(truck, load) <= 0;
   const isLocked = load.returnOnly ? false : loadHasDriverActivity(load);
   const firstOrder = load.stops.map(stopOrder).find(Boolean);
   const pickupLocations = load.stops.length ? uniquePickupLocations(load, truck) : [];
   const pickupPoint = pickupLocations.join(", ") || firstOrder?.pickupLocations?.[0] || truck.base;
+  const restOffset = stats.restBefore ? 1 : 0;
+  const travelOffset = stats.startTravel ? 1 : 0;
+  const stopOffset = restOffset + travelOffset;
+  const sequenceHtml = load.returnOnly
+    ? renderReturnPreviewStops(load, truck, stats)
+    : `${renderPreviewRestStop(stats)}${renderPreviewStartTravelStop(truck, load, stats.startTravel, stats.start, restOffset)}${load.stops.map((stop, index) => renderPreviewStop(truck, load, stop, index, stats.rows[index], index + stopOffset)).join("")}`;
   return `
     <aside class="load-preview-panel" style="width:${Math.min(Math.max(loadPreviewWidth, 390), Math.round(window.innerWidth * 0.92))}px">
       <div class="load-preview-resize" title="Drag to resize"></div>
@@ -3107,7 +3860,7 @@ function renderLoadPreview() {
             <span>Drag stops to reorder. Multiple pick/drop is allowed.</span>
           </div>
           <div class="preview-stop-list ${sequenceCollapsed ? "collapsed" : ""}" data-load="${load.id}">
-            ${load.returnOnly ? renderReturnPreviewStops(load, truck, stats) : `${renderPreviewStartTravelStop(truck, load, stats.startTravel, stats.start)}${load.stops.map((stop, index) => renderPreviewStop(truck, load, stop, index, stats.rows[index], index + (stats.startTravel ? 1 : 0))).join("")}` || `<div class="empty-drop">No assigned orders yet.</div>`}
+            ${sequenceHtml || `<div class="empty-drop">No assigned orders yet.</div>`}
           </div>
         </section>
         <section class="preview-section">
@@ -3120,10 +3873,9 @@ function renderLoadPreview() {
         <section class="preview-section">
           <div class="preview-section-title"><strong>Load Details</strong></div>
           <div class="preview-details-grid">
-            ${isFirstLoad
-              ? `<label><span>Start time</span><input id="loadStartTime" data-load="${load.id}" type="time" value="${load.start || timeText(stats.start)}" /></label>`
-              : `<div><span>Start</span><strong>${timeText(stats.start)}</strong></div>`}
+            <label><span>Start time</span><input id="loadStartTime" data-load="${load.id}" type="time" value="${load.start || timeText(stats.start)}" /></label>
             <div><span>Finish</span><strong>${timeText(stats.finish)}</strong></div>
+            <div><span>Rest before</span><strong>${stats.restBefore ? durationText(stats.restBefore) : "None"}</strong></div>
             <div><span>${load.returnOnly ? "Return route" : "Drive buffer"}</span><strong>${durationText(stats.returnTrip)}</strong></div>
             <div><span>Weight</span><strong>${formatLbs(stats.weightTotalLbs)}</strong></div>
             <div><span>Capacity</span><strong>${formatLbs(stats.capacityLbs)}</strong></div>
@@ -3159,13 +3911,26 @@ function renderLoadPreview() {
   `;
 }
 
-function renderPreviewStartTravelStop(truck, load, startTravel, start) {
+function renderPreviewRestStop(stats) {
+  if (!Number(stats?.restBefore || 0)) return "";
+  return `
+    <article class="preview-stop rest">
+      <div class="stop-main">
+        <strong>1. Rest / Wait</strong>
+        <span>Gap between previous load finish and this load start</span>
+      </div>
+      <div class="stop-time"><span>From ${timeText(stats.previousFinish)}</span><span>Leave ${timeText(stats.start)}</span></div>
+    </article>
+  `;
+}
+
+function renderPreviewStartTravelStop(truck, load, startTravel, start, displayOffset = 0) {
   if (!startTravel) return "";
   const executionStatus = travelExecutionStatus(truck, load, startTravel);
   return `
     <article class="preview-stop travel status-${executionStatus}">
       <div class="stop-main">
-        <strong>1. Travel | ${startTravel.from} to ${startTravel.to}</strong>
+        <strong>${displayOffset + 1}. Travel | ${startTravel.from} to ${startTravel.to}</strong>
         <span>Empty truck reposition</span>
       </div>
       <div class="stop-time"><span>Leave ${timeText(start)}</span><span>Arrive ${timeText(start + startTravel.minutes)}</span></div>
@@ -3196,7 +3961,8 @@ function renderReturnPreviewStops(load, truck, stats) {
   const stops = mapStopsForLoad(load, truck);
   const estimate = routeEstimates[load.id];
   const finish = estimate ? timeText(stats.start + estimate.totalMinutes) : "Calculating";
-  return stops.map((stop, index) => {
+  const restOffset = stats.restBefore ? 1 : 0;
+  const stopHtml = stops.map((stop, index) => {
     const isStart = index === 0;
     const sub = isStart
       ? `Leave ${timeText(stats.start)}`
@@ -3204,22 +3970,31 @@ function renderReturnPreviewStops(load, truck, stats) {
     return `
       <article class="preview-stop ${isStart ? "drop" : "pick"}" data-load="${load.id}" data-index="${index}">
         <div class="stop-main">
-          <strong>${index + 1}. ${escapeHtml(stop.title)}</strong>
+          <strong>${index + restOffset + 1}. ${escapeHtml(stop.title)}</strong>
           <span>${isStart ? "Return route start" : "Return yard"}</span>
         </div>
         <div class="stop-time"><span>${escapeHtml(sub)}</span></div>
       </article>
     `;
   }).join("") || `<div class="empty-drop">No previous stop available for return route.</div>`;
+  return `${renderPreviewRestStop(stats)}${stopHtml}`;
 }
 
 function renderPreviewMap() {
+  const { truck, load } = selectedLoad();
   const pins = mapPins();
   const estimate = routeEstimates[selectedLoadId];
+  const allowTolls = Boolean(load?.allowTolls);
   return `
     <div class="google-map-preview" id="googleMapPreview">Loading map...</div>
     <div class="route-estimate-summary" id="routeEstimateSummary">
-      ${estimate ? `<strong>${durationText(estimate.totalMinutes)} total</strong><span>${durationText(estimate.driveMinutes)} drive + ${durationText(estimate.stayMinutes)} stop time</span>` : `<strong>Calculating route...</strong><span>Google travel time plus driver stop time.</span>`}
+      ${estimate ? routeEstimateSummaryHtml(estimate, truck) : `<strong>Calculating route...</strong><span>Google travel time, truck adjustment, plus driver stop time.</span>`}
+    </div>
+    <div class="route-option-row">
+      <button class="${allowTolls ? "" : "active"}" data-action="toggle-route-tolls" data-load="${load?.id || ""}" type="button">
+        ${allowTolls ? "Tolls Allowed" : "Avoid Tolls"}
+      </button>
+      <span>${allowTolls ? "Google may use toll roads for faster ETA." : "Default: route avoids toll roads."}</span>
     </div>
     ${dispatchConfig.googleMapsApiKey ? "" : `<div class="map-preview load-map-preview fallback-map-preview">
       <div class="route-line"></div>
@@ -3253,6 +4028,7 @@ function renderTransitCoEditor(order) {
   const originalPickup = order.transitOriginalPickupLocations?.[0] || order.transitCo?.fromYard || order.pickupLocations?.[0] || "3445";
   const toYard = order.transitCo?.toYard || "12441";
   const checked = order.transitCo ? "checked" : "";
+  const sourceTypeLabel = order.childOrders?.length ? "grouped order" : order.type === "TO" ? "TO" : "SO";
   return `
     <section class="transit-co-editor">
       <label class="transit-check">
@@ -3269,7 +4045,7 @@ function renderTransitCoEditor(order) {
           <select name="transitToYard">${yardOptions(toYard)}</select>
         </label>
       </div>
-      <p>Creates a local CO and changes this SO pickup yard to the transit depot. The CO must be planned before this SO can be dropped to a load.</p>
+      <p>Creates a local CO and changes this ${sourceTypeLabel} pickup yard to the transit depot. The CO must be planned before this ${sourceTypeLabel} can be dropped to a load.</p>
       ${order.transitCo ? `<strong>Current CO: ${escapeHtml(order.transitCo.id)}</strong>` : ""}
     </section>
   `;
@@ -3368,8 +4144,8 @@ function renderModal() {
             <div class="plan-history-list">
               ${planHistory.map((plan) => `
                 <button class="plan-history-card ${currentPlan?.id === plan.id ? "selected" : ""}" data-action="load-plan-id" data-plan-id="${plan.id}" type="button">
-                  <strong>${escapeHtml(plan.planDate)} | ${escapeHtml(String(plan.status || "").toUpperCase())}</strong>
-                  <span>Saved ${plan.savedAt ? new Date(plan.savedAt).toLocaleString() : "--"}${plan.confirmedAt ? ` | Confirmed ${new Date(plan.confirmedAt).toLocaleString()}` : ""}</span>
+                  <strong>${escapeHtml(displayDate(plan.planDate))} | ${escapeHtml(String(plan.status || "").toUpperCase())}</strong>
+                  <span>Saved ${plan.savedAt ? displayDateTime(plan.savedAt) : "--"}${plan.confirmedAt ? ` | Confirmed ${displayDateTime(plan.confirmedAt)}` : ""}</span>
                   <span>${plan.summary ? `${plan.summary.planned || 0} planned | ${plan.summary.warnings || 0} warnings` : ""}</span>
                 </button>
               `).join("") || `<div class="empty-drop">No dispatch plans yet.</div>`}
@@ -3411,7 +4187,7 @@ function renderModal() {
                 <input name="windowEnd" value="${escapeHtml(modalTimeValue(order.windowEnd))}" placeholder="1900" inputmode="numeric" maxlength="4" />
               </label>
             </div>
-            ${order.type === "SO" ? renderTransitCoEditor(order) : ""}
+            ${supportsTransitCoForOrder(order) ? renderTransitCoEditor(order) : ""}
             <div class="modal-status" data-edit-status></div>
             <div class="modal-footer">
               <button data-action="close-modal" type="button">Cancel</button>
@@ -3543,7 +4319,7 @@ function renderModal() {
           <div class="modal-header">
             <div>
               <h2>Split Order</h2>
-              <p>${order.id} | ${orderFootprintPallets(order)} pos | ${formatLbs(orderWeightLbs(order))}</p>
+              <p>${order.id} | unit-based split | ${formatLbs(orderWeightLbs(order))}</p>
             </div>
             <button data-action="close-modal" type="button">Close</button>
           </div>
@@ -3555,20 +4331,42 @@ function renderModal() {
             <div class="split-item-editor" style="--split-cols:${splitParts}">
               <div class="split-row split-head">
                 <strong>Item</strong>
-                <span>Total pos</span>
+                <span>Total</span>
                 ${Array.from({ length: splitParts }).map((_, index) => `<span>Split ${index + 1}</span>`).join("")}
               </div>
-              ${(order.items || []).map((item) => {
-                const sku = item.sku;
-                const values = splitDraft.items[sku] || [];
-                const total = itemFootprint(item);
-                const assigned = values.reduce((sum, value) => sum + Number(value || 0), 0);
+              ${(order.items || []).map((item, itemIndex) => {
+                const sku = item.sku || item.itemName || item.item_name || `Line ${itemIndex + 1}`;
+                const itemKey = splitItemKey(item, itemIndex);
+                const units = splitUnitDefinitions(item);
+                const values = splitDraft.items[itemKey] || [];
+                const assignedByUnit = units.reduce((memo, unit) => {
+                  memo[unit.key] = values.reduce((sum, value) => sum + splitQuantityValue(normalizeSplitPartValue(item, value)[unit.key]), 0);
+                  return memo;
+                }, {});
+                const leftText = units
+                  .map((unit) => {
+                    const left = Math.round((Number(unit.total || 0) - Number(assignedByUnit[unit.key] || 0)) * 1000000) / 1000000;
+                    return Math.abs(left) > 0.000001 ? `${qtyText(left)} ${unit.label} left` : "";
+                  })
+                  .filter(Boolean)
+                  .join(" | ");
                 return `
                   <div class="split-row">
                     <strong>${escapeHtml(sku)}</strong>
-                    <span>${total} pos${assigned !== total ? ` | ${total - assigned} left` : ""}</span>
+                    <span>${escapeHtml(splitItemTotalLabel(item))}${leftText ? ` | ${escapeHtml(leftText)}` : ""}</span>
                     ${Array.from({ length: splitParts }).map((_, index) => `
-                      <input data-split-sku="${escapeHtml(sku)}" data-split-index="${index}" type="number" min="0" value="${values[index] || 0}" />
+                      <div class="split-unit-stack">
+                        ${units.map((unit) => {
+                          const part = normalizeSplitPartValue(item, values[index]);
+                          const step = unit.step >= 1 ? "1" : "0.01";
+                          return `
+                            <label class="split-unit-input">
+                              <span>${escapeHtml(unit.label)}</span>
+                              <input data-split-key="${escapeHtml(itemKey)}" data-split-sku="${escapeHtml(sku)}" data-split-index="${index}" data-split-unit="${unit.key}" type="number" min="0" step="${step}" value="${part[unit.key] || 0}" />
+                            </label>
+                          `;
+                        }).join("")}
+                      </div>
                     `).join("")}
                   </div>
                 `;
@@ -3710,6 +4508,12 @@ function addOrderToLoad(orderId, loadId, type = "drop", location = "", insertInd
     routeNotice = driverLockNotice(truck);
     return false;
   }
+  if (type === "drop" && isOrderPlannedOutsideCurrentPlan(order)) {
+    selectedOrderId = orderId;
+    selectedOrderIds = new Set([orderId]);
+    routeNotice = `${order.id} is already ${orderPlannedElsewhereText(order)}. Remove it from that plan before adding it here.`;
+    return false;
+  }
   const beforeLoad = summarizeLoad(load);
   if (type === "drop" && !hasUsableDispatchAddress(order)) {
     selectedOrderId = orderId;
@@ -3724,6 +4528,7 @@ function addOrderToLoad(orderId, loadId, type = "drop", location = "", insertInd
     routeNotice = `${transitMessage} Open the CO tab and plan the transit move first.`;
     return false;
   }
+  const beforeStops = (load.stops || []).map((stop) => ({ ...stop }));
   let cleanInsertIndex = Number.isInteger(insertIndex) ? insertIndex : null;
   if (type === "drop") {
     const addedPickups = ensurePickupStops(load, order, cleanInsertIndex);
@@ -3751,6 +4556,18 @@ function addOrderToLoad(orderId, loadId, type = "drop", location = "", insertInd
   stop.loadId = load.id;
   if (Number.isInteger(cleanInsertIndex)) load.stops.splice(Math.max(0, cleanInsertIndex - (sameLoadMove ? 1 : 0)), 0, stop);
   else load.stops.push(stop);
+  if (type === "drop") {
+    const coWarning = coTimingViolation(order);
+    if (coWarning) {
+      load.stops = beforeStops;
+      cleanupOrphanPickupStops();
+      pendingOperatorAlertRefs.delete(order.id);
+      selectedOrderId = orderId;
+      selectedOrderIds = new Set([orderId]);
+      routeNotice = coWarning;
+      return false;
+    }
+  }
   selectedOrderId = orderId;
   selectedLoadId = loadId;
   logDispatchAudit({
@@ -3881,31 +4698,58 @@ function insertIndexFromDrop(event, targetStop, targetLoad) {
 function ensureSplitDraft(order, force = false) {
   if (!force && splitDraft.orderId === order.id && splitDraft.parts === splitParts) return;
   const items = {};
-  for (const item of order.items || []) {
-    const total = itemFootprint(item);
-    const base = Math.floor(total / splitParts);
-    const remainder = total % splitParts;
-    items[item.sku] = Array.from({ length: splitParts }).map((_, index) => base + (index < remainder ? 1 : 0));
+  for (const [itemIndex, item] of (order.items || []).entries()) {
+    const units = splitUnitDefinitions(item);
+    const parts = Array.from({ length: splitParts }).map(() => splitPartTemplate(item));
+    for (const unit of units) {
+      const values = splitNumberAcrossParts(unit.total, splitParts, unit.step);
+      values.forEach((value, index) => {
+        parts[index][unit.key] = value;
+      });
+    }
+    items[splitItemKey(item, itemIndex)] = parts;
   }
   splitDraft = { orderId: order.id, parts: splitParts, items };
 }
 
 function splitTotalsForPart(order, partIndex) {
   const items = (order.items || [])
-    .map((item) => {
-      const qty = Number(splitDraft.items[item.sku]?.[partIndex] || 0);
-      if (!qty) return null;
-      return { ...item, pallets: qty, layers: 0, splitQty: qty };
+    .map((item, itemIndex) => {
+      const key = splitItemKey(item, itemIndex);
+      const part = normalizeSplitPartValue(item, splitDraft.items[key]?.[partIndex]);
+      const splitLabel = splitPartLabel(item, part);
+      if (!splitLabel) return null;
+      const salesQuantity = splitPartSalesQuantity(item, part);
+      const next = {
+        ...item,
+        pallets: splitQuantityValue(part.pallets),
+        layers: splitQuantityValue(part.layers),
+        sections: splitQuantityValue(part.sections),
+        pieces: splitQuantityValue(part.pieces),
+        quantity: salesQuantity,
+        splitQty: salesQuantity,
+        splitUnit: splitLabel
+      };
+      if (part.quantity !== undefined && splitUnitDefinitions(item).every((unit) => unit.key === "quantity")) {
+        next.quantity = splitQuantityValue(part.quantity);
+      }
+      return next;
     })
     .filter(Boolean);
-  const pallets = items.reduce((sum, item) => sum + Number(item.splitQty || 0), 0);
-  return { items, pallets };
+  const pallets = items.reduce((sum, item) => sum + Number(item.pallets || 0) + (Number(item.layers || 0) > 0 ? 1 : 0), 0);
+  const salesQty = items.reduce((sum, item) => sum + Number(item.quantity || 0), 0);
+  const weight = items.reduce((sum, item) => {
+    const itemWeight = Number(item.itemWeight || item.item_weight || 0);
+    return sum + (itemWeight > 0 ? Number(item.quantity || 0) * itemWeight : 0);
+  }, 0);
+  return { items, pallets, salesQty, weight };
 }
 
-function splitOrder(orderId, parts = 2) {
+function splitOrder(orderId, parts = 2, startSuffix = 1) {
   const order = orderById(orderId);
-  if (!order || order.pallets <= 1) return;
+  if (!order) return;
   const cleanParts = Math.min(Math.max(Number(parts) || 2, 2), 10);
+  const cleanStartSuffix = Math.max(Number(startSuffix) || 1, 1);
   const originalPallets = order.pallets;
   const insertAt = orders.findIndex((item) => item.id === order.id) + 1;
   orders.splice(orders.findIndex((item) => item.id === order.id), 1);
@@ -3913,12 +4757,14 @@ function splitOrder(orderId, parts = 2) {
     const totals = splitTotalsForPart(order, index);
     return {
       ...order,
-      id: `${order.id}-S${index + 1}`,
+      id: `${order.id}-S${cleanStartSuffix + index}`,
       pallets: totals.pallets,
       layers: 0,
       items: totals.items,
-      salesQty: totals.pallets * 100,
-      weight: Math.round((order.weight / Math.max(orderFootprintPallets(order), 1)) * totals.pallets * 10) / 10,
+      salesQty: Math.round(Number(totals.salesQty || 0) * 1000000) / 1000000,
+      weight: totals.weight > 0
+        ? Math.round(totals.weight * 10) / 10
+        : Math.round((Number(order.weight || 0) * (Number(totals.salesQty || 0) / Math.max(Number(order.salesQty || order.quantity || 0), 1))) * 10) / 10,
       notes: `Split ${index + 1}/${cleanParts} from ${order.id}. ${order.notes}`,
       originalOrderId: order.id,
       originalPallets
@@ -3930,6 +4776,63 @@ function splitOrder(orderId, parts = 2) {
   if (splits[0]?.type) activeOrderType = splits[0].type;
 }
 
+function prepareUnsplitOrder(splitOrderId) {
+  const split = orderById(splitOrderId);
+  if (!split?.originalOrderId) {
+    routeNotice = "Select a split order before using Unsplit.";
+    return null;
+  }
+  const siblings = splitSiblingsForOrder(split);
+  const blockReason = splitOrderPlanningBlock(siblings);
+  if (blockReason) {
+    routeNotice = blockReason;
+    return null;
+  }
+  const parent = orderCatalog.find((order) => order.id === split.originalOrderId);
+  if (!parent) {
+    routeNotice = `Cannot unsplit ${split.originalOrderId}. Refresh orders first, then try again.`;
+    return null;
+  }
+  return {
+    parent,
+    siblings,
+    before: siblings.map(summarizeOrder),
+    siblingIds: siblings.map((item) => item.id),
+    firstIndex: orders.findIndex((item) => siblings.some((sibling) => sibling.id === item.id))
+  };
+}
+
+function applyUnsplitOrder(prepared) {
+  if (!prepared?.parent || !prepared?.siblingIds?.length) return false;
+  const siblingIds = new Set(prepared.siblingIds);
+  orders = orders.filter((item) => !siblingIds.has(item.id));
+  const restored = normalizeOrder({
+    ...prepared.parent,
+    localDispatchStatus: "open",
+    dispatchPlanned: false,
+    dispatchPlanId: "",
+    dispatchPlanDate: "",
+    dispatchTruckPlate: "",
+    dispatchLoadName: "",
+    dispatchParkingSpot: ""
+  });
+  orders.splice(Math.max(prepared.firstIndex, 0), 0, restored);
+  selectedOrderId = restored.id;
+  selectedOrderIds = new Set([restored.id]);
+  if (restored.type) activeOrderType = restored.type;
+  routeNotice = `${restored.id} restored. Split orders removed: ${[...siblingIds].join(", ")}.`;
+  logDispatchAudit({
+    action: "order_unsplit",
+    entityType: "order",
+    entityId: restored.id,
+    orderId: restored.id,
+    before: prepared.before,
+    after: summarizeOrder(restored),
+    details: { removedSplitOrderIds: [...siblingIds] }
+  });
+  return true;
+}
+
 function groupOrder(orderId) {
   const order = orderById(orderId);
   const selected = selectedOrders();
@@ -3937,7 +4840,7 @@ function groupOrder(orderId) {
   if (groupItems.length < 2) return;
   const grouped = {
     ...groupItems[0],
-    id: `GRP-${groupItems.map((item) => item.id.replace(/\D/g, "").slice(-3)).join("-")}`,
+    id: uniqueGroupedDispatchOrderId(groupItems),
     customer: `${groupItems.length} orders grouped`,
     address: groupItems[0].address,
     pallets: groupItems.reduce((sum, item) => sum + Number(item.pallets || 0), 0),
@@ -3960,9 +4863,73 @@ function groupOrder(orderId) {
   selectedOrderIds = new Set([grouped.id]);
 }
 
+function groupedDispatchOrderId(groupItems = []) {
+  const parsed = groupItems.map((item) => {
+    const id = String(item?.id || "").trim().toUpperCase();
+    const match = id.match(/\b(SO[A-Z]|TO[A-Z]|PO[A-Z])\D*(\d+)/i) || id.match(/^([A-Z]+)[^\d]*(\d+)/);
+    if (!match) return { prefix: "GRP", number: id.replace(/\W+/g, "") || "ORDER", sortNumber: Number.MAX_SAFE_INTEGER, sortSuffix: id };
+    const sourcePrefix = match[1];
+    const groupPrefix = sourcePrefix.length > 1 ? `G${sourcePrefix.slice(1)}` : `G${sourcePrefix}`;
+    const splitSuffix = id.slice((match.index || 0) + match[0].length).match(/-S\d+/i)?.[0]?.replace(/\W+/g, "") || "";
+    const sortNumber = Number.parseInt(match[2], 10) || 0;
+    const number = `${String(sortNumber)}${splitSuffix}`;
+    return { prefix: groupPrefix, number, sortNumber, sortSuffix: splitSuffix };
+  }).sort((a, b) => a.prefix.localeCompare(b.prefix) || a.sortNumber - b.sortNumber || a.sortSuffix.localeCompare(b.sortSuffix) || a.number.localeCompare(b.number));
+  const prefixes = [...new Set(parsed.map((item) => item.prefix).filter(Boolean))];
+  const prefix = prefixes.length === 1 ? prefixes[0] : `G${prefixes.map((item) => item.replace(/^G/i, "")).join("")}`;
+  return `${prefix}-${parsed.map((item) => item.number).join("-")}`;
+}
+
+function dispatchOrderIdExists(id, excludedIds = new Set()) {
+  const target = String(id || "");
+  if (!target || excludedIds.has(target)) return false;
+  if (plannedAssignmentRefs.has(target)) return true;
+  const lists = [orders, orderCatalog];
+  for (const list of lists) {
+    if ((list || []).some((order) => String(order?.id || "") === target && !excludedIds.has(String(order?.id || "")))) return true;
+  }
+  for (const truck of trucks || []) {
+    for (const load of truck.loads || []) {
+      if ((load.stops || []).some((stop) => String(stop?.orderId || "") === target && !excludedIds.has(String(stop?.orderId || "")))) return true;
+    }
+  }
+  return false;
+}
+
+function uniqueGroupedDispatchOrderId(groupItems = []) {
+  const baseId = groupedDispatchOrderId(groupItems);
+  const excludedIds = new Set(groupItems.map((item) => String(item?.id || "")).filter(Boolean));
+  if (!dispatchOrderIdExists(baseId, excludedIds)) return baseId;
+  for (let version = 2; version < 1000; version += 1) {
+    const candidate = `${baseId}-V${version}`;
+    if (!dispatchOrderIdExists(candidate, excludedIds)) return candidate;
+  }
+  return `${baseId}-V${Date.now()}`;
+}
+
+function groupedOrderTransitCoId(order) {
+  if (!order?.childOrders?.length) return "";
+  const directCoId = String(order.transitCo?.id || "").trim();
+  if (directCoId) return directCoId;
+  const expectedCoId = `CO-${order.id}`;
+  const coOrder = orderById(expectedCoId);
+  if (coOrder) return expectedCoId;
+  const relatedCo = (orders || []).find((item) => item?.type === "CO" && (
+    String(item.sourceOrderId || "") === String(order.id || "")
+    || String(item.relatedSoId || "") === String(order.id || "")
+    || String(item.relatedToId || "") === String(order.id || "")
+  ));
+  return relatedCo?.id || "";
+}
+
 function ungroupOrder(orderId) {
   const group = orderById(orderId);
   if (!group?.childOrders?.length) return null;
+  const coId = groupedOrderTransitCoId(group);
+  if (coId) {
+    routeNotice = `Cancel ${coId} before ungrouping ${group.id}.`;
+    return null;
+  }
   const before = summarizeOrder(group);
   const removedStops = removeStopsForOrders([group.id]);
   const fallbackById = new Map(orderCatalog.map((item) => [item.id, item]));
@@ -4043,26 +5010,21 @@ function consolidatePick(orderId, sourceYard) {
 
 function upsertTransitCoForOrder(orderId, fromYard, toYard) {
   const order = orderById(orderId);
-  if (!order || order.type !== "SO") return null;
+  if (!order || !supportsTransitCoForOrder(order)) return null;
   if (!fromYard || !toYard || String(fromYard) === String(toYard)) return null;
   const beforeOrder = summarizeOrder(order);
-  const originalPickupLocations = order.transitOriginalPickupLocations?.length
-    ? order.transitOriginalPickupLocations
-    : [...(order.pickupLocations || [fromYard])];
   const coId = order.transitCo?.id || `CO-${order.id}`;
   const beforeCo = summarizeOrder(orderById(coId));
-  order.transitOriginalPickupLocations = originalPickupLocations;
-  order.transitCo = {
-    id: coId,
+  applyTransitPickupToOrder(order, {
+    coId,
     fromYard,
     toYard,
-    sourceOrderId: order.id,
     createdAt: order.transitCo?.createdAt || new Date().toISOString()
-  };
-  order.pickupLocations = [toYard];
+  });
   order.notes = order.notes?.includes(`Transit via ${toYard}`)
     ? order.notes
     : `Transit via ${toYard}. ${order.notes || ""}`.trim();
+  const sourceOrderType = transitSourceOrderType(order);
 
   const coOrder = normalizeOrder({
     ...(orderById(coId) || {}),
@@ -4085,9 +5047,14 @@ function upsertTransitCoForOrder(orderId, fromYard, toYard) {
     unloadMinutes: order.unloadMinutes,
     travelMinutes: yardTravelMinutes(fromYard, toYard),
     sourceOrderId: order.id,
-    relatedSoId: order.id,
+    relatedSoId: order.type === "SO" ? order.id : "",
+    relatedToId: order.type === "TO" ? order.id : "",
+    sourceOrderType: order.type,
     transitOrder: true,
     groupKey: `${fromYard} to ${toYard}`,
+    childOrders: order.childOrders || [],
+    childOrderDetails: order.childOrderDetails || [],
+    sourceOrderType,
     notes: `Local transit depot order for ${order.id}. No NetSuite order.`
   });
 
@@ -4123,7 +5090,9 @@ async function saveTransitCoToServer(sourceOrder, coOrder) {
         ...coOrder,
         customer: sourceOrder.customer,
         notes: coOrder.notes,
-        items: coOrder.items || sourceOrder.items || []
+        items: coOrder.items || sourceOrder.items || [],
+        childOrders: sourceOrder.childOrders || [],
+        childOrderDetails: sourceOrder.childOrderDetails || []
       },
       planId: currentPlan?.id || null,
       planDate: currentPlanDate,
@@ -4143,6 +5112,19 @@ async function cancelTransitCoOnServer(coId) {
   return response.json();
 }
 
+function persistTransitCoInBackground(promise, successMessage = "") {
+  promise
+    .then(() => {
+      if (!successMessage) return;
+      routeNotice = successMessage;
+      render({ save: false });
+    })
+    .catch((error) => {
+      routeNotice = `CO server update failed: ${error.message}`;
+      render({ save: false });
+    });
+}
+
 function cancelTransitCoForOrder(orderId) {
   const order = orderById(orderId);
   if (!order?.transitCo?.id) return null;
@@ -4156,8 +5138,22 @@ function cancelTransitCoForOrder(orderId) {
       ? [order.transitCo.fromYard]
       : order.pickupLocations || ["3445"];
   order.pickupLocations = restoredPickups;
+  order.sourceYard = order.transitOriginalSourceYard || restoredPickups[0] || order.sourceYard;
+  order.childOrderDetails = (order.childOrderDetails || []).map((child) => {
+    const next = normalizeOrder({ ...child });
+    const childRestoredPickups = next.transitOriginalPickupLocations?.length
+      ? next.transitOriginalPickupLocations
+      : restoredPickups;
+    next.pickupLocations = childRestoredPickups;
+    next.sourceYard = next.transitOriginalSourceYard || childRestoredPickups[0] || next.sourceYard;
+    delete next.transitCo;
+    delete next.transitOriginalPickupLocations;
+    delete next.transitOriginalSourceYard;
+    return next;
+  });
   delete order.transitCo;
   delete order.transitOriginalPickupLocations;
+  delete order.transitOriginalSourceYard;
   order.notes = String(order.notes || "").replace(/^Transit via [^.]+\.?\s*/i, "").trim();
   orders = orders.filter((item) => item.id !== coId);
   if (activeOrderType === "CO" && !orders.some((item) => item.type === "CO")) activeOrderType = "SO";
@@ -4200,9 +5196,14 @@ app.addEventListener("dragstart", (event) => {
     dragged = { type: "stop", stopId: stopCard.dataset.stop };
     event.dataTransfer.setData("text/plain", stopCard.dataset.stop);
   } else if (orderCard) {
+    const order = orderById(orderCard.dataset.order);
     if (orderCard.dataset.planned === "true") {
       event.preventDefault();
       dragged = null;
+      if (order && isOrderPlannedOutsideCurrentPlan(order)) {
+        routeNotice = `${order.id} is already ${orderPlannedElsewhereText(order)}. Remove it from that plan before adding it here.`;
+        render({ save: false });
+      }
       return;
     }
     dragged = { type: "order", orderId: orderCard.dataset.order };
@@ -4400,6 +5401,14 @@ app.addEventListener("click", (event) => {
     const orderCard = event.target.closest("[data-order]");
     if (orderCard) {
       if (event.detail > 1) return;
+      const clickedOrder = orderById(orderCard.dataset.order);
+      if (clickedOrder && isOrderPlannedOutsideCurrentPlan(clickedOrder)) {
+        jumpToPlannedOrder(clickedOrder.id).catch((error) => {
+          routeNotice = `Plan jump failed: ${error.message}`;
+          render({ save: false });
+        });
+        return;
+      }
       selectedOrderId = orderCard.dataset.order;
       const assignment = orderAssignment(selectedOrderId);
       if (assignment.load) {
@@ -4446,13 +5455,43 @@ app.addEventListener("click", (event) => {
   }
   if (action === "ungroup-order") {
     ungroupOrder(button.dataset.order);
+    requestOrderPoolRefreshOnNextSave();
     render();
+    return;
+  }
+  if (action === "unsplit-order") {
+    const prepared = prepareUnsplitOrder(button.dataset.order);
+    if (!prepared) {
+      render({ save: false });
+      return;
+    }
+    fetch("/api/dispatch/split-orders/unsplit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        originalOrderId: prepared.parent.id,
+        orderType: prepared.parent.type,
+        splitOrderIds: prepared.siblingIds,
+        audit: { sessionId: dispatchSessionId }
+      })
+    }).then((response) => {
+      if (!response.ok) return response.text().then((text) => Promise.reject(new Error(text)));
+      return response.json();
+    }).then(() => {
+      applyUnsplitOrder(prepared);
+      requestOrderPoolRefreshOnNextSave();
+      render();
+    }).catch((error) => {
+      routeNotice = `Unsplit failed: ${error.message}`;
+      render({ save: false });
+    });
     return;
   }
   if (action === "open-split-modal") {
     modalType = "split";
     modalOrderId = button.dataset.order;
-    splitParts = Math.max(2, Math.ceil((orderById(button.dataset.order)?.pallets || 2) / 10));
+    const splitOrderTarget = orderById(button.dataset.order);
+    splitParts = Math.max(2, Math.ceil((orderFootprintPallets(splitOrderTarget) || 2) / 10));
     ensureSplitDraft(orderById(button.dataset.order), true);
   }
   if (action === "open-consolidate-modal") {
@@ -4521,7 +5560,7 @@ app.addEventListener("click", (event) => {
   if (action === "load-plan-id") {
     loadPlanById(button.dataset.planId).then((plan) => {
       modalType = "";
-      routeNotice = `Loaded ${plan.planDate} ${plan.status}.`;
+      routeNotice = `Loaded ${displayDate(plan.planDate)} ${plan.status}.`;
       render({ save: false });
     }).catch((error) => {
       routeNotice = `Plan load failed: ${error.message}`;
@@ -4540,7 +5579,7 @@ app.addEventListener("click", (event) => {
     }).then(async (plan) => {
       currentPlan = plan;
       await loadPlanHistory();
-      routeNotice = `Plan ${plan.planDate} confirmed.`;
+      routeNotice = `Plan ${displayDate(plan.planDate)} confirmed.`;
       render({ save: false });
     }).catch((error) => {
       routeNotice = `Confirm failed: ${error.message}`;
@@ -4562,7 +5601,7 @@ app.addEventListener("click", (event) => {
       localStorage.setItem(DISPATCH_PLAN_DATE_KEY, currentPlanDate);
       if (plan.orders?.length && plan.trucks?.length) applySavedPlan(plan);
       await loadPlanHistory();
-      routeNotice = `Plan ${plan.planDate} opened for editing.`;
+      routeNotice = `Plan ${displayDate(plan.planDate)} opened for editing.`;
       render({ save: false });
     }).catch((error) => {
       routeNotice = `Edit failed: ${error.message}`;
@@ -4573,6 +5612,7 @@ app.addEventListener("click", (event) => {
   if (action === "confirm-group") {
     const before = selectedOrders().map(summarizeOrder);
     groupOrder(button.dataset.order);
+    requestOrderPoolRefreshOnNextSave();
     logDispatchAudit({
       action: "orders_grouped",
       entityType: "order",
@@ -4617,24 +5657,44 @@ app.addEventListener("click", (event) => {
     return;
   }
   if (action === "confirm-split") {
-    const before = summarizeOrder(orderById(button.dataset.order));
-    splitOrder(button.dataset.order, splitParts);
-    const created = orders.filter((order) => order.originalOrderId === button.dataset.order).map(summarizeOrder);
-    logDispatchAudit({
-      action: "order_split",
-      entityType: "order",
-      entityId: button.dataset.order,
-      orderId: button.dataset.order,
-      before,
-      after: created,
-      details: { splitParts, createdOrderIds: created.map((item) => item?.id).filter(Boolean) }
-    });
-    modalType = "";
-    modalOrderId = "";
+    const order = orderById(button.dataset.order);
+    const before = summarizeOrder(order);
+    fetch(`/api/dispatch/orders/${encodeURIComponent(button.dataset.order)}/split-seed?type=${encodeURIComponent(order?.type || "")}`)
+      .then((response) => {
+        if (!response.ok) return response.text().then((text) => Promise.reject(new Error(text)));
+        return response.json();
+      })
+      .then((seed) => {
+        splitOrder(button.dataset.order, splitParts, seed.nextSuffix);
+        requestOrderPoolRefreshOnNextSave();
+        const created = orders.filter((item) => item.originalOrderId === button.dataset.order).map(summarizeOrder);
+        logDispatchAudit({
+          action: "order_split",
+          entityType: "order",
+          entityId: button.dataset.order,
+          orderId: button.dataset.order,
+          before,
+          after: created,
+          details: {
+            splitParts,
+            startSuffix: seed.nextSuffix,
+            createdOrderIds: created.map((item) => item?.id).filter(Boolean)
+          }
+        });
+        modalType = "";
+        modalOrderId = "";
+        render();
+      })
+      .catch((error) => {
+        routeNotice = `Split failed: ${error.message}`;
+        render({ save: false });
+      });
+    return;
   }
   if (action === "confirm-consolidate") {
     const before = summarizeOrder(orderById(button.dataset.order));
     consolidatePick(button.dataset.order, button.dataset.yard);
+    requestOrderPoolRefreshOnNextSave();
     logDispatchAudit({
       action: "consolidate_pick_created",
       entityType: "order",
@@ -4677,6 +5737,7 @@ app.addEventListener("click", (event) => {
     }).then((payload) => {
       poAllocationOptions = payload.options;
       applyDispatchOrderFeed(payload.orders || []);
+      requestOrderPoolRefreshOnNextSave();
       routeNotice = "PO link cancelled.";
       render();
     }).catch((error) => {
@@ -4757,6 +5818,13 @@ app.addEventListener("click", (event) => {
       });
     }
   }
+  if (action === "move-truck-up" || action === "move-truck-down") {
+    const moved = moveTruckInPlan(button.dataset.truck, action === "move-truck-up" ? -1 : 1);
+    if (moved) {
+      routeNotice = "";
+      requestTruckSequenceSaveOnNextSave();
+    }
+  }
   if (action === "add-return-load") {
     const truck = trucks.find((item) => item.id === button.dataset.truck);
     if (truck) {
@@ -4817,6 +5885,26 @@ app.addEventListener("click", (event) => {
       after: summarizeLoad(load)
     });
   }
+  if (action === "toggle-route-tolls") {
+    const { truck, load } = selectedLoad();
+    if (!load) return;
+    const before = summarizeLoad(load);
+    load.allowTolls = !Boolean(load.allowTolls);
+    delete routeCache[load.id];
+    delete routeEstimates[load.id];
+    routeNotice = load.allowTolls
+      ? `${truck?.plate || "Truck"} ${load.name} may use toll roads. ETA recalculating.`
+      : `${truck?.plate || "Truck"} ${load.name} will avoid toll roads. ETA recalculating.`;
+    logDispatchAudit({
+      action: "route_toll_preference_updated",
+      entityType: "load",
+      entityId: load.id,
+      loadId: load.id,
+      before,
+      after: summarizeLoad(load),
+      details: { allowTolls: load.allowTolls }
+    });
+  }
   if (action === "support-tab") supportTab = button.dataset.tab;
   if (action === "refresh-orders") {
     searchText = "";
@@ -4850,18 +5938,23 @@ app.addEventListener("input", (event) => {
     return render();
   }
   if (event.target?.dataset?.splitSku) {
+    const key = event.target.dataset.splitKey || event.target.dataset.splitSku;
     const sku = event.target.dataset.splitSku;
     const index = Number(event.target.dataset.splitIndex);
-    if (!splitDraft.items[sku]) splitDraft.items[sku] = Array.from({ length: splitParts }).fill(0);
-    const beforeValue = Number(splitDraft.items[sku][index] || 0);
-    splitDraft.items[sku][index] = Math.max(0, Number(event.target.value) || 0);
+    const unit = event.target.dataset.splitUnit || "quantity";
+    const order = orderById(modalOrderId);
+    const item = (order?.items || []).find((candidate, candidateIndex) => splitItemKey(candidate, candidateIndex) === key) || {};
+    if (!splitDraft.items[key]) splitDraft.items[key] = Array.from({ length: splitParts }).map(() => splitPartTemplate(item));
+    splitDraft.items[key][index] = normalizeSplitPartValue(item, splitDraft.items[key][index]);
+    const beforeValue = splitQuantityValue(splitDraft.items[key][index][unit]);
+    splitDraft.items[key][index][unit] = Math.max(0, Number(event.target.value) || 0);
     logDispatchAudit({
       action: "split_quantity_edited",
       entityType: "order",
       entityId: modalOrderId,
       orderId: modalOrderId,
-      before: { sku, index, value: beforeValue },
-      after: { sku, index, value: splitDraft.items[sku][index] },
+      before: { sku, index, unit, value: beforeValue },
+      after: { sku, index, unit, value: splitDraft.items[key][index][unit] },
       details: { splitParts }
     });
     return;
@@ -5020,7 +6113,7 @@ function showOrderTooltip(event) {
     <strong>${order.id} | ${escapeHtml(order.customer)}</strong>
     <span>${escapeHtml(order.address)}</span>
     ${pickupLocation ? `<span>Pickup content: ${escapeHtml(pickupLocation)}</span>` : ""}
-    <span>${order.expectedDeliveryDate ? `${order.expectedDeliveryDate} | ` : ""}${orderUnitText(order)} | ${orderFootprintPallets(order)} pos | ${formatLbs(orderWeightLbs(order))} | ${order.windowStart || "--"}-${order.windowEnd || "--"}</span>
+    <span>${order.expectedDeliveryDate ? `${displayDate(order.expectedDeliveryDate)} | ` : ""}${orderUnitText(order)} | ${orderFootprintPallets(order)} pos | ${formatLbs(orderWeightLbs(order))} | ${order.windowStart || "--"}-${order.windowEnd || "--"}</span>
     ${order.consolidation ? `<span>Consolidate ${order.consolidation.shortageQty} from ${order.consolidation.sourceYard} to ${order.consolidation.targetYard}</span>` : ""}
     ${order.transitCo ? `<span>Requires ${order.transitCo.id}: ${order.transitCo.fromYard} to ${order.transitCo.toYard}</span>` : ""}
     ${order.type === "CO" ? `<span>Local CO for ${escapeHtml(order.sourceOrderId || order.relatedSoId || "")}</span>` : ""}
@@ -5126,6 +6219,7 @@ app.addEventListener("submit", (event) => {
     }).then((payload) => {
       poAllocationOptions = payload.options;
       if (Array.isArray(payload.orders)) applyDispatchOrderFeed(payload.orders);
+      requestOrderPoolRefreshOnNextSave();
       routeNotice = `${payload.allocations?.length || 0} PO item line(s) connected to sales order.`;
       render();
     }).catch((error) => {
@@ -5147,7 +6241,8 @@ app.addEventListener("submit", (event) => {
       setEditFormStatus(form, validation, "error");
       return;
     }
-    const wantsTransitCo = order.type === "SO" && data.createTransitCo === "on";
+    const supportsTransitCo = supportsTransitCoForOrder(order);
+    const wantsTransitCo = supportsTransitCo && data.createTransitCo === "on";
     const transitFromYard = data.transitFromYard || order.pickupLocations?.[0] || "3445";
     const transitToYard = data.transitToYard || "12441";
     if (wantsTransitCo && String(transitFromYard) === String(transitToYard)) {
@@ -5160,25 +6255,28 @@ app.addEventListener("submit", (event) => {
       submitButton.textContent = "Saving...";
     }
     setEditFormStatus(form, "Saving dispatch info...", "info");
-    fetch(`/api/dispatch/orders/${encodeURIComponent(order.id)}/details`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        type: order.type,
-        sourceTable: order.sourceTable,
-        address: data.address,
-        expectedDeliveryDate: data.expectedDeliveryDate,
-        windowStart,
-        windowEnd,
-        audit: {
-          sessionId: dispatchSessionId,
-          before: summarizeOrder(order)
-        }
-      })
-    }).then((response) => {
-      if (!response.ok) return response.text().then((text) => Promise.reject(new Error(text)));
-      return response.json();
-    }).then(async (payload) => {
+    const saveDetails = isLocalDispatchOrder(order)
+      ? Promise.resolve({ orders: null })
+      : fetch(`/api/dispatch/orders/${encodeURIComponent(order.id)}/details`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            type: order.type,
+            sourceTable: order.sourceTable,
+            address: data.address,
+            expectedDeliveryDate: data.expectedDeliveryDate,
+            windowStart,
+            windowEnd,
+            audit: {
+              sessionId: dispatchSessionId,
+              before: summarizeOrder(order)
+            }
+          })
+        }).then((response) => {
+          if (!response.ok) return response.text().then((text) => Promise.reject(new Error(text)));
+          return response.json();
+        });
+    saveDetails.then(async (payload) => {
       order.address = data.address;
       order.expectedDeliveryDate = data.expectedDeliveryDate || "";
       order.windowStart = windowStart;
@@ -5189,11 +6287,22 @@ app.addEventListener("submit", (event) => {
       if (wantsTransitCo) {
         coOrder = upsertTransitCoForOrder(order.id, transitFromYard, transitToYard);
         if (coOrder) activeOrderType = "CO";
-      } else if (order.type === "SO" && order.transitCo?.id) {
+      } else if (supportsTransitCo && order.transitCo?.id) {
         cancelledCo = cancelTransitCoForOrder(order.id);
       }
-      if (coOrder) await saveTransitCoToServer(order, coOrder);
-      if (cancelledCo?.coId) await cancelTransitCoOnServer(cancelledCo.coId);
+      if (coOrder || cancelledCo) requestOrderPoolRefreshOnNextSave();
+      if (coOrder) {
+        persistTransitCoInBackground(
+          saveTransitCoToServer(order, coOrder),
+          `${coOrder.id} saved to local DB.`
+        );
+      }
+      if (cancelledCo?.coId) {
+        persistTransitCoInBackground(
+          cancelTransitCoOnServer(cancelledCo.coId),
+          `${cancelledCo.coId} cancellation saved to local DB.`
+        );
+      }
       modalType = "";
       modalOrderId = "";
       routeNotice = coOrder

@@ -507,6 +507,49 @@ pre {
   white-space: nowrap;
 }
 
+.audit-filter-card {
+  border: 1px solid #d7dee2;
+  border-radius: 8px;
+  background: #f9fbfb;
+  padding: 10px;
+  margin-bottom: 12px;
+  min-width: 0;
+}
+
+.audit-filter-row {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(116px, 1fr)) auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.audit-filter-row label {
+  min-width: 0;
+}
+
+.audit-filter-row input,
+.audit-filter-row select {
+  width: 100%;
+  min-width: 0;
+}
+
+.audit-filter-actions {
+  display: flex;
+  gap: 8px;
+  align-items: end;
+  white-space: nowrap;
+}
+
+@media (max-width: 1280px) {
+  .audit-filter-row {
+    grid-template-columns: repeat(3, minmax(140px, 1fr));
+  }
+
+  .audit-filter-actions {
+    grid-column: 1 / -1;
+  }
+}
+
 .loaded-order-list,
 .loaded-detail-panel {
   border: 1px solid #d7dee2;

@@ -98,25 +98,35 @@ function rowToDispatchOrder(row) {
     weight: Math.round(toNumber(row.total_weight_lbs) * 1000) / 1000,
     items: normalizeDispatchItems(row.items || []),
     raw: row,
+    netsuiteStatus: row.status || "",
+    netsuiteStatusText: row.status_text || "",
+    fulfillmentStatus: row.fulfillment_status || "",
+    netsuiteActive: row.netsuite_active !== false,
     operatorStatus: row.operator_status || "",
     localYardOrderStatus: row.local_yard_order_status || "Open",
-    dispatchPlanned: Boolean(row.dispatch_planned)
+    dispatchPlanned: Boolean(row.dispatch_planned),
+    dispatchPlanDate: dateOnly(row.dispatch_plan_date),
+    dispatchTruckPlate: row.dispatch_truck_plate || "",
+    dispatchLoadName: row.dispatch_load_name || "",
+    dispatchParkingSpot: row.dispatch_parking_spot || ""
   };
 }
 
 function locationIdFromText(value) {
   const text = String(value || "").trim();
   if (text === "3445") return 1;
-  if (text === "2967") return 13;
+  if (text === "2967") return 28;
   if (text === "12441") return 15;
+  if (text === "150") return 26;
   return null;
 }
 
 function locationTextFromId(value) {
   const text = String(value || "").trim();
   if (text === "1") return "3445";
-  if (text === "13") return "2967";
+  if (text === "13" || text === "28") return "2967";
   if (text === "15") return "12441";
+  if (text === "26") return "150";
   return String(value || "").trim();
 }
 
@@ -176,6 +186,10 @@ export async function listDispatchOrders({ type = null } = {}) {
         operator_status,
         local_yard_order_status,
         dispatch_planned,
+        dispatch_plan_date,
+        dispatch_truck_plate,
+        dispatch_load_name,
+        dispatch_parking_spot,
         fulfillment_status,
         status,
         status_text,
@@ -201,6 +215,10 @@ export async function listDispatchOrders({ type = null } = {}) {
         outbound_operator_status AS operator_status,
         local_yard_order_status,
         dispatch_planned,
+        dispatch_plan_date,
+        dispatch_truck_plate,
+        dispatch_load_name,
+        dispatch_parking_spot,
         fulfillment_status,
         status,
         status_text,
@@ -277,6 +295,10 @@ export async function listDispatchOrders({ type = null } = {}) {
         dispatch_window_end,
         dispatch_instructions,
         dispatch_parse_source,
+        NULL::date AS dispatch_plan_date,
+        NULL::text AS dispatch_truck_plate,
+        NULL::text AS dispatch_load_name,
+        NULL::text AS dispatch_parking_spot,
         status_text,
         netsuite_active
       FROM purchase_orders
@@ -295,6 +317,10 @@ export async function listDispatchOrders({ type = null } = {}) {
         dispatch_window_end,
         dispatch_instructions,
         dispatch_parse_source,
+        dispatch_plan_date,
+        dispatch_truck_plate,
+        dispatch_load_name,
+        dispatch_parking_spot,
         status_text,
         netsuite_active
       FROM transfer_orders
@@ -386,6 +412,14 @@ export async function listDispatchOrders({ type = null } = {}) {
         o.operator_status,
         o.local_yard_order_status,
         o.dispatch_planned,
+        o.dispatch_plan_date,
+        o.dispatch_truck_plate,
+        o.dispatch_load_name,
+        o.dispatch_parking_spot,
+        o.fulfillment_status,
+        o.status,
+        o.status_text,
+        o.netsuite_active,
         COALESCE(SUM(l.pallet_qty), 0) AS total_pallet_qty,
         COALESCE(SUM(l.layer_qty), 0) AS total_layer_qty,
         COALESCE(SUM(l.quantity), 0) AS total_quantity,
@@ -432,18 +466,34 @@ export async function listDispatchOrders({ type = null } = {}) {
       ) co ON true
       LEFT JOIN so_alloc_pickups ap ON ap.sales_order_id = o.netsuite_id
       WHERE (o.netsuite_active = true OR co.co_ref IS NOT NULL)
-        AND COALESCE(o.local_yard_order_status, 'Open') <> 'Loaded'
-        AND o.fulfillment_status <> 'fulfilled'
         AND (
-          (o.order_type = 'sales_order' AND (o.status = 'B' OR o.status_text ILIKE '%Pending Fulfillment%' OR o.status_text ILIKE '%Partially Fulfilled%'))
-          OR (o.order_type = 'transfer_order' AND (o.status_text ILIKE '%Pending Fulfillment%' OR o.status_text ILIKE '%Partially Fulfilled%'))
+          o.dispatch_planned = true
+          OR COALESCE(o.local_yard_order_status, 'Open') IN ('Loaded', 'loaded', 'Shipped', 'shipped', 'Packed', 'packed')
+          OR o.fulfillment_status IN ('fulfilled', 'partial_fulfilled', 'partially_fulfilled', 'shipped')
+          OR (o.order_type = 'sales_order' AND (
+            o.status = 'B'
+            OR o.status_text ILIKE '%Pending Fulfillment%'
+            OR o.status_text ILIKE '%Partially Fulfilled%'
+            OR o.status_text ILIKE '%Pending Billing%'
+            OR o.status_text ILIKE '%Billed%'
+            OR o.status_text ILIKE '%Fulfilled%'
+          ))
+          OR (o.order_type = 'transfer_order' AND (
+            o.status_text ILIKE '%Pending Fulfillment%'
+            OR o.status_text ILIKE '%Partially Fulfilled%'
+            OR o.status_text ILIKE '%Pending Receipt%'
+            OR o.status_text ILIKE '%Partially Received%'
+            OR o.status_text ILIKE '%Received%'
+          ))
         )
       GROUP BY o.netsuite_id, o.tranid, o.order_type, o.customer, o.destination_location,
                o.expected_delivery_date, o.outbound_location, o.dispatch_address,
                o.dispatch_window_start, o.dispatch_window_end, o.dispatch_instructions,
                o.dispatch_parse_source, o.operator_status, o.local_yard_order_status,
-               o.dispatch_planned, o.fulfillment_status, o.status, o.status_text,
+               o.dispatch_planned, o.dispatch_plan_date, o.dispatch_truck_plate,
+               o.dispatch_load_name, o.dispatch_parking_spot, o.fulfillment_status, o.status, o.status_text,
                o.netsuite_active, co.co_ref, co.from_location, co.to_location, ap.pickup_locations
+      HAVING o.dispatch_planned = true OR COUNT(l.id) > 0
     ),
     receiving AS (
       SELECT
@@ -470,6 +520,14 @@ export async function listDispatchOrders({ type = null } = {}) {
         NULL::text AS operator_status,
         'Open'::text AS local_yard_order_status,
         false AS dispatch_planned,
+        o.dispatch_plan_date,
+        o.dispatch_truck_plate,
+        o.dispatch_load_name,
+        o.dispatch_parking_spot,
+        NULL::text AS fulfillment_status,
+        NULL::text AS status,
+        o.status_text,
+        o.netsuite_active,
         COALESCE(SUM(GREATEST(COALESCE(l.pallet_qty, 0) - COALESCE(pa.allocated_pallet_qty, 0), 0)), 0) AS total_pallet_qty,
         COALESCE(SUM(GREATEST(COALESCE(l.layer_qty, 0) - COALESCE(pa.allocated_layer_qty, 0), 0)), 0) AS total_layer_qty,
         COALESCE(SUM(GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_qty, 0) - COALESCE(pa.allocated_sales_qty, 0), 0)), 0) AS total_quantity,
@@ -510,7 +568,13 @@ export async function listDispatchOrders({ type = null } = {}) {
       LEFT JOIN receiving_line_source l ON l.order_id = o.netsuite_id AND l.netsuite_active = true
       LEFT JOIN po_alloc pa ON pa.po_line_id = l.id
       WHERE o.netsuite_active = true
-        AND (o.status_text ILIKE '%Pending Receipt%' OR o.status_text ILIKE '%Partially Received%')
+        AND (
+          o.status_text ILIKE '%Pending Receipt%'
+          OR o.status_text ILIKE '%Partially Received%'
+          OR o.status_text ILIKE '%Received%'
+          OR o.status_text ILIKE '%Pending Billing%'
+          OR o.status_text ILIKE '%Billed%'
+        )
         AND NOT EXISTS (
           SELECT 1
           FROM transfer_orders d
@@ -521,7 +585,11 @@ export async function listDispatchOrders({ type = null } = {}) {
       GROUP BY o.netsuite_id, o.tranid, o.order_type, o.vendor, o.source_location,
                o.destination_location, o.expected_delivery_date, o.dispatch_vendor_yard,
                o.dispatch_address, o.dispatch_window_start, o.dispatch_window_end,
-               o.dispatch_instructions, o.dispatch_parse_source, o.status_text, o.netsuite_active
+               o.dispatch_instructions, o.dispatch_parse_source, o.dispatch_plan_date,
+               o.dispatch_truck_plate, o.dispatch_load_name, o.dispatch_parking_spot,
+               o.status_text, o.netsuite_active
+      HAVING o.dispatch_plan_date IS NOT NULL
+          OR COALESCE(SUM(GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_qty, 0) - COALESCE(pa.allocated_sales_qty, 0), 0)), 0) > 0.000001
     ),
     local_co AS (
       SELECT
@@ -547,7 +615,15 @@ export async function listDispatchOrders({ type = null } = {}) {
         '[]'::jsonb AS allocation_pickup_locations,
         NULL::text AS operator_status,
         COALESCE(co.status, 'planned') AS local_yard_order_status,
-        true AS dispatch_planned,
+        (co.dispatch_plan_id IS NOT NULL OR co.dispatch_plan_date IS NOT NULL) AS dispatch_planned,
+        co.dispatch_plan_date,
+        co.dispatch_truck_plate,
+        co.dispatch_load_name,
+        co.dispatch_parking_spot,
+        NULL::text AS fulfillment_status,
+        co.status AS status,
+        co.status AS status_text,
+        true AS netsuite_active,
         COALESCE(SUM(l.pallet_qty), 0) AS total_pallet_qty,
         COALESCE(SUM(l.layer_qty), 0) AS total_layer_qty,
         COALESCE(SUM(l.quantity), 0) AS total_quantity,
@@ -594,6 +670,7 @@ export async function refreshDispatchEnrichment({ force = false, delivery: inclu
   if (includeDelivery) {
     const delivery = await query(
       `SELECT netsuite_id, 'sales_order'::text AS order_type, memo,
+              expected_delivery_date,
               outbound_location_id, outbound_location,
               NULL::bigint AS destination_location_id, NULL::text AS destination_location,
               NULL::bigint AS source_location_id, NULL::text AS source_location
@@ -602,6 +679,7 @@ export async function refreshDispatchEnrichment({ force = false, delivery: inclu
           AND ($1::boolean OR dispatch_note_hash IS NULL OR dispatch_parse_source IS NULL)
        UNION ALL
        SELECT netsuite_id, 'transfer_order'::text AS order_type, memo,
+              expected_delivery_date,
               from_location_id AS outbound_location_id, from_location AS outbound_location,
               to_location_id AS destination_location_id, to_location AS destination_location,
               from_location_id AS source_location_id, from_location AS source_location
@@ -623,6 +701,11 @@ export async function refreshDispatchEnrichment({ force = false, delivery: inclu
                 dispatch_instructions = $5,
                 dispatch_parse_source = $6,
                 dispatch_note_hash = $7,
+                expected_delivery_date = CASE
+                  WHEN expected_delivery_date IS NOT NULL THEN expected_delivery_date
+                  WHEN $8::date IS NULL THEN expected_delivery_date
+                  ELSE $8::date
+                END,
                 dispatch_parsed_at = now()
           WHERE netsuite_id = $1`,
         [
@@ -632,7 +715,8 @@ export async function refreshDispatchEnrichment({ force = false, delivery: inclu
           dispatch.dispatch_window_end,
           dispatch.dispatch_instructions,
           dispatch.dispatch_parse_source,
-          dispatch.dispatch_note_hash
+          dispatch.dispatch_note_hash,
+          dispatch.expected_delivery_date || null
         ]
       );
       deliveryCount += 1;
@@ -710,6 +794,127 @@ export async function refreshDispatchEnrichment({ force = false, delivery: inclu
     }
   }
   return { delivery: deliveryCount, receiving: receivingCount };
+}
+
+export async function reparseMissingSalesOrderDispatch({ limit = 200, dryRun = false, scope = "missing" } = {}) {
+  const cleanLimit = Math.min(Math.max(Number(limit) || 200, 1), 1000);
+  const allNonShipped = scope === "non_shipped";
+  const result = await query(
+    `SELECT netsuite_id, tranid, memo, sales_order_type AS delivery_method, delivery_method_id,
+            outbound_location_id, outbound_location,
+            dispatch_address, dispatch_window_start, dispatch_window_end,
+            dispatch_instructions, dispatch_parse_source, expected_delivery_date
+       FROM sales_orders
+      WHERE netsuite_active = true
+        AND COALESCE(status_text, '') NOT ILIKE '%pending approval%'
+        AND (
+          delivery_method_id::text = '2'
+          OR LOWER(COALESCE(sales_order_type, '')) = 'delivery'
+          OR LOWER(COALESCE(sales_order_type, '')) LIKE '%delivery%'
+        )
+        AND LOWER(COALESCE(sales_order_type, '')) NOT LIKE '%pick%'
+        AND COALESCE(local_yard_order_status, '') NOT IN ('loaded', 'shipped')
+        AND COALESCE(status_text, '') NOT ILIKE '%pending billing%'
+        AND COALESCE(status_text, '') NOT ILIKE '%closed%'
+        AND COALESCE(status_text, '') NOT ILIKE '%cancel%'
+        AND ($2::boolean OR (
+          NULLIF(dispatch_address, '') IS NULL
+          OR NULLIF(dispatch_window_start, '') IS NULL
+          OR NULLIF(dispatch_window_end, '') IS NULL
+          OR expected_delivery_date IS NULL
+        ))
+      ORDER BY expected_delivery_date NULLS LAST, tranid DESC
+      LIMIT $1`,
+    [cleanLimit, allNonShipped]
+  );
+
+  const details = [];
+  let updated = 0;
+  let resolvedTime = 0;
+  let resolvedAddress = 0;
+  let failed = 0;
+
+  for (const row of result.rows) {
+    try {
+      const before = {
+        address: row.dispatch_address || "",
+        expectedDeliveryDate: dateOnly(row.expected_delivery_date),
+        windowStart: row.dispatch_window_start || "",
+        windowEnd: row.dispatch_window_end || "",
+        parseSource: row.dispatch_parse_source || ""
+      };
+      const dispatch = await enrichSalesOrderDispatch(row);
+      const after = {
+        address: dispatch.dispatch_address || "",
+        expectedDeliveryDate: dispatch.expected_delivery_date || before.expectedDeliveryDate,
+        windowStart: dispatch.dispatch_window_start || "",
+        windowEnd: dispatch.dispatch_window_end || "",
+        parseSource: dispatch.dispatch_parse_source || ""
+      };
+      const hasTime = Boolean(after.windowStart && after.windowEnd);
+      const hasAddress = Boolean(after.address);
+
+      if (!dryRun) {
+        await query(
+          `UPDATE sales_orders
+              SET dispatch_address = $2,
+                  dispatch_window_start = $3,
+                  dispatch_window_end = $4,
+                  dispatch_instructions = $5,
+                  dispatch_parse_source = $6,
+                  dispatch_note_hash = $7,
+                  expected_delivery_date = CASE
+                    WHEN expected_delivery_date IS NOT NULL THEN expected_delivery_date
+                    WHEN $8::date IS NULL THEN expected_delivery_date
+                    ELSE $8::date
+                  END,
+                  dispatch_parsed_at = now()
+            WHERE netsuite_id = $1`,
+          [
+            row.netsuite_id,
+            dispatch.dispatch_address,
+            dispatch.dispatch_window_start,
+            dispatch.dispatch_window_end,
+            dispatch.dispatch_instructions,
+            dispatch.dispatch_parse_source,
+            dispatch.dispatch_note_hash,
+            dispatch.expected_delivery_date || null
+          ]
+        );
+        updated += 1;
+      }
+
+      if (!before.windowStart && after.windowStart && after.windowEnd) resolvedTime += 1;
+      if (!before.address && hasAddress) resolvedAddress += 1;
+      details.push({
+        tranid: row.tranid,
+        netsuiteId: row.netsuite_id,
+        before,
+        after,
+        resolvedTime: hasTime,
+        resolvedAddress: hasAddress
+      });
+    } catch (error) {
+      failed += 1;
+      details.push({
+        tranid: row.tranid,
+        netsuiteId: row.netsuite_id,
+        error: error.message
+      });
+    }
+  }
+
+  return {
+    matched: result.rowCount,
+    updated,
+    failed,
+    resolvedTime,
+    resolvedAddress,
+    dryRun,
+    scope: allNonShipped ? "non_shipped" : "missing",
+    limit: cleanLimit,
+    details
+  };
 }
 
 export async function setPurchaseOrderVendorYard(orderRef, vendorYardId) {
@@ -1236,16 +1441,20 @@ export async function upsertLocalCoOrder({ sourceOrderRef, fromYard, toYard, ord
   const sourceRef = String(sourceOrderRef || order.id || "").trim();
   const fromText = locationTextFromId(fromYard || order.sourceYard || order.pickupLocations?.[0]);
   const toText = locationTextFromId(toYard || "12441");
-  if (!sourceRef) throw new Error("Source sales order is required for CO.");
+  if (!sourceRef) throw new Error("Source order is required for CO.");
   if (!fromText || !toText || fromText === toText) throw new Error("CO source and destination yard must be different.");
   const coRef = String(order.transitCo?.id || `CO-${sourceRef}`).trim();
   const details = {
     customer: order.customer || "",
     notes: order.notes || `Local transit depot order for ${sourceRef}.`,
     sourceOrderId: sourceRef,
+    sourceOrderType: order.sourceOrderType || order.type || "",
+    childOrderIds: Array.isArray(order.childOrders) ? order.childOrders : [],
+    childOrderDetails: Array.isArray(order.childOrderDetails) ? order.childOrderDetails : [],
     weight: order.weight || 0,
     salesQty: order.salesQty || 0
   };
+  const hasDispatchAssignment = Boolean(plan.truckPlate || plan.loadName || plan.parkingSpot);
   const inserted = await query(
     `INSERT INTO local_co_orders (
        co_ref, source_order_ref, from_location_id, from_location, to_location_id, to_location,
@@ -1263,11 +1472,20 @@ export async function upsertLocalCoOrder({ sourceOrderRef, fromYard, toYard, ord
        to_location_id = EXCLUDED.to_location_id,
        to_location = EXCLUDED.to_location,
        status = CASE WHEN local_co_orders.status = 'cancelled' THEN 'pending_load' ELSE local_co_orders.status END,
-       dispatch_plan_id = EXCLUDED.dispatch_plan_id,
-       dispatch_plan_date = EXCLUDED.dispatch_plan_date,
-       dispatch_truck_plate = EXCLUDED.dispatch_truck_plate,
-       dispatch_load_name = EXCLUDED.dispatch_load_name,
-       dispatch_parking_spot = EXCLUDED.dispatch_parking_spot,
+       dispatch_plan_id = COALESCE(EXCLUDED.dispatch_plan_id, local_co_orders.dispatch_plan_id),
+       dispatch_plan_date = COALESCE(EXCLUDED.dispatch_plan_date, local_co_orders.dispatch_plan_date),
+       dispatch_truck_plate = CASE
+         WHEN EXCLUDED.dispatch_plan_id IS NULL AND EXCLUDED.dispatch_plan_date IS NULL THEN local_co_orders.dispatch_truck_plate
+         ELSE EXCLUDED.dispatch_truck_plate
+       END,
+       dispatch_load_name = CASE
+         WHEN EXCLUDED.dispatch_plan_id IS NULL AND EXCLUDED.dispatch_plan_date IS NULL THEN local_co_orders.dispatch_load_name
+         ELSE EXCLUDED.dispatch_load_name
+       END,
+       dispatch_parking_spot = CASE
+         WHEN EXCLUDED.dispatch_plan_id IS NULL AND EXCLUDED.dispatch_plan_date IS NULL THEN local_co_orders.dispatch_parking_spot
+         ELSE EXCLUDED.dispatch_parking_spot
+       END,
        details = EXCLUDED.details,
        updated_at = now()
      RETURNING *`,
@@ -1278,11 +1496,11 @@ export async function upsertLocalCoOrder({ sourceOrderRef, fromYard, toYard, ord
       fromText,
       locationIdFromText(toText),
       toText,
-      plan.id || null,
-      plan.planDate || null,
-      plan.truckPlate || "",
-      plan.loadName || "",
-      plan.parkingSpot || "",
+      hasDispatchAssignment ? plan.id || null : null,
+      hasDispatchAssignment ? plan.planDate || null : null,
+      hasDispatchAssignment ? plan.truckPlate || "" : "",
+      hasDispatchAssignment ? plan.loadName || "" : "",
+      hasDispatchAssignment ? plan.parkingSpot || "" : "",
       requestedBy || null,
       JSON.stringify(details)
     ]
