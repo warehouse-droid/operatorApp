@@ -10,15 +10,15 @@ import { listDeliveryOrders, getDeliveryOrder, getFulfillableDeliveryOrder, buil
 import { clearCustomerPickupDraft, confirmCustomerPickupLine, findCustomerPickupOrder, isPendingApprovalStatus, isPickupDeliveryMethod, recordCustomerPickupLoad } from "./customer-pickup-repository.js";
 import { createOperator, getOperatorByToken, hasOperators, listAudit, listAuditOptions, listOperators, loginOperator, logoutToken, setOperatorActive, updateOperatorPassword, writeAudit } from "./auth-repository.js";
 import { applyInventoryClassificationRules, confirmCycleCountLine, getCycleCountDraft, listCycleCountRecords, listInventoryClassifications, listInventoryFacets, listInventoryItems, submitCycleCount, updateInventoryClassification, upsertInventoryBalances } from "./inventory-repository.js";
-import { listReceivingVendors, listReceivingSources, listReceivingOrders, getReceivingOrder, searchReceivingItems, confirmReceivingLine, getReceivableReceivingOrder, buildItemReceiptPayload, recordReceivingReceipt, recordReceivingReceiptFailure, listReceivingReceipts, listLocalCoSources, listLocalCoReceivingOrders, searchLocalCoItems, getLocalCoReceivingOrder, confirmLocalCoReceivingLine, receiveLocalCoOrder } from "./receiving-repository.js";
+import { listReceivingVendors, listReceivingSources, listReceivingOrders, getReceivingOrder, searchReceivingItems, confirmReceivingLine, unconfirmReceivingLine, getReceivableReceivingOrder, buildItemReceiptPayload, recordReceivingReceipt, recordReceivingReceiptFailure, listReceivingReceipts, listLocalCoSources, listLocalCoReceivingOrders, searchLocalCoItems, getLocalCoReceivingOrder, confirmLocalCoReceivingLine, unconfirmLocalCoReceivingLine, receiveLocalCoOrder } from "./receiving-repository.js";
 import { listExistingInboundOrderIds, listExistingOutboundOrderIds, markMissingInboundOrderLines, markMissingInboundOrders, markMissingOutboundOrderLines, markOutboundOrderMissing, updatePurchaseOrderNetSuiteStatus, updateSalesOrderNetSuiteStatus, upsertInboundTransferOrderLines, upsertInboundTransferOrders, upsertOutboundTransferOrderLines, upsertOutboundTransferOrders, upsertPurchaseOrderLines, upsertPurchaseOrders, upsertSalesOrderLines, upsertSalesOrders } from "./order-sync-repository.js";
 import { listOperatorHistory, listRecordWarnings, reportOperatorRecordError, resolveRecordWarning } from "./history-repository.js";
-import { listDispatchOrders, refreshDispatchEnrichment, reparseMissingSalesOrderDispatch, setPurchaseOrderVendorYard, updateDispatchOrderDetails, getSalesOrderPoAllocationOptions, createSalesOrderPoAllocation, createSalesOrderPoAllocations, cancelSalesOrderPoAllocation, createDispatchOperatorRequest, upsertLocalCoOrder, cancelLocalCoOrder, listDispatchOperatorRequests, resolveDispatchOperatorRequestsForOrder } from "./dispatch-repository.js";
-import { listDispatchVendorYards, updateDispatchVendorYard, upsertDispatchVendorYard, listDispatchParserRules, updateDispatchParserRule, listOllamaAudit } from "./dispatch-enrichment.js";
+import { listDispatchOrders, listScmPurchaseOrders, listScmSchedule, updateScmScheduleEntry, createScmScheduleGroup, cancelScmScheduleGroup, listScmViewPresets, upsertScmViewPreset, createScmVrmaOrder, syncScmScheduleFromDispatchPlan, createScmPurchaseOrderSplit, updateScmPurchaseOrderSplitRef, updateScmPurchaseOrderSplitDestination, updateScmPurchaseOrderSplitPickupYard, updatePurchaseOrderDispatchRef, cancelScmPurchaseOrderSplit, refreshDispatchEnrichment, reparseMissingSalesOrderDispatch, searchSalesOrderMethodOverrides, setPurchaseOrderVendorYard, updateDispatchOrderDetails, updateSalesOrderLocalMethod, getSalesOrderPoAllocationOptions, createSalesOrderPoAllocation, createSalesOrderPoAllocations, cancelSalesOrderPoAllocation, createDispatchOperatorRequest, upsertLocalCoOrder, cancelLocalCoOrder, listDispatchOperatorRequests, resolveDispatchOperatorRequestsForOrder } from "./dispatch-repository.js";
+import { listDispatchVendorYards, updateDispatchVendorYard, upsertDispatchVendorYard, listDispatchParserRules, updateDispatchParserRule, listOllamaAudit, listDispatchVendorMappings, discoverDispatchVendorMappingsFromPurchaseOrders, updateDispatchVendorMapping, createDispatchLocalVendor, updateDispatchLocalVendor } from "./dispatch-enrichment.js";
 import { listDispatchAudit, writeDispatchAudit } from "./dispatch-audit-repository.js";
-import { StaleDispatchPlanSaveError, confirmDispatchPlan, createDispatchPlan, getCurrentDispatchPlan, getDispatchPlan, listDispatchPlans, reopenDispatchPlan, saveDispatchPlanSnapshot } from "./dispatch-plan-repository.js";
+import { DispatchPlanDateMismatchError, StaleDispatchPlanSaveError, confirmDispatchPlan, createDispatchPlan, getCurrentDispatchPlan, getDispatchPlan, getDispatchPlanRevision, getDispatchPlanSnapshot, listDispatchPlanSnapshots, listDispatchPlans, reopenDispatchPlan, restoreDispatchPlanSnapshot, saveDispatchPlanSnapshot } from "./dispatch-plan-repository.js";
 import { getDispatchStatistics } from "./dispatch-statistics-repository.js";
-import { getDriverDayState, getNextDriverJob, listDriverHistory, listDriverJobStatuses, recordDriverJobPhotos, skipDriverDvirForTesting, startDriverJob, submitDriverDvir } from "./driver-repository.js";
+import { endDriverRest, ensureDriverSamsaraDutyForJob, getActiveDriverRest, getDriverDayState, getNextDriverJob, listDriverHistory, listDriverJobStatuses, recordDriverJobPhotos, skipDriverDvirForTesting, startDriverJob, startDriverRest, submitDriverDvir } from "./driver-repository.js";
 import { createSamsaraDriverAuthToken, createSamsaraDriverVehicleAssignment, findSamsaraDriverByUsername, listSamsaraVehicleLocations, setSamsaraDriverDutyStatus, testSamsaraConnection } from "./samsara.js";
 import { createPhotoReadToken, createPhotoUploadToken, isR2PhotoReference, publicPhotoUploadConfig } from "./photo-upload.js";
 
@@ -294,14 +294,21 @@ function dispatchPlannedAssignmentMap(plan = {}) {
     if (ref && !assignments.has(ref)) assignments.set(ref, details);
   };
   const addOrderRefs = (orderId, details) => {
-    addRef(orderId, details);
     const order = orderById.get(String(orderId || ""));
+    const plannedDetails = {
+      ...details,
+      plannedOrderRef: String(orderId || "").trim()
+    };
+    if (order?.childOrders?.length || order?.originalOrderId) {
+      plannedDetails.plannedOrderSnapshot = order;
+    }
+    addRef(orderId, plannedDetails);
     if (!order || order.type === "CO") return;
-    addRef(order.originalOrderId, details);
-    for (const childId of order.childOrders || []) addRef(childId, details);
+    addRef(order.originalOrderId, plannedDetails);
+    for (const childId of order.childOrders || []) addRef(childId, plannedDetails);
     for (const child of order.childOrderDetails || []) {
-      addRef(child?.id, details);
-      addRef(child?.originalOrderId, details);
+      addRef(child?.id, plannedDetails);
+      addRef(child?.originalOrderId, plannedDetails);
     }
   };
   for (const truck of plan.trucks || []) {
@@ -394,6 +401,66 @@ async function listDispatchPlannedAssignments() {
   return [...plannedAssignments.entries()]
     .map(([orderRef, details]) => ({ orderRef, ...details }))
     .sort((a, b) => String(a.orderRef).localeCompare(String(b.orderRef)));
+}
+
+function isSnapshotDerivedDispatchOrder(order = {}) {
+  if (!order?.id || order?.type === "CO") return false;
+  return Boolean(
+    (Array.isArray(order.childOrders) && order.childOrders.length)
+    || String(order.originalOrderId || "").trim()
+  );
+}
+
+async function listDispatchSnapshotDerivedOrders({ type = null } = {}) {
+  const [result, inactiveSplits] = await Promise.all([
+    query(
+    `SELECT p.id, p.plan_date::text AS plan_date, p.updated_at, s.orders
+       FROM dispatch_plans p
+       JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+      WHERE p.status <> 'cancelled'
+      ORDER BY p.updated_at DESC, p.plan_date DESC`
+    ),
+    query(
+      `SELECT tranid FROM sales_orders WHERE tranid LIKE '%-S%' AND netsuite_active = false
+       UNION
+       SELECT tranid FROM transfer_orders WHERE tranid LIKE '%-S%' AND netsuite_active = false`
+    )
+  ]);
+  const inactiveSplitRefs = new Set(inactiveSplits.rows.map((row) => String(row.tranid || "")));
+  const derivedOrders = new Map();
+  const wantedType = type ? String(type).toUpperCase() : "";
+  for (const row of result.rows) {
+    for (const order of row.orders || []) {
+      if (!isSnapshotDerivedDispatchOrder(order)) continue;
+      if (wantedType && String(order?.type || "").toUpperCase() !== wantedType) continue;
+      const id = String(order?.id || "").trim();
+      if (String(order?.originalOrderId || "").trim() && inactiveSplitRefs.has(id)) continue;
+      if (!id || derivedOrders.has(id)) continue;
+      derivedOrders.set(id, {
+        ...order,
+        childOrders: Array.isArray(order.childOrders) ? order.childOrders.filter(Boolean) : [],
+        dispatchSnapshotSourcePlanId: String(row.id || ""),
+        dispatchSnapshotSourcePlanDate: String(row.plan_date || "").slice(0, 10)
+      });
+    }
+  }
+  return [...derivedOrders.values()];
+}
+
+function mergeDispatchOrderFeedWithSnapshotDerivedOrders(orders = [], derivedOrders = []) {
+  const byId = new Map((orders || []).map((order) => [String(order?.id || ""), order]));
+  for (const derived of derivedOrders || []) {
+    const id = String(derived?.id || "").trim();
+    if (!id || byId.has(id)) continue;
+    byId.set(id, derived);
+  }
+  return [...byId.values()];
+}
+
+async function listDispatchOrdersForResponse({ type = null } = {}) {
+  const orders = await listDispatchOrders({ type });
+  const derivedOrders = await listDispatchSnapshotDerivedOrders({ type });
+  return enrichDispatchOrdersWithPlanAssignments(mergeDispatchOrderFeedWithSnapshotDerivedOrders(orders, derivedOrders));
 }
 
 async function findDispatchPlanDateConflicts({ planId, planDate, orders = [], trucks = [] } = {}) {
@@ -957,6 +1024,19 @@ async function estimatedTruckSpeeds(plates = []) {
   }, {});
 }
 
+function localDateDaysAgo(days = 0) {
+  const date = new Date();
+  date.setDate(date.getDate() - Number(days || 0));
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Toronto",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(date);
+  const byType = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${byType.year}-${byType.month}-${byType.day}`;
+}
+
 function validCoordinate(latitude, longitude) {
   return Number.isFinite(Number(latitude)) && Number.isFinite(Number(longitude));
 }
@@ -1139,6 +1219,13 @@ function samsaraUsernameForDriver(driver, account = "primary") {
     : String(driver?.samsaraPrimaryLogin || "").trim();
 }
 
+function samsaraAccountsForDriver(driver) {
+  return {
+    primaryUsername: samsaraUsernameForDriver(driver, "primary"),
+    secondaryUsername: samsaraUsernameForDriver(driver, "secondary")
+  };
+}
+
 function publicSamsaraAuthResult(result = {}, { includeSecret = false } = {}) {
   const data = result.data || {};
   const token = data.token || data.authToken || result.token || result.authToken || "";
@@ -1234,6 +1321,28 @@ function requireDispatcher(req, res, next) {
   next();
 }
 
+function normalizedOperatorRole(operator) {
+  return String(operator?.role || "").trim().toLowerCase().replaceAll("-", "_").replaceAll(" ", "_");
+}
+
+function requireDispatchAccess(req, res, next) {
+  const role = normalizedOperatorRole(req.operator);
+  if (String(req.path || "").startsWith("/scm")) {
+    if (["admin", "dispatcher", "scm", "scm_staff"].includes(role)) return next();
+    return res.status(403).json({ error: "SCM account required" });
+  }
+  if (!["dispatcher", "admin"].includes(role)) {
+    return res.status(403).json({ error: "Dispatcher account required" });
+  }
+  next();
+}
+
+function requireScmAccess(req, res, next) {
+  const role = normalizedOperatorRole(req.operator);
+  if (["admin", "dispatcher", "scm", "scm_staff", "yard_manager"].includes(role)) return next();
+  return res.status(403).json({ error: "SCM account required" });
+}
+
 async function withTimeout(promise, ms) {
   let timer;
   const timeout = new Promise((resolve) => {
@@ -1270,8 +1379,8 @@ function normalizeSyncSettings(sync = {}) {
   const cleanSync = { ...(sync || {}) };
   delete cleanSync.salesOrderCreatedFrom;
   const mode = cleanSync.mode === "auto" ? "auto" : "manual";
-  const intervalSeconds = Number(cleanSync.intervalSeconds || defaultDispatchSetup.sync.intervalSeconds);
-  const maxRunSeconds = Number(cleanSync.maxRunSeconds || defaultDispatchSetup.sync.maxRunSeconds);
+  const intervalSeconds = Number(cleanSync.intervalSeconds ?? defaultDispatchSetup.sync.intervalSeconds);
+  const maxRunSeconds = Number(cleanSync.maxRunSeconds ?? defaultDispatchSetup.sync.maxRunSeconds);
   return {
     ...defaultDispatchSetup.sync,
     ...cleanSync,
@@ -1404,7 +1513,23 @@ function assertDispatchSyncCanContinue(context = "") {
   }
 }
 
-async function runDispatchSync({ source = "manual", actorOperatorId = null } = {}) {
+function syncAuditAction(source, { failed = false, stopped = false } = {}) {
+  if (source === "auto") {
+    if (stopped) return "netsuite.auto_sync_stopped";
+    if (failed) return "netsuite.auto_sync_failed";
+    return "netsuite.auto_sync";
+  }
+  if (source === "control_inbound_transfer_manual") {
+    if (stopped) return "netsuite.to_po_sync_stopped";
+    if (failed) return "netsuite.to_po_sync_failed";
+    return "netsuite.to_po_sync";
+  }
+  if (stopped) return "netsuite.manual_sync_stopped";
+  if (failed) return "netsuite.manual_sync_failed";
+  return "netsuite.manual_sync";
+}
+
+async function runDispatchSync({ source = "manual", actorOperatorId = null, orderScope = "all" } = {}) {
   if (syncRunning) {
     return { skipped: true, reason: "sync_running" };
   }
@@ -1432,7 +1557,9 @@ async function runDispatchSync({ source = "manual", actorOperatorId = null } = {
   });
   try {
     assertDispatchSyncCanContinue("start");
-    const synced = await syncDispatchOrderFeed();
+    const synced = orderScope === "transfer_purchase_order"
+      ? await syncTransferPurchaseOrderFeed()
+      : await syncDispatchOrderFeed();
     assertDispatchSyncCanContinue("enrichment");
     const enriched = await refreshDispatchEnrichment();
     const finishedAt = new Date().toISOString();
@@ -1449,8 +1576,8 @@ async function runDispatchSync({ source = "manual", actorOperatorId = null } = {
       actorType: actorOperatorId ? "operator" : "system",
       actorOperatorId,
       source: "netsuite",
-      action: source === "auto" ? "netsuite.auto_sync" : "netsuite.manual_sync",
-      details: { synced, enriched }
+      action: syncAuditAction(source),
+      details: { orderScope, synced, enriched }
     });
     emitAppEvent("dispatch.orders.updated", { source, syncedAt: finishedAt });
     return { synced, enriched, startedAt, finishedAt };
@@ -1470,10 +1597,8 @@ async function runDispatchSync({ source = "manual", actorOperatorId = null } = {
       actorType: actorOperatorId ? "operator" : "system",
       actorOperatorId,
       source: "netsuite",
-      action: stopped
-        ? (source === "auto" ? "netsuite.auto_sync_stopped" : "netsuite.manual_sync_stopped")
-        : (source === "auto" ? "netsuite.auto_sync_failed" : "netsuite.manual_sync_failed"),
-      details: { error: error.message }
+      action: syncAuditAction(source, { failed: !stopped, stopped }),
+      details: { orderScope, error: error.message }
     });
     if (stopped) return { stopped: true, startedAt, finishedAt, error: error.message };
     throw error;
@@ -1516,6 +1641,7 @@ async function clearOperationalOrderData({ actorOperatorId = null } = {}) {
     "dispatch_so_po_allocations",
     "dispatch_operator_requests",
     "dispatch_audit_log",
+    "driver_rest_records",
     "driver_job_records",
     "driver_day_records",
     "local_co_receipt_records",
@@ -2135,6 +2261,32 @@ async function syncDispatchOrderFeed() {
       orderType: "sales_order",
       synced: await syncDeliveryLocation(locationId, { orderType: "sales_order" })
     });
+    assertDispatchSyncCanContinue(`location ${locationId} transfer delivery orders`);
+    deliveryResults.push({
+      locationId,
+      orderType: "transfer_order",
+      synced: await syncDeliveryLocation(locationId, { orderType: "transfer_order" })
+    });
+    assertDispatchSyncCanContinue(`location ${locationId} purchase receiving orders`);
+    receivingResults.push({
+      destinationLocationId: locationId,
+      orderType: "purchase_order",
+      synced: await syncPurchaseReceiving({ locationId })
+    });
+    assertDispatchSyncCanContinue(`location ${locationId} transfer receiving orders`);
+    receivingResults.push({
+      destinationLocationId: locationId,
+      orderType: "transfer_order",
+      synced: await syncTransferReceiving({ destinationLocationId: locationId })
+    });
+  }
+  return { delivery: deliveryResults, receiving: receivingResults };
+}
+
+async function syncTransferPurchaseOrderFeed() {
+  const deliveryResults = [];
+  const receivingResults = [];
+  for (const locationId of deliveryLocations) {
     assertDispatchSyncCanContinue(`location ${locationId} transfer delivery orders`);
     deliveryResults.push({
       locationId,
@@ -2777,7 +2929,7 @@ app.use((req, res, next) => {
   if (req.path === "/service-worker.js") {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
     res.setHeader("Service-Worker-Allowed", "/");
-  } else if (req.path.endsWith(".webmanifest") || ["/operator", "/driver", "/control", "/operator.html", "/driver.html", "/control.html"].includes(req.path)) {
+  } else if (req.path.endsWith(".webmanifest") || ["/", "/operator", "/driver", "/control", "/operator.html", "/driver.html", "/control.html"].includes(req.path)) {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   }
   next();
@@ -2786,7 +2938,8 @@ app.use((req, res, next) => {
 app.use("/vendor/qr-scanner", express.static(qrScannerDir));
 app.use(express.static(publicDir));
 
-app.use("/api/dispatch", requireOperator, requireDispatcher);
+app.use("/api/scm", requireOperator, requireScmAccess);
+app.use("/api/dispatch", requireOperator, requireDispatchAccess);
 
 app.get("/api/dispatch/config", (req, res) => {
   res.json({
@@ -2968,6 +3121,82 @@ app.get("/api/dispatch/plans/current", async (req, res, next) => {
   }
 });
 
+app.get("/api/dispatch/plan-snapshots", requireOperator, requireDispatcher, async (req, res, next) => {
+  try {
+    res.json(await listDispatchPlanSnapshots({ planDate: req.query.date }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/dispatch/plan-snapshots/:snapshotId", requireOperator, requireDispatcher, async (req, res, next) => {
+  try {
+    const snapshot = await getDispatchPlanSnapshot(req.params.snapshotId);
+    if (!snapshot) return res.status(404).json({ error: "Dispatch snapshot not found" });
+    res.json(snapshot);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/dispatch/plan-snapshots/:snapshotId/restore", requireOperator, requireDispatcher, async (req, res, next) => {
+  try {
+    if (String(req.params.snapshotId || "").startsWith("current-")) {
+      return res.status(409).json({ error: "The current active version is already active." });
+    }
+    const beforePlan = await getDispatchPlanSnapshot(req.params.snapshotId);
+    if (!beforePlan) return res.status(404).json({ error: "Dispatch snapshot not found" });
+    const restored = await restoreDispatchPlanSnapshot(req.params.snapshotId, {
+      sessionId: req.body?.audit?.sessionId || ""
+    });
+    const plan = restored.plan;
+    const coAssignments = await applyDispatchPlanCoAssignments(plan);
+    const scmSchedule = await syncScmScheduleFromDispatchPlan(plan, { updatedBy: req.body?.audit?.sessionId || "dispatch-plan-save" }).catch(() => null);
+    const changedOperatorRefs = [...dispatchOperatorAssignmentMap(plan).keys()];
+    const operatorFlags = plan.status === "confirmed"
+      ? await applyConfirmedDispatchPlanToDelivery(plan, { forceOrderRefs: changedOperatorRefs })
+      : null;
+    await writeDispatchAudit({
+      action: "dispatch_plan_snapshot_restored",
+      entityType: "plan",
+      entityId: String(plan.id),
+      planId: plan.id,
+      planDate: plan.planDate,
+      sessionId: req.body?.audit?.sessionId,
+      before: {
+        snapshotId: req.params.snapshotId,
+        revision: restored.previousRevision
+      },
+      after: plan,
+      details: {
+        restoredSnapshotId: req.params.snapshotId,
+        previousRevision: restored.previousRevision,
+        restoredRevision: plan.revision,
+        restoredOrderCount: plan.orders.length,
+        restoredTruckCount: plan.trucks.length,
+        restoredLoadCount: (plan.trucks || []).reduce((sum, truck) => sum + (truck.loads || []).length, 0),
+        restoredStopCount: (plan.trucks || []).reduce((sum, truck) => sum + (truck.loads || []).reduce((loadSum, load) => loadSum + (load.stops || []).length, 0), 0),
+        sourceArchivedAt: beforePlan.archivedAt,
+        coAssignments,
+        operatorFlags
+      }
+    }).catch(() => null);
+    emitAppEvent("dispatch.plan.saved", {
+      planId: plan.id,
+      planDate: plan.planDate,
+      savedAt: plan.savedAt,
+      sourceSessionId: req.body?.audit?.sessionId,
+      operatorFlags,
+      changedOperatorRefs,
+      refreshOrderPool: true,
+      restoredSnapshotId: req.params.snapshotId
+    });
+    res.json({ plan, restoredSnapshot: restored.restoredSnapshot, operatorFlags, coAssignments });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/dispatch/plans/:id/shipped-orders.csv", async (req, res, next) => {
   try {
     const plan = await getDispatchPlan(req.params.id);
@@ -2993,9 +3222,29 @@ app.get("/api/dispatch/plans/:id", async (req, res, next) => {
   }
 });
 
-app.put("/api/dispatch/plans/:id", async (req, res, next) => {
+app.get("/api/dispatch/plans/:id/revision", async (req, res, next) => {
   try {
-    const previousPlan = await getDispatchPlan(req.params.id);
+    const revision = await getDispatchPlanRevision(req.params.id);
+    if (!revision) return res.status(404).json({ error: "Dispatch plan not found" });
+    res.json(revision);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/dispatch/plans/:id", async (req, res, next) => {
+  let previousPlan = null;
+  try {
+    previousPlan = await getDispatchPlan(req.params.id);
+    const requestedPlanDate = String(req.body?.planDate || req.body?.date || previousPlan?.planDate || "").slice(0, 10);
+    const existingPlanDate = String(previousPlan?.planDate || "").slice(0, 10);
+    if (previousPlan && requestedPlanDate && existingPlanDate && requestedPlanDate !== existingPlanDate) {
+      throw new DispatchPlanDateMismatchError({
+        planId: req.params.id,
+        expectedPlanDate: existingPlanDate,
+        payloadPlanDate: requestedPlanDate
+      });
+    }
     const saveMode = dispatchPlanSaveMode(req.body);
     const requestedOrders = sanitizeDispatchPlanOrders(Array.isArray(req.body?.orders) ? req.body.orders : []);
     const requestedTrucks = Array.isArray(req.body?.trucks) ? req.body.trucks : [];
@@ -3039,9 +3288,14 @@ app.put("/api/dispatch/plans/:id", async (req, res, next) => {
       orders: cleanOrders,
       trucks: cleanTrucks,
       summary: req.body?.summary || {},
-      baseRevision: saveMode === "truck_sequence" ? null : req.body?.baseRevision
+      baseRevision: saveMode === "truck_sequence" ? null : req.body?.baseRevision,
+      planDate: req.body?.planDate || req.body?.date || "",
+      sessionId: req.body?.audit?.sessionId || ""
     });
     const coAssignments = await applyDispatchPlanCoAssignments(plan);
+    const scmSchedule = await syncScmScheduleFromDispatchPlan(plan, {
+      updatedBy: req.body?.audit?.sessionId || "dispatch-plan-save"
+    }).catch(() => null);
     const changedOperatorRefs = [
       ...new Set([...changedDispatchOperatorRefs(previousPlan || {}, plan), ...explicitOperatorAlertRefs])
     ];
@@ -3067,26 +3321,118 @@ app.put("/api/dispatch/plans/:id", async (req, res, next) => {
           truckCount: plan.trucks.length,
           saveMode,
           coAssignments,
+          scmSchedule,
           operatorFlags,
           operatorFlagsSkipped: plan.status === "confirmed" && !shouldApplyOperatorFlags
         }
       }).catch(() => null);
     }
-    emitAppEvent("dispatch.plan.saved", { planId: plan.id, planDate: plan.planDate, savedAt: plan.savedAt, sourceSessionId: req.body?.audit?.sessionId, operatorFlags, changedOperatorRefs, refreshOrderPool });
-    res.json({ ...plan, operatorFlags });
+    emitAppEvent("dispatch.plan.saved", { planId: plan.id, planDate: plan.planDate, savedAt: plan.savedAt, sourceSessionId: req.body?.audit?.sessionId, operatorFlags, changedOperatorRefs, refreshOrderPool, scmSchedule });
+    res.json({ ...plan, operatorFlags, scmSchedule });
   } catch (error) {
-    if (error instanceof StaleDispatchPlanSaveError) return sendStaleDispatchPlanResponse(res, error);
+    if (error instanceof DispatchPlanDateMismatchError) {
+      await writeDispatchAudit({
+        action: "dispatch.plan.date_mismatch_blocked",
+        entityType: "plan",
+        entityId: String(req.params.id),
+        planId: req.params.id,
+        planDate: error.expectedPlanDate || previousPlan?.planDate || "",
+        actorType: "system",
+        source: "dispatch",
+        sessionId: req.body?.audit?.sessionId || "",
+        details: {
+          expectedPlanDate: error.expectedPlanDate,
+          payloadPlanDate: error.payloadPlanDate,
+          saveMode: dispatchPlanSaveMode(req.body),
+          orderCount: Array.isArray(req.body?.orders) ? req.body.orders.length : 0,
+          truckCount: Array.isArray(req.body?.trucks) ? req.body.trucks.length : 0
+        }
+      }).catch(() => null);
+      return res.status(409).json({
+        error: error.message,
+        code: error.code,
+        expectedPlanDate: error.expectedPlanDate,
+        payloadPlanDate: error.payloadPlanDate
+      });
+    }
+    if (error instanceof StaleDispatchPlanSaveError) {
+      await writeDispatchAudit({
+        action: "dispatch.plan.stale_save_debug",
+        entityType: "plan",
+        entityId: String(req.params.id),
+        planId: req.params.id,
+        planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date || "",
+        actorType: "system",
+        source: "dispatch",
+        sessionId: req.body?.audit?.sessionId || "",
+        details: {
+          expectedRevision: error.expectedRevision,
+          currentRevision: error.currentRevision,
+          saveMode: dispatchPlanSaveMode(req.body),
+          orderCount: Array.isArray(req.body?.orders) ? req.body.orders.length : 0,
+          truckCount: Array.isArray(req.body?.trucks) ? req.body.trucks.length : 0
+        }
+      }).catch(() => null);
+      return sendStaleDispatchPlanResponse(res, error);
+    }
     next(error);
   }
 });
 
 app.post("/api/dispatch/plans/:id/confirm", async (req, res, next) => {
+  let previousPlan = null;
   try {
-    const currentPlan = await getDispatchPlan(req.params.id);
-    const duplicateDrivers = dispatchDuplicateDriverAssignments(currentPlan?.trucks || []);
+    previousPlan = await getDispatchPlan(req.params.id);
+    if (!previousPlan) return res.status(404).json({ error: "Dispatch plan not found" });
+    const hasSubmittedSnapshot = Array.isArray(req.body?.orders) || Array.isArray(req.body?.trucks);
+    let planForConfirm = previousPlan;
+    if (hasSubmittedSnapshot) {
+      const requestedPlanDate = String(req.body?.planDate || req.body?.date || previousPlan?.planDate || "").slice(0, 10);
+      const existingPlanDate = String(previousPlan?.planDate || "").slice(0, 10);
+      if (requestedPlanDate && existingPlanDate && requestedPlanDate !== existingPlanDate) {
+        throw new DispatchPlanDateMismatchError({
+          planId: req.params.id,
+          expectedPlanDate: existingPlanDate,
+          payloadPlanDate: requestedPlanDate
+        });
+      }
+      const requestedOrders = sanitizeDispatchPlanOrders(Array.isArray(req.body?.orders) ? req.body.orders : previousPlan.orders || []);
+      const requestedTrucks = Array.isArray(req.body?.trucks) ? req.body.trucks : previousPlan.trucks || [];
+      const duplicateDrivers = dispatchDuplicateDriverAssignments(requestedTrucks);
+      if (duplicateDrivers.length) return sendDispatchDuplicateDriverResponse(res, duplicateDrivers);
+      const dateConflicts = await findNewDispatchPlanDateConflicts(previousPlan || {}, {
+        id: req.params.id,
+        planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date,
+        orders: requestedOrders,
+        trucks: requestedTrucks
+      });
+      if (dateConflicts.length) return sendDispatchPlanDateConflictResponse(res, dateConflicts);
+      const coSequenceConflicts = await findDispatchCoSequenceConflicts({
+        id: req.params.id,
+        planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date,
+        orders: requestedOrders,
+        trucks: requestedTrucks
+      });
+      if (coSequenceConflicts.length) return sendDispatchCoSequenceConflictResponse(res, coSequenceConflicts);
+      if (dispatchPlanDataChanged(
+        { orders: previousPlan.orders || [], trucks: previousPlan.trucks || [] },
+        { orders: requestedOrders, trucks: requestedTrucks }
+      )) {
+        planForConfirm = await saveDispatchPlanSnapshot(req.params.id, {
+          orders: requestedOrders,
+          trucks: requestedTrucks,
+          summary: req.body?.summary || {},
+          baseRevision: req.body?.baseRevision,
+          planDate: req.body?.planDate || req.body?.date || "",
+          sessionId: req.body?.audit?.sessionId || ""
+        });
+      }
+    }
+    const duplicateDrivers = dispatchDuplicateDriverAssignments(planForConfirm?.trucks || []);
     if (duplicateDrivers.length) return sendDispatchDuplicateDriverResponse(res, duplicateDrivers);
     const plan = await confirmDispatchPlan(req.params.id, { note: req.body?.note || "" });
     const coAssignments = await applyDispatchPlanCoAssignments(plan);
+    const scmSchedule = await syncScmScheduleFromDispatchPlan(plan, { updatedBy: req.body?.audit?.sessionId || "dispatch-plan-confirm" }).catch(() => null);
     const changedOperatorRefs = [...dispatchOperatorAssignmentMap(plan).keys()];
     const operatorFlags = await applyConfirmedDispatchPlanToDelivery(plan, { forceOrderRefs: changedOperatorRefs });
     await writeDispatchAudit({
@@ -3097,11 +3443,64 @@ app.post("/api/dispatch/plans/:id/confirm", async (req, res, next) => {
       planDate: plan.planDate,
       sessionId: req.body?.audit?.sessionId,
       after: plan,
-      details: { status: plan.status, coAssignments, operatorFlags }
+      details: {
+        ...(req.body?.audit?.details || {}),
+        status: plan.status,
+        submittedSnapshot: hasSubmittedSnapshot,
+        savedSnapshotBeforeConfirm: String(planForConfirm?.revision || "") !== String(previousPlan?.revision || ""),
+        coAssignments,
+        scmSchedule,
+        operatorFlags
+      }
     }).catch(() => null);
-    emitAppEvent("dispatch.plan.confirmed", { planId: plan.id, planDate: plan.planDate, sourceSessionId: req.body?.audit?.sessionId, operatorFlags, changedOperatorRefs, refreshOrderPool: true });
-    res.json({ ...plan, operatorFlags });
+    emitAppEvent("dispatch.plan.confirmed", { planId: plan.id, planDate: plan.planDate, sourceSessionId: req.body?.audit?.sessionId, operatorFlags, changedOperatorRefs, refreshOrderPool: true, scmSchedule });
+    res.json({ ...plan, operatorFlags, scmSchedule });
   } catch (error) {
+    if (error instanceof DispatchPlanDateMismatchError) {
+      await writeDispatchAudit({
+        action: "dispatch.plan.date_mismatch_blocked",
+        entityType: "plan",
+        entityId: String(req.params.id),
+        planId: req.params.id,
+        planDate: error.expectedPlanDate || previousPlan?.planDate || "",
+        actorType: "system",
+        source: "dispatch",
+        sessionId: req.body?.audit?.sessionId || "",
+        details: {
+          expectedPlanDate: error.expectedPlanDate,
+          payloadPlanDate: error.payloadPlanDate,
+          saveMode: "confirm",
+          orderCount: Array.isArray(req.body?.orders) ? req.body.orders.length : 0,
+          truckCount: Array.isArray(req.body?.trucks) ? req.body.trucks.length : 0
+        }
+      }).catch(() => null);
+      return res.status(409).json({
+        error: error.message,
+        code: error.code,
+        expectedPlanDate: error.expectedPlanDate,
+        payloadPlanDate: error.payloadPlanDate
+      });
+    }
+    if (error instanceof StaleDispatchPlanSaveError) {
+      await writeDispatchAudit({
+        action: "dispatch.plan.stale_save_debug",
+        entityType: "plan",
+        entityId: String(req.params.id),
+        planId: req.params.id,
+        planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date || "",
+        actorType: "system",
+        source: "dispatch",
+        sessionId: req.body?.audit?.sessionId || "",
+        details: {
+          expectedRevision: error.expectedRevision,
+          currentRevision: error.currentRevision,
+          saveMode: "confirm",
+          orderCount: Array.isArray(req.body?.orders) ? req.body.orders.length : 0,
+          truckCount: Array.isArray(req.body?.trucks) ? req.body.trucks.length : 0
+        }
+      }).catch(() => null);
+      return sendStaleDispatchPlanResponse(res, error);
+    }
     next(error);
   }
 });
@@ -3203,7 +3602,478 @@ app.post("/api/dispatch/samsara/driver-login-test", async (req, res, next) => {
 app.get("/api/dispatch/orders", async (req, res, next) => {
   try {
     const type = req.query.type ? String(req.query.type).toUpperCase() : null;
-    res.json(await enrichDispatchOrdersWithPlanAssignments(await listDispatchOrders({ type })));
+    res.json(await listDispatchOrdersForResponse({ type }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/dispatch/sales-order-methods", async (req, res, next) => {
+  try {
+    res.json(await searchSalesOrderMethodOverrides({
+      search: req.query.search || "",
+      limit: req.query.limit || 30
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/dispatch/sales-order-methods/:tranid", async (req, res, next) => {
+  try {
+    const before = (await searchSalesOrderMethodOverrides({ search: req.params.tranid, limit: 1 }))[0] || null;
+    const updated = await updateSalesOrderLocalMethod(req.params.tranid, {
+      method: req.body?.method,
+      updatedBy: operatorId(req)
+    });
+    if (!updated) return res.status(404).json({ error: "Sales order not found in local DB. Sync the order first, then update local method." });
+    await writeDispatchAudit({
+      action: "sales_order_local_method_updated",
+      entityType: "sales_order",
+      entityId: updated.netsuiteId,
+      orderId: updated.tranid,
+      operatorId: req.operator?.id,
+      operatorName: req.operator?.display_name || req.operator?.username,
+      before,
+      after: updated,
+      details: {
+        requestedMethod: req.body?.method,
+        netSuiteMethod: updated.netsuiteMethod,
+        overrideActive: updated.overrideActive
+      }
+    }).catch(() => null);
+    emitAppEvent("dispatch.orders.updated", { orderId: updated.tranid, change: "sales_order_local_method" });
+    res.json({ updated, orders: await listDispatchOrdersForResponse({ type: "SO" }) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/schedule", async (req, res, next) => {
+  try {
+    res.json(await listScmSchedule({
+      search: req.query.search || "",
+      status: req.query.status || "",
+      method: req.query.method || "",
+      kind: req.query.kind || "",
+      yard: req.query.dropoffPoint || req.query.yard || "",
+      brand: req.query.brand || "",
+      from: req.query.from || "",
+      to: req.query.to || "",
+      view: req.query.view || ""
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/schedule", async (req, res, next) => {
+  try {
+    const operator = await getOperatorByToken(bearerToken(req)).catch(() => null);
+    const updated = await updateScmScheduleEntry({
+      orderKind: req.body?.orderKind || req.body?.order_kind,
+      orderRef: req.body?.orderRef || req.body?.order_ref,
+      patch: req.body || {},
+      updatedBy: operator?.id || req.body?.audit?.sessionId || ""
+    });
+    await writeDispatchAudit({
+      action: "scm.schedule.updated",
+      entityType: "scm_schedule",
+      entityId: `${updated.order_kind}:${updated.order_ref}`,
+      orderId: updated.order_ref,
+      operatorId: operator?.id,
+      operatorName: operator?.display_name || operator?.username,
+      sessionId: req.body?.audit?.sessionId,
+      source: "scm",
+      after: updated
+    }).catch(() => null);
+    emitAppEvent("dispatch.orders.updated", { source: "scm-schedule", orderId: updated.order_ref });
+    res.json({ updated, schedule: await listScmSchedule() });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/scm/schedule/:id", async (req, res, next) => {
+  try {
+    const operator = await getOperatorByToken(bearerToken(req)).catch(() => null);
+    const updated = await updateScmScheduleEntry({
+      orderKind: req.body?.orderKind || req.body?.order_kind,
+      orderRef: req.params.id,
+      patch: req.body || {},
+      updatedBy: operator?.id || req.body?.audit?.sessionId || ""
+    });
+    await writeDispatchAudit({
+      action: "scm.schedule.updated",
+      entityType: "scm_schedule",
+      entityId: `${updated.order_kind}:${updated.order_ref}`,
+      orderId: updated.order_ref,
+      operatorId: operator?.id,
+      operatorName: operator?.display_name || operator?.username,
+      sessionId: req.body?.audit?.sessionId,
+      source: "scm",
+      after: updated
+    }).catch(() => null);
+    emitAppEvent("dispatch.orders.updated", { source: "scm-schedule", orderId: updated.order_ref });
+    res.json({ updated, schedule: await listScmSchedule() });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/schedule-groups", async (req, res, next) => {
+  try {
+    const operator = await getOperatorByToken(bearerToken(req)).catch(() => null);
+    const grouped = await createScmScheduleGroup({
+      refs: req.body?.refs || [],
+      createdBy: operator?.id || req.body?.audit?.sessionId || ""
+    });
+    await writeDispatchAudit({
+      action: "scm.schedule_group.created",
+      entityType: "scm_schedule_group",
+      entityId: grouped.groupRef,
+      orderId: grouped.groupRef,
+      operatorId: operator?.id,
+      operatorName: operator?.display_name || operator?.username,
+      sessionId: req.body?.audit?.sessionId,
+      source: "scm",
+      after: grouped
+    }).catch(() => null);
+    emitAppEvent("dispatch.orders.updated", { source: "scm-group", orderId: grouped.groupRef });
+    res.json({ grouped, schedule: await listScmSchedule() });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete("/api/scm/schedule-groups/:groupRef", async (req, res, next) => {
+  try {
+    const operator = await getOperatorByToken(bearerToken(req)).catch(() => null);
+    const cancelled = await cancelScmScheduleGroup({
+      groupRef: req.params.groupRef,
+      cancelledBy: operator?.id || req.query.sessionId || ""
+    });
+    await writeDispatchAudit({
+      action: "scm.schedule_group.cancelled",
+      entityType: "scm_schedule_group",
+      entityId: cancelled.groupRef,
+      orderId: cancelled.groupRef,
+      operatorId: operator?.id,
+      operatorName: operator?.display_name || operator?.username,
+      sessionId: req.query.sessionId,
+      source: "scm",
+      after: cancelled
+    }).catch(() => null);
+    emitAppEvent("dispatch.orders.updated", { source: "scm-group-cancel", orderId: cancelled.groupRef });
+    res.json({ cancelled, schedule: await listScmSchedule() });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/view-presets", async (req, res, next) => {
+  try {
+    res.json(await listScmViewPresets());
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/view-presets", async (req, res, next) => {
+  try {
+    const operator = await getOperatorByToken(bearerToken(req)).catch(() => null);
+    const preset = await upsertScmViewPreset({
+      id: req.body?.id || null,
+      name: req.body?.name,
+      description: req.body?.description,
+      config: req.body?.config || {},
+      updatedBy: operator?.id || req.body?.audit?.sessionId || ""
+    });
+    res.json({ preset, presets: await listScmViewPresets() });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/scm/view-presets/:id", async (req, res, next) => {
+  try {
+    const operator = await getOperatorByToken(bearerToken(req)).catch(() => null);
+    const preset = await upsertScmViewPreset({
+      id: req.params.id,
+      name: req.body?.name,
+      description: req.body?.description,
+      config: req.body?.config || {},
+      updatedBy: operator?.id || req.body?.audit?.sessionId || ""
+    });
+    res.json({ preset, presets: await listScmViewPresets() });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/vrma-orders", async (req, res, next) => {
+  try {
+    const operator = await getOperatorByToken(bearerToken(req)).catch(() => null);
+    const created = await createScmVrmaOrder({
+      vrmaRef: req.body?.vrmaRef || req.body?.vrma_ref,
+      vendor: req.body?.vendor,
+      localVendor: req.body?.localVendor || req.body?.local_vendor,
+      pickupLocation: req.body?.pickupLocation || req.body?.pickup_location,
+      dropoffLocation: req.body?.dropoffLocation || req.body?.dropoff_location,
+      status: req.body?.status,
+      method: req.body?.method,
+      notes: req.body?.notes,
+      lines: req.body?.lines || [],
+      createdBy: operator?.id || req.body?.audit?.sessionId || ""
+    });
+    await writeDispatchAudit({
+      action: "scm.vrma_order.upserted",
+      entityType: "scm_vrma_order",
+      entityId: req.body?.vrmaRef || req.body?.vrma_ref,
+      orderId: req.body?.vrmaRef || req.body?.vrma_ref,
+      operatorId: operator?.id,
+      operatorName: operator?.display_name || operator?.username,
+      sessionId: req.body?.audit?.sessionId,
+      source: "scm",
+      after: created
+    }).catch(() => null);
+    emitAppEvent("dispatch.orders.updated", { source: "scm-vrma", type: "PO", orderId: req.body?.vrmaRef || req.body?.vrma_ref });
+    res.json({ created, schedule: await listScmSchedule() });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/scm/vrma-orders/:id", async (req, res, next) => {
+  try {
+    req.body.vrmaRef = req.params.id;
+    const operator = await getOperatorByToken(bearerToken(req)).catch(() => null);
+    const updated = await createScmVrmaOrder({
+      vrmaRef: req.params.id,
+      vendor: req.body?.vendor,
+      localVendor: req.body?.localVendor || req.body?.local_vendor,
+      pickupLocation: req.body?.pickupLocation || req.body?.pickup_location,
+      dropoffLocation: req.body?.dropoffLocation || req.body?.dropoff_location,
+      status: req.body?.status,
+      method: req.body?.method,
+      notes: req.body?.notes,
+      lines: req.body?.lines || [],
+      createdBy: operator?.id || req.body?.audit?.sessionId || ""
+    });
+    emitAppEvent("dispatch.orders.updated", { source: "scm-vrma", type: "PO", orderId: req.params.id });
+    res.json({ updated, schedule: await listScmSchedule() });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/dispatch/scm/purchase-orders", async (req, res, next) => {
+  try {
+    res.json(await listScmPurchaseOrders({
+      search: req.query.search || "",
+      dropoff: req.query.dropoff || "",
+      vendor: req.query.vendor || "",
+      pickupPoint: req.query.pickupPoint || ""
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/dispatch/scm/purchase-order-splits", async (req, res, next) => {
+  try {
+    const operator = await getOperatorByToken(bearerToken(req)).catch(() => null);
+    const created = await createScmPurchaseOrderSplit({
+      sourcePoRef: req.body?.sourcePoRef,
+      newPoRef: req.body?.newPoRef,
+      pickupPoint: req.body?.pickupPoint,
+      destinationLocationId: req.body?.destinationLocationId,
+      lines: req.body?.lines,
+      createdBy: operator?.id || req.body?.audit?.sessionId || "",
+      details: {
+        sessionId: req.body?.audit?.sessionId || "",
+        source: "dispatch-scm"
+      }
+    });
+    await writeDispatchAudit({
+      action: "dispatch.scm_po_split_created",
+      entityType: "purchase_order",
+      entityId: created.split?.splitPoRef,
+      orderId: created.split?.splitPoRef,
+      operatorId: operator?.id,
+      operatorName: operator?.display_name || operator?.username,
+      sessionId: req.body?.audit?.sessionId,
+      source: "dispatch-scm",
+      after: created.split,
+      details: {
+        sourcePoRef: created.split?.sourcePoRef,
+        splitPoRef: created.split?.splitPoRef,
+        lineCount: created.lines?.length || 0
+      }
+    }).catch(() => null);
+    emitAppEvent("dispatch.orders.updated", { source: "scm-po-split", type: "PO", orderId: created.split?.splitPoRef });
+    res.json({ created, orders: await listScmPurchaseOrders() });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/dispatch/scm/purchase-orders/:ref/ref", async (req, res, next) => {
+  try {
+    const operator = await getOperatorByToken(bearerToken(req)).catch(() => null);
+    const updated = await updatePurchaseOrderDispatchRef({
+      poRef: req.params.ref,
+      newRef: req.body?.newRef,
+      updatedBy: operator?.id || req.body?.audit?.sessionId || ""
+    });
+    await writeDispatchAudit({
+      action: "dispatch.purchase_order_ref_updated",
+      entityType: "purchase_order",
+      entityId: updated.displayRef,
+      orderId: updated.displayRef,
+      operatorId: operator?.id,
+      operatorName: operator?.display_name || operator?.username,
+      sessionId: req.body?.audit?.sessionId,
+      source: "dispatch-scm",
+      before: { displayRef: updated.oldDisplayRef },
+      after: { displayRef: updated.displayRef, dispatchRef: updated.dispatchRef },
+      details: {
+        poRef: updated.poRef,
+        updatedPlans: updated.updatedPlans
+      }
+    }).catch(() => null);
+    emitAppEvent("dispatch.orders.updated", { source: "scm-po-ref", type: "PO", orderId: updated.displayRef });
+    emitAppEvent("receiving.order.updated", { source: "scm-po-ref", type: "PO", orderId: updated.poId });
+    res.json({ updated, orders: await listScmPurchaseOrders() });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/dispatch/scm/purchase-order-splits/:ref", async (req, res, next) => {
+  try {
+    const operator = await getOperatorByToken(bearerToken(req)).catch(() => null);
+    const updated = await updateScmPurchaseOrderSplitRef({
+      splitPoRef: req.params.ref,
+      newPoRef: req.body?.newPoRef,
+      updatedBy: operator?.id || req.body?.audit?.sessionId || ""
+    });
+    await writeDispatchAudit({
+      action: "dispatch.scm_po_split_ref_updated",
+      entityType: "purchase_order",
+      entityId: updated.newPoRef,
+      orderId: updated.newPoRef,
+      operatorId: operator?.id,
+      operatorName: operator?.display_name || operator?.username,
+      sessionId: req.body?.audit?.sessionId,
+      source: "dispatch-scm",
+      before: { splitPoRef: updated.oldPoRef },
+      after: { splitPoRef: updated.newPoRef },
+      details: {
+        sourcePoRef: updated.sourcePoRef,
+        updatedPlans: updated.updatedPlans
+      }
+    }).catch(() => null);
+    emitAppEvent("dispatch.orders.updated", { source: "scm-po-split-rename", type: "PO", orderId: updated.newPoRef });
+    res.json({ updated, orders: await listScmPurchaseOrders() });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/dispatch/scm/purchase-order-splits/:ref/destination", async (req, res, next) => {
+  try {
+    const operator = await getOperatorByToken(bearerToken(req)).catch(() => null);
+    const updated = await updateScmPurchaseOrderSplitDestination({
+      splitPoRef: req.params.ref,
+      destinationLocationId: req.body?.destinationLocationId,
+      updatedBy: operator?.id || req.body?.audit?.sessionId || ""
+    });
+    await writeDispatchAudit({
+      action: "dispatch.scm_po_split_destination_updated",
+      entityType: "purchase_order",
+      entityId: updated.splitPoRef,
+      orderId: updated.splitPoRef,
+      operatorId: operator?.id,
+      operatorName: operator?.display_name || operator?.username,
+      sessionId: req.body?.audit?.sessionId,
+      source: "dispatch-scm",
+      before: {
+        destinationLocationId: updated.oldDestinationLocationId,
+        destinationLocation: updated.oldDestinationLocation
+      },
+      after: {
+        destinationLocationId: updated.destinationLocationId,
+        destinationLocation: updated.destinationLocation
+      },
+      details: {
+        sourcePoRef: updated.sourcePoRef
+      }
+    }).catch(() => null);
+    emitAppEvent("dispatch.orders.updated", { source: "scm-po-split-destination", type: "PO", orderId: updated.splitPoRef });
+    emitAppEvent("receiving.order.updated", { source: "scm-po-split-destination", type: "PO", orderId: updated.splitPoId });
+    res.json({ updated, orders: await listScmPurchaseOrders() });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/dispatch/scm/purchase-order-splits/:ref/pickup", async (req, res, next) => {
+  try {
+    const operator = await getOperatorByToken(bearerToken(req)).catch(() => null);
+    const updated = await updateScmPurchaseOrderSplitPickupYard({
+      splitPoRef: req.params.ref,
+      pickupPoint: req.body?.pickupPoint,
+      updatedBy: operator?.id || req.body?.audit?.sessionId || ""
+    });
+    await writeDispatchAudit({
+      action: "dispatch.scm_po_split_pickup_updated",
+      entityType: "purchase_order",
+      entityId: updated.splitPoRef,
+      orderId: updated.splitPoRef,
+      operatorId: operator?.id,
+      operatorName: operator?.display_name || operator?.username,
+      sessionId: req.body?.audit?.sessionId,
+      source: "dispatch-scm",
+      before: { pickupPoint: updated.oldPickupPoint },
+      after: { pickupPoint: updated.pickupPoint, pickupAddress: updated.pickupAddress },
+      details: {
+        sourcePoRef: updated.sourcePoRef
+      }
+    }).catch(() => null);
+    emitAppEvent("dispatch.orders.updated", { source: "scm-po-split-pickup", type: "PO", orderId: updated.splitPoRef });
+    emitAppEvent("receiving.order.updated", { source: "scm-po-split-pickup", type: "PO", orderId: updated.splitPoId });
+    res.json({ updated, orders: await listScmPurchaseOrders() });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete("/api/dispatch/scm/purchase-order-splits/:ref", async (req, res, next) => {
+  try {
+    const operator = await getOperatorByToken(bearerToken(req)).catch(() => null);
+    const cancelled = await cancelScmPurchaseOrderSplit({
+      splitPoRef: req.params.ref,
+      cancelledBy: operator?.id || req.query.sessionId || ""
+    });
+    await writeDispatchAudit({
+      action: "dispatch.scm_po_split_cancelled",
+      entityType: "purchase_order",
+      entityId: cancelled.splitPoRef,
+      orderId: cancelled.splitPoRef,
+      operatorId: operator?.id,
+      operatorName: operator?.display_name || operator?.username,
+      sessionId: req.query.sessionId,
+      source: "dispatch-scm",
+      before: { splitPoRef: cancelled.splitPoRef },
+      after: { status: "cancelled" },
+      details: {
+        sourcePoRef: cancelled.sourcePoRef,
+        updatedPlans: cancelled.updatedPlans
+      }
+    }).catch(() => null);
+    emitAppEvent("dispatch.orders.updated", { source: "scm-po-split-cancelled", type: "PO", orderId: cancelled.splitPoRef });
+    res.json({ cancelled, orders: await listScmPurchaseOrders() });
   } catch (error) {
     next(error);
   }
@@ -3235,7 +4105,7 @@ app.post("/api/dispatch/sync", async (req, res, next) => {
       localOnly: true,
       skipped: true,
       reason: "NetSuite order sync is admin-only. Dispatcher refresh reads local DB.",
-      orders: await enrichDispatchOrdersWithPlanAssignments(await listDispatchOrders({ type }))
+      orders: await listDispatchOrdersForResponse({ type })
     });
   } catch (error) {
     next(error);
@@ -3246,7 +4116,7 @@ app.post("/api/dispatch/enrich", async (req, res, next) => {
   try {
     const enriched = await refreshDispatchEnrichment({ force: req.body?.force === true || req.query.force === "true" });
     emitAppEvent("dispatch.orders.updated", { source: "enrich", type: req.query.type ? String(req.query.type).toUpperCase() : null });
-    res.json({ enriched, orders: await enrichDispatchOrdersWithPlanAssignments(await listDispatchOrders({ type: req.query.type ? String(req.query.type).toUpperCase() : null })) });
+    res.json({ enriched, orders: await listDispatchOrdersForResponse({ type: req.query.type ? String(req.query.type).toUpperCase() : null }) });
   } catch (error) {
     next(error);
   }
@@ -3384,7 +4254,7 @@ app.put("/api/dispatch/orders/:id/vendor-yard", async (req, res, next) => {
       details: { vendorYardId: req.body?.vendorYardId }
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { orderId: req.params.id, type: "PO", change: "vendor_yard", sourceSessionId: req.body?.audit?.sessionId });
-    res.json({ updated, orders: await enrichDispatchOrdersWithPlanAssignments(await listDispatchOrders({ type: "PO" })) });
+    res.json({ updated, orders: await listDispatchOrdersForResponse({ type: "PO" }) });
   } catch (error) {
     next(error);
   }
@@ -3411,7 +4281,7 @@ app.put("/api/dispatch/orders/:id/details", async (req, res, next) => {
       }
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { orderId: req.params.id, change: "details", sourceSessionId: req.body?.audit?.sessionId });
-    res.json({ updated, orders: await enrichDispatchOrdersWithPlanAssignments(await listDispatchOrders()) });
+    res.json({ updated, orders: await listDispatchOrdersForResponse() });
   } catch (error) {
     next(error);
   }
@@ -3459,7 +4329,7 @@ app.post("/api/dispatch/orders/:id/po-allocations", async (req, res, next) => {
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { orderId: req.params.id, change: "so_po_allocation", sourceSessionId: req.body?.audit?.sessionId });
     emitAppEvent("delivery.order.updated", { orderRef: req.params.id, change: "so_po_allocation", sourceSessionId: req.body?.audit?.sessionId });
-    res.json({ allocations, allocation: allocations[0] || null, options: await getSalesOrderPoAllocationOptions(req.params.id), orders: await enrichDispatchOrdersWithPlanAssignments(await listDispatchOrders()) });
+    res.json({ allocations, allocation: allocations[0] || null, options: await getSalesOrderPoAllocationOptions(req.params.id), orders: await listDispatchOrdersForResponse() });
   } catch (error) {
     next(error);
   }
@@ -3479,7 +4349,7 @@ app.delete("/api/dispatch/po-allocations/:allocationId", async (req, res, next) 
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { orderId: cancelled.salesOrderRef, change: "so_po_allocation_cancelled", sourceSessionId: req.query.sessionId });
     emitAppEvent("delivery.order.updated", { orderRef: cancelled.salesOrderRef, change: "so_po_allocation_cancelled", sourceSessionId: req.query.sessionId });
-    res.json({ cancelled, options: await getSalesOrderPoAllocationOptions(cancelled.salesOrderRef), orders: await enrichDispatchOrdersWithPlanAssignments(await listDispatchOrders()) });
+    res.json({ cancelled, options: await getSalesOrderPoAllocationOptions(cancelled.salesOrderRef), orders: await listDispatchOrdersForResponse() });
   } catch (error) {
     next(error);
   }
@@ -3564,7 +4434,7 @@ app.delete("/api/dispatch/co-orders/:coRef", async (req, res, next) => {
     }).catch(() => null);
     emitAppEvent("dispatch.co.updated", { coRef: req.params.coRef, cancelled: true, sourceSessionId: req.query.sessionId });
     emitAppEvent("delivery.order.updated", { coRef: req.params.coRef, cancelled: true, source: "dispatch-co" });
-    res.json({ cancelled, orders: await enrichDispatchOrdersWithPlanAssignments(await listDispatchOrders()) });
+    res.json({ cancelled, orders: await listDispatchOrdersForResponse() });
   } catch (error) {
     next(error);
   }
@@ -3718,8 +4588,36 @@ app.get("/dispatch/setup", (req, res) => {
   res.sendFile(path.join(publicDir, "dispatch-setup.html"));
 });
 
+app.get("/dispatch/sales-order-methods", (req, res) => {
+  res.sendFile(path.join(publicDir, "dispatch-sales-order-methods.html"));
+});
+
+app.get("/dispatch/scm", (req, res) => {
+  res.redirect("/scm/POsplit");
+});
+
+app.get("/scm", (req, res) => {
+  res.sendFile(path.join(publicDir, "scm-menu.html"));
+});
+
+app.get("/scm/POsplit", (req, res) => {
+  res.sendFile(path.join(publicDir, "dispatch-scm.html"));
+});
+
+app.get("/scm/POTOschedule", (req, res) => {
+  res.sendFile(path.join(publicDir, "scm-schedule.html"));
+});
+
+app.get("/scm/VRMA", (req, res) => {
+  res.sendFile(path.join(publicDir, "scm-vrma.html"));
+});
+
 app.get("/dispatch/dvir", (req, res) => {
   res.sendFile(path.join(publicDir, "dispatch-dvir.html"));
+});
+
+app.get("/dispatch/snapshot", (req, res) => {
+  res.sendFile(path.join(publicDir, "dispatch-snapshot.html"));
 });
 
 app.get("/dispatch/monitor", (req, res) => {
@@ -3731,74 +4629,7 @@ app.get("/dispatch/statistics", (req, res) => {
 });
 
 app.get("/", (req, res) => {
-  res.type("html").send(`
-    <!doctype html>
-    <html lang="en">
-      <head>
-        <meta charset="utf-8" />
-        <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <title>MBBS Yard Server</title>
-        <style>
-          :root { color-scheme: light; }
-          * { box-sizing: border-box; }
-          body {
-            font-family: Arial, sans-serif;
-            margin: 0;
-            min-height: 100vh;
-            display: grid;
-            place-items: center;
-            background: #eef4f2;
-            color: #12211f;
-          }
-          main {
-            width: min(920px, calc(100vw - 32px));
-            display: grid;
-            gap: 18px;
-          }
-          h1 { margin: 0; font-size: 34px; }
-          p { margin: 0; color: #53635f; font-weight: 700; }
-          .routes {
-            display: grid;
-            grid-template-columns: repeat(2, minmax(0, 1fr));
-            gap: 14px;
-          }
-          a {
-            min-height: 112px;
-            border: 2px solid #bfd0cb;
-            border-radius: 10px;
-            background: #fff;
-            color: #12211f;
-            text-decoration: none;
-            padding: 18px;
-            display: grid;
-            align-content: center;
-            gap: 8px;
-            box-shadow: 0 12px 24px rgba(18, 33, 31, 0.08);
-          }
-          a:hover { border-color: #006f6b; }
-          strong { font-size: 24px; }
-          span { color: #53635f; font-weight: 800; }
-          @media (max-width: 640px) {
-            .routes { grid-template-columns: 1fr; }
-          }
-        </style>
-      </head>
-      <body>
-        <main>
-          <div>
-            <h1>MBBS Operation</h1>
-            <p>Select an application route.</p>
-          </div>
-          <section class="routes">
-            <a href="/operator"><strong>/operator</strong><span>Yard operator tablet app</span></a>
-            <a href="/control"><strong>/control</strong><span>Admin control panel</span></a>
-            <a href="/dispatch"><strong>/dispatch</strong><span>Dispatch menu</span></a>
-            <a href="/driver"><strong>/driver</strong><span>Driver phone PWA</span></a>
-          </section>
-        </main>
-      </body>
-    </html>
-  `);
+  res.sendFile(path.join(publicDir, "login.html"));
 });
 
 app.get("/health", (req, res) => {
@@ -3972,7 +4803,7 @@ app.post("/api/driver/login", async (req, res, next) => {
     if (!driver.password && password) return res.status(401).json({ error: "Password is not set for this driver. Leave password blank or update it in Dispatch Setup." });
     const token = crypto.randomBytes(32).toString("base64url");
     driverSessions.set(token, { login, createdAt: new Date().toISOString() });
-    const dayState = await getDriverDayState(login, { samsaraUsername: samsaraUsernameForDriver(driver, "primary") });
+    const dayState = await getDriverDayState(login, { samsaraAccounts: samsaraAccountsForDriver(driver) });
     res.json({ token, driver: publicDriver(driver), dayState });
   } catch (error) {
     next(error);
@@ -4016,7 +4847,7 @@ app.get("/api/driver/day-state", requireDriver, async (req, res, next) => {
   try {
     res.json({
       state: await getDriverDayState(req.driverLogin, {
-        samsaraUsername: samsaraUsernameForDriver(req.driver, "primary")
+        samsaraAccounts: samsaraAccountsForDriver(req.driver)
       })
     });
   } catch (error) {
@@ -4040,7 +4871,7 @@ app.get("/api/driver/history", requireDriver, async (req, res, next) => {
 app.post("/api/driver/logout", requireDriver, async (req, res, next) => {
   try {
     const state = await getDriverDayState(req.driverLogin, {
-      samsaraUsername: samsaraUsernameForDriver(req.driver, "primary")
+      samsaraAccounts: samsaraAccountsForDriver(req.driver)
     });
     if (state.preDvirStatus === "complete" && state.postDvirStatus !== "complete") {
       return res.status(409).json({ error: "MBBS post-trip inspection is required before logout.", state });
@@ -4055,15 +4886,15 @@ app.post("/api/driver/logout", requireDriver, async (req, res, next) => {
 app.post("/api/driver/dvir", requireDriver, async (req, res, next) => {
   try {
     const type = req.body?.type === "post" ? "post" : "pre";
-    const samsaraUsername = samsaraUsernameForDriver(req.driver, "primary");
-    const state = await getDriverDayState(req.driverLogin, { samsaraUsername });
+    const samsaraAccounts = samsaraAccountsForDriver(req.driver);
+    const state = await getDriverDayState(req.driverLogin, { samsaraAccounts });
     if (type === "post" && !state.allJobsComplete) {
       return res.status(409).json({ error: "MBBS post-trip inspection is only available after all assigned stops are complete.", state });
     }
     const result = await submitDriverDvir(req.driverLogin, {
       type,
       photoDataUrls: req.body?.photoDataUrls,
-      samsaraUsername,
+      samsaraAccounts,
       samsaraDvirAuthorId: (await readDispatchSetup()).samsara?.dvirAuthorId || config.samsara.dvirAuthorId || ""
     });
     writeAudit({
@@ -4072,7 +4903,8 @@ app.post("/api/driver/dvir", requireDriver, async (req, res, next) => {
       action: type === "post" ? "driver.post_dvir.submitted" : "driver.pre_dvir.submitted",
       details: {
         driverLogin: req.driverLogin,
-        samsaraUsername,
+        samsaraUsername: result.samsaraUsername || "",
+        samsaraAccount: result.samsaraAccount || "",
         truckPlate: result.state?.truckPlate || "",
         planDate: result.state?.planDate || "",
         samsaraError: result.samsaraError || ""
@@ -4219,7 +5051,7 @@ app.get("/api/dispatch/driver-job-statuses", async (req, res, next) => {
 app.get("/api/driver/next-job", requireDriver, async (req, res, next) => {
   try {
     const state = await getDriverDayState(req.driverLogin, {
-      samsaraUsername: samsaraUsernameForDriver(req.driver, "primary")
+      samsaraAccounts: samsaraAccountsForDriver(req.driver)
     });
     if (state.truckPlate && (state.preDvirStatus !== "complete" || !state.samsaraOnDutyConfirmed || !state.samsaraPreDvirConfirmed)) {
       const suffix = state.preDvirStatus === "complete"
@@ -4227,7 +5059,29 @@ app.get("/api/driver/next-job", requireDriver, async (req, res, next) => {
         : "";
       return res.status(428).json({ error: `MBBS pre-trip inspection must be received by Samsara before assigned jobs.${suffix}`, state });
     }
-    res.json({ job: await getNextDriverJob(req.driverLogin) });
+    res.json({ job: await getNextDriverJob(req.driverLogin), rest: await getActiveDriverRest(req.driverLogin) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/driver/rest/start", requireDriver, async (req, res, next) => {
+  try {
+    const nextJob = await getNextDriverJob(req.driverLogin);
+    const rest = await startDriverRest(req.driverLogin, { nextJob });
+    emitAppEvent("driver.rest.started", { driverLogin: req.driverLogin, restId: rest.restId, nextJobId: rest.nextJobId || null });
+    res.json({ rest, job: nextJob });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/driver/rest/end", requireDriver, async (req, res, next) => {
+  try {
+    const rest = await endDriverRest(req.driverLogin);
+    const job = await getNextDriverJob(req.driverLogin);
+    emitAppEvent("driver.rest.ended", { driverLogin: req.driverLogin, restId: rest?.restId || null, nextJobId: job?.jobId || null });
+    res.json({ rest, job });
   } catch (error) {
     next(error);
   }
@@ -4235,11 +5089,16 @@ app.get("/api/driver/next-job", requireDriver, async (req, res, next) => {
 
 app.post("/api/driver/jobs/:jobId/start", requireDriver, async (req, res, next) => {
   try {
+    const activeRest = await getActiveDriverRest(req.driverLogin);
+    if (activeRest) return res.status(409).json({ error: "End rest time before starting the next job.", rest: activeRest });
     const job = await getNextDriverJob(req.driverLogin);
     if (!job || job.jobId !== req.params.jobId) return res.status(409).json({ error: "This is no longer the next assigned job. Refresh and try again." });
+    const samsaraHandoff = await ensureDriverSamsaraDutyForJob(req.driverLogin, {
+      samsaraAccounts: samsaraAccountsForDriver(req.driver)
+    });
     const record = await startDriverJob(req.driverLogin, req.params.jobId, { job });
-    emitAppEvent("driver.job.started", { driverLogin: req.driverLogin, jobId: req.params.jobId, stopType: job.stopType, orderRefs: job.orderRefs || [] });
-    res.json({ record, job: await getNextDriverJob(req.driverLogin) });
+    emitAppEvent("driver.job.started", { driverLogin: req.driverLogin, jobId: req.params.jobId, stopType: job.stopType, orderRefs: job.orderRefs || [], samsaraHandoff });
+    res.json({ record, job: await getNextDriverJob(req.driverLogin), samsaraHandoff });
   } catch (error) {
     next(error);
   }
@@ -4277,9 +5136,20 @@ app.post("/api/driver/jobs/:jobId/photos", requireDriver, async (req, res, next)
       photoDataUrls: req.body?.photoDataUrls,
       job
     });
-    const nextJob = await getNextDriverJob(req.driverLogin);
+    let nextJob = await getNextDriverJob(req.driverLogin);
+    let rest = null;
+    if (nextJob && req.body?.autoStartRest === true) {
+      rest = await startDriverRest(req.driverLogin, { nextJob });
+      emitAppEvent("driver.rest.started", { driverLogin: req.driverLogin, restId: rest.restId, nextJobId: rest.nextJobId || null });
+    } else if (nextJob && req.body?.autoStartNext !== false) {
+      await ensureDriverSamsaraDutyForJob(req.driverLogin, {
+        samsaraAccounts: samsaraAccountsForDriver(req.driver)
+      });
+      await startDriverJob(req.driverLogin, nextJob.jobId, { job: nextJob });
+      nextJob = await getNextDriverJob(req.driverLogin);
+    }
     emitAppEvent("driver.job.completed", { driverLogin: req.driverLogin, jobId: req.params.jobId, stopType: job.stopType, nextJobId: nextJob?.jobId || null });
-    res.json({ record, nextJob, locationCheck });
+    res.json({ record, nextJob, rest, locationCheck });
   } catch (error) {
     next(error);
   }
@@ -4539,6 +5409,94 @@ app.get("/api/control/env-settings", requireOperator, requireAdmin, async (req, 
   }
 });
 
+app.get("/api/control/vendor-mappings", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    res.json(await listDispatchVendorMappings());
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/control/vendor-mappings/discover", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    const result = await discoverDispatchVendorMappingsFromPurchaseOrders();
+    const enriched = await refreshDispatchEnrichment({ force: true, delivery: false, receiving: true });
+    await writeAudit({
+      actorOperatorId: req.operator.id,
+      source: "control",
+      action: "vendor_mapping.discover",
+      details: { scanned: result.scanned, inserted: result.inserted, updated: result.updated, enriched }
+    });
+    emitAppEvent("dispatch.orders.updated", { source: "vendor-mapping-discover", enriched });
+    res.json({ ...result, enriched });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/control/local-vendors", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    const created = await createDispatchLocalVendor({
+      name: req.body?.name,
+      updatedBy: req.operator.display_name || req.operator.username || req.operator.id
+    });
+    await writeAudit({
+      actorOperatorId: req.operator.id,
+      source: "control",
+      action: "local_vendor.create",
+      details: { localVendor: created }
+    });
+    res.json({ created, ...(await listDispatchVendorMappings()) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/control/local-vendors/:id", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    const updated = await updateDispatchLocalVendor(req.params.id, {
+      name: req.body?.name,
+      active: req.body?.active,
+      updatedBy: req.operator.display_name || req.operator.username || req.operator.id
+    });
+    if (!updated) return res.status(404).json({ error: "Local vendor not found." });
+    const enriched = await refreshDispatchEnrichment({ force: true, delivery: false, receiving: true });
+    await writeAudit({
+      actorOperatorId: req.operator.id,
+      source: "control",
+      action: "local_vendor.update",
+      details: { localVendor: updated, enriched }
+    });
+    emitAppEvent("dispatch.vendor_mapping.updated", { localVendorId: req.params.id });
+    emitAppEvent("dispatch.orders.updated", { source: "local-vendor-update", enriched });
+    res.json({ updated, enriched, ...(await listDispatchVendorMappings()) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/control/vendor-mappings/:id", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    const updated = await updateDispatchVendorMapping(req.params.id, {
+      ...req.body,
+      updatedBy: req.operator.display_name || req.operator.username || req.operator.id
+    });
+    if (!updated) return res.status(404).json({ error: "Vendor mapping not found." });
+    const enriched = await refreshDispatchEnrichment({ force: true, delivery: false, receiving: true });
+    await writeAudit({
+      actorOperatorId: req.operator.id,
+      source: "control",
+      action: "vendor_mapping.update",
+      details: { mapping: updated, enriched }
+    });
+    emitAppEvent("dispatch.vendor_mapping.updated", { id: req.params.id });
+    emitAppEvent("dispatch.orders.updated", { source: "vendor-mapping", enriched });
+    res.json({ updated, enriched, ...(await listDispatchVendorMappings()) });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.put("/api/control/env-settings", requireOperator, requireAdmin, async (req, res, next) => {
   try {
     if (syncRunning || activeSyncRun) return res.status(409).json({ error: "Stop the current sync before switching env file." });
@@ -4609,6 +5567,40 @@ app.post("/api/control/sync-now", requireOperator, requireAdmin, async (req, res
         running: true,
         lastStartedAt: startedAt,
         lastSource: "control_manual",
+        lastStatus: "running",
+        lastError: ""
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/control/sync-transfer-orders", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    if (syncRunning || activeSyncRun) {
+      return res.status(202).json({
+        started: false,
+        skipped: true,
+        reason: "sync_running",
+        settings: (await readDispatchSetup()).sync
+      });
+    }
+    const startedAt = new Date().toISOString();
+    const source = "control_inbound_transfer_manual";
+    const runner = runDispatchSync({ source, actorOperatorId: req.operator.id, orderScope: "transfer_purchase_order" });
+    runner.catch((error) => {
+      console.error("Background NetSuite TO/PO sync failed:", error);
+    });
+    res.status(202).json({
+      started: true,
+      background: true,
+      message: "Transfer/Purchase Order sync started.",
+      settings: {
+        ...(await readDispatchSetup()).sync,
+        running: true,
+        lastStartedAt: startedAt,
+        lastSource: source,
         lastStatus: "running",
         lastError: ""
       }
@@ -5049,6 +6041,33 @@ app.get("/api/receiving/sources", async (req, res, next) => {
 
 app.get("/api/receiving/orders", async (req, res, next) => {
   try {
+    if (req.query.orderType === "all") {
+      const destinationLocationId = req.query.destinationLocationId || req.query.locationId || null;
+      const [purchaseOrders, transferOrders, coOrders] = await Promise.all([
+        listReceivingOrders({
+          orderType: "purchase_order",
+          destinationLocationId,
+          search: req.query.search || null,
+          itemSearch: req.query.itemSearch || null
+        }),
+        listReceivingOrders({
+          orderType: "transfer_order",
+          destinationLocationId,
+          search: req.query.search || null,
+          itemSearch: req.query.itemSearch || null
+        }),
+        listLocalCoReceivingOrders({
+          destinationLocationId,
+          search: req.query.search || null,
+          itemSearch: req.query.itemSearch || null
+        })
+      ]);
+      return res.json([...purchaseOrders, ...transferOrders, ...coOrders].sort((a, b) => {
+        const dateCompare = String(b.trandate || "").localeCompare(String(a.trandate || ""));
+        if (dateCompare) return dateCompare;
+        return String(b.tranid || "").localeCompare(String(a.tranid || ""));
+      }).slice(0, 200));
+    }
     if (req.query.orderType === "co_order") {
       return res.json(await listLocalCoReceivingOrders({
         sourceLocationId: req.query.sourceLocationId || null,
@@ -5073,6 +6092,23 @@ app.get("/api/receiving/orders", async (req, res, next) => {
 
 app.get("/api/receiving/items", async (req, res, next) => {
   try {
+    if (req.query.orderType === "all") {
+      const destinationLocationId = req.query.destinationLocationId || req.query.locationId || null;
+      const [purchaseItems, transferItems, coItems] = await Promise.all([
+        searchReceivingItems({ orderType: "purchase_order", destinationLocationId, search: req.query.search || "" }),
+        searchReceivingItems({ orderType: "transfer_order", destinationLocationId, search: req.query.search || "" }),
+        searchLocalCoItems({ destinationLocationId, search: req.query.search || "" })
+      ]);
+      const byName = new Map();
+      for (const item of [...purchaseItems, ...transferItems, ...coItems]) {
+        const key = String(item.item_name || item.item_id || "").toLowerCase();
+        const current = byName.get(key) || { ...item, order_count: 0 };
+        current.order_count = Number(current.order_count || 0) + Number(item.order_count || 0);
+        current.item_description = current.item_description || item.item_description || "";
+        byName.set(key, current);
+      }
+      return res.json([...byName.values()].sort((a, b) => Number(b.order_count || 0) - Number(a.order_count || 0)).slice(0, 12));
+    }
     if (req.query.orderType === "co_order") {
       return res.json(await searchLocalCoItems({
         sourceLocationId: req.query.sourceLocationId || null,
@@ -5113,14 +6149,17 @@ app.post("/api/receiving/orders/:id/sync", async (req, res, next) => {
 
 app.get("/api/receiving/orders/:id", async (req, res, next) => {
   try {
-    if (String(req.params.id).startsWith("CO-") || Number(req.params.id) < 0) {
+    const requestedType = req.query.orderType || "";
+    if (requestedType !== "co_order") {
+      const order = await getReceivingOrder(req.params.id);
+      if (order) return res.json(order);
+    }
+    if (requestedType === "co_order" || String(req.params.id).startsWith("CO-") || Number(req.params.id) < 0) {
       const localOrder = await getLocalCoReceivingOrder(req.params.id);
       if (!localOrder) return res.status(404).json({ error: "Local CO not found" });
       return res.json(localOrder);
     }
-    const order = await getReceivingOrder(req.params.id);
-    if (!order) return res.status(404).json({ error: "Receiving order not found" });
-    res.json(order);
+    return res.status(404).json({ error: "Receiving order not found" });
   } catch (error) {
     next(error);
   }
@@ -5128,7 +6167,7 @@ app.get("/api/receiving/orders/:id", async (req, res, next) => {
 
 app.post("/api/receiving/orders/:id/lines/:lineId/confirm", async (req, res, next) => {
   try {
-    if (req.body?.orderType === "co_order" || String(req.params.id).startsWith("CO-") || Number(req.params.id) < 0) {
+    if (req.body?.orderType === "co_order" || String(req.params.id).startsWith("CO-")) {
       const result = await confirmLocalCoReceivingLine(req.params.id, req.params.lineId, req.body || {}, operatorId(req));
       emitAppEvent("receiving.line.confirmed", { orderId: req.params.id, lineId: req.params.lineId, orderType: "co_order", operatorId: operatorId(req) });
       return res.json(result);
@@ -5141,9 +6180,24 @@ app.post("/api/receiving/orders/:id/lines/:lineId/confirm", async (req, res, nex
   }
 });
 
+app.post("/api/receiving/orders/:id/lines/:lineId/unconfirm", async (req, res, next) => {
+  try {
+    if (req.body?.orderType === "co_order" || String(req.params.id).startsWith("CO-")) {
+      const result = await unconfirmLocalCoReceivingLine(req.params.id, req.params.lineId, operatorId(req));
+      emitAppEvent("receiving.line.unconfirmed", { orderId: req.params.id, lineId: req.params.lineId, orderType: "co_order", operatorId: operatorId(req) });
+      return res.json(result);
+    }
+    const result = await unconfirmReceivingLine(req.params.id, req.params.lineId, operatorId(req));
+    emitAppEvent("receiving.line.unconfirmed", { orderId: req.params.id, lineId: req.params.lineId, orderType: req.body?.orderType || null, operatorId: operatorId(req) });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/receiving/orders/:id/receive", async (req, res, next) => {
   try {
-    if (req.body?.orderType === "co_order" || String(req.params.id).startsWith("CO-") || Number(req.params.id) < 0) {
+    if (req.body?.orderType === "co_order" || String(req.params.id).startsWith("CO-")) {
       const result = await receiveLocalCoOrder(req.params.id, operatorId(req), {
         photoDataUrls: req.body?.photoDataUrls
       });
@@ -5365,65 +6419,40 @@ app.get("/api/delivery/fulfillment-jobs/:jobId", async (req, res, next) => {
 });
 
 async function runReceivingReceipt(orderId, body, currentOperatorId, jobId) {
-  updateReceivingJob(jobId, { stage: "sync", message: "Checking latest received quantity from NetSuite." });
-  await syncReceivingOrderDetails(orderId, {
-    orderType: body?.orderType || null,
-    locationId: body?.locationId || body?.destinationLocationId || null,
-    sourceLocationId: body?.sourceLocationId || null
-  });
   updateReceivingJob(jobId, { stage: "validating", message: "Checking confirmed receiving lines." });
   const order = await getReceivableReceivingOrder(orderId);
   updateReceivingJob(jobId, {
     stage: "payload",
-    message: `Building item receipt for ${order.receivableLines.length} confirmed line(s).`
+    message: `Recording ${order.receivableLines.length} confirmed line(s) locally.`
   });
   const payload = buildItemReceiptPayload(order, order.receivableLines);
   updateReceivingJob(jobId, {
-    stage: "netsuite_post",
-    message: "Posting Item Receipt to NetSuite.",
+    stage: "local_record",
+    message: "Saving local receiving record.",
     payload,
     payloadSummary: {
       receiveLines: payload.item.items.filter((item) => item.itemReceive !== false).length,
       skipLines: payload.item.items.filter((item) => item.itemReceive === false).length
     }
   });
-  const netSuiteResult = order.order_type === "transfer_order"
-    ? await transformTransferOrderToItemReceipt(orderId, payload)
-    : await transformPurchaseOrderToItemReceipt(orderId, payload);
-  updateReceivingJob(jobId, {
-    stage: "netsuite_read",
-    message: "Reading IR number from NetSuite.",
-    itemReceiptId: netSuiteResult.id
-  });
-  const receipt = netSuiteResult.id ? await fetchItemReceiptFromNetSuite(netSuiteResult.id) : null;
-  const itemReceiptTranid = receipt?.tranId || receipt?.tranid || receipt?.id || null;
   updateReceivingJob(jobId, {
     stage: "recording",
-    message: itemReceiptTranid ? `Recording ${itemReceiptTranid} locally.` : "Recording item receipt locally.",
-    itemReceiptId: netSuiteResult.id,
-    itemReceiptTranid
+    message: "Recording receipt locally.",
+    itemReceiptId: null,
+    itemReceiptTranid: null
   });
   const record = await recordReceivingReceipt(orderId, currentOperatorId, {
     photoDataUrls: body?.photoDataUrls,
     payload,
-    response: { netSuiteResult, receipt },
-    itemReceiptId: netSuiteResult.id,
-    itemReceiptTranid
+    response: { localOnly: true },
+    itemReceiptId: null,
+    itemReceiptTranid: null
   });
   updateReceivingJob(jobId, {
-    stage: "sync_deferred",
-    message: "Receipt recorded. Order sync is continuing in background.",
+    stage: "complete",
+    message: "Receipt recorded locally.",
     itemReceiptId: record.itemReceiptId,
     itemReceiptTranid: record.itemReceiptTranid
-  });
-  Promise.resolve().then(async () => {
-    await syncReceivingOrderDetails(orderId, {
-      orderType: order.order_type,
-      locationId: order.destination_location_id,
-      sourceLocationId: order.source_location_id
-    });
-  }).catch((error) => {
-    console.error("Receiving follow-up sync failed:", error.message);
   });
   return record;
 }

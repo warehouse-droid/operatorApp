@@ -112,11 +112,13 @@ SELECT DISTINCT
   t.status,
   BUILTIN.DF(t.status) AS status_text,
   t.memo,
+  COALESCE(NULLIF(BUILTIN.DF(v.defaultbillingaddress), ''), NULLIF(BUILTIN.DF(t.billingaddress), '')) AS vendor_address,
   t.foreigntotal,
   tl.location AS destination_location_id,
   BUILTIN.DF(tl.location) AS destination_location
 FROM transaction t
 INNER JOIN transactionline tl ON tl.transaction = t.id
+LEFT JOIN vendor v ON v.id = t.entity
 WHERE t.type = 'PurchOrd'
   AND tl.item IS NOT NULL
   AND tl.location = ${id}
@@ -973,11 +975,13 @@ export async function fetchPurchaseOrderFromNetSuite(orderId, locationId = null)
       t.status,
       BUILTIN.DF(t.status) AS status_text,
       t.memo,
+      COALESCE(NULLIF(BUILTIN.DF(v.defaultbillingaddress), ''), NULLIF(BUILTIN.DF(t.billingaddress), '')) AS vendor_address,
       t.foreigntotal,
       tl.location AS destination_location_id,
       BUILTIN.DF(tl.location) AS destination_location
     FROM transaction t
     INNER JOIN transactionline tl ON tl.transaction = t.id
+    LEFT JOIN vendor v ON v.id = t.entity
     WHERE t.id = ${id}
       AND t.type = 'PurchOrd'
       AND tl.item IS NOT NULL

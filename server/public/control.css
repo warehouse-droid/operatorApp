@@ -283,6 +283,10 @@ th {
   min-height: 38px;
 }
 
+.sync-setting-grid {
+  grid-template-columns: minmax(220px, 320px) minmax(0, 1fr);
+}
+
 .sync-error {
   border-color: var(--danger);
   background: #fff4f4;
@@ -349,6 +353,53 @@ pre {
   min-height: 36px;
   border-width: 1px;
   font-weight: 800;
+}
+
+.vendor-mapping-table {
+  min-width: 1040px;
+}
+
+.local-vendor-table {
+  min-width: 920px;
+}
+
+.vendor-mapping-table select {
+  width: 220px;
+}
+
+.local-vendor-table input {
+  width: 260px;
+}
+
+.subtab-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.subtab-row button.active {
+  border-color: var(--accent);
+  background: #f0fbf8;
+  color: var(--accent);
+}
+
+.local-vendor-create {
+  display: grid;
+  grid-template-columns: minmax(260px, 360px) auto;
+  gap: 10px;
+  align-items: end;
+  justify-content: start;
+}
+
+.inline-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.inline-check input {
+  width: 22px;
+  min-height: 22px;
 }
 
 .cycle-review-list {

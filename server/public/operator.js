@@ -540,6 +540,7 @@ function connectEvents() {
     const receivingEvents = [
       "dispatch.co.updated",
       "receiving.line.confirmed",
+      "receiving.line.unconfirmed",
       "receiving.order.received",
       "dispatch.vendor_yard.updated",
       "dispatch.orders.updated"
@@ -1067,6 +1068,21 @@ function lineRequiredSalesQty(line) {
   });
 }
 
+const LOAD_SALES_QTY_TOLERANCE = 0.1;
+
+function wholeUnitsFromSalesQty(salesQuantity, conversion) {
+  const sales = qty(salesQuantity);
+  const unitSize = qty(conversion);
+  if (!sales || !unitSize) return 0;
+  const rawUnits = sales / unitSize;
+  const floorUnits = Math.floor(rawUnits + 0.000001);
+  const ceilUnits = Math.ceil(rawUnits - 0.000001);
+  if (ceilUnits > floorUnits && Math.abs((ceilUnits * unitSize) - sales) <= LOAD_SALES_QTY_TOLERANCE) {
+    return ceilUnits;
+  }
+  return floorUnits;
+}
+
 function unitConversion(line, unit) {
   if (unit === "pallets") return qty(line.to_plt);
   if (unit === "layers") return qty(line.to_lyr);
@@ -1089,7 +1105,7 @@ function unitRequiredLimit(line, unit) {
   if (!conversion) return 0;
   const explicit = explicitUnitQty(line, unit);
   if (explicit > 0) return explicit;
-  return !hasCustomPackQty(line) ? Math.floor((lineRequiredSalesQty(line) / conversion) + 0.000001) : 0;
+  return !hasCustomPackQty(line) ? wholeUnitsFromSalesQty(lineRequiredSalesQty(line), conversion) : 0;
 }
 
 function loadedUnits(line) {
@@ -1269,7 +1285,18 @@ function packedValue(line, unit) {
 
 function remainingValue(line, unit) {
   const loaded = loadedValue(line, unit);
-  return Math.max(0, requiredValue(line, unit) - loaded - packedValue(line, unit));
+  const remainingUnits = Math.max(0, requiredValue(line, unit) - loaded - packedValue(line, unit));
+  if (remainingUnits > 0 || unit === "sales") return remainingUnits;
+  const explicit = explicitUnitQty(line, unit);
+  const conversion = unitConversion(line, unit);
+  if (!explicit || !conversion) return remainingUnits;
+  const remainingSales = Math.max(0, lineRequiredSalesQty(line) - qty(line.loaded_qty) - lineUnitsToSalesQty(line, {
+    pallets: line.packed_pallet_qty,
+    layers: line.packed_layer_qty,
+    sections: line.packed_section_qty,
+    pieces: line.packed_piece_qty
+  }));
+  return wholeUnitsFromSalesQty(remainingSales, conversion);
 }
 
 function isActiveDraftPackedLine(line, order = selectedOrder) {
@@ -1306,7 +1333,7 @@ function receivingRemainingValue(line, unit) {
     : unit === "pieces" ? qty(line.to_pcs)
     : 0;
   if (!conversion) return 0;
-  return Math.max(0, Math.min(required, Math.floor((remainingSales / conversion) + 0.000001)));
+  return Math.max(0, Math.min(required, wholeUnitsFromSalesQty(remainingSales, conversion)));
 }
 
 function hasReceivingRemainingQty(line) {
@@ -1801,7 +1828,7 @@ function renderReceivingOrders() {
           ${visible.map((order) => `
             <button class="order-card ${String(order.netsuite_id) === String(receivingSelectedId) ? "active" : ""}" data-receiving-order="${order.netsuite_id}" type="button">
               <strong>${order.tranid}</strong>
-              <span class="muted">${formatDate(order.trandate)} | ${order.line_count || 0} line</span>
+              <span class="muted">${order.order_type === "co_order" ? "CO" : order.order_type === "transfer_order" ? "TO" : "PO"} | ${formatDate(order.trandate)} | ${order.line_count || 0} line</span>
               <span class="status-pill open">${order.status_text || "Pending Receipt"}</span>
             </button>
           `).join("") || `<div class="empty-state small"><strong>${t("operator.noOrderFound", "No order found")}</strong><span>${t("operator.noOrderFoundHelp", "Try another number or product.")}</span></div>`}
@@ -1824,6 +1851,7 @@ function sourceLocationText(id) {
 }
 
 function renderReceivingDetail(order) {
+  const orderType = order.order_type || receivingOrderType;
   const lines = (order.lines || []).filter((line) => isPickableLine(line) && hasReceivingRemainingQty(line));
   if (!receivingSelectedLineId || !lines.some((line) => String(line.id) === String(receivingSelectedLineId))) {
     receivingSelectedLineId = lines[0]?.id || null;
@@ -1838,7 +1866,7 @@ function renderReceivingDetail(order) {
     <div class="detail-header">
       <div>
         <h2>${order.tranid}</h2>
-        <p class="muted">${receivingOrderType === "purchase_order" ? order.vendor : `From ${order.source_location} to ${order.destination_location}`}</p>
+        <p class="muted">${orderType === "purchase_order" ? order.vendor : `From ${order.source_location} to ${order.destination_location}`}</p>
         <p class="muted">${formatDate(order.trandate)} | ${order.status_text}</p>
       </div>
       <div class="status-actions">
@@ -1872,7 +1900,16 @@ function renderReceivingLine(line) {
         ${hasReceivedQty(line) ? `<em class="underpack-note">${t("operator.confirmed", "Confirmed")}</em>` : ""}
       </div>
       <div class="required-measures">
-        ${units.map((unit) => `<div class="measure"><span>${t("operator.open", "Open")} ${unit.label}</span><b>${displayQty(receivingRemainingValue(line, unit.key))}</b></div>`).join("")}
+        ${units.map((unit) => `
+          <div class="measure">
+            <span>${t("operator.open", "Open")} ${unit.label}</span>
+            <b>${displayQty(receivingRemainingValue(line, unit.key))}</b>
+          </div>
+          <div class="measure ${receivingConfirmedValue(line, unit.key) > 0 ? "confirmed-measure" : ""}">
+            <span>${t("operator.confirmed", "Confirmed")} ${unit.label}</span>
+            <b>${displayQty(receivingConfirmedValue(line, unit.key))}</b>
+          </div>
+        `).join("")}
       </div>
     </button>
   `;
@@ -1894,6 +1931,15 @@ function receivingPanelValue(line, unit) {
   return 0;
 }
 
+function receivingConfirmedValue(line, unit) {
+  if (unit === "pallets") return qty(line.received_pallet_qty);
+  if (unit === "sections") return qty(line.received_section_qty);
+  if (unit === "layers") return qty(line.received_layer_qty);
+  if (unit === "pieces") return qty(line.received_piece_qty);
+  if (unit === "sales") return qty(line.received_piece_qty);
+  return 0;
+}
+
 function renderReceivingSelectedLinePanel(line) {
   const units = receivingLineUnits(line);
   return `
@@ -1904,10 +1950,20 @@ function renderReceivingSelectedLinePanel(line) {
         <p>${line.item_description || ""}</p>
       </div>
       <div class="selected-measures">
-        ${units.map((unit) => `<div class="measure"><span>${t("operator.open", "Open")} ${unit.label}</span><b>${displayQty(receivingRemainingValue(line, unit.key))}</b></div>`).join("")}
+        ${units.map((unit) => `
+          <div class="measure">
+            <span>${t("operator.open", "Open")} ${unit.label}</span>
+            <b>${displayQty(receivingRemainingValue(line, unit.key))}</b>
+          </div>
+          <div class="measure ${receivingConfirmedValue(line, unit.key) > 0 ? "confirmed-measure" : ""}">
+            <span>${t("operator.confirmed", "Confirmed")} ${unit.label}</span>
+            <b>${displayQty(receivingConfirmedValue(line, unit.key))}</b>
+          </div>
+        `).join("")}
       </div>
       ${units.map((unit) => renderStepper(unit.key, `Receive ${unit.label}`, receivingPanelValue(line, unit.key))).join("")}
       <div class="selected-actions">
+        ${hasReceivedQty(line) ? `<button class="secondary-button danger-button" data-action="unconfirm-receiving-line" data-line="${line.id}" type="button">${t("operator.unconfirmLine", "Unconfirm line")}</button>` : ""}
         <button class="primary-button" data-action="confirm-receiving-line" data-line="${line.id}" type="button">${t("operator.confirmLine", "Confirm line")}</button>
       </div>
     </aside>
@@ -2630,15 +2686,15 @@ async function loadReceivingOptions() {
 
 function receivingOrderUrl() {
   const url = new URL("/api/receiving/orders", window.location.origin);
-  url.searchParams.set("orderType", receivingOrderType);
   const isSearching = receivingSearch.trim() || receivingItemSearch.trim();
-  if (receivingOrderType === "transfer_order" || receivingOrderType === "co_order") {
+  url.searchParams.set("orderType", isSearching ? "all" : receivingOrderType);
+  if (!isSearching && (receivingOrderType === "transfer_order" || receivingOrderType === "co_order")) {
     if (receivingSelectedSourceId && !isSearching) url.searchParams.set("sourceLocationId", receivingSelectedSourceId);
     url.searchParams.set("destinationLocationId", locationId);
-  } else if (receivingSelectedVendor && !isSearching) {
+  } else if (!isSearching && receivingSelectedVendor) {
     url.searchParams.set("vendor", receivingSelectedVendor);
   }
-  if (receivingOrderType === "purchase_order") url.searchParams.set("destinationLocationId", locationId);
+  if (isSearching || receivingOrderType === "purchase_order") url.searchParams.set("destinationLocationId", locationId);
   if (receivingSearch.trim()) url.searchParams.set("search", receivingSearch.trim());
   if (receivingItemSearch.trim()) url.searchParams.set("itemSearch", receivingItemSearch.trim());
   return url.pathname + url.search;
@@ -2658,7 +2714,9 @@ async function loadReceivingOrders(options = {}) {
 
 async function loadReceivingDetail(id, options = {}) {
   receivingSelectedId = id;
-  receivingSelectedOrder = await api(`/api/receiving/orders/${id}`);
+  const listOrder = receivingOrders.find((order) => String(order.netsuite_id) === String(id));
+  const orderType = listOrder?.order_type || receivingOrderType;
+  receivingSelectedOrder = await api(`/api/receiving/orders/${encodeURIComponent(id)}?orderType=${encodeURIComponent(orderType)}`);
   if (!options.silentRender) render();
 }
 
@@ -2668,7 +2726,7 @@ async function loadReceivingItemSuggestions() {
     return;
   }
   const url = new URL("/api/receiving/items", window.location.origin);
-  url.searchParams.set("orderType", receivingOrderType);
+  url.searchParams.set("orderType", "all");
   url.searchParams.set("search", receivingItemSearch.trim());
   if (receivingOrderType === "transfer_order" || receivingOrderType === "co_order") {
     url.searchParams.set("destinationLocationId", locationId);
@@ -3210,7 +3268,7 @@ function renderReceiptScreen() {
         </div>
       </div>
       <div class="selected-actions">
-        ${receiptSubmitting ? `<div class="sync-alert"><strong>${receiptJobStage || "Posting to NetSuite"}</strong><span>${receiptStatusText || "Creating Item Receipt..."}${receiptStartedAt ? ` (${Math.max(1, Math.round((Date.now() - receiptStartedAt) / 1000))}s)` : ""}</span></div>` : ""}
+        ${receiptSubmitting ? `<div class="sync-alert"><strong>${receiptJobStage || "Recording locally"}</strong><span>${receiptStatusText || "Saving receiving record..."}${receiptStartedAt ? ` (${Math.max(1, Math.round((Date.now() - receiptStartedAt) / 1000))}s)` : ""}</span></div>` : ""}
         ${!receiptSubmitting && receiptJobStage === "Receiving failed" ? `<div class="sync-alert danger"><strong>${t("operator.receivingFailed", "Receiving failed")}</strong><span>${receiptStatusText}</span></div>` : ""}
         <button class="primary-button" data-action="confirm-receive" ${receiptPhotoDataUrls.filter(Boolean).length >= 2 && !receiptSubmitting ? "" : "disabled"} type="button">${receiptSubmitting ? "Receiving..." : "Receive"}</button>
       </div>
@@ -3228,13 +3286,26 @@ async function confirmReceivingLine(lineId) {
     pallets: row.querySelector('[data-pack="pallets"]')?.value || 0,
     layers: row.querySelector('[data-pack="layers"]')?.value || 0,
     pieces: row.querySelector('[data-pack="sales"]')?.value || row.querySelector('[data-pack="pieces"]')?.value || 0,
-    sections: row.querySelector('[data-pack="sections"]')?.value || 0
+    sections: row.querySelector('[data-pack="sections"]')?.value || 0,
+    orderType: receivingSelectedOrder?.order_type || receivingOrderType
   };
   receivingSelectedOrder = await api(`/api/receiving/orders/${receivingSelectedId}/lines/${lineId}/confirm`, {
     method: "POST",
     body: JSON.stringify(body)
   });
   showToast("Receiving line confirmed");
+  render();
+}
+
+async function unconfirmReceivingLine(lineId) {
+  if (!receivingSelectedId) return;
+  receivingSelectedOrder = await api(`/api/receiving/orders/${receivingSelectedId}/lines/${lineId}/unconfirm`, {
+    method: "POST",
+    body: JSON.stringify({
+      orderType: receivingSelectedOrder?.order_type || receivingOrderType
+    })
+  });
+  showToast(t("operator.receivingLineUnconfirmed", "Receiving line unconfirmed"));
   render();
 }
 
@@ -3309,7 +3380,7 @@ async function confirmReceipt() {
     receiptStatusText = "Uploading receiving photos to R2...";
     render();
     const uploadedPhotoRefs = await uploadOperatorPhotos(receiptPhotoDataUrls.filter(Boolean), {
-      recordType: receivingOrderType === "co_order" ? "operator-co-receiving-photo" : "operator-receiving-photo",
+      recordType: (receiptOrder.order_type || receivingOrderType) === "co_order" ? "operator-co-receiving-photo" : "operator-receiving-photo",
       orderType: receiptOrder.order_type || receivingOrderType,
       orderId: receiptOrder.netsuite_id,
       orderRef: receiptOrder.tranid
@@ -3326,14 +3397,14 @@ async function confirmReceipt() {
     });
     if (started.status === "complete" && started.result) {
       receiptResult = started.result;
-      showToast(receivingOrderType === "co_order" ? "CO received and moved to packed list" : "Receiving posted to NetSuite");
+      showToast((receiptOrder.order_type || receivingOrderType) === "co_order" ? "CO received and moved to packed list" : "Receiving recorded locally");
       return;
     }
     receiptJobStage = "Queued";
-    receiptStatusText = "Waiting for NetSuite IR number...";
+    receiptStatusText = "Waiting for local receiving record...";
     render();
     receiptResult = await pollReceiptJob(started.jobId);
-    showToast("Receiving posted to NetSuite");
+    showToast("Receiving recorded locally");
   } catch (error) {
     receiptJobStage = "Receiving failed";
     receiptStatusText = error.message;
@@ -3352,12 +3423,12 @@ async function pollReceiptJob(jobId) {
     await new Promise((resolve) => setTimeout(resolve, 1000));
     const job = await api(`/api/receiving/receipt-jobs/${jobId}`);
     if (job.status === "complete") return job.result;
-    if (job.status === "error") throw new Error(job.error || "NetSuite receiving failed.");
-    receiptJobStage = job.stage || "Posting";
-    receiptStatusText = job.message || `Still posting... ${attempt + 1}s`;
+    if (job.status === "error") throw new Error(job.error || "Receiving failed.");
+    receiptJobStage = job.stage || "Recording";
+    receiptStatusText = job.message || `Still recording... ${attempt + 1}s`;
     render();
   }
-  throw new Error("NetSuite receiving is still running. Please check control panel.");
+  throw new Error("Receiving record is still running. Please check control panel.");
 }
 
 async function finishReceipt() {
@@ -3998,6 +4069,7 @@ app.addEventListener("click", async (event) => {
       return render();
     }
     if (button.dataset.action === "confirm-receiving-line") return confirmReceivingLine(button.dataset.line);
+    if (button.dataset.action === "unconfirm-receiving-line") return unconfirmReceivingLine(button.dataset.line);
     if (button.dataset.action === "start-receive") return startReceipt();
     if (button.dataset.action === "cancel-receive") {
       stopReceiptCamera();

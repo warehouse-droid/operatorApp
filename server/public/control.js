@@ -18,6 +18,9 @@ let loadedOrderDetail = null;
 let selectedLoadedOrderKey = "";
 let syncSettings = { mode: "manual", running: false, lastStatus: "idle" };
 let envSettings = { activeEnvFile: ".env", selectedEnvFile: ".env", restartRequired: false, files: [] };
+let vendorMappings = { localVendors: [], mappings: [] };
+let vendorMappingTab = localStorage.getItem("mbbs.control.vendorMapping.tab") || "links";
+const USE_NETSUITE_ADDRESS_VENDOR = "__USE_NETSUITE_ADDRESS__";
 let classificationSearch = "";
 let bootstrapNeeded = false;
 let activeSection = localStorage.getItem("mbbs.control.section") || "dashboard";
@@ -50,6 +53,7 @@ let auditFilters = {
   limit: localStorage.getItem("mbbs.control.audit.limit") || "200"
 };
 let auditOptions = { actors: [], actions: [] };
+let syncMaxRunMinutesDraft = null;
 
 async function request(path, options = {}) {
   const response = await fetch(path, {
@@ -211,8 +215,43 @@ function renderLogin(message = "") {
   `;
 }
 
+function controlCssAttr(value) {
+  return String(value || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function controlSelectorForElement(element) {
+  if (!element || !app.contains(element)) return "";
+  if (element.id) return `#${controlCssAttr(element.id)}`;
+  const tag = element.tagName.toLowerCase();
+  const attrs = ["data-audit-filter", "data-field", "name"].filter((name) => element.hasAttribute(name));
+  if (!attrs.length) return "";
+  return `${tag}${attrs.map((name) => `[${name}="${controlCssAttr(element.getAttribute(name))}"]`).join("")}`;
+}
+
+function captureControlFocus() {
+  const element = document.activeElement;
+  const selector = controlSelectorForElement(element);
+  if (!selector) return null;
+  return {
+    selector,
+    start: typeof element.selectionStart === "number" ? element.selectionStart : null,
+    end: typeof element.selectionEnd === "number" ? element.selectionEnd : null
+  };
+}
+
+function restoreControlFocus(state) {
+  if (!state?.selector) return;
+  const element = app.querySelector(state.selector);
+  if (!element || typeof element.focus !== "function") return;
+  element.focus({ preventScroll: true });
+  if (state.start !== null && typeof element.setSelectionRange === "function") {
+    element.setSelectionRange(state.start, state.end ?? state.start);
+  }
+}
+
 function render() {
   if (!operator) return renderLogin();
+  const focusState = captureControlFocus();
   app.innerHTML = `
     <section class="shell">
       <header class="topbar">
@@ -233,6 +272,7 @@ function render() {
           ${renderMenuButton("operators", t("control.accountManagement", "Account Management"), t("control.accountManagementDesc", "Register and manage accounts"))}
           ${renderMenuButton("locks", t("control.orderLocks", "Order Locks"), t("control.orderLocksDesc", "Release stuck preparing orders"))}
           ${renderMenuButton("classification", t("control.itemClassification", "Item Classification"), t("control.itemClassificationDesc", "Maintain type, brand, series"))}
+          ${renderMenuButton("vendor-mapping", t("control.vendorMapping", "Vendor Mapping"), t("control.vendorMappingDesc", "Map NetSuite vendors to local vendors"))}
           ${renderMenuButton("sync", t("control.syncSettings", "Sync Settings"), t("control.syncSettingsDesc", "Auto or manual NetSuite sync"))}
           ${renderMenuButton("warnings", t("control.operatorWarnings", "Operator Warnings"), t("control.operatorWarningsDesc", "Handle reported record problems"))}
           ${renderMenuButton("loaded-export", t("control.loadedExport", "Loaded Export"), t("control.loadedExportDesc", "View and export loaded SO / TO"))}
@@ -246,6 +286,7 @@ function render() {
       </div>
     </section>
   `;
+  restoreControlFocus(focusState);
   scheduleSyncPoll();
 }
 
@@ -262,6 +303,7 @@ function renderActiveSection() {
   if (activeSection === "operators") return renderOperatorsSection();
   if (activeSection === "locks") return renderLocksSection();
   if (activeSection === "classification") return renderClassificationSection();
+  if (activeSection === "vendor-mapping") return renderVendorMappingSection();
   if (activeSection === "sync") return renderSyncSection();
   if (activeSection === "warnings") return renderWarningsSection();
   if (activeSection === "loaded-export") return renderLoadedExportSection();
@@ -389,6 +431,130 @@ function renderLocksSection() {
         </div>
       `}
     </section>
+  `;
+}
+
+function renderLocalVendorOptions(selected = "") {
+  const current = String(selected || "");
+  const vendors = [...new Set([current, ...(vendorMappings.localVendors || [])].filter((vendor) => vendor && vendor !== USE_NETSUITE_ADDRESS_VENDOR))]
+    .sort((a, b) => a.localeCompare(b));
+  return `
+    <option value="">${t("control.selectLocalVendor", "Select local vendor")}</option>
+    <option value="${USE_NETSUITE_ADDRESS_VENDOR}" ${current === USE_NETSUITE_ADDRESS_VENDOR ? "selected" : ""}>${t("control.useNetsuiteAddress", "Use Netsuite Address")}</option>
+    ${vendors.map((vendor) => `<option value="${escapeHtml(vendor)}" ${vendor === current ? "selected" : ""}>${escapeHtml(vendor)}</option>`).join("")}
+  `;
+}
+
+function renderVendorMappingSection() {
+  const rows = vendorMappings.mappings || [];
+  const unmappedCount = rows.filter((row) => row.active && !row.localVendor).length;
+  return `
+    <section class="panel">
+      <div class="section-heading">
+        <div>
+          <h2>${t("control.vendorMapping", "Vendor Mapping")}</h2>
+          <p class="muted">${t("control.vendorMappingHelp", "Link NetSuite PO vendor names to local app vendors first, then PO memo aliases choose the specific yard.")}</p>
+        </div>
+        <div class="actions">
+          <button class="primary" data-action="discover-vendor-mappings" type="button">${t("control.getNewPoVendors", "Get New Vendors From Latest POs")}</button>
+          <button data-action="refresh-vendor-mappings" type="button">${t("common.refresh", "Refresh")}</button>
+        </div>
+      </div>
+      <div class="subtab-row">
+        <button class="${vendorMappingTab === "links" ? "active" : ""}" data-action="vendor-mapping-tab" data-tab="links" type="button">${t("control.vendorLinks", "Vendor Links")}</button>
+        <button class="${vendorMappingTab === "local-vendors" ? "active" : ""}" data-action="vendor-mapping-tab" data-tab="local-vendors" type="button">${t("control.localVendors", "Local Vendors")}</button>
+      </div>
+      ${vendorMappingTab === "local-vendors" ? renderLocalVendorManagement() : `
+        ${unmappedCount ? `<div class="notice">${unmappedCount} ${t("control.unmappedVendors", "NetSuite vendor(s) need a local vendor mapping.")}</div>` : ""}
+        ${renderVendorMappingTable(rows)}
+      `}
+    </section>
+  `;
+}
+
+function renderVendorMappingTable(rows) {
+  return `
+      <div class="spreadsheet-wrap">
+        <table class="spreadsheet-table vendor-mapping-table">
+          <thead>
+            <tr>
+              <th>${t("control.netsuiteVendor", "NetSuite Vendor")}</th>
+              <th>${t("control.vendorId", "Vendor ID")}</th>
+              <th>${t("control.lastPo", "Last PO")}</th>
+              <th>${t("control.localVendor", "Local Vendor")}</th>
+              <th>${t("common.status", "Status")}</th>
+              <th>${t("common.updated", "Updated")}</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows.map((row) => `
+              <tr data-vendor-mapping-row="${escapeHtml(row.id)}">
+                <td><strong>${escapeHtml(row.netsuiteVendorName)}</strong></td>
+                <td>${escapeHtml(row.netsuiteVendorId || "")}</td>
+                <td><strong>${escapeHtml(row.lastPoRef || "")}</strong><br><span class="muted">${formatDate(row.lastSeenAt)}</span></td>
+                <td>
+                  <select data-field="localVendor">
+                    ${renderLocalVendorOptions(row.localVendor)}
+                  </select>
+                </td>
+                <td>
+                  <label class="inline-check">
+                    <input data-field="active" type="checkbox" ${row.active ? "checked" : ""} />
+                    <span>${row.active ? t("common.active", "Active") : t("common.disabled", "Disabled")}</span>
+                  </label>
+                </td>
+                <td>${formatDate(row.updatedAt)}<br><span class="muted">${escapeHtml(row.updatedBy || "")}</span></td>
+                <td><button class="primary" data-action="save-vendor-mapping" data-id="${escapeHtml(row.id)}" type="button">${t("common.save", "Save")}</button></td>
+              </tr>
+            `).join("") || `<tr><td colspan="7" class="muted">${t("control.noVendorMappings", "No PO vendors discovered yet. Sync POs, then click Get New Vendors From Latest POs.")}</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+  `;
+}
+
+function renderLocalVendorManagement() {
+  const rows = vendorMappings.localVendorRows || [];
+  return `
+    <div class="local-vendor-create">
+      <label>
+        <span>${t("control.newLocalVendor", "New Local Vendor")}</span>
+        <input id="newLocalVendorName" placeholder="${t("control.localVendorName", "Local vendor name")}" />
+      </label>
+      <button class="primary" data-action="create-local-vendor" type="button">${t("common.add", "Add")}</button>
+    </div>
+    <div class="spreadsheet-wrap">
+      <table class="spreadsheet-table local-vendor-table">
+        <thead>
+          <tr>
+            <th>${t("control.localVendor", "Local Vendor")}</th>
+            <th>${t("control.vendorYards", "Vendor Yards")}</th>
+            <th>${t("control.vendorLinks", "Vendor Links")}</th>
+            <th>${t("common.status", "Status")}</th>
+            <th>${t("common.updated", "Updated")}</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.map((row) => `
+            <tr data-local-vendor-row="${escapeHtml(row.id)}">
+              <td><input data-field="name" value="${escapeHtml(row.name)}" /></td>
+              <td>${row.yardCount || 0}</td>
+              <td>${row.mappingCount || 0}</td>
+              <td>
+                <label class="inline-check">
+                  <input data-field="active" type="checkbox" ${row.active ? "checked" : ""} />
+                  <span>${row.active ? t("common.active", "Active") : t("common.disabled", "Disabled")}</span>
+                </label>
+              </td>
+              <td>${formatDate(row.updatedAt)}<br><span class="muted">${escapeHtml(row.updatedBy || "")}</span></td>
+              <td><button class="primary" data-action="save-local-vendor" data-id="${escapeHtml(row.id)}" data-current-name="${escapeHtml(row.name)}" type="button">${t("common.save", "Save")}</button></td>
+            </tr>
+          `).join("") || `<tr><td colspan="6" class="muted">${t("control.noLocalVendors", "No local vendors yet.")}</td></tr>`}
+        </tbody>
+      </table>
+    </div>
   `;
 }
 
@@ -624,6 +790,8 @@ function renderLoadedOrderDetail() {
 
 function renderSyncSection() {
   const isAuto = syncSettings.mode === "auto";
+  const savedMaxRunMinutes = Math.max(1, Math.round(Number(syncSettings.maxRunSeconds || 900) / 60));
+  const maxRunMinutes = syncMaxRunMinutesDraft ?? savedMaxRunMinutes;
   return `
     <section class="panel">
       <div class="section-heading">
@@ -662,6 +830,16 @@ function renderSyncSection() {
         <div><span>${t("control.lastStarted", "Last Started")}</span><strong>${formatDate(syncSettings.lastStartedAt)}</strong></div>
         <div><span>${t("control.lastFinished", "Last Finished")}</span><strong>${formatDate(syncSettings.lastFinishedAt)}</strong></div>
       </div>
+      <div class="sync-status-grid sync-setting-grid">
+        <label>
+          <span>${t("control.maxRuntimeMinutes", "Max Runtime Minutes")}</span>
+          <input data-field="sync-max-run-minutes" type="number" min="1" step="1" value="${maxRunMinutes}" ${syncSettings.running ? "disabled" : ""}>
+        </label>
+        <div>
+          <span>${t("control.maxRuntimeHelp", "Timeout Rule")}</span>
+          <strong>${t("control.maxRuntimeHelpText", "Sync stops at the next safe checkpoint after this limit.")}</strong>
+        </div>
+      </div>
       ${syncSettings.lastError ? `<div class="notice sync-error">${escapeHtml(syncSettings.lastError)}</div>` : ""}
       <div class="notice">
         <strong>${t("control.environment", "NetSuite Environment")}</strong>
@@ -681,6 +859,7 @@ function renderSyncSection() {
         <button class="primary" data-action="connect-netsuite" type="button">${t("control.connectNetsuite", "Connect NetSuite")}</button>
         <button data-action="save-sync-settings" type="button">${t("control.saveSyncSettings", "Save Sync Settings")}</button>
         <button class="primary" data-action="run-sync-now" type="button" ${syncSettings.running ? "disabled" : ""}>${t("control.runSyncNow", "Run Sync Now")}</button>
+        <button data-action="run-transfer-order-sync" type="button" ${syncSettings.running ? "disabled" : ""}>${t("control.runTransferOrderSync", "Sync TO/PO Only")}</button>
         <button data-action="reconcile-netsuite-progress" type="button" ${syncSettings.running ? "disabled" : ""}>${t("control.reconcileProgress", "Reconcile NetSuite Progress")}</button>
         <button class="danger" data-action="stop-sync" type="button">${t("control.stopSync", "Stop / Clear Sync")}</button>
         <button data-action="refresh" type="button">${t("control.refreshStatus", "Refresh Status")}</button>
@@ -771,6 +950,8 @@ function renderOperatorsSection() {
             <select id="newRole">
               <option value="operator">${t("control.roleOperator", "Operator")}</option>
               <option value="dispatcher">${t("control.roleDispatcher", "Dispatcher")}</option>
+              <option value="scm">${t("control.roleScm", "SCM Staff")}</option>
+              <option value="yard_manager">${t("control.roleYardManager", "Yard Manager")}</option>
               <option value="admin">${t("control.roleAdmin", "Admin")}</option>
             </select>
           </label>
@@ -1050,6 +1231,7 @@ async function loadControlData() {
   fulfillmentRecords = await request("/api/delivery/fulfillments?limit=100");
   recordWarnings = await request("/api/control/record-warnings?limit=100");
   orderLocks = await request("/api/control/order-locks");
+  vendorMappings = await request("/api/control/vendor-mappings");
   await loadLoadedOrders({ keepSelection: true });
   if (isLoadedSearchActive()) await loadLoadedSearchResults();
   syncSettings = await request("/api/control/sync-settings");
@@ -1158,6 +1340,62 @@ app.addEventListener("click", async (event) => {
       orderLocks = await request("/api/control/order-locks");
       return render();
     }
+    if (button.dataset.action === "refresh-vendor-mappings") {
+      vendorMappings = await request("/api/control/vendor-mappings");
+      return render();
+    }
+    if (button.dataset.action === "vendor-mapping-tab") {
+      vendorMappingTab = button.dataset.tab || "links";
+      localStorage.setItem("mbbs.control.vendorMapping.tab", vendorMappingTab);
+      return render();
+    }
+    if (button.dataset.action === "discover-vendor-mappings") {
+      button.disabled = true;
+      button.textContent = t("common.loading", "Loading...");
+      const result = await request("/api/control/vendor-mappings/discover", { method: "POST" });
+      vendorMappings = { localVendors: result.localVendors || [], localVendorRows: result.localVendorRows || [], mappings: result.mappings || [] };
+      alert(`Vendor discovery complete. ${result.inserted || 0} new, ${result.updated || 0} updated.`);
+      return render();
+    }
+    if (button.dataset.action === "save-vendor-mapping") {
+      const row = app.querySelector(`[data-vendor-mapping-row="${controlCssAttr(button.dataset.id)}"]`);
+      const result = await request(`/api/control/vendor-mappings/${button.dataset.id}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          localVendor: row?.querySelector('[data-field="localVendor"]')?.value || "",
+          active: Boolean(row?.querySelector('[data-field="active"]')?.checked)
+        })
+      });
+      vendorMappings = { localVendors: result.localVendors || [], localVendorRows: result.localVendorRows || [], mappings: result.mappings || [] };
+      alert(`Vendor mapping saved. Re-enriched ${result.enriched?.receiving || 0} receiving orders.`);
+      return render();
+    }
+    if (button.dataset.action === "create-local-vendor") {
+      const name = document.getElementById("newLocalVendorName")?.value || "";
+      if (!name.trim()) return alert("Enter a local vendor name.");
+      const result = await request("/api/control/local-vendors", {
+        method: "POST",
+        body: JSON.stringify({ name })
+      });
+      vendorMappings = { localVendors: result.localVendors || [], localVendorRows: result.localVendorRows || [], mappings: result.mappings || [] };
+      return render();
+    }
+    if (button.dataset.action === "save-local-vendor") {
+      const row = app.querySelector(`[data-local-vendor-row="${controlCssAttr(button.dataset.id)}"]`);
+      const name = row?.querySelector('[data-field="name"]')?.value || "";
+      if (!name.trim()) return alert("Enter a local vendor name.");
+      if (button.dataset.currentName && button.dataset.currentName !== name && !confirm(`Rename local vendor "${button.dataset.currentName}" to "${name}"? Related vendor yards and vendor mappings will be updated.`)) return;
+      const result = await request(`/api/control/local-vendors/${button.dataset.id}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          name,
+          active: Boolean(row?.querySelector('[data-field="active"]')?.checked)
+        })
+      });
+      vendorMappings = { localVendors: result.localVendors || [], localVendorRows: result.localVendorRows || [], mappings: result.mappings || [] };
+      alert(`Local vendor saved. Re-enriched ${result.enriched?.receiving || 0} receiving orders.`);
+      return render();
+    }
     if (button.dataset.action === "refresh-loaded-orders") {
       await loadLoadedOrders({ keepSelection: true });
       if (isLoadedSearchActive()) await loadLoadedSearchResults();
@@ -1244,10 +1482,15 @@ app.addEventListener("click", async (event) => {
       return loadControlData();
     }
     if (button.dataset.action === "save-sync-settings") {
+      const minutesInput = app.querySelector('[data-field="sync-max-run-minutes"]');
+      const parsedMaxRunMinutes = Math.round(Number(minutesInput?.value || syncMaxRunMinutesDraft || 15));
+      if (!Number.isFinite(parsedMaxRunMinutes) || parsedMaxRunMinutes < 1) return alert("Enter a valid max runtime.");
+      const maxRunMinutes = Math.max(1, parsedMaxRunMinutes);
       syncSettings = await request("/api/control/sync-settings", {
         method: "PUT",
-        body: JSON.stringify({ mode: syncSettings.mode })
+        body: JSON.stringify({ mode: syncSettings.mode, maxRunSeconds: maxRunMinutes * 60 })
       });
+      syncMaxRunMinutesDraft = null;
       return loadControlData();
     }
     if (button.dataset.action === "connect-netsuite") {
@@ -1262,6 +1505,16 @@ app.addEventListener("click", async (event) => {
       render();
       scheduleSyncPoll();
       alert(result.skipped ? "Sync is already running." : "NetSuite sync started in the background.");
+      return;
+    }
+    if (button.dataset.action === "run-transfer-order-sync") {
+      button.disabled = true;
+      button.textContent = "Starting...";
+      const result = await request("/api/control/sync-transfer-orders", { method: "POST" });
+      syncSettings = result.settings || await request("/api/control/sync-settings");
+      render();
+      scheduleSyncPoll();
+      alert(result.skipped ? "Sync is already running." : "Transfer/Purchase Order sync started in the background.");
       return;
     }
     if (button.dataset.action === "reconcile-netsuite-progress") {
@@ -1332,6 +1585,18 @@ app.addEventListener("click", async (event) => {
   } catch (error) {
     alert(error.message);
   }
+});
+
+window.addEventListener("mbbs-control-section", (event) => {
+  activeSection = event.detail?.section || "dashboard";
+  localStorage.setItem("mbbs.control.section", activeSection);
+  render();
+});
+
+app.addEventListener("input", (event) => {
+  if (event.target?.dataset?.field !== "sync-max-run-minutes") return;
+  const value = Number(event.target.value);
+  syncMaxRunMinutesDraft = Number.isFinite(value) && value >= 0 ? event.target.value : "";
 });
 
 app.addEventListener("input", (event) => {

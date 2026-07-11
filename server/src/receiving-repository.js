@@ -239,7 +239,7 @@ export async function listReceivingOrders({ orderType, vendor = null, sourceLoca
   }
   if (search) {
     params.push(`%${String(search).trim()}%`);
-    clauses.push(`ro.tranid ILIKE $${params.length}`);
+    clauses.push(`(ro.tranid ILIKE $${params.length} OR ro.original_tranid ILIKE $${params.length})`);
   }
   if (itemSearch) {
     params.push(`%${String(itemSearch).trim()}%`);
@@ -252,7 +252,11 @@ export async function listReceivingOrders({ orderType, vendor = null, sourceLoca
   }
   const result = await query(
     `WITH receiving_order_source AS (
-       SELECT netsuite_id, 'purchase_order'::text AS order_type, tranid, trandate,
+       SELECT netsuite_id, 'purchase_order'::text AS order_type,
+              COALESCE(NULLIF(dispatch_ref, ''), tranid) AS tranid,
+              tranid AS original_tranid,
+              dispatch_ref,
+              trandate,
               vendor_id, vendor, status, status_text, foreign_total,
               source_location_id, source_location, destination_location_id, destination_location,
               netsuite_active, synced_at, receipt_status, memo, expected_delivery_date,
@@ -260,7 +264,11 @@ export async function listReceivingOrders({ orderType, vendor = null, sourceLoca
               dispatch_window_end, dispatch_instructions
        FROM purchase_orders
        UNION ALL
-       SELECT netsuite_id, 'transfer_order'::text AS order_type, tranid, trandate,
+       SELECT netsuite_id, 'transfer_order'::text AS order_type,
+              tranid,
+              tranid AS original_tranid,
+              NULL::text AS dispatch_ref,
+              trandate,
               NULL::bigint AS vendor_id, NULL::text AS vendor, status, status_text, NULL::numeric AS foreign_total,
               from_location_id AS source_location_id, from_location AS source_location,
               to_location_id AS destination_location_id, to_location AS destination_location,
@@ -292,7 +300,11 @@ export async function listReceivingOrders({ orderType, vendor = null, sourceLoca
 export async function getReceivingOrder(orderId) {
   const order = await query(
     `WITH receiving_order_source AS (
-       SELECT netsuite_id, 'purchase_order'::text AS order_type, tranid, trandate,
+       SELECT netsuite_id, 'purchase_order'::text AS order_type,
+              COALESCE(NULLIF(dispatch_ref, ''), tranid) AS tranid,
+              tranid AS original_tranid,
+              dispatch_ref,
+              trandate,
               vendor_id, vendor, status, status_text, foreign_total,
               source_location_id, source_location, destination_location_id, destination_location,
               netsuite_active, synced_at, receipt_status, memo, expected_delivery_date,
@@ -300,7 +312,11 @@ export async function getReceivingOrder(orderId) {
               dispatch_window_end, dispatch_instructions
        FROM purchase_orders
        UNION ALL
-       SELECT netsuite_id, 'transfer_order'::text AS order_type, tranid, trandate,
+       SELECT netsuite_id, 'transfer_order'::text AS order_type,
+              tranid,
+              tranid AS original_tranid,
+              NULL::text AS dispatch_ref,
+              trandate,
               NULL::bigint AS vendor_id, NULL::text AS vendor, status, status_text, NULL::numeric AS foreign_total,
               from_location_id AS source_location_id, from_location AS source_location,
               to_location_id AS destination_location_id, to_location AS destination_location,
@@ -445,6 +461,82 @@ export async function confirmReceivingLine(orderId, lineRowId, values, operatorI
     action: "receiving.line.confirm",
     lineId: current.line_id,
     details: { receivingOrderId: orderId, pallets, layers, sections, pieces }
+  });
+  return getReceivingOrder(orderId);
+}
+
+export async function unconfirmReceivingLine(orderId, lineRowId, operatorId) {
+  const line = await query(
+    `WITH receiving_line_source AS (
+       SELECT purchase_order_id AS order_id,
+              'purchase_order'::text AS order_type,
+              id,
+              line_id,
+              received_pallet_qty,
+              received_layer_qty,
+              received_section_qty,
+              received_piece_qty
+         FROM purchase_order_lines
+        UNION ALL
+       SELECT transfer_order_id AS order_id,
+              'transfer_order'::text AS order_type,
+              id,
+              line_id,
+              received_pallet_qty,
+              received_layer_qty,
+              received_section_qty,
+              received_piece_qty
+         FROM transfer_order_lines
+        WHERE line_stage = 'receiving'
+     )
+     SELECT *
+       FROM receiving_line_source
+      WHERE id = $1
+        AND order_id = $2`,
+    [lineRowId, orderId]
+  );
+  if (!line.rowCount) throw new Error("Receiving line not found.");
+  const current = line.rows[0];
+  if (current.order_type === "transfer_order") {
+    await query(
+      `UPDATE transfer_order_lines
+          SET received_pallet_qty = 0,
+              received_layer_qty = 0,
+              received_section_qty = 0,
+              received_piece_qty = 0,
+              confirmed_at = null,
+              confirmed_by = null
+        WHERE id = $1
+          AND transfer_order_id = $2
+          AND line_stage = 'receiving'`,
+      [lineRowId, orderId]
+    );
+  } else {
+    await query(
+      `UPDATE purchase_order_lines
+          SET received_pallet_qty = 0,
+              received_layer_qty = 0,
+              received_section_qty = 0,
+              received_piece_qty = 0,
+              confirmed_at = null,
+              confirmed_by = null
+        WHERE id = $1
+          AND purchase_order_id = $2`,
+      [lineRowId, orderId]
+    );
+  }
+  await writeAudit({
+    actorOperatorId: operatorId,
+    source: "receiving",
+    action: "receiving.line.unconfirm",
+    lineId: current.line_id,
+    details: {
+      receivingOrderId: orderId,
+      pallets: current.received_pallet_qty,
+      layers: current.received_layer_qty,
+      sections: current.received_section_qty,
+      pieces: current.received_piece_qty
+    }
   });
   return getReceivingOrder(orderId);
 }
@@ -694,6 +786,45 @@ export async function confirmLocalCoReceivingLine(coRefOrId, lineRowId, values, 
     source: "receiving",
     action: "local_co.line.confirm",
     details: { coRefOrId, lineRowId, pallets, layers, sections, pieces }
+  });
+  return getLocalCoReceivingOrder(coRefOrId);
+}
+
+export async function unconfirmLocalCoReceivingLine(coRefOrId, lineRowId, operatorId) {
+  const line = await query(
+    `SELECT line.*
+       FROM co_order_lines line
+       INNER JOIN co_orders co ON co.id = line.co_id
+      WHERE line.id = $1
+        AND (co.co_ref = $2 OR co.delivery_order_id::text = $2 OR co.id::text = $2)
+        AND co.status = 'planned'`,
+    [lineRowId, String(coRefOrId)]
+  );
+  if (!line.rowCount) throw new Error("CO receiving line not found.");
+  const current = line.rows[0];
+  await query(
+    `UPDATE co_order_lines
+        SET received_pallet_qty = 0,
+            received_layer_qty = 0,
+            received_section_qty = 0,
+            received_piece_qty = 0,
+            confirmed_at = null,
+            confirmed_by = null
+      WHERE id = $1`,
+    [lineRowId]
+  );
+  await writeAudit({
+    actorOperatorId: operatorId,
+    source: "receiving",
+    action: "local_co.line.unconfirm",
+    details: {
+      coRefOrId,
+      lineRowId,
+      pallets: current.received_pallet_qty,
+      layers: current.received_layer_qty,
+      sections: current.received_section_qty,
+      pieces: current.received_piece_qty
+    }
   });
   return getLocalCoReceivingOrder(coRefOrId);
 }
@@ -1082,7 +1213,7 @@ export async function listReceivingReceipts({ limit = 100, operatorId = null } =
   params.push(Math.min(Math.max(Number(limit) || 100, 1), 500));
   const result = await query(
     `WITH receiving_order_source AS (
-       SELECT netsuite_id, tranid, 'purchase_order'::text AS order_type FROM purchase_orders
+       SELECT netsuite_id, COALESCE(NULLIF(dispatch_ref, ''), tranid) AS tranid, 'purchase_order'::text AS order_type FROM purchase_orders
        UNION ALL
        SELECT netsuite_id, tranid, 'transfer_order'::text AS order_type FROM transfer_orders
      )

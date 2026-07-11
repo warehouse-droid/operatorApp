@@ -29,6 +29,88 @@ function planRow(row) {
   };
 }
 
+function countPlanLoads(trucks = []) {
+  return (trucks || []).reduce((sum, truck) => sum + (truck.loads || []).length, 0);
+}
+
+function countPlanStops(trucks = []) {
+  return (trucks || []).reduce((sum, truck) => sum + (truck.loads || []).reduce((loadSum, load) => loadSum + (load.stops || []).length, 0), 0);
+}
+
+function countLoadOrders(load = {}) {
+  return loadOrderRefs(load).length;
+}
+
+function loadOrderRefs(load = {}) {
+  if (Array.isArray(load.orders) && load.orders.length) {
+    return [
+      ...new Set(
+        load.orders
+          .map((order) => order.tranid || order.orderNumber || order.orderId || order.id || "")
+          .filter(Boolean)
+      )
+    ];
+  }
+  const orderIds = new Set(
+    (load.stops || [])
+      .map((stop) => stop.orderId || stop.order_id || stop.tranid || stop.orderNumber || "")
+      .filter(Boolean)
+  );
+  return [...orderIds];
+}
+
+function countPlanLoadOrders(trucks = []) {
+  return (trucks || []).reduce((sum, truck) => sum + (truck.loads || []).reduce((loadSum, load) => loadSum + countLoadOrders(load), 0), 0);
+}
+
+function truckSnapshotSummary(trucks = []) {
+  return (trucks || []).map((truck) => ({
+    id: truck.id || "",
+    plate: truck.plate || truck.truckPlate || "",
+    driver: truck.driver || truck.driverName || "",
+    loadCount: (truck.loads || []).length,
+    orderCount: (truck.loads || []).reduce((sum, load) => sum + countLoadOrders(load), 0),
+    stopCount: (truck.loads || []).reduce((sum, load) => sum + (load.stops || []).length, 0),
+    loads: (truck.loads || []).map((load) => ({
+      id: load.id || "",
+      name: load.name || "",
+      type: load.type || "",
+      orderCount: countLoadOrders(load),
+      orderRefs: loadOrderRefs(load),
+      stopCount: (load.stops || []).length,
+      startTime: load.startTime || load.timing?.start || "",
+      finishTime: load.finishTime || load.timing?.finish || ""
+    }))
+  }));
+}
+
+function snapshotSummary(row, { current = false } = {}) {
+  const orders = Array.isArray(row.orders) ? row.orders : [];
+  const trucks = Array.isArray(row.trucks) ? row.trucks : [];
+  return {
+    id: current ? `current-${row.plan_id || row.id}` : String(row.id),
+    snapshotId: current ? null : String(row.id),
+    planId: String(row.plan_id || row.id || ""),
+    planDate: row.plan_date instanceof Date ? row.plan_date.toISOString().slice(0, 10) : String(row.plan_date || "").slice(0, 10),
+    current,
+    label: current ? "Current Active Version" : `Archived ${row.archived_at || ""}`,
+    revision: Number(row.revision || 0),
+    status: row.status || "",
+    savedAt: row.saved_at || row.original_saved_at || "",
+    originalSavedAt: row.original_saved_at || row.saved_at || "",
+    archivedAt: row.archived_at || "",
+    archiveReason: row.archive_reason || (current ? "current" : ""),
+    sessionId: row.session_id || "",
+    orderCount: orders.length,
+    truckCount: trucks.length,
+    loadCount: countPlanLoads(trucks),
+    loadOrderCount: countPlanLoadOrders(trucks),
+    stopCount: countPlanStops(trucks),
+    summary: row.summary || {},
+    trucks: truckSnapshotSummary(trucks)
+  };
+}
+
 export class StaleDispatchPlanSaveError extends Error {
   constructor({ planId, expectedRevision, currentRevision }) {
     super("Dispatch plan changed on the server before this save completed.");
@@ -37,6 +119,18 @@ export class StaleDispatchPlanSaveError extends Error {
     this.planId = planId;
     this.expectedRevision = expectedRevision;
     this.currentRevision = currentRevision;
+    this.status = 409;
+  }
+}
+
+export class DispatchPlanDateMismatchError extends Error {
+  constructor({ planId, expectedPlanDate, payloadPlanDate }) {
+    super(`Dispatch plan date mismatch. Plan ${planId} is ${expectedPlanDate}, but payload was ${payloadPlanDate}.`);
+    this.name = "DispatchPlanDateMismatchError";
+    this.code = "DISPATCH_PLAN_DATE_MISMATCH";
+    this.planId = planId;
+    this.expectedPlanDate = expectedPlanDate;
+    this.payloadPlanDate = payloadPlanDate;
     this.status = 409;
   }
 }
@@ -213,6 +307,25 @@ export async function getDispatchPlan(planId) {
   return sanitizeDispatchPlan(planRow(result.rows[0]));
 }
 
+export async function getDispatchPlanRevision(planId) {
+  const result = await query(
+    `SELECT p.id, p.revision, p.updated_at, s.saved_at
+       FROM dispatch_plans p
+       LEFT JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+      WHERE p.id = $1`,
+    [planId]
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  return {
+    id: String(row.id),
+    revision: Number(row.revision || 0),
+    savedAt: row.saved_at || row.updated_at,
+    updatedAt: row.updated_at,
+    updatedBySessionId: ""
+  };
+}
+
 export async function getCurrentDispatchPlan({ planDate } = {}) {
   const cleanDate = cleanPlanDate(planDate);
   const result = await query(
@@ -226,8 +339,96 @@ export async function getCurrentDispatchPlan({ planDate } = {}) {
   return sanitizeDispatchPlan(planRow(result.rows[0]));
 }
 
-export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [], summary = {}, baseRevision = null } = {}) {
+export async function listDispatchPlanSnapshots({ planDate } = {}) {
+  const cleanDate = cleanPlanDate(planDate);
+  const current = await query(
+    `SELECT p.id AS plan_id, p.plan_date::text AS plan_date, p.status, p.revision,
+            s.orders, s.trucks, s.summary, s.saved_at,
+            NULL::bigint AS id, NULL::timestamptz AS archived_at,
+            NULL::text AS archive_reason, NULL::text AS session_id,
+            NULL::timestamptz AS original_saved_at
+       FROM dispatch_plans p
+       LEFT JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+      WHERE p.plan_date = $1::date
+      LIMIT 1`,
+    [cleanDate]
+  );
+  const history = await query(
+    `SELECT h.id, h.plan_id, h.plan_date::text AS plan_date, p.status, h.revision,
+            h.orders, h.trucks, h.summary, h.original_saved_at, h.archived_at,
+            h.archive_reason, h.session_id, NULL::timestamptz AS saved_at
+       FROM dispatch_plan_snapshot_history h
+       JOIN dispatch_plans p ON p.id = h.plan_id
+      WHERE h.plan_date = $1::date
+      ORDER BY h.archived_at DESC, h.id DESC`,
+    [cleanDate]
+  );
+  return {
+    planDate: cleanDate,
+    snapshots: [
+      ...current.rows.map((row) => snapshotSummary(row, { current: true })),
+      ...history.rows.map((row) => snapshotSummary(row))
+    ]
+  };
+}
+
+export async function getDispatchPlanSnapshot(snapshotId) {
+  const text = String(snapshotId || "");
+  if (text.startsWith("current-")) {
+    const planId = text.replace(/^current-/, "");
+    const result = await query(
+      `SELECT p.id AS plan_id, p.plan_date::text AS plan_date, p.status, p.revision,
+              s.orders, s.trucks, s.summary, s.saved_at,
+              NULL::bigint AS id, NULL::timestamptz AS archived_at,
+              NULL::text AS archive_reason, NULL::text AS session_id,
+              NULL::timestamptz AS original_saved_at
+         FROM dispatch_plans p
+         LEFT JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+        WHERE p.id = $1
+        LIMIT 1`,
+      [planId]
+    );
+    const row = result.rows[0];
+    if (!row) return null;
+    return { ...snapshotSummary(row, { current: true }), orders: row.orders || [], rawTrucks: row.trucks || [] };
+  }
+  const result = await query(
+    `SELECT h.id, h.plan_id, h.plan_date::text AS plan_date, p.status, h.revision,
+            h.orders, h.trucks, h.summary, h.original_saved_at, h.archived_at,
+            h.archive_reason, h.session_id, NULL::timestamptz AS saved_at
+       FROM dispatch_plan_snapshot_history h
+       JOIN dispatch_plans p ON p.id = h.plan_id
+      WHERE h.id = $1
+      LIMIT 1`,
+    [snapshotId]
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  return { ...snapshotSummary(row), orders: row.orders || [], rawTrucks: row.trucks || [] };
+}
+
+export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [], summary = {}, baseRevision = null, planDate = "", sessionId = "" } = {}) {
   return withTransaction(async () => {
+    const currentPlan = await query(
+      `SELECT p.id, p.plan_date::text AS plan_date, p.revision,
+              s.orders, s.trucks, s.summary, s.saved_at
+         FROM dispatch_plans p
+         LEFT JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+        WHERE p.id = $1
+        FOR UPDATE OF p`,
+      [planId]
+    );
+    const existingPlan = currentPlan.rows[0];
+    if (!existingPlan) throw new Error("Dispatch plan not found.");
+    const payloadPlanDate = cleanPlanDate(planDate || existingPlan.plan_date);
+    const expectedPlanDate = cleanPlanDate(existingPlan.plan_date);
+    if (payloadPlanDate !== expectedPlanDate) {
+      throw new DispatchPlanDateMismatchError({
+        planId,
+        expectedPlanDate,
+        payloadPlanDate
+      });
+    }
     const hasBaseRevision = baseRevision !== null && baseRevision !== undefined && baseRevision !== "";
     const expectedRevision = Number(baseRevision);
     const result = hasBaseRevision && Number.isFinite(expectedRevision)
@@ -249,12 +450,11 @@ export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [
           [planId]
         );
     if (!result.rows[0]) {
-      const current = await query("SELECT revision FROM dispatch_plans WHERE id = $1", [planId]);
-      if (current.rows[0] && hasBaseRevision) {
+      if (existingPlan && hasBaseRevision) {
         throw new StaleDispatchPlanSaveError({
           planId,
           expectedRevision,
-          currentRevision: Number(current.rows[0].revision || 0)
+          currentRevision: Number(existingPlan.revision || 0)
         });
       }
       throw new Error("Dispatch plan not found.");
@@ -266,6 +466,26 @@ export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [
       trucks: Array.isArray(trucks) ? trucks : [],
       summary: summary || {}
     });
+    if (existingPlan.saved_at) {
+      await query(
+        `INSERT INTO dispatch_plan_snapshot_history (
+           plan_id, plan_date, revision, orders, trucks, summary,
+           original_saved_at, archive_reason, session_id
+         )
+         VALUES ($1, $2::date, $3, COALESCE($4::jsonb, '[]'::jsonb), COALESCE($5::jsonb, '[]'::jsonb),
+                 COALESCE($6::jsonb, '{}'::jsonb), $7, 'before_save', $8)`,
+        [
+          planId,
+          expectedPlanDate,
+          existingPlan.revision,
+          JSON.stringify(existingPlan.orders || []),
+          JSON.stringify(existingPlan.trucks || []),
+          JSON.stringify(existingPlan.summary || {}),
+          existingPlan.saved_at,
+          sessionId || ""
+        ]
+      );
+    }
     await query(
       `INSERT INTO dispatch_plan_snapshots (plan_id, orders, trucks, summary, saved_at)
        VALUES ($1, $2::jsonb, $3::jsonb, $4::jsonb, now())
@@ -277,6 +497,88 @@ export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [
       [planId, JSON.stringify(cleanPlan.orders), JSON.stringify(cleanPlan.trucks), JSON.stringify(cleanPlan.summary || {})]
     );
     return getDispatchPlan(planId);
+  });
+}
+
+export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" } = {}) {
+  return withTransaction(async () => {
+    const sourceResult = await query(
+      `SELECT h.*
+         FROM dispatch_plan_snapshot_history h
+        WHERE h.id = $1
+        FOR UPDATE`,
+      [snapshotId]
+    );
+    const source = sourceResult.rows[0];
+    if (!source) throw new Error("Dispatch snapshot was not found.");
+    const currentResult = await query(
+      `SELECT p.id, p.plan_date::text AS plan_date, p.revision,
+              s.orders, s.trucks, s.summary, s.saved_at
+         FROM dispatch_plans p
+         LEFT JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+        WHERE p.id = $1
+        FOR UPDATE OF p`,
+      [source.plan_id]
+    );
+    const current = currentResult.rows[0];
+    if (!current) throw new Error("Dispatch plan was not found.");
+    const sourceDate = cleanPlanDate(source.plan_date);
+    const currentDate = cleanPlanDate(current.plan_date);
+    if (sourceDate !== currentDate) {
+      throw new DispatchPlanDateMismatchError({
+        planId: source.plan_id,
+        expectedPlanDate: currentDate,
+        payloadPlanDate: sourceDate
+      });
+    }
+    if (current.saved_at) {
+      await query(
+        `INSERT INTO dispatch_plan_snapshot_history (
+           plan_id, plan_date, revision, orders, trucks, summary,
+           original_saved_at, archive_reason, session_id
+         )
+         VALUES ($1, $2::date, $3, COALESCE($4::jsonb, '[]'::jsonb), COALESCE($5::jsonb, '[]'::jsonb),
+                 COALESCE($6::jsonb, '{}'::jsonb), $7, 'before_restore', $8)`,
+        [
+          current.id,
+          currentDate,
+          current.revision,
+          JSON.stringify(current.orders || []),
+          JSON.stringify(current.trucks || []),
+          JSON.stringify(current.summary || {}),
+          current.saved_at,
+          sessionId || ""
+        ]
+      );
+    }
+    await query(
+      `UPDATE dispatch_plans
+          SET revision = revision + 1,
+              updated_at = now()
+        WHERE id = $1`,
+      [source.plan_id]
+    );
+    const cleanPlan = await sanitizeDispatchPlan({
+      id: String(source.plan_id),
+      orders: source.orders || [],
+      trucks: source.trucks || [],
+      summary: source.summary || {}
+    });
+    await query(
+      `INSERT INTO dispatch_plan_snapshots (plan_id, orders, trucks, summary, saved_at)
+       VALUES ($1, $2::jsonb, $3::jsonb, $4::jsonb, now())
+       ON CONFLICT (plan_id) DO UPDATE
+         SET orders = EXCLUDED.orders,
+             trucks = EXCLUDED.trucks,
+             summary = EXCLUDED.summary,
+             saved_at = now()`,
+      [source.plan_id, JSON.stringify(cleanPlan.orders), JSON.stringify(cleanPlan.trucks), JSON.stringify(cleanPlan.summary || {})]
+    );
+    return {
+      plan: await getDispatchPlan(source.plan_id),
+      restoredSnapshot: snapshotSummary(source),
+      previousRevision: Number(current.revision || 0)
+    };
   });
 }
 

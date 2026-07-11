@@ -18,6 +18,9 @@ let eventSource = null;
 let locationCheck = null;
 let locationOverrideAccepted = false;
 let countdownTimer = null;
+let restAfterCurrentStop = false;
+let activeRest = null;
+let restTimer = null;
 let activeView = "job";
 let driverHistory = [];
 let selectedHistoryId = "";
@@ -104,11 +107,35 @@ function clearCountdownTimer() {
   countdownTimer = null;
 }
 
+function clearRestTimer() {
+  clearTimeout(restTimer);
+  restTimer = null;
+}
+
+function elapsedText(startedAt) {
+  const start = new Date(startedAt || "").getTime();
+  if (!Number.isFinite(start)) return "0 min";
+  const totalSeconds = Math.max(0, Math.floor((Date.now() - start) / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours) return `${hours} hr ${String(minutes).padStart(2, "0")} min`;
+  return `${minutes} min ${String(seconds).padStart(2, "0")} sec`;
+}
+
 function scheduleCountdownRender(job) {
   clearCountdownTimer();
   if (!job || job.status !== "in_progress" || completeWaitSeconds(job) <= 0) return;
   countdownTimer = setTimeout(() => {
     if (currentJob?.jobId === job.jobId) renderJob();
+  }, 1000);
+}
+
+function scheduleRestRender() {
+  clearRestTimer();
+  if (!activeRest?.startedAt) return;
+  restTimer = setTimeout(() => {
+    if (activeRest?.startedAt) renderRest();
   }, 1000);
 }
 
@@ -263,6 +290,7 @@ function shell(content) {
 
 function renderNoJob() {
   clearCountdownTimer();
+  clearRestTimer();
   shell(`
     <section class="empty-panel">
       <h2>${t("driver.noJob", "No assigned job")}</h2>
@@ -426,6 +454,8 @@ function renderPhotoSlots(job) {
 }
 
 function renderJob() {
+  if (activeRest) return renderRest();
+  clearRestTimer();
   const job = currentJob;
   if (!job) return renderNoJob();
   const isPickup = job.stopType === "pickup";
@@ -450,6 +480,7 @@ function renderJob() {
             <span class="job-type ${isTravel ? "travel" : isPickup ? "" : "dropoff"}">${typeText}</span>
             <h2>${escapeHtml(titleText)}</h2>
           </div>
+          <button class="rest-toggle ${restAfterCurrentStop ? "active" : ""}" data-action="${isStarted ? "toggle-rest" : "start-rest"}" type="button">${isStarted && restAfterCurrentStop ? "Rest after" : "Rest"}</button>
         </div>
         <div class="address-block">
           <div>
@@ -470,6 +501,41 @@ function renderJob() {
         <button class="secondary compact" data-action="open-history" type="button">${t("common.history", "History")}</button>
       </div>
       ${photoPromptOpen ? renderPhotoSlots(job) : ""}
+    </section>
+  `);
+}
+
+function renderRest() {
+  clearCountdownTimer();
+  const rest = activeRest;
+  if (!rest) return renderJob();
+  scheduleRestRender();
+  shell(`
+    <section class="job-panel rest-panel">
+      <div class="job-sticky">
+        <div class="plan-meta-row">
+          <span>${escapeHtml(planDateText(rest.planDate || currentJob?.planDate))}</span>
+          <span>${escapeHtml(driver?.name || "-")}</span>
+          <span>${escapeHtml(rest.truckPlate || currentJob?.truckPlate || "-")}</span>
+        </div>
+        <div class="job-head">
+          <div class="job-title-row">
+            <span class="job-type travel">Rest</span>
+            <h2>Rest time</h2>
+          </div>
+        </div>
+        <div class="address-block">
+          <div>
+            <span>Current rest duration</span>
+            <strong>${escapeHtml(elapsedText(rest.startedAt))}</strong>
+            <em>Next job will stay pending until rest ends.</em>
+          </div>
+        </div>
+      </div>
+      <div class="job-actions">
+        <button class="primary" data-action="end-rest" type="button">End rest time</button>
+        <button class="secondary compact" data-action="refresh" type="button">${t("common.refresh", "Refresh")}</button>
+      </div>
     </section>
   `);
 }
@@ -556,6 +622,7 @@ function renderDriverHistory() {
 
 async function loadNextJob() {
   activeView = "job";
+  clearRestTimer();
   const stateResult = await request("/api/driver/day-state");
   dayState = stateResult.state;
   if (dayState?.truckPlate && (dayState.preDvirStatus !== "complete" || !dayState.samsaraOnDutyConfirmed || !dayState.samsaraPreDvirConfirmed)) {
@@ -579,6 +646,7 @@ async function loadNextJob() {
     throw error;
   }
   currentJob = result.job;
+  activeRest = result.rest || null;
   photos = [];
   dvirMode = "";
   dvirPhotos = [];
@@ -586,6 +654,7 @@ async function loadNextJob() {
   photoPromptOpen = false;
   locationCheck = null;
   locationOverrideAccepted = false;
+  if (activeRest) return renderRest();
   if (!currentJob && dayState?.allJobsComplete && dayState.postDvirStatus !== "complete") {
     return renderDvir("post", "All assigned jobs are complete. MBBS post-trip inspection is required before logout.");
   }
@@ -609,6 +678,8 @@ function connectEvents() {
       "dispatch.plan.reopened",
       "driver.job.started",
       "driver.job.completed",
+      "driver.rest.started",
+      "driver.rest.ended",
       "delivery.order.loaded"
     ].includes(event.type);
     if (!relevant || !driver) return;
@@ -669,6 +740,7 @@ app.addEventListener("click", async (event) => {
     authToken = "";
     driver = null;
     currentJob = null;
+    activeRest = null;
     disconnectEvents();
     return renderLogin();
   }
@@ -726,6 +798,45 @@ app.addEventListener("click", async (event) => {
     locationOverrideAccepted = true;
     showToast("Location override accepted for this stop");
     return renderJob();
+  }
+  if (action === "toggle-rest") {
+    restAfterCurrentStop = !restAfterCurrentStop;
+    showToast(restAfterCurrentStop ? "Rest after this stop" : "Auto-start next stop");
+    return renderJob();
+  }
+  if (action === "start-rest") {
+    button.disabled = true;
+    button.textContent = "Starting rest...";
+    try {
+      const result = await request("/api/driver/rest/start", {
+        method: "POST",
+        body: JSON.stringify({})
+      });
+      activeRest = result.rest;
+      currentJob = result.job || currentJob;
+      showToast("Rest started");
+      return renderRest();
+    } catch (error) {
+      showToast(error.message);
+      return renderJob();
+    }
+  }
+  if (action === "end-rest") {
+    button.disabled = true;
+    button.textContent = "Ending rest...";
+    try {
+      const result = await request("/api/driver/rest/end", {
+        method: "POST",
+        body: JSON.stringify({})
+      });
+      activeRest = null;
+      currentJob = result.job || currentJob;
+      showToast("Rest ended");
+      return renderJob();
+    } catch (error) {
+      showToast(error.message);
+      return renderRest();
+    }
   }
   if (action === "close-photo") {
     photoPromptOpen = false;
@@ -788,6 +899,10 @@ app.addEventListener("click", async (event) => {
     }
   }
   if (action === "start-job" && currentJob) {
+    if (activeRest) {
+      showToast("End rest time before starting the next job.");
+      return renderRest();
+    }
     button.disabled = true;
     button.textContent = "Starting...";
     try {
@@ -802,6 +917,11 @@ app.addEventListener("click", async (event) => {
       showToast("Job started");
       checkCurrentJobLocation().catch((error) => showToast(error.message));
     } catch (error) {
+      if (error.data?.rest) {
+        activeRest = error.data.rest;
+        showToast(error.message);
+        return renderRest();
+      }
       showToast(error.message);
       renderJob();
     }
@@ -815,6 +935,7 @@ app.addEventListener("click", async (event) => {
     button.disabled = true;
     button.textContent = "Uploading...";
     try {
+      const shouldStartRest = restAfterCurrentStop;
       if (!locationCheck && !locationOverrideAccepted) await checkCurrentJobLocation({ render: false });
       if (locationCheckBlocksComplete()) {
         showToast("Recheck location or confirm override first.");
@@ -835,16 +956,26 @@ app.addEventListener("click", async (event) => {
         method: "POST",
         body: JSON.stringify({
           photoDataUrls: uploadedPhotos,
-          locationOverride: locationOverrideAccepted
+          locationOverride: locationOverrideAccepted,
+          autoStartNext: !shouldStartRest,
+          autoStartRest: shouldStartRest
         })
       });
       currentJob = result.nextJob;
+      activeRest = result.rest || null;
       photos = [];
       orderPages = {};
       photoPromptOpen = false;
+      const shouldCheckNext = currentJob?.status === "in_progress";
+      restAfterCurrentStop = false;
       locationCheck = null;
       locationOverrideAccepted = false;
+      if (activeRest) {
+        showToast("Rest started");
+        return renderRest();
+      }
       renderJob();
+      if (shouldCheckNext) checkCurrentJobLocation().catch((error) => showToast(error.message));
       showToast("Stop completed");
     } catch (error) {
       if (error.data?.locationCheck) locationCheck = error.data.locationCheck;
@@ -919,6 +1050,7 @@ window.addEventListener("mbbs-language-changed", () => {
   if (!authToken) return renderLogin();
   if (activeView === "history") return renderDriverHistory();
   if (dvirMode) return renderDvir(dvirMode);
+  if (activeRest) return renderRest();
   return renderJob();
 });
 

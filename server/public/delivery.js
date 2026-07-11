@@ -195,6 +195,21 @@ function lineRequiredSalesQty(line) {
   });
 }
 
+const LOAD_SALES_QTY_TOLERANCE = 0.1;
+
+function wholeUnitsFromSalesQty(salesQuantity, conversion) {
+  const sales = qty(salesQuantity);
+  const unitSize = qty(conversion);
+  if (!sales || !unitSize) return 0;
+  const rawUnits = sales / unitSize;
+  const floorUnits = Math.floor(rawUnits + 0.000001);
+  const ceilUnits = Math.ceil(rawUnits - 0.000001);
+  if (ceilUnits > floorUnits && Math.abs((ceilUnits * unitSize) - sales) <= LOAD_SALES_QTY_TOLERANCE) {
+    return ceilUnits;
+  }
+  return floorUnits;
+}
+
 function explicitUnitQty(line, unit) {
   if (unit === "pallets") return qty(line.pallet_qty);
   if (unit === "layers") return qty(line.layer_qty);
@@ -209,7 +224,7 @@ function unitRequiredLimit(line, unit) {
   if (!conversion) return 0;
   const explicit = explicitUnitQty(line, unit);
   if (explicit > 0) return explicit;
-  return !hasCustomPackQty(line) ? Math.floor((lineRequiredSalesQty(line) / conversion) + 0.000001) : 0;
+  return !hasCustomPackQty(line) ? wholeUnitsFromSalesQty(lineRequiredSalesQty(line), conversion) : 0;
 }
 
 function loadedUnits(line) {
@@ -291,7 +306,18 @@ function packedValue(line, unit) {
 }
 
 function remainingValue(line, unit) {
-  return Math.max(0, requiredValue(line, unit) - loadedValue(line, unit) - packedValue(line, unit));
+  const remainingUnits = Math.max(0, requiredValue(line, unit) - loadedValue(line, unit) - packedValue(line, unit));
+  if (remainingUnits > 0 || unit === "sales") return remainingUnits;
+  const explicit = explicitUnitQty(line, unit);
+  const conversion = unitConversion(line, unit);
+  if (!explicit || !conversion) return remainingUnits;
+  const remainingSales = Math.max(0, lineRequiredSalesQty(line) - qty(line.loaded_qty) - lineUnitsToSalesQty(line, {
+    pallets: line.packed_pallet_qty,
+    layers: line.packed_layer_qty,
+    sections: line.packed_section_qty,
+    pieces: line.packed_piece_qty
+  }));
+  return wholeUnitsFromSalesQty(remainingSales, conversion);
 }
 
 function panelValue(line, unit) {

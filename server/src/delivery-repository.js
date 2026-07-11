@@ -25,6 +25,8 @@ function roundQuantity(value) {
   return Number(Number(value || 0).toFixed(6));
 }
 
+const LOAD_SALES_QTY_TOLERANCE = 0.1;
+
 function syntheticOrderId(value) {
   const hex = crypto.createHash("sha1").update(String(value || "")).digest("hex").slice(0, 12);
   return -Number.parseInt(hex, 16);
@@ -122,6 +124,29 @@ function linePackedSalesQuantity(line) {
 
 function lineLoadedSalesQuantity(line) {
   return positiveQuantity(line.loaded_qty);
+}
+
+function lineLoadSalesQuantity(line) {
+  const packedSalesQty = roundQuantity(linePackedSalesQuantity(line));
+  if (packedSalesQty <= 0) return 0;
+  const remainingSalesQty = roundQuantity(Math.max(0, lineRequiredSalesQuantity(line) - lineLoadedSalesQuantity(line)));
+  if (remainingSalesQty > 0 && Math.abs(remainingSalesQty - packedSalesQty) <= LOAD_SALES_QTY_TOLERANCE) {
+    return remainingSalesQty;
+  }
+  return packedSalesQty;
+}
+
+function wholeUnitsFromSalesQuantity(salesQuantity, conversion) {
+  const sales = positiveQuantity(salesQuantity);
+  const unitSize = positiveQuantity(conversion);
+  if (!sales || !unitSize) return 0;
+  const rawUnits = sales / unitSize;
+  const floorUnits = Math.floor(rawUnits + 0.000001);
+  const ceilUnits = Math.ceil(rawUnits - 0.000001);
+  if (ceilUnits > floorUnits && Math.abs((ceilUnits * unitSize) - sales) <= LOAD_SALES_QTY_TOLERANCE) {
+    return ceilUnits;
+  }
+  return floorUnits;
 }
 
 function orderFamily(order) {
@@ -226,8 +251,10 @@ function remainingPackAvailability(line) {
     const conversion = unitConversion(line, unit);
     if (!conversion) return 0;
     const explicit = explicitUnitQuantity(line, unit);
-    if (explicit > 0) return Math.max(0, explicit - positiveQuantity(consumedValue));
-    return deriveFromSales ? Math.floor((salesAvailable / conversion) + 0.000001) : 0;
+    const explicitRemaining = explicit > 0 ? Math.max(0, explicit - positiveQuantity(consumedValue)) : 0;
+    if (explicitRemaining > 0) return explicitRemaining;
+    if (explicit > 0 && salesAvailable > 0) return wholeUnitsFromSalesQuantity(salesAvailable, conversion);
+    return deriveFromSales ? wholeUnitsFromSalesQuantity(salesAvailable, conversion) : 0;
   };
   return {
     pallets: unitAvailable("pallets", consumed.pallet),
@@ -342,7 +369,7 @@ function buildDeliveryLoadValidation(order) {
       continue;
     }
 
-    if (packedSalesQty > remainingSalesQty + 0.000001) {
+    if (packedSalesQty > remainingSalesQty + LOAD_SALES_QTY_TOLERANCE) {
       issues.push({
         ...issue,
         code: line.sync_exception || "overpacked",
@@ -2428,6 +2455,7 @@ export async function recordDeliveryLoad(orderId, operatorId, { photoDataUrl }) 
   for (const line of order.lines || []) {
     const packedSalesQty = roundQuantity(linePackedSalesQuantity(line));
     if (packedSalesQty <= 0) continue;
+    const loadSalesQty = lineLoadSalesQuantity(line);
     const lineTarget = canonicalLineTarget(order);
     await query(
       `UPDATE ${lineTarget.table}
@@ -2442,7 +2470,7 @@ export async function recordDeliveryLoad(orderId, operatorId, { photoDataUrl }) 
         WHERE ${lineTarget.orderColumn} = $1
           AND id = $2
           ${lineTarget.extraWhere}`,
-      [orderId, line.id, roundQuantity(lineRequiredSalesQuantity(line)), packedSalesQty]
+      [orderId, line.id, roundQuantity(lineRequiredSalesQuantity(line)), loadSalesQty]
     );
   }
 
@@ -2560,7 +2588,7 @@ export async function recordCustomerPickupLoad(orderId, operatorId, { photoDataU
     layers: sum.layers + positiveQuantity(line.packed_layer_qty),
     pieces: sum.pieces + positiveQuantity(line.packed_piece_qty),
     sections: sum.sections + positiveQuantity(line.packed_section_qty),
-    salesQuantity: sum.salesQuantity + roundQuantity(linePackedSalesQuantity(line))
+    salesQuantity: sum.salesQuantity + roundQuantity(lineLoadSalesQuantity(line))
   }), { pallets: 0, layers: 0, pieces: 0, sections: 0, salesQuantity: 0 });
   const loadedUoms = [...new Set(confirmedLines.map((line) => String(line.unit || "").trim()).filter(Boolean))];
   const loadedUom = loadedUoms.length === 1 ? loadedUoms[0] : loadedUoms.length > 1 ? "MIXED" : "";
@@ -2583,7 +2611,7 @@ export async function recordCustomerPickupLoad(orderId, operatorId, { photoDataU
         orderId,
         line.id,
         roundQuantity(lineRequiredSalesQuantity(line)),
-        roundQuantity(linePackedSalesQuantity(line))
+        roundQuantity(lineLoadSalesQuantity(line))
       ]
     );
   }

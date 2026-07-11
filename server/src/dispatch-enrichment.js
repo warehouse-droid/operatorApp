@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { query } from "./db.js";
+import { pool, query } from "./db.js";
 
 const YARD_ADDRESSES = {
   "3445": "3445 Kennedy Road, Toronto, ON",
@@ -31,6 +31,8 @@ const VENDOR_YARDS = [
   { vendor: "TRIPLE H", yard: "Triple H", aliases: ["triple h", "putnam"], windowStart: "08:00", windowEnd: "17:00", instructions: "", address: "4366 Breen Rd., Putnam ON, N0L 2B0" },
   { vendor: "MA-CO", yard: "Ma-Co Clay Products", aliases: ["ma-co", "maco", "bright", "oxford"], windowStart: "07:00", windowEnd: "16:30", instructions: "", address: "896474 Oxford County Rd. 3, Bright, ON N0J1B0" }
 ];
+
+const USE_NETSUITE_ADDRESS_VENDOR = "__USE_NETSUITE_ADDRESS__";
 
 const MONTH_INDEX = {
   jan: 1,
@@ -107,6 +109,19 @@ function rowToVendorYard(row) {
     instructions: row.instructions,
     address: row.address,
     active: row.active
+  };
+}
+
+function rowToLocalVendor(row) {
+  return {
+    id: row.id,
+    name: row.name || "",
+    active: row.active,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    updatedBy: row.updated_by || "",
+    yardCount: Number(row.yard_count || 0),
+    mappingCount: Number(row.mapping_count || 0)
   };
 }
 
@@ -238,6 +253,247 @@ export async function listDispatchVendorYards() {
   return result.rows.map(rowToVendorYard);
 }
 
+export async function listDispatchVendorMappings() {
+  const localVendorRows = await listDispatchLocalVendors();
+  const localVendors = localVendorRows
+    .filter((vendor) => vendor.active)
+    .map((vendor) => vendor.name)
+    .sort((a, b) => a.localeCompare(b));
+  const result = await query(
+    `SELECT id, netsuite_vendor_id, netsuite_vendor_name, local_vendor, active,
+            last_po_ref, discovered_at, last_seen_at, updated_at, updated_by
+       FROM dispatch_vendor_mappings
+      ORDER BY
+        CASE WHEN COALESCE(local_vendor, '') = '' THEN 0 ELSE 1 END,
+        netsuite_vendor_name,
+        netsuite_vendor_id`
+  );
+  return {
+    localVendors,
+    localVendorRows,
+    mappings: result.rows.map(rowToVendorMapping)
+  };
+}
+
+export async function listDispatchLocalVendors() {
+  try {
+    const result = await query(
+      `SELECT v.id, v.name, v.active, v.created_at, v.updated_at, v.updated_by,
+              COUNT(DISTINCT y.id)::int AS yard_count,
+              COUNT(DISTINCT m.id)::int AS mapping_count
+         FROM dispatch_local_vendors v
+         LEFT JOIN dispatch_vendor_yards y ON LOWER(y.vendor) = LOWER(v.name)
+         LEFT JOIN dispatch_vendor_mappings m ON LOWER(m.local_vendor) = LOWER(v.name)
+        GROUP BY v.id
+        ORDER BY v.active DESC, v.name`
+    );
+    return result.rows.map(rowToLocalVendor);
+  } catch {
+    const yards = await listDispatchVendorYards();
+    return [...new Set(yards.map((yard) => yard.vendor).filter(Boolean))]
+      .sort((a, b) => a.localeCompare(b))
+      .map((name, index) => ({
+        id: `fallback-${index}`,
+        name,
+        active: true,
+        createdAt: "",
+        updatedAt: "",
+        updatedBy: "",
+        yardCount: yards.filter((yard) => normalize(yard.vendor) === normalize(name)).length,
+        mappingCount: 0
+      }));
+  }
+}
+
+export async function createDispatchLocalVendor({ name = "", updatedBy = "" } = {}) {
+  const cleanName = String(name || "").trim();
+  if (!cleanName) throw new Error("Local vendor name is required.");
+  const result = await query(
+    `INSERT INTO dispatch_local_vendors (name, updated_by)
+     VALUES ($1, $2)
+     ON CONFLICT (LOWER(name)) DO UPDATE SET
+       active = true,
+       updated_by = EXCLUDED.updated_by,
+       updated_at = now()
+     RETURNING id, name, active, created_at, updated_at, updated_by,
+               0::int AS yard_count,
+               0::int AS mapping_count`,
+    [cleanName, updatedBy || ""]
+  );
+  return result.rows[0] ? rowToLocalVendor(result.rows[0]) : null;
+}
+
+export async function updateDispatchLocalVendor(id, patch = {}) {
+  const cleanName = String(patch.name || "").trim();
+  if (!cleanName) throw new Error("Local vendor name is required.");
+  const active = typeof patch.active === "boolean" ? patch.active : true;
+  const updatedBy = patch.updatedBy || patch.updated_by || "";
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const existing = await client.query(
+      `SELECT * FROM dispatch_local_vendors WHERE id = $1 FOR UPDATE`,
+      [id]
+    );
+    const current = existing.rows[0];
+    if (!current) throw new Error("Local vendor not found.");
+    if (normalize(current.name) !== normalize(cleanName)) {
+      const duplicate = await client.query(
+        `SELECT id FROM dispatch_local_vendors WHERE LOWER(name) = LOWER($1) AND id <> $2 LIMIT 1`,
+        [cleanName, id]
+      );
+      if (duplicate.rows[0]) throw new Error(`Local vendor "${cleanName}" already exists.`);
+    }
+    await client.query(
+      `UPDATE dispatch_local_vendors
+          SET name = $2,
+              active = $3,
+              updated_by = $4,
+              updated_at = now()
+        WHERE id = $1`,
+      [id, cleanName, active, updatedBy]
+    );
+    if (current.name !== cleanName) {
+      await client.query(
+        `UPDATE dispatch_vendor_yards
+            SET vendor = $2,
+                updated_at = now()
+          WHERE LOWER(vendor) = LOWER($1)`,
+        [current.name, cleanName]
+      );
+      await client.query(
+        `UPDATE dispatch_vendor_mappings
+            SET local_vendor = $2,
+                updated_by = $3,
+                updated_at = now()
+          WHERE LOWER(local_vendor) = LOWER($1)`,
+        [current.name, cleanName, updatedBy]
+      );
+    }
+    await client.query("COMMIT");
+    const refreshed = await query(
+      `SELECT v.id, v.name, v.active, v.created_at, v.updated_at, v.updated_by,
+              COUNT(DISTINCT y.id)::int AS yard_count,
+              COUNT(DISTINCT m.id)::int AS mapping_count
+         FROM dispatch_local_vendors v
+         LEFT JOIN dispatch_vendor_yards y ON LOWER(y.vendor) = LOWER(v.name)
+         LEFT JOIN dispatch_vendor_mappings m ON LOWER(m.local_vendor) = LOWER(v.name)
+        WHERE v.id = $1
+        GROUP BY v.id`,
+      [id]
+    );
+    return refreshed.rows[0] ? rowToLocalVendor(refreshed.rows[0]) : null;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => null);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+function autoLocalVendorForNetSuiteVendor(vendorName = "", localVendors = []) {
+  const normalizedVendor = normalize(vendorName);
+  return localVendors.find((vendor) => normalize(vendor) === normalizedVendor) || "";
+}
+
+export async function discoverDispatchVendorMappingsFromPurchaseOrders() {
+  const { localVendors } = await listDispatchVendorMappings().catch(async () => ({
+    localVendors: [...new Set((await listDispatchVendorYards()).map((yard) => yard.vendor).filter(Boolean))]
+  }));
+  const result = await query(
+    `SELECT vendor_id, vendor, MAX(tranid) AS last_po_ref, MAX(synced_at) AS last_seen_at
+       FROM purchase_orders
+      WHERE COALESCE(vendor, '') <> ''
+      GROUP BY vendor_id, vendor
+      ORDER BY vendor`
+  );
+  let inserted = 0;
+  let updated = 0;
+  for (const row of result.rows) {
+    const vendorId = String(row.vendor_id || "");
+    const vendorName = String(row.vendor || "").trim();
+    if (!vendorName) continue;
+    const key = vendorMappingKey(vendorId, vendorName);
+    const existing = await query(
+      `SELECT id, local_vendor
+         FROM dispatch_vendor_mappings
+        WHERE LOWER(COALESCE(NULLIF(netsuite_vendor_id, ''), netsuite_vendor_name)) = $1
+        LIMIT 1`,
+      [key]
+    );
+    if (existing.rows[0]) {
+      await query(
+        `UPDATE dispatch_vendor_mappings
+            SET netsuite_vendor_id = $2,
+                netsuite_vendor_name = $3,
+                last_po_ref = COALESCE($4, last_po_ref),
+                last_seen_at = COALESCE($5::timestamptz, now())
+          WHERE id = $1`,
+        [existing.rows[0].id, vendorId, vendorName, row.last_po_ref || "", row.last_seen_at || null]
+      );
+      updated += 1;
+      continue;
+    }
+    await query(
+      `INSERT INTO dispatch_vendor_mappings
+        (netsuite_vendor_id, netsuite_vendor_name, local_vendor, last_po_ref, last_seen_at)
+       VALUES ($1, $2, $3, $4, COALESCE($5::timestamptz, now()))`,
+      [vendorId, vendorName, autoLocalVendorForNetSuiteVendor(vendorName, localVendors), row.last_po_ref || "", row.last_seen_at || null]
+    );
+    inserted += 1;
+  }
+  return {
+    scanned: result.rows.length,
+    inserted,
+    updated,
+    ...(await listDispatchVendorMappings())
+  };
+}
+
+export async function updateDispatchVendorMapping(id, patch = {}) {
+  const localVendor = String(patch.localVendor ?? patch.local_vendor ?? "").trim();
+  const localVendors = (await listDispatchVendorMappings()).localVendors;
+  if (localVendor && !isUseNetSuiteAddressMapping(localVendor) && !localVendors.some((vendor) => normalize(vendor) === normalize(localVendor))) {
+    throw new Error(`Local vendor "${localVendor}" is not configured in vendor yards.`);
+  }
+  const result = await query(
+    `UPDATE dispatch_vendor_mappings
+        SET local_vendor = $2,
+            active = COALESCE($3, active),
+            updated_by = COALESCE($4, updated_by),
+            updated_at = now()
+      WHERE id = $1
+      RETURNING id, netsuite_vendor_id, netsuite_vendor_name, local_vendor, active,
+                last_po_ref, discovered_at, last_seen_at, updated_at, updated_by`,
+    [
+      id,
+      localVendor,
+      typeof patch.active === "boolean" ? patch.active : null,
+      patch.updatedBy || patch.updated_by || ""
+    ]
+  );
+  return result.rows[0] ? rowToVendorMapping(result.rows[0]) : null;
+}
+
+async function mappedLocalVendorForPurchaseOrder(order = {}) {
+  try {
+    const key = vendorMappingKey(order.vendor_id || order.vendorId, order.vendor);
+    if (!key) return "";
+    const result = await query(
+      `SELECT local_vendor
+         FROM dispatch_vendor_mappings
+        WHERE active = true
+          AND COALESCE(local_vendor, '') <> ''
+          AND LOWER(COALESCE(NULLIF(netsuite_vendor_id, ''), netsuite_vendor_name)) = $1
+        LIMIT 1`,
+      [key]
+    );
+    return result.rows[0]?.local_vendor || "";
+  } catch {
+    return "";
+  }
+}
+
 async function vendorYardsForMatching() {
   try {
     const rows = await listDispatchVendorYards();
@@ -291,6 +547,39 @@ function hashText(value) {
 
 function normalize(value) {
   return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function normalizedTermIncludes(text, term) {
+  const cleanText = ` ${normalize(text)} `;
+  const cleanTerm = normalize(term);
+  return Boolean(cleanTerm && cleanText.includes(` ${cleanTerm} `));
+}
+
+function vendorMappingKey(vendorId = "", vendorName = "") {
+  return String(vendorId || vendorName || "").trim().toLowerCase();
+}
+
+function rowToVendorMapping(row) {
+  return {
+    id: row.id,
+    netsuiteVendorId: row.netsuite_vendor_id || "",
+    netsuiteVendorName: row.netsuite_vendor_name || "",
+    localVendor: row.local_vendor || "",
+    active: row.active,
+    lastPoRef: row.last_po_ref || "",
+    discoveredAt: row.discovered_at,
+    lastSeenAt: row.last_seen_at,
+    updatedAt: row.updated_at,
+    updatedBy: row.updated_by || ""
+  };
+}
+
+export function isUseNetSuiteAddressMapping(value = "") {
+  return String(value || "").trim() === USE_NETSUITE_ADDRESS_VENDOR;
+}
+
+export function useNetSuiteAddressMappingValue() {
+  return USE_NETSUITE_ADDRESS_VENDOR;
 }
 
 function uniqueYards(rows) {
@@ -390,6 +679,26 @@ function hasDateLikeText(value) {
 function hasAnyDateLikeText(value) {
   const monthNames = Object.keys(MONTH_INDEX).sort((a, b) => b.length - a.length).join("|");
   return new RegExp(`\\d{1,2}[/-]\\d{1,2}(?:[/-]\\d{2,4})?|\\d{1,2}\\s*[\\u6708.]\\s*\\d{1,2}\\s*[\\u65e5.]?|\\b(?:${monthNames})\\.?\\s+\\d{1,2}(?:st|nd|rd|th)?\\b|\\b\\d{1,2}(?:st|nd|rd|th)?\\s+(?:${monthNames})\\.?\\b`, "i").test(String(value || ""));
+}
+
+function localVendorCandidates(vendorYards, localVendor = "") {
+  const normalizedLocal = normalize(localVendor);
+  if (!normalizedLocal) return [];
+  return uniqueYards(vendorYards.filter((yard) => normalize(yard.vendor) === normalizedLocal));
+}
+
+function candidateMatchesVendor(yard, vendorName = "") {
+  const vendor = normalize(yard.vendor);
+  const source = normalize(vendorName);
+  return Boolean(vendor && source && normalizedTermIncludes(source, vendor));
+}
+
+function candidateMatchesAlias(yard, haystack = "") {
+  return yard.aliases.some((alias) => normalizedTermIncludes(haystack, alias));
+}
+
+function candidateMatchesYard(yard, haystack = "") {
+  return normalizedTermIncludes(haystack, yard.yard);
 }
 
 function dateOnly(year, month, day) {
@@ -693,16 +1002,35 @@ export async function enrichPurchaseOrderDispatch(order) {
   const vendorYards = uniqueYards(await vendorYardsForMatching());
   const haystack = normalize(`${order.vendor || ""} ${order.memo || ""} ${order.tranid || ""}`);
   const vendorName = normalize(order.vendor);
-  const exactVendorCandidates = uniqueYards(vendorYards.filter((yard) => {
-    const vendorParts = normalize(yard.vendor).split(" ").filter(Boolean);
-    return vendorParts.some((part) => vendorName.includes(part));
-  }));
-  let candidate = vendorYards.find((yard) => {
-    const vendorMatch = normalize(yard.vendor).split(" ").some((part) => part && vendorName.includes(part));
-    const aliasMatch = yard.aliases.some((alias) => haystack.includes(normalize(alias)));
-    return aliasMatch && (vendorMatch || haystack.includes(normalize(yard.vendor)));
-  }) || vendorYards.find((yard) => haystack.includes(normalize(yard.yard)));
+  const mappedLocalVendor = await mappedLocalVendorForPurchaseOrder(order);
+  if (isUseNetSuiteAddressMapping(mappedLocalVendor)) {
+    const vendorAddress = cleanupAddress(order.vendor_address || order.vendorAddress || "");
+    return {
+      dispatch_address: vendorAddress,
+      dispatch_window_start: "",
+      dispatch_window_end: "",
+      dispatch_instructions: vendorAddress ? "Using NetSuite vendor address." : "Use NetSuite vendor address selected, but no vendor address was synced.",
+      dispatch_vendor_yard: order.vendor || "",
+      dispatch_parse_source: vendorAddress ? "netsuite-vendor-address" : "netsuite-vendor-address-missing",
+      dispatch_note_hash: hashText(`${order.vendor || ""}|${order.memo || ""}|${vendorAddress}`)
+    };
+  }
+  const mappedCandidates = localVendorCandidates(vendorYards, mappedLocalVendor);
+  const exactVendorCandidates = mappedCandidates.length
+    ? mappedCandidates
+    : uniqueYards(vendorYards.filter((yard) => candidateMatchesVendor(yard, vendorName)));
+  const candidatePool = exactVendorCandidates.length ? exactVendorCandidates : vendorYards;
+  let candidate = candidatePool.find((yard) => candidateMatchesAlias(yard, haystack))
+    || candidatePool.find((yard) => candidateMatchesYard(yard, haystack));
+  if (!candidate && !exactVendorCandidates.length) {
+    candidate = vendorYards.find((yard) => {
+      const vendorMatch = candidateMatchesVendor(yard, vendorName) || normalizedTermIncludes(haystack, yard.vendor);
+      const aliasMatch = candidateMatchesAlias(yard, haystack);
+      return aliasMatch && vendorMatch;
+    }) || vendorYards.find((yard) => candidateMatchesYard(yard, haystack));
+  }
   let parseSource = candidate ? "vendor-yard-table" : "unmatched-vendor";
+  if (candidate && mappedLocalVendor) parseSource = "vendor-map-yard-table";
   if (!candidate && exactVendorCandidates.length && hasPurchaseYardClue(`${order.vendor || ""} ${order.memo || ""}`, exactVendorCandidates)) {
     const parsed = await parsePurchaseYardWithOllama({
       vendor: order.vendor,
@@ -714,9 +1042,13 @@ export async function enrichPurchaseOrderDispatch(order) {
     candidate = parsedId ? exactVendorCandidates.find((yard) => String(yard.id) === parsedId) : null;
     if (candidate) parseSource = "ollama:po-yard";
   }
-  if (!candidate && exactVendorCandidates.length === 1 && normalize(order.memo).includes(normalize(exactVendorCandidates[0].yard))) {
+  if (!candidate && exactVendorCandidates.length === 1 && candidateMatchesYard(exactVendorCandidates[0], order.memo)) {
     candidate = exactVendorCandidates[0];
-    parseSource = "vendor-yard-table";
+    parseSource = mappedLocalVendor ? "vendor-map-yard-table" : "vendor-yard-table";
+  }
+  if (!candidate && mappedLocalVendor && exactVendorCandidates.length) {
+    candidate = exactVendorCandidates[0];
+    parseSource = "vendor-map-yard-fallback";
   }
   return {
     dispatch_address: candidate?.address || "",

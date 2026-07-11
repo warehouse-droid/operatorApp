@@ -69,16 +69,16 @@
       "license": "DZ",
       "number": "123",
       "login": "Aurther",
-      "password": "MBT@3445",
+      "password": "aurther1234",
       "samsaraPrimaryLogin": "",
       "samsaraSecondaryLogin": "",
       "ownYardFixedMinutes": 40,
       "vendorFixedMinutes": 45,
-      "deliveryFixedMinutes": 20,
-      "outsideFixedMinutes": 20,
-      "minutesPerPallet": 3,
+      "deliveryFixedMinutes": 15,
+      "outsideFixedMinutes": 15,
+      "minutesPerPallet": 1,
       "loadMinutes": 40,
-      "unloadMinutes": 20
+      "unloadMinutes": 15
     },
     {
       "name": "Dao",
@@ -121,7 +121,7 @@
       "samsaraPrimaryLogin": "",
       "samsaraSecondaryLogin": "",
       "ownYardFixedMinutes": 30,
-      "vendorFixedMinutes": 80,
+      "vendorFixedMinutes": 100,
       "deliveryFixedMinutes": 10,
       "outsideFixedMinutes": 10,
       "minutesPerPallet": 1,
@@ -159,22 +159,33 @@
       "minutesPerPallet": 2,
       "loadMinutes": 40,
       "unloadMinutes": 35
+    },
+    {
+      "name": "Nick",
+      "license": "DZ",
+      "number": "456",
+      "login": "Nick",
+      "password": "3445",
+      "samsaraPrimaryLogin": "",
+      "samsaraSecondaryLogin": "",
+      "ownYardFixedMinutes": 40,
+      "vendorFixedMinutes": 35,
+      "deliveryFixedMinutes": 20,
+      "outsideFixedMinutes": 20,
+      "minutesPerPallet": 1,
+      "loadMinutes": 40,
+      "unloadMinutes": 20
     }
   ],
   "trucks": [
     {
       "plate": "BL27129",
       "capacityLbs": 40000,
-      "travelTimePercent": 60
+      "travelTimePercent": 30
     },
     {
       "plate": "BC71838",
       "capacityLbs": 80000,
-      "travelTimePercent": 30
-    },
-    {
-      "plate": "CE94489",
-      "capacityLbs": 83000,
       "travelTimePercent": 30
     },
     {
@@ -183,8 +194,14 @@
       "travelTimePercent": 30
     },
     {
-      "plate": "CA54629",
-      "capacityLbs": 83000
+      "plate": "BD98773",
+      "capacityLbs": 83000,
+      "travelTimePercent": 30
+    },
+    {
+      "plate": "CE94489",
+      "capacityLbs": 83000,
+      "travelTimePercent": 30
     },
     {
       "plate": "CE94487",
@@ -192,9 +209,8 @@
       "travelTimePercent": 30
     },
     {
-      "plate": "BD98773",
-      "capacityLbs": 40000,
-      "travelTimePercent": 30
+      "plate": "CA54629",
+      "capacityLbs": 83000
     }
   ],
   "ownYards": [
@@ -234,9 +250,9 @@
     "intervalSeconds": 60,
     "maxRunSeconds": 900,
     "running": false,
-    "lastStartedAt": "2026-07-07T15:30:20.763Z",
-    "lastFinishedAt": "2026-07-07T15:44:47.152Z",
-    "lastSource": "control_manual",
+    "lastStartedAt": "2026-07-10T23:56:14.915Z",
+    "lastFinishedAt": "2026-07-10T23:58:29.409Z",
+    "lastSource": "control_inbound_transfer_manual",
     "lastStatus": "success",
     "lastError": ""
   },

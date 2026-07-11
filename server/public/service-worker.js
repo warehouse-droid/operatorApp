@@ -1,4 +1,4 @@
-const CACHE_NAME = "mbbs-yard-operator-v94-co-packed-list";
+const CACHE_NAME = "mbbs-yard-operator-v96-driver-rest-after";
 const APP_SHELL = [
   "/operator",
   "/operator.html",
@@ -9,7 +9,7 @@ const APP_SHELL = [
   "/driver",
   "/driver.html",
   "/driver.css?v=20260702-camera-v3",
-  "/driver.js?v=20260702-camera-v3",
+  "/driver.js?v=20260707-rest-after-v1",
   "/manifest.webmanifest",
   "/driver-manifest.webmanifest",
   "/icons/mbbs-yard-192.png",

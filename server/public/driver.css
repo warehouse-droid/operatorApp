@@ -197,7 +197,9 @@ button:disabled {
 
 .job-head {
   display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: 8px;
+  align-items: center;
 }
 
 .job-title-row {
@@ -237,6 +239,22 @@ button:disabled {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.rest-toggle {
+  border: 2px solid #f5b544;
+  border-radius: 999px;
+  background: #fff9ea;
+  color: #7a4b00;
+  padding: 8px 11px;
+  font-size: 13px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.rest-toggle.active {
+  background: #f5b544;
+  color: #1f2933;
 }
 
 .address-block {

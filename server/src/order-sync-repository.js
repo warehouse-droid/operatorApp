@@ -86,6 +86,7 @@ function normalizeReceivingOrder(order, orderType) {
     trandate: normalizeNetSuiteDate(order.trandate),
     vendor_id: order.vendor_id,
     vendor: order.vendor,
+    vendor_address: order.vendor_address || order.vendorAddress || "",
     status: order.status,
     status_text: order.status_text,
     foreign_total: normalizeNumber(order.foreigntotal),
@@ -277,7 +278,8 @@ export async function upsertSalesOrders(orders = []) {
       `SELECT tranid, trandate, customer_id, customer, status, status_text,
               expected_delivery_date, foreign_total, order_location_id, order_location,
               outbound_location_id, outbound_location, delivery_method_id,
-              sales_order_type AS delivery_method, memo, dispatch_address,
+              sales_order_type AS delivery_method, netsuite_sales_order_type,
+              sales_order_type_override, memo, dispatch_address,
               dispatch_window_start, dispatch_window_end, dispatch_instructions,
               dispatch_parse_source, dispatch_note_hash
          FROM sales_orders
@@ -300,7 +302,8 @@ export async function upsertSalesOrders(orders = []) {
       `INSERT INTO sales_orders (
          netsuite_id, tranid, trandate, customer_id, customer, status, status_text,
          foreign_total, order_location_id, order_location, outbound_location_id,
-         outbound_location, delivery_method_id, sales_order_type, memo,
+         outbound_location, delivery_method_id, sales_order_type,
+         netsuite_sales_order_type, memo,
          expected_delivery_date, dispatch_address, dispatch_window_start,
          dispatch_window_end, dispatch_instructions, dispatch_parse_source,
          dispatch_note_hash, dispatch_parsed_at, operator_status,
@@ -308,7 +311,7 @@ export async function upsertSalesOrders(orders = []) {
          synced_at, fulfillment_status, dispatch_planned, status_updated_at
        ) VALUES (
          $1, $2, $3, $4, $5, $6, $7,
-         $8, $9, $10, $11, $12, $13, $14, $15,
+         $8, $9, $10, $11, $12, $13, $14, $14, $15,
          $16, $17, $18, $19, $20, $21, $22, now(),
          'open', 'Open', true, null, now(), 'not_fulfilled', false, now()
        )
@@ -331,7 +334,11 @@ export async function upsertSalesOrders(orders = []) {
          outbound_location_id = EXCLUDED.outbound_location_id,
          outbound_location = EXCLUDED.outbound_location,
          delivery_method_id = EXCLUDED.delivery_method_id,
-         sales_order_type = EXCLUDED.sales_order_type,
+         sales_order_type = CASE
+           WHEN COALESCE(sales_orders.sales_order_type_override, false) THEN sales_orders.sales_order_type
+           ELSE EXCLUDED.sales_order_type
+         END,
+         netsuite_sales_order_type = EXCLUDED.netsuite_sales_order_type,
          memo = EXCLUDED.memo,
          expected_delivery_date = EXCLUDED.expected_delivery_date,
          dispatch_address = EXCLUDED.dispatch_address,
@@ -914,7 +921,7 @@ export async function upsertPurchaseOrders(orders = []) {
     const existing = await query(
       `SELECT tranid, trandate, vendor_id, vendor, status, status_text,
               foreign_total, source_location_id, source_location, destination_location_id,
-              destination_location, memo, dispatch_address, dispatch_window_start,
+              destination_location, memo, vendor_address, dispatch_address, dispatch_window_start,
               dispatch_window_end, dispatch_instructions, dispatch_vendor_yard,
               dispatch_parse_source, dispatch_note_hash
          FROM purchase_orders
@@ -924,7 +931,7 @@ export async function upsertPurchaseOrders(orders = []) {
     await query(
       `INSERT INTO purchase_orders (
          netsuite_id, tranid, trandate, vendor_id, vendor, status, status_text,
-         foreign_total, destination_location_id, destination_location, memo,
+         foreign_total, destination_location_id, destination_location, memo, vendor_address,
          dispatch_vendor_yard, dispatch_address, dispatch_window_start,
          dispatch_window_end, dispatch_instructions, receipt_status,
          netsuite_active, netsuite_missing_at, synced_at, source_location_id,
@@ -932,9 +939,9 @@ export async function upsertPurchaseOrders(orders = []) {
          dispatch_note_hash, dispatch_parsed_at, status_updated_at
        ) VALUES (
          $1, $2, $3, $4, $5, $6, $7,
-         $8, $9, $10, $11, $12, $13, $14, $15,
-         $16, 'not_received', true, null, now(), $17, $18, $19,
-         $20, $21, now(), now()
+         $8, $9, $10, $11, $12, $13, $14, $15, $16,
+         $17, 'not_received', true, null, now(), $18, $19, $20,
+         $21, $22, now(), now()
        )
        ON CONFLICT (netsuite_id) DO UPDATE SET
          tranid = EXCLUDED.tranid,
@@ -953,6 +960,7 @@ export async function upsertPurchaseOrders(orders = []) {
          destination_location_id = EXCLUDED.destination_location_id,
          destination_location = EXCLUDED.destination_location,
          memo = EXCLUDED.memo,
+         vendor_address = EXCLUDED.vendor_address,
          dispatch_vendor_yard = EXCLUDED.dispatch_vendor_yard,
          dispatch_address = EXCLUDED.dispatch_address,
          dispatch_window_start = EXCLUDED.dispatch_window_start,
@@ -982,6 +990,7 @@ export async function upsertPurchaseOrders(orders = []) {
         normalized.destination_location_id,
         normalized.destination_location,
         normalized.memo,
+        normalized.vendor_address,
         normalized.dispatch_vendor_yard,
         normalized.dispatch_address,
         normalized.dispatch_window_start,
@@ -1002,7 +1011,7 @@ export async function upsertPurchaseOrders(orders = []) {
         "tranid", "trandate", "vendor_id", "vendor", "status",
         "status_text", "foreign_total", "source_location_id", "source_location",
         "destination_location_id", "destination_location", "memo",
-        "dispatch_address", "dispatch_window_start", "dispatch_window_end",
+        "vendor_address", "dispatch_address", "dispatch_window_start", "dispatch_window_end",
         "dispatch_instructions", "dispatch_vendor_yard", "dispatch_parse_source",
         "dispatch_note_hash"
       ],

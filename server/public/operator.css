@@ -1458,6 +1458,16 @@ label span {
   padding: 5px;
 }
 
+.measure.confirmed-measure {
+  background: #e9f8f0;
+  border: 1px solid #8ed0aa;
+}
+
+.measure.confirmed-measure span,
+.measure.confirmed-measure b {
+  color: #087443;
+}
+
 .selected-panel {
   min-height: 0;
   border: 2px solid var(--line);

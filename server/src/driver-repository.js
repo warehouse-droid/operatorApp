@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import { query } from "./db.js";
 import { config } from "./config.js";
 import { createSamsaraDriverVehicleAssignment, createSamsaraMechanicDvir, findSamsaraDvirForVehicle, setSamsaraDriverDutyStatus } from "./samsara.js";
@@ -8,9 +9,54 @@ const YARD_ADDRESSES = {
   "12441": "12441 Woodbine Avenue, Whitchurch-Stouffville, ON"
 };
 const OWN_YARD_CODES = new Set(Object.keys(YARD_ADDRESSES));
+const SAMSARA_ACCOUNT_LIMIT_MS = 8 * 60 * 60 * 1000;
 
 function driverKey(value) {
   return String(value || "").trim().toLowerCase();
+}
+
+function normalizeSamsaraAccounts({ primaryUsername = "", secondaryUsername = "" } = {}) {
+  return {
+    primaryUsername: String(primaryUsername || "").trim(),
+    secondaryUsername: String(secondaryUsername || "").trim()
+  };
+}
+
+function samsaraAccountsFromLegacy(samsaraUsername = "", samsaraAccounts = {}) {
+  const normalized = normalizeSamsaraAccounts(samsaraAccounts);
+  if (!normalized.primaryUsername) normalized.primaryUsername = String(samsaraUsername || "").trim();
+  return normalized;
+}
+
+function samsaraUsernameForAccount(accounts = {}, account = "primary") {
+  return account === "secondary" ? accounts.secondaryUsername : accounts.primaryUsername;
+}
+
+function shouldSwitchToSecondary(row) {
+  if (!row?.on_duty_at || row?.secondary_on_duty_at) return false;
+  if (String(row?.samsara_active_account || "primary") === "secondary") return false;
+  const started = new Date(row.on_duty_at).getTime();
+  return Number.isFinite(started) && Date.now() - started >= SAMSARA_ACCOUNT_LIMIT_MS;
+}
+
+function mapRestRecord(row = null) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    restId: row.rest_id,
+    planId: row.plan_id,
+    planDate: row.plan_date,
+    driverLogin: row.driver_login,
+    truckId: row.truck_id || "",
+    truckPlate: row.truck_plate || "",
+    loadId: row.load_id || "",
+    loadName: row.load_name || "",
+    previousJobId: row.previous_job_id || "",
+    nextJobId: row.next_job_id || "",
+    status: row.status || "",
+    startedAt: row.started_at || null,
+    endedAt: row.ended_at || null
+  };
 }
 
 function planDateValue(value) {
@@ -40,6 +86,10 @@ function jobId(plan, truck, load, stop) {
 
 function travelJobId(plan, truck, load, from, to) {
   return [plan.id, truck.id || truck.plate, load.id, "TRAVEL", from, to].map((part) => encodeURIComponent(String(part || ""))).join(":");
+}
+
+function returnJobId(plan, truck, load, from, to) {
+  return [plan.id, truck.id || truck.plate, load.id, "RETURN", from, to].map((part) => encodeURIComponent(String(part || ""))).join(":");
 }
 
 function sortedPlans(rows) {
@@ -123,11 +173,66 @@ function firstPickupStop(load) {
   return (load.stops || []).find((stop) => stop.type === "pick") || null;
 }
 
-function buildTravelJob(plan, truck, load, truckIndex, loadIndex) {
-  const firstPickup = firstPickupStop(load);
-  if (!truck?.base || !firstPickup?.location || String(truck.base) === String(firstPickup.location)) return null;
+function lastRoutedStop(load) {
+  const stops = Array.isArray(load?.stops) ? load.stops : [];
+  for (let index = stops.length - 1; index >= 0; index -= 1) {
+    if (["pick", "drop"].includes(stops[index]?.type)) return stops[index];
+  }
+  return null;
+}
+
+function stopLocationLabel(plan, stop) {
+  if (!stop) return "";
+  if (stop.type === "pick") return String(stop.location || "");
+  const order = orderByRef(plan, stop.orderId) || {};
+  return String(order.id || stop.orderId || "");
+}
+
+function stopAddressLabel(plan, stop) {
+  if (!stop) return "";
+  if (stop.type === "pick") return yardAddress(stop.location);
+  const order = orderByRef(plan, stop.orderId) || {};
+  return order.address || order.dropAddress || order.destinationYard || order.id || stop.orderId || "";
+}
+
+function loadEndPoint(plan, truck, load) {
+  if (!load) return null;
+  if (load.returnOnly) {
+    const yard = String(load.returnYard || "12441");
+    return { location: yard, address: yardAddress(yard) };
+  }
+  const stop = lastRoutedStop(load);
+  if (!stop) return null;
   return {
-    jobId: travelJobId(plan, truck, load, truck.base, firstPickup.location),
+    location: stopLocationLabel(plan, stop),
+    address: stopAddressLabel(plan, stop)
+  };
+}
+
+function startTravelForLoad(plan, truck, load, loadIndex) {
+  const firstPickup = firstPickupStop(load);
+  if (!firstPickup?.location) return null;
+  let from = null;
+  if (loadIndex <= 0) {
+    if (!truck?.base) return null;
+    from = { location: String(truck.base), address: yardAddress(truck.base) };
+  } else {
+    from = loadEndPoint(plan, truck, (truck.loads || [])[loadIndex - 1]);
+  }
+  if (!from?.location || String(from.location) === String(firstPickup.location)) return null;
+  return {
+    from: from.location,
+    fromAddress: from.address || yardAddress(from.location),
+    to: String(firstPickup.location),
+    toAddress: yardAddress(firstPickup.location)
+  };
+}
+
+function buildTravelJob(plan, truck, load, truckIndex, loadIndex) {
+  const travel = startTravelForLoad(plan, truck, load, loadIndex);
+  if (!travel) return null;
+  return {
+    jobId: travelJobId(plan, truck, load, travel.from, travel.to),
     planId: plan.id,
     planDate: plan.planDate,
     driverLogin: driverKey(truck.driverLogin || truck.driver),
@@ -137,17 +242,51 @@ function buildTravelJob(plan, truck, load, truckIndex, loadIndex) {
     parkingSpot: truck.parkingSpot || "",
     loadId: load.id || "",
     loadName: load.name || "",
-    stopId: `travel-${truck.base}-${firstPickup.location}`,
+    stopId: `travel-${travel.from}-${travel.to}`,
     stopType: "travel",
-    location: `${truck.base} to ${firstPickup.location}`,
-    address: yardAddress(firstPickup.location),
-    fromLocation: truck.base,
-    fromAddress: yardAddress(truck.base),
-    toLocation: firstPickup.location,
-    toAddress: yardAddress(firstPickup.location),
+    location: `${travel.from} to ${travel.to}`,
+    address: travel.toAddress,
+    fromLocation: travel.from,
+    fromAddress: travel.fromAddress,
+    toLocation: travel.to,
+    toAddress: travel.toAddress,
     windowStart: "",
     windowEnd: "",
     instructions: "Travel to the pickup yard before loading.",
+    orderRefs: [],
+    orderTypes: [],
+    requiredPhotos: 0,
+    sequence: { truckIndex, loadIndex, stopIndex: -1 }
+  };
+}
+
+function buildReturnJob(plan, truck, load, truckIndex, loadIndex) {
+  const previous = loadEndPoint(plan, truck, (truck.loads || [])[loadIndex - 1]);
+  const to = String(load.returnYard || "12441");
+  const from = previous?.location || String(truck.base || "");
+  if (!from || String(from) === to) return null;
+  return {
+    jobId: returnJobId(plan, truck, load, from, to),
+    planId: plan.id,
+    planDate: plan.planDate,
+    driverLogin: driverKey(truck.driverLogin || truck.driver),
+    driverName: truck.driver || "",
+    truckId: truck.id || "",
+    truckPlate: truck.plate || "",
+    parkingSpot: truck.parkingSpot || "",
+    loadId: load.id || "",
+    loadName: load.name || "Return Load",
+    stopId: `return-${from}-${to}`,
+    stopType: "travel",
+    location: `${from} to ${to}`,
+    address: yardAddress(to),
+    fromLocation: from,
+    fromAddress: previous?.address || yardAddress(from),
+    toLocation: to,
+    toAddress: yardAddress(to),
+    windowStart: "",
+    windowEnd: "",
+    instructions: "Return to yard.",
     orderRefs: [],
     orderTypes: [],
     requiredPhotos: 0,
@@ -227,7 +366,11 @@ async function confirmedPlans() {
 function planJobsForTruck(plan, truck, truckIndex) {
   const jobs = [];
   (truck.loads || []).forEach((load, loadIndex) => {
-    if (load.returnOnly) return;
+    if (load.returnOnly) {
+      const returnJob = buildReturnJob(plan, truck, load, truckIndex, loadIndex);
+      if (returnJob) jobs.push(returnJob);
+      return;
+    }
     const travelJob = buildTravelJob(plan, truck, load, truckIndex, loadIndex);
     if (travelJob) jobs.push(travelJob);
     (load.stops || []).forEach((stop, stopIndex) => {
@@ -298,7 +441,8 @@ function isSamsaraOffDutyConfirmed(row) {
   );
 }
 
-async function upsertDriverDayBase({ driverLogin, plan, truck, samsaraUsername = "" }) {
+async function upsertDriverDayBase({ driverLogin, plan, truck, samsaraUsername = "", samsaraAccounts = {} }) {
+  const normalizedSamsaraAccounts = samsaraAccountsFromLegacy(samsaraUsername, samsaraAccounts);
   const login = driverKey(driverLogin);
   const planDate = plan?.planDate || todayLocalDate();
   const existing = await query(
@@ -317,24 +461,35 @@ async function upsertDriverDayBase({ driverLogin, plan, truck, samsaraUsername =
   );
   const result = await query(
     `INSERT INTO driver_day_records (
-       driver_login, plan_id, plan_date, truck_id, truck_plate, samsara_username
-     ) VALUES ($1, $2, $3::date, $4, $5, $6)
+       driver_login, plan_id, plan_date, truck_id, truck_plate, samsara_username, samsara_secondary_username
+     ) VALUES ($1, $2, $3::date, $4, $5, $6, $8)
      ON CONFLICT (driver_login, plan_date) DO UPDATE SET
        plan_id = EXCLUDED.plan_id,
        truck_id = EXCLUDED.truck_id,
        truck_plate = EXCLUDED.truck_plate,
        samsara_username = COALESCE(NULLIF(EXCLUDED.samsara_username, ''), driver_day_records.samsara_username),
+       samsara_secondary_username = COALESCE(NULLIF(EXCLUDED.samsara_secondary_username, ''), driver_day_records.samsara_secondary_username),
+       samsara_active_account = CASE WHEN $7 = true THEN 'primary' ELSE driver_day_records.samsara_active_account END,
        pre_dvir_photo_data_urls = CASE WHEN $7 = true THEN '[]'::jsonb ELSE driver_day_records.pre_dvir_photo_data_urls END,
        post_dvir_photo_data_urls = CASE WHEN $7 = true THEN '[]'::jsonb ELSE driver_day_records.post_dvir_photo_data_urls END,
        pre_dvir_completed_at = CASE WHEN $7 = true THEN NULL ELSE driver_day_records.pre_dvir_completed_at END,
        post_dvir_completed_at = CASE WHEN $7 = true THEN NULL ELSE driver_day_records.post_dvir_completed_at END,
        on_duty_at = CASE WHEN $7 = true THEN NULL ELSE driver_day_records.on_duty_at END,
        off_duty_at = CASE WHEN $7 = true THEN NULL ELSE driver_day_records.off_duty_at END,
+       primary_off_duty_at = CASE WHEN $7 = true THEN NULL ELSE driver_day_records.primary_off_duty_at END,
+       secondary_on_duty_at = CASE WHEN $7 = true THEN NULL ELSE driver_day_records.secondary_on_duty_at END,
+       secondary_off_duty_at = CASE WHEN $7 = true THEN NULL ELSE driver_day_records.secondary_off_duty_at END,
        samsara_driver_id = CASE WHEN $7 = true THEN NULL ELSE driver_day_records.samsara_driver_id END,
        samsara_vehicle_id = CASE WHEN $7 = true THEN NULL ELSE driver_day_records.samsara_vehicle_id END,
+       samsara_secondary_driver_id = CASE WHEN $7 = true THEN NULL ELSE driver_day_records.samsara_secondary_driver_id END,
+       samsara_secondary_vehicle_id = CASE WHEN $7 = true THEN NULL ELSE driver_day_records.samsara_secondary_vehicle_id END,
        samsara_assignment_response = CASE WHEN $7 = true THEN '{}'::jsonb ELSE driver_day_records.samsara_assignment_response END,
        samsara_on_duty_response = CASE WHEN $7 = true THEN '{}'::jsonb ELSE driver_day_records.samsara_on_duty_response END,
        samsara_off_duty_response = CASE WHEN $7 = true THEN '{}'::jsonb ELSE driver_day_records.samsara_off_duty_response END,
+       samsara_secondary_assignment_response = CASE WHEN $7 = true THEN '{}'::jsonb ELSE driver_day_records.samsara_secondary_assignment_response END,
+       samsara_secondary_on_duty_response = CASE WHEN $7 = true THEN '{}'::jsonb ELSE driver_day_records.samsara_secondary_on_duty_response END,
+       samsara_secondary_off_duty_response = CASE WHEN $7 = true THEN '{}'::jsonb ELSE driver_day_records.samsara_secondary_off_duty_response END,
+       samsara_handoff_response = CASE WHEN $7 = true THEN '{}'::jsonb ELSE driver_day_records.samsara_handoff_response END,
        updated_at = now()
      RETURNING *`,
     [
@@ -343,8 +498,9 @@ async function upsertDriverDayBase({ driverLogin, plan, truck, samsaraUsername =
       planDate,
       truck?.id || "",
       truck?.plate || "",
-      samsaraUsername || "",
-      Boolean(truckChanged)
+      normalizedSamsaraAccounts.primaryUsername || "",
+      Boolean(truckChanged),
+      normalizedSamsaraAccounts.secondaryUsername || ""
     ]
   );
   return result.rows[0];
@@ -366,7 +522,17 @@ async function clearUnconfirmedDvirIfNeeded(row) {
             post_dvir_photo_data_urls = CASE WHEN $3 = true THEN '[]'::jsonb ELSE post_dvir_photo_data_urls END,
             post_dvir_completed_at = CASE WHEN $3 = true THEN NULL ELSE post_dvir_completed_at END,
             off_duty_at = CASE WHEN $3 = true THEN NULL ELSE off_duty_at END,
+            samsara_active_account = CASE WHEN $2 = true THEN 'primary' ELSE samsara_active_account END,
+            primary_off_duty_at = CASE WHEN $2 = true THEN NULL ELSE primary_off_duty_at END,
+            secondary_on_duty_at = CASE WHEN $2 = true THEN NULL ELSE secondary_on_duty_at END,
+            secondary_off_duty_at = CASE WHEN $2 = true THEN NULL ELSE secondary_off_duty_at END,
             samsara_off_duty_response = CASE WHEN $3 = true THEN '{}'::jsonb ELSE samsara_off_duty_response END,
+            samsara_secondary_driver_id = CASE WHEN $2 = true THEN NULL ELSE samsara_secondary_driver_id END,
+            samsara_secondary_vehicle_id = CASE WHEN $2 = true THEN NULL ELSE samsara_secondary_vehicle_id END,
+            samsara_secondary_assignment_response = CASE WHEN $2 = true THEN '{}'::jsonb ELSE samsara_secondary_assignment_response END,
+            samsara_secondary_on_duty_response = CASE WHEN $2 = true THEN '{}'::jsonb ELSE samsara_secondary_on_duty_response END,
+            samsara_secondary_off_duty_response = CASE WHEN $3 = true OR $2 = true THEN '{}'::jsonb ELSE samsara_secondary_off_duty_response END,
+            samsara_handoff_response = CASE WHEN $2 = true THEN '{}'::jsonb ELSE samsara_handoff_response END,
             updated_at = now()
       WHERE id = $1
       RETURNING *`,
@@ -375,11 +541,12 @@ async function clearUnconfirmedDvirIfNeeded(row) {
   return result.rows[0] || row;
 }
 
-export async function getDriverDayState(driverLogin, { samsaraUsername = "" } = {}) {
+export async function getDriverDayState(driverLogin, { samsaraUsername = "", samsaraAccounts = {} } = {}) {
+  const normalizedSamsaraAccounts = samsaraAccountsFromLegacy(samsaraUsername, samsaraAccounts);
   const assignment = await activeDriverAssignment(driverLogin);
   const plan = assignment?.plan || { id: null, planDate: todayLocalDate() };
   const truck = assignment?.truck || {};
-  let row = await upsertDriverDayBase({ driverLogin, plan, truck, samsaraUsername });
+  let row = await upsertDriverDayBase({ driverLogin, plan, truck, samsaraAccounts: normalizedSamsaraAccounts });
   row = await clearUnconfirmedDvirIfNeeded(row);
   const jobs = assignment ? planJobsForTruck(plan, truck, assignment.truckIndex) : [];
   const jobIds = jobs.map((job) => job.jobId);
@@ -391,13 +558,18 @@ export async function getDriverDayState(driverLogin, { samsaraUsername = "" } = 
     truckId: truck?.id || "",
     truckPlate: truck?.plate || "",
     parkingSpot: truck?.parkingSpot || "",
-    samsaraUsername: row.samsara_username || samsaraUsername || "",
+    samsaraUsername: row.samsara_username || normalizedSamsaraAccounts.primaryUsername || "",
+    samsaraSecondaryUsername: row.samsara_secondary_username || normalizedSamsaraAccounts.secondaryUsername || "",
+    samsaraActiveAccount: row.samsara_active_account || "primary",
     preDvirStatus: dvirStatus(row, "pre") === "complete" && isSamsaraDvirConfirmed(row, "pre") ? "complete" : "required",
     postDvirStatus: dvirStatus(row, "post") === "complete" && isSamsaraDvirConfirmed(row, "post") ? "complete" : "required",
     preDvirCompletedAt: row.pre_dvir_completed_at || null,
     postDvirCompletedAt: row.post_dvir_completed_at || null,
     onDutyAt: row.on_duty_at || null,
     offDutyAt: row.off_duty_at || null,
+    primaryOffDutyAt: row.primary_off_duty_at || null,
+    secondaryOnDutyAt: row.secondary_on_duty_at || null,
+    secondaryOffDutyAt: row.secondary_off_duty_at || null,
     samsaraOnDutyConfirmed: isSamsaraOnDutyConfirmed(row),
     samsaraOffDutyConfirmed: isSamsaraOffDutyConfirmed(row),
     samsaraPreDvirConfirmed: isSamsaraDvirConfirmed(row, "pre"),
@@ -410,12 +582,13 @@ export async function getDriverDayState(driverLogin, { samsaraUsername = "" } = 
   };
 }
 
-export async function submitDriverDvir(driverLogin, { type = "pre", photoDataUrls = [], samsaraUsername = "", samsaraDvirAuthorId = "" } = {}) {
+export async function submitDriverDvir(driverLogin, { type = "pre", photoDataUrls = [], samsaraUsername = "", samsaraAccounts = {}, samsaraDvirAuthorId = "" } = {}) {
+  const normalizedSamsaraAccounts = samsaraAccountsFromLegacy(samsaraUsername, samsaraAccounts);
   const assignment = await activeDriverAssignment(driverLogin);
   const plan = assignment?.plan || { id: null, planDate: todayLocalDate() };
   const truck = assignment?.truck || {};
   if (!truck?.plate) throw new Error("No assigned truck was found in the confirmed dispatch plan.");
-  let row = await upsertDriverDayBase({ driverLogin, plan, truck, samsaraUsername });
+  let row = await upsertDriverDayBase({ driverLogin, plan, truck, samsaraAccounts: normalizedSamsaraAccounts });
   const photos = Array.isArray(photoDataUrls) ? photoDataUrls.filter(Boolean) : [];
   if (photos.length < 4) throw new Error("4 inspection photos are required.");
   let samsaraAssignment = null;
@@ -423,14 +596,21 @@ export async function submitDriverDvir(driverLogin, { type = "pre", photoDataUrl
   let samsaraDvir = null;
   let verifiedDvir = null;
   let samsaraError = "";
+  const activeAccount = type === "post" && row.samsara_active_account === "secondary" ? "secondary" : "primary";
+  const selectedUsername = type === "post"
+    ? samsaraUsernameForAccount(normalizedSamsaraAccounts, activeAccount)
+    : normalizedSamsaraAccounts.primaryUsername;
+  const selectedVehicleId = activeAccount === "secondary"
+    ? row.samsara_secondary_vehicle_id || row.samsara_vehicle_id || ""
+    : row.samsara_vehicle_id || "";
   try {
-    if (type === "pre" && samsaraUsername) {
+    if (type === "pre" && selectedUsername) {
       samsaraAssignment = await createSamsaraDriverVehicleAssignment({
-        username: samsaraUsername,
+        username: selectedUsername,
         vehiclePlate: truck.plate
       });
       samsaraDuty = await setSamsaraDriverDutyStatus({
-        username: samsaraUsername,
+        username: selectedUsername,
         vehicleId: samsaraAssignment.vehicle?.id || "",
         dutyStatus: "ON_DUTY",
         remark: `MBBS pre-DVIR complete with ${truck.plate}`
@@ -441,7 +621,7 @@ export async function submitDriverDvir(driverLogin, { type = "pre", photoDataUrl
         licensePlate: truck.plate,
         location: truck.base || truck.parkingSpot || "",
         safetyStatus: "safe",
-        mechanicNotes: `MBBS pre-trip inspection submitted from Driver PWA by ${samsaraUsername}. Four photos are stored in MBBS.`
+        mechanicNotes: `MBBS pre-trip inspection submitted from Driver PWA by ${selectedUsername}. Four photos are stored in MBBS.`
       });
       verifiedDvir = await findSamsaraDvirForVehicle({
         vehicleId: samsaraAssignment.vehicle?.id || "",
@@ -452,23 +632,23 @@ export async function submitDriverDvir(driverLogin, { type = "pre", photoDataUrl
         throw new Error("Samsara DVIR was not found after submission. Please redo the inspection in MBBS.");
       }
     }
-    if (type === "post" && samsaraUsername) {
+    if (type === "post" && selectedUsername) {
       samsaraDuty = await setSamsaraDriverDutyStatus({
-        username: samsaraUsername,
+        username: selectedUsername,
+        vehicleId: selectedVehicleId,
         dutyStatus: "OFF_DUTY",
-        remark: `MBBS post-DVIR complete with ${truck.plate}`
+        remark: `MBBS post-DVIR complete with ${truck.plate} (${activeAccount} account)`
       });
-      const vehicleId = row.samsara_vehicle_id || "";
       samsaraDvir = await createSamsaraMechanicDvir({
         authorId: samsaraDvirAuthorId || config.samsara.dvirAuthorId || "",
-        vehicleId,
+        vehicleId: selectedVehicleId,
         licensePlate: truck.plate,
         location: truck.base || truck.parkingSpot || "",
         safetyStatus: "safe",
-        mechanicNotes: `MBBS post-trip inspection submitted from Driver PWA by ${samsaraUsername}. Four photos are stored in MBBS.`
+        mechanicNotes: `MBBS post-trip inspection submitted from Driver PWA by ${selectedUsername}. Four photos are stored in MBBS.`
       });
       verifiedDvir = await findSamsaraDvirForVehicle({
-        vehicleId,
+        vehicleId: selectedVehicleId,
         sinceTime: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
         type: "mechanic"
       });
@@ -493,7 +673,9 @@ export async function submitDriverDvir(driverLogin, { type = "pre", photoDataUrl
             SET post_dvir_photo_data_urls = CASE WHEN $4 = true THEN $2::jsonb ELSE post_dvir_photo_data_urls END,
                 post_dvir_completed_at = CASE WHEN $4 = true THEN now() ELSE post_dvir_completed_at END,
                 off_duty_at = CASE WHEN $4 = true THEN now() ELSE off_duty_at END,
+                secondary_off_duty_at = CASE WHEN $4 = true AND $5 = 'secondary' THEN now() ELSE secondary_off_duty_at END,
                 samsara_off_duty_response = $3::jsonb,
+                samsara_secondary_off_duty_response = CASE WHEN $5 = 'secondary' THEN $3::jsonb ELSE samsara_secondary_off_duty_response END,
                 updated_at = now()
           WHERE id = $1
           RETURNING *`
@@ -501,6 +683,9 @@ export async function submitDriverDvir(driverLogin, { type = "pre", photoDataUrl
             SET pre_dvir_photo_data_urls = CASE WHEN $7 = true THEN $2::jsonb ELSE '[]'::jsonb END,
                 pre_dvir_completed_at = CASE WHEN $7 = true THEN now() ELSE NULL END,
                 on_duty_at = CASE WHEN $7 = true THEN now() ELSE NULL END,
+                samsara_active_account = CASE WHEN $7 = true THEN 'primary' ELSE samsara_active_account END,
+                samsara_username = COALESCE(NULLIF($8, ''), samsara_username),
+                samsara_secondary_username = COALESCE(NULLIF($9, ''), samsara_secondary_username),
                 samsara_driver_id = COALESCE(NULLIF($4, ''), samsara_driver_id),
                 samsara_vehicle_id = COALESCE(NULLIF($5, ''), samsara_vehicle_id),
                 samsara_assignment_response = $6::jsonb,
@@ -513,7 +698,8 @@ export async function submitDriverDvir(driverLogin, { type = "pre", photoDataUrl
           row.id,
           JSON.stringify(photos),
           JSON.stringify(dvirPayload),
-          samsaraConfirmed
+          samsaraConfirmed,
+          activeAccount
         ]
       : [
           row.id,
@@ -522,18 +708,115 @@ export async function submitDriverDvir(driverLogin, { type = "pre", photoDataUrl
           samsaraAssignment?.driver?.id || "",
           samsaraAssignment?.vehicle?.id || "",
           JSON.stringify(samsaraAssignment || (samsaraError ? { error: samsaraError } : {})),
-          samsaraConfirmed
+          samsaraConfirmed,
+          normalizedSamsaraAccounts.primaryUsername || "",
+          normalizedSamsaraAccounts.secondaryUsername || ""
         ]
   );
   row = result.rows[0];
   return {
-    state: await getDriverDayState(driverLogin, { samsaraUsername }),
+    state: await getDriverDayState(driverLogin, { samsaraAccounts: normalizedSamsaraAccounts }),
     samsaraError,
     samsaraAssignment,
     samsaraDuty,
     samsaraDvir,
     verifiedDvir,
+    samsaraAccount: type === "post" ? activeAccount : "primary",
+    samsaraUsername: selectedUsername,
     recordId: row.id
+  };
+}
+
+export async function ensureDriverSamsaraDutyForJob(driverLogin, { samsaraUsername = "", samsaraAccounts = {} } = {}) {
+  const normalizedSamsaraAccounts = samsaraAccountsFromLegacy(samsaraUsername, samsaraAccounts);
+  const assignment = await activeDriverAssignment(driverLogin);
+  if (!assignment) return { switched: false, reason: "no_assignment" };
+  const plan = assignment.plan;
+  const truck = assignment.truck || {};
+  if (!truck?.plate) return { switched: false, reason: "no_truck" };
+  const row = await upsertDriverDayBase({ driverLogin, plan, truck, samsaraAccounts: normalizedSamsaraAccounts });
+  if (!row.pre_dvir_completed_at || !row.on_duty_at) return { switched: false, reason: "pre_dvir_not_complete" };
+  if (!shouldSwitchToSecondary(row)) return { switched: false, account: row.samsara_active_account || "primary" };
+
+  if (!normalizedSamsaraAccounts.secondaryUsername) {
+    throw new Error("Secondary Samsara username is required after 8 hours on duty.");
+  }
+
+  let secondaryAssignment = null;
+  let secondaryDuty = null;
+  let primaryOffDuty = null;
+  try {
+    secondaryAssignment = await createSamsaraDriverVehicleAssignment({
+      username: normalizedSamsaraAccounts.secondaryUsername,
+      vehiclePlate: truck.plate
+    });
+    secondaryDuty = await setSamsaraDriverDutyStatus({
+      username: normalizedSamsaraAccounts.secondaryUsername,
+      vehicleId: secondaryAssignment.vehicle?.id || row.samsara_vehicle_id || "",
+      dutyStatus: "ON_DUTY",
+      remark: `MBBS automatic 8-hour handoff to secondary account with ${truck.plate}`
+    });
+    primaryOffDuty = await setSamsaraDriverDutyStatus({
+      username: normalizedSamsaraAccounts.primaryUsername,
+      driverId: row.samsara_driver_id || "",
+      vehicleId: row.samsara_vehicle_id || "",
+      dutyStatus: "OFF_DUTY",
+      remark: `MBBS automatic 8-hour handoff from primary account with ${truck.plate}`
+    });
+  } catch (error) {
+    await query(
+      `UPDATE driver_day_records
+          SET samsara_handoff_response = $2::jsonb,
+              updated_at = now()
+        WHERE id = $1`,
+      [row.id, JSON.stringify({
+        error: error.message,
+        secondaryAssignment,
+        secondaryDuty,
+        primaryOffDuty
+      })]
+    );
+    throw error;
+  }
+
+  await query(
+    `UPDATE driver_day_records
+        SET samsara_active_account = 'secondary',
+            samsara_secondary_username = COALESCE(NULLIF($2, ''), samsara_secondary_username),
+            samsara_secondary_driver_id = COALESCE(NULLIF($3, ''), samsara_secondary_driver_id),
+            samsara_secondary_vehicle_id = COALESCE(NULLIF($4, ''), samsara_secondary_vehicle_id),
+            primary_off_duty_at = now(),
+            secondary_on_duty_at = now(),
+            samsara_secondary_assignment_response = $5::jsonb,
+            samsara_secondary_on_duty_response = $6::jsonb,
+            samsara_handoff_response = $7::jsonb,
+            updated_at = now()
+      WHERE id = $1`,
+    [
+      row.id,
+      normalizedSamsaraAccounts.secondaryUsername,
+      secondaryAssignment?.driver?.id || "",
+      secondaryAssignment?.vehicle?.id || row.samsara_vehicle_id || "",
+      JSON.stringify(secondaryAssignment || {}),
+      JSON.stringify(secondaryDuty || {}),
+      JSON.stringify({
+        switchedAt: new Date().toISOString(),
+        from: normalizedSamsaraAccounts.primaryUsername,
+        to: normalizedSamsaraAccounts.secondaryUsername,
+        primaryOffDuty,
+        secondaryAssignment,
+        secondaryDuty
+      })
+    ]
+  );
+  return {
+    switched: true,
+    account: "secondary",
+    primaryUsername: normalizedSamsaraAccounts.primaryUsername,
+    secondaryUsername: normalizedSamsaraAccounts.secondaryUsername,
+    primaryOffDuty,
+    secondaryAssignment,
+    secondaryDuty
   };
 }
 
@@ -719,11 +1002,12 @@ async function detailsFromReceiving(orderRef, typeHint = "") {
   const typeClause = typeHint === "TO" ? "AND o.order_type = 'transfer_order'" : typeHint === "PO" ? "AND o.order_type = 'purchase_order'" : "";
   const order = await query(
     `WITH receiving_order_source AS (
-       SELECT netsuite_id, tranid, 'purchase_order'::text AS order_type, vendor AS party,
+       SELECT netsuite_id, COALESCE(NULLIF(dispatch_ref, ''), tranid) AS tranid, tranid AS original_tranid,
+              'purchase_order'::text AS order_type, vendor AS party,
               dispatch_address, dispatch_window_start, dispatch_window_end, destination_location, synced_at
        FROM purchase_orders
        UNION ALL
-       SELECT netsuite_id, tranid, 'transfer_order'::text AS order_type, from_location AS party,
+       SELECT netsuite_id, tranid, tranid AS original_tranid, 'transfer_order'::text AS order_type, from_location AS party,
               dispatch_address, dispatch_window_start, dispatch_window_end, to_location AS destination_location, synced_at
        FROM transfer_orders
        WHERE to_location_id IS NOT NULL
@@ -731,7 +1015,7 @@ async function detailsFromReceiving(orderRef, typeHint = "") {
      SELECT o.netsuite_id, o.tranid, o.order_type, o.party,
             o.dispatch_address, o.dispatch_window_start, o.dispatch_window_end, o.destination_location
        FROM receiving_order_source o
-      WHERE o.tranid = $1 ${typeClause}
+      WHERE (o.tranid = $1 OR o.original_tranid = $1) ${typeClause}
       ORDER BY o.synced_at DESC
       LIMIT 1`,
     [orderRef]
@@ -952,6 +1236,81 @@ export async function startDriverJob(driverLogin, jobIdValue, { job = null } = {
     ]
   );
   return result.rows[0];
+}
+
+export async function getActiveDriverRest(driverLogin) {
+  const result = await query(
+    `SELECT *
+       FROM driver_rest_records
+      WHERE driver_login = $1
+        AND status = 'active'
+        AND ended_at IS NULL
+      ORDER BY started_at DESC
+      LIMIT 1`,
+    [driverKey(driverLogin)]
+  );
+  return mapRestRecord(result.rows[0]);
+}
+
+export async function startDriverRest(driverLogin, { nextJob = null } = {}) {
+  if (!nextJob) throw new Error("No next job is available for rest.");
+  if (nextJob.status === "in_progress") throw new Error("Finish the current started job before resting.");
+  const login = driverKey(driverLogin);
+  const active = await getActiveDriverRest(login);
+  if (active) return active;
+  const previous = await query(
+    `SELECT job_id
+       FROM driver_job_records
+      WHERE driver_login = $1
+        AND status = 'complete'
+      ORDER BY completed_at DESC NULLS LAST, started_at DESC NULLS LAST, id DESC
+      LIMIT 1`,
+    [login]
+  );
+  const inserted = await query(
+    `INSERT INTO driver_rest_records (
+       rest_id, plan_id, plan_date, driver_login, truck_id, truck_plate,
+       load_id, load_name, previous_job_id, next_job_id, status, started_at
+     ) VALUES (
+       $1, $2, $3, $4, $5, $6,
+       $7, $8, $9, $10, 'active', now()
+     )
+     RETURNING *`,
+    [
+      crypto.randomUUID(),
+      nextJob.planId || null,
+      nextJob.planDate || null,
+      login,
+      nextJob.truckId || "",
+      nextJob.truckPlate || "",
+      nextJob.loadId || "",
+      nextJob.loadName || "",
+      previous.rows[0]?.job_id || "",
+      nextJob.jobId || ""
+    ]
+  );
+  return mapRestRecord(inserted.rows[0]);
+}
+
+export async function endDriverRest(driverLogin) {
+  const result = await query(
+    `UPDATE driver_rest_records
+        SET status = 'complete',
+            ended_at = now(),
+            updated_at = now()
+      WHERE id = (
+        SELECT id
+          FROM driver_rest_records
+         WHERE driver_login = $1
+           AND status = 'active'
+           AND ended_at IS NULL
+         ORDER BY started_at DESC
+         LIMIT 1
+      )
+      RETURNING *`,
+    [driverKey(driverLogin)]
+  );
+  return mapRestRecord(result.rows[0]);
 }
 
 export async function recordDriverJobPhotos(driverLogin, jobIdValue, { photoDataUrls = [], job = null } = {}) {

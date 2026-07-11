@@ -1,7 +1,33 @@
 const DISPATCH_AUTH_TOKEN_KEY = "mbbs.dispatch.token";
-let dispatchAuthToken = localStorage.getItem(DISPATCH_AUTH_TOKEN_KEY) || "";
+const DISPATCH_AUTH_FALLBACK_TOKEN_KEYS = ["mbbs.control.token"];
+let dispatchAuthTokenKey = DISPATCH_AUTH_TOKEN_KEY;
+let dispatchAuthToken = readDispatchAuthToken();
 let dispatchAuthOperator = null;
 const dispatchNativeFetch = window.fetch.bind(window);
+
+function readDispatchAuthToken() {
+  const primary = localStorage.getItem(DISPATCH_AUTH_TOKEN_KEY) || "";
+  if (primary) {
+    dispatchAuthTokenKey = DISPATCH_AUTH_TOKEN_KEY;
+    return primary;
+  }
+  for (const key of DISPATCH_AUTH_FALLBACK_TOKEN_KEYS) {
+    const token = localStorage.getItem(key) || "";
+    if (token) {
+      dispatchAuthTokenKey = key;
+      return token;
+    }
+  }
+  dispatchAuthTokenKey = DISPATCH_AUTH_TOKEN_KEY;
+  return "";
+}
+
+function clearDispatchAuthToken() {
+  if (dispatchAuthTokenKey) localStorage.removeItem(dispatchAuthTokenKey);
+  localStorage.removeItem(DISPATCH_AUTH_TOKEN_KEY);
+  dispatchAuthToken = "";
+  dispatchAuthTokenKey = DISPATCH_AUTH_TOKEN_KEY;
+}
 
 function dispatchAuthHeaders(headers = {}) {
   return {
@@ -12,7 +38,7 @@ function dispatchAuthHeaders(headers = {}) {
 
 window.fetch = (input, options = {}) => {
   const url = typeof input === "string" ? input : input?.url || "";
-  if (String(url).startsWith("/api/dispatch")) {
+  if (String(url).startsWith("/api/dispatch") || String(url).startsWith("/api/scm")) {
     return dispatchNativeFetch(input, {
       ...options,
       headers: dispatchAuthHeaders(options.headers || {})
@@ -21,22 +47,22 @@ window.fetch = (input, options = {}) => {
   return dispatchNativeFetch(input, options);
 };
 
-function dispatchCanAccess(operator) {
-  return ["dispatcher", "admin"].includes(operator?.role);
+function dispatchCanAccess(operator, roles = ["dispatcher", "admin"]) {
+  return roles.includes(operator?.role);
 }
 
-async function dispatchCheckSession() {
+async function dispatchCheckSession(roles) {
+  dispatchAuthToken = readDispatchAuthToken();
   if (!dispatchAuthToken) return null;
   const response = await dispatchNativeFetch("/api/auth/me", {
     headers: dispatchAuthHeaders()
   });
   if (!response.ok) {
-    dispatchAuthToken = "";
-    localStorage.removeItem(DISPATCH_AUTH_TOKEN_KEY);
+    clearDispatchAuthToken();
     return null;
   }
   const payload = await response.json();
-  if (!dispatchCanAccess(payload.operator)) return null;
+  if (!dispatchCanAccess(payload.operator, roles)) return null;
   dispatchAuthOperator = payload.operator;
   return payload.operator;
 }
@@ -64,8 +90,8 @@ function renderDispatchLogin(mount, message = "") {
   `;
 }
 
-async function requireDispatchLogin({ mount, onReady }) {
-  const existing = await dispatchCheckSession().catch(() => null);
+async function requireDispatchLogin({ mount, onReady, roles = ["dispatcher", "admin"] }) {
+  const existing = await dispatchCheckSession(roles).catch(() => null);
   if (existing) return onReady(existing);
 
   renderDispatchLogin(mount);
@@ -82,17 +108,17 @@ async function requireDispatchLogin({ mount, onReady }) {
       });
       if (!response.ok) throw new Error(await response.text());
       const payload = await response.json();
-      if (!dispatchCanAccess(payload.operator)) {
-        throw new Error("Dispatcher account required.");
+      if (!dispatchCanAccess(payload.operator, roles)) {
+        throw new Error("Authorized account required.");
       }
       dispatchAuthToken = payload.token;
+      dispatchAuthTokenKey = DISPATCH_AUTH_TOKEN_KEY;
       dispatchAuthOperator = payload.operator;
       localStorage.setItem(DISPATCH_AUTH_TOKEN_KEY, dispatchAuthToken);
       await onReady(payload.operator);
     } catch (error) {
-      dispatchAuthToken = "";
+      clearDispatchAuthToken();
       dispatchAuthOperator = null;
-      localStorage.removeItem(DISPATCH_AUTH_TOKEN_KEY);
       renderDispatchLogin(mount, error.message);
     }
   });
@@ -107,6 +133,6 @@ function dispatchLogout() {
   }
   dispatchAuthToken = "";
   dispatchAuthOperator = null;
-  localStorage.removeItem(DISPATCH_AUTH_TOKEN_KEY);
+  clearDispatchAuthToken();
   location.href = "/dispatch";
 }
