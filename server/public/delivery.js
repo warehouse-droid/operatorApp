@@ -1,6 +1,8 @@
 const LOCATIONS = [
   { id: 1, text: "3445" },
-  { id: 13, text: "2967" }
+  { id: 28, text: "2967" },
+  { id: 15, text: "12441" },
+  { id: 26, text: "150" }
 ];
 
 const ORDER_PAGE_SIZE = 4;
@@ -76,7 +78,9 @@ function statusText(status) {
   return {
     open: "Open",
     preparing: "Preparing",
-    packed: "Packed"
+    packed: "Packed",
+    loaded: "Loaded",
+    partial_loaded: "Partial Loaded"
   }[status] || "Open";
 }
 
@@ -90,19 +94,23 @@ function orderUnderpackCount(order) {
 
 function orderStatusText(order) {
   if (orderWarningCount(order)) return "Warning";
-  if (orderUnderpackCount(order) && order?.operator_status === "packed") return "Underpack";
+  if (orderUnderpackCount(order)) return "Underpack";
+  if (order?.operator_status === "partial_loaded" || order?.local_yard_order_status === "Partial Loaded") return "Underpack";
+  if (order?.local_yard_order_status === "Loaded") return "Loaded";
   return statusText(order?.operator_status);
 }
 
 function orderStatusClass(order) {
   if (orderWarningCount(order)) return "warning";
-  if (orderUnderpackCount(order) && order?.operator_status === "packed") return "underpack";
+  if (orderUnderpackCount(order)) return "underpack";
+  if (order?.operator_status === "partial_loaded" || order?.local_yard_order_status === "Partial Loaded") return "underpack";
+  if (order?.local_yard_order_status === "Loaded") return "loaded";
   return order?.operator_status || "open";
 }
 
 function formatDate(value) {
   if (!value) return "";
-  return new Date(value).toLocaleDateString();
+  return window.MBBS_I18N?.displayDate(value) || "";
 }
 
 function qty(value) {
@@ -154,6 +162,103 @@ function hasCustomPackQty(line) {
   return hasValue(line.pallet_qty) || hasValue(line.section_qty) || hasValue(line.layer_qty) || hasValue(line.piece_qty);
 }
 
+function shouldUseSalesQuantity(line) {
+  return !lineHasConversion(line) && qty(line.quantity) > 0;
+}
+
+function lineHasConversion(line) {
+  return qty(line.to_plt) > 0 || qty(line.to_lyr) > 0 || qty(line.to_sec) > 0 || qty(line.to_pcs) > 0;
+}
+
+function unitConversion(line, unit) {
+  if (unit === "pallets") return qty(line.to_plt);
+  if (unit === "layers") return qty(line.to_lyr);
+  if (unit === "sections") return qty(line.to_sec);
+  if (unit === "pieces") return qty(line.to_pcs);
+  return 0;
+}
+
+function lineUnitsToSalesQty(line, values) {
+  if (!lineHasConversion(line)) return qty(values.pieces) || qty(values.sections) || qty(values.layers) || qty(values.pallets);
+  return (qty(values.pallets) * qty(line.to_plt))
+    + (qty(values.layers) * qty(line.to_lyr))
+    + (qty(values.sections) * qty(line.to_sec))
+    + (qty(values.pieces) * qty(line.to_pcs));
+}
+
+function lineRequiredSalesQty(line) {
+  return qty(line.quantity) || lineUnitsToSalesQty(line, {
+    pallets: line.pallet_qty,
+    layers: line.layer_qty,
+    sections: line.section_qty,
+    pieces: line.piece_qty
+  });
+}
+
+const LOAD_SALES_QTY_TOLERANCE = 0.1;
+
+function wholeUnitsFromSalesQty(salesQuantity, conversion) {
+  const sales = qty(salesQuantity);
+  const unitSize = qty(conversion);
+  if (!sales || !unitSize) return 0;
+  const rawUnits = sales / unitSize;
+  const floorUnits = Math.floor(rawUnits + 0.000001);
+  const ceilUnits = Math.ceil(rawUnits - 0.000001);
+  if (ceilUnits > floorUnits && Math.abs((ceilUnits * unitSize) - sales) <= LOAD_SALES_QTY_TOLERANCE) {
+    return ceilUnits;
+  }
+  return floorUnits;
+}
+
+function explicitUnitQty(line, unit) {
+  if (unit === "pallets") return qty(line.pallet_qty);
+  if (unit === "layers") return qty(line.layer_qty);
+  if (unit === "sections") return qty(line.section_qty);
+  if (unit === "pieces") return qty(line.piece_qty);
+  return 0;
+}
+
+function unitRequiredLimit(line, unit) {
+  if (unit === "sales") return qty(line.quantity);
+  const conversion = unitConversion(line, unit);
+  if (!conversion) return 0;
+  const explicit = explicitUnitQty(line, unit);
+  if (explicit > 0) return explicit;
+  return !hasCustomPackQty(line) ? wholeUnitsFromSalesQty(lineRequiredSalesQty(line), conversion) : 0;
+}
+
+function loadedUnits(line) {
+  const loadedSales = qty(line.loaded_qty);
+  if (!loadedSales) return { pallets: 0, layers: 0, sections: 0, pieces: 0, sales: 0 };
+  if (shouldUseSalesQuantity(line)) {
+    return { pallets: 0, layers: 0, sections: 0, pieces: 0, sales: loadedSales };
+  }
+  let remainingLoaded = loadedSales;
+  const consume = (required, conversion) => {
+    if (!required || !conversion || remainingLoaded <= 0) return 0;
+    const value = Math.min(required, Math.floor((remainingLoaded / conversion) + 0.000001));
+    remainingLoaded = Math.max(0, remainingLoaded - (value * conversion));
+    return value;
+  };
+  return {
+    pallets: consume(unitRequiredLimit(line, "pallets"), qty(line.to_plt)),
+    layers: consume(unitRequiredLimit(line, "layers"), qty(line.to_lyr)),
+    sections: consume(unitRequiredLimit(line, "sections"), qty(line.to_sec)),
+    pieces: consume(unitRequiredLimit(line, "pieces"), qty(line.to_pcs)),
+    sales: loadedSales
+  };
+}
+
+function loadedValue(line, unit) {
+  const loaded = loadedUnits(line);
+  if (unit === "pallets") return loaded.pallets;
+  if (unit === "sections") return loaded.sections;
+  if (unit === "layers") return loaded.layers;
+  if (unit === "pieces") return loaded.pieces;
+  if (unit === "sales") return loaded.sales;
+  return 0;
+}
+
 function hasPackedQty(line) {
   return qty(line.packed_pallet_qty) > 0
     || qty(line.packed_section_qty) > 0
@@ -162,11 +267,12 @@ function hasPackedQty(line) {
 }
 
 function hasRemainingQty(line) {
+  if (shouldUseSalesQuantity(line)) return remainingValue(line, "sales") > 0;
   return remainingValue(line, "pallets") > 0
     || remainingValue(line, "sections") > 0
     || remainingValue(line, "layers") > 0
     || remainingValue(line, "pieces") > 0
-    || (!hasCustomPackQty(line) && remainingValue(line, "sales") > 0);
+    || (!lineHasConversion(line) && remainingValue(line, "sales") > 0);
 }
 
 function isUnderPacked(line) {
@@ -174,18 +280,16 @@ function isUnderPacked(line) {
 }
 
 function lineVariableUnit(line) {
-  if (hasValue(line.section_qty)) return { key: "sections", label: "SEC", required: line.section_qty, packedKey: "sections" };
-  if (hasValue(line.layer_qty)) return { key: "layers", label: "LYR", required: line.layer_qty, packedKey: "layers" };
-  if (hasValue(line.piece_qty)) return { key: "pieces", label: "PCS", required: line.piece_qty, packedKey: "pieces" };
-  if (!hasCustomPackQty(line)) return { key: "sales", label: line.unit || "Qty", required: line.quantity, packedKey: "sales" };
+  if (shouldUseSalesQuantity(line)) return { key: "sales", label: line.unit || "Qty", required: line.quantity, packedKey: "sales" };
+  if (unitRequiredLimit(line, "sections") > 0 || packedValue(line, "sections") > 0) return { key: "sections", label: "SEC", required: unitRequiredLimit(line, "sections"), packedKey: "sections" };
+  if (unitRequiredLimit(line, "layers") > 0 || packedValue(line, "layers") > 0) return { key: "layers", label: "LYR", required: unitRequiredLimit(line, "layers"), packedKey: "layers" };
+  if (unitRequiredLimit(line, "pieces") > 0 || packedValue(line, "pieces") > 0) return { key: "pieces", label: "PCS", required: unitRequiredLimit(line, "pieces"), packedKey: "pieces" };
+  if (!lineHasConversion(line)) return { key: "sales", label: line.unit || "Qty", required: line.quantity, packedKey: "sales" };
   return null;
 }
 
 function requiredValue(line, unit) {
-  if (unit === "pallets") return qty(line.pallet_qty);
-  if (unit === "sections") return qty(line.section_qty);
-  if (unit === "layers") return qty(line.layer_qty);
-  if (unit === "pieces") return qty(line.piece_qty);
+  if (unit === "pallets" || unit === "sections" || unit === "layers" || unit === "pieces") return unitRequiredLimit(line, unit);
   if (unit === "sales") return qty(line.quantity);
   return 0;
 }
@@ -202,7 +306,18 @@ function packedValue(line, unit) {
 }
 
 function remainingValue(line, unit) {
-  return Math.max(0, requiredValue(line, unit) - packedValue(line, unit));
+  const remainingUnits = Math.max(0, requiredValue(line, unit) - loadedValue(line, unit) - packedValue(line, unit));
+  if (remainingUnits > 0 || unit === "sales") return remainingUnits;
+  const explicit = explicitUnitQty(line, unit);
+  const conversion = unitConversion(line, unit);
+  if (!explicit || !conversion) return remainingUnits;
+  const remainingSales = Math.max(0, lineRequiredSalesQty(line) - qty(line.loaded_qty) - lineUnitsToSalesQty(line, {
+    pallets: line.packed_pallet_qty,
+    layers: line.packed_layer_qty,
+    sections: line.packed_section_qty,
+    pieces: line.packed_piece_qty
+  }));
+  return wholeUnitsFromSalesQty(remainingSales, conversion);
 }
 
 function panelValue(line, unit) {
@@ -303,8 +418,7 @@ function render() {
     ${renderInstallButton()}
     <button class="secondary-button" data-action="view-active" type="button">Active</button>
     <button class="secondary-button" data-action="view-packed" type="button">Packed</button>
-    <button class="primary-button" data-action="sync" type="button">Sync</button>
-    <button class="secondary-button" data-action="refresh" type="button">Refresh</button>
+    <button class="secondary-button" data-action="refresh" type="button">Refresh Orders</button>
     <button class="secondary-button" data-action="logout" type="button">${operator.display_name}</button>
   `;
 
@@ -338,7 +452,7 @@ function renderOrderPanel() {
           <span class="muted">${formatDate(order.trandate)} | ${order.outbound_location || ""}</span>
           <span class="status-pill ${orderStatusClass(order)}">${orderStatusText(order)}</span>
         </button>
-      `).join("") || `<div class="empty-state small"><strong>No orders</strong><span>Sync from NetSuite.</span></div>`}
+      `).join("") || `<div class="empty-state small"><strong>No orders</strong><span>Ask admin to sync if the order is missing.</span></div>`}
     </div>
     <div class="pagination-row">
       <button class="secondary-button" data-action="order-prev" ${orderPage === 0 ? "disabled" : ""} type="button">Previous</button>
@@ -409,7 +523,7 @@ function renderDetailPanel(order) {
     <div class="work-area">
       <div class="line-column">
         <div class="line-list">
-          ${visible.map((line) => renderLine(line)).join("") || `<div class="empty-state small"><strong>No lines</strong><span>Sync details for this order.</span></div>`}
+          ${visible.map((line) => renderLine(line)).join("") || `<div class="empty-state small"><strong>No lines</strong><span>Ask admin to sync if details are missing.</span></div>`}
         </div>
         <div class="pagination-row">
           <button class="secondary-button" data-action="line-prev" ${linePage === 0 ? "disabled" : ""} type="button">Previous</button>
@@ -636,14 +750,15 @@ app.addEventListener("click", async (event) => {
       return loadOrders();
     }
     if (button.dataset.action === "sync") {
-      await api("/api/delivery/sync", {
-        method: "POST",
-        body: JSON.stringify({ locationId })
-      });
-      showToast("Synced from NetSuite");
-      return loadOrders({ keepSelection: true });
+      await loadOrders({ keepSelection: true });
+      showToast("Orders refreshed from local DB");
+      return;
     }
-    if (button.dataset.action === "refresh") return loadOrders({ keepSelection: true });
+    if (button.dataset.action === "refresh") {
+      await loadOrders({ keepSelection: true });
+      showToast("Orders refreshed from local DB");
+      return;
+    }
     if (button.dataset.action === "open-warning-order") {
       selectedId = button.dataset.order;
       linePage = 0;

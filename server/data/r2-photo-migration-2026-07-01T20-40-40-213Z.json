@@ -1,0 +1,36 @@
+{
+  "migratedAt": "2026-07-01T20:40:40.212Z",
+  "uniqueUploads": 4,
+  "updatedReferences": 12,
+  "skipped": [],
+  "uploads": [
+    {
+      "hash": "0e08d519e45f52089d93489e909e34b1d3b46930198b1c5e2f6d90d6aa9d29a8",
+      "r2Ref": "r2://operator/operator-customer-pickup-photo/2026/07/01/SOB113630/b8a24246-de75-400c-a4d1-1b9f86f60a73-operator_load_records.photo_data_url-1.jpg",
+      "contentType": "image/jpeg",
+      "bytes": 18375,
+      "firstSource": "operator_load_records.photo_data_url:1"
+    },
+    {
+      "hash": "0f29579587c66e9f9b026ce2390f9f00f082b7a06031a645103dfa634aa03dfa",
+      "r2Ref": "r2://operator/operator-customer-pickup-photo/2026/07/01/SOB113252/510d9c30-519e-4c73-8253-3935488ecf7a-operator_load_records.photo_data_url-44.jpg",
+      "contentType": "image/jpeg",
+      "bytes": 155819,
+      "firstSource": "operator_load_records.photo_data_url:44"
+    },
+    {
+      "hash": "1b0d35578a9d008a3ff48d9fd0376e3b4a2a08c7ecf3f153fddac7efb761b9c6",
+      "r2Ref": "r2://operator/operator-load-photo/2026/07/01/SOB113434/4a563c92-a5e4-40e9-a1c9-7844d39c3ded-operator_load_records.photo_data_url-101.jpg",
+      "contentType": "image/jpeg",
+      "bytes": 1295033,
+      "firstSource": "operator_load_records.photo_data_url:101"
+    },
+    {
+      "hash": "5fd17729eb216dcf170d2ae73ab6c1532a08d6f6a633f0cd7657614c2c5b362f",
+      "r2Ref": "r2://operator/operator-load-photo/2026/07/01/SOA04197/df852e45-5418-49a2-a683-23eae4ba79c0-operator_load_records.photo_data_url-120.jpg",
+      "contentType": "image/jpeg",
+      "bytes": 30638,
+      "firstSource": "operator_load_records.photo_data_url:120"
+    }
+  ]
+}

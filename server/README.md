@@ -24,6 +24,8 @@ The tablet app should call this server. This server calls NetSuite and stores op
    - `NETSUITE_AUTH_URL`
    - `NETSUITE_TOKEN_URL`
    - `NETSUITE_REST_BASE_URL`
+   - `GOOGLE_MAPS_API_KEY` for dispatch route preview maps
+   - `SAMSARA_API_TOKEN` for server-side Samsara API calls
 
 4. Create the PostgreSQL database:
 
@@ -95,6 +97,7 @@ POST /api/delivery/orders/:id/lines/:lineId/packed-quantity
 POST /api/delivery/orders/:id/lines/:lineId/unpack
 POST /api/delivery/orders/:id/unpack
 POST /api/delivery/orders/:id/prepared
+POST /api/webhooks/netsuite/order
 POST /api/inventory/sync
 GET  /api/inventory/facets
 GET  /api/inventory/items
@@ -110,10 +113,57 @@ GET /api/delivery/orders?locationId=1&status=active
 GET /api/delivery/orders?locationId=13&status=packed
 ```
 
+## NetSuite Webhook
+
+Set a shared secret in the active env file:
+
+```text
+NETSUITE_WEBHOOK_SECRET=change-this-to-a-long-random-value
+```
+
+Endpoint:
+
+```text
+POST /api/webhooks/netsuite/order
+Header: x-mbbs-webhook-secret: <NETSUITE_WEBHOOK_SECRET>
+```
+
+The endpoint accepts Sales Order, Purchase Order, and Transfer Order payloads. It updates the local SO/TO delivery tables, PO/TO receiving tables, and sends realtime app events so operator/dispatch screens can refresh without waiting for a full sync.
+
+For Sales Orders, the server also schedules a lightweight NetSuite status check
+10 seconds after the webhook is received. This catches approval workflows that
+change the order from Pending Approval to Pending Fulfillment shortly after the
+User Event webhook fires.
+
+Deploy `server/netsuite-order-webhook-user-event.js` in NetSuite as a User Event Script on:
+
+- Sales Order
+- Purchase Order
+- Transfer Order
+
+Script parameters:
+
+```text
+custscriptmbbs_webhook_url=https://your-server.example/api/webhooks/netsuite/order
+custscriptwh_webhook_secret_i=<NETSUITE_WEBHOOK_SECRET>
+```
+
+The script also accepts the older parameter IDs `custscript_mbbs_webhook_url` and
+`custscript_mbbs_webhook_secret`, plus a few typo-tolerant variants. These
+parameters must be on the User Event Script or its deployment for the same script
+record that runs on Sales Order, Purchase Order, and Transfer Order. If the
+execution log says `urlConfigured:false` or `secretConfigured:false`, open the
+latest `MBBS webhook missing parameters` log detail and compare the displayed
+`scriptId`, `deploymentId`, and accepted parameter IDs with the parameter record
+you edited.
+
+After changing sandbox/production env in Control Panel, reconnect NetSuite if OAuth credentials/account changed.
+
 ## Notes
 
 - Keep `.env` private.
 - Do not put NetSuite credentials into tablet code.
+- Restrict the Google Maps browser key in Google Cloud by HTTP referrer, for example `https://your-domain.example/*` and `http://localhost:3000/*` during testing.
 - Delivery APIs require operator login. Send `Authorization: Bearer <token>` from the PWA.
 - Operator updates and NetSuite sync summaries are written to `delivery_audit_log`.
 - If tablets are not on the same network, do not rely on a LAN IP. Use a stable HTTPS URL.

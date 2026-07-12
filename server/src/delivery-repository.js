@@ -1,14 +1,6 @@
+import crypto from "node:crypto";
 import { query } from "./db.js";
 import { writeAudit } from "./auth-repository.js";
-
-function normalizeNetSuiteDate(value) {
-  if (!value) return null;
-  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
-  const match = String(value).match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-  if (!match) return value;
-  const [, month, day, year] = match;
-  return `${year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`;
-}
 
 function normalizeNumber(value) {
   if (value === null || value === undefined || value === "") return null;
@@ -24,8 +16,50 @@ function positiveQuantity(value) {
   return Math.max(0, normalizeQuantity(value) || 0);
 }
 
+function isPhotoReference(value) {
+  const text = String(value || "");
+  return text.startsWith("data:image/") || text.startsWith("r2://");
+}
+
 function roundQuantity(value) {
   return Number(Number(value || 0).toFixed(6));
+}
+
+const LOAD_SALES_QTY_TOLERANCE = 0.1;
+
+function syntheticOrderId(value) {
+  const hex = crypto.createHash("sha1").update(String(value || "")).digest("hex").slice(0, 12);
+  return -Number.parseInt(hex, 16);
+}
+
+function dateOnly(value) {
+  if (!value) return null;
+  if (value instanceof Date) return value.toISOString().slice(0, 10);
+  const text = String(value).slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : null;
+}
+
+function itemNumber(value) {
+  const number = Number(value ?? 0);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function splitLineSalesQuantity(item = {}) {
+  const pallets = itemNumber(item.pallets);
+  const layers = itemNumber(item.layers);
+  const sections = itemNumber(item.sections);
+  const pieces = itemNumber(item.pieces);
+  const toPlt = itemNumber(item.toPlt ?? item.to_plt);
+  const toLyr = itemNumber(item.toLyr ?? item.to_lyr);
+  const toSec = itemNumber(item.toSec ?? item.to_sec);
+  const toPcs = itemNumber(item.toPcs ?? item.to_pcs);
+  const converted = (pallets * toPlt) + (layers * toLyr) + (sections * toSec) + (pieces * toPcs);
+  if (converted > 0) return roundQuantity(converted);
+  return roundQuantity(pieces || sections || layers || pallets || itemNumber(item.splitQty) || itemNumber(item.quantity));
+}
+
+function isSplitOrder(order = {}) {
+  return Boolean(order.originalOrderId) && /-S\d+$/i.test(String(order.id || ""));
 }
 
 function hasConversion(line) {
@@ -42,6 +76,194 @@ function hasRequiredCustomQuantity(line) {
     || positiveQuantity(line.piece_qty) > 0;
 }
 
+function unitConversion(line, unit) {
+  if (unit === "pallets") return positiveQuantity(line.to_plt);
+  if (unit === "layers") return positiveQuantity(line.to_lyr);
+  if (unit === "sections") return positiveQuantity(line.to_sec);
+  if (unit === "pieces") return positiveQuantity(line.to_pcs);
+  return 0;
+}
+
+function explicitUnitQuantity(line, unit) {
+  if (unit === "pallets") return positiveQuantity(line.pallet_qty);
+  if (unit === "layers") return positiveQuantity(line.layer_qty);
+  if (unit === "sections") return positiveQuantity(line.section_qty);
+  if (unit === "pieces") return positiveQuantity(line.piece_qty);
+  return 0;
+}
+
+function lineUnitsToSalesQuantity(line, quantities) {
+  const pallets = positiveQuantity(quantities?.pallets);
+  const layers = positiveQuantity(quantities?.layers);
+  const sections = positiveQuantity(quantities?.sections);
+  const pieces = positiveQuantity(quantities?.pieces);
+  if (!hasConversion(line)) return pieces || sections || layers || pallets;
+  return (pallets * positiveQuantity(line.to_plt))
+    + (layers * positiveQuantity(line.to_lyr))
+    + (sections * positiveQuantity(line.to_sec))
+    + (pieces * positiveQuantity(line.to_pcs));
+}
+
+function lineRequiredSalesQuantity(line) {
+  return positiveQuantity(line.quantity) || lineUnitsToSalesQuantity(line, {
+    pallets: line.pallet_qty,
+    layers: line.layer_qty,
+    sections: line.section_qty,
+    pieces: line.piece_qty
+  });
+}
+
+function linePackedSalesQuantity(line) {
+  return lineUnitsToSalesQuantity(line, {
+    pallets: line.packed_pallet_qty,
+    layers: line.packed_layer_qty,
+    sections: line.packed_section_qty,
+    pieces: line.packed_piece_qty
+  });
+}
+
+function lineLoadedSalesQuantity(line) {
+  return positiveQuantity(line.loaded_qty);
+}
+
+function lineLoadSalesQuantity(line) {
+  const packedSalesQty = roundQuantity(linePackedSalesQuantity(line));
+  if (packedSalesQty <= 0) return 0;
+  const remainingSalesQty = roundQuantity(Math.max(0, lineRequiredSalesQuantity(line) - lineLoadedSalesQuantity(line)));
+  if (remainingSalesQty > 0 && Math.abs(remainingSalesQty - packedSalesQty) <= LOAD_SALES_QTY_TOLERANCE) {
+    return remainingSalesQty;
+  }
+  return packedSalesQty;
+}
+
+function wholeUnitsFromSalesQuantity(salesQuantity, conversion) {
+  const sales = positiveQuantity(salesQuantity);
+  const unitSize = positiveQuantity(conversion);
+  if (!sales || !unitSize) return 0;
+  const rawUnits = sales / unitSize;
+  const floorUnits = Math.floor(rawUnits + 0.000001);
+  const ceilUnits = Math.ceil(rawUnits - 0.000001);
+  if (ceilUnits > floorUnits && Math.abs((ceilUnits * unitSize) - sales) <= LOAD_SALES_QTY_TOLERANCE) {
+    return ceilUnits;
+  }
+  return floorUnits;
+}
+
+function orderFamily(order) {
+  if (order?.order_type === "transfer_order") return "transfer_order";
+  return "sales_order";
+}
+
+function operatorLoadLineSnapshot(lines = []) {
+  return lines
+    .filter((line) => positiveQuantity(line.loaded_qty) > 0 || positiveQuantity(line.packed_pallet_qty) > 0 || positiveQuantity(line.packed_layer_qty) > 0 || positiveQuantity(line.packed_section_qty) > 0 || positiveQuantity(line.packed_piece_qty) > 0)
+    .map((line) => ({
+      lineId: line.line_id,
+      itemId: line.item_id,
+      itemName: line.item_name,
+      description: line.item_description || "",
+      quantity: line.quantity,
+      unit: line.unit,
+      packedPallets: positiveQuantity(line.packed_pallet_qty),
+      packedLayers: positiveQuantity(line.packed_layer_qty),
+      packedSections: positiveQuantity(line.packed_section_qty),
+      packedPieces: positiveQuantity(line.packed_piece_qty),
+      loadedQty: positiveQuantity(line.loaded_qty),
+      loadedUom: line.loaded_uom || line.unit || ""
+    }));
+}
+
+async function insertOperatorLoadRecord({
+  loadType,
+  order,
+  operatorId,
+  photoDataUrl,
+  loadedQty = null,
+  loadedUom = null,
+  sourceTable = null,
+  sourceRecordId = null,
+  lineSnapshot = [],
+  response = {}
+}) {
+  const result = await query(
+    `INSERT INTO operator_load_records (
+       load_type, order_family, order_id, order_ref, source_table, source_record_id,
+       operator_id, photo_data_url, loaded_qty, loaded_uom, line_snapshot, response
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb)
+     ON CONFLICT (source_table, source_record_id) DO UPDATE SET
+       load_type = EXCLUDED.load_type,
+       order_family = EXCLUDED.order_family,
+       order_id = EXCLUDED.order_id,
+       order_ref = EXCLUDED.order_ref,
+       operator_id = EXCLUDED.operator_id,
+       photo_data_url = EXCLUDED.photo_data_url,
+       loaded_qty = EXCLUDED.loaded_qty,
+       loaded_uom = EXCLUDED.loaded_uom,
+       line_snapshot = EXCLUDED.line_snapshot,
+       response = EXCLUDED.response
+     RETURNING id`,
+    [
+      loadType,
+      orderFamily(order),
+      order?.netsuite_id || null,
+      order?.tranid || "",
+      sourceTable,
+      sourceRecordId,
+      operatorId || null,
+      photoDataUrl || "",
+      loadedQty,
+      loadedUom,
+      JSON.stringify(lineSnapshot || []),
+      JSON.stringify(response || {})
+    ]
+  );
+  return result.rows[0] || null;
+}
+
+function loadedUnitConsumption(line) {
+  let remainingLoadedSales = lineLoadedSalesQuantity(line);
+  const units = [
+    { key: "pallet", required: positiveQuantity(line.pallet_qty), conversion: positiveQuantity(line.to_plt) },
+    { key: "layer", required: positiveQuantity(line.layer_qty), conversion: positiveQuantity(line.to_lyr) },
+    { key: "section", required: positiveQuantity(line.section_qty), conversion: positiveQuantity(line.to_sec) },
+    { key: "piece", required: positiveQuantity(line.piece_qty), conversion: positiveQuantity(line.to_pcs) }
+  ];
+  return units.reduce((result, unit) => {
+    if (!unit.required || !unit.conversion || remainingLoadedSales <= 0) {
+      result[unit.key] = 0;
+      return result;
+    }
+    const consumed = Math.min(unit.required, Math.floor((remainingLoadedSales / unit.conversion) + 0.000001));
+    result[unit.key] = consumed;
+    remainingLoadedSales = Math.max(0, remainingLoadedSales - (consumed * unit.conversion));
+    return result;
+  }, {});
+}
+
+function remainingPackAvailability(line) {
+  const salesAvailable = Math.max(0, lineRequiredSalesQuantity(line) - lineLoadedSalesQuantity(line));
+  if (!hasConversion(line)) {
+    return { pallets: 0, layers: 0, sections: 0, pieces: salesAvailable };
+  }
+  const consumed = loadedUnitConsumption(line);
+  const deriveFromSales = !hasRequiredCustomQuantity(line);
+  const unitAvailable = (unit, consumedValue) => {
+    const conversion = unitConversion(line, unit);
+    if (!conversion) return 0;
+    const explicit = explicitUnitQuantity(line, unit);
+    const explicitRemaining = explicit > 0 ? Math.max(0, explicit - positiveQuantity(consumedValue)) : 0;
+    if (explicitRemaining > 0) return explicitRemaining;
+    if (explicit > 0 && salesAvailable > 0) return wholeUnitsFromSalesQuantity(salesAvailable, conversion);
+    return deriveFromSales ? wholeUnitsFromSalesQuantity(salesAvailable, conversion) : 0;
+  };
+  return {
+    pallets: unitAvailable("pallets", consumed.pallet),
+    layers: unitAvailable("layers", consumed.layer),
+    pieces: unitAvailable("pieces", consumed.piece),
+    sections: unitAvailable("sections", consumed.section)
+  };
+}
+
 const packedQtySql = `
   COALESCE(packed_pallet_qty, 0)
   + COALESCE(packed_section_qty, 0)
@@ -49,198 +271,657 @@ const packedQtySql = `
   + COALESCE(packed_piece_qty, 0)
 `;
 
-function comparable(value) {
-  if (value instanceof Date) return value.toISOString().slice(0, 10);
-  if (value === null || value === undefined || value === "") return "";
-  if (typeof value === "number") return String(value);
-  if (typeof value === "string" && /^-?\d+(\.\d+)?$/.test(value)) return String(Number(value));
-  return String(value);
+function applyDeliveryAllocationFields(line) {
+  const allocatedPallets = positiveQuantity(line.po_allocated_pallet_qty);
+  const allocatedLayers = positiveQuantity(line.po_allocated_layer_qty);
+  const allocatedSections = positiveQuantity(line.po_allocated_section_qty);
+  const allocatedPieces = positiveQuantity(line.po_allocated_piece_qty);
+  const allocatedSalesQty = positiveQuantity(line.po_allocated_sales_qty);
+  return {
+    ...line,
+    original_pallet_qty: line.pallet_qty,
+    original_layer_qty: line.layer_qty,
+    original_section_qty: line.section_qty,
+    original_piece_qty: line.piece_qty,
+    original_quantity: line.quantity,
+    po_allocated_pallet_qty: allocatedPallets,
+    po_allocated_layer_qty: allocatedLayers,
+    po_allocated_section_qty: allocatedSections,
+    po_allocated_piece_qty: allocatedPieces,
+    po_allocated_sales_qty: allocatedSalesQty,
+    pallet_qty: Math.max(positiveQuantity(line.pallet_qty) - allocatedPallets, 0),
+    layer_qty: Math.max(positiveQuantity(line.layer_qty) - allocatedLayers, 0),
+    section_qty: Math.max(positiveQuantity(line.section_qty) - allocatedSections, 0),
+    piece_qty: Math.max(positiveQuantity(line.piece_qty) - allocatedPieces, 0),
+    quantity: Math.max(positiveQuantity(line.quantity) - allocatedSalesQty, 0)
+  };
 }
 
-function changedFields(before, after, fields) {
-  const changed = {};
-  for (const field of fields) {
-    const beforeValue = before?.[field] ?? null;
-    const afterValue = after?.[field] ?? null;
-    if (comparable(beforeValue) !== comparable(afterValue)) {
-      changed[field] = { before: beforeValue, after: afterValue };
-    }
+function hasDeliveryDisplayQuantity(line) {
+  return positiveQuantity(line.pallet_qty) > 0
+    || positiveQuantity(line.layer_qty) > 0
+    || positiveQuantity(line.section_qty) > 0
+    || positiveQuantity(line.piece_qty) > 0
+    || positiveQuantity(line.quantity) > 0
+    || positiveQuantity(line.packed_pallet_qty) > 0
+    || positiveQuantity(line.packed_layer_qty) > 0
+    || positiveQuantity(line.packed_section_qty) > 0
+    || positiveQuantity(line.packed_piece_qty) > 0
+    || Boolean(line.sync_exception);
+}
+
+function loadLineUnits(line) {
+  if (hasConversion(line)) {
+    const available = remainingPackAvailability(line);
+    const customUnits = [
+      { key: "pallet", label: "PLT", required: available.pallets, packed: positiveQuantity(line.packed_pallet_qty) },
+      { key: "layer", label: "LYR", required: available.layers, packed: positiveQuantity(line.packed_layer_qty) },
+      { key: "section", label: "SEC", required: available.sections, packed: positiveQuantity(line.packed_section_qty) },
+      { key: "piece", label: "PCS", required: available.pieces, packed: positiveQuantity(line.packed_piece_qty) }
+    ].filter((unit) => unit.required > 0 || unit.packed > 0);
+    if (customUnits.length) return customUnits;
   }
-  return changed;
+  return [{
+    key: "sales",
+    label: line.unit || "Qty",
+    required: Math.max(0, lineRequiredSalesQuantity(line) - lineLoadedSalesQuantity(line)),
+    packed: linePackedSalesQuantity(line)
+  }];
 }
 
-export async function upsertDeliveryOrders(orders) {
-  for (const order of orders) {
-    const normalized = {
-      netsuite_id: order.id,
-      tranid: order.tranid,
-      trandate: normalizeNetSuiteDate(order.trandate),
-      customer_id: order.customer_id,
-      customer: order.customer,
-      status: order.status,
-      status_text: order.status_text,
-      foreign_total: normalizeNumber(order.foreigntotal),
-      order_location_id: order.order_location_id,
-      order_location: order.order_location,
-      outbound_location_id: order.outbound_location_id,
-      outbound_location: order.outbound_location,
-      delivery_method_id: order.delivery_method_id,
-      delivery_method: order.delivery_method,
-      order_type: order.order_type || "sales_order",
-      source_location_id: order.source_location_id,
-      source_location: order.source_location,
-      destination_location_id: order.destination_location_id,
-      destination_location: order.destination_location
+function formatLoadUnits(units, field) {
+  const visible = units.filter((unit) => positiveQuantity(unit[field]) > 0);
+  if (!visible.length) return "0";
+  return visible.map((unit) => `${roundQuantity(unit[field])} ${unit.label}`).join(" / ");
+}
+
+function buildDeliveryLoadValidation(order) {
+  const issues = [];
+  for (const line of order.lines || []) {
+    const lineDeleted = !line.netsuite_active || line.sync_exception === "line_deleted";
+    const units = loadLineUnits(line).map((unit) => lineDeleted ? { ...unit, required: 0 } : unit);
+    const packedSalesQty = linePackedSalesQuantity(line);
+    if (packedSalesQty <= 0) continue;
+    const remainingSalesQty = lineDeleted
+      ? 0
+      : Math.max(0, lineRequiredSalesQuantity(line) - lineLoadedSalesQuantity(line));
+    const itemLabel = line.sku || line.item_name || `Line ${line.line_id}`;
+    const issue = {
+      lineId: line.id,
+      netsuiteLineId: line.line_id,
+      itemName: itemLabel,
+      itemDescription: line.item_description || "",
+      syncException: line.sync_exception || null,
+      requiredText: formatLoadUnits(units, "required"),
+      packedText: formatLoadUnits(units, "packed"),
+      requiredSalesQty: roundQuantity(remainingSalesQty),
+      packedSalesQty: roundQuantity(packedSalesQty),
+      salesUom: line.unit || "",
+      units
     };
-    const existing = await query(
-      `SELECT tranid, trandate, customer_id, customer, status, status_text,
-              foreign_total, order_location_id, order_location, outbound_location_id,
-              outbound_location, delivery_method_id, delivery_method, order_type,
-              source_location_id, source_location, destination_location_id, destination_location
-       FROM delivery_orders
-       WHERE netsuite_id = $1`,
-      [normalized.netsuite_id]
-    );
 
-    await query(
-      `INSERT INTO delivery_orders (
-        netsuite_id, tranid, trandate, customer_id, customer, status, status_text,
-        foreign_total, order_location_id, order_location, outbound_location_id,
-        outbound_location, delivery_method_id, delivery_method, order_type,
-        source_location_id, source_location, destination_location_id, destination_location,
-        netsuite_active, netsuite_missing_at, synced_at
-      ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7,
-        $8, $9, $10, $11,
-        $12, $13, $14, $15, $16, $17, $18, $19, true, null, now()
-      )
-      ON CONFLICT (netsuite_id) DO UPDATE SET
-        tranid = EXCLUDED.tranid,
-        trandate = EXCLUDED.trandate,
-        customer_id = EXCLUDED.customer_id,
-        customer = EXCLUDED.customer,
-        status = EXCLUDED.status,
-        status_text = EXCLUDED.status_text,
-        foreign_total = EXCLUDED.foreign_total,
-        order_location_id = EXCLUDED.order_location_id,
-        order_location = EXCLUDED.order_location,
-        outbound_location_id = EXCLUDED.outbound_location_id,
-        outbound_location = EXCLUDED.outbound_location,
-        delivery_method_id = EXCLUDED.delivery_method_id,
-        delivery_method = EXCLUDED.delivery_method,
-        order_type = EXCLUDED.order_type,
-        source_location_id = EXCLUDED.source_location_id,
-        source_location = EXCLUDED.source_location,
-        destination_location_id = EXCLUDED.destination_location_id,
-        destination_location = EXCLUDED.destination_location,
-        netsuite_active = true,
-        netsuite_missing_at = null,
-        synced_at = now()`,
-      [
-        normalized.netsuite_id,
-        normalized.tranid,
-        normalized.trandate,
-        normalized.customer_id,
-        normalized.customer,
-        normalized.status,
-        normalized.status_text,
-        normalized.foreign_total,
-        normalized.order_location_id,
-        normalized.order_location,
-        normalized.outbound_location_id,
-        normalized.outbound_location,
-        normalized.delivery_method_id,
-        normalized.delivery_method,
-        normalized.order_type,
-        normalized.source_location_id,
-        normalized.source_location,
-        normalized.destination_location_id,
-        normalized.destination_location
-      ]
-    );
+    if (lineDeleted) {
+      issues.push({
+        ...issue,
+        code: "line_deleted",
+        message: `${itemLabel} was removed from NetSuite. Unpack the whole line before loading.`
+      });
+      continue;
+    }
 
-    const fields = [
-      "tranid", "trandate", "customer_id", "customer", "status", "status_text",
-      "foreign_total", "order_location_id", "order_location", "outbound_location_id",
-      "outbound_location", "delivery_method_id", "delivery_method", "order_type",
-      "source_location_id", "source_location", "destination_location_id", "destination_location"
-    ];
-    const changes = existing.rowCount ? changedFields(existing.rows[0], normalized, fields) : {};
-    if (!existing.rowCount || Object.keys(changes).length) {
-      await writeAudit({
-        actorType: "system",
-        source: "netsuite",
-        action: existing.rowCount ? "netsuite.order.update" : "netsuite.order.discover",
-        orderId: normalized.netsuite_id,
-        details: existing.rowCount ? { changes } : { order: normalized }
+    if (packedSalesQty > remainingSalesQty + LOAD_SALES_QTY_TOLERANCE) {
+      issues.push({
+        ...issue,
+        code: line.sync_exception || "overpacked",
+        message: `${itemLabel} packed sales quantity is higher than the latest remaining required quantity. Update packed qty to ${formatLoadUnits(units, "required")} or unpack the line and repack.`
       });
     }
   }
+  return {
+    ok: issues.length === 0,
+    issues
+  };
 }
 
-export async function markMissingDeliveryOrders(locationId, activeOrderIds) {
-  const ids = activeOrderIds.map((id) => Number(id)).filter((id) => Number.isInteger(id));
-  await query(
-    `UPDATE delivery_orders
-     SET netsuite_active = false,
-         netsuite_missing_at = now(),
-         synced_at = now()
-     WHERE outbound_location_id = $1
-       AND NOT (netsuite_id = ANY($2::bigint[]))`,
-    [locationId, ids]
-  );
+export const CUSTOMER_PICKUP_DELIVERY_METHOD = "Pick-Up";
+
+export function isPickupDeliveryMethod(value) {
+  return String(value || "").trim() === CUSTOMER_PICKUP_DELIVERY_METHOD;
 }
 
-export async function listExistingDeliveryOrderIds({ locationId = null, orderType = null } = {}) {
-  const params = [];
-  const clauses = [];
-  if (locationId) {
-    params.push(locationId);
-    clauses.push(`outbound_location_id = $${params.length}`);
-  }
-  if (orderType) {
-    params.push(orderType);
-    clauses.push(`order_type = $${params.length}`);
-  }
+function isPickupOrder(order) {
+  return order?.order_type === "sales_order" && isPickupDeliveryMethod(order.delivery_method);
+}
 
+export function isPendingApprovalStatus(status, statusText) {
+  return String(status || "").trim().toUpperCase() === "A"
+    || String(statusText || "").toLowerCase().includes("pending approval");
+}
+
+function deliveryMethodClause(alias = "delivery_order_source") {
+  return `(
+    ${alias}.order_type <> 'sales_order'
+    OR COALESCE(${alias}.delivery_method, '') <> '${CUSTOMER_PICKUP_DELIVERY_METHOD.replaceAll("'", "''")}'
+  )`;
+}
+
+function activePoAllocationSql(unit, lineAlias = "delivery_line_source") {
+  const column = unit === "pallet" ? "allocated_pallet_qty"
+    : unit === "layer" ? "allocated_layer_qty"
+      : unit === "section" ? "allocated_section_qty"
+        : unit === "piece" ? "allocated_piece_qty"
+          : "allocated_sales_qty";
+  return `COALESCE((SELECT SUM(${column}) FROM dispatch_so_po_allocations a WHERE a.status = 'active' AND a.sales_line_id = ${lineAlias}.id), 0)`;
+}
+
+function isTransferDeliveryOrder(order) {
+  return order?.order_type === "transfer_order";
+}
+
+function canonicalOrderTarget(order) {
+  return isTransferDeliveryOrder(order)
+    ? { table: "transfer_orders", statusColumn: "outbound_operator_status" }
+    : { table: "sales_orders", statusColumn: "operator_status" };
+}
+
+function canonicalLineTarget(order) {
+  return isTransferDeliveryOrder(order)
+    ? { table: "transfer_order_lines", orderColumn: "transfer_order_id", extraWhere: "AND line_stage = 'outbound'", allocationAlias: null }
+    : { table: "sales_order_lines", orderColumn: "sales_order_id", extraWhere: "", allocationAlias: "sales_order_lines" };
+}
+
+function activeDeliveryAllocationSql(order, unit, lineAlias) {
+  return isTransferDeliveryOrder(order) ? "0" : activePoAllocationSql(unit, lineAlias);
+}
+
+function lineRequiredSalesSql(alias) {
+  const customSales = `
+    (COALESCE(${alias}.pallet_qty, 0) * COALESCE(${alias}.to_plt, 0))
+    + (COALESCE(${alias}.layer_qty, 0) * COALESCE(${alias}.to_lyr, 0))
+    + (COALESCE(${alias}.section_qty, 0) * COALESCE(${alias}.to_sec, 0))
+    + (COALESCE(${alias}.piece_qty, 0) * COALESCE(${alias}.to_pcs, 0))
+  `;
+  return `CASE WHEN COALESCE(${alias}.quantity, 0) > 0 THEN COALESCE(${alias}.quantity, 0) ELSE (${customSales}) END`;
+}
+
+function linePackedSalesSql(alias) {
+  const converted = `
+    (COALESCE(${alias}.packed_pallet_qty, 0) * COALESCE(${alias}.to_plt, 0))
+    + (COALESCE(${alias}.packed_layer_qty, 0) * COALESCE(${alias}.to_lyr, 0))
+    + (COALESCE(${alias}.packed_section_qty, 0) * COALESCE(${alias}.to_sec, 0))
+    + (COALESCE(${alias}.packed_piece_qty, 0) * COALESCE(${alias}.to_pcs, 0))
+  `;
+  const rawUnits = `
+    COALESCE(${alias}.packed_pallet_qty, 0)
+    + COALESCE(${alias}.packed_layer_qty, 0)
+    + COALESCE(${alias}.packed_section_qty, 0)
+    + COALESCE(${alias}.packed_piece_qty, 0)
+  `;
+  return `CASE
+    WHEN (
+      COALESCE(${alias}.to_plt, 0)
+      + COALESCE(${alias}.to_lyr, 0)
+      + COALESCE(${alias}.to_sec, 0)
+      + COALESCE(${alias}.to_pcs, 0)
+    ) > 0 THEN (${converted})
+    ELSE (${rawUnits})
+  END`;
+}
+
+function lineOpenSalesSql(alias) {
+  const remaining = `((${lineRequiredSalesSql(alias)}) - COALESCE(${alias}.loaded_qty, 0) - (${linePackedSalesSql(alias)}))`;
+  return `CASE WHEN ${remaining} <= 0.000001 THEN 0 ELSE ${remaining} END`;
+}
+
+function isDispatchGroupOrderId(value) {
+  const text = String(value || "").trim();
+  return /^(?:GRP|G[A-Z]+)-/i.test(text) || /^GROUP:(?:GRP|G[A-Z]+)-/i.test(text);
+}
+
+function isLocalCoRef(value) {
+  return /^CO-/i.test(String(value || "").trim());
+}
+
+function normalizeDispatchGroupId(value) {
+  return String(value || "").trim().replace(/^GROUP:/i, "");
+}
+
+function lineHasPackedQuantity(line) {
+  return positiveQuantity(line.packed_pallet_qty) > 0
+    || positiveQuantity(line.packed_layer_qty) > 0
+    || positiveQuantity(line.packed_section_qty) > 0
+    || positiveQuantity(line.packed_piece_qty) > 0;
+}
+
+function lineHasOpenQuantity(line) {
+  return ["InvtPart", "NonInvtPart"].includes(line?.item_type || "")
+    && lineRequiredSalesQuantity(line) > lineLoadedSalesQuantity(line) + linePackedSalesQuantity(line) + 0.000001;
+}
+
+function groupLineKey(line) {
+  return [
+    line.item_id || "",
+    line.sku || line.item_name || "",
+    line.unit || "",
+    line.location_id || "",
+    line.location || "",
+    positiveQuantity(line.to_plt),
+    positiveQuantity(line.to_lyr),
+    positiveQuantity(line.to_sec),
+    positiveQuantity(line.to_pcs)
+  ].join("|");
+}
+
+function groupLineId(groupId, key) {
+  const hex = crypto.createHash("sha1").update(`${groupId}:${key}`).digest("hex").slice(0, 14);
+  return `GRPLINE-${hex}`;
+}
+
+function groupLineSource(line, order) {
+  return {
+    orderId: order.netsuite_id,
+    orderRef: order.tranid,
+    orderType: order.order_type,
+    lineId: line.id,
+    lineKey: groupLineKey(line)
+  };
+}
+
+function addNumericFields(target, source, fields) {
+  for (const field of fields) target[field] = roundQuantity(positiveQuantity(target[field]) + positiveQuantity(source[field]));
+}
+
+function aggregateGroupLines(groupId, childOrders = []) {
+  const linesByKey = new Map();
+  for (const order of childOrders) {
+    for (const line of order.lines || []) {
+      if (!["InvtPart", "NonInvtPart"].includes(line.item_type || "") && !line.sync_exception && !lineHasPackedQuantity(line)) continue;
+      const key = groupLineKey(line);
+      const existing = linesByKey.get(key);
+      if (!existing) {
+        linesByKey.set(key, {
+          ...line,
+          id: groupLineId(groupId, key),
+          group_line_key: key,
+          source_lines: [groupLineSource(line, order)],
+          source_order_refs: [order.tranid],
+          quantity: positiveQuantity(line.quantity),
+          pallet_qty: positiveQuantity(line.pallet_qty),
+          layer_qty: positiveQuantity(line.layer_qty),
+          section_qty: positiveQuantity(line.section_qty),
+          piece_qty: positiveQuantity(line.piece_qty),
+          packed_pallet_qty: positiveQuantity(line.packed_pallet_qty),
+          packed_layer_qty: positiveQuantity(line.packed_layer_qty),
+          packed_section_qty: positiveQuantity(line.packed_section_qty),
+          packed_piece_qty: positiveQuantity(line.packed_piece_qty),
+          loaded_qty: positiveQuantity(line.loaded_qty)
+        });
+        continue;
+      }
+      addNumericFields(existing, line, [
+        "quantity",
+        "pallet_qty",
+        "layer_qty",
+        "section_qty",
+        "piece_qty",
+        "packed_pallet_qty",
+        "packed_layer_qty",
+        "packed_section_qty",
+        "packed_piece_qty",
+        "loaded_qty"
+      ]);
+      existing.source_lines.push(groupLineSource(line, order));
+      if (!existing.source_order_refs.includes(order.tranid)) existing.source_order_refs.push(order.tranid);
+      existing.confirmed = Boolean(existing.confirmed || line.confirmed);
+      if (line.sync_exception && !existing.sync_exception) existing.sync_exception = line.sync_exception;
+      if (line.sync_exception_at && !existing.sync_exception_at) existing.sync_exception_at = line.sync_exception_at;
+    }
+  }
+  return [...linesByKey.values()].sort((a, b) => String(a.sku || a.item_name || "").localeCompare(String(b.sku || b.item_name || "")));
+}
+
+function childOrderRefsFromGroup(order = {}) {
+  return (Array.isArray(order.childOrders) ? order.childOrders : [])
+    .map((ref) => String(ref || "").trim())
+    .filter(Boolean);
+}
+
+function findDropAssignmentForGroup(plan, groupId) {
+  for (const truck of plan.trucks || []) {
+    for (const load of truck.loads || []) {
+      if (load.returnOnly) continue;
+      if ((load.stops || []).some((stop) => stop?.type === "drop" && String(stop.orderId || "") === String(groupId))) {
+        return {
+          planId: plan.id,
+          planDate: dateOnly(plan.planDate),
+          truckPlate: truck.plate || "",
+          loadName: load.name || "",
+          parkingSpot: truck.parkingSpot || ""
+        };
+      }
+    }
+  }
+  return null;
+}
+
+async function listDispatchGroupDefinitions({ orderType = "sales_order", includePast = false } = {}) {
+  const dispatchType = orderType === "transfer_order" ? "TO" : "SO";
   const result = await query(
-    `SELECT netsuite_id
-     FROM delivery_orders
-     ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
-     ORDER BY synced_at ASC, netsuite_id`,
-    params
+    `SELECT p.id, p.plan_date::text AS plan_date, p.status, s.orders, s.trucks
+      FROM dispatch_plans p
+      JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+      WHERE p.status <> 'cancelled'
+        ${includePast ? "" : "AND p.plan_date >= CURRENT_DATE"}
+        AND s.orders::text ILIKE '%childOrders%'
+      ORDER BY p.plan_date DESC, p.updated_at DESC`
   );
-  return result.rows.map((row) => row.netsuite_id);
+  const groups = new Map();
+  for (const row of result.rows) {
+    const plan = {
+      id: row.id,
+      planDate: row.plan_date,
+      orders: row.orders || [],
+      trucks: row.trucks || []
+    };
+    for (const order of plan.orders || []) {
+      if (order?.type !== dispatchType) continue;
+      const groupId = String(order?.id || "").trim();
+      if (!isDispatchGroupOrderId(groupId)) continue;
+      const childRefs = childOrderRefsFromGroup(order);
+      if (!childRefs.length || groups.has(groupId)) continue;
+      const assignment = findDropAssignmentForGroup(plan, groupId);
+      if (!assignment) continue;
+      groups.set(groupId, {
+        id: groupId,
+        type: dispatchType,
+        orderType,
+        childRefs,
+        snapshotOrder: order,
+        ...assignment
+      });
+    }
+  }
+  return [...groups.values()];
 }
 
-export async function markDeliveryOrderMissing(orderId) {
-  await query(
-    `UPDATE delivery_orders
-     SET netsuite_active = false,
-         netsuite_missing_at = now(),
-         synced_at = now()
-     WHERE netsuite_id = $1`,
-    [orderId]
+async function findDispatchGroupDefinition(groupId) {
+  const normalized = normalizeDispatchGroupId(groupId);
+  const result = await query(
+    `SELECT p.id, p.plan_date::text AS plan_date, p.status, s.orders, s.trucks
+       FROM dispatch_plans p
+       JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+      WHERE p.status <> 'cancelled'
+        AND s.orders::text ILIKE $1
+      ORDER BY p.plan_date DESC, p.updated_at DESC`,
+    [`%${normalized}%`]
   );
+  for (const row of result.rows) {
+    const plan = {
+      id: row.id,
+      planDate: row.plan_date,
+      orders: row.orders || [],
+      trucks: row.trucks || []
+    };
+    for (const order of plan.orders || []) {
+      const currentGroupId = String(order?.id || "").trim();
+      if (normalizeDispatchGroupId(currentGroupId) !== normalized) continue;
+      const dispatchType = order?.type === "TO" ? "TO" : "SO";
+      const childRefs = childOrderRefsFromGroup(order);
+      if (!childRefs.length) continue;
+      const assignment = findDropAssignmentForGroup(plan, currentGroupId) || findDropAssignmentForGroup(plan, normalized);
+      if (!assignment) continue;
+      return {
+        id: normalized,
+        type: dispatchType,
+        orderType: dispatchType === "TO" ? "transfer_order" : "sales_order",
+        childRefs,
+        snapshotOrder: order,
+        ...assignment
+      };
+    }
+  }
+  return null;
+}
+
+async function getDeliveryOrderByTranid(tranid, orderType) {
+  const table = orderType === "transfer_order" ? "transfer_orders" : "sales_orders";
+  const result = await query(`SELECT netsuite_id FROM ${table} WHERE tranid = $1 AND netsuite_active = true LIMIT 1`, [tranid]);
+  const id = result.rows[0]?.netsuite_id;
+  return id ? getDeliveryOrder(id) : null;
+}
+
+async function buildDispatchGroupDeliveryOrder(group) {
+  const childOrders = (await Promise.all(
+    group.childRefs.map((ref) => getDeliveryOrderByTranid(ref, group.orderType))
+  )).filter(Boolean);
+  if (!childOrders.length) return null;
+  const lines = aggregateGroupLines(group.id, childOrders).filter(hasDeliveryDisplayQuantity);
+  const childRefText = childOrders.map((order) => order.tranid).join("+");
+  const hasPacked = childOrders.some((order) => (order.lines || []).some(lineHasPackedQuantity));
+  const hasLoaded = childOrders.some((order) => (order.lines || []).some((line) => lineLoadedSalesQuantity(line) > 0));
+  const hasOpen = childOrders.some((order) => (order.lines || []).some(lineHasOpenQuantity));
+  const hasPreparing = childOrders.some((order) => order.operator_status === "preparing");
+  const allLoaded = childOrders.every((order) => String(order.local_yard_order_status || "").toLowerCase() === "loaded");
+  const operatorStatus = hasPreparing ? "preparing" : hasPacked ? "packed" : hasLoaded && hasOpen ? "partial_loaded" : "open";
+  const base = childOrders[0];
+  return {
+    ...base,
+    netsuite_id: group.id,
+    tranid: childRefText || group.id,
+    dispatch_group_id: group.id,
+    is_dispatch_group: true,
+    child_orders: childOrders,
+    child_order_refs: childOrders.map((order) => order.tranid),
+    child_order_ids: childOrders.map((order) => order.netsuite_id),
+    customer: [...new Set(childOrders.map((order) => order.customer).filter(Boolean))].join(" + "),
+    operator_status: operatorStatus,
+    local_yard_order_status: allLoaded ? "Loaded" : (hasOpen && (hasPacked || hasLoaded) ? "Partial Loaded" : "Open"),
+    dispatch_planned: true,
+    dispatch_plan_date: group.planDate,
+    dispatch_truck_plate: group.truckPlate,
+    dispatch_load_name: group.loadName,
+    dispatch_parking_spot: group.parkingSpot,
+    warning_count: childOrders.reduce((sum, order) => sum + positiveQuantity(order.warning_count), 0),
+    underpack_count: hasOpen && (hasPacked || hasLoaded) ? 1 : 0,
+    lines
+  };
+}
+
+async function buildDispatchGroupDeliveryListOrder(group) {
+  const isTransfer = group.orderType === "transfer_order";
+  const orderTable = isTransfer ? "transfer_orders" : "sales_orders";
+  const lineTable = isTransfer ? "transfer_order_lines" : "sales_order_lines";
+  const lineOrderColumn = isTransfer ? "transfer_order_id" : "sales_order_id";
+  const statusColumn = isTransfer ? "outbound_operator_status" : "operator_status";
+  const locationColumn = isTransfer ? "from_location_id" : "outbound_location_id";
+  const locationTextColumn = isTransfer ? "from_location" : "outbound_location";
+  const lineStageClause = isTransfer ? "AND line_stage = 'outbound'" : "";
+  const customerSelect = isTransfer ? "NULL::bigint AS customer_id, to_location AS customer" : "customer_id, customer";
+  const moneySelect = isTransfer ? "NULL::numeric AS foreign_total, NULL::bigint AS order_location_id, NULL::text AS order_location" : "foreign_total, order_location_id, order_location";
+  const deliveryMethodSelect = isTransfer ? "NULL::bigint AS delivery_method_id, NULL::text AS delivery_method" : "delivery_method_id, sales_order_type AS delivery_method";
+  const orderResult = await query(
+    `SELECT netsuite_id, tranid, trandate, ${customerSelect}, status, status_text,
+            ${moneySelect}, ${locationColumn} AS outbound_location_id,
+            ${locationTextColumn} AS outbound_location, ${deliveryMethodSelect},
+            ${statusColumn} AS operator_status, local_yard_order_status, preparing_operator_id,
+            preparing_started_at, status_updated_at, netsuite_active, synced_at,
+            fulfillment_status, expected_delivery_date, dispatch_address, dispatch_window_start,
+            dispatch_window_end, dispatch_instructions, memo,
+            ${isTransfer ? "'transfer_order'" : "'sales_order'"}::text AS order_type
+       FROM ${orderTable}
+      WHERE tranid = ANY($1::text[])
+        AND netsuite_active = true
+      ORDER BY tranid`,
+    [group.childRefs]
+  );
+  const orders = orderResult.rows;
+  if (!orders.length) return null;
+  const childIds = orders.map((order) => order.netsuite_id);
+  const lineResult = await query(
+    `SELECT *
+       FROM ${lineTable} l
+      WHERE ${lineOrderColumn} = ANY($1::bigint[])
+        ${lineStageClause}
+        AND (
+          netsuite_active = true
+          OR sync_exception IS NOT NULL
+          OR (${packedQtySql}) > 0
+        )`,
+    [childIds]
+  );
+  const lines = lineResult.rows;
+  const pickable = lines.filter((line) => ["InvtPart", "NonInvtPart"].includes(line.item_type || ""));
+  const hasPacked = pickable.some(lineHasPackedQuantity);
+  const hasLoaded = pickable.some((line) => lineLoadedSalesQuantity(line) > 0);
+  const hasOpen = pickable.some(lineHasOpenQuantity);
+  const allLoaded = orders.every((order) => String(order.local_yard_order_status || "").toLowerCase() === "loaded");
+  const hasPreparing = orders.some((order) => order.operator_status === "preparing");
+  const base = orders[0];
+  return {
+    ...base,
+    netsuite_id: group.id,
+    tranid: group.childRefs.join("+") || orders.map((order) => order.tranid).join("+") || group.id,
+    dispatch_group_id: group.id,
+    is_dispatch_group: true,
+    child_order_refs: group.childRefs,
+    child_order_ids: childIds,
+    customer: [...new Set(orders.map((order) => order.customer).filter(Boolean))].join(" + "),
+    operator_status: hasPreparing ? "preparing" : hasPacked ? "packed" : hasLoaded && hasOpen ? "partial_loaded" : "open",
+    local_yard_order_status: allLoaded ? "Loaded" : (hasOpen && (hasPacked || hasLoaded) ? "Partial Loaded" : "Open"),
+    dispatch_planned: true,
+    dispatch_plan_date: group.planDate,
+    dispatch_truck_plate: group.truckPlate,
+    dispatch_load_name: group.loadName,
+    dispatch_parking_spot: group.parkingSpot,
+    warning_count: lines.filter((line) => line.sync_exception && lineHasPackedQuantity(line)).length,
+    underpack_count: hasOpen && (hasPacked || hasLoaded) ? 1 : 0,
+    has_open_qty: hasOpen,
+    has_packed_qty: hasPacked,
+    has_loaded_qty: hasLoaded,
+    lines: []
+  };
+}
+
+async function listDispatchGroupDeliveryOrders({ locationId = null, status = "active", orderType = "sales_order", planDate = null, truckPlate = null } = {}) {
+  const definitions = await listDispatchGroupDefinitions({ orderType });
+  const rows = [];
+  for (const group of definitions) {
+    const order = await buildDispatchGroupDeliveryListOrder(group);
+    if (!order) continue;
+    if (locationId && String(order.outbound_location_id || "") !== String(locationId)) continue;
+    if (planDate && String(order.dispatch_plan_date || "").slice(0, 10) !== String(dateOnly(planDate) || "")) continue;
+    if (truckPlate && String(order.dispatch_truck_plate || "") !== String(truckPlate)) continue;
+    const hasPacked = Boolean(order.has_packed_qty);
+    const hasOpen = Boolean(order.has_open_qty);
+    const allLoaded = String(order.local_yard_order_status || "").toLowerCase() === "loaded";
+    const operatorStatus = String(order.operator_status || "").toLowerCase();
+    if (allLoaded) continue;
+    if (status === "packed" && !(hasPacked && ["packed", "loaded", "partial_loaded"].includes(operatorStatus))) continue;
+    if (status !== "packed" && !hasOpen && operatorStatus !== "preparing") continue;
+    rows.push(order);
+  }
+  return rows;
+}
+
+async function getDispatchGroupDeliveryOrder(groupId) {
+  const group = await findDispatchGroupDefinition(groupId);
+  if (!group) return null;
+  return buildDispatchGroupDeliveryOrder(group);
+}
+
+function savedOrderType(order) {
+  if (order?.is_dispatch_group || isDispatchGroupOrderId(order?.netsuite_id)) return "group_order";
+  return order?.order_type === "transfer_order" ? "transfer_order" : "sales_order";
+}
+
+function isFullyLoadedDeliveryOrder(order = {}) {
+  const lines = Array.isArray(order.lines) ? order.lines : [];
+  const hasOpen = lines.some(lineHasOpenQuantity);
+  const status = String(order.local_yard_order_status || order.operator_status || "").trim().toLowerCase();
+  return !hasOpen && (status === "loaded" || status === "shipped" || status === "fulfilled");
+}
+
+function groupChildOrderIds(order) {
+  return (order?.child_order_ids || []).map((id) => String(id));
+}
+
+async function updateCanonicalDeliveryOrder(order, setClauses, params) {
+  const target = canonicalOrderTarget(order);
+  await query(
+    `UPDATE ${target.table}
+        SET ${setClauses.join(", ")}
+      WHERE netsuite_id = $1`,
+    [order.netsuite_id, ...params]
+  );
+}
+
+async function setCanonicalDeliveryStatus(order, status, { clearPreparing = false, localYardOrderStatus = undefined } = {}) {
+  const target = canonicalOrderTarget(order);
+  const setClauses = [
+    `${target.statusColumn} = $2`,
+    "status_updated_at = now()"
+  ];
+  const params = [status];
+  if (clearPreparing) {
+    setClauses.push("preparing_operator_id = null", "preparing_started_at = null");
+  }
+  if (localYardOrderStatus !== undefined) {
+    params.push(localYardOrderStatus);
+    setClauses.push(`local_yard_order_status = $${params.length + 1}`);
+  }
+  await updateCanonicalDeliveryOrder(order, setClauses, params);
+}
+
+async function refreshDeliveryProgressStatus(orderId, { clearPreparing = false } = {}) {
+  const order = await getDeliveryOrder(orderId);
+  if (!order) throw new Error("Delivery order not found.");
+  const pickableLines = (order.lines || []).filter((line) => {
+    return line.netsuite_active && ["InvtPart", "NonInvtPart"].includes(line.item_type || "");
+  });
+  const hasPacked = pickableLines.some((line) => linePackedSalesQuantity(line) > 0);
+  const hasLoaded = pickableLines.some((line) => lineLoadedSalesQuantity(line) > 0);
+  const hasOpen = pickableLines.some((line) => {
+    return lineRequiredSalesQuantity(line) > lineLoadedSalesQuantity(line) + linePackedSalesQuantity(line) + 0.000001;
+  });
+
+  let status = "open";
+  let localYardOrderStatus = "Open";
+  if (hasPacked) {
+    status = "packed";
+  } else if (hasLoaded && hasOpen) {
+    status = "partial_loaded";
+    localYardOrderStatus = "Partial Loaded";
+  } else if (hasLoaded && !hasOpen) {
+    status = "loaded";
+    localYardOrderStatus = "Loaded";
+  }
+
+  await setCanonicalDeliveryStatus(order, status, { clearPreparing, localYardOrderStatus });
+  return getDeliveryOrder(orderId);
 }
 
 export async function resetDeliveryFulfillmentState(orderId, operatorId, reason = "netsuite_if_missing") {
+  const order = await getDeliveryOrder(orderId);
+  if (!order) throw new Error("Delivery order not found.");
+  const lineTarget = canonicalLineTarget(order);
+  const orderTarget = canonicalOrderTarget(order);
   await query(
-    `UPDATE delivery_order_lines
+    `UPDATE ${lineTarget.table}
      SET fulfilled_pallet_qty = 0,
          fulfilled_layer_qty = 0,
          fulfilled_piece_qty = 0,
          fulfilled_section_qty = 0
-     WHERE order_id = $1`,
+     WHERE ${lineTarget.orderColumn} = $1
+       ${lineTarget.extraWhere}`,
     [orderId]
   );
   await query(
-    `UPDATE delivery_orders
+    `UPDATE ${orderTarget.table}
      SET fulfillment_status = 'not_fulfilled',
          last_item_fulfillment_id = null,
          last_item_fulfillment_tranid = null,
          fulfilled_at = null,
-         operator_status = CASE WHEN operator_status = 'fulfilled' THEN 'packed' ELSE operator_status END,
+         ${orderTarget.statusColumn} = CASE WHEN ${orderTarget.statusColumn} = 'fulfilled' THEN 'packed' ELSE ${orderTarget.statusColumn} END,
          status_updated_at = now()
      WHERE netsuite_id = $1`,
     [orderId]
@@ -259,7 +940,141 @@ function parseStatusFilter(status) {
   return String(status).split(",").map((item) => item.trim()).filter(Boolean);
 }
 
-export async function listDeliveryOrders({ locationId = null, status = "active", orderType = "sales_order" } = {}) {
+function mapLocalCoLineForDelivery(line = {}) {
+  return {
+    ...line,
+    order_id: line.delivery_order_id || line.order_id,
+    item_description: line.item_description || "",
+    item_type: line.item_type || "InvtPart",
+    item_type_text: line.item_type_text || "Inventory Item",
+    packed_pallet_qty: positiveQuantity(line.packed_pallet_qty),
+    packed_layer_qty: positiveQuantity(line.packed_layer_qty),
+    packed_section_qty: positiveQuantity(line.packed_section_qty),
+    packed_piece_qty: positiveQuantity(line.packed_piece_qty),
+    fulfilled_pallet_qty: 0,
+    fulfilled_layer_qty: 0,
+    fulfilled_piece_qty: 0,
+    fulfilled_section_qty: 0,
+    loaded_qty: 0,
+    loaded_uom: line.unit || "",
+    netsuite_active: true,
+    sync_exception: null
+  };
+}
+
+function mapLocalCoOrderForDelivery(co = {}, lines = []) {
+  const details = co.details && typeof co.details === "object" ? co.details : {};
+  const status = String(co.status || "pending_load");
+  const operatorStatus = status === "packed" ? "packed" : status === "preparing" ? "preparing" : "open";
+  return {
+    local_co_id: co.id,
+    netsuite_id: co.delivery_order_id || -Number(co.id),
+    tranid: co.co_ref,
+    trandate: co.created_at,
+    customer_id: null,
+    customer: details.customer || "Transit Depot",
+    status: co.status,
+    status_text: co.status === "pending_load" ? "Local CO - Pending Load" : "Local CO",
+    foreign_total: null,
+    order_location_id: null,
+    order_location: "",
+    outbound_location_id: co.from_location_id,
+    outbound_location: co.from_location,
+    delivery_method_id: null,
+    delivery_method: "Transit CO",
+    operator_status: operatorStatus,
+    local_yard_order_status: "Open",
+    preparing_operator_id: co.preparing_operator_id || null,
+    preparing_started_at: co.preparing_started_at || null,
+    status_updated_at: co.updated_at || co.created_at,
+    netsuite_active: true,
+    synced_at: co.updated_at || co.created_at,
+    fulfillment_status: "not_fulfilled",
+    dispatch_planned: Boolean(co.dispatch_plan_id || co.dispatch_plan_date || co.dispatch_truck_plate || co.dispatch_load_name),
+    dispatch_plan_date: co.dispatch_plan_date,
+    dispatch_planned_at: co.updated_at || co.created_at,
+    dispatch_truck_plate: co.dispatch_truck_plate || "",
+    dispatch_load_name: co.dispatch_load_name || "",
+    dispatch_parking_spot: co.dispatch_parking_spot || "",
+    expected_delivery_date: co.dispatch_plan_date,
+    dispatch_address: "",
+    dispatch_window_start: "",
+    dispatch_window_end: "",
+    dispatch_instructions: details.notes || `Local transit depot order for ${co.source_order_ref}.`,
+    memo: details.notes || `Local transit depot order for ${co.source_order_ref}.`,
+    order_type: "co_order",
+    source_order_ref: co.source_order_ref,
+    source_location_id: co.from_location_id,
+    source_location: co.from_location,
+    destination_location_id: co.to_location_id,
+    destination_location: co.to_location,
+    warning_count: 0,
+    underpack_count: 0,
+    lines: lines.map(mapLocalCoLineForDelivery).filter(hasDeliveryDisplayQuantity)
+  };
+}
+
+async function getLocalCoDeliveryOrder(coRefOrId) {
+  const text = String(coRefOrId || "").trim();
+  if (!text) return null;
+  const order = await query(
+    `SELECT *
+       FROM local_co_orders
+      WHERE co_ref = $1
+         OR delivery_order_id::text = $1
+         OR id::text = $1`,
+    [text]
+  );
+  if (!order.rowCount) return null;
+  const co = order.rows[0];
+  const lines = await query(
+    `SELECT line.*,
+            co.delivery_order_id AS delivery_order_id,
+            co.delivery_order_id AS order_id
+       FROM local_co_order_lines line
+       INNER JOIN local_co_orders co ON co.id = line.co_id
+      WHERE co.id = $1
+      ORDER BY line.line_id NULLS LAST, line.id`,
+    [co.id]
+  );
+  return mapLocalCoOrderForDelivery(co, lines.rows);
+}
+
+async function listLocalCoDeliveryOrders({ locationId = null, status = "active", planDate = null, truckPlate = null } = {}) {
+  const params = [];
+  const clauses = [
+    status === "packed"
+      ? "co.status = 'packed'"
+      : "co.status IN ('pending_load', 'preparing')"
+  ];
+  if (locationId) {
+    params.push(Number(locationId));
+    clauses.push(`co.from_location_id = $${params.length}`);
+  }
+  if (planDate) {
+    params.push(dateOnly(planDate));
+    clauses.push(`co.dispatch_plan_date = $${params.length}`);
+  }
+  if (truckPlate) {
+    params.push(String(truckPlate));
+    clauses.push(`co.dispatch_truck_plate = $${params.length}`);
+  }
+  const result = await query(
+    `SELECT co.*,
+            COUNT(line.id)::int AS line_count
+       FROM local_co_orders co
+       LEFT JOIN local_co_order_lines line ON line.co_id = co.id
+      WHERE ${clauses.join(" AND ")}
+      GROUP BY co.id
+      ORDER BY co.dispatch_plan_date NULLS LAST,
+               co.dispatch_load_name NULLS LAST,
+               co.co_ref`,
+    params
+  );
+  return result.rows.map((row) => mapLocalCoOrderForDelivery(row, []));
+}
+
+export async function listDeliveryOrders({ locationId = null, status = "active", orderType = "sales_order", planDate = null, truckPlate = null } = {}) {
   const statuses = parseStatusFilter(status);
   const params = [];
   let locationClause = "";
@@ -270,8 +1085,8 @@ export async function listDeliveryOrders({ locationId = null, status = "active",
   const pickable = "COALESCE(l.item_type, '') IN ('InvtPart', 'NonInvtPart')";
   const hasPackedQty = `
     EXISTS (
-      SELECT 1 FROM delivery_order_lines l
-      WHERE l.order_id = delivery_orders.netsuite_id
+      SELECT 1 FROM delivery_line_source l
+      WHERE l.order_id = delivery_order_source.netsuite_id
         AND (${pickable} OR l.sync_exception IS NOT NULL)
         AND (
           COALESCE(l.packed_pallet_qty, 0) > 0
@@ -283,60 +1098,111 @@ export async function listDeliveryOrders({ locationId = null, status = "active",
   `;
   const hasRemainingQty = `
     EXISTS (
-      SELECT 1 FROM delivery_order_lines l
-      WHERE l.order_id = delivery_orders.netsuite_id
+      SELECT 1 FROM delivery_line_source l
+      WHERE l.order_id = delivery_order_source.netsuite_id
         AND ${pickable}
         AND l.netsuite_active = true
+        AND ${lineOpenSalesSql("l")} > 0
+    )
+  `;
+  const hasProgressQty = `
+    EXISTS (
+      SELECT 1 FROM delivery_line_source progress_line
+      WHERE progress_line.order_id = delivery_order_source.netsuite_id
+        AND COALESCE(progress_line.item_type, '') IN ('InvtPart', 'NonInvtPart')
+        AND progress_line.netsuite_active = true
         AND (
-          GREATEST(COALESCE(l.pallet_qty, 0) - COALESCE(l.packed_pallet_qty, 0), 0) > 0
-          OR GREATEST(COALESCE(l.section_qty, 0) - COALESCE(l.packed_section_qty, 0), 0) > 0
-          OR GREATEST(COALESCE(l.layer_qty, 0) - COALESCE(l.packed_layer_qty, 0), 0) > 0
-          OR GREATEST(COALESCE(l.piece_qty, 0) - COALESCE(l.packed_piece_qty, 0), 0) > 0
-          OR (
-            COALESCE(l.pallet_qty, 0) = 0
-            AND COALESCE(l.section_qty, 0) = 0
-            AND COALESCE(l.layer_qty, 0) = 0
-            AND COALESCE(l.piece_qty, 0) = 0
-            AND GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.packed_piece_qty, 0), 0) > 0
-          )
+          COALESCE(progress_line.loaded_qty, 0) > 0
+          OR COALESCE(progress_line.packed_pallet_qty, 0) > 0
+          OR COALESCE(progress_line.packed_section_qty, 0) > 0
+          OR COALESCE(progress_line.packed_layer_qty, 0) > 0
+          OR COALESCE(progress_line.packed_piece_qty, 0) > 0
         )
     )
   `;
   const underpackCountSql = `
     SELECT COUNT(*)::int
-    FROM delivery_order_lines underpack_line
-    WHERE underpack_line.order_id = delivery_orders.netsuite_id
+    FROM delivery_line_source underpack_line
+    WHERE underpack_line.order_id = delivery_order_source.netsuite_id
       AND COALESCE(underpack_line.item_type, '') IN ('InvtPart', 'NonInvtPart')
       AND underpack_line.netsuite_active = true
-      AND (
-        GREATEST(COALESCE(underpack_line.pallet_qty, 0) - COALESCE(underpack_line.packed_pallet_qty, 0), 0) > 0
-        OR GREATEST(COALESCE(underpack_line.section_qty, 0) - COALESCE(underpack_line.packed_section_qty, 0), 0) > 0
-        OR GREATEST(COALESCE(underpack_line.layer_qty, 0) - COALESCE(underpack_line.packed_layer_qty, 0), 0) > 0
-        OR GREATEST(COALESCE(underpack_line.piece_qty, 0) - COALESCE(underpack_line.packed_piece_qty, 0), 0) > 0
-        OR (
-          COALESCE(underpack_line.pallet_qty, 0) = 0
-          AND COALESCE(underpack_line.section_qty, 0) = 0
-          AND COALESCE(underpack_line.layer_qty, 0) = 0
-          AND COALESCE(underpack_line.piece_qty, 0) = 0
-          AND GREATEST(COALESCE(underpack_line.quantity, 0) - COALESCE(underpack_line.packed_piece_qty, 0), 0) > 0
-        )
-      )
+      AND ${hasProgressQty}
+      AND ${lineOpenSalesSql("underpack_line")} > 0
   `;
   const statusClause = status === "packed"
     ? `operator_status = 'packed'`
     : `(
         operator_status = ANY($${params.length + 1}) AND operator_status <> 'packed'
-        OR (operator_status = 'packed' AND (${underpackCountSql}) > 0)
+        OR (operator_status IN ('packed', 'loaded', 'partial_loaded') AND (${underpackCountSql}) > 0)
       )`;
   if (status !== "packed") params.push(statuses);
   params.push(orderType || "sales_order");
+  const orderTypeParam = params.length;
+  let planClause = "";
+  if (planDate) {
+    params.push(dateOnly(planDate));
+    planClause += ` AND dispatch_plan_date = $${params.length}`;
+  }
+  if (truckPlate) {
+    params.push(String(truckPlate));
+    planClause += ` AND dispatch_truck_plate = $${params.length}`;
+  }
 
   const result = await query(
-    `SELECT delivery_orders.*,
+    `WITH delivery_order_source AS (
+       SELECT netsuite_id, tranid, trandate, customer_id, customer, status, status_text,
+              foreign_total, order_location_id, order_location, outbound_location_id,
+              outbound_location, delivery_method_id, sales_order_type AS delivery_method,
+              operator_status, local_yard_order_status, preparing_operator_id,
+              preparing_started_at, status_updated_at, netsuite_active, synced_at,
+              fulfillment_status, dispatch_planned, dispatch_plan_date, dispatch_planned_at, dispatch_truck_plate,
+              dispatch_load_name, dispatch_parking_spot, expected_delivery_date,
+              dispatch_address, dispatch_window_start, dispatch_window_end,
+              dispatch_instructions, memo, 'sales_order'::text AS order_type,
+              NULL::bigint AS source_location_id, NULL::text AS source_location,
+              NULL::bigint AS destination_location_id, NULL::text AS destination_location
+       FROM sales_orders
+       WHERE sales_order_type <> '${CUSTOMER_PICKUP_DELIVERY_METHOD.replaceAll("'", "''")}'
+       UNION ALL
+       SELECT netsuite_id, tranid, trandate, NULL::bigint AS customer_id, NULL::text AS customer,
+              status, status_text, NULL::numeric AS foreign_total, NULL::bigint AS order_location_id,
+              NULL::text AS order_location, from_location_id AS outbound_location_id,
+              from_location AS outbound_location, NULL::bigint AS delivery_method_id,
+              NULL::text AS delivery_method, outbound_operator_status AS operator_status,
+              local_yard_order_status, preparing_operator_id, preparing_started_at,
+              status_updated_at, netsuite_active, synced_at, fulfillment_status,
+              dispatch_planned, dispatch_plan_date, dispatch_planned_at, dispatch_truck_plate,
+              dispatch_load_name, dispatch_parking_spot, expected_delivery_date,
+              dispatch_address, dispatch_window_start, dispatch_window_end,
+              dispatch_instructions, memo, 'transfer_order'::text AS order_type,
+              from_location_id AS source_location_id, from_location AS source_location,
+              to_location_id AS destination_location_id, to_location AS destination_location
+       FROM transfer_orders
+       WHERE from_location_id IS NOT NULL
+     ),
+     delivery_line_source AS (
+       SELECT sales_order_id AS order_id, id, line_id, item_id, item_name, sku,
+              item_description, item_type, item_type_text, quantity, unit,
+              pallet_qty, layer_qty, section_qty, piece_qty,
+              packed_pallet_qty, packed_layer_qty, packed_section_qty, packed_piece_qty,
+              to_plt, to_lyr, to_sec, to_pcs, loaded_qty, loaded_uom,
+              netsuite_active, sync_exception, synced_at
+       FROM sales_order_lines
+       UNION ALL
+       SELECT transfer_order_id AS order_id, id, line_id, item_id, item_name, sku,
+              item_description, item_type, item_type_text, quantity, unit,
+              pallet_qty, layer_qty, section_qty, piece_qty,
+              packed_pallet_qty, packed_layer_qty, packed_section_qty, packed_piece_qty,
+              to_plt, to_lyr, to_sec, to_pcs, loaded_qty, loaded_uom,
+              netsuite_active, sync_exception, synced_at
+       FROM transfer_order_lines
+       WHERE line_stage = 'outbound'
+     )
+     SELECT delivery_order_source.*,
             (
               SELECT COUNT(*)::int
-              FROM delivery_order_lines warning_line
-              WHERE warning_line.order_id = delivery_orders.netsuite_id
+              FROM delivery_line_source warning_line
+              WHERE warning_line.order_id = delivery_order_source.netsuite_id
                 AND warning_line.sync_exception IS NOT NULL
                 AND (
                   COALESCE(warning_line.packed_pallet_qty, 0) > 0
@@ -346,30 +1212,389 @@ export async function listDeliveryOrders({ locationId = null, status = "active",
                 )
             ) AS warning_count
             , (${underpackCountSql}) AS underpack_count
-     FROM delivery_orders
+     FROM delivery_order_source
      WHERE ${statusClause}
        ${locationClause}
-        AND order_type = $${params.length}
+        AND order_type = $${orderTypeParam}
+        ${planClause}
+        AND ${deliveryMethodClause("delivery_order_source")}
+        AND NOT (
+          delivery_order_source.tranid NOT LIKE '%-S%'
+          AND (
+            (
+              delivery_order_source.order_type = 'sales_order'
+              AND EXISTS (
+                SELECT 1
+                FROM sales_orders split_child
+                WHERE split_child.tranid LIKE delivery_order_source.tranid || '-S%'
+                  AND split_child.netsuite_active = true
+                  AND COALESCE(split_child.local_yard_order_status, 'Open') <> 'Loaded'
+              )
+            )
+            OR (
+              delivery_order_source.order_type = 'transfer_order'
+              AND EXISTS (
+                SELECT 1
+                FROM transfer_orders split_child
+                WHERE split_child.tranid LIKE delivery_order_source.tranid || '-S%'
+                  AND split_child.netsuite_active = true
+                  AND COALESCE(split_child.local_yard_order_status, 'Open') <> 'Loaded'
+              )
+            )
+          )
+        )
+        AND (COALESCE(local_yard_order_status, 'Open') <> 'Loaded' OR (${underpackCountSql}) > 0)
+        AND NOT EXISTS (
+          SELECT 1
+            FROM local_co_orders source_co
+           WHERE source_co.source_order_ref = delivery_order_source.tranid
+             AND source_co.status IN ('pending_load', 'preparing', 'packed', 'planned')
+             AND (
+               source_co.from_location_id IS NULL
+               OR delivery_order_source.outbound_location_id IS NULL
+               OR source_co.from_location_id = delivery_order_source.outbound_location_id
+             )
+        )
         AND netsuite_active = true
         AND (
-          (order_type = 'sales_order' AND (status = 'B' OR fulfillment_status = 'partial_fulfilled'))
-          OR (order_type = 'transfer_order' AND (status_text ILIKE '%Pending Fulfillment%' OR fulfillment_status = 'partial_fulfilled'))
+          (order_type = 'sales_order' AND (status = 'B' OR status_text ILIKE '%Pending Fulfillment%' OR status_text ILIKE '%Partially Fulfilled%' OR fulfillment_status = 'partial_fulfilled'))
+          OR (order_type = 'transfer_order' AND (status_text ILIKE '%Pending Fulfillment%' OR status_text ILIKE '%Partially Fulfilled%' OR fulfillment_status = 'partial_fulfilled'))
         )
         AND fulfillment_status <> 'fulfilled'
-     ORDER BY warning_count DESC, underpack_count DESC, trandate DESC, tranid DESC`
+     ORDER BY dispatch_planned DESC, warning_count DESC, underpack_count DESC, trandate DESC, tranid DESC`
     ,
+    params
+  );
+  const groupRows = await listDispatchGroupDeliveryOrders({ locationId, status, orderType, planDate, truckPlate });
+  const localCoRows = orderType === "sales_order"
+    ? await listLocalCoDeliveryOrders({ locationId, status, planDate, truckPlate })
+    : [];
+  if (!groupRows.length) return [...localCoRows, ...result.rows];
+  const groupedChildRefs = new Set(groupRows.flatMap((order) => order.child_order_refs || []));
+  return [
+    ...localCoRows,
+    ...groupRows,
+    ...result.rows.filter((row) => !groupedChildRefs.has(String(row.tranid || "")))
+  ];
+}
+
+export async function listDeliveryLoadTrucks({ locationId = null, planDate = null } = {}) {
+  const date = dateOnly(planDate);
+  if (!date) return [];
+  const params = [date];
+  const locationClause = locationId ? `AND outbound_location_id = $${params.push(Number(locationId))}` : "";
+  const result = await query(
+    `WITH planned_delivery_orders AS (
+       SELECT dispatch_truck_plate, dispatch_load_name, outbound_location_id, operator_status,
+              local_yard_order_status, 'sales_order'::text AS order_type
+         FROM sales_orders
+        WHERE dispatch_plan_date = $1
+          AND COALESCE(dispatch_truck_plate, '') <> ''
+          AND sales_order_type <> '${CUSTOMER_PICKUP_DELIVERY_METHOD.replaceAll("'", "''")}'
+          AND netsuite_active = true
+       UNION ALL
+       SELECT dispatch_truck_plate, dispatch_load_name, from_location_id AS outbound_location_id,
+              outbound_operator_status AS operator_status, local_yard_order_status,
+              'transfer_order'::text AS order_type
+         FROM transfer_orders
+        WHERE dispatch_plan_date = $1
+          AND COALESCE(dispatch_truck_plate, '') <> ''
+          AND from_location_id IS NOT NULL
+          AND netsuite_active = true
+     )
+     SELECT dispatch_truck_plate AS truck_plate,
+            COUNT(DISTINCT dispatch_load_name) AS load_count,
+            COUNT(*) AS order_count,
+            MIN(dispatch_load_name) AS first_load_name
+       FROM planned_delivery_orders
+      WHERE COALESCE(local_yard_order_status, 'Open') <> 'Loaded'
+        ${locationClause}
+      GROUP BY dispatch_truck_plate
+      ORDER BY dispatch_truck_plate`,
     params
   );
   return result.rows;
 }
 
+export async function listDeliveryLoadOrders({ locationId = null, status = "active", planDate = null, truckPlate = null } = {}) {
+  if (!dateOnly(planDate)) return [];
+  const [salesOrders, transferOrders] = await Promise.all([
+    listDeliveryOrders({ locationId, status, orderType: "sales_order", planDate, truckPlate }),
+    listDeliveryOrders({ locationId, status, orderType: "transfer_order", planDate, truckPlate })
+  ]);
+  return [...salesOrders, ...transferOrders].sort((a, b) =>
+    String(a.dispatch_load_name || "").localeCompare(String(b.dispatch_load_name || ""), undefined, { numeric: true, sensitivity: "base" })
+    || String(a.tranid || "").localeCompare(String(b.tranid || ""), undefined, { numeric: true, sensitivity: "base" })
+  );
+}
+
+export async function saveDeliveryOrderForOperator(operatorId, { locationId, orderId } = {}) {
+  if (!operatorId) throw new Error("Operator login is required.");
+  if (!locationId) throw new Error("Location is required.");
+  if (!orderId) throw new Error("Order is required.");
+  const order = await getDeliveryOrder(orderId);
+  if (!order) throw new Error("Delivery order not found.");
+  await query(
+    `INSERT INTO operator_saved_delivery_orders (operator_id, location_id, order_key, order_ref, order_type)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (operator_id, location_id, order_key)
+     DO UPDATE SET order_ref = EXCLUDED.order_ref,
+                   order_type = EXCLUDED.order_type,
+                   created_at = now()`,
+    [operatorId, locationId, String(order.netsuite_id), String(order.tranid || order.netsuite_id), savedOrderType(order)]
+  );
+  await writeAudit({
+    actorOperatorId: operatorId,
+    action: "delivery.saved_order.saved",
+    orderId: /^\d+$/.test(String(order.netsuite_id || "")) ? order.netsuite_id : null,
+    details: { locationId, orderId: order.netsuite_id, tranid: order.tranid, orderType: savedOrderType(order) }
+  });
+  return { saved: true, order };
+}
+
+export async function removeSavedDeliveryOrderForOperator(operatorId, { locationId, orderId } = {}) {
+  if (!operatorId) throw new Error("Operator login is required.");
+  if (!locationId) throw new Error("Location is required.");
+  if (!orderId) throw new Error("Order is required.");
+  const result = await query(
+    `DELETE FROM operator_saved_delivery_orders
+      WHERE operator_id = $1
+        AND location_id = $2
+        AND order_key = $3
+      RETURNING order_key, order_ref`,
+    [operatorId, locationId, String(orderId)]
+  );
+  await writeAudit({
+    actorOperatorId: operatorId,
+    action: "delivery.saved_order.removed",
+    orderId: /^\d+$/.test(String(orderId || "")) ? orderId : null,
+    details: { locationId, removed: result.rowCount }
+  });
+  return { removed: result.rowCount };
+}
+
+export async function listSavedDeliveryOrdersForOperator(operatorId, { locationId } = {}) {
+  if (!operatorId || !locationId) return [];
+  const saved = await query(
+    `SELECT order_key, order_ref, order_type, created_at
+       FROM operator_saved_delivery_orders
+      WHERE operator_id = $1
+        AND location_id = $2
+      ORDER BY created_at DESC, order_ref`,
+    [operatorId, locationId]
+  );
+  const rows = [];
+  for (const item of saved.rows) {
+    const order = await getDeliveryOrder(item.order_key).catch(() => null);
+    if (!order) continue;
+    if (isFullyLoadedDeliveryOrder(order)) continue;
+    rows.push({
+      ...order,
+      saved_order: true,
+      saved_at: item.created_at,
+      saved_order_type: item.order_type
+    });
+  }
+  return rows;
+}
+
+export async function listSavedDeliveryOrderKeysForOperator(operatorId, { locationId } = {}) {
+  if (!operatorId || !locationId) return [];
+  const result = await query(
+    `SELECT order_key
+       FROM operator_saved_delivery_orders
+      WHERE operator_id = $1
+        AND location_id = $2
+      ORDER BY created_at DESC`,
+    [operatorId, locationId]
+  );
+  return result.rows.map((row) => String(row.order_key));
+}
+
+function todayKey() {
+  const date = new Date();
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0")
+  ].join("-");
+}
+
+function addDaysKey(days) {
+  const date = new Date();
+  date.setHours(0, 0, 0, 0);
+  date.setDate(date.getDate() + days);
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0")
+  ].join("-");
+}
+
+function minutesFromTimeText(value) {
+  const text = String(value || "").replace(/[^0-9]/g, "");
+  if (!text) return null;
+  const padded = text.length <= 2 ? `${text}00` : text.padStart(4, "0").slice(0, 4);
+  const hours = Number(padded.slice(0, 2));
+  const minutes = Number(padded.slice(2, 4));
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes) || hours > 23 || minutes > 59) return null;
+  return (hours * 60) + minutes;
+}
+
+function dateKey(value) {
+  if (!value) return "";
+  if (typeof value === "string") {
+    const match = value.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (match) return `${match[1]}-${match[2]}-${match[3]}`;
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0")
+  ].join("-");
+}
+
+function hasBeforeNoonWindow(order) {
+  const start = minutesFromTimeText(order?.dispatch_window_start);
+  const end = minutesFromTimeText(order?.dispatch_window_end);
+  if (end !== null) return end <= 720;
+  if (start !== null) return start < 720;
+  return false;
+}
+
+function hasAnyDeliveryWindow(order) {
+  return minutesFromTimeText(order?.dispatch_window_start) !== null
+    || minutesFromTimeText(order?.dispatch_window_end) !== null;
+}
+
+function isBatchA(order) {
+  if (order?.dispatch_planned) return false;
+  const expected = dateKey(order?.expected_delivery_date);
+  if (!expected) return false;
+  const today = todayKey();
+  const tomorrow = addDaysKey(1);
+  return expected <= today || (expected === tomorrow && (hasBeforeNoonWindow(order) || !hasAnyDeliveryWindow(order)));
+}
+
+export async function getDeliveryPrepNotifications({ locationId = null } = {}) {
+  if (!locationId) return { locationId: null, total: 0, salesOrder: { dueToday: 0 }, transferOrder: { dueToday: 0 }, items: [] };
+  const [salesActive, transferActive] = await Promise.all([
+    listDeliveryOrders({ locationId, status: "active", orderType: "sales_order" }),
+    listDeliveryOrders({ locationId, status: "active", orderType: "transfer_order" })
+  ]);
+  const today = todayKey();
+  const uniqueById = (rows) => [...new Map(rows.map((row) => [String(row.netsuite_id), row])).values()];
+  const hasOpenOperatorStatus = (order) => {
+    const operatorStatus = String(order?.operator_status || "open").toLowerCase();
+    const yardStatus = String(order?.local_yard_order_status || "open").toLowerCase();
+    return operatorStatus === "open" && !["loaded", "shipped"].includes(yardStatus);
+  };
+  const shouldNotifyDeliveryPrep = (order) => {
+    if (order?.dispatch_planned) return true;
+    const expected = dateKey(order?.expected_delivery_date);
+    const planned = dateKey(order?.dispatch_plan_date);
+    return expected === today || planned === today;
+  };
+  const toNoticeItem = (order, type) => ({
+    orderId: order.netsuite_id,
+    type,
+    bucket: order.dispatch_planned ? "planned" : "due_today",
+    tranid: order.tranid,
+    customer: order.customer || "",
+    expectedDeliveryDate: dateKey(order.expected_delivery_date),
+    dispatchPlanDate: dateKey(order.dispatch_plan_date),
+    dispatchPlannedAt: order.dispatch_planned_at || "",
+    dispatchPlanned: Boolean(order.dispatch_planned),
+    windowStart: order.dispatch_window_start || "",
+    windowEnd: order.dispatch_window_end || "",
+    truck: order.dispatch_truck_plate || "",
+    load: order.dispatch_load_name || "",
+    parkingSpot: order.dispatch_parking_spot || "",
+    locationId: order.outbound_location_id,
+    location: order.outbound_location
+  });
+  const salesItems = uniqueById(salesActive)
+    .filter((order) => hasOpenOperatorStatus(order) && shouldNotifyDeliveryPrep(order))
+    .map((order) => toNoticeItem(order, "sales_order"));
+  const transferItems = uniqueById(transferActive)
+    .filter((order) => hasOpenOperatorStatus(order) && shouldNotifyDeliveryPrep(order))
+    .map((order) => toNoticeItem(order, "transfer_order"));
+  const items = [...salesItems, ...transferItems]
+    .sort((a, b) => String(a.expectedDeliveryDate || a.dispatchPlanDate || "").localeCompare(String(b.expectedDeliveryDate || b.dispatchPlanDate || "")) || String(a.tranid || "").localeCompare(String(b.tranid || "")));
+  return {
+    locationId: Number(locationId),
+    total: items.length,
+    salesOrder: {
+      dueToday: salesItems.length
+    },
+    transferOrder: {
+      dueToday: transferItems.length
+    },
+    items
+  };
+}
+
 export async function getDeliveryOrder(id) {
+  if (isLocalCoRef(id)) return getLocalCoDeliveryOrder(id);
+  if (isDispatchGroupOrderId(id)) return getDispatchGroupDeliveryOrder(id);
   const order = await query(
-    `SELECT delivery_orders.*,
+    `WITH delivery_order_source AS (
+       SELECT netsuite_id, tranid, trandate, customer_id, customer, status, status_text,
+              foreign_total, order_location_id, order_location, outbound_location_id,
+              outbound_location, delivery_method_id, sales_order_type AS delivery_method,
+              operator_status, local_yard_order_status, preparing_operator_id,
+              preparing_started_at, status_updated_at, netsuite_active, synced_at,
+              fulfillment_status, dispatch_planned, dispatch_plan_date, dispatch_planned_at, dispatch_truck_plate,
+              dispatch_load_name, dispatch_parking_spot, expected_delivery_date,
+              dispatch_address, dispatch_window_start, dispatch_window_end,
+              dispatch_instructions, memo, 'sales_order'::text AS order_type,
+              NULL::bigint AS source_location_id, NULL::text AS source_location,
+              NULL::bigint AS destination_location_id, NULL::text AS destination_location
+       FROM sales_orders
+       UNION ALL
+       SELECT netsuite_id, tranid, trandate, NULL::bigint AS customer_id, NULL::text AS customer,
+              status, status_text, NULL::numeric AS foreign_total, NULL::bigint AS order_location_id,
+              NULL::text AS order_location, from_location_id AS outbound_location_id,
+              from_location AS outbound_location, NULL::bigint AS delivery_method_id,
+              NULL::text AS delivery_method, outbound_operator_status AS operator_status,
+              local_yard_order_status, preparing_operator_id, preparing_started_at,
+              status_updated_at, netsuite_active, synced_at, fulfillment_status,
+              dispatch_planned, dispatch_plan_date, dispatch_planned_at, dispatch_truck_plate,
+              dispatch_load_name, dispatch_parking_spot, expected_delivery_date,
+              dispatch_address, dispatch_window_start, dispatch_window_end,
+              dispatch_instructions, memo, 'transfer_order'::text AS order_type,
+              from_location_id AS source_location_id, from_location AS source_location,
+              to_location_id AS destination_location_id, to_location AS destination_location
+       FROM transfer_orders
+       WHERE from_location_id IS NOT NULL
+     ),
+     delivery_line_source AS (
+       SELECT sales_order_id AS order_id, id, line_id, item_id, item_name, sku,
+              item_description, item_type, item_type_text, quantity, unit,
+              item_weight, location_id, location, pallet_qty, layer_qty, section_qty, piece_qty,
+              packed_pallet_qty, packed_layer_qty, packed_section_qty, packed_piece_qty,
+              fulfilled_pallet_qty, fulfilled_layer_qty, fulfilled_piece_qty, fulfilled_section_qty,
+              to_plt, to_lyr, to_sec, to_pcs, loaded_qty, loaded_uom,
+              netsuite_active, sync_exception, synced_at
+       FROM sales_order_lines
+       UNION ALL
+       SELECT transfer_order_id AS order_id, id, line_id, item_id, item_name, sku,
+              item_description, item_type, item_type_text, quantity, unit,
+              item_weight, location_id, location, pallet_qty, layer_qty, section_qty, piece_qty,
+              packed_pallet_qty, packed_layer_qty, packed_section_qty, packed_piece_qty,
+              fulfilled_pallet_qty, fulfilled_layer_qty, fulfilled_piece_qty, fulfilled_section_qty,
+              to_plt, to_lyr, to_sec, to_pcs, loaded_qty, loaded_uom,
+              netsuite_active, sync_exception, synced_at
+       FROM transfer_order_lines
+       WHERE line_stage = 'outbound'
+     )
+     SELECT delivery_order_source.*,
             (
               SELECT COUNT(*)::int
-              FROM delivery_order_lines warning_line
-              WHERE warning_line.order_id = delivery_orders.netsuite_id
+              FROM delivery_line_source warning_line
+              WHERE warning_line.order_id = delivery_order_source.netsuite_id
                 AND warning_line.sync_exception IS NOT NULL
                 AND (
                   COALESCE(warning_line.packed_pallet_qty, 0) > 0
@@ -380,33 +1605,71 @@ export async function getDeliveryOrder(id) {
             ) AS warning_count
             , (
               SELECT COUNT(*)::int
-              FROM delivery_order_lines underpack_line
-              WHERE underpack_line.order_id = delivery_orders.netsuite_id
+              FROM delivery_line_source underpack_line
+              WHERE underpack_line.order_id = delivery_order_source.netsuite_id
                 AND COALESCE(underpack_line.item_type, '') IN ('InvtPart', 'NonInvtPart')
                 AND underpack_line.netsuite_active = true
-                AND (
-                  GREATEST(COALESCE(underpack_line.pallet_qty, 0) - COALESCE(underpack_line.packed_pallet_qty, 0), 0) > 0
-                  OR GREATEST(COALESCE(underpack_line.section_qty, 0) - COALESCE(underpack_line.packed_section_qty, 0), 0) > 0
-                  OR GREATEST(COALESCE(underpack_line.layer_qty, 0) - COALESCE(underpack_line.packed_layer_qty, 0), 0) > 0
-                  OR GREATEST(COALESCE(underpack_line.piece_qty, 0) - COALESCE(underpack_line.packed_piece_qty, 0), 0) > 0
-                  OR (
-                    COALESCE(underpack_line.pallet_qty, 0) = 0
-                    AND COALESCE(underpack_line.section_qty, 0) = 0
-                    AND COALESCE(underpack_line.layer_qty, 0) = 0
-                    AND COALESCE(underpack_line.piece_qty, 0) = 0
-                    AND GREATEST(COALESCE(underpack_line.quantity, 0) - COALESCE(underpack_line.packed_piece_qty, 0), 0) > 0
-                  )
+                AND EXISTS (
+                  SELECT 1 FROM delivery_line_source progress_line
+                  WHERE progress_line.order_id = delivery_order_source.netsuite_id
+                    AND COALESCE(progress_line.item_type, '') IN ('InvtPart', 'NonInvtPart')
+                    AND progress_line.netsuite_active = true
+                    AND (
+                      COALESCE(progress_line.loaded_qty, 0) > 0
+                      OR COALESCE(progress_line.packed_pallet_qty, 0) > 0
+                      OR COALESCE(progress_line.packed_section_qty, 0) > 0
+                      OR COALESCE(progress_line.packed_layer_qty, 0) > 0
+                      OR COALESCE(progress_line.packed_piece_qty, 0) > 0
+                    )
                 )
+                AND ${lineOpenSalesSql("underpack_line")} > 0
             ) AS underpack_count
-     FROM delivery_orders
+     FROM delivery_order_source
      WHERE netsuite_id = $1`,
     [id]
   );
-  if (!order.rowCount) return null;
+  if (!order.rowCount) return Number(id) < 0 ? getLocalCoDeliveryOrder(id) : null;
 
   const lines = await query(
-    `SELECT *
-     FROM delivery_order_lines
+    `WITH alloc AS (
+       SELECT sales_line_id,
+              SUM(allocated_pallet_qty) AS po_allocated_pallet_qty,
+              SUM(allocated_layer_qty) AS po_allocated_layer_qty,
+              SUM(allocated_section_qty) AS po_allocated_section_qty,
+              SUM(allocated_piece_qty) AS po_allocated_piece_qty,
+              SUM(allocated_sales_qty) AS po_allocated_sales_qty
+         FROM dispatch_so_po_allocations
+        WHERE status = 'active'
+        GROUP BY sales_line_id
+     ),
+     delivery_line_source AS (
+       SELECT sales_order_id AS order_id, id, line_id, item_id, item_name, sku,
+              item_description, item_type, item_type_text, quantity, unit,
+              item_weight, location_id, location, pallet_qty, layer_qty, section_qty, piece_qty,
+              packed_pallet_qty, packed_layer_qty, packed_section_qty, packed_piece_qty,
+              fulfilled_pallet_qty, fulfilled_layer_qty, fulfilled_piece_qty, fulfilled_section_qty,
+              to_plt, to_lyr, to_sec, to_pcs, loaded_qty, loaded_uom,
+              netsuite_active, sync_exception, synced_at
+       FROM sales_order_lines
+       UNION ALL
+       SELECT transfer_order_id AS order_id, id, line_id, item_id, item_name, sku,
+              item_description, item_type, item_type_text, quantity, unit,
+              item_weight, location_id, location, pallet_qty, layer_qty, section_qty, piece_qty,
+              packed_pallet_qty, packed_layer_qty, packed_section_qty, packed_piece_qty,
+              fulfilled_pallet_qty, fulfilled_layer_qty, fulfilled_piece_qty, fulfilled_section_qty,
+              to_plt, to_lyr, to_sec, to_pcs, loaded_qty, loaded_uom,
+              netsuite_active, sync_exception, synced_at
+       FROM transfer_order_lines
+       WHERE line_stage = 'outbound'
+     )
+     SELECT delivery_line_source.*,
+            COALESCE(alloc.po_allocated_pallet_qty, 0) AS po_allocated_pallet_qty,
+            COALESCE(alloc.po_allocated_layer_qty, 0) AS po_allocated_layer_qty,
+            COALESCE(alloc.po_allocated_section_qty, 0) AS po_allocated_section_qty,
+            COALESCE(alloc.po_allocated_piece_qty, 0) AS po_allocated_piece_qty,
+            COALESCE(alloc.po_allocated_sales_qty, 0) AS po_allocated_sales_qty
+     FROM delivery_line_source
+     LEFT JOIN alloc ON alloc.sales_line_id = delivery_line_source.id
      WHERE order_id = $1
        AND (
          netsuite_active = true
@@ -417,7 +1680,452 @@ export async function getDeliveryOrder(id) {
     [id]
   );
 
-  return { ...order.rows[0], lines: lines.rows };
+  return { ...order.rows[0], lines: lines.rows.map(applyDeliveryAllocationFields).filter(hasDeliveryDisplayQuantity) };
+}
+
+export async function findCustomerPickupOrder(code, { locationId = null } = {}) {
+  const text = String(code || "").trim();
+  if (!text) return null;
+  const params = [text.toUpperCase()];
+  let locationClause = "";
+  if (locationId) {
+    params.push(locationId);
+    locationClause = `AND outbound_location_id = $${params.length}`;
+  }
+  const result = await query(
+    `SELECT netsuite_id
+       FROM sales_orders
+      WHERE (UPPER(tranid) = $1 OR netsuite_id::text = $1)
+        ${locationClause}
+        AND sales_order_type = $${params.length + 1}
+        AND NOT (status = 'A' OR status_text ILIKE '%Pending Approval%')
+        AND LOWER(COALESCE(local_yard_order_status, 'Open')) IN ('open', 'partial_loaded', 'partially loaded', 'loaded')
+        AND netsuite_active = true
+      LIMIT 1`,
+    [...params, CUSTOMER_PICKUP_DELIVERY_METHOD]
+  );
+  return result.rows[0]?.netsuite_id || null;
+}
+
+async function materializeSalesSplitOrder(order, parent) {
+  const splitId = syntheticOrderId(`sales:${order.id}`);
+  const splitItems = Array.isArray(order.items) ? order.items.filter(Boolean) : [];
+  await query(
+    `INSERT INTO sales_orders (
+       netsuite_id, tranid, trandate, customer_id, customer, status, status_text,
+       foreign_total, order_location_id, order_location, outbound_location_id,
+       outbound_location, delivery_method_id, sales_order_type, memo,
+       expected_delivery_date, dispatch_address, dispatch_window_start,
+       dispatch_window_end, dispatch_instructions, operator_status,
+       local_yard_order_status, netsuite_active, synced_at, dispatch_parse_source,
+       dispatch_note_hash, dispatch_parsed_at, fulfillment_status
+     )
+     SELECT $1, $2, trandate, customer_id, customer, status, status_text,
+            foreign_total, order_location_id, order_location, outbound_location_id,
+            outbound_location, delivery_method_id, sales_order_type, $3,
+            COALESCE($4::date, expected_delivery_date), dispatch_address, dispatch_window_start,
+            dispatch_window_end, dispatch_instructions, 'open',
+            'Open', true, now(), 'dispatch-split',
+            dispatch_note_hash, now(), 'not_fulfilled'
+       FROM sales_orders
+      WHERE netsuite_id = $5
+     ON CONFLICT (netsuite_id) DO UPDATE
+       SET tranid = EXCLUDED.tranid,
+           memo = EXCLUDED.memo,
+           expected_delivery_date = EXCLUDED.expected_delivery_date,
+           dispatch_address = EXCLUDED.dispatch_address,
+           dispatch_window_start = EXCLUDED.dispatch_window_start,
+           dispatch_window_end = EXCLUDED.dispatch_window_end,
+           dispatch_instructions = EXCLUDED.dispatch_instructions,
+           netsuite_active = true,
+           synced_at = now()`,
+    [splitId, order.id, order.notes || `Split from ${order.originalOrderId}`, dateOnly(order.expectedDeliveryDate || order.expected_delivery_date), parent.netsuite_id]
+  );
+  if (!splitItems.length) return splitId;
+  await query("DELETE FROM sales_order_lines WHERE sales_order_id = $1 AND COALESCE(loaded_qty, 0) = 0 AND COALESCE(packed_pallet_qty, 0) = 0 AND COALESCE(packed_layer_qty, 0) = 0 AND COALESCE(packed_section_qty, 0) = 0 AND COALESCE(packed_piece_qty, 0) = 0", [splitId]);
+  for (const item of splitItems) {
+    await query(
+      `INSERT INTO sales_order_lines (
+         sales_order_id, id, line_id, item_id, item_name, sku, item_description,
+         item_type, item_type_text, quantity, unit, pallet_qty, layer_qty,
+         section_qty, piece_qty, to_plt, to_lyr, to_sec, to_pcs,
+         netsuite_active, synced_at, location_id, location, item_weight,
+         fulfilled_pallet_qty, fulfilled_layer_qty, fulfilled_piece_qty, fulfilled_section_qty
+       )
+       SELECT $1, $2, $3, item_id, item_name, sku, item_description,
+              item_type, item_type_text, $4, unit, $5, $6,
+              $7, $8, to_plt, to_lyr, to_sec, to_pcs,
+              true, now(), location_id, location, item_weight,
+              0, 0, 0, 0
+         FROM sales_order_lines
+        WHERE sales_order_id = $10
+          AND (
+            id = $9
+            OR ($13::text IS NOT NULL AND line_id::text = $13::text)
+            OR ($11::text <> '' AND sku = $11::text)
+            OR ($12::text <> '' AND item_id::text = $12::text)
+          )
+        ORDER BY CASE
+          WHEN id = $9 THEN 0
+          WHEN $13::text IS NOT NULL AND line_id::text = $13::text THEN 1
+          WHEN $11::text <> '' AND sku = $11::text THEN 2
+          WHEN $12::text <> '' AND item_id::text = $12::text THEN 3
+          ELSE 4
+        END
+        LIMIT 1
+       ON CONFLICT (id) DO UPDATE
+         SET quantity = EXCLUDED.quantity,
+             pallet_qty = EXCLUDED.pallet_qty,
+             layer_qty = EXCLUDED.layer_qty,
+             section_qty = EXCLUDED.section_qty,
+             piece_qty = EXCLUDED.piece_qty,
+             netsuite_active = true,
+             synced_at = now()`,
+      [
+        splitId,
+        syntheticOrderId(`sales-line:${order.id}:${item.lineRowId || item.lineId || item.sku}`),
+        item.lineId || item.line_id || null,
+        splitLineSalesQuantity(item),
+        itemNumber(item.pallets),
+        itemNumber(item.layers),
+        itemNumber(item.sections),
+        itemNumber(item.pieces),
+        item.lineRowId || item.id,
+        parent.netsuite_id,
+        item.sku || item.itemName || "",
+        item.itemId || item.item_id || "",
+        item.lineId || item.line_id || null
+      ]
+    );
+  }
+  return splitId;
+}
+
+async function materializeTransferSplitOrder(order, parent) {
+  const splitId = syntheticOrderId(`transfer:${order.id}`);
+  const splitItems = Array.isArray(order.items) ? order.items.filter(Boolean) : [];
+  await query(
+    `INSERT INTO transfer_orders (
+       netsuite_id, tranid, trandate, status, status_text, from_location_id,
+       from_location, to_location_id, to_location, outbound_operator_status,
+       receiving_status, netsuite_active, synced_at, memo, expected_delivery_date,
+       dispatch_address, dispatch_window_start, dispatch_window_end,
+       dispatch_instructions, dispatch_parse_source, dispatch_note_hash,
+       dispatch_parsed_at, local_yard_order_status, fulfillment_status
+     )
+     SELECT $1, $2, trandate, status, status_text, from_location_id,
+            from_location, to_location_id, to_location, 'open',
+            receiving_status, true, now(), $3, COALESCE($4::date, expected_delivery_date),
+            dispatch_address, dispatch_window_start, dispatch_window_end,
+            dispatch_instructions, 'dispatch-split', dispatch_note_hash,
+            now(), 'Open', 'not_fulfilled'
+       FROM transfer_orders
+      WHERE netsuite_id = $5
+     ON CONFLICT (netsuite_id) DO UPDATE
+       SET tranid = EXCLUDED.tranid,
+           memo = EXCLUDED.memo,
+           expected_delivery_date = EXCLUDED.expected_delivery_date,
+           dispatch_address = EXCLUDED.dispatch_address,
+           dispatch_window_start = EXCLUDED.dispatch_window_start,
+           dispatch_window_end = EXCLUDED.dispatch_window_end,
+           dispatch_instructions = EXCLUDED.dispatch_instructions,
+           netsuite_active = true,
+           synced_at = now()`,
+    [splitId, order.id, order.notes || `Split from ${order.originalOrderId}`, dateOnly(order.expectedDeliveryDate || order.expected_delivery_date), parent.netsuite_id]
+  );
+  if (!splitItems.length) return splitId;
+  await query("DELETE FROM transfer_order_lines WHERE transfer_order_id = $1 AND COALESCE(loaded_qty, 0) = 0 AND COALESCE(packed_pallet_qty, 0) = 0 AND COALESCE(packed_layer_qty, 0) = 0 AND COALESCE(packed_section_qty, 0) = 0 AND COALESCE(packed_piece_qty, 0) = 0", [splitId]);
+  for (const item of splitItems) {
+    await query(
+      `INSERT INTO transfer_order_lines (
+         line_stage, transfer_order_id, id, line_id, item_id, item_name, sku,
+         item_description, quantity, unit, pallet_qty, layer_qty, section_qty,
+         piece_qty, loaded_qty, loaded_uom, netsuite_active, synced_at,
+         item_type, item_type_text, location_id, location, to_plt, to_lyr,
+         to_sec, to_pcs, item_weight, confirmed, fulfilled_pallet_qty,
+         fulfilled_layer_qty, fulfilled_piece_qty, fulfilled_section_qty
+       )
+       SELECT 'outbound', $1, $2, $3, item_id, item_name, sku,
+              item_description, $4, unit, $5, $6, $7,
+              $8, 0, unit, true, now(),
+              item_type, item_type_text, location_id, location, to_plt, to_lyr,
+              to_sec, to_pcs, item_weight, false, 0,
+              0, 0, 0
+         FROM transfer_order_lines
+        WHERE transfer_order_id = $10
+          AND line_stage = 'outbound'
+          AND (
+            id = $9
+            OR ($13::text IS NOT NULL AND line_id::text = $13::text)
+            OR ($11::text <> '' AND sku = $11::text)
+            OR ($12::text <> '' AND item_id::text = $12::text)
+          )
+        ORDER BY CASE
+          WHEN id = $9 THEN 0
+          WHEN $13::text IS NOT NULL AND line_id::text = $13::text THEN 1
+          WHEN $11::text <> '' AND sku = $11::text THEN 2
+          WHEN $12::text <> '' AND item_id::text = $12::text THEN 3
+          ELSE 4
+        END
+        LIMIT 1
+       ON CONFLICT (transfer_order_id, line_stage, line_id) WHERE line_id IS NOT NULL DO UPDATE
+         SET quantity = EXCLUDED.quantity,
+             pallet_qty = EXCLUDED.pallet_qty,
+             layer_qty = EXCLUDED.layer_qty,
+             section_qty = EXCLUDED.section_qty,
+             piece_qty = EXCLUDED.piece_qty,
+             netsuite_active = true,
+             synced_at = now()`,
+      [
+        splitId,
+        syntheticOrderId(`transfer-line:${order.id}:${item.lineRowId || item.lineId || item.sku}`),
+        item.lineId || item.line_id || null,
+        splitLineSalesQuantity(item),
+        itemNumber(item.pallets),
+        itemNumber(item.layers),
+        itemNumber(item.sections),
+        itemNumber(item.pieces),
+        item.lineRowId || item.id,
+        parent.netsuite_id,
+        item.sku || item.itemName || "",
+        item.itemId || item.item_id || "",
+        item.lineId || item.line_id || null
+      ]
+    );
+  }
+  return splitId;
+}
+
+async function materializeDispatchSplitOrders(plan) {
+  const splits = (plan.orders || []).filter((order) => isSplitOrder(order) && ["SO", "TO"].includes(order.type));
+  const activeSplitRefs = splits.map((order) => String(order.id || ""));
+  await query(
+    `UPDATE sales_orders
+        SET netsuite_active = false,
+            dispatch_planned = false
+      WHERE tranid LIKE '%-S%'
+        AND dispatch_plan_date = $1::date
+        AND NOT (tranid = ANY($2::text[]))`,
+    [plan.planDate, activeSplitRefs]
+  );
+  await query(
+    `UPDATE transfer_orders
+        SET netsuite_active = false,
+            dispatch_planned = false
+      WHERE tranid LIKE '%-S%'
+        AND dispatch_plan_date = $1::date
+        AND NOT (tranid = ANY($2::text[]))`,
+    [plan.planDate, activeSplitRefs]
+  );
+
+  for (const split of splits) {
+    if (split.type === "SO") {
+      const parent = await query("SELECT netsuite_id FROM sales_orders WHERE tranid = $1 LIMIT 1", [split.originalOrderId]);
+      if (parent.rows[0]) await materializeSalesSplitOrder(split, parent.rows[0]);
+    } else {
+      const parent = await query("SELECT netsuite_id FROM transfer_orders WHERE tranid = $1 LIMIT 1", [split.originalOrderId]);
+      if (parent.rows[0]) await materializeTransferSplitOrder(split, parent.rows[0]);
+    }
+  }
+
+  return { splits: splits.length, splitRefs: activeSplitRefs };
+}
+
+export async function applyConfirmedDispatchPlanToDelivery(plan, { forceOrderRefs = [] } = {}) {
+  if (!plan?.planDate || !Array.isArray(plan.trucks)) return { planned: 0 };
+  const materializedSplits = await materializeDispatchSplitOrders(plan);
+  const splitParentRefs = new Set((plan.orders || []).filter(isSplitOrder).map((order) => String(order.originalOrderId || "")));
+  const forceRefs = new Set((forceOrderRefs || []).map((ref) => String(ref || "").trim()).filter(Boolean));
+  const plannedRows = [];
+  for (const truck of plan.trucks || []) {
+    for (const load of truck.loads || []) {
+      if (load.returnOnly) continue;
+      for (const stop of load.stops || []) {
+        if (stop.type !== "drop" || !stop.orderId) continue;
+        const order = (plan.orders || []).find((item) => item.id === stop.orderId);
+        if (!["SO", "TO"].includes(order?.type)) continue;
+        if (!isSplitOrder(order) && splitParentRefs.has(String(order.id || ""))) continue;
+        plannedRows.push({
+          tranid: order.id,
+          orderType: order.type,
+          truckPlate: truck.plate || "",
+          loadName: load.name || "",
+          parkingSpot: truck.parkingSpot || "",
+          planDate: plan.planDate,
+          forcePlannedAt: forceRefs.has(String(order.id || ""))
+        });
+      }
+    }
+  }
+  const salesRefs = plannedRows.filter((row) => row.orderType === "SO").map((row) => row.tranid);
+  const transferRefs = plannedRows.filter((row) => row.orderType === "TO").map((row) => row.tranid);
+  await query(
+    `UPDATE sales_orders
+        SET dispatch_planned = false,
+            dispatch_plan_date = null,
+            dispatch_truck_plate = null,
+            dispatch_load_name = null,
+            dispatch_parking_spot = null,
+            dispatch_planned_at = null
+      WHERE dispatch_plan_date = $1::date
+        AND NOT (tranid = ANY($2::text[]))`,
+    [plan.planDate, salesRefs]
+  );
+  await query(
+    `UPDATE transfer_orders
+        SET dispatch_planned = false,
+            dispatch_plan_date = null,
+            dispatch_truck_plate = null,
+            dispatch_load_name = null,
+            dispatch_parking_spot = null,
+            dispatch_planned_at = null
+      WHERE dispatch_plan_date = $1::date
+        AND NOT (tranid = ANY($2::text[]))`,
+    [plan.planDate, transferRefs]
+  );
+
+  for (const row of plannedRows) {
+    const targetTable = row.orderType === "TO" ? "transfer_orders" : "sales_orders";
+    await query(
+      `UPDATE ${targetTable}
+          SET dispatch_planned = true,
+              dispatch_plan_date = $2::date,
+              dispatch_truck_plate = $3,
+              dispatch_load_name = $4,
+              dispatch_parking_spot = $5,
+              dispatch_planned_at = CASE
+                WHEN $6::boolean
+                  OR dispatch_planned IS DISTINCT FROM true
+                  OR COALESCE(dispatch_plan_date::text, '') <> $2::date::text
+                  OR COALESCE(dispatch_truck_plate, '') <> $3
+                  OR COALESCE(dispatch_load_name, '') <> $4
+                  OR COALESCE(dispatch_parking_spot, '') <> $5
+                  OR dispatch_planned_at IS NULL
+                THEN now()
+                ELSE dispatch_planned_at
+              END
+        WHERE tranid = $1
+          AND COALESCE(local_yard_order_status, 'Open') <> 'Loaded'`,
+      [row.tranid, row.planDate, row.truckPlate, row.loadName, row.parkingSpot, row.forcePlannedAt]
+    );
+  }
+
+  await writeAudit({
+    actorType: "system",
+    source: "dispatch",
+    action: "dispatch.plan.operator_flags_applied",
+    details: { planDate: plan.planDate, plannedCount: plannedRows.length, forcedCount: forceRefs.size }
+  });
+  return { planned: plannedRows.length, ...materializedSplits };
+}
+
+export async function deactivateUnplannedDispatchSplitOrders({ originalOrderId = "", orderType = "", splitOrderIds = [] } = {}) {
+  const originalRef = String(originalOrderId || "").trim();
+  const requestedRefs = (Array.isArray(splitOrderIds) ? splitOrderIds : [])
+    .map((ref) => String(ref || "").trim())
+    .filter((ref) => ref && ref !== originalRef);
+  if (!originalRef) throw new Error("Original order is required for unsplit.");
+
+  const type = String(orderType || "").trim().toUpperCase();
+  const isSales = type === "SO";
+  const tableName = isSales ? "sales_orders" : "transfer_orders";
+  const lineTableName = isSales ? "sales_order_lines" : "transfer_order_lines";
+  const lineOrderIdColumn = isSales ? "sales_order_id" : "transfer_order_id";
+  const splitPattern = `${originalRef}-S%`;
+
+  const existing = await query(
+    `SELECT netsuite_id, tranid, dispatch_planned, dispatch_plan_date, dispatch_truck_plate, dispatch_load_name, local_yard_order_status
+       FROM ${tableName}
+      WHERE tranid LIKE $1
+        AND ($2::text[] IS NULL OR tranid = ANY($2::text[]))
+      ORDER BY tranid`,
+    [splitPattern, requestedRefs.length ? requestedRefs : null]
+  );
+  const refs = existing.rows.map((row) => String(row.tranid || ""));
+  if (!refs.length) return { deactivated: [], deletedLines: 0 };
+
+  const lineActivity = await query(
+    `SELECT o.tranid,
+            SUM(
+              COALESCE(l.loaded_qty, 0)
+              + COALESCE(l.packed_pallet_qty, 0)
+              + COALESCE(l.packed_layer_qty, 0)
+              + COALESCE(l.packed_section_qty, 0)
+              + COALESCE(l.packed_piece_qty, 0)
+            ) AS activity_qty
+       FROM ${tableName} o
+       LEFT JOIN ${lineTableName} l ON l.${lineOrderIdColumn} = o.netsuite_id
+      WHERE o.tranid = ANY($1::text[])
+      GROUP BY o.tranid`,
+    [refs]
+  );
+  const activityByRef = new Map(lineActivity.rows.map((row) => [String(row.tranid || ""), Number(row.activity_qty || 0)]));
+  const blocked = existing.rows.filter((row) =>
+    row.dispatch_planned === true
+    || row.dispatch_plan_date
+    || row.dispatch_truck_plate
+    || row.dispatch_load_name
+    || activityByRef.get(String(row.tranid || "")) > 0
+  );
+  if (blocked.length) {
+    throw new Error(`Unsplit blocked. Unplan or clear these split orders first: ${blocked.map((row) => row.tranid).join(", ")}.`);
+  }
+
+  const deleted = await query(
+    `DELETE FROM ${lineTableName}
+      WHERE ${lineOrderIdColumn} IN (
+        SELECT netsuite_id FROM ${tableName} WHERE tranid = ANY($1::text[])
+      )`,
+    [refs]
+  );
+  await query(
+    `UPDATE ${tableName}
+        SET netsuite_active = false,
+            dispatch_planned = false,
+            dispatch_plan_date = null,
+            dispatch_truck_plate = null,
+            dispatch_load_name = null,
+            dispatch_parking_spot = null,
+            dispatch_planned_at = null,
+            status_updated_at = now(),
+            synced_at = now()
+      WHERE tranid = ANY($1::text[])`,
+    [refs]
+  );
+  await query(
+    `UPDATE dispatch_plan_snapshots
+        SET orders = (
+              SELECT COALESCE(jsonb_agg(order_item), '[]'::jsonb)
+                FROM jsonb_array_elements(orders) AS order_item
+               WHERE NOT (order_item->>'id' = ANY($1::text[]))
+            ),
+            saved_at = now()
+      WHERE orders::text LIKE $2`,
+    [refs, `%${originalRef}%`]
+  );
+
+  return {
+    deactivated: refs,
+    deletedLines: deleted.rowCount || 0
+  };
+}
+
+export async function getNextDispatchSplitSuffix({ originalOrderId = "", orderType = "" } = {}) {
+  const originalRef = String(originalOrderId || "").trim();
+  if (!originalRef) throw new Error("Original order is required for split numbering.");
+  const type = String(orderType || "").trim().toUpperCase();
+  const tableName = type === "SO" ? "sales_orders" : "transfer_orders";
+  const result = await query(
+    `SELECT COALESCE(MAX(NULLIF(substring(tranid FROM '-S([0-9]+)$'), '')::integer), 0) AS max_suffix
+       FROM ${tableName}
+      WHERE tranid LIKE $1`,
+    [`${originalRef}-S%`]
+  );
+  const maxSuffix = Number(result.rows[0]?.max_suffix || 0);
+  return {
+    originalOrderId: originalRef,
+    nextSuffix: maxSuffix + 1
+  };
 }
 
 export async function getFulfillableDeliveryOrder(orderId) {
@@ -502,13 +2210,15 @@ function fulfillmentLineQuantity(line) {
 }
 
 export async function recordDeliveryFulfillment(orderId, operatorId, { photoDataUrl, payload, response, itemFulfillmentId, itemFulfillmentTranid }) {
-  if (!photoDataUrl || !String(photoDataUrl).startsWith("data:image/")) {
+  if (!isPhotoReference(photoDataUrl)) {
     throw new Error("Photo proof is required.");
   }
   const order = await getDeliveryOrder(orderId);
   if (!order) throw new Error("Delivery order not found.");
+  const lineTarget = canonicalLineTarget(order);
+  const orderTarget = canonicalOrderTarget(order);
   await query(
-    `UPDATE delivery_order_lines
+    `UPDATE ${lineTarget.table}
      SET fulfilled_pallet_qty = GREATEST(
            COALESCE(fulfilled_pallet_qty, 0),
            CASE
@@ -545,8 +2255,9 @@ export async function recordDeliveryFulfillment(orderId, operatorId, { photoData
              ELSE COALESCE(packed_section_qty, 0)
            END
          )
-     WHERE order_id = $1
-       AND line_id = ANY($2::bigint[])`,
+     WHERE ${lineTarget.orderColumn} = $1
+       AND line_id = ANY($2::bigint[])
+       ${lineTarget.extraWhere}`,
     [
       orderId,
       (payload?.item?.items || [])
@@ -584,12 +2295,12 @@ export async function recordDeliveryFulfillment(orderId, operatorId, { photoData
   );
 
   await query(
-    `UPDATE delivery_orders
+    `UPDATE ${orderTarget.table}
      SET fulfillment_status = $2,
          last_item_fulfillment_id = $3,
          last_item_fulfillment_tranid = $4,
          fulfilled_at = now(),
-         operator_status = CASE WHEN $2 = 'fulfilled' THEN 'fulfilled' ELSE 'packed' END,
+         ${orderTarget.statusColumn} = CASE WHEN $2 = 'fulfilled' THEN 'fulfilled' ELSE 'packed' END,
          status_updated_at = now()
      WHERE netsuite_id = $1`,
     [orderId, fulfillmentStatus, itemFulfillmentId || null, itemFulfillmentTranid || null]
@@ -605,6 +2316,368 @@ export async function recordDeliveryFulfillment(orderId, operatorId, { photoData
   return { fulfillmentStatus, itemFulfillmentId, itemFulfillmentTranid };
 }
 
+async function recordLocalCoDeliveryLoad(order, operatorId, { photoDataUrl }) {
+  if (!order || order.order_type !== "co_order") throw new Error("Local CO order not found.");
+  if (String(order.status || "") !== "packed") {
+    throw new Error("Local CO must be packed before loading.");
+  }
+  const validation = buildDeliveryLoadValidation(order);
+  if (!validation.ok) {
+    const error = new Error("Packed quantity must be corrected before loading.");
+    error.code = "DELIVERY_LOAD_VALIDATION_FAILED";
+    error.status = 409;
+    error.validation = validation;
+    throw error;
+  }
+  const loadRecord = await insertOperatorLoadRecord({
+    loadType: "local_co_load",
+    order,
+    operatorId,
+    photoDataUrl,
+    sourceTable: "local_co_orders",
+    sourceRecordId: order.local_co_id || Math.abs(Number(order.netsuite_id)),
+    lineSnapshot: operatorLoadLineSnapshot(order.lines || []),
+    response: {
+      localYardOrderStatus: "Loaded",
+      coStatus: "planned",
+      sourceOrderRef: order.source_order_ref,
+      fromLocation: order.source_location,
+      toLocation: order.destination_location,
+      dispatchPlanDate: order.dispatch_plan_date,
+      dispatchTruckPlate: order.dispatch_truck_plate,
+      dispatchLoadName: order.dispatch_load_name,
+      dispatchParkingSpot: order.dispatch_parking_spot
+    }
+  });
+  await query(
+    `UPDATE local_co_order_lines line
+        SET pallet_qty = COALESCE(line.packed_pallet_qty, 0),
+            layer_qty = COALESCE(line.packed_layer_qty, 0),
+            piece_qty = COALESCE(line.packed_piece_qty, 0),
+            section_qty = COALESCE(line.packed_section_qty, 0),
+            quantity = CASE
+              WHEN (
+                COALESCE(line.to_plt, 0)
+                + COALESCE(line.to_lyr, 0)
+                + COALESCE(line.to_sec, 0)
+                + COALESCE(line.to_pcs, 0)
+              ) > 0 THEN
+                (COALESCE(line.packed_pallet_qty, 0) * COALESCE(line.to_plt, 0))
+                + (COALESCE(line.packed_layer_qty, 0) * COALESCE(line.to_lyr, 0))
+                + (COALESCE(line.packed_section_qty, 0) * COALESCE(line.to_sec, 0))
+                + (COALESCE(line.packed_piece_qty, 0) * COALESCE(line.to_pcs, 0))
+              ELSE
+                COALESCE(line.packed_piece_qty, 0)
+                + COALESCE(line.packed_section_qty, 0)
+                + COALESCE(line.packed_layer_qty, 0)
+                + COALESCE(line.packed_pallet_qty, 0)
+            END
+      FROM local_co_orders co
+      WHERE line.co_id = co.id
+        AND (co.delivery_order_id = $1 OR co.co_ref = $2)`,
+    [order.netsuite_id, order.tranid]
+  );
+  await query(
+    `DELETE FROM local_co_order_lines line
+      USING local_co_orders co
+      WHERE line.co_id = co.id
+        AND (co.delivery_order_id = $1 OR co.co_ref = $2)
+        AND COALESCE(line.pallet_qty, 0) = 0
+        AND COALESCE(line.layer_qty, 0) = 0
+        AND COALESCE(line.section_qty, 0) = 0
+        AND COALESCE(line.piece_qty, 0) = 0
+        AND COALESCE(line.quantity, 0) = 0`,
+    [order.netsuite_id, order.tranid]
+  );
+  const activatedCo = await query(
+    `UPDATE local_co_orders
+        SET status = 'planned',
+            loaded_at = COALESCE(loaded_at, now()),
+            details = details || $2::jsonb,
+            updated_at = now()
+      WHERE delivery_order_id = $1
+         OR co_ref = $3
+      RETURNING co_ref, from_location, to_location`,
+    [
+      order.netsuite_id,
+      JSON.stringify({
+        sourceLoaded: true,
+        sourceLoadedAt: new Date().toISOString(),
+        sourceDeliveryOrderId: order.netsuite_id
+      }),
+      order.tranid
+    ]
+  );
+  await writeAudit({
+    actorOperatorId: operatorId,
+    action: "delivery.local_co.load",
+    orderId: order.netsuite_id,
+    details: {
+      coRef: order.tranid,
+      sourceOrderRef: order.source_order_ref,
+      fromLocation: order.source_location,
+      toLocation: order.destination_location,
+      activatedCo: activatedCo.rows
+    }
+  });
+  return {
+    id: loadRecord?.id || null,
+    localYardOrderStatus: "Loaded",
+    dispatchPlanDate: order.dispatch_plan_date,
+    dispatchTruckPlate: order.dispatch_truck_plate,
+    dispatchLoadName: order.dispatch_load_name,
+    dispatchParkingSpot: order.dispatch_parking_spot,
+    activatedCo: activatedCo.rows,
+    remainingLines: 0
+  };
+}
+
+export async function recordDeliveryLoad(orderId, operatorId, { photoDataUrl }) {
+  if (isDispatchGroupOrderId(orderId)) return recordGroupedDeliveryLoad(orderId, operatorId, { photoDataUrl });
+  if (!isPhotoReference(photoDataUrl)) {
+    throw new Error("Photo proof is required.");
+  }
+  const order = await getDeliveryOrder(orderId);
+  if (!order) throw new Error("Delivery order not found.");
+  if (order.order_type === "co_order") return recordLocalCoDeliveryLoad(order, operatorId, { photoDataUrl });
+  if (!["packed", "loaded"].includes(order.operator_status)) {
+    throw new Error("Order must be packed before loading.");
+  }
+  const validation = buildDeliveryLoadValidation(order);
+  if (!validation.ok) {
+    const error = new Error("Packed quantity must be corrected before loading.");
+    error.code = "DELIVERY_LOAD_VALIDATION_FAILED";
+    error.status = 409;
+    error.validation = validation;
+    throw error;
+  }
+
+  for (const line of order.lines || []) {
+    const packedSalesQty = roundQuantity(linePackedSalesQuantity(line));
+    if (packedSalesQty <= 0) continue;
+    const loadSalesQty = lineLoadSalesQuantity(line);
+    const lineTarget = canonicalLineTarget(order);
+    await query(
+      `UPDATE ${lineTarget.table}
+          SET loaded_qty = LEAST($3, COALESCE(loaded_qty, 0) + $4),
+              loaded_uom = COALESCE(NULLIF(unit, ''), loaded_uom),
+              packed_pallet_qty = 0,
+              packed_layer_qty = 0,
+              packed_piece_qty = 0,
+              packed_section_qty = 0,
+              confirmed = false,
+              confirmed_at = null
+        WHERE ${lineTarget.orderColumn} = $1
+          AND id = $2
+          ${lineTarget.extraWhere}`,
+      [orderId, line.id, roundQuantity(lineRequiredSalesQuantity(line)), loadSalesQty]
+    );
+  }
+
+  const loadedSnapshotOrder = await getDeliveryOrder(orderId);
+  const remainingLines = (loadedSnapshotOrder.lines || []).filter((line) => {
+    if (!line.netsuite_active || !["InvtPart", "NonInvtPart"].includes(line.item_type || "")) return false;
+    return lineRequiredSalesQuantity(line) > lineLoadedSalesQuantity(line) + linePackedSalesQuantity(line) + 0.000001;
+  });
+  const nextStatus = remainingLines.length ? "partial_loaded" : "loaded";
+  const loadRecord = await insertOperatorLoadRecord({
+    loadType: order.order_type === "transfer_order" ? "transfer_order_load" : "sales_order_delivery_load",
+    order,
+    operatorId,
+    photoDataUrl,
+    sourceTable: null,
+    sourceRecordId: null,
+    lineSnapshot: operatorLoadLineSnapshot(loadedSnapshotOrder.lines || order.lines || []),
+    response: {
+      localYardOrderStatus: nextStatus === "loaded" ? "Loaded" : "Partial Loaded",
+      dispatchPlanDate: order.dispatch_plan_date,
+      dispatchTruckPlate: order.dispatch_truck_plate,
+      dispatchLoadName: order.dispatch_load_name,
+      dispatchParkingSpot: order.dispatch_parking_spot,
+      remainingLines: remainingLines.length
+    }
+  });
+
+  await setCanonicalDeliveryStatus(order, nextStatus, {
+    clearPreparing: true,
+    localYardOrderStatus: nextStatus === "loaded" ? "Loaded" : "Partial Loaded"
+  });
+
+  let activatedCo = { rows: [] };
+  if (nextStatus === "loaded") {
+    await query(
+      `UPDATE local_co_orders
+          SET status = 'loaded',
+              loaded_at = now(),
+              updated_at = now()
+        WHERE delivery_order_id = $1`,
+      [orderId]
+    );
+    activatedCo = await query(
+      `UPDATE local_co_orders
+          SET status = 'planned',
+              loaded_at = COALESCE(loaded_at, now()),
+              details = details || $2::jsonb,
+              updated_at = now()
+        WHERE source_order_ref = $1
+          AND status = 'pending_load'
+        RETURNING co_ref, from_location, to_location`,
+      [
+        order.tranid,
+        JSON.stringify({
+          sourceLoaded: true,
+          sourceLoadedAt: new Date().toISOString(),
+          sourceDeliveryOrderId: orderId
+        })
+      ]
+    );
+  }
+
+  await writeAudit({
+    actorOperatorId: operatorId,
+    action: "delivery.order.load",
+    orderId,
+    details: {
+      localYardOrderStatus: nextStatus === "loaded" ? "Loaded" : "Partial Loaded",
+      dispatchPlanDate: order.dispatch_plan_date,
+      dispatchTruckPlate: order.dispatch_truck_plate,
+      dispatchLoadName: order.dispatch_load_name,
+      dispatchParkingSpot: order.dispatch_parking_spot
+      ,
+      activatedCo: activatedCo.rows,
+      remainingLines: remainingLines.length
+    }
+  });
+
+  return {
+    id: loadRecord?.id || null,
+    localYardOrderStatus: nextStatus === "loaded" ? "Loaded" : "Partial Loaded",
+    dispatchPlanDate: order.dispatch_plan_date,
+    dispatchTruckPlate: order.dispatch_truck_plate,
+    dispatchLoadName: order.dispatch_load_name,
+    dispatchParkingSpot: order.dispatch_parking_spot,
+    activatedCo: activatedCo.rows,
+    remainingLines: remainingLines.length
+  };
+}
+
+export async function recordCustomerPickupLoad(orderId, operatorId, { photoDataUrl }) {
+  if (!isPhotoReference(photoDataUrl)) {
+    throw new Error("Photo proof is required.");
+  }
+  const order = await getDeliveryOrder(orderId);
+  if (!order || !isPickupOrder(order)) throw new Error("Customer pickup sales order not found.");
+  const confirmedLines = (order.lines || []).filter((line) => {
+    return positiveQuantity(line.packed_pallet_qty)
+      + positiveQuantity(line.packed_layer_qty)
+      + positiveQuantity(line.packed_piece_qty)
+      + positiveQuantity(line.packed_section_qty) > 0;
+  });
+  if (!confirmedLines.length) throw new Error("Confirm at least one pickup line before loading.");
+  const validation = buildDeliveryLoadValidation(order);
+  if (!validation.ok) {
+    const error = new Error("Packed quantity must be corrected before loading.");
+    error.code = "DELIVERY_LOAD_VALIDATION_FAILED";
+    error.status = 409;
+    error.validation = validation;
+    throw error;
+  }
+
+  const totals = confirmedLines.reduce((sum, line) => ({
+    pallets: sum.pallets + positiveQuantity(line.packed_pallet_qty),
+    layers: sum.layers + positiveQuantity(line.packed_layer_qty),
+    pieces: sum.pieces + positiveQuantity(line.packed_piece_qty),
+    sections: sum.sections + positiveQuantity(line.packed_section_qty),
+    salesQuantity: sum.salesQuantity + roundQuantity(lineLoadSalesQuantity(line))
+  }), { pallets: 0, layers: 0, pieces: 0, sections: 0, salesQuantity: 0 });
+  const loadedUoms = [...new Set(confirmedLines.map((line) => String(line.unit || "").trim()).filter(Boolean))];
+  const loadedUom = loadedUoms.length === 1 ? loadedUoms[0] : loadedUoms.length > 1 ? "MIXED" : "";
+  const aggregateLoadedQty = loadedUom === "MIXED" ? null : roundQuantity(totals.salesQuantity);
+
+  for (const line of confirmedLines) {
+    await query(
+      `UPDATE sales_order_lines
+          SET loaded_qty = LEAST($3, COALESCE(loaded_qty, 0) + $4),
+              loaded_uom = COALESCE(NULLIF(unit, ''), loaded_uom),
+              packed_pallet_qty = 0,
+              packed_layer_qty = 0,
+              packed_piece_qty = 0,
+              packed_section_qty = 0,
+              confirmed = false,
+              confirmed_at = null
+        WHERE sales_order_id = $1
+          AND id = $2`,
+      [
+        orderId,
+        line.id,
+        roundQuantity(lineRequiredSalesQuantity(line)),
+        roundQuantity(lineLoadSalesQuantity(line))
+      ]
+    );
+  }
+
+  await query(
+    `UPDATE sales_order_lines
+        SET packed_pallet_qty = 0,
+            packed_layer_qty = 0,
+            packed_piece_qty = 0,
+            packed_section_qty = 0,
+            confirmed = false,
+            confirmed_at = null
+      WHERE sales_order_id = $1
+        AND (
+          COALESCE(packed_pallet_qty, 0) > 0
+          OR COALESCE(packed_layer_qty, 0) > 0
+          OR COALESCE(packed_piece_qty, 0) > 0
+          OR COALESCE(packed_section_qty, 0) > 0
+        )`,
+    [orderId]
+  );
+
+  const refreshed = await getDeliveryOrder(orderId);
+  const remainingLines = (refreshed.lines || []).filter((line) => {
+    return lineRequiredSalesQuantity(line) > lineLoadedSalesQuantity(line);
+  });
+  const pickupStatus = remainingLines.length ? "partial_loaded" : "loaded";
+
+  await query(
+    `UPDATE sales_orders
+        SET local_yard_order_status = $2,
+            operator_status = $2,
+            status_updated_at = now()
+      WHERE netsuite_id = $1`,
+    [orderId, pickupStatus]
+  );
+
+  const loadRecord = await insertOperatorLoadRecord({
+    loadType: "customer_pickup_load",
+    order,
+    operatorId,
+    photoDataUrl,
+    loadedQty: aggregateLoadedQty,
+    loadedUom,
+    sourceTable: null,
+    sourceRecordId: null,
+    lineSnapshot: operatorLoadLineSnapshot(refreshed.lines || []),
+    response: { pickupStatus, tranid: order.tranid, loadedQty: aggregateLoadedQty, loadedUom }
+  });
+
+  await writeAudit({
+    actorOperatorId: operatorId,
+    action: "customer_pickup.order.load",
+    orderId,
+    details: { pickupStatus, totals, loadedQty: aggregateLoadedQty, loadedUom, remainingLines: remainingLines.length }
+  });
+
+  return {
+    id: loadRecord?.id || null,
+    pickupStatus,
+    localYardOrderStatus: pickupStatus,
+    loaded: { ...totals, salesQuantity: aggregateLoadedQty, uom: loadedUom },
+    remainingLines: remainingLines.length
+  };
+}
+
 export async function recordDeliveryFulfillmentFailure(orderId, operatorId, { photoDataUrl, payload, error, stage }) {
   const message = error?.message || String(error || "Unknown fulfillment error");
   try {
@@ -615,7 +2688,7 @@ export async function recordDeliveryFulfillmentFailure(orderId, operatorId, { ph
       [
         orderId,
         operatorId || null,
-        photoDataUrl && String(photoDataUrl).startsWith("data:image/") ? photoDataUrl : "",
+        isPhotoReference(photoDataUrl) ? photoDataUrl : "",
         JSON.stringify(payload || {}),
         JSON.stringify({ error: message, stage: stage || null })
       ]
@@ -635,246 +2708,914 @@ export async function recordDeliveryFulfillmentFailure(orderId, operatorId, { ph
 export async function listDeliveryFulfillments({ limit = 100 } = {}) {
   const safeLimit = Math.min(Math.max(Number(limit) || 100, 1), 500);
   const result = await query(
-    `SELECT f.id,
-            f.order_id,
-            o.tranid,
-            f.item_fulfillment_id,
-            f.item_fulfillment_tranid,
-            f.fulfillment_status,
-            f.created_at,
+    `SELECT l.id,
+            l.order_id,
+            l.order_ref AS tranid,
+            null::bigint AS item_fulfillment_id,
+            null::text AS item_fulfillment_tranid,
+            l.load_type AS fulfillment_status,
+            l.created_at,
             op.display_name AS operator_name,
-            f.payload,
-            f.response,
-            left(f.photo_data_url, 80) AS photo_preview
-     FROM delivery_fulfillment_records f
-     LEFT JOIN delivery_orders o ON o.netsuite_id = f.order_id
-     LEFT JOIN operators op ON op.id = f.operator_id
-     ORDER BY f.created_at DESC
+            jsonb_build_object(
+              'orderFamily', l.order_family,
+              'loadedQty', l.loaded_qty,
+              'loadedUom', l.loaded_uom,
+              'lines', l.line_snapshot
+            ) AS payload,
+            l.response,
+            left(l.photo_data_url, 80) AS photo_preview
+     FROM operator_load_records l
+     LEFT JOIN operators op ON op.id = l.operator_id
+     ORDER BY l.created_at DESC
      LIMIT ${safeLimit}`
   );
   return result.rows;
 }
 
-export async function upsertDeliveryOrderLines(orderId, lines) {
-  for (const line of lines) {
-    const normalized = {
-      line_id: line.line_id,
-      item_id: line.item_id,
-      item_name: line.item_name,
-      item_type: line.item_type,
-      item_type_text: line.item_type_text,
-      item_description: line.item_description,
-      sku: line.item_name,
-      quantity: normalizeQuantity(line.quantity),
-      unit: line.unit,
-      location_id: line.location_id,
-      location: line.location,
-      pallet_qty: normalizeQuantity(line.pallet_qty),
-      layer_qty: normalizeQuantity(line.layer_qty),
-      piece_qty: normalizeQuantity(line.piece_qty),
-      section_qty: normalizeQuantity(line.section_qty),
-      to_plt: normalizeNumber(line.to_plt),
-      to_lyr: normalizeNumber(line.to_lyr),
-      to_sec: normalizeNumber(line.to_sec),
-      to_pcs: normalizeNumber(line.to_pcs),
-      section: line.section || null
-    };
-    const existing = await query(
-      `SELECT line_id, item_id, item_name, item_type, item_type_text,
-              item_description, sku, quantity, unit, location_id, location,
-              pallet_qty, layer_qty, piece_qty, section_qty, section
-       FROM delivery_order_lines
-       WHERE order_id = $1
-         AND line_id = $2`,
-      [orderId, normalized.line_id]
-    );
-
-    await query(
-      `INSERT INTO delivery_order_lines (
-        order_id, line_id, item_id, item_name, item_type, item_type_text,
-        item_description, sku, quantity,
-        unit, location_id, location, pallet_qty, layer_qty, piece_qty,
-        section_qty, to_plt, to_lyr, to_sec, to_pcs, section, raw, synced_at
-      ) VALUES (
-        $1, $2, $3, $4, $5, $6,
-        $7, $8, $9, $10, $11, $12, $13, $14, $15,
-        $16, $17, $18, $19, $20, $21, $22, now()
-      )
-      ON CONFLICT (order_id, line_id) DO UPDATE SET
-        item_id = EXCLUDED.item_id,
-        item_name = EXCLUDED.item_name,
-        item_type = EXCLUDED.item_type,
-        item_type_text = EXCLUDED.item_type_text,
-        item_description = EXCLUDED.item_description,
-        sku = EXCLUDED.sku,
-        quantity = EXCLUDED.quantity,
-        unit = EXCLUDED.unit,
-        location_id = EXCLUDED.location_id,
-        location = EXCLUDED.location,
-        sync_exception = CASE
-          WHEN (
-            COALESCE(delivery_order_lines.packed_pallet_qty, 0) > COALESCE(EXCLUDED.pallet_qty, 0)
-            OR COALESCE(delivery_order_lines.packed_layer_qty, 0) > COALESCE(EXCLUDED.layer_qty, 0)
-            OR COALESCE(delivery_order_lines.packed_piece_qty, 0) > COALESCE(EXCLUDED.piece_qty, EXCLUDED.quantity, 0)
-            OR COALESCE(delivery_order_lines.packed_section_qty, 0) > COALESCE(EXCLUDED.section_qty, 0)
-          ) THEN 'qty_reduced'
-          ELSE null
-        END,
-        sync_exception_at = CASE
-          WHEN (
-            COALESCE(delivery_order_lines.packed_pallet_qty, 0) > COALESCE(EXCLUDED.pallet_qty, 0)
-            OR COALESCE(delivery_order_lines.packed_layer_qty, 0) > COALESCE(EXCLUDED.layer_qty, 0)
-            OR COALESCE(delivery_order_lines.packed_piece_qty, 0) > COALESCE(EXCLUDED.piece_qty, EXCLUDED.quantity, 0)
-            OR COALESCE(delivery_order_lines.packed_section_qty, 0) > COALESCE(EXCLUDED.section_qty, 0)
-          ) THEN now()
-          ELSE null
-        END,
-        pallet_qty = EXCLUDED.pallet_qty,
-        layer_qty = EXCLUDED.layer_qty,
-        piece_qty = EXCLUDED.piece_qty,
-        section_qty = EXCLUDED.section_qty,
-        to_plt = EXCLUDED.to_plt,
-        to_lyr = EXCLUDED.to_lyr,
-        to_sec = EXCLUDED.to_sec,
-        to_pcs = EXCLUDED.to_pcs,
-        section = EXCLUDED.section,
-        netsuite_active = true,
-        raw = EXCLUDED.raw,
-        synced_at = now()`,
-      [
-        orderId,
-        normalized.line_id,
-        normalized.item_id,
-        normalized.item_name,
-        normalized.item_type,
-        normalized.item_type_text,
-        normalized.item_description,
-        normalized.sku,
-        normalized.quantity,
-        normalized.unit,
-        normalized.location_id,
-        normalized.location,
-        normalized.pallet_qty,
-        normalized.layer_qty,
-        normalized.piece_qty,
-        normalized.section_qty,
-        normalized.to_plt,
-        normalized.to_lyr,
-        normalized.to_sec,
-        normalized.to_pcs,
-        normalized.section,
-        JSON.stringify(line)
-      ]
-    );
-
-    const fields = [
-      "line_id", "item_id", "item_name", "item_type", "item_type_text",
-      "item_description", "sku", "quantity", "unit", "location_id", "location",
-      "pallet_qty", "layer_qty", "piece_qty", "section_qty", "to_plt", "to_lyr", "to_sec", "to_pcs", "section"
-    ];
-    const changes = existing.rowCount ? changedFields(existing.rows[0], normalized, fields) : {};
-    if (!existing.rowCount || Object.keys(changes).length) {
-      await writeAudit({
-        actorType: "system",
-        source: "netsuite",
-        action: existing.rowCount ? "netsuite.line.update" : "netsuite.line.discover",
-        orderId,
-        lineId: normalized.line_id,
-        details: existing.rowCount ? { changes } : { line: normalized }
-      });
-    }
-  }
+function normalizeControlDate(value, fallback = new Date()) {
+  const text = String(value || "").trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return text;
+  return [
+    fallback.getFullYear(),
+    String(fallback.getMonth() + 1).padStart(2, "0"),
+    String(fallback.getDate()).padStart(2, "0")
+  ].join("-");
 }
 
-export async function markMissingDeliveryOrderLines(orderId, activeLineIds) {
-  const ids = activeLineIds.map((id) => Number(id)).filter((id) => Number.isInteger(id));
-  const result = await query(
-    `UPDATE delivery_order_lines
-     SET netsuite_active = false,
-         sync_exception = CASE WHEN (${packedQtySql}) > 0 THEN 'line_deleted' ELSE sync_exception END,
-         sync_exception_at = CASE WHEN (${packedQtySql}) > 0 THEN now() ELSE sync_exception_at END,
-         synced_at = now()
-     WHERE order_id = $1
-       AND NOT (line_id = ANY($2::bigint[]))
-       AND netsuite_active = true
-     RETURNING line_id, item_name, (${packedQtySql}) AS packed_qty, sync_exception`,
-    [orderId, ids]
-  );
-
-  for (const row of result.rows) {
-    await writeAudit({
-      actorType: "system",
-      source: "netsuite",
-      action: "netsuite.line.missing",
-      orderId,
-      lineId: row.line_id,
-      details: row
-    });
+function loadedOrderFilterParams({ from = "", to = "", yard = "all", search = "" } = {}) {
+  const fromDate = normalizeControlDate(from);
+  const toDate = normalizeControlDate(to || fromDate);
+  const params = [fromDate, toDate];
+  const clauses = [
+    "l.load_type IN ('sales_order_delivery_load', 'transfer_order_load')",
+    "l.created_at >= $1::date",
+    "l.created_at < ($2::date + interval '1 day')"
+  ];
+  if (yard && yard !== "all") {
+    params.push(String(yard));
+    clauses.push("source.outbound_location_id::text = $" + params.length);
   }
+  if (String(search || "").trim()) {
+    params.push(`%${String(search).trim()}%`);
+    clauses.push(`(
+      source.tranid ILIKE $${params.length}
+      OR source.customer ILIKE $${params.length}
+      OR source.order_id::text ILIKE $${params.length}
+    )`);
+  }
+  return { params, where: clauses.join("\n        AND ") };
+}
+
+function loadedOrderSourceCte() {
+  return `
+    WITH source AS (
+      SELECT 'sales_order'::text AS order_type,
+             o.netsuite_id AS order_id,
+             o.tranid,
+             o.customer,
+             o.outbound_location_id,
+             o.outbound_location,
+             o.local_yard_order_status,
+             o.operator_status AS operator_status
+        FROM sales_orders o
+      UNION ALL
+      SELECT 'transfer_order'::text AS order_type,
+             o.netsuite_id AS order_id,
+             o.tranid,
+             NULL::text AS customer,
+             o.from_location_id AS outbound_location_id,
+             o.from_location AS outbound_location,
+             o.local_yard_order_status,
+             o.outbound_operator_status AS operator_status
+        FROM transfer_orders o
+    )
+  `;
+}
+
+export async function listControlLoadedOrders(filters = {}) {
+  const { params, where } = loadedOrderFilterParams(filters);
+  const result = await query(
+    `${loadedOrderSourceCte()}
+     SELECT source.order_type,
+            source.order_id,
+            source.tranid,
+            source.customer,
+            source.outbound_location_id,
+            source.outbound_location,
+            source.local_yard_order_status,
+            source.operator_status,
+            MIN(l.created_at) AS first_loaded_at,
+            MAX(l.created_at) AS last_loaded_at,
+            COUNT(DISTINCT l.id)::int AS load_count,
+            COUNT(*) FILTER (WHERE COALESCE(l.photo_data_url, '') <> '')::int AS photo_count
+       FROM operator_load_records l
+       JOIN source ON source.order_id = l.order_id
+                  AND source.order_type = l.order_family
+      WHERE ${where}
+      GROUP BY source.order_type, source.order_id, source.tranid, source.customer,
+               source.outbound_location_id, source.outbound_location,
+               source.local_yard_order_status, source.operator_status
+      ORDER BY MAX(l.created_at) DESC, source.tranid`
+    ,
+    params
+  );
+  return result.rows;
+}
+
+export async function getControlLoadedOrderDetail({ orderType, orderId, from = "", to = "" } = {}) {
+  const family = orderType === "transfer_order" ? "transfer_order" : "sales_order";
+  const fromDate = normalizeControlDate(from);
+  const toDate = normalizeControlDate(to || fromDate);
+  const isTransfer = family === "transfer_order";
+  const orderResult = await query(
+    isTransfer
+      ? `SELECT 'transfer_order'::text AS order_type, netsuite_id AS order_id, tranid, NULL::text AS customer,
+                from_location_id AS outbound_location_id, from_location AS outbound_location,
+                local_yard_order_status, outbound_operator_status AS operator_status
+           FROM transfer_orders
+          WHERE netsuite_id = $1`
+      : `SELECT 'sales_order'::text AS order_type, netsuite_id AS order_id, tranid, customer,
+                outbound_location_id, outbound_location, local_yard_order_status,
+                operator_status
+           FROM sales_orders
+          WHERE netsuite_id = $1`,
+    [orderId]
+  );
+  if (!orderResult.rowCount) return null;
+
+  const lineResult = await query(
+    isTransfer
+      ? `SELECT id, line_id, item_id, item_name, sku, item_description,
+                loaded_qty, COALESCE(NULLIF(loaded_uom, ''), unit) AS loaded_uom,
+                location_id, location
+           FROM transfer_order_lines
+          WHERE transfer_order_id = $1
+            AND line_stage = 'outbound'
+            AND COALESCE(loaded_qty, 0) > 0
+          ORDER BY line_id NULLS LAST, id`
+      : `SELECT id, line_id, item_id, item_name, sku, item_description,
+                loaded_qty, COALESCE(NULLIF(loaded_uom, ''), unit) AS loaded_uom,
+                location_id, location
+           FROM sales_order_lines
+          WHERE sales_order_id = $1
+            AND COALESCE(loaded_qty, 0) > 0
+          ORDER BY line_id NULLS LAST, id`,
+    [orderId]
+  );
+  const photoResult = await query(
+    `SELECT id, created_at, photo_data_url, response
+       FROM operator_load_records
+      WHERE order_family = $1
+        AND order_id = $2
+        AND load_type IN ('sales_order_delivery_load', 'transfer_order_load')
+        AND created_at >= $3::date
+        AND created_at < ($4::date + interval '1 day')
+      ORDER BY created_at DESC`,
+    [family, orderId, fromDate, toDate]
+  );
+  return {
+    order: orderResult.rows[0],
+    lines: lineResult.rows,
+    photos: photoResult.rows
+  };
+}
+
+export async function listControlLoadedOrderCsvRows(filters = {}) {
+  const orders = await listControlLoadedOrders(filters);
+  const rows = [];
+  for (const order of orders) {
+    const isTransfer = order.order_type === "transfer_order";
+    const lineResult = await query(
+      isTransfer
+        ? `SELECT $2::text AS order_ref, item_name, loaded_qty, COALESCE(NULLIF(loaded_uom, ''), unit) AS loaded_uom, location
+             FROM transfer_order_lines
+            WHERE transfer_order_id = $1
+              AND line_stage = 'outbound'
+              AND COALESCE(loaded_qty, 0) > 0
+            ORDER BY line_id NULLS LAST, id`
+        : `SELECT $2::text AS order_ref, item_name, loaded_qty, COALESCE(NULLIF(loaded_uom, ''), unit) AS loaded_uom, location
+             FROM sales_order_lines
+            WHERE sales_order_id = $1
+              AND COALESCE(loaded_qty, 0) > 0
+            ORDER BY line_id NULLS LAST, id`,
+      [order.order_id, order.tranid]
+    );
+    rows.push(...lineResult.rows);
+  }
+  return rows;
 }
 
 async function assertOrderEditable(orderId, operatorId) {
-  const result = await query(
-    `SELECT operator_status, preparing_operator_id
-     FROM delivery_orders
-     WHERE netsuite_id = $1`,
-    [orderId]
-  );
-  const order = result.rows[0];
+  const order = await getDeliveryOrder(orderId);
   if (!order) throw new Error("Delivery order not found.");
-  if (order.operator_status === "preparing" && order.preparing_operator_id && order.preparing_operator_id !== operatorId) {
+  if (order.operator_status === "preparing" && order.preparing_operator_id && String(order.preparing_operator_id) !== String(operatorId)) {
     throw new Error("This order is preparing on another tablet.");
   }
+  if (!["packed", "loaded", "fulfilled"].includes(order.operator_status || "") && order.preparing_operator_id && String(order.preparing_operator_id) !== String(operatorId)) {
+    const hasDraftPackedQty = (order.lines || []).some((line) => {
+      return ["InvtPart", "NonInvtPart"].includes(line.item_type || "")
+        && (
+          positiveQuantity(line.packed_pallet_qty) > 0
+          || positiveQuantity(line.packed_layer_qty) > 0
+          || positiveQuantity(line.packed_section_qty) > 0
+          || positiveQuantity(line.packed_piece_qty) > 0
+        );
+    });
+    if (hasDraftPackedQty) throw new Error("This order is preparing on another tablet.");
+  }
+  return order;
+}
+
+function orderHasPackedQuantity(order) {
+  return (order?.lines || []).some((line) => {
+    return ["InvtPart", "NonInvtPart"].includes(line.item_type || "")
+      && linePackedSalesQuantity(line) > 0;
+  });
+}
+
+function isLocalCoDeliveryOrder(order) {
+  return order?.order_type === "co_order";
+}
+
+async function setLocalCoDeliveryStatus(order, status, { clearPreparing = false } = {}) {
+  const coStatus = status === "packed" ? "packed"
+    : status === "preparing" ? "preparing"
+      : "pending_load";
+  const setClauses = [
+    "status = $2",
+    "updated_at = now()"
+  ];
+  if (clearPreparing) {
+    setClauses.push("preparing_operator_id = null", "preparing_started_at = null");
+  }
+  await query(
+    `UPDATE local_co_orders
+        SET ${setClauses.join(", ")}
+      WHERE delivery_order_id = $1
+         OR co_ref = $3`,
+    [order.netsuite_id, coStatus, order.tranid]
+  );
+}
+
+async function claimLocalCoPreparingOrder(order, operatorId) {
+  if (order.status === "preparing" && order.preparing_operator_id && String(order.preparing_operator_id) !== String(operatorId)) {
+    throw new Error("This CO is preparing on another tablet.");
+  }
+  await query(
+    `UPDATE local_co_orders
+        SET status = CASE WHEN status = 'pending_load' THEN 'preparing' ELSE status END,
+            preparing_operator_id = CASE WHEN status <> 'packed' THEN $2 ELSE preparing_operator_id END,
+            preparing_started_at = CASE WHEN status <> 'packed' THEN COALESCE(preparing_started_at, now()) ELSE preparing_started_at END,
+            updated_at = now()
+      WHERE delivery_order_id = $1
+         OR co_ref = $3`,
+    [order.netsuite_id, operatorId, order.tranid]
+  );
+  return getDeliveryOrder(order.tranid);
+}
+
+async function updateLocalCoLinePackedQuantity(order, lineId, next) {
+  await query(
+    `UPDATE local_co_order_lines line
+        SET packed_pallet_qty = $3,
+            packed_layer_qty = $4,
+            packed_piece_qty = $5,
+            packed_section_qty = $6,
+            confirmed_at = CASE WHEN ($3::numeric + $4::numeric + $5::numeric + $6::numeric) > 0 THEN COALESCE(confirmed_at, now()) ELSE null END
+      FROM local_co_orders co
+      WHERE line.co_id = co.id
+        AND (co.delivery_order_id = $1 OR co.co_ref = $7)
+        AND line.id = $2`,
+    [order.netsuite_id, lineId, next.pallets, next.layers, next.pieces, next.sections, order.tranid]
+  );
+}
+
+async function confirmLocalCoDeliveryLine(orderId, lineId, values, operatorId, { absolute = false } = {}) {
+  const currentOrder = await getDeliveryOrder(orderId);
+  if (!currentOrder || !isLocalCoDeliveryOrder(currentOrder)) throw new Error("Local CO order not found.");
+  const order = await claimLocalCoPreparingOrder(currentOrder, operatorId);
+  const line = (order.lines || []).find((item) => String(item.id) === String(lineId));
+  if (!line) throw new Error("Local CO line not found.");
+  const available = remainingPackAvailability(line);
+  const valuesToApply = {
+    pallets: normalizeQuantity(values?.pallets) || 0,
+    layers: normalizeQuantity(values?.layers) || 0,
+    pieces: normalizeQuantity(values?.pieces) || 0,
+    sections: normalizeQuantity(values?.sections) || 0
+  };
+  const next = absolute
+    ? {
+      pallets: Math.min(available.pallets, valuesToApply.pallets),
+      layers: Math.min(available.layers, valuesToApply.layers),
+      pieces: Math.min(available.pieces, valuesToApply.pieces),
+      sections: Math.min(available.sections, valuesToApply.sections)
+    }
+    : {
+      pallets: Math.min(available.pallets, positiveQuantity(line.packed_pallet_qty) + valuesToApply.pallets),
+      layers: Math.min(available.layers, positiveQuantity(line.packed_layer_qty) + valuesToApply.layers),
+      pieces: Math.min(available.pieces, positiveQuantity(line.packed_piece_qty) + valuesToApply.pieces),
+      sections: Math.min(available.sections, positiveQuantity(line.packed_section_qty) + valuesToApply.sections)
+    };
+  await updateLocalCoLinePackedQuantity(order, lineId, next);
+  await writeAudit({
+    actorOperatorId: operatorId,
+    action: absolute ? "delivery.local_co.line.update_packed_quantity" : "delivery.local_co.line.confirm",
+    orderId: order.netsuite_id,
+    lineId,
+    details: { coRef: order.tranid, pallets: next.pallets, layers: next.layers, pieces: next.pieces, sections: next.sections }
+  });
+}
+
+async function findActiveDraftOrder(operatorId, orderId) {
+  const result = await query(
+    `SELECT netsuite_id
+       FROM (
+         SELECT o.netsuite_id
+           FROM sales_orders o
+         WHERE o.netsuite_id <> $2
+            AND (
+              (o.operator_status = 'preparing' AND o.preparing_operator_id::text = $1)
+              OR (
+                o.operator_status <> 'packed'
+                AND o.preparing_operator_id::text = $1
+                AND EXISTS (
+                  SELECT 1
+                    FROM sales_order_lines l
+                   WHERE l.sales_order_id = o.netsuite_id
+                     AND COALESCE(l.item_type, '') IN ('InvtPart', 'NonInvtPart')
+                     AND (${packedQtySql}) > 0
+                )
+              )
+            )
+         UNION ALL
+         SELECT o.netsuite_id
+           FROM transfer_orders o
+          WHERE o.netsuite_id <> $2
+            AND (
+              (o.outbound_operator_status = 'preparing' AND o.preparing_operator_id::text = $1)
+              OR (
+                o.outbound_operator_status <> 'packed'
+                AND o.preparing_operator_id::text = $1
+                AND EXISTS (
+                  SELECT 1
+                    FROM transfer_order_lines l
+                   WHERE l.transfer_order_id = o.netsuite_id
+                     AND l.line_stage = 'outbound'
+                     AND COALESCE(l.item_type, '') IN ('InvtPart', 'NonInvtPart')
+                     AND (${packedQtySql}) > 0
+                )
+              )
+            )
+         UNION ALL
+         SELECT o.delivery_order_id AS netsuite_id
+           FROM local_co_orders o
+          WHERE o.delivery_order_id::text <> $2::text
+            AND o.status = 'preparing'
+            AND o.preparing_operator_id::text = $1
+       ) active_draft
+      LIMIT 1`,
+    [operatorId, orderId]
+  );
+  return result.rows[0]?.netsuite_id || null;
+}
+
+async function recordGroupedDeliveryLoad(groupId, operatorId, { photoDataUrl }) {
+  if (!isPhotoReference(photoDataUrl)) {
+    throw new Error("Photo proof is required.");
+  }
+  const groupOrder = await getDispatchGroupDeliveryOrder(groupId);
+  if (!groupOrder) throw new Error("Grouped delivery order not found.");
+  const childOrders = (await Promise.all(groupChildOrderIds(groupOrder).map((id) => getDeliveryOrder(id)))).filter(Boolean);
+  const loadResults = [];
+  const validations = [];
+  for (const child of childOrders) {
+    if (!(child.lines || []).some(lineHasPackedQuantity)) continue;
+    const validation = buildDeliveryLoadValidation(child);
+    if (!validation.ok) validations.push(...(validation.issues || []).map((issue) => ({ ...issue, orderRef: child.tranid })));
+  }
+  if (validations.length) {
+    const error = new Error("Packed quantity must be corrected before loading.");
+    error.code = "DELIVERY_LOAD_VALIDATION_FAILED";
+    error.status = 409;
+    error.validation = { ok: false, issues: validations };
+    throw error;
+  }
+  const groupLoadRef = crypto.randomUUID();
+  for (const child of childOrders) {
+    if (!(child.lines || []).some(lineHasPackedQuantity)) continue;
+    if (!["packed", "loaded"].includes(child.operator_status)) {
+      await setCanonicalDeliveryStatus(child, "packed", { clearPreparing: true });
+    }
+    const result = await recordDeliveryLoad(child.netsuite_id, operatorId, { photoDataUrl });
+    if (result?.id) {
+      await query(
+        `UPDATE operator_load_records
+            SET response = COALESCE(response, '{}'::jsonb) || $2::jsonb
+          WHERE id = $1`,
+        [
+          result.id,
+          JSON.stringify({
+            dispatchGroupId: normalizeDispatchGroupId(groupId),
+            groupedOrderRef: groupOrder.tranid,
+            groupLoadRef
+          })
+        ]
+      );
+    }
+    loadResults.push({ orderId: child.netsuite_id, tranid: child.tranid, ...result });
+  }
+  if (!loadResults.length) throw new Error("No packed grouped lines to load.");
+  await writeAudit({
+    actorOperatorId: operatorId,
+    action: "delivery.group.order.load",
+    details: {
+      groupId: normalizeDispatchGroupId(groupId),
+      childOrders: childOrders.map((order) => order.tranid),
+      loadRecordIds: loadResults.map((item) => item.id).filter(Boolean)
+    }
+  });
+  const refreshed = await getDispatchGroupDeliveryOrder(groupId);
+  return {
+    id: loadResults[0]?.id || null,
+    groupLoad: true,
+    groupLoadRef,
+    sourceLoadRecords: loadResults,
+    localYardOrderStatus: refreshed?.local_yard_order_status || "Partial Loaded",
+    dispatchPlanDate: groupOrder.dispatch_plan_date,
+    dispatchTruckPlate: groupOrder.dispatch_truck_plate,
+    dispatchLoadName: groupOrder.dispatch_load_name,
+    dispatchParkingSpot: groupOrder.dispatch_parking_spot,
+    remainingLines: (refreshed?.lines || []).filter(lineHasOpenQuantity).length
+  };
+}
+
+async function findActiveDraftOrderExcluding(operatorId, excludedOrderIds = []) {
+  const excluded = (excludedOrderIds || []).map((id) => String(id)).filter(Boolean);
+  const result = await query(
+    `SELECT netsuite_id
+       FROM (
+         SELECT o.netsuite_id
+           FROM sales_orders o
+          WHERE NOT (o.netsuite_id::text = ANY($2::text[]))
+            AND (
+              (o.operator_status = 'preparing' AND o.preparing_operator_id::text = $1)
+              OR (
+                o.operator_status <> 'packed'
+                AND o.preparing_operator_id::text = $1
+                AND EXISTS (
+                  SELECT 1
+                    FROM sales_order_lines l
+                   WHERE l.sales_order_id = o.netsuite_id
+                     AND COALESCE(l.item_type, '') IN ('InvtPart', 'NonInvtPart')
+                     AND (${packedQtySql}) > 0
+                )
+              )
+            )
+         UNION ALL
+         SELECT o.netsuite_id
+           FROM transfer_orders o
+          WHERE NOT (o.netsuite_id::text = ANY($2::text[]))
+            AND (
+              (o.outbound_operator_status = 'preparing' AND o.preparing_operator_id::text = $1)
+              OR (
+                o.outbound_operator_status <> 'packed'
+                AND o.preparing_operator_id::text = $1
+                AND EXISTS (
+                  SELECT 1
+                    FROM transfer_order_lines l
+                   WHERE l.transfer_order_id = o.netsuite_id
+                     AND l.line_stage = 'outbound'
+                     AND COALESCE(l.item_type, '') IN ('InvtPart', 'NonInvtPart')
+                     AND (${packedQtySql}) > 0
+                )
+              )
+            )
+       ) active_draft
+      LIMIT 1`,
+    [operatorId, excluded]
+  );
+  return result.rows[0]?.netsuite_id || null;
+}
+
+async function assertGroupEditable(groupOrder, operatorId) {
+  const childIds = groupChildOrderIds(groupOrder);
+  if (!childIds.length) throw new Error("Grouped delivery order has no source order.");
+  const childOrders = Array.isArray(groupOrder.child_orders) && groupOrder.child_orders.length
+    ? groupOrder.child_orders
+    : (await Promise.all(childIds.map((childId) => assertOrderEditable(childId, operatorId))));
+  for (const child of childOrders.filter(Boolean)) {
+    if (child.preparing_operator_id && String(child.preparing_operator_id) !== String(operatorId)) {
+      throw new Error(`${child.tranid} is preparing on another tablet.`);
+    }
+  }
+  return childIds;
+}
+
+async function claimPreparingGroupOrder(groupOrder, operatorId) {
+  const childIds = await assertGroupEditable(groupOrder, operatorId);
+  const existing = await findActiveDraftOrderExcluding(operatorId, childIds);
+  if (existing) throw new Error("Pack your current preparing order before moving on.");
+
+  const target = canonicalOrderTarget(groupOrder);
+  await query(
+    `UPDATE ${target.table}
+        SET ${target.statusColumn} = CASE WHEN ${target.statusColumn} = 'open' THEN 'preparing' ELSE ${target.statusColumn} END,
+            preparing_operator_id = CASE WHEN ${target.statusColumn} <> 'packed' THEN $2 ELSE preparing_operator_id END,
+            preparing_started_at = CASE WHEN ${target.statusColumn} <> 'packed' THEN COALESCE(preparing_started_at, now()) ELSE preparing_started_at END,
+            status_updated_at = now()
+      WHERE netsuite_id = ANY($1::bigint[])`,
+    [childIds.map((id) => Number(id)).filter((id) => Number.isInteger(id)), operatorId]
+  );
+  return groupOrder;
+}
+
+function sourceLinesForGroupLine(groupOrder, groupLineId) {
+  const aggregate = (groupOrder.lines || []).find((line) => String(line.id) === String(groupLineId));
+  if (!aggregate) throw new Error("Grouped delivery line not found.");
+  const sources = [];
+  for (const source of aggregate.source_lines || []) {
+    const child = (groupOrder.child_order_ids || []).includes(source.orderId)
+      ? null
+      : null;
+    sources.push(source);
+  }
+  return { aggregate, sources };
+}
+
+async function resolveGroupSourceLines(groupOrder, groupLineId) {
+  const { aggregate } = sourceLinesForGroupLine(groupOrder, groupLineId);
+  const childOrders = Array.isArray(groupOrder.child_orders) && groupOrder.child_orders.length
+    ? groupOrder.child_orders
+    : (await Promise.all(groupChildOrderIds(groupOrder).map((id) => getDeliveryOrder(id)))).filter(Boolean);
+  const sourceSet = new Set((aggregate.source_lines || []).map((source) => `${source.orderId}:${source.lineId}`));
+  const lines = [];
+  for (const order of childOrders) {
+    for (const line of order.lines || []) {
+      if (sourceSet.has(`${order.netsuite_id}:${line.id}`)) lines.push({ order, line });
+    }
+  }
+  return { aggregate, lines };
+}
+
+function unitFieldMap() {
+  return {
+    pallets: "packed_pallet_qty",
+    layers: "packed_layer_qty",
+    pieces: "packed_piece_qty",
+    sections: "packed_section_qty"
+  };
+}
+
+async function updateSourceLinePackedQuantity(order, line, next) {
+  const lineTarget = canonicalLineTarget(order);
+  await query(
+    `UPDATE ${lineTarget.table}
+        SET packed_pallet_qty = $3,
+            packed_layer_qty = $4,
+            packed_piece_qty = $5,
+            packed_section_qty = $6,
+            confirmed = ($3::numeric + $4::numeric + $5::numeric + $6::numeric) > 0,
+            confirmed_at = CASE WHEN ($3::numeric + $4::numeric + $5::numeric + $6::numeric) > 0 THEN COALESCE(confirmed_at, now()) ELSE null END
+      WHERE ${lineTarget.orderColumn} = $1
+        AND sync_exception IS NULL
+        AND id = $2
+        ${lineTarget.extraWhere}`,
+    [order.netsuite_id, line.id, next.pallets, next.layers, next.pieces, next.sections]
+  );
+}
+
+async function applyGroupedLinePackedQuantityToOrder(groupOrder, lineId, values, operatorId, { absolute = false, claim = true, audit = true } = {}) {
+  if (claim) await claimPreparingGroupOrder(groupOrder, operatorId);
+  const { lines } = await resolveGroupSourceLines(groupOrder, lineId);
+  if (!lines.length) throw new Error("Grouped delivery line not found.");
+  const requested = {
+    pallets: normalizeQuantity(values?.pallets) || 0,
+    layers: normalizeQuantity(values?.layers) || 0,
+    pieces: normalizeQuantity(values?.pieces) || 0,
+    sections: normalizeQuantity(values?.sections) || 0
+  };
+  const packedFields = unitFieldMap();
+  const working = lines.map(({ order, line }) => {
+    const available = remainingPackAvailability(line);
+    const current = {
+      pallets: positiveQuantity(line.packed_pallet_qty),
+      layers: positiveQuantity(line.packed_layer_qty),
+      pieces: positiveQuantity(line.packed_piece_qty),
+      sections: positiveQuantity(line.packed_section_qty)
+    };
+    return {
+      order,
+      line,
+      next: absolute ? { pallets: 0, layers: 0, pieces: 0, sections: 0 } : { ...current },
+      capacity: Object.fromEntries(Object.keys(packedFields).map((unit) => [
+        unit,
+        positiveQuantity(available[unit]) + (absolute ? current[unit] : 0)
+      ]))
+    };
+  });
+
+  for (const unit of Object.keys(packedFields)) {
+    let remaining = positiveQuantity(requested[unit]);
+    for (const source of working) {
+      if (remaining <= 0) break;
+      const canAdd = Math.max(0, source.capacity[unit] - (absolute ? source.next[unit] : positiveQuantity(source.next[unit] - positiveQuantity(source.line[packedFields[unit]]))));
+      const add = Math.min(canAdd, remaining);
+      source.next[unit] = roundQuantity(source.next[unit] + add);
+      remaining = roundQuantity(remaining - add);
+    }
+  }
+
+  for (const source of working) {
+    await updateSourceLinePackedQuantity(source.order, source.line, source.next);
+  }
+  if (audit) {
+    await writeAudit({
+      actorOperatorId: operatorId,
+      action: absolute ? "delivery.group.line.update_packed_quantity" : "delivery.group.line.confirm",
+      lineId,
+      details: { groupId: groupOrder.dispatch_group_id || groupOrder.netsuite_id, requested, childOrders: groupChildOrderIds(groupOrder) }
+    });
+  }
+  return { lineId, requested, sourceCount: working.length };
+}
+
+async function applyGroupedLinePackedQuantity(groupId, lineId, values, operatorId, { absolute = false } = {}) {
+  if (!operatorId) throw new Error("Operator ID is required.");
+  const groupOrder = await getDispatchGroupDeliveryOrder(groupId);
+  if (!groupOrder) throw new Error("Grouped delivery order not found.");
+  return applyGroupedLinePackedQuantityToOrder(groupOrder, lineId, values, operatorId, { absolute });
+}
+
+export async function getCurrentOperatorDeliveryDraft(operatorId, { locationId = null } = {}) {
+  if (!operatorId) return null;
+  const params = [String(operatorId)];
+  let salesLocationClause = "";
+  let transferLocationClause = "";
+  if (locationId) {
+    params.push(locationId);
+    salesLocationClause = `AND o.outbound_location_id = $${params.length}`;
+    transferLocationClause = `AND o.from_location_id = $${params.length}`;
+  }
+  const result = await query(
+    `SELECT *
+       FROM (
+         SELECT 'sales_order'::text AS order_type,
+                o.netsuite_id,
+                o.tranid,
+                o.operator_status,
+                o.local_yard_order_status,
+                o.outbound_location_id AS location_id,
+                o.outbound_location AS location,
+                o.preparing_operator_id,
+                o.preparing_started_at,
+                COUNT(l.id) FILTER (
+                  WHERE COALESCE(l.item_type, '') IN ('InvtPart', 'NonInvtPart')
+                    AND (
+                      COALESCE(l.packed_pallet_qty, 0) > 0
+                      OR COALESCE(l.packed_layer_qty, 0) > 0
+                      OR COALESCE(l.packed_section_qty, 0) > 0
+                      OR COALESCE(l.packed_piece_qty, 0) > 0
+                    )
+                )::int AS draft_line_count
+           FROM sales_orders o
+           LEFT JOIN sales_order_lines l ON l.sales_order_id = o.netsuite_id
+          WHERE o.preparing_operator_id::text = $1
+            AND COALESCE(o.sales_order_type, '') <> '${CUSTOMER_PICKUP_DELIVERY_METHOD.replaceAll("'", "''")}'
+            ${salesLocationClause}
+          GROUP BY o.netsuite_id
+         UNION ALL
+         SELECT 'transfer_order'::text AS order_type,
+                o.netsuite_id,
+                o.tranid,
+                o.outbound_operator_status AS operator_status,
+                o.local_yard_order_status,
+                o.from_location_id AS location_id,
+                o.from_location AS location,
+                o.preparing_operator_id,
+                o.preparing_started_at,
+                COUNT(l.id) FILTER (
+                  WHERE COALESCE(l.item_type, '') IN ('InvtPart', 'NonInvtPart')
+                    AND (
+                      COALESCE(l.packed_pallet_qty, 0) > 0
+                      OR COALESCE(l.packed_layer_qty, 0) > 0
+                      OR COALESCE(l.packed_section_qty, 0) > 0
+                      OR COALESCE(l.packed_piece_qty, 0) > 0
+                    )
+                )::int AS draft_line_count
+           FROM transfer_orders o
+           LEFT JOIN transfer_order_lines l
+             ON l.transfer_order_id = o.netsuite_id
+            AND l.line_stage = 'outbound'
+         WHERE o.preparing_operator_id::text = $1
+            ${transferLocationClause}
+          GROUP BY o.netsuite_id
+         UNION ALL
+         SELECT 'co_order'::text AS order_type,
+                o.delivery_order_id AS netsuite_id,
+                o.co_ref AS tranid,
+                CASE WHEN o.status = 'preparing' THEN 'preparing' ELSE 'open' END AS operator_status,
+                'Open'::text AS local_yard_order_status,
+                o.from_location_id AS location_id,
+                o.from_location AS location,
+                o.preparing_operator_id,
+                o.preparing_started_at,
+                COUNT(l.id) FILTER (
+                  WHERE COALESCE(l.item_type, '') IN ('InvtPart', 'NonInvtPart')
+                    AND (
+                      COALESCE(l.packed_pallet_qty, 0) > 0
+                      OR COALESCE(l.packed_layer_qty, 0) > 0
+                      OR COALESCE(l.packed_section_qty, 0) > 0
+                      OR COALESCE(l.packed_piece_qty, 0) > 0
+                    )
+                )::int AS draft_line_count
+           FROM local_co_orders o
+           LEFT JOIN local_co_order_lines l ON l.co_id = o.id
+          WHERE o.preparing_operator_id::text = $1
+            AND o.status = 'preparing'
+            ${locationId ? `AND o.from_location_id = $${params.length}` : ""}
+          GROUP BY o.id
+       ) draft
+      ORDER BY preparing_started_at DESC NULLS LAST, tranid
+      LIMIT 1`,
+    params
+  );
+  return result.rows[0] || null;
 }
 
 async function claimPreparingOrder(orderId, operatorId) {
-  await assertOrderEditable(orderId, operatorId);
+  const order = await assertOrderEditable(orderId, operatorId);
+  if (isLocalCoDeliveryOrder(order)) return claimLocalCoPreparingOrder(order, operatorId);
 
-  const existing = await query(
-    `SELECT netsuite_id
-     FROM delivery_orders
-     WHERE operator_status = 'preparing'
-       AND preparing_operator_id = $1
-       AND netsuite_id <> $2
-     LIMIT 1`,
-    [operatorId, orderId]
-  );
-  if (existing.rowCount) {
+  const existing = await findActiveDraftOrder(operatorId, orderId);
+  if (existing) {
     throw new Error("Pack your current preparing order before moving on.");
   }
 
+  const target = canonicalOrderTarget(order);
   await query(
-    `UPDATE delivery_orders
-     SET operator_status = CASE WHEN operator_status = 'open' THEN 'preparing' ELSE operator_status END,
-         preparing_operator_id = CASE WHEN operator_status = 'open' THEN $2 ELSE preparing_operator_id END,
-         preparing_started_at = CASE WHEN operator_status = 'open' THEN now() ELSE preparing_started_at END,
-         status_updated_at = now()
-     WHERE netsuite_id = $1`,
+    `UPDATE ${target.table}
+        SET ${target.statusColumn} = CASE WHEN ${target.statusColumn} = 'open' THEN 'preparing' ELSE ${target.statusColumn} END,
+            preparing_operator_id = CASE WHEN ${target.statusColumn} <> 'packed' THEN $2 ELSE preparing_operator_id END,
+            preparing_started_at = CASE WHEN ${target.statusColumn} <> 'packed' THEN COALESCE(preparing_started_at, now()) ELSE preparing_started_at END,
+            status_updated_at = now()
+      WHERE netsuite_id = $1`,
     [orderId, operatorId]
   );
+  return getDeliveryOrder(orderId);
+}
+
+export async function releaseCurrentDeliveryDraft(orderId, operatorId) {
+  if (!operatorId) throw new Error("Operator ID is required.");
+  if (isDispatchGroupOrderId(orderId)) {
+    const groupOrder = await getDispatchGroupDeliveryOrder(orderId);
+    if (!groupOrder) throw new Error("Grouped delivery order not found.");
+    const childIds = groupChildOrderIds(groupOrder).map((id) => Number(id)).filter((id) => Number.isInteger(id));
+    if (!childIds.length) return groupOrder;
+    const orderTarget = canonicalOrderTarget(groupOrder);
+    const lineTarget = canonicalLineTarget(groupOrder);
+    await query(
+      `UPDATE ${lineTarget.table}
+          SET packed_pallet_qty = 0,
+              packed_layer_qty = 0,
+              packed_piece_qty = 0,
+              packed_section_qty = 0,
+              confirmed = false,
+              confirmed_at = null
+        WHERE ${lineTarget.orderColumn} = ANY($1::bigint[])
+          ${lineTarget.extraWhere}
+          AND (
+            confirmed = true
+            OR COALESCE(packed_pallet_qty, 0) > 0
+            OR COALESCE(packed_layer_qty, 0) > 0
+            OR COALESCE(packed_piece_qty, 0) > 0
+            OR COALESCE(packed_section_qty, 0) > 0
+          )`,
+      [childIds]
+    );
+    await query(
+      `UPDATE ${orderTarget.table}
+          SET ${orderTarget.statusColumn} = CASE WHEN ${orderTarget.statusColumn} <> 'loaded' THEN 'open' ELSE ${orderTarget.statusColumn} END,
+              preparing_operator_id = null,
+              preparing_started_at = null,
+              status_updated_at = now()
+        WHERE netsuite_id = ANY($1::bigint[])
+          AND preparing_operator_id::text = $2`,
+      [childIds, String(operatorId)]
+    );
+    await writeAudit({
+      actorOperatorId: operatorId,
+      action: "delivery.group.draft.release",
+      details: { groupId: orderId, childOrders: groupChildOrderIds(groupOrder) }
+    });
+    return getDispatchGroupDeliveryOrder(orderId);
+  }
+  const order = await getDeliveryOrder(orderId);
+  if (!order) throw new Error("Delivery order not found.");
+  if (!order.preparing_operator_id || String(order.preparing_operator_id) !== String(operatorId)) {
+    const error = new Error("This order is not locked by your account.");
+    error.status = 409;
+    throw error;
+  }
+  if (isPickupOrder(order)) {
+    const error = new Error("Use customer pickup back/reset for pickup orders.");
+    error.status = 409;
+    throw error;
+  }
+  if (isLocalCoDeliveryOrder(order)) {
+    await query(
+      `UPDATE local_co_order_lines line
+          SET packed_pallet_qty = 0,
+              packed_layer_qty = 0,
+              packed_piece_qty = 0,
+              packed_section_qty = 0,
+              confirmed_at = null
+        FROM local_co_orders co
+        WHERE line.co_id = co.id
+          AND (co.delivery_order_id = $1 OR co.co_ref = $2)`,
+      [order.netsuite_id, order.tranid]
+    );
+    await setLocalCoDeliveryStatus(order, "open", { clearPreparing: true });
+    await writeAudit({
+      actorOperatorId: operatorId,
+      action: "delivery.local_co.draft.release",
+      orderId,
+      details: { coRef: order.tranid }
+    });
+    return getDeliveryOrder(order.tranid);
+  }
+
+  const lineTarget = canonicalLineTarget(order);
+  await query(
+    `UPDATE ${lineTarget.table}
+        SET packed_pallet_qty = 0,
+            packed_layer_qty = 0,
+            packed_piece_qty = 0,
+            packed_section_qty = 0,
+            confirmed = false,
+            confirmed_at = null
+      WHERE ${lineTarget.orderColumn} = $1
+        ${lineTarget.extraWhere}
+        AND (
+          confirmed = true
+          OR COALESCE(packed_pallet_qty, 0) > 0
+          OR COALESCE(packed_layer_qty, 0) > 0
+          OR COALESCE(packed_piece_qty, 0) > 0
+          OR COALESCE(packed_section_qty, 0) > 0
+        )`,
+    [orderId]
+  );
+
+  const refreshed = await refreshDeliveryProgressStatus(orderId, { clearPreparing: true });
+  await writeAudit({
+    actorOperatorId: operatorId,
+    action: "delivery.draft.release",
+    orderId,
+    details: { tranid: order.tranid, orderType: order.order_type }
+  });
+  return refreshed;
 }
 
 export async function confirmDeliveryLine(orderId, lineId, values, operatorId) {
   if (!operatorId) throw new Error("Operator ID is required.");
-  await claimPreparingOrder(orderId, operatorId);
+  if (isDispatchGroupOrderId(orderId)) {
+    await applyGroupedLinePackedQuantity(orderId, lineId, values, operatorId);
+    return;
+  }
+  const current = await getDeliveryOrder(orderId);
+  if (isLocalCoDeliveryOrder(current)) {
+    await confirmLocalCoDeliveryLine(orderId, lineId, values, operatorId);
+    return;
+  }
+  const order = await claimPreparingOrder(orderId, operatorId);
+  const line = (order.lines || []).find((item) => String(item.id) === String(lineId));
+  if (!line || line.sync_exception) throw new Error("Delivery line not found.");
 
   const pallets = normalizeQuantity(values?.pallets) || 0;
   const layers = normalizeQuantity(values?.layers) || 0;
   const pieces = normalizeQuantity(values?.pieces) || 0;
   const sections = normalizeQuantity(values?.sections) || 0;
+  const lineTarget = canonicalLineTarget(order);
+  const available = remainingPackAvailability(line);
+  const next = {
+    pallets: Math.min(available.pallets, positiveQuantity(line.packed_pallet_qty) + pallets),
+    layers: Math.min(available.layers, positiveQuantity(line.packed_layer_qty) + layers),
+    pieces: Math.min(available.pieces, positiveQuantity(line.packed_piece_qty) + pieces),
+    sections: Math.min(available.sections, positiveQuantity(line.packed_section_qty) + sections)
+  };
 
   await query(
-    `UPDATE delivery_order_lines
-     SET packed_pallet_qty = LEAST(COALESCE(pallet_qty, 0), COALESCE(packed_pallet_qty, 0) + $3),
-         packed_layer_qty = LEAST(COALESCE(layer_qty, 0), COALESCE(packed_layer_qty, 0) + $4),
-         packed_piece_qty = LEAST(COALESCE(piece_qty, quantity, 0), COALESCE(packed_piece_qty, 0) + $5),
-         packed_section_qty = LEAST(COALESCE(section_qty, 0), COALESCE(packed_section_qty, 0) + $6),
-         confirmed = true,
-         confirmed_at = now()
-     WHERE order_id = $1
+    `UPDATE ${lineTarget.table}
+     SET packed_pallet_qty = $3,
+         packed_layer_qty = $4,
+         packed_piece_qty = $5,
+         packed_section_qty = $6,
+         confirmed = ($3::numeric + $4::numeric + $5::numeric + $6::numeric) > 0,
+         confirmed_at = CASE WHEN ($3::numeric + $4::numeric + $5::numeric + $6::numeric) > 0 THEN now() ELSE null END
+     WHERE ${lineTarget.orderColumn} = $1
        AND sync_exception IS NULL
-       AND id = $2`,
-    [orderId, lineId, pallets, layers, pieces, sections]
+       AND id = $2
+       ${lineTarget.extraWhere}`,
+    [orderId, lineId, next.pallets, next.layers, next.pieces, next.sections]
   );
 
   await writeAudit({
@@ -882,31 +3623,167 @@ export async function confirmDeliveryLine(orderId, lineId, values, operatorId) {
     action: "delivery.line.confirm",
     orderId,
     lineId,
-    details: { pallets, layers, pieces, sections }
+    details: { pallets: next.pallets, layers: next.layers, pieces: next.pieces, sections: next.sections }
   });
 }
 
-export async function setDeliveryLinePackedQuantity(orderId, lineId, values, operatorId) {
+export async function confirmDeliveryLines(orderId, lines = [], operatorId) {
   if (!operatorId) throw new Error("Operator ID is required.");
-  await assertOrderEditable(orderId, operatorId);
+  const requestedLines = Array.isArray(lines) ? lines : [];
+  if (!requestedLines.length) return { confirmed: 0, failures: [] };
+
+  if (isDispatchGroupOrderId(orderId)) {
+    const groupOrder = await getDispatchGroupDeliveryOrder(orderId);
+    if (!groupOrder) throw new Error("Grouped delivery order not found.");
+    await claimPreparingGroupOrder(groupOrder, operatorId);
+    const results = [];
+    const failures = [];
+    for (const item of requestedLines) {
+      const lineId = item?.lineId || item?.id;
+      if (!lineId) continue;
+      try {
+        results.push(await applyGroupedLinePackedQuantityToOrder(groupOrder, lineId, item?.values || item || {}, operatorId, { claim: false, audit: false }));
+      } catch (error) {
+        failures.push({ lineId, error: error.message });
+      }
+    }
+    await writeAudit({
+      actorOperatorId: operatorId,
+      action: "delivery.group.page.confirm",
+      details: { groupId: orderId, confirmed: results.length, failures, childOrders: groupChildOrderIds(groupOrder) }
+    });
+    return { confirmed: results.length, failures };
+  }
+
+  let confirmed = 0;
+  const failures = [];
+  for (const item of requestedLines) {
+    const lineId = item?.lineId || item?.id;
+    if (!lineId) continue;
+    try {
+      await confirmDeliveryLine(orderId, lineId, item?.values || item || {}, operatorId);
+      confirmed += 1;
+    } catch (error) {
+      failures.push({ lineId, error: error.message });
+    }
+  }
+  return { confirmed, failures };
+}
+
+export async function confirmCustomerPickupLine(orderId, lineId, values, operatorId) {
+  if (!operatorId) throw new Error("Operator ID is required.");
+  const order = await getDeliveryOrder(orderId);
+  if (!order || !isPickupOrder(order)) throw new Error("Customer pickup sales order not found.");
+  const line = (order.lines || []).find((item) => String(item.id) === String(lineId));
+  if (!line || line.sync_exception) throw new Error("Customer pickup line not found.");
 
   const pallets = normalizeQuantity(values?.pallets) || 0;
   const layers = normalizeQuantity(values?.layers) || 0;
   const pieces = normalizeQuantity(values?.pieces) || 0;
   const sections = normalizeQuantity(values?.sections) || 0;
+  const available = remainingPackAvailability(line);
+  const next = {
+    pallets: Math.min(available.pallets, positiveQuantity(line.packed_pallet_qty) + pallets),
+    layers: Math.min(available.layers, positiveQuantity(line.packed_layer_qty) + layers),
+    pieces: Math.min(available.pieces, positiveQuantity(line.packed_piece_qty) + pieces),
+    sections: Math.min(available.sections, positiveQuantity(line.packed_section_qty) + sections)
+  };
+  if ((next.pallets + next.layers + next.pieces + next.sections) <= 0) {
+    throw new Error("This pickup line has no remaining quantity to load.");
+  }
 
   await query(
-    `UPDATE delivery_order_lines
-     SET packed_pallet_qty = LEAST(COALESCE(pallet_qty, 0), $3),
-         packed_layer_qty = LEAST(COALESCE(layer_qty, 0), $4),
-         packed_piece_qty = LEAST(COALESCE(piece_qty, quantity, 0), $5),
-         packed_section_qty = LEAST(COALESCE(section_qty, 0), $6),
-         confirmed = ($3 + $4 + $5 + $6) > 0,
-         confirmed_at = CASE WHEN ($3 + $4 + $5 + $6) > 0 THEN COALESCE(confirmed_at, now()) ELSE null END
-     WHERE order_id = $1
+    `UPDATE sales_order_lines
+     SET packed_pallet_qty = $3,
+         packed_layer_qty = $4,
+         packed_piece_qty = $5,
+         packed_section_qty = $6,
+         confirmed = true,
+         confirmed_at = now()
+     WHERE sales_order_id = $1
        AND sync_exception IS NULL
        AND id = $2`,
-    [orderId, lineId, pallets, layers, pieces, sections]
+    [orderId, lineId, next.pallets, next.layers, next.pieces, next.sections]
+  );
+
+  await writeAudit({
+    actorOperatorId: operatorId,
+    action: "customer_pickup.line.confirm",
+    orderId,
+    lineId,
+    details: { pallets: next.pallets, layers: next.layers, pieces: next.pieces, sections: next.sections }
+  });
+}
+
+export async function clearCustomerPickupDraft(orderId, operatorId) {
+  const order = await getDeliveryOrder(orderId);
+  if (!order || !isPickupOrder(order)) throw new Error("Customer pickup sales order not found.");
+  await query(
+    `UPDATE sales_order_lines
+        SET packed_pallet_qty = 0,
+            packed_layer_qty = 0,
+            packed_piece_qty = 0,
+            packed_section_qty = 0,
+            confirmed = false,
+            confirmed_at = null
+      WHERE sales_order_id = $1
+        AND (
+          COALESCE(packed_pallet_qty, 0) > 0
+          OR COALESCE(packed_layer_qty, 0) > 0
+          OR COALESCE(packed_piece_qty, 0) > 0
+          OR COALESCE(packed_section_qty, 0) > 0
+        )`,
+    [orderId]
+  );
+  await writeAudit({
+    actorOperatorId: operatorId,
+    action: "customer_pickup.draft.clear",
+    orderId
+  });
+  return getDeliveryOrder(orderId);
+}
+
+export async function setDeliveryLinePackedQuantity(orderId, lineId, values, operatorId) {
+  if (!operatorId) throw new Error("Operator ID is required.");
+  if (isDispatchGroupOrderId(orderId)) {
+    await applyGroupedLinePackedQuantity(orderId, lineId, values, operatorId, { absolute: true });
+    return;
+  }
+  const current = await getDeliveryOrder(orderId);
+  if (isLocalCoDeliveryOrder(current)) {
+    await confirmLocalCoDeliveryLine(orderId, lineId, values, operatorId, { absolute: true });
+    return;
+  }
+  const order = await assertOrderEditable(orderId, operatorId);
+
+  const pallets = normalizeQuantity(values?.pallets) || 0;
+  const layers = normalizeQuantity(values?.layers) || 0;
+  const pieces = normalizeQuantity(values?.pieces) || 0;
+  const sections = normalizeQuantity(values?.sections) || 0;
+  const lineTarget = canonicalLineTarget(order);
+  const line = (order.lines || []).find((item) => String(item.id) === String(lineId));
+  if (!line || line.sync_exception) throw new Error("Delivery line not found.");
+  const available = remainingPackAvailability(line);
+  const next = {
+    pallets: Math.min(available.pallets, pallets),
+    layers: Math.min(available.layers, layers),
+    pieces: Math.min(available.pieces, pieces),
+    sections: Math.min(available.sections, sections)
+  };
+
+  await query(
+    `UPDATE ${lineTarget.table}
+     SET packed_pallet_qty = $3,
+         packed_layer_qty = $4,
+         packed_piece_qty = $5,
+         packed_section_qty = $6,
+         confirmed = ($3::numeric + $4::numeric + $5::numeric + $6::numeric) > 0,
+         confirmed_at = CASE WHEN ($3::numeric + $4::numeric + $5::numeric + $6::numeric) > 0 THEN COALESCE(confirmed_at, now()) ELSE null END
+     WHERE ${lineTarget.orderColumn} = $1
+       AND sync_exception IS NULL
+       AND id = $2
+       ${lineTarget.extraWhere}`,
+    [orderId, lineId, next.pallets, next.layers, next.pieces, next.sections]
   );
 
   await writeAudit({
@@ -914,62 +3791,104 @@ export async function setDeliveryLinePackedQuantity(orderId, lineId, values, ope
     action: "delivery.line.update_packed_quantity",
     orderId,
     lineId,
-    details: { pallets, layers, pieces, sections }
+    details: { pallets: next.pallets, layers: next.layers, pieces: next.pieces, sections: next.sections }
   });
 }
 
 export async function unpackDeliveryLine(orderId, lineId, values, operatorId) {
   if (!operatorId) throw new Error("Operator ID is required.");
-  await assertOrderEditable(orderId, operatorId);
+  if (isDispatchGroupOrderId(orderId)) {
+    const groupOrder = await getDispatchGroupDeliveryOrder(orderId);
+    if (!groupOrder) throw new Error("Grouped delivery order not found.");
+    await assertGroupEditable(groupOrder, operatorId);
+    const { lines } = await resolveGroupSourceLines(groupOrder, lineId);
+    for (const { order, line } of lines) {
+      const lineTarget = canonicalLineTarget(order);
+      await query(
+        `UPDATE ${lineTarget.table}
+            SET packed_pallet_qty = 0,
+                packed_layer_qty = 0,
+                packed_piece_qty = 0,
+                packed_section_qty = 0,
+                confirmed = false,
+                confirmed_at = null,
+                sync_exception = null,
+                sync_exception_at = null
+          WHERE ${lineTarget.orderColumn} = $1
+            AND id = $2
+            ${lineTarget.extraWhere}`,
+        [order.netsuite_id, line.id]
+      );
+      await refreshDeliveryProgressStatus(order.netsuite_id, { clearPreparing: true });
+    }
+    await writeAudit({
+      actorOperatorId: operatorId,
+      action: "delivery.group.line.unpack",
+      lineId,
+      details: { groupId: orderId, childOrders: groupChildOrderIds(groupOrder) }
+    });
+    return;
+  }
+  const order = await assertOrderEditable(orderId, operatorId);
+  if (isLocalCoDeliveryOrder(order)) {
+    const line = (order.lines || []).find((item) => String(item.id) === String(lineId));
+    if (!line) throw new Error("Local CO line not found.");
+    const packed = {
+      pallets: positiveQuantity(line.packed_pallet_qty),
+      layers: positiveQuantity(line.packed_layer_qty),
+      pieces: positiveQuantity(line.packed_piece_qty),
+      sections: positiveQuantity(line.packed_section_qty)
+    };
+    await updateLocalCoLinePackedQuantity(order, lineId, { pallets: 0, layers: 0, pieces: 0, sections: 0 });
+    await setLocalCoDeliveryStatus(order, "preparing", { clearPreparing: false });
+    await writeAudit({
+      actorOperatorId: operatorId,
+      action: "delivery.local_co.line.unpack",
+      orderId,
+      lineId,
+      details: { coRef: order.tranid, ...packed }
+    });
+    return;
+  }
 
-  const pallets = normalizeQuantity(values?.pallets) || 0;
-  const layers = normalizeQuantity(values?.layers) || 0;
-  const pieces = normalizeQuantity(values?.pieces) || 0;
-  const sections = normalizeQuantity(values?.sections) || 0;
+  const lineTarget = canonicalLineTarget(order);
+  const line = (order.lines || []).find((item) => String(item.id) === String(lineId));
+  if (!line) throw new Error("Delivery line not found.");
+  const pallets = positiveQuantity(line.packed_pallet_qty);
+  const layers = positiveQuantity(line.packed_layer_qty);
+  const pieces = positiveQuantity(line.packed_piece_qty);
+  const sections = positiveQuantity(line.packed_section_qty);
 
   await query(
-    `UPDATE delivery_order_lines
-     SET packed_pallet_qty = GREATEST(COALESCE(packed_pallet_qty, 0) - $3, 0),
-         packed_layer_qty = GREATEST(COALESCE(packed_layer_qty, 0) - $4, 0),
-         packed_piece_qty = GREATEST(COALESCE(packed_piece_qty, 0) - $5, 0),
-         packed_section_qty = GREATEST(COALESCE(packed_section_qty, 0) - $6, 0),
-         confirmed = (
-           GREATEST(COALESCE(packed_pallet_qty, 0) - $3, 0)
-           + GREATEST(COALESCE(packed_layer_qty, 0) - $4, 0)
-           + GREATEST(COALESCE(packed_piece_qty, 0) - $5, 0)
-           + GREATEST(COALESCE(packed_section_qty, 0) - $6, 0)
-         ) > 0,
-         confirmed_at = CASE WHEN (
-           GREATEST(COALESCE(packed_pallet_qty, 0) - $3, 0)
-           + GREATEST(COALESCE(packed_layer_qty, 0) - $4, 0)
-           + GREATEST(COALESCE(packed_piece_qty, 0) - $5, 0)
-           + GREATEST(COALESCE(packed_section_qty, 0) - $6, 0)
-        ) > 0 THEN confirmed_at ELSE null END,
-         sync_exception = CASE WHEN (
-           GREATEST(COALESCE(packed_pallet_qty, 0) - $3, 0)
-           + GREATEST(COALESCE(packed_layer_qty, 0) - $4, 0)
-           + GREATEST(COALESCE(packed_piece_qty, 0) - $5, 0)
-           + GREATEST(COALESCE(packed_section_qty, 0) - $6, 0)
-         ) > 0 THEN sync_exception ELSE null END,
-         sync_exception_at = CASE WHEN (
-           GREATEST(COALESCE(packed_pallet_qty, 0) - $3, 0)
-           + GREATEST(COALESCE(packed_layer_qty, 0) - $4, 0)
-           + GREATEST(COALESCE(packed_piece_qty, 0) - $5, 0)
-           + GREATEST(COALESCE(packed_section_qty, 0) - $6, 0)
-         ) > 0 THEN sync_exception_at ELSE null END
-     WHERE order_id = $1
-       AND id = $2`,
-    [orderId, lineId, pallets, layers, pieces, sections]
+    `UPDATE ${lineTarget.table}
+     SET packed_pallet_qty = 0,
+         packed_layer_qty = 0,
+         packed_piece_qty = 0,
+         packed_section_qty = 0,
+         confirmed = false,
+         confirmed_at = null,
+         sync_exception = null,
+         sync_exception_at = null
+     WHERE ${lineTarget.orderColumn} = $1
+       AND id = $2
+       ${lineTarget.extraWhere}`,
+    [orderId, lineId]
   );
 
+  await refreshDeliveryProgressStatus(orderId, { clearPreparing: true });
+
   await query(
-    `UPDATE delivery_orders
-     SET operator_status = 'open',
-         prepared = false,
-         prepared_at = null,
-         status_updated_at = now()
-     WHERE netsuite_id = $1`,
-    [orderId]
+    `UPDATE dispatch_operator_requests
+        SET status = 'resolved',
+            resolved_by = $2,
+            resolved_at = now()
+      WHERE status = 'open'
+        AND (order_ref = $1 OR order_ref IN (
+          SELECT tranid FROM sales_orders WHERE netsuite_id::text = $1
+          UNION ALL
+          SELECT tranid FROM transfer_orders WHERE netsuite_id::text = $1
+        ))`,
+    [String(orderId), operatorId || null]
   );
 
   await writeAudit({
@@ -983,10 +3902,47 @@ export async function unpackDeliveryLine(orderId, lineId, values, operatorId) {
 
 export async function unpackDeliveryOrder(orderId, operatorId) {
   if (!operatorId) throw new Error("Operator ID is required.");
-  await assertOrderEditable(orderId, operatorId);
+  if (isDispatchGroupOrderId(orderId)) {
+    const groupOrder = await getDispatchGroupDeliveryOrder(orderId);
+    if (!groupOrder) throw new Error("Grouped delivery order not found.");
+    await assertGroupEditable(groupOrder, operatorId);
+    for (const childId of groupChildOrderIds(groupOrder)) {
+      await unpackDeliveryOrder(childId, operatorId);
+    }
+    await writeAudit({
+      actorOperatorId: operatorId,
+      action: "delivery.group.order.unpack",
+      details: { groupId: orderId, childOrders: groupChildOrderIds(groupOrder) }
+    });
+    return;
+  }
+  const order = await assertOrderEditable(orderId, operatorId);
+  if (isLocalCoDeliveryOrder(order)) {
+    await query(
+      `UPDATE local_co_order_lines line
+          SET packed_pallet_qty = 0,
+              packed_layer_qty = 0,
+              packed_piece_qty = 0,
+              packed_section_qty = 0,
+              confirmed_at = null
+        FROM local_co_orders co
+        WHERE line.co_id = co.id
+          AND (co.delivery_order_id = $1 OR co.co_ref = $2)`,
+      [order.netsuite_id, order.tranid]
+    );
+    await setLocalCoDeliveryStatus(order, "open", { clearPreparing: true });
+    await writeAudit({
+      actorOperatorId: operatorId,
+      action: "delivery.local_co.order.unpack",
+      orderId,
+      details: { coRef: order.tranid }
+    });
+    return;
+  }
+  const lineTarget = canonicalLineTarget(order);
 
   await query(
-    `UPDATE delivery_order_lines
+    `UPDATE ${lineTarget.table}
      SET packed_pallet_qty = 0,
          packed_layer_qty = 0,
          packed_piece_qty = 0,
@@ -995,20 +3951,25 @@ export async function unpackDeliveryOrder(orderId, operatorId) {
          confirmed_at = null,
          sync_exception = null,
          sync_exception_at = null
-     WHERE order_id = $1`,
+     WHERE ${lineTarget.orderColumn} = $1
+       ${lineTarget.extraWhere}`,
     [orderId]
   );
 
+  await refreshDeliveryProgressStatus(orderId, { clearPreparing: true });
+
   await query(
-    `UPDATE delivery_orders
-     SET operator_status = 'open',
-         prepared = false,
-         prepared_at = null,
-         preparing_operator_id = null,
-         preparing_started_at = null,
-         status_updated_at = now()
-     WHERE netsuite_id = $1`,
-    [orderId]
+    `UPDATE dispatch_operator_requests
+        SET status = 'resolved',
+            resolved_by = $2,
+            resolved_at = now()
+      WHERE status = 'open'
+        AND (order_ref = $1 OR order_ref IN (
+          SELECT tranid FROM sales_orders WHERE netsuite_id::text = $1
+          UNION ALL
+          SELECT tranid FROM transfer_orders WHERE netsuite_id::text = $1
+        ))`,
+    [String(orderId), operatorId || null]
   );
 
   await writeAudit({
@@ -1023,6 +3984,83 @@ export async function updateDeliveryStatus(id, status, operatorId) {
   const allowed = new Set(["open", "preparing", "packed"]);
   if (!allowed.has(status)) throw new Error("Invalid delivery status.");
 
+  if (isDispatchGroupOrderId(id)) {
+    const groupOrder = await getDispatchGroupDeliveryOrder(id);
+    if (!groupOrder) throw new Error("Grouped delivery order not found.");
+    if (status === "preparing") {
+      await claimPreparingGroupOrder(groupOrder, operatorId);
+    } else if (status === "packed") {
+      if (!orderHasPackedQuantity(groupOrder)) {
+        const error = new Error("Cannot mark this grouped order as packed because no order line has confirmed packed quantity.");
+        error.status = 409;
+        throw error;
+      }
+      await assertGroupEditable(groupOrder, operatorId);
+      const childIds = groupChildOrderIds(groupOrder).map((childId) => Number(childId)).filter((childId) => Number.isInteger(childId));
+      const orderTarget = canonicalOrderTarget(groupOrder);
+      const lineTarget = canonicalLineTarget(groupOrder);
+      await query(
+        `UPDATE ${orderTarget.table} o
+            SET ${orderTarget.statusColumn} = CASE
+                  WHEN EXISTS (
+                    SELECT 1
+                      FROM ${lineTarget.table} l
+                     WHERE l.${lineTarget.orderColumn} = o.netsuite_id
+                       ${lineTarget.extraWhere}
+                       AND COALESCE(l.item_type, '') IN ('InvtPart', 'NonInvtPart')
+                       AND (${packedQtySql}) > 0
+                  ) THEN 'packed'
+                  ELSE 'open'
+                END,
+                preparing_operator_id = null,
+                preparing_started_at = null,
+                status_updated_at = now()
+          WHERE o.netsuite_id = ANY($1::bigint[])`,
+        [childIds]
+      );
+    } else {
+      await assertGroupEditable(groupOrder, operatorId);
+      const childIds = groupChildOrderIds(groupOrder).map((childId) => Number(childId)).filter((childId) => Number.isInteger(childId));
+      const orderTarget = canonicalOrderTarget(groupOrder);
+      await query(
+        `UPDATE ${orderTarget.table}
+            SET ${orderTarget.statusColumn} = CASE WHEN ${orderTarget.statusColumn} = 'loaded' THEN ${orderTarget.statusColumn} ELSE 'open' END,
+                preparing_operator_id = null,
+                preparing_started_at = null,
+                status_updated_at = now()
+          WHERE netsuite_id = ANY($1::bigint[])`,
+        [childIds]
+      );
+    }
+    await writeAudit({
+      actorOperatorId: operatorId,
+      action: "delivery.group.order.status",
+      details: { groupId: id, status, childOrders: groupChildOrderIds(groupOrder) }
+    });
+    return;
+  }
+  const currentOrder = await getDeliveryOrder(id);
+  if (isLocalCoDeliveryOrder(currentOrder)) {
+    if (status === "preparing") {
+      await claimLocalCoPreparingOrder(currentOrder, operatorId);
+    } else if (status === "packed") {
+      if (!orderHasPackedQuantity(currentOrder)) {
+        const error = new Error("Cannot mark this CO as packed because no order line has confirmed packed quantity.");
+        error.status = 409;
+        throw error;
+      }
+      await setLocalCoDeliveryStatus(currentOrder, "packed", { clearPreparing: true });
+    } else {
+      await setLocalCoDeliveryStatus(currentOrder, "open", { clearPreparing: true });
+    }
+    await writeAudit({
+      actorOperatorId: operatorId,
+      action: "delivery.local_co.order.status",
+      details: { coOrderId: id, coRef: currentOrder.tranid, status }
+    });
+    return;
+  }
+
   if (status === "preparing") {
     await claimPreparingOrder(id, operatorId);
     await writeAudit({
@@ -1034,34 +4072,21 @@ export async function updateDeliveryStatus(id, status, operatorId) {
     return;
   }
 
-  await assertOrderEditable(id, operatorId);
+  const order = await assertOrderEditable(id, operatorId);
 
   if (status === "packed") {
-    const existing = await query(
-      `SELECT netsuite_id
-       FROM delivery_orders
-       WHERE operator_status = 'preparing'
-         AND preparing_operator_id = $1
-         AND netsuite_id <> $2
-       LIMIT 1`,
-      [operatorId, id]
-    );
-    if (existing.rowCount) {
+    if (!orderHasPackedQuantity(order)) {
+      const error = new Error("Cannot mark this order as packed because no order line has confirmed packed quantity.");
+      error.status = 409;
+      throw error;
+    }
+    const existing = await findActiveDraftOrder(operatorId, id);
+    if (existing) {
       throw new Error("Pack your current preparing order before moving on.");
     }
   }
 
-  await query(
-    `UPDATE delivery_orders
-     SET operator_status = $2,
-         prepared = $2 = 'packed',
-         prepared_at = CASE WHEN $2 = 'packed' THEN COALESCE(prepared_at, now()) ELSE null END,
-         preparing_operator_id = CASE WHEN $2 = 'packed' OR $2 = 'open' THEN null ELSE preparing_operator_id END,
-         preparing_started_at = CASE WHEN $2 = 'packed' OR $2 = 'open' THEN null ELSE preparing_started_at END,
-         status_updated_at = now()
-     WHERE netsuite_id = $1`,
-    [id, status]
-  );
+  await setCanonicalDeliveryStatus(order, status, { clearPreparing: status === "packed" || status === "open" });
 
   await writeAudit({
     actorOperatorId: operatorId,
@@ -1072,15 +4097,9 @@ export async function updateDeliveryStatus(id, status, operatorId) {
 }
 
 export async function markDeliveryPrepared(id, { operatorName, photoPath, notes }) {
-  await query(
-    `UPDATE delivery_orders
-     SET prepared = true,
-         prepared_at = now(),
-         operator_status = 'packed',
-         status_updated_at = now()
-     WHERE netsuite_id = $1`,
-    [id]
-  );
+  const order = await getDeliveryOrder(id);
+  if (!order) throw new Error("Delivery order not found.");
+  await setCanonicalDeliveryStatus(order, "packed", { clearPreparing: true });
 
   await query(
     `INSERT INTO delivery_preparation_records (order_id, operator_name, photo_path, notes)

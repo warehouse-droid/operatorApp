@@ -1,10 +1,17 @@
-const CACHE_NAME = "mbbs-yard-operator-v6";
+const CACHE_NAME = "mbbs-yard-operator-v96-driver-rest-after";
 const APP_SHELL = [
   "/operator",
   "/operator.html",
-  "/operator.css?v=20260622-history-units",
-  "/operator.js?v=20260622-history-units",
+  "/operator.css?v=20260706-star-bottom-v1",
+  "/i18n.css?v=20260701-i18n-v2",
+  "/i18n.js?v=20260706-delivery-menu-i18n-v1",
+  "/operator.js?v=20260707-co-packed-list-v1",
+  "/driver",
+  "/driver.html",
+  "/driver.css?v=20260702-camera-v3",
+  "/driver.js?v=20260707-rest-after-v1",
   "/manifest.webmanifest",
+  "/driver-manifest.webmanifest",
   "/icons/mbbs-yard-192.png",
   "/icons/mbbs-yard-512.png",
   "/icons/mbbs-yard.svg"
@@ -16,12 +23,41 @@ self.addEventListener("install", (event) => {
 });
 
 self.addEventListener("activate", (event) => {
-  event.waitUntil(
-    caches.keys().then((names) => Promise.all(
-      names.filter((name) => name !== CACHE_NAME).map((name) => caches.delete(name))
-    ))
-  );
-  self.clients.claim();
+  event.waitUntil((async () => {
+    const names = await caches.keys();
+    await Promise.all(names.filter((name) => name !== CACHE_NAME).map((name) => caches.delete(name)));
+    await self.clients.claim();
+  })());
+});
+
+self.addEventListener("message", (event) => {
+  if (event.data?.type === "SKIP_WAITING") self.skipWaiting();
+  if (event.data?.type === "SHOW_NOTIFICATION") {
+    event.waitUntil(self.registration.showNotification(
+      event.data.title || "Delivery Prep",
+      event.data.options || {}
+    ));
+  }
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const targetUrl = event.notification.data?.url || "/operator";
+  event.waitUntil((async () => {
+    const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+    const existing = windows.find((client) => {
+      try {
+        return new URL(client.url).pathname === targetUrl;
+      } catch {
+        return false;
+      }
+    });
+    if (existing) {
+      existing.postMessage({ type: "OPEN_URGENT_DELIVERY_ALERT" });
+      return existing.focus();
+    }
+    return self.clients.openWindow(targetUrl);
+  })());
 });
 
 self.addEventListener("fetch", (event) => {
@@ -35,6 +71,6 @@ self.addEventListener("fetch", (event) => {
         caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
         return response;
       })
-      .catch(() => caches.match(event.request).then((cached) => cached || caches.match("/operator")))
+      .catch(() => caches.match(event.request).then((cached) => cached || caches.match(url.pathname.startsWith("/driver") ? "/driver" : "/operator")))
   );
 });

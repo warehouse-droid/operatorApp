@@ -1,0 +1,140 @@
+{
+  "repairedAt": "2026-07-01T20:44:37.156Z",
+  "uploadedReferences": 16,
+  "oldRefs": [
+    "r2://operator/operator-customer-pickup-photo/2026/07/01/SOB113630/b8a24246-de75-400c-a4d1-1b9f86f60a73-operator_load_records.photo_data_url-1.jpg",
+    "r2://operator/operator-customer-pickup-photo/2026/07/01/SOB113252/510d9c30-519e-4c73-8253-3935488ecf7a-operator_load_records.photo_data_url-44.jpg",
+    "r2://operator/operator-load-photo/2026/07/01/SOB113434/4a563c92-a5e4-40e9-a1c9-7844d39c3ded-operator_load_records.photo_data_url-101.jpg",
+    "r2://operator/operator-load-photo/2026/07/01/SOA04197/df852e45-5418-49a2-a683-23eae4ba79c0-operator_load_records.photo_data_url-120.jpg"
+  ],
+  "entries": [
+    {
+      "source": "operator_load_records.photo_data_url:1",
+      "oldRef": "r2://operator/operator-customer-pickup-photo/2026/07/01/SOB113630/b8a24246-de75-400c-a4d1-1b9f86f60a73-operator_load_records.photo_data_url-1.jpg",
+      "newRef": "r2://operator/operator-customer-pickup-photo/2026/07/01/SOB113630/cef71668-d54f-4b73-b74f-aca6d51afc4a-operator_load_records.photo_data_url-1.jpg",
+      "contentType": "image/jpeg",
+      "bytes": 18375,
+      "hash": "0e08d519e45f52089d93489e909e34b1d3b46930198b1c5e2f6d90d6aa9d29a8"
+    },
+    {
+      "source": "operator_load_records.photo_data_url:44",
+      "oldRef": "r2://operator/operator-customer-pickup-photo/2026/07/01/SOB113252/510d9c30-519e-4c73-8253-3935488ecf7a-operator_load_records.photo_data_url-44.jpg",
+      "newRef": "r2://operator/operator-customer-pickup-photo/2026/07/01/SOB113252/a0d12dca-a91a-415b-9dfc-cb0e9157f038-operator_load_records.photo_data_url-44.jpg",
+      "contentType": "image/jpeg",
+      "bytes": 155819,
+      "hash": "0f29579587c66e9f9b026ce2390f9f00f082b7a06031a645103dfa634aa03dfa"
+    },
+    {
+      "source": "operator_load_records.photo_data_url:73",
+      "oldRef": "r2://operator/operator-customer-pickup-photo/2026/07/01/SOB113252/510d9c30-519e-4c73-8253-3935488ecf7a-operator_load_records.photo_data_url-44.jpg",
+      "newRef": "r2://operator/operator-customer-pickup-photo/2026/07/01/SOB113629/8d390ca1-79af-4364-94f3-f13c7d0d265b-operator_load_records.photo_data_url-73.jpg",
+      "contentType": "image/jpeg",
+      "bytes": 155819,
+      "hash": "0f29579587c66e9f9b026ce2390f9f00f082b7a06031a645103dfa634aa03dfa"
+    },
+    {
+      "source": "operator_load_records.photo_data_url:74",
+      "oldRef": "r2://operator/operator-customer-pickup-photo/2026/07/01/SOB113252/510d9c30-519e-4c73-8253-3935488ecf7a-operator_load_records.photo_data_url-44.jpg",
+      "newRef": "r2://operator/operator-load-photo/2026/07/01/SOB113566/5fce2028-738b-4767-ad4e-89c9709ade9b-operator_load_records.photo_data_url-74.jpg",
+      "contentType": "image/jpeg",
+      "bytes": 155819,
+      "hash": "0f29579587c66e9f9b026ce2390f9f00f082b7a06031a645103dfa634aa03dfa"
+    },
+    {
+      "source": "operator_load_records.photo_data_url:75",
+      "oldRef": "r2://operator/operator-customer-pickup-photo/2026/07/01/SOB113252/510d9c30-519e-4c73-8253-3935488ecf7a-operator_load_records.photo_data_url-44.jpg",
+      "newRef": "r2://operator/operator-load-photo/2026/07/01/SOM04553/f352df47-01c0-4f3f-9d5a-c8275634a318-operator_load_records.photo_data_url-75.jpg",
+      "contentType": "image/jpeg",
+      "bytes": 155819,
+      "hash": "0f29579587c66e9f9b026ce2390f9f00f082b7a06031a645103dfa634aa03dfa"
+    },
+    {
+      "source": "operator_load_records.photo_data_url:81",
+      "oldRef": "r2://operator/operator-customer-pickup-photo/2026/07/01/SOB113252/510d9c30-519e-4c73-8253-3935488ecf7a-operator_load_records.photo_data_url-44.jpg",
+      "newRef": "r2://operator/operator-load-photo/2026/07/01/SOB113566/984155f4-af76-4934-9734-ff47eb54ff5d-operator_load_records.photo_data_url-81.jpg",
+      "contentType": "image/jpeg",
+      "bytes": 155819,
+      "hash": "0f29579587c66e9f9b026ce2390f9f00f082b7a06031a645103dfa634aa03dfa"
+    },
+    {
+      "source": "operator_load_records.photo_data_url:88",
+      "oldRef": "r2://operator/operator-customer-pickup-photo/2026/07/01/SOB113252/510d9c30-519e-4c73-8253-3935488ecf7a-operator_load_records.photo_data_url-44.jpg",
+      "newRef": "r2://operator/operator-load-photo/2026/07/01/SOM04553/d07487c4-5c7f-4efc-a448-89e29f93163f-operator_load_records.photo_data_url-88.jpg",
+      "contentType": "image/jpeg",
+      "bytes": 155819,
+      "hash": "0f29579587c66e9f9b026ce2390f9f00f082b7a06031a645103dfa634aa03dfa"
+    },
+    {
+      "source": "operator_load_records.photo_data_url:101",
+      "oldRef": "r2://operator/operator-load-photo/2026/07/01/SOB113434/4a563c92-a5e4-40e9-a1c9-7844d39c3ded-operator_load_records.photo_data_url-101.jpg",
+      "newRef": "r2://operator/operator-load-photo/2026/07/01/SOB113434/4d5d44d6-c0d5-450b-ae3e-492d07da25ac-operator_load_records.photo_data_url-101.jpg",
+      "contentType": "image/jpeg",
+      "bytes": 1295033,
+      "hash": "1b0d35578a9d008a3ff48d9fd0376e3b4a2a08c7ecf3f153fddac7efb761b9c6"
+    },
+    {
+      "source": "operator_load_records.photo_data_url:120",
+      "oldRef": "r2://operator/operator-load-photo/2026/07/01/SOA04197/df852e45-5418-49a2-a683-23eae4ba79c0-operator_load_records.photo_data_url-120.jpg",
+      "newRef": "r2://operator/operator-load-photo/2026/07/01/SOA04197/6bb8dade-4a47-43f8-934b-1072158e791a-operator_load_records.photo_data_url-120.jpg",
+      "contentType": "image/jpeg",
+      "bytes": 30638,
+      "hash": "5fd17729eb216dcf170d2ae73ab6c1532a08d6f6a633f0cd7657614c2c5b362f"
+    },
+    {
+      "source": "customer_pickup_load_records.photo_data_url:1",
+      "oldRef": "r2://operator/operator-customer-pickup-photo/2026/07/01/SOB113630/b8a24246-de75-400c-a4d1-1b9f86f60a73-operator_load_records.photo_data_url-1.jpg",
+      "newRef": "r2://operator/operator-customer-pickup-photo/2026/07/01/891513/72699242-787e-45c4-9d2c-ef874984c8f6-customer_pickup_load_records.photo_data_url-1.jpg",
+      "contentType": "image/jpeg",
+      "bytes": 18375,
+      "hash": "0e08d519e45f52089d93489e909e34b1d3b46930198b1c5e2f6d90d6aa9d29a8"
+    },
+    {
+      "source": "local_co_receipt_records.photo_data_urls:2[0]",
+      "oldRef": "r2://operator/operator-customer-pickup-photo/2026/07/01/SOB113252/510d9c30-519e-4c73-8253-3935488ecf7a-operator_load_records.photo_data_url-44.jpg",
+      "newRef": "r2://operator/operator-co-receiving-photo/2026/07/01/1/3ca6e13f-d0f2-42eb-b3ae-8bb60d110c4c-local_co_receipt_records.photo_data_urls-2-0.jpg",
+      "contentType": "image/jpeg",
+      "bytes": 155819,
+      "hash": "0f29579587c66e9f9b026ce2390f9f00f082b7a06031a645103dfa634aa03dfa"
+    },
+    {
+      "source": "local_co_receipt_records.photo_data_urls:2[1]",
+      "oldRef": "r2://operator/operator-customer-pickup-photo/2026/07/01/SOB113252/510d9c30-519e-4c73-8253-3935488ecf7a-operator_load_records.photo_data_url-44.jpg",
+      "newRef": "r2://operator/operator-co-receiving-photo/2026/07/01/1/5941bc5a-4c84-473e-9cc4-0501bd878797-local_co_receipt_records.photo_data_urls-2-1.jpg",
+      "contentType": "image/jpeg",
+      "bytes": 155819,
+      "hash": "0f29579587c66e9f9b026ce2390f9f00f082b7a06031a645103dfa634aa03dfa"
+    },
+    {
+      "source": "driver_day_records.pre_dvir_photo_data_urls:1[0]",
+      "oldRef": "r2://operator/operator-customer-pickup-photo/2026/07/01/SOB113252/510d9c30-519e-4c73-8253-3935488ecf7a-operator_load_records.photo_data_url-44.jpg",
+      "newRef": "r2://driver/driver-dvir-pre-photo/2026/07/01/testing-2026-06-25/bae8ed1e-bb11-4469-8f6e-ff7590f43002-driver_day_records.pre_dvir_photo_data_urls-1-0.jpg",
+      "contentType": "image/jpeg",
+      "bytes": 155819,
+      "hash": "0f29579587c66e9f9b026ce2390f9f00f082b7a06031a645103dfa634aa03dfa"
+    },
+    {
+      "source": "driver_day_records.pre_dvir_photo_data_urls:1[1]",
+      "oldRef": "r2://operator/operator-customer-pickup-photo/2026/07/01/SOB113252/510d9c30-519e-4c73-8253-3935488ecf7a-operator_load_records.photo_data_url-44.jpg",
+      "newRef": "r2://driver/driver-dvir-pre-photo/2026/07/01/testing-2026-06-25/32899976-8ad1-4841-9ea9-875f4d0e51d2-driver_day_records.pre_dvir_photo_data_urls-1-1.jpg",
+      "contentType": "image/jpeg",
+      "bytes": 155819,
+      "hash": "0f29579587c66e9f9b026ce2390f9f00f082b7a06031a645103dfa634aa03dfa"
+    },
+    {
+      "source": "driver_day_records.pre_dvir_photo_data_urls:1[2]",
+      "oldRef": "r2://operator/operator-customer-pickup-photo/2026/07/01/SOB113252/510d9c30-519e-4c73-8253-3935488ecf7a-operator_load_records.photo_data_url-44.jpg",
+      "newRef": "r2://driver/driver-dvir-pre-photo/2026/07/01/testing-2026-06-25/d24262f9-9334-49bb-b55d-96ef150ad362-driver_day_records.pre_dvir_photo_data_urls-1-2.jpg",
+      "contentType": "image/jpeg",
+      "bytes": 155819,
+      "hash": "0f29579587c66e9f9b026ce2390f9f00f082b7a06031a645103dfa634aa03dfa"
+    },
+    {
+      "source": "driver_day_records.pre_dvir_photo_data_urls:1[3]",
+      "oldRef": "r2://operator/operator-customer-pickup-photo/2026/07/01/SOB113252/510d9c30-519e-4c73-8253-3935488ecf7a-operator_load_records.photo_data_url-44.jpg",
+      "newRef": "r2://driver/driver-dvir-pre-photo/2026/07/01/testing-2026-06-25/44c1137b-a0c7-47b1-9519-2add3e0e9ee6-driver_day_records.pre_dvir_photo_data_urls-1-3.jpg",
+      "contentType": "image/jpeg",
+      "bytes": 155819,
+      "hash": "0f29579587c66e9f9b026ce2390f9f00f082b7a06031a645103dfa634aa03dfa"
+    }
+  ]
+}

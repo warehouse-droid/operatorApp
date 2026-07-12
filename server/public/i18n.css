@@ -1,0 +1,27 @@
+.language-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--line, #aebbc2);
+  border-radius: 999px;
+  background: #eef6f4;
+  white-space: nowrap;
+}
+
+.language-toggle button {
+  min-width: 42px;
+  min-height: 30px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.language-toggle button.active {
+  background: var(--accent, #006f6b);
+  color: #fff;
+}

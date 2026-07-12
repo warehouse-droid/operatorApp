@@ -1,0 +1,262 @@
+{
+  "drivers": [
+    {
+      "name": "Alex Wong",
+      "license": "DZ",
+      "number": "123",
+      "login": "alex",
+      "password": "123456",
+      "samsaraPrimaryLogin": "",
+      "samsaraSecondaryLogin": "",
+      "ownYardFixedMinutes": 30,
+      "vendorFixedMinutes": 30,
+      "deliveryFixedMinutes": 15,
+      "outsideFixedMinutes": 15,
+      "minutesPerPallet": 1.5,
+      "loadMinutes": 30,
+      "unloadMinutes": 15
+    },
+    {
+      "name": "Jenny Lee",
+      "license": "DZ",
+      "number": "D18870",
+      "login": "jenny",
+      "password": "",
+      "samsaraPrimaryLogin": "",
+      "samsaraSecondaryLogin": "",
+      "ownYardFixedMinutes": 50,
+      "vendorFixedMinutes": 70,
+      "deliveryFixedMinutes": 70,
+      "outsideFixedMinutes": 70,
+      "minutesPerPallet": 1.5,
+      "loadMinutes": 50,
+      "unloadMinutes": 70
+    },
+    {
+      "name": "testing",
+      "license": "AZ",
+      "number": "ABCD1234",
+      "login": "testing",
+      "password": "123456",
+      "samsaraPrimaryLogin": "Henry",
+      "samsaraSecondaryLogin": "",
+      "ownYardFixedMinutes": 30,
+      "vendorFixedMinutes": 20,
+      "deliveryFixedMinutes": 20,
+      "outsideFixedMinutes": 20,
+      "minutesPerPallet": 1,
+      "loadMinutes": 30,
+      "unloadMinutes": 20
+    },
+    {
+      "name": "testing2",
+      "license": "AZ",
+      "number": "testing2",
+      "login": "testing2",
+      "password": "testing2",
+      "samsaraPrimaryLogin": "",
+      "samsaraSecondaryLogin": "",
+      "ownYardFixedMinutes": 40,
+      "vendorFixedMinutes": 35,
+      "deliveryFixedMinutes": 35,
+      "outsideFixedMinutes": 35,
+      "minutesPerPallet": 1,
+      "loadMinutes": 40,
+      "unloadMinutes": 35
+    },
+    {
+      "name": "Aurther",
+      "license": "DZ",
+      "number": "123",
+      "login": "Aurther",
+      "password": "aurther1234",
+      "samsaraPrimaryLogin": "",
+      "samsaraSecondaryLogin": "",
+      "ownYardFixedMinutes": 40,
+      "vendorFixedMinutes": 45,
+      "deliveryFixedMinutes": 15,
+      "outsideFixedMinutes": 15,
+      "minutesPerPallet": 1,
+      "loadMinutes": 40,
+      "unloadMinutes": 15
+    },
+    {
+      "name": "Dao",
+      "license": "AZ",
+      "number": "1234",
+      "login": "Dao",
+      "password": "MBT@3445",
+      "samsaraPrimaryLogin": "",
+      "samsaraSecondaryLogin": "",
+      "ownYardFixedMinutes": 45,
+      "vendorFixedMinutes": 30,
+      "deliveryFixedMinutes": 10,
+      "outsideFixedMinutes": 10,
+      "minutesPerPallet": 1,
+      "loadMinutes": 45,
+      "unloadMinutes": 10
+    },
+    {
+      "name": "Li",
+      "license": "AZ",
+      "number": "223",
+      "login": "Li",
+      "password": "MBT@3445",
+      "samsaraPrimaryLogin": "",
+      "samsaraSecondaryLogin": "",
+      "ownYardFixedMinutes": 45,
+      "vendorFixedMinutes": 70,
+      "deliveryFixedMinutes": 20,
+      "outsideFixedMinutes": 20,
+      "minutesPerPallet": 3,
+      "loadMinutes": 45,
+      "unloadMinutes": 20
+    },
+    {
+      "name": "Sety",
+      "license": "AZ",
+      "number": "344",
+      "login": "Sety",
+      "password": "MBT@3445",
+      "samsaraPrimaryLogin": "",
+      "samsaraSecondaryLogin": "",
+      "ownYardFixedMinutes": 30,
+      "vendorFixedMinutes": 100,
+      "deliveryFixedMinutes": 10,
+      "outsideFixedMinutes": 10,
+      "minutesPerPallet": 1,
+      "loadMinutes": 30,
+      "unloadMinutes": 10
+    },
+    {
+      "name": "Jason",
+      "license": "AZ",
+      "number": "234",
+      "login": "jason",
+      "password": "jason",
+      "samsaraPrimaryLogin": "",
+      "samsaraSecondaryLogin": "",
+      "ownYardFixedMinutes": 40,
+      "vendorFixedMinutes": 70,
+      "deliveryFixedMinutes": 30,
+      "outsideFixedMinutes": 30,
+      "minutesPerPallet": 1.5,
+      "loadMinutes": 40,
+      "unloadMinutes": 30
+    },
+    {
+      "name": "Mike",
+      "license": "AZ",
+      "number": "345",
+      "login": "mike",
+      "password": "mike",
+      "samsaraPrimaryLogin": "",
+      "samsaraSecondaryLogin": "",
+      "ownYardFixedMinutes": 40,
+      "vendorFixedMinutes": 35,
+      "deliveryFixedMinutes": 35,
+      "outsideFixedMinutes": 35,
+      "minutesPerPallet": 2,
+      "loadMinutes": 40,
+      "unloadMinutes": 35
+    },
+    {
+      "name": "Nick",
+      "license": "DZ",
+      "number": "456",
+      "login": "Nick",
+      "password": "3445",
+      "samsaraPrimaryLogin": "",
+      "samsaraSecondaryLogin": "",
+      "ownYardFixedMinutes": 40,
+      "vendorFixedMinutes": 35,
+      "deliveryFixedMinutes": 20,
+      "outsideFixedMinutes": 20,
+      "minutesPerPallet": 1,
+      "loadMinutes": 40,
+      "unloadMinutes": 20
+    }
+  ],
+  "trucks": [
+    {
+      "plate": "BL27129",
+      "capacityLbs": 40000,
+      "travelTimePercent": 30
+    },
+    {
+      "plate": "BC71838",
+      "capacityLbs": 80000,
+      "travelTimePercent": 30
+    },
+    {
+      "plate": "CC46868",
+      "capacityLbs": 78000,
+      "travelTimePercent": 30
+    },
+    {
+      "plate": "BD98773",
+      "capacityLbs": 83000,
+      "travelTimePercent": 30
+    },
+    {
+      "plate": "CE94489",
+      "capacityLbs": 83000,
+      "travelTimePercent": 30
+    },
+    {
+      "plate": "CE94487",
+      "capacityLbs": 83000,
+      "travelTimePercent": 30
+    },
+    {
+      "plate": "CA54629",
+      "capacityLbs": 83000
+    }
+  ],
+  "ownYards": [
+    {
+      "code": "3445",
+      "name": "3445",
+      "locationId": 1,
+      "address": "3445 Kennedy Road, Toronto, ON",
+      "lat": 43.8204306,
+      "lng": -79.3053423
+    },
+    {
+      "code": "2967",
+      "name": "2967",
+      "locationId": 28,
+      "address": "2967 Kennedy Road, Toronto, ON",
+      "lat": 43.806119,
+      "lng": -79.2986377
+    },
+    {
+      "code": "12441",
+      "name": "12441",
+      "locationId": 15,
+      "address": "12441 Woodbine Avenue, Whitchurch-Stouffville, ON",
+      "lat": 43.948694,
+      "lng": -79.3727582
+    },
+    {
+      "code": "150",
+      "name": "150",
+      "locationId": 26,
+      "address": "150 Clark Blvd, Brampton, ON L6T 4Y8, Canada"
+    }
+  ],
+  "sync": {
+    "mode": "manual",
+    "intervalSeconds": 60,
+    "maxRunSeconds": 1800,
+    "running": false,
+    "lastStartedAt": "2026-07-11T19:14:56.721Z",
+    "lastFinishedAt": "2026-07-11T19:34:37.131Z",
+    "lastSource": "control_manual",
+    "lastStatus": "success",
+    "lastError": ""
+  },
+  "samsara": {
+    "dvirAuthorId": "1868723"
+  }
+}

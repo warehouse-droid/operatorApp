@@ -7,11 +7,14 @@
     "dev": "node --watch src/server.js",
     "start": "node src/server.js",
     "migrate": "node src/migrate.js",
+    "test:rollback-endpoints": "node src/rollback-test-harness.js",
+    "test:sync-shape": "node src/sync-shape-harness.js",
     "sync:delivery": "node src/sync-delivery.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "pg": "^8.11.5"
+    "pg": "^8.11.5",
+    "qr-scanner": "^1.4.2"
   }
 }
