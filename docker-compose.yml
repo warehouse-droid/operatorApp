@@ -1,0 +1,104 @@
+name: mbbs-operator-app
+
+x-app-common: &app-common
+  build:
+    context: ./server
+  env_file:
+    - ./docker/env/.env
+  volumes:
+    - app_data:/app/data
+    - ./docker/env/.env:/app/.env:ro
+    - ./docker/env/.env.old:/app/.env.old:ro
+  networks:
+    - mbbs
+
+services:
+  db:
+    image: postgres:18-alpine
+    env_file:
+      - ./docker/env/.env
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    networks:
+      - mbbs
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama_models:/root/.ollama
+    networks:
+      - mbbs
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  app:
+    <<: *app-common
+    environment:
+      PORT: 3000
+      NODE_ENV: production
+    ports:
+      - "127.0.0.1:${MBBS_APP_HOST_PORT:-3001}:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    restart: unless-stopped
+
+  migrate:
+    <<: *app-common
+    command: ["npm", "run", "migrate"]
+    depends_on:
+      db:
+        condition: service_healthy
+    profiles: ["tools"]
+    restart: "no"
+
+  bootstrap-data:
+    image: alpine:3.22
+    command:
+      - /bin/sh
+      - -c
+      - |
+        if [ ! -f /target/.mbbs-data-bootstrapped ]; then
+          cp -a /source/. /target/
+          touch /target/.mbbs-data-bootstrapped
+        fi
+        chown -R 1000:1000 /target
+    volumes:
+      - ./server/data:/source:ro
+      - app_data:/target
+    profiles: ["tools"]
+    restart: "no"
+
+  ollama-pull:
+    image: ollama/ollama:latest
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    command: ["pull", "qwen3:4b-instruct"]
+    networks:
+      - mbbs
+    depends_on:
+      ollama:
+        condition: service_healthy
+    profiles: ["tools"]
+    restart: "no"
+
+networks:
+  mbbs:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  app_data:
+  ollama_models:

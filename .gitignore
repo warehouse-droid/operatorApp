@@ -1,3 +1,6 @@
+.env
+.env.old
+.env.old.backup
 server/.env
 server/.env.*
 !server/.env.example
@@ -5,3 +8,5 @@ server/data/env-selection.json
 server/node_modules/
 
 env.old.backup
+docker/env/
+docker/backups/

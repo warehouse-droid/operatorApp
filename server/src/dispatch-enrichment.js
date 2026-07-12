@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { pool, query } from "./db.js";
+import { config } from "./config.js";
 
 const YARD_ADDRESSES = {
   "3445": "3445 Kennedy Road, Toronto, ON",
@@ -237,7 +238,7 @@ async function writeOllamaAudit({ parserType, sourceRef = "", prompt, response =
       `INSERT INTO dispatch_ollama_audit
         (parser_type, model, source_ref, prompt, response, parsed, error)
        VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [parserType, "qwen3:4b-instruct", sourceRef, prompt, response, parsed ? JSON.stringify(parsed) : null, error]
+      [parserType, config.ollama.model, sourceRef, prompt, response, parsed ? JSON.stringify(parsed) : null, error]
     );
   } catch {
     // Audit should never block operational parsing.
@@ -850,12 +851,12 @@ async function parseSalesOrderWithOllama(note, { sourceRef = "" } = {}) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 15000);
   try {
-    const response = await fetch("http://127.0.0.1:11434/api/generate", {
+    const response = await fetch(`${config.ollama.baseUrl}/api/generate`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       signal: controller.signal,
       body: JSON.stringify({
-        model: "qwen3:4b-instruct",
+        model: config.ollama.model,
         stream: false,
         prompt: `You extract dispatch data from messy sales-order notes for a yard delivery planner.
 
@@ -929,12 +930,12 @@ async function parsePurchaseYardWithOllama({ vendor, memo, candidates, sourceRef
       aliases: yard.aliases,
       address: yard.address
     }));
-    const response = await fetch("http://127.0.0.1:11434/api/generate", {
+    const response = await fetch(`${config.ollama.baseUrl}/api/generate`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       signal: controller.signal,
       body: JSON.stringify({
-        model: "qwen3:4b-instruct",
+        model: config.ollama.model,
         stream: false,
         prompt: `A purchase order memo may mention which vendor yard to pick up from, for example "Ayr Yard - Unilock". Choose exactly one yard id from the candidate list only if the memo clearly identifies it. Return strict JSON only with keys yardId and confidence. If uncertain, yardId must be empty.\n\nVendor: ${vendor || ""}\nMemo: ${memo || ""}\nCandidates: ${JSON.stringify(options)}`
       })
@@ -981,7 +982,7 @@ export async function enrichSalesOrderDispatch(order) {
     dispatch_window_start: parsed.windowStart || fallback.dispatch_window_start,
     dispatch_window_end: parsed.windowEnd || fallback.dispatch_window_end,
     dispatch_instructions: parsed.instructions || fallback.dispatch_instructions,
-    dispatch_parse_source: "ollama:qwen3:4b-instruct",
+    dispatch_parse_source: `ollama:${config.ollama.model}`,
     dispatch_note_hash: fallback.dispatch_note_hash
   };
 }

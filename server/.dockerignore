@@ -1,0 +1,11 @@
+.env
+.env.old
+.env.old.backup
+node_modules
+data
+npm-debug.log*
+*.log
+*.dump
+*.backup
+.git
+.gitignore

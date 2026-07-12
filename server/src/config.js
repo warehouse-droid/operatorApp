@@ -35,6 +35,10 @@ function buildConfig(env) {
       apiToken: env.SAMSARA_API_TOKEN || env.SAMSARA_API_KEY || "",
       dvirAuthorId: env.SAMSARA_DVIR_AUTHOR_ID || ""
     },
+    ollama: {
+      baseUrl: String(env.OLLAMA_BASE_URL || "http://127.0.0.1:11434").replace(/\/+$/, ""),
+      model: env.OLLAMA_MODEL || "qwen3:4b-instruct"
+    },
     photoUpload: {
       provider: env.PHOTO_UPLOAD_PROVIDER || "local_data_url",
       workerUrl: env.PHOTO_UPLOAD_WORKER_URL || "",
@@ -65,6 +69,7 @@ function replaceConfig(target, next) {
   target.databaseUrl = next.databaseUrl;
   target.googleMapsApiKey = next.googleMapsApiKey;
   target.samsara = { ...next.samsara };
+  target.ollama = { ...next.ollama };
   target.photoUpload = { ...next.photoUpload };
   target.netsuite = { ...next.netsuite };
 }
