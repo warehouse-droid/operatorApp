@@ -8,6 +8,12 @@ let selectedSnapshotId = "";
 let selectedSnapshot = null;
 let snapshotNotice = "";
 let snapshotLoading = false;
+const SNAPSHOT_EDIT_SESSION_KEY = "mbbs.dispatch.snapshot.sessionId";
+const snapshotSessionId = sessionStorage.getItem(SNAPSHOT_EDIT_SESSION_KEY) || `snapshot-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+sessionStorage.setItem(SNAPSHOT_EDIT_SESSION_KEY, snapshotSessionId);
+let snapshotLease = null;
+let snapshotLeaseToken = "";
+let snapshotLeaseHeartbeatTimer = null;
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -46,6 +52,53 @@ function snapshotApi(path, options = {}) {
   });
 }
 
+function snapshotCanEdit() {
+  return Boolean(snapshotLeaseToken && snapshotLease?.active && snapshotLease.sessionId === snapshotSessionId);
+}
+
+async function refreshSnapshotLease() {
+  const payload = await snapshotApi(`/api/dispatch/plan-edit-lease?planDate=${encodeURIComponent(snapshotDate)}`);
+  snapshotLease = payload.lease || null;
+  if (!snapshotLease?.active || snapshotLease.sessionId !== snapshotSessionId) snapshotLeaseToken = "";
+}
+
+async function enterSnapshotEditMode() {
+  const payload = await snapshotApi("/api/dispatch/plan-edit-lease/acquire", {
+    method: "POST",
+    body: JSON.stringify({ planDate: snapshotDate, sessionId: snapshotSessionId })
+  });
+  snapshotLease = payload.lease || null;
+  snapshotLeaseToken = payload.editLeaseToken || "";
+  window.clearInterval(snapshotLeaseHeartbeatTimer);
+  snapshotLeaseHeartbeatTimer = window.setInterval(async () => {
+    if (!snapshotCanEdit()) return;
+    try {
+      const heartbeat = await snapshotApi("/api/dispatch/plan-edit-lease/heartbeat", {
+        method: "POST",
+        body: JSON.stringify({ planDate: snapshotDate, sessionId: snapshotSessionId, editLeaseToken: snapshotLeaseToken })
+      });
+      snapshotLease = heartbeat.lease || snapshotLease;
+    } catch {
+      snapshotLeaseToken = "";
+      window.clearInterval(snapshotLeaseHeartbeatTimer);
+      snapshotLeaseHeartbeatTimer = null;
+      renderSnapshotApp();
+    }
+  }, 30000);
+}
+
+async function releaseSnapshotEditMode() {
+  if (!snapshotCanEdit()) return;
+  await snapshotApi("/api/dispatch/plan-edit-lease/release", {
+    method: "POST",
+    body: JSON.stringify({ planDate: snapshotDate, sessionId: snapshotSessionId, editLeaseToken: snapshotLeaseToken })
+  });
+  snapshotLease = null;
+  snapshotLeaseToken = "";
+  window.clearInterval(snapshotLeaseHeartbeatTimer);
+  snapshotLeaseHeartbeatTimer = null;
+}
+
 function snapshotCounts(snapshot) {
   return `${snapshot.orderCount || 0} orders | ${snapshot.truckCount || 0} trucks | ${snapshot.loadCount || 0} loads | ${snapshot.stopCount || 0} stops`;
 }
@@ -76,7 +129,9 @@ function renderSnapshotDetail() {
         </div>
         <div class="actions">
           <button data-action="back-menu" type="button">${st("dispatch.backMenu", "Back to Menu")}</button>
-          <button class="primary" data-action="restore-snapshot" ${snapshot.current ? "disabled" : ""} type="button">${st("dispatch.restoreSnapshot", "Restore Snapshot")}</button>
+          ${snapshotCanEdit()
+            ? `<button data-action="exit-edit-mode" type="button">Exit Edit</button><button class="primary" data-action="restore-snapshot" ${snapshot.current ? "disabled" : ""} type="button">${st("dispatch.restoreSnapshot", "Restore Snapshot")}</button>`
+            : `<button class="primary" data-action="enter-edit-mode" ${snapshotLease?.active ? "disabled" : ""} type="button">${snapshotLease?.active ? `${escapeHtml(snapshotLease.operatorName || "Another dispatcher")} editing` : "Enter Edit"}</button>`}
         </div>
       </div>
       <div class="snapshot-meta-grid">
@@ -149,6 +204,7 @@ async function loadSnapshots({ keepSelection = false } = {}) {
   try {
     const payload = await snapshotApi(`/api/dispatch/plan-snapshots?date=${encodeURIComponent(snapshotDate)}`);
     snapshots = payload.snapshots || [];
+    await refreshSnapshotLease();
     if (!keepSelection || !snapshots.some((snapshot) => snapshot.id === selectedSnapshotId)) {
       selectedSnapshotId = snapshots[0]?.id || "";
     }
@@ -177,7 +233,12 @@ async function restoreSelectedSnapshot() {
   try {
     const restored = await snapshotApi(`/api/dispatch/plan-snapshots/${encodeURIComponent(selectedSnapshot.id)}/restore`, {
       method: "POST",
-      body: JSON.stringify({ audit: { sessionId: `snapshot-${Date.now()}-${Math.random().toString(16).slice(2)}` } })
+      body: JSON.stringify({
+        planDate: selectedSnapshot.planDate,
+        sessionId: snapshotSessionId,
+        editLeaseToken: snapshotLeaseToken,
+        audit: { sessionId: snapshotSessionId }
+      })
     });
     selectedSnapshotId = `current-${restored.plan?.id || selectedSnapshot.planId}`;
     snapshotNotice = "Snapshot restored. Planning screens will refresh.";
@@ -199,6 +260,7 @@ snapshotApp.addEventListener("click", (event) => {
     return;
   }
   if (action === "load-snapshots") {
+    releaseSnapshotEditMode().catch(() => {});
     snapshotDate = document.getElementById("snapshotDate")?.value || snapshotDate;
     loadSnapshots();
     return;
@@ -214,6 +276,30 @@ snapshotApp.addEventListener("click", (event) => {
   if (action === "restore-snapshot") {
     restoreSelectedSnapshot();
   }
+  if (action === "enter-edit-mode") {
+    enterSnapshotEditMode().then(() => {
+      snapshotNotice = "Edit Mode enabled for this date.";
+      renderSnapshotApp();
+    }).catch((error) => {
+      snapshotNotice = `Cannot enter Edit Mode: ${error.message}`;
+      renderSnapshotApp();
+    });
+  }
+  if (action === "exit-edit-mode") {
+    releaseSnapshotEditMode().then(renderSnapshotApp).catch((error) => {
+      snapshotNotice = `Cannot exit Edit Mode: ${error.message}`;
+      renderSnapshotApp();
+    });
+  }
+});
+
+window.addEventListener("pagehide", () => {
+  if (!snapshotCanEdit()) return;
+  snapshotApi("/api/dispatch/plan-edit-lease/release", {
+    method: "POST",
+    keepalive: true,
+    body: JSON.stringify({ planDate: snapshotDate, sessionId: snapshotSessionId, editLeaseToken: snapshotLeaseToken })
+  }).catch(() => {});
 });
 
 window.addEventListener("mbbs-language-changed", renderSnapshotApp);

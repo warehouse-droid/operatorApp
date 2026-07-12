@@ -248,11 +248,11 @@
   "sync": {
     "mode": "manual",
     "intervalSeconds": 60,
-    "maxRunSeconds": 900,
+    "maxRunSeconds": 1800,
     "running": false,
-    "lastStartedAt": "2026-07-10T23:56:14.915Z",
-    "lastFinishedAt": "2026-07-10T23:58:29.409Z",
-    "lastSource": "control_inbound_transfer_manual",
+    "lastStartedAt": "2026-07-11T19:14:56.721Z",
+    "lastFinishedAt": "2026-07-11T19:34:37.131Z",
+    "lastSource": "control_manual",
     "lastStatus": "success",
     "lastError": ""
   },

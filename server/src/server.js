@@ -17,6 +17,7 @@ import { listDispatchOrders, listScmPurchaseOrders, listScmSchedule, updateScmSc
 import { listDispatchVendorYards, updateDispatchVendorYard, upsertDispatchVendorYard, listDispatchParserRules, updateDispatchParserRule, listOllamaAudit, listDispatchVendorMappings, discoverDispatchVendorMappingsFromPurchaseOrders, updateDispatchVendorMapping, createDispatchLocalVendor, updateDispatchLocalVendor } from "./dispatch-enrichment.js";
 import { listDispatchAudit, writeDispatchAudit } from "./dispatch-audit-repository.js";
 import { DispatchPlanDateMismatchError, StaleDispatchPlanSaveError, confirmDispatchPlan, createDispatchPlan, getCurrentDispatchPlan, getDispatchPlan, getDispatchPlanRevision, getDispatchPlanSnapshot, listDispatchPlanSnapshots, listDispatchPlans, reopenDispatchPlan, restoreDispatchPlanSnapshot, saveDispatchPlanSnapshot } from "./dispatch-plan-repository.js";
+import { DispatchPlanEditLeaseError, acquireDispatchPlanEditLease, assertDispatchPlanEditLease, getDispatchPlanEditLease, heartbeatDispatchPlanEditLease, releaseDispatchPlanEditLease } from "./dispatch-plan-lease-repository.js";
 import { getDispatchStatistics } from "./dispatch-statistics-repository.js";
 import { endDriverRest, ensureDriverSamsaraDutyForJob, getActiveDriverRest, getDriverDayState, getNextDriverJob, listDriverHistory, listDriverJobStatuses, recordDriverJobPhotos, skipDriverDvirForTesting, startDriverJob, startDriverRest, submitDriverDvir } from "./driver-repository.js";
 import { createSamsaraDriverAuthToken, createSamsaraDriverVehicleAssignment, findSamsaraDriverByUsername, listSamsaraVehicleLocations, setSamsaraDriverDutyStatus, testSamsaraConnection } from "./samsara.js";
@@ -1319,6 +1320,34 @@ function requireDispatcher(req, res, next) {
     return res.status(403).json({ error: "Dispatcher account required" });
   }
   next();
+}
+
+function dispatchEditLeaseInput(req, planDate = "") {
+  return {
+    planDate: planDate || req.body?.planDate || req.body?.date || req.query?.planDate || req.query?.date || "",
+    operatorId: req.operator?.id || "",
+    operatorName: req.operator?.display_name || req.operator?.username || "",
+    sessionId: req.body?.sessionId || req.body?.audit?.sessionId || req.query?.sessionId || "",
+    token: req.body?.editLeaseToken || req.get("x-dispatch-edit-lease") || req.query?.editLeaseToken || ""
+  };
+}
+
+async function requireDispatchPlanEditLease(req, planDate = "") {
+  const input = dispatchEditLeaseInput(req, planDate);
+  if (process.env.MBBS_ENABLE_ROLLBACK_TESTS === "1" && req.get("x-mbbs-rollback-test") === "1" && !input.token) {
+    input.planDate = input.planDate || "2099-12-31";
+    const acquired = await acquireDispatchPlanEditLease(input);
+    input.token = acquired.token;
+  }
+  return assertDispatchPlanEditLease(input);
+}
+
+function sendDispatchPlanEditLeaseError(res, error) {
+  return res.status(error.status || 409).json({
+    error: error.message,
+    code: error.code || "DISPATCH_PLAN_EDIT_LEASE_REQUIRED",
+    lease: error.lease || null
+  });
 }
 
 function normalizedOperatorRole(operator) {
@@ -3089,8 +3118,76 @@ app.get("/api/dispatch/plans", async (req, res, next) => {
   }
 });
 
-app.post("/api/dispatch/plans", async (req, res, next) => {
+app.get("/api/dispatch/plan-edit-lease", requireOperator, requireDispatcher, async (req, res, next) => {
   try {
+    res.json({ lease: await getDispatchPlanEditLease(req.query.planDate || req.query.date || "") });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/dispatch/plan-edit-lease/acquire", requireOperator, requireDispatcher, async (req, res, next) => {
+  try {
+    const acquired = await acquireDispatchPlanEditLease(dispatchEditLeaseInput(req));
+    await writeDispatchAudit({
+      action: acquired.replacedExpired ? "dispatch_plan_edit_lease_expired_takeover" : acquired.renewed ? "dispatch_plan_edit_lease_renewed" : "dispatch_plan_edit_lease_acquired",
+      entityType: "plan",
+      entityId: acquired.lease.planDate,
+      planDate: acquired.lease.planDate,
+      operatorId: req.operator.id,
+      operatorName: req.operator.display_name || req.operator.username,
+      sessionId: acquired.lease.sessionId,
+      details: { expiresAt: acquired.lease.expiresAt }
+    }).catch(() => null);
+    emitAppEvent("dispatch.plan.edit_lease_changed", {
+      planDate: acquired.lease.planDate,
+      lease: acquired.lease,
+      sourceSessionId: acquired.lease.sessionId
+    });
+    res.json({ lease: acquired.lease, editLeaseToken: acquired.token });
+  } catch (error) {
+    if (error instanceof DispatchPlanEditLeaseError) return sendDispatchPlanEditLeaseError(res, error);
+    next(error);
+  }
+});
+
+app.post("/api/dispatch/plan-edit-lease/heartbeat", requireOperator, requireDispatcher, async (req, res, next) => {
+  try {
+    res.json({ lease: await heartbeatDispatchPlanEditLease(dispatchEditLeaseInput(req)) });
+  } catch (error) {
+    if (error instanceof DispatchPlanEditLeaseError) return sendDispatchPlanEditLeaseError(res, error);
+    next(error);
+  }
+});
+
+app.post("/api/dispatch/plan-edit-lease/release", requireOperator, requireDispatcher, async (req, res, next) => {
+  try {
+    const released = await releaseDispatchPlanEditLease(dispatchEditLeaseInput(req));
+    if (released) {
+      await writeDispatchAudit({
+        action: "dispatch_plan_edit_lease_released",
+        entityType: "plan",
+        entityId: released.planDate,
+        planDate: released.planDate,
+        operatorId: req.operator.id,
+        operatorName: req.operator.display_name || req.operator.username,
+        sessionId: released.sessionId
+      }).catch(() => null);
+      emitAppEvent("dispatch.plan.edit_lease_changed", {
+        planDate: released.planDate,
+        lease: null,
+        sourceSessionId: released.sessionId
+      });
+    }
+    res.json({ released: Boolean(released) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/dispatch/plans", requireOperator, requireDispatcher, async (req, res, next) => {
+  try {
+    await requireDispatchPlanEditLease(req, req.body?.planDate);
     const plan = await createDispatchPlan({
       planDate: req.body?.planDate,
       note: req.body?.note || ""
@@ -3117,6 +3214,7 @@ app.get("/api/dispatch/plans/current", async (req, res, next) => {
     const plan = await getCurrentDispatchPlan({ planDate: req.query.date });
     res.json(plan || { savedAt: "", orders: [], trucks: [], planDate: req.query.date || new Date().toISOString().slice(0, 10) });
   } catch (error) {
+    if (error instanceof DispatchPlanEditLeaseError) return sendDispatchPlanEditLeaseError(res, error);
     next(error);
   }
 });
@@ -3146,6 +3244,7 @@ app.post("/api/dispatch/plan-snapshots/:snapshotId/restore", requireOperator, re
     }
     const beforePlan = await getDispatchPlanSnapshot(req.params.snapshotId);
     if (!beforePlan) return res.status(404).json({ error: "Dispatch snapshot not found" });
+    await requireDispatchPlanEditLease(req, beforePlan.planDate);
     const restored = await restoreDispatchPlanSnapshot(req.params.snapshotId, {
       sessionId: req.body?.audit?.sessionId || ""
     });
@@ -3193,6 +3292,7 @@ app.post("/api/dispatch/plan-snapshots/:snapshotId/restore", requireOperator, re
     });
     res.json({ plan, restoredSnapshot: restored.restoredSnapshot, operatorFlags, coAssignments });
   } catch (error) {
+    if (error instanceof DispatchPlanEditLeaseError) return sendDispatchPlanEditLeaseError(res, error);
     next(error);
   }
 });
@@ -3232,10 +3332,13 @@ app.get("/api/dispatch/plans/:id/revision", async (req, res, next) => {
   }
 });
 
-app.put("/api/dispatch/plans/:id", async (req, res, next) => {
+app.put("/api/dispatch/plans/:id", requireOperator, requireDispatcher, async (req, res, next) => {
   let previousPlan = null;
   try {
     previousPlan = await getDispatchPlan(req.params.id);
+    if (!previousPlan) return res.status(404).json({ error: "Dispatch plan not found" });
+    await requireDispatchPlanEditLease(req, previousPlan.planDate);
+    const forceSave = req.body?.forceSave === true;
     const requestedPlanDate = String(req.body?.planDate || req.body?.date || previousPlan?.planDate || "").slice(0, 10);
     const existingPlanDate = String(previousPlan?.planDate || "").slice(0, 10);
     if (previousPlan && requestedPlanDate && existingPlanDate && requestedPlanDate !== existingPlanDate) {
@@ -3288,7 +3391,7 @@ app.put("/api/dispatch/plans/:id", async (req, res, next) => {
       orders: cleanOrders,
       trucks: cleanTrucks,
       summary: req.body?.summary || {},
-      baseRevision: saveMode === "truck_sequence" ? null : req.body?.baseRevision,
+      baseRevision: forceSave || saveMode === "truck_sequence" ? null : req.body?.baseRevision,
       planDate: req.body?.planDate || req.body?.date || "",
       sessionId: req.body?.audit?.sessionId || ""
     });
@@ -3320,6 +3423,7 @@ app.put("/api/dispatch/plans/:id", async (req, res, next) => {
           orderCount: plan.orders.length,
           truckCount: plan.trucks.length,
           saveMode,
+          forceSave,
           coAssignments,
           scmSchedule,
           operatorFlags,
@@ -3327,9 +3431,10 @@ app.put("/api/dispatch/plans/:id", async (req, res, next) => {
         }
       }).catch(() => null);
     }
-    emitAppEvent("dispatch.plan.saved", { planId: plan.id, planDate: plan.planDate, savedAt: plan.savedAt, sourceSessionId: req.body?.audit?.sessionId, operatorFlags, changedOperatorRefs, refreshOrderPool, scmSchedule });
+    emitAppEvent("dispatch.plan.saved", { planId: plan.id, planDate: plan.planDate, savedAt: plan.savedAt, sourceSessionId: req.body?.audit?.sessionId, operatorFlags, changedOperatorRefs, refreshOrderPool, scmSchedule, forceSave });
     res.json({ ...plan, operatorFlags, scmSchedule });
   } catch (error) {
+    if (error instanceof DispatchPlanEditLeaseError) return sendDispatchPlanEditLeaseError(res, error);
     if (error instanceof DispatchPlanDateMismatchError) {
       await writeDispatchAudit({
         action: "dispatch.plan.date_mismatch_blocked",
@@ -3379,11 +3484,12 @@ app.put("/api/dispatch/plans/:id", async (req, res, next) => {
   }
 });
 
-app.post("/api/dispatch/plans/:id/confirm", async (req, res, next) => {
+app.post("/api/dispatch/plans/:id/confirm", requireOperator, requireDispatcher, async (req, res, next) => {
   let previousPlan = null;
   try {
     previousPlan = await getDispatchPlan(req.params.id);
     if (!previousPlan) return res.status(404).json({ error: "Dispatch plan not found" });
+    await requireDispatchPlanEditLease(req, previousPlan.planDate);
     const hasSubmittedSnapshot = Array.isArray(req.body?.orders) || Array.isArray(req.body?.trucks);
     let planForConfirm = previousPlan;
     if (hasSubmittedSnapshot) {
@@ -3456,6 +3562,7 @@ app.post("/api/dispatch/plans/:id/confirm", async (req, res, next) => {
     emitAppEvent("dispatch.plan.confirmed", { planId: plan.id, planDate: plan.planDate, sourceSessionId: req.body?.audit?.sessionId, operatorFlags, changedOperatorRefs, refreshOrderPool: true, scmSchedule });
     res.json({ ...plan, operatorFlags, scmSchedule });
   } catch (error) {
+    if (error instanceof DispatchPlanEditLeaseError) return sendDispatchPlanEditLeaseError(res, error);
     if (error instanceof DispatchPlanDateMismatchError) {
       await writeDispatchAudit({
         action: "dispatch.plan.date_mismatch_blocked",
@@ -3505,8 +3612,11 @@ app.post("/api/dispatch/plans/:id/confirm", async (req, res, next) => {
   }
 });
 
-app.post("/api/dispatch/plans/:id/reopen", async (req, res, next) => {
+app.post("/api/dispatch/plans/:id/reopen", requireOperator, requireDispatcher, async (req, res, next) => {
   try {
+    const existingPlan = await getDispatchPlan(req.params.id);
+    if (!existingPlan) return res.status(404).json({ error: "Dispatch plan not found" });
+    await requireDispatchPlanEditLease(req, existingPlan.planDate);
     const plan = await reopenDispatchPlan(req.params.id, { note: req.body?.note || "" });
     await writeDispatchAudit({
       action: "dispatch_plan_reopened",
@@ -3604,6 +3714,7 @@ app.get("/api/dispatch/orders", async (req, res, next) => {
     const type = req.query.type ? String(req.query.type).toUpperCase() : null;
     res.json(await listDispatchOrdersForResponse({ type }));
   } catch (error) {
+    if (error instanceof DispatchPlanEditLeaseError) return sendDispatchPlanEditLeaseError(res, error);
     next(error);
   }
 });
@@ -4242,6 +4353,7 @@ app.post("/api/dispatch/vendor-yards", async (req, res, next) => {
 
 app.put("/api/dispatch/orders/:id/vendor-yard", async (req, res, next) => {
   try {
+    await requireDispatchPlanEditLease(req);
     const updated = await setPurchaseOrderVendorYard(req.params.id, req.body?.vendorYardId);
     await writeDispatchAudit({
       action: "po_vendor_yard_updated",
@@ -4262,6 +4374,7 @@ app.put("/api/dispatch/orders/:id/vendor-yard", async (req, res, next) => {
 
 app.put("/api/dispatch/orders/:id/details", async (req, res, next) => {
   try {
+    await requireDispatchPlanEditLease(req);
     const updated = await updateDispatchOrderDetails(req.params.id, req.body || {});
     await writeDispatchAudit({
       action: "dispatch_info_updated",
@@ -4297,6 +4410,7 @@ app.get("/api/dispatch/orders/:id/po-allocations", async (req, res, next) => {
 
 app.post("/api/dispatch/orders/:id/po-allocations", async (req, res, next) => {
   try {
+    await requireDispatchPlanEditLease(req);
     const allocations = Array.isArray(req.body?.lines)
       ? await createSalesOrderPoAllocations({
         salesOrderRef: req.params.id,
@@ -4337,6 +4451,7 @@ app.post("/api/dispatch/orders/:id/po-allocations", async (req, res, next) => {
 
 app.delete("/api/dispatch/po-allocations/:allocationId", async (req, res, next) => {
   try {
+    await requireDispatchPlanEditLease(req);
     const cancelled = await cancelSalesOrderPoAllocation(req.params.allocationId, { cancelledBy: req.query.sessionId || "" });
     if (!cancelled) return res.status(404).json({ error: "Allocation not found or already cancelled." });
     await writeDispatchAudit({
@@ -4357,6 +4472,7 @@ app.delete("/api/dispatch/po-allocations/:allocationId", async (req, res, next) 
 
 app.post("/api/dispatch/split-orders/unsplit", async (req, res, next) => {
   try {
+    await requireDispatchPlanEditLease(req);
     const result = await deactivateUnplannedDispatchSplitOrders({
       originalOrderId: req.body?.originalOrderId,
       orderType: req.body?.orderType,
@@ -4389,6 +4505,7 @@ app.post("/api/dispatch/split-orders/unsplit", async (req, res, next) => {
 
 app.post("/api/dispatch/co-orders", async (req, res, next) => {
   try {
+    await requireDispatchPlanEditLease(req);
     const co = await upsertLocalCoOrder({
       sourceOrderRef: req.body?.sourceOrderRef,
       fromYard: req.body?.fromYard,
@@ -4422,6 +4539,7 @@ app.post("/api/dispatch/co-orders", async (req, res, next) => {
 
 app.delete("/api/dispatch/co-orders/:coRef", async (req, res, next) => {
   try {
+    await requireDispatchPlanEditLease(req);
     const cancelled = await cancelLocalCoOrder(req.params.coRef, { requestedBy: req.query.sessionId || "" });
     if (!cancelled) return res.status(409).json({ error: "CO cannot be cancelled after it is received or loaded." });
     await writeDispatchAudit({
@@ -4442,6 +4560,7 @@ app.delete("/api/dispatch/co-orders/:coRef", async (req, res, next) => {
 
 app.post("/api/dispatch/operator-requests", async (req, res, next) => {
   try {
+    await requireDispatchPlanEditLease(req);
     const written = await createDispatchOperatorRequest({
       requestType: req.body?.requestType,
       orderRef: req.body?.orderRef,
@@ -4471,6 +4590,7 @@ app.put("/api/dispatch/plan", async (req, res, next) => {
     const requestedOrders = sanitizeDispatchPlanOrders(Array.isArray(req.body?.orders) ? req.body.orders : []);
     const requestedTrucks = Array.isArray(req.body?.trucks) ? req.body.trucks : [];
     const planDate = req.body?.planDate || req.body?.date || new Date().toISOString().slice(0, 10);
+    await requireDispatchPlanEditLease(req, planDate);
     let plan = req.body?.planId ? await getDispatchPlan(req.body.planId) : await getCurrentDispatchPlan({ planDate });
     if (!plan) plan = await createDispatchPlan({ planDate });
     const previousPlan = plan;
@@ -4555,6 +4675,7 @@ app.put("/api/dispatch/plan", async (req, res, next) => {
     emitAppEvent("dispatch.plan.saved", { planId: savedPlan.id, planDate: savedPlan.planDate, savedAt: savedPlan.savedAt, sourceSessionId: req.body?.audit?.sessionId, operatorFlags, changedOperatorRefs, refreshOrderPool });
     res.json({ ...savedPlan, operatorFlags });
   } catch (error) {
+    if (error instanceof DispatchPlanEditLeaseError) return sendDispatchPlanEditLeaseError(res, error);
     if (error instanceof StaleDispatchPlanSaveError) return sendStaleDispatchPlanResponse(res, error);
     next(error);
   }
@@ -6677,6 +6798,9 @@ app.post("/api/cycle-count/submit", async (req, res, next) => {
 
 app.use((error, req, res, next) => {
   console.error(error);
+  if (error instanceof DispatchPlanEditLeaseError) {
+    return sendDispatchPlanEditLeaseError(res, error);
+  }
   res.status(error.status || 500).json({ error: error.message });
 });
 

@@ -210,6 +210,46 @@ select {
   background: #edf8f6;
 }
 
+.dispatch-mode-pill {
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--ink-soft);
+  background: #f8fbfc;
+  font-size: 11px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.dispatch-mode-pill.editing {
+  border-color: #46a561;
+  background: #e7f6e8;
+  color: #216a36;
+}
+
+.dispatch-mode-pill.viewing {
+  background: #f1f5f7;
+}
+
+button[data-action="enter-edit-mode"]:disabled {
+  border-color: #c4cdd2;
+  background: #e4e8ea;
+  color: #7a878d;
+  cursor: not-allowed;
+  opacity: 1;
+  box-shadow: none;
+}
+
+button[data-action="enter-edit-mode"]:disabled:hover {
+  border-color: #c4cdd2;
+  background: #e4e8ea;
+  color: #7a878d;
+  transform: none;
+}
+
 .dispatch-menu-shell {
   min-width: 960px;
 }
