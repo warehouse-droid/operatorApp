@@ -24,6 +24,7 @@ const RESTORABLE_MODULES = new Set([
   "menu",
   "delivery-select",
   "delivery",
+  "delivery-consolidation",
   "receiving",
   "return-select",
   "cycle-count",
@@ -70,6 +71,17 @@ let deliveryLoadViewTruck = "";
 localStorage.removeItem("mbbs.operator.deliveryLoadViewTruck");
 let deliveryLoadTrucks = [];
 let savedDeliveryOrderKeys = new Set();
+let consolidationQueue = { total: 0, eligible: 0, blocked: 0, orders: [] };
+let consolidationBatch = null;
+let consolidationStage = initialOperatorState.consolidationStage === "review" ? "review" : "pick";
+let consolidationSearch = initialOperatorState.consolidationSearch || "";
+let consolidationSelectedItemKey = initialOperatorState.consolidationSelectedItemKey || "";
+let consolidationReviewOrderId = initialOperatorState.consolidationReviewOrderId || "";
+let consolidationReviewLineKey = initialOperatorState.consolidationReviewLineKey || "";
+let consolidationReviewLinePage = Number(initialOperatorState.consolidationReviewLinePage || 0);
+let consolidationDrafts = new Map();
+let consolidationBusy = false;
+let consolidationNotice = "";
 let compactLineMode = localStorage.getItem("mbbs.operator.compactLineList") === "true";
 let orders = [];
 let deliveryNotifications = { total: 0, salesOrder: { dueToday: 0 }, transferOrder: { dueToday: 0 }, items: [] };
@@ -538,6 +550,7 @@ function connectEvents() {
       "delivery.line.updated",
       "delivery.order.unpacked",
       "delivery.order.loaded",
+      "delivery.consolidation.updated",
       "dispatch.orders.updated"
     ];
     const receivingEvents = [
@@ -571,6 +584,10 @@ function connectEvents() {
         pendingDeliveryEventRefresh = false;
         pendingReceivingEventRefresh = false;
         pendingOperatorRequestAlert = false;
+        if (refreshDelivery && currentModule === "delivery-consolidation" && !consolidationBusy) {
+          await loadConsolidation({ keepItem: true });
+          return;
+        }
         if (refreshDelivery && currentModule === "delivery" && !fulfillmentSubmitting) {
           await loadOrders({ keepSelection: true, alertRefs });
           showToast("Orders updated");
@@ -1481,6 +1498,12 @@ function saveOperatorState() {
     deliveryBatchFilter,
     deliveryPrepMode,
     deliveryLoadViewDate,
+    consolidationStage,
+    consolidationSearch,
+    consolidationSelectedItemKey,
+    consolidationReviewOrderId,
+    consolidationReviewLineKey,
+    consolidationReviewLinePage,
     selectedId,
     selectedLineId,
     orderPage,
@@ -1515,6 +1538,10 @@ async function restoreOperatorView() {
   try {
     if (currentModule === "delivery") {
       await loadOrders({ keepSelection: true, alertRecent: true });
+      return;
+    }
+    if (currentModule === "delivery-consolidation") {
+      await loadConsolidation({ keepItem: true });
       return;
     }
     await Promise.all([
@@ -1584,6 +1611,7 @@ function render() {
   if (currentModule === "customer-pickup-scan") return renderCustomerPickupScan();
   if (currentModule === "customer-pickup") return renderCustomerPickupOrder();
   if (currentModule === "delivery-select") return renderDeliverySelect();
+  if (currentModule === "delivery-consolidation") return renderConsolidationPick();
   if (currentModule === "receiving") return renderReceiving();
   if (currentModule === "receiving-receipt") return renderReceiptScreen();
   if (currentModule === "return-select") return renderReturnSelect();
@@ -1687,6 +1715,10 @@ function renderDeliverySelect() {
       <button class="module-tile" data-action="select-delivery-pool" data-mode="load" type="button">
         <strong>${t("operator.perLoadView", "Per Load View")}</strong>
         <span>${t("operator.perLoadViewDesc", "Choose date and truck, then prepare by load sequence.")}</span>
+      </button>
+      <button class="module-tile" data-action="open-consolidation" type="button">
+        <strong>${t("operator.consolidationPick", "Consolidation Pick")}</strong>
+        <span>${t("operator.consolidationPickDesc", "Pick starred Sales Orders together across loads and dates.")}</span>
       </button>
     </section>
   `, `
@@ -2233,7 +2265,14 @@ function renderOrderPanel() {
           </div>
         ` : ""}
       </div>
-      <strong>${panelOrders.length}</strong>
+      <div class="order-panel-heading-actions">
+        ${deliveryPrepMode === "saved" ? `
+          <button class="secondary-button compact-action consolidation-jump-button" data-action="open-consolidation" type="button">
+            ${t("operator.consolidationPick", "Consolidation Pick")}
+          </button>
+        ` : ""}
+        <strong>${panelOrders.length}</strong>
+      </div>
     </div>
     ${renderDeliveryLoadControls()}
     ${renderDeliveryPrepModeControls()}
@@ -2603,6 +2642,481 @@ async function loadOrders(options = {}) {
   if (detailId) {
     await loadDetail(detailId, { silentRender: true });
     if (String(selectedId) === String(detailId)) render();
+  }
+}
+
+function consolidationDraftKey(allocation) {
+  return `${allocation.batchOrderId}:${allocation.lineKey}`;
+}
+
+function consolidationDraft(allocation) {
+  const key = consolidationDraftKey(allocation);
+  if (!consolidationDrafts.has(key)) {
+    consolidationDrafts.set(key, Object.fromEntries((allocation.units || []).map((unit) => [unit.key, qty(unit.required)])));
+  }
+  return consolidationDrafts.get(key);
+}
+
+function consolidationStatusText(status) {
+  return {
+    picking: t("operator.consolidationPicking", "Picking"),
+    ready: t("operator.readyToPack", "Ready to Pack"),
+    packed: t("operator.packed", "Packed"),
+    attention: t("operator.attentionRequired", "Attention Required")
+  }[status] || status;
+}
+
+function consolidationTotalsText(totals = []) {
+  return totals
+    .filter((unit) => qty(unit.required) > 0 || qty(unit.confirmed) > 0)
+    .map((unit) => `${displayQty(unit.confirmed)} / ${displayQty(unit.required)} ${escapeHtml(unit.label)}`)
+    .join(" | ") || "0";
+}
+
+function renderConsolidationQueue() {
+  const rows = consolidationQueue.orders || [];
+  return `
+    <section class="consolidation-queue">
+      <div class="consolidation-intro">
+        <div>
+          <span>${t("operator.savedSalesOrders", "Saved Sales Orders")}</span>
+          <strong>${consolidationQueue.eligible || 0} ${t("operator.ready", "ready")}</strong>
+          <p>${t("operator.consolidationQueueHelp", "All starred Sales Orders at this yard will be reserved together.")}</p>
+        </div>
+        <button class="primary-button" data-action="start-consolidation" ${consolidationBusy || !(consolidationQueue.eligible > 0) ? "disabled" : ""} type="button">
+          ${consolidationBusy ? t("operator.starting", "Starting...") : t("operator.startConsolidation", "Start Consolidation")}
+        </button>
+      </div>
+      ${consolidationNotice ? `<div class="sync-alert danger"><strong>${t("operator.cannotStart", "Cannot start")}</strong><span>${escapeHtml(consolidationNotice)}</span></div>` : ""}
+      <div class="consolidation-queue-list">
+        ${rows.map((row) => `
+          <article class="consolidation-queue-row ${row.eligible ? "eligible" : "blocked"}">
+            <div>
+              <strong>${escapeHtml(row.orderRef)}</strong>
+              <span>${formatDate(row.planDate)} | ${escapeHtml(row.truckPlate || "-")} | ${escapeHtml(row.loadName || "-")}</span>
+              ${row.customer ? `<small>${escapeHtml(row.customer)}</small>` : ""}
+            </div>
+            <div class="consolidation-queue-state">
+              <b>${row.eligible ? t("operator.ready", "Ready") : t("operator.blocked", "Blocked")}</b>
+              <span>${escapeHtml(row.issue || `${row.lineCount || 0} lines`)}</span>
+            </div>
+          </article>
+        `).join("") || `<div class="empty-state"><strong>${t("operator.noSavedSalesOrders", "No saved Sales Orders")}</strong><span>${t("operator.starOrdersFirst", "Star Sales Orders in Delivery Prep first.")}</span></div>`}
+      </div>
+    </section>
+  `;
+}
+
+function filteredConsolidationItems() {
+  const needle = consolidationSearch.trim().toLowerCase();
+  return (consolidationBatch?.items || []).filter((item) => {
+    return !needle || `${item.itemName} ${item.description}`.toLowerCase().includes(needle);
+  });
+}
+
+function selectedConsolidationItem() {
+  const items = filteredConsolidationItems();
+  let selected = items.find((item) => item.key === consolidationSelectedItemKey);
+  if (!selected) {
+    selected = items[0] || null;
+    consolidationSelectedItemKey = selected?.key || "";
+  }
+  return selected;
+}
+
+function renderConsolidationAllocation(allocation) {
+  const draft = consolidationDraft(allocation);
+  return `
+    <article class="consolidation-allocation ${allocation.syncException ? "warning" : ""}">
+      <div class="consolidation-allocation-head">
+        <div>
+          <strong>${escapeHtml(allocation.orderRef)}</strong>
+          <span>${formatDate(allocation.planDate)} | ${escapeHtml(allocation.truckPlate || "-")} | ${escapeHtml(allocation.loadName || "-")}</span>
+        </div>
+        ${allocation.syncException ? `<b>${t("operator.attentionRequired", "Attention Required")}</b>` : ""}
+      </div>
+      <div class="consolidation-unit-grid">
+        ${(allocation.units || []).map((unit) => {
+          const value = qty(draft[unit.key]);
+          return `
+            <div class="consolidation-unit">
+              <span>${escapeHtml(unit.label)}</span>
+              <div class="consolidation-required">
+                <span>${t("operator.required", "Required")}</span>
+                <strong>${displayQty(unit.required)} ${escapeHtml(unit.label)}</strong>
+                <small>${t("operator.remaining", "Remaining")} ${displayQty(Math.max(0, qty(unit.required) - value))}</small>
+              </div>
+              <div class="stepper">
+                <button data-action="step-consolidation" data-order="${allocation.batchOrderId}" data-line="${escapeHtml(allocation.lineKey)}" data-unit="${unit.key}" data-delta="-1" type="button">-</button>
+                <input value="${displayQty(value)}" readonly />
+                <button data-action="step-consolidation" data-order="${allocation.batchOrderId}" data-line="${escapeHtml(allocation.lineKey)}" data-unit="${unit.key}" data-delta="1" type="button">+</button>
+              </div>
+            </div>
+          `;
+        }).join("")}
+      </div>
+      <button class="primary-button compact-action" data-action="confirm-consolidation-line" data-order="${allocation.batchOrderId}" data-line="${escapeHtml(allocation.lineKey)}" ${consolidationBusy || allocation.syncException ? "disabled" : ""} type="button">${t("operator.confirmAllocation", "Confirm Allocation")}</button>
+    </article>
+  `;
+}
+
+function renderConsolidationPickStage() {
+  const items = filteredConsolidationItems();
+  const selected = selectedConsolidationItem();
+  return `
+    <div class="consolidation-workspace">
+      <aside class="consolidation-item-panel">
+        <label class="consolidation-search">
+          <span>${t("common.search", "Search")}</span>
+          <input id="consolidationSearch" value="${escapeHtml(consolidationSearch)}" placeholder="SKU / item" autocomplete="off" />
+        </label>
+        <div class="consolidation-item-list">
+          ${items.map((item) => `
+            <button class="consolidation-item-card ${item.key === selected?.key ? "active" : ""}" data-action="select-consolidation-item" data-item="${escapeHtml(item.key)}" type="button">
+              <strong>${escapeHtml(item.itemName)}</strong>
+              <span>${consolidationTotalsText(item.totals)}</span>
+              <small>${item.allocations.length} ${t("common.order", "order")}</small>
+            </button>
+          `).join("") || `<div class="empty-state small"><strong>${t("operator.noItems", "No items")}</strong><span>${t("operator.trySearch", "Try another search.")}</span></div>`}
+        </div>
+      </aside>
+      <section class="consolidation-allocation-panel">
+        ${selected ? `
+          <div class="consolidation-selected-item">
+            <div><span>${t("operator.consolidatedItem", "Consolidated item")}</span><strong>${escapeHtml(selected.itemName)}</strong><p>${escapeHtml(selected.description || "")}</p></div>
+            <div class="consolidation-selected-actions">
+              <b>${consolidationTotalsText(selected.totals)}</b>
+              <button class="primary-button compact-action" data-action="confirm-consolidation-item" data-item="${escapeHtml(selected.key)}" ${consolidationBusy || selected.allocations.some((allocation) => allocation.syncException) ? "disabled" : ""} type="button">${t("operator.confirmAllSkuLines", "Confirm all SKU lines")}</button>
+            </div>
+          </div>
+          <div class="consolidation-allocation-list">${selected.allocations.map(renderConsolidationAllocation).join("")}</div>
+        ` : `<div class="empty-state"><strong>${t("operator.selectItem", "Select item")}</strong></div>`}
+      </section>
+    </div>
+  `;
+}
+
+function consolidationLineComplete(line) {
+  return (line?.units || []).length > 0
+    && (line.units || []).every((unit) => qty(unit.remaining) <= 0.000001);
+}
+
+function consolidationQtyText(value) {
+  return qty(value) <= 0.000001 ? "0" : displayQty(value);
+}
+
+function consolidationUnitLabel(unit) {
+  return String(unit?.label || "").toUpperCase() === "PCS" ? "PC" : String(unit?.label || "");
+}
+
+function selectedConsolidationReviewOrder() {
+  const batchOrders = consolidationBatch?.orders || [];
+  let selected = batchOrders.find((order) => String(order.id) === String(consolidationReviewOrderId));
+  if (!selected) {
+    selected = batchOrders.find((order) => order.status !== "packed") || batchOrders[0] || null;
+    consolidationReviewOrderId = selected?.id || "";
+    consolidationReviewLineKey = "";
+    consolidationReviewLinePage = 0;
+  }
+  return selected;
+}
+
+function selectedConsolidationReviewLine(order, visibleLines = []) {
+  const lines = order?.lines || [];
+  let selected = lines.find((line) => String(line.lineKey) === String(consolidationReviewLineKey));
+  if (!selected) {
+    selected = visibleLines[0] || lines[0] || null;
+    consolidationReviewLineKey = selected?.lineKey || "";
+  }
+  return selected;
+}
+
+function renderConsolidationReviewOrderCard(order) {
+  const completedLines = (order.lines || []).filter(consolidationLineComplete).length;
+  const planLabel = formatDate(order.planDate) || t("operator.notPlanned", "Not planned");
+  return `
+    <button class="order-card consolidation-review-order-card status-${escapeHtml(order.status)} ${String(order.id) === String(consolidationReviewOrderId) ? "active" : ""}" data-action="select-consolidation-review-order" data-order="${order.id}" type="button">
+      <strong>${escapeHtml(order.orderRef)}</strong>
+      ${order.customer ? `<span>${escapeHtml(order.customer)}</span>` : ""}
+      <span class="order-schedule-line">${planLabel} | ${escapeHtml(order.truckPlate || "-")} | ${escapeHtml(order.loadName || "-")}</span>
+      <span class="consolidation-review-card-status">${consolidationStatusText(order.status)} | ${completedLines} / ${(order.lines || []).length} ${t("operator.lines", "lines")}</span>
+    </button>
+  `;
+}
+
+function renderConsolidationReviewLine(line) {
+  const complete = consolidationLineComplete(line);
+  const units = line.units || [];
+  const cardUnits = units.slice(0, 2);
+  return `
+    <button class="line-card consolidation-review-line-card ${String(line.lineKey) === String(consolidationReviewLineKey) ? "active" : ""} ${complete ? "confirmed" : ""} ${line.syncException ? "exception" : ""}" data-action="select-consolidation-review-line" data-line="${escapeHtml(line.lineKey)}" type="button">
+      <div class="line-info">
+        <strong>${escapeHtml(line.itemName)}</strong>
+        ${compactLineMode ? "" : `<span>${escapeHtml(line.description || "")}</span>`}
+        ${line.syncException ? `<em>${escapeHtml(line.syncException)}</em>` : ""}
+      </div>
+      <div class="required-measures">
+        ${cardUnits.map((unit) => `
+          <div class="measure ${qty(unit.remaining) <= 0.000001 ? "confirmed-measure" : ""}">
+            <span>${escapeHtml(consolidationUnitLabel(unit))}</span>
+            <b>${consolidationQtyText(unit.confirmed)} / ${consolidationQtyText(unit.required)}</b>
+          </div>
+        `).join("")}
+      </div>
+    </button>
+  `;
+}
+
+function renderConsolidationReviewLinePanel(line) {
+  if (!line) return `<aside class="selected-panel"><div class="empty-state small"><strong>${t("operator.selectLine", "Select line")}</strong></div></aside>`;
+  return `
+    <aside class="selected-panel consolidation-review-selected-line">
+      <div class="selected-header">
+        <span>${t("operator.selectedItem", "Selected item")}</span>
+        <strong>${escapeHtml(line.itemName)}</strong>
+        <p>${escapeHtml(line.description || "")}</p>
+      </div>
+      <div class="consolidation-review-quantity-list">
+        ${(line.units || []).map((unit) => `
+          <div class="consolidation-review-quantity ${qty(unit.remaining) <= 0.000001 ? "complete" : ""}">
+            <span>${escapeHtml(consolidationUnitLabel(unit))}</span>
+            <strong>${consolidationQtyText(unit.confirmed)} / ${consolidationQtyText(unit.required)}</strong>
+          </div>
+        `).join("")}
+      </div>
+      ${line.syncException ? `<div class="line-alert"><strong>${t("operator.attentionRequired", "Attention Required")}</strong><span>${escapeHtml(line.syncException)}</span></div>` : ""}
+      <div class="selected-actions consolidation-review-selected-actions">
+        <button class="secondary-button" data-action="consolidation-stage" data-stage="pick" type="button">${t("operator.adjustInPickItems", "Adjust in Pick Items")}</button>
+      </div>
+    </aside>
+  `;
+}
+
+function renderConsolidationReviewStage() {
+  const batchOrders = consolidationBatch?.orders || [];
+  const selectedOrder = selectedConsolidationReviewOrder();
+  const lines = selectedOrder?.lines || [];
+  const linePageSize = activeLinePageSize();
+  const count = pageCount(lines, linePageSize);
+  consolidationReviewLinePage = Math.min(Math.max(0, consolidationReviewLinePage), count - 1);
+  const visible = pageItems(lines, consolidationReviewLinePage, linePageSize);
+  const selectedLine = selectedConsolidationReviewLine(selectedOrder, visible);
+  const confirmedLines = lines.filter(consolidationLineComplete).length;
+  const selectedPlanLabel = formatDate(selectedOrder?.planDate) || t("operator.notPlanned", "Not planned");
+  return `
+    <div class="consolidation-review-workspace">
+      <aside class="order-panel consolidation-review-orders">
+        <div class="panel-title"><strong>${t("operator.orders", "Orders")}</strong><b>${batchOrders.length}</b></div>
+        <div class="order-list consolidation-review-order-list">
+          ${batchOrders.map(renderConsolidationReviewOrderCard).join("") || `<div class="empty-state"><strong>${t("operator.noOrders", "No orders")}</strong></div>`}
+        </div>
+      </aside>
+      <section class="detail-panel consolidation-review-detail">
+        ${selectedOrder ? `
+          <div class="detail-header">
+            <div>
+              <div class="order-title-row"><h2>${escapeHtml(selectedOrder.orderRef)}</h2></div>
+              <p class="muted">${escapeHtml(selectedOrder.customer || "")}</p>
+              <p class="dispatch-plan-note">${selectedPlanLabel} | ${escapeHtml(selectedOrder.truckPlate || "-")} | ${escapeHtml(selectedOrder.loadName || "-")}</p>
+            </div>
+            <div class="status-actions">
+              ${renderLineDensityToggle()}
+              <span class="status-pill consolidation-status-${escapeHtml(selectedOrder.status)}">${consolidationStatusText(selectedOrder.status)}</span>
+              <button class="primary-button" data-action="pack-consolidation-order" data-order="${selectedOrder.id}" ${selectedOrder.status !== "ready" || consolidationBusy ? "disabled" : ""} type="button">${selectedOrder.status === "packed" ? t("operator.packed", "Packed") : t("operator.markPacked", "Mark Packed")}</button>
+            </div>
+          </div>
+          <div class="progress-strip">
+            <div><span>${t("operator.confirmedLines", "Confirmed lines")}</span><strong>${confirmedLines} / ${lines.length}</strong></div>
+            <div><span>${t("operator.truck", "Truck")}</span><strong>${escapeHtml(selectedOrder.truckPlate || "-")}</strong></div>
+            <div><span>${t("operator.status", "Status")}</span><strong>${consolidationStatusText(selectedOrder.status)}</strong></div>
+          </div>
+          <div class="work-area">
+            <div class="line-column">
+              <div class="line-list ${compactLineMode ? "compact-line-list" : ""}">
+                ${visible.map(renderConsolidationReviewLine).join("") || `<div class="empty-state small"><strong>${t("operator.noItemLine", "No item line")}</strong></div>`}
+              </div>
+              <div class="pagination-row">
+                <button class="secondary-button" data-action="consolidation-review-line-prev" ${consolidationReviewLinePage === 0 ? "disabled" : ""} type="button">${t("common.previous", "Previous")}</button>
+                <strong>${consolidationReviewLinePage + 1} / ${count}</strong>
+                <button class="secondary-button" data-action="consolidation-review-line-next" ${consolidationReviewLinePage >= count - 1 ? "disabled" : ""} type="button">${t("common.next", "Next")}</button>
+              </div>
+            </div>
+            ${renderConsolidationReviewLinePanel(selectedLine)}
+          </div>
+        ` : `<div class="empty-state"><strong>${t("operator.selectOrder", "Select order")}</strong></div>`}
+      </section>
+    </div>
+  `;
+}
+
+function renderConsolidationPick() {
+  const summary = consolidationBatch?.summary || {};
+  shell(t("operator.consolidationPick", "Consolidation Pick"), `${t("common.location", "Location")} ${currentLocation()?.text || locationId}`, `
+    <section class="consolidation-screen">
+      ${consolidationBatch ? `
+        <div class="consolidation-toolbar">
+          <div class="consolidation-stage-tabs">
+            <button class="${consolidationStage === "pick" ? "active" : ""}" data-action="consolidation-stage" data-stage="pick" type="button">${t("operator.pickItems", "Pick Items")} <b>${summary.items || 0}</b></button>
+            <button class="${consolidationStage === "review" ? "active" : ""}" data-action="consolidation-stage" data-stage="review" type="button">${t("operator.reviewPack", "Review & Pack")} <b>${summary.ready || 0}</b></button>
+          </div>
+          <div class="consolidation-summary">
+            <span>${summary.picking || 0} ${t("operator.picking", "picking")}</span>
+            <span>${summary.ready || 0} ${t("operator.ready", "ready")}</span>
+            <span>${summary.packed || 0} ${t("operator.packed", "packed")}</span>
+          </div>
+          <button class="secondary-button danger-button" data-action="release-consolidation" ${consolidationBusy ? "disabled" : ""} type="button">${t("operator.releaseBatch", "Release Batch")}</button>
+        </div>
+        ${consolidationNotice ? `<div class="sync-alert danger"><strong>${t("common.notice", "Notice")}</strong><span>${escapeHtml(consolidationNotice)}</span></div>` : ""}
+        ${consolidationStage === "review" ? renderConsolidationReviewStage() : renderConsolidationPickStage()}
+      ` : renderConsolidationQueue()}
+    </section>
+  `, `
+    <button class="secondary-button" data-action="consolidation-back" type="button">${t("operator.deliveryPrep", "Delivery Prep")}</button>
+    <button class="secondary-button" data-action="refresh-consolidation" type="button">${t("common.refresh", "Refresh")}</button>
+    <button class="secondary-button" data-action="logout" type="button">${operator.display_name}</button>
+  `);
+  if (consolidationStage === "pick") {
+    window.requestAnimationFrame(() => {
+      const search = document.getElementById("consolidationSearch");
+      if (search && document.activeElement?.id === "consolidationSearch") search.focus();
+    });
+  }
+}
+
+async function loadConsolidation({ keepItem = false } = {}) {
+  const previousItem = keepItem ? consolidationSelectedItemKey : "";
+  const active = await api(`/api/delivery/consolidation/active?locationId=${locationId}`);
+  consolidationBatch = active || null;
+  consolidationDrafts = new Map();
+  consolidationNotice = "";
+  if (consolidationBatch) {
+    consolidationSelectedItemKey = previousItem;
+    consolidationQueue = { total: 0, eligible: 0, blocked: 0, orders: [] };
+  } else {
+    consolidationSelectedItemKey = "";
+    consolidationQueue = await api(`/api/delivery/consolidation/queue?locationId=${locationId}`);
+  }
+  render();
+}
+
+async function startConsolidation() {
+  consolidationBusy = true;
+  consolidationNotice = "";
+  render();
+  try {
+    consolidationBatch = await api("/api/delivery/consolidation/start", {
+      method: "POST",
+      body: JSON.stringify({ locationId })
+    });
+    consolidationStage = "pick";
+    consolidationDrafts = new Map();
+    showToast(t("operator.consolidationStarted", "Consolidation started"));
+  } catch (error) {
+    const blockers = error.payload?.details || [];
+    consolidationNotice = blockers.length
+      ? blockers.map((item) => `${item.orderRef}: ${item.issue}`).join(" | ")
+      : error.message;
+  } finally {
+    consolidationBusy = false;
+    render();
+  }
+}
+
+function stepConsolidationAllocation(batchOrderId, lineKey, unit, delta) {
+  const allocation = (consolidationBatch?.items || []).flatMap((item) => item.allocations || [])
+    .find((item) => String(item.batchOrderId) === String(batchOrderId) && String(item.lineKey) === String(lineKey));
+  if (!allocation) return;
+  const unitInfo = (allocation.units || []).find((item) => item.key === unit);
+  if (!unitInfo) return;
+  const draft = consolidationDraft(allocation);
+  draft[unit] = Math.max(0, Math.min(qty(unitInfo.required), qty(draft[unit]) + Number(delta || 0)));
+  render();
+}
+
+async function confirmConsolidationAllocation(batchOrderId, lineKey) {
+  const allocation = (consolidationBatch?.items || []).flatMap((item) => item.allocations || [])
+    .find((item) => String(item.batchOrderId) === String(batchOrderId) && String(item.lineKey) === String(lineKey));
+  if (!allocation) return;
+  consolidationBusy = true;
+  render();
+  try {
+    consolidationBatch = await api(`/api/delivery/consolidation/orders/${encodeURIComponent(batchOrderId)}/lines/${encodeURIComponent(lineKey)}`, {
+      method: "PUT",
+      body: JSON.stringify({ values: consolidationDraft(allocation) })
+    });
+    consolidationDrafts.delete(consolidationDraftKey(allocation));
+    consolidationNotice = "";
+    showToast(t("operator.allocationSaved", "Allocation saved"));
+  } catch (error) {
+    consolidationNotice = error.message;
+  } finally {
+    consolidationBusy = false;
+    render();
+  }
+}
+
+async function confirmConsolidationSku(itemKey) {
+  if (!consolidationBatch?.batch?.id || !itemKey) return;
+  consolidationBusy = true;
+  consolidationNotice = "";
+  render();
+  try {
+    consolidationBatch = await api(`/api/delivery/consolidation/batches/${encodeURIComponent(consolidationBatch.batch.id)}/items/confirm`, {
+      method: "PUT",
+      body: JSON.stringify({ itemKey })
+    });
+    consolidationDrafts = new Map();
+    showToast(t("operator.skuLinesConfirmed", "All SKU lines confirmed"));
+  } catch (error) {
+    consolidationNotice = error.message;
+  } finally {
+    consolidationBusy = false;
+    render();
+  }
+}
+
+async function packConsolidationBatchOrder(batchOrderId) {
+  consolidationBusy = true;
+  render();
+  try {
+    const result = await api(`/api/delivery/consolidation/orders/${encodeURIComponent(batchOrderId)}/pack`, { method: "POST" });
+    if (result.completed) {
+      consolidationBatch = null;
+      consolidationNotice = t("operator.consolidationComplete", "Consolidation complete. Packed orders are ready for loading.");
+      consolidationQueue = await api(`/api/delivery/consolidation/queue?locationId=${locationId}`);
+    } else {
+      consolidationBatch = result;
+      consolidationDrafts = new Map();
+      consolidationNotice = "";
+    }
+    showToast(t("operator.orderPacked", "Order packed"));
+  } catch (error) {
+    consolidationNotice = error.message;
+  } finally {
+    consolidationBusy = false;
+    render();
+  }
+}
+
+async function releaseConsolidation() {
+  if (!window.confirm(t("operator.releaseConsolidationConfirm", "Release this consolidation batch and undo only its confirmed quantities?"))) return;
+  consolidationBusy = true;
+  render();
+  try {
+    await api("/api/delivery/consolidation/release", {
+      method: "POST",
+      body: JSON.stringify({ locationId })
+    });
+    consolidationBatch = null;
+    consolidationDrafts = new Map();
+    consolidationQueue = await api(`/api/delivery/consolidation/queue?locationId=${locationId}`);
+    consolidationNotice = "";
+    showToast(t("operator.batchReleased", "Batch released"));
+  } catch (error) {
+    consolidationNotice = error.message;
+  } finally {
+    consolidationBusy = false;
+    render();
   }
 }
 
@@ -4013,6 +4527,8 @@ app.addEventListener("click", async (event) => {
       localStorage.setItem("mbbs.operator.compactLineList", compactLineMode ? "true" : "false");
       linePage = 0;
       receivingLinePage = 0;
+      consolidationReviewLinePage = 0;
+      consolidationReviewLineKey = "";
       showToast(compactLineMode ? "Compact line list" : "Normal line list");
       return render();
     }
@@ -4045,6 +4561,58 @@ app.addEventListener("click", async (event) => {
       localStorage.setItem("mbbs.operator.deliveryPrepMode", deliveryPrepMode);
       return openModule("delivery-run");
     }
+    if (button.dataset.action === "open-consolidation") {
+      currentModule = "delivery-consolidation";
+      consolidationStage = "pick";
+      consolidationSearch = "";
+      consolidationSelectedItemKey = "";
+      return loadConsolidation();
+    }
+    if (button.dataset.action === "consolidation-back") {
+      currentModule = "delivery-select";
+      consolidationNotice = "";
+      return render();
+    }
+    if (button.dataset.action === "refresh-consolidation") return loadConsolidation({ keepItem: true });
+    if (button.dataset.action === "start-consolidation") return startConsolidation();
+    if (button.dataset.action === "consolidation-stage") {
+      consolidationStage = button.dataset.stage === "review" ? "review" : "pick";
+      return render();
+    }
+    if (button.dataset.action === "select-consolidation-review-order") {
+      consolidationReviewOrderId = button.dataset.order || "";
+      consolidationReviewLineKey = "";
+      consolidationReviewLinePage = 0;
+      return render();
+    }
+    if (button.dataset.action === "select-consolidation-review-line") {
+      consolidationReviewLineKey = button.dataset.line || "";
+      return render();
+    }
+    if (button.dataset.action === "consolidation-review-line-prev") {
+      consolidationReviewLinePage = Math.max(0, consolidationReviewLinePage - 1);
+      consolidationReviewLineKey = "";
+      return render();
+    }
+    if (button.dataset.action === "consolidation-review-line-next") {
+      const selectedOrder = selectedConsolidationReviewOrder();
+      consolidationReviewLinePage = Math.min(pageCount(selectedOrder?.lines || [], activeLinePageSize()) - 1, consolidationReviewLinePage + 1);
+      consolidationReviewLineKey = "";
+      return render();
+    }
+    if (button.dataset.action === "select-consolidation-item") {
+      consolidationSelectedItemKey = button.dataset.item || "";
+      return render();
+    }
+    if (button.dataset.action === "step-consolidation") {
+      return stepConsolidationAllocation(button.dataset.order, button.dataset.line, button.dataset.unit, button.dataset.delta);
+    }
+    if (button.dataset.action === "confirm-consolidation-line") {
+      return confirmConsolidationAllocation(button.dataset.order, button.dataset.line);
+    }
+    if (button.dataset.action === "confirm-consolidation-item") return confirmConsolidationSku(button.dataset.item);
+    if (button.dataset.action === "pack-consolidation-order") return packConsolidationBatchOrder(button.dataset.order);
+    if (button.dataset.action === "release-consolidation") return releaseConsolidation();
     if (button.dataset.action === "select-receiving-type") {
       receivingOrderType = button.dataset.orderType || "purchase_order";
       receivingStep = "vendor";
@@ -4387,6 +4955,20 @@ app.addEventListener("click", async (event) => {
 });
 
 app.addEventListener("input", async (event) => {
+  if (event.target?.id === "consolidationSearch") {
+    consolidationSearch = event.target.value;
+    window.clearTimeout(app.consolidationSearchTimer);
+    app.consolidationSearchTimer = window.setTimeout(() => {
+      render();
+      window.requestAnimationFrame(() => {
+        const input = document.getElementById("consolidationSearch");
+        if (!input) return;
+        input.focus();
+        input.setSelectionRange(input.value.length, input.value.length);
+      });
+    }, 100);
+    return;
+  }
   if (event.target?.id === "customerPickupScan") {
     customerPickupScan = event.target.value;
     customerPickupMessage = "";

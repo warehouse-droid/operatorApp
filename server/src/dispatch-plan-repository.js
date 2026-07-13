@@ -60,6 +60,50 @@ function loadOrderRefs(load = {}) {
   return [...orderIds];
 }
 
+export function dispatchPlannedAssignmentMap(plan = {}) {
+  const orderById = new Map((plan.orders || []).map((order) => [String(order?.id || ""), order]));
+  const assignments = new Map();
+  const addRef = (value, details) => {
+    const ref = String(value || "").trim();
+    if (ref && !assignments.has(ref)) assignments.set(ref, details);
+  };
+  const addOrderRefs = (orderId, details) => {
+    const order = orderById.get(String(orderId || ""));
+    const plannedDetails = {
+      ...details,
+      plannedOrderRef: String(orderId || "").trim()
+    };
+    if (order?.childOrders?.length || order?.originalOrderId) {
+      plannedDetails.plannedOrderSnapshot = order;
+    }
+    addRef(orderId, plannedDetails);
+    if (!order || order.type === "CO") return;
+    addRef(order.originalOrderId, plannedDetails);
+    for (const childId of order.childOrders || []) addRef(childId, plannedDetails);
+    for (const child of order.childOrderDetails || []) {
+      addRef(child?.id, plannedDetails);
+      addRef(child?.originalOrderId, plannedDetails);
+    }
+  };
+  for (const truck of plan.trucks || []) {
+    for (const load of truck.loads || []) {
+      if (load.returnOnly) continue;
+      for (const stop of load.stops || []) {
+        if (stop?.type !== "drop" || !stop.orderId) continue;
+        addOrderRefs(stop.orderId, {
+          dispatchPlanned: true,
+          dispatchPlanId: plan.id ? String(plan.id) : "",
+          dispatchPlanDate: String(plan.planDate || "").slice(0, 10),
+          dispatchTruckPlate: truck.plate || "",
+          dispatchLoadName: load.name || "",
+          dispatchParkingSpot: truck.parkingSpot || ""
+        });
+      }
+    }
+  }
+  return assignments;
+}
+
 function countPlanLoadOrders(trucks = []) {
   return (trucks || []).reduce((sum, truck) => sum + (truck.loads || []).reduce((loadSum, load) => loadSum + countLoadOrders(load), 0), 0);
 }

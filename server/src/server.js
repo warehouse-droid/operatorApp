@@ -16,13 +16,14 @@ import { listOperatorHistory, listRecordWarnings, reportOperatorRecordError, res
 import { listDispatchOrders, listScmPurchaseOrders, listScmSchedule, updateScmScheduleEntry, createScmScheduleGroup, cancelScmScheduleGroup, listScmViewPresets, upsertScmViewPreset, createScmVrmaOrder, syncScmScheduleFromDispatchPlan, createScmPurchaseOrderSplit, updateScmPurchaseOrderSplitRef, updateScmPurchaseOrderSplitDestination, updateScmPurchaseOrderSplitPickupYard, updatePurchaseOrderDispatchRef, cancelScmPurchaseOrderSplit, refreshDispatchEnrichment, reparseMissingSalesOrderDispatch, searchSalesOrderMethodOverrides, setPurchaseOrderVendorYard, updateDispatchOrderDetails, updateSalesOrderLocalMethod, getSalesOrderPoAllocationOptions, createSalesOrderPoAllocation, createSalesOrderPoAllocations, cancelSalesOrderPoAllocation, createDispatchOperatorRequest, upsertLocalCoOrder, cancelLocalCoOrder, listDispatchOperatorRequests, resolveDispatchOperatorRequestsForOrder } from "./dispatch-repository.js";
 import { listDispatchVendorYards, updateDispatchVendorYard, upsertDispatchVendorYard, listDispatchParserRules, updateDispatchParserRule, listOllamaAudit, listDispatchVendorMappings, discoverDispatchVendorMappingsFromPurchaseOrders, updateDispatchVendorMapping, createDispatchLocalVendor, updateDispatchLocalVendor } from "./dispatch-enrichment.js";
 import { listDispatchAudit, writeDispatchAudit } from "./dispatch-audit-repository.js";
-import { DispatchPlanDateMismatchError, StaleDispatchPlanSaveError, confirmDispatchPlan, createDispatchPlan, getCurrentDispatchPlan, getDispatchPlan, getDispatchPlanRevision, getDispatchPlanSnapshot, listDispatchPlanSnapshots, listDispatchPlans, reopenDispatchPlan, restoreDispatchPlanSnapshot, saveDispatchPlanSnapshot } from "./dispatch-plan-repository.js";
+import { DispatchPlanDateMismatchError, StaleDispatchPlanSaveError, confirmDispatchPlan, createDispatchPlan, dispatchPlannedAssignmentMap, getCurrentDispatchPlan, getDispatchPlan, getDispatchPlanRevision, getDispatchPlanSnapshot, listDispatchPlanSnapshots, listDispatchPlans, reopenDispatchPlan, restoreDispatchPlanSnapshot, saveDispatchPlanSnapshot } from "./dispatch-plan-repository.js";
 import { DispatchPlanEditLeaseError, acquireDispatchPlanEditLease, assertDispatchPlanEditLease, getDispatchPlanEditLease, heartbeatDispatchPlanEditLease, releaseDispatchPlanEditLease } from "./dispatch-plan-lease-repository.js";
 import { getDispatchStatistics } from "./dispatch-statistics-repository.js";
 import { endDriverRest, ensureDriverSamsaraDutyForJob, getActiveDriverRest, getDriverDayState, getNextDriverJob, listDriverHistory, listDriverJobStatuses, recordDriverJobPhotos, skipDriverDvirForTesting, startDriverJob, startDriverRest, submitDriverDvir } from "./driver-repository.js";
 import { createSamsaraDriverAuthToken, createSamsaraDriverVehicleAssignment, findSamsaraDriverByUsername, listSamsaraVehicleLocations, setSamsaraDriverDutyStatus, testSamsaraConnection } from "./samsara.js";
 import { createPhotoReadToken, createPhotoUploadToken, isR2PhotoReference, publicPhotoUploadConfig } from "./photo-upload.js";
 import { authenticateDispatchDriver, ensureDispatchFleetSetup, getDispatchDriverByLogin, listDispatchDrivers, listDispatchTrucks, replaceDispatchFleetSetup } from "./dispatch-setup-repository.js";
+import { assertNoActiveConsolidationClaimsByRefs, confirmConsolidationItem, getActiveConsolidationBatch, getSavedConsolidationQueue, packConsolidationOrder, releaseConsolidationBatch, startSavedConsolidationBatch, updateConsolidationLine } from "./delivery-consolidation-repository.js";
 
 const app = express();
 const dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -286,50 +287,6 @@ function dispatchPlannedOrderRefs(plan = {}) {
     }
   }
   return refs;
-}
-
-function dispatchPlannedAssignmentMap(plan = {}) {
-  const orderById = new Map((plan.orders || []).map((order) => [String(order?.id || ""), order]));
-  const assignments = new Map();
-  const addRef = (value, details) => {
-    const ref = String(value || "").trim();
-    if (ref && !assignments.has(ref)) assignments.set(ref, details);
-  };
-  const addOrderRefs = (orderId, details) => {
-    const order = orderById.get(String(orderId || ""));
-    const plannedDetails = {
-      ...details,
-      plannedOrderRef: String(orderId || "").trim()
-    };
-    if (order?.childOrders?.length || order?.originalOrderId) {
-      plannedDetails.plannedOrderSnapshot = order;
-    }
-    addRef(orderId, plannedDetails);
-    if (!order || order.type === "CO") return;
-    addRef(order.originalOrderId, plannedDetails);
-    for (const childId of order.childOrders || []) addRef(childId, plannedDetails);
-    for (const child of order.childOrderDetails || []) {
-      addRef(child?.id, plannedDetails);
-      addRef(child?.originalOrderId, plannedDetails);
-    }
-  };
-  for (const truck of plan.trucks || []) {
-    for (const load of truck.loads || []) {
-      if (load.returnOnly) continue;
-      for (const stop of load.stops || []) {
-        if (stop?.type !== "drop" || !stop.orderId) continue;
-        addOrderRefs(stop.orderId, {
-          dispatchPlanned: true,
-          dispatchPlanId: plan.id ? String(plan.id) : "",
-          dispatchPlanDate: String(plan.planDate || "").slice(0, 10),
-          dispatchTruckPlate: truck.plate || "",
-          dispatchLoadName: load.name || "",
-          dispatchParkingSpot: truck.parkingSpot || ""
-        });
-      }
-    }
-  }
-  return assignments;
 }
 
 async function dispatchPlannedAssignmentsFromSnapshots() {
@@ -1462,6 +1419,65 @@ async function writeDispatchSetup(patch = {}) {
   await fs.mkdir(dataDir, { recursive: true });
   await fs.writeFile(dispatchSetupPath, `${JSON.stringify(configPayload, null, 2)}\n`);
   return payload;
+}
+
+function dispatchOrderStructureState(plan = {}) {
+  const membership = new Map();
+  const containers = new Map();
+  const splitChildrenByParent = new Map();
+  for (const order of plan.orders || []) {
+    const id = String(order?.id || "").trim();
+    if (!id) continue;
+    const childRefs = [
+      ...(order?.childOrders || []),
+      ...(order?.childOrderDetails || []).flatMap((child) => [child?.id, child?.originalOrderId])
+    ].map((value) => String(value || "").trim()).filter(Boolean).sort();
+    const parentRef = String(order?.originalOrderId || "").trim();
+    if (childRefs.length) {
+      const token = `group:${id}:${childRefs.join("|")}`;
+      containers.set(id, { signature: token, refs: [id, ...childRefs] });
+      for (const ref of childRefs) membership.set(ref, token);
+      continue;
+    }
+    if (parentRef) {
+      if (!splitChildrenByParent.has(parentRef)) splitChildrenByParent.set(parentRef, []);
+      splitChildrenByParent.get(parentRef).push(id);
+      membership.set(id, `split-child:${parentRef}`);
+      continue;
+    }
+    membership.set(id, "normal");
+  }
+  for (const [parentRef, childRefs] of splitChildrenByParent.entries()) {
+    childRefs.sort();
+    const token = `split:${childRefs.join("|")}`;
+    membership.set(parentRef, token);
+    containers.set(parentRef, { signature: token, refs: [parentRef, ...childRefs] });
+  }
+  return { membership, containers };
+}
+
+function changedDispatchOrderStructureRefs(previousPlan = {}, nextPlan = {}) {
+  const before = dispatchOrderStructureState(previousPlan);
+  const after = dispatchOrderStructureState(nextPlan);
+  const refs = new Set();
+  for (const key of before.membership.keys()) {
+    if (!after.membership.has(key) || before.membership.get(key) === after.membership.get(key)) continue;
+    refs.add(key);
+  }
+  for (const key of before.containers.keys()) {
+    if (!after.containers.has(key)) continue;
+    const left = before.containers.get(key);
+    const right = after.containers.get(key);
+    if (left.signature === right.signature) continue;
+    for (const ref of [...left.refs, ...right.refs]) refs.add(ref);
+  }
+  return [...refs];
+}
+
+async function assertNoConsolidationStructureConflict(previousPlan, nextPlan) {
+  const changedRefs = changedDispatchOrderStructureRefs(previousPlan, nextPlan);
+  if (!changedRefs.length) return;
+  await assertNoActiveConsolidationClaimsByRefs(changedRefs, "group, ungroup, split, or unsplit these orders");
 }
 
 function normalizeOrderType(value) {
@@ -3372,6 +3388,7 @@ app.put("/api/dispatch/plans/:id", requireOperator, requireDispatcher, async (re
       : requestedTrucks;
     const duplicateDrivers = dispatchDuplicateDriverAssignments(cleanTrucks);
     if (duplicateDrivers.length) return sendDispatchDuplicateDriverResponse(res, duplicateDrivers);
+    await assertNoConsolidationStructureConflict(previousPlan, { orders: cleanOrders });
     const explicitOperatorAlertRefs = Array.isArray(req.body?.audit?.details?.operatorAlertRefs)
       ? req.body.audit.details.operatorAlertRefs.map((ref) => String(ref || "").trim()).filter(Boolean)
       : [];
@@ -3519,6 +3536,7 @@ app.post("/api/dispatch/plans/:id/confirm", requireOperator, requireDispatcher, 
       const requestedTrucks = Array.isArray(req.body?.trucks) ? req.body.trucks : previousPlan.trucks || [];
       const duplicateDrivers = dispatchDuplicateDriverAssignments(requestedTrucks);
       if (duplicateDrivers.length) return sendDispatchDuplicateDriverResponse(res, duplicateDrivers);
+      await assertNoConsolidationStructureConflict(previousPlan, { orders: requestedOrders });
       const dateConflicts = await findNewDispatchPlanDateConflicts(previousPlan || {}, {
         id: req.params.id,
         planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date,
@@ -6112,6 +6130,132 @@ app.delete("/api/delivery/saved-orders/:id", async (req, res, next) => {
       locationId: req.query.locationId || req.body?.locationId,
       orderId: req.params.id
     }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/delivery/consolidation/queue", async (req, res, next) => {
+  try {
+    res.json(await getSavedConsolidationQueue(operatorId(req), {
+      locationId: req.query.locationId
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/delivery/consolidation/active", async (req, res, next) => {
+  try {
+    res.json(await getActiveConsolidationBatch(operatorId(req), {
+      locationId: req.query.locationId
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/delivery/consolidation/start", async (req, res, next) => {
+  try {
+    const result = await startSavedConsolidationBatch(operatorId(req), {
+      locationId: req.body?.locationId || req.query.locationId
+    });
+    emitAppEvent("delivery.consolidation.updated", {
+      batchId: result?.batch?.id || null,
+      change: "started",
+      operatorId: operatorId(req)
+    });
+    res.json(result);
+  } catch (error) {
+    if (error.details) {
+      return res.status(error.status || 409).json({ error: error.message, code: error.code, details: error.details });
+    }
+    next(error);
+  }
+});
+
+app.put("/api/delivery/consolidation/orders/:batchOrderId/lines/:lineKey", async (req, res, next) => {
+  try {
+    const result = await updateConsolidationLine(
+      operatorId(req),
+      req.params.batchOrderId,
+      req.params.lineKey,
+      req.body?.values || req.body || {}
+    );
+    emitAppEvent("delivery.consolidation.updated", {
+      batchId: result?.batch?.id || null,
+      batchOrderId: req.params.batchOrderId,
+      lineKey: req.params.lineKey,
+      change: "line_updated",
+      operatorId: operatorId(req)
+    });
+    emitAppEvent("delivery.line.updated", {
+      orderId: result?.orders?.find((order) => String(order.id) === String(req.params.batchOrderId))?.orderKey || null,
+      source: "consolidation",
+      operatorId: operatorId(req)
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/delivery/consolidation/batches/:batchId/items/confirm", async (req, res, next) => {
+  try {
+    const result = await confirmConsolidationItem(operatorId(req), req.params.batchId, req.body?.itemKey);
+    emitAppEvent("delivery.consolidation.updated", {
+      batchId: result?.batch?.id || req.params.batchId,
+      itemKey: req.body?.itemKey || "",
+      change: "item_confirmed",
+      operatorId: operatorId(req)
+    });
+    emitAppEvent("delivery.line.updated", {
+      source: "consolidation",
+      change: "item_confirmed",
+      operatorId: operatorId(req)
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/delivery/consolidation/orders/:batchOrderId/pack", async (req, res, next) => {
+  try {
+    const result = await packConsolidationOrder(operatorId(req), req.params.batchOrderId);
+    emitAppEvent("delivery.consolidation.updated", {
+      batchId: result?.batch?.id || result?.batchId || null,
+      batchOrderId: req.params.batchOrderId,
+      change: result?.completed ? "completed" : "order_packed",
+      operatorId: operatorId(req)
+    });
+    emitAppEvent("delivery.order.updated", {
+      source: "consolidation",
+      change: "packed",
+      operatorId: operatorId(req)
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/delivery/consolidation/release", async (req, res, next) => {
+  try {
+    const result = await releaseConsolidationBatch(operatorId(req), {
+      locationId: req.body?.locationId || req.query.locationId
+    });
+    emitAppEvent("delivery.consolidation.updated", {
+      batchId: result?.batchId || null,
+      change: "released",
+      operatorId: operatorId(req)
+    });
+    emitAppEvent("delivery.order.updated", {
+      source: "consolidation",
+      change: "released",
+      operatorId: operatorId(req)
+    });
+    res.json(result);
   } catch (error) {
     next(error);
   }

@@ -54,7 +54,7 @@ not be committed or shared.
 Connect to the VM, then run:
 
 ```bash
-cd ~/apps/operatorApp
+
 git pull origin codex/dispatch
 docker compose --env-file docker/env/.env build app migrate
 docker compose --env-file docker/env/.env --profile tools run --rm migrate

@@ -797,6 +797,81 @@ async function getDispatchGroupDeliveryOrder(groupId) {
   return buildDispatchGroupDeliveryOrder(group, childOrdersByGroup.get(group.id) || []);
 }
 
+export async function getDeliveryOrdersBatch(ids = []) {
+  const keys = [...new Set((ids || []).map((id) => String(id || "").trim()).filter(Boolean))];
+  if (!keys.length) return [];
+  const groupKeys = keys.filter(isDispatchGroupOrderId).map(normalizeDispatchGroupId);
+  const regularIds = keys
+    .filter((key) => /^-?\d+$/.test(key))
+    .map(Number)
+    .filter(Number.isSafeInteger);
+  const ordersByKey = new Map();
+
+  if (regularIds.length) {
+    const orderResult = await query(
+        `SELECT o.*,
+                o.sales_order_type AS delivery_method,
+                'sales_order'::text AS order_type,
+                NULL::bigint AS source_location_id,
+                NULL::text AS source_location,
+                NULL::bigint AS destination_location_id,
+                NULL::text AS destination_location
+           FROM sales_orders o
+          WHERE o.netsuite_id = ANY($1::bigint[])`,
+        [regularIds]
+      );
+    const lineResult = await query(
+        `WITH alloc AS (
+           SELECT sales_line_id,
+                  SUM(allocated_pallet_qty) AS po_allocated_pallet_qty,
+                  SUM(allocated_layer_qty) AS po_allocated_layer_qty,
+                  SUM(allocated_section_qty) AS po_allocated_section_qty,
+                  SUM(allocated_piece_qty) AS po_allocated_piece_qty,
+                  SUM(allocated_sales_qty) AS po_allocated_sales_qty
+             FROM dispatch_so_po_allocations
+            WHERE status = 'active'
+            GROUP BY sales_line_id
+         )
+         SELECT l.*,
+                COALESCE(alloc.po_allocated_pallet_qty, 0) AS po_allocated_pallet_qty,
+                COALESCE(alloc.po_allocated_layer_qty, 0) AS po_allocated_layer_qty,
+                COALESCE(alloc.po_allocated_section_qty, 0) AS po_allocated_section_qty,
+                COALESCE(alloc.po_allocated_piece_qty, 0) AS po_allocated_piece_qty,
+                COALESCE(alloc.po_allocated_sales_qty, 0) AS po_allocated_sales_qty
+           FROM sales_order_lines l
+           LEFT JOIN alloc ON alloc.sales_line_id = l.id
+          WHERE l.sales_order_id = ANY($1::bigint[])
+            AND (l.netsuite_active = true OR l.sync_exception IS NOT NULL OR (${packedQtySql}) > 0)
+          ORDER BY l.sales_order_id, l.line_id NULLS LAST, l.id`,
+        [regularIds]
+      );
+    const linesByOrder = new Map();
+    for (const line of lineResult.rows.map(applyDeliveryAllocationFields)) {
+      const key = String(line.sales_order_id);
+      if (!linesByOrder.has(key)) linesByOrder.set(key, []);
+      linesByOrder.get(key).push(line);
+    }
+    for (const order of orderResult.rows) {
+      ordersByKey.set(String(order.netsuite_id), {
+        ...order,
+        lines: (linesByOrder.get(String(order.netsuite_id)) || []).filter(hasDeliveryDisplayQuantity)
+      });
+    }
+  }
+
+  if (groupKeys.length) {
+    const definitions = (await listDispatchDeliveryGroups({ orderType: "sales_order", includePast: true }))
+      .filter((group) => groupKeys.includes(normalizeDispatchGroupId(group.id)));
+    const childOrdersByGroup = await loadDispatchGroupChildOrders(definitions);
+    for (const group of definitions) {
+      const order = buildDispatchGroupDeliveryOrder(group, childOrdersByGroup.get(group.id) || []);
+      if (order) ordersByKey.set(normalizeDispatchGroupId(group.id), order);
+    }
+  }
+
+  return keys.map((key) => ordersByKey.get(normalizeDispatchGroupId(key))).filter(Boolean);
+}
+
 function savedOrderType(order) {
   if (order?.is_dispatch_group || isDispatchGroupOrderId(order?.netsuite_id)) return "group_order";
   return order?.order_type === "transfer_order" ? "transfer_order" : "sales_order";
@@ -1352,9 +1427,11 @@ export async function listSavedDeliveryOrdersForOperator(operatorId, { locationI
       ORDER BY created_at DESC, order_ref`,
     [operatorId, locationId]
   );
+  const orders = await getDeliveryOrdersBatch(saved.rows.map((item) => item.order_key));
+  const orderByKey = new Map(orders.map((order) => [String(order.netsuite_id), order]));
   const rows = [];
   for (const item of saved.rows) {
-    const order = await getDeliveryOrder(item.order_key).catch(() => null);
+    const order = orderByKey.get(String(item.order_key));
     if (!order) continue;
     if (isFullyLoadedDeliveryOrder(order)) continue;
     rows.push({
@@ -2901,9 +2978,34 @@ export async function listControlLoadedOrderCsvRows(filters = {}) {
   return rows;
 }
 
-async function assertOrderEditable(orderId, operatorId) {
+async function activeConsolidationClaimForOrder(orderId) {
+  const result = await query(
+    `SELECT b.id AS batch_id,
+            b.operator_id,
+            o.order_key,
+            o.order_ref
+       FROM operator_consolidation_claims claim
+       JOIN operator_consolidation_orders o ON o.id = claim.batch_order_id
+       JOIN operator_consolidation_batches b ON b.id = o.batch_id
+      WHERE claim.canonical_order_id = $1
+        AND claim.released_at IS NULL
+        AND b.status = 'active'
+      LIMIT 1`,
+    [orderId]
+  );
+  return result.rows[0] || null;
+}
+
+async function assertOrderEditable(orderId, operatorId, { allowConsolidation = false } = {}) {
   const order = await getDeliveryOrder(orderId);
   if (!order) throw new Error("Delivery order not found.");
+  const consolidation = await activeConsolidationClaimForOrder(order.netsuite_id);
+  if (consolidation && (!allowConsolidation || String(consolidation.operator_id) !== String(operatorId))) {
+    const error = new Error(`${consolidation.order_ref || order.tranid} is reserved in Consolidation Pick.`);
+    error.status = 409;
+    error.code = "ORDER_RESERVED_FOR_CONSOLIDATION";
+    throw error;
+  }
   if (order.operator_status === "preparing" && order.preparing_operator_id && String(order.preparing_operator_id) !== String(operatorId)) {
     throw new Error("This order is preparing on another tablet.");
   }
@@ -3193,13 +3295,20 @@ async function findActiveDraftOrderExcluding(operatorId, excludedOrderIds = []) 
   return result.rows[0]?.netsuite_id || null;
 }
 
-async function assertGroupEditable(groupOrder, operatorId) {
+async function assertGroupEditable(groupOrder, operatorId, { allowConsolidation = false } = {}) {
   const childIds = groupChildOrderIds(groupOrder);
   if (!childIds.length) throw new Error("Grouped delivery order has no source order.");
   const childOrders = Array.isArray(groupOrder.child_orders) && groupOrder.child_orders.length
     ? groupOrder.child_orders
-    : (await Promise.all(childIds.map((childId) => assertOrderEditable(childId, operatorId))));
+    : (await Promise.all(childIds.map((childId) => assertOrderEditable(childId, operatorId, { allowConsolidation }))));
   for (const child of childOrders.filter(Boolean)) {
+    const consolidation = await activeConsolidationClaimForOrder(child.netsuite_id);
+    if (consolidation && (!allowConsolidation || String(consolidation.operator_id) !== String(operatorId))) {
+      const error = new Error(`${consolidation.order_ref || groupOrder.tranid} is reserved in Consolidation Pick.`);
+      error.status = 409;
+      error.code = "ORDER_RESERVED_FOR_CONSOLIDATION";
+      throw error;
+    }
     if (child.preparing_operator_id && String(child.preparing_operator_id) !== String(operatorId)) {
       throw new Error(`${child.tranid} is preparing on another tablet.`);
     }
@@ -3326,7 +3435,7 @@ async function applyGroupedLinePackedQuantityToOrder(groupOrder, lineId, values,
       next: absolute ? { pallets: 0, layers: 0, pieces: 0, sections: 0 } : { ...current },
       capacity: Object.fromEntries(Object.keys(packedFields).map((unit) => [
         unit,
-        positiveQuantity(available[unit]) + (absolute ? current[unit] : 0)
+        positiveQuantity(available[unit])
       ]))
     };
   });
@@ -3335,7 +3444,7 @@ async function applyGroupedLinePackedQuantityToOrder(groupOrder, lineId, values,
     let remaining = positiveQuantity(requested[unit]);
     for (const source of working) {
       if (remaining <= 0) break;
-      const canAdd = Math.max(0, source.capacity[unit] - (absolute ? source.next[unit] : positiveQuantity(source.next[unit] - positiveQuantity(source.line[packedFields[unit]]))));
+      const canAdd = Math.max(0, source.capacity[unit] - source.next[unit]);
       const add = Math.min(canAdd, remaining);
       source.next[unit] = roundQuantity(source.next[unit] + add);
       remaining = roundQuantity(remaining - add);
@@ -3360,6 +3469,31 @@ async function applyGroupedLinePackedQuantity(groupId, lineId, values, operatorI
     const groupOrder = await getDispatchGroupDeliveryOrder(groupId);
     if (!groupOrder) throw new Error("Grouped delivery order not found.");
     return applyGroupedLinePackedQuantityToOrder(groupOrder, lineId, values, operatorId, { absolute });
+  });
+}
+
+export async function setConsolidationDeliveryLinePackedQuantity(orderId, lineId, values, operatorId) {
+  if (!operatorId) throw new Error("Operator ID is required.");
+  if (!isDispatchGroupOrderId(orderId)) {
+    await setDeliveryLinePackedQuantity(orderId, lineId, values, operatorId, { allowConsolidation: true });
+    return getDeliveryOrder(orderId);
+  }
+  return withTransaction(async () => {
+    const groupOrder = await getDispatchGroupDeliveryOrder(orderId);
+    if (!groupOrder) throw new Error("Grouped delivery order not found.");
+    await assertGroupEditable(groupOrder, operatorId, { allowConsolidation: true });
+    await applyGroupedLinePackedQuantityToOrder(groupOrder, lineId, values, operatorId, {
+      absolute: true,
+      claim: false,
+      audit: false
+    });
+    await writeAudit({
+      actorOperatorId: operatorId,
+      action: "delivery.consolidation.group_line.updated",
+      lineId: /^\d+$/.test(String(lineId)) ? lineId : null,
+      details: { groupId: orderId, values }
+    });
+    return getDispatchGroupDeliveryOrder(orderId);
   });
 }
 
@@ -3398,6 +3532,15 @@ export async function getCurrentOperatorDeliveryDraft(operatorId, { locationId =
            LEFT JOIN sales_order_lines l ON l.sales_order_id = o.netsuite_id
           WHERE o.preparing_operator_id::text = $1
             AND COALESCE(o.sales_order_type, '') <> '${CUSTOMER_PICKUP_DELIVERY_METHOD.replaceAll("'", "''")}'
+            AND NOT EXISTS (
+              SELECT 1
+                FROM operator_consolidation_claims consolidation_claim
+                JOIN operator_consolidation_orders consolidation_order ON consolidation_order.id = consolidation_claim.batch_order_id
+                JOIN operator_consolidation_batches consolidation_batch ON consolidation_batch.id = consolidation_order.batch_id
+               WHERE consolidation_claim.canonical_order_id = o.netsuite_id
+                 AND consolidation_claim.released_at IS NULL
+                 AND consolidation_batch.status = 'active'
+            )
             ${salesLocationClause}
           GROUP BY o.netsuite_id
          UNION ALL
@@ -3762,7 +3905,7 @@ export async function clearCustomerPickupDraft(orderId, operatorId) {
   return getDeliveryOrder(orderId);
 }
 
-export async function setDeliveryLinePackedQuantity(orderId, lineId, values, operatorId) {
+export async function setDeliveryLinePackedQuantity(orderId, lineId, values, operatorId, { allowConsolidation = false } = {}) {
   if (!operatorId) throw new Error("Operator ID is required.");
   if (isDispatchGroupOrderId(orderId)) {
     await applyGroupedLinePackedQuantity(orderId, lineId, values, operatorId, { absolute: true });
@@ -3773,7 +3916,7 @@ export async function setDeliveryLinePackedQuantity(orderId, lineId, values, ope
     await confirmLocalCoDeliveryLine(orderId, lineId, values, operatorId, { absolute: true });
     return;
   }
-  const order = await assertOrderEditable(orderId, operatorId);
+  const order = await assertOrderEditable(orderId, operatorId, { allowConsolidation });
 
   const pallets = normalizeQuantity(values?.pallets) || 0;
   const layers = normalizeQuantity(values?.layers) || 0;
@@ -4113,6 +4256,79 @@ export async function updateDeliveryStatus(id, status, operatorId) {
     action: "delivery.order.status",
     orderId: id,
     details: { status }
+  });
+}
+
+export async function markConsolidationDeliveryOrderPacked(id, operatorId) {
+  if (!operatorId) throw new Error("Operator ID is required.");
+  return withTransaction(async () => {
+    if (isDispatchGroupOrderId(id)) {
+      const groupOrder = await getDispatchGroupDeliveryOrder(id);
+      if (!groupOrder) throw new Error("Grouped delivery order not found.");
+      await assertGroupEditable(groupOrder, operatorId, { allowConsolidation: true });
+      if (!orderHasPackedQuantity(groupOrder)) {
+        const error = new Error("Cannot mark this grouped order as packed because no order line has confirmed packed quantity.");
+        error.status = 409;
+        throw error;
+      }
+      const childIds = groupChildOrderIds(groupOrder).map(Number).filter(Number.isInteger);
+      await query(
+        `UPDATE sales_orders o
+            SET operator_status = CASE
+                  WHEN EXISTS (
+                    SELECT 1
+                      FROM sales_order_lines l
+                     WHERE l.sales_order_id = o.netsuite_id
+                       AND COALESCE(l.item_type, '') IN ('InvtPart', 'NonInvtPart')
+                       AND (${packedQtySql}) > 0
+                  ) THEN 'packed'
+                  ELSE 'open'
+                END,
+                preparing_operator_id = null,
+                preparing_started_at = null,
+                status_updated_at = now()
+          WHERE o.netsuite_id = ANY($1::bigint[])`,
+        [childIds]
+      );
+      await writeAudit({
+        actorOperatorId: operatorId,
+        action: "delivery.consolidation.group_order.packed",
+        details: { groupId: id, childOrders: groupChildOrderIds(groupOrder) }
+      });
+      return getDispatchGroupDeliveryOrder(id);
+    }
+
+    const order = await assertOrderEditable(id, operatorId, { allowConsolidation: true });
+    if (!orderHasPackedQuantity(order)) {
+      const error = new Error("Cannot mark this order as packed because no order line has confirmed packed quantity.");
+      error.status = 409;
+      throw error;
+    }
+    await setCanonicalDeliveryStatus(order, "packed", { clearPreparing: true });
+    await writeAudit({
+      actorOperatorId: operatorId,
+      action: "delivery.consolidation.order.packed",
+      orderId: id,
+      details: { tranid: order.tranid }
+    });
+    return getDeliveryOrder(id);
+  });
+}
+
+export async function releaseConsolidationDeliveryOrder(id, operatorId) {
+  if (!operatorId) throw new Error("Operator ID is required.");
+  return withTransaction(async () => {
+    if (isDispatchGroupOrderId(id)) {
+      const groupOrder = await getDispatchGroupDeliveryOrder(id);
+      if (!groupOrder) return null;
+      await assertGroupEditable(groupOrder, operatorId, { allowConsolidation: true });
+      for (const childId of groupChildOrderIds(groupOrder)) {
+        await refreshDeliveryProgressStatus(childId, { clearPreparing: true });
+      }
+      return getDispatchGroupDeliveryOrder(id);
+    }
+    await assertOrderEditable(id, operatorId, { allowConsolidation: true });
+    return refreshDeliveryProgressStatus(id, { clearPreparing: true });
   });
 }
 
