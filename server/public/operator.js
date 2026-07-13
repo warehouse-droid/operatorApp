@@ -171,6 +171,9 @@ let lastCameraDeviceId = "";
 let pickupScannerBuffer = "";
 let pickupScannerLastKeyAt = 0;
 let pickupFocusTimer = null;
+const OPERATOR_CAMERA_IDEAL_WIDTH = 2560;
+const OPERATOR_CAMERA_IDEAL_HEIGHT = 1440;
+const OPERATOR_CAMERA_JPEG_QUALITY = 0.92;
 
 function cameraFacingLabel() {
   return cameraFacingMode === "user"
@@ -182,9 +185,17 @@ function cameraCaptureMode() {
   return cameraFacingMode === "user" ? "user" : "environment";
 }
 
+function cameraVideoConstraints(overrides = {}) {
+  return {
+    width: { ideal: OPERATOR_CAMERA_IDEAL_WIDTH },
+    height: { ideal: OPERATOR_CAMERA_IDEAL_HEIGHT },
+    ...overrides
+  };
+}
+
 function cameraMediaConstraints() {
   return {
-    video: { facingMode: { ideal: cameraCaptureMode() } },
+    video: cameraVideoConstraints({ facingMode: { ideal: cameraCaptureMode() } }),
     audio: false
   };
 }
@@ -225,7 +236,7 @@ async function openCameraStream() {
   const facing = cameraCaptureMode();
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { exact: facing } },
+      video: cameraVideoConstraints({ facingMode: { exact: facing } }),
       audio: false
     });
     rememberCameraStream(stream);
@@ -237,7 +248,7 @@ async function openCameraStream() {
   if (deviceId) {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { deviceId: { exact: deviceId } },
+        video: cameraVideoConstraints({ deviceId: { exact: deviceId } }),
         audio: false
       });
       rememberCameraStream(stream);
@@ -252,7 +263,7 @@ async function openCameraStream() {
     return stream;
   } catch (error) {
     if (error?.name === "NotFoundError" || error?.name === "OverconstrainedError") {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      const stream = await navigator.mediaDevices.getUserMedia({ video: cameraVideoConstraints(), audio: false });
       rememberCameraStream(stream);
       return stream;
     }
@@ -3671,20 +3682,39 @@ async function switchFulfillmentCamera() {
   render();
 }
 
-function captureFulfillmentPhoto() {
+async function captureCameraPhotoDataUrl(stream, video) {
+  const track = stream?.getVideoTracks?.()[0];
+  if (track && typeof window.ImageCapture === "function") {
+    try {
+      const blob = await new window.ImageCapture(track).takePhoto();
+      if (blob?.size) return readPhotoFile(blob);
+    } catch {
+      // Fall back to the highest-resolution frame supplied by the video track.
+    }
+  }
+  if (!video?.videoWidth || !video?.videoHeight) throw new Error("Camera preview is not ready yet.");
+  const canvas = document.createElement("canvas");
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("Camera photo capture is not available in this browser.");
+  context.drawImage(video, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL("image/jpeg", OPERATOR_CAMERA_JPEG_QUALITY);
+}
+
+async function captureFulfillmentPhoto() {
   const video = document.getElementById("fulfillmentCamera");
   if (!video || !video.videoWidth || !video.videoHeight) {
     showToast("Camera preview is not ready yet.");
     return;
   }
-  const canvas = document.createElement("canvas");
-  canvas.width = video.videoWidth;
-  canvas.height = video.videoHeight;
-  const context = canvas.getContext("2d");
-  context.drawImage(video, 0, 0, canvas.width, canvas.height);
-  fulfillmentPhotoDataUrl = canvas.toDataURL("image/jpeg", 0.82);
-  stopFulfillmentCamera();
-  render();
+  try {
+    fulfillmentPhotoDataUrl = await captureCameraPhotoDataUrl(fulfillmentCameraStream, video);
+    stopFulfillmentCamera();
+    render();
+  } catch (error) {
+    showToast(error.message || "Photo capture failed.");
+  }
 }
 
 function readPhotoFile(file) {
@@ -3919,17 +3949,17 @@ async function switchReceiptCamera() {
   render();
 }
 
-function captureReceiptPhoto() {
+async function captureReceiptPhoto() {
   const video = document.getElementById("receiptCamera");
   if (!video || !video.videoWidth || !video.videoHeight) return showToast("Camera preview is not ready yet.");
-  const canvas = document.createElement("canvas");
-  canvas.width = video.videoWidth;
-  canvas.height = video.videoHeight;
-  canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
-  receiptPhotoDataUrls[receiptActivePhotoSlot] = canvas.toDataURL("image/jpeg", 0.82);
-  receiptActivePhotoSlot = Math.min(1, receiptActivePhotoSlot + 1);
-  stopReceiptCamera();
-  render();
+  try {
+    receiptPhotoDataUrls[receiptActivePhotoSlot] = await captureCameraPhotoDataUrl(receiptCameraStream, video);
+    receiptActivePhotoSlot = Math.min(1, receiptActivePhotoSlot + 1);
+    stopReceiptCamera();
+    render();
+  } catch (error) {
+    showToast(error.message || "Photo capture failed.");
+  }
 }
 
 async function confirmReceipt() {
