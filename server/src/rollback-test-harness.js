@@ -31,6 +31,8 @@ async function fingerprint(fixtures) {
     "dispatch_audit_log",
     "dispatch_plans",
     "dispatch_plan_snapshots",
+    "dispatch_delivery_groups",
+    "dispatch_delivery_group_members",
     "dispatch_operator_requests",
     "dispatch_so_po_allocations",
     "sales_orders",

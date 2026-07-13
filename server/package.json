@@ -9,7 +9,10 @@
     "migrate": "node src/migrate.js",
     "test:rollback-endpoints": "node src/rollback-test-harness.js",
     "test:sync-shape": "node src/sync-shape-harness.js",
-    "sync:delivery": "node src/sync-delivery.js"
+    "sync:delivery": "node src/sync-delivery.js",
+    "rebuild:delivery-groups": "node src/rebuild-dispatch-delivery-groups.js",
+    "migrate:dispatch-fleet": "node src/migrate-dispatch-setup-to-db.js",
+    "verify:dispatch-fleet": "node src/verify-dispatch-fleet.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

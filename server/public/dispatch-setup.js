@@ -947,7 +947,8 @@ setupApp.addEventListener("submit", (event) => {
       license: data.license,
       number: data.number,
       login: data.login,
-      password: data.password || existingDriver?.password || "",
+      id: existingDriver?.id || null,
+      password: data.password || "",
       samsaraPrimaryLogin: String(data.samsaraPrimaryLogin || "").trim(),
       samsaraSecondaryLogin: String(data.samsaraSecondaryLogin || "").trim(),
       ownYardFixedMinutes: Number(data.ownYardFixedMinutes || data.loadMinutes || 40),
@@ -973,7 +974,9 @@ setupApp.addEventListener("submit", (event) => {
     return;
   }
   if (form.dataset.form === "truck") {
+    const existingTruck = Number.isInteger(selectedSetupIndex) ? trucks[selectedSetupIndex] : null;
     const truck = {
+      id: existingTruck?.id || null,
       plate: data.plate,
       capacityLbs: Number(data.capacityLbs || 48000),
       travelTimePercent: Math.max(0, Number(data.travelTimePercent || 0))

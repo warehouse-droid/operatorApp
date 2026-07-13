@@ -1,4 +1,5 @@
 import { query, withTransaction } from "./db.js";
+import { syncDispatchDeliveryGroupsFromPlan } from "./dispatch-delivery-group-repository.js";
 
 const CUSTOMER_PICKUP_DELIVERY_METHOD = "Pick-Up";
 
@@ -496,6 +497,12 @@ export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [
              saved_at = now()`,
       [planId, JSON.stringify(cleanPlan.orders), JSON.stringify(cleanPlan.trucks), JSON.stringify(cleanPlan.summary || {})]
     );
+    await syncDispatchDeliveryGroupsFromPlan({
+      id: planId,
+      planDate: expectedPlanDate,
+      orders: cleanPlan.orders,
+      trucks: cleanPlan.trucks
+    });
     return getDispatchPlan(planId);
   });
 }
@@ -574,6 +581,12 @@ export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" }
              saved_at = now()`,
       [source.plan_id, JSON.stringify(cleanPlan.orders), JSON.stringify(cleanPlan.trucks), JSON.stringify(cleanPlan.summary || {})]
     );
+    await syncDispatchDeliveryGroupsFromPlan({
+      id: source.plan_id,
+      planDate: currentDate,
+      orders: cleanPlan.orders,
+      trucks: cleanPlan.trucks
+    });
     return {
       plan: await getDispatchPlan(source.plan_id),
       restoredSnapshot: snapshotSummary(source),

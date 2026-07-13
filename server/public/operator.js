@@ -149,6 +149,9 @@ let historyPage = Number(initialOperatorState.historyPage || 0);
 let eventSource = null;
 let eventRefreshTimer = null;
 let pendingDeliveryEventAlertRefs = new Set();
+let pendingDeliveryEventRefresh = false;
+let pendingReceivingEventRefresh = false;
+let pendingOperatorRequestAlert = false;
 let deliveryNotificationState = new Map();
 let deliveryNotificationStateReady = false;
 let cameraFacingMode = localStorage.getItem(CAMERA_FACING_KEY) === "user" ? "user" : "environment";
@@ -548,6 +551,9 @@ function connectEvents() {
     const needsDelivery = deliveryEvents.includes(event.type);
     const needsReceiving = receivingEvents.includes(event.type);
     if (!needsDelivery && !needsReceiving) return;
+    pendingDeliveryEventRefresh ||= needsDelivery;
+    pendingReceivingEventRefresh ||= needsReceiving;
+    pendingOperatorRequestAlert ||= event.type === "dispatch.operator_request.created";
     if (needsDelivery && Array.isArray(payload.changedOperatorRefs)) {
       payload.changedOperatorRefs.forEach((ref) => {
         const cleanRef = String(ref || "").trim();
@@ -559,29 +565,37 @@ function connectEvents() {
       try {
         const alertRefs = [...pendingDeliveryEventAlertRefs];
         pendingDeliveryEventAlertRefs.clear();
-        if (needsDelivery) await loadDeliveryNotifications({
-          alertRefs
-        });
-        if (needsDelivery) await loadCurrentDeliveryDraft();
-        if (needsDelivery && currentModule === "delivery-select" && !fulfillmentSubmitting) {
-          render();
-          return;
-        }
-        if (needsDelivery && currentModule === "delivery" && !fulfillmentSubmitting) {
-          await loadOrders({ keepSelection: true });
+        const refreshDelivery = pendingDeliveryEventRefresh;
+        const refreshReceiving = pendingReceivingEventRefresh;
+        const showOperatorRequestAlert = pendingOperatorRequestAlert;
+        pendingDeliveryEventRefresh = false;
+        pendingReceivingEventRefresh = false;
+        pendingOperatorRequestAlert = false;
+        if (refreshDelivery && currentModule === "delivery" && !fulfillmentSubmitting) {
+          await loadOrders({ keepSelection: true, alertRefs });
           showToast("Orders updated");
           return;
         }
-        if (needsReceiving && currentModule === "receiving" && !receiptSubmitting) {
+        if (refreshDelivery) {
+          await Promise.all([
+            loadDeliveryNotifications({ alertRefs }),
+            loadCurrentDeliveryDraft()
+          ]);
+        }
+        if (refreshDelivery && currentModule === "delivery-select" && !fulfillmentSubmitting) {
+          render();
+          return;
+        }
+        if (refreshReceiving && currentModule === "receiving" && !receiptSubmitting) {
           await loadReceivingOptions();
           if (receivingStep === "orders") await loadReceivingOrders({ keepSelection: true });
           else render();
           showToast("Receiving updated");
           return;
         }
-        if (event.type === "dispatch.operator_request.created") {
+        if (showOperatorRequestAlert) {
           showToast("Dispatch request received");
-        } else if (needsDelivery && currentModule === "menu") {
+        } else if (refreshDelivery && currentModule === "menu") {
           render();
         }
       } catch (error) {
@@ -598,6 +612,10 @@ function connectEvents() {
 
 function disconnectEvents() {
   window.clearTimeout(eventRefreshTimer);
+  pendingDeliveryEventRefresh = false;
+  pendingReceivingEventRefresh = false;
+  pendingOperatorRequestAlert = false;
+  pendingDeliveryEventAlertRefs.clear();
   eventSource?.close();
   eventSource = null;
 }
@@ -1172,6 +1190,8 @@ function warningOrders() {
 
 function isPickableLine(line) {
   if (!line.item_type && !line.item_type_text) return false;
+  const itemName = String(line.sku || line.item_name || line.itemName || "").trim().toUpperCase();
+  if (itemName.startsWith("DELIVERY CHARGE") || itemName.startsWith("SALES CREDIT")) return false;
   return PICKABLE_ITEM_TYPES.has(line.item_type);
 }
 
@@ -1491,14 +1511,16 @@ function saveOperatorState() {
 async function restoreOperatorView() {
   if (!operator) return renderLogin();
   if (!locationId) return renderLocationSelect();
-  await loadDeliveryNotifications({ alertRecent: true });
-  await loadCurrentDeliveryDraft();
   currentModule = restorableModule(currentModule);
   try {
     if (currentModule === "delivery") {
-      await loadOrders({ keepSelection: true });
+      await loadOrders({ keepSelection: true, alertRecent: true });
       return;
     }
+    await Promise.all([
+      loadDeliveryNotifications({ alertRecent: true }),
+      loadCurrentDeliveryDraft()
+    ]);
     if (currentModule === "customer-pickup") {
       if (selectedId) {
         await loadDetail(selectedId, { silentRender: true });
@@ -2523,17 +2545,37 @@ function renderStepper(unit, label, value) {
 
 async function loadOrders(options = {}) {
   const status = viewMode === "packed" ? "packed" : "active";
-  await loadDeliveryNotifications();
-  await loadCurrentDeliveryDraft();
-  await loadSavedDeliveryOrderKeys();
-  if (deliveryPrepMode === "saved") {
+  const canBootstrap = ["standard", "saved"].includes(deliveryPrepMode) && status === "active";
+  if (canBootstrap) {
+    const [bootstrap, requests] = await Promise.all([
+      api(`/api/delivery/bootstrap?locationId=${locationId}`),
+      deliveryPrepMode === "standard" && deliveryBatchFilter !== "transfer"
+        ? api(`/api/operator/requests?locationId=${locationId}&orderType=${deliveryOrderType}&status=open`).catch(() => [])
+        : Promise.resolve([])
+    ]);
+    savedDeliveryOrderKeys = new Set((bootstrap.savedOrderKeys || []).map((key) => String(key)));
+    activeDeliveryDraft = bootstrap.activeDraft || null;
+    applyDeliveryNotifications(bootstrap.notifications, options);
+    const bootstrappedOrders = [...(bootstrap.orders?.salesOrder || []), ...(bootstrap.orders?.transferOrder || [])];
+    orders = deliveryPrepMode === "saved"
+      ? bootstrappedOrders.filter((order) => savedDeliveryOrderKeys.has(String(order.netsuite_id || "")))
+      : bootstrappedOrders;
+    operatorRequests = requests;
+  } else {
+    await Promise.all([
+      loadDeliveryNotifications(options),
+      loadCurrentDeliveryDraft(),
+      loadSavedDeliveryOrderKeys()
+    ]);
+  }
+  if (!canBootstrap && deliveryPrepMode === "saved") {
     orders = await api(`/api/delivery/saved-orders?locationId=${locationId}`);
-  } else if (deliveryPrepMode === "load") {
+  } else if (!canBootstrap && deliveryPrepMode === "load") {
     await loadDeliveryLoadTrucks();
     orders = deliveryLoadViewTruck
       ? await api(`/api/delivery/load-orders?locationId=${locationId}&status=${status}&planDate=${encodeURIComponent(deliveryLoadViewDate || "")}&truckPlate=${encodeURIComponent(deliveryLoadViewTruck)}`)
       : await api(`/api/delivery/load-orders?locationId=${locationId}&status=${status}&planDate=${encodeURIComponent(deliveryLoadViewDate || "")}`);
-  } else {
+  } else if (!canBootstrap) {
     if (deliveryPrepMode === "standard") {
       const [salesOrders, transferOrders] = await Promise.all([
         api(`/api/delivery/orders?locationId=${locationId}&status=${status}&orderType=sales_order`),
@@ -2544,7 +2586,7 @@ async function loadOrders(options = {}) {
       orders = await api(`/api/delivery/orders?locationId=${locationId}&status=${status}&orderType=${deliveryOrderType}`);
     }
   }
-  operatorRequests = deliveryPrepMode === "standard" && deliveryBatchFilter !== "transfer"
+  if (!canBootstrap) operatorRequests = deliveryPrepMode === "standard" && deliveryBatchFilter !== "transfer"
     ? await api(`/api/operator/requests?locationId=${locationId}&orderType=${deliveryOrderType}&status=open`).catch(() => [])
     : [];
   orders = annotateSavedOrders(orders);
@@ -2556,8 +2598,12 @@ async function loadOrders(options = {}) {
     selectedId = panelOrders[0]?.netsuite_id || null;
   }
   selectedOrder = null;
-  if (selectedId) await loadDetail(selectedId, { silentRender: true });
   render();
+  const detailId = selectedId;
+  if (detailId) {
+    await loadDetail(detailId, { silentRender: true });
+    if (String(selectedId) === String(detailId)) render();
+  }
 }
 
 async function loadDeliveryLoadTrucks() {
@@ -2638,9 +2684,14 @@ async function loadDeliveryNotifications(options = {}) {
     return deliveryNotifications;
   }
   const previous = deliveryNotifications;
-  deliveryNotifications = await api(`/api/delivery/notifications?locationId=${locationId}`).catch(() => (
+  const nextNotifications = await api(`/api/delivery/notifications?locationId=${locationId}`).catch(() => (
     previous || { total: 0, salesOrder: { dueToday: 0 }, transferOrder: { dueToday: 0 }, items: [] }
   ));
+  return applyDeliveryNotifications(nextNotifications, options);
+}
+
+function applyDeliveryNotifications(nextNotifications, options = {}) {
+  deliveryNotifications = nextNotifications || { total: 0, salesOrder: { dueToday: 0 }, transferOrder: { dueToday: 0 }, items: [] };
   const items = deliveryNotificationItems();
   const alertRefs = new Set((options.alertRefs || []).map((ref) => String(ref || "").trim()).filter(Boolean));
   let alertItems = [];
@@ -2880,12 +2931,14 @@ function pressReceivingKey(key) {
 async function loadDetail(id, options = {}) {
   selectedId = id;
   const order = await api(`/api/delivery/orders/${id}`);
+  if (String(selectedId) !== String(id)) return null;
   selectedOrder = order;
   const lines = visibleLines(order);
   if (!selectedLineId || !lines.some((line) => String(line.id) === String(selectedLineId))) {
     selectedLineId = lines[0]?.id || null;
   }
   if (!options.silentRender) render();
+  return order;
 }
 
 async function setOrderStatus(status) {

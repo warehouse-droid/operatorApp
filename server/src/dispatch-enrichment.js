@@ -959,8 +959,8 @@ async function parsePurchaseYardWithOllama({ vendor, memo, candidates, sourceRef
 
 export async function enrichSalesOrderDispatch(order) {
   const memo = order.memo || order.note || order.notes || "";
-  const config = await parserConfig();
-  const labeled = extractLabeledDispatchFields(memo, config);
+  const parserRules = await parserConfig();
+  const labeled = extractLabeledDispatchFields(memo, parserRules);
   const relativeDate = parseRelativeDeliveryDate(memo, order.trandate || order.datecreated || order.createddate);
   const fallbackAddress = labeled.deliveryAddress || extractAddress(memo);
   const fallback = {

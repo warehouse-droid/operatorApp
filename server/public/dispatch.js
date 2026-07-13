@@ -1289,10 +1289,96 @@ function canonicalDispatchOrderType(value, id = "") {
   return "SO";
 }
 
+function flattenDispatchGroupMembers(order = {}) {
+  const leafDetails = [];
+  const leafIndexById = new Map();
+  const groupAliases = new Set(
+    (Array.isArray(order.groupAliases) ? order.groupAliases : [])
+      .map((id) => String(id || "").trim())
+      .filter(Boolean)
+  );
+  const visiting = new Set();
+
+  const addLeaf = (id, detail = {}, fallbackType = order.type) => {
+    const leafId = String(id || detail?.id || "").trim();
+    if (!leafId) return;
+    const normalizedDetail = {
+      ...detail,
+      id: leafId,
+      type: canonicalDispatchOrderType(detail?.type || fallbackType, leafId),
+      childOrders: [],
+      childOrderDetails: []
+    };
+    if (leafIndexById.has(leafId)) {
+      const index = leafIndexById.get(leafId);
+      leafDetails[index] = { ...leafDetails[index], ...normalizedDetail };
+      return;
+    }
+    leafIndexById.set(leafId, leafDetails.length);
+    leafDetails.push(normalizedDetail);
+  };
+
+  const visit = (group, { root = false, fallbackType = order.type } = {}) => {
+    const groupId = String(group?.id || "").trim();
+    const childIds = (Array.isArray(group?.childOrders) ? group.childOrders : [])
+      .map((id) => String(id || "").trim())
+      .filter(Boolean);
+    if (!childIds.length) {
+      if (!root) addLeaf(groupId, group, fallbackType);
+      return;
+    }
+
+    if (!root && groupId) groupAliases.add(groupId);
+    for (const alias of Array.isArray(group?.groupAliases) ? group.groupAliases : []) {
+      const normalizedAlias = String(alias || "").trim();
+      if (normalizedAlias) groupAliases.add(normalizedAlias);
+    }
+    if (groupId && visiting.has(groupId)) return;
+    if (groupId) visiting.add(groupId);
+
+    const detailById = new Map(
+      (Array.isArray(group?.childOrderDetails) ? group.childOrderDetails : [])
+        .filter((detail) => detail?.id)
+        .map((detail) => [String(detail.id), detail])
+    );
+    for (const childId of childIds) {
+      const detail = detailById.get(childId) || { id: childId, type: fallbackType };
+      if (Array.isArray(detail.childOrders) && detail.childOrders.length) {
+        visit(detail, { fallbackType: detail.type || fallbackType });
+      } else {
+        addLeaf(childId, detail, fallbackType);
+      }
+    }
+
+    if (groupId) visiting.delete(groupId);
+  };
+
+  visit(order, { root: true, fallbackType: order.type });
+  return {
+    childOrders: leafDetails.map((detail) => detail.id),
+    childOrderDetails: leafDetails,
+    groupAliases: [...groupAliases]
+  };
+}
+
+function splitParentOrderId(order = {}) {
+  const explicitParent = String(order.originalOrderId || "").trim();
+  if (explicitParent) return explicitParent;
+  const orderId = String(order.id || "").trim();
+  return /-S\d+$/i.test(orderId) ? orderId.replace(/-S\d+$/i, "") : "";
+}
+
 function normalizeOrder(order) {
   const id = String(order.id || "");
   const type = canonicalDispatchOrderType(order.type, id);
   const items = Array.isArray(order.items) ? order.items : [];
+  const groupMembers = Array.isArray(order.childOrders) && order.childOrders.length
+    ? flattenDispatchGroupMembers({ ...order, type })
+    : {
+        childOrders: Array.isArray(order.childOrders) ? order.childOrders : [],
+        childOrderDetails: Array.isArray(order.childOrderDetails) ? order.childOrderDetails : [],
+        groupAliases: Array.isArray(order.groupAliases) ? order.groupAliases : []
+      };
   const basePickupLocations = Array.isArray(order.pickupLocations) && order.pickupLocations.length
     ? order.pickupLocations
     : order.sourceYard
@@ -1304,6 +1390,7 @@ function normalizeOrder(order) {
   return {
     ...order,
     type,
+    originalOrderId: splitParentOrderId({ ...order, id }) || order.originalOrderId || "",
     committedQty: Number(order.committedQty ?? order.salesQty ?? 0),
     customer: order.customer || order.vendorYard || order.sourceYard || "",
     address: order.address || "",
@@ -1317,6 +1404,9 @@ function normalizeOrder(order) {
     salesQty: Number(order.salesQty || 0),
     weight: Number(order.weight || 0),
     pickupLocations,
+    childOrders: groupMembers.childOrders,
+    childOrderDetails: groupMembers.childOrderDetails,
+    groupAliases: groupMembers.groupAliases,
     groupKey: order.groupKey || id,
     unloadMinutes: Number(order.unloadMinutes || 35),
     travelMinutes: Number(order.travelMinutes || 30)
@@ -2030,7 +2120,7 @@ function isLocalDispatchOrder(order) {
     || id.startsWith("GRP-")
     || /^G[A-Z]+-/i.test(id)
     || id.startsWith("TO-DRAFT-")
-    || Boolean(order?.originalOrderId);
+    || Boolean(splitParentOrderId(order));
 }
 
 function isNetSuiteDispatchOrder(order) {
@@ -2129,7 +2219,7 @@ function assignedOrderIdsForTrucks(truckList = trucks) {
 function groupedChildOrderIds(orderList = orders) {
   const ids = new Set();
   for (const order of orderList || []) {
-    for (const childId of order.childOrders || []) {
+    for (const childId of [...(order.childOrders || []), ...(order.groupAliases || [])]) {
       if (childId) ids.add(childId);
     }
   }
@@ -2138,14 +2228,14 @@ function groupedChildOrderIds(orderList = orders) {
 
 function splitParentOrderIds(orderList = orders) {
   return new Set((orderList || [])
-    .map((order) => String(order?.originalOrderId || "").trim())
+    .map(splitParentOrderId)
     .filter(Boolean));
 }
 
 function splitSiblingsForOrder(order = {}) {
-  const originalOrderId = String(order?.originalOrderId || "").trim();
+  const originalOrderId = splitParentOrderId(order);
   if (!originalOrderId) return [];
-  return orders.filter((item) => String(item?.originalOrderId || "").trim() === originalOrderId);
+  return orders.filter((item) => splitParentOrderId(item) === originalOrderId);
 }
 
 function splitOrderPlanningBlock(splits = []) {
@@ -2178,11 +2268,15 @@ function applySavedPlan(saved) {
       childOrders: order.childOrders,
       childOrderDetails: order.childOrderDetails,
       consolidation: order.consolidation,
-      originalOrderId: order.originalOrderId,
+      originalOrderId: splitParentOrderId(order) || order.originalOrderId,
       originalPallets: order.originalPallets,
       transitCo: order.transitCo,
       transitOriginalPickupLocations: order.transitOriginalPickupLocations
     };
+    if (splitParentOrderId(order) && Array.isArray(order.items) && order.items.length && !base.items?.length) {
+      keepPlanningFields.items = order.items;
+      keepPlanningFields.raw = order.raw;
+    }
     const merged = {
       ...order,
       ...base,
@@ -3141,6 +3235,7 @@ function matchesSearch(order) {
     order.expectedDeliveryDate,
     order.notes,
     ...(order.childOrders || []),
+    ...(order.groupAliases || []),
     ...(order.childOrderDetails || []).flatMap((child) => [child?.id, child?.originalOrderId]),
     ...(order.items || []).map((item) => item.sku)
   ].join(" ").toLowerCase().includes(term);
@@ -6033,10 +6128,20 @@ function groupOrder(orderId) {
     routeNotice = blockReason;
     return;
   }
+  const flattenedMembers = flattenDispatchGroupMembers({
+    type: groupItems[0].type,
+    childOrders: groupItems.map((item) => item.id),
+    childOrderDetails: groupItems
+  });
+  const leafItems = flattenedMembers.childOrderDetails;
+  const groupAliases = [...new Set([
+    ...flattenedMembers.groupAliases,
+    ...groupItems.filter((item) => item.childOrders?.length).map((item) => item.id)
+  ])];
   const grouped = {
     ...groupItems[0],
-    id: uniqueGroupedDispatchOrderId(groupItems),
-    customer: `${groupItems.length} orders grouped`,
+    id: uniqueGroupedDispatchOrderId(leafItems),
+    customer: `${leafItems.length} orders grouped`,
     address: groupItems[0].address,
     pallets: groupItems.reduce((sum, item) => sum + Number(item.pallets || 0), 0),
     layers: groupItems.reduce((sum, item) => sum + Number(item.layers || 0), 0),
@@ -6046,9 +6151,10 @@ function groupOrder(orderId) {
     travelMinutes: Math.max(...groupItems.map((item) => Number(item.travelMinutes || 0))),
     pickupLocations: [...new Set(groupItems.flatMap((item) => item.pickupLocations || []))],
     items: groupItems.flatMap((item) => item.items || []),
-    childOrders: groupItems.map((item) => item.id),
-    childOrderDetails: groupItems.map((item) => normalizeOrder({ ...item })),
-    notes: `Grouped orders: ${groupItems.map((item) => item.id).join(", ")}`
+    childOrders: flattenedMembers.childOrders,
+    childOrderDetails: leafItems.map((item) => normalizeOrder({ ...item })),
+    groupAliases,
+    notes: `Grouped orders: ${flattenedMembers.childOrders.join(", ")}`
   };
   const ids = new Set(groupItems.map((item) => item.id));
   const firstIndex = orders.findIndex((item) => ids.has(item.id));

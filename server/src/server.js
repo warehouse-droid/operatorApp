@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { config, listEnvFiles, selectEnvFile } from "./config.js";
 import { beginRollbackContext, pool, query, withTransaction } from "./db.js";
 import { buildAuthorizationUrl, exchangeCodeForToken, fetchDeliveryOrdersFromNetSuite, fetchDeliveryOrderFromNetSuite, fetchCustomerPickupOrderFromNetSuite, fetchDeliveryOrderDetailsFromNetSuite, fetchTransferDeliveryOrdersFromNetSuite, fetchTransferDeliveryOrderFromNetSuite, fetchTransferOrderDetailsFromNetSuite, fetchPurchaseOrdersFromNetSuite, fetchPurchaseOrderFromNetSuite, fetchPurchaseOrderDetailsFromNetSuite, fetchTransferReceivingOrdersFromNetSuite, fetchTransferReceivingOrderFromNetSuite, fetchInventoryBalanceForItemFromNetSuite, fetchInventoryBalancesFromNetSuite, fetchItemFulfillmentFromNetSuite, fetchItemReceiptFromNetSuite, fetchTransactionProgressFromNetSuite, fetchTransactionStatusFromNetSuite, transformSalesOrderToItemFulfillment, transformTransferOrderToItemFulfillment, transformPurchaseOrderToItemReceipt, transformTransferOrderToItemReceipt } from "./netsuite.js";
-import { listDeliveryOrders, getDeliveryOrder, getFulfillableDeliveryOrder, buildItemFulfillmentPayload, markDeliveryPrepared, updateDeliveryStatus, confirmDeliveryLine, confirmDeliveryLines, setDeliveryLinePackedQuantity, unpackDeliveryLine, unpackDeliveryOrder, recordDeliveryFulfillment, recordDeliveryFulfillmentFailure, recordDeliveryLoad, listDeliveryFulfillments, listControlLoadedOrders, getControlLoadedOrderDetail, listControlLoadedOrderCsvRows, getDeliveryPrepNotifications, resetDeliveryFulfillmentState, applyConfirmedDispatchPlanToDelivery, deactivateUnplannedDispatchSplitOrders, getNextDispatchSplitSuffix, getCurrentOperatorDeliveryDraft, releaseCurrentDeliveryDraft, listSavedDeliveryOrdersForOperator, listSavedDeliveryOrderKeysForOperator, saveDeliveryOrderForOperator, removeSavedDeliveryOrderForOperator, listDeliveryLoadTrucks, listDeliveryLoadOrders } from "./delivery-repository.js";
+import { listDeliveryOrders, getDeliveryOrder, getFulfillableDeliveryOrder, buildItemFulfillmentPayload, markDeliveryPrepared, updateDeliveryStatus, confirmDeliveryLine, confirmDeliveryLines, setDeliveryLinePackedQuantity, unpackDeliveryLine, unpackDeliveryOrder, recordDeliveryFulfillment, recordDeliveryFulfillmentFailure, recordDeliveryLoad, listDeliveryFulfillments, listControlLoadedOrders, getControlLoadedOrderDetail, listControlLoadedOrderCsvRows, getDeliveryBootstrap, getDeliveryPrepNotifications, resetDeliveryFulfillmentState, applyConfirmedDispatchPlanToDelivery, deactivateUnplannedDispatchSplitOrders, getNextDispatchSplitSuffix, getCurrentOperatorDeliveryDraft, releaseCurrentDeliveryDraft, listSavedDeliveryOrdersForOperator, listSavedDeliveryOrderKeysForOperator, saveDeliveryOrderForOperator, removeSavedDeliveryOrderForOperator, listDeliveryLoadTrucks, listDeliveryLoadOrders } from "./delivery-repository.js";
 import { clearCustomerPickupDraft, confirmCustomerPickupLine, findCustomerPickupOrder, isPendingApprovalStatus, isPickupDeliveryMethod, recordCustomerPickupLoad } from "./customer-pickup-repository.js";
 import { createOperator, getOperatorByToken, hasOperators, listAudit, listAuditOptions, listOperators, loginOperator, logoutToken, setOperatorActive, updateOperatorPassword, writeAudit } from "./auth-repository.js";
 import { applyInventoryClassificationRules, confirmCycleCountLine, getCycleCountDraft, listCycleCountRecords, listInventoryClassifications, listInventoryFacets, listInventoryItems, submitCycleCount, updateInventoryClassification, upsertInventoryBalances } from "./inventory-repository.js";
@@ -22,6 +22,7 @@ import { getDispatchStatistics } from "./dispatch-statistics-repository.js";
 import { endDriverRest, ensureDriverSamsaraDutyForJob, getActiveDriverRest, getDriverDayState, getNextDriverJob, listDriverHistory, listDriverJobStatuses, recordDriverJobPhotos, skipDriverDvirForTesting, startDriverJob, startDriverRest, submitDriverDvir } from "./driver-repository.js";
 import { createSamsaraDriverAuthToken, createSamsaraDriverVehicleAssignment, findSamsaraDriverByUsername, listSamsaraVehicleLocations, setSamsaraDriverDutyStatus, testSamsaraConnection } from "./samsara.js";
 import { createPhotoReadToken, createPhotoUploadToken, isR2PhotoReference, publicPhotoUploadConfig } from "./photo-upload.js";
+import { authenticateDispatchDriver, ensureDispatchFleetSetup, getDispatchDriverByLogin, listDispatchDrivers, listDispatchTrucks, replaceDispatchFleetSetup } from "./dispatch-setup-repository.js";
 
 const app = express();
 const dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1251,8 +1252,7 @@ async function requireDriver(req, res, next) {
     const token = driverToken(req);
     const session = driverSessions.get(token);
     if (!session) return res.status(401).json({ error: "Driver login required" });
-    const setup = await readDispatchSetup();
-    const driver = (setup.drivers || []).find((item) => String(item.login || "").trim().toLowerCase() === session.login);
+    const driver = await getDispatchDriverByLogin(session.login);
     if (!driver) {
       driverSessions.delete(token);
       return res.status(401).json({ error: "Driver login required" });
@@ -1390,11 +1390,16 @@ async function readDispatchSetup() {
     if (error.code === "ENOENT") return "";
     throw error;
   });
-  if (!text) return defaultDispatchSetup;
-  const saved = JSON.parse(text);
+  const saved = text ? JSON.parse(text) : {};
+  let [drivers, trucks] = await Promise.all([listDispatchDrivers(), listDispatchTrucks()]);
+  const seedDrivers = Array.isArray(saved.drivers) ? saved.drivers : defaultDispatchSetup.drivers;
+  const seedTrucks = Array.isArray(saved.trucks) ? saved.trucks : defaultDispatchSetup.trucks;
+  if ((!drivers.length && seedDrivers.length) || (!trucks.length && seedTrucks.length)) {
+    ({ drivers, trucks } = await ensureDispatchFleetSetup({ drivers: seedDrivers, trucks: seedTrucks }));
+  }
   return {
-    drivers: Array.isArray(saved.drivers) ? saved.drivers : defaultDispatchSetup.drivers,
-    trucks: Array.isArray(saved.trucks) ? saved.trucks : defaultDispatchSetup.trucks,
+    drivers,
+    trucks,
     ownYards: Array.isArray(saved.ownYards) ? saved.ownYards : defaultDispatchSetup.ownYards,
     sync: normalizeSyncSettings(saved.sync),
     samsara: {
@@ -1438,16 +1443,24 @@ function validateDispatchSetupDrivers(drivers = []) {
 
 async function writeDispatchSetup(patch = {}) {
   const current = await readDispatchSetup();
-  const payload = {
-    drivers: Array.isArray(patch.drivers) ? patch.drivers : current.drivers,
-    trucks: Array.isArray(patch.trucks) ? patch.trucks : current.trucks,
+  const requestedDrivers = Array.isArray(patch.drivers) ? patch.drivers : current.drivers;
+  const requestedTrucks = Array.isArray(patch.trucks) ? patch.trucks : current.trucks;
+  validateDispatchSetupDrivers(requestedDrivers);
+  const fleet = Array.isArray(patch.drivers) || Array.isArray(patch.trucks)
+    ? await replaceDispatchFleetSetup({ drivers: requestedDrivers, trucks: requestedTrucks })
+    : { drivers: current.drivers, trucks: current.trucks };
+  const configPayload = {
     ownYards: Array.isArray(patch.ownYards) ? patch.ownYards : current.ownYards,
     sync: patch.sync ? normalizeSyncSettings({ ...current.sync, ...patch.sync }) : current.sync,
     samsara: patch.samsara ? { ...current.samsara, ...patch.samsara } : current.samsara
   };
-  validateDispatchSetupDrivers(payload.drivers);
+  const payload = {
+    ...configPayload,
+    drivers: fleet.drivers,
+    trucks: fleet.trucks
+  };
   await fs.mkdir(dataDir, { recursive: true });
-  await fs.writeFile(dispatchSetupPath, JSON.stringify(payload, null, 2));
+  await fs.writeFile(dispatchSetupPath, `${JSON.stringify(configPayload, null, 2)}\n`);
   return payload;
 }
 
@@ -4917,11 +4930,12 @@ app.post("/api/driver/login", async (req, res, next) => {
   try {
     const login = String(req.body?.username || req.body?.login || "").trim().toLowerCase();
     const password = String(req.body?.password || "");
-    const setup = await readDispatchSetup();
-    const driver = (setup.drivers || []).find((item) => String(item.login || "").trim().toLowerCase() === login);
+    const authenticated = await authenticateDispatchDriver(login, password);
+    if (!authenticated.driver && authenticated.reason === "password_not_configured") {
+      return res.status(401).json({ error: "Password is not set for this driver. Leave password blank or update it in Dispatch Setup." });
+    }
+    const driver = authenticated.driver;
     if (!driver) return res.status(401).json({ error: "Invalid driver login." });
-    if (driver.password && String(driver.password) !== password) return res.status(401).json({ error: "Invalid driver login." });
-    if (!driver.password && password) return res.status(401).json({ error: "Password is not set for this driver. Leave password blank or update it in Dispatch Setup." });
     const token = crypto.randomBytes(32).toString("base64url");
     driverSessions.set(token, { login, createdAt: new Date().toISOString() });
     const dayState = await getDriverDayState(login, { samsaraAccounts: samsaraAccountsForDriver(driver) });
@@ -6020,6 +6034,17 @@ app.get("/api/delivery/orders", async (req, res, next) => {
       locationId: req.query.locationId,
       status: req.query.status,
       orderType: normalizeOrderType(req.query.orderType)
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/delivery/bootstrap", async (req, res, next) => {
+  try {
+    res.json(await getDeliveryBootstrap({
+      operatorId: operatorId(req),
+      locationId: req.query.locationId
     }));
   } catch (error) {
     next(error);
