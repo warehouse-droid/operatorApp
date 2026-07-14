@@ -209,8 +209,14 @@ export async function listReceivingSources({ destinationLocationId = null } = {}
               to_location_id AS destination_location_id,
               status_text,
               netsuite_active
-       FROM transfer_orders
-       WHERE to_location_id IS NOT NULL
+       FROM transfer_orders t
+       WHERE t.to_location_id IS NOT NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM order_dependencies d
+            WHERE d.transfer_order_id = t.netsuite_id
+              AND d.dependency_mode = 'direct_to_customer'
+              AND d.status <> 'cancelled'
+         )
      ) transfer_receiving_source
      WHERE netsuite_active = true
        AND (status_text ILIKE '%Pending Receipt%' OR status_text ILIKE '%Partially Received%')
@@ -275,8 +281,14 @@ export async function listReceivingOrders({ orderType, vendor = null, sourceLoca
               netsuite_active, synced_at, receiving_status AS receipt_status, memo, expected_delivery_date,
               NULL::text AS dispatch_vendor_yard, dispatch_address, dispatch_window_start,
               dispatch_window_end, dispatch_instructions
-       FROM transfer_orders
-       WHERE to_location_id IS NOT NULL
+       FROM transfer_orders t
+       WHERE t.to_location_id IS NOT NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM order_dependencies d
+            WHERE d.transfer_order_id = t.netsuite_id
+              AND d.dependency_mode = 'direct_to_customer'
+              AND d.status <> 'cancelled'
+         )
      ),
      receiving_line_source AS (
        SELECT purchase_order_id AS order_id, item_name, item_description, netsuite_active
@@ -323,8 +335,14 @@ export async function getReceivingOrder(orderId) {
               netsuite_active, synced_at, receiving_status AS receipt_status, memo, expected_delivery_date,
               NULL::text AS dispatch_vendor_yard, dispatch_address, dispatch_window_start,
               dispatch_window_end, dispatch_instructions
-       FROM transfer_orders
-       WHERE to_location_id IS NOT NULL
+       FROM transfer_orders t
+       WHERE t.to_location_id IS NOT NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM order_dependencies d
+            WHERE d.transfer_order_id = t.netsuite_id
+              AND d.dependency_mode = 'direct_to_customer'
+              AND d.status <> 'cancelled'
+         )
      )
      SELECT *
      FROM receiving_order_source
@@ -1272,8 +1290,14 @@ export async function searchReceivingItems({ orderType, vendor = null, sourceLoc
        SELECT netsuite_id, 'transfer_order'::text AS order_type, NULL::text AS vendor,
               from_location_id AS source_location_id, to_location_id AS destination_location_id,
               status_text, netsuite_active
-       FROM transfer_orders
-       WHERE to_location_id IS NOT NULL
+       FROM transfer_orders t
+       WHERE t.to_location_id IS NOT NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM order_dependencies d
+            WHERE d.transfer_order_id = t.netsuite_id
+              AND d.dependency_mode = 'direct_to_customer'
+              AND d.status <> 'cancelled'
+         )
      ),
      receiving_line_source AS (
        SELECT purchase_order_id AS order_id, item_id, item_name, item_description, netsuite_active

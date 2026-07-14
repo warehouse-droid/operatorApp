@@ -31,6 +31,9 @@ function buildConfig(env) {
     appBaseUrl: env.APP_BASE_URL || "http://localhost:3000",
     databaseUrl: env.DATABASE_URL,
     googleMapsApiKey: env.GOOGLE_MAPS_API_KEY || "",
+    transferDependency: {
+      westYardPenaltyMinutes: Number(env.TRANSFER_DEPENDENCY_150_PENALTY_MINUTES || 60)
+    },
     samsara: {
       apiToken: env.SAMSARA_API_TOKEN || env.SAMSARA_API_KEY || "",
       dvirAuthorId: env.SAMSARA_DVIR_AUTHOR_ID || ""
@@ -58,6 +61,7 @@ function buildConfig(env) {
       restBaseUrl: env.NETSUITE_REST_BASE_URL,
       scopes: env.NETSUITE_SCOPES || "rest_webservices",
       requestTimeoutMs: Number(env.NETSUITE_REQUEST_TIMEOUT_MS || 120000),
+      subsidiaryId: env.NETSUITE_SUBSIDIARY_ID || "",
       webhookSecret: env.NETSUITE_WEBHOOK_SECRET || ""
     }
   };
@@ -68,6 +72,7 @@ function replaceConfig(target, next) {
   target.appBaseUrl = next.appBaseUrl;
   target.databaseUrl = next.databaseUrl;
   target.googleMapsApiKey = next.googleMapsApiKey;
+  target.transferDependency = { ...next.transferDependency };
   target.samsara = { ...next.samsara };
   target.ollama = { ...next.ollama };
   target.photoUpload = { ...next.photoUpload };
@@ -80,6 +85,11 @@ export let activeEnvPath = path.join(serverRoot, activeEnvFile);
 dotenv.config({ path: activeEnvPath, override: true });
 
 export const config = buildConfig(process.env);
+
+export function isNetSuiteSandboxEnvironment() {
+  const marker = `${config.netsuite.accountId || ""} ${config.netsuite.restBaseUrl || ""}`.toLowerCase();
+  return /(?:^|[-_])sb\d+(?:$|[.\s/_-])/.test(marker) || marker.includes("sandbox");
+}
 
 export function requireConfig(keys) {
   const missing = keys.filter((key) => !key.split(".").reduce((value, part) => value?.[part], config));

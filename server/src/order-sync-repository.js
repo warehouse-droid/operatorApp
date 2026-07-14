@@ -1,6 +1,7 @@
 import { writeAudit } from "./auth-repository.js";
 import { query } from "./db.js";
 import { enrichPurchaseOrderDispatch, enrichSalesOrderDispatch, enrichTransferDispatch } from "./dispatch-enrichment.js";
+import { syncOrderDependenciesForTransferOrder } from "./order-dependency-repository.js";
 
 function normalizeNetSuiteDate(value) {
   const text = String(value ?? "").trim();
@@ -108,6 +109,8 @@ function normalizeLine(line) {
     item_description: line.item_description,
     sku: line.sku || line.item_name,
     quantity: normalizeQuantity(line.quantity),
+    netsuite_committed_qty: normalizeQuantity(line.netsuite_committed_qty),
+    netsuite_backordered_qty: normalizeQuantity(line.netsuite_backordered_qty),
     netsuite_received_qty: normalizeQuantity(line.netsuite_received_qty),
     unit: line.unit,
     item_weight: normalizeNumber(line.item_weight),
@@ -518,11 +521,13 @@ export async function upsertSalesOrderLines(orderId, lines = []) {
          item_description, sku, quantity, unit, item_weight, location_id,
          location, pallet_qty, layer_qty, piece_qty, section_qty, to_plt,
          to_lyr, to_sec, to_pcs, loaded_qty, loaded_uom, netsuite_active, sync_exception,
+         netsuite_committed_qty, netsuite_backordered_qty,
          sync_exception_at, synced_at
        ) VALUES (
          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
          $11, $12, $13, $14, $15, $16, $17, $18, $19,
-         $20, $21, COALESCE($22::numeric, 0), $23, true, null, null, now()
+         $20, $21, COALESCE($22::numeric, 0), $23, true, null,
+         COALESCE($24::numeric, 0), COALESCE($25::numeric, 0), null, now()
        )
        ON CONFLICT (sales_order_id, line_id) DO UPDATE SET
          item_id = EXCLUDED.item_id,
@@ -568,6 +573,14 @@ export async function upsertSalesOrderLines(orderId, lines = []) {
          to_lyr = EXCLUDED.to_lyr,
          to_sec = EXCLUDED.to_sec,
          to_pcs = EXCLUDED.to_pcs,
+         netsuite_committed_qty = CASE
+           WHEN $24::numeric IS NULL THEN sales_order_lines.netsuite_committed_qty
+           ELSE EXCLUDED.netsuite_committed_qty
+         END,
+         netsuite_backordered_qty = CASE
+           WHEN $25::numeric IS NULL THEN sales_order_lines.netsuite_backordered_qty
+           ELSE EXCLUDED.netsuite_backordered_qty
+         END,
          netsuite_active = true,
          synced_at = now()`,
       [
@@ -593,7 +606,9 @@ export async function upsertSalesOrderLines(orderId, lines = []) {
         normalized.to_sec,
         normalized.to_pcs,
         normalized.netsuite_received_qty,
-        normalized.unit
+        normalized.unit,
+        normalized.netsuite_committed_qty,
+        normalized.netsuite_backordered_qty
       ]
     );
     await upsertInventoryItemFromLine(normalized);
@@ -607,7 +622,8 @@ export async function upsertSalesOrderLines(orderId, lines = []) {
         "line_id", "item_id", "item_name", "item_type", "item_type_text",
         "item_description", "sku", "quantity", "unit", "item_weight",
         "location_id", "location", "pallet_qty", "layer_qty", "piece_qty",
-        "section_qty", "to_plt", "to_lyr", "to_sec", "to_pcs"
+        "section_qty", "to_plt", "to_lyr", "to_sec", "to_pcs",
+        "netsuite_committed_qty", "netsuite_backordered_qty"
       ],
       detailsKey: "line"
     });
@@ -755,6 +771,7 @@ async function upsertTransferOrderLines(orderId, lines = [], stage) {
       detailsKey: "line"
     });
   }
+  await syncOrderDependenciesForTransferOrder(orderId);
 }
 
 export async function listExistingOutboundOrderIds({ locationId = null, orderFamily = "sales_order" } = {}) {

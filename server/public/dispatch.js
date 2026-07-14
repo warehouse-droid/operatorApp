@@ -361,6 +361,8 @@ let splitParts = 2;
 let splitDraft = { orderId: "", parts: 0, items: {} };
 let poAllocationOptions = null;
 let poAllocationLoading = false;
+let orderDependencyOptions = null;
+let orderDependencyLoading = false;
 let selectedOrderIds = new Set([selectedOrderId]);
 let loadPreviewOpen = false;
 let sequenceCollapsed = false;
@@ -442,6 +444,7 @@ const DISPATCH_VIEW_MUTATION_ACTIONS = new Set([
   "open-group-modal", "confirm-group", "ungroup-order", "open-split-modal", "confirm-split", "unsplit-order", "request-unpack-for-split",
   "open-consolidate-modal", "confirm-consolidate", "open-po-link-modal", "confirm-po-link",
   "open-co-modal", "confirm-co", "open-po-yard-modal", "confirm-po-yard", "cancel-po-link",
+  "load-dependency-lines", "link-order-dependency", "update-dependency-mode", "unlink-dependency",
   "delete-load", "confirm-delete-load", "clear-load", "add-load", "move-truck-up", "move-truck-down",
   "add-return-load", "remove-stop", "optimize-route", "toggle-route-tolls"
 ]);
@@ -1021,18 +1024,55 @@ function isOwnYardCode(value) {
   return Boolean(ownYardForLocation(value));
 }
 
-function itemForPickupLocation(item = {}, pickupLocation = "") {
+function directPickupEntriesForLocation(order = {}, pickupLocation = "") {
+  const location = normalizedPickupLocation(pickupLocation);
+  return (order.directPickupManifest || []).filter((entry) => normalizedPickupLocation(entry.location) === location);
+}
+
+function directPickupItemsForLocation(order = {}, pickupLocation = "") {
+  return directPickupEntriesForLocation(order, pickupLocation).flatMap((entry) => (entry.items || []).map((item) => ({
+    ...item,
+    sku: item.sku || item.itemName || "",
+    pallets: Number(item.palletQty || 0),
+    layers: Number(item.layerQty || 0),
+    sections: Number(item.sectionQty || 0),
+    pieces: Number(item.pieceQty || 0),
+    quantity: Number(item.quantity || 0),
+    salesQty: Number(item.quantity || 0)
+  })));
+}
+
+function directPickupAllocatedForItem(order = {}, item = {}) {
+  const itemId = String(item.itemId || item.item_id || "");
+  const sku = String(item.sku || item.itemName || item.name || "").trim().toLowerCase();
+  const matches = (order.directPickupManifest || []).flatMap((entry) => entry.items || []).filter((entry) => {
+    if (itemId && String(entry.itemId || entry.item_id || "") === itemId) return true;
+    return sku && String(entry.sku || entry.itemName || "").trim().toLowerCase() === sku;
+  });
+  return matches.reduce((total, entry) => ({
+    pallets: total.pallets + Number(entry.palletQty || 0),
+    layers: total.layers + Number(entry.layerQty || 0),
+    sections: total.sections + Number(entry.sectionQty || 0),
+    pieces: total.pieces + Number(entry.pieceQty || 0),
+    quantity: total.quantity + Number(entry.quantity || 0)
+  }), { pallets: 0, layers: 0, sections: 0, pieces: 0, quantity: 0 });
+}
+
+function itemForPickupLocation(item = {}, pickupLocation = "", order = {}) {
   const location = String(pickupLocation || "").trim();
   if (!location) return item;
   if (isOwnYardCode(location)) {
+    const direct = String(order.sourceYard || order.outboundLocation || "") === location
+      ? directPickupAllocatedForItem(order, item)
+      : { pallets: 0, layers: 0, sections: 0, pieces: 0, quantity: 0 };
     return {
       ...item,
-      pallets: positiveBalance(item.pallets, item.poAllocatedPallets),
-      layers: positiveBalance(item.layers, item.poAllocatedLayers),
-      sections: positiveBalance(item.sections, item.poAllocatedSections),
-      pieces: positiveBalance(item.pieces, item.poAllocatedPieces),
-      quantity: positiveBalance(item.quantity || item.salesQty, item.poAllocatedSalesQty),
-      salesQty: positiveBalance(item.salesQty || item.quantity, item.poAllocatedSalesQty)
+      pallets: positiveBalance(item.pallets, Number(item.poAllocatedPallets || 0) + direct.pallets),
+      layers: positiveBalance(item.layers, Number(item.poAllocatedLayers || 0) + direct.layers),
+      sections: positiveBalance(item.sections, Number(item.poAllocatedSections || 0) + direct.sections),
+      pieces: positiveBalance(item.pieces, Number(item.poAllocatedPieces || 0) + direct.pieces),
+      quantity: positiveBalance(item.quantity || item.salesQty, Number(item.poAllocatedSalesQty || 0) + direct.quantity),
+      salesQty: positiveBalance(item.salesQty || item.quantity, Number(item.poAllocatedSalesQty || 0) + direct.quantity)
     };
   }
   return {
@@ -1085,12 +1125,38 @@ function tooltipItemsForOrder(order, { pickupLocation = "" } = {}) {
   if (pickupLocation && order?.type === "PO") {
     return (order.items || []).filter(itemHasQuantity);
   }
+  const directItems = pickupLocation ? directPickupItemsForLocation(order, pickupLocation) : [];
+  if (directItems.length && String(order.sourceYard || order.outboundLocation || "") !== String(pickupLocation || "")) {
+    return directItems.filter(itemHasQuantity);
+  }
   return (order.items || [])
-    .map((item) => pickupLocation ? itemForPickupLocation(item, pickupLocation) : item)
+    .map((item) => pickupLocation ? itemForPickupLocation(item, pickupLocation, order) : item)
     .filter(itemHasQuantity);
 }
 
 function tooltipItemRowsForOrder(order, { pickupLocation = "", includeOrderHeader = false } = {}) {
+  const directEntries = pickupLocation ? directPickupEntriesForLocation(order, pickupLocation) : [];
+  if (directEntries.length && String(order.sourceYard || order.outboundLocation || "") !== String(pickupLocation || "")) {
+    return directEntries.map((entry) => `
+      <div>
+        <b>${escapeHtml(entry.transferOrderRef || order.id)}</b>
+        <span>For ${escapeHtml(entry.salesOrderRef || order.id)}</span>
+      </div>
+      ${(entry.items || []).map((item) => `
+        <div>
+          <b>${escapeHtml(item.sku || item.itemName || "")}</b>
+          <span>${escapeHtml(itemQtyText({
+            pallets: item.palletQty,
+            layers: item.layerQty,
+            sections: item.sectionQty,
+            pieces: item.pieceQty,
+            quantity: item.quantity,
+            unit: item.unit
+          }))}</span>
+        </div>
+      `).join("")}
+    `).join("");
+  }
   const rows = tooltipItemsForOrder(order, { pickupLocation }).map((item) => `
     <div>
       <b>${escapeHtml(item.sku)}</b>
@@ -1433,6 +1499,47 @@ function isTransitCoPlanned(order) {
 function transitBlockMessage(order) {
   if (!order?.transitCo?.id || isTransitCoPlanned(order)) return "";
   return `${order.id} requires ${order.transitCo.id} to be planned first.`;
+}
+
+function replenishmentDependencyComplete(dependency = {}, transferOrder = {}) {
+  const dependencyStatus = String(dependency.status || "").toLowerCase();
+  const receivingStatus = String(transferOrder.receivingStatus || transferOrder.raw?.receiving_status || "").toLowerCase();
+  return ["delivered", "received_local"].includes(dependencyStatus)
+    || ["received", "completed", "shipped"].includes(receivingStatus);
+}
+
+function replenishmentPlacementBlockMessage(order, targetTruck, targetLoad, insertIndex = null) {
+  const dependencies = (order?.orderDependencies || []).filter((dependency) =>
+    dependency.mode === "yard_replenishment" && dependency.status !== "cancelled"
+  );
+  for (const dependency of dependencies) {
+    const transferOrder = orderById(dependency.transferOrderRef);
+    if (replenishmentDependencyComplete(dependency, transferOrder)) continue;
+    const transferDate = String(transferOrder?.dispatchPlanDate || "").slice(0, 10);
+    if (transferDate && comparePlanDate(transferDate, currentPlanDate) < 0) continue;
+    const assignment = orderAssignment(dependency.transferOrderRef);
+    if (!assignment.load) {
+      return `${order.id} requires ${dependency.transferOrderRef} to be planned before this delivery.`;
+    }
+    if (String(assignment.load.id || "") === String(targetLoad?.id || "")) {
+      const transferDropIndex = (assignment.load.stops || []).findIndex((stop) =>
+        stop.type === "drop" && String(stop.orderId || "") === String(dependency.transferOrderRef)
+      );
+      const targetIndex = Number.isInteger(insertIndex) ? insertIndex : (targetLoad?.stops || []).length;
+      if (transferDropIndex < 0 || transferDropIndex >= targetIndex) {
+        return `${dependency.transferOrderRef} must be completed before ${order.id} pickup in this load.`;
+      }
+      continue;
+    }
+    if (String(assignment.truck?.id || "") === String(targetTruck?.id || "")) {
+      const transferLoadIndex = (targetTruck?.loads || []).findIndex((load) => load.id === assignment.load.id);
+      const targetLoadIndex = (targetTruck?.loads || []).findIndex((load) => load.id === targetLoad?.id);
+      if (transferLoadIndex >= targetLoadIndex) {
+        return `${dependency.transferOrderRef} must be in an earlier load than ${order.id}.`;
+      }
+    }
+  }
+  return "";
 }
 
 function comparePlanDate(a, b) {
@@ -3211,6 +3318,7 @@ function openOrders() {
   const term = searchText.trim();
   return orders.filter((order) => {
     if (hiddenOrderIds.has(order.id)) return false;
+    if (!term && order.dependencyHidden) return false;
     if (!term && assigned.has(order.id)) return false;
     if (!term && isOrderPlannedOutsideCurrentPlan(order)) return false;
     if (!matchesSearch(order)) return false;
@@ -3261,7 +3369,14 @@ function stopById(stopId) {
 }
 
 function requiredPickupLocations(order) {
-  return order?.pickupLocations?.length ? order.pickupLocations : ["3445"];
+  const locations = order?.pickupLocations?.length ? order.pickupLocations : ["3445"];
+  const seen = new Set();
+  return locations.filter((location) => {
+    const key = normalizedPickupLocation(location);
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return tooltipItemsForOrder(order, { pickupLocation: location }).some(itemHasQuantity);
+  });
 }
 
 function sequenceWarningsForStops(stops) {
@@ -3311,9 +3426,38 @@ function pickupFootprintForLocation(load, location) {
     if (!order) continue;
     if (!requiredPickupLocations(order).map(String).includes(pickupLocation)) continue;
     countedOrders.add(stop.orderId);
-    total += orderFootprintPallets(order);
+    total += pickupFootprintForOrderLocation(order, pickupLocation);
   }
   return total;
+}
+
+function pickupFootprintForOrderLocation(order, location) {
+  const items = tooltipItemsForOrder(order, { pickupLocation: location });
+  if (!items.length) return 0;
+  const pallets = items.reduce((sum, item) => sum + Number(item.pallets || item.pallet_qty || 0), 0);
+  const hasLoose = items.some((item) => Number(item.layers || item.layer_qty || 0)
+    || Number(item.sections || item.section_qty || 0)
+    || Number(item.pieces || item.piece_qty || 0));
+  if (pallets || hasLoose) return pallets + (hasLoose ? 1 : 0);
+  const direct = directPickupEntriesForLocation(order, location);
+  if (direct.length) return direct.reduce((sum, entry) => sum + (entry.items || []).reduce((itemSum, item) => itemSum + Number(item.palletQty || 0), 0), 0);
+  return orderFootprintPallets(order);
+}
+
+function directPickupWeight(order = {}, entries = order.directPickupManifest || []) {
+  return entries.reduce((sum, entry) => sum + (entry.items || []).reduce((itemSum, item) => {
+    return itemSum + (Number(item.quantity || 0) * Number(item.itemWeight || item.item_weight || 0));
+  }, 0), 0);
+}
+
+function pickupWeightForOrderLocation(order, location) {
+  const direct = directPickupEntriesForLocation(order, location);
+  const source = String(order.sourceYard || order.outboundLocation || "");
+  if (direct.length && source !== String(location || "")) return directPickupWeight(order, direct);
+  if (source === String(location || "") && (order.directPickupManifest || []).length) {
+    return Math.max(0, orderWeightLbs(order) - directPickupWeight(order));
+  }
+  return orderWeightLbs(order);
 }
 
 function routeLegMinutesForLoad(load) {
@@ -3446,12 +3590,12 @@ function loadStats(truck, load) {
       pickedLocations.add(String(stop.location));
       let pickedFootprint = 0;
       for (const dropStop of load.stops) {
-        if (dropStop.type !== "drop" || droppedOrderIds.has(dropStop.orderId) || onboardOrderIds.has(dropStop.orderId)) continue;
+        if (dropStop.type !== "drop" || droppedOrderIds.has(dropStop.orderId)) continue;
         const dropOrder = stopOrder(dropStop);
         if (!dropOrder) continue;
         if (!requiredPickupLocations(dropOrder).map(String).includes(String(stop.location))) continue;
-        currentWeightLbs += orderWeightLbs(dropOrder);
-        pickedFootprint += orderFootprintPallets(dropOrder);
+        currentWeightLbs += pickupWeightForOrderLocation(dropOrder, stop.location);
+        pickedFootprint += pickupFootprintForOrderLocation(dropOrder, stop.location);
         onboardOrderIds.add(dropStop.orderId);
         peakWeightLbs = Math.max(peakWeightLbs, currentWeightLbs);
       }
@@ -3579,7 +3723,7 @@ function makePickupStop(load, order, location) {
 
 function ensurePickupStops(load, order, insertIndex = null) {
   let added = 0;
-  for (const location of order.pickupLocations || []) {
+  for (const location of requiredPickupLocations(order)) {
     const exists = load.stops.some((stop) => stop.type === "pick" && String(stop.location) === String(location));
     if (exists) continue;
     const stop = makePickupStop(load, order, location);
@@ -4809,7 +4953,12 @@ function renderOrderCard(order) {
   const assignment = orderAssignment(order.id);
   const planned = Boolean(assignment.load);
   const plannedElsewhere = isOrderPlannedOutsideCurrentPlan(order);
+  const dependencyLinked = Boolean(order.dependencyHidden);
+  const dependentSalesOrder = dependencyLinked ? orderById(order.dependentSalesOrderRef) : null;
+  const dependentSalesAssignment = dependentSalesOrder ? orderAssignment(dependentSalesOrder.id) : {};
+  const dependencyParentPlanned = dependencyLinked && Boolean(dependentSalesAssignment.load || dependentSalesOrder?.dispatchPlanned);
   const anyPlanned = planned || plannedElsewhere;
+  const dragBlocked = anyPlanned || dependencyLinked;
   const reviewOnly = isReviewOnlyOrder(order);
   const packedText = packedUnitText(order);
   const executionStatus = orderExecutionStatus(order.id);
@@ -4817,7 +4966,7 @@ function renderOrderCard(order) {
     ? `${assignment.truck?.plate || ""} ${assignment.load?.name || "Planned"}`
     : orderPlannedElsewhereText(order);
   return `
-    <article class="order-card status-${executionStatus} ${selectedOrderIds.has(order.id) ? "selected" : ""} ${planned ? "planned" : ""} ${plannedElsewhere ? "planned-elsewhere" : ""} ${reviewOnly ? "review-only" : ""} ${missingAddress || transitBlocked ? "warning" : ""}" draggable="${anyPlanned ? "false" : "true"}" data-order="${order.id}" data-planned="${anyPlanned ? "true" : "false"}" data-review-only="${reviewOnly ? "true" : "false"}" data-planned-elsewhere="${plannedElsewhere ? "true" : "false"}">
+    <article class="order-card status-${executionStatus} ${selectedOrderIds.has(order.id) ? "selected" : ""} ${planned ? "planned" : ""} ${plannedElsewhere ? "planned-elsewhere" : ""} ${dependencyLinked && !dependencyParentPlanned ? "dependency-linked" : ""} ${dependencyParentPlanned ? "dependency-parent-planned" : ""} ${reviewOnly ? "review-only" : ""} ${missingAddress || transitBlocked || order.dependencyAttention ? "warning" : ""}" draggable="${dragBlocked ? "false" : "true"}" data-order="${order.id}" data-planned="${anyPlanned ? "true" : "false"}" data-dependency-linked="${dependencyLinked ? "true" : "false"}" data-review-only="${reviewOnly ? "true" : "false"}" data-planned-elsewhere="${plannedElsewhere ? "true" : "false"}">
       <strong>${order.id} | ${escapeHtml(order.customer)}</strong>
       <span>${plannedElsewhere ? escapeHtml(orderPlannedElsewhereText(order)) : missingAddress ? "Missing delivery address" : transitBlocked ? escapeHtml(transitMessage) : escapeHtml(movementText(order))}</span>
       <span class="order-compact-line">Pickup ${escapeHtml(orderPickupText(order))} | ${dateText}${order.windowStart || "--"}-${order.windowEnd || "--"}</span>
@@ -4834,9 +4983,11 @@ function renderOrderCard(order) {
         ${(order.items || []).some((item) => Number(item.poAllocatedSalesQty || 0) > 0) ? `<span class="chip">PO linked</span>` : ""}
         ${order.type === "CO" ? `<span class="chip">For ${escapeHtml(order.sourceOrderId || order.relatedSoId || "SO")}</span>` : ""}
         ${order.scm?.isSpecialOrder ? `<span class="chip warn">Sp.O</span>` : ""}
+        ${order.testFixture ? `<span class="chip">TEST</span>` : ""}
         ${order.scm?.status && order.scm.status !== "Queued" ? `<span class="chip">${escapeHtml(order.scm.status)}</span>` : ""}
         ${order.scm?.packingSlipRef ? `<span class="chip">Ref ${escapeHtml(order.scm.packingSlipRef)}</span>` : ""}
         ${order.scm?.groupRef ? `<span class="chip">PGOB ${escapeHtml(order.scm.groupRef.replace(/^PGOB-/, ""))}</span>` : ""}
+        ${(order.dependencyLabels || []).map((label) => `<span class="chip ${/attention|uncovered/i.test(label) ? "warn" : ""}">${escapeHtml(label)}</span>`).join("")}
         ${groupedCount ? `<span class="chip">Grouped ${groupedCount}</span>` : ""}
         ${splitWarning ? `<span class="chip warn">Split suggested</span>` : ""}
         ${shortage ? `<span class="chip warn">${shortage} short</span>` : ""}
@@ -5318,6 +5469,86 @@ function renderTransitCoEditor(order) {
   `;
 }
 
+async function loadOrderDependencyOptions(order, { salesOrderRef = "", transferOrderRef = "" } = {}) {
+  orderDependencyLoading = true;
+  const selectedIsTransfer = order?.type === "TO";
+  const salesRef = salesOrderRef || (selectedIsTransfer ? (order?.orderDependency?.salesOrderRef || "") : order?.id || "");
+  const transferRef = transferOrderRef || (selectedIsTransfer ? order?.id || "" : "");
+  const params = new URLSearchParams();
+  if (salesRef) params.set("salesOrderRef", salesRef);
+  if (transferRef) params.set("transferOrderRef", transferRef);
+  try {
+    const response = await fetch(`/api/dispatch/order-dependencies/options?${params.toString()}`);
+    if (!response.ok) throw new Error(await response.text());
+    orderDependencyOptions = await response.json();
+  } catch (error) {
+    routeNotice = `Dependency options failed: ${error.message}`;
+    orderDependencyOptions = null;
+  } finally {
+    orderDependencyLoading = false;
+    render({ save: false });
+  }
+}
+
+function renderOrderDependencyEditor(order) {
+  if (!["SO", "TO"].includes(order?.type)) return "";
+  const linked = order.type === "TO"
+    ? [order.orderDependency].filter(Boolean)
+    : (order.orderDependencies || []);
+  const options = orderDependencyOptions || {};
+  const salesRef = order.type === "TO" ? (options.salesOrderRef || order.orderDependency?.salesOrderRef || "") : order.id;
+  const transferRef = order.type === "TO" ? order.id : (options.transferOrderRef || "");
+  return `
+    <section class="order-dependency-editor">
+      <div class="order-dependency-head">
+        <div><strong>Order Dependency</strong><span>Link replenishment or direct customer pickup Transfer Orders.</span></div>
+        ${orderDependencyLoading ? `<em>Loading...</em>` : ""}
+      </div>
+      ${linked.map((dependency) => `
+        <div class="order-dependency-linked">
+          <div>
+            <strong>${escapeHtml(dependency.salesOrderRef)} &rarr; ${escapeHtml(dependency.transferOrderRef)}</strong>
+            <span>${escapeHtml(dependency.status)} | ${escapeHtml(dependency.reconciliationStatus || "pending")}</span>
+          </div>
+          <select data-dependency-mode="${dependency.id}">
+            <option value="yard_replenishment" ${dependency.mode === "yard_replenishment" ? "selected" : ""}>Replenishment</option>
+            <option value="direct_to_customer" ${dependency.mode === "direct_to_customer" ? "selected" : ""}>Direct pickup</option>
+          </select>
+          <button data-action="update-dependency-mode" data-dependency="${dependency.id}" type="button">Update</button>
+          <button class="danger-text" data-action="unlink-dependency" data-dependency="${dependency.id}" type="button">Unlink</button>
+        </div>
+        <div class="order-dependency-lines">
+          ${(dependency.lines || []).map((line) => `<span><b>${escapeHtml(line.itemName)}</b> ${escapeHtml(itemQtyText({
+            pallets: line.palletQty,
+            layers: line.layerQty,
+            sections: line.sectionQty,
+            pieces: line.pieceQty,
+            salesQty: line.allocatedQuantity,
+            unit: line.unit
+          }))}</span>`).join("")}
+        </div>
+      `).join("") || `<div class="muted">No active dependency.</div>`}
+      ${linked.length ? "" : `
+        <div class="order-dependency-link-grid">
+          <label><span>Sales Order</span><input id="dependencySalesRef" list="dependencySalesOrders" value="${escapeHtml(salesRef)}" ${order.type === "SO" ? "readonly" : ""} /></label>
+          <label><span>Transfer Order</span><input id="dependencyTransferRef" list="dependencyTransferOrders" value="${escapeHtml(transferRef)}" ${order.type === "TO" ? "readonly" : ""} /></label>
+          <label><span>Mode</span><select id="dependencyMode"><option value="yard_replenishment">Replenishment</option><option value="direct_to_customer">Direct pickup</option></select></label>
+          <button data-action="load-dependency-lines" type="button">Match Lines</button>
+        </div>
+        <datalist id="dependencySalesOrders">${(options.salesOrders || []).map((entry) => `<option value="${escapeHtml(entry.ref)}">${escapeHtml(entry.customer || "")} | ${escapeHtml(entry.outboundLocation || "")}</option>`).join("")}</datalist>
+        <datalist id="dependencyTransferOrders">${(options.transferOrders || []).filter((entry) => !entry.linkedSalesOrderRef).map((entry) => `<option value="${escapeHtml(entry.ref)}">${escapeHtml(entry.fromLocation || "")} to ${escapeHtml(entry.toLocation || "")}</option>`).join("")}</datalist>
+        <div class="order-dependency-match-lines">
+          ${(options.matchingLines || []).map((line) => `<label data-dependency-sales-line="${line.salesLineId}" data-dependency-item="${line.itemId}">
+            <span><strong>${escapeHtml(line.sku || line.itemName)}</strong><small>SO shortage ${qtyText(line.shortageQuantity)} | TO ${qtyText(line.transferQuantity)} ${escapeHtml(line.unit || "")}</small></span>
+            <input data-dependency-quantity type="number" min="0" step="0.001" value="${Number(line.suggestedQuantity || 0)}" />
+          </label>`).join("") || `<span class="muted">Select a Sales Order and Transfer Order, then match their item lines.</span>`}
+        </div>
+        <button class="primary" data-action="link-order-dependency" type="button" ${(options.matchingLines || []).length ? "" : "disabled"}>Link Transfer Order</button>
+      `}
+    </section>
+  `;
+}
+
 function renderPoLinkModal(order) {
   const options = poAllocationOptions;
   const salesLines = options?.salesLines || [];
@@ -5427,7 +5658,7 @@ function renderModal() {
   if (modalType === "edit-order") {
     return `
       <div class="modal-backdrop show">
-        <section class="dispatch-modal">
+        <section class="dispatch-modal wide-modal">
           <div class="modal-header">
             <div>
               <h2>Edit Dispatch Info</h2>
@@ -5455,6 +5686,7 @@ function renderModal() {
               </label>
             </div>
             ${supportsTransitCoForOrder(order) ? renderTransitCoEditor(order) : ""}
+            ${renderOrderDependencyEditor(order)}
             <div class="modal-status" data-edit-status></div>
             <div class="modal-footer">
               <button data-action="close-modal" type="button">Cancel</button>
@@ -5783,6 +6015,15 @@ function addOrderToLoad(orderId, loadId, type = "drop", location = "", insertInd
   }
   if (type === "drop" && isScmGroupedPoOrder(order)) {
     return addScmGroupedPoToLoad(order, loadId, insertIndex);
+  }
+  const dependencyTimingMessage = type === "drop"
+    ? replenishmentPlacementBlockMessage(order, truck, load, insertIndex)
+    : "";
+  if (dependencyTimingMessage) {
+    selectedOrderId = orderId;
+    selectedOrderIds = new Set([orderId]);
+    routeNotice = dependencyTimingMessage;
+    return false;
   }
   const beforeLoad = summarizeLoad(load);
   if (type === "drop" && !hasUsableDispatchAddress(order)) {
@@ -6127,6 +6368,12 @@ function groupOrder(orderId) {
   if (blockReason) {
     routeNotice = blockReason;
     return;
+  }
+  if (type === "drop" && order.dependencyHidden) {
+    selectedOrderId = orderId;
+    selectedOrderIds = new Set([orderId]);
+    routeNotice = `${order.id} is linked to ${order.dependentSalesOrderRef || "a Sales Order"} as direct pickup and cannot be planned independently.`;
+    return false;
   }
   const flattenedMembers = flattenDispatchGroupMembers({
     type: groupItems[0].type,
@@ -6710,6 +6957,8 @@ app.addEventListener("click", (event) => {
     modalLoadId = "";
     poAllocationOptions = null;
     poAllocationLoading = false;
+    orderDependencyOptions = null;
+    orderDependencyLoading = false;
     return render({ save: false });
   }
   const button = event.target.closest("button");
@@ -6769,6 +7018,89 @@ app.addEventListener("click", (event) => {
     return;
   }
   if (DISPATCH_VIEW_MUTATION_ACTIONS.has(action) && !ensureDispatchPlanEditor()) return;
+  if (action === "load-dependency-lines") {
+    const order = orderById(modalOrderId);
+    loadOrderDependencyOptions(order, {
+      salesOrderRef: document.getElementById("dependencySalesRef")?.value || "",
+      transferOrderRef: document.getElementById("dependencyTransferRef")?.value || ""
+    });
+    return;
+  }
+  if (action === "link-order-dependency") {
+    const allocations = [...app.querySelectorAll("[data-dependency-sales-line]")].map((row) => ({
+      salesLineId: Number(row.dataset.dependencySalesLine),
+      itemId: Number(row.dataset.dependencyItem),
+      quantity: Number(row.querySelector("[data-dependency-quantity]")?.value || 0)
+    })).filter((line) => line.quantity > 0);
+    const salesOrderRef = document.getElementById("dependencySalesRef")?.value || "";
+    const transferOrderRef = document.getElementById("dependencyTransferRef")?.value || "";
+    fetch("/api/dispatch/order-dependencies", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(dispatchLeaseRequestPayload({
+        salesOrderRef,
+        transferOrderRef,
+        mode: document.getElementById("dependencyMode")?.value || "yard_replenishment",
+        allocations,
+        audit: { sessionId: dispatchSessionId }
+      }))
+    }).then(async (response) => {
+      if (!response.ok) throw new Error(await dispatchErrorMessage(response));
+      return response.json();
+    }).then(async () => {
+      await loadDispatchOrders();
+      modalOrderId = salesOrderRef;
+      selectedOrderId = salesOrderRef;
+      orderDependencyOptions = null;
+      routeNotice = `${transferOrderRef} linked to ${salesOrderRef}.`;
+      render({ save: false });
+    }).catch((error) => {
+      routeNotice = `Dependency link failed: ${error.message}`;
+      render({ save: false });
+    });
+    return;
+  }
+  if (action === "update-dependency-mode") {
+    const dependencyId = button.dataset.dependency;
+    const mode = app.querySelector(`[data-dependency-mode="${CSS.escape(dependencyId)}"]`)?.value;
+    fetch(`/api/dispatch/order-dependencies/${encodeURIComponent(dependencyId)}/mode`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(dispatchLeaseRequestPayload({ mode }))
+    }).then(async (response) => {
+      if (!response.ok) throw new Error(await dispatchErrorMessage(response));
+      return response.json();
+    }).then(async () => {
+      await loadDispatchOrders();
+      routeNotice = "Dependency mode updated.";
+      render({ save: false });
+    }).catch((error) => {
+      routeNotice = `Dependency update failed: ${error.message}`;
+      render({ save: false });
+    });
+    return;
+  }
+  if (action === "unlink-dependency") {
+    const dependencyId = button.dataset.dependency;
+    if (!window.confirm("Unlink this Transfer Order dependency?")) return;
+    fetch(`/api/dispatch/order-dependencies/${encodeURIComponent(dependencyId)}`, {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(dispatchLeaseRequestPayload())
+    }).then(async (response) => {
+      if (!response.ok) throw new Error(await dispatchErrorMessage(response));
+      return response.json();
+    }).then(async () => {
+      await loadDispatchOrders();
+      orderDependencyOptions = null;
+      routeNotice = "Order dependency unlinked.";
+      render({ save: false });
+    }).catch((error) => {
+      routeNotice = `Dependency unlink failed: ${error.message}`;
+      render({ save: false });
+    });
+    return;
+  }
   if (action === "undo-plan") {
     if (!undoDispatchChange()) {
       routeNotice = "Nothing to undo.";
@@ -7276,6 +7608,8 @@ app.addEventListener("dblclick", (event) => {
   selectedOrderIds = new Set([order.id]);
   modalType = "edit-order";
   modalOrderId = order.id;
+  orderDependencyOptions = null;
+  if (["SO", "TO"].includes(order.type)) loadOrderDependencyOptions(order);
   render({ save: false });
 });
 

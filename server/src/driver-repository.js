@@ -6,7 +6,8 @@ import { createSamsaraDriverVehicleAssignment, createSamsaraMechanicDvir, findSa
 const YARD_ADDRESSES = {
   "3445": "3445 Kennedy Road, Toronto, ON",
   "2967": "2967 Kennedy Road, Toronto, ON",
-  "12441": "12441 Woodbine Avenue, Whitchurch-Stouffville, ON"
+  "12441": "12441 Woodbine Avenue, Whitchurch-Stouffville, ON",
+  "150": "150 Clark Blvd, Brampton, ON L6T 4Y8, Canada"
 };
 const OWN_YARD_CODES = new Set(Object.keys(YARD_ADDRESSES));
 const SAMSARA_ACCOUNT_LIMIT_MS = 8 * 60 * 60 * 1000;
@@ -84,8 +85,8 @@ function jobId(plan, truck, load, stop) {
   return [plan.id, truck.id || truck.plate, load.id, stop.id].map((part) => encodeURIComponent(String(part || ""))).join(":");
 }
 
-function travelJobId(plan, truck, load, from, to) {
-  return [plan.id, truck.id || truck.plate, load.id, "TRAVEL", from, to].map((part) => encodeURIComponent(String(part || ""))).join(":");
+function travelJobId(plan, truck, load, from, to, legKey = "") {
+  return [plan.id, truck.id || truck.plate, load.id, "TRAVEL", from, to, legKey].map((part) => encodeURIComponent(String(part || ""))).join(":");
 }
 
 function returnJobId(plan, truck, load, from, to) {
@@ -260,6 +261,50 @@ function buildTravelJob(plan, truck, load, truckIndex, loadIndex) {
   };
 }
 
+function loadHasDirectDependency(plan, load) {
+  return (load.stops || []).some((stop) => {
+    if (stop.type !== "drop") return false;
+    return (orderByRef(plan, stop.orderId)?.directPickupManifest || []).length > 0;
+  });
+}
+
+function buildInterStopTravelJob(plan, truck, load, previousStop, stop, truckIndex, loadIndex, stopIndex) {
+  if (!previousStop || !stop) return null;
+  const from = stopLocationLabel(plan, previousStop);
+  const to = stopLocationLabel(plan, stop);
+  const fromAddress = stopAddressLabel(plan, previousStop);
+  const toAddress = stopAddressLabel(plan, stop);
+  if (!from || !to || (String(from) === String(to) && String(fromAddress) === String(toAddress))) return null;
+  const legKey = `${previousStop.id || stopIndex - 1}-${stop.id || stopIndex}`;
+  return {
+    jobId: travelJobId(plan, truck, load, from, to, legKey),
+    planId: plan.id,
+    planDate: plan.planDate,
+    driverLogin: driverKey(truck.driverLogin || truck.driver),
+    driverName: truck.driver || "",
+    truckId: truck.id || "",
+    truckPlate: truck.plate || "",
+    parkingSpot: truck.parkingSpot || "",
+    loadId: load.id || "",
+    loadName: load.name || "",
+    stopId: `travel-${legKey}`,
+    stopType: "travel",
+    location: `${from} to ${to}`,
+    address: toAddress,
+    fromLocation: from,
+    fromAddress,
+    toLocation: to,
+    toAddress,
+    windowStart: "",
+    windowEnd: "",
+    instructions: "Travel to the next required stop.",
+    orderRefs: [],
+    orderTypes: [],
+    requiredPhotos: 0,
+    sequence: { truckIndex, loadIndex, stopIndex: stopIndex - 0.5 }
+  };
+}
+
 function buildReturnJob(plan, truck, load, truckIndex, loadIndex) {
   const previous = loadEndPoint(plan, truck, (truck.loads || [])[loadIndex - 1]);
   const to = String(load.returnYard || "12441");
@@ -298,7 +343,23 @@ function buildJob(plan, truck, load, stop, truckIndex, loadIndex, stopIndex) {
   const isPickup = stop.type === "pick";
   const relatedStops = isPickup ? dropStopsForPickup(plan, load, stop.location) : [stop];
   const stopOrderRefs = [...new Set(relatedStops.map((item) => String(item.orderId || "")).filter(Boolean))];
-  const orderRefs = expandOrderRefs(plan, stopOrderRefs);
+  const dependencyPickupManifests = isPickup
+    ? relatedStops.flatMap((relatedStop) => {
+        const order = orderByRef(plan, relatedStop.orderId) || {};
+        return (order.directPickupManifest || [])
+          .filter((entry) => String(entry.location || "") === String(stop.location || ""))
+          .map((entry) => ({ ...entry, salesOrderRef: entry.salesOrderRef || String(relatedStop.orderId || "") }));
+      })
+    : [];
+  const directTransferRefs = dependencyPickupManifests.map((entry) => String(entry.transferOrderRef || "")).filter(Boolean);
+  const ordinaryStopRefs = isPickup
+    ? stopOrderRefs.filter((ref) => {
+        const order = orderByRef(plan, ref) || {};
+        const hasDirectHere = (order.directPickupManifest || []).some((entry) => String(entry.location || "") === String(stop.location || ""));
+        return !hasDirectHere || String(order.sourceYard || order.outboundLocation || "") === String(stop.location || "");
+      })
+    : stopOrderRefs;
+  const orderRefs = [...new Set([...expandOrderRefs(plan, ordinaryStopRefs), ...directTransferRefs])];
   const firstOrder = orderByRef(plan, stopOrderRefs[0]) || orderByRef(plan, orderRefs[0]) || {};
   return {
     jobId: jobId(plan, truck, load, stop),
@@ -321,7 +382,8 @@ function buildJob(plan, truck, load, stop, truckIndex, loadIndex, stopIndex) {
     windowEnd: isPickup ? "" : (firstOrder.windowEnd || ""),
     instructions: firstOrder.notes || firstOrder.dispatchInstructions || "",
     orderRefs,
-    orderTypes: [...new Set(orderRefs.map((ref) => orderByRef(plan, ref)?.type).filter(Boolean))],
+    orderTypes: [...new Set(orderRefs.map((ref) => directTransferRefs.includes(ref) ? "TO" : orderByRef(plan, ref)?.type).filter(Boolean))],
+    dependencyPickupManifests,
     requiredPhotos: isPickup ? 2 : 1,
     sequence: { truckIndex, loadIndex, stopIndex }
   };
@@ -373,9 +435,16 @@ function planJobsForTruck(plan, truck, truckIndex) {
     }
     const travelJob = buildTravelJob(plan, truck, load, truckIndex, loadIndex);
     if (travelJob) jobs.push(travelJob);
+    const requireInterStopTravel = loadHasDirectDependency(plan, load);
+    let previousRoutedStop = null;
     (load.stops || []).forEach((stop, stopIndex) => {
       if (!["pick", "drop"].includes(stop.type)) return;
+      if (requireInterStopTravel && previousRoutedStop) {
+        const legJob = buildInterStopTravelJob(plan, truck, load, previousRoutedStop, stop, truckIndex, loadIndex, stopIndex);
+        if (legJob) jobs.push(legJob);
+      }
       jobs.push(buildJob(plan, truck, load, stop, truckIndex, loadIndex, stopIndex));
+      previousRoutedStop = stop;
     });
   });
   return jobs;
@@ -1188,7 +1257,28 @@ export async function getNextDriverJob(driverLogin) {
     next.address = await locationAddress(next.location || next.address);
   }
   const details = await Promise.all(next.orderRefs.map((ref) => {
-    const hint = next.orderTypes.length === 1 ? next.orderTypes[0] : "";
+    const dependencyManifest = (next.dependencyPickupManifests || []).find((entry) => String(entry.transferOrderRef || "") === String(ref));
+    if (dependencyManifest) {
+      return {
+        orderRef: dependencyManifest.transferOrderRef,
+        party: dependencyManifest.salesOrderRef || "",
+        source: "direct_dependency",
+        items: (dependencyManifest.items || []).map((item) => ({
+          itemName: item.itemName || item.sku || "",
+          sku: item.sku || item.itemName || "",
+          description: item.description || "",
+          units: visibleUnitsFromPlanItem({
+            pallets: item.palletQty,
+            layers: item.layerQty,
+            sections: item.sectionQty,
+            pieces: item.pieceQty,
+            quantity: item.quantity,
+            unit: item.unit
+          })
+        }))
+      };
+    }
+    const hint = orderByRef(assignment.plan, ref)?.type || (next.orderTypes.length === 1 ? next.orderTypes[0] : "");
     return orderDetails(ref, hint, orderByRef(assignment.plan, ref), {
       stopType: next.stopType,
       pickupLocation: next.stopType === "pickup" ? next.location : ""

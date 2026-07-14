@@ -57,6 +57,7 @@
 
   const scmItems = [
     { label: "SCM Menu", href: "/scm", icon: "SM" },
+    { label: "Auto Transfer", href: "/scm/transfer-dependencies", icon: "AT" },
     { label: "PO Split", href: "/scm/POsplit", icon: "PS" },
     { label: "PO/TO Schedule", href: "/scm/POTOschedule", icon: "PT" },
     { label: "VRMA", href: "/scm/VRMA", icon: "VR" }

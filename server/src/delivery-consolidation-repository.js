@@ -223,6 +223,7 @@ export async function getSavedConsolidationQueue(operatorId, { locationId } = {}
       truckPlate: order?.dispatch_truck_plate || "",
       loadName: order?.dispatch_load_name || "",
       customer: order?.customer || "",
+      testFixture: order?.testFixture === true,
       lineCount: (order?.lines || []).filter(pickableLine).length
     };
   });
@@ -324,6 +325,7 @@ function buildBatchState(batch, stored, liveOrders) {
       truckPlate: live?.dispatch_truck_plate || batchOrder.dispatch_truck_plate,
       loadName: live?.dispatch_load_name || batchOrder.dispatch_load_name,
       customer: live?.customer || "",
+      testFixture: live?.testFixture === true,
       lines
     };
     orderViews.push(orderView);

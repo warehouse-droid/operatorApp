@@ -48,6 +48,10 @@
               <p>Manage PO split/ref, local VRMA, and the transportation schedule shared with dispatch.</p>
             </div>
             <div class="dispatch-menu-grid">
+              ${canEdit ? `<button class="dispatch-menu-card primary-card" onclick="location.href='/scm/transfer-dependencies'" type="button">
+                <strong>Auto Transfer</strong>
+                <span>Review Sales Order shortages, allocate stock across yards, and create dependent Transfer Orders.</span>
+              </button>` : ""}
               ${canEdit ? `<button class="dispatch-menu-card primary-card" onclick="location.href='/scm/POsplit'" type="button">
                 <strong>PO Split</strong>
                 <span>Split blanket POs, update refs, destination yards, grouping, and schedule flags.</span>

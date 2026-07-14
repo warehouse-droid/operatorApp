@@ -2303,7 +2303,7 @@ function renderOrderPanel() {
         return `
         <div class="order-card-wrap">
           <button class="order-card ${String(order.netsuite_id) === String(selectedId) ? "active" : ""} ${orderWarningCount(order) ? "warning" : ""} ${orderUnderpackCount(order) && order.operator_status === "packed" ? "underpack" : ""} ${request ? "request" : ""}" data-order="${order.netsuite_id}" type="button">
-            <strong>${order.tranid}</strong>
+            <strong>${order.tranid}${order.testFixture ? ` <span class="status-pill test-fixture">TEST</span>` : ""}</strong>
             <span class="muted order-schedule-line">${shouldShowDeliverySchedule() ? deliveryScheduleText(order) : formatDate(order.trandate)} | ${order.outbound_location || ""}</span>
             ${order.dispatch_planned || order.load_view ? `<span class="planned-line">${plannedOrderText(order)}</span>` : ""}
             ${isOrderSaved(order) ? `<span class="saved-line">${t("operator.savedOrder", "Saved order")}</span>` : ""}
@@ -2405,12 +2405,13 @@ function renderDetailPanel(order) {
   const selectedLine = lines.find((line) => String(line.id) === String(selectedLineId)) || visible[0] || lines[0];
   if (selectedLine && String(selectedLineId) !== String(selectedLine.id)) selectedLineId = selectedLine.id;
   const customerPickupNotice = isCustomerPickupMode() && !lines.length ? customerPickupUnavailableMessage(order) : "";
+  const directPickupInfo = !isCustomerPickupMode() && order.direct_pickup_only === true && !lines.length;
 
   return `
     <div class="detail-header">
       <div>
         <div class="order-title-row">
-          <h2>${order.tranid}</h2>
+          <h2>${order.tranid}${order.testFixture ? ` <span class="status-pill test-fixture">TEST</span>` : ""}</h2>
           ${viewMode === "packed" && !isCustomerPickupMode() ? `<button class="secondary-button danger-button compact-action" data-action="unpack-order" type="button">${t("operator.unpackWholeOrder", "Unpack whole order")}</button>` : ""}
         </div>
         <p class="muted">${order.customer || ""}</p>
@@ -2421,7 +2422,7 @@ function renderDetailPanel(order) {
         ${renderLineDensityToggle()}
         ${renderSavedOrderAction(order)}
         <span class="status-pill ${orderStatusClass(order)}">${orderStatusText(order)}</span>
-        ${isCustomerPickupMode()
+        ${directPickupInfo ? "" : isCustomerPickupMode()
           ? `<button class="primary-button" data-action="start-fulfill" type="button" ${hasCustomerPickupDraft(order) ? "" : "disabled"}>${t("common.load", "Load")}</button>`
           : viewMode === "packed"
           ? `<button class="primary-button" data-action="start-fulfill" type="button">${t("common.load", "Load")}</button>`
@@ -2432,7 +2433,7 @@ function renderDetailPanel(order) {
     <div class="progress-strip">
       <div><span>${isCustomerPickupMode() ? "Pickup lines" : viewMode === "packed" ? t("operator.packedLines", "Packed lines") : t("operator.openLines", "Open lines")}</span><strong>${confirmed} / ${lines.length}</strong></div>
       <div><span>${t("common.location", "Location")}</span><strong>${currentLocation()?.text}</strong></div>
-      <div><span>${t("operator.status", "Status")}</span><strong>${orderStatusText(order)}</strong></div>
+      <div><span>${t("operator.status", "Status")}</span><strong>${directPickupInfo ? "Direct pickup" : orderStatusText(order)}</strong></div>
     </div>
     ${exceptions.length ? `
       <div class="sync-alert">
@@ -2446,10 +2447,16 @@ function renderDetailPanel(order) {
         <span>${escapeHtml(customerPickupNotice)}</span>
       </div>
     ` : ""}
+    ${directPickupInfo ? `
+      <div class="sync-alert">
+        <strong>Direct pickup order</strong>
+        <span>All remaining quantities will be collected from linked source yards. There are no lines to prepare at ${escapeHtml(currentLocation()?.text || "this yard")}.</span>
+      </div>
+    ` : ""}
     <div class="work-area">
       <div class="line-column">
         <div class="line-list ${compactLineMode ? "compact-line-list" : ""}">
-          ${visible.map((line) => renderLine(line)).join("") || `<div class="empty-state small"><strong>${isCustomerPickupMode() ? "No pickup quantity" : "No lines"}</strong><span>${escapeHtml(customerPickupNotice || "Ask admin to sync if details are missing.")}</span></div>`}
+          ${visible.map((line) => renderLine(line)).join("") || `<div class="empty-state small"><strong>${isCustomerPickupMode() ? "No pickup quantity" : directPickupInfo ? "No local-yard quantity" : "No lines"}</strong><span>${escapeHtml(customerPickupNotice || (directPickupInfo ? "Driver will collect the linked quantities from their source yards." : "Ask admin to sync if details are missing."))}</span></div>`}
         </div>
         <div class="pagination-row">
           <button class="secondary-button" data-action="line-prev" ${linePage === 0 ? "disabled" : ""} type="button">${t("common.previous", "Previous")}</button>
@@ -2457,7 +2464,7 @@ function renderDetailPanel(order) {
           <button class="secondary-button" data-action="line-next" ${linePage >= count - 1 ? "disabled" : ""} type="button">${t("common.next", "Next")}</button>
         </div>
       </div>
-      ${selectedLine ? renderSelectedLinePanel(selectedLine) : customerPickupNotice ? `<aside class="selected-panel"><div class="empty-state"><strong>${t("operator.pickupUnavailable", "Pickup unavailable")}</strong><span>${escapeHtml(customerPickupNotice)}</span></div></aside>` : renderEmptyDetail()}
+      ${selectedLine ? renderSelectedLinePanel(selectedLine) : customerPickupNotice ? `<aside class="selected-panel"><div class="empty-state"><strong>${t("operator.pickupUnavailable", "Pickup unavailable")}</strong><span>${escapeHtml(customerPickupNotice)}</span></div></aside>` : directPickupInfo ? `<aside class="selected-panel"><div class="empty-state"><strong>Dispatch information only</strong><span>No packing action is required at this yard.</span></div></aside>` : renderEmptyDetail()}
     </div>
   `;
 }
@@ -2847,7 +2854,7 @@ function renderConsolidationReviewOrderCard(order) {
   const planLabel = formatDate(order.planDate) || t("operator.notPlanned", "Not planned");
   return `
     <button class="order-card consolidation-review-order-card status-${escapeHtml(order.status)} ${String(order.id) === String(consolidationReviewOrderId) ? "active" : ""}" data-action="select-consolidation-review-order" data-order="${order.id}" type="button">
-      <strong>${escapeHtml(order.orderRef)}</strong>
+      <strong>${escapeHtml(order.orderRef)}${order.testFixture ? ` <span class="status-pill test-fixture">TEST</span>` : ""}</strong>
       ${order.customer ? `<span>${escapeHtml(order.customer)}</span>` : ""}
       <span class="order-schedule-line">${planLabel} | ${escapeHtml(order.truckPlate || "-")} | ${escapeHtml(order.loadName || "-")}</span>
       <span class="consolidation-review-card-status">${consolidationStatusText(order.status)} | ${completedLines} / ${(order.lines || []).length} ${t("operator.lines", "lines")}</span>
@@ -2926,7 +2933,7 @@ function renderConsolidationReviewStage() {
         ${selectedOrder ? `
           <div class="detail-header">
             <div>
-              <div class="order-title-row"><h2>${escapeHtml(selectedOrder.orderRef)}</h2></div>
+              <div class="order-title-row"><h2>${escapeHtml(selectedOrder.orderRef)}${selectedOrder.testFixture ? ` <span class="status-pill test-fixture">TEST</span>` : ""}</h2></div>
               <p class="muted">${escapeHtml(selectedOrder.customer || "")}</p>
               <p class="dispatch-plan-note">${selectedPlanLabel} | ${escapeHtml(selectedOrder.truckPlate || "-")} | ${escapeHtml(selectedOrder.loadName || "-")}</p>
             </div>

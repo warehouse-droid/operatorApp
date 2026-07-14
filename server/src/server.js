@@ -3,9 +3,9 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { config, listEnvFiles, selectEnvFile } from "./config.js";
+import { config, isNetSuiteSandboxEnvironment, listEnvFiles, selectEnvFile } from "./config.js";
 import { beginRollbackContext, pool, query, withTransaction } from "./db.js";
-import { buildAuthorizationUrl, exchangeCodeForToken, fetchDeliveryOrdersFromNetSuite, fetchDeliveryOrderFromNetSuite, fetchCustomerPickupOrderFromNetSuite, fetchDeliveryOrderDetailsFromNetSuite, fetchTransferDeliveryOrdersFromNetSuite, fetchTransferDeliveryOrderFromNetSuite, fetchTransferOrderDetailsFromNetSuite, fetchPurchaseOrdersFromNetSuite, fetchPurchaseOrderFromNetSuite, fetchPurchaseOrderDetailsFromNetSuite, fetchTransferReceivingOrdersFromNetSuite, fetchTransferReceivingOrderFromNetSuite, fetchInventoryBalanceForItemFromNetSuite, fetchInventoryBalancesFromNetSuite, fetchItemFulfillmentFromNetSuite, fetchItemReceiptFromNetSuite, fetchTransactionProgressFromNetSuite, fetchTransactionStatusFromNetSuite, transformSalesOrderToItemFulfillment, transformTransferOrderToItemFulfillment, transformPurchaseOrderToItemReceipt, transformTransferOrderToItemReceipt } from "./netsuite.js";
+import { buildAuthorizationUrl, exchangeCodeForToken, fetchDeliveryOrdersFromNetSuite, fetchDeliveryOrderFromNetSuite, fetchCustomerPickupOrderFromNetSuite, fetchDeliveryOrderDetailsFromNetSuite, fetchTransferDeliveryOrdersFromNetSuite, fetchTransferDeliveryOrderFromNetSuite, fetchTransferOrderDetailsFromNetSuite, fetchTransferOrderByIdFromNetSuite, fetchPurchaseOrdersFromNetSuite, fetchPurchaseOrderFromNetSuite, fetchPurchaseOrderDetailsFromNetSuite, fetchTransferReceivingOrdersFromNetSuite, fetchTransferReceivingOrderFromNetSuite, fetchInventoryBalanceForItemFromNetSuite, fetchInventoryBalancesFromNetSuite, fetchInventoryBalancesForItemsFromNetSuite, fetchItemFulfillmentFromNetSuite, fetchItemReceiptFromNetSuite, fetchTransactionProgressFromNetSuite, fetchTransactionStatusFromNetSuite, createTransferOrderInNetSuite, resolveNetSuiteTransferLocations, resolveNetSuiteYardLocations, resolvePalletItemFromNetSuite, transformSalesOrderToItemFulfillment, transformTransferOrderToItemFulfillment, transformPurchaseOrderToItemReceipt, transformTransferOrderToItemReceipt } from "./netsuite.js";
 import { listDeliveryOrders, getDeliveryOrder, getFulfillableDeliveryOrder, buildItemFulfillmentPayload, markDeliveryPrepared, updateDeliveryStatus, confirmDeliveryLine, confirmDeliveryLines, setDeliveryLinePackedQuantity, unpackDeliveryLine, unpackDeliveryOrder, recordDeliveryFulfillment, recordDeliveryFulfillmentFailure, recordDeliveryLoad, listDeliveryFulfillments, listControlLoadedOrders, getControlLoadedOrderDetail, listControlLoadedOrderCsvRows, getDeliveryBootstrap, getDeliveryPrepNotifications, resetDeliveryFulfillmentState, applyConfirmedDispatchPlanToDelivery, deactivateUnplannedDispatchSplitOrders, getNextDispatchSplitSuffix, getCurrentOperatorDeliveryDraft, releaseCurrentDeliveryDraft, listSavedDeliveryOrdersForOperator, listSavedDeliveryOrderKeysForOperator, saveDeliveryOrderForOperator, removeSavedDeliveryOrderForOperator, listDeliveryLoadTrucks, listDeliveryLoadOrders } from "./delivery-repository.js";
 import { clearCustomerPickupDraft, confirmCustomerPickupLine, findCustomerPickupOrder, isPendingApprovalStatus, isPickupDeliveryMethod, recordCustomerPickupLoad } from "./customer-pickup-repository.js";
 import { createOperator, getOperatorByToken, hasOperators, listAudit, listAuditOptions, listOperators, loginOperator, logoutToken, setOperatorActive, updateOperatorPassword, writeAudit } from "./auth-repository.js";
@@ -24,6 +24,7 @@ import { createSamsaraDriverAuthToken, createSamsaraDriverVehicleAssignment, fin
 import { createPhotoReadToken, createPhotoUploadToken, isR2PhotoReference, publicPhotoUploadConfig } from "./photo-upload.js";
 import { authenticateDispatchDriver, ensureDispatchFleetSetup, getDispatchDriverByLogin, listDispatchDrivers, listDispatchTrucks, replaceDispatchFleetSetup } from "./dispatch-setup-repository.js";
 import { assertNoActiveConsolidationClaimsByRefs, confirmConsolidationItem, getActiveConsolidationBatch, getSavedConsolidationQueue, packConsolidationOrder, releaseConsolidationBatch, startSavedConsolidationBatch, updateConsolidationLine } from "./delivery-consolidation-repository.js";
+import { DEPENDENCY_YARDS, assertNoActiveOrderDependenciesByRefs, cancelOrderDependency, completeDirectDependenciesForSalesOrderDrop, confirmTransferDependencyBatch, createOrderDependency, enrichDispatchOrdersWithDependencies, generateTransferDependencySuggestion, getDependencyInventoryMatrix, getDirectPickupDependencyExecutionBlock, getOrderDependencyOptions, getSalesOrderDependencyExecutionBlock, getTransferDependencyBatch, listOrderDependencies, listTransferDependencyCandidates, markDirectDependencyPickupCompleted, prepareTransferDependencyPalletItem, reconcileOrderDependency, reopenTransferDependencyCandidate, retryTransferDependencyBatch, reviewTransferDependencyCandidate, syncDirectDependencyOperatorProgress, syncOrderDependenciesForTransferOrder, syncOrderDependenciesFromDispatchPlan, updateOrderDependencyMode, updateTransferDependencyBatch, validateDispatchPlanDependencies } from "./order-dependency-repository.js";
 
 const app = express();
 const dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -371,6 +372,7 @@ function isSnapshotDerivedDispatchOrder(order = {}) {
 }
 
 async function listDispatchSnapshotDerivedOrders({ type = null } = {}) {
+  const sandbox = isNetSuiteSandboxEnvironment();
   const [result, inactiveSplits] = await Promise.all([
     query(
     `SELECT p.id, p.plan_date::text AS plan_date, p.updated_at, s.orders
@@ -393,10 +395,14 @@ async function listDispatchSnapshotDerivedOrders({ type = null } = {}) {
       if (!isSnapshotDerivedDispatchOrder(order)) continue;
       if (wantedType && String(order?.type || "").toUpperCase() !== wantedType) continue;
       const id = String(order?.id || "").trim();
+      const fixtureRefs = [id, order?.originalOrderId, ...(Array.isArray(order?.childOrders) ? order.childOrders : [])]
+        .map((value) => String(value || "").trim());
+      if (!sandbox && fixtureRefs.some((value) => /^TSTDEP-SO-/i.test(value))) continue;
       if (String(order?.originalOrderId || "").trim() && inactiveSplitRefs.has(id)) continue;
       if (!id || derivedOrders.has(id)) continue;
       derivedOrders.set(id, {
         ...order,
+        testFixture: sandbox && fixtureRefs.some((value) => /^TSTDEP-SO-/i.test(value)),
         childOrders: Array.isArray(order.childOrders) ? order.childOrders.filter(Boolean) : [],
         dispatchSnapshotSourcePlanId: String(row.id || ""),
         dispatchSnapshotSourcePlanDate: String(row.plan_date || "").slice(0, 10)
@@ -419,7 +425,133 @@ function mergeDispatchOrderFeedWithSnapshotDerivedOrders(orders = [], derivedOrd
 async function listDispatchOrdersForResponse({ type = null } = {}) {
   const orders = await listDispatchOrders({ type });
   const derivedOrders = await listDispatchSnapshotDerivedOrders({ type });
-  return enrichDispatchOrdersWithPlanAssignments(mergeDispatchOrderFeedWithSnapshotDerivedOrders(orders, derivedOrders));
+  const assigned = await enrichDispatchOrdersWithPlanAssignments(mergeDispatchOrderFeedWithSnapshotDerivedOrders(orders, derivedOrders));
+  return enrichDispatchOrdersWithDependencies(assigned);
+}
+
+function sendDispatchDependencyConflictResponse(res, conflicts = []) {
+  return res.status(409).json({
+    error: conflicts[0] || "Order dependency timing is invalid.",
+    code: "DISPATCH_ORDER_DEPENDENCY_CONFLICT",
+    conflicts
+  });
+}
+
+async function transferDependencyRestPayload({ proposal, batch }) {
+  const locations = await resolveNetSuiteTransferLocations({
+    sourceLocationId: proposal.fromLocationId,
+    sourceLocation: proposal.fromLocation,
+    destinationLocationId: proposal.toLocationId,
+    destinationLocation: proposal.toLocation
+  });
+  const palletItemId = Number(proposal.palletItemId);
+  const materialItems = (proposal.lines || [])
+    .filter((line) => String(line.itemId) !== String(palletItemId)
+      && String(line.sku || line.itemName || "").trim().toUpperCase() !== "PALLET")
+    .map((line) => ({
+      item: { id: String(line.itemId) },
+      quantity: Number(line.proposedQuantity)
+    }));
+  const palletQuantity = Number(proposal.palletTransferQuantity || 0);
+  const payload = {
+    location: { id: String(locations.source.netsuiteLocationId) },
+    transferLocation: { id: String(locations.destination.netsuiteLocationId) },
+    orderStatus: { id: "B" },
+    memo: `${proposal.memo || `Inventory dependency for ${batch.salesOrderRef}`} | MBBS dependency batch ${batch.id}`,
+    item: {
+      items: [
+        ...materialItems,
+        ...(palletQuantity > 0 ? [{ item: { id: String(palletItemId) }, quantity: palletQuantity }] : [])
+      ]
+    }
+  };
+  payload.subsidiary = { id: String(locations.source.subsidiaryId) };
+  if (locations.intercompany) {
+    payload.toSubsidiary = { id: String(locations.destination.subsidiaryId) };
+  }
+  return { payload, intercompany: locations.intercompany, locations };
+}
+
+async function refreshTransferDependencyInventory(itemIds = []) {
+  const ids = [...new Set((itemIds || []).map(Number).filter(Number.isInteger))];
+  if (!ids.length) return [];
+  const resolvedYards = await resolveNetSuiteYardLocations(DEPENDENCY_YARDS);
+  const localByNetSuiteId = new Map(resolvedYards.map((yard) => [String(yard.netsuiteLocationId), yard]));
+  const inventory = await fetchInventoryBalancesForItemsFromNetSuite(
+    ids,
+    resolvedYards.map((yard) => yard.netsuiteLocationId)
+  );
+  const canonicalInventory = inventory.map((row) => {
+    const yard = localByNetSuiteId.get(String(row.location_id));
+    return yard ? {
+      ...row,
+      location_id: yard.localLocationId,
+      location: yard.localLocationCode
+    } : row;
+  });
+  await upsertInventoryBalances(canonicalInventory);
+  return canonicalInventory;
+}
+
+async function refreshTransferDependencyBatchInventory(batchId, operatorId = null) {
+  let batch = await getTransferDependencyBatch(batchId);
+  if (!batch) throw new Error("Dependency batch not found.");
+  const palletItem = await resolvePalletItemFromNetSuite();
+  batch = await prepareTransferDependencyPalletItem(batchId, palletItem, operatorId);
+  const itemIds = [...new Set((batch.proposals || [])
+    .filter((proposal) => !["created", "attention", "cancelled"].includes(proposal.creationStatus))
+    .flatMap((proposal) => [
+      ...(proposal.lines || []).map((line) => Number(line.itemId)),
+      Number(proposal.palletTransferQuantity) > 0 ? Number(proposal.palletItemId) : null
+    ])
+    .filter(Number.isInteger))];
+  if (itemIds.length) await refreshTransferDependencyInventory(itemIds);
+  return batch;
+}
+
+async function hydrateCreatedDependencyTransferOrder(transferOrderId, proposal) {
+  const order = await fetchTransferOrderByIdFromNetSuite(transferOrderId);
+  if (!order) throw new Error("Created NetSuite Transfer Order was not found.");
+  const sourceLocationId = Number(order.source_location_id || proposal.fromLocationId);
+  const destinationLocationId = Number(order.destination_location_id || proposal.toLocationId);
+  const outboundLines = await fetchTransferOrderDetailsFromNetSuite(transferOrderId, sourceLocationId, { direction: "source" });
+  const receivingLines = await fetchTransferOrderDetailsFromNetSuite(transferOrderId, destinationLocationId, { direction: "destination" });
+  const canonicalOrder = {
+    ...order,
+    source_location_id: proposal.fromLocationId,
+    source_location: proposal.fromLocation,
+    outbound_location_id: proposal.fromLocationId,
+    outbound_location: proposal.fromLocation,
+    destination_location_id: proposal.toLocationId,
+    destination_location: proposal.toLocation,
+    order_location_id: proposal.toLocationId,
+    order_location: proposal.toLocation,
+    customer_id: proposal.toLocationId,
+    customer: `Transfer to ${proposal.toLocation}`
+  };
+  const canonicalOutboundLines = outboundLines.map((line) => ({
+    ...line,
+    location_id: proposal.fromLocationId,
+    location: proposal.fromLocation
+  }));
+  const canonicalReceivingLines = receivingLines.map((line) => ({
+    ...line,
+    location_id: proposal.toLocationId,
+    location: proposal.toLocation
+  }));
+  await upsertOutboundTransferOrders([canonicalOrder]);
+  await upsertOutboundTransferOrderLines(transferOrderId, canonicalOutboundLines);
+  await upsertInboundTransferOrders([canonicalOrder]);
+  await upsertInboundTransferOrderLines(transferOrderId, canonicalReceivingLines);
+  const status = String(order.status || "").trim();
+  const statusText = String(order.status_text || "").trim();
+  return {
+    id: Number(order.id),
+    tranid: order.tranid,
+    status,
+    statusText,
+    pendingFulfillment: status.toUpperCase() === "B" || /pending fulfillment/i.test(statusText)
+  };
 }
 
 async function findDispatchPlanDateConflicts({ planId, planDate, orders = [], trucks = [] } = {}) {
@@ -1478,6 +1610,7 @@ async function assertNoConsolidationStructureConflict(previousPlan, nextPlan) {
   const changedRefs = changedDispatchOrderStructureRefs(previousPlan, nextPlan);
   if (!changedRefs.length) return;
   await assertNoActiveConsolidationClaimsByRefs(changedRefs, "group, ungroup, split, or unsplit these orders");
+  await assertNoActiveOrderDependenciesByRefs(changedRefs, "group, ungroup, split, or unsplit these orders");
 }
 
 function normalizeOrderType(value) {
@@ -2652,6 +2785,8 @@ function normalizeWebhookLine(line, { locationId = null, locationText = "", proc
     item_type_text: line.item_type_text ?? line.itemTypeText,
     item_description: line.item_description ?? line.itemDescription ?? line.description ?? "",
     quantity: derived.quantity,
+    netsuite_committed_qty: webhookNumber(line.netsuite_committed_qty ?? line.quantityCommitted ?? line.quantitycommitted),
+    netsuite_backordered_qty: webhookNumber(line.netsuite_backordered_qty ?? line.quantityBackordered ?? line.quantitybackordered),
     netsuite_received_qty: processed,
     unit: line.unit ?? line.unitText ?? "",
     item_weight: line.item_weight ?? line.itemWeight ?? line.weight,
@@ -3274,10 +3409,13 @@ app.post("/api/dispatch/plan-snapshots/:snapshotId/restore", requireOperator, re
     const beforePlan = await getDispatchPlanSnapshot(req.params.snapshotId);
     if (!beforePlan) return res.status(404).json({ error: "Dispatch snapshot not found" });
     await requireDispatchPlanEditLease(req, beforePlan.planDate);
+    const dependencyConflicts = await validateDispatchPlanDependencies(beforePlan);
+    if (dependencyConflicts.length) return sendDispatchDependencyConflictResponse(res, dependencyConflicts);
     const restored = await restoreDispatchPlanSnapshot(req.params.snapshotId, {
       sessionId: req.body?.audit?.sessionId || ""
     });
     const plan = restored.plan;
+    await syncOrderDependenciesFromDispatchPlan(plan);
     const coAssignments = await applyDispatchPlanCoAssignments(plan);
     const scmSchedule = await syncScmScheduleFromDispatchPlan(plan, { updatedBy: req.body?.audit?.sessionId || "dispatch-plan-save" }).catch(() => null);
     const changedOperatorRefs = [...dispatchOperatorAssignmentMap(plan).keys()];
@@ -3417,6 +3555,13 @@ app.put("/api/dispatch/plans/:id", requireOperator, requireDispatcher, async (re
       trucks: cleanTrucks
     });
     if (coSequenceConflicts.length) return sendDispatchCoSequenceConflictResponse(res, coSequenceConflicts);
+    const dependencyConflicts = await validateDispatchPlanDependencies({
+      id: req.params.id,
+      planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date,
+      orders: cleanOrders,
+      trucks: cleanTrucks
+    });
+    if (dependencyConflicts.length) return sendDispatchDependencyConflictResponse(res, dependencyConflicts);
     const plan = await saveDispatchPlanSnapshot(req.params.id, {
       orders: cleanOrders,
       trucks: cleanTrucks,
@@ -3425,6 +3570,7 @@ app.put("/api/dispatch/plans/:id", requireOperator, requireDispatcher, async (re
       planDate: req.body?.planDate || req.body?.date || "",
       sessionId: req.body?.audit?.sessionId || ""
     });
+    await syncOrderDependenciesFromDispatchPlan(plan);
     const coAssignments = await applyDispatchPlanCoAssignments(plan);
     const scmSchedule = await syncScmScheduleFromDispatchPlan(plan, {
       updatedBy: req.body?.audit?.sessionId || "dispatch-plan-save"
@@ -3551,6 +3697,13 @@ app.post("/api/dispatch/plans/:id/confirm", requireOperator, requireDispatcher, 
         trucks: requestedTrucks
       });
       if (coSequenceConflicts.length) return sendDispatchCoSequenceConflictResponse(res, coSequenceConflicts);
+      const dependencyConflicts = await validateDispatchPlanDependencies({
+        id: req.params.id,
+        planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date,
+        orders: requestedOrders,
+        trucks: requestedTrucks
+      });
+      if (dependencyConflicts.length) return sendDispatchDependencyConflictResponse(res, dependencyConflicts);
       if (dispatchPlanDataChanged(
         { orders: previousPlan.orders || [], trucks: previousPlan.trucks || [] },
         { orders: requestedOrders, trucks: requestedTrucks }
@@ -3567,7 +3720,10 @@ app.post("/api/dispatch/plans/:id/confirm", requireOperator, requireDispatcher, 
     }
     const duplicateDrivers = dispatchDuplicateDriverAssignments(planForConfirm?.trucks || []);
     if (duplicateDrivers.length) return sendDispatchDuplicateDriverResponse(res, duplicateDrivers);
+    const finalDependencyConflicts = await validateDispatchPlanDependencies(planForConfirm);
+    if (finalDependencyConflicts.length) return sendDispatchDependencyConflictResponse(res, finalDependencyConflicts);
     const plan = await confirmDispatchPlan(req.params.id, { note: req.body?.note || "" });
+    await syncOrderDependenciesFromDispatchPlan(plan);
     const coAssignments = await applyDispatchPlanCoAssignments(plan);
     const scmSchedule = await syncScmScheduleFromDispatchPlan(plan, { updatedBy: req.body?.audit?.sessionId || "dispatch-plan-confirm" }).catch(() => null);
     const changedOperatorRefs = [...dispatchOperatorAssignmentMap(plan).keys()];
@@ -3786,6 +3942,240 @@ app.put("/api/dispatch/sales-order-methods/:tranid", async (req, res, next) => {
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { orderId: updated.tranid, change: "sales_order_local_method" });
     res.json({ updated, orders: await listDispatchOrdersForResponse({ type: "SO" }) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/dispatch/order-dependencies", async (req, res, next) => {
+  try {
+    res.json(await listOrderDependencies({
+      salesOrderRef: req.query.salesOrderRef || "",
+      transferOrderRef: req.query.transferOrderRef || "",
+      includeCancelled: req.query.includeCancelled === "true"
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/dispatch/order-dependencies/options", async (req, res, next) => {
+  try {
+    res.json(await getOrderDependencyOptions({
+      salesOrderRef: req.query.salesOrderRef || "",
+      transferOrderRef: req.query.transferOrderRef || ""
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/dispatch/order-dependencies", async (req, res, next) => {
+  try {
+    await requireDispatchPlanEditLease(req, req.body?.planDate || req.body?.date || "");
+    const dependency = await createOrderDependency({
+      salesOrderRef: req.body?.salesOrderRef,
+      transferOrderRef: req.body?.transferOrderRef,
+      mode: req.body?.mode,
+      allocations: req.body?.allocations || [],
+      operatorId: req.operator?.id
+    });
+    emitAppEvent("dispatch.orders.updated", { source: "order-dependency", orderId: dependency.salesOrderRef, refreshOrderPool: true });
+    res.status(201).json({ dependency, orders: await listDispatchOrdersForResponse() });
+  } catch (error) {
+    if (error instanceof DispatchPlanEditLeaseError) return sendDispatchPlanEditLeaseError(res, error);
+    next(error);
+  }
+});
+
+app.patch("/api/dispatch/order-dependencies/:id/mode", async (req, res, next) => {
+  try {
+    await requireDispatchPlanEditLease(req, req.body?.planDate || req.body?.date || "");
+    const dependency = await updateOrderDependencyMode(req.params.id, req.body?.mode, req.operator?.id);
+    emitAppEvent("dispatch.orders.updated", { source: "order-dependency-mode", orderId: dependency.salesOrderRef, refreshOrderPool: true });
+    res.json({ dependency, orders: await listDispatchOrdersForResponse() });
+  } catch (error) {
+    if (error instanceof DispatchPlanEditLeaseError) return sendDispatchPlanEditLeaseError(res, error);
+    next(error);
+  }
+});
+
+app.delete("/api/dispatch/order-dependencies/:id", async (req, res, next) => {
+  try {
+    await requireDispatchPlanEditLease(req, req.body?.planDate || req.query?.planDate || "");
+    const cancelled = await cancelOrderDependency(req.params.id, req.operator?.id);
+    emitAppEvent("dispatch.orders.updated", { source: "order-dependency-unlink", refreshOrderPool: true });
+    res.json({ cancelled, orders: await listDispatchOrdersForResponse() });
+  } catch (error) {
+    if (error instanceof DispatchPlanEditLeaseError) return sendDispatchPlanEditLeaseError(res, error);
+    next(error);
+  }
+});
+
+app.get("/api/scm/transfer-dependencies/candidates", async (req, res, next) => {
+  try {
+    res.json(await listTransferDependencyCandidates({
+      search: req.query.search || "",
+      salesOrderId: req.query.salesOrderId || null,
+      reviewStatus: req.query.reviewStatus || "open"
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/transfer-dependencies/candidates/:salesOrderId/review", async (req, res, next) => {
+  try {
+    if (!["admin", "scm", "scm_staff"].includes(normalizedOperatorRole(req.operator))) {
+      return res.status(403).json({ error: "SCM write access required." });
+    }
+    const candidate = await reviewTransferDependencyCandidate({
+      salesOrderId: req.params.salesOrderId,
+      operatorId: req.operator?.id
+    });
+    emitAppEvent("scm.transfer_dependency.updated", {
+      source: "reviewed-no-transfer",
+      orderId: candidate.salesOrderRef
+    });
+    res.json(candidate);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete("/api/scm/transfer-dependencies/candidates/:salesOrderId/review", async (req, res, next) => {
+  try {
+    if (!["admin", "scm", "scm_staff"].includes(normalizedOperatorRole(req.operator))) {
+      return res.status(403).json({ error: "SCM write access required." });
+    }
+    const candidate = await reopenTransferDependencyCandidate({
+      salesOrderId: req.params.salesOrderId,
+      operatorId: req.operator?.id
+    });
+    emitAppEvent("scm.transfer_dependency.updated", {
+      source: "review-reopened",
+      orderId: candidate.salesOrderRef
+    });
+    res.json(candidate);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/transfer-dependencies/candidates/:salesOrderId/inventory", async (req, res, next) => {
+  try {
+    res.json(await getDependencyInventoryMatrix(req.params.salesOrderId));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/transfer-dependencies/candidates/:salesOrderId/refresh-inventory", async (req, res, next) => {
+  try {
+    if (!["admin", "scm", "scm_staff"].includes(normalizedOperatorRole(req.operator))) {
+      return res.status(403).json({ error: "SCM write access required." });
+    }
+    const candidates = await listTransferDependencyCandidates({ salesOrderId: req.params.salesOrderId });
+    const itemIds = [...new Set(candidates.flatMap((order) => order.lines || [])
+      .map((line) => Number(line.itemId)).filter(Number.isInteger))];
+    if (itemIds.length) await refreshTransferDependencyInventory(itemIds);
+    res.json(await getDependencyInventoryMatrix(req.params.salesOrderId));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/transfer-dependencies/batches/:id", async (req, res, next) => {
+  try {
+    const batch = await getTransferDependencyBatch(req.params.id);
+    if (!batch) return res.status(404).json({ error: "Dependency batch not found." });
+    res.json(batch);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/transfer-dependencies/suggestions", async (req, res, next) => {
+  try {
+    if (!["admin", "scm", "scm_staff"].includes(normalizedOperatorRole(req.operator))) {
+      return res.status(403).json({ error: "SCM write access required." });
+    }
+    const candidates = await listTransferDependencyCandidates({ salesOrderId: req.body?.salesOrderId });
+    const itemIds = candidates.flatMap((order) => order.lines || []).map((line) => Number(line.itemId)).filter(Number.isInteger);
+    if (req.body?.refreshInventory !== false && itemIds.length) await refreshTransferDependencyInventory(itemIds);
+    const batch = await generateTransferDependencySuggestion({
+      salesOrderId: req.body?.salesOrderId,
+      mode: req.body?.mode,
+      operatorId: req.operator?.id
+    });
+    emitAppEvent("scm.transfer_dependency.updated", { batchId: batch.id, orderId: batch.salesOrderRef });
+    res.status(201).json(batch);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/scm/transfer-dependencies/batches/:id", async (req, res, next) => {
+  try {
+    if (!["admin", "scm", "scm_staff"].includes(normalizedOperatorRole(req.operator))) {
+      return res.status(403).json({ error: "SCM write access required." });
+    }
+    const batch = await updateTransferDependencyBatch(req.params.id, req.body || {}, req.operator?.id);
+    emitAppEvent("scm.transfer_dependency.updated", { batchId: batch.id, orderId: batch.salesOrderRef });
+    res.json(batch);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/transfer-dependencies/batches/:id/confirm", async (req, res, next) => {
+  try {
+    if (!["admin", "scm", "scm_staff"].includes(normalizedOperatorRole(req.operator))) {
+      return res.status(403).json({ error: "SCM write access required." });
+    }
+    await refreshTransferDependencyBatchInventory(req.params.id, req.operator?.id);
+    const result = await confirmTransferDependencyBatch(req.params.id, {
+      operatorId: req.operator?.id,
+      createTransferOrder: async ({ proposal, batch }) => {
+        const request = await transferDependencyRestPayload({ proposal, batch });
+        return createTransferOrderInNetSuite(request.payload, { intercompany: request.intercompany });
+      },
+      hydrateTransferOrder: hydrateCreatedDependencyTransferOrder
+    });
+    emitAppEvent("dispatch.orders.updated", { source: "scm-transfer-dependency", refreshOrderPool: true });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/transfer-dependencies/batches/:id/retry", async (req, res, next) => {
+  try {
+    if (!["admin", "scm", "scm_staff"].includes(normalizedOperatorRole(req.operator))) {
+      return res.status(403).json({ error: "SCM write access required." });
+    }
+    await refreshTransferDependencyBatchInventory(req.params.id, req.operator?.id);
+    const result = await retryTransferDependencyBatch(req.params.id, {
+      operatorId: req.operator?.id,
+      createTransferOrder: async ({ proposal, batch }) => {
+        const request = await transferDependencyRestPayload({ proposal, batch });
+        return createTransferOrderInNetSuite(request.payload, { intercompany: request.intercompany });
+      },
+      hydrateTransferOrder: hydrateCreatedDependencyTransferOrder
+    });
+    emitAppEvent("dispatch.orders.updated", { source: "scm-transfer-dependency-retry", refreshOrderPool: true });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/order-dependencies/:id/reconcile", async (req, res, next) => {
+  try {
+    if (!["admin", "scm", "scm_staff"].includes(normalizedOperatorRole(req.operator))) {
+      return res.status(403).json({ error: "SCM write access required." });
+    }
+    res.json(await reconcileOrderDependency(req.params.id, req.operator?.id));
   } catch (error) {
     next(error);
   }
@@ -4504,6 +4894,10 @@ app.delete("/api/dispatch/po-allocations/:allocationId", async (req, res, next) 
 app.post("/api/dispatch/split-orders/unsplit", async (req, res, next) => {
   try {
     await requireDispatchPlanEditLease(req);
+    await assertNoActiveOrderDependenciesByRefs([
+      req.body?.originalOrderId,
+      ...(req.body?.splitOrderIds || [])
+    ], "unsplit these orders");
     const result = await deactivateUnplannedDispatchSplitOrders({
       originalOrderId: req.body?.originalOrderId,
       orderType: req.body?.orderType,
@@ -4666,12 +5060,20 @@ app.put("/api/dispatch/plan", async (req, res, next) => {
       trucks: payload.trucks
     });
     if (coSequenceConflicts.length) return sendDispatchCoSequenceConflictResponse(res, coSequenceConflicts);
+    const dependencyConflicts = await validateDispatchPlanDependencies({
+      id: plan.id,
+      planDate: plan.planDate || planDate,
+      orders: payload.orders,
+      trucks: payload.trucks
+    });
+    if (dependencyConflicts.length) return sendDispatchDependencyConflictResponse(res, dependencyConflicts);
     const savedPlan = await saveDispatchPlanSnapshot(plan.id, {
       orders: payload.orders,
       trucks: payload.trucks,
       summary: req.body?.summary || {},
       baseRevision: saveMode === "truck_sequence" ? null : req.body?.baseRevision
     });
+    await syncOrderDependenciesFromDispatchPlan(savedPlan);
     const coAssignments = await applyDispatchPlanCoAssignments(savedPlan);
     const changedOperatorRefs = [
       ...new Set([...changedDispatchOperatorRefs(previousPlan || {}, savedPlan), ...explicitOperatorAlertRefs])
@@ -4758,6 +5160,10 @@ app.get("/scm/POsplit", (req, res) => {
 
 app.get("/scm/POTOschedule", (req, res) => {
   res.sendFile(path.join(publicDir, "scm-schedule.html"));
+});
+
+app.get("/scm/transfer-dependencies", (req, res) => {
+  res.sendFile(path.join(publicDir, "scm-transfer-dependencies.html"));
 });
 
 app.get("/scm/VRMA", (req, res) => {
@@ -5246,6 +5652,15 @@ app.post("/api/driver/jobs/:jobId/start", requireDriver, async (req, res, next) 
     if (activeRest) return res.status(409).json({ error: "End rest time before starting the next job.", rest: activeRest });
     const job = await getNextDriverJob(req.driverLogin);
     if (!job || job.jobId !== req.params.jobId) return res.status(409).json({ error: "This is no longer the next assigned job. Refresh and try again." });
+    if (job.stopType === "pickup" || job.stopType === "dropoff") {
+      const dependencyBlock = await getSalesOrderDependencyExecutionBlock(job.orderRefs || []);
+      if (dependencyBlock) return res.status(409).json({ error: dependencyBlock.message, dependencyBlock });
+      if (job.stopType === "pickup") {
+        const directTransferRefs = (job.dependencyPickupManifests || []).map((entry) => entry.transferOrderRef).filter(Boolean);
+        const directPickupBlock = await getDirectPickupDependencyExecutionBlock(directTransferRefs);
+        if (directPickupBlock) return res.status(409).json({ error: directPickupBlock.message, dependencyBlock: directPickupBlock });
+      }
+    }
     const samsaraHandoff = await ensureDriverSamsaraDutyForJob(req.driverLogin, {
       samsaraAccounts: samsaraAccountsForDriver(req.driver)
     });
@@ -5285,10 +5700,32 @@ app.post("/api/driver/jobs/:jobId/photos", requireDriver, async (req, res, next)
         locationCheck
       });
     }
-    const record = await recordDriverJobPhotos(req.driverLogin, req.params.jobId, {
-      photoDataUrls: req.body?.photoDataUrls,
-      job
+    const completion = await withTransaction(async () => {
+      const record = await recordDriverJobPhotos(req.driverLogin, req.params.jobId, {
+        photoDataUrls: req.body?.photoDataUrls,
+        job
+      });
+      let dependencyUpdate = null;
+      if (job.stopType === "pickup") {
+        const transferRefs = (job.dependencyPickupManifests || []).map((entry) => entry.transferOrderRef).filter(Boolean);
+        dependencyUpdate = await markDirectDependencyPickupCompleted({
+          transferOrderRefs: transferRefs,
+          driverJobId: req.params.jobId
+        });
+      } else if (job.stopType === "dropoff") {
+        dependencyUpdate = await completeDirectDependenciesForSalesOrderDrop({
+          salesOrderRefs: job.orderRefs || [],
+          driverJobId: req.params.jobId,
+          planId: job.planId,
+          planDate: job.planDate,
+          truckPlate: job.truckPlate,
+          loadId: job.loadId,
+          loadName: job.loadName
+        });
+      }
+      return { record, dependencyUpdate };
     });
+    const { record, dependencyUpdate } = completion;
     let nextJob = await getNextDriverJob(req.driverLogin);
     let rest = null;
     if (nextJob && req.body?.autoStartRest === true) {
@@ -5301,8 +5738,11 @@ app.post("/api/driver/jobs/:jobId/photos", requireDriver, async (req, res, next)
       await startDriverJob(req.driverLogin, nextJob.jobId, { job: nextJob });
       nextJob = await getNextDriverJob(req.driverLogin);
     }
-    emitAppEvent("driver.job.completed", { driverLogin: req.driverLogin, jobId: req.params.jobId, stopType: job.stopType, nextJobId: nextJob?.jobId || null });
-    res.json({ record, nextJob, rest, locationCheck });
+    emitAppEvent("driver.job.completed", { driverLogin: req.driverLogin, jobId: req.params.jobId, stopType: job.stopType, nextJobId: nextJob?.jobId || null, dependencyUpdate });
+    if (dependencyUpdate && (Array.isArray(dependencyUpdate) ? dependencyUpdate.length : dependencyUpdate.completed?.length)) {
+      emitAppEvent("dispatch.orders.updated", { source: "driver-order-dependency", refreshOrderPool: true });
+    }
+    res.json({ record, nextJob, rest, locationCheck, dependencyUpdate });
   } catch (error) {
     next(error);
   }
@@ -5941,6 +6381,25 @@ app.use("/api/receiving", requireOperator);
 app.use("/api/inventory", requireOperator);
 app.use("/api/cycle-count", requireOperator);
 
+app.use("/api/delivery/orders/:id", async (req, res, next) => {
+  try {
+    if (isNetSuiteSandboxEnvironment()) return next();
+    const orderId = String(req.params.id || "").trim();
+    const fixture = await query(
+      `SELECT 1
+         FROM sales_orders
+        WHERE COALESCE(is_test_fixture, false) = true
+          AND (tranid = $1 OR ($2::bigint IS NOT NULL AND netsuite_id = $2::bigint))
+        LIMIT 1`,
+      [orderId, /^\d+$/.test(orderId) ? Number(orderId) : null]
+    );
+    if (fixture.rowCount) return res.status(404).json({ error: "Delivery order not found." });
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/customer-pickup/lookup", async (req, res, next) => {
   try {
     const code = String(req.body?.code || "").trim();
@@ -6561,8 +7020,9 @@ app.post("/api/delivery/orders/:id/prepared", async (req, res, next) => {
 app.post("/api/delivery/orders/:id/status", async (req, res, next) => {
   try {
     await updateDeliveryStatus(req.params.id, req.body?.status, operatorId(req));
+    const dependencyProgress = await syncDirectDependencyOperatorProgress(req.params.id);
     emitAppEvent("delivery.order.updated", { orderId: req.params.id, status: req.body?.status, operatorId: operatorId(req) });
-    res.json({ ok: true });
+    res.json({ ok: true, dependencyProgress });
   } catch (error) {
     next(error);
   }
@@ -6616,6 +7076,7 @@ app.post("/api/delivery/orders/:id/lines/:lineId/packed-quantity", async (req, r
 app.post("/api/delivery/orders/:id/lines/:lineId/unpack", async (req, res, next) => {
   try {
     await unpackDeliveryLine(req.params.id, req.params.lineId, req.body || {}, operatorId(req));
+    await syncDirectDependencyOperatorProgress(req.params.id);
     const resolvedRequests = await resolveDispatchOperatorRequestsForOrder(req.params.id, operatorId(req)).catch(() => []);
     emitAppEvent("delivery.order.unpacked", { orderId: req.params.id, lineId: req.params.lineId, operatorId: operatorId(req), resolvedRequestIds: resolvedRequests.map((request) => request.id) });
     res.json({ ok: true });
@@ -6627,6 +7088,7 @@ app.post("/api/delivery/orders/:id/lines/:lineId/unpack", async (req, res, next)
 app.post("/api/delivery/orders/:id/unpack", async (req, res, next) => {
   try {
     await unpackDeliveryOrder(req.params.id, operatorId(req));
+    await syncDirectDependencyOperatorProgress(req.params.id);
     const resolvedRequests = await resolveDispatchOperatorRequestsForOrder(req.params.id, operatorId(req)).catch(() => []);
     emitAppEvent("delivery.order.unpacked", { orderId: req.params.id, operatorId: operatorId(req), resolvedRequestIds: resolvedRequests.map((request) => request.id) });
     res.json({ ok: true });
@@ -6684,6 +7146,7 @@ app.post("/api/delivery/orders/:id/load", async (req, res, next) => {
     const result = await recordDeliveryLoad(req.params.id, operatorId(req), {
       photoDataUrl: req.body?.photoDataUrl
     });
+    result.dependencyProgress = await syncDirectDependencyOperatorProgress(req.params.id);
     emitAppEvent("delivery.order.loaded", { orderId: req.params.id, operatorId: operatorId(req), resultId: result?.id || null });
     if (Array.isArray(result?.activatedCo) && result.activatedCo.length) {
       emitAppEvent("receiving.order.updated", { orderId: req.params.id, activatedCo: result.activatedCo, source: "delivery-load" });
@@ -6738,6 +7201,7 @@ async function runReceivingReceipt(orderId, body, currentOperatorId, jobId) {
     itemReceiptId: null,
     itemReceiptTranid: null
   });
+  await syncOrderDependenciesForTransferOrder(orderId);
   updateReceivingJob(jobId, {
     stage: "complete",
     message: "Receipt recorded locally.",

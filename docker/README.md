@@ -44,4 +44,27 @@ docker compose --env-file docker/env/.env down
 docker compose --env-file docker/env/.env up -d
 ```
 
+## VM update
+
+From the repository root on the Ubuntu VM, run the automated updater:
+
+```bash
+bash docker/update-vm.sh
+```
+
+The updater creates a PostgreSQL backup, pulls `origin/codex/dockerVer`, builds the
+new images, stops only the app, applies migrations, recreates the app container,
+and verifies the configured host port with `/health`.
+
+Optional overrides:
+
+```bash
+BRANCH=codex/dockerVer bash docker/update-vm.sh
+HEALTH_URL=http://127.0.0.1:3000/health bash docker/update-vm.sh
+SKIP_BACKUP=1 bash docker/update-vm.sh
+```
+
+The script intentionally stops if the VM Git worktree contains local changes.
+Commit or stash those changes before running it.
+
 Do not use `docker compose down -v` during normal operation because `-v` deletes the PostgreSQL, app-data, and Ollama model volumes.

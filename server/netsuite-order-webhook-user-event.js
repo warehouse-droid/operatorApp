@@ -176,6 +176,8 @@ define(["N/https", "N/log", "N/record", "N/runtime", "N/search"], (https, log, r
         itemDescription: description,
         quantity: numberValue(getLineValueSafe(rec, line, "quantity")),
         signedQuantity: signedNumberValue(getLineValueSafe(rec, line, "quantity")),
+        quantityCommitted: numberValue(getLineValueSafe(rec, line, "quantitycommitted")),
+        quantityBackordered: numberValue(getLineValueSafe(rec, line, "quantitybackordered")),
         quantityShipRecv: numberValue(getLineValueSafe(rec, line, "quantityshiprecv")),
         quantityFulfilled: numberValue(getLineValueSafe(rec, line, "quantityfulfilled")),
         quantityReceived: numberValue(getLineValueSafe(rec, line, "quantityreceived")),

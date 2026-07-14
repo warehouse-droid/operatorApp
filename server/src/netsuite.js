@@ -4,6 +4,10 @@ import { query } from "./db.js";
 
 let suiteqlQueue = Promise.resolve();
 let restMutationQueue = Promise.resolve();
+let locationDirectoryCache = { key: "", expiresAt: 0, rows: [] };
+let palletItemCache = { key: "", item: null };
+
+const LOCATION_DIRECTORY_TTL_MS = 10 * 60 * 1000;
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -441,7 +445,7 @@ async function netsuiteRest(path, { method = "GET", body = null, headers = {} } 
       throw lastError;
     }
     const location = response.headers.get("location") || "";
-    const idMatch = location.match(/\/(?:itemFulfillment|itemReceipt)\/(\d+)/i);
+    const idMatch = location.match(/\/(?:itemFulfillment|itemReceipt|transferOrder|intercompanyTransferOrder)\/(\d+)/i);
     return { status: response.status, location, id: idMatch ? Number(idMatch[1]) : null, data };
   }
   throw lastError;
@@ -501,6 +505,55 @@ export async function transformTransferOrderToItemReceipt(orderId, payload) {
   const result = restMutationQueue.then(run, run);
   restMutationQueue = result.catch(() => {});
   return result;
+}
+
+export async function createTransferOrderInNetSuite(payload, { intercompany = false } = {}) {
+  const recordType = intercompany ? "intercompanyTransferOrder" : "transferOrder";
+  const run = () => netsuiteRest(`/record/v1/${recordType}`, {
+    method: "POST",
+    body: payload
+  });
+  const result = restMutationQueue.then(run, run);
+  restMutationQueue = result.catch(() => {});
+  return result;
+}
+
+export async function updateTransferOrderStatusInNetSuite(orderId, { intercompany = false, statusId = "B" } = {}) {
+  const id = Number(orderId);
+  if (!Number.isInteger(id) || id <= 0) throw new Error("A valid numeric NetSuite transfer order ID is required.");
+  const recordType = intercompany ? "intercompanyTransferOrder" : "transferOrder";
+  const run = () => netsuiteRest(`/record/v1/${recordType}/${id}`, {
+    method: "PATCH",
+    body: { orderStatus: { id: String(statusId || "B") } }
+  });
+  const result = restMutationQueue.then(run, run);
+  restMutationQueue = result.catch(() => {});
+  return result;
+}
+
+export async function resolvePalletItemFromNetSuite() {
+  const key = `${config.netsuite.accountId || ""}|${config.netsuite.restBaseUrl || ""}`;
+  if (palletItemCache.key === key && palletItemCache.item) return palletItemCache.item;
+  const rows = await suiteqlAll(`
+    SELECT i.id, i.itemid, BUILTIN.DF(i.stockunit) AS stock_unit
+      FROM item i
+     WHERE i.itemid = 'PALLET'
+       AND i.isinactive = 'F'
+     ORDER BY i.id
+  `);
+  if (rows.length !== 1) {
+    throw new Error(rows.length
+      ? "More than one active NetSuite item is named exactly PALLET. Resolve the duplicate before creating Transfer Orders."
+      : "The active NetSuite account has no active item named exactly PALLET.");
+  }
+  const row = rows[0];
+  const id = Number(row.id);
+  if (!Number.isInteger(id) || id <= 0) throw new Error("NetSuite returned an invalid PALLET item ID.");
+  palletItemCache = {
+    key,
+    item: { id, itemId: id, itemName: String(row.itemid || "PALLET"), unit: String(row.stock_unit || "EACH") }
+  };
+  return palletItemCache.item;
 }
 
 export async function fetchItemFulfillmentFromNetSuite(itemFulfillmentId) {
@@ -876,6 +929,8 @@ export async function fetchDeliveryOrderDetailsFromNetSuite(orderId, locationId 
       BUILTIN.DF(i.itemtype) AS item_type_text,
       tl.memo AS item_description,
       tl.quantity,
+      tl.quantitycommitted AS netsuite_committed_qty,
+      tl.quantitybackordered AS netsuite_backordered_qty,
       tl.quantityshiprecv AS netsuite_received_qty,
       BUILTIN.DF(tl.units) AS unit,
       i.weight AS item_weight,
@@ -1175,4 +1230,177 @@ export async function fetchInventoryBalanceForItemFromNetSuite(itemId, locationI
   `);
 
   return result.items || [];
+}
+
+function normalizedLocationLabel(value) {
+  return String(value || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+function locationCodeScore(row = {}, code = "") {
+  const normalizedCode = normalizedLocationLabel(code);
+  if (!normalizedCode) return 0;
+  const name = String(row.name || "").trim();
+  const fullname = String(row.fullname || "").trim();
+  const leafName = fullname.split(":").at(-1)?.trim() || "";
+  if (normalizedLocationLabel(name) === normalizedCode) return 100;
+  if (normalizedLocationLabel(leafName) === normalizedCode) return 95;
+  if (normalizedLocationLabel(fullname) === normalizedCode) return 90;
+  if (normalizedCode === "150") {
+    if (/^150(?:\D|$)/i.test(name)) return 80;
+    if (/^150(?:\D|$)/i.test(leafName)) return 75;
+  }
+  return 0;
+}
+
+export function matchNetSuiteLocation(directory = [], { locationId = null, code = "" } = {}) {
+  const activeRows = (directory || []).filter((row) => String(row.isinactive || "F").toUpperCase() !== "T");
+  const normalizedCode = normalizedLocationLabel(code);
+  if (!normalizedCode) {
+    const byId = activeRows.find((row) => String(row.id) === String(locationId));
+    if (!byId) throw new Error(`NetSuite location ${locationId || "(missing)"} is not active in the selected account.`);
+    return byId;
+  }
+
+  const ranked = activeRows
+    .map((row) => ({ row, score: locationCodeScore(row, normalizedCode) }))
+    .filter((entry) => entry.score > 0)
+    .sort((left, right) => right.score - left.score || Number(left.row.id) - Number(right.row.id));
+  if (!ranked.length) {
+    throw new Error(`Yard ${code} could not be matched to an active NetSuite location in account ${config.netsuite.accountId || "current"}.`);
+  }
+  if (ranked.length > 1 && ranked[0].score === ranked[1].score) {
+    throw new Error(`Yard ${code} matches multiple active NetSuite locations. Rename the locations so the yard code is unique.`);
+  }
+  return ranked[0].row;
+}
+
+async function activeNetSuiteLocationDirectory() {
+  const key = `${config.netsuite.accountId || ""}|${config.netsuite.restBaseUrl || ""}`;
+  if (locationDirectoryCache.key === key && locationDirectoryCache.expiresAt > Date.now()) {
+    return locationDirectoryCache.rows;
+  }
+  const rows = await suiteqlAll(`
+    SELECT l.id, l.name, l.fullname, l.isinactive, l.subsidiary,
+           BUILTIN.DF(l.subsidiary) AS subsidiary_name
+      FROM location l
+     WHERE l.isinactive = 'F'
+     ORDER BY l.id
+  `);
+  locationDirectoryCache = {
+    key,
+    expiresAt: Date.now() + LOCATION_DIRECTORY_TTL_MS,
+    rows
+  };
+  return rows;
+}
+
+function resolvedNetSuiteLocation(row, local = {}) {
+  const netsuiteLocationId = Number(row?.id);
+  const subsidiaryId = Number(row?.subsidiary);
+  if (!Number.isInteger(netsuiteLocationId) || netsuiteLocationId <= 0) {
+    throw new Error(`NetSuite returned an invalid location for yard ${local.code || local.locationId || "unknown"}.`);
+  }
+  return {
+    localLocationId: Number(local.locationId),
+    localLocationCode: String(local.code || "").trim(),
+    netsuiteLocationId,
+    netsuiteLocationName: String(row.name || row.fullname || "").trim(),
+    subsidiaryId: Number.isInteger(subsidiaryId) && subsidiaryId > 0 ? subsidiaryId : null,
+    subsidiaryName: String(row.subsidiary_name || "").trim()
+  };
+}
+
+export async function resolveNetSuiteYardLocations(yards = []) {
+  const directory = await activeNetSuiteLocationDirectory();
+  return (yards || []).map((yard) => resolvedNetSuiteLocation(
+    matchNetSuiteLocation(directory, { locationId: yard.locationId, code: yard.code }),
+    yard
+  ));
+}
+
+export async function resolveNetSuiteTransferLocations({
+  sourceLocationId,
+  sourceLocation,
+  destinationLocationId,
+  destinationLocation
+} = {}) {
+  const [source, destination] = await resolveNetSuiteYardLocations([
+    { locationId: sourceLocationId, code: sourceLocation },
+    { locationId: destinationLocationId, code: destinationLocation }
+  ]);
+  if (!source.subsidiaryId || !destination.subsidiaryId) {
+    throw new Error("NetSuite subsidiary could not be determined for the selected transfer locations.");
+  }
+  return {
+    source,
+    destination,
+    intercompany: source.subsidiaryId !== destination.subsidiaryId
+  };
+}
+
+export async function fetchTransferOrderByIdFromNetSuite(orderId) {
+  const id = Number(orderId);
+  if (!Number.isInteger(id) || id <= 0) throw new Error("A valid numeric NetSuite transfer order ID is required.");
+  const result = await suiteql(`
+    SELECT
+      t.id,
+      t.tranid,
+      t.trandate,
+      t.status,
+      BUILTIN.DF(t.status) AS status_text,
+      t.custbody7 AS memo,
+      t.location AS source_location_id,
+      BUILTIN.DF(t.location) AS source_location,
+      t.transferlocation AS destination_location_id,
+      BUILTIN.DF(t.transferlocation) AS destination_location
+    FROM transaction t
+    WHERE t.id = ${id}
+      AND t.type = 'TrnfrOrd'
+    FETCH FIRST 1 ROWS ONLY
+  `);
+  const order = result.items?.[0];
+  if (!order) return null;
+  return {
+    ...order,
+    order_type: "transfer_order",
+    customer_id: order.destination_location_id,
+    customer: `Transfer to ${order.destination_location || ""}`.trim(),
+    order_location_id: order.destination_location_id,
+    order_location: order.destination_location,
+    outbound_location_id: order.source_location_id,
+    outbound_location: order.source_location,
+    delivery_method: "Transfer Order"
+  };
+}
+
+export async function fetchInventoryBalancesForItemsFromNetSuite(itemIds = [], locationIds = [1, 28, 15, 26]) {
+  const items = [...new Set((itemIds || []).map(Number).filter((id) => Number.isInteger(id) && id > 0))];
+  const locations = [...new Set((locationIds || []).map(Number).filter((id) => Number.isInteger(id) && id > 0))];
+  if (!items.length) return [];
+  if (!locations.length) throw new Error("At least one NetSuite location ID is required.");
+  return suiteqlAll(`
+    SELECT
+      i.id AS item_id,
+      BUILTIN.DF(i.id) AS item_name,
+      i.displayname AS display_name,
+      i.description AS item_description,
+      i.itemtype AS item_type,
+      BUILTIN.DF(i.itemtype) AS item_type_text,
+      BUILTIN.DF(i.stockunit) AS stock_unit,
+      i.weight AS item_weight,
+      i.custitem_toplt AS to_plt,
+      i.custitem_tolyr AS to_lyr,
+      i.custitem_tosec AS to_sec,
+      i.custitem_topcs AS to_pcs,
+      ib.location AS location_id,
+      BUILTIN.DF(ib.location) AS location,
+      ib.quantityonhand AS quantity_on_hand,
+      ib.quantityavailable AS quantity_available
+    FROM AggregateItemLocation ib
+    INNER JOIN item i ON i.id = ib.item
+    WHERE ib.item IN (${items.join(",")})
+      AND ib.location IN (${locations.join(",")})
+      AND i.isinactive = 'F'
+    ORDER BY BUILTIN.DF(i.id), BUILTIN.DF(ib.location)
+  `);
 }

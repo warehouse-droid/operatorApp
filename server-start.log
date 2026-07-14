@@ -1,1 +1,4 @@
-MBBS Yard Server listening on http://localhost:3000
+
+> mbbs-yard-server@0.1.0 start
+> node src/server.js
+

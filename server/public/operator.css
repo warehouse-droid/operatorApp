@@ -1735,6 +1735,16 @@ label span {
   font-weight: 900;
 }
 
+.status-pill.test-fixture {
+  display: inline-flex;
+  min-height: 20px;
+  padding: 2px 6px;
+  border: 1px solid #0b7285;
+  background: #d9f3f7;
+  color: #075766;
+  vertical-align: middle;
+}
+
 .status-pill.preparing {
   background: #ffe2b8;
   color: var(--warn);

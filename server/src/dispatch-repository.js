@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { pool, query } from "./db.js";
+import { isNetSuiteSandboxEnvironment } from "./config.js";
 import {
   enrichPurchaseOrderDispatch,
   enrichSalesOrderDispatch,
@@ -112,6 +113,7 @@ function rowToDispatchOrder(row) {
     netsuiteStatusText: row.status_text || "",
     fulfillmentStatus: row.fulfillment_status || "",
     netsuiteActive: row.netsuite_active !== false,
+    testFixture: isNetSuiteSandboxEnvironment() && /^TSTDEP-SO-/i.test(String(row.tranid || "")),
     operatorStatus: row.operator_status || "",
     localYardOrderStatus: row.local_yard_order_status || "Open",
     dispatchPlanned: Boolean(row.dispatch_planned),
@@ -169,8 +171,8 @@ function yardAddressSql(field) {
 }
 
 export async function listDispatchOrders({ type = null, includeHiddenScm = false } = {}) {
-  const params = [Boolean(includeHiddenScm)];
-  const typeClause = type ? `WHERE dispatch_type = $2` : "";
+  const params = [Boolean(includeHiddenScm), isNetSuiteSandboxEnvironment()];
+  const typeClause = type ? `WHERE dispatch_type = $3` : "";
   if (type) params.push(type);
   const result = await query(
     `
@@ -234,9 +236,10 @@ export async function listDispatchOrders({ type = null, includeHiddenScm = false
         fulfillment_status,
         status,
         status_text,
-        netsuite_active
+        CASE WHEN $2::boolean AND COALESCE(is_test_fixture, false) THEN true ELSE netsuite_active END AS netsuite_active
       FROM sales_orders
       WHERE sales_order_type <> '${CUSTOMER_PICKUP_DELIVERY_METHOD.replaceAll("'", "''")}'
+        AND (COALESCE(is_test_fixture, false) = false OR $2::boolean)
       UNION ALL
       SELECT
         netsuite_id,
@@ -291,8 +294,9 @@ export async function listDispatchOrders({ type = null, includeHiddenScm = false
         to_lyr,
         to_sec,
         to_pcs,
-        netsuite_active
-      FROM sales_order_lines
+        CASE WHEN $2::boolean AND COALESCE(o.is_test_fixture, false) THEN true ELSE l.netsuite_active END AS netsuite_active
+      FROM sales_order_lines l
+      JOIN sales_orders o ON o.netsuite_id = l.sales_order_id
       UNION ALL
       SELECT
         transfer_order_id AS order_id,
@@ -880,7 +884,8 @@ export async function listDispatchOrders({ type = null, includeHiddenScm = false
       SELECT * FROM local_vrma
     ) orders
     ${typeClause}
-    ORDER BY dispatch_window_start NULLS LAST, tranid DESC
+    ORDER BY CASE WHEN $2::boolean AND tranid LIKE 'TSTDEP-SO-%' THEN 0 ELSE 1 END,
+             dispatch_window_start NULLS LAST, tranid DESC
     LIMIT 500
     `,
     params

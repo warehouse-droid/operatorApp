@@ -3,8 +3,6 @@ name: mbbs-operator-app
 x-app-common: &app-common
   build:
     context: ./server
-  env_file:
-    - ./docker/env/.env
   volumes:
     - app_data:/app/data
     - ./docker/env/.env:/app/.env:ro

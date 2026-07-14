@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { query, withTransaction } from "./db.js";
+import { isNetSuiteSandboxEnvironment } from "./config.js";
 import { writeAudit } from "./auth-repository.js";
 import { getDispatchDeliveryGroup, listDispatchDeliveryGroups } from "./dispatch-delivery-group-repository.js";
 
@@ -437,7 +438,22 @@ function activePoAllocationSql(unit, lineAlias = "delivery_line_source") {
       : unit === "section" ? "allocated_section_qty"
         : unit === "piece" ? "allocated_piece_qty"
           : "allocated_sales_qty";
-  return `COALESCE((SELECT SUM(${column}) FROM dispatch_so_po_allocations a WHERE a.status = 'active' AND a.sales_line_id = ${lineAlias}.id), 0)`;
+  const dependencyColumn = unit === "pallet" ? "pallet_qty"
+    : unit === "layer" ? "layer_qty"
+      : unit === "section" ? "section_qty"
+        : unit === "piece" ? "piece_qty"
+          : "allocated_quantity";
+  return `(
+    COALESCE((SELECT SUM(${column}) FROM dispatch_so_po_allocations a WHERE a.status = 'active' AND a.sales_line_id = ${lineAlias}.id), 0)
+    + COALESCE((
+      SELECT SUM(dl.${dependencyColumn})
+        FROM order_dependency_lines dl
+        JOIN order_dependencies d ON d.id = dl.dependency_id
+       WHERE dl.sales_line_id = ${lineAlias}.id
+         AND d.dependency_mode = 'direct_to_customer'
+         AND d.status <> 'cancelled'
+    ), 0)
+  )`;
 }
 
 function isTransferDeliveryOrder(order) {
@@ -611,6 +627,8 @@ async function loadDispatchGroupChildOrders(groups = []) {
   const childRefs = [...new Set(groups.flatMap((group) => group.childRefs || []))];
   if (!childRefs.length || !groups.length) return new Map();
   const isTransfer = groups[0].orderType === "transfer_order";
+  const sandboxFixtures = isNetSuiteSandboxEnvironment();
+  const sandboxSql = sandboxFixtures ? "true" : "false";
   const orderResult = await query(
     isTransfer
       ? `SELECT o.*,
@@ -631,6 +649,7 @@ async function loadDispatchGroupChildOrders(groups = []) {
           WHERE o.tranid = ANY($1::text[])
           ORDER BY o.tranid`
       : `SELECT o.*,
+                CASE WHEN ${sandboxSql} AND COALESCE(o.is_test_fixture, false) THEN true ELSE o.netsuite_active END AS netsuite_active,
                 o.sales_order_type AS delivery_method,
                 'sales_order'::text AS order_type,
                 NULL::bigint AS source_location_id,
@@ -638,8 +657,9 @@ async function loadDispatchGroupChildOrders(groups = []) {
                 NULL::bigint AS destination_location_id,
                 NULL::text AS destination_location
            FROM sales_orders o
-          WHERE o.tranid = ANY($1::text[])
-          ORDER BY o.tranid`,
+           WHERE o.tranid = ANY($1::text[])
+             AND (COALESCE(o.is_test_fixture, false) = false OR ${sandboxSql})
+           ORDER BY o.tranid`,
     [childRefs]
   );
   const childIds = orderResult.rows.map((order) => order.netsuite_id);
@@ -669,15 +689,19 @@ async function loadDispatchGroupChildOrders(groups = []) {
             GROUP BY sales_line_id
          )
          SELECT l.*,
-                COALESCE(alloc.po_allocated_pallet_qty, 0) AS po_allocated_pallet_qty,
-                COALESCE(alloc.po_allocated_layer_qty, 0) AS po_allocated_layer_qty,
-                COALESCE(alloc.po_allocated_section_qty, 0) AS po_allocated_section_qty,
-                COALESCE(alloc.po_allocated_piece_qty, 0) AS po_allocated_piece_qty,
-                COALESCE(alloc.po_allocated_sales_qty, 0) AS po_allocated_sales_qty
+                COALESCE(alloc.po_allocated_pallet_qty, 0) + ${activePoAllocationSql("pallet", "l")} - COALESCE(alloc.po_allocated_pallet_qty, 0) AS po_allocated_pallet_qty,
+                COALESCE(alloc.po_allocated_layer_qty, 0) + ${activePoAllocationSql("layer", "l")} - COALESCE(alloc.po_allocated_layer_qty, 0) AS po_allocated_layer_qty,
+                COALESCE(alloc.po_allocated_section_qty, 0) + ${activePoAllocationSql("section", "l")} - COALESCE(alloc.po_allocated_section_qty, 0) AS po_allocated_section_qty,
+                COALESCE(alloc.po_allocated_piece_qty, 0) + ${activePoAllocationSql("piece", "l")} - COALESCE(alloc.po_allocated_piece_qty, 0) AS po_allocated_piece_qty,
+                COALESCE(alloc.po_allocated_sales_qty, 0) + ${activePoAllocationSql("sales", "l")} - COALESCE(alloc.po_allocated_sales_qty, 0) AS po_allocated_sales_qty
            FROM sales_order_lines l
+           JOIN sales_orders o ON o.netsuite_id = l.sales_order_id
            LEFT JOIN alloc ON alloc.sales_line_id = l.id
           WHERE l.sales_order_id = ANY($1::bigint[])
-            AND (l.netsuite_active = true OR l.sync_exception IS NOT NULL OR (${packedQtySql}) > 0)
+            AND (l.netsuite_active = true
+              OR (${sandboxSql} AND COALESCE(o.is_test_fixture, false))
+              OR l.sync_exception IS NOT NULL
+              OR (${packedQtySql}) > 0)
           ORDER BY l.sales_order_id, l.line_id NULLS LAST, l.id`,
     [childIds]
   );
@@ -806,10 +830,13 @@ export async function getDeliveryOrdersBatch(ids = []) {
     .map(Number)
     .filter(Number.isSafeInteger);
   const ordersByKey = new Map();
+  const sandboxFixtures = isNetSuiteSandboxEnvironment();
+  const sandboxSql = sandboxFixtures ? "true" : "false";
 
   if (regularIds.length) {
     const orderResult = await query(
         `SELECT o.*,
+                CASE WHEN ${sandboxSql} AND COALESCE(o.is_test_fixture, false) THEN true ELSE o.netsuite_active END AS netsuite_active,
                 o.sales_order_type AS delivery_method,
                 'sales_order'::text AS order_type,
                 NULL::bigint AS source_location_id,
@@ -817,7 +844,8 @@ export async function getDeliveryOrdersBatch(ids = []) {
                 NULL::bigint AS destination_location_id,
                 NULL::text AS destination_location
            FROM sales_orders o
-          WHERE o.netsuite_id = ANY($1::bigint[])`,
+          WHERE o.netsuite_id = ANY($1::bigint[])
+            AND (COALESCE(o.is_test_fixture, false) = false OR ${sandboxSql})`,
         [regularIds]
       );
     const lineResult = await query(
@@ -832,16 +860,21 @@ export async function getDeliveryOrdersBatch(ids = []) {
             WHERE status = 'active'
             GROUP BY sales_line_id
          )
-         SELECT l.*,
-                COALESCE(alloc.po_allocated_pallet_qty, 0) AS po_allocated_pallet_qty,
-                COALESCE(alloc.po_allocated_layer_qty, 0) AS po_allocated_layer_qty,
-                COALESCE(alloc.po_allocated_section_qty, 0) AS po_allocated_section_qty,
-                COALESCE(alloc.po_allocated_piece_qty, 0) AS po_allocated_piece_qty,
-                COALESCE(alloc.po_allocated_sales_qty, 0) AS po_allocated_sales_qty
-           FROM sales_order_lines l
+          SELECT l.*,
+                 CASE WHEN ${sandboxSql} AND COALESCE(o.is_test_fixture, false) THEN true ELSE l.netsuite_active END AS netsuite_active,
+                COALESCE(alloc.po_allocated_pallet_qty, 0) + ${activePoAllocationSql("pallet", "l")} - COALESCE(alloc.po_allocated_pallet_qty, 0) AS po_allocated_pallet_qty,
+                COALESCE(alloc.po_allocated_layer_qty, 0) + ${activePoAllocationSql("layer", "l")} - COALESCE(alloc.po_allocated_layer_qty, 0) AS po_allocated_layer_qty,
+                COALESCE(alloc.po_allocated_section_qty, 0) + ${activePoAllocationSql("section", "l")} - COALESCE(alloc.po_allocated_section_qty, 0) AS po_allocated_section_qty,
+                COALESCE(alloc.po_allocated_piece_qty, 0) + ${activePoAllocationSql("piece", "l")} - COALESCE(alloc.po_allocated_piece_qty, 0) AS po_allocated_piece_qty,
+                COALESCE(alloc.po_allocated_sales_qty, 0) + ${activePoAllocationSql("sales", "l")} - COALESCE(alloc.po_allocated_sales_qty, 0) AS po_allocated_sales_qty
+            FROM sales_order_lines l
+            JOIN sales_orders o ON o.netsuite_id = l.sales_order_id
            LEFT JOIN alloc ON alloc.sales_line_id = l.id
           WHERE l.sales_order_id = ANY($1::bigint[])
-            AND (l.netsuite_active = true OR l.sync_exception IS NOT NULL OR (${packedQtySql}) > 0)
+             AND (l.netsuite_active = true
+               OR (${sandboxSql} AND COALESCE(o.is_test_fixture, false))
+               OR l.sync_exception IS NOT NULL
+               OR (${packedQtySql}) > 0)
           ORDER BY l.sales_order_id, l.line_id NULLS LAST, l.id`,
         [regularIds]
       );
@@ -854,6 +887,7 @@ export async function getDeliveryOrdersBatch(ids = []) {
     for (const order of orderResult.rows) {
       ordersByKey.set(String(order.netsuite_id), {
         ...order,
+        testFixture: sandboxFixtures && order.is_test_fixture === true,
         lines: (linesByOrder.get(String(order.netsuite_id)) || []).filter(hasDeliveryDisplayQuantity)
       });
     }
@@ -1118,6 +1152,8 @@ async function listLocalCoDeliveryOrders({ locationId = null, status = "active",
 }
 
 export async function listDeliveryOrders({ locationId = null, status = "active", orderType = "sales_order", planDate = null, truckPlate = null } = {}) {
+  const sandboxFixtures = isNetSuiteSandboxEnvironment();
+  const sandboxSql = sandboxFixtures ? "true" : "false";
   const statuses = parseStatusFilter(status);
   const params = [];
   let locationClause = "";
@@ -1196,8 +1232,10 @@ export async function listDeliveryOrders({ locationId = null, status = "active",
        SELECT netsuite_id, tranid, trandate, customer_id, customer, status, status_text,
               foreign_total, order_location_id, order_location, outbound_location_id,
               outbound_location, delivery_method_id, sales_order_type AS delivery_method,
-              operator_status, local_yard_order_status, preparing_operator_id,
-              preparing_started_at, status_updated_at, netsuite_active, synced_at,
+               operator_status, local_yard_order_status, preparing_operator_id,
+               preparing_started_at, status_updated_at,
+               CASE WHEN ${sandboxSql} AND COALESCE(is_test_fixture, false) THEN true ELSE netsuite_active END AS netsuite_active,
+               is_test_fixture, synced_at,
               fulfillment_status, dispatch_planned, dispatch_plan_date, dispatch_planned_at, dispatch_truck_plate,
               dispatch_load_name, dispatch_parking_spot, expected_delivery_date,
               dispatch_address, dispatch_window_start, dispatch_window_end,
@@ -1206,6 +1244,7 @@ export async function listDeliveryOrders({ locationId = null, status = "active",
               NULL::bigint AS destination_location_id, NULL::text AS destination_location
        FROM sales_orders
        WHERE sales_order_type <> '${CUSTOMER_PICKUP_DELIVERY_METHOD.replaceAll("'", "''")}'
+         AND (COALESCE(is_test_fixture, false) = false OR ${sandboxSql})
        UNION ALL
        SELECT netsuite_id, tranid, trandate, NULL::bigint AS customer_id, NULL::text AS customer,
               status, status_text, NULL::numeric AS foreign_total, NULL::bigint AS order_location_id,
@@ -1213,7 +1252,7 @@ export async function listDeliveryOrders({ locationId = null, status = "active",
               from_location AS outbound_location, NULL::bigint AS delivery_method_id,
               NULL::text AS delivery_method, outbound_operator_status AS operator_status,
               local_yard_order_status, preparing_operator_id, preparing_started_at,
-              status_updated_at, netsuite_active, synced_at, fulfillment_status,
+               status_updated_at, netsuite_active, false AS is_test_fixture, synced_at, fulfillment_status,
               dispatch_planned, dispatch_plan_date, dispatch_planned_at, dispatch_truck_plate,
               dispatch_load_name, dispatch_parking_spot, expected_delivery_date,
               dispatch_address, dispatch_window_start, dispatch_window_end,
@@ -1225,23 +1264,35 @@ export async function listDeliveryOrders({ locationId = null, status = "active",
      ),
      delivery_line_source AS (
        SELECT sales_order_id AS order_id, id, line_id, item_id, item_name, sku,
-              item_description, item_type, item_type_text, quantity, unit,
-              pallet_qty, layer_qty, section_qty, piece_qty,
+              item_description, item_type, item_type_text,
+               GREATEST(COALESCE(quantity, 0) - ${activePoAllocationSql("sales", "l")}, 0) AS quantity, unit,
+               GREATEST(COALESCE(pallet_qty, 0) - ${activePoAllocationSql("pallet", "l")}, 0) AS pallet_qty,
+               GREATEST(COALESCE(layer_qty, 0) - ${activePoAllocationSql("layer", "l")}, 0) AS layer_qty,
+               GREATEST(COALESCE(section_qty, 0) - ${activePoAllocationSql("section", "l")}, 0) AS section_qty,
+               GREATEST(COALESCE(piece_qty, 0) - ${activePoAllocationSql("piece", "l")}, 0) AS piece_qty,
               packed_pallet_qty, packed_layer_qty, packed_section_qty, packed_piece_qty,
               to_plt, to_lyr, to_sec, to_pcs, loaded_qty, loaded_uom,
-              netsuite_active, sync_exception, synced_at
-       FROM sales_order_lines
+               CASE WHEN ${sandboxSql} AND COALESCE(o.is_test_fixture, false) THEN true ELSE l.netsuite_active END AS netsuite_active,
+               sync_exception, l.synced_at
+        FROM sales_order_lines l
+        JOIN sales_orders o ON o.netsuite_id = l.sales_order_id
        UNION ALL
        SELECT transfer_order_id AS order_id, id, line_id, item_id, item_name, sku,
               item_description, item_type, item_type_text, quantity, unit,
               pallet_qty, layer_qty, section_qty, piece_qty,
               packed_pallet_qty, packed_layer_qty, packed_section_qty, packed_piece_qty,
               to_plt, to_lyr, to_sec, to_pcs, loaded_qty, loaded_uom,
-              netsuite_active, sync_exception, synced_at
+               netsuite_active, sync_exception, synced_at
        FROM transfer_order_lines
        WHERE line_stage = 'outbound'
      )
      SELECT delivery_order_source.*,
+            EXISTS (
+              SELECT 1 FROM order_dependencies direct_dependency
+               WHERE direct_dependency.sales_order_id = delivery_order_source.netsuite_id
+                 AND direct_dependency.dependency_mode = 'direct_to_customer'
+                 AND direct_dependency.status <> 'cancelled'
+            ) AS direct_pickup_only,
             (
               SELECT COUNT(*)::int
               FROM delivery_line_source warning_line
@@ -1304,7 +1355,12 @@ export async function listDeliveryOrders({ locationId = null, status = "active",
           OR (order_type = 'transfer_order' AND (status_text ILIKE '%Pending Fulfillment%' OR status_text ILIKE '%Partially Fulfilled%' OR fulfillment_status = 'partial_fulfilled'))
         )
         AND fulfillment_status <> 'fulfilled'
-        AND ((${hasRemainingQty}) OR (${hasPackedQty}) OR (${hasProgressQty}))
+        AND ((${hasRemainingQty}) OR (${hasPackedQty}) OR (${hasProgressQty}) OR EXISTS (
+          SELECT 1 FROM order_dependencies direct_dependency
+           WHERE direct_dependency.sales_order_id = delivery_order_source.netsuite_id
+             AND direct_dependency.dependency_mode = 'direct_to_customer'
+             AND direct_dependency.status <> 'cancelled'
+        ))
      ORDER BY dispatch_planned DESC, warning_count DESC, underpack_count DESC, trandate DESC, tranid DESC`
     ,
     params
@@ -1313,29 +1369,35 @@ export async function listDeliveryOrders({ locationId = null, status = "active",
   const localCoRows = orderType === "sales_order"
     ? await listLocalCoDeliveryOrders({ locationId, status, planDate, truckPlate })
     : [];
-  if (!groupRows.length) return [...localCoRows, ...result.rows];
+  const markFixture = (order) => ({
+    ...order,
+    testFixture: sandboxFixtures && (/^TSTDEP-SO-/i.test(String(order.tranid || "")) || order.is_test_fixture === true)
+  });
+  if (!groupRows.length) return [...localCoRows, ...result.rows].map(markFixture);
   const groupedChildRefs = new Set(groupRows.flatMap((order) => order.child_order_refs || []));
   return [
     ...localCoRows,
     ...groupRows,
     ...result.rows.filter((row) => !groupedChildRefs.has(String(row.tranid || "")))
-  ];
+  ].map(markFixture);
 }
 
 export async function listDeliveryLoadTrucks({ locationId = null, planDate = null } = {}) {
   const date = dateOnly(planDate);
   if (!date) return [];
   const params = [date];
+  const sandboxSql = isNetSuiteSandboxEnvironment() ? "true" : "false";
   const locationClause = locationId ? `AND outbound_location_id = $${params.push(Number(locationId))}` : "";
   const result = await query(
     `WITH planned_delivery_orders AS (
        SELECT dispatch_truck_plate, dispatch_load_name, outbound_location_id, operator_status,
               local_yard_order_status, 'sales_order'::text AS order_type
          FROM sales_orders
-        WHERE dispatch_plan_date = $1
-          AND COALESCE(dispatch_truck_plate, '') <> ''
-          AND sales_order_type <> '${CUSTOMER_PICKUP_DELIVERY_METHOD.replaceAll("'", "''")}'
-          AND netsuite_active = true
+         WHERE dispatch_plan_date = $1
+           AND COALESCE(dispatch_truck_plate, '') <> ''
+           AND sales_order_type <> '${CUSTOMER_PICKUP_DELIVERY_METHOD.replaceAll("'", "''")}'
+            AND (COALESCE(is_test_fixture, false) = false OR ${sandboxSql})
+           AND (netsuite_active = true OR (${sandboxSql} AND COALESCE(is_test_fixture, false)))
        UNION ALL
        SELECT dispatch_truck_plate, dispatch_load_name, from_location_id AS outbound_location_id,
               outbound_operator_status AS operator_status, local_yard_order_status,
@@ -1581,13 +1643,17 @@ function buildDeliveryPrepNotifications({ locationId = null, salesActive = [], t
 export async function getDeliveryOrder(id) {
   if (isLocalCoRef(id)) return getLocalCoDeliveryOrder(id);
   if (isDispatchGroupOrderId(id)) return getDispatchGroupDeliveryOrder(id);
+  const sandboxFixtures = isNetSuiteSandboxEnvironment();
+  const sandboxSql = sandboxFixtures ? "true" : "false";
   const order = await query(
     `WITH delivery_order_source AS (
        SELECT netsuite_id, tranid, trandate, customer_id, customer, status, status_text,
               foreign_total, order_location_id, order_location, outbound_location_id,
               outbound_location, delivery_method_id, sales_order_type AS delivery_method,
               operator_status, local_yard_order_status, preparing_operator_id,
-              preparing_started_at, status_updated_at, netsuite_active, synced_at,
+               preparing_started_at, status_updated_at,
+               CASE WHEN ${sandboxSql} AND COALESCE(is_test_fixture, false) THEN true ELSE netsuite_active END AS netsuite_active,
+               is_test_fixture, synced_at,
               fulfillment_status, dispatch_planned, dispatch_plan_date, dispatch_planned_at, dispatch_truck_plate,
               dispatch_load_name, dispatch_parking_spot, expected_delivery_date,
               dispatch_address, dispatch_window_start, dispatch_window_end,
@@ -1595,6 +1661,7 @@ export async function getDeliveryOrder(id) {
               NULL::bigint AS source_location_id, NULL::text AS source_location,
               NULL::bigint AS destination_location_id, NULL::text AS destination_location
        FROM sales_orders
+       WHERE COALESCE(is_test_fixture, false) = false OR ${sandboxSql}
        UNION ALL
        SELECT netsuite_id, tranid, trandate, NULL::bigint AS customer_id, NULL::text AS customer,
               status, status_text, NULL::numeric AS foreign_total, NULL::bigint AS order_location_id,
@@ -1602,7 +1669,7 @@ export async function getDeliveryOrder(id) {
               from_location AS outbound_location, NULL::bigint AS delivery_method_id,
               NULL::text AS delivery_method, outbound_operator_status AS operator_status,
               local_yard_order_status, preparing_operator_id, preparing_started_at,
-              status_updated_at, netsuite_active, synced_at, fulfillment_status,
+               status_updated_at, netsuite_active, false AS is_test_fixture, synced_at, fulfillment_status,
               dispatch_planned, dispatch_plan_date, dispatch_planned_at, dispatch_truck_plate,
               dispatch_load_name, dispatch_parking_spot, expected_delivery_date,
               dispatch_address, dispatch_window_start, dispatch_window_end,
@@ -1619,8 +1686,10 @@ export async function getDeliveryOrder(id) {
               packed_pallet_qty, packed_layer_qty, packed_section_qty, packed_piece_qty,
               fulfilled_pallet_qty, fulfilled_layer_qty, fulfilled_piece_qty, fulfilled_section_qty,
               to_plt, to_lyr, to_sec, to_pcs, loaded_qty, loaded_uom,
-              netsuite_active, sync_exception, synced_at
-       FROM sales_order_lines
+               CASE WHEN ${sandboxSql} AND COALESCE(o.is_test_fixture, false) THEN true ELSE l.netsuite_active END AS netsuite_active,
+               sync_exception, l.synced_at
+        FROM sales_order_lines l
+        JOIN sales_orders o ON o.netsuite_id = l.sales_order_id
        UNION ALL
        SELECT transfer_order_id AS order_id, id, line_id, item_id, item_name, sku,
               item_description, item_type, item_type_text, quantity, unit,
@@ -1628,7 +1697,7 @@ export async function getDeliveryOrder(id) {
               packed_pallet_qty, packed_layer_qty, packed_section_qty, packed_piece_qty,
               fulfilled_pallet_qty, fulfilled_layer_qty, fulfilled_piece_qty, fulfilled_section_qty,
               to_plt, to_lyr, to_sec, to_pcs, loaded_qty, loaded_uom,
-              netsuite_active, sync_exception, synced_at
+               netsuite_active, sync_exception, synced_at
        FROM transfer_order_lines
        WHERE line_stage = 'outbound'
      )
@@ -1691,8 +1760,10 @@ export async function getDeliveryOrder(id) {
               packed_pallet_qty, packed_layer_qty, packed_section_qty, packed_piece_qty,
               fulfilled_pallet_qty, fulfilled_layer_qty, fulfilled_piece_qty, fulfilled_section_qty,
               to_plt, to_lyr, to_sec, to_pcs, loaded_qty, loaded_uom,
-              netsuite_active, sync_exception, synced_at
-       FROM sales_order_lines
+               CASE WHEN ${sandboxSql} AND COALESCE(o.is_test_fixture, false) THEN true ELSE l.netsuite_active END AS netsuite_active,
+               sync_exception, l.synced_at
+        FROM sales_order_lines l
+        JOIN sales_orders o ON o.netsuite_id = l.sales_order_id
        UNION ALL
        SELECT transfer_order_id AS order_id, id, line_id, item_id, item_name, sku,
               item_description, item_type, item_type_text, quantity, unit,
@@ -1705,11 +1776,11 @@ export async function getDeliveryOrder(id) {
        WHERE line_stage = 'outbound'
      )
      SELECT delivery_line_source.*,
-            COALESCE(alloc.po_allocated_pallet_qty, 0) AS po_allocated_pallet_qty,
-            COALESCE(alloc.po_allocated_layer_qty, 0) AS po_allocated_layer_qty,
-            COALESCE(alloc.po_allocated_section_qty, 0) AS po_allocated_section_qty,
-            COALESCE(alloc.po_allocated_piece_qty, 0) AS po_allocated_piece_qty,
-            COALESCE(alloc.po_allocated_sales_qty, 0) AS po_allocated_sales_qty
+            ${activePoAllocationSql("pallet", "delivery_line_source")} AS po_allocated_pallet_qty,
+            ${activePoAllocationSql("layer", "delivery_line_source")} AS po_allocated_layer_qty,
+            ${activePoAllocationSql("section", "delivery_line_source")} AS po_allocated_section_qty,
+            ${activePoAllocationSql("piece", "delivery_line_source")} AS po_allocated_piece_qty,
+            ${activePoAllocationSql("sales", "delivery_line_source")} AS po_allocated_sales_qty
      FROM delivery_line_source
      LEFT JOIN alloc ON alloc.sales_line_id = delivery_line_source.id
      WHERE order_id = $1
@@ -1724,6 +1795,7 @@ export async function getDeliveryOrder(id) {
 
   return {
     ...order.rows[0],
+    testFixture: sandboxFixtures && order.rows[0].is_test_fixture === true,
     lines: lines.rows
       .map(applyDeliveryAllocationFields)
       .filter(hasDeliveryDisplayQuantity)
@@ -1771,7 +1843,8 @@ export async function findCustomerPickupOrder(code, { locationId = null } = {}) 
         AND sales_order_type = $${params.length + 1}
         AND NOT (status = 'A' OR status_text ILIKE '%Pending Approval%')
         AND LOWER(COALESCE(local_yard_order_status, 'Open')) IN ('open', 'partial_loaded', 'partially loaded', 'loaded')
-        AND netsuite_active = true
+         AND netsuite_active = true
+         AND COALESCE(is_test_fixture, false) = false
       LIMIT 1`,
     [...params, CUSTOMER_PICKUP_DELIVERY_METHOD]
   );

@@ -1,0 +1,440 @@
+const scmDependencyApp = document.getElementById("scmDependencyApp");
+const DEPENDENCY_YARDS = [
+  { id: 1, code: "3445" },
+  { id: 28, code: "2967" },
+  { id: 15, code: "12441" },
+  { id: 26, code: "150" }
+];
+
+const dependencyState = {
+  operator: null,
+  candidates: [],
+  selectedSalesOrderId: null,
+  inventory: null,
+  batch: null,
+  search: "",
+  reviewStatus: "open",
+  busy: "",
+  notice: "",
+  error: ""
+};
+
+function depEscape(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function depNumber(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function depQty(value) {
+  const amount = depNumber(value);
+  return new Intl.NumberFormat("en-CA", { maximumFractionDigits: 3 }).format(amount);
+}
+
+function depDate(value) {
+  if (!value) return "No delivery date";
+  return window.MBBS_I18N?.formatDate?.(value) || String(value).slice(0, 10);
+}
+
+function depUnitText(line = {}, quantityField = "unresolvedQuantity") {
+  const parts = [
+    [line.palletQty, "PLT"],
+    [line.layerQty, "LYR"],
+    [line.sectionQty, "SEC"],
+    [line.pieceQty, line.toPcs || line.to_pcs ? "PCS" : ""]
+  ].filter(([value, unit]) => depNumber(value) > 0 && unit).map(([value, unit]) => `${depQty(value)} ${unit}`);
+  return parts.length ? parts.join(" ") : `${depQty(line[quantityField])} ${line.unit || "UOM"}`;
+}
+
+async function depApi(path, options = {}) {
+  const response = await fetch(path, {
+    ...options,
+    headers: { "Content-Type": "application/json", ...(options.headers || {}) }
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) throw new Error(payload?.error || response.statusText || "Request failed");
+  return payload;
+}
+
+function depSelectedOrder() {
+  return dependencyState.candidates.find((order) => String(order.salesOrderId) === String(dependencyState.selectedSalesOrderId)) || null;
+}
+
+function depCandidateQuery() {
+  const params = new URLSearchParams({ reviewStatus: dependencyState.reviewStatus });
+  if (dependencyState.search) params.set("search", dependencyState.search);
+  return `?${params.toString()}`;
+}
+
+function depYardOptions(selected) {
+  return DEPENDENCY_YARDS.map((yard) => `<option value="${yard.id}" ${String(yard.id) === String(selected) ? "selected" : ""}>${yard.code}</option>`).join("");
+}
+
+function renderDependencyCandidates() {
+  if (!dependencyState.candidates.length) {
+    return `<div class="empty-state">${dependencyState.reviewStatus === "completed"
+      ? "No completed Auto Transfer reviews."
+      : "No open Sales Order shortages."}</div>`;
+  }
+  return dependencyState.candidates.map((order) => `
+    <button class="scm-dependency-order ${String(order.salesOrderId) === String(dependencyState.selectedSalesOrderId) ? "selected" : ""}"
+      data-action="select-order" data-order-id="${order.salesOrderId}" type="button">
+      <span><strong class="scm-dependency-order-ref">${depEscape(order.salesOrderRef)}${order.testFixture ? `<b class="scm-dependency-test-badge">TEST</b>` : ""}</strong><small>${depEscape(order.customer || "")}</small></span>
+      <span class="scm-dependency-order-side"><b>${depQty(order.uncoveredQuantity)}</b><small>uncovered</small></span>
+      <small>${depEscape(order.outboundLocation || "--")} | ${depEscape(depDate(order.expectedDeliveryDate))}${order.completionType === "reviewed_no_transfer" ? " | Reviewed - No Transfer" : order.completionType === "transfer_created" ? " | Transfer Orders Created" : ""}</small>
+    </button>
+  `).join("");
+}
+
+function renderInventoryMatrix() {
+  const order = depSelectedOrder();
+  if (!order) return `<div class="empty-state">Select a Sales Order to review shortages.</div>`;
+  const matrix = dependencyState.inventory;
+  if (!matrix) return `<div class="empty-state">Loading inventory coverage...</div>`;
+  const byItem = new Map((matrix?.items || []).map((item) => [String(item.itemId), item]));
+  const coverage = order.lines.map((line) => {
+    const item = byItem.get(String(line.itemId));
+    const available = (item?.balances || [])
+      .filter((balance) => String(balance.locationId) !== String(order.outboundLocationId))
+      .reduce((total, balance) => total + depNumber(balance.effectiveAvailable), 0);
+    const required = depNumber(line.unresolvedQuantity);
+    return { line, required, available, shortfall: Math.max(0, required - available) };
+  });
+  const impossible = coverage.filter((entry) => entry.shortfall > 0.000001);
+  return `
+    <div class="scm-dependency-order-summary">
+      <div><span>Sales Order</span><strong>${depEscape(order.salesOrderRef)}</strong></div>
+      <div><span>Outbound Yard</span><strong>${depEscape(order.outboundLocation || "--")}</strong></div>
+      <div><span>Uncovered</span><strong>${depQty(order.uncoveredQuantity)}</strong></div>
+    </div>
+    ${impossible.length ? `<div class="scm-dependency-coverage-warning" role="alert">
+      <strong>Cannot fully cover this Sales Order from the other yards</strong>
+      <span>${impossible.map(({ line, required, available, shortfall }) => `${depEscape(line.sku || line.itemName)}: required ${depQty(required)}, all source yards ${depQty(available)}, still short ${depQty(shortfall)}`).join("<br>")}</span>
+    </div>` : ""}
+    <div class="scm-dependency-review-action">
+      <span>${order.completionType === "transfer_created"
+        ? `Transfer Orders were created${order.completedAt ? ` on ${depEscape(depDate(order.completedAt))}` : ""}.`
+        : order.reviewed
+          ? `Reviewed${order.reviewedAt ? ` on ${depEscape(depDate(order.reviewedAt))}` : ""}. This order cannot generate a transfer proposal.`
+          : "No transfer needed? Mark only this SCM shortage review; dispatch and operator status stay unchanged."}</span>
+      ${order.completionType === "transfer_created" ? "" : `<button data-action="${order.reviewed ? "reopen-review" : "review-no-transfer"}" type="button" ${dependencyState.busy ? "disabled" : ""}>
+        ${order.reviewed ? "Undo Review" : "Mark Reviewed - No Transfer"}
+      </button>`}
+    </div>
+    <div class="scm-dependency-matrix-wrap">
+      <div class="scm-dependency-matrix-head">
+        <strong>Item / Required</strong>${DEPENDENCY_YARDS.map((yard) => `<strong>${yard.code}</strong>`).join("")}
+      </div>
+      ${coverage.map(({ line, shortfall }) => {
+        const item = byItem.get(String(line.itemId));
+        return `<div class="scm-dependency-matrix-row ${shortfall > 0.000001 ? "coverage-impossible" : ""}">
+          <div><strong>${depEscape(line.sku || line.itemName)}</strong><small>${depEscape(depUnitText(line))}</small></div>
+          ${DEPENDENCY_YARDS.map((yard) => {
+            const balance = item?.balances?.find((entry) => String(entry.locationId) === String(yard.id));
+            return `<div><b>${depQty(balance?.effectiveAvailable)}</b><small>${depQty(balance?.reservedQuantity)} reserved</small></div>`;
+          }).join("")}
+        </div>`;
+      }).join("")}
+    </div>
+  `;
+}
+
+function renderProposal(proposal) {
+  const editable = !["created", "creating", "attention"].includes(proposal.creationStatus);
+  return `
+    <article class="scm-dependency-proposal" data-proposal-id="${proposal.id}">
+      <header>
+        <strong>${depEscape(proposal.transferOrderRef || `Proposed TO ${proposal.id}`)}</strong>
+        <span class="dependency-status status-${depEscape(proposal.creationStatus)}">${depEscape(proposal.creationStatus)}</span>
+      </header>
+      <div class="scm-dependency-proposal-route">
+        <label><span>Mode</span><select data-proposal-field="mode" ${editable ? "" : "disabled"}>
+          <option value="yard_replenishment" ${proposal.mode === "yard_replenishment" ? "selected" : ""}>Replenish yard</option>
+          <option value="direct_to_customer" ${proposal.mode === "direct_to_customer" ? "selected" : ""}>Direct pickup</option>
+        </select></label>
+        <label><span>From</span><select data-proposal-field="fromLocationId" ${editable ? "" : "disabled"}>${depYardOptions(proposal.fromLocationId)}</select></label>
+        <label><span>Accounting To</span><select data-proposal-field="toLocationId" ${editable ? "" : "disabled"}>${depYardOptions(proposal.toLocationId)}</select></label>
+        <div><span>Route score</span><strong>${proposal.routeScore === null ? "Fallback" : `${depQty(proposal.routeScore)} min`}</strong></div>
+      </div>
+      <label class="scm-dependency-memo"><span>Memo</span><input data-proposal-field="memo" value="${depEscape(proposal.memo || "")}" ${editable ? "" : "disabled"} /></label>
+      <div class="scm-dependency-proposal-lines">
+        ${proposal.lines.map((line) => `<label data-sales-line-id="${line.salesLineId}">
+          <span><strong>${depEscape(line.itemName)}</strong><small>${depEscape(line.unit || "")}</small></span>
+          <input data-line-field="proposedQuantity" type="number" min="0.001" step="0.001" value="${depNumber(line.proposedQuantity)}" ${editable ? "" : "disabled"} />
+        </label>`).join("")}
+      </div>
+      <div class="scm-dependency-pallet-summary">
+        <div><span>Calculated PALLET</span><strong>${depQty(proposal.calculatedPalletQuantity)}</strong></div>
+        <label><span>Final PALLET quantity</span>
+          <input data-proposal-field="palletTransferQuantity" type="number" min="0" step="1"
+            value="${!proposal.palletCalculationComplete && !proposal.palletQuantityOverridden ? "" : depNumber(proposal.palletTransferQuantity)}"
+            placeholder="${depNumber(proposal.palletTransferQuantity)}" ${editable ? "" : "disabled"} />
+        </label>
+        <small class="${proposal.palletCalculationComplete ? "" : "warning-text"}">${proposal.palletCalculationComplete
+          ? "One PALLET per full PLT, plus one for each SKU with loose remainder."
+          : "Manual quantity required: at least one item has no PLT conversion."}</small>
+      </div>
+      ${proposal.creationError ? `<div class="scm-dependency-error">${depEscape(proposal.creationError)}</div>` : ""}
+    </article>
+  `;
+}
+
+function renderDependencyProposals() {
+  const batch = dependencyState.batch;
+  if (!batch) return `<div class="empty-state">Generate a suggestion to create editable transfer proposals.</div>`;
+  return `
+    <div class="scm-dependency-batch-head">
+      <div><span>Batch</span><strong>#${batch.id} | ${depEscape(batch.status)}</strong></div>
+      <div><span>Uncovered</span><strong class="${batch.uncoveredShortageQuantity > 0 ? "warning-text" : ""}">${depQty(batch.uncoveredShortageQuantity)}</strong></div>
+    </div>
+    <div class="scm-dependency-proposal-list">${batch.proposals.map(renderProposal).join("") || `<div class="empty-state">No source yard has available stock.</div>`}</div>
+    <label class="scm-dependency-incomplete">
+      <input data-field="allow-incomplete" type="checkbox" ${batch.allowIncompleteCoverage ? "checked" : ""} />
+      <span>I understand this creates only partial shortage coverage.</span>
+    </label>
+  `;
+}
+
+function renderDependencyPage() {
+  const activeId = document.activeElement?.id;
+  const selection = document.activeElement?.selectionStart;
+  const scrollPositions = new Map([...scmDependencyApp.querySelectorAll("[data-preserve-scroll]")]
+    .map((element) => [element.dataset.preserveScroll, element.scrollTop]));
+  const operator = dependencyState.operator || {};
+  const selectedOrder = depSelectedOrder();
+  scmDependencyApp.innerHTML = `
+    <header class="dispatch-topbar">
+      <div><p>SCM</p><h1>Auto Transfer</h1></div>
+      <div class="topbar-language">${window.MBBS_I18N?.toggleHtml() || ""}</div>
+      <div class="topbar-actions">
+        <span class="dispatch-user">${depEscape(operator.display_name || operator.username || "")}</span>
+        <button onclick="location.href='/scm'" type="button">SCM Menu</button>
+        <button onclick="dispatchLogout()" type="button">Logout</button>
+      </div>
+    </header>
+    ${dependencyState.notice || dependencyState.error ? `<div class="route-notice scm-notice ${dependencyState.error ? "error" : ""}">
+      <span>${depEscape(dependencyState.error || dependencyState.notice)}</span>
+      <button class="scm-notice-close" data-action="close-notice" type="button" aria-label="Close">&times;</button>
+    </div>` : ""}
+    <section class="scm-dependency-toolbar">
+      <button data-action="refresh-inventory" type="button" ${dependencyState.selectedSalesOrderId && !selectedOrder?.completed && !dependencyState.busy ? "" : "disabled"}>Refresh Inventory</button>
+      <select data-field="suggest-mode">
+        <option value="yard_replenishment">Replenish outbound yard</option>
+        <option value="direct_to_customer">Direct pickup to customer</option>
+      </select>
+      <button class="primary-action" data-action="generate" type="button" ${dependencyState.selectedSalesOrderId && !selectedOrder?.completed && !dependencyState.busy ? "" : "disabled"}>Generate Suggestion</button>
+      <span class="scm-dependency-busy">${depEscape(dependencyState.busy)}</span>
+    </section>
+    <section class="scm-dependency-grid">
+      <aside class="scm-dependency-panel scm-dependency-candidates">
+        <div class="panel-title scm-dependency-candidate-title">
+          <div><p>${dependencyState.reviewStatus === "completed" ? "Completed reviews" : "Open shortages"}</p><h2>Sales Orders</h2></div>
+          <div class="scm-dependency-review-tabs" role="group" aria-label="Review status">
+            <button class="${dependencyState.reviewStatus === "open" ? "active" : ""}" data-action="set-review-filter" data-review-status="open" type="button">Open</button>
+            <button class="${dependencyState.reviewStatus === "completed" ? "active" : ""}" data-action="set-review-filter" data-review-status="completed" type="button">Completed</button>
+          </div>
+        </div>
+        <div class="scm-dependency-search"><input id="dependencySearch" data-field="candidate-search" value="${depEscape(dependencyState.search)}" placeholder="SO / customer / item" /></div>
+        <div class="scm-dependency-order-list" data-preserve-scroll="orders">${renderDependencyCandidates()}</div>
+      </aside>
+      <section class="scm-dependency-panel scm-dependency-inventory">
+        <div class="panel-title"><div><p>Base quantity</p><h2>Shortage & Inventory</h2></div></div>
+        <div class="scm-dependency-panel-scroll" data-preserve-scroll="inventory">${renderInventoryMatrix()}</div>
+      </section>
+      <section class="scm-dependency-panel scm-dependency-proposals">
+        <div class="panel-title">
+          <div><p>NetSuite Transfer Orders</p><h2>Proposals</h2></div>
+          <div class="scm-dependency-actions">
+            <button data-action="save-batch" type="button" ${dependencyState.batch && !dependencyState.busy ? "" : "disabled"}>Save Draft</button>
+            ${dependencyState.batch?.proposals?.some((proposal) => proposal.creationStatus === "failed")
+              ? `<button class="primary-action" data-action="retry-batch" type="button" ${dependencyState.busy ? "disabled" : ""}>Retry Failed</button>`
+              : `<button class="primary-action" data-action="confirm-batch" type="button" ${dependencyState.batch && !dependencyState.busy ? "" : "disabled"}>Create Transfer Orders</button>`}
+          </div>
+        </div>
+        <div class="scm-dependency-panel-scroll" data-preserve-scroll="proposals">${renderDependencyProposals()}</div>
+      </section>
+    </section>
+  `;
+  for (const [key, scrollTop] of scrollPositions) {
+    const element = scmDependencyApp.querySelector(`[data-preserve-scroll="${key}"]`);
+    if (element) element.scrollTop = scrollTop;
+  }
+  if (activeId) {
+    const next = document.getElementById(activeId);
+    next?.focus();
+    if (next && Number.isInteger(selection)) next.setSelectionRange(selection, selection);
+  }
+}
+
+async function loadDependencyCandidates({ preserveSelection = true } = {}) {
+  dependencyState.candidates = await depApi(`/api/scm/transfer-dependencies/candidates${depCandidateQuery()}`);
+  if (!preserveSelection || !dependencyState.candidates.some((order) => String(order.salesOrderId) === String(dependencyState.selectedSalesOrderId))) {
+    dependencyState.selectedSalesOrderId = dependencyState.candidates[0]?.salesOrderId || null;
+    dependencyState.batch = null;
+  }
+  if (dependencyState.selectedSalesOrderId) {
+    dependencyState.inventory = await depApi(`/api/scm/transfer-dependencies/candidates/${dependencyState.selectedSalesOrderId}/inventory`);
+  } else {
+    dependencyState.inventory = null;
+  }
+}
+
+function collectDependencyBatchPayload() {
+  const batch = dependencyState.batch;
+  return {
+    allowIncompleteCoverage: scmDependencyApp.querySelector('[data-field="allow-incomplete"]')?.checked === true,
+    proposals: [...scmDependencyApp.querySelectorAll(".scm-dependency-proposal")].map((card) => ({
+      id: Number(card.dataset.proposalId),
+      mode: card.querySelector('[data-proposal-field="mode"]')?.value,
+      fromLocationId: Number(card.querySelector('[data-proposal-field="fromLocationId"]')?.value),
+      toLocationId: Number(card.querySelector('[data-proposal-field="toLocationId"]')?.value),
+      memo: card.querySelector('[data-proposal-field="memo"]')?.value,
+      palletTransferQuantity: (() => {
+        const value = card.querySelector('[data-proposal-field="palletTransferQuantity"]')?.value;
+        return value === "" || value === undefined ? null : Number(value);
+      })(),
+      lines: [...card.querySelectorAll("[data-sales-line-id]")].map((row) => ({
+        salesLineId: Number(row.dataset.salesLineId),
+        proposedQuantity: Number(row.querySelector('[data-line-field="proposedQuantity"]')?.value)
+      }))
+    }))
+  };
+}
+
+async function runDependencyAction(label, action) {
+  if (dependencyState.busy) return;
+  dependencyState.busy = label;
+  dependencyState.error = "";
+  dependencyState.notice = "";
+  renderDependencyPage();
+  try {
+    await action();
+  } catch (error) {
+    dependencyState.error = error.message;
+  } finally {
+    dependencyState.busy = "";
+    renderDependencyPage();
+  }
+}
+
+let dependencySearchTimer = null;
+scmDependencyApp.addEventListener("input", (event) => {
+  if (event.target.dataset.field !== "candidate-search") return;
+  dependencyState.search = event.target.value;
+  clearTimeout(dependencySearchTimer);
+  dependencySearchTimer = setTimeout(() => runDependencyAction("Searching...", () => loadDependencyCandidates({ preserveSelection: false })), 250);
+});
+
+scmDependencyApp.addEventListener("click", async (event) => {
+  const target = event.target.closest("[data-action]");
+  if (!target) return;
+  const action = target.dataset.action;
+  if (action === "close-notice") {
+    dependencyState.notice = "";
+    dependencyState.error = "";
+    renderDependencyPage();
+    return;
+  }
+  if (action === "select-order") {
+    dependencyState.selectedSalesOrderId = target.dataset.orderId;
+    dependencyState.batch = null;
+    dependencyState.inventory = null;
+    await runDependencyAction("Loading inventory...", async () => {
+      dependencyState.inventory = await depApi(`/api/scm/transfer-dependencies/candidates/${dependencyState.selectedSalesOrderId}/inventory`);
+    });
+    return;
+  }
+  if (action === "set-review-filter") {
+    const status = target.dataset.reviewStatus === "completed" ? "completed" : "open";
+    if (status === dependencyState.reviewStatus) return;
+    dependencyState.reviewStatus = status;
+    await runDependencyAction("Loading shortages...", () => loadDependencyCandidates({ preserveSelection: false }));
+    return;
+  }
+  if (action === "review-no-transfer") {
+    const order = depSelectedOrder();
+    if (!order || !window.confirm(`Mark ${order.salesOrderRef} as Reviewed - No Transfer? This does not change dispatch or operator eligibility.`)) return;
+    await runDependencyAction("Saving review...", async () => {
+      await depApi(`/api/scm/transfer-dependencies/candidates/${order.salesOrderId}/review`, { method: "POST", body: "{}" });
+      dependencyState.notice = `${order.salesOrderRef} moved to Completed. Dispatch and operator status were not changed.`;
+      await loadDependencyCandidates({ preserveSelection: false });
+    });
+    return;
+  }
+  if (action === "reopen-review") {
+    const order = depSelectedOrder();
+    if (!order) return;
+    await runDependencyAction("Reopening shortage...", async () => {
+      await depApi(`/api/scm/transfer-dependencies/candidates/${order.salesOrderId}/review`, { method: "DELETE" });
+      dependencyState.notice = `${order.salesOrderRef} returned to the Open queue.`;
+      await loadDependencyCandidates({ preserveSelection: false });
+    });
+    return;
+  }
+  if (action === "refresh-inventory") {
+    await runDependencyAction("Refreshing NetSuite inventory...", async () => {
+      dependencyState.inventory = await depApi(`/api/scm/transfer-dependencies/candidates/${dependencyState.selectedSalesOrderId}/refresh-inventory`, { method: "POST", body: "{}" });
+      dependencyState.notice = "Inventory refreshed from NetSuite.";
+    });
+    return;
+  }
+  if (action === "generate") {
+    const mode = scmDependencyApp.querySelector('[data-field="suggest-mode"]')?.value || "yard_replenishment";
+    await runDependencyAction("Calculating routes and allocations...", async () => {
+      dependencyState.batch = await depApi("/api/scm/transfer-dependencies/suggestions", {
+        method: "POST",
+        body: JSON.stringify({ salesOrderId: dependencyState.selectedSalesOrderId, mode, refreshInventory: true })
+      });
+      dependencyState.inventory = await depApi(`/api/scm/transfer-dependencies/candidates/${dependencyState.selectedSalesOrderId}/inventory`);
+      dependencyState.notice = `Suggestion created for ${dependencyState.batch.salesOrderRef}.`;
+    });
+    return;
+  }
+  if (action === "save-batch") {
+    await runDependencyAction("Saving draft...", async () => {
+      dependencyState.batch = await depApi(`/api/scm/transfer-dependencies/batches/${dependencyState.batch.id}`, {
+        method: "PUT",
+        body: JSON.stringify(collectDependencyBatchPayload())
+      });
+      dependencyState.notice = "Dependency draft saved.";
+    });
+    return;
+  }
+  if (action === "confirm-batch" || action === "retry-batch") {
+    const verb = action === "retry-batch" ? "retry" : "confirm";
+    if (!window.confirm("Create these Transfer Orders in NetSuite? Successful orders cannot be rolled back from this screen.")) return;
+    await runDependencyAction("Creating NetSuite Transfer Orders...", async () => {
+      dependencyState.batch = await depApi(`/api/scm/transfer-dependencies/batches/${dependencyState.batch.id}`, {
+        method: "PUT",
+        body: JSON.stringify(collectDependencyBatchPayload())
+      });
+      const result = await depApi(`/api/scm/transfer-dependencies/batches/${dependencyState.batch.id}/${verb}`, { method: "POST", body: "{}" });
+      dependencyState.batch = result.batch;
+      const createdCount = result.results.filter((entry) => entry.status === "created").length;
+      const attentionCount = result.results.filter((entry) => entry.status === "attention").length;
+      dependencyState.notice = `${createdCount} Transfer Order proposal(s) created.${attentionCount ? ` ${attentionCount} need attention; review the NetSuite status shown below.` : ""}`;
+      dependencyState.candidates = await depApi(`/api/scm/transfer-dependencies/candidates${depCandidateQuery()}`);
+      if (dependencyState.selectedSalesOrderId) {
+        dependencyState.inventory = await depApi(`/api/scm/transfer-dependencies/candidates/${dependencyState.selectedSalesOrderId}/inventory`);
+      }
+    });
+  }
+});
+
+window.addEventListener("mbbs-language-changed", renderDependencyPage);
+
+requireDispatchLogin({
+  mount: scmDependencyApp,
+  roles: ["admin", "scm", "scm_staff"],
+  async onReady(operator) {
+    dependencyState.operator = operator;
+    await runDependencyAction("Loading shortages...", () => loadDependencyCandidates({ preserveSelection: false }));
+  }
+});
