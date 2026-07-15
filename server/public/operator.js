@@ -2497,7 +2497,8 @@ function renderFulfillmentScreen() {
         <span>${t("operator.photoProof", "Photo proof")}</span>
         <strong>${t("operator.loadedOnTruck", "Loaded on truck")}</strong>
         <div class="camera-actions">
-          <button class="primary-button" data-action="start-camera" type="button">${fulfillmentCameraActive ? "Restart camera" : "Open camera"}</button>
+          <input id="fulfillmentPhoto" accept="image/*" capture="${cameraCaptureMode()}" type="file" hidden />
+          <button class="primary-button" data-action="start-camera" type="button">${t("common.openCamera", "Open camera")}</button>
           ${renderCameraSwitchButton("switch-fulfillment-camera")}
         </div>
         ${fulfillmentCameraActive ? `
@@ -3670,6 +3671,13 @@ function attachFulfillmentCamera() {
 }
 
 async function startFulfillmentCamera() {
+  const nativeCamera = document.getElementById("fulfillmentPhoto");
+  if (nativeCamera) {
+    stopFulfillmentCamera();
+    nativeCamera.value = "";
+    nativeCamera.click();
+    return;
+  }
   if (!navigator.mediaDevices?.getUserMedia) {
     showToast("Camera is not available in this browser.");
     return;
@@ -3843,7 +3851,8 @@ function renderReceiptScreen() {
         <span>${t("operator.photoProof", "Photo proof")}</span>
         <strong>${t("operator.truckPhotos", "Truck photos")}</strong>
         <div class="camera-actions">
-          <button class="primary-button" data-action="start-receipt-camera" type="button">${receiptCameraActive ? "Restart camera" : "Open camera"}</button>
+          <input id="receiptPhoto" accept="image/*" capture="${cameraCaptureMode()}" type="file" hidden />
+          <button class="primary-button" data-action="start-receipt-camera" type="button">${t("common.openCamera", "Open camera")}</button>
           ${renderCameraSwitchButton("switch-receipt-camera")}
         </div>
         <div class="photo-slot-row">
@@ -3941,6 +3950,13 @@ function attachReceiptCamera() {
 }
 
 async function startReceiptCamera() {
+  const nativeCamera = document.getElementById("receiptPhoto");
+  if (nativeCamera) {
+    stopReceiptCamera();
+    nativeCamera.value = "";
+    nativeCamera.click();
+    return;
+  }
   if (!navigator.mediaDevices?.getUserMedia) return showToast("Camera is not available in this browser.");
   stopReceiptCamera();
   receiptCameraStream = await openCameraStream();
