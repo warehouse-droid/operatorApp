@@ -113,7 +113,7 @@ function conversionDisplay(quantity, line = {}) {
   return result;
 }
 
-function conversionSelection(quantity, line = {}) {
+export function transferProposalConversionSelection(quantity, line = {}) {
   const salesQty = number(quantity);
   const conversions = {
     pallets: number(line.toPlt ?? line.to_plt),
@@ -128,7 +128,19 @@ function conversionSelection(quantity, line = {}) {
     to_sec: conversions.sections,
     to_pcs: conversions.pieces
   }) : { palletQty: 0, layerQty: 0, sectionQty: 0, pieceQty: 0 };
+  if (hasConversion && conversions.layers > EPSILON) {
+    converted.layerQty = Math.max(0, Math.round(number(converted.layerQty)));
+  }
+  const convertedSalesQty = hasConversion
+    ? Number((
+      (number(converted.palletQty) * conversions.pallets)
+      + (number(converted.layerQty) * conversions.layers)
+      + (number(converted.sectionQty) * conversions.sections)
+      + (number(converted.pieceQty) * conversions.pieces)
+    ).toFixed(6))
+    : salesQty;
   return {
+    salesQty: convertedSalesQty,
     hasConversion,
     conversions,
     available: hasConversion ? {
@@ -148,6 +160,8 @@ function conversionSelection(quantity, line = {}) {
   };
 }
 
+const conversionSelection = transferProposalConversionSelection;
+
 function allocationSalesQuantity(allocation = {}, targetLine = {}) {
   if (!allocation.quantities || typeof allocation.quantities !== "object") {
     const quantity = number(allocation.quantity);
@@ -163,7 +177,7 @@ function allocationSalesQuantity(allocation = {}, targetLine = {}) {
   }
   const quantities = {
     pallets: number(allocation.quantities.pallets),
-    layers: number(allocation.quantities.layers),
+    layers: Math.max(0, Math.round(number(allocation.quantities.layers))),
     sections: number(allocation.quantities.sections),
     pieces: number(allocation.quantities.pieces),
     salesQty: number(allocation.quantities.salesQty)
@@ -968,6 +982,9 @@ export async function generateTransferDependencySuggestion({ salesOrderId, mode 
       const available = number(balance?.effectiveAvailable);
       if (available <= EPSILON) continue;
       const allocated = Math.min(remaining, available);
+      const selection = transferProposalConversionSelection(allocated, line);
+      const finalAllocated = selection.hasConversion ? selection.salesQty : allocated;
+      if (finalAllocated <= EPSILON) continue;
       const groupKey = `${yard.locationId}:${destination.locationId}`;
       if (!proposalGroups.has(groupKey)) {
         proposalGroups.set(groupKey, {
@@ -990,14 +1007,17 @@ export async function generateTransferDependencySuggestion({ salesOrderId, mode 
         itemName: line.itemName,
         sku: line.sku,
         unit: line.unit,
-        proposedQuantity: allocated,
+        proposedQuantity: finalAllocated,
         toPlt: line.toPlt,
         toLyr: line.toLyr,
         toSec: line.toSec,
         toPcs: line.toPcs,
-        ...conversionDisplay(allocated, line)
+        palletQty: selection.quantities.pallets,
+        layerQty: selection.quantities.layers,
+        sectionQty: selection.quantities.sections,
+        pieceQty: selection.quantities.pieces
       });
-      remaining -= allocated;
+      remaining = Math.max(0, remaining - finalAllocated);
     }
     uncovered += Math.max(0, remaining);
   }
@@ -1326,19 +1346,30 @@ export async function updateTransferDependencyBatch(batchId, input = {}, operato
   });
 }
 
-async function validateTransferDependencyBatchForCreation(batch) {
-  const pendingProposals = (batch.proposals || []).filter((proposal) => !["created", "attention", "cancelled"].includes(proposal.creationStatus));
+async function validateTransferDependencyBatchForCreation(batch, { proposalIds = null } = {}) {
+  const selectedIds = proposalIds ? new Set(proposalIds.map(String)) : null;
+  const pendingProposals = (batch.proposals || []).filter((proposal) =>
+    !["created", "attention", "cancelled"].includes(proposal.creationStatus)
+    && (!selectedIds || selectedIds.has(String(proposal.id))));
   if (!pendingProposals.length) return { uncovered: 0, pendingProposals: [] };
   const shortageRows = await salesOrderShortageRows(batch.salesOrderId);
   const shortageByLine = new Map(shortageRows.map((row) => [String(row.id), number(row.unresolved_quantity)]));
-  const requestedByLine = new Map();
+  const directRequestedByLine = new Map();
+  const directRoundingAllowanceByLine = new Map();
   for (const proposal of pendingProposals) {
     if (String(proposal.fromLocationId) === String(proposal.toLocationId)) {
       throw new Error(`${proposal.fromLocation} cannot transfer to the same yard.`);
     }
     for (const line of proposal.lines || []) {
+      if (proposal.mode !== "direct_to_customer") continue;
       const key = String(line.salesLineId);
-      requestedByLine.set(key, number(requestedByLine.get(key)) + number(line.proposedQuantity));
+      directRequestedByLine.set(key, number(directRequestedByLine.get(key)) + number(line.proposedQuantity));
+      if (number(line.layerQty) > EPSILON && number(line.toLyr) > EPSILON) {
+        directRoundingAllowanceByLine.set(
+          key,
+          number(directRoundingAllowanceByLine.get(key)) + (number(line.toLyr) / 2)
+        );
+      }
     }
     const pallet = calculateTransferProposalPallets(proposal.lines || []);
     if (!proposal.palletCalculationComplete && !proposal.palletQuantityOverridden) {
@@ -1351,10 +1382,11 @@ async function validateTransferDependencyBatchForCreation(batch) {
       throw new Error("The active NetSuite PALLET item has not been resolved. Refresh inventory and try again.");
     }
   }
-  for (const [lineId, requested] of requestedByLine) {
+  for (const [lineId, requested] of directRequestedByLine) {
     const shortage = number(shortageByLine.get(lineId));
-    if (requested > shortage + EPSILON) {
-      throw new Error(`Proposed quantity ${requested} exceeds the current unresolved Sales Order shortage ${shortage}.`);
+    const roundingAllowance = number(directRoundingAllowanceByLine.get(lineId));
+    if (requested > shortage + roundingAllowance + EPSILON) {
+      throw new Error(`Direct-pickup quantity ${requested} exceeds the current Sales Order shortage ${shortage}. Use Replenish yard for intentional surplus transfer.`);
     }
   }
 
@@ -1501,6 +1533,7 @@ async function createDependencyFromProposal(proposal, batch, transferOrder, oper
 
 export async function confirmTransferDependencyBatch(batchId, {
   operatorId = null,
+  proposalId = null,
   createTransferOrder,
   hydrateTransferOrder
 } = {}) {
@@ -1525,20 +1558,33 @@ export async function confirmTransferDependencyBatch(batchId, {
   if (candidate?.reviewed) {
     throw new Error("This Sales Order is marked Reviewed - No Transfer. Undo the review before creating Transfer Orders.");
   }
-  const validation = await validateTransferDependencyBatchForCreation(batch);
-  if (validation.uncovered > EPSILON && !batch.allowIncompleteCoverage) {
+  const requestedProposal = proposalId === null || proposalId === undefined
+    ? null
+    : batch.proposals.find((proposal) => String(proposal.id) === String(proposalId));
+  if (proposalId !== null && proposalId !== undefined && !requestedProposal) {
+    throw new Error("Transfer proposal not found in this dependency batch.");
+  }
+  if (requestedProposal && ["created", "attention"].includes(requestedProposal.creationStatus) && requestedProposal.transferOrderId) {
+    return {
+      batch,
+      results: [{ proposalId: requestedProposal.id, status: requestedProposal.creationStatus,
+        transferOrderId: requestedProposal.transferOrderId, transferOrderRef: requestedProposal.transferOrderRef, reused: true }]
+    };
+  }
+  const validation = await validateTransferDependencyBatchForCreation(batch, {
+    proposalIds: requestedProposal ? [requestedProposal.id] : null
+  });
+  if (!requestedProposal && validation.uncovered > EPSILON && !batch.allowIncompleteCoverage) {
     throw new Error("The shortage is not fully covered. Enable incomplete coverage before creating Transfer Orders.");
   }
-  await query(
-    `UPDATE scm_transfer_dependency_batches SET status = 'creating', updated_by = $2, updated_at = now() WHERE id = $1`,
-    [Number(batchId), operatorId]
-  );
+  if (!requestedProposal) {
+    await query(
+      `UPDATE scm_transfer_dependency_batches SET status = 'creating', updated_by = $2, updated_at = now() WHERE id = $1`,
+      [Number(batchId), operatorId]
+    );
+  }
   const results = [];
-  for (const proposal of batch.proposals) {
-    if (["created", "attention"].includes(proposal.creationStatus) && proposal.transferOrderId) {
-      results.push({ proposalId: proposal.id, status: proposal.creationStatus, transferOrderId: proposal.transferOrderId, transferOrderRef: proposal.transferOrderRef, reused: true });
-      continue;
-    }
+  for (const proposal of validation.pendingProposals) {
     let createdTransferOrderId = null;
     try {
       await query(
@@ -1591,7 +1637,19 @@ export async function confirmTransferDependencyBatch(batchId, {
   const failed = results.filter((result) => result.status === "failed").length;
   const created = results.filter((result) => result.status === "created").length;
   const attention = results.filter((result) => result.status === "attention").length;
-  const status = attention ? "attention" : failed ? (created ? "partially_created" : "attention") : "created";
+  const refreshed = await getTransferDependencyBatch(batchId);
+  const proposalStatuses = (refreshed?.proposals || []).map((proposal) => proposal.creationStatus);
+  const totalCreated = proposalStatuses.filter((status) => status === "created").length;
+  const hasPending = proposalStatuses.some((status) => ["draft", "suggested", "creating"].includes(status));
+  const hasFailed = proposalStatuses.includes("failed");
+  const hasAttention = proposalStatuses.includes("attention");
+  const status = hasAttention
+    ? "attention"
+    : hasPending
+      ? (totalCreated ? "partially_created" : (hasFailed ? "attention" : "suggested"))
+      : hasFailed
+        ? (totalCreated ? "partially_created" : "attention")
+        : "created";
   await query(
     `UPDATE scm_transfer_dependency_batches
         SET status = $2, confirmed_at = CASE WHEN $2 IN ('created', 'partially_created') THEN now() ELSE confirmed_at END,

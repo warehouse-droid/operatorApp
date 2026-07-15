@@ -14,6 +14,7 @@
     "test:sync-shape": "node src/sync-shape-harness.js",
     "seed:transfer-dependencies": "node src/seed-transfer-dependency-orders.js",
     "repair:auto-transfer-to-status": "node src/repair-auto-transfer-to-status.js",
+    "repair:po-received-baseline": "node src/repair-purchase-order-received-baseline.js",
     "sync:delivery": "node src/sync-delivery.js",
     "rebuild:delivery-groups": "node src/rebuild-dispatch-delivery-groups.js",
     "migrate:dispatch-fleet": "node src/migrate-dispatch-setup-to-db.js",

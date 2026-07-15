@@ -87,6 +87,9 @@ async function assertPurchaseOrder(orderId, expected) {
   check(number(line.section_qty) === expected.section_qty, "Purchase line SEC mapped incorrectly.", { line });
   check(number(line.piece_qty) === expected.piece_qty, "Purchase line PCS mapped incorrectly.", { line });
   check(number(line.netsuite_received_qty) === expected.netsuite_received_qty, "Purchase received sales quantity mapped incorrectly.", { line });
+  if (expected.netsuite_received_baseline_qty !== undefined) {
+    check(number(line.netsuite_received_baseline_qty) === expected.netsuite_received_baseline_qty, "Purchase received baseline quantity mapped incorrectly.", { line });
+  }
   check(number(line.item_weight) === expected.item_weight, "Purchase line item weight mapped incorrectly.", { line });
 }
 
@@ -228,8 +231,176 @@ async function runRepositorySimulation(checks) {
     section_qty: 0,
     piece_qty: 0,
     netsuite_received_qty: 40,
+    netsuite_received_baseline_qty: 40,
     item_weight: 3.25
   });
+  await upsertPurchaseOrderLines(ids.purchase, [{
+    line_id: 21,
+    item_id: 8101,
+    item_name: "UNI-ARTLINE-XL",
+    item_type: "InvtPart",
+    item_type_text: "Inventory Item",
+    item_description: "Repository simulated PO line",
+    quantity: 240,
+    netsuite_received_qty: 60,
+    unit: "EA",
+    item_weight: 3.25,
+    location_id: 15,
+    location: "12441",
+    pallet_qty: 2,
+    layer_qty: 4,
+    section_qty: 0,
+    piece_qty: 0,
+    to_plt: 100,
+    to_lyr: 10
+  }]);
+  await assertPurchaseOrder(ids.purchase, {
+    vendor: "UNILOCK Ayr",
+    destination_location_id: 15,
+    memo: "Ayr Yard - Unilock",
+    line_id: 21,
+    item_name: "UNI-ARTLINE-XL",
+    pallet_qty: 2,
+    layer_qty: 4,
+    section_qty: 0,
+    piece_qty: 0,
+    netsuite_received_qty: 60,
+    netsuite_received_baseline_qty: 40,
+    item_weight: 3.25
+  });
+  const amendedPurchaseLine = await one(
+    "SELECT quantity, netsuite_received_qty, netsuite_received_baseline_qty FROM purchase_order_lines WHERE purchase_order_id = $1 AND line_id = 21",
+    [ids.purchase]
+  );
+  check(
+    number(amendedPurchaseLine.quantity) - number(amendedPurchaseLine.netsuite_received_baseline_qty) === 200,
+    "Later NetSuite receipts changed local PO operational quantity.",
+    { amendedPurchaseLine }
+  );
+  await upsertPurchaseOrderLines(ids.purchase, [{
+    line_id: 21,
+    item_id: 8101,
+    item_name: "UNI-ARTLINE-XL",
+    item_type: "InvtPart",
+    item_type_text: "Inventory Item",
+    item_description: "Repository simulated PO line",
+    quantity: 260,
+    netsuite_received_qty: 60,
+    unit: "EA",
+    item_weight: 3.25,
+    location_id: 15,
+    location: "12441",
+    pallet_qty: 2,
+    layer_qty: 6,
+    section_qty: 0,
+    piece_qty: 0,
+    to_plt: 100,
+    to_lyr: 10
+  }]);
+  const quantityAmendedLine = await one(
+    "SELECT quantity, netsuite_received_qty, netsuite_received_baseline_qty FROM purchase_order_lines WHERE purchase_order_id = $1 AND line_id = 21",
+    [ids.purchase]
+  );
+  check(
+    number(quantityAmendedLine.quantity) - number(quantityAmendedLine.netsuite_received_baseline_qty) === 220,
+    "A NetSuite PO quantity amendment did not update local operational quantity.",
+    { quantityAmendedLine }
+  );
+  const dispatchRepository = await import("./dispatch-repository.js");
+  const dispatchOrders = await dispatchRepository.listDispatchOrders({ includeHiddenScm: true });
+  const dispatchPurchase = dispatchOrders.find((order) => order.id === `SIM-PO-${runId}`);
+  check(number(dispatchPurchase?.salesQty) === 220, "Dispatch did not use the fixed PO receipt baseline.", { dispatchPurchase });
+  const receivingRepository = await import("./receiving-repository.js");
+  const receivingPurchase = await receivingRepository.getReceivingOrder(ids.purchase);
+  const receivingLine = receivingPurchase?.lines?.find((line) => number(line.line_id) === 21);
+  check(number(receivingLine?.quantity) === 220, "Receiving did not use the fixed PO receipt baseline.", { receivingLine });
+
+  const sourceLine = await one(
+    "SELECT id FROM purchase_order_lines WHERE purchase_order_id = $1 AND line_id = 21",
+    [ids.purchase]
+  );
+  const splitOrderId = -(ids.purchase * 10 + 1);
+  const splitLineRowId = -(ids.purchase * 10 + 2);
+  const splitRef = `SIM-PO-SPLIT-${runId}`;
+  await query(
+    `INSERT INTO purchase_orders (netsuite_id, tranid, status, status_text, destination_location_id, destination_location, netsuite_active, synced_at)
+     VALUES ($1, $2, 'B', 'Pending Receipt', 15, '12441', true, now())`,
+    [splitOrderId, splitRef]
+  );
+  await query(
+    `INSERT INTO purchase_order_lines (
+       id, purchase_order_id, line_id, item_id, item_name, sku, quantity, unit,
+       pallet_qty, layer_qty, section_qty, piece_qty, to_plt, to_lyr,
+       netsuite_received_qty, netsuite_received_baseline_qty, netsuite_active, synced_at, raw
+     ) VALUES (
+       $1, $2, 21, 8101, 'UNI-ARTLINE-XL', 'UNI-ARTLINE-XL', 100, 'EA',
+       1, 0, 0, 0, 100, 10,
+       0, 0, true, now(), '{"scmSplit":true}'::jsonb
+     )`,
+    [splitLineRowId, splitOrderId]
+  );
+  const splitHeader = await one(
+    `INSERT INTO dispatch_scm_po_splits (source_po_id, source_po_ref, split_po_id, split_po_ref, status)
+     VALUES ($1, $2, $3, $4, 'active')
+     RETURNING id`,
+    [ids.purchase, `SIM-PO-${runId}`, splitOrderId, splitRef]
+  );
+  const splitLedger = await one(
+    `INSERT INTO dispatch_scm_po_split_lines (
+       split_id, source_line_id, split_line_id, item_id, sku, item_name,
+       pallet_qty, layer_qty, section_qty, piece_qty, sales_qty, unit,
+       requested_pallet_qty, requested_layer_qty, requested_section_qty,
+       requested_piece_qty, requested_sales_qty
+     ) VALUES ($1, $2, $3, 8101, 'UNI-ARTLINE-XL', 'UNI-ARTLINE-XL', 1, 0, 0, 0, 100, 'EA', 1, 0, 0, 0, 100)
+     RETURNING id`,
+    [splitHeader.id, sourceLine.id, splitLineRowId]
+  );
+  const amendedPurchasePayload = {
+    line_id: 21,
+    item_id: 8101,
+    item_name: "UNI-ARTLINE-XL",
+    item_type: "InvtPart",
+    item_type_text: "Inventory Item",
+    item_description: "Repository simulated PO line",
+    netsuite_received_qty: 80,
+    unit: "EA",
+    item_weight: 3.25,
+    location_id: 15,
+    location: "12441",
+    pallet_qty: 0,
+    layer_qty: 0,
+    section_qty: 0,
+    piece_qty: 0,
+    to_plt: 100,
+    to_lyr: 10
+  };
+  await upsertPurchaseOrderLines(ids.purchase, [{ ...amendedPurchasePayload, quantity: 40 }]);
+  const completedSplit = await one(
+    `SELECT line.quantity, line.netsuite_active AS line_active, po.netsuite_active AS order_active,
+            ledger.sales_qty, ledger.requested_sales_qty
+       FROM dispatch_scm_po_split_lines ledger
+       JOIN purchase_order_lines line ON line.id = ledger.split_line_id
+       JOIN purchase_orders po ON po.netsuite_id = line.purchase_order_id
+      WHERE ledger.id = $1`,
+    [splitLedger.id]
+  );
+  check(number(completedSplit.quantity) === 0 && !completedSplit.line_active && !completedSplit.order_active,
+    "A downward PO quantity amendment left an obsolete split quantity active.", { completedSplit });
+  check(number(completedSplit.requested_sales_qty) === 100,
+    "A downward PO quantity amendment erased the original split request.", { completedSplit });
+
+  await upsertPurchaseOrderLines(ids.purchase, [{ ...amendedPurchasePayload, quantity: 160 }]);
+  const restoredSplit = await one(
+    `SELECT line.quantity, line.netsuite_active AS line_active, po.netsuite_active AS order_active,
+            ledger.sales_qty, ledger.requested_sales_qty
+       FROM dispatch_scm_po_split_lines ledger
+       JOIN purchase_order_lines line ON line.id = ledger.split_line_id
+       JOIN purchase_orders po ON po.netsuite_id = line.purchase_order_id
+      WHERE ledger.id = $1`,
+    [splitLedger.id]
+  );
+  check(number(restoredSplit.quantity) === 100 && restoredSplit.line_active && restoredSplit.order_active,
+    "A later PO quantity increase did not restore the requested split quantity.", { restoredSplit });
   checks.push("repository purchase order -> purchase_orders/purchase_order_lines");
 
   const transferOrder = {

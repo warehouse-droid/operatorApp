@@ -16,6 +16,10 @@ function positiveQuantity(value) {
   return number === null ? 0 : Math.max(number, 0);
 }
 
+function netsuiteReceivedBaseline(line) {
+  return positiveQuantity(line?.netsuite_received_baseline_qty ?? line?.netsuite_received_qty);
+}
+
 function isPhotoReference(value) {
   const text = String(value || "");
   return text.startsWith("data:image/") || text.startsWith("r2://");
@@ -90,8 +94,9 @@ function receivingUnitAvailability(line) {
 }
 
 function remainingLineQuantities(line) {
-  const quantity = Math.max(positiveQuantity(line.quantity) - positiveQuantity(line.netsuite_received_qty), 0);
-  if (positiveQuantity(line.netsuite_received_qty) <= 0) {
+  const baselineReceived = netsuiteReceivedBaseline(line);
+  const quantity = Math.max(positiveQuantity(line.quantity) - baselineReceived, 0);
+  if (baselineReceived <= 0) {
     return {
       pallet_qty: positiveQuantity(line.pallet_qty),
       layer_qty: positiveQuantity(line.layer_qty),
@@ -368,7 +373,7 @@ export async function getReceivingOrder(orderId) {
               pallet_qty, layer_qty, piece_qty, section_qty, to_plt, to_lyr, to_sec, to_pcs,
               netsuite_active, sync_exception, synced_at, received_pallet_qty,
               received_layer_qty, received_piece_qty, received_section_qty, NULL::timestamptz AS confirmed_at,
-              NULL::text AS confirmed_by, netsuite_received_qty
+              NULL::text AS confirmed_by, netsuite_received_qty, netsuite_received_baseline_qty
        FROM purchase_order_lines
        UNION ALL
        SELECT transfer_order_id AS order_id, id, line_id, item_id, item_name, item_type,
@@ -376,7 +381,8 @@ export async function getReceivingOrder(orderId) {
               pallet_qty, layer_qty, piece_qty, section_qty, to_plt, to_lyr, to_sec, to_pcs,
               netsuite_active, sync_exception, synced_at, received_pallet_qty,
               received_layer_qty, received_piece_qty, received_section_qty, NULL::timestamptz AS confirmed_at,
-              NULL::text AS confirmed_by, netsuite_received_qty
+              NULL::text AS confirmed_by, netsuite_received_qty,
+              netsuite_received_qty AS netsuite_received_baseline_qty
        FROM transfer_order_lines
        WHERE line_stage = 'receiving'
      )
@@ -414,14 +420,16 @@ export async function confirmReceivingLine(orderId, lineRowId, values, operatorI
               item_type_text, item_description, sku, quantity, unit, location_id, location,
               pallet_qty, layer_qty, piece_qty, section_qty, to_plt, to_lyr, to_sec, to_pcs,
               netsuite_active, sync_exception, synced_at, received_pallet_qty,
-              received_layer_qty, received_piece_qty, received_section_qty, netsuite_received_qty
+              received_layer_qty, received_piece_qty, received_section_qty, netsuite_received_qty,
+              netsuite_received_baseline_qty
        FROM purchase_order_lines
        UNION ALL
        SELECT 'transfer_order'::text AS order_type, transfer_order_id AS order_id, id, line_id, item_id, item_name, item_type,
               item_type_text, item_description, sku, quantity, unit, location_id, location,
               pallet_qty, layer_qty, piece_qty, section_qty, to_plt, to_lyr, to_sec, to_pcs,
               netsuite_active, sync_exception, synced_at, received_pallet_qty,
-              received_layer_qty, received_piece_qty, received_section_qty, netsuite_received_qty
+              received_layer_qty, received_piece_qty, received_section_qty, netsuite_received_qty,
+              netsuite_received_qty AS netsuite_received_baseline_qty
        FROM transfer_order_lines
        WHERE line_stage = 'receiving'
      )
@@ -624,7 +632,7 @@ function receiptLineQuantity(line) {
 
 function remainingSalesQuantity(line) {
   if (Object.hasOwn(line || {}, "original_quantity")) return positiveQuantity(line.quantity);
-  return Math.max(positiveQuantity(line.quantity) - positiveQuantity(line.netsuite_received_qty), 0);
+  return Math.max(positiveQuantity(line.quantity) - netsuiteReceivedBaseline(line), 0);
 }
 
 function locationTextFromId(value) {

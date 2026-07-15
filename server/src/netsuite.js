@@ -1085,7 +1085,6 @@ export async function fetchPurchaseOrderDetailsFromNetSuite(orderId, locationId 
       AND tl.item IS NOT NULL
       AND tl.mainline = 'F'
       AND (tl.taxline = 'F' OR tl.taxline IS NULL)
-      AND ${openLineFilterSql("tl")}
       ${locationFilter}
     ORDER BY tl.uniquekey
   `);

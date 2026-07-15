@@ -1207,6 +1207,17 @@ button[data-action="enter-edit-mode"]:disabled:hover {
   color: #53646c;
 }
 
+.scm-dependency-proposal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 2px;
+}
+
+.scm-dependency-proposal-actions button {
+  min-width: 132px;
+}
+
 .scm-dependency-pallet-summary small {
   grid-column: 1 / -1;
 }

@@ -77,7 +77,7 @@ function depProposalQuantities(line = {}) {
 
 function depProposalSalesQuantity(values = {}, conversions = {}) {
   const converted = ["pallets", "layers", "sections", "pieces"].reduce(
-    (sum, unit) => sum + (depNumber(values[unit]) * depNumber(conversions[unit])),
+    (sum, unit) => sum + ((unit === "layers" ? Math.round(depNumber(values[unit])) : depNumber(values[unit])) * depNumber(conversions[unit])),
     0
   );
   return Number((converted > 0 ? converted : depNumber(values.salesQty)).toFixed(6));
@@ -304,6 +304,12 @@ function renderProposal(proposal) {
           : "Manual quantity required: at least one item has no PLT conversion."}</small>
       </div>
       ${proposal.creationError ? `<div class="scm-dependency-error">${depEscape(proposal.creationError)}</div>` : ""}
+      <footer class="scm-dependency-proposal-actions">
+        <button data-action="save-proposal" data-proposal-id="${proposal.id}" type="button" ${editable && !dependencyState.busy ? "" : "disabled"}>Save Draft</button>
+        <button class="primary-action" data-action="confirm-proposal" data-proposal-id="${proposal.id}" type="button" ${editable && !dependencyState.busy ? "" : "disabled"}>
+          ${proposal.creationStatus === "failed" ? "Retry Transfer Order" : "Create Transfer Order"}
+        </button>
+      </footer>
     </article>
   `;
 }
@@ -373,12 +379,6 @@ function renderDependencyPage() {
       <section class="scm-dependency-panel scm-dependency-proposals">
         <div class="panel-title">
           <div><p>NetSuite Transfer Orders</p><h2>Proposals</h2></div>
-          <div class="scm-dependency-actions">
-            <button data-action="save-batch" type="button" ${dependencyState.batch && !dependencyState.busy ? "" : "disabled"}>Save Draft</button>
-            ${dependencyState.batch?.proposals?.some((proposal) => proposal.creationStatus === "failed")
-              ? `<button class="primary-action" data-action="retry-batch" type="button" ${dependencyState.busy ? "disabled" : ""}>Retry Failed</button>`
-              : `<button class="primary-action" data-action="confirm-batch" type="button" ${dependencyState.batch && !dependencyState.busy ? "" : "disabled"}>Create Transfer Orders</button>`}
-          </div>
         </div>
         <div class="scm-dependency-panel-scroll" data-preserve-scroll="proposals">${renderDependencyProposals()}</div>
       </section>
@@ -408,37 +408,46 @@ async function loadDependencyCandidates({ preserveSelection = true } = {}) {
   }
 }
 
-function collectDependencyBatchPayload() {
-  const batch = dependencyState.batch;
+function proposalUnitValues(row) {
+  return Object.fromEntries([...row.querySelectorAll("[data-proposal-unit]")]
+    .map((input) => [
+      input.dataset.proposalUnit,
+      input.dataset.proposalUnit === "layers" ? Math.max(0, Math.round(depNumber(input.value))) : depNumber(input.value)
+    ]));
+}
+
+function collectDependencyProposalPayload(card) {
+  return {
+    id: Number(card.dataset.proposalId),
+    mode: card.querySelector('[data-proposal-field="mode"]')?.value,
+    fromLocationId: Number(card.querySelector('[data-proposal-field="fromLocationId"]')?.value),
+    toLocationId: Number(card.querySelector('[data-proposal-field="toLocationId"]')?.value),
+    memo: card.querySelector('[data-proposal-field="memo"]')?.value,
+    palletTransferQuantity: (() => {
+      if (card.dataset.palletOverridden !== "true") return undefined;
+      const value = card.querySelector('[data-proposal-field="palletTransferQuantity"]')?.value;
+      return value === "" || value === undefined ? null : Number(value);
+    })(),
+    lines: [...card.querySelectorAll("[data-sales-line-id]")].map((row) => {
+      const quantities = proposalUnitValues(row);
+      return {
+        salesLineId: Number(row.dataset.salesLineId),
+        quantities,
+        proposedQuantity: depProposalSalesQuantity(quantities, {
+          pallets: depNumber(row.dataset.toPlt),
+          layers: depNumber(row.dataset.toLyr),
+          sections: depNumber(row.dataset.toSec),
+          pieces: depNumber(row.dataset.toPcs)
+        })
+      };
+    })
+  };
+}
+
+function collectDependencyBatchPayload(cards = [...scmDependencyApp.querySelectorAll(".scm-dependency-proposal")]) {
   return {
     allowIncompleteCoverage: scmDependencyApp.querySelector('[data-field="allow-incomplete"]')?.checked === true,
-    proposals: [...scmDependencyApp.querySelectorAll(".scm-dependency-proposal")].map((card) => ({
-      id: Number(card.dataset.proposalId),
-      mode: card.querySelector('[data-proposal-field="mode"]')?.value,
-      fromLocationId: Number(card.querySelector('[data-proposal-field="fromLocationId"]')?.value),
-      toLocationId: Number(card.querySelector('[data-proposal-field="toLocationId"]')?.value),
-      memo: card.querySelector('[data-proposal-field="memo"]')?.value,
-      palletTransferQuantity: (() => {
-        if (card.dataset.palletOverridden !== "true") return undefined;
-        const value = card.querySelector('[data-proposal-field="palletTransferQuantity"]')?.value;
-        return value === "" || value === undefined ? null : Number(value);
-      })(),
-      lines: [...card.querySelectorAll("[data-sales-line-id]")].map((row) => ({
-        salesLineId: Number(row.dataset.salesLineId),
-        quantities: Object.fromEntries([...row.querySelectorAll("[data-proposal-unit]")]
-          .map((input) => [input.dataset.proposalUnit, depNumber(input.value)])),
-        proposedQuantity: depProposalSalesQuantity(
-          Object.fromEntries([...row.querySelectorAll("[data-proposal-unit]")]
-            .map((input) => [input.dataset.proposalUnit, depNumber(input.value)])),
-          {
-            pallets: depNumber(row.dataset.toPlt),
-            layers: depNumber(row.dataset.toLyr),
-            sections: depNumber(row.dataset.toSec),
-            pieces: depNumber(row.dataset.toPcs)
-          }
-        )
-      }))
-    }))
+    proposals: cards.map(collectDependencyProposalPayload)
   };
 }
 
@@ -475,6 +484,14 @@ scmDependencyApp.addEventListener("input", (event) => {
   dependencyState.search = event.target.value;
   clearTimeout(dependencySearchTimer);
   dependencySearchTimer = setTimeout(() => runDependencyAction("Searching...", () => loadDependencyCandidates({ preserveSelection: false })), 250);
+});
+
+scmDependencyApp.addEventListener("change", (event) => {
+  if (!event.target.matches('[data-proposal-unit="layers"]')) return;
+  event.target.value = String(Math.max(0, Math.round(depNumber(event.target.value))));
+  const row = event.target.closest("[data-sales-line-id]");
+  updateProposalSalesEquivalent(row);
+  updateProposalPalletEstimate(event.target.closest(".scm-dependency-proposal"));
 });
 
 scmDependencyApp.addEventListener("click", async (event) => {
@@ -542,34 +559,49 @@ scmDependencyApp.addEventListener("click", async (event) => {
     });
     return;
   }
-  if (action === "save-batch") {
+  if (action === "save-proposal") {
+    const card = target.closest(".scm-dependency-proposal");
+    if (!card || !dependencyState.batch) return;
+    const payload = collectDependencyBatchPayload([card]);
+    const proposalId = Number(card.dataset.proposalId);
     await runDependencyAction("Saving draft...", async () => {
       dependencyState.batch = await depApi(`/api/scm/transfer-dependencies/batches/${dependencyState.batch.id}`, {
         method: "PUT",
-        body: JSON.stringify(collectDependencyBatchPayload())
+        body: JSON.stringify(payload)
       });
-      dependencyState.notice = "Dependency draft saved.";
+      dependencyState.notice = `Proposed TO ${proposalId} draft saved.`;
     });
     return;
   }
-  if (action === "confirm-batch" || action === "retry-batch") {
-    const verb = action === "retry-batch" ? "retry" : "confirm";
-    if (!window.confirm("Create these Transfer Orders in NetSuite? Successful orders cannot be rolled back from this screen.")) return;
-    await runDependencyAction("Creating NetSuite Transfer Orders...", async () => {
+  if (action === "confirm-proposal") {
+    const card = target.closest(".scm-dependency-proposal");
+    if (!card || !dependencyState.batch) return;
+    const proposalId = Number(card.dataset.proposalId);
+    const payload = collectDependencyBatchPayload([card]);
+    if (!window.confirm("Create this Transfer Order in NetSuite? A successful order cannot be rolled back from this screen.")) return;
+    await runDependencyAction("Creating NetSuite Transfer Order...", async () => {
       dependencyState.batch = await depApi(`/api/scm/transfer-dependencies/batches/${dependencyState.batch.id}`, {
         method: "PUT",
-        body: JSON.stringify(collectDependencyBatchPayload())
+        body: JSON.stringify(payload)
       });
-      const result = await depApi(`/api/scm/transfer-dependencies/batches/${dependencyState.batch.id}/${verb}`, { method: "POST", body: "{}" });
+      const result = await depApi(`/api/scm/transfer-dependencies/batches/${dependencyState.batch.id}/proposals/${proposalId}/confirm`, { method: "POST", body: "{}" });
       dependencyState.batch = result.batch;
       const createdCount = result.results.filter((entry) => entry.status === "created").length;
       const attentionCount = result.results.filter((entry) => entry.status === "attention").length;
-      dependencyState.notice = `${createdCount} Transfer Order proposal(s) created.${attentionCount ? ` ${attentionCount} need attention; review the NetSuite status shown below.` : ""}`;
+      const failedCount = result.results.filter((entry) => entry.status === "failed").length;
+      dependencyState.notice = createdCount
+        ? "Transfer Order created in NetSuite."
+        : attentionCount
+          ? "Transfer Order was created but needs attention; review its NetSuite status below."
+          : failedCount
+            ? "Transfer Order creation failed. Correct this proposal and retry."
+            : "Transfer Order proposal is already created.";
       dependencyState.candidates = await depApi(`/api/scm/transfer-dependencies/candidates${depCandidateQuery()}`);
       if (dependencyState.selectedSalesOrderId) {
         dependencyState.inventory = await depApi(`/api/scm/transfer-dependencies/candidates/${dependencyState.selectedSalesOrderId}/inventory`);
       }
     });
+    return;
   }
 });
 

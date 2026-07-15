@@ -393,6 +393,7 @@ export async function listDispatchOrders({ type = null, includeHiddenScm = false
         section_qty,
         piece_qty,
         netsuite_received_qty,
+        netsuite_received_baseline_qty,
         to_plt,
         to_lyr,
         to_sec,
@@ -416,6 +417,7 @@ export async function listDispatchOrders({ type = null, includeHiddenScm = false
         section_qty,
         piece_qty,
         netsuite_received_qty,
+        netsuite_received_qty AS netsuite_received_baseline_qty,
         to_plt,
         to_lyr,
         to_sec,
@@ -612,13 +614,13 @@ export async function listDispatchOrders({ type = null, includeHiddenScm = false
         scm.notes AS scm_notes,
         COALESCE(SUM(GREATEST(COALESCE(l.pallet_qty, 0) - COALESCE(pa.allocated_pallet_qty, 0) - COALESCE(spa.split_pallet_qty, 0), 0)), 0) AS total_pallet_qty,
         COALESCE(SUM(GREATEST(COALESCE(l.layer_qty, 0) - COALESCE(pa.allocated_layer_qty, 0) - COALESCE(spa.split_layer_qty, 0), 0)), 0) AS total_layer_qty,
-        COALESCE(SUM(GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_qty, 0) - COALESCE(pa.allocated_sales_qty, 0) - COALESCE(spa.split_sales_qty, 0), 0)), 0) AS total_quantity,
+        COALESCE(SUM(GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0) - COALESCE(pa.allocated_sales_qty, 0) - COALESCE(spa.split_sales_qty, 0), 0)), 0) AS total_quantity,
         0::numeric AS total_packed_pallet_qty,
         0::numeric AS total_packed_layer_qty,
         0::numeric AS total_packed_section_qty,
         0::numeric AS total_packed_piece_qty,
         COALESCE(SUM(
-          GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_qty, 0) - COALESCE(pa.allocated_sales_qty, 0) - COALESCE(spa.split_sales_qty, 0), 0)
+          GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0) - COALESCE(pa.allocated_sales_qty, 0) - COALESCE(spa.split_sales_qty, 0), 0)
           * COALESCE(l.item_weight, 0)
         ), 0) AS total_weight_lbs,
         jsonb_agg(jsonb_build_object(
@@ -632,11 +634,12 @@ export async function listDispatchOrders({ type = null, includeHiddenScm = false
           'layers', GREATEST(COALESCE(l.layer_qty, 0) - COALESCE(pa.allocated_layer_qty, 0) - COALESCE(spa.split_layer_qty, 0), 0),
           'sections', GREATEST(COALESCE(l.section_qty, 0) - COALESCE(pa.allocated_section_qty, 0) - COALESCE(spa.split_section_qty, 0), 0),
           'pieces', GREATEST(COALESCE(l.piece_qty, 0) - COALESCE(pa.allocated_piece_qty, 0) - COALESCE(spa.split_piece_qty, 0), 0),
-          'quantity', GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_qty, 0) - COALESCE(pa.allocated_sales_qty, 0) - COALESCE(spa.split_sales_qty, 0), 0),
+          'quantity', GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0) - COALESCE(pa.allocated_sales_qty, 0) - COALESCE(spa.split_sales_qty, 0), 0),
           'unit', l.unit,
           'itemWeight', COALESCE(l.item_weight, 0),
-          'lineWeight', GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_qty, 0) - COALESCE(pa.allocated_sales_qty, 0) - COALESCE(spa.split_sales_qty, 0), 0) * COALESCE(l.item_weight, 0),
+          'lineWeight', GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0) - COALESCE(pa.allocated_sales_qty, 0) - COALESCE(spa.split_sales_qty, 0), 0) * COALESCE(l.item_weight, 0),
           'netsuiteReceivedQty', COALESCE(l.netsuite_received_qty, 0),
+          'netsuiteReceivedBaselineQty', COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0),
           'poAllocatedPallets', COALESCE(pa.allocated_pallet_qty, 0),
           'poAllocatedLayers', COALESCE(pa.allocated_layer_qty, 0),
           'poAllocatedSections', COALESCE(pa.allocated_section_qty, 0),
@@ -702,7 +705,7 @@ export async function listDispatchOrders({ type = null, includeHiddenScm = false
                schedule_pickup_yard.address, schedule_pickup_yard.window_start, schedule_pickup_yard.window_end,
                schedule_pickup_yard.instructions, schedule_pickup_yard.day_label
       HAVING o.dispatch_plan_date IS NOT NULL
-          OR COALESCE(SUM(GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_qty, 0) - COALESCE(pa.allocated_sales_qty, 0) - COALESCE(spa.split_sales_qty, 0), 0)), 0) > 0.000001
+          OR COALESCE(SUM(GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0) - COALESCE(pa.allocated_sales_qty, 0) - COALESCE(spa.split_sales_qty, 0), 0)), 0) > 0.000001
     ),
     local_co AS (
       SELECT
@@ -1327,6 +1330,10 @@ function hasCustomQuantity(row) {
     || positiveQuantity(row.piece_qty) > 0;
 }
 
+function purchaseOrderReceivedBaseline(row) {
+  return positiveQuantity(row?.netsuite_received_baseline_qty ?? row?.netsuite_received_qty);
+}
+
 function lineSalesQty(row, qtys = {}) {
   const pallets = positiveQuantity(qtys.pallets);
   const layers = positiveQuantity(qtys.layers);
@@ -1352,7 +1359,7 @@ function availableUnitQty(row, unit) {
         : unit === "piece" ? positiveQuantity(row.to_pcs)
           : 0;
   const remainingSales = Math.max(
-    positiveQuantity(row.quantity) - positiveQuantity(row.netsuite_received_qty) - positiveQuantity(row.allocated_sales_qty),
+    positiveQuantity(row.quantity) - purchaseOrderReceivedBaseline(row) - positiveQuantity(row.allocated_sales_qty),
     0
   );
   if (!conversion) return byUnit || (!hasCustomQuantity(row) && unit === "piece" ? remainingSales : byUnit);
@@ -1362,7 +1369,7 @@ function availableUnitQty(row, unit) {
 
 function availableUnitSelection(row) {
   const remainingSales = Math.max(
-    positiveQuantity(row.quantity) - positiveQuantity(row.netsuite_received_qty) - positiveQuantity(row.allocated_sales_qty),
+    positiveQuantity(row.quantity) - purchaseOrderReceivedBaseline(row) - positiveQuantity(row.allocated_sales_qty),
     0
   );
   if (hasCustomQuantity(row)) {
@@ -1427,6 +1434,48 @@ function visibleScmSplitItem(item = {}) {
     + positiveQuantity(item.sections)
     + positiveQuantity(item.pieces)
     + positiveQuantity(item.quantity) > 0;
+}
+
+function scmPurchaseOrderRefValues(order = {}) {
+  return [...new Set([
+    order.id,
+    order.originalPoRef,
+    order.dispatchRef,
+    order.sourcePoRef
+  ].map((value) => String(value || "").trim()).filter(Boolean))];
+}
+
+function scmPurchaseOrderSearchRefs(orders = [], splitRows = []) {
+  const refsByLookup = new Map();
+  const connectRefs = (values = []) => {
+    const refs = [...new Set(values.map((value) => String(value || "").trim()).filter(Boolean))];
+    for (const ref of refs) {
+      const key = ref.toLowerCase();
+      const connected = refsByLookup.get(key) || new Set();
+      refs.forEach((value) => connected.add(value));
+      refsByLookup.set(key, connected);
+    }
+  };
+  for (const order of orders) connectRefs(scmPurchaseOrderRefValues(order));
+  for (const split of splitRows) connectRefs([split.split_po_ref, split.source_po_ref]);
+
+  return new Map((orders || []).map((order) => {
+    const refs = new Set(scmPurchaseOrderRefValues(order));
+    for (const childRef of order.childOrders || []) {
+      const child = String(childRef || "").trim();
+      if (!child) continue;
+      refs.add(child);
+      for (const connected of refsByLookup.get(child.toLowerCase()) || []) refs.add(connected);
+    }
+    return [String(order.id || ""), [...refs]];
+  }));
+}
+
+function compareScmPurchaseOrders(left = {}, right = {}) {
+  return String(left.id || "").localeCompare(String(right.id || ""), undefined, {
+    numeric: true,
+    sensitivity: "base"
+  });
 }
 
 function replaceRefDeep(value, oldRef, newRef) {
@@ -1521,6 +1570,11 @@ export async function listScmPurchaseOrders({ search = "", dropoff = "", vendor 
       scmSplitSalesQty: positiveQuantity(split.sales_qty)
     };
   });
+  const searchRefsByOrderId = scmPurchaseOrderSearchRefs(orders, splitRows.rows);
+  orders = orders.map((order) => ({
+    ...order,
+    scmSearchRefs: searchRefsByOrderId.get(String(order.id || "")) || scmPurchaseOrderRefValues(order)
+  }));
   if (needle) {
     orders = orders.filter((order) => {
       const haystack = [
@@ -1532,6 +1586,7 @@ export async function listScmPurchaseOrders({ search = "", dropoff = "", vendor 
         order.sourceYard,
         order.address,
         order.sourcePoRef,
+        ...(order.scmSearchRefs || []),
         ...(order.childOrders || []),
         ...(order.items || []).flatMap((item) => [item.sku, item.itemName, item.description])
       ].join(" ").toLowerCase();
@@ -1573,7 +1628,8 @@ export async function listScmPurchaseOrders({ search = "", dropoff = "", vendor 
       if (!pickupFilter) return true;
       return scmEffectivePickupPoint(order).toLowerCase() === pickupFilter;
     })
-    .filter((order) => (order.items || []).length || needle);
+    .filter((order) => (order.items || []).length || needle)
+    .sort(compareScmPurchaseOrders);
 }
 
 function scmOrderVendorLabel(order = {}) {
@@ -1795,7 +1851,7 @@ export async function listScmSchedule({
             ELSE
               trim(concat_ws(' ',
                 COALESCE(NULLIF(l.sku, ''), NULLIF(l.item_name, ''), 'Item'),
-                trim(to_char(GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_qty, 0), 0), 'FM999999999990.######')),
+                trim(to_char(GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0), 0), 'FM999999999990.######')),
                 NULLIF(l.unit, '')
               ))
           END,
@@ -1809,14 +1865,14 @@ export async function listScmSchedule({
                   + GREATEST(COALESCE(l.layer_qty, 0) - COALESCE(l.received_layer_qty, 0), 0)
                   + GREATEST(COALESCE(l.section_qty, 0) - COALESCE(l.received_section_qty, 0), 0)
                   + GREATEST(COALESCE(l.piece_qty, 0) - COALESCE(l.received_piece_qty, 0), 0)
-                ELSE GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_qty, 0), 0)
+                ELSE GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0), 0)
               END
             ) > 0
         ) AS content,
         po.expected_delivery_date,
         COALESCE(po.synced_at, po.status_updated_at, now()) AS queued_at,
         COALESCE(SUM(GREATEST(COALESCE(l.pallet_qty, 0) - COALESCE(l.received_pallet_qty, 0), 0)), 0) AS total_pallet_qty,
-        COALESCE(SUM(GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_qty, 0), 0) * COALESCE(l.item_weight, 0)), 0) AS weight_lbs
+        COALESCE(SUM(GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0), 0) * COALESCE(l.item_weight, 0)), 0) AS weight_lbs
       FROM purchase_orders po
       LEFT JOIN dispatch_scm_po_splits active_split
         ON active_split.split_po_id = po.netsuite_id
@@ -2442,7 +2498,7 @@ export async function createScmScheduleGroup({ refs = [], createdBy = "" } = {})
          JOIN purchase_orders po ON po.netsuite_id = l.purchase_order_id
         WHERE po.netsuite_id = ANY($1::bigint[])
           AND l.netsuite_active = true
-          AND GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_qty, 0), 0) > 0`,
+          AND GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0), 0) > 0`,
       [members.map((member) => member.netsuite_id)]
     );
     for (const line of lineRows.rows) {
@@ -2482,7 +2538,7 @@ export async function createScmScheduleGroup({ refs = [], createdBy = "" } = {})
           line.item_description,
           line.item_type,
           line.item_type_text,
-          Math.max(positiveQuantity(line.quantity) - positiveQuantity(line.netsuite_received_qty), 0),
+          Math.max(positiveQuantity(line.quantity) - purchaseOrderReceivedBaseline(line), 0),
           line.unit,
           line.location_id,
           line.location,
@@ -2532,7 +2588,7 @@ export async function createScmScheduleGroup({ refs = [], createdBy = "" } = {})
         destinationNames.join(" + "),
         pickupPoint || "SCM Group",
         "",
-        lineRows.rows.reduce((sum, line) => sum + (Math.max(positiveQuantity(line.quantity) - positiveQuantity(line.netsuite_received_qty), 0) * positiveQuantity(line.item_weight)), 0),
+        lineRows.rows.reduce((sum, line) => sum + (Math.max(positiveQuantity(line.quantity) - purchaseOrderReceivedBaseline(line), 0) * positiveQuantity(line.item_weight)), 0),
         createdBy || null
       ]
     );
@@ -3394,7 +3450,7 @@ export async function createScmPurchaseOrderSplit({
         }
       }
       const salesRemaining = Math.max(
-        positiveQuantity(sourceLine.quantity) - positiveQuantity(sourceLine.netsuite_received_qty) - positiveQuantity(sourceLine.allocated_sales_qty),
+        positiveQuantity(sourceLine.quantity) - purchaseOrderReceivedBaseline(sourceLine) - positiveQuantity(sourceLine.allocated_sales_qty),
         0
       );
       if (salesQty <= 0) throw new Error(`${label}: selected quantity is zero.`);
@@ -3538,8 +3594,13 @@ export async function createScmPurchaseOrderSplit({
       await client.query(
         `INSERT INTO dispatch_scm_po_split_lines (
            split_id, source_line_id, split_line_id, item_id, sku, item_name,
-           pallet_qty, layer_qty, section_qty, piece_qty, sales_qty, unit
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+           pallet_qty, layer_qty, section_qty, piece_qty, sales_qty, unit,
+           requested_pallet_qty, requested_layer_qty, requested_section_qty,
+           requested_piece_qty, requested_sales_qty
+         ) VALUES (
+           $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+           $7, $8, $9, $10, $11
+         )`,
         [
           split.id,
           sourceLine.id,
@@ -3973,7 +4034,7 @@ async function createSalesOrderPoAllocationWithExecutor(executor, {
     if (value > poAvailable) throw new Error(`${itemLabel}: PO ${poLine.po_order_ref} only has ${poAvailable} ${label} available.`);
   }
   const salesRemaining = Math.max(positiveQuantity(salesLine.quantity) - positiveQuantity(salesLine.allocated_sales_qty), 0);
-  const poRemaining = Math.max(positiveQuantity(poLine.quantity) - positiveQuantity(poLine.netsuite_received_qty) - positiveQuantity(poLine.allocated_sales_qty), 0);
+  const poRemaining = Math.max(positiveQuantity(poLine.quantity) - purchaseOrderReceivedBaseline(poLine) - positiveQuantity(poLine.allocated_sales_qty), 0);
   if (salesQty > salesRemaining) throw new Error(`${itemLabel}: SO open sales quantity is only ${salesRemaining}.`);
   if (salesQty > poRemaining) throw new Error(`${itemLabel}: PO ${poLine.po_order_ref} only has ${poRemaining} sales quantity available.`);
 

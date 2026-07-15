@@ -135,6 +135,13 @@ function scmUniqueOptions(values = []) {
     .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }));
 }
 
+function compareScmOrders(left = {}, right = {}) {
+  return String(left.id || "").localeCompare(String(right.id || ""), undefined, {
+    numeric: true,
+    sensitivity: "base"
+  });
+}
+
 function scmOrderVendorLabel(order = {}) {
   const localVendor = scmVendorYardOptions(order).map((option) => option.vendor).find(Boolean);
   return localVendor || order.customer || order.vendorYard || order.sourceYard || "";
@@ -312,7 +319,7 @@ async function loadScmOrders() {
     if (scmVendorFilter) params.set("vendor", scmVendorFilter);
     if (scmPickupFilter) params.set("pickupPoint", scmPickupFilter);
     const query = params.toString() ? `?${params.toString()}` : "";
-    scmOrders = await scmApi(`/api/dispatch/scm/purchase-orders${query}`);
+    scmOrders = (await scmApi(`/api/dispatch/scm/purchase-orders${query}`)).sort(compareScmOrders);
     if (scmInitialOrderRef && !scmInitialOrderApplied) {
       const initialNeedle = scmInitialOrderRef.toLowerCase();
       const initialOrder = scmOrders.find((order) => [
@@ -618,7 +625,8 @@ async function createScmSplit() {
         audit: { sessionId: sessionStorage.getItem("mbbs.dispatch.sessionId") || "" }
       })
     });
-    scmNotice = `Created ${payload.created?.split?.splitPoRef || scmRef}. It is now searchable under PO.`;
+    const createdRef = payload.created?.split?.splitPoRef || scmRef;
+    scmNotice = `Created ${createdRef}. It is now searchable under PO.`;
     scmRef = "";
     scmDestinationLocationId = "";
     scmPickupPoint = "";

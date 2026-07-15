@@ -179,6 +179,163 @@ async function auditSyncChange({ action, orderId = null, lineId = null, existing
   });
 }
 
+const PO_SPLIT_EPSILON = 0.000001;
+
+function splitQuantityNumber(value) {
+  const number = Number(value || 0);
+  return Number.isFinite(number) ? Math.max(number, 0) : 0;
+}
+
+function roundSplitQuantity(value) {
+  return Math.round(splitQuantityNumber(value) * 1000000) / 1000000;
+}
+
+function splitUnitsWithinSalesCapacity(sourceLine, splitLine, allowedSalesQty) {
+  const requestedSales = splitQuantityNumber(splitLine.requested_sales_qty);
+  const requested = {
+    pallet_qty: splitQuantityNumber(splitLine.requested_pallet_qty),
+    layer_qty: splitQuantityNumber(splitLine.requested_layer_qty),
+    section_qty: splitQuantityNumber(splitLine.requested_section_qty),
+    piece_qty: splitQuantityNumber(splitLine.requested_piece_qty)
+  };
+  if (allowedSalesQty + PO_SPLIT_EPSILON >= requestedSales) return requested;
+
+  let remaining = splitQuantityNumber(allowedSalesQty);
+  const current = { pallet_qty: 0, layer_qty: 0, section_qty: 0, piece_qty: 0 };
+  for (const [quantityField, conversionField] of [
+    ["pallet_qty", "to_plt"],
+    ["layer_qty", "to_lyr"],
+    ["section_qty", "to_sec"],
+    ["piece_qty", "to_pcs"]
+  ]) {
+    const conversion = splitQuantityNumber(sourceLine[conversionField]);
+    if (!conversion || !requested[quantityField] || remaining <= PO_SPLIT_EPSILON) continue;
+    const units = Math.min(requested[quantityField], Math.floor((remaining / conversion) + PO_SPLIT_EPSILON));
+    current[quantityField] = units;
+    remaining = roundSplitQuantity(remaining - (units * conversion));
+  }
+  return current;
+}
+
+async function reconcilePurchaseOrderSplitCapacity(orderId, lineId) {
+  if (lineId === null || lineId === undefined) return;
+  const sourceResult = await query(
+    `SELECT line.*,
+            COALESCE((
+              SELECT SUM(allocation.allocated_sales_qty)
+                FROM dispatch_so_po_allocations allocation
+               WHERE allocation.po_line_id = line.id
+                 AND allocation.status = 'active'
+            ), 0) AS linked_sales_qty
+       FROM purchase_order_lines line
+      WHERE line.purchase_order_id = $1
+        AND line.line_id = $2
+      LIMIT 1`,
+    [orderId, lineId]
+  );
+  const sourceLine = sourceResult.rows[0];
+  if (!sourceLine) return;
+
+  const splitResult = await query(
+    `SELECT split_line.*,
+            split.split_po_id,
+            split.split_po_ref,
+            split.created_at AS split_created_at
+       FROM dispatch_scm_po_split_lines split_line
+       JOIN dispatch_scm_po_splits split ON split.id = split_line.split_id
+      WHERE split_line.source_line_id = $1
+        AND split.status = 'active'
+      ORDER BY split.created_at, split_line.id`,
+    [sourceLine.id]
+  );
+  if (!splitResult.rowCount) return;
+
+  let remainingCapacity = Math.max(
+    splitQuantityNumber(sourceLine.quantity)
+      - splitQuantityNumber(sourceLine.netsuite_received_baseline_qty ?? sourceLine.netsuite_received_qty)
+      - splitQuantityNumber(sourceLine.linked_sales_qty),
+    0
+  );
+  const adjustments = [];
+  const affectedSplitOrderIds = new Set();
+
+  for (const splitLine of splitResult.rows) {
+    const requestedSales = splitQuantityNumber(splitLine.requested_sales_qty);
+    const allowedSales = roundSplitQuantity(Math.min(requestedSales, remainingCapacity));
+    remainingCapacity = roundSplitQuantity(Math.max(remainingCapacity - allowedSales, 0));
+    const units = splitUnitsWithinSalesCapacity(sourceLine, splitLine, allowedSales);
+    const changed = Math.abs(splitQuantityNumber(splitLine.sales_qty) - allowedSales) > PO_SPLIT_EPSILON
+      || Math.abs(splitQuantityNumber(splitLine.pallet_qty) - units.pallet_qty) > PO_SPLIT_EPSILON
+      || Math.abs(splitQuantityNumber(splitLine.layer_qty) - units.layer_qty) > PO_SPLIT_EPSILON
+      || Math.abs(splitQuantityNumber(splitLine.section_qty) - units.section_qty) > PO_SPLIT_EPSILON
+      || Math.abs(splitQuantityNumber(splitLine.piece_qty) - units.piece_qty) > PO_SPLIT_EPSILON;
+    if (!changed) continue;
+
+    await query(
+      `UPDATE dispatch_scm_po_split_lines
+          SET pallet_qty = $2,
+              layer_qty = $3,
+              section_qty = $4,
+              piece_qty = $5,
+              sales_qty = $6
+        WHERE id = $1`,
+      [splitLine.id, units.pallet_qty, units.layer_qty, units.section_qty, units.piece_qty, allowedSales]
+    );
+    await query(
+      `UPDATE purchase_order_lines
+          SET quantity = $2,
+              pallet_qty = $3,
+              layer_qty = $4,
+              section_qty = $5,
+              piece_qty = $6,
+              netsuite_active = ($2::numeric > $7::numeric),
+              synced_at = now()
+        WHERE id = $1`,
+      [splitLine.split_line_id, allowedSales, units.pallet_qty, units.layer_qty, units.section_qty, units.piece_qty, PO_SPLIT_EPSILON]
+    );
+    affectedSplitOrderIds.add(String(splitLine.split_po_id));
+    adjustments.push({
+      splitPoRef: splitLine.split_po_ref,
+      requestedSalesQty: requestedSales,
+      beforeSalesQty: splitQuantityNumber(splitLine.sales_qty),
+      afterSalesQty: allowedSales
+    });
+  }
+
+  for (const splitOrderId of affectedSplitOrderIds) {
+    await query(
+      `UPDATE purchase_orders split_order
+          SET netsuite_active = EXISTS (
+                SELECT 1
+                  FROM purchase_order_lines child_line
+                 WHERE child_line.purchase_order_id = split_order.netsuite_id
+                   AND child_line.netsuite_active = true
+                   AND COALESCE(child_line.quantity, 0) > $2
+              ),
+              synced_at = now(),
+              status_updated_at = now()
+        WHERE split_order.netsuite_id = $1`,
+      [splitOrderId, PO_SPLIT_EPSILON]
+    );
+  }
+
+  if (adjustments.length) {
+    await writeAudit({
+      actorType: "system",
+      source: "netsuite",
+      action: "purchase_order.split_capacity.reconciled",
+      orderId,
+      lineId,
+      details: {
+        sourceQuantity: splitQuantityNumber(sourceLine.quantity),
+        receivedBaseline: splitQuantityNumber(sourceLine.netsuite_received_baseline_qty ?? sourceLine.netsuite_received_qty),
+        linkedSalesQty: splitQuantityNumber(sourceLine.linked_sales_qty),
+        adjustments
+      }
+    });
+  }
+}
+
 async function rekeyLineIfSingleCandidate({ table, orderColumn, orderId, normalized, stage = null }) {
   if (!normalized.line_id || !normalized.item_id) return null;
   const params = [orderId, normalized.line_id, normalized.item_id, normalized.location_id ?? null];
@@ -230,7 +387,7 @@ async function rekeyLineIfSingleCandidate({ table, orderColumn, orderId, normali
 
 async function upsertInventoryItemFromLine(normalized) {
   if (!normalized.item_id) return;
-  await query(
+    await query(
     `INSERT INTO inventory_items (
        item_id, item_name, display_name, item_description, item_type,
        item_type_text, stock_unit, item_weight, to_plt, to_lyr, to_sec,
@@ -1057,16 +1214,16 @@ export async function upsertPurchaseOrderLines(orderId, lines = []) {
       if (rekeyed) existing = { rows: [rekeyed] };
     }
     await query(
-      `INSERT INTO purchase_order_lines (
+       `INSERT INTO purchase_order_lines (
          purchase_order_id, line_id, item_id, item_name, item_type,
          item_type_text, item_description, sku, quantity,
-         netsuite_received_qty, unit, item_weight, location_id, location,
+         netsuite_received_qty, netsuite_received_baseline_qty, unit, item_weight, location_id, location,
          pallet_qty, layer_qty, piece_qty, section_qty, to_plt, to_lyr,
          to_sec, to_pcs, netsuite_active, sync_exception,
          sync_exception_at, raw, synced_at
        ) VALUES (
          $1, $2, $3, $4, $5, $6, $7, $8,
-         $9, COALESCE($10::numeric, 0), $11, $12, $13, $14, $15,
+         $9, COALESCE($10::numeric, 0), COALESCE($10::numeric, 0), $11, $12, $13, $14, $15,
          $16, $17, $18, $19, $20, $21, $22, true, null,
          null, $23::jsonb, now()
        )
@@ -1123,8 +1280,11 @@ export async function upsertPurchaseOrderLines(orderId, lines = []) {
       ]
     );
     await upsertInventoryItemFromLine(normalized);
+    await reconcilePurchaseOrderSplitCapacity(orderId, normalized.line_id);
     await auditSyncChange({
       action: "netsuite.receiving_line",
+      orderId,
+      lineId: normalized.line_id,
       existing: existing.rows[0] || null,
       normalized,
       fields: [
@@ -1286,14 +1446,9 @@ export async function markMissingInboundOrders({ orderFamily, activeOrderIds = [
     clauses.push(`destination_location_id = $${params.length}`);
   }
   if (!isTransfer) {
-    await query(
-      `UPDATE purchase_orders
-          SET netsuite_active = false,
-              netsuite_missing_at = now(),
-              synced_at = now()
-        WHERE ${clauses.join(" AND ")}`,
-      params
-    );
+    // The NetSuite PO discovery query only returns currently open receipts. Once a
+    // PO enters local tracking, absence from that result cannot mean deletion: it
+    // may have been received in NetSuite while local split work is still active.
     return;
   }
 

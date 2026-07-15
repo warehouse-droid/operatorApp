@@ -19,6 +19,7 @@ import {
   syncDirectDependencyOperatorProgress,
   syncOrderDependenciesForTransferOrder,
   syncOrderDependenciesFromDispatchPlan,
+  transferProposalConversionSelection,
   updateTransferDependencyBatch,
   validateDispatchPlanDependencies
 } from "./order-dependency-repository.js";
@@ -153,6 +154,10 @@ try {
     ]).calculatedQuantity === 2, "Loose quantities from separate SKUs must each require a PALLET.");
     check(calculateTransferProposalPallets([{ itemId: 1, itemName: "A", proposedQuantity: 1, toPlt: 0 }]).complete === false,
       "An item without PLT conversion must require a manual PALLET quantity.");
+    const roundedLayerSelection = transferProposalConversionSelection(69.721, { toLyr: 10 });
+    check(roundedLayerSelection.quantities.layers === 7 && roundedLayerSelection.salesQty === 70,
+      "Auto Transfer must round 6.9721 LYR to 7 and use 7 times the layer conversion as the transfer quantity.",
+      { roundedLayerSelection });
     await query(
       `INSERT INTO sales_orders (
          netsuite_id, tranid, trandate, customer, status, status_text,
@@ -280,6 +285,23 @@ try {
     check(convertedLine?.proposedQuantity === 3 && convertedLine?.quantities?.pallets === 1 && convertedLine?.quantities?.pieces === 2,
       "Auto Transfer proposal unit inputs must persist their exact PLT/LYR/SEC/PCS selection and converted sales quantity.",
       { convertedLine });
+    const surplusDraft = await updateTransferDependencyBatch(batch.id, {
+      proposals: [{
+        id: editableProposal.id,
+        mode: "yard_replenishment",
+        fromLocationId: editableProposal.fromLocationId,
+        toLocationId: editableProposal.toLocationId,
+        memo: editableProposal.memo,
+        lines: [{
+          salesLineId: editableLine.salesLineId,
+          quantities: { pallets: 10, layers: 0, sections: 0, pieces: 0, salesQty: 0 }
+        }]
+      }]
+    }, "dependency-harness");
+    const surplusLine = surplusDraft.proposals.find((proposal) => proposal.id === editableProposal.id)?.lines[0];
+    check(surplusLine?.proposedQuantity === 10 && surplusLine?.quantities?.pallets === 10,
+      "Saving a proposal draft must preserve an SCM surplus override instead of restoring the generated shortage quantity.",
+      { surplusLine });
     await updateTransferDependencyBatch(batch.id, {
       proposals: [{
         id: editableProposal.id,
@@ -313,19 +335,25 @@ try {
     await query("UPDATE sales_orders SET is_test_fixture = false WHERE netsuite_id = $1", [salesOrderId]);
     check(productionFixtureBlocked, "Backend TO creation must reject test fixtures in production.");
 
-    let createAttempt = 0;
-    const firstResult = await confirmTransferDependencyBatch(batch.id, {
+    const singleProposalResult = await confirmTransferDependencyBatch(batch.id, {
       operatorId: "dependency-harness",
-      createTransferOrder: async () => {
-        const index = createAttempt;
-        createAttempt += 1;
-        if (index === 1) throw new Error("Intentional fake NetSuite failure");
-        return { id: createdTransferIds[index] };
-      },
+      proposalId: batch.proposals[0].id,
+      createTransferOrder: async () => ({ id: createdTransferIds[0] }),
       hydrateTransferOrder: fakeHydrateTransferOrder
     });
-    check(firstResult.results.filter((entry) => entry.status === "created").length === 1, "Successful NetSuite TO must survive a later proposal failure.", { firstResult });
-    check(firstResult.results.filter((entry) => entry.status === "failed").length === 1, "Failed proposal must be retained for retry.", { firstResult });
+    check(singleProposalResult.results.filter((entry) => entry.status === "created").length === 1
+      && singleProposalResult.batch.status === "partially_created"
+      && singleProposalResult.batch.proposals.some((proposal) => proposal.creationStatus === "draft"),
+    "Creating one proposed TO must leave sibling proposals editable for separate creation.", { singleProposalResult });
+    const firstResult = await confirmTransferDependencyBatch(batch.id, {
+      operatorId: "dependency-harness",
+      createTransferOrder: async () => { throw new Error("Intentional fake NetSuite failure"); },
+      hydrateTransferOrder: fakeHydrateTransferOrder
+    });
+    check(firstResult.results.filter((entry) => entry.status === "failed").length === 1,
+      "A later failed proposal must be retained without changing the already-created TO.", { firstResult });
+    check(firstResult.batch.proposals.filter((proposal) => proposal.creationStatus === "created").length === 1,
+      "Successful NetSuite TO must survive a later sibling proposal failure.", { firstResult });
 
     const createdAllocation = await query(
       `SELECT dl.id, dl.allocated_quantity

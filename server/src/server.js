@@ -2865,7 +2865,40 @@ const DELAYED_STATUS_REFRESH_CONFIG = {
   }
 };
 
-function scheduleTransactionStatusRefresh(orderType, orderId, { tranid = "", delayMs = 10000 } = {}) {
+function summarizeSalesOrderAllocationRefresh(lines = []) {
+  const totals = (lines || []).reduce((summary, line) => {
+    const quantity = webhookNumber(line.quantity);
+    const committed = webhookNumber(line.netsuite_committed_qty);
+    const backordered = webhookNumber(line.netsuite_backordered_qty);
+    const processed = webhookNumber(line.netsuite_received_qty);
+    summary.backorderedQuantity += backordered;
+    if (backordered > 0) summary.backorderedLineCount += 1;
+    if (quantity > 0 && committed <= 0 && backordered <= 0 && processed <= 0) {
+      summary.unsettledLineCount += 1;
+    }
+    return summary;
+  }, {
+    lineCount: (lines || []).length,
+    backorderedLineCount: 0,
+    backorderedQuantity: 0,
+    unsettledLineCount: 0
+  });
+  totals.backorderedQuantity = Number(totals.backorderedQuantity.toFixed(6));
+  return totals;
+}
+
+async function refreshSalesOrderAllocationsAfterWebhook(orderId) {
+  const lines = await fetchDeliveryOrderDetailsFromNetSuite(orderId);
+  if (lines.length) await upsertSalesOrderLines(orderId, lines);
+  return summarizeSalesOrderAllocationRefresh(lines);
+}
+
+function scheduleTransactionStatusRefresh(orderType, orderId, {
+  tranid = "",
+  delayMs = 10000,
+  refreshAttempt = 0,
+  maxLineRefreshAttempts = 2
+} = {}) {
   const config = DELAYED_STATUS_REFRESH_CONFIG[orderType];
   if (!config) return;
   const id = Number(orderId);
@@ -2877,34 +2910,52 @@ function scheduleTransactionStatusRefresh(orderType, orderId, { tranid = "", del
     delayedTransactionStatusRefreshes.delete(key);
     try {
       const status = await fetchTransactionStatusFromNetSuite(id, config.netsuiteType);
-      if (!status) {
-        await writeAudit({
-          actorType: "system",
-          source: "netsuite-webhook",
-          action: "netsuite.webhook.delayed_status_missing",
-          details: { netsuiteOrderId: id, orderType, tranid }
-        });
-        return;
+      const updated = status
+        ? await config.updateStatus(id, {
+            status: status.status,
+            statusText: status.status_text
+          })
+        : false;
+      let allocationRefresh = null;
+      let allocationRefreshError = "";
+      if (orderType === "sales_order") {
+        try {
+          allocationRefresh = await refreshSalesOrderAllocationsAfterWebhook(id);
+        } catch (error) {
+          allocationRefreshError = error.message;
+        }
       }
-      const updated = await config.updateStatus(id, {
-        status: status.status,
-        statusText: status.status_text
-      });
       await writeAudit({
         actorType: "system",
         source: "netsuite-webhook",
-        action: "netsuite.webhook.delayed_status_refresh",
+        action: status
+          ? "netsuite.webhook.delayed_status_refresh"
+          : "netsuite.webhook.delayed_status_missing",
         details: {
           netsuiteOrderId: id,
           orderType,
-          tranid: status.tranid || tranid,
-          status: status.status,
-          statusText: status.status_text,
-          updated: Boolean(updated)
+          tranid: status?.tranid || tranid,
+          status: status?.status || "",
+          statusText: status?.status_text || "",
+          updated: Boolean(updated),
+          refreshAttempt: refreshAttempt + 1,
+          allocationRefresh,
+          allocationRefreshError
         }
       });
       for (const eventName of config.events) {
-        emitAppEvent(eventName, { orderId: id, tranid: status.tranid || tranid, orderType, source: "netsuite-webhook-delayed-status" });
+        emitAppEvent(eventName, { orderId: id, tranid: status?.tranid || tranid, orderType, source: "netsuite-webhook-delayed-status" });
+      }
+      const shouldRetryLineRefresh = orderType === "sales_order"
+        && refreshAttempt + 1 < maxLineRefreshAttempts
+        && (allocationRefreshError || Number(allocationRefresh?.unsettledLineCount || 0) > 0);
+      if (shouldRetryLineRefresh) {
+        scheduleTransactionStatusRefresh(orderType, id, {
+          tranid: status?.tranid || tranid,
+          delayMs: 30000,
+          refreshAttempt: refreshAttempt + 1,
+          maxLineRefreshAttempts
+        });
       }
     } catch (error) {
       await writeAudit({
@@ -4149,6 +4200,28 @@ app.post("/api/scm/transfer-dependencies/batches/:id/confirm", async (req, res, 
       hydrateTransferOrder: hydrateCreatedDependencyTransferOrder
     });
     emitAppEvent("dispatch.orders.updated", { source: "scm-transfer-dependency", refreshOrderPool: true });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/transfer-dependencies/batches/:id/proposals/:proposalId/confirm", async (req, res, next) => {
+  try {
+    if (!["admin", "scm", "scm_staff"].includes(normalizedOperatorRole(req.operator))) {
+      return res.status(403).json({ error: "SCM write access required." });
+    }
+    await refreshTransferDependencyBatchInventory(req.params.id, req.operator?.id);
+    const result = await confirmTransferDependencyBatch(req.params.id, {
+      operatorId: req.operator?.id,
+      proposalId: req.params.proposalId,
+      createTransferOrder: async ({ proposal, batch }) => {
+        const request = await transferDependencyRestPayload({ proposal, batch });
+        return createTransferOrderInNetSuite(request.payload, { intercompany: request.intercompany });
+      },
+      hydrateTransferOrder: hydrateCreatedDependencyTransferOrder
+    });
+    emitAppEvent("dispatch.orders.updated", { source: "scm-transfer-dependency-proposal", refreshOrderPool: true });
     res.json(result);
   } catch (error) {
     next(error);

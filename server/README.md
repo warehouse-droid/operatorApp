@@ -135,7 +135,26 @@ For Sales Orders, the server also schedules a lightweight NetSuite status check
 change the order from Pending Approval to Pending Fulfillment shortly after the
 User Event webhook fires.
 
-Deploy `server/netsuite-order-webhook-user-event.js` in NetSuite as a User Event Script on:
+The webhook uses two SuiteScripts so external HTTP never blocks transaction
+approval workflows:
+
+1. Upload `server/netsuite-order-webhook-scheduled.js` and create a Scheduled
+   Script with script ID `customscript_mbbs_order_webhook_worker`.
+2. Add these Scheduled Script parameters as Free-Form Text fields:
+
+```text
+custscriptmbbs_wh_record_type
+custscriptmbbs_wh_record_id
+custscriptmbbs_wh_event_type
+custscriptmbbs_wh_url
+custscriptmbbs_wh_secret
+```
+
+3. Create at least one deployment with status `Not Scheduled`. For accounts
+   with frequent transaction updates, create multiple deployments so NetSuite
+   can select an available worker.
+4. Upload `server/netsuite-order-webhook-user-event.js` and deploy it as a User
+   Event Script on:
 
 - Sales Order
 - Purchase Order
@@ -147,6 +166,14 @@ Script parameters:
 custscriptmbbs_webhook_url=https://your-server.example/api/webhooks/netsuite/order
 custscriptwh_webhook_secret_i=<NETSUITE_WEBHOOK_SECRET>
 ```
+
+The User Event queues the Scheduled Script and returns immediately. Leave
+`custscriptmbbs_webhook_worker_deploy` empty to let NetSuite choose an available
+worker deployment. If the Scheduled Script uses a different script ID, add
+`custscriptmbbs_webhook_worker_script` to the User Event and set that value.
+
+The Scheduled Script parameters receive their values from the queued task; do
+not place the webhook secret directly in the script source file.
 
 The script also accepts the older parameter IDs `custscript_mbbs_webhook_url` and
 `custscript_mbbs_webhook_secret`, plus a few typo-tolerant variants. These

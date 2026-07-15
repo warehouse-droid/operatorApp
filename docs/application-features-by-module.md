@@ -656,6 +656,7 @@ Primary files:
 - `server/src/order-sync-repository.js`
 - `server/src/sync-delivery.js`
 - `server/netsuite-order-webhook-user-event.js`
+- `server/netsuite-order-webhook-scheduled.js`
 
 Features:
 
@@ -664,7 +665,8 @@ Features:
 - Manual sync and automatic sync.
 - Background sync with progress polling.
 - Webhook endpoint: `POST /api/webhooks/netsuite/order`.
-- User Event script for SO, PO, TO sends webhook payloads.
+- Lightweight User Event for SO, PO, and TO queues an asynchronous Scheduled
+  Script, preventing webhook latency or failure from blocking approval workflows.
 - SO webhook has delayed status refresh to handle NetSuite auto-approval workflow.
 - PO webhook also supports delayed status update where needed.
 - Sync retrieves pending and partially completed orders with remaining quantity.
