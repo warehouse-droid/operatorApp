@@ -19,6 +19,7 @@ import {
   syncDirectDependencyOperatorProgress,
   syncOrderDependenciesForTransferOrder,
   syncOrderDependenciesFromDispatchPlan,
+  updateTransferDependencyBatch,
   validateDispatchPlanDependencies
 } from "./order-dependency-repository.js";
 import {
@@ -255,6 +256,43 @@ try {
     });
     check(batch.proposals.length === 2, "Suggestion should cover the shortage from two source yards.", { batch });
     check(batch.uncoveredShortageQuantity === 0, "Suggestion should fully cover the shortage.", { batch });
+    check(batch.proposals.every((proposal) => proposal.lines.every((proposalLine) =>
+      proposalLine.quantities?.pallets === proposalLine.proposedQuantity)),
+    "Generated Auto Transfer proposals must default conversion-unit inputs to the suggested required quantity.",
+    { proposals: batch.proposals });
+    const editableProposal = batch.proposals[0];
+    const editableLine = editableProposal.lines[0];
+    const originalQuantity = editableLine.proposedQuantity;
+    const convertedDraft = await updateTransferDependencyBatch(batch.id, {
+      proposals: [{
+        id: editableProposal.id,
+        mode: editableProposal.mode,
+        fromLocationId: editableProposal.fromLocationId,
+        toLocationId: editableProposal.toLocationId,
+        memo: editableProposal.memo,
+        lines: [{
+          salesLineId: editableLine.salesLineId,
+          quantities: { pallets: 1, layers: 0, sections: 0, pieces: 2, salesQty: 0 }
+        }]
+      }]
+    }, "dependency-harness");
+    const convertedLine = convertedDraft.proposals.find((proposal) => proposal.id === editableProposal.id)?.lines[0];
+    check(convertedLine?.proposedQuantity === 3 && convertedLine?.quantities?.pallets === 1 && convertedLine?.quantities?.pieces === 2,
+      "Auto Transfer proposal unit inputs must persist their exact PLT/LYR/SEC/PCS selection and converted sales quantity.",
+      { convertedLine });
+    await updateTransferDependencyBatch(batch.id, {
+      proposals: [{
+        id: editableProposal.id,
+        mode: editableProposal.mode,
+        fromLocationId: editableProposal.fromLocationId,
+        toLocationId: editableProposal.toLocationId,
+        memo: editableProposal.memo,
+        lines: [{
+          salesLineId: editableLine.salesLineId,
+          quantities: { pallets: originalQuantity, layers: 0, sections: 0, pieces: 0, salesQty: 0 }
+        }]
+      }]
+    }, "dependency-harness");
     await prepareTransferDependencyPalletItem(batch.id, { itemId: palletItemId, itemName: "PALLET" }, "dependency-harness");
 
     await query("UPDATE sales_orders SET is_test_fixture = true WHERE netsuite_id = $1", [salesOrderId]);

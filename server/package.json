@@ -10,6 +10,7 @@
     "test:rollback-endpoints": "node src/rollback-test-harness.js",
     "test:consolidation": "node src/consolidation-pick-harness.js",
     "test:order-dependencies": "node src/order-dependency-harness.js",
+    "test:dispatch-links": "node src/dispatch-link-target-harness.js",
     "test:sync-shape": "node src/sync-shape-harness.js",
     "seed:transfer-dependencies": "node src/seed-transfer-dependency-orders.js",
     "repair:auto-transfer-to-status": "node src/repair-auto-transfer-to-status.js",

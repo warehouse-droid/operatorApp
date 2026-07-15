@@ -3,6 +3,7 @@ import { query, withTransaction } from "./db.js";
 import { isNetSuiteSandboxEnvironment } from "./config.js";
 import { writeAudit } from "./auth-repository.js";
 import { getDispatchDeliveryGroup, listDispatchDeliveryGroups } from "./dispatch-delivery-group-repository.js";
+import { remapDispatchLinksToMaterializedSplit } from "./dispatch-order-target-repository.js";
 
 function normalizeNumber(value) {
   if (value === null || value === undefined || value === "") return null;
@@ -1942,6 +1943,7 @@ async function materializeSalesSplitOrder(order, parent) {
       ]
     );
   }
+  await remapDispatchLinksToMaterializedSplit(order, splitId);
   return splitId;
 }
 

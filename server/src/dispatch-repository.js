@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { pool, query } from "./db.js";
+import { pool, query, withTransaction } from "./db.js";
 import { isNetSuiteSandboxEnvironment } from "./config.js";
 import {
   enrichPurchaseOrderDispatch,
@@ -7,6 +7,7 @@ import {
   enrichTransferDispatch,
   useNetSuiteAddressMappingValue
 } from "./dispatch-enrichment.js";
+import { resolveDispatchSalesTarget } from "./dispatch-order-target-repository.js";
 
 function toNumber(value) {
   return Number(value || 0) || 0;
@@ -1355,7 +1356,34 @@ function availableUnitQty(row, unit) {
     0
   );
   if (!conversion) return byUnit || (!hasCustomQuantity(row) && unit === "piece" ? remainingSales : byUnit);
+  if (!hasCustomQuantity(row)) return Math.floor((remainingSales / conversion) + 0.000001);
   return Math.min(byUnit, Math.floor((remainingSales / conversion) + 0.000001));
+}
+
+function availableUnitSelection(row) {
+  const remainingSales = Math.max(
+    positiveQuantity(row.quantity) - positiveQuantity(row.netsuite_received_qty) - positiveQuantity(row.allocated_sales_qty),
+    0
+  );
+  if (hasCustomQuantity(row)) {
+    return {
+      pallets: availableUnitQty(row, "pallet"),
+      layers: availableUnitQty(row, "layer"),
+      sections: availableUnitQty(row, "section"),
+      pieces: availableUnitQty(row, "piece"),
+      salesQty: remainingSales
+    };
+  }
+  if (!hasConversion(row)) return { pallets: 0, layers: 0, sections: 0, pieces: 0, salesQty: remainingSales };
+  let remainder = remainingSales;
+  const result = { pallets: 0, layers: 0, sections: 0, pieces: 0, salesQty: 0 };
+  for (const [field, conversionField] of [["pallets", "to_plt"], ["layers", "to_lyr"], ["sections", "to_sec"], ["pieces", "to_pcs"]]) {
+    const conversion = positiveQuantity(row[conversionField]);
+    if (!conversion || remainder <= 0.000001) continue;
+    result[field] = Math.floor((remainder / conversion) + 0.000001);
+    remainder = Math.max(0, Number((remainder - (result[field] * conversion)).toFixed(6)));
+  }
+  return result;
 }
 
 function syntheticPurchaseOrderId(value) {
@@ -3577,6 +3605,9 @@ function normalizeAllocationRow(row) {
     salesOrderId: row.sales_order_id,
     salesOrderRef: row.sales_order_ref,
     salesLineId: row.sales_line_id,
+    dispatchTargetRef: row.dispatch_target_ref || row.sales_order_ref,
+    dispatchTargetKind: row.dispatch_target_kind || "normal",
+    targetLineKey: row.dispatch_target_line_key || "",
     poOrderId: row.po_order_id,
     poOrderRef: row.po_order_ref,
     poLineId: row.po_line_id,
@@ -3597,46 +3628,138 @@ function normalizeAllocationRow(row) {
   };
 }
 
-export async function getSalesOrderPoAllocationOptions(orderRef) {
-  const order = await query(
-    `SELECT netsuite_id, tranid, customer, outbound_location
-       FROM sales_orders
-      WHERE tranid = $1 OR netsuite_id::text = $1
-      LIMIT 1`,
-    [String(orderRef || "").trim()]
-  );
-  if (!order.rows[0]) throw new Error("Sales order not found.");
-  const salesOrder = order.rows[0];
+function dispatchItemLineIdentities(item = {}) {
+  return [...new Set([
+    item.lineRowId,
+    item.sourceLineId,
+    item.lineId,
+    item.line_id,
+    item.id
+  ].map((value) => String(value || "").trim()).filter(Boolean))];
+}
 
-  const salesLines = await query(
-    `WITH alloc AS (
-       SELECT sales_line_id,
-              SUM(allocated_pallet_qty) AS allocated_pallet_qty,
-              SUM(allocated_layer_qty) AS allocated_layer_qty,
-              SUM(allocated_section_qty) AS allocated_section_qty,
-              SUM(allocated_piece_qty) AS allocated_piece_qty,
-              SUM(allocated_sales_qty) AS allocated_sales_qty
-         FROM dispatch_so_po_allocations
-        WHERE status = 'active'
-        GROUP BY sales_line_id
-     )
-     SELECT l.*,
-            COALESCE(a.allocated_pallet_qty, 0) AS allocated_pallet_qty,
-            COALESCE(a.allocated_layer_qty, 0) AS allocated_layer_qty,
-            COALESCE(a.allocated_section_qty, 0) AS allocated_section_qty,
-            COALESCE(a.allocated_piece_qty, 0) AS allocated_piece_qty,
-            COALESCE(a.allocated_sales_qty, 0) AS allocated_sales_qty
-       FROM sales_order_lines l
-       LEFT JOIN alloc a ON a.sales_line_id = l.id
-      WHERE l.sales_order_id = $1
-        AND l.netsuite_active = true
-        AND COALESCE(l.item_type, '') IN ('InvtPart', 'NonInvtPart')
-      ORDER BY l.line_id NULLS LAST, l.id`,
-    [salesOrder.netsuite_id]
-  );
+function allocationMatchesDispatchItem(allocation = {}, item = {}, sourceRefs = []) {
+  const key = String(allocation.dispatch_target_line_key || "");
+  const identities = dispatchItemLineIdentities(item);
+  if (!identities.some((identity) => key.endsWith(`::${identity}`))) return false;
+  const sources = sourceRefs.map((value) => String(value || "").trim()).filter(Boolean);
+  return !sources.length || sources.some((source) => key.includes(`::${source}::`));
+}
 
-  const itemIds = [...new Set(salesLines.rows.map((line) => line.item_id).filter(Boolean))];
-  const itemNames = [...new Set(salesLines.rows.map((line) => String(line.sku || line.item_name || "").trim()).filter(Boolean))];
+function applyTargetPoAllocationsToOrder(order = {}, allocations = []) {
+  const applyItems = (candidate) => {
+    const sources = [candidate.id, candidate.originalOrderId];
+    const childOrderDetails = (candidate.childOrderDetails || []).map(applyItems);
+    const items = childOrderDetails.length
+      ? childOrderDetails.flatMap((child) => child.items || [])
+      : (candidate.items || []).map((item) => {
+          const matches = allocations.filter((allocation) => allocationMatchesDispatchItem(allocation, item, sources));
+          if (!matches.length) return item;
+          return {
+            ...item,
+            poAllocatedPallets: matches.reduce((sum, row) => sum + positiveQuantity(row.allocated_pallet_qty), 0),
+            poAllocatedLayers: matches.reduce((sum, row) => sum + positiveQuantity(row.allocated_layer_qty), 0),
+            poAllocatedSections: matches.reduce((sum, row) => sum + positiveQuantity(row.allocated_section_qty), 0),
+            poAllocatedPieces: matches.reduce((sum, row) => sum + positiveQuantity(row.allocated_piece_qty), 0),
+            poAllocatedSalesQty: matches.reduce((sum, row) => sum + positiveQuantity(row.allocated_sales_qty), 0)
+          };
+        });
+    return { ...candidate, childOrderDetails, items };
+  };
+  const enriched = applyItems(order);
+  const manifestByLocation = new Map();
+  for (const allocation of allocations) {
+    const location = allocation.po_vendor_yard || allocation.po_vendor || "";
+    if (!location) continue;
+    const key = `${allocation.po_order_ref || ""}|${location}`;
+    const entry = manifestByLocation.get(key) || {
+      poOrderRef: allocation.po_order_ref || "",
+      location,
+      address: allocation.po_address || "",
+      items: []
+    };
+    entry.items.push({
+      itemId: allocation.item_id,
+      itemName: allocation.item_name,
+      sku: allocation.sku,
+      unit: allocation.unit || "",
+      pallets: positiveQuantity(allocation.allocated_pallet_qty),
+      layers: positiveQuantity(allocation.allocated_layer_qty),
+      sections: positiveQuantity(allocation.allocated_section_qty),
+      pieces: positiveQuantity(allocation.allocated_piece_qty),
+      quantity: positiveQuantity(allocation.allocated_sales_qty)
+    });
+    manifestByLocation.set(key, entry);
+  }
+  const poPickupManifest = [...manifestByLocation.values()];
+  return {
+    ...enriched,
+    pickupLocations: [...new Set([
+      ...(enriched.pickupLocations || []),
+      ...poPickupManifest.map((entry) => entry.location).filter(Boolean)
+    ])],
+    poPickupManifest
+  };
+}
+
+export async function enrichDispatchOrdersWithPoTargetAllocations(orders = []) {
+  if (!orders.length) return orders;
+  const refs = [...new Set(orders.map((order) => String(order?.id || "").trim()).filter(Boolean))];
+  const result = await query(
+    `SELECT allocation.*, po.vendor AS po_vendor, po.dispatch_vendor_yard AS po_vendor_yard,
+            po.dispatch_address AS po_address, po_line.unit
+       FROM dispatch_so_po_allocations allocation
+       LEFT JOIN purchase_orders po ON po.netsuite_id = allocation.po_order_id
+       LEFT JOIN purchase_order_lines po_line ON po_line.id = allocation.po_line_id
+      WHERE allocation.status = 'active'
+        AND allocation.dispatch_target_ref = ANY($1::text[])
+      ORDER BY allocation.dispatch_target_ref, allocation.po_order_ref, allocation.id`,
+    [refs]
+  );
+  const byTarget = new Map();
+  for (const allocation of result.rows) {
+    const ref = String(allocation.dispatch_target_ref || allocation.sales_order_ref || "");
+    if (!byTarget.has(ref)) byTarget.set(ref, []);
+    byTarget.get(ref).push(allocation);
+  }
+  return orders.map((order) => {
+    const allocations = byTarget.get(String(order?.id || "")) || [];
+    return allocations.length ? applyTargetPoAllocationsToOrder(order, allocations) : order;
+  });
+}
+
+function targetLineAsAllocationRow(line = {}) {
+  return {
+    id: line.salesLineId,
+    line_id: line.lineId,
+    item_id: line.itemId,
+    sku: line.sku,
+    item_name: line.itemName,
+    item_description: line.description,
+    unit: line.unit,
+    quantity: line.quantity,
+    pallet_qty: line.pallets,
+    layer_qty: line.layers,
+    section_qty: line.sections,
+    piece_qty: line.pieces,
+    to_plt: line.toPlt,
+    to_lyr: line.toLyr,
+    to_sec: line.toSec,
+    to_pcs: line.toPcs,
+    netsuite_received_qty: 0,
+    allocated_pallet_qty: line.poAllocatedPallets,
+    allocated_layer_qty: line.poAllocatedLayers,
+    allocated_section_qty: line.poAllocatedSections,
+    allocated_piece_qty: line.poAllocatedPieces,
+    allocated_sales_qty: line.poAllocatedSalesQty
+  };
+}
+
+export async function getSalesOrderPoAllocationOptions(orderRef, { planDate = "" } = {}) {
+  const resolved = await resolveDispatchSalesTarget({ dispatchTargetRef: orderRef, planDate });
+  const salesLines = resolved.lines.map(targetLineAsAllocationRow);
+  const itemIds = [...new Set(salesLines.map((line) => line.item_id).filter(Boolean))];
+  const itemNames = [...new Set(salesLines.map((line) => String(line.sku || line.item_name || "").trim()).filter(Boolean))];
   const poParams = [itemIds, itemNames];
   const poLines = await query(
     `WITH alloc AS (
@@ -3680,21 +3803,27 @@ export async function getSalesOrderPoAllocationOptions(orderRef) {
     `SELECT a.*, po.vendor AS po_vendor, po.dispatch_vendor_yard AS po_vendor_yard, po.dispatch_address AS po_address
        FROM dispatch_so_po_allocations a
        LEFT JOIN purchase_orders po ON po.netsuite_id = a.po_order_id
-      WHERE a.sales_order_id = $1
+      WHERE a.dispatch_target_ref = $1
         AND a.status = 'active'
       ORDER BY a.created_at DESC, a.id DESC`,
-    [salesOrder.netsuite_id]
+    [resolved.target.ref]
   );
 
   return {
     order: {
-      id: salesOrder.tranid,
-      netsuiteId: salesOrder.netsuite_id,
-      customer: salesOrder.customer || "",
-      outboundLocation: salesOrder.outbound_location || ""
+      id: resolved.target.ref,
+      kind: resolved.target.kind,
+      memberRefs: resolved.target.memberRefs,
+      customer: resolved.target.customer || "",
+      outboundLocation: resolved.target.outboundLocation || "",
+      targetSignature: resolved.signature
     },
-    salesLines: salesLines.rows.map((line) => ({
+    salesLines: resolved.lines.map((targetLine) => {
+      const line = targetLineAsAllocationRow(targetLine);
+      return {
       id: line.id,
+      targetLineKey: targetLine.targetLineKey,
+      sourceOrderRef: targetLine.sourceOrderRef,
       lineId: line.line_id,
       itemId: line.item_id,
       sku: line.sku || line.item_name,
@@ -3715,14 +3844,14 @@ export async function getSalesOrderPoAllocationOptions(orderRef) {
         pieces: positiveQuantity(line.allocated_piece_qty),
         salesQty: positiveQuantity(line.allocated_sales_qty)
       },
-      available: {
-        pallets: availableUnitQty(line, "pallet"),
-        layers: availableUnitQty(line, "layer"),
-        sections: availableUnitQty(line, "section"),
-        pieces: hasCustomQuantity(line) ? availableUnitQty(line, "piece") : 0,
-        salesQty: Math.max(positiveQuantity(line.quantity) - positiveQuantity(line.allocated_sales_qty), 0)
+      available: availableUnitSelection(line),
+      conversions: {
+        pallets: positiveQuantity(line.to_plt),
+        layers: positiveQuantity(line.to_lyr),
+        sections: positiveQuantity(line.to_sec),
+        pieces: positiveQuantity(line.to_pcs)
       }
-    })),
+    }; }),
     poLines: poLines.rows.map((line) => ({
       id: line.id,
       orderId: line.purchase_order_id,
@@ -3751,46 +3880,33 @@ export async function getSalesOrderPoAllocationOptions(orderRef) {
         pieces: positiveQuantity(line.allocated_piece_qty),
         salesQty: positiveQuantity(line.allocated_sales_qty)
       },
-      available: {
-        pallets: availableUnitQty(line, "pallet"),
-        layers: availableUnitQty(line, "layer"),
-        sections: availableUnitQty(line, "section"),
-        pieces: hasCustomQuantity(line) ? availableUnitQty(line, "piece") : 0,
-        salesQty: Math.max(positiveQuantity(line.quantity) - positiveQuantity(line.netsuite_received_qty) - positiveQuantity(line.allocated_sales_qty), 0)
-      }
+      available: availableUnitSelection(line)
     })),
     allocations: allocations.rows.map(normalizeAllocationRow)
   };
 }
 
-async function createSalesOrderPoAllocationWithExecutor(executor, { salesOrderRef, salesLineId, poLineId, poRef = "", quantities = {}, createdBy = "" } = {}) {
-  const sales = await executor.query(
-    `WITH alloc AS (
-       SELECT sales_line_id,
-              SUM(allocated_pallet_qty) AS allocated_pallet_qty,
-              SUM(allocated_layer_qty) AS allocated_layer_qty,
-              SUM(allocated_section_qty) AS allocated_section_qty,
-              SUM(allocated_piece_qty) AS allocated_piece_qty,
-              SUM(allocated_sales_qty) AS allocated_sales_qty
-         FROM dispatch_so_po_allocations
-        WHERE status = 'active'
-        GROUP BY sales_line_id
-     )
-     SELECT l.*, o.tranid AS sales_order_ref,
-            COALESCE(a.allocated_pallet_qty, 0) AS allocated_pallet_qty,
-            COALESCE(a.allocated_layer_qty, 0) AS allocated_layer_qty,
-            COALESCE(a.allocated_section_qty, 0) AS allocated_section_qty,
-            COALESCE(a.allocated_piece_qty, 0) AS allocated_piece_qty,
-            COALESCE(a.allocated_sales_qty, 0) AS allocated_sales_qty
-       FROM sales_order_lines l
-       JOIN sales_orders o ON o.netsuite_id = l.sales_order_id
-       LEFT JOIN alloc a ON a.sales_line_id = l.id
-      WHERE (o.tranid = $1 OR o.netsuite_id::text = $1)
-        AND l.id = $2
-        AND l.netsuite_active = true`,
-    [String(salesOrderRef || "").trim(), salesLineId]
-  );
-  const salesLine = sales.rows[0];
+async function createSalesOrderPoAllocationWithExecutor(executor, {
+  dispatchTargetRef = "", salesOrderRef, targetLineKey = "", salesLineId, poLineId, poRef = "",
+  planDate = "", targetSignature = "", quantities = {}, createdBy = ""
+} = {}) {
+  const resolved = await resolveDispatchSalesTarget({
+    dispatchTargetRef: dispatchTargetRef || salesOrderRef,
+    planDate
+  });
+  if (targetSignature && targetSignature !== resolved.signature) {
+    const error = new Error(`${resolved.target.ref} changed while the link window was open. Refresh before linking the PO.`);
+    error.status = 409;
+    error.code = "DISPATCH_TARGET_CHANGED";
+    throw error;
+  }
+  const targetLine = resolved.lines.find((line) => line.targetLineKey === String(targetLineKey || ""))
+    || resolved.lines.find((line) => Number(line.salesLineId) === Number(salesLineId));
+  const salesLine = targetLine ? {
+    ...targetLineAsAllocationRow(targetLine),
+    sales_order_id: targetLine.sourceOrderId,
+    sales_order_ref: targetLine.sourceOrderRef
+  } : null;
   if (!salesLine) throw new Error("Sales order line not found.");
 
   const poParams = poLineId ? [poLineId] : [String(poRef || "").trim(), salesLine.item_id || null, salesLine.sku || salesLine.item_name || ""];
@@ -3865,11 +3981,12 @@ async function createSalesOrderPoAllocationWithExecutor(executor, { salesOrderRe
     `INSERT INTO dispatch_so_po_allocations (
        sales_order_id, sales_order_ref, sales_line_id, po_order_id, po_order_ref, po_line_id,
        item_id, item_name, sku, allocated_pallet_qty, allocated_layer_qty, allocated_section_qty,
-       allocated_piece_qty, allocated_sales_qty, created_by, details
+       allocated_piece_qty, allocated_sales_qty, created_by, details,
+       dispatch_target_ref, dispatch_target_kind, dispatch_target_line_key
      ) VALUES (
        $1, $2, $3, $4, $5, $6,
        $7, $8, $9, $10, $11, $12,
-       $13, $14, $15, $16::jsonb
+       $13, $14, $15, $16::jsonb, $17, $18, $19
      )
      RETURNING *`,
     [
@@ -3892,7 +4009,10 @@ async function createSalesOrderPoAllocationWithExecutor(executor, { salesOrderRe
         poVendor: poLine.vendor || "",
         poVendorYard: poLine.dispatch_vendor_yard || "",
         poAddress: poLine.dispatch_address || ""
-      })
+      }),
+      resolved.target.ref,
+      resolved.target.kind,
+      targetLine.targetLineKey
     ]
   );
   return normalizeAllocationRow({
@@ -3907,10 +4027,13 @@ export async function createSalesOrderPoAllocation(options = {}) {
   return createSalesOrderPoAllocationWithExecutor({ query }, options);
 }
 
-export async function createSalesOrderPoAllocations({ salesOrderRef, poRef = "", lines = [], createdBy = "" } = {}) {
+export async function createSalesOrderPoAllocations({
+  dispatchTargetRef = "", salesOrderRef, poRef = "", planDate = "", targetSignature = "", lines = [], createdBy = ""
+} = {}) {
   const cleaned = (Array.isArray(lines) ? lines : [])
     .map((line) => ({
       salesLineId: line.salesLineId,
+      targetLineKey: line.targetLineKey,
       quantities: line.quantities || line
     }))
     .filter((line) => {
@@ -3920,28 +4043,24 @@ export async function createSalesOrderPoAllocations({ salesOrderRef, poRef = "",
   if (!cleaned.length) throw new Error("At least one SO item quantity is required.");
   if (!String(poRef || "").trim()) throw new Error("Purchase order number is required.");
 
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const executor = { query: (text, params) => client.query(text, params) };
+  return withTransaction(async () => {
+    const executor = { query };
     const created = [];
     for (const line of cleaned) {
       created.push(await createSalesOrderPoAllocationWithExecutor(executor, {
+        dispatchTargetRef: dispatchTargetRef || salesOrderRef,
         salesOrderRef,
         salesLineId: line.salesLineId,
+        targetLineKey: line.targetLineKey,
         poRef,
+        planDate,
+        targetSignature,
         quantities: line.quantities,
         createdBy
       }));
     }
-    await client.query("COMMIT");
     return created;
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => null);
-    throw error;
-  } finally {
-    client.release();
-  }
+  });
 }
 
 export async function cancelSalesOrderPoAllocation(allocationId, { cancelledBy = "" } = {}) {

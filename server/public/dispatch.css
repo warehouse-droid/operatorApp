@@ -1140,21 +1140,49 @@ button[data-action="enter-edit-mode"]:disabled:hover {
   gap: 4px;
 }
 
-.scm-dependency-proposal-lines label {
+.scm-dependency-proposal-lines small {
+  color: #657883;
+  font-size: 10px;
+}
+
+.scm-dependency-proposal-line.link-quantity-line {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 6px;
+  padding: 7px;
+}
+
+.scm-dependency-line-info {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 110px;
-  gap: 7px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
   align-items: center;
 }
 
-.scm-dependency-proposal-lines label > span {
+.scm-dependency-line-info > span {
   min-width: 0;
   display: grid;
 }
 
-.scm-dependency-proposal-lines small {
-  color: #657883;
-  font-size: 10px;
+.scm-dependency-line-info .link-sales-equivalent {
+  overflow: visible;
+  color: #075f8f;
+  font-size: 14px;
+  text-align: right;
+}
+
+.scm-dependency-proposal-line .link-quantity-units {
+  grid-template-columns: repeat(4, minmax(58px, 1fr));
+}
+
+.scm-dependency-proposal-line .link-quantity-units label {
+  font-size: 13px;
+}
+
+.scm-dependency-proposal-line .link-quantity-units input {
+  min-height: 42px;
+  padding: 8px 9px;
+  font-size: 17px;
+  font-weight: 900;
 }
 
 .scm-dependency-pallet-summary {
@@ -1260,6 +1288,17 @@ button[data-action="enter-edit-mode"]:disabled:hover {
   font: inherit;
 }
 
+.order-dependency-linked select {
+  min-width: 160px;
+  flex: 0 1 190px;
+}
+
+.order-dependency-linked .dependency-action-button {
+  min-width: 88px;
+  flex: 0 0 88px;
+  white-space: nowrap;
+}
+
 .order-dependency-lines {
   display: flex;
   flex-wrap: wrap;
@@ -1268,7 +1307,7 @@ button[data-action="enter-edit-mode"]:disabled:hover {
 
 .order-dependency-link-grid {
   display: grid;
-  grid-template-columns: minmax(150px, 1fr) minmax(150px, 1fr) 150px auto;
+  grid-template-columns: minmax(170px, 1fr) minmax(190px, 1fr) 180px;
   gap: 7px;
   align-items: end;
 }
@@ -1277,6 +1316,30 @@ button[data-action="enter-edit-mode"]:disabled:hover {
   min-width: 0;
   display: grid;
   gap: 3px;
+}
+
+.to-link-ref-field {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.to-link-ref-field > label {
+  color: #526a74;
+  font-size: 10px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.to-link-ref-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px;
+}
+
+.to-link-ref-control button {
+  min-width: 104px;
+  white-space: nowrap;
 }
 
 .order-dependency-link-grid label > span {
@@ -1289,18 +1352,8 @@ button[data-action="enter-edit-mode"]:disabled:hover {
 .order-dependency-match-lines {
   display: grid;
   gap: 5px;
-}
-
-.order-dependency-match-lines label {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 120px;
-  gap: 8px;
-  align-items: center;
-}
-
-.order-dependency-match-lines label > span {
-  min-width: 0;
-  display: grid;
+  max-height: 310px;
+  overflow: auto;
 }
 
 @media (max-width: 1500px) {
@@ -1315,6 +1368,15 @@ button[data-action="enter-edit-mode"]:disabled:hover {
 }
 
 @media (max-width: 850px) {
+  .order-dependency-link-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .order-dependency-linked {
+    align-items: stretch;
+    flex-wrap: wrap;
+  }
+
   .scm-dependency-toolbar {
     flex-wrap: wrap;
   }
@@ -4413,24 +4475,24 @@ button[data-action="enter-edit-mode"]:disabled:hover {
   gap: 8px;
 }
 
-.po-link-line {
+.link-quantity-line {
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 8px;
   display: grid;
-  grid-template-columns: minmax(180px, 1fr) repeat(4, minmax(72px, 92px));
+  grid-template-columns: minmax(220px, 1fr) minmax(260px, 0.9fr);
   gap: 8px;
-  align-items: end;
+  align-items: center;
 }
 
-.po-link-line > div {
+.link-quantity-info {
   min-width: 0;
   display: grid;
   gap: 2px;
 }
 
-.po-link-line > div span,
-.po-link-line > div em {
+.link-quantity-info span,
+.link-quantity-info em {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -4441,15 +4503,34 @@ button[data-action="enter-edit-mode"]:disabled:hover {
   font-weight: 800;
 }
 
-.po-link-line label {
+.link-quantity-info .link-sales-equivalent {
+  color: #075f8f;
+  font-weight: 900;
+}
+
+.link-quantity-units {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(64px, 1fr));
+  gap: 7px;
+}
+
+.link-quantity-units label {
   display: grid;
   gap: 4px;
   font-size: 11px;
   font-weight: 900;
 }
 
-.po-link-line input {
+.link-quantity-units input {
   min-width: 0;
+}
+
+@media (max-width: 850px) {
+  .link-quantity-line {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: stretch;
+  }
 }
 
 .split-preview {

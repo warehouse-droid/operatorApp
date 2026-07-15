@@ -53,6 +53,105 @@ function depUnitText(line = {}, quantityField = "unresolvedQuantity") {
   return parts.length ? parts.join(" ") : `${depQty(line[quantityField])} ${line.unit || "UOM"}`;
 }
 
+function depProposalConversions(line = {}) {
+  return {
+    pallets: depNumber(line.conversions?.pallets ?? line.toPlt),
+    layers: depNumber(line.conversions?.layers ?? line.toLyr),
+    sections: depNumber(line.conversions?.sections ?? line.toSec),
+    pieces: depNumber(line.conversions?.pieces ?? line.toPcs)
+  };
+}
+
+function depProposalQuantities(line = {}) {
+  if (line.quantities && typeof line.quantities === "object") return { ...line.quantities };
+  const conversions = depProposalConversions(line);
+  const hasConversion = Object.values(conversions).some((value) => value > 0);
+  return hasConversion ? {
+    pallets: depNumber(line.palletQty),
+    layers: depNumber(line.layerQty),
+    sections: depNumber(line.sectionQty),
+    pieces: depNumber(line.pieceQty),
+    salesQty: 0
+  } : { pallets: 0, layers: 0, sections: 0, pieces: 0, salesQty: depNumber(line.proposedQuantity) };
+}
+
+function depProposalSalesQuantity(values = {}, conversions = {}) {
+  const converted = ["pallets", "layers", "sections", "pieces"].reduce(
+    (sum, unit) => sum + (depNumber(values[unit]) * depNumber(conversions[unit])),
+    0
+  );
+  return Number((converted > 0 ? converted : depNumber(values.salesQty)).toFixed(6));
+}
+
+function updateProposalSalesEquivalent(row) {
+  if (!row) return;
+  const quantities = {};
+  for (const input of row.querySelectorAll("[data-proposal-unit]")) {
+    quantities[input.dataset.proposalUnit] = depNumber(input.value);
+  }
+  const conversions = {
+    pallets: depNumber(row.dataset.toPlt),
+    layers: depNumber(row.dataset.toLyr),
+    sections: depNumber(row.dataset.toSec),
+    pieces: depNumber(row.dataset.toPcs)
+  };
+  const equivalent = row.querySelector("[data-proposal-sales-equivalent]");
+  if (equivalent) equivalent.textContent = `${depQty(depProposalSalesQuantity(quantities, conversions))} ${row.dataset.salesUnit || "UOM"}`;
+}
+
+function updateProposalPalletEstimate(card) {
+  if (!card) return;
+  let calculated = 0;
+  let explicit = 0;
+  let complete = true;
+  const materialByItem = new Map();
+  for (const row of card.querySelectorAll("[data-sales-line-id]")) {
+    const quantities = Object.fromEntries([...row.querySelectorAll("[data-proposal-unit]")]
+      .map((input) => [input.dataset.proposalUnit, depNumber(input.value)]));
+    const conversions = {
+      pallets: depNumber(row.dataset.toPlt),
+      layers: depNumber(row.dataset.toLyr),
+      sections: depNumber(row.dataset.toSec),
+      pieces: depNumber(row.dataset.toPcs)
+    };
+    const salesQuantity = depProposalSalesQuantity(quantities, conversions);
+    if (salesQuantity <= 0) continue;
+    if (String(row.dataset.itemName || "").trim().toUpperCase() === "PALLET") {
+      explicit += salesQuantity;
+      continue;
+    }
+    const itemKey = row.dataset.itemId || row.dataset.itemName || row.dataset.salesLineId;
+    const material = materialByItem.get(itemKey) || { quantity: 0, toPlt: conversions.pallets };
+    material.quantity += salesQuantity;
+    if (!material.toPlt) material.toPlt = conversions.pallets;
+    materialByItem.set(itemKey, material);
+  }
+  for (const material of materialByItem.values()) {
+    if (material.toPlt <= 0) {
+      complete = false;
+      continue;
+    }
+    calculated += Math.ceil(Math.max(0, material.quantity - 0.000001) / material.toPlt);
+  }
+  calculated = Number(calculated.toFixed(6));
+  explicit = Number(explicit.toFixed(6));
+  const recommended = Math.max(calculated, explicit);
+  const calculatedOutput = card.querySelector("[data-calculated-pallet]");
+  if (calculatedOutput) calculatedOutput.textContent = depQty(calculated);
+  const finalInput = card.querySelector('[data-proposal-field="palletTransferQuantity"]');
+  if (finalInput && card.dataset.palletOverridden !== "true") {
+    finalInput.value = complete ? String(recommended) : "";
+    finalInput.placeholder = String(recommended);
+  }
+  const note = card.querySelector("[data-pallet-calculation-note]");
+  if (note) {
+    note.classList.toggle("warning-text", !complete);
+    note.textContent = complete
+      ? "One PALLET per full PLT, plus one for each SKU with loose remainder."
+      : "Manual quantity required: at least one item has no PLT conversion.";
+  }
+}
+
 async function depApi(path, options = {}) {
   const response = await fetch(path, {
     ...options,
@@ -149,7 +248,7 @@ function renderInventoryMatrix() {
 function renderProposal(proposal) {
   const editable = !["created", "creating", "attention"].includes(proposal.creationStatus);
   return `
-    <article class="scm-dependency-proposal" data-proposal-id="${proposal.id}">
+    <article class="scm-dependency-proposal" data-proposal-id="${proposal.id}" data-pallet-overridden="${proposal.palletQuantityOverridden === true}">
       <header>
         <strong>${depEscape(proposal.transferOrderRef || `Proposed TO ${proposal.id}`)}</strong>
         <span class="dependency-status status-${depEscape(proposal.creationStatus)}">${depEscape(proposal.creationStatus)}</span>
@@ -165,19 +264,42 @@ function renderProposal(proposal) {
       </div>
       <label class="scm-dependency-memo"><span>Memo</span><input data-proposal-field="memo" value="${depEscape(proposal.memo || "")}" ${editable ? "" : "disabled"} /></label>
       <div class="scm-dependency-proposal-lines">
-        ${proposal.lines.map((line) => `<label data-sales-line-id="${line.salesLineId}">
-          <span><strong>${depEscape(line.itemName)}</strong><small>${depEscape(line.unit || "")}</small></span>
-          <input data-line-field="proposedQuantity" type="number" min="0.001" step="0.001" value="${depNumber(line.proposedQuantity)}" ${editable ? "" : "disabled"} />
-        </label>`).join("")}
+        ${proposal.lines.map((line, lineIndex) => {
+          const conversions = depProposalConversions(line);
+          const values = depProposalQuantities(line);
+          const units = [
+            ["pallets", "PLT", conversions.pallets],
+            ["layers", "LYR", conversions.layers],
+            ["sections", "SEC", conversions.sections],
+            ["pieces", "PCS", conversions.pieces]
+          ].filter(([, , conversion]) => conversion > 0);
+          if (!units.length) units.push(["salesQty", line.unit || "UOM", 0]);
+          const salesQuantity = depProposalSalesQuantity(values, conversions);
+          return `<section class="scm-dependency-proposal-line link-quantity-line" data-sales-line-id="${line.salesLineId}"
+            data-item-id="${depEscape(line.itemId)}" data-item-name="${depEscape(line.itemName)}"
+            data-to-plt="${conversions.pallets}" data-to-lyr="${conversions.layers}"
+            data-to-sec="${conversions.sections}" data-to-pcs="${conversions.pieces}"
+            data-sales-unit="${depEscape(line.unit || "UOM")}">
+            <div class="link-quantity-info scm-dependency-line-info">
+              <span><strong>${depEscape(line.itemName)}</strong><small>Sales quantity</small></span>
+              <em class="link-sales-equivalent" data-proposal-sales-equivalent>${depQty(salesQuantity)} ${depEscape(line.unit || "UOM")}</em>
+            </div>
+            <div class="link-quantity-units">${units.map(([field, label]) => `<label>
+              <span>${depEscape(label)}</span>
+              <input id="proposal-${proposal.id}-${lineIndex}-${field}" data-proposal-unit="${field}" type="number"
+                min="0" step="${field === "salesQty" ? "0.001" : "1"}" value="${depNumber(values[field])}" ${editable ? "" : "disabled"} />
+            </label>`).join("")}</div>
+          </section>`;
+        }).join("")}
       </div>
       <div class="scm-dependency-pallet-summary">
-        <div><span>Calculated PALLET</span><strong>${depQty(proposal.calculatedPalletQuantity)}</strong></div>
+        <div><span>Calculated PALLET</span><strong data-calculated-pallet>${depQty(proposal.calculatedPalletQuantity)}</strong></div>
         <label><span>Final PALLET quantity</span>
           <input data-proposal-field="palletTransferQuantity" type="number" min="0" step="1"
             value="${!proposal.palletCalculationComplete && !proposal.palletQuantityOverridden ? "" : depNumber(proposal.palletTransferQuantity)}"
             placeholder="${depNumber(proposal.palletTransferQuantity)}" ${editable ? "" : "disabled"} />
         </label>
-        <small class="${proposal.palletCalculationComplete ? "" : "warning-text"}">${proposal.palletCalculationComplete
+        <small data-pallet-calculation-note class="${proposal.palletCalculationComplete ? "" : "warning-text"}">${proposal.palletCalculationComplete
           ? "One PALLET per full PLT, plus one for each SKU with loose remainder."
           : "Manual quantity required: at least one item has no PLT conversion."}</small>
       </div>
@@ -297,12 +419,24 @@ function collectDependencyBatchPayload() {
       toLocationId: Number(card.querySelector('[data-proposal-field="toLocationId"]')?.value),
       memo: card.querySelector('[data-proposal-field="memo"]')?.value,
       palletTransferQuantity: (() => {
+        if (card.dataset.palletOverridden !== "true") return undefined;
         const value = card.querySelector('[data-proposal-field="palletTransferQuantity"]')?.value;
         return value === "" || value === undefined ? null : Number(value);
       })(),
       lines: [...card.querySelectorAll("[data-sales-line-id]")].map((row) => ({
         salesLineId: Number(row.dataset.salesLineId),
-        proposedQuantity: Number(row.querySelector('[data-line-field="proposedQuantity"]')?.value)
+        quantities: Object.fromEntries([...row.querySelectorAll("[data-proposal-unit]")]
+          .map((input) => [input.dataset.proposalUnit, depNumber(input.value)])),
+        proposedQuantity: depProposalSalesQuantity(
+          Object.fromEntries([...row.querySelectorAll("[data-proposal-unit]")]
+            .map((input) => [input.dataset.proposalUnit, depNumber(input.value)])),
+          {
+            pallets: depNumber(row.dataset.toPlt),
+            layers: depNumber(row.dataset.toLyr),
+            sections: depNumber(row.dataset.toSec),
+            pieces: depNumber(row.dataset.toPcs)
+          }
+        )
       }))
     }))
   };
@@ -326,6 +460,17 @@ async function runDependencyAction(label, action) {
 
 let dependencySearchTimer = null;
 scmDependencyApp.addEventListener("input", (event) => {
+  if (event.target.matches("[data-proposal-unit]")) {
+    const row = event.target.closest("[data-sales-line-id]");
+    updateProposalSalesEquivalent(row);
+    updateProposalPalletEstimate(event.target.closest(".scm-dependency-proposal"));
+    return;
+  }
+  if (event.target.matches('[data-proposal-field="palletTransferQuantity"]')) {
+    const card = event.target.closest(".scm-dependency-proposal");
+    if (card) card.dataset.palletOverridden = "true";
+    return;
+  }
   if (event.target.dataset.field !== "candidate-search") return;
   dependencyState.search = event.target.value;
   clearTimeout(dependencySearchTimer);

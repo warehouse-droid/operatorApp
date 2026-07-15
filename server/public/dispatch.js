@@ -361,8 +361,15 @@ let splitParts = 2;
 let splitDraft = { orderId: "", parts: 0, items: {} };
 let poAllocationOptions = null;
 let poAllocationLoading = false;
+let poAllocationError = "";
 let orderDependencyOptions = null;
 let orderDependencyLoading = false;
+let orderDependencyError = "";
+const linkModalDrafts = new Map();
+let orderDependencyRequestSequence = 0;
+let orderDependencyAbortController = null;
+let poAllocationRequestSequence = 0;
+let poAllocationAbortController = null;
 let selectedOrderIds = new Set([selectedOrderId]);
 let loadPreviewOpen = false;
 let sequenceCollapsed = false;
@@ -442,9 +449,9 @@ function ensureDispatchPlanEditor() {
 const DISPATCH_VIEW_MUTATION_ACTIONS = new Set([
   "undo-plan", "redo-plan", "confirm-plan", "reopen-plan",
   "open-group-modal", "confirm-group", "ungroup-order", "open-split-modal", "confirm-split", "unsplit-order", "request-unpack-for-split",
-  "open-consolidate-modal", "confirm-consolidate", "open-po-link-modal", "confirm-po-link",
+  "open-consolidate-modal", "confirm-consolidate", "open-po-link-modal", "open-to-link-modal", "confirm-po-link",
   "open-co-modal", "confirm-co", "open-po-yard-modal", "confirm-po-yard", "cancel-po-link",
-  "load-dependency-lines", "link-order-dependency", "update-dependency-mode", "unlink-dependency",
+  "link-order-dependency", "update-dependency-mode", "unlink-dependency",
   "delete-load", "confirm-delete-load", "clear-load", "add-load", "move-truck-up", "move-truck-down",
   "add-return-load", "remove-stop", "optimize-route", "toggle-route-tolls"
 ]);
@@ -1042,6 +1049,19 @@ function directPickupItemsForLocation(order = {}, pickupLocation = "") {
   })));
 }
 
+function poPickupEntriesForLocation(order = {}, pickupLocation = "") {
+  const location = normalizedPickupLocation(pickupLocation);
+  return (order.poPickupManifest || []).filter((entry) => normalizedPickupLocation(entry.location) === location);
+}
+
+function poPickupItemsForLocation(order = {}, pickupLocation = "") {
+  return poPickupEntriesForLocation(order, pickupLocation).flatMap((entry) => (entry.items || []).map((item) => ({
+    ...item,
+    sku: item.sku || item.itemName || "",
+    salesQty: Number(item.quantity || 0)
+  })));
+}
+
 function directPickupAllocatedForItem(order = {}, item = {}) {
   const itemId = String(item.itemId || item.item_id || "");
   const sku = String(item.sku || item.itemName || item.name || "").trim().toLowerCase();
@@ -1129,6 +1149,8 @@ function tooltipItemsForOrder(order, { pickupLocation = "" } = {}) {
   if (directItems.length && String(order.sourceYard || order.outboundLocation || "") !== String(pickupLocation || "")) {
     return directItems.filter(itemHasQuantity);
   }
+  const poItems = pickupLocation ? poPickupItemsForLocation(order, pickupLocation) : [];
+  if (poItems.length && !isOwnYardCode(pickupLocation)) return poItems.filter(itemHasQuantity);
   return (order.items || [])
     .map((item) => pickupLocation ? itemForPickupLocation(item, pickupLocation, order) : item)
     .filter(itemHasQuantity);
@@ -1153,6 +1175,21 @@ function tooltipItemRowsForOrder(order, { pickupLocation = "", includeOrderHeade
             quantity: item.quantity,
             unit: item.unit
           }))}</span>
+        </div>
+      `).join("")}
+    `).join("");
+  }
+  const poEntries = pickupLocation ? poPickupEntriesForLocation(order, pickupLocation) : [];
+  if (poEntries.length && !isOwnYardCode(pickupLocation)) {
+    return poEntries.map((entry) => `
+      <div>
+        <b>${escapeHtml(entry.poOrderRef || order.id)}</b>
+        <span>${escapeHtml(entry.location || "Vendor pickup")}</span>
+      </div>
+      ${(entry.items || []).map((item) => `
+        <div>
+          <b>${escapeHtml(item.sku || item.itemName || "")}</b>
+          <span>${escapeHtml(itemQtyText(item))}</span>
         </div>
       `).join("")}
     `).join("");
@@ -1189,6 +1226,69 @@ function availableUnitsForLine(line = {}) {
 
 function availableQtyTextForLine(line = {}) {
   return itemQtyText({ ...(line.available || {}), unit: line.required?.unit || "Qty" });
+}
+
+function linkSalesQuantityFromValues(values = {}, conversions = {}) {
+  const converted = ["pallets", "layers", "sections", "pieces"].reduce(
+    (sum, unit) => sum + (Number(values[unit] || 0) * Number(conversions[unit] || 0)),
+    0
+  );
+  return Number((converted > 0 ? converted : Number(values.salesQty || 0)).toFixed(6));
+}
+
+function updateLinkSalesEquivalent(row) {
+  if (!row) return;
+  const values = {};
+  for (const input of row.querySelectorAll("[data-to-link-qty], [data-po-link-qty]")) {
+    const field = input.dataset.toLinkQty || input.dataset.poLinkQty;
+    values[field] = Number(input.value || 0);
+  }
+  const conversions = {
+    pallets: Number(row.dataset.toPlt || 0),
+    layers: Number(row.dataset.toLyr || 0),
+    sections: Number(row.dataset.toSec || 0),
+    pieces: Number(row.dataset.toPcs || 0)
+  };
+  const equivalent = row.querySelector("[data-link-sales-equivalent]");
+  if (equivalent) equivalent.textContent = `Selected ${qtyText(linkSalesQuantityFromValues(values, conversions))} ${row.dataset.salesUnit || "Qty"}`;
+}
+
+function normalizedLinkItemName(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function linkLineItemsMatch(salesLine = {}, sourceLine = {}) {
+  const salesItemId = String(salesLine.itemId || salesLine.item_id || "").trim();
+  const sourceItemId = String(sourceLine.itemId || sourceLine.item_id || "").trim();
+  if (salesItemId && sourceItemId) return salesItemId === sourceItemId;
+  const salesName = normalizedLinkItemName(salesLine.sku || salesLine.itemName || salesLine.item_name);
+  const sourceName = normalizedLinkItemName(sourceLine.sku || sourceLine.itemName || sourceLine.item_name);
+  return Boolean(salesName && sourceName && salesName === sourceName);
+}
+
+function applyPoLinkDefaultsForRef(orderRef, poRef) {
+  const options = poAllocationOptions || {};
+  const draft = getLinkModalDraft("po", orderRef);
+  const normalizedRef = String(poRef || "").trim().toLowerCase();
+  const selectedPoLines = (options.poLines || []).filter((line) => String(line.poRef || "").trim().toLowerCase() === normalizedRef);
+  if (!normalizedRef || !selectedPoLines.length) return false;
+  draft.quantities = {};
+  for (const line of options.salesLines || []) {
+    const units = availableUnitsForLine(line);
+    const matched = selectedPoLines.some((poLine) => linkLineItemsMatch(line, poLine));
+    const quantities = {};
+    units.forEach(([field, , max]) => {
+      quantities[field] = matched ? Number(max || 0) : 0;
+    });
+    draft.quantities[line.targetLineKey] = quantities;
+    const row = app.querySelector(`.po-link-line[data-target-line-key="${CSS.escape(line.targetLineKey)}"]`);
+    for (const input of row?.querySelectorAll("[data-po-link-qty]") || []) {
+      input.value = String(quantities[input.dataset.poLinkQty] || 0);
+    }
+    updateLinkSalesEquivalent(row);
+  }
+  draft.defaultsAppliedRef = normalizedRef;
+  return true;
 }
 
 function movementText(order) {
@@ -1786,16 +1886,98 @@ async function loadDispatchOrders({ sync = false } = {}) {
   }
 }
 
+function linkModalDraftKey(type, orderRef) {
+  return `${type}:${String(orderRef || "").trim()}`;
+}
+
+function getLinkModalDraft(type, orderRef) {
+  const key = linkModalDraftKey(type, orderRef);
+  if (!linkModalDrafts.has(key)) {
+    linkModalDrafts.set(key, {
+      ref: "",
+      mode: "direct_to_customer",
+      quantities: {},
+      targetSignature: "",
+      structureWarning: "",
+      defaultsAppliedRef: ""
+    });
+  }
+  return linkModalDrafts.get(key);
+}
+
+function clearLinkModalDraft(type, orderRef) {
+  linkModalDrafts.delete(linkModalDraftKey(type, orderRef));
+}
+
+function captureActiveLinkModalDraft() {
+  if (!modalOrderId || !["po-link", "to-link"].includes(modalType)) return;
+  const type = modalType === "to-link" ? "to" : "po";
+  const draft = getLinkModalDraft(type, modalOrderId);
+  const refInput = document.getElementById(type === "to" ? "toLinkRef" : "poLinkRef");
+  if (refInput) draft.ref = refInput.value;
+  if (type === "to") {
+    const mode = document.getElementById("toLinkMode");
+    if (mode) draft.mode = mode.value || "direct_to_customer";
+    for (const input of app.querySelectorAll("[data-to-link-qty][data-target-line-key]")) {
+      const quantities = typeof draft.quantities[input.dataset.targetLineKey] === "object"
+        ? draft.quantities[input.dataset.targetLineKey]
+        : {};
+      quantities[input.dataset.toLinkQty] = input.value;
+      draft.quantities[input.dataset.targetLineKey] = quantities;
+    }
+  } else {
+    for (const row of app.querySelectorAll(".po-link-line[data-target-line-key]")) {
+      const quantities = draft.quantities[row.dataset.targetLineKey] || {};
+      for (const input of row.querySelectorAll("[data-po-link-qty]")) {
+        quantities[input.dataset.poLinkQty] = input.value;
+      }
+      draft.quantities[row.dataset.targetLineKey] = quantities;
+    }
+  }
+}
+
+function renderActiveLinkModalInPlace() {
+  const current = app.querySelector('.modal-backdrop[data-link-modal="true"]');
+  const order = orderById(modalOrderId);
+  if (!current || !order) return render({ save: false });
+  const uiState = captureRenderUiState();
+  current.outerHTML = modalType === "to-link" ? renderToLinkModal(order) : renderPoLinkModal(order);
+  restoreRenderUiState(uiState);
+}
+
 async function loadPoAllocationOptions(orderId) {
+  const sequence = ++poAllocationRequestSequence;
+  poAllocationAbortController?.abort();
+  poAllocationAbortController = new AbortController();
   poAllocationLoading = true;
+  poAllocationError = "";
   poAllocationOptions = null;
-  render({ save: false });
+  renderActiveLinkModalInPlace();
   try {
-    const response = await fetch(`/api/dispatch/orders/${encodeURIComponent(orderId)}/po-allocations`);
-    if (!response.ok) throw new Error(await response.text());
+    const params = new URLSearchParams({ planDate: currentPlanDate });
+    const response = await fetch(`/api/dispatch/orders/${encodeURIComponent(orderId)}/po-allocations?${params}`, {
+      signal: poAllocationAbortController.signal
+    });
+    if (!response.ok) throw new Error(await dispatchErrorMessage(response));
+    if (sequence !== poAllocationRequestSequence || modalType !== "po-link" || modalOrderId !== orderId) return;
     poAllocationOptions = await response.json();
+    const draft = getLinkModalDraft("po", orderId);
+    const nextSignature = poAllocationOptions?.order?.targetSignature || "";
+    if (draft.targetSignature && nextSignature && draft.targetSignature !== nextSignature) {
+      draft.structureWarning = `${orderId} changed while this window was open. Review the refreshed quantities.`;
+    } else {
+      draft.structureWarning = "";
+    }
+    draft.targetSignature = nextSignature;
+  } catch (error) {
+    if (error.name !== "AbortError" && sequence === poAllocationRequestSequence) {
+      poAllocationError = error.message || "Unable to load Link PO options.";
+    }
   } finally {
-    poAllocationLoading = false;
+    if (sequence === poAllocationRequestSequence) {
+      poAllocationLoading = false;
+      renderActiveLinkModalInPlace();
+    }
   }
 }
 
@@ -2694,6 +2876,10 @@ function applyHistorySnapshot(snapshot) {
   modalLoadId = "";
   poAllocationOptions = null;
   poAllocationLoading = false;
+  poAllocationError = "";
+  orderDependencyOptions = null;
+  orderDependencyLoading = false;
+  orderDependencyError = "";
   routeCache = {};
   routeEstimates = {};
 }
@@ -3122,6 +3308,11 @@ function queueRemoteRefresh(reason = "Plan updated from another screen.", { relo
       if (!reloadOrders) await refreshPlannedAssignments();
       if (reason) routeNotice = reason;
       render({ save: false });
+      if (reloadOrders && modalType === "to-link") {
+        loadOrderDependencyOptions(orderById(modalOrderId)).catch(() => null);
+      } else if (reloadOrders && modalType === "po-link") {
+        loadPoAllocationOptions(modalOrderId).catch(() => null);
+      }
       if (applied && reason) routeNotice = reason;
     } catch (error) {
       routeNotice = `Auto refresh failed: ${error.message}`;
@@ -4775,7 +4966,7 @@ function captureRenderUiState() {
     focusSelector: selectorForElement(active),
     selectionStart: typeof active?.selectionStart === "number" ? active.selectionStart : null,
     selectionEnd: typeof active?.selectionEnd === "number" ? active.selectionEnd : null,
-    scrolls: [...app.querySelectorAll(".order-list, .truck-board, .load-preview-body, .preview-stop-list, .stop-list")]
+    scrolls: [...app.querySelectorAll(".order-list, .truck-board, .load-preview-body, .preview-stop-list, .stop-list, .modal-body, .po-link-lines, .order-dependency-match-lines")]
       .map((element) => ({
         selector: selectorForElement(element) || `.${[...element.classList].join(".")}`,
         top: element.scrollTop,
@@ -4935,6 +5126,7 @@ function renderSelectedOrderActions() {
       ${blockedUngroup ? `<span>Cancel ${escapeHtml(blockedUngroup)} before ungrouping</span>` : ""}
       ${!reviewOnly && order.type === "PO" ? `<button data-action="open-po-yard-modal" data-order="${order.id}" type="button">Set Yard</button>` : ""}
       ${!reviewOnly && order.type === "SO" ? `<button data-action="open-po-link-modal" data-order="${order.id}" type="button">Link PO</button>` : ""}
+      ${!reviewOnly && order.type === "SO" ? `<button data-action="open-to-link-modal" data-order="${order.id}" type="button">Link TO</button>` : ""}
       ${!reviewOnly && order.type !== "CO" && !order.originalOrderId ? `<button data-action="open-split-modal" data-order="${order.id}" type="button">Split</button>` : ""}
       ${!reviewOnly && order.originalOrderId ? `<button data-action="unsplit-order" data-order="${order.id}" type="button">Unsplit</button>` : ""}
       ${!reviewOnly && canConsolidatePick(order) ? `<button data-action="open-consolidate-modal" data-order="${order.id}" type="button">Consolidate Pick</button>` : ""}
@@ -5469,94 +5661,149 @@ function renderTransitCoEditor(order) {
   `;
 }
 
-async function loadOrderDependencyOptions(order, { salesOrderRef = "", transferOrderRef = "" } = {}) {
+async function loadOrderDependencyOptions(order, { transferOrderRef = "" } = {}) {
+  if (!order?.id) return;
+  const targetRef = order.id;
+  const draft = getLinkModalDraft("to", targetRef);
+  const requestRef = String(transferOrderRef ?? draft.ref).trim();
+  draft.ref = requestRef;
+  const sequence = ++orderDependencyRequestSequence;
+  orderDependencyAbortController?.abort();
+  orderDependencyAbortController = new AbortController();
   orderDependencyLoading = true;
-  const selectedIsTransfer = order?.type === "TO";
-  const salesRef = salesOrderRef || (selectedIsTransfer ? (order?.orderDependency?.salesOrderRef || "") : order?.id || "");
-  const transferRef = transferOrderRef || (selectedIsTransfer ? order?.id || "" : "");
-  const params = new URLSearchParams();
-  if (salesRef) params.set("salesOrderRef", salesRef);
-  if (transferRef) params.set("transferOrderRef", transferRef);
+  orderDependencyError = "";
+  renderActiveLinkModalInPlace();
+  const params = new URLSearchParams({
+    dispatchTargetRef: targetRef,
+    transferOrderRef: requestRef,
+    planDate: currentPlanDate
+  });
   try {
-    const response = await fetch(`/api/dispatch/order-dependencies/options?${params.toString()}`);
-    if (!response.ok) throw new Error(await response.text());
-    orderDependencyOptions = await response.json();
+    const response = await fetch(`/api/dispatch/order-dependencies/options?${params}`, {
+      signal: orderDependencyAbortController.signal
+    });
+    if (!response.ok) throw new Error(await dispatchErrorMessage(response));
+    const payload = await response.json();
+    if (sequence !== orderDependencyRequestSequence || modalType !== "to-link" || modalOrderId !== targetRef) return;
+    orderDependencyOptions = payload;
+    if (draft.targetSignature && draft.targetSignature !== payload.targetSignature) {
+      draft.structureWarning = `${targetRef} changed while this window was open. Review the refreshed matching quantities.`;
+    } else {
+      draft.structureWarning = "";
+    }
+    draft.targetSignature = payload.targetSignature || "";
+    for (const line of payload.matchingLines || []) {
+      if (draft.quantities[line.targetLineKey] === undefined) {
+        draft.quantities[line.targetLineKey] = { ...(line.suggestedQuantities || { salesQty: Number(line.suggestedQuantity || 0) }) };
+      }
+    }
   } catch (error) {
-    routeNotice = `Dependency options failed: ${error.message}`;
+    if (error.name === "AbortError" || sequence !== orderDependencyRequestSequence) return;
+    orderDependencyError = error.message || "Unable to load Link TO options.";
     orderDependencyOptions = null;
   } finally {
-    orderDependencyLoading = false;
-    render({ save: false });
+    if (sequence === orderDependencyRequestSequence) {
+      orderDependencyLoading = false;
+      renderActiveLinkModalInPlace();
+    }
   }
 }
 
-function renderOrderDependencyEditor(order) {
-  if (!["SO", "TO"].includes(order?.type)) return "";
-  const linked = order.type === "TO"
-    ? [order.orderDependency].filter(Boolean)
-    : (order.orderDependencies || []);
-  const options = orderDependencyOptions || {};
-  const salesRef = order.type === "TO" ? (options.salesOrderRef || order.orderDependency?.salesOrderRef || "") : order.id;
-  const transferRef = order.type === "TO" ? order.id : (options.transferOrderRef || "");
-  return `
-    <section class="order-dependency-editor">
-      <div class="order-dependency-head">
-        <div><strong>Order Dependency</strong><span>Link replenishment or direct customer pickup Transfer Orders.</span></div>
-        ${orderDependencyLoading ? `<em>Loading...</em>` : ""}
+function renderDependencyLinks(links = []) {
+  if (!links.length) return `<div class="muted">No active linked Transfer Order.</div>`;
+  return links.map((dependency) => `
+    <div class="order-dependency-linked">
+      <div>
+        <strong>${escapeHtml(dependency.transferOrderRef)} linked with ${escapeHtml(dependency.dispatchTargetRef || dependency.salesOrderRef)}</strong>
+        <span>${escapeHtml(dependency.status)} | ${escapeHtml(dependency.reconciliationStatus || "pending")}</span>
       </div>
-      ${linked.map((dependency) => `
-        <div class="order-dependency-linked">
+      <select data-dependency-mode="${dependency.id}">
+        <option value="direct_to_customer" ${dependency.mode === "direct_to_customer" ? "selected" : ""}>Direct pickup</option>
+        <option value="yard_replenishment" ${dependency.mode === "yard_replenishment" ? "selected" : ""}>Replenishment</option>
+      </select>
+      <button class="dependency-action-button" data-action="update-dependency-mode" data-dependency="${dependency.id}" type="button">Update</button>
+      <button class="danger-text dependency-action-button" data-action="unlink-dependency" data-dependency="${dependency.id}" type="button">Unlink</button>
+    </div>
+    <div class="order-dependency-lines">
+      ${(dependency.lines || []).map((line) => `<span><b>${escapeHtml(line.sourceOrderRef ? `${line.sourceOrderRef} | ` : "")}${escapeHtml(line.itemName)}</b> ${escapeHtml(itemQtyText({
+        pallets: line.palletQty,
+        layers: line.layerQty,
+        sections: line.sectionQty,
+        pieces: line.pieceQty,
+        salesQty: line.allocatedQuantity,
+        unit: line.unit
+      }))}</span>`).join("")}
+    </div>
+  `).join("");
+}
+
+function renderToLinkModal(order) {
+  const options = orderDependencyOptions || {};
+  const draft = getLinkModalDraft("to", order.id);
+  const links = options.existingLinks || order.orderDependencies || [];
+  const transferOrders = options.transferOrders || [];
+  const matchingLines = options.matchingLines || [];
+  const matchError = options.matchError || "";
+  return `
+    <div class="modal-backdrop show" data-link-modal="true">
+      <section class="dispatch-modal wide-modal">
+        <div class="modal-header">
           <div>
-            <strong>${escapeHtml(dependency.salesOrderRef)} &rarr; ${escapeHtml(dependency.transferOrderRef)}</strong>
-            <span>${escapeHtml(dependency.status)} | ${escapeHtml(dependency.reconciliationStatus || "pending")}</span>
+            <h2>Link TO</h2>
+            <p>${escapeHtml(order.id)}${options.dispatchTargetKind && options.dispatchTargetKind !== "normal" ? ` | ${escapeHtml(options.dispatchTargetKind)}` : ""}</p>
           </div>
-          <select data-dependency-mode="${dependency.id}">
-            <option value="yard_replenishment" ${dependency.mode === "yard_replenishment" ? "selected" : ""}>Replenishment</option>
-            <option value="direct_to_customer" ${dependency.mode === "direct_to_customer" ? "selected" : ""}>Direct pickup</option>
-          </select>
-          <button data-action="update-dependency-mode" data-dependency="${dependency.id}" type="button">Update</button>
-          <button class="danger-text" data-action="unlink-dependency" data-dependency="${dependency.id}" type="button">Unlink</button>
+          <button data-action="close-modal" type="button">Close</button>
         </div>
-        <div class="order-dependency-lines">
-          ${(dependency.lines || []).map((line) => `<span><b>${escapeHtml(line.itemName)}</b> ${escapeHtml(itemQtyText({
-            pallets: line.palletQty,
-            layers: line.layerQty,
-            sections: line.sectionQty,
-            pieces: line.pieceQty,
-            salesQty: line.allocatedQuantity,
-            unit: line.unit
-          }))}</span>`).join("")}
+        <div class="modal-body">
+          <section class="order-dependency-editor">
+            <div class="order-dependency-head">
+              <div><strong>Active links</strong><span>One TO can allocate several item lines from this dispatch order.</span></div>
+            </div>
+            ${renderDependencyLinks(links)}
+          </section>
+          <form class="po-link-form" data-form="to-link">
+            <div class="order-dependency-link-grid">
+              <label><span>Sales Order target</span><input value="${escapeHtml(order.id)}" readonly /></label>
+              <div class="to-link-ref-field"><label for="toLinkRef">Transfer Order</label><div class="to-link-ref-control"><input id="toLinkRef" list="toLinkOptions" value="${escapeHtml(draft.ref)}" placeholder="Type TO number" autocomplete="off" /><button data-action="match-to-link-lines" type="button">Match Lines</button></div></div>
+              <label><span>Mode</span><select id="toLinkMode"><option value="direct_to_customer" ${draft.mode === "direct_to_customer" ? "selected" : ""}>Direct pickup</option><option value="yard_replenishment" ${draft.mode === "yard_replenishment" ? "selected" : ""}>Replenishment</option></select></label>
+            </div>
+            <datalist id="toLinkOptions">${transferOrders.filter((entry) => !entry.linkedSalesOrderRef || entry.linkedSalesOrderRef === order.id).map((entry) => `<option value="${escapeHtml(entry.ref)}">${escapeHtml(entry.fromLocation || "")} to ${escapeHtml(entry.toLocation || "")}</option>`).join("")}</datalist>
+            ${orderDependencyLoading ? `<div class="empty-drop">Matching Transfer Order lines...</div>` : ""}
+            ${orderDependencyError ? `<div class="warning-detail">Link TO options failed: ${escapeHtml(orderDependencyError)}</div>` : ""}
+            ${draft.structureWarning ? `<div class="warning-detail">${escapeHtml(draft.structureWarning)} <button data-action="refresh-to-link-match" type="button">Refresh Match</button></div>` : ""}
+            <div class="order-dependency-match-lines">
+              ${matchingLines.map((line, index) => {
+                const units = availableUnitsForLine({ available: line.available, required: { unit: line.unit } });
+                const saved = typeof draft.quantities[line.targetLineKey] === "object" ? draft.quantities[line.targetLineKey] : {};
+                const values = { ...(line.suggestedQuantities || {}), ...saved };
+                const equivalent = linkSalesQuantityFromValues(values, line.conversions || {});
+                return `<section class="link-quantity-line to-link-line" data-target-line-key="${escapeHtml(line.targetLineKey)}" data-dependency-item="${line.itemId}" data-to-plt="${Number(line.conversions?.pallets || 0)}" data-to-lyr="${Number(line.conversions?.layers || 0)}" data-to-sec="${Number(line.conversions?.sections || 0)}" data-to-pcs="${Number(line.conversions?.pieces || 0)}" data-sales-unit="${escapeHtml(line.unit || "Qty")}">
+                  <div class="link-quantity-info"><strong>${escapeHtml(line.sku || line.itemName)}</strong>${line.sourceOrderRef && line.sourceOrderRef !== order.id ? `<span>${escapeHtml(line.sourceOrderRef)}</span>` : ""}<em>SO open ${escapeHtml(availableQtyTextForLine({ available: line.available, required: { unit: line.unit } }))} | TO ${escapeHtml(itemQtyText({ ...(line.transferDisplay || {}), salesQty: line.transferDisplay?.salesQty, unit: line.unit }))}</em><em class="link-sales-equivalent" data-link-sales-equivalent>Selected ${escapeHtml(qtyText(equivalent))} ${escapeHtml(line.unit || "Qty")}</em></div>
+                  <div class="link-quantity-units">${units.map(([field, label, max]) => `<label><span>${escapeHtml(label)}</span><input id="toLinkQty-${index}-${field}" data-to-link-qty="${field}" data-target-line-key="${escapeHtml(line.targetLineKey)}" type="number" min="0" max="${Number(max || 0)}" step="1" value="${escapeHtml(values[field] ?? 0)}" /></label>`).join("")}</div>
+                </section>`;
+              }).join("") || (!orderDependencyLoading ? (matchError ? `<div class="warning-detail">${escapeHtml(matchError)}</div>` : `<span class="muted">Type a Transfer Order number, then press Match Lines.</span>`) : "")}
+            </div>
+            <div class="modal-status" data-modal-status></div>
+            <div class="modal-footer">
+              <button data-action="close-modal" type="button">Cancel</button>
+              <button class="primary" type="submit" ${matchingLines.length && !draft.structureWarning ? "" : "disabled"}>Link Transfer Order</button>
+            </div>
+          </form>
         </div>
-      `).join("") || `<div class="muted">No active dependency.</div>`}
-      ${linked.length ? "" : `
-        <div class="order-dependency-link-grid">
-          <label><span>Sales Order</span><input id="dependencySalesRef" list="dependencySalesOrders" value="${escapeHtml(salesRef)}" ${order.type === "SO" ? "readonly" : ""} /></label>
-          <label><span>Transfer Order</span><input id="dependencyTransferRef" list="dependencyTransferOrders" value="${escapeHtml(transferRef)}" ${order.type === "TO" ? "readonly" : ""} /></label>
-          <label><span>Mode</span><select id="dependencyMode"><option value="yard_replenishment">Replenishment</option><option value="direct_to_customer">Direct pickup</option></select></label>
-          <button data-action="load-dependency-lines" type="button">Match Lines</button>
-        </div>
-        <datalist id="dependencySalesOrders">${(options.salesOrders || []).map((entry) => `<option value="${escapeHtml(entry.ref)}">${escapeHtml(entry.customer || "")} | ${escapeHtml(entry.outboundLocation || "")}</option>`).join("")}</datalist>
-        <datalist id="dependencyTransferOrders">${(options.transferOrders || []).filter((entry) => !entry.linkedSalesOrderRef).map((entry) => `<option value="${escapeHtml(entry.ref)}">${escapeHtml(entry.fromLocation || "")} to ${escapeHtml(entry.toLocation || "")}</option>`).join("")}</datalist>
-        <div class="order-dependency-match-lines">
-          ${(options.matchingLines || []).map((line) => `<label data-dependency-sales-line="${line.salesLineId}" data-dependency-item="${line.itemId}">
-            <span><strong>${escapeHtml(line.sku || line.itemName)}</strong><small>SO shortage ${qtyText(line.shortageQuantity)} | TO ${qtyText(line.transferQuantity)} ${escapeHtml(line.unit || "")}</small></span>
-            <input data-dependency-quantity type="number" min="0" step="0.001" value="${Number(line.suggestedQuantity || 0)}" />
-          </label>`).join("") || `<span class="muted">Select a Sales Order and Transfer Order, then match their item lines.</span>`}
-        </div>
-        <button class="primary" data-action="link-order-dependency" type="button" ${(options.matchingLines || []).length ? "" : "disabled"}>Link Transfer Order</button>
-      `}
-    </section>
+      </section>
+    </div>
   `;
 }
 
 function renderPoLinkModal(order) {
   const options = poAllocationOptions;
+  const draft = getLinkModalDraft("po", order.id);
   const salesLines = options?.salesLines || [];
   const poLines = options?.poLines || [];
   const allocations = options?.allocations || [];
   const poRefs = [...new Map(poLines.map((line) => [line.poRef, line])).values()];
   return `
-    <div class="modal-backdrop show">
+    <div class="modal-backdrop show" data-link-modal="true">
       <section class="dispatch-modal wide-modal">
         <div class="modal-header">
           <div>
@@ -5567,6 +5814,8 @@ function renderPoLinkModal(order) {
         </div>
         <div class="modal-body">
           ${poAllocationLoading ? `<div class="empty-drop">Loading matching PO lines...</div>` : ""}
+          ${poAllocationError ? `<div class="warning-detail">Link PO options failed: ${escapeHtml(poAllocationError)}</div>` : ""}
+          ${draft.structureWarning ? `<div class="warning-detail">${escapeHtml(draft.structureWarning)} <button data-action="refresh-po-link-options" type="button">Refresh Match</button></div>` : ""}
           ${allocations.length ? `
             <div class="allocation-list">
               <strong>Active linked PO quantity</strong>
@@ -5582,7 +5831,7 @@ function renderPoLinkModal(order) {
           <form class="po-link-form" data-form="po-link">
             <label class="split-field">
               <span>Purchase order</span>
-              <input name="poRef" list="poLinkPoOptions" placeholder="Type PO number" autocomplete="off" required />
+              <input id="poLinkRef" name="poRef" value="${escapeHtml(draft.ref)}" list="poLinkPoOptions" placeholder="Type PO number" autocomplete="off" required />
               <datalist id="poLinkPoOptions">
                 ${poRefs.map((line) => `
                   <option value="${escapeHtml(line.poRef)}">${escapeHtml(line.vendorYard || line.vendor)} | ${escapeHtml(line.address || "")}</option>
@@ -5590,18 +5839,24 @@ function renderPoLinkModal(order) {
               </datalist>
             </label>
             <div class="po-link-lines">
-              ${salesLines.map((line) => {
+              ${salesLines.map((line, index) => {
                 const units = availableUnitsForLine(line);
+                const selectedPoLines = poLines.filter((poLine) => String(poLine.poRef || "").trim().toLowerCase() === String(draft.ref || "").trim().toLowerCase());
+                const selectedPoHasItem = selectedPoLines.some((poLine) => linkLineItemsMatch(line, poLine));
+                const values = Object.fromEntries(units.map(([field, , max]) => [field, draft.quantities[line.targetLineKey]?.[field] ?? (selectedPoHasItem ? max : 0)]));
+                const equivalent = linkSalesQuantityFromValues(values, line.conversions || {});
                 return `
-                <section class="po-link-line" data-sales-line="${line.id}">
-                  <div>
+                <section class="po-link-line link-quantity-line" data-sales-line="${line.id}" data-target-line-key="${escapeHtml(line.targetLineKey || "")}" data-to-plt="${Number(line.conversions?.pallets || 0)}" data-to-lyr="${Number(line.conversions?.layers || 0)}" data-to-sec="${Number(line.conversions?.sections || 0)}" data-to-pcs="${Number(line.conversions?.pieces || 0)}" data-sales-unit="${escapeHtml(line.required?.unit || "Qty")}">
+                  <div class="link-quantity-info">
                     <strong>${escapeHtml(line.sku || line.itemName)}</strong>
+                    ${line.sourceOrderRef && line.sourceOrderRef !== order.id ? `<span>${escapeHtml(line.sourceOrderRef)}</span>` : ""}
                     <span>${escapeHtml(line.description || "")}</span>
                     <em>Open ${availableQtyTextForLine(line)}</em>
+                    <em class="link-sales-equivalent" data-link-sales-equivalent>Selected ${escapeHtml(qtyText(equivalent))} ${escapeHtml(line.required?.unit || "Qty")}</em>
                   </div>
-                  ${units.map(([field, label, max]) => `
-                    <label><span>${escapeHtml(label)}</span><input data-po-link-qty="${field}" type="number" min="0" max="${Number(max || 0)}" step="1" value="0" /></label>
-                  `).join("") || `<span class="muted">No available quantity</span>`}
+                  <div class="link-quantity-units">${units.map(([field, label, max]) => `
+                    <label><span>${escapeHtml(label)}</span><input id="poLinkQty-${index}-${field}" data-po-link-qty="${field}" type="number" min="0" max="${Number(max || 0)}" step="1" value="${escapeHtml(values[field] ?? 0)}" /></label>
+                  `).join("") || `<span class="muted">No available quantity</span>`}</div>
                 </section>
               `; }).join("")}
             </div>
@@ -5611,7 +5866,7 @@ function renderPoLinkModal(order) {
             <div class="modal-status" data-modal-status></div>
             <div class="modal-footer">
               <button data-action="close-modal" type="button">Cancel</button>
-              <button class="primary" ${salesLines.length ? "" : "disabled"} type="submit">Connect PO Quantity</button>
+              <button class="primary" ${salesLines.length && !draft.structureWarning ? "" : "disabled"} type="submit">Connect PO Quantity</button>
             </div>
           </form>
           ${!poAllocationLoading && !salesLines.length ? `<div class="empty-drop">No SO item line was found.</div>` : ""}
@@ -5686,7 +5941,6 @@ function renderModal() {
               </label>
             </div>
             ${supportsTransitCoForOrder(order) ? renderTransitCoEditor(order) : ""}
-            ${renderOrderDependencyEditor(order)}
             <div class="modal-status" data-edit-status></div>
             <div class="modal-footer">
               <button data-action="close-modal" type="button">Cancel</button>
@@ -5699,6 +5953,9 @@ function renderModal() {
   }
   if (modalType === "po-link") {
     return renderPoLinkModal(order);
+  }
+  if (modalType === "to-link") {
+    return renderToLinkModal(order);
   }
   if (modalType === "group") {
     const selected = selectedOrders();
@@ -6363,16 +6620,20 @@ function groupOrder(orderId) {
   const order = orderById(orderId);
   const selected = selectedOrders();
   const groupItems = selected.length > 1 ? selected : [];
-  if (groupItems.length < 2) return;
+  if (groupItems.length < 2) {
+    routeNotice = "Select at least two orders before grouping.";
+    return false;
+  }
   const blockReason = mixedYardGroupBlockReason(groupItems);
   if (blockReason) {
     routeNotice = blockReason;
-    return;
+    return false;
   }
-  if (type === "drop" && order.dependencyHidden) {
-    selectedOrderId = orderId;
-    selectedOrderIds = new Set([orderId]);
-    routeNotice = `${order.id} is linked to ${order.dependentSalesOrderRef || "a Sales Order"} as direct pickup and cannot be planned independently.`;
+  const dependencyBlockedOrder = groupItems.find((item) => item.dependencyHidden);
+  if (dependencyBlockedOrder) {
+    selectedOrderId = dependencyBlockedOrder.id;
+    selectedOrderIds = new Set([dependencyBlockedOrder.id]);
+    routeNotice = `${dependencyBlockedOrder.id} is linked to ${dependencyBlockedOrder.dependentSalesOrderRef || "a Sales Order"} as direct pickup and cannot be grouped independently.`;
     return false;
   }
   const flattenedMembers = flattenDispatchGroupMembers({
@@ -6409,6 +6670,7 @@ function groupOrder(orderId) {
   orders.splice(Math.max(firstIndex, 0), 0, grouped);
   selectedOrderId = grouped.id;
   selectedOrderIds = new Set([grouped.id]);
+  return true;
 }
 
 function groupedDispatchOrderId(groupItems = []) {
@@ -6952,13 +7214,22 @@ app.addEventListener("drop", (event) => {
 
 app.addEventListener("click", (event) => {
   if (event.target.dataset?.action === "close-modal") {
+    const closingType = modalType;
+    const closingOrderRef = modalOrderId;
+    captureActiveLinkModalDraft();
+    if (closingType === "po-link") clearLinkModalDraft("po", closingOrderRef);
+    if (closingType === "to-link") clearLinkModalDraft("to", closingOrderRef);
+    orderDependencyAbortController?.abort();
+    poAllocationAbortController?.abort();
     modalType = "";
     modalOrderId = "";
     modalLoadId = "";
     poAllocationOptions = null;
     poAllocationLoading = false;
+    poAllocationError = "";
     orderDependencyOptions = null;
     orderDependencyLoading = false;
+    orderDependencyError = "";
     return render({ save: false });
   }
   const button = event.target.closest("button");
@@ -7017,49 +7288,34 @@ app.addEventListener("click", (event) => {
     });
     return;
   }
-  if (DISPATCH_VIEW_MUTATION_ACTIONS.has(action) && !ensureDispatchPlanEditor()) return;
-  if (action === "load-dependency-lines") {
+  if (action === "refresh-to-link-match") {
+    const draft = getLinkModalDraft("to", modalOrderId);
+    draft.structureWarning = "";
+    loadOrderDependencyOptions(orderById(modalOrderId)).catch(() => null);
+    return;
+  }
+  if (action === "match-to-link-lines") {
+    captureActiveLinkModalDraft();
     const order = orderById(modalOrderId);
-    loadOrderDependencyOptions(order, {
-      salesOrderRef: document.getElementById("dependencySalesRef")?.value || "",
-      transferOrderRef: document.getElementById("dependencyTransferRef")?.value || ""
+    const draft = getLinkModalDraft("to", modalOrderId);
+    const form = button.closest("form");
+    if (!String(draft.ref || "").trim()) {
+      setModalFormStatus(form, "Enter a Transfer Order number before matching.", "error");
+      return;
+    }
+    loadOrderDependencyOptions(order, { transferOrderRef: draft.ref }).catch((error) => {
+      orderDependencyError = error.message || "Unable to match Transfer Order lines.";
+      renderActiveLinkModalInPlace();
     });
     return;
   }
-  if (action === "link-order-dependency") {
-    const allocations = [...app.querySelectorAll("[data-dependency-sales-line]")].map((row) => ({
-      salesLineId: Number(row.dataset.dependencySalesLine),
-      itemId: Number(row.dataset.dependencyItem),
-      quantity: Number(row.querySelector("[data-dependency-quantity]")?.value || 0)
-    })).filter((line) => line.quantity > 0);
-    const salesOrderRef = document.getElementById("dependencySalesRef")?.value || "";
-    const transferOrderRef = document.getElementById("dependencyTransferRef")?.value || "";
-    fetch("/api/dispatch/order-dependencies", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(dispatchLeaseRequestPayload({
-        salesOrderRef,
-        transferOrderRef,
-        mode: document.getElementById("dependencyMode")?.value || "yard_replenishment",
-        allocations,
-        audit: { sessionId: dispatchSessionId }
-      }))
-    }).then(async (response) => {
-      if (!response.ok) throw new Error(await dispatchErrorMessage(response));
-      return response.json();
-    }).then(async () => {
-      await loadDispatchOrders();
-      modalOrderId = salesOrderRef;
-      selectedOrderId = salesOrderRef;
-      orderDependencyOptions = null;
-      routeNotice = `${transferOrderRef} linked to ${salesOrderRef}.`;
-      render({ save: false });
-    }).catch((error) => {
-      routeNotice = `Dependency link failed: ${error.message}`;
-      render({ save: false });
-    });
+  if (action === "refresh-po-link-options") {
+    const draft = getLinkModalDraft("po", modalOrderId);
+    draft.structureWarning = "";
+    loadPoAllocationOptions(modalOrderId).catch(() => null);
     return;
   }
+  if (DISPATCH_VIEW_MUTATION_ACTIONS.has(action) && !ensureDispatchPlanEditor()) return;
   if (action === "update-dependency-mode") {
     const dependencyId = button.dataset.dependency;
     const mode = app.querySelector(`[data-dependency-mode="${CSS.escape(dependencyId)}"]`)?.value;
@@ -7070,10 +7326,10 @@ app.addEventListener("click", (event) => {
     }).then(async (response) => {
       if (!response.ok) throw new Error(await dispatchErrorMessage(response));
       return response.json();
-    }).then(async () => {
-      await loadDispatchOrders();
+    }).then(async (payload) => {
+      if (Array.isArray(payload.orders)) applyDispatchOrderFeed(payload.orders);
       routeNotice = "Dependency mode updated.";
-      render({ save: false });
+      await loadOrderDependencyOptions(orderById(modalOrderId));
     }).catch((error) => {
       routeNotice = `Dependency update failed: ${error.message}`;
       render({ save: false });
@@ -7090,11 +7346,13 @@ app.addEventListener("click", (event) => {
     }).then(async (response) => {
       if (!response.ok) throw new Error(await dispatchErrorMessage(response));
       return response.json();
-    }).then(async () => {
-      await loadDispatchOrders();
+    }).then(async (payload) => {
+      if (Array.isArray(payload.orders)) applyDispatchOrderFeed(payload.orders);
       orderDependencyOptions = null;
       routeNotice = "Order dependency unlinked.";
-      render({ save: false });
+      requestOrderPoolRefreshOnNextSave();
+      commitPlanMutation("to_link_cancelled");
+      await loadOrderDependencyOptions(orderById(modalOrderId));
     }).catch((error) => {
       routeNotice = `Dependency unlink failed: ${error.message}`;
       render({ save: false });
@@ -7177,12 +7435,20 @@ app.addEventListener("click", (event) => {
   if (action === "open-po-link-modal") {
     modalType = "po-link";
     modalOrderId = button.dataset.order;
-    loadPoAllocationOptions(button.dataset.order).then(() => render({ save: false })).catch((error) => {
-      poAllocationLoading = false;
-      routeNotice = `PO link options failed: ${error.message}`;
-      render({ save: false });
-    });
+    poAllocationError = "";
+    getLinkModalDraft("po", modalOrderId);
     render({ save: false });
+    loadPoAllocationOptions(button.dataset.order).catch(() => null);
+    return;
+  }
+  if (action === "open-to-link-modal") {
+    modalType = "to-link";
+    modalOrderId = button.dataset.order;
+    orderDependencyOptions = null;
+    orderDependencyError = "";
+    getLinkModalDraft("to", modalOrderId);
+    render({ save: false });
+    loadOrderDependencyOptions(orderById(modalOrderId)).catch(() => null);
     return;
   }
   if (action === "order-type-tab") {
@@ -7274,7 +7540,10 @@ app.addEventListener("click", (event) => {
   }
   if (action === "confirm-group") {
     const before = selectedOrders().map(summarizeOrder);
-    groupOrder(button.dataset.order);
+    if (!groupOrder(button.dataset.order)) {
+      render({ save: false });
+      return;
+    }
     requestOrderPoolRefreshOnNextSave();
     logDispatchAudit({
       action: "orders_grouped",
@@ -7609,11 +7878,42 @@ app.addEventListener("dblclick", (event) => {
   modalType = "edit-order";
   modalOrderId = order.id;
   orderDependencyOptions = null;
-  if (["SO", "TO"].includes(order.type)) loadOrderDependencyOptions(order);
   render({ save: false });
 });
 
 app.addEventListener("input", (event) => {
+  if (["po-link", "to-link"].includes(modalType) && event.target.closest('[data-link-modal="true"]')) {
+    if (modalType === "to-link" && event.target?.id === "toLinkRef") {
+      const draft = getLinkModalDraft("to", modalOrderId);
+      const nextRef = event.target.value;
+      if (draft.ref !== nextRef) {
+        draft.ref = nextRef;
+        draft.quantities = {};
+        draft.structureWarning = "";
+        orderDependencyError = "";
+        if (orderDependencyOptions) orderDependencyOptions = { ...orderDependencyOptions, matchingLines: [] };
+        const results = event.target.closest("form")?.querySelector(".order-dependency-match-lines");
+        if (results) results.innerHTML = '<span class="muted">Choose a Transfer Order, then press Match Lines.</span>';
+        const submit = event.target.closest("form")?.querySelector('button[type="submit"]');
+        if (submit) submit.disabled = true;
+      }
+      return;
+    }
+    if (modalType === "po-link" && event.target?.id === "poLinkRef") {
+      const draft = getLinkModalDraft("po", modalOrderId);
+      const nextRef = event.target.value;
+      if (draft.ref !== nextRef) {
+        draft.ref = nextRef;
+        draft.quantities = {};
+        draft.defaultsAppliedRef = "";
+      }
+      applyPoLinkDefaultsForRef(modalOrderId, nextRef);
+      return;
+    }
+    if (event.target.matches("[data-to-link-qty], [data-po-link-qty]")) updateLinkSalesEquivalent(event.target.closest(".link-quantity-line"));
+    captureActiveLinkModalDraft();
+    return;
+  }
   if (event.target?.id === "splitParts") {
     splitParts = Math.min(Math.max(Number(event.target.value) || 2, 2), 10);
     ensureSplitDraft(orderById(modalOrderId), true);
@@ -7646,7 +7946,17 @@ app.addEventListener("input", (event) => {
   refreshOrderPoolForSearch();
 });
 
+app.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" || event.target?.id !== "toLinkRef" || modalType !== "to-link") return;
+  event.preventDefault();
+  event.target.closest("form")?.querySelector('[data-action="match-to-link-lines"]')?.click();
+});
+
 app.addEventListener("change", (event) => {
+  if (["po-link", "to-link"].includes(modalType) && event.target.closest('[data-link-modal="true"]')) {
+    captureActiveLinkModalDraft();
+    return;
+  }
   if (event.target?.id === "planDateInput") {
     const nextDate = event.target.value || todayLocalDate();
     Promise.resolve()
@@ -7897,14 +8207,80 @@ app.addEventListener("submit", (event) => {
   if (!form) return;
   if (form.dataset.form === "dispatch-login") return;
   event.preventDefault();
-  if (["po-link", "edit-order-details"].includes(form.dataset.form) && !ensureDispatchPlanEditor()) return;
+  if (["po-link", "to-link", "edit-order-details"].includes(form.dataset.form) && !ensureDispatchPlanEditor()) return;
   const data = Object.fromEntries(new FormData(form).entries());
+  if (form.dataset.form === "to-link") {
+    const order = orderById(modalOrderId);
+    if (!order) return;
+    captureActiveLinkModalDraft();
+    const draft = getLinkModalDraft("to", order.id);
+    const transferOrderRef = String(draft.ref || "").trim();
+    const allocations = [...form.querySelectorAll(".to-link-line[data-target-line-key]")]
+      .map((row) => {
+        const quantities = {};
+        for (const input of row.querySelectorAll("[data-to-link-qty]")) quantities[input.dataset.toLinkQty] = Number(input.value || 0);
+        return { targetLineKey: row.dataset.targetLineKey, quantities };
+      })
+      .filter((line) => Object.values(line.quantities).some((value) => Number(value || 0) > 0));
+    if (!transferOrderRef) {
+      setModalFormStatus(form, "Enter a Transfer Order number.", "error");
+      return;
+    }
+    if (!allocations.length) {
+      setModalFormStatus(form, "Enter quantity for at least one matched item.", "error");
+      return;
+    }
+    if (draft.structureWarning) {
+      setModalFormStatus(form, "Review the refreshed order structure before linking.", "error");
+      return;
+    }
+    const submitButton = form.querySelector("button[type='submit']");
+    if (submitButton) {
+      submitButton.disabled = true;
+      submitButton.textContent = "Linking...";
+    }
+    setModalFormStatus(form, "Validating Transfer Order quantities...", "info");
+    fetch("/api/dispatch/order-dependencies", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(dispatchLeaseRequestPayload({
+        dispatchTargetRef: order.id,
+        transferOrderRef,
+        mode: draft.mode || "direct_to_customer",
+        targetSignature: draft.targetSignature,
+        allocations,
+        audit: { sessionId: dispatchSessionId }
+      }))
+    }).then(async (response) => {
+      if (!response.ok) throw new Error(await dispatchErrorMessage(response));
+      return response.json();
+    }).then((payload) => {
+      if (Array.isArray(payload.orders)) applyDispatchOrderFeed(payload.orders);
+      clearLinkModalDraft("to", order.id);
+      getLinkModalDraft("to", order.id);
+      orderDependencyOptions = null;
+      requestOrderPoolRefreshOnNextSave();
+      routeNotice = `${transferOrderRef} linked with ${order.id}.`;
+      commitPlanMutation("to_link_created");
+      loadOrderDependencyOptions(orderById(order.id)).catch(() => null);
+    }).catch((error) => {
+      setModalFormStatus(form, `TO link failed: ${error.message}`, "error");
+      if (submitButton) {
+        submitButton.disabled = false;
+        submitButton.textContent = "Link Transfer Order";
+      }
+    });
+    return;
+  }
   if (form.dataset.form === "po-link") {
     const order = orderById(modalOrderId);
     if (!order) return;
+    captureActiveLinkModalDraft();
+    const draft = getLinkModalDraft("po", order.id);
     const poRef = String(data.poRef || "").trim();
     const lines = [...form.querySelectorAll(".po-link-line")].map((row) => ({
       salesLineId: row.dataset.salesLine,
+      targetLineKey: row.dataset.targetLineKey,
       quantities: {
         pallets: row.querySelector('[data-po-link-qty="pallets"]')?.value || 0,
         layers: row.querySelector('[data-po-link-qty="layers"]')?.value || 0,
@@ -7921,6 +8297,10 @@ app.addEventListener("submit", (event) => {
       setModalFormStatus(form, "Enter quantity for at least one SO item.", "error");
       return;
     }
+    if (draft.structureWarning) {
+      setModalFormStatus(form, "Review the refreshed order structure before connecting the PO.", "error");
+      return;
+    }
     const submitButton = form.querySelector("button[type='submit']");
     if (submitButton) {
       submitButton.disabled = true;
@@ -7933,6 +8313,7 @@ app.addEventListener("submit", (event) => {
       body: JSON.stringify(dispatchLeaseRequestPayload({
         poRef,
         lines,
+        targetSignature: draft.targetSignature,
         audit: { sessionId: dispatchSessionId }
       }))
     }).then((response) => {
@@ -7941,6 +8322,9 @@ app.addEventListener("submit", (event) => {
     }).then((payload) => {
       poAllocationOptions = payload.options;
       if (Array.isArray(payload.orders)) applyDispatchOrderFeed(payload.orders);
+      clearLinkModalDraft("po", order.id);
+      const nextDraft = getLinkModalDraft("po", order.id);
+      nextDraft.targetSignature = payload.options?.order?.targetSignature || "";
       requestOrderPoolRefreshOnNextSave();
       routeNotice = `${payload.allocations?.length || 0} PO item line(s) connected to sales order.`;
       commitPlanMutation("po_link_created");

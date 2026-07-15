@@ -13,7 +13,7 @@ import { applyInventoryClassificationRules, confirmCycleCountLine, getCycleCount
 import { listReceivingVendors, listReceivingSources, listReceivingOrders, getReceivingOrder, searchReceivingItems, confirmReceivingLine, unconfirmReceivingLine, getReceivableReceivingOrder, buildItemReceiptPayload, recordReceivingReceipt, recordReceivingReceiptFailure, listReceivingReceipts, listLocalCoSources, listLocalCoReceivingOrders, searchLocalCoItems, getLocalCoReceivingOrder, confirmLocalCoReceivingLine, unconfirmLocalCoReceivingLine, receiveLocalCoOrder } from "./receiving-repository.js";
 import { listExistingInboundOrderIds, listExistingOutboundOrderIds, markMissingInboundOrderLines, markMissingInboundOrders, markMissingOutboundOrderLines, markOutboundOrderMissing, updatePurchaseOrderNetSuiteStatus, updateSalesOrderNetSuiteStatus, upsertInboundTransferOrderLines, upsertInboundTransferOrders, upsertOutboundTransferOrderLines, upsertOutboundTransferOrders, upsertPurchaseOrderLines, upsertPurchaseOrders, upsertSalesOrderLines, upsertSalesOrders } from "./order-sync-repository.js";
 import { listOperatorHistory, listRecordWarnings, reportOperatorRecordError, resolveRecordWarning } from "./history-repository.js";
-import { listDispatchOrders, listScmPurchaseOrders, listScmSchedule, updateScmScheduleEntry, createScmScheduleGroup, cancelScmScheduleGroup, listScmViewPresets, upsertScmViewPreset, createScmVrmaOrder, syncScmScheduleFromDispatchPlan, createScmPurchaseOrderSplit, updateScmPurchaseOrderSplitRef, updateScmPurchaseOrderSplitDestination, updateScmPurchaseOrderSplitPickupYard, updatePurchaseOrderDispatchRef, cancelScmPurchaseOrderSplit, refreshDispatchEnrichment, reparseMissingSalesOrderDispatch, searchSalesOrderMethodOverrides, setPurchaseOrderVendorYard, updateDispatchOrderDetails, updateSalesOrderLocalMethod, getSalesOrderPoAllocationOptions, createSalesOrderPoAllocation, createSalesOrderPoAllocations, cancelSalesOrderPoAllocation, createDispatchOperatorRequest, upsertLocalCoOrder, cancelLocalCoOrder, listDispatchOperatorRequests, resolveDispatchOperatorRequestsForOrder } from "./dispatch-repository.js";
+import { listDispatchOrders, enrichDispatchOrdersWithPoTargetAllocations, listScmPurchaseOrders, listScmSchedule, updateScmScheduleEntry, createScmScheduleGroup, cancelScmScheduleGroup, listScmViewPresets, upsertScmViewPreset, createScmVrmaOrder, syncScmScheduleFromDispatchPlan, createScmPurchaseOrderSplit, updateScmPurchaseOrderSplitRef, updateScmPurchaseOrderSplitDestination, updateScmPurchaseOrderSplitPickupYard, updatePurchaseOrderDispatchRef, cancelScmPurchaseOrderSplit, refreshDispatchEnrichment, reparseMissingSalesOrderDispatch, searchSalesOrderMethodOverrides, setPurchaseOrderVendorYard, updateDispatchOrderDetails, updateSalesOrderLocalMethod, getSalesOrderPoAllocationOptions, createSalesOrderPoAllocation, createSalesOrderPoAllocations, cancelSalesOrderPoAllocation, createDispatchOperatorRequest, upsertLocalCoOrder, cancelLocalCoOrder, listDispatchOperatorRequests, resolveDispatchOperatorRequestsForOrder } from "./dispatch-repository.js";
 import { listDispatchVendorYards, updateDispatchVendorYard, upsertDispatchVendorYard, listDispatchParserRules, updateDispatchParserRule, listOllamaAudit, listDispatchVendorMappings, discoverDispatchVendorMappingsFromPurchaseOrders, updateDispatchVendorMapping, createDispatchLocalVendor, updateDispatchLocalVendor } from "./dispatch-enrichment.js";
 import { listDispatchAudit, writeDispatchAudit } from "./dispatch-audit-repository.js";
 import { DispatchPlanDateMismatchError, StaleDispatchPlanSaveError, confirmDispatchPlan, createDispatchPlan, dispatchPlannedAssignmentMap, getCurrentDispatchPlan, getDispatchPlan, getDispatchPlanRevision, getDispatchPlanSnapshot, listDispatchPlanSnapshots, listDispatchPlans, reopenDispatchPlan, restoreDispatchPlanSnapshot, saveDispatchPlanSnapshot } from "./dispatch-plan-repository.js";
@@ -426,7 +426,8 @@ async function listDispatchOrdersForResponse({ type = null } = {}) {
   const orders = await listDispatchOrders({ type });
   const derivedOrders = await listDispatchSnapshotDerivedOrders({ type });
   const assigned = await enrichDispatchOrdersWithPlanAssignments(mergeDispatchOrderFeedWithSnapshotDerivedOrders(orders, derivedOrders));
-  return enrichDispatchOrdersWithDependencies(assigned);
+  const poLinked = await enrichDispatchOrdersWithPoTargetAllocations(assigned);
+  return enrichDispatchOrdersWithDependencies(poLinked);
 }
 
 function sendDispatchDependencyConflictResponse(res, conflicts = []) {
@@ -3962,8 +3963,10 @@ app.get("/api/dispatch/order-dependencies", async (req, res, next) => {
 app.get("/api/dispatch/order-dependencies/options", async (req, res, next) => {
   try {
     res.json(await getOrderDependencyOptions({
+      dispatchTargetRef: req.query.dispatchTargetRef || "",
       salesOrderRef: req.query.salesOrderRef || "",
-      transferOrderRef: req.query.transferOrderRef || ""
+      transferOrderRef: req.query.transferOrderRef || "",
+      planDate: req.query.planDate || ""
     }));
   } catch (error) {
     next(error);
@@ -3974,8 +3977,11 @@ app.post("/api/dispatch/order-dependencies", async (req, res, next) => {
   try {
     await requireDispatchPlanEditLease(req, req.body?.planDate || req.body?.date || "");
     const dependency = await createOrderDependency({
+      dispatchTargetRef: req.body?.dispatchTargetRef,
       salesOrderRef: req.body?.salesOrderRef,
       transferOrderRef: req.body?.transferOrderRef,
+      planDate: req.body?.planDate,
+      targetSignature: req.body?.targetSignature,
       mode: req.body?.mode,
       allocations: req.body?.allocations || [],
       operatorId: req.operator?.id
@@ -4823,7 +4829,7 @@ app.put("/api/dispatch/orders/:id/details", async (req, res, next) => {
 
 app.get("/api/dispatch/orders/:id/po-allocations", async (req, res, next) => {
   try {
-    res.json(await getSalesOrderPoAllocationOptions(req.params.id));
+    res.json(await getSalesOrderPoAllocationOptions(req.params.id, { planDate: req.query.planDate || "" }));
   } catch (error) {
     next(error);
   }
@@ -4831,19 +4837,26 @@ app.get("/api/dispatch/orders/:id/po-allocations", async (req, res, next) => {
 
 app.post("/api/dispatch/orders/:id/po-allocations", async (req, res, next) => {
   try {
-    await requireDispatchPlanEditLease(req);
+    await requireDispatchPlanEditLease(req, req.body?.planDate || "");
     const allocations = Array.isArray(req.body?.lines)
       ? await createSalesOrderPoAllocations({
+        dispatchTargetRef: req.params.id,
         salesOrderRef: req.params.id,
         poRef: req.body?.poRef,
+        planDate: req.body?.planDate || "",
+        targetSignature: req.body?.targetSignature || "",
         lines: req.body.lines,
         createdBy: req.body?.audit?.sessionId || ""
       })
       : [await createSalesOrderPoAllocation({
+        dispatchTargetRef: req.params.id,
         salesOrderRef: req.params.id,
+        targetLineKey: req.body?.targetLineKey,
         salesLineId: req.body?.salesLineId,
         poLineId: req.body?.poLineId,
         poRef: req.body?.poRef,
+        planDate: req.body?.planDate || "",
+        targetSignature: req.body?.targetSignature || "",
         quantities: req.body?.quantities || req.body || {},
         createdBy: req.body?.audit?.sessionId || ""
       })];
@@ -4864,7 +4877,7 @@ app.post("/api/dispatch/orders/:id/po-allocations", async (req, res, next) => {
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { orderId: req.params.id, change: "so_po_allocation", sourceSessionId: req.body?.audit?.sessionId });
     emitAppEvent("delivery.order.updated", { orderRef: req.params.id, change: "so_po_allocation", sourceSessionId: req.body?.audit?.sessionId });
-    res.json({ allocations, allocation: allocations[0] || null, options: await getSalesOrderPoAllocationOptions(req.params.id), orders: await listDispatchOrdersForResponse() });
+    res.json({ allocations, allocation: allocations[0] || null, options: await getSalesOrderPoAllocationOptions(req.params.id, { planDate: req.body?.planDate || "" }), orders: await listDispatchOrdersForResponse() });
   } catch (error) {
     next(error);
   }
@@ -4872,7 +4885,7 @@ app.post("/api/dispatch/orders/:id/po-allocations", async (req, res, next) => {
 
 app.delete("/api/dispatch/po-allocations/:allocationId", async (req, res, next) => {
   try {
-    await requireDispatchPlanEditLease(req);
+    await requireDispatchPlanEditLease(req, req.query?.planDate || "");
     const cancelled = await cancelSalesOrderPoAllocation(req.params.allocationId, { cancelledBy: req.query.sessionId || "" });
     if (!cancelled) return res.status(404).json({ error: "Allocation not found or already cancelled." });
     await writeDispatchAudit({
@@ -4883,9 +4896,10 @@ app.delete("/api/dispatch/po-allocations/:allocationId", async (req, res, next) 
       sessionId: req.query.sessionId,
       after: cancelled
     }).catch(() => null);
-    emitAppEvent("dispatch.orders.updated", { orderId: cancelled.salesOrderRef, change: "so_po_allocation_cancelled", sourceSessionId: req.query.sessionId });
-    emitAppEvent("delivery.order.updated", { orderRef: cancelled.salesOrderRef, change: "so_po_allocation_cancelled", sourceSessionId: req.query.sessionId });
-    res.json({ cancelled, options: await getSalesOrderPoAllocationOptions(cancelled.salesOrderRef), orders: await listDispatchOrdersForResponse() });
+    const targetRef = cancelled.dispatchTargetRef || cancelled.salesOrderRef;
+    emitAppEvent("dispatch.orders.updated", { orderId: targetRef, change: "so_po_allocation_cancelled", sourceSessionId: req.query.sessionId });
+    emitAppEvent("delivery.order.updated", { orderRef: targetRef, change: "so_po_allocation_cancelled", sourceSessionId: req.query.sessionId });
+    res.json({ cancelled, options: await getSalesOrderPoAllocationOptions(targetRef, { planDate: req.query.planDate || "" }), orders: await listDispatchOrdersForResponse() });
   } catch (error) {
     next(error);
   }
