@@ -1,11 +1,11 @@
-const CACHE_NAME = "mbbs-yard-operator-v101-native-hd-photo";
+const CACHE_NAME = "mbbs-yard-operator-v103-batch-switch";
 const APP_SHELL = [
   "/operator",
   "/operator.html",
   "/operator.css?v=20260713-consolidation-review-v3",
   "/i18n.css?v=20260701-i18n-v2",
   "/i18n.js?v=20260713-consolidation-review-v3",
-  "/operator.js?v=20260715-native-hd-photo-v1",
+  "/operator.js?v=20260715-batch-switch-v1",
   "/driver",
   "/driver.html",
   "/driver.css?v=20260702-camera-v3",

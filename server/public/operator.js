@@ -84,6 +84,8 @@ let consolidationBusy = false;
 let consolidationNotice = "";
 let compactLineMode = localStorage.getItem("mbbs.operator.compactLineList") === "true";
 let orders = [];
+let deliveryOrderBuckets = { active: null, packed: null };
+let packedDeliveryPrefetch = null;
 let deliveryNotifications = { total: 0, salesOrder: { dueToday: 0 }, transferOrder: { dueToday: 0 }, items: [] };
 let urgentDeliveryAlert = null;
 let operatorRequests = [];
@@ -164,6 +166,7 @@ let pendingDeliveryEventAlertRefs = new Set();
 let pendingDeliveryEventRefresh = false;
 let pendingReceivingEventRefresh = false;
 let pendingOperatorRequestAlert = false;
+const localDeliveryMutationRefs = new Map();
 let deliveryNotificationState = new Map();
 let deliveryNotificationStateReady = false;
 let cameraFacingMode = localStorage.getItem(CAMERA_FACING_KEY) === "user" ? "user" : "environment";
@@ -540,6 +543,26 @@ async function publicApi(path, options = {}) {
   return response.json();
 }
 
+function markLocalDeliveryMutation(orderId, ttlMs = 4000) {
+  const key = String(orderId || "").trim();
+  if (key) localDeliveryMutationRefs.set(key, Date.now() + ttlMs);
+}
+
+function finishLocalDeliveryMutation(orderId) {
+  markLocalDeliveryMutation(orderId, 1500);
+}
+
+function isLocalDeliveryMutationEvent(payload = {}) {
+  const now = Date.now();
+  for (const [key, expiresAt] of localDeliveryMutationRefs.entries()) {
+    if (expiresAt <= now) localDeliveryMutationRefs.delete(key);
+  }
+  const refs = [payload.orderId, payload.orderRef, payload.tranid]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+  return refs.some((ref) => (localDeliveryMutationRefs.get(ref) || 0) > now);
+}
+
 function connectEvents() {
   if (!authToken || eventSource) return;
   eventSource = new EventSource(`/api/events?client=operator&token=${encodeURIComponent(authToken)}`);
@@ -575,6 +598,11 @@ function connectEvents() {
     const needsDelivery = deliveryEvents.includes(event.type);
     const needsReceiving = receivingEvents.includes(event.type);
     if (!needsDelivery && !needsReceiving) return;
+    if (needsDelivery && isLocalDeliveryMutationEvent(payload)) return;
+    if (needsDelivery) {
+      deliveryOrderBuckets.active = null;
+      deliveryOrderBuckets.packed = null;
+    }
     pendingDeliveryEventRefresh ||= needsDelivery;
     pendingReceivingEventRefresh ||= needsReceiving;
     pendingOperatorRequestAlert ||= event.type === "dispatch.operator_request.created";
@@ -1613,6 +1641,67 @@ function renderLocationSelect() {
   `;
 }
 
+function deliveryScreenTitle() {
+  if (deliveryPrepMode === "load") return t("operator.perLoadView", "Per Load View");
+  return viewMode === "packed" ? t("operator.packedOrders", "Packed Orders") : t("operator.deliveryPrep", "Delivery Prep");
+}
+
+function deliveryScreenSubtitle() {
+  const subtype = deliveryPrepMode === "load"
+    ? `${formatDate(deliveryLoadViewDate)}${deliveryLoadViewTruck ? ` | ${deliveryLoadViewTruck}` : ""}`
+    : deliveryPrepMode === "saved"
+      ? t("operator.salesTransferOrders", "Sales Order + Transfer Order")
+      : deliveryOrderType === "transfer_order" ? t("operator.transferOrder", "Transfer Order") : t("operator.salesOrder", "Sales Order");
+  return `${subtype} | ${t("common.location", "Location")} ${currentLocation()?.text || locationId}`;
+}
+
+function deliveryScreenActions() {
+  const topWarnings = viewMode === "packed" ? warningOrders() : [];
+  return `
+    ${topWarnings.length ? `<button class="top-warning-button" data-action="open-warning-order" data-order="${topWarnings[0].netsuite_id}" type="button">${t("operator.warning", "Warning")} ${topWarnings.length}</button>` : ""}
+    <button class="secondary-button" data-action="main-menu" type="button">${t("common.menu", "Menu")}</button>
+    ${renderInstallButton()}
+    <button class="secondary-button" data-action="refresh" type="button">${t("common.refreshOrders", "Refresh Orders")}</button>
+    <button class="secondary-button" data-action="logout" type="button">${operator.display_name}</button>
+  `;
+}
+
+function renderDeliveryDetailContent() {
+  if (selectedOrder) return renderDetailPanel(selectedOrder);
+  if (selectedId) {
+    return `<div class="empty-state"><strong>${t("common.loading", "Loading")}</strong><span>${t("operator.loadingOrderDetails", "Loading order details...")}</span></div>`;
+  }
+  return renderEmptyDetail();
+}
+
+function renderDeliveryPanels({ orderPanel = true, detailPanel = true } = {}) {
+  const grid = currentModule === "delivery" ? app.querySelector(".delivery-grid") : null;
+  if (!grid) return render();
+
+  saveOperatorState();
+  const orderPanelElement = grid.querySelector(".order-panel");
+  const detailPanelElement = grid.querySelector(".detail-panel");
+  const orderListScroll = orderPanelElement?.querySelector(".order-list")?.scrollTop || 0;
+  const detailScroll = detailPanelElement?.scrollTop || 0;
+
+  if (orderPanel && orderPanelElement) {
+    orderPanelElement.innerHTML = renderOrderPanel();
+    const nextOrderList = orderPanelElement.querySelector(".order-list");
+    if (nextOrderList) nextOrderList.scrollTop = orderListScroll;
+  }
+  if (detailPanel && detailPanelElement) {
+    detailPanelElement.innerHTML = renderDeliveryDetailContent();
+    detailPanelElement.scrollTop = detailScroll;
+  }
+
+  const title = app.querySelector(".topbar-title h1");
+  const subtitle = app.querySelector(".topbar-title span");
+  const actions = app.querySelector(".topbar-actions");
+  if (title) title.textContent = deliveryScreenTitle();
+  if (subtitle) subtitle.textContent = deliveryScreenSubtitle();
+  if (actions) actions.innerHTML = `${renderReleaseDraftButton()}${renderNotificationButton()}${deliveryScreenActions()}`;
+}
+
 function render() {
   if (!operator) return renderLogin();
   if (!locationId) return renderLocationSelect();
@@ -1630,34 +1719,16 @@ function render() {
   if (currentModule === "delivery-fulfill") return renderFulfillmentScreen();
   if (currentModule === "customer-pickup-load") return renderFulfillmentScreen();
 
-  const title = deliveryPrepMode === "load"
-    ? t("operator.perLoadView", "Per Load View")
-    : viewMode === "packed" ? t("operator.packedOrders", "Packed Orders") : t("operator.deliveryPrep", "Delivery Prep");
-  const subtype = deliveryPrepMode === "load"
-    ? `${formatDate(deliveryLoadViewDate)}${deliveryLoadViewTruck ? ` | ${deliveryLoadViewTruck}` : ""}`
-    : deliveryPrepMode === "saved"
-    ? t("operator.salesTransferOrders", "Sales Order + Transfer Order")
-    : deliveryOrderType === "transfer_order" ? t("operator.transferOrder", "Transfer Order") : t("operator.salesOrder", "Sales Order");
-  const subtitle = `${subtype} | ${t("common.location", "Location")} ${currentLocation()?.text || locationId}`;
-  const topWarnings = viewMode === "packed" ? warningOrders() : [];
-  const actions = `
-    ${topWarnings.length ? `<button class="top-warning-button" data-action="open-warning-order" data-order="${topWarnings[0].netsuite_id}" type="button">${t("operator.warning", "Warning")} ${topWarnings.length}</button>` : ""}
-    <button class="secondary-button" data-action="main-menu" type="button">${t("common.menu", "Menu")}</button>
-    ${renderInstallButton()}
-    <button class="secondary-button" data-action="refresh" type="button">${t("common.refreshOrders", "Refresh Orders")}</button>
-    <button class="secondary-button" data-action="logout" type="button">${operator.display_name}</button>
-  `;
-
-  shell(title, subtitle, `
+  shell(deliveryScreenTitle(), deliveryScreenSubtitle(), `
     <section class="delivery-grid">
       <aside class="order-panel">
         ${renderOrderPanel()}
       </aside>
       <section class="detail-panel">
-        ${selectedOrder ? renderDetailPanel(selectedOrder) : renderEmptyDetail()}
+        ${renderDeliveryDetailContent()}
       </section>
     </section>
-  `, actions);
+  `, deliveryScreenActions());
 }
 
 function renderMenu() {
@@ -2601,9 +2672,156 @@ function renderStepper(unit, label, value) {
   `;
 }
 
+function deliveryOrderKey(order) {
+  return String(order?.netsuite_id || order?.id || "");
+}
+
+function combineDeliveryOrderTypes(source = {}) {
+  return [...(source.salesOrder || []), ...(source.transferOrder || [])];
+}
+
+function applyDeliveryBootstrapState(bootstrap, options = {}) {
+  savedDeliveryOrderKeys = new Set((bootstrap.savedOrderKeys || []).map((key) => String(key)));
+  activeDeliveryDraft = bootstrap.activeDraft || null;
+  applyDeliveryNotifications(bootstrap.notifications, options);
+  deliveryOrderBuckets.active = combineDeliveryOrderTypes(bootstrap.orders);
+}
+
+async function fetchPackedDeliveryOrders(targetLocationId = locationId) {
+  const [salesOrders, transferOrders] = await Promise.all([
+    api(`/api/delivery/orders?locationId=${targetLocationId}&status=packed&orderType=sales_order`),
+    api(`/api/delivery/orders?locationId=${targetLocationId}&status=packed&orderType=transfer_order`)
+  ]);
+  return [...salesOrders, ...transferOrders];
+}
+
+async function primePackedDeliveryOrders({ force = false } = {}) {
+  if (deliveryPrepMode !== "standard" || !operator || !locationId) return deliveryOrderBuckets.packed;
+  if (!force && Array.isArray(deliveryOrderBuckets.packed)) return deliveryOrderBuckets.packed;
+  const prefetchLocationId = String(locationId);
+  if (packedDeliveryPrefetch?.locationId === prefetchLocationId) return packedDeliveryPrefetch.promise;
+  const promise = fetchPackedDeliveryOrders(prefetchLocationId)
+    .then((packedOrders) => {
+      if (String(locationId) === prefetchLocationId) deliveryOrderBuckets.packed = packedOrders;
+      return packedOrders;
+    })
+    .finally(() => {
+      if (packedDeliveryPrefetch?.promise === promise) packedDeliveryPrefetch = null;
+    });
+  packedDeliveryPrefetch = { locationId: prefetchLocationId, promise };
+  return promise;
+}
+
+function mergeDeliveryOrderIntoState(order) {
+  if (!order) return;
+  const key = deliveryOrderKey(order);
+  const merge = (list) => (Array.isArray(list)
+    ? list.map((item) => deliveryOrderKey(item) === key ? { ...item, ...order } : item)
+    : list);
+  orders = merge(orders);
+  deliveryOrderBuckets.active = merge(deliveryOrderBuckets.active);
+  deliveryOrderBuckets.packed = merge(deliveryOrderBuckets.packed);
+}
+
+function upsertDeliveryOrder(list, order) {
+  if (!Array.isArray(list)) return list;
+  const key = deliveryOrderKey(order);
+  const index = list.findIndex((item) => deliveryOrderKey(item) === key);
+  if (index < 0) return [...list, order];
+  return list.map((item, itemIndex) => itemIndex === index ? { ...item, ...order } : item);
+}
+
+function acceptRefreshedDeliveryOrder(order, { renderPanels = true } = {}) {
+  if (!order) return false;
+  mergeDeliveryOrderIntoState(order);
+  if (String(selectedId || "") === deliveryOrderKey(order)) {
+    selectedOrder = order;
+    const lines = visibleLines(order);
+    if (!selectedLineId || !lines.some((line) => String(line.id) === String(selectedLineId))) {
+      selectedLineId = lines[0]?.id || null;
+    }
+  }
+  if (renderPanels && currentModule === "delivery") renderDeliveryPanels();
+  return true;
+}
+
+function applyPackedOrderTransition(order) {
+  if (!order) return;
+  const stillOpen = (order.lines || []).some((line) => isPickableLine(line) && hasRemainingQty(line));
+  const nextOrder = { ...order, underpack_count: stillOpen ? 1 : 0 };
+  const key = deliveryOrderKey(nextOrder);
+  if (Array.isArray(deliveryOrderBuckets.active)) {
+    deliveryOrderBuckets.active = stillOpen
+      ? upsertDeliveryOrder(deliveryOrderBuckets.active, nextOrder)
+      : deliveryOrderBuckets.active.filter((item) => deliveryOrderKey(item) !== key);
+  }
+  deliveryOrderBuckets.packed = upsertDeliveryOrder(deliveryOrderBuckets.packed || [], nextOrder);
+  if (viewMode === "active") {
+    orders = stillOpen
+      ? upsertDeliveryOrder(orders, nextOrder)
+      : orders.filter((item) => deliveryOrderKey(item) !== key);
+    const panelOrders = filteredDeliveryOrders();
+    selectedId = stillOpen ? key : panelOrders[0]?.netsuite_id || null;
+    selectedOrder = stillOpen ? nextOrder : null;
+    if (!stillOpen) selectedLineId = null;
+    activeDeliveryDraft = null;
+    renderDeliveryPanels();
+  }
+}
+
+async function activateCachedDeliveryView(nextView) {
+  const cached = deliveryOrderBuckets[nextView];
+  if (!Array.isArray(cached)) return false;
+  viewMode = nextView;
+  orderPage = 0;
+  orders = annotateSavedOrders(cached);
+  selectedId = filteredDeliveryOrders()[0]?.netsuite_id || null;
+  selectedOrder = null;
+  selectedLineId = null;
+  renderDeliveryPanels();
+  if (nextView === "packed") {
+    void api(`/api/operator/requests?locationId=${locationId}&status=open`)
+      .then((requests) => {
+        operatorRequests = requests;
+        if (currentModule === "delivery" && viewMode === "packed") {
+          renderDeliveryPanels({ detailPanel: false });
+        }
+      })
+      .catch(() => null);
+  }
+  const detailId = selectedId;
+  if (detailId) {
+    await loadDetail(detailId, { silentRender: true });
+    if (String(selectedId) === String(detailId)) renderDeliveryPanels({ orderPanel: false });
+  }
+  return true;
+}
+
+async function activateCachedDeliveryBatch(nextFilter) {
+  deliveryBatchFilter = nextFilter || "batch_a";
+  deliveryOrderType = deliveryBatchFilter === "transfer" ? "transfer_order" : "sales_order";
+  localStorage.setItem("mbbs.operator.deliveryOrderType", deliveryOrderType);
+  localStorage.setItem("mbbs.operator.deliveryBatchFilter", deliveryBatchFilter);
+
+  orderPage = 0;
+  linePage = 0;
+  selectedLineId = null;
+  selectedId = filteredDeliveryOrders()[0]?.netsuite_id || null;
+  selectedOrder = null;
+
+  renderDeliveryPanels();
+  const detailId = selectedId;
+  if (detailId) {
+    await loadDetail(detailId, { silentRender: true });
+    if (String(selectedId) === String(detailId)) renderDeliveryPanels({ orderPanel: false });
+  }
+}
+
 async function loadOrders(options = {}) {
   const status = viewMode === "packed" ? "packed" : "active";
   const canBootstrap = ["standard", "saved"].includes(deliveryPrepMode) && status === "active";
+  const previousSelectedOrder = selectedOrder;
+  const previousSelectedId = selectedId;
   if (canBootstrap) {
     const [bootstrap, requests] = await Promise.all([
       api(`/api/delivery/bootstrap?locationId=${locationId}`),
@@ -2611,14 +2829,29 @@ async function loadOrders(options = {}) {
         ? api(`/api/operator/requests?locationId=${locationId}&orderType=${deliveryOrderType}&status=open`).catch(() => [])
         : Promise.resolve([])
     ]);
-    savedDeliveryOrderKeys = new Set((bootstrap.savedOrderKeys || []).map((key) => String(key)));
-    activeDeliveryDraft = bootstrap.activeDraft || null;
-    applyDeliveryNotifications(bootstrap.notifications, options);
-    const bootstrappedOrders = [...(bootstrap.orders?.salesOrder || []), ...(bootstrap.orders?.transferOrder || [])];
+    applyDeliveryBootstrapState(bootstrap, options);
+    const bootstrappedOrders = deliveryOrderBuckets.active || [];
     orders = deliveryPrepMode === "saved"
       ? bootstrappedOrders.filter((order) => savedDeliveryOrderKeys.has(String(order.netsuite_id || "")))
       : bootstrappedOrders;
     operatorRequests = requests;
+  } else if (deliveryPrepMode === "standard" && status === "packed") {
+    const [packedOrders, requests] = await Promise.all([
+      primePackedDeliveryOrders({ force: true }),
+      api(`/api/operator/requests?locationId=${locationId}&status=open`).catch(() => [])
+    ]);
+    deliveryOrderBuckets.packed = packedOrders;
+    orders = packedOrders;
+    operatorRequests = requests;
+    void Promise.all([
+      loadDeliveryNotifications(options),
+      loadCurrentDeliveryDraft(),
+      loadSavedDeliveryOrderKeys()
+    ]).then(() => {
+      if (currentModule === "delivery" && viewMode === "packed") {
+        renderDeliveryPanels({ orderPanel: false, detailPanel: false });
+      }
+    }).catch(() => null);
   } else {
     await Promise.all([
       loadDeliveryNotifications(options),
@@ -2655,12 +2888,18 @@ async function loadOrders(options = {}) {
   if (selectedId && !panelOrders.some((order) => String(order.netsuite_id) === String(selectedId))) {
     selectedId = panelOrders[0]?.netsuite_id || null;
   }
-  selectedOrder = null;
-  render();
+  const keepCurrentDetail = options.keepSelection
+    && previousSelectedOrder
+    && String(previousSelectedId || "") === String(selectedId || "");
+  selectedOrder = keepCurrentDetail ? previousSelectedOrder : null;
+  renderDeliveryPanels({ detailPanel: !keepCurrentDetail });
   const detailId = selectedId;
   if (detailId) {
     await loadDetail(detailId, { silentRender: true });
-    if (String(selectedId) === String(detailId)) render();
+    if (String(selectedId) === String(detailId)) renderDeliveryPanels({ orderPanel: false });
+  }
+  if (status === "active" && deliveryPrepMode === "standard") {
+    void primePackedDeliveryOrders().catch(() => null);
   }
 }
 
@@ -3330,6 +3569,8 @@ async function refreshReceiving() {
 }
 
 async function refreshDeliveryOrders() {
+  deliveryOrderBuckets.active = null;
+  deliveryOrderBuckets.packed = null;
   await loadOrders({ keepSelection: true });
   showToast("Orders refreshed from local DB");
 }
@@ -3466,11 +3707,15 @@ async function loadDetail(id, options = {}) {
   const order = await api(`/api/delivery/orders/${id}`);
   if (String(selectedId) !== String(id)) return null;
   selectedOrder = order;
+  mergeDeliveryOrderIntoState(order);
   const lines = visibleLines(order);
   if (!selectedLineId || !lines.some((line) => String(line.id) === String(selectedLineId))) {
     selectedLineId = lines[0]?.id || null;
   }
-  if (!options.silentRender) render();
+  if (!options.silentRender) {
+    if (currentModule === "delivery") renderDeliveryPanels();
+    else render();
+  }
   return order;
 }
 
@@ -3479,12 +3724,32 @@ async function setOrderStatus(status) {
   if (status === "packed" && !canMarkPacked(selectedOrder)) {
     return showToast("Confirm at least one order line before marking Packed.");
   }
-  await api(`/api/delivery/orders/${selectedId}/status`, {
-    method: "POST",
-    body: JSON.stringify({ status })
-  });
-  showToast(statusText(status));
-  await reloadDeliveryScreen({ keepSelection: status !== "packed" || viewMode === "packed" });
+  const mutationOrderId = selectedId;
+  markLocalDeliveryMutation(mutationOrderId);
+  try {
+    const result = await api(`/api/delivery/orders/${mutationOrderId}/status`, {
+      method: "POST",
+      body: JSON.stringify({ status })
+    });
+    showToast(statusText(status));
+    if (status === "packed") {
+      applyPackedOrderTransition(result.order);
+      const nextOrderId = selectedId;
+      if (nextOrderId && !selectedOrder) {
+        await loadDetail(nextOrderId, { silentRender: true });
+        if (String(selectedId) === String(nextOrderId)) renderDeliveryPanels({ orderPanel: false });
+      }
+      void primePackedDeliveryOrders({ force: true })
+        .then((packedOrders) => {
+          deliveryOrderBuckets.packed = upsertDeliveryOrder(packedOrders || [], result.order);
+        })
+        .catch(() => null);
+    } else {
+      acceptRefreshedDeliveryOrder(result.order);
+    }
+  } finally {
+    finishLocalDeliveryMutation(mutationOrderId);
+  }
 }
 
 async function confirmLine(lineId) {
@@ -3504,16 +3769,22 @@ async function confirmLine(lineId) {
     : isActiveDraftPackedLine(line)
       ? `/api/delivery/orders/${encodeURIComponent(selectedId)}/lines/${encodeURIComponent(lineId)}/packed-quantity`
     : `/api/delivery/orders/${encodeURIComponent(selectedId)}/lines/${encodeURIComponent(lineId)}/confirm`;
-  await api(path, {
-    method: "POST",
-    body: JSON.stringify(body)
-  });
-  showToast("Line confirmed");
-  if (isCustomerPickupMode()) {
-    selectedOrder = await api(`/api/delivery/orders/${selectedId}`);
-    return render();
+  const mutationOrderId = selectedId;
+  if (!isCustomerPickupMode()) markLocalDeliveryMutation(mutationOrderId);
+  try {
+    const result = await api(path, {
+      method: "POST",
+      body: JSON.stringify(body)
+    });
+    showToast("Line confirmed");
+    if (isCustomerPickupMode()) {
+      selectedOrder = await api(`/api/delivery/orders/${selectedId}`);
+      return render();
+    }
+    if (!acceptRefreshedDeliveryOrder(result.order)) await loadDetail(selectedId);
+  } finally {
+    if (!isCustomerPickupMode()) finishLocalDeliveryMutation(mutationOrderId);
   }
-  await loadDetail(selectedId);
 }
 
 function confirmPayloadForLine(line) {
@@ -3546,53 +3817,71 @@ async function confirmPage() {
     if (isActiveDraftPackedLine(line)) packedLines.push(payload);
     else lines.push(payload);
   }
+  const mutationOrderId = selectedId;
+  markLocalDeliveryMutation(mutationOrderId);
   let confirmedCount = 0;
   const failures = [];
-  if (lines.length) {
-    try {
-      const result = await api(`/api/delivery/orders/${encodeURIComponent(selectedId)}/lines/confirm-page`, {
-        method: "POST",
-        body: JSON.stringify({ lines })
-      });
-      confirmedCount += Number(result.confirmed || 0);
-      for (const failure of result.failures || []) failures.push(`${failure.lineId}: ${failure.error}`);
-    } catch (error) {
-      failures.push(error.message);
+  let refreshedOrder = null;
+  try {
+    if (lines.length) {
+      try {
+        const result = await api(`/api/delivery/orders/${encodeURIComponent(selectedId)}/lines/confirm-page`, {
+          method: "POST",
+          body: JSON.stringify({ lines })
+        });
+        confirmedCount += Number(result.confirmed || 0);
+        refreshedOrder = result.order || refreshedOrder;
+        for (const failure of result.failures || []) failures.push(`${failure.lineId}: ${failure.error}`);
+      } catch (error) {
+        failures.push(error.message);
+      }
     }
-  }
-  for (const line of packedLines) {
-    try {
-      await api(`/api/delivery/orders/${encodeURIComponent(selectedId)}/lines/${encodeURIComponent(line.lineId)}/packed-quantity`, {
-        method: "POST",
-        body: JSON.stringify(line.values)
-      });
-      confirmedCount += 1;
-    } catch (error) {
-      failures.push(`${line.label}: ${error.message}`);
+    for (const line of packedLines) {
+      try {
+        const result = await api(`/api/delivery/orders/${encodeURIComponent(selectedId)}/lines/${encodeURIComponent(line.lineId)}/packed-quantity`, {
+          method: "POST",
+          body: JSON.stringify(line.values)
+        });
+        refreshedOrder = result.order || refreshedOrder;
+        confirmedCount += 1;
+      } catch (error) {
+        failures.push(`${line.label}: ${error.message}`);
+      }
     }
+    if (failures.length) {
+      showToast(confirmedCount ? `${confirmedCount} confirmed, ${failures.length} failed` : failures[0]);
+    } else {
+      showToast(confirmedCount ? `${confirmedCount} line confirmed` : "No visible line quantity to confirm");
+    }
+    if (!acceptRefreshedDeliveryOrder(refreshedOrder)) await loadDetail(selectedId);
+  } finally {
+    finishLocalDeliveryMutation(mutationOrderId);
   }
-  if (failures.length) {
-    showToast(confirmedCount ? `${confirmedCount} confirmed, ${failures.length} failed` : failures[0]);
-  } else {
-    showToast(confirmedCount ? `${confirmedCount} line confirmed` : "No visible line quantity to confirm");
-  }
-  await loadDetail(selectedId);
 }
 
 async function unpackLine(lineId) {
   const line = selectedOrder?.lines?.find((item) => String(item.id) === String(lineId));
   if (!line) return;
-  await api(`/api/delivery/orders/${selectedId}/lines/${lineId}/unpack`, {
-    method: "POST",
-    body: JSON.stringify({
-      pallets: packedValue(line, "pallets"),
-      layers: packedValue(line, "layers"),
-      pieces: packedValue(line, "pieces") || packedValue(line, "sales"),
-      sections: packedValue(line, "sections")
-    })
-  });
-  showToast("Line unpacked");
-  await reloadDeliveryScreen({ keepSelection: true });
+  const mutationOrderId = selectedId;
+  markLocalDeliveryMutation(mutationOrderId);
+  try {
+    const result = await api(`/api/delivery/orders/${mutationOrderId}/lines/${lineId}/unpack`, {
+      method: "POST",
+      body: JSON.stringify({
+        pallets: packedValue(line, "pallets"),
+        layers: packedValue(line, "layers"),
+        pieces: packedValue(line, "pieces") || packedValue(line, "sales"),
+        sections: packedValue(line, "sections")
+      })
+    });
+    acceptRefreshedDeliveryOrder(result.order);
+    showToast("Line unpacked");
+    deliveryOrderBuckets.active = null;
+    deliveryOrderBuckets.packed = null;
+    await reloadDeliveryScreen({ keepSelection: true });
+  } finally {
+    finishLocalDeliveryMutation(mutationOrderId);
+  }
 }
 
 async function updatePackedLine(lineId) {
@@ -3603,20 +3892,35 @@ async function updatePackedLine(lineId) {
     pieces: row.querySelector('[data-pack="sales"]')?.value || row.querySelector('[data-pack="pieces"]')?.value || 0,
     sections: row.querySelector('[data-pack="sections"]')?.value || 0
   };
-  await api(`/api/delivery/orders/${selectedId}/lines/${lineId}/packed-quantity`, {
-    method: "POST",
-    body: JSON.stringify(body)
-  });
-  showToast("Packed qty updated");
-  await reloadDeliveryScreen({ keepSelection: true });
+  const mutationOrderId = selectedId;
+  markLocalDeliveryMutation(mutationOrderId);
+  try {
+    const result = await api(`/api/delivery/orders/${mutationOrderId}/lines/${lineId}/packed-quantity`, {
+      method: "POST",
+      body: JSON.stringify(body)
+    });
+    acceptRefreshedDeliveryOrder(result.order);
+    showToast("Packed qty updated");
+  } finally {
+    finishLocalDeliveryMutation(mutationOrderId);
+  }
 }
 
 async function unpackOrder() {
   if (!selectedId) return;
-  await api(`/api/delivery/orders/${selectedId}/unpack`, { method: "POST" });
-  showToast("Order unpacked");
-  viewMode = "active";
-  await reloadDeliveryScreen({ keepSelection: true });
+  const mutationOrderId = selectedId;
+  markLocalDeliveryMutation(mutationOrderId);
+  try {
+    const result = await api(`/api/delivery/orders/${mutationOrderId}/unpack`, { method: "POST" });
+    acceptRefreshedDeliveryOrder(result.order, { renderPanels: false });
+    showToast("Order unpacked");
+    viewMode = "active";
+    deliveryOrderBuckets.active = null;
+    deliveryOrderBuckets.packed = null;
+    await reloadDeliveryScreen({ keepSelection: true });
+  } finally {
+    finishLocalDeliveryMutation(mutationOrderId);
+  }
 }
 
 async function releaseCurrentDraft(orderId) {
@@ -4527,6 +4831,7 @@ app.addEventListener("click", async (event) => {
       locationDropdownOpen = false;
       localStorage.setItem("mbbs.operator.locationId", String(value));
       localStorage.removeItem(STATE_KEY);
+      deliveryOrderBuckets = { active: null, packed: null };
       selectedId = null;
       selectedOrder = null;
       selectedLineId = null;
@@ -4797,6 +5102,7 @@ app.addEventListener("click", async (event) => {
       locationId = value;
       locationDropdownOpen = false;
       localStorage.setItem("mbbs.operator.locationId", String(value));
+      deliveryOrderBuckets = { active: null, packed: null };
       orderPage = 0;
       linePage = 0;
       currentModule = "menu";
@@ -4807,6 +5113,7 @@ app.addEventListener("click", async (event) => {
       localStorage.removeItem(STATE_KEY);
       locationId = 0;
       locationDropdownOpen = false;
+      deliveryOrderBuckets = { active: null, packed: null };
       selectedId = null;
       selectedOrder = null;
       return render();
@@ -4815,6 +5122,7 @@ app.addEventListener("click", async (event) => {
       viewMode = "active";
       orderPage = 0;
       selectedId = null;
+      if (deliveryPrepMode === "standard" && await activateCachedDeliveryView("active")) return;
       return loadOrders();
     }
     if (button.dataset.action === "view-packed") {
@@ -4822,18 +5130,12 @@ app.addEventListener("click", async (event) => {
       viewMode = "packed";
       orderPage = 0;
       selectedId = null;
+      if (deliveryPrepMode === "standard" && await activateCachedDeliveryView("packed")) return;
       return loadOrders();
     }
     if (button.dataset.action === "delivery-batch-filter") {
       if (currentOrderBlocksMove()) return showToast("Pack current order before moving on.");
-      deliveryBatchFilter = button.dataset.filter || "batch_a";
-      deliveryOrderType = deliveryBatchFilter === "transfer" ? "transfer_order" : "sales_order";
-      localStorage.setItem("mbbs.operator.deliveryOrderType", deliveryOrderType);
-      localStorage.setItem("mbbs.operator.deliveryBatchFilter", deliveryBatchFilter);
-      orderPage = 0;
-      selectedId = null;
-      selectedOrder = null;
-      return loadOrders();
+      return activateCachedDeliveryBatch(button.dataset.filter);
     }
     if (button.dataset.action === "delivery-prep-mode") {
       if (currentOrderBlocksMove()) return showToast("Pack current order before moving on.");

@@ -7108,8 +7108,9 @@ app.post("/api/delivery/orders/:id/status", async (req, res, next) => {
   try {
     await updateDeliveryStatus(req.params.id, req.body?.status, operatorId(req));
     const dependencyProgress = await syncDirectDependencyOperatorProgress(req.params.id);
+    const order = await getDeliveryOrder(req.params.id);
     emitAppEvent("delivery.order.updated", { orderId: req.params.id, status: req.body?.status, operatorId: operatorId(req) });
-    res.json({ ok: true, dependencyProgress });
+    res.json({ ok: true, dependencyProgress, order });
   } catch (error) {
     next(error);
   }
@@ -7133,8 +7134,9 @@ app.post("/api/delivery/orders/:id/release-draft", async (req, res, next) => {
 app.post("/api/delivery/orders/:id/lines/:lineId/confirm", async (req, res, next) => {
   try {
     await confirmDeliveryLine(req.params.id, req.params.lineId, req.body || {}, operatorId(req));
+    const order = await getDeliveryOrder(req.params.id);
     emitAppEvent("delivery.line.confirmed", { orderId: req.params.id, lineId: req.params.lineId, operatorId: operatorId(req) });
-    res.json({ ok: true });
+    res.json({ ok: true, order });
   } catch (error) {
     next(error);
   }
@@ -7143,8 +7145,9 @@ app.post("/api/delivery/orders/:id/lines/:lineId/confirm", async (req, res, next
 app.post("/api/delivery/orders/:id/lines/confirm-page", async (req, res, next) => {
   try {
     const result = await confirmDeliveryLines(req.params.id, req.body?.lines || [], operatorId(req));
+    const order = await getDeliveryOrder(req.params.id);
     emitAppEvent("delivery.line.confirmed", { orderId: req.params.id, count: result.confirmed, operatorId: operatorId(req), bulk: true });
-    res.json({ ok: true, ...result });
+    res.json({ ok: true, ...result, order });
   } catch (error) {
     next(error);
   }
@@ -7153,8 +7156,9 @@ app.post("/api/delivery/orders/:id/lines/confirm-page", async (req, res, next) =
 app.post("/api/delivery/orders/:id/lines/:lineId/packed-quantity", async (req, res, next) => {
   try {
     await setDeliveryLinePackedQuantity(req.params.id, req.params.lineId, req.body || {}, operatorId(req));
+    const order = await getDeliveryOrder(req.params.id);
     emitAppEvent("delivery.line.updated", { orderId: req.params.id, lineId: req.params.lineId, change: "packed_quantity", operatorId: operatorId(req) });
-    res.json({ ok: true });
+    res.json({ ok: true, order });
   } catch (error) {
     next(error);
   }
@@ -7165,8 +7169,9 @@ app.post("/api/delivery/orders/:id/lines/:lineId/unpack", async (req, res, next)
     await unpackDeliveryLine(req.params.id, req.params.lineId, req.body || {}, operatorId(req));
     await syncDirectDependencyOperatorProgress(req.params.id);
     const resolvedRequests = await resolveDispatchOperatorRequestsForOrder(req.params.id, operatorId(req)).catch(() => []);
+    const order = await getDeliveryOrder(req.params.id);
     emitAppEvent("delivery.order.unpacked", { orderId: req.params.id, lineId: req.params.lineId, operatorId: operatorId(req), resolvedRequestIds: resolvedRequests.map((request) => request.id) });
-    res.json({ ok: true });
+    res.json({ ok: true, order });
   } catch (error) {
     next(error);
   }
@@ -7177,8 +7182,9 @@ app.post("/api/delivery/orders/:id/unpack", async (req, res, next) => {
     await unpackDeliveryOrder(req.params.id, operatorId(req));
     await syncDirectDependencyOperatorProgress(req.params.id);
     const resolvedRequests = await resolveDispatchOperatorRequestsForOrder(req.params.id, operatorId(req)).catch(() => []);
+    const order = await getDeliveryOrder(req.params.id);
     emitAppEvent("delivery.order.unpacked", { orderId: req.params.id, operatorId: operatorId(req), resolvedRequestIds: resolvedRequests.map((request) => request.id) });
-    res.json({ ok: true });
+    res.json({ ok: true, order });
   } catch (error) {
     next(error);
   }
