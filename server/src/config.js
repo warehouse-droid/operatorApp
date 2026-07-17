@@ -32,7 +32,9 @@ function buildConfig(env) {
     databaseUrl: env.DATABASE_URL,
     googleMapsApiKey: env.GOOGLE_MAPS_API_KEY || "",
     transferDependency: {
-      westYardPenaltyMinutes: Number(env.TRANSFER_DEPENDENCY_150_PENALTY_MINUTES || 60)
+      westYardPenaltyMinutes: Number(env.TRANSFER_DEPENDENCY_150_PENALTY_MINUTES || 60),
+      employeeId: String(env.TRANSFER_DEPENDENCY_EMPLOYEE_ID || "8721"),
+      deliveryMethodId: String(env.TRANSFER_DEPENDENCY_DELIVERY_METHOD_ID || "2")
     },
     samsara: {
       apiToken: env.SAMSARA_API_TOKEN || env.SAMSARA_API_KEY || "",

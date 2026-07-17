@@ -6,6 +6,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { config, isNetSuiteSandboxEnvironment, listEnvFiles, selectEnvFile } from "./config.js";
 import { beginRollbackContext, pool, query, withTransaction } from "./db.js";
 import { buildAuthorizationUrl, exchangeCodeForToken, fetchDeliveryOrdersFromNetSuite, fetchDeliveryOrderFromNetSuite, fetchCustomerPickupOrderFromNetSuite, fetchDeliveryOrderDetailsFromNetSuite, fetchTransferDeliveryOrdersFromNetSuite, fetchTransferDeliveryOrderFromNetSuite, fetchTransferOrderDetailsFromNetSuite, fetchTransferOrderByIdFromNetSuite, fetchPurchaseOrdersFromNetSuite, fetchPurchaseOrderFromNetSuite, fetchPurchaseOrderDetailsFromNetSuite, fetchTransferReceivingOrdersFromNetSuite, fetchTransferReceivingOrderFromNetSuite, fetchInventoryBalanceForItemFromNetSuite, fetchInventoryBalancesFromNetSuite, fetchInventoryBalancesForItemsFromNetSuite, fetchItemFulfillmentFromNetSuite, fetchItemReceiptFromNetSuite, fetchTransactionProgressFromNetSuite, fetchTransactionStatusFromNetSuite, createTransferOrderInNetSuite, resolveNetSuiteTransferLocations, resolveNetSuiteYardLocations, resolvePalletItemFromNetSuite, transformSalesOrderToItemFulfillment, transformTransferOrderToItemFulfillment, transformPurchaseOrderToItemReceipt, transformTransferOrderToItemReceipt } from "./netsuite.js";
+import { buildTransferDependencyRestPayload } from "./transfer-dependency-netsuite.js";
 import { listDeliveryOrders, listVrmaDeliveryPrepOrders, getDeliveryOrder, getFulfillableDeliveryOrder, buildItemFulfillmentPayload, markDeliveryPrepared, updateDeliveryStatus, confirmDeliveryLine, confirmDeliveryLines, setDeliveryLinePackedQuantity, unpackDeliveryLine, unpackDeliveryOrder, recordDeliveryFulfillment, recordDeliveryFulfillmentFailure, recordDeliveryLoad, listDeliveryFulfillments, getDeliveryBootstrap, getDeliveryPrepNotifications, resetDeliveryFulfillmentState, applyConfirmedDispatchPlanToDelivery, deactivateUnplannedDispatchSplitOrders, getNextDispatchSplitSuffix, getCurrentOperatorDeliveryDraft, releaseCurrentDeliveryDraft, listSavedDeliveryOrdersForOperator, listSavedDeliveryOrderKeysForOperator, saveDeliveryOrderForOperator, removeSavedDeliveryOrderForOperator, listDeliveryLoadTrucks, listDeliveryLoadOrders } from "./delivery-repository.js";
 import { getYardMovementDetail, listYardMovementCsvRows, listYardMovements } from "./yard-movement-repository.js";
 import { yardMixedUnits } from "./yard-quantity.js";
@@ -480,32 +481,11 @@ async function transferDependencyRestPayload({ proposal, batch }) {
     destinationLocationId: proposal.toLocationId,
     destinationLocation: proposal.toLocation
   });
-  const palletItemId = Number(proposal.palletItemId);
-  const materialItems = (proposal.lines || [])
-    .filter((line) => String(line.itemId) !== String(palletItemId)
-      && String(line.sku || line.itemName || "").trim().toUpperCase() !== "PALLET")
-    .map((line) => ({
-      item: { id: String(line.itemId) },
-      quantity: Number(line.proposedQuantity)
-    }));
-  const palletQuantity = Number(proposal.palletTransferQuantity || 0);
-  const payload = {
-    location: { id: String(locations.source.netsuiteLocationId) },
-    transferLocation: { id: String(locations.destination.netsuiteLocationId) },
-    orderStatus: { id: "B" },
-    memo: `${proposal.memo || `Inventory dependency for ${batch.salesOrderRef}`} | MBBS dependency batch ${batch.id}`,
-    item: {
-      items: [
-        ...materialItems,
-        ...(palletQuantity > 0 ? [{ item: { id: String(palletItemId) }, quantity: palletQuantity }] : [])
-      ]
-    }
+  return {
+    payload: buildTransferDependencyRestPayload({ proposal, batch, locations }),
+    intercompany: locations.intercompany,
+    locations
   };
-  payload.subsidiary = { id: String(locations.source.subsidiaryId) };
-  if (locations.intercompany) {
-    payload.toSubsidiary = { id: String(locations.destination.subsidiaryId) };
-  }
-  return { payload, intercompany: locations.intercompany, locations };
 }
 
 async function refreshTransferDependencyInventory(itemIds = []) {

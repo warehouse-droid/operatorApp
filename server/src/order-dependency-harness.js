@@ -1,6 +1,7 @@
 import { beginRollbackContext, closeDb, query } from "./db.js";
 import { config } from "./config.js";
 import { matchNetSuiteLocation } from "./netsuite.js";
+import { buildTransferDependencyRestPayload } from "./transfer-dependency-netsuite.js";
 import {
   assertNoActiveOrderDependenciesByRefs,
   calculateTransferProposalPallets,
@@ -119,6 +120,45 @@ try {
       "NetSuite location matching must prefer the canonical yard code over an environment-specific numeric ID.");
     check(matchNetSuiteLocation(sandboxLocations, { locationId: 26, code: "150" }).id === "7",
       "The canonical 150 yard must match the sandbox 150WBS location alias.");
+    const restPayload = buildTransferDependencyRestPayload({
+      proposal: {
+        memo: "Dependency payload fixture",
+        palletItemId: 9999,
+        palletTransferQuantity: 2,
+        lines: [{
+          itemId: 1234,
+          itemName: "Dependency Material",
+          proposedQuantity: 65.31,
+          palletQty: 1,
+          layerQty: 2,
+          sectionQty: 3,
+          pieceQty: 4
+        }]
+      },
+      batch: { id: 42, salesOrderRef: "SO-PAYLOAD-TEST" },
+      locations: {
+        source: { netsuiteLocationId: 1, subsidiaryId: 1 },
+        destination: { netsuiteLocationId: 15, subsidiaryId: 1 },
+        intercompany: false
+      }
+    });
+    const materialPayloadLine = restPayload.item.items.find((line) => line.item.id === "1234");
+    const palletPayloadLine = restPayload.item.items.find((line) => line.item.id === "9999");
+    check(!Object.hasOwn(restPayload, "orderStatus"),
+      "Auto Transfer creation must let NetSuite choose the initial order status.");
+    check(restPayload.employee?.id === config.transferDependency.employeeId,
+      "Auto Transfer must write the configured current-login employee.", { restPayload });
+    check(restPayload.custbody3?.id === config.transferDependency.deliveryMethodId,
+      "Auto Transfer must write the configured Delivery method.", { restPayload });
+    check(materialPayloadLine?.custcol_plt === 1
+      && materialPayloadLine?.custcol_lyr === 2
+      && materialPayloadLine?.custcol_sec === 3
+      && materialPayloadLine?.custcol_pcs === 4,
+    "Auto Transfer must copy PLT/LYR/SEC/PCS quantities to each NetSuite TO material line.",
+    { materialPayloadLine });
+    check(palletPayloadLine?.custcol_pcs === 2,
+      "The ancillary PALLET line must write its count to the NetSuite PCS column.",
+      { palletPayloadLine });
 
     config.googleMapsApiKey = "";
     await query(
@@ -386,11 +426,11 @@ try {
       [salesOrderId]
     );
     await query("UPDATE order_dependency_lines SET allocated_quantity = 10 WHERE id = $1", [createdAllocation.rows[0].id]);
-    await query("UPDATE scm_transfer_dependency_batches SET status = 'created' WHERE id = $1", [batch.id]);
+    await query("UPDATE scm_transfer_dependency_batches SET status = 'attention' WHERE id = $1", [batch.id]);
     const completedAfterTransferCreation = await listTransferDependencyCandidates({ salesOrderId, reviewStatus: "completed" });
     check(completedAfterTransferCreation.length === 1
       && completedAfterTransferCreation[0].completionType === "transfer_created",
-    "A fully allocated created batch must remain visible in the Completed queue.",
+    "A fully allocated batch with a created NetSuite TO must appear in Completed even when its status needs attention.",
     { completedAfterTransferCreation });
     await query("UPDATE order_dependency_lines SET allocated_quantity = $2 WHERE id = $1",
       [createdAllocation.rows[0].id, createdAllocation.rows[0].allocated_quantity]);

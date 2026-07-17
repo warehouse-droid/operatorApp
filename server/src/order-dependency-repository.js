@@ -695,11 +695,16 @@ async function applyTransferDependencyReviews(orders = [], reviewStatus = "open"
       [ids]
     ),
     query(
-      `SELECT DISTINCT ON (sales_order_id)
-              sales_order_id, id AS batch_id, status, updated_at
-         FROM scm_transfer_dependency_batches
-        WHERE sales_order_id = ANY($1::bigint[])
-        ORDER BY sales_order_id, updated_at DESC, id DESC`,
+      `SELECT DISTINCT ON (b.sales_order_id)
+              b.sales_order_id, b.id AS batch_id, b.status, b.updated_at,
+              EXISTS (
+                SELECT 1
+                  FROM scm_transfer_dependency_proposals p
+                 WHERE p.batch_id = b.id AND p.netsuite_transfer_order_id IS NOT NULL
+              ) AS has_created_transfer
+         FROM scm_transfer_dependency_batches b
+        WHERE b.sales_order_id = ANY($1::bigint[])
+        ORDER BY b.sales_order_id, b.updated_at DESC, b.id DESC`,
       [ids]
     )
   ]);
@@ -735,7 +740,9 @@ async function applyTransferDependencyReviews(orders = [], reviewStatus = "open"
       activeReview = false;
     }
     const batch = batches.get(String(order.salesOrderId));
-    const transferCompleted = batch?.status === "created" && number(order.uncoveredQuantity) <= EPSILON;
+    const transferCompleted = ["created", "attention"].includes(batch?.status)
+      && batch?.has_created_transfer === true
+      && number(order.uncoveredQuantity) <= EPSILON;
     const completionType = activeReview ? "reviewed_no_transfer" : transferCompleted ? "transfer_created" : null;
     enriched.push({
       ...order,

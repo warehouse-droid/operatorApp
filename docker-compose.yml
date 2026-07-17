@@ -45,7 +45,7 @@ services:
       PORT: 3000
       NODE_ENV: production
     ports:
-      - "127.0.0.1:${MBBS_APP_HOST_PORT:-3001}:3000"
+      - "127.0.0.1:${MBBS_APP_HOST_PORT:-3000}:3000"
     depends_on:
       db:
         condition: service_healthy
