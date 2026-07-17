@@ -15,9 +15,14 @@ const PICKABLE_ITEM_TYPES = new Set(["InvtPart", "NonInvtPart"]);
 const app = document.getElementById("app");
 const toast = document.getElementById("toast");
 const t = (key, fallback) => window.MBBS_I18N?.t(key, fallback) || fallback;
+const tf = (key, fallback, variables = {}) => window.MBBS_I18N?.format(key, fallback, variables) || fallback;
+const localizeMessage = (message) => window.MBBS_I18N?.message(message) || String(message || "");
 const languageToggle = () => window.MBBS_I18N?.toggleHtml() || "";
 
 const TOKEN_KEY = "mbbs.operator.token";
+const STAFF_TOKEN_KEY = "mbbs.staff.token";
+const STAFF_ROLE_KEY = "mbbs.staff.role";
+const STAFF_ROLES_KEY = "mbbs.staff.roles";
 const STATE_KEY = "mbbs.operator.state";
 const CAMERA_FACING_KEY = "mbbs.camera.facingMode";
 const RESTORABLE_MODULES = new Set([
@@ -41,6 +46,50 @@ function readOperatorState() {
   }
 }
 
+function normalizedStaffRole(value) {
+  return String(value || "").trim().toLowerCase().replaceAll("-", "_").replaceAll(" ", "_");
+}
+
+function staffRoleHome(role) {
+  const clean = normalizedStaffRole(role);
+  if (clean === "admin") return "/admin";
+  if (clean === "dispatcher") return "/dispatch";
+  if (clean === "scm" || clean === "scm_staff") return "/scm";
+  if (clean === "yard_manager") return "/control";
+  if (clean === "operator") return "/operator";
+  return "/";
+}
+
+function operatorRoleAllowed(account) {
+  const roles = new Set([...(Array.isArray(account?.roles) ? account.roles : []), account?.role].map(normalizedStaffRole).filter(Boolean));
+  return ["admin", "operator", "yard_manager"].some((role) => roles.has(role));
+}
+
+function readOperatorToken() {
+  return localStorage.getItem(STAFF_TOKEN_KEY)
+    || localStorage.getItem(TOKEN_KEY)
+    || localStorage.getItem("mbbs.control.token")
+    || localStorage.getItem("mbbs.dispatch.token")
+    || "";
+}
+
+function storeOperatorSession(nextToken, nextOperator) {
+  authToken = nextToken || "";
+  if (authToken) {
+    localStorage.setItem(STAFF_TOKEN_KEY, authToken);
+    localStorage.setItem(TOKEN_KEY, authToken);
+  }
+  if (nextOperator?.role) localStorage.setItem(STAFF_ROLE_KEY, normalizedStaffRole(nextOperator.role));
+  localStorage.setItem(STAFF_ROLES_KEY, JSON.stringify([...new Set([...(Array.isArray(nextOperator?.roles) ? nextOperator.roles : []), nextOperator?.role].filter(Boolean))]));
+}
+
+function clearOperatorSession() {
+  for (const key of [STAFF_TOKEN_KEY, STAFF_ROLE_KEY, STAFF_ROLES_KEY, "mbbs.control.token", "mbbs.dispatch.token", "mbbs.operator.token"]) {
+    localStorage.removeItem(key);
+  }
+  authToken = "";
+}
+
 function restorableModule(value) {
   const module = value === "delivery-fulfill" ? "delivery"
     : value === "customer-pickup-load" ? "customer-pickup"
@@ -50,7 +99,7 @@ function restorableModule(value) {
 }
 
 const initialOperatorState = readOperatorState();
-let authToken = localStorage.getItem(TOKEN_KEY) || "";
+let authToken = readOperatorToken();
 let operator = null;
 
 let locationId = Number(initialOperatorState.locationId || localStorage.getItem("mbbs.operator.locationId") || localStorage.getItem("mbbs.delivery.locationId") || 0);
@@ -98,7 +147,8 @@ let linePage = Number(initialOperatorState.linePage || 0);
 let installPromptEvent = null;
 let appInstalled = window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true;
 let fulfillmentOrder = null;
-let fulfillmentPhotoDataUrl = "";
+let fulfillmentPhotoDataUrls = [];
+let fulfillmentActivePhotoSlot = 0;
 let fulfillmentSubmitting = false;
 let fulfillmentResult = null;
 let fulfillmentCameraStream = null;
@@ -293,7 +343,7 @@ function renderCameraSwitchButton(action) {
 }
 
 function showToast(message) {
-  toast.textContent = message;
+  toast.textContent = localizeMessage(message);
   toast.classList.add("show");
   window.clearTimeout(showToast.timer);
   showToast.timer = window.setTimeout(() => toast.classList.remove("show"), 1800);
@@ -378,8 +428,8 @@ async function handleCustomerPickupScannerKey(event) {
 
 function installLabel() {
   if (appInstalled) return t("operator.appMode", "App mode");
-  if (installPromptEvent) return "Install app";
-  return "Use browser install";
+  if (installPromptEvent) return t("operator.installApp", "Install app");
+  return t("operator.useBrowserInstall", "Use browser install");
 }
 
 function renderInstallButton() {
@@ -435,9 +485,8 @@ async function api(path, options = {}) {
     ...options
   });
   if (response.status === 401) {
-    authToken = "";
+    clearOperatorSession();
     operator = null;
-    localStorage.removeItem(TOKEN_KEY);
     localStorage.removeItem(STATE_KEY);
     renderLogin("Login expired. Please login again.");
     throw new Error("Login required");
@@ -453,6 +502,7 @@ async function api(path, options = {}) {
     const error = new Error(payload?.error || text || "Request failed.");
     error.status = response.status;
     error.payload = payload;
+    if (response.status === 403 && payload?.redirect) window.location.replace(payload.redirect);
     throw error;
   }
   return response.json();
@@ -682,13 +732,13 @@ function currentLocation() {
 
 function statusText(status) {
   return {
-    open: "Open",
-    preparing: "Preparing",
-    packed: "Packed",
-    fulfilled: "Fulfilled",
-    loaded: "Loaded",
-    partial_loaded: "Partial Loaded"
-  }[status] || "Open";
+    open: t("operator.open", "Open"),
+    preparing: t("operator.preparing", "Preparing"),
+    packed: t("operator.packed", "Packed"),
+    fulfilled: t("operator.statusFulfilled", "Fulfilled"),
+    loaded: t("common.loaded", "Loaded"),
+    partial_loaded: t("operator.statusPartialLoaded", "Partial Loaded")
+  }[status] || t("operator.open", "Open");
 }
 
 function orderWarningCount(order) {
@@ -699,14 +749,24 @@ function orderUnderpackCount(order) {
   return qty(order?.underpack_count);
 }
 
+function isVrmaReferenceOrder(order = selectedOrder) {
+  return order?.vrma_reference_only === true;
+}
+
+function isVrmaOrder(order = selectedOrder) {
+  return order?.order_type === "vrma_order";
+}
+
 function orderStatusText(order) {
-  if (orderWarningCount(order)) return "Warning";
-  if (orderUnderpackCount(order)) return "Underpack";
-  if (order?.local_yard_order_status === "Loaded") return "Loaded";
+  if (isVrmaReferenceOrder(order)) return order?.dispatch_planned ? t("operator.planned", "Planned") : t("operator.batchB", "Batch B");
+  if (orderWarningCount(order)) return t("operator.warning", "Warning");
+  if (orderUnderpackCount(order)) return t("operator.statusUnderpack", "Underpack");
+  if (order?.local_yard_order_status === "Loaded") return t("common.loaded", "Loaded");
   return statusText(order?.operator_status);
 }
 
 function orderStatusClass(order) {
+  if (isVrmaReferenceOrder(order)) return order?.dispatch_planned ? "planned" : "open";
   if (orderWarningCount(order)) return "warning";
   if (orderUnderpackCount(order)) return "underpack";
   if (order?.local_yard_order_status === "Loaded") return "loaded";
@@ -846,6 +906,7 @@ function orderMatchesDeliveryBatch(order, filter = deliveryBatchFilter) {
   if (viewMode !== "active") return true;
   if (filter === "transfer") return order?.order_type === "transfer_order";
   if (order?.order_type === "co_order") return filter === "planned";
+  if (isVrmaOrder(order)) return filter === (order?.dispatch_planned ? "planned" : "batch_b");
   if (order?.order_type !== "sales_order") return false;
   if (filter === "planned") return Boolean(order?.dispatch_planned);
   if (filter === "batch_b") return !order?.dispatch_planned && !isBatchAOrder(order);
@@ -1052,15 +1113,24 @@ function deliveryWindowText(order) {
   const start = compactTime(order?.dispatch_window_start);
   const end = compactTime(order?.dispatch_window_end);
   if (start && end) return `${start}-${end}`;
-  if (start) return `After ${start}`;
-  if (end) return `Before ${end}`;
-  return "All day";
+  if (start) return tf("operator.afterTime", "After {time}", { time: start });
+  if (end) return tf("operator.beforeTime", "Before {time}", { time: end });
+  return t("operator.allDay", "All day");
 }
 
 function deliveryScheduleText(order) {
+  if (isVrmaOrder(order)) {
+    return tf("operator.pickupRoute", "Pickup {from} → {to}", {
+      from: order?.outbound_location || "--",
+      to: order?.destination_location || t("operator.vendorYard", "Vendor yard")
+    });
+  }
   const expected = order?.expected_delivery_date;
-  if (!expected) return "No delivery date";
-  return `Delivery ${formatDate(expected)} | ${deliveryWindowText(order)}`;
+  if (!expected) return t("operator.noDeliveryDate", "No delivery date");
+  return tf("operator.deliverySchedule", "Delivery {date} | {window}", {
+    date: formatDate(expected),
+    window: deliveryWindowText(order)
+  });
 }
 
 function plannedOrderText(order, { spotLabel = "Spot" } = {}) {
@@ -1121,8 +1191,17 @@ function lineHasConversion(line) {
   return qty(line.to_plt) > 0 || qty(line.to_lyr) > 0 || qty(line.to_sec) > 0 || qty(line.to_pcs) > 0;
 }
 
+function isIndependentManualLine(line) {
+  return !lineHasConversion(line) && hasCustomPackQty(line);
+}
+
 function shouldUseSalesQuantity(line) {
-  return !lineHasConversion(line) && qty(line.quantity) > 0;
+  return !lineHasConversion(line) && !hasCustomPackQty(line) && qty(line.quantity) > 0;
+}
+
+function salesQuantityLabel(line, fallback = "Qty") {
+  const itemName = String(line?.sku || line?.item_name || "").trim().toUpperCase();
+  return itemName === "PALLET" ? "PALLET" : line?.unit || fallback;
 }
 
 function lineUnitsToSalesQty(line, values) {
@@ -1228,10 +1307,10 @@ function hasCustomerPickupDraft(order = selectedOrder) {
 
 function exceptionText(line) {
   if (line.sync_exception === "line_deleted") {
-    return "Line removed in NetSuite. Unpack this line and repack the order.";
+    return t("operator.lineDeleted", "Line removed in NetSuite. Unpack this line and repack the order.");
   }
   if (line.sync_exception === "qty_reduced") {
-    return "Required qty changed in NetSuite. Unpack this line and repack with the new qty.";
+    return t("operator.qtyReduced", "Required qty changed in NetSuite. Unpack this line and repack with the new qty.");
   }
   return "";
 }
@@ -1309,7 +1388,8 @@ function hasPackedQty(line) {
   return qty(line.packed_pallet_qty) > 0
     || qty(line.packed_section_qty) > 0
     || qty(line.packed_layer_qty) > 0
-    || qty(line.packed_piece_qty) > 0;
+    || qty(line.packed_piece_qty) > 0
+    || qty(line.packed_sales_qty) > 0;
 }
 
 function hasDraftPackedQty(order) {
@@ -1334,11 +1414,11 @@ function isUnderPacked(line) {
 }
 
 function lineVariableUnit(line) {
-  if (shouldUseSalesQuantity(line)) return { key: "sales", label: line.unit || "Qty", required: line.quantity, packedKey: "sales" };
+  if (shouldUseSalesQuantity(line)) return { key: "sales", label: salesQuantityLabel(line), required: line.quantity, packedKey: "sales" };
   if (unitRequiredLimit(line, "sections") > 0 || packedValue(line, "sections") > 0) return { key: "sections", label: "SEC", required: unitRequiredLimit(line, "sections"), packedKey: "sections" };
   if (unitRequiredLimit(line, "layers") > 0 || packedValue(line, "layers") > 0) return { key: "layers", label: "LYR", required: unitRequiredLimit(line, "layers"), packedKey: "layers" };
   if (unitRequiredLimit(line, "pieces") > 0 || packedValue(line, "pieces") > 0) return { key: "pieces", label: "PCS", required: unitRequiredLimit(line, "pieces"), packedKey: "pieces" };
-  if (!lineHasConversion(line)) return { key: "sales", label: line.unit || "Qty", required: line.quantity, packedKey: "sales" };
+  if (!lineHasConversion(line)) return { key: "sales", label: salesQuantityLabel(line), required: line.quantity, packedKey: "sales" };
   return null;
 }
 
@@ -1348,7 +1428,39 @@ function requiredValue(line, unit) {
   return 0;
 }
 
+function deliveryLineUnits(line) {
+  if (line?.vrma_reference_only === true) {
+    const physical = [
+      { key: "pallets", label: "PLT" },
+      { key: "layers", label: "LYR" },
+      { key: "sections", label: "SEC" },
+      { key: "pieces", label: "PCS" }
+    ].filter((unit) => requiredValue(line, unit.key) > 0);
+    return physical.length ? physical : [{ key: "sales", label: line.unit || "Qty" }];
+  }
+  if (isIndependentManualLine(line)) {
+    const physical = [
+      { key: "pallets", label: "PLT" },
+      { key: "layers", label: "LYR" },
+      { key: "sections", label: "SEC" },
+      { key: "pieces", label: "PCS" }
+    ].filter((unit) => requiredValue(line, unit.key) > 0 || packedValue(line, unit.key) > 0);
+    return [...physical, { key: "sales", label: line.unit || "Sales Qty" }];
+  }
+  const units = [];
+  if (requiredValue(line, "pallets") > 0 || packedValue(line, "pallets") > 0) {
+    units.push({ key: "pallets", label: "PLT" });
+  }
+  const variable = lineVariableUnit(line);
+  if (variable && variable.packedKey !== "pallets") {
+    units.push({ key: variable.packedKey, label: variable.label });
+  }
+  if (!units.length) units.push({ key: "sales", label: salesQuantityLabel(line) });
+  return units;
+}
+
 function packedValue(line, unit) {
+  if (unit === "sales") return qty(line.packed_sales_qty);
   const saved = unit === "pallets"
     ? line.packed_pallet_qty
     : unit === "sections"
@@ -1403,6 +1515,7 @@ function receivingRemainingValue(line, unit) {
   const remainingSales = receivingRemainingSalesQty(line);
   if (unit === "sales") return remainingSales;
   const required = requiredValue(line, unit);
+  if (isIndependentManualLine(line)) return required;
   const conversion = unit === "pallets" ? qty(line.to_plt)
     : unit === "layers" ? qty(line.to_lyr)
     : unit === "sections" ? qty(line.to_sec)
@@ -1417,6 +1530,18 @@ function hasReceivingRemainingQty(line) {
 }
 
 function receivingLineUnits(line) {
+  if (isIndependentManualLine(line)) {
+    const physical = [
+      { key: "pallets", label: "PLT" },
+      { key: "layers", label: "LYR" },
+      { key: "sections", label: "SEC" },
+      { key: "pieces", label: "PCS" }
+    ].filter((unit) => requiredValue(line, unit.key) > 0 || receivingConfirmedValue(line, unit.key) > 0);
+    return [
+      ...physical,
+      { key: "sales", label: line.unit || "Sales Qty" }
+    ];
+  }
   const units = [];
   if (receivingRemainingValue(line, "pallets") > 0 || qty(line.received_pallet_qty) > 0) {
     units.push({ key: "pallets", label: "PLT" });
@@ -1462,7 +1587,7 @@ function activeLinePageSize() {
 
 function renderLineDensityToggle() {
   return `
-    <div class="line-density-toggle" role="group" aria-label="Line list display mode">
+    <div class="line-density-toggle" role="group" aria-label="${t("operator.lineListDisplayMode", "Line list display mode")}">
       <button class="${compactLineMode ? "" : "active"}" data-action="set-line-density" data-density="normal" type="button">${t("operator.normal", "Normal")}</button>
       <button class="${compactLineMode ? "active" : ""}" data-action="set-line-density" data-density="compact" type="button">${t("operator.compact", "Compact")}</button>
     </div>
@@ -1510,7 +1635,9 @@ function renderLogin(message = "") {
         ${message ? `<div class="login-message">${message}</div>` : ""}
         <div class="install-hint">
           <strong>${installLabel()}</strong>
-          <span>${installPromptEvent ? "Tap Install app to open as a standalone tablet app." : "If this still opens like a browser, use Chrome or Edge on Android/Windows and install from a trusted HTTPS URL."}</span>
+          <span>${installPromptEvent
+            ? t("operator.installAppHelp", "Tap Install app to open as a standalone tablet app.")
+            : t("operator.browserInstallHelp", "If this still opens like a browser, use Chrome or Edge on Android/Windows and install from a trusted HTTPS URL.")}</span>
         </div>
         <label>
           <span>${t("common.username", "Username")}</span>
@@ -1832,7 +1959,7 @@ function renderCustomerPickupScan() {
           <span>${t("operator.scanOrType", "Scan or type and press Enter")}</span>
           <input id="customerPickupScan" value="${escapeHtml(customerPickupScan)}" placeholder="SOB104325" autocomplete="off" autofocus />
         </label>
-        ${customerPickupMessage ? `<div class="sync-alert danger"><strong>${t("common.notice", "Notice")}</strong><span>${escapeHtml(customerPickupMessage)}</span></div>` : ""}
+        ${customerPickupMessage ? `<div class="sync-alert danger"><strong>${t("common.notice", "Notice")}</strong><span>${escapeHtml(localizeMessage(customerPickupMessage))}</span></div>` : ""}
         <div class="selected-actions">
           <button class="primary-button" data-action="lookup-customer-pickup" type="button">${t("operator.findOrder", "Find Order")}</button>
         </div>
@@ -1927,8 +2054,8 @@ function renderReceivingMain() {
       <section class="receiving-option-grid">
         ${list.map((item) => `
           <button class="module-tile compact" data-action="${receivingOrderType === "purchase_order" ? "select-receiving-vendor" : "select-receiving-source"}" data-value="${receivingOrderType === "purchase_order" ? item.vendor : item.source_location_id}" type="button">
-            <strong>${receivingOrderType === "purchase_order" ? item.vendor : `From ${item.source_location}`}</strong>
-            <span>${item.order_count} open order</span>
+            <strong>${receivingOrderType === "purchase_order" ? item.vendor : tf("operator.fromLocation", "From {location}", { location: item.source_location })}</strong>
+            <span>${tf("operator.openOrdersCount", "{count} open order(s)", { count: item.order_count })}</span>
           </button>
         `).join("") || `<div class="empty-state"><strong>${t("operator.noOpenOrders", "No open orders")}</strong><span>${t("operator.noOpenOrdersHelp", "Ask admin to sync if the order is missing.")}</span></div>`}
       </section>
@@ -1946,26 +2073,28 @@ function renderReceivingOrders() {
       <aside class="order-panel">
         <div class="panel-title">
           <div>
-            <span>${receivingSearch.trim() || receivingItemSearch.trim() ? "Orders" : receivingOrderType === "purchase_order" ? "Vendor" : "Source"}</span>
+            <span>${receivingSearch.trim() || receivingItemSearch.trim()
+              ? t("operator.ordersLabel", "Orders")
+              : receivingOrderType === "purchase_order" ? t("operator.vendor", "Vendor") : t("operator.source", "Source")}</span>
             <strong>${receivingSearch.trim() || receivingItemSearch.trim()
-              ? "Search results"
+              ? t("operator.searchResults", "Search results")
               : receivingOrderType === "purchase_order"
                 ? receivingSelectedVendor
-                : `From ${sourceLocationText(receivingSelectedSourceId)}`}</strong>
+                : tf("operator.fromLocation", "From {location}", { location: sourceLocationText(receivingSelectedSourceId) })}</strong>
           </div>
           <strong>${receivingOrders.length}</strong>
         </div>
         <div class="number-pad compact-pad">
           ${["1","2","3","4","5","6","7","8","9","Clear","0","Back"].map((key) => `
-            <button data-action="receiving-key" data-key="${key}" type="button">${key}</button>
+            <button data-action="receiving-key" data-key="${key}" type="button">${key === "Clear" ? t("common.clear", "Clear") : key === "Back" ? t("common.backspace", "Back") : key}</button>
           `).join("")}
         </div>
         <div class="order-list">
           ${visible.map((order) => `
             <button class="order-card ${String(order.netsuite_id) === String(receivingSelectedId) ? "active" : ""}" data-receiving-order="${order.netsuite_id}" type="button">
               <strong>${order.tranid}</strong>
-              <span class="muted">${order.order_type === "co_order" ? "CO" : order.order_type === "transfer_order" ? "TO" : "PO"} | ${formatDate(order.trandate)} | ${order.line_count || 0} line</span>
-              <span class="status-pill open">${order.status_text || "Pending Receipt"}</span>
+              <span class="muted">${order.order_type === "co_order" ? "CO" : order.order_type === "transfer_order" ? "TO" : "PO"} | ${formatDate(order.trandate)} | ${tf("operator.lineCount", "{count} line(s)", { count: order.line_count || 0 })}</span>
+              <span class="status-pill open">${escapeHtml(localizeMessage(order.status_text || t("operator.pendingReceipt", "Pending Receipt")))}</span>
             </button>
           `).join("") || `<div class="empty-state small"><strong>${t("operator.noOrderFound", "No order found")}</strong><span>${t("operator.noOrderFoundHelp", "Try another number or product.")}</span></div>`}
         </div>
@@ -2002,8 +2131,8 @@ function renderReceivingDetail(order) {
     <div class="detail-header">
       <div>
         <h2>${order.tranid}</h2>
-        <p class="muted">${orderType === "purchase_order" ? order.vendor : `From ${order.source_location} to ${order.destination_location}`}</p>
-        <p class="muted">${formatDate(order.trandate)} | ${order.status_text}</p>
+        <p class="muted">${orderType === "purchase_order" ? order.vendor : tf("operator.fromTo", "From {from} to {to}", { from: order.source_location, to: order.destination_location })}</p>
+        <p class="muted">${formatDate(order.trandate)} | ${escapeHtml(localizeMessage(order.status_text || ""))}</p>
       </div>
       <div class="status-actions">
         ${renderLineDensityToggle()}
@@ -2055,7 +2184,8 @@ function hasReceivedQty(line) {
   return qty(line.received_pallet_qty) > 0
     || qty(line.received_section_qty) > 0
     || qty(line.received_layer_qty) > 0
-    || qty(line.received_piece_qty) > 0;
+    || qty(line.received_piece_qty) > 0
+    || qty(line.received_sales_qty) > 0;
 }
 
 function receivingPanelValue(line, unit) {
@@ -2063,7 +2193,7 @@ function receivingPanelValue(line, unit) {
   if (unit === "sections") return qty(line.received_section_qty) || receivingRemainingValue(line, "sections");
   if (unit === "layers") return qty(line.received_layer_qty) || receivingRemainingValue(line, "layers");
   if (unit === "pieces") return qty(line.received_piece_qty) || receivingRemainingValue(line, "pieces");
-  if (unit === "sales") return qty(line.received_piece_qty) || receivingRemainingValue(line, "sales");
+  if (unit === "sales") return qty(line.received_sales_qty) || receivingRemainingValue(line, "sales");
   return 0;
 }
 
@@ -2072,7 +2202,7 @@ function receivingConfirmedValue(line, unit) {
   if (unit === "sections") return qty(line.received_section_qty);
   if (unit === "layers") return qty(line.received_layer_qty);
   if (unit === "pieces") return qty(line.received_piece_qty);
-  if (unit === "sales") return qty(line.received_piece_qty);
+  if (unit === "sales") return qty(line.received_sales_qty);
   return 0;
 }
 
@@ -2097,7 +2227,7 @@ function renderReceivingSelectedLinePanel(line) {
           </div>
         `).join("")}
       </div>
-      ${units.map((unit) => renderStepper(unit.key, `Receive ${unit.label}`, receivingPanelValue(line, unit.key))).join("")}
+      ${units.map((unit) => renderStepper(unit.key, tf("operator.receiveUnit", "Receive {unit}", { unit: unit.label }), receivingPanelValue(line, unit.key))).join("")}
       <div class="selected-actions">
         ${hasReceivedQty(line) ? `<button class="secondary-button danger-button" data-action="unconfirm-receiving-line" data-line="${line.id}" type="button">${t("operator.unconfirmLine", "Unconfirm line")}</button>` : ""}
         <button class="primary-button" data-action="confirm-receiving-line" data-line="${line.id}" type="button">${t("operator.confirmLine", "Confirm line")}</button>
@@ -2236,7 +2366,7 @@ function renderCycleCountPanel(item) {
     </div>
     <div class="cycle-number-pad">
       ${["1", "2", "3", "4", "5", "6", "7", "8", "9", "Clear", "0", "Back"].map((key) => `
-        <button data-action="cycle-key" data-key="${key}" type="button">${key}</button>
+        <button data-action="cycle-key" data-key="${key}" type="button">${key === "Clear" ? t("common.clear", "Clear") : key === "Back" ? t("common.backspace", "Back") : key}</button>
       `).join("")}
     </div>
     <div class="cycle-variance" data-cycle-variance>
@@ -2319,6 +2449,7 @@ function isOrderSaved(order) {
 }
 
 function renderOrderSaveStar(order) {
+  if (isVrmaOrder(order)) return "";
   if (!order || viewMode === "packed") return "";
   const saved = isOrderSaved(order);
   return `
@@ -2410,7 +2541,7 @@ function renderOperatorRequestNotice() {
   return `
     <button class="operator-request-notice" data-action="open-operator-request" data-order="${target.netsuite_id || ""}" type="button">
       <strong>${t("operator.dispatchRequest", "Dispatch Request")}</strong>
-      <span>${requests.length} unpack request${requests.length > 1 ? "s" : ""} for split. Tap to handle.</span>
+      <span>${tf("operator.unpackRequestSummary", "{requests} unpack request(s) for split. Tap to handle.", { requests: requests.length })}</span>
     </button>
   `;
 }
@@ -2422,7 +2553,7 @@ function renderPackedWarningNotice() {
   return `
     <button class="order-warning-notice" data-action="open-warning-order" data-order="${warnings[0].netsuite_id}" type="button">
       <strong>${t("operator.warning", "Warning")}</strong>
-      <span>${warnings.length} order / ${lines} line needs adjustment</span>
+      <span>${tf("operator.warningSummary", "{orders} order(s) / {lines} line(s) need adjustment", { orders: warnings.length, lines })}</span>
     </button>
   `;
 }
@@ -2450,13 +2581,13 @@ function renderLoadValidation(validation) {
   if (!issues.length) return "";
   return `
     <div class="sync-alert danger load-validation-alert">
-      <strong>${issues.length} line cannot load</strong>
+      <strong>${tf("operator.linesCannotLoad", "{count} line(s) cannot load", { count: issues.length })}</strong>
       <span>${t("operator.netsuiteChangedFix", "NetSuite changed after packing. Correct these packed quantities first.")}</span>
       <div class="validation-lines">
         ${issues.map((issue) => `
           <div>
             <b>${escapeHtml(issue.itemName || "Line")}</b>
-            <span>${escapeHtml(issue.message || "Update this packed line.")}</span>
+            <span>${escapeHtml(localizeMessage(issue.message || t("operator.updatePackedLine", "Update this packed line.")))}</span>
             <em>${t("operator.packedRequiredNow", "Packed: {packed} | Required now: {required}").replace("{packed}", escapeHtml(issue.packedText || "0")).replace("{required}", escapeHtml(issue.requiredText || "0"))}</em>
           </div>
         `).join("")}
@@ -2477,13 +2608,15 @@ function renderDetailPanel(order) {
   if (selectedLine && String(selectedLineId) !== String(selectedLine.id)) selectedLineId = selectedLine.id;
   const customerPickupNotice = isCustomerPickupMode() && !lines.length ? customerPickupUnavailableMessage(order) : "";
   const directPickupInfo = !isCustomerPickupMode() && order.direct_pickup_only === true && !lines.length;
+  const vrmaReferenceOnly = isVrmaReferenceOrder(order);
+  const vrmaLocalOnly = isVrmaOrder(order) && !vrmaReferenceOnly;
 
   return `
     <div class="detail-header">
       <div>
         <div class="order-title-row">
           <h2>${order.tranid}${order.testFixture ? ` <span class="status-pill test-fixture">TEST</span>` : ""}</h2>
-          ${viewMode === "packed" && !isCustomerPickupMode() ? `<button class="secondary-button danger-button compact-action" data-action="unpack-order" type="button">${t("operator.unpackWholeOrder", "Unpack whole order")}</button>` : ""}
+          ${viewMode === "packed" && !isCustomerPickupMode() && !vrmaReferenceOnly ? `<button class="secondary-button danger-button compact-action" data-action="unpack-order" type="button">${t("operator.unpackWholeOrder", "Unpack whole order")}</button>` : ""}
         </div>
         <p class="muted">${order.customer || ""}</p>
         <p class="muted">${shouldShowDeliverySchedule() ? deliveryScheduleText(order) : formatDate(order.trandate)} | ${order.delivery_method || ""}</p>
@@ -2493,41 +2626,60 @@ function renderDetailPanel(order) {
         ${renderLineDensityToggle()}
         ${renderSavedOrderAction(order)}
         <span class="status-pill ${orderStatusClass(order)}">${orderStatusText(order)}</span>
-        ${directPickupInfo ? "" : isCustomerPickupMode()
-          ? `<button class="primary-button" data-action="start-fulfill" type="button" ${hasCustomerPickupDraft(order) ? "" : "disabled"}>${t("common.load", "Load")}</button>`
-          : viewMode === "packed"
-          ? `<button class="primary-button" data-action="start-fulfill" type="button">${t("common.load", "Load")}</button>`
-          : `<button class="secondary-button" data-action="set-preparing" type="button">${t("operator.preparing", "Preparing")}</button>
-             <button class="primary-button" data-action="set-packed" type="button" ${canMarkPacked(order) ? "" : "disabled"}>${t("operator.packed", "Packed")}</button>`}
+        ${vrmaReferenceOnly
+          ? `<span class="muted">${t("operator.referenceOnlyNoInventory", "Reference only · No inventory deduction")}</span>`
+          : directPickupInfo ? "" : isCustomerPickupMode()
+            ? `<button class="primary-button" data-action="start-fulfill" type="button" ${hasCustomerPickupDraft(order) ? "" : "disabled"}>${t("common.load", "Load")}</button>`
+            : viewMode === "packed"
+              ? `<button class="primary-button" data-action="start-fulfill" type="button">${t("common.load", "Load")}</button>`
+              : `<button class="secondary-button" data-action="set-preparing" type="button">${t("operator.preparing", "Preparing")}</button>
+                 <button class="primary-button" data-action="set-packed" type="button" ${canMarkPacked(order) ? "" : "disabled"}>${t("operator.packed", "Packed")}</button>`}
       </div>
     </div>
     <div class="progress-strip">
-      <div><span>${isCustomerPickupMode() ? "Pickup lines" : viewMode === "packed" ? t("operator.packedLines", "Packed lines") : t("operator.openLines", "Open lines")}</span><strong>${confirmed} / ${lines.length}</strong></div>
+      <div><span>${vrmaReferenceOnly ? t("operator.referenceLines", "Reference lines") : isCustomerPickupMode() ? t("operator.pickupLines", "Pickup lines") : viewMode === "packed" ? t("operator.packedLines", "Packed lines") : t("operator.openLines", "Open lines")}</span><strong>${vrmaReferenceOnly ? lines.length : confirmed} / ${lines.length}</strong></div>
       <div><span>${t("common.location", "Location")}</span><strong>${currentLocation()?.text}</strong></div>
-      <div><span>${t("operator.status", "Status")}</span><strong>${directPickupInfo ? "Direct pickup" : orderStatusText(order)}</strong></div>
+      <div><span>${t("operator.status", "Status")}</span><strong>${directPickupInfo ? t("operator.directPickup", "Direct pickup") : orderStatusText(order)}</strong></div>
     </div>
+    ${vrmaReferenceOnly ? `
+      <div class="sync-alert">
+        <strong>${t("operator.localVrmaReference", "Local VRMA pickup reference")}</strong>
+        <span>${tf("operator.localVrmaReferenceHelp", "Prepare for pickup from {from} to {to}. Quantities are for dispatch and driver reference only; this order does not deduct inventory.", {
+          from: escapeHtml(order.outbound_location || t("operator.ourYard", "our yard")),
+          to: escapeHtml(order.destination_location || t("operator.vendorYardGeneric", "the vendor yard"))
+        })}</span>
+      </div>
+    ` : vrmaLocalOnly ? `
+      <div class="sync-alert">
+        <strong>${t("operator.localVrmaPacking", "Local VRMA packing and loading")}</strong>
+        <span>${tf("operator.localVrmaPackingHelp", "Pack at {from} and load for {to}. These activities are recorded locally only: no NetSuite fulfillment and no inventory deduction.", {
+          from: escapeHtml(order.outbound_location || t("operator.ourYard", "our yard")),
+          to: escapeHtml(order.destination_location || t("operator.vendorYardGeneric", "the vendor yard"))
+        })}</span>
+      </div>
+    ` : ""}
     ${exceptions.length ? `
       <div class="sync-alert">
-        <strong>${exceptions.length} line needs repack</strong>
+        <strong>${tf("operator.linesNeedRepack", "{count} line(s) need repack", { count: exceptions.length })}</strong>
         <span>${t("operator.netsuiteChangedRepack", "NetSuite changed after packing. Unpack the affected line, then pack again with the latest required qty.")}</span>
       </div>
     ` : ""}
     ${customerPickupNotice ? `
       <div class="sync-alert danger">
         <strong>${t("operator.pickupUnavailable", "Pickup unavailable")}</strong>
-        <span>${escapeHtml(customerPickupNotice)}</span>
+        <span>${escapeHtml(localizeMessage(customerPickupNotice))}</span>
       </div>
     ` : ""}
     ${directPickupInfo ? `
       <div class="sync-alert">
-        <strong>Direct pickup order</strong>
-        <span>All remaining quantities will be collected from linked source yards. There are no lines to prepare at ${escapeHtml(currentLocation()?.text || "this yard")}.</span>
+        <strong>${t("operator.directPickupOrder", "Direct pickup order")}</strong>
+        <span>${tf("operator.directPickupHelp", "All remaining quantities will be collected from linked source yards. There are no lines to prepare at {yard}.", { yard: escapeHtml(currentLocation()?.text || t("operator.thisYard", "this yard")) })}</span>
       </div>
     ` : ""}
     <div class="work-area">
       <div class="line-column">
         <div class="line-list ${compactLineMode ? "compact-line-list" : ""}">
-          ${visible.map((line) => renderLine(line)).join("") || `<div class="empty-state small"><strong>${isCustomerPickupMode() ? "No pickup quantity" : directPickupInfo ? "No local-yard quantity" : "No lines"}</strong><span>${escapeHtml(customerPickupNotice || (directPickupInfo ? "Driver will collect the linked quantities from their source yards." : "Ask admin to sync if details are missing."))}</span></div>`}
+          ${visible.map((line) => renderLine(line)).join("") || `<div class="empty-state small"><strong>${isCustomerPickupMode() ? t("operator.noPickupQuantity", "No pickup quantity") : directPickupInfo ? t("operator.noLocalYardQuantity", "No local-yard quantity") : t("operator.noLines", "No lines")}</strong><span>${escapeHtml(localizeMessage(customerPickupNotice || (directPickupInfo ? t("operator.driverCollectHelp", "Driver will collect the linked quantities from their source yards.") : t("operator.noOpenOrdersHelp", "Ask admin to sync if details are missing."))))}</span></div>`}
         </div>
         <div class="pagination-row">
           <button class="secondary-button" data-action="line-prev" ${linePage === 0 ? "disabled" : ""} type="button">${t("common.previous", "Previous")}</button>
@@ -2535,7 +2687,7 @@ function renderDetailPanel(order) {
           <button class="secondary-button" data-action="line-next" ${linePage >= count - 1 ? "disabled" : ""} type="button">${t("common.next", "Next")}</button>
         </div>
       </div>
-      ${selectedLine ? renderSelectedLinePanel(selectedLine) : customerPickupNotice ? `<aside class="selected-panel"><div class="empty-state"><strong>${t("operator.pickupUnavailable", "Pickup unavailable")}</strong><span>${escapeHtml(customerPickupNotice)}</span></div></aside>` : directPickupInfo ? `<aside class="selected-panel"><div class="empty-state"><strong>Dispatch information only</strong><span>No packing action is required at this yard.</span></div></aside>` : renderEmptyDetail()}
+      ${selectedLine ? (vrmaReferenceOnly ? renderVrmaReferenceLinePanel(selectedLine) : renderSelectedLinePanel(selectedLine)) : customerPickupNotice ? `<aside class="selected-panel"><div class="empty-state"><strong>${t("operator.pickupUnavailable", "Pickup unavailable")}</strong><span>${escapeHtml(localizeMessage(customerPickupNotice))}</span></div></aside>` : directPickupInfo ? `<aside class="selected-panel"><div class="empty-state"><strong>${t("operator.dispatchInfoOnly", "Dispatch information only")}</strong><span>${t("operator.noPackingAtYard", "No packing action is required at this yard.")}</span></div></aside>` : renderEmptyDetail()}
     </div>
   `;
 }
@@ -2547,22 +2699,24 @@ function renderFulfillmentScreen() {
     return render();
   }
   const packedLines = visibleLines(order).filter((line) => hasPackedQty(line));
+  const fulfillmentPhotoSlots = Math.max(2, fulfillmentPhotoDataUrls.length);
+  const fulfillmentPhotoCount = fulfillmentPhotoDataUrls.filter(Boolean).length;
   if (fulfillmentResult) {
     const isPickupLoad = currentModule === "customer-pickup-load";
-    return shell("Load Complete", `Order ${order.tranid}`, `
+    return shell(t("operator.loadComplete", "Load Complete"), `${t("common.order", "Order")} ${order.tranid}`, `
       <section class="fulfillment-screen">
         <div class="fulfillment-card success">
-          <span>${isPickupLoad ? "Pickup Status" : "Local Yard Status"}</span>
-          <strong>${isPickupLoad ? (fulfillmentResult.pickupStatus === "partial_loaded" ? "Partial Loaded" : "Loaded") : (fulfillmentResult.localYardOrderStatus || "Loaded")}</strong>
-          <p>${isPickupLoad ? `Photo proof saved. Remaining line count: ${fulfillmentResult.remainingLines || 0}.` : "Photo proof saved. This order is hidden from the operator list."}</p>
+          <span>${isPickupLoad ? t("operator.pickupStatus", "Pickup Status") : t("operator.localYardStatus", "Local Yard Status")}</span>
+          <strong>${isPickupLoad ? (fulfillmentResult.pickupStatus === "partial_loaded" ? t("operator.partialLoaded", "Partial Loaded") : t("common.loaded", "Loaded")) : (fulfillmentResult.localYardOrderStatus || t("common.loaded", "Loaded"))}</strong>
+          <p>${isPickupLoad ? tf("operator.photoSavedRemaining", "Photo proof saved. Remaining line count: {count}.", { count: fulfillmentResult.remainingLines || 0 }) : t("operator.photoSavedHidden", "Photo proof saved. This order is hidden from the operator list.")}</p>
         </div>
         <div class="selected-actions">
-          <button class="primary-button" data-action="finish-fulfill" type="button">${isPickupLoad ? "Back to Scan" : "Back to Delivery"}</button>
+          <button class="primary-button" data-action="finish-fulfill" type="button">${isPickupLoad ? t("operator.backToScan", "Back to Scan") : t("operator.backToDelivery", "Back to Delivery")}</button>
         </div>
       </section>
     `, `<button class="secondary-button" data-action="finish-fulfill" type="button">${t("operator.deliveryPrep", "Delivery")}</button>`);
   }
-  return shell("Load Order", `${order.tranid} | Location ${currentLocation()?.text || ""}`, `
+  return shell(t("operator.loadOrder", "Load Order"), `${order.tranid} | ${t("common.location", "Location")} ${currentLocation()?.text || ""}`, `
     <section class="fulfillment-screen">
       <div class="fulfillment-card">
         <span>${t("operator.photoProof", "Photo proof")}</span>
@@ -2572,14 +2726,26 @@ function renderFulfillmentScreen() {
           <button class="primary-button" data-action="start-camera" type="button">${t("common.openCamera", "Open camera")}</button>
           ${renderCameraSwitchButton("switch-fulfillment-camera")}
         </div>
+        <div class="photo-slot-row">
+          ${Array.from({ length: fulfillmentPhotoSlots }, (_, slot) => `
+            <button class="${fulfillmentActivePhotoSlot === slot ? "active" : ""}" data-action="select-fulfillment-photo-slot" data-slot="${slot}" type="button">
+              <strong>${t("common.photos", "Photo")} ${slot + 1}</strong>
+              <span>${fulfillmentPhotoDataUrls[slot] ? t("common.ready", "Ready") : slot < 2 ? t("common.needed", "Needed") : t("common.optional", "Optional")}</span>
+            </button>
+          `).join("")}
+        </div>
+        <div class="photo-list-actions">
+          <button class="secondary-button" data-action="add-fulfillment-photo" type="button">${t("common.addAnotherPhoto", "Add another photo")}</button>
+          ${fulfillmentPhotoSlots > 2 ? `<button class="secondary-button danger-button" data-action="remove-fulfillment-photo" data-slot="${fulfillmentActivePhotoSlot}" ${fulfillmentActivePhotoSlot < 2 ? "disabled" : ""} type="button">${t("common.removeSelected", "Remove selected")}</button>` : ""}
+        </div>
         ${fulfillmentCameraActive ? `
           <video class="camera-preview" id="fulfillmentCamera" autoplay muted playsinline></video>
-          <button class="primary-button" data-action="capture-photo" type="button">${t("operator.capturePhoto", "Capture photo")}</button>
-        ` : fulfillmentPhotoDataUrl ? `<img class="photo-preview" src="${fulfillmentPhotoDataUrl}" alt="Truck loading proof" />` : `<div class="photo-placeholder">${t("operator.loadPhotoHelp", "Open camera and take 1 photo before confirming load.")}</div>`}
+          <button class="primary-button" data-action="capture-photo" type="button">${t("operator.capturePhoto", "Capture photo")} ${fulfillmentActivePhotoSlot + 1}</button>
+        ` : fulfillmentPhotoDataUrls[fulfillmentActivePhotoSlot] ? `<img class="photo-preview" src="${fulfillmentPhotoDataUrls[fulfillmentActivePhotoSlot]}" alt="${t("operator.photoProof", "Truck loading proof")} ${fulfillmentActivePhotoSlot + 1}" />` : `<div class="photo-placeholder">${t("operator.takeTwoLoadPhotos", "Take at least 2 photos before confirming load. You can add more photos if needed.")}</div>`}
       </div>
       <div class="fulfillment-card">
         <span>${t("operator.packedQtyToLoad", "Packed qty to load")}</span>
-        <strong>${packedLines.length} line</strong>
+        <strong>${tf("operator.lineCount", "{count} line(s)", { count: packedLines.length })}</strong>
         <div class="fulfillment-lines">
           ${packedLines.map((line) => `
             <div>
@@ -2590,10 +2756,10 @@ function renderFulfillmentScreen() {
         </div>
       </div>
       <div class="selected-actions">
-        ${fulfillmentSubmitting ? `<div class="sync-alert"><strong>${fulfillmentJobStage || "Saving load proof"}</strong><span>${fulfillmentStatusText || "Saving local yard status..."}${fulfillmentStartedAt ? ` (${Math.max(1, Math.round((Date.now() - fulfillmentStartedAt) / 1000))}s)` : ""}</span></div>` : ""}
-        ${!fulfillmentSubmitting && fulfillmentJobStage === "Load failed" ? `<div class="sync-alert danger"><strong>${t("operator.loadFailed", "Load failed")}</strong><span>${fulfillmentStatusText}</span></div>` : ""}
+        ${fulfillmentSubmitting ? `<div class="sync-alert"><strong>${localizeMessage(fulfillmentJobStage || t("operator.savingLoadProof", "Saving load proof"))}</strong><span>${localizeMessage(fulfillmentStatusText || t("operator.savingLocalYardStatus", "Saving local yard status..."))}${fulfillmentStartedAt ? ` (${Math.max(1, Math.round((Date.now() - fulfillmentStartedAt) / 1000))}s)` : ""}</span></div>` : ""}
+        ${!fulfillmentSubmitting && fulfillmentJobStage === "Load failed" ? `<div class="sync-alert danger"><strong>${t("operator.loadFailed", "Load failed")}</strong><span>${escapeHtml(localizeMessage(fulfillmentStatusText))}</span></div>` : ""}
         ${renderLoadValidation(fulfillmentValidation)}
-        <button class="primary-button" data-action="confirm-fulfill" ${fulfillmentPhotoDataUrl && !fulfillmentSubmitting ? "" : "disabled"} type="button">${fulfillmentSubmitting ? "Loading..." : "Load"}</button>
+        <button class="primary-button" data-action="confirm-fulfill" ${fulfillmentPhotoCount >= 2 && !fulfillmentSubmitting ? "" : "disabled"} type="button">${fulfillmentSubmitting ? t("operator.loading", "Loading...") : t("common.load", "Load")}</button>
       </div>
     </section>
   `, `
@@ -2603,11 +2769,12 @@ function renderFulfillmentScreen() {
 }
 
 function renderLine(line) {
-  const variable = lineVariableUnit(line);
+  const units = deliveryLineUnits(line);
   const notice = exceptionText(line);
   const underPacked = isUnderPacked(line);
   const draftConfirmed = isActiveDraftPackedLine(line);
-  const valueLabel = isActiveDraftPackedLine(line) ? "Confirmed" : viewMode === "packed" ? "Packed" : "Open";
+  const referenceOnly = line.vrma_reference_only === true || isVrmaReferenceOrder();
+  const valueLabel = referenceOnly ? t("operator.reference", "Reference") : isActiveDraftPackedLine(line) ? t("operator.confirmed", "Confirmed") : viewMode === "packed" ? t("operator.packed", "Packed") : t("operator.open", "Open");
   return `
     <button class="line-card ${String(selectedLineId) === String(line.id) ? "active" : ""} ${line.confirmed ? "confirmed" : ""} ${underPacked ? "underpacked" : ""} ${notice ? "exception" : ""}" data-line="${line.id}" type="button">
       <div class="line-info">
@@ -2618,15 +2785,34 @@ function renderLine(line) {
         ${underPacked ? `<em class="underpack-note">${t("operator.stillOpenQty", "Still has open qty")}</em>` : ""}
       </div>
       <div class="required-measures">
-        <div class="measure"><span>${valueLabel} PLT</span><b>${displayQty(panelValue(line, "pallets"))}</b></div>
-        ${variable ? `<div class="measure"><span>${valueLabel} ${variable.label}</span><b>${displayQty(panelValue(line, variable.packedKey))}</b></div>` : ""}
+        ${units.map((unit) => `<div class="measure"><span>${valueLabel} ${unit.label}</span><b>${displayQty(panelValue(line, unit.key))}</b></div>`).join("")}
       </div>
     </button>
   `;
 }
 
+function renderVrmaReferenceLinePanel(line) {
+  const units = deliveryLineUnits(line);
+  return `
+    <aside class="selected-panel vrma-reference-panel" data-selected-line="${line.id}">
+      <div class="selected-header">
+        <span>${t("operator.vrmaReferenceItem", "VRMA reference item")}</span>
+        <strong>${escapeHtml(line.sku || line.item_name)}</strong>
+        <p>${escapeHtml(line.item_description || "")}</p>
+      </div>
+      <div class="selected-measures">
+        ${units.map((unit) => `<div class="measure"><span>${t("operator.reference", "Reference")} ${unit.label}</span><b>${displayQty(requiredValue(line, unit.key))}</b></div>`).join("")}
+      </div>
+      <div class="sync-alert">
+        <strong>${t("operator.noPackingTransaction", "No packing transaction")}</strong>
+        <span>${t("operator.vrmaReferenceItemHelp", "This item and quantity are shown for pickup preparation, dispatch, and driver reference. They do not update inventory or create a NetSuite fulfillment.")}</span>
+      </div>
+    </aside>
+  `;
+}
+
 function renderSelectedLinePanel(line) {
-  const variable = lineVariableUnit(line);
+  const units = deliveryLineUnits(line);
   const notice = exceptionText(line);
   const showConfirmPage = currentModule === "delivery" && viewMode !== "packed";
   const packedActions = notice
@@ -2646,12 +2832,10 @@ function renderSelectedLinePanel(line) {
         <p>${line.item_description || ""}</p>
       </div>
       <div class="selected-measures">
-        <div class="measure"><span>${isCustomerPickupMode() ? "Remaining" : "Required"} PLT</span><b>${displayQty(isCustomerPickupMode() ? Math.max(0, qty(line.pallet_qty) - pickupLoadedValue(line, "pallets")) : line.pallet_qty)}</b></div>
-        ${variable ? `<div class="measure"><span>${isCustomerPickupMode() ? "Remaining" : "Required"} ${variable.label}</span><b>${displayQty(isCustomerPickupMode() ? Math.max(0, requiredValue(line, variable.packedKey) - pickupLoadedValue(line, variable.packedKey)) : variable.required)}</b></div>` : ""}
+        ${units.map((unit) => `<div class="measure"><span>${isCustomerPickupMode() ? t("operator.remaining", "Remaining") : t("operator.required", "Required")} ${unit.label}</span><b>${displayQty(isCustomerPickupMode() ? Math.max(0, requiredValue(line, unit.key) - pickupLoadedValue(line, unit.key)) : requiredValue(line, unit.key))}</b></div>`).join("")}
       </div>
       ${notice ? `<div class="line-alert"><strong>${t("operator.repackNeeded", "Repack needed")}</strong><span>${notice}</span></div>` : ""}
-      ${notice ? "" : renderStepper("pallets", `${viewMode === "packed" ? "Packed" : "Pack"} PLT`, panelValue(line, "pallets"))}
-      ${!notice && variable?.packedKey ? renderStepper(variable.packedKey, `${viewMode === "packed" ? "Packed" : "Pack"} ${variable.label}`, panelValue(line, variable.packedKey)) : ""}
+      ${notice ? "" : units.map((unit) => renderStepper(unit.key, `${viewMode === "packed" ? t("operator.packed", "Packed") : t("operator.pack", "Pack")} ${unit.label}`, panelValue(line, unit.key))).join("")}
       ${viewMode === "packed"
         ? `<div class="selected-actions">${packedActions}</div>`
         : `<div class="selected-actions"><button class="primary-button" data-action="confirm-line" data-line="${line.id}" type="button">${t("operator.confirmLine", "Confirm line")}</button></div>`}
@@ -2677,7 +2861,7 @@ function deliveryOrderKey(order) {
 }
 
 function combineDeliveryOrderTypes(source = {}) {
-  return [...(source.salesOrder || []), ...(source.transferOrder || [])];
+  return [...(source.salesOrder || []), ...(source.transferOrder || []), ...(source.vrmaOrder || [])];
 }
 
 function applyDeliveryBootstrapState(bootstrap, options = {}) {
@@ -2688,11 +2872,12 @@ function applyDeliveryBootstrapState(bootstrap, options = {}) {
 }
 
 async function fetchPackedDeliveryOrders(targetLocationId = locationId) {
-  const [salesOrders, transferOrders] = await Promise.all([
+  const [salesOrders, transferOrders, vrmaOrders] = await Promise.all([
     api(`/api/delivery/orders?locationId=${targetLocationId}&status=packed&orderType=sales_order`),
-    api(`/api/delivery/orders?locationId=${targetLocationId}&status=packed&orderType=transfer_order`)
+    api(`/api/delivery/orders?locationId=${targetLocationId}&status=packed&orderType=transfer_order`),
+    api(`/api/delivery/vrma-orders?locationId=${targetLocationId}&status=packed`)
   ]);
-  return [...salesOrders, ...transferOrders];
+  return [...salesOrders, ...transferOrders, ...vrmaOrders];
 }
 
 async function primePackedDeliveryOrders({ force = false } = {}) {
@@ -2945,7 +3130,7 @@ function renderConsolidationQueue() {
           ${consolidationBusy ? t("operator.starting", "Starting...") : t("operator.startConsolidation", "Start Consolidation")}
         </button>
       </div>
-      ${consolidationNotice ? `<div class="sync-alert danger"><strong>${t("operator.cannotStart", "Cannot start")}</strong><span>${escapeHtml(consolidationNotice)}</span></div>` : ""}
+      ${consolidationNotice ? `<div class="sync-alert danger"><strong>${t("operator.cannotStart", "Cannot start")}</strong><span>${escapeHtml(localizeMessage(consolidationNotice))}</span></div>` : ""}
       <div class="consolidation-queue-list">
         ${rows.map((row) => `
           <article class="consolidation-queue-row ${row.eligible ? "eligible" : "blocked"}">
@@ -2956,7 +3141,7 @@ function renderConsolidationQueue() {
             </div>
             <div class="consolidation-queue-state">
               <b>${row.eligible ? t("operator.ready", "Ready") : t("operator.blocked", "Blocked")}</b>
-              <span>${escapeHtml(row.issue || `${row.lineCount || 0} lines`)}</span>
+              <span>${escapeHtml(localizeMessage(row.issue || `${row.lineCount || 0} lines`))}</span>
             </div>
           </article>
         `).join("") || `<div class="empty-state"><strong>${t("operator.noSavedSalesOrders", "No saved Sales Orders")}</strong><span>${t("operator.starOrdersFirst", "Star Sales Orders in Delivery Prep first.")}</span></div>`}
@@ -3026,7 +3211,7 @@ function renderConsolidationPickStage() {
       <aside class="consolidation-item-panel">
         <label class="consolidation-search">
           <span>${t("common.search", "Search")}</span>
-          <input id="consolidationSearch" value="${escapeHtml(consolidationSearch)}" placeholder="SKU / item" autocomplete="off" />
+          <input id="consolidationSearch" value="${escapeHtml(consolidationSearch)}" placeholder="${t("operator.searchSkuItem", "SKU / item")}" autocomplete="off" />
         </label>
         <div class="consolidation-item-list">
           ${items.map((item) => `
@@ -3111,7 +3296,7 @@ function renderConsolidationReviewLine(line) {
       <div class="line-info">
         <strong>${escapeHtml(line.itemName)}</strong>
         ${compactLineMode ? "" : `<span>${escapeHtml(line.description || "")}</span>`}
-        ${line.syncException ? `<em>${escapeHtml(line.syncException)}</em>` : ""}
+        ${line.syncException ? `<em>${escapeHtml(localizeMessage(line.syncException))}</em>` : ""}
       </div>
       <div class="required-measures">
         ${cardUnits.map((unit) => `
@@ -3142,7 +3327,7 @@ function renderConsolidationReviewLinePanel(line) {
           </div>
         `).join("")}
       </div>
-      ${line.syncException ? `<div class="line-alert"><strong>${t("operator.attentionRequired", "Attention Required")}</strong><span>${escapeHtml(line.syncException)}</span></div>` : ""}
+      ${line.syncException ? `<div class="line-alert"><strong>${t("operator.attentionRequired", "Attention Required")}</strong><span>${escapeHtml(localizeMessage(line.syncException))}</span></div>` : ""}
       <div class="selected-actions consolidation-review-selected-actions">
         <button class="secondary-button" data-action="consolidation-stage" data-stage="pick" type="button">${t("operator.adjustInPickItems", "Adjust in Pick Items")}</button>
       </div>
@@ -3224,7 +3409,7 @@ function renderConsolidationPick() {
           </div>
           <button class="secondary-button danger-button" data-action="release-consolidation" ${consolidationBusy ? "disabled" : ""} type="button">${t("operator.releaseBatch", "Release Batch")}</button>
         </div>
-        ${consolidationNotice ? `<div class="sync-alert danger"><strong>${t("common.notice", "Notice")}</strong><span>${escapeHtml(consolidationNotice)}</span></div>` : ""}
+        ${consolidationNotice ? `<div class="sync-alert danger"><strong>${t("common.notice", "Notice")}</strong><span>${escapeHtml(localizeMessage(consolidationNotice))}</span></div>` : ""}
         ${consolidationStage === "review" ? renderConsolidationReviewStage() : renderConsolidationPickStage()}
       ` : renderConsolidationQueue()}
     </section>
@@ -3612,7 +3797,7 @@ async function lookupCustomerPickup() {
 
 async function confirmDiscardCustomerPickupDraft() {
   if (!isCustomerPickupMode() || !selectedId || !hasCustomerPickupDraft()) return true;
-  if (!confirm("All the confirmed line for this order will be erased. Confirm?")) return false;
+  if (!confirm(t("operator.discardPickupDraftConfirm", "All the confirmed lines for this order will be erased. Confirm?"))) return false;
   selectedOrder = await api(`/api/customer-pickup/orders/${selectedId}/clear-draft`, { method: "POST" });
   return true;
 }
@@ -3758,10 +3943,12 @@ async function confirmLine(lineId) {
   const pallets = row.querySelector('[data-pack="pallets"]')?.value || 0;
   const layers = row.querySelector('[data-pack="layers"]')?.value || 0;
   const pieces = row.querySelector('[data-pack="pieces"]')?.value || 0;
+  const salesQty = row.querySelector('[data-pack="sales"]')?.value || 0;
   const body = {
     pallets,
     layers,
-    pieces: row.querySelector('[data-pack="sales"]')?.value || pieces,
+    pieces: isIndependentManualLine(line) ? pieces : salesQty || pieces,
+    salesQty,
     sections: row.querySelector('[data-pack="sections"]')?.value || 0
   };
   const path = isCustomerPickupMode()
@@ -3791,17 +3978,19 @@ function confirmPayloadForLine(line) {
   const row = app.querySelector(`[data-selected-line="${line.id}"]`);
   const fieldValue = (unit) => row?.querySelector(`[data-pack="${unit}"]`)?.value;
   const value = (unit) => fieldValue(unit) ?? panelValue(line, unit);
-  const pieces = fieldValue("sales") ?? fieldValue("pieces") ?? (shouldUseSalesQuantity(line) ? panelValue(line, "sales") : panelValue(line, "pieces"));
+  const pieces = fieldValue("pieces") ?? panelValue(line, "pieces");
+  const salesQty = fieldValue("sales") ?? (isIndependentManualLine(line) || shouldUseSalesQuantity(line) ? panelValue(line, "sales") : 0);
   return {
     pallets: value("pallets") || 0,
     layers: value("layers") || 0,
-    pieces: pieces || 0,
+    pieces: isIndependentManualLine(line) ? pieces || 0 : salesQty || pieces || 0,
+    salesQty: salesQty || 0,
     sections: value("sections") || 0
   };
 }
 
 function confirmPayloadHasQty(body) {
-  return qty(body.pallets) > 0 || qty(body.layers) > 0 || qty(body.pieces) > 0 || qty(body.sections) > 0;
+  return qty(body.pallets) > 0 || qty(body.layers) > 0 || qty(body.pieces) > 0 || qty(body.sections) > 0 || qty(body.salesQty) > 0;
 }
 
 async function confirmPage() {
@@ -3886,10 +4075,13 @@ async function unpackLine(lineId) {
 
 async function updatePackedLine(lineId) {
   const row = app.querySelector(`[data-selected-line="${lineId}"]`);
+  const line = selectedOrder?.lines?.find((item) => String(item.id) === String(lineId));
+  const salesQty = row.querySelector('[data-pack="sales"]')?.value || 0;
   const body = {
     pallets: row.querySelector('[data-pack="pallets"]')?.value || 0,
     layers: row.querySelector('[data-pack="layers"]')?.value || 0,
-    pieces: row.querySelector('[data-pack="sales"]')?.value || row.querySelector('[data-pack="pieces"]')?.value || 0,
+    pieces: isIndependentManualLine(line) ? row.querySelector('[data-pack="pieces"]')?.value || 0 : salesQty || row.querySelector('[data-pack="pieces"]')?.value || 0,
+    salesQty,
     sections: row.querySelector('[data-pack="sections"]')?.value || 0
   };
   const mutationOrderId = selectedId;
@@ -3928,7 +4120,7 @@ async function releaseCurrentDraft(orderId) {
   const targetOrderId = orderId || draft?.orderId;
   if (!targetOrderId) return showToast("No preparing order lock found.");
   const label = draft?.tranid || targetOrderId;
-  if (!confirm(`Release ${label}? This will erase confirmed draft lines for this order only. Loaded quantities will not change.`)) return;
+  if (!confirm(tf("operator.releaseDraftConfirm", "Release {order}? This will erase confirmed draft lines for this order only. Loaded quantities will not change.", { order: label }))) return;
   const result = await api(`/api/delivery/orders/${targetOrderId}/release-draft`, { method: "POST" });
   activeDeliveryDraft = null;
   if (String(selectedId || "") === String(targetOrderId)) {
@@ -3948,7 +4140,8 @@ async function startFulfillment() {
   if (!selectedOrder) return;
   fulfillmentOrder = selectedOrder;
   fulfillmentReturnModule = currentModule;
-  fulfillmentPhotoDataUrl = "";
+  fulfillmentPhotoDataUrls = [];
+  fulfillmentActivePhotoSlot = 0;
   fulfillmentResult = null;
   fulfillmentSubmitting = false;
   fulfillmentStatusText = "";
@@ -3989,7 +4182,6 @@ async function startFulfillmentCamera() {
   stopFulfillmentCamera();
   fulfillmentCameraStream = await openCameraStream();
   fulfillmentCameraActive = true;
-  fulfillmentPhotoDataUrl = "";
   render();
   window.requestAnimationFrame(attachFulfillmentCamera);
 }
@@ -4021,6 +4213,15 @@ async function captureCameraPhotoDataUrl(stream, video) {
   return canvas.toDataURL("image/jpeg", OPERATOR_CAMERA_JPEG_QUALITY);
 }
 
+function nextPhotoSlot(photoDataUrls, currentSlot, minimumSlots) {
+  const slotCount = Math.max(minimumSlots, photoDataUrls.length);
+  for (let offset = 1; offset < slotCount; offset += 1) {
+    const candidate = (currentSlot + offset) % slotCount;
+    if (!photoDataUrls[candidate]) return candidate;
+  }
+  return currentSlot;
+}
+
 async function captureFulfillmentPhoto() {
   const video = document.getElementById("fulfillmentCamera");
   if (!video || !video.videoWidth || !video.videoHeight) {
@@ -4028,7 +4229,8 @@ async function captureFulfillmentPhoto() {
     return;
   }
   try {
-    fulfillmentPhotoDataUrl = await captureCameraPhotoDataUrl(fulfillmentCameraStream, video);
+    fulfillmentPhotoDataUrls[fulfillmentActivePhotoSlot] = await captureCameraPhotoDataUrl(fulfillmentCameraStream, video);
+    fulfillmentActivePhotoSlot = nextPhotoSlot(fulfillmentPhotoDataUrls, fulfillmentActivePhotoSlot, 2);
     stopFulfillmentCamera();
     render();
   } catch (error) {
@@ -4046,7 +4248,7 @@ function readPhotoFile(file) {
 }
 
 async function confirmFulfillment() {
-  if (!fulfillmentOrder || !fulfillmentPhotoDataUrl || fulfillmentSubmitting) return;
+  if (!fulfillmentOrder || fulfillmentPhotoDataUrls.filter(Boolean).length < 2 || fulfillmentSubmitting) return;
   fulfillmentSubmitting = true;
   fulfillmentStartedAt = Date.now();
   fulfillmentJobStage = "Saving proof";
@@ -4060,7 +4262,7 @@ async function confirmFulfillment() {
   try {
     fulfillmentStatusText = "Uploading photo proof to R2...";
     render();
-    const uploadedPhotoRef = await uploadOperatorPhoto(fulfillmentPhotoDataUrl, {
+    const uploadedPhotoRefs = await uploadOperatorPhotos(fulfillmentPhotoDataUrls.filter(Boolean), {
       recordType: currentModule === "customer-pickup-load" ? "operator-customer-pickup-photo" : "operator-load-photo",
       orderType: fulfillmentOrder.order_type || deliveryOrderType,
       orderId: fulfillmentOrder.netsuite_id,
@@ -4072,7 +4274,7 @@ async function confirmFulfillment() {
     fulfillmentStatusText = "Saving local loaded status...";
     fulfillmentResult = await api(path, {
       method: "POST",
-      body: JSON.stringify({ photoDataUrl: uploadedPhotoRef, locationId })
+      body: JSON.stringify({ photoDataUrls: uploadedPhotoRefs, locationId })
     });
     showToast("Order loaded");
   } catch (error) {
@@ -4098,7 +4300,7 @@ async function pollFulfillmentJob(jobId) {
     if (job.status === "complete") return job.result;
     if (job.status === "error") throw new Error(job.error || "NetSuite fulfillment failed.");
     fulfillmentJobStage = job.stage || "Posting";
-    fulfillmentStatusText = job.message || `Still posting... ${attempt + 1}s`;
+    fulfillmentStatusText = job.message || tf("operator.stillPosting", "Still posting... {seconds}s", { seconds: attempt + 1 });
     render();
   }
   throw new Error("NetSuite fulfillment is still running. Please check Delivery Fulfillment in control panel.");
@@ -4110,7 +4312,8 @@ async function finishFulfillment() {
   const returnModule = fulfillmentReturnModule || "delivery";
   currentModule = wasPickup ? "customer-pickup-scan" : returnModule;
   fulfillmentOrder = null;
-  fulfillmentPhotoDataUrl = "";
+  fulfillmentPhotoDataUrls = [];
+  fulfillmentActivePhotoSlot = 0;
   fulfillmentResult = null;
   fulfillmentStatusText = "";
   fulfillmentJobStage = "";
@@ -4136,12 +4339,12 @@ function renderReceiptScreen() {
   const confirmedLines = (order.lines || []).filter((line) => hasReceivedQty(line));
   if (receiptResult) {
     const isLocalCo = (receiptOrder?.order_type || receivingOrderType) === "co_order";
-    return shell("Receiving Complete", `Order ${order.tranid}`, `
+    return shell(t("operator.receivingComplete", "Receiving Complete"), `${t("common.order", "Order")} ${order.tranid}`, `
       <section class="fulfillment-screen">
         <div class="fulfillment-card success">
-          <span>${isLocalCo ? "Local CO Received" : "Item Receipt"}</span>
-          <strong>${receiptResult.itemReceiptTranid || receiptResult.itemReceiptId || "Created"}</strong>
-          <p>${isLocalCo ? "CO is now available in Delivery Prep packed orders for loading." : "Receiving posted to NetSuite."}</p>
+          <span>${isLocalCo ? t("operator.localCoReceived", "Local CO Received") : t("operator.itemReceipt", "Item Receipt")}</span>
+          <strong>${receiptResult.itemReceiptTranid || receiptResult.itemReceiptId || t("common.created", "Created")}</strong>
+          <p>${isLocalCo ? t("operator.coReadyForLoading", "CO is now available in Delivery Prep packed orders for loading.") : t("operator.receivingPosted", "Receiving posted to NetSuite.")}</p>
         </div>
         <div class="selected-actions">
           <button class="primary-button" data-action="finish-receive" type="button">${t("operator.backToReceiving", "Back to Receiving")}</button>
@@ -4149,7 +4352,7 @@ function renderReceiptScreen() {
       </section>
     `, `<button class="secondary-button" data-action="finish-receive" type="button">${t("operator.receiving", "Receiving")}</button>`);
   }
-  return shell("Receive Order", `${order.tranid} | Location ${currentLocation()?.text || ""}`, `
+  return shell(t("operator.receiveOrder", "Receive Order"), `${order.tranid} | ${t("common.location", "Location")} ${currentLocation()?.text || ""}`, `
     <section class="fulfillment-screen">
       <div class="fulfillment-card">
         <span>${t("operator.photoProof", "Photo proof")}</span>
@@ -4160,12 +4363,16 @@ function renderReceiptScreen() {
           ${renderCameraSwitchButton("switch-receipt-camera")}
         </div>
         <div class="photo-slot-row">
-          ${[0, 1].map((slot) => `
+          ${Array.from({ length: Math.max(2, receiptPhotoDataUrls.length) }, (_, slot) => `
             <button class="${receiptActivePhotoSlot === slot ? "active" : ""}" data-action="select-receipt-photo-slot" data-slot="${slot}" type="button">
               <strong>${t("common.photos", "Photo")} ${slot + 1}</strong>
-              <span>${receiptPhotoDataUrls[slot] ? "Ready" : "Needed"}</span>
+              <span>${receiptPhotoDataUrls[slot] ? t("common.ready", "Ready") : slot < 2 ? t("common.needed", "Needed") : t("common.optional", "Optional")}</span>
             </button>
           `).join("")}
+        </div>
+        <div class="photo-list-actions">
+          <button class="secondary-button" data-action="add-receipt-photo" type="button">${t("common.addAnotherPhoto", "Add another photo")}</button>
+          ${Math.max(2, receiptPhotoDataUrls.length) > 2 ? `<button class="secondary-button danger-button" data-action="remove-receipt-photo" data-slot="${receiptActivePhotoSlot}" ${receiptActivePhotoSlot < 2 ? "disabled" : ""} type="button">${t("common.removeSelected", "Remove selected")}</button>` : ""}
         </div>
         ${receiptCameraActive ? `
           <video class="camera-preview" id="receiptCamera" autoplay muted playsinline></video>
@@ -4174,7 +4381,7 @@ function renderReceiptScreen() {
       </div>
       <div class="fulfillment-card">
         <span>${t("operator.confirmedQtyToReceive", "Confirmed qty to receive")}</span>
-        <strong>${confirmedLines.length} line</strong>
+        <strong>${tf("operator.lineCount", "{count} line(s)", { count: confirmedLines.length })}</strong>
         <div class="fulfillment-lines">
           ${confirmedLines.map((line) => `
             <div>
@@ -4185,9 +4392,9 @@ function renderReceiptScreen() {
         </div>
       </div>
       <div class="selected-actions">
-        ${receiptSubmitting ? `<div class="sync-alert"><strong>${receiptJobStage || "Recording locally"}</strong><span>${receiptStatusText || "Saving receiving record..."}${receiptStartedAt ? ` (${Math.max(1, Math.round((Date.now() - receiptStartedAt) / 1000))}s)` : ""}</span></div>` : ""}
-        ${!receiptSubmitting && receiptJobStage === "Receiving failed" ? `<div class="sync-alert danger"><strong>${t("operator.receivingFailed", "Receiving failed")}</strong><span>${receiptStatusText}</span></div>` : ""}
-        <button class="primary-button" data-action="confirm-receive" ${receiptPhotoDataUrls.filter(Boolean).length >= 2 && !receiptSubmitting ? "" : "disabled"} type="button">${receiptSubmitting ? "Receiving..." : "Receive"}</button>
+        ${receiptSubmitting ? `<div class="sync-alert"><strong>${localizeMessage(receiptJobStage || t("operator.recordingLocally", "Recording locally"))}</strong><span>${localizeMessage(receiptStatusText || t("operator.savingReceivingRecord", "Saving receiving record..."))}${receiptStartedAt ? ` (${Math.max(1, Math.round((Date.now() - receiptStartedAt) / 1000))}s)` : ""}</span></div>` : ""}
+        ${!receiptSubmitting && receiptJobStage === "Receiving failed" ? `<div class="sync-alert danger"><strong>${t("operator.receivingFailed", "Receiving failed")}</strong><span>${escapeHtml(localizeMessage(receiptStatusText))}</span></div>` : ""}
+        <button class="primary-button" data-action="confirm-receive" ${receiptPhotoDataUrls.filter(Boolean).length >= 2 && !receiptSubmitting ? "" : "disabled"} type="button">${receiptSubmitting ? t("operator.receivingProgress", "Receiving...") : t("operator.receive", "Receive")}</button>
       </div>
     </section>
   `, `
@@ -4199,10 +4406,13 @@ function renderReceiptScreen() {
 async function confirmReceivingLine(lineId) {
   const row = app.querySelector(`[data-receiving-selected-line="${lineId}"]`);
   if (!row || !receivingSelectedId) return;
+  const line = receivingSelectedOrder?.lines?.find((item) => String(item.id) === String(lineId));
+  const salesQty = row.querySelector('[data-pack="sales"]')?.value || 0;
   const body = {
     pallets: row.querySelector('[data-pack="pallets"]')?.value || 0,
     layers: row.querySelector('[data-pack="layers"]')?.value || 0,
-    pieces: row.querySelector('[data-pack="sales"]')?.value || row.querySelector('[data-pack="pieces"]')?.value || 0,
+    pieces: isIndependentManualLine(line) ? row.querySelector('[data-pack="pieces"]')?.value || 0 : salesQty || row.querySelector('[data-pack="pieces"]')?.value || 0,
+    salesQty,
     sections: row.querySelector('[data-pack="sections"]')?.value || 0,
     orderType: receivingSelectedOrder?.order_type || receivingOrderType
   };
@@ -4281,7 +4491,7 @@ async function captureReceiptPhoto() {
   if (!video || !video.videoWidth || !video.videoHeight) return showToast("Camera preview is not ready yet.");
   try {
     receiptPhotoDataUrls[receiptActivePhotoSlot] = await captureCameraPhotoDataUrl(receiptCameraStream, video);
-    receiptActivePhotoSlot = Math.min(1, receiptActivePhotoSlot + 1);
+    receiptActivePhotoSlot = nextPhotoSlot(receiptPhotoDataUrls, receiptActivePhotoSlot, 2);
     stopReceiptCamera();
     render();
   } catch (error) {
@@ -4349,7 +4559,7 @@ async function pollReceiptJob(jobId) {
     if (job.status === "complete") return job.result;
     if (job.status === "error") throw new Error(job.error || "Receiving failed.");
     receiptJobStage = job.stage || "Recording";
-    receiptStatusText = job.message || `Still recording... ${attempt + 1}s`;
+    receiptStatusText = job.message || tf("operator.stillRecording", "Still recording... {seconds}s", { seconds: attempt + 1 });
     render();
   }
   throw new Error("Receiving record is still running. Please check control panel.");
@@ -4390,12 +4600,12 @@ async function loadPersonalHistory() {
 
 function historyTypeLabel(type) {
   return {
-    confirm_line: "Confirm Line",
+    confirm_line: t("operator.confirmLineHistory", "Confirm Line"),
     item_receipt: "IR",
     item_fulfillment: "IF",
-    cycle_count: "Cycle",
-    customer_return: "Customer Return"
-  }[type] || type || "Record";
+    cycle_count: t("operator.cycleHistory", "Cycle"),
+    customer_return: t("operator.customerReturnHistory", "Customer Return")
+  }[type] || type || t("operator.recordHistory", "Record");
 }
 
 function renderHistoryPhotos(record) {
@@ -4404,8 +4614,8 @@ function renderHistoryPhotos(record) {
   return `
     <div class="history-photo-grid">
       ${photos.map((photo, index) => `
-        <button class="history-photo-button" data-action="open-history-photo" data-photo-ref="${escapeHtml(photo)}" data-photo-label="Record photo ${index + 1}" type="button">
-          <img src="${photoImgSrc(photo)}" alt="Record photo ${index + 1}" />
+        <button class="history-photo-button" data-action="open-history-photo" data-photo-ref="${escapeHtml(photo)}" data-photo-label="${tf("operator.recordPhotoNumber", "Record photo {number}", { number: index + 1 })}" type="button">
+          <img src="${photoImgSrc(photo)}" alt="${tf("operator.recordPhotoNumber", "Record photo {number}", { number: index + 1 })}" />
         </button>
       `).join("")}
     </div>
@@ -4423,7 +4633,7 @@ function historyLineUnits(line) {
     .filter((unit) => qty(line?.[unit.key]) !== 0)
     .map((unit) => ({ ...unit, value: displayQty(line?.[unit.key]) }));
   const salesKey = line.countedTotal !== undefined ? "countedTotal" : "salesQuantity";
-  units.push({ label: "Sales", key: salesKey, value: displayQty(line?.[salesKey]) });
+  units.push({ label: t("operator.salesUnit", "Sales"), key: salesKey, value: displayQty(line?.[salesKey]) });
   return units;
 }
 
@@ -4459,11 +4669,11 @@ function renderHistoryDetail(record) {
           <h2>${escapeHtml(record.tranid || record.reference || historyTypeLabel(record.type))}</h2>
           <p>${escapeHtml(historyTypeLabel(record.type))} | ${formatDateTime(record.createdAt)}</p>
         </div>
-        ${record.status ? `<span class="status-pill open">${escapeHtml(record.status)}</span>` : ""}
+        ${record.status ? `<span class="status-pill open">${escapeHtml(localizeMessage(record.status))}</span>` : ""}
       </div>
       <div class="progress-strip history-meta">
         <div><span>${t("operator.reference", "Reference")}</span><strong>${escapeHtml(record.reference || "-")}</strong></div>
-        <div><span>${t("operator.action", "Action")}</span><strong>${escapeHtml(record.action || "-")}</strong></div>
+        <div><span>${t("operator.action", "Action")}</span><strong>${escapeHtml(localizeMessage(record.action || "-"))}</strong></div>
         <div><span>${t("common.order", "Order")}</span><strong>${escapeHtml(record.orderId || "-")}</strong></div>
       </div>
       ${renderHistoryPhotos(record)}
@@ -4578,7 +4788,7 @@ async function openModule(moduleName) {
     await loadCycleData();
     return render();
   }
-  showToast("This module is next.");
+  showToast(t("operator.moduleComingSoon", "This module is next."));
 }
 
 async function loadCycleData() {
@@ -4772,7 +4982,7 @@ function updateCycleVariancePreview() {
     if (!defaultBox) return;
     const defaultValues = defaultBox.querySelectorAll("strong");
     defaultValues[0].textContent = displayQty(countedDefault);
-    defaultValues[1].textContent = "Blind";
+    defaultValues[1].textContent = t("operator.blind", "Blind");
     defaultValues[1].className = "";
     return;
   }
@@ -4784,7 +4994,7 @@ function updateCycleVariancePreview() {
   if (!box) return;
   const values = box.querySelectorAll("strong");
   values[0].textContent = displayQty(countedTotal);
-  values[1].textContent = "Blind";
+  values[1].textContent = t("operator.blind", "Blind");
   values[1].className = "";
 }
 
@@ -4805,9 +5015,8 @@ app.addEventListener("click", async (event) => {
     }
     if (button.dataset.action === "logout") {
       await api("/api/auth/logout", { method: "POST" }).catch(() => ({}));
-      authToken = "";
       operator = null;
-      localStorage.removeItem(TOKEN_KEY);
+      clearOperatorSession();
       localStorage.removeItem(STATE_KEY);
       disconnectEvents();
       return renderLogin();
@@ -5065,6 +5274,18 @@ app.addEventListener("click", async (event) => {
       receiptActivePhotoSlot = Number(button.dataset.slot) || 0;
       return render();
     }
+    if (button.dataset.action === "add-receipt-photo") {
+      while (receiptPhotoDataUrls.length < 2) receiptPhotoDataUrls.push("");
+      receiptPhotoDataUrls.push("");
+      receiptActivePhotoSlot = receiptPhotoDataUrls.length - 1;
+      return render();
+    }
+    if (button.dataset.action === "remove-receipt-photo") {
+      const slot = Number(button.dataset.slot);
+      if (slot >= 2 && slot < receiptPhotoDataUrls.length) receiptPhotoDataUrls.splice(slot, 1);
+      receiptActivePhotoSlot = Math.min(receiptActivePhotoSlot, Math.max(1, receiptPhotoDataUrls.length - 1));
+      return render();
+    }
     if (button.dataset.action === "start-receipt-camera") return startReceiptCamera();
     if (button.dataset.action === "switch-receipt-camera") return switchReceiptCamera();
     if (button.dataset.action === "capture-receipt-photo") return captureReceiptPhoto();
@@ -5236,7 +5457,8 @@ app.addEventListener("click", async (event) => {
       stopFulfillmentCamera();
       currentModule = currentModule === "customer-pickup-load" ? "customer-pickup" : (fulfillmentReturnModule || "delivery");
       fulfillmentOrder = null;
-      fulfillmentPhotoDataUrl = "";
+      fulfillmentPhotoDataUrls = [];
+      fulfillmentActivePhotoSlot = 0;
       fulfillmentResult = null;
       fulfillmentStatusText = "";
       fulfillmentJobStage = "";
@@ -5248,6 +5470,22 @@ app.addEventListener("click", async (event) => {
     if (button.dataset.action === "start-camera") return startFulfillmentCamera();
     if (button.dataset.action === "switch-fulfillment-camera") return switchFulfillmentCamera();
     if (button.dataset.action === "capture-photo") return captureFulfillmentPhoto();
+    if (button.dataset.action === "select-fulfillment-photo-slot") {
+      fulfillmentActivePhotoSlot = Number(button.dataset.slot) || 0;
+      return render();
+    }
+    if (button.dataset.action === "add-fulfillment-photo") {
+      while (fulfillmentPhotoDataUrls.length < 2) fulfillmentPhotoDataUrls.push("");
+      fulfillmentPhotoDataUrls.push("");
+      fulfillmentActivePhotoSlot = fulfillmentPhotoDataUrls.length - 1;
+      return render();
+    }
+    if (button.dataset.action === "remove-fulfillment-photo") {
+      const slot = Number(button.dataset.slot);
+      if (slot >= 2 && slot < fulfillmentPhotoDataUrls.length) fulfillmentPhotoDataUrls.splice(slot, 1);
+      fulfillmentActivePhotoSlot = Math.min(fulfillmentActivePhotoSlot, Math.max(1, fulfillmentPhotoDataUrls.length - 1));
+      return render();
+    }
     if (button.dataset.action === "select-history") {
       selectedHistoryId = button.dataset.record;
       historyReportReason = "";
@@ -5445,11 +5683,12 @@ app.addEventListener("change", async (event) => {
   try {
     if (event.target.id === "fulfillmentPhoto") {
       stopFulfillmentCamera();
-      fulfillmentPhotoDataUrl = await readPhotoFile(file);
+      fulfillmentPhotoDataUrls[fulfillmentActivePhotoSlot] = await readPhotoFile(file);
+      fulfillmentActivePhotoSlot = nextPhotoSlot(fulfillmentPhotoDataUrls, fulfillmentActivePhotoSlot, 2);
     } else {
       stopReceiptCamera();
       receiptPhotoDataUrls[receiptActivePhotoSlot] = await readPhotoFile(file);
-      receiptActivePhotoSlot = Math.min(1, receiptActivePhotoSlot + 1);
+      receiptActivePhotoSlot = nextPhotoSlot(receiptPhotoDataUrls, receiptActivePhotoSlot, 2);
     }
     render();
   } catch (error) {
@@ -5469,9 +5708,12 @@ app.addEventListener("submit", async (event) => {
         password: document.getElementById("loginPassword").value
       })
     });
-    authToken = result.token;
     operator = result.operator;
-    localStorage.setItem(TOKEN_KEY, authToken);
+    storeOperatorSession(result.token, operator);
+    if (!operatorRoleAllowed(operator)) {
+      window.location.replace(staffRoleHome(operator.role));
+      return;
+    }
     connectEvents();
     showToast(`Welcome ${operator.display_name}`);
     await restoreOperatorView();
@@ -5482,12 +5724,21 @@ app.addEventListener("submit", async (event) => {
 
 async function boot() {
   if (!authToken) {
+    if (localStorage.getItem("mbbs.driver.token")) {
+      window.location.replace("/driver");
+      return;
+    }
     const bootstrap = await publicApi("/api/auth/bootstrap-needed").catch(() => ({ needed: false }));
     return renderLogin(bootstrap.needed ? "No operator account yet. Open /control to create the first admin account." : "");
   }
   try {
     const result = await api("/api/auth/me");
     operator = result.operator;
+    storeOperatorSession(authToken, operator);
+    if (!operatorRoleAllowed(operator)) {
+      window.location.replace(staffRoleHome(operator.role));
+      return;
+    }
     connectEvents();
     await restoreOperatorView();
   } catch (error) {

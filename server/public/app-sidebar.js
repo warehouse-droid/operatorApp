@@ -3,8 +3,8 @@
   const WIDTH = 206;
   const COLLAPSED_WIDTH = 58;
 
-  const path = window.location.pathname;
-  if (!path.startsWith("/control") && !path.startsWith("/dispatch") && !path.startsWith("/scm")) return;
+  let path = window.location.pathname;
+  if (!path.startsWith("/admin") && !path.startsWith("/control") && !path.startsWith("/dispatch") && !path.startsWith("/scm")) return;
 
   function t(key, fallback) {
     return window.MBBS_I18N?.t?.(key, fallback) || fallback;
@@ -28,15 +28,20 @@
 
   function isActive(item) {
     if (item.controlSection) {
-      const current = localStorage.getItem("mbbs.control.section") || "dashboard";
-      return path === "/control" && current === item.controlSection;
+      if (item.href.startsWith("/control")) return path === item.href;
+      const storageKey = item.href === "/admin" ? "mbbs.admin.section" : "mbbs.control.section";
+      const current = localStorage.getItem(storageKey) || "dashboard";
+      return path === item.href && current === item.controlSection;
     }
+    if (item.href === "/control") return path.startsWith("/control");
+    if (item.href === "/admin") return path.startsWith("/admin");
     if (item.href === "/dispatch") return path === "/dispatch";
     if (item.href === "/scm") return path === "/scm";
     return path === item.href;
   }
 
   const mainItems = [
+    { label: "Admin", href: "/admin", icon: "AD" },
     { label: "Control", href: "/control", icon: "CT" },
     { label: "Dispatch", href: "/dispatch", icon: "DP" },
     { label: "SCM", href: "/scm", icon: "SC" },
@@ -50,6 +55,7 @@
     { label: "Monitor", href: "/dispatch/monitor", icon: "MO" },
     { label: "Statistics", href: "/dispatch/statistics", icon: "ST" },
     { label: "DVIR", href: "/dispatch/dvir", icon: "DV" },
+    { label: "Yard In/Outbound", href: "/dispatch/loaded-export", icon: "YI" },
     { label: "SO Method", href: "/dispatch/sales-order-methods", icon: "SO" },
     { label: "Snapshot", href: "/dispatch/snapshot", icon: "SN" },
     { label: "Setup", href: "/dispatch/setup", icon: "SE" }
@@ -65,15 +71,45 @@
 
   const controlItems = [
     { label: "Dashboard", href: "/control", controlSection: "dashboard", icon: "DB" },
-    { label: "Accounts", href: "/control", controlSection: "operators", icon: "AC" },
-    { label: "Sync", href: "/control", controlSection: "sync", icon: "SY" },
-    { label: "Vendor Map", href: "/control", controlSection: "vendor-mapping", icon: "VM" },
-    { label: "Audit", href: "/control", controlSection: "audit", icon: "AU" },
-    { label: "Loaded Export", href: "/control", controlSection: "loaded-export", icon: "LE" },
-    { label: "Locks", href: "/control", controlSection: "locks", icon: "LK" }
+    { label: "Order Locks", href: "/control/order-locks", controlSection: "locks", icon: "LK" },
+    { label: "Item Classification", href: "/control/item-classification", controlSection: "classification", icon: "CL" },
+    { label: "Vendor Mapping", href: "/control/vendor-mapping", controlSection: "vendor-mapping", icon: "VM" },
+    { label: "Operator Warnings", href: "/control/operator-warnings", controlSection: "warnings", icon: "WN" },
+    { label: "Yard In/Outbound", href: "/control/yard-in-outbound", controlSection: "loaded-export", icon: "YI" },
+    { label: "Cycle Count Review", href: "/control/cycle-count-review", controlSection: "cycle-count", icon: "CC" },
+    { label: "Operator Load Records", href: "/control/operator-load-records", controlSection: "fulfillment", icon: "LD" }
   ];
 
+  const adminItems = [
+    { label: "Overview", href: "/admin", controlSection: "dashboard", icon: "OV" },
+    { label: "Accounts", href: "/admin", controlSection: "operators", icon: "AC" },
+    { label: "Sync", href: "/admin", controlSection: "sync", icon: "SY" },
+    { label: "Photo Storage", href: "/admin", controlSection: "storage", icon: "PS" },
+    { label: "Audit", href: "/admin", controlSection: "audit", icon: "AU" }
+  ];
+
+  function visibleMainItems() {
+    const normalizeRole = (value) => String(value || "").trim().toLowerCase().replaceAll("-", "_").replaceAll(" ", "_");
+    let savedRoles = [];
+    try {
+      const parsed = JSON.parse(localStorage.getItem("mbbs.staff.roles") || "[]");
+      savedRoles = Array.isArray(parsed) ? parsed : [];
+    } catch {
+      savedRoles = [];
+    }
+    const roles = new Set([...savedRoles, localStorage.getItem("mbbs.staff.role")].map(normalizeRole).filter(Boolean));
+    if (roles.has("admin")) return mainItems.filter((item) => item.href !== "/driver");
+    const visiblePaths = new Set();
+    if (roles.has("yard_manager")) ["/control", "/operator"].forEach((href) => visiblePaths.add(href));
+    if (roles.has("dispatcher")) ["/dispatch", "/scm"].forEach((href) => visiblePaths.add(href));
+    if (roles.has("scm") || roles.has("scm_staff")) visiblePaths.add("/scm");
+    if (roles.has("operator")) visiblePaths.add("/operator");
+    if (visiblePaths.size) return mainItems.filter((item) => visiblePaths.has(item.href));
+    return mainItems;
+  }
+
   function currentItems() {
+    if (path.startsWith("/admin")) return { title: "Admin", items: adminItems };
     if (path.startsWith("/dispatch")) return { title: "Dispatch", items: dispatchItems };
     if (path.startsWith("/scm")) return { title: "SCM", items: scmItems };
     return { title: "Control", items: controlItems };
@@ -284,7 +320,7 @@
       <div class="app-sidebar-scroll">
         <nav class="app-sidebar-section" aria-label="Main modules">
           <div class="app-sidebar-section-title">Modules</div>
-          ${mainItems.map(linkHtml).join("")}
+          ${visibleMainItems().map(linkHtml).join("")}
         </nav>
         <nav class="app-sidebar-section" aria-label="${escapeHtml(scoped.title)} pages">
           <div class="app-sidebar-section-title">${escapeHtml(scoped.title)}</div>
@@ -311,8 +347,11 @@
   function handleControlSection(event) {
     const link = event.target.closest?.("[data-control-section]");
     if (!link) return;
-    localStorage.setItem("mbbs.control.section", link.dataset.controlSection || "dashboard");
-    if (path === "/control") {
+    const targetPath = new URL(link.href, window.location.origin).pathname;
+    const sectionStorageKey = targetPath.startsWith("/admin") ? "mbbs.admin.section" : "mbbs.control.section";
+    localStorage.setItem(sectionStorageKey, link.dataset.controlSection || "dashboard");
+    if (targetPath.startsWith("/control")) return;
+    if (path.startsWith("/admin") && targetPath.startsWith("/admin")) {
       event.preventDefault();
       window.dispatchEvent(new CustomEvent("mbbs-control-section", {
         detail: { section: link.dataset.controlSection || "dashboard" }
@@ -334,6 +373,14 @@
       handleControlSection(event);
     });
     window.addEventListener("mbbs-language-changed", render);
+    window.addEventListener("mbbs-sidebar-route-changed", () => {
+      path = window.location.pathname;
+      render();
+    });
+    window.addEventListener("popstate", () => {
+      path = window.location.pathname;
+      render();
+    });
   }
 
   if (document.readyState === "loading") {

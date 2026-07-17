@@ -48,6 +48,14 @@ function minutesBetween(startedAt, completedAt) {
   return Math.round((end - start) / 60000);
 }
 
+function secondsBetween(startedAt, completedAt) {
+  if (!startedAt || !completedAt) return 0;
+  const start = new Date(startedAt).getTime();
+  const end = new Date(completedAt).getTime();
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return 0;
+  return (end - start) / 1000;
+}
+
 function orderByRef(plan, ref) {
   const id = String(ref || "");
   const direct = (plan.orders || []).find((order) => String(order?.id || "") === id);
@@ -159,6 +167,8 @@ function makeEmptyAggregate(key, label = key) {
     deliveryStops: 0,
     travelStops: 0,
     actualMinutes: 0,
+    grossMinutes: 0,
+    restMinutes: 0,
     plannedMinutes: 0,
     overrunMinutes: 0,
     deliveryPallets: 0,
@@ -176,6 +186,8 @@ function addStop(aggregate, stop) {
   if (stop.stopClass === "travel") aggregate.travelStops += 1;
   if (stop.photoCount > 0) aggregate.photoStops += 1;
   aggregate.actualMinutes += stop.actualMinutes;
+  aggregate.grossMinutes += stop.grossMinutes;
+  aggregate.restMinutes += stop.restMinutes;
   aggregate.plannedMinutes += stop.plannedMinutes;
   aggregate.overrunMinutes += stop.overrunMinutes;
   if (stop.stopClass === "delivery") {
@@ -221,7 +233,13 @@ function rowToStop(row) {
       ? orderFootprintPallets(order)
       : orderFootprintPallets(order);
   const plannedMinutes = plannedStopMinutes(currentClass, truck, pallets);
-  const actualMinutes = row.status === "complete" ? minutesBetween(row.started_at, row.completed_at) : 0;
+  const grossSeconds = row.status === "complete" ? secondsBetween(row.started_at, row.completed_at) : 0;
+  const restSeconds = row.status === "complete"
+    ? Math.min(grossSeconds, Math.max(0, numberValue(row.rest_seconds)))
+    : 0;
+  const grossMinutes = row.status === "complete" ? Math.round(grossSeconds / 60) : 0;
+  const restMinutes = row.status === "complete" ? round(restSeconds / 60) : 0;
+  const actualMinutes = row.status === "complete" ? Math.max(0, Math.round((grossSeconds - restSeconds) / 60)) : 0;
   return {
     jobId: row.job_id || "",
     planId: String(row.plan_id || ""),
@@ -237,6 +255,8 @@ function rowToStop(row) {
     startedAt: row.started_at,
     completedAt: row.completed_at,
     actualMinutes,
+    grossMinutes,
+    restMinutes,
     plannedMinutes,
     overrunMinutes: row.status === "complete" ? Math.max(actualMinutes - plannedMinutes, 0) : 0,
     pallets,
@@ -305,6 +325,17 @@ export async function getDispatchStatistics({ from = "", to = "", driver = "" } 
             r.stop_id, r.stop_type, COALESCE(r.order_refs, '[]'::jsonb) AS order_refs,
             COALESCE(r.photo_data_urls, '[]'::jsonb) AS photo_data_urls,
             r.status, r.started_at, r.completed_at,
+            COALESCE((
+              SELECT SUM(EXTRACT(EPOCH FROM (
+                LEAST(COALESCE(rr.ended_at, now()), r.completed_at)
+                - GREATEST(rr.started_at, r.started_at)
+              )))
+                FROM driver_rest_records rr
+               WHERE rr.driver_login = r.driver_login
+                 AND r.completed_at IS NOT NULL
+                 AND rr.started_at < r.completed_at
+                 AND COALESCE(rr.ended_at, now()) > r.started_at
+            ), 0) AS rest_seconds,
             COALESCE(s.orders, '[]'::jsonb) AS orders,
             COALESCE(s.trucks, '[]'::jsonb) AS trucks
        FROM driver_job_records r
@@ -346,6 +377,7 @@ export async function getDispatchStatistics({ from = "", to = "", driver = "" } 
       deliveryMinutesPerPallet: delivery.deliveryMinutesPerPallet,
       totalOverrunMinutes: total.overrunMinutes,
       averageOverrunMinutes: total.averageOverrunMinutes,
+      totalRestMinutes: round(total.restMinutes),
       photoRate: total.photoRate
     },
     byDriver: byDriver.sort((left, right) => right.completedStops - left.completedStops || right.overrunMinutes - left.overrunMinutes),

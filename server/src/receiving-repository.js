@@ -61,6 +61,9 @@ function explicitUnitQuantity(line, unit) {
 
 function receivedSalesQuantity(line) {
   if (!hasConversion(line)) {
+    if (hasRequiredCustomQuantity(line)) {
+      return positiveQuantity(line.received_sales_qty);
+    }
     return positiveQuantity(line.received_piece_qty)
       || positiveQuantity(line.received_section_qty)
       || positiveQuantity(line.received_layer_qty)
@@ -75,6 +78,14 @@ function receivedSalesQuantity(line) {
 function receivingUnitAvailability(line) {
   const salesAvailable = remainingSalesQuantity(line);
   if (!hasConversion(line)) {
+    if (hasRequiredCustomQuantity(line)) {
+      return {
+        pallets: positiveQuantity(line.pallet_qty),
+        layers: positiveQuantity(line.layer_qty),
+        sections: positiveQuantity(line.section_qty),
+        pieces: positiveQuantity(line.piece_qty)
+      };
+    }
     return { pallets: 0, layers: 0, sections: 0, pieces: salesAvailable };
   }
   const deriveFromSales = !hasRequiredCustomQuantity(line);
@@ -91,6 +102,34 @@ function receivingUnitAvailability(line) {
     sections: unitAvailable("sections"),
     pieces: unitAvailable("pieces")
   };
+}
+
+function resolveIndependentReceivedSalesQuantity(line, received, requestedSalesQty) {
+  if (hasConversion(line) || !hasRequiredCustomQuantity(line)) return 0;
+  const explicitSalesQty = positiveQuantity(requestedSalesQty);
+  const selectedPhysical = positiveQuantity(received.pallets)
+    + positiveQuantity(received.layers)
+    + positiveQuantity(received.sections)
+    + positiveQuantity(received.pieces) > 0;
+  const fullPhysical = [
+    ["pallets", "pallet_qty"],
+    ["layers", "layer_qty"],
+    ["sections", "section_qty"],
+    ["pieces", "piece_qty"]
+  ].every(([unit, field]) => {
+    const required = positiveQuantity(line[field]);
+    return required <= 0.000001 || positiveQuantity(received[unit]) + 0.000001 >= required;
+  });
+  let salesQty = explicitSalesQty;
+  if (selectedPhysical && salesQty <= 0) {
+    if (!fullPhysical) throw new Error("Enter the sales-unit quantity when partially receiving a manual PLT/LYR/SEC/PCS line.");
+    salesQty = remainingSalesQuantity(line);
+  }
+  const available = remainingSalesQuantity(line);
+  if (salesQty > available + 0.000001) {
+    throw new Error("Received sales quantity cannot exceed " + roundQuantity(available) + " " + (line.unit || "sales units") + ".");
+  }
+  return roundQuantity(salesQty);
 }
 
 function remainingLineQuantities(line) {
@@ -175,6 +214,7 @@ function hasReceivingDisplayQuantity(line) {
     || positiveQuantity(line.received_layer_qty) > 0
     || positiveQuantity(line.received_section_qty) > 0
     || positiveQuantity(line.received_piece_qty) > 0
+    || positiveQuantity(line.received_sales_qty) > 0
     || Boolean(line.sync_exception);
 }
 
@@ -373,7 +413,7 @@ export async function getReceivingOrder(orderId) {
               pallet_qty, layer_qty, piece_qty, section_qty, to_plt, to_lyr, to_sec, to_pcs,
               netsuite_active, sync_exception, synced_at, received_pallet_qty,
               received_layer_qty, received_piece_qty, received_section_qty, NULL::timestamptz AS confirmed_at,
-              NULL::text AS confirmed_by, netsuite_received_qty, netsuite_received_baseline_qty
+              NULL::text AS confirmed_by, netsuite_received_qty, netsuite_received_baseline_qty, pack_quantity_source, received_sales_qty
        FROM purchase_order_lines
        UNION ALL
        SELECT transfer_order_id AS order_id, id, line_id, item_id, item_name, item_type,
@@ -382,7 +422,7 @@ export async function getReceivingOrder(orderId) {
               netsuite_active, sync_exception, synced_at, received_pallet_qty,
               received_layer_qty, received_piece_qty, received_section_qty, NULL::timestamptz AS confirmed_at,
               NULL::text AS confirmed_by, netsuite_received_qty,
-              netsuite_received_qty AS netsuite_received_baseline_qty
+              netsuite_received_qty AS netsuite_received_baseline_qty, pack_quantity_source, received_sales_qty
        FROM transfer_order_lines
        WHERE line_stage = 'receiving'
      )
@@ -421,7 +461,7 @@ export async function confirmReceivingLine(orderId, lineRowId, values, operatorI
               pallet_qty, layer_qty, piece_qty, section_qty, to_plt, to_lyr, to_sec, to_pcs,
               netsuite_active, sync_exception, synced_at, received_pallet_qty,
               received_layer_qty, received_piece_qty, received_section_qty, netsuite_received_qty,
-              netsuite_received_baseline_qty
+              netsuite_received_baseline_qty, pack_quantity_source, received_sales_qty
        FROM purchase_order_lines
        UNION ALL
        SELECT 'transfer_order'::text AS order_type, transfer_order_id AS order_id, id, line_id, item_id, item_name, item_type,
@@ -429,7 +469,7 @@ export async function confirmReceivingLine(orderId, lineRowId, values, operatorI
               pallet_qty, layer_qty, piece_qty, section_qty, to_plt, to_lyr, to_sec, to_pcs,
               netsuite_active, sync_exception, synced_at, received_pallet_qty,
               received_layer_qty, received_piece_qty, received_section_qty, netsuite_received_qty,
-              netsuite_received_qty AS netsuite_received_baseline_qty
+              netsuite_received_qty AS netsuite_received_baseline_qty, pack_quantity_source, received_sales_qty
        FROM transfer_order_lines
        WHERE line_stage = 'receiving'
      )
@@ -453,6 +493,8 @@ export async function confirmReceivingLine(orderId, lineRowId, values, operatorI
   const layers = Math.min(positiveQuantity(values.layers), available.layers);
   const sections = Math.min(positiveQuantity(values.sections), available.sections);
   const pieces = Math.min(positiveQuantity(values.pieces), available.pieces);
+  const received = { pallets, layers, sections, pieces };
+  const receivedSalesQty = resolveIndependentReceivedSalesQuantity(current, received, values.salesQty);
   if (current.order_type === "transfer_order") {
     await query(
       `UPDATE transfer_order_lines
@@ -460,12 +502,13 @@ export async function confirmReceivingLine(orderId, lineRowId, values, operatorI
            received_layer_qty = $4,
            received_section_qty = $5,
            received_piece_qty = $6,
+           received_sales_qty = $8,
            confirmed_at = now(),
            confirmed_by = $7
        WHERE id = $1
          AND transfer_order_id = $2
          AND line_stage = 'receiving'`,
-      [lineRowId, orderId, pallets, layers, sections, pieces, operatorId || null]
+      [lineRowId, orderId, pallets, layers, sections, pieces, operatorId || null, receivedSalesQty]
     );
   } else {
     await query(
@@ -474,11 +517,12 @@ export async function confirmReceivingLine(orderId, lineRowId, values, operatorI
            received_layer_qty = $4,
            received_section_qty = $5,
            received_piece_qty = $6,
+           received_sales_qty = $8,
            confirmed_at = now(),
            confirmed_by = $7
        WHERE id = $1
          AND purchase_order_id = $2`,
-      [lineRowId, orderId, pallets, layers, sections, pieces, operatorId || null]
+      [lineRowId, orderId, pallets, layers, sections, pieces, operatorId || null, receivedSalesQty]
     );
   }
   await writeAudit({
@@ -486,7 +530,7 @@ export async function confirmReceivingLine(orderId, lineRowId, values, operatorI
     source: "receiving",
     action: "receiving.line.confirm",
     lineId: current.line_id,
-    details: { receivingOrderId: orderId, pallets, layers, sections, pieces }
+    details: { receivingOrderId: orderId, pallets, layers, sections, pieces, salesQty: receivedSalesQty }
   });
   return getReceivingOrder(orderId);
 }
@@ -530,6 +574,7 @@ export async function unconfirmReceivingLine(orderId, lineRowId, operatorId) {
               received_layer_qty = 0,
               received_section_qty = 0,
               received_piece_qty = 0,
+              received_sales_qty = 0,
               confirmed_at = null,
               confirmed_by = null
         WHERE id = $1
@@ -544,6 +589,7 @@ export async function unconfirmReceivingLine(orderId, lineRowId, operatorId) {
               received_layer_qty = 0,
               received_section_qty = 0,
               received_piece_qty = 0,
+              received_sales_qty = 0,
               confirmed_at = null,
               confirmed_by = null
         WHERE id = $1
@@ -619,7 +665,7 @@ function receiptLineQuantity(line) {
     || positiveQuantity(line.received_pallet_qty);
   const remaining = remainingSalesQuantity(line);
   if (!hasConversion(line)) {
-    const quantity = hasRequiredCustomQuantity(line) ? (positiveQuantity(line.quantity) || baseQuantity) : baseQuantity;
+    const quantity = hasRequiredCustomQuantity(line) ? positiveQuantity(line.received_sales_qty) : baseQuantity;
     return roundQuantity(Math.min(quantity, remaining || quantity));
   }
   const convertedQuantity = (positiveQuantity(line.received_pallet_qty) * positiveQuantity(line.to_plt))

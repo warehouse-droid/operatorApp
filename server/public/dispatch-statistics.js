@@ -224,8 +224,8 @@ function renderRecentStops() {
               <span>${escapeHtml((row.orderRefs || []).join(", ") || row.stopType)}</span>
             </div>
             <div>
-              <strong>${row.status === "complete" ? durationText(row.actualMinutes) : t("stats.started", "Started")}</strong>
-              <span>${dateTimeText(row.startedAt)}${row.completedAt ? ` - ${dateTimeText(row.completedAt)}` : ""}</span>
+              <strong>${row.status === "complete" ? `${durationText(row.actualMinutes)} ${t("stats.net", "net")}` : t("stats.started", "Started")}</strong>
+              <span>${dateTimeText(row.startedAt)}${row.completedAt ? ` - ${dateTimeText(row.completedAt)}` : ""}${row.restMinutes > 0 ? ` | ${t("stats.gross", "Gross")} ${durationText(row.grossMinutes)} - ${t("stats.restDeducted", "rest")} ${durationText(row.restMinutes)}` : ""}</span>
             </div>
             <div>
               <strong class="${row.overrunMinutes > 0 ? "stats-warn-text" : ""}">${row.status === "complete" ? durationText(row.overrunMinutes) : "--"}</strong>
@@ -261,7 +261,7 @@ function render() {
     <section class="stats-page">
       <div class="stats-note">
         <strong>${t("stats.currentCalculation", "Current calculation:")}</strong>
-        <span>${t("stats.calculationHelp", "Actual stop time is Driver PWA Start to Confirm. Planned overrun compares actual stop service time with driver/truck timing rules. Google route leg history is not persisted yet, so drive-time overrun is not included here.")}</span>
+        <span>${t("stats.calculationHelp", "Net stop time is Driver PWA Start to Confirm minus any overlapping driver rest sessions. Planned overrun compares this rest-adjusted service time with driver/truck timing rules. Google route leg history is not persisted yet, so drive-time overrun is not included here.")}</span>
       </div>
       ${state.error ? `<div class="route-notice visible danger">${escapeHtml(state.error)}</div>` : ""}
       ${state.loading ? `<div class="stats-loading">${t("stats.loading", "Loading statistics...")}</div>` : `
@@ -271,6 +271,7 @@ function render() {
           ${kpiCard(t("stats.vendorYardAvg", "Vendor Yard Avg"), `${numberText(summary.averageVendorYardStopMinutes || 0, 1)} ${t("stats.min", "min")}`, t("stats.vendorYardNote", "Vendor pickup stops"))}
           ${kpiCard(t("stats.deliveryPerPlt", "Delivery / PLT"), summary.deliveryMinutesPerPallet ? `${numberText(summary.deliveryMinutesPerPallet, 1)} ${t("stats.min", "min")}` : "--", t("stats.deliverySpeed", "Customer drop speed"))}
           ${kpiCard(t("stats.overPlanned", "Over Planned"), durationText(summary.totalOverrunMinutes || 0), `${numberText(summary.averageOverrunMinutes || 0, 1)} ${t("stats.min", "min")} ${t("stats.avg", "avg")}`)}
+          ${kpiCard(t("stats.restDeducted", "Rest Deducted"), durationText(summary.totalRestMinutes || 0), t("stats.restDeductedNote", "Overlap removed from stop service time"))}
           ${kpiCard(t("stats.photoRate", "Photo Rate"), `${numberText(summary.photoRate || 0, 0)}%`, t("stats.photoRateNote", "Completed stops with photos"))}
         </div>
         <div class="stats-chart-grid">

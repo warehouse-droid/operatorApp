@@ -2274,7 +2274,7 @@ label span {
 
 .photo-slot-row {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
   gap: 8px;
 }
 
@@ -2291,6 +2291,16 @@ label span {
 .photo-slot-row button.active {
   border-color: var(--accent);
   background: #e8f6f3;
+}
+
+.photo-list-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.photo-list-actions button {
+  flex: 1 1 150px;
 }
 
 .fulfillment-card input[type="file"] {

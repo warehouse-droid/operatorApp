@@ -1,11 +1,144 @@
 const app = document.getElementById("controlApp");
 const TOKEN_KEY = "mbbs.control.token";
+const STAFF_TOKEN_KEY = "mbbs.staff.token";
+const STAFF_ROLE_KEY = "mbbs.staff.role";
+const STAFF_ROLES_KEY = "mbbs.staff.roles";
+const ACCOUNT_ROLE_OPTIONS = [
+  { value: "operator", labelKey: "control.roleOperator", label: "Operator" },
+  { value: "dispatcher", labelKey: "control.roleDispatcher", label: "Dispatcher" },
+  { value: "scm", labelKey: "control.roleScm", label: "SCM Staff" },
+  { value: "yard_manager", labelKey: "control.roleYardManager", label: "Yard Manager" },
+  { value: "admin", labelKey: "control.roleAdmin", label: "Admin" }
+];
+const IS_ADMIN_PAGE = window.location.pathname.startsWith("/admin");
+const SECTION_STORAGE_KEY = IS_ADMIN_PAGE ? "mbbs.admin.section" : "mbbs.control.section";
+const ACCOUNT_SELECTION_KEY = "mbbs.admin.selectedAccount";
+const ADMIN_SECTIONS = new Set(["dashboard", "operators", "sync", "storage", "audit"]);
+const CONTROL_SECTIONS = new Set(["dashboard", "locks", "classification", "vendor-mapping", "warnings", "loaded-export", "cycle-count", "fulfillment"]);
+const CONTROL_SECTION_ROUTES = {
+  dashboard: "/control",
+  locks: "/control/order-locks",
+  classification: "/control/item-classification",
+  "vendor-mapping": "/control/vendor-mapping",
+  warnings: "/control/operator-warnings",
+  "loaded-export": "/control/yard-in-outbound",
+  "cycle-count": "/control/cycle-count-review",
+  fulfillment: "/control/operator-load-records"
+};
+const CONTROL_ROUTE_SECTIONS = Object.fromEntries(
+  Object.entries(CONTROL_SECTION_ROUTES).map(([section, route]) => [route, section])
+);
+const PAGE_SECTIONS = IS_ADMIN_PAGE ? ADMIN_SECTIONS : CONTROL_SECTIONS;
 const t = (key, fallback) => window.MBBS_I18N?.t(key, fallback) || fallback;
 const languageToggle = () => window.MBBS_I18N?.toggleHtml() || "";
 
-let token = localStorage.getItem(TOKEN_KEY) || "";
+function normalizedRole(value) {
+  return String(value || "").trim().toLowerCase().replaceAll("-", "_").replaceAll(" ", "_");
+}
+
+function normalizedStaffRoles(account) {
+  return [...new Set([
+    ...(Array.isArray(account?.roles) ? account.roles : []),
+    account?.role
+  ].map(normalizedRole).filter(Boolean))];
+}
+
+function hasStaffAuthority(account, allowedRoles) {
+  const granted = new Set(normalizedStaffRoles(account));
+  return allowedRoles.some((role) => granted.has(normalizedRole(role)));
+}
+
+function operatorRoleLabel(role) {
+  const option = ACCOUNT_ROLE_OPTIONS.find((entry) => entry.value === normalizedRole(role));
+  return option ? t(option.labelKey, option.label) : String(role || "");
+}
+
+function renderRoleOptions(selectedRole) {
+  const selected = normalizedRole(selectedRole);
+  return ACCOUNT_ROLE_OPTIONS.map((option) => `
+    <option value="${option.value}" ${option.value === selected ? "selected" : ""}>${t(option.labelKey, option.label)}</option>
+  `).join("");
+}
+
+function renderAuthorityChoices(selectedRoles, attributeName) {
+  const selected = new Set((selectedRoles || []).map(normalizedRole));
+  return ACCOUNT_ROLE_OPTIONS.map((option) => `
+    <label class="authority-choice">
+      <input type="checkbox" ${attributeName} value="${option.value}" ${selected.has(option.value) ? "checked" : ""} />
+      <span>${t(option.labelKey, option.label)}</span>
+    </label>
+  `).join("");
+}
+
+function roleHomeRoute(role) {
+  const clean = normalizedRole(role);
+  if (clean === "admin") return "/admin";
+  if (clean === "dispatcher") return "/dispatch";
+  if (clean === "scm" || clean === "scm_staff") return "/scm";
+  if (clean === "yard_manager") return "/control";
+  if (clean === "operator") return "/operator";
+  return "/";
+}
+
+function readStaffToken() {
+  return localStorage.getItem(STAFF_TOKEN_KEY)
+    || localStorage.getItem(TOKEN_KEY)
+    || localStorage.getItem("mbbs.dispatch.token")
+    || localStorage.getItem("mbbs.operator.token")
+    || "";
+}
+
+function storeStaffSession(nextToken, nextOperator) {
+  token = nextToken || "";
+  if (token) {
+    localStorage.setItem(STAFF_TOKEN_KEY, token);
+    localStorage.setItem(TOKEN_KEY, token);
+  }
+  if (nextOperator?.role) localStorage.setItem(STAFF_ROLE_KEY, normalizedRole(nextOperator.role));
+  localStorage.setItem(STAFF_ROLES_KEY, JSON.stringify(normalizedStaffRoles(nextOperator)));
+}
+
+function clearStaffSession() {
+  for (const key of [STAFF_TOKEN_KEY, STAFF_ROLE_KEY, STAFF_ROLES_KEY, "mbbs.control.token", "mbbs.dispatch.token", "mbbs.operator.token"]) {
+    localStorage.removeItem(key);
+  }
+  token = "";
+}
+
+function canAccessCurrentPage(account) {
+  return IS_ADMIN_PAGE
+    ? hasStaffAuthority(account, ["admin"])
+    : hasStaffAuthority(account, ["admin", "yard_manager"]);
+}
+
+function normalizedSection(value) {
+  return PAGE_SECTIONS.has(value) ? value : "dashboard";
+}
+
+function sectionFromCurrentRoute() {
+  if (IS_ADMIN_PAGE) return null;
+  return CONTROL_ROUTE_SECTIONS[window.location.pathname] || null;
+}
+
+function routeForSection(section) {
+  return IS_ADMIN_PAGE ? "/admin" : (CONTROL_SECTION_ROUTES[normalizedSection(section)] || "/control");
+}
+
+function setActiveSection(section, { updateRoute = true } = {}) {
+  activeSection = normalizedSection(section);
+  localStorage.setItem(SECTION_STORAGE_KEY, activeSection);
+  if (updateRoute && !IS_ADMIN_PAGE) {
+    const route = routeForSection(activeSection);
+    if (window.location.pathname !== route) window.history.pushState({ controlSection: activeSection }, "", route);
+    window.dispatchEvent(new Event("mbbs-sidebar-route-changed"));
+  }
+  render();
+}
+
+let token = readStaffToken();
 let operator = null;
 let operators = [];
+let selectedOperatorId = localStorage.getItem(ACCOUNT_SELECTION_KEY) || "";
 let audit = [];
 let classifications = [];
 let cycleRecords = [];
@@ -17,14 +150,22 @@ let loadedSearchResults = [];
 let loadedOrderDetail = null;
 let selectedLoadedOrderKey = "";
 let syncSettings = { mode: "manual", running: false, lastStatus: "idle" };
+let photoArchiveSettings = {
+  mode: "off",
+  intervalMinutes: 1440,
+  running: false,
+  lastStatus: "idle",
+  stats: {}
+};
 let envSettings = { activeEnvFile: ".env", selectedEnvFile: ".env", restartRequired: false, files: [] };
 let vendorMappings = { localVendors: [], mappings: [] };
 let vendorMappingTab = localStorage.getItem("mbbs.control.vendorMapping.tab") || "links";
 const USE_NETSUITE_ADDRESS_VENDOR = "__USE_NETSUITE_ADDRESS__";
 let classificationSearch = "";
 let bootstrapNeeded = false;
-let activeSection = localStorage.getItem("mbbs.control.section") || "dashboard";
+let activeSection = normalizedSection(sectionFromCurrentRoute() || localStorage.getItem(SECTION_STORAGE_KEY) || "dashboard");
 let syncPollTimer = null;
+let photoArchivePollTimer = null;
 
 function todayKey() {
   const date = new Date();
@@ -41,6 +182,16 @@ let loadedFilters = {
   yard: localStorage.getItem("mbbs.control.loaded.yard") || "all"
 };
 let loadedSearchTerm = localStorage.getItem("mbbs.control.loaded.search") || "";
+let loadedItemSearchTerm = localStorage.getItem("mbbs.control.loaded.itemSearch") || "";
+let loadedDirection = localStorage.getItem("mbbs.control.loaded.direction") === "inbound" ? "inbound" : "outbound";
+const loadedTypeByDirection = {
+  inbound: ["purchase_order", "transfer_order", "co_order"].includes(localStorage.getItem("mbbs.control.loaded.inboundType"))
+    ? localStorage.getItem("mbbs.control.loaded.inboundType")
+    : "purchase_order",
+  outbound: ["sales_order", "transfer_order", "vrma_order"].includes(localStorage.getItem("mbbs.control.loaded.outboundType"))
+    ? localStorage.getItem("mbbs.control.loaded.outboundType")
+    : "sales_order"
+};
 let loadedSearchTimer = null;
 let loadedSearchSeq = 0;
 let loadedSearchLoading = false;
@@ -61,19 +212,42 @@ async function request(path, options = {}) {
     ...options
   });
   if (response.status === 401) {
-    token = "";
+    clearStaffSession();
     operator = null;
-    localStorage.removeItem(TOKEN_KEY);
     renderLogin("Please login again.");
     throw new Error("Login required");
   }
-  if (!response.ok) throw new Error(await response.text());
+  if (!response.ok) {
+    const text = await response.text();
+    let payload = null;
+    try {
+      payload = text ? JSON.parse(text) : null;
+    } catch {
+      payload = null;
+    }
+    if (response.status === 403 && payload?.redirect) {
+      window.location.replace(payload.redirect);
+      throw new Error(payload.error || "Not authorized");
+    }
+    throw new Error(payload?.error || text || "Request failed");
+  }
   return response.json();
 }
 
 function formatDate(value) {
   if (!value) return "";
   return window.MBBS_I18N?.displayDateTime(value) || "";
+}
+
+function formatBytes(value) {
+  let amount = Math.max(0, Number(value || 0));
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let unit = 0;
+  while (amount >= 1024 && unit < units.length - 1) {
+    amount /= 1024;
+    unit += 1;
+  }
+  return `${amount.toLocaleString(undefined, { maximumFractionDigits: unit ? 2 : 0 })} ${units[unit]}`;
 }
 
 function escapeHtml(value) {
@@ -165,7 +339,7 @@ function clearSyncPoll() {
 
 function scheduleSyncPoll() {
   clearSyncPoll();
-  if (!operator || !syncSettings.running) return;
+  if (!IS_ADMIN_PAGE || !operator || !syncSettings.running) return;
   syncPollTimer = setTimeout(pollSyncStatus, 3000);
 }
 
@@ -187,11 +361,40 @@ async function pollSyncStatus() {
   }
 }
 
+function clearPhotoArchivePoll() {
+  clearTimeout(photoArchivePollTimer);
+  photoArchivePollTimer = null;
+}
+
+function schedulePhotoArchivePoll() {
+  clearPhotoArchivePoll();
+  if (!IS_ADMIN_PAGE || !operator || !photoArchiveSettings.running) return;
+  photoArchivePollTimer = setTimeout(pollPhotoArchiveStatus, 3000);
+}
+
+async function pollPhotoArchiveStatus() {
+  if (!operator) return;
+  const wasRunning = Boolean(photoArchiveSettings.running);
+  try {
+    photoArchiveSettings = await request("/api/admin/photo-archive");
+    if (wasRunning && !photoArchiveSettings.running) {
+      await loadControlData();
+      return;
+    }
+    if (["dashboard", "storage"].includes(activeSection)) render();
+  } catch (error) {
+    console.warn(error);
+  } finally {
+    schedulePhotoArchivePoll();
+  }
+}
+
 function renderLogin(message = "") {
   clearSyncPoll();
+  clearPhotoArchivePoll();
   app.innerHTML = `
     <section class="panel login">
-      <h1>${t("control.operatorControl", "MBBS Operator Control")}</h1>
+      <h1>${IS_ADMIN_PAGE ? "MBBS Administration" : t("control.operatorControl", "MBBS Yard Control")}</h1>
       ${bootstrapNeeded ? `<div class="notice">${t("control.noAccountBootstrap", "No account exists yet. Create the first admin account.")}</div>` : ""}
       ${message ? `<div class="notice">${message}</div>` : ""}
       <form class="form-grid" data-form="${bootstrapNeeded ? "bootstrap" : "login"}">
@@ -257,53 +460,34 @@ function render() {
       <header class="topbar">
         <div>
           <p class="muted">${t("app.control", "MBBS Yard Server")}</p>
-          <h1>${t("control.operatorControl", "Operator Control")}</h1>
+          <h1>${IS_ADMIN_PAGE ? "Administration" : t("control.operatorControl", "Yard Control")}</h1>
         </div>
         <div class="topbar-language">${languageToggle()}</div>
         <div class="actions">
-          <button onclick="location.href='/operator'">${t("control.openOperator", "Open Operator PWA")}</button>
+          ${IS_ADMIN_PAGE
+            ? `<button onclick="location.href='/control'">Open Control</button>`
+            : `<button onclick="location.href='/operator'">${t("control.openOperator", "Open Operator PWA")}</button>${hasStaffAuthority(operator, ["admin"]) ? `<button onclick="location.href='/admin'">Admin</button>` : ""}`}
           <button data-action="refresh">${t("common.refresh", "Refresh")}</button>
           <button data-action="logout">${t("common.logout", "Logout")} ${operator.display_name}</button>
         </div>
       </header>
-      <div class="control-layout">
-        <nav class="control-menu">
-          ${renderMenuButton("dashboard", t("control.dashboard", "Dashboard"), t("control.quickStatus", "Quick status and shortcuts"))}
-          ${renderMenuButton("operators", t("control.accountManagement", "Account Management"), t("control.accountManagementDesc", "Register and manage accounts"))}
-          ${renderMenuButton("locks", t("control.orderLocks", "Order Locks"), t("control.orderLocksDesc", "Release stuck preparing orders"))}
-          ${renderMenuButton("classification", t("control.itemClassification", "Item Classification"), t("control.itemClassificationDesc", "Maintain type, brand, series"))}
-          ${renderMenuButton("vendor-mapping", t("control.vendorMapping", "Vendor Mapping"), t("control.vendorMappingDesc", "Map NetSuite vendors to local vendors"))}
-          ${renderMenuButton("sync", t("control.syncSettings", "Sync Settings"), t("control.syncSettingsDesc", "Auto or manual NetSuite sync"))}
-          ${renderMenuButton("warnings", t("control.operatorWarnings", "Operator Warnings"), t("control.operatorWarningsDesc", "Handle reported record problems"))}
-          ${renderMenuButton("loaded-export", t("control.loadedExport", "Loaded Export"), t("control.loadedExportDesc", "View and export loaded SO / TO"))}
-          ${renderMenuButton("cycle-count", t("control.cycleCountReview", "Cycle Count Review"), t("control.cycleCountReviewDesc", "Review submitted blind counts"))}
-          ${renderMenuButton("fulfillment", t("control.operatorLoadRecords", "Operator Load Records"), t("control.operatorLoadRecordsDesc", "Review load/photo records"))}
-          ${renderMenuButton("audit", t("control.auditLog", "Audit Log"), t("control.auditLogDesc", "Trace operator and sync actions"))}
-        </nav>
-        <section class="control-content">
-          ${renderActiveSection()}
-        </section>
-      </div>
+      <section class="control-content">
+        ${renderActiveSection()}
+      </section>
     </section>
   `;
   restoreControlFocus(focusState);
+  schedulePhotoArchivePoll();
   scheduleSyncPoll();
 }
 
-function renderMenuButton(section, title, subtitle) {
-  return `
-    <button class="menu-button ${activeSection === section ? "active" : ""}" data-action="control-section" data-section="${section}" type="button">
-      <strong>${title}</strong>
-      <span>${subtitle}</span>
-    </button>
-  `;
-}
-
 function renderActiveSection() {
+  activeSection = normalizedSection(activeSection);
   if (activeSection === "operators") return renderOperatorsSection();
   if (activeSection === "locks") return renderLocksSection();
   if (activeSection === "classification") return renderClassificationSection();
   if (activeSection === "vendor-mapping") return renderVendorMappingSection();
+  if (activeSection === "storage") return renderStorageSection();
   if (activeSection === "sync") return renderSyncSection();
   if (activeSection === "warnings") return renderWarningsSection();
   if (activeSection === "loaded-export") return renderLoadedExportSection();
@@ -314,30 +498,46 @@ function renderActiveSection() {
 }
 
 function renderDashboardSection() {
-  const activeOperators = operators.filter((item) => item.active).length;
+  if (IS_ADMIN_PAGE) {
+    const activeOperators = operators.filter((item) => item.active).length;
+    return `
+      <div class="dashboard-grid">
+        <button class="metric-card" data-action="control-section" data-section="operators" type="button">
+          <span>${t("control.accounts", "Accounts")}</span>
+          <strong>${activeOperators} / ${operators.length}</strong>
+          <em>${t("control.activeAccounts", "active accounts")}</em>
+        </button>
+        <button class="metric-card" data-action="control-section" data-section="sync" type="button">
+          <span>${t("control.netsuiteSync", "NetSuite Sync")}</span>
+          <strong>${syncSettings.mode === "auto" ? t("control.auto", "Auto") : t("control.manual", "Manual")}</strong>
+          <em>${syncSettings.running ? t("control.syncRunning", "sync running") : syncSettings.lastStatus || "idle"}</em>
+        </button>
+        <button class="metric-card ${photoArchiveSettings.lastStatus === "partial" || photoArchiveSettings.lastStatus === "failed" ? "warning" : ""}" data-action="control-section" data-section="storage" type="button">
+          <span>Photo Storage</span>
+          <strong>${photoArchiveSettings.mode === "off" ? "Off" : photoArchiveSettings.mode === "auto" ? "Auto" : "Manual"}</strong>
+          <em>${photoArchiveSettings.stats?.referencedArchivedCount || 0} / ${photoArchiveSettings.stats?.referencedR2Count || 0} photos archived locally</em>
+        </button>
+        <button class="metric-card" data-action="control-section" data-section="audit" type="button">
+          <span>${t("control.auditLog", "Audit Log")}</span>
+          <strong>${audit.length}</strong>
+          <em>login and application records loaded</em>
+        </button>
+      </div>
+      <section class="panel">
+        <h2>Administration</h2>
+        <p class="muted">Manage application access, NetSuite synchronization, photo storage, and security audit history. Yard operations remain under Control.</p>
+        <div class="actions"><button onclick="location.href='/control'">Open Control</button></div>
+      </section>
+    `;
+  }
   const classified = classifications.filter((item) => item.product_type || item.brand || item.series).length;
   const openWarnings = recordWarnings.filter((item) => item.status === "open").length;
   return `
     <div class="dashboard-grid">
-      <button class="metric-card" data-action="control-section" data-section="operators" type="button">
-        <span>${t("control.accounts", "Accounts")}</span>
-        <strong>${activeOperators} / ${operators.length}</strong>
-        <em>${t("control.activeAccounts", "active accounts")}</em>
-      </button>
       <button class="metric-card" data-action="control-section" data-section="classification" type="button">
         <span>${t("control.itemClassification", "Item Classification")}</span>
         <strong>${classified} / ${classifications.length}</strong>
         <em>${t("control.loadedRowsClassified", "loaded rows classified")}</em>
-      </button>
-      <button class="metric-card" data-action="control-section" data-section="audit" type="button">
-        <span>${t("control.auditLog", "Audit Log")}</span>
-        <strong>${audit.length}</strong>
-        <em>${t("control.latestRecordsLoaded", "latest records loaded")}</em>
-      </button>
-      <button class="metric-card" data-action="control-section" data-section="sync" type="button">
-        <span>${t("control.netsuiteSync", "NetSuite Sync")}</span>
-        <strong>${syncSettings.mode === "auto" ? t("control.auto", "Auto") : t("control.manual", "Manual")}</strong>
-        <em>${syncSettings.running ? t("control.syncRunning", "sync running") : syncSettings.lastStatus || "idle"}</em>
       </button>
       <button class="metric-card ${openWarnings ? "warning" : ""}" data-action="control-section" data-section="warnings" type="button">
         <span>${t("control.operatorWarnings", "Operator Warnings")}</span>
@@ -360,14 +560,19 @@ function renderDashboardSection() {
         <em>${t("control.latestLoadRecords", "latest load records")}</em>
       </button>
       <button class="metric-card" data-action="control-section" data-section="loaded-export" type="button">
-        <span>${t("control.loadedExport", "Loaded Export")}</span>
+        <span>${t("control.loadedExport", "Yard In/Outbound")}</span>
         <strong>${loadedOrders.length}</strong>
-        <em>${t("control.filteredLoaded", "filtered loaded SO / TO")}</em>
+        <em>${t("control.filteredLoaded", "processed movements in the selected tab")}</em>
+      </button>
+      <button class="metric-card" data-action="control-section" data-section="vendor-mapping" type="button">
+        <span>${t("control.vendorMapping", "Vendor Mapping")}</span>
+        <strong>${vendorMappings.mappings?.length || 0}</strong>
+        <em>local vendor links</em>
       </button>
     </div>
     <section class="panel">
-      <h2>${t("control.operatorControl", "Control Panel")}</h2>
-      <p class="muted">${t("control.panelIntro", "Use the left menu to register operators, maintain item classification, or review audit history.")}</p>
+      <h2>${t("control.operatorControl", "Yard Control")}</h2>
+      <p class="muted">Use the left menu to manage yard records, classifications, warnings, locks, and load history.</p>
       <div class="actions">
         <button class="primary" data-action="sync-inventory">${t("control.syncInventory", "Sync Inventory")}</button>
         <button data-action="refresh">${t("control.refreshAll", "Refresh All")}</button>
@@ -559,7 +764,100 @@ function renderLocalVendorManagement() {
 }
 
 function loadedOrderKey(order) {
-  return `${order.order_type}:${order.order_id}`;
+  return `${order.direction}:${order.order_type}:${order.order_id}`;
+}
+
+const YARD_MOVEMENT_TYPES = {
+  inbound: ["purchase_order", "transfer_order", "co_order"],
+  outbound: ["sales_order", "transfer_order", "vrma_order"]
+};
+
+function selectedLoadedOrderType() {
+  return loadedTypeByDirection[loadedDirection];
+}
+
+function movementTypeCode(orderType) {
+  return {
+    sales_order: "SO",
+    transfer_order: "TO",
+    purchase_order: "PO",
+    co_order: "CO",
+    vrma_order: "VRMA"
+  }[orderType] || String(orderType || "").toUpperCase();
+}
+
+function movementTypeLabel(orderType) {
+  return {
+    sales_order: t("yard.salesOrder", "Sales Order"),
+    transfer_order: t("yard.transferOrder", "Transfer Order"),
+    purchase_order: t("yard.purchaseOrder", "Purchase Order"),
+    co_order: t("yard.coOrder", "CO Order"),
+    vrma_order: "VRMA"
+  }[orderType] || orderType;
+}
+
+function movementQuantity(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return escapeHtml(valueText(value));
+  return numeric.toLocaleString(undefined, { maximumFractionDigits: 6 });
+}
+
+function movementMixedUnits(line) {
+  const processedQty = Number(line.processed_qty || 0);
+  const definitions = [
+    { label: "PLT", direct: "processed_pallet_qty", conversion: "to_plt" },
+    { label: "LYR", direct: "processed_layer_qty", conversion: "to_lyr" },
+    { label: "SEC", direct: "processed_section_qty", conversion: "to_sec" },
+    { label: "PCS", direct: "processed_piece_qty", conversion: "to_pcs" }
+  ].map((definition) => ({
+    ...definition,
+    directQty: Math.max(0, Number(line[definition.direct] || 0)),
+    conversionQty: Math.max(0, Number(line[definition.conversion] || 0))
+  }));
+  const hasConversion = definitions.some((definition) => definition.conversionQty > 0);
+  const directSalesQty = definitions.reduce(
+    (sum, definition) => sum + (definition.directQty * definition.conversionQty),
+    0
+  );
+  const useDirect = definitions.some((definition) => definition.directQty > 0 && definition.conversionQty > 0)
+    && Math.abs(directSalesQty - processedQty) <= 0.1;
+  if (useDirect) {
+    return {
+      hasConversion,
+      remainder: 0,
+      units: definitions
+        .filter((definition) => definition.directQty > 0 && definition.conversionQty > 0)
+        .map((definition) => ({ label: definition.label, value: definition.directQty }))
+    };
+  }
+  let remainder = Math.max(0, processedQty);
+  const units = [];
+  definitions.forEach((definition) => {
+    if (definition.conversionQty <= 0 || remainder <= 0) return;
+    const value = Math.floor((remainder / definition.conversionQty) + 0.000001);
+    if (value <= 0) return;
+    units.push({ label: definition.label, value });
+    remainder = Math.max(0, remainder - (value * definition.conversionQty));
+  });
+  return {
+    hasConversion,
+    units,
+    remainder: remainder <= 0.1 ? 0 : Math.round(remainder * 1000000) / 1000000
+  };
+}
+
+function renderMovementQuantityEquation(line) {
+  const salesUom = line.processed_uom || line.unit || "";
+  const mixed = movementMixedUnits(line);
+  const salesTerm = `<span class="movement-quantity-term sales"><b>${movementQuantity(line.processed_qty)}</b><small>${escapeHtml(salesUom)}</small></span>`;
+  if (!mixed.units.length) {
+    return `<div class="movement-quantity-equation single">${salesTerm}</div>${!mixed.hasConversion ? `<small class="converted-uom-empty">${t("yard.noConversion", "No item conversion")}</small>` : ""}`;
+  }
+  const terms = [
+    ...mixed.units.map((unit) => `<span class="movement-quantity-term"><b>${movementQuantity(unit.value)}</b><small>${unit.label}</small></span>`),
+    ...(mixed.remainder > 0 ? [`<span class="movement-quantity-term remainder"><b>${movementQuantity(mixed.remainder)}</b><small>${escapeHtml(salesUom)}</small></span>`] : [])
+  ];
+  return `<div class="movement-quantity-equation">${terms.join('<i class="movement-quantity-join">&amp;</i>')}<i class="movement-quantity-equals">=</i>${salesTerm}</div>`;
 }
 
 function loadedOrdersQuery() {
@@ -567,6 +865,8 @@ function loadedOrdersQuery() {
   params.set("from", loadedFilters.from || todayKey());
   params.set("to", loadedFilters.to || loadedFilters.from || todayKey());
   params.set("yard", loadedFilters.yard || "all");
+  params.set("direction", loadedDirection);
+  params.set("orderType", selectedLoadedOrderType());
   return params;
 }
 
@@ -575,7 +875,8 @@ function loadedSearchQuery() {
   params.set("from", "2000-01-01");
   params.set("to", "2099-12-31");
   params.set("yard", "all");
-  params.set("search", loadedSearchTerm.trim());
+  if (loadedSearchTerm.trim()) params.set("search", loadedSearchTerm.trim());
+  if (loadedItemSearchTerm.trim()) params.set("itemSearch", loadedItemSearchTerm.trim());
   return params;
 }
 
@@ -587,10 +888,11 @@ function saveLoadedFilters() {
 
 function saveLoadedSearch() {
   localStorage.setItem("mbbs.control.loaded.search", loadedSearchTerm || "");
+  localStorage.setItem("mbbs.control.loaded.itemSearch", loadedItemSearchTerm || "");
 }
 
 function isLoadedSearchActive() {
-  return loadedSearchTerm.trim().length > 0;
+  return loadedSearchTerm.trim().length > 0 || loadedItemSearchTerm.trim().length > 0;
 }
 
 function visibleLoadedOrders() {
@@ -608,6 +910,7 @@ async function loadLoadedOrderDetailForSelection() {
   const selected = findSelectedLoadedOrder();
   if (!selected) return;
   const detailParams = new URLSearchParams(isLoadedSearchActive() ? loadedSearchQuery() : loadedOrdersQuery());
+  detailParams.set("direction", selected.direction);
   detailParams.set("orderType", selected.order_type);
   detailParams.set("orderId", selected.order_id);
   loadedOrderDetail = await request(`/api/control/loaded-orders/detail?${detailParams.toString()}`);
@@ -624,8 +927,9 @@ async function loadLoadedOrders(options = {}) {
 
 async function loadLoadedSearchResults() {
   const term = loadedSearchTerm.trim();
+  const itemTerm = loadedItemSearchTerm.trim();
   const seq = ++loadedSearchSeq;
-  if (!term) {
+  if (!term && !itemTerm) {
     loadedSearchResults = [];
     loadedSearchLoading = false;
     if (!loadedOrders.some((order) => loadedOrderKey(order) === selectedLoadedOrderKey)) {
@@ -661,7 +965,7 @@ async function downloadLoadedCsv() {
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
-  link.download = `loaded-orders-${loadedFilters.from || "from"}-${loadedFilters.to || "to"}.csv`;
+  link.download = `yard-in-outbound-${loadedFilters.from || "from"}-${loadedFilters.to || "to"}.csv`;
   document.body.appendChild(link);
   link.click();
   link.remove();
@@ -674,36 +978,55 @@ function renderLoadedOrderList() {
   return `
     <div class="loaded-list-head">
       <strong>${orders.length}</strong>
-      <span>${searchActive ? `${t("control.searchResults", "search results across all dates/yards")}` : `${t("control.loadedShown", "shown / loaded")} ${loadedOrders.length}`}</span>
+      <span>${searchActive ? t("yard.globalResults", "results across all directions and order types") : `${movementTypeCode(selectedLoadedOrderType())} · ${t("yard.processed", "processed")}`}</span>
     </div>
-    ${loadedSearchLoading ? `<div class="notice"><strong>${t("control.searching", "Searching...")}</strong><span>${t("control.searchingHelp", "Checking loaded SO / TO records across all yards and dates.")}</span></div>` : ""}
+    ${loadedSearchLoading ? `<div class="notice"><strong>${t("control.searching", "Searching...")}</strong><span>${t("yard.searchingHelp", "Checking all processed yard movements across every direction, type, yard, and date.")}</span></div>` : ""}
     ${orders.map((order) => `
       <button class="loaded-order-card ${loadedOrderKey(order) === selectedLoadedOrderKey ? "active" : ""}" data-action="select-loaded-order" data-key="${escapeHtml(loadedOrderKey(order))}" type="button">
-        <strong>${escapeHtml(order.tranid || order.order_id)}</strong>
-        <span>${order.order_type === "transfer_order" ? "TO" : "SO"} | ${escapeHtml(order.outbound_location || "")} | ${escapeHtml(order.local_yard_order_status || order.operator_status || "")}</span>
-        <em>${formatDate(order.last_loaded_at)} | ${order.load_count || 0} ${t("common.load", "load")} | ${order.photo_count || 0} ${t("common.photos", "photo")}</em>
-        ${order.customer ? `<small>${escapeHtml(order.customer)}</small>` : ""}
+        <div class="movement-card-head">
+          <strong>${escapeHtml(order.tranid || order.order_id)}</strong>
+          <span class="movement-badges"><i class="movement-badge ${escapeHtml(order.direction)}">${t(`yard.${order.direction}`, order.direction)}</i><i class="movement-badge type">${movementTypeCode(order.order_type)}</i></span>
+        </div>
+        <span>${escapeHtml(order.yard_location || t("common.yard", "Yard"))} | ${escapeHtml(order.movement_status || t("yard.processed", "Processed"))}</span>
+        <em>${formatDate(order.last_processed_at)} | ${order.process_count || 0} ${t("yard.activities", "activities")} | ${order.photo_count || 0} ${t("common.photos", "photos")}</em>
+        ${order.party ? `<small>${escapeHtml(order.party)}</small>` : ""}
       </button>
-    `).join("") || (!loadedSearchLoading ? `<div class="notice"><strong>${t("control.noLoadedOrders", "No loaded orders")}</strong><span>${searchActive ? t("control.noLoadedSearch", "No loaded SO / TO record matched this search across all dates and yards.") : t("control.noLoadedFilter", "Adjust the date or yard filter, then press Apply.")}</span></div>` : "")}
+    `).join("") || (!loadedSearchLoading ? `<div class="notice"><strong>${t("yard.noMovements", "No processed yard movements")}</strong><span>${searchActive ? t("yard.noSearchResults", "No order matched either search across all dates, yards, directions, and order types.") : t("yard.noFilterResults", "No processed movement matched this direction, order type, date, and yard.")}</span></div>` : "")}
   `;
 }
 
 function renderLoadedExportSection() {
+  const searchActive = isLoadedSearchActive();
+  const typeTabs = YARD_MOVEMENT_TYPES[loadedDirection] || [];
   return `
     <section class="panel">
       <div class="section-heading">
         <div>
-          <h2>${t("control.loadedExportTitle", "Loaded SO / TO Export")}</h2>
-          <p class="muted">${t("control.loadedExportHelp", "View loaded and partially loaded Sales Orders / Transfer Orders by yard and load date.")}</p>
+          <h2>${t("control.loadedExportTitle", "Yard In/Outbound")}</h2>
+          <p class="muted">${t("control.loadedExportHelp", "Review processed receipts and loads for PO, TO, CO, SO, and VRMA orders.")}</p>
         </div>
         <button data-action="refresh-loaded-orders" type="button">${t("common.refresh", "Refresh")}</button>
       </div>
       <div class="loaded-layout">
         <aside class="loaded-left-panel">
-          <label class="loaded-search-panel">
-            <span>${t("control.orderSearch", "Order Search")}</span>
-            <input id="loadedSearch" placeholder="${t("control.orderSearchPlaceholder", "SO / TO / customer")}" value="${escapeHtml(loadedSearchTerm)}" />
-          </label>
+          <div class="loaded-search-panel loaded-search-stack">
+            <label>
+              <span>${t("control.orderSearch", "Order Search")}</span>
+              <input id="loadedSearch" placeholder="${t("yard.orderSearchPlaceholder", "Order / party / location")}" value="${escapeHtml(loadedSearchTerm)}" />
+            </label>
+            <label>
+              <span>${t("yard.itemSearch", "Item Search")}</span>
+              <input id="loadedItemSearch" placeholder="${t("yard.itemSearchPlaceholder", "SKU / item / description")}" value="${escapeHtml(loadedItemSearchTerm)}" />
+            </label>
+          </div>
+          <div class="yard-movement-tabs">
+            <div class="yard-direction-tabs" role="tablist" aria-label="${t("yard.direction", "Direction")}">
+              ${["inbound", "outbound"].map((direction) => `<button class="${loadedDirection === direction && !searchActive ? "active" : ""}" data-action="yard-direction" data-direction="${direction}" type="button">${t(`yard.${direction}`, direction === "inbound" ? "Inbound" : "Outbound")}</button>`).join("")}
+            </div>
+            <div class="yard-type-tabs" role="tablist" aria-label="${t("yard.orderType", "Order Type")}">
+              ${typeTabs.map((orderType) => `<button class="${selectedLoadedOrderType() === orderType && !searchActive ? "active" : ""}" data-action="yard-type" data-order-type="${orderType}" aria-label="${escapeHtml(movementTypeLabel(orderType))}" title="${escapeHtml(movementTypeLabel(orderType))}" type="button">${movementTypeCode(orderType)}</button>`).join("")}
+            </div>
+          </div>
           <div class="loaded-order-list" id="loadedOrderList">
             ${renderLoadedOrderList()}
           </div>
@@ -712,7 +1035,7 @@ function renderLoadedExportSection() {
           <div class="loaded-filter-card">
             <div class="loaded-filter-title">
               <strong>${t("control.exportFilter", "Export Filter")}</strong>
-              <span>${t("control.exportFilterHelp", "CSV uses these applied filters only.")}</span>
+              <span>${t("yard.exportFilterHelp", "CSV uses the selected direction, type, date, and yard filters.")}</span>
             </div>
             <div class="loaded-filter-row">
               <label><span>${t("common.from", "From")}</span><input id="loadedFrom" type="date" value="${escapeHtml(loadedFilters.from)}" /></label>
@@ -744,15 +1067,17 @@ function renderLoadedExportSection() {
 
 function renderLoadedOrderDetail() {
   if (!loadedOrderDetail) {
-    return `<div class="empty-detail"><strong>${t("common.selectOrder", "Select an order")}</strong><span>${t("control.selectLoadedHelp", "Loaded lines and photo proof will show here.")}</span></div>`;
+    return `<div class="empty-detail"><strong>${t("common.selectOrder", "Select an order")}</strong><span>${t("yard.selectMovementHelp", "Processed lines, converted UOM, and photo proof will show here.")}</span></div>`;
   }
   const { order, lines = [], photos = [] } = loadedOrderDetail;
+  const route = [order.source_location, order.destination_location].filter(Boolean).join(" → ");
   return `
     <div class="loaded-detail-head">
       <div>
-        <h3>${escapeHtml(order.tranid || order.order_id)}</h3>
-        <p class="muted">${order.order_type === "transfer_order" ? "Transfer Order" : "Sales Order"} | ${escapeHtml(order.outbound_location || "")} | ${escapeHtml(order.local_yard_order_status || order.operator_status || "")}</p>
-        ${order.customer ? `<p class="muted">${escapeHtml(order.customer)}</p>` : ""}
+        <div class="movement-detail-title"><h3>${escapeHtml(order.tranid || order.order_id)}</h3><span class="movement-badges"><i class="movement-badge ${escapeHtml(order.direction)}">${t(`yard.${order.direction}`, order.direction)}</i><i class="movement-badge type">${movementTypeCode(order.order_type)}</i></span></div>
+        <p class="muted">${escapeHtml(movementTypeLabel(order.order_type))} | ${escapeHtml(order.yard_location || "")} | ${escapeHtml(order.movement_status || t("yard.processed", "Processed"))}</p>
+        ${route ? `<p class="muted">${escapeHtml(route)}</p>` : ""}
+        ${order.party ? `<p class="muted">${escapeHtml(order.party)}</p>` : ""}
       </div>
       <strong>${lines.length} ${t("control.lines", "line(s)")}</strong>
     </div>
@@ -765,24 +1090,23 @@ function renderLoadedOrderDetail() {
             ${line.item_description ? `<em>${escapeHtml(line.item_description)}</em>` : ""}
           </div>
           <div class="loaded-line-qty">
-            <b>${valueText(line.loaded_qty)}</b>
-            <span>${escapeHtml(line.loaded_uom || "")}</span>
-            <small>${escapeHtml(line.location || order.outbound_location || "")}</small>
+            ${renderMovementQuantityEquation(line)}
+            <small>${escapeHtml(line.location || order.yard_location || "")}</small>
           </div>
         </div>
-      `).join("") || `<div class="notice"><strong>${t("control.noLoadedLines", "No loaded lines")}</strong><span>${t("control.noLoadedLinesHelp", "This order has load records but no current loaded line quantity.")}</span></div>`}
+      `).join("") || `<div class="notice"><strong>${t("yard.noProcessedLines", "No processed lines")}</strong><span>${t("yard.noProcessedLinesHelp", "This order has an activity record but no retained processed line quantity.")}</span></div>`}
     </div>
     <div class="loaded-photo-section">
       <h3>${t("common.photos", "Photos")}</h3>
       <div class="loaded-photo-grid">
         ${photos.filter((photo) => photo.photo_data_url).map((photo) => `
           <figure>
-            <button class="photo-thumb-button" data-action="open-photo-lightbox" data-photo-ref="${escapeHtml(photo.photo_data_url)}" data-photo-label="Load photo ${escapeHtml(photo.id)}" type="button">
-              <img src="${photoImgSrc(photo.photo_data_url)}" alt="Load photo ${escapeHtml(photo.id)}" />
+            <button class="photo-thumb-button" data-action="open-photo-lightbox" data-photo-ref="${escapeHtml(photo.photo_data_url)}" data-photo-label="${t("yard.activityPhoto", "Activity photo")} ${escapeHtml(photo.id)}" type="button">
+              <img src="${photoImgSrc(photo.photo_data_url)}" alt="${t("yard.activityPhoto", "Activity photo")} ${escapeHtml(photo.id)}" />
             </button>
             <figcaption>${formatDate(photo.created_at)}</figcaption>
           </figure>
-        `).join("") || `<div class="notice"><strong>${t("common.noPhoto", "No photo")}</strong><span>${t("control.noPhotoHelp", "No photo proof is attached in this filtered date range.")}</span></div>`}
+        `).join("") || `<div class="notice"><strong>${t("common.noPhoto", "No photo")}</strong><span>${t("yard.noPhotoHelp", "No photo proof is attached to this processed activity in the filtered date range.")}</span></div>`}
       </div>
     </div>
   `;
@@ -879,6 +1203,92 @@ function renderSyncSection() {
   `;
 }
 
+function renderStorageSection() {
+  const stats = photoArchiveSettings.stats || {};
+  const summary = photoArchiveSettings.lastSummary || {};
+  const mode = photoArchiveSettings.mode || "off";
+  const intervalMinutes = Math.max(5, Number(photoArchiveSettings.intervalMinutes || 1440));
+  const failures = Array.isArray(summary.failures) ? summary.failures : [];
+  return `
+    <section class="panel">
+      <div class="section-heading">
+        <div>
+          <h2>Photo Storage Management</h2>
+          <p class="muted">Archive referenced R2 photos into persistent local storage, verify every local copy, and then remove the R2 object.</p>
+        </div>
+        <button data-action="refresh-photo-archive" type="button">Refresh</button>
+      </div>
+      <div class="sync-mode-grid">
+        <button class="sync-mode-card ${mode === "off" ? "active" : ""}" data-action="set-photo-archive-mode" data-mode="off" type="button" ${photoArchiveSettings.running ? "disabled" : ""}>
+          <strong>Off</strong>
+          <span>Disable manual and scheduled archival.</span>
+        </button>
+        <button class="sync-mode-card ${mode === "manual" ? "active" : ""}" data-action="set-photo-archive-mode" data-mode="manual" type="button" ${photoArchiveSettings.running ? "disabled" : ""}>
+          <strong>Manual</strong>
+          <span>Archive only when an admin selects Run Backup Now.</span>
+        </button>
+        <button class="sync-mode-card ${mode === "auto" ? "active" : ""}" data-action="set-photo-archive-mode" data-mode="auto" type="button" ${photoArchiveSettings.running ? "disabled" : ""}>
+          <strong>Auto</strong>
+          <span>Run automatically using the interval below.</span>
+        </button>
+      </div>
+      <div class="sync-status-grid">
+        <div><span>Referenced R2 Photos</span><strong>${Number(stats.referencedR2Count || 0).toLocaleString()}</strong></div>
+        <div><span>Readable Locally</span><strong>${Number(stats.referencedArchivedCount || 0).toLocaleString()}</strong></div>
+        <div><span>Removed From R2</span><strong>${Number(stats.referencedRemoteDeletedCount || 0).toLocaleString()}</strong></div>
+        <div><span>Still Pending in R2</span><strong>${Number(stats.referencedPendingCount || 0).toLocaleString()}</strong></div>
+        <div><span>Local Archive Size</span><strong>${formatBytes(stats.localBytes)}</strong></div>
+        <div><span>Local Disk Available</span><strong>${formatBytes(stats.localDiskAvailableBytes)}</strong></div>
+        <div><span>Status</span><strong>${photoArchiveSettings.running ? "Running" : escapeHtml(photoArchiveSettings.lastStatus || "idle")}</strong></div>
+        <div><span>Next Auto Run</span><strong>${formatDate(photoArchiveSettings.nextRunAt) || (mode === "auto" ? "Due now" : "Not scheduled")}</strong></div>
+      </div>
+      <div class="sync-status-grid sync-setting-grid">
+        <label>
+          <span>Automatic Interval (minutes)</span>
+          <input data-field="photo-archive-interval" type="number" min="5" max="43200" step="1" value="${intervalMinutes}" ${photoArchiveSettings.running ? "disabled" : ""}>
+        </label>
+        <div>
+          <span>Examples</span>
+          <strong>60 = hourly · 1,440 = daily · 10,080 = weekly</strong>
+        </div>
+      </div>
+      <div class="actions">
+        <button data-action="save-photo-archive-settings" type="button" ${photoArchiveSettings.running ? "disabled" : ""}>Save Settings</button>
+        <button class="primary" data-action="run-photo-archive" type="button" ${mode === "off" || photoArchiveSettings.running ? "disabled" : ""}>
+          ${photoArchiveSettings.running ? "Backup Running..." : "Run Backup Now"}
+        </button>
+        <button data-action="refresh-photo-archive" type="button">Refresh Status</button>
+      </div>
+      <div class="notice">
+        <strong>Safe deletion order</strong>
+        <span>Download from R2 → write locally → verify file size and SHA-256 → record the archive → request R2 deletion. A failed download or verification never deletes the R2 copy.</span>
+      </div>
+      <div class="notice">
+        <strong>Transparent photo access</strong>
+        <span>Historical records keep their current R2 references. Operator, Driver, Dispatch, Control, and export screens automatically read an archived local file first.</span>
+      </div>
+      <div class="notice ${photoArchiveSettings.lastError ? "sync-error" : ""}">
+        <strong>R2 Worker requirement</strong>
+        <span>The configured photo worker must accept signed <code>DELETE /object</code> requests with the <code>photo-delete</code> scope. If deletion is unsupported, the verified local copy remains readable, the R2 object remains pending, and the run reports Partial.</span>
+      </div>
+      ${photoArchiveSettings.lastError ? `<div class="notice sync-error">
+        <strong>Last run needs attention</strong>
+        <span>${escapeHtml(photoArchiveSettings.lastError)}</span>
+      </div>` : ""}
+      <div class="sync-status-grid">
+        <div><span>Last Started</span><strong>${formatDate(photoArchiveSettings.lastStartedAt) || "-"}</strong></div>
+        <div><span>Last Finished</span><strong>${formatDate(photoArchiveSettings.lastFinishedAt) || "-"}</strong></div>
+        <div><span>Downloaded This Run</span><strong>${Number(summary.archived || 0).toLocaleString()} · ${formatBytes(summary.bytesArchived)}</strong></div>
+        <div><span>Deleted This Run</span><strong>${Number(summary.remoteDeleted || 0).toLocaleString()}</strong></div>
+      </div>
+      ${failures.length ? `<details class="notice sync-error">
+        <summary>Show the first ${Math.min(failures.length, 25)} failed objects</summary>
+        <pre>${escapeHtml(failures.slice(0, 25).map((failure) => `${failure.stage}: ${failure.key} — ${failure.error}`).join("\n"))}</pre>
+      </details>` : ""}
+    </section>
+  `;
+}
+
 function warningTypeLabel(type) {
   return {
     confirm_line: "Confirm Line",
@@ -937,30 +1347,136 @@ function renderWarningsSection() {
 }
 
 function renderOperatorsSection() {
+  ensureOperatorSelection();
+  const selected = operators.find((item) => String(item.id) === String(selectedOperatorId)) || null;
   return `
-    <div class="grid">
-      <section class="panel">
-        <h2>${t("control.registerAccount", "Register Account")}</h2>
-        <form class="form-grid" data-form="create-operator">
-          <label><span>${t("common.username", "Username")}</span><input id="newUsername" required /></label>
-          <label><span>${t("control.displayName", "Display name")}</span><input id="newDisplayName" required /></label>
-          <label><span>${t("common.password", "Password")}</span><input id="newPassword" type="password" required /></label>
-          <label>
-            <span>${t("common.role", "Role")}</span>
-            <select id="newRole">
-              <option value="operator">${t("control.roleOperator", "Operator")}</option>
-              <option value="dispatcher">${t("control.roleDispatcher", "Dispatcher")}</option>
-              <option value="scm">${t("control.roleScm", "SCM Staff")}</option>
-              <option value="yard_manager">${t("control.roleYardManager", "Yard Manager")}</option>
-              <option value="admin">${t("control.roleAdmin", "Admin")}</option>
-            </select>
-          </label>
-          <button class="primary" type="submit">${t("control.createAccount", "Create account")}</button>
+    <div class="account-management-layout">
+      <aside class="panel account-master-panel">
+        <div class="account-master-head">
+          <div>
+            <h2>${t("control.users", "Users")}</h2>
+            <p class="muted">${operators.length} ${t("control.accounts", "accounts")}</p>
+          </div>
+          <button class="primary" data-action="new-account" type="button">+ ${t("control.newUser", "New User")}</button>
+        </div>
+        <div class="account-user-list" role="listbox" aria-label="${t("control.users", "Users")}">
+          ${operators.map((item) => `
+            <button class="account-user-option ${String(item.id) === String(selectedOperatorId) ? "selected" : ""}" data-action="select-account" data-id="${escapeHtml(item.id)}" type="button" role="option" aria-selected="${String(item.id) === String(selectedOperatorId)}">
+              <span class="account-user-avatar">${escapeHtml(String(item.display_name || item.username || "?").trim().slice(0, 1).toUpperCase())}</span>
+              <span class="account-user-copy">
+                <strong>${escapeHtml(item.display_name || item.username)}</strong>
+                <small>@${escapeHtml(item.username)} · ${escapeHtml(operatorRoleLabel(item.role))}</small>
+              </span>
+              <span class="account-status-dot ${item.active ? "active" : "disabled"}" title="${item.active ? t("common.active", "Active") : t("common.disabled", "Disabled")}"></span>
+              ${String(item.id) === String(operator?.id) ? `<em>${t("control.you", "You")}</em>` : ""}
+            </button>
+          `).join("") || `<p class="muted account-list-empty">${t("control.noUsers", "No users found.")}</p>`}
+        </div>
+      </aside>
+      <section class="panel account-detail-panel">
+        ${selectedOperatorId === "new" ? renderNewOperatorDetail() : renderOperatorDetail(selected)}
+      </section>
+    </div>
+  `;
+}
+
+function ensureOperatorSelection() {
+  if (selectedOperatorId === "new") return;
+  if (operators.some((item) => String(item.id) === String(selectedOperatorId))) return;
+  selectedOperatorId = operators.find((item) => String(item.id) === String(operator?.id))?.id || operators[0]?.id || "new";
+  if (selectedOperatorId !== "new") localStorage.setItem(ACCOUNT_SELECTION_KEY, selectedOperatorId);
+}
+
+function renderNewOperatorDetail() {
+  return `
+    <div class="account-detail-head">
+      <div>
+        <p class="eyebrow">${t("control.accountDetails", "Account details")}</p>
+        <h2>${t("control.newUser", "New User")}</h2>
+        <p class="muted">${t("control.newUserHelp", "Enter the new account information and assign its module authorities.")}</p>
+      </div>
+      ${operators.length ? `<button data-action="cancel-new-account" type="button">${t("common.cancel", "Cancel")}</button>` : ""}
+    </div>
+    <form class="account-detail-form" data-form="create-operator">
+      <div class="account-form-grid">
+        <label><span>${t("common.username", "Username")}</span><input id="newUsername" autocomplete="off" required /></label>
+        <label><span>${t("control.displayName", "Display name")}</span><input id="newDisplayName" required /></label>
+        <label><span>${t("common.password", "Password")}</span><input id="newPassword" type="password" minlength="6" autocomplete="new-password" required /></label>
+        <label>
+          <span>${t("control.primaryRole", "Primary role")}</span>
+          <select id="newRole">${renderRoleOptions("operator")}</select>
+        </label>
+      </div>
+      <fieldset class="authority-picker">
+        <legend>${t("control.authorities", "Module authorities")}</legend>
+        <p class="muted">${t("control.authoritiesHelp", "Select every module this account may access. The primary role controls the default page after login.")}</p>
+        <div class="authority-choice-grid">${renderAuthorityChoices(["operator"], "data-new-authority")}</div>
+      </fieldset>
+      <div class="account-detail-actions">
+        <button class="primary" type="submit">${t("control.createAccount", "Create account")}</button>
+      </div>
+    </form>
+  `;
+}
+
+function renderOperatorDetail(item) {
+  if (!item) {
+    return `
+      <div class="account-detail-empty">
+        <h2>${t("control.selectUser", "Select a user")}</h2>
+        <p class="muted">${t("control.selectUserHelp", "Choose a user on the left or create a new account.")}</p>
+      </div>
+    `;
+  }
+  return `
+    <div class="account-detail-head">
+      <div>
+        <p class="eyebrow">${t("control.accountDetails", "Account details")}</p>
+        <h2>${escapeHtml(item.display_name || item.username)}</h2>
+        <p class="muted">@${escapeHtml(item.username)}</p>
+      </div>
+      <span class="account-status-badge ${item.active ? "active" : "disabled"}">${item.active ? t("common.active", "Active") : t("common.disabled", "Disabled")}</span>
+    </div>
+    <div class="account-detail-body" data-account-detail data-account-row="${escapeHtml(item.id)}">
+      <section class="account-detail-card">
+        <h3>${t("control.identity", "Identity")}</h3>
+        <div class="account-form-grid">
+          <label><span>${t("common.username", "Username")}</span><input value="${escapeHtml(item.username)}" readonly /></label>
+          <label><span>${t("control.displayName", "Display name")}</span><input value="${escapeHtml(item.display_name)}" readonly /></label>
+        </div>
+      </section>
+      <section class="account-detail-card account-access-editor">
+        <div>
+          <h3>${t("control.accessRights", "Access rights")}</h3>
+          <p class="muted">${t("control.authoritiesHelp", "Select every module this account may access. The primary role controls the default page after login.")}</p>
+        </div>
+        <label>
+          <span>${t("control.primaryRole", "Primary role")}</span>
+          <select data-account-primary-role>${renderRoleOptions(item.role)}</select>
+        </label>
+        <div>
+          <span class="field-label">${t("control.authorities", "Module authorities")}</span>
+          <div class="authority-choice-grid">${renderAuthorityChoices(normalizedStaffRoles(item), "data-account-authority")}</div>
+        </div>
+        <div class="account-detail-actions">
+          <button class="primary" data-action="save-account-roles" data-id="${escapeHtml(item.id)}" type="button">${t("control.saveAccess", "Save access")}</button>
+        </div>
+      </section>
+      <section class="account-detail-card">
+        <h3>${t("control.security", "Security")}</h3>
+        <form class="password-reset-form" data-form="reset-password" data-id="${escapeHtml(item.id)}" data-name="${escapeHtml(item.display_name)}">
+          <input name="password" type="password" minlength="6" placeholder="${t("common.passwordNew", "New password")}" autocomplete="new-password" required />
+          <button class="primary" type="submit">${t("common.reset", "Reset")}</button>
         </form>
       </section>
-      <section class="panel">
-        <h2>${t("control.accounts", "Accounts")}</h2>
-        ${renderOperators()}
+      <section class="account-detail-card account-status-card">
+        <div>
+          <h3>${t("control.accountStatus", "Account status")}</h3>
+          <p class="muted">${item.active ? t("control.activeAccountHelp", "This user can currently sign in.") : t("control.disabledAccountHelp", "This user is blocked from signing in.")}</p>
+        </div>
+        <button class="${item.active ? "danger" : "primary"}" data-action="toggle-active" data-id="${escapeHtml(item.id)}" data-active="${!item.active}" type="button">
+          ${item.active ? t("common.disable", "Disable") : t("common.enable", "Enable")}
+        </button>
       </section>
     </div>
   `;
@@ -1164,34 +1680,6 @@ function renderClassifications() {
   `;
 }
 
-function renderOperators() {
-  return `
-    <table>
-      <thead><tr><th>${t("common.name", "Name")}</th><th>${t("common.role", "Role")}</th><th>${t("common.status", "Status")}</th><th>${t("common.password", "Password")}</th><th></th></tr></thead>
-      <tbody>
-        ${operators.map((item) => `
-          <tr>
-            <td><strong>${item.display_name}</strong><br><span class="muted">${item.username}</span></td>
-            <td>${item.role}</td>
-            <td>${item.active ? t("common.active", "Active") : t("common.disabled", "Disabled")}</td>
-            <td>
-              <form class="password-reset-form" data-form="reset-password" data-id="${item.id}" data-name="${item.display_name}">
-                <input name="password" type="password" minlength="6" placeholder="${t("common.passwordNew", "New password")}" autocomplete="new-password" required />
-                <button class="primary" type="submit">${t("common.reset", "Reset")}</button>
-              </form>
-            </td>
-            <td>
-              <button class="${item.active ? "danger" : ""}" data-action="toggle-active" data-id="${item.id}" data-active="${!item.active}">
-                ${item.active ? t("common.disable", "Disable") : t("common.enable", "Enable")}
-              </button>
-            </td>
-          </tr>
-        `).join("")}
-      </tbody>
-    </table>
-  `;
-}
-
 function renderAudit() {
   return `
     <table>
@@ -1223,19 +1711,31 @@ async function loadAuditOptions() {
 }
 
 async function loadControlData() {
-  operators = await request("/api/operators");
-  await loadAuditOptions();
-  await loadAudit();
-  classifications = await request(`/api/inventory/classifications?limit=300${classificationSearch ? `&search=${encodeURIComponent(classificationSearch)}` : ""}`);
-  cycleRecords = await request("/api/cycle-count/records?limit=50");
-  fulfillmentRecords = await request("/api/delivery/fulfillments?limit=100");
-  recordWarnings = await request("/api/control/record-warnings?limit=100");
-  orderLocks = await request("/api/control/order-locks");
-  vendorMappings = await request("/api/control/vendor-mappings");
-  await loadLoadedOrders({ keepSelection: true });
-  if (isLoadedSearchActive()) await loadLoadedSearchResults();
-  syncSettings = await request("/api/control/sync-settings");
-  envSettings = await request("/api/control/env-settings");
+  if (IS_ADMIN_PAGE) {
+    const [nextOperators, nextAuditOptions, nextAudit, nextSyncSettings, nextEnvSettings, nextPhotoArchiveSettings] = await Promise.all([
+      request("/api/operators"),
+      request(auditOptionsQueryString()),
+      request(auditQueryString()),
+      request("/api/control/sync-settings"),
+      request("/api/control/env-settings"),
+      request("/api/admin/photo-archive")
+    ]);
+    operators = nextOperators;
+    auditOptions = nextAuditOptions;
+    audit = nextAudit;
+    syncSettings = nextSyncSettings;
+    envSettings = nextEnvSettings;
+    photoArchiveSettings = nextPhotoArchiveSettings;
+  } else {
+    classifications = await request(`/api/inventory/classifications?limit=300${classificationSearch ? `&search=${encodeURIComponent(classificationSearch)}` : ""}`);
+    cycleRecords = await request("/api/cycle-count/records?limit=50");
+    fulfillmentRecords = await request("/api/delivery/fulfillments?limit=100");
+    recordWarnings = await request("/api/control/record-warnings?limit=100");
+    orderLocks = await request("/api/control/order-locks");
+    vendorMappings = await request("/api/control/vendor-mappings");
+    await loadLoadedOrders({ keepSelection: true });
+    if (isLoadedSearchActive()) await loadLoadedSearchResults();
+  }
   render();
 }
 
@@ -1252,9 +1752,12 @@ app.addEventListener("submit", async (event) => {
           password: document.getElementById("password").value
         })
       });
-      token = result.token;
       operator = result.operator;
-      localStorage.setItem(TOKEN_KEY, token);
+      storeStaffSession(result.token, operator);
+      if (!canAccessCurrentPage(operator)) {
+        window.location.replace(roleHomeRoute(operator.role));
+        return;
+      }
       return loadControlData();
     }
     if (form.dataset.form === "bootstrap") {
@@ -1270,15 +1773,21 @@ app.addEventListener("submit", async (event) => {
       return renderLogin("Admin created. Please login.");
     }
     if (form.dataset.form === "create-operator") {
-      await request("/api/operators", {
+      const primaryRole = document.getElementById("newRole").value;
+      const roles = [...document.querySelectorAll("[data-new-authority]:checked")].map((input) => input.value);
+      if (!roles.includes(primaryRole)) roles.push(primaryRole);
+      const created = await request("/api/operators", {
         method: "POST",
         body: JSON.stringify({
           username: document.getElementById("newUsername").value,
           displayName: document.getElementById("newDisplayName").value,
           password: document.getElementById("newPassword").value,
-          role: document.getElementById("newRole").value
+          role: primaryRole,
+          roles
         })
       });
+      selectedOperatorId = created.id;
+      localStorage.setItem(ACCOUNT_SELECTION_KEY, selectedOperatorId);
       return loadControlData();
     }
     if (form.dataset.form === "reset-password") {
@@ -1302,8 +1811,22 @@ app.addEventListener("click", async (event) => {
   if (!button) return;
   try {
     if (button.dataset.action === "control-section") {
-      activeSection = button.dataset.section;
-      localStorage.setItem("mbbs.control.section", activeSection);
+      return setActiveSection(button.dataset.section);
+    }
+    if (button.dataset.action === "new-account") {
+      selectedOperatorId = "new";
+      return render();
+    }
+    if (button.dataset.action === "select-account") {
+      selectedOperatorId = button.dataset.id || "";
+      if (selectedOperatorId) localStorage.setItem(ACCOUNT_SELECTION_KEY, selectedOperatorId);
+      return render();
+    }
+    if (button.dataset.action === "cancel-new-account") {
+      const savedId = localStorage.getItem(ACCOUNT_SELECTION_KEY) || "";
+      selectedOperatorId = operators.some((item) => String(item.id) === String(savedId))
+        ? savedId
+        : operators.find((item) => String(item.id) === String(operator?.id))?.id || operators[0]?.id || "new";
       return render();
     }
     if (button.dataset.action === "refresh") return loadControlData();
@@ -1396,6 +1919,34 @@ app.addEventListener("click", async (event) => {
       alert(`Local vendor saved. Re-enriched ${result.enriched?.receiving || 0} receiving orders.`);
       return render();
     }
+    if (button.dataset.action === "yard-direction") {
+      const direction = button.dataset.direction;
+      if (!YARD_MOVEMENT_TYPES[direction]) return;
+      loadedDirection = direction;
+      localStorage.setItem("mbbs.control.loaded.direction", loadedDirection);
+      loadedSearchTerm = "";
+      loadedItemSearchTerm = "";
+      loadedSearchResults = [];
+      loadedSearchLoading = false;
+      saveLoadedSearch();
+      selectedLoadedOrderKey = "";
+      await loadLoadedOrders();
+      return render();
+    }
+    if (button.dataset.action === "yard-type") {
+      const orderType = button.dataset.orderType;
+      if (!(YARD_MOVEMENT_TYPES[loadedDirection] || []).includes(orderType)) return;
+      loadedTypeByDirection[loadedDirection] = orderType;
+      localStorage.setItem(`mbbs.control.loaded.${loadedDirection}Type`, orderType);
+      loadedSearchTerm = "";
+      loadedItemSearchTerm = "";
+      loadedSearchResults = [];
+      loadedSearchLoading = false;
+      saveLoadedSearch();
+      selectedLoadedOrderKey = "";
+      await loadLoadedOrders();
+      return render();
+    }
     if (button.dataset.action === "refresh-loaded-orders") {
       await loadLoadedOrders({ keepSelection: true });
       if (isLoadedSearchActive()) await loadLoadedSearchResults();
@@ -1456,6 +2007,44 @@ app.addEventListener("click", async (event) => {
         body: JSON.stringify({ locationIds: [1, 28, 15, 26] })
       });
       return loadControlData();
+    }
+    if (button.dataset.action === "refresh-photo-archive") {
+      photoArchiveSettings = await request("/api/admin/photo-archive");
+      return render();
+    }
+    if (button.dataset.action === "set-photo-archive-mode") {
+      const intervalMinutes = Math.round(Number(app.querySelector('[data-field="photo-archive-interval"]')?.value || photoArchiveSettings.intervalMinutes || 1440));
+      if (!Number.isFinite(intervalMinutes) || intervalMinutes < 5 || intervalMinutes > 43200) {
+        return alert("Enter an interval between 5 and 43,200 minutes.");
+      }
+      photoArchiveSettings = await request("/api/admin/photo-archive", {
+        method: "PUT",
+        body: JSON.stringify({ mode: button.dataset.mode, intervalMinutes })
+      });
+      return render();
+    }
+    if (button.dataset.action === "save-photo-archive-settings") {
+      const intervalMinutes = Math.round(Number(app.querySelector('[data-field="photo-archive-interval"]')?.value || 0));
+      if (!Number.isFinite(intervalMinutes) || intervalMinutes < 5 || intervalMinutes > 43200) {
+        return alert("Enter an interval between 5 and 43,200 minutes.");
+      }
+      photoArchiveSettings = await request("/api/admin/photo-archive", {
+        method: "PUT",
+        body: JSON.stringify({ mode: photoArchiveSettings.mode, intervalMinutes })
+      });
+      alert("Photo Storage settings saved.");
+      return render();
+    }
+    if (button.dataset.action === "run-photo-archive") {
+      if (!confirm("Run photo backup now? Each R2 object will be deleted only after its local copy passes size and SHA-256 verification.")) return;
+      button.disabled = true;
+      button.textContent = "Starting Backup...";
+      const result = await request("/api/admin/photo-archive/run", { method: "POST", body: "{}" });
+      photoArchiveSettings = result.settings || await request("/api/admin/photo-archive");
+      render();
+      schedulePhotoArchivePoll();
+      if (!result.started) alert("A photo backup is already running.");
+      return;
     }
     if (button.dataset.action === "set-sync-mode") {
       syncSettings = await request("/api/control/sync-settings", {
@@ -1569,10 +2158,9 @@ app.addEventListener("click", async (event) => {
     }
     if (button.dataset.action === "logout") {
       await request("/api/auth/logout", { method: "POST" }).catch(() => ({}));
-      token = "";
       operator = null;
       clearSyncPoll();
-      localStorage.removeItem(TOKEN_KEY);
+      clearStaffSession();
       return renderLogin();
     }
     if (button.dataset.action === "toggle-active") {
@@ -1582,15 +2170,30 @@ app.addEventListener("click", async (event) => {
       });
       return loadControlData();
     }
+    if (button.dataset.action === "save-account-roles") {
+      const row = button.closest("[data-account-row]");
+      const role = row?.querySelector("[data-account-primary-role]")?.value || "operator";
+      const roles = [...(row?.querySelectorAll("[data-account-authority]:checked") || [])].map((input) => input.value);
+      if (!roles.includes(role)) roles.push(role);
+      await request(`/api/operators/${button.dataset.id}/roles`, {
+        method: "PUT",
+        body: JSON.stringify({ role, roles })
+      });
+      alert(t("control.accessSaved", "Account access updated."));
+      return loadControlData();
+    }
   } catch (error) {
     alert(error.message);
   }
 });
 
 window.addEventListener("mbbs-control-section", (event) => {
-  activeSection = event.detail?.section || "dashboard";
-  localStorage.setItem("mbbs.control.section", activeSection);
-  render();
+  setActiveSection(event.detail?.section || "dashboard", { updateRoute: !IS_ADMIN_PAGE });
+});
+
+window.addEventListener("popstate", () => {
+  const routedSection = sectionFromCurrentRoute();
+  if (routedSection) setActiveSection(routedSection, { updateRoute: false });
 });
 
 app.addEventListener("input", (event) => {
@@ -1599,9 +2202,24 @@ app.addEventListener("input", (event) => {
   syncMaxRunMinutesDraft = Number.isFinite(value) && value >= 0 ? event.target.value : "";
 });
 
+app.addEventListener("change", (event) => {
+  if (event.target?.id === "newRole") {
+    const checkbox = document.querySelector(`[data-new-authority][value="${event.target.value}"]`);
+    if (checkbox) checkbox.checked = true;
+    return;
+  }
+  if (event.target?.matches?.("[data-account-primary-role]")) {
+    const row = event.target.closest("[data-account-row]");
+    const checkbox = [...(row?.querySelectorAll("[data-account-authority]") || [])]
+      .find((input) => input.value === event.target.value);
+    if (checkbox) checkbox.checked = true;
+  }
+});
+
 app.addEventListener("input", (event) => {
-  if (event.target?.id !== "loadedSearch") return;
-  loadedSearchTerm = event.target.value || "";
+  if (!["loadedSearch", "loadedItemSearch"].includes(event.target?.id)) return;
+  if (event.target.id === "loadedSearch") loadedSearchTerm = event.target.value || "";
+  if (event.target.id === "loadedItemSearch") loadedItemSearchTerm = event.target.value || "";
   saveLoadedSearch();
   clearTimeout(loadedSearchTimer);
   if (!isLoadedSearchActive()) {
@@ -1631,14 +2249,28 @@ app.addEventListener("input", (event) => {
 async function boot() {
   const bootstrap = await request("/api/auth/bootstrap-needed");
   bootstrapNeeded = bootstrap.needed;
-  if (!token) return renderLogin();
+  if (!token) {
+    if (bootstrapNeeded && !IS_ADMIN_PAGE) {
+      window.location.replace("/admin");
+      return;
+    }
+    if (localStorage.getItem("mbbs.driver.token")) {
+      window.location.replace("/driver");
+      return;
+    }
+    return renderLogin();
+  }
   try {
     const result = await request("/api/auth/me");
     operator = result.operator;
-    if (operator.role !== "admin") return renderLogin("Admin account required.");
+    storeStaffSession(token, operator);
+    if (!canAccessCurrentPage(operator)) {
+      window.location.replace(roleHomeRoute(operator.role));
+      return;
+    }
     await loadControlData();
   } catch (error) {
-    renderLogin();
+    if (!operator) renderLogin();
   }
 }
 

@@ -104,6 +104,19 @@ export function dispatchPlannedAssignmentMap(plan = {}) {
   return assignments;
 }
 
+export function applyDispatchPlannedAssignment(order = {}, assignment = null) {
+  return {
+    ...order,
+    dispatchPlanned: Boolean(assignment),
+    dispatchPlanId: assignment?.dispatchPlanId || "",
+    dispatchPlanDate: assignment?.dispatchPlanDate || "",
+    dispatchTruckPlate: assignment?.dispatchTruckPlate || "",
+    dispatchLoadName: assignment?.dispatchLoadName || "",
+    dispatchParkingSpot: assignment?.dispatchParkingSpot || "",
+    plannedOrderRef: assignment?.plannedOrderRef || ""
+  };
+}
+
 function countPlanLoadOrders(trucks = []) {
   return (trucks || []).reduce((sum, truck) => sum + (truck.loads || []).reduce((loadSum, load) => loadSum + countLoadOrders(load), 0), 0);
 }

@@ -1219,9 +1219,16 @@ function availableUnitsForLine(line = {}) {
     ["sections", "SEC", available.sections],
     ["pieces", "PCS", available.pieces]
   ].filter(([, , value]) => Number(value || 0) > 0);
+  if (line.independentSalesQty && Number(available.salesQty || 0) > 0) {
+    units.push(["salesQty", line.required?.unit || "Sales Qty", available.salesQty]);
+  }
   if (units.length) return units;
   if (Number(available.salesQty || 0) > 0) return [["salesQty", line.required?.unit || "Qty", available.salesQty]];
   return [];
+}
+
+function linkQuantityInputStep() {
+  return "0.000001";
 }
 
 function availableQtyTextForLine(line = {}) {
@@ -1266,6 +1273,170 @@ function linkLineItemsMatch(salesLine = {}, sourceLine = {}) {
   return Boolean(salesName && sourceName && salesName === sourceName);
 }
 
+function poLinkLinesForRef(poRef) {
+  const normalizedRef = String(poRef || "").trim().toLowerCase();
+  if (!normalizedRef) return [];
+  return (poAllocationOptions?.poLines || []).filter(
+    (line) => String(line.poRef || "").trim().toLowerCase() === normalizedRef
+  );
+}
+
+function poLinkCandidateMetaForLine(line = {}, poRef) {
+  const normalizedRef = String(poRef || "").trim().toLowerCase();
+  return (line.poCandidates || []).filter(
+    (candidate) => String(candidate.poRef || "").trim().toLowerCase() === normalizedRef
+  );
+}
+
+function poLinkCandidateLinesForSalesLine(line = {}, poRef) {
+  const candidateIds = new Set(
+    poLinkCandidateMetaForLine(line, poRef).map((candidate) => String(candidate.poLineId))
+  );
+  return poLinkLinesForRef(poRef).filter((poLine) => candidateIds.has(String(poLine.id)));
+}
+
+function poLinkMatchMeta(line = {}, poLineId, poRef) {
+  return poLinkCandidateMetaForLine(line, poRef).find(
+    (candidate) => String(candidate.poLineId) === String(poLineId || "")
+  ) || null;
+}
+
+function currentPoLinkBoardState(orderRef) {
+  const draft = getLinkModalDraft("po", orderRef);
+  const poLines = poLinkLinesForRef(draft.ref);
+  const salesLines = (poAllocationOptions?.salesLines || []).filter(
+    (line) => poLinkCandidateLinesForSalesLine(line, draft.ref).length
+  );
+  const pendingLine = salesLines.find(
+    (line) => String(line.targetLineKey) === String(draft.pendingSoLineKey || "")
+  ) || null;
+  const connections = salesLines.map((line) => {
+    const poLineId = String(draft.poLineIds[line.targetLineKey] || "");
+    const poLine = poLines.find((candidate) => String(candidate.id) === poLineId);
+    const matchMeta = poLine ? poLinkMatchMeta(line, poLine.id, draft.ref) : null;
+    return poLine && matchMeta ? { line, poLine, matchMeta } : null;
+  }).filter(Boolean);
+  const linkedCountByPo = connections.reduce((counts, connection) => {
+    const key = String(connection.poLine.id);
+    counts.set(key, (counts.get(key) || 0) + 1);
+    return counts;
+  }, new Map());
+  return { draft, poLines, salesLines, pendingLine, connections, linkedCountByPo };
+}
+
+function refreshPoLinkBoardInPlace(orderRef) {
+  const board = app.querySelector(".po-match-board");
+  if (!board) return false;
+  const order = orderById(orderRef);
+  const state = currentPoLinkBoardState(orderRef);
+  const salesByKey = new Map(state.salesLines.map((line) => [String(line.targetLineKey), line]));
+
+  for (const card of board.querySelectorAll("[data-po-map-so]")) {
+    const targetLineKey = String(card.dataset.targetLineKey || "");
+    const mappedPoId = String(state.draft.poLineIds[targetLineKey] || "");
+    const mappedPoLine = state.poLines.find((line) => String(line.id) === mappedPoId);
+    const selected = targetLineKey === String(state.draft.pendingSoLineKey || "");
+    card.classList.toggle("mapped", Boolean(mappedPoLine));
+    card.classList.toggle("selected", selected);
+    card.setAttribute("aria-pressed", selected ? "true" : "false");
+    const status = card.querySelector(".po-match-card-state");
+    if (status) {
+      status.classList.toggle("connected", Boolean(mappedPoLine));
+      status.textContent = mappedPoLine
+        ? `Connected to PO line ${mappedPoLine.lineId || mappedPoLine.id}`
+        : "Drag or click to connect";
+    }
+  }
+
+  for (const card of board.querySelectorAll("[data-po-map-po]")) {
+    const poLineId = String(card.dataset.poLineId || "");
+    const matchMeta = state.pendingLine ? poLinkMatchMeta(state.pendingLine, poLineId, state.draft.ref) : null;
+    const linkedCount = state.linkedCountByPo.get(poLineId) || 0;
+    const stateClass = !state.pendingLine ? "waiting" : (matchMeta ? (matchMeta.exactMatch ? "exact" : "compatible") : "incompatible");
+    card.classList.remove("waiting", "exact", "compatible", "incompatible");
+    card.classList.add(stateClass);
+    card.classList.toggle("mapped", linkedCount > 0);
+    card.setAttribute("aria-disabled", state.pendingLine && !matchMeta ? "true" : "false");
+    const status = card.querySelector(".po-match-card-state");
+    if (status) {
+      const stateText = !state.pendingLine ? "Select SO first" : (matchMeta ? (matchMeta.exactMatch ? "Exact match" : "Manual match allowed") : "Different item");
+      status.textContent = `${stateText}${linkedCount ? ` · ${linkedCount} connection(s)` : ""}`;
+    }
+  }
+
+  const counts = board.querySelector("[data-po-match-counts]");
+  if (counts) counts.textContent = `${state.connections.length} matched · ${state.salesLines.length - state.connections.length} remaining`;
+  const connectorList = board.querySelector('[data-po-match-scroll="connections"]');
+  if (connectorList) {
+    connectorList.innerHTML = state.connections.map(({ line, poLine, matchMeta }) => `
+      <div class="po-match-connector ${matchMeta.exactMatch ? "exact" : "manual"}">
+        <span class="po-match-connector-line" aria-hidden="true">→</span>
+        <div>
+          <strong>${escapeHtml(line.sourceOrderRef || order?.id || orderRef)} #${escapeHtml(line.lineId || line.id || "--")}</strong>
+          <span>to ${escapeHtml(poLine.poRef)} #${escapeHtml(poLine.lineId || poLine.id || "--")}</span>
+          <em>${matchMeta.exactMatch ? "Exact description + unit" : `Manual match${!matchMeta.descriptionMatch ? " · description differs" : ""}${!matchMeta.unitMatch ? " · unit differs" : ""}`}</em>
+        </div>
+        <button data-action="remove-po-line-match" data-target-line-key="${escapeHtml(line.targetLineKey || "")}" type="button" aria-label="Remove this match">×</button>
+      </div>
+    `).join("") || `<div class="po-match-connector-empty">Select an SO line to begin.</div>`;
+  }
+
+  for (const row of app.querySelectorAll(".po-link-line[data-target-line-key]")) {
+    const targetLineKey = String(row.dataset.targetLineKey || "");
+    const line = salesByKey.get(targetLineKey);
+    if (!line) continue;
+    const poLineId = String(state.draft.poLineIds[targetLineKey] || "");
+    const poLine = state.poLines.find((candidate) => String(candidate.id) === poLineId);
+    const matchMeta = poLine ? poLinkMatchMeta(line, poLine.id, state.draft.ref) : null;
+    const connected = Boolean(poLine && matchMeta);
+    const quantities = state.draft.quantities[targetLineKey] || {};
+    for (const input of row.querySelectorAll("[data-po-link-qty]")) {
+      input.disabled = !connected;
+      input.value = String(quantities[input.dataset.poLinkQty] ?? 0);
+    }
+    updateLinkSalesEquivalent(row);
+    const matchLabel = row.querySelector(".po-link-qty-match");
+    if (matchLabel) {
+      matchLabel.classList.toggle("connected", connected);
+      matchLabel.textContent = connected
+        ? `${matchMeta.exactMatch ? "Exact" : "Manual"} match · ${poLine.poRef} line ${poLine.lineId || poLine.id}`
+        : "Not connected — match this SO line above to enter quantity.";
+    }
+  }
+  return true;
+}
+
+function setPoLineMatch(orderRef, targetLineKey, poLineId) {
+  captureActiveLinkModalDraft();
+  const draft = getLinkModalDraft("po", orderRef);
+  const salesLine = (poAllocationOptions?.salesLines || []).find(
+    (line) => String(line.targetLineKey) === String(targetLineKey)
+  );
+  const poLine = poLinkLinesForRef(draft.ref).find((line) => String(line.id) === String(poLineId));
+  const matchMeta = salesLine ? poLinkMatchMeta(salesLine, poLineId, draft.ref) : null;
+  if (!salesLine || !poLine || !matchMeta) return false;
+
+  draft.poLineIds[targetLineKey] = String(poLineId);
+  const saved = draft.quantities[targetLineKey] || {};
+  if (!Object.values(saved).some((value) => Number(value || 0) > 0)) {
+    draft.quantities[targetLineKey] = Object.fromEntries(
+      availableUnitsForLine(salesLine).map(([field, , max]) => [field, Number(max || 0)])
+    );
+  }
+  draft.pendingSoLineKey = "";
+  if (!refreshPoLinkBoardInPlace(orderRef)) renderActiveLinkModalInPlace();
+  return true;
+}
+
+function removePoLineMatch(orderRef, targetLineKey) {
+  captureActiveLinkModalDraft();
+  const draft = getLinkModalDraft("po", orderRef);
+  draft.poLineIds[targetLineKey] = "";
+  draft.quantities[targetLineKey] = {};
+  if (draft.pendingSoLineKey === targetLineKey) draft.pendingSoLineKey = "";
+  if (!refreshPoLinkBoardInPlace(orderRef)) renderActiveLinkModalInPlace();
+}
+
 function applyPoLinkDefaultsForRef(orderRef, poRef) {
   const options = poAllocationOptions || {};
   const draft = getLinkModalDraft("po", orderRef);
@@ -1273,9 +1444,18 @@ function applyPoLinkDefaultsForRef(orderRef, poRef) {
   const selectedPoLines = (options.poLines || []).filter((line) => String(line.poRef || "").trim().toLowerCase() === normalizedRef);
   if (!normalizedRef || !selectedPoLines.length) return false;
   draft.quantities = {};
+  draft.poLineIds = {};
+  draft.pendingSoLineKey = "";
   for (const line of options.salesLines || []) {
     const units = availableUnitsForLine(line);
-    const matched = selectedPoLines.some((poLine) => linkLineItemsMatch(line, poLine));
+    const candidateMeta = (line.poCandidates || []).filter((candidate) => String(candidate.poRef || "").trim().toLowerCase() === normalizedRef);
+    const candidateIds = new Set(candidateMeta.map((candidate) => String(candidate.poLineId)));
+    const candidates = selectedPoLines.filter((poLine) => candidateIds.has(String(poLine.id)));
+    const exactIds = new Set(candidateMeta.filter((candidate) => candidate.exactMatch).map((candidate) => String(candidate.poLineId)));
+    const exactCandidates = candidates.filter((poLine) => exactIds.has(String(poLine.id)));
+    const selected = exactCandidates.length === 1 ? exactCandidates[0] : (!line.isSpecial && candidates.length === 1 ? candidates[0] : null);
+    const matched = Boolean(selected);
+    draft.poLineIds[line.targetLineKey] = selected ? String(selected.id) : "";
     const quantities = {};
     units.forEach(([field, , max]) => {
       quantities[field] = matched ? Number(max || 0) : 0;
@@ -1896,10 +2076,12 @@ function getLinkModalDraft(type, orderRef) {
     linkModalDrafts.set(key, {
       ref: "",
       mode: "direct_to_customer",
+      poLineIds: {},
       quantities: {},
       targetSignature: "",
       structureWarning: "",
-      defaultsAppliedRef: ""
+      defaultsAppliedRef: "",
+      pendingSoLineKey: ""
     });
   }
   return linkModalDrafts.get(key);
@@ -1930,6 +2112,10 @@ function captureActiveLinkModalDraft() {
       const quantities = draft.quantities[row.dataset.targetLineKey] || {};
       for (const input of row.querySelectorAll("[data-po-link-qty]")) {
         quantities[input.dataset.poLinkQty] = input.value;
+      }
+      const poLineSelect = row.querySelector("[data-po-line-id]");
+      if (poLineSelect) {
+        draft.poLineIds[row.dataset.targetLineKey] = poLineSelect.value;
       }
       draft.quantities[row.dataset.targetLineKey] = quantities;
     }
@@ -4953,7 +5139,8 @@ function selectorForElement(element) {
     "data-truck-driver",
     "data-truck-start",
     "data-truck-parking",
-    "data-return-yard"
+    "data-return-yard",
+    "data-po-match-scroll"
   ].filter((name) => element.hasAttribute(name));
   if (attrs.length) return `${tag}${attrs.map((name) => `[${name}="${cssAttr(element.getAttribute(name))}"]`).join("")}`;
   const dataParent = element.closest("[data-action], [data-load-card], [data-stop], [data-order]");
@@ -4966,7 +5153,7 @@ function captureRenderUiState() {
     focusSelector: selectorForElement(active),
     selectionStart: typeof active?.selectionStart === "number" ? active.selectionStart : null,
     selectionEnd: typeof active?.selectionEnd === "number" ? active.selectionEnd : null,
-    scrolls: [...app.querySelectorAll(".order-list, .truck-board, .load-preview-body, .preview-stop-list, .stop-list, .modal-body, .po-link-lines, .order-dependency-match-lines")]
+    scrolls: [...app.querySelectorAll(".order-list, .truck-board, .load-preview-body, .preview-stop-list, .stop-list, .modal-body, .po-link-lines, .order-dependency-match-lines, [data-po-match-scroll]")]
       .map((element) => ({
         selector: selectorForElement(element) || `.${[...element.classList].join(".")}`,
         top: element.scrollTop,
@@ -5124,10 +5311,10 @@ function renderSelectedOrderActions() {
       ${reviewOnly ? `<span>Loaded/shipped history</span>` : ""}
       ${groupedCount ? `<button data-action="ungroup-order" data-order="${order.id}" ${blockedUngroup ? `disabled title="Cancel ${escapeHtml(blockedUngroup)} before ungrouping"` : ""} type="button">Ungroup</button>` : selected.length > 1 ? `<button data-action="open-group-modal" data-order="${order.id}" type="button">Group</button>` : ""}
       ${blockedUngroup ? `<span>Cancel ${escapeHtml(blockedUngroup)} before ungrouping</span>` : ""}
-      ${!reviewOnly && order.type === "PO" ? `<button data-action="open-po-yard-modal" data-order="${order.id}" type="button">Set Yard</button>` : ""}
+      ${!reviewOnly && order.type === "PO" && order.sourceTable !== "scm_vrma_orders" ? `<button data-action="open-po-yard-modal" data-order="${order.id}" type="button">Set Yard</button>` : ""}
       ${!reviewOnly && order.type === "SO" ? `<button data-action="open-po-link-modal" data-order="${order.id}" type="button">Link PO</button>` : ""}
       ${!reviewOnly && order.type === "SO" ? `<button data-action="open-to-link-modal" data-order="${order.id}" type="button">Link TO</button>` : ""}
-      ${!reviewOnly && order.type !== "CO" && !order.originalOrderId ? `<button data-action="open-split-modal" data-order="${order.id}" type="button">Split</button>` : ""}
+      ${!reviewOnly && order.type !== "CO" && order.sourceTable !== "scm_vrma_orders" && !order.originalOrderId ? `<button data-action="open-split-modal" data-order="${order.id}" type="button">Split</button>` : ""}
       ${!reviewOnly && order.originalOrderId ? `<button data-action="unsplit-order" data-order="${order.id}" type="button">Unsplit</button>` : ""}
       ${!reviewOnly && canConsolidatePick(order) ? `<button data-action="open-consolidate-modal" data-order="${order.id}" type="button">Consolidate Pick</button>` : ""}
     </div>
@@ -5166,6 +5353,7 @@ function renderOrderCard(order) {
       ${groupedCount ? `<span>Includes ${order.childOrders.join(", ")}</span>` : ""}
       <div class="chip-row">
         <span class="chip">${order.type}</span>
+        ${order.sourceTable === "scm_vrma_orders" ? `<span class="chip">Local VRMA</span>` : ""}
         ${executionStatus === "complete" ? `<span class="chip complete-chip">Completed</span>` : executionStatus === "in_progress" ? `<span class="chip progress-chip">In progress</span>` : ""}
         ${reviewOnly ? `<span class="chip complete-chip">${escapeHtml(reviewOnlyText(order))}</span>` : ""}
         ${anyPlanned ? `<span class="chip planned-chip">${escapeHtml(plannedText)}</span>` : ""}
@@ -5779,7 +5967,7 @@ function renderToLinkModal(order) {
                 const equivalent = linkSalesQuantityFromValues(values, line.conversions || {});
                 return `<section class="link-quantity-line to-link-line" data-target-line-key="${escapeHtml(line.targetLineKey)}" data-dependency-item="${line.itemId}" data-to-plt="${Number(line.conversions?.pallets || 0)}" data-to-lyr="${Number(line.conversions?.layers || 0)}" data-to-sec="${Number(line.conversions?.sections || 0)}" data-to-pcs="${Number(line.conversions?.pieces || 0)}" data-sales-unit="${escapeHtml(line.unit || "Qty")}">
                   <div class="link-quantity-info"><strong>${escapeHtml(line.sku || line.itemName)}</strong>${line.sourceOrderRef && line.sourceOrderRef !== order.id ? `<span>${escapeHtml(line.sourceOrderRef)}</span>` : ""}<em>SO open ${escapeHtml(availableQtyTextForLine({ available: line.available, required: { unit: line.unit } }))} | TO ${escapeHtml(itemQtyText({ ...(line.transferDisplay || {}), salesQty: line.transferDisplay?.salesQty, unit: line.unit }))}</em><em class="link-sales-equivalent" data-link-sales-equivalent>Selected ${escapeHtml(qtyText(equivalent))} ${escapeHtml(line.unit || "Qty")}</em></div>
-                  <div class="link-quantity-units">${units.map(([field, label, max]) => `<label><span>${escapeHtml(label)}</span><input id="toLinkQty-${index}-${field}" data-to-link-qty="${field}" data-target-line-key="${escapeHtml(line.targetLineKey)}" type="number" min="0" max="${Number(max || 0)}" step="1" value="${escapeHtml(values[field] ?? 0)}" /></label>`).join("")}</div>
+                  <div class="link-quantity-units">${units.map(([field, label, max]) => `<label><span>${escapeHtml(label)}</span><input id="toLinkQty-${index}-${field}" data-to-link-qty="${field}" data-target-line-key="${escapeHtml(line.targetLineKey)}" type="number" inputmode="decimal" min="0" max="${Number(max || 0)}" step="${linkQuantityInputStep()}" value="${escapeHtml(values[field] ?? 0)}" /></label>`).join("")}</div>
                 </section>`;
               }).join("") || (!orderDependencyLoading ? (matchError ? `<div class="warning-detail">${escapeHtml(matchError)}</div>` : `<span class="muted">Type a Transfer Order number, then press Match Lines.</span>`) : "")}
             </div>
@@ -5795,13 +5983,119 @@ function renderToLinkModal(order) {
   `;
 }
 
+
+function renderPoLinkMatchBoard(order, salesLines, poLines, draft) {
+  const normalizedRef = String(draft.ref || "").trim().toLowerCase();
+  const selectedPoLines = poLines.filter(
+    (line) => String(line.poRef || "").trim().toLowerCase() === normalizedRef
+  );
+  if (!normalizedRef) {
+    return `<div class="po-match-empty">Choose a purchase order to start matching its lines.</div>`;
+  }
+  if (!selectedPoLines.length) {
+    return `<div class="po-match-empty">No lines found for <strong>${escapeHtml(draft.ref)}</strong>. Choose a purchase order from the list.</div>`;
+  }
+
+  const pendingLine = salesLines.find(
+    (line) => String(line.targetLineKey) === String(draft.pendingSoLineKey || "")
+  );
+  const connections = salesLines.map((line) => {
+    const poLineId = String(draft.poLineIds[line.targetLineKey] || "");
+    const poLine = selectedPoLines.find((candidate) => String(candidate.id) === poLineId);
+    const matchMeta = poLine ? poLinkMatchMeta(line, poLine.id, draft.ref) : null;
+    return poLine && matchMeta ? { line, poLine, matchMeta } : null;
+  }).filter(Boolean);
+  const linkedCountByPo = connections.reduce((counts, connection) => {
+    const key = String(connection.poLine.id);
+    counts.set(key, (counts.get(key) || 0) + 1);
+    return counts;
+  }, new Map());
+  const unmatchedCount = salesLines.length - connections.length;
+
+  return `
+    <div class="po-match-guide">
+      <strong>Match PO and SO lines</strong>
+      <span>Drag an SO card onto its PO card. You can also click the SO card, then click the PO card.</span>
+    </div>
+    <div class="po-match-board">
+      <section class="po-match-column po-match-so-column">
+        <header><span>1</span><div><strong>Sales order lines</strong><small>${salesLines.length} line(s)</small></div></header>
+        <div class="po-match-card-list" data-po-match-scroll="so">
+          ${salesLines.map((line) => {
+            const mappedPoId = String(draft.poLineIds[line.targetLineKey] || "");
+            const mappedPoLine = selectedPoLines.find((candidate) => String(candidate.id) === mappedPoId);
+            const selected = String(draft.pendingSoLineKey || "") === String(line.targetLineKey);
+            return `
+              <button class="po-match-card po-match-so-card ${mappedPoLine ? "mapped" : ""} ${selected ? "selected" : ""}"
+                data-action="select-po-map-so" data-po-map-so="true" data-target-line-key="${escapeHtml(line.targetLineKey || "")}"
+                draggable="true" type="button" aria-pressed="${selected ? "true" : "false"}">
+                <span class="po-match-card-top"><b>${escapeHtml(line.sourceOrderRef || order.id)}</b><em>SO line ${escapeHtml(line.lineId || line.id || "--")}</em></span>
+                <strong>${escapeHtml(line.sku || line.itemName)}</strong>
+                <span class="po-match-card-description">${escapeHtml(line.description || "No description")}</span>
+                <span class="po-match-card-qty">Open ${escapeHtml(availableQtyTextForLine(line))}</span>
+                ${mappedPoLine ? `<span class="po-match-card-state connected">Connected to PO line ${escapeHtml(mappedPoLine.lineId || mappedPoLine.id)}</span>` : `<span class="po-match-card-state">Drag or click to connect</span>`}
+              </button>
+            `;
+          }).join("") || `<div class="po-match-empty">No SO lines available.</div>`}
+        </div>
+      </section>
+
+      <section class="po-match-column po-match-connections-column">
+        <header><span>2</span><div><strong>Connections</strong><small data-po-match-counts>${connections.length} matched · ${unmatchedCount} remaining</small></div></header>
+        <div class="po-match-connector-list" data-po-match-scroll="connections">
+          ${connections.map(({ line, poLine, matchMeta }) => `
+            <div class="po-match-connector ${matchMeta.exactMatch ? "exact" : "manual"}">
+              <span class="po-match-connector-line" aria-hidden="true">→</span>
+              <div>
+                <strong>${escapeHtml(line.sourceOrderRef || order.id)} #${escapeHtml(line.lineId || line.id || "--")}</strong>
+                <span>to ${escapeHtml(poLine.poRef)} #${escapeHtml(poLine.lineId || poLine.id || "--")}</span>
+                <em>${matchMeta.exactMatch ? "Exact description + unit" : `Manual match${!matchMeta.descriptionMatch ? " · description differs" : ""}${!matchMeta.unitMatch ? " · unit differs" : ""}`}</em>
+              </div>
+              <button data-action="remove-po-line-match" data-target-line-key="${escapeHtml(line.targetLineKey || "")}" type="button" aria-label="Remove this match">×</button>
+            </div>
+          `).join("") || `<div class="po-match-connector-empty">Select an SO line to begin.</div>`}
+        </div>
+      </section>
+
+      <section class="po-match-column po-match-po-column">
+        <header><span>3</span><div><strong>${escapeHtml(selectedPoLines[0]?.poRef || draft.ref)} lines</strong><small>${selectedPoLines.length} line(s)</small></div></header>
+        <div class="po-match-card-list" data-po-match-scroll="po">
+          ${selectedPoLines.map((poLine) => {
+            const matchMeta = pendingLine ? poLinkMatchMeta(pendingLine, poLine.id, draft.ref) : null;
+            const linkedCount = linkedCountByPo.get(String(poLine.id)) || 0;
+            const stateClass = !pendingLine ? "waiting" : (matchMeta ? (matchMeta.exactMatch ? "exact" : "compatible") : "incompatible");
+            const stateText = !pendingLine ? "Select SO first" : (matchMeta ? (matchMeta.exactMatch ? "Exact match" : "Manual match allowed") : "Different item");
+            return `
+              <button class="po-match-card po-match-po-card ${stateClass} ${linkedCount ? "mapped" : ""}"
+                data-action="select-po-map-po" data-po-map-po="true" data-po-line-id="${poLine.id}" type="button"
+                aria-disabled="${pendingLine && !matchMeta ? "true" : "false"}">
+                <span class="po-match-card-top"><b>${escapeHtml(poLine.poRef)}</b><em>PO line ${escapeHtml(poLine.lineId || poLine.id || "--")}</em></span>
+                <strong>${escapeHtml(poLine.sku || poLine.itemName)}</strong>
+                <span class="po-match-card-description">${escapeHtml(poLine.description || "No description")}</span>
+                <span class="po-match-card-qty">Open ${escapeHtml(availableQtyTextForLine(poLine))}</span>
+                <span class="po-match-card-state">${escapeHtml(stateText)}${linkedCount ? ` · ${linkedCount} connection(s)` : ""}</span>
+              </button>
+            `;
+          }).join("")}
+        </div>
+      </section>
+    </div>
+  `;
+}
+
 function renderPoLinkModal(order) {
   const options = poAllocationOptions;
   const draft = getLinkModalDraft("po", order.id);
+  draft.poLineIds ||= {};
+  draft.pendingSoLineKey ||= "";
   const salesLines = options?.salesLines || [];
   const poLines = options?.poLines || [];
   const allocations = options?.allocations || [];
   const poRefs = [...new Map(poLines.map((line) => [line.poRef, line])).values()];
+  const selectedPoLines = poLinkLinesForRef(draft.ref);
+  const matchableSalesLines = selectedPoLines.length
+    ? salesLines.filter((line) => poLinkCandidateLinesForSalesLine(line, draft.ref).length)
+    : salesLines;
   return `
     <div class="modal-backdrop show" data-link-modal="true">
       <section class="dispatch-modal wide-modal">
@@ -5828,7 +6122,7 @@ function renderPoLinkModal(order) {
               `).join("")}
             </div>
           ` : ""}
-          <form class="po-link-form" data-form="po-link">
+          <form class="po-link-form" data-form="po-link" novalidate>
             <label class="split-field">
               <span>Purchase order</span>
               <input id="poLinkRef" name="poRef" value="${escapeHtml(draft.ref)}" list="poLinkPoOptions" placeholder="Type PO number" autocomplete="off" required />
@@ -5838,12 +6132,19 @@ function renderPoLinkModal(order) {
                 `).join("")}
               </datalist>
             </label>
+            ${renderPoLinkMatchBoard(order, matchableSalesLines, poLines, draft)}
+            <div class="po-link-quantity-heading">
+              <strong>Connected quantities</strong>
+              <span>Only connected SO lines can be entered below.</span>
+            </div>
             <div class="po-link-lines">
-              ${salesLines.map((line, index) => {
+              ${matchableSalesLines.map((line, index) => {
                 const units = availableUnitsForLine(line);
-                const selectedPoLines = poLines.filter((poLine) => String(poLine.poRef || "").trim().toLowerCase() === String(draft.ref || "").trim().toLowerCase());
-                const selectedPoHasItem = selectedPoLines.some((poLine) => linkLineItemsMatch(line, poLine));
-                const values = Object.fromEntries(units.map(([field, , max]) => [field, draft.quantities[line.targetLineKey]?.[field] ?? (selectedPoHasItem ? max : 0)]));
+                const selectedPoLineId = String(draft.poLineIds[line.targetLineKey] || "");
+                const selectedPoLine = selectedPoLines.find((poLine) => String(poLine.id) === selectedPoLineId);
+                const matchMeta = selectedPoLine ? poLinkMatchMeta(line, selectedPoLine.id, draft.ref) : null;
+                const selectedPoHasItem = Boolean(selectedPoLine && matchMeta);
+                const values = Object.fromEntries(units.map(([field]) => [field, draft.quantities[line.targetLineKey]?.[field] ?? 0]));
                 const equivalent = linkSalesQuantityFromValues(values, line.conversions || {});
                 return `
                 <section class="po-link-line link-quantity-line" data-sales-line="${line.id}" data-target-line-key="${escapeHtml(line.targetLineKey || "")}" data-to-plt="${Number(line.conversions?.pallets || 0)}" data-to-lyr="${Number(line.conversions?.layers || 0)}" data-to-sec="${Number(line.conversions?.sections || 0)}" data-to-pcs="${Number(line.conversions?.pieces || 0)}" data-sales-unit="${escapeHtml(line.required?.unit || "Qty")}">
@@ -5853,20 +6154,23 @@ function renderPoLinkModal(order) {
                     <span>${escapeHtml(line.description || "")}</span>
                     <em>Open ${availableQtyTextForLine(line)}</em>
                     <em class="link-sales-equivalent" data-link-sales-equivalent>Selected ${escapeHtml(qtyText(equivalent))} ${escapeHtml(line.required?.unit || "Qty")}</em>
+                    ${selectedPoHasItem ? `
+                      <span class="po-link-qty-match connected">${matchMeta.exactMatch ? "Exact" : "Manual"} match · ${escapeHtml(selectedPoLine.poRef)} line ${escapeHtml(selectedPoLine.lineId || selectedPoLine.id)}</span>
+                    ` : `<span class="po-link-qty-match">Not connected — match this SO line above to enter quantity.</span>`}
                   </div>
                   <div class="link-quantity-units">${units.map(([field, label, max]) => `
-                    <label><span>${escapeHtml(label)}</span><input id="poLinkQty-${index}-${field}" data-po-link-qty="${field}" type="number" min="0" max="${Number(max || 0)}" step="1" value="${escapeHtml(values[field] ?? 0)}" /></label>
+                    <label><span>${escapeHtml(label)}</span><input id="poLinkQty-${index}-${field}" data-po-link-qty="${field}" type="number" inputmode="decimal" min="0" max="${Number(max || 0)}" step="${linkQuantityInputStep()}" value="${escapeHtml(values[field] ?? 0)}" ${selectedPoHasItem ? "" : "disabled"} /></label>
                   `).join("") || `<span class="muted">No available quantity</span>`}</div>
                 </section>
               `; }).join("")}
             </div>
             <div class="warning-detail">
-              The PO number is free input with autocomplete. On submit, each SO item with quantity will be matched to the same item in that PO and reserved locally.
+              Item code controls which cards can connect. For MBBS-Special, description and sales unit identify an exact match; when either differs, the connection is clearly saved as a manual line match. Physical quantities and sales quantity remain independent.
             </div>
             <div class="modal-status" data-modal-status></div>
             <div class="modal-footer">
               <button data-action="close-modal" type="button">Cancel</button>
-              <button class="primary" ${salesLines.length && !draft.structureWarning ? "" : "disabled"} type="submit">Connect PO Quantity</button>
+              <button class="primary" ${matchableSalesLines.length && !draft.structureWarning ? "" : "disabled"} type="submit">Connect PO Quantity</button>
             </div>
           </form>
           ${!poAllocationLoading && !salesLines.length ? `<div class="empty-drop">No SO item line was found.</div>` : ""}
@@ -7006,6 +7310,18 @@ app.addEventListener("dragstart", (event) => {
     event.preventDefault();
     return;
   }
+  const poMapSo = event.target.closest("[data-po-map-so]");
+  if (poMapSo) {
+    captureActiveLinkModalDraft();
+    const draft = getLinkModalDraft("po", modalOrderId);
+    draft.pendingSoLineKey = poMapSo.dataset.targetLineKey || "";
+    refreshPoLinkBoardInPlace(modalOrderId);
+    dragged = { type: "po-map-so", targetLineKey: poMapSo.dataset.targetLineKey };
+    poMapSo.classList.add("dragging");
+    event.dataTransfer.effectAllowed = "link";
+    event.dataTransfer.setData("text/plain", poMapSo.dataset.targetLineKey);
+    return;
+  }
   const orderCard = event.target.closest("[data-order]");
   const stopCard = event.target.closest("[data-stop]");
   if (stopCard) {
@@ -7025,6 +7341,13 @@ app.addEventListener("dragstart", (event) => {
     dragged = { type: "order", orderId: orderCard.dataset.order };
     event.dataTransfer.setData("text/plain", orderCard.dataset.order);
   }
+});
+
+app.addEventListener("dragend", () => {
+  document.querySelectorAll(".po-match-card.dragging, .po-match-card.drag-over").forEach(
+    (card) => card.classList.remove("dragging", "drag-over")
+  );
+  if (dragged?.type === "po-map-so") dragged = null;
 });
 
 function startPreviewResize(event) {
@@ -7090,6 +7413,13 @@ window.addEventListener("keydown", (event) => {
 });
 
 app.addEventListener("dragover", (event) => {
+  const poMapTarget = event.target.closest("[data-po-map-po]");
+  if (dragged?.type === "po-map-so" && poMapTarget) {
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "link";
+    poMapTarget.classList.add("drag-over");
+    return;
+  }
   const list = event.target.closest(".stop-list, .preview-stop-list");
   const stopCard = event.target.closest(".stop-card, .preview-stop");
   const createZone = event.target.closest(".timeline-drop-zone");
@@ -7105,6 +7435,7 @@ app.addEventListener("dragover", (event) => {
 });
 
 app.addEventListener("dragleave", (event) => {
+  event.target.closest("[data-po-map-po]")?.classList.remove("drag-over");
   event.target.closest(".stop-list, .preview-stop-list")?.classList.remove("drag-over");
   event.target.closest(".stop-card, .preview-stop")?.classList.remove("drag-over", "insert-before", "insert-after");
   event.target.closest(".timeline-drop-zone")?.classList.remove("drag-over");
@@ -7113,6 +7444,17 @@ app.addEventListener("dragleave", (event) => {
 app.addEventListener("drop", (event) => {
   if (!ensureDispatchPlanEditor()) {
     event.preventDefault();
+    return;
+  }
+  const poMapTarget = event.target.closest("[data-po-map-po]");
+  if (dragged?.type === "po-map-so" && poMapTarget) {
+    event.preventDefault();
+    poMapTarget.classList.remove("drag-over");
+    const connected = setPoLineMatch(modalOrderId, dragged.targetLineKey, poMapTarget.dataset.poLineId);
+    dragged = null;
+    if (!connected) {
+      setModalFormStatus(poMapTarget.closest("form"), "These lines have different item codes and cannot be connected.", "error");
+    }
     return;
   }
   const targetStop = event.target.closest(".stop-card, .preview-stop");
@@ -7313,6 +7655,30 @@ app.addEventListener("click", (event) => {
     const draft = getLinkModalDraft("po", modalOrderId);
     draft.structureWarning = "";
     loadPoAllocationOptions(modalOrderId).catch(() => null);
+    return;
+  }
+  if (action === "select-po-map-so") {
+    captureActiveLinkModalDraft();
+    const draft = getLinkModalDraft("po", modalOrderId);
+    draft.pendingSoLineKey = button.dataset.targetLineKey || "";
+    if (!refreshPoLinkBoardInPlace(modalOrderId)) renderActiveLinkModalInPlace();
+    return;
+  }
+  if (action === "select-po-map-po") {
+    captureActiveLinkModalDraft();
+    const draft = getLinkModalDraft("po", modalOrderId);
+    const form = button.closest("form");
+    if (!draft.pendingSoLineKey) {
+      setModalFormStatus(form, "Select an SO line first, then choose its PO line.", "info");
+      return;
+    }
+    if (!setPoLineMatch(modalOrderId, draft.pendingSoLineKey, button.dataset.poLineId)) {
+      setModalFormStatus(form, "These lines have different item codes and cannot be connected.", "error");
+    }
+    return;
+  }
+  if (action === "remove-po-line-match") {
+    removePoLineMatch(modalOrderId, button.dataset.targetLineKey);
     return;
   }
   if (DISPATCH_VIEW_MUTATION_ACTIONS.has(action) && !ensureDispatchPlanEditor()) return;
@@ -7905,9 +8271,11 @@ app.addEventListener("input", (event) => {
       if (draft.ref !== nextRef) {
         draft.ref = nextRef;
         draft.quantities = {};
+        draft.poLineIds = {};
         draft.defaultsAppliedRef = "";
+        draft.pendingSoLineKey = "";
       }
-      applyPoLinkDefaultsForRef(modalOrderId, nextRef);
+      if (applyPoLinkDefaultsForRef(modalOrderId, nextRef)) renderActiveLinkModalInPlace();
       return;
     }
     if (event.target.matches("[data-to-link-qty], [data-po-link-qty]")) updateLinkSalesEquivalent(event.target.closest(".link-quantity-line"));
@@ -8281,6 +8649,7 @@ app.addEventListener("submit", (event) => {
     const lines = [...form.querySelectorAll(".po-link-line")].map((row) => ({
       salesLineId: row.dataset.salesLine,
       targetLineKey: row.dataset.targetLineKey,
+      poLineId: String(draft.poLineIds[row.dataset.targetLineKey] || ""),
       quantities: {
         pallets: row.querySelector('[data-po-link-qty="pallets"]')?.value || 0,
         layers: row.querySelector('[data-po-link-qty="layers"]')?.value || 0,
@@ -8294,7 +8663,11 @@ app.addEventListener("submit", (event) => {
       return;
     }
     if (!lines.length) {
-      setModalFormStatus(form, "Enter quantity for at least one SO item.", "error");
+      setModalFormStatus(form, "Enter quantity for at least one connected SO item.", "error");
+      return;
+    }
+    if (lines.some((line) => !line.poLineId)) {
+      setModalFormStatus(form, "Connect every SO line that has a quantity to a PO line.", "error");
       return;
     }
     if (draft.structureWarning) {

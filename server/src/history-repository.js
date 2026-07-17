@@ -166,7 +166,11 @@ export async function listOperatorHistory({ operatorId, date = "", limit = 100 }
               ),
               'response', l.response
             ) AS details,
-            CASE WHEN l.photo_data_url <> '' THEN jsonb_build_array(l.photo_data_url) ELSE '[]'::jsonb END AS photos
+            CASE
+              WHEN jsonb_array_length(COALESCE(l.photo_data_urls, '[]'::jsonb)) > 0 THEN l.photo_data_urls
+              WHEN l.photo_data_url <> '' THEN jsonb_build_array(l.photo_data_url)
+              ELSE '[]'::jsonb
+            END AS photos
      FROM operator_load_records l
      LEFT JOIN sales_orders so ON so.netsuite_id = l.order_id AND l.order_family = 'sales_order'
      LEFT JOIN transfer_orders tr ON tr.netsuite_id = l.order_id AND l.order_family = 'transfer_order'

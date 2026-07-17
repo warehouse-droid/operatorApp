@@ -14,6 +14,7 @@ import {
   listTransferDependencyCandidates,
   markDirectDependencyPickupCompleted,
   prepareTransferDependencyPalletItem,
+  removeTransferDependencyProposalLine,
   reopenTransferDependencyCandidate,
   reviewTransferDependencyCandidate,
   syncDirectDependencyOperatorProgress,
@@ -37,6 +38,8 @@ const suffix = Number(String(Date.now()).slice(-6));
 const salesOrderId = 9871000000 + suffix;
 const itemId = 9872000000 + suffix;
 const palletItemId = itemId + 1;
+const repeatedItemId = itemId + 2;
+const repeatedSalesOrderId = salesOrderId + 1;
 const createdTransferIds = [9873000000 + suffix, 9874000000 + suffix];
 const salesOrderRef = `TSTDEP-SO-HARNESS-${suffix}`;
 
@@ -254,7 +257,7 @@ try {
     await query("UPDATE sales_orders SET is_test_fixture = false, netsuite_active = true WHERE netsuite_id = $1", [salesOrderId]);
     await query("UPDATE sales_order_lines SET netsuite_active = true WHERE sales_order_id = $1", [salesOrderId]);
 
-    const batch = await generateTransferDependencySuggestion({
+    let batch = await generateTransferDependencySuggestion({
       salesOrderId,
       mode: "direct_to_customer",
       operatorId: "dependency-harness"
@@ -265,6 +268,25 @@ try {
       proposalLine.quantities?.pallets === proposalLine.proposedQuantity)),
     "Generated Auto Transfer proposals must default conversion-unit inputs to the suggested required quantity.",
     { proposals: batch.proposals });
+    const removableProposal = batch.proposals[0];
+    const removableLine = removableProposal.lines[0];
+    const removedDraft = await removeTransferDependencyProposalLine(
+      batch.id,
+      removableProposal.id,
+      removableLine.id,
+      "dependency-harness"
+    );
+    check(!removedDraft.proposals.some((proposal) => proposal.lines.some((line) => line.id === removableLine.id)),
+      "Auto Transfer must allow a suggested order line to be removed instead of requiring a zero quantity.",
+      { removableLine, removedDraft });
+    check(removedDraft.uncoveredShortageQuantity >= removableLine.proposedQuantity,
+      "Removing a suggested order line must restore its quantity to the uncovered total.",
+      { removableLine, removedDraft });
+    batch = await generateTransferDependencySuggestion({
+      salesOrderId,
+      mode: "direct_to_customer",
+      operatorId: "dependency-harness"
+    });
     const editableProposal = batch.proposals[0];
     const editableLine = editableProposal.lines[0];
     const originalQuantity = editableLine.proposedQuantity;
@@ -608,6 +630,58 @@ try {
     const block = await getSalesOrderDependencyExecutionBlock([salesOrderRef]);
     check(block === null, "Direct dependency must not block SO execution as a replenishment prerequisite.", { block });
     check(Number(line.rows[0].id) > 0, "Fixture Sales Order line should remain canonical.");
+
+    await query(
+      `INSERT INTO inventory_items (
+         item_id, item_name, item_type, item_type_text, stock_unit,
+         to_plt, to_lyr, to_sec, to_pcs, item_weight
+       ) VALUES ($1, 'Repeated Dependency Block', 'InvtPart', 'Inventory Item', 'EA', 1, 0, 0, 1, 50)`,
+      [repeatedItemId]
+    );
+    await query(
+      `INSERT INTO inventory_balances (item_id, location_id, location, quantity_on_hand, quantity_available)
+       VALUES ($1, 1, '3445', 6, 6), ($1, 28, '2967', 4, 4),
+              ($1, 15, '12441', 0, 0), ($1, 26, '150', 0, 0)`,
+      [repeatedItemId]
+    );
+    await query(
+      `INSERT INTO sales_orders (
+         netsuite_id, tranid, trandate, customer, status, status_text,
+         outbound_location_id, outbound_location, sales_order_type,
+         fulfillment_status, operator_status, local_yard_order_status,
+         dispatch_address, netsuite_active
+       ) VALUES (
+         $1, $2, DATE '2097-07-13', 'Repeated Item Harness', 'B', 'Pending Fulfillment',
+         15, '12441', 'Delivery', 'open', 'open', 'Open',
+         '100 Test Street, Toronto, ON', true
+       )`,
+      [repeatedSalesOrderId, `${salesOrderRef}-REPEATED`]
+    );
+    await query(
+      `INSERT INTO sales_order_lines (
+         sales_order_id, line_id, item_id, item_name, sku, item_type,
+         item_type_text, quantity, unit, pallet_qty, to_plt, to_pcs,
+         netsuite_committed_qty, netsuite_backordered_qty, netsuite_active,
+         location_id, location
+       ) VALUES
+         ($1, $3, $2, 'Repeated Dependency Block', 'DEP-REPEATED', 'InvtPart',
+          'Inventory Item', 6, 'EA', 6, 1, 1, 0, 6, true, 15, '12441'),
+         ($1, $4, $2, 'Repeated Dependency Block', 'DEP-REPEATED', 'InvtPart',
+          'Inventory Item', 6, 'EA', 6, 1, 1, 0, 6, true, 15, '12441')`,
+      [repeatedSalesOrderId, repeatedItemId, 9875001000 + suffix, 9875002000 + suffix]
+    );
+    const repeatedBatch = await generateTransferDependencySuggestion({
+      salesOrderId: repeatedSalesOrderId,
+      mode: "direct_to_customer",
+      operatorId: "dependency-harness"
+    });
+    const repeatedProposedQuantity = repeatedBatch.proposals
+      .flatMap((proposal) => proposal.lines)
+      .filter((proposalLine) => String(proposalLine.itemId) === String(repeatedItemId))
+      .reduce((total, proposalLine) => total + Number(proposalLine.proposedQuantity || 0), 0);
+    check(repeatedProposedQuantity === 10 && repeatedBatch.uncoveredShortageQuantity === 2,
+      "Repeated SO lines for one item must share the same source-yard availability and leave the true item-level undercoverage.",
+      { repeatedProposedQuantity, repeatedBatch });
   });
   console.log("Order dependency rollback harness passed.");
 } finally {

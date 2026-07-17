@@ -185,6 +185,103 @@ async function runRepositorySimulation(checks) {
     item_weight: 2.5
   });
   await assertDispatchWeight(`SIM-SO-${runId}`, 280);
+  const specialSalesLines = [
+    {
+      line_id: 12,
+      item_id: 2055,
+      item_name: "MBBS-Special",
+      item_description: "Custom coping - charcoal",
+      quantity: 1,
+      unit: "PC",
+      location_id: 1,
+      location: "3445",
+      pallet_qty: 1,
+      layer_qty: 0,
+      section_qty: 0,
+      piece_qty: 0
+    },
+    {
+      line_id: 13,
+      item_id: 2055,
+      item_name: "MBBS-Special",
+      item_description: "Custom coping - limestone",
+      quantity: 2,
+      unit: "PC",
+      location_id: 1,
+      location: "3445",
+      pallet_qty: 0,
+      layer_qty: 2,
+      section_qty: 0,
+      piece_qty: 0
+    },
+    {
+      line_id: 14,
+      item_id: 2055,
+      item_name: "MBBS-Special",
+      item_description: "Custom coping - ivory",
+      quantity: 3,
+      unit: "PC",
+      location_id: 1,
+      location: "3445",
+      pallet_qty: 0,
+      layer_qty: 0,
+      section_qty: 1,
+      piece_qty: 4
+    }
+  ];
+  await upsertSalesOrderLines(ids.sales, specialSalesLines);
+  await upsertSalesOrderLines(ids.sales, [...specialSalesLines].reverse());
+  const storedSpecialSalesLines = await all(
+    "SELECT line_id, item_description, pallet_qty, layer_qty, section_qty, piece_qty, pack_quantity_source "
+      + "FROM sales_order_lines WHERE sales_order_id = $1 AND item_id = 2055 AND netsuite_active = true ORDER BY line_id",
+    [ids.sales]
+  );
+  check(storedSpecialSalesLines.length === 3, "Repeated MBBS-Special sales lines collapsed during sync.", { storedSpecialSalesLines });
+  check(storedSpecialSalesLines.map((line) => number(line.line_id)).join(",") === "12,13,14",
+    "MBBS-Special sales lines did not retain their NetSuite unique keys.", { storedSpecialSalesLines });
+  check(storedSpecialSalesLines.every((line) => line.pack_quantity_source === "netsuite_manual"),
+    "Manual MBBS-Special sales quantities did not retain their source.", { storedSpecialSalesLines });
+  check(storedSpecialSalesLines.map((line) => line.item_description).join("|")
+      === "Custom coping - charcoal|Custom coping - limestone|Custom coping - ivory",
+    "MBBS-Special sales descriptions were not retained line by line.", { storedSpecialSalesLines });
+  const deliveryRepository = await import("./delivery-repository.js");
+  const testOperator = await one("SELECT id FROM operators WHERE active = true ORDER BY created_at LIMIT 1");
+  check(testOperator, "An active operator is required for MBBS-Special delivery regression coverage.");
+  const manualDeliveryLine = await one(
+    "SELECT id FROM sales_order_lines WHERE sales_order_id = $1 AND line_id = 13",
+    [ids.sales]
+  );
+  let partialPackRejected = false;
+  try {
+    await deliveryRepository.confirmDeliveryLine(ids.sales, manualDeliveryLine.id, { layers: 1 }, testOperator.id);
+  } catch (error) {
+    partialPackRejected = /sales-unit quantity/i.test(error.message);
+  }
+  check(partialPackRejected, "Partial manual MBBS-Special packing did not require sales quantity.");
+  await deliveryRepository.confirmDeliveryLine(
+    ids.sales,
+    manualDeliveryLine.id,
+    { layers: 1, salesQty: 1 },
+    testOperator.id
+  );
+  let manualDeliveryProgress = await one(
+    "SELECT packed_layer_qty, packed_sales_qty FROM sales_order_lines WHERE id = $1",
+    [manualDeliveryLine.id]
+  );
+  check(number(manualDeliveryProgress.packed_layer_qty) === 1 && number(manualDeliveryProgress.packed_sales_qty) === 1,
+    "Manual MBBS-Special physical and sales packing quantities were not persisted independently.", { manualDeliveryProgress });
+  await deliveryRepository.setDeliveryLinePackedQuantity(
+    ids.sales,
+    manualDeliveryLine.id,
+    { layers: 2 },
+    testOperator.id
+  );
+  manualDeliveryProgress = await one(
+    "SELECT packed_layer_qty, packed_sales_qty FROM sales_order_lines WHERE id = $1",
+    [manualDeliveryLine.id]
+  );
+  check(number(manualDeliveryProgress.packed_layer_qty) === 2 && number(manualDeliveryProgress.packed_sales_qty) === 2,
+    "Full manual MBBS-Special packing did not map the remaining sales quantity.", { manualDeliveryProgress });
   checks.push("repository sales order -> sales_orders/sales_order_lines");
 
   await upsertPurchaseOrders([{
@@ -401,6 +498,100 @@ async function runRepositorySimulation(checks) {
   );
   check(number(restoredSplit.quantity) === 100 && restoredSplit.line_active && restoredSplit.order_active,
     "A later PO quantity increase did not restore the requested split quantity.", { restoredSplit });
+  const specialPurchaseLines = [
+    {
+      line_id: 22,
+      item_id: 2055,
+      item_name: "MBBS-Special",
+      item_description: "Custom coping - charcoal",
+      quantity: 1,
+      unit: "PC",
+      location_id: 15,
+      location: "12441",
+      pallet_qty: 1,
+      layer_qty: 0,
+      section_qty: 0,
+      piece_qty: 0
+    },
+    {
+      line_id: 23,
+      item_id: 2055,
+      item_name: "MBBS-Special",
+      item_description: "Custom coping - limestone",
+      quantity: 2,
+      unit: "PC",
+      location_id: 15,
+      location: "12441",
+      pallet_qty: 0,
+      layer_qty: 2,
+      section_qty: 0,
+      piece_qty: 0
+    },
+    {
+      line_id: 24,
+      item_id: 2055,
+      item_name: "MBBS-Special",
+      item_description: "Custom coping - ivory",
+      quantity: 3,
+      unit: "PC",
+      location_id: 15,
+      location: "12441",
+      pallet_qty: 0,
+      layer_qty: 0,
+      section_qty: 1,
+      piece_qty: 4
+    }
+  ];
+  await upsertPurchaseOrderLines(ids.purchase, specialPurchaseLines);
+  await upsertPurchaseOrderLines(ids.purchase, [...specialPurchaseLines].reverse());
+  const storedSpecialPurchaseLines = await all(
+    "SELECT line_id, item_description, pallet_qty, layer_qty, section_qty, piece_qty, pack_quantity_source "
+      + "FROM purchase_order_lines WHERE purchase_order_id = $1 AND item_id = 2055 AND netsuite_active = true ORDER BY line_id",
+    [ids.purchase]
+  );
+  check(storedSpecialPurchaseLines.length === 3, "Repeated MBBS-Special PO lines collapsed during sync.", { storedSpecialPurchaseLines });
+  check(storedSpecialPurchaseLines.map((line) => number(line.line_id)).join(",") === "22,23,24",
+    "MBBS-Special PO lines did not retain their NetSuite unique keys.", { storedSpecialPurchaseLines });
+  check(storedSpecialPurchaseLines.every((line) => line.pack_quantity_source === "netsuite_manual"),
+    "Manual MBBS-Special PO quantities did not retain their source.", { storedSpecialPurchaseLines });
+  check(storedSpecialPurchaseLines.map((line) => line.item_description).join("|")
+      === "Custom coping - charcoal|Custom coping - limestone|Custom coping - ivory",
+    "MBBS-Special PO descriptions were not retained line by line.", { storedSpecialPurchaseLines });
+  const manualReceivingLine = await one(
+    "SELECT id FROM purchase_order_lines WHERE purchase_order_id = $1 AND line_id = 23",
+    [ids.purchase]
+  );
+  let partialReceiptRejected = false;
+  try {
+    await receivingRepository.confirmReceivingLine(ids.purchase, manualReceivingLine.id, { layers: 1 }, testOperator.id);
+  } catch (error) {
+    partialReceiptRejected = /sales-unit quantity/i.test(error.message);
+  }
+  check(partialReceiptRejected, "Partial manual MBBS-Special receiving did not require sales quantity.");
+  await receivingRepository.confirmReceivingLine(
+    ids.purchase,
+    manualReceivingLine.id,
+    { layers: 1, salesQty: 1 },
+    testOperator.id
+  );
+  let manualReceivingProgress = await one(
+    "SELECT received_layer_qty, received_sales_qty FROM purchase_order_lines WHERE id = $1",
+    [manualReceivingLine.id]
+  );
+  check(number(manualReceivingProgress.received_layer_qty) === 1 && number(manualReceivingProgress.received_sales_qty) === 1,
+    "Manual MBBS-Special physical and sales receiving quantities were not persisted independently.", { manualReceivingProgress });
+  await receivingRepository.confirmReceivingLine(
+    ids.purchase,
+    manualReceivingLine.id,
+    { layers: 2 },
+    testOperator.id
+  );
+  manualReceivingProgress = await one(
+    "SELECT received_layer_qty, received_sales_qty FROM purchase_order_lines WHERE id = $1",
+    [manualReceivingLine.id]
+  );
+  check(number(manualReceivingProgress.received_layer_qty) === 2 && number(manualReceivingProgress.received_sales_qty) === 2,
+    "Full manual MBBS-Special receiving did not map the remaining sales quantity.", { manualReceivingProgress });
   checks.push("repository purchase order -> purchase_orders/purchase_order_lines");
 
   const transferOrder = {
@@ -607,7 +798,7 @@ async function runWebhookSimulation(checks) {
     to_location_id: 15,
     line_id: 61,
     outbound_pallet_qty: 1,
-    outbound_layer_qty: 0,
+    outbound_layer_qty: 2,
     receiving_pallet_qty: 1,
     netsuite_received_qty: 10,
     to_plt: 100,

@@ -1,14 +1,17 @@
 const DISPATCH_AUTH_TOKEN_KEY = "mbbs.dispatch.token";
-const DISPATCH_AUTH_FALLBACK_TOKEN_KEYS = ["mbbs.control.token"];
+const DISPATCH_STAFF_TOKEN_KEY = "mbbs.staff.token";
+const DISPATCH_STAFF_ROLE_KEY = "mbbs.staff.role";
+const DISPATCH_STAFF_ROLES_KEY = "mbbs.staff.roles";
+const DISPATCH_AUTH_FALLBACK_TOKEN_KEYS = ["mbbs.control.token", "mbbs.operator.token"];
 let dispatchAuthTokenKey = DISPATCH_AUTH_TOKEN_KEY;
 let dispatchAuthToken = readDispatchAuthToken();
 let dispatchAuthOperator = null;
 const dispatchNativeFetch = window.fetch.bind(window);
 
 function readDispatchAuthToken() {
-  const primary = localStorage.getItem(DISPATCH_AUTH_TOKEN_KEY) || "";
+  const primary = localStorage.getItem(DISPATCH_STAFF_TOKEN_KEY) || localStorage.getItem(DISPATCH_AUTH_TOKEN_KEY) || "";
   if (primary) {
-    dispatchAuthTokenKey = DISPATCH_AUTH_TOKEN_KEY;
+    dispatchAuthTokenKey = localStorage.getItem(DISPATCH_STAFF_TOKEN_KEY) ? DISPATCH_STAFF_TOKEN_KEY : DISPATCH_AUTH_TOKEN_KEY;
     return primary;
   }
   for (const key of DISPATCH_AUTH_FALLBACK_TOKEN_KEYS) {
@@ -23,8 +26,9 @@ function readDispatchAuthToken() {
 }
 
 function clearDispatchAuthToken() {
-  if (dispatchAuthTokenKey) localStorage.removeItem(dispatchAuthTokenKey);
-  localStorage.removeItem(DISPATCH_AUTH_TOKEN_KEY);
+  for (const key of [DISPATCH_STAFF_TOKEN_KEY, DISPATCH_STAFF_ROLE_KEY, DISPATCH_STAFF_ROLES_KEY, DISPATCH_AUTH_TOKEN_KEY, "mbbs.control.token", "mbbs.operator.token"]) {
+    localStorage.removeItem(key);
+  }
   dispatchAuthToken = "";
   dispatchAuthTokenKey = DISPATCH_AUTH_TOKEN_KEY;
 }
@@ -48,7 +52,33 @@ window.fetch = (input, options = {}) => {
 };
 
 function dispatchCanAccess(operator, roles = ["dispatcher", "admin"]) {
-  return roles.includes(operator?.role);
+  const granted = new Set([
+    ...(Array.isArray(operator?.roles) ? operator.roles : []),
+    operator?.role
+  ].map((role) => String(role || "").trim().toLowerCase().replaceAll("-", "_").replaceAll(" ", "_")).filter(Boolean));
+  return roles.some((role) => granted.has(String(role || "").trim().toLowerCase().replaceAll("-", "_").replaceAll(" ", "_")));
+}
+
+function dispatchRoleHome(role) {
+  const clean = String(role || "").trim().toLowerCase().replaceAll("-", "_").replaceAll(" ", "_");
+  if (clean === "admin") return "/admin";
+  if (clean === "dispatcher") return "/dispatch";
+  if (clean === "scm" || clean === "scm_staff") return "/scm";
+  if (clean === "yard_manager") return "/control";
+  if (clean === "operator") return "/operator";
+  return "/";
+}
+
+function storeDispatchStaffSession(nextToken, nextOperator) {
+  dispatchAuthToken = nextToken || "";
+  if (dispatchAuthToken) {
+    localStorage.setItem(DISPATCH_STAFF_TOKEN_KEY, dispatchAuthToken);
+    localStorage.setItem(DISPATCH_AUTH_TOKEN_KEY, dispatchAuthToken);
+  }
+  if (nextOperator?.role) localStorage.setItem(DISPATCH_STAFF_ROLE_KEY, String(nextOperator.role));
+  localStorage.setItem(DISPATCH_STAFF_ROLES_KEY, JSON.stringify([
+    ...new Set([...(Array.isArray(nextOperator?.roles) ? nextOperator.roles : []), nextOperator?.role].filter(Boolean))
+  ]));
 }
 
 async function dispatchCheckSession(roles) {
@@ -62,7 +92,11 @@ async function dispatchCheckSession(roles) {
     return null;
   }
   const payload = await response.json();
-  if (!dispatchCanAccess(payload.operator, roles)) return null;
+  storeDispatchStaffSession(dispatchAuthToken, payload.operator);
+  if (!dispatchCanAccess(payload.operator, roles)) {
+    window.location.replace(dispatchRoleHome(payload.operator?.role));
+    return { redirected: true };
+  }
   dispatchAuthOperator = payload.operator;
   return payload.operator;
 }
@@ -92,7 +126,12 @@ function renderDispatchLogin(mount, message = "") {
 
 async function requireDispatchLogin({ mount, onReady, roles = ["dispatcher", "admin"] }) {
   const existing = await dispatchCheckSession(roles).catch(() => null);
+  if (existing?.redirected) return;
   if (existing) return onReady(existing);
+  if (localStorage.getItem("mbbs.driver.token")) {
+    window.location.replace("/driver");
+    return;
+  }
 
   renderDispatchLogin(mount);
   mount.addEventListener("submit", async (event) => {
@@ -109,12 +148,13 @@ async function requireDispatchLogin({ mount, onReady, roles = ["dispatcher", "ad
       if (!response.ok) throw new Error(await response.text());
       const payload = await response.json();
       if (!dispatchCanAccess(payload.operator, roles)) {
-        throw new Error("Authorized account required.");
+        storeDispatchStaffSession(payload.token, payload.operator);
+        window.location.replace(dispatchRoleHome(payload.operator?.role));
+        return;
       }
-      dispatchAuthToken = payload.token;
+      storeDispatchStaffSession(payload.token, payload.operator);
       dispatchAuthTokenKey = DISPATCH_AUTH_TOKEN_KEY;
       dispatchAuthOperator = payload.operator;
-      localStorage.setItem(DISPATCH_AUTH_TOKEN_KEY, dispatchAuthToken);
       await onReady(payload.operator);
     } catch (error) {
       clearDispatchAuthToken();
@@ -134,5 +174,5 @@ function dispatchLogout() {
   dispatchAuthToken = "";
   dispatchAuthOperator = null;
   clearDispatchAuthToken();
-  location.href = "/dispatch";
+  location.href = "/";
 }

@@ -1,17 +1,35 @@
 import crypto from "node:crypto";
 import { promisify } from "node:util";
 import { query } from "./db.js";
+import { trackSemanticAudit } from "./audit-context.js";
 
 const scrypt = promisify(crypto.scrypt);
 const SESSION_DAYS = 14;
+export const OPERATOR_ROLES = Object.freeze(["operator", "dispatcher", "admin", "scm", "yard_manager"]);
+
+function normalizeRole(value) {
+  return String(value || "").trim().toLowerCase().replaceAll("-", "_").replaceAll(" ", "_");
+}
+
+function normalizeAuthorities(roles, primaryRole = "operator") {
+  const primary = normalizeRole(primaryRole || "operator");
+  if (!OPERATOR_ROLES.includes(primary)) throw new Error("Invalid primary operator role.");
+  const provided = Array.isArray(roles) ? roles : roles ? [roles] : [];
+  const normalized = [...new Set(provided.map(normalizeRole).filter(Boolean))];
+  if (normalized.some((role) => !OPERATOR_ROLES.includes(role))) throw new Error("Invalid operator authority.");
+  if (!normalized.includes(primary)) normalized.unshift(primary);
+  return { role: primary, roles: normalized.length ? normalized : [primary] };
+}
 
 function publicOperator(row) {
   if (!row) return null;
+  const authority = normalizeAuthorities(row.roles, row.role);
   return {
     id: row.id,
     username: row.username,
     display_name: row.display_name,
-    role: row.role,
+    role: authority.role,
+    roles: authority.roles,
     active: row.active,
     created_at: row.created_at,
     updated_at: row.updated_at
@@ -39,28 +57,28 @@ export async function hasOperators() {
   return result.rowCount > 0;
 }
 
-export async function createOperator({ username, displayName, password, role = "operator" }) {
+export async function createOperator({ username, displayName, password, role = "operator", roles = null }) {
   const cleanUsername = String(username || "").trim().toLowerCase();
   const cleanDisplayName = String(displayName || username || "").trim();
   if (!cleanUsername) throw new Error("Username is required.");
   if (!cleanDisplayName) throw new Error("Display name is required.");
   if (!password || String(password).length < 6) throw new Error("Password must be at least 6 characters.");
-  if (!["operator", "dispatcher", "admin", "scm", "yard_manager"].includes(role)) throw new Error("Invalid operator role.");
+  const authority = normalizeAuthorities(roles, role);
 
   const { salt, hash } = await hashPassword(String(password));
   const id = crypto.randomUUID();
   const result = await query(
-    `INSERT INTO operators (id, username, display_name, password_hash, password_salt, role)
-     VALUES ($1, $2, $3, $4, $5, $6)
-     RETURNING id, username, display_name, role, active, created_at, updated_at`,
-    [id, cleanUsername, cleanDisplayName, hash, salt, role]
+    `INSERT INTO operators (id, username, display_name, password_hash, password_salt, role, roles)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::text[])
+     RETURNING id, username, display_name, role, roles, active, created_at, updated_at`,
+    [id, cleanUsername, cleanDisplayName, hash, salt, authority.role, authority.roles]
   );
   return publicOperator(result.rows[0]);
 }
 
 export async function listOperators() {
   const result = await query(
-    `SELECT id, username, display_name, role, active, created_at, updated_at
+    `SELECT id, username, display_name, role, roles, active, created_at, updated_at
      FROM operators
      ORDER BY active DESC, display_name ASC`
   );
@@ -73,7 +91,7 @@ export async function setOperatorActive(id, active) {
      SET active = $2,
          updated_at = now()
      WHERE id = $1
-     RETURNING id, username, display_name, role, active, created_at, updated_at`,
+     RETURNING id, username, display_name, role, roles, active, created_at, updated_at`,
     [id, Boolean(active)]
   );
   return publicOperator(result.rows[0]);
@@ -88,10 +106,26 @@ export async function updateOperatorPassword(id, password) {
          password_salt = $3,
          updated_at = now()
      WHERE id = $1
-     RETURNING id, username, display_name, role, active, created_at, updated_at`,
+     RETURNING id, username, display_name, role, roles, active, created_at, updated_at`,
     [id, hash, salt]
   );
   await query("DELETE FROM operator_sessions WHERE operator_id = $1", [id]);
+  return publicOperator(result.rows[0]);
+}
+
+export async function updateOperatorRoles(id, { role, roles } = {}) {
+  const current = await query("SELECT id, role, roles FROM operators WHERE id = $1", [id]);
+  if (!current.rowCount) return null;
+  const authority = normalizeAuthorities(roles, role || current.rows[0].role);
+  const result = await query(
+    `UPDATE operators
+     SET role = $2,
+         roles = $3::text[],
+         updated_at = now()
+     WHERE id = $1
+     RETURNING id, username, display_name, role, roles, active, created_at, updated_at`,
+    [id, authority.role, authority.roles]
+  );
   return publicOperator(result.rows[0]);
 }
 
@@ -120,7 +154,7 @@ export async function loginOperator(username, password) {
 export async function getOperatorByToken(token) {
   if (!token) return null;
   const result = await query(
-    `SELECT o.id, o.username, o.display_name, o.role, o.active, o.created_at, o.updated_at
+    `SELECT o.id, o.username, o.display_name, o.role, o.roles, o.active, o.created_at, o.updated_at
      FROM operator_sessions s
      INNER JOIN operators o ON o.id = s.operator_id
      WHERE s.token_hash = $1
@@ -152,7 +186,7 @@ export async function writeAudit({
   lineId = null,
   details = {}
 }) {
-  await query(
+  await trackSemanticAudit(query(
     `INSERT INTO delivery_audit_log (
        actor_type, actor_operator_id, source, action, order_id, line_id, details
      ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
@@ -165,8 +199,84 @@ export async function writeAudit({
       lineId || null,
       JSON.stringify(details || {})
     ]
-  );
+  ));
 }
+
+const UNIFIED_AUDIT_CTE = `WITH unified_audit AS (
+  SELECT
+    a.id,
+    'delivery'::text AS audit_stream,
+    a.actor_type,
+    a.actor_operator_id,
+    NULL::text AS actor_name,
+    a.source,
+    a.action,
+    a.order_id::text AS order_id,
+    a.order_id AS numeric_order_id,
+    a.line_id,
+    NULL::text AS entity_type,
+    NULL::text AS entity_id,
+    NULL::text AS load_id,
+    NULL::text AS truck_id,
+    NULL::text AS session_id,
+    NULL::bigint AS plan_id,
+    NULL::date AS plan_date,
+    NULL::jsonb AS before_state,
+    NULL::jsonb AS after_state,
+    a.details,
+    a.created_at
+  FROM delivery_audit_log a
+  UNION ALL
+  SELECT
+    a.id,
+    'dispatch'::text AS audit_stream,
+    COALESCE(NULLIF(a.operator_name, ''), 'operator') AS actor_type,
+    a.operator_id AS actor_operator_id,
+    a.operator_name AS actor_name,
+    a.source,
+    a.action,
+    a.order_id,
+    CASE WHEN a.order_id ~ '^[0-9]+$' THEN a.order_id::bigint ELSE NULL END AS numeric_order_id,
+    NULL::bigint AS line_id,
+    a.entity_type,
+    a.entity_id,
+    a.load_id,
+    a.truck_id,
+    a.session_id,
+    a.plan_id,
+    a.plan_date,
+    a.before_state,
+    a.after_state,
+    COALESCE(a.details, '{}'::jsonb) AS details,
+    a.created_at
+  FROM dispatch_audit_log a
+), resolved_audit AS (
+  SELECT
+    a.*,
+    COALESCE(o.username, NULLIF(a.actor_name, '')) AS username,
+    COALESCE(o.display_name, NULLIF(a.actor_name, '')) AS display_name,
+    COALESCE(
+      so.tranid,
+      tr.tranid,
+      po.tranid,
+      co.co_ref,
+      a.details->>'tranid',
+      a.details->>'coRef',
+      a.details->>'vrmaRef',
+      a.details->>'sourceOrderRef',
+      a.details->>'orderRef',
+      a.details->>'receivingOrderId',
+      a.details->>'deliveryOrderId',
+      NULLIF(a.order_id, ''),
+      NULLIF(a.entity_id, '')
+    ) AS tranid
+  FROM unified_audit a
+  LEFT JOIN operators o ON o.id = a.actor_operator_id
+  LEFT JOIN sales_orders so ON so.netsuite_id = a.numeric_order_id
+  LEFT JOIN transfer_orders tr ON tr.netsuite_id = a.numeric_order_id
+  LEFT JOIN purchase_orders po ON po.netsuite_id = a.numeric_order_id
+  LEFT JOIN local_co_orders co ON co.delivery_order_id = a.numeric_order_id
+)`;
 
 export async function listAudit({
   limit = 100,
@@ -181,7 +291,7 @@ export async function listAudit({
   const params = [];
   const clauses = [];
   if (orderId) {
-    params.push(orderId);
+    params.push(String(orderId));
     clauses.push(`a.order_id = $${params.length}`);
   }
   if (operatorId) {
@@ -199,8 +309,9 @@ export async function listAudit({
   if (actor) {
     params.push(`%${String(actor).trim()}%`);
     clauses.push(`(
-      COALESCE(o.display_name, '') ILIKE $${params.length}
-      OR COALESCE(o.username, '') ILIKE $${params.length}
+      COALESCE(a.display_name, '') ILIKE $${params.length}
+      OR COALESCE(a.username, '') ILIKE $${params.length}
+      OR COALESCE(a.actor_name, '') ILIKE $${params.length}
       OR COALESCE(a.actor_type, '') ILIKE $${params.length}
       OR COALESCE(a.actor_operator_id, '') ILIKE $${params.length}
     )`);
@@ -211,48 +322,48 @@ export async function listAudit({
   }
   if (tranid) {
     params.push(`%${String(tranid).trim()}%`);
-    clauses.push(`COALESCE(
-      so.tranid,
-      tr.tranid,
-      po.tranid,
-      co.co_ref,
-      a.details->>'tranid',
-      a.details->>'coRef',
-      a.details->>'sourceOrderRef',
-      a.details->>'orderRef',
-      a.details->>'receivingOrderId',
-      a.details->>'deliveryOrderId',
-      a.order_id::text
-    ) ILIKE $${params.length}`);
+    clauses.push(`COALESCE(a.tranid, '') ILIKE $${params.length}`);
   }
   params.push(Math.min(Math.max(Number(limit) || 100, 1), 500));
 
   const result = await query(
-    `SELECT a.*,
-            o.username,
-            o.display_name,
-            COALESCE(
-              so.tranid,
-              tr.tranid,
-              po.tranid,
-              co.co_ref,
-              a.details->>'tranid',
-              a.details->>'coRef',
-              a.details->>'sourceOrderRef',
-              a.details->>'orderRef',
-              a.details->>'receivingOrderId',
-              a.details->>'deliveryOrderId',
-              a.order_id::text
-            ) AS tranid
-     FROM delivery_audit_log a
-     LEFT JOIN operators o ON o.id = a.actor_operator_id
-     LEFT JOIN sales_orders so ON so.netsuite_id = a.order_id
-     LEFT JOIN transfer_orders tr ON tr.netsuite_id = a.order_id
-     LEFT JOIN purchase_orders po ON po.netsuite_id = a.order_id
-     LEFT JOIN local_co_orders co ON co.delivery_order_id = a.order_id
-     ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
-     ORDER BY a.created_at DESC, a.id DESC
-     LIMIT $${params.length}`,
+    `${UNIFIED_AUDIT_CTE}, limited_audit AS MATERIALIZED (
+       SELECT a.*
+       FROM resolved_audit a
+       ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
+       ORDER BY a.created_at DESC, a.id DESC
+       LIMIT $${params.length}
+     )
+     SELECT
+       a.id,
+       a.audit_stream,
+       a.actor_type,
+       a.actor_operator_id,
+       a.actor_name,
+       a.source,
+       a.action,
+       a.order_id,
+       a.numeric_order_id,
+       a.line_id,
+       a.entity_type,
+       a.entity_id,
+       a.created_at,
+       a.username,
+       a.display_name,
+       a.tranid,
+       jsonb_strip_nulls(jsonb_build_object(
+         'entityType', a.entity_type,
+         'entityId', a.entity_id,
+         'loadId', a.load_id,
+         'truckId', a.truck_id,
+         'sessionId', a.session_id,
+         'planId', a.plan_id,
+         'planDate', a.plan_date,
+         'before', a.before_state,
+         'after', a.after_state
+       )) || COALESCE(a.details, '{}'::jsonb) AS details
+     FROM limited_audit a
+     ORDER BY a.created_at DESC, a.id DESC`,
     params
   );
   return result.rows;
@@ -275,31 +386,14 @@ export async function listAuditOptions({
   }
   if (tranid) {
     params.push(`%${String(tranid).trim()}%`);
-    clauses.push(`COALESCE(
-      so.tranid,
-      tr.tranid,
-      po.tranid,
-      co.co_ref,
-      a.details->>'tranid',
-      a.details->>'coRef',
-      a.details->>'sourceOrderRef',
-      a.details->>'orderRef',
-      a.details->>'receivingOrderId',
-      a.details->>'deliveryOrderId',
-      a.order_id::text
-    ) ILIKE $${params.length}`);
+    clauses.push(`COALESCE(a.tranid, '') ILIKE $${params.length}`);
   }
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
   const result = await query(
-    `WITH filtered AS (
+    `${UNIFIED_AUDIT_CTE}, filtered AS (
        SELECT a.action,
-              NULLIF(COALESCE(o.display_name, o.username, a.actor_type, a.actor_operator_id), '') AS actor
-       FROM delivery_audit_log a
-       LEFT JOIN operators o ON o.id = a.actor_operator_id
-       LEFT JOIN sales_orders so ON so.netsuite_id = a.order_id
-       LEFT JOIN transfer_orders tr ON tr.netsuite_id = a.order_id
-       LEFT JOIN purchase_orders po ON po.netsuite_id = a.order_id
-       LEFT JOIN local_co_orders co ON co.delivery_order_id = a.order_id
+              NULLIF(COALESCE(a.display_name, a.username, a.actor_name, a.actor_type, a.actor_operator_id), '') AS actor
+       FROM resolved_audit a
        ${where}
      )
      SELECT

@@ -435,7 +435,7 @@ window.addEventListener("mbbs-language-changed", renderScmSchedule);
 
 requireDispatchLogin({
   mount: scmScheduleApp,
-  roles: ["admin", "scm", "scm_staff", "dispatcher", "yard_manager"],
+  roles: ["admin", "scm", "scm_staff", "dispatcher"],
   async onReady(operator) {
     scmScheduleOperator = operator;
     scmScheduleFilters.view = scmScheduleDefaultViewForRole();

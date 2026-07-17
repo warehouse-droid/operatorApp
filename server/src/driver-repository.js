@@ -12,6 +12,11 @@ const YARD_ADDRESSES = {
 const OWN_YARD_CODES = new Set(Object.keys(YARD_ADDRESSES));
 const SAMSARA_ACCOUNT_LIMIT_MS = 8 * 60 * 60 * 1000;
 
+function isPhotoReference(value) {
+  const text = String(value || "");
+  return text.startsWith("data:image/") || text.startsWith("r2://");
+}
+
 function driverKey(value) {
   return String(value || "").trim().toLowerCase();
 }
@@ -384,7 +389,7 @@ function buildJob(plan, truck, load, stop, truckIndex, loadIndex, stopIndex) {
     orderRefs,
     orderTypes: [...new Set(orderRefs.map((ref) => directTransferRefs.includes(ref) ? "TO" : orderByRef(plan, ref)?.type).filter(Boolean))],
     dependencyPickupManifests,
-    requiredPhotos: isPickup ? 2 : 1,
+    requiredPhotos: 2,
     sequence: { truckIndex, loadIndex, stopIndex }
   };
 }
@@ -658,7 +663,7 @@ export async function submitDriverDvir(driverLogin, { type = "pre", photoDataUrl
   const truck = assignment?.truck || {};
   if (!truck?.plate) throw new Error("No assigned truck was found in the confirmed dispatch plan.");
   let row = await upsertDriverDayBase({ driverLogin, plan, truck, samsaraAccounts: normalizedSamsaraAccounts });
-  const photos = Array.isArray(photoDataUrls) ? photoDataUrls.filter(Boolean) : [];
+  const photos = Array.isArray(photoDataUrls) ? photoDataUrls.filter(isPhotoReference) : [];
   if (photos.length < 4) throw new Error("4 inspection photos are required.");
   let samsaraAssignment = null;
   let samsaraDuty = null;
@@ -1342,9 +1347,34 @@ export async function getActiveDriverRest(driverLogin) {
   return mapRestRecord(result.rows[0]);
 }
 
+export async function getDriverRestSummary(driverLogin, { planDate = "" } = {}) {
+  const login = driverKey(driverLogin);
+  const date = planDateValue(planDate) || todayLocalDate();
+  const result = await query(
+    `SELECT COUNT(*)::int AS session_count,
+            COALESCE(SUM(EXTRACT(EPOCH FROM (COALESCE(ended_at, now()) - started_at))), 0) AS total_seconds,
+            COALESCE(SUM(EXTRACT(EPOCH FROM (ended_at - started_at)))
+              FILTER (WHERE ended_at IS NOT NULL), 0) AS completed_seconds,
+            COALESCE(SUM(EXTRACT(EPOCH FROM (now() - started_at)))
+              FILTER (WHERE status = 'active' AND ended_at IS NULL), 0) AS active_seconds
+       FROM driver_rest_records
+      WHERE driver_login = $1
+        AND COALESCE(plan_date, (started_at AT TIME ZONE 'America/Toronto')::date) = $2::date`,
+    [login, date]
+  );
+  const row = result.rows[0] || {};
+  return {
+    planDate: date,
+    sessionCount: Number(row.session_count || 0),
+    totalSeconds: Math.max(0, Math.floor(Number(row.total_seconds || 0))),
+    completedSeconds: Math.max(0, Math.floor(Number(row.completed_seconds || 0))),
+    activeSeconds: Math.max(0, Math.floor(Number(row.active_seconds || 0))),
+    calculatedAt: new Date().toISOString()
+  };
+}
+
 export async function startDriverRest(driverLogin, { nextJob = null } = {}) {
   if (!nextJob) throw new Error("No next job is available for rest.");
-  if (nextJob.status === "in_progress") throw new Error("Finish the current started job before resting.");
   const login = driverKey(driverLogin);
   const active = await getActiveDriverRest(login);
   if (active) return active;
@@ -1404,8 +1434,10 @@ export async function endDriverRest(driverLogin) {
 }
 
 export async function recordDriverJobPhotos(driverLogin, jobIdValue, { photoDataUrls = [], job = null } = {}) {
-  const photos = Array.isArray(photoDataUrls) ? photoDataUrls.filter(Boolean) : [];
-  const requiredPhotos = job?.requiredPhotos ?? 1;
+  const photos = Array.isArray(photoDataUrls) ? photoDataUrls.filter(isPhotoReference) : [];
+  const requiredPhotos = job && Number(job.requiredPhotos) === 0
+    ? 0
+    : Math.max(2, Number(job?.requiredPhotos || 2));
   if (photos.length < requiredPhotos) throw new Error(`${requiredPhotos} photo${requiredPhotos > 1 ? "s are" : " is"} required.`);
   const result = await query(
     `INSERT INTO driver_job_records (

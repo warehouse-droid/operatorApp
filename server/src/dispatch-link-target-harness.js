@@ -4,6 +4,7 @@ import {
   getSalesOrderPoAllocationOptions
 } from "./dispatch-repository.js";
 import { resolveDispatchSalesTarget } from "./dispatch-order-target-repository.js";
+import { applyDispatchPlannedAssignment } from "./dispatch-plan-repository.js";
 import {
   createOrderDependency,
   getOrderDependencyOptions,
@@ -75,6 +76,21 @@ function snapshotItem(line, quantity) {
 
 const rollback = await beginRollbackContext();
 try {
+  const clearedAssignment = applyDispatchPlannedAssignment({
+    id: groupRef,
+    dispatchPlanned: true,
+    dispatchPlanId: "stale-plan",
+    dispatchPlanDate: planDate,
+    dispatchTruckPlate: "STALE",
+    dispatchLoadName: "Stale Load"
+  });
+  assert(!clearedAssignment.dispatchPlanned
+      && !clearedAssignment.dispatchPlanId
+      && !clearedAssignment.dispatchPlanDate
+      && !clearedAssignment.dispatchTruckPlate
+      && !clearedAssignment.dispatchLoadName,
+    "Orders without a live plan assignment must not retain stale planned metadata.",
+    { clearedAssignment });
   await rollback.run(async () => {
     await query(
       `INSERT INTO inventory_items (
@@ -92,7 +108,14 @@ try {
       customer: "Grouped Link Harness",
       childOrders: orderRefs.slice(0, 2),
       childOrderDetails: [
-        { id: orderRefs[0], type: "SO", items: [snapshotItem(firstLine, 4)] },
+        {
+          id: orderRefs[0],
+          type: "SO",
+          items: [
+            snapshotItem(firstLine, 4),
+            { ...snapshotItem(firstLine, 4), lineRowId: firstLine.id + 999999, lineId: `stale-${firstLine.line_id}` }
+          ]
+        },
         { id: orderRefs[1], type: "SO", items: [snapshotItem(secondLine, 6)] }
       ],
       items: [snapshotItem(firstLine, 4), snapshotItem(secondLine, 6)]
@@ -223,7 +246,112 @@ try {
     });
     assert(poAllocations.length === 2 && poAllocations.every((allocation) => allocation.dispatchTargetRef === groupRef),
       "Grouped PO allocations must persist under the visible target.", { poAllocations });
+    const specialOrderId = base + 4;
+    const specialOrderRef = "LINK-SO-SPECIAL-" + suffix;
+    const specialLine = await insertSalesOrder(specialOrderId, specialOrderRef, 5, base + 104);
+    await query(
+      "UPDATE sales_order_lines SET item_id = 2055, item_name = 'MBBS-Special', sku = 'MBBS-Special', "
+        + "item_description = 'Custom coping - charcoal', unit = 'PC', pallet_qty = 2, layer_qty = 0, "
+        + "section_qty = 0, piece_qty = 4, to_plt = NULL, to_lyr = NULL, to_sec = NULL, to_pcs = NULL, "
+        + "pack_quantity_source = 'netsuite_manual' WHERE id = $1",
+      [specialLine.id]
+    );
+    const specialPoLines = await query(
+      "INSERT INTO purchase_order_lines (purchase_order_id, line_id, item_id, item_name, sku, item_type, "
+        + "item_type_text, item_description, quantity, unit, pallet_qty, layer_qty, section_qty, piece_qty, "
+        + "pack_quantity_source, netsuite_received_qty, netsuite_active, location_id, location) VALUES "
+        + "($1, $2, 2055, 'MBBS-Special', 'MBBS-Special', 'InvtPart', 'Inventory Item', "
+        + "'Custom coping - charcoal', 5, 'PC', 2, 0, 0, 4, 'netsuite_manual', 0, true, 15, '12441'), "
+        + "($1, $3, 2055, 'MBBS-Special', 'MBBS-Special', 'InvtPart', 'Inventory Item', "
+        + "'Custom coping - manual override', 5, 'PC', 2, 0, 0, 4, 'netsuite_manual', 0, true, 15, '12441') "
+        + "RETURNING id, item_description",
+      [poId, base + 302, base + 303]
+    );
+    const specialOptions = await getSalesOrderPoAllocationOptions(specialOrderRef, { planDate });
+    const specialSalesLine = specialOptions.salesLines[0];
+    const harnessCandidates = specialSalesLine.poCandidates.filter((candidate) => candidate.poRef === poRef);
+    const exactCandidate = harnessCandidates.find((candidate) => candidate.exactMatch);
+    const mismatchCandidate = harnessCandidates.find((candidate) => !candidate.exactMatch);
+    assert(specialSalesLine.isSpecial && specialSalesLine.independentSalesQty,
+      "MBBS-Special must expose independent manual and sales quantities.", { specialSalesLine });
+    assert(harnessCandidates.length === 2 && exactCandidate && mismatchCandidate,
+      "MBBS-Special PO candidates must distinguish exact description/unit matches from manual overrides.",
+      { harnessCandidates, specialPoLines: specialPoLines.rows });
 
+    let missingLineRejected = false;
+    try {
+      await createSalesOrderPoAllocations({
+        dispatchTargetRef: specialOrderRef,
+        poRef,
+        planDate,
+        targetSignature: specialOptions.order.targetSignature,
+        lines: [{ targetLineKey: specialSalesLine.targetLineKey, quantities: { pallets: 2, pieces: 4 } }],
+        createdBy: "dispatch-link-harness"
+      });
+    } catch (error) {
+      missingLineRejected = /exact PO line/i.test(error.message);
+    }
+    assert(missingLineRejected, "MBBS-Special linking must require an explicit PO line selection.");
+
+    let partialSalesRejected = false;
+    try {
+      await createSalesOrderPoAllocations({
+        dispatchTargetRef: specialOrderRef,
+        poRef,
+        planDate,
+        targetSignature: specialOptions.order.targetSignature,
+        lines: [{
+          targetLineKey: specialSalesLine.targetLineKey,
+          poLineId: exactCandidate.poLineId,
+          quantities: { pallets: 1 }
+        }],
+        createdBy: "dispatch-link-harness"
+      });
+    } catch (error) {
+      partialSalesRejected = /sales-unit quantity/i.test(error.message);
+    }
+    assert(partialSalesRejected, "Partial manual MBBS-Special quantity must require an explicit sales quantity.");
+
+    const specialAllocation = await createSalesOrderPoAllocations({
+      dispatchTargetRef: specialOrderRef,
+      poRef,
+      planDate,
+      targetSignature: specialOptions.order.targetSignature,
+      lines: [{
+        targetLineKey: specialSalesLine.targetLineKey,
+        poLineId: mismatchCandidate.poLineId,
+        quantities: { pallets: 2, pieces: 4 }
+      }],
+      createdBy: "dispatch-link-harness"
+    });
+    assert(specialAllocation.length === 1
+        && Number(specialAllocation[0].poLineId) === Number(mismatchCandidate.poLineId)
+        && Number(specialAllocation[0].salesQty) === 5,
+      "A deliberate mismatched-description selection must link the selected PO line and map full physical completion to sales quantity.",
+      { specialAllocation, mismatchCandidate });
+
+    const normalOrderId = base + 5;
+    const normalOrderRef = "LINK-SO-NORMAL-" + suffix;
+    const normalFirstLine = await insertSalesOrder(normalOrderId, normalOrderRef, 4, base + 105);
+    await query(
+      "INSERT INTO sales_order_lines (sales_order_id, line_id, item_id, item_name, sku, item_type, item_type_text, "
+        + "quantity, unit, netsuite_committed_qty, netsuite_backordered_qty, netsuite_active, location_id, location, to_pcs) "
+        + "VALUES ($1, $2, $3, 'Link Target Item', 'LINK-TARGET-SKU', 'InvtPart', 'Inventory Item', "
+        + "3, 'EA', 0, 3, true, 15, '12441', 1)",
+      [normalOrderId, base + 106, itemId]
+    );
+    await query(
+      "UPDATE dispatch_plan_snapshots SET orders = orders || $2::jsonb WHERE plan_id = $1",
+      [plan.rows[0].id, JSON.stringify([{
+        id: normalOrderRef,
+        type: "SO",
+        items: [snapshotItem(normalFirstLine, 4)]
+      }])]
+    );
+    const normalTarget = await resolveDispatchSalesTarget({ dispatchTargetRef: normalOrderRef, planDate });
+    assert(normalTarget.target.kind === "normal" && normalTarget.lines.length === 2,
+      "Normal targets must use all active canonical lines instead of a stale dispatch snapshot.",
+      { normalTarget });
     const firstSplit = await resolveDispatchSalesTarget({ dispatchTargetRef: splitRefs[0], planDate });
     const secondSplit = await resolveDispatchSalesTarget({ dispatchTargetRef: splitRefs[1], planDate });
     assert(firstSplit.target.kind === "split" && secondSplit.target.kind === "split",

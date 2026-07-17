@@ -1,8 +1,13 @@
 const app = document.getElementById("driverApp");
 const toast = document.getElementById("driverToast");
 const TOKEN_KEY = "mbbs.driver.token";
+const STAFF_TOKEN_KEY = "mbbs.staff.token";
+const STAFF_ROLE_KEY = "mbbs.staff.role";
+const STAFF_ROLES_KEY = "mbbs.staff.roles";
 const CAMERA_FACING_KEY = "mbbs.camera.facingMode";
 const t = (key, fallback) => window.MBBS_I18N?.t(key, fallback) || fallback;
+const tf = (key, fallback, variables = {}) => window.MBBS_I18N?.format(key, fallback, variables) || fallback;
+const localizeMessage = (message) => window.MBBS_I18N?.message(message) || String(message || "");
 const languageToggle = () => window.MBBS_I18N?.toggleHtml() || "";
 
 let authToken = localStorage.getItem(TOKEN_KEY) || "";
@@ -18,8 +23,8 @@ let eventSource = null;
 let locationCheck = null;
 let locationOverrideAccepted = false;
 let countdownTimer = null;
-let restAfterCurrentStop = false;
 let activeRest = null;
+let restSummary = null;
 let restTimer = null;
 let activeView = "job";
 let driverHistory = [];
@@ -28,6 +33,35 @@ let historyDate = localDate();
 let cameraFacingMode = localStorage.getItem(CAMERA_FACING_KEY) === "user" ? "user" : "environment";
 const ITEMS_PER_PAGE = 5;
 const COMPLETE_DELAY_MS = 10000;
+
+function staffHomeRoute(role) {
+  const clean = String(role || "").trim().toLowerCase().replaceAll("-", "_").replaceAll(" ", "_");
+  if (clean === "admin") return "/admin";
+  if (clean === "dispatcher") return "/dispatch";
+  if (clean === "scm" || clean === "scm_staff") return "/scm";
+  if (clean === "yard_manager") return "/control";
+  if (clean === "operator") return "/operator";
+  return "/";
+}
+
+async function redirectExistingStaffSession() {
+  const staffToken = localStorage.getItem(STAFF_TOKEN_KEY) || "";
+  if (!staffToken) return false;
+  const response = await fetch("/api/auth/me", {
+    headers: { Authorization: `Bearer ${staffToken}` }
+  }).catch(() => null);
+  if (!response?.ok) {
+    localStorage.removeItem(STAFF_TOKEN_KEY);
+    localStorage.removeItem(STAFF_ROLE_KEY);
+    localStorage.removeItem(STAFF_ROLES_KEY);
+    return false;
+  }
+  const payload = await response.json();
+  if (payload.operator?.role) localStorage.setItem(STAFF_ROLE_KEY, payload.operator.role);
+  localStorage.setItem(STAFF_ROLES_KEY, JSON.stringify([...new Set([...(Array.isArray(payload.operator?.roles) ? payload.operator.roles : []), payload.operator?.role].filter(Boolean))]));
+  window.location.replace(staffHomeRoute(payload.operator?.role));
+  return true;
+}
 
 function cameraFacingLabel() {
   return cameraFacingMode === "user"
@@ -64,7 +98,7 @@ function escapeHtml(value) {
 }
 
 function showToast(message) {
-  toast.textContent = message;
+  toast.textContent = localizeMessage(message);
   toast.classList.add("show");
   clearTimeout(showToast.timer);
   showToast.timer = setTimeout(() => toast.classList.remove("show"), 2600);
@@ -72,8 +106,8 @@ function showToast(message) {
 
 function planDateText(value) {
   const text = String(value || "").slice(0, 10);
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return "Plan date not set";
-  return window.MBBS_I18N?.displayDate(text) || "Plan date not set";
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return t("driver.planDateNotSet", "Plan date not set");
+  return window.MBBS_I18N?.displayDate(text) || t("driver.planDateNotSet", "Plan date not set");
 }
 
 function dateTimeText(value) {
@@ -93,13 +127,21 @@ function completeWaitSeconds(job) {
   return Math.max(0, Math.ceil((COMPLETE_DELAY_MS - (Date.now() - startedAt)) / 1000));
 }
 
-function locationCheckBlocksComplete() {
+function locationCheckApproved() {
+  return locationCheck?.status === "ok" || locationOverrideAccepted;
+}
+
+function locationCheckBlocksConfirmation() {
   return locationCheck?.status === "checking"
     || (["warning", "unavailable"].includes(locationCheck?.status) && !locationOverrideAccepted);
 }
 
-function canConfirmCurrentJob(job) {
-  return job?.status === "in_progress" && completeWaitSeconds(job) <= 0 && !locationCheckBlocksComplete();
+function canBeginJobConfirmation(job) {
+  return job?.status === "in_progress" && completeWaitSeconds(job) <= 0 && !locationCheckBlocksConfirmation();
+}
+
+function canCompleteCurrentJob(job) {
+  return canBeginJobConfirmation(job) && locationCheckApproved();
 }
 
 function clearCountdownTimer() {
@@ -112,36 +154,65 @@ function clearRestTimer() {
   restTimer = null;
 }
 
-function elapsedText(startedAt) {
+function elapsedSeconds(startedAt) {
   const start = new Date(startedAt || "").getTime();
-  if (!Number.isFinite(start)) return "0 min";
-  const totalSeconds = Math.max(0, Math.floor((Date.now() - start) / 1000));
+  if (!Number.isFinite(start)) return 0;
+  return Math.max(0, Math.floor((Date.now() - start) / 1000));
+}
+
+function durationClock(value) {
+  const totalSeconds = Math.max(0, Math.floor(Number(value || 0)));
   const hours = Math.floor(totalSeconds / 3600);
   const minutes = Math.floor((totalSeconds % 3600) / 60);
   const seconds = totalSeconds % 60;
-  if (hours) return `${hours} hr ${String(minutes).padStart(2, "0")} min`;
-  return `${minutes} min ${String(seconds).padStart(2, "0")} sec`;
+  return [hours, minutes, seconds].map((part) => String(part).padStart(2, "0")).join(":");
+}
+
+function dailyRestSeconds() {
+  return Math.max(0, Number(restSummary?.completedSeconds || 0)) + elapsedSeconds(activeRest?.startedAt);
+}
+
+function updateRestTimerText() {
+  const dailyTimer = app.querySelector("[data-rest-daily-timer]");
+  const sessionTimer = app.querySelector("[data-rest-session-timer]");
+  if (dailyTimer) dailyTimer.textContent = durationClock(dailyRestSeconds());
+  if (sessionTimer) sessionTimer.textContent = durationClock(elapsedSeconds(activeRest?.startedAt));
+}
+
+function updateCountdownButtons(job) {
+  if (!job || currentJob?.jobId !== job.jobId) return;
+  const waitSeconds = completeWaitSeconds(job);
+  app.querySelectorAll("[data-job-confirm]").forEach((button) => {
+    const photosReady = button.dataset.photoRequired !== "true" || photos.filter(Boolean).length >= Number(job.requiredPhotos || 0);
+    const gpsReady = button.dataset.gpsGate === "complete"
+      ? canCompleteCurrentJob(job)
+      : canBeginJobConfirmation(job);
+    button.disabled = waitSeconds > 0 || !gpsReady || !photosReady;
+    button.textContent = waitSeconds > 0
+      ? tf("driver.waitSeconds", "Wait {seconds}s", { seconds: waitSeconds })
+      : button.dataset.readyLabel || t("driver.confirm", "Confirm");
+  });
 }
 
 function scheduleCountdownRender(job) {
   clearCountdownTimer();
   if (!job || job.status !== "in_progress" || completeWaitSeconds(job) <= 0) return;
   countdownTimer = setTimeout(() => {
-    if (currentJob?.jobId === job.jobId) renderJob();
+    updateCountdownButtons(job);
+    if (currentJob?.jobId === job.jobId && completeWaitSeconds(job) > 0) scheduleCountdownRender(job);
   }, 1000);
 }
 
 function scheduleRestRender() {
   clearRestTimer();
   if (!activeRest?.startedAt) return;
-  restTimer = setTimeout(() => {
-    if (activeRest?.startedAt) renderRest();
-  }, 1000);
+  updateRestTimerText();
+  restTimer = setTimeout(scheduleRestRender, 1000);
 }
 
 async function checkCurrentJobLocation({ render = true } = {}) {
   if (!currentJob?.jobId) return null;
-  locationCheck = { status: "checking", message: "Checking Samsara truck GPS against expected stop..." };
+  locationCheck = { status: "checking", message: t("driver.checkingGps", "Checking Samsara truck GPS against expected stop...") };
   locationOverrideAccepted = false;
   if (render) renderJob();
   try {
@@ -152,11 +223,20 @@ async function checkCurrentJobLocation({ render = true } = {}) {
   } catch (error) {
     locationCheck = {
       status: "unavailable",
-      message: error.message || "Samsara truck GPS could not be checked."
+      message: localizeMessage(error.message || t("driver.gpsUnavailable", "Samsara truck GPS could not be checked."))
     };
   }
   if (render) renderJob();
   return locationCheck;
+}
+
+async function ensureLocationApprovalBeforeConfirmation() {
+  if (!currentJob || completeWaitSeconds(currentJob) > 0) return false;
+  if (!locationCheck) await checkCurrentJobLocation();
+  if (locationCheckApproved()) return true;
+  showToast("Verify the Samsara GPS location or confirm override before adding photos.");
+  renderJob();
+  return false;
 }
 
 async function request(path, options = {}) {
@@ -263,7 +343,7 @@ function renderLogin(message = "") {
             <p>${t("app.driver", "MBBS Driver")}</p>
             <h1>${t("driver.loginTitle", "Driver Login")}</h1>
           </div>
-          ${message ? `<div class="message">${escapeHtml(message)}</div>` : ""}
+          ${message ? `<div class="message">${escapeHtml(localizeMessage(message))}</div>` : ""}
           <label>
             <span>${t("common.login", "Login")}</span>
             <input id="driverLogin" autocomplete="username" required />
@@ -290,24 +370,30 @@ function shell(content) {
 
 function renderNoJob() {
   clearCountdownTimer();
-  clearRestTimer();
+  if (activeRest) scheduleRestRender();
+  else clearRestTimer();
   shell(`
     <section class="empty-panel">
       <h2>${t("driver.noJob", "No assigned job")}</h2>
-      <p>No pending stop was found for your login in the confirmed dispatch plans.</p>
+      <p>${t("driver.noJobHelp", "No pending stop was found for your login in the confirmed dispatch plans.")}</p>
       <div class="empty-actions">
         <button class="primary" data-action="refresh" type="button">${t("common.refresh", "Refresh")}</button>
         <button class="secondary" data-action="open-history" type="button">${t("common.history", "History")}</button>
       </div>
     </section>
+    ${activeRest ? renderRestModal() : ""}
   `);
 }
 
 function renderDvir(type = "pre", message = "") {
   clearCountdownTimer();
-  const labels = ["Driver side", "Front", "Passenger side", "Back"];
+  const labels = [
+    t("driver.driverSide", "Driver side"),
+    t("driver.front", "Front"),
+    t("driver.passengerSide", "Passenger side"),
+    t("driver.back", "Back")
+  ];
   dvirMode = type;
-  dvirPhotos = dvirPhotos.slice(0, 4);
   while (dvirPhotos.length < 4) dvirPhotos.push("");
   const isPost = type === "post";
   const needsSamsaraRetry = false;
@@ -321,27 +407,34 @@ function renderDvir(type = "pre", message = "") {
         </div>
         <div class="job-head">
           <div class="job-title-row">
-            <span class="job-type ${isPost ? "dropoff" : ""}">${isPost ? "Post-Trip" : "Pre-Trip"}</span>
-            <h2>${escapeHtml(dayState?.truckPlate || "Truck Inspection")}</h2>
+            <span class="job-type ${isPost ? "dropoff" : ""}">${isPost ? t("driver.postTrip", "Post-Trip") : t("driver.preTrip", "Pre-Trip")}</span>
+            <h2>${escapeHtml(dayState?.truckPlate || t("driver.truckInspection", "Truck Inspection"))}</h2>
           </div>
         </div>
       </div>
-      ${message ? `<div class="message">${escapeHtml(message)}</div>` : ""}
+      ${message ? `<div class="message">${escapeHtml(localizeMessage(message))}</div>` : ""}
       <div class="photo-grid dvir-photo-grid">
-        ${labels.map((label, index) => `
+        ${dvirPhotos.map((photo, index) => {
+          const label = labels[index] || tf("driver.additionalPhoto", "Additional photo {number}", { number: index - labels.length + 1 });
+          return `
           <div class="photo-slot dvir-photo-slot">
             <input data-dvir-photo-index="${index}" type="file" accept="image/*" capture="${cameraCaptureMode()}" />
-            <div class="photo-preview">${dvirPhotos[index] ? `<img src="${dvirPhotos[index]}" alt="${escapeHtml(label)}" />` : escapeHtml(label)}</div>
-            <button data-action="take-dvir-photo" data-dvir-photo-index="${index}" type="button">Camera</button>
+            <div class="photo-preview">${photo ? `<img src="${photo}" alt="${escapeHtml(label)}" />` : escapeHtml(label)}</div>
+            <button data-action="take-dvir-photo" data-dvir-photo-index="${index}" type="button">${t("common.camera", "Camera")}</button>
           </div>
-        `).join("")}
+        `;
+        }).join("")}
+      </div>
+      <div class="photo-list-actions">
+        <button class="secondary compact" data-action="add-dvir-photo" type="button">${t("common.addAnotherPhoto", "Add another photo")}</button>
+        ${dvirPhotos.length > 4 ? `<button class="secondary compact danger-button" data-action="remove-dvir-photo" type="button">${t("common.removeLastPhoto", "Remove last photo")}</button>` : ""}
       </div>
       <div class="job-actions">
-        <button class="primary" data-action="submit-dvir" ${dvirPhotos.filter(Boolean).length >= 4 ? "" : "disabled"} type="button">${isPost ? "Submit Post-Trip" : "Submit Pre-Trip"}</button>
+        <button class="primary" data-action="submit-dvir" ${dvirPhotos.filter(Boolean).length >= 4 ? "" : "disabled"} type="button">${isPost ? t("driver.submitPostTrip", "Submit Post-Trip") : t("driver.submitPreTrip", "Submit Pre-Trip")}</button>
         ${renderCameraSwitchButton()}
-        <button class="secondary compact" data-action="skip-dvir" type="button">Skip DVIR Test</button>
-        <button class="secondary compact" data-action="refresh" type="button">Refresh</button>
-        <button class="secondary compact" data-action="open-history" type="button">History</button>
+        <button class="secondary compact" data-action="skip-dvir" type="button">${t("driver.skipDvirTest", "Skip DVIR Test")}</button>
+        <button class="secondary compact" data-action="refresh" type="button">${t("common.refresh", "Refresh")}</button>
+        <button class="secondary compact" data-action="open-history" type="button">${t("common.history", "History")}</button>
       </div>
     </section>
   `);
@@ -374,18 +467,18 @@ function renderOrders(job) {
         ${pageItems.map((item) => `
           <div class="item-row">
             <div class="item-main-row">
-              <strong>${escapeHtml(item.itemName || item.sku || "Item")}</strong>
+              <strong>${escapeHtml(item.itemName || item.sku || t("driver.item", "Item"))}</strong>
               <div class="unit-row">${unitPills(item.units)}</div>
             </div>
             ${item.description ? `<span class="item-description">${escapeHtml(item.description)}</span>` : ""}
           </div>
-        `).join("") || `<div class="item-row"><strong>No item detail found in local DB</strong></div>`}
+        `).join("") || `<div class="item-row"><strong>${t("driver.noItemDetail", "No item detail found in local DB")}</strong></div>`}
       </div>
       ${items.length > ITEMS_PER_PAGE ? `
         <div class="order-pager">
-          <button data-action="order-page" data-order-key="${escapeHtml(key)}" data-page="${page - 1}" ${page <= 0 ? "disabled" : ""} type="button">Prev</button>
+          <button data-action="order-page" data-order-key="${escapeHtml(key)}" data-page="${page - 1}" ${page <= 0 ? "disabled" : ""} type="button">${t("common.previous", "Previous")}</button>
           <span>${page + 1} / ${pageCount}</span>
-          <button data-action="order-page" data-order-key="${escapeHtml(key)}" data-page="${page + 1}" ${page >= pageCount - 1 ? "disabled" : ""} type="button">Next</button>
+          <button data-action="order-page" data-order-key="${escapeHtml(key)}" data-page="${page + 1}" ${page >= pageCount - 1 ? "disabled" : ""} type="button">${t("common.next", "Next")}</button>
         </div>
       ` : ""}
     </section>
@@ -396,76 +489,80 @@ function renderOrders(job) {
 function renderLocationCheck(job) {
   if (!job || job.status !== "in_progress") return "";
   const status = locationCheck?.status || "unavailable";
-  const text = locationCheck?.message || "Samsara truck GPS check has not run yet.";
+  const text = localizeMessage(locationCheck?.message || t("driver.gpsNotRun", "Samsara truck GPS check has not run yet."));
   const detail = locationCheck?.expectedAddress
-    ? `<small>Expected: ${escapeHtml(locationCheck.expectedAddress)}</small>`
+    ? `<small>${t("driver.expected", "Expected")}: ${escapeHtml(locationCheck.expectedAddress)}</small>`
     : "";
   const truckDetail = locationCheck?.truckFormattedLocation
-    ? `<small>Truck: ${escapeHtml(locationCheck.truckFormattedLocation)}</small>`
+    ? `<small>${t("driver.truck", "Truck")}: ${escapeHtml(locationCheck.truckFormattedLocation)}</small>`
     : "";
   return `
     <section class="location-check ${escapeHtml(status)}">
       <div>
-        <strong>${status === "ok" ? "Location verified" : status === "warning" ? "Location warning" : status === "checking" ? "Checking location" : "Location not verified"}</strong>
+        <strong>${status === "ok" ? t("driver.locationVerified", "Location verified") : status === "warning" ? t("driver.locationWarning", "Location warning") : status === "checking" ? t("driver.checkingLocation", "Checking location") : t("driver.locationNotVerified", "Location not verified")}</strong>
         <span>${escapeHtml(text)}</span>
         ${detail}
         ${truckDetail}
       </div>
       <div class="location-actions">
-        <button class="secondary compact" data-action="recheck-location" ${status === "checking" ? "disabled" : ""} type="button">Recheck</button>
-        ${["warning", "unavailable"].includes(status) && !locationOverrideAccepted ? `<button class="secondary compact danger-button" data-action="override-location" type="button">Override</button>` : ""}
+        <button class="secondary compact" data-action="recheck-location" ${status === "checking" ? "disabled" : ""} type="button">${t("driver.recheck", "Recheck")}</button>
+        ${["warning", "unavailable"].includes(status) && !locationOverrideAccepted ? `<button class="secondary compact danger-button" data-action="override-location" type="button">${t("driver.override", "Override")}</button>` : ""}
       </div>
     </section>
   `;
 }
 
 function renderPhotoSlots(job) {
-  photos = photos.slice(0, job.requiredPhotos || 1);
-  while (photos.length < (job.requiredPhotos || 1)) photos.push("");
   if (!job.requiredPhotos) {
     return `
       <section class="photo-panel">
-        <h3>No photos required</h3>
-        <button class="primary" data-action="complete-job" type="button">Complete Travel</button>
+        <h3>${t("driver.noPhotosRequired", "No photos required")}</h3>
+        <button class="primary" data-action="complete-job" type="button">${t("driver.completeTravel", "Complete Travel")}</button>
       </section>
     `;
   }
+  const minimumPhotos = Math.max(2, Number(job.requiredPhotos || 0));
+  while (photos.length < minimumPhotos) photos.push("");
   return `
-    <div class="photo-modal" role="dialog" aria-modal="true" aria-label="Photos required">
+    <div class="photo-modal" role="dialog" aria-modal="true" aria-label="${tf("driver.photosRequired", "At least {count} photos required", { count: minimumPhotos })}">
       <section class="photo-panel">
         <div class="photo-head">
-          <h3>${job.requiredPhotos} photo${job.requiredPhotos > 1 ? "s" : ""} required</h3>
+          <h3>${tf("driver.photosRequired", "At least {count} photos required", { count: minimumPhotos })}</h3>
           ${renderCameraSwitchButton()}
-          <button class="icon-button" data-action="close-photo" type="button">X</button>
+          <button class="icon-button" data-action="close-photo" aria-label="${t("driver.closePhoto", "Close photo")}" title="${t("driver.closePhoto", "Close photo")}" type="button">X</button>
         </div>
         <div class="photo-grid">
           ${photos.map((photo, index) => `
             <div class="photo-slot">
               <input data-photo-index="${index}" type="file" accept="image/*" capture="${cameraCaptureMode()}" />
-              <div class="photo-preview">${photo ? `<img src="${photo}" alt="Photo ${index + 1}" />` : `Photo ${index + 1}`}</div>
-              <button data-action="take-photo" data-photo-index="${index}" type="button">Camera</button>
+              <div class="photo-preview">${photo ? `<img src="${photo}" alt="${t("common.photos", "Photo")} ${index + 1}" />` : `${t("common.photos", "Photo")} ${index + 1}`}</div>
+              <button data-action="take-photo" data-photo-index="${index}" type="button">${t("common.camera", "Camera")}</button>
             </div>
           `).join("")}
         </div>
-        <button class="primary" data-action="complete-job" ${photos.filter(Boolean).length >= job.requiredPhotos && canConfirmCurrentJob(job) ? "" : "disabled"} type="button">${completeWaitSeconds(job) > 0 ? `Wait ${completeWaitSeconds(job)}s` : "Complete Stop"}</button>
+        <div class="photo-list-actions">
+          <button class="secondary compact" data-action="add-job-photo" type="button">${t("common.addAnotherPhoto", "Add another photo")}</button>
+          ${photos.length > minimumPhotos ? `<button class="secondary compact danger-button" data-action="remove-job-photo" type="button">${t("common.removeLastPhoto", "Remove last photo")}</button>` : ""}
+        </div>
+        <button class="primary" data-action="complete-job" data-job-confirm data-gps-gate="complete" data-photo-required="true" data-ready-label="${t("driver.completeStop", "Complete Stop")}" ${photos.filter(Boolean).length >= minimumPhotos && canCompleteCurrentJob(job) ? "" : "disabled"} type="button">${completeWaitSeconds(job) > 0 ? tf("driver.waitSeconds", "Wait {seconds}s", { seconds: completeWaitSeconds(job) }) : t("driver.completeStop", "Complete Stop")}</button>
       </section>
     </div>
   `;
 }
 
 function renderJob() {
-  if (activeRest) return renderRest();
-  clearRestTimer();
+  if (activeRest) scheduleRestRender();
+  else clearRestTimer();
   const job = currentJob;
   if (!job) return renderNoJob();
   const isPickup = job.stopType === "pickup";
   const isTravel = job.stopType === "travel";
   const isStarted = job.status === "in_progress";
   const typeText = isTravel ? t("driver.travel", "Travel") : isPickup ? t("driver.pickup", "Pickup") : t("driver.dropoff", "Drop Off");
-  const titleText = isTravel ? job.location : (job.location || job.address || "Stop");
+  const titleText = isTravel ? job.location : (job.location || job.address || t("driver.stop", "Stop"));
   const navigationUrl = mapsUrl(job);
   const waitSeconds = completeWaitSeconds(job);
-  const confirmDisabled = !canConfirmCurrentJob(job);
+  const confirmDisabled = !canBeginJobConfirmation(job);
   scheduleCountdownRender(job);
   shell(`
     <section class="job-panel">
@@ -480,13 +577,13 @@ function renderJob() {
             <span class="job-type ${isTravel ? "travel" : isPickup ? "" : "dropoff"}">${typeText}</span>
             <h2>${escapeHtml(titleText)}</h2>
           </div>
-          <button class="rest-toggle ${restAfterCurrentStop ? "active" : ""}" data-action="${isStarted ? "toggle-rest" : "start-rest"}" type="button">${isStarted && restAfterCurrentStop ? "Rest after" : "Rest"}</button>
+          <button class="rest-toggle" data-action="start-rest" type="button">${t("driver.rest", "Rest")}</button>
         </div>
         <div class="address-block">
           <div>
-            <span>${isTravel ? "Travel destination" : isPickup ? "Pickup address / yard" : "Delivery address"}</span>
+            <span>${isTravel ? t("driver.travelDestination", "Travel destination") : isPickup ? t("driver.pickupAddress", "Pickup address / yard") : t("driver.deliveryAddress", "Delivery address")}</span>
             <strong>${escapeHtml(job.address || job.location || "")}</strong>
-            ${isTravel && job.fromAddress ? `<em>Start: ${escapeHtml(job.fromAddress)}</em>` : ""}
+            ${isTravel && job.fromAddress ? `<em>${tf("driver.startAddress", "Start: {address}", { address: escapeHtml(job.fromAddress) })}</em>` : ""}
           </div>
           ${navigationUrl ? `<a class="map-button" href="${navigationUrl}" target="_blank" rel="noopener">${t("driver.maps", "Maps")}</a>` : ""}
         </div>
@@ -495,49 +592,54 @@ function renderJob() {
       ${isTravel ? "" : renderOrders(job)}
       <div class="job-actions">
         ${isStarted
-          ? `<button class="primary" data-action="${job.requiredPhotos ? "show-photo" : "complete-job"}" ${confirmDisabled ? "disabled" : ""} type="button">${waitSeconds > 0 ? `Wait ${waitSeconds}s` : "Confirm"}</button>`
+          ? `<button class="primary" data-action="${job.requiredPhotos ? "show-photo" : "complete-job"}" data-job-confirm data-gps-gate="begin" data-ready-label="${t("driver.confirm", "Confirm")}" ${confirmDisabled ? "disabled" : ""} type="button">${waitSeconds > 0 ? tf("driver.waitSeconds", "Wait {seconds}s", { seconds: waitSeconds }) : t("driver.confirm", "Confirm")}</button>`
           : `<button class="primary" data-action="start-job" type="button">${t("common.start", "Start")}</button>`}
         <button class="secondary compact" data-action="refresh" type="button">${t("common.refresh", "Refresh")}</button>
         <button class="secondary compact" data-action="open-history" type="button">${t("common.history", "History")}</button>
       </div>
       ${photoPromptOpen ? renderPhotoSlots(job) : ""}
     </section>
+    ${activeRest ? renderRestModal() : ""}
   `);
 }
 
-function renderRest() {
-  clearCountdownTimer();
+function renderRestModal() {
   const rest = activeRest;
-  if (!rest) return renderJob();
-  scheduleRestRender();
-  shell(`
-    <section class="job-panel rest-panel">
-      <div class="job-sticky">
-        <div class="plan-meta-row">
-          <span>${escapeHtml(planDateText(rest.planDate || currentJob?.planDate))}</span>
-          <span>${escapeHtml(driver?.name || "-")}</span>
-          <span>${escapeHtml(rest.truckPlate || currentJob?.truckPlate || "-")}</span>
-        </div>
-        <div class="job-head">
-          <div class="job-title-row">
-            <span class="job-type travel">Rest</span>
-            <h2>Rest time</h2>
-          </div>
-        </div>
-        <div class="address-block">
+  if (!rest) return "";
+  const sessionCount = Math.max(1, Number(restSummary?.sessionCount || 0));
+  return `
+    <div class="rest-modal" role="dialog" aria-modal="true" aria-labelledby="restTimerTitle">
+      <section class="rest-timer-panel">
+        <div class="rest-timer-head">
+          <span class="rest-status-dot" aria-hidden="true"></span>
           <div>
-            <span>Current rest duration</span>
-            <strong>${escapeHtml(elapsedText(rest.startedAt))}</strong>
-            <em>Next job will stay pending until rest ends.</em>
+            <span>${t("driver.restInProgress", "Rest in progress")}</span>
+            <h2 id="restTimerTitle">${t("driver.todayAccumulatedRest", "Today's accumulated rest")}</h2>
           </div>
         </div>
-      </div>
-      <div class="job-actions">
-        <button class="primary" data-action="end-rest" type="button">End rest time</button>
-        <button class="secondary compact" data-action="refresh" type="button">${t("common.refresh", "Refresh")}</button>
-      </div>
-    </section>
-  `);
+        <div class="rest-daily-total">
+          <strong data-rest-daily-timer>${durationClock(dailyRestSeconds())}</strong>
+          <span>${tf("driver.totalRestFor", "Total rest for {date}", { date: escapeHtml(planDateText(rest.planDate || restSummary?.planDate || currentJob?.planDate)) })}</span>
+        </div>
+        <div class="rest-session-grid">
+          <div>
+            <span>${t("driver.currentSession", "Current session")}</span>
+            <strong data-rest-session-timer>${durationClock(elapsedSeconds(rest.startedAt))}</strong>
+          </div>
+          <div>
+            <span>${t("driver.sessionsToday", "Sessions today")}</span>
+            <strong>${sessionCount}</strong>
+          </div>
+        </div>
+        <p>${t("driver.restStatisticsHelp", "Rest time that overlaps a started stop is automatically deducted from that stop's service-time statistics.")}</p>
+        <button class="primary rest-end-button" data-action="end-rest" type="button">${t("driver.endRest", "End rest time")}</button>
+      </section>
+    </div>
+  `;
+}
+
+function renderRest() {
+  return renderJob();
 }
 
 async function loadDriverHistory({ keepSelection = false } = {}) {
@@ -554,10 +656,10 @@ async function loadDriverHistory({ keepSelection = false } = {}) {
 }
 
 function historyTypeText(record) {
-  if (!record) return "Record";
-  if (record.type === "pre_dvir") return "Pre-Trip";
-  if (record.type === "post_dvir") return "Post-Trip";
-  return record.title || "Stop";
+  if (!record) return t("driver.record", "Record");
+  if (record.type === "pre_dvir") return t("driver.preTrip", "Pre-Trip");
+  if (record.type === "post_dvir") return t("driver.postTrip", "Post-Trip");
+  return record.title || t("driver.stop", "Stop");
 }
 
 function selectedHistoryRecord() {
@@ -566,12 +668,12 @@ function selectedHistoryRecord() {
 
 function renderHistoryPhotos(record) {
   const photos = (record?.photos || []).filter(Boolean);
-  if (!photos.length) return `<div class="history-empty small">No photos saved for this record.</div>`;
+  if (!photos.length) return `<div class="history-empty small">${t("driver.noPhotosSaved", "No photos saved for this record.")}</div>`;
   return `
     <div class="history-photo-grid">
       ${photos.map((photo, index) => `
-        <button class="history-photo-button" data-action="open-history-photo" data-photo-ref="${escapeHtml(photo)}" data-photo-label="${escapeHtml(historyTypeText(record))} photo ${index + 1}" type="button">
-          <img src="${photoImgSrc(photo)}" alt="${escapeHtml(historyTypeText(record))} photo ${index + 1}" />
+        <button class="history-photo-button" data-action="open-history-photo" data-photo-ref="${escapeHtml(photo)}" data-photo-label="${tf("driver.historyPhotoNumber", "{type} photo {number}", { type: historyTypeText(record), number: index + 1 })}" type="button">
+          <img src="${photoImgSrc(photo)}" alt="${tf("driver.historyPhotoNumber", "{type} photo {number}", { type: historyTypeText(record), number: index + 1 })}" />
         </button>
       `).join("")}
     </div>
@@ -584,14 +686,14 @@ function renderDriverHistory() {
     <section class="history-panel">
       <div class="history-head">
         <div>
-          <p>${escapeHtml(driver?.name || "Driver")}</p>
-          <h2>Personal History</h2>
+          <p>${escapeHtml(driver?.name || t("stats.driver", "Driver"))}</p>
+          <h2>${t("driver.personalHistory", "Personal History")}</h2>
         </div>
-        <button class="secondary compact" data-action="back-job" type="button">Back</button>
+        <button class="secondary compact" data-action="back-job" type="button">${t("common.back", "Back")}</button>
       </div>
       <div class="history-filter">
         <input id="driverHistoryDate" type="date" value="${escapeHtml(historyDate)}" />
-        <button class="secondary compact" data-action="refresh-history" type="button">Refresh</button>
+        <button class="secondary compact" data-action="refresh-history" type="button">${t("common.refresh", "Refresh")}</button>
       </div>
       <div class="history-list">
         ${driverHistory.map((record) => `
@@ -600,13 +702,13 @@ function renderDriverHistory() {
             <span>${escapeHtml(record.reference || record.truckPlate || "-")}</span>
             <em>${dateTimeText(record.createdAt)}</em>
           </button>
-        `).join("") || `<div class="history-empty">No history for this date.</div>`}
+        `).join("") || `<div class="history-empty">${t("driver.noHistory", "No history for this date.")}</div>`}
       </div>
       <div class="history-detail">
         ${selected ? `
           <div class="history-detail-title">
             <strong>${escapeHtml(historyTypeText(selected))}</strong>
-            <span>${escapeHtml(selected.status || "")}</span>
+            <span>${escapeHtml(localizeMessage(selected.status || ""))}</span>
           </div>
           <div class="history-meta">
             <span>${escapeHtml(planDateText(selected.planDate))}</span>
@@ -614,7 +716,7 @@ function renderDriverHistory() {
             <span>${escapeHtml(selected.details?.loadName || selected.details?.samsaraDvirId || "")}</span>
           </div>
           ${renderHistoryPhotos(selected)}
-        ` : `<div class="history-empty">Select one record.</div>`}
+        ` : `<div class="history-empty">${t("driver.selectRecord", "Select one record.")}</div>`}
       </div>
     </section>
   `);
@@ -629,7 +731,9 @@ async function loadNextJob() {
     currentJob = null;
     dvirPhotos = [];
     const message = dayState.preDvirStatus === "complete" && (!dayState.samsaraOnDutyConfirmed || !dayState.samsaraPreDvirConfirmed)
-      ? `Samsara did not receive/verify the inspection. Please redo it in MBBS PWA. ${dayState.samsaraOnDutyError || "Check Samsara DVIR author ID and Write DVIRs permission."}`
+      ? tf("driver.samsaraInspectionRetry", "Samsara did not receive/verify the inspection. Please redo it in MBBS PWA. {detail}", {
+          detail: localizeMessage(dayState.samsaraOnDutyError || t("driver.samsaraDvirPermissionHelp", "Check Samsara DVIR author ID and Write DVIRs permission."))
+        })
       : "";
     return renderDvir("pre", message);
   }
@@ -647,6 +751,7 @@ async function loadNextJob() {
   }
   currentJob = result.job;
   activeRest = result.rest || null;
+  restSummary = result.restSummary || null;
   photos = [];
   dvirMode = "";
   dvirPhotos = [];
@@ -654,9 +759,8 @@ async function loadNextJob() {
   photoPromptOpen = false;
   locationCheck = null;
   locationOverrideAccepted = false;
-  if (activeRest) return renderRest();
   if (!currentJob && dayState?.allJobsComplete && dayState.postDvirStatus !== "complete") {
-    return renderDvir("post", "All assigned jobs are complete. MBBS post-trip inspection is required before logout.");
+    return renderDvir("post", t("driver.postTripRequired", "All assigned jobs are complete. MBBS post-trip inspection is required before logout."));
   }
   renderJob();
 }
@@ -741,6 +845,7 @@ app.addEventListener("click", async (event) => {
     driver = null;
     currentJob = null;
     activeRest = null;
+    restSummary = null;
     disconnectEvents();
     return renderLogin();
   }
@@ -787,6 +892,7 @@ app.addEventListener("click", async (event) => {
     return renderJob();
   }
   if (action === "show-photo") {
+    if (!(await ensureLocationApprovalBeforeConfirmation())) return;
     photoPromptOpen = true;
     return renderJob();
   }
@@ -799,20 +905,16 @@ app.addEventListener("click", async (event) => {
     showToast("Location override accepted for this stop");
     return renderJob();
   }
-  if (action === "toggle-rest") {
-    restAfterCurrentStop = !restAfterCurrentStop;
-    showToast(restAfterCurrentStop ? "Rest after this stop" : "Auto-start next stop");
-    return renderJob();
-  }
   if (action === "start-rest") {
     button.disabled = true;
-    button.textContent = "Starting rest...";
+    button.textContent = localizeMessage("Starting rest...");
     try {
       const result = await request("/api/driver/rest/start", {
         method: "POST",
         body: JSON.stringify({})
       });
       activeRest = result.rest;
+      restSummary = result.restSummary || restSummary;
       currentJob = result.job || currentJob;
       showToast("Rest started");
       return renderRest();
@@ -823,13 +925,14 @@ app.addEventListener("click", async (event) => {
   }
   if (action === "end-rest") {
     button.disabled = true;
-    button.textContent = "Ending rest...";
+    button.textContent = localizeMessage("Ending rest...");
     try {
       const result = await request("/api/driver/rest/end", {
         method: "POST",
         body: JSON.stringify({})
       });
       activeRest = null;
+      restSummary = result.restSummary || restSummary;
       currentJob = result.job || currentJob;
       showToast("Rest ended");
       return renderJob();
@@ -855,16 +958,32 @@ app.addEventListener("click", async (event) => {
     const input = app.querySelector(`input[data-dvir-photo-index="${button.dataset.dvirPhotoIndex}"]`);
     input?.click();
   }
+  if (action === "add-job-photo") {
+    photos.push("");
+    return renderJob();
+  }
+  if (action === "remove-job-photo") {
+    if (photos.length > Math.max(2, Number(currentJob?.requiredPhotos || 0))) photos.pop();
+    return renderJob();
+  }
+  if (action === "add-dvir-photo") {
+    dvirPhotos.push("");
+    return renderDvir(dvirMode || "pre");
+  }
+  if (action === "remove-dvir-photo") {
+    if (dvirPhotos.length > 4) dvirPhotos.pop();
+    return renderDvir(dvirMode || "pre");
+  }
   if (action === "submit-dvir") {
     button.disabled = true;
-    button.textContent = "Uploading...";
+    button.textContent = t("common.uploading", "Uploading...");
     try {
       const type = dvirMode || "pre";
       const uploadedPhotos = await uploadDriverPhotos(dvirPhotos.filter(Boolean), {
         recordType: type === "post" ? "driver-dvir-post-photo" : "driver-dvir-pre-photo",
         dvirType: type
       });
-      button.textContent = "Saving...";
+      button.textContent = t("common.saving", "Saving...");
       const result = await request("/api/driver/dvir", {
         method: "POST",
         body: JSON.stringify({ type, photoDataUrls: uploadedPhotos })
@@ -882,7 +1001,7 @@ app.addEventListener("click", async (event) => {
   }
   if (action === "skip-dvir") {
     button.disabled = true;
-    button.textContent = "Skipping...";
+    button.textContent = `${t("driver.skipDvirTest", "Skipping DVIR Test")}...`;
     try {
       const result = await request("/api/driver/dvir/skip", {
         method: "POST",
@@ -904,7 +1023,7 @@ app.addEventListener("click", async (event) => {
       return renderRest();
     }
     button.disabled = true;
-    button.textContent = "Starting...";
+    button.textContent = `${t("common.start", "Start")}...`;
     try {
       const result = await request(`/api/driver/jobs/${encodeURIComponent(currentJob.jobId)}/start`, {
         method: "POST",
@@ -927,17 +1046,16 @@ app.addEventListener("click", async (event) => {
     }
   }
   if (action === "complete-job" && currentJob) {
-    if (!canConfirmCurrentJob(currentJob)) {
+    if (!canBeginJobConfirmation(currentJob)) {
       if (completeWaitSeconds(currentJob) > 0) showToast(`Please wait ${completeWaitSeconds(currentJob)} seconds.`);
-      else if (locationCheckBlocksComplete()) showToast("Recheck location or confirm override first.");
+      else if (locationCheckBlocksConfirmation()) showToast("Recheck location or confirm override first.");
       return renderJob();
     }
+    if (!(await ensureLocationApprovalBeforeConfirmation())) return;
     button.disabled = true;
-    button.textContent = "Uploading...";
+    button.textContent = t("common.uploading", "Uploading...");
     try {
-      const shouldStartRest = restAfterCurrentStop;
-      if (!locationCheck && !locationOverrideAccepted) await checkCurrentJobLocation({ render: false });
-      if (locationCheckBlocksComplete()) {
+      if (locationCheckBlocksConfirmation() || !locationCheckApproved()) {
         showToast("Recheck location or confirm override first.");
         return renderJob();
       }
@@ -951,23 +1069,22 @@ app.addEventListener("click", async (event) => {
         loadId: currentJob.loadId,
         orderRef: (currentJob.orderRefs || []).join(",")
       });
-      button.textContent = "Saving...";
+      button.textContent = t("common.saving", "Saving...");
       const result = await request(`/api/driver/jobs/${encodeURIComponent(currentJob.jobId)}/photos`, {
         method: "POST",
         body: JSON.stringify({
           photoDataUrls: uploadedPhotos,
           locationOverride: locationOverrideAccepted,
-          autoStartNext: !shouldStartRest,
-          autoStartRest: shouldStartRest
+          autoStartNext: true
         })
       });
       currentJob = result.nextJob;
       activeRest = result.rest || null;
+      restSummary = result.restSummary || restSummary;
       photos = [];
       orderPages = {};
       photoPromptOpen = false;
       const shouldCheckNext = currentJob?.status === "in_progress";
-      restAfterCurrentStop = false;
       locationCheck = null;
       locationOverrideAccepted = false;
       if (activeRest) {
@@ -1027,12 +1144,15 @@ app.addEventListener("submit", async (event) => {
     await loadNextJob();
     showToast(`Welcome ${driver.name}`);
   } catch (error) {
-    renderLogin(error.message);
+    renderLogin(localizeMessage(error.message));
   }
 });
 
 async function init() {
-  if (!authToken) return renderLogin();
+  if (!authToken) {
+    if (await redirectExistingStaffSession()) return;
+    return renderLogin();
+  }
   try {
     const result = await request("/api/driver/me");
     driver = result.driver;
@@ -1042,7 +1162,7 @@ async function init() {
     authToken = "";
     localStorage.removeItem(TOKEN_KEY);
     disconnectEvents();
-    renderLogin("Please login to continue.");
+    renderLogin(localizeMessage("Please login to continue."));
   }
 }
 

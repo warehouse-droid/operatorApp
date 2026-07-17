@@ -1,15 +1,15 @@
-const CACHE_NAME = "mbbs-yard-operator-v103-batch-switch";
+const CACHE_NAME = "mbbs-yard-operator-v114-yard-movements";
 const APP_SHELL = [
   "/operator",
   "/operator.html",
-  "/operator.css?v=20260713-consolidation-review-v3",
+  "/operator.css?v=20260716-multi-photo-pallet-v1",
   "/i18n.css?v=20260701-i18n-v2",
-  "/i18n.js?v=20260713-consolidation-review-v3",
-  "/operator.js?v=20260715-batch-switch-v1",
+  "/i18n.js?v=20260716-yard-movements-v1",
+  "/operator.js?v=20260716-multi-role-v1",
   "/driver",
   "/driver.html",
-  "/driver.css?v=20260702-camera-v3",
-  "/driver.js?v=20260707-rest-after-v1",
+  "/driver.css?v=20260716-multi-photo-pallet-v1",
+  "/driver.js?v=20260716-multi-role-v1",
   "/manifest.webmanifest",
   "/driver-manifest.webmanifest",
   "/icons/mbbs-yard-192.png",

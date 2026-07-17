@@ -162,6 +162,27 @@ export function transferProposalConversionSelection(quantity, line = {}) {
 
 const conversionSelection = transferProposalConversionSelection;
 
+export function preferredFullCoverageSourceYards(lines = [], matrixItems = [], rankedYards = []) {
+  const requiredByItem = new Map();
+  for (const line of lines || []) {
+    const itemKey = String(line.itemId ?? line.item_id ?? line.salesLineId ?? line.sales_line_id);
+    requiredByItem.set(itemKey, number(requiredByItem.get(itemKey)) + number(line.unresolvedQuantity ?? line.unresolved_quantity));
+  }
+  const matrixByItem = new Map((matrixItems || []).map((item) => [String(item.itemId ?? item.item_id), item]));
+  const preferredByItem = new Map();
+  for (const [itemKey, required] of requiredByItem.entries()) {
+    if (required <= EPSILON) continue;
+    const item = matrixByItem.get(itemKey);
+    const fullCoverYard = (rankedYards || []).find((yard) => {
+      const locationId = yard.locationId ?? yard.location_id;
+      const balance = (item?.balances || []).find((entry) => String(entry.locationId ?? entry.location_id) === String(locationId));
+      return number(balance?.effectiveAvailable ?? balance?.effective_available) + EPSILON >= required;
+    });
+    if (fullCoverYard) preferredByItem.set(itemKey, fullCoverYard.locationId ?? fullCoverYard.location_id);
+  }
+  return preferredByItem;
+}
+
 function allocationSalesQuantity(allocation = {}, targetLine = {}) {
   if (!allocation.quantities || typeof allocation.quantities !== "object") {
     const quantity = number(allocation.quantity);
@@ -971,15 +992,25 @@ export async function generateTransferDependencySuggestion({ salesOrderId, mode 
     }))
     .sort((left, right) => left.routeScore - right.routeScore || left.priority - right.priority);
   const matrixByItem = new Map(matrix.items.map((item) => [String(item.itemId), item]));
+  const remainingAvailability = new Map(matrix.items.flatMap((item) => (item.balances || []).map((balance) => [
+    `${item.itemId}:${balance.locationId}`,
+    number(balance.effectiveAvailable)
+  ])));
+  const preferredSourceByItem = preferredFullCoverageSourceYards(order.lines, matrix.items, rankedYards);
   const proposalGroups = new Map();
   let uncovered = 0;
   for (const line of order.lines) {
     let remaining = line.unresolvedQuantity;
     const item = matrixByItem.get(String(line.itemId));
-    for (const yard of rankedYards) {
+    const preferredSourceLocationId = preferredSourceByItem.get(String(line.itemId));
+    const sourceYards = preferredSourceLocationId === undefined
+      ? rankedYards
+      : rankedYards.filter((yard) => String(yard.locationId) === String(preferredSourceLocationId));
+    for (const yard of sourceYards) {
       if (remaining <= EPSILON) break;
       const balance = item?.balances?.find((entry) => String(entry.locationId) === String(yard.locationId));
-      const available = number(balance?.effectiveAvailable);
+      const availabilityKey = `${line.itemId}:${yard.locationId}`;
+      const available = number(remainingAvailability.get(availabilityKey) ?? balance?.effectiveAvailable);
       if (available <= EPSILON) continue;
       const allocated = Math.min(remaining, available);
       const selection = transferProposalConversionSelection(allocated, line);
@@ -1017,6 +1048,7 @@ export async function generateTransferDependencySuggestion({ salesOrderId, mode 
         sectionQty: selection.quantities.sections,
         pieceQty: selection.quantities.pieces
       });
+      remainingAvailability.set(availabilityKey, Math.max(0, available - finalAllocated));
       remaining = Math.max(0, remaining - finalAllocated);
     }
     uncovered += Math.max(0, remaining);
@@ -1093,7 +1125,12 @@ export async function generateTransferDependencySuggestion({ salesOrderId, mode 
       entityId: String(batchId),
       orderId: order.salesOrderRef,
       operatorId,
-      details: { proposalCount: proposalGroups.size, uncoveredQuantity: uncovered, mode: normalizedMode }
+      details: {
+        proposalCount: proposalGroups.size,
+        uncoveredQuantity: uncovered,
+        mode: normalizedMode,
+        fullCoverItemCount: preferredSourceByItem.size
+      }
     });
     return getTransferDependencyBatch(batchId);
   });
@@ -1237,6 +1274,94 @@ async function recalculateTransferProposalPallets(proposalId, overrideValue = un
     [Number(proposalId), pallet.calculatedQuantity, finalQuantity, pallet.complete, overrideProvided]
   );
   return { ...pallet, finalQuantity, overridden: overrideProvided || current.rows[0].pallet_qty_overridden === true };
+}
+
+export async function removeTransferDependencyProposalLine(batchId, proposalId, proposalLineId, operatorId = null) {
+  return withTransaction(async () => {
+    const selected = await query(
+      `SELECT b.id AS batch_id, b.sales_order_id, b.sales_order_ref, b.status AS batch_status,
+              p.id AS proposal_id, p.creation_status,
+              pl.id AS proposal_line_id, pl.sales_line_id, pl.item_id, pl.item_name,
+              pl.proposed_quantity
+         FROM scm_transfer_dependency_batches b
+         JOIN scm_transfer_dependency_proposals p ON p.batch_id = b.id
+         JOIN scm_transfer_dependency_proposal_lines pl ON pl.proposal_id = p.id
+        WHERE b.id = $1 AND p.id = $2 AND pl.id = $3
+        FOR UPDATE OF b, p, pl`,
+      [Number(batchId), Number(proposalId), Number(proposalLineId)]
+    );
+    if (!selected.rowCount) {
+      const error = new Error("Transfer proposal line not found.");
+      error.status = 404;
+      throw error;
+    }
+    const removed = selected.rows[0];
+    if (["creating", "created"].includes(removed.batch_status)
+      || !["draft", "failed"].includes(removed.creation_status)) {
+      const error = new Error("This transfer proposal can no longer be edited.");
+      error.status = 409;
+      throw error;
+    }
+    await query(
+      `DELETE FROM scm_transfer_dependency_proposal_lines
+        WHERE id = $1 AND proposal_id = $2`,
+      [Number(proposalLineId), Number(proposalId)]
+    );
+    const remaining = await query(
+      `SELECT COUNT(*)::int AS line_count
+         FROM scm_transfer_dependency_proposal_lines
+        WHERE proposal_id = $1`,
+      [Number(proposalId)]
+    );
+    const proposalRemoved = Number(remaining.rows[0]?.line_count || 0) === 0;
+    if (proposalRemoved) {
+      await query(
+        `DELETE FROM scm_transfer_dependency_proposals
+          WHERE id = $1 AND batch_id = $2`,
+        [Number(proposalId), Number(batchId)]
+      );
+    } else {
+      await recalculateTransferProposalPallets(proposalId);
+    }
+    const destinationCoverage = await query(
+      `SELECT COALESCE(SUM(pl.proposed_quantity), 0) AS proposed
+         FROM scm_transfer_dependency_proposal_lines pl
+         JOIN scm_transfer_dependency_proposals p ON p.id = pl.proposal_id
+         JOIN sales_orders o ON o.netsuite_id = $2
+        WHERE p.batch_id = $1
+          AND p.creation_status <> 'cancelled'
+          AND p.to_location_id = o.outbound_location_id`,
+      [Number(batchId), Number(removed.sales_order_id)]
+    );
+    const shortageRows = await salesOrderShortageRows(removed.sales_order_id);
+    const shortage = shortageRows.reduce((total, row) => total + row.unresolved_quantity, 0);
+    const uncovered = Math.max(0, shortage - number(destinationCoverage.rows[0]?.proposed));
+    await query(
+      `UPDATE scm_transfer_dependency_batches
+          SET uncovered_shortage_qty = $2, updated_by = $3, updated_at = now()
+        WHERE id = $1`,
+      [Number(batchId), uncovered, operatorId]
+    );
+    await writeDispatchAudit({
+      action: "scm.transfer_dependency.proposal_line_removed",
+      source: "scm",
+      entityType: "dependency_batch",
+      entityId: String(batchId),
+      orderId: removed.sales_order_ref,
+      operatorId,
+      details: {
+        proposalId: Number(proposalId),
+        proposalLineId: Number(proposalLineId),
+        salesLineId: removed.sales_line_id,
+        itemId: removed.item_id,
+        itemName: removed.item_name,
+        proposedQuantity: number(removed.proposed_quantity),
+        proposalRemoved,
+        uncoveredQuantity: uncovered
+      }
+    });
+    return getTransferDependencyBatch(batchId);
+  });
 }
 
 export async function prepareTransferDependencyPalletItem(batchId, palletItem, operatorId = null) {

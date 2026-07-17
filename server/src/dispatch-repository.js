@@ -14,6 +14,14 @@ function toNumber(value) {
 }
 
 const CUSTOMER_PICKUP_DELIVERY_METHOD = "Pick-Up";
+const SCM_VRMA_OWN_YARDS = [
+  { code: "3445", name: "3445", address: "3445 Kennedy Road, Toronto, ON" },
+  { code: "2967", name: "2967", address: "2967 Kennedy Road, Toronto, ON" },
+  { code: "12441", name: "12441", address: "12441 Woodbine Avenue, Whitchurch-Stouffville, ON" },
+  { code: "150", name: "150", address: "150 Clark Blvd, Brampton, ON L6T 4Y8, Canada" }
+];
+const SCM_VRMA_OWN_YARD_CODES = new Set(SCM_VRMA_OWN_YARDS.map((yard) => yard.code));
+const SCM_VRMA_FALLBACK_UNITS = new Set(["PLT", "SQFT", "PC"]);
 
 function dispatchItemHasConversion(item) {
   return toNumber(item.toPlt) > 0 || toNumber(item.toLyr) > 0 || toNumber(item.toSec) > 0 || toNumber(item.toPcs) > 0;
@@ -68,6 +76,13 @@ function rowToDispatchOrder(row) {
   const address = row.dispatch_type === "PO"
     ? row.drop_address || row.dispatch_address || row.source_address || ""
     : row.drop_address || row.dispatch_address || "";
+  const items = normalizeDispatchItems(row.items || []);
+  const salesByUnit = new Map();
+  for (const item of items) {
+    const unit = String(item.unit || "Qty").trim() || "Qty";
+    salesByUnit.set(unit, toNumber(salesByUnit.get(unit)) + toNumber(item.quantity));
+  }
+  const salesQuantities = [...salesByUnit.entries()].map(([unit, quantity]) => ({ unit, quantity }));
   const transitCo = row.transit_co_ref ? {
     id: row.transit_co_ref,
     fromYard: row.transit_co_from_yard || row.pickup_location || "",
@@ -98,9 +113,12 @@ function rowToDispatchOrder(row) {
     transitOriginalPickupLocations: transitCo?.fromYard ? [transitCo.fromYard] : [],
     transitCo,
     destinationYard: row.destination_location || "",
-    pallets: totalPallets || Math.floor(fallbackQty / 100),
+    pallets: row.source_table === "scm_vrma_orders"
+      ? totalPallets
+      : totalPallets || Math.floor(fallbackQty / 100),
     layers: totalLayers,
     salesQty: fallbackQty,
+    salesQuantities,
     packed: {
       pallets: toNumber(row.total_packed_pallet_qty),
       layers: toNumber(row.total_packed_layer_qty),
@@ -108,7 +126,7 @@ function rowToDispatchOrder(row) {
       pieces: toNumber(row.total_packed_piece_qty)
     },
     weight: Math.round(toNumber(row.total_weight_lbs) * 1000) / 1000,
-    items: normalizeDispatchItems(row.items || []),
+    items,
     raw: row,
     netsuiteStatus: row.status || "",
     netsuiteStatusText: row.status_text || "",
@@ -167,6 +185,7 @@ function yardAddressSql(field) {
     WHEN ${field} = '3445' THEN '3445 Kennedy Road, Toronto, ON'
     WHEN ${field} = '2967' THEN '2967 Kennedy Road, Toronto, ON'
     WHEN ${field} = '12441' THEN '12441 Woodbine Avenue, Whitchurch-Stouffville, ON'
+    WHEN ${field} = '150' THEN '150 Clark Blvd, Brampton, ON L6T 4Y8, Canada'
     ELSE ''
   END`;
 }
@@ -786,21 +805,15 @@ export async function listDispatchOrders({ type = null, includeHiddenScm = false
         'scm_vrma_orders' AS source_table,
         COALESCE(v.local_vendor, v.vendor, 'Vendor Return') AS party,
         scm.eta_date AS expected_delivery_date,
-        COALESCE(NULLIF(v.pickup_location, ''), NULLIF(scm.pickup_point, ''), 'Vendor') AS pickup_location,
-        NULL::text AS source_address,
-        COALESCE(NULLIF(v.dropoff_location, ''), NULLIF(scm.dropoff_point, ''), '') AS destination_location,
-        CASE
-          WHEN COALESCE(NULLIF(v.dropoff_location, ''), NULLIF(scm.dropoff_point, ''), '') = '3445' THEN 1
-          WHEN COALESCE(NULLIF(v.dropoff_location, ''), NULLIF(scm.dropoff_point, ''), '') = '2967' THEN 28
-          WHEN COALESCE(NULLIF(v.dropoff_location, ''), NULLIF(scm.dropoff_point, ''), '') = '12441' THEN 15
-          WHEN COALESCE(NULLIF(v.dropoff_location, ''), NULLIF(scm.dropoff_point, ''), '') = '150' THEN 26
-          ELSE NULL
-        END AS destination_location_id,
-        ${yardAddressSql("COALESCE(NULLIF(v.dropoff_location, ''), NULLIF(scm.dropoff_point, ''), '')")} AS drop_address,
-        NULL::text AS dispatch_address,
-        ''::text AS dispatch_window_start,
-        ''::text AS dispatch_window_end,
-        COALESCE(v.notes, scm.notes, 'Vendor return') AS dispatch_instructions,
+        v.pickup_location AS pickup_location,
+        ${yardAddressSql("v.pickup_location")} AS source_address,
+        v.dropoff_location AS destination_location,
+        NULL::bigint AS destination_location_id,
+        COALESCE(vrma_yard.address, '') AS drop_address,
+        COALESCE(vrma_yard.address, '') AS dispatch_address,
+        COALESCE(vrma_yard.window_start, '') AS dispatch_window_start,
+        COALESCE(vrma_yard.window_end, '') AS dispatch_window_end,
+        COALESCE(NULLIF(trim(concat_ws(' | ', NULLIF(v.notes, ''), NULLIF(vrma_yard.instructions, ''))), ''), 'Vendor return') AS dispatch_instructions,
         COALESCE(v.local_vendor, v.vendor, scm.brand) AS dispatch_vendor_yard,
         'scm-vrma'::text AS dispatch_parse_source,
         NULL::text AS transit_co_ref,
@@ -827,8 +840,8 @@ export async function listDispatchOrders({ type = null, includeHiddenScm = false
         scm.eta_time AS scm_eta_time,
         scm.driver AS scm_driver,
         scm.notes AS scm_notes,
-        0::numeric AS total_pallet_qty,
-        0::numeric AS total_layer_qty,
+        COALESCE(SUM(l.pallet_qty), 0) AS total_pallet_qty,
+        COALESCE(SUM(l.layer_qty), 0) AS total_layer_qty,
         COALESCE(SUM(l.quantity), 0) AS total_quantity,
         0::numeric AS total_packed_pallet_qty,
         0::numeric AS total_packed_layer_qty,
@@ -841,25 +854,36 @@ export async function listDispatchOrders({ type = null, includeHiddenScm = false
           'itemId', l.item_id,
           'sku', COALESCE(l.sku, l.item_name),
           'itemName', l.item_name,
-          'description', '',
-          'pallets', 0,
-          'layers', 0,
-          'sections', 0,
-          'pieces', 0,
+          'description', COALESCE(l.item_description, ''),
+          'pallets', COALESCE(l.pallet_qty, 0),
+          'layers', COALESCE(l.layer_qty, 0),
+          'sections', COALESCE(l.section_qty, 0),
+          'pieces', COALESCE(l.piece_qty, 0),
           'quantity', COALESCE(l.quantity, 0),
           'unit', l.unit,
           'itemWeight', CASE WHEN COALESCE(l.quantity, 0) = 0 THEN 0 ELSE COALESCE(l.weight_lbs, 0) / NULLIF(l.quantity, 0) END,
           'lineWeight', COALESCE(l.weight_lbs, 0),
           'netsuiteReceivedQty', 0,
-          'toPlt', 0,
-          'toLyr', 0,
-          'toSec', 0,
-          'toPcs', 0
+          'toPlt', COALESCE(l.to_plt, 0),
+          'toLyr', COALESCE(l.to_lyr, 0),
+          'toSec', COALESCE(l.to_sec, 0),
+          'toPcs', COALESCE(l.to_pcs, 0)
         ) ORDER BY l.id) FILTER (WHERE l.id IS NOT NULL) AS items
       FROM scm_vrma_orders v
       LEFT JOIN scm_transport_schedule scm ON scm.order_kind = 'VRMA' AND lower(scm.order_ref) = lower(v.vrma_ref)
+      LEFT JOIN LATERAL (
+        SELECT y.id, y.address, y.window_start, y.window_end, y.instructions
+          FROM dispatch_vendor_yards y
+         WHERE y.active = true
+           AND LOWER(y.vendor) = LOWER(COALESCE(v.local_vendor, v.vendor, ''))
+           AND LOWER(y.yard) = LOWER(COALESCE(v.dropoff_location, ''))
+         ORDER BY y.id
+         LIMIT 1
+      ) vrma_yard ON true
       LEFT JOIN scm_vrma_order_lines l ON l.vrma_order_id = v.id
-      WHERE (
+      WHERE v.pickup_location IN ('3445', '2967', '12441', '150')
+        AND vrma_yard.id IS NOT NULL
+        AND (
           $1::boolean
           OR COALESCE(scm.method, v.method, 'MBT') = 'MBT'
         )
@@ -867,7 +891,7 @@ export async function listDispatchOrders({ type = null, includeHiddenScm = false
           $1::boolean
           OR COALESCE(scm.status, v.status, 'Queued') NOT IN ('Cancelled', 'Hold')
         )
-      GROUP BY v.id, scm.id
+      GROUP BY v.id, scm.id, vrma_yard.address, vrma_yard.window_start, vrma_yard.window_end, vrma_yard.instructions
     )
     SELECT orders.*,
            COALESCE((
@@ -1345,6 +1369,7 @@ function lineSalesQty(row, qtys = {}) {
     + (sections * positiveQuantity(row.to_sec))
     + (pieces * positiveQuantity(row.to_pcs));
   if (converted > 0) return converted;
+  if (!hasConversion(row) && hasCustomQuantity(row)) return directSales;
   if (!hasConversion(row)) return directSales || pieces || sections || layers || pallets;
   return directSales;
 }
@@ -1800,6 +1825,170 @@ function scmDisplayRef(row = {}) {
   return row.dispatch_ref || row.display_ref || row.order_ref || row.tranid || row.vrma_ref || "";
 }
 
+async function listScmVrmaSchedule({
+  search = "",
+  status = "",
+  method = "",
+  yard = "",
+  brand = "",
+  from = "",
+  to = "",
+  view = ""
+} = {}) {
+  const params = [
+    String(search || "").trim().toLowerCase(),
+    String(status || "").trim(),
+    String(method || "").trim(),
+    String(yard || "").trim(),
+    String(brand || "").trim().toLowerCase(),
+    String(from || "").trim() || null,
+    String(to || "").trim() || null,
+    String(view || "").trim()
+  ];
+  const result = await query(
+    `WITH line_summary AS (
+       SELECT l.vrma_order_id,
+              string_agg(
+                trim(concat_ws(' ',
+                  COALESCE(NULLIF(l.sku, ''), NULLIF(l.item_name, ''), 'Item'),
+                  CASE
+                    WHEN COALESCE(l.pallet_qty, 0) + COALESCE(l.layer_qty, 0) + COALESCE(l.section_qty, 0) + COALESCE(l.piece_qty, 0) > 0
+                      THEN trim(concat_ws(' ',
+                        CASE WHEN COALESCE(l.pallet_qty, 0) > 0 THEN trim(to_char(l.pallet_qty, 'FM999999999990.##')) || ' PLT' END,
+                        CASE WHEN COALESCE(l.layer_qty, 0) > 0 THEN trim(to_char(l.layer_qty, 'FM999999999990.##')) || ' LYR' END,
+                        CASE WHEN COALESCE(l.section_qty, 0) > 0 THEN trim(to_char(l.section_qty, 'FM999999999990.##')) || ' SEC' END,
+                        CASE WHEN COALESCE(l.piece_qty, 0) > 0 THEN trim(to_char(l.piece_qty, 'FM999999999990.##')) || ' PCS' END
+                      ))
+                    ELSE trim(concat_ws(' ',
+                      trim(to_char(COALESCE(l.quantity, 0), 'FM999999999990.######')),
+                      NULLIF(l.unit, '')
+                    ))
+                  END
+                )),
+                '; ' ORDER BY l.id
+              ) AS content,
+              COALESCE(SUM(l.pallet_qty), 0) AS total_pallet_qty,
+              COALESCE(SUM(l.weight_lbs), 0) AS weight_lbs
+         FROM scm_vrma_order_lines l
+        GROUP BY l.vrma_order_id
+     ),
+     planned AS (
+       SELECT DISTINCT ON (LOWER(a.order_ref))
+              a.order_ref,
+              a.plan_date AS eta_date,
+              COALESCE(a.eta_time, '') AS eta_time,
+              COALESCE(a.driver, '') AS driver,
+              trim(concat_ws(' ', NULLIF(a.truck_plate, ''), NULLIF(a.load_name, ''))) AS notes
+         FROM dispatch_vrma_plan_assignments a
+         JOIN dispatch_plans p ON p.id = a.plan_id AND p.status <> 'cancelled'
+        ORDER BY LOWER(a.order_ref), a.plan_date DESC, a.updated_at DESC
+     ),
+     vrma_rows AS (
+       SELECT
+         COALESCE(s.id, 0) AS schedule_id,
+         'VRMA'::text AS order_kind,
+         'scm_vrma_orders'::text AS source_table,
+         v.id AS source_id,
+         v.vrma_ref AS source_ref,
+         v.vrma_ref AS order_ref,
+         ''::text AS dispatch_ref,
+         COALESCE(v.local_vendor, v.vendor, 'Vendor Return') AS party,
+         COALESCE(NULLIF(s.display_ref, ''), v.vrma_ref) AS display_ref,
+         COALESCE(s.is_special_order, false) AS is_special_order,
+         'MBT'::text AS method,
+         v.pickup_location AS pickup_point,
+         v.dropoff_location AS dropoff_point,
+         COALESCE(v.local_vendor, v.vendor, '') AS brand,
+         COALESCE(NULLIF(s.content, ''), summary.content, '') AS content,
+         COALESCE(summary.total_pallet_qty, 0) AS total_pallet_qty,
+         COALESCE(NULLIF(s.weight_lbs, 0), summary.weight_lbs, 0) AS weight_lbs,
+         COALESCE(NULLIF(s.packing_slip_ref, ''), '') AS packing_slip_ref,
+         COALESCE(s.group_ref, '') AS group_ref,
+         CASE
+           WHEN COALESCE(s.status, '') IN ('Completed', 'Cancelled', 'Hold') THEN s.status
+           WHEN planned.order_ref IS NOT NULL THEN 'Planned'
+           WHEN COALESCE(s.status, '') = 'Planned' THEN COALESCE(v.status, 'Queued')
+           ELSE COALESCE(s.status, v.status, 'Queued')
+         END AS status,
+         COALESCE(s.created_at, v.created_at) AS queued_at,
+         COALESCE(s.eta_date, planned.eta_date) AS eta_date,
+         COALESCE(NULLIF(s.eta_time, ''), planned.eta_time, '') AS eta_time,
+         COALESCE(NULLIF(s.driver, ''), planned.driver, '') AS driver,
+         COALESCE(NULLIF(s.notes, ''), planned.notes, '') AS notes,
+         s.updated_at,
+         s.updated_by
+       FROM scm_vrma_orders v
+       LEFT JOIN line_summary summary ON summary.vrma_order_id = v.id
+       LEFT JOIN scm_transport_schedule s
+         ON s.order_kind = 'VRMA'
+        AND LOWER(s.order_ref) = LOWER(v.vrma_ref)
+       LEFT JOIN planned ON LOWER(planned.order_ref) = LOWER(v.vrma_ref)
+     )
+     SELECT *,
+            CASE
+              WHEN eta_date IS NULL OR queued_at IS NULL THEN NULL
+              ELSE eta_date - queued_at::date
+            END AS sla_days
+       FROM vrma_rows
+      WHERE ($1 = '' OR LOWER(CONCAT_WS(' ', order_ref, party, pickup_point, dropoff_point, brand, content, packing_slip_ref, group_ref)) LIKE '%' || $1 || '%')
+        AND ($2 = '' OR status = $2)
+        AND ($3 = '' OR method = $3)
+        AND ($4 = '' OR dropoff_point = $4)
+        AND ($5 = '' OR LOWER(brand) = $5)
+        AND ($6::date IS NULL OR eta_date >= $6::date)
+        AND ($7::date IS NULL OR eta_date <= $7::date)
+        AND ($8 <> 'dispatch' OR (method = 'MBT' AND status NOT IN ('Cancelled', 'Hold')))
+        AND ($8 <> 'completed' OR status = 'Completed')
+      ORDER BY
+        CASE status
+          WHEN 'Urgent' THEN 0
+          WHEN 'Priority' THEN 1
+          WHEN 'Queued' THEN 2
+          WHEN 'Book Appt' THEN 3
+          WHEN 'Surplus Only' THEN 4
+          WHEN 'Planned' THEN 5
+          WHEN 'Completed' THEN 6
+          WHEN 'Hold' THEN 7
+          ELSE 9
+        END,
+        eta_date NULLS LAST,
+        order_ref
+      LIMIT 1000`,
+    params
+  );
+  return result.rows.map((row) => ({
+    scheduleId: Number(row.schedule_id || 0),
+    orderKind: "VRMA",
+    sourceTable: row.source_table,
+    sourceId: row.source_id,
+    sourceRef: row.source_ref,
+    orderRef: row.order_ref,
+    dispatchRef: "",
+    party: row.party || "",
+    displayRef: row.display_ref || row.order_ref,
+    isSpecialOrder: row.is_special_order === true,
+    method: "MBT",
+    pickupPoint: row.pickup_point || "",
+    dropoffPoint: row.dropoff_point || "",
+    brand: row.brand || "",
+    content: row.content || "",
+    totalPalletQty: Number(row.total_pallet_qty || 0),
+    weightLbs: Number(row.weight_lbs || 0),
+    packingSlipRef: row.packing_slip_ref || "",
+    groupRef: row.group_ref || "",
+    status: row.status || "Queued",
+    queuedDate: dateOnly(row.queued_at),
+    etaDate: dateOnly(row.eta_date),
+    etaTime: row.eta_time || "",
+    driver: row.driver || "",
+    sla: row.sla_days === null || row.sla_days === undefined ? "" : `${Number(row.sla_days)} day${Number(row.sla_days) === 1 ? "" : "s"}`,
+    slaDays: row.sla_days === null || row.sla_days === undefined ? null : Number(row.sla_days),
+    notes: row.notes || "",
+    updatedAt: row.updated_at,
+    updatedBy: row.updated_by || ""
+  }));
+}
+
 export async function listScmSchedule({
   search = "",
   status = "",
@@ -1811,6 +2000,18 @@ export async function listScmSchedule({
   to = "",
   view = ""
 } = {}) {
+  if (String(kind || "").trim().toUpperCase() === "VRMA") {
+    return listScmVrmaSchedule({
+      search,
+      status,
+      method,
+      yard,
+      brand,
+      from,
+      to,
+      view
+    });
+  }
   const params = [
     String(search || "").trim().toLowerCase(),
     String(status || "").trim(),
@@ -1961,14 +2162,25 @@ export async function listScmSchedule({
         string_agg(
           trim(concat_ws(' ',
             COALESCE(NULLIF(l.sku, ''), NULLIF(l.item_name, ''), 'Item'),
-            trim(to_char(COALESCE(l.quantity, 0), 'FM999999999990.######')),
-            NULLIF(l.unit, '')
+            CASE
+              WHEN COALESCE(l.pallet_qty, 0) + COALESCE(l.layer_qty, 0) + COALESCE(l.section_qty, 0) + COALESCE(l.piece_qty, 0) > 0
+                THEN trim(concat_ws(' ',
+                  CASE WHEN COALESCE(l.pallet_qty, 0) > 0 THEN trim(to_char(l.pallet_qty, 'FM999999999990.##')) || ' PLT' END,
+                  CASE WHEN COALESCE(l.layer_qty, 0) > 0 THEN trim(to_char(l.layer_qty, 'FM999999999990.##')) || ' LYR' END,
+                  CASE WHEN COALESCE(l.section_qty, 0) > 0 THEN trim(to_char(l.section_qty, 'FM999999999990.##')) || ' SEC' END,
+                  CASE WHEN COALESCE(l.piece_qty, 0) > 0 THEN trim(to_char(l.piece_qty, 'FM999999999990.##')) || ' PCS' END
+                ))
+              ELSE trim(concat_ws(' ',
+                trim(to_char(COALESCE(l.quantity, 0), 'FM999999999990.######')),
+                NULLIF(l.unit, '')
+              ))
+            END
           )),
           '; ' ORDER BY l.id
         ) FILTER (WHERE l.id IS NOT NULL) AS content,
         NULL::date AS expected_delivery_date,
         v.created_at AS queued_at,
-        0::numeric AS total_pallet_qty,
+        COALESCE(SUM(l.pallet_qty), 0) AS total_pallet_qty,
         COALESCE(SUM(l.weight_lbs), 0) AS weight_lbs
       FROM scm_vrma_orders v
       LEFT JOIN scm_vrma_order_lines l ON l.vrma_order_id = v.id
@@ -2024,11 +2236,17 @@ export async function listScmSchedule({
       b.party,
       COALESCE(NULLIF(s.display_ref, ''), b.order_ref) AS display_ref,
       COALESCE(s.is_special_order, false) AS is_special_order,
-      COALESCE(s.method, 'MBT') AS method,
+      CASE WHEN b.order_kind = 'VRMA' THEN 'MBT' ELSE COALESCE(s.method, 'MBT') END AS method,
       NULLIF(s.pickup_point, '') AS schedule_pickup_point,
-      COALESCE(NULLIF(s.pickup_point, ''), b.pickup_point, '') AS pickup_point,
-      COALESCE(NULLIF(s.dropoff_point, ''), b.dropoff_point, '') AS dropoff_point,
-      COALESCE(NULLIF(s.brand, ''), b.brand, '') AS brand,
+      CASE WHEN b.order_kind = 'VRMA'
+        THEN COALESCE(b.pickup_point, '')
+        ELSE COALESCE(NULLIF(s.pickup_point, ''), b.pickup_point, '') END AS pickup_point,
+      CASE WHEN b.order_kind = 'VRMA'
+        THEN COALESCE(b.dropoff_point, '')
+        ELSE COALESCE(NULLIF(s.dropoff_point, ''), b.dropoff_point, '') END AS dropoff_point,
+      CASE WHEN b.order_kind = 'VRMA'
+        THEN COALESCE(b.brand, '')
+        ELSE COALESCE(NULLIF(s.brand, ''), b.brand, '') END AS brand,
       COALESCE(NULLIF(s.content, ''), b.content, '') AS content,
       COALESCE(b.total_pallet_qty, 0) AS total_pallet_qty,
       COALESCE(NULLIF(s.weight_lbs, 0), b.weight_lbs, 0) AS weight_lbs,
@@ -2255,6 +2473,29 @@ export async function updateScmScheduleEntry({
     sla: pickText("sla", "sla", current.sla || ""),
     notes: pickText("notes", "notes", current.notes || "")
   };
+  if (kind === "VRMA") {
+    const routeResult = await query(
+      `SELECT v.pickup_location, v.dropoff_location, COALESCE(v.local_vendor, v.vendor, '') AS local_vendor
+         FROM scm_vrma_orders v
+         JOIN dispatch_local_vendors lv
+           ON lv.active = true
+          AND LOWER(lv.name) = LOWER(COALESCE(v.local_vendor, v.vendor, ''))
+         JOIN dispatch_vendor_yards y
+           ON y.active = true
+          AND LOWER(y.vendor) = LOWER(lv.name)
+          AND LOWER(y.yard) = LOWER(v.dropoff_location)
+        WHERE LOWER(v.vrma_ref) = LOWER($1)
+          AND v.pickup_location IN ('3445', '2967', '12441', '150')
+        LIMIT 1`,
+      [ref]
+    );
+    const route = routeResult.rows[0];
+    if (!route) throw new Error("VRMA route must be one of our yards to an active local vendor yard.");
+    next.method = "MBT";
+    next.pickupPoint = route.pickup_location;
+    next.dropoffPoint = route.dropoff_location;
+    next.brand = route.local_vendor;
+  }
   const result = await query(
     `INSERT INTO scm_transport_schedule (
        order_kind, order_ref, display_ref, is_special_order, method,
@@ -2705,6 +2946,146 @@ export async function upsertScmViewPreset({ id = null, name = "", description = 
   return result.rows[0];
 }
 
+export async function getScmVrmaOptions() {
+  const result = await query(
+    `SELECT y.id, y.vendor, y.yard, y.address, y.day_label, y.window_start, y.window_end, y.instructions
+       FROM dispatch_local_vendors v
+       JOIN dispatch_vendor_yards y ON LOWER(y.vendor) = LOWER(v.name)
+      WHERE v.active = true
+        AND y.active = true
+      ORDER BY v.name, y.yard, y.day_label, y.id`
+  );
+  const byVendor = new Map();
+  for (const row of result.rows) {
+    const name = String(row.vendor || "").trim();
+    if (!name) continue;
+    if (!byVendor.has(name)) byVendor.set(name, { name, yards: [] });
+    const vendor = byVendor.get(name);
+    if (vendor.yards.some((yard) => yard.name.toLowerCase() === String(row.yard || "").trim().toLowerCase())) continue;
+    vendor.yards.push({
+      id: row.id,
+      name: row.yard || "",
+      address: row.address || "",
+      dayLabel: row.day_label || "",
+      windowStart: row.window_start || "",
+      windowEnd: row.window_end || "",
+      instructions: row.instructions || ""
+    });
+  }
+  return {
+    ownYards: SCM_VRMA_OWN_YARDS.map((yard) => ({ ...yard })),
+    localVendors: [...byVendor.values()]
+  };
+}
+
+export async function searchScmVrmaItems({ search = "", limit = 20 } = {}) {
+  const term = String(search || "").trim();
+  if (term.length < 2) return [];
+  const result = await query(
+    `SELECT item_id, item_name, display_name, item_description, stock_unit, item_weight,
+            to_plt, to_lyr, to_sec, to_pcs
+       FROM inventory_items
+      WHERE item_name ILIKE $1
+         OR COALESCE(display_name, '') ILIKE $1
+         OR COALESCE(item_description, '') ILIKE $1
+      ORDER BY
+        CASE WHEN LOWER(item_name) = LOWER($2) THEN 0
+             WHEN LOWER(item_name) LIKE LOWER($2) || '%' THEN 1
+             ELSE 2 END,
+        item_name
+      LIMIT $3`,
+    [`%${term}%`, term, Math.min(Math.max(Number(limit) || 20, 1), 40)]
+  );
+  return result.rows.map((row) => ({
+    itemId: row.item_id,
+    sku: row.item_name || "",
+    itemName: row.display_name || row.item_name || "",
+    description: row.item_description || "",
+    stockUnit: row.stock_unit || "",
+    itemWeight: positiveQuantity(row.item_weight),
+    toPlt: positiveQuantity(row.to_plt),
+    toLyr: positiveQuantity(row.to_lyr),
+    toSec: positiveQuantity(row.to_sec),
+    toPcs: positiveQuantity(row.to_pcs)
+  }));
+}
+
+export async function getScmVrmaOrder(vrmaRef = "") {
+  const ref = String(vrmaRef || "").trim();
+  if (!ref) return null;
+  const headerResult = await query(
+    `SELECT id, vrma_ref, vendor, local_vendor, pickup_location, dropoff_location,
+            status, method, notes, created_at, updated_at
+       FROM scm_vrma_orders
+      WHERE LOWER(vrma_ref) = LOWER($1)
+      LIMIT 1`,
+    [ref]
+  );
+  const header = headerResult.rows[0];
+  if (!header) return null;
+  const lineResult = await query(
+    `SELECT l.id, l.item_id, l.sku, l.item_name, l.item_description, l.quantity, l.unit,
+            l.weight_lbs, l.pallet_qty, l.layer_qty, l.section_qty, l.piece_qty,
+            l.to_plt, l.to_lyr, l.to_sec, l.to_pcs,
+            i.stock_unit, i.item_weight
+       FROM scm_vrma_order_lines l
+       LEFT JOIN inventory_items i ON i.item_id = l.item_id
+      WHERE l.vrma_order_id = $1
+      ORDER BY l.id`,
+    [header.id]
+  );
+  return {
+    id: header.id,
+    vrmaRef: header.vrma_ref,
+    vendor: header.vendor || "",
+    localVendor: header.local_vendor || header.vendor || "",
+    pickupLocation: header.pickup_location || "",
+    dropoffLocation: header.dropoff_location || "",
+    status: header.status || "Queued",
+    method: header.method || "MBT",
+    notes: header.notes || "",
+    createdAt: header.created_at,
+    updatedAt: header.updated_at,
+    lines: lineResult.rows.map((line) => ({
+      id: line.id,
+      itemId: line.item_id,
+      sku: line.sku || "",
+      itemName: line.item_name || line.sku || "",
+      description: line.item_description || "",
+      quantity: positiveQuantity(line.quantity),
+      unit: line.unit || "",
+      weightLbs: positiveQuantity(line.weight_lbs),
+      palletQty: positiveQuantity(line.pallet_qty),
+      layerQty: positiveQuantity(line.layer_qty),
+      sectionQty: positiveQuantity(line.section_qty),
+      pieceQty: positiveQuantity(line.piece_qty),
+      toPlt: positiveQuantity(line.to_plt),
+      toLyr: positiveQuantity(line.to_lyr),
+      toSec: positiveQuantity(line.to_sec),
+      toPcs: positiveQuantity(line.to_pcs),
+      stockUnit: line.stock_unit || line.unit || "",
+      itemWeight: positiveQuantity(line.item_weight)
+    }))
+  };
+}
+
+function vrmaUnit(value) {
+  const unit = String(value || "").trim().toUpperCase();
+  return SCM_VRMA_FALLBACK_UNITS.has(unit) ? unit : "";
+}
+
+function vrmaLineContent(line = {}) {
+  const units = [
+    ["PLT", line.palletQty],
+    ["LYR", line.layerQty],
+    ["SEC", line.sectionQty],
+    ["PCS", line.pieceQty]
+  ].filter(([, quantity]) => positiveQuantity(quantity) > 0)
+    .map(([unit, quantity]) => `${positiveQuantity(quantity)} ${unit}`);
+  const quantityText = units.length ? units.join(" ") : `${positiveQuantity(line.quantity)} ${line.unit || ""}`.trim();
+  return `${line.sku || line.itemName || "Item"} ${quantityText}`.trim();
+}
+
 export async function createScmVrmaOrder({
   vrmaRef = "",
   vendor = "",
@@ -2720,10 +3101,120 @@ export async function createScmVrmaOrder({
   const ref = String(vrmaRef || "").trim();
   if (!ref) throw new Error("VRMA ref is required.");
   if (!Array.isArray(lines) || !lines.length) throw new Error("At least one VRMA line is required.");
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const header = await client.query(
+  const pickup = String(pickupLocation || "").trim();
+  const selectedVendor = String(localVendor || vendor || "").trim();
+  const requestedDropoff = String(dropoffLocation || "").trim();
+  if (!SCM_VRMA_OWN_YARD_CODES.has(pickup)) throw new Error("VRMA pickup must be one of our local yards.");
+  if (!selectedVendor) throw new Error("Local vendor is required.");
+  if (!requestedDropoff) throw new Error("Vendor drop-off yard is required.");
+  return withTransaction(async () => {
+    const existingActivity = await query(
+      `SELECT v.id, v.operator_status, v.preparing_operator_id, v.loaded_at,
+              EXISTS (
+                SELECT 1
+                  FROM scm_vrma_order_lines line
+                 WHERE line.vrma_order_id = v.id
+                   AND (
+                     COALESCE(line.packed_pallet_qty, 0) > 0
+                     OR COALESCE(line.packed_layer_qty, 0) > 0
+                     OR COALESCE(line.packed_section_qty, 0) > 0
+                     OR COALESCE(line.packed_piece_qty, 0) > 0
+                     OR COALESCE(line.packed_sales_qty, 0) > 0
+                     OR COALESCE(line.loaded_qty, 0) > 0
+                   )
+              ) AS has_operator_activity
+         FROM scm_vrma_orders v
+        WHERE LOWER(v.vrma_ref) = LOWER($1)
+        LIMIT 1`,
+      [ref]
+    );
+    const activity = existingActivity.rows[0];
+    if (activity && (
+      activity.operator_status !== "open"
+      || activity.preparing_operator_id
+      || activity.loaded_at
+      || activity.has_operator_activity
+    )) {
+      const error = new Error("This VRMA can no longer be edited because Operator packing or loading has started.");
+      error.status = 409;
+      throw error;
+    }
+
+    const vendorYardResult = await query(
+      `SELECT y.yard, y.address, y.window_start, y.window_end, y.instructions, y.day_label
+         FROM dispatch_local_vendors v
+         JOIN dispatch_vendor_yards y ON LOWER(y.vendor) = LOWER(v.name)
+        WHERE v.active = true
+          AND y.active = true
+          AND LOWER(v.name) = LOWER($1)
+          AND LOWER(y.yard) = LOWER($2)
+        ORDER BY y.id
+        LIMIT 1`,
+      [selectedVendor, requestedDropoff]
+    );
+    const vendorYard = vendorYardResult.rows[0];
+    if (!vendorYard) throw new Error(`${requestedDropoff} is not an active yard for ${selectedVendor}.`);
+    const normalizedLines = [];
+    for (const [index, line] of lines.entries()) {
+      const itemId = Number(line.itemId || line.item_id || 0);
+      if (!Number.isFinite(itemId) || itemId <= 0) throw new Error(`Select an inventory item for VRMA line ${index + 1}.`);
+      const itemResult = await query(
+        `SELECT item_id, item_name, display_name, item_description, stock_unit, item_weight,
+                to_plt, to_lyr, to_sec, to_pcs
+           FROM inventory_items
+          WHERE item_id = $1
+          LIMIT 1`,
+        [itemId]
+      );
+      const item = itemResult.rows[0];
+      if (!item) throw new Error(`Inventory item ${itemId} is no longer available.`);
+      const conversions = {
+        toPlt: positiveQuantity(item.to_plt),
+        toLyr: positiveQuantity(item.to_lyr),
+        toSec: positiveQuantity(item.to_sec),
+        toPcs: positiveQuantity(item.to_pcs)
+      };
+      const componentQuantities = {
+        palletQty: conversions.toPlt ? positiveQuantity(line.palletQty ?? line.pallet_qty) : 0,
+        layerQty: conversions.toLyr ? positiveQuantity(line.layerQty ?? line.layer_qty) : 0,
+        sectionQty: conversions.toSec ? positiveQuantity(line.sectionQty ?? line.section_qty) : 0,
+        pieceQty: conversions.toPcs ? positiveQuantity(line.pieceQty ?? line.piece_qty) : 0
+      };
+      const hasConversions = Object.values(conversions).some((value) => value > 0);
+      let quantity = 0;
+      let unit = "";
+      if (hasConversions) {
+        quantity = (componentQuantities.palletQty * conversions.toPlt)
+          + (componentQuantities.layerQty * conversions.toLyr)
+          + (componentQuantities.sectionQty * conversions.toSec)
+          + (componentQuantities.pieceQty * conversions.toPcs);
+        unit = String(item.stock_unit || "").trim();
+        if (!Object.values(componentQuantities).some((value) => value > 0)) {
+          throw new Error(`Enter at least one converted quantity for VRMA line ${index + 1}.`);
+        }
+      } else {
+        quantity = positiveQuantity(line.quantity);
+        unit = vrmaUnit(line.unit);
+        if (!quantity) throw new Error(`Quantity is required for VRMA line ${index + 1}.`);
+        if (!unit) throw new Error(`UOM for VRMA line ${index + 1} must be PLT, SQFT, or PC.`);
+        if (unit === "PLT") componentQuantities.palletQty = quantity;
+      }
+      const itemWeight = positiveQuantity(item.item_weight);
+      normalizedLines.push({
+        itemId: item.item_id,
+        sku: item.item_name || "",
+        itemName: item.display_name || item.item_name || "",
+        description: item.item_description || "",
+        quantity,
+        unit,
+        weightLbs: quantity * itemWeight,
+        ...componentQuantities,
+        ...conversions
+      });
+    }
+    if (!normalizedLines.length) throw new Error("At least one VRMA line is required.");
+
+    const header = await query(
       `INSERT INTO scm_vrma_orders (vrma_ref, vendor, local_vendor, pickup_location, dropoff_location, status, method, notes, created_by, updated_by)
        VALUES ($1, NULLIF($2, ''), NULLIF($3, ''), NULLIF($4, ''), NULLIF($5, ''), $6, $7, NULLIF($8, ''), $9, $9)
        ON CONFLICT (vrma_ref) DO UPDATE SET
@@ -2739,35 +3230,47 @@ export async function createScmVrmaOrder({
        RETURNING *`,
       [
         ref,
-        String(vendor || "").trim(),
-        String(localVendor || "").trim(),
-        String(pickupLocation || "").trim(),
-        String(dropoffLocation || "").trim(),
+        selectedVendor,
+        selectedVendor,
+        pickup,
+        vendorYard.yard,
         normalizeManualScmStatus(status),
-        normalizeScmMethod(method),
+        "MBT",
         String(notes || "").trim(),
         createdBy || null
       ]
     );
-    await client.query("DELETE FROM scm_vrma_order_lines WHERE vrma_order_id = $1", [header.rows[0].id]);
-    for (const line of lines) {
-      const itemName = String(line.itemName || line.item_name || line.sku || "").trim();
-      if (!itemName) continue;
-      await client.query(
-        `INSERT INTO scm_vrma_order_lines (vrma_order_id, item_id, sku, item_name, quantity, unit, weight_lbs)
-         VALUES ($1, $2, NULLIF($3, ''), $4, COALESCE($5::numeric, 0), NULLIF($6, ''), COALESCE($7::numeric, 0))`,
+    await query("DELETE FROM scm_vrma_order_lines WHERE vrma_order_id = $1", [header.rows[0].id]);
+    for (const line of normalizedLines) {
+      await query(
+        `INSERT INTO scm_vrma_order_lines (
+           vrma_order_id, item_id, sku, item_name, item_description, quantity, unit, weight_lbs,
+           pallet_qty, layer_qty, section_qty, piece_qty, to_plt, to_lyr, to_sec, to_pcs
+         ) VALUES (
+           $1, $2, NULLIF($3, ''), $4, NULLIF($5, ''), $6, NULLIF($7, ''), $8,
+           $9, $10, $11, $12, NULLIF($13, 0), NULLIF($14, 0), NULLIF($15, 0), NULLIF($16, 0)
+         )`,
         [
           header.rows[0].id,
-          line.itemId || line.item_id || null,
-          String(line.sku || "").trim(),
-          itemName,
-          positiveQuantity(line.quantity),
-          String(line.unit || "").trim(),
-          positiveQuantity(line.weightLbs ?? line.weight_lbs)
+          line.itemId,
+          line.sku,
+          line.itemName,
+          line.description,
+          line.quantity,
+          line.unit,
+          line.weightLbs,
+          line.palletQty,
+          line.layerQty,
+          line.sectionQty,
+          line.pieceQty,
+          line.toPlt,
+          line.toLyr,
+          line.toSec,
+          line.toPcs
         ]
       );
     }
-    await client.query(
+    await query(
       `INSERT INTO scm_transport_schedule (
          order_kind, source_table, source_id, order_ref, method, pickup_point, dropoff_point,
          brand, content, weight_lbs, status, notes, created_by, updated_by
@@ -2792,24 +3295,18 @@ export async function createScmVrmaOrder({
       [
         header.rows[0].id,
         ref,
-        normalizeScmMethod(method),
-        String(pickupLocation || "").trim(),
-        String(dropoffLocation || "").trim(),
-        String(localVendor || vendor || "").trim(),
-        lines.map((line) => `${line.itemName || line.sku || "Item"} ${line.quantity || 0} ${line.unit || ""}`.trim()).join("; "),
+        "MBT",
+        pickup,
+        vendorYard.yard,
+        selectedVendor,
+        normalizedLines.map(vrmaLineContent).join("; "),
         normalizeManualScmStatus(status),
         String(notes || "").trim(),
         createdBy || null
       ]
     );
-    await client.query("COMMIT");
-    return { vrma: header.rows[0] };
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => null);
-    throw error;
-  } finally {
-    client.release();
-  }
+    return { vrma: header.rows[0], vendorYard, lines: normalizedLines };
+  });
 }
 
 export async function syncScmScheduleFromDispatchPlan(plan, { updatedBy = "dispatch-plan" } = {}) {
@@ -2828,10 +3325,31 @@ export async function syncScmScheduleFromDispatchPlan(plan, { updatedBy = "dispa
           truckPlate: truck.plate || "",
           driver: truck.driverName || truck.driver || "",
           loadName: load.name || "",
+          parkingSpot: load.parkingSpot || truck.parkingSpot || "",
           etaDate: plan.planDate,
           etaTime: stop.arriveTime || stop.plannedArrive || ""
         });
       }
+    }
+  }
+  const vrmaAssignments = plannedRows.filter((row) => row.orderKind === "VRMA");
+  if (plan.id) {
+    await query("DELETE FROM dispatch_vrma_plan_assignments WHERE plan_id = $1", [plan.id]);
+    for (const row of vrmaAssignments) {
+      await query(
+        `INSERT INTO dispatch_vrma_plan_assignments (
+           plan_id, order_ref, plan_date, truck_plate, driver, load_name, parking_spot, eta_time, updated_at
+         ) VALUES ($1, $2, $3::date, NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''), NULLIF($7, ''), NULLIF($8, ''), now())
+         ON CONFLICT (plan_id, order_ref) DO UPDATE SET
+           plan_date = EXCLUDED.plan_date,
+           truck_plate = EXCLUDED.truck_plate,
+           driver = EXCLUDED.driver,
+           load_name = EXCLUDED.load_name,
+           parking_spot = EXCLUDED.parking_spot,
+           eta_time = EXCLUDED.eta_time,
+           updated_at = now()`,
+        [plan.id, row.orderRef, row.etaDate, row.truckPlate, row.driver, row.loadName, row.parkingSpot, row.etaTime]
+      );
     }
   }
   for (const row of plannedRows) {
@@ -3653,6 +4171,26 @@ export async function createScmPurchaseOrderSplit({
   }
 }
 
+const MBBS_SPECIAL_ITEM_ID = 2055;
+
+function isMbbsSpecialLine(line = {}) {
+  return Number(line.item_id ?? line.itemId) === MBBS_SPECIAL_ITEM_ID;
+}
+
+function normalizedSpecialDescription(value, itemName = "") {
+  const normalize = (text) => String(text || "").normalize("NFKC").trim().toLowerCase().replace(/\s+/g, " ");
+  const itemLabel = normalize(itemName);
+  const parts = String(value || "").normalize("NFKC").split(/\r?\n/).map(normalize).filter(Boolean);
+  while (parts.length && [itemLabel, "mbbs-special", "mbbs special"].filter(Boolean).includes(parts[0])) parts.shift();
+  return normalize(parts.join(" "))
+    .replace(/^mbbs[\s-]*special(?:\s+order)?\s*[:\-–—]?\s*/, "")
+    .trim();
+}
+
+function normalizedSpecialUnit(value) {
+  return String(value || "").normalize("NFKC").trim().toUpperCase().replace(/\s+/g, " ");
+}
+
 function lineMatches(left, right) {
   if (left.item_id && right.item_id && String(left.item_id) === String(right.item_id)) return true;
   const leftSku = String(left.sku || left.item_name || "").trim().toLowerCase();
@@ -3881,6 +4419,15 @@ export async function getSalesOrderPoAllocationOptions(orderRef, { planDate = ""
     },
     salesLines: resolved.lines.map((targetLine) => {
       const line = targetLineAsAllocationRow(targetLine);
+      const special = isMbbsSpecialLine(line);
+      const normalizedDescription = normalizedSpecialDescription(line.item_description, line.item_name || line.sku);
+      const lineCandidates = poLines.rows.filter((poLine) => lineMatches(line, poLine)).map((poLine) => ({
+        poLineId: poLine.id,
+        poRef: poLine.po_ref,
+        descriptionMatch: Boolean(normalizedDescription) && normalizedDescription === normalizedSpecialDescription(poLine.item_description, poLine.item_name || poLine.sku),
+        unitMatch: normalizedSpecialUnit(line.unit) === normalizedSpecialUnit(poLine.unit),
+        exactMatch: !special || (Boolean(normalizedDescription) && normalizedDescription === normalizedSpecialDescription(poLine.item_description, poLine.item_name || poLine.sku) && normalizedSpecialUnit(line.unit) === normalizedSpecialUnit(poLine.unit))
+      }));
       return {
       id: line.id,
       targetLineKey: targetLine.targetLineKey,
@@ -3890,6 +4437,9 @@ export async function getSalesOrderPoAllocationOptions(orderRef, { planDate = ""
       sku: line.sku || line.item_name,
       itemName: line.item_name,
       description: line.item_description || "",
+      isSpecial: special,
+      independentSalesQty: !hasConversion(line) && hasCustomQuantity(line),
+      poCandidates: lineCandidates,
       required: {
         pallets: positiveQuantity(line.pallet_qty),
         layers: positiveQuantity(line.layer_qty),
@@ -3968,6 +4518,9 @@ async function createSalesOrderPoAllocationWithExecutor(executor, {
     sales_order_id: targetLine.sourceOrderId,
     sales_order_ref: targetLine.sourceOrderRef
   } : null;
+  if (isMbbsSpecialLine(salesLine) && !poLineId) {
+    throw new Error("Select the exact PO line for MBBS-Special before connecting quantity.");
+  }
   if (!salesLine) throw new Error("Sales order line not found.");
 
   const poParams = poLineId ? [poLineId] : [String(poRef || "").trim(), salesLine.item_id || null, salesLine.sku || salesLine.item_name || ""];
@@ -4009,14 +4562,20 @@ async function createSalesOrderPoAllocationWithExecutor(executor, {
   );
   const poLine = po.rows[0];
   if (!poLine) throw new Error("Purchase order line not found.");
+  const requestedPoRef = String(poRef || "").trim().toLowerCase();
+  if (requestedPoRef && requestedPoRef !== String(poLine.po_order_ref || "").trim().toLowerCase()
+    && requestedPoRef !== String(poLine.purchase_order_id || "").trim().toLowerCase()) {
+    throw new Error("Selected PO line is not part of the entered purchase order.");
+  }
   if (!lineMatches(salesLine, poLine)) throw new Error("Selected PO line item does not match the SO line item.");
 
   const pallets = positiveQuantity(quantities.pallets);
   const layers = positiveQuantity(quantities.layers);
   const sections = positiveQuantity(quantities.sections);
   const pieces = positiveQuantity(quantities.pieces);
-  const conversionLine = hasConversion(salesLine) ? salesLine : poLine;
-  const salesQty = lineSalesQty(conversionLine, { ...quantities, pallets, layers, sections, pieces });
+  const independentSalesQty = !hasConversion(salesLine) && hasCustomQuantity(salesLine);
+  const conversionLine = independentSalesQty || isMbbsSpecialLine(salesLine) ? salesLine : hasConversion(salesLine) ? salesLine : poLine;
+  let salesQty = lineSalesQty(conversionLine, { ...quantities, pallets, layers, sections, pieces });
   if (pallets + layers + sections + pieces + salesQty <= 0) throw new Error("Allocation quantity is required.");
 
   const checks = [
@@ -4035,6 +4594,15 @@ async function createSalesOrderPoAllocationWithExecutor(executor, {
   }
   const salesRemaining = Math.max(positiveQuantity(salesLine.quantity) - positiveQuantity(salesLine.allocated_sales_qty), 0);
   const poRemaining = Math.max(positiveQuantity(poLine.quantity) - purchaseOrderReceivedBaseline(poLine) - positiveQuantity(poLine.allocated_sales_qty), 0);
+  const selectedPhysical = pallets + layers + sections + pieces > 0;
+  const fullPhysical = selectedPhysical && checks.every(([unit, value]) => {
+    const available = availableUnitQty(salesLine, unit);
+    return available <= 0.000001 || value + 0.000001 >= available;
+  });
+  if (independentSalesQty && selectedPhysical && salesQty <= 0) {
+    if (!fullPhysical) throw new Error(`${itemLabel}: enter the sales-unit quantity for a partial manual PLT/LYR/SEC/PCS allocation.`);
+    salesQty = salesRemaining;
+  }
   if (salesQty > salesRemaining) throw new Error(`${itemLabel}: SO open sales quantity is only ${salesRemaining}.`);
   if (salesQty > poRemaining) throw new Error(`${itemLabel}: PO ${poLine.po_order_ref} only has ${poRemaining} sales quantity available.`);
 
@@ -4095,6 +4663,7 @@ export async function createSalesOrderPoAllocations({
     .map((line) => ({
       salesLineId: line.salesLineId,
       targetLineKey: line.targetLineKey,
+      poLineId: line.poLineId,
       quantities: line.quantities || line
     }))
     .filter((line) => {
@@ -4113,6 +4682,7 @@ export async function createSalesOrderPoAllocations({
         salesOrderRef,
         salesLineId: line.salesLineId,
         targetLineKey: line.targetLineKey,
+        poLineId: line.poLineId,
         poRef,
         planDate,
         targetSignature,

@@ -213,7 +213,8 @@ function linesForEntry({ targetRef, kind, entry, canonical }) {
   const sourceLines = canonical.lines.get(sourceRef) || [];
   const parentLines = parentRef ? canonical.lines.get(parentRef) || [] : [];
   const items = Array.isArray(entry.items) ? entry.items.filter(Boolean) : [];
-  if (!items.length) {
+  const useCanonicalGroupLines = kind === "group" && exactHeader && !parentRef;
+  if (!items.length || useCanonicalGroupLines) {
     return sourceLines.map((line) => normalizedTargetLine({ targetRef, kind, sourceRef, line }));
   }
   const rows = [];
@@ -277,7 +278,9 @@ export async function resolveDispatchSalesTarget({ dispatchTargetRef = "", planD
   if (!snapshot && !exactCanonical) throw new Error(`${ref} was not found in the selected dispatch plan or Sales Order table.`);
   const order = snapshot?.order || { id: ref, type: "SO", items: [] };
   const kind = targetKind(order, exactCanonical);
-  const entries = kind === "group" ? flattenGroupMembers(order) : [{ ...order, id: ref }];
+  const entries = kind === "group"
+    ? flattenGroupMembers(order)
+    : [{ ...order, id: ref, items: kind === "normal" && exactCanonical ? [] : order.items }];
   const requiredRefs = entries.flatMap((entry) => [text(entry.id), splitParentRef(entry)]).filter(Boolean);
   canonical = await loadCanonicalOrders([...initialRefs, ...requiredRefs]);
   let lines = entries.flatMap((entry) => linesForEntry({ targetRef: ref, kind, entry, canonical }));

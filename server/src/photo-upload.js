@@ -134,6 +134,38 @@ export function createPhotoReadToken({ actor, key, options = {} } = {}) {
   };
 }
 
+export function createPhotoDeleteToken({ actor, key, options = {} } = {}) {
+  const settings = photoUploadSettings();
+  const secret = config.photoUpload?.tokenSecret || "";
+  if (!settings.workerUrl) throw httpError(503, "PHOTO_UPLOAD_WORKER_URL is not configured.");
+  if (!secret) throw httpError(503, "PHOTO_UPLOAD_TOKEN_SECRET is not configured.");
+  const cleanKey = normalizeR2Key(key);
+  if (!cleanKey) throw httpError(400, "R2 object key is required.");
+
+  const ttlMinutes = saneNumber(options.ttlMinutes || 10, 10, 1, 60);
+  const now = Math.floor(Date.now() / 1000);
+  const expiresAt = now + ttlMinutes * 60;
+  const claims = compactClaims({
+    aud: "mbbs-r2-upload",
+    scope: "photo-delete",
+    iss: "mbbs-node-server",
+    sub: cleanValue(actor?.id || actor?.login || actor?.username || "unknown", 120),
+    role: cleanValue(actor?.role || "system", 40),
+    key: cleanKey,
+    iat: now,
+    nbf: now - 5,
+    exp: expiresAt,
+    jti: crypto.randomUUID()
+  });
+
+  return {
+    objectUrl: `${settings.workerUrl}/object?key=${encodeURIComponent(cleanKey)}`,
+    token: signJwt(claims, secret),
+    key: cleanKey,
+    expiresAt: new Date(expiresAt * 1000).toISOString()
+  };
+}
+
 export function normalizeR2Key(value) {
   const text = String(value || "").replace(/^r2:\/\//, "").trim();
   if (!text || text.includes("..") || text.startsWith("/") || text.includes("\\")) return "";

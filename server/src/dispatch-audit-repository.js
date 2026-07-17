@@ -1,4 +1,5 @@
 import { query } from "./db.js";
+import { trackSemanticAudit } from "./audit-context.js";
 
 function cleanText(value) {
   const text = String(value ?? "").trim();
@@ -35,7 +36,7 @@ function auditRow(row) {
 export async function writeDispatchAudit(entry = {}) {
   const action = cleanText(entry.action);
   if (!action) throw new Error("Dispatch audit action is required.");
-  const result = await query(
+  const result = await trackSemanticAudit(query(
     `INSERT INTO dispatch_audit_log (
        action, entity_type, entity_id, order_id, load_id, truck_id,
        session_id, operator_id, operator_name, source, plan_id, plan_date,
@@ -60,7 +61,7 @@ export async function writeDispatchAudit(entry = {}) {
       JSON.stringify(cleanJson(entry.after, null)),
       JSON.stringify(cleanJson(entry.details, {}))
     ]
-  );
+  ));
   return auditRow(result.rows[0]);
 }
 

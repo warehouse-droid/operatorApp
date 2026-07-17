@@ -7,8 +7,11 @@ const STAFF_TOKEN_KEYS = {
   dispatcher: "mbbs.dispatch.token",
   scm: "mbbs.dispatch.token",
   scm_staff: "mbbs.dispatch.token",
-  yard_manager: "mbbs.dispatch.token"
+  yard_manager: "mbbs.control.token"
 };
+const STAFF_TOKEN_KEY = "mbbs.staff.token";
+const STAFF_ROLE_KEY = "mbbs.staff.role";
+const STAFF_ROLES_KEY = "mbbs.staff.roles";
 
 function cleanRole(role) {
   return String(role || "").trim().toLowerCase().replaceAll("-", "_").replaceAll(" ", "_");
@@ -16,11 +19,11 @@ function cleanRole(role) {
 
 function routeForStaffRole(role) {
   const clean = cleanRole(role);
-  if (clean === "admin") return "/control";
+  if (clean === "admin") return "/admin";
   if (clean === "operator") return "/operator";
   if (clean === "dispatcher") return "/dispatch";
   if (clean === "scm" || clean === "scm_staff") return "/scm";
-  if (clean === "yard_manager") return "/scm/POTOschedule";
+  if (clean === "yard_manager") return "/control";
   return "";
 }
 
@@ -29,6 +32,9 @@ function clearModuleTokens() {
     "mbbs.control.token",
     "mbbs.operator.token",
     "mbbs.dispatch.token",
+    STAFF_TOKEN_KEY,
+    STAFF_ROLE_KEY,
+    STAFF_ROLES_KEY,
     "mbbs.driver.token"
   ]) {
     localStorage.removeItem(key);
@@ -91,6 +97,9 @@ async function loginStaff(data) {
   const tokenKey = STAFF_TOKEN_KEYS[role];
   if (!route || !tokenKey) throw new Error("This account does not have an application route.");
   clearModuleTokens();
+  localStorage.setItem(STAFF_TOKEN_KEY, payload.token);
+  localStorage.setItem(STAFF_ROLE_KEY, role);
+  localStorage.setItem(STAFF_ROLES_KEY, JSON.stringify([...new Set([...(Array.isArray(payload.operator?.roles) ? payload.operator.roles : []), role].filter(Boolean))]));
   localStorage.setItem(tokenKey, payload.token);
   location.href = route;
 }

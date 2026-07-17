@@ -415,7 +415,7 @@ function buildCases(fixtures) {
       name: "POST /api/customer-pickup/orders/:id/load",
       method: "POST",
       path: `/api/customer-pickup/orders/${fixtures.pickupOrderId}/load`,
-      body: { photoDataUrl: "data:image/png;base64,cm9sbGJhY2s=" }
+      body: { photoDataUrls: ["data:image/png;base64,cm9sbGJhY2sx", "data:image/png;base64,cm9sbGJhY2sy"] }
     },
     {
       name: "POST /api/delivery/sync",
@@ -463,7 +463,7 @@ function buildCases(fixtures) {
       name: "POST /api/delivery/orders/:id/load",
       method: "POST",
       path: `/api/delivery/orders/${fixtures.deliveryOrderId}/load`,
-      body: { photoDataUrl: "data:image/png;base64,cm9sbGJhY2s=" }
+      body: { photoDataUrls: ["data:image/png;base64,cm9sbGJhY2sx", "data:image/png;base64,cm9sbGJhY2sy"] }
     },
     {
       name: "POST /api/receiving/sync",

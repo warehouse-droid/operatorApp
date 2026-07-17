@@ -223,10 +223,11 @@ function toNumber(value) {
 
 function derivePackQuantitiesFromConversion(line) {
   if (toNumber(line.pallet_qty) || toNumber(line.layer_qty) || toNumber(line.section_qty) || toNumber(line.piece_qty)) {
-    return line;
+    return { ...line, pack_quantity_source: line.pack_quantity_source || "netsuite_manual" };
   }
+  if (!hasConversion(line)) return { ...line, pack_quantity_source: "sales_only" };
   let remaining = toNumber(line.quantity);
-  const next = { ...line };
+  const next = { ...line, pack_quantity_source: "item_conversion" };
   const conversions = [
     ["pallet_qty", "to_plt"],
     ["layer_qty", "to_lyr"],
@@ -242,9 +243,6 @@ function derivePackQuantitiesFromConversion(line) {
       remaining = Number((remaining - (units * conversion)).toFixed(6));
     }
   }
-  if (!toNumber(next.pallet_qty) && !toNumber(next.layer_qty) && !toNumber(next.section_qty) && !toNumber(next.piece_qty)) {
-    next.piece_qty = toNumber(line.quantity);
-  }
   return next;
 }
 
@@ -256,6 +254,17 @@ function hasConversion(line) {
 }
 
 function deriveQuantitiesFromSalesQuantity(line, quantity) {
+  const hasManualPackQuantity = toNumber(line.pallet_qty) > 0
+    || toNumber(line.layer_qty) > 0
+    || toNumber(line.section_qty) > 0
+    || toNumber(line.piece_qty) > 0;
+  if (hasManualPackQuantity) {
+    return {
+      ...line,
+      quantity,
+      pack_quantity_source: "netsuite_manual"
+    };
+  }
   const next = {
     ...line,
     quantity,
@@ -264,7 +273,7 @@ function deriveQuantitiesFromSalesQuantity(line, quantity) {
     section_qty: 0,
     piece_qty: 0
   };
-  if (!hasConversion(next)) return next;
+  if (!hasConversion(next)) return { ...next, pack_quantity_source: "sales_only" };
   return derivePackQuantitiesFromConversion(next);
 }
 
