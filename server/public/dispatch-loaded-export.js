@@ -19,7 +19,7 @@ const loadedState = {
     inbound: ["purchase_order", "transfer_order", "co_order"].includes(localStorage.getItem("mbbs.dispatch.loaded.inboundType"))
       ? localStorage.getItem("mbbs.dispatch.loaded.inboundType")
       : "purchase_order",
-    outbound: ["sales_order", "transfer_order", "vrma_order"].includes(localStorage.getItem("mbbs.dispatch.loaded.outboundType"))
+    outbound: ["sales_order", "transfer_order", "co_order", "vrma_order"].includes(localStorage.getItem("mbbs.dispatch.loaded.outboundType"))
       ? localStorage.getItem("mbbs.dispatch.loaded.outboundType")
       : "sales_order"
   },
@@ -57,7 +57,7 @@ function loadedOrderKey(order) {
 
 const DISPATCH_YARD_TYPES = {
   inbound: ["purchase_order", "transfer_order", "co_order"],
-  outbound: ["sales_order", "transfer_order", "vrma_order"]
+  outbound: ["sales_order", "transfer_order", "co_order", "vrma_order"]
 };
 
 function selectedMovementType() {

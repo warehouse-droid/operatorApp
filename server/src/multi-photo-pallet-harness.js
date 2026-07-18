@@ -1,7 +1,10 @@
 import { createOperator } from "./auth-repository.js";
 import { closeDb, query, withTransaction } from "./db.js";
 import { confirmDeliveryLine, getDeliveryOrder, recordDeliveryLoad, setDeliveryLinePackedQuantity } from "./delivery-repository.js";
+import { upsertLocalCoOrder } from "./dispatch-repository.js";
 import { recordDriverJobPhotos } from "./driver-repository.js";
+import { confirmLocalCoReceivingLine } from "./receiving-repository.js";
+import { getYardMovementDetail } from "./yard-movement-repository.js";
 
 const runId = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
 const orderId = 9960000000 + Number(runId.slice(-6));
@@ -139,7 +142,7 @@ async function main() {
            packed_sales_qty, loaded_qty, netsuite_active
          ) VALUES ($1, $2, 1784, 'PALLET', 'PALLET', 'InvtPart',
            $3, 'EACH', 1, '3445',
-           0, 0, 0, 0,
+           0, 0, 0, CASE WHEN $3::numeric = 4 THEN $3::numeric ELSE 0 END,
            0, 0, 0, 0,
            0, 0, 0, 0,
            0, 0, true)`,
@@ -161,6 +164,7 @@ async function main() {
     const groupedOrder = await getDeliveryOrder(groupRef);
     const groupedPallet = groupedOrder?.lines?.find((item) => Number(item.item_id) === 1784);
     check(String(groupedPallet?.id || "").startsWith("GRPLINE-"), "Grouped PALLET line was not synthesized.", groupedOrder || {});
+    check(Number(groupedPallet?.piece_qty) === 4, "Grouped PALLET regression must include the legacy piece-quantity shape.", groupedPallet || {});
     await confirmDeliveryLine(groupRef, groupedPallet.id, { pieces: 10, salesQty: 10 }, operator.id);
     const groupedPacked = await query(
       `SELECT packed_piece_qty, packed_sales_qty
@@ -192,9 +196,84 @@ async function main() {
     check(groupedAudit.rows[0].line_id === null, "Synthetic grouped line ID was written into numeric audit line_id.", groupedAudit.rows[0]);
     check(groupedAudit.rows[0].details?.groupLineId === groupedPallet.id, "Synthetic grouped line ID was not retained in audit details.", groupedAudit.rows[0]);
 
+    const co = await upsertLocalCoOrder({
+      sourceOrderRef: groupRef,
+      fromYard: "3445",
+      toYard: "2967",
+      requestedBy: operator.id,
+      order: {
+        id: groupRef,
+        type: "SO",
+        childOrderDetails: [
+          {
+            id: groupRefs[0],
+            raw: { pickup_location: "3445" },
+            items: [{ lineId: lineId + 101, lineRowId: lineId + 201, itemId: 1784, itemName: "PALLET", sku: "PALLET", quantity: 4, pieces: 4, unit: "EACH" }]
+          },
+          {
+            id: groupRefs[1],
+            raw: { pickup_location: "2967" },
+            items: [{ lineId: lineId + 102, lineRowId: lineId + 202, itemId: 1784, itemName: "PALLET", sku: "PALLET", quantity: 6, pieces: 6, unit: "EACH" }]
+          }
+        ]
+      }
+    });
+    check(co.lines.length === 1, "Grouped CO must contain only child lines from its source yard.", co.lines);
+    check(Number(co.lines[0].item_id) === 1784 && Number(co.lines[0].quantity) === 4,
+      "Grouped CO omitted or mis-sized the source-yard PALLET line.", co.lines[0]);
+    await confirmDeliveryLine(co.co_ref, co.lines[0].id, { pieces: 4, salesQty: 4 }, operator.id);
+    const packedCo = await getDeliveryOrder(co.co_ref);
+    const packedCoPallet = packedCo.lines.find((line) => Number(line.item_id) === 1784);
+    const storedCoPallet = (await query(
+      "SELECT packed_piece_qty, packed_sales_qty FROM local_co_order_lines WHERE co_id = $1 AND id = $2",
+      [co.id, co.lines[0].id]
+    )).rows[0];
+    check(Number(storedCoPallet?.packed_piece_qty) === 0 && Number(storedCoPallet?.packed_sales_qty) === 4,
+      "Local CO no-conversion quantity must be stored only in packed_sales_qty.", storedCoPallet || {});
+    check(Number(packedCoPallet?.packed_piece_qty) === 0 && Number(packedCoPallet?.packed_sales_qty) === 4,
+      "Local CO response must expose the persisted packed sales quantity.", packedCoPallet || {});
+    await query("UPDATE local_co_orders SET status = 'packed' WHERE id = $1", [co.id]);
+    const coLoad = await recordDeliveryLoad(co.co_ref, operator.id, { photoDataUrls: photos });
+    const coLoadRecord = (await query(
+      "SELECT order_family, load_type FROM operator_load_records WHERE id = $1",
+      [coLoad.id]
+    )).rows[0];
+    check(coLoadRecord.order_family === "co_order" && coLoadRecord.load_type === "local_co_load",
+      "Local CO outbound load record must retain the CO order family.", coLoadRecord);
+    const coMovement = await getYardMovementDetail({
+      direction: "outbound",
+      orderType: "co_order",
+      orderId: co.id,
+      from: "2000-01-01",
+      to: "2099-12-31"
+    });
+    check(coMovement?.lines?.length === 1 && Number(coMovement.lines[0].item_id) === 1784,
+      "CO outbound movement must use its processed line snapshot.", coMovement || {});
+    await confirmLocalCoReceivingLine(co.co_ref, co.lines[0].id, { pieces: 4, salesQty: 4 }, operator.id);
+    const receivedCoPallet = (await query(
+      `SELECT canonical.received_piece_qty,
+              canonical.received_sales_qty,
+              local.received_sales_qty AS local_received_sales_qty
+         FROM co_order_lines canonical
+         JOIN local_co_order_lines local ON local.id = canonical.id
+        WHERE canonical.co_id = $1
+          AND canonical.id = $2`,
+      [co.id, co.lines[0].id]
+    )).rows[0];
+    check(Number(receivedCoPallet?.received_piece_qty) === 0
+        && Number(receivedCoPallet?.received_sales_qty) === 4
+        && Number(receivedCoPallet?.local_received_sales_qty) === 4,
+      "Local CO no-conversion receiving must persist received_sales_qty in both canonical and local lines.",
+      receivedCoPallet || {});
+
     return {
       palletPackedSalesQty: Number(packed.packed_sales_qty),
       groupedPalletPackedSalesQty: groupedPacked.rows.reduce((sum, row) => sum + Number(row.packed_sales_qty || 0), 0),
+      groupedCoPalletQty: Number(co.lines[0].quantity),
+      coPackedSalesQty: Number(packedCoPallet.packed_sales_qty),
+      coReceivedSalesQty: Number(receivedCoPallet.received_sales_qty),
+      coLoadOrderFamily: coLoadRecord.order_family,
+      coMovementLineCount: coMovement.lines.length,
       loadPhotoCount: loadRecord.photo_data_urls.length,
       loadPhotoError,
       driverPhotoError

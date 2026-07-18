@@ -95,6 +95,17 @@ function movementRecordsSql() {
      WHERE r.order_family = 'vrma_order'
        AND r.load_type = 'vrma_local_load'
     UNION ALL
+    SELECT 'outbound', 'co_order', o.id, o.co_ref, o.source_order_ref,
+           o.from_location_id, o.from_location, o.from_location, o.to_location,
+           COALESCE(NULLIF(o.status, ''), 'planned'),
+           r.id, r.created_at,
+           ${photoCountSql("r.photo_data_urls", "r.photo_data_url")}::int
+      FROM operator_load_records r
+      JOIN local_co_orders o
+        ON o.id = r.source_record_id
+       AND r.source_table = 'local_co_orders'
+     WHERE r.load_type = 'local_co_load'
+    UNION ALL
     SELECT 'inbound', 'purchase_order', o.netsuite_id,
            COALESCE(NULLIF(o.dispatch_ref, ''), o.tranid), o.vendor,
            o.destination_location_id, o.destination_location,
@@ -161,6 +172,32 @@ function movementLinesSql() {
       FROM scm_vrma_order_lines l
      WHERE COALESCE(l.loaded_qty, 0) > 0
     UNION ALL
+    SELECT 'outbound', 'co_order', o.id, COALESCE(l.id, r.id),
+           NULLIF(snapshot."lineId", '')::bigint, COALESCE(l.item_id, NULLIF(snapshot."itemId", '')::bigint),
+           COALESCE(NULLIF(l.item_name, ''), snapshot."itemName"),
+           COALESCE(NULLIF(l.sku, ''), snapshot."itemName"),
+           COALESCE(NULLIF(l.item_description, ''), snapshot.description),
+           COALESCE(snapshot.quantity, 0),
+           COALESCE(NULLIF(snapshot."loadedUom", ''), NULLIF(snapshot.unit, ''), l.unit),
+           COALESCE(NULLIF(snapshot.unit, ''), l.unit), NULL::text,
+           l.to_plt, l.to_lyr, l.to_sec, l.to_pcs,
+           COALESCE(snapshot."packedPallets", 0), COALESCE(snapshot."packedLayers", 0),
+           COALESCE(snapshot."packedSections", 0), COALESCE(snapshot."packedPieces", 0)
+      FROM operator_load_records r
+      JOIN local_co_orders o
+        ON o.id = r.source_record_id
+       AND r.source_table = 'local_co_orders'
+      CROSS JOIN LATERAL jsonb_to_recordset(COALESCE(r.line_snapshot, '[]'::jsonb)) AS snapshot(
+        "lineId" text, "itemId" text, "itemName" text, description text,
+        quantity numeric, unit text, "packedPallets" numeric, "packedLayers" numeric,
+        "packedSections" numeric, "packedPieces" numeric, "packedSalesQty" numeric,
+        "loadedQty" numeric, "loadedUom" text
+      )
+      LEFT JOIN local_co_order_lines l
+        ON l.co_id = o.id
+       AND l.line_id::text = snapshot."lineId"
+     WHERE r.load_type = 'local_co_load'
+    UNION ALL
     SELECT 'inbound', 'purchase_order', l.purchase_order_id, l.id, l.line_id, l.item_id,
            l.item_name, l.sku, l.item_description, ${poReceived}, l.unit, l.unit, l.location,
            l.to_plt, l.to_lyr, l.to_sec, l.to_pcs,
@@ -206,6 +243,15 @@ function movementPhotosSql() {
      WHERE (r.order_family = 'sales_order' AND r.load_type IN ('sales_order_delivery_load', 'customer_pickup_load'))
         OR (r.order_family = 'transfer_order' AND r.load_type = 'transfer_order_load')
         OR (r.order_family = 'vrma_order' AND r.load_type = 'vrma_local_load')
+    UNION ALL
+    SELECT 'outbound', 'co_order', o.id, r.id, r.created_at,
+           photo.photo_data_url, r.response
+      FROM operator_load_records r
+      JOIN local_co_orders o
+        ON o.id = r.source_record_id
+       AND r.source_table = 'local_co_orders'
+      CROSS JOIN LATERAL ${arrayRows("r.photo_data_urls", "r.photo_data_url")} photo(photo_data_url)
+     WHERE r.load_type = 'local_co_load'
     UNION ALL
     SELECT 'inbound', 'purchase_order', r.order_id, r.id, r.created_at,
            photo.photo_data_url, r.response

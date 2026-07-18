@@ -4749,6 +4749,58 @@ export async function cancelSalesOrderPoAllocation(allocationId, { cancelledBy =
   return result.rows[0] ? normalizeAllocationRow(result.rows[0]) : null;
 }
 
+function localCoChildSourceYards(child = {}) {
+  const raw = child.raw && typeof child.raw === "object" ? child.raw : {};
+  const normalized = (values) => [...new Set(values.map(locationTextFromId).filter(Boolean))];
+  const rawYards = normalized([
+    raw.pickup_location,
+    raw.outbound_location,
+    raw.source_location
+  ]);
+  if (rawYards.length) return rawYards;
+  const originalYards = normalized([
+    ...(Array.isArray(child.transitOriginalPickupLocations) ? child.transitOriginalPickupLocations : []),
+    child.transitOriginalSourceYard
+  ]);
+  if (originalYards.length) return originalYards;
+  return normalized([
+    ...(Array.isArray(child.pickupLocations) ? child.pickupLocations : []),
+    child.sourceYard
+  ]);
+}
+
+function isLocalCoTransportItem(item = {}) {
+  const itemName = String(item.sku || item.itemName || item.item_name || "").trim().toUpperCase();
+  if (itemName.startsWith("DELIVERY CHARGE") || itemName.startsWith("SALES CREDIT")) return false;
+  return positiveQuantity(item.quantity || item.salesQty)
+    + positiveQuantity(item.pallets || item.pallet_qty)
+    + positiveQuantity(item.layers || item.layer_qty)
+    + positiveQuantity(item.sections || item.section_qty)
+    + positiveQuantity(item.pieces || item.piece_qty) > 0;
+}
+
+function localCoSourceItems(order = {}, fromYard = "") {
+  const children = Array.isArray(order.childOrderDetails) ? order.childOrderDetails : [];
+  if (!children.length) return (Array.isArray(order.items) ? order.items : []).filter(isLocalCoTransportItem);
+  const fromText = locationTextFromId(fromYard);
+  const selectedChildren = children.filter((child) => {
+    const yards = localCoChildSourceYards(child);
+    return !yards.length || yards.includes(fromText);
+  });
+  const childItems = selectedChildren.flatMap((child) => (
+    Array.isArray(child.items) && child.items.length
+      ? child.items
+      : Array.isArray(child.raw?.items) ? child.raw.items : []
+  )).filter(isLocalCoTransportItem);
+  if (!childItems.length) return (Array.isArray(order.items) ? order.items : []).filter(isLocalCoTransportItem);
+  const unique = new Map();
+  childItems.forEach((item, index) => {
+    const key = String(item.lineRowId || item.line_row_id || item.lineId || item.line_id || `${item.itemId || item.item_id || item.sku || "item"}:${index}`);
+    if (!unique.has(key)) unique.set(key, item);
+  });
+  return [...unique.values()];
+}
+
 export async function upsertLocalCoOrder({ sourceOrderRef, fromYard, toYard, order = {}, plan = {}, requestedBy = "" } = {}) {
   const sourceRef = String(sourceOrderRef || order.id || "").trim();
   const fromText = locationTextFromId(fromYard || order.sourceYard || order.pickupLocations?.[0]);
@@ -4823,7 +4875,7 @@ export async function upsertLocalCoOrder({ sourceOrderRef, fromYard, toYard, ord
     co.delivery_order_id = -Number(co.id);
   }
 
-  const items = Array.isArray(order.items) ? order.items : [];
+  const items = localCoSourceItems(order, fromText);
   const activeLineIds = [];
   for (let index = 0; index < items.length; index += 1) {
     const item = items[index] || {};

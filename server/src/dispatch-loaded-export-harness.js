@@ -100,6 +100,7 @@ includesAll(repository, [
   "sales_order_delivery_load",
   "customer_pickup_load",
   "transfer_order_load",
+  "local_co_load",
   "vrma_local_load",
   "purchase_order",
   "co_order",

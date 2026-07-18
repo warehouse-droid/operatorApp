@@ -16,7 +16,7 @@ assert.deepEqual(
 const range = { from: "2000-01-01", to: "2099-12-31", yard: "all" };
 const movementTypes = {
   inbound: ["purchase_order", "transfer_order", "co_order"],
-  outbound: ["sales_order", "transfer_order", "vrma_order"]
+  outbound: ["sales_order", "transfer_order", "co_order", "vrma_order"]
 };
 
 const allMovements = [];

@@ -1242,17 +1242,20 @@ function lineHasConversion(line) {
   return qty(line.to_plt) > 0 || qty(line.to_lyr) > 0 || qty(line.to_sec) > 0 || qty(line.to_pcs) > 0;
 }
 
+function isPalletSalesItem(line) {
+  return String(line?.sku || line?.item_name || "").trim().toUpperCase() === "PALLET";
+}
+
 function isIndependentManualLine(line) {
-  return !lineHasConversion(line) && hasCustomPackQty(line);
+  return !lineHasConversion(line) && !shouldUseSalesQuantity(line) && hasCustomPackQty(line);
 }
 
 function shouldUseSalesQuantity(line) {
-  return !lineHasConversion(line) && !hasCustomPackQty(line) && qty(line.quantity) > 0;
+  return !lineHasConversion(line) && qty(line.quantity) > 0;
 }
 
 function salesQuantityLabel(line, fallback = "Qty") {
-  const itemName = String(line?.sku || line?.item_name || "").trim().toUpperCase();
-  return itemName === "PALLET" ? "PALLET" : line?.unit || fallback;
+  return isPalletSalesItem(line) ? "PALLET" : line?.unit || fallback;
 }
 
 function lineUnitsToSalesQty(line, values) {
@@ -1480,7 +1483,7 @@ function requiredValue(line, unit) {
 }
 
 function deliveryLineUnits(line) {
-  if (line?.vrma_reference_only === true) {
+  if (line?.vrma_reference_only === true && !shouldUseSalesQuantity(line)) {
     const physical = [
       { key: "pallets", label: "PLT" },
       { key: "layers", label: "LYR" },
@@ -4460,7 +4463,9 @@ function renderReceiptScreen() {
           ${confirmedLines.map((line) => `
             <div>
               <b>${line.sku || line.item_name}</b>
-              <span>${displayQty(line.received_pallet_qty)} PLT / ${displayQty(line.received_section_qty)} SEC / ${displayQty(line.received_layer_qty)} LYR / ${displayQty(line.received_piece_qty)} PCS</span>
+              <span>${shouldUseSalesQuantity(line)
+                ? `${displayQty(line.received_sales_qty)} ${salesQuantityLabel(line)}`
+                : `${displayQty(line.received_pallet_qty)} PLT / ${displayQty(line.received_section_qty)} SEC / ${displayQty(line.received_layer_qty)} LYR / ${displayQty(line.received_piece_qty)} PCS`}</span>
             </div>
           `).join("") || `<p class="muted">${t("operator.noConfirmedQty", "No confirmed qty.")}</p>`}
         </div>

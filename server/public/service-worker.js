@@ -1,11 +1,11 @@
-const CACHE_NAME = "mbbs-yard-operator-v115-in-pwa-camera";
+const CACHE_NAME = "mbbs-yard-operator-v117-no-conversion-sales";
 const APP_SHELL = [
   "/operator",
   "/operator.html",
   "/operator.css?v=20260717-in-pwa-camera-v1",
   "/i18n.css?v=20260701-i18n-v2",
   "/i18n.js?v=20260717-in-pwa-camera-v1",
-  "/operator.js?v=20260717-in-pwa-camera-v1",
+  "/operator.js?v=20260718-no-conversion-sales-v1",
   "/driver",
   "/driver.html",
   "/driver.css?v=20260716-multi-photo-pallet-v1",

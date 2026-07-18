@@ -251,37 +251,20 @@ async function runRepositorySimulation(checks) {
     "SELECT id FROM sales_order_lines WHERE sales_order_id = $1 AND line_id = 13",
     [ids.sales]
   );
-  let partialPackRejected = false;
-  try {
-    await deliveryRepository.confirmDeliveryLine(ids.sales, manualDeliveryLine.id, { layers: 1 }, testOperator.id);
-  } catch (error) {
-    partialPackRejected = /sales-unit quantity/i.test(error.message);
-  }
-  check(partialPackRejected, "Partial manual MBBS-Special packing did not require sales quantity.");
-  await deliveryRepository.confirmDeliveryLine(
-    ids.sales,
-    manualDeliveryLine.id,
-    { layers: 1, salesQty: 1 },
-    testOperator.id
-  );
+  await deliveryRepository.confirmDeliveryLine(ids.sales, manualDeliveryLine.id, { layers: 1 }, testOperator.id);
   let manualDeliveryProgress = await one(
     "SELECT packed_layer_qty, packed_sales_qty FROM sales_order_lines WHERE id = $1",
     [manualDeliveryLine.id]
   );
-  check(number(manualDeliveryProgress.packed_layer_qty) === 1 && number(manualDeliveryProgress.packed_sales_qty) === 1,
-    "Manual MBBS-Special physical and sales packing quantities were not persisted independently.", { manualDeliveryProgress });
-  await deliveryRepository.setDeliveryLinePackedQuantity(
-    ids.sales,
-    manualDeliveryLine.id,
-    { layers: 2 },
-    testOperator.id
-  );
+  check(number(manualDeliveryProgress.packed_layer_qty) === 0 && number(manualDeliveryProgress.packed_sales_qty) === 1,
+    "No-conversion MBBS-Special packing did not use packed_sales_qty exclusively.", { manualDeliveryProgress });
+  await deliveryRepository.setDeliveryLinePackedQuantity(ids.sales, manualDeliveryLine.id, { layers: 2 }, testOperator.id);
   manualDeliveryProgress = await one(
     "SELECT packed_layer_qty, packed_sales_qty FROM sales_order_lines WHERE id = $1",
     [manualDeliveryLine.id]
   );
-  check(number(manualDeliveryProgress.packed_layer_qty) === 2 && number(manualDeliveryProgress.packed_sales_qty) === 2,
-    "Full manual MBBS-Special packing did not map the remaining sales quantity.", { manualDeliveryProgress });
+  check(number(manualDeliveryProgress.packed_layer_qty) === 0 && number(manualDeliveryProgress.packed_sales_qty) === 2,
+    "No-conversion MBBS-Special packed sales quantity was not editable in its sales UOM.", { manualDeliveryProgress });
   checks.push("repository sales order -> sales_orders/sales_order_lines");
 
   await upsertPurchaseOrders([{
@@ -581,37 +564,20 @@ async function runRepositorySimulation(checks) {
     "SELECT id FROM purchase_order_lines WHERE purchase_order_id = $1 AND line_id = 23",
     [ids.purchase]
   );
-  let partialReceiptRejected = false;
-  try {
-    await receivingRepository.confirmReceivingLine(ids.purchase, manualReceivingLine.id, { layers: 1 }, testOperator.id);
-  } catch (error) {
-    partialReceiptRejected = /sales-unit quantity/i.test(error.message);
-  }
-  check(partialReceiptRejected, "Partial manual MBBS-Special receiving did not require sales quantity.");
-  await receivingRepository.confirmReceivingLine(
-    ids.purchase,
-    manualReceivingLine.id,
-    { layers: 1, salesQty: 1 },
-    testOperator.id
-  );
+  await receivingRepository.confirmReceivingLine(ids.purchase, manualReceivingLine.id, { layers: 1 }, testOperator.id);
   let manualReceivingProgress = await one(
     "SELECT received_layer_qty, received_sales_qty FROM purchase_order_lines WHERE id = $1",
     [manualReceivingLine.id]
   );
-  check(number(manualReceivingProgress.received_layer_qty) === 1 && number(manualReceivingProgress.received_sales_qty) === 1,
-    "Manual MBBS-Special physical and sales receiving quantities were not persisted independently.", { manualReceivingProgress });
-  await receivingRepository.confirmReceivingLine(
-    ids.purchase,
-    manualReceivingLine.id,
-    { layers: 2 },
-    testOperator.id
-  );
+  check(number(manualReceivingProgress.received_layer_qty) === 0 && number(manualReceivingProgress.received_sales_qty) === 1,
+    "No-conversion MBBS-Special receiving did not use received_sales_qty exclusively.", { manualReceivingProgress });
+  await receivingRepository.confirmReceivingLine(ids.purchase, manualReceivingLine.id, { layers: 2 }, testOperator.id);
   manualReceivingProgress = await one(
     "SELECT received_layer_qty, received_sales_qty FROM purchase_order_lines WHERE id = $1",
     [manualReceivingLine.id]
   );
-  check(number(manualReceivingProgress.received_layer_qty) === 2 && number(manualReceivingProgress.received_sales_qty) === 2,
-    "Full manual MBBS-Special receiving did not map the remaining sales quantity.", { manualReceivingProgress });
+  check(number(manualReceivingProgress.received_layer_qty) === 0 && number(manualReceivingProgress.received_sales_qty) === 2,
+    "No-conversion MBBS-Special received sales quantity was not editable in its sales UOM.", { manualReceivingProgress });
   checks.push("repository purchase order -> purchase_orders/purchase_order_lines");
 
   const transferOrder = {
@@ -647,8 +613,25 @@ async function runRepositorySimulation(checks) {
     to_plt: 100,
     to_lyr: 10
   };
+  const noConversionTransferLine = {
+    ...transferLine,
+    line_id: 32,
+    item_id: 2055,
+    item_name: "MBBS-Special",
+    item_description: "No-conversion TO sales-UOM line",
+    quantity: 3,
+    unit: "PC",
+    pallet_qty: 0,
+    layer_qty: 2,
+    section_qty: 0,
+    piece_qty: 0,
+    to_plt: 0,
+    to_lyr: 0,
+    to_sec: 0,
+    to_pcs: 0
+  };
   await upsertOutboundTransferOrders([transferOrder]);
-  await upsertOutboundTransferOrderLines(ids.transfer, [transferLine]);
+  await upsertOutboundTransferOrderLines(ids.transfer, [transferLine, noConversionTransferLine]);
   await upsertInboundTransferOrders([{
     ...transferOrder,
     status_text: "Pending Receipt",
@@ -660,6 +643,11 @@ async function runRepositorySimulation(checks) {
     location_id: 15,
     location: "12441",
     netsuite_received_qty: 50
+  }, {
+    ...noConversionTransferLine,
+    location_id: 15,
+    location: "12441",
+    netsuite_received_qty: 0
   }]);
   await assertTransferOrder(ids.transfer, {
     from_location_id: 1,
@@ -672,6 +660,34 @@ async function runRepositorySimulation(checks) {
     to_plt: 100,
     item_weight: 4
   });
+  await query(
+    `UPDATE sales_orders
+        SET operator_status = 'packed', preparing_operator_id = null, preparing_started_at = null
+      WHERE netsuite_id = $1`,
+    [ids.sales]
+  );
+  const outboundNoConversionTransfer = await one(
+    "SELECT id FROM transfer_order_lines WHERE transfer_order_id = $1 AND line_stage = 'outbound' AND line_id = 32",
+    [ids.transfer]
+  );
+  await deliveryRepository.confirmDeliveryLine(ids.transfer, outboundNoConversionTransfer.id, { layers: 2 }, testOperator.id);
+  const outboundTransferProgress = await one(
+    "SELECT packed_layer_qty, packed_sales_qty FROM transfer_order_lines WHERE id = $1",
+    [outboundNoConversionTransfer.id]
+  );
+  check(number(outboundTransferProgress.packed_layer_qty) === 0 && number(outboundTransferProgress.packed_sales_qty) === 2,
+    "No-conversion TO packing did not use packed_sales_qty exclusively.", { outboundTransferProgress });
+  const inboundNoConversionTransfer = await one(
+    "SELECT id FROM transfer_order_lines WHERE transfer_order_id = $1 AND line_stage = 'receiving' AND line_id = 32",
+    [ids.transfer]
+  );
+  await receivingRepository.confirmReceivingLine(ids.transfer, inboundNoConversionTransfer.id, { layers: 2 }, testOperator.id);
+  const inboundTransferProgress = await one(
+    "SELECT received_layer_qty, received_sales_qty FROM transfer_order_lines WHERE id = $1",
+    [inboundNoConversionTransfer.id]
+  );
+  check(number(inboundTransferProgress.received_layer_qty) === 0 && number(inboundTransferProgress.received_sales_qty) === 2,
+    "No-conversion TO receiving did not use received_sales_qty exclusively.", { inboundTransferProgress });
   checks.push("repository transfer order -> transfer_orders/transfer_order_lines both stages");
 }
 
