@@ -404,6 +404,26 @@ async function runRepositorySimulation(checks) {
     { quantityAmendedLine }
   );
   const dispatchRepository = await import("./dispatch-repository.js");
+  const perTypeCappedOrders = await dispatchRepository.listDispatchOrders({
+    includeHiddenScm: true,
+    perTypeLimit: 1
+  });
+  const cappedTypeCounts = perTypeCappedOrders.reduce((counts, order) => {
+    counts.set(order.type, Number(counts.get(order.type) || 0) + 1);
+    return counts;
+  }, new Map());
+  check(cappedTypeCounts.size >= 2 && [...cappedTypeCounts.values()].every((count) => count === 1),
+    "Dispatch pool limits must be applied independently per order type.",
+    { cappedTypeCounts: Object.fromEntries(cappedTypeCounts) });
+  const searchedDispatchOrders = await dispatchRepository.listDispatchOrders({
+    includeHiddenScm: true,
+    perTypeLimit: 1,
+    search: `SIM-SO-${runId}`
+  });
+  check(searchedDispatchOrders.some((order) => order.id === `SIM-SO-${runId}`),
+    "Backend dispatch search must return a valid order even when it falls outside the normal pool cap.",
+    { searchedDispatchOrders: searchedDispatchOrders.map((order) => order.id) });
+  checks.push("dispatch per-type pool limit + backend search bypass");
   const dispatchOrders = await dispatchRepository.listDispatchOrders({ includeHiddenScm: true });
   const dispatchPurchase = dispatchOrders.find((order) => order.id === `SIM-PO-${runId}`);
   check(number(dispatchPurchase?.salesQty) === 220, "Dispatch did not use the fixed PO receipt baseline.", { dispatchPurchase });

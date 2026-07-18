@@ -999,11 +999,22 @@ export function enrichTransferDispatch(order) {
   };
 }
 
-export async function enrichPurchaseOrderDispatch(order) {
+export async function createPurchaseOrderDispatchEnricher({ allowOllama = true } = {}) {
   const vendorYards = uniqueYards(await vendorYardsForMatching());
+  return (order, options = {}) => enrichPurchaseOrderDispatch(order, {
+    ...options,
+    vendorYards,
+    allowOllama
+  });
+}
+
+export async function enrichPurchaseOrderDispatch(order, options = {}) {
+  const vendorYards = uniqueYards(Array.isArray(options.vendorYards) ? options.vendorYards : await vendorYardsForMatching());
   const haystack = normalize(`${order.vendor || ""} ${order.memo || ""} ${order.tranid || ""}`);
   const vendorName = normalize(order.vendor);
-  const mappedLocalVendor = await mappedLocalVendorForPurchaseOrder(order);
+  const mappedLocalVendor = Object.prototype.hasOwnProperty.call(options, "mappedLocalVendor")
+    ? String(options.mappedLocalVendor || "")
+    : await mappedLocalVendorForPurchaseOrder(order);
   if (isUseNetSuiteAddressMapping(mappedLocalVendor)) {
     const vendorAddress = cleanupAddress(order.vendor_address || order.vendorAddress || "");
     return {
@@ -1032,7 +1043,7 @@ export async function enrichPurchaseOrderDispatch(order) {
   }
   let parseSource = candidate ? "vendor-yard-table" : "unmatched-vendor";
   if (candidate && mappedLocalVendor) parseSource = "vendor-map-yard-table";
-  if (!candidate && exactVendorCandidates.length && hasPurchaseYardClue(`${order.vendor || ""} ${order.memo || ""}`, exactVendorCandidates)) {
+  if (options.allowOllama !== false && !candidate && exactVendorCandidates.length && hasPurchaseYardClue(`${order.vendor || ""} ${order.memo || ""}`, exactVendorCandidates)) {
     const parsed = await parsePurchaseYardWithOllama({
       vendor: order.vendor,
       memo: order.memo,

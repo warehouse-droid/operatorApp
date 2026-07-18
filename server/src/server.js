@@ -458,12 +458,41 @@ function mergeDispatchOrderFeedWithSnapshotDerivedOrders(orders = [], derivedOrd
   return [...byId.values()];
 }
 
-async function listDispatchOrdersForResponse({ type = null } = {}) {
-  const orders = await listDispatchOrders({ type });
-  const derivedOrders = await listDispatchSnapshotDerivedOrders({ type });
+function dispatchOrderMatchesSearch(order = {}, search = "") {
+  const term = String(search || "").trim().toLowerCase();
+  if (!term) return true;
+  return [
+    order.id,
+    order.type,
+    order.dispatchRef,
+    order.originalPoRef,
+    order.customer,
+    order.address,
+    order.sourceYard,
+    order.destinationYard,
+    order.sourceOrderId,
+    order.relatedSoId,
+    order.transitCo?.id,
+    order.expectedDeliveryDate,
+    order.notes,
+    ...(order.childOrders || []),
+    ...(order.groupAliases || []),
+    ...(order.childOrderDetails || []).flatMap((child) => [child?.id, child?.originalOrderId]),
+    ...(order.items || []).flatMap((item) => [item.sku, item.itemName, item.description])
+  ].join(" ").toLowerCase().includes(term);
+}
+
+async function listDispatchOrdersForResponse({ type = null, search = "" } = {}) {
+  const searchTerm = String(search || "").trim().slice(0, 120);
+  const orders = await listDispatchOrders({ type, search: searchTerm });
+  const snapshotOrders = await listDispatchSnapshotDerivedOrders({ type });
+  const derivedOrders = searchTerm
+    ? snapshotOrders.filter((order) => dispatchOrderMatchesSearch(order, searchTerm))
+    : snapshotOrders;
   const assigned = await enrichDispatchOrdersWithPlanAssignments(mergeDispatchOrderFeedWithSnapshotDerivedOrders(orders, derivedOrders));
   const poLinked = await enrichDispatchOrdersWithPoTargetAllocations(assigned);
-  return enrichDispatchOrdersWithDependencies(poLinked);
+  const enriched = await enrichDispatchOrdersWithDependencies(poLinked);
+  return searchTerm ? enriched.filter((order) => dispatchOrderMatchesSearch(order, searchTerm)) : enriched;
 }
 
 function sendDispatchDependencyConflictResponse(res, conflicts = []) {
@@ -1789,11 +1818,26 @@ function changedDispatchOrderStructureRefs(previousPlan = {}, nextPlan = {}) {
   return [...refs];
 }
 
+export function safeNormalDependencyGroupingRefs(previousPlan = {}, nextPlan = {}) {
+  const before = dispatchOrderStructureState(previousPlan);
+  const after = dispatchOrderStructureState(nextPlan);
+  const refs = [];
+  for (const [ref, beforeToken] of before.membership.entries()) {
+    const afterToken = after.membership.get(ref) || "";
+    if (beforeToken === "normal" && afterToken.startsWith("group:")) refs.push(ref);
+  }
+  return refs;
+}
+
 async function assertNoConsolidationStructureConflict(previousPlan, nextPlan) {
   const changedRefs = changedDispatchOrderStructureRefs(previousPlan, nextPlan);
   if (!changedRefs.length) return;
   await assertNoActiveConsolidationClaimsByRefs(changedRefs, "group, ungroup, split, or unsplit these orders");
-  await assertNoActiveOrderDependenciesByRefs(changedRefs, "group, ungroup, split, or unsplit these orders");
+  await assertNoActiveOrderDependenciesByRefs(
+    changedRefs,
+    "group, ungroup, split, or unsplit these orders",
+    { allowNormalGroupingRefs: safeNormalDependencyGroupingRefs(previousPlan, nextPlan) }
+  );
 }
 
 function normalizeOrderType(value) {
@@ -3382,7 +3426,7 @@ app.use((req, res, next) => {
   if (req.path === "/service-worker.js") {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
     res.setHeader("Service-Worker-Allowed", "/");
-  } else if (req.path.endsWith(".webmanifest") || ["/", "/operator", "/driver", "/control", "/admin", "/dispatch", "/dispatch/loaded-export", "/operator.html", "/driver.html", "/control.html", "/admin.html", "/dispatch-menu.html", "/dispatch-loaded-export.html"].includes(req.path)) {
+  } else if (req.path.endsWith(".webmanifest") || ["/", "/operator", "/driver", "/control", "/admin", "/dispatch", "/dispatch/loaded-export", "/dispatch/po-to-schedule", "/operator.html", "/driver.html", "/control.html", "/admin.html", "/dispatch-menu.html", "/dispatch-loaded-export.html"].includes(req.path)) {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   }
   next();
@@ -4159,7 +4203,8 @@ app.post("/api/dispatch/samsara/driver-login-test", async (req, res, next) => {
 app.get("/api/dispatch/orders", async (req, res, next) => {
   try {
     const type = req.query.type ? String(req.query.type).toUpperCase() : null;
-    res.json(await listDispatchOrdersForResponse({ type }));
+    const search = req.query.search ? String(req.query.search) : "";
+    res.json(await listDispatchOrdersForResponse({ type, search }));
   } catch (error) {
     if (error instanceof DispatchPlanEditLeaseError) return sendDispatchPlanEditLeaseError(res, error);
     next(error);
@@ -4569,7 +4614,7 @@ app.post("/api/scm/schedule", async (req, res, next) => {
       after: updated
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { source: "scm-schedule", orderId: updated.order_ref });
-    res.json({ updated, schedule: await listScmSchedule() });
+    res.json({ updated, ...(req.query.includeSchedule === "false" ? {} : { schedule: await listScmSchedule() }) });
   } catch (error) {
     next(error);
   }
@@ -4596,7 +4641,7 @@ app.put("/api/scm/schedule/:id", async (req, res, next) => {
       after: updated
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { source: "scm-schedule", orderId: updated.order_ref });
-    res.json({ updated, schedule: await listScmSchedule() });
+    res.json({ updated, ...(req.query.includeSchedule === "false" ? {} : { schedule: await listScmSchedule() }) });
   } catch (error) {
     next(error);
   }
@@ -4621,7 +4666,7 @@ app.post("/api/scm/schedule-groups", async (req, res, next) => {
       after: grouped
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { source: "scm-group", orderId: grouped.groupRef });
-    res.json({ grouped, schedule: await listScmSchedule() });
+    res.json({ grouped, ...(req.query.includeSchedule === "false" ? {} : { schedule: await listScmSchedule() }) });
   } catch (error) {
     next(error);
   }
@@ -5565,6 +5610,10 @@ app.get("/dispatch/sales-order-methods", (req, res) => {
 
 app.get("/dispatch/loaded-export", (req, res) => {
   res.sendFile(path.join(publicDir, "dispatch-loaded-export.html"));
+});
+
+app.get(["/dispatch/po-to-schedule", "/dispatch/POTOschedule"], (req, res) => {
+  res.sendFile(path.join(publicDir, "scm-schedule.html"));
 });
 
 app.get("/dispatch/scm", (req, res) => {

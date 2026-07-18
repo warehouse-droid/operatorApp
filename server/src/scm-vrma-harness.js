@@ -106,7 +106,7 @@ try {
     const itemMatches = await searchScmVrmaItems({ search: suffix.slice(-7) });
     const convertedMatch = itemMatches.find((item) => Number(item.itemId) === convertedItemId);
     const genericMatch = itemMatches.find((item) => Number(item.itemId) === genericItemId);
-    assert(convertedMatch?.toPlt === 100 && convertedMatch?.toLyr === 10 && convertedMatch?.toPcs === 1,
+    assert(convertedMatch?.toPlt === 100 && convertedMatch?.toLyr === 10 && convertedMatch?.toPcs === 1 && convertedMatch?.itemWeight === 0.5,
       "Item autocomplete must expose configured conversion inputs.",
       { convertedMatch });
     assert(genericMatch && !genericMatch.toPlt && !genericMatch.toLyr && !genericMatch.toSec && !genericMatch.toPcs,
@@ -156,7 +156,7 @@ try {
       { detail });
 
     const stored = await query(
-      `SELECT item_id, quantity, unit, pallet_qty, layer_qty, section_qty, piece_qty,
+      `SELECT item_id, quantity, unit, weight_lbs, pallet_qty, layer_qty, section_qty, piece_qty,
               to_plt, to_lyr, to_sec, to_pcs
          FROM scm_vrma_order_lines
         WHERE vrma_order_id = $1
@@ -169,12 +169,14 @@ try {
         && Number(convertedLine?.pallet_qty) === 2
         && Number(convertedLine?.layer_qty) === 3
         && Number(convertedLine?.piece_qty) === 4
-        && Number(convertedLine?.to_plt) === 100,
+        && Number(convertedLine?.to_plt) === 100
+        && Number(convertedLine?.weight_lbs) === 117,
       "Converted quantities must be retained and produce the correct stock-unit reference total.",
       { convertedLine });
     assert(Number(genericLine?.quantity) === 1200
         && genericLine?.unit === "SQFT"
-        && Number(genericLine?.pallet_qty) === 0,
+        && Number(genericLine?.pallet_qty) === 0
+        && Number(genericLine?.weight_lbs) === 300,
       "No-conversion quantities must retain their selected fallback UOM without fake pallets.",
       { genericLine });
 

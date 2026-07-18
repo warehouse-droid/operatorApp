@@ -55,6 +55,34 @@ function scmNumber(value) {
   return Number.isFinite(number) ? Math.max(number, 0) : 0;
 }
 
+function scmWeightLabel(value) {
+  return `${scmNumber(value).toLocaleString("en-CA", { maximumFractionDigits: 0 })} lb`;
+}
+
+function scmLineSalesQuantity(item = {}, quantities = {}) {
+  const converted = (scmNumber(quantities.pallets) * scmNumber(item.toPlt))
+    + (scmNumber(quantities.layers) * scmNumber(item.toLyr))
+    + (scmNumber(quantities.sections) * scmNumber(item.toSec))
+    + (scmNumber(quantities.pieces) * scmNumber(item.toPcs));
+  return converted > 0 ? converted : scmNumber(quantities.salesQty);
+}
+
+function scmLineWeight(item = {}, quantities = {}) {
+  return scmLineSalesQuantity(item, quantities) * scmNumber(item.itemWeight);
+}
+
+function scmLineWeightText(item = {}, quantities = {}) {
+  return `${t("dispatch.selectedLineWeight", "Selected weight")}: ${scmWeightLabel(scmLineWeight(item, quantities))}`;
+}
+
+function scmItemWeightText(item = {}) {
+  const palletConversion = scmNumber(item.toPlt);
+  if (palletConversion > 0) {
+    return `${t("dispatch.weightPerPallet", "Weight per PLT")}: ${scmWeightLabel(scmNumber(item.itemWeight) * palletConversion)} / PLT`;
+  }
+  return `${t("dispatch.unitWeight", "Unit weight")}: ${scmWeightLabel(item.itemWeight)} / ${item.unit || item.salesUnit || "sales unit"}`;
+}
+
 function scmHasConversion(item = {}) {
   return scmNumber(item.toPlt) > 0
     || scmNumber(item.toLyr) > 0
@@ -392,6 +420,7 @@ function renderOrderList() {
             ? `${t("dispatch.sourcePo", "Source PO")}: ${escapeHtml(order.sourcePoRef || "")}`
             : `${order.dispatchRef ? `PO ${escapeHtml(order.originalPoRef || "")} | ` : ""}${escapeHtml(scmDefaultPickupPoint(order) || "")}${scmDefaultPickupPoint(order) && order.destinationYard ? " -> " : ""}${escapeHtml(order.destinationYard || "")}`}</span>
           <span class="scm-card-qty">${escapeHtml(quantityLabel || "-")}</span>
+          <span class="scm-card-weight">${t("dispatch.orderWeight", "Order weight")}: ${escapeHtml(scmWeightLabel(order.weight))}</span>
         </div>
         ${plannedLabel ? `<div class="scm-card-plan-side">
           <span class="scm-planned-badge">Planned</span>
@@ -417,6 +446,9 @@ function renderSelectedOrder() {
   const lineRows = visibleItems.map((item) => {
     const input = scmInputForLine(item.lineRowId);
     const units = scmAvailableUnits(item);
+    const displayedQuantities = isSplit
+      ? Object.fromEntries(units.map((unit) => [unit.key, unit.value]))
+      : input;
     return `
       <article class="scm-line-card">
         <div class="scm-line-main">
@@ -424,7 +456,11 @@ function renderSelectedOrder() {
             <strong>${escapeHtml(item.sku || item.itemName || "Item")}</strong>
             <span>${escapeHtml(item.description || "")}</span>
           </div>
-          <div class="scm-line-available">${escapeHtml(scmQuantityLabel(item))}</div>
+          <div class="scm-line-totals">
+            <div class="scm-line-available">${escapeHtml(scmQuantityLabel(item))}</div>
+            <span>${escapeHtml(scmItemWeightText(item))}</span>
+            <span>${t("dispatch.availableLineWeight", "Available line weight")}: ${escapeHtml(scmWeightLabel(item.lineWeight))}</span>
+          </div>
         </div>
         <div class="scm-line-inputs ${isSplit ? "readonly" : ""}">
           ${units.map((unit) => `
@@ -434,6 +470,7 @@ function renderSelectedOrder() {
             </label>
           `).join("")}
         </div>
+        <div class="scm-line-selected-weight" data-scm-line-weight="${escapeHtml(item.lineRowId)}">${escapeHtml(scmLineWeightText(item, displayedQuantities))}</div>
       </article>
     `;
   }).join("");
@@ -444,6 +481,10 @@ function renderSelectedOrder() {
           <p>${t("dispatch.blanketPo", "Blanket PO")}</p>
           <h2>${escapeHtml(order.id)}</h2>
           <span>${order.originalPoRef && order.originalPoRef !== order.id ? `PO ${escapeHtml(order.originalPoRef)} | ` : ""}${escapeHtml(order.customer || order.vendorYard || order.sourceYard || "")}</span>
+        </div>
+        <div class="scm-detail-total-weight">
+          <span>${isSplit ? t("dispatch.splitPoTotalWeight", "Split PO total weight") : t("dispatch.poTotalWeight", "PO total weight")}</span>
+          <strong>${escapeHtml(scmWeightLabel(order.weight))}</strong>
         </div>
       </div>
       ${renderScmScheduleMiniPanel(order)}
@@ -501,6 +542,7 @@ function renderScmSplitModal() {
   if (!scmSummaryOpen) return "";
   const order = scmSelectedOrder();
   const rows = scmSelectedLinesForOrder(order);
+  const totalSelectedWeight = rows.reduce((sum, row) => sum + scmLineWeight(row.item, row.quantities), 0);
   const selectedDestination = ensureScmDestinationLocation(order);
   ensureScmPickupPoint(order);
   return `
@@ -532,9 +574,11 @@ function renderScmSplitModal() {
               <article>
                 <strong>${escapeHtml(item.sku || item.itemName || "Item")}</strong>
                 <span>${escapeHtml(scmSelectedLineLabel(item, quantities))}</span>
+                <small>${escapeHtml(scmLineWeightText(item, quantities))}</small>
               </article>
             `).join("") || `<div class="empty-state">${t("dispatch.noLinesSelected", "No lines selected.")}</div>`}
           </div>
+          <div class="scm-summary-total-weight">${t("dispatch.totalSelectedWeight", "Total selected weight")}: <strong>${escapeHtml(scmWeightLabel(totalSelectedWeight))}</strong></div>
         </div>
         <div class="modal-footer">
           <button data-action="close-summary" type="button">${t("common.cancel", "Cancel")}</button>
@@ -1001,6 +1045,9 @@ scmApp.addEventListener("input", (event) => {
   if (target.dataset.action === "line-qty") {
     const input = scmInputForLine(target.dataset.line);
     input[target.dataset.field] = scmNumber(target.value);
+    const item = scmSelectedOrder()?.items?.find((candidate) => String(candidate.lineRowId) === String(target.dataset.line));
+    const weight = scmApp.querySelector(`[data-scm-line-weight="${CSS.escape(String(target.dataset.line || ""))}"]`);
+    if (item && weight) weight.textContent = scmLineWeightText(item, input);
   }
 });
 

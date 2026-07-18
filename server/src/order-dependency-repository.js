@@ -355,12 +355,26 @@ export async function listOrderDependencies(filters = {}) {
   return loadDependencies(filters);
 }
 
-export async function assertNoActiveOrderDependenciesByRefs(orderRefs = [], action = "change these orders") {
+export async function assertNoActiveOrderDependenciesByRefs(orderRefs = [], action = "change these orders", options = {}) {
   const refs = [...new Set((orderRefs || []).map(text).filter(Boolean))];
   if (!refs.length) return;
+  const allowNormalGroupingRefs = new Set(
+    (options.allowNormalGroupingRefs || []).map(text).filter(Boolean)
+  );
   const result = await query(
     `SELECT DISTINCT dependency.dispatch_target_ref, dependency.sales_order_ref,
-            dependency.transfer_order_ref, dependency.dependency_mode, dependency.status
+            dependency.transfer_order_ref, dependency.dependency_mode, dependency.status,
+            dependency.dispatch_target_kind,
+            EXISTS (
+              SELECT 1
+                FROM order_dependency_lines progress_line
+               WHERE progress_line.dependency_id = dependency.id
+                 AND (
+                   COALESCE(progress_line.loaded_quantity, 0) > $2
+                   OR COALESCE(progress_line.delivered_quantity, 0) > $2
+                   OR COALESCE(progress_line.locally_received_quantity, 0) > $2
+                 )
+            ) AS has_execution_progress
        FROM order_dependencies dependency
        LEFT JOIN order_dependency_lines line ON line.dependency_id = dependency.id
        LEFT JOIN sales_order_lines sales_line ON sales_line.id = line.sales_line_id
@@ -373,10 +387,19 @@ export async function assertNoActiveOrderDependenciesByRefs(orderRefs = [], acti
           OR source_sales.tranid = ANY($1::text[])
         )
       ORDER BY dependency.dispatch_target_ref, dependency.transfer_order_ref`,
-    [refs]
+    [refs, EPSILON]
   );
-  if (!result.rowCount) return;
-  const relations = result.rows.map((row) => `${row.dispatch_target_ref || row.sales_order_ref} -> ${row.transfer_order_ref}`).join(", ");
+  const blocked = result.rows.filter((row) => {
+    const targetRef = text(row.dispatch_target_ref || row.sales_order_ref);
+    const safeNormalGrouping = allowNormalGroupingRefs.has(targetRef)
+      && row.dispatch_target_kind === "normal"
+      && row.dependency_mode === "yard_replenishment"
+      && row.status === "active"
+      && !row.has_execution_progress;
+    return !safeNormalGrouping;
+  });
+  if (!blocked.length) return;
+  const relations = blocked.map((row) => `${row.dispatch_target_ref || row.sales_order_ref} -> ${row.transfer_order_ref}`).join(", ");
   const error = new Error(`Cannot ${action} while an active order dependency exists: ${relations}. Unlink the dependency first.`);
   error.status = 409;
   error.code = "ORDER_DEPENDENCY_STRUCTURE_LOCK";

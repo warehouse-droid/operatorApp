@@ -55,6 +55,7 @@
     { label: "Monitor", href: "/dispatch/monitor", icon: "MO" },
     { label: "Statistics", href: "/dispatch/statistics", icon: "ST" },
     { label: "DVIR", href: "/dispatch/dvir", icon: "DV" },
+    { label: "PO/TO Schedule", href: "/dispatch/po-to-schedule", icon: "PT" },
     { label: "Yard In/Outbound", href: "/dispatch/loaded-export", icon: "YI" },
     { label: "SO Method", href: "/dispatch/sales-order-methods", icon: "SO" },
     { label: "Snapshot", href: "/dispatch/snapshot", icon: "SN" },
