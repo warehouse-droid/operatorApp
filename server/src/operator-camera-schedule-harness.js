@@ -59,9 +59,14 @@ includesAll(i18n, [
 ], "Bilingual camera strings");
 includesAll(operatorHtml, [
   "/operator.css?v=20260717-in-pwa-camera-v1",
-  "/operator.js?v=20260717-in-pwa-camera-v1"
+  "/operator.js?v=20260718-no-conversion-sales-v1"
 ], "Operator camera cache busting");
-assert.ok(serviceWorker.includes("mbbs-yard-operator-v115-in-pwa-camera"), "Operator service-worker cache must advance.");
+includesAll(serviceWorker, [
+  "mbbs-yard-operator-v118-driver-oriented-merge",
+  "/i18n.js?v=20260718-driver-oriented-merge-v1",
+  "/operator.js?v=20260718-no-conversion-sales-v1",
+  "/driver.js?v=20260717-history-accordion-v1"
+], "Merged Operator and Driver service-worker cache");
 
 includesAll(server, [
   'app.get(["/dispatch/po-to-schedule", "/dispatch/POTOschedule"]',

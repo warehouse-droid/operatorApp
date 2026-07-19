@@ -39,6 +39,7 @@ function cleanTruck(truck = {}, displayOrder = 0) {
     plate,
     capacityLbs: numberValue(truck.capacityLbs, 48000),
     travelTimePercent: numberValue(truck.travelTimePercent, 0),
+    baseYard: String(truck.baseYard || truck.base || "").trim(),
     displayOrder
   };
 }
@@ -74,7 +75,8 @@ function publicTruck(row) {
     id: String(row.id),
     plate: row.plate,
     capacityLbs: numberValue(row.capacity_lbs, 48000),
-    travelTimePercent: numberValue(row.travel_time_percent, 0)
+    travelTimePercent: numberValue(row.travel_time_percent, 0),
+    baseYard: String(row.base_yard || "").trim()
   };
 }
 
@@ -209,23 +211,24 @@ async function upsertTrucks(trucks, { deactivateMissing = true } = {}) {
 
   for (const truck of cleaned) {
     const existing = (truck.id && existingById.get(truck.id)) || existingByPlate.get(truck.plate) || null;
-    const params = [truck.plate, truck.capacityLbs, truck.travelTimePercent, truck.displayOrder];
+    const params = [truck.plate, truck.capacityLbs, truck.travelTimePercent, truck.baseYard, truck.displayOrder];
     const result = existing
       ? await query(
           `UPDATE dispatch_trucks
            SET plate = $1,
                capacity_lbs = $2,
                travel_time_percent = $3,
-               display_order = $4,
+               base_yard = $4,
+               display_order = $5,
                active = true,
                updated_at = now()
-           WHERE id = $5
+           WHERE id = $6
            RETURNING id`,
           [...params, existing.id]
         )
       : await query(
-          `INSERT INTO dispatch_trucks (plate, capacity_lbs, travel_time_percent, display_order)
-           VALUES ($1, $2, $3, $4)
+          `INSERT INTO dispatch_trucks (plate, capacity_lbs, travel_time_percent, base_yard, display_order)
+           VALUES ($1, $2, $3, $4, $5)
            RETURNING id`,
           params
         );

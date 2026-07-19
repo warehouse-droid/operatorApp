@@ -11,9 +11,9 @@ let drivers = [
   { name: "Jenny Lee", license: "DZ", number: "D18870", login: "jenny", ownYardFixedMinutes: 38, vendorFixedMinutes: 32, deliveryFixedMinutes: 32, outsideFixedMinutes: 32, minutesPerPallet: 1, loadMinutes: 38, unloadMinutes: 32 }
 ];
 let trucks = [
-  { plate: "MBBS-101", capacityLbs: 48000, travelTimePercent: 0 },
-  { plate: "MBBS-205", capacityLbs: 44000, travelTimePercent: 0 },
-  { plate: "MBBS-318", capacityLbs: 52000, travelTimePercent: 0 }
+  { plate: "MBBS-101", capacityLbs: 48000, travelTimePercent: 0, baseYard: "" },
+  { plate: "MBBS-205", capacityLbs: 44000, travelTimePercent: 0, baseYard: "" },
+  { plate: "MBBS-318", capacityLbs: 52000, travelTimePercent: 0, baseYard: "" }
 ];
 let ownYards = [
   { code: "3445", name: "3445", locationId: 1, address: "3445 Kennedy Road, Toronto, ON", lat: 43.8204306, lng: -79.3053423 },
@@ -29,6 +29,7 @@ let parserReparseResult = null;
 let setupNotice = "";
 let samsaraTestResult = null;
 let samsaraSettings = { dvirAuthorId: "1868723" };
+let planningSettings = { truckSwitchMinutes: 10 };
 let selectedVendor = "";
 let selectedYard = "";
 let vendorAddMode = false;
@@ -68,6 +69,7 @@ async function loadDispatchSetup() {
     if (Array.isArray(setup.trucks)) trucks = setup.trucks;
     if (Array.isArray(setup.ownYards)) ownYards = setup.ownYards;
     if (setup.samsara) samsaraSettings = { ...samsaraSettings, ...setup.samsara };
+    if (setup.planning) planningSettings = { ...planningSettings, ...setup.planning };
   } catch (error) {
     setupNotice = `Dispatch setup failed to load: ${error.message}`;
   }
@@ -89,12 +91,13 @@ async function saveDispatchSetup() {
   validateUniqueDriverLogins();
   const saved = await api("/api/dispatch/setup", {
     method: "PUT",
-    body: JSON.stringify({ drivers, trucks, ownYards, samsara: samsaraSettings })
+    body: JSON.stringify({ drivers, trucks, ownYards, samsara: samsaraSettings, planning: planningSettings })
   });
   if (Array.isArray(saved.drivers)) drivers = saved.drivers;
   if (Array.isArray(saved.trucks)) trucks = saved.trucks;
   if (Array.isArray(saved.ownYards)) ownYards = saved.ownYards;
   if (saved.samsara) samsaraSettings = { ...samsaraSettings, ...saved.samsara };
+  if (saved.planning) planningSettings = { ...planningSettings, ...saved.planning };
 }
 
 async function loadParserRules() {
@@ -178,6 +181,18 @@ function truckCapacityLbs(truck) {
 function truckTravelTimePercent(truck) {
   const value = Number(truck?.travelTimePercent ?? truck?.travelPercent ?? 0);
   return Number.isFinite(value) ? value : 0;
+}
+
+function truckBaseYardOptions(selected = "") {
+  const selectedValue = String(selected || "").trim();
+  return [
+    `<option value="" ${selectedValue ? "" : "selected"}>Unknown / not confirmed</option>`,
+    ...ownYards.map((yard) => {
+      const code = String(yard.code || yard.name || "").trim();
+      const label = yard.name && yard.name !== code ? `${code} - ${yard.name}` : code;
+      return `<option value="${escapeHtml(code)}" ${selectedValue === code ? "selected" : ""}>${escapeHtml(label)}</option>`;
+    })
+  ].join("");
 }
 
 function ownYardFixedMinutesFor(driver) {
@@ -374,15 +389,18 @@ function renderTrucks() {
             <strong>${escapeHtml(truck.plate)}</strong>
             <span class="muted">Capacity ${formatLbs(truckCapacityLbs(truck))}</span>
             <span class="muted">Google travel time +${truckTravelTimePercent(truck)}%</span>
+            <span class="muted">Base yard ${escapeHtml(truck.baseYard || "Unknown")}</span>
           </button>
         `).join("")}
         </div>
       </div>
       <form class="registration-form setup-form" data-form="truck">
         <h3>${selected ? "Update Truck" : "Register Truck"}</h3>
+        <label><span>${t("dispatch.truckSwitchMinutes", "Truck switch time (minutes)")}</span><input name="truckSwitchMinutes" type="number" min="0" max="120" step="1" value="${Number(planningSettings.truckSwitchMinutes ?? 10)}" required /></label>
         <label><span>Vehicle plate number</span><input name="plate" value="${escapeHtml(selected?.plate || "")}" required /></label>
         <label><span>Load capacity (lb)</span><input name="capacityLbs" type="number" value="${truckCapacityLbs(selected)}" required /></label>
         <label><span>Google travel time + %</span><input name="travelTimePercent" type="number" min="0" max="300" step="1" value="${truckTravelTimePercent(selected)}" required /></label>
+        <label><span>Default base yard</span><select name="baseYard">${truckBaseYardOptions(selected?.baseYard || "")}</select></label>
         <button class="primary" type="submit">${selected ? "Update Truck" : "Register Truck"}</button>
       </form>
     </div>
@@ -979,8 +997,10 @@ setupApp.addEventListener("submit", (event) => {
       id: existingTruck?.id || null,
       plate: data.plate,
       capacityLbs: Number(data.capacityLbs || 48000),
-      travelTimePercent: Math.max(0, Number(data.travelTimePercent || 0))
+      travelTimePercent: Math.max(0, Number(data.travelTimePercent || 0)),
+      baseYard: String(data.baseYard || "").trim()
     };
+    planningSettings.truckSwitchMinutes = Math.max(0, Math.round(Number(data.truckSwitchMinutes ?? 10)));
     if (Number.isInteger(selectedSetupIndex)) trucks[selectedSetupIndex] = truck;
     else {
       trucks.push(truck);

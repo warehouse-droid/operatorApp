@@ -1,5 +1,7 @@
 import { query, withTransaction } from "./db.js";
 import { syncDispatchDeliveryGroupsFromPlan } from "./dispatch-delivery-group-repository.js";
+import { normalizeDispatchPlanLoadAssignments, dispatchLoadAssignment } from "./dispatch-load-assignment.js";
+import { syncDispatchPlanLoadAssignments } from "./dispatch-load-assignment-repository.js";
 
 const CUSTOMER_PICKUP_DELIVERY_METHOD = "Pick-Up";
 
@@ -8,6 +10,9 @@ function todayDate() {
 }
 
 function cleanPlanDate(value) {
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    return value.toISOString().slice(0, 10);
+  }
   const text = String(value || "").slice(0, 10);
   return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : todayDate();
 }
@@ -94,9 +99,11 @@ export function dispatchPlannedAssignmentMap(plan = {}) {
           dispatchPlanned: true,
           dispatchPlanId: plan.id ? String(plan.id) : "",
           dispatchPlanDate: String(plan.planDate || "").slice(0, 10),
-          dispatchTruckPlate: truck.plate || "",
+          dispatchTruckPlate: dispatchLoadAssignment(truck, load).truckPlate,
           dispatchLoadName: load.name || "",
-          dispatchParkingSpot: truck.parkingSpot || ""
+          dispatchParkingSpot: dispatchLoadAssignment(truck, load).parkingSpot,
+          dispatchDriverLogin: dispatchLoadAssignment(truck, load).driverLogin,
+          dispatchDriverName: dispatchLoadAssignment(truck, load).driverName
         });
       }
     }
@@ -113,6 +120,8 @@ export function applyDispatchPlannedAssignment(order = {}, assignment = null) {
     dispatchTruckPlate: assignment?.dispatchTruckPlate || "",
     dispatchLoadName: assignment?.dispatchLoadName || "",
     dispatchParkingSpot: assignment?.dispatchParkingSpot || "",
+    dispatchDriverLogin: assignment?.dispatchDriverLogin || "",
+    dispatchDriverName: assignment?.dispatchDriverName || "",
     plannedOrderRef: assignment?.plannedOrderRef || ""
   };
 }
@@ -130,6 +139,7 @@ function truckSnapshotSummary(trucks = []) {
     orderCount: (truck.loads || []).reduce((sum, load) => sum + countLoadOrders(load), 0),
     stopCount: (truck.loads || []).reduce((sum, load) => sum + (load.stops || []).length, 0),
     loads: (truck.loads || []).map((load) => ({
+      ...dispatchLoadAssignment(truck, load),
       id: load.id || "",
       name: load.name || "",
       type: load.type || "",
@@ -298,8 +308,9 @@ async function enrichDispatchPlanWeights(plan) {
 
 async function sanitizeDispatchPlan(plan) {
   if (!plan) return null;
-  const pickupRefs = await pickupSalesOrderRefs(plan);
-  const enrichedPlan = await enrichDispatchPlanWeights(plan);
+  const normalizedPlan = normalizeDispatchPlanLoadAssignments(plan);
+  const pickupRefs = await pickupSalesOrderRefs(normalizedPlan);
+  const enrichedPlan = await enrichDispatchPlanWeights(normalizedPlan);
   if (!pickupRefs.size) return enrichedPlan;
 
   return {
@@ -560,6 +571,11 @@ export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [
       orders: cleanPlan.orders,
       trucks: cleanPlan.trucks
     });
+    await syncDispatchPlanLoadAssignments({
+      ...cleanPlan,
+      id: planId,
+      planDate: expectedPlanDate
+    });
     return getDispatchPlan(planId);
   });
 }
@@ -644,6 +660,11 @@ export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" }
       orders: cleanPlan.orders,
       trucks: cleanPlan.trucks
     });
+    await syncDispatchPlanLoadAssignments({
+      ...cleanPlan,
+      id: source.plan_id,
+      planDate: currentDate
+    });
     return {
       plan: await getDispatchPlan(source.plan_id),
       restoredSnapshot: snapshotSummary(source),
@@ -653,19 +674,23 @@ export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" }
 }
 
 export async function confirmDispatchPlan(planId, { note = "" } = {}) {
-  const result = await query(
-    `UPDATE dispatch_plans
-        SET status = 'confirmed',
-            note = COALESCE(NULLIF($2, ''), note),
-            confirmed_at = COALESCE(confirmed_at, now()),
-            revision = revision + 1,
-            updated_at = now()
-      WHERE id = $1
-      RETURNING *`,
-    [planId, note || ""]
-  );
-  if (!result.rows[0]) throw new Error("Dispatch plan not found.");
-  return getDispatchPlan(planId);
+  return withTransaction(async () => {
+    const result = await query(
+      `UPDATE dispatch_plans
+          SET status = 'confirmed',
+              note = COALESCE(NULLIF($2, ''), note),
+              confirmed_at = COALESCE(confirmed_at, now()),
+              revision = revision + 1,
+              updated_at = now()
+        WHERE id = $1
+        RETURNING *`,
+      [planId, note || ""]
+    );
+    if (!result.rows[0]) throw new Error("Dispatch plan not found.");
+    const plan = await getDispatchPlan(planId);
+    await syncDispatchPlanLoadAssignments(plan);
+    return plan;
+  });
 }
 
 export async function reopenDispatchPlan(planId, { note = "" } = {}) {

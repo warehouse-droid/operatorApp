@@ -360,12 +360,21 @@ function renderLogin(message = "") {
 }
 
 function shell(content) {
+  const switchWarning = dayState?.truckSwitchAttention?.[0];
   app.innerHTML = `
     <section class="driver-shell">
       <div class="driver-language">${languageToggle()}</div>
-      <div class="driver-content">${content}</div>
+      <div class="driver-content">
+        ${switchWarning ? `<div class="truck-switch-attention"><strong>${t("driver.switchAttention", "Samsara truck assignment needs attention")}</strong><span>${escapeHtml(switchWarning.fromTruckPlate || t("driver.previousTruck", "Previous truck"))} to ${escapeHtml(switchWarning.toTruckPlate || t("driver.newTruck", "new truck"))}: ${escapeHtml(switchWarning.error || t("driver.switchRetryHelp", "Reassignment failed. Retry the switch or contact dispatch."))}</span></div>` : ""}
+        ${content}
+      </div>
     </section>
   `;
+}
+
+function truckSwitchAttentionForJob(job) {
+  if (!job?.jobId || job.stopType !== "truck_switch") return null;
+  return (dayState?.truckSwitchAttention || []).find((item) => item.jobId === job.jobId) || null;
 }
 
 function renderNoJob() {
@@ -557,9 +566,13 @@ function renderJob() {
   if (!job) return renderNoJob();
   const isPickup = job.stopType === "pickup";
   const isTravel = job.stopType === "travel";
+  const isTruckSwitch = job.stopType === "truck_switch";
+  const switchAttention = truckSwitchAttentionForJob(job);
   const isStarted = job.status === "in_progress";
-  const typeText = isTravel ? t("driver.travel", "Travel") : isPickup ? t("driver.pickup", "Pickup") : t("driver.dropoff", "Drop Off");
-  const titleText = isTravel ? job.location : (job.location || job.address || t("driver.stop", "Stop"));
+  const typeText = isTruckSwitch ? t("driver.truckSwitch", "Truck Switch") : isTravel ? t("driver.travel", "Travel") : isPickup ? t("driver.pickup", "Pickup") : t("driver.dropoff", "Drop Off");
+  const titleText = isTruckSwitch
+    ? `${job.fromTruckPlate || "-"} to ${job.nextTruckPlate || job.truckPlate || "-"}`
+    : isTravel ? job.location : (job.location || job.address || t("driver.stop", "Stop"));
   const navigationUrl = mapsUrl(job);
   const waitSeconds = completeWaitSeconds(job);
   const confirmDisabled = !canBeginJobConfirmation(job);
@@ -574,24 +587,34 @@ function renderJob() {
         </div>
         <div class="job-head">
           <div class="job-title-row">
-            <span class="job-type ${isTravel ? "travel" : isPickup ? "" : "dropoff"}">${typeText}</span>
+            <span class="job-type ${isTruckSwitch ? "truck-switch" : isTravel ? "travel" : isPickup ? "" : "dropoff"}">${typeText}</span>
             <h2>${escapeHtml(titleText)}</h2>
           </div>
           <button class="rest-toggle" data-action="start-rest" type="button">${t("driver.rest", "Rest")}</button>
         </div>
         <div class="address-block">
           <div>
-            <span>${isTravel ? t("driver.travelDestination", "Travel destination") : isPickup ? t("driver.pickupAddress", "Pickup address / yard") : t("driver.deliveryAddress", "Delivery address")}</span>
+            <span>${isTruckSwitch ? t("driver.switchYard", "Switch yard") : isTravel ? t("driver.travelDestination", "Travel destination") : isPickup ? t("driver.pickupAddress", "Pickup address / yard") : t("driver.deliveryAddress", "Delivery address")}</span>
             <strong>${escapeHtml(job.address || job.location || "")}</strong>
             ${isTravel && job.fromAddress ? `<em>${tf("driver.startAddress", "Start: {address}", { address: escapeHtml(job.fromAddress) })}</em>` : ""}
+            ${isTruckSwitch ? `<em>${t("driver.nextLoad", "Next load")}: ${escapeHtml(job.loadName || job.loadId || "-")} | ${t("driver.parkingSpot", "Parking spot")}: ${escapeHtml(job.parkingSpot || "-")}</em>` : ""}
           </div>
           ${navigationUrl ? `<a class="map-button" href="${navigationUrl}" target="_blank" rel="noopener">${t("driver.maps", "Maps")}</a>` : ""}
         </div>
       </div>
-      ${renderLocationCheck(job)}
-      ${isTravel ? "" : renderOrders(job)}
-      <div class="job-actions">
-        ${isStarted
+      ${isTruckSwitch ? `<section class="truck-switch-summary">
+        <div><span>${t("driver.currentTruck", "Current truck")}</span><strong>${escapeHtml(job.fromTruckPlate || "-")}</strong></div>
+        <div><span>${t("driver.nextTruck", "Next truck")}</span><strong>${escapeHtml(job.nextTruckPlate || job.truckPlate || "-")}</strong></div>
+        <p>${escapeHtml(job.instructions || t("driver.switchInstruction", "Park the current truck and confirm after entering the next truck."))}</p>
+      </section>` : renderLocationCheck(job)}
+      ${isTravel || isTruckSwitch ? "" : renderOrders(job)}
+      <div class="job-actions ${isTruckSwitch ? "truck-switch-job-actions" : ""}">
+        ${isTruckSwitch
+          ? `<div class="truck-switch-action-set">
+              <button class="primary" data-action="confirm-truck-switch" type="button">${switchAttention ? t("driver.retryTruckSwitch", "Retry Samsara & Confirm") : t("driver.confirmTruckSwitch", "Confirm Truck Switch")}</button>
+              <button class="secondary danger-button skip-samsara-button" data-action="skip-samsara-switch" type="button">${t("driver.skipSamsara", "Skip Samsara & Confirm")}</button>
+            </div>`
+          : isStarted
           ? `<button class="primary" data-action="${job.requiredPhotos ? "show-photo" : "complete-job"}" data-job-confirm data-gps-gate="begin" data-ready-label="${t("driver.confirm", "Confirm")}" ${confirmDisabled ? "disabled" : ""} type="button">${waitSeconds > 0 ? tf("driver.waitSeconds", "Wait {seconds}s", { seconds: waitSeconds }) : t("driver.confirm", "Confirm")}</button>`
           : `<button class="primary" data-action="start-job" type="button">${t("common.start", "Start")}</button>`}
         <button class="secondary compact" data-action="refresh" type="button">${t("common.refresh", "Refresh")}</button>
@@ -648,10 +671,11 @@ async function loadDriverHistory({ keepSelection = false } = {}) {
   const params = new URLSearchParams({ limit: "100" });
   if (historyDate) params.set("date", historyDate);
   const result = await request(`/api/driver/history?${params.toString()}`);
-  driverHistory = result.records || [];
-  if (!keepSelection || !driverHistory.some((item) => String(item.id) === String(selectedHistoryId))) {
-    selectedHistoryId = driverHistory[0]?.id || "";
-  }
+  driverHistory = [...(result.records || [])].sort((left, right) =>
+    new Date(left.createdAt || 0) - new Date(right.createdAt || 0)
+      || String(left.id || "").localeCompare(String(right.id || ""))
+  );
+  if (!keepSelection || !driverHistory.some((item) => String(item.id) === String(selectedHistoryId))) selectedHistoryId = "";
   renderDriverHistory();
 }
 
@@ -660,10 +684,6 @@ function historyTypeText(record) {
   if (record.type === "pre_dvir") return t("driver.preTrip", "Pre-Trip");
   if (record.type === "post_dvir") return t("driver.postTrip", "Post-Trip");
   return record.title || t("driver.stop", "Stop");
-}
-
-function selectedHistoryRecord() {
-  return driverHistory.find((record) => String(record.id) === String(selectedHistoryId)) || driverHistory[0] || null;
 }
 
 function renderHistoryPhotos(record) {
@@ -681,7 +701,8 @@ function renderHistoryPhotos(record) {
 }
 
 function renderDriverHistory() {
-  const selected = selectedHistoryRecord();
+  const historyWasVisible = Boolean(app.querySelector(".history-panel"));
+  const previousScrollTop = historyWasVisible ? Number(app.querySelector(".driver-content")?.scrollTop || 0) : 0;
   shell(`
     <section class="history-panel">
       <div class="history-head">
@@ -696,30 +717,39 @@ function renderDriverHistory() {
         <button class="secondary compact" data-action="refresh-history" type="button">${t("common.refresh", "Refresh")}</button>
       </div>
       <div class="history-list">
-        ${driverHistory.map((record) => `
-          <button class="history-record ${String(record.id) === String(selectedHistoryId) ? "active" : ""}" data-action="select-history" data-record="${escapeHtml(record.id)}" type="button">
-            <strong>${escapeHtml(historyTypeText(record))}</strong>
-            <span>${escapeHtml(record.reference || record.truckPlate || "-")}</span>
-            <em>${dateTimeText(record.createdAt)}</em>
-          </button>
-        `).join("") || `<div class="history-empty">${t("driver.noHistory", "No history for this date.")}</div>`}
-      </div>
-      <div class="history-detail">
-        ${selected ? `
-          <div class="history-detail-title">
-            <strong>${escapeHtml(historyTypeText(selected))}</strong>
-            <span>${escapeHtml(localizeMessage(selected.status || ""))}</span>
-          </div>
-          <div class="history-meta">
-            <span>${escapeHtml(planDateText(selected.planDate))}</span>
-            <span>${escapeHtml(selected.truckPlate || "")}</span>
-            <span>${escapeHtml(selected.details?.loadName || selected.details?.samsaraDvirId || "")}</span>
-          </div>
-          ${renderHistoryPhotos(selected)}
-        ` : `<div class="history-empty">${t("driver.selectRecord", "Select one record.")}</div>`}
+        ${driverHistory.map((record) => {
+          const expanded = String(record.id) === String(selectedHistoryId);
+          return `
+          <section class="history-entry ${expanded ? "expanded" : ""}">
+            <button class="history-record ${expanded ? "active" : ""}" data-action="select-history" data-record="${escapeHtml(record.id)}" aria-expanded="${expanded}" type="button">
+              <span class="history-record-copy">
+                <strong>${escapeHtml(historyTypeText(record))}</strong>
+                <span>${escapeHtml(record.reference || record.truckPlate || "-")}</span>
+              </span>
+              <span class="history-record-side">
+                <em>${dateTimeText(record.createdAt)}</em>
+                <span class="history-toggle-symbol" aria-hidden="true">${expanded ? "-" : "+"}</span>
+              </span>
+            </button>
+            ${expanded ? `<div class="history-inline-detail">
+              <div class="history-detail-title">
+                <strong>${escapeHtml(historyTypeText(record))}</strong>
+                <span>${escapeHtml(localizeMessage(record.status || ""))}</span>
+              </div>
+              <div class="history-meta">
+                <span>${escapeHtml(planDateText(record.planDate))}</span>
+                <span>${escapeHtml(record.truckPlate || "")}</span>
+                <span>${escapeHtml(record.details?.loadName || record.details?.samsaraDvirId || "")}</span>
+              </div>
+              ${renderHistoryPhotos(record)}
+            </div>` : ""}
+          </section>`;
+        }).join("") || `<div class="history-empty">${t("driver.noHistory", "No history for this date.")}</div>`}
       </div>
     </section>
   `);
+  const historyScroller = app.querySelector(".driver-content");
+  if (historyScroller) historyScroller.scrollTop = previousScrollTop;
 }
 
 async function loadNextJob() {
@@ -782,6 +812,9 @@ function connectEvents() {
       "dispatch.plan.reopened",
       "driver.job.started",
       "driver.job.completed",
+      "driver.truck.switched",
+      "driver.truck.switch.overridden",
+      "driver.truck.switch.samsara_skipped",
       "driver.rest.started",
       "driver.rest.ended",
       "delivery.order.loaded"
@@ -880,7 +913,8 @@ app.addEventListener("click", async (event) => {
     }
   }
   if (action === "select-history") {
-    selectedHistoryId = button.dataset.record || "";
+    const recordId = button.dataset.record || "";
+    selectedHistoryId = String(selectedHistoryId) === String(recordId) ? "" : recordId;
     return renderDriverHistory();
   }
   if (action === "open-history-photo") {
@@ -1043,6 +1077,61 @@ app.addEventListener("click", async (event) => {
       }
       showToast(error.message);
       renderJob();
+    }
+  }
+  if (action === "confirm-truck-switch" && currentJob?.stopType === "truck_switch") {
+    if (activeRest) {
+      showToast(t("driver.endRestBeforeSwitch", "End rest time before switching trucks."));
+      return renderRest();
+    }
+    button.disabled = true;
+    button.textContent = `${t("driver.confirmTruckSwitch", "Confirm Truck Switch")}...`;
+    try {
+      const result = await request(`/api/driver/jobs/${encodeURIComponent(currentJob.jobId)}/confirm-truck-switch`, {
+        method: "POST",
+        body: JSON.stringify({})
+      });
+      dayState = result.state || dayState;
+      currentJob = result.job || null;
+      locationCheck = null;
+      locationOverrideAccepted = false;
+      renderJob();
+      showToast(t("driver.switchConfirmed", "Truck switch confirmed"));
+    } catch (error) {
+      showToast(`${t("driver.switchFailed", "Truck switch failed")}: ${error.message}`);
+      await loadNextJob().catch(() => renderJob());
+    }
+  }
+  if (action === "skip-samsara-switch" && currentJob?.stopType === "truck_switch") {
+    if (activeRest) {
+      showToast(t("driver.endRestBeforeSwitch", "End rest time before switching trucks."));
+      return renderRest();
+    }
+    const confirmed = window.confirm(tf(
+      "driver.skipSamsaraConfirm",
+      "Skip Samsara assignment and confirm the switch from {from} to {to} in MBBS? Samsara will remain unresolved.",
+      {
+        from: currentJob.fromTruckPlate || "-",
+        to: currentJob.nextTruckPlate || currentJob.truckPlate || "-"
+      }
+    ));
+    if (!confirmed) return;
+    button.disabled = true;
+    button.textContent = `${t("driver.skipSamsara", "Skip Samsara & Confirm")}...`;
+    try {
+      const result = await request(`/api/driver/jobs/${encodeURIComponent(currentJob.jobId)}/skip-samsara`, {
+        method: "POST",
+        body: JSON.stringify({})
+      });
+      dayState = result.state || dayState;
+      currentJob = result.job || null;
+      locationCheck = null;
+      locationOverrideAccepted = false;
+      renderJob();
+      showToast(t("driver.samsaraSkipped", "Truck switch confirmed in MBBS. Samsara was skipped."));
+    } catch (error) {
+      showToast(`${t("driver.skipSamsaraFailed", "Could not skip Samsara")}: ${error.message}`);
+      await loadNextJob().catch(() => renderJob());
     }
   }
   if (action === "complete-job" && currentJob) {

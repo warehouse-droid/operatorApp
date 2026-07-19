@@ -23,13 +23,14 @@ import { runWithAuditContext } from "./audit-context.js";
 import { DispatchPlanDateMismatchError, StaleDispatchPlanSaveError, applyDispatchPlannedAssignment, confirmDispatchPlan, createDispatchPlan, dispatchPlannedAssignmentMap, getCurrentDispatchPlan, getDispatchPlan, getDispatchPlanRevision, getDispatchPlanSnapshot, listDispatchPlanSnapshots, listDispatchPlans, reopenDispatchPlan, restoreDispatchPlanSnapshot, saveDispatchPlanSnapshot } from "./dispatch-plan-repository.js";
 import { DispatchPlanEditLeaseError, acquireDispatchPlanEditLease, assertDispatchPlanEditLease, getDispatchPlanEditLease, heartbeatDispatchPlanEditLease, releaseDispatchPlanEditLease } from "./dispatch-plan-lease-repository.js";
 import { getDispatchStatistics } from "./dispatch-statistics-repository.js";
-import { endDriverRest, ensureDriverSamsaraDutyForJob, getActiveDriverRest, getDriverDayState, getDriverRestSummary, getNextDriverJob, listDriverHistory, listDriverJobStatuses, recordDriverJobPhotos, skipDriverDvirForTesting, startDriverJob, startDriverRest, submitDriverDvir } from "./driver-repository.js";
+import { confirmDriverTruckSwitch, endDriverRest, ensureDriverSamsaraDutyForJob, getActiveDriverRest, getDriverDayState, getDriverRestSummary, getNextDriverJob, listDriverHistory, listDriverJobStatuses, listDriverTruckSwitchAttention, overrideDriverTruckSwitch, recordDriverJobPhotos, skipDriverDvirForTesting, skipDriverTruckSwitchSamsara, startDriverJob, startDriverRest, submitDriverDvir } from "./driver-repository.js";
 import { createSamsaraDriverAuthToken, createSamsaraDriverVehicleAssignment, findSamsaraDriverByUsername, listSamsaraVehicleLocations, setSamsaraDriverDutyStatus, testSamsaraConnection } from "./samsara.js";
 import { createPhotoReadToken, createPhotoUploadToken, isR2PhotoReference, publicPhotoUploadConfig } from "./photo-upload.js";
 import { getPhotoArchiveSettings, isPhotoArchiveRunning, photoArchiveAutoTick, readArchivedPhoto, recoverInterruptedPhotoArchive, runPhotoArchive, updatePhotoArchiveSettings } from "./photo-archive-repository.js";
 import { authenticateDispatchDriver, ensureDispatchFleetSetup, getDispatchDriverByLogin, listDispatchDrivers, listDispatchTrucks, replaceDispatchFleetSetup } from "./dispatch-setup-repository.js";
 import { assertNoActiveConsolidationClaimsByRefs, confirmConsolidationItem, getActiveConsolidationBatch, getSavedConsolidationQueue, packConsolidationOrder, releaseConsolidationBatch, startSavedConsolidationBatch, updateConsolidationLine } from "./delivery-consolidation-repository.js";
 import { DEPENDENCY_YARDS, assertNoActiveOrderDependenciesByRefs, cancelOrderDependency, completeDirectDependenciesForSalesOrderDrop, confirmTransferDependencyBatch, createOrderDependency, enrichDispatchOrdersWithDependencies, generateTransferDependencySuggestion, getDependencyInventoryMatrix, getDirectPickupDependencyExecutionBlock, getOrderDependencyOptions, getSalesOrderDependencyExecutionBlock, getTransferDependencyBatch, listOrderDependencies, listTransferDependencyCandidates, markDirectDependencyPickupCompleted, prepareTransferDependencyPalletItem, reconcileOrderDependency, removeTransferDependencyProposalLine, reopenTransferDependencyCandidate, retryTransferDependencyBatch, reviewTransferDependencyCandidate, syncDirectDependencyOperatorProgress, syncOrderDependenciesForTransferOrder, syncOrderDependenciesFromDispatchPlan, updateOrderDependencyMode, updateTransferDependencyBatch, validateDispatchPlanDependencies } from "./order-dependency-repository.js";
+import { changedLockedLoadAssignments, dispatchLoadAssignment, normalizeDispatchPlanLoadAssignments, validateDispatchLoadAssignments } from "./dispatch-load-assignment.js";
 
 const app = express();
 const dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -76,6 +77,9 @@ const defaultDispatchSetup = {
   },
   samsara: {
     dvirAuthorId: config.samsara.dvirAuthorId || ""
+  },
+  planning: {
+    truckSwitchMinutes: 10
   }
 };
 
@@ -139,6 +143,7 @@ function dispatchOperatorAssignmentMap(plan = {}) {
   for (const truck of plan.trucks || []) {
     for (const load of truck.loads || []) {
       if (load.returnOnly) continue;
+      const loadAssignment = dispatchLoadAssignment(truck, load);
       for (const stop of load.stops || []) {
         if (stop?.type !== "drop" || !stop.orderId) continue;
         const order = orderById.get(String(stop.orderId || ""));
@@ -147,9 +152,9 @@ function dispatchOperatorAssignmentMap(plan = {}) {
         assignments.set(orderRef, [
           order.type,
           plan.planDate || "",
-          truck.plate || "",
+          loadAssignment.truckPlate,
           load.name || "",
-          truck.parkingSpot || ""
+          loadAssignment.parkingSpot
         ].join("|"));
       }
     }
@@ -268,6 +273,40 @@ function sendDispatchDuplicateDriverResponse(res, duplicates = []) {
     code: "DISPATCH_DRIVER_DUPLICATE",
     error: `One driver can only be assigned to one truck${preview ? `: ${preview}` : "."}`,
     duplicates
+  });
+}
+
+async function dispatchLoadAssignmentConflicts(previousPlan = {}, nextPlan = {}, { requireAssignments = false } = {}) {
+  if (!config.dispatch?.driverOrientedPlanning) return [];
+  const setup = await readDispatchSetup();
+  const normalized = normalizeDispatchPlanLoadAssignments(nextPlan);
+  const conflicts = validateDispatchLoadAssignments(normalized, {
+    switchMinutes: setup.planning?.truckSwitchMinutes ?? 10,
+    ownYards: (setup.ownYards || []).map((yard) => String(yard.code || yard.name || "")).filter(Boolean),
+    requireAssignments
+  });
+  if (!previousPlan?.id) return conflicts;
+  const statuses = await listDriverJobStatuses({ planId: previousPlan.id });
+  const lockedLoadIds = new Set(statuses
+    .filter((status) => ["in_progress", "complete"].includes(String(status.status || "")))
+    .map((status) => String(status.load_id || status.loadId || ""))
+    .filter(Boolean));
+  for (const change of changedLockedLoadAssignments(previousPlan, normalized, lockedLoadIds)) {
+    conflicts.push({
+      code: "DISPATCH_ACTIVE_LOAD_LOCKED",
+      message: `${change.previous?.load?.name || change.loadId} has driver activity and cannot change driver, truck, stops, or orders.`,
+      loadId: change.loadId
+    });
+  }
+  return conflicts;
+}
+
+function sendDispatchLoadAssignmentConflictResponse(res, conflicts = []) {
+  const first = conflicts[0] || {};
+  return res.status(409).json({
+    code: first.code || "DISPATCH_DRIVER_TIME_CONFLICT",
+    error: first.message || "Driver or truck assignment is invalid.",
+    conflicts
   });
 }
 
@@ -835,6 +874,7 @@ function dispatchCoAssignments(plan = {}) {
   for (const truck of plan.trucks || []) {
     for (const load of truck.loads || []) {
       if (load.returnOnly) continue;
+      const loadAssignment = dispatchLoadAssignment(truck, load);
       for (const stop of load.stops || []) {
         if (stop?.type !== "drop") continue;
         const coRef = String(stop.orderId || "").trim();
@@ -843,9 +883,9 @@ function dispatchCoAssignments(plan = {}) {
           coRef,
           planId: plan.id || null,
           planDate: String(plan.planDate || "").slice(0, 10),
-          truckPlate: truck.plate || "",
+          truckPlate: loadAssignment.truckPlate,
           loadName: load.name || "",
-          parkingSpot: truck.parkingSpot || ""
+          parkingSpot: loadAssignment.parkingSpot
         });
       }
     }
@@ -955,8 +995,19 @@ function monitorLoadForTruck(plan, truck, driverJobStatuses = []) {
   if (!plan || !truck) return null;
   const ordersById = new Map((plan.orders || []).map((order) => [String(order.id || ""), order]));
   const plate = normalizedPlate(truck.plate);
-  const loads = Array.isArray(truck.loads) ? truck.loads : [];
-  for (const load of loads) {
+  const loads = [];
+  for (const parentTruck of plan.trucks || []) {
+    for (const load of parentTruck.loads || []) {
+      const assignment = dispatchLoadAssignment(parentTruck, load);
+      if (normalizedPlate(assignment.truckPlate) === plate) loads.push({ parentTruck, load, assignment });
+    }
+  }
+  loads.sort((left, right) =>
+    (left.assignment.plannedStartMinute ?? Number.MAX_SAFE_INTEGER) - (right.assignment.plannedStartMinute ?? Number.MAX_SAFE_INTEGER)
+      || left.assignment.driverSequence - right.assignment.driverSequence
+  );
+  for (const entry of loads) {
+    const { load, assignment } = entry;
     const loadStatuses = driverJobStatuses.filter((record) =>
       normalizedPlate(record.truck_plate || record.truckPlate) === plate
       && String(record.load_id || record.loadId || "") === String(load.id || "")
@@ -964,13 +1015,19 @@ function monitorLoadForTruck(plan, truck, driverJobStatuses = []) {
     const statusByStop = new Map(loadStatuses.map((record) => [String(record.stop_id || record.stopId || ""), record.status || ""]));
     const plannedStops = Array.isArray(load.stops) ? load.stops : [];
     const started = loadStatuses.some((record) => ["in_progress", "complete"].includes(record.status));
-    const complete = plannedStops.length > 0 && plannedStops.every((stop) => statusByStop.get(String(stop.id || "")) === "complete");
+    const complete = load.returnOnly
+      ? loadStatuses.length > 0 && loadStatuses.every((record) => record.status === "complete")
+      : plannedStops.length > 0 && plannedStops.every((stop) => statusByStop.get(String(stop.id || "")) === "complete");
     if (!started || complete) continue;
     const orderIds = [...new Set(plannedStops.map((stop) => String(stop.orderId || "")).filter(Boolean))];
     const currentStatus = loadStatuses.find((record) => record.status === "in_progress") || null;
     return {
       loadId: load.id || "",
       loadName: load.name || "Load",
+      driver: assignment.driverName || "",
+      driverLogin: assignment.driverLogin || "",
+      truckPlate: assignment.truckPlate || truck.plate || "",
+      parkingSpot: assignment.parkingSpot || "",
       status: currentStatus ? "in_progress" : "started",
       orderIds,
       orders: orderIds.map((id) => monitorOrderSummary(ordersById.get(id))).filter(Boolean),
@@ -1706,6 +1763,13 @@ async function readDispatchSetup() {
     samsara: {
       ...defaultDispatchSetup.samsara,
       ...(saved.samsara || {})
+    },
+    planning: {
+      ...defaultDispatchSetup.planning,
+      ...(saved.planning || {}),
+      truckSwitchMinutes: Math.max(0, Math.round(Number.isFinite(Number(saved.planning?.truckSwitchMinutes))
+        ? Number(saved.planning.truckSwitchMinutes)
+        : defaultDispatchSetup.planning.truckSwitchMinutes))
     }
   };
 }
@@ -1753,7 +1817,16 @@ async function writeDispatchSetup(patch = {}) {
   const configPayload = {
     ownYards: Array.isArray(patch.ownYards) ? patch.ownYards : current.ownYards,
     sync: patch.sync ? normalizeSyncSettings({ ...current.sync, ...patch.sync }) : current.sync,
-    samsara: patch.samsara ? { ...current.samsara, ...patch.samsara } : current.samsara
+    samsara: patch.samsara ? { ...current.samsara, ...patch.samsara } : current.samsara,
+    planning: patch.planning
+      ? {
+          ...current.planning,
+          ...patch.planning,
+          truckSwitchMinutes: Math.max(0, Math.round(Number.isFinite(Number(patch.planning.truckSwitchMinutes))
+            ? Number(patch.planning.truckSwitchMinutes)
+            : Number(current.planning?.truckSwitchMinutes ?? 10)))
+        }
+      : current.planning
   };
   const payload = {
     ...configPayload,
@@ -3440,7 +3513,8 @@ app.use("/api/dispatch", requireOperator, requireDispatchAccess);
 
 app.get("/api/dispatch/config", (req, res) => {
   res.json({
-    googleMapsApiKey: config.googleMapsApiKey
+    googleMapsApiKey: config.googleMapsApiKey,
+    driverOrientedPlanning: Boolean(config.dispatch?.driverOrientedPlanning)
   });
 });
 
@@ -3452,6 +3526,24 @@ app.get("/api/dispatch/monitor", async (req, res, next) => {
     const setup = await readDispatchSetup();
     const plan = await getCurrentDispatchPlan({ planDate });
     const driverJobStatuses = plan?.id ? await listDriverJobStatuses({ planId: plan.id }) : [];
+    const truckSwitchAttention = plan?.id ? await listDriverTruckSwitchAttention({ planId: plan.id }) : [];
+    const switchAttentionByPlate = new Map(truckSwitchAttention.map((item) => [normalizedPlate(item.to_truck_plate), item]));
+    const currentDriverResult = await query(
+      `SELECT DISTINCT ON (upper(COALESCE(NULLIF(current_truck_plate, ''), truck_plate)))
+              driver_login,
+              COALESCE(NULLIF(current_truck_plate, ''), truck_plate) AS truck_plate,
+              current_load_id,
+              updated_at
+         FROM driver_day_records
+        WHERE plan_date = $1::date
+          AND on_duty_at IS NOT NULL
+          AND off_duty_at IS NULL
+          AND COALESCE(NULLIF(current_truck_plate, ''), truck_plate, '') <> ''
+        ORDER BY upper(COALESCE(NULLIF(current_truck_plate, ''), truck_plate)), updated_at DESC`,
+      [planDate]
+    );
+    const currentDriverByPlate = new Map(currentDriverResult.rows.map((item) => [normalizedPlate(item.truck_plate), item]));
+    const driverNameByLogin = new Map((setup.drivers || []).map((driver) => [String(driver.login || "").trim().toLowerCase(), driver.name || driver.login || ""]));
     const currentTruckMap = new Map();
     for (const truck of setup.trucks || []) {
       const plate = String(truck.plate || "").trim();
@@ -3466,10 +3558,15 @@ app.get("/api/dispatch/monitor", async (req, res, next) => {
       samsaraError = error.message;
     }
     const locationByPlate = new Map(locations.map((location) => [normalizedPlate(location.plate), location]));
-    const planTruckByPlate = new Map((plan?.trucks || []).map((truck) => [normalizedPlate(truck.plate), truck]));
     let trucks = [...currentTruckMap.values()].map((truck) => {
-      const planTruck = planTruckByPlate.get(normalizedPlate(truck.plate)) || truck;
       const location = locationByPlate.get(normalizedPlate(truck.plate)) || {};
+      const activeLoad = monitorLoadForTruck(plan, truck, driverJobStatuses);
+      const currentDriver = currentDriverByPlate.get(normalizedPlate(truck.plate)) || null;
+      const plannedAssignment = (plan?.trucks || []).flatMap((parentTruck) => (parentTruck.loads || []).map((load) => ({
+        parentTruck,
+        load,
+        assignment: dispatchLoadAssignment(parentTruck, load)
+      }))).find((entry) => normalizedPlate(entry.assignment.truckPlate) === normalizedPlate(truck.plate));
       return {
         plate: truck.plate || "",
         vehicleId: location.vehicleId || "",
@@ -3480,11 +3577,12 @@ app.get("/api/dispatch/monitor", async (req, res, next) => {
         speedMilesPerHour: location.speedMilesPerHour || 0,
         formattedLocation: location.formattedLocation || "",
         locationTime: location.time || "",
-        driver: planTruck.driver || "",
-        driverLogin: planTruck.driverLogin || "",
-        base: planTruck.base || truck.base || "",
-        parkingSpot: planTruck.parkingSpot || "",
-        activeLoad: monitorLoadForTruck(plan, planTruck, driverJobStatuses)
+        driver: activeLoad?.driver || driverNameByLogin.get(String(currentDriver?.driver_login || "").toLowerCase()) || currentDriver?.driver_login || "",
+        driverLogin: activeLoad?.driverLogin || currentDriver?.driver_login || "",
+        base: plannedAssignment?.assignment?.switchYard || truck.base || "",
+        parkingSpot: activeLoad?.parkingSpot || plannedAssignment?.assignment?.parkingSpot || "",
+        activeLoad,
+        truckSwitchAttention: switchAttentionByPlate.get(normalizedPlate(truck.plate)) || null
       };
     });
     await recordTruckLocationHistory(trucks).catch(() => null);
@@ -3713,7 +3811,18 @@ app.post("/api/dispatch/plan-snapshots/:snapshotId/restore", requireOperator, re
     const beforePlan = await getDispatchPlanSnapshot(req.params.snapshotId);
     if (!beforePlan) return res.status(404).json({ error: "Dispatch snapshot not found" });
     await requireDispatchPlanEditLease(req, beforePlan.planDate);
-    const dependencyConflicts = await validateDispatchPlanDependencies(beforePlan);
+    const currentPlanBeforeRestore = await getDispatchPlan(beforePlan.planId);
+    const restoreCandidate = normalizeDispatchPlanLoadAssignments({
+      ...currentPlanBeforeRestore,
+      planDate: beforePlan.planDate,
+      orders: beforePlan.orders || [],
+      trucks: beforePlan.rawTrucks || []
+    });
+    const assignmentConflicts = await dispatchLoadAssignmentConflicts(currentPlanBeforeRestore, restoreCandidate, {
+      requireAssignments: String(currentPlanBeforeRestore?.status || "") === "confirmed"
+    });
+    if (assignmentConflicts.length) return sendDispatchLoadAssignmentConflictResponse(res, assignmentConflicts);
+    const dependencyConflicts = await validateDispatchPlanDependencies(restoreCandidate);
     if (dependencyConflicts.length) return sendDispatchDependencyConflictResponse(res, dependencyConflicts);
     const restored = await restoreDispatchPlanSnapshot(req.params.snapshotId, {
       sessionId: req.body?.audit?.sessionId || ""
@@ -3825,10 +3934,13 @@ app.put("/api/dispatch/plans/:id", requireOperator, requireDispatcher, async (re
     const cleanOrders = saveMode === "truck_sequence" && previousPlan
       ? sanitizeDispatchPlanOrders(previousPlan.orders || [])
       : requestedOrders;
-    const cleanTrucks = saveMode === "truck_sequence" && previousPlan
+    let cleanTrucks = saveMode === "truck_sequence" && previousPlan
       ? mergeDispatchTruckSequence(previousPlan.trucks || [], requestedTrucks)
       : requestedTrucks;
-    const duplicateDrivers = dispatchDuplicateDriverAssignments(cleanTrucks);
+    if (config.dispatch?.driverOrientedPlanning) {
+      cleanTrucks = normalizeDispatchPlanLoadAssignments({ ...previousPlan, trucks: cleanTrucks }).trucks;
+    }
+    const duplicateDrivers = config.dispatch?.driverOrientedPlanning ? [] : dispatchDuplicateDriverAssignments(cleanTrucks);
     if (duplicateDrivers.length) return sendDispatchDuplicateDriverResponse(res, duplicateDrivers);
     await assertNoConsolidationStructureConflict(previousPlan, { orders: cleanOrders });
     const explicitOperatorAlertRefs = Array.isArray(req.body?.audit?.details?.operatorAlertRefs)
@@ -3866,6 +3978,13 @@ app.put("/api/dispatch/plans/:id", requireOperator, requireDispatcher, async (re
       trucks: cleanTrucks
     });
     if (dependencyConflicts.length) return sendDispatchDependencyConflictResponse(res, dependencyConflicts);
+    const assignmentConflicts = await dispatchLoadAssignmentConflicts(previousPlan, {
+      ...previousPlan,
+      planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date,
+      orders: cleanOrders,
+      trucks: cleanTrucks
+    });
+    if (assignmentConflicts.length) return sendDispatchLoadAssignmentConflictResponse(res, assignmentConflicts);
     const plan = await saveDispatchPlanSnapshot(req.params.id, {
       orders: cleanOrders,
       trucks: cleanTrucks,
@@ -3983,8 +4102,11 @@ app.post("/api/dispatch/plans/:id/confirm", requireOperator, requireDispatcher, 
         });
       }
       const requestedOrders = sanitizeDispatchPlanOrders(Array.isArray(req.body?.orders) ? req.body.orders : previousPlan.orders || []);
-      const requestedTrucks = Array.isArray(req.body?.trucks) ? req.body.trucks : previousPlan.trucks || [];
-      const duplicateDrivers = dispatchDuplicateDriverAssignments(requestedTrucks);
+      let requestedTrucks = Array.isArray(req.body?.trucks) ? req.body.trucks : previousPlan.trucks || [];
+      if (config.dispatch?.driverOrientedPlanning) {
+        requestedTrucks = normalizeDispatchPlanLoadAssignments({ ...previousPlan, trucks: requestedTrucks }).trucks;
+      }
+      const duplicateDrivers = config.dispatch?.driverOrientedPlanning ? [] : dispatchDuplicateDriverAssignments(requestedTrucks);
       if (duplicateDrivers.length) return sendDispatchDuplicateDriverResponse(res, duplicateDrivers);
       await assertNoConsolidationStructureConflict(previousPlan, { orders: requestedOrders });
       const dateConflicts = await findNewDispatchPlanDateConflicts(previousPlan || {}, {
@@ -4008,6 +4130,13 @@ app.post("/api/dispatch/plans/:id/confirm", requireOperator, requireDispatcher, 
         trucks: requestedTrucks
       });
       if (dependencyConflicts.length) return sendDispatchDependencyConflictResponse(res, dependencyConflicts);
+      const assignmentConflicts = await dispatchLoadAssignmentConflicts(previousPlan, {
+        ...previousPlan,
+        planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date,
+        orders: requestedOrders,
+        trucks: requestedTrucks
+      }, { requireAssignments: true });
+      if (assignmentConflicts.length) return sendDispatchLoadAssignmentConflictResponse(res, assignmentConflicts);
       if (dispatchPlanDataChanged(
         { orders: previousPlan.orders || [], trucks: previousPlan.trucks || [] },
         { orders: requestedOrders, trucks: requestedTrucks }
@@ -4022,8 +4151,10 @@ app.post("/api/dispatch/plans/:id/confirm", requireOperator, requireDispatcher, 
         });
       }
     }
-    const duplicateDrivers = dispatchDuplicateDriverAssignments(planForConfirm?.trucks || []);
+    const duplicateDrivers = config.dispatch?.driverOrientedPlanning ? [] : dispatchDuplicateDriverAssignments(planForConfirm?.trucks || []);
     if (duplicateDrivers.length) return sendDispatchDuplicateDriverResponse(res, duplicateDrivers);
+    const finalAssignmentConflicts = await dispatchLoadAssignmentConflicts(previousPlan, planForConfirm, { requireAssignments: true });
+    if (finalAssignmentConflicts.length) return sendDispatchLoadAssignmentConflictResponse(res, finalAssignmentConflicts);
     const finalDependencyConflicts = await validateDispatchPlanDependencies(planForConfirm);
     if (finalDependencyConflicts.length) return sendDispatchDependencyConflictResponse(res, finalDependencyConflicts);
     const plan = await confirmDispatchPlan(req.params.id, { note: req.body?.note || "" });
@@ -4155,7 +4286,8 @@ app.put("/api/dispatch/setup", async (req, res, next) => {
       drivers: Array.isArray(req.body?.drivers) ? req.body.drivers : [],
       trucks: Array.isArray(req.body?.trucks) ? req.body.trucks : [],
       ownYards: Array.isArray(req.body?.ownYards) ? req.body.ownYards : undefined,
-      samsara: req.body?.samsara || undefined
+      samsara: req.body?.samsara || undefined,
+      planning: req.body?.planning || undefined
     });
     emitAppEvent("dispatch.setup.updated", { driverCount: payload.drivers.length, truckCount: payload.trucks.length });
     res.json(payload);
@@ -5471,10 +5603,13 @@ app.put("/api/dispatch/plan", async (req, res, next) => {
     const cleanOrders = saveMode === "truck_sequence" && previousPlan
       ? sanitizeDispatchPlanOrders(previousPlan.orders || [])
       : requestedOrders;
-    const cleanTrucks = saveMode === "truck_sequence" && previousPlan
+    let cleanTrucks = saveMode === "truck_sequence" && previousPlan
       ? mergeDispatchTruckSequence(previousPlan.trucks || [], requestedTrucks)
       : requestedTrucks;
-    const duplicateDrivers = dispatchDuplicateDriverAssignments(cleanTrucks);
+    if (config.dispatch?.driverOrientedPlanning) {
+      cleanTrucks = normalizeDispatchPlanLoadAssignments({ ...previousPlan, trucks: cleanTrucks }).trucks;
+    }
+    const duplicateDrivers = config.dispatch?.driverOrientedPlanning ? [] : dispatchDuplicateDriverAssignments(cleanTrucks);
     if (duplicateDrivers.length) return sendDispatchDuplicateDriverResponse(res, duplicateDrivers);
     const payload = {
       savedAt: new Date().toISOString(),
@@ -5516,6 +5651,13 @@ app.put("/api/dispatch/plan", async (req, res, next) => {
       trucks: payload.trucks
     });
     if (dependencyConflicts.length) return sendDispatchDependencyConflictResponse(res, dependencyConflicts);
+    const assignmentConflicts = await dispatchLoadAssignmentConflicts(previousPlan, {
+      ...previousPlan,
+      planDate: plan.planDate || planDate,
+      orders: payload.orders,
+      trucks: payload.trucks
+    });
+    if (assignmentConflicts.length) return sendDispatchLoadAssignmentConflictResponse(res, assignmentConflicts);
     const savedPlan = await saveDispatchPlanSnapshot(plan.id, {
       orders: payload.orders,
       trucks: payload.trucks,
@@ -6181,6 +6323,9 @@ app.post("/api/driver/jobs/:jobId/start", requireDriver, async (req, res, next) 
     if (activeRest) return res.status(409).json({ error: "End rest time before starting the next job.", rest: activeRest });
     const job = await getNextDriverJob(req.driverLogin);
     if (!job || job.jobId !== req.params.jobId) return res.status(409).json({ error: "This is no longer the next assigned job. Refresh and try again." });
+    if (job.stopType === "truck_switch") {
+      return res.status(409).json({ error: "Confirm the truck switch with the dedicated Switch Truck action." });
+    }
     if (job.stopType === "pickup" || job.stopType === "dropoff") {
       const dependencyBlock = await getSalesOrderDependencyExecutionBlock(job.orderRefs || []);
       if (dependencyBlock) return res.status(409).json({ error: dependencyBlock.message, dependencyBlock });
@@ -6191,11 +6336,144 @@ app.post("/api/driver/jobs/:jobId/start", requireDriver, async (req, res, next) 
       }
     }
     const samsaraHandoff = await ensureDriverSamsaraDutyForJob(req.driverLogin, {
-      samsaraAccounts: samsaraAccountsForDriver(req.driver)
+      samsaraAccounts: samsaraAccountsForDriver(req.driver),
+      job
     });
     const record = await startDriverJob(req.driverLogin, req.params.jobId, { job });
     emitAppEvent("driver.job.started", { driverLogin: req.driverLogin, jobId: req.params.jobId, stopType: job.stopType, orderRefs: job.orderRefs || [], samsaraHandoff });
     res.json({ record, job: await getNextDriverJob(req.driverLogin), samsaraHandoff });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/driver/jobs/:jobId/confirm-truck-switch", requireDriver, async (req, res, next) => {
+  try {
+    const activeRest = await getActiveDriverRest(req.driverLogin);
+    if (activeRest) return res.status(409).json({ error: "End rest time before switching trucks.", rest: activeRest });
+    const job = await getNextDriverJob(req.driverLogin);
+    if (!job || job.jobId !== req.params.jobId || job.stopType !== "truck_switch") {
+      return res.status(409).json({ error: "This is no longer the next assigned truck switch. Refresh and try again." });
+    }
+    const result = await confirmDriverTruckSwitch(req.driverLogin, job, {
+      samsaraAccounts: samsaraAccountsForDriver(req.driver)
+    });
+    await writeDispatchAudit({
+      action: "driver_truck_switch_confirmed",
+      entityType: "driver_job",
+      entityId: job.jobId,
+      planId: job.planId,
+      planDate: job.planDate,
+      operatorName: req.driverLogin,
+      source: "driver",
+      details: {
+        driverLogin: req.driverLogin,
+        fromTruckPlate: job.fromTruckPlate || "",
+        toTruckPlate: job.nextTruckPlate || job.truckPlate || "",
+        switchYard: job.switchYard || "",
+        nextLoadId: job.loadId || "",
+        samsaraAccountHandoff: Boolean(result.samsaraHandoff?.switched)
+      }
+    }).catch(() => null);
+    let nextJob = await getNextDriverJob(req.driverLogin);
+    if (nextJob && nextJob.stopType !== "truck_switch") {
+      await startDriverJob(req.driverLogin, nextJob.jobId, { job: nextJob });
+      nextJob = await getNextDriverJob(req.driverLogin);
+    }
+    const state = await getDriverDayState(req.driverLogin, { samsaraAccounts: samsaraAccountsForDriver(req.driver) });
+    emitAppEvent("driver.truck.switched", {
+      driverLogin: req.driverLogin,
+      jobId: job.jobId,
+      fromTruckPlate: job.fromTruckPlate,
+      truckPlate: job.nextTruckPlate || job.truckPlate,
+      nextLoadId: job.loadId
+    });
+    res.json({ ...result, job: nextJob, state });
+  } catch (error) {
+    await writeDispatchAudit({
+      action: "driver_truck_switch_failed",
+      entityType: "driver_job",
+      entityId: req.params.jobId,
+      operatorName: req.driverLogin,
+      source: "driver",
+      details: { driverLogin: req.driverLogin, error: error.message }
+    }).catch(() => null);
+    emitAppEvent("driver.truck.switch.attention", { driverLogin: req.driverLogin, jobId: req.params.jobId, error: error.message });
+    next(error);
+  }
+});
+
+app.post("/api/driver/jobs/:jobId/skip-samsara", requireDriver, async (req, res, next) => {
+  try {
+    const activeRest = await getActiveDriverRest(req.driverLogin);
+    if (activeRest) return res.status(409).json({ error: "End rest time before switching trucks.", rest: activeRest });
+    const job = await getNextDriverJob(req.driverLogin);
+    if (!job || job.jobId !== req.params.jobId || job.stopType !== "truck_switch") {
+      return res.status(409).json({ error: "This is no longer the next assigned truck switch. Refresh and try again." });
+    }
+    const reason = "Driver skipped Samsara truck assignment.";
+    const result = await skipDriverTruckSwitchSamsara(job.jobId, req.driverLogin, { reason, job });
+    await writeDispatchAudit({
+      action: "driver_truck_switch_samsara_skipped",
+      entityType: "driver_job",
+      entityId: job.jobId,
+      planId: job.planId,
+      planDate: job.planDate,
+      operatorName: req.driverLogin,
+      source: "driver",
+      details: {
+        driverLogin: req.driverLogin,
+        fromTruckPlate: job.fromTruckPlate || "",
+        toTruckPlate: job.nextTruckPlate || job.truckPlate || "",
+        switchYard: job.switchYard || "",
+        nextLoadId: job.loadId || "",
+        samsaraError: result.switchRecord?.samsara_error || "",
+        reason
+      }
+    }).catch(() => null);
+    let nextJob = await getNextDriverJob(req.driverLogin);
+    if (nextJob && nextJob.stopType !== "truck_switch") {
+      await startDriverJob(req.driverLogin, nextJob.jobId, { job: nextJob });
+      nextJob = await getNextDriverJob(req.driverLogin);
+    }
+    const state = await getDriverDayState(req.driverLogin, { samsaraAccounts: samsaraAccountsForDriver(req.driver) });
+    emitAppEvent("driver.truck.switch.samsara_skipped", {
+      driverLogin: req.driverLogin,
+      jobId: job.jobId,
+      fromTruckPlate: job.fromTruckPlate || "",
+      truckPlate: job.nextTruckPlate || job.truckPlate || "",
+      nextLoadId: job.loadId || ""
+    });
+    res.json({ ...result, job: nextJob, state });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/dispatch/driver-truck-switches/attention", requireOperator, requireDispatcher, async (req, res, next) => {
+  try {
+    res.json(await listDriverTruckSwitchAttention({ planId: req.query.planId || null }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/dispatch/driver-truck-switches/:jobId/override", requireOperator, requireDispatcher, async (req, res, next) => {
+  try {
+    const result = await overrideDriverTruckSwitch(req.params.jobId, {
+      actor: req.operator?.login || req.operator?.username || req.operator?.name || "dispatcher",
+      reason: req.body?.reason || "Dispatcher override"
+    });
+    await writeDispatchAudit({
+      action: "dispatch_driver_truck_switch_overridden",
+      entityType: "driver_job",
+      entityId: req.params.jobId,
+      actorType: "operator",
+      actorId: req.operator?.id,
+      details: { reason: req.body?.reason || "Dispatcher override", switchRecord: result.switchRecord }
+    }).catch(() => null);
+    emitAppEvent("driver.truck.switch.overridden", { jobId: req.params.jobId, driverLogin: result.switchRecord?.driver_login || "" });
+    res.json(result);
   } catch (error) {
     next(error);
   }
@@ -6264,9 +6542,10 @@ app.post("/api/driver/jobs/:jobId/photos", requireDriver, async (req, res, next)
     if (nextJob && req.body?.autoStartRest === true) {
       rest = await startDriverRest(req.driverLogin, { nextJob });
       emitAppEvent("driver.rest.started", { driverLogin: req.driverLogin, restId: rest.restId, nextJobId: rest.nextJobId || null });
-    } else if (nextJob && req.body?.autoStartNext !== false) {
+    } else if (nextJob && nextJob.stopType !== "truck_switch" && req.body?.autoStartNext !== false) {
       await ensureDriverSamsaraDutyForJob(req.driverLogin, {
-        samsaraAccounts: samsaraAccountsForDriver(req.driver)
+        samsaraAccounts: samsaraAccountsForDriver(req.driver),
+        job: nextJob
       });
       await startDriverJob(req.driverLogin, nextJob.jobId, { job: nextJob });
       nextJob = await getNextDriverJob(req.driverLogin);

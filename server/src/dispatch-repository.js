@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { pool, query, withTransaction } from "./db.js";
+import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
 import { isNetSuiteSandboxEnvironment } from "./config.js";
 import {
   createPurchaseOrderDispatchEnricher,
@@ -3355,6 +3356,7 @@ export async function syncScmScheduleFromDispatchPlan(plan, { updatedBy = "dispa
   for (const truck of plan.trucks || []) {
     for (const load of truck.loads || []) {
       if (load.returnOnly) continue;
+      const assignment = dispatchLoadAssignment(truck, load);
       for (const stop of load.stops || []) {
         if (stop.type !== "drop" || !stop.orderId) continue;
         const order = (plan.orders || []).find((item) => item.id === stop.orderId);
@@ -3362,10 +3364,10 @@ export async function syncScmScheduleFromDispatchPlan(plan, { updatedBy = "dispa
         plannedRows.push({
           orderRef: order.id,
           orderKind: order.sourceTable === "scm_vrma_orders" ? "VRMA" : order.type === "TO" ? "TO" : "PO",
-          truckPlate: truck.plate || "",
-          driver: truck.driverName || truck.driver || "",
+          truckPlate: assignment.truckPlate,
+          driver: assignment.driverName,
           loadName: load.name || "",
-          parkingSpot: load.parkingSpot || truck.parkingSpot || "",
+          parkingSpot: assignment.parkingSpot,
           etaDate: plan.planDate,
           etaTime: stop.arriveTime || stop.plannedArrive || ""
         });

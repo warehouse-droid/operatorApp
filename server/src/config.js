@@ -31,6 +31,9 @@ function buildConfig(env) {
     appBaseUrl: env.APP_BASE_URL || "http://localhost:3000",
     databaseUrl: env.DATABASE_URL,
     googleMapsApiKey: env.GOOGLE_MAPS_API_KEY || "",
+    dispatch: {
+      driverOrientedPlanning: ["1", "true", "yes", "on"].includes(String(env.DISPATCH_DRIVER_ORIENTED_PLANNING ?? "false").trim().toLowerCase())
+    },
     transferDependency: {
       westYardPenaltyMinutes: Number(env.TRANSFER_DEPENDENCY_150_PENALTY_MINUTES || 60),
       employeeId: String(env.TRANSFER_DEPENDENCY_EMPLOYEE_ID || "8721"),
@@ -74,6 +77,7 @@ function replaceConfig(target, next) {
   target.appBaseUrl = next.appBaseUrl;
   target.databaseUrl = next.databaseUrl;
   target.googleMapsApiKey = next.googleMapsApiKey;
+  target.dispatch = { ...next.dispatch };
   target.transferDependency = { ...next.transferDependency };
   target.samsara = { ...next.samsara };
   target.ollama = { ...next.ollama };
