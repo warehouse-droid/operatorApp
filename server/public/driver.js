@@ -274,7 +274,6 @@ async function uploadDriverPhoto(photo, context = {}) {
     method: "POST",
     body: JSON.stringify(context)
   });
-  if (ticket.provider === "local_data_url") return photo;
   const file = dataUrlToFile(photo, context.filename || `${context.recordType || "driver-photo"}.jpg`);
   const formData = new FormData();
   formData.append("file", file);

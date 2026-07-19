@@ -27,7 +27,7 @@ const RECORD_TYPES = new Set([
 export function photoUploadSettings() {
   const workerUrl = String(config.photoUpload?.workerUrl || "").replace(/\/+$/, "");
   return {
-    provider: String(config.photoUpload?.provider || "local_data_url").trim().toLowerCase(),
+    provider: config.photoUpload?.provider || "local_data_url",
     workerUrl,
     uploadUrl: workerUrl ? `${workerUrl}/upload` : "",
     healthUrl: workerUrl ? `${workerUrl}/health` : "",
@@ -42,17 +42,6 @@ export function photoUploadSettings() {
 export function createPhotoUploadToken({ actor, source, recordType, metadata = {}, options = {} } = {}) {
   const settings = photoUploadSettings();
   const secret = config.photoUpload?.tokenSecret || "";
-  if (settings.provider === "local_data_url") {
-    return {
-      provider: "local_data_url",
-      uploadUrl: "",
-      token: "",
-      maxBytes: settings.maxBytes,
-      maxMb: settings.maxMb,
-      allowedTypes: settings.allowedTypes,
-      publicBaseUrl: ""
-    };
-  }
   if (!settings.uploadUrl) throw httpError(503, "PHOTO_UPLOAD_WORKER_URL is not configured.");
   if (!secret) throw httpError(503, "PHOTO_UPLOAD_TOKEN_SECRET is not configured.");
 
@@ -190,7 +179,7 @@ export function isR2PhotoReference(value) {
 export function publicPhotoUploadConfig() {
   const settings = photoUploadSettings();
   return {
-    provider: settings.provider,
+    provider: config.photoUpload?.provider || "local_data_url",
     workerConfigured: Boolean(settings.uploadUrl),
     uploadUrl: settings.uploadUrl,
     tokenTtlMinutes: settings.tokenTtlMinutes,

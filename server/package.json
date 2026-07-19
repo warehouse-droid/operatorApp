@@ -19,6 +19,8 @@
     "test:driver-rest": "node src/driver-rest-harness.js",
     "test:driver-gps-gate": "node src/driver-gps-gate-harness.js",
     "test:pwa-i18n": "node src/pwa-i18n-harness.js",
+    "test:operator-camera-schedule": "node src/operator-camera-schedule-harness.js",
+    "test:scm-weight-schedule": "node src/scm-weight-schedule-harness.js",
     "test:multi-photo-pallet": "node src/multi-photo-pallet-harness.js",
     "test:photo-upload": "node src/photo-upload-harness.js",
     "test:scm-vrma": "node src/scm-vrma-harness.js",

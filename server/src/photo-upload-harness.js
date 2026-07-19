@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { config } from "./config.js";
-import { createPhotoUploadToken, publicPhotoUploadConfig } from "./photo-upload.js";
+import { createPhotoReadToken, createPhotoUploadToken, publicPhotoUploadConfig } from "./photo-upload.js";
 
 const original = { ...config.photoUpload };
 
@@ -11,14 +11,11 @@ try {
     workerUrl: "",
     tokenSecret: ""
   };
-  const localTicket = createPhotoUploadToken({
+  assert.throws(() => createPhotoUploadToken({
     actor: { login: "test-driver", role: "driver" },
     source: "driver",
     recordType: "driver-stop-photo"
-  });
-  assert.equal(localTicket.provider, "local_data_url");
-  assert.equal(localTicket.uploadUrl, "");
-  assert.equal(localTicket.token, "");
+  }), /PHOTO_UPLOAD_WORKER_URL is not configured/);
   assert.equal(publicPhotoUploadConfig().workerConfigured, false);
 
   config.photoUpload = {
@@ -38,7 +35,14 @@ try {
   assert.equal(r2Ticket.token.split(".").length, 3);
   assert.equal(publicPhotoUploadConfig().workerConfigured, true);
 
-  console.log(JSON.stringify({ ok: true, tests: 8, providers: [localTicket.provider, r2Ticket.provider] }));
+  const readTicket = createPhotoReadToken({
+    actor: { login: "test-driver", role: "driver" },
+    key: "driver/driver-stop-photo/2026/07/18/TEST/photo.jpg"
+  });
+  assert.equal(readTicket.objectUrl, "https://photos.example.test/object?key=driver%2Fdriver-stop-photo%2F2026%2F07%2F18%2FTEST%2Fphoto.jpg");
+  assert.equal(readTicket.token.split(".").length, 3);
+
+  console.log(JSON.stringify({ ok: true, tests: 8, provider: r2Ticket.provider, readKey: readTicket.key }));
 } finally {
   config.photoUpload = original;
 }

@@ -135,8 +135,10 @@ function lineRequiredSalesQuantity(line) {
 }
 
 function linePackedSalesQuantity(line) {
-  if (!hasConversion(line) && positiveQuantity(line.packed_sales_qty) > 0) {
-    return positiveQuantity(line.packed_sales_qty);
+  if (!hasConversion(line)) {
+    const packedSalesQty = positiveQuantity(line.packed_sales_qty);
+    if (packedSalesQty > 0) return packedSalesQty;
+    if (!isLegacySalesQuantityOnlyLine(line)) return 0;
   }
   return lineUnitsToSalesQuantity(line, {
     pallets: line.packed_pallet_qty,
@@ -150,8 +152,16 @@ function lineLoadedSalesQuantity(line) {
   return positiveQuantity(line.loaded_qty);
 }
 
+function isPalletSalesItem(line) {
+  return String(line?.sku || line?.item_name || "").trim().toUpperCase() === "PALLET";
+}
+
+function isLegacySalesQuantityOnlyLine(line) {
+  return !hasConversion(line) && (isPalletSalesItem(line) || !hasRequiredCustomQuantity(line));
+}
+
 function isSalesQuantityOnlyLine(line) {
-  return !hasConversion(line) && !hasRequiredCustomQuantity(line);
+  return !hasConversion(line) && positiveQuantity(line.quantity) > 0;
 }
 
 function resolveSalesOnlyPackedQuantity(line, values = {}, { absolute = false } = {}) {
@@ -193,6 +203,7 @@ function wholeUnitsFromSalesQuantity(salesQuantity, conversion) {
 function orderFamily(order) {
   if (order?.order_type === "transfer_order") return "transfer_order";
   if (order?.order_type === "vrma_order") return "vrma_order";
+  if (order?.order_type === "co_order") return "co_order";
   return "sales_order";
 }
 
@@ -289,6 +300,9 @@ function loadedUnitConsumption(line) {
 function remainingPackAvailability(line) {
   const salesAvailable = Math.max(0, lineRequiredSalesQuantity(line) - lineLoadedSalesQuantity(line));
   if (!hasConversion(line)) {
+    if (isSalesQuantityOnlyLine(line)) {
+      return { pallets: 0, layers: 0, sections: 0, pieces: 0 };
+    }
     if (hasRequiredCustomQuantity(line)) {
       return {
         pallets: Math.max(positiveQuantity(line.pallet_qty) - positiveQuantity(line.fulfilled_pallet_qty), 0),
@@ -412,7 +426,7 @@ function hasDeliveryDisplayQuantity(line) {
 }
 
 function loadLineUnits(line) {
-  if (hasConversion(line) || hasRequiredCustomQuantity(line)) {
+  if (!isSalesQuantityOnlyLine(line) && (hasConversion(line) || hasRequiredCustomQuantity(line))) {
     const available = remainingPackAvailability(line);
     const customUnits = [
       { key: "pallet", label: "PLT", required: available.pallets, packed: positiveQuantity(line.packed_pallet_qty) },
@@ -576,10 +590,19 @@ function linePackedSalesSql(alias) {
     + (COALESCE(${alias}.packed_piece_qty, 0) * COALESCE(${alias}.to_pcs, 0))
   `;
   const rawUnits = `
-    COALESCE(${alias}.packed_pallet_qty, 0)
-    + COALESCE(${alias}.packed_layer_qty, 0)
-    + COALESCE(${alias}.packed_section_qty, 0)
-    + COALESCE(${alias}.packed_piece_qty, 0)
+    COALESCE(NULLIF(${alias}.packed_piece_qty, 0),
+      NULLIF(${alias}.packed_section_qty, 0),
+      NULLIF(${alias}.packed_layer_qty, 0),
+      NULLIF(${alias}.packed_pallet_qty, 0), 0)
+  `;
+  const legacySalesOnly = `
+    UPPER(COALESCE(NULLIF(${alias}.sku, ''), ${alias}.item_name, '')) = 'PALLET'
+    OR (
+      COALESCE(${alias}.pallet_qty, 0) = 0
+      AND COALESCE(${alias}.layer_qty, 0) = 0
+      AND COALESCE(${alias}.section_qty, 0) = 0
+      AND COALESCE(${alias}.piece_qty, 0) = 0
+    )
   `;
   return `CASE
     WHEN (
@@ -588,7 +611,7 @@ function linePackedSalesSql(alias) {
       + COALESCE(${alias}.to_sec, 0)
       + COALESCE(${alias}.to_pcs, 0)
     ) > 0 THEN (${converted})
-    ELSE COALESCE(NULLIF(${alias}.packed_sales_qty, 0), (${rawUnits}))
+    ELSE COALESCE(NULLIF(${alias}.packed_sales_qty, 0), CASE WHEN ${legacySalesOnly} THEN (${rawUnits}) ELSE 0 END)
   END`;
 }
 
@@ -1105,6 +1128,13 @@ function parseStatusFilter(status) {
 }
 
 function mapLocalCoLineForDelivery(line = {}) {
+  const packedSalesQty = isLegacySalesQuantityOnlyLine(line)
+    ? positiveQuantity(line.packed_sales_qty)
+      || positiveQuantity(line.packed_pallet_qty)
+      || positiveQuantity(line.packed_layer_qty)
+      || positiveQuantity(line.packed_section_qty)
+      || positiveQuantity(line.packed_piece_qty)
+    : positiveQuantity(line.packed_sales_qty);
   return {
     ...line,
     order_id: line.delivery_order_id || line.order_id,
@@ -1115,6 +1145,7 @@ function mapLocalCoLineForDelivery(line = {}) {
     packed_layer_qty: positiveQuantity(line.packed_layer_qty),
     packed_section_qty: positiveQuantity(line.packed_section_qty),
     packed_piece_qty: positiveQuantity(line.packed_piece_qty),
+    packed_sales_qty: packedSalesQty,
     fulfilled_pallet_qty: 0,
     fulfilled_layer_qty: 0,
     fulfilled_piece_qty: 0,
@@ -2674,10 +2705,7 @@ function fulfillmentLineQuantity(line) {
     || Math.max(positiveQuantity(line.packed_layer_qty) - positiveQuantity(line.fulfilled_layer_qty), 0)
     || Math.max(positiveQuantity(line.packed_pallet_qty) - positiveQuantity(line.fulfilled_pallet_qty), 0);
   if (!hasConversion(line)) {
-    if (hasRequiredCustomQuantity(line)) {
-      return roundQuantity(positiveQuantity(line.packed_sales_qty));
-    }
-    return roundQuantity(salesQuantity);
+    return roundQuantity(linePackedSalesQuantity(line));
   }
   const convertedQuantity = (Math.max(positiveQuantity(line.packed_pallet_qty) - positiveQuantity(line.fulfilled_pallet_qty), 0) * positiveQuantity(line.to_plt))
     + (Math.max(positiveQuantity(line.packed_layer_qty) - positiveQuantity(line.fulfilled_layer_qty), 0) * positiveQuantity(line.to_lyr))
@@ -2844,10 +2872,7 @@ async function recordLocalCoDeliveryLoad(order, operatorId, { photoDataUrls }) {
                 + (COALESCE(line.packed_section_qty, 0) * COALESCE(line.to_sec, 0))
                 + (COALESCE(line.packed_piece_qty, 0) * COALESCE(line.to_pcs, 0))
               ELSE
-                COALESCE(line.packed_piece_qty, 0)
-                + COALESCE(line.packed_section_qty, 0)
-                + COALESCE(line.packed_layer_qty, 0)
-                + COALESCE(line.packed_pallet_qty, 0)
+                COALESCE(line.packed_sales_qty, 0)
             END
       FROM local_co_orders co
       WHERE line.co_id = co.id
@@ -3624,7 +3649,7 @@ async function updateVrmaLinePackedQuantity(orderId, lineId, values, operatorId,
     sections: normalizeQuantity(values?.sections) || 0,
     salesQty: normalizeQuantity(values?.salesQty) || 0
   };
-  const fallbackUom = !hasConversion(line) && !hasRequiredCustomQuantity(line);
+  const fallbackUom = isSalesQuantityOnlyLine(line);
   let next;
   let packedSalesQty = 0;
   if (fallbackUom) {
@@ -3754,12 +3779,13 @@ async function updateLocalCoLinePackedQuantity(order, lineId, next) {
             packed_layer_qty = $4,
             packed_piece_qty = $5,
             packed_section_qty = $6,
-            confirmed_at = CASE WHEN ($3::numeric + $4::numeric + $5::numeric + $6::numeric) > 0 THEN COALESCE(confirmed_at, now()) ELSE null END
+            packed_sales_qty = $7,
+            confirmed_at = CASE WHEN ($3::numeric + $4::numeric + $5::numeric + $6::numeric + $7::numeric) > 0 THEN COALESCE(confirmed_at, now()) ELSE null END
       FROM local_co_orders co
       WHERE line.co_id = co.id
-        AND (co.delivery_order_id = $1 OR co.co_ref = $7)
+        AND (co.delivery_order_id = $1 OR co.co_ref = $8)
         AND line.id = $2`,
-    [order.netsuite_id, lineId, next.pallets, next.layers, next.pieces, next.sections, order.tranid]
+    [order.netsuite_id, lineId, next.pallets, next.layers, next.pieces, next.sections, next.salesQty, order.tranid]
   );
 }
 
@@ -3774,28 +3800,48 @@ async function confirmLocalCoDeliveryLine(orderId, lineId, values, operatorId, {
     pallets: normalizeQuantity(values?.pallets) || 0,
     layers: normalizeQuantity(values?.layers) || 0,
     pieces: normalizeQuantity(values?.pieces) || 0,
-    sections: normalizeQuantity(values?.sections) || 0
+    sections: normalizeQuantity(values?.sections) || 0,
+    salesQty: normalizeQuantity(values?.salesQty) || 0
   };
-  const next = absolute
+  const salesOnly = isSalesQuantityOnlyLine(line);
+  const next = salesOnly
     ? {
+      pallets: 0,
+      layers: 0,
+      pieces: 0,
+      sections: 0,
+      salesQty: resolveSalesOnlyPackedQuantity(line, values, { absolute })
+    }
+    : absolute
+      ? {
       pallets: Math.min(available.pallets, valuesToApply.pallets),
       layers: Math.min(available.layers, valuesToApply.layers),
       pieces: Math.min(available.pieces, valuesToApply.pieces),
-      sections: Math.min(available.sections, valuesToApply.sections)
+      sections: Math.min(available.sections, valuesToApply.sections),
+      salesQty: resolveIndependentPackedSalesQuantity(line, valuesToApply, valuesToApply.salesQty, {
+        absolute: true,
+        physicalChanged: valuesToApply.pallets + valuesToApply.layers + valuesToApply.pieces + valuesToApply.sections > 0
+      })
     }
-    : {
+      : {
       pallets: Math.min(available.pallets, positiveQuantity(line.packed_pallet_qty) + valuesToApply.pallets),
       layers: Math.min(available.layers, positiveQuantity(line.packed_layer_qty) + valuesToApply.layers),
       pieces: Math.min(available.pieces, positiveQuantity(line.packed_piece_qty) + valuesToApply.pieces),
-      sections: Math.min(available.sections, positiveQuantity(line.packed_section_qty) + valuesToApply.sections)
+      sections: Math.min(available.sections, positiveQuantity(line.packed_section_qty) + valuesToApply.sections),
+      salesQty: 0
     };
+  if (!salesOnly && !absolute) {
+    next.salesQty = resolveIndependentPackedSalesQuantity(line, next, valuesToApply.salesQty, {
+      physicalChanged: valuesToApply.pallets + valuesToApply.layers + valuesToApply.pieces + valuesToApply.sections > 0
+    });
+  }
   await updateLocalCoLinePackedQuantity(order, lineId, next);
   await writeAudit({
     actorOperatorId: operatorId,
     action: absolute ? "delivery.local_co.line.update_packed_quantity" : "delivery.local_co.line.confirm",
     orderId: order.netsuite_id,
     lineId,
-    details: { coRef: order.tranid, pallets: next.pallets, layers: next.layers, pieces: next.pieces, sections: next.sections }
+    details: { coRef: order.tranid, pallets: next.pallets, layers: next.layers, pieces: next.pieces, sections: next.sections, salesQty: next.salesQty }
   });
 }
 
@@ -4310,6 +4356,7 @@ export async function getCurrentOperatorDeliveryDraft(operatorId, { locationId =
                       OR COALESCE(l.packed_layer_qty, 0) > 0
                       OR COALESCE(l.packed_section_qty, 0) > 0
                       OR COALESCE(l.packed_piece_qty, 0) > 0
+                      OR COALESCE(l.packed_sales_qty, 0) > 0
                     )
                 )::int AS draft_line_count
            FROM local_co_orders o
@@ -4465,6 +4512,7 @@ export async function releaseCurrentDeliveryDraft(orderId, operatorId) {
               packed_layer_qty = 0,
               packed_piece_qty = 0,
               packed_section_qty = 0,
+              packed_sales_qty = 0,
               confirmed_at = null
         FROM local_co_orders co
         WHERE line.co_id = co.id
@@ -4847,9 +4895,10 @@ export async function unpackDeliveryLine(orderId, lineId, values, operatorId) {
       pallets: positiveQuantity(line.packed_pallet_qty),
       layers: positiveQuantity(line.packed_layer_qty),
       pieces: positiveQuantity(line.packed_piece_qty),
-      sections: positiveQuantity(line.packed_section_qty)
+      sections: positiveQuantity(line.packed_section_qty),
+      salesQty: positiveQuantity(line.packed_sales_qty)
     };
-    await updateLocalCoLinePackedQuantity(order, lineId, { pallets: 0, layers: 0, pieces: 0, sections: 0 });
+    await updateLocalCoLinePackedQuantity(order, lineId, { pallets: 0, layers: 0, pieces: 0, sections: 0, salesQty: 0 });
     await setLocalCoDeliveryStatus(order, "preparing", { clearPreparing: false });
     await writeAudit({
       actorOperatorId: operatorId,
@@ -4957,6 +5006,7 @@ export async function unpackDeliveryOrder(orderId, operatorId) {
               packed_layer_qty = 0,
               packed_piece_qty = 0,
               packed_section_qty = 0,
+              packed_sales_qty = 0,
               confirmed_at = null
         FROM local_co_orders co
         WHERE line.co_id = co.id

@@ -263,7 +263,8 @@ function hasPackedQty(line) {
   return qty(line.packed_pallet_qty) > 0
     || qty(line.packed_section_qty) > 0
     || qty(line.packed_layer_qty) > 0
-    || qty(line.packed_piece_qty) > 0;
+    || qty(line.packed_piece_qty) > 0
+    || qty(line.packed_sales_qty) > 0;
 }
 
 function hasRemainingQty(line) {
@@ -295,6 +296,7 @@ function requiredValue(line, unit) {
 }
 
 function packedValue(line, unit) {
+  if (unit === "sales") return qty(line.packed_sales_qty);
   const saved = unit === "pallets"
     ? line.packed_pallet_qty
     : unit === "sections"
@@ -637,10 +639,12 @@ async function confirmLine(lineId) {
   const pallets = row.querySelector('[data-pack="pallets"]')?.value || 0;
   const layers = row.querySelector('[data-pack="layers"]')?.value || 0;
   const pieces = row.querySelector('[data-pack="pieces"]')?.value || 0;
+  const salesQty = row.querySelector('[data-pack="sales"]')?.value || 0;
   const body = {
     pallets,
     layers,
-    pieces: row.querySelector('[data-pack="sales"]')?.value || pieces,
+    pieces: salesQty || pieces,
+    salesQty,
     sections: row.querySelector('[data-pack="sections"]')?.value || 0
   };
   await api(`/api/delivery/orders/${selectedId}/lines/${lineId}/confirm`, {
@@ -669,10 +673,12 @@ async function unpackLine(lineId) {
 
 async function updatePackedLine(lineId) {
   const row = app.querySelector(`[data-selected-line="${lineId}"]`);
+  const salesQty = row.querySelector('[data-pack="sales"]')?.value || 0;
   const body = {
     pallets: row.querySelector('[data-pack="pallets"]')?.value || 0,
     layers: row.querySelector('[data-pack="layers"]')?.value || 0,
-    pieces: row.querySelector('[data-pack="sales"]')?.value || row.querySelector('[data-pack="pieces"]')?.value || 0,
+    pieces: salesQty || row.querySelector('[data-pack="pieces"]')?.value || 0,
+    salesQty,
     sections: row.querySelector('[data-pack="sections"]')?.value || 0
   };
   await api(`/api/delivery/orders/${selectedId}/lines/${lineId}/packed-quantity`, {

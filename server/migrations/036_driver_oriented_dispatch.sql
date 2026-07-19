@@ -89,7 +89,7 @@ INSERT INTO dispatch_plan_snapshot_history (
   original_saved_at, archive_reason, session_id
 )
 SELECT p.id, p.plan_date, p.revision, s.orders, s.trucks, s.summary,
-       s.saved_at, 'before_driver_oriented_planning', 'migration-035'
+       s.saved_at, 'before_driver_oriented_planning', 'migration-036'
   FROM dispatch_plans p
   JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
  WHERE NOT EXISTS (

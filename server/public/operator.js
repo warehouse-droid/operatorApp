@@ -224,8 +224,8 @@ let lastCameraDeviceId = "";
 let pickupScannerBuffer = "";
 let pickupScannerLastKeyAt = 0;
 let pickupFocusTimer = null;
-const OPERATOR_CAMERA_IDEAL_WIDTH = 2560;
-const OPERATOR_CAMERA_IDEAL_HEIGHT = 1440;
+const OPERATOR_CAMERA_IDEAL_WIDTH = 4096;
+const OPERATOR_CAMERA_IDEAL_HEIGHT = 3072;
 const OPERATOR_CAMERA_JPEG_QUALITY = 0.92;
 
 function cameraFacingLabel() {
@@ -236,6 +236,11 @@ function cameraFacingLabel() {
 
 function cameraCaptureMode() {
   return cameraFacingMode === "user" ? "user" : "environment";
+}
+
+function selectRearCamera() {
+  cameraFacingMode = "environment";
+  localStorage.setItem(CAMERA_FACING_KEY, cameraFacingMode);
 }
 
 function cameraVideoConstraints(overrides = {}) {
@@ -285,6 +290,43 @@ function rememberCameraStream(stream) {
   if (deviceId) lastCameraDeviceId = deviceId;
 }
 
+async function maximizeCameraStreamResolution(stream) {
+  const track = stream?.getVideoTracks?.()[0];
+  if (!track?.applyConstraints || !track?.getCapabilities) return stream;
+  let capabilities = {};
+  try {
+    capabilities = track.getCapabilities() || {};
+  } catch {
+    return stream;
+  }
+  const width = Number(capabilities.width?.max);
+  const height = Number(capabilities.height?.max);
+  const resolution = {};
+  if (Number.isFinite(width) && width > 0) resolution.width = { ideal: width };
+  if (Number.isFinite(height) && height > 0) resolution.height = { ideal: height };
+  if (Object.keys(resolution).length) {
+    try {
+      await track.applyConstraints(resolution);
+    } catch {
+      // Keep the high-resolution stream when a device rejects its reported maximum pair.
+    }
+  }
+  if (Array.isArray(capabilities.focusMode) && capabilities.focusMode.includes("continuous")) {
+    try {
+      await track.applyConstraints({ advanced: [{ focusMode: "continuous" }] });
+    } catch {
+      // Continuous autofocus is an optional enhancement.
+    }
+  }
+  return stream;
+}
+
+async function prepareCameraStream(stream) {
+  await maximizeCameraStreamResolution(stream);
+  rememberCameraStream(stream);
+  return stream;
+}
+
 async function openCameraStream() {
   const facing = cameraCaptureMode();
   try {
@@ -292,8 +334,7 @@ async function openCameraStream() {
       video: cameraVideoConstraints({ facingMode: { exact: facing } }),
       audio: false
     });
-    rememberCameraStream(stream);
-    return stream;
+    return prepareCameraStream(stream);
   } catch {
     // Some browsers reject exact facingMode even when the camera exists.
   }
@@ -304,21 +345,18 @@ async function openCameraStream() {
         video: cameraVideoConstraints({ deviceId: { exact: deviceId } }),
         audio: false
       });
-      rememberCameraStream(stream);
-      return stream;
+      return prepareCameraStream(stream);
     } catch {
       // Fall through to facingMode / generic camera fallback.
     }
   }
   try {
     const stream = await navigator.mediaDevices.getUserMedia(cameraMediaConstraints());
-    rememberCameraStream(stream);
-    return stream;
+    return prepareCameraStream(stream);
   } catch (error) {
     if (error?.name === "NotFoundError" || error?.name === "OverconstrainedError") {
       const stream = await navigator.mediaDevices.getUserMedia({ video: cameraVideoConstraints(), audio: false });
-      rememberCameraStream(stream);
-      return stream;
+      return prepareCameraStream(stream);
     }
     throw error;
   }
@@ -340,6 +378,19 @@ function switchCameraFacing() {
 
 function renderCameraSwitchButton(action) {
   return `<button class="secondary-button compact-camera-button" data-action="${action}" type="button">${t("common.switchCamera", "Switch camera")} (${cameraFacingLabel()})</button>`;
+}
+
+function cameraErrorMessage(error) {
+  if (error?.name === "NotAllowedError" || error?.name === "SecurityError") {
+    return t("operator.cameraPermissionRequired", "Camera permission is required. Allow camera access in the browser settings and try again.");
+  }
+  if (error?.name === "NotFoundError" || error?.name === "OverconstrainedError") {
+    return t("operator.rearCameraUnavailable", "A rear camera is not available on this device.");
+  }
+  if (error?.name === "NotReadableError" || error?.name === "AbortError") {
+    return t("operator.cameraInUse", "The camera is in use by another app. Close it and try again.");
+  }
+  return error?.message || t("operator.cameraOpenFailed", "Camera could not be opened.");
 }
 
 function showToast(message) {
@@ -553,7 +604,6 @@ async function uploadOperatorPhoto(photo, context = {}) {
     method: "POST",
     body: JSON.stringify(context)
   });
-  if (ticket.provider === "local_data_url") return photo;
   const file = dataUrlToFile(photo, context.filename || `${context.recordType || "operator-photo"}.jpg`);
   const formData = new FormData();
   formData.append("file", file);
@@ -1192,17 +1242,20 @@ function lineHasConversion(line) {
   return qty(line.to_plt) > 0 || qty(line.to_lyr) > 0 || qty(line.to_sec) > 0 || qty(line.to_pcs) > 0;
 }
 
+function isPalletSalesItem(line) {
+  return String(line?.sku || line?.item_name || "").trim().toUpperCase() === "PALLET";
+}
+
 function isIndependentManualLine(line) {
-  return !lineHasConversion(line) && hasCustomPackQty(line);
+  return !lineHasConversion(line) && !shouldUseSalesQuantity(line) && hasCustomPackQty(line);
 }
 
 function shouldUseSalesQuantity(line) {
-  return !lineHasConversion(line) && !hasCustomPackQty(line) && qty(line.quantity) > 0;
+  return !lineHasConversion(line) && qty(line.quantity) > 0;
 }
 
 function salesQuantityLabel(line, fallback = "Qty") {
-  const itemName = String(line?.sku || line?.item_name || "").trim().toUpperCase();
-  return itemName === "PALLET" ? "PALLET" : line?.unit || fallback;
+  return isPalletSalesItem(line) ? "PALLET" : line?.unit || fallback;
 }
 
 function lineUnitsToSalesQty(line, values) {
@@ -1430,7 +1483,7 @@ function requiredValue(line, unit) {
 }
 
 function deliveryLineUnits(line) {
-  if (line?.vrma_reference_only === true) {
+  if (line?.vrma_reference_only === true && !shouldUseSalesQuantity(line)) {
     const physical = [
       { key: "pallets", label: "PLT" },
       { key: "layers", label: "LYR" },
@@ -1625,6 +1678,8 @@ function shell(title, subtitle, body, actions = "") {
     ${renderUrgentDeliveryAlert()}
     ${body}
   `;
+  if (fulfillmentCameraActive) window.requestAnimationFrame(attachFulfillmentCamera);
+  if (receiptCameraActive) window.requestAnimationFrame(attachReceiptCamera);
 }
 
 function renderLogin(message = "") {
@@ -2723,8 +2778,9 @@ function renderFulfillmentScreen() {
         <span>${t("operator.photoProof", "Photo proof")}</span>
         <strong>${t("operator.loadedOnTruck", "Loaded on truck")}</strong>
         <div class="camera-actions">
-          <input id="fulfillmentPhoto" accept="image/*" capture="${cameraCaptureMode()}" type="file" hidden />
-          <button class="primary-button" data-action="start-camera" type="button">${t("common.openCamera", "Open camera")}</button>
+          ${fulfillmentCameraActive
+            ? `<button class="secondary-button" data-action="stop-camera" type="button">${t("common.closeCamera", "Close camera")}</button>`
+            : `<button class="primary-button" data-action="start-camera" type="button">${t("common.openCamera", "Open camera")}</button>`}
           ${renderCameraSwitchButton("switch-fulfillment-camera")}
         </div>
         <div class="photo-slot-row">
@@ -2740,7 +2796,7 @@ function renderFulfillmentScreen() {
           ${fulfillmentPhotoSlots > 2 ? `<button class="secondary-button danger-button" data-action="remove-fulfillment-photo" data-slot="${fulfillmentActivePhotoSlot}" ${fulfillmentActivePhotoSlot < 2 ? "disabled" : ""} type="button">${t("common.removeSelected", "Remove selected")}</button>` : ""}
         </div>
         ${fulfillmentCameraActive ? `
-          <video class="camera-preview" id="fulfillmentCamera" autoplay muted playsinline></video>
+          <video class="camera-preview ${cameraCaptureMode() === "user" ? "mirrored" : ""}" id="fulfillmentCamera" autoplay muted playsinline></video>
           <button class="primary-button" data-action="capture-photo" type="button">${t("operator.capturePhoto", "Capture photo")} ${fulfillmentActivePhotoSlot + 1}</button>
         ` : fulfillmentPhotoDataUrls[fulfillmentActivePhotoSlot] ? `<img class="photo-preview" src="${fulfillmentPhotoDataUrls[fulfillmentActivePhotoSlot]}" alt="${t("operator.photoProof", "Truck loading proof")} ${fulfillmentActivePhotoSlot + 1}" />` : `<div class="photo-placeholder">${t("operator.takeTwoLoadPhotos", "Take at least 2 photos before confirming load. You can add more photos if needed.")}</div>`}
       </div>
@@ -4149,6 +4205,7 @@ async function startFulfillment() {
   fulfillmentJobStage = "";
   fulfillmentStartedAt = 0;
   fulfillmentValidation = null;
+  selectRearCamera();
   currentModule = isCustomerPickupMode() ? "customer-pickup-load" : "delivery-fulfill";
   render();
 }
@@ -4169,22 +4226,20 @@ function attachFulfillmentCamera() {
 }
 
 async function startFulfillmentCamera() {
-  const nativeCamera = document.getElementById("fulfillmentPhoto");
-  if (nativeCamera) {
-    stopFulfillmentCamera();
-    nativeCamera.value = "";
-    nativeCamera.click();
-    return;
-  }
   if (!navigator.mediaDevices?.getUserMedia) {
-    showToast("Camera is not available in this browser.");
+    showToast(t("operator.cameraUnavailable", "Camera is not available in this browser."));
     return;
   }
   stopFulfillmentCamera();
-  fulfillmentCameraStream = await openCameraStream();
-  fulfillmentCameraActive = true;
-  render();
-  window.requestAnimationFrame(attachFulfillmentCamera);
+  try {
+    fulfillmentCameraStream = await openCameraStream();
+    fulfillmentCameraActive = true;
+    render();
+  } catch (error) {
+    stopFulfillmentCamera();
+    showToast(cameraErrorMessage(error));
+    render();
+  }
 }
 
 async function switchFulfillmentCamera() {
@@ -4198,13 +4253,33 @@ async function captureCameraPhotoDataUrl(stream, video) {
   const track = stream?.getVideoTracks?.()[0];
   if (track && typeof window.ImageCapture === "function") {
     try {
-      const blob = await new window.ImageCapture(track).takePhoto();
+      const imageCapture = new window.ImageCapture(track);
+      let photoSettings;
+      try {
+        const capabilities = await imageCapture.getPhotoCapabilities?.();
+        const imageWidth = Number(capabilities?.imageWidth?.max);
+        const imageHeight = Number(capabilities?.imageHeight?.max);
+        if ((Number.isFinite(imageWidth) && imageWidth > 0) || (Number.isFinite(imageHeight) && imageHeight > 0)) {
+          photoSettings = {};
+          if (Number.isFinite(imageWidth) && imageWidth > 0) photoSettings.imageWidth = imageWidth;
+          if (Number.isFinite(imageHeight) && imageHeight > 0) photoSettings.imageHeight = imageHeight;
+        }
+      } catch {
+        photoSettings = undefined;
+      }
+      let blob;
+      try {
+        blob = await imageCapture.takePhoto(photoSettings);
+      } catch (error) {
+        if (!photoSettings) throw error;
+        blob = await imageCapture.takePhoto();
+      }
       if (blob?.size) return readPhotoFile(blob);
     } catch {
-      // Fall back to the highest-resolution frame supplied by the video track.
+      // Fall back to the maximum-resolution frame supplied by the video track.
     }
   }
-  if (!video?.videoWidth || !video?.videoHeight) throw new Error("Camera preview is not ready yet.");
+  if (!video?.videoWidth || !video?.videoHeight) throw new Error(t("operator.cameraPreviewNotReady", "Camera preview is not ready yet."));
   const canvas = document.createElement("canvas");
   canvas.width = video.videoWidth;
   canvas.height = video.videoHeight;
@@ -4226,16 +4301,15 @@ function nextPhotoSlot(photoDataUrls, currentSlot, minimumSlots) {
 async function captureFulfillmentPhoto() {
   const video = document.getElementById("fulfillmentCamera");
   if (!video || !video.videoWidth || !video.videoHeight) {
-    showToast("Camera preview is not ready yet.");
+    showToast(t("operator.cameraPreviewNotReady", "Camera preview is not ready yet."));
     return;
   }
   try {
     fulfillmentPhotoDataUrls[fulfillmentActivePhotoSlot] = await captureCameraPhotoDataUrl(fulfillmentCameraStream, video);
     fulfillmentActivePhotoSlot = nextPhotoSlot(fulfillmentPhotoDataUrls, fulfillmentActivePhotoSlot, 2);
-    stopFulfillmentCamera();
     render();
   } catch (error) {
-    showToast(error.message || "Photo capture failed.");
+    showToast(error.message || t("operator.photoCaptureFailed", "Photo capture failed."));
   }
 }
 
@@ -4250,6 +4324,7 @@ function readPhotoFile(file) {
 
 async function confirmFulfillment() {
   if (!fulfillmentOrder || fulfillmentPhotoDataUrls.filter(Boolean).length < 2 || fulfillmentSubmitting) return;
+  stopFulfillmentCamera();
   fulfillmentSubmitting = true;
   fulfillmentStartedAt = Date.now();
   fulfillmentJobStage = "Saving proof";
@@ -4359,8 +4434,9 @@ function renderReceiptScreen() {
         <span>${t("operator.photoProof", "Photo proof")}</span>
         <strong>${t("operator.truckPhotos", "Truck photos")}</strong>
         <div class="camera-actions">
-          <input id="receiptPhoto" accept="image/*" capture="${cameraCaptureMode()}" type="file" hidden />
-          <button class="primary-button" data-action="start-receipt-camera" type="button">${t("common.openCamera", "Open camera")}</button>
+          ${receiptCameraActive
+            ? `<button class="secondary-button" data-action="stop-receipt-camera" type="button">${t("common.closeCamera", "Close camera")}</button>`
+            : `<button class="primary-button" data-action="start-receipt-camera" type="button">${t("common.openCamera", "Open camera")}</button>`}
           ${renderCameraSwitchButton("switch-receipt-camera")}
         </div>
         <div class="photo-slot-row">
@@ -4376,7 +4452,7 @@ function renderReceiptScreen() {
           ${Math.max(2, receiptPhotoDataUrls.length) > 2 ? `<button class="secondary-button danger-button" data-action="remove-receipt-photo" data-slot="${receiptActivePhotoSlot}" ${receiptActivePhotoSlot < 2 ? "disabled" : ""} type="button">${t("common.removeSelected", "Remove selected")}</button>` : ""}
         </div>
         ${receiptCameraActive ? `
-          <video class="camera-preview" id="receiptCamera" autoplay muted playsinline></video>
+          <video class="camera-preview ${cameraCaptureMode() === "user" ? "mirrored" : ""}" id="receiptCamera" autoplay muted playsinline></video>
           <button class="primary-button" data-action="capture-receipt-photo" type="button">${t("operator.capturePhoto", "Capture photo")} ${receiptActivePhotoSlot + 1}</button>
         ` : receiptPhotoDataUrls[receiptActivePhotoSlot] ? `<img class="photo-preview" src="${receiptPhotoDataUrls[receiptActivePhotoSlot]}" alt="Receiving proof" />` : `<div class="photo-placeholder">${t("operator.receivePhotoHelp", "Take 2 truck photos before receiving.")}</div>`}
       </div>
@@ -4387,7 +4463,9 @@ function renderReceiptScreen() {
           ${confirmedLines.map((line) => `
             <div>
               <b>${line.sku || line.item_name}</b>
-              <span>${displayQty(line.received_pallet_qty)} PLT / ${displayQty(line.received_section_qty)} SEC / ${displayQty(line.received_layer_qty)} LYR / ${displayQty(line.received_piece_qty)} PCS</span>
+              <span>${shouldUseSalesQuantity(line)
+                ? `${displayQty(line.received_sales_qty)} ${salesQuantityLabel(line)}`
+                : `${displayQty(line.received_pallet_qty)} PLT / ${displayQty(line.received_section_qty)} SEC / ${displayQty(line.received_layer_qty)} LYR / ${displayQty(line.received_piece_qty)} PCS`}</span>
             </div>
           `).join("") || `<p class="muted">${t("operator.noConfirmedQty", "No confirmed qty.")}</p>`}
         </div>
@@ -4447,6 +4525,7 @@ function startReceipt() {
   receiptStatusText = "";
   receiptJobStage = "";
   receiptStartedAt = 0;
+  selectRearCamera();
   currentModule = "receiving-receipt";
   render();
 }
@@ -4465,19 +4544,17 @@ function attachReceiptCamera() {
 }
 
 async function startReceiptCamera() {
-  const nativeCamera = document.getElementById("receiptPhoto");
-  if (nativeCamera) {
-    stopReceiptCamera();
-    nativeCamera.value = "";
-    nativeCamera.click();
-    return;
-  }
-  if (!navigator.mediaDevices?.getUserMedia) return showToast("Camera is not available in this browser.");
+  if (!navigator.mediaDevices?.getUserMedia) return showToast(t("operator.cameraUnavailable", "Camera is not available in this browser."));
   stopReceiptCamera();
-  receiptCameraStream = await openCameraStream();
-  receiptCameraActive = true;
-  render();
-  window.requestAnimationFrame(attachReceiptCamera);
+  try {
+    receiptCameraStream = await openCameraStream();
+    receiptCameraActive = true;
+    render();
+  } catch (error) {
+    stopReceiptCamera();
+    showToast(cameraErrorMessage(error));
+    render();
+  }
 }
 
 async function switchReceiptCamera() {
@@ -4489,19 +4566,19 @@ async function switchReceiptCamera() {
 
 async function captureReceiptPhoto() {
   const video = document.getElementById("receiptCamera");
-  if (!video || !video.videoWidth || !video.videoHeight) return showToast("Camera preview is not ready yet.");
+  if (!video || !video.videoWidth || !video.videoHeight) return showToast(t("operator.cameraPreviewNotReady", "Camera preview is not ready yet."));
   try {
     receiptPhotoDataUrls[receiptActivePhotoSlot] = await captureCameraPhotoDataUrl(receiptCameraStream, video);
     receiptActivePhotoSlot = nextPhotoSlot(receiptPhotoDataUrls, receiptActivePhotoSlot, 2);
-    stopReceiptCamera();
     render();
   } catch (error) {
-    showToast(error.message || "Photo capture failed.");
+    showToast(error.message || t("operator.photoCaptureFailed", "Photo capture failed."));
   }
 }
 
 async function confirmReceipt() {
   if (!receiptOrder || receiptPhotoDataUrls.filter(Boolean).length < 2 || receiptSubmitting) return;
+  stopReceiptCamera();
   receiptSubmitting = true;
   receiptStartedAt = Date.now();
   receiptJobStage = "Uploading proof";
@@ -5288,6 +5365,10 @@ app.addEventListener("click", async (event) => {
       return render();
     }
     if (button.dataset.action === "start-receipt-camera") return startReceiptCamera();
+    if (button.dataset.action === "stop-receipt-camera") {
+      stopReceiptCamera();
+      return render();
+    }
     if (button.dataset.action === "switch-receipt-camera") return switchReceiptCamera();
     if (button.dataset.action === "capture-receipt-photo") return captureReceiptPhoto();
     if (button.dataset.action === "confirm-receive") return confirmReceipt();
@@ -5469,6 +5550,10 @@ app.addEventListener("click", async (event) => {
     if (button.dataset.action === "confirm-fulfill") return confirmFulfillment();
     if (button.dataset.action === "finish-fulfill") return finishFulfillment();
     if (button.dataset.action === "start-camera") return startFulfillmentCamera();
+    if (button.dataset.action === "stop-camera") {
+      stopFulfillmentCamera();
+      return render();
+    }
     if (button.dataset.action === "switch-fulfillment-camera") return switchFulfillmentCamera();
     if (button.dataset.action === "capture-photo") return captureFulfillmentPhoto();
     if (button.dataset.action === "select-fulfillment-photo-slot") {
@@ -5678,23 +5763,7 @@ app.addEventListener("change", async (event) => {
     selectedId = null;
     return loadOrders();
   }
-  if (event.target?.id !== "fulfillmentPhoto" && event.target?.id !== "receiptPhoto") return;
-  const file = event.target.files?.[0];
-  if (!file) return;
-  try {
-    if (event.target.id === "fulfillmentPhoto") {
-      stopFulfillmentCamera();
-      fulfillmentPhotoDataUrls[fulfillmentActivePhotoSlot] = await readPhotoFile(file);
-      fulfillmentActivePhotoSlot = nextPhotoSlot(fulfillmentPhotoDataUrls, fulfillmentActivePhotoSlot, 2);
-    } else {
-      stopReceiptCamera();
-      receiptPhotoDataUrls[receiptActivePhotoSlot] = await readPhotoFile(file);
-      receiptActivePhotoSlot = nextPhotoSlot(receiptPhotoDataUrls, receiptActivePhotoSlot, 2);
-    }
-    render();
-  } catch (error) {
-    showToast(error.message);
-  }
+  return;
 });
 
 app.addEventListener("submit", async (event) => {
@@ -5795,6 +5864,11 @@ if ("serviceWorker" in navigator) {
     }
   });
 }
+
+window.addEventListener("pagehide", () => {
+  stopFulfillmentCamera();
+  stopReceiptCamera();
+});
 
 window.addEventListener("beforeinstallprompt", (event) => {
   event.preventDefault();

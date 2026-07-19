@@ -360,6 +360,10 @@ let pointerDraggedLoadId = "";
 let supportTab = "drivers";
 let searchText = "";
 let activeOrderType = "SO";
+let orderSearchTimer = null;
+let orderSearchSequence = 0;
+let orderSearchLoading = false;
+let orderSearchError = "";
 let modalType = "";
 let modalOrderId = "";
 let modalLoadId = "";
@@ -2306,6 +2310,65 @@ function applyDispatchOrderFeed(feed) {
   if (!selectedOrderIds.size && selectedOrderId) selectedOrderIds.add(selectedOrderId);
 }
 
+function mergeDispatchOrderSearchFeed(feed) {
+  const candidates = Array.isArray(feed) ? feed.map(normalizeOrder).filter((order) => order.id) : [];
+  if (!candidates.length) return;
+  const catalogById = new Map(orderCatalog.map((order) => [order.id, order]));
+  const ordersById = new Map(orders.map((order) => [order.id, order]));
+  for (const candidate of candidates) {
+    const existing = ordersById.get(candidate.id);
+    const merged = normalizeOrder(existing ? { ...candidate, ...existing } : candidate);
+    ordersById.set(candidate.id, merged);
+    catalogById.set(candidate.id, normalizeOrder(catalogById.has(candidate.id)
+      ? { ...candidate, ...catalogById.get(candidate.id) }
+      : candidate));
+  }
+  orders = [...ordersById.values()];
+  orderCatalog = [...catalogById.values()];
+  reconcileTransitCoSourceOrders();
+}
+
+function cancelDispatchOrderSearch() {
+  if (orderSearchTimer) clearTimeout(orderSearchTimer);
+  orderSearchTimer = null;
+  orderSearchSequence += 1;
+  orderSearchLoading = false;
+  orderSearchError = "";
+}
+
+async function loadDispatchOrderSearch(term, sequence) {
+  try {
+    const params = new URLSearchParams({ search: term });
+    const response = await fetch("/api/dispatch/orders?" + params.toString());
+    if (!response.ok) throw new Error(await response.text());
+    const feed = await response.json();
+    if (sequence !== orderSearchSequence || term !== searchText.trim()) return;
+    mergeDispatchOrderSearchFeed(feed);
+    orderSearchError = "";
+  } catch (error) {
+    if (sequence !== orderSearchSequence) return;
+    orderSearchError = error.message || "Search failed.";
+  } finally {
+    if (sequence !== orderSearchSequence) return;
+    orderSearchLoading = false;
+    refreshOrderPoolForSearch();
+  }
+}
+
+function scheduleDispatchOrderSearch() {
+  if (orderSearchTimer) clearTimeout(orderSearchTimer);
+  orderSearchTimer = null;
+  const term = searchText.trim();
+  const sequence = ++orderSearchSequence;
+  orderSearchError = "";
+  orderSearchLoading = term.length >= 2;
+  if (term.length < 2) return;
+  orderSearchTimer = setTimeout(() => {
+    orderSearchTimer = null;
+    loadDispatchOrderSearch(term, sequence);
+  }, 300);
+}
+
 function applyPlannedAssignments(assignments = []) {
   plannedAssignmentRefs = new Set((assignments || []).map((assignment) => String(assignment.orderRef || "")).filter(Boolean));
   const byOrderRef = new Map((assignments || []).map((assignment) => [String(assignment.orderRef || ""), assignment]));
@@ -2795,6 +2858,7 @@ function trucksWithTimingMetadata() {
 
 function normalizePlanBeforeSave() {
   expandScmGroupedPoStops();
+  collapseGroupedOrderStops();
   cleanupOrphanPickupStops();
   syncPickupStops();
   syncReturnLoads();
@@ -3122,6 +3186,7 @@ function applySavedPlan(saved) {
   normalizeLoadAssignments();
   reconcileTransitCoSourceOrders();
   expandScmGroupedPoStops();
+  collapseGroupedOrderStops();
   syncPickupStops();
   cleanupOrphanPickupStops();
   selectedOrderId = orders.find((order) => order.id === selectedOrderId)?.id || orders[0]?.id || "";
@@ -4120,7 +4185,13 @@ function groupCandidates(order) {
 }
 
 function stopOrder(stop) {
-  return orderById(stop.orderId);
+  const orderId = String(stop?.orderId || "");
+  if (!orderId) return null;
+  const directPlanOrder = orders.find((order) => String(order?.id || "") === orderId);
+  if (directPlanOrder) return directPlanOrder;
+  const catalogOrder = orderCatalog.find((order) => String(order?.id || "") === orderId);
+  if (catalogOrder) return catalogOrder;
+  return orders.find((order) => dispatchGroupingRefs(order).has(orderId)) || null;
 }
 
 function stopById(stopId) {
@@ -4766,14 +4837,53 @@ function syncPickupStops() {
   }
 }
 
+function collapseGroupedOrderStops() {
+  const groupsById = new Map();
+  const groupsByMemberRef = new Map();
+  for (const order of orders || []) {
+    if (!order?.childOrders?.length || isScmGroupedPoOrder(order)) continue;
+    groupsById.set(String(order.id), order);
+    for (const ref of dispatchGroupingRefs(order)) {
+      if (ref !== String(order.id)) groupsByMemberRef.set(ref, order);
+    }
+  }
+  if (!groupsById.size) return;
+
+  for (const truck of trucks) {
+    for (const load of truck.loads || []) {
+      if (load.returnOnly) continue;
+      const seenDropGroups = new Set();
+      const nextStops = [];
+      for (const stop of load.stops || []) {
+        const stopOrderId = String(stop.orderId || "");
+        const group = groupsById.get(stopOrderId) || groupsByMemberRef.get(stopOrderId);
+        if (!group) {
+          nextStops.push(stop);
+          continue;
+        }
+        if (stop.type === "drop") {
+          if (seenDropGroups.has(group.id)) continue;
+          seenDropGroups.add(group.id);
+        }
+        nextStops.push(stopOrderId === String(group.id)
+          ? stop
+          : { ...stop, orderId: group.id, location: stop.type === "drop" ? (group.address || stop.location || "") : stop.location });
+      }
+      load.stops = nextStops;
+    }
+  }
+}
+
 function cleanupOrphanPickupStops() {
   for (const truck of trucks) {
     for (const load of truck.loads) {
       if (load.returnOnly) continue;
+      load.stops = load.stops.filter((stop) => stop.type !== "drop" || Boolean(stopOrder(stop)));
       const needed = new Set();
       for (const stop of load.stops) {
         if (stop.type !== "drop") continue;
         const order = stopOrder(stop);
+        if (!order) continue;
         for (const location of requiredPickupLocations(order)) needed.add(String(location));
       }
       load.stops = load.stops.filter((stop) => stop.type !== "pick" || needed.has(String(stop.location)));
@@ -6171,6 +6281,13 @@ function render(options = {}) {
   scheduleBackgroundRouteEstimates();
 }
 
+function orderPoolSubtitle() {
+  if (!searchText.trim()) return orderTypeLabel(activeOrderType) + " list";
+  if (orderSearchLoading) return "Searching all valid SO, PO, TO, and CO orders...";
+  if (orderSearchError) return "Server search unavailable: " + orderSearchError;
+  return "Search results across all valid SO, PO, TO, and CO orders.";
+}
+
 function renderOrderPool() {
   const searching = Boolean(searchText.trim());
   return `
@@ -6178,7 +6295,7 @@ function renderOrderPool() {
       <div class="panel-header">
         <div>
           <h2>${t("dispatch.orderPool", "Order Pool")}</h2>
-          <p>${searching ? "Search results across SO, PO, TO, and CO." : `${orderTypeLabel(activeOrderType)} list`}</p>
+          <p>${orderPoolSubtitle()}</p>
         </div>
         <div class="order-tools">
           <input id="orderSearch" value="${escapeHtml(searchText)}" placeholder="Search SO, PO, TO, CO, SKU, address" />
@@ -6211,7 +6328,7 @@ function refreshOrderPoolForSearch() {
   const subtitle = pool?.querySelector(".panel-header p");
   const tabs = pool?.querySelectorAll(".order-type-tabs button");
   const list = pool?.querySelector(".order-list");
-  if (subtitle) subtitle.textContent = searching ? "Search results across SO, PO, TO, and CO." : `${orderTypeLabel(activeOrderType)} list`;
+  if (subtitle) subtitle.textContent = orderPoolSubtitle();
   tabs?.forEach((button) => button.classList.toggle("active", !searching && activeOrderType === button.dataset.type));
   if (list) list.innerHTML = renderOrderList();
   if (searchSelection) {
@@ -8078,8 +8195,96 @@ function mixedYardGroupBlockReason(groupItems = []) {
   return `Cannot group orders from different yards: ${yardRows.map((row) => `${row.id} (${row.yard})`).join(", ")}.`;
 }
 
+function dispatchGroupingRefs(order = {}) {
+  return new Set([
+    order.id,
+    ...(order.childOrders || []),
+    ...(order.groupAliases || []),
+    ...(order.childOrderDetails || []).flatMap((child) => [child?.id, child?.originalOrderId])
+  ].map((value) => String(value || "")).filter(Boolean));
+}
+
+function prepareGroupedOrderPlanning(groupItems = []) {
+  const plannedElsewhere = groupItems.find((item) => isOrderPlannedOutsideCurrentPlan(item));
+  if (plannedElsewhere) {
+    selectedOrderId = plannedElsewhere.id;
+    selectedOrderIds = new Set([plannedElsewhere.id]);
+    routeNotice = `${plannedElsewhere.id} is already ${orderPlannedElsewhereText(plannedElsewhere)}. Remove it from that plan before grouping.`;
+    return null;
+  }
+
+  const refs = new Set(groupItems.flatMap((item) => [...dispatchGroupingRefs(item)]));
+  const assignments = [];
+  for (const truck of trucks) {
+    for (const load of truck.loads || []) {
+      for (const [index, stop] of (load.stops || []).entries()) {
+        if (stop.type === "drop" && refs.has(String(stop.orderId || ""))) {
+          assignments.push({ truck, load, stop, index });
+        }
+      }
+    }
+  }
+
+  const assignedLoadIds = new Set(assignments.map((entry) => String(entry.load.id || "")));
+  if (assignedLoadIds.size > 1) {
+    routeNotice = `Cannot group orders assigned to different loads: ${assignments.map((entry) => `${entry.stop.orderId} (${entry.truck.plate} ${entry.load.name})`).join(", ")}.`;
+    return null;
+  }
+  const activeAssignment = assignments.find((entry) =>
+    loadHasDriverActivity(entry.load) || stopHasDriverActivity(entry.load, entry.stop)
+  );
+  if (activeAssignment) {
+    routeNotice = `Cannot group orders in ${activeAssignment.truck.plate} ${activeAssignment.load.name} because driver activity has already started.`;
+    return null;
+  }
+
+  return {
+    refs,
+    assignments,
+    truck: assignments[0]?.truck || null,
+    load: assignments[0]?.load || null
+  };
+}
+
+function applyGroupedOrderPlanning(grouped, planning = {}) {
+  const load = planning.load;
+  if (!load || !planning.assignments?.length) return;
+  const affectedStopIds = new Set(planning.assignments.map((entry) => String(entry.stop.id || "")));
+  const primary = [...planning.assignments].sort((left, right) => left.index - right.index)[0];
+  const groupedStop = {
+    ...primary.stop,
+    id: `${load.id}-${grouped.id}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    loadId: load.id,
+    orderId: grouped.id,
+    location: grouped.address || primary.stop.location || ""
+  };
+  const nextStops = [];
+  let inserted = false;
+  for (const stop of load.stops || []) {
+    if (affectedStopIds.has(String(stop.id || ""))) {
+      if (!inserted) {
+        nextStops.push(groupedStop);
+        inserted = true;
+      }
+      continue;
+    }
+    if (stop.type === "pick" && planning.refs.has(String(stop.orderId || ""))) {
+      nextStops.push({ ...stop, orderId: grouped.id });
+      continue;
+    }
+    nextStops.push(stop);
+  }
+  load.stops = nextStops;
+  selectedLoadId = load.id;
+  delete routeCache[load.id];
+  delete routeEstimates[load.id];
+  if (["SO", "TO"].includes(grouped.type)) {
+    for (const ref of grouped.childOrders || []) pendingOperatorAlertRefs.add(ref);
+  }
+  routeNotice = `${grouped.id} grouped in ${planning.truck?.plate || "truck"} ${load.name}.`;
+}
+
 function groupOrder(orderId) {
-  const order = orderById(orderId);
   const selected = selectedOrders();
   const groupItems = selected.length > 1 ? selected : [];
   if (groupItems.length < 2) {
@@ -8098,6 +8303,8 @@ function groupOrder(orderId) {
     routeNotice = `${dependencyBlockedOrder.id} is linked to ${dependencyBlockedOrder.dependentSalesOrderRef || "a Sales Order"} as direct pickup and cannot be grouped independently.`;
     return false;
   }
+  const planning = prepareGroupedOrderPlanning(groupItems);
+  if (!planning) return false;
   const flattenedMembers = flattenDispatchGroupMembers({
     type: groupItems[0].type,
     childOrders: groupItems.map((item) => item.id),
@@ -8130,6 +8337,7 @@ function groupOrder(orderId) {
   const firstIndex = orders.findIndex((item) => ids.has(item.id));
   orders = orders.filter((item) => !ids.has(item.id));
   orders.splice(Math.max(firstIndex, 0), 0, grouped);
+  applyGroupedOrderPlanning(grouped, planning);
   selectedOrderId = grouped.id;
   selectedOrderIds = new Set([grouped.id]);
   return true;
@@ -9133,6 +9341,7 @@ app.addEventListener("click", (event) => {
   if (action === "order-type-tab") {
     activeOrderType = button.dataset.type;
     searchText = "";
+    cancelDispatchOrderSearch();
     selectedOrderIds = new Set();
     selectedOrderId = openOrders()[0]?.id || selectedOrderId;
     if (selectedOrderId) selectedOrderIds.add(selectedOrderId);
@@ -9572,6 +9781,7 @@ app.addEventListener("click", (event) => {
   if (action === "support-tab") supportTab = button.dataset.tab;
   if (action === "refresh-orders") {
     searchText = "";
+    cancelDispatchOrderSearch();
     loadDispatchOrders().then(() => restoreServerPlan()).then((applied) => {
       if (applied) render({ save: false });
       else render({ save: false });
@@ -9681,6 +9891,7 @@ app.addEventListener("input", (event) => {
   }
   if (event.target?.id !== "orderSearch") return;
   searchText = event.target.value;
+  scheduleDispatchOrderSearch();
   refreshOrderPoolForSearch();
 });
 

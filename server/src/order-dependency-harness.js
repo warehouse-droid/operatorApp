@@ -1,5 +1,6 @@
 import { beginRollbackContext, closeDb, query } from "./db.js";
 import { config } from "./config.js";
+import { safeNormalDependencyGroupingRefs } from "./server.js";
 import { matchNetSuiteLocation } from "./netsuite.js";
 import { buildTransferDependencyRestPayload } from "./transfer-dependency-netsuite.js";
 import {
@@ -109,6 +110,26 @@ async function fakeHydrateTransferOrder(transferOrderId, proposal) {
 const rollback = await beginRollbackContext();
 try {
   await rollback.run(async () => {
+    const normalStructure = {
+      orders: [{ id: "SOM05091" }, { id: "SOM05092" }]
+    };
+    const groupedStructure = {
+      orders: [{
+        id: "GOM-5091-5092",
+        childOrders: ["SOM05091", "SOM05092"],
+        childOrderDetails: [{ id: "SOM05091" }, { id: "SOM05092" }]
+      }]
+    };
+    const safeGroupingRefs = safeNormalDependencyGroupingRefs(normalStructure, groupedStructure);
+    check(safeGroupingRefs.includes("SOM05091") && safeGroupingRefs.includes("SOM05092"),
+      "Only normal orders entering a new group should receive the safe dependency grouping exception.",
+      { safeGroupingRefs });
+    check(safeNormalDependencyGroupingRefs(groupedStructure, normalStructure).length === 0,
+      "Ungrouping must not receive the safe dependency grouping exception.");
+    check(safeNormalDependencyGroupingRefs(normalStructure, {
+      orders: [{ id: "SOM05091-S1", originalOrderId: "SOM05091" }]
+    }).length === 0, "Splitting must not receive the safe dependency grouping exception.");
+
     const sandboxLocations = [
       { id: "1", name: "3445", fullname: "Mr Bin Building Supply LTD : 3445", isinactive: "F", subsidiary: "1" },
       { id: "13", name: "2967", fullname: "Brampton Stone : 2967", isinactive: "F", subsidiary: "6" },
@@ -535,6 +556,42 @@ try {
     });
     check(orderedConflicts.length === 0,
       "Replenishment TO before SO pickup in the same load should be valid.", { orderedConflicts });
+
+    let safeNormalGroupingBlocked = false;
+    try {
+      await assertNoActiveOrderDependenciesByRefs(
+        [salesOrderRef],
+        "group these orders",
+        { allowNormalGroupingRefs: [salesOrderRef] }
+      );
+    } catch {
+      safeNormalGroupingBlocked = true;
+    }
+    check(!safeNormalGroupingBlocked,
+      "An unstarted normal yard-replenishment dependency should allow its Sales Order to enter a group.");
+
+    await query(
+      `UPDATE order_dependency_lines
+          SET loaded_quantity = 1
+        WHERE id = (
+          SELECT id FROM order_dependency_lines WHERE dependency_id = $1 ORDER BY id LIMIT 1
+        )`,
+      [dependency.id]
+    );
+    let progressedGroupingBlocked = false;
+    try {
+      await assertNoActiveOrderDependenciesByRefs(
+        [salesOrderRef],
+        "group these orders",
+        { allowNormalGroupingRefs: [salesOrderRef] }
+      );
+    } catch (error) {
+      progressedGroupingBlocked = error.code === "ORDER_DEPENDENCY_STRUCTURE_LOCK";
+    }
+    check(progressedGroupingBlocked,
+      "Dependency grouping must remain blocked after execution progress starts.");
+    await query("UPDATE order_dependency_lines SET loaded_quantity = 0 WHERE dependency_id = $1", [dependency.id]);
+
     await query("UPDATE transfer_orders SET receiving_status = 'received' WHERE netsuite_id = $1", [dependency.transferOrderId]);
     await syncOrderDependenciesForTransferOrder(dependency.transferOrderId);
     const completedReplenishment = (await listOrderDependencies({ salesOrderRef }))[0];
@@ -575,11 +632,15 @@ try {
 
     let structureBlocked = false;
     try {
-      await assertNoActiveOrderDependenciesByRefs([salesOrderRef], "split this order");
+      await assertNoActiveOrderDependenciesByRefs(
+        [salesOrderRef],
+        "split this order",
+        { allowNormalGroupingRefs: [salesOrderRef] }
+      );
     } catch (error) {
       structureBlocked = error.code === "ORDER_DEPENDENCY_STRUCTURE_LOCK";
     }
-    check(structureBlocked, "Active dependency must block group/split structural changes.");
+    check(structureBlocked, "Direct dependencies must remain blocked from group/split structural changes.");
 
     const planId = 9876000000 + suffix;
     const loadId = `DEP-LOAD-${suffix}`;

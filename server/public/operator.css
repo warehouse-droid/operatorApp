@@ -2268,10 +2268,6 @@ label span {
   font-weight: 800;
 }
 
-.camera-actions input[type="file"] {
-  display: none;
-}
-
 .photo-slot-row {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
@@ -2303,15 +2299,6 @@ label span {
   flex: 1 1 150px;
 }
 
-.fulfillment-card input[type="file"] {
-  width: 100%;
-  min-height: 54px;
-  border: 2px solid var(--line);
-  border-radius: 8px;
-  padding: 10px;
-  font-weight: 900;
-}
-
 .photo-preview,
 .camera-preview,
 .photo-placeholder {
@@ -2329,6 +2316,11 @@ label span {
 }
 
 .camera-preview {
+  aspect-ratio: 4 / 3;
+  max-height: min(62vh, 720px);
+}
+
+.camera-preview.mirrored {
   transform: scaleX(-1);
 }
 

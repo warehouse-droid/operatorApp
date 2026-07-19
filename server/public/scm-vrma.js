@@ -48,6 +48,32 @@ function vrmaEditableNumber(value) {
   return quantity > 0 ? quantity : "";
 }
 
+function vrmaNumber(value) {
+  const number = Number(value || 0);
+  return Number.isFinite(number) ? Math.max(number, 0) : 0;
+}
+
+function vrmaWeightLabel(value) {
+  return `${vrmaNumber(value).toLocaleString("en-CA", { maximumFractionDigits: 2 })} lb`;
+}
+
+function vrmaLineSalesQuantity(line = {}) {
+  if (!line.item) return 0;
+  const converted = (vrmaNumber(line.palletQty) * vrmaNumber(line.item.toPlt))
+    + (vrmaNumber(line.layerQty) * vrmaNumber(line.item.toLyr))
+    + (vrmaNumber(line.sectionQty) * vrmaNumber(line.item.toSec))
+    + (vrmaNumber(line.pieceQty) * vrmaNumber(line.item.toPcs));
+  return converted > 0 ? converted : vrmaNumber(line.quantity);
+}
+
+function vrmaLineWeight(line = {}) {
+  return vrmaLineSalesQuantity(line) * vrmaNumber(line.item?.itemWeight);
+}
+
+function vrmaLineWeightText(line = {}) {
+  return `Estimated line weight: ${vrmaWeightLabel(vrmaLineWeight(line))}`;
+}
+
 function vrmaLineFromOrder(line = {}) {
   const item = {
     itemId: line.itemId,
@@ -229,6 +255,7 @@ function renderVrmaLine(line, index) {
               <button data-action="select-item" data-line-key="${vrmaEscape(line.key)}" data-item-id="${vrmaEscape(item.itemId)}" type="button">
                 <strong>${vrmaEscape(item.sku)} · ${vrmaEscape(item.itemName)}</strong>
                 <span>${vrmaEscape(item.description || "No description")}</span>
+                <small>Unit weight: ${vrmaEscape(vrmaWeightLabel(item.itemWeight))} / ${vrmaEscape(item.stockUnit || "stock unit")}</small>
               </button>
             `).join("")}
           </div>
@@ -238,16 +265,23 @@ function renderVrmaLine(line, index) {
         <div class="vrma-line-meta">
           <strong>${vrmaEscape(line.item.sku)}</strong>
           <span>${vrmaEscape(line.item.description || line.item.itemName)}</span>
-          <small>Stock UOM: ${vrmaEscape(line.item.stockUnit || "--")}</small>
+          <small>Stock UOM: ${vrmaEscape(line.item.stockUnit || "--")} · Unit weight: ${vrmaEscape(vrmaWeightLabel(line.item.itemWeight))}</small>
         </div>
       ` : ""}
       ${renderVrmaQuantityInputs(line)}
+      ${line.item ? `<div class="vrma-line-weight" data-vrma-line-weight>${vrmaEscape(vrmaLineWeightText(line))}</div>` : ""}
     </article>
   `;
 }
 
 function renderVrmaLines() {
   return scmVrmaDraft.lines.map(renderVrmaLine).join("");
+}
+
+function updateVrmaLineWeightDisplay(line) {
+  const card = scmVrmaApp.querySelector(`[data-line-key="${CSS.escape(String(line?.key || ""))}"]`);
+  const weight = card?.querySelector("[data-vrma-line-weight]");
+  if (weight) weight.textContent = vrmaLineWeightText(line);
 }
 
 function renderVrmaLineRegion(focusKey = "") {
@@ -428,7 +462,9 @@ scmVrmaApp.addEventListener("input", (event) => {
     const selectedLabel = line.item ? `${line.item.sku} — ${line.item.itemName}` : "";
     if (line.item && line.itemQuery !== selectedLabel) line.item = null;
     queueVrmaItemSearch(line);
+    return;
   }
+  updateVrmaLineWeightDisplay(line);
 });
 
 scmVrmaApp.addEventListener("change", (event) => {
@@ -444,7 +480,10 @@ scmVrmaApp.addEventListener("change", (event) => {
   const lineField = event.target.closest("[data-line-field]");
   if (!lineField) return;
   const line = lineByKey(lineField.closest("[data-line-key]")?.dataset.lineKey);
-  if (line) line[lineField.dataset.lineField] = lineField.value;
+  if (line) {
+    line[lineField.dataset.lineField] = lineField.value;
+    updateVrmaLineWeightDisplay(line);
+  }
 });
 
 scmVrmaApp.addEventListener("click", async (event) => {

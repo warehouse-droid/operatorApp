@@ -10,7 +10,7 @@
   <body>
     <main class="dispatch-shell dispatch-menu-shell" id="dispatchMenuApp"></main>
     <script src="/i18n.js?v=20260716-yard-movements-v1"></script>
-    <script src="/app-sidebar.js?v=20260717-control-direct-routes-v1"></script>
+    <script src="/app-sidebar.js?v=20260717-po-to-schedule-v1"></script>
     <script src="/dispatch-auth.js?v=20260716-multi-role-v1"></script>
     <script>
       let dispatchMenuOperator = null;
@@ -39,6 +39,10 @@
                 <button class="dispatch-menu-card primary-card" onclick="location.href='/dispatch/planning'" type="button">
                   <strong>${mt("dispatch.planning", "Planning")}</strong>
                   <span>${mt("dispatch.planningDesc", "Build daily truck loads, routes, CO transit moves, and stop sequences.")}</span>
+                </button>
+                <button class="dispatch-menu-card" onclick="location.href='/dispatch/po-to-schedule'" type="button">
+                  <strong>${mt("dispatch.poToSchedule", "PO / TO Schedule")}</strong>
+                  <span>${mt("dispatch.poToScheduleDesc", "Review purchase and transfer order transport schedules, status, yards, and ETA.")}</span>
                 </button>
                 <button class="dispatch-menu-card" onclick="location.href='/dispatch/monitor'" type="button">
                   <strong>${mt("dispatch.monitor", "Monitor")}</strong>

@@ -188,7 +188,7 @@ const loadedTypeByDirection = {
   inbound: ["purchase_order", "transfer_order", "co_order"].includes(localStorage.getItem("mbbs.control.loaded.inboundType"))
     ? localStorage.getItem("mbbs.control.loaded.inboundType")
     : "purchase_order",
-  outbound: ["sales_order", "transfer_order", "vrma_order"].includes(localStorage.getItem("mbbs.control.loaded.outboundType"))
+  outbound: ["sales_order", "transfer_order", "co_order", "vrma_order"].includes(localStorage.getItem("mbbs.control.loaded.outboundType"))
     ? localStorage.getItem("mbbs.control.loaded.outboundType")
     : "sales_order"
 };
@@ -769,7 +769,7 @@ function loadedOrderKey(order) {
 
 const YARD_MOVEMENT_TYPES = {
   inbound: ["purchase_order", "transfer_order", "co_order"],
-  outbound: ["sales_order", "transfer_order", "vrma_order"]
+  outbound: ["sales_order", "transfer_order", "co_order", "vrma_order"]
 };
 
 function selectedLoadedOrderType() {

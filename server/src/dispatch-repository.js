@@ -3,6 +3,7 @@ import { pool, query, withTransaction } from "./db.js";
 import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
 import { isNetSuiteSandboxEnvironment } from "./config.js";
 import {
+  createPurchaseOrderDispatchEnricher,
   enrichPurchaseOrderDispatch,
   enrichSalesOrderDispatch,
   enrichTransferDispatch,
@@ -15,6 +16,8 @@ function toNumber(value) {
 }
 
 const CUSTOMER_PICKUP_DELIVERY_METHOD = "Pick-Up";
+const DEFAULT_DISPATCH_ORDERS_PER_TYPE = 500;
+const MAX_DISPATCH_ORDERS_PER_TYPE = 2000;
 const SCM_VRMA_OWN_YARDS = [
   { code: "3445", name: "3445", address: "3445 Kennedy Road, Toronto, ON" },
   { code: "2967", name: "2967", address: "2967 Kennedy Road, Toronto, ON" },
@@ -191,10 +194,13 @@ function yardAddressSql(field) {
   END`;
 }
 
-export async function listDispatchOrders({ type = null, includeHiddenScm = false } = {}) {
-  const params = [Boolean(includeHiddenScm), isNetSuiteSandboxEnvironment()];
-  const typeClause = type ? `WHERE dispatch_type = $3` : "";
-  if (type) params.push(type);
+export async function listDispatchOrders({
+  type = null, includeHiddenScm = false, search = "", perTypeLimit = DEFAULT_DISPATCH_ORDERS_PER_TYPE
+} = {}) {
+  const searchTerm = String(search || "").trim().slice(0, 120);
+  const cleanPerTypeLimit = Math.min(Math.max(Number(perTypeLimit) || DEFAULT_DISPATCH_ORDERS_PER_TYPE, 1), MAX_DISPATCH_ORDERS_PER_TYPE);
+  const normalizedType = String(type || "").trim().toUpperCase();
+  const params = [Boolean(includeHiddenScm), isNetSuiteSandboxEnvironment(), searchTerm, cleanPerTypeLimit, normalizedType];
   const result = await query(
     `
     WITH so_alloc AS (
@@ -893,6 +899,36 @@ export async function listDispatchOrders({ type = null, includeHiddenScm = false
           OR COALESCE(scm.status, v.status, 'Queued') NOT IN ('Cancelled', 'Hold')
         )
       GROUP BY v.id, scm.id, vrma_yard.address, vrma_yard.window_start, vrma_yard.window_end, vrma_yard.instructions
+    ),
+    eligible_orders AS (
+      SELECT * FROM delivery
+      UNION ALL
+      SELECT * FROM receiving
+      UNION ALL
+      SELECT * FROM local_co
+      UNION ALL
+      SELECT * FROM local_vrma
+    ),
+    ranked_orders AS (
+      SELECT eligible_orders.*,
+             ROW_NUMBER() OVER (
+               PARTITION BY dispatch_type
+               ORDER BY CASE WHEN $2::boolean AND tranid LIKE 'TSTDEP-SO-%' THEN 0 ELSE 1 END,
+                        dispatch_window_start NULLS LAST, tranid DESC
+             ) AS dispatch_type_rank
+        FROM eligible_orders
+       WHERE ($5::text = '' OR dispatch_type = $5)
+         AND (
+           $3::text = ''
+           OR tranid ILIKE '%' || $3 || '%'
+           OR COALESCE(dispatch_ref, '') ILIKE '%' || $3 || '%'
+           OR COALESCE(party, '') ILIKE '%' || $3 || '%'
+           OR COALESCE(drop_address, '') ILIKE '%' || $3 || '%'
+           OR COALESCE(pickup_location, '') ILIKE '%' || $3 || '%'
+           OR COALESCE(destination_location, '') ILIKE '%' || $3 || '%'
+           OR COALESCE(dispatch_instructions, '') ILIKE '%' || $3 || '%'
+           OR COALESCE(items, '[]'::jsonb)::text ILIKE '%' || $3 || '%'
+         )
     )
     SELECT orders.*,
            COALESCE((
@@ -903,19 +939,11 @@ export async function listDispatchOrders({ type = null, includeHiddenScm = false
                 AND orders.dispatch_type = 'PO'
                 AND lower(g.group_ref) = lower(COALESCE(NULLIF(orders.dispatch_ref, ''), orders.tranid))
            ), '[]'::jsonb) AS scm_child_orders
-    FROM (
-      SELECT * FROM delivery
-      UNION ALL
-      SELECT * FROM receiving
-      UNION ALL
-      SELECT * FROM local_co
-      UNION ALL
-      SELECT * FROM local_vrma
-    ) orders
-    ${typeClause}
+    FROM ranked_orders orders
+    WHERE $3::text <> '' OR orders.dispatch_type_rank <= $4
     ORDER BY CASE WHEN $2::boolean AND tranid LIKE 'TSTDEP-SO-%' THEN 0 ELSE 1 END,
              dispatch_window_start NULLS LAST, tranid DESC
-    LIMIT 500
+    LIMIT CASE WHEN $3::text <> '' THEN 200 ELSE NULL END
     `,
     params
   );
@@ -1822,6 +1850,12 @@ function normalizeScmOrderKind(value) {
   return "PO";
 }
 
+function normalizeScmScheduleFilterValues(value, { lowercase = false } = {}) {
+  const source = Array.isArray(value) ? value : String(value || "").split(",");
+  const values = source.map((item) => String(item || "").trim()).filter(Boolean);
+  return [...new Set(values.map((item) => lowercase ? item.toLowerCase() : item))];
+}
+
 function scmDisplayRef(row = {}) {
   return row.dispatch_ref || row.display_ref || row.order_ref || row.tranid || row.vrma_ref || "";
 }
@@ -1838,10 +1872,10 @@ async function listScmVrmaSchedule({
 } = {}) {
   const params = [
     String(search || "").trim().toLowerCase(),
-    String(status || "").trim(),
+    normalizeScmScheduleFilterValues(status),
     String(method || "").trim(),
     String(yard || "").trim(),
-    String(brand || "").trim().toLowerCase(),
+    normalizeScmScheduleFilterValues(brand, { lowercase: true }),
     String(from || "").trim() || null,
     String(to || "").trim() || null,
     String(view || "").trim()
@@ -1932,10 +1966,10 @@ async function listScmVrmaSchedule({
             END AS sla_days
        FROM vrma_rows
       WHERE ($1 = '' OR LOWER(CONCAT_WS(' ', order_ref, party, pickup_point, dropoff_point, brand, content, packing_slip_ref, group_ref)) LIKE '%' || $1 || '%')
-        AND ($2 = '' OR status = $2)
+        AND (cardinality($2::text[]) = 0 OR status = ANY($2::text[]))
         AND ($3 = '' OR method = $3)
         AND ($4 = '' OR dropoff_point = $4)
-        AND ($5 = '' OR LOWER(brand) = $5)
+        AND (cardinality($5::text[]) = 0 OR LOWER(brand) = ANY($5::text[]))
         AND ($6::date IS NULL OR eta_date >= $6::date)
         AND ($7::date IS NULL OR eta_date <= $7::date)
         AND ($8 <> 'dispatch' OR (method = 'MBT' AND status NOT IN ('Cancelled', 'Hold')))
@@ -2001,9 +2035,11 @@ export async function listScmSchedule({
   to = "",
   view = ""
 } = {}) {
-  if (String(kind || "").trim().toUpperCase() === "VRMA") {
+  const globalSearch = String(search || "").trim().toLowerCase();
+  const cleanKind = String(kind || "").trim().toUpperCase();
+  if (!globalSearch && cleanKind === "VRMA") {
     return listScmVrmaSchedule({
-      search,
+      search: "",
       status,
       method,
       yard,
@@ -2014,15 +2050,15 @@ export async function listScmSchedule({
     });
   }
   const params = [
-    String(search || "").trim().toLowerCase(),
-    String(status || "").trim(),
-    String(method || "").trim(),
-    String(kind || "").trim().toUpperCase(),
-    String(yard || "").trim(),
-    String(brand || "").trim().toLowerCase(),
-    String(from || "").trim() || null,
-    String(to || "").trim() || null,
-    String(view || "").trim()
+    globalSearch,
+    globalSearch ? [] : normalizeScmScheduleFilterValues(status),
+    globalSearch ? "" : String(method || "").trim(),
+    globalSearch ? "" : cleanKind,
+    globalSearch ? "" : String(yard || "").trim(),
+    globalSearch ? [] : normalizeScmScheduleFilterValues(brand, { lowercase: true }),
+    globalSearch ? null : String(from || "").trim() || null,
+    globalSearch ? null : String(to || "").trim() || null,
+    globalSearch ? "" : String(view || "").trim()
   ];
   const result = await query(
     `
@@ -2192,10 +2228,23 @@ export async function listScmSchedule({
       UNION ALL SELECT * FROM base_to
       UNION ALL SELECT * FROM base_vrma
     ),
+    plan_order_types AS MATERIALIZED (
+      SELECT snap.plan_id,
+             item.value->>'id' AS order_ref,
+             CASE
+               WHEN item.value->>'sourceTable' = 'scm_vrma_orders' THEN 'VRMA'
+               WHEN item.value->>'type' = 'TO' THEN 'TO'
+               ELSE 'PO'
+             END AS order_kind
+        FROM dispatch_plan_snapshots snap
+        CROSS JOIN LATERAL jsonb_array_elements(COALESCE(snap.orders, '[]'::jsonb)) item(value)
+       WHERE item.value->>'type' IN ('PO', 'TO')
+          OR item.value->>'sourceTable' = 'scm_vrma_orders'
+    ),
     planned AS (
-      SELECT DISTINCT ON (planned_order.order_kind, planned_order.order_ref)
-        planned_order.order_kind,
-        planned_order.order_ref,
+      SELECT DISTINCT ON (plan_order.order_kind, plan_order.order_ref)
+        plan_order.order_kind,
+        plan_order.order_ref,
         p.plan_date AS eta_date,
         COALESCE(NULLIF(stop.value->>'arriveTime', ''), NULLIF(stop.value->>'plannedArrive', ''), '') AS eta_time,
         COALESCE(NULLIF(truck.value->>'driverName', ''), NULLIF(truck.value->>'driver', ''), '') AS driver,
@@ -2205,26 +2254,14 @@ export async function listScmSchedule({
       CROSS JOIN LATERAL jsonb_array_elements(COALESCE(snap.trucks, '[]'::jsonb)) truck(value)
       CROSS JOIN LATERAL jsonb_array_elements(COALESCE(truck.value->'loads', '[]'::jsonb)) load(value)
       CROSS JOIN LATERAL jsonb_array_elements(COALESCE(load.value->'stops', '[]'::jsonb)) stop(value)
-      LEFT JOIN LATERAL (
-        SELECT item.value
-          FROM jsonb_array_elements(COALESCE(snap.orders, '[]'::jsonb)) item(value)
-         WHERE item.value->>'id' = stop.value->>'orderId'
-         LIMIT 1
-      ) plan_order ON true
-      CROSS JOIN LATERAL (
-        SELECT
-          CASE
-            WHEN plan_order.value->>'sourceTable' = 'scm_vrma_orders' THEN 'VRMA'
-            WHEN plan_order.value->>'type' = 'TO' THEN 'TO'
-            ELSE 'PO'
-          END AS order_kind,
-          stop.value->>'orderId' AS order_ref
-      ) planned_order
+      JOIN plan_order_types plan_order
+        ON plan_order.plan_id = snap.plan_id
+       AND plan_order.order_ref = stop.value->>'orderId'
       WHERE stop.value->>'type' = 'drop'
         AND COALESCE(stop.value->>'orderId', '') <> ''
         AND COALESCE(load.value->>'returnOnly', 'false') <> 'true'
-        AND (plan_order.value->>'type' IN ('PO', 'TO') OR plan_order.value->>'sourceTable' = 'scm_vrma_orders')
-      ORDER BY planned_order.order_kind, planned_order.order_ref, p.plan_date DESC, COALESCE(NULLIF(stop.value->>'arriveTime', ''), NULLIF(stop.value->>'plannedArrive', ''), '') DESC
+      ORDER BY plan_order.order_kind, plan_order.order_ref, p.plan_date DESC,
+               COALESCE(NULLIF(stop.value->>'arriveTime', ''), NULLIF(stop.value->>'plannedArrive', ''), '') DESC
     )
     SELECT
       COALESCE(s.id, 0) AS schedule_id,
@@ -2277,13 +2314,13 @@ export async function listScmSchedule({
       ON planned.order_kind = b.order_kind
      AND lower(planned.order_ref) = lower(b.order_ref)
     WHERE ($1 = '' OR lower(concat_ws(' ', b.order_ref, b.source_ref, b.dispatch_ref, b.party, b.pickup_point, b.dropoff_point, b.brand, b.content, s.packing_slip_ref, s.group_ref)) LIKE '%' || $1 || '%')
-      AND ($2 = '' OR (
+      AND (cardinality($2::text[]) = 0 OR (
         CASE
           WHEN COALESCE(s.status, '') IN ('Completed', 'Cancelled', 'Hold') THEN s.status
           WHEN planned.order_ref IS NOT NULL THEN 'Planned'
           ELSE COALESCE(s.status, 'Queued')
         END
-      ) = $2)
+      ) = ANY($2::text[]))
       AND ($3 = '' OR COALESCE(s.method, 'MBT') = $3)
       AND ($4 = '' OR b.order_kind = $4)
       AND (
@@ -2291,7 +2328,7 @@ export async function listScmSchedule({
         OR COALESCE(s.dropoff_point, b.dropoff_point, '') = $5
         OR regexp_split_to_array(regexp_replace(COALESCE(s.dropoff_point, b.dropoff_point, ''), '\\s+', '', 'g'), '\\+') @> ARRAY[$5]
       )
-      AND ($6 = '' OR lower(COALESCE(NULLIF(s.brand, ''), b.brand, '')) = $6)
+      AND (cardinality($6::text[]) = 0 OR lower(COALESCE(NULLIF(s.brand, ''), b.brand, '')) = ANY($6::text[]))
       AND ($7::date IS NULL OR COALESCE(s.eta_date, planned.eta_date, b.expected_delivery_date) >= $7::date)
       AND ($8::date IS NULL OR COALESCE(s.eta_date, planned.eta_date, b.expected_delivery_date) <= $8::date)
       AND (
@@ -2339,29 +2376,32 @@ export async function listScmSchedule({
       .filter((row) => row.order_kind === "PO" && row.source_id)
       .map((row) => String(row.source_id))
   ));
-  const poDetails = poIds.length
-    ? await query(
-      `SELECT po.netsuite_id,
-              po.tranid,
-              po.dispatch_ref,
-              po.vendor_id,
-              po.vendor,
-              po.memo,
-              po.vendor_address,
-              po.dispatch_vendor_yard,
-              vendor_map.local_vendor
-         FROM purchase_orders po
-         LEFT JOIN dispatch_vendor_mappings vendor_map
-           ON vendor_map.active = true
-          AND COALESCE(vendor_map.local_vendor, '') <> ''
-          AND (
-            (COALESCE(po.vendor_id::text, '') <> '' AND vendor_map.netsuite_vendor_id::text = po.vendor_id::text)
-            OR lower(vendor_map.netsuite_vendor_name) = lower(po.vendor)
-          )
-        WHERE po.netsuite_id::text = ANY($1::text[])`,
-      [poIds]
-    )
-    : { rows: [] };
+  const [poDetails, schedulePoEnricher] = poIds.length
+    ? await Promise.all([
+      query(
+        `SELECT po.netsuite_id,
+                po.tranid,
+                po.dispatch_ref,
+                po.vendor_id,
+                po.vendor,
+                po.memo,
+                po.vendor_address,
+                po.dispatch_vendor_yard,
+                vendor_map.local_vendor
+           FROM purchase_orders po
+           LEFT JOIN dispatch_vendor_mappings vendor_map
+             ON vendor_map.active = true
+            AND COALESCE(vendor_map.local_vendor, '') <> ''
+            AND (
+              (COALESCE(po.vendor_id::text, '') <> '' AND vendor_map.netsuite_vendor_id::text = po.vendor_id::text)
+              OR lower(vendor_map.netsuite_vendor_name) = lower(po.vendor)
+            )
+          WHERE po.netsuite_id::text = ANY($1::text[])`,
+        [poIds]
+      ),
+      createPurchaseOrderDispatchEnricher({ allowOllama: false })
+    ])
+    : [{ rows: [] }, null];
   const poById = new Map(poDetails.rows.map((row) => [String(row.netsuite_id), row]));
   const enrichmentCache = new Map();
   const enrichPoForSchedule = async (po) => {
@@ -2373,7 +2413,7 @@ export async function listScmSchedule({
       po.vendor_address || ""
     ].join("|");
     if (!enrichmentCache.has(key)) {
-      enrichmentCache.set(key, enrichPurchaseOrderDispatch(po));
+      enrichmentCache.set(key, schedulePoEnricher(po, { mappedLocalVendor: po.local_vendor || "" }));
     }
     return enrichmentCache.get(key);
   };
@@ -4711,6 +4751,58 @@ export async function cancelSalesOrderPoAllocation(allocationId, { cancelledBy =
   return result.rows[0] ? normalizeAllocationRow(result.rows[0]) : null;
 }
 
+function localCoChildSourceYards(child = {}) {
+  const raw = child.raw && typeof child.raw === "object" ? child.raw : {};
+  const normalized = (values) => [...new Set(values.map(locationTextFromId).filter(Boolean))];
+  const rawYards = normalized([
+    raw.pickup_location,
+    raw.outbound_location,
+    raw.source_location
+  ]);
+  if (rawYards.length) return rawYards;
+  const originalYards = normalized([
+    ...(Array.isArray(child.transitOriginalPickupLocations) ? child.transitOriginalPickupLocations : []),
+    child.transitOriginalSourceYard
+  ]);
+  if (originalYards.length) return originalYards;
+  return normalized([
+    ...(Array.isArray(child.pickupLocations) ? child.pickupLocations : []),
+    child.sourceYard
+  ]);
+}
+
+function isLocalCoTransportItem(item = {}) {
+  const itemName = String(item.sku || item.itemName || item.item_name || "").trim().toUpperCase();
+  if (itemName.startsWith("DELIVERY CHARGE") || itemName.startsWith("SALES CREDIT")) return false;
+  return positiveQuantity(item.quantity || item.salesQty)
+    + positiveQuantity(item.pallets || item.pallet_qty)
+    + positiveQuantity(item.layers || item.layer_qty)
+    + positiveQuantity(item.sections || item.section_qty)
+    + positiveQuantity(item.pieces || item.piece_qty) > 0;
+}
+
+function localCoSourceItems(order = {}, fromYard = "") {
+  const children = Array.isArray(order.childOrderDetails) ? order.childOrderDetails : [];
+  if (!children.length) return (Array.isArray(order.items) ? order.items : []).filter(isLocalCoTransportItem);
+  const fromText = locationTextFromId(fromYard);
+  const selectedChildren = children.filter((child) => {
+    const yards = localCoChildSourceYards(child);
+    return !yards.length || yards.includes(fromText);
+  });
+  const childItems = selectedChildren.flatMap((child) => (
+    Array.isArray(child.items) && child.items.length
+      ? child.items
+      : Array.isArray(child.raw?.items) ? child.raw.items : []
+  )).filter(isLocalCoTransportItem);
+  if (!childItems.length) return (Array.isArray(order.items) ? order.items : []).filter(isLocalCoTransportItem);
+  const unique = new Map();
+  childItems.forEach((item, index) => {
+    const key = String(item.lineRowId || item.line_row_id || item.lineId || item.line_id || `${item.itemId || item.item_id || item.sku || "item"}:${index}`);
+    if (!unique.has(key)) unique.set(key, item);
+  });
+  return [...unique.values()];
+}
+
 export async function upsertLocalCoOrder({ sourceOrderRef, fromYard, toYard, order = {}, plan = {}, requestedBy = "" } = {}) {
   const sourceRef = String(sourceOrderRef || order.id || "").trim();
   const fromText = locationTextFromId(fromYard || order.sourceYard || order.pickupLocations?.[0]);
@@ -4785,7 +4877,7 @@ export async function upsertLocalCoOrder({ sourceOrderRef, fromYard, toYard, ord
     co.delivery_order_id = -Number(co.id);
   }
 
-  const items = Array.isArray(order.items) ? order.items : [];
+  const items = localCoSourceItems(order, fromText);
   const activeLineIds = [];
   for (let index = 0; index < items.length; index += 1) {
     const item = items[index] || {};

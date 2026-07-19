@@ -59,11 +59,20 @@ function explicitUnitQuantity(line, unit) {
   return 0;
 }
 
+function isLegacySalesQuantityOnlyLine(line) {
+  const itemName = String(line?.sku || line?.item_name || "").trim().toUpperCase();
+  return !hasConversion(line) && (itemName === "PALLET" || !hasRequiredCustomQuantity(line));
+}
+
+function isSalesQuantityOnlyLine(line) {
+  return !hasConversion(line) && positiveQuantity(line.quantity) > 0;
+}
+
 function receivedSalesQuantity(line) {
   if (!hasConversion(line)) {
-    if (hasRequiredCustomQuantity(line)) {
-      return positiveQuantity(line.received_sales_qty);
-    }
+    const receivedSalesQty = positiveQuantity(line.received_sales_qty);
+    if (receivedSalesQty > 0) return receivedSalesQty;
+    if (!isLegacySalesQuantityOnlyLine(line)) return 0;
     return positiveQuantity(line.received_piece_qty)
       || positiveQuantity(line.received_section_qty)
       || positiveQuantity(line.received_layer_qty)
@@ -78,6 +87,9 @@ function receivedSalesQuantity(line) {
 function receivingUnitAvailability(line) {
   const salesAvailable = remainingSalesQuantity(line);
   if (!hasConversion(line)) {
+    if (isSalesQuantityOnlyLine(line)) {
+      return { pallets: 0, layers: 0, sections: 0, pieces: 0 };
+    }
     if (hasRequiredCustomQuantity(line)) {
       return {
         pallets: positiveQuantity(line.pallet_qty),
@@ -105,8 +117,16 @@ function receivingUnitAvailability(line) {
 }
 
 function resolveIndependentReceivedSalesQuantity(line, received, requestedSalesQty) {
-  if (hasConversion(line) || !hasRequiredCustomQuantity(line)) return 0;
   const explicitSalesQty = positiveQuantity(requestedSalesQty);
+  if (isSalesQuantityOnlyLine(line)) {
+    const requested = explicitSalesQty
+      || positiveQuantity(received.pieces)
+      || positiveQuantity(received.sections)
+      || positiveQuantity(received.layers)
+      || positiveQuantity(received.pallets);
+    return roundQuantity(Math.min(requested, remainingSalesQuantity(line)));
+  }
+  if (hasConversion(line) || !hasRequiredCustomQuantity(line)) return 0;
   const selectedPhysical = positiveQuantity(received.pallets)
     + positiveQuantity(received.layers)
     + positiveQuantity(received.sections)
@@ -489,11 +509,14 @@ export async function confirmReceivingLine(orderId, lineRowId, values, operatorI
   if (!line.rowCount) throw new Error("Receiving line not found.");
   const current = applyPoAllocationFields(line.rows[0]);
   const available = receivingUnitAvailability(current);
-  const pallets = Math.min(positiveQuantity(values.pallets), available.pallets);
-  const layers = Math.min(positiveQuantity(values.layers), available.layers);
-  const sections = Math.min(positiveQuantity(values.sections), available.sections);
-  const pieces = Math.min(positiveQuantity(values.pieces), available.pieces);
-  const received = { pallets, layers, sections, pieces };
+  const salesOnly = isSalesQuantityOnlyLine(current);
+  const pallets = salesOnly ? 0 : Math.min(positiveQuantity(values.pallets), available.pallets);
+  const layers = salesOnly ? 0 : Math.min(positiveQuantity(values.layers), available.layers);
+  const sections = salesOnly ? 0 : Math.min(positiveQuantity(values.sections), available.sections);
+  const pieces = salesOnly ? 0 : Math.min(positiveQuantity(values.pieces), available.pieces);
+  const received = salesOnly
+    ? { pallets: values.pallets, layers: values.layers, sections: values.sections, pieces: values.pieces }
+    : { pallets, layers, sections, pieces };
   const receivedSalesQty = resolveIndependentReceivedSalesQuantity(current, received, values.salesQty);
   if (current.order_type === "transfer_order") {
     await query(
@@ -665,7 +688,7 @@ function receiptLineQuantity(line) {
     || positiveQuantity(line.received_pallet_qty);
   const remaining = remainingSalesQuantity(line);
   if (!hasConversion(line)) {
-    const quantity = hasRequiredCustomQuantity(line) ? positiveQuantity(line.received_sales_qty) : baseQuantity;
+    const quantity = receivedSalesQuantity(line);
     return roundQuantity(Math.min(quantity, remaining || quantity));
   }
   const convertedQuantity = (positiveQuantity(line.received_pallet_qty) * positiveQuantity(line.to_plt))
@@ -838,26 +861,32 @@ export async function confirmLocalCoReceivingLine(coRefOrId, lineRowId, values, 
   if (!line.rowCount) throw new Error("CO receiving line not found.");
   const current = line.rows[0];
   const available = receivingUnitAvailability(current);
-  const pallets = Math.min(positiveQuantity(values.pallets), available.pallets);
-  const layers = Math.min(positiveQuantity(values.layers), available.layers);
-  const sections = Math.min(positiveQuantity(values.sections), available.sections);
-  const pieces = Math.min(positiveQuantity(values.pieces), available.pieces);
+  const salesOnly = isSalesQuantityOnlyLine(current);
+  const pallets = salesOnly ? 0 : Math.min(positiveQuantity(values.pallets), available.pallets);
+  const layers = salesOnly ? 0 : Math.min(positiveQuantity(values.layers), available.layers);
+  const sections = salesOnly ? 0 : Math.min(positiveQuantity(values.sections), available.sections);
+  const pieces = salesOnly ? 0 : Math.min(positiveQuantity(values.pieces), available.pieces);
+  const received = salesOnly
+    ? { pallets: values.pallets, layers: values.layers, sections: values.sections, pieces: values.pieces }
+    : { pallets, layers, sections, pieces };
+  const receivedSalesQty = resolveIndependentReceivedSalesQuantity(current, received, values.salesQty);
   await query(
     `UPDATE co_order_lines
         SET received_pallet_qty = $2,
             received_layer_qty = $3,
             received_section_qty = $4,
             received_piece_qty = $5,
+            received_sales_qty = $7,
             confirmed_at = now(),
             confirmed_by = $6
       WHERE id = $1`,
-    [lineRowId, pallets, layers, sections, pieces, operatorId || null]
+    [lineRowId, pallets, layers, sections, pieces, operatorId || null, receivedSalesQty]
   );
   await writeAudit({
     actorOperatorId: operatorId,
     source: "receiving",
     action: "local_co.line.confirm",
-    details: { coRefOrId, lineRowId, pallets, layers, sections, pieces }
+    details: { coRefOrId, lineRowId, pallets, layers, sections, pieces, salesQty: receivedSalesQty }
   });
   return getLocalCoReceivingOrder(coRefOrId);
 }
@@ -880,6 +909,7 @@ export async function unconfirmLocalCoReceivingLine(coRefOrId, lineRowId, operat
             received_layer_qty = 0,
             received_section_qty = 0,
             received_piece_qty = 0,
+            received_sales_qty = 0,
             confirmed_at = null,
             confirmed_by = null
       WHERE id = $1`,
@@ -895,7 +925,8 @@ export async function unconfirmLocalCoReceivingLine(coRefOrId, lineRowId, operat
       pallets: current.received_pallet_qty,
       layers: current.received_layer_qty,
       sections: current.received_section_qty,
-      pieces: current.received_piece_qty
+      pieces: current.received_piece_qty,
+      salesQty: current.received_sales_qty
     }
   });
   return getLocalCoReceivingOrder(coRefOrId);
@@ -911,7 +942,8 @@ export async function receiveLocalCoOrder(coRefOrId, operatorId, { photoDataUrls
     return positiveQuantity(line.received_pallet_qty)
       + positiveQuantity(line.received_layer_qty)
       + positiveQuantity(line.received_section_qty)
-      + positiveQuantity(line.received_piece_qty) > 0;
+      + positiveQuantity(line.received_piece_qty)
+      + positiveQuantity(line.received_sales_qty) > 0;
   });
   if (!confirmedLines.length) throw new Error("No confirmed CO lines to receive.");
   const sourceDelivery = await query(
@@ -1099,7 +1131,8 @@ export async function receiveLocalCoOrder(coRefOrId, operatorId, { photoDataUrls
       line.received_pallet_qty,
       line.received_layer_qty,
       line.received_piece_qty,
-      line.received_section_qty
+      line.received_section_qty,
+      line.received_sales_qty
     ];
     if (receiveAsSourceSo) {
       await query(
@@ -1107,13 +1140,13 @@ export async function receiveLocalCoOrder(coRefOrId, operatorId, { photoDataUrls
           sales_order_id, line_id, item_id, item_name, item_type, item_type_text,
           item_description, sku, quantity, unit, location_id, location,
           pallet_qty, layer_qty, piece_qty, section_qty, to_plt, to_lyr, to_sec, to_pcs,
-          packed_pallet_qty, packed_layer_qty, packed_piece_qty, packed_section_qty,
+          packed_pallet_qty, packed_layer_qty, packed_piece_qty, packed_section_qty, packed_sales_qty,
           confirmed, confirmed_at, synced_at, netsuite_active
         ) VALUES (
           $1, $2, $3, $4, COALESCE($5, 'InvtPart'), $6,
           $7, $8, $9, $10, $11, $12,
           $13, $14, $15, $16, $17, $18, $19, $20,
-          $21, $22, $23, $24,
+          $21, $22, $23, $24, $25,
           true, now(), now(), true
         )`,
         values
@@ -1124,14 +1157,14 @@ export async function receiveLocalCoOrder(coRefOrId, operatorId, { photoDataUrls
           line_stage, transfer_order_id, line_id, item_id, item_name, item_type, item_type_text,
           item_description, sku, quantity, unit, location_id, location,
           pallet_qty, layer_qty, piece_qty, section_qty, to_plt, to_lyr, to_sec, to_pcs,
-          packed_pallet_qty, packed_layer_qty, packed_piece_qty, packed_section_qty,
+          packed_pallet_qty, packed_layer_qty, packed_piece_qty, packed_section_qty, packed_sales_qty,
           confirmed, confirmed_at, raw, synced_at, netsuite_active
         ) VALUES (
           'outbound', $1, $2, $3, $4, COALESCE($5, 'InvtPart'), $6,
           $7, $8, $9, $10, $11, $12,
           $13, $14, $15, $16, $17, $18, $19, $20,
-          $21, $22, $23, $24,
-          true, now(), $25::jsonb, now(), true
+          $21, $22, $23, $24, $25,
+          true, now(), $26::jsonb, now(), true
         )`,
         [...values, JSON.stringify(line.raw || {})]
       );

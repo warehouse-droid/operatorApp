@@ -48,7 +48,7 @@ function buildConfig(env) {
       model: env.OLLAMA_MODEL || "qwen3:4b-instruct"
     },
     photoUpload: {
-      provider: env.PHOTO_UPLOAD_PROVIDER || (env.PHOTO_UPLOAD_WORKER_URL ? "r2_worker" : "local_data_url"),
+      provider: env.PHOTO_UPLOAD_PROVIDER || "local_data_url",
       workerUrl: env.PHOTO_UPLOAD_WORKER_URL || "",
       tokenSecret: env.PHOTO_UPLOAD_TOKEN_SECRET || "",
       tokenTtlMinutes: Number(env.PHOTO_UPLOAD_TOKEN_TTL_MINUTES || 45),
