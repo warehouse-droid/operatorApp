@@ -553,6 +553,7 @@ async function uploadOperatorPhoto(photo, context = {}) {
     method: "POST",
     body: JSON.stringify(context)
   });
+  if (ticket.provider === "local_data_url") return photo;
   const file = dataUrlToFile(photo, context.filename || `${context.recordType || "operator-photo"}.jpg`);
   const formData = new FormData();
   formData.append("file", file);

@@ -3,6 +3,7 @@ import { config, isNetSuiteSandboxEnvironment } from "./config.js";
 import { query, withTransaction } from "./db.js";
 import { writeDispatchAudit } from "./dispatch-audit-repository.js";
 import { resolveDispatchSalesTarget } from "./dispatch-order-target-repository.js";
+import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
 
 export const DEPENDENCY_YARDS = Object.freeze([
   { code: "3445", locationId: 1, address: "3445 Kennedy Road, Toronto, ON", priority: 1, westPenaltyMinutes: 0 },
@@ -2090,6 +2091,7 @@ function loadSequenceIndex(plan = {}) {
   let sequence = 0;
   for (const [truckIndex, truck] of (plan.trucks || []).entries()) {
     for (const [loadIndex, load] of (truck.loads || []).entries()) {
+      const loadAssignment = dispatchLoadAssignment(truck, load, { driverSequence: loadIndex });
       const sequencedStops = [];
       for (const stop of load.stops || []) {
         sequence += 1;
@@ -2119,9 +2121,9 @@ function loadSequenceIndex(plan = {}) {
           firstPickupSequence: pickupSequences.length ? Math.min(...pickupSequences) : sequence,
           firstPickupArrival: pickupArrivals.length ? Math.min(...pickupArrivals) : null,
           planDate: plan.planDate,
-          truckPlate: truck.plate,
+          truckPlate: loadAssignment.truckPlate,
           truckIndex,
-          loadIndex,
+          loadIndex: loadAssignment.driverSequence,
           loadId: load.id,
           loadName: load.name,
           stopType: stop.type,

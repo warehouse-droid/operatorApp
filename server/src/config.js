@@ -31,6 +31,9 @@ function buildConfig(env) {
     appBaseUrl: env.APP_BASE_URL || "http://localhost:3000",
     databaseUrl: env.DATABASE_URL,
     googleMapsApiKey: env.GOOGLE_MAPS_API_KEY || "",
+    dispatch: {
+      driverOrientedPlanning: ["1", "true", "yes", "on"].includes(String(env.DISPATCH_DRIVER_ORIENTED_PLANNING ?? "false").trim().toLowerCase())
+    },
     transferDependency: {
       westYardPenaltyMinutes: Number(env.TRANSFER_DEPENDENCY_150_PENALTY_MINUTES || 60),
       employeeId: String(env.TRANSFER_DEPENDENCY_EMPLOYEE_ID || "8721"),
@@ -45,7 +48,7 @@ function buildConfig(env) {
       model: env.OLLAMA_MODEL || "qwen3:4b-instruct"
     },
     photoUpload: {
-      provider: env.PHOTO_UPLOAD_PROVIDER || "local_data_url",
+      provider: env.PHOTO_UPLOAD_PROVIDER || (env.PHOTO_UPLOAD_WORKER_URL ? "r2_worker" : "local_data_url"),
       workerUrl: env.PHOTO_UPLOAD_WORKER_URL || "",
       tokenSecret: env.PHOTO_UPLOAD_TOKEN_SECRET || "",
       tokenTtlMinutes: Number(env.PHOTO_UPLOAD_TOKEN_TTL_MINUTES || 45),
@@ -74,6 +77,7 @@ function replaceConfig(target, next) {
   target.appBaseUrl = next.appBaseUrl;
   target.databaseUrl = next.databaseUrl;
   target.googleMapsApiKey = next.googleMapsApiKey;
+  target.dispatch = { ...next.dispatch };
   target.transferDependency = { ...next.transferDependency };
   target.samsara = { ...next.samsara };
   target.ollama = { ...next.ollama };

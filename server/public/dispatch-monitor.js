@@ -293,6 +293,7 @@ function markerInfoForTruck(truck) {
       <span>${escapeHtml(truck.formattedLocation || "")}</span>
       <span>${truck.locationStale ? "Last known" : "Updated"} ${escapeHtml(formatTime(truck.locationTime))}</span>
       <span>Speed ${escapeHtml(formatKmh(truck.estimatedKmh))}</span>
+      ${truck.truckSwitchAttention ? `<span class="warning">Samsara assignment warning: ${escapeHtml(truck.truckSwitchAttention.samsara_error || "Truck switch requires attention")}</span>` : ""}
       ${direction ? `<span>Direction ${Math.round(direction.degrees)}° (${escapeHtml(direction.source)})</span>` : ""}
       ${load ? `<hr><b>${escapeHtml(load.loadName || "Load")}</b><span>${escapeHtml(orders)}</span><small>${stops}</small>` : ""}
     </div>
@@ -454,6 +455,7 @@ function renderTruckList() {
           <span>Speed ${escapeHtml(estimatedSpeed)}</span>
           <span>${direction ? `${Math.round(direction.degrees)}° ${escapeHtml(direction.source)}` : "No direction"}</span>
         </div>
+        ${truck.truckSwitchAttention ? `<div class="monitor-switch-warning">Samsara switch unresolved: ${escapeHtml(truck.truckSwitchAttention.samsara_error || "Dispatcher action required")}</div>` : ""}
         ${load ? `
           <div class="monitor-load-blob">
             <b>${escapeHtml(load.loadName || "Load")}</b>
