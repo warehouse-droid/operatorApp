@@ -15,6 +15,8 @@ import { createOperator, getOperatorByToken, hasOperators, listAudit, listAuditO
 import { applyInventoryClassificationRules, confirmCycleCountLine, getCycleCountDraft, listCycleCountRecords, listInventoryClassifications, listInventoryFacets, listInventoryItems, submitCycleCount, updateInventoryClassification, upsertInventoryBalances } from "./inventory-repository.js";
 import { listReceivingVendors, listReceivingSources, listReceivingOrders, getReceivingOrder, searchReceivingItems, confirmReceivingLine, unconfirmReceivingLine, getReceivableReceivingOrder, buildItemReceiptPayload, recordReceivingReceipt, recordReceivingReceiptFailure, listReceivingReceipts, listLocalCoSources, listLocalCoReceivingOrders, searchLocalCoItems, getLocalCoReceivingOrder, confirmLocalCoReceivingLine, unconfirmLocalCoReceivingLine, receiveLocalCoOrder } from "./receiving-repository.js";
 import { listExistingInboundOrderIds, listExistingOutboundOrderIds, markMissingInboundOrderLines, markMissingInboundOrders, markMissingOutboundOrderLines, markOutboundOrderMissing, updatePurchaseOrderNetSuiteStatus, updateSalesOrderNetSuiteStatus, upsertInboundTransferOrderLines, upsertInboundTransferOrders, upsertOutboundTransferOrderLines, upsertOutboundTransferOrders, upsertPurchaseOrderLines, upsertPurchaseOrders, upsertSalesOrderLines, upsertSalesOrders } from "./order-sync-repository.js";
+import { acceptNetSuiteMirrorEvents, enqueueNetSuiteMirrorOrderEvent, getNetSuiteMirrorStatus, isNetSuiteMirrorConsumer, isNetSuiteMirrorSource, listNetSuiteMirrorManifest, retryNetSuiteMirrorFailures } from "./netsuite-mirror-repository.js";
+import { kickNetSuiteMirrorConsumer, localNetSuiteMirrorEventPage, localNetSuiteMirrorInventorySnapshot, localNetSuiteMirrorOrderSnapshot, relayPendingNetSuiteMirrorEvents, requireNetSuiteMirrorSignature, runNetSuiteMirrorConsumerTick, runNetSuiteMirrorReconciliation, startNetSuiteMirrorWorkers } from "./netsuite-mirror-service.js";
 import { listOperatorHistory, listRecordWarnings, reportOperatorRecordError, resolveRecordWarning } from "./history-repository.js";
 import { listDispatchOrders, enrichDispatchOrdersWithPoTargetAllocations, listScmPurchaseOrders, listScmSchedule, updateScmScheduleEntry, createScmScheduleGroup, cancelScmScheduleGroup, listScmViewPresets, upsertScmViewPreset, createScmVrmaOrder, getScmVrmaOrder, getScmVrmaOptions, searchScmVrmaItems, syncScmScheduleFromDispatchPlan, createScmPurchaseOrderSplit, updateScmPurchaseOrderSplitRef, updateScmPurchaseOrderSplitDestination, updateScmPurchaseOrderSplitPickupYard, updatePurchaseOrderDispatchRef, cancelScmPurchaseOrderSplit, refreshDispatchEnrichment, reparseMissingSalesOrderDispatch, searchSalesOrderMethodOverrides, setPurchaseOrderVendorYard, updateDispatchOrderDetails, updateSalesOrderLocalMethod, getSalesOrderPoAllocationOptions, createSalesOrderPoAllocation, createSalesOrderPoAllocations, cancelSalesOrderPoAllocation, createDispatchOperatorRequest, upsertLocalCoOrder, cancelLocalCoOrder, listDispatchOperatorRequests, resolveDispatchOperatorRequestsForOrder } from "./dispatch-repository.js";
 import { listDispatchVendorYards, updateDispatchVendorYard, upsertDispatchVendorYard, listDispatchParserRules, updateDispatchParserRule, listOllamaAudit, listDispatchVendorMappings, discoverDispatchVendorMappingsFromPurchaseOrders, updateDispatchVendorMapping, createDispatchLocalVendor, updateDispatchLocalVendor } from "./dispatch-enrichment.js";
@@ -2519,6 +2521,7 @@ async function reconcileSalesOrderProgress(progress) {
       WHERE netsuite_id = $1`,
     [progress.id, progress.status || null, progress.status_text || null, status.operatorStatus, status.yardStatus, status.fulfillmentStatus]
   );
+  await enqueueNetSuiteMirrorOrderEvent("sales_order", progress.id, { changeType: "progress" });
   return { lines: lines.length, ...summary, ...status };
 }
 
@@ -2538,6 +2541,7 @@ async function reconcilePurchaseOrderProgress(progress) {
       WHERE netsuite_id = $1`,
     [progress.id, progress.status || null, progress.status_text || null, receiptStatus]
   );
+  await enqueueNetSuiteMirrorOrderEvent("purchase_order", progress.id, { changeType: "progress" });
   return { lines: lines.length, ...summary, receiptStatus };
 }
 
@@ -2573,6 +2577,7 @@ async function reconcileTransferOrderProgress(progress) {
       receiptStatus
     ]
   );
+  await enqueueNetSuiteMirrorOrderEvent("transfer_order", progress.id, { changeType: "progress" });
   return {
     outbound: { lines: outboundLines.length, ...outboundSummary, ...outboundStatus },
     receiving: { lines: receivingLines.length, ...receivingSummary, receiptStatus }
@@ -2633,7 +2638,7 @@ async function reconcileNetSuiteProgress({ actorOperatorId = null } = {}) {
       try {
         const progress = await fetchTransactionProgressFromNetSuite(row.netsuite_id, target.recordType);
         if (!progress) continue;
-        const result = await target.apply(progress);
+        const result = await withTransaction(() => target.apply(progress));
         summary[target.key].updated += 1;
         await writeAudit({
           actorType: actorOperatorId ? "operator" : "system",
@@ -2721,6 +2726,7 @@ async function runNetSuiteProgressReconcile({ source = "control_reconcile", acto
 
 async function autoSyncTick() {
   try {
+    if (!config.netsuite.directAccessEnabled) return;
     const setup = await readDispatchSetup();
     if (setup.sync?.mode !== "auto") return;
     await runDispatchSync({ source: "auto" });
@@ -3393,7 +3399,12 @@ export async function processNetSuiteOrderWebhook(payload = {}, { scheduleDelaye
   return { ok: true, orderId: payload.id, tranid: payload.tranid, recordType: type, results };
 }
 
-app.use(express.json({ limit: "25mb" }));
+app.use(express.json({
+  limit: "25mb",
+  verify(req, res, buffer) {
+    req.rawBody = buffer.toString("utf8");
+  }
+}));
 
 app.use(async (req, res, next) => {
   if (process.env.MBBS_ENABLE_ROLLBACK_TESTS !== "1" || req.get("x-mbbs-rollback-test") !== "1") {
@@ -3421,6 +3432,70 @@ app.use(async (req, res, next) => {
   return context.run(() => next());
 });
 
+app.get("/api/internal/netsuite-sync/events", requireNetSuiteMirrorSignature, async (req, res, next) => {
+  try {
+    if (!isNetSuiteMirrorSource()) return res.status(409).json({ error: "This application is not the NetSuite mirror source." });
+    res.json(await localNetSuiteMirrorEventPage({ after: req.query.after, limit: req.query.limit }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/internal/netsuite-sync/manifest", requireNetSuiteMirrorSignature, async (req, res, next) => {
+  try {
+    if (!isNetSuiteMirrorSource()) return res.status(409).json({ error: "This application is not the NetSuite mirror source." });
+    res.json(await listNetSuiteMirrorManifest({
+      cursor: req.query.cursor,
+      limit: req.query.limit,
+      updatedAfter: req.query.updatedAfter
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/internal/netsuite-sync/orders/:entityType/:entityId", requireNetSuiteMirrorSignature, async (req, res, next) => {
+  try {
+    if (!isNetSuiteMirrorSource()) return res.status(409).json({ error: "This application is not the NetSuite mirror source." });
+    const snapshot = await localNetSuiteMirrorOrderSnapshot(req.params.entityType, req.params.entityId);
+    if (!snapshot) return res.status(404).json({ error: "NetSuite-backed order was not found in the source database." });
+    res.json(snapshot);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/internal/netsuite-sync/inventory-snapshot", requireNetSuiteMirrorSignature, async (req, res, next) => {
+  try {
+    if (!isNetSuiteMirrorSource()) return res.status(409).json({ error: "This application is not the NetSuite mirror source." });
+    res.json(await localNetSuiteMirrorInventorySnapshot(req.body?.itemIds || []));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/internal/netsuite-sync/status", requireNetSuiteMirrorSignature, async (req, res, next) => {
+  try {
+    res.json(await getNetSuiteMirrorStatus());
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/internal/netsuite-sync/events", requireNetSuiteMirrorSignature, async (req, res, next) => {
+  try {
+    if (!isNetSuiteMirrorConsumer()) return res.status(409).json({ error: "This application is not the NetSuite mirror consumer." });
+    if (req.body?.contract !== "netsuite-mirror/v1" || !Array.isArray(req.body?.events)) {
+      return res.status(400).json({ error: "Expected a netsuite-mirror/v1 event batch." });
+    }
+    const accepted = await acceptNetSuiteMirrorEvents(req.body.events);
+    kickNetSuiteMirrorConsumer();
+    res.status(202).json({ ...accepted, queued: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.use((req, res, next) => {
   if (!req.path.startsWith("/api/")
       || !MUTATING_API_METHODS.has(req.method)
@@ -3438,6 +3513,7 @@ app.use((req, res, next) => {
 
 app.post("/api/webhooks/netsuite/order", async (req, res, next) => {
   try {
+    if (isNetSuiteMirrorConsumer()) return res.status(403).json({ error: "NetSuite webhooks are disabled on the mirror consumer." });
     const expectedSecret = config.netsuite.webhookSecret;
     if (!expectedSecret) return res.status(503).json({ error: "NETSUITE_WEBHOOK_SECRET is not configured on the server." });
     const providedSecret = req.get("x-mbbs-webhook-secret") || req.body?.secret || "";
@@ -3446,7 +3522,7 @@ app.post("/api/webhooks/netsuite/order", async (req, res, next) => {
     if (providedBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(providedBuffer, expectedBuffer)) {
       return res.status(401).json({ error: "Invalid webhook secret." });
     }
-    res.json(await processNetSuiteOrderWebhook(req.body));
+    res.json(await withTransaction(() => processNetSuiteOrderWebhook(req.body)));
   } catch (error) {
     await writeAudit({
       actorType: "system",
@@ -6847,6 +6923,48 @@ app.post("/api/admin/photo-archive/run", requireOperator, requireAdmin, async (r
   }
 });
 
+app.get("/api/admin/netsuite-mirror", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    res.json(await getNetSuiteMirrorStatus());
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/admin/netsuite-mirror/retry", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    const retried = await retryNetSuiteMirrorFailures();
+    const result = isNetSuiteMirrorConsumer()
+      ? await runNetSuiteMirrorConsumerTick()
+      : await relayPendingNetSuiteMirrorEvents();
+    await writeAudit({
+      actorOperatorId: req.operator.id,
+      source: "admin",
+      action: "netsuite.mirror.retry",
+      details: { retried, result }
+    });
+    res.json({ retried, result, status: await getNetSuiteMirrorStatus() });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/admin/netsuite-mirror/reconcile", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    if (!isNetSuiteMirrorConsumer()) return res.status(409).json({ error: "Reconciliation runs on the mirror consumer." });
+    const result = await runNetSuiteMirrorReconciliation({ full: true });
+    await writeAudit({
+      actorOperatorId: req.operator.id,
+      source: "admin",
+      action: "netsuite.mirror.reconcile",
+      details: result
+    });
+    res.json({ result, status: await getNetSuiteMirrorStatus() });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/control/sync-settings", requireOperator, requireAdmin, async (req, res, next) => {
   try {
     const setup = await readDispatchSetup();
@@ -8329,6 +8447,7 @@ export async function startServer() {
   await recoverInterruptedPhotoArchive();
   return app.listen(config.port, () => {
     console.log(`MBBS Yard Server listening on ${config.appBaseUrl}`);
+    startNetSuiteMirrorWorkers();
     autoSyncTick();
     photoArchiveAutoTick();
     setInterval(autoSyncTick, 60000);

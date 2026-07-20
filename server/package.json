@@ -39,7 +39,9 @@
     "rebuild:delivery-groups": "node src/rebuild-dispatch-delivery-groups.js",
     "rebuild:dispatch-load-assignments": "node src/rebuild-dispatch-load-assignments.js",
     "migrate:dispatch-fleet": "node src/migrate-dispatch-setup-to-db.js",
-    "verify:dispatch-fleet": "node src/verify-dispatch-fleet.js"
+    "verify:dispatch-fleet": "node src/verify-dispatch-fleet.js",
+    "mirror:init": "node src/netsuite-mirror-init.js",
+    "test:netsuite-mirror": "node src/netsuite-mirror-harness.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

@@ -1,5 +1,6 @@
 import { query } from "./db.js";
 import { writeAudit } from "./auth-repository.js";
+import { enqueueNetSuiteMirrorInventoryEvent } from "./netsuite-mirror-repository.js";
 
 function normalizeNumber(value) {
   if (value === null || value === undefined || value === "") return 0;
@@ -105,6 +106,7 @@ export async function upsertInventoryBalances(rows) {
     );
     balanceCount += 1;
   }
+  await enqueueNetSuiteMirrorInventoryEvent(rows.map((row) => row.item_id));
 
   return { items: itemCount, balances: balanceCount };
 }

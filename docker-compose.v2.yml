@@ -1,0 +1,38 @@
+name: mbbs-operator-app-v2
+
+services:
+  db:
+    env_file: !override
+      - ./docker/env/.env.v2
+
+  app:
+    environment:
+      MBBS_ENV_FILE: .env
+      DISPATCH_DRIVER_ORIENTED_PLANNING: "true"
+    volumes: !override
+      - app_data:/app/data
+      - ./docker/env/.env.v2:/app/.env:ro
+    ports: !override
+      - "127.0.0.1:3099:3000"
+    networks:
+      mbbs:
+      mirror_sync:
+        aliases:
+          - mbbs-dispatch-v2-app
+
+  migrate:
+    environment:
+      MBBS_ENV_FILE: .env
+    volumes: !override
+      - app_data:/app/data
+      - ./docker/env/.env.v2:/app/.env:ro
+
+  bootstrap-data:
+    volumes:
+      - ./server/data:/source:ro
+      - app_data:/target
+
+networks:
+  mirror_sync:
+    name: ${MBBS_MIRROR_NETWORK:-mbbs-sync}
+    external: true
