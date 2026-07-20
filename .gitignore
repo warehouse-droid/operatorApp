@@ -10,3 +10,4 @@ server/node_modules/
 env.old.backup
 docker/env/
 docker/backups/
+.worktrees/

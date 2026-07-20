@@ -150,6 +150,7 @@ let loadedSearchResults = [];
 let loadedOrderDetail = null;
 let selectedLoadedOrderKey = "";
 let syncSettings = { mode: "manual", running: false, lastStatus: "idle" };
+let mirrorStatus = { role: "disabled", configured: false, source: {}, consumer: {} };
 let photoArchiveSettings = {
   mode: "off",
   intervalMinutes: 1440,
@@ -1112,11 +1113,55 @@ function renderLoadedOrderDetail() {
   `;
 }
 
+
+function renderNetSuiteMirrorPanel() {
+  const role = mirrorStatus.role || "disabled";
+  if (role === "disabled") return "";
+  const source = mirrorStatus.source || {};
+  const consumer = mirrorStatus.consumer || {};
+  const isConsumer = role === "consumer";
+  const ready = mirrorStatus.configured
+    && (isConsumer ? mirrorStatus.sourceUrlConfigured : mirrorStatus.consumerUrlConfigured);
+  return `
+    <section class="panel">
+      <div class="section-heading">
+        <div>
+          <h2>NetSuite Data Mirror</h2>
+          <p class="muted">${isConsumer
+            ? "This V2 server reads normalized NetSuite data only from the current port 3000 application."
+            : "This server is the NetSuite source of truth and relays durable change events to Dispatch V2."}</p>
+        </div>
+        <button data-action="refresh" type="button">${t("common.refresh", "Refresh")}</button>
+      </div>
+      <div class="sync-status-grid">
+        <div><span>Role</span><strong>${escapeHtml(role)}</strong></div>
+        <div><span>Configured</span><strong>${ready ? t("control.yes", "Yes") : t("control.no", "No")}</strong></div>
+        <div><span>Source high-water</span><strong>${Number(source.highWaterSequence || 0)}</strong></div>
+        ${isConsumer
+          ? `<div><span>Applied sequence</span><strong>${Number(consumer.appliedSequence || 0)}</strong></div>
+             <div><span>Event lag</span><strong>${Number(consumer.lag || 0)}</strong></div>
+             <div><span>Failed</span><strong>${Number(consumer.failed || 0)}</strong></div>
+             <div><span>Last applied</span><strong>${formatDate(consumer.lastAppliedAt)}</strong></div>`
+          : `<div><span>Pending relay</span><strong>${Number(source.pending || 0)}</strong></div>
+             <div><span>Failed relay</span><strong>${Number(source.failed || 0)}</strong></div>
+             <div><span>Last delivered</span><strong>${formatDate(source.lastDeliveredAt)}</strong></div>`}
+      </div>
+      ${source.lastError || consumer.lastError ? `<div class="notice sync-error">${escapeHtml(source.lastError || consumer.lastError)}</div>` : ""}
+      <div class="actions">
+        <button data-action="retry-netsuite-mirror" type="button">Retry Failed / Catch Up</button>
+        ${isConsumer ? '<button data-action="reconcile-netsuite-mirror" type="button">Run Full Reconciliation</button>' : ""}
+      </div>
+    </section>
+  `;
+}
+
 function renderSyncSection() {
   const isAuto = syncSettings.mode === "auto";
   const savedMaxRunMinutes = Math.max(1, Math.round(Number(syncSettings.maxRunSeconds || 900) / 60));
   const maxRunMinutes = syncMaxRunMinutesDraft ?? savedMaxRunMinutes;
-  return `
+  const mirrorPanel = renderNetSuiteMirrorPanel();
+  if (mirrorStatus.role === "consumer") return mirrorPanel;
+  return `${mirrorPanel}
     <section class="panel">
       <div class="section-heading">
         <div>
@@ -1712,13 +1757,14 @@ async function loadAuditOptions() {
 
 async function loadControlData() {
   if (IS_ADMIN_PAGE) {
-    const [nextOperators, nextAuditOptions, nextAudit, nextSyncSettings, nextEnvSettings, nextPhotoArchiveSettings] = await Promise.all([
+    const [nextOperators, nextAuditOptions, nextAudit, nextSyncSettings, nextEnvSettings, nextPhotoArchiveSettings, nextMirrorStatus] = await Promise.all([
       request("/api/operators"),
       request(auditOptionsQueryString()),
       request(auditQueryString()),
       request("/api/control/sync-settings"),
       request("/api/control/env-settings"),
-      request("/api/admin/photo-archive")
+      request("/api/admin/photo-archive"),
+      request("/api/admin/netsuite-mirror")
     ]);
     operators = nextOperators;
     auditOptions = nextAuditOptions;
@@ -1726,6 +1772,7 @@ async function loadControlData() {
     syncSettings = nextSyncSettings;
     envSettings = nextEnvSettings;
     photoArchiveSettings = nextPhotoArchiveSettings;
+    mirrorStatus = nextMirrorStatus;
   } else {
     classifications = await request(`/api/inventory/classifications?limit=300${classificationSearch ? `&search=${encodeURIComponent(classificationSearch)}` : ""}`);
     cycleRecords = await request("/api/cycle-count/records?limit=50");
@@ -2044,6 +2091,25 @@ app.addEventListener("click", async (event) => {
       render();
       schedulePhotoArchivePoll();
       if (!result.started) alert("A photo backup is already running.");
+      return;
+    }
+    if (button.dataset.action === "retry-netsuite-mirror") {
+      button.disabled = true;
+      button.textContent = "Retrying...";
+      const result = await request("/api/admin/netsuite-mirror/retry", { method: "POST", body: "{}" });
+      mirrorStatus = result.status || await request("/api/admin/netsuite-mirror");
+      render();
+      alert("NetSuite mirror retry and catch-up completed.");
+      return;
+    }
+    if (button.dataset.action === "reconcile-netsuite-mirror") {
+      if (!confirm("Run a full reconciliation of all NetSuite-backed orders and inventory from the current server? V2 planning and workflow fields will be preserved.")) return;
+      button.disabled = true;
+      button.textContent = "Reconciling...";
+      const result = await request("/api/admin/netsuite-mirror/reconcile", { method: "POST", body: "{}" });
+      mirrorStatus = result.status || await request("/api/admin/netsuite-mirror");
+      render();
+      alert("Full NetSuite mirror reconciliation completed.");
       return;
     }
     if (button.dataset.action === "set-sync-mode") {

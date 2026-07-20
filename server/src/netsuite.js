@@ -13,9 +13,17 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+export function assertNetSuiteDirectAccessEnabled() {
+  if (config.netsuite?.directAccessEnabled) return;
+  const error = new Error("Direct NetSuite access is disabled on this application. NetSuite data is mirrored from the current server.");
+  error.status = 409;
+  throw error;
+}
+
 async function netsuiteFetch(url, options = {}) {
   const timeoutMs = Number(config.netsuite.requestTimeoutMs || 120000);
   const signal = options.signal || (AbortSignal.timeout ? AbortSignal.timeout(timeoutMs) : undefined);
+  assertNetSuiteDirectAccessEnabled();
   try {
     return await fetch(url, { ...options, signal });
   } catch (error) {
@@ -316,6 +324,7 @@ function normalizeTransferDetailLines(lines, { sourceLocationId = null, destinat
 }
 
 export function buildAuthorizationUrl() {
+  assertNetSuiteDirectAccessEnabled();
   requireConfig([
     "netsuite.clientId",
     "netsuite.redirectUri",

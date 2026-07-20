@@ -26,6 +26,13 @@ function readSelectedEnvFileSync() {
 }
 
 function buildConfig(env) {
+  const mirrorRole = ["source", "consumer"].includes(String(env.NETSUITE_MIRROR_ROLE || "").trim().toLowerCase())
+    ? String(env.NETSUITE_MIRROR_ROLE).trim().toLowerCase()
+    : "disabled";
+  const booleanValue = (value, fallback) => {
+    if (value === undefined || value === null || value === "") return fallback;
+    return /^(1|true|yes|on)$/i.test(String(value).trim());
+  };
   return {
     port: Number(env.PORT || 3000),
     appBaseUrl: env.APP_BASE_URL || "http://localhost:3000",
@@ -38,7 +45,8 @@ function buildConfig(env) {
     },
     samsara: {
       apiToken: env.SAMSARA_API_TOKEN || env.SAMSARA_API_KEY || "",
-      dvirAuthorId: env.SAMSARA_DVIR_AUTHOR_ID || ""
+      dvirAuthorId: env.SAMSARA_DVIR_AUTHOR_ID || "",
+      writesEnabled: mirrorRole === "consumer" ? false : booleanValue(env.SAMSARA_WRITES_ENABLED, true)
     },
     ollama: {
       baseUrl: String(env.OLLAMA_BASE_URL || "http://127.0.0.1:11434").replace(/\/+$/, ""),
@@ -64,7 +72,20 @@ function buildConfig(env) {
       scopes: env.NETSUITE_SCOPES || "rest_webservices",
       requestTimeoutMs: Number(env.NETSUITE_REQUEST_TIMEOUT_MS || 120000),
       subsidiaryId: env.NETSUITE_SUBSIDIARY_ID || "",
-      webhookSecret: env.NETSUITE_WEBHOOK_SECRET || ""
+      webhookSecret: env.NETSUITE_WEBHOOK_SECRET || "",
+      directAccessEnabled: mirrorRole === "consumer" ? false : booleanValue(env.NETSUITE_DIRECT_ACCESS_ENABLED, true)
+    },
+    netSuiteMirror: {
+      role: mirrorRole,
+      sharedSecret: env.NETSUITE_MIRROR_SHARED_SECRET || "",
+      sourceBaseUrl: String(env.NETSUITE_MIRROR_SOURCE_URL || "").replace(/\/+$/, ""),
+      consumerBaseUrl: String(env.NETSUITE_MIRROR_CONSUMER_URL || "").replace(/\/+$/, ""),
+      relayIntervalMs: Math.max(1000, Number(env.NETSUITE_MIRROR_RELAY_INTERVAL_MS || 5000)),
+      pollIntervalMs: Math.max(5000, Number(env.NETSUITE_MIRROR_POLL_INTERVAL_MS || 30000)),
+      reconcileIntervalMs: Math.max(300000, Number(env.NETSUITE_MIRROR_RECONCILE_INTERVAL_MS || 21600000)),
+      requestTimeoutMs: Math.max(1000, Number(env.NETSUITE_MIRROR_REQUEST_TIMEOUT_MS || 15000)),
+      signatureMaxAgeSeconds: Math.max(30, Number(env.NETSUITE_MIRROR_SIGNATURE_MAX_AGE_SECONDS || 300)),
+      pageSize: Math.min(500, Math.max(1, Number(env.NETSUITE_MIRROR_PAGE_SIZE || 100)))
     }
   };
 }
@@ -79,6 +100,7 @@ function replaceConfig(target, next) {
   target.ollama = { ...next.ollama };
   target.photoUpload = { ...next.photoUpload };
   target.netsuite = { ...next.netsuite };
+  target.netSuiteMirror = { ...next.netSuiteMirror };
 }
 
 export let activeEnvFile = readSelectedEnvFileSync();

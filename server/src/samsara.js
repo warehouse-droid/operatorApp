@@ -14,6 +14,11 @@ function requireSamsaraToken() {
 }
 
 async function samsaraRequest(path, { method = "GET", body = null, includeMeta = false } = {}) {
+  if (String(method || "GET").toUpperCase() !== "GET" && !config.samsara?.writesEnabled) {
+    const error = new Error("Samsara writes are disabled on this application.");
+    error.status = 409;
+    throw error;
+  }
   const token = requireSamsaraToken();
   const response = await fetch(`${SAMSARA_BASE_URL}${path}`, {
     method,
