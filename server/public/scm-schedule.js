@@ -1,5 +1,6 @@
 const scmScheduleApp = document.getElementById("scmScheduleApp");
 const scmScheduleDispatchHost = window.location.pathname.startsWith("/dispatch/");
+const scmScheduleSalesHost = window.location.pathname.startsWith("/sales/");
 
 let scmScheduleOperator = null;
 let scmScheduleRows = [];
@@ -134,6 +135,7 @@ function scmScheduleQuery() {
   const search = String(scmScheduleFilters.search || "").trim();
   if (search) {
     params.set("search", search);
+    if (scmScheduleSalesHost) params.set("view", scmScheduleFilters.view || "yard manager");
     return `?${params.toString()}`;
   }
   Object.entries(scmScheduleFilters).forEach(([key, value]) => {
@@ -151,7 +153,7 @@ function scmScheduleQuery() {
 function loadScmSchedulePresetsOnce() {
   if (scmSchedulePresets.length) return Promise.resolve(scmSchedulePresets);
   if (!scmSchedulePresetsRequest) {
-    scmSchedulePresetsRequest = scmScheduleApi("/api/scm/view-presets").catch((error) => {
+    scmSchedulePresetsRequest = scmScheduleApi(scmScheduleSalesHost ? "/api/sales/schedule-presets" : "/api/scm/view-presets").catch((error) => {
       scmSchedulePresetsRequest = null;
       throw error;
     });
@@ -166,7 +168,7 @@ async function loadScmSchedule() {
   renderScmSchedule();
   try {
     const [rows, presets] = await Promise.all([
-      scmScheduleApi(`/api/scm/schedule${query}`),
+      scmScheduleApi(`${scmScheduleSalesHost ? "/api/sales/schedule" : "/api/scm/schedule"}${query}`),
       loadScmSchedulePresetsOnce()
     ]);
     if (requestId !== scmScheduleLoadRequestId) return;
@@ -197,6 +199,7 @@ function scmScheduleRole() {
 }
 
 function scmScheduleAllowedViewsForRole() {
+  if (scmScheduleSalesHost) return ["yard manager", "completed"];
   if (scmScheduleDispatchHost) return ["dispatch", "completed"];
   const role = scmScheduleRole();
   if (role === "dispatcher") return ["dispatch", "completed"];
@@ -205,6 +208,7 @@ function scmScheduleAllowedViewsForRole() {
 }
 
 function scmScheduleDefaultViewForRole() {
+  if (scmScheduleSalesHost) return "yard manager";
   if (scmScheduleDispatchHost) return "dispatch";
   const role = scmScheduleRole();
   if (role === "dispatcher") return "dispatch";
@@ -366,7 +370,7 @@ function contentCell(row = {}) {
 }
 
 function orderNumberCell(row = {}) {
-  if (row.orderKind === "PO") {
+  if (row.orderKind === "PO" && !scmScheduleSalesHost) {
     const source = row.sourceRef || row.orderRef || row.displayRef;
     const ref = row.dispatchRef || row.displayRef || row.orderRef;
     return `
@@ -447,11 +451,11 @@ function renderScmSchedule() {
   const sheetMetrics = scmScheduleGridMetrics(editable);
   scmScheduleApp.innerHTML = `
     <header class="dispatch-topbar">
-      <div><p>${scmScheduleDispatchHost ? "Dispatch" : "SCM"}</p><h1>PO / TO Schedule</h1></div>
+      <div><p>${scmScheduleSalesHost ? "Sales" : scmScheduleDispatchHost ? "Dispatch" : "SCM"}</p><h1>PO / TO Schedule</h1></div>
       <div class="topbar-language">${window.MBBS_I18N?.toggleHtml() || ""}</div>
       <div class="topbar-actions">
         <span class="dispatch-user">${scmScheduleEscape(operator.display_name || operator.username || "")}</span>
-        <button onclick="location.href='${scmScheduleDispatchHost ? "/dispatch" : "/scm"}'" type="button">${scmScheduleDispatchHost ? "Dispatch Menu" : "SCM Menu"}</button>
+        <button onclick="location.href='${scmScheduleSalesHost ? "/sales" : scmScheduleDispatchHost ? "/dispatch" : "/scm"}'" type="button">${scmScheduleSalesHost ? "Sales Menu" : scmScheduleDispatchHost ? "Dispatch Menu" : "SCM Menu"}</button>
         <button onclick="dispatchLogout()" type="button">Logout</button>
       </div>
     </header>
@@ -670,7 +674,7 @@ window.addEventListener("mbbs-language-changed", renderScmSchedule);
 
 requireDispatchLogin({
   mount: scmScheduleApp,
-  roles: ["admin", "scm", "scm_staff", "dispatcher"],
+  roles: scmScheduleSalesHost ? ["sales", "admin"] : ["admin", "scm", "scm_staff", "dispatcher"],
   async onReady(operator) {
     scmScheduleOperator = operator;
     scmScheduleFilters.view = scmScheduleDefaultViewForRole();

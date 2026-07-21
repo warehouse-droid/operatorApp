@@ -14,6 +14,13 @@ function transferUnitFields(line = {}) {
   };
 }
 
+export function transferDependencyMemoMarker(batchId, proposalId) {
+  const batch = String(batchId ?? "").trim();
+  const proposal = String(proposalId ?? "").trim();
+  if (!batch || !proposal) return "";
+  return `MBBS dependency batch ${batch} proposal ${proposal}`;
+}
+
 export function buildTransferDependencyRestPayload({ proposal, batch, locations }) {
   const palletItemId = Number(proposal.palletItemId);
   const materialItems = (proposal.lines || [])
@@ -27,10 +34,11 @@ export function buildTransferDependencyRestPayload({ proposal, batch, locations 
   const palletQuantity = quantity(proposal.palletTransferQuantity);
   const employeeId = String(config.transferDependency.employeeId || "").trim();
   const deliveryMethodId = String(config.transferDependency.deliveryMethodId || "").trim();
+  const memoMarker = transferDependencyMemoMarker(batch.id, proposal.id);
   const payload = {
     location: { id: String(locations.source.netsuiteLocationId) },
     transferLocation: { id: String(locations.destination.netsuiteLocationId) },
-    memo: `${proposal.memo || `Inventory dependency for ${batch.salesOrderRef}`} | MBBS dependency batch ${batch.id}`,
+    memo: `${proposal.memo || `Inventory dependency for ${batch.salesOrderRef}`} | ${memoMarker || `MBBS dependency batch ${batch.id}`}`,
     item: {
       items: [
         ...materialItems,

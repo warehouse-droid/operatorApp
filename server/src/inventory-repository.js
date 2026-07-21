@@ -12,6 +12,12 @@ function nullableNumber(value) {
   return Number(String(value).replaceAll(",", ""));
 }
 
+function nullableBoolean(value) {
+  if (value === null || value === undefined || value === "") return null;
+  if (typeof value === "boolean") return value;
+  return ["t", "true", "1", "yes", "y"].includes(String(value).trim().toLowerCase());
+}
+
 function ruleBasedClassification(itemName = "") {
   const name = String(itemName || "").trim();
   const [prefix = "", series = ""] = name.split("-");
@@ -47,8 +53,11 @@ export async function upsertInventoryBalances(rows) {
     await query(
       `INSERT INTO inventory_items (
          item_id, item_name, display_name, item_description, item_type, item_type_text,
-         stock_unit, item_weight, to_plt, to_lyr, to_sec, to_pcs, product_type, brand, series, raw, synced_at
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb, now())
+         stock_unit, item_weight, to_plt, to_lyr, to_sec, to_pcs, product_type, brand, series,
+         vendor_id, vendor, netsuite_lead_time_days, netsuite_safety_stock_level,
+         netsuite_seasonal_demand, raw, synced_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+                 $16, $17, $18, $19, $20, $21::jsonb, now())
        ON CONFLICT (item_id) DO UPDATE SET
          item_name = EXCLUDED.item_name,
          display_name = EXCLUDED.display_name,
@@ -61,6 +70,11 @@ export async function upsertInventoryBalances(rows) {
          to_lyr = EXCLUDED.to_lyr,
          to_sec = EXCLUDED.to_sec,
          to_pcs = EXCLUDED.to_pcs,
+         vendor_id = EXCLUDED.vendor_id,
+         vendor = EXCLUDED.vendor,
+         netsuite_lead_time_days = EXCLUDED.netsuite_lead_time_days,
+         netsuite_safety_stock_level = EXCLUDED.netsuite_safety_stock_level,
+         netsuite_seasonal_demand = EXCLUDED.netsuite_seasonal_demand,
          product_type = CASE WHEN inventory_items.classification_updated_by IS NULL THEN EXCLUDED.product_type ELSE inventory_items.product_type END,
          brand = CASE WHEN inventory_items.classification_updated_by IS NULL THEN EXCLUDED.brand ELSE inventory_items.brand END,
          series = CASE WHEN inventory_items.classification_updated_by IS NULL THEN EXCLUDED.series ELSE inventory_items.series END,
@@ -82,6 +96,11 @@ export async function upsertInventoryBalances(rows) {
         classification.productType,
         classification.brand,
         classification.series,
+        nullableNumber(row.vendor_id),
+        row.vendor || null,
+        nullableNumber(row.netsuite_lead_time_days),
+        nullableNumber(row.netsuite_safety_stock_level),
+        nullableBoolean(row.netsuite_seasonal_demand),
         JSON.stringify(row)
       ]
     );
@@ -109,6 +128,95 @@ export async function upsertInventoryBalances(rows) {
   await enqueueNetSuiteMirrorInventoryEvent(rows.map((row) => row.item_id));
 
   return { items: itemCount, balances: balanceCount };
+}
+
+export async function upsertInventoryBalancesBulk(rows = []) {
+  const validRows = (rows || []).filter((row) => Number.isInteger(Number(row.item_id)) && Number.isInteger(Number(row.location_id)));
+  const itemRows = [...new Map(validRows.map((row) => [Number(row.item_id), row])).values()];
+
+  for (let offset = 0; offset < itemRows.length; offset += 150) {
+    const group = itemRows.slice(offset, offset + 150);
+    const params = [];
+    const values = group.map((row) => {
+      const classification = ruleBasedClassification(row.item_name || row.display_name || "");
+      const fields = [
+        Number(row.item_id), row.item_name || String(row.item_id), row.display_name || null,
+        row.item_description || null, row.item_type || null, row.item_type_text || null,
+        row.stock_unit || null, nullableNumber(row.item_weight), nullableNumber(row.to_plt),
+        nullableNumber(row.to_lyr), nullableNumber(row.to_sec), nullableNumber(row.to_pcs),
+        classification.productType, classification.brand, classification.series,
+        nullableNumber(row.vendor_id), row.vendor || null, nullableNumber(row.netsuite_lead_time_days),
+        nullableNumber(row.netsuite_safety_stock_level), nullableBoolean(row.netsuite_seasonal_demand),
+        JSON.stringify(row)
+      ];
+      const placeholders = fields.map((field) => {
+        params.push(field);
+        return `$${params.length}`;
+      });
+      placeholders[20] += "::jsonb";
+      return `(${placeholders.join(", ")}, now())`;
+    });
+    await query(
+      `INSERT INTO inventory_items (
+         item_id, item_name, display_name, item_description, item_type, item_type_text,
+         stock_unit, item_weight, to_plt, to_lyr, to_sec, to_pcs, product_type, brand, series,
+         vendor_id, vendor, netsuite_lead_time_days, netsuite_safety_stock_level,
+         netsuite_seasonal_demand, raw, synced_at
+       ) VALUES ${values.join(", ")}
+       ON CONFLICT (item_id) DO UPDATE SET
+         item_name = EXCLUDED.item_name,
+         display_name = EXCLUDED.display_name,
+         item_description = EXCLUDED.item_description,
+         item_type = EXCLUDED.item_type,
+         item_type_text = EXCLUDED.item_type_text,
+         stock_unit = EXCLUDED.stock_unit,
+         item_weight = EXCLUDED.item_weight,
+         to_plt = EXCLUDED.to_plt,
+         to_lyr = EXCLUDED.to_lyr,
+         to_sec = EXCLUDED.to_sec,
+         to_pcs = EXCLUDED.to_pcs,
+         vendor_id = EXCLUDED.vendor_id,
+         vendor = EXCLUDED.vendor,
+         netsuite_lead_time_days = EXCLUDED.netsuite_lead_time_days,
+         netsuite_safety_stock_level = EXCLUDED.netsuite_safety_stock_level,
+         netsuite_seasonal_demand = EXCLUDED.netsuite_seasonal_demand,
+         product_type = CASE WHEN inventory_items.classification_updated_by IS NULL THEN EXCLUDED.product_type ELSE inventory_items.product_type END,
+         brand = CASE WHEN inventory_items.classification_updated_by IS NULL THEN EXCLUDED.brand ELSE inventory_items.brand END,
+         series = CASE WHEN inventory_items.classification_updated_by IS NULL THEN EXCLUDED.series ELSE inventory_items.series END,
+         raw = EXCLUDED.raw,
+         synced_at = now()`,
+      params
+    );
+  }
+
+  for (let offset = 0; offset < validRows.length; offset += 300) {
+    const group = validRows.slice(offset, offset + 300);
+    const params = [];
+    const values = group.map((row) => {
+      const fields = [
+        Number(row.item_id), Number(row.location_id), row.location || null,
+        normalizeNumber(row.quantity_on_hand), normalizeNumber(row.quantity_available)
+      ];
+      return `(${fields.map((field) => {
+        params.push(field);
+        return `$${params.length}`;
+      }).join(", ")}, now())`;
+    });
+    await query(
+      `INSERT INTO inventory_balances (
+         item_id, location_id, location, quantity_on_hand, quantity_available, synced_at
+       ) VALUES ${values.join(", ")}
+       ON CONFLICT (item_id, location_id) DO UPDATE SET
+         location = EXCLUDED.location,
+         quantity_on_hand = EXCLUDED.quantity_on_hand,
+         quantity_available = EXCLUDED.quantity_available,
+         synced_at = now()`,
+      params
+    );
+  }
+
+  await enqueueNetSuiteMirrorInventoryEvent(itemRows.map((row) => row.item_id));
+  return { items: itemRows.length, balances: validRows.length };
 }
 
 export async function applyInventoryClassificationRules() {

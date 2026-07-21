@@ -167,7 +167,7 @@ SELECT DISTINCT
   t.createddate AS datecreated,
   t.status,
   BUILTIN.DF(t.status) AS status_text,
-  t.custbody7 AS memo,
+  t.memo,
   t.location AS source_location_id,
   BUILTIN.DF(t.location) AS source_location,
   tl.location AS line_location_id,
@@ -463,7 +463,7 @@ async function netsuiteRest(path, { method = "GET", body = null, headers = {} } 
       throw lastError;
     }
     const location = response.headers.get("location") || "";
-    const idMatch = location.match(/\/(?:itemFulfillment|itemReceipt|transferOrder|intercompanyTransferOrder)\/(\d+)/i);
+    const idMatch = location.match(/\/(?:itemFulfillment|itemReceipt|transferOrder|intercompanyTransferOrder|purchaseOrder)\/(\d+)/i);
     return { status: response.status, location, id: idMatch ? Number(idMatch[1]) : null, data };
   }
   throw lastError;
@@ -536,6 +536,16 @@ export async function createTransferOrderInNetSuite(payload, { intercompany = fa
   return result;
 }
 
+export async function createPurchaseOrderInNetSuite(payload) {
+  const run = () => netsuiteRest("/record/v1/purchaseOrder", {
+    method: "POST",
+    body: payload
+  });
+  const result = restMutationQueue.then(run, run);
+  restMutationQueue = result.catch(() => {});
+  return result;
+}
+
 export async function updateTransferOrderStatusInNetSuite(orderId, { intercompany = false, statusId = "B" } = {}) {
   const id = Number(orderId);
   if (!Number.isInteger(id) || id <= 0) throw new Error("A valid numeric NetSuite transfer order ID is required.");
@@ -547,6 +557,45 @@ export async function updateTransferOrderStatusInNetSuite(orderId, { intercompan
   const result = restMutationQueue.then(run, run);
   restMutationQueue = result.catch(() => {});
   return result;
+}
+
+export async function fetchPickingTicketFromNetSuite(orderId, { locationId = null, filenamePrefix = "TO" } = {}) {
+  const id = Number(orderId);
+  if (!Number.isInteger(id) || id <= 0) throw new Error("A valid numeric NetSuite transaction ID is required.");
+  const location = Number(locationId);
+  const prefix = String(filenamePrefix || "transaction").trim().replace(/[^a-zA-Z0-9_-]+/g, "-") || "transaction";
+  const endpoint = String(config.smartScm?.pickingTicketRestletUrl || "").trim();
+  if (!endpoint) throw new Error("SMART_SCM_PICKING_TICKET_RESTLET_URL is not configured.");
+  const url = new URL(endpoint);
+  url.searchParams.set("entityId", String(id));
+  if (Number.isInteger(location) && location > 0) url.searchParams.set("location", String(location));
+  const accessToken = await getAccessToken();
+  const response = await netsuiteFetch(url, {
+    method: "GET",
+    headers: {
+      "Authorization": `Bearer ${accessToken}`,
+      "Accept": "application/pdf, application/json"
+    }
+  });
+  if (!response.ok) throw new Error(`NetSuite picking ticket failed: ${response.status} ${await response.text()}`);
+  const contentType = response.headers.get("content-type") || "";
+  if (contentType.includes("application/pdf")) {
+    return {
+      buffer: Buffer.from(await response.arrayBuffer()),
+      contentType: "application/pdf",
+      filename: `${prefix}-${id}-picking-ticket.pdf`,
+      locationApplied: false
+    };
+  }
+  const payload = await response.json();
+  const base64 = payload.contentBase64 || payload.base64 || payload.contents || "";
+  if (!base64) throw new Error("NetSuite picking-ticket RESTlet returned no PDF content.");
+  return {
+    buffer: Buffer.from(String(base64).replace(/^data:application\/pdf;base64,/, ""), "base64"),
+    contentType: payload.contentType || "application/pdf",
+    filename: `${prefix}-${id}-picking-ticket.pdf`,
+    locationApplied: payload.locationApplied === true && Number(payload.locationId) === location
+  };
 }
 
 export async function resolvePalletItemFromNetSuite() {
@@ -796,7 +845,7 @@ export async function fetchTransactionStatusFromNetSuite(orderId, recordType = "
   const allowed = new Set(["SalesOrd", "PurchOrd", "TrnfrOrd"]);
   const type = allowed.has(recordType) ? recordType : "SalesOrd";
   const result = await suiteql(`
-    SELECT
+    SELECT DISTINCT
       t.id,
       t.tranid,
       t.status,
@@ -1027,6 +1076,36 @@ export async function fetchTransferOrderDetailsFromNetSuite(orderId, locationId 
     : { sourceLocationId: locationId });
 }
 
+export async function fetchTransferOrderVerificationLinesFromNetSuite(orderId, sourceLocationId) {
+  const id = Number(orderId);
+  const source = Number(sourceLocationId);
+  if (!Number.isInteger(id) || id <= 0) throw new Error("A valid numeric NetSuite transfer order ID is required.");
+  if (!Number.isInteger(source) || source <= 0) throw new Error("A valid NetSuite source location ID is required.");
+  // NetSuite exposes two identical source-side transaction rows for each TO item
+  // (the physical line and its transfer accounting mirror). Aggregate both and
+  // divide once so repeated legitimate item lines still retain their full total.
+  const result = await suiteql(`
+    SELECT
+      tl.item AS item_id,
+      BUILTIN.DF(tl.item) AS item_name,
+      ABS(SUM(NVL(tl.quantity, 0))) / 2 AS quantity,
+      SUM(NVL(tl.custcol_plt, 0)) / 2 AS pallet_qty,
+      SUM(NVL(tl.custcol_lyr, 0)) / 2 AS layer_qty,
+      SUM(NVL(tl.custcol_sec, 0)) / 2 AS section_qty,
+      SUM(NVL(tl.custcol_pcs, 0)) / 2 AS piece_qty
+    FROM transactionline tl
+    WHERE tl.transaction = ${id}
+      AND tl.item IS NOT NULL
+      AND tl.location = ${source}
+      AND tl.quantity < 0
+      AND tl.mainline = 'F'
+      AND tl.taxline = 'F'
+    GROUP BY tl.item, BUILTIN.DF(tl.item)
+    ORDER BY tl.item
+  `);
+  return result.items || [];
+}
+
 export async function fetchPurchaseOrdersFromNetSuite(locationId = 1) {
   const result = await suiteqlAll(purchaseOrderListQuery(locationId));
   return result.map((order) => ({ ...order, order_type: "purchase_order" }));
@@ -1064,6 +1143,27 @@ export async function fetchPurchaseOrderFromNetSuite(orderId, locationId = null)
       AND ${openLineFilterSql("tl")}
       ${locationFilter}
     ORDER BY t.trandate DESC
+  `);
+  const order = result.items?.[0];
+  return order ? { ...order, order_type: "purchase_order" } : null;
+}
+
+export async function fetchPurchaseOrderReferenceFromNetSuite(orderId) {
+  const id = Number(orderId);
+  if (!Number.isInteger(id) || id <= 0) throw new Error("A valid numeric NetSuite purchase order ID is required.");
+  const result = await suiteql(`
+    SELECT t.id,
+           t.tranid,
+           t.trandate,
+           t.entity AS vendor_id,
+           BUILTIN.DF(t.entity) AS vendor,
+           t.status,
+           BUILTIN.DF(t.status) AS status_text,
+           t.memo
+      FROM transaction t
+     WHERE t.id = ${id}
+       AND t.type = 'PurchOrd'
+     FETCH FIRST 1 ROWS ONLY
   `);
   const order = result.items?.[0];
   return order ? { ...order, order_type: "purchase_order" } : null;
@@ -1149,7 +1249,7 @@ export async function fetchTransferReceivingOrderFromNetSuite(orderId, sourceLoc
       t.trandate,
       t.status,
       BUILTIN.DF(t.status) AS status_text,
-      t.custbody7 AS memo,
+      t.memo,
       t.location AS source_location_id,
       BUILTIN.DF(t.location) AS source_location,
       tl.location AS line_location_id,
@@ -1196,6 +1296,11 @@ export async function fetchInventoryBalancesFromNetSuite(locationIds = [1, 28, 1
       i.itemtype AS item_type,
       BUILTIN.DF(i.itemtype) AS item_type_text,
       BUILTIN.DF(i.stockunit) AS stock_unit,
+      i.vendor AS vendor_id,
+      BUILTIN.DF(i.vendor) AS vendor,
+      i.leadtime AS netsuite_lead_time_days,
+      i.safetystocklevel AS netsuite_safety_stock_level,
+      i.seasonaldemand AS netsuite_seasonal_demand,
       i.weight AS item_weight,
       i.custitem_toplt AS to_plt,
       i.custitem_tolyr AS to_lyr,
@@ -1229,6 +1334,11 @@ export async function fetchInventoryBalanceForItemFromNetSuite(itemId, locationI
       i.itemtype AS item_type,
       BUILTIN.DF(i.itemtype) AS item_type_text,
       BUILTIN.DF(i.stockunit) AS stock_unit,
+      i.vendor AS vendor_id,
+      BUILTIN.DF(i.vendor) AS vendor,
+      i.leadtime AS netsuite_lead_time_days,
+      i.safetystocklevel AS netsuite_safety_stock_level,
+      i.seasonaldemand AS netsuite_seasonal_demand,
       i.weight AS item_weight,
       i.custitem_toplt AS to_plt,
       i.custitem_tolyr AS to_lyr,
@@ -1365,14 +1475,21 @@ export async function fetchTransferOrderByIdFromNetSuite(orderId) {
       t.trandate,
       t.status,
       BUILTIN.DF(t.status) AS status_text,
-      t.custbody7 AS memo,
-      t.location AS source_location_id,
-      BUILTIN.DF(t.location) AS source_location,
+      t.memo,
+      source_tl.location AS source_location_id,
+      BUILTIN.DF(source_tl.location) AS source_location,
       t.transferlocation AS destination_location_id,
       BUILTIN.DF(t.transferlocation) AS destination_location
     FROM transaction t
+    LEFT JOIN transactionline source_tl
+      ON source_tl.transaction = t.id
+     AND source_tl.item IS NOT NULL
+     AND source_tl.quantity < 0
+     AND source_tl.mainline = 'F'
+     AND source_tl.taxline = 'F'
     WHERE t.id = ${id}
       AND t.type = 'TrnfrOrd'
+    ORDER BY source_tl.uniquekey
     FETCH FIRST 1 ROWS ONLY
   `);
   const order = result.items?.[0];
@@ -1390,6 +1507,56 @@ export async function fetchTransferOrderByIdFromNetSuite(orderId) {
   };
 }
 
+export async function findTransferOrdersByDependencyMarkerFromNetSuite({
+  batchId,
+  proposalId = null,
+  sourceLocationId,
+  destinationLocationId
+} = {}) {
+  const batch = Number(batchId);
+  const proposal = Number(proposalId);
+  const source = Number(sourceLocationId);
+  const destination = Number(destinationLocationId);
+  if (!Number.isInteger(batch) || batch <= 0) throw new Error("A valid dependency batch ID is required.");
+  if (!Number.isInteger(source) || source <= 0 || !Number.isInteger(destination) || destination <= 0) {
+    throw new Error("Valid NetSuite transfer locations are required to recover a Transfer Order.");
+  }
+  const exactMarker = Number.isInteger(proposal) && proposal > 0
+    ? `MBBS DEPENDENCY BATCH ${batch} PROPOSAL ${proposal}`
+    : "";
+  const legacyMarker = `MBBS DEPENDENCY BATCH ${batch}`;
+  const markerFilter = exactMarker
+    ? `(UPPER(t.memo) LIKE '%${exactMarker}%' OR UPPER(t.memo) LIKE '%${legacyMarker}%')`
+    : `UPPER(t.memo) LIKE '%${legacyMarker}%'`;
+  const result = await suiteql(`
+    SELECT DISTINCT
+      t.id,
+      t.tranid,
+      t.trandate,
+      t.status,
+      BUILTIN.DF(t.status) AS status_text,
+      t.memo,
+      source_tl.location AS source_location_id,
+      BUILTIN.DF(source_tl.location) AS source_location,
+      t.transferlocation AS destination_location_id,
+      BUILTIN.DF(t.transferlocation) AS destination_location
+    FROM transaction t
+    INNER JOIN transactionline source_tl
+      ON source_tl.transaction = t.id
+     AND source_tl.item IS NOT NULL
+     AND source_tl.quantity < 0
+     AND source_tl.location = ${source}
+     AND source_tl.mainline = 'F'
+     AND source_tl.taxline = 'F'
+    WHERE t.type = 'TrnfrOrd'
+      AND t.transferlocation = ${destination}
+      AND ${markerFilter}
+    ORDER BY t.id DESC
+    FETCH FIRST 10 ROWS ONLY
+  `);
+  return result.items || [];
+}
+
 export async function fetchInventoryBalancesForItemsFromNetSuite(itemIds = [], locationIds = [1, 28, 15, 26]) {
   const items = [...new Set((itemIds || []).map(Number).filter((id) => Number.isInteger(id) && id > 0))];
   const locations = [...new Set((locationIds || []).map(Number).filter((id) => Number.isInteger(id) && id > 0))];
@@ -1404,6 +1571,11 @@ export async function fetchInventoryBalancesForItemsFromNetSuite(itemIds = [], l
       i.itemtype AS item_type,
       BUILTIN.DF(i.itemtype) AS item_type_text,
       BUILTIN.DF(i.stockunit) AS stock_unit,
+      i.vendor AS vendor_id,
+      BUILTIN.DF(i.vendor) AS vendor,
+      i.leadtime AS netsuite_lead_time_days,
+      i.safetystocklevel AS netsuite_safety_stock_level,
+      i.seasonaldemand AS netsuite_seasonal_demand,
       i.weight AS item_weight,
       i.custitem_toplt AS to_plt,
       i.custitem_tolyr AS to_lyr,
@@ -1419,5 +1591,55 @@ export async function fetchInventoryBalancesForItemsFromNetSuite(itemIds = [], l
       AND ib.location IN (${locations.join(",")})
       AND i.isinactive = 'F'
     ORDER BY BUILTIN.DF(i.id), BUILTIN.DF(ib.location)
+  `);
+}
+
+function smartScmSuiteQlDate(value, fallback) {
+  const resolved = String(value || fallback || "").slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(resolved)) throw new Error("Smart SCM sales dates must use YYYY-MM-DD.");
+  return resolved;
+}
+
+export async function fetchSmartScmSalesHistoryFromNetSuite({
+  itemIds = [],
+  locationIds = [1, 28, 15, 26],
+  startDate,
+  endDate
+} = {}) {
+  const items = [...new Set((itemIds || []).map(Number).filter((id) => Number.isInteger(id) && id > 0))];
+  const locations = [...new Set((locationIds || []).map(Number).filter((id) => Number.isInteger(id) && id > 0))];
+  if (!items.length) return [];
+  if (!locations.length) throw new Error("At least one NetSuite location ID is required.");
+  const start = smartScmSuiteQlDate(startDate);
+  const end = smartScmSuiteQlDate(endDate, start);
+  return suiteqlAll(`
+    SELECT
+      t.id AS transaction_id,
+      t.tranid AS document_ref,
+      t.trandate AS transaction_date,
+      t.status,
+      BUILTIN.DF(t.status) AS status_text,
+      t.custbody3 AS delivery_method_id,
+      BUILTIN.DF(t.custbody3) AS delivery_method,
+      tl.uniquekey AS line_id,
+      tl.item AS item_id,
+      BUILTIN.DF(tl.item) AS item_name,
+      ABS(NVL(tl.quantity, 0)) AS quantity,
+      tl.location AS location_id,
+      BUILTIN.DF(tl.location) AS location
+    FROM transaction t
+    INNER JOIN transactionline tl ON tl.transaction = t.id
+    WHERE t.type = 'SalesOrd'
+      ${excludedSalesOrderPrefixSql("t")}
+      AND t.trandate >= TO_DATE('${start}', 'YYYY-MM-DD')
+      AND t.trandate <= TO_DATE('${end}', 'YYYY-MM-DD')
+      AND tl.item IN (${items.join(",")})
+      AND tl.location IN (${locations.join(",")})
+      AND tl.item IS NOT NULL
+      AND tl.mainline = 'F'
+      AND tl.taxline = 'F'
+      AND ABS(NVL(tl.quantity, 0)) > 0.000001
+      AND UPPER(BUILTIN.DF(t.status)) NOT LIKE '%CANCEL%'
+    ORDER BY t.trandate, t.id, tl.uniquekey
   `);
 }

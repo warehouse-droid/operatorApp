@@ -35,10 +35,21 @@ includesAll(operator, [
   "window.requestAnimationFrame(attachReceiptCamera)",
   'data-action="stop-camera"',
   'data-action="stop-receipt-camera"',
-  'window.addEventListener("pagehide"'
+  'window.addEventListener("pagehide"',
+  'readers: ["code_128_reader", "code_39_reader", "code_93_reader"]',
+  "handlePickupBarcodeDetected",
+  "confirmRepeated: true",
+  "scanPickupQrFrame",
+  "pickupCameraCodeText",
+  "pickupQuaggaOrderCode",
+  "value.rawValue",
+  "resolvePickupScannerVideoConstraints",
+  "deviceId: { exact: deviceId }",
+  'if (/^\\[object\\s+object\\]$/i.test(clean)) return "";',
+  'import("/vendor/qr-scanner/qr-scanner.min.js")'
 ], "Operator in-PWA camera");
 
-assert.equal((operator.match(/selectRearCamera\(\);/g) || []).length, 2, "Both operator photo workflows must default to the rear camera.");
+assert.equal((operator.match(/selectRearCamera\(\);/g) || []).length, 3, "Operator photo and pickup workflows must default to the rear camera.");
 assert.ok(!operator.includes('id="fulfillmentPhoto"'), "Fulfillment must not expose a photo file input.");
 assert.ok(!operator.includes('id="receiptPhoto"'), "Receiving must not expose a photo file input.");
 assert.ok(!operator.includes('type="file"'), "Operator PWA must not expose file/gallery upload inputs.");
@@ -58,10 +69,25 @@ includesAll(i18n, [
   '"operator.cameraPreviewNotReady"'
 ], "Bilingual camera strings");
 includesAll(operatorHtml, [
-  "/operator.css?v=20260717-in-pwa-camera-v1",
-  "/operator.js?v=20260717-in-pwa-camera-v1"
+  "/operator.css?v=20260721-barcode-v1",
+  "/vendor/quagga2/quagga.min.js?v=1.12.1",
+  "/operator.js?v=20260721-barcode-v3"
 ], "Operator camera cache busting");
-assert.ok(serviceWorker.includes("mbbs-yard-operator-v115-in-pwa-camera"), "Operator service-worker cache must advance.");
+assert.ok(serviceWorker.includes("mbbs-yard-operator-v120-barcode-camera-fix"), "Operator service-worker cache must advance.");
+assert.ok(serviceWorker.includes("/vendor/quagga2/quagga.min.js?v=1.12.1"), "The offline PWA shell must cache the 1D scanner.");
+assert.ok(server.includes('app.use("/vendor/quagga2", express.static(quaggaScannerDir))'), "Server must expose the installed 1D scanner bundle.");
+
+const barcodeHelperStart = operator.indexOf("function pickupCameraCodeText");
+const barcodeHelperEnd = operator.indexOf("async function acceptPickupCameraScan", barcodeHelperStart);
+assert.ok(barcodeHelperStart >= 0 && barcodeHelperEnd > barcodeHelperStart, "Barcode result helpers must be testable.");
+const barcodeHelpers = Function(`${operator.slice(barcodeHelperStart, barcodeHelperEnd)}; return { normalizedPickupCameraCode };`)();
+assert.equal(barcodeHelpers.normalizedPickupCameraCode({ codeResult: { code: "SOA05325" } }), "SOA05325");
+assert.equal(barcodeHelpers.normalizedPickupCameraCode({ data: { rawValue: "SOB115000" } }), "SOB115000");
+assert.equal(barcodeHelpers.normalizedPickupCameraCode({ data: { data: "som05091" } }), "SOM05091");
+assert.equal(barcodeHelpers.normalizedPickupCameraCode({ data: {} }), "");
+assert.equal(barcodeHelpers.normalizedPickupCameraCode("[object Object]"), "");
+const quaggaHelpers = Function(`${operator.slice(barcodeHelperStart, barcodeHelperEnd)}; return { pickupQuaggaOrderCode };`)();
+assert.equal(quaggaHelpers.pickupQuaggaOrderCode([{ codeResult: { code: "SOB115348" } }]), "SOB115348");
 
 includesAll(server, [
   'app.get(["/dispatch/po-to-schedule", "/dispatch/POTOschedule"]',
@@ -73,9 +99,9 @@ includesAll(schedule, [
   'window.location.pathname.startsWith("/dispatch/")',
   'scmScheduleDispatchHost ? "Dispatch" : "SCM"',
   'scmScheduleDispatchHost ? "/dispatch" : "/scm"',
-  'roles: ["admin", "scm", "scm_staff", "dispatcher"]',
+  'roles: scmScheduleSalesHost ? ["sales", "admin"] : ["admin", "scm", "scm_staff", "dispatcher"]',
   'if (role === "dispatcher") return ["dispatch", "completed"];'
 ], "Shared schedule host and dispatcher access");
-assert.ok(scheduleHtml.includes("/scm-schedule.js?v=20260718-schedule-multifilter-v3"), "Shared schedule client cache busting missing.");
+assert.ok(scheduleHtml.includes("/scm-schedule.js?v=20260721-sales-v1"), "Shared schedule client cache busting missing.");
 
 console.log("Operator camera and Dispatch PO/TO Schedule harness passed.");

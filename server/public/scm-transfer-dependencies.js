@@ -19,6 +19,9 @@ const dependencyState = {
   error: ""
 };
 
+let dependencyEventSource = null;
+let dependencyRemoteRefreshTimer = null;
+
 function depEscape(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -172,6 +175,9 @@ async function loadSelectedDependencyInventory({ forceRefresh = false, refreshUn
     return null;
   }
   const selectedOrder = depSelectedOrder();
+  if (selectedOrder?.dependencyBatchId) {
+    dependencyState.batch = await depApi(`/api/scm/transfer-dependencies/batches/${selectedOrder.dependencyBatchId}`);
+  }
   const shouldRefresh = forceRefresh || (
     refreshUndercovered
     && dependencyState.reviewStatus === "open"
@@ -195,16 +201,19 @@ function depYardOptions(selected) {
 
 function renderDependencyCandidates() {
   if (!dependencyState.candidates.length) {
-    return `<div class="empty-state">${dependencyState.reviewStatus === "completed"
+    const emptyText = dependencyState.reviewStatus === "completed"
       ? "No completed Auto Transfer reviews."
-      : "No open Sales Order shortages."}</div>`;
+      : dependencyState.reviewStatus === "created"
+        ? "No created Transfer Orders waiting for approval or printing."
+        : "No open Sales Order shortages.";
+    return `<div class="empty-state">${emptyText}</div>`;
   }
   return dependencyState.candidates.map((order) => `
     <button class="scm-dependency-order ${String(order.salesOrderId) === String(dependencyState.selectedSalesOrderId) ? "selected" : ""}"
       data-action="select-order" data-order-id="${order.salesOrderId}" type="button">
       <span><strong class="scm-dependency-order-ref">${depEscape(order.salesOrderRef)}${order.testFixture ? `<b class="scm-dependency-test-badge">TEST</b>` : ""}</strong><small>${depEscape(order.customer || "")}</small></span>
       <span class="scm-dependency-order-side"><b>${depQty(order.uncoveredQuantity)}</b><small>uncovered</small></span>
-      <small>${depEscape(order.outboundLocation || "--")} | ${depEscape(depDate(order.expectedDeliveryDate))}${order.completionType === "reviewed_no_transfer" ? " | Reviewed - No Transfer" : order.completionType === "transfer_created" ? " | Transfer Orders Created" : ""}</small>
+      <small>${depEscape(order.outboundLocation || "--")} | ${depEscape(depDate(order.expectedDeliveryDate))}${order.completionType === "reviewed_no_transfer" ? " | Reviewed - No Transfer" : order.workflowStage === "created" ? " | Waiting approval / print" : order.completionType === "transfer_approved_printed" ? " | Approved & printed" : ""}</small>
     </button>
   `).join("");
 }
@@ -252,12 +261,14 @@ function renderInventoryMatrix() {
       <span>${impossible.map(({ line, required, sourceAvailable, sourceShortfall }) => `${depEscape(line.sku || line.itemName)}: required ${depQty(required)}, usable source stock ${depQty(sourceAvailable)}, source stock short ${depQty(sourceShortfall)}`).join("<br>")}</span>
     </div>` : ""}
     <div class="scm-dependency-review-action">
-      <span>${order.completionType === "transfer_created"
-        ? `Transfer Orders were created${order.completedAt ? ` on ${depEscape(depDate(order.completedAt))}` : ""}.`
+      <span>${order.workflowStage === "created"
+        ? "Transfer Orders were created and are waiting for quantity verification, approval, and source-yard printing."
+        : order.completionType === "transfer_approved_printed"
+          ? `Transfer Orders were verified, approved, and printed${order.completedAt ? ` on ${depEscape(depDate(order.completedAt))}` : ""}.`
         : order.reviewed
           ? `Reviewed${order.reviewedAt ? ` on ${depEscape(depDate(order.reviewedAt))}` : ""}. This order cannot generate a transfer proposal.`
           : "No transfer needed? Mark only this SCM shortage review; dispatch and operator status stay unchanged."}</span>
-      ${order.completionType === "transfer_created" ? "" : `<button data-action="${order.reviewed ? "reopen-review" : "review-no-transfer"}" type="button" ${dependencyState.busy ? "disabled" : ""}>
+      ${order.workflowStage !== "open" && !order.reviewed ? "" : `<button data-action="${order.reviewed ? "reopen-review" : "review-no-transfer"}" type="button" ${dependencyState.busy ? "disabled" : ""}>
         ${order.reviewed ? "Undo Review" : "Mark Reviewed - No Transfer"}
       </button>`}
     </div>
@@ -294,8 +305,19 @@ function renderInventoryMatrix() {
 
 function renderProposal(proposal) {
   const editable = !["created", "creating", "attention"].includes(proposal.creationStatus);
+  const recoverable = proposal.creationStatus === "creating";
+  const created = ["created", "attention"].includes(proposal.creationStatus) && proposal.transferOrderId;
+  const printStatus = proposal.printJob?.status || "not queued";
+  const printInProgress = ["queued", "leased", "printing"].includes(printStatus);
+  const printed = printStatus === "printed";
+  const approvalInProgress = proposal.approvalStatus === "approving";
+  const approveLabel = ["failed", "uncertain"].includes(printStatus)
+    ? "Retry Source-yard Print"
+    : proposal.approvalStatus === "approved"
+      ? "Get Ticket & Print"
+      : "Verify, Approve & Print";
   return `
-    <article class="scm-dependency-proposal" data-proposal-id="${proposal.id}" data-pallet-overridden="${proposal.palletQuantityOverridden === true}">
+    <article class="scm-dependency-proposal" data-proposal-id="${proposal.id}" data-creation-status="${depEscape(proposal.creationStatus)}" data-pallet-overridden="${proposal.palletQuantityOverridden === true}">
       <header>
         <strong>${depEscape(proposal.transferOrderRef || `Proposed TO ${proposal.id}`)}</strong>
         <span class="dependency-status status-${depEscape(proposal.creationStatus)}">${depEscape(proposal.creationStatus)}</span>
@@ -356,11 +378,20 @@ function renderProposal(proposal) {
           : "Manual quantity required: at least one item has no PLT conversion."}</small>
       </div>
       ${proposal.creationError ? `<div class="scm-dependency-error">${depEscape(proposal.creationError)}</div>` : ""}
+      ${created ? `<div class="scm-dependency-workflow">
+        <div><span>Quantity check</span><strong>${depEscape(proposal.quantityVerificationStatus || "pending")}</strong></div>
+        <div><span>NetSuite approval</span><strong>${depEscape(proposal.approvalStatus || "pending")}</strong></div>
+        <div><span>Source-yard print</span><strong>${depEscape(printStatus)}</strong></div>
+      </div>` : ""}
+      ${proposal.quantityVerificationError ? `<div class="scm-dependency-error">${depEscape(proposal.quantityVerificationError)}</div>` : ""}
+      ${proposal.approvalError ? `<div class="scm-dependency-error">${depEscape(proposal.approvalError)}</div>` : ""}
+      ${proposal.printJob?.error ? `<div class="scm-dependency-error">${depEscape(proposal.printJob.error)}</div>` : ""}
       <footer class="scm-dependency-proposal-actions">
         <button data-action="save-proposal" data-proposal-id="${proposal.id}" type="button" ${editable && !dependencyState.busy ? "" : "disabled"}>Save Draft</button>
-        <button class="primary-action" data-action="confirm-proposal" data-proposal-id="${proposal.id}" type="button" ${editable && !dependencyState.busy ? "" : "disabled"}>
-          ${proposal.creationStatus === "failed" ? "Retry Transfer Order" : "Create Transfer Order"}
-        </button>
+        ${(editable || recoverable) ? `<button class="primary-action" data-action="confirm-proposal" data-proposal-id="${proposal.id}" type="button" ${!dependencyState.busy ? "" : "disabled"}>
+          ${recoverable ? "Recover Transfer Order" : proposal.creationStatus === "failed" ? "Retry Transfer Order" : "Create Transfer Order"}
+        </button>` : ""}
+        ${created && !printed ? `<button class="primary-action" data-action="approve-print" data-proposal-id="${proposal.id}" type="button" ${!dependencyState.busy && !printInProgress && !approvalInProgress ? "" : "disabled"}>${printInProgress ? `Print ${depEscape(printStatus)}` : depEscape(approveLabel)}</button>` : ""}
       </footer>
     </article>
   `;
@@ -404,20 +435,21 @@ function renderDependencyPage() {
       <button class="scm-notice-close" data-action="close-notice" type="button" aria-label="Close">&times;</button>
     </div>` : ""}
     <section class="scm-dependency-toolbar">
-      <button data-action="refresh-inventory" type="button" ${dependencyState.selectedSalesOrderId && !selectedOrder?.completed && !dependencyState.busy ? "" : "disabled"}>Refresh Inventory</button>
+      <button data-action="refresh-inventory" type="button" ${dependencyState.reviewStatus === "open" && dependencyState.selectedSalesOrderId && !selectedOrder?.completed && !dependencyState.busy ? "" : "disabled"}>Refresh Inventory</button>
       <select data-field="suggest-mode">
         <option value="yard_replenishment">Replenish outbound yard</option>
         <option value="direct_to_customer">Direct pickup to customer</option>
       </select>
-      <button class="primary-action" data-action="generate" type="button" ${dependencyState.selectedSalesOrderId && !selectedOrder?.completed && !dependencyState.busy ? "" : "disabled"}>Generate Suggestion</button>
+      <button class="primary-action" data-action="generate" type="button" ${dependencyState.reviewStatus === "open" && dependencyState.selectedSalesOrderId && !selectedOrder?.completed && !dependencyState.busy ? "" : "disabled"}>Generate Suggestion</button>
       <span class="scm-dependency-busy">${depEscape(dependencyState.busy)}</span>
     </section>
     <section class="scm-dependency-grid">
       <aside class="scm-dependency-panel scm-dependency-candidates">
         <div class="panel-title scm-dependency-candidate-title">
-          <div><p>${dependencyState.reviewStatus === "completed" ? "Completed reviews" : "Open shortages"}</p><h2>Sales Orders</h2></div>
+          <div><p>${dependencyState.reviewStatus === "completed" ? "Completed reviews" : dependencyState.reviewStatus === "created" ? "Created · action required" : "Open shortages"}</p><h2>Sales Orders</h2></div>
           <div class="scm-dependency-review-tabs" role="group" aria-label="Review status">
             <button class="${dependencyState.reviewStatus === "open" ? "active" : ""}" data-action="set-review-filter" data-review-status="open" type="button">Open</button>
+            <button class="${dependencyState.reviewStatus === "created" ? "active" : ""}" data-action="set-review-filter" data-review-status="created" type="button">Created</button>
             <button class="${dependencyState.reviewStatus === "completed" ? "active" : ""}" data-action="set-review-filter" data-review-status="completed" type="button">Completed</button>
           </div>
         </div>
@@ -447,17 +479,69 @@ function renderDependencyPage() {
   }
 }
 
-async function loadDependencyCandidates({ preserveSelection = true } = {}) {
+async function loadDependencyCandidates({ preserveSelection = true, refreshInventory = true } = {}) {
+  const previousSelected = depSelectedOrder();
   dependencyState.candidates = await depApi(`/api/scm/transfer-dependencies/candidates${depCandidateQuery()}`);
   if (!preserveSelection || !dependencyState.candidates.some((order) => String(order.salesOrderId) === String(dependencyState.selectedSalesOrderId))) {
     dependencyState.selectedSalesOrderId = dependencyState.candidates[0]?.salesOrderId || null;
     dependencyState.batch = null;
   }
+  const nextSelected = depSelectedOrder();
+  const shortageChanged = previousSelected
+    && nextSelected
+    && String(previousSelected.salesOrderId) === String(nextSelected.salesOrderId)
+    && previousSelected.shortageSignature
+    && nextSelected.shortageSignature
+    && previousSelected.shortageSignature !== nextSelected.shortageSignature;
+  if (shortageChanged) {
+    dependencyState.batch = null;
+    dependencyState.notice = `${nextSelected.salesOrderRef} backorder changed in NetSuite. Generate a new proposal from the updated shortage.`;
+  }
   if (dependencyState.selectedSalesOrderId) {
-    await loadSelectedDependencyInventory();
+    await loadSelectedDependencyInventory({ refreshUndercovered: refreshInventory });
   } else {
     dependencyState.inventory = null;
   }
+}
+
+function scheduleDependencyRemoteRefresh(delayMs = 450) {
+  window.clearTimeout(dependencyRemoteRefreshTimer);
+  dependencyRemoteRefreshTimer = window.setTimeout(async () => {
+    if (dependencyState.busy) {
+      scheduleDependencyRemoteRefresh(1000);
+      return;
+    }
+    try {
+      const previousSelected = depSelectedOrder();
+      await loadDependencyCandidates({ preserveSelection: true, refreshInventory: false });
+      if (previousSelected
+          && !dependencyState.candidates.some((order) => String(order.salesOrderId) === String(previousSelected.salesOrderId))) {
+        dependencyState.notice = previousSelected.workflowStage === "created"
+          ? `${previousSelected.salesOrderRef} completed approval and source-yard printing.`
+          : `${previousSelected.salesOrderRef} no longer has an uncovered NetSuite backorder.`;
+      }
+      dependencyState.error = "";
+    } catch (error) {
+      dependencyState.error = `Shortage auto-refresh failed: ${error.message}`;
+    }
+    renderDependencyPage();
+  }, delayMs);
+}
+
+function connectDependencyEvents() {
+  if (dependencyEventSource) return;
+  dependencyEventSource = new EventSource("/api/events?client=scm-transfer-dependencies");
+  dependencyEventSource.addEventListener("app-event", (message) => {
+    let event;
+    try {
+      event = JSON.parse(message.data || "{}");
+    } catch {
+      return;
+    }
+    const isDependencyEvent = event.type === "scm.transfer_dependency.updated";
+    const isOrderRefresh = event.type === "dispatch.orders.updated";
+    if (isDependencyEvent || isOrderRefresh) scheduleDependencyRemoteRefresh();
+  });
 }
 
 function proposalUnitValues(row) {
@@ -564,7 +648,7 @@ scmDependencyApp.addEventListener("click", async (event) => {
     return;
   }
   if (action === "set-review-filter") {
-    const status = target.dataset.reviewStatus === "completed" ? "completed" : "open";
+    const status = ["created", "completed"].includes(target.dataset.reviewStatus) ? target.dataset.reviewStatus : "open";
     if (status === dependencyState.reviewStatus) return;
     dependencyState.reviewStatus = status;
     await runDependencyAction("Loading shortages...", () => loadDependencyCandidates({ preserveSelection: false }));
@@ -638,39 +722,69 @@ scmDependencyApp.addEventListener("click", async (event) => {
     });
     return;
   }
+  if (action === "approve-print") {
+    if (!dependencyState.batch) return;
+    const proposalId = Number(target.dataset.proposalId);
+    const proposal = dependencyState.batch.proposals.find((row) => Number(row.id) === proposalId);
+    if (!proposal) return;
+    const prompt = proposal.printJob && ["failed", "uncertain"].includes(proposal.printJob.status)
+      ? `Requeue ${proposal.transferOrderRef} picking ticket to the ${proposal.fromLocation} printer?`
+      : `Verify ${proposal.transferOrderRef} against the saved quantities, approve it in NetSuite, and print its picking ticket at ${proposal.fromLocation}?`;
+    if (!window.confirm(prompt)) return;
+    await runDependencyAction("Verifying, approving, and preparing source-yard print...", async () => {
+      const result = await depApi(`/api/scm/transfer-dependencies/batches/${dependencyState.batch.id}/proposals/${proposalId}/approve-print`, { method: "POST", body: "{}" });
+      dependencyState.batch = result.batch;
+      dependencyState.notice = result.printJob?.status === "printed"
+        ? `${proposal.transferOrderRef} was approved and printed.`
+        : `${proposal.transferOrderRef} was approved; its picking ticket is ${result.printJob?.status || "queued"} at ${proposal.fromLocation}.`;
+      await loadDependencyCandidates({ preserveSelection: true, refreshInventory: false });
+    });
+    return;
+  }
   if (action === "confirm-proposal") {
     const card = target.closest(".scm-dependency-proposal");
     if (!card || !dependencyState.batch) return;
     const proposalId = Number(card.dataset.proposalId);
-    const payload = collectDependencyBatchPayload([card]);
-    if (!window.confirm("Create this Transfer Order in NetSuite? A successful order cannot be rolled back from this screen.")) return;
-    await runDependencyAction("Creating NetSuite Transfer Order...", async () => {
-      dependencyState.batch = await depApi(`/api/scm/transfer-dependencies/batches/${dependencyState.batch.id}`, {
-        method: "PUT",
-        body: JSON.stringify(payload)
-      });
+    const recovering = card.dataset.creationStatus === "creating";
+    const payload = recovering ? null : collectDependencyBatchPayload([card]);
+    const confirmation = recovering
+      ? "Recover the Transfer Order already created by the interrupted request? This will not create a duplicate if the existing order is found."
+      : "Create this Transfer Order in NetSuite? A successful order cannot be rolled back from this screen.";
+    if (!window.confirm(confirmation)) return;
+    await runDependencyAction(recovering ? "Recovering NetSuite Transfer Order..." : "Creating NetSuite Transfer Order...", async () => {
+      if (payload) {
+        dependencyState.batch = await depApi(`/api/scm/transfer-dependencies/batches/${dependencyState.batch.id}`, {
+          method: "PUT",
+          body: JSON.stringify(payload)
+        });
+      }
       const result = await depApi(`/api/scm/transfer-dependencies/batches/${dependencyState.batch.id}/proposals/${proposalId}/confirm`, { method: "POST", body: "{}" });
       dependencyState.batch = result.batch;
       const createdCount = result.results.filter((entry) => entry.status === "created").length;
       const attentionCount = result.results.filter((entry) => entry.status === "attention").length;
       const failedCount = result.results.filter((entry) => entry.status === "failed").length;
-      dependencyState.notice = createdCount
+      const recoveredCount = result.results.filter((entry) => entry.recovered).length;
+      dependencyState.notice = recoveredCount
+        ? "Existing Transfer Order recovered and linked without creating a duplicate."
+        : createdCount
         ? "Transfer Order created in NetSuite."
         : attentionCount
           ? "Transfer Order was created but needs attention; review its NetSuite status below."
           : failedCount
             ? "Transfer Order creation failed. Correct this proposal and retry."
             : "Transfer Order proposal is already created.";
-      dependencyState.candidates = await depApi(`/api/scm/transfer-dependencies/candidates${depCandidateQuery()}`);
-      if (dependencyState.selectedSalesOrderId) {
-        await loadSelectedDependencyInventory({ refreshUndercovered: false });
-      }
+      if (result.results.some((entry) => entry.transferOrderId)) dependencyState.reviewStatus = "created";
+      await loadDependencyCandidates({ preserveSelection: false, refreshInventory: false });
     });
     return;
   }
 });
 
 window.addEventListener("mbbs-language-changed", renderDependencyPage);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && dependencyState.operator) scheduleDependencyRemoteRefresh(100);
+});
+window.addEventListener("beforeunload", () => dependencyEventSource?.close());
 
 requireDispatchLogin({
   mount: scmDependencyApp,
@@ -678,5 +792,6 @@ requireDispatchLogin({
   async onReady(operator) {
     dependencyState.operator = operator;
     await runDependencyAction("Loading shortages...", () => loadDependencyCandidates({ preserveSelection: false }));
+    connectDependencyEvents();
   }
 });

@@ -7,7 +7,8 @@ const STAFF_TOKEN_KEYS = {
   dispatcher: "mbbs.dispatch.token",
   scm: "mbbs.dispatch.token",
   scm_staff: "mbbs.dispatch.token",
-  yard_manager: "mbbs.control.token"
+  yard_manager: "mbbs.control.token",
+  sales: "mbbs.dispatch.token"
 };
 const STAFF_TOKEN_KEY = "mbbs.staff.token";
 const STAFF_ROLE_KEY = "mbbs.staff.role";
@@ -24,6 +25,7 @@ function routeForStaffRole(role) {
   if (clean === "dispatcher") return "/dispatch";
   if (clean === "scm" || clean === "scm_staff") return "/scm";
   if (clean === "yard_manager") return "/control";
+  if (clean === "sales") return "/sales";
   return "";
 }
 

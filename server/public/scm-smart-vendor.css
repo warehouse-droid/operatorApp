@@ -1,0 +1,125 @@
+.smart-pill.order_requested {
+  border-color: #9dbfda;
+  color: var(--smart-blue);
+  background: #eef6fc;
+}
+
+.smart-pill.vendor_replied {
+  border-color: #a8d3bd;
+  color: var(--smart-green);
+  background: #eff9f3;
+}
+
+.smart-vendor-load {
+  scroll-margin-top: 78px;
+}
+
+.smart-vendor-load-head {
+  grid-template-columns: 72px minmax(260px, 1fr) repeat(3, minmax(105px, auto)) auto;
+}
+
+.smart-vendor-error {
+  padding: 8px 12px;
+  border-top: 1px solid #e2b2b2;
+  color: var(--smart-red);
+  background: #fff1f1;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.smart-vendor-meta {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(150px, 1fr)) minmax(260px, 2fr);
+  gap: 9px;
+  padding: 11px 12px;
+  border-top: 1px solid var(--smart-border);
+  background: white;
+}
+
+.smart-vendor-meta input,
+.smart-vendor-alternative input,
+.smart-vendor-alternative select {
+  width: 100%;
+  min-height: 32px;
+}
+
+.smart-vendor-lines {
+  min-width: 960px;
+}
+
+.smart-vendor-lines td:nth-child(1) {
+  min-width: 250px;
+}
+
+.smart-vendor-lines td:nth-child(2) {
+  width: 150px;
+}
+
+.smart-vendor-lines td:nth-child(4) {
+  width: 125px;
+}
+
+.smart-vendor-alternative {
+  display: grid;
+  grid-template-columns: minmax(230px, .8fr) minmax(230px, .8fr) minmax(300px, 1.4fr) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 11px 12px;
+  border-top: 1px solid var(--smart-border);
+  background: #f8fbfc;
+}
+
+.smart-vendor-alternative-results {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 6px;
+}
+
+.smart-vendor-alternative-result {
+  display: grid;
+  grid-template-columns: minmax(280px, 1fr) 100px auto;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 9px;
+  border: 1px solid #d5e0e7;
+  border-radius: 7px;
+  background: white;
+}
+
+.smart-vendor-alternative-result label {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: 5px;
+  color: var(--smart-muted);
+  font-size: 10px;
+  font-weight: 900;
+}
+
+.smart-vendor-load-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 11px 12px;
+  border-top: 1px solid var(--smart-border);
+  background: #f8fafb;
+}
+
+.smart-empty-compact {
+  padding: 14px;
+}
+
+@media (max-width: 1220px) {
+  .smart-vendor-meta {
+    grid-template-columns: repeat(3, minmax(160px, 1fr));
+  }
+
+  .smart-vendor-remarks {
+    grid-column: span 2;
+  }
+
+  .smart-vendor-alternative {
+    grid-template-columns: repeat(2, minmax(240px, 1fr));
+  }
+}

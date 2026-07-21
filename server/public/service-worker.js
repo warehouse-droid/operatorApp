@@ -1,11 +1,12 @@
-const CACHE_NAME = "mbbs-yard-operator-v117-no-conversion-sales";
+const CACHE_NAME = "mbbs-yard-operator-v120-barcode-camera-fix";
 const APP_SHELL = [
   "/operator",
   "/operator.html",
-  "/operator.css?v=20260717-in-pwa-camera-v1",
+  "/operator.css?v=20260721-barcode-v1",
   "/i18n.css?v=20260701-i18n-v2",
-  "/i18n.js?v=20260717-in-pwa-camera-v1",
-  "/operator.js?v=20260718-no-conversion-sales-v1",
+  "/vendor/quagga2/quagga.min.js?v=1.12.1",
+  "/i18n.js?v=20260721-barcode-v1",
+  "/operator.js?v=20260721-barcode-v3",
   "/driver",
   "/driver.html",
   "/driver.css?v=20260716-multi-photo-pallet-v1",

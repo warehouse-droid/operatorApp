@@ -689,6 +689,7 @@ export async function upsertOutboundTransferOrders(orders = []) {
       ],
       detailsKey: "order"
     });
+    await syncOrderDependenciesForTransferOrder(normalized.netsuite_id);
     await enqueueNetSuiteMirrorOrderEvent("transfer_order", normalized.netsuite_id);
   }
 }
@@ -1039,6 +1040,7 @@ export async function markOutboundOrderMissing(orderId, { orderFamily = "sales_o
           )`,
       [orderId]
     );
+    await syncOrderDependenciesForTransferOrder(orderId);
     await enqueueNetSuiteMirrorOrderEvent("transfer_order", orderId, { changeType: "missing" });
     return;
   }
@@ -1453,6 +1455,7 @@ export async function upsertInboundTransferOrders(orders = []) {
       ],
       detailsKey: "order"
     });
+    await syncOrderDependenciesForTransferOrder(normalized.netsuite_id);
     await enqueueNetSuiteMirrorOrderEvent("transfer_order", normalized.netsuite_id);
   }
 }
@@ -1560,6 +1563,7 @@ export async function markMissingInboundOrders({ orderFamily, activeOrderIds = [
     params
   );
   for (const row of missingOrders.rows) {
+    await syncOrderDependenciesForTransferOrder(row.netsuite_id);
     await enqueueNetSuiteMirrorOrderEvent("transfer_order", row.netsuite_id, { changeType: "missing" });
   }
 }

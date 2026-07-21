@@ -241,6 +241,8 @@ function scmLineMatchesSearch(item = {}) {
     item.description,
     item.unit,
     item.salesUnit,
+    item.destinationYard,
+    item.destinationLocationId,
     scmQuantityLabel(item)
   ].join(" ").toLowerCase().includes(needle);
 }
@@ -381,7 +383,10 @@ async function loadScmOrders() {
 }
 
 function renderScmListFilters() {
-  const dropoffOptions = scmUniqueOptions([scmDropoffFilter, ...scmOrders.map((order) => order.destinationYard)]);
+  const dropoffOptions = scmUniqueOptions([
+    scmDropoffFilter,
+    ...scmOrders.flatMap((order) => [order.destinationYard, ...(order.dropoffs || []).map((dropoff) => dropoff.destinationYard)])
+  ]);
   const vendorOptions = scmUniqueOptions([scmVendorFilter, ...scmOrders.map(scmOrderVendorLabel)]);
   const pickupOptions = scmUniqueOptions([scmPickupFilter, ...scmOrders.map(scmDefaultPickupPoint)]);
   const renderSelect = (action, value, label, options) => `
@@ -411,6 +416,12 @@ function renderOrderList() {
     const groupSelected = scmGroupSelection.has(String(order.id));
     const quantityLabel = scmOrderQuantityLabel(order);
     const plannedLabel = scmPlannedLabel(order);
+    const pickupPoint = scmDefaultPickupPoint(order) || "";
+    const destinationYards = [...new Set([
+      order.destinationYard,
+      ...(order.dropoffs || []).map((dropoff) => dropoff.destinationYard)
+    ].map((yard) => String(yard || "").trim()).filter(Boolean))];
+    const destinationText = destinationYards.join(", ");
     return `
       <button class="order-card scm-po-card ${plannedLabel ? "has-plan" : ""} ${isSplit ? "scm-split-card" : ""} ${alreadyGrouped ? "scm-grouped-card" : ""} ${groupSelected ? "multi-selected" : ""} ${String(order.id) === String(selectedScmOrderId) ? "selected" : ""}" data-action="select-order" data-id="${escapeHtml(order.id)}" type="button">
         <div class="scm-card-main">
@@ -418,7 +429,7 @@ function renderOrderList() {
           <span class="scm-card-party">${isSplit ? t("dispatch.scmSplitOrder", "SCM Split Order") : escapeHtml(order.customer || order.vendorYard || order.sourceYard || "Purchase Order")}</span>
           <span class="scm-card-route">${isSplit
             ? `${t("dispatch.sourcePo", "Source PO")}: ${escapeHtml(order.sourcePoRef || "")}`
-            : `${order.dispatchRef ? `PO ${escapeHtml(order.originalPoRef || "")} | ` : ""}${escapeHtml(scmDefaultPickupPoint(order) || "")}${scmDefaultPickupPoint(order) && order.destinationYard ? " -> " : ""}${escapeHtml(order.destinationYard || "")}`}</span>
+            : `${order.dispatchRef ? `PO ${escapeHtml(order.originalPoRef || "")} | ` : ""}${escapeHtml(pickupPoint)}${pickupPoint && destinationText ? " -> " : ""}${escapeHtml(destinationText)}`}</span>
           <span class="scm-card-qty">${escapeHtml(quantityLabel || "-")}</span>
           <span class="scm-card-weight">${t("dispatch.orderWeight", "Order weight")}: ${escapeHtml(scmWeightLabel(order.weight))}</span>
         </div>
@@ -455,6 +466,9 @@ function renderSelectedOrder() {
           <div>
             <strong>${escapeHtml(item.sku || item.itemName || "Item")}</strong>
             <span>${escapeHtml(item.description || "")}</span>
+            <span class="scm-line-yard">
+              ${t("dispatch.destinationYard", "Destination Yard")}: <b>${escapeHtml(item.destinationYard || order.destinationYard || "--")}</b>
+            </span>
           </div>
           <div class="scm-line-totals">
             <div class="scm-line-available">${escapeHtml(scmQuantityLabel(item))}</div>
@@ -574,6 +588,7 @@ function renderScmSplitModal() {
               <article>
                 <strong>${escapeHtml(item.sku || item.itemName || "Item")}</strong>
                 <span>${escapeHtml(scmSelectedLineLabel(item, quantities))}</span>
+                <small>${t("dispatch.destinationYard", "Destination Yard")}: ${escapeHtml(item.destinationYard || order?.destinationYard || "--")}</small>
                 <small>${escapeHtml(scmLineWeightText(item, quantities))}</small>
               </article>
             `).join("") || `<div class="empty-state">${t("dispatch.noLinesSelected", "No lines selected.")}</div>`}

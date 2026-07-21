@@ -5,8 +5,8 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { config, isNetSuiteSandboxEnvironment, listEnvFiles, selectEnvFile } from "./config.js";
 import { beginRollbackContext, pool, query, withTransaction } from "./db.js";
-import { buildAuthorizationUrl, exchangeCodeForToken, fetchDeliveryOrdersFromNetSuite, fetchDeliveryOrderFromNetSuite, fetchCustomerPickupOrderFromNetSuite, fetchDeliveryOrderDetailsFromNetSuite, fetchTransferDeliveryOrdersFromNetSuite, fetchTransferDeliveryOrderFromNetSuite, fetchTransferOrderDetailsFromNetSuite, fetchTransferOrderByIdFromNetSuite, fetchPurchaseOrdersFromNetSuite, fetchPurchaseOrderFromNetSuite, fetchPurchaseOrderDetailsFromNetSuite, fetchTransferReceivingOrdersFromNetSuite, fetchTransferReceivingOrderFromNetSuite, fetchInventoryBalanceForItemFromNetSuite, fetchInventoryBalancesFromNetSuite, fetchInventoryBalancesForItemsFromNetSuite, fetchItemFulfillmentFromNetSuite, fetchItemReceiptFromNetSuite, fetchTransactionProgressFromNetSuite, fetchTransactionStatusFromNetSuite, createTransferOrderInNetSuite, resolveNetSuiteTransferLocations, resolveNetSuiteYardLocations, resolvePalletItemFromNetSuite, transformSalesOrderToItemFulfillment, transformTransferOrderToItemFulfillment, transformPurchaseOrderToItemReceipt, transformTransferOrderToItemReceipt } from "./netsuite.js";
-import { buildTransferDependencyRestPayload } from "./transfer-dependency-netsuite.js";
+import { buildAuthorizationUrl, exchangeCodeForToken, fetchDeliveryOrdersFromNetSuite, fetchDeliveryOrderFromNetSuite, fetchCustomerPickupOrderFromNetSuite, fetchDeliveryOrderDetailsFromNetSuite, fetchTransferDeliveryOrdersFromNetSuite, fetchTransferDeliveryOrderFromNetSuite, fetchTransferOrderDetailsFromNetSuite, fetchTransferOrderVerificationLinesFromNetSuite, fetchTransferOrderByIdFromNetSuite, findTransferOrdersByDependencyMarkerFromNetSuite, fetchPurchaseOrdersFromNetSuite, fetchPurchaseOrderFromNetSuite, fetchPurchaseOrderReferenceFromNetSuite, fetchPurchaseOrderDetailsFromNetSuite, fetchTransferReceivingOrdersFromNetSuite, fetchTransferReceivingOrderFromNetSuite, fetchInventoryBalanceForItemFromNetSuite, fetchInventoryBalancesFromNetSuite, fetchInventoryBalancesForItemsFromNetSuite, fetchItemFulfillmentFromNetSuite, fetchItemReceiptFromNetSuite, fetchTransactionProgressFromNetSuite, fetchTransactionStatusFromNetSuite, createPurchaseOrderInNetSuite, createTransferOrderInNetSuite, updateTransferOrderStatusInNetSuite, fetchPickingTicketFromNetSuite, resolveNetSuiteTransferLocations, resolveNetSuiteYardLocations, resolvePalletItemFromNetSuite, transformSalesOrderToItemFulfillment, transformTransferOrderToItemFulfillment, transformPurchaseOrderToItemReceipt, transformTransferOrderToItemReceipt } from "./netsuite.js";
+import { buildTransferDependencyRestPayload, transferDependencyMemoMarker } from "./transfer-dependency-netsuite.js";
 import { listDeliveryOrders, listVrmaDeliveryPrepOrders, getDeliveryOrder, getFulfillableDeliveryOrder, buildItemFulfillmentPayload, markDeliveryPrepared, updateDeliveryStatus, confirmDeliveryLine, confirmDeliveryLines, setDeliveryLinePackedQuantity, unpackDeliveryLine, unpackDeliveryOrder, recordDeliveryFulfillment, recordDeliveryFulfillmentFailure, recordDeliveryLoad, listDeliveryFulfillments, getDeliveryBootstrap, getDeliveryPrepNotifications, resetDeliveryFulfillmentState, applyConfirmedDispatchPlanToDelivery, deactivateUnplannedDispatchSplitOrders, getNextDispatchSplitSuffix, getCurrentOperatorDeliveryDraft, releaseCurrentDeliveryDraft, listSavedDeliveryOrdersForOperator, listSavedDeliveryOrderKeysForOperator, saveDeliveryOrderForOperator, removeSavedDeliveryOrderForOperator, listDeliveryLoadTrucks, listDeliveryLoadOrders } from "./delivery-repository.js";
 import { getYardMovementDetail, listYardMovementCsvRows, listYardMovements } from "./yard-movement-repository.js";
 import { yardMixedUnits } from "./yard-quantity.js";
@@ -32,11 +32,23 @@ import { getPhotoArchiveSettings, isPhotoArchiveRunning, photoArchiveAutoTick, r
 import { authenticateDispatchDriver, ensureDispatchFleetSetup, getDispatchDriverByLogin, listDispatchDrivers, listDispatchTrucks, replaceDispatchFleetSetup } from "./dispatch-setup-repository.js";
 import { assertNoActiveConsolidationClaimsByRefs, confirmConsolidationItem, getActiveConsolidationBatch, getSavedConsolidationQueue, packConsolidationOrder, releaseConsolidationBatch, startSavedConsolidationBatch, updateConsolidationLine } from "./delivery-consolidation-repository.js";
 import { DEPENDENCY_YARDS, assertNoActiveOrderDependenciesByRefs, cancelOrderDependency, completeDirectDependenciesForSalesOrderDrop, confirmTransferDependencyBatch, createOrderDependency, enrichDispatchOrdersWithDependencies, generateTransferDependencySuggestion, getDependencyInventoryMatrix, getDirectPickupDependencyExecutionBlock, getOrderDependencyOptions, getSalesOrderDependencyExecutionBlock, getTransferDependencyBatch, listOrderDependencies, listTransferDependencyCandidates, markDirectDependencyPickupCompleted, prepareTransferDependencyPalletItem, reconcileOrderDependency, removeTransferDependencyProposalLine, reopenTransferDependencyCandidate, retryTransferDependencyBatch, reviewTransferDependencyCandidate, syncDirectDependencyOperatorProgress, syncOrderDependenciesForTransferOrder, syncOrderDependenciesFromDispatchPlan, updateOrderDependencyMode, updateTransferDependencyBatch, validateDispatchPlanDependencies } from "./order-dependency-repository.js";
+import { activateSmartScmInputFile, importSmartScmSalesCsv, listSmartScmInputFiles, parseSmartScmVendorResponseFile, smartScmInputDownload, storeSmartScmInputFile } from "./smart-scm-import-repository.js";
+import { getSmartScmBootstrap, getSmartScmSettings, getSmartScmPlanningRun, listSmartScmForecasts, listSmartScmForecastRuns, listSmartScmPlanningRuns, listSmartScmProposals, promoteSmartScmForecastSegment, runSmartScmForecast, runSmartScmPlan, smartScmAutoTick, updateSmartScmSettings } from "./smart-scm-repository.js";
+import { getSmartScmSyncStatus, listSmartScmItems, updateSmartScmItem } from "./smart-scm-item-repository.js";
+import { refreshSmartScmLiveData } from "./smart-scm-sync-service.js";
+import { completeSmartScmTransferExecution, failSmartScmTransferExecution, getSmartScmProposal, markSmartScmTransferAttention, prepareSmartScmTransferExecution, recordSmartScmVendorResponses, updateSmartScmProposal } from "./smart-scm-planning-repository.js";
+import { createSimplePdf, leaseYardPrintJob, listSmartScmPrintJobs, listYardPrinters, queueSmartScmPrintJob, queueYardPrinterTest, retrySmartScmPrintJob, rotateYardPrinterToken, updateLeasedPrintJob, updateYardPrinter, yardPrintJobDocument } from "./smart-scm-print-repository.js";
+import { addSmartScmVendorAlternativeLine, listSmartScmVendorReplyLoads, removeSmartScmVendorAlternativeLine, saveSmartScmVendorReplyLoad, searchSmartScmVendorAlternatives } from "./smart-scm-vendor-repository.js";
+import { addSmartScmProposalLine, groupSmartScmProposals, recalculateSmartScmPoProposal, removeSmartScmProposalLine, searchSmartScmProposalItems, updateSmartScmProposalLine } from "./smart-scm-proposal-editor.js";
+import { listSmartScmRouteRules, upsertSmartScmRouteRule } from "./smart-scm-route-repository.js";
 
+import { executeSmartScmPurchaseProposal } from "./smart-scm-purchase-service.js";
+import { SALES_YARDS, getSalesOrderPrintCandidate, getSalesOrderPrintSnapshot, listSalesOrderPrintCandidates, listSalesOrderPrintHistory, normalizeSalesYardLocationIds } from "./sales-repository.js";
 const app = express();
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.resolve(dirname, "../public");
 const qrScannerDir = path.resolve(dirname, "../node_modules/qr-scanner");
+const quaggaScannerDir = path.resolve(dirname, "../node_modules/@ericblade/quagga2/dist");
 const dataDir = path.resolve(dirname, "../data");
 const dispatchPlanPath = path.join(dataDir, "dispatch-plan.json");
 const dispatchSetupPath = path.join(dataDir, "dispatch-setup.json");
@@ -519,6 +531,127 @@ async function transferDependencyRestPayload({ proposal, batch }) {
   };
 }
 
+function transferDependencyExpectedItemQuantities(proposal = {}) {
+  return new Map([...transferDependencyExpectedLineTotals(proposal)].map(([itemId, line]) => [itemId, line.quantity]));
+}
+
+function transferDependencyExpectedLineTotals(proposal = {}) {
+  const palletItemId = Number(proposal.palletItemId);
+  const totals = new Map();
+  const add = (itemId, itemName, values = {}) => {
+    const current = totals.get(itemId) || {
+      itemId,
+      itemName: String(itemName || itemId),
+      quantity: 0,
+      palletQty: 0,
+      layerQty: 0,
+      sectionQty: 0,
+      pieceQty: 0
+    };
+    for (const field of ["quantity", "palletQty", "layerQty", "sectionQty", "pieceQty"]) {
+      current[field] += Number(values[field] || 0);
+    }
+    totals.set(itemId, current);
+  };
+  for (const line of proposal.lines || []) {
+    const itemId = Number(line.itemId);
+    const itemName = String(line.sku || line.itemName || "").trim().toUpperCase();
+    if (!Number.isInteger(itemId) || itemId <= 0 || String(itemId) === String(palletItemId) || itemName === "PALLET") continue;
+    add(itemId, line.itemName || line.sku, {
+      quantity: line.proposedQuantity,
+      palletQty: line.palletQty,
+      layerQty: line.layerQty,
+      sectionQty: line.sectionQty,
+      pieceQty: line.pieceQty
+    });
+  }
+  const palletQuantity = Number(proposal.palletTransferQuantity || 0);
+  if (Number.isInteger(palletItemId) && palletItemId > 0 && palletQuantity > 0) {
+    add(palletItemId, proposal.palletItemName || "PALLET", { quantity: palletQuantity, pieceQty: palletQuantity });
+  }
+  return totals;
+}
+
+function transferDependencyItemQuantitiesMatch(expected, lines = []) {
+  const actual = new Map();
+  for (const line of lines || []) {
+    const itemId = Number(line.item_id ?? line.itemId);
+    if (!Number.isInteger(itemId) || itemId <= 0) continue;
+    actual.set(itemId, Number(actual.get(itemId) || 0) + Number(line.quantity || 0));
+  }
+  if (actual.size !== expected.size) return false;
+  for (const [itemId, quantity] of expected) {
+    if (Math.abs(Number(actual.get(itemId) || 0) - quantity) > 0.000001) return false;
+  }
+  return true;
+}
+
+async function findCreatedDependencyTransferOrder({ proposal, batch }) {
+  const expected = transferDependencyExpectedItemQuantities(proposal);
+  if (!expected.size) return null;
+  const exactMarker = transferDependencyMemoMarker(batch.id, proposal.id);
+  const legacyMarker = `MBBS dependency batch ${batch.id}`;
+  const linked = await query(
+    `SELECT netsuite_transfer_order_id
+       FROM scm_transfer_dependency_proposals
+      WHERE netsuite_transfer_order_id IS NOT NULL
+        AND id <> $1`,
+    [Number(proposal.id)]
+  );
+  const linkedIds = new Set(linked.rows.map((row) => Number(row.netsuite_transfer_order_id)));
+  const local = await query(
+    `SELECT netsuite_id AS id, tranid, memo
+       FROM transfer_orders
+      WHERE from_location_id = $1
+        AND to_location_id = $2
+        AND COALESCE(netsuite_active, true) = true
+        AND memo ILIKE $3
+      ORDER BY CASE WHEN memo ILIKE $4 THEN 0 ELSE 1 END, netsuite_id DESC
+      LIMIT 10`,
+    [Number(proposal.fromLocationId), Number(proposal.toLocationId), `%${legacyMarker}%`, `%${exactMarker}%`]
+  );
+  const matches = [];
+  for (const candidate of local.rows) {
+    const candidateId = Number(candidate.id);
+    if (linkedIds.has(candidateId)) continue;
+    const lines = await query(
+      `SELECT item_id, SUM(quantity) AS quantity
+         FROM transfer_order_lines
+        WHERE transfer_order_id = $1
+          AND line_stage = 'outbound'
+          AND COALESCE(netsuite_active, true) = true
+        GROUP BY item_id`,
+      [candidateId]
+    );
+    if (transferDependencyItemQuantitiesMatch(expected, lines.rows)) matches.push(candidate);
+  }
+  if (!matches.length) {
+    const locations = await resolveNetSuiteTransferLocations({
+      sourceLocationId: proposal.fromLocationId,
+      sourceLocation: proposal.fromLocation,
+      destinationLocationId: proposal.toLocationId,
+      destinationLocation: proposal.toLocation
+    });
+    const remote = await findTransferOrdersByDependencyMarkerFromNetSuite({
+      batchId: batch.id,
+      proposalId: proposal.id,
+      sourceLocationId: locations.source.netsuiteLocationId,
+      destinationLocationId: locations.destination.netsuiteLocationId
+    });
+    for (const candidate of remote) {
+      const candidateId = Number(candidate.id);
+      if (linkedIds.has(candidateId)) continue;
+      const lines = await fetchTransferOrderDetailsFromNetSuite(candidateId, locations.source.netsuiteLocationId, { direction: "source" });
+      if (transferDependencyItemQuantitiesMatch(expected, lines)) matches.push(candidate);
+    }
+  }
+  const uniqueMatches = [...new Map(matches.map((candidate) => [Number(candidate.id), candidate])).values()];
+  if (uniqueMatches.length > 1) {
+    throw new Error(`Multiple matching NetSuite Transfer Orders were found for proposal ${proposal.id}. Link the correct TO manually before retrying.`);
+  }
+  return uniqueMatches[0] ? { id: Number(uniqueMatches[0].id), recovered: true } : null;
+}
+
 async function refreshTransferDependencyInventory(itemIds = []) {
   const ids = [...new Set((itemIds || []).map(Number).filter(Number.isInteger))];
   if (!ids.length) return [];
@@ -599,6 +732,358 @@ async function hydrateCreatedDependencyTransferOrder(transferOrderId, proposal) 
     statusText,
     pendingFulfillment: status.toUpperCase() === "B" || /pending fulfillment/i.test(statusText)
   };
+}
+
+function transferDependencyVerificationMismatches(proposal, remoteLines = []) {
+  const expected = transferDependencyExpectedLineTotals(proposal);
+  const actual = new Map();
+  for (const line of remoteLines || []) {
+    const itemId = Number(line.item_id ?? line.itemId);
+    if (!Number.isInteger(itemId) || itemId <= 0) continue;
+    actual.set(itemId, {
+      itemId,
+      itemName: String(line.item_name || line.itemName || itemId),
+      quantity: Number(line.quantity || 0),
+      palletQty: Number(line.pallet_qty ?? line.palletQty ?? 0),
+      layerQty: Number(line.layer_qty ?? line.layerQty ?? 0),
+      sectionQty: Number(line.section_qty ?? line.sectionQty ?? 0),
+      pieceQty: Number(line.piece_qty ?? line.pieceQty ?? 0)
+    });
+  }
+  const mismatches = [];
+  const fields = [
+    ["quantity", "sales quantity"],
+    ["palletQty", "PLT"],
+    ["layerQty", "LYR"],
+    ["sectionQty", "SEC"],
+    ["pieceQty", "PCS"]
+  ];
+  for (const itemId of new Set([...expected.keys(), ...actual.keys()])) {
+    const wanted = expected.get(itemId);
+    const found = actual.get(itemId);
+    if (!wanted) {
+      mismatches.push(`${found?.itemName || itemId} exists only in NetSuite`);
+      continue;
+    }
+    if (!found) {
+      mismatches.push(`${wanted.itemName} is missing from NetSuite`);
+      continue;
+    }
+    for (const [field, label] of fields) {
+      if (Math.abs(Number(wanted[field] || 0) - Number(found[field] || 0)) > 0.000001) {
+        mismatches.push(`${wanted.itemName} ${label}: local ${wanted[field] || 0}, NetSuite ${found[field] || 0}`);
+      }
+    }
+  }
+  return mismatches;
+}
+
+async function approveAndPrintTransferDependencyProposal(batchId, proposalId, operator) {
+  const batch = await getTransferDependencyBatch(batchId);
+  if (!batch) throw Object.assign(new Error("Dependency batch not found."), { status: 404 });
+  const proposal = batch.proposals.find((row) => String(row.id) === String(proposalId));
+  if (!proposal) throw Object.assign(new Error("Transfer proposal not found."), { status: 404 });
+  const transferOrderId = Number(proposal.transferOrderId);
+  if (!Number.isInteger(transferOrderId) || transferOrderId <= 0 || !proposal.transferOrderRef) {
+    throw Object.assign(new Error("Create the NetSuite Transfer Order before approval and printing."), { status: 409 });
+  }
+  if (!['created', 'attention'].includes(proposal.creationStatus)) {
+    throw Object.assign(new Error("This Transfer Order is not ready for approval."), { status: 409 });
+  }
+  if (proposal.printJob) {
+    let printJob = proposal.printJob;
+    if (["failed", "uncertain"].includes(printJob.status)) {
+      printJob = await retrySmartScmPrintJob(printJob.id, operator?.id);
+    }
+    return { batch: await getTransferDependencyBatch(batchId), proposalId: proposal.id, transferOrderId, transferOrderRef: proposal.transferOrderRef, printJob, reused: true };
+  }
+
+  const locations = await resolveNetSuiteTransferLocations({
+    sourceLocationId: proposal.fromLocationId,
+    sourceLocation: proposal.fromLocation,
+    destinationLocationId: proposal.toLocationId,
+    destinationLocation: proposal.toLocation
+  });
+  const [order, remoteLines] = await Promise.all([
+    fetchTransferOrderByIdFromNetSuite(transferOrderId),
+    fetchTransferOrderVerificationLinesFromNetSuite(transferOrderId, locations.source.netsuiteLocationId)
+  ]);
+  const mismatches = transferDependencyVerificationMismatches(proposal, remoteLines);
+  if (!order) mismatches.unshift(`${proposal.transferOrderRef} was not found in NetSuite`);
+  if (order && String(order.source_location_id) !== String(locations.source.netsuiteLocationId)) {
+    mismatches.unshift(`source yard: local ${proposal.fromLocation}, NetSuite ${order.source_location || order.source_location_id || "missing"}`);
+  }
+  if (order && String(order.destination_location_id) !== String(locations.destination.netsuiteLocationId)) {
+    mismatches.unshift(`destination yard: local ${proposal.toLocation}, NetSuite ${order.destination_location || order.destination_location_id || "missing"}`);
+  }
+  if (mismatches.length) {
+    const message = `TO verification failed: ${mismatches.slice(0, 8).join("; ")}`;
+    await query(
+      `UPDATE scm_transfer_dependency_proposals
+          SET quantity_verification_status = 'failed', quantity_verification_error = $2,
+              approval_status = 'failed', approval_error = $2, updated_at = now()
+        WHERE id = $1`,
+      [Number(proposal.id), message]
+    );
+    await writeDispatchAudit({
+      action: "scm.transfer_dependency.verification_failed",
+      source: "scm",
+      entityType: "transfer_dependency_proposal",
+      entityId: String(proposal.id),
+      orderId: proposal.transferOrderRef,
+      operatorId: operator?.id,
+      details: { batchId: batch.id, salesOrderRef: batch.salesOrderRef, transferOrderId, mismatches }
+    });
+    throw Object.assign(new Error(message), { status: 409 });
+  }
+  await query(
+    `UPDATE scm_transfer_dependency_proposals
+        SET quantity_verification_status = 'verified', quantity_verification_error = NULL,
+            quantity_verified_at = now(), quantity_verified_by = $2, updated_at = now()
+      WHERE id = $1`,
+    [Number(proposal.id), operator?.id]
+  );
+
+  const restletUrl = String(config.smartScm?.pickingTicketRestletUrl || "").trim();
+  if (!restletUrl) {
+    const message = "Quantity verified. SMART_SCM_PICKING_TICKET_RESTLET_URL is not configured, so the TO remains Pending Approval in Created.";
+    await query(
+      `UPDATE scm_transfer_dependency_proposals
+          SET approval_status = 'pending', approval_error = $2, updated_at = now()
+        WHERE id = $1`,
+      [Number(proposal.id), message]
+    );
+    throw Object.assign(new Error(message), { status: 409 });
+  }
+  const printer = (await listYardPrinters()).find((row) => Number(row.locationId) === Number(proposal.fromLocationId));
+  if (!printer?.enabled || !printer?.hasToken || !printer?.printerName) {
+    const message = `Quantity verified. ${proposal.fromLocation} printer must be enabled with a printer name and agent token before approval.`;
+    await query(
+      `UPDATE scm_transfer_dependency_proposals
+          SET approval_status = 'pending', approval_error = $2, updated_at = now()
+        WHERE id = $1`,
+      [Number(proposal.id), message]
+    );
+    throw Object.assign(new Error(message), { status: 409 });
+  }
+
+  let approved = proposal.approvalStatus === "approved";
+  try {
+    if (!approved) {
+      const claimed = await query(
+        `UPDATE scm_transfer_dependency_proposals
+            SET approval_status = 'approving', approval_error = NULL, updated_at = now()
+          WHERE id = $1 AND approval_status IN ('pending', 'failed')
+          RETURNING id`,
+        [Number(proposal.id)]
+      );
+      if (!claimed.rowCount) {
+        throw Object.assign(new Error("This Transfer Order approval is already in progress. Refresh before retrying."), { status: 409 });
+      }
+      await updateTransferOrderStatusInNetSuite(transferOrderId, { intercompany: locations.intercompany, statusId: "B" });
+      let approvedOrder = null;
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        approvedOrder = await fetchTransferOrderByIdFromNetSuite(transferOrderId);
+        const status = String(approvedOrder?.status || "").toUpperCase();
+        if (status === "B" || /pending fulfillment/i.test(String(approvedOrder?.status_text || ""))) break;
+        await new Promise((resolve) => setTimeout(resolve, 1250));
+      }
+      const hydrated = await hydrateCreatedDependencyTransferOrder(transferOrderId, proposal);
+      if (!hydrated.pendingFulfillment) {
+        throw new Error(`${proposal.transferOrderRef} did not reach Pending Fulfillment after approval.`);
+      }
+      approved = true;
+      await query(
+        `UPDATE scm_transfer_dependency_proposals
+            SET creation_status = 'created', creation_error = NULL,
+                approval_status = 'approved', approval_error = NULL,
+                approved_at = now(), approved_by = $2, updated_at = now()
+          WHERE id = $1`,
+        [Number(proposal.id), operator?.id]
+      );
+      await query(
+        `UPDATE order_dependencies
+            SET status = 'active', attention_reason = NULL,
+                updated_by = $2, updated_at = now()
+          WHERE transfer_order_id = $1
+            AND status = 'attention'
+            AND attention_reason ILIKE '%instead of Pending Fulfillment%'`,
+        [transferOrderId, operator?.id]
+      );
+    }
+
+    const document = await fetchPickingTicketFromNetSuite(transferOrderId, { filenamePrefix: proposal.transferOrderRef });
+    const printJob = await queueSmartScmPrintJob({
+      proposalId: null,
+      locationId: proposal.fromLocationId,
+      documentType: "transfer_dependency_picking_ticket",
+      documentName: document.filename,
+      documentBuffer: document.buffer,
+      jobKey: `transfer-dependency:${proposal.id}:picking-ticket:${proposal.transferOrderRef}`,
+      sourceOrderId: transferOrderId,
+      sourceOrderRef: proposal.transferOrderRef,
+      lineLocationId: proposal.fromLocationId
+    }, operator?.id);
+    await query(
+      `UPDATE scm_transfer_dependency_proposals
+          SET approval_status = 'approved', approval_error = NULL,
+              print_job_id = $2, updated_at = now()
+        WHERE id = $1`,
+      [Number(proposal.id), printJob.id]
+    );
+    await writeDispatchAudit({
+      action: "scm.transfer_dependency.approved_print_queued",
+      source: "scm",
+      entityType: "transfer_dependency_proposal",
+      entityId: String(proposal.id),
+      orderId: proposal.transferOrderRef,
+      operatorId: operator?.id,
+      details: { batchId: batch.id, salesOrderRef: batch.salesOrderRef, transferOrderId, sourceYard: proposal.fromLocation, printJobId: printJob.id }
+    });
+    return { batch: await getTransferDependencyBatch(batchId), proposalId: proposal.id, transferOrderId, transferOrderRef: proposal.transferOrderRef, printJob };
+  } catch (error) {
+    await query(
+      `UPDATE scm_transfer_dependency_proposals
+          SET approval_status = $2, approval_error = $3, updated_at = now()
+        WHERE id = $1`,
+      [Number(proposal.id), approved ? "approved" : "failed", error.message]
+    );
+    throw error;
+  }
+}
+
+async function executeSmartScmTransferProposal(proposalId, operator) {
+  const prepared = await prepareSmartScmTransferExecution(proposalId, operator?.id);
+  let transferOrderId = null;
+  let transferOrderRef = null;
+  try {
+    const printers = await listYardPrinters();
+    const printer = printers.find((row) => Number(row.locationId) === Number(prepared.sourceLocationId));
+    if (!printer?.enabled || !printer?.hasToken || !printer?.printerName) {
+      throw new Error(`${prepared.sourceName} printer must be enabled with a printer name and agent token before confirming this TO.`);
+    }
+    let document;
+    if (prepared.mode === "live") {
+      if (!config.smartScm.liveExecutionEnabled) {
+        throw new Error("Smart SCM live execution is blocked by SMART_SCM_LIVE_EXECUTION_ENABLED=false.");
+      }
+      const [locations, palletItem] = await Promise.all([
+        resolveNetSuiteTransferLocations({
+          sourceLocationId: prepared.sourceLocationId,
+          sourceLocation: prepared.sourceName,
+          destinationLocationId: prepared.destinationLocationId,
+          destinationLocation: prepared.destinationName
+        }),
+        resolvePalletItemFromNetSuite()
+      ]);
+      const payload = buildTransferDependencyRestPayload({
+        proposal: {
+          lines: prepared.lines,
+          palletItemId: palletItem.id,
+          palletTransferQuantity: prepared.totalPallets,
+          memo: `${prepared.memo || "Smart SCM replenishment"} | MBBS-SCM:${prepared.id}`
+        },
+        batch: { id: `smart-${prepared.id}`, salesOrderRef: `Smart SCM run ${prepared.runId}` },
+        locations
+      });
+      const created = await createTransferOrderInNetSuite(payload, { intercompany: locations.intercompany });
+      transferOrderId = Number(created.id);
+      if (!Number.isInteger(transferOrderId) || transferOrderId <= 0) {
+        throw new Error("NetSuite created the TO without returning a usable record ID; reconcile the MBBS-SCM memo before retrying.");
+      }
+      await updateTransferOrderStatusInNetSuite(transferOrderId, { intercompany: locations.intercompany, statusId: "B" });
+      const hydrated = await hydrateCreatedDependencyTransferOrder(transferOrderId, {
+        fromLocationId: prepared.sourceLocationId,
+        fromLocation: prepared.sourceName,
+        toLocationId: prepared.destinationLocationId,
+        toLocation: prepared.destinationName
+      });
+      transferOrderRef = hydrated.tranid || `TO-${transferOrderId}`;
+      if (!hydrated.pendingFulfillment) throw new Error(`${transferOrderRef} was created but did not reach Pending Fulfillment.`);
+      await completeSmartScmTransferExecution(prepared.id, { transferOrderId, transferOrderRef, mock: false }, operator?.id);
+      document = await fetchPickingTicketFromNetSuite(transferOrderId);
+    } else {
+      transferOrderRef = `MOCK-TO-${prepared.id}`;
+      await completeSmartScmTransferExecution(prepared.id, { transferOrderId: null, transferOrderRef, mock: true }, operator?.id);
+      document = {
+        filename: `${transferOrderRef}-picking-ticket.pdf`,
+        buffer: createSimplePdf([
+          "MBBS Smart SCM — MOCK Picking Ticket",
+          `Reference: ${transferOrderRef}`,
+          `From: ${prepared.sourceName}`,
+          `To: ${prepared.destinationName}`,
+          `Pallets: ${prepared.totalPallets}`,
+          ...prepared.lines.map((line) => `${line.itemName}: ${line.palletQty} PLT`),
+          "No NetSuite record was created."
+        ])
+      };
+    }
+    const printJob = await queueSmartScmPrintJob({
+      proposalId: prepared.id,
+      locationId: prepared.sourceLocationId,
+      documentType: "picking_ticket",
+      documentName: document.filename,
+      documentBuffer: document.buffer,
+      jobKey: `smart-scm:${prepared.id}:picking-ticket:${transferOrderRef}`
+    }, operator?.id);
+    emitAppEvent("scm.smart.updated", { source: "smart-scm-transfer", proposalId: prepared.id, transferOrderId, transferOrderRef });
+    if (transferOrderId) emitAppEvent("dispatch.orders.updated", { source: "smart-scm-transfer", refreshOrderPool: true });
+    return { proposalId: prepared.id, mode: prepared.mode, transferOrderId, transferOrderRef, printJob };
+  } catch (error) {
+    if (transferOrderId || transferOrderRef?.startsWith("MOCK-TO-")) {
+      await markSmartScmTransferAttention(prepared.id, { transferOrderId, transferOrderRef, error }, operator?.id);
+    } else {
+      await failSmartScmTransferExecution(prepared.id, error, operator?.id);
+    }
+    throw error;
+  }
+}
+
+async function retrySmartScmTransferPrint(proposalId, operator) {
+  const proposal = await getSmartScmProposal(proposalId);
+  if (!proposal) throw Object.assign(new Error("Smart SCM proposal was not found."), { status: 404 });
+  if (proposal.proposalType !== "TO") throw Object.assign(new Error("Only a TO proposal has a picking ticket."), { status: 400 });
+  if (!proposal.netsuiteTransferOrderId && !String(proposal.netsuiteTransferOrderRef || "").startsWith("MOCK-TO-")) {
+    throw Object.assign(new Error("This proposal has no created TO reference to recover."), { status: 409 });
+  }
+  const printers = await listYardPrinters();
+  const printer = printers.find((row) => Number(row.locationId) === Number(proposal.sourceLocationId));
+  if (!printer?.enabled || !printer?.hasToken || !printer?.printerName) {
+    throw Object.assign(new Error(`${proposal.sourceName} printer must be enabled with a printer name and agent token.`), { status: 409 });
+  }
+  const transferOrderRef = proposal.netsuiteTransferOrderRef || `TO-${proposal.netsuiteTransferOrderId}`;
+  const document = proposal.netsuiteTransferOrderId
+    ? await fetchPickingTicketFromNetSuite(proposal.netsuiteTransferOrderId)
+    : {
+        filename: `${transferOrderRef}-picking-ticket.pdf`,
+        buffer: createSimplePdf([
+          "MBBS Smart SCM — MOCK Picking Ticket",
+          `Reference: ${transferOrderRef}`,
+          `From: ${proposal.sourceName}`,
+          `To: ${proposal.destinationName}`,
+          `Pallets: ${proposal.totalPallets}`,
+          ...proposal.lines.map((line) => `${line.itemName}: ${line.proposedPallets} PLT`),
+          "No NetSuite record was created."
+        ])
+      };
+  let printJob = await queueSmartScmPrintJob({
+    proposalId: proposal.id,
+    locationId: proposal.sourceLocationId,
+    documentType: "picking_ticket",
+    documentName: document.filename,
+    documentBuffer: document.buffer,
+    jobKey: `smart-scm:${proposal.id}:picking-ticket:${transferOrderRef}`
+  }, operator?.id);
+  if (["failed", "uncertain"].includes(printJob.status)) {
+    printJob = await retrySmartScmPrintJob(printJob.id, operator?.id);
+  }
+  await completeSmartScmTransferExecution(proposal.id, {
+    transferOrderId: proposal.netsuiteTransferOrderId,
+    transferOrderRef,
+    mock: !proposal.netsuiteTransferOrderId
+  }, operator?.id);
+  emitAppEvent("scm.smart.updated", { source: "smart-scm-print-retry", proposalId: proposal.id, printJobId: printJob.id });
+  return { proposalId: proposal.id, transferOrderId: proposal.netsuiteTransferOrderId, transferOrderRef, printJob };
 }
 
 async function findDispatchPlanDateConflicts({ planId, planDate, orders = [], trucks = [] } = {}) {
@@ -951,6 +1436,119 @@ function monitorOrderSummary(order) {
     windowStart: order.windowStart || "",
     windowEnd: order.windowEnd || ""
   };
+}
+
+function monitorPlanOrder(plan = {}, orderRef = "") {
+  const ref = String(orderRef || "");
+  const direct = (plan.orders || []).find((order) => String(order?.id || "") === ref);
+  if (direct) return direct;
+  for (const order of plan.orders || []) {
+    const child = (order?.childOrderDetails || []).find((item) => String(item?.id || "") === ref);
+    if (child) return child;
+  }
+  return null;
+}
+
+function monitorPlannedItemLines(order = {}, stop = {}) {
+  const source = Array.isArray(order.items) && order.items.length
+    ? order.items
+    : Array.isArray(order.raw?.items) ? order.raw.items : [];
+  const lineRowIds = new Set((stop.lineRowIds || []).map(String));
+  const scoped = lineRowIds.size
+    ? source.filter((item) => lineRowIds.has(String(item.lineRowId ?? item.line_row_id ?? item.id ?? "")))
+    : source;
+  const selected = scoped.length ? scoped : source;
+  return selected.map((item) => ({
+    itemName: item.itemName || item.name || item.sku || "Item",
+    quantity: Number(item.quantity ?? item.salesQty ?? 0),
+    unit: item.unit || item.uom || "",
+    pallets: Number(item.pallets ?? item.pallet_qty ?? 0),
+    layers: Number(item.layers ?? item.layer_qty ?? 0),
+    sections: Number(item.sections ?? item.section_qty ?? 0),
+    pieces: Number(item.pieces ?? item.piece_qty ?? 0)
+  }));
+}
+
+function monitorStopRecord(driverJobStatuses = [], truck = {}, load = {}, stop = {}) {
+  return driverJobStatuses.find((record) =>
+    normalizedPlate(record.truck_plate || record.truckPlate) === normalizedPlate(truck.plate)
+    && String(record.load_id || record.loadId || "") === String(load.id || "")
+    && String(record.stop_id || record.stopId || "") === String(stop.id || "")
+  ) || null;
+}
+
+function monitorOrderExecutionStatus(plan = {}, orderRef = "", driverJobStatuses = []) {
+  const ref = String(orderRef || "");
+  const currentStopIds = new Set();
+  const statuses = [];
+  for (const truck of plan.trucks || []) {
+    for (const load of truck.loads || []) {
+      for (const stop of load.stops || []) {
+        currentStopIds.add(String(stop.id || ""));
+        if (String(stop.orderId || "") !== ref) continue;
+        statuses.push(monitorStopRecord(driverJobStatuses, truck, load, stop)?.status || "pending");
+      }
+    }
+  }
+  for (const record of driverJobStatuses) {
+    if (!currentStopIds.has(String(record.stop_id || record.stopId || ""))) continue;
+    const refs = record.order_refs || record.orderRefs || [];
+    if (refs.map(String).includes(ref)) statuses.push(record.status || "pending");
+  }
+  if (!statuses.length) return "pending";
+  if (statuses.every((status) => status === "complete")) return "complete";
+  if (statuses.some((status) => status === "complete" || status === "in_progress")) return "in_progress";
+  return "pending";
+}
+
+export function monitorPlannedOrders(plan, driverJobStatuses = []) {
+  if (!plan) return [];
+  const rows = [];
+  for (const truck of plan.trucks || []) {
+    for (const load of truck.loads || []) {
+      const stops = Array.isArray(load.stops) ? load.stops : [];
+      for (let stopIndex = 0; stopIndex < stops.length; stopIndex += 1) {
+        const stop = stops[stopIndex];
+        if (stop?.type !== "drop" || !stop.orderId) continue;
+        const order = monitorPlanOrder(plan, stop.orderId) || {};
+        const pickupStops = stops.filter((candidate) =>
+          candidate?.type === "pick" && String(candidate.orderId || "") === String(stop.orderId || "")
+        );
+        const fallbackPickups = Array.isArray(order.pickupLocations) ? order.pickupLocations : [];
+        const fromLocations = [...new Set([
+          ...pickupStops.map((candidate) => candidate.location),
+          order.sourceYard,
+          ...fallbackPickups
+        ].map((value) => String(value || "").trim()).filter(Boolean))];
+        const record = monitorStopRecord(driverJobStatuses, truck, load, stop);
+        rows.push({
+          key: `${truck.id || truck.plate || "truck"}:${load.id || "load"}:${stop.id || stopIndex}`,
+          orderRef: String(stop.orderId || ""),
+          orderType: order.type || "",
+          fromLocation: fromLocations.join(" + ") || truck.base || "—",
+          destination: order.destinationYard
+            || order.destinationAddress
+            || order.address
+            || stop.location
+            || "—",
+          driver: truck.driver || truck.driverLogin || "—",
+          vehiclePlate: truck.plate || "—",
+          truckPlate: truck.plate || "",
+          loadId: load.id || "",
+          loadName: load.name || "Load",
+          plannedStart: dispatchTimingNumber(stop.timing?.arrival) ?? dispatchTimingNumber(load.timing?.finish),
+          plannedEnd: dispatchTimingNumber(stop.timing?.depart)
+            ?? dispatchTimingNumber(stop.timing?.arrival)
+            ?? dispatchTimingNumber(load.timing?.finish),
+          actualStart: record?.started_at || record?.startedAt || "",
+          actualEnd: record?.completed_at || record?.completedAt || "",
+          status: monitorOrderExecutionStatus(plan, stop.orderId, driverJobStatuses),
+          items: monitorPlannedItemLines(order, stop)
+        });
+      }
+    }
+  }
+  return rows;
 }
 
 function monitorLoadForTruck(plan, truck, driverJobStatuses = []) {
@@ -1593,6 +2191,7 @@ function roleHomeRoute(operator) {
   if (role === "dispatcher") return "/dispatch";
   if (["scm", "scm_staff"].includes(role)) return "/scm";
   if (role === "yard_manager") return "/control";
+  if (role === "sales") return "/sales";
   if (role === "operator") return "/operator";
   return "/";
 }
@@ -1664,6 +2263,7 @@ function requireDispatchAccess(req, res, next) {
     if (operatorHasAnyRole(req.operator, ["admin", "dispatcher", "scm", "scm_staff"])) return next();
     return sendRoleForbidden(res, req.operator, "SCM account required");
   }
+  if (req.method === "GET" && operatorHasAnyRole(req.operator, ["sales"])) return next();
   if (!operatorHasAnyRole(req.operator, ["dispatcher", "admin"])) {
     return sendRoleForbidden(res, req.operator, "Dispatcher account required");
   }
@@ -1673,6 +2273,75 @@ function requireDispatchAccess(req, res, next) {
 function requireScmAccess(req, res, next) {
   if (operatorHasAnyRole(req.operator, ["admin", "dispatcher", "scm", "scm_staff"])) return next();
   return sendRoleForbidden(res, req.operator, "SCM account required");
+}
+
+function requireSalesAccess(req, res, next) {
+  if (operatorHasAnyRole(req.operator, ["admin", "sales"])) return next();
+  return sendRoleForbidden(res, req.operator, "Sales account required");
+}
+
+function operatorSalesYardLocationIds(operator) {
+  if (operatorHasAnyRole(operator, ["admin"])) return SALES_YARDS.map((yard) => yard.locationId);
+  return normalizeSalesYardLocationIds(operator?.yardLocationIds || []);
+}
+
+function operatorSalesYardCodes(operator) {
+  const allowed = new Set(operatorSalesYardLocationIds(operator));
+  return SALES_YARDS.filter((yard) => allowed.has(yard.locationId)).map((yard) => yard.yardCode);
+}
+
+function salesPrintDestinationLocationIds() {
+  return SALES_YARDS.map((yard) => yard.locationId);
+}
+
+function requireSalesPrintDestination(value) {
+  const locationId = Number(value);
+  if (!salesPrintDestinationLocationIds().includes(locationId)) {
+    throw Object.assign(new Error("Select a valid Sales printer destination."), { status: 400 });
+  }
+  return locationId;
+}
+
+async function salesOrderPrintContext(req, lineLocationValue) {
+  const hasRequestedLocation = lineLocationValue !== undefined
+    && lineLocationValue !== null
+    && String(lineLocationValue).trim() !== "";
+  const requestedLocationId = Number(lineLocationValue);
+  if (hasRequestedLocation && (!Number.isInteger(requestedLocationId) || requestedLocationId <= 0)) {
+    throw Object.assign(new Error("This Sales Order does not have a valid inventory line yard."), { status: 400 });
+  }
+  const candidate = await getSalesOrderPrintCandidate({
+    orderId: req.params.id,
+    allowedOrderingLocationIds: operatorSalesYardLocationIds(req.operator)
+  });
+  if (candidate.lineYards.length !== 1) {
+    const message = candidate.lineYards.length
+      ? "This Sales Order has multiple inventory line yards. Printing is blocked until its outbound inventory yard is corrected."
+      : "This Sales Order does not have an inventory line yard for printing.";
+    throw Object.assign(new Error(message), { status: 409 });
+  }
+  const lineYard = candidate.lineYards[0];
+  const lineLocationId = Number(lineYard.locationId);
+  if (hasRequestedLocation && requestedLocationId !== lineLocationId) {
+    throw Object.assign(new Error("The print destination is fixed to this Sales Order's inventory line yard."), { status: 400 });
+  }
+  const printerLocationId = requireSalesPrintDestination(lineYard.printerLocationId);
+  const printer = (await listYardPrinters())
+    .find((item) => Number(item.locationId) === printerLocationId);
+  if (!printer) {
+    throw Object.assign(new Error("The selected Sales printer destination was not found."), { status: 404 });
+  }
+  return { candidate, lineYard, lineLocationId, printer, printerLocationId };
+}
+
+function requireSmartScmAccess(req, res, next) {
+  if (operatorHasAnyRole(req.operator, ["admin", "dispatcher", "scm", "scm_staff", "yard_manager"])) return next();
+  return sendRoleForbidden(res, req.operator, "Smart SCM access required");
+}
+
+function requireSmartScmWriteAccess(req, res, next) {
+  if (operatorHasAnyRole(req.operator, ["admin", "scm", "scm_staff"])) return next();
+  return sendRoleForbidden(res, req.operator, "SCM edit access required");
 }
 
 async function withTimeout(promise, ms) {
@@ -3502,17 +4171,612 @@ app.use((req, res, next) => {
   if (req.path === "/service-worker.js") {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
     res.setHeader("Service-Worker-Allowed", "/");
-  } else if (req.path.endsWith(".webmanifest") || ["/", "/operator", "/driver", "/control", "/admin", "/dispatch", "/dispatch/loaded-export", "/dispatch/po-to-schedule", "/operator.html", "/driver.html", "/control.html", "/admin.html", "/dispatch-menu.html", "/dispatch-loaded-export.html"].includes(req.path)) {
+  } else if (req.path.endsWith(".webmanifest") || ["/", "/operator", "/driver", "/control", "/admin", "/admin/printers", "/dispatch", "/sales", "/sales/planning", "/sales/schedule", "/sales/monitor", "/sales/printing", "/dispatch/loaded-export", "/dispatch/po-to-schedule", "/scm/smart", "/scm/printers", "/scm/route-rules", "/operator.html", "/driver.html", "/control.html", "/admin.html", "/dispatch-menu.html", "/sales.html", "/sales-printing.html", "/dispatch-loaded-export.html", "/scm-smart.html", "/scm-printers.html", "/scm-route-rules.html"].includes(req.path)) {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   }
   next();
 });
 
 app.use("/vendor/qr-scanner", express.static(qrScannerDir));
+app.use("/vendor/quagga2", express.static(quaggaScannerDir));
 app.use(express.static(publicDir));
+
+const smartScmRawUpload = express.raw({
+  type: () => true,
+  limit: `${config.smartScm.maxInputMb}mb`
+});
+
+function printerAgentId(req) {
+  return String(req.get("x-printer-agent-id") || req.body?.agentId || "").trim();
+}
+
+function printerLeaseToken(req) {
+  return String(req.get("x-print-lease-token") || req.body?.leaseToken || req.query?.leaseToken || "").trim();
+}
+
+function requiredRawUpload(req) {
+  if (!Buffer.isBuffer(req.body) || !req.body.length) {
+    throw Object.assign(new Error("Select a non-empty file."), { status: 400 });
+  }
+  return req.body;
+}
+
+// Printer agents intentionally authenticate only against a single yard queue. These
+// routes are registered before the staff SCM middleware so agent tokens cannot be
+// confused with operator sessions and cannot reach any other application endpoint.
+app.post("/api/scm/print-agent/lease", async (req, res, next) => {
+  try {
+    res.json(await leaseYardPrintJob(bearerToken(req), printerAgentId(req)));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/print-agent/jobs/:id/document", async (req, res, next) => {
+  try {
+    const document = await yardPrintJobDocument(
+      req.params.id,
+      bearerToken(req),
+      printerAgentId(req),
+      printerLeaseToken(req)
+    );
+    res.download(document.path, document.filename, (error) => {
+      if (error && !res.headersSent) next(error);
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/print-agent/jobs/:id/:action", async (req, res, next) => {
+  try {
+    const job = await updateLeasedPrintJob(
+      req.params.id,
+      bearerToken(req),
+      printerAgentId(req),
+      printerLeaseToken(req),
+      req.params.action,
+      req.body || {}
+    );
+    if (job.documentType === "transfer_dependency_picking_ticket") {
+      emitAppEvent("scm.transfer_dependency.updated", {
+        source: "transfer-dependency-print-agent",
+        printJobId: job.id,
+        printStatus: job.status
+      });
+    }
+    if (job.documentType === "sales_order_picking_ticket") {
+      emitAppEvent("sales.printing.updated", {
+        source: "sales-print-agent",
+        printJobId: job.id,
+        printStatus: job.status,
+        sourceOrderId: job.sourceOrderId
+      });
+    }
+    res.json(job);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.use("/api/scm/smart", requireOperator, requireSmartScmAccess);
+
+app.get("/api/scm/smart/bootstrap", async (req, res, next) => {
+  try {
+    res.json(await getSmartScmBootstrap({ proposalLimit: req.query.proposalLimit }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/smart/settings", async (_req, res, next) => {
+  try {
+    res.json(await getSmartScmSettings());
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/scm/smart/settings", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const settings = await updateSmartScmSettings(req.body || {}, operatorId(req));
+    emitAppEvent("scm.smart.updated", { source: "settings" });
+    res.json(settings);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/smart/route-rules", async (_req, res, next) => {
+  try {
+    res.json(await listSmartScmRouteRules());
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/scm/smart/route-rules", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const rule = await upsertSmartScmRouteRule(req.body || {}, operatorId(req));
+    emitAppEvent("scm.smart.updated", { source: "route-rule", sourceKey: rule.sourceKey });
+    res.json(rule);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/smart/model-segments", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const settings = await promoteSmartScmForecastSegment(req.body || {}, operatorId(req));
+    emitAppEvent("scm.smart.updated", { source: "model-segment" });
+    res.json(settings);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/smart/items", async (req, res, next) => {
+  try {
+    res.json(await listSmartScmItems({
+      search: req.query.search,
+      enabled: req.query.enabled,
+      vendorYard: req.query.vendorYard,
+      limit: req.query.limit,
+      offset: req.query.offset
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.patch("/api/scm/smart/items/:itemId", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    await updateSmartScmItem(req.params.itemId, req.body || {}, operatorId(req));
+    const result = await listSmartScmItems({ search: String(req.params.itemId), limit: 10 });
+    emitAppEvent("scm.smart.updated", { source: "item-master", itemId: Number(req.params.itemId) });
+    res.json(result.items.find((item) => Number(item.itemId) === Number(req.params.itemId)) || null);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/smart/sync-status", async (_req, res, next) => {
+  try {
+    res.json(await getSmartScmSyncStatus());
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/smart/sync", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const result = await refreshSmartScmLiveData({
+      fullCatalog: req.body?.fullCatalog !== false,
+      includeSales: false,
+      operatorId: operatorId(req),
+      triggerSource: "manual"
+    });
+    emitAppEvent("scm.smart.updated", { source: "netsuite-sync" });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/smart/sales-csv", requireSmartScmWriteAccess, smartScmRawUpload, async (req, res, next) => {
+  try {
+    const summary = await importSmartScmSalesCsv({
+      buffer: requiredRawUpload(req),
+      filename: req.get("x-file-name") || "sales.csv",
+      operatorId: operatorId(req)
+    });
+    emitAppEvent("scm.smart.updated", { source: "sales-csv", facts: summary.facts });
+    res.status(201).json(summary);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/smart/sales-csv/template", (_req, res) => {
+  res.type("text/csv");
+  res.setHeader("Content-Disposition", "attachment; filename=smart-scm-raw-sales-template.csv");
+  res.send("Internal ID,Date,Document Number,Item,Quantity,Delivery Method,Location,Sales Amount,Status\n");
+});
+
+app.get("/api/scm/smart/inputs", async (_req, res, next) => {
+  try {
+    res.json(await listSmartScmInputFiles());
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/smart/inputs/:slot", requireSmartScmWriteAccess, smartScmRawUpload, async (req, res, next) => {
+  try {
+    const file = await storeSmartScmInputFile({
+      slot: req.params.slot,
+      filename: req.get("x-file-name") || "upload.bin",
+      contentType: req.get("content-type") || "application/octet-stream",
+      buffer: requiredRawUpload(req),
+      operatorId: operatorId(req)
+    });
+    emitAppEvent("scm.smart.updated", { source: "input-upload", fileId: file.id, slot: file.slot });
+    res.status(201).json(file);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/smart/inputs/:id/activate", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const file = await activateSmartScmInputFile(req.params.id, operatorId(req));
+    emitAppEvent("scm.smart.updated", { source: "input-activate", fileId: file.id, slot: file.slot });
+    res.json(file);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/smart/inputs/:id/download", async (req, res, next) => {
+  try {
+    const file = await smartScmInputDownload(req.params.id);
+    res.type(file.contentType);
+    res.download(file.path, file.filename, (error) => {
+      if (error && !res.headersSent) next(error);
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/smart/forecasts", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    await refreshSmartScmLiveData({
+      fullCatalog: false,
+      includeSales: false,
+      operatorId: operatorId(req),
+      triggerSource: "forecast"
+    });
+    const run = await runSmartScmForecast({ triggerSource: "manual", operatorId: operatorId(req) });
+    emitAppEvent("scm.smart.updated", { source: "forecast", forecastRunId: Number(run.id) });
+    res.status(201).json(run);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/smart/forecast-runs", async (req, res, next) => {
+  try {
+    res.json(await listSmartScmForecastRuns({ limit: req.query.limit }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/smart/forecasts", async (req, res, next) => {
+  try {
+    res.json(await listSmartScmForecasts({
+      runId: req.query.runId,
+      search: req.query.search,
+      yard: req.query.yard,
+      limit: req.query.limit
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/smart/plans", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    await refreshSmartScmLiveData({
+      fullCatalog: false,
+      includeSales: false,
+      operatorId: operatorId(req),
+      triggerSource: "planning"
+    });
+    const forecast = await runSmartScmForecast({ triggerSource: "planning", operatorId: operatorId(req) });
+    const run = await runSmartScmPlan({
+      triggerSource: "manual",
+      operatorId: operatorId(req),
+      forecastRunId: Number(forecast.id)
+    });
+    emitAppEvent("scm.smart.updated", { source: "planning", planningRunId: run.id });
+    res.status(201).json(run);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/smart/planning-runs", async (req, res, next) => {
+  try {
+    res.json(await listSmartScmPlanningRuns({ limit: req.query.limit }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/smart/planning-runs/:id", async (req, res, next) => {
+  try {
+    const run = await getSmartScmPlanningRun(req.params.id);
+    if (!run) return res.status(404).json({ error: "Smart SCM planning run was not found." });
+    res.json(run);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/smart/proposals", async (req, res, next) => {
+  try {
+    res.json(await listSmartScmProposals({
+      runId: req.query.runId,
+      status: req.query.status,
+      type: req.query.type,
+      search: req.query.search,
+      limit: req.query.limit
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/smart/proposals/group", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const run = await groupSmartScmProposals(req.body?.proposalIds || [], operatorId(req));
+    emitAppEvent("scm.smart.updated", { source: "proposal-group", planningRunId: run.id });
+    res.json(run);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/smart/proposals/:id/recalculate-po", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const run = await recalculateSmartScmPoProposal(req.params.id, operatorId(req));
+    emitAppEvent("scm.smart.updated", { source: "po-proposal-recalculate", planningRunId: run.id });
+    res.json(run);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.patch("/api/scm/smart/proposals/:id", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const proposal = await updateSmartScmProposal(req.params.id, req.body || {}, operatorId(req));
+    emitAppEvent("scm.smart.updated", { source: "proposal", proposalId: proposal.id });
+    res.json(proposal);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/smart/proposals/:id/items", async (req, res, next) => {
+  try {
+    res.json(await searchSmartScmProposalItems(req.params.id, {
+      search: req.query.search,
+      destinationLocationId: req.query.destinationLocationId,
+      limit: req.query.limit
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/smart/proposals/:id/lines", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const proposal = await addSmartScmProposalLine(req.params.id, req.body || {}, operatorId(req));
+    emitAppEvent("scm.smart.updated", { source: "proposal-line", proposalId: proposal.id });
+    res.status(201).json(proposal);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.patch("/api/scm/smart/proposals/:id/lines/:lineId", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const proposal = await updateSmartScmProposalLine(req.params.id, req.params.lineId, req.body || {}, operatorId(req));
+    emitAppEvent("scm.smart.updated", { source: "proposal-line", proposalId: proposal.id });
+    res.json(proposal);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete("/api/scm/smart/proposals/:id/lines/:lineId", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const result = await removeSmartScmProposalLine(req.params.id, req.params.lineId, operatorId(req));
+    emitAppEvent("scm.smart.updated", { source: "proposal-line", proposalId: Number(req.params.id), planningRunId: result.runId });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/smart/proposals/:id/confirm-transfer", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    res.status(201).json(await executeSmartScmTransferProposal(req.params.id, req.operator));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/smart/proposals/:id/retry-picking-ticket", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    res.json(await retrySmartScmTransferPrint(req.params.id, req.operator));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/smart/vendor-reply-loads", async (req, res, next) => {
+  try {
+    res.json(await listSmartScmVendorReplyLoads({ search: req.query.search, limit: req.query.limit }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/scm/smart/vendor-reply-loads/:id", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const proposal = await saveSmartScmVendorReplyLoad(req.params.id, req.body || {}, operatorId(req));
+    emitAppEvent("scm.smart.updated", { source: "vendor-reply-load", proposalId: proposal.id, planningRunId: proposal.runId });
+    res.json(proposal);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/smart/vendor-reply-loads/:id/alternatives", async (req, res, next) => {
+  try {
+    res.json(await searchSmartScmVendorAlternatives(req.params.id, {
+      search: req.query.search,
+      lineId: req.query.lineId,
+      limit: req.query.limit
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/smart/vendor-reply-loads/:id/lines", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const proposal = await addSmartScmVendorAlternativeLine(req.params.id, req.body || {}, operatorId(req));
+    emitAppEvent("scm.smart.updated", { source: "vendor-alternative-add", proposalId: proposal.id, planningRunId: proposal.runId });
+    res.status(201).json(proposal);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete("/api/scm/smart/vendor-reply-loads/:id/lines/:lineId", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const proposal = await removeSmartScmVendorAlternativeLine(req.params.id, req.params.lineId, operatorId(req));
+    emitAppEvent("scm.smart.updated", { source: "vendor-alternative-remove", proposalId: proposal.id, planningRunId: proposal.runId });
+    res.json(proposal);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/smart/vendor-reply-loads/:id/confirm", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const result = await executeSmartScmPurchaseProposal(req.params.id, operatorId(req));
+    emitAppEvent("scm.smart.updated", { source: "smart-scm-purchase", proposalId: result.proposalId, purchaseOrderId: result.purchaseOrderId, purchaseOrderRef: result.purchaseOrderRef });
+    if (result.purchaseOrderId) emitAppEvent("dispatch.orders.updated", { source: "smart-scm-purchase", refreshOrderPool: true });
+    res.status(201).json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/smart/vendor-responses", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const run = await recordSmartScmVendorResponses(req.body?.responses || req.body || [], operatorId(req));
+    emitAppEvent("scm.smart.updated", { source: "vendor-response", planningRunId: run.id });
+    res.json(run);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/smart/vendor-responses/import", requireSmartScmWriteAccess, smartScmRawUpload, async (req, res, next) => {
+  try {
+    const responses = await parseSmartScmVendorResponseFile(
+      requiredRawUpload(req),
+      req.get("x-file-name") || "vendor-responses.csv"
+    );
+    const run = await recordSmartScmVendorResponses(responses, operatorId(req));
+    emitAppEvent("scm.smart.updated", { source: "vendor-response-import", planningRunId: run.id });
+    res.json({ imported: responses.length, run });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/smart/vendor-responses/template", async (req, res, next) => {
+  try {
+    const proposals = await listSmartScmProposals({
+      runId: req.query.runId,
+      type: "PO",
+      statuses: ["order_requested", "vendor_replied", "executing", "attention", "failed", "completed"],
+      requestedOnly: true,
+      limit: 2000
+    });
+    const header = ["Proposal Line ID", "Response Status", "Confirmed Pallets", "Unavailable Pallets", "Ready Date", "Vendor Reference", "Packing Number", "Credit Status", "Remarks"];
+    const rows = proposals.flatMap((proposal) => proposal.lines.map((line) => [
+      line.id, "awaiting", "", "", "", "", "", "", `${proposal.vendor || proposal.sourceName || ""} | ${line.itemName}`
+    ]));
+    const csv = [header, ...rows].map((row) => row.map(csvCell).join(",")).join("\r\n");
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", "attachment; filename=smart-scm-vendor-responses.csv");
+    res.send(csv);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/smart/printers", async (_req, res, next) => {
+  try {
+    res.json(await listYardPrinters());
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/scm/smart/printers/:locationId", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const printer = await updateYardPrinter(req.params.locationId, req.body || {}, operatorId(req));
+    emitAppEvent("scm.smart.updated", { source: "printer", locationId: printer.locationId });
+    res.json(printer);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/smart/printers/:locationId/token", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const result = await rotateYardPrinterToken(req.params.locationId, operatorId(req));
+    emitAppEvent("scm.smart.updated", { source: "printer-token", locationId: result.printer.locationId });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/smart/printers/:locationId/test", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const job = await queueYardPrinterTest(req.params.locationId, operatorId(req));
+    emitAppEvent("scm.smart.updated", { source: "printer-test", printJobId: job.id });
+    res.status(201).json(job);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/smart/print-jobs", async (req, res, next) => {
+  try {
+    res.json(await listSmartScmPrintJobs({
+      locationId: req.query.locationId,
+      status: req.query.status,
+      limit: req.query.limit
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/smart/print-jobs/:id/retry", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const job = await retrySmartScmPrintJob(req.params.id, operatorId(req));
+    emitAppEvent("scm.smart.updated", { source: "print-retry", printJobId: job.id });
+    res.json(job);
+  } catch (error) {
+    next(error);
+  }
+});
 
 app.use("/api/scm", requireOperator, requireScmAccess);
 app.use("/api/dispatch", requireOperator, requireDispatchAccess);
+app.use("/api/sales", requireOperator, requireSalesAccess);
 
 app.get("/api/dispatch/config", (req, res) => {
   res.json({
@@ -3575,6 +4839,7 @@ app.get("/api/dispatch/monitor", async (req, res, next) => {
       planDate,
       refreshSeconds: 10,
       plan: plan ? { id: plan.id, status: plan.status, planDate: plan.planDate } : null,
+      plannedOrders: monitorPlannedOrders(plan, driverJobStatuses),
       trucks,
       trails,
       yards: [...ownYards, ...vendorYards],
@@ -3584,6 +4849,200 @@ app.get("/api/dispatch/monitor", async (req, res, next) => {
         refreshRecommendation: "10 seconds"
       }
     });
+  } catch (error) {
+    next(error);
+  }
+});
+
+function salesScheduleRowMatchesYards(row, yardCodes = []) {
+  const route = `${row?.pickupPoint || ""} ${row?.dropoffPoint || ""}`;
+  return yardCodes.some((yardCode) => new RegExp(`(^|[^0-9])${yardCode}([^0-9]|$)`).test(route));
+}
+
+app.get("/api/sales/schedule-presets", async (req, res, next) => {
+  try {
+    const presets = await listScmViewPresets();
+    const allowed = new Set(["yard manager", "completed"]);
+    res.json(presets.filter((preset) => allowed.has(String(preset.name || "").trim().toLowerCase())));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/sales/schedule", async (req, res, next) => {
+  try {
+    const requestedView = String(req.query.view || "yard manager").trim().toLowerCase();
+    const view = requestedView === "completed" ? "completed" : "yard manager";
+    const rows = await listScmSchedule({
+      search: req.query.search || "",
+      status: req.query.status || "",
+      method: req.query.method || "",
+      kind: req.query.kind || "",
+      yard: req.query.dropoffPoint || req.query.yard || "",
+      brand: req.query.brand || "",
+      from: req.query.from || "",
+      to: req.query.to || "",
+      view
+    });
+    const yardCodes = operatorSalesYardCodes(req.operator);
+    const scoped = rows.filter((row) => salesScheduleRowMatchesYards(row, yardCodes));
+    res.json(view === "completed"
+      ? scoped.filter((row) => String(row.status || "").toLowerCase() === "completed")
+      : scoped.filter((row) => !["cancelled", "hold"].includes(String(row.status || "").toLowerCase())));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/sales/printers", async (req, res, next) => {
+  try {
+    const allowed = new Set(salesPrintDestinationLocationIds());
+    res.json((await listYardPrinters()).filter((printer) => allowed.has(Number(printer.locationId))));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/sales/print-jobs", async (req, res, next) => {
+  try {
+    const allowed = salesPrintDestinationLocationIds();
+    const requestedLocation = Number(req.query.locationId || 0);
+    const locations = requestedLocation
+      ? (allowed.includes(requestedLocation) ? [requestedLocation] : [])
+      : allowed;
+    const pages = await Promise.all(locations.map((locationId) => listSmartScmPrintJobs({
+      locationId,
+      status: req.query.status || "",
+      limit: Math.min(200, Math.max(1, Number(req.query.limit) || 100))
+    })));
+    res.json(pages.flat()
+      .filter((job) => job.documentType === "sales_order_picking_ticket")
+      .sort((left, right) => Number(right.id) - Number(left.id))
+      .slice(0, Math.min(200, Math.max(1, Number(req.query.limit) || 100))));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/sales/sales-orders", async (req, res, next) => {
+  try {
+    res.json(await listSalesOrderPrintCandidates({
+      search: req.query.search || "",
+      orderingLocationIds: operatorSalesYardLocationIds(req.operator),
+      limit: req.query.limit || 100
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/sales/sales-orders/:id/print-history", async (req, res, next) => {
+  try {
+    const candidate = await getSalesOrderPrintCandidate({
+      orderId: req.params.id,
+      allowedOrderingLocationIds: operatorSalesYardLocationIds(req.operator)
+    });
+    res.json({
+      order: candidate,
+      history: await listSalesOrderPrintHistory(candidate.orderId)
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/sales/sales-orders/:id/print-history/:jobId/snapshot", async (req, res, next) => {
+  try {
+    const candidate = await getSalesOrderPrintCandidate({
+      orderId: req.params.id,
+      allowedOrderingLocationIds: operatorSalesYardLocationIds(req.operator)
+    });
+    const snapshot = await getSalesOrderPrintSnapshot({
+      orderId: candidate.orderId,
+      jobId: req.params.jobId
+    });
+    const filename = String(snapshot.documentName || `${candidate.orderRef}-picking-ticket.pdf`)
+      .replace(/[^a-zA-Z0-9_.-]+/g, "-");
+    res.type("application/pdf");
+    res.setHeader("Cache-Control", "private, no-store");
+    res.setHeader("Content-Disposition", `inline; filename="${filename}"`);
+    res.sendFile(snapshot.documentPath, (error) => {
+      if (error && !res.headersSent) next(error);
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/sales/sales-orders/:id/picking-ticket-preview", async (req, res, next) => {
+  try {
+    const { candidate, lineYard, lineLocationId, printer } = await salesOrderPrintContext(
+      req,
+      req.query.lineLocationId ?? req.query.printerLocationId
+    );
+    const document = await fetchPickingTicketFromNetSuite(candidate.orderId, {
+      locationId: lineLocationId,
+      filenamePrefix: candidate.orderRef || "SO"
+    });
+    if (candidate.lineYards.length > 1 && !document.locationApplied) {
+      throw Object.assign(new Error("NetSuite did not confirm the selected line-yard filter. Deploy the updated picking-ticket RESTlet before previewing this multi-yard order."), { status: 409 });
+    }
+    const filename = String(document.filename || `${candidate.orderRef || "SO"}-picking-ticket.pdf`)
+      .replace(/[^a-zA-Z0-9_.-]+/g, "-");
+    res.type(document.contentType || "application/pdf");
+    res.setHeader("Cache-Control", "private, no-store");
+    res.setHeader("Content-Disposition", `inline; filename="${filename}"`);
+    res.setHeader("X-MBBS-Print-Yard", printer.yardCode || "");
+    res.setHeader("X-MBBS-Line-Yard", lineYard.yardCode || "");
+    res.send(document.buffer);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/sales/sales-orders/:id/print", async (req, res, next) => {
+  try {
+    const { candidate, lineYard, lineLocationId, printer, printerLocationId } = await salesOrderPrintContext(
+      req,
+      req.body?.lineLocationId ?? req.body?.printerLocationId ?? req.body?.locationId
+    );
+    if (!(printer.enabled && printer.hasToken && printer.printerName)) {
+      throw Object.assign(new Error(`${printer.yardCode} printer must be enabled with a printer name and agent token.`), { status: 409 });
+    }
+    const document = await fetchPickingTicketFromNetSuite(candidate.orderId, {
+      locationId: lineLocationId,
+      filenamePrefix: candidate.orderRef || "SO"
+    });
+    if (candidate.lineYards.length > 1 && !document.locationApplied) {
+      throw Object.assign(new Error("NetSuite did not confirm the selected line-yard filter. Printing was blocked to prevent the wrong yard ticket."), { status: 409 });
+    }
+    const printJob = await queueSmartScmPrintJob({
+      locationId: printerLocationId,
+      documentType: "sales_order_picking_ticket",
+      documentName: document.filename,
+      documentBuffer: document.buffer,
+      jobKey: `sales:${candidate.orderId}:${lineLocationId}:${Date.now()}:${crypto.randomUUID()}`,
+      sourceOrderId: candidate.orderId,
+      sourceOrderRef: candidate.orderRef,
+      lineLocationId
+    }, req.operator.id);
+    await writeAudit({
+      actorOperatorId: req.operator.id,
+      source: "sales",
+      action: "sales.sales_order_picking_ticket.queued",
+      orderId: candidate.orderId,
+      details: {
+        orderRef: candidate.orderRef,
+        orderingLocationId: candidate.orderingLocationId,
+        orderingYardCode: candidate.orderingYardCode,
+        lineLocationId,
+        lineYardCode: lineYard.yardCode,
+        printerLocationId,
+        printerYardCode: printer.yardCode,
+        printJobId: printJob.id
+      }
+    });
+    res.json({ order: candidate, lineYard, printer, printJob });
   } catch (error) {
     next(error);
   }
@@ -4588,7 +6047,8 @@ app.post("/api/scm/transfer-dependencies/batches/:id/confirm", async (req, res, 
         const request = await transferDependencyRestPayload({ proposal, batch });
         return createTransferOrderInNetSuite(request.payload, { intercompany: request.intercompany });
       },
-      hydrateTransferOrder: hydrateCreatedDependencyTransferOrder
+      hydrateTransferOrder: hydrateCreatedDependencyTransferOrder,
+      findTransferOrder: findCreatedDependencyTransferOrder
     });
     emitAppEvent("dispatch.orders.updated", { source: "scm-transfer-dependency", refreshOrderPool: true });
     res.json(result);
@@ -4610,11 +6070,37 @@ app.post("/api/scm/transfer-dependencies/batches/:id/proposals/:proposalId/confi
         const request = await transferDependencyRestPayload({ proposal, batch });
         return createTransferOrderInNetSuite(request.payload, { intercompany: request.intercompany });
       },
-      hydrateTransferOrder: hydrateCreatedDependencyTransferOrder
+      hydrateTransferOrder: hydrateCreatedDependencyTransferOrder,
+      findTransferOrder: findCreatedDependencyTransferOrder
     });
     emitAppEvent("dispatch.orders.updated", { source: "scm-transfer-dependency-proposal", refreshOrderPool: true });
     res.json(result);
   } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/transfer-dependencies/batches/:id/proposals/:proposalId/approve-print", async (req, res, next) => {
+  try {
+    if (!operatorHasAnyRole(req.operator, ["admin", "scm", "scm_staff"])) {
+      return res.status(403).json({ error: "SCM write access required." });
+    }
+    const result = await approveAndPrintTransferDependencyProposal(req.params.id, req.params.proposalId, req.operator);
+    emitAppEvent("scm.transfer_dependency.updated", {
+      source: "transfer-dependency-approve-print",
+      batchId: Number(req.params.id),
+      proposalId: Number(req.params.proposalId),
+      printJobId: result.printJob?.id,
+      printStatus: result.printJob?.status
+    });
+    emitAppEvent("dispatch.orders.updated", { source: "scm-transfer-dependency-approved", refreshOrderPool: true });
+    res.json(result);
+  } catch (error) {
+    emitAppEvent("scm.transfer_dependency.updated", {
+      source: "transfer-dependency-approve-print-attention",
+      batchId: Number(req.params.id),
+      proposalId: Number(req.params.proposalId)
+    });
     next(error);
   }
 });
@@ -4631,7 +6117,8 @@ app.post("/api/scm/transfer-dependencies/batches/:id/retry", async (req, res, ne
         const request = await transferDependencyRestPayload({ proposal, batch });
         return createTransferOrderInNetSuite(request.payload, { intercompany: request.intercompany });
       },
-      hydrateTransferOrder: hydrateCreatedDependencyTransferOrder
+      hydrateTransferOrder: hydrateCreatedDependencyTransferOrder,
+      findTransferOrder: findCreatedDependencyTransferOrder
     });
     emitAppEvent("dispatch.orders.updated", { source: "scm-transfer-dependency-retry", refreshOrderPool: true });
     res.json(result);
@@ -5668,6 +7155,30 @@ app.get("/admin", (req, res) => {
   res.sendFile(path.join(publicDir, "admin.html"));
 });
 
+app.get("/admin/printers", (req, res) => {
+  res.sendFile(path.join(publicDir, "scm-printers.html"));
+});
+
+app.get("/sales", (req, res) => {
+  res.sendFile(path.join(publicDir, "sales.html"));
+});
+
+app.get("/sales/planning", (req, res) => {
+  res.sendFile(path.join(publicDir, "dispatch.html"));
+});
+
+app.get("/sales/schedule", (req, res) => {
+  res.sendFile(path.join(publicDir, "scm-schedule.html"));
+});
+
+app.get("/sales/monitor", (req, res) => {
+  res.sendFile(path.join(publicDir, "dispatch-monitor.html"));
+});
+
+app.get("/sales/printing", (req, res) => {
+  res.sendFile(path.join(publicDir, "sales-printing.html"));
+});
+
 app.get("/dispatch", (req, res) => {
   res.sendFile(path.join(publicDir, "dispatch-menu.html"));
 });
@@ -5714,6 +7225,18 @@ app.get("/scm/transfer-dependencies", (req, res) => {
 
 app.get("/scm/VRMA", (req, res) => {
   res.sendFile(path.join(publicDir, "scm-vrma.html"));
+});
+
+app.get("/scm/smart", (req, res) => {
+  res.sendFile(path.join(publicDir, "scm-smart.html"));
+});
+
+app.get("/scm/printers", (req, res) => {
+  res.redirect("/admin/printers");
+});
+
+app.get("/scm/route-rules", (req, res) => {
+  res.sendFile(path.join(publicDir, "scm-route-rules.html"));
 });
 
 app.get("/dispatch/dvir", (req, res) => {
@@ -6375,13 +7898,14 @@ app.post("/api/operators", requireOperator, requireAdmin, async (req, res, next)
       displayName: req.body?.displayName,
       password: req.body?.password,
       role: req.body?.role || "operator",
-      roles: req.body?.roles
+      roles: req.body?.roles,
+      yardLocationIds: req.body?.yardLocationIds
     });
     await writeAudit({
       actorOperatorId: req.operator.id,
       source: "control",
       action: "operator.create",
-      details: { operatorId: operator.id, username: operator.username, role: operator.role, roles: operator.roles }
+      details: { operatorId: operator.id, username: operator.username, role: operator.role, roles: operator.roles, yardLocationIds: operator.yardLocationIds }
     });
     res.json(operator);
   } catch (error) {
@@ -6424,7 +7948,8 @@ app.put("/api/operators/:id/roles", requireOperator, requireAdmin, async (req, r
   try {
     const operator = await updateOperatorRoles(req.params.id, {
       role: req.body?.role,
-      roles: req.body?.roles
+      roles: req.body?.roles,
+      yardLocationIds: req.body?.yardLocationIds
     });
     if (!operator) return res.status(404).json({ error: "Operator not found" });
     await writeAudit({
@@ -6435,7 +7960,8 @@ app.put("/api/operators/:id/roles", requireOperator, requireAdmin, async (req, r
         operatorId: operator.id,
         username: operator.username,
         role: operator.role,
-        roles: operator.roles
+        roles: operator.roles,
+        yardLocationIds: operator.yardLocationIds
       }
     });
     res.json(operator);
@@ -8171,8 +9697,13 @@ export async function startServer() {
     startNetSuiteMirrorWorkers();
     autoSyncTick();
     photoArchiveAutoTick();
+    void smartScmAutoTick().catch((error) => console.error("Smart SCM scheduled tick failed:", error));
     setInterval(autoSyncTick, 60000);
     setInterval(photoArchiveAutoTick, 60000);
+    setInterval(
+      () => void smartScmAutoTick().catch((error) => console.error("Smart SCM scheduled tick failed:", error)),
+      Math.max(1, Number(config.smartScm.forecastIntervalMinutes) || 5) * 60000
+    );
   });
 }
 

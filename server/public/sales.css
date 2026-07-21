@@ -1,0 +1,465 @@
+.sales-printing-page {
+  display: grid;
+  gap: 16px;
+  padding: 18px;
+}
+
+.sales-print-columns {
+  display: grid;
+  grid-template-columns: minmax(0, 7fr) minmax(300px, 3fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.sales-print-columns > .panel {
+  min-width: 0;
+}
+
+.sales-print-orders-panel {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.sales-print-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.sales-print-toolbar > input[type="search"] {
+  flex: 1 1 260px;
+  min-width: 180px;
+}
+
+.sales-print-toolbar > select { flex: 0 1 190px; }
+
+.sales-print-toolbar input,
+.sales-print-toolbar select {
+  min-height: 42px;
+  border: 1px solid #b8c9d2;
+  border-radius: 8px;
+  background: #fff;
+  padding: 8px 10px;
+  font: inherit;
+}
+
+.sales-printer-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 10px;
+}
+
+.sales-printer-card {
+  display: grid;
+  gap: 5px;
+  border: 1px solid #ccd8de;
+  border-left: 5px solid #80949e;
+  border-radius: 9px;
+  background: #fff;
+  padding: 11px 13px;
+}
+
+.sales-printer-card.online { border-left-color: #138a57; }
+.sales-printer-card.offline { border-left-color: #d48a00; }
+.sales-printer-card.error { border-left-color: #c9362b; }
+.sales-printer-card strong { font-size: 18px; }
+.sales-printer-card span,
+.sales-printer-card small { color: #52636d; }
+
+.sales-table-wrap {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  overflow: auto;
+  border: 1px solid #cbd7dd;
+  border-radius: 9px;
+  background: #fff;
+}
+
+.sales-table {
+  width: 100%;
+  min-width: 900px;
+  border-collapse: collapse;
+}
+
+.sales-order-print-table {
+  table-layout: fixed;
+  font-size: var(--sales-print-table-font-size, 12px);
+}
+
+.sales-order-table-wrap {
+  max-height: calc(100vh - 255px);
+  overscroll-behavior: contain;
+}
+
+.sales-table th,
+.sales-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid #e1e8ec;
+  text-align: left;
+  vertical-align: middle;
+}
+
+.sales-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: #edf3f6;
+  color: #2e444f;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+
+.sales-order-print-table th {
+  padding-right: 15px;
+  font-size: var(--sales-print-table-font-size, 12px);
+  white-space: nowrap;
+}
+
+.sales-order-print-table td,
+.sales-order-print-table button,
+.sales-order-print-table .sales-status-pill {
+  font-size: var(--sales-print-table-font-size, 12px);
+}
+
+.sales-order-print-table th > span {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sales-column-resizer {
+  position: absolute;
+  top: 0;
+  right: -5px;
+  z-index: 3;
+  width: 10px;
+  height: 100%;
+  min-height: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 0;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.sales-column-resizer::after {
+  content: "";
+  position: absolute;
+  top: 5px;
+  bottom: 5px;
+  left: 4px;
+  width: 2px;
+  border-radius: 2px;
+  background: transparent;
+}
+
+.sales-column-resizer:hover::after,
+.sales-column-resizer:focus-visible::after,
+.sales-resizing-column .sales-column-resizer::after {
+  background: #14747b;
+}
+
+.sales-resizing-column,
+.sales-resizing-column * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
+
+.sales-table td.items {
+  min-width: 0;
+  max-width: none;
+}
+
+.sales-item-scroll {
+  width: 100%;
+  box-sizing: border-box;
+  max-height: 68px;
+  overflow: auto;
+  padding-right: 5px;
+  color: #3d505a;
+  line-height: 1.35;
+  white-space: normal;
+  scrollbar-width: thin;
+}
+
+.sales-item-line {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 9px;
+  align-items: center;
+  min-width: 0;
+  padding: 3px 0;
+  border-bottom: 1px solid #e8eef1;
+}
+
+.sales-item-line:last-child { border-bottom: 0; }
+
+.sales-item-line span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sales-item-line strong {
+  color: #20313a;
+  white-space: nowrap;
+}
+
+.sales-status-pill {
+  display: inline-flex;
+  border-radius: 999px;
+  background: #e9f0f4;
+  padding: 4px 8px;
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: capitalize;
+}
+
+.sales-status-pill.printed { background: #d7f5e6; color: #11683f; }
+.sales-status-pill.failed,
+.sales-status-pill.uncertain { background: #ffe0dc; color: #9f2018; }
+.sales-status-pill.queued,
+.sales-status-pill.leased,
+.sales-status-pill.printing { background: #fff0c7; color: #7a5100; }
+
+.sales-section-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: end;
+  margin-bottom: 10px;
+}
+
+.sales-section-head h2,
+.sales-section-head p { margin: 0; }
+.sales-section-head p { color: #5d6e77; }
+
+.sales-print-action {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+  align-items: center;
+}
+
+.sales-print-action-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.sales-order-print-table .sales-print-action-buttons button {
+  padding: 6px 8px;
+}
+
+.sales-order-date { white-space: nowrap; }
+
+.sales-table-settings {
+  display: flex;
+  flex: 0 1 auto;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  border: 1px solid #cbd7dd;
+  border-radius: 8px;
+  background: #f7fafb;
+  padding: 5px 7px;
+}
+
+.sales-table-settings label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: #52636d;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.sales-table-settings input[type="range"] { width: 92px; }
+.sales-table-settings output { min-width: 30px; }
+
+.sales-print-job-list {
+  display: grid;
+  gap: 9px;
+  max-height: calc(100vh - 210px);
+  overflow: auto;
+  padding-right: 4px;
+  scrollbar-width: thin;
+}
+
+.sales-print-job-card {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  border: 1px solid #d5e0e5;
+  border-radius: 9px;
+  background: #fff;
+  padding: 10px 11px;
+}
+
+.sales-print-job-card header {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: center;
+}
+
+.sales-print-job-card > div {
+  overflow: hidden;
+  color: #304650;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sales-print-job-card small { color: #61737c; }
+
+.sales-print-job-card p {
+  max-height: 52px;
+  margin: 0;
+  overflow: auto;
+  color: #9f2018;
+  font-size: 12px;
+}
+
+.sales-print-jobs-empty {
+  border: 1px dashed #c4d1d7;
+  border-radius: 9px;
+  padding: 18px;
+  color: #61737c;
+  text-align: center;
+}
+
+.sales-history-dialog {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  width: min(1180px, 96vw);
+  max-height: min(820px, 94vh);
+  overflow: hidden;
+  border-radius: 12px;
+  background: #fff;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, .34);
+}
+
+.sales-history-dialog > header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  padding: 14px 16px;
+  border-bottom: 1px solid #d8e1e6;
+}
+
+.sales-history-dialog header p,
+.sales-history-dialog header h2,
+.sales-history-dialog header span {
+  margin: 0;
+}
+
+.sales-history-dialog > .sales-table-wrap {
+  margin: 14px;
+}
+
+.sales-history-error {
+  color: #9f2018;
+}
+
+.sales-preview-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  background: rgba(12, 25, 33, .72);
+}
+
+.sales-preview-dialog {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  width: min(1180px, 96vw);
+  height: min(920px, 95vh);
+  overflow: hidden;
+  border-radius: 12px;
+  background: #fff;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, .34);
+}
+
+.sales-preview-dialog > header,
+.sales-preview-dialog > footer {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  padding: 12px 16px;
+  border-color: #d8e1e6;
+}
+
+.sales-preview-dialog > header {
+  justify-content: space-between;
+  border-bottom: 1px solid #d8e1e6;
+}
+
+.sales-preview-dialog > footer {
+  justify-content: flex-end;
+  border-top: 1px solid #d8e1e6;
+}
+
+.sales-preview-dialog header p,
+.sales-preview-dialog header h2,
+.sales-preview-dialog header span,
+.sales-preview-dialog header small {
+  margin: 0;
+}
+
+.sales-preview-dialog header small {
+  display: block;
+  margin-top: 4px;
+  color: #63757f;
+}
+
+.sales-preview-dialog header p {
+  color: #63757f;
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+}
+
+.sales-preview-dialog iframe {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: #56616a;
+}
+
+.sales-preview-warning {
+  margin-right: auto;
+  color: #9f2018;
+  font-weight: 700;
+}
+
+@media (max-width: 1100px) {
+  .sales-print-columns { grid-template-columns: 1fr; }
+  .sales-print-job-list { max-height: 420px; }
+  .sales-order-table-wrap { max-height: 62vh; }
+}
+
+@media (max-width: 760px) {
+  .sales-print-toolbar { align-items: stretch; }
+  .sales-print-toolbar > input[type="search"],
+  .sales-print-toolbar > select,
+  .sales-table-settings { flex: 1 1 100%; }
+  .sales-table-settings { margin-left: 0; justify-content: space-between; }
+  .sales-printing-page { padding: 10px; }
+  .sales-print-action { grid-template-columns: 1fr; min-width: 150px; }
+  .sales-print-action-buttons { flex-wrap: wrap; }
+  .sales-preview-backdrop { padding: 0; }
+  .sales-preview-dialog { width: 100vw; height: 100vh; border-radius: 0; }
+  .sales-history-dialog { width: 100vw; max-height: 100vh; border-radius: 0; }
+  .sales-preview-dialog > footer { flex-wrap: wrap; }
+}

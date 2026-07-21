@@ -1,0 +1,406 @@
+import assert from "node:assert/strict";
+import crypto from "node:crypto";
+import fs from "node:fs/promises";
+import { closeDb, query, withTransaction } from "./db.js";
+import { listSmartScmInputFiles } from "./smart-scm-import-repository.js";
+import { runSmartScmForecast, listSmartScmForecasts, smartScmCoverageFloor } from "./smart-scm-forecast-repository.js";
+import { consolidateCompatibleDrafts, getSmartScmPlanningRun, runSmartScmPlan, smartScmPackWholePalletLines, smartScmSourceTransferLimit, updateSmartScmProposal } from "./smart-scm-planning-repository.js";
+import { addSmartScmVendorAlternativeLine, listSmartScmVendorReplyLoads, removeSmartScmVendorAlternativeLine, saveSmartScmVendorReplyLoad, searchSmartScmVendorAlternatives } from "./smart-scm-vendor-repository.js";
+import { executeSmartScmPurchaseProposal } from "./smart-scm-purchase-service.js";
+import { leaseYardPrintJob, queueYardPrinterTest, rotateYardPrinterToken, updateLeasedPrintJob, updateYardPrinter, yardPrintJobDocument } from "./smart-scm-print-repository.js";
+import { groupSmartScmProposals, recalculateSmartScmPoProposal, removeSmartScmProposalLine, smartScmAllocateProRata, updateSmartScmProposalLine } from "./smart-scm-proposal-editor.js";
+import { buildSmartScmPurchaseOrderRestPayload } from "./smart-scm-purchase-netsuite.js";
+import { listSmartScmRouteRules, upsertSmartScmRouteRule } from "./smart-scm-route-repository.js";
+
+let temporaryPrintPath = null;
+const pickupFloor = smartScmCoverageFloor({ representativeOrderPallets: 0.29, orderCount: 5, capacityPallets: 25 });
+assert.equal(pickupFloor.rawFloorPallets, 1.45, "Five fractional pickup orders must stay fractional until the final rounding step.");
+assert.equal(pickupFloor.coverageFloorPallets, 2, "Five 0.29-PLT pickup orders must create a 2-PLT floor, not a 5-PLT floor.");
+const deliveryFloor = smartScmCoverageFloor({ representativeOrderPallets: 0.66, orderCount: 1, capacityPallets: 25 });
+assert.equal(deliveryFloor.coverageFloorPallets, 1, "One 0.66-PLT delivery order must create a 1-PLT floor.");
+const cappedFloor = smartScmCoverageFloor({ representativeOrderPallets: 4, orderCount: 5, capacityPallets: 12 });
+const proportionalLoads = smartScmAllocateProRata([
+  { itemId: 1, destinationLocationId: 26, proposedPallets: 8, requiredPallets: 8, palletWeight: 10, toPlt: 1, lineWeight: 80 },
+  { itemId: 2, destinationLocationId: 15, proposedPallets: 4, requiredPallets: 4, palletWeight: 10, toPlt: 1, lineWeight: 40 }
+], 100);
+assert.equal(proportionalLoads.length, 1, "Manual grouping must create exactly one physical load.");
+assert(proportionalLoads[0].reduce((sum, line) => sum + line.lineWeight, 0) <= 100.000001, "The grouped load must stay within truck capacity.");
+assert(proportionalLoads[0].every((line) => Number.isInteger(line.proposedPallets)), "Every grouped quantity must be a whole pallet.");
+const proportionalTotals = new Map();
+for (const load of proportionalLoads) {
+  for (const line of load) proportionalTotals.set(line.itemId, (proportionalTotals.get(line.itemId) || 0) + line.proposedPallets);
+}
+assert.equal(proportionalTotals.get(1), 7, "Capacity-limited allocation must apportion the first item proportionally.");
+assert.equal(proportionalTotals.get(2), 3, "Capacity-limited allocation must apportion the second item proportionally.");
+assert.equal(proportionalLoads[0].reduce((sum, line) => sum + line.reason.groupingDeferredPallets, 0), 2, "Unallocated demand must be recorded as deferred pallets.");
+const roundedCapacityLoad = smartScmAllocateProRata([
+  { itemId: 3, destinationLocationId: 26, proposedPallets: 20.6, requiredPallets: 20.6, palletWeight: 3000, toPlt: 1, lineWeight: 61800 },
+  { itemId: 4, destinationLocationId: 26, proposedPallets: 5.6, requiredPallets: 5.6, palletWeight: 3000, toPlt: 1, lineWeight: 16800 }
+], 80000);
+assert.equal(roundedCapacityLoad.length, 1);
+assert.deepEqual(roundedCapacityLoad[0].map((line) => line.proposedPallets), [20, 6], "20.6 and 5.6 PLT must become a capacity-safe whole-pallet allocation.");
+assert(roundedCapacityLoad[0].every((line) => Number.isInteger(line.proposedPallets)));
+assert(roundedCapacityLoad[0].reduce((sum, line) => sum + line.lineWeight, 0) <= 80000, "Rounding may never push a grouped truck over capacity.");
+const fourDestinationPo = smartScmPackWholePalletLines([
+  { itemId: 11, destinationLocationId: 26, destinationName: "150", proposedPallets: 1, requiredPallets: 1, palletWeight: 10, lineWeight: 10, toPlt: 1, reason: {} },
+  { itemId: 12, destinationLocationId: 15, destinationName: "12441", proposedPallets: 1, requiredPallets: 1, palletWeight: 10, lineWeight: 10, toPlt: 1, reason: {} },
+  { itemId: 13, destinationLocationId: 1, destinationName: "3445", proposedPallets: 1, requiredPallets: 1, palletWeight: 10, lineWeight: 10, toPlt: 1, reason: {} },
+  { itemId: 14, destinationLocationId: 28, destinationName: "2967", proposedPallets: 1, requiredPallets: 1, palletWeight: 10, lineWeight: 10, toPlt: 1, reason: {} }
+], 100, { proposalType: "PO", sourceName: "Milton", maxStops: 2 });
+assert.equal(fourDestinationPo.length, 2, "Four PO destinations must split across two routes.");
+assert(fourDestinationPo.every((load) => load.routeStops.length <= 2), "A PO load may have at most two drops.");
+assert.deepEqual(fourDestinationPo[0].routeStops.map((stop) => stop.name), ["150", "12441"], "Hub stops must use the preferred route order.");
+const gormleyPartial = smartScmPackWholePalletLines([
+  { itemId: 15, destinationLocationId: 1, destinationName: "3445", proposedPallets: 2, requiredPallets: 2, palletWeight: 30, lineWeight: 60, toPlt: 1, reason: {} }
+], 100, { proposalType: "PO", sourceName: "Gormley", maxStops: 2 });
+assert.deepEqual(gormleyPartial[0].routeStops.map((stop) => stop.name), ["12441"], "A partial Gormley direct-shop load must route through 12441.");
+assert.equal(gormleyPartial[0].lines[0].reason.gormleyHubRedirected, true);
+const gormleyFull = smartScmPackWholePalletLines([
+  { itemId: 16, destinationLocationId: 1, destinationName: "3445", proposedPallets: 3, requiredPallets: 3, palletWeight: 30, lineWeight: 90, toPlt: 1, reason: {} }
+], 100, { proposalType: "PO", sourceName: "Gormley", maxStops: 2 });
+assert.deepEqual(gormleyFull[0].routeStops.map((stop) => stop.name), ["3445"], "An operationally full Gormley load may deliver directly to the shop.");
+const gormleyMixedPartial = smartScmPackWholePalletLines([
+  { itemId: 160, destinationLocationId: 1, destinationName: "3445", proposedPallets: 1, requiredPallets: 1, palletWeight: 30, lineWeight: 30, toPlt: 1, reason: {} },
+  { itemId: 161, destinationLocationId: 26, destinationName: "150", proposedPallets: 7, requiredPallets: 7, palletWeight: 10, lineWeight: 70, toPlt: 1, reason: {} }
+], 100, { proposalType: "PO", sourceName: "Gormley", maxStops: 2 });
+assert(!gormleyMixedPartial.flatMap((load) => load.lines).some((line) => line.destinationLocationId === 1), "A partial Gormley shop quantity must not become direct just because 150 fills the truck.");
+assert.deepEqual(gormleyMixedPartial[0].routeStops.map((stop) => stop.name), ["12441", "150"], "The redirected Gormley load must use 12441 before 150.");
+const uxbridgeRoute = smartScmPackWholePalletLines([
+  { itemId: 162, destinationLocationId: 26, destinationName: "150", proposedPallets: 1, requiredPallets: 1, palletWeight: 50, lineWeight: 50, toPlt: 1, reason: {} },
+  { itemId: 163, destinationLocationId: 1, destinationName: "3445", proposedPallets: 1, requiredPallets: 1, palletWeight: 50, lineWeight: 50, toPlt: 1, reason: {} }
+], 100, { proposalType: "PO", sourceName: "Uxbridge", maxStops: 2 });
+assert.deepEqual(uxbridgeRoute[0].routeStops.map((stop) => stop.name), ["3445", "150"], "Uxbridge must not use 150 as the first stop when another yard is present.");
+const woodbridgeRoute = smartScmPackWholePalletLines([
+  { itemId: 164, destinationLocationId: 26, destinationName: "150", proposedPallets: 1, requiredPallets: 1, palletWeight: 50, lineWeight: 50, toPlt: 1, reason: {} },
+  { itemId: 165, destinationLocationId: 15, destinationName: "12441", proposedPallets: 1, requiredPallets: 1, palletWeight: 50, lineWeight: 50, toPlt: 1, reason: {} }
+], 100, { proposalType: "PO", sourceName: "Woodbridge", maxStops: 2 });
+assert.deepEqual(woodbridgeRoute[0].routeStops.map((stop) => stop.name), ["12441", "150"], "Woodbridge must not use 150 as the first stop when another yard is present.");
+const bwsWoodbridgeRoute = smartScmPackWholePalletLines([
+  { itemId: 166, destinationLocationId: 26, destinationName: "150", proposedPallets: 1, requiredPallets: 1, palletWeight: 50, lineWeight: 50, toPlt: 1, reason: {} },
+  { itemId: 167, destinationLocationId: 28, destinationName: "2967", proposedPallets: 1, requiredPallets: 1, palletWeight: 50, lineWeight: 50, toPlt: 1, reason: {} }
+], 100, { proposalType: "PO", sourceName: "BWS Woodbridge", maxStops: 2 });
+assert.deepEqual(bwsWoodbridgeRoute[0].routeStops.map((stop) => stop.name), ["2967", "150"], "Woodbridge-family pickup sources must not use 150 as the first stop.");
+const twoFullDestinationLoads = smartScmPackWholePalletLines([
+  { itemId: 17, destinationLocationId: 26, destinationName: "150", proposedPallets: 19, requiredPallets: 19, palletWeight: 4000, lineWeight: 76000, toPlt: 1, reason: {} },
+  { itemId: 18, destinationLocationId: 15, destinationName: "12441", proposedPallets: 19, requiredPallets: 19, palletWeight: 4000, lineWeight: 76000, toPlt: 1, reason: {} }
+], 78000, { proposalType: "PO", sourceName: "Ayr", maxStops: 2 });
+assert.equal(twoFullDestinationLoads.length, 2, "Full quantities for 150 and 12441 must recalculate into two PO loads.");
+assert(twoFullDestinationLoads.every((load) => load.totalWeight === 76000 && load.routeStops.length === 1));
+assert.equal(twoFullDestinationLoads.flatMap((load) => load.lines).reduce((sum, line) => sum + line.proposedPallets, 0), 38);
+const destinationFirstLoads = smartScmPackWholePalletLines([
+  { itemId: 180, destinationLocationId: 26, destinationName: "150", proposedPallets: 11, requiredPallets: 11, palletWeight: 10, lineWeight: 110, toPlt: 1, reason: {} },
+  { itemId: 181, destinationLocationId: 1, destinationName: "3445", proposedPallets: 15, requiredPallets: 15, palletWeight: 10, lineWeight: 150, toPlt: 1, reason: {} }
+], 100, { proposalType: "PO", sourceName: "Ayr", maxStops: 2 });
+assert.equal(destinationFirstLoads.length, 3, "Destination-first PO packing must preserve the minimum three-truck count.");
+assert.equal(destinationFirstLoads.filter((load) => load.routeStops.length === 1 && load.totalWeight === 100).length, 2, "Full single-destination trucks must be locked before residual quantities are mixed.");
+assert.equal(destinationFirstLoads.filter((load) => load.routeStops.length > 1).length, 1, "Only the residual Ayr quantities should form a two-stop route.");
+assert(destinationFirstLoads.every((load) => load.totalWeight <= 100.000001), "Destination-first loads must stay within capacity.");
+assert.equal(destinationFirstLoads.flatMap((load) => load.lines).reduce((sum, line) => sum + line.proposedPallets, 0), 26, "Destination-first packing must preserve every pallet.");
+const urgencyFragmentationLoads = smartScmPackWholePalletLines([
+  { itemId: 184, destinationLocationId: 1, destinationName: "3445", proposedPallets: 4, requiredPallets: 4, palletWeight: 4, lineWeight: 16, toPlt: 1, urgent: true, reason: {} },
+  { itemId: 185, destinationLocationId: 1, destinationName: "3445", proposedPallets: 2, requiredPallets: 2, palletWeight: 6, lineWeight: 12, toPlt: 1, urgent: false, reason: {} }
+], 10, { proposalType: "PO", sourceName: "Ayr", maxStops: 2 });
+assert.equal(urgencyFragmentationLoads.length, 3, "Urgent small pallets must not fragment three destination-full trucks into four loads.");
+assert(urgencyFragmentationLoads.every((load) => load.routeStops.length === 1 && load.totalWeight <= 10.000001), "Weight-first packing must preserve the single destination and capacity.");
+const forcedSingleDestinationLoads = smartScmPackWholePalletLines([
+  { itemId: 182, destinationLocationId: 26, destinationName: "150", proposedPallets: 11, requiredPallets: 11, palletWeight: 10, lineWeight: 110, toPlt: 1, reason: {} },
+  { itemId: 183, destinationLocationId: 1, destinationName: "3445", proposedPallets: 15, requiredPallets: 15, palletWeight: 10, lineWeight: 150, toPlt: 1, reason: {} }
+], 100, { proposalType: "PO", sourceName: "Ayr", maxStops: 1 });
+assert.equal(forcedSingleDestinationLoads.length, 4, "A one-drop rule must keep every destination separate.");
+assert(forcedSingleDestinationLoads.every((load) => load.routeStops.length === 1), "A one-drop rule may never create a mixed route.");
+const mixedPriorityLoads = consolidateCompatibleDrafts([
+  {
+    proposalType: "TO", phase: "internal_transfer", sourceKind: "yard", sourceLocationId: 28, sourceName: "2967",
+    destinationLocationId: 26, destinationName: "150", vendor: null, plant: null, status: "draft", urgent: true, provisional: true,
+    lines: [{ itemId: 1, itemName: "Urgent item", destinationLocationId: 26, destinationName: "150", requiredPallets: 1, proposedPallets: 1, confirmedPallets: 0, residualPallets: 1, salesQuantity: 1, palletWeight: 30, lineWeight: 30, urgent: true, provisional: true, reason: {} }]
+  },
+  {
+    proposalType: "TO", phase: "internal_transfer", sourceKind: "yard", sourceLocationId: 28, sourceName: "2967",
+    destinationLocationId: 26, destinationName: "150", vendor: null, plant: null, status: "held", urgent: false, provisional: false,
+    lines: [{ itemId: 2, itemName: "Normal item", destinationLocationId: 26, destinationName: "150", requiredPallets: 1, proposedPallets: 1, confirmedPallets: 0, residualPallets: 1, salesQuantity: 1, palletWeight: 20, lineWeight: 20, urgent: false, provisional: false, reason: {} }]
+  }
+], { truck_capacity_lbs: 100, hold_load_ratio: 0.5 }, "priority-test");
+assert.equal(mixedPriorityLoads.length, 1, "Urgency and provisional state must not split an otherwise compatible route.");
+assert.equal(mixedPriorityLoads[0].status, "draft", "Draft/Held must be assigned from final load utilization.");
+assert.equal(mixedPriorityLoads[0].lines[0].urgent, true, "Urgent lines must be packed first.");
+assert(mixedPriorityLoads[0].lines.some((line) => !line.urgent), "A final load may contain both urgent and non-urgent lines.");
+
+try {
+const safetyLimit = smartScmSourceTransferLimit({ availablePallets: 20, safetyStockPallets: 10, reorderPointPallets: 8 });
+assert.equal(safetyLimit.maximumTransferablePallets, 10, "20 available with safety 10 can transfer at most 10.");
+const reorderPointLimit = smartScmSourceTransferLimit({ availablePallets: 20, safetyStockPallets: 10, reorderPointPallets: 12 });
+assert.equal(reorderPointLimit.maximumTransferablePallets, 8, "The higher reorder point must also remain protected.");
+const unavailableLimit = smartScmSourceTransferLimit({ availablePallets: 1, safetyStockPallets: 4, reorderPointPallets: 6 });
+assert.equal(unavailableLimit.maximumTransferablePallets, 0, "A yard below its protected floor cannot source a TO.");
+
+const purchasePayload = buildSmartScmPurchaseOrderRestPayload({
+  proposal: {
+    id: 321,
+    vendorId: 7101,
+    destinationLocationId: 15,
+    memo: "Harness PO",
+    vendorReference: "VENDOR-REF",
+    lines: [
+      { itemId: 601, destinationLocationId: 15, salesQuantity: 61.5, confirmedPallets: 1, palletQty: 1, layerQty: 0, sectionQty: 0, pieceQty: 0 },
+      { itemId: 600, destinationLocationId: 26, salesQuantity: 50, confirmedPallets: 1, palletQty: 1, layerQty: 0, sectionQty: 0, pieceQty: 0 }
+    ]
+  },
+  locations: [
+    { locationId: 15, netsuiteLocationId: 15, subsidiaryId: 2 },
+    { locationId: 26, netsuiteLocationId: 26, subsidiaryId: 2 }
+  ]
+});
+assert.equal(purchasePayload.entity.id, "7101");
+assert.equal(purchasePayload.item.items[0].custcol_plt, 1);
+assert.equal(purchasePayload.item.items[0].quantity, 61.5);
+assert.equal(purchasePayload.location.id, "15");
+assert(!Object.hasOwn(purchasePayload, "orderStatus"), "PO creation must not submit an order status override.");
+assert.equal(purchasePayload.item.items[1].location.id, "26", "A multi-drop PO line must retain its own destination yard.");
+
+  const inputs = await listSmartScmInputFiles();
+  const activeSlots = new Set(inputs.filter((file) => file.active).map((file) => file.slot));
+  for (const slot of ["item_master", "sales_data", "decision_workbook", "decision_tree", "decision_script"]) {
+    assert(activeSlots.has(slot), `Expected active ${slot} input.`);
+  }
+  const routeRules = await listSmartScmRouteRules();
+  const gormleyRule = routeRules.rules.find((rule) => rule.sourceKey === "gormley");
+  assert.deepEqual(gormleyRule?.stopOrder, [15, 1, 28, 26], "Gormley must use 12441 before 150.");
+  assert.equal(gormleyRule?.partialRedirectHubLocationId, 15, "Gormley partial direct loads must redirect to 12441.");
+  const savedRouteRule = await upsertSmartScmRouteRule({
+    sourceName: "BWS Woodbridge",
+    enabled: true,
+    maxDrops: 2,
+    stopOrder: [15, 1, 28, 26],
+    partialRedirectEnabled: false,
+    partialRedirectDestinationIds: [1, 28],
+    partialRedirectHubLocationId: null,
+    notes: "Harness route rule"
+  }, null);
+  assert.deepEqual(savedRouteRule.stopOrder, [15, 1, 28, 26], "Route-rule stop priority must persist as JSON.");
+
+  await withTransaction(async () => {
+    await query(
+      `UPDATE scm_smart_settings
+          SET forecast_mode = 'formula',
+              formula_average_weeks = 6,
+              stockout_benchmark_weeks = 6,
+              delivery_safety_factor = 1.645,
+              execution_mode = 'mock',
+              pickup_safety_factor = 1.3,
+              zero_demand_coverage_enabled = true,
+              zero_demand_pickup_order_count = 5,
+              zero_demand_delivery_order_count = 1,
+              coverage_order_percentile = 0.50,
+              coverage_history_weeks = 104,
+              coverage_prior_strength_orders = 8`
+    );
+    const forecastRun = await runSmartScmForecast({ triggerSource: "harness", operatorId: null });
+    assert.equal(forecastRun.status, "completed");
+    const forecasts = await listSmartScmForecasts({ runId: Number(forecastRun.id), limit: 5000 });
+    assert(forecasts.length > 0, "Expected at least one item-yard forecast.");
+    assert(forecasts.every((row) => Number.isFinite(row.p50Weekly) && Number.isFinite(row.leadTimeP90)));
+    const coverageEvidence = forecasts.filter((row) => row.representativeOrderPallets > 0 && row.coverageFloorPallets > 0);
+    assert(coverageEvidence.length > 0, "Expected representative order evidence from the selected sales source.");
+    const appliedCoverage = coverageEvidence.filter((row) => row.zeroDemandCoverageApplied);
+    assert(appliedCoverage.length > 0, "Expected at least one zero-demand item-yard coverage floor.");
+    for (const row of appliedCoverage) {
+      assert(row.formulaWeeklyDemand <= 0.000001, "Coverage may apply only when corrected formula demand is zero.");
+      assert.equal(row.coverageOrderCount, row.yardCode === "12441" ? 1 : 5, "Coverage count must follow the configured yard channel.");
+      const requestedFloor = Math.ceil((row.representativeOrderPallets * row.coverageOrderCount) - 0.000001);
+      assert(row.coverageFloorPallets <= requestedFloor, "Capacity may cap a coverage floor but may never increase it.");
+      if (row.coverageFloorPallets < requestedFloor) assert.equal(row.coverageCapacityShortfall, true);
+    }
+    const alliance = forecasts.find((row) => row.itemId === 601 && row.yardCode === "12441");
+    assert(alliance, "Expected Alliance G2 Supersand Grey at 12441.");
+    assert.equal(alliance.formulaStockout, true);
+    assert(Math.abs(alliance.formulaWeeklyDemand - 2.642857) < 0.00001, `Expected stockout peak 2.642857, received ${alliance.formulaWeeklyDemand}.`);
+    assert(Math.abs(alliance.formulaWeeklySd - 1.003358) < 0.00001, `Expected six-week SD 1.003358, received ${alliance.formulaWeeklySd}.`);
+
+    const plan = await runSmartScmPlan({ triggerSource: "harness", operatorId: null, forecastRunId: Number(forecastRun.id) });
+    assert.equal(plan.status, "ready");
+    assert(Array.isArray(plan.proposals));
+    assert(!plan.proposals.some((proposal) => proposal.phase === "hub_store"), "Future inbound stock must not pre-create a hub-store TO.");
+    assert(plan.proposals.filter((proposal) => proposal.proposalType === "PO").every((proposal) => proposal.routeStops.length <= 2), "Every generated PO route must have at most two drops.");
+    for (const proposal of plan.proposals.filter((row) => row.proposalType === "PO" && row.sourceName === "Gormley")) {
+      const directLines = proposal.lines.filter((line) => [1, 28].includes(line.destinationLocationId));
+      if (!directLines.length) continue;
+      const smallestPallet = Math.min(...proposal.lines.map((line) => Number(line.palletWeightLbs)).filter((weight) => weight > 0));
+      assert((78000 - proposal.totalWeightLbs) < smallestPallet + 0.000001, "A partial Gormley direct-shop PO must be redirected to 12441.");
+    }
+    for (const transfer of plan.proposals.filter((proposal) => proposal.proposalType === "TO" && proposal.phase === "internal_transfer")) {
+      for (const line of transfer.lines) {
+        assert(line.proposedPallets <= Number(line.reason.sourceMaximumTransferablePallets) + 0.000001, "Suggested TO exceeds live source transfer limit.");
+      }
+    }
+    const coverageReviewLines = plan.proposals.flatMap((proposal) => proposal.lines
+      .filter((line) => line.reason?.coverageReviewRequired)
+      .map((line) => ({ proposal, line })));
+    for (const { proposal, line } of coverageReviewLines) {
+      assert.equal(proposal.status, "held", `${line.itemName} must remain held while its order-size evidence is mostly borrowed.`);
+    }
+    const allianceLine = plan.proposals.flatMap((proposal) => proposal.lines.map((line) => ({ proposal, line })))
+      .find(({ proposal, line }) => proposal.destinationLocationId === 15 && line.itemId === 601 && Number(line.reason.safetyFactor) === 1.645);
+    assert(allianceLine, "Expected an Alliance G2 Supersand Grey replenishment line for 12441.");
+    assert(Math.abs(Number(allianceLine.line.reason.safetyStockPallets) - 2.334194) < 0.00001, `Expected safety stock 2.334194, received ${allianceLine.line.reason.safetyStockPallets}.`);
+    assert.equal(Number(allianceLine.line.reason.reorderPointPallets), 8);
+    assert.equal(Number(allianceLine.line.reason.preferredPallets), 14);
+
+    const destinationEditCandidate = await query(
+      `SELECT line.proposal_id, line.id AS line_id, line.item_id, line.proposed_pallets,
+              line.destination_location_id AS before_destination_location_id,
+              sibling.destination_location_id AS destination_location_id
+         FROM scm_smart_proposal_lines line
+         JOIN scm_smart_proposals proposal ON proposal.id = line.proposal_id
+         JOIN scm_smart_proposal_lines sibling
+           ON sibling.proposal_id = line.proposal_id
+          AND sibling.destination_location_id <> line.destination_location_id
+         JOIN scm_smart_item_yard_policies yard
+           ON yard.item_id = line.item_id
+          AND yard.location_id = sibling.destination_location_id
+          AND yard.eligible = true
+        WHERE proposal.run_id = $1
+          AND proposal.proposal_type = 'PO'
+          AND proposal.status = 'held'
+          AND NOT EXISTS (
+            SELECT 1
+              FROM scm_smart_proposal_lines duplicate
+             WHERE duplicate.proposal_id = line.proposal_id
+               AND duplicate.item_id = line.item_id
+               AND duplicate.destination_location_id = sibling.destination_location_id
+          )
+        ORDER BY proposal.id, line.id
+        LIMIT 1`,
+      [plan.id]
+    );
+    assert(destinationEditCandidate.rowCount, "Expected an editable multi-drop PO line with an eligible alternate destination.");
+    const move = destinationEditCandidate.rows[0];
+    const destinationAdjusted = await updateSmartScmProposalLine(
+      move.proposal_id,
+      move.line_id,
+      { proposedPallets: Number(move.proposed_pallets), destinationLocationId: Number(move.destination_location_id) },
+      null
+    );
+    const movedLine = destinationAdjusted.lines.find((line) => line.id === Number(move.line_id));
+    assert.equal(movedLine.destinationLocationId, Number(move.destination_location_id), "A PO proposal line destination must be editable.");
+    assert.equal(movedLine.reason.destinationManuallyAdjusted, true, "A manual destination change must be recorded on the line.");
+    assert(destinationAdjusted.routeStops.length <= 2, "A destination edit must preserve the proposal route limit.");
+
+    const po = plan.proposals.find((proposal) => proposal.proposalType === "PO" && proposal.lines.length);
+    assert(plan.proposals.filter((proposal) => proposal.proposalType === "PO").every((proposal) => proposal.status === "held"), "Every new PO load must start on Hold.");
+    let vendorLoadChecked = false;
+    let alternativeLineChecked = false;
+    if (po) {
+      const requested = await updateSmartScmProposal(po.id, { status: "order_requested" }, null);
+      assert.equal(requested.status, "order_requested");
+      assert(requested.orderRequestedAt, "Order Requested must record its load-level timestamp.");
+      const queue = await listSmartScmVendorReplyLoads({ search: String(po.id), limit: 50 });
+      assert(queue.some((load) => load.id === po.id), "Requested PO must appear in the cross-plan vendor queue.");
+      const alternatives = await searchSmartScmVendorAlternatives(po.id, { lineId: po.lines[0].id, limit: 12 });
+      assert(Array.isArray(alternatives), "Alternative item autocomplete must return a list.");
+      if (alternatives[0]) {
+        const withAlternative = await addSmartScmVendorAlternativeLine(po.id, { itemId: alternatives[0].itemId, proposedPallets: 1, confirmedPallets: 1, alternativeForLineId: po.lines[0].id, source: "system" }, null);
+        const added = withAlternative.lines.find((line) => line.isAlternative && line.itemId === alternatives[0].itemId);
+        assert(added, "Selected system alternative should be added to the load.");
+        const withoutAlternative = await removeSmartScmVendorAlternativeLine(po.id, added.id, null);
+        assert(!withoutAlternative.lines.some((line) => line.id === added.id), "Alternative line removal should restore the load.");
+        alternativeLineChecked = true;
+      }
+      const replied = await saveSmartScmVendorReplyLoad(po.id, {
+        vendorReference: "HARNESS-VENDOR-REF",
+        remarks: "Smart SCM rollback harness",
+        lines: po.lines.map((line) => ({ proposalLineId: line.id, confirmedPallets: line.proposedPallets }))
+      }, null);
+      assert.equal(replied.status, "vendor_replied");
+      assert.equal(replied.vendorReference, "HARNESS-VENDOR-REF");
+      const execution = await executeSmartScmPurchaseProposal(po.id, null);
+      assert.equal(execution.purchaseOrderRef, `MOCK-PO-${po.id}`);
+      const completed = (await listSmartScmVendorReplyLoads({ search: String(po.id), limit: 50 })).find((load) => load.id === po.id);
+      assert.equal(completed.status, "completed");
+      assert.equal(completed.netsuitePurchaseOrderRef, `MOCK-PO-${po.id}`);
+      vendorLoadChecked = true;
+    }
+    const groupCandidates = plan.proposals.filter((proposal) => proposal.id !== po?.id && ["draft", "held", "reviewed", "attention"].includes(proposal.status));
+    const groupBuckets = new Map();
+    for (const proposal of groupCandidates) {
+      const key = proposal.proposalType === "PO"
+        ? [proposal.proposalType, proposal.phase, proposal.sourceName, proposal.vendor].join("|")
+        : [proposal.proposalType, proposal.phase, proposal.sourceLocationId, proposal.destinationLocationId].join("|");
+      if (!groupBuckets.has(key)) groupBuckets.set(key, []);
+      groupBuckets.get(key).push(proposal);
+    }
+    let compatibleGroup = null;
+    for (const rows of groupBuckets.values()) {
+      for (let left = 0; left < rows.length && !compatibleGroup; left += 1) {
+        for (let right = left + 1; right < rows.length; right += 1) {
+          const pair = [rows[left], rows[right]];
+          const destinations = new Set(pair.flatMap((proposal) => proposal.lines.map((line) => line.destinationLocationId)));
+          if (pair[0].proposalType !== "PO" || destinations.size <= 2) {
+            compatibleGroup = pair;
+            break;
+          }
+        }
+      }
+      if (compatibleGroup) break;
+    }
+    assert(compatibleGroup, "Expected at least two compatible proposal loads for manual grouping.");
+    const groupedRun = await groupSmartScmProposals(compatibleGroup.map((proposal) => proposal.id), null);
+    const groupedLoads = groupedRun.proposals.filter((proposal) => proposal.manuallyGrouped);
+    assert(groupedLoads.length > 0, "Manual grouping must create route-aware replacement loads.");
+    assert(groupedLoads.every((proposal) => proposal.utilization <= 1.000001), "Manual grouped loads must not exceed truck capacity.");
+    assert(groupedLoads.every((proposal) => proposal.routeStops.length > 0), "Every grouped load must expose at least one route stop.");
+    const editableGrouped = groupedLoads[0];
+    const editLine = editableGrouped.lines[0];
+    const edited = await updateSmartScmProposalLine(editableGrouped.id, editLine.id, { proposedPallets: editLine.proposedPallets }, null);
+    assert.equal(edited.lines.find((line) => line.id === editLine.id).proposedPallets, editLine.proposedPallets, "Proposal pallet quantity must be editable.");
+    if (edited.lines.length > 1) {
+      const removedLineId = edited.lines[edited.lines.length - 1].id;
+      const afterRemoval = await removeSmartScmProposalLine(edited.id, removedLineId, null);
+      if (!afterRemoval.deleted) assert(!afterRemoval.lines.some((line) => line.id === removedLineId), "Proposal line removal must persist.");
+    }
+    const beforeRecalculate = await getSmartScmPlanningRun(plan.id);
+    const recalculateCandidate = beforeRecalculate.proposals.find((proposal) => proposal.proposalType === "PO"
+      && proposal.id !== po?.id && proposal.status === "held" && proposal.lines.length);
+    assert(recalculateCandidate, "Expected an editable PO proposal for Re-Calculate coverage.");
+    const expectedRecalculatedPallets = recalculateCandidate.lines.reduce((sum, line) => sum + Math.max(1, Math.round(line.proposedPallets)), 0);
+    const recalculatedRun = await recalculateSmartScmPoProposal(recalculateCandidate.id, null);
+    assert(!recalculatedRun.proposals.some((proposal) => proposal.id === recalculateCandidate.id), "Re-Calculate must replace the original PO proposal.");
+    const recalculatedLoads = recalculatedRun.proposals.filter((proposal) => proposal.memo?.startsWith("PO recalculated load"));
+    assert(recalculatedLoads.length > 0, "Re-Calculate must create replacement PO loads.");
+    assert(recalculatedLoads.every((proposal) => proposal.utilization <= 1.000001 && proposal.routeStops.length <= 2), "Every recalculated PO must be capacity-safe with at most two drops.");
+    assert(recalculatedLoads.flatMap((proposal) => proposal.lines).every((line) => Number.isInteger(line.proposedPallets)), "Recalculated PO quantities must remain whole pallets.");
+    assert.equal(recalculatedLoads.flatMap((proposal) => proposal.lines).reduce((sum, line) => sum + line.proposedPallets, 0), expectedRecalculatedPallets, "Re-Calculate must preserve the edited purchase quantity.");
+
+    const printerCount = await query("SELECT COUNT(*)::integer AS count FROM scm_yard_printers");
+    assert.equal(printerCount.rows[0].count, 4);
+    const configuredPrinter = await updateYardPrinter(1, { printerName: "MBBS Harness Printer", enabled: true }, null);
+    const credentials = await rotateYardPrinterToken(1, null);
+    const queued = await queueYardPrinterTest(1, null);
+    const storedJob = await query("SELECT document_path, document_sha256 FROM scm_print_jobs WHERE id = $1", [queued.id]);
+    temporaryPrintPath = storedJob.rows[0].document_path;
+    const leased = await leaseYardPrintJob(credentials.token, configuredPrinter.agentId);
+    assert.equal(leased.job.id, queued.id);
+    const document = await yardPrintJobDocument(queued.id, credentials.token, configuredPrinter.agentId, leased.job.leaseToken);
+    assert.equal(document.path, temporaryPrintPath);
+    const documentBytes = await fs.readFile(document.path);
+    assert.equal(crypto.createHash("sha256").update(documentBytes).digest("hex"), storedJob.rows[0].document_sha256);
+    await updateLeasedPrintJob(queued.id, credentials.token, configuredPrinter.agentId, leased.job.leaseToken, "started");
+    const printed = await updateLeasedPrintJob(queued.id, credentials.token, configuredPrinter.agentId, leased.job.leaseToken, "completed");
+    assert.equal(printed.status, "printed");
+    console.log(JSON.stringify({
+      activeInputs: activeSlots.size,
+      forecasts: forecasts.length,
+      proposals: plan.proposals.length,
+      poProposals: plan.proposals.filter((proposal) => proposal.proposalType === "PO").length,
+      toProposals: plan.proposals.filter((proposal) => proposal.proposalType === "TO").length,
+      vendorLoadChecked,
+      printerLeaseChecked: true,
+      alternativeLineChecked,
+      routeRulesChecked: true,
+      proposalDestinationChecked: true,
+      rolledBack: true
+    }, null, 2));
+  }, { rollback: true });
+} finally {
+  if (temporaryPrintPath) await fs.unlink(temporaryPrintPath).catch(() => null);
+  await closeDb();
+}

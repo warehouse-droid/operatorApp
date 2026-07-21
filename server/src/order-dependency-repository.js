@@ -33,6 +33,15 @@ function normalizeMode(value) {
   return value === "direct_to_customer" ? "direct_to_customer" : "yard_replenishment";
 }
 
+function terminalTransferOrderStatus(row = {}) {
+  const status = text(row.transfer_status ?? row.status).toUpperCase();
+  const statusText = text(row.transfer_status_text ?? row.status_text);
+  const combined = `${status} ${statusText}`;
+  if (status === "H" || /closed|cancel/i.test(combined)) return statusText || "Closed";
+  if (status === "C" || /reject/i.test(combined)) return statusText || "Rejected";
+  return "";
+}
+
 function isMaterialLine(line = {}) {
   const name = `${line.item_name || ""} ${line.sku || ""}`.trim().toLowerCase();
   const type = `${line.item_type || ""} ${line.item_type_text || ""}`.toLowerCase();
@@ -529,25 +538,31 @@ export async function getOrderDependencyOptions({ dispatchTargetRef = "", salesO
   const targetRef = text(dispatchTargetRef || salesOrderRef);
   const transferOrders = await query(
     `SELECT t.netsuite_id, t.tranid, t.from_location, t.to_location,
-            t.dispatch_planned, t.fulfillment_status,
+            t.dispatch_planned, t.fulfillment_status, t.status, t.status_text,
             COALESCE(d.dispatch_target_ref, d.sales_order_ref) AS linked_sales_order_ref
        FROM transfer_orders t
        LEFT JOIN order_dependencies d
          ON d.transfer_order_id = t.netsuite_id AND d.status <> 'cancelled'
       WHERE COALESCE(t.netsuite_active, true)
+        AND UPPER(COALESCE(t.status, '')) NOT IN ('C', 'H')
+        AND LOWER(COALESCE(t.status_text, '')) !~ '(closed|cancel|reject)'
       ORDER BY t.trandate DESC NULLS LAST, t.tranid
       LIMIT 500`
   );
-  const transfer = transferOrderRef
+  const requestedTransfer = transferOrderRef
     ? transferOrders.rows.find((row) => row.tranid === text(transferOrderRef))
       || (await query("SELECT * FROM transfer_orders WHERE tranid = $1", [text(transferOrderRef)])).rows[0]
     : null;
+  const requestedTerminalStatus = terminalTransferOrderStatus(requestedTransfer);
+  const transfer = requestedTerminalStatus ? null : requestedTransfer;
   const resolved = targetRef
     ? await resolveDispatchSalesTarget({ dispatchTargetRef: targetRef, planDate })
     : null;
   let matchingLines = [];
-  let matchError = "";
-  if (transferOrderRef && !transfer) matchError = `Transfer Order ${text(transferOrderRef)} was not found.`;
+  let matchError = requestedTerminalStatus
+    ? `${text(transferOrderRef)} is ${requestedTerminalStatus} and cannot be linked.`
+    : "";
+  if (transferOrderRef && !transfer && !requestedTerminalStatus) matchError = `Transfer Order ${text(transferOrderRef)} was not found.`;
   if (resolved && transfer) {
     const transferLines = await query(
       `SELECT item_id, MAX(COALESCE(sku, item_name, item_id::text)) AS item_label,
@@ -724,7 +739,19 @@ async function applyTransferDependencyReviews(orders = [], reviewStatus = "open"
                 SELECT 1
                   FROM scm_transfer_dependency_proposals p
                  WHERE p.batch_id = b.id AND p.netsuite_transfer_order_id IS NOT NULL
-              ) AS has_created_transfer
+              ) AS has_created_transfer,
+              NOT EXISTS (
+                SELECT 1
+                  FROM scm_transfer_dependency_proposals p
+                  LEFT JOIN scm_print_jobs j ON j.id = p.print_job_id
+                 WHERE p.batch_id = b.id
+                   AND p.netsuite_transfer_order_id IS NOT NULL
+                   AND (p.approval_status <> 'approved' OR COALESCE(j.status, '') <> 'printed')
+              ) AS all_created_transfers_printed,
+              (SELECT MAX(j.printed_at)
+                 FROM scm_transfer_dependency_proposals p
+                 JOIN scm_print_jobs j ON j.id = p.print_job_id
+                WHERE p.batch_id = b.id AND j.status = 'printed') AS last_printed_at
          FROM scm_transfer_dependency_batches b
         WHERE b.sales_order_id = ANY($1::bigint[])
         ORDER BY b.sales_order_id, b.updated_at DESC, b.id DESC`,
@@ -763,10 +790,18 @@ async function applyTransferDependencyReviews(orders = [], reviewStatus = "open"
       activeReview = false;
     }
     const batch = batches.get(String(order.salesOrderId));
-    const transferCompleted = ["created", "attention"].includes(batch?.status)
-      && batch?.has_created_transfer === true
+    const transferCreated = batch?.has_created_transfer === true;
+    const transferCompleted = transferCreated
+      && batch?.all_created_transfers_printed === true
       && number(order.uncoveredQuantity) <= EPSILON;
-    const completionType = activeReview ? "reviewed_no_transfer" : transferCompleted ? "transfer_created" : null;
+    const workflowStage = activeReview || transferCompleted ? "completed" : transferCreated ? "created" : "open";
+    const completionType = activeReview
+      ? "reviewed_no_transfer"
+      : transferCompleted
+        ? "transfer_approved_printed"
+        : transferCreated
+          ? "transfer_created"
+          : null;
     enriched.push({
       ...order,
       shortageSignature: signature,
@@ -775,14 +810,16 @@ async function applyTransferDependencyReviews(orders = [], reviewStatus = "open"
       reviewedBy: activeReview ? review.reviewed_by : null,
       completed: Boolean(completionType),
       completionType,
-      completedAt: activeReview ? review.reviewed_at : transferCompleted ? batch.updated_at : null,
-      dependencyBatchId: transferCompleted ? batch.batch_id : null
+      completedAt: activeReview ? review.reviewed_at : transferCompleted ? batch.last_printed_at || batch.updated_at : null,
+      workflowStage,
+      dependencyBatchId: transferCreated ? batch.batch_id : null
     });
   }
-  const normalizedStatus = ["reviewed", "completed", "all"].includes(reviewStatus) ? reviewStatus : "open";
-  if (["reviewed", "completed"].includes(normalizedStatus)) return enriched.filter((order) => order.completed);
+  const normalizedStatus = ["reviewed", "created", "completed", "all"].includes(reviewStatus) ? reviewStatus : "open";
+  if (["reviewed", "completed"].includes(normalizedStatus)) return enriched.filter((order) => order.workflowStage === "completed");
+  if (normalizedStatus === "created") return enriched.filter((order) => order.workflowStage === "created");
   if (normalizedStatus === "all") return enriched;
-  return enriched.filter((order) => !order.completed && number(order.uncoveredQuantity) > EPSILON);
+  return enriched.filter((order) => order.workflowStage === "open" && number(order.uncoveredQuantity) > EPSILON);
 }
 
 export async function listTransferDependencyCandidates({ search = "", salesOrderId = null, reviewStatus = "open" } = {}) {
@@ -1176,7 +1213,17 @@ export async function getTransferDependencyBatch(batchId) {
   );
   if (!header.rowCount) return null;
   const proposals = await query(
-    `SELECT * FROM scm_transfer_dependency_proposals WHERE batch_id = $1 ORDER BY id`,
+    `SELECT p.*,
+            j.status AS print_status,
+            j.document_name AS print_document_name,
+            j.queued_at AS print_queued_at,
+            j.started_at AS print_started_at,
+            j.printed_at AS print_printed_at,
+            j.last_error AS print_error
+       FROM scm_transfer_dependency_proposals p
+       LEFT JOIN scm_print_jobs j ON j.id = p.print_job_id
+      WHERE p.batch_id = $1
+      ORDER BY p.id`,
     [Number(batchId)]
   );
   const proposalIds = proposals.rows.map((row) => row.id);
@@ -1262,9 +1309,28 @@ export async function getTransferDependencyBatch(batchId) {
       palletItemId: proposal.pallet_item_id,
       palletItemName: proposal.pallet_item_name || "PALLET",
       creationStatus: proposal.creation_status,
+      creationAttemptId: proposal.creation_attempt_id,
+      creationStartedAt: proposal.creation_started_at,
       transferOrderId: proposal.netsuite_transfer_order_id,
       transferOrderRef: proposal.netsuite_transfer_order_ref,
       creationError: proposal.creation_error,
+      quantityVerificationStatus: proposal.quantity_verification_status || "pending",
+      quantityVerificationError: proposal.quantity_verification_error,
+      quantityVerifiedAt: proposal.quantity_verified_at,
+      quantityVerifiedBy: proposal.quantity_verified_by,
+      approvalStatus: proposal.approval_status || "pending",
+      approvalError: proposal.approval_error,
+      approvedAt: proposal.approved_at,
+      approvedBy: proposal.approved_by,
+      printJob: proposal.print_job_id ? {
+        id: Number(proposal.print_job_id),
+        status: proposal.print_status,
+        documentName: proposal.print_document_name,
+        queuedAt: proposal.print_queued_at,
+        startedAt: proposal.print_started_at,
+        printedAt: proposal.print_printed_at,
+        error: proposal.print_error
+      } : null,
       lines: byProposal.get(String(proposal.id)) || []
     }))
   };
@@ -1690,7 +1756,8 @@ export async function confirmTransferDependencyBatch(batchId, {
   operatorId = null,
   proposalId = null,
   createTransferOrder,
-  hydrateTransferOrder
+  hydrateTransferOrder,
+  findTransferOrder = null
 } = {}) {
   if (typeof createTransferOrder !== "function" || typeof hydrateTransferOrder !== "function") {
     throw new Error("NetSuite transfer-order transport is unavailable.");
@@ -1742,13 +1809,38 @@ export async function confirmTransferDependencyBatch(batchId, {
   for (const proposal of validation.pendingProposals) {
     let createdTransferOrderId = null;
     try {
-      await query(
-        `UPDATE scm_transfer_dependency_proposals
-            SET creation_status = 'creating', creation_error = null, updated_at = now()
-          WHERE id = $1`,
-        [proposal.id]
-      );
-      const created = await createTransferOrder({ proposal, batch });
+      let created = null;
+      if (["creating", "failed"].includes(proposal.creationStatus) && typeof findTransferOrder === "function") {
+        created = await findTransferOrder({ proposal, batch });
+      }
+      if (!created && proposal.creationStatus === "creating") {
+        const startedAt = new Date(proposal.creationStartedAt || 0).getTime();
+        const attemptAgeMs = Number.isFinite(startedAt) ? Date.now() - startedAt : 0;
+        if (attemptAgeMs < 3 * 60 * 1000) {
+          const error = new Error("This Transfer Order creation is still in progress. Wait a moment, then use Recover Transfer Order.");
+          error.status = 409;
+          throw error;
+        }
+      }
+      if (!created) {
+        const attemptId = crypto.randomUUID();
+        const claimableStatuses = proposal.creationStatus === "creating" ? ["creating"] : ["draft", "failed"];
+        const claimed = await query(
+          `UPDATE scm_transfer_dependency_proposals
+              SET creation_status = 'creating', creation_error = null,
+                  creation_attempt_id = $2, creation_started_at = now(), updated_at = now()
+            WHERE id = $1
+              AND creation_status = ANY($3::text[])
+            RETURNING id`,
+          [proposal.id, attemptId, claimableStatuses]
+        );
+        if (!claimed.rowCount) {
+          const error = new Error("This Transfer Order proposal was changed by another request. Refresh before retrying.");
+          error.status = 409;
+          throw error;
+        }
+        created = await createTransferOrder({ proposal, batch, attemptId });
+      }
       const transferOrderId = Number(created?.id);
       if (!Number.isInteger(transferOrderId) || transferOrderId <= 0) throw new Error("NetSuite did not return the created Transfer Order ID.");
       createdTransferOrderId = transferOrderId;
@@ -1776,8 +1868,10 @@ export async function confirmTransferDependencyBatch(batchId, {
         );
       }
       results.push({ proposalId: proposal.id, status: creationStatus, transferOrderId: transferOrder.id,
-        transferOrderRef: transferOrder.tranid, netsuiteStatus: transferOrder.statusText || transferOrder.status, error: statusMessage });
+        transferOrderRef: transferOrder.tranid, netsuiteStatus: transferOrder.statusText || transferOrder.status,
+        recovered: created?.recovered === true, error: statusMessage });
     } catch (error) {
+      if (error.status === 409) throw error;
       await query(
         `UPDATE scm_transfer_dependency_proposals
             SET creation_status = $3, creation_error = $2,
@@ -1850,9 +1944,9 @@ export async function createOrderDependency({
       throw error;
     }
     if (!transfer.rowCount) throw new Error("Transfer Order not found.");
-    const transferStatus = `${transfer.rows[0].status || ""} ${transfer.rows[0].status_text || ""}`.toLowerCase();
-    if (transfer.rows[0].netsuite_active === false || /cancel|closed/.test(transferStatus)) {
-      throw new Error(`${transferOrderRef} is cancelled or closed and cannot be linked.`);
+    const terminalStatus = terminalTransferOrderStatus(transfer.rows[0]);
+    if (transfer.rows[0].netsuite_active === false || terminalStatus) {
+      throw new Error(`${transferOrderRef} is ${terminalStatus || "inactive"} and cannot be linked.`);
     }
     if (String(transfer.rows[0].from_location_id || "") === String(transfer.rows[0].to_location_id || "")) {
       throw new Error(`${transferOrderRef} has the same source and destination yard.`);
@@ -2554,8 +2648,59 @@ export async function syncOrderDependenciesForTransferOrder(transferOrderId) {
           WHERE dl.dependency_id = $1`,
         [dependency.id]
       );
-      const statusText = `${dependency.transfer_status || ""} ${dependency.transfer_status_text || ""}`.toLowerCase();
-      const cancelled = dependency.transfer_active === false || /cancel|closed/.test(statusText);
+      const terminalStatus = terminalTransferOrderStatus(dependency);
+      const hasExecutionProgress = lines.rows.some((line) =>
+        number(line.loaded_quantity) > EPSILON
+        || number(line.delivered_quantity) > EPSILON
+        || number(line.locally_received_quantity) > EPSILON
+      );
+      const canAutoCancel = Boolean(terminalStatus)
+        && ["active", "attention"].includes(String(dependency.status || ""))
+        && !hasExecutionProgress;
+      if (canAutoCancel) {
+        const attentionReason = `${dependency.transfer_order_ref} was automatically unlinked because NetSuite marked it ${terminalStatus}.`;
+        await query(
+          `UPDATE order_dependencies
+              SET status = 'cancelled',
+                  attention_reason = $2,
+                  reconciliation_status = 'not_required',
+                  reconciled_at = null,
+                  updated_at = now()
+            WHERE id = $1`,
+          [dependency.id, attentionReason]
+        );
+        await writeDispatchAudit({
+          action: "dispatch.order_dependency.unlinked",
+          entityType: "order_dependency",
+          entityId: String(dependency.id),
+          orderId: dependency.dispatch_target_ref || dependency.sales_order_ref,
+          source: "netsuite_sync",
+          before: {
+            status: dependency.status,
+            reconciliationStatus: dependency.reconciliation_status
+          },
+          after: {
+            status: "cancelled",
+            reconciliationStatus: "not_required"
+          },
+          details: {
+            automatic: true,
+            transferOrderRef: dependency.transfer_order_ref,
+            transferStatus: dependency.transfer_status,
+            transferStatusText: dependency.transfer_status_text,
+            reason: attentionReason
+          }
+        });
+        results.push({
+          dependencyId: dependency.id,
+          cancelled: true,
+          attention: false,
+          attentionReason,
+          reconciled: false
+        });
+        continue;
+      }
+      const unavailable = dependency.transfer_active === false || Boolean(terminalStatus);
       const reduced = lines.rows.some((line) => {
         const available = line.outbound_quantity ?? line.receiving_quantity;
         return available === null || available === undefined || number(available) + EPSILON < number(line.allocated_quantity);
@@ -2564,11 +2709,13 @@ export async function syncOrderDependenciesForTransferOrder(transferOrderId) {
         number(line.netsuite_received_qty) + EPSILON >= number(line.allocated_quantity)
       );
       const beforeDelivery = !["delivered", "received_local"].includes(dependency.status);
-      const attention = beforeDelivery && (cancelled || reduced);
+      const attention = beforeDelivery && (unavailable || reduced);
       const replenishmentComplete = dependency.dependency_mode === "yard_replenishment"
         && ["received", "completed", "shipped"].includes(String(dependency.transfer_receiving_status || "").toLowerCase());
-      const attentionReason = cancelled
-        ? `${dependency.transfer_order_ref} was cancelled or closed in NetSuite.`
+      const attentionReason = terminalStatus
+        ? `${dependency.transfer_order_ref} is ${terminalStatus} in NetSuite and has already started or has execution progress that requires review.`
+        : dependency.transfer_active === false
+          ? `${dependency.transfer_order_ref} is no longer active in NetSuite.`
         : reduced
           ? `${dependency.transfer_order_ref} quantity is below its linked Sales Order allocation.`
           : null;

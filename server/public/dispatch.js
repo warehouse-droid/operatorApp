@@ -3,10 +3,66 @@ const t = (key, fallback) => window.MBBS_I18N?.t(key, fallback) || fallback;
 const languageToggle = () => window.MBBS_I18N?.toggleHtml() || "";
 const displayDate = (value) => window.MBBS_I18N?.displayDate(value) || "";
 const displayDateTime = (value) => window.MBBS_I18N?.displayDateTime(value) || "";
+const SALES_PLANNING_HOST = window.location.pathname.startsWith("/sales/");
+const DISPATCH_PLAN_CACHE_KEY = "mbbs.dispatch.plan";
+
+function dispatchStorageGet(key, fallback = null) {
+  // Dispatch plans are server-authoritative and can be larger than the browser's
+  // per-origin localStorage quota. Never hydrate a plan from this legacy cache.
+  if (key === DISPATCH_PLAN_CACHE_KEY) return fallback;
+  try {
+    const value = window.localStorage.getItem(key);
+    return value === null ? fallback : value;
+  } catch {
+    return fallback;
+  }
+}
+
+function dispatchStorageSet(key, value) {
+  // Older releases stored the complete plan under this key. Discard that cache
+  // instead of allowing a quota exception to interrupt load, save, or confirm.
+  if (key === DISPATCH_PLAN_CACHE_KEY) {
+    dispatchStorageRemove(key);
+    return false;
+  }
+  try {
+    window.localStorage.setItem(key, value);
+    return true;
+  } catch {
+    // The server is authoritative for dispatch plans. A full browser quota must
+    // never stop a read-only board from loading or a server save from running.
+    return false;
+  }
+}
+
+function dispatchStorageRemove(key) {
+  try {
+    window.localStorage.removeItem(key);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Free space consumed by plans written by older versions before any other
+// preference is persisted. The active plan is always loaded from the API.
+dispatchStorageRemove(DISPATCH_PLAN_CACHE_KEY);
+
 const DISPATCH_SESSION_KEY = "mbbs.dispatch.sessionId";
-const dispatchSessionStorage = window.sessionStorage || window.localStorage;
-const dispatchSessionId = dispatchSessionStorage.getItem(DISPATCH_SESSION_KEY) || `dispatch-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-dispatchSessionStorage.setItem(DISPATCH_SESSION_KEY, dispatchSessionId);
+
+function createDispatchSessionId() {
+  const generated = `dispatch-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  try {
+    const stored = window.sessionStorage?.getItem(DISPATCH_SESSION_KEY);
+    if (stored) return stored;
+    window.sessionStorage?.setItem(DISPATCH_SESSION_KEY, generated);
+  } catch {
+    // An in-memory ID is sufficient when browser storage is blocked.
+  }
+  return generated;
+}
+
+const dispatchSessionId = createDispatchSessionId();
 const DEFAULT_FIRST_LOAD_START = "07:00";
 
 const HUBS = {
@@ -393,7 +449,7 @@ let backgroundRouteRenderQueued = false;
 let backgroundRouteInFlight = new Set();
 let geocodeCache = {};
 let orderListScrollTop = 0;
-let loadPreviewWidth = Number(localStorage.getItem("mbbs.dispatch.previewWidth") || 520);
+let loadPreviewWidth = Number(dispatchStorageGet("mbbs.dispatch.previewWidth", "520"));
 let isResizingPreview = false;
 let lastServerSavedAt = "";
 let saveTimer = null;
@@ -421,9 +477,9 @@ let nextSaveNeedsOrderPoolRefresh = false;
 let nextPlanSaveMode = "";
 let plannedAssignmentRefs = new Set();
 const HISTORY_LIMIT = 80;
-const DISPATCH_PLAN_KEY = "mbbs.dispatch.plan";
+const DISPATCH_PLAN_KEY = DISPATCH_PLAN_CACHE_KEY;
 const DISPATCH_PLAN_DATE_KEY = "mbbs.dispatch.planDate";
-let currentPlanDate = localStorage.getItem(DISPATCH_PLAN_DATE_KEY) || todayLocalDate();
+let currentPlanDate = dispatchStorageGet(DISPATCH_PLAN_DATE_KEY, "") || todayLocalDate();
 let currentPlan = null;
 let planHistory = [];
 let planEditLease = null;
@@ -483,6 +539,10 @@ function leaveDispatchEditMode({ clearLease = false } = {}) {
 }
 
 async function refreshDispatchPlanEditLease(planDate = currentPlanDate) {
+  if (SALES_PLANNING_HOST) {
+    leaveDispatchEditMode({ clearLease: true });
+    return null;
+  }
   const response = await fetch(`/api/dispatch/plan-edit-lease?planDate=${encodeURIComponent(planDate)}`);
   if (!response.ok) throw new Error(await dispatchErrorMessage(response));
   const payload = await response.json();
@@ -554,7 +614,7 @@ async function releaseDispatchEditMode() {
 }
 
 function autosaveDebugEnabled() {
-  return localStorage.getItem("mbbs.dispatch.debugAutosave") === "1";
+  return dispatchStorageGet("mbbs.dispatch.debugAutosave", "") === "1";
 }
 
 function shortHash(value = "") {
@@ -863,6 +923,66 @@ function orderWeightLbs(order) {
   return Math.round(Number(order?.weight || 0));
 }
 
+function dropoffForStop(order = {}, stop = {}) {
+  const dropoffs = Array.isArray(order.dropoffs) ? order.dropoffs : [];
+  const key = String(stop.dropoffKey || "");
+  if (key) {
+    const exact = dropoffs.find((dropoff) => String(dropoff.key || "") === key);
+    if (exact) return exact;
+  }
+  const yard = String(stop.dropLocation || "");
+  if (yard) {
+    const exact = dropoffs.find((dropoff) => String(dropoff.destinationYard || "") === yard);
+    if (exact) return exact;
+  }
+  return dropoffs.length === 1 ? dropoffs[0] : null;
+}
+
+function dropItemsForStop(order = {}, stop = {}) {
+  const stopLineRowIds = Array.isArray(stop.lineRowIds) ? stop.lineRowIds.filter((value) => value !== null && value !== undefined && String(value) !== "") : [];
+  const dropoffLineRowIds = dropoffForStop(order, stop)?.lineRowIds || [];
+  const lineRowIds = new Set((stopLineRowIds.length ? stopLineRowIds : dropoffLineRowIds).map(String));
+  if (!lineRowIds.size) return (order.dropoffs || []).length > 1 ? [] : order.items || [];
+  return (order.items || []).filter((item) => lineRowIds.has(String(item.lineRowId)));
+}
+
+function dropWeightLbs(order = {}, stop = {}) {
+  const explicit = stop.dropWeight ?? dropoffForStop(order, stop)?.weight;
+  if (explicit !== undefined && explicit !== null && Number.isFinite(Number(explicit))) return Math.max(0, Math.round(Number(explicit)));
+  const itemWeight = dropItemsForStop(order, stop).reduce((sum, item) => {
+    const lineWeight = Number(item.lineWeight || 0);
+    return sum + (lineWeight || (Number(item.quantity || item.salesQty || 0) * Number(item.itemWeight || 0)));
+  }, 0);
+  if (itemWeight > 0) return Math.round(itemWeight);
+  return (order.dropoffs || []).length > 1 ? 0 : orderWeightLbs(order);
+}
+
+function dropPallets(order = {}, stop = {}) {
+  const explicit = stop.dropPallets ?? dropoffForStop(order, stop)?.pallets;
+  if (explicit !== undefined && explicit !== null && Number.isFinite(Number(explicit))) return Math.max(0, Number(explicit));
+  const itemPallets = dropItemsForStop(order, stop).reduce((sum, item) => sum + Number(item.pallets || 0), 0);
+  if (itemPallets > 0) return itemPallets;
+  return (order.dropoffs || []).length > 1 ? 0 : Number(order.pallets || 0);
+}
+
+function dropUnitText(order = {}, stop = {}) {
+  const dropoff = dropoffForStop(order, stop) || {};
+  const items = dropItemsForStop(order, stop);
+  const layers = Number(stop.dropLayers ?? dropoff.layers ?? items.reduce((sum, item) => sum + Number(item.layers || 0), 0));
+  return `${qtyText(dropPallets(order, stop))} PLT${layers ? ` ${qtyText(layers)} LYR` : ""}`;
+}
+
+function dropFootprintPallets(order = {}, stop = {}) {
+  const dropoff = dropoffForStop(order, stop) || {};
+  const items = dropItemsForStop(order, stop);
+  const pallets = dropPallets(order, stop);
+  const hasLoose = Number(stop.dropLayers ?? dropoff.layers ?? 0) > 0
+    || Number(stop.dropSections ?? dropoff.sections ?? 0) > 0
+    || Number(stop.dropPieces ?? dropoff.pieces ?? 0) > 0
+    || items.some((item) => Number(item.layers || 0) > 0 || Number(item.sections || 0) > 0 || Number(item.pieces || 0) > 0);
+  return pallets + (hasLoose ? 1 : 0);
+}
+
 function orderFootprintPallets(order) {
   return Number(order?.pallets || 0) + (Number(order?.layers || 0) > 0 ? 1 : 0);
 }
@@ -1145,7 +1265,8 @@ function itemHasQuantity(item = {}) {
     || Number(item.quantity || item.salesQty || 0);
 }
 
-function tooltipItemsForOrder(order, { pickupLocation = "" } = {}) {
+function tooltipItemsForOrder(order, { pickupLocation = "", stop = null } = {}) {
+  if (stop?.type === "drop") return dropItemsForStop(order, stop).filter(itemHasQuantity);
   if (pickupLocation && order?.type === "PO") {
     return (order.items || []).filter(itemHasQuantity);
   }
@@ -1160,7 +1281,7 @@ function tooltipItemsForOrder(order, { pickupLocation = "" } = {}) {
     .filter(itemHasQuantity);
 }
 
-function tooltipItemRowsForOrder(order, { pickupLocation = "", includeOrderHeader = false } = {}) {
+function tooltipItemRowsForOrder(order, { pickupLocation = "", stop = null, includeOrderHeader = false } = {}) {
   const directEntries = pickupLocation ? directPickupEntriesForLocation(order, pickupLocation) : [];
   if (directEntries.length && String(order.sourceYard || order.outboundLocation || "") !== String(pickupLocation || "")) {
     return directEntries.map((entry) => `
@@ -1198,7 +1319,7 @@ function tooltipItemRowsForOrder(order, { pickupLocation = "", includeOrderHeade
       `).join("")}
     `).join("");
   }
-  const rows = tooltipItemsForOrder(order, { pickupLocation }).map((item) => `
+  const rows = tooltipItemsForOrder(order, { pickupLocation, stop }).map((item) => `
     <div>
       <b>${escapeHtml(item.sku)}</b>
       <span>${escapeHtml(itemQtyText(item))}</span>
@@ -1476,7 +1597,13 @@ function applyPoLinkDefaultsForRef(orderRef, poRef) {
 }
 
 function movementText(order) {
-  if (order.type === "PO") return `${order.sourceYard || "Vendor yard"} to ${order.destinationYard || order.pickupLocations?.[0] || "our yard"}`;
+  if (order.type === "PO") {
+    const destinations = [...new Set((order.dropoffs || []).map((dropoff) => dropoff.destinationYard).filter(Boolean))];
+    const destinationText = destinations.length
+      ? destinations.join(" + ")
+      : order.destinationYard || order.pickupLocations?.[0] || "our yard";
+    return `${order.sourceYard || "Vendor yard"} to ${destinationText}`;
+  }
   if (order.type === "TO") return `${order.sourceYard || order.pickupLocations?.[0] || "source yard"} to ${order.destinationYard || "destination yard"}`;
   if (order.type === "CO") return `${order.sourceYard || order.pickupLocations?.[0] || "source yard"} to ${order.destinationYard || "transit depot"}`;
   return order.address;
@@ -1718,6 +1845,43 @@ function splitParentOrderId(order = {}) {
   return /-S\d+$/i.test(orderId) ? orderId.replace(/-S\d+$/i, "") : "";
 }
 
+function normalizePoDropoffs(order = {}, type = "", items = []) {
+  if (type !== "PO") return [];
+  const source = Array.isArray(order.dropoffs) && order.dropoffs.length
+    ? order.dropoffs
+    : (order.destinationYard || order.destinationLocationId || order.address)
+      ? [{
+          destinationLocationId: order.destinationLocationId || null,
+          destinationYard: order.destinationYard || "",
+          address: order.destinationAddress || order.address || "",
+          lineRowIds: items.map((item) => item.lineRowId).filter((value) => value !== undefined && value !== null),
+          pallets: order.pallets,
+          layers: order.layers,
+          salesQty: order.salesQty,
+          weight: order.weight
+        }]
+      : [];
+  return source.map((dropoff, index) => {
+    const destinationYard = String(dropoff.destinationYard || order.destinationYard || "").trim();
+    const destinationLocationId = dropoff.destinationLocationId ?? order.destinationLocationId ?? null;
+    const key = String(dropoff.key || (destinationLocationId ? `location:${destinationLocationId}` : `yard:${destinationYard.toLowerCase()}`) || `drop:${index}`);
+    return {
+      ...dropoff,
+      key,
+      destinationLocationId,
+      destinationYard,
+      address: dropoff.address || HUBS[destinationYard]?.address || order.destinationAddress || order.address || destinationYard,
+      lineRowIds: (dropoff.lineRowIds || []).map(String),
+      pallets: Number(dropoff.pallets || 0),
+      layers: Number(dropoff.layers || 0),
+      sections: Number(dropoff.sections || 0),
+      pieces: Number(dropoff.pieces || 0),
+      salesQty: Number(dropoff.salesQty || 0),
+      weight: Number(dropoff.weight || 0)
+    };
+  });
+}
+
 function normalizeOrder(order) {
   const id = String(order.id || "");
   const type = canonicalDispatchOrderType(order.type, id);
@@ -1737,6 +1901,7 @@ function normalizeOrder(order) {
         ? ["3445"]
         : [];
   const pickupLocations = order.transitCo?.toYard ? [order.transitCo.toYard] : basePickupLocations;
+  const dropoffs = normalizePoDropoffs(order, type, items);
   return {
     ...order,
     type,
@@ -1754,6 +1919,7 @@ function normalizeOrder(order) {
     salesQty: Number(order.salesQty || 0),
     weight: Number(order.weight || 0),
     pickupLocations,
+    dropoffs,
     childOrders: groupMembers.childOrders,
     childOrderDetails: groupMembers.childOrderDetails,
     groupAliases: groupMembers.groupAliases,
@@ -2846,7 +3012,6 @@ function applySavedPlan(saved) {
   lastSavedAt = saved.savedAt ? new Date(saved.savedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "";
   lastServerSavedAt = saved.savedAt || lastServerSavedAt;
   lastSavedPlanHash = savedPlanHash(saved);
-  localStorage.setItem(DISPATCH_PLAN_KEY, JSON.stringify(saved));
   return true;
 }
 
@@ -3012,7 +3177,6 @@ async function savePlanToServer(payload, { retryOnStale = true, forceSave = fals
     routeNotice = `Plan save failed: ${error.message}`;
     render({ save: false });
     return { failed: true, error };
-    // Local storage keeps the latest draft if the server is temporarily unavailable.
   }
 }
 
@@ -3058,7 +3222,6 @@ async function flushPlanSaveQueue() {
           continue;
         }
         lastSavedAt = savedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-        localStorage.setItem(DISPATCH_PLAN_KEY, JSON.stringify(payload));
         const result = await savePlanToServer(payload, { retryOnStale: staleRetryCount < 1 });
         if (result?.staleRetryQueued) {
           autosaveDebug("flushPlanSaveQueue:staleRetryQueued", { staleRetryCount });
@@ -3235,7 +3398,6 @@ function autoSavePlan() {
     return;
   }
   lastSavedAt = savedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-  localStorage.setItem(DISPATCH_PLAN_KEY, JSON.stringify(payload));
   queueServerSave();
 }
 
@@ -3305,24 +3467,29 @@ async function confirmCurrentPlanAtomic() {
       })
     });
     if (!response.ok) throw new Error(await dispatchErrorMessage(response));
-    const plan = await response.json();
-    currentPlan = plan;
-    currentPlanDate = plan.planDate || currentPlanDate;
-    localStorage.setItem(DISPATCH_PLAN_DATE_KEY, currentPlanDate);
-    applySavedPlan(plan);
-    await loadPlanHistory();
-    lastServerSavedAt = plan.savedAt || plan.updatedAt || lastServerSavedAt;
-    lastSavedPlanHash = savedPlanHash(plan);
-    lastSavedAt = savedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-    localStorage.setItem(DISPATCH_PLAN_KEY, JSON.stringify(plan));
-    saveQueued = false;
-    nextSaveNeedsOrderPoolRefresh = false;
-    nextPlanSaveMode = "";
-    pendingOperatorAlertRefs.clear();
-    resetLocalPlanDirty();
-    resetUndoHistory();
-    minimumPlanRevisionToApply = Number(plan.revision || 0);
-    return plan;
+    try {
+      const plan = await response.json();
+      currentPlan = plan;
+      currentPlanDate = plan.planDate || currentPlanDate;
+      dispatchStorageSet(DISPATCH_PLAN_DATE_KEY, currentPlanDate);
+      applySavedPlan(plan);
+      await loadPlanHistory();
+      lastServerSavedAt = plan.savedAt || plan.updatedAt || lastServerSavedAt;
+      lastSavedPlanHash = savedPlanHash(plan);
+      lastSavedAt = savedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+      saveQueued = false;
+      nextSaveNeedsOrderPoolRefresh = false;
+      nextPlanSaveMode = "";
+      pendingOperatorAlertRefs.clear();
+      resetLocalPlanDirty();
+      resetUndoHistory();
+      minimumPlanRevisionToApply = Number(plan.revision || 0);
+      return plan;
+    } catch (error) {
+      const refreshError = new Error(`Plan confirmation succeeded on the server, but this screen could not refresh: ${error.message}. Reload the plan before retrying.`);
+      refreshError.code = "DISPATCH_CONFIRM_REFRESH_FAILED";
+      throw refreshError;
+    }
   } finally {
     confirmInFlight = false;
   }
@@ -3353,15 +3520,6 @@ function commitPlanMutation(actionName = "dispatch_plan_mutation", mutator = nul
   return planChanged;
 }
 
-function restoreSavedPlan() {
-  try {
-    const saved = JSON.parse(localStorage.getItem(DISPATCH_PLAN_KEY) || "null");
-    applySavedPlan(saved);
-  } catch {
-    localStorage.removeItem(DISPATCH_PLAN_KEY);
-  }
-}
-
 async function loadPlanHistory() {
   try {
     const response = await fetch("/api/dispatch/plans?limit=80");
@@ -3390,7 +3548,7 @@ async function createPlanForDate(planDate = currentPlanDate) {
   const plan = await response.json();
   currentPlan = plan;
   currentPlanDate = plan.planDate || planDate;
-  localStorage.setItem(DISPATCH_PLAN_DATE_KEY, currentPlanDate);
+  dispatchStorageSet(DISPATCH_PLAN_DATE_KEY, currentPlanDate);
   await loadPlanHistory();
   return plan;
 }
@@ -3408,7 +3566,7 @@ function resetPlanningBoard() {
 async function resetDispatchAfterOrderDataClear() {
   clearTimeout(saveTimer);
   clearTimeout(remoteRefreshTimer);
-  localStorage.removeItem(DISPATCH_PLAN_KEY);
+  dispatchStorageRemove(DISPATCH_PLAN_KEY);
   currentPlan = null;
   lastSavedAt = "";
   lastServerSavedAt = "";
@@ -3439,7 +3597,7 @@ async function loadPlanForDate(planDate = currentPlanDate, { createIfMissing = t
   }
   currentPlan = plan?.id ? plan : null;
   currentPlanDate = plan?.planDate || planDate;
-  localStorage.setItem(DISPATCH_PLAN_DATE_KEY, currentPlanDate);
+  dispatchStorageSet(DISPATCH_PLAN_DATE_KEY, currentPlanDate);
   // Lease status controls editing only. A transient read failure must not prevent
   // the read-only planning board from rendering.
   try {
@@ -3477,7 +3635,7 @@ async function loadPlanById(planId) {
   const plan = await response.json();
   currentPlan = plan;
   currentPlanDate = plan.planDate || currentPlanDate;
-  localStorage.setItem(DISPATCH_PLAN_DATE_KEY, currentPlanDate);
+  dispatchStorageSet(DISPATCH_PLAN_DATE_KEY, currentPlanDate);
   leaveDispatchEditMode();
   try {
     await refreshDispatchPlanEditLease(currentPlanDate);
@@ -3946,10 +4104,10 @@ function fallbackTravelMinutesBetweenStops(truck, previousStop, currentStop, pre
   if (!previousStop) return 0;
   const previousLocation = previousStop.type === "pick"
     ? previousStop.location
-    : previousOrder?.destinationYard || previousOrder?.address || "";
+    : dropLocationForStop(previousStop, previousOrder) || previousOrder?.address || "";
   const currentLocation = currentStop.type === "pick"
     ? currentStop.location
-    : currentOrder?.destinationYard || currentOrder?.address || "";
+    : dropLocationForStop(currentStop, currentOrder) || currentOrder?.address || "";
   let value = 30;
   if (HUBS[previousLocation] && HUBS[currentLocation]) value = yardTravelMinutes(previousLocation, currentLocation);
   else if (currentStop.type === "drop") value = Number(currentOrder?.travelMinutes || 30);
@@ -4010,6 +4168,14 @@ function loadStats(truck, load) {
   const pickedLocations = new Set();
   const onboardOrderIds = new Set();
   const droppedOrderIds = new Set();
+  const remainingDropCounts = new Map();
+  for (const stop of load.stops) {
+    if (stop.type !== "drop" || !stop.orderId) continue;
+    remainingDropCounts.set(
+      String(stop.orderId),
+      Number(remainingDropCounts.get(String(stop.orderId)) || 0) + 1
+    );
+  }
   const explicitPickCount = load.stops.filter((stop) => stop.type === "pick").length;
   if (!explicitPickCount) {
     for (const location of uniquePickupLocations(load, truck)) {
@@ -4037,13 +4203,16 @@ function loadStats(truck, load) {
     if (stop.type === "pick") {
       pickedLocations.add(String(stop.location));
       let pickedFootprint = 0;
+      const pickedOrderIdsAtLocation = new Set();
       for (const dropStop of load.stops) {
         if (dropStop.type !== "drop" || droppedOrderIds.has(dropStop.orderId)) continue;
+        if (pickedOrderIdsAtLocation.has(String(dropStop.orderId))) continue;
         const dropOrder = stopOrder(dropStop);
         if (!dropOrder) continue;
         if (!requiredPickupLocations(dropOrder).map(String).includes(String(stop.location))) continue;
         currentWeightLbs += pickupWeightForOrderLocation(dropOrder, stop.location);
         pickedFootprint += pickupFootprintForOrderLocation(dropOrder, stop.location);
+        pickedOrderIdsAtLocation.add(String(dropStop.orderId));
         onboardOrderIds.add(dropStop.orderId);
         peakWeightLbs = Math.max(peakWeightLbs, currentWeightLbs);
       }
@@ -4066,14 +4235,20 @@ function loadStats(truck, load) {
     }
     const missingPickupLocations = requiredPickupLocations(order).filter((location) => !pickedLocations.has(String(location)));
     const arrival = current;
-    current += truckStopMinutes(truck, stopServiceType(stop, order), orderFootprintPallets(order));
-    palletTotal += Number(order.pallets || 0);
-    footprintTotal += orderFootprintPallets(order);
-    processedWeightLbs += orderWeightLbs(order);
+    const dropFootprint = dropFootprintPallets(order, stop);
+    const dropWeight = dropWeightLbs(order, stop);
+    current += truckStopMinutes(truck, stopServiceType(stop, order), dropFootprint);
+    palletTotal += dropPallets(order, stop);
+    footprintTotal += dropFootprint;
+    processedWeightLbs += dropWeight;
     if (onboardOrderIds.has(order.id)) {
-      currentWeightLbs = Math.max(0, currentWeightLbs - orderWeightLbs(order));
-      onboardOrderIds.delete(order.id);
-      droppedOrderIds.add(order.id);
+      currentWeightLbs = Math.max(0, currentWeightLbs - dropWeight);
+      const remainingDrops = Math.max(Number(remainingDropCounts.get(String(order.id)) || 1) - 1, 0);
+      remainingDropCounts.set(String(order.id), remainingDrops);
+      if (!remainingDrops) {
+        onboardOrderIds.delete(order.id);
+        droppedOrderIds.add(order.id);
+      }
     }
     travelTotal += Number(routeLegMinutes[Math.max(routeLegIndex - 1, 0)] ?? order.travelMinutes ?? 0);
     let warningReason = "";
@@ -4537,7 +4712,10 @@ function mapPins() {
       const hub = HUBS[place?.key] || HUBS[truck?.base] || { x: 50, y: 50 };
       pins.push({ label: String(index + 1), className: "pick", x: hub.x, y: hub.y });
     } else {
-      pins.push({ label: `${index + 1}`, className: "", x: order.x, y: order.y });
+      const destination = dropLocationForStop(stop, order);
+      const hub = HUBS[destination];
+      if (hub) pins.push({ label: `${index + 1}`, className: "", x: hub.x, y: hub.y });
+      else pins.push({ label: `${index + 1}`, className: "", x: order.x, y: order.y });
     }
   });
   return pins;
@@ -4575,6 +4753,25 @@ function fallbackPositionForAddress(address, order) {
   const text = normalizedPlaceKey(address);
   if (text && text === normalizedPlaceKey(order?.address)) return orderPosition(order);
   return MAP_CENTER;
+}
+
+function dropLocationForStop(stop = {}, order = {}) {
+  return String(stop.dropLocation || dropoffForStop(order, stop)?.destinationYard || order?.destinationYard || "").trim();
+}
+
+function dropAddressForStop(stop = {}, order = {}) {
+  const location = dropLocationForStop(stop, order);
+  return stop.dropAddress
+    || dropoffForStop(order, stop)?.address
+    || HUBS[location]?.address
+    || order?.destinationAddress
+    || order?.address
+    || location;
+}
+
+function dropStopLabel(stop = {}, order = {}) {
+  const location = dropLocationForStop(stop, order);
+  return location ? `${order?.id || stop.orderId || "Drop"} · ${location}` : order?.id || stop.orderId || "Drop";
 }
 
 function resolveStopPlace(stop, order) {
@@ -4619,13 +4816,14 @@ function resolveStopPlace(stop, order) {
       lng: position.lng
     };
   }
-  const destinationPlace = order?.destinationYard ? placeForLocation(order.destinationYard, order) : null;
-  const address = destinationPlace?.address || order?.address || hubAddress("3445");
+  const destinationYard = dropLocationForStop(stop, order);
+  const destinationPlace = destinationYard ? placeForLocation(destinationYard, order) : null;
+  const address = dropAddressForStop(stop, order) || destinationPlace?.address || hubAddress("3445");
   const position = placePosition(destinationPlace) || fallbackPositionForAddress(address, order);
   return {
     kind: destinationPlace?.kind || "delivery",
-    key: destinationPlace?.key || order?.id || address,
-    label: destinationPlace?.label || order?.id || "Drop off",
+    key: destinationPlace?.key || destinationYard || order?.id || address,
+    label: destinationPlace?.label || destinationYard || order?.id || "Drop off",
     address,
     routeLocation: address || position,
     lat: position.lat,
@@ -4635,7 +4833,8 @@ function resolveStopPlace(stop, order) {
 
 function stopIsOwnYard(stop, order) {
   if (stop.type === "pick") return placeForLocation(stop.location, order)?.kind === "own";
-  return Boolean(order?.destinationYard && placeForLocation(order.destinationYard, order)?.kind === "own");
+  const destinationYard = dropLocationForStop(stop, order);
+  return Boolean(destinationYard && placeForLocation(destinationYard, order)?.kind === "own");
 }
 
 function stopServiceType(stop, order) {
@@ -4652,7 +4851,7 @@ function stopTimeWindow(stop, order) {
 }
 
 function stopStayMinutes(stop, order, truck) {
-  return truckStopMinutes(truck, stopServiceType(stop, order), orderFootprintPallets(order));
+  return truckStopMinutes(truck, stopServiceType(stop, order), stop.type === "drop" ? dropFootprintPallets(order, stop) : orderFootprintPallets(order));
 }
 
 function stopPosition(stop, order) {
@@ -4728,7 +4927,7 @@ function mapStopsForLoad(load, truck) {
       address,
       routeLocation: routeLocationForStop(stop, order, position, address),
       label: String(sequence),
-      title: stop.type === "pick" ? `${sequence}. Pickup ${stop.location}` : `${sequence}. Drop ${order.id}`,
+      title: stop.type === "pick" ? `${sequence}. Pickup ${stop.location}` : `${sequence}. Drop ${dropStopLabel(stop, order)}`,
       type: stop.type,
       stayMinutes: stop.type === "pick"
         ? truckStopMinutes(truck, stopServiceType(stop, order), pickupFootprintForLocation(load, stop.location))
@@ -4754,7 +4953,7 @@ function routeSignature(stops) {
 
 function loadPersistedRouteEstimateCache() {
   try {
-    return JSON.parse(localStorage.getItem("mbbs.dispatch.routeEstimates.v1") || "{}") || {};
+    return JSON.parse(dispatchStorageGet("mbbs.dispatch.routeEstimates.v1", "{}") || "{}") || {};
   } catch {
     return {};
   }
@@ -4766,7 +4965,7 @@ function savePersistedRouteEstimateCache() {
     .slice(0, 350);
   persistedRouteEstimateCache = Object.fromEntries(entries);
   try {
-    localStorage.setItem("mbbs.dispatch.routeEstimates.v1", JSON.stringify(persistedRouteEstimateCache));
+    dispatchStorageSet("mbbs.dispatch.routeEstimates.v1", JSON.stringify(persistedRouteEstimateCache));
   } catch {
     // Local storage can be full or unavailable; in-memory estimates still work for this page.
   }
@@ -5212,6 +5411,9 @@ function planBadgeText() {
 }
 
 function planModeControlHtml() {
+  if (SALES_PLANNING_HOST) {
+    return `<span class="dispatch-mode-pill viewing">Sales view only</span>`;
+  }
   if (isDispatchPlanEditor()) {
     return `
       <span class="dispatch-mode-pill editing">Edit mode</span>
@@ -5317,7 +5519,7 @@ function render(options = {}) {
         </div>
         <div class="topbar-language">${languageToggle()}</div>
         <div class="topbar-actions">
-          <button onclick="location.href='/dispatch'" type="button">${t("common.menu", "Menu")}</button>
+          <button onclick="location.href='${SALES_PLANNING_HOST ? "/sales" : "/dispatch"}'" type="button">${t("common.menu", "Menu")}</button>
           <button data-action="undo-plan" ${undoStack.length && isDispatchPlanEditor() ? "" : "disabled"} title="Undo (Ctrl+Z)" type="button">${t("dispatch.undo", "Undo")}</button>
           <button data-action="redo-plan" ${redoStack.length && isDispatchPlanEditor() ? "" : "disabled"} title="Redo (Ctrl+Y)" type="button">${t("dispatch.redo", "Redo")}</button>
           <button data-action="export-shipped-csv" ${currentPlan?.id ? "" : "disabled"} type="button">${t("dispatch.exportShippedCsv", "Export Shipped CSV")}</button>
@@ -5640,7 +5842,7 @@ function renderStop(truck, load, stop, index, row) {
     <article class="stop-card compact status-${executionStatus} ${isPick ? "pick" : ""} ${selectedOrderId === order.id ? "selected-order-stop" : ""} ${showWarning ? "warning" : ""}" draggable="true" data-load="${stop.loadId}" data-stop="${stop.id}" data-order="${order.id}" data-index="${index}">
       <button class="stop-remove" data-action="remove-stop" data-stop="${stop.id}" ${removalLocked ? "disabled" : ""} title="${removalLocked ? escapeHtml(stopActivityLockNotice(stop)) : "Remove stop"}" type="button">x</button>
       <div class="stop-main">
-        <strong>${index + 1}. ${isPick ? `Pickup ${stop.location}` : order.id}</strong>
+        <strong>${index + 1}. ${escapeHtml(isPick ? `Pickup ${stop.location}` : dropStopLabel(stop, order))}</strong>
         <span>${escapeHtml(stopAddress(stop, order))}</span>
       </div>
       <div class="stop-time">${timingSummaryHtml({
@@ -5691,7 +5893,7 @@ function renderLoadTimingDetails(truck, load, stats) {
     if (!order || !row) continue;
     const record = driverRecordForStop(truck, load, stop);
     rows.push(timingDetailHtml({
-      title: stop.type === "pick" ? `Pickup ${stop.location}` : `Drop ${order.id}`,
+      title: stop.type === "pick" ? `Pickup ${stop.location}` : `Drop ${dropStopLabel(stop, order)}`,
       plannedStart: row.arrival || 0,
       plannedEnd: row.depart || row.arrival || 0,
       actualStart: recordStartedAt(record),
@@ -5834,7 +6036,7 @@ function renderPreviewStartTravelStop(truck, load, startTravel, start, displayOf
 function renderPreviewStop(truck, load, stop, index, row, displayIndex = index) {
   const order = stopOrder(stop);
   if (!order) return "";
-  const label = stop.type === "pick" ? `${displayIndex + 1}. Pickup | ${stop.location}` : `${displayIndex + 1}. Drop | ${order.id}`;
+  const label = stop.type === "pick" ? `${displayIndex + 1}. Pickup | ${stop.location}` : `${displayIndex + 1}. Drop | ${dropStopLabel(stop, order)}`;
   const sub = stopAddress(stop, order);
   const executionStatus = stopExecutionStatus(truck, load, stop);
   const record = driverRecordForStop(truck, load, stop);
@@ -6677,7 +6879,58 @@ function googleMapsUrl() {
   return `https://www.google.com/maps/dir/?${params.toString()}`;
 }
 
-function addOrderToLoad(orderId, loadId, type = "drop", location = "", insertIndex = null) {
+function poDropStopDetails(dropoff = {}) {
+  return {
+    dropoffKey: String(dropoff.key || ""),
+    dropLocation: String(dropoff.destinationYard || ""),
+    dropAddress: String(dropoff.address || ""),
+    destinationLocationId: dropoff.destinationLocationId ?? null,
+    lineRowIds: (dropoff.lineRowIds || []).map(String),
+    dropPallets: Number(dropoff.pallets || 0),
+    dropLayers: Number(dropoff.layers || 0),
+    dropSections: Number(dropoff.sections || 0),
+    dropPieces: Number(dropoff.pieces || 0),
+    dropSalesQty: Number(dropoff.salesQty || 0),
+    dropWeight: Number(dropoff.weight || 0)
+  };
+}
+
+function addPoDropoffsToLoad(order, loadId, insertIndex = null) {
+  const { load } = findLoad(loadId);
+  const dropoffs = Array.isArray(order?.dropoffs) ? order.dropoffs : [];
+  if (!load || !dropoffs.length) return false;
+  const beforeStops = (load.stops || []).map((stop) => ({ ...stop }));
+  const beforeNotice = routeNotice;
+  let nextInsertIndex = Number.isInteger(insertIndex) ? insertIndex : null;
+  for (const dropoff of dropoffs) {
+    const beforeLength = load.stops.length;
+    const added = addOrderToLoad(
+      order.id,
+      loadId,
+      "drop",
+      "",
+      nextInsertIndex,
+      poDropStopDetails(dropoff)
+    );
+    if (!added) {
+      load.stops = beforeStops;
+      selectedOrderId = order.id;
+      selectedOrderIds = new Set([order.id]);
+      routeNotice = routeNotice || `${order.id} could not add every destination drop.`;
+      return false;
+    }
+    if (Number.isInteger(nextInsertIndex)) {
+      nextInsertIndex += Math.max(load.stops.length - beforeLength, 1);
+    }
+  }
+  selectedOrderId = order.id;
+  selectedOrderIds = new Set([order.id]);
+  selectedLoadId = loadId;
+  routeNotice = beforeNotice;
+  return true;
+}
+
+function addOrderToLoad(orderId, loadId, type = "drop", location = "", insertIndex = null, stopDetails = {}) {
   const { truck, load } = findLoad(loadId);
   const order = orderById(orderId);
   if (!load || !order) return false;
@@ -6693,6 +6946,9 @@ function addOrderToLoad(orderId, loadId, type = "drop", location = "", insertInd
   }
   if (type === "drop" && isScmGroupedPoOrder(order)) {
     return addScmGroupedPoToLoad(order, loadId, insertIndex);
+  }
+  if (type === "drop" && order.type === "PO" && !stopDetails.dropoffKey && order.dropoffs?.length) {
+    return addPoDropoffsToLoad(order, loadId, insertIndex);
   }
   const dependencyTimingMessage = type === "drop"
     ? replenishmentPlacementBlockMessage(order, truck, load, insertIndex)
@@ -6725,7 +6981,7 @@ function addOrderToLoad(orderId, loadId, type = "drop", location = "", insertInd
     if (["SO", "TO"].includes(order.type)) pendingOperatorAlertRefs.add(order.id);
   }
   const stopLocation = location || order.pickupLocations[0] || "3445";
-  const existing = pullExistingStop(orderId, type, stopLocation);
+  const existing = pullExistingStop(orderId, type, stopLocation, stopDetails);
   if (existing?.locked) {
     if (existing.load.id !== load.id) {
       routeNotice = stopActivityLockNotice(existing.stop);
@@ -6743,6 +6999,7 @@ function addOrderToLoad(orderId, loadId, type = "drop", location = "", insertInd
     location: stopLocation
   };
   stop.loadId = load.id;
+  Object.assign(stop, stopDetails);
   if (Number.isInteger(cleanInsertIndex)) load.stops.splice(Math.max(0, cleanInsertIndex - (sameLoadMove ? 1 : 0)), 0, stop);
   else load.stops.push(stop);
   if (type === "drop") {
@@ -6770,6 +7027,8 @@ function addOrderToLoad(orderId, loadId, type = "drop", location = "", insertInd
     details: {
       stopType: type,
       location: stopLocation,
+      dropLocation: stop.dropLocation || "",
+      dropoffKey: stop.dropoffKey || "",
       insertIndex: cleanInsertIndex,
       movedFromLoadId: existing?.load?.id || null,
       order: summarizeOrder(order)
@@ -6778,12 +7037,21 @@ function addOrderToLoad(orderId, loadId, type = "drop", location = "", insertInd
   return true;
 }
 
-function pullExistingStop(orderId, type, location) {
+function pullExistingStop(orderId, type, location, stopDetails = {}) {
   for (const truck of trucks) {
     for (const load of truck.loads) {
       const index = load.stops.findIndex((stop) => {
         if (stop.orderId !== orderId || stop.type !== type) return false;
-        return type !== "pick" || String(stop.location) === String(location);
+        if (type === "pick") return String(stop.location) === String(location);
+        if (!stopDetails.dropoffKey) return true;
+        if (String(stop.dropoffKey || "") === String(stopDetails.dropoffKey)) return true;
+        if (stop.dropLocation && String(stop.dropLocation) === String(stopDetails.dropLocation || "")) return true;
+        if (!stop.dropoffKey && !stop.dropLocation) {
+          const order = orderById(orderId);
+          const dropoffs = Array.isArray(order?.dropoffs) ? order.dropoffs : [];
+          return dropoffs.length <= 1 || String(dropoffs[0]?.key || "") === String(stopDetails.dropoffKey);
+        }
+        return false;
       });
       if (index >= 0) {
         const found = { truck, load, stops: load.stops, stop: load.stops[index], index };
@@ -7567,7 +7835,7 @@ function movePreviewResize(event) {
   if (!isResizingPreview) return;
   const maxWidth = Math.round(window.innerWidth * 0.92);
   loadPreviewWidth = Math.min(Math.max(window.innerWidth - event.clientX, 390), maxWidth);
-  localStorage.setItem("mbbs.dispatch.previewWidth", String(loadPreviewWidth));
+  dispatchStorageSet("mbbs.dispatch.previewWidth", String(loadPreviewWidth));
   const panel = document.querySelector(".load-preview-panel");
   if (panel) panel.style.width = `${loadPreviewWidth}px`;
 }
@@ -8086,7 +8354,9 @@ app.addEventListener("click", (event) => {
       routeNotice = `Plan ${displayDate(plan.planDate)} confirmed.`;
       render({ save: false });
     }).catch((error) => {
-      routeNotice = `Confirm failed: ${error.message}`;
+      routeNotice = error.code === "DISPATCH_CONFIRM_REFRESH_FAILED"
+        ? error.message
+        : `Confirm failed: ${error.message}`;
       render({ save: false });
     });
     return;
@@ -8102,7 +8372,7 @@ app.addEventListener("click", (event) => {
     }).then(async (plan) => {
       currentPlan = plan;
       currentPlanDate = plan.planDate;
-      localStorage.setItem(DISPATCH_PLAN_DATE_KEY, currentPlanDate);
+      dispatchStorageSet(DISPATCH_PLAN_DATE_KEY, currentPlanDate);
       if (plan.orders?.length && plan.trucks?.length) applySavedPlan(plan);
       await loadPlanHistory();
       routeNotice = `Plan ${displayDate(plan.planDate)} opened for editing.`;
@@ -8693,6 +8963,8 @@ function showOrderTooltip(event) {
   const foundStop = stopCard ? findStop(stopCard.dataset.stop) : null;
   const stop = foundStop?.stop || null;
   const pickupLocation = stop?.type === "pick" ? stop.location : "";
+  const isDropStop = stop?.type === "drop";
+  const dropItems = isDropStop ? dropItemsForStop(order, stop).filter(itemHasQuantity) : [];
   const pickupOrders = pickupLocation && foundStop?.load ? pickupOrdersForStop(foundStop.load, stop) : [];
   let timingHtml = "";
   if (foundStop?.truck && foundStop?.load && stop) {
@@ -8700,7 +8972,7 @@ function showOrderTooltip(event) {
     const row = stats.rows[foundStop.index];
     const record = driverRecordForStop(foundStop.truck, foundStop.load, stop);
     timingHtml = timingDetailHtml({
-      title: stop.type === "pick" ? `Pickup ${stop.location}` : `Drop ${order.id}`,
+      title: stop.type === "pick" ? `Pickup ${stop.location}` : `Drop ${dropStopLabel(stop, order)}`,
       plannedStart: row?.arrival || 0,
       plannedEnd: row?.depart || row?.arrival || 0,
       actualStart: recordStartedAt(record),
@@ -8709,18 +8981,31 @@ function showOrderTooltip(event) {
   }
   const itemRows = pickupOrders.length
     ? pickupOrders.map((pickupOrder) => tooltipItemRowsForOrder(pickupOrder, { pickupLocation, includeOrderHeader: true })).join("")
-    : tooltipItemRowsForOrder(order, { pickupLocation });
-  const poPickupAddress = !pickupLocation && order.type === "PO" && order.sourceAddress
+    : tooltipItemRowsForOrder(order, { pickupLocation, stop });
+  const poPickupAddress = !pickupLocation && !isDropStop && order.type === "PO" && order.sourceAddress
     ? `<span>Pickup address: ${escapeHtml(order.sourceAddress)}</span>`
     : "";
+  const tooltipTitle = pickupLocation
+    ? `Pickup | ${escapeHtml(pickupLocation)}`
+    : isDropStop
+      ? `${escapeHtml(dropStopLabel(stop, order))} | ${escapeHtml(order.customer)}`
+      : `${order.id} | ${escapeHtml(order.customer)}`;
+  const tooltipAddress = pickupLocation
+    ? stopAddress(stop, pickupOrders[0] || order)
+    : isDropStop
+      ? stopAddress(stop, order)
+      : order.address;
+  const dropSummary = isDropStop
+    ? `${order.expectedDeliveryDate ? `${displayDate(order.expectedDeliveryDate)} | ` : ""}${dropItems.length} line${dropItems.length === 1 ? "" : "s"} | ${dropUnitText(order, stop)} | ${dropFootprintPallets(order, stop)} pos | ${formatLbs(dropWeightLbs(order, stop))} | ${order.windowStart || "--"}-${order.windowEnd || "--"}`
+    : "";
   tooltip.innerHTML = `
-    <strong>${pickupLocation ? `Pickup | ${escapeHtml(pickupLocation)}` : `${order.id} | ${escapeHtml(order.customer)}`}</strong>
-    <span>${escapeHtml(pickupLocation ? stopAddress(stop, pickupOrders[0] || order) : order.address)}</span>
+    <strong>${tooltipTitle}</strong>
+    <span>${escapeHtml(tooltipAddress)}</span>
     ${poPickupAddress}
     ${pickupLocation ? `<span>Pickup content: ${escapeHtml(pickupLocation)}</span>` : ""}
     ${pickupLocation
       ? `<span>${pickupOrders.length} order${pickupOrders.length === 1 ? "" : "s"} at this pickup stop.</span>`
-      : `<span>${order.expectedDeliveryDate ? `${displayDate(order.expectedDeliveryDate)} | ` : ""}${orderUnitText(order)} | ${orderFootprintPallets(order)} pos | ${formatLbs(orderWeightLbs(order))} | ${order.windowStart || "--"}-${order.windowEnd || "--"}</span>`}
+      : `<span>${dropSummary || `${order.expectedDeliveryDate ? `${displayDate(order.expectedDeliveryDate)} | ` : ""}${orderUnitText(order)} | ${orderFootprintPallets(order)} pos | ${formatLbs(orderWeightLbs(order))} | ${order.windowStart || "--"}-${order.windowEnd || "--"}`}</span>`}
     ${!pickupLocation && order.consolidation ? `<span>Consolidate ${order.consolidation.shortageQty} from ${order.consolidation.sourceYard} to ${order.consolidation.targetYard}</span>` : ""}
     ${!pickupLocation && order.transitCo ? `<span>Requires ${order.transitCo.id}: ${order.transitCo.fromYard} to ${order.transitCo.toYard}</span>` : ""}
     ${!pickupLocation && order.type === "CO" ? `<span>Local CO for ${escapeHtml(order.sourceOrderId || order.relatedSoId || "")}</span>` : ""}
@@ -9070,5 +9355,6 @@ window.addEventListener("pagehide", () => {
 
 requireDispatchLogin({
   mount: app,
+  roles: SALES_PLANNING_HOST ? ["sales", "admin"] : ["dispatcher", "admin"],
   onReady: initDispatch
 });

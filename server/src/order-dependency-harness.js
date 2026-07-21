@@ -11,6 +11,7 @@ import {
   enrichDispatchOrdersWithDependencies,
   generateTransferDependencySuggestion,
   getDirectPickupDependencyExecutionBlock,
+  getOrderDependencyOptions,
   getSalesOrderDependencyExecutionBlock,
   listOrderDependencies,
   listTransferDependencyCandidates,
@@ -143,6 +144,7 @@ try {
       "The canonical 150 yard must match the sandbox 150WBS location alias.");
     const restPayload = buildTransferDependencyRestPayload({
       proposal: {
+        id: 99,
         memo: "Dependency payload fixture",
         palletItemId: 9999,
         palletTransferQuantity: 2,
@@ -180,6 +182,28 @@ try {
     check(palletPayloadLine?.custcol_pcs === 2,
       "The ancillary PALLET line must write its count to the NetSuite PCS column.",
       { palletPayloadLine });
+    check(restPayload.memo.includes("MBBS dependency batch 42 proposal 99"),
+      "Each NetSuite TO must carry a proposal-specific recovery marker.", { memo: restPayload.memo });
+    const zeroPalletPayload = buildTransferDependencyRestPayload({
+      proposal: {
+        id: 100,
+        memo: "Zero pallet dependency fixture",
+        palletItemId: 9999,
+        palletTransferQuantity: 0,
+        lines: [{ itemId: 1234, itemName: "Bulk Bag", proposedQuantity: 2 }]
+      },
+      batch: { id: 42, salesOrderRef: "SO-ZERO-PALLET" },
+      locations: {
+        source: { netsuiteLocationId: 1, subsidiaryId: 1 },
+        destination: { netsuiteLocationId: 15, subsidiaryId: 1 },
+        intercompany: false
+      }
+    });
+    check(zeroPalletPayload.item.items.length === 1
+      && zeroPalletPayload.item.items[0].item.id === "1234"
+      && zeroPalletPayload.item.items[0].quantity === 2,
+    "A manual PALLET quantity of zero must create a material-only TO payload without a zero-quantity PALLET line.",
+    { zeroPalletPayload });
 
     config.googleMapsApiKey = "";
     await query(
@@ -448,11 +472,32 @@ try {
     );
     await query("UPDATE order_dependency_lines SET allocated_quantity = 10 WHERE id = $1", [createdAllocation.rows[0].id]);
     await query("UPDATE scm_transfer_dependency_batches SET status = 'attention' WHERE id = $1", [batch.id]);
-    const completedAfterTransferCreation = await listTransferDependencyCandidates({ salesOrderId, reviewStatus: "completed" });
-    check(completedAfterTransferCreation.length === 1
-      && completedAfterTransferCreation[0].completionType === "transfer_created",
-    "A fully allocated batch with a created NetSuite TO must appear in Completed even when its status needs attention.",
-    { completedAfterTransferCreation });
+    const createdAfterTransferCreation = await listTransferDependencyCandidates({ salesOrderId, reviewStatus: "created" });
+    check(createdAfterTransferCreation.length === 1
+      && createdAfterTransferCreation[0].completionType === "transfer_created",
+    "A created NetSuite TO must remain in Created until approval and source-yard printing are complete.",
+    { createdAfterTransferCreation });
+    const printedJob = await query(
+      `INSERT INTO scm_print_jobs (
+         job_key, location_id, document_type, document_name, document_path,
+         document_sha256, status, queued_at, started_at, printed_at
+       ) VALUES ($1, $2, 'transfer_dependency_picking_ticket', $3, $4, $5, 'printed', now(), now(), now())
+       RETURNING id`,
+      [`dependency-harness:${suffix}`, singleProposalResult.batch.proposals[0].fromLocationId,
+        `DEP-TO-${createdTransferIds[0]}.pdf`, `/tmp/dependency-harness-${suffix}.pdf`, String(suffix).padStart(64, "0").slice(0, 64)]
+    );
+    await query(
+      `UPDATE scm_transfer_dependency_proposals
+          SET quantity_verification_status = 'verified', approval_status = 'approved',
+              print_job_id = $2, approved_at = now()
+        WHERE id = $1`,
+      [singleProposalResult.batch.proposals[0].id, printedJob.rows[0].id]
+    );
+    const completedAfterPrint = await listTransferDependencyCandidates({ salesOrderId, reviewStatus: "completed" });
+    check(completedAfterPrint.length === 1
+      && completedAfterPrint[0].completionType === "transfer_approved_printed",
+    "A fully allocated TO must move to Completed only after approval and a confirmed printed job.",
+    { completedAfterPrint });
     await query("UPDATE order_dependency_lines SET allocated_quantity = $2 WHERE id = $1",
       [createdAllocation.rows[0].id, createdAllocation.rows[0].allocated_quantity]);
     await query("UPDATE scm_transfer_dependency_batches SET status = $2 WHERE id = $1", [batch.id, firstResult.batch.status]);
@@ -622,6 +667,85 @@ try {
     const restoredDependency = (await listOrderDependencies({ salesOrderRef }))[0];
     check(restoredSync[0]?.attention === false && restoredDependency.status === "active",
       "Corrected NetSuite TO quantity should clear attention and resume the dependency.", { restoredSync, restoredDependency });
+
+    const transferFixture = await query(
+      `SELECT netsuite_id AS id, tranid, trandate::text, from_location_id AS source_location_id,
+              from_location AS source_location, to_location_id AS destination_location_id,
+              to_location AS destination_location, memo
+         FROM transfer_orders
+        WHERE netsuite_id = $1`,
+      [dependency.transferOrderId]
+    );
+    const closedTransfer = {
+      ...transferFixture.rows[0],
+      status: "H",
+      status_text: "Closed"
+    };
+    await upsertOutboundTransferOrders([closedTransfer]);
+    const closedDependencies = await listOrderDependencies({ salesOrderRef, includeCancelled: true });
+    const closedDependency = closedDependencies.find((row) => String(row.id) === String(dependency.id));
+    check(closedDependency?.status === "cancelled",
+      "A header-only NetSuite sync must automatically unlink a closed, unstarted TO dependency.", { closedDependency });
+    check((await listOrderDependencies({ salesOrderRef })).every((row) => String(row.id) !== String(dependency.id)),
+      "An automatically cancelled dependency must no longer be returned as an active SO link.");
+    const automaticAudit = await query(
+      `SELECT COUNT(*)::int AS count
+         FROM dispatch_audit_log
+        WHERE action = 'dispatch.order_dependency.unlinked'
+          AND source = 'netsuite_sync'
+          AND entity_id = $1
+          AND details @> '{"automatic": true}'::jsonb`,
+      [String(dependency.id)]
+    );
+    check(automaticAudit.rows[0].count === 1,
+      "Automatic closed-TO unlink must write exactly one audit event.", { automaticAudit: automaticAudit.rows[0] });
+    check((await syncOrderDependenciesForTransferOrder(dependency.transferOrderId)).length === 0,
+      "Repeated closed-TO synchronization must be idempotent after the dependency is cancelled.");
+    const closedOptions = await getOrderDependencyOptions({
+      salesOrderRef,
+      transferOrderRef: dependency.transferOrderRef,
+      planDate: "2097-07-13"
+    });
+    check(closedOptions.matchError.includes("cannot be linked")
+        && !closedOptions.transferOrders.some((row) => row.ref === dependency.transferOrderRef),
+      "Closed TOs must be excluded from dependency choices and rejected when requested directly.", { closedOptions });
+
+    await query(
+      `UPDATE transfer_orders SET status = 'B', status_text = 'Pending Fulfillment' WHERE netsuite_id = $1`,
+      [dependency.transferOrderId]
+    );
+    await query(
+      `UPDATE order_dependencies
+          SET status = 'active', attention_reason = null,
+              reconciliation_status = 'pending', reconciled_at = null
+        WHERE id = $1`,
+      [dependency.id]
+    );
+    await query(
+      `UPDATE order_dependency_lines
+          SET loaded_quantity = CASE WHEN id = (
+            SELECT MIN(id) FROM order_dependency_lines WHERE dependency_id = $1
+          ) THEN 1 ELSE 0 END
+        WHERE dependency_id = $1`,
+      [dependency.id]
+    );
+    await upsertOutboundTransferOrders([closedTransfer]);
+    const progressedClosedDependency = (await listOrderDependencies({ salesOrderRef }))[0];
+    check(progressedClosedDependency?.status === "attention",
+      "A closed TO with execution progress must stay linked in attention for manual review.", { progressedClosedDependency });
+
+    await query(
+      `UPDATE transfer_orders SET status = 'B', status_text = 'Pending Fulfillment' WHERE netsuite_id = $1`,
+      [dependency.transferOrderId]
+    );
+    await query(
+      `UPDATE order_dependencies
+          SET status = 'active', attention_reason = null,
+              reconciliation_status = 'pending', reconciled_at = null
+        WHERE id = $1`,
+      [dependency.id]
+    );
+    await query("UPDATE order_dependency_lines SET loaded_quantity = 0 WHERE dependency_id = $1", [dependency.id]);
 
     const unloadedPickupBlock = await getDirectPickupDependencyExecutionBlock([dependency.transferOrderRef]);
     check(unloadedPickupBlock?.transferOrderRef === dependency.transferOrderRef,

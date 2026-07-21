@@ -1,0 +1,104 @@
+.route-rule-intro {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 16px;
+  align-items: end;
+}
+
+.route-rule-add {
+  display: flex;
+  gap: 8px;
+  align-items: end;
+}
+
+.route-rule-add .smart-field {
+  min-width: 230px;
+}
+
+.route-rule-grid {
+  display: grid;
+  gap: 14px;
+}
+
+.route-rule-card {
+  border: 1px solid var(--line, #d8dee8);
+  border-radius: 14px;
+  background: #fff;
+  overflow: hidden;
+}
+
+.route-rule-card-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 14px 16px;
+  background: #f7f9fc;
+  border-bottom: 1px solid var(--line, #d8dee8);
+}
+
+.route-rule-card-head h3,
+.route-rule-card-head p {
+  margin: 0;
+}
+
+.route-rule-card-head p {
+  margin-top: 3px;
+  color: #637083;
+  font-size: 12px;
+}
+
+.route-rule-fields {
+  display: grid;
+  grid-template-columns: 130px repeat(4, minmax(105px, 1fr));
+  gap: 10px;
+  padding: 14px 16px;
+  align-items: end;
+}
+
+.route-rule-options {
+  display: grid;
+  grid-template-columns: minmax(260px, 1.3fr) minmax(150px, .7fr) minmax(220px, 1fr);
+  gap: 12px;
+  padding: 0 16px 14px;
+  align-items: end;
+}
+
+.route-rule-notes {
+  padding: 0 16px 14px;
+}
+
+.route-rule-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--line, #d8dee8);
+}
+
+.route-rule-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  min-height: 38px;
+  align-items: center;
+}
+
+.route-rule-checks label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 13px;
+}
+
+@media (max-width: 1000px) {
+  .route-rule-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .route-rule-options { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 680px) {
+  .route-rule-intro { grid-template-columns: 1fr; }
+  .route-rule-add { align-items: stretch; flex-direction: column; }
+  .route-rule-fields { grid-template-columns: 1fr; }
+  .route-rule-card-head, .route-rule-actions { align-items: flex-start; flex-direction: column; }
+}

@@ -187,18 +187,34 @@ function lastRoutedStop(load) {
   return null;
 }
 
+function dropLocationForStop(stop = {}, order = {}) {
+  return String(stop.dropLocation || order.destinationYard || order.address || order.id || stop.orderId || "");
+}
+
+function dropAddressForStop(stop = {}, order = {}) {
+  const location = dropLocationForStop(stop, order);
+  return String(
+    stop.dropAddress
+    || yardAddress(location)
+    || order.address
+    || order.dropAddress
+    || order.destinationYard
+    || location
+  );
+}
+
 function stopLocationLabel(plan, stop) {
   if (!stop) return "";
   if (stop.type === "pick") return String(stop.location || "");
   const order = orderByRef(plan, stop.orderId) || {};
-  return String(order.id || stop.orderId || "");
+  return dropLocationForStop(stop, order);
 }
 
 function stopAddressLabel(plan, stop) {
   if (!stop) return "";
   if (stop.type === "pick") return yardAddress(stop.location);
   const order = orderByRef(plan, stop.orderId) || {};
-  return order.address || order.dropAddress || order.destinationYard || order.id || stop.orderId || "";
+  return dropAddressForStop(stop, order);
 }
 
 function loadEndPoint(plan, truck, load) {
@@ -366,6 +382,8 @@ function buildJob(plan, truck, load, stop, truckIndex, loadIndex, stopIndex) {
     : stopOrderRefs;
   const orderRefs = [...new Set([...expandOrderRefs(plan, ordinaryStopRefs), ...directTransferRefs])];
   const firstOrder = orderByRef(plan, stopOrderRefs[0]) || orderByRef(plan, orderRefs[0]) || {};
+  const dropLocation = isPickup ? "" : dropLocationForStop(stop, firstOrder);
+  const dropAddress = isPickup ? "" : dropAddressForStop(stop, firstOrder);
   return {
     jobId: jobId(plan, truck, load, stop),
     planId: plan.id,
@@ -379,10 +397,14 @@ function buildJob(plan, truck, load, stop, truckIndex, loadIndex, stopIndex) {
     loadName: load.name || "",
     stopId: stop.id || "",
     stopType: isPickup ? "pickup" : "dropoff",
-    location: isPickup ? stop.location : (firstOrder.destinationYard || firstOrder.address || ""),
+    location: isPickup ? stop.location : dropLocation,
     address: isPickup
       ? (firstOrder.sourceAddress || yardAddress(stop.location) || "")
-      : (firstOrder.address || firstOrder.dropAddress || firstOrder.destinationYard || ""),
+      : dropAddress,
+    dropLocation,
+    dropAddress,
+    destinationLocationId: stop.destinationLocationId ?? null,
+    lineRowIds: (stop.lineRowIds || []).map(String),
     windowStart: isPickup ? "" : (firstOrder.windowStart || ""),
     windowEnd: isPickup ? "" : (firstOrder.windowEnd || ""),
     instructions: firstOrder.notes || firstOrder.dispatchInstructions || "",
@@ -1072,7 +1094,7 @@ async function detailsFromDelivery(orderRef, typeHint = "", context = {}) {
   return { ...order.rows[0], source: "delivery", lines: adjustedLines };
 }
 
-async function detailsFromReceiving(orderRef, typeHint = "") {
+async function detailsFromReceiving(orderRef, typeHint = "", context = {}) {
   const typeClause = typeHint === "TO" ? "AND o.order_type = 'transfer_order'" : typeHint === "PO" ? "AND o.order_type = 'purchase_order'" : "";
   const order = await query(
     `WITH receiving_order_source AS (
@@ -1096,15 +1118,15 @@ async function detailsFromReceiving(orderRef, typeHint = "") {
   );
   if (!order.rowCount) return null;
   const lines = await query(
-    `SELECT item_name, sku, item_description, item_type, quantity, unit,
-            pallet_qty, layer_qty, section_qty, piece_qty
+    `SELECT id AS line_row_id, line_id, location_id, location,
+            item_name, sku, item_description, item_type, quantity, unit, pallet_qty, layer_qty, section_qty, piece_qty
        FROM (
          SELECT purchase_order_id AS order_id, line_id, id, item_name, sku, item_description, item_type,
-                quantity, unit, pallet_qty, layer_qty, section_qty, piece_qty, netsuite_active
+                quantity, unit, pallet_qty, layer_qty, section_qty, piece_qty, location_id, location, netsuite_active
          FROM purchase_order_lines
          UNION ALL
          SELECT transfer_order_id AS order_id, line_id, id, item_name, sku, item_description, item_type,
-                quantity, unit, pallet_qty, layer_qty, section_qty, piece_qty, netsuite_active
+                quantity, unit, pallet_qty, layer_qty, section_qty, piece_qty, location_id, location, netsuite_active
          FROM transfer_order_lines
          WHERE line_stage = 'receiving'
        ) receiving_lines
@@ -1113,7 +1135,11 @@ async function detailsFromReceiving(orderRef, typeHint = "") {
       ORDER BY line_id NULLS LAST, id`,
     [order.rows[0].netsuite_id]
   );
-  return { ...order.rows[0], source: "receiving", lines: lines.rows };
+  const requestedLineRowIds = new Set((context.lineRowIds || []).map(String));
+  const scopedLines = typeHint === "PO" && context.stopType === "dropoff" && requestedLineRowIds.size
+    ? lines.rows.filter((line) => requestedLineRowIds.has(String(line.line_row_id)))
+    : lines.rows;
+  return { ...order.rows[0], source: "receiving", lines: scopedLines };
 }
 
 async function detailsFromLocalCo(orderRef) {
@@ -1202,7 +1228,11 @@ function isMaterialLine(line) {
 }
 
 function orderDetailsFromPlan(orderRef, planOrder = null, context = {}) {
-  const items = (planOrder?.items || [])
+  const requestedLineRowIds = new Set((context.lineRowIds || []).map(String));
+  const sourceItems = context.stopType === "dropoff" && requestedLineRowIds.size
+    ? (planOrder?.items || []).filter((item) => requestedLineRowIds.has(String(item.lineRowId)))
+    : (planOrder?.items || []);
+  const items = sourceItems
     .map((item) => planItemForPickup(item, context))
     .filter(planItemHasQuantity);
   return {
@@ -1220,7 +1250,7 @@ function orderDetailsFromPlan(orderRef, planOrder = null, context = {}) {
 
 async function orderDetails(orderRef, typeHint = "", planOrder = null, context = {}) {
   const detail = typeHint === "PO"
-    ? await detailsFromReceiving(orderRef, "PO")
+    ? await detailsFromReceiving(orderRef, "PO", context)
     : typeHint === "CO"
       ? await detailsFromLocalCo(orderRef)
       : typeHint === "TO"
@@ -1286,7 +1316,10 @@ export async function getNextDriverJob(driverLogin) {
     const hint = orderByRef(assignment.plan, ref)?.type || (next.orderTypes.length === 1 ? next.orderTypes[0] : "");
     return orderDetails(ref, hint, orderByRef(assignment.plan, ref), {
       stopType: next.stopType,
-      pickupLocation: next.stopType === "pickup" ? next.location : ""
+      pickupLocation: next.stopType === "pickup" ? next.location : "",
+      dropLocation: next.stopType === "dropoff" ? next.dropLocation || next.location : "",
+      destinationLocationId: next.destinationLocationId ?? null,
+      lineRowIds: next.stopType === "dropoff" ? next.lineRowIds || [] : []
     });
   }));
   return { ...next, orders: details };

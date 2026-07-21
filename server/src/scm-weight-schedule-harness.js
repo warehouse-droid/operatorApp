@@ -111,8 +111,8 @@ includesAll(enrichment, [
   "options.allowOllama !== false"
 ], "Reusable PO enrichment context");
 assert.equal((server.match(/req\.query\.includeSchedule === "false"/g) || []).length, 3, "Schedule mutations must support omitting unused full-list responses.");
-assert.ok(scheduleHtml.includes("/scm-schedule.js?v=20260718-schedule-multifilter-v3"), "Schedule cache bust missing.");
-assert.ok(poHtml.includes("/dispatch-scm.js?v=20260718-whole-weight-v4"), "PO Split cache bust missing.");
+assert.ok(scheduleHtml.includes("/scm-schedule.js?v=20260721-sales-v1"), "Schedule cache bust missing.");
+assert.ok(poHtml.includes("/dispatch-scm.js?v=20260720-po-multi-drop-route-v3"), "PO Split cache bust missing.");
 assert.ok(vrmaHtml.includes("/scm-vrma.js?v=20260718-scm-item-weight-v1"), "VRMA cache bust missing.");
 
 const poStart = poSplit.indexOf("function scmNumber");

@@ -5,7 +5,8 @@ import { trackSemanticAudit } from "./audit-context.js";
 
 const scrypt = promisify(crypto.scrypt);
 const SESSION_DAYS = 14;
-export const OPERATOR_ROLES = Object.freeze(["operator", "dispatcher", "admin", "scm", "yard_manager"]);
+export const OPERATOR_ROLES = Object.freeze(["operator", "dispatcher", "admin", "scm", "yard_manager", "sales"]);
+export const SALES_YARD_LOCATION_IDS = Object.freeze([1, 28, 15, 26]);
 
 function normalizeRole(value) {
   return String(value || "").trim().toLowerCase().replaceAll("-", "_").replaceAll(" ", "_");
@@ -21,6 +22,15 @@ function normalizeAuthorities(roles, primaryRole = "operator") {
   return { role: primary, roles: normalized.length ? normalized : [primary] };
 }
 
+function normalizeYardLocationIds(values = []) {
+  const provided = Array.isArray(values) ? values : values === null || values === undefined ? [] : [values];
+  const normalized = [...new Set(provided.map(Number).filter((value) => Number.isInteger(value) && value > 0))];
+  if (normalized.some((value) => !SALES_YARD_LOCATION_IDS.includes(value))) {
+    throw new Error("Invalid sales yard authorization.");
+  }
+  return SALES_YARD_LOCATION_IDS.filter((value) => normalized.includes(value));
+}
+
 function publicOperator(row) {
   if (!row) return null;
   const authority = normalizeAuthorities(row.roles, row.role);
@@ -30,6 +40,7 @@ function publicOperator(row) {
     display_name: row.display_name,
     role: authority.role,
     roles: authority.roles,
+    yardLocationIds: normalizeYardLocationIds(row.yard_location_ids),
     active: row.active,
     created_at: row.created_at,
     updated_at: row.updated_at
@@ -57,28 +68,29 @@ export async function hasOperators() {
   return result.rowCount > 0;
 }
 
-export async function createOperator({ username, displayName, password, role = "operator", roles = null }) {
+export async function createOperator({ username, displayName, password, role = "operator", roles = null, yardLocationIds = [] }) {
   const cleanUsername = String(username || "").trim().toLowerCase();
   const cleanDisplayName = String(displayName || username || "").trim();
   if (!cleanUsername) throw new Error("Username is required.");
   if (!cleanDisplayName) throw new Error("Display name is required.");
   if (!password || String(password).length < 6) throw new Error("Password must be at least 6 characters.");
   const authority = normalizeAuthorities(roles, role);
+  const yards = normalizeYardLocationIds(yardLocationIds);
 
   const { salt, hash } = await hashPassword(String(password));
   const id = crypto.randomUUID();
   const result = await query(
-    `INSERT INTO operators (id, username, display_name, password_hash, password_salt, role, roles)
-     VALUES ($1, $2, $3, $4, $5, $6, $7::text[])
-     RETURNING id, username, display_name, role, roles, active, created_at, updated_at`,
-    [id, cleanUsername, cleanDisplayName, hash, salt, authority.role, authority.roles]
+    `INSERT INTO operators (id, username, display_name, password_hash, password_salt, role, roles, yard_location_ids)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::text[], $8::integer[])
+     RETURNING id, username, display_name, role, roles, yard_location_ids, active, created_at, updated_at`,
+    [id, cleanUsername, cleanDisplayName, hash, salt, authority.role, authority.roles, yards]
   );
   return publicOperator(result.rows[0]);
 }
 
 export async function listOperators() {
   const result = await query(
-    `SELECT id, username, display_name, role, roles, active, created_at, updated_at
+    `SELECT id, username, display_name, role, roles, yard_location_ids, active, created_at, updated_at
      FROM operators
      ORDER BY active DESC, display_name ASC`
   );
@@ -91,7 +103,7 @@ export async function setOperatorActive(id, active) {
      SET active = $2,
          updated_at = now()
      WHERE id = $1
-     RETURNING id, username, display_name, role, roles, active, created_at, updated_at`,
+     RETURNING id, username, display_name, role, roles, yard_location_ids, active, created_at, updated_at`,
     [id, Boolean(active)]
   );
   return publicOperator(result.rows[0]);
@@ -106,25 +118,29 @@ export async function updateOperatorPassword(id, password) {
          password_salt = $3,
          updated_at = now()
      WHERE id = $1
-     RETURNING id, username, display_name, role, roles, active, created_at, updated_at`,
+     RETURNING id, username, display_name, role, roles, yard_location_ids, active, created_at, updated_at`,
     [id, hash, salt]
   );
   await query("DELETE FROM operator_sessions WHERE operator_id = $1", [id]);
   return publicOperator(result.rows[0]);
 }
 
-export async function updateOperatorRoles(id, { role, roles } = {}) {
-  const current = await query("SELECT id, role, roles FROM operators WHERE id = $1", [id]);
+export async function updateOperatorRoles(id, { role, roles, yardLocationIds } = {}) {
+  const current = await query("SELECT id, role, roles, yard_location_ids FROM operators WHERE id = $1", [id]);
   if (!current.rowCount) return null;
   const authority = normalizeAuthorities(roles, role || current.rows[0].role);
+  const yards = yardLocationIds === undefined
+    ? normalizeYardLocationIds(current.rows[0].yard_location_ids)
+    : normalizeYardLocationIds(yardLocationIds);
   const result = await query(
     `UPDATE operators
      SET role = $2,
          roles = $3::text[],
+         yard_location_ids = $4::integer[],
          updated_at = now()
      WHERE id = $1
-     RETURNING id, username, display_name, role, roles, active, created_at, updated_at`,
-    [id, authority.role, authority.roles]
+     RETURNING id, username, display_name, role, roles, yard_location_ids, active, created_at, updated_at`,
+    [id, authority.role, authority.roles, yards]
   );
   return publicOperator(result.rows[0]);
 }
@@ -154,7 +170,7 @@ export async function loginOperator(username, password) {
 export async function getOperatorByToken(token) {
   if (!token) return null;
   const result = await query(
-    `SELECT o.id, o.username, o.display_name, o.role, o.roles, o.active, o.created_at, o.updated_at
+    `SELECT o.id, o.username, o.display_name, o.role, o.roles, o.yard_location_ids, o.active, o.created_at, o.updated_at
      FROM operator_sessions s
      INNER JOIN operators o ON o.id = s.operator_id
      WHERE s.token_hash = $1

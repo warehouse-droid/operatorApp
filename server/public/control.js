@@ -8,7 +8,14 @@ const ACCOUNT_ROLE_OPTIONS = [
   { value: "dispatcher", labelKey: "control.roleDispatcher", label: "Dispatcher" },
   { value: "scm", labelKey: "control.roleScm", label: "SCM Staff" },
   { value: "yard_manager", labelKey: "control.roleYardManager", label: "Yard Manager" },
+  { value: "sales", labelKey: "control.roleSales", label: "Sales" },
   { value: "admin", labelKey: "control.roleAdmin", label: "Admin" }
+];
+const SALES_YARD_OPTIONS = [
+  { locationId: 1, yardCode: "3445" },
+  { locationId: 28, yardCode: "2967" },
+  { locationId: 15, yardCode: "12441" },
+  { locationId: 26, yardCode: "150" }
 ];
 const IS_ADMIN_PAGE = window.location.pathname.startsWith("/admin");
 const SECTION_STORAGE_KEY = IS_ADMIN_PAGE ? "mbbs.admin.section" : "mbbs.control.section";
@@ -70,12 +77,23 @@ function renderAuthorityChoices(selectedRoles, attributeName) {
   `).join("");
 }
 
+function renderSalesYardChoices(selectedYards, attributeName) {
+  const selected = new Set((selectedYards || []).map(Number));
+  return SALES_YARD_OPTIONS.map((yard) => `
+    <label class="authority-choice">
+      <input type="checkbox" ${attributeName} value="${yard.locationId}" ${selected.has(yard.locationId) ? "checked" : ""} />
+      <span>${yard.yardCode}</span>
+    </label>
+  `).join("");
+}
+
 function roleHomeRoute(role) {
   const clean = normalizedRole(role);
   if (clean === "admin") return "/admin";
   if (clean === "dispatcher") return "/dispatch";
   if (clean === "scm" || clean === "scm_staff") return "/scm";
   if (clean === "yard_manager") return "/control";
+  if (clean === "sales") return "/sales";
   if (clean === "operator") return "/operator";
   return "/";
 }
@@ -513,6 +531,11 @@ function renderDashboardSection() {
           <strong>${syncSettings.mode === "auto" ? t("control.auto", "Auto") : t("control.manual", "Manual")}</strong>
           <em>${syncSettings.running ? t("control.syncRunning", "sync running") : syncSettings.lastStatus || "idle"}</em>
         </button>
+        <button class="metric-card" onclick="location.href='/admin/printers'" type="button">
+          <span>Yard Printers</span>
+          <strong>Setup</strong>
+          <em>printer agents, queues, tests, and print jobs</em>
+        </button>
         <button class="metric-card ${photoArchiveSettings.lastStatus === "partial" || photoArchiveSettings.lastStatus === "failed" ? "warning" : ""}" data-action="control-section" data-section="storage" type="button">
           <span>Photo Storage</span>
           <strong>${photoArchiveSettings.mode === "off" ? "Off" : photoArchiveSettings.mode === "auto" ? "Auto" : "Manual"}</strong>
@@ -526,7 +549,7 @@ function renderDashboardSection() {
       </div>
       <section class="panel">
         <h2>Administration</h2>
-        <p class="muted">Manage application access, NetSuite synchronization, photo storage, and security audit history. Yard operations remain under Control.</p>
+        <p class="muted">Manage application access, NetSuite synchronization, yard printers, photo storage, and security audit history. Yard operations remain under Control.</p>
         <div class="actions"><button onclick="location.href='/control'">Open Control</button></div>
       </section>
     `;
@@ -1457,6 +1480,11 @@ function renderNewOperatorDetail() {
         <p class="muted">${t("control.authoritiesHelp", "Select every module this account may access. The primary role controls the default page after login.")}</p>
         <div class="authority-choice-grid">${renderAuthorityChoices(["operator"], "data-new-authority")}</div>
       </fieldset>
+      <fieldset class="authority-picker">
+        <legend>${t("control.salesYards", "Sales yard access")}</legend>
+        <p class="muted">${t("control.salesYardsHelp", "Sales schedule, Sales Orders, printers, and print jobs are limited to these yards.")}</p>
+        <div class="authority-choice-grid">${renderSalesYardChoices([], "data-new-sales-yard")}</div>
+      </fieldset>
       <div class="account-detail-actions">
         <button class="primary" type="submit">${t("control.createAccount", "Create account")}</button>
       </div>
@@ -1502,6 +1530,11 @@ function renderOperatorDetail(item) {
         <div>
           <span class="field-label">${t("control.authorities", "Module authorities")}</span>
           <div class="authority-choice-grid">${renderAuthorityChoices(normalizedStaffRoles(item), "data-account-authority")}</div>
+        </div>
+        <div>
+          <span class="field-label">${t("control.salesYards", "Sales yard access")}</span>
+          <p class="muted">${t("control.salesYardsHelp", "Sales schedule, Sales Orders, printers, and print jobs are limited to these yards.")}</p>
+          <div class="authority-choice-grid">${renderSalesYardChoices(item.yardLocationIds, "data-account-sales-yard")}</div>
         </div>
         <div class="account-detail-actions">
           <button class="primary" data-action="save-account-roles" data-id="${escapeHtml(item.id)}" type="button">${t("control.saveAccess", "Save access")}</button>
@@ -1822,6 +1855,7 @@ app.addEventListener("submit", async (event) => {
     if (form.dataset.form === "create-operator") {
       const primaryRole = document.getElementById("newRole").value;
       const roles = [...document.querySelectorAll("[data-new-authority]:checked")].map((input) => input.value);
+      const yardLocationIds = [...document.querySelectorAll("[data-new-sales-yard]:checked")].map((input) => Number(input.value));
       if (!roles.includes(primaryRole)) roles.push(primaryRole);
       const created = await request("/api/operators", {
         method: "POST",
@@ -1830,7 +1864,8 @@ app.addEventListener("submit", async (event) => {
           displayName: document.getElementById("newDisplayName").value,
           password: document.getElementById("newPassword").value,
           role: primaryRole,
-          roles
+          roles,
+          yardLocationIds
         })
       });
       selectedOperatorId = created.id;
@@ -2240,10 +2275,11 @@ app.addEventListener("click", async (event) => {
       const row = button.closest("[data-account-row]");
       const role = row?.querySelector("[data-account-primary-role]")?.value || "operator";
       const roles = [...(row?.querySelectorAll("[data-account-authority]:checked") || [])].map((input) => input.value);
+      const yardLocationIds = [...(row?.querySelectorAll("[data-account-sales-yard]:checked") || [])].map((input) => Number(input.value));
       if (!roles.includes(role)) roles.push(role);
       await request(`/api/operators/${button.dataset.id}/roles`, {
         method: "PUT",
-        body: JSON.stringify({ role, roles })
+        body: JSON.stringify({ role, roles, yardLocationIds })
       });
       alert(t("control.accessSaved", "Account access updated."));
       return loadControlData();

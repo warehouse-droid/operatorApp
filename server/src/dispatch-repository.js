@@ -57,6 +57,82 @@ function normalizeDispatchItems(items = []) {
   });
 }
 
+function dispatchItemHasQuantity(item = {}) {
+  return toNumber(item.pallets) > 0
+    || toNumber(item.layers) > 0
+    || toNumber(item.sections) > 0
+    || toNumber(item.pieces) > 0
+    || toNumber(item.quantity) > 0;
+}
+
+function purchaseOrderDropoffs(items = [], {
+  destinationLocationId = null,
+  destinationYard = "",
+  destinationAddress = ""
+} = {}) {
+  const groups = new Map();
+  for (const item of items.filter(dispatchItemHasQuantity)) {
+    const locationId = normalizeScmDestinationLocationId(item.destinationLocationId)
+      || normalizeScmDestinationLocationId(destinationLocationId);
+    const yard = locationTextFromId(locationId)
+      || String(item.destinationYard || destinationYard || "").trim();
+    const key = locationId ? `location:${locationId}` : `yard:${yard.toLowerCase()}`;
+    if (!groups.has(key)) {
+      groups.set(key, {
+        key,
+        destinationLocationId: locationId || null,
+        destinationYard: yard,
+        address: SCM_VRMA_OWN_YARDS.find((candidate) => candidate.code === yard)?.address
+          || destinationAddress
+          || yard,
+        lineRowIds: [],
+        pallets: 0,
+        layers: 0,
+        sections: 0,
+        pieces: 0,
+        salesQty: 0,
+        weight: 0
+      });
+    }
+    const group = groups.get(key);
+    if (item.lineRowId !== undefined && item.lineRowId !== null) group.lineRowIds.push(item.lineRowId);
+    group.pallets += toNumber(item.pallets);
+    group.layers += toNumber(item.layers);
+    group.sections += toNumber(item.sections);
+    group.pieces += toNumber(item.pieces);
+    group.salesQty += toNumber(item.quantity);
+    group.weight += toNumber(item.lineWeight);
+  }
+  if (!groups.size && (destinationYard || destinationLocationId)) {
+    const locationId = normalizeScmDestinationLocationId(destinationLocationId)
+      || normalizeScmDestinationLocationId(destinationYard);
+    const yard = locationTextFromId(locationId) || String(destinationYard || "").trim();
+    const key = locationId ? `location:${locationId}` : `yard:${yard.toLowerCase()}`;
+    groups.set(key, {
+      key,
+      destinationLocationId: locationId || null,
+      destinationYard: yard,
+      address: destinationAddress || SCM_VRMA_OWN_YARDS.find((candidate) => candidate.code === yard)?.address || yard,
+      lineRowIds: [],
+      pallets: 0,
+      layers: 0,
+      sections: 0,
+      pieces: 0,
+      salesQty: 0,
+      weight: 0
+    });
+  }
+  return [...groups.values()].map((dropoff) => ({
+    ...dropoff,
+    pallets: Math.round(dropoff.pallets * 1000000) / 1000000,
+    layers: Math.round(dropoff.layers * 1000000) / 1000000,
+    sections: Math.round(dropoff.sections * 1000000) / 1000000,
+    pieces: Math.round(dropoff.pieces * 1000000) / 1000000,
+    salesQty: Math.round(dropoff.salesQty * 1000000) / 1000000,
+    weight: Math.round(dropoff.weight * 1000) / 1000
+  }));
+}
+
 function dateOnly(value) {
   if (!value) return "";
   if (value instanceof Date) return value.toISOString().slice(0, 10);
@@ -92,6 +168,15 @@ function rowToDispatchOrder(row) {
     toYard: row.transit_co_to_yard || "",
     source: "local-db"
   } : null;
+  const destinationYard = row.destination_location || "";
+  const destinationAddress = row.drop_address || row.dispatch_address || "";
+  const dropoffs = row.dispatch_type === "PO"
+    ? purchaseOrderDropoffs(items, {
+        destinationLocationId: row.destination_location_id,
+        destinationYard,
+        destinationAddress
+      })
+    : [];
   return {
     id: visibleRef,
     netsuiteId: row.netsuite_id,
@@ -115,7 +200,8 @@ function rowToDispatchOrder(row) {
     pickupLocations,
     transitOriginalPickupLocations: transitCo?.fromYard ? [transitCo.fromYard] : [],
     transitCo,
-    destinationYard: row.destination_location || "",
+    destinationYard,
+    dropoffs,
     pallets: row.source_table === "scm_vrma_orders"
       ? totalPallets
       : totalPallets || Math.floor(fallbackQty / 100),
@@ -423,6 +509,8 @@ export async function listDispatchOrders({
         to_lyr,
         to_sec,
         to_pcs,
+        location_id,
+        location,
         netsuite_active
       FROM purchase_order_lines
       UNION ALL
@@ -447,6 +535,8 @@ export async function listDispatchOrders({
         to_lyr,
         to_sec,
         to_pcs,
+        location_id,
+        location,
         netsuite_active
       FROM transfer_order_lines
       WHERE line_stage = 'receiving'
@@ -652,6 +742,8 @@ export async function listDispatchOrders({
           'lineRowId', l.id,
           'lineId', l.line_id,
           'itemId', l.item_id,
+          'destinationLocationId', COALESCE(l.location_id, o.destination_location_id),
+          'destinationYard', COALESCE(NULLIF(l.location, ''), o.destination_location),
           'sku', COALESCE(l.sku, l.item_name),
           'itemName', l.item_name,
           'description', l.item_description,
@@ -1670,7 +1762,10 @@ export async function listScmPurchaseOrders({ search = "", dropoff = "", vendor 
     .filter((order) => String(order.scm?.status || "").trim().toLowerCase() !== "completed")
     .filter((order) => {
       if (!dropoffFilter) return true;
-      return String(order.destinationYard || "").trim().toLowerCase() === dropoffFilter;
+      return [
+        order.destinationYard,
+        ...(order.dropoffs || []).map((dropoff) => dropoff.destinationYard)
+      ].some((yard) => String(yard || "").trim().toLowerCase() === dropoffFilter);
     })
     .filter((order) => {
       if (!vendorFilter) return true;

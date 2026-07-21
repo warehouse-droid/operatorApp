@@ -2,6 +2,7 @@ const monitorApp = document.getElementById("dispatchMonitorApp");
 const t = (key, fallback) => window.MBBS_I18N?.t(key, fallback) || fallback;
 const languageToggle = () => window.MBBS_I18N?.toggleHtml() || "";
 const displayDate = (value) => window.MBBS_I18N?.displayDate(value) || "";
+const SALES_MONITOR_HOST = window.location.pathname.startsWith("/sales/");
 const MAP_CENTER = { lat: 43.82, lng: -79.45 };
 const LAST_KNOWN_FALLBACK_MS = 10 * 60 * 1000;
 const TRUCK_COLORS = [
@@ -13,7 +14,7 @@ const TRUCK_COLORS = [
 
 let monitorOperator = null;
 let monitorConfig = { googleMapsApiKey: "" };
-let monitorData = { trucks: [], trails: {}, yards: [], refreshSeconds: 10 };
+let monitorData = { trucks: [], trails: {}, yards: [], plannedOrders: [], refreshSeconds: 10 };
 let monitorError = "";
 let monitorLoading = false;
 let monitorTimer = null;
@@ -26,6 +27,9 @@ let googleMapsPromise = null;
 let monitorGeocodeCache = readGeocodeCache();
 let monitorLastTruckLocations = readLastTruckLocations();
 let selectedTruckPlate = "";
+let selectedMonitorOrderKey = "";
+let monitorOrderSearch = "";
+let monitorTooltipOrderKey = "";
 let mapHasFitBounds = false;
 
 function escapeHtml(value) {
@@ -75,6 +79,43 @@ function formatTime(value) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "-";
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function formatActualTime(value) {
+  if (!value) return "--";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "--";
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
+function formatPlannedMinute(value) {
+  if (value === null || value === undefined || value === "") return "--";
+  const total = Number(value);
+  if (!Number.isFinite(total)) return "--";
+  const wrapped = ((Math.round(total) % 1440) + 1440) % 1440;
+  return `${String(Math.floor(wrapped / 60)).padStart(2, "0")}:${String(wrapped % 60).padStart(2, "0")}`;
+}
+
+function formatMonitorQuantity(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "—";
+  return number.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 4 });
+}
+
+function monitorItemQuantity(item = {}) {
+  const quantity = Number(item.quantity);
+  if (Number.isFinite(quantity) && quantity !== 0) {
+    return `${formatMonitorQuantity(quantity)}${item.unit ? ` ${item.unit}` : ""}`;
+  }
+  const converted = [
+    ["PLT", item.pallets],
+    ["LYR", item.layers],
+    ["SEC", item.sections],
+    ["PCS", item.pieces]
+  ].filter(([, amount]) => Number(amount || 0) > 0);
+  return converted.length
+    ? converted.map(([unit, amount]) => `${formatMonitorQuantity(amount)} ${unit}`).join(" · ")
+    : `${formatMonitorQuantity(quantity || 0)}${item.unit ? ` ${item.unit}` : ""}`;
 }
 
 function formatKmh(value) {
@@ -466,9 +507,108 @@ function renderTruckList() {
   }).join("");
 }
 
+function monitorOrderSearchText(order = {}) {
+  return [
+    order.orderRef,
+    order.fromLocation,
+    order.destination,
+    order.driver,
+    order.vehiclePlate,
+    order.loadName,
+    ...(order.items || []).flatMap((item) => [item.itemName, item.unit])
+  ].join(" ").toLowerCase();
+}
+
+function visibleMonitorOrders() {
+  const term = monitorOrderSearch.trim().toLowerCase();
+  const orders = monitorData.plannedOrders || [];
+  return term ? orders.filter((order) => monitorOrderSearchText(order).includes(term)) : orders;
+}
+
+function monitorOrderStatusLabel(status) {
+  if (status === "in_progress") return "In progress";
+  if (status === "complete") return "Completed";
+  return "Planned";
+}
+
+function monitorTimeRange(start, end, formatter) {
+  const startText = formatter(start);
+  const endText = formatter(end);
+  if (startText === "--" && endText === "--") return "--";
+  if (endText === "--" || startText === endText) return startText;
+  return `${startText}–${endText}`;
+}
+
+function renderMonitorOrderList() {
+  if (monitorLoading) return `<div class="monitor-empty">Loading today's planned orders...</div>`;
+  if (monitorError) return `<div class="monitor-empty warning">${escapeHtml(monitorError)}</div>`;
+  const visible = visibleMonitorOrders();
+  if (!monitorData.plan) return `<div class="monitor-empty">No plan is available for today.</div>`;
+  if (!visible.length) return `<div class="monitor-empty">${monitorOrderSearch.trim() ? "No planned orders match this search." : "No orders are assigned to today's trucks."}</div>`;
+  return visible.map((order) => {
+    const plannedTime = monitorTimeRange(order.plannedStart, order.plannedEnd, formatPlannedMinute);
+    const actualTime = monitorTimeRange(order.actualStart, order.actualEnd, formatActualTime);
+    return `
+      <article class="monitor-order-card status-${escapeHtml(order.status || "pending")} ${String(order.key) === String(selectedMonitorOrderKey) ? "selected" : ""}" role="button" tabindex="0" data-monitor-order-key="${escapeHtml(order.key)}" data-monitor-order-truck="${escapeHtml(order.truckPlate || order.vehiclePlate || "")}">
+        <div class="monitor-order-head">
+          <strong>${escapeHtml(order.orderRef || "Order")}</strong>
+          <span>${escapeHtml(monitorOrderStatusLabel(order.status))}</span>
+        </div>
+        <div class="monitor-order-route"><b>From</b><span>${escapeHtml(order.fromLocation || "—")}</span><b>To</b><span>${escapeHtml(order.destination || "—")}</span></div>
+        <div class="monitor-order-assignment"><span>Driver <b>${escapeHtml(order.driver || "—")}</b></span><span>Vehicle <b>${escapeHtml(order.vehiclePlate || "—")}</b></span></div>
+        <div class="monitor-order-times"><span><b>Planned</b> ${escapeHtml(plannedTime)}</span><span><b>Actual</b> ${escapeHtml(actualTime)}</span></div>
+      </article>
+    `;
+  }).join("");
+}
+
+function monitorOrderByKey(key) {
+  return (monitorData.plannedOrders || []).find((order) => String(order.key) === String(key)) || null;
+}
+
+function hideMonitorOrderTooltip() {
+  const tooltip = document.getElementById("monitorOrderTooltip");
+  if (tooltip) tooltip.hidden = true;
+  monitorTooltipOrderKey = "";
+}
+
+function positionMonitorOrderTooltip(event) {
+  const tooltip = document.getElementById("monitorOrderTooltip");
+  if (!tooltip || tooltip.hidden) return;
+  const width = Math.min(390, window.innerWidth - 24);
+  const left = event.clientX > window.innerWidth * 0.65
+    ? Math.max(12, event.clientX - width - 16)
+    : Math.min(window.innerWidth - width - 12, event.clientX + 16);
+  tooltip.style.width = `${width}px`;
+  tooltip.style.left = `${left}px`;
+  tooltip.style.top = `${Math.max(12, Math.min(event.clientY + 12, window.innerHeight - tooltip.offsetHeight - 12))}px`;
+}
+
+function showMonitorOrderTooltip(card, event) {
+  const order = monitorOrderByKey(card?.dataset.monitorOrderKey);
+  const tooltip = document.getElementById("monitorOrderTooltip");
+  if (!order || !tooltip) return;
+  monitorTooltipOrderKey = String(order.key || "");
+  const itemRows = (order.items || []).map((item) => `
+    <div><span>${escapeHtml(item.itemName || "Item")}</span><strong>${escapeHtml(monitorItemQuantity(item))}</strong></div>
+  `).join("") || `<div><span>No order-line details</span><strong>—</strong></div>`;
+  tooltip.innerHTML = `
+    <header><strong>${escapeHtml(order.orderRef || "Order")}</strong><span>${escapeHtml(order.loadName || "Load")}</span></header>
+    <p>${escapeHtml(order.fromLocation || "—")} → ${escapeHtml(order.destination || "—")}</p>
+    <section>${itemRows}</section>
+  `;
+  tooltip.hidden = false;
+  positionMonitorOrderTooltip(event);
+}
+
 function updateMonitorUi() {
   const list = document.querySelector(".monitor-list");
   if (list) list.innerHTML = renderTruckList();
+  const orderList = document.querySelector(".monitor-order-list");
+  if (orderList) orderList.innerHTML = renderMonitorOrderList();
+  const orderCount = document.querySelector("[data-monitor-order-count]");
+  if (orderCount) orderCount.textContent = `${visibleMonitorOrders().length}/${(monitorData.plannedOrders || []).length} orders`;
+  hideMonitorOrderTooltip();
   const planText = document.querySelector("[data-monitor-plan]");
   if (planText) {
     planText.textContent = monitorData.plan
@@ -501,7 +641,7 @@ function renderMonitorApp() {
       </div>
       <div class="topbar-actions">
         ${languageToggle()}
-        <button onclick="location.href='/dispatch'" type="button">Menu</button>
+        <button onclick="location.href='${SALES_MONITOR_HOST ? "/sales" : "/dispatch"}'" type="button">Menu</button>
         <span class="dispatch-user">${escapeHtml(monitorOperator?.display_name || monitorOperator?.username || "")}</span>
         <button onclick="dispatchLogout()" type="button">Logout</button>
       </div>
@@ -520,11 +660,29 @@ function renderMonitorApp() {
           ${renderTruckList()}
         </div>
       </aside>
+      <aside class="panel monitor-orders-side">
+        <div class="panel-header monitor-orders-header">
+          <div><h2>Today's Planned Orders</h2><p data-monitor-order-count>${visibleMonitorOrders().length}/${(monitorData.plannedOrders || []).length} orders</p></div>
+          <input data-monitor-order-search type="search" value="${escapeHtml(monitorOrderSearch)}" placeholder="Search order, route, driver, vehicle, item" autocomplete="off" />
+        </div>
+        <div class="monitor-order-list">
+          ${renderMonitorOrderList()}
+        </div>
+      </aside>
     </section>
+    <div id="monitorOrderTooltip" class="monitor-order-tooltip" hidden></div>
   `;
 }
 
 monitorApp.addEventListener("click", (event) => {
+  const orderCard = event.target.closest("[data-monitor-order-key]");
+  if (orderCard) {
+    selectedMonitorOrderKey = orderCard.dataset.monitorOrderKey || "";
+    selectedTruckPlate = orderCard.dataset.monitorOrderTruck || "";
+    updateMonitorUi();
+    focusTruckOnMap(selectedTruckPlate);
+    return;
+  }
   const truckCard = event.target.closest("[data-truck-plate]");
   if (truckCard) {
     selectedTruckPlate = truckCard.dataset.truckPlate || "";
@@ -538,6 +696,15 @@ monitorApp.addEventListener("click", (event) => {
 
 monitorApp.addEventListener("keydown", (event) => {
   if (!["Enter", " "].includes(event.key)) return;
+  const orderCard = event.target.closest("[data-monitor-order-key]");
+  if (orderCard) {
+    event.preventDefault();
+    selectedMonitorOrderKey = orderCard.dataset.monitorOrderKey || "";
+    selectedTruckPlate = orderCard.dataset.monitorOrderTruck || "";
+    updateMonitorUi();
+    focusTruckOnMap(selectedTruckPlate);
+    return;
+  }
   const truckCard = event.target.closest("[data-truck-plate]");
   if (!truckCard) return;
   event.preventDefault();
@@ -546,12 +713,39 @@ monitorApp.addEventListener("keydown", (event) => {
   focusTruckOnMap(selectedTruckPlate);
 });
 
+monitorApp.addEventListener("input", (event) => {
+  if (!event.target.matches("[data-monitor-order-search]")) return;
+  monitorOrderSearch = event.target.value || "";
+  const orderList = monitorApp.querySelector(".monitor-order-list");
+  if (orderList) orderList.innerHTML = renderMonitorOrderList();
+  const orderCount = monitorApp.querySelector("[data-monitor-order-count]");
+  if (orderCount) orderCount.textContent = `${visibleMonitorOrders().length}/${(monitorData.plannedOrders || []).length} orders`;
+});
+
+monitorApp.addEventListener("pointerover", (event) => {
+  const card = event.target.closest("[data-monitor-order-key]");
+  if (!card || card.contains(event.relatedTarget)) return;
+  showMonitorOrderTooltip(card, event);
+});
+
+monitorApp.addEventListener("pointermove", (event) => {
+  if (!monitorTooltipOrderKey || !event.target.closest("[data-monitor-order-key]")) return;
+  positionMonitorOrderTooltip(event);
+});
+
+monitorApp.addEventListener("pointerout", (event) => {
+  const card = event.target.closest("[data-monitor-order-key]");
+  if (!card || card.contains(event.relatedTarget)) return;
+  hideMonitorOrderTooltip();
+});
+
 window.addEventListener("mbbs-language-changed", () => {
   renderMonitorApp();
 });
 
 requireDispatchLogin({
   mount: monitorApp,
+  roles: SALES_MONITOR_HOST ? ["sales", "admin"] : ["dispatcher", "admin"],
   async onReady(operator) {
     monitorOperator = operator;
     renderMonitorApp();

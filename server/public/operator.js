@@ -159,12 +159,20 @@ let fulfillmentStartedAt = 0;
 let fulfillmentProgressTimer = null;
 let fulfillmentValidation = null;
 let fulfillmentReturnModule = "delivery";
-let customerPickupScan = initialOperatorState.customerPickupScan || "";
+let customerPickupScan = ["string", "number"].includes(typeof initialOperatorState.customerPickupScan)
+  ? String(initialOperatorState.customerPickupScan)
+  : "";
 let customerPickupMessage = "";
 let pickupScannerStream = null;
 let pickupScannerActive = false;
 let pickupScanTimer = null;
-let pickupQrScanner = null;
+let pickupQrDecoder = null;
+let pickupQrFrameBusy = false;
+let pickupQuaggaActive = false;
+let pickupScanSubmitting = false;
+let pickupScanCandidate = "";
+let pickupScanCandidateHits = 0;
+let pickupScanCandidateAt = 0;
 
 let cycleStep = initialOperatorState.cycleStep || "type";
 let cycleSelection = initialOperatorState.cycleSelection || { productType: "", brand: "", series: "" };
@@ -220,6 +228,10 @@ const localDeliveryMutationRefs = new Map();
 let deliveryNotificationState = new Map();
 let deliveryNotificationStateReady = false;
 let cameraFacingMode = localStorage.getItem(CAMERA_FACING_KEY) === "user" ? "user" : "environment";
+if (currentModule === "customer-pickup-scan") {
+  cameraFacingMode = "environment";
+  localStorage.setItem(CAMERA_FACING_KEY, cameraFacingMode);
+}
 let lastCameraDeviceId = "";
 let pickupScannerBuffer = "";
 let pickupScannerLastKeyAt = 0;
@@ -362,13 +374,40 @@ async function openCameraStream() {
   }
 }
 
-async function preferredQrScannerCamera(QrScanner) {
-  try {
-    const cameras = await QrScanner.listCameras(true);
-    return pickCameraDevice(cameras, cameraCaptureMode(), lastCameraDeviceId) || cameraCaptureMode();
-  } catch {
-    return cameraCaptureMode();
+async function resolvePickupScannerVideoConstraints() {
+  const facing = cameraCaptureMode();
+  const resolution = {
+    width: { min: 640, ideal: 1920 },
+    height: { min: 480, ideal: 1080 }
+  };
+
+  const labelledDevice = (await listVideoInputDevices())
+    .find((device) => cameraLabelMatchesFacing(device, facing));
+  let deviceId = labelledDevice?.deviceId || "";
+
+  if (!deviceId) {
+    let probeStream = null;
+    try {
+      probeStream = await navigator.mediaDevices.getUserMedia({
+        video: { ...resolution, facingMode: { exact: facing } },
+        audio: false
+      });
+    } catch {
+      probeStream = await navigator.mediaDevices.getUserMedia({
+        video: { ...resolution, facingMode: { ideal: facing } },
+        audio: false
+      });
+    }
+    const probeTrack = probeStream?.getVideoTracks?.()[0];
+    deviceId = probeTrack?.getSettings?.().deviceId || "";
+    if (deviceId) lastCameraDeviceId = deviceId;
+    probeStream?.getTracks?.().forEach((track) => track.stop());
+    await new Promise((resolve) => window.setTimeout(resolve, 80));
   }
+
+  return deviceId
+    ? { ...resolution, deviceId: { exact: deviceId } }
+    : { ...resolution, facingMode: { exact: facing } };
 }
 
 function switchCameraFacing() {
@@ -2000,13 +2039,17 @@ function renderCustomerPickupScan() {
         <strong>${t("operator.customerPickupOnly", "Customer pickup only")}</strong>
         <div class="scanner-ready-banner">
           <b>${t("operator.scannerReady", "Scanner ready")}</b>
-          <span>${t("operator.scannerReadyHelp", "Scan the sales order with Zebra scanner. The order will open automatically.")}</span>
+          <span>${t("operator.scannerReadyHelp", "Scan a 1D or QR sales-order barcode with the camera or Zebra scanner. The order will open automatically.")}</span>
         </div>
         <div class="camera-actions">
           <button class="primary-button" data-action="start-pickup-scanner" type="button">${pickupScannerActive ? t("common.restartCamera", "Restart camera") : t("common.openCamera", "Open camera")}</button>
           ${renderCameraSwitchButton("switch-pickup-camera")}
         </div>
-        ${pickupScannerActive ? `<video class="camera-preview" id="pickupScannerCamera" autoplay muted playsinline></video>` : `<div class="photo-placeholder">${t("operator.scannerHelp", "Use the Zebra scanner, camera scanner, or type the sales order number.")}</div>`}
+        ${pickupScannerActive ? `
+          <div class="barcode-scanner-viewport${cameraFacingMode === "user" ? " mirrored" : ""}" id="pickupScannerCamera">
+            <div class="barcode-scan-guide" aria-hidden="true"><span></span></div>
+          </div>
+        ` : `<div class="photo-placeholder">${t("operator.scannerHelp", "Use the camera for 1D/QR barcodes, the Zebra scanner, or type the sales order number.")}</div>`}
       </div>
       <div class="fulfillment-card">
         <span>${t("operator.manualInput", "Manual / Zebra input")}</span>
@@ -2027,7 +2070,6 @@ function renderCustomerPickupScan() {
   `);
   window.requestAnimationFrame(() => {
     scheduleCustomerPickupFocus();
-    attachPickupScannerCamera();
   });
 }
 
@@ -3862,57 +3904,175 @@ async function confirmDiscardCustomerPickupDraft() {
 function stopPickupScannerCamera() {
   window.clearInterval(pickupScanTimer);
   pickupScanTimer = null;
-  if (pickupQrScanner) {
-    pickupQrScanner.stop();
-    pickupQrScanner.destroy();
+  pickupQrDecoder = null;
+  pickupQrFrameBusy = false;
+  if (pickupQuaggaActive && window.Quagga) {
+    window.Quagga.offDetected(handlePickupBarcodeDetected);
+    try {
+      window.Quagga.stop();
+    } catch {
+      // The scanner may already have released the camera after a navigation.
+    }
   }
-  pickupQrScanner = null;
+  pickupQuaggaActive = false;
   if (pickupScannerStream) pickupScannerStream.getTracks().forEach((track) => track.stop());
   pickupScannerStream = null;
   pickupScannerActive = false;
+  pickupScanCandidate = "";
+  pickupScanCandidateHits = 0;
+  pickupScanCandidateAt = 0;
 }
 
-function attachPickupScannerCamera() {
-  const video = document.getElementById("pickupScannerCamera");
-  if (!video || !pickupScannerStream) return;
-  video.srcObject = pickupScannerStream;
-  video.play().catch(() => {});
+function pickupCameraCodeText(value, depth = 0) {
+  if (depth > 4 || value === null || value === undefined) return "";
+  if (typeof value === "string" || typeof value === "number") return String(value);
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const text = pickupCameraCodeText(entry, depth + 1);
+      if (text) return text;
+    }
+    return "";
+  }
+  if (typeof value !== "object") return "";
+
+  const candidates = [
+    value.data,
+    value.rawValue,
+    value.text,
+    value.value,
+    value.code,
+    value.content,
+    value.codeResult?.code
+  ];
+  for (const candidate of candidates) {
+    if (candidate === value) continue;
+    const text = pickupCameraCodeText(candidate, depth + 1);
+    if (text) return text;
+  }
+  return "";
+}
+
+function normalizedPickupCameraCode(value) {
+  const clean = pickupCameraCodeText(value)
+    .replace(/[\u0000-\u001f\u007f]/g, "")
+    .trim();
+  if (/^\[object\s+object\]$/i.test(clean)) return "";
+  const orderRef = clean.match(/SO[A-Z]?\d+/i)?.[0];
+  return orderRef ? orderRef.toUpperCase() : clean;
+}
+
+function pickupQuaggaOrderCode(result) {
+  const results = Array.isArray(result) ? result : [result];
+  for (const entry of results) {
+    const code = normalizedPickupCameraCode(entry?.codeResult?.code);
+    if (/^SO[A-Z]?\d+$/i.test(code)) return code;
+  }
+  return normalizedPickupCameraCode(result);
+}
+
+async function acceptPickupCameraScan(value, { confirmRepeated = false } = {}) {
+  const code = normalizedPickupCameraCode(value);
+  if (!code || !pickupScannerActive || pickupScanSubmitting) return;
+
+  if (confirmRepeated && !/^SO[A-Z]?\d+$/i.test(code)) {
+    const now = Date.now();
+    if (code === pickupScanCandidate && now - pickupScanCandidateAt <= 1600) {
+      pickupScanCandidateHits += 1;
+    } else {
+      pickupScanCandidate = code;
+      pickupScanCandidateHits = 1;
+    }
+    pickupScanCandidateAt = now;
+    if (pickupScanCandidateHits < 2) return;
+  }
+
+  pickupScanSubmitting = true;
+  customerPickupScan = code;
+  const input = document.getElementById("customerPickupScan");
+  if (input) input.value = code;
+  stopPickupScannerCamera();
+  try {
+    await lookupCustomerPickup();
+  } finally {
+    pickupScanSubmitting = false;
+  }
+}
+
+function handlePickupBarcodeDetected(result) {
+  void acceptPickupCameraScan(pickupQuaggaOrderCode(result), { confirmRepeated: true });
+}
+
+async function scanPickupQrFrame() {
+  if (!pickupScannerActive || pickupScanSubmitting || pickupQrFrameBusy || !pickupQrDecoder) return;
+  const video = document.querySelector("#pickupScannerCamera video");
+  if (!video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
+  pickupQrFrameBusy = true;
+  try {
+    const result = await pickupQrDecoder.scanImage(video, {
+      returnDetailedScanResult: true,
+      alsoTryWithoutScanRegion: true
+    });
+    await acceptPickupCameraScan(result);
+  } catch {
+    // No QR code in this frame is the normal case; Quagga continues scanning 1D codes.
+  } finally {
+    pickupQrFrameBusy = false;
+  }
 }
 
 async function startPickupScannerCamera() {
   stopPickupScannerCamera();
+  pickupScanSubmitting = false;
   try {
     if (!navigator.mediaDevices?.getUserMedia) {
       customerPickupMessage = "Camera is not available in this browser. Use Zebra scanner or manual input.";
       return render();
     }
+    if (!window.Quagga) throw new Error("1D barcode scanner could not load. Refresh the app and try again.");
     pickupScannerActive = true;
-    customerPickupMessage = "Starting QR camera scanner...";
+    customerPickupMessage = "Starting 1D / QR camera scanner...";
     render();
     await new Promise((resolve) => window.requestAnimationFrame(resolve));
-    const video = document.getElementById("pickupScannerCamera");
-    if (!video) throw new Error("Camera preview is not ready.");
-    const { default: QrScanner } = await import("/vendor/qr-scanner/qr-scanner.min.js");
-    if (!(await QrScanner.hasCamera())) {
-      customerPickupMessage = "No camera was found. Use Zebra scanner or manual input.";
-      stopPickupScannerCamera();
-      return render();
-    }
-    const preferredCamera = await preferredQrScannerCamera(QrScanner);
-    pickupQrScanner = new QrScanner(video, async (result) => {
-      const value = String(result?.data || result || "").trim();
-      if (!value) return;
-      customerPickupScan = value;
-      stopPickupScannerCamera();
-      await lookupCustomerPickup();
-    }, {
-      preferredCamera,
-      maxScansPerSecond: 6,
-      returnDetailedScanResult: true,
-      highlightScanRegion: true,
-      highlightCodeOutline: true
+    const target = document.getElementById("pickupScannerCamera");
+    if (!target) throw new Error("Camera preview is not ready.");
+
+    const quagga = window.Quagga;
+    const scannerConstraints = await resolvePickupScannerVideoConstraints();
+    await new Promise((resolve, reject) => {
+      quagga.init({
+        inputStream: {
+          name: "Operator barcode camera",
+          type: "LiveStream",
+          target,
+          constraints: scannerConstraints
+        },
+        frequency: 8,
+        numOfWorkers: Math.min(4, Math.max(1, (navigator.hardwareConcurrency || 4) - 1)),
+        locate: true,
+        locator: { patchSize: "medium", halfSample: true },
+        decoder: {
+          readers: ["code_128_reader", "code_39_reader", "code_93_reader"],
+          multiple: false
+        }
+      }, (error) => error ? reject(error) : resolve());
     });
-    await pickupQrScanner.start();
+
+    quagga.onDetected(handlePickupBarcodeDetected);
+    quagga.start();
+    pickupQuaggaActive = true;
+
+    const video = target.querySelector("video");
+    pickupScannerStream = video?.srcObject || null;
+    if (pickupScannerStream) rememberCameraStream(pickupScannerStream);
+
+    try {
+      const { default: QrScanner } = await import("/vendor/qr-scanner/qr-scanner.min.js");
+      pickupQrDecoder = QrScanner;
+      pickupScanTimer = window.setInterval(() => void scanPickupQrFrame(), 650);
+    } catch {
+      // The 1D scanner remains available if the optional QR fallback cannot load.
+    }
+
     customerPickupMessage = "";
     document.querySelector(".fulfillment-screen .sync-alert")?.remove();
   } catch (error) {
@@ -4809,6 +4969,7 @@ function renderPersonalHistory() {
 
 async function openModule(moduleName) {
   if (moduleName === "customer-pickup") {
+    selectRearCamera();
     currentModule = "customer-pickup-scan";
     customerPickupScan = "";
     customerPickupMessage = "";
@@ -5868,6 +6029,7 @@ if ("serviceWorker" in navigator) {
 window.addEventListener("pagehide", () => {
   stopFulfillmentCamera();
   stopReceiptCamera();
+  stopPickupScannerCamera();
 });
 
 window.addEventListener("beforeinstallprompt", (event) => {

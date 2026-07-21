@@ -43,6 +43,14 @@ function buildConfig(env) {
       employeeId: String(env.TRANSFER_DEPENDENCY_EMPLOYEE_ID || "8721"),
       deliveryMethodId: String(env.TRANSFER_DEPENDENCY_DELIVERY_METHOD_ID || "2")
     },
+    smartScm: {
+      inputDir: path.resolve(env.SMART_SCM_INPUT_DIR || path.join(dataDir, "scm-inputs")),
+      printDir: path.resolve(env.SMART_SCM_PRINT_DIR || path.join(dataDir, "scm-print-jobs")),
+      maxInputMb: Math.min(100, Math.max(1, Number(env.SMART_SCM_MAX_INPUT_MB || 30))),
+      liveExecutionEnabled: booleanValue(env.SMART_SCM_LIVE_EXECUTION_ENABLED, false),
+      pickingTicketRestletUrl: String(env.SMART_SCM_PICKING_TICKET_RESTLET_URL || "").trim(),
+      forecastIntervalMinutes: Math.max(5, Number(env.SMART_SCM_TICK_INTERVAL_MINUTES || 15))
+    },
     samsara: {
       apiToken: env.SAMSARA_API_TOKEN || env.SAMSARA_API_KEY || "",
       dvirAuthorId: env.SAMSARA_DVIR_AUTHOR_ID || "",
@@ -96,6 +104,7 @@ function replaceConfig(target, next) {
   target.databaseUrl = next.databaseUrl;
   target.googleMapsApiKey = next.googleMapsApiKey;
   target.transferDependency = { ...next.transferDependency };
+  target.smartScm = { ...next.smartScm };
   target.samsara = { ...next.samsara };
   target.ollama = { ...next.ollama };
   target.photoUpload = { ...next.photoUpload };

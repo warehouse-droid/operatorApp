@@ -4,7 +4,7 @@
   const COLLAPSED_WIDTH = 58;
 
   let path = window.location.pathname;
-  if (!path.startsWith("/admin") && !path.startsWith("/control") && !path.startsWith("/dispatch") && !path.startsWith("/scm")) return;
+  if (!path.startsWith("/admin") && !path.startsWith("/control") && !path.startsWith("/dispatch") && !path.startsWith("/scm") && !path.startsWith("/sales")) return;
 
   function t(key, fallback) {
     return window.MBBS_I18N?.t?.(key, fallback) || fallback;
@@ -37,6 +37,7 @@
     if (item.href === "/admin") return path.startsWith("/admin");
     if (item.href === "/dispatch") return path === "/dispatch";
     if (item.href === "/scm") return path === "/scm";
+    if (item.href === "/sales") return path === "/sales";
     return path === item.href;
   }
 
@@ -45,6 +46,7 @@
     { label: "Control", href: "/control", icon: "CT" },
     { label: "Dispatch", href: "/dispatch", icon: "DP" },
     { label: "SCM", href: "/scm", icon: "SC" },
+    { label: "Sales", href: "/sales", icon: "SA" },
     { label: "Operator", href: "/operator", icon: "OP" },
     { label: "Driver", href: "/driver", icon: "DR" }
   ];
@@ -64,10 +66,20 @@
 
   const scmItems = [
     { label: "SCM Menu", href: "/scm", icon: "SM" },
+    { label: "Smart SCM", href: "/scm/smart", icon: "AI" },
     { label: "Auto Transfer", href: "/scm/transfer-dependencies", icon: "AT" },
     { label: "PO Split", href: "/scm/POsplit", icon: "PS" },
     { label: "PO/TO Schedule", href: "/scm/POTOschedule", icon: "PT" },
-    { label: "VRMA", href: "/scm/VRMA", icon: "VR" }
+    { label: "VRMA", href: "/scm/VRMA", icon: "VR" },
+    { label: "PO Route Rules", href: "/scm/route-rules", icon: "RT" }
+  ];
+
+  const salesItems = [
+    { label: "Sales Menu", href: "/sales", icon: "SM" },
+    { label: "Planning View", href: "/sales/planning", icon: "PL" },
+    { label: "PO/TO Schedule", href: "/sales/schedule", icon: "PT" },
+    { label: "Truck Monitor", href: "/sales/monitor", icon: "MO" },
+    { label: "SO Printing", href: "/sales/printing", icon: "PR" }
   ];
 
   const controlItems = [
@@ -85,6 +97,7 @@
     { label: "Overview", href: "/admin", controlSection: "dashboard", icon: "OV" },
     { label: "Accounts", href: "/admin", controlSection: "operators", icon: "AC" },
     { label: "Sync", href: "/admin", controlSection: "sync", icon: "SY" },
+    { label: "Yard Printers", href: "/admin/printers", icon: "PR" },
     { label: "Photo Storage", href: "/admin", controlSection: "storage", icon: "PS" },
     { label: "Audit", href: "/admin", controlSection: "audit", icon: "AU" }
   ];
@@ -104,6 +117,7 @@
     if (roles.has("yard_manager")) ["/control", "/operator"].forEach((href) => visiblePaths.add(href));
     if (roles.has("dispatcher")) ["/dispatch", "/scm"].forEach((href) => visiblePaths.add(href));
     if (roles.has("scm") || roles.has("scm_staff")) visiblePaths.add("/scm");
+    if (roles.has("sales")) visiblePaths.add("/sales");
     if (roles.has("operator")) visiblePaths.add("/operator");
     if (visiblePaths.size) return mainItems.filter((item) => visiblePaths.has(item.href));
     return mainItems;
@@ -113,6 +127,7 @@
     if (path.startsWith("/admin")) return { title: "Admin", items: adminItems };
     if (path.startsWith("/dispatch")) return { title: "Dispatch", items: dispatchItems };
     if (path.startsWith("/scm")) return { title: "SCM", items: scmItems };
+    if (path.startsWith("/sales")) return { title: "Sales", items: salesItems };
     return { title: "Control", items: controlItems };
   }
 
