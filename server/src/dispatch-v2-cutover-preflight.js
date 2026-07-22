@@ -13,11 +13,21 @@ export const dispatchV2CutoverChecks = [
   },
   {
     key: "activeDriverDays",
-    sql: "SELECT count(*)::int AS count FROM driver_day_records WHERE on_duty_at IS NOT NULL AND off_duty_at IS NULL"
+    sql: `SELECT count(*)::int AS count
+            FROM driver_day_records
+           WHERE on_duty_at IS NOT NULL
+             AND off_duty_at IS NULL
+             AND (plan_date >= CURRENT_DATE - 1 OR updated_at >= now() - interval '48 hours')`
   },
   {
     key: "inProgressDriverJobs",
-    sql: "SELECT count(*)::int AS count FROM driver_job_records WHERE status = 'in_progress'"
+    sql: `SELECT count(*)::int AS count
+            FROM driver_job_records
+           WHERE status = 'in_progress'
+             AND (
+               plan_date >= CURRENT_DATE - 1
+               OR COALESCE(started_at, created_at) >= now() - interval '48 hours'
+             )`
   },
   {
     key: "unresolvedTruckSwitches",
