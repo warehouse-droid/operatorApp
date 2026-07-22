@@ -1,13 +1,125 @@
 import { query, withTransaction } from "./db.js";
 import { syncDispatchDeliveryGroupsFromPlan } from "./dispatch-delivery-group-repository.js";
+import {
+  dispatchLoadAssignment,
+  dispatchLoadAssignmentDefaults,
+  normalizeDispatchPlanLoadAssignments
+} from "./dispatch-load-assignment.js";
+import { syncDispatchPlanLoadAssignments } from "./dispatch-load-assignment-repository.js";
 
 const CUSTOMER_PICKUP_DELIVERY_METHOD = "Pick-Up";
+const DISPATCH_PLAN_V2_VERSION = 2;
+const DISPATCH_PLAN_V2_BACKFILL_SOURCE = "dockerVer-backfill";
+const DISPATCH_PLAN_V2_SAVE_SOURCE = "dispatchV2-save";
+
+function uniqueTextValues(values = []) {
+  return [...new Set((values || []).map((value) => String(value ?? "").trim()).filter(Boolean))];
+}
+
+export function isDispatchV2Plan(plan = {}) {
+  return Number(plan?.summary?.dispatchPlanFormat?.version || 0) >= DISPATCH_PLAN_V2_VERSION;
+}
+
+function dispatchPlanV2Summary(summary = {}, {
+  previousSummary = {},
+  source = DISPATCH_PLAN_V2_SAVE_SOURCE,
+  migratedAt = new Date().toISOString(),
+  ownYardCodes = null
+} = {}) {
+  const previousFormat = previousSummary?.dispatchPlanFormat || {};
+  const resolvedOwnYardCodes = uniqueTextValues(
+    (Array.isArray(ownYardCodes) && ownYardCodes.length && ownYardCodes)
+    || (Array.isArray(summary?.ownYardCodes) && summary.ownYardCodes.length && summary.ownYardCodes)
+    || (Array.isArray(previousSummary?.ownYardCodes) && previousSummary.ownYardCodes.length && previousSummary.ownYardCodes)
+    || (Array.isArray(previousFormat?.ownYardCodes) && previousFormat.ownYardCodes.length && previousFormat.ownYardCodes)
+    || dispatchLoadAssignmentDefaults.ownYards
+  );
+  const existingV2Format = Number(summary?.dispatchPlanFormat?.version || 0) >= DISPATCH_PLAN_V2_VERSION
+    ? summary.dispatchPlanFormat
+    : Number(previousFormat?.version || 0) >= DISPATCH_PLAN_V2_VERSION
+      ? previousFormat
+      : null;
+  return {
+    ...(summary || {}),
+    ownYardCodes: resolvedOwnYardCodes,
+    dispatchPlanFormat: existingV2Format
+      ? { ...existingV2Format, ownYardCodes: resolvedOwnYardCodes }
+      : {
+          version: DISPATCH_PLAN_V2_VERSION,
+          source,
+          migratedAt: String(migratedAt || new Date().toISOString()),
+          ownYardCodes: resolvedOwnYardCodes
+        }
+  };
+}
+
+export function convertLegacyDispatchPlanToV2(plan = {}, {
+  migratedAt = new Date().toISOString(),
+  ownYardCodes = dispatchLoadAssignmentDefaults.ownYards
+} = {}) {
+  const normalized = normalizeDispatchPlanLoadAssignments(plan);
+  const loadRows = [];
+  for (const [truckIndex, truck] of (normalized.trucks || []).entries()) {
+    for (const [loadIndex, load] of (truck.loads || []).entries()) {
+      const assignment = dispatchLoadAssignment(truck, load, { driverSequence: loadIndex });
+      loadRows.push({ truckIndex, loadIndex, assignment });
+    }
+  }
+
+  const rowsByDriver = new Map();
+  for (const row of loadRows) {
+    const driverKey = row.assignment.driverLogin;
+    if (!rowsByDriver.has(driverKey)) rowsByDriver.set(driverKey, []);
+    rowsByDriver.get(driverKey).push(row);
+  }
+  const sequenceByLoad = new Map();
+  for (const rows of rowsByDriver.values()) {
+    rows.sort((left, right) => {
+      const leftStart = left.assignment.plannedStartMinute ?? Number.MAX_SAFE_INTEGER;
+      const rightStart = right.assignment.plannedStartMinute ?? Number.MAX_SAFE_INTEGER;
+      return leftStart - rightStart
+        || left.truckIndex - right.truckIndex
+        || left.loadIndex - right.loadIndex;
+    });
+    rows.forEach((row, driverSequence) => {
+      sequenceByLoad.set(`${row.truckIndex}:${row.loadIndex}`, driverSequence);
+    });
+  }
+
+  return {
+    ...normalized,
+    trucks: (normalized.trucks || []).map((truck, truckIndex) => ({
+      ...truck,
+      loads: (truck.loads || []).map((load, loadIndex) => ({
+        ...load,
+        ...dispatchLoadAssignment(truck, load, { driverSequence: loadIndex }),
+        driverSequence: sequenceByLoad.get(`${truckIndex}:${loadIndex}`) ?? loadIndex
+      }))
+    })),
+    summary: {
+      ...dispatchPlanV2Summary(normalized.summary || {}, {
+        source: DISPATCH_PLAN_V2_BACKFILL_SOURCE,
+        migratedAt,
+        ownYardCodes
+      })
+    }
+  };
+}
+
+function normalizedSnapshotTrucks(row = {}) {
+  return normalizeDispatchPlanLoadAssignments({
+    trucks: Array.isArray(row.trucks) ? row.trucks : []
+  }).trucks;
+}
 
 function todayDate() {
   return new Date().toISOString().slice(0, 10);
 }
 
 function cleanPlanDate(value) {
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    return value.toISOString().slice(0, 10);
+  }
   const text = String(value || "").slice(0, 10);
   return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : todayDate();
 }
@@ -94,9 +206,11 @@ export function dispatchPlannedAssignmentMap(plan = {}) {
           dispatchPlanned: true,
           dispatchPlanId: plan.id ? String(plan.id) : "",
           dispatchPlanDate: String(plan.planDate || "").slice(0, 10),
-          dispatchTruckPlate: truck.plate || "",
+          dispatchTruckPlate: dispatchLoadAssignment(truck, load).truckPlate,
           dispatchLoadName: load.name || "",
-          dispatchParkingSpot: truck.parkingSpot || ""
+          dispatchParkingSpot: dispatchLoadAssignment(truck, load).parkingSpot,
+          dispatchDriverLogin: dispatchLoadAssignment(truck, load).driverLogin,
+          dispatchDriverName: dispatchLoadAssignment(truck, load).driverName
         });
       }
     }
@@ -113,6 +227,8 @@ export function applyDispatchPlannedAssignment(order = {}, assignment = null) {
     dispatchTruckPlate: assignment?.dispatchTruckPlate || "",
     dispatchLoadName: assignment?.dispatchLoadName || "",
     dispatchParkingSpot: assignment?.dispatchParkingSpot || "",
+    dispatchDriverLogin: assignment?.dispatchDriverLogin || "",
+    dispatchDriverName: assignment?.dispatchDriverName || "",
     plannedOrderRef: assignment?.plannedOrderRef || ""
   };
 }
@@ -130,6 +246,7 @@ function truckSnapshotSummary(trucks = []) {
     orderCount: (truck.loads || []).reduce((sum, load) => sum + countLoadOrders(load), 0),
     stopCount: (truck.loads || []).reduce((sum, load) => sum + (load.stops || []).length, 0),
     loads: (truck.loads || []).map((load) => ({
+      ...dispatchLoadAssignment(truck, load),
       id: load.id || "",
       name: load.name || "",
       type: load.type || "",
@@ -144,7 +261,7 @@ function truckSnapshotSummary(trucks = []) {
 
 function snapshotSummary(row, { current = false } = {}) {
   const orders = Array.isArray(row.orders) ? row.orders : [];
-  const trucks = Array.isArray(row.trucks) ? row.trucks : [];
+  const trucks = normalizedSnapshotTrucks(row);
   return {
     id: current ? `current-${row.plan_id || row.id}` : String(row.id),
     snapshotId: current ? null : String(row.id),
@@ -298,8 +415,9 @@ async function enrichDispatchPlanWeights(plan) {
 
 async function sanitizeDispatchPlan(plan) {
   if (!plan) return null;
-  const pickupRefs = await pickupSalesOrderRefs(plan);
-  const enrichedPlan = await enrichDispatchPlanWeights(plan);
+  const normalizedPlan = normalizeDispatchPlanLoadAssignments(plan);
+  const pickupRefs = await pickupSalesOrderRefs(normalizedPlan);
+  const enrichedPlan = await enrichDispatchPlanWeights(normalizedPlan);
   if (!pickupRefs.size) return enrichedPlan;
 
   return {
@@ -448,7 +566,7 @@ export async function getDispatchPlanSnapshot(snapshotId) {
     );
     const row = result.rows[0];
     if (!row) return null;
-    return { ...snapshotSummary(row, { current: true }), orders: row.orders || [], rawTrucks: row.trucks || [] };
+    return { ...snapshotSummary(row, { current: true }), orders: row.orders || [], rawTrucks: normalizedSnapshotTrucks(row) };
   }
   const result = await query(
     `SELECT h.id, h.plan_id, h.plan_date::text AS plan_date, p.status, h.revision,
@@ -462,7 +580,7 @@ export async function getDispatchPlanSnapshot(snapshotId) {
   );
   const row = result.rows[0];
   if (!row) return null;
-  return { ...snapshotSummary(row), orders: row.orders || [], rawTrucks: row.trucks || [] };
+  return { ...snapshotSummary(row), orders: row.orders || [], rawTrucks: normalizedSnapshotTrucks(row) };
 }
 
 export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [], summary = {}, baseRevision = null, planDate = "", sessionId = "" } = {}) {
@@ -517,13 +635,20 @@ export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [
       }
       throw new Error("Dispatch plan not found.");
     }
-    const cleanPlan = await sanitizeDispatchPlan({
+    const sanitizedPlan = await sanitizeDispatchPlan({
       id: String(planId),
       revision: Number(result.rows[0].revision || 0),
       orders: Array.isArray(orders) ? orders : [],
       trucks: Array.isArray(trucks) ? trucks : [],
       summary: summary || {}
     });
+    const cleanPlan = {
+      ...sanitizedPlan,
+      summary: dispatchPlanV2Summary(sanitizedPlan.summary || {}, {
+        previousSummary: existingPlan.summary || {},
+        source: DISPATCH_PLAN_V2_SAVE_SOURCE
+      })
+    };
     if (existingPlan.saved_at) {
       await query(
         `INSERT INTO dispatch_plan_snapshot_history (
@@ -559,6 +684,11 @@ export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [
       planDate: expectedPlanDate,
       orders: cleanPlan.orders,
       trucks: cleanPlan.trucks
+    });
+    await syncDispatchPlanLoadAssignments({
+      ...cleanPlan,
+      id: planId,
+      planDate: expectedPlanDate
     });
     return getDispatchPlan(planId);
   });
@@ -622,12 +752,30 @@ export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" }
         WHERE id = $1`,
       [source.plan_id]
     );
-    const cleanPlan = await sanitizeDispatchPlan({
+    const sourcePlan = {
       id: String(source.plan_id),
       orders: source.orders || [],
       trucks: source.trucks || [],
       summary: source.summary || {}
-    });
+    };
+    const sanitizedPlan = await sanitizeDispatchPlan(
+      isDispatchV2Plan(sourcePlan)
+        ? sourcePlan
+        : convertLegacyDispatchPlanToV2(sourcePlan, {
+            ownYardCodes: current.summary?.ownYardCodes
+              || current.summary?.dispatchPlanFormat?.ownYardCodes
+              || dispatchLoadAssignmentDefaults.ownYards
+          })
+    );
+    const cleanPlan = {
+      ...sanitizedPlan,
+      summary: dispatchPlanV2Summary(sanitizedPlan.summary || {}, {
+        previousSummary: current.summary || {},
+        source: isDispatchV2Plan(sourcePlan)
+          ? sourcePlan.summary?.dispatchPlanFormat?.source || DISPATCH_PLAN_V2_SAVE_SOURCE
+          : DISPATCH_PLAN_V2_BACKFILL_SOURCE
+      })
+    };
     await query(
       `INSERT INTO dispatch_plan_snapshots (plan_id, orders, trucks, summary, saved_at)
        VALUES ($1, $2::jsonb, $3::jsonb, $4::jsonb, now())
@@ -644,6 +792,11 @@ export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" }
       orders: cleanPlan.orders,
       trucks: cleanPlan.trucks
     });
+    await syncDispatchPlanLoadAssignments({
+      ...cleanPlan,
+      id: source.plan_id,
+      planDate: currentDate
+    });
     return {
       plan: await getDispatchPlan(source.plan_id),
       restoredSnapshot: snapshotSummary(source),
@@ -653,19 +806,23 @@ export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" }
 }
 
 export async function confirmDispatchPlan(planId, { note = "" } = {}) {
-  const result = await query(
-    `UPDATE dispatch_plans
-        SET status = 'confirmed',
-            note = COALESCE(NULLIF($2, ''), note),
-            confirmed_at = COALESCE(confirmed_at, now()),
-            revision = revision + 1,
-            updated_at = now()
-      WHERE id = $1
-      RETURNING *`,
-    [planId, note || ""]
-  );
-  if (!result.rows[0]) throw new Error("Dispatch plan not found.");
-  return getDispatchPlan(planId);
+  return withTransaction(async () => {
+    const result = await query(
+      `UPDATE dispatch_plans
+          SET status = 'confirmed',
+              note = COALESCE(NULLIF($2, ''), note),
+              confirmed_at = COALESCE(confirmed_at, now()),
+              revision = revision + 1,
+              updated_at = now()
+        WHERE id = $1
+        RETURNING *`,
+      [planId, note || ""]
+    );
+    if (!result.rows[0]) throw new Error("Dispatch plan not found.");
+    const plan = await getDispatchPlan(planId);
+    await syncDispatchPlanLoadAssignments(plan);
+    return plan;
+  });
 }
 
 export async function reopenDispatchPlan(planId, { note = "" } = {}) {

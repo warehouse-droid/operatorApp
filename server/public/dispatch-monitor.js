@@ -334,6 +334,7 @@ function markerInfoForTruck(truck) {
       <span>${escapeHtml(truck.formattedLocation || "")}</span>
       <span>${truck.locationStale ? "Last known" : "Updated"} ${escapeHtml(formatTime(truck.locationTime))}</span>
       <span>Speed ${escapeHtml(formatKmh(truck.estimatedKmh))}</span>
+      ${truck.truckSwitchAttention ? `<span class="warning">Samsara assignment warning: ${escapeHtml(truck.truckSwitchAttention.samsara_error || "Truck switch requires attention")}</span>` : ""}
       ${direction ? `<span>Direction ${Math.round(direction.degrees)}° (${escapeHtml(direction.source)})</span>` : ""}
       ${load ? `<hr><b>${escapeHtml(load.loadName || "Load")}</b><span>${escapeHtml(orders)}</span><small>${stops}</small>` : ""}
     </div>
@@ -495,6 +496,7 @@ function renderTruckList() {
           <span>Speed ${escapeHtml(estimatedSpeed)}</span>
           <span>${direction ? `${Math.round(direction.degrees)}° ${escapeHtml(direction.source)}` : "No direction"}</span>
         </div>
+        ${truck.truckSwitchAttention ? `<div class="monitor-switch-warning">Samsara switch unresolved: ${escapeHtml(truck.truckSwitchAttention.samsara_error || "Dispatcher action required")}</div>` : ""}
         ${load ? `
           <div class="monitor-load-blob">
             <b>${escapeHtml(load.loadName || "Load")}</b>
@@ -514,6 +516,7 @@ function monitorOrderSearchText(order = {}) {
     order.destination,
     order.driver,
     order.vehiclePlate,
+    order.parkingSpot,
     order.loadName,
     ...(order.items || []).flatMap((item) => [item.itemName, item.unit])
   ].join(" ").toLowerCase();
@@ -555,7 +558,7 @@ function renderMonitorOrderList() {
           <span>${escapeHtml(monitorOrderStatusLabel(order.status))}</span>
         </div>
         <div class="monitor-order-route"><b>From</b><span>${escapeHtml(order.fromLocation || "—")}</span><b>To</b><span>${escapeHtml(order.destination || "—")}</span></div>
-        <div class="monitor-order-assignment"><span>Driver <b>${escapeHtml(order.driver || "—")}</b></span><span>Vehicle <b>${escapeHtml(order.vehiclePlate || "—")}</b></span></div>
+        <div class="monitor-order-assignment"><span>Driver <b>${escapeHtml(order.driver || "—")}</b></span><span>Vehicle <b>${escapeHtml(order.vehiclePlate || "—")}</b></span>${order.parkingSpot ? `<span>Parking <b>${escapeHtml(order.parkingSpot)}</b></span>` : ""}</div>
         <div class="monitor-order-times"><span><b>Planned</b> ${escapeHtml(plannedTime)}</span><span><b>Actual</b> ${escapeHtml(actualTime)}</span></div>
       </article>
     `;
@@ -593,7 +596,7 @@ function showMonitorOrderTooltip(card, event) {
     <div><span>${escapeHtml(item.itemName || "Item")}</span><strong>${escapeHtml(monitorItemQuantity(item))}</strong></div>
   `).join("") || `<div><span>No order-line details</span><strong>—</strong></div>`;
   tooltip.innerHTML = `
-    <header><strong>${escapeHtml(order.orderRef || "Order")}</strong><span>${escapeHtml(order.loadName || "Load")}</span></header>
+    <header><strong>${escapeHtml(order.orderRef || "Order")}</strong><span>${escapeHtml(order.loadName || "Load")}${order.parkingSpot ? ` · Parking ${escapeHtml(order.parkingSpot)}` : ""}</span></header>
     <p>${escapeHtml(order.fromLocation || "—")} → ${escapeHtml(order.destination || "—")}</p>
     <section>${itemRows}</section>
   `;

@@ -1,6 +1,5 @@
 import { query } from "./db.js";
-
-const OWN_YARD_CODES = new Set(["3445", "2967", "12441", "150"]);
+import { dispatchLoadAssignment, dispatchOwnYardCodes } from "./dispatch-load-assignment.js";
 
 function todayLocalDate() {
   const parts = new Intl.DateTimeFormat("en-CA", {
@@ -67,18 +66,30 @@ function orderByRef(plan, ref) {
   return null;
 }
 
-function findTruck(plan, row) {
-  const truckId = String(row.truck_id || "");
-  const plate = String(row.truck_plate || "").replace(/\s+/g, "").toUpperCase();
+function normalizedPlate(value) {
+  return String(value || "").replace(/\s+/g, "").toUpperCase();
+}
+
+function findTruck(plan, { truckId = "", truckPlate = "" } = {}) {
+  const id = String(truckId || "");
+  const plate = normalizedPlate(truckPlate);
   return (plan.trucks || []).find((truck) =>
-    String(truck?.id || "") === truckId
-    || String(truck?.plate || "").replace(/\s+/g, "").toUpperCase() === plate
+    (id && String(truck?.id || "") === id)
+    || (plate && normalizedPlate(truck?.plate) === plate)
   ) || {};
 }
 
-function findLoad(truck, row) {
+function findLoadContext(plan, row) {
   const loadId = String(row.load_id || "");
-  return (truck.loads || []).find((load) => String(load?.id || "") === loadId) || {};
+  const stopId = String(row.stop_id || "");
+  for (const truck of plan.trucks || []) {
+    const load = (truck.loads || []).find((candidate) =>
+      (loadId && String(candidate?.id || "") === loadId)
+      || (!loadId && stopId && (candidate?.stops || []).some((stop) => String(stop?.id || "") === stopId))
+    );
+    if (load) return { parentTruck: truck, load };
+  }
+  return { parentTruck: {}, load: {} };
 }
 
 function findStop(load, row) {
@@ -104,10 +115,14 @@ function requiredPickupLocations(order) {
   return ["3445"];
 }
 
-function orderFootprintPallets(order) {
+function orderFootprintPallets(order, lineRowIds = []) {
   if (!order) return 0;
   if (Array.isArray(order.items) && order.items.length) {
-    return order.items.reduce((sum, item) => (
+    const selectedIds = new Set((lineRowIds || []).map(String));
+    const items = selectedIds.size
+      ? order.items.filter((item) => selectedIds.has(String(item?.lineRowId ?? item?.line_row_id ?? item?.id ?? "")))
+      : order.items;
+    return items.reduce((sum, item) => (
       sum
       + numberValue(item?.splitQty ?? item?.pallets)
       + (numberValue(item?.layers) > 0 ? 1 : 0)
@@ -134,24 +149,27 @@ function pickupFootprintForLocation(plan, load, location) {
 function stopClass(plan, row, stop, order) {
   const type = String(row.stop_type || "");
   if (type === "travel") return "travel";
+  if (type === "truck_switch") return "truck_switch";
+  const ownYards = new Set(dispatchOwnYardCodes(plan));
   if (type === "pickup") {
     const location = String(stop?.location || row.location || "");
-    return OWN_YARD_CODES.has(location) ? "own_yard" : "vendor_yard";
+    return ownYards.has(location) ? "own_yard" : "vendor_yard";
   }
   if (type === "dropoff") {
-    const destination = String(order?.destinationYard || stop?.location || "");
-    return OWN_YARD_CODES.has(destination) ? "own_yard" : "delivery";
+    const destination = String(stop?.dropLocation || stop?.destinationYard || order?.destinationYard || stop?.location || "");
+    return ownYards.has(destination) ? "own_yard" : "delivery";
   }
   return "unknown";
 }
 
-function plannedStopMinutes(stopClassValue, truck, palletCount) {
+function plannedStopMinutes(stopClassValue, planningProfile, palletCount) {
   if (stopClassValue === "travel") return 0;
-  if (stopClassValue === "own_yard") return Math.round(numberValue(truck.ownYardFixedMinutes || truck.loadMinutes || 40));
-  if (stopClassValue === "vendor_yard") return Math.round(numberValue(truck.vendorFixedMinutes || truck.outsideFixedMinutes || truck.unloadMinutes || 35));
+  if (stopClassValue === "truck_switch") return Math.round(numberValue(planningProfile.truckSwitchMinutes || 10));
+  if (stopClassValue === "own_yard") return Math.round(numberValue(planningProfile.ownYardFixedMinutes || planningProfile.loadMinutes || 40));
+  if (stopClassValue === "vendor_yard") return Math.round(numberValue(planningProfile.vendorFixedMinutes || planningProfile.outsideFixedMinutes || planningProfile.unloadMinutes || 35));
   if (stopClassValue === "delivery") {
-    return Math.round(numberValue(truck.deliveryFixedMinutes || truck.outsideFixedMinutes || truck.unloadMinutes || 35)
-      + (numberValue(palletCount) * numberValue(truck.minutesPerPallet || 1)));
+    return Math.round(numberValue(planningProfile.deliveryFixedMinutes || planningProfile.outsideFixedMinutes || planningProfile.unloadMinutes || 35)
+      + (numberValue(palletCount) * numberValue(planningProfile.minutesPerPallet || 1)));
   }
   return 0;
 }
@@ -166,6 +184,7 @@ function makeEmptyAggregate(key, label = key) {
     vendorStops: 0,
     deliveryStops: 0,
     travelStops: 0,
+    truckSwitchStops: 0,
     actualMinutes: 0,
     grossMinutes: 0,
     restMinutes: 0,
@@ -184,6 +203,7 @@ function addStop(aggregate, stop) {
   if (stop.stopClass === "vendor_yard") aggregate.vendorStops += 1;
   if (stop.stopClass === "delivery") aggregate.deliveryStops += 1;
   if (stop.stopClass === "travel") aggregate.travelStops += 1;
+  if (stop.stopClass === "truck_switch") aggregate.truckSwitchStops += 1;
   if (stop.photoCount > 0) aggregate.photoStops += 1;
   aggregate.actualMinutes += stop.actualMinutes;
   aggregate.grossMinutes += stop.grossMinutes;
@@ -212,27 +232,34 @@ function classLabel(stopClassValue) {
   if (stopClassValue === "vendor_yard") return "Vendor Yard";
   if (stopClassValue === "delivery") return "Delivery";
   if (stopClassValue === "travel") return "Travel";
+  if (stopClassValue === "truck_switch") return "Truck Switch";
   return "Unknown";
 }
 
-function rowToStop(row) {
+export function dispatchStatisticStopFromRow(row) {
   const plan = {
     id: row.plan_id,
     planDate: String(row.plan_date || "").slice(0, 10),
     orders: Array.isArray(row.orders) ? row.orders : [],
-    trucks: Array.isArray(row.trucks) ? row.trucks : []
+    trucks: Array.isArray(row.trucks) ? row.trucks : [],
+    summary: row.summary || {}
   };
-  const truck = findTruck(plan, row);
-  const load = findLoad(truck, row);
+  const { parentTruck, load } = findLoadContext(plan, row);
+  const assignment = dispatchLoadAssignment(parentTruck, load);
+  const assignedTruck = findTruck(plan, {
+    truckId: row.truck_id || assignment.truckId,
+    truckPlate: row.truck_plate || assignment.truckPlate
+  });
+  const planningProfile = { ...assignedTruck, ...parentTruck, ...load };
   const stop = findStop(load, row);
   const order = primaryOrder(plan, row);
   const currentClass = stopClass(plan, row, stop, order);
   const pallets = row.stop_type === "pickup"
     ? pickupFootprintForLocation(plan, load, stop?.location)
     : currentClass === "delivery"
-      ? orderFootprintPallets(order)
-      : orderFootprintPallets(order);
-  const plannedMinutes = plannedStopMinutes(currentClass, truck, pallets);
+      ? orderFootprintPallets(order, stop?.lineRowIds)
+      : orderFootprintPallets(order, stop?.lineRowIds);
+  const plannedMinutes = plannedStopMinutes(currentClass, planningProfile, pallets);
   const grossSeconds = row.status === "complete" ? secondsBetween(row.started_at, row.completed_at) : 0;
   const restSeconds = row.status === "complete"
     ? Math.min(grossSeconds, Math.max(0, numberValue(row.rest_seconds)))
@@ -245,7 +272,7 @@ function rowToStop(row) {
     planId: String(row.plan_id || ""),
     planDate: String(row.plan_date || "").slice(0, 10),
     driverLogin: row.driver_login || "",
-    truckPlate: row.truck_plate || truck.plate || "",
+    truckPlate: row.truck_plate || assignment.truckPlate || assignedTruck.plate || parentTruck.plate || "",
     loadName: row.load_name || load.name || "",
     stopId: row.stop_id || "",
     stopType: row.stop_type || "",
@@ -337,7 +364,8 @@ export async function getDispatchStatistics({ from = "", to = "", driver = "" } 
                  AND COALESCE(rr.ended_at, now()) > r.started_at
             ), 0) AS rest_seconds,
             COALESCE(s.orders, '[]'::jsonb) AS orders,
-            COALESCE(s.trucks, '[]'::jsonb) AS trucks
+            COALESCE(s.trucks, '[]'::jsonb) AS trucks,
+            COALESCE(s.summary, '{}'::jsonb) AS summary
        FROM driver_job_records r
        LEFT JOIN dispatch_plan_snapshots s ON s.plan_id::text = r.plan_id::text
       WHERE r.plan_date BETWEEN $1::date AND $2::date
@@ -346,11 +374,11 @@ export async function getDispatchStatistics({ from = "", to = "", driver = "" } 
       ORDER BY r.plan_date DESC, r.driver_login, r.started_at DESC NULLS LAST`,
     params
   );
-  const stops = result.rows.map(rowToStop);
+  const stops = result.rows.map(dispatchStatisticStopFromRow);
   const completed = stops.filter((stop) => stop.status === "complete");
   const byDriver = aggregateBy(stops, (stop) => stop.driverLogin || "unknown");
   const byStopClass = aggregateBy(completed, (stop) => stop.stopClass, (stop) => stop.stopClassLabel)
-    .sort((left, right) => ["own_yard", "vendor_yard", "delivery", "travel", "unknown"].indexOf(left.key) - ["own_yard", "vendor_yard", "delivery", "travel", "unknown"].indexOf(right.key));
+    .sort((left, right) => ["own_yard", "vendor_yard", "delivery", "travel", "truck_switch", "unknown"].indexOf(left.key) - ["own_yard", "vendor_yard", "delivery", "travel", "truck_switch", "unknown"].indexOf(right.key));
   const daily = aggregateBy(stops, (stop) => stop.planDate)
     .sort((left, right) => left.key.localeCompare(right.key));
   const total = finalizeAggregate(stops.reduce((aggregate, stop) => {

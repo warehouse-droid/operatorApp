@@ -1,4 +1,5 @@
 import { query, withTransaction } from "./db.js";
+import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
 
 function dateOnly(value) {
   if (!value) return null;
@@ -51,10 +52,11 @@ function findGroupAssignment(plan, groupRef) {
     for (const load of truck.loads || []) {
       if (load.returnOnly) continue;
       if (!(load.stops || []).some((stop) => stop?.type === "drop" && String(stop.orderId || "") === groupRef)) continue;
+      const assignment = dispatchLoadAssignment(truck, load);
       return {
-        truckPlate: String(truck.plate || ""),
+        truckPlate: assignment.truckPlate,
         loadName: String(load.name || ""),
-        parkingSpot: String(truck.parkingSpot || "")
+        parkingSpot: assignment.parkingSpot
       };
     }
   }

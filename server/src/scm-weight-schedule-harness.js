@@ -102,7 +102,11 @@ includesAll(repository, [
   "status = ANY($2::text[])",
   "cardinality($6::text[]) = 0",
   "globalSearch ? [] : normalizeScmScheduleFilterValues(status)",
-  'globalSearch ? "" : String(view || "").trim()'
+  'globalSearch ? "" : String(view || "").trim()',
+  "load.value->>'driverName'",
+  "load.value->>'truckPlate'",
+  "NULLIF(s.dispatch_assignment_note, '')",
+  "dispatch_assignment_note = EXCLUDED.dispatch_assignment_note"
 ], "Batched enrichment, type-safe planning, multi-value filters, and filter-free global search");
 includesAll(enrichment, [
   "export async function createPurchaseOrderDispatchEnricher",

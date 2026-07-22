@@ -3,6 +3,7 @@ import { config, isNetSuiteSandboxEnvironment } from "./config.js";
 import { query, withTransaction } from "./db.js";
 import { writeDispatchAudit } from "./dispatch-audit-repository.js";
 import { resolveDispatchSalesTarget } from "./dispatch-order-target-repository.js";
+import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
 
 export const DEPENDENCY_YARDS = Object.freeze([
   { code: "3445", locationId: 1, address: "3445 Kennedy Road, Toronto, ON", priority: 1, westPenaltyMinutes: 0 },
@@ -2198,8 +2199,24 @@ function dispatchOrderRefs(order = {}) {
   ].map(text).filter(Boolean))];
 }
 
+function physicalTruckLoadSequence(plan = {}) {
+  const sequences = new Map();
+  const nextSequenceByTruck = new Map();
+  for (const [truckIndex, truck] of (plan.trucks || []).entries()) {
+    for (const [loadIndex, load] of (truck.loads || []).entries()) {
+      const assignment = dispatchLoadAssignment(truck, load, { driverSequence: loadIndex });
+      const truckPlate = text(assignment.truckPlate).replace(/\s+/g, "").toUpperCase() || `parent:${truckIndex}`;
+      const sequence = nextSequenceByTruck.get(truckPlate) || 0;
+      sequences.set(`${truckIndex}:${loadIndex}`, sequence);
+      nextSequenceByTruck.set(truckPlate, sequence + 1);
+    }
+  }
+  return sequences;
+}
+
 function loadSequenceIndex(plan = {}) {
   const index = new Map();
+  const truckLoadSequence = physicalTruckLoadSequence(plan);
   const orderByRef = new Map();
   for (const order of plan.orders || []) {
     for (const ref of dispatchOrderRefs(order)) orderByRef.set(ref, order);
@@ -2207,6 +2224,7 @@ function loadSequenceIndex(plan = {}) {
   let sequence = 0;
   for (const [truckIndex, truck] of (plan.trucks || []).entries()) {
     for (const [loadIndex, load] of (truck.loads || []).entries()) {
+      const loadAssignment = dispatchLoadAssignment(truck, load, { driverSequence: loadIndex });
       const sequencedStops = [];
       for (const stop of load.stops || []) {
         sequence += 1;
@@ -2236,14 +2254,14 @@ function loadSequenceIndex(plan = {}) {
           firstPickupSequence: pickupSequences.length ? Math.min(...pickupSequences) : sequence,
           firstPickupArrival: pickupArrivals.length ? Math.min(...pickupArrivals) : null,
           planDate: plan.planDate,
-          truckPlate: truck.plate,
+          truckPlate: loadAssignment.truckPlate,
           truckIndex,
-          loadIndex,
+          loadIndex: truckLoadSequence.get(`${truckIndex}:${loadIndex}`) ?? loadIndex,
           loadId: load.id,
           loadName: load.name,
           stopType: stop.type,
-          loadStart: dependencyTimingNumber(load.timing?.start),
-          loadFinish: dependencyTimingNumber(load.timing?.finish),
+          loadStart: dependencyTimingNumber(loadAssignment.plannedStartMinute ?? load.timing?.start),
+          loadFinish: dependencyTimingNumber(loadAssignment.plannedFinishMinute ?? load.timing?.finish),
           arrival: dependencyTimingNumber(stop.timing?.arrival ?? stop.arrival ?? stop.arrive),
           departure: dependencyTimingNumber(stop.timing?.depart ?? stop.end ?? stop.departure ?? stop.leave)
         };
@@ -2265,13 +2283,16 @@ function replenishmentTransferPrecedesSales(transferAssignment, salesAssignment)
   if (String(transferAssignment.loadId || "") === String(salesAssignment.loadId || "")) {
     return transferAssignment.sequence < salesAssignment.firstPickupSequence;
   }
-  if (String(transferAssignment.truckPlate || "") === String(salesAssignment.truckPlate || "")
-    && Number(transferAssignment.loadIndex) < Number(salesAssignment.loadIndex)) {
-    return true;
-  }
   const transferFinish = dependencyTimingNumber(transferAssignment.loadFinish ?? transferAssignment.departure);
-  const salesPickup = dependencyTimingNumber(salesAssignment.firstPickupArrival ?? salesAssignment.arrival);
-  return Number.isFinite(transferFinish) && Number.isFinite(salesPickup) && transferFinish <= salesPickup;
+  const salesPickup = dependencyTimingNumber(salesAssignment.firstPickupArrival);
+  const hasComparableTiming = Number.isFinite(transferFinish) && Number.isFinite(salesPickup);
+  const sameTruck = String(transferAssignment.truckPlate || "") === String(salesAssignment.truckPlate || "");
+  if (sameTruck) {
+    return hasComparableTiming
+      ? transferFinish <= salesPickup
+      : Number(transferAssignment.loadIndex) < Number(salesAssignment.loadIndex);
+  }
+  return hasComparableTiming && transferFinish <= salesPickup;
 }
 
 async function priorPlannedTransferRefs(transferRefs = [], plan = {}) {

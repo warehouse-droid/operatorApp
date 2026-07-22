@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { query, withTransaction } from "./db.js";
+import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
 import { isNetSuiteSandboxEnvironment } from "./config.js";
 import { writeAudit } from "./auth-repository.js";
 import { getDispatchDeliveryGroup, listDispatchDeliveryGroups } from "./dispatch-delivery-group-repository.js";
@@ -2447,6 +2448,7 @@ export async function applyConfirmedDispatchPlanToDelivery(plan, { forceOrderRef
   for (const truck of plan.trucks || []) {
     for (const load of truck.loads || []) {
       if (load.returnOnly) continue;
+      const assignment = dispatchLoadAssignment(truck, load);
       for (const stop of load.stops || []) {
         if (stop.type !== "drop" || !stop.orderId) continue;
         const order = (plan.orders || []).find((item) => item.id === stop.orderId);
@@ -2455,9 +2457,9 @@ export async function applyConfirmedDispatchPlanToDelivery(plan, { forceOrderRef
         plannedRows.push({
           tranid: order.id,
           orderType: order.type,
-          truckPlate: truck.plate || "",
+          truckPlate: assignment.truckPlate,
           loadName: load.name || "",
-          parkingSpot: truck.parkingSpot || "",
+          parkingSpot: assignment.parkingSpot,
           planDate: plan.planDate,
           forcePlannedAt: forceRefs.has(String(order.id || ""))
         });

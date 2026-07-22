@@ -602,6 +602,67 @@ try {
     check(orderedConflicts.length === 0,
       "Replenishment TO before SO pickup in the same load should be valid.", { orderedConflicts });
 
+    const sharedTruckPlan = {
+      id: 0,
+      planDate: "2097-07-13",
+      orders: dependencyPlanOrders,
+      trucks: [{
+        id: "PARENT-A",
+        plate: "PARENT-A",
+        loads: [{
+          id: "DEP-TO-LOAD",
+          name: "Transfer first",
+          truckPlate: "SHARED-V2",
+          driverLogin: "driver-a",
+          driverSequence: 0,
+          stops: [
+            { id: "to-pick-v2", type: "pick", orderId: dependency.transferOrderRef, location: dependency.sourceLocation },
+            { id: "to-drop-v2", type: "drop", orderId: dependency.transferOrderRef, location: "12441" }
+          ]
+        }]
+      }, {
+        id: "PARENT-B",
+        plate: "PARENT-B",
+        loads: [{
+          id: "DEP-SO-LOAD",
+          name: "Sales second",
+          truckPlate: "SHARED-V2",
+          driverLogin: "driver-b",
+          driverSequence: 0,
+          stops: [
+            { id: "so-pick-v2", type: "pick", orderId: salesOrderRef, location: "12441" },
+            { id: "so-drop-v2", type: "drop", orderId: salesOrderRef, location: "Customer" }
+          ]
+        }]
+      }]
+    };
+    const sharedTruckConflicts = await validateDispatchPlanDependencies(sharedTruckPlan);
+    check(sharedTruckConflicts.length === 0,
+      "Per-load driver sequences must not replace the physical truck load order for replenishment dependencies.", { sharedTruckConflicts });
+    const reversedSharedTruckPlan = structuredClone(sharedTruckPlan);
+    reversedSharedTruckPlan.trucks.reverse();
+    const reversedSharedTruckConflicts = await validateDispatchPlanDependencies(reversedSharedTruckPlan);
+    check(reversedSharedTruckConflicts.some((message) => message.includes(dependency.transferOrderRef)),
+      "A Sales load before its replenishment load on the same per-load truck must remain blocked.", { reversedSharedTruckConflicts });
+
+    const reversedTimeSharedTruckPlan = structuredClone(sharedTruckPlan);
+    reversedTimeSharedTruckPlan.trucks[0].loads[0].plannedStartMinute = 420;
+    reversedTimeSharedTruckPlan.trucks[0].loads[0].plannedFinishMinute = 600;
+    reversedTimeSharedTruckPlan.trucks[1].loads[0].plannedStartMinute = 490;
+    reversedTimeSharedTruckPlan.trucks[1].loads[0].plannedFinishMinute = 650;
+    reversedTimeSharedTruckPlan.trucks[1].loads[0].stops[0].timing = { arrival: 500, depart: 515 };
+    const reversedTimeSharedTruckConflicts = await validateDispatchPlanDependencies(reversedTimeSharedTruckPlan);
+    check(reversedTimeSharedTruckConflicts.some((message) => message.includes(dependency.transferOrderRef)),
+      "Comparable V2 timing must block a cross-driver transfer that finishes after the Sales pickup on the same truck.",
+      { reversedTimeSharedTruckConflicts });
+
+    const orderedTimeSharedTruckPlan = structuredClone(reversedTimeSharedTruckPlan);
+    orderedTimeSharedTruckPlan.trucks[0].loads[0].plannedFinishMinute = 480;
+    const orderedTimeSharedTruckConflicts = await validateDispatchPlanDependencies(orderedTimeSharedTruckPlan);
+    check(orderedTimeSharedTruckConflicts.length === 0,
+      "Comparable V2 timing should allow a cross-driver transfer that finishes before the Sales pickup on the same truck.",
+      { orderedTimeSharedTruckConflicts });
+
     let safeNormalGroupingBlocked = false;
     try {
       await assertNoActiveOrderDependenciesByRefs(

@@ -23,7 +23,7 @@ assert(
   "The photo popup completion button must retain the GPS approval gate."
 );
 
-const completeHandler = driverSource.match(/if \(action === "complete-job" && currentJob\) \{([\s\S]*?)\n  \}\n\}\);/)?.[1] || "";
+const completeHandler = driverSource.match(/if \(action === "complete-job" && currentJob\) \{([\s\S]*?)\r?\n  \}\r?\n\}\);/)?.[1] || "";
 assert(completeHandler.includes("await ensureLocationApprovalBeforeConfirmation()"), "Final completion must reassert frontend GPS approval.");
 assert(
   completeHandler.indexOf("await ensureLocationApprovalBeforeConfirmation()") < completeHandler.indexOf("uploadDriverPhotos"),

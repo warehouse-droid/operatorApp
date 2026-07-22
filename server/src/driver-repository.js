@@ -1,7 +1,8 @@
 import crypto from "node:crypto";
-import { query } from "./db.js";
+import { query, withTransaction } from "./db.js";
 import { config } from "./config.js";
 import { createSamsaraDriverVehicleAssignment, createSamsaraMechanicDvir, findSamsaraDvirForVehicle, setSamsaraDriverDutyStatus } from "./samsara.js";
+import { dispatchLoadAssignment, dispatchOwnYardCodes, flattenDispatchPlanLoads, normalizeDispatchPlanLoadAssignments } from "./dispatch-load-assignment.js";
 
 const YARD_ADDRESSES = {
   "3445": "3445 Kennedy Road, Toronto, ON",
@@ -9,8 +10,23 @@ const YARD_ADDRESSES = {
   "12441": "12441 Woodbine Avenue, Whitchurch-Stouffville, ON",
   "150": "150 Clark Blvd, Brampton, ON L6T 4Y8, Canada"
 };
-const OWN_YARD_CODES = new Set(Object.keys(YARD_ADDRESSES));
 const SAMSARA_ACCOUNT_LIMIT_MS = 8 * 60 * 60 * 1000;
+
+function ownYardCodeSet(plan = {}) {
+  const planHasOwnYards = [
+    plan.ownYardCodes,
+    plan.ownYards,
+    plan.summary?.ownYardCodes,
+    plan.summary?.ownYards,
+    plan.summary?.dispatchPlanFormat?.ownYardCodes
+  ].some((candidate) => Array.isArray(candidate) && candidate.length);
+  const configuredOwnYards = planHasOwnYards ? null : config.dispatch?.ownYardCodes;
+  return new Set(dispatchOwnYardCodes(plan, configuredOwnYards));
+}
+
+function isOwnYard(plan = {}, value = "") {
+  return ownYardCodeSet(plan).has(String(value || "").trim());
+}
 
 function isPhotoReference(value) {
   const text = String(value || "");
@@ -98,14 +114,50 @@ function returnJobId(plan, truck, load, from, to) {
   return [plan.id, truck.id || truck.plate, load.id, "RETURN", from, to].map((part) => encodeURIComponent(String(part || ""))).join(":");
 }
 
+function truckSwitchJobId(plan, driverLogin, nextLoad) {
+  return [plan.id, driverKey(driverLogin), nextLoad.id, "TRUCK_SWITCH"]
+    .map((part) => encodeURIComponent(String(part || "")))
+    .join(":");
+}
+
 function sortedPlans(rows) {
-  return rows.map((row) => ({
+  return rows.map((row) => normalizeDispatchPlanLoadAssignments({
     id: row.id,
     planDate: planDateValue(row.plan_date),
     status: row.status,
+    summary: row.summary || {},
+    ownYardCodes: Array.isArray(row.own_yard_codes) ? row.own_yard_codes : undefined,
     orders: Array.isArray(row.orders) ? row.orders : [],
     trucks: Array.isArray(row.trucks) ? row.trucks : []
   }));
+}
+
+function assignedTruckForLoad(truck = {}, load = {}) {
+  const assignment = dispatchLoadAssignment(truck, load);
+  return {
+    ...truck,
+    id: assignment.truckId || truck.id || "",
+    plate: assignment.truckPlate || truck.plate || "",
+    driverLogin: assignment.driverLogin,
+    driver: assignment.driverName || truck.driver || "",
+    parkingSpot: assignment.parkingSpot,
+    base: assignment.switchYard || truck.base || ""
+  };
+}
+
+function driverLoadAssignments(plan, driverLogin) {
+  const login = driverKey(driverLogin);
+  return flattenDispatchPlanLoads(plan)
+    .filter((row) => row.driverLogin === login)
+    .map((row) => ({ ...row, truck: assignedTruckForLoad(row.truck, row.load) }))
+    .sort((left, right) => {
+      const leftStart = left.plannedStartMinute ?? Number.MAX_SAFE_INTEGER;
+      const rightStart = right.plannedStartMinute ?? Number.MAX_SAFE_INTEGER;
+      return leftStart - rightStart
+        || left.driverSequence - right.driverSequence
+        || left.truckIndex - right.truckIndex
+        || left.loadIndex - right.loadIndex;
+    });
 }
 
 function orderByRef(plan, ref) {
@@ -187,8 +239,30 @@ function lastRoutedStop(load) {
   return null;
 }
 
+function scopedPurchaseOrderDropLocation(stop = {}, order = {}) {
+  const orderType = String(order.type || order.orderType || order.order_type || "").trim().toUpperCase();
+  const purchaseOrder = orderType === "PO" || orderType === "PURCHASE_ORDER";
+  const lineScoped = Array.isArray(stop.lineRowIds) && stop.lineRowIds.length > 0;
+  const dropoffScoped = Boolean(String(stop.dropoffKey || stop.dropoff_key || "").trim());
+  return purchaseOrder && (lineScoped || dropoffScoped) ? String(stop.location || "") : "";
+}
+
 function dropLocationForStop(stop = {}, order = {}) {
-  return String(stop.dropLocation || order.destinationYard || order.address || order.id || stop.orderId || "");
+  return String(
+    stop.dropLocation
+    || stop.drop_location
+    || stop.destinationYard
+    || stop.destination_yard
+    || scopedPurchaseOrderDropLocation(stop, order)
+    || order.destinationYard
+    || order.destination_yard
+    || order.toLocation
+    || order.to_location
+    || order.address
+    || order.id
+    || stop.orderId
+    || ""
+  );
 }
 
 function dropAddressForStop(stop = {}, order = {}) {
@@ -231,11 +305,97 @@ function loadEndPoint(plan, truck, load) {
   };
 }
 
-function startTravelForLoad(plan, truck, load, loadIndex) {
+function loadEndOwnYard(plan, load) {
+  if (!load) return "";
+  if (load.returnOnly) {
+    const yard = String(load.returnYard || "");
+    return isOwnYard(plan, yard) ? yard : "";
+  }
+  const stop = lastRoutedStop(load);
+  if (!stop) return "";
+  if (stop.type === "pick") {
+    const yard = String(stop.location || "");
+    return isOwnYard(plan, yard) ? yard : "";
+  }
+  const order = orderByRef(plan, stop.orderId) || {};
+  const location = dropLocationForStop(stop, order).trim();
+  return isOwnYard(plan, location) ? location : "";
+}
+
+function buildTruckSwitchApproachJob(plan, previousAssignment, nextAssignment, sequenceIndex) {
+  const load = nextAssignment.load;
+  const switchYard = String(load.switchYard || load.switch_yard || nextAssignment.truck?.base || "");
+  if (!switchYard) return null;
+  if (loadEndOwnYard(plan, previousAssignment.load) === switchYard) return null;
+  const from = loadEndPoint(plan, previousAssignment.truck, previousAssignment.load);
+  if (!from?.location) return null;
+  const normalizedFromAddress = String(from.address || "").trim().toLowerCase();
+  const normalizedSwitchAddress = String(yardAddress(switchYard) || "").trim().toLowerCase();
+  if (normalizedFromAddress && normalizedFromAddress === normalizedSwitchAddress) return null;
+  const parsedMinutes = Number(
+    load.handoffTravelMinutes
+    ?? load.handoff_travel_minutes
+    ?? load.timing?.handoffTravel?.minutes
+    ?? 30
+  );
+  const handoffMinutes = Math.max(1, Math.round(Number.isFinite(parsedMinutes) ? parsedMinutes : 30));
+  const parsedSwitchMinutes = Number(load.truckSwitchMinutes ?? load.truck_switch_minutes ?? 10);
+  const switchMinutes = Math.max(0, Math.round(Number.isFinite(parsedSwitchMinutes) ? parsedSwitchMinutes : 10));
+  const plannedFinishMinute = Number.isFinite(Number(nextAssignment.plannedStartMinute))
+    ? Number(nextAssignment.plannedStartMinute) - switchMinutes
+    : null;
+  const plannedStartMinute = plannedFinishMinute === null ? null : plannedFinishMinute - handoffMinutes;
+  return {
+    jobId: travelJobId(
+      plan,
+      previousAssignment.truck,
+      load,
+      from.location,
+      switchYard,
+      "TRUCK_SWITCH_APPROACH"
+    ),
+    planId: plan.id,
+    planDate: plan.planDate,
+    driverLogin: nextAssignment.driverLogin,
+    driverName: nextAssignment.driverName || previousAssignment.driverName || "",
+    truckId: previousAssignment.truck?.id || "",
+    truckPlate: previousAssignment.truck?.plate || "",
+    parkingSpot: previousAssignment.parkingSpot || previousAssignment.truck?.parkingSpot || "",
+    loadId: load.id || "",
+    loadName: load.name || "",
+    stopId: `travel-switch-${load.id || sequenceIndex}`,
+    stopType: "travel",
+    location: `${from.location} to ${switchYard}`,
+    address: yardAddress(switchYard),
+    fromLocation: from.location,
+    fromAddress: from.address || yardAddress(from.location),
+    toLocation: switchYard,
+    toAddress: yardAddress(switchYard),
+    windowStart: "",
+    windowEnd: "",
+    instructions: `Travel to ${switchYard} before switching from ${previousAssignment.truck?.plate || "the current truck"} to ${nextAssignment.truck?.plate || "the next truck"}.`,
+    orderRefs: [],
+    orderTypes: [],
+    requiredPhotos: 0,
+    handoffTravel: true,
+    plannedStartMinute,
+    plannedFinishMinute,
+    sequence: { truckIndex: previousAssignment.truckIndex, loadIndex: sequenceIndex, stopIndex: -3 }
+  };
+}
+
+function startTravelForLoad(plan, truck, load, loadIndex, previousAssignment = null) {
   const firstPickup = firstPickupStop(load);
   if (!firstPickup?.location) return null;
   let from = null;
-  if (loadIndex <= 0) {
+  if (previousAssignment) {
+    if (String(previousAssignment.truck?.plate || "") !== String(truck?.plate || "")) {
+      const switchYard = String(load.switchYard || load.switch_yard || truck.base || "");
+      from = switchYard ? { location: switchYard, address: yardAddress(switchYard) } : null;
+    } else {
+      from = loadEndPoint(plan, previousAssignment.truck, previousAssignment.load);
+    }
+  } else if (loadIndex <= 0) {
     if (!truck?.base) return null;
     from = { location: String(truck.base), address: yardAddress(truck.base) };
   } else {
@@ -250,8 +410,8 @@ function startTravelForLoad(plan, truck, load, loadIndex) {
   };
 }
 
-function buildTravelJob(plan, truck, load, truckIndex, loadIndex) {
-  const travel = startTravelForLoad(plan, truck, load, loadIndex);
+function buildTravelJob(plan, truck, load, truckIndex, loadIndex, previousAssignment = null) {
+  const travel = startTravelForLoad(plan, truck, load, loadIndex, previousAssignment);
   if (!travel) return null;
   return {
     jobId: travelJobId(plan, truck, load, travel.from, travel.to),
@@ -326,8 +486,15 @@ function buildInterStopTravelJob(plan, truck, load, previousStop, stop, truckInd
   };
 }
 
-function buildReturnJob(plan, truck, load, truckIndex, loadIndex) {
-  const previous = loadEndPoint(plan, truck, (truck.loads || [])[loadIndex - 1]);
+function buildReturnJob(plan, truck, load, truckIndex, loadIndex, previousAssignment = null) {
+  const changedTruck = previousAssignment
+    && String(previousAssignment.truck?.plate || "") !== String(truck?.plate || "");
+  const switchYard = String(load.switchYard || load.switch_yard || truck.base || "");
+  const previous = changedTruck
+    ? { location: switchYard, address: yardAddress(switchYard) }
+    : previousAssignment
+      ? loadEndPoint(plan, previousAssignment.truck, previousAssignment.load)
+    : loadEndPoint(plan, truck, (truck.loads || [])[loadIndex - 1]);
   const to = String(load.returnYard || "12441");
   const from = previous?.location || String(truck.base || "");
   if (!from || String(from) === to) return null;
@@ -357,6 +524,46 @@ function buildReturnJob(plan, truck, load, truckIndex, loadIndex) {
     orderTypes: [],
     requiredPhotos: 0,
     sequence: { truckIndex, loadIndex, stopIndex: -1 }
+  };
+}
+
+function buildTruckSwitchJob(plan, previousAssignment, nextAssignment, sequenceIndex) {
+  const load = nextAssignment.load;
+  const truck = nextAssignment.truck;
+  const switchYard = String(load.switchYard || load.switch_yard || truck.base || "");
+  const parsedSwitchMinutes = Number(load.truckSwitchMinutes ?? load.truck_switch_minutes ?? 10);
+  const switchMinutes = Math.max(0, Math.round(Number.isFinite(parsedSwitchMinutes) ? parsedSwitchMinutes : 10));
+  return {
+    jobId: truckSwitchJobId(plan, nextAssignment.driverLogin, load),
+    planId: plan.id,
+    planDate: plan.planDate,
+    driverLogin: nextAssignment.driverLogin,
+    driverName: nextAssignment.driverName || truck.driver || "",
+    truckId: truck.id || "",
+    truckPlate: truck.plate || "",
+    fromTruckId: previousAssignment.truck?.id || "",
+    fromTruckPlate: previousAssignment.truck?.plate || "",
+    nextTruckId: truck.id || "",
+    nextTruckPlate: truck.plate || "",
+    parkingSpot: nextAssignment.parkingSpot || truck.parkingSpot || "",
+    switchYard,
+    plannedSwitchMinute: Number.isFinite(Number(nextAssignment.plannedStartMinute))
+      ? Number(nextAssignment.plannedStartMinute) - switchMinutes
+      : null,
+    truckSwitchMinutes: switchMinutes,
+    loadId: load.id || "",
+    loadName: load.name || "",
+    stopId: `truck-switch-${load.id || sequenceIndex}`,
+    stopType: "truck_switch",
+    location: switchYard,
+    address: yardAddress(switchYard),
+    windowStart: "",
+    windowEnd: "",
+    instructions: `Switch from ${previousAssignment.truck?.plate || "previous truck"} to ${truck.plate || "next truck"}.`,
+    orderRefs: [],
+    orderTypes: [],
+    requiredPhotos: 0,
+    sequence: { truckIndex: nextAssignment.truckIndex, loadIndex: sequenceIndex, stopIndex: -2 }
   };
 }
 
@@ -443,7 +650,7 @@ async function jobStatusMap(jobIds) {
 
 async function confirmedPlans() {
   const result = await query(
-    `SELECT p.id, p.plan_date, p.status, s.orders, s.trucks
+    `SELECT p.id, p.plan_date, p.status, s.orders, s.trucks, s.summary
        FROM dispatch_plans p
        INNER JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
       WHERE p.status = 'confirmed'
@@ -477,15 +684,79 @@ function planJobsForTruck(plan, truck, truckIndex) {
   return jobs;
 }
 
+async function refreshProjectedLoadExecution(job = {}) {
+  if (!job.planId || !job.loadId || !job.driverLogin) return;
+  const planResult = await query(
+    `SELECT p.id, p.plan_date, p.status, s.orders, s.trucks
+       FROM dispatch_plans p
+       JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+      WHERE p.id = $1
+      LIMIT 1`,
+    [job.planId]
+  );
+  if (!planResult.rowCount) return;
+  const plan = sortedPlans(planResult.rows)[0];
+  const expected = planJobsForDriver(plan, job.driverLogin).filter((item) => String(item.loadId) === String(job.loadId));
+  if (!expected.length) return;
+  const statuses = await jobStatusMap(expected.map((item) => item.jobId));
+  const started = expected.some((item) => ["in_progress", "complete"].includes(statuses.get(item.jobId)?.status));
+  const completed = expected.every((item) => statuses.get(item.jobId)?.status === "complete");
+  await query(
+    `UPDATE dispatch_plan_load_assignments
+        SET started = $3, completed = $4, updated_at = now()
+      WHERE plan_id = $1 AND load_id = $2`,
+    [job.planId, job.loadId, started, completed]
+  ).catch(() => null);
+}
+
+export function planJobsForDriver(plan, driverLogin) {
+  const assignments = driverLoadAssignments(plan, driverLogin);
+  const jobs = [];
+  assignments.forEach((assignment, assignmentIndex) => {
+    const { truck, load, truckIndex } = assignment;
+    const previousAssignment = assignmentIndex > 0 ? assignments[assignmentIndex - 1] : null;
+    if (previousAssignment && previousAssignment.truck.plate !== truck.plate) {
+      const approachJob = buildTruckSwitchApproachJob(plan, previousAssignment, assignment, assignmentIndex);
+      if (approachJob) jobs.push(approachJob);
+      jobs.push(buildTruckSwitchJob(plan, previousAssignment, assignment, assignmentIndex));
+    }
+    if (load.returnOnly) {
+      const returnJob = buildReturnJob(plan, truck, load, truckIndex, assignmentIndex, previousAssignment);
+      if (returnJob) jobs.push(returnJob);
+      return;
+    }
+    const travelJob = buildTravelJob(plan, truck, load, truckIndex, assignmentIndex, previousAssignment);
+    if (travelJob) jobs.push(travelJob);
+    const requireInterStopTravel = loadHasDirectDependency(plan, load);
+    let previousRoutedStop = null;
+    (load.stops || []).forEach((stop, stopIndex) => {
+      if (!["pick", "drop"].includes(stop.type)) return;
+      if (requireInterStopTravel && previousRoutedStop) {
+        const legJob = buildInterStopTravelJob(plan, truck, load, previousRoutedStop, stop, truckIndex, assignmentIndex, stopIndex);
+        if (legJob) jobs.push(legJob);
+      }
+      jobs.push(buildJob(plan, truck, load, stop, truckIndex, assignmentIndex, stopIndex));
+      previousRoutedStop = stop;
+    });
+  });
+  return jobs;
+}
+
 async function activeDriverAssignment(driverLogin) {
   const login = driverKey(driverLogin);
   const today = todayLocalDate();
   const matches = [];
   for (const plan of await confirmedPlans()) {
     if (plan.planDate < today) continue;
-    (plan.trucks || []).forEach((truck, truckIndex) => {
-      if (driverKey(truck.driverLogin || truck.driver) !== login) return;
-      matches.push({ plan, truck, truckIndex });
+    const assignments = driverLoadAssignments(plan, login);
+    if (!assignments.length) continue;
+    matches.push({
+      plan,
+      assignments,
+      truck: assignments[0].truck,
+      truckIndex: assignments[0].truckIndex,
+      initialTruck: assignments[0].truck,
+      finalTruck: assignments[assignments.length - 1].truck
     });
   }
   if (!matches.length) return null;
@@ -520,10 +791,12 @@ function isSamsaraDvirConfirmed(row, type = "pre") {
   const dvir = response.dvir || response.verifiedDvir || {};
   const dvirVehicleId = String(dvir.vehicle?.id || "");
   const dvirPlate = normalizedPlate(dvir.licensePlate || dvir.vehicle?.licensePlate || response.dvir?.licensePlate || "");
-  const currentPlate = normalizedPlate(row?.truck_plate || "");
+  const currentPlate = normalizedPlate(type === "pre"
+    ? row?.initial_truck_plate || row?.truck_plate || ""
+    : row?.current_truck_plate || row?.truck_plate || "");
   if (!(dvir.id || response.dvirId)) return false;
   if (currentPlate && dvirPlate !== currentPlate) return false;
-  if (row?.samsara_vehicle_id && dvirVehicleId && dvirVehicleId !== String(row.samsara_vehicle_id)) return false;
+  if (type === "post" && row?.samsara_vehicle_id && dvirVehicleId && dvirVehicleId !== String(row.samsara_vehicle_id)) return false;
   return true;
 }
 
@@ -541,51 +814,22 @@ async function upsertDriverDayBase({ driverLogin, plan, truck, samsaraUsername =
   const normalizedSamsaraAccounts = samsaraAccountsFromLegacy(samsaraUsername, samsaraAccounts);
   const login = driverKey(driverLogin);
   const planDate = plan?.planDate || todayLocalDate();
-  const existing = await query(
-    `SELECT *
-       FROM driver_day_records
-      WHERE driver_login = $1
-        AND plan_date = $2::date
-      LIMIT 1`,
-    [login, planDate]
-  );
-  const existingRow = existing.rows[0] || null;
-  const truckChanged = existingRow && (
-    String(existingRow.truck_id || "") !== String(truck?.id || "")
-    || String(existingRow.truck_plate || "") !== String(truck?.plate || "")
-    || String(existingRow.plan_id || "") !== String(plan?.id || "")
-  );
   const result = await query(
     `INSERT INTO driver_day_records (
-       driver_login, plan_id, plan_date, truck_id, truck_plate, samsara_username, samsara_secondary_username
-     ) VALUES ($1, $2, $3::date, $4, $5, $6, $8)
+       driver_login, plan_id, plan_date, truck_id, truck_plate,
+       initial_truck_id, initial_truck_plate, current_truck_id, current_truck_plate,
+       samsara_username, samsara_secondary_username
+     ) VALUES ($1, $2, $3::date, $4, $5, $4, $5, $4, $5, $6, $7)
      ON CONFLICT (driver_login, plan_date) DO UPDATE SET
        plan_id = EXCLUDED.plan_id,
-       truck_id = EXCLUDED.truck_id,
-       truck_plate = EXCLUDED.truck_plate,
+       initial_truck_id = COALESCE(NULLIF(driver_day_records.initial_truck_id, ''), EXCLUDED.initial_truck_id),
+       initial_truck_plate = COALESCE(NULLIF(driver_day_records.initial_truck_plate, ''), EXCLUDED.initial_truck_plate),
+       current_truck_id = COALESCE(NULLIF(driver_day_records.current_truck_id, ''), EXCLUDED.current_truck_id),
+       current_truck_plate = COALESCE(NULLIF(driver_day_records.current_truck_plate, ''), EXCLUDED.current_truck_plate),
+       truck_id = COALESCE(NULLIF(driver_day_records.current_truck_id, ''), EXCLUDED.truck_id),
+       truck_plate = COALESCE(NULLIF(driver_day_records.current_truck_plate, ''), EXCLUDED.truck_plate),
        samsara_username = COALESCE(NULLIF(EXCLUDED.samsara_username, ''), driver_day_records.samsara_username),
        samsara_secondary_username = COALESCE(NULLIF(EXCLUDED.samsara_secondary_username, ''), driver_day_records.samsara_secondary_username),
-       samsara_active_account = CASE WHEN $7 = true THEN 'primary' ELSE driver_day_records.samsara_active_account END,
-       pre_dvir_photo_data_urls = CASE WHEN $7 = true THEN '[]'::jsonb ELSE driver_day_records.pre_dvir_photo_data_urls END,
-       post_dvir_photo_data_urls = CASE WHEN $7 = true THEN '[]'::jsonb ELSE driver_day_records.post_dvir_photo_data_urls END,
-       pre_dvir_completed_at = CASE WHEN $7 = true THEN NULL ELSE driver_day_records.pre_dvir_completed_at END,
-       post_dvir_completed_at = CASE WHEN $7 = true THEN NULL ELSE driver_day_records.post_dvir_completed_at END,
-       on_duty_at = CASE WHEN $7 = true THEN NULL ELSE driver_day_records.on_duty_at END,
-       off_duty_at = CASE WHEN $7 = true THEN NULL ELSE driver_day_records.off_duty_at END,
-       primary_off_duty_at = CASE WHEN $7 = true THEN NULL ELSE driver_day_records.primary_off_duty_at END,
-       secondary_on_duty_at = CASE WHEN $7 = true THEN NULL ELSE driver_day_records.secondary_on_duty_at END,
-       secondary_off_duty_at = CASE WHEN $7 = true THEN NULL ELSE driver_day_records.secondary_off_duty_at END,
-       samsara_driver_id = CASE WHEN $7 = true THEN NULL ELSE driver_day_records.samsara_driver_id END,
-       samsara_vehicle_id = CASE WHEN $7 = true THEN NULL ELSE driver_day_records.samsara_vehicle_id END,
-       samsara_secondary_driver_id = CASE WHEN $7 = true THEN NULL ELSE driver_day_records.samsara_secondary_driver_id END,
-       samsara_secondary_vehicle_id = CASE WHEN $7 = true THEN NULL ELSE driver_day_records.samsara_secondary_vehicle_id END,
-       samsara_assignment_response = CASE WHEN $7 = true THEN '{}'::jsonb ELSE driver_day_records.samsara_assignment_response END,
-       samsara_on_duty_response = CASE WHEN $7 = true THEN '{}'::jsonb ELSE driver_day_records.samsara_on_duty_response END,
-       samsara_off_duty_response = CASE WHEN $7 = true THEN '{}'::jsonb ELSE driver_day_records.samsara_off_duty_response END,
-       samsara_secondary_assignment_response = CASE WHEN $7 = true THEN '{}'::jsonb ELSE driver_day_records.samsara_secondary_assignment_response END,
-       samsara_secondary_on_duty_response = CASE WHEN $7 = true THEN '{}'::jsonb ELSE driver_day_records.samsara_secondary_on_duty_response END,
-       samsara_secondary_off_duty_response = CASE WHEN $7 = true THEN '{}'::jsonb ELSE driver_day_records.samsara_secondary_off_duty_response END,
-       samsara_handoff_response = CASE WHEN $7 = true THEN '{}'::jsonb ELSE driver_day_records.samsara_handoff_response END,
        updated_at = now()
      RETURNING *`,
     [
@@ -595,7 +839,6 @@ async function upsertDriverDayBase({ driverLogin, plan, truck, samsaraUsername =
       truck?.id || "",
       truck?.plate || "",
       normalizedSamsaraAccounts.primaryUsername || "",
-      Boolean(truckChanged),
       normalizedSamsaraAccounts.secondaryUsername || ""
     ]
   );
@@ -641,19 +884,68 @@ export async function getDriverDayState(driverLogin, { samsaraUsername = "", sam
   const normalizedSamsaraAccounts = samsaraAccountsFromLegacy(samsaraUsername, samsaraAccounts);
   const assignment = await activeDriverAssignment(driverLogin);
   const plan = assignment?.plan || { id: null, planDate: todayLocalDate() };
-  const truck = assignment?.truck || {};
-  let row = await upsertDriverDayBase({ driverLogin, plan, truck, samsaraAccounts: normalizedSamsaraAccounts });
+  const initialTruck = assignment?.initialTruck || assignment?.truck || {};
+  let row = await upsertDriverDayBase({ driverLogin, plan, truck: initialTruck, samsaraAccounts: normalizedSamsaraAccounts });
   row = await clearUnconfirmedDvirIfNeeded(row);
-  const jobs = assignment ? planJobsForTruck(plan, truck, assignment.truckIndex) : [];
+  const jobs = assignment ? planJobsForDriver(plan, driverLogin) : [];
   const jobIds = jobs.map((job) => job.jobId);
   const completed = await completedJobIds(jobIds);
   const allJobsComplete = jobs.length > 0 && jobs.every((job) => completed.has(job.jobId));
+  const currentTruck = assignment?.assignments?.find((item) =>
+    normalizedPlate(item.truck.plate) === normalizedPlate(row.current_truck_plate || row.truck_plate)
+  )?.truck || initialTruck;
+  const nextPendingJob = jobs.find((job) => !completed.has(job.jobId)) || null;
+  const nextTruck = nextPendingJob
+    ? assignment?.assignments?.find((item) => normalizedPlate(item.truck.plate) === normalizedPlate(nextPendingJob.truckPlate))?.truck || null
+    : null;
+  const truckSegments = [];
+  for (const item of assignment?.assignments || []) {
+    const previous = truckSegments[truckSegments.length - 1];
+    if (previous && normalizedPlate(previous.truckPlate) === normalizedPlate(item.truck.plate)) {
+      previous.loadIds.push(String(item.load.id || ""));
+      previous.finishMinute = item.plannedFinishMinute;
+      continue;
+    }
+    truckSegments.push({
+      truckId: item.truck.id || "",
+      truckPlate: item.truck.plate || "",
+      parkingSpot: item.parkingSpot || item.truck.parkingSpot || "",
+      switchYard: item.switchYard || item.truck.base || "",
+      startMinute: item.plannedStartMinute,
+      finishMinute: item.plannedFinishMinute,
+      loadIds: [String(item.load.id || "")]
+    });
+  }
+  const switchAttentionResult = await query(
+    `SELECT job_id, from_truck_plate, to_truck_plate, switch_yard, parking_spot,
+            next_load_id, samsara_error, updated_at
+       FROM driver_truck_switch_records
+      WHERE driver_login = $1
+        AND plan_date = $2::date
+        AND status = 'attention'
+      ORDER BY updated_at DESC`,
+    [driverKey(driverLogin), plan?.planDate || todayLocalDate()]
+  ).catch(() => ({ rows: [] }));
   return {
     planId: plan?.id || null,
     planDate: plan?.planDate || todayLocalDate(),
-    truckId: truck?.id || "",
-    truckPlate: truck?.plate || "",
-    parkingSpot: truck?.parkingSpot || "",
+    truckId: currentTruck?.id || "",
+    truckPlate: currentTruck?.plate || "",
+    parkingSpot: currentTruck?.parkingSpot || "",
+    initialTruck: { id: initialTruck?.id || "", plate: initialTruck?.plate || "", parkingSpot: initialTruck?.parkingSpot || "" },
+    currentTruck: { id: currentTruck?.id || "", plate: currentTruck?.plate || "", parkingSpot: currentTruck?.parkingSpot || "" },
+    nextTruck: nextTruck ? { id: nextTruck.id || "", plate: nextTruck.plate || "", parkingSpot: nextTruck.parkingSpot || "" } : null,
+    truckSegments,
+    truckSwitchAttention: switchAttentionResult.rows.map((item) => ({
+      jobId: item.job_id,
+      fromTruckPlate: item.from_truck_plate,
+      toTruckPlate: item.to_truck_plate,
+      switchYard: item.switch_yard,
+      parkingSpot: item.parking_spot,
+      nextLoadId: item.next_load_id,
+      error: item.samsara_error,
+      updatedAt: item.updated_at
+    })),
     samsaraUsername: row.samsara_username || normalizedSamsaraAccounts.primaryUsername || "",
     samsaraSecondaryUsername: row.samsara_secondary_username || normalizedSamsaraAccounts.secondaryUsername || "",
     samsaraActiveAccount: row.samsara_active_account || "primary",
@@ -682,9 +974,15 @@ export async function submitDriverDvir(driverLogin, { type = "pre", photoDataUrl
   const normalizedSamsaraAccounts = samsaraAccountsFromLegacy(samsaraUsername, samsaraAccounts);
   const assignment = await activeDriverAssignment(driverLogin);
   const plan = assignment?.plan || { id: null, planDate: todayLocalDate() };
-  const truck = assignment?.truck || {};
-  if (!truck?.plate) throw new Error("No assigned truck was found in the confirmed dispatch plan.");
-  let row = await upsertDriverDayBase({ driverLogin, plan, truck, samsaraAccounts: normalizedSamsaraAccounts });
+  const initialTruck = assignment?.initialTruck || assignment?.truck || {};
+  if (!initialTruck?.plate) throw new Error("No assigned truck was found in the confirmed dispatch plan.");
+  let row = await upsertDriverDayBase({ driverLogin, plan, truck: initialTruck, samsaraAccounts: normalizedSamsaraAccounts });
+  const currentTruck = assignment?.assignments?.find((item) =>
+    normalizedPlate(item.truck.plate) === normalizedPlate(row.current_truck_plate || row.truck_plate)
+  )?.truck;
+  const truck = type === "post"
+    ? currentTruck || assignment?.finalTruck || initialTruck
+    : initialTruck;
   const photos = Array.isArray(photoDataUrls) ? photoDataUrls.filter(isPhotoReference) : [];
   if (photos.length < 4) throw new Error("4 inspection photos are required.");
   let samsaraAssignment = null;
@@ -823,12 +1121,19 @@ export async function submitDriverDvir(driverLogin, { type = "pre", photoDataUrl
   };
 }
 
-export async function ensureDriverSamsaraDutyForJob(driverLogin, { samsaraUsername = "", samsaraAccounts = {} } = {}) {
+export async function ensureDriverSamsaraDutyForJob(driverLogin, { samsaraUsername = "", samsaraAccounts = {}, job = null } = {}) {
   const normalizedSamsaraAccounts = samsaraAccountsFromLegacy(samsaraUsername, samsaraAccounts);
   const assignment = await activeDriverAssignment(driverLogin);
   if (!assignment) return { switched: false, reason: "no_assignment" };
   const plan = assignment.plan;
-  const truck = assignment.truck || {};
+  const truck = job?.truckPlate
+    ? {
+        id: job.truckId || "",
+        plate: job.truckPlate,
+        base: job.switchYard || job.location || "",
+        parkingSpot: job.parkingSpot || ""
+      }
+    : assignment.truck || {};
   if (!truck?.plate) return { switched: false, reason: "no_truck" };
   const row = await upsertDriverDayBase({ driverLogin, plan, truck, samsaraAccounts: normalizedSamsaraAccounts });
   if (!row.pre_dvir_completed_at || !row.on_duty_at) return { switched: false, reason: "pre_dvir_not_complete" };
@@ -919,7 +1224,19 @@ export async function ensureDriverSamsaraDutyForJob(driverLogin, { samsaraUserna
 export async function skipDriverDvirForTesting(driverLogin, { type = "pre", samsaraUsername = "" } = {}) {
   const assignment = await activeDriverAssignment(driverLogin);
   const plan = assignment?.plan || { id: null, planDate: todayLocalDate() };
-  const truck = assignment?.truck || {};
+  const initialTruck = assignment?.initialTruck || assignment?.truck || {};
+  const currentResult = await query(
+    `SELECT current_truck_plate, current_truck_id
+       FROM driver_day_records
+      WHERE driver_login = $1 AND plan_date = $2::date
+      LIMIT 1`,
+    [driverKey(driverLogin), plan.planDate]
+  );
+  const currentRow = currentResult.rows[0] || {};
+  const currentTruck = assignment?.assignments?.find((item) =>
+    normalizedPlate(item.truck.plate) === normalizedPlate(currentRow.current_truck_plate)
+  )?.truck;
+  const truck = type === "post" ? currentTruck || assignment?.finalTruck || initialTruck : initialTruck;
   if (!truck?.plate) throw new Error("No assigned truck was found in the confirmed dispatch plan.");
   const row = await upsertDriverDayBase({ driverLogin, plan, truck, samsaraUsername });
   const fakeDvir = {
@@ -1072,7 +1389,7 @@ async function detailsFromDelivery(orderRef, typeHint = "", context = {}) {
   if (context.stopType !== "pickup" || order.rows[0].order_type !== "sales_order") {
     return { ...order.rows[0], source: "delivery", lines: lines.rows };
   }
-  const ownPickup = !pickupLocation || OWN_YARD_CODES.has(pickupLocation) || String(order.rows[0].outbound_location || "") === pickupLocation;
+  const ownPickup = !pickupLocation || isOwnYard(context.plan, pickupLocation) || String(order.rows[0].outbound_location || "") === pickupLocation;
   const adjustedLines = lines.rows.map((line) => ownPickup
     ? {
         ...line,
@@ -1190,7 +1507,7 @@ function visibleUnitsFromPlanItem(item) {
 function planItemForPickup(item, context = {}) {
   if (context.stopType !== "pickup") return item;
   const pickupLocation = String(context.pickupLocation || "").trim();
-  const ownPickup = !pickupLocation || OWN_YARD_CODES.has(pickupLocation);
+  const ownPickup = !pickupLocation || isOwnYard(context.plan, pickupLocation);
   if (ownPickup) {
     return {
       ...item,
@@ -1275,7 +1592,7 @@ async function orderDetails(orderRef, typeHint = "", planOrder = null, context =
 export async function getNextDriverJob(driverLogin) {
   const assignment = await activeDriverAssignment(driverLogin);
   if (!assignment) return null;
-  const jobs = planJobsForTruck(assignment.plan, assignment.truck, assignment.truckIndex);
+  const jobs = planJobsForDriver(assignment.plan, driverLogin);
   const jobIds = jobs.map((job) => job.jobId);
   const completed = await completedJobIds(jobIds);
   const statuses = await jobStatusMap(jobIds);
@@ -1315,6 +1632,7 @@ export async function getNextDriverJob(driverLogin) {
     }
     const hint = orderByRef(assignment.plan, ref)?.type || (next.orderTypes.length === 1 ? next.orderTypes[0] : "");
     return orderDetails(ref, hint, orderByRef(assignment.plan, ref), {
+      plan: assignment.plan,
       stopType: next.stopType,
       pickupLocation: next.stopType === "pickup" ? next.location : "",
       dropLocation: next.stopType === "dropoff" ? next.dropLocation || next.location : "",
@@ -1330,10 +1648,10 @@ export async function startDriverJob(driverLogin, jobIdValue, { job = null } = {
   const result = await query(
     `INSERT INTO driver_job_records (
        job_id, plan_id, plan_date, driver_login, truck_id, truck_plate, load_id, load_name,
-       stop_id, stop_type, order_refs, photo_data_urls, status, started_at, completed_at
+       stop_id, stop_type, order_refs, photo_data_urls, status, started_at, completed_at, job_details
      ) VALUES (
        $1, $2, $3, $4, $5, $6, $7, $8,
-       $9, $10, $11::jsonb, '[]'::jsonb, 'in_progress', now(), NULL
+       $9, $10, $11::jsonb, '[]'::jsonb, 'in_progress', now(), NULL, $12::jsonb
      )
      ON CONFLICT (job_id) DO UPDATE SET
        status = CASE WHEN driver_job_records.status = 'complete' THEN driver_job_records.status ELSE 'in_progress' END,
@@ -1347,7 +1665,8 @@ export async function startDriverJob(driverLogin, jobIdValue, { job = null } = {
        load_name = EXCLUDED.load_name,
        stop_id = EXCLUDED.stop_id,
        stop_type = EXCLUDED.stop_type,
-       order_refs = EXCLUDED.order_refs
+       order_refs = EXCLUDED.order_refs,
+       job_details = EXCLUDED.job_details
      RETURNING *`,
     [
       jobIdValue,
@@ -1360,9 +1679,32 @@ export async function startDriverJob(driverLogin, jobIdValue, { job = null } = {
       job?.loadName || "",
       job?.stopId || "",
       job?.stopType || "",
-      JSON.stringify(job?.orderRefs || [])
+      JSON.stringify(job?.orderRefs || []),
+      JSON.stringify({
+        fromTruckPlate: job?.fromTruckPlate || "",
+        nextTruckPlate: job?.nextTruckPlate || "",
+        switchYard: job?.switchYard || "",
+        parkingSpot: job?.parkingSpot || ""
+      })
     ]
   );
+  await query(
+    `UPDATE dispatch_plan_load_assignments
+        SET started = true, updated_at = now()
+      WHERE plan_id = $1 AND load_id = $2`,
+    [job?.planId || null, job?.loadId || ""]
+  ).catch(() => null);
+  await query(
+    `UPDATE driver_day_records
+        SET truck_id = $3,
+            truck_plate = $4,
+            current_truck_id = $3,
+            current_truck_plate = $4,
+            current_load_id = $5,
+            updated_at = now()
+      WHERE driver_login = $1 AND plan_date = $2::date`,
+    [driverKey(driverLogin), job?.planDate || null, job?.truckId || "", job?.truckPlate || "", job?.loadId || ""]
+  ).catch(() => null);
   return result.rows[0];
 }
 
@@ -1475,16 +1817,17 @@ export async function recordDriverJobPhotos(driverLogin, jobIdValue, { photoData
   const result = await query(
     `INSERT INTO driver_job_records (
        job_id, plan_id, plan_date, driver_login, truck_id, truck_plate, load_id, load_name,
-       stop_id, stop_type, order_refs, photo_data_urls, status, started_at, completed_at
+       stop_id, stop_type, order_refs, photo_data_urls, status, started_at, completed_at, job_details
      ) VALUES (
        $1, $2, $3, $4, $5, $6, $7, $8,
-       $9, $10, $11::jsonb, $12::jsonb, 'complete', COALESCE($13::timestamptz, now()), now()
+       $9, $10, $11::jsonb, $12::jsonb, 'complete', COALESCE($13::timestamptz, now()), now(), $14::jsonb
      )
      ON CONFLICT (job_id) DO UPDATE SET
        photo_data_urls = EXCLUDED.photo_data_urls,
        status = 'complete',
        started_at = COALESCE(driver_job_records.started_at, EXCLUDED.started_at, now()),
-       completed_at = now()
+       completed_at = now(),
+       job_details = EXCLUDED.job_details
      RETURNING *`,
     [
       jobIdValue,
@@ -1499,10 +1842,316 @@ export async function recordDriverJobPhotos(driverLogin, jobIdValue, { photoData
       job?.stopType || "",
       JSON.stringify(job?.orderRefs || []),
       JSON.stringify(photos),
-      job?.startedAt || null
+      job?.startedAt || null,
+      JSON.stringify({
+        fromTruckPlate: job?.fromTruckPlate || "",
+        nextTruckPlate: job?.nextTruckPlate || "",
+        switchYard: job?.switchYard || "",
+        parkingSpot: job?.parkingSpot || ""
+      })
     ]
   );
+  await refreshProjectedLoadExecution({ ...job, driverLogin: driverKey(driverLogin) });
   return result.rows[0];
+}
+
+async function writeTruckSwitchFailure(driverLogin, job, error) {
+  await query(
+    `INSERT INTO driver_truck_switch_records (
+       job_id, plan_id, plan_date, driver_login,
+       from_truck_id, from_truck_plate, to_truck_id, to_truck_plate,
+       switch_yard, parking_spot, next_load_id, planned_switch_minute,
+       status, samsara_error, updated_at
+     ) VALUES (
+       $1, $2, $3::date, $4,
+       $5, $6, $7, $8,
+       $9, $10, $11, $12,
+       'attention', $13, now()
+     )
+     ON CONFLICT (job_id) DO UPDATE SET
+       status = 'attention',
+       samsara_error = EXCLUDED.samsara_error,
+       updated_at = now()`,
+    [
+      job.jobId,
+      job.planId || null,
+      job.planDate,
+      driverKey(driverLogin),
+      job.fromTruckId || "",
+      job.fromTruckPlate || "",
+      job.nextTruckId || job.truckId || "",
+      job.nextTruckPlate || job.truckPlate || "",
+      job.switchYard || "",
+      job.parkingSpot || "",
+      job.loadId || "",
+      job.plannedSwitchMinute,
+      error?.message || String(error || "Samsara truck reassignment failed.")
+    ]
+  );
+}
+
+export async function confirmDriverTruckSwitch(driverLogin, job, { samsaraUsername = "", samsaraAccounts = {} } = {}) {
+  if (!job || job.stopType !== "truck_switch") throw new Error("This is not an active truck-switch job.");
+  const normalizedAccounts = samsaraAccountsFromLegacy(samsaraUsername, samsaraAccounts);
+  const assignment = await activeDriverAssignment(driverLogin);
+  if (!assignment || String(assignment.plan.id) !== String(job.planId)) throw new Error("The driver assignment changed. Refresh and try again.");
+  const initialTruck = assignment.initialTruck || assignment.truck || {};
+  let row = await upsertDriverDayBase({ driverLogin, plan: assignment.plan, truck: initialTruck, samsaraAccounts: normalizedAccounts });
+  let samsaraHandoff = null;
+  try {
+    samsaraHandoff = await ensureDriverSamsaraDutyForJob(driverLogin, {
+      samsaraAccounts: normalizedAccounts,
+      job
+    });
+    if (samsaraHandoff?.switched) {
+      const refreshed = await query("SELECT * FROM driver_day_records WHERE id = $1", [row.id]);
+      row = refreshed.rows[0] || row;
+    }
+  } catch (error) {
+    await writeTruckSwitchFailure(driverLogin, job, error);
+    throw error;
+  }
+  const activeAccount = row.samsara_active_account === "secondary" ? "secondary" : "primary";
+  const username = samsaraUsernameForAccount(normalizedAccounts, activeAccount);
+  if (!username) {
+    const error = new Error(`The ${activeAccount} Samsara username is not configured.`);
+    await writeTruckSwitchFailure(driverLogin, job, error);
+    throw error;
+  }
+
+  let samsaraAssignment = samsaraHandoff?.switched ? samsaraHandoff.secondaryAssignment : null;
+  let samsaraDuty = samsaraHandoff?.switched ? samsaraHandoff.secondaryDuty : null;
+  try {
+    if (!samsaraAssignment) {
+      samsaraAssignment = await createSamsaraDriverVehicleAssignment({
+        username,
+        vehiclePlate: job.nextTruckPlate || job.truckPlate
+      });
+      samsaraDuty = await setSamsaraDriverDutyStatus({
+        username,
+        vehicleId: samsaraAssignment.vehicle?.id || "",
+        dutyStatus: "ON_DUTY",
+        remark: `MBBS truck switch to ${job.nextTruckPlate || job.truckPlate} at ${job.switchYard || "yard"}`
+      });
+    }
+  } catch (error) {
+    await writeTruckSwitchFailure(driverLogin, job, error);
+    throw error;
+  }
+
+  return withTransaction(async () => {
+    await query(
+      `INSERT INTO driver_truck_switch_records (
+         job_id, plan_id, plan_date, driver_login,
+         from_truck_id, from_truck_plate, to_truck_id, to_truck_plate,
+         switch_yard, parking_spot, next_load_id, planned_switch_minute,
+         status, samsara_username, samsara_driver_id, samsara_vehicle_id,
+         samsara_response, samsara_error, confirmed_at, updated_at
+       ) VALUES (
+         $1, $2, $3::date, $4,
+         $5, $6, $7, $8,
+         $9, $10, $11, $12,
+         'complete', $13, $14, $15,
+         $16::jsonb, '', now(), now()
+       )
+       ON CONFLICT (job_id) DO UPDATE SET
+         status = 'complete',
+         samsara_username = EXCLUDED.samsara_username,
+         samsara_driver_id = EXCLUDED.samsara_driver_id,
+         samsara_vehicle_id = EXCLUDED.samsara_vehicle_id,
+         samsara_response = EXCLUDED.samsara_response,
+         samsara_error = '',
+         confirmed_at = now(),
+         updated_at = now()`,
+      [
+        job.jobId,
+        job.planId || null,
+        job.planDate,
+        driverKey(driverLogin),
+        job.fromTruckId || "",
+        job.fromTruckPlate || "",
+        job.nextTruckId || job.truckId || "",
+        job.nextTruckPlate || job.truckPlate || "",
+        job.switchYard || "",
+        job.parkingSpot || "",
+        job.loadId || "",
+        job.plannedSwitchMinute,
+        username,
+        samsaraAssignment.driver?.id || "",
+        samsaraAssignment.vehicle?.id || "",
+        JSON.stringify({ assignment: samsaraAssignment, duty: samsaraDuty })
+      ]
+    );
+    const completedJob = await recordDriverJobPhotos(driverLogin, job.jobId, { photoDataUrls: [], job });
+    await query(
+      `UPDATE driver_day_records
+          SET truck_id = $2,
+              truck_plate = $3,
+              current_truck_id = $2,
+              current_truck_plate = $3,
+              current_load_id = $4,
+              samsara_driver_id = CASE WHEN samsara_active_account = 'primary' THEN COALESCE(NULLIF($5, ''), samsara_driver_id) ELSE samsara_driver_id END,
+              samsara_vehicle_id = CASE WHEN samsara_active_account = 'primary' THEN COALESCE(NULLIF($6, ''), samsara_vehicle_id) ELSE samsara_vehicle_id END,
+              samsara_secondary_driver_id = CASE WHEN samsara_active_account = 'secondary' THEN COALESCE(NULLIF($5, ''), samsara_secondary_driver_id) ELSE samsara_secondary_driver_id END,
+              samsara_secondary_vehicle_id = CASE WHEN samsara_active_account = 'secondary' THEN COALESCE(NULLIF($6, ''), samsara_secondary_vehicle_id) ELSE samsara_secondary_vehicle_id END,
+              samsara_assignment_response = CASE WHEN samsara_active_account = 'primary' THEN $7::jsonb ELSE samsara_assignment_response END,
+              samsara_secondary_assignment_response = CASE WHEN samsara_active_account = 'secondary' THEN $7::jsonb ELSE samsara_secondary_assignment_response END,
+              updated_at = now()
+        WHERE id = $1`,
+      [
+        row.id,
+        job.nextTruckId || job.truckId || "",
+        job.nextTruckPlate || job.truckPlate || "",
+        job.loadId || "",
+        samsaraAssignment.driver?.id || "",
+        samsaraAssignment.vehicle?.id || "",
+        JSON.stringify(samsaraAssignment || {})
+      ]
+    );
+    return { record: completedJob, switchRecord: { jobId: job.jobId, status: "complete" }, samsaraAssignment, samsaraDuty, samsaraHandoff };
+  });
+}
+
+async function finalizeDriverTruckSwitchWithoutSamsara(row) {
+  const job = {
+    jobId: row.job_id,
+    planId: row.plan_id,
+    planDate: planDateValue(row.plan_date),
+    driverLogin: row.driver_login,
+    truckId: row.to_truck_id,
+    truckPlate: row.to_truck_plate,
+    fromTruckId: row.from_truck_id,
+    fromTruckPlate: row.from_truck_plate,
+    nextTruckId: row.to_truck_id,
+    nextTruckPlate: row.to_truck_plate,
+    switchYard: row.switch_yard,
+    parkingSpot: row.parking_spot,
+    loadId: row.next_load_id,
+    loadName: "",
+    stopId: `truck-switch-${row.next_load_id}`,
+    stopType: "truck_switch",
+    orderRefs: [],
+    requiredPhotos: 0
+  };
+  const completedJob = await recordDriverJobPhotos(row.driver_login, row.job_id, { photoDataUrls: [], job });
+  await query(
+    `UPDATE driver_day_records
+        SET truck_id = $3,
+            truck_plate = $4,
+            current_truck_id = $3,
+            current_truck_plate = $4,
+            current_load_id = $5,
+            updated_at = now()
+      WHERE driver_login = $1 AND plan_date = $2::date`,
+    [row.driver_login, row.plan_date, row.to_truck_id, row.to_truck_plate, row.next_load_id]
+  );
+  return { switchRecord: row, record: completedJob };
+}
+
+async function completeDriverTruckSwitchWithoutSamsara(jobIdValue, {
+  actor = "",
+  reason = "",
+  driverLogin = "",
+  status = "override",
+  missingMessage = "A failed truck switch was not found for override."
+} = {}) {
+  return withTransaction(async () => {
+    const result = await query(
+      `UPDATE driver_truck_switch_records
+          SET status = $2,
+              overridden_at = now(),
+              overridden_by = $3,
+              override_reason = $4,
+              updated_at = now()
+        WHERE job_id = $1
+          AND status = 'attention'
+          AND ($5 = '' OR lower(driver_login) = lower($5))
+        RETURNING *`,
+      [
+        jobIdValue,
+        String(status || "override"),
+        String(actor || ""),
+        String(reason || ""),
+        driverKey(driverLogin || "")
+      ]
+    );
+    const row = result.rows[0];
+    if (!row) throw new Error(missingMessage);
+    return finalizeDriverTruckSwitchWithoutSamsara(row);
+  });
+}
+
+export async function overrideDriverTruckSwitch(jobIdValue, { actor = "", reason = "" } = {}) {
+  return completeDriverTruckSwitchWithoutSamsara(jobIdValue, {
+    actor,
+    reason,
+    status: "override"
+  });
+}
+
+export async function skipDriverTruckSwitchSamsara(jobIdValue, driverLogin, {
+  reason = "Driver skipped Samsara truck assignment.",
+  job = null
+} = {}) {
+  const login = driverKey(driverLogin);
+  if (!job || job.stopType !== "truck_switch" || String(job.jobId || "") !== String(jobIdValue || "")) {
+    throw new Error("This is not an active truck-switch job.");
+  }
+  return withTransaction(async () => {
+    const result = await query(
+      `INSERT INTO driver_truck_switch_records (
+         job_id, plan_id, plan_date, driver_login,
+         from_truck_id, from_truck_plate, to_truck_id, to_truck_plate,
+         switch_yard, parking_spot, next_load_id, planned_switch_minute,
+         status, overridden_at, overridden_by, override_reason, updated_at
+       ) VALUES (
+         $1, $2, $3::date, $4,
+         $5, $6, $7, $8,
+         $9, $10, $11, $12,
+         'skipped', now(), $13, $14, now()
+       )
+       ON CONFLICT (job_id) DO UPDATE SET
+         status = 'skipped',
+         overridden_at = now(),
+         overridden_by = EXCLUDED.overridden_by,
+         override_reason = EXCLUDED.override_reason,
+         updated_at = now()
+       WHERE lower(driver_truck_switch_records.driver_login) = lower(EXCLUDED.driver_login)
+         AND driver_truck_switch_records.status IN ('pending', 'attention')
+       RETURNING *`,
+      [
+        jobIdValue,
+        job.planId || null,
+        job.planDate,
+        login,
+        job.fromTruckId || "",
+        job.fromTruckPlate || "",
+        job.nextTruckId || job.truckId || "",
+        job.nextTruckPlate || job.truckPlate || "",
+        job.switchYard || "",
+        job.parkingSpot || "",
+        job.loadId || "",
+        job.plannedSwitchMinute,
+        login,
+        String(reason || "Driver skipped Samsara truck assignment.")
+      ]
+    );
+    const row = result.rows[0];
+    if (!row) throw new Error("This truck switch can no longer be skipped. Refresh and try again.");
+    return finalizeDriverTruckSwitchWithoutSamsara(row);
+  });
+}
+
+export async function listDriverTruckSwitchAttention({ planId = null } = {}) {
+  const result = await query(
+    `SELECT *
+       FROM driver_truck_switch_records
+      WHERE status = 'attention'
+        AND ($1::bigint IS NULL OR plan_id = $1)
+      ORDER BY updated_at DESC`,
+    [planId]
+  );
+  return result.rows;
 }
 
 export async function listDriverJobStatuses({ planId = null, planDate = null } = {}) {
@@ -1519,7 +2168,7 @@ export async function listDriverJobStatuses({ planId = null, planDate = null } =
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
   const result = await query(
     `SELECT job_id, plan_id, plan_date, driver_login, truck_id, truck_plate, load_id, load_name,
-            stop_id, stop_type, order_refs, status, started_at, completed_at
+            stop_id, stop_type, order_refs, status, started_at, completed_at, job_details
        FROM driver_job_records
       ${where}
       ORDER BY plan_date DESC NULLS LAST, started_at DESC NULLS LAST, completed_at DESC NULLS LAST, id DESC
@@ -1638,6 +2287,6 @@ export async function listDriverHistory(driverLogin, { date = "", limit = 100 } 
   }
 
   return records
-    .sort((left, right) => new Date(right.createdAt || 0) - new Date(left.createdAt || 0))
+    .sort((left, right) => new Date(left.createdAt || 0) - new Date(right.createdAt || 0))
     .slice(0, safeLimit);
 }

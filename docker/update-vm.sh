@@ -46,6 +46,9 @@ command -v curl >/dev/null 2>&1 || fail "curl is not installed."
 docker info >/dev/null 2>&1 || fail "Docker is not running or this user cannot access Docker."
 "${COMPOSE[@]}" config --quiet
 
+DRIVER_ORIENTED_VALUE="$("${COMPOSE[@]}" config | awk '$1 == "DISPATCH_DRIVER_ORIENTED_PLANNING:" { value=tolower($2); gsub(/"/, "", value); print value; exit }')"
+[[ "${DRIVER_ORIENTED_VALUE}" == "true" ]] || fail "DISPATCH_DRIVER_ORIENTED_PLANNING must resolve to true for the combined production cutover."
+
 CURRENT_BRANCH="$(git branch --show-current)"
 [[ "${CURRENT_BRANCH}" == "${BRANCH}" ]] || fail "Current branch is '${CURRENT_BRANCH}'. Switch to '${BRANCH}' before updating."
 
@@ -91,6 +94,18 @@ APP_STOPPED=1
 log "Applying database migrations"
 "${COMPOSE[@]}" --profile tools run --rm migrate
 
+log "Checking that dispatch and driver execution are idle for the V2 cutover"
+"${COMPOSE[@]}" --profile tools run --rm migrate npm run preflight:dispatch-v2-cutover
+
+log "Previewing legacy dispatch-plan conversion"
+"${COMPOSE[@]}" --profile tools run --rm migrate npm run backfill:dispatch-v2-plans -- --dry-run
+
+log "Persisting current dispatch plans in DispatchV2 format"
+"${COMPOSE[@]}" --profile tools run --rm migrate npm run backfill:dispatch-v2-plans -- --apply
+
+log "Verifying every current dispatch plan is DispatchV2"
+"${COMPOSE[@]}" --profile tools run --rm migrate npm run backfill:dispatch-v2-plans -- --verify
+
 log "Recreating the application container"
 "${COMPOSE[@]}" up -d --no-deps --force-recreate app
 APP_STOPPED=0
@@ -123,4 +138,3 @@ log "Recent application logs"
 "${COMPOSE[@]}" logs --tail 80 app
 
 printf '\nVM update completed successfully: %s -> %s\n' "${BEFORE_COMMIT}" "${AFTER_COMMIT}"
-

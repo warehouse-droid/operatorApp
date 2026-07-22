@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { pool, query, withTransaction } from "./db.js";
+import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
 import { isNetSuiteSandboxEnvironment } from "./config.js";
 import {
   createPurchaseOrderDispatchEnricher,
@@ -2340,14 +2341,47 @@ export async function listScmSchedule({
         plan_order.order_kind,
         plan_order.order_ref,
         p.plan_date AS eta_date,
-        COALESCE(NULLIF(stop.value->>'arriveTime', ''), NULLIF(stop.value->>'plannedArrive', ''), '') AS eta_time,
-        COALESCE(NULLIF(truck.value->>'driverName', ''), NULLIF(truck.value->>'driver', ''), '') AS driver,
-        trim(concat_ws(' ', NULLIF(truck.value->>'plate', ''), NULLIF(load.value->>'name', ''))) AS notes
+        stop_schedule.eta_time,
+        COALESCE(
+          NULLIF(load.value->>'driverName', ''),
+          NULLIF(load.value->>'driver_name', ''),
+          NULLIF(load.value->>'driverLogin', ''),
+          NULLIF(load.value->>'driver_login', ''),
+          NULLIF(truck.value->>'driverName', ''),
+          NULLIF(truck.value->>'driver', ''),
+          NULLIF(truck.value->>'driverLogin', ''),
+          ''
+        ) AS driver,
+        trim(concat_ws(' ',
+          COALESCE(
+            NULLIF(load.value->>'truckPlate', ''),
+            NULLIF(load.value->>'truck_plate', ''),
+            NULLIF(truck.value->>'plate', '')
+          ),
+          NULLIF(load.value->>'name', ''),
+          CASE
+            WHEN COALESCE(NULLIF(load.value->>'parkingSpot', ''), NULLIF(load.value->>'parking_spot', '')) IS NOT NULL
+              THEN 'Parking ' || COALESCE(NULLIF(load.value->>'parkingSpot', ''), NULLIF(load.value->>'parking_spot', ''))
+          END
+        )) AS notes
       FROM dispatch_plans p
       JOIN dispatch_plan_snapshots snap ON snap.plan_id = p.id
       CROSS JOIN LATERAL jsonb_array_elements(COALESCE(snap.trucks, '[]'::jsonb)) truck(value)
       CROSS JOIN LATERAL jsonb_array_elements(COALESCE(truck.value->'loads', '[]'::jsonb)) load(value)
       CROSS JOIN LATERAL jsonb_array_elements(COALESCE(load.value->'stops', '[]'::jsonb)) stop(value)
+      CROSS JOIN LATERAL (
+        SELECT COALESCE(
+          NULLIF(stop.value->>'arriveTime', ''),
+          NULLIF(stop.value->>'plannedArrive', ''),
+          CASE
+            WHEN COALESCE(stop.value->'timing'->>'arrival', '') ~ '^[0-9]+([.][0-9]+)?$' THEN
+              lpad(floor((stop.value->'timing'->>'arrival')::numeric / 60)::integer::text, 2, '0')
+              || ':' ||
+              lpad(mod(floor((stop.value->'timing'->>'arrival')::numeric)::integer, 60)::text, 2, '0')
+          END,
+          ''
+        ) AS eta_time
+      ) stop_schedule
       JOIN plan_order_types plan_order
         ON plan_order.plan_id = snap.plan_id
        AND plan_order.order_ref = stop.value->>'orderId'
@@ -2355,7 +2389,7 @@ export async function listScmSchedule({
         AND COALESCE(stop.value->>'orderId', '') <> ''
         AND COALESCE(load.value->>'returnOnly', 'false') <> 'true'
       ORDER BY plan_order.order_kind, plan_order.order_ref, p.plan_date DESC,
-               COALESCE(NULLIF(stop.value->>'arriveTime', ''), NULLIF(stop.value->>'plannedArrive', ''), '') DESC
+               stop_schedule.eta_time DESC
     )
     SELECT
       COALESCE(s.id, 0) AS schedule_id,
@@ -2397,7 +2431,7 @@ export async function listScmSchedule({
         WHEN COALESCE(s.eta_date, planned.eta_date, b.expected_delivery_date) IS NULL OR COALESCE(s.created_at, b.queued_at) IS NULL THEN NULL
         ELSE COALESCE(s.eta_date, planned.eta_date, b.expected_delivery_date) - COALESCE(s.created_at, b.queued_at)::date
       END AS sla_days,
-      COALESCE(NULLIF(s.notes, ''), planned.notes, '') AS notes,
+      COALESCE(NULLIF(s.notes, ''), NULLIF(s.dispatch_assignment_note, ''), planned.notes, '') AS notes,
       s.updated_at,
       s.updated_by
     FROM base b
@@ -3444,12 +3478,24 @@ export async function createScmVrmaOrder({
   });
 }
 
+function dispatchScheduleEtaTime(stop = {}) {
+  const legacyTime = String(stop.arriveTime || stop.plannedArrive || "").trim();
+  if (legacyTime) return legacyTime;
+  const rawArrival = stop?.timing?.arrival;
+  if (rawArrival === null || rawArrival === undefined || rawArrival === "") return "";
+  const arrival = Number(rawArrival);
+  if (!Number.isFinite(arrival) || arrival < 0) return "";
+  const minute = Math.floor(arrival);
+  return `${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}`;
+}
+
 export async function syncScmScheduleFromDispatchPlan(plan, { updatedBy = "dispatch-plan" } = {}) {
   if (!plan?.planDate || !Array.isArray(plan.trucks)) return { planned: 0 };
   const plannedRows = [];
   for (const truck of plan.trucks || []) {
     for (const load of truck.loads || []) {
       if (load.returnOnly) continue;
+      const assignment = dispatchLoadAssignment(truck, load);
       for (const stop of load.stops || []) {
         if (stop.type !== "drop" || !stop.orderId) continue;
         const order = (plan.orders || []).find((item) => item.id === stop.orderId);
@@ -3457,12 +3503,12 @@ export async function syncScmScheduleFromDispatchPlan(plan, { updatedBy = "dispa
         plannedRows.push({
           orderRef: order.id,
           orderKind: order.sourceTable === "scm_vrma_orders" ? "VRMA" : order.type === "TO" ? "TO" : "PO",
-          truckPlate: truck.plate || "",
-          driver: truck.driverName || truck.driver || "",
+          truckPlate: assignment.truckPlate,
+          driver: assignment.driverName || assignment.driverLogin,
           loadName: load.name || "",
-          parkingSpot: load.parkingSpot || truck.parkingSpot || "",
+          parkingSpot: assignment.parkingSpot,
           etaDate: plan.planDate,
-          etaTime: stop.arriveTime || stop.plannedArrive || ""
+          etaTime: dispatchScheduleEtaTime(stop)
         });
       }
     }
@@ -3490,7 +3536,7 @@ export async function syncScmScheduleFromDispatchPlan(plan, { updatedBy = "dispa
   for (const row of plannedRows) {
     await query(
       `INSERT INTO scm_transport_schedule (
-         order_kind, order_ref, method, status, eta_date, eta_time, driver, notes, updated_by, created_by
+         order_kind, order_ref, method, status, eta_date, eta_time, driver, dispatch_assignment_note, updated_by, created_by
        )
        VALUES ($1, $2, 'MBT', 'Planned', $3::date, NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''), $7, $7)
        ON CONFLICT (order_kind, order_ref) DO UPDATE SET
@@ -3502,7 +3548,7 @@ export async function syncScmScheduleFromDispatchPlan(plan, { updatedBy = "dispa
          eta_date = EXCLUDED.eta_date,
          eta_time = EXCLUDED.eta_time,
          driver = EXCLUDED.driver,
-         notes = COALESCE(NULLIF(scm_transport_schedule.notes, ''), EXCLUDED.notes),
+         dispatch_assignment_note = EXCLUDED.dispatch_assignment_note,
          updated_by = EXCLUDED.updated_by,
          updated_at = now()`,
       [
@@ -3511,7 +3557,7 @@ export async function syncScmScheduleFromDispatchPlan(plan, { updatedBy = "dispa
         row.etaDate,
         row.etaTime,
         row.driver,
-        `${row.truckPlate} ${row.loadName}`.trim(),
+        `${row.truckPlate} ${row.loadName}${row.parkingSpot ? ` Parking ${row.parkingSpot}` : ""}`.trim(),
         updatedBy || null
       ]
     );

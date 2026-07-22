@@ -124,6 +124,39 @@ select {
   justify-self: center;
 }
 
+@media (max-width: 1500px) {
+  .dispatch-shell {
+    grid-template-rows: 96px minmax(0, 1fr);
+  }
+
+  .dispatch-topbar {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "main language"
+      "actions actions";
+    align-content: center;
+    row-gap: 4px;
+  }
+
+  .topbar-main {
+    grid-area: main;
+  }
+
+  .topbar-language {
+    grid-area: language;
+  }
+
+  .topbar-actions {
+    grid-area: actions;
+    justify-self: end;
+    flex-wrap: wrap;
+  }
+
+  .dispatch-shell .route-notice {
+    top: 108px;
+  }
+}
+
 .dispatch-user {
   color: var(--ink-soft);
   font-size: 12px;
@@ -4160,6 +4193,65 @@ button[data-action="enter-edit-mode"]:disabled:hover {
   align-items: stretch;
 }
 
+.monitor-switch-warning {
+  margin-top: 7px;
+  padding: 7px 8px;
+  border: 1px solid #e59a72;
+  border-radius: 6px;
+  background: #fff0e7;
+  color: #8a3515;
+  font-size: 11px;
+  font-weight: 900;
+  line-height: 1.3;
+}
+
+.driver-lane-marker {
+  display: grid;
+  place-items: center;
+  border: 1px solid #99b9c7;
+  border-radius: 6px;
+  background: #e7f4f7;
+  color: #173f4d;
+  font-size: 13px;
+  font-weight: 1000;
+}
+
+.driver-lane-sequence-controls {
+  position: sticky;
+  left: 0;
+  z-index: 3;
+  min-height: 116px;
+  display: grid;
+  grid-template-rows: 30px minmax(32px, 1fr) 30px;
+  gap: 4px;
+}
+
+.driver-lane-sequence-controls button {
+  min-height: 30px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: white;
+  color: var(--ink);
+  font-size: 15px;
+  font-weight: 1000;
+}
+
+.driver-lane-sequence-controls button:disabled {
+  cursor: not-allowed;
+  opacity: 0.35;
+}
+
+.driver-lane .driver-label {
+  align-content: start;
+}
+
+.driver-lane .truck-timeline.drag-over {
+  border-color: #008a73;
+  background: #ebfffa;
+  box-shadow: inset 0 0 0 2px rgba(0, 138, 115, 0.2);
+}
+
 .truck-sequence-controls {
   position: sticky;
   left: 0;
@@ -4287,6 +4379,8 @@ button[data-action="enter-edit-mode"]:disabled:hover {
   align-items: stretch;
   overflow-x: auto;
   overflow-y: visible;
+  overflow-anchor: none;
+  scrollbar-gutter: stable;
 }
 
 .load-block {
@@ -4299,6 +4393,231 @@ button[data-action="enter-edit-mode"]:disabled:hover {
   display: flex;
   flex-direction: column;
   overflow: visible;
+}
+
+.driver-lane .load-block,
+.driver-lane .load-block.return-only {
+  flex-basis: 370px;
+}
+
+.load-block[draggable="true"] > .load-header {
+  cursor: grab;
+}
+
+.load-block[draggable="true"]:active > .load-header {
+  cursor: grabbing;
+}
+
+.load-assignment-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 0.72fr);
+  gap: 4px;
+  padding: 0 6px 6px;
+  align-items: end;
+}
+
+.load-assignment-controls.has-start-yard {
+  grid-template-columns: minmax(0, 0.95fr) minmax(0, 0.7fr) minmax(0, 0.9fr);
+}
+
+.load-assignment-controls.has-start-yard.has-parking {
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 0.66fr) minmax(0, 0.9fr) minmax(0, 0.62fr);
+}
+
+.load-assignment-controls label {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.load-assignment-controls label > span {
+  overflow: hidden;
+  color: #53666f;
+  font-size: 9px;
+  font-weight: 900;
+  line-height: 1.15;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.load-assignment-controls select,
+.load-assignment-controls input {
+  width: 100%;
+  min-width: 0;
+  min-height: 28px;
+  padding: 0 5px;
+  border: 1px solid #aebfc7;
+  border-radius: 5px;
+  background: white;
+  color: #17272e;
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.load-assignment-controls select:disabled,
+.load-assignment-controls input:disabled {
+  background: #edf1f3;
+  color: #66777f;
+  opacity: 0.75;
+}
+
+.load-truck-meta {
+  grid-column: 1 / -1;
+  color: #53666f;
+  font-size: 9px;
+  font-weight: 900;
+}
+
+.load-assignment-advisory {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 2px;
+  padding: 4px 5px;
+  border: 1px solid #e1a84c;
+  border-radius: 5px;
+  background: #fff6d8;
+  color: #704600;
+  font-size: 9px;
+  font-weight: 850;
+  line-height: 1.25;
+}
+
+.load-assignment-advisory span {
+  display: block;
+}
+
+.truck-switch-stop,
+.preview-stop.truck-switch {
+  border-color: #79c7d2;
+  background: #e8fbfd;
+  box-shadow: inset 5px 0 0 #16899a;
+}
+
+.truck-switch-transition {
+  flex: 0 0 330px;
+  align-self: stretch;
+  border: 1px solid #79c7d2;
+  border-radius: 8px;
+  background: #f0fcfd;
+  box-shadow: inset 5px 0 0 #16899a;
+  padding: 7px;
+  display: grid;
+  gap: 6px;
+  align-content: start;
+}
+
+.truck-switch-transition-header {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  justify-content: space-between;
+}
+
+.truck-switch-transition-header strong,
+.truck-switch-transition-header span {
+  display: block;
+}
+
+.truck-switch-transition-header strong {
+  color: #075e6b;
+  font-size: 13px;
+  font-weight: 1000;
+}
+
+.truck-switch-transition-header span {
+  margin-top: 2px;
+  color: #4f6970;
+  font-size: 9px;
+  font-weight: 850;
+}
+
+.truck-switch-plates {
+  flex: 0 0 auto;
+  margin: 0 !important;
+  color: #075e6b !important;
+  font-size: 10px !important;
+  white-space: nowrap;
+}
+
+.truck-switch-transition-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 0.62fr);
+  gap: 5px;
+}
+
+.truck-switch-transition-controls label {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.truck-switch-transition-controls label > span {
+  color: #47656c;
+  font-size: 9px;
+  font-weight: 900;
+}
+
+.truck-switch-transition-controls select,
+.truck-switch-transition-controls input {
+  width: 100%;
+  min-width: 0;
+  min-height: 28px;
+  padding: 0 5px;
+  border: 1px solid #8dbbc2;
+  border-radius: 5px;
+  background: white;
+  color: #17272e;
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.truck-switch-transition-controls select:disabled,
+.truck-switch-transition-controls input:disabled {
+  background: #e8f1f2;
+  color: #66777f;
+  opacity: 0.75;
+}
+
+.truck-switch-transition-steps {
+  display: grid;
+  gap: 5px;
+}
+
+.truck-switch-transition-steps .stop-card {
+  min-height: 48px;
+}
+
+.truck-switch-attention-panel {
+  display: grid;
+  gap: 6px;
+  margin: 0 10px 10px;
+  padding: 8px;
+  border: 1px solid #e99b74;
+  border-radius: 7px;
+  background: #fff1e9;
+}
+
+.truck-switch-attention-panel > div {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+  color: #842f12;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.truck-switch-attention-panel button {
+  flex: 0 0 auto;
+  min-height: 30px;
+  border-color: #b54b24;
+  background: white;
+  color: #842f12;
+}
+
+.timeline-drop-zone.unassigned-zone {
+  border-color: #db9c48;
+  background: #fff8eb;
 }
 
 .load-block.return-only {
@@ -4395,7 +4714,7 @@ button[data-action="enter-edit-mode"]:disabled:hover {
   min-height: 36px;
   border: 0;
   background: transparent;
-  padding: 0 52px 0 0;
+  padding: 0 118px 0 0;
   text-align: left;
 }
 
@@ -4416,7 +4735,7 @@ button[data-action="enter-edit-mode"]:disabled:hover {
   display: grid;
   align-content: center;
   gap: 2px;
-  padding-right: 30px;
+  padding-right: 104px;
   white-space: normal;
 }
 
@@ -4439,6 +4758,55 @@ button[data-action="enter-edit-mode"]:disabled:hover {
   display: flex;
   align-items: flex-start;
   gap: 5px;
+}
+
+.load-drag-handle {
+  width: 24px;
+  min-height: 24px;
+  border: 1px solid #7e98a3;
+  border-radius: 6px;
+  background: #f7fbfc;
+  color: #294f5d !important;
+  display: grid !important;
+  place-items: center;
+  margin: 0 !important;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  font-size: 13px !important;
+  font-weight: 1000 !important;
+  line-height: 1 !important;
+}
+
+.load-drag-handle:active {
+  cursor: grabbing;
+}
+
+.load-pointer-dragging,
+.load-pointer-dragging * {
+  cursor: grabbing !important;
+}
+
+.load-block.pointer-drag-source {
+  opacity: 0.6;
+  outline: 2px solid #16899a;
+}
+
+.load-insert-return {
+  min-width: 34px;
+  min-height: 24px;
+  padding: 0 6px;
+  border-color: #6f94a3;
+  border-radius: 6px;
+  background: white;
+  color: #214d5d;
+  font-size: 11px;
+  font-weight: 1000;
+}
+
+.load-insert-return:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
 }
 
 .load-delete {
