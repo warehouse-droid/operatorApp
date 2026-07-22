@@ -35,6 +35,8 @@
     "test:photo-upload": "node src/photo-upload-harness.js",
     "test:scm-vrma": "node src/scm-vrma-harness.js",
     "test:smart-scm": "node src/smart-scm-harness.js",
+    "test:smart-scm-policy-calculation": "node src/smart-scm-policy-calculation-harness.js",
+    "test:smart-scm-calculation-ui": "node src/smart-scm-calculation-ui-harness.js",
     "test:sync-shape": "node src/sync-shape-harness.js",
     "test:admin-access": "node src/admin-access-harness.js",
     "test:admin-access-integration": "node src/admin-access-integration-harness.js",

@@ -1,5 +1,6 @@
 import { query } from "./db.js";
 import { writeAudit } from "./auth-repository.js";
+import { calculateSmartScmPolicyLevels } from "./smart-scm-policy-calculation.js";
 
 const EPSILON = 0.000001;
 const BUSINESS_SEASONAL_PRIOR = Object.freeze([
@@ -521,7 +522,8 @@ async function insertForecastRows(rows = []) {
   }
 }
 
-function publicForecast(row) {
+function publicForecast(row, settings = {}) {
+  const levels = calculateSmartScmPolicyLevels(row, row, settings);
   return {
     id: Number(row.id),
     runId: Number(row.run_id),
@@ -557,6 +559,17 @@ function publicForecast(row) {
     leadTimeP75: number(row.lead_time_p75),
     leadTimeP90: number(row.lead_time_p90),
     leadTimeP95: number(row.lead_time_p95),
+    leadWeeks: round(levels.leadWeeks),
+    weeklyDemandPallets: round(levels.weeklyDemandPallets),
+    weeklyDemandSdPallets: round(levels.weeklyDemandSdPallets),
+    safetyFactor: round(levels.serviceFactor),
+    safetyStockPallets: round(levels.safetyStockPallets),
+    baseReorderPointPallets: round(levels.baseReorderPointPallets),
+    basePreferredPallets: round(levels.basePreferredPallets),
+    reorderPointPallets: round(levels.reorderPointPallets),
+    preferredPallets: round(levels.preferredPallets),
+    capacityPallets: round(levels.capacityPallets),
+    stockPolicyModel: levels.forecastModel,
     wape: row.wape === null ? null : number(row.wape),
     bias: row.bias === null ? null : number(row.bias),
     eligibleForPromotion: Boolean(row.eligible_for_promotion),
@@ -825,16 +838,23 @@ export async function listSmartScmForecasts({ runId = null, search = "", yard = 
     clauses.push(`(p.item_name ILIKE $${params.length} OR p.series ILIKE $${params.length} OR p.vendor ILIKE $${params.length} OR p.item_id::text ILIKE $${params.length})`);
   }
   params.push(Math.min(5000, Math.max(1, Number(limit) || 500)));
-  const result = await query(
-    `SELECT f.*, p.item_name, p.series
+  const [result, settings] = await Promise.all([
+    query(
+    `SELECT f.*, p.item_name, p.series,
+            COALESCE(p.lead_time_days, i.netsuite_lead_time_days, p.purchase_lead_time_days, 7) AS effective_lead_time_days,
+            y.capacity_pallets, y.service_quantile, y.minimum_safety_pallets
        FROM scm_smart_forecasts f
        JOIN scm_smart_item_policies p ON p.item_id = f.item_id
+       JOIN scm_smart_item_yard_policies y ON y.item_id = f.item_id AND y.location_id = f.location_id
+       LEFT JOIN inventory_items i ON i.item_id = f.item_id
       WHERE ${clauses.join(" AND ")}
       ORDER BY f.eligible_for_promotion DESC, f.confidence DESC, p.item_name, f.yard_code
       LIMIT $${params.length}`,
     params
-  );
-  return result.rows.map(publicForecast);
+    ),
+    smartScmSettings()
+  ]);
+  return result.rows.map((row) => publicForecast(row, settings));
 }
 
 export async function latestSmartScmForecastRunId() {

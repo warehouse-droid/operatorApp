@@ -61,7 +61,7 @@
 .smart-inventory-context {
   display: grid;
   gap: 3px;
-  min-width: 145px;
+  min-width: 220px;
 }
 
 .smart-inventory-context span,
@@ -72,6 +72,22 @@
 
 .smart-inventory-context strong {
   color: #203f4d;
+}
+
+.smart-replenishment-calculation {
+  line-height: 1.35;
+}
+
+.smart-replenishment-calculation small {
+  max-width: 300px;
+}
+
+.smart-replenishment-equation {
+  margin: 2px 0;
+  padding: 4px 6px;
+  border-radius: 4px;
+  background: #eef6f8;
+  color: #244c59 !important;
 }
 
 .smart-line-destination-select {

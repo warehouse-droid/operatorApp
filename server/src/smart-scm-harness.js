@@ -199,6 +199,9 @@ assert.equal(purchasePayload.item.items[1].location.id, "26", "A multi-drop PO l
     const forecasts = await listSmartScmForecasts({ runId: Number(forecastRun.id), limit: 5000 });
     assert(forecasts.length > 0, "Expected at least one item-yard forecast.");
     assert(forecasts.every((row) => Number.isFinite(row.p50Weekly) && Number.isFinite(row.leadTimeP90)));
+    assert(forecasts.every((row) => Number.isFinite(row.safetyStockPallets)
+      && Number.isFinite(row.reorderPointPallets) && Number.isFinite(row.preferredPallets)),
+    "Every forecast must expose finite safety, ROP, and preferred policy levels.");
     const coverageEvidence = forecasts.filter((row) => row.representativeOrderPallets > 0 && row.coverageFloorPallets > 0);
     assert(coverageEvidence.length > 0, "Expected representative order evidence from the selected sales source.");
     const appliedCoverage = coverageEvidence.filter((row) => row.zeroDemandCoverageApplied);
@@ -215,6 +218,9 @@ assert.equal(purchasePayload.item.items[1].location.id, "26", "A multi-drop PO l
     assert.equal(alliance.formulaStockout, true);
     assert(Math.abs(alliance.formulaWeeklyDemand - 2.642857) < 0.00001, `Expected stockout peak 2.642857, received ${alliance.formulaWeeklyDemand}.`);
     assert(Math.abs(alliance.formulaWeeklySd - 1.003358) < 0.00001, `Expected six-week SD 1.003358, received ${alliance.formulaWeeklySd}.`);
+    assert(Math.abs(alliance.safetyStockPallets - 2.334194) < 0.00001, `Expected forecast safety stock 2.334194, received ${alliance.safetyStockPallets}.`);
+    assert.equal(alliance.reorderPointPallets, 8);
+    assert.equal(alliance.preferredPallets, 14);
 
     const plan = await runSmartScmPlan({ triggerSource: "harness", operatorId: null, forecastRunId: Number(forecastRun.id) });
     assert.equal(plan.status, "ready");

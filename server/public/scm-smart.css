@@ -650,6 +650,22 @@ body {
   font-size: 9px;
 }
 
+.smart-stock-policy {
+  display: grid;
+  gap: 3px;
+  min-width: 145px;
+  color: var(--smart-muted);
+  font-size: 10px;
+}
+
+.smart-stock-policy strong {
+  color: #203f4d;
+}
+
+.smart-stock-policy small {
+  line-height: 1.35;
+}
+
 .smart-empty {
   padding: 34px 18px;
   color: var(--smart-muted);

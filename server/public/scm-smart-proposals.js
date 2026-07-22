@@ -42,10 +42,69 @@ function smartProposalInventory(proposal, line) {
     const source = Number(reason.sourceAvailablePallets ?? 0);
     return `<div class="smart-inventory-context"><span>Source available: <strong>${smartNumber(source, 2)} PLT</strong></span><span>${smartEscape(line.destinationName || proposal.destinationName)} available: <strong>${smartNumber(current, 2)} PLT</strong></span></div>`;
   }
-  const expected = reason.destinationExpectedAvailablePallets ?? (toPlt > 0
-    ? (Number(reason.quantityAvailable || 0) + Number(reason.quantityOnOrder || 0) - Number(reason.quantityBackordered || 0)) / toPlt
-    : 0);
-  return `<div class="smart-inventory-context"><span>${smartEscape(line.destinationName || proposal.destinationName)} current: <strong>${smartNumber(current, 2)} PLT</strong></span><span>Expected: <strong>${smartNumber(expected, 2)} PLT</strong></span><small>available + on order − backorder</small></div>`;
+  const pallets = (value) => toPlt > 0 ? Number(value || 0) / toPlt : 0;
+  const available = pallets(reason.quantityAvailable);
+  const onOrder = pallets(reason.quantityOnOrder);
+  const backordered = pallets(reason.quantityBackordered);
+  const reservedOutbound = pallets(reason.quantityReservedOutbound);
+  const calculatedPosition = available + onOrder - backordered - reservedOutbound;
+  const storedPosition = Number(reason.positionPallets ?? reason.destinationExpectedAvailablePallets);
+  const position = Number.isFinite(storedPosition) ? storedPosition : calculatedPosition;
+  const reorderPoint = Number(reason.reorderPointPallets);
+  const preferred = Number(reason.preferredPallets);
+  const recommended = Number(line.requiredPallets ?? line.proposedPallets ?? 0);
+  const proposed = Number(line.proposedPallets || 0);
+  const afterProposal = position + proposed;
+  const planningYard = reason.actualDestinationYard || line.destinationName || proposal.destinationName;
+  const hasPolicyDecision = Number.isFinite(reorderPoint) && Number.isFinite(preferred);
+  const targetGap = hasPolicyDecision ? Math.max(0, preferred - position) : 0;
+  const minimumOrder = Number(reason.minimumOrderPallets || 0);
+  const capacity = Number(reason.capacityPallets);
+  const matchesTargetGap = Math.abs(targetGap - recommended) < 0.000001;
+  const exactOrderRule = hasPolicyDecision && position < reorderPoint && matchesTargetGap;
+  const decision = hasPolicyDecision
+    ? position < reorderPoint
+      ? matchesTargetGap
+        ? `${smartNumber(position, 2)} &lt; ROP ${smartNumber(reorderPoint, 2)} → ${smartNumber(preferred, 2)} − ${smartNumber(position, 2)} = <strong>${smartNumber(recommended, 2)} PLT recommended</strong>`
+        : `${smartNumber(position, 2)} &lt; ROP ${smartNumber(reorderPoint, 2)} → policy gap ${smartNumber(targetGap, 2)} PLT → <strong>this load carries ${smartNumber(recommended, 2)} PLT</strong>`
+      : `${smartNumber(position, 2)} ≥ ROP ${smartNumber(reorderPoint, 2)} → <strong>no automatic replenishment trigger</strong>`
+    : "Policy trigger and target are unavailable for this manually added line.";
+  const orderRule = exactOrderRule
+    ? `Order rule: ceil(max(${smartNumber(targetGap, 2)} target gap, ${smartNumber(minimumOrder, 2)} minimum order))${Number.isFinite(capacity) ? ` within ${smartNumber(capacity, 2)}-PLT capacity` : ""} = ${smartNumber(recommended, 2)} PLT`
+    : `Policy target gap: ${smartNumber(targetGap, 2)} PLT · minimum order: ${smartNumber(minimumOrder, 2)} PLT${Number.isFinite(capacity) ? ` · capacity: ${smartNumber(capacity, 2)} PLT` : ""} · this load allocation: ${smartNumber(recommended, 2)} PLT`;
+  return `<div class="smart-inventory-context smart-replenishment-calculation">
+    <span><strong>${smartEscape(planningYard)}</strong></span>
+    <span>Available now: <strong>${smartNumber(current, 2)} PLT</strong></span>
+    <span>Projected position before recommendation: <strong>${smartNumber(position, 2)} PLT</strong></span>
+    <small>${smartNumber(available, 2)} available + ${smartNumber(onOrder, 2)} on order − ${smartNumber(backordered, 2)} backorder − ${smartNumber(reservedOutbound, 2)} reserved = ${smartNumber(position, 2)} PLT</small>
+    ${hasPolicyDecision ? `<span>Reorder trigger: <strong>${smartNumber(reorderPoint, 2)} PLT</strong></span><span>Preferred target: <strong>${smartNumber(preferred, 2)} PLT</strong></span>` : ""}
+    <span class="smart-replenishment-equation">${decision}</span>
+    ${hasPolicyDecision ? `<small>${orderRule}</small>` : ""}
+    <span>After current ${smartNumber(proposed, 2)}-PLT proposal: <strong>${smartNumber(afterProposal, 2)} PLT</strong></span>
+  </div>`;
+}
+
+function smartProposalDecisionEvidence(line) {
+  const reason = line.reason || {};
+  const evidence = [
+    ["Weekly demand", reason.weeklyDemandPallets, " PLT/week", 2],
+    ["Demand SD", reason.weeklyDemandSdPallets, " PLT/week", 3],
+    ["Safety stock", reason.safetyStockPallets, " PLT", 3],
+    ["Minimum order", reason.minimumOrderPallets, " PLT", 2],
+    ["Weeks of cover", reason.weeksOfCover, "", 2]
+  ].filter(([, value]) => Number.isFinite(Number(value)));
+  const labels = evidence.map(([label, value, suffix, places]) => `<span>${smartEscape(label)}: ${smartNumber(value, places)}${suffix}</span>`);
+  if (reason.forecastModel) labels.push(`<span>Forecast: ${smartEscape(reason.forecastModel)}</span>`);
+  if (reason.vendorSupplyStatus) labels.push(`<span>Vendor supply: ${smartEscape(reason.vendorSupplyStatus)}</span>`);
+  if (reason.vendorConfirmationRequired) labels.push("<span>Vendor confirmation required</span>");
+  if (reason.importedVendorAvailablePallets !== null && reason.importedVendorAvailablePallets !== undefined
+    && Number.isFinite(Number(reason.importedVendorAvailablePallets))) {
+    labels.push(`<span>Imported vendor available: ${smartNumber(reason.importedVendorAvailablePallets, 2)} PLT</span>`);
+  }
+  if (reason.zeroDemandCoverageApplied) labels.push(`<span>Coverage floor: ${smartNumber(reason.coverageFloorPallets, 2)} PLT · ${smartEscape(reason.coverageSource || "unknown")}</span>`);
+  if (reason.urgent) labels.push("<span>Urgent</span>");
+  if (reason.provisional) labels.push("<span>Provisional</span>");
+  return `<div class="smart-reason">${labels.join("")}</div>`;
 }
 
 smartFilteredProposals = function smartFilteredProposalsV2() {
@@ -79,7 +138,7 @@ function smartProposalLineRow(proposal, line, editable) {
     <td class="numeric">${smartNumber(line.salesQuantity, 3)} ${smartEscape(line.unit || "UOM")}</td>
     <td class="numeric">${smartNumber(line.lineWeightLbs, 0)} lb</td>
     <td>${smartProposalInventory(proposal, line)}</td>
-    <td>${smartCoverageEvidence(line)}<div class="smart-reason">${Object.entries(line.reason || {}).slice(0, 8).map(([key, value]) => `<span>${smartEscape(key.replaceAll(/([A-Z])/g, " $1"))}: ${smartEscape(value)}</span>`).join("")}</div></td>
+    <td>${smartCoverageEvidence(line)}${smartProposalDecisionEvidence(line)}</td>
   </tr>`;
 }
 

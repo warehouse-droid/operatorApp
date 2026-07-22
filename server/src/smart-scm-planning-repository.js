@@ -1,6 +1,7 @@
 import { query, withTransaction } from "./db.js";
 import { writeAudit } from "./auth-repository.js";
 import { latestSmartScmForecastRunId, smartScmForecastMap } from "./smart-scm-forecast-repository.js";
+import { calculateSmartScmPolicyLevels } from "./smart-scm-policy-calculation.js";
 import { smartScmBuiltInRouteRule, smartScmRouteRuleKey, smartScmRouteRuleMap } from "./smart-scm-route-repository.js";
 
 const EPSILON = 0.000001;
@@ -58,19 +59,6 @@ function robustMinimumOrder(values = []) {
 
 function normalizedDeliveryMethod(value) {
   return text(value).toLowerCase().replace(/[^a-z]/g, "");
-}
-
-function serviceFactor(policy, settings = {}) {
-  return String(policy.yard_code) === "12441"
-    ? positive(settings.delivery_safety_factor, 1.645)
-    : positive(settings.pickup_safety_factor, 1.3);
-}
-
-function forecastQuantileForPolicy(forecast, policy) {
-  const target = number(policy.service_quantile, String(policy.yard_code) === "12441" ? 0.95 : 0.90);
-  if (target >= 0.95) return number(forecast?.lead_time_p95);
-  if (target >= 0.90) return number(forecast?.lead_time_p90);
-  return number(forecast?.lead_time_p75);
 }
 
 async function settingsRow() {
@@ -226,32 +214,19 @@ function calculatePolicyState(policy, forecast, inventory, minimumOrder, setting
   const reservedOutboundSales = positive(inventory.outboundReservationMap.get(key));
   const positionPallets = toPlt > EPSILON ? (availableSales + onOrderSales - backorderedSales - reservedOutboundSales) / toPlt : 0;
   const availablePallets = toPlt > EPSILON ? Math.max(0, availableSales - reservedOutboundSales) / toPlt : 0;
-  const leadWeeks = Math.max(1 / 7, positive(policy.effective_lead_time_days || policy.lead_time_days || policy.purchase_lead_time_days || 7) / 7);
-  const weeklyDemand = !forecast || forecast.authoritative_model === "formula"
-    ? positive(forecast?.formula_weekly_demand ?? forecast?.baseline_weekly)
-    : positive(forecast?.p50_weekly || forecast?.baseline_weekly);
-  const estimatedSd = forecast?.formula_weekly_sd === null || forecast?.formula_weekly_sd === undefined
-    ? Math.max(0, (positive(forecast?.p90_weekly) - positive(forecast?.p50_weekly)) / 1.282)
-    : positive(forecast.formula_weekly_sd);
-  const selectedServiceFactor = serviceFactor(policy, settings);
-  const formulaSafety = Math.max(
-    positive(policy.minimum_safety_pallets),
-    estimatedSd * selectedServiceFactor * Math.sqrt(leadWeeks)
-  );
-  const formulaRop = Math.max(1, Math.round(formulaSafety + (weeklyDemand * leadWeeks)));
-  const formulaPreferred = Math.min(positive(policy.capacity_pallets, 25), Math.ceil(formulaRop + (weeklyDemand * leadWeeks)));
-  const usePrediction = forecast && forecast.authoritative_model !== "formula";
-  const predictedRop = Math.max(1, Math.ceil(forecastQuantileForPolicy(forecast, policy)));
-  const predictedReview = policy.service_quantile >= 0.95 ? positive(forecast?.p95_weekly) : positive(forecast?.p90_weekly);
-  const predictedPreferred = Math.min(positive(policy.capacity_pallets, 25), Math.ceil(predictedRop + predictedReview));
-  const safety = usePrediction ? Math.max(positive(policy.minimum_safety_pallets), predictedRop - (weeklyDemand * leadWeeks)) : formulaSafety;
-  const baseRop = usePrediction ? predictedRop : formulaRop;
-  const basePreferred = usePrediction ? predictedPreferred : formulaPreferred;
-  const coverageApplied = Boolean(forecast?.zero_demand_coverage_applied);
-  const coverageFloor = coverageApplied ? positive(forecast?.coverage_floor_pallets) : 0;
-  const capacity = positive(policy.capacity_pallets, 25);
-  const rop = Math.max(baseRop, coverageFloor);
-  const preferred = Math.min(capacity, Math.max(basePreferred, rop));
+  const levels = calculateSmartScmPolicyLevels(policy, forecast, settings);
+  const leadWeeks = levels.leadWeeks;
+  const weeklyDemand = levels.weeklyDemandPallets;
+  const estimatedSd = levels.weeklyDemandSdPallets;
+  const selectedServiceFactor = levels.serviceFactor;
+  const safety = levels.safetyStockPallets;
+  const baseRop = levels.baseReorderPointPallets;
+  const basePreferred = levels.basePreferredPallets;
+  const coverageApplied = levels.zeroDemandCoverageApplied;
+  const coverageFloor = levels.coverageFloorPallets;
+  const capacity = levels.capacityPallets;
+  const rop = levels.reorderPointPallets;
+  const preferred = levels.preferredPallets;
   const minimumOrderPallets = positive(minimumOrder, 1);
   const capacityGap = Math.max(0, capacity - positionPallets);
   const requested = Math.ceil(Math.max(preferred - positionPallets, minimumOrderPallets));
@@ -367,6 +342,8 @@ function proposalLine(state, pallets, extraReason = {}) {
       minimumOrderPallets: state.minimumOrder,
       weeklyDemandPallets: state.weeklyDemand,
       weeklyDemandSdPallets: state.weeklyDemandSd,
+      leadTimeWeeks: state.leadWeeks,
+      capacityPallets: state.capacity,
       safetyFactor: state.serviceFactor,
       weeksOfCover: state.weeksOfCover,
       inventorySyncedAt: state.inventorySyncedAt,
