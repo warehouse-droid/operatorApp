@@ -719,23 +719,25 @@ export async function updateSmartScmProposalLine(proposalId, lineId, values = {}
     let palletWeight = positive(line.pallet_weight_lbs);
     let unit = line.unit;
     let reason = { ...(line.reason || {}), manuallyAdjusted: true };
-    if (proposal.proposal_type === "PO" && destinationWasProvided) {
+    if (proposal.proposal_type === "PO") {
       const yard = YARD_BY_ID.get(destinationLocationId);
       const policy = await itemPolicy(line.item_id, destinationLocationId);
       if (!policy) {
         throw Object.assign(new Error(`${line.item_name} is not enabled for Smart SCM planning at ${yard.code}.`), { status: 409 });
       }
-      toPlt = positive(policy.to_plt);
-      toLyr = positive(policy.to_lyr);
-      toSec = positive(policy.to_sec);
-      toPcs = positive(policy.to_pcs);
-      palletWeight = positive(policy.pallet_weight_lbs);
-      unit = policy.stock_unit || unit;
-      destinationName = yard.code;
-      if (toPlt <= EPSILON || palletWeight <= EPSILON) {
+      const policyToPlt = positive(policy.to_plt);
+      const policyPalletWeight = positive(policy.pallet_weight_lbs);
+      if (policyToPlt <= EPSILON || policyPalletWeight <= EPSILON) {
         throw Object.assign(new Error(`${line.item_name} needs a pallet conversion and pallet weight at ${yard.code}.`), { status: 409 });
       }
       if (destinationChanged) {
+        toPlt = policyToPlt;
+        toLyr = positive(policy.to_lyr);
+        toSec = positive(policy.to_sec);
+        toPcs = positive(policy.to_pcs);
+        palletWeight = policyPalletWeight;
+        unit = policy.stock_unit || unit;
+        destinationName = yard.code;
         const duplicate = await query(
           "SELECT id FROM scm_smart_proposal_lines WHERE proposal_id = $1 AND item_id = $2 AND destination_location_id = $3 AND id <> $4",
           [id, Number(line.item_id), destinationLocationId, targetLineId]
@@ -754,21 +756,25 @@ export async function updateSmartScmProposalLine(proposalId, lineId, values = {}
         if (nextDestinations.size > maximumDrops) {
           throw Object.assign(new Error(`${proposal.source_name || "This source"} allows at most ${maximumDrops} destination${maximumDrops === 1 ? "" : "s"} per load. Move or remove another line first.`), { status: 409 });
         }
-      }
-      const inventory = await inventorySnapshot(line.item_id, destinationLocationId, toPlt);
-      reason = {
-        ...reason,
-        ...inventory,
-        destinationAvailablePallets: inventory.availablePallets,
-        destinationExpectedAvailablePallets: inventory.expectedAvailablePallets,
-        ...(destinationChanged ? {
+        const inventory = await inventorySnapshot(line.item_id, destinationLocationId, toPlt);
+        reason = {
+          ...reason,
+          ...inventory,
+          destinationAvailablePallets: inventory.availablePallets,
+          destinationExpectedAvailablePallets: inventory.expectedAvailablePallets,
           destinationManuallyAdjusted: true,
           previousDestinationLocationId: beforeDestinationLocationId,
           previousDestinationName: line.destination_name
-        } : {})
-      };
-      if (destinationChanged) {
+        };
         for (const key of [
+          "quantityOnHand", "inventorySyncedAt", "positionPallets", "baseReorderPointPallets", "basePreferredPallets",
+          "safetyStockPallets", "reorderPointPallets", "preferredPallets", "minimumOrderPallets",
+          "weeklyDemandPallets", "weeklyDemandSdPallets", "leadTimeWeeks", "capacityPallets",
+          "safetyFactor", "weeksOfCover", "forecastModel", "zeroDemandCoverageApplied",
+          "representativeOrderPallets", "coverageOrderCount", "coverageFloorPallets", "coverageSource",
+          "coverageLocalSamples", "coverageDonorSamples", "coverageCapacityShortfall",
+          "coverageCausedNeed", "coverageReviewRequired", "availableCoverageOrders",
+          "availableCoverageGapPallets", "coverageCoveredByInbound",
           "gormleyHubRedirected", "gormleyOriginalDestinations", "routeRulePartialRedirected",
           "routeRuleOriginalDestinations", "routeRuleSource", "actualDestinationYard"
         ]) delete reason[key];

@@ -235,7 +235,14 @@ assert.equal(purchasePayload.item.items[1].location.id, "26", "A multi-drop PO l
     }
     for (const transfer of plan.proposals.filter((proposal) => proposal.proposalType === "TO" && proposal.phase === "internal_transfer")) {
       for (const line of transfer.lines) {
-        assert(line.proposedPallets <= Number(line.reason.sourceMaximumTransferablePallets) + 0.000001, "Suggested TO exceeds live source transfer limit.");
+        const sourceAvailable = Number(line.reason.sourceAvailablePallets);
+        const sourceSafety = Number(line.reason.sourceSafetyStockPallets);
+        const sourceRop = Number(line.reason.sourceReorderPointPallets);
+        const protectedFloor = Math.max(sourceSafety, sourceRop);
+        const maximumTransferable = Math.floor(Math.max(0, sourceAvailable - protectedFloor) + 0.000001);
+        assert(Math.abs(Number(line.reason.sourceProtectedFloorPallets) - protectedFloor) < 0.000001, "TO source protected floor must equal max(safety stock, ROP).");
+        assert.equal(Number(line.reason.sourceMaximumTransferablePallets), maximumTransferable, "TO source transfer limit must equal floored available stock above the protected floor.");
+        assert(line.proposedPallets <= maximumTransferable + 0.000001, "Suggested TO exceeds live source transfer limit.");
       }
     }
     const coverageReviewLines = plan.proposals.flatMap((proposal) => proposal.lines
@@ -289,7 +296,24 @@ assert.equal(purchasePayload.item.items[1].location.id, "26", "A multi-drop PO l
     const movedLine = destinationAdjusted.lines.find((line) => line.id === Number(move.line_id));
     assert.equal(movedLine.destinationLocationId, Number(move.destination_location_id), "A PO proposal line destination must be editable.");
     assert.equal(movedLine.reason.destinationManuallyAdjusted, true, "A manual destination change must be recorded on the line.");
+    assert.equal(movedLine.reason.positionPallets, undefined, "A destination change must invalidate the old yard's inventory position snapshot.");
+    assert.equal(movedLine.reason.reorderPointPallets, undefined, "A destination change must invalidate the old yard's reorder point.");
+    assert.equal(movedLine.reason.preferredPallets, undefined, "A destination change must invalidate the old yard's preferred target.");
+    assert(Number.isFinite(Number(movedLine.reason.quantityAvailable)), "A destination change must capture the new yard's inventory components.");
     assert(destinationAdjusted.routeStops.length <= 2, "A destination edit must preserve the proposal route limit.");
+    await query(
+      "UPDATE scm_smart_item_yard_policies SET eligible = false WHERE item_id = $1 AND location_id = $2",
+      [movedLine.itemId, movedLine.destinationLocationId]
+    );
+    await assert.rejects(
+      () => updateSmartScmProposalLine(move.proposal_id, move.line_id, { proposedPallets: movedLine.proposedPallets }, null),
+      /not enabled for Smart SCM planning/,
+      "A same-yard quantity edit must reject an item or yard policy disabled after planning."
+    );
+    await query(
+      "UPDATE scm_smart_item_yard_policies SET eligible = true WHERE item_id = $1 AND location_id = $2",
+      [movedLine.itemId, movedLine.destinationLocationId]
+    );
 
     const po = plan.proposals.find((proposal) => proposal.proposalType === "PO" && proposal.lines.length);
     assert(plan.proposals.filter((proposal) => proposal.proposalType === "PO").every((proposal) => proposal.status === "held"), "Every new PO load must start on Hold.");
