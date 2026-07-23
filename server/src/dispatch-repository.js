@@ -187,7 +187,9 @@ function rowToDispatchOrder(row) {
     customer: row.party || "",
     address,
     sourceYard: row.pickup_location || "",
-    sourceAddress: row.source_address || "",
+    sourceAddress: row.pickup_address_override || row.source_address || "",
+    defaultSourceAddress: row.source_address || "",
+    pickupAddressOverride: row.pickup_address_override || "",
     destinationAddress: row.drop_address || "",
     destinationLocationId: row.destination_location_id || null,
     expectedDeliveryDate: dateOnly(row.expected_delivery_date),
@@ -334,6 +336,7 @@ export async function listDispatchOrders({
         NULL::text AS source_location,
         NULL::bigint AS destination_location_id,
         dispatch_address,
+        dispatch_pickup_address,
         dispatch_window_start,
         dispatch_window_end,
         dispatch_instructions,
@@ -364,6 +367,7 @@ export async function listDispatchOrders({
         from_location AS source_location,
         to_location_id AS destination_location_id,
         dispatch_address,
+        dispatch_pickup_address,
         dispatch_window_start,
         dispatch_window_end,
         dispatch_instructions,
@@ -450,6 +454,7 @@ export async function listDispatchOrders({
         expected_delivery_date,
         dispatch_vendor_yard,
         dispatch_address,
+        dispatch_pickup_address,
         dispatch_window_start,
         dispatch_window_end,
         dispatch_instructions,
@@ -474,6 +479,7 @@ export async function listDispatchOrders({
         expected_delivery_date,
         NULL::text AS dispatch_vendor_yard,
         dispatch_address,
+        dispatch_pickup_address,
         dispatch_window_start,
         dispatch_window_end,
         dispatch_instructions,
@@ -561,6 +567,7 @@ export async function listDispatchOrders({
         COALESCE(o.customer, o.destination_location, '') AS party,
         o.expected_delivery_date,
         o.outbound_location AS pickup_location,
+        o.dispatch_pickup_address AS pickup_address_override,
         NULL::text AS source_address,
         o.destination_location,
         o.destination_location_id,
@@ -666,7 +673,7 @@ export async function listDispatchOrders({
           ))
         )
       GROUP BY o.netsuite_id, o.tranid, o.order_type, o.customer, o.destination_location, o.destination_location_id,
-               o.expected_delivery_date, o.outbound_location, o.dispatch_address,
+               o.expected_delivery_date, o.outbound_location, o.dispatch_address, o.dispatch_pickup_address,
                o.dispatch_window_start, o.dispatch_window_end, o.dispatch_instructions,
                o.dispatch_parse_source, o.operator_status, o.local_yard_order_status,
                o.dispatch_planned, o.dispatch_plan_date, o.dispatch_truck_plate,
@@ -684,6 +691,7 @@ export async function listDispatchOrders({
         COALESCE(o.vendor, o.source_location, '') AS party,
         o.expected_delivery_date,
         COALESCE(NULLIF(scm.pickup_point, ''), NULLIF(o.dispatch_vendor_yard, ''), NULLIF(o.source_location, ''), NULLIF(o.vendor, '')) AS pickup_location,
+        o.dispatch_pickup_address AS pickup_address_override,
         COALESCE(NULLIF(schedule_pickup_yard.address, ''), NULLIF(o.dispatch_address, '')) AS source_address,
         COALESCE(NULLIF(scm.dropoff_point, ''), o.destination_location) AS destination_location,
         CASE
@@ -813,7 +821,7 @@ export async function listDispatchOrders({
       GROUP BY o.netsuite_id, o.tranid, o.order_type, o.vendor, o.source_location,
                 o.dispatch_ref,
                 o.destination_location, o.destination_location_id, o.expected_delivery_date, o.dispatch_vendor_yard,
-               o.dispatch_address, o.dispatch_window_start, o.dispatch_window_end,
+               o.dispatch_address, o.dispatch_pickup_address, o.dispatch_window_start, o.dispatch_window_end,
                o.dispatch_instructions, o.dispatch_parse_source, o.dispatch_plan_date,
                o.dispatch_truck_plate, o.dispatch_load_name, o.dispatch_parking_spot,
                o.status_text, o.netsuite_active, scm.method, scm.status, scm.is_special_order,
@@ -834,6 +842,7 @@ export async function listDispatchOrders({
         COALESCE(co.details->>'customer', 'Transit Depot') AS party,
         co.dispatch_plan_date AS expected_delivery_date,
         co.from_location AS pickup_location,
+        ''::text AS pickup_address_override,
         ${yardAddressSql("co.from_location")} AS source_address,
         co.to_location AS destination_location,
         co.to_location_id AS destination_location_id,
@@ -904,6 +913,7 @@ export async function listDispatchOrders({
         COALESCE(v.local_vendor, v.vendor, 'Vendor Return') AS party,
         scm.eta_date AS expected_delivery_date,
         v.pickup_location AS pickup_location,
+        ''::text AS pickup_address_override,
         ${yardAddressSql("v.pickup_location")} AS source_address,
         v.dropoff_location AS destination_location,
         NULL::bigint AS destination_location_id,
@@ -1416,6 +1426,9 @@ export async function setPurchaseOrderVendorYard(orderRef, vendorYardId) {
 
 export async function updateDispatchOrderDetails(orderRef, patch = {}) {
   const address = String(patch.address || "").trim();
+  const pickupAddressProvided = patch.pickupAddress !== undefined
+    || patch.pickup_address !== undefined;
+  const pickupAddress = String(patch.pickupAddress ?? patch.pickup_address ?? "").trim();
   const windowStart = String(patch.windowStart || patch.window_start || "").trim();
   const windowEnd = String(patch.windowEnd || patch.window_end || "").trim();
   const expectedDate = String(patch.expectedDeliveryDate || patch.expected_delivery_date || "").trim() || null;
@@ -1443,12 +1456,14 @@ export async function updateDispatchOrderDetails(orderRef, patch = {}) {
               dispatch_window_start = $3,
               dispatch_window_end = $4,
               expected_delivery_date = $5::date,
+              dispatch_pickup_address = CASE WHEN $6::boolean THEN $7 ELSE dispatch_pickup_address END,
               dispatch_parse_source = 'manual-dispatch-details',
               dispatch_parsed_at = now()
         WHERE (tranid = $1 OR netsuite_id::text = $1)
         RETURNING netsuite_id, tranid, dispatch_address, dispatch_window_start,
-                  dispatch_window_end, expected_delivery_date, '${table}'::text AS source_table`,
-      [orderRef, address, windowStart, windowEnd, expectedDate]
+                  dispatch_window_end, expected_delivery_date, dispatch_pickup_address,
+                  '${table}'::text AS source_table`,
+      [orderRef, address, windowStart, windowEnd, expectedDate, pickupAddressProvided, pickupAddress]
     );
     if (result.rows[0]) return { ...result.rows[0], order_type: orderType };
   }

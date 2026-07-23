@@ -737,6 +737,78 @@ body {
   gap: 9px;
 }
 
+.printer-destinations {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.printer-destination {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+  margin: 0;
+  padding: 10px;
+  border: 1px solid #cbd7dd;
+  border-radius: 8px;
+  background: #f8fbfc;
+}
+
+.printer-destination legend {
+  padding: 0 5px;
+  color: var(--smart-navy);
+  font-size: 11px;
+  font-weight: 950;
+  text-transform: uppercase;
+}
+
+.printer-route-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px;
+}
+
+.printer-route-options .smart-check {
+  min-height: 28px;
+  font-size: 10px;
+}
+
+.printer-route-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.printer-route-summary span {
+  padding: 5px 8px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 950;
+}
+
+.printer-route-summary .ready {
+  color: #0d7047;
+  background: #e5f7ee;
+}
+
+.printer-route-summary .incomplete {
+  color: #8a5a0a;
+  background: #fff1d7;
+}
+
+.printer-no-so {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--smart-muted);
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.printer-no-so input {
+  min-height: auto;
+}
+
 .printer-meta {
   display: flex;
   align-items: center;
@@ -783,6 +855,10 @@ body {
 }
 
 @media (max-width: 1250px) {
+  .printer-grid {
+    grid-template-columns: 1fr;
+  }
+
   .smart-grid-4,
   .smart-stats {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -790,5 +866,24 @@ body {
 
   .smart-form-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 700px) {
+  .printer-card {
+    grid-template-columns: 1fr;
+  }
+
+  .printer-yard {
+    min-height: 64px;
+  }
+
+  .printer-destinations,
+  .printer-route-options {
+    grid-template-columns: 1fr;
+  }
+
+  .printer-secret {
+    grid-template-columns: 1fr;
   }
 }

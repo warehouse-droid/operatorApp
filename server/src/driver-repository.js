@@ -210,9 +210,19 @@ function stopLocationLabel(plan, stop) {
   return dropLocationForStop(stop, order);
 }
 
+function pickupAddressForStop(plan, stop) {
+  const order = orderByRef(plan, stop?.orderId) || {};
+  return String(
+    order.pickupAddressOverride
+    || order.sourceAddress
+    || yardAddress(stop?.location)
+    || ""
+  );
+}
+
 function stopAddressLabel(plan, stop) {
   if (!stop) return "";
-  if (stop.type === "pick") return yardAddress(stop.location);
+  if (stop.type === "pick") return pickupAddressForStop(plan, stop);
   const order = orderByRef(plan, stop.orderId) || {};
   return dropAddressForStop(stop, order);
 }
@@ -234,6 +244,7 @@ function loadEndPoint(plan, truck, load) {
 function startTravelForLoad(plan, truck, load, loadIndex) {
   const firstPickup = firstPickupStop(load);
   if (!firstPickup?.location) return null;
+  const toAddress = stopAddressLabel(plan, firstPickup);
   let from = null;
   if (loadIndex <= 0) {
     if (!truck?.base) return null;
@@ -241,12 +252,15 @@ function startTravelForLoad(plan, truck, load, loadIndex) {
   } else {
     from = loadEndPoint(plan, truck, (truck.loads || [])[loadIndex - 1]);
   }
-  if (!from?.location || String(from.location) === String(firstPickup.location)) return null;
+  if (!from?.location) return null;
+  const sameLocation = String(from.location) === String(firstPickup.location);
+  const sameAddress = String(from.address || "").trim().toLowerCase() === String(toAddress || "").trim().toLowerCase();
+  if (sameLocation && sameAddress) return null;
   return {
     from: from.location,
     fromAddress: from.address || yardAddress(from.location),
     to: String(firstPickup.location),
-    toAddress: yardAddress(firstPickup.location)
+    toAddress
   };
 }
 
@@ -399,7 +413,7 @@ function buildJob(plan, truck, load, stop, truckIndex, loadIndex, stopIndex) {
     stopType: isPickup ? "pickup" : "dropoff",
     location: isPickup ? stop.location : dropLocation,
     address: isPickup
-      ? (firstOrder.sourceAddress || yardAddress(stop.location) || "")
+      ? (firstOrder.pickupAddressOverride || firstOrder.sourceAddress || pickupAddressForStop(plan, stop))
       : dropAddress,
     dropLocation,
     dropAddress,

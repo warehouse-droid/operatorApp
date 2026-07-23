@@ -2748,6 +2748,8 @@ function summarizeOrder(order) {
     type: order.type,
     customer: order.customer,
     address: order.address,
+    sourceAddress: order.sourceAddress,
+    pickupAddressOverride: order.pickupAddressOverride,
     expectedDeliveryDate: order.expectedDeliveryDate,
     windowStart: order.windowStart,
     windowEnd: order.windowEnd,
@@ -4623,29 +4625,36 @@ function startTravelForLoad(truck, load) {
   if (load?.returnOnly) return null;
   const firstPickup = load.stops.find((stop) => stop.type === "pick");
   if (!firstPickup?.location) return null;
+  const firstPickupOrder = stopOrder(firstPickup);
+  const pickupAddress = stopAddress(firstPickup, firstPickupOrder);
   const index = loadIndexInTruck(truck, load);
   if (index <= 0) {
-    if (!truck?.base || String(truck.base) === String(firstPickup.location)) return null;
+    if (!truck?.base) return null;
     const basePlace = placeForLocation(truck.base);
+    const baseAddress = basePlace?.address || hubAddress(truck.base);
+    const sameLocation = String(truck.base) === String(firstPickup.location);
+    if (sameLocation && normalizedPlaceKey(baseAddress) === normalizedPlaceKey(pickupAddress)) return null;
     return {
       from: truck.base,
       to: firstPickup.location,
-      address: basePlace?.address || hubAddress(truck.base),
+      address: baseAddress,
       position: placePosition(basePlace) || hubPosition(truck.base),
-      routeLocation: basePlace?.address || hubAddress(truck.base),
-      minutes: yardTravelMinutes(truck.base, firstPickup.location)
+      routeLocation: baseAddress,
+      minutes: sameLocation ? 30 : yardTravelMinutes(truck.base, firstPickup.location)
     };
   }
   const previous = truck.loads[index - 1];
   const from = startPointAfterLoad(truck, previous);
-  if (!from || String(from.label) === String(firstPickup.location)) return null;
+  if (!from) return null;
+  const sameLocation = String(from.label) === String(firstPickup.location);
+  if (sameLocation && normalizedPlaceKey(from.address) === normalizedPlaceKey(pickupAddress)) return null;
   return {
     from: from.label || from.address || "Previous stop",
     to: firstPickup.location,
     address: from.address,
     position: from.position,
     routeLocation: from.routeLocation,
-    minutes: travelMinutesBetweenPoints(from, firstPickup.location)
+    minutes: sameLocation ? 30 : travelMinutesBetweenPoints(from, firstPickup.location)
   };
 }
 
@@ -4801,7 +4810,8 @@ function resolveStopPlace(stop, order) {
   }
   if (stop.type === "pick") {
     const place = placeForLocation(stop.location, order);
-    const address = place?.address
+    const address = order?.pickupAddressOverride
+      || place?.address
       || order?.sourceAddress
       || (order?.type === "PO" ? "" : order?.address)
       || String(stop.location || "");
@@ -6550,8 +6560,12 @@ function renderModal() {
               <input name="expectedDeliveryDate" type="date" value="${escapeHtml(order.expectedDeliveryDate || "")}" />
             </label>
             <label class="split-field">
-              <span>Address</span>
+              <span>Delivery address</span>
               <input name="address" value="${escapeHtml(order.address || "")}" placeholder="Address" required />
+            </label>
+            <label class="split-field">
+              <span>Pickup address override <small>(optional)</small></span>
+              <input name="pickupAddress" value="${escapeHtml(order.pickupAddressOverride || "")}" placeholder="Leave blank to use the mapped pickup location" />
             </label>
             <div class="split-row">
               <label class="split-field">
@@ -9239,6 +9253,7 @@ app.addEventListener("submit", (event) => {
             type: order.type,
             sourceTable: order.sourceTable,
             address: data.address,
+            pickupAddress: String(data.pickupAddress || "").trim(),
             expectedDeliveryDate: data.expectedDeliveryDate,
             windowStart,
             windowEnd,
@@ -9252,7 +9267,10 @@ app.addEventListener("submit", (event) => {
           return response.json();
         });
     saveDetails.then(async (payload) => {
+      const pickupAddress = String(data.pickupAddress || "").trim();
       order.address = data.address;
+      order.pickupAddressOverride = pickupAddress;
+      order.sourceAddress = pickupAddress || order.defaultSourceAddress || "";
       order.expectedDeliveryDate = data.expectedDeliveryDate || "";
       order.windowStart = windowStart;
       order.windowEnd = windowEnd;

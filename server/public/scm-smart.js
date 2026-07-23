@@ -182,14 +182,14 @@ function smartOverview() {
   const forecast = data.forecastRuns?.[0];
   const plan = data.planningRuns?.[0];
   const printers = data.printers || [];
-  const healthyPrinters = printers.filter((printer) => printer.enabled && printer.hasToken && ["online", "offline"].includes(printer.status)).length;
+  const healthyPrinters = printers.filter((printer) => printer.transferOrderReady && ["online", "offline"].includes(printer.status)).length;
   const totals = plan?.totals || {};
   return `
     <section class="smart-stats">
       <article class="smart-stat"><small>Inventory + sales data</small><strong>${sync.inventoryStatus === "ready" ? "Inventory ready" : "Sync inventory"}</strong><span>${smartNumber(sync.inventoryItemCount, 0)} NetSuite items · ${smartNumber(sync.salesFactCount, 0)} ${smartEscape((sync.salesSource || "workbook").toUpperCase())} sales facts</span></article>
       <article class="smart-stat"><small>Latest forecast</small><strong>${forecast ? `#${forecast.id}` : "—"}</strong><span>${forecast ? `${smartNumber(forecast.metrics?.forecasts, 0)} item-yard series · ${smartDate(forecast.completedAt, true)}` : "No forecast run yet"}</span></article>
       <article class="smart-stat"><small>Latest plan</small><strong>${plan ? smartNumber(totals.proposals, 0) : "—"}</strong><span>${plan ? `${smartNumber(totals.poProposals, 0)} PO · ${smartNumber(totals.toProposals, 0)} TO · revision ${plan.revision}` : "No planning run yet"}</span></article>
-      <article class="smart-stat"><small>Yard print queues</small><strong>${healthyPrinters}/4</strong><span>${printers.filter((printer) => printer.status === "online").length} agent(s) online · setup required before TO confirmation</span></article>
+      <article class="smart-stat"><small>TO print routing</small><strong>${healthyPrinters}/4</strong><span>${printers.filter((printer) => printer.status === "online").length} agent(s) online · two printers required per source yard</span></article>
     </section>
     <section class="smart-section">
       <div class="smart-section-head">
@@ -203,7 +203,7 @@ function smartOverview() {
         <article class="smart-card"><h3>1. Live item and inventory truth</h3><p>NetSuite owns item identity, vendor, UOM, conversions, weight, and all four yard balances. Item Master stores only operational overrides such as lead time, vendor yard, and yard eligibility.</p></article>
         <article class="smart-card"><h3>2. Seasonal demand forecast</h3><p>The uploaded raw sales CSV feeds a calendar-aware baseline: demand ramps in March/April, peaks in June/July, and declines from October. Statistical candidates remain backtested and explainable.</p></article>
         <article class="smart-card"><h3>3. Vendor response revisions</h3><p>Direct-vendor PO proposals wait for reply. Partial supply, stock-out, production ETA, or credit hold creates a new revision and recalculates only unconfirmed draft transfers.</p></article>
-        <article class="smart-card"><h3>4. Safe TO execution</h3><p>A confirmed TO reserves source stock, creates exactly one transfer in live mode, verifies Pending Fulfillment, retrieves its picking ticket, and queues it only to the source yard printer.</p></article>
+        <article class="smart-card"><h3>4. Safe TO execution</h3><p>A confirmed TO reserves source stock, creates exactly one transfer in live mode, verifies Pending Fulfillment, retrieves its picking ticket, and prints one copy on each of the source yard's two TO printers.</p></article>
       </div>
     </section>
     ${plan ? `<section class="smart-section"><div class="smart-section-head"><div><h3>Latest planning run #${plan.id}</h3><p>${smartDate(plan.completedAt, true)} · ${smartEscape(plan.triggerSource)} · revision ${plan.revision}</p></div>${smartPill(plan.status)}</div><div class="smart-section-body smart-grid-4"><div class="smart-card"><h3>${smartNumber(totals.shortageLines, 0)}</h3><p>Undercover item-yard lines</p></div><div class="smart-card"><h3>${smartNumber(totals.urgent, 0)}</h3><p>Urgent proposals</p></div><div class="smart-card"><h3>${smartNumber(totals.held, 0)}</h3><p>Held or incomplete loads</p></div><div class="smart-card"><h3>${smartNumber(totals.exceptions?.length || 0, 0)}</h3><p>Manual planning exceptions</p></div></div></section>` : ""}`;

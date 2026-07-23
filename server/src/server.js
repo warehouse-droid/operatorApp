@@ -856,8 +856,8 @@ async function approveAndPrintTransferDependencyProposal(batchId, proposalId, op
     throw Object.assign(new Error(message), { status: 409 });
   }
   const printer = (await listYardPrinters()).find((row) => Number(row.locationId) === Number(proposal.fromLocationId));
-  if (!printer?.enabled || !printer?.hasToken || !printer?.printerName) {
-    const message = `Quantity verified. ${proposal.fromLocation} printer must be enabled with a printer name and agent token before approval.`;
+  if (!printer?.transferOrderReady) {
+    const message = `Quantity verified. ${proposal.fromLocation} requires two different TO printers, an enabled yard queue, and an agent token before approval.`;
     await query(
       `UPDATE scm_transfer_dependency_proposals
           SET approval_status = 'pending', approval_error = $2, updated_at = now()
@@ -959,8 +959,8 @@ async function executeSmartScmTransferProposal(proposalId, operator) {
   try {
     const printers = await listYardPrinters();
     const printer = printers.find((row) => Number(row.locationId) === Number(prepared.sourceLocationId));
-    if (!printer?.enabled || !printer?.hasToken || !printer?.printerName) {
-      throw new Error(`${prepared.sourceName} printer must be enabled with a printer name and agent token before confirming this TO.`);
+    if (!printer?.transferOrderReady) {
+      throw new Error(`${prepared.sourceName} requires two different printers assigned to TO printing, an enabled yard queue, and an agent token before confirming this TO.`);
     }
     let document;
     if (prepared.mode === "live") {
@@ -1048,8 +1048,8 @@ async function retrySmartScmTransferPrint(proposalId, operator) {
   }
   const printers = await listYardPrinters();
   const printer = printers.find((row) => Number(row.locationId) === Number(proposal.sourceLocationId));
-  if (!printer?.enabled || !printer?.hasToken || !printer?.printerName) {
-    throw Object.assign(new Error(`${proposal.sourceName} printer must be enabled with a printer name and agent token.`), { status: 409 });
+  if (!printer?.transferOrderReady) {
+    throw Object.assign(new Error(`${proposal.sourceName} requires two different printers assigned to TO printing, an enabled yard queue, and an agent token.`), { status: 409 });
   }
   const transferOrderRef = proposal.netsuiteTransferOrderRef || `TO-${proposal.netsuiteTransferOrderId}`;
   const document = proposal.netsuiteTransferOrderId
@@ -4190,6 +4190,10 @@ function printerAgentId(req) {
   return String(req.get("x-printer-agent-id") || req.body?.agentId || "").trim();
 }
 
+function printerAgentVersion(req) {
+  return Math.max(1, Number(req.get("x-printer-agent-version") || req.body?.agentVersion || 1) || 1);
+}
+
 function printerLeaseToken(req) {
   return String(req.get("x-print-lease-token") || req.body?.leaseToken || req.query?.leaseToken || "").trim();
 }
@@ -4206,7 +4210,7 @@ function requiredRawUpload(req) {
 // confused with operator sessions and cannot reach any other application endpoint.
 app.post("/api/scm/print-agent/lease", async (req, res, next) => {
   try {
-    res.json(await leaseYardPrintJob(bearerToken(req), printerAgentId(req)));
+    res.json(await leaseYardPrintJob(bearerToken(req), printerAgentId(req), printerAgentVersion(req)));
   } catch (error) {
     next(error);
   }
@@ -4744,7 +4748,7 @@ app.post("/api/scm/smart/printers/:locationId/token", requireSmartScmWriteAccess
 
 app.post("/api/scm/smart/printers/:locationId/test", requireSmartScmWriteAccess, async (req, res, next) => {
   try {
-    const job = await queueYardPrinterTest(req.params.locationId, operatorId(req));
+    const job = await queueYardPrinterTest(req.params.locationId, operatorId(req), req.body?.printerSlot);
     emitAppEvent("scm.smart.updated", { source: "printer-test", printJobId: job.id });
     res.status(201).json(job);
   } catch (error) {
@@ -5006,8 +5010,8 @@ app.post("/api/sales/sales-orders/:id/print", async (req, res, next) => {
       req,
       req.body?.lineLocationId ?? req.body?.printerLocationId ?? req.body?.locationId
     );
-    if (!(printer.enabled && printer.hasToken && printer.printerName)) {
-      throw Object.assign(new Error(`${printer.yardCode} printer must be enabled with a printer name and agent token.`), { status: 409 });
+    if (!printer.salesOrderReady) {
+      throw Object.assign(new Error(`${printer.yardCode} requires exactly one printer assigned to SO printing, an enabled yard queue, and an agent token.`), { status: 409 });
     }
     const document = await fetchPickingTicketFromNetSuite(candidate.orderId, {
       locationId: lineLocationId,
@@ -6813,6 +6817,7 @@ app.put("/api/dispatch/orders/:id/details", async (req, res, next) => {
         type: req.body?.type,
         sourceTable: req.body?.sourceTable,
         address: req.body?.address,
+        pickupAddress: req.body?.pickupAddress,
         expectedDeliveryDate: req.body?.expectedDeliveryDate,
         windowStart: req.body?.windowStart,
         windowEnd: req.body?.windowEnd

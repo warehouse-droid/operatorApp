@@ -7,12 +7,12 @@ import { runSmartScmForecast, listSmartScmForecasts, smartScmCoverageFloor } fro
 import { consolidateCompatibleDrafts, getSmartScmPlanningRun, runSmartScmPlan, smartScmPackWholePalletLines, smartScmSourceTransferLimit, updateSmartScmProposal } from "./smart-scm-planning-repository.js";
 import { addSmartScmVendorAlternativeLine, listSmartScmVendorReplyLoads, removeSmartScmVendorAlternativeLine, saveSmartScmVendorReplyLoad, searchSmartScmVendorAlternatives } from "./smart-scm-vendor-repository.js";
 import { executeSmartScmPurchaseProposal } from "./smart-scm-purchase-service.js";
-import { leaseYardPrintJob, queueYardPrinterTest, rotateYardPrinterToken, updateLeasedPrintJob, updateYardPrinter, yardPrintJobDocument } from "./smart-scm-print-repository.js";
+import { createSimplePdf, leaseYardPrintJob, queueSmartScmPrintJob, queueYardPrinterTest, rotateYardPrinterToken, updateLeasedPrintJob, updateYardPrinter, yardPrintJobDocument } from "./smart-scm-print-repository.js";
 import { groupSmartScmProposals, recalculateSmartScmPoProposal, removeSmartScmProposalLine, smartScmAllocateProRata, updateSmartScmProposalLine } from "./smart-scm-proposal-editor.js";
 import { buildSmartScmPurchaseOrderRestPayload } from "./smart-scm-purchase-netsuite.js";
 import { listSmartScmRouteRules, upsertSmartScmRouteRule } from "./smart-scm-route-repository.js";
 
-let temporaryPrintPath = null;
+const temporaryPrintPaths = [];
 const pickupFloor = smartScmCoverageFloor({ representativeOrderPallets: 0.29, orderCount: 5, capacityPallets: 25 });
 assert.equal(pickupFloor.rawFloorPallets, 1.45, "Five fractional pickup orders must stay fractional until the final rounding step.");
 assert.equal(pickupFloor.coverageFloorPallets, 2, "Five 0.29-PLT pickup orders must create a 2-PLT floor, not a 5-PLT floor.");
@@ -372,20 +372,47 @@ assert.equal(purchasePayload.item.items[1].location.id, "26", "A multi-drop PO l
 
     const printerCount = await query("SELECT COUNT(*)::integer AS count FROM scm_yard_printers");
     assert.equal(printerCount.rows[0].count, 4);
-    const configuredPrinter = await updateYardPrinter(1, { printerName: "MBBS Harness Printer", enabled: true }, null);
+    const configuredPrinter = await updateYardPrinter(1, {
+      enabled: true,
+      printers: [
+        { slot: 1, printerName: "MBBS Harness Printer 1", printTransferOrders: true, printSalesOrders: true },
+        { slot: 2, printerName: "MBBS Harness Printer 2", printTransferOrders: true, printSalesOrders: false }
+      ]
+    }, null);
     const credentials = await rotateYardPrinterToken(1, null);
-    const queued = await queueYardPrinterTest(1, null);
-    const storedJob = await query("SELECT document_path, document_sha256 FROM scm_print_jobs WHERE id = $1", [queued.id]);
-    temporaryPrintPath = storedJob.rows[0].document_path;
+    assert.equal(credentials.printer.transferOrderReady, true);
+    assert.equal(credentials.printer.salesOrderReady, true);
+    const queued = await queueYardPrinterTest(1, null, 2);
+    assert.deepEqual(queued.printerNames, ["MBBS Harness Printer 2"]);
+    const storedJob = await query("SELECT document_path, document_sha256, printer_names FROM scm_print_jobs WHERE id = $1", [queued.id]);
+    temporaryPrintPaths.push(storedJob.rows[0].document_path);
     const leased = await leaseYardPrintJob(credentials.token, configuredPrinter.agentId);
     assert.equal(leased.job.id, queued.id);
     const document = await yardPrintJobDocument(queued.id, credentials.token, configuredPrinter.agentId, leased.job.leaseToken);
-    assert.equal(document.path, temporaryPrintPath);
+    assert.equal(document.path, storedJob.rows[0].document_path);
     const documentBytes = await fs.readFile(document.path);
     assert.equal(crypto.createHash("sha256").update(documentBytes).digest("hex"), storedJob.rows[0].document_sha256);
     await updateLeasedPrintJob(queued.id, credentials.token, configuredPrinter.agentId, leased.job.leaseToken, "started");
     const printed = await updateLeasedPrintJob(queued.id, credentials.token, configuredPrinter.agentId, leased.job.leaseToken, "completed");
     assert.equal(printed.status, "printed");
+
+    const transferQueued = await queueSmartScmPrintJob({
+      locationId: 1,
+      documentType: "picking_ticket",
+      documentName: "MBBS-dual-printer-harness.pdf",
+      documentBuffer: createSimplePdf(["MBBS dual-printer harness"]),
+      jobKey: `smart-scm-dual-printer-harness:${Date.now()}`
+    }, null);
+    assert.deepEqual(transferQueued.printerNames, ["MBBS Harness Printer 1", "MBBS Harness Printer 2"]);
+    const transferStored = await query("SELECT document_path, printer_names FROM scm_print_jobs WHERE id = $1", [transferQueued.id]);
+    temporaryPrintPaths.push(transferStored.rows[0].document_path);
+    assert.deepEqual(transferStored.rows[0].printer_names, ["MBBS Harness Printer 1", "MBBS Harness Printer 2"]);
+    await assert.rejects(leaseYardPrintJob(credentials.token, configuredPrinter.agentId, 1), /Update the MBBS Yard Printer Agent/);
+    const transferLease = await leaseYardPrintJob(credentials.token, configuredPrinter.agentId, 2);
+    assert.deepEqual(transferLease.job.printerNames, ["MBBS Harness Printer 1", "MBBS Harness Printer 2"]);
+    await updateLeasedPrintJob(transferQueued.id, credentials.token, configuredPrinter.agentId, transferLease.job.leaseToken, "started");
+    const transferPrinted = await updateLeasedPrintJob(transferQueued.id, credentials.token, configuredPrinter.agentId, transferLease.job.leaseToken, "completed");
+    assert.equal(transferPrinted.status, "printed");
     console.log(JSON.stringify({
       activeInputs: activeSlots.size,
       forecasts: forecasts.length,
@@ -401,6 +428,6 @@ assert.equal(purchasePayload.item.items[1].location.id, "26", "A multi-drop PO l
     }, null, 2));
   }, { rollback: true });
 } finally {
-  if (temporaryPrintPath) await fs.unlink(temporaryPrintPath).catch(() => null);
+  await Promise.all(temporaryPrintPaths.map((printPath) => fs.unlink(printPath).catch(() => null)));
   await closeDb();
 }

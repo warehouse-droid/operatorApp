@@ -157,7 +157,7 @@ function salesPrinter(locationId) {
 }
 
 function salesPrinterReady(printer) {
-  return Boolean(printer?.enabled && printer?.hasToken && printer?.printerName);
+  return Boolean(printer?.salesOrderReady);
 }
 
 function salesOrderLineYards(order) {

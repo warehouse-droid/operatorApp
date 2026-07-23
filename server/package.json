@@ -23,6 +23,7 @@
     "test:multi-photo-pallet": "node src/multi-photo-pallet-harness.js",
     "test:scm-vrma": "node src/scm-vrma-harness.js",
     "test:smart-scm": "node src/smart-scm-harness.js",
+    "test:dual-printers": "node src/dual-printer-harness.js",
     "test:sync-shape": "node src/sync-shape-harness.js",
     "test:admin-access": "node src/admin-access-harness.js",
     "test:admin-access-integration": "node src/admin-access-integration-harness.js",

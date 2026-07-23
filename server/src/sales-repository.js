@@ -295,6 +295,9 @@ export async function getSalesOrderPrintCandidate({ orderId, allowedOrderingLoca
 
 function publicPrintHistory(row) {
   const lineLocationId = Number(row.line_location_id);
+  const printerNames = (Array.isArray(row.printer_names) ? row.printer_names : [])
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
   return {
     jobId: Number(row.id),
     orderId: Number(row.source_order_id),
@@ -303,7 +306,8 @@ function publicPrintHistory(row) {
     lineYardCode: row.line_yard_code || "",
     printerLocationId: Number(row.location_id),
     printerYardCode: row.printer_yard_code || "",
-    printerName: row.printer_name || "",
+    printerName: printerNames.join(" + ") || row.printer_name || "",
+    printerNames,
     requestedBy: row.requested_by || row.queued_by_operator_id || "System",
     requestedAt: row.queued_at,
     status: row.status || "",

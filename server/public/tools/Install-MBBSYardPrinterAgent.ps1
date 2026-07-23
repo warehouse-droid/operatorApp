@@ -14,6 +14,7 @@ $InstalledScript = Join-Path $InstallDirectory "MBBSYardPrinterAgent.ps1"
 $ConfigPath = Join-Path $InstallDirectory "agent.json"
 $LogPath = Join-Path $InstallDirectory "agent.log"
 $TaskName = "MBBS Yard Printer Agent"
+$AgentVersion = "2"
 
 function Write-AgentLog {
   param([string]$Message)
@@ -50,6 +51,7 @@ function Send-JobState {
   $headers = @{
     Authorization = "Bearer $($script:Config.token)"
     "x-printer-agent-id" = $script:Config.agentId
+    "x-printer-agent-version" = $AgentVersion
     "x-print-lease-token" = $Job.leaseToken
   }
   Invoke-AgentApi -Method "POST" -Path "/api/scm/print-agent/jobs/$($Job.id)/$Action" -Headers $headers -Body @{ error = $ErrorMessage } | Out-Null
@@ -65,6 +67,7 @@ function Start-AgentLoop {
       $headers = @{
         Authorization = "Bearer $($script:Config.token)"
         "x-printer-agent-id" = $script:Config.agentId
+        "x-printer-agent-version" = $AgentVersion
       }
       $lease = Invoke-AgentApi -Method "POST" -Path "/api/scm/print-agent/lease" -Headers $headers -Body @{}
       if ($null -eq $lease.job) {
@@ -79,6 +82,7 @@ function Start-AgentLoop {
         $downloadHeaders = @{
           Authorization = "Bearer $($script:Config.token)"
           "x-printer-agent-id" = $script:Config.agentId
+          "x-printer-agent-version" = $AgentVersion
           "x-print-lease-token" = $job.leaseToken
         }
         Invoke-WebRequest -Uri "$($script:Config.serverUrl.TrimEnd('/'))$($job.downloadUrl)" -Headers $downloadHeaders -OutFile $tempFile -TimeoutSec 90
@@ -86,15 +90,25 @@ function Start-AgentLoop {
           $actualHash = (Get-FileHash -LiteralPath $tempFile -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($actualHash -ne ([string]$job.documentSha256).ToLowerInvariant()) { throw "Downloaded document hash did not match the queued job." }
         }
+        $targetPrinters = @()
+        if ($null -ne $job.printerNames) {
+          $targetPrinters = @($job.printerNames | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        }
+        if ($targetPrinters.Count -eq 0 -and -not [string]::IsNullOrWhiteSpace([string]$job.printerName)) {
+          $targetPrinters = @([string]$job.printerName)
+        }
+        if ($targetPrinters.Count -eq 0) { throw "The print job did not contain a printer destination." }
         Send-JobState -Job $job -Action "started"
         $started = $true
-        Write-AgentLog "Printing job $($job.id) to '$($job.printerName)'."
-        $quotedPrinter = '"' + ([string]$job.printerName).Replace('"', '\"') + '"'
         $quotedFile = '"' + $tempFile.Replace('"', '\"') + '"'
-        $process = Start-Process -FilePath $script:Config.sumatraPath -ArgumentList @("-print-to", $quotedPrinter, "-silent", $quotedFile) -Wait -PassThru
-        if ($process.ExitCode -ne 0) { throw "SumatraPDF exited with code $($process.ExitCode)." }
+        foreach ($printerName in $targetPrinters) {
+          Write-AgentLog "Printing job $($job.id) to '$printerName'."
+          $quotedPrinter = '"' + ([string]$printerName).Replace('"', '\"') + '"'
+          $process = Start-Process -FilePath $script:Config.sumatraPath -ArgumentList @("-print-to", $quotedPrinter, "-silent", $quotedFile) -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "SumatraPDF exited with code $($process.ExitCode) while printing to '$printerName'." }
+        }
         Send-JobState -Job $job -Action "completed"
-        Write-AgentLog "Job $($job.id) completed."
+        Write-AgentLog "Job $($job.id) completed on $($targetPrinters.Count) printer(s)."
       } catch {
         $message = $_.Exception.Message
         try {
