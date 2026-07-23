@@ -2249,6 +2249,12 @@ async function materializeSalesSplitOrder(order, parent) {
   if (!splitItems.length) return splitId;
   await query("DELETE FROM sales_order_lines WHERE sales_order_id = $1 AND COALESCE(loaded_qty, 0) = 0 AND COALESCE(packed_pallet_qty, 0) = 0 AND COALESCE(packed_layer_qty, 0) = 0 AND COALESCE(packed_section_qty, 0) = 0 AND COALESCE(packed_piece_qty, 0) = 0", [splitId]);
   for (const item of splitItems) {
+    const rawLineId = item.lineId ?? item.line_id;
+    const lineId = rawLineId == null || String(rawLineId).trim() === "" ? null : rawLineId;
+    const fallbackIdentity = [item.lineRowId, item.id, item.itemId, item.item_id, item.sku]
+      .find((value) => value != null && String(value).trim() !== "");
+    const lineIdentity = lineId ?? fallbackIdentity ?? "line";
+    const conflictTarget = lineId == null ? "(id)" : "(sales_order_id, line_id)";
     await query(
       `INSERT INTO sales_order_lines (
          sales_order_id, id, line_id, item_id, item_name, sku, item_description,
@@ -2278,7 +2284,7 @@ async function materializeSalesSplitOrder(order, parent) {
           ELSE 4
         END
         LIMIT 1
-       ON CONFLICT (id) DO UPDATE
+       ON CONFLICT ${conflictTarget} DO UPDATE
          SET quantity = EXCLUDED.quantity,
              pallet_qty = EXCLUDED.pallet_qty,
              layer_qty = EXCLUDED.layer_qty,
@@ -2288,8 +2294,8 @@ async function materializeSalesSplitOrder(order, parent) {
              synced_at = now()`,
       [
         splitId,
-        syntheticOrderId(`sales-line:${order.id}:${item.lineRowId || item.lineId || item.sku}`),
-        item.lineId || item.line_id || null,
+        syntheticOrderId(`sales-line:${order.id}:${lineIdentity}`),
+        lineId,
         splitLineSalesQuantity(item),
         itemNumber(item.pallets),
         itemNumber(item.layers),
@@ -2299,7 +2305,7 @@ async function materializeSalesSplitOrder(order, parent) {
         parent.netsuite_id,
         item.sku || item.itemName || "",
         item.itemId || item.item_id || "",
-        item.lineId || item.line_id || null
+        lineId
       ]
     );
   }

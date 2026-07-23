@@ -388,6 +388,14 @@ export function changedLockedLoadAssignments(previousPlan = {}, nextPlan = {}, l
       depart: dispatchMinute(stop.timing?.depart)
     }
   });
+  const stableSignatureValue = (value) => {
+    if (Array.isArray(value)) return value.map(stableSignatureValue);
+    if (!value || typeof value !== "object") return value;
+    return Object.keys(value).sort().reduce((memo, keyName) => {
+      memo[keyName] = stableSignatureValue(value[keyName]);
+      return memo;
+    }, {});
+  };
   const lockedSignature = (plan, row) => row ? JSON.stringify({
     driverLogin: row.driverLogin,
     driverName: row.driverName,
@@ -403,6 +411,7 @@ export function changedLockedLoadAssignments(previousPlan = {}, nextPlan = {}, l
     handoffTravelTo: row.handoffTravelTo,
     returnOnly: row.load.returnOnly === true,
     returnYard: text(row.load.returnYard || row.load.return_yard),
+    orders: stableSignatureValue(row.load.orders || []),
     stops: (row.load.stops || []).map(stopSignature),
     allocations: allocationSignature(plan, row)
   }) : "";

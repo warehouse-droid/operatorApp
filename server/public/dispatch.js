@@ -11,6 +11,10 @@ const displayDateTime = (value) => window.MBBS_I18N?.displayDateTime(value) || "
 const SALES_PLANNING_HOST = window.location.pathname.startsWith("/sales/");
 const DISPATCH_PLAN_CACHE_KEY = "mbbs.dispatch.plan";
 
+const ROUTE_ESTIMATE_STORAGE_KEY = "mbbs.dispatch.routeEstimates.v1";
+const ROUTE_ESTIMATE_CACHE_LIMIT = 100;
+const ROUTE_ESTIMATE_CACHE_MAX_CHARS = 500000;
+const ROUTE_ESTIMATE_CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 function dispatchStorageGet(key, fallback = null) {
   // Dispatch plans are server-authoritative and can be larger than the browser's
   // per-origin localStorage quota. Never hydrate a plan from this legacy cache.
@@ -443,6 +447,7 @@ let lastSavedAt = "";
 let routeNotice = "";
 let dispatchDateFilter = "";
 let dispatchConfig = { googleMapsApiKey: "" };
+let dispatchSetupLoaded = false;
 let dispatchPlanningSettings = { truckSwitchMinutes: 10 };
 const driverNewTruckSelections = new Map();
 let driverLaneOrder = [];
@@ -454,6 +459,7 @@ let googleMapsPromise = null;
 let routeEstimates = {};
 let routeCache = {};
 let persistedRouteEstimateCache = loadPersistedRouteEstimateCache();
+let persistedRouteEstimateSaveTimer = null;
 let backgroundRouteTimer = null;
 let backgroundRoutesRunning = false;
 let backgroundRouteRenderQueued = false;
@@ -468,13 +474,17 @@ let saveTimer = null;
 let saveInFlight = false;
 let saveQueued = false;
 let saveFlushPromise = null;
+let forceNextPlanSave = false;
 let confirmInFlight = false;
-let minimumPlanRevisionToApply = 0;
+let minimumPlanRevisionToApply = { planId: "", revision: 0 };
 let isApplyingRemotePlan = false;
 let localPlanDirty = false;
 let lastLocalPlanEditAt = "";
+let localPlanGeneration = 0;
 let blockedRemotePlanUpdate = false;
+let blockedDispatchSetupUpdate = false;
 let lastSavedPlanHash = "";
+let planPollInFlight = false;
 let eventSource = null;
 let remoteRefreshTimer = null;
 let orderClickTimer = null;
@@ -488,7 +498,8 @@ let pendingOperatorAlertRefs = new Set();
 let nextSaveNeedsOrderPoolRefresh = false;
 let nextPlanSaveMode = "";
 let plannedAssignmentRefs = new Set();
-const HISTORY_LIMIT = 80;
+const HISTORY_LIMIT = 20;
+const HISTORY_MEMORY_LIMIT_BYTES = 32 * 1024 * 1024;
 const DISPATCH_PLAN_KEY = DISPATCH_PLAN_CACHE_KEY;
 const DISPATCH_PLAN_DATE_KEY = "mbbs.dispatch.planDate";
 let currentPlanDate = dispatchStorageGet(DISPATCH_PLAN_DATE_KEY, "") || todayLocalDate();
@@ -546,6 +557,7 @@ const DISPATCH_ASSIGNMENT_MUTATION_ACTIONS = new Set([
   "load_truck_updated",
   "load_start_time_updated",
   "load_deleted",
+  "load_start_mode_updated",
   "load_cleared",
   "order_removed_from_load",
   "drop_order_new_load",
@@ -677,6 +689,18 @@ function autosaveDebug(event, details = {}) {
   console.log("[dispatch-autosave]", payload);
 }
 
+function reportDispatchSaveError(event, error, details = {}) {
+  console.error("[dispatch-save]", {
+    event,
+    planId: currentPlan?.id || "",
+    planDate: currentPlanDate,
+    revision: currentPlan?.revision ?? null,
+    sessionId: dispatchSessionId,
+    message: error?.message || String(error || "Unknown save error"),
+    ...details
+  }, error);
+}
+
 function minutes(value) {
   const [hour, minute] = String(value || "00:00").split(":").map(Number);
   return (hour * 60) + minute;
@@ -691,6 +715,36 @@ function todayLocalDate() {
 function timeText(totalMinutes) {
   const wrapped = ((Math.round(totalMinutes) % 1440) + 1440) % 1440;
   return `${String(Math.floor(wrapped / 60)).padStart(2, "0")}:${String(wrapped % 60).padStart(2, "0")}`;
+}
+
+function normalizeTypedDispatchTime(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return "";
+  let hour;
+  let minute;
+  const colonMatch = text.match(/^(\d{1,2}):(\d{1,2})$/);
+  if (colonMatch) {
+    hour = Number(colonMatch[1]);
+    minute = Number(colonMatch[2]);
+  } else if (/^\d{1,4}$/.test(text)) {
+    if (text.length <= 2) {
+      hour = Number(text);
+      minute = 0;
+    } else {
+      hour = Number(text.slice(0, -2));
+      minute = Number(text.slice(-2));
+    }
+  } else {
+    return "";
+  }
+  if (!Number.isInteger(hour) || !Number.isInteger(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59) return "";
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+}
+
+function resolvedLoadStartMode(load = {}) {
+  const configured = String(load.startMode || load.start_mode || "").trim().toLowerCase();
+  if (configured === "auto" || configured === "fixed") return configured;
+  return String(load.start || "").trim() ? "fixed" : "auto";
 }
 
 function driverJobIdForStop(truck, load, stop) {
@@ -803,8 +857,12 @@ function loadDriver(truck, load) {
   return driverByKey(loadDriverKey(truck, load)) || driverByKey(load?.driverName || load?.driver || truck?.driver) || null;
 }
 
+function normalizedTruckPlate(value) {
+  return String(value || "").replace(/\s+/g, "").toUpperCase();
+}
+
 function loadTruckPlate(truck, load) {
-  return String(load?.truckPlate || load?.truck_plate || truck?.plate || "").trim().toUpperCase();
+  return normalizedTruckPlate(load?.truckPlate || load?.truck_plate || truck?.plate);
 }
 
 function loadTruckId(truck, load) {
@@ -821,7 +879,7 @@ function loadParkingSpot(truck, load) {
 
 function effectiveTruckForLoad(truck, load) {
   const plate = loadTruckPlate(truck, load);
-  const fleetTruck = fleet.find((item) => String(item.plate || "").trim().toUpperCase() === plate);
+  const fleetTruck = fleet.find((item) => normalizedTruckPlate(item.plate) === plate);
   const assignedDriver = loadDriver(truck, load);
   return {
     ...truck,
@@ -883,33 +941,80 @@ function driverLoadEntries(driverLogin = null) {
     }
   }
   return entries.sort((left, right) =>
-    minutes(left.load.start || left.truck.start || DEFAULT_FIRST_LOAD_START) - minutes(right.load.start || right.truck.start || DEFAULT_FIRST_LOAD_START)
-      || left.sequence - right.sequence
+    left.sequence - right.sequence
+      || minutes(left.load.start || left.truck.start || DEFAULT_FIRST_LOAD_START) - minutes(right.load.start || right.truck.start || DEFAULT_FIRST_LOAD_START)
       || left.truckIndex - right.truckIndex
       || left.loadIndex - right.loadIndex
   );
 }
 
+function normalizedDriverLaneOrder(values = []) {
+  const next = [];
+  for (const login of Array.isArray(values) ? values : []) {
+    const key = String(login || "").trim().toLowerCase();
+    if (!key || next.includes(key)) continue;
+    next.push(key);
+  }
+  return next;
+}
+
 function defaultDriverLaneOrder() {
-  return [...drivers]
-    .sort((left, right) => Number(left.displayOrder ?? 0) - Number(right.displayOrder ?? 0) || String(left.name || "").localeCompare(String(right.name || "")))
-    .map(driverKey)
+  return drivers
+    .map((driver, index) => ({ driver, index }))
+    .sort((left, right) => {
+      const leftOrder = Number(left.driver?.displayOrder);
+      const rightOrder = Number(right.driver?.displayOrder);
+      const orderDifference = (Number.isFinite(leftOrder) ? leftOrder : left.index)
+        - (Number.isFinite(rightOrder) ? rightOrder : right.index);
+      return orderDifference || left.index - right.index;
+    })
+    .map(({ driver }) => String(driverKey(driver) || "").trim().toLowerCase())
     .filter(Boolean);
 }
 
-function ensureDriverLaneOrder(preferred = driverLaneOrder) {
-  const valid = new Set(drivers.map(driverKey).filter(Boolean));
+function plannedHistoricalDriverLaneOrder() {
   const next = [];
-  for (const login of Array.isArray(preferred) ? preferred : []) {
-    const key = String(login || "").trim().toLowerCase();
-    if (!key || !valid.has(key) || next.includes(key)) continue;
-    next.push(key);
+  for (const truck of trucks || []) {
+    for (const load of truck.loads || []) {
+      if (!loadHasPlanningContentForAssignment(load)) continue;
+      const login = loadDriverKey(truck, load);
+      if (login && !next.includes(login)) next.push(login);
+    }
   }
-  for (const login of defaultDriverLaneOrder()) {
+  return next;
+}
+
+function ensureDriverLaneOrder(preferred = driverLaneOrder) {
+  const preferredOrder = normalizedDriverLaneOrder(preferred);
+  const defaultOrder = normalizedDriverLaneOrder(defaultDriverLaneOrder());
+  const historicalOrder = normalizedDriverLaneOrder(plannedHistoricalDriverLaneOrder());
+  const valid = new Set([...defaultOrder, ...historicalOrder, ...preferredOrder]);
+  const next = [];
+  for (const login of preferredOrder) {
+    if (valid.has(login) && !next.includes(login)) next.push(login);
+  }
+  for (const login of [...defaultOrder, ...historicalOrder]) {
     if (!next.includes(login)) next.push(login);
   }
   driverLaneOrder = next;
   return driverLaneOrder;
+}
+
+function applyDriverLaneOrder(nextOrder, driverLogin) {
+  const next = normalizedDriverLaneOrder(nextOrder);
+  const before = [...driverLaneOrder];
+  if (before.length === next.length && before.every((login, index) => login === next[index])) return false;
+  driverLaneOrder = next;
+  const key = String(driverLogin || "").trim().toLowerCase();
+  logDispatchAudit({
+    action: "driver_lane_sequence_updated",
+    entityType: "plan",
+    entityId: currentPlan?.id || currentPlanDate,
+    before,
+    after: [...driverLaneOrder],
+    details: { planDate: currentPlanDate, driverLogin: key, fromIndex: before.indexOf(key), toIndex: driverLaneOrder.indexOf(key) }
+  });
+  return true;
 }
 
 function moveDriverLane(driverLogin, delta) {
@@ -918,45 +1023,85 @@ function moveDriverLane(driverLogin, delta) {
   const index = driverLaneOrder.indexOf(key);
   const target = index + Number(delta || 0);
   if (index < 0 || target < 0 || target >= driverLaneOrder.length) return false;
-  const before = [...driverLaneOrder];
-  const [login] = driverLaneOrder.splice(index, 1);
-  driverLaneOrder.splice(target, 0, login);
-  logDispatchAudit({
-    action: "driver_lane_sequence_updated",
-    entityType: "plan",
-    entityId: currentPlan?.id || currentPlanDate,
-    before,
-    after: [...driverLaneOrder],
-    details: { planDate: currentPlanDate, driverLogin: key, fromIndex: index, toIndex: target }
-  });
-  return true;
+  const next = [...driverLaneOrder];
+  const [login] = next.splice(index, 1);
+  next.splice(target, 0, login);
+  return applyDriverLaneOrder(next, key);
+}
+
+function moveDriverLaneByDrop(driverLogin, targetLogin, insertAfter = false) {
+  const key = String(driverLogin || "").trim().toLowerCase();
+  const targetKey = String(targetLogin || "").trim().toLowerCase();
+  ensureDriverLaneOrder();
+  if (!key || !targetKey || key === targetKey || !driverLaneOrder.includes(key) || !driverLaneOrder.includes(targetKey)) return false;
+  const next = driverLaneOrder.filter((login) => login !== key);
+  const targetIndex = next.indexOf(targetKey);
+  next.splice(targetIndex + (insertAfter ? 1 : 0), 0, key);
+  return applyDriverLaneOrder(next, key);
+}
+
+function historicalDriverForLane(driverLogin) {
+  const key = String(driverLogin || "").trim().toLowerCase();
+  for (const truck of trucks || []) {
+    for (const load of truck.loads || []) {
+      if (loadDriverKey(truck, load) !== key) continue;
+      return {
+        login: key,
+        name: load.driverName || load.driver || truck.driver || key,
+        license: load.driverLicense || load.license || truck.license || "-"
+      };
+    }
+    if (String(truck.driverLogin || truck.driver_login || "").trim().toLowerCase() === key) {
+      return { login: key, name: truck.driver || key, license: truck.license || "-" };
+    }
+  }
+  return { login: key, name: key, license: "-" };
 }
 
 function driverLanes() {
   ensureDriverLaneOrder();
   const laneOrder = new Map(driverLaneOrder.map((login, index) => [login, index]));
-  const laneByLogin = new Map(drivers.map((driver, index) => [driverKey(driver), {
-    driverLogin: driverKey(driver),
-    driver,
-    driverName: driver.name,
-    displayOrder: Number(driver.displayOrder ?? index),
-    entries: []
-  }]));
+  const laneByLogin = new Map(drivers.map((driver, index) => {
+    const login = String(driverKey(driver) || "").trim().toLowerCase();
+    return [login, {
+      driverLogin: login,
+      driver,
+      driverName: driver.name,
+      displayOrder: Number(driver.displayOrder ?? index),
+      historical: false,
+      entries: []
+    }];
+  }));
+  for (const [index, login] of driverLaneOrder.entries()) {
+    if (laneByLogin.has(login)) continue;
+    const historicalDriver = historicalDriverForLane(login);
+    laneByLogin.set(login, {
+      driverLogin: login,
+      driver: historicalDriver,
+      driverName: historicalDriver.name || login,
+      displayOrder: index,
+      historical: true,
+      entries: []
+    });
+  }
   laneByLogin.set("", {
     driverLogin: "",
     driver: null,
     driverName: "Unassigned",
     displayOrder: 200000,
+    historical: false,
     entries: []
   });
   for (const entry of driverLoadEntries()) {
     const login = entry.driverLogin;
     if (!laneByLogin.has(login)) {
+      if (!loadHasPlanningContentForAssignment(entry.load)) continue;
       laneByLogin.set(login, {
         driverLogin: login,
-        driver: entry.driver,
+        driver: entry.driver || historicalDriverForLane(login),
         driverName: entry.driver?.name || entry.load.driverName || (login ? login : "Unassigned"),
         displayOrder: login ? 100000 : 200000,
+        historical: Boolean(login && !entry.driver),
         entries: []
       });
     }
@@ -1174,25 +1319,28 @@ function makeTruckFromFleet(vehicle, index, saved = {}) {
 
 function trucksFromFleetAndSavedPlan(savedTrucks = []) {
   const savedList = Array.isArray(savedTrucks) ? savedTrucks : [];
-  const fleetByPlate = new Map(fleet.map((vehicle) => [String(vehicle.plate || ""), vehicle]));
-  const savedByPlate = new Map(savedList.map((truck) => [String(truck.plate || ""), truck]));
+  const plateKey = normalizedTruckPlate;
+  const fleetByPlate = new Map(fleet.map((vehicle) => [plateKey(vehicle.plate), vehicle]));
+  const savedByPlate = new Map(savedList.map((truck) => [plateKey(truck.plate), truck]));
   const orderedVehicles = [];
   const seen = new Set();
   for (const savedTruck of savedList) {
-    const plate = String(savedTruck.plate || "");
-    const vehicle = fleetByPlate.get(plate) || { plate, capacityLbs: truckCapacityLbs(savedTruck), travelTimePercent: truckTravelTimePercent(savedTruck) };
-    if (!vehicle.plate || seen.has(String(vehicle.plate))) continue;
+    const plate = plateKey(savedTruck.plate);
+    const activeVehicle = fleetByPlate.get(plate);
+    if (!activeVehicle && !(savedTruck.loads || []).some(loadHasPlanningContentForAssignment)) continue;
+    const vehicle = activeVehicle || { plate, capacityLbs: truckCapacityLbs(savedTruck), travelTimePercent: truckTravelTimePercent(savedTruck) };
+    if (!vehicle.plate || seen.has(plateKey(vehicle.plate))) continue;
     orderedVehicles.push(vehicle);
-    seen.add(String(vehicle.plate));
+    seen.add(plateKey(vehicle.plate));
   }
   for (const vehicle of fleet) {
-    const plate = String(vehicle.plate || "");
+    const plate = plateKey(vehicle.plate);
     if (!plate || seen.has(plate)) continue;
     orderedVehicles.push(vehicle);
     seen.add(plate);
   }
   return normalizeUniqueTruckDrivers(orderedVehicles.map((vehicle, index) => {
-    const savedTruck = savedByPlate.get(String(vehicle.plate || ""));
+    const savedTruck = savedByPlate.get(plateKey(vehicle.plate));
     return makeTruckFromFleet(
       vehicle,
       index,
@@ -2447,11 +2595,12 @@ async function loadDispatchSetup() {
     const response = await fetch("/api/dispatch/setup");
     if (!response.ok) return;
     const setup = await response.json();
+    dispatchSetupLoaded = true;
     if (Array.isArray(setup.drivers)) drivers = setup.drivers;
     ensureDriverLaneOrder();
     if (Array.isArray(setup.ownYards)) applyOwnYards(setup.ownYards);
     if (setup.planning) dispatchPlanningSettings = { ...dispatchPlanningSettings, ...setup.planning };
-    if (Array.isArray(setup.trucks) && setup.trucks.length) {
+    if (Array.isArray(setup.trucks)) {
       fleet = setup.trucks;
       trucks = fleet.map((vehicle, index) => makeTruckFromFleet(vehicle, index));
     }
@@ -2983,10 +3132,15 @@ function trucksWithTimingMetadata() {
       const { routeEstimate, routeEstimateId, fromPersistentCache, ...savedLoad } = load;
       const stats = loadStats(truck, load);
       const assignment = assignLoadFields(truck, savedLoad);
+      const startMode = resolvedLoadStartMode(load);
       const effectiveTruck = effectiveTruckForLoad(truck, assignment);
       const rowsByStopId = new Map((stats.rows || []).map((row) => [String(row.stop?.id || ""), row]));
       return {
         ...assignment,
+        startMode,
+        start: startMode === "auto"
+          ? ""
+          : (normalizeTypedDispatchTime(assignment.start) || timeText(stats.scheduledStart)),
         ownYardFixedMinutes: Number(effectiveTruck.ownYardFixedMinutes || 40),
         vendorFixedMinutes: Number(effectiveTruck.vendorFixedMinutes || 35),
         deliveryFixedMinutes: Number(effectiveTruck.deliveryFixedMinutes || 35),
@@ -3035,14 +3189,26 @@ function normalizePlanBeforeSave() {
   syncReturnLoads();
 }
 
+function compactStringFingerprint(value = "") {
+  const text = String(value || "");
+  let first = 2166136261;
+  let second = 2246822507;
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    first = Math.imul(first ^ code, 16777619);
+    second = Math.imul(second ^ code, 3266489909);
+  }
+  return `${text.length.toString(36)}:${(first >>> 0).toString(36)}:${(second >>> 0).toString(36)}`;
+}
+
 function stablePlanHashPayload(payload = {}) {
-  return JSON.stringify({
+  return compactStringFingerprint(JSON.stringify({
     planId: payload.planId || null,
     planDate: payload.planDate || currentPlanDate,
     orders: payload.orders || [],
     trucks: payload.trucks || [],
     driverLaneOrder: payload.summary?.driverLaneOrder || []
-  });
+  }));
 }
 
 function savedPlanHash(saved = {}) {
@@ -3055,14 +3221,9 @@ function savedPlanHash(saved = {}) {
   });
 }
 
-function currentLocalPlanHash() {
-  return stablePlanHashPayload(planPayload(new Date()));
-}
-
-function payloadRequiresSave(payload = {}) {
-  const nextHash = stablePlanHashPayload(payload);
-  const forceSave = payload.refreshOrderPool || payload.saveMode || pendingOperatorAlertRefs.size;
-  return forceSave || nextHash !== lastSavedPlanHash;
+function payloadRequiresSave(payload = {}, nextHash = stablePlanHashPayload(payload), forceSave = false) {
+  const requiresFollowup = payload.refreshOrderPool || payload.saveMode || pendingOperatorAlertRefs.size;
+  return forceSave || requiresFollowup || nextHash !== lastSavedPlanHash;
 }
 
 function requestOrderPoolRefreshOnNextSave() {
@@ -3127,6 +3288,7 @@ function summarizeLoad(load) {
     allowTolls: Boolean(load.allowTolls),
     returnYard: load.returnYard,
     start: load.start,
+    startMode: resolvedLoadStartMode(load),
     driverLogin: load.driverLogin || "",
     driverName: load.driverName || "",
     truckId: load.truckId || "",
@@ -3310,7 +3472,8 @@ function splitOrderPlanningBlock(splits = []) {
 }
 
 function applySavedPlan(saved) {
-  if (!saved?.orders?.length || !saved?.trucks?.length) return false;
+  if (!Array.isArray(saved?.orders) || !Array.isArray(saved?.trucks)) return false;
+  clearActiveRouteEstimates();
   const defaultById = new Map(orderCatalog.map((order) => [order.id, normalizeOrder(order)]));
   const savedAssignedIds = assignedOrderIdsForTrucks(saved.trucks);
   const allowSavedOnlyOrder = (order) => {
@@ -3355,9 +3518,9 @@ function applySavedPlan(saved) {
     if (!savedById.has(order.id)) savedById.set(order.id, normalizeOrder(order));
   }
   orders = [...savedById.values()].filter((order) => !hiddenOrderIds.has(order.id));
-  ensureDriverLaneOrder(Array.isArray(saved.summary?.driverLaneOrder) ? saved.summary.driverLaneOrder : defaultDriverLaneOrder());
   trucks = trucksFromFleetAndSavedPlan(saved.trucks);
   normalizeLoadAssignments();
+  ensureDriverLaneOrder(Array.isArray(saved.summary?.driverLaneOrder) ? saved.summary.driverLaneOrder : defaultDriverLaneOrder());
   reconcileTransitCoSourceOrders();
   expandScmGroupedPoStops();
   collapseGroupedOrderStops();
@@ -3372,7 +3535,13 @@ function applySavedPlan(saved) {
   return true;
 }
 
-async function savePlanToServer(payload, { retryOnStale = true, forceSave = false } = {}) {
+function compactCurrentPlan(plan) {
+  if (!plan?.id) return plan || null;
+  const { orders: _orders, trucks: _trucks, ...metadata } = plan;
+  return metadata;
+}
+
+async function savePlanToServer(payload, { retryOnStale = true, forceSave = false, payloadHash = "", saveGeneration = localPlanGeneration } = {}) {
   try {
     let targetPlanId = payload.planId || null;
     let targetPlanDate = payload.planDate || currentPlanDate;
@@ -3386,8 +3555,9 @@ async function savePlanToServer(payload, { retryOnStale = true, forceSave = fals
         planDate: targetPlanDate,
         baseRevision: created.revision ?? payload.baseRevision ?? 0
       };
+      payloadHash = "";
     }
-    const payloadHash = stablePlanHashPayload(payload);
+    payloadHash ||= stablePlanHashPayload(payload);
     const operatorAlertRefs = [...pendingOperatorAlertRefs];
     const refreshOrderPool = Boolean(payload.refreshOrderPool);
     const saveMode = payload.saveMode || "";
@@ -3426,6 +3596,13 @@ async function savePlanToServer(payload, { retryOnStale = true, forceSave = fals
         currentRevision: conflict.currentRevision,
         retryOnStale,
         willRetry: conflict.code === "STALE_DISPATCH_PLAN" && retryOnStale && localPlanDirty
+      });
+      reportDispatchSaveError("conflict", new Error(conflict.error || conflict.message || `Plan save conflict (${response.status})`), {
+        status: response.status,
+        code: conflict.code || "",
+        expectedRevision: conflict.expectedRevision,
+        currentRevision: conflict.currentRevision,
+        retryOnStale
       });
       if (conflict.code === "DISPATCH_ORDER_ALREADY_PLANNED") {
         if (conflict.currentRevision !== undefined && currentPlan) {
@@ -3475,30 +3652,36 @@ async function savePlanToServer(payload, { retryOnStale = true, forceSave = fals
       return { blocked: true, code: conflict.code || "STALE_DISPATCH_PLAN", error: routeNotice };
     }
     if (!response.ok) {
-      routeNotice = `Plan save failed: ${await response.text()}`;
+      const responseText = await response.text();
+      const error = new Error(responseText || response.statusText || `HTTP ${response.status}`);
+      reportDispatchSaveError("server-response", error, { status: response.status, responseText });
+      routeNotice = `Plan save failed: ${error.message}`;
       render({ save: false });
-      return { failed: true };
+      return { failed: true, error };
     }
     const result = await response.json();
     const saveTargetsCurrentView = String(currentPlan?.id || "") === String(targetPlanId)
       && String(currentPlanDate || "").slice(0, 10) === String(targetPlanDate || "").slice(0, 10);
     const resultRevision = Number(result.revision || 0);
-    if (saveTargetsCurrentView && resultRevision < minimumPlanRevisionToApply) {
+    const guardedRevision = String(minimumPlanRevisionToApply.planId || "") === String(targetPlanId)
+      ? Number(minimumPlanRevisionToApply.revision || 0)
+      : 0;
+    if (saveTargetsCurrentView && resultRevision < guardedRevision) {
       autosaveDebug("savePlanToServer:ignoredOlderResult", {
         resultRevision,
-        minimumPlanRevisionToApply
+        minimumPlanRevisionToApply: guardedRevision
       });
       return { saved: true, ignoredOlderResult: true };
     }
-    if (saveTargetsCurrentView) currentPlan = result;
+    if (saveTargetsCurrentView) currentPlan = compactCurrentPlan(result);
     lastServerSavedAt = result.savedAt || payload.savedAt;
     lastSavedPlanHash = payloadHash;
-    const latestLocalHash = currentLocalPlanHash();
-    const savedLatestLocal = latestLocalHash === payloadHash;
+    const savedLatestLocal = saveGeneration === localPlanGeneration;
     autosaveDebug("savePlanToServer:success", {
       returnedRevision: result.revision,
       payloadHash: shortHash(payloadHash),
-      latestLocalHash: shortHash(latestLocalHash),
+      saveGeneration,
+      localPlanGeneration,
       savedLatestLocal,
       noChange: Boolean(result.noChange),
       refreshOrderPool,
@@ -3508,7 +3691,7 @@ async function savePlanToServer(payload, { retryOnStale = true, forceSave = fals
       if (savedLatestLocal) {
         if (refreshOrderPool) nextSaveNeedsOrderPoolRefresh = false;
         if (saveMode === "truck_sequence") nextPlanSaveMode = "";
-        clearLocalPlanDirty(payload.savedAt);
+        clearLocalPlanDirty(payload.savedAt, saveGeneration);
       } else {
         saveQueued = true;
       }
@@ -3530,13 +3713,19 @@ async function savePlanToServer(payload, { retryOnStale = true, forceSave = fals
       refreshAfterSave.then(() => render({ save: false })).catch(() => null);
       if (refreshOrderPool) nextSaveNeedsOrderPoolRefresh = false;
       if (saveMode === "truck_sequence") nextPlanSaveMode = "";
-      clearLocalPlanDirty(payload.savedAt);
+      clearLocalPlanDirty(payload.savedAt, saveGeneration);
       operatorAlertRefs.forEach((ref) => pendingOperatorAlertRefs.delete(ref));
     } else {
       saveQueued = true;
     }
+    if (Array.isArray(result.followupWarnings) && result.followupWarnings.length) {
+      const warning = new Error(result.followupWarnings.map((item) => `${item.step}: ${item.message}`).join("; "));
+      reportDispatchSaveError("saved-with-followup-warning", warning, { followupWarnings: result.followupWarnings });
+      routeNotice = `Plan saved, but ${result.followupWarnings.map((item) => item.label || item.step).join(", ")} needs attention. Details are in the browser console.`;
+    }
     return { saved: true, latest: savedLatestLocal };
   } catch (error) {
+    reportDispatchSaveError("exception", error);
     routeNotice = `Plan save failed: ${error.message}`;
     render({ save: false });
     return { failed: true, error };
@@ -3566,26 +3755,39 @@ async function flushPlanSaveQueue() {
   saveInFlight = true;
   saveFlushPromise = (async () => {
     let staleRetryCount = 0;
+    let finalResult = null;
     try {
       while (saveQueued) {
         saveQueued = false;
         const savedAt = new Date();
         const payload = planPayload(savedAt);
         const payloadHash = stablePlanHashPayload(payload);
+        const saveGeneration = localPlanGeneration;
+        const forceSave = forceNextPlanSave;
+        forceNextPlanSave = false;
+        const requiresSave = payloadRequiresSave(payload, payloadHash, forceSave);
         autosaveDebug("flushPlanSaveQueue:payload", {
           staleRetryCount,
           baseRevision: payload.baseRevision,
           payloadHash: shortHash(payloadHash),
-          requiresSave: payloadRequiresSave(payload),
+          requiresSave,
           refreshOrderPool: Boolean(payload.refreshOrderPool),
-          saveMode: payload.saveMode || ""
+          saveMode: payload.saveMode || "",
+          forceSave
         });
-        if (!payloadRequiresSave(payload)) {
-          clearLocalPlanDirty(savedAt.toISOString());
+        if (!requiresSave) {
+          finalResult = { saved: true, noChange: true };
+          clearLocalPlanDirty(savedAt.toISOString(), saveGeneration);
           continue;
         }
         lastSavedAt = savedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-        const result = await savePlanToServer(payload, { retryOnStale: staleRetryCount < 1 });
+        const result = await savePlanToServer(payload, {
+          retryOnStale: staleRetryCount < 1,
+          payloadHash,
+          saveGeneration,
+          forceSave
+        });
+        finalResult = result;
         if (result?.staleRetryQueued) {
           autosaveDebug("flushPlanSaveQueue:staleRetryQueued", { staleRetryCount });
           staleRetryCount += 1;
@@ -3594,25 +3796,20 @@ async function flushPlanSaveQueue() {
         staleRetryCount = 0;
         if (result?.blocked || result?.failed) break;
       }
+      return finalResult;
     } finally {
       saveInFlight = false;
-      const shouldContinue = saveQueued;
       saveFlushPromise = null;
-      autosaveDebug("flushPlanSaveQueue:end", { shouldContinue });
-      if (shouldContinue) flushPlanSaveQueue();
+      autosaveDebug("flushPlanSaveQueue:end", { saveQueued });
     }
   })();
   return saveFlushPromise;
 }
 
-function cloneHistoryValue(value) {
-  return JSON.parse(JSON.stringify(value));
-}
-
 function historySnapshot() {
   return {
-    orders: cloneHistoryValue(orders),
-    trucks: cloneHistoryValue(trucks),
+    orders,
+    trucks,
     driverLaneOrder: [...driverLaneOrder],
     selectedOrderId,
     selectedOrderIds: [...selectedOrderIds],
@@ -3622,12 +3819,30 @@ function historySnapshot() {
   };
 }
 
-function serializeHistorySnapshot(snapshot = historySnapshot()) {
-  return JSON.stringify({
+function packHistorySnapshot(snapshot = historySnapshot()) {
+  return JSON.stringify(snapshot);
+}
+
+function unpackHistorySnapshot(packed) {
+  return packed ? JSON.parse(packed) : null;
+}
+
+function historySnapshotFingerprint(snapshot = historySnapshot()) {
+  return compactStringFingerprint(JSON.stringify({
     orders: snapshot.orders,
     trucks: snapshot.trucks,
     driverLaneOrder: snapshot.driverLaneOrder || []
-  });
+  }));
+}
+
+function trimHistoryMemory() {
+  while (undoStack.length > HISTORY_LIMIT) undoStack.shift();
+  while (redoStack.length > HISTORY_LIMIT) redoStack.shift();
+  const memoryBytes = () => [...undoStack, ...redoStack].reduce((sum, packed) => sum + (String(packed || "").length * 2), 0);
+  while (memoryBytes() > HISTORY_MEMORY_LIMIT_BYTES && undoStack.length + redoStack.length > 1) {
+    if (undoStack.length > 1 || !redoStack.length) undoStack.shift();
+    else redoStack.shift();
+  }
 }
 
 function resetUndoHistory() {
@@ -3641,7 +3856,7 @@ function resetUndoHistory() {
 function applyHistorySnapshot(snapshot) {
   if (!snapshot) return;
   orders = (snapshot.orders || []).map(normalizeOrder);
-  trucks = cloneHistoryValue(snapshot.trucks || []);
+  trucks = snapshot.trucks || [];
   ensureDriverLaneOrder(snapshot.driverLaneOrder || defaultDriverLaneOrder());
   selectedOrderId = orders.find((order) => order.id === snapshot.selectedOrderId)?.id || orders[0]?.id || "";
   selectedOrderIds = new Set((snapshot.selectedOrderIds || []).filter((id) => orders.some((order) => order.id === id)));
@@ -3660,38 +3875,39 @@ function applyHistorySnapshot(snapshot) {
   orderDependencyOptions = null;
   orderDependencyLoading = false;
   orderDependencyError = "";
-  routeCache = {};
-  routeEstimates = {};
+  clearActiveRouteEstimates();
 }
 
 function captureUndoPointIfNeeded(save) {
   const snapshot = historySnapshot();
-  const serialized = serializeHistorySnapshot(snapshot);
+  const fingerprint = historySnapshotFingerprint(snapshot);
   if (!historyReady) {
-    historyCurrentState = serialized;
-    historyCurrentSnapshot = cloneHistoryValue(snapshot);
+    historyCurrentState = fingerprint;
+    historyCurrentSnapshot = packHistorySnapshot(snapshot);
     historyReady = true;
     return false;
   }
-  if (serialized === historyCurrentState) return false;
+  if (fingerprint === historyCurrentState) return false;
   if (save && !isApplyingHistory && !isApplyingRemotePlan) {
-    undoStack.push(cloneHistoryValue(historyCurrentSnapshot || snapshot));
-    if (undoStack.length > HISTORY_LIMIT) undoStack.shift();
+    undoStack.push(historyCurrentSnapshot || packHistorySnapshot(snapshot));
     redoStack = [];
+    trimHistoryMemory();
   }
-  historyCurrentState = serialized;
-  historyCurrentSnapshot = cloneHistoryValue(snapshot);
+  historyCurrentState = fingerprint;
+  historyCurrentSnapshot = packHistorySnapshot(snapshot);
   return true;
 }
 
 function markLocalPlanDirty() {
   if (isApplyingHistory || isApplyingRemotePlan) return;
   localPlanDirty = true;
+  localPlanGeneration += 1;
   lastLocalPlanEditAt = new Date().toISOString();
-  autosaveDebug("markLocalPlanDirty", { lastLocalPlanEditAt });
+  autosaveDebug("markLocalPlanDirty", { lastLocalPlanEditAt, localPlanGeneration });
 }
 
-function clearLocalPlanDirty(savedAt = "") {
+function clearLocalPlanDirty(savedAt = "", savedGeneration = localPlanGeneration) {
+  if (savedGeneration !== localPlanGeneration) return;
   if (savedAt && lastLocalPlanEditAt && new Date(savedAt) < new Date(lastLocalPlanEditAt)) return;
   localPlanDirty = false;
   lastLocalPlanEditAt = "";
@@ -3699,25 +3915,34 @@ function clearLocalPlanDirty(savedAt = "") {
     routeNotice = "Your changes were saved. A remote plan update was held back while you were editing.";
     blockedRemotePlanUpdate = false;
   }
+  if (blockedDispatchSetupUpdate) {
+    blockedDispatchSetupUpdate = false;
+    queueDispatchSetupRefresh(0);
+  }
 }
 
 function resetLocalPlanDirty() {
+  const refreshSetup = blockedDispatchSetupUpdate;
   localPlanDirty = false;
   lastLocalPlanEditAt = "";
   blockedRemotePlanUpdate = false;
+  blockedDispatchSetupUpdate = false;
+  if (refreshSetup) queueDispatchSetupRefresh(0);
 }
 
 function undoDispatchChange() {
   if (!undoStack.length) return false;
   const current = historySnapshot();
-  const previousState = undoStack.pop();
-  redoStack.push(current);
-  if (redoStack.length > HISTORY_LIMIT) redoStack.shift();
+  const currentPacked = packHistorySnapshot(current);
+  const previousPacked = undoStack.pop();
+  const previousState = unpackHistorySnapshot(previousPacked);
+  redoStack.push(currentPacked);
+  trimHistoryMemory();
   isApplyingHistory = true;
   applyHistorySnapshot(previousState);
   routeNotice = "Undo applied.";
-  historyCurrentState = serializeHistorySnapshot(previousState);
-  historyCurrentSnapshot = cloneHistoryValue(previousState);
+  historyCurrentState = historySnapshotFingerprint(previousState);
+  historyCurrentSnapshot = previousPacked;
   logDispatchAudit({
     action: "dispatch_plan_undo",
     entityType: "plan",
@@ -3734,14 +3959,16 @@ function undoDispatchChange() {
 function redoDispatchChange() {
   if (!redoStack.length) return false;
   const current = historySnapshot();
-  const nextState = redoStack.pop();
-  undoStack.push(current);
-  if (undoStack.length > HISTORY_LIMIT) undoStack.shift();
+  const currentPacked = packHistorySnapshot(current);
+  const nextPacked = redoStack.pop();
+  const nextState = unpackHistorySnapshot(nextPacked);
+  undoStack.push(currentPacked);
+  trimHistoryMemory();
   isApplyingHistory = true;
   applyHistorySnapshot(nextState);
   routeNotice = "Redo applied.";
-  historyCurrentState = serializeHistorySnapshot(nextState);
-  historyCurrentSnapshot = cloneHistoryValue(nextState);
+  historyCurrentState = historySnapshotFingerprint(nextState);
+  historyCurrentSnapshot = nextPacked;
   logDispatchAudit({
     action: "dispatch_plan_redo",
     entityType: "plan",
@@ -3757,21 +3984,19 @@ function redoDispatchChange() {
 
 function autoSavePlan() {
   if (!isDispatchPlanEditor()) return;
-  const savedAt = new Date();
-  const payload = planPayload(savedAt);
-  if (!payloadRequiresSave(payload)) {
-    clearLocalPlanDirty(savedAt.toISOString());
-    return;
-  }
-  lastSavedAt = savedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  lastSavedAt = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   queueServerSave();
 }
 
-async function saveCurrentPlanNow() {
+async function saveCurrentPlanNow({ forceSave = false } = {}) {
   if (!ensureDispatchPlanEditor()) throw new Error(dispatchEditModeMessage());
   clearTimeout(saveTimer);
+  if (forceSave) forceNextPlanSave = true;
   saveQueued = true;
-  await flushPlanSaveQueue();
+  const result = await flushPlanSaveQueue();
+  if (result?.failed || result?.blocked) {
+    throw result.error instanceof Error ? result.error : new Error(result.error || routeNotice || "Dispatch plan save failed.");
+  }
   if (localPlanDirty) {
     throw new Error(routeNotice || "Latest dispatch plan changes were not saved.");
   }
@@ -3780,14 +4005,8 @@ async function saveCurrentPlanNow() {
 async function forceSaveCurrentPlan() {
   if (!ensureDispatchPlanEditor()) throw new Error(dispatchEditModeMessage());
   if (!currentPlan?.id) throw new Error("Dispatch plan is not loaded.");
-  clearTimeout(saveTimer);
-  saveQueued = false;
-  const savedAt = new Date();
-  const payload = planPayload(savedAt);
-  const result = await savePlanToServer(payload, { retryOnStale: false, forceSave: true });
-  if (result?.blocked || result?.failed) throw new Error(result?.error || routeNotice || "Force save failed.");
-  if (localPlanDirty) throw new Error(routeNotice || "Latest dispatch plan changes were not saved.");
-  routeNotice = "Plan saved.";
+  await saveCurrentPlanNow({ forceSave: true });
+  if (!routeNotice.startsWith("Plan saved, but")) routeNotice = "Plan saved.";
   render({ save: false });
 }
 
@@ -3805,6 +4024,7 @@ async function confirmCurrentPlanAtomic() {
   if (!ensureDispatchPlanEditor()) throw new Error(dispatchEditModeMessage());
   if (!currentPlan?.id) throw new Error("Dispatch plan is not loaded.");
   clearTimeout(saveTimer);
+  await saveCurrentPlanNow();
   saveQueued = false;
   const savedAt = new Date();
   const payload = planPayload(savedAt);
@@ -3839,6 +4059,7 @@ async function confirmCurrentPlanAtomic() {
       currentPlanDate = plan.planDate || currentPlanDate;
       dispatchStorageSet(DISPATCH_PLAN_DATE_KEY, currentPlanDate);
       applySavedPlan(plan);
+      currentPlan = compactCurrentPlan(plan);
       await loadPlanHistory();
       lastServerSavedAt = plan.savedAt || plan.updatedAt || lastServerSavedAt;
       lastSavedPlanHash = savedPlanHash(plan);
@@ -3849,7 +4070,7 @@ async function confirmCurrentPlanAtomic() {
       pendingOperatorAlertRefs.clear();
       resetLocalPlanDirty();
       resetUndoHistory();
-      minimumPlanRevisionToApply = Number(plan.revision || 0);
+      minimumPlanRevisionToApply = { planId: String(plan.id || ""), revision: Number(plan.revision || 0) };
       return plan;
     } catch (error) {
       const refreshError = new Error(`Plan confirmation succeeded on the server, but this screen could not refresh: ${error.message}. Reload the plan before retrying.`);
@@ -3863,9 +4084,7 @@ async function confirmCurrentPlanAtomic() {
 
 function commitPlanMutation(actionName = "dispatch_plan_mutation", mutator = null, options = {}) {
   if (!ensureDispatchPlanEditor()) return false;
-  const rollbackSnapshot = historyReady && historyCurrentSnapshot
-    ? cloneHistoryValue(historyCurrentSnapshot)
-    : null;
+  const rollbackPacked = historyReady ? historyCurrentSnapshot : null;
   autosaveDebug("commitPlanMutation:start", {
     actionName,
     options,
@@ -3879,7 +4098,7 @@ function commitPlanMutation(actionName = "dispatch_plan_mutation", mutator = nul
     ? null
     : localDispatchLoadAssignmentConflict();
   if (assignmentConflict) {
-    if (rollbackSnapshot) applyHistorySnapshot(rollbackSnapshot);
+    if (rollbackPacked) applyHistorySnapshot(unpackHistorySnapshot(rollbackPacked));
     routeNotice = assignmentConflict.message;
     autosaveDebug("commitPlanMutation:assignmentRejected", {
       actionName,
@@ -3929,7 +4148,7 @@ async function createPlanForDate(planDate = currentPlanDate) {
   });
   if (!response.ok) throw new Error(await response.text());
   const plan = await response.json();
-  currentPlan = plan;
+  currentPlan = compactCurrentPlan(plan);
   currentPlanDate = plan.planDate || planDate;
   dispatchStorageSet(DISPATCH_PLAN_DATE_KEY, currentPlanDate);
   await loadPlanHistory();
@@ -3946,8 +4165,7 @@ function resetPlanningBoard() {
   selectedOrderId = orders[0]?.id || "";
   selectedOrderIds = new Set(selectedOrderId ? [selectedOrderId] : []);
   selectedLoadId = trucks[0]?.loads?.[0]?.id || "";
-  routeCache = {};
-  routeEstimates = {};
+  clearActiveRouteEstimates();
 }
 
 async function resetDispatchAfterOrderDataClear() {
@@ -3994,14 +4212,16 @@ async function loadPlanForDate(planDate = currentPlanDate, { createIfMissing = t
     leaveDispatchEditMode({ clearLease: true });
     routeNotice = `Edit Mode status is temporarily unavailable: ${error.message}`;
   }
-  if (currentPlan?.orders?.length && currentPlan?.trucks?.length) {
+  if (Array.isArray(currentPlan?.orders) && Array.isArray(currentPlan?.trucks)) {
     applySavedPlan(currentPlan);
+    currentPlan = compactCurrentPlan(currentPlan);
     lastServerSavedAt = currentPlan.savedAt || currentPlan.updatedAt || lastServerSavedAt;
     await loadDriverJobStatuses();
     resetUndoHistory();
     resetLocalPlanDirty();
     return { loaded: true, created, hasSnapshot: true };
   }
+    currentPlan = compactCurrentPlan(currentPlan);
   if (currentPlan?.id) {
     resetPlanningBoard();
     lastServerSavedAt = currentPlan.savedAt || currentPlan.updatedAt || lastServerSavedAt;
@@ -4032,7 +4252,8 @@ async function loadPlanById(planId) {
     leaveDispatchEditMode({ clearLease: true });
     routeNotice = `Edit Mode status is temporarily unavailable: ${error.message}`;
   }
-  if (plan.orders?.length && plan.trucks?.length) applySavedPlan(plan);
+  currentPlan = compactCurrentPlan(plan);
+  if (Array.isArray(plan.orders) && Array.isArray(plan.trucks)) applySavedPlan(plan);
   lastServerSavedAt = plan.savedAt || plan.updatedAt || lastServerSavedAt;
   await loadPlanHistory();
   await loadDriverJobStatuses();
@@ -4044,20 +4265,25 @@ async function loadPlanById(planId) {
 async function restoreServerPlan() {
   try {
     if (!currentPlan?.id) return false;
+    const requestedPlanId = currentPlan.id;
+    const response = await fetch(`/api/dispatch/plans/${encodeURIComponent(requestedPlanId)}`);
+    if (!response.ok) return false;
+    const saved = await response.json();
+    if (!saved?.savedAt || !Array.isArray(saved.orders) || !Array.isArray(saved.trucks)) return false;
+    const savedRevision = Number(saved.revision || 0);
+    const localRevision = Number(currentPlan?.revision || 0);
+    const newerRevision = savedRevision > localRevision;
+    const newerSavedAt = !lastServerSavedAt || new Date(saved.savedAt) > new Date(lastServerSavedAt);
+    if (!newerRevision && !newerSavedAt) return false;
     if (localPlanDirty) {
       blockedRemotePlanUpdate = true;
       routeNotice = "Remote update available. Your unsaved changes are still visible.";
       return false;
     }
-    const response = await fetch(`/api/dispatch/plans/${encodeURIComponent(currentPlan?.id || "")}`);
-    if (!response.ok) return false;
-    const saved = await response.json();
-    if (!saved?.savedAt || !saved.orders?.length || !saved.trucks?.length) return false;
-    if (lastServerSavedAt && new Date(saved.savedAt) <= new Date(lastServerSavedAt)) return false;
     isApplyingRemotePlan = true;
-    currentPlan = saved;
     currentPlanDate = saved.planDate || currentPlanDate;
     const applied = applySavedPlan(saved);
+    currentPlan = compactCurrentPlan(saved);
     await loadDriverJobStatuses();
     if (applied) resetUndoHistory();
     isApplyingRemotePlan = false;
@@ -4069,7 +4295,8 @@ async function restoreServerPlan() {
 }
 
 async function pollServerPlan() {
-  if (!currentPlan?.id) return;
+  if (!currentPlan?.id || planPollInFlight || saveInFlight || saveQueued || confirmInFlight) return;
+  planPollInFlight = true;
   try {
     const response = await fetch(`/api/dispatch/plans/${encodeURIComponent(currentPlan.id)}/revision`);
     if (!response.ok) return;
@@ -4083,10 +4310,6 @@ async function pollServerPlan() {
       updatedBySessionId: remote.updatedBySessionId || ""
     });
     if (!remoteRevision || remoteRevision <= localRevision) return;
-    if (remote.updatedBySessionId && remote.updatedBySessionId === dispatchSessionId && saveInFlight) {
-      autosaveDebug("pollServerPlan:ownSaveInFlight", { remoteRevision, localRevision });
-      return;
-    }
     if (localPlanDirty) {
       blockedRemotePlanUpdate = true;
       routeNotice = "Remote update available. Your unsaved changes are still visible.";
@@ -4098,6 +4321,8 @@ async function pollServerPlan() {
     if (applied) render({ save: false });
   } catch {
     // Keep polling quietly; SSE or the next poll will catch up.
+  } finally {
+    planPollInFlight = false;
   }
 }
 
@@ -4122,6 +4347,30 @@ function queueRemoteRefresh(reason = "Plan updated from another screen.", { relo
       render({ save: false });
     }
   }, 350);
+}
+
+function queueDispatchSetupRefresh(delay = 350) {
+  window.clearTimeout(remoteRefreshTimer);
+  remoteRefreshTimer = window.setTimeout(async () => {
+    if (localPlanDirty) {
+      blockedDispatchSetupUpdate = true;
+      routeNotice = "Dispatch setup changed. Your unsaved plan changes are still visible; setup will refresh after they are saved or cleared.";
+      render({ save: false });
+      return;
+    }
+    try {
+      const savedTrucks = trucks;
+      await loadDispatchSetup();
+      trucks = trucksFromFleetAndSavedPlan(savedTrucks);
+      normalizeLoadAssignments();
+      clearActiveRouteEstimates();
+      routeNotice = "Dispatch setup updated.";
+      render({ save: false });
+    } catch (error) {
+      routeNotice = `Setup refresh failed: ${error.message}`;
+      render({ save: false });
+    }
+  }, delay);
 }
 
 function connectEvents() {
@@ -4162,32 +4411,21 @@ function connectEvents() {
         savedAt: payload.savedAt || "",
         refreshOrderPool: payload.refreshOrderPool === true
       });
-      if (localPlanDirty) {
-        blockedRemotePlanUpdate = true;
-        routeNotice = "Remote update available. Your unsaved changes are still visible.";
-        autosaveDebug("sse:blockedByDirty", { type: event.type });
-        render({ save: false });
-        return;
-      }
-      queueRemoteRefresh("Dispatch plan updated.", { reloadOrders: payload.refreshOrderPool === true });
+      // Some legacy server events omit sourceSessionId. Verify that the server
+      // revision is actually newer before warning about a remote editor.
+      if (saveInFlight || saveQueued || confirmInFlight) return;
+      pollServerPlan();
       return;
     }
 
     if (event.type === "dispatch.setup.updated") {
-      window.clearTimeout(remoteRefreshTimer);
-      remoteRefreshTimer = window.setTimeout(async () => {
-        try {
-          await loadDispatchSetup();
-          if (currentPlan?.orders?.length && currentPlan?.trucks?.length) applySavedPlan(currentPlan);
-          routeCache = {};
-          routeEstimates = {};
-          routeNotice = "Dispatch setup updated.";
-          render({ save: false });
-        } catch (error) {
-          routeNotice = `Setup refresh failed: ${error.message}`;
-          render({ save: false });
-        }
-      }, 350);
+      if (localPlanDirty) {
+        blockedDispatchSetupUpdate = true;
+        routeNotice = "Dispatch setup changed. Your unsaved plan changes are still visible; setup will refresh after they are saved or cleared.";
+        render({ save: false });
+        return;
+      }
+      queueDispatchSetupRefresh();
       return;
     }
 
@@ -4468,8 +4706,52 @@ function routeLegMinutesForLoad(load) {
   return Array.isArray(estimate?.legMinutes) ? estimate.legMinutes : [];
 }
 
+function normalizeRouteEstimateForLoad(load, estimate) {
+  if (!estimate || !load?.returnOnly || !load?.manual) return estimate || null;
+  const stayMinutes = Math.max(0, Number(estimate.stayMinutes || 0));
+  const totalMinutes = Math.max(0, Number(estimate.totalMinutes || 0));
+  const explicitDriveMinutes = Number(estimate.driveMinutes);
+  const driveMinutes = Number.isFinite(explicitDriveMinutes)
+    ? Math.max(0, explicitDriveMinutes)
+    : Math.max(0, totalMinutes - stayMinutes);
+  if (stayMinutes === 0 && totalMinutes === driveMinutes) return estimate;
+  return { ...estimate, driveMinutes, stayMinutes: 0, totalMinutes: driveMinutes };
+}
+
 function estimateForLoad(load) {
-  return routeEstimates[load?.id] || load?.routeEstimate || null;
+  const estimate = routeEstimates[load?.id] || load?.routeEstimate || null;
+  return normalizeRouteEstimateForLoad(load, estimate);
+}
+
+function discardRouteEstimateForLoad(load) {
+  if (!load?.id) return;
+  delete routeCache[load.id];
+  delete routeEstimates[load.id];
+  delete load.routeEstimate;
+}
+
+function clearActiveRouteEstimates() {
+  window.clearTimeout(backgroundRouteTimer);
+  backgroundRouteTimer = null;
+  backgroundRouteRenderQueued = false;
+  backgroundRouteInFlight.clear();
+  routeCache = {};
+  routeEstimates = {};
+  for (const truck of trucks || []) {
+    for (const load of truck.loads || []) delete load.routeEstimate;
+  }
+}
+
+function invalidateDriverRoutesFromLoad(loadId) {
+  const found = findLoad(loadId);
+  if (!found.load) return;
+  const entries = driverLoadEntries(loadDriverKey(found.truck, found.load));
+  const startIndex = entries.findIndex((entry) => entry.load.id === found.load.id);
+  const affected = startIndex >= 0 ? entries.slice(startIndex) : [found];
+  for (const entry of affected) discardRouteEstimateForLoad(entry.load);
+  backgroundRouteInFlight.clear();
+  window.clearTimeout(backgroundRouteTimer);
+  backgroundRouteTimer = null;
 }
 
 function routeStopIsOwnYard(stop = {}) {
@@ -4717,7 +4999,7 @@ function loadStats(parentTruck, load) {
 }
 
 function loadHasPlanningContentForAssignment(load) {
-  return Boolean(load?.returnOnly || (load?.stops || []).length);
+  return Boolean(load?.returnOnly || (load?.stops || []).length || (load?.orders || []).length);
 }
 
 function localDispatchLoadAssignmentConflict() {
@@ -5137,8 +5419,8 @@ function renumberTruckLoads(truck) {
     }
     for (const entries of byDriver.values()) {
       entries.sort((left, right) =>
-        minutes(left.load.start || left.truck.start || DEFAULT_FIRST_LOAD_START) - minutes(right.load.start || right.truck.start || DEFAULT_FIRST_LOAD_START)
-          || Number(left.load.driverSequence || 0) - Number(right.load.driverSequence || 0)
+        Number(left.load.driverSequence || 0) - Number(right.load.driverSequence || 0)
+          || minutes(left.load.start || left.truck.start || DEFAULT_FIRST_LOAD_START) - minutes(right.load.start || right.truck.start || DEFAULT_FIRST_LOAD_START)
       );
       let number = 1;
       for (const entry of entries) {
@@ -5174,10 +5456,19 @@ function insertIndexForLoadButton(truck, button) {
   return afterIndex >= 0 ? afterIndex + 1 : truck.loads.length;
 }
 
+function newLoadStartFields(truck, driver = null) {
+  const hasPrevious = driverOrientedPlanningEnabled()
+    ? driverLoadEntries(driver ? driverKey(driver) : "").length > 0
+    : (truck?.loads || []).length > 0;
+  return hasPrevious
+    ? { startMode: "auto", start: "" }
+    : { startMode: "fixed", start: DEFAULT_FIRST_LOAD_START };
+}
+
 function addLoadToTruck(truck, insertIndex = truck?.loads?.length || 0, assignedDriver = null) {
   const driver = assignedDriver || truckDriver(truck);
   const sequence = nextDriverSequence(driver ? driverKey(driver) : "");
-  const load = { id: `${truck.id}-L${Date.now()}-${Math.random().toString(16).slice(2)}`, name: "Load", stops: [] };
+  const load = { id: `${truck.id}-L${Date.now()}-${Math.random().toString(16).slice(2)}`, name: "Load", stops: [], ...newLoadStartFields(truck, driver) };
   assignLoadFields(truck, load, { driver, sequence });
   truck.loads.splice(Math.max(0, Math.min(insertIndex, truck.loads.length)), 0, load);
   renumberTruckLoads(truck);
@@ -5187,7 +5478,7 @@ function addLoadToTruck(truck, insertIndex = truck?.loads?.length || 0, assigned
 function addReturnLoadToTruck(truck, insertIndex = truck?.loads?.length || 0, assignedDriver = null) {
   const driver = assignedDriver || truckDriver(truck);
   const sequence = nextDriverSequence(driver ? driverKey(driver) : "");
-  const load = { id: `${truck.id}-MR${Date.now()}-${Math.random().toString(16).slice(2)}`, name: "Return Load", returnOnly: true, manual: true, returnYard: "12441", stops: [] };
+  const load = { id: `${truck.id}-MR${Date.now()}-${Math.random().toString(16).slice(2)}`, name: "Return Load", returnOnly: true, manual: true, returnYard: "12441", stops: [], ...newLoadStartFields(truck, driver) };
   assignLoadFields(truck, load, { driver, sequence });
   truck.loads.splice(Math.max(0, Math.min(insertIndex, truck.loads.length)), 0, load);
   renumberTruckLoads(truck);
@@ -5204,7 +5495,7 @@ function defaultTruckForDriver(driverLogin) {
   }
   const previousPlate = previous?.load?.truckPlate || previous?.truck?.plate || "";
   if (!previousPlate) return null;
-  return trucks.find((truck) => String(truck.plate || "").toUpperCase() === String(previousPlate).toUpperCase()) || null;
+  return trucks.find((truck) => normalizedTruckPlate(truck.plate) === normalizedTruckPlate(previousPlate)) || null;
 }
 
 function driverEntryTimingSnapshot() {
@@ -5237,7 +5528,9 @@ function reflowDriverLaneEntries(driverLogin, orderedEntries, timingByLoad, move
     const timing = timingByLoad.get(entry.load.id) || { start: laneStart, duration: 30 };
     assignLoadToDriver(entry.truck, entry.load, login, { append: false });
     entry.load.driverSequence = index;
-    let start = index === 0 ? laneStart : Number(timing.start);
+    const startMode = resolvedLoadStartMode(entry.load);
+    const fixedStart = normalizeTypedDispatchTime(entry.load.start);
+    let start = startMode === "fixed" ? minutes(fixedStart || timeText(timing.start)) : (index === 0 ? laneStart : Number(timing.start));
     if (previous) {
       const changedTruck = loadTruckPlate(previous.truck, previous.load) !== loadTruckPlate(entry.truck, entry.load);
       const switchMinutes = changedTruck ? Math.max(0, Number(dispatchPlanningSettings.truckSwitchMinutes ?? 10)) : 0;
@@ -5255,9 +5548,10 @@ function reflowDriverLaneEntries(driverLogin, orderedEntries, timingByLoad, move
         )
         : 0;
       const earliest = previousFinish + handoffMinutes + switchMinutes;
-      if (entry.load.id === movedLoadId || start < earliest) start = earliest;
+      if (startMode === "auto" || entry.load.id === movedLoadId || start < earliest) start = earliest;
     }
-    entry.load.start = timeText(start);
+    entry.load.startMode = startMode;
+    entry.load.start = startMode === "auto" ? "" : timeText(start);
     previousFinish = start + Math.max(1, Number(timing.duration || 30));
     previous = entry;
   }
@@ -5353,9 +5647,12 @@ function loadStartInfo(truck, load) {
   if (driverOrientedPlanningEnabled()) {
     const previousEntry = previousDriverLoad(truck, load);
     const assignedTruck = effectiveTruckForLoad(truck, load);
+    const startMode = resolvedLoadStartMode(load);
     if (!previousEntry) {
-      const start = minutes(load?.start || assignedTruck?.start || DEFAULT_FIRST_LOAD_START);
+      const fixedStart = normalizeTypedDispatchTime(load?.start);
+      const start = minutes(startMode === "fixed" ? (fixedStart || DEFAULT_FIRST_LOAD_START) : (assignedTruck?.start || DEFAULT_FIRST_LOAD_START));
       return {
+        startMode,
         start,
         scheduledStart: start,
         previousFinish: null,
@@ -5376,13 +5673,14 @@ function loadStartInfo(truck, load) {
       : 0;
     const handoffMinutes = Math.max(0, Math.round(Number.isFinite(estimatedHandoffMinutes) ? estimatedHandoffMinutes : 0));
     const earliestStart = previousFinish + handoffMinutes + switchMinutes;
-    const hasManualStart = Boolean(String(load?.start || "").trim());
-    const scheduledStart = hasManualStart ? minutes(load.start) : earliestStart;
+    const fixedStart = normalizeTypedDispatchTime(load?.start);
+    const scheduledStart = startMode === "fixed" ? minutes(fixedStart || timeText(earliestStart)) : earliestStart;
     const start = Math.max(earliestStart, scheduledStart);
     const restBefore = Math.max(0, scheduledStart - earliestStart);
     const handoffStart = previousFinish + restBefore;
     const handoffFinish = handoffStart + handoffMinutes;
     return {
+      startMode,
       start,
       scheduledStart,
       previousFinish,
@@ -5394,25 +5692,28 @@ function loadStartInfo(truck, load) {
       handoffStart,
       handoffFinish,
       switchStart: handoffFinish,
-      startClamped: hasManualStart && scheduledStart < earliestStart
+      startClamped: startMode === "fixed" && scheduledStart < earliestStart
     };
   }
+  const startMode = resolvedLoadStartMode(load);
   const index = loadIndexInTruck(truck, load);
   if (index <= 0) {
-    const start = minutes(load?.start || DEFAULT_FIRST_LOAD_START);
-    return { start, scheduledStart: start, previousFinish: null, restBefore: 0, startClamped: false };
+    const fixedStart = normalizeTypedDispatchTime(load?.start);
+    const start = minutes(startMode === "fixed" ? (fixedStart || DEFAULT_FIRST_LOAD_START) : DEFAULT_FIRST_LOAD_START);
+    return { startMode, start, scheduledStart: start, previousFinish: null, restBefore: 0, startClamped: false };
   }
   const previous = truck.loads[index - 1];
   const previousFinish = loadStats(truck, previous).finish;
-  const hasManualStart = Boolean(String(load?.start || "").trim());
-  const scheduledStart = hasManualStart ? minutes(load.start) : previousFinish;
+  const fixedStart = normalizeTypedDispatchTime(load?.start);
+  const scheduledStart = startMode === "fixed" ? minutes(fixedStart || timeText(previousFinish)) : previousFinish;
   const start = Math.max(previousFinish, scheduledStart);
   return {
+    startMode,
     start,
     scheduledStart,
     previousFinish,
     restBefore: Math.max(0, scheduledStart - previousFinish),
-    startClamped: hasManualStart && scheduledStart < previousFinish
+    startClamped: startMode === "fixed" && scheduledStart < previousFinish
   };
 }
 
@@ -5757,6 +6058,17 @@ function routeLocationForStop(stop, order, position, address) {
   return place.routeLocation || address || position;
 }
 
+function returnYardStayMinutes(load, truck) {
+  // A manual return represents travel only. The following load owns any yard service time.
+  if (load?.returnOnly && load?.manual) return 0;
+  return truckStopMinutes(truck, "own", 0);
+}
+
+function routeStayMinutesForLoad(load, stops = []) {
+  if (load?.returnOnly && load?.manual) return 0;
+  return stops.reduce((sum, stop) => sum + Number(stop.stayMinutes || 0), 0);
+}
+
 function mapStopsForLoad(load, truck) {
   const parentTruck = findLoad(load?.id).truck || truck;
   truck = effectiveTruckForLoad(parentTruck, load);
@@ -5793,7 +6105,7 @@ function mapStopsForLoad(load, truck) {
         label: "2",
         title: `Return ${returnYard}`,
         type: "pick",
-        stayMinutes: truckStopMinutes(truck, "own", 0),
+        stayMinutes: returnYardStayMinutes(load, truck),
         orderId: ""
       }
     ];
@@ -5858,24 +6170,45 @@ function routeSignature(stops) {
   ].join("|")).join(">");
 }
 
+function boundedPersistedRouteEstimateCache(cache = {}, now = Date.now()) {
+  const entries = Object.entries(cache || {})
+    .filter(([, entry]) => {
+      const savedAt = Date.parse(entry?.savedAt || "");
+      return Boolean(entry?.estimate) && Number.isFinite(savedAt) && savedAt <= now + 300000 && now - savedAt <= ROUTE_ESTIMATE_CACHE_MAX_AGE_MS;
+    })
+    .sort(([, left], [, right]) => String(right.savedAt || "").localeCompare(String(left.savedAt || "")));
+  const bounded = {};
+  let charCount = 2;
+  for (const [id, entry] of entries.slice(0, ROUTE_ESTIMATE_CACHE_LIMIT)) {
+    const entryChars = JSON.stringify([id, entry]).length + 1;
+    if (charCount + entryChars > ROUTE_ESTIMATE_CACHE_MAX_CHARS) continue;
+    bounded[id] = entry;
+    charCount += entryChars;
+  }
+  return bounded;
+}
+
 function loadPersistedRouteEstimateCache() {
   try {
-    return JSON.parse(dispatchStorageGet("mbbs.dispatch.routeEstimates.v1", "{}") || "{}") || {};
+    const parsed = JSON.parse(dispatchStorageGet(ROUTE_ESTIMATE_STORAGE_KEY, "{}") || "{}") || {};
+    return boundedPersistedRouteEstimateCache(parsed);
   } catch {
     return {};
   }
 }
 
+function flushPersistedRouteEstimateCache() {
+  window.clearTimeout(persistedRouteEstimateSaveTimer);
+  persistedRouteEstimateSaveTimer = null;
+  persistedRouteEstimateCache = boundedPersistedRouteEstimateCache(persistedRouteEstimateCache);
+  const serialized = JSON.stringify(persistedRouteEstimateCache);
+  if (!dispatchStorageSet(ROUTE_ESTIMATE_STORAGE_KEY, serialized)) dispatchStorageRemove(ROUTE_ESTIMATE_STORAGE_KEY);
+}
+
 function savePersistedRouteEstimateCache() {
-  const entries = Object.entries(persistedRouteEstimateCache)
-    .sort(([, left], [, right]) => String(right.savedAt || "").localeCompare(String(left.savedAt || "")))
-    .slice(0, 350);
-  persistedRouteEstimateCache = Object.fromEntries(entries);
-  try {
-    dispatchStorageSet("mbbs.dispatch.routeEstimates.v1", JSON.stringify(persistedRouteEstimateCache));
-  } catch {
-    // Local storage can be full or unavailable; in-memory estimates still work for this page.
-  }
+  persistedRouteEstimateCache = boundedPersistedRouteEstimateCache(persistedRouteEstimateCache);
+  window.clearTimeout(persistedRouteEstimateSaveTimer);
+  persistedRouteEstimateSaveTimer = window.setTimeout(flushPersistedRouteEstimateCache, 500);
 }
 
 function routeEstimateId(signature = "") {
@@ -5941,7 +6274,6 @@ function applyCachedRouteEstimate(truck, load, stops = mapStopsForLoad(load, tru
   if (!cached?.estimate || cached.signature !== meta.signature) return false;
   const estimate = { ...cached.estimate, routeEstimateId: meta.id, fromPersistentCache: true };
   routeEstimates[load.id] = estimate;
-  load.routeEstimate = estimate;
   return true;
 }
 
@@ -6046,6 +6378,8 @@ function geocodeAddress(address) {
       const location = results[0].geometry.location;
       const point = { lat: location.lat(), lng: location.lng() };
       geocodeCache[key] = point;
+      const oldestKey = Object.keys(geocodeCache).length >= 400 ? Object.keys(geocodeCache)[0] : "";
+      if (oldestKey) delete geocodeCache[oldestKey];
       resolve(point);
     });
   });
@@ -6065,7 +6399,7 @@ function routeEstimateFromGoogleLegs(load, stops, legs = [], truck = {}) {
   const legMinutes = rawLegMinutes.map((value) => adjustedTravelMinutesForTruck(truck, value));
   const rawDriveMinutes = rawLegMinutes.reduce((sum, value) => sum + value, 0);
   const driveMinutes = legMinutes.reduce((sum, value) => sum + value, 0);
-  const stayMinutes = stops.reduce((sum, stop) => sum + Number(stop.stayMinutes || 0), 0);
+  const stayMinutes = routeStayMinutesForLoad(load, stops);
   const totalMinutes = driveMinutes + stayMinutes;
   const estimate = {
     rawDriveMinutes,
@@ -6078,7 +6412,6 @@ function routeEstimateFromGoogleLegs(load, stops, legs = [], truck = {}) {
     travelTimePercent: truckTravelTimePercent(truck)
   };
   routeEstimates[load.id] = estimate;
-  load.routeEstimate = estimate;
   cacheRouteEstimate(truck, load, stops, estimate);
   return estimate;
 }
@@ -6267,7 +6600,7 @@ async function renderGoogleMapPreview() {
       strokeWeight: 4,
       map
     });
-    const stayMinutes = stops.reduce((sum, stop) => sum + Number(stop.stayMinutes || 0), 0);
+    const stayMinutes = routeStayMinutesForLoad(load, stops);
     if (routeSummary) routeSummary.innerHTML = `<strong>${stayMinutes} min stay</strong><span>Add more stops for Google travel estimate.</span>`;
   } else {
     drawStopMarkers(await geocodeMarkerStops(stops));
@@ -6371,6 +6704,7 @@ function selectorForElement(element) {
     "data-load-driver",
     "data-load-truck",
     "data-load-start",
+    "data-load-start-mode",
     "data-load-switch-yard",
     "data-load-parking",
     "data-return-yard",
@@ -6429,7 +6763,7 @@ function render(options = {}) {
   const uiState = captureRenderUiState();
   orderListScrollTop = app.querySelector(".order-list")?.scrollTop ?? orderListScrollTop;
   if (save) normalizePlanBeforeSave();
-  const planChanged = captureUndoPointIfNeeded(save);
+  const planChanged = (!historyReady || save) ? captureUndoPointIfNeeded(save) : false;
   if (save && planChanged) {
     markLocalPlanDirty();
     autoSavePlan();
@@ -6696,19 +7030,21 @@ function renderDriverLane(lane, index = 0) {
   const login = String(lane.driverLogin || "").toLowerCase();
   const selectedTruck = defaultTruckForDriver(login);
   const isUnassigned = !login;
-  const disabled = isDispatchPlanEditor() && !isUnassigned ? "" : "disabled";
+  const isHistorical = Boolean(lane.historical);
+  const canReorder = isDispatchPlanEditor() && !isUnassigned && !isHistorical;
+  const disabled = isDispatchPlanEditor() && !isUnassigned && !isHistorical ? "" : "disabled";
   const movableLaneCount = driverLaneOrder.length;
   return `
-    <article class="truck-row driver-lane ${isUnassigned ? "driver-missing" : ""}" data-driver-lane="${escapeHtml(login)}">
+    <article class="truck-row driver-lane ${isUnassigned ? "driver-missing" : ""} ${isHistorical ? "historical-disabled-driver" : ""}" data-driver-lane="${escapeHtml(login)}" data-driver-lane-reorderable="${canReorder ? "true" : "false"}">
       <div class="driver-lane-sequence-controls">
-        <button data-action="move-driver-up" data-driver-login="${escapeHtml(login)}" ${disabled || index <= 0 ? "disabled" : ""} title="Move driver lane up" type="button">&uarr;</button>
-        <span class="driver-lane-marker">${isUnassigned ? "?" : escapeHtml(String(lane.driverName || login).slice(0, 1).toUpperCase())}</span>
-        <button data-action="move-driver-down" data-driver-login="${escapeHtml(login)}" ${disabled || index >= movableLaneCount - 1 ? "disabled" : ""} title="Move driver lane down" type="button">&darr;</button>
+        <button data-action="move-driver-up" data-driver-login="${escapeHtml(login)}" ${!canReorder || index <= 0 ? "disabled" : ""} title="Move driver lane up" type="button">&uarr;</button>
+        <span class="driver-lane-marker" data-driver-lane-handle="${escapeHtml(login)}" draggable="${canReorder ? "true" : "false"}" aria-label="Drag ${escapeHtml(lane.driverName || login)} lane" title="${canReorder ? "Drag to reorder this driver lane" : "Lane reordering unavailable"}">${isUnassigned ? "?" : escapeHtml(String(lane.driverName || login).slice(0, 1).toUpperCase())}</span>
+        <button data-action="move-driver-down" data-driver-login="${escapeHtml(login)}" ${!canReorder || index >= movableLaneCount - 1 ? "disabled" : ""} title="Move driver lane down" type="button">&darr;</button>
       </div>
       <div class="truck-label driver-label">
         <div>
           <strong>${escapeHtml(lane.driverName || t("dispatch.unassigned", "Unassigned"))}</strong>
-          <span>${isUnassigned ? t("dispatch.assignLoadsBeforeConfirm", "Assign these loads before confirmation") : `${escapeHtml(lane.driver?.license || "-")} | ${tf("dispatch.driverLoadCount", "{count} load(s)", { count: lane.entries.length })}`}</span>
+          <span>${isUnassigned ? t("dispatch.assignLoadsBeforeConfirm", "Assign these loads before confirmation") : `${escapeHtml(lane.driver?.license || "-")} | ${tf("dispatch.driverLoadCount", "{count} load(s)", { count: lane.entries.length })}${isHistorical ? " | Disabled (historical plan)" : ""}`}</span>
         </div>
         <label class="truck-start-yard">
           <span>${t("dispatch.truckForNewLoad", "Truck for new load")}</span>
@@ -6719,16 +7055,45 @@ function renderDriverLane(lane, index = 0) {
           <button data-action="add-driver-return" data-driver-login="${escapeHtml(login)}" ${disabled || (!selectedTruck ? "disabled" : "")} type="button">${t("dispatch.addReturn", "+ Return")}</button>
         </div>
       </div>
-      <div class="truck-timeline driver-lane-timeline" data-driver-lane-drop="${escapeHtml(login)}">
+      <div class="truck-timeline driver-lane-timeline" ${isHistorical ? "" : `data-driver-lane-drop="${escapeHtml(login)}"`}>
         ${lane.entries.map((entry, entryIndex) => `
           ${entryIndex > 0 ? renderTruckSwitchTransition(lane.entries[entryIndex - 1], entry) : ""}
           ${renderLoad(entry.truck, entry.load)}
         `).join("")}
-        <div class="timeline-drop-zone ${isUnassigned ? "unassigned-zone" : ""}" data-load-create-driver="${escapeHtml(login)}">
-          ${isUnassigned ? t("dispatch.dropLoadToUnassign", "Drop a load here to unassign") : t("dispatch.dropOrderToCreateLoad", "Drop order here to create a load")}
-        </div>
+        ${isHistorical ? `
+          <div class="timeline-drop-zone locked">Historical driver retained for this saved plan. New loads are disabled.</div>
+        ` : `
+          <div class="timeline-drop-zone ${isUnassigned ? "unassigned-zone" : ""}" data-load-create-driver="${escapeHtml(login)}">
+            ${isUnassigned ? t("dispatch.dropLoadToUnassign", "Drop a load here to unassign") : t("dispatch.dropOrderToCreateLoad", "Drop order here to create a load")}
+          </div>
+        `}
       </div>
     </article>
+  `;
+}
+
+function renderLoadStartControl(parentTruck, load, { disabled = false, preview = false } = {}) {
+  const startInfo = loadStartInfo(parentTruck, load);
+  const startMode = resolvedLoadStartMode(load);
+  const displayedTime = startMode === "fixed"
+    ? (normalizeTypedDispatchTime(load.start) || timeText(startInfo.scheduledStart))
+    : timeText(startInfo.start);
+  const controlDisabled = disabled ? "disabled" : "";
+  const timeDisabled = disabled || startMode === "auto" ? "disabled" : "";
+  return `
+    <div class="load-start-control ${preview ? "preview-load-start-control" : ""}">
+      <label>
+        <span>${t("dispatch.startMode", "Start mode")}</span>
+        <select data-load-start-mode="${escapeHtml(load.id)}" ${controlDisabled}>
+          <option value="auto" ${startMode === "auto" ? "selected" : ""}>${t("dispatch.autoInherit", "Auto inherit")}</option>
+          <option value="fixed" ${startMode === "fixed" ? "selected" : ""}>${t("dispatch.dedicatedStart", "Dedicated time")}</option>
+        </select>
+      </label>
+      <label>
+        <span>${t("dispatch.start", "Start")}</span>
+        <input data-load-start="${escapeHtml(load.id)}" type="text" inputmode="numeric" maxlength="5" autocomplete="off" placeholder="HH:MM" value="${escapeHtml(displayedTime)}" ${timeDisabled} />
+      </label>
+    </div>
   `;
 }
 
@@ -6736,17 +7101,18 @@ function renderLoadAssignmentControls(parentTruck, load) {
   if (!driverOrientedPlanningEnabled()) return "";
   const truck = effectiveTruckForLoad(parentTruck, load);
   const startInfo = loadStartInfo(parentTruck, load);
-  const disabled = isDispatchPlanEditor() && !loadHasDriverActivity(load) ? "" : "disabled";
+  const controlDisabled = !isDispatchPlanEditor() || loadHasDriverActivity(load);
+  const disabled = controlDisabled ? "disabled" : "";
   const advisories = assignmentAdvisoryByLoad.get(String(load.id)) || [];
   const firstUse = isFirstTruckUse(parentTruck, load);
   const showParking = firstUse && !startInfo.switchBefore;
   const assignedTruck = trucks.find((item) => String(item.id) === String(loadTruckId(parentTruck, load)))
-    || trucks.find((item) => String(item.plate || "").toUpperCase() === loadTruckPlate(parentTruck, load))
+    || trucks.find((item) => normalizedTruckPlate(item.plate) === loadTruckPlate(parentTruck, load))
     || parentTruck;
   return `
     <div class="load-assignment-controls ${firstUse ? "has-start-yard" : ""} ${showParking ? "has-parking" : ""}">
       <label><span>${t("dispatch.truck", "Truck")}</span><select data-load-truck="${escapeHtml(load.id)}" ${disabled}>${loadTruckOptions(truck.id)}</select></label>
-      <label><span>${t("dispatch.start", "Start")}</span><input data-load-start="${escapeHtml(load.id)}" type="time" value="${escapeHtml(load.start || timeText(startInfo.scheduledStart))}" ${disabled} /></label>
+      ${renderLoadStartControl(parentTruck, load, { disabled: controlDisabled })}
       ${firstUse ? `<label><span>${t("dispatch.startYard", "Start Yard")}</span><select data-plan-truck-base="${escapeHtml(assignedTruck.id)}" ${disabled}>${yardOptions(assignedTruck.base || loadSwitchYard(parentTruck, load), { includeUnknown: true })}</select></label>` : ""}
       ${showParking ? `<label><span>${t("dispatch.parking", "Parking")}</span><input data-load-parking="${escapeHtml(load.id)}" value="${escapeHtml(loadParkingSpot(parentTruck, load))}" placeholder="A1" ${disabled} /></label>` : ""}
       <span class="load-truck-meta">${formatLbs(truckCapacityLbs(truck))} | ${escapeHtml(travelAdjustmentText(truck))}</span>
@@ -7068,7 +7434,7 @@ function renderLoadPreview() {
         <section class="preview-section">
           <div class="preview-section-title"><strong>Load Details</strong></div>
           <div class="preview-details-grid">
-            <label><span>Start time</span><input id="loadStartTime" data-load="${load.id}" type="time" value="${load.start || timeText(stats.start)}" /></label>
+            ${renderLoadStartControl(parentTruck, load, { disabled: !isDispatchPlanEditor() || loadHasDriverActivity(load), preview: true })}
             <div><span>Finish</span><strong class="${finishText === "Route pending" ? "route-pending" : ""}">${finishText}</strong></div>
             <div><span>Rest before</span><strong>${stats.restBefore ? durationText(stats.restBefore) : "None"}</strong></div>
             <div><span>${load.returnOnly ? "Return route" : "Drive buffer"}</span><strong>${durationText(stats.returnTrip)}</strong></div>
@@ -8980,9 +9346,29 @@ function moveWholeLoadToDriverLane(loadId, driverLane, targetLoadCard = null, cl
   return commitPlanMutation("load_driver_updated");
 }
 
+function clearDriverLaneDragStyles() {
+  document.querySelectorAll(".driver-lane.driver-lane-dragging, .driver-lane.driver-lane-drag-before, .driver-lane.driver-lane-drag-after")
+    .forEach((lane) => lane.classList.remove("driver-lane-dragging", "driver-lane-drag-before", "driver-lane-drag-after"));
+}
+
 app.addEventListener("dragstart", (event) => {
   if (!ensureDispatchPlanEditor()) {
     event.preventDefault();
+    return;
+  }
+  const driverLaneHandle = event.target.closest("[data-driver-lane-handle]");
+  if (driverLaneHandle) {
+    const driverLane = driverLaneHandle.closest("[data-driver-lane]");
+    const driverLogin = String(driverLaneHandle.dataset.driverLaneHandle || "").trim().toLowerCase();
+    if (!driverLogin || driverLane?.dataset.driverLaneReorderable !== "true") {
+      event.preventDefault();
+      return;
+    }
+    dragged = { type: "driver-lane-order", driverLogin };
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", `driver-lane:${driverLogin}`);
+    driverLane.classList.add("driver-lane-dragging");
+    if (typeof event.dataTransfer.setDragImage === "function") event.dataTransfer.setDragImage(driverLane, 16, 24);
     return;
   }
   const poMapSo = event.target.closest("[data-po-map-so]");
@@ -9039,6 +9425,7 @@ app.addEventListener("dragend", () => {
   document.querySelectorAll(".po-match-card.dragging, .po-match-card.drag-over").forEach(
     (card) => card.classList.remove("dragging", "drag-over")
   );
+  clearDriverLaneDragStyles();
   dragged = null;
 });
 
@@ -9158,6 +9545,19 @@ window.addEventListener("keydown", (event) => {
 });
 
 app.addEventListener("dragover", (event) => {
+  if (dragged?.type === "driver-lane-order") {
+    const targetLane = event.target.closest('[data-driver-lane][data-driver-lane-reorderable="true"]');
+    const targetLogin = String(targetLane?.dataset.driverLane || "").trim().toLowerCase();
+    if (!targetLane || !targetLogin || targetLogin === dragged.driverLogin) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+    document.querySelectorAll(".driver-lane.driver-lane-drag-before, .driver-lane.driver-lane-drag-after")
+      .forEach((lane) => lane.classList.remove("driver-lane-drag-before", "driver-lane-drag-after"));
+    const rect = targetLane.getBoundingClientRect();
+    const insertAfter = event.clientY > rect.top + (rect.height / 2);
+    targetLane.classList.add(insertAfter ? "driver-lane-drag-after" : "driver-lane-drag-before");
+    return;
+  }
   const poMapTarget = event.target.closest("[data-po-map-po]");
   if (dragged?.type === "po-map-so" && poMapTarget) {
     event.preventDefault();
@@ -9186,11 +9586,28 @@ app.addEventListener("dragleave", (event) => {
   event.target.closest(".stop-card, .preview-stop")?.classList.remove("drag-over", "insert-before", "insert-after");
   event.target.closest(".timeline-drop-zone")?.classList.remove("drag-over");
   event.target.closest("[data-driver-lane-drop]")?.classList.remove("drag-over");
+  event.target.closest("[data-driver-lane]")?.classList.remove("driver-lane-drag-before", "driver-lane-drag-after");
 });
 
 app.addEventListener("drop", (event) => {
   if (!ensureDispatchPlanEditor()) {
     event.preventDefault();
+    return;
+  }
+  if (dragged?.type === "driver-lane-order") {
+    event.preventDefault();
+    const sourceLogin = dragged.driverLogin;
+    const targetLane = event.target.closest('[data-driver-lane][data-driver-lane-reorderable="true"]');
+    const targetLogin = String(targetLane?.dataset.driverLane || "").trim().toLowerCase();
+    const insertAfter = Boolean(targetLane?.classList.contains("driver-lane-drag-after"));
+    dragged = null;
+    clearDriverLaneDragStyles();
+    if (targetLogin && moveDriverLaneByDrop(sourceLogin, targetLogin, insertAfter)) {
+      routeNotice = "Driver lane position updated for this plan date.";
+      commitPlanMutation("move-driver-lane");
+    } else {
+      render({ save: false });
+    }
     return;
   }
   const poMapTarget = event.target.closest("[data-po-map-po]");
@@ -9404,6 +9821,7 @@ app.addEventListener("click", (event) => {
   }
   if (action === "save-plan-now") {
     forceSaveCurrentPlan().catch((error) => {
+      reportDispatchSaveError("save-now", error);
       routeNotice = `Save failed: ${error.message}`;
       render({ save: false });
     });
@@ -9672,9 +10090,16 @@ app.addEventListener("click", (event) => {
   }
   if (action === "confirm-plan") {
     confirmCurrentPlanAtomic().then((plan) => {
-      routeNotice = `Plan ${displayDate(plan.planDate)} confirmed.`;
+      if (Array.isArray(plan.followupWarnings) && plan.followupWarnings.length) {
+        const warning = new Error(plan.followupWarnings.map((item) => `${item.step}: ${item.message}`).join("; "));
+        reportDispatchSaveError("confirmed-with-followup-warning", warning, { followupWarnings: plan.followupWarnings });
+        routeNotice = `Plan ${displayDate(plan.planDate)} confirmed, but ${plan.followupWarnings.map((item) => item.label || item.step).join(", ")} needs attention. Details are in the browser console.`;
+      } else {
+        routeNotice = `Plan ${displayDate(plan.planDate)} confirmed.`;
+      }
       render({ save: false });
     }).catch((error) => {
+      reportDispatchSaveError("confirm", error, { code: error.code || "" });
       routeNotice = error.code === "DISPATCH_CONFIRM_REFRESH_FAILED"
         ? error.message
         : `Confirm failed: ${error.message}`;
@@ -9694,8 +10119,9 @@ app.addEventListener("click", (event) => {
       currentPlan = plan;
       currentPlanDate = plan.planDate;
       dispatchStorageSet(DISPATCH_PLAN_DATE_KEY, currentPlanDate);
-      if (plan.orders?.length && plan.trucks?.length) applySavedPlan(plan);
+      if (Array.isArray(plan.orders) && Array.isArray(plan.trucks)) applySavedPlan(plan);
       await loadPlanHistory();
+      currentPlan = compactCurrentPlan(plan);
       routeNotice = `Plan ${displayDate(plan.planDate)} opened for editing.`;
       render({ save: false });
     }).catch((error) => {
@@ -9938,13 +10364,11 @@ app.addEventListener("click", (event) => {
       ? addReturnLoadToTruck(truck, physicalInsertIndex, driver)
       : addLoadToTruck(truck, physicalInsertIndex, driver);
     if (previous) {
-      const previousFinish = loadStats(previous.truck, previous.load).finish;
-      const switchMinutes = loadTruckPlate(previous.truck, previous.load) === truck.plate
-        ? 0
-        : Number(dispatchPlanningSettings.truckSwitchMinutes ?? 10);
-      load.start = timeText(previousFinish + switchMinutes);
+      load.startMode = "auto";
+      load.start = "";
       load.switchYard = loadEndOwnYard(previous.load) || previous.load.returnYard || truck.base || "12441";
     } else {
+      load.startMode = "fixed";
       load.start = DEFAULT_FIRST_LOAD_START;
     }
     moveLoadToDriverLane(load.id, login, {
@@ -10174,6 +10598,16 @@ app.addEventListener("input", (event) => {
 });
 
 app.addEventListener("keydown", (event) => {
+  if (event.target?.dataset?.loadStart !== undefined) {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      event.target.blur();
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      render({ save: false });
+    }
+    return;
+  }
   if (event.key !== "Enter" || event.target?.id !== "toLinkRef" || modalType !== "to-link") return;
   event.preventDefault();
   event.target.closest("form")?.querySelector('[data-action="match-to-link-lines"]')?.click();
@@ -10229,8 +10663,7 @@ app.addEventListener("change", (event) => {
     const before = summarizeTruck(truck);
     truck.base = String(event.target.value || "").trim();
     if (truck.base && firstUse?.load) firstUse.load.switchYard = truck.base;
-    routeCache = {};
-    routeEstimates = {};
+    clearActiveRouteEstimates();
     logDispatchAudit({
       action: "truck_start_yard_updated",
       entityType: "truck",
@@ -10286,8 +10719,7 @@ app.addEventListener("change", (event) => {
       routeNotice = "The selected truck is no longer available.";
       return render({ save: false });
     }
-    routeCache = {};
-    routeEstimates = {};
+    clearActiveRouteEstimates();
     logDispatchAudit({
       action: "load_truck_updated",
       entityType: "load",
@@ -10301,12 +10733,50 @@ app.addEventListener("change", (event) => {
     commitPlanMutation("load_truck_updated");
     return;
   }
-  if (event.target?.dataset?.loadStart) {
+  if (event.target?.dataset?.loadStartMode !== undefined) {
+    if (!ensureDispatchPlanEditor()) return;
+    const found = findLoad(event.target.dataset.loadStartMode);
+    if (!found.load) return;
+    if (loadHasDriverActivity(found.load)) {
+      routeNotice = loadActivityLockNotice(found.load);
+      return render({ save: false });
+    }
+    const before = summarizeLoad(found.load);
+    const inheritedTime = timeText(loadStartInfo(found.truck, found.load).start);
+    const nextMode = event.target.value === "fixed" ? "fixed" : "auto";
+    found.load.startMode = nextMode;
+    found.load.start = nextMode === "auto"
+      ? ""
+      : (normalizeTypedDispatchTime(found.load.start) || inheritedTime);
+    invalidateDriverRoutesFromLoad(found.load.id);
+    logDispatchAudit({
+      action: "load_start_mode_updated",
+      entityType: "load",
+      entityId: found.load.id,
+      loadId: found.load.id,
+      before,
+      after: summarizeLoad(found.load)
+    });
+    commitPlanMutation("load_start_mode_updated");
+    return;
+  }
+  if (event.target?.dataset?.loadStart !== undefined) {
     if (!ensureDispatchPlanEditor()) return;
     const found = findLoad(event.target.dataset.loadStart);
     if (!found.load) return;
+    if (loadHasDriverActivity(found.load)) {
+      routeNotice = loadActivityLockNotice(found.load);
+      return render({ save: false });
+    }
+    const normalizedStart = normalizeTypedDispatchTime(event.target.value);
+    if (!normalizedStart) {
+      routeNotice = "Enter a valid start time, for example 7, 700, 07:30, or 7:30.";
+      return render({ save: false });
+    }
     const before = summarizeLoad(found.load);
-    found.load.start = event.target.value || DEFAULT_FIRST_LOAD_START;
+    found.load.startMode = "fixed";
+    found.load.start = normalizedStart;
+    invalidateDriverRoutesFromLoad(found.load.id);
     logDispatchAudit({
       action: "load_start_time_updated",
       entityType: "load",
@@ -10324,8 +10794,7 @@ app.addEventListener("change", (event) => {
     if (!found.load) return;
     const before = summarizeLoad(found.load);
     found.load.switchYard = event.target.value || "12441";
-    routeCache = {};
-    routeEstimates = {};
+    invalidateDriverRoutesFromLoad(found.load.id);
     logDispatchAudit({
       action: "load_switch_yard_updated",
       entityType: "load",
@@ -10360,7 +10829,7 @@ app.addEventListener("change", (event) => {
     if (truck) {
       const before = summarizeTruck(truck);
       truck.base = event.target.value || "12441";
-      routeCache = {};
+      clearActiveRouteEstimates();
       logDispatchAudit({
         action: "truck_start_yard_updated",
         entityType: "truck",
@@ -10393,7 +10862,7 @@ app.addEventListener("change", (event) => {
       }
       applyDriverToTruck(truck, driver);
       if (swapTruck) applyDriverToTruck(swapTruck, currentDriver);
-      routeCache = {};
+      clearActiveRouteEstimates();
       logDispatchAudit({
         action: swapTruck ? "truck_driver_swapped" : "truck_driver_updated",
         entityType: "truck",
@@ -10445,22 +10914,6 @@ app.addEventListener("change", (event) => {
       commitPlanMutation("return_yard_updated");
     }
     return;
-  }
-  if (event.target?.id !== "loadStartTime") return;
-  const { load } = findLoad(event.target.dataset.load);
-  if (load) {
-    if (!ensureDispatchPlanEditor()) return;
-    const before = summarizeLoad(load);
-    load.start = event.target.value;
-    logDispatchAudit({
-      action: "load_start_time_updated",
-      entityType: "load",
-      entityId: load.id,
-      loadId: load.id,
-      before,
-      after: summarizeLoad(load)
-    });
-    commitPlanMutation("load_start_time_updated");
   }
 });
 
@@ -10847,7 +11300,7 @@ async function initDispatch() {
   } catch (error) {
     console.error("Dispatch planner initialization failed", error);
     routeNotice = `Planning data could not fully load: ${error.message}. You can still review the available board and retry Edit Mode.`;
-    if (!trucks.length) resetPlanningBoard();
+    if (!trucks.length && !dispatchSetupLoaded) resetPlanningBoard();
   }
   render({ save: false });
   connectEvents();
@@ -10859,6 +11312,7 @@ window.addEventListener("mbbs-language-changed", () => {
 });
 
 window.addEventListener("pagehide", () => {
+  flushPersistedRouteEstimateCache();
   if (!isDispatchPlanEditor()) return;
   fetch("/api/dispatch/plan-edit-lease/release", {
     method: "POST",

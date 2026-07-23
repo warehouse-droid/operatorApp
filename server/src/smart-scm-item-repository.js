@@ -204,6 +204,16 @@ function publicItem(row) {
       yardCode: policy.yardCode,
       eligible: Boolean(policy.eligible),
       capacityPallets: number(policy.capacityPallets, 25),
+      capacitySource: policy.capacitySource || "default",
+      capacityManuallyOverridden: Boolean(policy.capacityManuallyOverridden),
+      capacitySourceInputFileId: policy.capacitySourceInputFileId === null || policy.capacitySourceInputFileId === undefined
+        ? null
+        : Number(policy.capacitySourceInputFileId),
+      capacitySourceSheet: policy.capacitySourceSheet || "",
+      capacitySourceRow: policy.capacitySourceRow === null || policy.capacitySourceRow === undefined
+        ? null
+        : Number(policy.capacitySourceRow),
+      capacityMatchMethod: policy.capacityMatchMethod || "",
       serviceQuantile: number(policy.serviceQuantile, policy.yardCode === "12441" ? 0.95 : 0.9),
       minimumSafetyPallets: number(policy.minimumSafetyPallets, 1)
     })) : []
@@ -271,6 +281,12 @@ export async function listSmartScmItems({ search = "", enabled = "", vendorYard 
                 'yardCode', y.yard_code,
                 'eligible', y.eligible,
                 'capacityPallets', y.capacity_pallets,
+                'capacitySource', y.capacity_source,
+                'capacityManuallyOverridden', y.capacity_manually_overridden,
+                'capacitySourceInputFileId', y.capacity_source_input_file_id,
+                'capacitySourceSheet', y.capacity_source_sheet,
+                'capacitySourceRow', y.capacity_source_row,
+                'capacityMatchMethod', y.capacity_match_method,
                 'serviceQuantile', y.service_quantile,
                 'minimumSafetyPallets', y.minimum_safety_pallets
               ) ORDER BY CASE y.yard_code WHEN '3445' THEN 1 WHEN '2967' THEN 2 WHEN '12441' THEN 3 ELSE 4 END)
@@ -342,10 +358,35 @@ export async function updateSmartScmItem(itemId, values = {}, operatorId = null)
       await query(
         `UPDATE scm_smart_item_yard_policies
             SET eligible = $3,
+                manually_overridden = manually_overridden
+                  OR eligible IS DISTINCT FROM $3::boolean
+                  OR service_quantile IS DISTINCT FROM $5::numeric
+                  OR minimum_safety_pallets IS DISTINCT FROM $6::numeric,
+                capacity_manually_overridden = capacity_manually_overridden
+                  OR capacity_pallets IS DISTINCT FROM $4::numeric,
+                capacity_source = CASE
+                  WHEN capacity_pallets IS DISTINCT FROM $4::numeric THEN 'manual'
+                  ELSE capacity_source
+                END,
+                capacity_source_input_file_id = CASE
+                  WHEN capacity_pallets IS DISTINCT FROM $4::numeric THEN NULL
+                  ELSE capacity_source_input_file_id
+                END,
+                capacity_source_sheet = CASE
+                  WHEN capacity_pallets IS DISTINCT FROM $4::numeric THEN NULL
+                  ELSE capacity_source_sheet
+                END,
+                capacity_source_row = CASE
+                  WHEN capacity_pallets IS DISTINCT FROM $4::numeric THEN NULL
+                  ELSE capacity_source_row
+                END,
+                capacity_match_method = CASE
+                  WHEN capacity_pallets IS DISTINCT FROM $4::numeric THEN NULL
+                  ELSE capacity_match_method
+                END,
                 capacity_pallets = $4,
                 service_quantile = $5,
                 minimum_safety_pallets = $6,
-                manually_overridden = true,
                 source_input_file_id = NULL,
                 updated_by = $7,
                 updated_at = now()

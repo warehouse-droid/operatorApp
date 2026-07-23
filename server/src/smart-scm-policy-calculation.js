@@ -7,6 +7,38 @@ function positive(value, fallback = 0) {
   return Math.max(0, number(value, fallback));
 }
 
+const EPSILON = 0.000001;
+
+export function calculateSmartScmOrderRequirement({
+  positionPallets = 0,
+  reorderPointPallets = 0,
+  preferredPallets = 0,
+  capacityPallets = 0,
+  minimumOrderPallets = 1
+} = {}) {
+  const position = number(positionPallets);
+  const reorderPoint = positive(reorderPointPallets);
+  const preferred = positive(preferredPallets);
+  const capacity = positive(capacityPallets);
+  const minimumOrder = positive(minimumOrderPallets, 1);
+  const requiredGapPallets = Math.max(0, preferred - position);
+  const capacityGapPallets = Math.max(0, capacity - position);
+  const requestedPallets = Math.ceil(Math.max(requiredGapPallets, minimumOrder));
+  const capacityBelowMinimum = position < reorderPoint - EPSILON
+    && capacityGapPallets + EPSILON < minimumOrder;
+  const requiredPallets = position < reorderPoint - EPSILON && !capacityBelowMinimum
+    ? Math.max(0, Math.min(requestedPallets, Math.floor(capacityGapPallets + EPSILON)))
+    : 0;
+  return {
+    minimumOrderPallets: minimumOrder,
+    requiredGapPallets,
+    capacityGapPallets,
+    requestedPallets,
+    capacityBelowMinimum,
+    requiredPallets
+  };
+}
+
 function serviceFactor(policy = {}, settings = {}) {
   return String(policy.yard_code) === "12441"
     ? positive(settings.delivery_safety_factor, 1.645)

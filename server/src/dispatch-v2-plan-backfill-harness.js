@@ -128,6 +128,21 @@ const rollback = await beginRollbackContext();
 
 try {
   await rollback.run(async () => {
+    await query("UPDATE dispatch_drivers SET active = true WHERE lower(btrim(login)) = 'legacy-driver'");
+    await query(
+      `INSERT INTO dispatch_drivers (name, login, active)
+       SELECT 'Legacy Driver', 'legacy-driver', true
+        WHERE NOT EXISTS (SELECT 1 FROM dispatch_drivers WHERE lower(btrim(login)) = 'legacy-driver')`
+    );
+    for (const plate of ["LEGACY-A", "LEGACY-B"]) {
+      await query("UPDATE dispatch_trucks SET active = true WHERE upper(btrim(plate)) = $1", [plate]);
+      await query(
+        `INSERT INTO dispatch_trucks (plate, active)
+         SELECT $1, true
+          WHERE NOT EXISTS (SELECT 1 FROM dispatch_trucks WHERE upper(btrim(plate)) = $1)`,
+        [plate]
+      );
+    }
     const day = String((Date.now() % 26) + 1).padStart(2, "0");
     const planDate = `2198-11-${day}`;
     const inserted = await query(

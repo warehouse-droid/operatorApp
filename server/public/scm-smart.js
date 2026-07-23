@@ -215,9 +215,27 @@ function smartItemYard(item, locationId) {
     yardCode: String(locationId),
     eligible: false,
     capacityPallets: 25,
+    capacitySource: "default",
+    capacityManuallyOverridden: false,
     serviceQuantile: Number(locationId) === 15 ? 0.95 : 0.90,
     minimumSafetyPallets: 1
   };
+}
+
+function smartCapacityProvenance(policy = {}) {
+  const source = String(policy.capacitySource || "default").trim().toLowerCase();
+  if (policy.capacityManuallyOverridden || source === "manual") return "Manual override";
+  if (source === "decision_workbook") {
+    const sheet = String(policy.capacitySourceSheet || "*_Cal").trim();
+    const row = Number(policy.capacitySourceRow);
+    const reference = Number.isInteger(row) && row > 1 ? `${sheet} row ${row}` : sheet;
+    const method = String(policy.capacityMatchMethod || "").trim().replaceAll("_", " ");
+    return method ? `${reference} · ${method}` : reference;
+  }
+  if (source === "legacy_import") return "Legacy import · awaiting verified *_Cal match";
+  return Number(policy.capacityPallets) === 25
+    ? "Default 25 · no verified *_Cal match"
+    : "Default · no verified *_Cal match";
 }
 
 function smartItemBalance(item, locationId) {
@@ -289,6 +307,7 @@ function smartItemYardCell(item, yard) {
     <span>${pallets === null ? "No ToPLT" : `${smartNumber(pallets, 2)} PLT available`}</span>
     <label><input data-item-yard-enabled="${yard.locationId}" data-service-quantile="${policy.serviceQuantile}" data-minimum-safety="${policy.minimumSafetyPallets}" type="checkbox" ${policy.eligible ? "checked" : ""} ${smartCanWrite() ? "" : "disabled"} /> Plan this yard</label>
     <label class="smart-capacity">Capacity <input data-item-yard-capacity="${yard.locationId}" type="number" min="0" step="1" value="${smartEscape(policy.capacityPallets)}" ${smartCanWrite() ? "" : "disabled"} /> PLT</label>
+    <small class="smart-capacity-provenance">${smartEscape(smartCapacityProvenance(policy))}</small>
   </td>`;
 }
 

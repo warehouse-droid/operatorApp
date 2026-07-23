@@ -1,0 +1,121 @@
+.smart-po-review-list {
+  padding-top: 10px;
+}
+
+.smart-po-toolbar {
+  grid-template-columns: minmax(300px, 1fr) minmax(170px, auto) auto;
+}
+
+.smart-po-review-head {
+  grid-template-columns: 72px minmax(310px, 1fr) repeat(3, minmax(105px, auto)) minmax(160px, auto);
+}
+
+.smart-po-review-action {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.smart-po-review-action .smart-button {
+  white-space: nowrap;
+}
+
+.smart-po-error {
+  padding: 8px 12px;
+  border-top: 1px solid #e2b2b2;
+  color: var(--smart-red);
+  background: #fff1f1;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.smart-po-blockers {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  padding: 9px 12px;
+  border-top: 1px solid #e2b2b2;
+  color: var(--smart-red);
+  background: #fff1f1;
+  font-size: 11px;
+}
+
+.smart-po-blockers span {
+  padding: 3px 6px;
+  border: 1px solid #e2b2b2;
+  border-radius: 5px;
+  background: white;
+}
+
+.smart-po-lines {
+  min-width: 980px;
+}
+
+.smart-po-lines td:first-child {
+  min-width: 280px;
+}
+
+.smart-po-line-meta {
+  display: block;
+  margin-top: 2px;
+  color: var(--smart-muted);
+  font-size: 9px;
+}
+
+.smart-po-price-missing,
+.smart-po-unit-missing {
+  color: var(--smart-red);
+  font-weight: 900;
+  background: #fff1f1;
+}
+
+.smart-po-pallet-line {
+  background: #f3f8fb;
+}
+
+.smart-po-pallet-editor {
+  display: grid;
+  grid-template-columns: 90px auto auto;
+  align-items: center;
+  justify-content: end;
+  gap: 5px;
+  min-width: 305px;
+}
+
+.smart-po-pallet-editor input {
+  width: 90px;
+  min-height: 31px;
+  text-align: right;
+}
+
+.smart-po-pallet-editor .smart-button {
+  min-height: 31px;
+  padding: 5px 8px;
+  white-space: nowrap;
+}
+
+.smart-po-pallet-editor .smart-po-line-meta {
+  grid-column: 1 / -1;
+  text-align: right;
+}
+
+.smart-po-review-foot {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 12px;
+  border-top: 1px solid var(--smart-border);
+  color: var(--smart-muted);
+  background: #f8fafb;
+  font-size: 10px;
+}
+
+@media (max-width: 1180px) {
+  .smart-po-review-head {
+    grid-template-columns: 64px minmax(260px, 1fr) repeat(2, minmax(90px, auto));
+  }
+
+  .smart-po-review-action {
+    grid-column: -2 / -1;
+  }
+}

@@ -963,7 +963,7 @@ function sortDeliveryOrders(list) {
       || compareText(a.tranid, b.tranid)
     );
   }
-  if (deliveryOrderType === "sales_order" && viewMode === "active" && deliveryBatchFilter === "planned") {
+  if (deliveryPrepMode === "standard" && viewMode === "active" && deliveryBatchFilter === "planned") {
     return sorted.sort((a, b) =>
       plannedDateSortKey(a).localeCompare(plannedDateSortKey(b))
       || loadSortKey(a) - loadSortKey(b)
@@ -990,17 +990,23 @@ function isBatchAOrder(order) {
   return expected <= today || (expected === tomorrow && (beforeNoonWindow(order) || !hasDeliveryWindow(order)));
 }
 
+function deliveryBatchForOrder(order) {
+  if (order?.order_type === "co_order") return "planned";
+  if (isVrmaOrder(order)) return order?.dispatch_planned ? "planned" : "batch_b";
+  if (!["sales_order", "transfer_order"].includes(order?.order_type)) return "";
+  if (order?.dispatch_planned) return "planned";
+  if (order?.order_type === "transfer_order") return "transfer";
+  return isBatchAOrder(order) ? "batch_a" : "batch_b";
+}
+
+function deliveryBatchForNotification(item) {
+  if (item?.dispatchPlanned) return "planned";
+  return item?.type === "transfer_order" ? "transfer" : "batch_a";
+}
+
 function orderMatchesDeliveryBatch(order, filter = deliveryBatchFilter) {
-  if (deliveryPrepMode === "load") return true;
-  if (deliveryPrepMode !== "standard") return true;
-  if (viewMode !== "active") return true;
-  if (filter === "transfer") return order?.order_type === "transfer_order";
-  if (order?.order_type === "co_order") return filter === "planned";
-  if (isVrmaOrder(order)) return filter === (order?.dispatch_planned ? "planned" : "batch_b");
-  if (order?.order_type !== "sales_order") return false;
-  if (filter === "planned") return Boolean(order?.dispatch_planned);
-  if (filter === "batch_b") return !order?.dispatch_planned && !isBatchAOrder(order);
-  return isBatchAOrder(order);
+  if (deliveryPrepMode === "load" || deliveryPrepMode !== "standard" || viewMode !== "active") return true;
+  return deliveryBatchForOrder(order) === filter;
 }
 
 function filteredDeliveryOrders() {
@@ -1873,7 +1879,9 @@ function deliveryScreenSubtitle() {
     ? `${formatDate(deliveryLoadViewDate)}${deliveryLoadViewTruck ? ` | ${deliveryLoadViewTruck}` : ""}`
     : deliveryPrepMode === "saved"
       ? t("operator.salesTransferOrders", "Sales Order + Transfer Order")
-      : deliveryOrderType === "transfer_order" ? t("operator.transferOrder", "Transfer Order") : t("operator.salesOrder", "Sales Order");
+      : deliveryBatchFilter === "planned"
+        ? t("operator.salesTransferOrders", "Sales Order + Transfer Order")
+        : deliveryOrderType === "transfer_order" ? t("operator.transferOrder", "Transfer Order") : t("operator.salesOrder", "Sales Order");
   return `${subtype} | ${t("common.location", "Location")} ${currentLocation()?.text || locationId}`;
 }
 
@@ -3768,11 +3776,12 @@ function applyDeliveryNotifications(nextNotifications, options = {}) {
 async function openUrgentDeliveryAlert() {
   const first = urgentDeliveryAlert?.items?.[0] || deliveryNotificationItems()[0];
   if (!first) return;
+  const batch = deliveryBatchForNotification(first);
   urgentDeliveryAlert = null;
-  deliveryOrderType = first.type === "transfer_order" ? "transfer_order" : "sales_order";
+  deliveryOrderType = batch === "transfer" ? "transfer_order" : "sales_order";
   deliveryPrepMode = "standard";
   viewMode = "active";
-  deliveryBatchFilter = deliveryOrderType === "transfer_order" ? "transfer" : first.dispatchPlanned ? "planned" : "batch_a";
+  deliveryBatchFilter = batch;
   localStorage.setItem("mbbs.operator.deliveryPrepMode", deliveryPrepMode);
   localStorage.setItem("mbbs.operator.deliveryOrderType", deliveryOrderType);
   localStorage.setItem("mbbs.operator.deliveryBatchFilter", deliveryBatchFilter);

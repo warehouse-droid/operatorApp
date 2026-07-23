@@ -9,6 +9,10 @@ function numberValue(value, fallback = 0) {
   return Number.isFinite(number) ? number : fallback;
 }
 
+function normalizedPlate(value) {
+  return String(value || "").replace(/\s+/g, "").toUpperCase();
+}
+
 function cleanDriver(driver = {}, displayOrder = 0) {
   const login = String(driver.login || "").trim().toLowerCase();
   const name = String(driver.name || "").trim();
@@ -27,6 +31,7 @@ function cleanDriver(driver = {}, displayOrder = 0) {
     vendorFixedMinutes: numberValue(driver.vendorFixedMinutes ?? driver.outsideFixedMinutes ?? driver.unloadMinutes, 35),
     deliveryFixedMinutes: numberValue(driver.deliveryFixedMinutes ?? driver.outsideFixedMinutes ?? driver.unloadMinutes, 35),
     minutesPerPallet: numberValue(driver.minutesPerPallet, 1),
+    active: driver.active !== false,
     displayOrder
   };
 }
@@ -40,6 +45,7 @@ function cleanTruck(truck = {}, displayOrder = 0) {
     capacityLbs: numberValue(truck.capacityLbs, 48000),
     travelTimePercent: numberValue(truck.travelTimePercent, 0),
     baseYard: String(truck.baseYard || truck.base || "").trim(),
+    active: truck.active !== false,
     displayOrder
   };
 }
@@ -55,6 +61,7 @@ function publicDriver(row) {
     license: row.license_class,
     number: row.license_number,
     login: row.login,
+    active: row.active !== false,
     password: "",
     passwordConfigured: Boolean(row.password_hash && row.password_salt),
     samsaraPrimaryLogin: row.samsara_primary_login,
@@ -64,6 +71,7 @@ function publicDriver(row) {
     deliveryFixedMinutes,
     outsideFixedMinutes: deliveryFixedMinutes,
     minutesPerPallet: numberValue(row.minutes_per_pallet, 1),
+    displayOrder: numberValue(row.display_order, 0),
     loadMinutes: ownYardFixedMinutes,
     unloadMinutes: deliveryFixedMinutes
   };
@@ -74,9 +82,11 @@ function publicTruck(row) {
   return {
     id: String(row.id),
     plate: row.plate,
+    active: row.active !== false,
     capacityLbs: numberValue(row.capacity_lbs, 48000),
     travelTimePercent: numberValue(row.travel_time_percent, 0),
-    baseYard: String(row.base_yard || "").trim()
+    baseYard: String(row.base_yard || "").trim(),
+    displayOrder: numberValue(row.display_order, 0)
   };
 }
 
@@ -121,7 +131,7 @@ async function truckRows({ activeOnly = true } = {}) {
 }
 
 async function upsertDrivers(drivers, { deactivateMissing = true } = {}) {
-  const cleaned = drivers.map(cleanDriver);
+  const cleaned = drivers.map((driver, index) => cleanDriver(driver, index));
   assertUnique(cleaned.map((driver) => driver.login), "driver login");
   const existingRows = await driverRows({ activeOnly: false });
   const existingById = new Map(existingRows.map((row) => [String(row.id), row]));
@@ -130,6 +140,7 @@ async function upsertDrivers(drivers, { deactivateMissing = true } = {}) {
 
   for (const driver of cleaned) {
     const existing = (driver.id && existingById.get(driver.id)) || existingByLogin.get(driver.login) || null;
+    const persistedLogin = existing ? String(existing.login || "").trim().toLowerCase() : driver.login;
     let passwordHash = existing?.password_hash || null;
     let passwordSalt = existing?.password_salt || null;
     if (driver.password) {
@@ -141,7 +152,7 @@ async function upsertDrivers(drivers, { deactivateMissing = true } = {}) {
       driver.name,
       driver.license,
       driver.number,
-      driver.login,
+      persistedLogin,
       passwordHash,
       passwordSalt,
       driver.samsaraPrimaryLogin,
@@ -168,7 +179,6 @@ async function upsertDrivers(drivers, { deactivateMissing = true } = {}) {
                delivery_fixed_minutes = $11,
                minutes_per_pallet = $12,
                display_order = $13,
-               active = true,
                updated_at = now()
            WHERE id = $14
            RETURNING id`,
@@ -178,11 +188,11 @@ async function upsertDrivers(drivers, { deactivateMissing = true } = {}) {
           `INSERT INTO dispatch_drivers (
              name, license_class, license_number, login, password_hash, password_salt,
              samsara_primary_login, samsara_secondary_login, own_yard_fixed_minutes,
-             vendor_fixed_minutes, delivery_fixed_minutes, minutes_per_pallet, display_order
+             vendor_fixed_minutes, delivery_fixed_minutes, minutes_per_pallet, display_order, active
            )
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
            RETURNING id`,
-          params
+          [...params, driver.active]
         );
     keptIds.push(String(result.rows[0].id));
   }
@@ -202,16 +212,26 @@ async function upsertDrivers(drivers, { deactivateMissing = true } = {}) {
 }
 
 async function upsertTrucks(trucks, { deactivateMissing = true } = {}) {
-  const cleaned = trucks.map(cleanTruck);
-  assertUnique(cleaned.map((truck) => truck.plate), "truck plate");
+  const cleaned = trucks.map((truck, index) => cleanTruck(truck, index));
+  assertUnique(cleaned.map((truck) => normalizedPlate(truck.plate)), "truck plate");
   const existingRows = await truckRows({ activeOnly: false });
   const existingById = new Map(existingRows.map((row) => [String(row.id), row]));
-  const existingByPlate = new Map(existingRows.map((row) => [String(row.plate).trim().toUpperCase(), row]));
+  const existingByPlate = new Map();
+  for (const row of existingRows) {
+    const plate = normalizedPlate(row.plate);
+    if (!existingByPlate.has(plate)) existingByPlate.set(plate, []);
+    existingByPlate.get(plate).push(row);
+  }
   const keptIds = [];
 
   for (const truck of cleaned) {
-    const existing = (truck.id && existingById.get(truck.id)) || existingByPlate.get(truck.plate) || null;
-    const params = [truck.plate, truck.capacityLbs, truck.travelTimePercent, truck.baseYard, truck.displayOrder];
+    const plateMatches = existingByPlate.get(normalizedPlate(truck.plate)) || [];
+    if (!truck.id && plateMatches.length > 1) {
+      throw new Error(`Ambiguous truck plate: ${truck.plate}. Resolve the existing duplicate fleet records first.`);
+    }
+    const existing = (truck.id && existingById.get(truck.id)) || (plateMatches.length === 1 ? plateMatches[0] : null);
+    const persistedPlate = existing ? String(existing.plate || "").trim().toUpperCase() : truck.plate;
+    const params = [persistedPlate, truck.capacityLbs, truck.travelTimePercent, truck.baseYard, truck.displayOrder];
     const result = existing
       ? await query(
           `UPDATE dispatch_trucks
@@ -220,17 +240,16 @@ async function upsertTrucks(trucks, { deactivateMissing = true } = {}) {
                travel_time_percent = $3,
                base_yard = $4,
                display_order = $5,
-               active = true,
                updated_at = now()
            WHERE id = $6
            RETURNING id`,
           [...params, existing.id]
         )
       : await query(
-          `INSERT INTO dispatch_trucks (plate, capacity_lbs, travel_time_percent, base_yard, display_order)
-           VALUES ($1, $2, $3, $4, $5)
+          `INSERT INTO dispatch_trucks (plate, capacity_lbs, travel_time_percent, base_yard, display_order, active)
+           VALUES ($1, $2, $3, $4, $5, $6)
            RETURNING id`,
-          params
+          [...params, truck.active]
         );
     keptIds.push(String(result.rows[0].id));
   }
@@ -249,12 +268,60 @@ async function upsertTrucks(trucks, { deactivateMissing = true } = {}) {
   }
 }
 
-export async function listDispatchDrivers() {
-  return (await driverRows()).map(publicDriver);
+export async function listDispatchDrivers({ activeOnly = true } = {}) {
+  return (await driverRows({ activeOnly })).map(publicDriver);
 }
 
-export async function listDispatchTrucks() {
-  return (await truckRows()).map(publicTruck);
+export async function listDispatchTrucks({ activeOnly = true } = {}) {
+  return (await truckRows({ activeOnly })).map(publicTruck);
+}
+
+function fleetRecordId(value, label) {
+  const id = String(value || "").trim();
+  if (!/^[1-9]\d*$/.test(id)) {
+    const error = new Error(`${label} ID must be a positive integer.`);
+    error.status = 400;
+    throw error;
+  }
+  return id;
+}
+
+export async function setDispatchDriverActive(id, active) {
+  const driverId = fleetRecordId(id, "Driver");
+  return withTransaction(async () => {
+    const existing = await query("SELECT * FROM dispatch_drivers WHERE id = $1 FOR UPDATE", [driverId]);
+    if (!existing.rows[0]) return null;
+    const updated = await query(
+      `UPDATE dispatch_drivers
+       SET active = $2, updated_at = now()
+       WHERE id = $1
+       RETURNING *`,
+      [driverId, active === true]
+    );
+    return {
+      before: publicDriver(existing.rows[0]),
+      driver: publicDriver(updated.rows[0])
+    };
+  });
+}
+
+export async function setDispatchTruckActive(id, active) {
+  const truckId = fleetRecordId(id, "Truck");
+  return withTransaction(async () => {
+    const existing = await query("SELECT * FROM dispatch_trucks WHERE id = $1 FOR UPDATE", [truckId]);
+    if (!existing.rows[0]) return null;
+    const updated = await query(
+      `UPDATE dispatch_trucks
+       SET active = $2, updated_at = now()
+       WHERE id = $1
+       RETURNING *`,
+      [truckId, active === true]
+    );
+    return {
+      before: publicTruck(existing.rows[0]),
+      truck: publicTruck(updated.rows[0])
+    };
+  });
 }
 
 export async function getDispatchDriverByLogin(login) {
@@ -289,13 +356,13 @@ export async function authenticateDispatchDriver(login, password) {
   return valid ? { driver: publicDriver(row), reason: "" } : { driver: null, reason: "invalid" };
 }
 
-export async function replaceDispatchFleetSetup({ drivers = [], trucks = [] }) {
+export async function replaceDispatchFleetSetup({ drivers = [], trucks = [] }, { activeOnly = true, deactivateMissing = true } = {}) {
   return withTransaction(async () => {
-    await upsertDrivers(drivers, { deactivateMissing: true });
-    await upsertTrucks(trucks, { deactivateMissing: true });
+    await upsertDrivers(drivers, { deactivateMissing });
+    await upsertTrucks(trucks, { deactivateMissing });
     return {
-      drivers: (await driverRows()).map(publicDriver),
-      trucks: (await truckRows()).map(publicTruck)
+      drivers: (await driverRows({ activeOnly })).map(publicDriver),
+      trucks: (await truckRows({ activeOnly })).map(publicTruck)
     };
   });
 }
@@ -303,10 +370,8 @@ export async function replaceDispatchFleetSetup({ drivers = [], trucks = [] }) {
 export async function ensureDispatchFleetSetup({ drivers = [], trucks = [] }) {
   return withTransaction(async () => {
     await query("SELECT pg_advisory_xact_lock(hashtext('dispatch_fleet_setup_seed'))");
-    const [driverCount, truckCount] = await Promise.all([
-      query("SELECT count(*)::integer AS count FROM dispatch_drivers WHERE active = true"),
-      query("SELECT count(*)::integer AS count FROM dispatch_trucks WHERE active = true")
-    ]);
+    const driverCount = await query("SELECT count(*)::integer AS count FROM dispatch_drivers");
+    const truckCount = await query("SELECT count(*)::integer AS count FROM dispatch_trucks");
     if (!driverCount.rows[0].count && drivers.length) await upsertDrivers(drivers, { deactivateMissing: false });
     if (!truckCount.rows[0].count && trucks.length) await upsertTrucks(trucks, { deactivateMissing: false });
     return {

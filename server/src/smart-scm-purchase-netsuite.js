@@ -5,29 +5,116 @@ function quantity(value) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-export function buildSmartScmPurchaseOrderRestPayload({ proposal, locations = [] }) {
+function normalizedUnit(value) {
+  return String(value || "").trim().toUpperCase().replace(/\s+/g, " ");
+}
+
+function assertPurchaseUnit(itemName, stockUnit, purchaseUnit) {
+  if (normalizedUnit(stockUnit) === "" || normalizedUnit(purchaseUnit) === "") {
+    throw new Error(itemName + " needs both a stock-unit and purchase-unit snapshot before PO payload creation.");
+  }
+  if (normalizedUnit(stockUnit) !== normalizedUnit(purchaseUnit)) {
+    throw new Error(itemName + " stock unit " + stockUnit + " does not match purchase unit " + purchaseUnit + ".");
+  }
+}
+
+export function smartScmPurchaseOrderMemoMarker(proposalId) {
+  const id = Number(proposalId);
+  if (!Number.isInteger(id) || id <= 0) return "";
+  return `MBBS-SCM-PO:${id}`;
+}
+
+function isPalletLine(line = {}, palletItemId = null) {
+  return String(line.itemId) === String(palletItemId)
+    || String(line.itemName || line.sku || "").trim().toUpperCase() === "PALLET";
+}
+
+export function buildSmartScmPurchaseOrderRestPayload({ proposal, locations = [], palletItem = null }) {
   const locationById = new Map(locations.map((location) => [Number(location.localLocationId ?? location.locationId), location]));
   const defaultLocation = locationById.get(Number(proposal.destinationLocationId)) || locations[0];
   if (!defaultLocation?.netsuiteLocationId) throw new Error("The Smart SCM PO destination could not be resolved to NetSuite.");
-  const lines = (proposal.lines || [])
-    .filter((line) => quantity(line.salesQuantity) > 0 && quantity(line.confirmedPallets) > 0)
+  const resolvedPalletItem = palletItem || proposal.palletItem || {
+    id: proposal.palletItemId,
+    itemId: proposal.palletItemId,
+    itemName: proposal.palletItemName,
+    unit: proposal.palletUnit,
+    purchaseUnit: proposal.palletPurchaseUnit,
+    lastPurchasePrice: proposal.palletLastPurchasePrice
+  };
+  const palletItemId = Number(resolvedPalletItem?.id ?? resolvedPalletItem?.itemId);
+  const materialLines = (proposal.lines || [])
+    .filter((line) => quantity(line.salesQuantity) > 0
+      && quantity(line.confirmedPallets) > 0
+      && !isPalletLine(line, palletItemId));
+  const lines = materialLines
     .map((line) => {
       const lineLocation = locationById.get(Number(line.destinationLocationId)) || defaultLocation;
+      const rate = quantity(line.lastPurchasePrice);
+      if (rate <= 0) throw new Error((line.itemName || line.itemId) + " needs a positive Last Purchase Price before PO payload creation.");
+      assertPurchaseUnit(line.itemName || line.itemId, line.unit, line.purchaseUnit);
       return {
         item: { id: String(line.itemId) },
         quantity: quantity(line.salesQuantity),
         location: { id: String(lineLocation.netsuiteLocationId) },
+        rate,
         custcol_plt: quantity(line.palletQty),
         custcol_lyr: quantity(line.layerQty),
         custcol_sec: quantity(line.sectionQty),
         custcol_pcs: quantity(line.pieceQty)
       };
     });
+  const palletsByDestination = new Map();
+  for (const line of materialLines) {
+    const destinationLocationId = Number(line.destinationLocationId || proposal.destinationLocationId);
+    palletsByDestination.set(
+      destinationLocationId,
+      quantity(palletsByDestination.get(destinationLocationId)) + quantity(line.confirmedPallets)
+    );
+  }
+  const explicitPalletLines = Array.isArray(proposal.palletLines) ? proposal.palletLines : null;
+  if (explicitPalletLines) {
+    palletsByDestination.clear();
+    for (const line of explicitPalletLines) {
+      const destinationLocationId = Number(line.destinationLocationId || proposal.destinationLocationId);
+      if (!Number.isInteger(destinationLocationId) || destinationLocationId <= 0) {
+        throw new Error("Every Official PALLET line needs a valid destination before PO payload creation.");
+      }
+      palletsByDestination.set(destinationLocationId, quantity(
+        line.purchaseQuantity ?? line.salesQuantity ?? line.confirmedPallets ?? line.quantity
+      ));
+    }
+  } else if (proposal.palletQuantityOverrides && typeof proposal.palletQuantityOverrides === "object") {
+    for (const [rawDestinationLocationId, rawQuantity] of Object.entries(proposal.palletQuantityOverrides)) {
+      const destinationLocationId = Number(rawDestinationLocationId);
+      if (palletsByDestination.has(destinationLocationId)) {
+        palletsByDestination.set(destinationLocationId, quantity(rawQuantity));
+      }
+    }
+  }
+  const palletRate = quantity(resolvedPalletItem?.lastPurchasePrice ?? proposal.palletLastPurchasePrice);
+  const needsPalletItem = [...palletsByDestination.values()].some((value) => value > 0);
+  if (needsPalletItem && (Number.isInteger(palletItemId) === false || palletItemId <= 0)) throw new Error("The active NetSuite PALLET item is required before PO payload creation.");
+  if (needsPalletItem && palletRate <= 0) throw new Error("PALLET needs a positive Last Purchase Price before PO payload creation.");
+  if (needsPalletItem) assertPurchaseUnit(resolvedPalletItem?.itemName || "PALLET", resolvedPalletItem?.unit, resolvedPalletItem?.purchaseUnit);
+  for (const [destinationLocationId, palletQuantity] of palletsByDestination) {
+    if (palletQuantity <= 0) continue;
+    const lineLocation = locationById.get(destinationLocationId) || defaultLocation;
+    lines.push({
+      item: { id: String(palletItemId) },
+      quantity: palletQuantity,
+      location: { id: String(lineLocation.netsuiteLocationId) },
+      rate: palletRate,
+      custcol_plt: 0,
+      custcol_lyr: 0,
+      custcol_sec: 0,
+      custcol_pcs: palletQuantity
+    });
+  }
   if (!lines.length) throw new Error("The Smart SCM PO has no confirmed line quantity.");
   const payload = {
     entity: { id: String(proposal.vendorId) },
     location: { id: String(defaultLocation.netsuiteLocationId) },
-    memo: `${proposal.memo || "Smart SCM replenishment"} | MBBS-SCM-PO:${proposal.id}${proposal.vendorReference ? ` | Vendor ref: ${proposal.vendorReference}` : ""}`,
+    memo: `${proposal.memo || "Smart SCM replenishment"} | ${smartScmPurchaseOrderMemoMarker(proposal.id)}${proposal.vendorReference ? ` | Vendor ref: ${proposal.vendorReference}` : ""}`,
     item: { items: lines }
   };
   if (defaultLocation.subsidiaryId) payload.subsidiary = { id: String(defaultLocation.subsidiaryId) };

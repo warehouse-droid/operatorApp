@@ -92,6 +92,24 @@ async function completeDriverJob(job) {
 
 try {
   await rollback.run(async () => {
+    for (const login of ["driver-a", "driver-b", "driver-execution"]) {
+      await query("UPDATE dispatch_drivers SET active = true WHERE lower(btrim(login)) = $1", [login]);
+      await query(
+        `INSERT INTO dispatch_drivers (name, login, active)
+         SELECT $1, $1, true
+          WHERE NOT EXISTS (SELECT 1 FROM dispatch_drivers WHERE lower(btrim(login)) = $1)`,
+        [login]
+      );
+    }
+    for (const plate of ["TEST-A", "TEST-B", "TEST-EXECUTION"]) {
+      await query("UPDATE dispatch_trucks SET active = true WHERE upper(btrim(plate)) = $1", [plate]);
+      await query(
+        `INSERT INTO dispatch_trucks (plate, active)
+         SELECT $1, true
+          WHERE NOT EXISTS (SELECT 1 FROM dispatch_trucks WHERE upper(btrim(plate)) = $1)`,
+        [plate]
+      );
+    }
     const planDate = `2088-${String((Date.now() % 11) + 1).padStart(2, "0")}-${String((Date.now() % 27) + 1).padStart(2, "0")}`;
     const plan = await createDispatchPlan({ planDate, note: "driver assignment integration harness" });
     const savedA = await saveDispatchPlanSnapshot(plan.id, {

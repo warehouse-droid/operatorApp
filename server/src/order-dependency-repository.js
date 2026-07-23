@@ -1215,6 +1215,12 @@ export async function getTransferDependencyBatch(batchId) {
   if (!header.rowCount) return null;
   const proposals = await query(
     `SELECT p.*,
+            ARRAY(
+              SELECT source.id
+                FROM scm_transfer_dependency_proposals source
+               WHERE source.merged_into_proposal_id = p.id
+               ORDER BY source.id
+            ) AS merged_from_proposal_ids,
             j.status AS print_status,
             j.document_name AS print_document_name,
             j.queued_at AS print_queued_at,
@@ -1224,6 +1230,7 @@ export async function getTransferDependencyBatch(batchId) {
        FROM scm_transfer_dependency_proposals p
        LEFT JOIN scm_print_jobs j ON j.id = p.print_job_id
       WHERE p.batch_id = $1
+        AND p.creation_status <> 'cancelled'
       ORDER BY p.id`,
     [Number(batchId)]
   );
@@ -1309,6 +1316,7 @@ export async function getTransferDependencyBatch(batchId) {
       palletQuantityOverridden: proposal.pallet_qty_overridden === true,
       palletItemId: proposal.pallet_item_id,
       palletItemName: proposal.pallet_item_name || "PALLET",
+      mergedFromProposalIds: (proposal.merged_from_proposal_ids || []).map(Number),
       creationStatus: proposal.creation_status,
       creationAttemptId: proposal.creation_attempt_id,
       creationStartedAt: proposal.creation_started_at,
@@ -1565,6 +1573,313 @@ export async function updateTransferDependencyBatch(batchId, input = {}, operato
       [Number(batchId), uncovered, input.allowIncompleteCoverage === undefined ? null : input.allowIncompleteCoverage === true, operatorId]
     );
     return getTransferDependencyBatch(batchId);
+  });
+}
+
+export async function mergeTransferDependencyProposals(batchId, input = {}, operatorId = null) {
+  const resolvedBatchId = Number(batchId);
+  if (!Number.isInteger(resolvedBatchId) || resolvedBatchId <= 0) {
+    throw Object.assign(new Error("Select a valid dependency batch."), { status: 400 });
+  }
+  const requestedIds = Array.isArray(input.proposalIds) ? input.proposalIds : [];
+  const proposalIds = [...new Set(requestedIds.map(Number).filter((id) => Number.isInteger(id) && id > 0))]
+    .sort((left, right) => left - right);
+  if (proposalIds.length < 2) {
+    throw Object.assign(new Error("Select at least two proposed Transfer Orders to merge."), { status: 400 });
+  }
+  if (proposalIds.length > 20) {
+    throw Object.assign(new Error("Merge no more than 20 proposed Transfer Orders at once."), { status: 400 });
+  }
+  const requestedTargetId = input.targetProposalId === undefined || input.targetProposalId === null
+    ? proposalIds[0]
+    : Number(input.targetProposalId);
+  if (!Number.isInteger(requestedTargetId) || !proposalIds.includes(requestedTargetId)) {
+    throw Object.assign(new Error("The merge target must be one of the selected proposals."), { status: 400 });
+  }
+  const proposalUpdates = Array.isArray(input.proposals) ? input.proposals : [];
+  const updateIds = proposalUpdates.map((proposal) => Number(proposal?.id));
+  if (updateIds.some((id) => !Number.isInteger(id) || !proposalIds.includes(id))
+    || new Set(updateIds).size !== updateIds.length) {
+    throw Object.assign(new Error("Draft updates may include each selected proposal only once."), { status: 400 });
+  }
+  const mergeSignature = crypto.createHash("sha256").update(JSON.stringify({
+    batchId: resolvedBatchId,
+    proposalIds,
+    targetProposalId: requestedTargetId
+  })).digest("hex");
+  const replacementKey = `manual-merge:${mergeSignature}`;
+  const conflict = (message, code = "TRANSFER_DEPENDENCY_MERGE_CONFLICT") => Object.assign(
+    new Error(message),
+    { status: 409, code }
+  );
+
+  return withTransaction(async () => {
+    const batchResult = await query(
+      `SELECT * FROM scm_transfer_dependency_batches WHERE id = $1 FOR UPDATE`,
+      [resolvedBatchId]
+    );
+    if (!batchResult.rowCount) {
+      throw Object.assign(new Error("Dependency batch not found."), { status: 404 });
+    }
+    const batchRow = batchResult.rows[0];
+    const priorReplacement = await query(
+      `SELECT id
+         FROM scm_transfer_dependency_proposals
+        WHERE batch_id = $1 AND proposal_key = $2
+        FOR UPDATE`,
+      [resolvedBatchId, replacementKey]
+    );
+    if (priorReplacement.rowCount) {
+      const mergedProposalId = Number(priorReplacement.rows[0].id);
+      const lineage = await query(
+        `SELECT id, merged_into_proposal_id
+           FROM scm_transfer_dependency_proposals
+          WHERE batch_id = $1 AND id = ANY($2::bigint[])
+          ORDER BY id
+          FOR UPDATE`,
+        [resolvedBatchId, proposalIds]
+      );
+      const exactReplay = lineage.rowCount === proposalIds.length
+        && lineage.rows.every((row) => Number(row.merged_into_proposal_id) === mergedProposalId);
+      if (!exactReplay) {
+        throw conflict("This merge key is already associated with different proposal lineage. Refresh and try again.");
+      }
+      return {
+        batch: await getTransferDependencyBatch(resolvedBatchId),
+        mergedProposalId,
+        sourceProposalIds: proposalIds,
+        reused: true
+      };
+    }
+    if (["creating", "created", "cancelled"].includes(batchRow.status)) {
+      throw conflict("Only a batch with editable draft proposals can be merged.");
+    }
+
+    const lockSelected = async () => query(
+      `SELECT *
+         FROM scm_transfer_dependency_proposals
+        WHERE batch_id = $1 AND id = ANY($2::bigint[])
+        ORDER BY id
+        FOR UPDATE`,
+      [resolvedBatchId, proposalIds]
+    );
+    let selectedResult = await lockSelected();
+    if (selectedResult.rowCount !== proposalIds.length) {
+      throw Object.assign(new Error("One or more selected Transfer Order proposals were not found in this batch."), { status: 404 });
+    }
+    const assertDraftSources = (rows) => {
+      if (rows.some((proposal) => proposal.creation_status !== "draft")) {
+        throw conflict("Only draft Transfer Order proposals can be merged.");
+      }
+      if (rows.some((proposal) => proposal.netsuite_transfer_order_id
+        || text(proposal.netsuite_transfer_order_ref)
+        || text(proposal.creation_attempt_id)
+        || proposal.creation_started_at
+        || proposal.print_job_id
+        || proposal.quantity_verification_status !== "pending"
+        || proposal.approval_status !== "pending")) {
+        throw conflict("A draft with Transfer Order execution, verification, approval, or print history cannot be merged.");
+      }
+    };
+    assertDraftSources(selectedResult.rows);
+
+    if (proposalUpdates.length || input.allowIncompleteCoverage !== undefined) {
+      await updateTransferDependencyBatch(resolvedBatchId, {
+        proposals: proposalUpdates,
+        ...(input.allowIncompleteCoverage === undefined
+          ? {}
+          : { allowIncompleteCoverage: input.allowIncompleteCoverage === true })
+      }, operatorId);
+      selectedResult = await lockSelected();
+      assertDraftSources(selectedResult.rows);
+    }
+
+    const selected = selectedResult.rows;
+    const template = selected.find((proposal) => Number(proposal.id) === requestedTargetId);
+    const route = `${template.from_location_id}:${template.to_location_id}`;
+    if (selected.some((proposal) => `${proposal.from_location_id}:${proposal.to_location_id}` !== route)) {
+      throw conflict("Proposed Transfer Orders can be merged only when they have the same From and To locations.");
+    }
+    if (selected.some((proposal) => proposal.dependency_mode !== template.dependency_mode)) {
+      throw conflict("Proposed Transfer Orders must use the same dependency mode before merging.");
+    }
+
+    const configuredPalletItemIds = [...new Set(selected
+      .map((proposal) => Number(proposal.pallet_item_id))
+      .filter((itemId) => Number.isInteger(itemId) && itemId > 0))];
+    if (configuredPalletItemIds.length > 1) {
+      throw conflict("Selected proposals use different PALLET items and cannot be merged.");
+    }
+    const palletItemId = configuredPalletItemIds[0] || null;
+    const palletItemName = selected.find((proposal) => Number(proposal.pallet_item_id) === palletItemId)?.pallet_item_name
+      || template.pallet_item_name
+      || "PALLET";
+
+    const lineResult = await query(
+      `SELECT pl.*, sl.sku, sl.to_plt, sl.to_lyr, sl.to_sec, sl.to_pcs
+         FROM scm_transfer_dependency_proposal_lines pl
+         LEFT JOIN sales_order_lines sl ON sl.id = pl.sales_line_id
+        WHERE pl.proposal_id = ANY($1::bigint[])
+        ORDER BY array_position($1::bigint[], pl.proposal_id), pl.id
+        FOR UPDATE OF pl`,
+      [proposalIds]
+    );
+    if (!lineResult.rowCount) {
+      throw conflict("Selected draft proposals have no transfer lines to merge.");
+    }
+    const combinedBySalesLine = new Map();
+    for (const line of lineResult.rows) {
+      const key = String(line.sales_line_id);
+      const current = combinedBySalesLine.get(key);
+      if (!current) {
+        combinedBySalesLine.set(key, {
+          ...line,
+          proposed_quantity: number(line.proposed_quantity),
+          pallet_qty: number(line.pallet_qty),
+          layer_qty: number(line.layer_qty),
+          section_qty: number(line.section_qty),
+          piece_qty: number(line.piece_qty)
+        });
+        continue;
+      }
+      if (String(current.item_id) !== String(line.item_id)) {
+        throw conflict(`Sales Order line ${line.sales_line_id} resolves to different items and cannot be merged.`);
+      }
+      current.proposed_quantity = Number((current.proposed_quantity + number(line.proposed_quantity)).toFixed(6));
+      current.pallet_qty = Number((current.pallet_qty + number(line.pallet_qty)).toFixed(6));
+      current.layer_qty = Number((current.layer_qty + number(line.layer_qty)).toFixed(6));
+      current.section_qty = Number((current.section_qty + number(line.section_qty)).toFixed(6));
+      current.piece_qty = Number((current.piece_qty + number(line.piece_qty)).toFixed(6));
+    }
+    const combinedLines = [...combinedBySalesLine.values()];
+    const pallet = calculateTransferProposalPallets(combinedLines);
+    const hasManualPalletOverride = selected.some((proposal) => proposal.pallet_qty_overridden === true);
+    const priorFinalPalletQuantity = Number(selected.reduce(
+      (total, proposal) => total + number(proposal.pallet_transfer_qty),
+      0
+    ).toFixed(6));
+    const finalPalletQuantity = hasManualPalletOverride
+      ? priorFinalPalletQuantity
+      : pallet.recommendedQuantity;
+
+    const replacement = await query(
+      `INSERT INTO scm_transfer_dependency_proposals (
+         batch_id, proposal_key, dependency_mode, from_location_id, from_location,
+         to_location_id, to_location, memo, route_minutes,
+         priority_penalty_minutes, route_score, calculated_pallet_qty,
+         pallet_transfer_qty, pallet_calculation_complete, pallet_qty_overridden,
+         pallet_item_id, pallet_item_name
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+       RETURNING id`,
+      [resolvedBatchId, replacementKey, template.dependency_mode,
+        template.from_location_id, template.from_location, template.to_location_id, template.to_location,
+        template.memo, template.route_minutes, template.priority_penalty_minutes, template.route_score,
+        pallet.calculatedQuantity, finalPalletQuantity, pallet.complete, hasManualPalletOverride,
+        palletItemId, palletItemName]
+    );
+    const mergedProposalId = Number(replacement.rows[0].id);
+    for (const line of combinedLines) {
+      await query(
+        `INSERT INTO scm_transfer_dependency_proposal_lines (
+           proposal_id, sales_line_id, item_id, item_name, unit, proposed_quantity,
+           pallet_qty, layer_qty, section_qty, piece_qty
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        [mergedProposalId, line.sales_line_id, line.item_id, line.item_name, line.unit,
+          line.proposed_quantity, line.pallet_qty, line.layer_qty, line.section_qty, line.piece_qty]
+      );
+    }
+    const cancelled = await query(
+      `UPDATE scm_transfer_dependency_proposals
+          SET creation_status = 'cancelled', merged_into_proposal_id = $2,
+              merged_at = now(), merged_by = $3, updated_at = now()
+        WHERE batch_id = $1
+          AND id = ANY($4::bigint[])
+          AND creation_status = 'draft'
+        RETURNING id`,
+      [resolvedBatchId, mergedProposalId, operatorId, proposalIds]
+    );
+    if (cancelled.rowCount !== proposalIds.length) {
+      throw conflict("A selected proposal changed while the merge was being saved. Refresh and try again.");
+    }
+
+    const destinationCoverage = await query(
+      `SELECT COALESCE(SUM(pl.proposed_quantity), 0) AS proposed
+         FROM scm_transfer_dependency_proposal_lines pl
+         JOIN scm_transfer_dependency_proposals p ON p.id = pl.proposal_id
+         JOIN sales_orders o ON o.netsuite_id = $2
+        WHERE p.batch_id = $1
+          AND p.creation_status <> 'cancelled'
+          AND p.to_location_id = o.outbound_location_id`,
+      [resolvedBatchId, Number(batchRow.sales_order_id)]
+    );
+    const shortageRows = await salesOrderShortageRows(batchRow.sales_order_id);
+    const shortage = shortageRows.reduce((total, row) => total + row.unresolved_quantity, 0);
+    const uncovered = Math.max(0, shortage - number(destinationCoverage.rows[0]?.proposed));
+    await query(
+      `UPDATE scm_transfer_dependency_batches
+          SET uncovered_shortage_qty = $2,
+              allow_incomplete_coverage = COALESCE($3, allow_incomplete_coverage),
+              updated_by = $4, updated_at = now()
+        WHERE id = $1`,
+      [resolvedBatchId, uncovered,
+        input.allowIncompleteCoverage === undefined ? null : input.allowIncompleteCoverage === true,
+        operatorId]
+    );
+
+    const itemTotals = new Map();
+    for (const line of combinedLines) {
+      const key = String(line.item_id);
+      const item = itemTotals.get(key) || {
+        itemId: line.item_id,
+        itemName: line.item_name,
+        proposedQuantity: 0
+      };
+      item.proposedQuantity = Number((item.proposedQuantity + number(line.proposed_quantity)).toFixed(6));
+      itemTotals.set(key, item);
+    }
+    await writeDispatchAudit({
+      action: "scm.transfer_dependency.proposals_merged",
+      source: "scm",
+      entityType: "dependency_batch",
+      entityId: String(resolvedBatchId),
+      orderId: batchRow.sales_order_ref,
+      operatorId,
+      before: {
+        proposalIds,
+        proposalCount: proposalIds.length,
+        lineCount: lineResult.rowCount,
+        finalPalletQuantity: priorFinalPalletQuantity
+      },
+      after: {
+        proposalId: mergedProposalId,
+        proposalCount: 1,
+        lineCount: combinedLines.length,
+        finalPalletQuantity
+      },
+      details: {
+        sourceProposalIds: proposalIds,
+        replacementProposalId: mergedProposalId,
+        targetProposalId: requestedTargetId,
+        proposalKey: replacementKey,
+        dependencyMode: template.dependency_mode,
+        fromLocationId: Number(template.from_location_id),
+        fromLocation: template.from_location,
+        toLocationId: Number(template.to_location_id),
+        toLocation: template.to_location,
+        duplicateSalesLinesCombined: lineResult.rowCount - combinedLines.length,
+        itemTotals: [...itemTotals.values()],
+        calculatedPalletQuantity: pallet.calculatedQuantity,
+        finalPalletQuantity,
+        manualPalletOverridePreserved: hasManualPalletOverride,
+        uncoveredQuantity: uncovered
+      }
+    });
+    return {
+      batch: await getTransferDependencyBatch(resolvedBatchId),
+      mergedProposalId,
+      sourceProposalIds: proposalIds,
+      reused: false
+    };
   });
 }
 

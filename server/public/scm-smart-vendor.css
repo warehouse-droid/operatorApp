@@ -15,7 +15,97 @@
 }
 
 .smart-vendor-load-head {
-  grid-template-columns: 72px minmax(260px, 1fr) repeat(3, minmax(105px, auto)) auto;
+  grid-template-columns: 72px minmax(260px, 1fr) repeat(3, minmax(105px, auto)) minmax(142px, auto);
+}
+
+.smart-vendor-head-action,
+.smart-vendor-section-actions {
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  gap: 7px;
+}
+
+.smart-vendor-head-action {
+  align-self: stretch;
+  justify-content: space-between;
+  flex-direction: column;
+}
+
+.smart-vendor-head-action .smart-button {
+  min-width: 118px;
+}
+
+.smart-vendor-section-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.smart-vendor-section-actions .smart-help {
+  align-self: center;
+}
+
+.smart-button.smart-vendor-review-link {
+  display: grid;
+  grid-template-columns: 34px minmax(128px, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  min-height: 48px;
+  padding: 6px 10px 6px 7px;
+  border-color: #17689e;
+  color: white;
+  background: linear-gradient(135deg, #0d5d91 0%, #167eb5 100%);
+  box-shadow: 0 7px 18px rgb(10 72 111 / 22%);
+  text-align: left;
+  text-decoration: none;
+}
+
+.smart-button.smart-vendor-review-link:hover {
+  border-color: #0c547f;
+  background: linear-gradient(135deg, #0a527f 0%, #126fa1 100%);
+  box-shadow: 0 9px 22px rgb(10 72 111 / 30%);
+  transform: translateY(-1px);
+}
+
+.smart-button.smart-vendor-review-link:focus-visible {
+  outline: 3px solid rgb(42 145 201 / 32%);
+  outline-offset: 2px;
+}
+
+.smart-vendor-review-link > span:nth-child(2) {
+  display: grid;
+  gap: 1px;
+}
+
+.smart-vendor-review-link strong {
+  color: inherit;
+  font-size: 12px;
+  line-height: 1.15;
+}
+
+.smart-vendor-review-link small {
+  color: rgb(255 255 255 / 76%);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .02em;
+}
+
+.smart-vendor-review-icon {
+  display: inline-grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border: 1px solid rgb(255 255 255 / 30%);
+  border-radius: 9px;
+  background: rgb(255 255 255 / 14%);
+  font-size: 10px;
+  font-weight: 950;
+  letter-spacing: .08em;
+}
+
+.smart-vendor-review-arrow {
+  font-size: 18px;
+  line-height: 1;
 }
 
 .smart-vendor-error {
@@ -59,6 +149,26 @@
   width: 125px;
 }
 
+.smart-vendor-lines [data-vendor-pallet-quantity] {
+  width: 105px;
+  min-height: 32px;
+  text-align: right;
+}
+
+.smart-pallet-override-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.smart-pallet-override-toggle input {
+  width: 16px;
+  height: 16px;
+}
+
 .smart-vendor-alternative {
   display: grid;
   grid-template-columns: minmax(230px, .8fr) minmax(230px, .8fr) minmax(300px, 1.4fr) auto;
@@ -84,6 +194,49 @@
   border: 1px solid #d5e0e7;
   border-radius: 7px;
   background: white;
+}
+
+.smart-vendor-alternative-summary {
+  display: grid;
+  min-width: 0;
+  gap: 7px;
+}
+
+.smart-vendor-need-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.smart-vendor-need-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 23px;
+  padding: 3px 6px;
+  border: 1px solid #d8e1e7;
+  border-radius: 999px;
+  color: #425867;
+  background: #f6f9fb;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.smart-vendor-need-chip b {
+  color: #243b49;
+  font-weight: 900;
+}
+
+.smart-vendor-need-chip.yard {
+  border-color: #b9d6e9;
+  color: var(--smart-blue);
+  background: #eef7fc;
+}
+
+.smart-vendor-need-chip.need {
+  border-color: #e7c799;
+  color: #7a4b0c;
+  background: #fff7e8;
 }
 
 .smart-vendor-alternative-result label {

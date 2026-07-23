@@ -16,6 +16,7 @@ import {
   listOrderDependencies,
   listTransferDependencyCandidates,
   markDirectDependencyPickupCompleted,
+  mergeTransferDependencyProposals,
   prepareTransferDependencyPalletItem,
   removeTransferDependencyProposalLine,
   reopenTransferDependencyCandidate,
@@ -353,6 +354,244 @@ try {
       proposalLine.quantities?.pallets === proposalLine.proposedQuantity)),
     "Generated Auto Transfer proposals must default conversion-unit inputs to the suggested required quantity.",
     { proposals: batch.proposals });
+
+    const mergeOriginals = [...batch.proposals];
+    const mergeTarget = mergeOriginals[0];
+    const mergeSource = mergeOriginals[1];
+    const mergeProposalPayload = (proposal, overrides = {}) => ({
+      id: proposal.id,
+      mode: proposal.mode,
+      fromLocationId: proposal.fromLocationId,
+      toLocationId: proposal.toLocationId,
+      memo: proposal.memo,
+      palletTransferQuantity: proposal.palletQuantityOverridden
+        ? proposal.palletTransferQuantity
+        : undefined,
+      lines: proposal.lines.map((proposalLine) => ({
+        salesLineId: proposalLine.salesLineId,
+        proposedQuantity: proposalLine.proposedQuantity,
+        quantities: { ...proposalLine.quantities }
+      })),
+      ...overrides
+    });
+    const mergeProposalWithMixedUnits = (proposal, overrides = {}) => {
+      const payload = mergeProposalPayload(proposal, overrides);
+      return {
+        ...payload,
+        lines: payload.lines.map((proposalLine) => ({
+          ...proposalLine,
+          quantities: {
+            ...proposalLine.quantities,
+            pallets: Math.max(0, Number(proposalLine.quantities.pallets || 0) - 1),
+            pieces: Number(proposalLine.quantities.pieces || 0) + 1
+          }
+        }))
+      };
+    };
+    const mergeInput = {
+      proposalIds: mergeOriginals.map((proposal) => proposal.id),
+      targetProposalId: mergeTarget.id,
+      proposals: [
+        mergeProposalWithMixedUnits(mergeTarget),
+        mergeProposalWithMixedUnits(mergeSource, { fromLocationId: mergeTarget.fromLocationId })
+      ],
+      allowIncompleteCoverage: batch.allowIncompleteCoverage
+    };
+    const preMergeQuantity = mergeOriginals
+      .flatMap((proposal) => proposal.lines)
+      .reduce((total, proposalLine) => total + Number(proposalLine.proposedQuantity || 0), 0);
+    const expectedMergedUnits = mergeInput.proposals
+      .flatMap((proposal) => proposal.lines)
+      .reduce((totals, proposalLine) => {
+        for (const unit of ["pallets", "layers", "sections", "pieces", "salesQty"]) {
+          totals[unit] += Number(proposalLine.quantities?.[unit] || 0);
+        }
+        return totals;
+      }, { pallets: 0, layers: 0, sections: 0, pieces: 0, salesQty: 0 });
+    const firstMergeResult = await mergeTransferDependencyProposals(
+      batch.id,
+      mergeInput,
+      "dependency-harness"
+    );
+    const mergedDraft = firstMergeResult.batch;
+    check(firstMergeResult.reused === false
+      && firstMergeResult.sourceProposalIds.length === 2
+      && mergedDraft.proposals.length === 1,
+    "Merging matching proposed TOs must replace them with one visible draft proposal.",
+    { mergedDraft, firstMergeResult });
+    const mergedProposal = mergedDraft.proposals[0];
+    check(String(firstMergeResult.mergedProposalId) === String(mergedProposal.id)
+      && !mergeOriginals.some((proposal) => String(proposal.id) === String(mergedProposal.id))
+      && mergedProposal.creationStatus === "draft",
+    "A merge must create a fresh draft proposal rather than mutating either original proposal.",
+    { mergeOriginals, mergedProposal, firstMergeResult });
+    check(String(mergedProposal.fromLocationId) === String(mergeTarget.fromLocationId)
+      && String(mergedProposal.toLocationId) === String(mergeTarget.toLocationId),
+    "Atomic proposal edits must make the replacement use the selected common From and To yards.",
+    { mergeTarget, mergeSource, mergedProposal });
+    check(mergedProposal.lines.length === 1,
+      "Two allocations for the same Sales Order line must collapse to one replacement proposal line.",
+      { mergedProposal });
+    const mergedLine = mergedProposal.lines[0];
+    check(String(mergedLine.salesLineId) === String(mergeTarget.lines[0].salesLineId)
+      && Number(mergedLine.proposedQuantity) === preMergeQuantity,
+    "The merged line must retain its canonical Sales Order line link and sum both proposed quantities.",
+    { mergedLine, preMergeQuantity });
+    check(["pallets", "layers", "sections", "pieces", "salesQty"].every((unit) =>
+      Number(mergedLine.quantities?.[unit] || 0) === expectedMergedUnits[unit]),
+    "Merging a duplicate Sales Order line must add its exact PLT/LYR/SEC/PCS selections.",
+    { mergedLine, expectedMergedUnits });
+    const expectedMergedPallets = calculateTransferProposalPallets([mergedLine]);
+    check(Number(mergedProposal.calculatedPalletQuantity) === expectedMergedPallets.calculatedQuantity
+      && Number(mergedProposal.palletTransferQuantity) === expectedMergedPallets.recommendedQuantity
+      && mergedProposal.palletQuantityOverridden === false,
+    "The replacement must recalculate PALLET quantity from merged material instead of summing stale proposal headers.",
+    { mergedProposal, expectedMergedPallets });
+    check(Number(mergedDraft.uncoveredShortageQuantity) === Number(batch.uncoveredShortageQuantity),
+      "Merging proposals with the same destination must not change shortage coverage.",
+      { before: batch.uncoveredShortageQuantity, after: mergedDraft.uncoveredShortageQuantity });
+    const mergeRows = await query(
+      `SELECT id, creation_status
+         FROM scm_transfer_dependency_proposals
+        WHERE batch_id = $1
+        ORDER BY id`,
+      [batch.id]
+    );
+    const cancelledOriginalIds = mergeRows.rows
+      .filter((proposal) => proposal.creation_status === "cancelled")
+      .map((proposal) => String(proposal.id));
+    check(mergeOriginals.every((proposal) => cancelledOriginalIds.includes(String(proposal.id)))
+      && mergeRows.rows.filter((proposal) => proposal.creation_status === "draft").length === 1,
+    "Both source proposals must remain as cancelled lineage while only the replacement stays active.",
+    { mergeRows: mergeRows.rows, mergeOriginals });
+    const lineageLines = await query(
+      `SELECT proposal_id, sales_line_id
+         FROM scm_transfer_dependency_proposal_lines
+        WHERE proposal_id = ANY($1::bigint[])
+        ORDER BY proposal_id`,
+      [mergeOriginals.map((proposal) => Number(proposal.id))]
+    );
+    check(lineageLines.rows.length === mergeOriginals.length
+      && lineageLines.rows.every((proposalLine) =>
+        String(proposalLine.sales_line_id) === String(mergeTarget.lines[0].salesLineId)),
+    "Cancelled originals must retain their source-line lineage after the replacement is created.",
+    { lineageLines: lineageLines.rows, mergeOriginals });
+    const activeMergedQuantity = await query(
+      `SELECT COALESCE(SUM(pl.proposed_quantity), 0) AS proposed_quantity
+         FROM scm_transfer_dependency_proposal_lines pl
+         JOIN scm_transfer_dependency_proposals p ON p.id = pl.proposal_id
+        WHERE p.batch_id = $1
+          AND p.creation_status <> 'cancelled'`,
+      [batch.id]
+    );
+    check(Number(activeMergedQuantity.rows[0]?.proposed_quantity) === preMergeQuantity,
+      "Cancelled lineage must not double-count active proposal coverage.",
+      { activeMergedQuantity: activeMergedQuantity.rows[0], preMergeQuantity });
+
+    const replayMergeResult = await mergeTransferDependencyProposals(
+      batch.id,
+      mergeInput,
+      "dependency-harness-replay"
+    );
+    const replayRows = await query(
+      `SELECT id, creation_status
+         FROM scm_transfer_dependency_proposals
+        WHERE batch_id = $1
+        ORDER BY id`,
+      [batch.id]
+    );
+    check(replayMergeResult.reused === true
+      && replayMergeResult.batch.proposals.length === 1
+      && String(replayMergeResult.mergedProposalId) === String(mergedProposal.id)
+      && String(replayMergeResult.batch.proposals[0].id) === String(mergedProposal.id)
+      && replayRows.rows.length === mergeRows.rows.length,
+    "Repeating an identical merge request must reuse the replacement without creating another proposal.",
+    { replayMergeResult, replayRows: replayRows.rows, mergeRows: mergeRows.rows });
+
+    batch = await generateTransferDependencySuggestion({
+      salesOrderId,
+      mode: "direct_to_customer",
+      operatorId: "dependency-harness"
+    });
+    check(batch.proposals.length === 2,
+      "Regenerating after a merge must restore the current two-source suggestion for later lifecycle tests.",
+      { batch });
+
+    const mismatchTarget = batch.proposals[0];
+    const mismatchSource = batch.proposals[1];
+    const mismatchInput = {
+      proposalIds: [mismatchTarget.id, mismatchSource.id],
+      targetProposalId: mismatchTarget.id,
+      proposals: [mergeProposalPayload(mismatchTarget), mergeProposalPayload(mismatchSource)],
+      allowIncompleteCoverage: batch.allowIncompleteCoverage
+    };
+    let routeMismatchBlocked = false;
+    try {
+      await mergeTransferDependencyProposals(batch.id, mismatchInput, "dependency-harness");
+    } catch (error) {
+      routeMismatchBlocked = error.status === 409 && /same.*from.*to/i.test(error.message);
+    }
+    const afterMismatch = await query(
+      `SELECT id, creation_status, from_location_id, to_location_id
+         FROM scm_transfer_dependency_proposals
+        WHERE batch_id = $1
+        ORDER BY id`,
+      [batch.id]
+    );
+    check(routeMismatchBlocked
+      && afterMismatch.rows.length === 2
+      && afterMismatch.rows.every((proposal) => proposal.creation_status === "draft"),
+    "A route-mismatched merge must fail atomically without cancelling or replacing either proposal.",
+    { afterMismatch: afterMismatch.rows, mismatchInput });
+
+    await query(
+      `UPDATE scm_transfer_dependency_proposals
+          SET creation_status = 'creating',
+              from_location_id = $2, from_location = $3
+        WHERE id = $1`,
+      [mismatchSource.id, mismatchTarget.fromLocationId, mismatchTarget.fromLocation]
+    );
+    let nonDraftMergeBlocked = false;
+    try {
+      await mergeTransferDependencyProposals(batch.id, {
+        ...mismatchInput,
+        proposals: [
+          mergeProposalPayload(mismatchTarget),
+          mergeProposalPayload(mismatchSource, { fromLocationId: mismatchTarget.fromLocationId })
+        ]
+      }, "dependency-harness");
+    } catch (error) {
+      nonDraftMergeBlocked = error.status === 409 && /draft/i.test(error.message);
+    }
+    const afterNonDraft = await query(
+      `SELECT id, creation_status
+         FROM scm_transfer_dependency_proposals
+        WHERE batch_id = $1
+        ORDER BY id`,
+      [batch.id]
+    );
+    check(nonDraftMergeBlocked
+      && afterNonDraft.rows.length === 2
+      && afterNonDraft.rows.some((proposal) => proposal.creation_status === "creating")
+      && !afterNonDraft.rows.some((proposal) => proposal.creation_status === "cancelled"),
+    "A non-draft proposal must make the entire merge fail without altering its sibling.",
+    { afterNonDraft: afterNonDraft.rows });
+    await query(
+      `UPDATE scm_transfer_dependency_proposals
+          SET creation_status = 'draft',
+              from_location_id = $2, from_location = $3
+        WHERE id = $1`,
+      [mismatchSource.id, mismatchSource.fromLocationId, mismatchSource.fromLocation]
+    );
+
+    batch = await generateTransferDependencySuggestion({
+      salesOrderId,
+      mode: "direct_to_customer",
+      operatorId: "dependency-harness"
+    });
+    check(batch.proposals.length === 2,
+      "Merge validation fixtures must leave the original proposal lifecycle test with two clean drafts.",
+      { batch });
     const removableProposal = batch.proposals[0];
     const removableLine = removableProposal.lines[0];
     const removedDraft = await removeTransferDependencyProposalLine(
@@ -533,6 +772,14 @@ try {
       "Grouped SO should inherit its canonical child's dependency manifest.", { groupedEnriched });
 
     await query("UPDATE order_dependencies SET dependency_mode = 'yard_replenishment' WHERE id = $1", [dependency.id]);
+    const replenishmentDeliveryOrders = await listDeliveryOrders({
+      locationId: 15,
+      status: "active",
+      orderType: "sales_order"
+    });
+    check(replenishmentDeliveryOrders.some((order) => order.tranid === salesOrderRef),
+      "A backordered Sales Order with an active yard-replenishment dependency must remain in Operator Delivery Prep.",
+      { salesOrderRef, dependencyId: dependency.id });
     const replenishmentBlock = await getSalesOrderDependencyExecutionBlock([salesOrderRef]);
     check(replenishmentBlock?.transferOrderRef === dependency.transferOrderRef,
       "Unreceived replenishment dependency must block SO driver execution.", { replenishmentBlock });

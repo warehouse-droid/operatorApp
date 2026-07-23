@@ -168,6 +168,9 @@ let loadedSearchResults = [];
 let loadedOrderDetail = null;
 let selectedLoadedOrderKey = "";
 let syncSettings = { mode: "manual", running: false, lastStatus: "idle" };
+let targetedSyncOrderRef = "";
+let targetedSyncBusy = false;
+let targetedSyncResult = null;
 let mirrorStatus = { role: "disabled", configured: false, source: {}, consumer: {} };
 let photoArchiveSettings = {
   mode: "off",
@@ -1178,13 +1181,50 @@ function renderNetSuiteMirrorPanel() {
   `;
 }
 
+function renderTargetedOrderSyncPanel() {
+  const result = targetedSyncResult;
+  const lineSummary = result?.lines
+    ? Object.entries(result.lines).map(([stage, count]) => `${Number(count || 0)} ${stage}`).join(" / ")
+    : "";
+  const statusSummary = result?.ok
+    ? (result.statusChanged
+      ? `${result.previousStatus || "—"} → ${result.status || "—"}`
+      : (result.status || result.previousStatus || "—"))
+    : "";
+  return `
+    <section class="panel targeted-sync-panel">
+      <div class="section-heading">
+        <div>
+          <h2>${t("control.targetedOrderSync", "Sync One NetSuite Order")}</h2>
+          <p class="muted">${t("control.targetedOrderSyncHelp", "Enter an SO, PO, or TO number. The server infers the type and refreshes only that order header and its lines.")}</p>
+        </div>
+      </div>
+      <form class="targeted-sync-form" data-form="targeted-order-sync">
+        <label>
+          <span>${t("control.orderNumber", "Order Number")}</span>
+          <input id="targetedSyncOrderRef" name="orderRef" maxlength="64" autocomplete="off" spellcheck="false" placeholder="POB03581 / SOA05632 / TOB00690" value="${escapeHtml(targetedSyncOrderRef)}" ${targetedSyncBusy || syncSettings.running ? "disabled" : ""} />
+        </label>
+        <button class="primary" type="submit" ${targetedSyncBusy || syncSettings.running ? "disabled" : ""}>${targetedSyncBusy ? t("control.syncingOrder", "Syncing Order...") : t("control.syncThisOrder", "Sync This Order")}</button>
+      </form>
+      <p class="muted">${t("control.targetedOrderSyncNote", "Use the NetSuite transaction number, not a local split PO reference. A full sync cannot run at the same time.")}</p>
+      ${result?.ok ? `
+        <div class="notice sync-success" role="status">
+          <strong>${escapeHtml(result.orderRef)} ${t("control.syncComplete", "sync complete")}</strong>
+          <span>${escapeHtml(result.orderType)} · NetSuite ID ${escapeHtml(result.netSuiteId)} · ${escapeHtml(statusSummary)}${lineSummary ? ` · ${escapeHtml(lineSummary)}` : ""} · ${formatDate(result.syncedAt)}</span>
+        </div>
+      ` : result?.error ? `<div class="notice sync-error" role="alert"><strong>${t("control.syncFailed", "Sync failed")}</strong><span>${escapeHtml(result.error)}</span></div>` : ""}
+    </section>
+  `;
+}
+
 function renderSyncSection() {
   const isAuto = syncSettings.mode === "auto";
   const savedMaxRunMinutes = Math.max(1, Math.round(Number(syncSettings.maxRunSeconds || 900) / 60));
   const maxRunMinutes = syncMaxRunMinutesDraft ?? savedMaxRunMinutes;
   const mirrorPanel = renderNetSuiteMirrorPanel();
   if (mirrorStatus.role === "consumer") return mirrorPanel;
-  return `${mirrorPanel}
+  const targetedOrderPanel = renderTargetedOrderSyncPanel();
+  return `${mirrorPanel}${targetedOrderPanel}
     <section class="panel">
       <div class="section-heading">
         <div>
@@ -1824,6 +1864,29 @@ app.addEventListener("submit", async (event) => {
   if (!form) return;
   event.preventDefault();
   try {
+    if (form.dataset.form === "targeted-order-sync") {
+      targetedSyncOrderRef = String(form.elements.orderRef?.value || "").trim().toUpperCase();
+      if (!targetedSyncOrderRef) {
+        targetedSyncResult = { ok: false, error: t("control.enterOrderNumber", "Enter a NetSuite SO, PO, or TO order number.") };
+        return render();
+      }
+      targetedSyncBusy = true;
+      targetedSyncResult = null;
+      render();
+      try {
+        targetedSyncResult = await request("/api/control/sync-order", {
+          method: "POST",
+          body: JSON.stringify({ orderRef: targetedSyncOrderRef })
+        });
+        targetedSyncOrderRef = targetedSyncResult.orderRef || targetedSyncOrderRef;
+      } catch (error) {
+        targetedSyncResult = { ok: false, error: error.message };
+      } finally {
+        targetedSyncBusy = false;
+        render();
+      }
+      return;
+    }
     if (form.dataset.form === "login") {
       const result = await request("/api/auth/login", {
         method: "POST",
@@ -2299,6 +2362,11 @@ window.addEventListener("popstate", () => {
 });
 
 app.addEventListener("input", (event) => {
+  if (event.target?.id === "targetedSyncOrderRef") {
+    targetedSyncOrderRef = event.target.value || "";
+    targetedSyncResult = null;
+    return;
+  }
   if (event.target?.dataset?.field !== "sync-max-run-minutes") return;
   const value = Number(event.target.value);
   syncMaxRunMinutesDraft = Number.isFinite(value) && value >= 0 ? event.target.value : "";

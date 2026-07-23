@@ -1,6 +1,8 @@
+import { randomUUID } from "node:crypto";
 import { query, withTransaction } from "./db.js";
 import { writeAudit } from "./auth-repository.js";
-import { getSmartScmPlanningRun, getSmartScmProposal, smartScmPackWholePalletLines } from "./smart-scm-planning-repository.js";
+import { getSmartScmPlanningRun, getSmartScmProposal, smartScmPackWholePalletLines,
+  smartScmNormalizePalletQuantityOverrides, smartScmPalletLoadWeightLbs, smartScmPhysicalPalletLines, smartScmProposalLineLoadWeightLbs } from "./smart-scm-planning-repository.js";
 import { getSmartScmRouteRule } from "./smart-scm-route-repository.js";
 
 const EPSILON = 0.000001;
@@ -69,7 +71,7 @@ function routeStopsForLines(lines = [], routeRule = null) {
     .map((stop, index) => ({ ...stop, sequence: index + 1 }));
 }
 
-function draftLine(row) {
+function draftLine(row, physicalPalletWeightLbs = 0) {
   return {
     itemId: Number(row.item_id),
     itemName: row.item_name,
@@ -83,6 +85,7 @@ function draftLine(row) {
     residualPallets: positive(row.proposed_pallets),
     salesQuantity: positive(row.sales_quantity),
     palletWeight: positive(row.pallet_weight_lbs),
+    physicalPalletWeightLbs: positive(physicalPalletWeightLbs),
     lineWeight: positive(row.line_weight_lbs),
     toPlt: positive(row.to_plt),
     toLyr: positive(row.to_lyr),
@@ -112,6 +115,97 @@ function combineLines(lines, next) {
     urgent: existing.urgent,
     provisional: existing.provisional
   };
+}
+
+function palletDestinationKey(line = {}) {
+  const locationId = Number(line.destinationLocationId ?? line.destination_location_id);
+  return Number.isInteger(locationId) && locationId > 0 ? String(locationId) : "";
+}
+
+function automaticPalletsByDestination(lines = []) {
+  const totals = new Map();
+  for (const line of lines) {
+    const key = palletDestinationKey(line);
+    if (!key) continue;
+    const quantity = positive(line.proposedPallets ?? line.proposed_pallets);
+    totals.set(key, round((totals.get(key) || 0) + quantity));
+  }
+  return totals;
+}
+
+function palletOverrideProfile(proposals = [], lines = []) {
+  const profile = new Map();
+  for (const proposal of proposals) {
+    const proposalLines = lines.filter((line) => Number(line.proposal_id ?? line.proposalId) === Number(proposal.id));
+    const automatic = automaticPalletsByDestination(proposalLines);
+    const overrides = smartScmNormalizePalletQuantityOverrides(proposal.pallet_quantity_overrides ?? proposal.palletQuantityOverrides);
+    for (const [key, automaticQuantity] of automatic) {
+      const overridden = Object.prototype.hasOwnProperty.call(overrides, key);
+      const current = profile.get(key) || { automaticQuantity: 0, effectiveQuantity: 0, overridden: false };
+      current.automaticQuantity = round(current.automaticQuantity + automaticQuantity);
+      current.effectiveQuantity = round(current.effectiveQuantity + (overridden ? overrides[key] : automaticQuantity));
+      current.overridden = current.overridden || overridden;
+      profile.set(key, current);
+    }
+  }
+  return profile;
+}
+
+function applyPalletOverrideWeight(lines = [], profile = new Map(), physicalPalletWeightLbs = 0) {
+  return lines.map((line) => {
+    const entry = profile.get(palletDestinationKey(line));
+    const ratio = entry?.overridden && entry.automaticQuantity > EPSILON
+      ? entry.effectiveQuantity / entry.automaticQuantity
+      : 1;
+    const effectiveUnitWeight = positive(physicalPalletWeightLbs) * Math.max(0, ratio);
+    return {
+      ...line,
+      physicalPalletWeightLbs: effectiveUnitWeight,
+      reason: { ...(line.reason || {}), physicalPalletWeightLbs: effectiveUnitWeight }
+    };
+  });
+}
+
+function distributePalletOverrides(profile = new Map(), loadLines = []) {
+  const overrides = loadLines.map(() => ({}));
+  const automaticByLoad = loadLines.map(automaticPalletsByDestination);
+  for (const [key, entry] of profile) {
+    if (!entry.overridden) continue;
+    const participating = automaticByLoad
+      .map((automatic, index) => ({ index, automaticQuantity: automatic.get(key) || 0 }))
+      .filter((row) => row.automaticQuantity > EPSILON);
+    if (!participating.length) continue;
+    const outputAutomatic = participating.reduce((sum, row) => sum + row.automaticQuantity, 0);
+    const ratio = entry.automaticQuantity > EPSILON ? entry.effectiveQuantity / entry.automaticQuantity : 0;
+    const outputEffective = round(outputAutomatic * Math.max(0, ratio));
+    let allocated = 0;
+    participating.forEach((row, index) => {
+      const quantity = index === participating.length - 1
+        ? round(outputEffective - allocated)
+        : round(outputEffective * row.automaticQuantity / outputAutomatic);
+      overrides[row.index][key] = Math.max(0, quantity);
+      allocated = round(allocated + quantity);
+    });
+  }
+  return overrides;
+}
+
+function prunePalletOverrides(overrides = {}, lines = []) {
+  const activeDestinations = new Set(automaticPalletsByDestination(lines).keys());
+  return Object.fromEntries(Object.entries(smartScmNormalizePalletQuantityOverrides(overrides))
+    .filter(([key]) => activeDestinations.has(key)));
+}
+
+function proposalLoadWeight(lines = [], overrides = {}, physicalPalletWeightLbs = 0) {
+  const materialWeight = lines.reduce((sum, line) => sum + positive(
+    line.lineWeight ?? line.line_weight_lbs,
+    positive(line.proposedPallets ?? line.proposed_pallets) * positive(line.palletWeight ?? line.pallet_weight_lbs)
+  ), 0);
+  const physicalWeight = smartScmPhysicalPalletLines({
+    lines,
+    palletQuantityOverrides: overrides
+  }, { itemWeightLbs: physicalPalletWeightLbs }).reduce((sum, line) => sum + positive(line.lineWeightLbs), 0);
+  return round(materialWeight + physicalWeight);
 }
 
 function wholePalletQuantity(value) {
@@ -144,17 +238,17 @@ export function smartScmAllocateProRata(lines = [], capacityLbs = 0) {
   const capacity = positive(capacityLbs);
   if (capacity <= EPSILON) throw new Error("Truck capacity must be greater than zero.");
   if (!lines.length) return [];
-  if (lines.some((line) => positive(line.palletWeight) <= EPSILON || positive(line.proposedPallets) <= EPSILON)) {
+  if (lines.some((line) => smartScmPalletLoadWeightLbs(line) <= EPSILON || positive(line.proposedPallets) <= EPSILON)) {
     throw new Error("Every grouped line needs a positive pallet quantity and pallet weight.");
   }
-  if (lines.some((line) => positive(line.palletWeight) > capacity + EPSILON)) {
+  if (lines.some((line) => smartScmPalletLoadWeightLbs(line) > capacity + EPSILON)) {
     throw new Error("At least one pallet is heavier than the configured truck capacity.");
   }
   const entries = lines.map((line, index) => ({
     line,
     index,
     requestedPallets: wholePalletQuantity(line.proposedPallets),
-    palletWeight: positive(line.palletWeight),
+    palletWeight: smartScmPalletLoadWeightLbs(line),
     allocatedPallets: 0,
     idealPallets: 0
   }));
@@ -196,7 +290,7 @@ export function smartScmAllocateProRata(lines = [], capacityLbs = 0) {
   const allocation = entries.map((entry) => allocatedLine(
     entry.line, entry.allocatedPallets, entry.requestedPallets, capacityRatio
   ));
-  const finalWeight = allocation.reduce((sum, line) => sum + positive(line.lineWeight), 0);
+  const finalWeight = allocation.reduce((sum, line) => sum + smartScmProposalLineLoadWeightLbs(line), 0);
   if (finalWeight > capacity + EPSILON || allocation.some((line) => !Number.isInteger(line.proposedPallets))) {
     throw new Error("Whole-pallet allocation could not be kept within the configured truck capacity.");
   }
@@ -204,7 +298,13 @@ export function smartScmAllocateProRata(lines = [], capacityLbs = 0) {
 }
 
 async function settingsRow() {
-  const result = await query("SELECT truck_capacity_lbs, hold_load_ratio FROM scm_smart_settings WHERE id = 1");
+  const result = await query(
+    `SELECT settings.truck_capacity_lbs, settings.hold_load_ratio,
+            COALESCE((SELECT item_weight FROM inventory_items
+                       WHERE UPPER(BTRIM(COALESCE(item_name, ''))) = 'PALLET'
+                       ORDER BY item_id LIMIT 1), 0) AS physical_pallet_weight_lbs
+       FROM scm_smart_settings settings WHERE settings.id = 1`
+  );
   if (!result.rowCount) throw new Error("Smart SCM settings are missing. Run migrations first.");
   return result.rows[0];
 }
@@ -212,6 +312,21 @@ async function settingsRow() {
 async function rawProposal(proposalId, { lock = false } = {}) {
   const result = await query(`SELECT * FROM scm_smart_proposals WHERE id = $1${lock ? " FOR UPDATE" : ""}`, [Number(proposalId)]);
   return result.rows[0] || null;
+}
+
+async function rawPlanningRun(runId, { lock = false } = {}) {
+  const result = await query(
+    `SELECT * FROM scm_smart_planning_runs WHERE id = $1${lock ? " FOR UPDATE" : ""}`,
+    [Number(runId)]
+  );
+  return result.rows[0] || null;
+}
+
+function assertReadyPlanningRun(run) {
+  if (!run) throw Object.assign(new Error("Smart SCM planning run was not found."), { status: 404 });
+  if (run.status !== "ready") {
+    throw Object.assign(new Error("Manual loads can be added only to a ready planning run."), { status: 409 });
+  }
 }
 
 async function rawProposalLines(proposalIds) {
@@ -232,8 +347,9 @@ async function updateDerivedProposal(proposalId) {
   const proposal = await rawProposal(proposalId);
   const routeRule = await getSmartScmRouteRule(proposal?.source_name);
   const routeStops = routeStopsForLines(lines, routeRule);
+  const palletQuantityOverrides = prunePalletOverrides(proposal?.pallet_quantity_overrides, lines);
   const totalPallets = round(lines.reduce((sum, line) => sum + positive(line.proposed_pallets), 0));
-  const totalWeight = round(lines.reduce((sum, line) => sum + positive(line.proposed_pallets) * positive(line.pallet_weight_lbs), 0));
+  const totalWeight = proposalLoadWeight(lines, palletQuantityOverrides, settings.physical_pallet_weight_lbs);
   await query(
     `UPDATE scm_smart_proposals
         SET destination_location_id = $2,
@@ -242,13 +358,15 @@ async function updateDerivedProposal(proposalId) {
             total_pallets = $5,
             total_weight_lbs = $6,
             utilization = CASE WHEN $7::numeric > 0 THEN $6::numeric / $7::numeric ELSE 0 END,
+            pallet_quantity_overrides = $8::jsonb,
             urgent = EXISTS (SELECT 1 FROM scm_smart_proposal_lines line WHERE line.proposal_id = $1 AND line.urgent),
             provisional = EXISTS (SELECT 1 FROM scm_smart_proposal_lines line WHERE line.proposal_id = $1 AND line.provisional),
             updated_at = now()
       WHERE id = $1`,
-    [Number(proposalId), routeStops[0].locationId, routeStops[0].name, JSON.stringify(routeStops), totalPallets, totalWeight, positive(settings.truck_capacity_lbs)]
+    [Number(proposalId), routeStops[0].locationId, routeStops[0].name, JSON.stringify(routeStops), totalPallets, totalWeight,
+      positive(settings.truck_capacity_lbs), JSON.stringify(palletQuantityOverrides)]
   );
-  return { totalPallets, totalWeight, capacity: positive(settings.truck_capacity_lbs), routeStops };
+  return { totalPallets, totalWeight, capacity: positive(settings.truck_capacity_lbs), routeStops, palletQuantityOverrides };
 }
 
 async function recordRevision(runId, reason, diff, operatorId) {
@@ -281,18 +399,19 @@ async function recordRevision(runId, reason, diff, operatorId) {
   return numberValue;
 }
 
-async function insertGroupedDraft(runId, draft) {
+async function insertGroupedDraft(runId, draft, { manuallyGrouped = true } = {}) {
   const proposal = await query(
     `INSERT INTO scm_smart_proposals (
        run_id, proposal_key, proposal_type, phase, source_kind, source_location_id, source_name,
        destination_location_id, destination_name, vendor, plant, status, urgent, provisional,
-       total_pallets, total_weight_lbs, utilization, memo, route_stops, manually_grouped
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19::jsonb,true)
+       total_pallets, total_weight_lbs, utilization, memo, route_stops, pallet_quantity_overrides, manually_grouped
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19::jsonb,$20::jsonb,$21)
      RETURNING id`,
     [runId, draft.proposalKey, draft.proposalType, draft.phase, draft.sourceKind, draft.sourceLocationId,
       draft.sourceName, draft.destinationLocationId, draft.destinationName, draft.vendor, draft.plant,
       draft.status, draft.urgent, draft.provisional, draft.totalPallets, draft.totalWeight,
-      draft.utilization, draft.memo, JSON.stringify(draft.routeStops)]
+      draft.utilization, draft.memo, JSON.stringify(draft.routeStops),
+      JSON.stringify(smartScmNormalizePalletQuantityOverrides(draft.palletQuantityOverrides)), Boolean(manuallyGrouped)]
   );
   for (const line of draft.lines) {
     await query(
@@ -356,14 +475,17 @@ export async function groupSmartScmProposals(proposalIds = [], operatorId = null
       }
     }
     const rawLines = await rawProposalLines(ids);
+    const settings = await settingsRow();
+    const palletProfile = palletOverrideProfile(selected, rawLines);
     const combined = [];
-    rawLines.map(draftLine).forEach((line) => combineLines(combined, line));
+    rawLines.map((line) => draftLine(line, settings.physical_pallet_weight_lbs)).forEach((line) => combineLines(combined, line));
     if (first.proposal_type === "PO" && new Set(combined.map((line) => line.destinationLocationId)).size > 2) {
       throw Object.assign(new Error("A grouped PO truck may have at most two destination yards. Select loads with no more than two combined drops."), { status: 409 });
     }
-    const settings = await settingsRow();
     const routeRule = await getSmartScmRouteRule(first.source_name);
-    const allocations = smartScmAllocateProRata(combined, settings.truck_capacity_lbs);
+    const weightedCombined = applyPalletOverrideWeight(combined, palletProfile, settings.physical_pallet_weight_lbs);
+    const allocations = smartScmAllocateProRata(weightedCombined, settings.truck_capacity_lbs);
+    const allocationOverrides = distributePalletOverrides(palletProfile, allocations);
     const deferredPallets = round(allocations.flat().reduce(
       (sum, line) => sum + positive(line.reason?.groupingDeferredPallets), 0
     ));
@@ -373,9 +495,13 @@ export async function groupSmartScmProposals(proposalIds = [], operatorId = null
     const createdIds = [];
     for (let index = 0; index < allocations.length; index += 1) {
       const lines = allocations[index];
+      const palletQuantityOverrides = allocationOverrides[index];
       const routeStops = routeStopsForLines(lines, routeRule);
       const totalPallets = round(lines.reduce((sum, line) => sum + line.proposedPallets, 0));
-      const totalWeight = round(lines.reduce((sum, line) => sum + line.lineWeight, 0));
+      const totalWeight = proposalLoadWeight(lines, palletQuantityOverrides, settings.physical_pallet_weight_lbs);
+      if (totalWeight > positive(settings.truck_capacity_lbs) + EPSILON) {
+        throw Object.assign(new Error("The grouped load exceeds capacity after applying its manual PALLET quantity."), { status: 409 });
+      }
       const utilization = round(totalWeight / positive(settings.truck_capacity_lbs));
       const urgent = lines.some((line) => Boolean(line.urgent));
       const provisional = lines.some((line) => Boolean(line.provisional));
@@ -400,6 +526,7 @@ export async function groupSmartScmProposals(proposalIds = [], operatorId = null
         totalWeight,
         utilization,
         memo: `manually grouped load · ${lines.length} line${lines.length === 1 ? "" : "s"}${capacityLimited ? ` · ${deferredPallets} PLT deferred` : ""}`,
+        palletQuantityOverrides,
         routeStops,
         lines,
         operatorId
@@ -431,7 +558,10 @@ export async function recalculateSmartScmPoProposal(proposalId, operatorId = nul
     if (proposal.proposal_type !== "PO") {
       throw Object.assign(new Error("Only a PO proposal can be recalculated into purchase loads."), { status: 400 });
     }
-    const sourceLines = (await rawProposalLines([id])).map(draftLine);
+    const settings = await settingsRow();
+    const sourceRows = await rawProposalLines([id]);
+    const palletProfile = palletOverrideProfile([proposal], sourceRows);
+    const sourceLines = sourceRows.map((line) => draftLine(line, settings.physical_pallet_weight_lbs));
     if (!sourceLines.length) throw Object.assign(new Error("This PO proposal has no lines to recalculate."), { status: 409 });
     const normalizedLines = sourceLines.map((line) => {
       const pallets = wholePalletQuantity(line.proposedPallets);
@@ -450,24 +580,30 @@ export async function recalculateSmartScmPoProposal(proposalId, operatorId = nul
         }
       };
     });
-    const settings = await settingsRow();
     const routeRule = await getSmartScmRouteRule(proposal.source_name);
-    const packed = smartScmPackWholePalletLines(normalizedLines, settings.truck_capacity_lbs, {
+    const weightedLines = applyPalletOverrideWeight(normalizedLines, palletProfile, settings.physical_pallet_weight_lbs);
+    const packed = smartScmPackWholePalletLines(weightedLines, settings.truck_capacity_lbs, {
       proposalType: "PO", sourceName: proposal.source_name, maxStops: 2, routeRule
     });
     if (!packed.length) throw Object.assign(new Error("The PO recalculation did not produce a load."), { status: 409 });
-    const beforePallets = round(normalizedLines.reduce((sum, line) => sum + line.proposedPallets, 0));
+    const beforePallets = round(weightedLines.reduce((sum, line) => sum + line.proposedPallets, 0));
     const afterPallets = round(packed.flatMap((load) => load.lines).reduce((sum, line) => sum + positive(line.proposedPallets), 0));
     if (beforePallets !== afterPallets) throw new Error("PO recalculation did not preserve the whole-pallet purchase quantity.");
     await query("DELETE FROM scm_smart_proposals WHERE id = $1", [id]);
     const namespace = `${Date.now()}-${id}`;
+    const packedOverrides = distributePalletOverrides(palletProfile, packed.map((load) => load.lines));
     const createdIds = [];
     for (let index = 0; index < packed.length; index += 1) {
       const load = packed[index];
       const routeStops = load.routeStops || routeStopsForLines(load.lines, routeRule);
       const urgent = load.lines.some((line) => Boolean(line.urgent));
+      const palletQuantityOverrides = packedOverrides[index];
       const provisional = load.lines.some((line) => Boolean(line.provisional));
-      const utilization = round(load.totalWeight / positive(settings.truck_capacity_lbs));
+      const totalWeight = proposalLoadWeight(load.lines, palletQuantityOverrides, settings.physical_pallet_weight_lbs);
+      if (totalWeight > positive(settings.truck_capacity_lbs) + EPSILON) {
+        throw Object.assign(new Error("A recalculated PO load exceeds capacity after applying its manual PALLET quantity."), { status: 409 });
+      }
+      const utilization = round(totalWeight / positive(settings.truck_capacity_lbs));
       createdIds.push(await insertGroupedDraft(proposal.run_id, {
         proposalKey: `po-recalculated:${namespace}:${index + 1}`,
         proposalType: "PO",
@@ -483,11 +619,12 @@ export async function recalculateSmartScmPoProposal(proposalId, operatorId = nul
         urgent,
         provisional,
         totalPallets: load.totalPallets,
-        totalWeight: load.totalWeight,
+        totalWeight,
         utilization,
         memo: `PO recalculated load ${index + 1}/${packed.length} · ${routeStops.map((stop) => stop.name).join(" → ")}`,
         routeStops,
         lines: load.lines,
+        palletQuantityOverrides,
         operatorId
       }));
     }
@@ -512,7 +649,11 @@ export async function recalculateSmartScmPoProposal(proposalId, operatorId = nul
 
 async function itemPolicy(itemId, destinationLocationId) {
   const result = await query(
-    `SELECT item.item_id, item.item_name, item.item_description, item.stock_unit, item.vendor_id, item.vendor,
+    `SELECT item.item_id, item.item_name, item.item_description, item.stock_unit, item.vendor_id,
+            COALESCE(NULLIF(item.vendor, ''), NULLIF(policy.vendor, '')) AS vendor,
+            policy.vendor_yard_id,
+            COALESCE(NULLIF(policy.vendor_yard, ''), NULLIF(policy.plant, ''), NULLIF(item.vendor, ''), NULLIF(policy.vendor, '')) AS vendor_yard,
+            policy.plant,
             COALESCE(item.to_plt, policy.to_plt) AS to_plt,
             COALESCE(item.to_lyr, policy.to_lyr) AS to_lyr,
             COALESCE(item.to_sec, policy.to_sec) AS to_sec,
@@ -570,6 +711,198 @@ async function inventorySnapshot(itemId, locationId, toPlt) {
     availablePallets: conversion > EPSILON ? round(Math.max(0, availableSales - reservedSales) / conversion) : 0,
     expectedAvailablePallets: conversion > EPSILON ? round(Math.max(0, availableSales + onOrderSales - backorderedSales) / conversion) : 0
   };
+}
+
+function manualProposalType(value) {
+  const proposalType = text(value).toUpperCase();
+  if (!new Set(["PO", "TO"]).has(proposalType)) {
+    throw Object.assign(new Error("Manual load type must be PO or TO."), { status: 400 });
+  }
+  return proposalType;
+}
+
+function manualLoadYard(value, label) {
+  const yard = YARD_BY_ID.get(Number(value));
+  if (!yard) throw Object.assign(new Error(`Select a valid ${label} yard.`), { status: 400 });
+  return yard;
+}
+
+export async function searchSmartScmManualLoadItems({
+  proposalType: requestedType = "TO",
+  sourceLocationId = null,
+  destinationLocationId = null,
+  search = "",
+  limit = 12
+} = {}) {
+  const proposalType = manualProposalType(requestedType);
+  const destination = manualLoadYard(destinationLocationId, "destination");
+  const source = proposalType === "TO" ? manualLoadYard(sourceLocationId, "source") : null;
+  if (source && source.locationId === destination.locationId) {
+    throw Object.assign(new Error("TO source and destination yards must be different."), { status: 400 });
+  }
+  const params = [destination.locationId, `%${text(search)}%`, Math.min(30, Math.max(1, Number(limit) || 12))];
+  let compatibilityClause = `AND item.vendor_id IS NOT NULL
+    AND COALESCE(NULLIF(policy.vendor_yard, ''), NULLIF(policy.plant, ''),
+                 NULLIF(item.vendor, ''), NULLIF(policy.vendor, '')) IS NOT NULL`;
+  if (proposalType === "TO") {
+    params.push(source.locationId);
+    compatibilityClause = `AND EXISTS (
+      SELECT 1 FROM scm_smart_item_yard_policies source_yard
+       WHERE source_yard.item_id = item.item_id AND source_yard.location_id = $4 AND source_yard.eligible = true
+    )`;
+  }
+  const result = await query(
+    `SELECT item.item_id, item.item_name, item.item_description, item.stock_unit, item.vendor_id,
+            COALESCE(NULLIF(item.vendor, ''), NULLIF(policy.vendor, '')) AS vendor,
+            COALESCE(NULLIF(policy.vendor_yard, ''), NULLIF(policy.plant, ''), NULLIF(item.vendor, ''), NULLIF(policy.vendor, '')) AS source_name,
+            COALESCE(item.to_plt, policy.to_plt) AS to_plt,
+            CASE WHEN COALESCE(item.item_weight, 0) > 0 AND COALESCE(item.to_plt, policy.to_plt, 0) > 0
+                 THEN item.item_weight * COALESCE(item.to_plt, policy.to_plt) ELSE policy.pallet_weight_lbs END AS pallet_weight_lbs
+       FROM inventory_items item
+       JOIN scm_smart_item_policies policy ON policy.item_id = item.item_id
+       JOIN scm_smart_item_yard_policies yard
+         ON yard.item_id = item.item_id AND yard.location_id = $1 AND yard.eligible = true
+      WHERE policy.planning_enabled = true AND policy.inactive = false AND policy.discontinued = false
+        AND COALESCE(item.to_plt, policy.to_plt, 0) > 0
+        AND (CASE WHEN COALESCE(item.item_weight, 0) > 0 AND COALESCE(item.to_plt, policy.to_plt, 0) > 0
+                  THEN item.item_weight * COALESCE(item.to_plt, policy.to_plt) ELSE COALESCE(policy.pallet_weight_lbs, 0) END) > 0
+        AND (item.item_name ILIKE $2 OR COALESCE(item.item_description, '') ILIKE $2 OR item.item_id::text ILIKE $2)
+        ${compatibilityClause}
+      ORDER BY item.item_name, item.item_id
+      LIMIT $3`,
+    params
+  );
+  return result.rows.map((row) => ({
+    itemId: Number(row.item_id),
+    itemName: row.item_name,
+    itemDescription: row.item_description,
+    vendorId: row.vendor_id === null ? null : Number(row.vendor_id),
+    vendor: row.vendor,
+    sourceName: proposalType === "TO" ? source.code : row.source_name,
+    unit: row.stock_unit,
+    toPlt: positive(row.to_plt),
+    palletWeightLbs: positive(row.pallet_weight_lbs)
+  }));
+}
+
+export async function createSmartScmManualLoad(runId, values = {}, operatorId = null) {
+  const targetRunId = Number(runId);
+  const proposalType = manualProposalType(values.proposalType ?? values.type);
+  const itemId = Number(values.itemId);
+  const pallets = Number(values.proposedPallets ?? values.pallets);
+  if (!Number.isInteger(targetRunId) || targetRunId <= 0) {
+    throw Object.assign(new Error("Select a valid planning run."), { status: 400 });
+  }
+  if (!Number.isInteger(itemId) || itemId <= 0) {
+    throw Object.assign(new Error("Select an item for the manual load."), { status: 400 });
+  }
+  if (!Number.isInteger(pallets) || pallets <= 0) {
+    throw Object.assign(new Error("Manual load pallets must be a positive whole number."), { status: 400 });
+  }
+  const destination = manualLoadYard(values.destinationLocationId, "destination");
+  const source = proposalType === "TO" ? manualLoadYard(values.sourceLocationId, "source") : null;
+  if (source && source.locationId === destination.locationId) {
+    throw Object.assign(new Error("TO source and destination yards must be different."), { status: 400 });
+  }
+  const outcome = await withTransaction(async () => {
+    const run = await rawPlanningRun(targetRunId, { lock: true });
+    assertReadyPlanningRun(run);
+    const item = await itemPolicy(itemId, destination.locationId);
+    if (!item) throw Object.assign(new Error("This item is not enabled for planning at the selected destination yard."), { status: 409 });
+    const toPlt = positive(item.to_plt);
+    const palletWeight = positive(item.pallet_weight_lbs);
+    if (toPlt <= EPSILON || palletWeight <= EPSILON) {
+      throw Object.assign(new Error("The selected item needs a pallet conversion and pallet weight."), { status: 409 });
+    }
+    if (proposalType === "TO") {
+      const sourcePolicy = await itemPolicy(itemId, source.locationId);
+      if (!sourcePolicy) throw Object.assign(new Error("This item is not enabled for planning at the TO source yard."), { status: 409 });
+    } else if (!Number.isInteger(Number(item.vendor_id)) || Number(item.vendor_id) <= 0) {
+      throw Object.assign(new Error("This item has no NetSuite vendor ID. Refresh Item Master before creating a PO load."), { status: 409 });
+    }
+    const sourceName = proposalType === "TO" ? source.code : text(item.vendor_yard || item.plant || item.vendor);
+    if (!sourceName) {
+      throw Object.assign(new Error("This item has no vendor pickup source. Configure its vendor yard before creating a PO load."), { status: 409 });
+    }
+    const destinationInventory = await inventorySnapshot(itemId, destination.locationId, toPlt);
+    const sourceInventory = proposalType === "TO" ? await inventorySnapshot(itemId, source.locationId, toPlt) : null;
+    const settings = await settingsRow();
+    const lineWeight = round(pallets * palletWeight);
+    const physicalPalletWeightLbs = positive(settings.physical_pallet_weight_lbs);
+    const loadWeight = round(lineWeight + (pallets * physicalPalletWeightLbs));
+    if (proposalType === "TO" && loadWeight > positive(settings.truck_capacity_lbs) + EPSILON) {
+      throw Object.assign(new Error("This manual TO load would exceed the configured truck capacity."), { status: 409 });
+    }
+    const reason = {
+      ...destinationInventory,
+      sourceAvailablePallets: sourceInventory?.availablePallets ?? null,
+      destinationAvailablePallets: destinationInventory.availablePallets,
+      destinationExpectedAvailablePallets: destinationInventory.expectedAvailablePallets,
+      actualDestinationYard: destination.code,
+      manuallyAdded: true,
+      manualLoad: true,
+      physicalPalletWeightLbs
+    };
+    const line = {
+      itemId,
+      itemName: item.item_name,
+      itemDescription: item.item_description,
+      unit: item.stock_unit,
+      destinationLocationId: destination.locationId,
+      destinationName: destination.code,
+      requiredPallets: pallets,
+      proposedPallets: pallets,
+      confirmedPallets: 0,
+      residualPallets: pallets,
+      salesQuantity: round(pallets * toPlt),
+      palletWeight,
+      physicalPalletWeightLbs,
+      lineWeight,
+      toPlt,
+      toLyr: positive(item.to_lyr),
+      toSec: positive(item.to_sec),
+      toPcs: positive(item.to_pcs),
+      manualPlanningRequired: false,
+      urgent: false,
+      provisional: false,
+      reason
+    };
+    const createdProposalId = await insertGroupedDraft(targetRunId, {
+      proposalKey: `manual-load:${randomUUID()}`,
+      proposalType,
+      phase: proposalType === "PO" ? "direct_vendor" : "internal_transfer",
+      sourceKind: proposalType === "PO" ? "vendor" : "yard",
+      sourceLocationId: proposalType === "TO" ? source.locationId : null,
+      sourceName,
+      destinationLocationId: destination.locationId,
+      destinationName: destination.code,
+      vendor: proposalType === "PO" ? item.vendor : null,
+      plant: proposalType === "PO" ? sourceName : null,
+      status: "held",
+      urgent: false,
+      provisional: false,
+      totalPallets: pallets,
+      totalWeight: loadWeight,
+      utilization: round(loadWeight / positive(settings.truck_capacity_lbs)),
+      memo: `manually added ${proposalType} load · ${item.item_name}`,
+      routeStops: [{ locationId: destination.locationId, name: destination.code, sequence: 1 }],
+      lines: [line],
+      operatorId
+    }, { manuallyGrouped: false });
+    const revision = await recordRevision(targetRunId, "Manual proposal load added", {
+      createdProposalId, proposalType, itemId, pallets,
+      sourceLocationId: source?.locationId ?? null,
+      destinationLocationId: destination.locationId
+    }, operatorId);
+    return { createdProposalId, revision };
+  });
+  await writeAudit({
+    actorOperatorId: operatorId,
+    source: "smart_scm",
+    action: "smart_scm.proposal.manual_load_add",
+    details: { runId: targetRunId, proposalType, itemId, pallets, ...outcome }
+  });
+  return getSmartScmPlanningRun(targetRunId);
 }
 
 async function assertSamePoVendor(proposalId, candidateVendorId) {
@@ -654,7 +987,22 @@ export async function addSmartScmProposalLine(proposalId, values = {}, operatorI
       settingsRow()
     ]);
     const addedWeight = pallets * palletWeight;
-    if (proposal.proposal_type !== "PO" && positive(proposal.total_weight_lbs) + addedWeight > positive(settings.truck_capacity_lbs) + EPSILON) {
+    const physicalPalletWeightLbs = positive(settings.physical_pallet_weight_lbs);
+    const currentLines = await rawProposalLines([id]);
+    const matchingLine = currentLines.find((line) => Number(line.item_id) === itemId
+      && Number(line.destination_location_id) === destinationLocationId);
+    const candidateLines = matchingLine
+      ? currentLines.map((line) => Number(line.id) === Number(matchingLine.id) ? {
+        ...line,
+        proposed_pallets: positive(line.proposed_pallets) + pallets,
+        line_weight_lbs: positive(line.line_weight_lbs) + addedWeight
+      } : line)
+      : [...currentLines, {
+        item_id: itemId, item_name: item.item_name, destination_location_id: destinationLocationId,
+        proposed_pallets: pallets, pallet_weight_lbs: palletWeight, line_weight_lbs: addedWeight
+      }];
+    const candidateWeight = proposalLoadWeight(candidateLines, proposal.pallet_quantity_overrides, physicalPalletWeightLbs);
+    if (proposal.proposal_type !== "PO" && candidateWeight > positive(settings.truck_capacity_lbs) + EPSILON) {
       throw Object.assign(new Error("Adding this quantity would exceed the configured truck capacity."), { status: 409 });
     }
     const reason = {
@@ -662,7 +1010,8 @@ export async function addSmartScmProposalLine(proposalId, values = {}, operatorI
       sourceAvailablePallets: sourceInventory?.availablePallets ?? null,
       destinationAvailablePallets: destinationInventory.availablePallets,
       destinationExpectedAvailablePallets: destinationInventory.expectedAvailablePallets,
-      manuallyAdded: true
+      manuallyAdded: true,
+      physicalPalletWeightLbs
     };
     await query(
       `INSERT INTO scm_smart_proposal_lines (
@@ -781,9 +1130,19 @@ export async function updateSmartScmProposalLine(proposalId, lineId, values = {}
       }
     }
     const settings = await settingsRow();
+    const physicalPalletWeightLbs = positive(settings.physical_pallet_weight_lbs);
+    reason.physicalPalletWeightLbs = physicalPalletWeightLbs;
     const nextWeight = pallets * palletWeight;
-    const proposalWeight = positive(proposal.total_weight_lbs) - positive(line.line_weight_lbs) + nextWeight;
-    if (proposal.proposal_type !== "PO" && pallets > positive(line.proposed_pallets) + EPSILON && proposalWeight > positive(settings.truck_capacity_lbs) + EPSILON) {
+    const candidateLines = (await rawProposalLines([id])).map((current) => Number(current.id) === targetLineId ? {
+      ...current,
+      proposed_pallets: pallets,
+      pallet_weight_lbs: palletWeight,
+      line_weight_lbs: nextWeight,
+      destination_location_id: destinationLocationId,
+      destination_name: destinationName
+    } : current);
+    const proposalWeight = proposalLoadWeight(candidateLines, proposal.pallet_quantity_overrides, physicalPalletWeightLbs);
+    if (proposal.proposal_type !== "PO" && proposalWeight > positive(settings.truck_capacity_lbs) + EPSILON) {
       throw Object.assign(new Error("This quantity would exceed the configured truck capacity."), { status: 409 });
     }
     await query(
@@ -831,4 +1190,124 @@ export async function removeSmartScmProposalLine(proposalId, lineId, operatorId 
   await writeAudit({ actorOperatorId: operatorId, source: "smart_scm", action: "smart_scm.proposal_line.remove", details: { proposalId: id, lineId: targetLineId, ...outcome } });
   if (outcome.deletedProposal) return { deleted: true, runId: outcome.runId };
   return getSmartScmProposal(id);
+}
+
+export async function splitSmartScmProposalLine(proposalId, lineId, _values = {}, operatorId = null) {
+  const id = Number(proposalId);
+  const targetLineId = Number(lineId);
+  if (!Number.isInteger(id) || id <= 0 || !Number.isInteger(targetLineId) || targetLineId <= 0) {
+    throw Object.assign(new Error("Select a valid proposal line to split."), { status: 400 });
+  }
+  const outcome = await withTransaction(async () => {
+    const proposal = await rawProposal(id, { lock: true });
+    assertEditableProposal(proposal);
+    const lineResult = await query(
+      "SELECT * FROM scm_smart_proposal_lines WHERE id = $1 AND proposal_id = $2 FOR UPDATE",
+      [targetLineId, id]
+    );
+    if (!lineResult.rowCount) throw Object.assign(new Error("Proposal line was not found."), { status: 404 });
+    const line = lineResult.rows[0];
+    const originalLines = await rawProposalLines([id]);
+    const palletProfile = palletOverrideProfile([proposal], originalLines);
+    const remainingLines = originalLines.filter((row) => Number(row.id) !== targetLineId);
+    const movedPallets = positive(line.proposed_pallets);
+    if (!Number.isInteger(movedPallets) || movedPallets <= 0) {
+      throw Object.assign(new Error("Save this line as a positive whole-pallet quantity before splitting it."), { status: 409 });
+    }
+    const movedSalesQuantity = positive(line.sales_quantity);
+    const movedLineWeight = positive(line.line_weight_lbs);
+    const settings = await settingsRow();
+    const physicalPalletWeightLbs = positive(settings.physical_pallet_weight_lbs);
+    const movedReason = {
+      ...(line.reason || {}),
+      manuallySplit: true,
+      splitWholeLine: true,
+      splitFromProposalId: id,
+      splitFromLineId: targetLineId,
+      splitOriginalPallets: movedPallets,
+      splitPallets: movedPallets,
+      physicalPalletWeightLbs
+    };
+    const childLine = {
+      ...draftLine(line, physicalPalletWeightLbs),
+      requiredPallets: positive(line.required_pallets),
+      proposedPallets: movedPallets,
+      confirmedPallets: 0,
+      residualPallets: movedPallets,
+      salesQuantity: movedSalesQuantity,
+      lineWeight: movedLineWeight,
+      reason: movedReason
+    };
+    const routeRule = await getSmartScmRouteRule(proposal.source_name);
+    const outputLineSets = remainingLines.length
+      ? [remainingLines, [childLine]]
+      : [[childLine]];
+    const splitOverrides = distributePalletOverrides(palletProfile, outputLineSets);
+    const sourcePalletQuantityOverrides = remainingLines.length ? splitOverrides[0] : {};
+    const childPalletQuantityOverrides = splitOverrides[splitOverrides.length - 1];
+    const movedLoadWeight = proposalLoadWeight([childLine], childPalletQuantityOverrides, physicalPalletWeightLbs);
+    const routeStops = routeStopsForLines([childLine], routeRule);
+    const createdProposalId = await insertGroupedDraft(proposal.run_id, {
+      proposalKey: `manual-split:${randomUUID()}`,
+      proposalType: proposal.proposal_type,
+      phase: proposal.phase,
+      sourceKind: proposal.source_kind,
+      sourceLocationId: proposal.source_location_id,
+      sourceName: proposal.source_name,
+      destinationLocationId: Number(line.destination_location_id),
+      destinationName: line.destination_name,
+      vendor: proposal.vendor,
+      plant: proposal.plant,
+      status: "held",
+      urgent: Boolean(line.urgent),
+      provisional: Boolean(line.provisional),
+      totalPallets: movedPallets,
+      totalWeight: movedLoadWeight,
+      utilization: positive(settings.truck_capacity_lbs) > EPSILON
+        ? round(movedLoadWeight / positive(settings.truck_capacity_lbs))
+        : 0,
+      memo: `split from load #${id} · ${line.item_name}`,
+      routeStops,
+      palletQuantityOverrides: childPalletQuantityOverrides,
+      lines: [childLine],
+      operatorId
+    }, { manuallyGrouped: false });
+    await query("DELETE FROM scm_smart_proposal_lines WHERE id = $1 AND proposal_id = $2", [targetLineId, id]);
+    const remaining = await query("SELECT COUNT(*)::int AS count FROM scm_smart_proposal_lines WHERE proposal_id = $1", [id]);
+    const sourceProposalRemoved = Number(remaining.rows[0]?.count || 0) === 0;
+    if (sourceProposalRemoved) {
+      await query("DELETE FROM scm_smart_proposals WHERE id = $1", [id]);
+    } else {
+      await query(
+        "UPDATE scm_smart_proposals SET status = 'held', pallet_quantity_overrides = $2::jsonb, updated_at = now() WHERE id = $1",
+        [id, JSON.stringify(sourcePalletQuantityOverrides)]
+      );
+      await updateDerivedProposal(id);
+    }
+    await updateDerivedProposal(createdProposalId);
+    const revision = await recordRevision(proposal.run_id, "Proposal item line moved into a separate load", {
+      proposalId: id,
+      lineId: targetLineId,
+      createdProposalId,
+      movedPallets,
+      movedSalesQuantity,
+      movedLineWeightLbs: movedLineWeight,
+      sourceProposalRemoved,
+      wholeLineMove: true
+    }, operatorId);
+    return {
+      runId: Number(proposal.run_id),
+      createdProposalId,
+      revision,
+      movedPallets,
+      sourceProposalRemoved
+    };
+  });
+  await writeAudit({
+    actorOperatorId: operatorId,
+    source: "smart_scm",
+    action: "smart_scm.proposal_line.split",
+    details: { proposalId: id, lineId: targetLineId, ...outcome }
+  });
+  return getSmartScmPlanningRun(outcome.runId);
 }

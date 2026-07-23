@@ -5,8 +5,10 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { config, isNetSuiteSandboxEnvironment, listEnvFiles, selectEnvFile } from "./config.js";
 import { beginRollbackContext, pool, query, withTransaction } from "./db.js";
+import { fetchSalesOrderReferenceFromNetSuite, fetchTransactionReferenceByTranidFromNetSuite } from "./netsuite.js";
 import { buildAuthorizationUrl, exchangeCodeForToken, fetchDeliveryOrdersFromNetSuite, fetchDeliveryOrderFromNetSuite, fetchCustomerPickupOrderFromNetSuite, fetchDeliveryOrderDetailsFromNetSuite, fetchTransferDeliveryOrdersFromNetSuite, fetchTransferDeliveryOrderFromNetSuite, fetchTransferOrderDetailsFromNetSuite, fetchTransferOrderVerificationLinesFromNetSuite, fetchTransferOrderByIdFromNetSuite, findTransferOrdersByDependencyMarkerFromNetSuite, fetchPurchaseOrdersFromNetSuite, fetchPurchaseOrderFromNetSuite, fetchPurchaseOrderReferenceFromNetSuite, fetchPurchaseOrderDetailsFromNetSuite, fetchTransferReceivingOrdersFromNetSuite, fetchTransferReceivingOrderFromNetSuite, fetchInventoryBalanceForItemFromNetSuite, fetchInventoryBalancesFromNetSuite, fetchInventoryBalancesForItemsFromNetSuite, fetchItemFulfillmentFromNetSuite, fetchItemReceiptFromNetSuite, fetchTransactionProgressFromNetSuite, fetchTransactionStatusFromNetSuite, createPurchaseOrderInNetSuite, createTransferOrderInNetSuite, updateTransferOrderStatusInNetSuite, fetchPickingTicketFromNetSuite, resolveNetSuiteTransferLocations, resolveNetSuiteYardLocations, resolvePalletItemFromNetSuite, transformSalesOrderToItemFulfillment, transformTransferOrderToItemFulfillment, transformPurchaseOrderToItemReceipt, transformTransferOrderToItemReceipt } from "./netsuite.js";
 import { buildTransferDependencyRestPayload, transferDependencyMemoMarker } from "./transfer-dependency-netsuite.js";
+import { syncTargetedNetSuiteOrder } from "./targeted-order-sync.js";
 import { listDeliveryOrders, listVrmaDeliveryPrepOrders, getDeliveryOrder, getFulfillableDeliveryOrder, buildItemFulfillmentPayload, markDeliveryPrepared, updateDeliveryStatus, confirmDeliveryLine, confirmDeliveryLines, setDeliveryLinePackedQuantity, unpackDeliveryLine, unpackDeliveryOrder, recordDeliveryFulfillment, recordDeliveryFulfillmentFailure, recordDeliveryLoad, listDeliveryFulfillments, getDeliveryBootstrap, getDeliveryPrepNotifications, resetDeliveryFulfillmentState, applyConfirmedDispatchPlanToDelivery, deactivateUnplannedDispatchSplitOrders, getNextDispatchSplitSuffix, getCurrentOperatorDeliveryDraft, releaseCurrentDeliveryDraft, listSavedDeliveryOrdersForOperator, listSavedDeliveryOrderKeysForOperator, saveDeliveryOrderForOperator, removeSavedDeliveryOrderForOperator, listDeliveryLoadTrucks, listDeliveryLoadOrders } from "./delivery-repository.js";
 import { getYardMovementDetail, listYardMovementCsvRows, listYardMovements } from "./yard-movement-repository.js";
 import { yardMixedUnits } from "./yard-quantity.js";
@@ -19,27 +21,30 @@ import { acceptNetSuiteMirrorEvents, enqueueNetSuiteMirrorOrderEvent, getNetSuit
 import { kickNetSuiteMirrorConsumer, localNetSuiteMirrorEventPage, localNetSuiteMirrorInventorySnapshot, localNetSuiteMirrorOrderSnapshot, relayPendingNetSuiteMirrorEvents, requireNetSuiteMirrorSignature, runNetSuiteMirrorConsumerTick, runNetSuiteMirrorReconciliation, startNetSuiteMirrorWorkers } from "./netsuite-mirror-service.js";
 import { listOperatorHistory, listRecordWarnings, reportOperatorRecordError, resolveRecordWarning } from "./history-repository.js";
 import { listDispatchOrders, enrichDispatchOrdersWithPoTargetAllocations, listScmPurchaseOrders, listScmSchedule, updateScmScheduleEntry, createScmScheduleGroup, cancelScmScheduleGroup, listScmViewPresets, upsertScmViewPreset, createScmVrmaOrder, getScmVrmaOrder, getScmVrmaOptions, searchScmVrmaItems, syncScmScheduleFromDispatchPlan, createScmPurchaseOrderSplit, updateScmPurchaseOrderSplitRef, updateScmPurchaseOrderSplitDestination, updateScmPurchaseOrderSplitPickupYard, updatePurchaseOrderDispatchRef, cancelScmPurchaseOrderSplit, refreshDispatchEnrichment, reparseMissingSalesOrderDispatch, searchSalesOrderMethodOverrides, setPurchaseOrderVendorYard, updateDispatchOrderDetails, updateSalesOrderLocalMethod, getSalesOrderPoAllocationOptions, createSalesOrderPoAllocation, createSalesOrderPoAllocations, cancelSalesOrderPoAllocation, createDispatchOperatorRequest, upsertLocalCoOrder, cancelLocalCoOrder, listDispatchOperatorRequests, resolveDispatchOperatorRequestsForOrder } from "./dispatch-repository.js";
-import { listDispatchVendorYards, updateDispatchVendorYard, upsertDispatchVendorYard, listDispatchParserRules, updateDispatchParserRule, listOllamaAudit, listDispatchVendorMappings, discoverDispatchVendorMappingsFromPurchaseOrders, updateDispatchVendorMapping, createDispatchLocalVendor, updateDispatchLocalVendor } from "./dispatch-enrichment.js";
+import { setPurchaseOrderBlanketFlag } from "./dispatch-repository.js";
+import { DISPATCH_VENDOR_WEEK_DAYS, listDispatchVendorYards, listDispatchLocalVendors, saveDispatchVendorYardSchedule, updateDispatchVendorYard, upsertDispatchVendorYard, listDispatchParserRules, updateDispatchParserRule, listOllamaAudit, listDispatchVendorMappings, discoverDispatchVendorMappingsFromPurchaseOrders, updateDispatchVendorMapping, createDispatchLocalVendor, updateDispatchLocalVendor } from "./dispatch-enrichment.js";
 import { listDispatchAudit, writeDispatchAudit } from "./dispatch-audit-repository.js";
 import { runWithAuditContext } from "./audit-context.js";
 import { DispatchPlanDateMismatchError, StaleDispatchPlanSaveError, applyDispatchPlannedAssignment, confirmDispatchPlan, createDispatchPlan, dispatchPlannedAssignmentMap, getCurrentDispatchPlan, getDispatchPlan, getDispatchPlanRevision, getDispatchPlanSnapshot, listDispatchPlanSnapshots, listDispatchPlans, reopenDispatchPlan, restoreDispatchPlanSnapshot, saveDispatchPlanSnapshot } from "./dispatch-plan-repository.js";
 import { DispatchPlanEditLeaseError, acquireDispatchPlanEditLease, assertDispatchPlanEditLease, getDispatchPlanEditLease, heartbeatDispatchPlanEditLease, releaseDispatchPlanEditLease } from "./dispatch-plan-lease-repository.js";
 import { getDispatchStatistics } from "./dispatch-statistics-repository.js";
+import { DISPATCH_FLEET_PLANNING_LOCK, dispatchFleetAssignmentStatusConflicts, dispatchFleetPlanConflicts, dispatchLegacyDriverRenameConflicts, unchangedCompletedDispatchLoadIds } from "./dispatch-fleet-status.js";
+import { syncDispatchPlanLoadAssignments } from "./dispatch-load-assignment-repository.js";
 import { confirmDriverTruckSwitch, endDriverRest, ensureDriverSamsaraDutyForJob, getActiveDriverRest, getDriverDayState, getDriverRestSummary, getNextDriverJob, listDriverHistory, listDriverJobStatuses, listDriverTruckSwitchAttention, overrideDriverTruckSwitch, recordDriverJobPhotos, skipDriverDvirForTesting, skipDriverTruckSwitchSamsara, startDriverJob, startDriverRest, submitDriverDvir } from "./driver-repository.js";
 import { createSamsaraDriverAuthToken, createSamsaraDriverVehicleAssignment, findSamsaraDriverByUsername, listSamsaraVehicleLocations, setSamsaraDriverDutyStatus, testSamsaraConnection } from "./samsara.js";
 import { createPhotoReadToken, createPhotoUploadToken, isR2PhotoReference, publicPhotoUploadConfig } from "./photo-upload.js";
 import { getPhotoArchiveSettings, isPhotoArchiveRunning, photoArchiveAutoTick, readArchivedPhoto, recoverInterruptedPhotoArchive, runPhotoArchive, updatePhotoArchiveSettings } from "./photo-archive-repository.js";
-import { authenticateDispatchDriver, ensureDispatchFleetSetup, getDispatchDriverByLogin, listDispatchDrivers, listDispatchTrucks, replaceDispatchFleetSetup } from "./dispatch-setup-repository.js";
+import { authenticateDispatchDriver, ensureDispatchFleetSetup, getDispatchDriverByLogin, listDispatchDrivers, listDispatchTrucks, replaceDispatchFleetSetup, setDispatchDriverActive, setDispatchTruckActive } from "./dispatch-setup-repository.js";
 import { assertNoActiveConsolidationClaimsByRefs, confirmConsolidationItem, getActiveConsolidationBatch, getSavedConsolidationQueue, packConsolidationOrder, releaseConsolidationBatch, startSavedConsolidationBatch, updateConsolidationLine } from "./delivery-consolidation-repository.js";
-import { DEPENDENCY_YARDS, assertNoActiveOrderDependenciesByRefs, cancelOrderDependency, completeDirectDependenciesForSalesOrderDrop, confirmTransferDependencyBatch, createOrderDependency, enrichDispatchOrdersWithDependencies, generateTransferDependencySuggestion, getDependencyInventoryMatrix, getDirectPickupDependencyExecutionBlock, getOrderDependencyOptions, getSalesOrderDependencyExecutionBlock, getTransferDependencyBatch, listOrderDependencies, listTransferDependencyCandidates, markDirectDependencyPickupCompleted, prepareTransferDependencyPalletItem, reconcileOrderDependency, removeTransferDependencyProposalLine, reopenTransferDependencyCandidate, retryTransferDependencyBatch, reviewTransferDependencyCandidate, syncDirectDependencyOperatorProgress, syncOrderDependenciesForTransferOrder, syncOrderDependenciesFromDispatchPlan, updateOrderDependencyMode, updateTransferDependencyBatch, validateDispatchPlanDependencies } from "./order-dependency-repository.js";
+import { DEPENDENCY_YARDS, assertNoActiveOrderDependenciesByRefs, cancelOrderDependency, completeDirectDependenciesForSalesOrderDrop, confirmTransferDependencyBatch, createOrderDependency, enrichDispatchOrdersWithDependencies, generateTransferDependencySuggestion, getDependencyInventoryMatrix, getDirectPickupDependencyExecutionBlock, getOrderDependencyOptions, getSalesOrderDependencyExecutionBlock, getTransferDependencyBatch, listOrderDependencies, listTransferDependencyCandidates, markDirectDependencyPickupCompleted, mergeTransferDependencyProposals, prepareTransferDependencyPalletItem, reconcileOrderDependency, removeTransferDependencyProposalLine, reopenTransferDependencyCandidate, retryTransferDependencyBatch, reviewTransferDependencyCandidate, syncDirectDependencyOperatorProgress, syncOrderDependenciesForTransferOrder, syncOrderDependenciesFromDispatchPlan, updateOrderDependencyMode, updateTransferDependencyBatch, validateDispatchPlanDependencies } from "./order-dependency-repository.js";
 import { activateSmartScmInputFile, importSmartScmSalesCsv, listSmartScmInputFiles, parseSmartScmVendorResponseFile, smartScmInputDownload, storeSmartScmInputFile } from "./smart-scm-import-repository.js";
 import { getSmartScmBootstrap, getSmartScmSettings, getSmartScmPlanningRun, listSmartScmForecasts, listSmartScmForecastRuns, listSmartScmPlanningRuns, listSmartScmProposals, promoteSmartScmForecastSegment, runSmartScmForecast, runSmartScmPlan, smartScmAutoTick, updateSmartScmSettings } from "./smart-scm-repository.js";
 import { getSmartScmSyncStatus, listSmartScmItems, updateSmartScmItem } from "./smart-scm-item-repository.js";
 import { refreshSmartScmLiveData } from "./smart-scm-sync-service.js";
-import { completeSmartScmTransferExecution, failSmartScmTransferExecution, getSmartScmProposal, markSmartScmTransferAttention, prepareSmartScmTransferExecution, recordSmartScmVendorResponses, updateSmartScmProposal } from "./smart-scm-planning-repository.js";
+import { completeSmartScmTransferExecution, failSmartScmTransferExecution, getSmartScmProposal, markSmartScmTransferAttention, prepareSmartScmTransferExecution, recordSmartScmVendorResponses, setSmartScmPalletQuantityOverride, updateSmartScmProposal } from "./smart-scm-planning-repository.js";
 import { createSimplePdf, leaseYardPrintJob, listSmartScmPrintJobs, listYardPrinters, queueSmartScmPrintJob, queueYardPrinterTest, retrySmartScmPrintJob, rotateYardPrinterToken, updateLeasedPrintJob, updateYardPrinter, yardPrintJobDocument } from "./smart-scm-print-repository.js";
-import { addSmartScmVendorAlternativeLine, listSmartScmVendorReplyLoads, removeSmartScmVendorAlternativeLine, saveSmartScmVendorReplyLoad, searchSmartScmVendorAlternatives } from "./smart-scm-vendor-repository.js";
-import { addSmartScmProposalLine, groupSmartScmProposals, recalculateSmartScmPoProposal, removeSmartScmProposalLine, searchSmartScmProposalItems, updateSmartScmProposalLine } from "./smart-scm-proposal-editor.js";
+import { addSmartScmVendorAlternativeLine, listSmartScmNetSuitePoReviewLoads, listSmartScmVendorReplyLoads, removeSmartScmVendorAlternativeLine, saveSmartScmVendorReplyLoad, searchSmartScmVendorAlternatives, stageSmartScmVendorReplyLoad, updateSmartScmNetSuitePoReviewPalletQuantity } from "./smart-scm-vendor-repository.js";
+import { addSmartScmProposalLine, createSmartScmManualLoad, groupSmartScmProposals, recalculateSmartScmPoProposal, removeSmartScmProposalLine, searchSmartScmManualLoadItems, searchSmartScmProposalItems, splitSmartScmProposalLine, updateSmartScmProposalLine } from "./smart-scm-proposal-editor.js";
 import { listSmartScmRouteRules, upsertSmartScmRouteRule } from "./smart-scm-route-repository.js";
 import { changedLockedLoadAssignments, dispatchLoadAssignment, normalizeDispatchPlanLoadAssignments, validateDispatchLoadAssignments } from "./dispatch-load-assignment.js";
 
@@ -292,15 +297,37 @@ function sendDispatchDuplicateDriverResponse(res, duplicates = []) {
 
 async function dispatchLoadAssignmentConflicts(previousPlan = {}, nextPlan = {}, { requireAssignments = false } = {}) {
   if (!config.dispatch?.driverOrientedPlanning) return [];
-  const setup = await readDispatchSetup();
+  const setup = await readDispatchSetup({ includeInactive: true });
   const normalized = normalizeDispatchPlanLoadAssignments(nextPlan);
+  let statuses = [];
+  let allowedInactiveLoadIds = new Set();
+  if (previousPlan?.id) {
+    statuses = await listDriverJobStatuses({ planId: previousPlan.id });
+    const completed = await query(
+      `SELECT load_id
+         FROM dispatch_plan_load_assignments
+        WHERE plan_id = $1
+          AND completed = true`,
+      [previousPlan.id]
+    );
+    allowedInactiveLoadIds = unchangedCompletedDispatchLoadIds(
+      previousPlan,
+      normalized,
+      completed.rows.map((row) => row.load_id)
+    );
+  }
   const conflicts = validateDispatchLoadAssignments(normalized, {
     switchMinutes: setup.planning?.truckSwitchMinutes ?? 10,
     ownYards: (setup.ownYards || []).map((yard) => String(yard.code || yard.name || "")).filter(Boolean),
     requireAssignments
   });
+  conflicts.push(...dispatchFleetAssignmentStatusConflicts(normalized, {
+    drivers: setup.drivers,
+    trucks: setup.trucks
+  }, {
+    allowedInactiveLoadIds
+  }));
   if (!previousPlan?.id) return conflicts;
-  const statuses = await listDriverJobStatuses({ planId: previousPlan.id });
   const lockedLoadIds = new Set(statuses
     .filter((status) => ["in_progress", "complete"].includes(String(status.status || "")))
     .map((status) => String(status.load_id || status.loadId || ""))
@@ -472,7 +499,7 @@ function isSnapshotDerivedDispatchOrder(order = {}) {
 
 async function listDispatchSnapshotDerivedOrders({ type = null } = {}) {
   const sandbox = isNetSuiteSandboxEnvironment();
-  const [result, inactiveSplits] = await Promise.all([
+  const [result, inactiveSplits, blanketPurchaseOrders] = await Promise.all([
     query(
     `SELECT p.id, p.plan_date::text AS plan_date, p.updated_at, s.orders
        FROM dispatch_plans p
@@ -484,9 +511,17 @@ async function listDispatchSnapshotDerivedOrders({ type = null } = {}) {
       `SELECT tranid FROM sales_orders WHERE tranid LIKE '%-S%' AND netsuite_active = false
        UNION
        SELECT tranid FROM transfer_orders WHERE tranid LIKE '%-S%' AND netsuite_active = false`
+    ),
+    query(
+      `SELECT tranid, dispatch_ref
+         FROM purchase_orders
+        WHERE is_blanket_po = true`
     )
   ]);
   const inactiveSplitRefs = new Set(inactiveSplits.rows.map((row) => String(row.tranid || "")));
+  const blanketPurchaseOrderRefs = new Set(blanketPurchaseOrders.rows.flatMap((row) => [row.tranid, row.dispatch_ref])
+    .map((ref) => String(ref || "").trim().toLowerCase())
+    .filter(Boolean));
   const derivedOrders = new Map();
   const wantedType = type ? String(type).toUpperCase() : "";
   for (const row of result.rows) {
@@ -494,6 +529,7 @@ async function listDispatchSnapshotDerivedOrders({ type = null } = {}) {
       if (!isSnapshotDerivedDispatchOrder(order)) continue;
       if (wantedType && String(order?.type || "").toUpperCase() !== wantedType) continue;
       const id = String(order?.id || "").trim();
+      if (String(order?.type || "").toUpperCase() === "PO" && blanketPurchaseOrderRefs.has(id.toLowerCase())) continue;
       const fixtureRefs = [id, order?.originalOrderId, ...(Array.isArray(order?.childOrders) ? order.childOrders : [])]
         .map((value) => String(value || "").trim());
       if (!sandbox && fixtureRefs.some((value) => /^TSTDEP-SO-/i.test(value))) continue;
@@ -1023,13 +1059,15 @@ async function executeSmartScmTransferProposal(proposalId, operator) {
           destinationLocationId: prepared.destinationLocationId,
           destinationLocation: prepared.destinationName
         }),
-        resolvePalletItemFromNetSuite()
+        Number(prepared.palletTransferQuantity) > 0
+          ? resolvePalletItemFromNetSuite()
+          : Promise.resolve(null)
       ]);
       const payload = buildTransferDependencyRestPayload({
         proposal: {
           lines: prepared.lines,
-          palletItemId: palletItem.id,
-          palletTransferQuantity: prepared.totalPallets,
+          palletItemId: palletItem?.id ?? null,
+          palletTransferQuantity: prepared.palletTransferQuantity,
           memo: `${prepared.memo || "Smart SCM replenishment"} | MBBS-SCM:${prepared.id}`
         },
         batch: { id: `smart-${prepared.id}`, salesOrderRef: `Smart SCM run ${prepared.runId}` },
@@ -1061,7 +1099,8 @@ async function executeSmartScmTransferProposal(proposalId, operator) {
           `Reference: ${transferOrderRef}`,
           `From: ${prepared.sourceName}`,
           `To: ${prepared.destinationName}`,
-          `Pallets: ${prepared.totalPallets}`,
+          `Material pallets: ${prepared.totalPallets}`,
+          `PALLET item: ${prepared.palletTransferQuantity}`,
           ...prepared.lines.map((line) => `${line.itemName}: ${line.palletQty} PLT`),
           "No NetSuite record was created."
         ])
@@ -1433,6 +1472,63 @@ async function applyDispatchPlanCoAssignments(plan = {}) {
     );
   }
   return { planned: refs.length, cleared: cleared.rowCount };
+}
+
+async function runDispatchPlanPostCommitFollowup({
+  plan,
+  committedAction,
+  stage,
+  code,
+  label,
+  sessionId = "",
+  operator = null,
+  followupWarnings
+}, callback) {
+  try {
+    return await callback();
+  } catch (error) {
+    const errorMessage = String(error?.message || error || "Unknown error").trim() || "Unknown error";
+    const warning = {
+      code,
+      stage,
+      step: stage,
+      label,
+      message: errorMessage,
+      summary: `${label} failed after the dispatch plan was ${committedAction}. The plan itself was ${committedAction} successfully.`
+    };
+    followupWarnings.push(warning);
+    console.error(
+      `Dispatch plan ${committedAction} follow-up failed (${stage}) for plan ${plan?.id || "unknown"} revision ${plan?.revision || "unknown"}:`,
+      error
+    );
+    await writeDispatchAudit({
+      action: "dispatch_plan_followup_failed",
+      entityType: "plan",
+      entityId: String(plan?.id || ""),
+      planId: plan?.id,
+      planDate: plan?.planDate,
+      sessionId,
+      operatorId: operator?.id,
+      operatorName: operator?.display_name || operator?.username,
+      source: "dispatch",
+      after: {
+        revision: plan?.revision,
+        status: plan?.status,
+        savedAt: plan?.savedAt
+      },
+      details: {
+        committedAction,
+        warning,
+        errorName: String(error?.name || "Error")
+      }
+    }).catch((auditError) => {
+      console.error(
+        `Dispatch plan follow-up failure audit could not be written for plan ${plan?.id || "unknown"} (${stage}):`,
+        auditError
+      );
+    });
+    return null;
+  }
 }
 
 function shippedDispatchCsv(plan, driverJobStatuses = []) {
@@ -2431,18 +2527,27 @@ async function withTimeout(promise, ms) {
   return result;
 }
 
-async function readDispatchSetup() {
+async function readDispatchSetup({ includeInactive = false } = {}) {
   const text = await fs.readFile(dispatchSetupPath, "utf8").catch((error) => {
     if (error.code === "ENOENT") return "";
     throw error;
   });
   const saved = text ? JSON.parse(text) : {};
-  let [drivers, trucks] = await Promise.all([listDispatchDrivers(), listDispatchTrucks()]);
+  let [allDrivers, allTrucks] = await Promise.all([
+    listDispatchDrivers({ activeOnly: false }),
+    listDispatchTrucks({ activeOnly: false })
+  ]);
   const seedDrivers = Array.isArray(saved.drivers) ? saved.drivers : defaultDispatchSetup.drivers;
   const seedTrucks = Array.isArray(saved.trucks) ? saved.trucks : defaultDispatchSetup.trucks;
-  if ((!drivers.length && seedDrivers.length) || (!trucks.length && seedTrucks.length)) {
-    ({ drivers, trucks } = await ensureDispatchFleetSetup({ drivers: seedDrivers, trucks: seedTrucks }));
+  if ((!allDrivers.length && seedDrivers.length) || (!allTrucks.length && seedTrucks.length)) {
+    await ensureDispatchFleetSetup({ drivers: seedDrivers, trucks: seedTrucks });
+    [allDrivers, allTrucks] = await Promise.all([
+      listDispatchDrivers({ activeOnly: false }),
+      listDispatchTrucks({ activeOnly: false })
+    ]);
   }
+  const drivers = includeInactive ? allDrivers : allDrivers.filter((driver) => driver.active !== false);
+  const trucks = includeInactive ? allTrucks : allTrucks.filter((truck) => truck.active !== false);
   return {
     drivers,
     trucks,
@@ -2494,13 +2599,63 @@ function validateDispatchSetupDrivers(drivers = []) {
   }
 }
 
-async function writeDispatchSetup(patch = {}) {
-  const current = await readDispatchSetup();
-  const requestedDrivers = Array.isArray(patch.drivers) ? patch.drivers : current.drivers;
-  const requestedTrucks = Array.isArray(patch.trucks) ? patch.trucks : current.trucks;
+async function writeDispatchSetup(patch = {}, { includeInactive = false } = {}) {
+  const current = await readDispatchSetup({ includeInactive });
+  const currentDriversById = new Map((current.drivers || []).map((driver) => [String(driver.id || ""), driver]).filter(([id]) => id));
+  const currentDriversByLogin = new Map((current.drivers || []).map((driver) => [String(driver.login || "").trim().toLowerCase(), driver]).filter(([login]) => login));
+  const currentTrucksById = new Map((current.trucks || []).map((truck) => [String(truck.id || ""), truck]).filter(([id]) => id));
+  const currentTrucksByPlate = new Map((current.trucks || []).map((truck) => [normalizedPlate(truck.plate), truck]).filter(([plate]) => plate));
+  const requestedDrivers = Array.isArray(patch.drivers)
+    ? patch.drivers.map((driver) => {
+        const existing = currentDriversById.get(String(driver?.id || ""))
+          || currentDriversByLogin.get(String(driver?.login || "").trim().toLowerCase());
+        return { ...driver, active: existing ? existing.active !== false : true };
+      })
+    : current.drivers;
+  const requestedTrucks = Array.isArray(patch.trucks)
+    ? patch.trucks.map((truck) => {
+        const existing = currentTrucksById.get(String(truck?.id || ""))
+          || currentTrucksByPlate.get(normalizedPlate(truck?.plate));
+        return { ...truck, active: existing ? existing.active !== false : true };
+      })
+    : current.trucks;
   validateDispatchSetupDrivers(requestedDrivers);
+  const driverRenames = requestedDrivers.map((driver) => {
+    const existing = currentDriversById.get(String(driver?.id || ""))
+      || currentDriversByLogin.get(String(driver?.login || "").trim().toLowerCase());
+    return existing && String(existing.name || "").trim() !== String(driver?.name || "").trim()
+      ? {
+          id: existing.id,
+          login: existing.login,
+          previousName: existing.name,
+          nextName: driver.name
+        }
+      : null;
+  }).filter(Boolean);
+  if (driverRenames.length) {
+    const futurePlans = await query(
+      `SELECT p.id, p.plan_date::text, p.status, s.trucks
+         FROM dispatch_plans p
+         JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+        WHERE p.plan_date >= $1::date
+          AND lower(p.status) NOT IN ('cancelled', 'canceled', 'archived')
+        ORDER BY p.plan_date, p.id`,
+      [localDateDaysAgo(0)]
+    );
+    const renameConflicts = dispatchLegacyDriverRenameConflicts(futurePlans.rows, driverRenames);
+    if (renameConflicts.length) {
+      const error = new Error(renameConflicts[0].message);
+      error.status = 409;
+      error.code = "DISPATCH_DRIVER_LEGACY_NAME_IN_USE";
+      error.conflicts = renameConflicts;
+      throw error;
+    }
+  }
   const fleet = Array.isArray(patch.drivers) || Array.isArray(patch.trucks)
-    ? await replaceDispatchFleetSetup({ drivers: requestedDrivers, trucks: requestedTrucks })
+    ? await replaceDispatchFleetSetup(
+        { drivers: requestedDrivers, trucks: requestedTrucks },
+        { activeOnly: !includeInactive, deactivateMissing: false }
+      )
     : { drivers: current.drivers, trucks: current.trucks };
   const configPayload = {
     ownYards: Array.isArray(patch.ownYards) ? patch.ownYards : current.ownYards,
@@ -2524,6 +2679,176 @@ async function writeDispatchSetup(patch = {}) {
   await fs.mkdir(dataDir, { recursive: true });
   await fs.writeFile(dispatchSetupPath, `${JSON.stringify(configPayload, null, 2)}\n`);
   return payload;
+}
+
+async function dispatchFleetDisableConflicts({ driver = null, truck = null } = {}) {
+  const today = localDateDaysAgo(0);
+  const planRows = await query(
+    `SELECT p.id, p.plan_date::text, p.status, s.orders, s.trucks, s.summary
+       FROM dispatch_plans p
+       JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+      WHERE p.plan_date >= $1::date
+        AND lower(p.status) NOT IN ('cancelled', 'canceled', 'archived')
+      ORDER BY p.plan_date ASC, p.id ASC`,
+    [today]
+  );
+  const todayPlans = planRows.rows.filter((row) => String(row.plan_date || "").slice(0, 10) === today);
+  for (const row of todayPlans) {
+    await syncDispatchPlanLoadAssignments({
+      id: row.id,
+      planDate: row.plan_date,
+      orders: row.orders || [],
+      trucks: row.trucks || [],
+      summary: row.summary || {}
+    });
+  }
+  if (todayPlans.length) {
+    const completed = await query(
+      `SELECT plan_id::text, array_agg(load_id ORDER BY load_id) FILTER (WHERE completed = true) AS completed_load_ids
+         FROM dispatch_plan_load_assignments
+        WHERE plan_id = ANY($1::bigint[])
+        GROUP BY plan_id`,
+      [todayPlans.map((row) => String(row.id))]
+    );
+    const completedByPlan = new Map(completed.rows.map((row) => [String(row.plan_id), row.completed_load_ids || []]));
+    for (const row of todayPlans) row.completedLoadIds = completedByPlan.get(String(row.id)) || [];
+  }
+  const driverLogin = String(driver?.login || "").trim().toLowerCase();
+  const truckPlate = normalizedPlate(truck?.plate);
+  const resourceLabel = driver?.name || driver?.login || truck?.plate || "This resource";
+  const conflicts = dispatchFleetPlanConflicts(planRows.rows, {
+    driver,
+    truck,
+    drivers: driver ? await listDispatchDrivers({ activeOnly: false }) : null,
+    trucks: truck ? await listDispatchTrucks({ activeOnly: false }) : null
+  });
+
+  if (driver) {
+    const onDuty = await query(
+        `SELECT plan_date::text, current_load_id
+           FROM driver_day_records
+          WHERE lower(driver_login) = $1
+            AND on_duty_at IS NOT NULL
+            AND off_duty_at IS NULL
+          ORDER BY plan_date DESC
+          LIMIT 5`,
+        [driverLogin]
+      );
+    const activeJobs = await query(
+        `SELECT plan_date::text, load_id, load_name, job_id
+           FROM driver_job_records
+          WHERE lower(driver_login) = $1
+            AND status = 'in_progress'
+          ORDER BY started_at DESC NULLS LAST
+          LIMIT 5`,
+        [driverLogin]
+      );
+    const switches = await query(
+        `SELECT plan_date::text, next_load_id, job_id, status
+           FROM driver_truck_switch_records
+          WHERE lower(driver_login) = $1
+            AND status IN ('pending', 'attention')
+          ORDER BY plan_date DESC
+          LIMIT 5`,
+        [driverLogin]
+      );
+    for (const row of onDuty.rows) conflicts.push({
+      type: "on_duty",
+      planDate: String(row.plan_date || "").slice(0, 10),
+      loadId: row.current_load_id || "",
+      message: `${resourceLabel} is currently on duty.`
+    });
+    for (const row of activeJobs.rows) conflicts.push({
+      type: "active_job",
+      planDate: String(row.plan_date || "").slice(0, 10),
+      loadId: row.load_id || "",
+      jobId: row.job_id || "",
+      message: `${resourceLabel} has an in-progress driver job${row.load_name ? ` on ${row.load_name}` : ""}.`
+    });
+    for (const row of switches.rows) conflicts.push({
+      type: "truck_switch",
+      planDate: String(row.plan_date || "").slice(0, 10),
+      loadId: row.next_load_id || "",
+      jobId: row.job_id || "",
+      message: `${resourceLabel} has a ${row.status} truck switch.`
+    });
+  }
+
+  if (truck) {
+    const activeJobs = await query(
+        `SELECT plan_date::text, load_id, load_name, job_id
+           FROM driver_job_records
+          WHERE upper(regexp_replace(COALESCE(truck_plate, ''), '\\s+', '', 'g')) = $1
+            AND status = 'in_progress'
+          ORDER BY started_at DESC NULLS LAST
+          LIMIT 5`,
+        [truckPlate]
+      );
+    const activeDays = await query(
+        `SELECT plan_date::text, current_load_id, driver_login
+           FROM driver_day_records
+          WHERE upper(regexp_replace(COALESCE(NULLIF(current_truck_plate, ''), truck_plate, ''), '\\s+', '', 'g')) = $1
+            AND on_duty_at IS NOT NULL
+            AND off_duty_at IS NULL
+          ORDER BY plan_date DESC
+          LIMIT 5`,
+        [truckPlate]
+      );
+    const switches = await query(
+        `SELECT plan_date::text, next_load_id, job_id, status
+           FROM driver_truck_switch_records
+          WHERE status IN ('pending', 'attention')
+            AND (
+              upper(regexp_replace(COALESCE(from_truck_plate, ''), '\\s+', '', 'g')) = $1
+              OR upper(regexp_replace(COALESCE(to_truck_plate, ''), '\\s+', '', 'g')) = $1
+            )
+          ORDER BY plan_date DESC
+          LIMIT 5`,
+        [truckPlate]
+      );
+    for (const row of activeJobs.rows) conflicts.push({
+      type: "active_job",
+      planDate: String(row.plan_date || "").slice(0, 10),
+      loadId: row.load_id || "",
+      jobId: row.job_id || "",
+      message: `${resourceLabel} has an in-progress driver job${row.load_name ? ` on ${row.load_name}` : ""}.`
+    });
+    for (const row of activeDays.rows) conflicts.push({
+      type: "on_duty",
+      planDate: String(row.plan_date || "").slice(0, 10),
+      loadId: row.current_load_id || "",
+      message: `${resourceLabel} is assigned to on-duty driver ${row.driver_login}.`
+    });
+    for (const row of switches.rows) conflicts.push({
+      type: "truck_switch",
+      planDate: String(row.plan_date || "").slice(0, 10),
+      loadId: row.next_load_id || "",
+      jobId: row.job_id || "",
+      message: `${resourceLabel} has a ${row.status} truck switch.`
+    });
+  }
+
+  const seen = new Set();
+  return conflicts.filter((conflict) => {
+    const key = [conflict.type, conflict.planId, conflict.planDate, conflict.loadId, conflict.jobId, conflict.message].join("|");
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function revokeDispatchDriverSessions(login) {
+  const normalizedLogin = String(login || "").trim().toLowerCase();
+  for (const [token, session] of driverSessions.entries()) {
+    if (String(session?.login || "").trim().toLowerCase() === normalizedLogin) driverSessions.delete(token);
+  }
+}
+
+async function withDispatchFleetPlanningLock(callback) {
+  return withTransaction(async () => {
+    await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
+    return callback();
+  });
 }
 
 function dispatchOrderStructureState(plan = {}) {
@@ -2672,6 +2997,53 @@ async function syncDeliveryLocation(locationId, { includeDetails = true, orderTy
 
 let syncRunning = false;
 let activeSyncRun = null;
+let targetedSyncRunning = false;
+
+async function findLocalTargetedOrder({ orderType, orderRef }) {
+  const table = {
+    sales_order: "sales_orders",
+    purchase_order: "purchase_orders",
+    transfer_order: "transfer_orders"
+  }[orderType];
+  if (!table) return null;
+  const result = await query(
+    `SELECT netsuite_id AS id, tranid, status, status_text
+       FROM ${table}
+      WHERE upper(tranid) = upper($1)
+        AND netsuite_id > 0
+      ORDER BY synced_at DESC
+      LIMIT 1`,
+    [orderRef]
+  );
+  return result.rows[0] || null;
+}
+
+const targetedOrderSyncDependencies = {
+  findLocalOrder: findLocalTargetedOrder,
+  findNetSuiteOrder: ({ orderRef, netSuiteType }) => fetchTransactionReferenceByTranidFromNetSuite(orderRef, netSuiteType),
+  fetchSalesOrder: fetchSalesOrderReferenceFromNetSuite,
+  fetchSalesOrderLines: fetchDeliveryOrderDetailsFromNetSuite,
+  upsertSalesOrders,
+  upsertSalesOrderLines,
+  markMissingOutboundOrderLines,
+  fetchPurchaseOrder: fetchPurchaseOrderReferenceFromNetSuite,
+  fetchPurchaseOrderLines: fetchPurchaseOrderDetailsFromNetSuite,
+  upsertPurchaseOrders,
+  upsertPurchaseOrderLines,
+  markMissingInboundOrderLines,
+  fetchTransferOrder: fetchTransferOrderByIdFromNetSuite,
+  fetchTransferOrderLines: fetchTransferOrderDetailsFromNetSuite,
+  upsertOutboundTransferOrders,
+  upsertInboundTransferOrders,
+  upsertOutboundTransferOrderLines,
+  upsertInboundTransferOrderLines,
+  writeAudit,
+  emitEvent: emitAppEvent
+};
+
+function anyNetSuiteSyncRunning() {
+  return syncRunning || Boolean(activeSyncRun) || targetedSyncRunning;
+}
 
 class DispatchSyncStoppedError extends Error {
   constructor(message) {
@@ -2709,7 +3081,7 @@ function syncAuditAction(source, { failed = false, stopped = false } = {}) {
 }
 
 async function runDispatchSync({ source = "manual", actorOperatorId = null, orderScope = "all" } = {}) {
-  if (syncRunning) {
+  if (anyNetSuiteSyncRunning()) {
     return { skipped: true, reason: "sync_running" };
   }
   syncRunning = true;
@@ -2813,7 +3185,7 @@ async function stopDispatchSync({ actorOperatorId = null, reason = "Stopped manu
 }
 
 async function clearOperationalOrderData({ actorOperatorId = null } = {}) {
-  if (syncRunning || activeSyncRun) {
+  if (anyNetSuiteSyncRunning()) {
     throw new Error("Stop the current sync before clearing order data.");
   }
   const tables = [
@@ -3354,7 +3726,7 @@ async function reconcileNetSuiteProgress({ actorOperatorId = null } = {}) {
 }
 
 async function runNetSuiteProgressReconcile({ source = "control_reconcile", actorOperatorId = null } = {}) {
-  if (syncRunning) return { skipped: true, reason: "sync_running" };
+  if (anyNetSuiteSyncRunning()) return { skipped: true, reason: "sync_running" };
   syncRunning = true;
   const runId = crypto.randomUUID();
   const settings = (await readDispatchSetup()).sync;
@@ -4261,6 +4633,8 @@ app.use((req, res, next) => {
   if (req.path === "/service-worker.js") {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
     res.setHeader("Service-Worker-Allowed", "/");
+  } else if (["/scm/netsuite-po", "/scm-netsuite-po.html", "/scm/vendors", "/scm-vendors.html"].includes(req.path)) {
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   } else if (req.path.endsWith(".webmanifest") || ["/", "/operator", "/driver", "/control", "/admin", "/admin/printers", "/dispatch", "/sales", "/sales/planning", "/sales/schedule", "/sales/monitor", "/sales/printing", "/dispatch/loaded-export", "/dispatch/po-to-schedule", "/scm/smart", "/scm/printers", "/scm/route-rules", "/operator.html", "/driver.html", "/control.html", "/admin.html", "/dispatch-menu.html", "/sales.html", "/sales-printing.html", "/dispatch-loaded-export.html", "/scm-smart.html", "/scm-printers.html", "/scm-route-rules.html"].includes(req.path)) {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   }
@@ -4595,6 +4969,30 @@ app.get("/api/scm/smart/planning-runs/:id", async (req, res, next) => {
   }
 });
 
+app.post("/api/scm/smart/planning-runs/:id/proposals", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const run = await createSmartScmManualLoad(req.params.id, req.body || {}, operatorId(req));
+    emitAppEvent("scm.smart.updated", { source: "manual-proposal-load", planningRunId: run.id });
+    res.status(201).json(run);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/smart/manual-load/items", async (req, res, next) => {
+  try {
+    res.json(await searchSmartScmManualLoadItems({
+      proposalType: req.query.proposalType,
+      sourceLocationId: req.query.sourceLocationId,
+      destinationLocationId: req.query.destinationLocationId,
+      search: req.query.search,
+      limit: req.query.limit
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/scm/smart/proposals", async (req, res, next) => {
   try {
     res.json(await listSmartScmProposals({
@@ -4624,6 +5022,16 @@ app.post("/api/scm/smart/proposals/:id/recalculate-po", requireSmartScmWriteAcce
     const run = await recalculateSmartScmPoProposal(req.params.id, operatorId(req));
     emitAppEvent("scm.smart.updated", { source: "po-proposal-recalculate", planningRunId: run.id });
     res.json(run);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.patch("/api/scm/smart/proposals/:id/pallets/:destinationLocationId", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const proposal = await setSmartScmPalletQuantityOverride(req.params.id, req.params.destinationLocationId, req.body || {}, operatorId(req));
+    emitAppEvent("scm.smart.updated", { source: "proposal-pallet-quantity", proposalId: proposal.id });
+    res.json(proposal);
   } catch (error) {
     next(error);
   }
@@ -4666,6 +5074,16 @@ app.patch("/api/scm/smart/proposals/:id/lines/:lineId", requireSmartScmWriteAcce
     const proposal = await updateSmartScmProposalLine(req.params.id, req.params.lineId, req.body || {}, operatorId(req));
     emitAppEvent("scm.smart.updated", { source: "proposal-line", proposalId: proposal.id });
     res.json(proposal);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/smart/proposals/:id/lines/:lineId/split", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const run = await splitSmartScmProposalLine(req.params.id, req.params.lineId, req.body || {}, operatorId(req));
+    emitAppEvent("scm.smart.updated", { source: "proposal-line-split", proposalId: Number(req.params.id), planningRunId: run.id });
+    res.status(201).json(run);
   } catch (error) {
     next(error);
   }
@@ -4748,6 +5166,63 @@ app.delete("/api/scm/smart/vendor-reply-loads/:id/lines/:lineId", requireSmartSc
 });
 
 app.post("/api/scm/smart/vendor-reply-loads/:id/confirm", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const result = await stageSmartScmVendorReplyLoad(req.params.id, req.body || {}, operatorId(req));
+    const messages = [];
+    if (result.reviewProposalId) messages.push("Confirmed lines were staged for NetSuite PO review.");
+    else messages.push("Vendor decisions were applied. No NetSuite PO review was created.");
+    if (result.heldProposalIds?.length) messages.push(`${result.heldProposalIds.length} held line(s) were split into separate Vendor Replies loads.`);
+    if (result.cancelledProposalId) messages.push("Cancelled and unused Hold quantities were finalized at 0 PLT with history retained.");
+    emitAppEvent("scm.smart.updated", {
+      source: "vendor-reply-staged",
+      proposalId: result.sourceProposalId,
+      planningRunId: result.runId,
+      reviewProposalId: result.reviewProposalId,
+      cancelledProposalId: result.cancelledProposalId,
+      heldProposalIds: result.heldProposalIds
+    });
+    res.status(201).json({
+      ...result,
+      message: messages.join(" ")
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/smart/netsuite-purchase-orders", async (req, res, next) => {
+  try {
+    res.json(await listSmartScmNetSuitePoReviewLoads({
+      search: req.query.search,
+      view: req.query.view,
+      limit: req.query.limit
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.patch("/api/scm/smart/netsuite-purchase-orders/:id/pallets/:destinationLocationId", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const review = await updateSmartScmNetSuitePoReviewPalletQuantity(
+      req.params.id,
+      req.params.destinationLocationId,
+      req.body || {},
+      operatorId(req)
+    );
+    emitAppEvent("scm.smart.updated", {
+      source: "netsuite-po-pallet-override",
+      proposalId: review.id,
+      planningRunId: review.runId,
+      destinationLocationId: Number(req.params.destinationLocationId)
+    });
+    res.json(review);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/smart/netsuite-purchase-orders/:id/insert", requireSmartScmWriteAccess, async (req, res, next) => {
   try {
     const result = await executeSmartScmPurchaseProposal(req.params.id, operatorId(req));
     emitAppEvent("scm.smart.updated", { source: "smart-scm-purchase", proposalId: result.proposalId, purchaseOrderId: result.purchaseOrderId, purchaseOrderRef: result.purchaseOrderRef });
@@ -4867,6 +5342,106 @@ app.post("/api/scm/smart/print-jobs/:id/retry", requireSmartScmWriteAccess, asyn
 app.use("/api/scm", requireOperator, requireScmAccess);
 app.use("/api/dispatch", requireOperator, requireDispatchAccess);
 app.use("/api/sales", requireOperator, requireSalesAccess);
+
+async function scmVendorManagementPayload() {
+  const [vendors, yards] = await Promise.all([
+    listDispatchLocalVendors(),
+    listDispatchVendorYards()
+  ]);
+  return { vendors, yards, weekDays: [...DISPATCH_VENDOR_WEEK_DAYS] };
+}
+
+app.get("/api/scm/local-vendors", async (req, res, next) => {
+  try {
+    res.json(await scmVendorManagementPayload());
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/local-vendors", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const name = String(req.body?.name || "").trim();
+    if (!name) return res.status(400).json({ error: "Local vendor name is required." });
+    const created = await createDispatchLocalVendor({ name, updatedBy: operatorId(req) });
+    await writeAudit({
+      actorOperatorId: operatorId(req),
+      source: "smart_scm",
+      action: "scm.local_vendor.create",
+      details: { localVendor: created }
+    });
+    emitAppEvent("dispatch.vendor_yard.updated", { source: "scm-local-vendor-create", localVendorId: created?.id });
+    res.json({ created, ...(await scmVendorManagementPayload()) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/scm/local-vendors/:id", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const name = String(req.body?.name || "").trim();
+    if (!name) return res.status(400).json({ error: "Local vendor name is required." });
+    const updated = await updateDispatchLocalVendor(req.params.id, {
+      name,
+      active: req.body?.active,
+      updatedBy: operatorId(req)
+    });
+    if (!updated) return res.status(404).json({ error: "Local vendor not found." });
+    const enriched = await refreshDispatchEnrichment({ force: true, delivery: false, receiving: true });
+    await writeAudit({
+      actorOperatorId: operatorId(req),
+      source: "smart_scm",
+      action: "scm.local_vendor.update",
+      details: { localVendor: updated, enriched }
+    });
+    emitAppEvent("dispatch.vendor_yard.updated", { source: "scm-local-vendor-update", localVendorId: req.params.id });
+    emitAppEvent("dispatch.orders.updated", { source: "scm-local-vendor-update", enriched });
+    res.json({ updated, enriched, ...(await scmVendorManagementPayload()) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+async function saveScmVendorYard(req, res, next) {
+  try {
+    const saved = await saveDispatchVendorYardSchedule({
+      localVendorId: req.params.id,
+      yardRowId: req.params.yardRowId || null,
+      yard: req.body?.yard,
+      aliases: req.body?.aliases,
+      address: req.body?.address,
+      days: req.body?.days,
+      updatedBy: operatorId(req)
+    });
+    const enriched = await refreshDispatchEnrichment({ force: true, delivery: false, receiving: true });
+    await writeAudit({
+      actorOperatorId: operatorId(req),
+      source: "smart_scm",
+      action: req.params.yardRowId ? "scm.local_vendor_yard.update" : "scm.local_vendor_yard.create",
+      details: {
+        localVendorId: req.params.id,
+        yardRowId: req.params.yardRowId || null,
+        yard: saved.yard,
+        previousYard: saved.previousYard,
+        activeDays: saved.rows.filter((row) => row.active).map((row) => row.dayLabel),
+        enriched
+      }
+    });
+    emitAppEvent("dispatch.vendor_yard.updated", {
+      source: "scm-local-vendor-yard",
+      localVendorId: req.params.id,
+      yard: saved.yard,
+      previousYard: saved.previousYard
+    });
+    emitAppEvent("dispatch.orders.updated", { source: "scm-local-vendor-yard", enriched });
+    res.json({ saved, enriched, ...(await scmVendorManagementPayload()) });
+  } catch (error) {
+    next(error);
+  }
+}
+
+app.post("/api/scm/local-vendors/:id/yards", requireSmartScmWriteAccess, saveScmVendorYard);
+app.put("/api/scm/local-vendors/:id/yards/:yardRowId", requireSmartScmWriteAccess, saveScmVendorYard);
 
 app.get("/api/dispatch/config", (req, res) => {
   res.json({
@@ -5549,11 +6124,34 @@ app.put("/api/dispatch/plans/:id", requireOperator, requireDispatcher, async (re
       planDate: req.body?.planDate || req.body?.date || "",
       sessionId: req.body?.audit?.sessionId || ""
     });
-    await syncOrderDependenciesFromDispatchPlan(plan);
-    const coAssignments = await applyDispatchPlanCoAssignments(plan);
-    const scmSchedule = await syncScmScheduleFromDispatchPlan(plan, {
+    const followupWarnings = [];
+    const followupContext = {
+      plan,
+      committedAction: "saved",
+      sessionId: req.body?.audit?.sessionId || "",
+      operator: req.operator,
+      followupWarnings
+    };
+    await runDispatchPlanPostCommitFollowup({
+      ...followupContext,
+      stage: "order_dependencies",
+      code: "DISPATCH_PLAN_DEPENDENCY_SYNC_FAILED",
+      label: "Order dependency synchronization"
+    }, () => syncOrderDependenciesFromDispatchPlan(plan));
+    const coAssignments = await runDispatchPlanPostCommitFollowup({
+      ...followupContext,
+      stage: "co_assignments",
+      code: "DISPATCH_PLAN_CO_ASSIGNMENT_FAILED",
+      label: "CO assignment synchronization"
+    }, () => applyDispatchPlanCoAssignments(plan));
+    const scmSchedule = await runDispatchPlanPostCommitFollowup({
+      ...followupContext,
+      stage: "scm_schedule",
+      code: "DISPATCH_PLAN_SCM_SYNC_FAILED",
+      label: "SCM schedule synchronization"
+    }, () => syncScmScheduleFromDispatchPlan(plan, {
       updatedBy: req.body?.audit?.sessionId || "dispatch-plan-save"
-    }).catch(() => null);
+    }));
     const changedOperatorRefs = [
       ...new Set([...changedDispatchOperatorRefs(previousPlan || {}, plan), ...explicitOperatorAlertRefs])
     ];
@@ -5561,9 +6159,14 @@ app.put("/api/dispatch/plans/:id", requireOperator, requireDispatcher, async (re
     const shouldApplyOperatorFlags = plan.status === "confirmed"
       && (changedOperatorRefs.length > 0 || dispatchOperatorImpactChanged(previousPlan || {}, plan));
     if (shouldApplyOperatorFlags) {
-      operatorFlags = await applyConfirmedDispatchPlanToDelivery(plan, {
+      operatorFlags = await runDispatchPlanPostCommitFollowup({
+        ...followupContext,
+        stage: "delivery_materialization",
+        code: "DISPATCH_PLAN_DELIVERY_MATERIALIZATION_FAILED",
+        label: "Delivery order materialization"
+      }, () => applyConfirmedDispatchPlanToDelivery(plan, {
         forceOrderRefs: changedOperatorRefs
-      });
+      }));
     }
     if (req.body?.audit) {
       await writeDispatchAudit({
@@ -5582,12 +6185,13 @@ app.put("/api/dispatch/plans/:id", requireOperator, requireDispatcher, async (re
           coAssignments,
           scmSchedule,
           operatorFlags,
-          operatorFlagsSkipped: plan.status === "confirmed" && !shouldApplyOperatorFlags
+          operatorFlagsSkipped: plan.status === "confirmed" && !shouldApplyOperatorFlags,
+          followupWarnings
         }
       }).catch(() => null);
     }
-    emitAppEvent("dispatch.plan.saved", { planId: plan.id, planDate: plan.planDate, savedAt: plan.savedAt, sourceSessionId: req.body?.audit?.sessionId, operatorFlags, changedOperatorRefs, refreshOrderPool, scmSchedule, forceSave });
-    res.json({ ...plan, operatorFlags, scmSchedule });
+    emitAppEvent("dispatch.plan.saved", { planId: plan.id, planDate: plan.planDate, savedAt: plan.savedAt, sourceSessionId: req.body?.audit?.sessionId, operatorFlags, changedOperatorRefs, refreshOrderPool, scmSchedule, forceSave, followupWarnings });
+    res.json({ ...plan, operatorFlags, scmSchedule, followupWarnings });
   } catch (error) {
     if (error instanceof DispatchPlanEditLeaseError) return sendDispatchPlanEditLeaseError(res, error);
     if (error instanceof DispatchPlanDateMismatchError) {
@@ -5714,11 +6318,41 @@ app.post("/api/dispatch/plans/:id/confirm", requireOperator, requireDispatcher, 
     const finalDependencyConflicts = await validateDispatchPlanDependencies(planForConfirm);
     if (finalDependencyConflicts.length) return sendDispatchDependencyConflictResponse(res, finalDependencyConflicts);
     const plan = await confirmDispatchPlan(req.params.id, { note: req.body?.note || "" });
-    await syncOrderDependenciesFromDispatchPlan(plan);
-    const coAssignments = await applyDispatchPlanCoAssignments(plan);
-    const scmSchedule = await syncScmScheduleFromDispatchPlan(plan, { updatedBy: req.body?.audit?.sessionId || "dispatch-plan-confirm" }).catch(() => null);
+    const followupWarnings = [];
+    const followupContext = {
+      plan,
+      committedAction: "confirmed",
+      sessionId: req.body?.audit?.sessionId || "",
+      operator: req.operator,
+      followupWarnings
+    };
+    await runDispatchPlanPostCommitFollowup({
+      ...followupContext,
+      stage: "order_dependencies",
+      code: "DISPATCH_PLAN_DEPENDENCY_SYNC_FAILED",
+      label: "Order dependency synchronization"
+    }, () => syncOrderDependenciesFromDispatchPlan(plan));
+    const coAssignments = await runDispatchPlanPostCommitFollowup({
+      ...followupContext,
+      stage: "co_assignments",
+      code: "DISPATCH_PLAN_CO_ASSIGNMENT_FAILED",
+      label: "CO assignment synchronization"
+    }, () => applyDispatchPlanCoAssignments(plan));
+    const scmSchedule = await runDispatchPlanPostCommitFollowup({
+      ...followupContext,
+      stage: "scm_schedule",
+      code: "DISPATCH_PLAN_SCM_SYNC_FAILED",
+      label: "SCM schedule synchronization"
+    }, () => syncScmScheduleFromDispatchPlan(plan, {
+      updatedBy: req.body?.audit?.sessionId || "dispatch-plan-confirm"
+    }));
     const changedOperatorRefs = [...dispatchOperatorAssignmentMap(plan).keys()];
-    const operatorFlags = await applyConfirmedDispatchPlanToDelivery(plan, { forceOrderRefs: changedOperatorRefs });
+    const operatorFlags = await runDispatchPlanPostCommitFollowup({
+      ...followupContext,
+      stage: "delivery_materialization",
+      code: "DISPATCH_PLAN_DELIVERY_MATERIALIZATION_FAILED",
+      label: "Delivery order materialization"
+    }, () => applyConfirmedDispatchPlanToDelivery(plan, { forceOrderRefs: changedOperatorRefs }));
     await writeDispatchAudit({
       action: "dispatch_plan_confirmed",
       entityType: "plan",
@@ -5734,11 +6368,12 @@ app.post("/api/dispatch/plans/:id/confirm", requireOperator, requireDispatcher, 
         savedSnapshotBeforeConfirm: String(planForConfirm?.revision || "") !== String(previousPlan?.revision || ""),
         coAssignments,
         scmSchedule,
-        operatorFlags
+        operatorFlags,
+        followupWarnings
       }
     }).catch(() => null);
-    emitAppEvent("dispatch.plan.confirmed", { planId: plan.id, planDate: plan.planDate, sourceSessionId: req.body?.audit?.sessionId, operatorFlags, changedOperatorRefs, refreshOrderPool: true, scmSchedule });
-    res.json({ ...plan, operatorFlags, scmSchedule });
+    emitAppEvent("dispatch.plan.confirmed", { planId: plan.id, planDate: plan.planDate, sourceSessionId: req.body?.audit?.sessionId, operatorFlags, changedOperatorRefs, refreshOrderPool: true, scmSchedule, followupWarnings });
+    res.json({ ...plan, operatorFlags, scmSchedule, followupWarnings });
   } catch (error) {
     if (error instanceof DispatchPlanEditLeaseError) return sendDispatchPlanEditLeaseError(res, error);
     if (error instanceof DispatchPlanDateMismatchError) {
@@ -5830,23 +6465,122 @@ app.get("/api/dispatch/plan", async (req, res, next) => {
 
 app.get("/api/dispatch/setup", async (req, res, next) => {
   try {
-    res.json(await readDispatchSetup());
+    const includeInactive = ["1", "true", "yes"].includes(String(req.query.includeInactive || "").trim().toLowerCase());
+    if (includeInactive && !operatorHasAnyRole(req.operator, ["dispatcher", "admin"])) {
+      return sendRoleForbidden(res, req.operator, "Dispatcher account required");
+    }
+    res.json(await readDispatchSetup({ includeInactive }));
   } catch (error) {
     next(error);
   }
 });
 
-app.put("/api/dispatch/setup", async (req, res, next) => {
+app.put("/api/dispatch/setup", requireDispatcher, async (req, res, next) => {
   try {
-    const payload = await writeDispatchSetup({
-      drivers: Array.isArray(req.body?.drivers) ? req.body.drivers : [],
-      trucks: Array.isArray(req.body?.trucks) ? req.body.trucks : [],
-      ownYards: Array.isArray(req.body?.ownYards) ? req.body.ownYards : undefined,
-      samsara: req.body?.samsara || undefined,
-      planning: req.body?.planning || undefined
+    const payload = await withDispatchFleetPlanningLock(() => writeDispatchSetup({
+        drivers: Array.isArray(req.body?.drivers) ? req.body.drivers : [],
+        trucks: Array.isArray(req.body?.trucks) ? req.body.trucks : [],
+        ownYards: Array.isArray(req.body?.ownYards) ? req.body.ownYards : undefined,
+        samsara: req.body?.samsara || undefined,
+        planning: req.body?.planning || undefined
+      }, { includeInactive: true }));
+    emitAppEvent("dispatch.setup.updated", {
+      driverCount: payload.drivers.filter((driver) => driver.active !== false).length,
+      truckCount: payload.trucks.filter((truck) => truck.active !== false).length
     });
-    emitAppEvent("dispatch.setup.updated", { driverCount: payload.drivers.length, truckCount: payload.trucks.length });
     res.json(payload);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.patch("/api/dispatch/setup/drivers/:id/active", requireDispatcher, async (req, res, next) => {
+  try {
+    if (typeof req.body?.active !== "boolean") return res.status(400).json({ error: "active must be true or false." });
+    const change = await withDispatchFleetPlanningLock(async () => {
+      const drivers = await listDispatchDrivers({ activeOnly: false });
+      const current = drivers.find((driver) => String(driver.id) === String(req.params.id));
+      if (!current) return { notFound: true };
+      if (current.active === req.body.active) return { current, unchanged: true };
+      const conflicts = req.body.active ? [] : await dispatchFleetDisableConflicts({ driver: current });
+      if (conflicts.length) return { current, conflicts };
+      return { current, result: await setDispatchDriverActive(current.id, req.body.active) };
+    });
+    if (change.notFound) return res.status(404).json({ error: "Driver not found." });
+    if (change.unchanged) return res.json({ driver: change.current, unchanged: true });
+    if (change.conflicts?.length) {
+      return res.status(409).json({
+        code: "DISPATCH_FLEET_IN_USE",
+        error: `Cannot disable ${change.current.name || change.current.login}. Reassign or finish the active work first. ${change.conflicts[0].message}`,
+        conflicts: change.conflicts
+      });
+    }
+    const { result } = change;
+    if (!result) return res.status(404).json({ error: "Driver not found." });
+    if (!result.driver.active) revokeDispatchDriverSessions(result.driver.login);
+    await writeDispatchAudit({
+      action: result.driver.active ? "dispatch_driver_enabled" : "dispatch_driver_disabled",
+      entityType: "dispatch_driver",
+      entityId: result.driver.id,
+      operatorId: req.operator?.id,
+      operatorName: req.operator?.display_name || req.operator?.username,
+      source: "dispatch-setup",
+      before: result.before,
+      after: result.driver,
+      details: { login: result.driver.login }
+    }).catch(() => null);
+    emitAppEvent("dispatch.setup.updated", {
+      resourceType: "driver",
+      resourceId: result.driver.id,
+      active: result.driver.active
+    });
+    res.json({ driver: result.driver });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.patch("/api/dispatch/setup/trucks/:id/active", requireDispatcher, async (req, res, next) => {
+  try {
+    if (typeof req.body?.active !== "boolean") return res.status(400).json({ error: "active must be true or false." });
+    const change = await withDispatchFleetPlanningLock(async () => {
+      const trucks = await listDispatchTrucks({ activeOnly: false });
+      const current = trucks.find((truck) => String(truck.id) === String(req.params.id));
+      if (!current) return { notFound: true };
+      if (current.active === req.body.active) return { current, unchanged: true };
+      const conflicts = req.body.active ? [] : await dispatchFleetDisableConflicts({ truck: current });
+      if (conflicts.length) return { current, conflicts };
+      return { current, result: await setDispatchTruckActive(current.id, req.body.active) };
+    });
+    if (change.notFound) return res.status(404).json({ error: "Truck not found." });
+    if (change.unchanged) return res.json({ truck: change.current, unchanged: true });
+    if (change.conflicts?.length) {
+      return res.status(409).json({
+        code: "DISPATCH_FLEET_IN_USE",
+        error: `Cannot disable ${change.current.plate}. Reassign or finish the active work first. ${change.conflicts[0].message}`,
+        conflicts: change.conflicts
+      });
+    }
+    const { result } = change;
+    if (!result) return res.status(404).json({ error: "Truck not found." });
+    await writeDispatchAudit({
+      action: result.truck.active ? "dispatch_truck_enabled" : "dispatch_truck_disabled",
+      entityType: "dispatch_truck",
+      entityId: result.truck.id,
+      truckId: result.truck.id,
+      operatorId: req.operator?.id,
+      operatorName: req.operator?.display_name || req.operator?.username,
+      source: "dispatch-setup",
+      before: result.before,
+      after: result.truck,
+      details: { plate: result.truck.plate }
+    }).catch(() => null);
+    emitAppEvent("dispatch.setup.updated", {
+      resourceType: "truck",
+      resourceId: result.truck.id,
+      active: result.truck.active
+    });
+    res.json({ truck: result.truck });
   } catch (error) {
     next(error);
   }
@@ -6166,6 +6900,29 @@ app.put("/api/scm/transfer-dependencies/batches/:id", async (req, res, next) => 
   }
 });
 
+app.post("/api/scm/transfer-dependencies/batches/:id/proposals/merge", async (req, res, next) => {
+  try {
+    if (!operatorHasAnyRole(req.operator, ["admin", "scm", "scm_staff"])) {
+      return res.status(403).json({ error: "SCM write access required." });
+    }
+    const result = await mergeTransferDependencyProposals(
+      req.params.id,
+      req.body || {},
+      req.operator?.id
+    );
+    emitAppEvent("scm.transfer_dependency.updated", {
+      source: "proposals-merged",
+      batchId: result.batch.id,
+      orderId: result.batch.salesOrderRef,
+      proposalId: result.mergedProposalId,
+      sourceProposalIds: result.sourceProposalIds
+    });
+    return res.json(result);
+  } catch (error) {
+    return next(error);
+  }
+});
+
 app.delete("/api/scm/transfer-dependencies/batches/:id/proposals/:proposalId/lines/:lineId", async (req, res, next) => {
   try {
     if (!operatorHasAnyRole(req.operator, ["admin", "scm", "scm_staff"])) {
@@ -6304,6 +7061,40 @@ app.get("/api/scm/schedule", async (req, res, next) => {
       to: req.query.to || "",
       view: req.query.view || ""
     }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/scm/purchase-orders/:ref/blanket", async (req, res, next) => {
+  try {
+    if (!operatorHasAnyRole(req.operator, ["admin", "scm", "scm_staff"])) {
+      return res.status(403).json({ error: "SCM write access required." });
+    }
+    const operator = req.operator || await getOperatorByToken(bearerToken(req)).catch(() => null);
+    const isBlanket = req.body?.isBlanket === true || req.body?.is_blanket === true;
+    const updated = await setPurchaseOrderBlanketFlag(req.params.ref, {
+      isBlanket,
+      updatedBy: operator?.id || req.body?.audit?.sessionId || ""
+    });
+    await writeDispatchAudit({
+      action: "scm.purchase_order.blanket_flag_updated",
+      entityType: "purchase_order",
+      entityId: String(updated.netsuiteId || req.params.ref),
+      orderId: updated.orderRef || req.params.ref,
+      operatorId: operator?.id,
+      operatorName: operator?.display_name || operator?.username,
+      sessionId: req.body?.audit?.sessionId,
+      source: "scm-schedule",
+      after: updated,
+      details: { isBlanket: updated.isBlanket }
+    }).catch(() => null);
+    emitAppEvent("dispatch.orders.updated", {
+      source: "scm-blanket-po",
+      orderId: updated.dispatchRef || updated.orderRef,
+      refreshOrderPool: true
+    });
+    res.json({ updated });
   } catch (error) {
     next(error);
   }
@@ -6560,6 +7351,7 @@ app.get("/api/dispatch/scm/purchase-orders", async (req, res, next) => {
   try {
     res.json(await listScmPurchaseOrders({
       search: req.query.search || "",
+      poType: req.query.poType || "",
       dropoff: req.query.dropoff || "",
       vendor: req.query.vendor || "",
       pickupPoint: req.query.pickupPoint || ""
@@ -7392,6 +8184,14 @@ app.get("/scm/VRMA", (req, res) => {
 
 app.get("/scm/smart", (req, res) => {
   res.sendFile(path.join(publicDir, "scm-smart.html"));
+});
+
+app.get("/scm/netsuite-po", (req, res) => {
+  res.sendFile(path.join(publicDir, "scm-netsuite-po.html"));
+});
+
+app.get("/scm/vendors", (req, res) => {
+  res.sendFile(path.join(publicDir, "scm-vendors.html"));
 });
 
 app.get("/scm/printers", (req, res) => {
@@ -8619,7 +9419,7 @@ app.put("/api/control/vendor-mappings/:id", requireOperator, requireControlAcces
 
 app.put("/api/control/env-settings", requireOperator, requireAdmin, async (req, res, next) => {
   try {
-    if (syncRunning || activeSyncRun) return res.status(409).json({ error: "Stop the current sync before switching env file." });
+    if (anyNetSuiteSyncRunning()) return res.status(409).json({ error: "Stop the current sync before switching env file." });
     const settings = await selectEnvFile(req.body?.envFile, { applyNow: Boolean(req.body?.applyNow) });
     if (settings.appliedNow && settings.previousActiveEnvFile !== settings.activeEnvFile) {
       await pool.query("DELETE FROM netsuite_tokens");
@@ -8663,9 +9463,27 @@ app.put("/api/control/sync-settings", requireOperator, requireAdmin, async (req,
   }
 });
 
+app.post("/api/control/sync-order", requireOperator, requireAdmin, async (req, res, next) => {
+  if (anyNetSuiteSyncRunning()) {
+    return res.status(409).json({ error: "Another NetSuite sync is currently running. Wait for it to finish, then retry this order." });
+  }
+  targetedSyncRunning = true;
+  try {
+    const result = await syncTargetedNetSuiteOrder({
+      orderRef: req.body?.orderRef,
+      actorOperatorId: req.operator.id
+    }, targetedOrderSyncDependencies);
+    res.json(result);
+  } catch (error) {
+    next(error);
+  } finally {
+    targetedSyncRunning = false;
+  }
+});
+
 app.post("/api/control/sync-now", requireOperator, requireAdmin, async (req, res, next) => {
   try {
-    if (syncRunning || activeSyncRun) {
+    if (anyNetSuiteSyncRunning()) {
       return res.status(202).json({
         started: false,
         skipped: true,
@@ -8698,7 +9516,7 @@ app.post("/api/control/sync-now", requireOperator, requireAdmin, async (req, res
 
 app.post("/api/control/sync-transfer-orders", requireOperator, requireAdmin, async (req, res, next) => {
   try {
-    if (syncRunning || activeSyncRun) {
+    if (anyNetSuiteSyncRunning()) {
       return res.status(202).json({
         started: false,
         skipped: true,
@@ -8732,7 +9550,7 @@ app.post("/api/control/sync-transfer-orders", requireOperator, requireAdmin, asy
 
 app.post("/api/control/netsuite-progress/reconcile", requireOperator, requireAdmin, async (req, res, next) => {
   try {
-    if (syncRunning || activeSyncRun) {
+    if (anyNetSuiteSyncRunning()) {
       return res.status(202).json({
         started: false,
         skipped: true,
@@ -9984,7 +10802,11 @@ app.use((error, req, res, next) => {
   if (error instanceof DispatchPlanEditLeaseError) {
     return sendDispatchPlanEditLeaseError(res, error);
   }
-  res.status(error.status || 500).json({ error: error.message });
+  res.status(error.status || 500).json({
+    error: error.message,
+    ...(error.code ? { code: error.code } : {}),
+    ...(Array.isArray(error.conflicts) ? { conflicts: error.conflicts } : {})
+  });
 });
 
 export { app };

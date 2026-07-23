@@ -38,6 +38,7 @@ let expandedDispatchAuditId = "";
 let eventSource = null;
 let setupRefreshTimer = null;
 let draggedTruckSetupIndex = null;
+let draggedDriverSetupIndex = null;
 const WEEK_DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
 
 async function api(path, options = {}) {
@@ -48,7 +49,17 @@ async function api(path, options = {}) {
       ...(options.headers || {})
     }
   });
-  if (!response.ok) throw new Error(await response.text());
+  if (!response.ok) {
+    const text = await response.text();
+    let message = text || `Request failed (${response.status}).`;
+    try {
+      const payload = JSON.parse(text);
+      message = payload.error || payload.message || message;
+    } catch {
+      // Keep the plain-text response.
+    }
+    throw new Error(message);
+  }
   return response.json();
 }
 
@@ -64,7 +75,7 @@ async function loadVendorYards() {
 
 async function loadDispatchSetup() {
   try {
-    const setup = await api("/api/dispatch/setup");
+    const setup = await api("/api/dispatch/setup?includeInactive=true");
     if (Array.isArray(setup.drivers)) drivers = setup.drivers;
     if (Array.isArray(setup.trucks)) trucks = setup.trucks;
     if (Array.isArray(setup.ownYards)) ownYards = setup.ownYards;
@@ -73,6 +84,20 @@ async function loadDispatchSetup() {
   } catch (error) {
     setupNotice = `Dispatch setup failed to load: ${error.message}`;
   }
+}
+
+function setupRecordActive(record) {
+  return record?.active !== false;
+}
+
+function driverSetupRows() {
+  return drivers
+    .map((driver, canonicalIndex) => ({ driver, canonicalIndex }))
+    .sort((left, right) => {
+      const activeDifference = Number(setupRecordActive(right.driver)) - Number(setupRecordActive(left.driver));
+      if (activeDifference) return activeDifference;
+      return left.canonicalIndex - right.canonicalIndex;
+    });
 }
 
 function validateUniqueDriverLogins() {
@@ -326,17 +351,21 @@ function renderSamsaraTestResult() {
 
 function renderDrivers() {
   const selected = Number.isInteger(selectedSetupIndex) ? drivers[selectedSetupIndex] : null;
+  const selectedActive = setupRecordActive(selected);
   return `
     <div class="setup-content">
       <div class="setup-list-column">
         <div class="section-heading-row">
-          <strong>Current Drivers</strong>
+          <div>
+            <strong>Current Drivers</strong>
+            <span class="muted">Active drivers are shown first. Drag an active driver to set the default order for new plans.</span>
+          </div>
           <button data-action="new-setup-record" type="button">New</button>
         </div>
         <div class="registration-list setup-list">
-        ${drivers.map((driver, index) => `
-          <button class="registration-card ${selectedSetupIndex === index ? "selected" : ""}" data-action="select-setup-record" data-index="${index}" type="button">
-            <strong>${escapeHtml(driver.name)} | ${driver.license}</strong>
+        ${driverSetupRows().map(({ driver, canonicalIndex }) => `
+          <button class="registration-card driver-setup-card ${setupRecordActive(driver) ? "" : "is-disabled"} ${selectedSetupIndex === canonicalIndex ? "selected" : ""}" data-action="select-setup-record" data-index="${canonicalIndex}" data-driver-index="${canonicalIndex}" draggable="${setupRecordActive(driver) ? "true" : "false"}" type="button">
+            <span class="setup-card-title"><strong>${escapeHtml(driver.name)} | ${escapeHtml(driver.license || "-")}</strong><span class="setup-status-pill ${setupRecordActive(driver) ? "active" : "disabled"}">${setupRecordActive(driver) ? "Active" : "Disabled"}</span></span>
             <span class="muted">License ${escapeHtml(driver.number)} | Login ${escapeHtml(driver.login)}</span>
             ${samsaraLoginSummary(driver) ? `<span class="muted">Samsara ${escapeHtml(samsaraLoginSummary(driver))}</span>` : ""}
             <span class="muted">Own yard ${ownYardFixedMinutesFor(driver)}m | Vendor ${vendorFixedMinutesFor(driver)}m | Delivery ${deliveryFixedMinutesFor(driver)}m + ${minutesPerPalletFor(driver)}m/PLT</span>
@@ -346,10 +375,15 @@ function renderDrivers() {
       </div>
       <form class="registration-form setup-form" data-form="driver">
         <h3>${selected ? "Update Driver" : "Register Driver"}</h3>
+        ${selected ? `<div class="setup-record-status-row">
+          <span class="setup-status-pill ${selectedActive ? "active" : "disabled"}">${selectedActive ? "Active" : "Disabled"}</span>
+          <span class="muted">${selectedActive ? "Available for dispatch planning and driver sign-in." : "Hidden from new planning and sign-in. Historical plans and statistics are preserved."}</span>
+          <button class="${selectedActive ? "danger" : "primary"}" data-action="toggle-driver-active" type="button">${selectedActive ? "Disable Driver" : "Enable Driver"}</button>
+        </div>` : ""}
         <div class="form-action-row">
           <button data-action="test-samsara-api" type="button">Test Samsara API</button>
-          ${selected ? `<button data-action="test-samsara-login" data-account="primary" type="button">Find Primary Driver</button>` : ""}
-          ${selected ? `<button data-action="test-samsara-login" data-account="secondary" type="button">Find Secondary Driver</button>` : ""}
+          ${selected ? `<button data-action="test-samsara-login" data-account="primary" type="button" ${selectedActive ? "" : "disabled"}>Find Primary Driver</button>` : ""}
+          ${selected ? `<button data-action="test-samsara-login" data-account="secondary" type="button" ${selectedActive ? "" : "disabled"}>Find Secondary Driver</button>` : ""}
         </div>
         <label><span>Driver name</span><input name="name" value="${escapeHtml(selected?.name || "")}" required /></label>
         <label><span>License class</span><select name="license">
@@ -357,7 +391,7 @@ function renderDrivers() {
           <option ${selected?.license === "DZ" ? "selected" : ""}>DZ</option>
         </select></label>
         <label><span>License number</span><input name="number" value="${escapeHtml(selected?.number || "")}" required /></label>
-        <label><span>Login</span><input name="login" value="${escapeHtml(selected?.login || "")}" required /></label>
+        <label><span>${selected?.id ? "Login (fixed after registration)" : "Login"}</span><input name="login" value="${escapeHtml(selected?.login || "")}" ${selected?.id ? "readonly" : ""} required /></label>
         <label><span>${selected ? "New password optional" : "Password"}</span><input name="password" type="password" ${selected ? "" : "required"} /></label>
         <label><span>Samsara primary username</span><input name="samsaraPrimaryLogin" autocomplete="off" value="${escapeHtml(selected?.samsaraPrimaryLogin || "")}" /></label>
         <label><span>Samsara secondary username</span><input name="samsaraSecondaryLogin" autocomplete="off" value="${escapeHtml(selected?.samsaraSecondaryLogin || "")}" /></label>
@@ -373,6 +407,7 @@ function renderDrivers() {
 
 function renderTrucks() {
   const selected = Number.isInteger(selectedSetupIndex) ? trucks[selectedSetupIndex] : null;
+  const selectedActive = setupRecordActive(selected);
   return `
     <div class="setup-content">
       <div class="setup-list-column">
@@ -385,8 +420,8 @@ function renderTrucks() {
         </div>
         <div class="registration-list setup-list">
         ${trucks.map((truck, index) => `
-          <button class="registration-card truck-setup-card ${selectedSetupIndex === index ? "selected" : ""}" data-action="select-setup-record" data-index="${index}" data-truck-index="${index}" draggable="true" type="button">
-            <strong>${escapeHtml(truck.plate)}</strong>
+          <button class="registration-card truck-setup-card ${setupRecordActive(truck) ? "" : "is-disabled"} ${selectedSetupIndex === index ? "selected" : ""}" data-action="select-setup-record" data-index="${index}" data-truck-index="${index}" draggable="${setupRecordActive(truck) ? "true" : "false"}" type="button">
+            <span class="setup-card-title"><strong>${escapeHtml(truck.plate)}</strong><span class="setup-status-pill ${setupRecordActive(truck) ? "active" : "disabled"}">${setupRecordActive(truck) ? "Active" : "Disabled"}</span></span>
             <span class="muted">Capacity ${formatLbs(truckCapacityLbs(truck))}</span>
             <span class="muted">Google travel time +${truckTravelTimePercent(truck)}%</span>
             <span class="muted">Base yard ${escapeHtml(truck.baseYard || "Unknown")}</span>
@@ -396,8 +431,13 @@ function renderTrucks() {
       </div>
       <form class="registration-form setup-form" data-form="truck">
         <h3>${selected ? "Update Truck" : "Register Truck"}</h3>
+        ${selected ? `<div class="setup-record-status-row">
+          <span class="setup-status-pill ${selectedActive ? "active" : "disabled"}">${selectedActive ? "Active" : "Disabled"}</span>
+          <span class="muted">${selectedActive ? "Available for dispatch planning and load assignment." : "Hidden from new planning and assignments. Historical plans and statistics are preserved."}</span>
+          <button class="${selectedActive ? "danger" : "primary"}" data-action="toggle-truck-active" type="button">${selectedActive ? "Disable Truck" : "Enable Truck"}</button>
+        </div>` : ""}
         <label><span>${t("dispatch.truckSwitchMinutes", "Truck switch time (minutes)")}</span><input name="truckSwitchMinutes" type="number" min="0" max="120" step="1" value="${Number(planningSettings.truckSwitchMinutes ?? 10)}" required /></label>
-        <label><span>Vehicle plate number</span><input name="plate" value="${escapeHtml(selected?.plate || "")}" required /></label>
+        <label><span>${selected?.id ? "Vehicle plate (fixed after registration)" : "Vehicle plate number"}</span><input name="plate" value="${escapeHtml(selected?.plate || "")}" ${selected?.id ? "readonly" : ""} required /></label>
         <label><span>Load capacity (lb)</span><input name="capacityLbs" type="number" value="${truckCapacityLbs(selected)}" required /></label>
         <label><span>Google travel time + %</span><input name="travelTimePercent" type="number" min="0" max="300" step="1" value="${truckTravelTimePercent(selected)}" required /></label>
         <label><span>Default base yard</span><select name="baseYard">${truckBaseYardOptions(selected?.baseYard || "")}</select></label>
@@ -416,6 +456,28 @@ function moveSetupTruck(fromIndex, toIndex) {
   else if (Number.isInteger(selectedSetupIndex)) {
     if (fromIndex < selectedSetupIndex && toIndex >= selectedSetupIndex) selectedSetupIndex -= 1;
     else if (fromIndex > selectedSetupIndex && toIndex <= selectedSetupIndex) selectedSetupIndex += 1;
+  }
+  return true;
+}
+
+function moveSetupDriver(fromIndex, toIndex) {
+  if (!Number.isInteger(fromIndex) || !Number.isInteger(toIndex)) return false;
+  if (fromIndex < 0 || fromIndex >= drivers.length || toIndex < 0 || toIndex >= drivers.length || fromIndex === toIndex) return false;
+  if (!setupRecordActive(drivers[fromIndex]) || !setupRecordActive(drivers[toIndex])) return false;
+  const activeSlots = drivers.map((driver, index) => setupRecordActive(driver) ? index : -1).filter((index) => index >= 0);
+  const fromActiveIndex = activeSlots.indexOf(fromIndex);
+  const toActiveIndex = activeSlots.indexOf(toIndex);
+  if (fromActiveIndex < 0 || toActiveIndex < 0 || fromActiveIndex === toActiveIndex) return false;
+  const selectedDriver = Number.isInteger(selectedSetupIndex) ? drivers[selectedSetupIndex] : null;
+  const activeDrivers = activeSlots.map((index) => drivers[index]);
+  const [driver] = activeDrivers.splice(fromActiveIndex, 1);
+  activeDrivers.splice(toActiveIndex, 0, driver);
+  const nextDrivers = [...drivers];
+  activeSlots.forEach((slot, index) => { nextDrivers[slot] = activeDrivers[index]; });
+  drivers = nextDrivers;
+  if (selectedDriver) {
+    const selectedIndex = drivers.indexOf(selectedDriver);
+    selectedSetupIndex = selectedIndex >= 0 ? selectedIndex : null;
   }
   return true;
 }
@@ -681,18 +743,53 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
+function clearSetupDragStyles() {
+  document.querySelectorAll(".driver-setup-card.dragging, .driver-setup-card.drag-over, .truck-setup-card.dragging, .truck-setup-card.drag-over")
+    .forEach((card) => card.classList.remove("dragging", "drag-over"));
+}
+
 setupApp.addEventListener("dragstart", (event) => {
+  const driverCard = event.target.closest("[data-driver-index]");
+  if (driverCard && setupTab === "drivers") {
+    const driverIndex = Number(driverCard.dataset.driverIndex);
+    if (!setupRecordActive(drivers[driverIndex])) {
+      event.preventDefault();
+      return;
+    }
+    draggedDriverSetupIndex = driverIndex;
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", `driver:${driverIndex}`);
+    driverCard.classList.add("dragging");
+    return;
+  }
   const truckCard = event.target.closest("[data-truck-index]");
   if (!truckCard || setupTab !== "trucks") return;
-  draggedTruckSetupIndex = Number(truckCard.dataset.truckIndex);
+  const truckIndex = Number(truckCard.dataset.truckIndex);
+  if (!setupRecordActive(trucks[truckIndex])) {
+    event.preventDefault();
+    return;
+  }
+  draggedTruckSetupIndex = truckIndex;
   event.dataTransfer.effectAllowed = "move";
-  event.dataTransfer.setData("text/plain", String(draggedTruckSetupIndex));
+  event.dataTransfer.setData("text/plain", `truck:${truckIndex}`);
   truckCard.classList.add("dragging");
 });
 
 setupApp.addEventListener("dragover", (event) => {
+  const driverCard = event.target.closest("[data-driver-index]");
+  if (driverCard && setupTab === "drivers" && draggedDriverSetupIndex !== null) {
+    const targetIndex = Number(driverCard.dataset.driverIndex);
+    if (!setupRecordActive(drivers[targetIndex])) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+    document.querySelectorAll(".driver-setup-card.drag-over").forEach((card) => card.classList.remove("drag-over"));
+    driverCard.classList.add("drag-over");
+    return;
+  }
   const truckCard = event.target.closest("[data-truck-index]");
   if (!truckCard || setupTab !== "trucks" || draggedTruckSetupIndex === null) return;
+  const targetIndex = Number(truckCard.dataset.truckIndex);
+  if (!setupRecordActive(trucks[targetIndex])) return;
   event.preventDefault();
   event.dataTransfer.dropEffect = "move";
   document.querySelectorAll(".truck-setup-card.drag-over").forEach((card) => card.classList.remove("drag-over"));
@@ -700,27 +797,53 @@ setupApp.addEventListener("dragover", (event) => {
 });
 
 setupApp.addEventListener("dragleave", (event) => {
-  event.target.closest(".truck-setup-card")?.classList.remove("drag-over");
+  event.target.closest(".driver-setup-card, .truck-setup-card")?.classList.remove("drag-over");
 });
 
 setupApp.addEventListener("dragend", () => {
+  draggedDriverSetupIndex = null;
   draggedTruckSetupIndex = null;
-  document.querySelectorAll(".truck-setup-card.dragging, .truck-setup-card.drag-over").forEach((card) => card.classList.remove("dragging", "drag-over"));
+  clearSetupDragStyles();
 });
 
 setupApp.addEventListener("drop", (event) => {
+  const driverCard = event.target.closest("[data-driver-index]");
+  if (driverCard && setupTab === "drivers" && draggedDriverSetupIndex !== null) {
+    event.preventDefault();
+    const fromIndex = draggedDriverSetupIndex;
+    const toIndex = Number(driverCard.dataset.driverIndex);
+    const previousDrivers = [...drivers];
+    const previousSelectedSetupIndex = selectedSetupIndex;
+    draggedDriverSetupIndex = null;
+    clearSetupDragStyles();
+    if (!setupRecordActive(drivers[toIndex]) || !moveSetupDriver(fromIndex, toIndex)) return renderSetup();
+    saveDispatchSetup().then(() => {
+      setupNotice = "Driver default sequence saved for new plans.";
+      renderSetup();
+    }).catch((error) => {
+      drivers = previousDrivers;
+      selectedSetupIndex = previousSelectedSetupIndex;
+      setupNotice = `Driver sequence save failed: ${error.message}`;
+      renderSetup();
+    });
+    return;
+  }
   const truckCard = event.target.closest("[data-truck-index]");
   if (!truckCard || setupTab !== "trucks" || draggedTruckSetupIndex === null) return;
   event.preventDefault();
   const fromIndex = draggedTruckSetupIndex;
   const toIndex = Number(truckCard.dataset.truckIndex);
+  const previousTrucks = [...trucks];
+  const previousSelectedSetupIndex = selectedSetupIndex;
   draggedTruckSetupIndex = null;
-  document.querySelectorAll(".truck-setup-card.dragging, .truck-setup-card.drag-over").forEach((card) => card.classList.remove("dragging", "drag-over"));
-  if (!moveSetupTruck(fromIndex, toIndex)) return renderSetup();
+  clearSetupDragStyles();
+  if (!setupRecordActive(trucks[toIndex]) || !moveSetupTruck(fromIndex, toIndex)) return renderSetup();
   saveDispatchSetup().then(() => {
     setupNotice = "Truck default sequence saved.";
     renderSetup();
   }).catch((error) => {
+    trucks = previousTrucks;
+    selectedSetupIndex = previousSelectedSetupIndex;
     setupNotice = `Truck sequence save failed: ${error.message}`;
     renderSetup();
   });
@@ -745,6 +868,56 @@ setupApp.addEventListener("click", (event) => {
   if (newButton) {
     selectedSetupIndex = null;
     return renderSetup();
+  }
+  const driverActiveButton = event.target.closest("[data-action='toggle-driver-active']");
+  if (driverActiveButton) {
+    const index = selectedSetupIndex;
+    const driver = Number.isInteger(index) ? drivers[index] : null;
+    if (!driver?.id) return;
+    const active = !setupRecordActive(driver);
+    const confirmed = window.confirm(active
+      ? `Enable ${driver.name || driver.login}? The driver will be available for planning and sign-in again.`
+      : `Disable ${driver.name || driver.login}? The driver will be removed from new planning and sign-in. Existing history and statistics will remain. Active work must be reassigned or finished first.`);
+    if (!confirmed) return;
+    driverActiveButton.disabled = true;
+    driverActiveButton.textContent = active ? "Enabling..." : "Disabling...";
+    api(`/api/dispatch/setup/drivers/${encodeURIComponent(driver.id)}/active`, {
+      method: "PATCH",
+      body: JSON.stringify({ active })
+    }).then((result) => {
+      drivers[index] = result.driver || { ...driver, active };
+      setupNotice = `${driver.name || driver.login} ${active ? "enabled" : "disabled"}. Historical plans and statistics were preserved.`;
+      renderSetup();
+    }).catch((error) => {
+      setupNotice = `Driver status change failed: ${error.message}`;
+      renderSetup();
+    });
+    return;
+  }
+  const truckActiveButton = event.target.closest("[data-action='toggle-truck-active']");
+  if (truckActiveButton) {
+    const index = selectedSetupIndex;
+    const truck = Number.isInteger(index) ? trucks[index] : null;
+    if (!truck?.id) return;
+    const active = !setupRecordActive(truck);
+    const confirmed = window.confirm(active
+      ? `Enable ${truck.plate}? The truck will be available for planning and assignment again.`
+      : `Disable ${truck.plate}? The truck will be removed from new planning and assignments. Existing history and statistics will remain. Active work must be reassigned or finished first.`);
+    if (!confirmed) return;
+    truckActiveButton.disabled = true;
+    truckActiveButton.textContent = active ? "Enabling..." : "Disabling...";
+    api(`/api/dispatch/setup/trucks/${encodeURIComponent(truck.id)}/active`, {
+      method: "PATCH",
+      body: JSON.stringify({ active })
+    }).then((result) => {
+      trucks[index] = result.truck || { ...truck, active };
+      setupNotice = `${truck.plate} ${active ? "enabled" : "disabled"}. Historical plans and statistics were preserved.`;
+      renderSetup();
+    }).catch((error) => {
+      setupNotice = `Truck status change failed: ${error.message}`;
+      renderSetup();
+    });
+    return;
   }
   const auditButton = event.target.closest("[data-action='toggle-audit']");
   if (auditButton) {
@@ -966,6 +1139,7 @@ setupApp.addEventListener("submit", (event) => {
       number: data.number,
       login: data.login,
       id: existingDriver?.id || null,
+      active: existingDriver?.active !== false,
       password: data.password || "",
       samsaraPrimaryLogin: String(data.samsaraPrimaryLogin || "").trim(),
       samsaraSecondaryLogin: String(data.samsaraSecondaryLogin || "").trim(),
@@ -995,6 +1169,7 @@ setupApp.addEventListener("submit", (event) => {
     const existingTruck = Number.isInteger(selectedSetupIndex) ? trucks[selectedSetupIndex] : null;
     const truck = {
       id: existingTruck?.id || null,
+      active: existingTruck?.active !== false,
       plate: data.plate,
       capacityLbs: Number(data.capacityLbs || 48000),
       travelTimePercent: Math.max(0, Number(data.travelTimePercent || 0)),

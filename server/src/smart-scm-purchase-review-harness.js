@@ -1,0 +1,135 @@
+import assert from "node:assert/strict";
+import { closeDb } from "./db.js";
+import { buildSmartScmPurchaseOrderRestPayload, smartScmPurchaseOrderMemoMarker } from "./smart-scm-purchase-netsuite.js";
+import { selectSmartScmMarkerPurchaseOrder } from "./smart-scm-purchase-service.js";
+import { normalizeSmartScmVendorDecision } from "./smart-scm-vendor-repository.js";
+
+try {
+  const sourceLine = { id: 71, proposedPallets: 6 };
+  assert.deepEqual(normalizeSmartScmVendorDecision(sourceLine, { decision: "confirm" }), {
+    decision: "confirm",
+    proposalLineId: 71,
+    requestedPallets: 6,
+    decisionPallets: 6,
+    heldPallets: 0,
+    remainderPallets: 0,
+    responseStatus: "confirmed",
+    confirmedPallets: 6,
+    unavailablePallets: 0
+  });
+  const defaultHold = normalizeSmartScmVendorDecision(sourceLine, { decision: "hold" });
+  assert.equal(defaultHold.responseStatus, "awaiting");
+  assert.equal(defaultHold.confirmedPallets, 0);
+  assert.equal(defaultHold.heldPallets, 6);
+  assert.equal(defaultHold.decisionPallets, 6);
+  const partialHold = normalizeSmartScmVendorDecision(sourceLine, { decision: "hold", decisionPallets: 2.5 });
+  assert.equal(partialHold.heldPallets, 2.5);
+  assert.equal(partialHold.remainderPallets, 3.5);
+  assert.throws(
+    () => normalizeSmartScmVendorDecision(sourceLine, { decision: "hold", decisionPallets: 0 }),
+    /greater than zero/
+  );
+  assert.throws(
+    () => normalizeSmartScmVendorDecision(sourceLine, { decision: "hold", decisionPallets: 7 }),
+    /cannot exceed/
+  );
+  assert.equal(normalizeSmartScmVendorDecision(sourceLine, { decision: "hold", decisionPallets: 6.0000005 }).decisionPallets, 6);
+  assert.equal(normalizeSmartScmVendorDecision({ ...sourceLine, residualPallets: 4 }, { decision: "hold" }).decisionPallets, 4);
+  assert.equal(normalizeSmartScmVendorDecision(sourceLine, { decision: "cancel" }).responseStatus, "cancelled");
+  assert.equal(normalizeSmartScmVendorDecision(sourceLine, { decision: "cancel" }).confirmedPallets, 0);
+  assert.equal(normalizeSmartScmVendorDecision(sourceLine, { decision: "confirm", confirmedPallets: 2 }).responseStatus, "partial");
+
+  assert.equal(selectSmartScmMarkerPurchaseOrder([], { proposalId: 501 }), null);
+  assert.equal(selectSmartScmMarkerPurchaseOrder([{ id: "901", tranid: "PO901", vendor_id: "77" }], {
+    proposalId: 501,
+    vendorId: 77
+  }).id, 901);
+  assert.throws(
+    () => selectSmartScmMarkerPurchaseOrder([{ id: 901 }, { id: 902 }], { proposalId: 501 }),
+    (error) => error.smartScmAttention === true
+  );
+  assert.throws(
+    () => selectSmartScmMarkerPurchaseOrder([{ id: 901, vendor_id: 88 }], { proposalId: 501, vendorId: 77 }),
+    /different NetSuite vendor/
+  );
+
+  const proposal = {
+    id: 501,
+    vendorId: 77,
+    destinationLocationId: 15,
+    memo: "Harness staged PO",
+    vendorReference: "V-501",
+    palletItem: {
+      id: 999,
+      itemName: "PALLET",
+      unit: "Each",
+      purchaseUnit: "Each",
+      lastPurchasePrice: 4.25
+    },
+    lines: [
+      { itemId: 601, itemName: "A", unit: "Each", purchaseUnit: "Each", lastPurchasePrice: 11.5, destinationLocationId: 15, salesQuantity: 40, confirmedPallets: 1, palletQty: 1, layerQty: 0, sectionQty: 0, pieceQty: 0 },
+      { itemId: 602, itemName: "B", unit: "Each", purchaseUnit: "Each", lastPurchasePrice: 3.75, destinationLocationId: 15, salesQuantity: 80, confirmedPallets: 2, palletQty: 2, layerQty: 0, sectionQty: 0, pieceQty: 0 },
+      { itemId: 603, itemName: "C", unit: "Each", purchaseUnit: "Each", lastPurchasePrice: 9, destinationLocationId: 26, salesQuantity: 12, confirmedPallets: 0.5, palletQty: 0.5, layerQty: 0, sectionQty: 0, pieceQty: 0 },
+      { itemId: 999, itemName: "PALLET", unit: "Each", purchaseUnit: "Each", lastPurchasePrice: 4.25, destinationLocationId: 15, salesQuantity: 3.5, confirmedPallets: 3.5, ancillaryPallet: true }
+    ]
+  };
+  const locations = [
+    { locationId: 15, netsuiteLocationId: 115, subsidiaryId: 2 },
+    { locationId: 26, netsuiteLocationId: 126, subsidiaryId: 2 }
+  ];
+  const payload = buildSmartScmPurchaseOrderRestPayload({ proposal, locations });
+  assert.equal(smartScmPurchaseOrderMemoMarker(501), "MBBS-SCM-PO:501");
+  assert.match(payload.memo, /MBBS-SCM-PO:501/);
+  assert.equal(payload.item.items.length, 5);
+  assert.deepEqual(payload.item.items.slice(0, 3).map((line) => line.rate), [11.5, 3.75, 9]);
+  const palletLines = payload.item.items.filter((line) => line.item.id === "999");
+  assert.equal(palletLines.length, 2);
+  assert.deepEqual(palletLines.map((line) => [line.location.id, line.quantity, line.custcol_pcs, line.rate]), [
+    ["115", 3, 3, 4.25],
+    ["126", 0.5, 0.5, 4.25]
+  ]);
+
+  const overridden = structuredClone(proposal);
+  overridden.palletLines = [
+    { itemId: 999, itemName: "PALLET", destinationLocationId: 15, purchaseQuantity: 1.25, ancillaryPallet: true },
+    { itemId: 999, itemName: "PALLET", destinationLocationId: 26, purchaseQuantity: 0, ancillaryPallet: true }
+  ];
+  const overriddenPayload = buildSmartScmPurchaseOrderRestPayload({ proposal: overridden, locations });
+  assert.deepEqual(
+    overriddenPayload.item.items.filter((line) => line.item.id === "999").map((line) => [line.location.id, line.quantity]),
+    [["115", 1.25]],
+    "A saved manual PALLET override must replace automatic regeneration, while explicit zero omits that destination."
+  );
+  assert.equal(overriddenPayload.item.items.length, 4, "Visible PALLET material rows must still be filtered from the final payload.");
+
+  const zeroOverride = structuredClone(proposal);
+  zeroOverride.palletLines = [
+    { itemId: 999, itemName: "PALLET", destinationLocationId: 15, purchaseQuantity: 0, ancillaryPallet: true },
+    { itemId: 999, itemName: "PALLET", destinationLocationId: 26, purchaseQuantity: 0, ancillaryPallet: true }
+  ];
+  zeroOverride.palletItem = { id: null, itemName: "PALLET", unit: null, purchaseUnit: null, lastPurchasePrice: null };
+  const zeroPayload = buildSmartScmPurchaseOrderRestPayload({ proposal: zeroOverride, locations });
+  assert.equal(zeroPayload.item.items.length, 3);
+  assert.equal(zeroPayload.item.items.filter((line) => line.item.id === "999").length, 0);
+
+  const directOverride = structuredClone(proposal);
+  directOverride.palletQuantityOverrides = { 15: 2.75, 26: 0 };
+  const directOverridePayload = buildSmartScmPurchaseOrderRestPayload({ proposal: directOverride, locations });
+  assert.deepEqual(
+    directOverridePayload.item.items.filter((line) => line.item.id === "999").map((line) => [line.location.id, line.quantity]),
+    [["115", 2.75]],
+    "A persisted override map must also be honored when a caller has not projected palletLines."
+  );
+
+  const missingPrice = structuredClone(proposal);
+  missingPrice.lines[0].lastPurchasePrice = null;
+  assert.throws(() => buildSmartScmPurchaseOrderRestPayload({ proposal: missingPrice, locations }), /positive Last Purchase Price/);
+  const mismatchedUnit = structuredClone(proposal);
+  assert.equal(payload.item.items.filter((line) => line.item.id === "999").length, 2, "Visible Official PALLET rows must not duplicate the one derived payload line per destination.");
+  mismatchedUnit.lines[0].purchaseUnit = "Case";
+  assert.throws(() => buildSmartScmPurchaseOrderRestPayload({ proposal: mismatchedUnit, locations }), /does not match purchase unit/);
+
+  console.log(JSON.stringify({ ok: true, materialLines: 3, automaticPalletLines: 2, manualOverride: 1.25, zeroOverride: true, exactlyOnce: true, markerRecoveryCovered: true }));
+} finally {
+  await closeDb();
+}

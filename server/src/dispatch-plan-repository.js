@@ -6,11 +6,59 @@ import {
   normalizeDispatchPlanLoadAssignments
 } from "./dispatch-load-assignment.js";
 import { syncDispatchPlanLoadAssignments } from "./dispatch-load-assignment-repository.js";
+import {
+  DISPATCH_FLEET_PLANNING_LOCK,
+  dispatchFleetAssignmentStatusConflicts,
+  unchangedCompletedDispatchLoadIds
+} from "./dispatch-fleet-status.js";
 
 const CUSTOMER_PICKUP_DELIVERY_METHOD = "Pick-Up";
 const DISPATCH_PLAN_V2_VERSION = 2;
 const DISPATCH_PLAN_V2_BACKFILL_SOURCE = "dockerVer-backfill";
 const DISPATCH_PLAN_V2_SAVE_SOURCE = "dispatchV2-save";
+
+export class DisabledDispatchFleetAssignmentError extends Error {
+  constructor(conflicts = []) {
+    const first = conflicts[0] || {};
+    super(first.message || "Driver or truck assignment uses a disabled resource.");
+    this.name = "DisabledDispatchFleetAssignmentError";
+    this.code = first.code || "DISPATCH_FLEET_DISABLED";
+    this.status = 409;
+    this.conflicts = conflicts;
+  }
+}
+
+async function lockDispatchFleetPlanning() {
+  await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
+}
+
+async function assertActiveDispatchFleetAssignments(plan = {}, { previousPlan = null } = {}) {
+  const driverResult = await query("SELECT id::text, name, login, active FROM dispatch_drivers ORDER BY id");
+  const truckResult = await query("SELECT id::text, plate, active FROM dispatch_trucks ORDER BY id");
+  let allowedInactiveLoadIds = new Set();
+  const planId = String(plan?.id || plan?.planId || previousPlan?.id || previousPlan?.planId || "").trim();
+  if (previousPlan && planId) {
+    const completedResult = await query(
+      `SELECT load_id
+         FROM dispatch_plan_load_assignments
+        WHERE plan_id = $1
+          AND completed = true`,
+      [planId]
+    );
+    allowedInactiveLoadIds = unchangedCompletedDispatchLoadIds(
+      previousPlan,
+      plan,
+      completedResult.rows.map((row) => row.load_id)
+    );
+  }
+  const conflicts = dispatchFleetAssignmentStatusConflicts(plan, {
+    drivers: driverResult.rows,
+    trucks: truckResult.rows
+  }, {
+    allowedInactiveLoadIds
+  });
+  if (conflicts.length) throw new DisabledDispatchFleetAssignmentError(conflicts);
+}
 
 function uniqueTextValues(values = []) {
   return [...new Set((values || []).map((value) => String(value ?? "").trim()).filter(Boolean))];
@@ -585,6 +633,7 @@ export async function getDispatchPlanSnapshot(snapshotId) {
 
 export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [], summary = {}, baseRevision = null, planDate = "", sessionId = "" } = {}) {
   return withTransaction(async () => {
+    await lockDispatchFleetPlanning();
     const currentPlan = await query(
       `SELECT p.id, p.plan_date::text AS plan_date, p.revision,
               s.orders, s.trucks, s.summary, s.saved_at
@@ -605,6 +654,19 @@ export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [
         payloadPlanDate
       });
     }
+    await assertActiveDispatchFleetAssignments({
+      id: planId,
+      planDate: expectedPlanDate,
+      orders: Array.isArray(orders) ? orders : [],
+      trucks: Array.isArray(trucks) ? trucks : []
+    }, {
+      previousPlan: {
+        id: planId,
+        planDate: expectedPlanDate,
+        orders: existingPlan.orders || [],
+        trucks: existingPlan.trucks || []
+      }
+    });
     const hasBaseRevision = baseRevision !== null && baseRevision !== undefined && baseRevision !== "";
     const expectedRevision = Number(baseRevision);
     const result = hasBaseRevision && Number.isFinite(expectedRevision)
@@ -696,6 +758,7 @@ export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [
 
 export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" } = {}) {
   return withTransaction(async () => {
+    await lockDispatchFleetPlanning();
     const sourceResult = await query(
       `SELECT h.*
          FROM dispatch_plan_snapshot_history h
@@ -776,6 +839,17 @@ export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" }
           : DISPATCH_PLAN_V2_BACKFILL_SOURCE
       })
     };
+    await assertActiveDispatchFleetAssignments({
+      ...cleanPlan,
+      planDate: currentDate
+    }, {
+      previousPlan: {
+        id: current.id,
+        planDate: currentDate,
+        orders: current.orders || [],
+        trucks: current.trucks || []
+      }
+    });
     await query(
       `INSERT INTO dispatch_plan_snapshots (plan_id, orders, trucks, summary, saved_at)
        VALUES ($1, $2::jsonb, $3::jsonb, $4::jsonb, now())
@@ -807,6 +881,7 @@ export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" }
 
 export async function confirmDispatchPlan(planId, { note = "" } = {}) {
   return withTransaction(async () => {
+    await lockDispatchFleetPlanning();
     const result = await query(
       `UPDATE dispatch_plans
           SET status = 'confirmed',
@@ -820,6 +895,7 @@ export async function confirmDispatchPlan(planId, { note = "" } = {}) {
     );
     if (!result.rows[0]) throw new Error("Dispatch plan not found.");
     const plan = await getDispatchPlan(planId);
+    await assertActiveDispatchFleetAssignments(plan, { previousPlan: plan });
     await syncDispatchPlanLoadAssignments(plan);
     return plan;
   });

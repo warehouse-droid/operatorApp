@@ -542,6 +542,15 @@ body {
   min-height: 25px;
 }
 
+.smart-yard-cell .smart-capacity-provenance {
+  display: block;
+  margin-top: 3px;
+  color: var(--smart-muted);
+  font-size: 8px;
+  font-weight: 700;
+  line-height: 1.25;
+}
+
 .smart-pill {
   display: inline-flex;
   align-items: center;

@@ -82,9 +82,10 @@
 
 .smart-line-quantity {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 5px;
-  min-width: 270px;
+  min-width: 340px;
 }
 
 .smart-line-quantity input {
@@ -215,6 +216,90 @@
   padding-bottom: 5px;
 }
 
+.smart-manual-load-panel {
+  display: grid;
+  gap: 10px;
+  margin: 12px;
+  padding: 12px;
+  border: 1px solid #9fbac6;
+  border-radius: 8px;
+  background: #f4f9fb;
+  box-shadow: 0 4px 12px rgb(23 50 77 / 8%);
+}
+
+.smart-manual-load-head {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.smart-manual-load-head h3,
+.smart-manual-load-head p {
+  margin: 0;
+}
+
+.smart-manual-load-head p {
+  margin-top: 3px;
+  color: var(--smart-muted);
+  font-size: 11px;
+}
+
+.smart-manual-load-fields {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(130px, 0.7fr)) minmax(230px, 1.6fr) auto;
+  align-items: end;
+  gap: 8px;
+}
+
+.smart-manual-load-fields label {
+  display: grid;
+  gap: 4px;
+}
+
+.smart-manual-load-fields label > span,
+.smart-manual-load-item label > span {
+  color: var(--smart-muted);
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.smart-manual-load-fields label > strong {
+  min-height: 36px;
+  padding: 9px 8px;
+  border: 1px solid var(--smart-border);
+  border-radius: 5px;
+  background: #fff;
+  font-size: 11px;
+}
+
+.smart-manual-load-results {
+  display: grid;
+  gap: 6px;
+}
+
+.smart-manual-load-item {
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) 90px auto;
+  align-items: center;
+  gap: 9px;
+  padding: 8px;
+  border: 1px solid var(--smart-border);
+  border-radius: 6px;
+  background: #fff;
+}
+
+.smart-manual-load-item label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.smart-manual-load-item input {
+  width: 62px;
+}
+
 .smart-proposal-lines-compact .smart-help {
   line-height: 1.25;
 }
@@ -222,6 +307,10 @@
 @media (max-width: 1280px) {
   .smart-plan-toolbar {
     grid-template-columns: repeat(4, minmax(150px, 1fr));
+  }
+
+  .smart-manual-load-fields {
+    grid-template-columns: repeat(3, minmax(150px, 1fr));
   }
 }
 
@@ -249,6 +338,16 @@
   .smart-plan-header-actions {
     justify-content: flex-start;
   }
+
+  .smart-manual-load-fields,
+  .smart-manual-load-item {
+    grid-template-columns: 1fr;
+  }
+
+  .smart-manual-load-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
 }
 
 @media (max-width: 520px) {
@@ -257,7 +356,7 @@
   }
 
   .smart-line-quantity {
-    min-width: 230px;
+    min-width: 280px;
   }
 
   .smart-proposal-column-controls {
@@ -270,4 +369,14 @@
   flex-wrap: wrap;
   gap: 0.3rem;
   margin-top: 0.35rem;
+}
+
+
+.smart-physical-pallet-line td {
+  border-top: 2px solid #99b9c5;
+  background: #f2f8fa;
+}
+
+.smart-physical-pallet-line strong {
+  color: #164f64;
 }

@@ -67,6 +67,8 @@
   const scmItems = [
     { label: "SCM Menu", href: "/scm", icon: "SM" },
     { label: "Smart SCM", href: "/scm/smart", icon: "AI" },
+    { label: "NetSuite PO", href: "/scm/netsuite-po", icon: "PO" },
+    { label: "Local Vendors", href: "/scm/vendors", icon: "LV" },
     { label: "Auto Transfer", href: "/scm/transfer-dependencies", icon: "AT" },
     { label: "PO Split", href: "/scm/POsplit", icon: "PS" },
     { label: "PO/TO Schedule", href: "/scm/POTOschedule", icon: "PT" },
