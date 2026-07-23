@@ -306,9 +306,14 @@ const DECISION_CAPACITY_YARDS = Object.freeze([
   { code: "150", locationId: 26, sheet: "150_Cal", eligibilityColumn: 19, salesAverageColumn: 4, salesSdColumn: 12, minimumOrderColumn: 8, inventoryColumns: [10, 11, 12], safetyFactor: 1.3, minimumSafety: 2 }
 ]);
 
+function decisionSignatureValue(value) {
+  if (value === null || !Number.isFinite(Number(value))) return null;
+  return Math.round(Number(value) * 100000) / 100000;
+}
+
 function decisionSignature(values = []) {
   if (values.some((value) => value === null || !Number.isFinite(Number(value)))) return null;
-  return values.map((value) => Math.round(Number(value) * 100000) / 100000).join("|");
+  return values.map(decisionSignatureValue).join("|");
 }
 
 function decisionSheetRowsByItem(sheet) {
@@ -317,34 +322,226 @@ function decisionSheetRowsByItem(sheet) {
   sheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
     if (rowNumber === 1) return;
     const itemId = cleanNumber(rowValue(row, 1));
-    if (Number.isInteger(itemId) && itemId > 0) rows.set(itemId, row);
+    // The calculation sheets use VLOOKUP with an exact match, which returns
+    // the first source row when the workbook contains a duplicate item ID.
+    if (Number.isInteger(itemId) && itemId > 0 && !rows.has(itemId)) rows.set(itemId, row);
   });
   return rows;
 }
 
-function parseDecisionCapacities(workbook) {
+export function matchSmartScmDecisionCapacityRows({ yard, candidates = [], calculationRows = [] } = {}) {
+  const orderedCandidates = candidates.filter((candidate) => candidate?.signature);
+  const orderedRows = calculationRows.filter((row) => row?.hasEvidence);
+  const candidateCounts = new Map();
+  const rowCounts = new Map();
+  for (const candidate of orderedCandidates) {
+    candidateCounts.set(candidate.signature, Number(candidateCounts.get(candidate.signature) || 0) + 1);
+  }
+  for (const row of orderedRows) {
+    if (row.signature) rowCounts.set(row.signature, Number(rowCounts.get(row.signature) || 0) + 1);
+  }
+  const usedCandidates = new Set();
+  const usedRows = new Set();
+  const capacities = [];
+  const provenance = [];
+  const mappedByMethod = {};
+
+  const recordMatch = (row, candidate, matchMethod) => {
+    usedRows.add(row.sourceRow);
+    usedCandidates.add(candidate.itemId);
+    const invalidCapacity = row.capacity !== null && row.capacity < 0;
+    const mappingStatus = invalidCapacity
+      ? "unresolved_invalid_capacity"
+      : row.capacity === null
+        ? "default_missing_capacity"
+        : "matched";
+    provenance.push({
+      yardCode: yard.code,
+      locationId: yard.locationId,
+      sheetName: yard.sheet,
+      sourceRow: row.sourceRow,
+      itemId: candidate.itemId,
+      capacityPallets: invalidCapacity ? null : row.capacity,
+      mappingStatus,
+      matchMethod,
+      signature: row.signature,
+      candidateItemIds: [candidate.itemId],
+      details: {
+        candidateSourceRow: candidate.sourceRow,
+        candidateSignatureValues: candidate.signatureValues,
+        signatureValues: row.signatureValues,
+        derivedSignatureColumns: row.derivedSignatureColumns || [],
+        rawCapacity: row.capacity
+      }
+    });
+    if (mappingStatus !== "matched") return;
+    capacities.push({
+      item_id: candidate.itemId,
+      location_id: yard.locationId,
+      yard_code: yard.code,
+      capacity_pallets: row.capacity,
+      source_sheet: yard.sheet,
+      source_row: row.sourceRow,
+      match_method: matchMethod
+    });
+    mappedByMethod[matchMethod] = Number(mappedByMethod[matchMethod] || 0) + 1;
+  };
+
+  const recordUnresolved = (row, mappingStatus, candidateItemIds = []) => {
+    usedRows.add(row.sourceRow);
+    const invalidCapacity = row.capacity !== null && row.capacity < 0;
+    provenance.push({
+      yardCode: yard.code,
+      locationId: yard.locationId,
+      sheetName: yard.sheet,
+      sourceRow: row.sourceRow,
+      itemId: null,
+      capacityPallets: invalidCapacity ? null : row.capacity,
+      mappingStatus: row.capacity === null && mappingStatus.startsWith("unresolved_")
+        ? "default_unresolved_identity"
+        : mappingStatus,
+      matchMethod: null,
+      signature: row.signature,
+      candidateItemIds,
+      details: {
+        signatureValues: row.signatureValues,
+        derivedSignatureColumns: row.derivedSignatureColumns || [],
+        rawCapacity: row.capacity
+      }
+    });
+  };
+
+  // Prefer the workbook's natural item order only when the signature uniquely
+  // identifies both sides. A repeated signature cannot verify an identity by
+  // itself, even when the ordinal happens to line up.
+  const directCount = Math.min(orderedCandidates.length, orderedRows.length);
+  for (let index = 0; index < directCount; index += 1) {
+    const candidate = orderedCandidates[index];
+    const row = orderedRows[index];
+    if (row.signature
+      && row.signature === candidate.signature
+      && candidateCounts.get(candidate.signature) === 1
+      && rowCounts.get(row.signature) === 1) {
+      recordMatch(row, candidate, "ordered_verified");
+    }
+  }
+
+  const candidatesBySignature = new Map();
+  for (const candidate of orderedCandidates) {
+    if (usedCandidates.has(candidate.itemId)) continue;
+    if (!candidatesBySignature.has(candidate.signature)) candidatesBySignature.set(candidate.signature, []);
+    candidatesBySignature.get(candidate.signature).push(candidate);
+  }
+  const rowsBySignature = new Map();
+  for (const row of orderedRows) {
+    if (usedRows.has(row.sourceRow) || !row.signature) continue;
+    if (!rowsBySignature.has(row.signature)) rowsBySignature.set(row.signature, []);
+    rowsBySignature.get(row.signature).push(row);
+  }
+
+  // A repeated signature only resolves safely when all corresponding rows
+  // carry the same capacity. Pairing differing capacities by ordinal would be
+  // a guess because the calculation sheets contain no item identity columns.
+  for (const [signature, rows] of rowsBySignature) {
+    const signatureCandidates = candidatesBySignature.get(signature) || [];
+    const sameCapacity = new Set(rows.map((row) => row.capacity === null ? "null" : String(row.capacity))).size === 1;
+    if (signatureCandidates.length > 0
+      && signatureCandidates.length === rows.length
+      && (signatureCandidates.length === 1 || sameCapacity)) {
+      rows.forEach((row, index) => recordMatch(
+        row,
+        signatureCandidates[index],
+        signatureCandidates.length === 1 ? "signature_unique" : "signature_same_capacity"
+      ));
+      continue;
+    }
+    const candidateIds = signatureCandidates.map((candidate) => candidate.itemId);
+    const status = signatureCandidates.length ? "unresolved_cardinality" : "unresolved_no_candidate";
+    rows.forEach((row) => recordUnresolved(row, status, candidateIds));
+  }
+
+  // Some shared Excel formulas have no cached result even though enough other
+  // calculated fields remain to identify the item. Accept a partial signature
+  // only when at least three fields agree and exactly one unused candidate
+  // matches every available value.
+  for (const row of orderedRows) {
+    if (usedRows.has(row.sourceRow) || row.signature) continue;
+    const evidenceCount = (row.signatureValues || []).filter((value) => value !== null).length;
+    if (evidenceCount < 3) continue;
+    const candidateMatches = orderedCandidates.filter((candidate) => {
+      if (usedCandidates.has(candidate.itemId) || !Array.isArray(candidate.signatureValues)) return false;
+      return row.signatureValues.every((value, index) =>
+        value === null || decisionSignatureValue(value) === decisionSignatureValue(candidate.signatureValues[index])
+      );
+    });
+    if (candidateMatches.length === 1) {
+      recordMatch(row, candidateMatches[0], "partial_signature_unique");
+    } else if (candidateMatches.length > 1) {
+      recordUnresolved(row, "unresolved_partial_cardinality", candidateMatches.map((candidate) => candidate.itemId));
+    } else {
+      recordUnresolved(row, "unresolved_no_candidate");
+    }
+  }
+
+  for (const row of orderedRows) {
+    if (usedRows.has(row.sourceRow)) continue;
+    recordUnresolved(row, row.signature ? "unresolved_no_candidate" : "unresolved_no_signature");
+  }
+
+  const unresolvedCapacityRows = provenance.filter((row) =>
+    row.details?.rawCapacity !== null && row.mappingStatus !== "matched"
+  ).length;
+  return {
+    capacities,
+    provenance,
+    summary: {
+      calculationRows: orderedRows.length,
+      capacityRows: orderedRows.filter((row) => row.capacity !== null).length,
+      mapped: capacities.length,
+      mappedZero: capacities.filter((row) => row.capacity_pallets === 0).length,
+      mappedByMethod,
+      defaultRows: provenance.filter((row) => row.mappingStatus.startsWith("default_")).length,
+      unresolvedCapacityRows,
+      ambiguous: provenance.filter((row) => ["unresolved_cardinality", "unresolved_partial_cardinality"].includes(row.mappingStatus)).length,
+      unmatched: provenance.filter((row) => ["unresolved_no_candidate", "unresolved_no_signature"].includes(row.mappingStatus)).length,
+      unmatchedCandidates: orderedCandidates.filter((candidate) => !usedCandidates.has(candidate.itemId)).length
+    }
+  };
+}
+
+export function parseSmartScmDecisionCapacities(workbook) {
   const itemSheet = workbookSheet(workbook, "ItemMaster");
   const salesSheet = workbookSheet(workbook, "2026SalesData");
   const inventorySheet = workbookSheet(workbook, "CurrentInventory");
   if (!itemSheet || !salesSheet || !inventorySheet) {
-    return { capacities: [], mapped: 0, ambiguous: 0, unmatched: 0, warning: "Capacity source sheets were not found." };
+    return {
+      capacities: [], provenance: [], mapped: 0, mappedZero: 0, ambiguous: 0, unmatched: 0,
+      unresolved: 0, defaultRows: 0, mappedByMethod: {}, yardSummaries: [],
+      warning: "Capacity source sheets were not found."
+    };
   }
   const salesByItem = decisionSheetRowsByItem(salesSheet);
   const inventoryByItem = decisionSheetRowsByItem(inventorySheet);
-  const items = [];
+  const itemById = new Map();
   itemSheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
     if (rowNumber === 1) return;
     const itemId = cleanNumber(rowValue(row, 1));
     const toPlt = cleanNumber(rowValue(row, 8));
     const leadTimeDays = cleanNumber(rowValue(row, 12));
     if (!Number.isInteger(itemId) || itemId <= 0 || !(toPlt > 0) || !(leadTimeDays > 0)) return;
-    items.push({ itemId, toPlt, leadTimeDays, row });
+    // Match the first row because the *_Cal formulas resolve ItemMaster data
+    // with exact-match VLOOKUP semantics.
+    if (!itemById.has(itemId)) {
+      itemById.set(itemId, { itemId, toPlt, leadTimeDays, row, sourceRow: rowNumber });
+    }
   });
-  const capacityByKey = new Map();
-  let ambiguous = 0;
-  let unmatched = 0;
+  const items = [...itemById.values()].sort((left, right) => left.sourceRow - right.sourceRow);
+  const capacities = [];
+  const provenance = [];
+  const summaries = [];
+  const missingSheets = [];
   for (const yard of DECISION_CAPACITY_YARDS) {
-    const signatureItems = new Map();
+    const candidates = [];
     for (const item of items) {
       if (!/^(yes|y|true|1)$/i.test(cleanText(rowValue(item.row, yard.eligibilityColumn)))) continue;
       const sales = salesByItem.get(item.itemId);
@@ -371,31 +568,70 @@ function parseDecisionCapacities(workbook) {
         minimumOrder
       ]);
       if (!signature) continue;
-      if (!signatureItems.has(signature)) signatureItems.set(signature, new Set());
-      signatureItems.get(signature).add(item.itemId);
+      candidates.push({ itemId: item.itemId, sourceRow: item.sourceRow, signature, signatureValues: [
+        weeklyDemand,
+        leadWeeks,
+        safety,
+        reorderPoint,
+        inventoryPosition,
+        inventoryPosition - reorderPoint,
+        minimumOrder
+      ] });
     }
     const calculationSheet = workbookSheet(workbook, yard.sheet);
-    if (!calculationSheet) continue;
+    if (!calculationSheet) {
+      missingSheets.push(yard.sheet);
+      continue;
+    }
+    const calculationRows = [];
     calculationSheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
       if (rowNumber === 1) return;
       const capacity = cleanNumber(rowValue(row, 17));
-      const signature = decisionSignature([10, 11, 12, 13, 15, 16, 18].map((column) => cleanNumber(rowValue(row, column))));
-      if (!(capacity > 0) || !signature) return;
-      const candidates = [...(signatureItems.get(signature) || [])];
-      if (candidates.length === 1) {
-        const itemId = candidates[0];
-        capacityByKey.set(itemId + ":" + yard.locationId, {
-          item_id: itemId,
-          location_id: yard.locationId,
-          yard_code: yard.code,
-          capacity_pallets: capacity
-        });
-      } else if (candidates.length > 1) ambiguous += 1;
-      else unmatched += 1;
+      const signatureColumns = [10, 11, 12, 13, 15, 16, 18];
+      const signatureValues = signatureColumns.map((column) => cleanNumber(rowValue(row, column)));
+      const derivedSignatureColumns = [];
+      if (signatureValues[4] === null && signatureValues[5] !== null && signatureValues[3] !== null) {
+        signatureValues[4] = signatureValues[5] + signatureValues[3];
+        derivedSignatureColumns.push(15);
+      }
+      if (signatureValues[5] === null && signatureValues[4] !== null && signatureValues[3] !== null) {
+        signatureValues[5] = signatureValues[4] - signatureValues[3];
+        derivedSignatureColumns.push(16);
+      }
+      const hasEvidence = capacity !== null || signatureValues.some((value) => value !== null);
+      if (!hasEvidence) return;
+      calculationRows.push({
+        sourceRow: rowNumber,
+        capacity,
+        signatureValues,
+        signature: decisionSignature(signatureValues),
+        derivedSignatureColumns,
+        hasEvidence
+      });
     });
+    const matched = matchSmartScmDecisionCapacityRows({ yard, candidates, calculationRows });
+    capacities.push(...matched.capacities);
+    provenance.push(...matched.provenance);
+    summaries.push({ yard: yard.code, ...matched.summary });
   }
-  const capacities = [...capacityByKey.values()];
-  return { capacities, mapped: capacities.length, ambiguous, unmatched, warning: null };
+  return {
+    capacities,
+    provenance,
+    mapped: capacities.length,
+    mappedZero: capacities.filter((row) => row.capacity_pallets === 0).length,
+    ambiguous: summaries.reduce((sum, summary) => sum + summary.ambiguous, 0),
+    unmatched: summaries.reduce((sum, summary) => sum + summary.unmatched, 0),
+    unresolved: summaries.reduce((sum, summary) => sum + summary.unresolvedCapacityRows, 0),
+    defaultRows: summaries.reduce((sum, summary) => sum + summary.defaultRows, 0),
+    mappedByMethod: summaries.reduce((totals, summary) => {
+      for (const [method, count] of Object.entries(summary.mappedByMethod)) {
+        totals[method] = Number(totals[method] || 0) + Number(count || 0);
+      }
+      return totals;
+    }, {}),
+    yardSummaries: summaries,
+    warning: missingSheets.length ? `Capacity calculation sheets were not found: ${missingSheets.join(", ")}.` : null
+  };
 }
 
 
@@ -452,10 +688,18 @@ function parseDecisionWorkbook(workbook, sourceFileId) {
       });
     }
   }
-  const capacityResult = parseDecisionCapacities(workbook);
-  return { supplies, capacities: capacityResult.capacities, summary: {
+  const capacityResult = parseSmartScmDecisionCapacities(workbook);
+  return { supplies, capacities: capacityResult.capacities, capacityProvenance: capacityResult.provenance, summary: {
     supplySnapshots: supplies.length, outOfStock: supplies.filter((row) => row.status === "out_of_stock").length,
-    capacityMappings: capacityResult.mapped, ambiguousCapacityRows: capacityResult.ambiguous, unmatchedCapacityRows: capacityResult.unmatched, capacityWarning: capacityResult.warning
+    capacityMappings: capacityResult.mapped,
+    zeroCapacityMappings: capacityResult.mappedZero,
+    capacityMappingsByMethod: capacityResult.mappedByMethod,
+    defaultCapacityRows: capacityResult.defaultRows,
+    unresolvedCapacityRows: capacityResult.unresolved,
+    ambiguousCapacityRows: capacityResult.ambiguous,
+    unmatchedCapacityRows: capacityResult.unmatched,
+    capacityYards: capacityResult.yardSummaries,
+    capacityWarning: capacityResult.warning
   } };
 }
 
@@ -468,6 +712,123 @@ async function prepareWorkbookImport(file) {
   if (file.slot === "sales_data") return { type: "sales_data", ...parseSalesData(workbook, file.id) };
   if (file.slot === "decision_workbook") return { type: "decision_workbook", ...parseDecisionWorkbook(workbook, file.id) };
   throw new Error("Unsupported Smart SCM input type.");
+}
+
+async function reconcileDecisionCapacities(file, prepared) {
+  const reset = await query(
+    `UPDATE scm_smart_item_yard_policies
+        SET capacity_pallets = 25,
+            capacity_source = 'default',
+            capacity_source_input_file_id = NULL,
+            capacity_source_sheet = NULL,
+            capacity_source_row = NULL,
+            capacity_match_method = NULL,
+            updated_at = now()
+      WHERE capacity_manually_overridden = false
+        AND capacity_source IN ('decision_workbook', 'legacy_import')`
+  );
+
+  await query("DELETE FROM scm_smart_capacity_import_rows WHERE source_input_file_id = $1", [file.id]);
+  const provenanceColumns = [
+    "source_input_file_id", "yard_code", "location_id", "sheet_name", "source_row",
+    "item_id", "capacity_pallets", "mapping_status", "match_method", "signature",
+    "candidate_item_ids", "details"
+  ];
+  const provenanceRows = (prepared.capacityProvenance || []).map((row) => ({
+    source_input_file_id: file.id,
+    yard_code: row.yardCode,
+    location_id: row.locationId,
+    sheet_name: row.sheetName,
+    source_row: row.sourceRow,
+    item_id: row.itemId,
+    capacity_pallets: row.capacityPallets,
+    mapping_status: row.mappingStatus,
+    match_method: row.matchMethod,
+    signature: row.signature,
+    candidate_item_ids: row.candidateItemIds || [],
+    details: JSON.stringify(row.details || {})
+  }));
+  if (provenanceRows.length) {
+    await bulkStatement({
+      rows: provenanceRows,
+      columns: provenanceColumns,
+      chunkSize: 200,
+      prefix: `INSERT INTO scm_smart_capacity_import_rows (${provenanceColumns.join(", ")})`
+    });
+  }
+
+  await query(
+    `UPDATE scm_smart_capacity_import_rows imported
+        SET mapping_status = 'unresolved_policy_missing'
+      WHERE imported.source_input_file_id = $1
+        AND imported.mapping_status = 'matched'
+        AND NOT EXISTS (
+          SELECT 1 FROM scm_smart_item_yard_policies policy
+           WHERE policy.item_id = imported.item_id
+             AND policy.location_id = imported.location_id
+        )`,
+    [file.id]
+  );
+  await query(
+    `UPDATE scm_smart_capacity_import_rows imported
+        SET mapping_status = 'skipped_manual_override'
+       FROM scm_smart_item_yard_policies policy
+      WHERE imported.source_input_file_id = $1
+        AND imported.mapping_status = 'matched'
+        AND policy.item_id = imported.item_id
+        AND policy.location_id = imported.location_id
+        AND policy.capacity_manually_overridden = true`,
+    [file.id]
+  );
+
+  for (const group of chunks(prepared.capacities || [], 200)) {
+    const params = [];
+    const values = group.map((capacity) => {
+      params.push(
+        capacity.item_id,
+        capacity.location_id,
+        capacity.capacity_pallets,
+        capacity.source_sheet,
+        capacity.source_row,
+        capacity.match_method
+      );
+      return `($${params.length - 5}, $${params.length - 4}, $${params.length - 3}, $${params.length - 2}, $${params.length - 1}, $${params.length})`;
+    });
+    params.push(file.id);
+    await query(
+      `UPDATE scm_smart_item_yard_policies policy
+          SET capacity_pallets = imported.capacity_pallets::numeric,
+              capacity_source = 'decision_workbook',
+              capacity_source_input_file_id = $${params.length}::bigint,
+              capacity_source_sheet = imported.source_sheet::text,
+              capacity_source_row = imported.source_row::integer,
+              capacity_match_method = imported.match_method::text,
+              updated_at = now()
+         FROM (VALUES ${values.join(", ")})
+              AS imported(item_id, location_id, capacity_pallets, source_sheet, source_row, match_method)
+        WHERE policy.item_id = imported.item_id::bigint
+          AND policy.location_id = imported.location_id::bigint
+          AND policy.capacity_manually_overridden = false`,
+      params
+    );
+  }
+
+  const statusResult = await query(
+    `SELECT mapping_status, COUNT(*)::int AS count
+       FROM scm_smart_capacity_import_rows
+      WHERE source_input_file_id = $1
+      GROUP BY mapping_status`,
+    [file.id]
+  );
+  const statuses = Object.fromEntries(statusResult.rows.map((row) => [row.mapping_status, Number(row.count)]));
+  return {
+    priorDecisionCapacitiesReset: reset.rowCount,
+    capacityRowsRecorded: provenanceRows.length,
+    capacityApplied: Number(statuses.matched || 0),
+    capacityManualOverridesSkipped: Number(statuses.skipped_manual_override || 0),
+    capacityPoliciesMissing: Number(statuses.unresolved_policy_missing || 0),
+    capacityReconciliationStatuses: statuses
+  };
 }
 
 async function applyPreparedImport(file, prepared) {
@@ -523,12 +884,12 @@ async function applyPreparedImport(file, prepared) {
       suffix: `ON CONFLICT (item_id, location_id) DO UPDATE SET
         yard_code = EXCLUDED.yard_code,
         eligible = CASE WHEN scm_smart_item_yard_policies.manually_overridden THEN scm_smart_item_yard_policies.eligible ELSE EXCLUDED.eligible END,
-        capacity_pallets = CASE WHEN scm_smart_item_yard_policies.manually_overridden THEN scm_smart_item_yard_policies.capacity_pallets ELSE EXCLUDED.capacity_pallets END,
         service_quantile = CASE WHEN scm_smart_item_yard_policies.manually_overridden THEN scm_smart_item_yard_policies.service_quantile ELSE EXCLUDED.service_quantile END,
         minimum_safety_pallets = CASE WHEN scm_smart_item_yard_policies.manually_overridden THEN scm_smart_item_yard_policies.minimum_safety_pallets ELSE EXCLUDED.minimum_safety_pallets END,
         source_input_file_id = EXCLUDED.source_input_file_id,
         updated_at = now()`
     });
+    return { itemPoliciesApplied: items.length, itemYardPoliciesApplied: yards.length };
   }
   if (prepared.type === "sales_data") {
     await query("DELETE FROM scm_smart_sales_facts WHERE source = 'workbook'");
@@ -540,6 +901,7 @@ async function applyPreparedImport(file, prepared) {
       prefix: `INSERT INTO scm_smart_sales_facts (${columns.join(", ")})`,
       suffix: "ON CONFLICT (source_key) DO NOTHING"
     });
+    return { salesFactsApplied: prepared.facts.length };
   }
   if (prepared.type === "decision_workbook") {
     await query("DELETE FROM scm_smart_vendor_supply WHERE source = 'decision_workbook'");
@@ -552,24 +914,12 @@ async function applyPreparedImport(file, prepared) {
         prefix: `INSERT INTO scm_smart_vendor_supply (${columns.join(", ")})`
       });
     }
-    for (const group of chunks(prepared.capacities || [], 200)) {
-      const params = [];
-      const values = group.map((capacity) => {
-        params.push(capacity.item_id, capacity.location_id, capacity.capacity_pallets);
-        return `($${params.length - 2}, $${params.length - 1}, $${params.length})`;
-      });
-      await query(
-        `UPDATE scm_smart_item_yard_policies policy
-            SET capacity_pallets = imported.capacity_pallets::numeric,
-                updated_at = now()
-           FROM (VALUES ${values.join(", ")}) AS imported(item_id, location_id, capacity_pallets)
-          WHERE policy.item_id = imported.item_id::bigint
-            AND policy.location_id = imported.location_id::bigint
-            AND policy.manually_overridden = false`,
-        params
-      );
-    }
+    return {
+      vendorSupplySnapshotsApplied: prepared.supplies.length,
+      ...await reconcileDecisionCapacities(file, prepared)
+    };
   }
+  return {};
 }
 
 function publicFile(row) {
@@ -666,8 +1016,40 @@ export async function activateSmartScmInputFile(id, operatorId) {
   if (!file) throw Object.assign(new Error("Smart SCM input file was not found."), { status: 404 });
   if (file.status !== "ready") throw Object.assign(new Error("Only a validated Smart SCM file can be activated."), { status: 409 });
   const prepared = await prepareWorkbookImport(file);
+  let activeDecisionFile = null;
+  let activeDecisionPrepared = null;
+  if (file.slot === "item_master") {
+    const activeDecisionResult = await query(
+      "SELECT * FROM scm_smart_input_files WHERE slot = 'decision_workbook' AND active = true ORDER BY version DESC LIMIT 1"
+    );
+    activeDecisionFile = activeDecisionResult.rows[0] || null;
+    if (activeDecisionFile) activeDecisionPrepared = await prepareWorkbookImport(activeDecisionFile);
+  }
+  let activationSummary = { ...(prepared.summary || {}) };
   const activated = await withTransaction(async () => {
-    await applyPreparedImport(file, prepared);
+    const applySummary = await applyPreparedImport(file, prepared);
+    activationSummary = { ...activationSummary, ...applySummary };
+    if (activeDecisionFile && activeDecisionPrepared) {
+      const decisionApplySummary = await applyPreparedImport(activeDecisionFile, activeDecisionPrepared);
+      const decisionSummary = {
+        ...(activeDecisionPrepared.summary || {}),
+        ...decisionApplySummary,
+        reappliedAfterItemMasterFileId: Number(file.id)
+      };
+      activationSummary.reappliedDecisionWorkbook = {
+        fileId: Number(activeDecisionFile.id),
+        version: Number(activeDecisionFile.version),
+        ...(activeDecisionPrepared.summary || {}),
+        ...decisionApplySummary
+      };
+      await query(
+        `UPDATE scm_smart_input_files
+            SET imported_summary = $2::jsonb,
+                imported_at = now()
+          WHERE id = $1`,
+        [activeDecisionFile.id, JSON.stringify(decisionSummary)]
+      );
+    }
     await query("UPDATE scm_smart_input_files SET active = false WHERE slot = $1 AND id <> $2", [file.slot, file.id]);
     const result = await query(
       `UPDATE scm_smart_input_files
@@ -677,7 +1059,7 @@ export async function activateSmartScmInputFile(id, operatorId) {
               activated_at = now()
         WHERE id = $1
         RETURNING *`,
-      [file.id, JSON.stringify(prepared.summary || {})]
+      [file.id, JSON.stringify(activationSummary)]
     );
     return result.rows[0];
   });
@@ -685,7 +1067,7 @@ export async function activateSmartScmInputFile(id, operatorId) {
     actorOperatorId: operatorId,
     source: "smart_scm",
     action: "smart_scm.input.activate",
-    details: { fileId: Number(file.id), slot: file.slot, version: Number(file.version), summary: prepared.summary }
+    details: { fileId: Number(file.id), slot: file.slot, version: Number(file.version), summary: activationSummary }
   });
   return publicFile(activated);
 }

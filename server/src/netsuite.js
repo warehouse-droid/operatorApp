@@ -602,7 +602,10 @@ export async function resolvePalletItemFromNetSuite() {
   const key = `${config.netsuite.accountId || ""}|${config.netsuite.restBaseUrl || ""}`;
   if (palletItemCache.key === key && palletItemCache.item) return palletItemCache.item;
   const rows = await suiteqlAll(`
-    SELECT i.id, i.itemid, BUILTIN.DF(i.stockunit) AS stock_unit
+    SELECT i.id, i.itemid, BUILTIN.DF(i.stockunit) AS stock_unit,
+           BUILTIN.DF(i.purchaseunit) AS purchase_unit,
+           i.lastpurchaseprice AS last_purchase_price,
+           i.weight AS item_weight
       FROM item i
      WHERE i.itemid = 'PALLET'
        AND i.isinactive = 'F'
@@ -618,7 +621,19 @@ export async function resolvePalletItemFromNetSuite() {
   if (!Number.isInteger(id) || id <= 0) throw new Error("NetSuite returned an invalid PALLET item ID.");
   palletItemCache = {
     key,
-    item: { id, itemId: id, itemName: String(row.itemid || "PALLET"), unit: String(row.stock_unit || "EACH") }
+    item: {
+      id,
+      itemId: id,
+      itemName: String(row.itemid || "PALLET"),
+      unit: String(row.stock_unit || "EACH"),
+      purchaseUnit: String(row.purchase_unit || row.stock_unit || "EACH"),
+      itemWeightLbs: row.item_weight === null || row.item_weight === undefined
+        ? null
+        : Number(row.item_weight),
+      lastPurchasePrice: row.last_purchase_price === null || row.last_purchase_price === undefined
+        ? null
+        : Number(row.last_purchase_price)
+    }
   };
   return palletItemCache.item;
 }
@@ -695,6 +710,31 @@ export async function suiteqlAll(q, params = [], { pageSize = 1000 } = {}) {
   }
 }
 
+export async function fetchTransactionReferenceByTranidFromNetSuite(tranid, recordType) {
+  const orderRef = String(tranid || "").trim().toUpperCase();
+  const allowedTypes = new Set(["SalesOrd", "PurchOrd", "TrnfrOrd"]);
+  if (!orderRef || orderRef.length > 64 || !/^[A-Z0-9_-]+$/.test(orderRef)) {
+    throw new Error("A valid NetSuite transaction number is required.");
+  }
+  if (!allowedTypes.has(recordType)) throw new Error("A valid NetSuite transaction type is required.");
+  const result = await suiteql(`
+    SELECT
+      t.id,
+      t.tranid,
+      t.status,
+      BUILTIN.DF(t.status) AS status_text
+    FROM transaction t
+    WHERE UPPER(t.tranid) = '${orderRef}'
+      AND t.type = '${recordType}'
+    ORDER BY t.id DESC
+    FETCH FIRST 2 ROWS ONLY
+  `);
+  if ((result.items || []).length > 1) {
+    throw new Error(`More than one ${recordType} transaction uses order number ${orderRef}.`);
+  }
+  return result.items?.[0] || null;
+}
+
 export async function fetchDeliveryOrdersFromNetSuite(locationId = 1) {
   return suiteqlAll(deliveryOrderListQuery(locationId));
 }
@@ -750,6 +790,42 @@ export async function fetchTransferDeliveryOrdersFromNetSuite(locationId = 1) {
     delivery_method_id: null,
     delivery_method: "Transfer Order"
   }));
+}
+
+export async function fetchSalesOrderReferenceFromNetSuite(orderId) {
+  const id = Number(orderId);
+  if (!Number.isInteger(id) || id <= 0) throw new Error("A valid numeric NetSuite sales order ID is required.");
+  const result = await suiteql(`
+    SELECT
+      t.id,
+      t.tranid,
+      t.trandate,
+      t.entity AS customer_id,
+      BUILTIN.DF(t.entity) AS customer,
+      t.status,
+      BUILTIN.DF(t.status) AS status_text,
+      t.custbody7 AS memo,
+      t.custbody4 AS expected_delivery_date,
+      t.foreigntotal,
+      t.location AS order_location_id,
+      BUILTIN.DF(t.location) AS order_location,
+      tl.location AS outbound_location_id,
+      BUILTIN.DF(tl.location) AS outbound_location,
+      t.custbody3 AS delivery_method_id,
+      BUILTIN.DF(t.custbody3) AS delivery_method
+    FROM transaction t
+    LEFT JOIN transactionline tl
+      ON tl.transaction = t.id
+     AND tl.item IS NOT NULL
+     AND tl.mainline = 'F'
+     AND tl.taxline = 'F'
+    WHERE t.id = ${id}
+      AND t.type = 'SalesOrd'
+      ${excludedSalesOrderPrefixSql("t")}
+    ORDER BY tl.uniquekey
+    FETCH FIRST 1 ROWS ONLY
+  `);
+  return result.items?.[0] || null;
 }
 
 export async function fetchDeliveryOrderFromNetSuite(orderId, locationId = null) {
@@ -1152,18 +1228,30 @@ export async function fetchPurchaseOrderReferenceFromNetSuite(orderId) {
   const id = Number(orderId);
   if (!Number.isInteger(id) || id <= 0) throw new Error("A valid numeric NetSuite purchase order ID is required.");
   const result = await suiteql(`
-    SELECT t.id,
-           t.tranid,
-           t.trandate,
-           t.entity AS vendor_id,
-           BUILTIN.DF(t.entity) AS vendor,
-           t.status,
-           BUILTIN.DF(t.status) AS status_text,
-           t.memo
-      FROM transaction t
-     WHERE t.id = ${id}
-       AND t.type = 'PurchOrd'
-     FETCH FIRST 1 ROWS ONLY
+    SELECT
+      t.id,
+      t.tranid,
+      t.trandate,
+      t.entity AS vendor_id,
+      BUILTIN.DF(t.entity) AS vendor,
+      t.status,
+      BUILTIN.DF(t.status) AS status_text,
+      t.memo,
+      COALESCE(NULLIF(BUILTIN.DF(v.defaultbillingaddress), ''), NULLIF(BUILTIN.DF(t.billingaddress), '')) AS vendor_address,
+      t.foreigntotal,
+      tl.location AS destination_location_id,
+      BUILTIN.DF(tl.location) AS destination_location
+    FROM transaction t
+    LEFT JOIN vendor v ON v.id = t.entity
+    LEFT JOIN transactionline tl
+      ON tl.transaction = t.id
+     AND tl.item IS NOT NULL
+     AND tl.mainline = 'F'
+     AND (tl.taxline = 'F' OR tl.taxline IS NULL)
+    WHERE t.id = ${id}
+      AND t.type = 'PurchOrd'
+    ORDER BY tl.uniquekey
+    FETCH FIRST 1 ROWS ONLY
   `);
   const order = result.items?.[0];
   return order ? { ...order, order_type: "purchase_order" } : null;
@@ -1296,11 +1384,13 @@ export async function fetchInventoryBalancesFromNetSuite(locationIds = [1, 28, 1
       i.itemtype AS item_type,
       BUILTIN.DF(i.itemtype) AS item_type_text,
       BUILTIN.DF(i.stockunit) AS stock_unit,
+      BUILTIN.DF(i.purchaseunit) AS purchase_unit,
       i.vendor AS vendor_id,
       BUILTIN.DF(i.vendor) AS vendor,
       i.leadtime AS netsuite_lead_time_days,
       i.safetystocklevel AS netsuite_safety_stock_level,
       i.seasonaldemand AS netsuite_seasonal_demand,
+      i.lastpurchaseprice AS last_purchase_price,
       i.weight AS item_weight,
       i.custitem_toplt AS to_plt,
       i.custitem_tolyr AS to_lyr,
@@ -1334,11 +1424,13 @@ export async function fetchInventoryBalanceForItemFromNetSuite(itemId, locationI
       i.itemtype AS item_type,
       BUILTIN.DF(i.itemtype) AS item_type_text,
       BUILTIN.DF(i.stockunit) AS stock_unit,
+      BUILTIN.DF(i.purchaseunit) AS purchase_unit,
       i.vendor AS vendor_id,
       BUILTIN.DF(i.vendor) AS vendor,
       i.leadtime AS netsuite_lead_time_days,
       i.safetystocklevel AS netsuite_safety_stock_level,
       i.seasonaldemand AS netsuite_seasonal_demand,
+      i.lastpurchaseprice AS last_purchase_price,
       i.weight AS item_weight,
       i.custitem_toplt AS to_plt,
       i.custitem_tolyr AS to_lyr,
@@ -1557,6 +1649,36 @@ export async function findTransferOrdersByDependencyMarkerFromNetSuite({
   return result.items || [];
 }
 
+export async function findPurchaseOrdersBySmartScmMarkerFromNetSuite({ proposalId, vendorId = null } = {}) {
+  const proposal = Number(proposalId);
+  const vendor = Number(vendorId);
+  if (!Number.isInteger(proposal) || proposal <= 0) {
+    throw new Error("A valid Smart SCM PO review proposal ID is required.");
+  }
+  const vendorFilter = Number.isInteger(vendor) && vendor > 0 ? `AND t.entity = ${vendor}` : "";
+  const marker = `MBBS-SCM-PO:${proposal}`.toUpperCase();
+  const result = await suiteql(`
+    SELECT t.id,
+           t.tranid,
+           t.trandate,
+           t.entity AS vendor_id,
+           BUILTIN.DF(t.entity) AS vendor,
+           t.status,
+           BUILTIN.DF(t.status) AS status_text,
+           t.memo
+      FROM transaction t
+     WHERE t.type = 'PurchOrd'
+       AND (
+         UPPER(COALESCE(t.memo, '')) LIKE '%${marker} |%'
+         OR UPPER(COALESCE(t.memo, '')) LIKE '%${marker}'
+       )
+       ${vendorFilter}
+     ORDER BY t.id DESC
+     FETCH FIRST 10 ROWS ONLY
+  `);
+  return result.items || [];
+}
+
 export async function fetchInventoryBalancesForItemsFromNetSuite(itemIds = [], locationIds = [1, 28, 15, 26]) {
   const items = [...new Set((itemIds || []).map(Number).filter((id) => Number.isInteger(id) && id > 0))];
   const locations = [...new Set((locationIds || []).map(Number).filter((id) => Number.isInteger(id) && id > 0))];
@@ -1571,11 +1693,13 @@ export async function fetchInventoryBalancesForItemsFromNetSuite(itemIds = [], l
       i.itemtype AS item_type,
       BUILTIN.DF(i.itemtype) AS item_type_text,
       BUILTIN.DF(i.stockunit) AS stock_unit,
+      BUILTIN.DF(i.purchaseunit) AS purchase_unit,
       i.vendor AS vendor_id,
       BUILTIN.DF(i.vendor) AS vendor,
       i.leadtime AS netsuite_lead_time_days,
       i.safetystocklevel AS netsuite_safety_stock_level,
       i.seasonaldemand AS netsuite_seasonal_demand,
+      i.lastpurchaseprice AS last_purchase_price,
       i.weight AS item_weight,
       i.custitem_toplt AS to_plt,
       i.custitem_tolyr AS to_lyr,

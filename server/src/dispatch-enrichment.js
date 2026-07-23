@@ -34,6 +34,15 @@ const VENDOR_YARDS = [
 ];
 
 const USE_NETSUITE_ADDRESS_VENDOR = "__USE_NETSUITE_ADDRESS__";
+export const DISPATCH_VENDOR_WEEK_DAYS = Object.freeze([
+  "Monday",
+  "Tuesday",
+  "Wednesday",
+  "Thursday",
+  "Friday",
+  "Saturday",
+  "Sunday"
+]);
 
 const MONTH_INDEX = {
   jan: 1,
@@ -124,6 +133,53 @@ function rowToLocalVendor(row) {
     yardCount: Number(row.yard_count || 0),
     mappingCount: Number(row.mapping_count || 0)
   };
+}
+
+function vendorManagementError(message, status = 400) {
+  return Object.assign(new Error(message), { status });
+}
+
+function cleanVendorTime(value, fieldLabel) {
+  const time = String(value || "").trim();
+  if (!time) return "";
+  if (!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(time)) {
+    throw vendorManagementError(`${fieldLabel} must use 24-hour HH:MM format.`);
+  }
+  return time;
+}
+
+export function normalizeDispatchVendorScheduleDays(days = []) {
+  if (!Array.isArray(days)) throw vendorManagementError("Opening days must be a list.");
+  const byDay = new Map();
+  for (const input of days) {
+    const dayLabel = String(input?.dayLabel || input?.day_label || "").trim();
+    if (!DISPATCH_VENDOR_WEEK_DAYS.includes(dayLabel)) {
+      throw vendorManagementError(`Opening day "${dayLabel || "blank"}" is not valid.`);
+    }
+    if (byDay.has(dayLabel)) throw vendorManagementError(`${dayLabel} appears more than once.`);
+    const windowStart = cleanVendorTime(input?.windowStart ?? input?.window_start, `${dayLabel} opening time`);
+    const windowEnd = cleanVendorTime(input?.windowEnd ?? input?.window_end, `${dayLabel} closing time`);
+    if (Boolean(windowStart) !== Boolean(windowEnd)) {
+      throw vendorManagementError(`${dayLabel} needs both an opening and closing time.`);
+    }
+    if (windowStart && windowEnd && windowStart >= windowEnd) {
+      throw vendorManagementError(`${dayLabel} closing time must be later than opening time.`);
+    }
+    byDay.set(dayLabel, {
+      dayLabel,
+      windowStart,
+      windowEnd,
+      instructions: String(input?.instructions || "").trim(),
+      active: input?.active === true
+    });
+  }
+  return DISPATCH_VENDOR_WEEK_DAYS.map((dayLabel) => byDay.get(dayLabel) || {
+    dayLabel,
+    windowStart: "",
+    windowEnd: "",
+    instructions: "",
+    active: false
+  });
 }
 
 function csv(value) {
@@ -540,6 +596,265 @@ export async function updateDispatchVendorYard(id, patch = {}) {
     ]
   );
   return result.rows[0] ? rowToVendorYard(result.rows[0]) : null;
+}
+
+export async function saveDispatchVendorYardSchedule({
+  localVendorId,
+  yardRowId = null,
+  yard = "",
+  aliases = [],
+  address = "",
+  days = [],
+  updatedBy = ""
+} = {}) {
+  const vendorId = String(localVendorId || "").trim();
+  const sourceRowId = yardRowId === null || yardRowId === undefined || yardRowId === ""
+    ? ""
+    : String(yardRowId).trim();
+  const cleanYard = String(yard || "").trim();
+  if (!/^\d+$/.test(vendorId)) throw vendorManagementError("Select a valid local vendor.");
+  if (sourceRowId && !/^\d+$/.test(sourceRowId)) throw vendorManagementError("Select a valid vendor yard.");
+  if (!cleanYard) throw vendorManagementError("Vendor yard name is required.");
+  if (cleanYard.length > 180) throw vendorManagementError("Vendor yard name is too long.");
+  const cleanAddress = String(address || "").trim();
+  const cleanDays = normalizeDispatchVendorScheduleDays(days);
+  const aliasValues = (Array.isArray(aliases) ? aliases : String(aliases || "").split(","))
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+  const operator = String(updatedBy || "").trim();
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const vendorResult = await client.query(
+      `SELECT id, name, active
+         FROM dispatch_local_vendors
+        WHERE id = $1
+        FOR UPDATE`,
+      [vendorId]
+    );
+    const localVendor = vendorResult.rows[0];
+    if (!localVendor) throw vendorManagementError("Local vendor not found.", 404);
+    if (!localVendor.active) throw vendorManagementError("Enable this local vendor before adding or editing yards.", 409);
+
+    let previousYard = "";
+    if (sourceRowId) {
+      const sourceResult = await client.query(
+        `SELECT id, vendor, yard
+           FROM dispatch_vendor_yards
+          WHERE id = $1
+          FOR UPDATE`,
+        [sourceRowId]
+      );
+      const source = sourceResult.rows[0];
+      if (!source || normalize(source.vendor) !== normalize(localVendor.name)) {
+        throw vendorManagementError("Vendor yard not found for this local vendor.", 404);
+      }
+      previousYard = String(source.yard || "").trim();
+    }
+
+    const duplicate = await client.query(
+      `SELECT id
+         FROM dispatch_vendor_yards
+        WHERE LOWER(vendor) = LOWER($1)
+          AND LOWER(yard) = LOWER($2)
+          AND ($3 = '' OR LOWER(yard) <> LOWER($3))
+        LIMIT 1`,
+      [localVendor.name, cleanYard, previousYard]
+    );
+    if (duplicate.rowCount) {
+      throw vendorManagementError(`Vendor yard "${cleanYard}" already exists for ${localVendor.name}.`, 409);
+    }
+
+    const sourceYard = previousYard || cleanYard;
+    const rowsResult = await client.query(
+      `SELECT id, vendor, yard, aliases, day_label, window_start, window_end, instructions, address, active
+         FROM dispatch_vendor_yards
+        WHERE LOWER(vendor) = LOWER($1)
+          AND LOWER(yard) = LOWER($2)
+        ORDER BY id
+        FOR UPDATE`,
+      [localVendor.name, sourceYard]
+    );
+    if (!sourceRowId && rowsResult.rowCount) {
+      throw vendorManagementError(`Vendor yard "${cleanYard}" already exists for ${localVendor.name}.`, 409);
+    }
+    if (sourceRowId && !rowsResult.rowCount) {
+      throw vendorManagementError("Vendor yard schedule was not found.", 404);
+    }
+
+    if (previousYard && normalize(previousYard) !== normalize(cleanYard)) aliasValues.push(previousYard);
+    const aliasesText = [...new Set(aliasValues.map((value) => value.toLowerCase()))]
+      .map((key) => aliasValues.find((value) => value.toLowerCase() === key))
+      .join(",");
+    const currentRows = rowsResult.rows;
+    const currentIds = currentRows.map((row) => Number(row.id)).filter(Number.isInteger);
+    const referencedIds = currentIds.length
+      ? new Set((await client.query(
+        `SELECT DISTINCT vendor_yard_id AS id
+           FROM scm_smart_item_policies
+          WHERE vendor_yard_id = ANY($1::bigint[])`,
+        [currentIds]
+      )).rows.map((row) => Number(row.id)))
+      : new Set();
+    const byDay = new Map(currentRows
+      .filter((row) => DISPATCH_VENDOR_WEEK_DAYS.includes(row.day_label))
+      .map((row) => [row.day_label, row]));
+    const reusableRows = currentRows
+      .filter((row) => !DISPATCH_VENDOR_WEEK_DAYS.includes(row.day_label))
+      .sort((left, right) => Number(referencedIds.has(Number(right.id))) - Number(referencedIds.has(Number(left.id))) || Number(left.id) - Number(right.id));
+    const savedRows = [];
+
+    for (const day of cleanDays) {
+      const existing = byDay.get(day.dayLabel) || reusableRows.shift();
+      const values = [
+        localVendor.name,
+        cleanYard,
+        aliasesText,
+        day.dayLabel,
+        day.windowStart,
+        day.windowEnd,
+        day.instructions,
+        cleanAddress,
+        day.active
+      ];
+      const saved = existing
+        ? await client.query(
+          `UPDATE dispatch_vendor_yards
+              SET vendor = $2,
+                  yard = $3,
+                  aliases = $4,
+                  day_label = $5,
+                  window_start = $6,
+                  window_end = $7,
+                  instructions = $8,
+                  address = $9,
+                  active = $10,
+                  updated_at = now()
+            WHERE id = $1
+            RETURNING id, vendor, yard, aliases, day_label, window_start, window_end, instructions, address, active`,
+          [existing.id, ...values]
+        )
+        : await client.query(
+          `INSERT INTO dispatch_vendor_yards
+            (vendor, yard, aliases, day_label, window_start, window_end, instructions, address, active)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+           RETURNING id, vendor, yard, aliases, day_label, window_start, window_end, instructions, address, active`,
+          values
+        );
+      savedRows.push(saved.rows[0]);
+    }
+
+    if (reusableRows.length) {
+      await client.query(
+        `UPDATE dispatch_vendor_yards
+            SET vendor = $2,
+                yard = $3,
+                aliases = $4,
+                address = $5,
+                active = false,
+                updated_at = now()
+          WHERE id = ANY($1::bigint[])`,
+        [reusableRows.map((row) => row.id), localVendor.name, cleanYard, aliasesText, cleanAddress]
+      );
+    }
+
+    if (previousYard && previousYard !== cleanYard) {
+      const previousRouteKey = previousYard.toLowerCase().replace(/[^a-z0-9]+/g, "");
+      const nextRouteKey = cleanYard.toLowerCase().replace(/[^a-z0-9]+/g, "");
+      if (previousRouteKey !== nextRouteKey) {
+        const routeConflict = await client.query(
+          `SELECT id FROM scm_smart_route_rules WHERE source_key = $1 AND source_key <> $2 LIMIT 1`,
+          [nextRouteKey, previousRouteKey]
+        );
+        const oldRoute = await client.query(
+          `SELECT id FROM scm_smart_route_rules WHERE source_key = $1 OR LOWER(source_name) = LOWER($2) LIMIT 1`,
+          [previousRouteKey, previousYard]
+        );
+        if (routeConflict.rowCount && oldRoute.rowCount && routeConflict.rows[0].id !== oldRoute.rows[0].id) {
+          throw vendorManagementError(`A Smart SCM route rule already uses the name "${cleanYard}".`, 409);
+        }
+      }
+      await client.query(
+        `UPDATE scm_smart_route_rules
+            SET source_key = $2,
+                source_name = $3,
+                updated_by = COALESCE(NULLIF($4, ''), updated_by),
+                updated_at = now()
+          WHERE source_key = $1 OR LOWER(source_name) = LOWER($5)`,
+        [previousRouteKey, nextRouteKey, cleanYard, operator, previousYard]
+      );
+      await client.query(
+        `UPDATE scm_smart_item_policies
+            SET vendor_yard = CASE WHEN LOWER(COALESCE(vendor_yard, '')) = LOWER($1) THEN $2 ELSE vendor_yard END,
+                plant = CASE WHEN LOWER(COALESCE(plant, '')) = LOWER($1) THEN $2 ELSE plant END,
+                updated_by = COALESCE(NULLIF($3, ''), updated_by),
+                updated_at = now()
+          WHERE vendor_yard_id = ANY($4::bigint[])
+             OR LOWER(COALESCE(vendor_yard, '')) = LOWER($1)`,
+        [previousYard, cleanYard, operator, currentIds]
+      );
+      await client.query(
+        `UPDATE purchase_orders po
+            SET dispatch_vendor_yard = $2
+          WHERE LOWER(COALESCE(po.dispatch_vendor_yard, '')) = LOWER($1)
+            AND EXISTS (
+              SELECT 1
+                FROM dispatch_vendor_mappings mapping
+               WHERE mapping.active = true
+                 AND LOWER(mapping.local_vendor) = LOWER($3)
+                 AND (
+                   (COALESCE(mapping.netsuite_vendor_id, '') <> '' AND mapping.netsuite_vendor_id = po.vendor_id::text)
+                   OR LOWER(mapping.netsuite_vendor_name) = LOWER(COALESCE(po.vendor, ''))
+                 )
+            )`,
+        [previousYard, cleanYard, localVendor.name]
+      );
+      await client.query(
+        `UPDATE scm_transport_schedule schedule
+            SET pickup_point = $2,
+                updated_by = COALESCE(NULLIF($4, ''), updated_by),
+                updated_at = now()
+          WHERE LOWER(COALESCE(schedule.pickup_point, '')) = LOWER($1)
+            AND schedule.order_kind = 'PO'
+            AND EXISTS (
+              SELECT 1
+                FROM purchase_orders po
+                JOIN dispatch_vendor_mappings mapping
+                  ON mapping.active = true
+                 AND LOWER(mapping.local_vendor) = LOWER($3)
+                 AND (
+                   (COALESCE(mapping.netsuite_vendor_id, '') <> '' AND mapping.netsuite_vendor_id = po.vendor_id::text)
+                   OR LOWER(mapping.netsuite_vendor_name) = LOWER(COALESCE(po.vendor, ''))
+                 )
+               WHERE LOWER(COALESCE(po.tranid, '')) = LOWER(schedule.order_ref)
+                  OR LOWER(COALESCE(po.dispatch_ref, '')) = LOWER(schedule.order_ref)
+            )`,
+        [previousYard, cleanYard, localVendor.name, operator]
+      );
+      await client.query(
+        `UPDATE scm_vrma_orders
+            SET pickup_location = $2,
+                updated_by = COALESCE(NULLIF($4, ''), updated_by),
+                updated_at = now()
+          WHERE LOWER(COALESCE(pickup_location, '')) = LOWER($1)
+            AND LOWER(COALESCE(local_vendor, '')) = LOWER($3)`,
+        [previousYard, cleanYard, localVendor.name, operator]
+      );
+    }
+
+    await client.query("COMMIT");
+    return {
+      vendor: rowToLocalVendor({ ...localVendor, yard_count: 0, mapping_count: 0 }),
+      yard: cleanYard,
+      previousYard,
+      rows: savedRows.map(rowToVendorYard)
+    };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => null);
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 function hashText(value) {

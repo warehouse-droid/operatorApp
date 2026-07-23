@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { pool, query, withTransaction } from "./db.js";
+import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
 import { isNetSuiteSandboxEnvironment } from "./config.js";
 import {
   createPurchaseOrderDispatchEnricher,
@@ -464,6 +465,8 @@ export async function listDispatchOrders({
         NULL::text AS dispatch_load_name,
         NULL::text AS dispatch_parking_spot,
         status_text,
+        initial_scm_status,
+        is_blanket_po,
         netsuite_active
       FROM purchase_orders
       UNION ALL
@@ -489,6 +492,8 @@ export async function listDispatchOrders({
         dispatch_load_name,
         dispatch_parking_spot,
         status_text,
+        'Queued'::text AS initial_scm_status,
+        false AS is_blanket_po,
         netsuite_active
       FROM transfer_orders
       WHERE to_location_id IS NOT NULL
@@ -727,7 +732,7 @@ export async function listDispatchOrders({
         o.status_text,
         o.netsuite_active,
         COALESCE(scm.method, 'MBT') AS scm_method,
-        COALESCE(scm.status, 'Queued') AS scm_status,
+        COALESCE(scm.status, o.initial_scm_status, 'Queued') AS scm_status,
         COALESCE(scm.is_special_order, false) AS scm_is_special_order,
         scm.group_ref AS scm_group_ref,
         scm.packing_slip_ref AS scm_packing_slip_ref,
@@ -798,11 +803,15 @@ export async function listDispatchOrders({
       WHERE o.netsuite_active = true
         AND (
           $1::boolean
+          OR NOT COALESCE(o.is_blanket_po, false)
+        )
+        AND (
+          $1::boolean
           OR COALESCE(scm.method, 'MBT') = 'MBT'
         )
         AND (
           $1::boolean
-          OR COALESCE(scm.status, 'Queued') NOT IN ('Cancelled', 'Hold')
+          OR COALESCE(scm.status, o.initial_scm_status, 'Queued') NOT IN ('Cancelled', 'Hold')
         )
         AND (
           o.status_text ILIKE '%Pending Receipt%'
@@ -824,7 +833,8 @@ export async function listDispatchOrders({
                o.dispatch_address, o.dispatch_pickup_address, o.dispatch_window_start, o.dispatch_window_end,
                o.dispatch_instructions, o.dispatch_parse_source, o.dispatch_plan_date,
                o.dispatch_truck_plate, o.dispatch_load_name, o.dispatch_parking_spot,
-               o.status_text, o.netsuite_active, scm.method, scm.status, scm.is_special_order,
+               o.status_text, o.initial_scm_status, o.is_blanket_po, o.netsuite_active,
+               scm.method, scm.status, scm.is_special_order,
                scm.group_ref, scm.packing_slip_ref, scm.pickup_point, scm.dropoff_point,
                scm.eta_date, scm.eta_time, scm.driver, scm.notes,
                schedule_pickup_yard.address, schedule_pickup_yard.window_start, schedule_pickup_yard.window_end,
@@ -1699,12 +1709,45 @@ async function updateDispatchSnapshotsForRef(client, { oldRef = "", newRef = "",
   return { planIds: changedPlanIds };
 }
 
-export async function listScmPurchaseOrders({ search = "", dropoff = "", vendor = "", pickupPoint = "" } = {}) {
-  const needle = String(search || "").trim().toLowerCase();
+export function scmPurchaseOrderListKind(order = {}) {
+  const sourceTable = String(order.sourceTable || "").trim().toLowerCase();
+  const parseSource = String(order.parseSource || "").trim().toLowerCase();
+  if (sourceTable === "scm_vrma_orders" || parseSource === "scm-vrma") return "vrma";
+  return order.isScmSplit === true ? "split" : "po";
+}
+
+export function scmPurchaseOrderMatchesListFilters(order = {}, {
+  search = "",
+  poType = "",
+  dropoff = "",
+  vendor = "",
+  pickupPoint = ""
+} = {}) {
+  const kind = scmPurchaseOrderListKind(order);
+  if (kind === "vrma") return false;
+  if (String(search || "").trim()) return true;
+  const typeFilter = ["po", "split"].includes(String(poType || "").trim().toLowerCase())
+    ? String(poType || "").trim().toLowerCase()
+    : "";
+  if (typeFilter && kind !== typeFilter) return false;
   const dropoffFilter = String(dropoff || "").trim().toLowerCase();
+  if (dropoffFilter && ![
+    order.destinationYard,
+    ...(order.dropoffs || []).map((drop) => drop.destinationYard)
+  ].some((yard) => String(yard || "").trim().toLowerCase() === dropoffFilter)) return false;
   const vendorFilter = String(vendor || "").trim().toLowerCase();
+  if (vendorFilter && scmOrderVendorLabel(order).toLowerCase() !== vendorFilter) return false;
   const pickupFilter = String(pickupPoint || "").trim().toLowerCase();
+  if (pickupFilter && scmEffectivePickupPoint(order).toLowerCase() !== pickupFilter) return false;
+  return true;
+}
+
+export async function listScmPurchaseOrders({
+  search = "", poType = "", dropoff = "", vendor = "", pickupPoint = ""
+} = {}) {
+  const needle = String(search || "").trim().toLowerCase();
   let orders = await listDispatchOrders({ type: "PO", includeHiddenScm: true });
+  orders = orders.filter((order) => scmPurchaseOrderListKind(order) !== "vrma");
   const splitRows = await query(
     `SELECT s.id, s.source_po_ref, s.split_po_ref, s.created_at, s.created_by,
             COUNT(l.id) AS line_count,
@@ -1775,24 +1818,56 @@ export async function listScmPurchaseOrders({ search = "", dropoff = "", vendor 
       return String(order.id || "").trim().toLowerCase() === groupRef.toLowerCase();
     })
     .filter((order) => String(order.scm?.status || "").trim().toLowerCase() !== "completed")
-    .filter((order) => {
-      if (!dropoffFilter) return true;
-      return [
-        order.destinationYard,
-        ...(order.dropoffs || []).map((dropoff) => dropoff.destinationYard)
-      ].some((yard) => String(yard || "").trim().toLowerCase() === dropoffFilter);
-    })
-    .filter((order) => {
-      if (!vendorFilter) return true;
-      const orderVendor = scmOrderVendorLabel(order).toLowerCase();
-      return orderVendor === vendorFilter;
-    })
-    .filter((order) => {
-      if (!pickupFilter) return true;
-      return scmEffectivePickupPoint(order).toLowerCase() === pickupFilter;
-    })
+    .filter((order) => scmPurchaseOrderMatchesListFilters(order, {
+      search: needle,
+      poType,
+      dropoff,
+      vendor,
+      pickupPoint
+    }))
     .filter((order) => (order.items || []).length || needle)
     .sort(compareScmPurchaseOrders);
+}
+
+export async function setPurchaseOrderBlanketFlag(orderRef, {
+  isBlanket = false,
+  updatedBy = ""
+} = {}) {
+  const ref = String(orderRef || "").trim();
+  if (!ref) throw Object.assign(new Error("Purchase order reference is required."), { status: 400 });
+  const flagged = isBlanket === true;
+  const result = await query(
+    `UPDATE purchase_orders
+        SET is_blanket_po = $2,
+            blanket_flagged_at = CASE WHEN $2 THEN now() ELSE NULL END,
+            blanket_flagged_by = CASE WHEN $2 THEN NULLIF($3, '') ELSE NULL END
+      WHERE netsuite_id = (
+        SELECT netsuite_id
+          FROM purchase_orders
+         WHERE lower(COALESCE(tranid, '')) = lower($1)
+            OR lower(COALESCE(dispatch_ref, '')) = lower($1)
+            OR netsuite_id::text = $1
+         ORDER BY CASE
+           WHEN lower(COALESCE(tranid, '')) = lower($1) THEN 0
+           WHEN lower(COALESCE(dispatch_ref, '')) = lower($1) THEN 1
+           ELSE 2
+         END
+         LIMIT 1
+      )
+      RETURNING netsuite_id, tranid, dispatch_ref, is_blanket_po,
+                blanket_flagged_at, blanket_flagged_by`,
+    [ref, flagged, String(updatedBy || "").trim()]
+  );
+  const row = result.rows[0];
+  if (!row) throw Object.assign(new Error(`Purchase order ${ref} was not found.`), { status: 404 });
+  return {
+    netsuiteId: row.netsuite_id,
+    orderRef: row.tranid || ref,
+    dispatchRef: row.dispatch_ref || "",
+    isBlanket: row.is_blanket_po === true,
+    flaggedAt: row.blanket_flagged_at,
+    flaggedBy: row.blanket_flagged_by || ""
+  };
 }
 
 function scmOrderVendorLabel(order = {}) {
@@ -2167,7 +2242,7 @@ export async function listScmSchedule({
     globalSearch ? [] : normalizeScmScheduleFilterValues(brand, { lowercase: true }),
     globalSearch ? null : String(from || "").trim() || null,
     globalSearch ? null : String(to || "").trim() || null,
-    globalSearch ? "" : String(view || "").trim()
+    String(view || "").trim().toLowerCase()
   ];
   const result = await query(
     `
@@ -2219,7 +2294,9 @@ export async function listScmSchedule({
         po.expected_delivery_date,
         COALESCE(po.synced_at, po.status_updated_at, now()) AS queued_at,
         COALESCE(SUM(GREATEST(COALESCE(l.pallet_qty, 0) - COALESCE(l.received_pallet_qty, 0), 0)), 0) AS total_pallet_qty,
-        COALESCE(SUM(GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0), 0) * COALESCE(l.item_weight, 0)), 0) AS weight_lbs
+        COALESCE(SUM(GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0), 0) * COALESCE(l.item_weight, 0)), 0) AS weight_lbs,
+        po.initial_scm_status,
+        po.is_blanket_po
       FROM purchase_orders po
       LEFT JOIN dispatch_scm_po_splits active_split
         ON active_split.split_po_id = po.netsuite_id
@@ -2286,7 +2363,9 @@ export async function listScmSchedule({
         t.expected_delivery_date,
         COALESCE(t.synced_at, t.status_updated_at, now()) AS queued_at,
         COALESCE(SUM(GREATEST(COALESCE(l.pallet_qty, 0) - GREATEST(COALESCE(l.fulfilled_pallet_qty, 0), COALESCE(l.received_pallet_qty, 0)), 0)), 0) AS total_pallet_qty,
-        COALESCE(SUM(GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_qty, 0), 0) * COALESCE(l.item_weight, 0)), 0) AS weight_lbs
+        COALESCE(SUM(GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_qty, 0), 0) * COALESCE(l.item_weight, 0)), 0) AS weight_lbs,
+        'Queued'::text AS initial_scm_status,
+        false AS is_blanket_po
       FROM transfer_orders t
       LEFT JOIN transfer_order_lines l ON l.transfer_order_id = t.netsuite_id AND l.netsuite_active = true
       WHERE t.netsuite_active = true
@@ -2327,7 +2406,9 @@ export async function listScmSchedule({
         NULL::date AS expected_delivery_date,
         v.created_at AS queued_at,
         COALESCE(SUM(l.pallet_qty), 0) AS total_pallet_qty,
-        COALESCE(SUM(l.weight_lbs), 0) AS weight_lbs
+        COALESCE(SUM(l.weight_lbs), 0) AS weight_lbs,
+        'Queued'::text AS initial_scm_status,
+        false AS is_blanket_po
       FROM scm_vrma_orders v
       LEFT JOIN scm_vrma_order_lines l ON l.vrma_order_id = v.id
       GROUP BY v.id
@@ -2355,14 +2436,47 @@ export async function listScmSchedule({
         plan_order.order_kind,
         plan_order.order_ref,
         p.plan_date AS eta_date,
-        COALESCE(NULLIF(stop.value->>'arriveTime', ''), NULLIF(stop.value->>'plannedArrive', ''), '') AS eta_time,
-        COALESCE(NULLIF(truck.value->>'driverName', ''), NULLIF(truck.value->>'driver', ''), '') AS driver,
-        trim(concat_ws(' ', NULLIF(truck.value->>'plate', ''), NULLIF(load.value->>'name', ''))) AS notes
+        stop_schedule.eta_time,
+        COALESCE(
+          NULLIF(load.value->>'driverName', ''),
+          NULLIF(load.value->>'driver_name', ''),
+          NULLIF(load.value->>'driverLogin', ''),
+          NULLIF(load.value->>'driver_login', ''),
+          NULLIF(truck.value->>'driverName', ''),
+          NULLIF(truck.value->>'driver', ''),
+          NULLIF(truck.value->>'driverLogin', ''),
+          ''
+        ) AS driver,
+        trim(concat_ws(' ',
+          COALESCE(
+            NULLIF(load.value->>'truckPlate', ''),
+            NULLIF(load.value->>'truck_plate', ''),
+            NULLIF(truck.value->>'plate', '')
+          ),
+          NULLIF(load.value->>'name', ''),
+          CASE
+            WHEN COALESCE(NULLIF(load.value->>'parkingSpot', ''), NULLIF(load.value->>'parking_spot', '')) IS NOT NULL
+              THEN 'Parking ' || COALESCE(NULLIF(load.value->>'parkingSpot', ''), NULLIF(load.value->>'parking_spot', ''))
+          END
+        )) AS notes
       FROM dispatch_plans p
       JOIN dispatch_plan_snapshots snap ON snap.plan_id = p.id
       CROSS JOIN LATERAL jsonb_array_elements(COALESCE(snap.trucks, '[]'::jsonb)) truck(value)
       CROSS JOIN LATERAL jsonb_array_elements(COALESCE(truck.value->'loads', '[]'::jsonb)) load(value)
       CROSS JOIN LATERAL jsonb_array_elements(COALESCE(load.value->'stops', '[]'::jsonb)) stop(value)
+      CROSS JOIN LATERAL (
+        SELECT COALESCE(
+          NULLIF(stop.value->>'arriveTime', ''),
+          NULLIF(stop.value->>'plannedArrive', ''),
+          CASE
+            WHEN COALESCE(stop.value->'timing'->>'arrival', '') ~ '^[0-9]+([.][0-9]+)?$' THEN
+              lpad(floor((stop.value->'timing'->>'arrival')::numeric / 60)::integer::text, 2, '0')
+              || ':' ||
+              lpad(mod(floor((stop.value->'timing'->>'arrival')::numeric)::integer, 60)::text, 2, '0')
+          END,
+          ''
+        ) AS eta_time
+      ) stop_schedule
       JOIN plan_order_types plan_order
         ON plan_order.plan_id = snap.plan_id
        AND plan_order.order_ref = stop.value->>'orderId'
@@ -2370,7 +2484,7 @@ export async function listScmSchedule({
         AND COALESCE(stop.value->>'orderId', '') <> ''
         AND COALESCE(load.value->>'returnOnly', 'false') <> 'true'
       ORDER BY plan_order.order_kind, plan_order.order_ref, p.plan_date DESC,
-               COALESCE(NULLIF(stop.value->>'arriveTime', ''), NULLIF(stop.value->>'plannedArrive', ''), '') DESC
+               stop_schedule.eta_time DESC
     )
     SELECT
       COALESCE(s.id, 0) AS schedule_id,
@@ -2383,6 +2497,7 @@ export async function listScmSchedule({
       b.party,
       COALESCE(NULLIF(s.display_ref, ''), b.order_ref) AS display_ref,
       COALESCE(s.is_special_order, false) AS is_special_order,
+      b.is_blanket_po,
       CASE WHEN b.order_kind = 'VRMA' THEN 'MBT' ELSE COALESCE(s.method, 'MBT') END AS method,
       NULLIF(s.pickup_point, '') AS schedule_pickup_point,
       CASE WHEN b.order_kind = 'VRMA'
@@ -2400,9 +2515,9 @@ export async function listScmSchedule({
       COALESCE(NULLIF(s.packing_slip_ref, ''), b.dispatch_ref, '') AS packing_slip_ref,
       COALESCE(s.group_ref, '') AS group_ref,
       CASE
-        WHEN COALESCE(s.status, '') IN ('Completed', 'Cancelled', 'Hold') THEN s.status
+        WHEN COALESCE(s.status, b.initial_scm_status, '') IN ('Completed', 'Cancelled', 'Hold') THEN COALESCE(s.status, b.initial_scm_status)
         WHEN planned.order_ref IS NOT NULL THEN 'Planned'
-        ELSE COALESCE(s.status, 'Queued')
+        ELSE COALESCE(s.status, b.initial_scm_status, 'Queued')
       END AS status,
       COALESCE(s.created_at, b.queued_at) AS queued_at,
       COALESCE(s.eta_date, planned.eta_date, b.expected_delivery_date) AS eta_date,
@@ -2412,7 +2527,7 @@ export async function listScmSchedule({
         WHEN COALESCE(s.eta_date, planned.eta_date, b.expected_delivery_date) IS NULL OR COALESCE(s.created_at, b.queued_at) IS NULL THEN NULL
         ELSE COALESCE(s.eta_date, planned.eta_date, b.expected_delivery_date) - COALESCE(s.created_at, b.queued_at)::date
       END AS sla_days,
-      COALESCE(NULLIF(s.notes, ''), planned.notes, '') AS notes,
+      COALESCE(NULLIF(s.notes, ''), NULLIF(s.dispatch_assignment_note, ''), planned.notes, '') AS notes,
       s.updated_at,
       s.updated_by
     FROM base b
@@ -2423,11 +2538,13 @@ export async function listScmSchedule({
       ON planned.order_kind = b.order_kind
      AND lower(planned.order_ref) = lower(b.order_ref)
     WHERE ($1 = '' OR lower(concat_ws(' ', b.order_ref, b.source_ref, b.dispatch_ref, b.party, b.pickup_point, b.dropoff_point, b.brand, b.content, s.packing_slip_ref, s.group_ref)) LIKE '%' || $1 || '%')
+      AND ($9 = 'blanket' OR NOT COALESCE(b.is_blanket_po, false))
+      AND ($9 <> 'blanket' OR b.order_kind = 'PO')
       AND (cardinality($2::text[]) = 0 OR (
         CASE
-          WHEN COALESCE(s.status, '') IN ('Completed', 'Cancelled', 'Hold') THEN s.status
+          WHEN COALESCE(s.status, b.initial_scm_status, '') IN ('Completed', 'Cancelled', 'Hold') THEN COALESCE(s.status, b.initial_scm_status)
           WHEN planned.order_ref IS NOT NULL THEN 'Planned'
-          ELSE COALESCE(s.status, 'Queued')
+          ELSE COALESCE(s.status, b.initial_scm_status, 'Queued')
         END
       ) = ANY($2::text[]))
       AND ($3 = '' OR COALESCE(s.method, 'MBT') = $3)
@@ -2445,23 +2562,23 @@ export async function listScmSchedule({
         OR $9 <> 'dispatch'
         OR (COALESCE(s.method, 'MBT') = 'MBT' AND (
           CASE
-            WHEN COALESCE(s.status, '') IN ('Completed', 'Cancelled', 'Hold') THEN s.status
+            WHEN COALESCE(s.status, b.initial_scm_status, '') IN ('Completed', 'Cancelled', 'Hold') THEN COALESCE(s.status, b.initial_scm_status)
             WHEN planned.order_ref IS NOT NULL THEN 'Planned'
-            ELSE COALESCE(s.status, 'Queued')
+            ELSE COALESCE(s.status, b.initial_scm_status, 'Queued')
           END
         ) NOT IN ('Cancelled', 'Hold'))
       )
       AND (
         $9 = ''
         OR $9 <> 'completed'
-        OR COALESCE(s.status, 'Queued') = 'Completed'
+        OR COALESCE(s.status, b.initial_scm_status, 'Queued') = 'Completed'
       )
     ORDER BY
       CASE (
         CASE
-          WHEN COALESCE(s.status, '') IN ('Completed', 'Cancelled', 'Hold') THEN s.status
+          WHEN COALESCE(s.status, b.initial_scm_status, '') IN ('Completed', 'Cancelled', 'Hold') THEN COALESCE(s.status, b.initial_scm_status)
           WHEN planned.order_ref IS NOT NULL THEN 'Planned'
-          ELSE COALESCE(s.status, 'Queued')
+          ELSE COALESCE(s.status, b.initial_scm_status, 'Queued')
         END
       )
         WHEN 'Urgent' THEN 0
@@ -2556,6 +2673,7 @@ export async function listScmSchedule({
       party: row.party || "",
       displayRef: row.display_ref || row.order_ref,
       isSpecialOrder: row.is_special_order === true,
+      isBlanket: row.is_blanket_po === true,
       method: row.method || "MBT",
       pickupPoint,
       dropoffPoint: row.dropoff_point || "",
@@ -3459,12 +3577,24 @@ export async function createScmVrmaOrder({
   });
 }
 
+function dispatchScheduleEtaTime(stop = {}) {
+  const legacyTime = String(stop.arriveTime || stop.plannedArrive || "").trim();
+  if (legacyTime) return legacyTime;
+  const rawArrival = stop?.timing?.arrival;
+  if (rawArrival === null || rawArrival === undefined || rawArrival === "") return "";
+  const arrival = Number(rawArrival);
+  if (!Number.isFinite(arrival) || arrival < 0) return "";
+  const minute = Math.floor(arrival);
+  return `${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}`;
+}
+
 export async function syncScmScheduleFromDispatchPlan(plan, { updatedBy = "dispatch-plan" } = {}) {
   if (!plan?.planDate || !Array.isArray(plan.trucks)) return { planned: 0 };
   const plannedRows = [];
   for (const truck of plan.trucks || []) {
     for (const load of truck.loads || []) {
       if (load.returnOnly) continue;
+      const assignment = dispatchLoadAssignment(truck, load);
       for (const stop of load.stops || []) {
         if (stop.type !== "drop" || !stop.orderId) continue;
         const order = (plan.orders || []).find((item) => item.id === stop.orderId);
@@ -3472,12 +3602,12 @@ export async function syncScmScheduleFromDispatchPlan(plan, { updatedBy = "dispa
         plannedRows.push({
           orderRef: order.id,
           orderKind: order.sourceTable === "scm_vrma_orders" ? "VRMA" : order.type === "TO" ? "TO" : "PO",
-          truckPlate: truck.plate || "",
-          driver: truck.driverName || truck.driver || "",
+          truckPlate: assignment.truckPlate,
+          driver: assignment.driverName || assignment.driverLogin,
           loadName: load.name || "",
-          parkingSpot: load.parkingSpot || truck.parkingSpot || "",
+          parkingSpot: assignment.parkingSpot,
           etaDate: plan.planDate,
-          etaTime: stop.arriveTime || stop.plannedArrive || ""
+          etaTime: dispatchScheduleEtaTime(stop)
         });
       }
     }
@@ -3505,7 +3635,7 @@ export async function syncScmScheduleFromDispatchPlan(plan, { updatedBy = "dispa
   for (const row of plannedRows) {
     await query(
       `INSERT INTO scm_transport_schedule (
-         order_kind, order_ref, method, status, eta_date, eta_time, driver, notes, updated_by, created_by
+         order_kind, order_ref, method, status, eta_date, eta_time, driver, dispatch_assignment_note, updated_by, created_by
        )
        VALUES ($1, $2, 'MBT', 'Planned', $3::date, NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''), $7, $7)
        ON CONFLICT (order_kind, order_ref) DO UPDATE SET
@@ -3517,7 +3647,7 @@ export async function syncScmScheduleFromDispatchPlan(plan, { updatedBy = "dispa
          eta_date = EXCLUDED.eta_date,
          eta_time = EXCLUDED.eta_time,
          driver = EXCLUDED.driver,
-         notes = COALESCE(NULLIF(scm_transport_schedule.notes, ''), EXCLUDED.notes),
+         dispatch_assignment_note = EXCLUDED.dispatch_assignment_note,
          updated_by = EXCLUDED.updated_by,
          updated_at = now()`,
       [
@@ -3526,7 +3656,7 @@ export async function syncScmScheduleFromDispatchPlan(plan, { updatedBy = "dispa
         row.etaDate,
         row.etaTime,
         row.driver,
-        `${row.truckPlate} ${row.loadName}`.trim(),
+        `${row.truckPlate} ${row.loadName}${row.parkingSpot ? ` Parking ${row.parkingSpot}` : ""}`.trim(),
         updatedBy || null
       ]
     );

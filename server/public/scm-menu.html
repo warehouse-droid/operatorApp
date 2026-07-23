@@ -52,6 +52,15 @@
                 <strong>Smart SCM</strong>
                 <span>Review versioned inputs, demand evidence, PO / TO suggestions, vendor replies, and controlled execution.</span>
               </button>
+              <button class="dispatch-menu-card primary-card" onclick="location.href='/scm/netsuite-po'" type="button">
+                <strong>NetSuite PO</strong>
+                <span>Review vendor-confirmed purchase quantities, pricing, and accounting insertion status.</span>
+              </button>
+
+              ${canEdit ? `<button class="dispatch-menu-card primary-card" onclick="location.href='/scm/vendors'" type="button">
+                <strong>Local Vendors</strong>
+                <span>Add or rename local vendors and yards, then maintain each yard's opening days and hours.</span>
+              </button>` : ""}
               ${canEdit ? `<button class="dispatch-menu-card primary-card" onclick="location.href='/scm/transfer-dependencies'" type="button">
                 <strong>Auto Transfer</strong>
                 <span>Review Sales Order shortages, allocate stock across yards, and create dependent Transfer Orders.</span>

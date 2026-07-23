@@ -215,9 +215,27 @@ function smartItemYard(item, locationId) {
     yardCode: String(locationId),
     eligible: false,
     capacityPallets: 25,
+    capacitySource: "default",
+    capacityManuallyOverridden: false,
     serviceQuantile: Number(locationId) === 15 ? 0.95 : 0.90,
     minimumSafetyPallets: 1
   };
+}
+
+function smartCapacityProvenance(policy = {}) {
+  const source = String(policy.capacitySource || "default").trim().toLowerCase();
+  if (policy.capacityManuallyOverridden || source === "manual") return "Manual override";
+  if (source === "decision_workbook") {
+    const sheet = String(policy.capacitySourceSheet || "*_Cal").trim();
+    const row = Number(policy.capacitySourceRow);
+    const reference = Number.isInteger(row) && row > 1 ? `${sheet} row ${row}` : sheet;
+    const method = String(policy.capacityMatchMethod || "").trim().replaceAll("_", " ");
+    return method ? `${reference} · ${method}` : reference;
+  }
+  if (source === "legacy_import") return "Legacy import · awaiting verified *_Cal match";
+  return Number(policy.capacityPallets) === 25
+    ? "Default 25 · no verified *_Cal match"
+    : "Default · no verified *_Cal match";
 }
 
 function smartItemBalance(item, locationId) {
@@ -289,6 +307,7 @@ function smartItemYardCell(item, yard) {
     <span>${pallets === null ? "No ToPLT" : `${smartNumber(pallets, 2)} PLT available`}</span>
     <label><input data-item-yard-enabled="${yard.locationId}" data-service-quantile="${policy.serviceQuantile}" data-minimum-safety="${policy.minimumSafetyPallets}" type="checkbox" ${policy.eligible ? "checked" : ""} ${smartCanWrite() ? "" : "disabled"} /> Plan this yard</label>
     <label class="smart-capacity">Capacity <input data-item-yard-capacity="${yard.locationId}" type="number" min="0" step="1" value="${smartEscape(policy.capacityPallets)}" ${smartCanWrite() ? "" : "disabled"} /> PLT</label>
+    <small class="smart-capacity-provenance">${smartEscape(smartCapacityProvenance(policy))}</small>
   </td>`;
 }
 
@@ -338,6 +357,30 @@ function smartItemMaster() {
     </section>`;
 }
 
+function smartForecastStockPolicy(row) {
+  const calculationDriver = row.stockPolicyModel && row.stockPolicyModel !== "formula"
+    ? `${smartEscape(row.stockPolicyModel)} quantile target`
+    : `factor ${smartNumber(row.safetyFactor, 3)}`;
+  let formulaExplanation;
+  if (row.stockPolicyModel && row.stockPolicyModel !== "formula") {
+    formulaExplanation = `<small>ROP and preferred use the active ${smartEscape(row.stockPolicyModel)} quantiles and remain capped by ${smartNumber(row.capacityPallets, 2)} PLT capacity.</small>`;
+  } else if (row.zeroDemandCoverageApplied) {
+    formulaExplanation = `<small>Base ROP = round(${smartNumber(row.safetyStockPallets, 3)} safety + ${smartNumber(row.weeklyDemandPallets, 2)} demand × ${smartNumber(row.leadWeeks, 2)} lead) = ${smartNumber(row.baseReorderPointPallets, 2)} PLT; coverage floor raises final ROP to ${smartNumber(row.reorderPointPallets, 2)} PLT.</small>
+      <small>Preferred = min(${smartNumber(row.capacityPallets, 2)} capacity, max(${smartNumber(row.basePreferredPallets, 2)} base preferred, ${smartNumber(row.reorderPointPallets, 2)} ROP)) = ${smartNumber(row.preferredPallets, 2)} PLT</small>`;
+  } else {
+    formulaExplanation = `<small>ROP = round(${smartNumber(row.safetyStockPallets, 3)} safety + ${smartNumber(row.weeklyDemandPallets, 2)} demand × ${smartNumber(row.leadWeeks, 2)} lead) = ${smartNumber(row.baseReorderPointPallets, 2)} PLT</small>
+      <small>Preferred = min(${smartNumber(row.capacityPallets, 2)} capacity, ceil(${smartNumber(row.reorderPointPallets, 2)} ROP + ${smartNumber(row.weeklyDemandPallets, 2)} demand × ${smartNumber(row.leadWeeks, 2)} lead)) = ${smartNumber(row.preferredPallets, 2)} PLT</small>`;
+  }
+  return `<div class="smart-stock-policy">
+    <span>Safety stock <strong>${smartNumber(row.safetyStockPallets, 3)} PLT</strong></span>
+    <span>ROP <strong>${smartNumber(row.reorderPointPallets, 2)} PLT</strong></span>
+    <span>Preferred stock level <strong>${smartNumber(row.preferredPallets, 2)} PLT</strong></span>
+    <span>Capacity <strong>${smartNumber(row.capacityPallets, 2)} PLT</strong></span>
+    <small>${smartNumber(row.weeklyDemandPallets, 2)} PLT/week · SD ${smartNumber(row.weeklyDemandSdPallets, 3)} · ${smartNumber(row.leadWeeks, 2)} lead weeks · ${calculationDriver} · current policy/settings</small>
+    ${formulaExplanation}
+  </div>`;
+}
+
 function smartForecasts() {
   const rows = smartState.forecasts || [];
   const latest = smartState.data.forecastRuns?.[0];
@@ -353,8 +396,8 @@ function smartForecasts() {
         <span class="smart-help">Current: ${smartEscape(sync.salesFilename || "legacy workbook fallback")} · ${smartNumber(sync.salesFactCount, 0)} rows · ${smartDate(sync.salesCoverageStart)} to ${smartDate(sync.salesSyncedThrough)}</span>
       </div>
       <div class="smart-toolbar"><input id="smartForecastSearch" type="search" value="${smartEscape(smartState.forecastSearch)}" placeholder="Item, ID, series, or vendor" /><select id="smartForecastYard"><option value="">All yards</option>${["3445", "2967", "12441", "150"].map((yard) => `<option value="${yard}" ${smartState.forecastYard === yard ? "selected" : ""}>${yard}</option>`).join("")}</select><button class="smart-button" data-smart-action="filter-forecasts" type="button">Apply</button>${latest ? `<span class="smart-help">Run #${latest.id} · cutoff ${smartDate(latest.dataCutoff)} · ${smartNumber(latest.metrics?.scoredSeries, 0)} backtested series</span>` : ""}</div>
-      <div class="smart-table-wrap"><table class="smart-table"><thead><tr><th>Item</th><th>Yard</th><th>Series</th><th>Selected / active</th><th>Confidence</th><th class="numeric">History</th><th class="numeric">P50 / week</th><th class="numeric">P90 / week</th><th class="numeric">Lead P90</th><th class="numeric">WAPE</th><th class="numeric">Bias</th><th>Zero-demand coverage</th><th>Gate</th></tr></thead><tbody>
-        ${rows.map((row) => `<tr><td><strong>${smartEscape(row.itemName || row.itemId)}</strong><div class="smart-help">ID ${row.itemId}</div></td><td>${smartEscape(row.yardCode)}</td><td>${smartEscape(row.series || "—")}</td><td>${smartEscape(row.selectedModel)}<div class="smart-help">active: ${smartEscape(row.authoritativeModel)}</div></td><td>${smartPill(row.confidence)}</td><td class="numeric">${row.historyWeeks} wk<br><span class="smart-help">${row.positiveWeeks} positive</span></td><td class="numeric">${smartNumber(row.p50Weekly, 2)}</td><td class="numeric">${smartNumber(row.p90Weekly, 2)}</td><td class="numeric">${smartNumber(row.leadTimeP90, 2)}</td><td class="numeric">${row.wape === null ? "—" : smartPercent(row.wape, 1)}</td><td class="numeric">${row.bias === null ? "—" : smartPercent(row.bias, 1)}</td><td>${row.coverageFloorPallets > 0 ? `<strong>${smartNumber(row.coverageFloorPallets, 0)} PLT</strong><div class="smart-help">${smartNumber(row.representativeOrderPallets, 2)} PLT/order × ${smartNumber(row.coverageOrderCount, 0)} · ${smartEscape(row.coverageSource)}</div>${row.zeroDemandCoverageApplied ? smartPill("ok", "Active") : smartPill("warn", "Preview")}${row.coverageCapacityShortfall ? smartPill("attention", "Capacity capped") : ""}` : `<span class="smart-help">No usable order evidence</span>`}</td><td>${row.eligibleForPromotion ? `${smartPill("ok", "Eligible")}${smartCanWrite() ? `<div><button class="smart-button" data-smart-action="promote-model" data-yard="${smartEscape(row.yardCode)}" data-series="${smartEscape(row.series || "*")}" type="button">Promote segment</button></div>` : ""}` : smartPill("warn", "Shadow only")}</td></tr>`).join("") || `<tr><td colspan="13" class="smart-empty">No forecast matches this filter. Enable the item and at least one yard in Item Master, then run a forecast.</td></tr>`}
+      <div class="smart-table-wrap"><table class="smart-table"><thead><tr><th>Item</th><th>Yard</th><th>Series</th><th>Selected / active</th><th>Confidence</th><th class="numeric">History</th><th class="numeric">P50 / week</th><th class="numeric">P90 / week</th><th class="numeric">Lead P90</th><th class="numeric">WAPE</th><th class="numeric">Bias</th><th>Current stock policy</th><th>Zero-demand coverage</th><th>Gate</th></tr></thead><tbody>
+        ${rows.map((row) => `<tr><td><strong>${smartEscape(row.itemName || row.itemId)}</strong><div class="smart-help">ID ${row.itemId}</div></td><td>${smartEscape(row.yardCode)}</td><td>${smartEscape(row.series || "—")}</td><td>${smartEscape(row.selectedModel)}<div class="smart-help">active: ${smartEscape(row.authoritativeModel)}</div></td><td>${smartPill(row.confidence)}</td><td class="numeric">${row.historyWeeks} wk<br><span class="smart-help">${row.positiveWeeks} positive</span></td><td class="numeric">${smartNumber(row.p50Weekly, 2)}</td><td class="numeric">${smartNumber(row.p90Weekly, 2)}</td><td class="numeric">${smartNumber(row.leadTimeP90, 2)}</td><td class="numeric">${row.wape === null ? "—" : smartPercent(row.wape, 1)}</td><td class="numeric">${row.bias === null ? "—" : smartPercent(row.bias, 1)}</td><td>${smartForecastStockPolicy(row)}</td><td>${row.coverageFloorPallets > 0 ? `<strong>${smartNumber(row.coverageFloorPallets, 0)} PLT</strong><div class="smart-help">${smartNumber(row.representativeOrderPallets, 2)} PLT/order × ${smartNumber(row.coverageOrderCount, 0)} · ${smartEscape(row.coverageSource)}</div>${row.zeroDemandCoverageApplied ? smartPill("ok", "Active") : smartPill("warn", "Preview")}${row.coverageCapacityShortfall ? smartPill("attention", "Capacity capped") : ""}` : `<span class="smart-help">No usable order evidence</span>`}</td><td>${row.eligibleForPromotion ? `${smartPill("ok", "Eligible")}${smartCanWrite() ? `<div><button class="smart-button" data-smart-action="promote-model" data-yard="${smartEscape(row.yardCode)}" data-series="${smartEscape(row.series || "*")}" type="button">Promote segment</button></div>` : ""}` : smartPill("warn", "Shadow only")}</td></tr>`).join("") || `<tr><td colspan="14" class="smart-empty">No forecast matches this filter. Enable the item and at least one yard in Item Master, then run a forecast.</td></tr>`}
       </tbody></table></div>
     </section>`;
 }

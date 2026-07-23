@@ -12,6 +12,7 @@ const dependencyState = {
   selectedSalesOrderId: null,
   inventory: null,
   batch: null,
+  selectedProposalIds: new Set(),
   search: "",
   reviewStatus: "open",
   busy: "",
@@ -176,6 +177,7 @@ async function loadSelectedDependencyInventory({ forceRefresh = false, refreshUn
   }
   const selectedOrder = depSelectedOrder();
   if (selectedOrder?.dependencyBatchId) {
+    clearDependencyProposalSelection();
     dependencyState.batch = await depApi(`/api/scm/transfer-dependencies/batches/${selectedOrder.dependencyBatchId}`);
   }
   const shouldRefresh = forceRefresh || (
@@ -198,6 +200,78 @@ function depCandidateQuery() {
 function depYardOptions(selected) {
   return DEPENDENCY_YARDS.map((yard) => `<option value="${yard.id}" ${String(yard.id) === String(selected) ? "selected" : ""}>${yard.code}</option>`).join("");
 }
+
+function clearDependencyProposalSelection() {
+  dependencyState.selectedProposalIds.clear();
+}
+
+function pruneDependencyProposalSelection() {
+  const selectableIds = new Set((dependencyState.batch?.proposals || [])
+    .filter((proposal) => proposal.creationStatus === "draft")
+    .map((proposal) => Number(proposal.id)));
+  for (const proposalId of dependencyState.selectedProposalIds) {
+    if (!selectableIds.has(Number(proposalId))) dependencyState.selectedProposalIds.delete(proposalId);
+  }
+}
+
+function dependencyMergeEntry(entry = {}) {
+  const fieldValue = (name, fallback) => entry.querySelector?.(`[data-proposal-field="${name}"]`)?.value ?? entry[fallback];
+  return {
+    id: Number(entry.dataset?.proposalId ?? entry.id),
+    mode: String(fieldValue("mode", "mode") || ""),
+    fromLocationId: String(fieldValue("fromLocationId", "fromLocationId") || ""),
+    toLocationId: String(fieldValue("toLocationId", "toLocationId") || "")
+  };
+}
+
+function dependencyProposalMergeCompatibility(entries = []) {
+  const selected = entries.map(dependencyMergeEntry);
+  if (selected.length < 2) {
+    return { eligible: false, selected, reason: selected.length ? "Select at least one more draft TO." : "Select two or more draft TOs to merge." };
+  }
+  const target = selected[0];
+  if (selected.some((entry) => !entry.fromLocationId || !entry.toLocationId)) {
+    return { eligible: false, selected, target, reason: "Select a From and Accounting To yard for every selected TO." };
+  }
+  if (selected.some((entry) => entry.fromLocationId === entry.toLocationId)) {
+    return { eligible: false, selected, target, reason: "A Transfer Order cannot use the same yard as both From and Accounting To." };
+  }
+  if (selected.some((entry) => entry.fromLocationId !== target.fromLocationId || entry.toLocationId !== target.toLocationId)) {
+    return { eligible: false, selected, target, reason: "Selected TOs must use the same From and Accounting To yards." };
+  }
+  if (selected.some((entry) => entry.mode !== target.mode)) {
+    return { eligible: false, selected, target, reason: "Selected TOs must use the same dispatch Mode." };
+  }
+  return {
+    eligible: true,
+    selected,
+    target,
+    reason: `Ready to combine ${selected.length} drafts; the first selected TO's memo is retained.`
+  };
+}
+
+function selectedDependencyProposalCards() {
+  return [...dependencyState.selectedProposalIds]
+    .map((proposalId) => scmDependencyApp.querySelector(`.scm-dependency-proposal[data-proposal-id="${proposalId}"]`))
+    .filter(Boolean);
+}
+
+function updateDependencyProposalMergeState() {
+  const cards = selectedDependencyProposalCards();
+  const compatibility = dependencyProposalMergeCompatibility(cards);
+  for (const card of scmDependencyApp.querySelectorAll(".scm-dependency-proposal")) {
+    card.classList.toggle("merge-selected", dependencyState.selectedProposalIds.has(Number(card.dataset.proposalId)));
+  }
+  const button = scmDependencyApp.querySelector('[data-action="merge-proposals"]');
+  if (button) {
+    button.textContent = `Merge selected (${cards.length})`;
+    button.disabled = Boolean(dependencyState.busy) || !compatibility.eligible;
+  }
+  const hint = scmDependencyApp.querySelector("[data-merge-proposal-hint]");
+  if (hint) hint.textContent = compatibility.reason;
+  return compatibility;
+}
+
 
 function renderDependencyCandidates() {
   if (!dependencyState.candidates.length) {
@@ -304,6 +378,8 @@ function renderInventoryMatrix() {
 }
 
 function renderProposal(proposal) {
+  const mergeSelectable = proposal.creationStatus === "draft";
+  const mergeSelected = dependencyState.selectedProposalIds.has(Number(proposal.id));
   const editable = !["created", "creating", "attention"].includes(proposal.creationStatus);
   const recoverable = proposal.creationStatus === "creating";
   const created = ["created", "attention"].includes(proposal.creationStatus) && proposal.transferOrderId;
@@ -317,9 +393,15 @@ function renderProposal(proposal) {
       ? "Get Ticket & Print"
       : "Verify, Approve & Print";
   return `
-    <article class="scm-dependency-proposal" data-proposal-id="${proposal.id}" data-creation-status="${depEscape(proposal.creationStatus)}" data-pallet-overridden="${proposal.palletQuantityOverridden === true}">
+    <article class="scm-dependency-proposal ${mergeSelected ? "merge-selected" : ""}" data-proposal-id="${proposal.id}" data-creation-status="${depEscape(proposal.creationStatus)}" data-pallet-overridden="${proposal.palletQuantityOverridden === true}">
       <header>
-        <strong>${depEscape(proposal.transferOrderRef || `Proposed TO ${proposal.id}`)}</strong>
+        <div class="scm-dependency-proposal-heading">
+          ${mergeSelectable ? `<label class="scm-dependency-proposal-select">
+            <input data-field="merge-proposal" type="checkbox" ${mergeSelected ? "checked" : ""} ${dependencyState.busy ? "disabled" : ""} aria-label="Select Proposed TO ${proposal.id} for merge" />
+            <span>Select</span>
+          </label>` : ""}
+          <strong>${depEscape(proposal.transferOrderRef || `Proposed TO ${proposal.id}`)}</strong>
+        </div>
         <span class="dependency-status status-${depEscape(proposal.creationStatus)}">${depEscape(proposal.creationStatus)}</span>
       </header>
       <div class="scm-dependency-proposal-route">
@@ -400,10 +482,19 @@ function renderProposal(proposal) {
 function renderDependencyProposals() {
   const batch = dependencyState.batch;
   if (!batch) return `<div class="empty-state">Generate a suggestion to create editable transfer proposals.</div>`;
+  pruneDependencyProposalSelection();
+  const selectedProposals = [...dependencyState.selectedProposalIds]
+    .map((proposalId) => batch.proposals.find((proposal) => Number(proposal.id) === Number(proposalId)))
+    .filter(Boolean);
+  const mergeCompatibility = dependencyProposalMergeCompatibility(selectedProposals);
   return `
     <div class="scm-dependency-batch-head">
       <div><span>Batch</span><strong>#${batch.id} | ${depEscape(batch.status)}</strong></div>
       <div><span>Uncovered</span><strong class="${batch.uncoveredShortageQuantity > 0 ? "warning-text" : ""}">${depQty(batch.uncoveredShortageQuantity)}</strong></div>
+      <div class="scm-dependency-merge-actions">
+        <button data-action="merge-proposals" type="button" ${!dependencyState.busy && mergeCompatibility.eligible ? "" : "disabled"}>Merge selected (${selectedProposals.length})</button>
+        <small data-merge-proposal-hint>${depEscape(mergeCompatibility.reason)}</small>
+      </div>
     </div>
     <div class="scm-dependency-proposal-list">${batch.proposals.map(renderProposal).join("") || `<div class="empty-state">No source yard has available stock.</div>`}</div>
     <label class="scm-dependency-incomplete">
@@ -484,6 +575,7 @@ async function loadDependencyCandidates({ preserveSelection = true, refreshInven
   dependencyState.candidates = await depApi(`/api/scm/transfer-dependencies/candidates${depCandidateQuery()}`);
   if (!preserveSelection || !dependencyState.candidates.some((order) => String(order.salesOrderId) === String(dependencyState.selectedSalesOrderId))) {
     dependencyState.selectedSalesOrderId = dependencyState.candidates[0]?.salesOrderId || null;
+    clearDependencyProposalSelection();
     dependencyState.batch = null;
   }
   const nextSelected = depSelectedOrder();
@@ -494,6 +586,7 @@ async function loadDependencyCandidates({ preserveSelection = true, refreshInven
     && nextSelected.shortageSignature
     && previousSelected.shortageSignature !== nextSelected.shortageSignature;
   if (shortageChanged) {
+    clearDependencyProposalSelection();
     dependencyState.batch = null;
     dependencyState.notice = `${nextSelected.salesOrderRef} backorder changed in NetSuite. Generate a new proposal from the updated shortage.`;
   }
@@ -623,11 +716,25 @@ scmDependencyApp.addEventListener("input", (event) => {
 });
 
 scmDependencyApp.addEventListener("change", (event) => {
-  if (!event.target.matches('[data-proposal-unit="layers"]')) return;
-  event.target.value = String(Math.max(0, Math.round(depNumber(event.target.value))));
-  const row = event.target.closest("[data-sales-line-id]");
-  updateProposalSalesEquivalent(row);
-  updateProposalPalletEstimate(event.target.closest(".scm-dependency-proposal"));
+  if (event.target.matches('[data-field="merge-proposal"]')) {
+    const proposalId = Number(event.target.closest(".scm-dependency-proposal")?.dataset.proposalId);
+    if (Number.isInteger(proposalId)) {
+      if (event.target.checked) dependencyState.selectedProposalIds.add(proposalId);
+      else dependencyState.selectedProposalIds.delete(proposalId);
+    }
+    updateDependencyProposalMergeState();
+    return;
+  }
+  if (event.target.matches('[data-proposal-field="mode"], [data-proposal-field="fromLocationId"], [data-proposal-field="toLocationId"]')) {
+    updateDependencyProposalMergeState();
+    return;
+  }
+  if (event.target.matches('[data-proposal-unit="layers"]')) {
+    event.target.value = String(Math.max(0, Math.round(depNumber(event.target.value))));
+    const row = event.target.closest("[data-sales-line-id]");
+    updateProposalSalesEquivalent(row);
+    updateProposalPalletEstimate(event.target.closest(".scm-dependency-proposal"));
+  }
 });
 
 scmDependencyApp.addEventListener("click", async (event) => {
@@ -642,6 +749,7 @@ scmDependencyApp.addEventListener("click", async (event) => {
   }
   if (action === "select-order") {
     dependencyState.selectedSalesOrderId = target.dataset.orderId;
+    clearDependencyProposalSelection();
     dependencyState.batch = null;
     dependencyState.inventory = null;
     await runDependencyAction("Refreshing NetSuite inventory...", () => loadSelectedDependencyInventory());
@@ -684,12 +792,46 @@ scmDependencyApp.addEventListener("click", async (event) => {
   if (action === "generate") {
     const mode = scmDependencyApp.querySelector('[data-field="suggest-mode"]')?.value || "yard_replenishment";
     await runDependencyAction("Calculating routes and allocations...", async () => {
+      clearDependencyProposalSelection();
       dependencyState.batch = await depApi("/api/scm/transfer-dependencies/suggestions", {
         method: "POST",
         body: JSON.stringify({ salesOrderId: dependencyState.selectedSalesOrderId, mode, refreshInventory: true })
       });
       await loadSelectedDependencyInventory({ refreshUndercovered: false });
       dependencyState.notice = `Suggestion created for ${dependencyState.batch.salesOrderRef}.`;
+    });
+    return;
+  }
+  if (action === "merge-proposals") {
+    if (!dependencyState.batch) return;
+    const cards = selectedDependencyProposalCards();
+    const compatibility = dependencyProposalMergeCompatibility(cards);
+    if (!compatibility.eligible) {
+      updateDependencyProposalMergeState();
+      return;
+    }
+    const proposalIds = compatibility.selected.map((proposal) => proposal.id);
+    const targetProposalId = compatibility.target.id;
+    const targetCard = cards[0];
+    const fromYard = targetCard.querySelector('[data-proposal-field="fromLocationId"]')?.selectedOptions?.[0]?.textContent?.trim() || compatibility.target.fromLocationId;
+    const toYard = targetCard.querySelector('[data-proposal-field="toLocationId"]')?.selectedOptions?.[0]?.textContent?.trim() || compatibility.target.toLocationId;
+    const confirmation = `Merge ${proposalIds.length} proposed TOs from ${fromYard} to ${toYard}? A new draft will keep the first selected TO's memo, and nothing is sent to NetSuite yet.`;
+    if (!window.confirm(confirmation)) return;
+    const payload = {
+      ...collectDependencyBatchPayload(cards),
+      proposalIds,
+      targetProposalId
+    };
+    await runDependencyAction("Merging proposed Transfer Orders...", async () => {
+      const result = await depApi(`/api/scm/transfer-dependencies/batches/${dependencyState.batch.id}/proposals/merge`, {
+        method: "POST",
+        body: JSON.stringify(payload)
+      });
+      dependencyState.batch = result.batch;
+      clearDependencyProposalSelection();
+      dependencyState.notice = result.reused
+        ? `The existing merged draft for ${fromYard} → ${toYard} was recovered safely.`
+        : `${proposalIds.length} proposed TOs merged into one new draft for ${fromYard} → ${toYard}. Review it before creation.`;
     });
     return;
   }

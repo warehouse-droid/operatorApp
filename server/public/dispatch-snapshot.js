@@ -154,6 +154,7 @@ function renderSnapshotDetail() {
                 <div class="snapshot-load">
                   <strong>${escapeHtml(load.name || load.id || "Load")}</strong>
                   <span class="snapshot-load-orders">${escapeHtml((load.orderRefs || []).join(", ") || "-")}</span>
+                  <span>${escapeHtml(load.driverName || load.driverLogin || st("dispatch.unassigned", "Unassigned"))} | ${escapeHtml(load.truckPlate || truck.plate || st("dispatch.noTruck", "No truck"))}</span>
                   <span>${load.orderCount || 0} orders</span>
                   <span>${load.stopCount || 0} stops</span>
                 </div>

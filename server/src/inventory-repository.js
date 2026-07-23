@@ -53,11 +53,11 @@ export async function upsertInventoryBalances(rows) {
     await query(
       `INSERT INTO inventory_items (
          item_id, item_name, display_name, item_description, item_type, item_type_text,
-         stock_unit, item_weight, to_plt, to_lyr, to_sec, to_pcs, product_type, brand, series,
+         stock_unit, purchase_unit, item_weight, to_plt, to_lyr, to_sec, to_pcs, product_type, brand, series,
          vendor_id, vendor, netsuite_lead_time_days, netsuite_safety_stock_level,
-         netsuite_seasonal_demand, raw, synced_at
+         netsuite_seasonal_demand, last_purchase_price, raw, synced_at
        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-                 $16, $17, $18, $19, $20, $21::jsonb, now())
+                 $16, $17, $18, $19, $20, $21, $22, $23::jsonb, now())
        ON CONFLICT (item_id) DO UPDATE SET
          item_name = EXCLUDED.item_name,
          display_name = EXCLUDED.display_name,
@@ -65,6 +65,7 @@ export async function upsertInventoryBalances(rows) {
          item_type = EXCLUDED.item_type,
          item_type_text = EXCLUDED.item_type_text,
          stock_unit = EXCLUDED.stock_unit,
+         purchase_unit = EXCLUDED.purchase_unit,
          item_weight = EXCLUDED.item_weight,
          to_plt = EXCLUDED.to_plt,
          to_lyr = EXCLUDED.to_lyr,
@@ -75,6 +76,7 @@ export async function upsertInventoryBalances(rows) {
          netsuite_lead_time_days = EXCLUDED.netsuite_lead_time_days,
          netsuite_safety_stock_level = EXCLUDED.netsuite_safety_stock_level,
          netsuite_seasonal_demand = EXCLUDED.netsuite_seasonal_demand,
+         last_purchase_price = EXCLUDED.last_purchase_price,
          product_type = CASE WHEN inventory_items.classification_updated_by IS NULL THEN EXCLUDED.product_type ELSE inventory_items.product_type END,
          brand = CASE WHEN inventory_items.classification_updated_by IS NULL THEN EXCLUDED.brand ELSE inventory_items.brand END,
          series = CASE WHEN inventory_items.classification_updated_by IS NULL THEN EXCLUDED.series ELSE inventory_items.series END,
@@ -88,6 +90,7 @@ export async function upsertInventoryBalances(rows) {
         row.item_type || null,
         row.item_type_text || null,
         row.stock_unit || null,
+        row.purchase_unit || null,
         nullableNumber(row.item_weight),
         nullableNumber(row.to_plt),
         nullableNumber(row.to_lyr),
@@ -101,6 +104,7 @@ export async function upsertInventoryBalances(rows) {
         nullableNumber(row.netsuite_lead_time_days),
         nullableNumber(row.netsuite_safety_stock_level),
         nullableBoolean(row.netsuite_seasonal_demand),
+        nullableNumber(row.last_purchase_price),
         JSON.stringify(row)
       ]
     );
@@ -142,26 +146,26 @@ export async function upsertInventoryBalancesBulk(rows = []) {
       const fields = [
         Number(row.item_id), row.item_name || String(row.item_id), row.display_name || null,
         row.item_description || null, row.item_type || null, row.item_type_text || null,
-        row.stock_unit || null, nullableNumber(row.item_weight), nullableNumber(row.to_plt),
+        row.stock_unit || null, row.purchase_unit || null, nullableNumber(row.item_weight), nullableNumber(row.to_plt),
         nullableNumber(row.to_lyr), nullableNumber(row.to_sec), nullableNumber(row.to_pcs),
         classification.productType, classification.brand, classification.series,
         nullableNumber(row.vendor_id), row.vendor || null, nullableNumber(row.netsuite_lead_time_days),
         nullableNumber(row.netsuite_safety_stock_level), nullableBoolean(row.netsuite_seasonal_demand),
-        JSON.stringify(row)
+        nullableNumber(row.last_purchase_price), JSON.stringify(row)
       ];
       const placeholders = fields.map((field) => {
         params.push(field);
         return `$${params.length}`;
       });
-      placeholders[20] += "::jsonb";
+      placeholders[22] += "::jsonb";
       return `(${placeholders.join(", ")}, now())`;
     });
     await query(
       `INSERT INTO inventory_items (
          item_id, item_name, display_name, item_description, item_type, item_type_text,
-         stock_unit, item_weight, to_plt, to_lyr, to_sec, to_pcs, product_type, brand, series,
+         stock_unit, purchase_unit, item_weight, to_plt, to_lyr, to_sec, to_pcs, product_type, brand, series,
          vendor_id, vendor, netsuite_lead_time_days, netsuite_safety_stock_level,
-         netsuite_seasonal_demand, raw, synced_at
+         netsuite_seasonal_demand, last_purchase_price, raw, synced_at
        ) VALUES ${values.join(", ")}
        ON CONFLICT (item_id) DO UPDATE SET
          item_name = EXCLUDED.item_name,
@@ -170,6 +174,7 @@ export async function upsertInventoryBalancesBulk(rows = []) {
          item_type = EXCLUDED.item_type,
          item_type_text = EXCLUDED.item_type_text,
          stock_unit = EXCLUDED.stock_unit,
+         purchase_unit = EXCLUDED.purchase_unit,
          item_weight = EXCLUDED.item_weight,
          to_plt = EXCLUDED.to_plt,
          to_lyr = EXCLUDED.to_lyr,
@@ -181,6 +186,7 @@ export async function upsertInventoryBalancesBulk(rows = []) {
          netsuite_safety_stock_level = EXCLUDED.netsuite_safety_stock_level,
          netsuite_seasonal_demand = EXCLUDED.netsuite_seasonal_demand,
          product_type = CASE WHEN inventory_items.classification_updated_by IS NULL THEN EXCLUDED.product_type ELSE inventory_items.product_type END,
+         last_purchase_price = EXCLUDED.last_purchase_price,
          brand = CASE WHEN inventory_items.classification_updated_by IS NULL THEN EXCLUDED.brand ELSE inventory_items.brand END,
          series = CASE WHEN inventory_items.classification_updated_by IS NULL THEN EXCLUDED.series ELSE inventory_items.series END,
          raw = EXCLUDED.raw,

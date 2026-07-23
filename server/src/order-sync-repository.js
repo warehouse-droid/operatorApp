@@ -1168,14 +1168,14 @@ export async function upsertPurchaseOrders(orders = []) {
          netsuite_id, tranid, trandate, vendor_id, vendor, status, status_text,
          foreign_total, destination_location_id, destination_location, memo, vendor_address,
          dispatch_vendor_yard, dispatch_address, dispatch_window_start,
-         dispatch_window_end, dispatch_instructions, receipt_status,
+         dispatch_window_end, dispatch_instructions, receipt_status, initial_scm_status,
          netsuite_active, netsuite_missing_at, synced_at, source_location_id,
          source_location, expected_delivery_date, dispatch_parse_source,
          dispatch_note_hash, dispatch_parsed_at, status_updated_at
        ) VALUES (
          $1, $2, $3, $4, $5, $6, $7,
          $8, $9, $10, $11, $12, $13, $14, $15, $16,
-         $17, 'not_received', true, null, now(), $18, $19, $20,
+         $17, 'not_received', 'Hold', true, null, now(), $18, $19, $20,
          $21, $22, now(), now()
        )
        ON CONFLICT (netsuite_id) DO UPDATE SET

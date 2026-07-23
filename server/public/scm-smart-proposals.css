@@ -21,6 +21,46 @@
   min-width: 0;
 }
 
+.smart-plan-header-actions {
+  justify-content: flex-end;
+}
+
+.smart-proposal-column-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 34px;
+  margin: 0;
+  padding: 4px 9px;
+  border: 1px solid #c8d4dc;
+  border-radius: 6px;
+  background: #fff;
+}
+
+.smart-proposal-column-controls legend {
+  float: left;
+  margin-right: 2px;
+  padding: 0;
+  color: var(--smart-muted);
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.smart-proposal-column-controls label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #315b6d;
+  font-size: 10px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.smart-proposal-column-controls input {
+  margin: 0;
+}
+
 .smart-proposal.selected {
   border-color: #236d87;
   box-shadow: 0 0 0 2px rgb(35 109 135 / 12%);
@@ -42,9 +82,10 @@
 
 .smart-line-quantity {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 5px;
-  min-width: 270px;
+  min-width: 340px;
 }
 
 .smart-line-quantity input {
@@ -60,8 +101,22 @@
 
 .smart-inventory-context {
   display: grid;
+  gap: 7px;
+  min-width: 220px;
+}
+
+.smart-calculation-block {
+  display: grid;
   gap: 3px;
-  min-width: 145px;
+}
+
+.smart-calculation-block + .smart-calculation-block {
+  padding-top: 7px;
+  border-top: 1px dashed #cbd7de;
+}
+
+.smart-calculation-title {
+  margin-bottom: 1px;
 }
 
 .smart-inventory-context span,
@@ -72,6 +127,22 @@
 
 .smart-inventory-context strong {
   color: #203f4d;
+}
+
+.smart-replenishment-calculation {
+  line-height: 1.35;
+}
+
+.smart-replenishment-calculation small {
+  max-width: 300px;
+}
+
+.smart-replenishment-equation {
+  margin: 2px 0;
+  padding: 4px 6px;
+  border-radius: 4px;
+  background: #eef6f8;
+  color: #244c59 !important;
 }
 
 .smart-line-destination-select {
@@ -127,9 +198,119 @@
   min-width: 1260px;
 }
 
+.smart-proposal-lines [hidden] {
+  display: none !important;
+}
+
+.smart-proposal-lines-one-detail-hidden .smart-table {
+  min-width: 1050px;
+}
+
+.smart-proposal-lines-compact .smart-table {
+  min-width: 900px;
+}
+
+.smart-proposal-lines-compact .smart-table th,
+.smart-proposal-lines-compact .smart-table td {
+  padding-top: 5px;
+  padding-bottom: 5px;
+}
+
+.smart-manual-load-panel {
+  display: grid;
+  gap: 10px;
+  margin: 12px;
+  padding: 12px;
+  border: 1px solid #9fbac6;
+  border-radius: 8px;
+  background: #f4f9fb;
+  box-shadow: 0 4px 12px rgb(23 50 77 / 8%);
+}
+
+.smart-manual-load-head {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.smart-manual-load-head h3,
+.smart-manual-load-head p {
+  margin: 0;
+}
+
+.smart-manual-load-head p {
+  margin-top: 3px;
+  color: var(--smart-muted);
+  font-size: 11px;
+}
+
+.smart-manual-load-fields {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(130px, 0.7fr)) minmax(230px, 1.6fr) auto;
+  align-items: end;
+  gap: 8px;
+}
+
+.smart-manual-load-fields label {
+  display: grid;
+  gap: 4px;
+}
+
+.smart-manual-load-fields label > span,
+.smart-manual-load-item label > span {
+  color: var(--smart-muted);
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.smart-manual-load-fields label > strong {
+  min-height: 36px;
+  padding: 9px 8px;
+  border: 1px solid var(--smart-border);
+  border-radius: 5px;
+  background: #fff;
+  font-size: 11px;
+}
+
+.smart-manual-load-results {
+  display: grid;
+  gap: 6px;
+}
+
+.smart-manual-load-item {
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) 90px auto;
+  align-items: center;
+  gap: 9px;
+  padding: 8px;
+  border: 1px solid var(--smart-border);
+  border-radius: 6px;
+  background: #fff;
+}
+
+.smart-manual-load-item label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.smart-manual-load-item input {
+  width: 62px;
+}
+
+.smart-proposal-lines-compact .smart-help {
+  line-height: 1.25;
+}
+
 @media (max-width: 1280px) {
   .smart-plan-toolbar {
     grid-template-columns: repeat(4, minmax(150px, 1fr));
+  }
+
+  .smart-manual-load-fields {
+    grid-template-columns: repeat(3, minmax(150px, 1fr));
   }
 }
 
@@ -153,6 +334,20 @@
   .smart-proposal-item-result > div:first-child {
     grid-column: 1 / -1;
   }
+
+  .smart-plan-header-actions {
+    justify-content: flex-start;
+  }
+
+  .smart-manual-load-fields,
+  .smart-manual-load-item {
+    grid-template-columns: 1fr;
+  }
+
+  .smart-manual-load-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
 }
 
 @media (max-width: 520px) {
@@ -161,7 +356,12 @@
   }
 
   .smart-line-quantity {
-    min-width: 230px;
+    min-width: 280px;
+  }
+
+  .smart-proposal-column-controls {
+    flex-wrap: wrap;
+    width: 100%;
   }
 }
 .smart-line-flags {
@@ -169,4 +369,14 @@
   flex-wrap: wrap;
   gap: 0.3rem;
   margin-top: 0.35rem;
+}
+
+
+.smart-physical-pallet-line td {
+  border-top: 2px solid #99b9c5;
+  background: #f2f8fa;
+}
+
+.smart-physical-pallet-line strong {
+  color: #164f64;
 }

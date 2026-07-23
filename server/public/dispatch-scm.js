@@ -6,6 +6,7 @@ let scmOperator = null;
 let scmOrders = [];
 let selectedScmOrderId = "";
 let scmSearch = "";
+let scmPoTypeFilter = "";
 let scmDropoffFilter = "";
 let scmVendorFilter = "";
 let scmPickupFilter = "";
@@ -345,6 +346,7 @@ async function loadScmOrders() {
   try {
     const params = new URLSearchParams();
     if (scmSearch) params.set("search", scmSearch);
+    if (scmPoTypeFilter) params.set("poType", scmPoTypeFilter);
     if (scmDropoffFilter) params.set("dropoff", scmDropoffFilter);
     if (scmVendorFilter) params.set("vendor", scmVendorFilter);
     if (scmPickupFilter) params.set("pickupPoint", scmPickupFilter);
@@ -400,6 +402,10 @@ function renderScmListFilters() {
   `;
   return `
     <div class="scm-list-filters">
+      <div class="scm-po-type-filters" role="group" aria-label="${t("dispatch.poType", "PO type")}">
+        <button class="scm-po-type-filter ${scmPoTypeFilter === "po" ? "active" : ""}" data-action="filter-po-type" data-value="po" type="button" aria-pressed="${scmPoTypeFilter === "po"}">${t("dispatch.po", "PO")}</button>
+        <button class="scm-po-type-filter ${scmPoTypeFilter === "split" ? "active" : ""}" data-action="filter-po-type" data-value="split" type="button" aria-pressed="${scmPoTypeFilter === "split"}">${t("dispatch.splitPo", "Split PO")}</button>
+      </div>
       ${renderSelect("filter-dropoff", scmDropoffFilter, t("dispatch.dropoff", "Drop off"), dropoffOptions)}
       ${renderSelect("filter-vendor", scmVendorFilter, t("dispatch.vendor", "Vendor"), vendorOptions)}
       ${renderSelect("filter-pickup", scmPickupFilter, t("dispatch.pickupPoint", "Pickup point"), pickupOptions)}
@@ -982,6 +988,14 @@ scmApp.addEventListener("click", async (event) => {
   }
   if (action === "refresh") {
     await loadScmOrders();
+  }
+  if (action === "filter-po-type") {
+    const nextType = target.dataset.value || "";
+    scmPoTypeFilter = scmPoTypeFilter === nextType ? "" : nextType;
+    selectedScmOrderId = "";
+    scmGroupSelection = new Set();
+    await loadScmOrders();
+    return;
   }
   if (action === "clear-inputs") {
     scmLineInputs = {};

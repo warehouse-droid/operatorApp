@@ -243,6 +243,30 @@ th {
   grid-template-columns: minmax(220px, 320px) minmax(0, 1fr);
 }
 
+.targeted-sync-form {
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.targeted-sync-form button {
+  min-width: 170px;
+}
+
+.notice.sync-success {
+  border-color: var(--accent);
+  background: #f0fbf8;
+  color: #064c49;
+  display: grid;
+  gap: 4px;
+}
+
+.targeted-sync-panel .sync-error {
+  display: grid;
+  gap: 4px;
+}
+
 .sync-error {
   border-color: var(--danger);
   background: #fff4f4;
@@ -569,6 +593,14 @@ th {
 
   .account-user-list {
     max-height: 320px;
+  }
+
+  .targeted-sync-form {
+    grid-template-columns: 1fr;
+  }
+
+  .targeted-sync-form button {
+    width: 100%;
   }
 }
 

@@ -4,11 +4,11 @@ import fs from "node:fs/promises";
 import { closeDb, query, withTransaction } from "./db.js";
 import { listSmartScmInputFiles } from "./smart-scm-import-repository.js";
 import { runSmartScmForecast, listSmartScmForecasts, smartScmCoverageFloor } from "./smart-scm-forecast-repository.js";
-import { consolidateCompatibleDrafts, getSmartScmPlanningRun, runSmartScmPlan, smartScmPackWholePalletLines, smartScmSourceTransferLimit, updateSmartScmProposal } from "./smart-scm-planning-repository.js";
-import { addSmartScmVendorAlternativeLine, listSmartScmVendorReplyLoads, removeSmartScmVendorAlternativeLine, saveSmartScmVendorReplyLoad, searchSmartScmVendorAlternatives } from "./smart-scm-vendor-repository.js";
+import { consolidateCompatibleDrafts, getSmartScmPlanningRun, runSmartScmPlan, smartScmPackWholePalletLines, smartScmPhysicalPalletLines, smartScmProposalLineLoadWeightLbs, smartScmSourceTransferLimit, updateSmartScmProposal } from "./smart-scm-planning-repository.js";
+import { addSmartScmVendorAlternativeLine, listSmartScmNetSuitePoReviewLoads, listSmartScmVendorReplyLoads, removeSmartScmVendorAlternativeLine, searchSmartScmVendorAlternatives, stageSmartScmVendorReplyLoad } from "./smart-scm-vendor-repository.js";
 import { executeSmartScmPurchaseProposal } from "./smart-scm-purchase-service.js";
 import { createSimplePdf, leaseYardPrintJob, queueSmartScmPrintJob, queueYardPrinterTest, rotateYardPrinterToken, updateLeasedPrintJob, updateYardPrinter, yardPrintJobDocument } from "./smart-scm-print-repository.js";
-import { groupSmartScmProposals, recalculateSmartScmPoProposal, removeSmartScmProposalLine, smartScmAllocateProRata, updateSmartScmProposalLine } from "./smart-scm-proposal-editor.js";
+import { createSmartScmManualLoad, groupSmartScmProposals, recalculateSmartScmPoProposal, removeSmartScmProposalLine, smartScmAllocateProRata, splitSmartScmProposalLine, updateSmartScmProposalLine } from "./smart-scm-proposal-editor.js";
 import { buildSmartScmPurchaseOrderRestPayload } from "./smart-scm-purchase-netsuite.js";
 import { listSmartScmRouteRules, upsertSmartScmRouteRule } from "./smart-scm-route-repository.js";
 
@@ -27,6 +27,15 @@ assert.equal(proportionalLoads.length, 1, "Manual grouping must create exactly o
 assert(proportionalLoads[0].reduce((sum, line) => sum + line.lineWeight, 0) <= 100.000001, "The grouped load must stay within truck capacity.");
 assert(proportionalLoads[0].every((line) => Number.isInteger(line.proposedPallets)), "Every grouped quantity must be a whole pallet.");
 const proportionalTotals = new Map();
+assert.equal(smartScmProposalLineLoadWeightLbs({ proposedPallets: 1, palletWeight: 1000, lineWeight: 1000, physicalPalletWeightLbs: 40 }), 1040,
+  "One material PLT must include exactly one 40-lb official PALLET in gross load weight.");
+const palletTareCapacityLoads = smartScmPackWholePalletLines([
+  { itemId: 99, destinationLocationId: 26, destinationName: "150", proposedPallets: 26, requiredPallets: 26,
+    palletWeight: 3000, physicalPalletWeightLbs: 40, lineWeight: 78000, toPlt: 1, reason: {} }
+], 78000, { proposalType: "TO", sourceName: "2967", maxStops: 1 });
+assert.equal(palletTareCapacityLoads.length, 2, "Gross material-plus-PALLET weight must split a load that material weight alone would fill exactly.");
+assert(palletTareCapacityLoads.every((load) => load.totalWeight <= 78000), "Every tare-aware packed load must stay within truck capacity.");
+assert.equal(palletTareCapacityLoads.reduce((sum, load) => sum + load.totalPallets, 0), 26, "Tare-aware packing must preserve pallet quantity.");
 for (const load of proportionalLoads) {
   for (const line of load) proportionalTotals.set(line.itemId, (proportionalTotals.get(line.itemId) || 0) + line.proposedPallets);
 }
@@ -140,9 +149,17 @@ const purchasePayload = buildSmartScmPurchaseOrderRestPayload({
     destinationLocationId: 15,
     memo: "Harness PO",
     vendorReference: "VENDOR-REF",
+    palletItem: {
+      id: 699,
+      itemName: "PALLET",
+      unit: "Each",
+      purchaseUnit: "Each",
+      lastPurchasePrice: 4.25
+    },
     lines: [
-      { itemId: 601, destinationLocationId: 15, salesQuantity: 61.5, confirmedPallets: 1, palletQty: 1, layerQty: 0, sectionQty: 0, pieceQty: 0 },
-      { itemId: 600, destinationLocationId: 26, salesQuantity: 50, confirmedPallets: 1, palletQty: 1, layerQty: 0, sectionQty: 0, pieceQty: 0 }
+      { itemId: 601, itemName: "Harness A", unit: "Each", purchaseUnit: "Each", lastPurchasePrice: 11.5, destinationLocationId: 15, salesQuantity: 61.5, confirmedPallets: 1, palletQty: 1, layerQty: 0, sectionQty: 0, pieceQty: 0 },
+      { itemId: 600, itemName: "Harness B", unit: "Each", purchaseUnit: "Each", lastPurchasePrice: 9.75, destinationLocationId: 26, salesQuantity: 50, confirmedPallets: 1, palletQty: 1, layerQty: 0, sectionQty: 0, pieceQty: 0 },
+      { itemId: 699, itemName: "PALLET", unit: "Each", purchaseUnit: "Each", lastPurchasePrice: 4.25, destinationLocationId: 15, salesQuantity: 2, confirmedPallets: 2, palletQty: 0, layerQty: 0, sectionQty: 0, pieceQty: 2, ancillaryPallet: true }
     ]
   },
   locations: [
@@ -153,10 +170,47 @@ const purchasePayload = buildSmartScmPurchaseOrderRestPayload({
 assert.equal(purchasePayload.entity.id, "7101");
 assert.equal(purchasePayload.item.items[0].custcol_plt, 1);
 assert.equal(purchasePayload.item.items[0].quantity, 61.5);
+assert.equal(purchasePayload.item.items[0].rate, 11.5);
 assert.equal(purchasePayload.location.id, "15");
 assert(!Object.hasOwn(purchasePayload, "orderStatus"), "PO creation must not submit an order status override.");
 assert.equal(purchasePayload.item.items[1].location.id, "26", "A multi-drop PO line must retain its own destination yard.");
+assert.deepEqual(
+  purchasePayload.item.items.filter((line) => line.item.id === "699").map((line) => [line.location.id, line.quantity, line.custcol_pcs, line.rate]),
+  [["15", 1, 1, 4.25], ["26", 1, 1, 4.25]],
+  "PO creation must add one priced PALLET line per destination."
+);
+assert.equal(purchasePayload.item.items.length, 4, "A visible PALLET row must not duplicate the derived NetSuite payload lines.");
+const visiblePhysicalPallets = smartScmPhysicalPalletLines({
+  id: 321,
+  destinationLocationId: 15,
+  destinationName: "12441",
+  lines: [
+    { itemId: 601, itemName: "Harness A", destinationLocationId: 15, destinationName: "12441", proposedPallets: 3 },
+    { itemId: 600, itemName: "Harness B", destinationLocationId: 26, destinationName: "150", proposedPallets: 2 },
+    { itemId: 699, itemName: "PALLET", destinationLocationId: 15, destinationName: "12441", proposedPallets: 5 }
+  ]
+}, { itemId: 699, itemName: "PALLET", unit: "EACH", itemWeightLbs: 40 });
+assert.deepEqual(
+  visiblePhysicalPallets.map((line) => [line.destinationLocationId, line.quantity, line.itemWeightLbs, line.lineWeightLbs, line.ancillaryPallet]),
+  [[15, 3, 40, 120, true], [26, 2, 40, 80, true]],
+  "Proposal display must expose one physical PALLET row per destination without counting an existing PALLET row again."
+);
+assert(visiblePhysicalPallets.every((line) => !line.includedInLoadPallets && line.includedInLoadWeight && line.weightSource === "netsuite_item_master"),
+  "Physical PALLET rows must not double the pallet count, but their NetSuite item weight must count once in gross load weight.");
+assert(visiblePhysicalPallets.every((line) => line.officialLineItem && line.submittedToNetSuite),
+  "Every derived PALLET row must remain an official ancillary line through final NetSuite insertion.");
 
+  const legacyPlan59 = await getSmartScmPlanningRun(59);
+  if (legacyPlan59) {
+    for (const proposal of legacyPlan59.proposals) {
+      const materialWeight = proposal.lines.reduce((sum, line) => sum + Number(line.lineWeightLbs || 0), 0);
+      const palletWeight = (proposal.physicalPalletLines || []).reduce((sum, line) => sum + Number(line.lineWeightLbs || 0), 0);
+      assert(Math.abs(proposal.totalWeightLbs - materialWeight - palletWeight) < 0.000001,
+        "Legacy plan #59 must expose gross material-plus-PALLET weight without mutating or double-counting stored totals.");
+      assert((proposal.physicalPalletLines || []).every((line) => line.itemWeightLbs === 40 && line.includedInLoadWeight),
+        "Legacy plan #59 must use the live mirrored NetSuite PALLET weight.");
+    }
+  }
   const inputs = await listSmartScmInputFiles();
   const activeSlots = new Set(inputs.filter((file) => file.active).map((file) => file.slot));
   for (const slot of ["item_master", "sales_data", "decision_workbook", "decision_tree", "decision_script"]) {
@@ -199,6 +253,9 @@ assert.equal(purchasePayload.item.items[1].location.id, "26", "A multi-drop PO l
     const forecasts = await listSmartScmForecasts({ runId: Number(forecastRun.id), limit: 5000 });
     assert(forecasts.length > 0, "Expected at least one item-yard forecast.");
     assert(forecasts.every((row) => Number.isFinite(row.p50Weekly) && Number.isFinite(row.leadTimeP90)));
+    assert(forecasts.every((row) => Number.isFinite(row.safetyStockPallets)
+      && Number.isFinite(row.reorderPointPallets) && Number.isFinite(row.preferredPallets)),
+    "Every forecast must expose finite safety, ROP, and preferred policy levels.");
     const coverageEvidence = forecasts.filter((row) => row.representativeOrderPallets > 0 && row.coverageFloorPallets > 0);
     assert(coverageEvidence.length > 0, "Expected representative order evidence from the selected sales source.");
     const appliedCoverage = coverageEvidence.filter((row) => row.zeroDemandCoverageApplied);
@@ -215,12 +272,55 @@ assert.equal(purchasePayload.item.items[1].location.id, "26", "A multi-drop PO l
     assert.equal(alliance.formulaStockout, true);
     assert(Math.abs(alliance.formulaWeeklyDemand - 2.642857) < 0.00001, `Expected stockout peak 2.642857, received ${alliance.formulaWeeklyDemand}.`);
     assert(Math.abs(alliance.formulaWeeklySd - 1.003358) < 0.00001, `Expected six-week SD 1.003358, received ${alliance.formulaWeeklySd}.`);
+    assert(Math.abs(alliance.safetyStockPallets - 2.334194) < 0.00001, `Expected forecast safety stock 2.334194, received ${alliance.safetyStockPallets}.`);
+    assert.equal(alliance.reorderPointPallets, 8);
+    assert.equal(alliance.preferredPallets, 14);
 
     const plan = await runSmartScmPlan({ triggerSource: "harness", operatorId: null, forecastRunId: Number(forecastRun.id) });
     assert.equal(plan.status, "ready");
     assert(Array.isArray(plan.proposals));
     assert(!plan.proposals.some((proposal) => proposal.phase === "hub_store"), "Future inbound stock must not pre-create a hub-store TO.");
     assert(plan.proposals.filter((proposal) => proposal.proposalType === "PO").every((proposal) => proposal.routeStops.length <= 2), "Every generated PO route must have at most two drops.");
+    for (const proposal of plan.proposals) {
+      const materialPallets = proposal.lines.reduce((sum, line) => sum + Number(line.proposedPallets || 0), 0);
+      const physicalPallets = (proposal.physicalPalletLines || []).reduce((sum, line) => sum + Number(line.quantity || 0), 0);
+      const materialWeight = proposal.lines.reduce((sum, line) => sum + Number(line.lineWeightLbs || 0), 0);
+      const physicalWeight = (proposal.physicalPalletLines || []).reduce((sum, line) => sum + Number(line.lineWeightLbs || 0), 0);
+      assert.equal(materialPallets, proposal.totalPallets, "Material lines must remain the only source of the load pallet total.");
+      assert.equal(physicalPallets, proposal.totalPallets, "Existing PO and TO plans must expose matching physical PALLET item quantities.");
+      assert((proposal.physicalPalletLines || []).every((line) => line.itemName === "PALLET" && line.ancillaryPallet),
+        "Every derived physical packaging row must be identified as PALLET and ancillary.");
+      assert(Math.abs(proposal.totalWeightLbs - materialWeight - physicalWeight) < 0.000001,
+        "Public proposal gross weight must equal material line weight plus official PALLET line weight exactly once.");
+      assert(proposal.totalWeightLbs <= 78000.000001, "New PO and TO packing must remain within capacity after PALLET tare.");
+    }
+    const manualSeed = plan.proposals.find((proposal) => proposal.proposalType === "PO" && proposal.lines.length)?.lines[0];
+    assert(manualSeed, "Expected a planning-enabled PO item for manual-load coverage.");
+    const beforeManualIds = new Set(plan.proposals.map((proposal) => proposal.id));
+    const manualRun = await createSmartScmManualLoad(plan.id, {
+      proposalType: "PO",
+      itemId: manualSeed.itemId,
+      destinationLocationId: manualSeed.destinationLocationId,
+      proposedPallets: 1
+    }, null);
+    const manualProposal = manualRun.proposals.find((proposal) => !beforeManualIds.has(proposal.id));
+    assert(manualProposal, "Adding a manual load must create a new proposal in the current planning run.");
+    assert.equal(manualProposal.status, "held", "A manual PO load must start on Hold.");
+    assert.equal(manualProposal.lines.length, 1);
+    assert.equal(manualProposal.lines[0].proposedPallets, 1);
+    assert.equal(manualProposal.lines[0].reason.manualLoad, true);
+    const splitRun = await splitSmartScmProposalLine(manualProposal.id, manualProposal.lines[0].id, {}, null);
+    const remainingManual = splitRun.proposals.find((proposal) => proposal.id === manualProposal.id);
+    const splitProposal = splitRun.proposals.find((proposal) =>
+      proposal.id !== manualProposal.id && proposal.memo === `split from load #${manualProposal.id} · ${manualSeed.itemName}`
+    );
+    assert.equal(remainingManual, undefined, "A one-line source load must be removed after its entire line is split out.");
+    assert(splitProposal, "Splitting a 1-PLT line must create a separate held load.");
+    assert.equal(splitProposal.status, "held");
+    assert.equal(splitProposal.lines.length, 1);
+    assert.equal(splitProposal.lines[0].proposedPallets, 1);
+    assert.equal(splitProposal.lines[0].reason.splitWholeLine, true);
+    assert.equal(splitProposal.totalPallets, 1, "The moved PALLET quantity must be conserved without an empty source load.");
     for (const proposal of plan.proposals.filter((row) => row.proposalType === "PO" && row.sourceName === "Gormley")) {
       const directLines = proposal.lines.filter((line) => [1, 28].includes(line.destinationLocationId));
       if (!directLines.length) continue;
@@ -229,7 +329,14 @@ assert.equal(purchasePayload.item.items[1].location.id, "26", "A multi-drop PO l
     }
     for (const transfer of plan.proposals.filter((proposal) => proposal.proposalType === "TO" && proposal.phase === "internal_transfer")) {
       for (const line of transfer.lines) {
-        assert(line.proposedPallets <= Number(line.reason.sourceMaximumTransferablePallets) + 0.000001, "Suggested TO exceeds live source transfer limit.");
+        const sourceAvailable = Number(line.reason.sourceAvailablePallets);
+        const sourceSafety = Number(line.reason.sourceSafetyStockPallets);
+        const sourceRop = Number(line.reason.sourceReorderPointPallets);
+        const protectedFloor = Math.max(sourceSafety, sourceRop);
+        const maximumTransferable = Math.floor(Math.max(0, sourceAvailable - protectedFloor) + 0.000001);
+        assert(Math.abs(Number(line.reason.sourceProtectedFloorPallets) - protectedFloor) < 0.000001, "TO source protected floor must equal max(safety stock, ROP).");
+        assert.equal(Number(line.reason.sourceMaximumTransferablePallets), maximumTransferable, "TO source transfer limit must equal floored available stock above the protected floor.");
+        assert(line.proposedPallets <= maximumTransferable + 0.000001, "Suggested TO exceeds live source transfer limit.");
       }
     }
     const coverageReviewLines = plan.proposals.flatMap((proposal) => proposal.lines
@@ -283,7 +390,24 @@ assert.equal(purchasePayload.item.items[1].location.id, "26", "A multi-drop PO l
     const movedLine = destinationAdjusted.lines.find((line) => line.id === Number(move.line_id));
     assert.equal(movedLine.destinationLocationId, Number(move.destination_location_id), "A PO proposal line destination must be editable.");
     assert.equal(movedLine.reason.destinationManuallyAdjusted, true, "A manual destination change must be recorded on the line.");
+    assert.equal(movedLine.reason.positionPallets, undefined, "A destination change must invalidate the old yard's inventory position snapshot.");
+    assert.equal(movedLine.reason.reorderPointPallets, undefined, "A destination change must invalidate the old yard's reorder point.");
+    assert.equal(movedLine.reason.preferredPallets, undefined, "A destination change must invalidate the old yard's preferred target.");
+    assert(Number.isFinite(Number(movedLine.reason.quantityAvailable)), "A destination change must capture the new yard's inventory components.");
     assert(destinationAdjusted.routeStops.length <= 2, "A destination edit must preserve the proposal route limit.");
+    await query(
+      "UPDATE scm_smart_item_yard_policies SET eligible = false WHERE item_id = $1 AND location_id = $2",
+      [movedLine.itemId, movedLine.destinationLocationId]
+    );
+    await assert.rejects(
+      () => updateSmartScmProposalLine(move.proposal_id, move.line_id, { proposedPallets: movedLine.proposedPallets }, null),
+      /not enabled for Smart SCM planning/,
+      "A same-yard quantity edit must reject an item or yard policy disabled after planning."
+    );
+    await query(
+      "UPDATE scm_smart_item_yard_policies SET eligible = true WHERE item_id = $1 AND location_id = $2",
+      [movedLine.itemId, movedLine.destinationLocationId]
+    );
 
     const po = plan.proposals.find((proposal) => proposal.proposalType === "PO" && proposal.lines.length);
     assert(plan.proposals.filter((proposal) => proposal.proposalType === "PO").every((proposal) => proposal.status === "held"), "Every new PO load must start on Hold.");
@@ -305,18 +429,36 @@ assert.equal(purchasePayload.item.items[1].location.id, "26", "A multi-drop PO l
         assert(!withoutAlternative.lines.some((line) => line.id === added.id), "Alternative line removal should restore the load.");
         alternativeLineChecked = true;
       }
-      const replied = await saveSmartScmVendorReplyLoad(po.id, {
+      await query(
+        `UPDATE inventory_items
+            SET purchase_unit = COALESCE(NULLIF(stock_unit, ''), 'EACH'),
+                last_purchase_price = CASE WHEN COALESCE(last_purchase_price, 0) > 0 THEN last_purchase_price ELSE 1 END
+          WHERE item_id = ANY($1::bigint[])
+             OR UPPER(COALESCE(item_name, '')) = 'PALLET'`,
+        [po.lines.map((line) => line.itemId)]
+      );
+      const staged = await stageSmartScmVendorReplyLoad(po.id, {
         vendorReference: "HARNESS-VENDOR-REF",
         remarks: "Smart SCM rollback harness",
-        lines: po.lines.map((line) => ({ proposalLineId: line.id, confirmedPallets: line.proposedPallets }))
+        lines: po.lines.map((line) => ({ proposalLineId: line.id, decision: "confirm", confirmedPallets: line.proposedPallets }))
       }, null);
-      assert.equal(replied.status, "vendor_replied");
-      assert.equal(replied.vendorReference, "HARNESS-VENDOR-REF");
-      const execution = await executeSmartScmPurchaseProposal(po.id, null);
-      assert.equal(execution.purchaseOrderRef, `MOCK-PO-${po.id}`);
-      const completed = (await listSmartScmVendorReplyLoads({ search: String(po.id), limit: 50 })).find((load) => load.id === po.id);
+      assert(staged.reviewProposalId, "Confirmed vendor lines must create a NetSuite PO review child.");
+      assert.equal(staged.source.status, "superseded");
+      assert.equal(staged.review.vendorReference, "HARNESS-VENDOR-REF");
+      assert(staged.review.lines.every((line) => line.lastPurchasePrice > 0 && line.purchaseUnit === line.unit));
+      assert(staged.review.palletItem.lastPurchasePrice > 0);
+      assert.equal(staged.review.palletItem.itemWeightLbs, 40, "NetSuite PO review must expose the official PALLET item weight.");
+      assert(staged.review.palletLines.every((line) => line.itemWeightLbs === 40 && line.lineWeightLbs === line.confirmedPallets * 40),
+        "Every NetSuite PO review PALLET line must expose quantity × 40 lb.");
+      assert.equal(staged.review.palletLines.reduce((sum, line) => sum + line.confirmedPallets, 0), staged.review.totalPallets);
+      const pendingReviews = await listSmartScmNetSuitePoReviewLoads({ search: String(staged.reviewProposalId), view: "pending", limit: 50 });
+      assert(pendingReviews.some((load) => load.id === staged.reviewProposalId), "Staged PO must appear in NetSuite PO review.");
+      const execution = await executeSmartScmPurchaseProposal(staged.reviewProposalId, null);
+      assert.equal(execution.purchaseOrderRef, "MOCK-PO-" + staged.reviewProposalId);
+      const completed = (await listSmartScmNetSuitePoReviewLoads({ search: String(staged.reviewProposalId), view: "completed", limit: 50 }))
+        .find((load) => load.id === staged.reviewProposalId);
       assert.equal(completed.status, "completed");
-      assert.equal(completed.netsuitePurchaseOrderRef, `MOCK-PO-${po.id}`);
+      assert.equal(completed.netsuitePurchaseOrderRef, "MOCK-PO-" + staged.reviewProposalId);
       vendorLoadChecked = true;
     }
     const groupCandidates = plan.proposals.filter((proposal) => proposal.id !== po?.id && ["draft", "held", "reviewed", "attention"].includes(proposal.status));
@@ -369,6 +511,35 @@ assert.equal(purchasePayload.item.items[1].location.id, "26", "A multi-drop PO l
     assert(recalculatedLoads.every((proposal) => proposal.utilization <= 1.000001 && proposal.routeStops.length <= 2), "Every recalculated PO must be capacity-safe with at most two drops.");
     assert(recalculatedLoads.flatMap((proposal) => proposal.lines).every((line) => Number.isInteger(line.proposedPallets)), "Recalculated PO quantities must remain whole pallets.");
     assert.equal(recalculatedLoads.flatMap((proposal) => proposal.lines).reduce((sum, line) => sum + line.proposedPallets, 0), expectedRecalculatedPallets, "Re-Calculate must preserve the edited purchase quantity.");
+
+    const beforeWholeLineMove = await getSmartScmPlanningRun(plan.id);
+    const multiLineSplitSource = beforeWholeLineMove.proposals.find((proposal) =>
+      ["draft", "held", "reviewed", "attention"].includes(proposal.status)
+      && proposal.lines.length > 1
+      && proposal.lines.some((line) => line.proposedPallets > 1)
+    );
+    assert(multiLineSplitSource, "Expected an editable multi-line load for whole-line split coverage.");
+    const wholeLineTarget = multiLineSplitSource.lines.find((line) => line.proposedPallets > 1);
+    const proposalIdsBeforeWholeLineMove = new Set(beforeWholeLineMove.proposals.map((proposal) => proposal.id));
+    const afterWholeLineMove = await splitSmartScmProposalLine(
+      multiLineSplitSource.id,
+      wholeLineTarget.id,
+      { splitPallets: 1 },
+      null
+    );
+    const retainedSource = afterWholeLineMove.proposals.find((proposal) => proposal.id === multiLineSplitSource.id);
+    const wholeLineChild = afterWholeLineMove.proposals.find((proposal) => !proposalIdsBeforeWholeLineMove.has(proposal.id));
+    assert(retainedSource, "Splitting one line from a multi-line load must retain the remaining source load.");
+    assert(!retainedSource.lines.some((line) => line.id === wholeLineTarget.id), "The selected item line must be removed completely from its source load.");
+    assert.equal(retainedSource.lines.length, multiLineSplitSource.lines.length - 1);
+    assert.equal(retainedSource.status, "held", "The changed source load must return to Hold.");
+    assert(wholeLineChild && wholeLineChild.lines.length === 1, "The moved item must be the only material line in its new load.");
+    assert.equal(wholeLineChild.lines[0].proposedPallets, wholeLineTarget.proposedPallets,
+      "A legacy partial split quantity must be ignored; Split always moves the entire selected line.");
+    assert.equal(retainedSource.totalPallets + wholeLineChild.totalPallets, multiLineSplitSource.totalPallets,
+      "Whole-line split must conserve the source load pallet quantity.");
+    assert.equal(wholeLineChild.physicalPalletLines.reduce((sum, line) => sum + line.quantity, 0), wholeLineChild.totalPallets,
+      "The separated load must immediately expose its matching physical PALLET line.");
 
     const printerCount = await query("SELECT COUNT(*)::integer AS count FROM scm_yard_printers");
     assert.equal(printerCount.rows[0].count, 4);

@@ -8,6 +8,7 @@ let scmSchedulePresets = [];
 let scmScheduleNotice = "";
 let scmScheduleLoading = false;
 let scmScheduleSavingRef = "";
+let scmScheduleBlanketSavingRef = "";
 let scmScheduleFilters = { view: "dispatch", search: "", status: [], method: "", kind: "", dropoffPoint: "", brand: [], from: "", to: "" };
 let scmScheduleSelectedRows = new Set();
 let scmScheduleFocusAfterRender = "";
@@ -135,7 +136,7 @@ function scmScheduleQuery() {
   const search = String(scmScheduleFilters.search || "").trim();
   if (search) {
     params.set("search", search);
-    if (scmScheduleSalesHost) params.set("view", scmScheduleFilters.view || "yard manager");
+    params.set("view", scmScheduleFilters.view || (scmScheduleSalesHost ? "yard manager" : "scm working"));
     return `?${params.toString()}`;
   }
   Object.entries(scmScheduleFilters).forEach(([key, value]) => {
@@ -224,6 +225,11 @@ function scmScheduleVisiblePresets() {
 
 function scmScheduleCanShowScmWorkingControls() {
   return canEditScmSchedule() && ["admin", "scm", "scm_staff", "scm-staff", "scm staff"].includes(scmScheduleRole());
+}
+
+function scmScheduleCanManageBlankets() {
+  return !scmScheduleDispatchHost && !scmScheduleSalesHost && scmScheduleFilters.view === "blanket"
+    && ["admin", "scm", "scm_staff", "scm-staff", "scm staff"].includes(scmScheduleRole());
 }
 
 function scmScheduleIsYardManagerView() {
@@ -407,13 +413,20 @@ function renderScheduleTableRows({ pickupOptions = [], dropoffOptions = OWN_YARD
     const displayType = row.orderKind;
     const eta = [row.etaDate, row.etaTime].filter(Boolean).join(" ") || "--";
     const isGroupOrder = Boolean(row.groupRef) || String(row.orderRef || "").toUpperCase().startsWith("PGOB-");
+    const blanketView = scmScheduleFilters.view === "blanket";
+    const canManageBlankets = scmScheduleCanManageBlankets();
     return `
       <div class="scm-sheet-row status-${scmScheduleEscape(String(row.status || "").toLowerCase().replaceAll(" ", "-"))} ${isGroupOrder ? "group-order" : ""}" data-row-ref="${scmScheduleEscape(row.orderRef)}">
         ${editable ? `<div class="scm-sheet-cell scm-select-cell">${selectable ? `<input data-action="select-row" data-row="${scmScheduleEscape(rowId)}" type="checkbox" ${scmScheduleSelectedRows.has(rowId) ? "checked" : ""} aria-label="Select ${scmScheduleEscape(row.orderRef)}" />` : ""}</div>` : ""}
         <div class="scm-sheet-cell readonly">${readOnlyCell(scheduleDateText(row))}</div>
         <div class="scm-sheet-cell readonly scm-type-cell">
           <strong>${scmScheduleEscape(displayType)}</strong>
-          ${row.orderKind === "PO" ? `<label class="scm-sheet-check"><input data-row="${scmScheduleEscape(rowId)}" data-field="isSpecialOrder" type="checkbox" ${row.isSpecialOrder ? "checked" : ""} ${editable ? "" : "disabled"} /> Sp.O</label>` : ""}
+          ${row.orderKind === "PO" && !blanketView ? `<label class="scm-sheet-check"><input data-row="${scmScheduleEscape(rowId)}" data-field="isSpecialOrder" type="checkbox" ${row.isSpecialOrder ? "checked" : ""} ${editable ? "" : "disabled"} /> Sp.O</label>` : ""}
+          ${blanketView && row.orderKind === "PO" ? `<label class="scm-blanket-flag ${row.isBlanket ? "active" : ""}" title="${row.isBlanket ? "Flagged blanket parent: hidden from normal schedules and dispatch planning" : "Flag this large parent PO as a blanket order"}">
+            <input data-action="toggle-blanket" data-ref="${scmScheduleEscape(row.orderRef)}" type="checkbox" ${row.isBlanket ? "checked" : ""}
+              ${canManageBlankets && scmScheduleBlanketSavingRef !== rowId ? "" : "disabled"} />
+            <span aria-hidden="true">⚑</span> Blanket
+          </label>` : ""}
         </div>
         <div class="scm-sheet-cell">${editable ? selectHtml({ rowId, field: "method", value: row.method, options: SCM_METHODS }) : readOnlyCell(row.method)}</div>
         <div class="scm-sheet-cell">${editable ? selectHtml({ rowId, field: "pickupPoint", value: row.pickupPoint, options: pickupOptions }) : readOnlyCell(row.pickupPoint)}</div>
@@ -575,6 +588,37 @@ scmScheduleApp.addEventListener("click", async (event) => {
   if (action === "close-notice") {
     scmScheduleNotice = "";
     renderScmSchedule();
+    return;
+  }
+
+  if (action === "toggle-blanket") {
+    const orderRef = target.dataset.ref || "";
+    const row = scmScheduleRows.find((item) => item.orderKind === "PO" && item.orderRef === orderRef);
+    if (!orderRef || !row || !scmScheduleCanManageBlankets()) return;
+    const rowId = scheduleRowId(row);
+    const isBlanket = target.checked === true;
+    scmScheduleBlanketSavingRef = rowId;
+    scmScheduleNotice = `${isBlanket ? "Flagging" : "Clearing"} ${orderRef}...`;
+    renderScmSchedule();
+    try {
+      await scmScheduleApi(`/api/scm/purchase-orders/${encodeURIComponent(orderRef)}/blanket`, {
+        method: "PUT",
+        body: JSON.stringify({
+          isBlanket,
+          audit: { sessionId: sessionStorage.getItem("mbbs.dispatch.sessionId") || "" }
+        })
+      });
+      scmScheduleNotice = isBlanket
+        ? `${orderRef} is now a Blanket parent and is hidden from normal schedules and dispatch planning.`
+        : `${orderRef} is no longer flagged as a Blanket parent.`;
+      await loadScmSchedule();
+    } catch (error) {
+      scmScheduleNotice = `Blanket flag failed: ${error.message}`;
+      await loadScmSchedule();
+    } finally {
+      scmScheduleBlanketSavingRef = "";
+      renderScmSchedule();
+    }
     return;
   }
 

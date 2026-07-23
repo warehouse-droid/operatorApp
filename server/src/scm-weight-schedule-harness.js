@@ -102,8 +102,12 @@ includesAll(repository, [
   "status = ANY($2::text[])",
   "cardinality($6::text[]) = 0",
   "globalSearch ? [] : normalizeScmScheduleFilterValues(status)",
-  'globalSearch ? "" : String(view || "").trim()'
-], "Batched enrichment, type-safe planning, multi-value filters, and filter-free global search");
+  'String(view || "").trim().toLowerCase()',
+  "load.value->>'driverName'",
+  "load.value->>'truckPlate'",
+  "NULLIF(s.dispatch_assignment_note, '')",
+  "dispatch_assignment_note = EXCLUDED.dispatch_assignment_note"
+], "Batched enrichment, type-safe planning, multi-value filters, and view-preserving global search");
 includesAll(enrichment, [
   "export async function createPurchaseOrderDispatchEnricher",
   "Array.isArray(options.vendorYards)",
@@ -111,8 +115,8 @@ includesAll(enrichment, [
   "options.allowOllama !== false"
 ], "Reusable PO enrichment context");
 assert.equal((server.match(/req\.query\.includeSchedule === "false"/g) || []).length, 3, "Schedule mutations must support omitting unused full-list responses.");
-assert.ok(scheduleHtml.includes("/scm-schedule.js?v=20260721-sales-v1"), "Schedule cache bust missing.");
-assert.ok(poHtml.includes("/dispatch-scm.js?v=20260720-po-multi-drop-route-v3"), "PO Split cache bust missing.");
+assert.ok(scheduleHtml.includes("/scm-schedule.js?v=20260723-blanket-po-v1"), "Schedule cache bust missing.");
+assert.ok(poHtml.includes("/dispatch-scm.js?v=20260723-po-type-filters-v1"), "PO Split cache bust missing.");
 assert.ok(vrmaHtml.includes("/scm-vrma.js?v=20260718-scm-item-weight-v1"), "VRMA cache bust missing.");
 
 const poStart = poSplit.indexOf("function scmNumber");

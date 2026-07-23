@@ -542,6 +542,15 @@ body {
   min-height: 25px;
 }
 
+.smart-yard-cell .smart-capacity-provenance {
+  display: block;
+  margin-top: 3px;
+  color: var(--smart-muted);
+  font-size: 8px;
+  font-weight: 700;
+  line-height: 1.25;
+}
+
 .smart-pill {
   display: inline-flex;
   align-items: center;
@@ -648,6 +657,22 @@ body {
   color: #536874;
   background: #eef3f6;
   font-size: 9px;
+}
+
+.smart-stock-policy {
+  display: grid;
+  gap: 3px;
+  min-width: 145px;
+  color: var(--smart-muted);
+  font-size: 10px;
+}
+
+.smart-stock-policy strong {
+  color: #203f4d;
+}
+
+.smart-stock-policy small {
+  line-height: 1.35;
 }
 
 .smart-empty {
