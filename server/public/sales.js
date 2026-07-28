@@ -33,13 +33,13 @@ function renderSales() {
       <div class="topbar-language">${window.MBBS_I18N?.toggleHtml?.() || ""}</div>
       <div class="topbar-actions">
         <span class="dispatch-user">${salesEscape(operator.display_name || operator.username || "")}</span>
-        <button onclick="dispatchLogout()" type="button">${salesT("common.logout", "Logout")}</button>
+        ${operator.publicSales ? "" : `<button onclick="dispatchLogout()" type="button">${salesT("common.logout", "Logout")}</button>`}
       </div>
     </header>
     <section class="dispatch-menu-page">
       <div class="dispatch-menu-heading">
         <h2>${salesT("sales.menu", "Sales Menu")}</h2>
-        <p>Authorized yards: ${salesEscape(yards.join(", ") || "None assigned")}</p>
+        <p>${operator.publicSales ? "Available" : "Authorized"} yards: ${salesEscape(yards.join(", ") || "None assigned")}</p>
       </div>
       ${yards.length ? "" : `<div class="route-notice"><span>No Sales yards are assigned to this account. Ask an administrator to update Account Management.</span></div>`}
       <div class="dispatch-menu-grid">
@@ -55,6 +55,12 @@ function renderSales() {
         <button class="dispatch-menu-card" onclick="location.href='/sales/printing'" type="button">
           <strong>Sales Order Printing</strong><span>Find Delivery orders by ordering location, preview the selected line-yard ticket, and review every stored print snapshot.</span>
         </button>
+        ${operator.publicSales ? "" : `
+          <button class="dispatch-menu-card" onclick="location.href='/sales/in-outbound-record'" type="button">
+            <strong>${salesT("control.loadedExport", "In/Outbound Record")}</strong>
+            <span>${salesT("control.loadedExportHelp", "Review yard processing, driver delivery timestamps, details, and photo proof.")}</span>
+          </button>
+        `}
       </div>
     </section>
   `;

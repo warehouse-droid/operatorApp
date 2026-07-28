@@ -73,6 +73,7 @@ function splitLineSalesQuantity(item = {}) {
 }
 
 function splitParentOrderId(order = {}) {
+  if (String(order?.type || "").trim().toUpperCase() === "CUSTOM") return "";
   const explicitParent = String(order.originalOrderId || "").trim();
   if (explicitParent) return explicitParent;
   const orderId = String(order.id || "").trim();
@@ -2631,9 +2632,16 @@ export async function getNextDispatchSplitSuffix({ originalOrderId = "", orderTy
   const type = String(orderType || "").trim().toUpperCase();
   const tableName = type === "SO" ? "sales_orders" : "transfer_orders";
   const result = await query(
-    `SELECT COALESCE(MAX(NULLIF(substring(tranid FROM '-S([0-9]+)$'), '')::integer), 0) AS max_suffix
-       FROM ${tableName}
-      WHERE tranid LIKE $1`,
+    `SELECT COALESCE(MAX(NULLIF(substring(order_ref FROM '-S([0-9]+)$'), '')::integer), 0) AS max_suffix
+       FROM (
+         SELECT tranid AS order_ref
+           FROM ${tableName}
+          WHERE tranid LIKE $1
+         UNION ALL
+         SELECT ref_number AS order_ref
+           FROM dispatch_custom_orders
+          WHERE ref_number LIKE $1
+       ) known_refs`,
     [`${originalRef}-S%`]
   );
   const maxSuffix = Number(result.rows[0]?.max_suffix || 0);

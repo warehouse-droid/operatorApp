@@ -174,6 +174,10 @@ function smartProposalSourceCalculation(proposal, line) {
   const sourceAvailable = smartReasonNumber(reason, "sourceAvailablePallets");
   const sourceSafety = smartReasonNumber(reason, "sourceSafetyStockPallets");
   const sourceRop = smartReasonNumber(reason, "sourceReorderPointPallets");
+  const sourcePreferred = smartReasonNumber(reason, "sourcePreferredPallets");
+  const sourceStandardSafety = smartReasonNumber(reason, "sourceStandardSafetyStockPallets");
+  const sourceStandardRop = smartReasonNumber(reason, "sourceStandardReorderPointPallets");
+  const sourceStandardPreferred = smartReasonNumber(reason, "sourceStandardPreferredPallets");
   const storedProtectedFloor = smartReasonNumber(reason, "sourceProtectedFloorPallets");
   const calculatedProtectedFloor = sourceSafety !== null && sourceRop !== null ? Math.max(sourceSafety, sourceRop) : null;
   const storedMaximum = smartReasonNumber(reason, "sourceMaximumTransferablePallets");
@@ -188,9 +192,19 @@ function smartProposalSourceCalculation(proposal, line) {
     && Math.abs(storedProtectedFloor - calculatedProtectedFloor) > 0.000001)
     || (storedMaximum !== null && calculatedMaximum !== null && Math.abs(storedMaximum - calculatedMaximum) > 0.000001);
   const withinLimit = maximumTransferable === null ? null : proposed <= maximumTransferable + 0.000001;
+  const sourceLowerStockEvidence = reason.sourceLowerStockPolicyEnabled
+    ? reason.sourceLowerStockPolicyApplied
+      && sourceStandardSafety !== null
+      && sourceStandardRop !== null
+      && sourceStandardPreferred !== null
+      && sourcePreferred !== null
+      ? `<small>Lower stock policy · 1-PLT floor: Safety ${smartNumber(sourceStandardSafety, 3)} → ${smartNumber(sourceSafety, 3)} PLT · ROP ${smartNumber(sourceStandardRop, 2)} → ${smartNumber(sourceRop, 2)} PLT · Preferred ${smartNumber(sourceStandardPreferred, 2)} → ${smartNumber(sourcePreferred, 2)} PLT.</small>`
+      : "<small>Lower stock policy · 1-PLT floor enabled; active demand/floor rules leave this source policy unchanged.</small>"
+    : "";
   return `<div class="smart-calculation-block smart-source-calculation">
     <span class="smart-calculation-title"><strong>${smartEscape(proposal.sourceName || "Source yard")} source protection</strong></span>
     <small>Plan-time snapshot; confirmation rechecks live source inventory.</small>
+    ${sourceLowerStockEvidence}
     <span>Available after active reservations: <strong>${smartOptionalNumber(sourceAvailable, 2)} PLT</strong></span>
     ${hasSourceFormula ? `<span>Safety stock: <strong>${smartNumber(sourceSafety, 2)} PLT</strong> · ROP: <strong>${smartNumber(sourceRop, 2)} PLT</strong></span>
     <small>Protected floor = max(${smartNumber(sourceSafety, 2)} safety stock, ${smartNumber(sourceRop, 2)} ROP) = ${smartNumber(calculatedProtectedFloor, 2)} PLT</small>
@@ -225,6 +239,19 @@ function smartProposalDecisionEvidence(line) {
   ].filter(([, value]) => value !== null && value !== undefined && value !== "" && Number.isFinite(Number(value)));
   const labels = evidence.map(([label, value, suffix, places]) => `<span>${smartEscape(label)}: ${smartNumber(value, places)}${suffix}</span>`);
   if (destinationPolicyInvalid) labels.unshift("<span>Destination changed · rebuild plan for yard policy evidence</span>");
+  if (reason.lowerStockPolicyEnabled && !destinationPolicyInvalid) {
+    const standardSafety = smartReasonNumber(reason, "standardSafetyStockPallets");
+    const standardRop = smartReasonNumber(reason, "standardReorderPointPallets");
+    const standardPreferred = smartReasonNumber(reason, "standardPreferredPallets");
+    if (reason.lowerStockPolicyApplied
+      && standardSafety !== null
+      && standardRop !== null
+      && standardPreferred !== null) {
+      labels.push(`<span>Lower stock policy · 1-PLT floor · Safety ${smartNumber(standardSafety, 3)} → ${smartNumber(reason.safetyStockPallets, 3)} · ROP ${smartNumber(standardRop, 2)} → ${smartNumber(reason.reorderPointPallets, 2)} · Preferred ${smartNumber(standardPreferred, 2)} → ${smartNumber(reason.preferredPallets, 2)} PLT</span>`);
+    } else {
+      labels.push("<span>Lower stock policy · 1-PLT floor enabled · levels unchanged by active demand/floor rules</span>");
+    }
+  }
   if (reason.forecastModel && !destinationPolicyInvalid) labels.push(`<span>Forecast: ${smartEscape(reason.forecastModel)}</span>`);
   if (reason.vendorSupplyStatus) labels.push(`<span>Vendor supply: ${smartEscape(reason.vendorSupplyStatus)}</span>`);
   if (reason.vendorConfirmationRequired) labels.push("<span>Vendor confirmation required</span>");

@@ -5,6 +5,7 @@ const DEPENDENCY_YARDS = [
   { id: 15, code: "12441" },
   { id: 26, code: "150" }
 ];
+const DEPENDENCY_PROPOSAL_LINE_SELECTOR = ".scm-dependency-proposal-line[data-proposal-line-id]";
 
 const dependencyState = {
   operator: null,
@@ -15,6 +16,7 @@ const dependencyState = {
   selectedProposalIds: new Set(),
   search: "",
   reviewStatus: "open",
+  mobilePanel: "candidates",
   busy: "",
   notice: "",
   error: ""
@@ -22,6 +24,8 @@ const dependencyState = {
 
 let dependencyEventSource = null;
 let dependencyRemoteRefreshTimer = null;
+const dependencyManualItemEditors = new Map();
+const dependencyManualItemSearchTimers = new Map();
 
 function depEscape(value) {
   return String(value ?? "")
@@ -109,7 +113,7 @@ function updateProposalPalletEstimate(card) {
   let explicit = 0;
   let complete = true;
   const materialByItem = new Map();
-  for (const row of card.querySelectorAll("[data-sales-line-id]")) {
+  for (const row of card.querySelectorAll(DEPENDENCY_PROPOSAL_LINE_SELECTOR)) {
     const quantities = Object.fromEntries([...row.querySelectorAll("[data-proposal-unit]")]
       .map((input) => [input.dataset.proposalUnit, depNumber(input.value)]));
     const conversions = {
@@ -156,6 +160,87 @@ function updateProposalPalletEstimate(card) {
   }
 }
 
+function dependencyManualItemEditor(proposalId) {
+  const key = String(proposalId);
+  if (!dependencyManualItemEditors.has(key)) {
+    dependencyManualItemEditors.set(key, {
+      search: "",
+      results: [],
+      selectedItem: null,
+      loading: false,
+      error: "",
+      requestVersion: 0
+    });
+  }
+  return dependencyManualItemEditors.get(key);
+}
+
+function dependencyManualItemConversions(item = {}) {
+  return {
+    pallets: depNumber(item.conversions?.pallets ?? item.toPlt ?? item.to_plt),
+    layers: depNumber(item.conversions?.layers ?? item.toLyr ?? item.to_lyr),
+    sections: depNumber(item.conversions?.sections ?? item.toSec ?? item.to_sec),
+    pieces: depNumber(item.conversions?.pieces ?? item.toPcs ?? item.to_pcs)
+  };
+}
+
+function dependencyManualItemUnitOptions(item = {}) {
+  const conversions = dependencyManualItemConversions(item);
+  const options = [
+    ["pallets", "PLT", conversions.pallets],
+    ["layers", "LYR", conversions.layers],
+    ["sections", "SEC", conversions.sections],
+    ["pieces", "PCS", conversions.pieces]
+  ].filter(([, , conversion]) => conversion > 0);
+  if (!options.length) options.push(["salesQty", item.unit || item.stockUnit || "UOM", 1]);
+  return options;
+}
+
+function renderDependencyManualItemEditor(proposal) {
+  const editor = dependencyManualItemEditor(proposal.id);
+  const selected = editor.selectedItem;
+  const options = selected ? dependencyManualItemUnitOptions(selected) : [];
+  const resultMarkup = editor.loading
+    ? `<div class="scm-dependency-manual-item-message">Searching items...</div>`
+    : editor.error
+      ? `<div class="scm-dependency-manual-item-message error">${depEscape(editor.error)}</div>`
+      : editor.results.length
+        ? `<div class="scm-dependency-manual-item-results" role="listbox">${editor.results.map((item) => `
+            <button data-action="select-manual-item" data-proposal-id="${proposal.id}" data-item-id="${depEscape(item.itemId)}" type="button" role="option">
+              <strong>${depEscape(item.sku || item.itemName)}</strong>
+              <span>${depEscape(item.itemName || item.description || "")}</span>
+              <small>${depQty(item.effectiveAvailable ?? item.quantityAvailable)} available at ${depEscape(proposal.fromLocation)}</small>
+            </button>`).join("")}</div>`
+        : editor.search.trim().length >= 2 && !selected
+          ? `<div class="scm-dependency-manual-item-message">No matching transferable item.</div>`
+          : "";
+  return `
+    <section class="scm-dependency-manual-item-editor" data-manual-item-editor data-proposal-id="${proposal.id}">
+      <div class="scm-dependency-manual-item-heading">
+        <div><strong>Add item manually</strong><small>Type an item name, SKU, or NetSuite internal ID, then choose a match.</small></div>
+      </div>
+      <div class="scm-dependency-manual-item-grid">
+        <label class="scm-dependency-manual-item-search"><span>Item</span>
+          <input id="manualItemSearch-${proposal.id}" data-field="manual-item-search" data-proposal-id="${proposal.id}"
+            value="${depEscape(editor.search)}" placeholder="Start typing an item..." autocomplete="off" />
+          ${resultMarkup}
+        </label>
+        ${selected ? `
+          <div class="scm-dependency-manual-item-selected">
+            <strong>${depEscape(selected.sku || selected.itemName)}</strong>
+            <span>${depEscape(selected.itemName || selected.description || "")}</span>
+            <small>${depQty(selected.effectiveAvailable ?? selected.quantityAvailable)} available at ${depEscape(proposal.fromLocation)}</small>
+          </div>
+          <label><span>Unit</span><select data-field="manual-item-unit">${options.map(([value, label, conversion]) =>
+            `<option value="${value}">${depEscape(label)}${conversion > 0 ? ` = ${depQty(conversion)} ${depEscape(selected.unit || selected.stockUnit || "UOM")}` : ""}</option>`
+          ).join("")}</select></label>
+          <label><span>Quantity</span><input data-field="manual-item-quantity" type="number" min="0.001" step="0.001" value="1" /></label>
+          <button class="primary-action" data-action="add-manual-item" data-proposal-id="${proposal.id}" type="button">Add item</button>
+        ` : ""}
+      </div>
+    </section>`;
+}
+
 async function depApi(path, options = {}) {
   const response = await fetch(path, {
     ...options,
@@ -187,7 +272,30 @@ async function loadSelectedDependencyInventory({ forceRefresh = false, refreshUn
     && depNumber(selectedOrder?.uncoveredQuantity) > 0
   );
   const path = `/api/scm/transfer-dependencies/candidates/${dependencyState.selectedSalesOrderId}/${shouldRefresh ? "refresh-inventory" : "inventory"}`;
-  dependencyState.inventory = await depApi(path, shouldRefresh ? { method: "POST", body: "{}" } : {});
+  const payload = await depApi(path, shouldRefresh
+    ? { method: "POST", body: JSON.stringify({ force: forceRefresh, includeCandidate: true }) }
+    : {});
+  dependencyState.inventory = payload?.inventory || payload;
+  if (shouldRefresh && payload && Object.hasOwn(payload, "candidate")) {
+    const currentIndex = dependencyState.candidates.findIndex((order) =>
+      String(order.salesOrderId) === String(dependencyState.selectedSalesOrderId));
+    if (payload.candidate && currentIndex >= 0) {
+      dependencyState.candidates.splice(currentIndex, 1, payload.candidate);
+    } else if (!payload.candidate && currentIndex >= 0) {
+      const removed = dependencyState.candidates[currentIndex];
+      dependencyState.candidates.splice(currentIndex, 1);
+      dependencyState.selectedSalesOrderId = dependencyState.candidates[0]?.salesOrderId || null;
+      dependencyState.inventory = null;
+      dependencyState.batch = null;
+      clearDependencyProposalSelection();
+      dependencyState.notice = `${removed.salesOrderRef} is now fully committed in NetSuite and was removed from Open shortages.`;
+      if (dependencyState.selectedSalesOrderId) {
+        dependencyState.inventory = await depApi(
+          `/api/scm/transfer-dependencies/candidates/${dependencyState.selectedSalesOrderId}/inventory`
+        );
+      }
+    }
+  }
   return dependencyState.inventory;
 }
 
@@ -287,7 +395,7 @@ function renderDependencyCandidates() {
       data-action="select-order" data-order-id="${order.salesOrderId}" type="button">
       <span><strong class="scm-dependency-order-ref">${depEscape(order.salesOrderRef)}${order.testFixture ? `<b class="scm-dependency-test-badge">TEST</b>` : ""}</strong><small>${depEscape(order.customer || "")}</small></span>
       <span class="scm-dependency-order-side"><b>${depQty(order.uncoveredQuantity)}</b><small>uncovered</small></span>
-      <small>${depEscape(order.outboundLocation || "--")} | ${depEscape(depDate(order.expectedDeliveryDate))}${order.completionType === "reviewed_no_transfer" ? " | Reviewed - No Transfer" : order.workflowStage === "created" ? " | Waiting approval / print" : order.completionType === "transfer_approved_printed" ? " | Approved & printed" : ""}</small>
+      <small>${depEscape(order.outboundLocation || "--")} | ${depEscape(depDate(order.expectedDeliveryDate))}${order.completionType === "reviewed_no_transfer" ? " | Reviewed - No Transfer" : order.completionType === "transfer_manually_reviewed" ? " | Created TO reviewed" : order.workflowStage === "created" ? " | Waiting approval / print" : order.completionType === "transfer_approved_printed" ? " | Approved & printed" : ""}</small>
     </button>
   `).join("");
 }
@@ -295,11 +403,22 @@ function renderDependencyCandidates() {
 function depInventoryCoverage(order = {}, matrix = {}) {
   const byItem = new Map((matrix?.items || []).map((item) => [String(item.itemId), item]));
   const coverageByItem = new Map();
-  for (const line of order.lines || []) {
+  const orderLines = Array.isArray(matrix?.orderLines) ? matrix.orderLines : (order.lines || []);
+  for (const line of orderLines) {
     const key = String(line.itemId || line.salesLineId);
-    const entry = coverageByItem.get(key) || { line, lines: [], required: 0 };
+    const entry = coverageByItem.get(key) || {
+      line,
+      lines: [],
+      required: 0,
+      ordered: 0,
+      committed: 0,
+      backordered: 0
+    };
     entry.lines.push(line);
     entry.required += depNumber(line.unresolvedQuantity);
+    entry.ordered += depNumber(line.quantity);
+    entry.committed += depNumber(line.committedQuantity);
+    entry.backordered += depNumber(line.backorderedQuantity);
     coverageByItem.set(key, entry);
   }
   return [...coverageByItem.entries()].map(([itemKey, entry]) => {
@@ -336,31 +455,41 @@ function renderInventoryMatrix() {
     </div>` : ""}
     <div class="scm-dependency-review-action">
       <span>${order.workflowStage === "created"
-        ? "Transfer Orders were created and are waiting for quantity verification, approval, and source-yard printing."
+        ? "Transfer Orders were created and are waiting for quantity verification, approval, and source-yard printing. If no further action is required, mark this order reviewed manually."
+        : order.completionType === "transfer_manually_reviewed"
+          ? `Created Transfer Orders were manually reviewed${order.completedAt ? ` on ${depEscape(depDate(order.completedAt))}` : ""}.`
         : order.completionType === "transfer_approved_printed"
           ? `Transfer Orders were verified, approved, and printed${order.completedAt ? ` on ${depEscape(depDate(order.completedAt))}` : ""}.`
         : order.reviewed
           ? `Reviewed${order.reviewedAt ? ` on ${depEscape(depDate(order.reviewedAt))}` : ""}. This order cannot generate a transfer proposal.`
           : "No transfer needed? Mark only this SCM shortage review; dispatch and operator status stay unchanged."}</span>
-      ${order.workflowStage !== "open" && !order.reviewed ? "" : `<button data-action="${order.reviewed ? "reopen-review" : "review-no-transfer"}" type="button" ${dependencyState.busy ? "disabled" : ""}>
-        ${order.reviewed ? "Undo Review" : "Mark Reviewed - No Transfer"}
+      ${order.workflowStage === "completed" && !order.reviewed ? "" : `<button data-action="${order.reviewed ? "reopen-review" : "review-no-transfer"}" type="button" ${dependencyState.busy ? "disabled" : ""}>
+        ${order.reviewed ? "Undo Review" : order.workflowStage === "created" ? "Mark Reviewed" : "Mark Reviewed - No Transfer"}
       </button>`}
     </div>
     <div class="scm-dependency-matrix-wrap">
       <div class="scm-dependency-matrix-head">
-        <strong>Item / Required</strong>
+        <strong>Order item / quantity</strong>
         <strong class="scm-dependency-undercovered-head"><span>Undercovered</span><small>Not covered by linked TO</small></strong>
         ${DEPENDENCY_YARDS.map((yard) => `<strong class="${String(yard.id) === String(order.outboundLocationId) ? "outbound-yard" : ""}"><span>${yard.code}</span><small>${String(yard.id) === String(order.outboundLocationId) ? "Outbound · available" : "All available"}</small></strong>`).join("")}
       </div>
-      ${coverage.map(({ line, lines, item, required, undercovered, sourceShortfall }) => {
-        const requiredText = lines.length === 1
-          ? depUnitText(line)
-          : `${depQty(required)} ${line.unit || item?.unit || "UOM"} · ${lines.length} SO lines`;
+      ${coverage.map(({ line, lines, item, ordered, committed, backordered, undercovered, sourceShortfall }) => {
         const undercoveredUnit = line.unit || item?.unit || "UOM";
+        const requiredText = [
+          `${depQty(ordered)} ${undercoveredUnit} ordered`,
+          `${depQty(committed)} committed`,
+          `${depQty(backordered)} backordered`,
+          lines.length > 1 ? `${lines.length} SO lines` : ""
+        ].filter(Boolean).join(" · ");
+        const coverageStatus = undercovered > 0.000001
+          ? "needs linked transfer"
+          : depNumber(backordered) > 0.000001
+            ? "Covered by linked TO"
+            : "No backorder";
         return `<div class="scm-dependency-matrix-row ${sourceShortfall > 0.000001 ? "coverage-impossible" : ""}">
           <div><strong>${depEscape(line.sku || line.itemName)}</strong><small>${depEscape(requiredText)}</small></div>
           <div class="scm-dependency-undercovered-cell ${undercovered > 0.000001 ? "has-shortfall" : "is-covered"}">
-            <b>${depQty(undercovered)} ${depEscape(undercoveredUnit)}</b><small>${undercovered > 0.000001 ? "needs linked transfer" : "Covered by linked TO"}</small>
+            <b>${depQty(undercovered)} ${depEscape(undercoveredUnit)}</b><small>${coverageStatus}</small>
           </div>
           ${DEPENDENCY_YARDS.map((yard) => {
             const balance = item?.balances?.find((entry) => String(entry.locationId) === String(yard.id));
@@ -426,13 +555,13 @@ function renderProposal(proposal) {
           ].filter(([, , conversion]) => conversion > 0);
           if (!units.length) units.push(["salesQty", line.unit || "UOM", 0]);
           const salesQuantity = depProposalSalesQuantity(values, conversions);
-          return `<section class="scm-dependency-proposal-line link-quantity-line" data-sales-line-id="${line.salesLineId}"
+          return `<section class="scm-dependency-proposal-line link-quantity-line" data-sales-line-id="${line.salesLineId ?? ""}"
             data-proposal-line-id="${line.id}" data-item-id="${depEscape(line.itemId)}" data-item-name="${depEscape(line.itemName)}"
             data-to-plt="${conversions.pallets}" data-to-lyr="${conversions.layers}"
             data-to-sec="${conversions.sections}" data-to-pcs="${conversions.pieces}"
             data-sales-unit="${depEscape(line.unit || "UOM")}">
             <div class="link-quantity-info scm-dependency-line-info">
-              <span><strong>${depEscape(line.itemName)}</strong><small>Sales quantity</small></span>
+              <span><strong>${depEscape(line.sku || line.itemName)}${line.lineSource === "manual" ? `<b class="scm-dependency-manual-badge">Manual</b>` : ""}</strong><small>${line.lineSource === "manual" ? depEscape(line.itemName || "Manually added item") : "Sales quantity"}</small></span>
               <div class="scm-dependency-line-controls">
                 <em class="link-sales-equivalent" data-proposal-sales-equivalent>${depQty(salesQuantity)} ${depEscape(line.unit || "UOM")}</em>
                 ${editable && !dependencyState.busy ? `<button class="scm-dependency-remove-line" data-action="remove-proposal-line"
@@ -448,6 +577,7 @@ function renderProposal(proposal) {
           </section>`;
         }).join("")}
       </div>
+      ${editable ? renderDependencyManualItemEditor(proposal) : ""}
       <div class="scm-dependency-pallet-summary">
         <div><span>Calculated PALLET</span><strong data-calculated-pallet>${depQty(proposal.calculatedPalletQuantity)}</strong></div>
         <label><span>Final PALLET quantity</span>
@@ -525,6 +655,11 @@ function renderDependencyPage() {
       <span>${depEscape(dependencyState.error || dependencyState.notice)}</span>
       <button class="scm-notice-close" data-action="close-notice" type="button" aria-label="Close">&times;</button>
     </div>` : ""}
+    <nav class="scm-dependency-mobile-steps" aria-label="Auto Transfer steps">
+      <button class="${dependencyState.mobilePanel === "candidates" ? "active" : ""}" data-action="set-mobile-panel" data-mobile-panel="candidates" type="button"><span>1</span>Orders</button>
+      <button class="${dependencyState.mobilePanel === "inventory" ? "active" : ""}" data-action="set-mobile-panel" data-mobile-panel="inventory" type="button"><span>2</span>Inventory</button>
+      <button class="${dependencyState.mobilePanel === "proposals" ? "active" : ""}" data-action="set-mobile-panel" data-mobile-panel="proposals" type="button"><span>3</span>Proposals</button>
+    </nav>
     <section class="scm-dependency-toolbar">
       <button data-action="refresh-inventory" type="button" ${dependencyState.reviewStatus === "open" && dependencyState.selectedSalesOrderId && !selectedOrder?.completed && !dependencyState.busy ? "" : "disabled"}>Refresh Inventory</button>
       <select data-field="suggest-mode">
@@ -534,7 +669,7 @@ function renderDependencyPage() {
       <button class="primary-action" data-action="generate" type="button" ${dependencyState.reviewStatus === "open" && dependencyState.selectedSalesOrderId && !selectedOrder?.completed && !dependencyState.busy ? "" : "disabled"}>Generate Suggestion</button>
       <span class="scm-dependency-busy">${depEscape(dependencyState.busy)}</span>
     </section>
-    <section class="scm-dependency-grid">
+    <section class="scm-dependency-grid" data-mobile-panel="${depEscape(dependencyState.mobilePanel)}">
       <aside class="scm-dependency-panel scm-dependency-candidates">
         <div class="panel-title scm-dependency-candidate-title">
           <div><p>${dependencyState.reviewStatus === "completed" ? "Completed reviews" : dependencyState.reviewStatus === "created" ? "Created · action required" : "Open shortages"}</p><h2>Sales Orders</h2></div>
@@ -657,10 +792,11 @@ function collectDependencyProposalPayload(card) {
       const value = card.querySelector('[data-proposal-field="palletTransferQuantity"]')?.value;
       return value === "" || value === undefined ? null : Number(value);
     })(),
-    lines: [...card.querySelectorAll("[data-sales-line-id]")].map((row) => {
+    lines: [...card.querySelectorAll(DEPENDENCY_PROPOSAL_LINE_SELECTOR)].map((row) => {
       const quantities = proposalUnitValues(row);
       return {
-        salesLineId: Number(row.dataset.salesLineId),
+        proposalLineId: Number(row.dataset.proposalLineId),
+        salesLineId: row.dataset.salesLineId ? Number(row.dataset.salesLineId) : null,
         quantities,
         proposedQuantity: depProposalSalesQuantity(quantities, {
           pallets: depNumber(row.dataset.toPlt),
@@ -699,9 +835,48 @@ async function runDependencyAction(label, action) {
 let dependencySearchTimer = null;
 scmDependencyApp.addEventListener("input", (event) => {
   if (event.target.matches("[data-proposal-unit]")) {
-    const row = event.target.closest("[data-sales-line-id]");
+    const row = event.target.closest(DEPENDENCY_PROPOSAL_LINE_SELECTOR);
     updateProposalSalesEquivalent(row);
     updateProposalPalletEstimate(event.target.closest(".scm-dependency-proposal"));
+    return;
+  }
+  if (event.target.matches('[data-field="manual-item-search"]')) {
+    const proposalId = Number(event.target.dataset.proposalId);
+    const editor = dependencyManualItemEditor(proposalId);
+    editor.search = event.target.value;
+    editor.selectedItem = null;
+    editor.loading = false;
+    editor.error = "";
+    editor.results = [];
+    editor.requestVersion += 1;
+    const requestVersion = editor.requestVersion;
+    const previousTimer = dependencyManualItemSearchTimers.get(String(proposalId));
+    if (previousTimer) clearTimeout(previousTimer);
+    if (editor.search.trim().length < 2) return;
+    const timer = setTimeout(async () => {
+      const requestedSearch = editor.search.trim();
+      editor.loading = true;
+      renderDependencyPage();
+      try {
+        if (!dependencyState.batch) return;
+        const payload = await depApi(
+          `/api/scm/transfer-dependencies/batches/${dependencyState.batch?.id}/proposals/${proposalId}/items?search=${encodeURIComponent(requestedSearch)}&limit=12`
+        );
+        if (editor.requestVersion !== requestVersion || editor.search.trim() !== requestedSearch) return;
+        editor.results = Array.isArray(payload) ? payload : payload.items || [];
+        editor.error = "";
+      } catch (error) {
+        if (editor.requestVersion !== requestVersion || editor.search.trim() !== requestedSearch) return;
+        editor.results = [];
+        editor.error = error.message;
+      } finally {
+        if (editor.requestVersion === requestVersion && editor.search.trim() === requestedSearch) {
+          editor.loading = false;
+          renderDependencyPage();
+        }
+      }
+    }, 300);
+    dependencyManualItemSearchTimers.set(String(proposalId), timer);
     return;
   }
   if (event.target.matches('[data-proposal-field="palletTransferQuantity"]')) {
@@ -731,7 +906,7 @@ scmDependencyApp.addEventListener("change", (event) => {
   }
   if (event.target.matches('[data-proposal-unit="layers"]')) {
     event.target.value = String(Math.max(0, Math.round(depNumber(event.target.value))));
-    const row = event.target.closest("[data-sales-line-id]");
+    const row = event.target.closest(DEPENDENCY_PROPOSAL_LINE_SELECTOR);
     updateProposalSalesEquivalent(row);
     updateProposalPalletEstimate(event.target.closest(".scm-dependency-proposal"));
   }
@@ -747,8 +922,16 @@ scmDependencyApp.addEventListener("click", async (event) => {
     renderDependencyPage();
     return;
   }
+  if (action === "set-mobile-panel") {
+    const panel = target.dataset.mobilePanel;
+    if (!["candidates", "inventory", "proposals"].includes(panel)) return;
+    dependencyState.mobilePanel = panel;
+    renderDependencyPage();
+    return;
+  }
   if (action === "select-order") {
     dependencyState.selectedSalesOrderId = target.dataset.orderId;
+    if (window.matchMedia?.("(max-width: 760px)").matches) dependencyState.mobilePanel = "inventory";
     clearDependencyProposalSelection();
     dependencyState.batch = null;
     dependencyState.inventory = null;
@@ -759,15 +942,62 @@ scmDependencyApp.addEventListener("click", async (event) => {
     const status = ["created", "completed"].includes(target.dataset.reviewStatus) ? target.dataset.reviewStatus : "open";
     if (status === dependencyState.reviewStatus) return;
     dependencyState.reviewStatus = status;
+    dependencyState.mobilePanel = "candidates";
     await runDependencyAction("Loading shortages...", () => loadDependencyCandidates({ preserveSelection: false }));
+    return;
+  }
+  if (action === "select-manual-item") {
+    const proposalId = Number(target.dataset.proposalId);
+    const editor = dependencyManualItemEditor(proposalId);
+    const selected = editor.results.find((item) => String(item.itemId) === String(target.dataset.itemId));
+    if (!selected) return;
+    editor.selectedItem = selected;
+    editor.search = selected.sku || selected.itemName || String(selected.itemId);
+    editor.results = [];
+    editor.error = "";
+    renderDependencyPage();
+    return;
+  }
+  if (action === "add-manual-item") {
+    if (!dependencyState.batch) return;
+    const proposalId = Number(target.dataset.proposalId);
+    const editor = dependencyManualItemEditor(proposalId);
+    if (!editor.selectedItem) return;
+    const wrapper = target.closest("[data-manual-item-editor]");
+    const unit = wrapper?.querySelector('[data-field="manual-item-unit"]')?.value || "salesQty";
+    const quantity = depNumber(wrapper?.querySelector('[data-field="manual-item-quantity"]')?.value);
+    if (quantity <= 0) {
+      editor.error = "Enter a quantity above zero.";
+      renderDependencyPage();
+      return;
+    }
+    const quantities = { pallets: 0, layers: 0, sections: 0, pieces: 0, salesQty: 0, [unit]: quantity };
+    const itemName = editor.selectedItem.sku || editor.selectedItem.itemName || `Item ${editor.selectedItem.itemId}`;
+    await runDependencyAction("Adding item to proposal...", async () => {
+      dependencyState.batch = await depApi(
+        `/api/scm/transfer-dependencies/batches/${dependencyState.batch.id}/proposals/${proposalId}/lines`,
+        {
+          method: "POST",
+          body: JSON.stringify({ itemId: editor.selectedItem.itemId, quantities })
+        }
+      );
+      dependencyManualItemEditors.delete(String(proposalId));
+      dependencyState.notice = `${itemName} added manually. Review and save the Transfer Order before creation.`;
+    });
     return;
   }
   if (action === "review-no-transfer") {
     const order = depSelectedOrder();
-    if (!order || !window.confirm(`Mark ${order.salesOrderRef} as Reviewed - No Transfer? This does not change dispatch or operator eligibility.`)) return;
+    const createdReview = order?.workflowStage === "created";
+    const prompt = createdReview
+      ? `Mark ${order.salesOrderRef} as reviewed and move it to Completed? Existing Transfer Orders and their records will be kept.`
+      : `Mark ${order?.salesOrderRef} as Reviewed - No Transfer? This does not change dispatch or operator eligibility.`;
+    if (!order || !window.confirm(prompt)) return;
     await runDependencyAction("Saving review...", async () => {
       await depApi(`/api/scm/transfer-dependencies/candidates/${order.salesOrderId}/review`, { method: "POST", body: "{}" });
-      dependencyState.notice = `${order.salesOrderRef} moved to Completed. Dispatch and operator status were not changed.`;
+      dependencyState.notice = createdReview
+        ? `${order.salesOrderRef} moved to Completed. Its created Transfer Orders were kept.`
+        : `${order.salesOrderRef} moved to Completed. Dispatch and operator status were not changed.`;
       await loadDependencyCandidates({ preserveSelection: false });
     });
     return;
@@ -775,9 +1005,10 @@ scmDependencyApp.addEventListener("click", async (event) => {
   if (action === "reopen-review") {
     const order = depSelectedOrder();
     if (!order) return;
+    const returnStage = order.completionType === "transfer_manually_reviewed" ? "Created" : "Open";
     await runDependencyAction("Reopening shortage...", async () => {
       await depApi(`/api/scm/transfer-dependencies/candidates/${order.salesOrderId}/review`, { method: "DELETE" });
-      dependencyState.notice = `${order.salesOrderRef} returned to the Open queue.`;
+      dependencyState.notice = `${order.salesOrderRef} returned to the ${returnStage} queue.`;
       await loadDependencyCandidates({ preserveSelection: false });
     });
     return;
@@ -785,7 +1016,8 @@ scmDependencyApp.addEventListener("click", async (event) => {
   if (action === "refresh-inventory") {
     await runDependencyAction("Refreshing NetSuite inventory...", async () => {
       await loadSelectedDependencyInventory({ forceRefresh: true });
-      dependencyState.notice = "Inventory refreshed from NetSuite.";
+      await loadDependencyCandidates({ preserveSelection: true, refreshInventory: false });
+      dependencyState.notice = "Sales Order commitment and yard inventory refreshed from NetSuite.";
     });
     return;
   }
@@ -798,6 +1030,7 @@ scmDependencyApp.addEventListener("click", async (event) => {
         body: JSON.stringify({ salesOrderId: dependencyState.selectedSalesOrderId, mode, refreshInventory: true })
       });
       await loadSelectedDependencyInventory({ refreshUndercovered: false });
+      dependencyState.mobilePanel = "proposals";
       dependencyState.notice = `Suggestion created for ${dependencyState.batch.salesOrderRef}.`;
     });
     return;
@@ -840,13 +1073,19 @@ scmDependencyApp.addEventListener("click", async (event) => {
     const proposalId = Number(target.dataset.proposalId);
     const proposalLineId = Number(target.dataset.proposalLineId);
     const itemName = target.dataset.itemName || "this order line";
-    if (!window.confirm(`Remove ${itemName} from this Transfer Order proposal? The quantity will return to Undercovered.`)) return;
+    const manual = target.closest(DEPENDENCY_PROPOSAL_LINE_SELECTOR)?.dataset.salesLineId === "";
+    const consequence = manual
+      ? "This manually added item will be removed; Sales Order undercoverage will not change."
+      : "The quantity will return to Undercovered.";
+    if (!window.confirm(`Remove ${itemName} from this Transfer Order proposal? ${consequence}`)) return;
     await runDependencyAction("Removing order line...", async () => {
       dependencyState.batch = await depApi(
         `/api/scm/transfer-dependencies/batches/${dependencyState.batch.id}/proposals/${proposalId}/lines/${proposalLineId}`,
         { method: "DELETE" }
       );
-      dependencyState.notice = `${itemName} removed. The uncovered quantity and PALLET estimate were recalculated.`;
+      dependencyState.notice = manual
+        ? `${itemName} removed. The PALLET estimate was recalculated.`
+        : `${itemName} removed. The uncovered quantity and PALLET estimate were recalculated.`;
     });
     return;
   }
@@ -915,8 +1154,11 @@ scmDependencyApp.addEventListener("click", async (event) => {
           : failedCount
             ? "Transfer Order creation failed. Correct this proposal and retry."
             : "Transfer Order proposal is already created.";
-      if (result.results.some((entry) => entry.transferOrderId)) dependencyState.reviewStatus = "created";
-      await loadDependencyCandidates({ preserveSelection: false, refreshInventory: false });
+      if (result.results.some((entry) => entry.transferOrderId)) {
+        dependencyState.reviewStatus = "created";
+        dependencyState.mobilePanel = "proposals";
+      }
+      await loadDependencyCandidates({ preserveSelection: true, refreshInventory: false });
     });
     return;
   }

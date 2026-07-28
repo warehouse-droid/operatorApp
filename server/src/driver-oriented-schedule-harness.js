@@ -218,4 +218,187 @@ assert.deepEqual(multiDropJobs.map((job) => ({
   { location: "2967", address: "2967 Address", destinationLocationId: 28, lineRowIds: ["201", "202"] }
 ]);
 
-console.log(JSON.stringify({ ok: true, tests: 34, jobTypes: jobs.map((job) => job.stopType), approachJobTypes: approachJobs.map((job) => job.stopType) }));
+const pickupOverridePlan = {
+  id: 5634,
+  planDate: "2026-07-24",
+  ownYardCodes: ["3445", "2967", "12441"],
+  orders: [
+    {
+      id: "GOA-5634-5636",
+      type: "SO",
+      sourceYard: "12441",
+      pickupLocations: ["12441"],
+      pickupAddressOverride: "2967 Kennedy Rd, Scarborough, ON M1V 1S9",
+      childOrders: ["SOA05634", "SOA05636"],
+      childOrderDetails: [
+        { id: "SOA05634", type: "SO" },
+        { id: "SOA05636", type: "SO" }
+      ],
+      address: "89 Remington Dr, Richmond Hill, ON"
+    },
+    {
+      id: "SOB115974",
+      type: "SO",
+      sourceYard: "2967",
+      pickupLocations: ["2967"],
+      directPickupManifest: [{
+        location: "2967",
+        transferOrderRef: "TOB00720",
+        salesOrderRef: "SOB115974",
+        items: []
+      }],
+      address: "Customer 2"
+    }
+  ],
+  trucks: [{
+    id: "T2",
+    plate: "BC71838",
+    base: "3445",
+    loads: [{
+      id: "BC71838-L1",
+      name: "Load 1",
+      driverLogin: "alex",
+      driverName: "Alex",
+      truckId: "T2",
+      truckPlate: "BC71838",
+      plannedStartMinute: 660,
+      plannedFinishMinute: 800,
+      stops: [
+        stop("GOA-P", "pick", "GOA-5634-5636", "12441"),
+        stop("SOB-P", "pick", "SOB115974", "2967"),
+        stop("GOA-D", "drop", "GOA-5634-5636", "89 Remington Dr"),
+        stop("SOB-D", "drop", "SOB115974", "Customer 2")
+      ]
+    }]
+  }]
+};
+const pickupOverrideJobs = planJobsForDriver(pickupOverridePlan, "alex");
+const pickupOverrideTravel = pickupOverrideJobs.find((job) => job.stopType === "travel");
+const coLocatedPickups = pickupOverrideJobs.filter((job) => job.stopType === "pickup");
+assert.equal(pickupOverrideTravel?.toLocation, "2967");
+assert.equal(pickupOverrideTravel?.location, "3445 to 2967");
+assert.equal(
+  pickupOverrideTravel?.jobId,
+  "5634:T2:BC71838-L1:TRAVEL:3445:12441:",
+  "The physical display label must not change the legacy travel-job identity."
+);
+assert.deepEqual(
+  coLocatedPickups.map((job) => ({ location: job.location, pickupLocation: job.pickupLocation })),
+  [
+    { location: "2967", pickupLocation: "12441" },
+    { location: "2967", pickupLocation: "2967" }
+  ],
+  "Co-located pickups must show the same physical yard while retaining their separate inventory identities."
+);
+assert.equal(coLocatedPickups[0].address, "2967 Kennedy Rd, Scarborough, ON M1V 1S9");
+assert.deepEqual(coLocatedPickups[0].orderRefs, ["SOA05634", "SOA05636"]);
+assert.ok(coLocatedPickups[1].orderRefs.includes("SOB115974"));
+assert.ok(coLocatedPickups[1].orderRefs.includes("TOB00720"));
+assert.notEqual(coLocatedPickups[0].jobId, coLocatedPickups[1].jobId);
+assert.ok(
+  pickupOverrideJobs.every((job) => !String(job.location || "").includes("12441")),
+  "The driver projection must not tell the driver to travel to the logical 12441 yard."
+);
+assert.equal(
+  pickupOverrideJobs.filter((job) =>
+    job.stopType === "travel"
+    && job.fromLocation === "2967"
+    && job.toLocation === "2967"
+  ).length,
+  0,
+  "Co-located logical pickups must not create a false inter-stop travel job."
+);
+
+const overrideEndBasePlan = {
+  id: 6000,
+  planDate: "2026-07-24",
+  ownYardCodes: ["3445", "2967", "12441"],
+  orders: [
+    {
+      id: "OVERRIDE-END",
+      type: "SO",
+      sourceYard: "12441",
+      pickupLocations: ["12441"],
+      pickupAddressOverride: "2967 Kennedy Rd, Scarborough, ON M1V 1S9"
+    },
+    { id: "NEXT", type: "SO", sourceYard: "3445", pickupLocations: ["3445"], address: "Next customer" }
+  ],
+  trucks: [{
+    id: "T1",
+    plate: "AA100",
+    base: "3445",
+    loads: [{
+      id: "L1",
+      name: "Override end",
+      driverLogin: "alex",
+      driverName: "Alex",
+      truckId: "T1",
+      truckPlate: "AA100",
+      plannedStartMinute: 420,
+      plannedFinishMinute: 480,
+      driverSequence: 0,
+      stops: [stop("OVERRIDE-P", "pick", "OVERRIDE-END", "12441")]
+    }, {
+      id: "L2",
+      name: "Next load",
+      driverLogin: "alex",
+      driverName: "Alex",
+      truckId: "T1",
+      truckPlate: "AA100",
+      plannedStartMinute: 500,
+      plannedFinishMinute: 560,
+      driverSequence: 1,
+      stops: [
+        stop("NEXT-P", "pick", "NEXT", "3445"),
+        stop("NEXT-D", "drop", "NEXT", "Next customer")
+      ]
+    }]
+  }]
+};
+const overrideEndJobs = planJobsForDriver(overrideEndBasePlan, "alex");
+const nextLoadTravel = overrideEndJobs.find((job) => job.loadId === "L2" && job.stopType === "travel");
+assert.equal(nextLoadTravel?.location, "2967 to 3445");
+assert.equal(nextLoadTravel?.jobId, "6000:T1:L2:TRAVEL:12441:3445:");
+
+const overrideReturnPlan = structuredClone(overrideEndBasePlan);
+overrideReturnPlan.trucks[0].loads[1] = {
+  id: "R1",
+  name: "Manual Return",
+  returnOnly: true,
+  manual: true,
+  returnYard: "3445",
+  driverLogin: "alex",
+  driverName: "Alex",
+  truckId: "T1",
+  truckPlate: "AA100",
+  plannedStartMinute: 500,
+  plannedFinishMinute: 530,
+  driverSequence: 1,
+  stops: []
+};
+const overrideReturnJob = planJobsForDriver(overrideReturnPlan, "alex")
+  .find((job) => job.loadId === "R1" && job.stopType === "travel");
+assert.equal(overrideReturnJob?.location, "2967 to 3445");
+assert.equal(overrideReturnJob?.jobId, "6000:T1:R1:RETURN:12441:3445");
+
+const overrideSwitchPlan = structuredClone(overrideEndBasePlan);
+const switchedLoad = overrideSwitchPlan.trucks[0].loads.pop();
+switchedLoad.id = "S2";
+switchedLoad.truckId = "T2";
+switchedLoad.truckPlate = "BB200";
+switchedLoad.switchYard = "3445";
+overrideSwitchPlan.trucks.push({
+  id: "T2",
+  plate: "BB200",
+  base: "3445",
+  loads: [switchedLoad]
+});
+const overrideSwitchApproach = planJobsForDriver(overrideSwitchPlan, "alex")
+  .find((job) => job.loadId === "S2" && job.handoffTravel === true);
+assert.equal(overrideSwitchApproach?.location, "2967 to 3445");
+assert.equal(
+  overrideSwitchApproach?.jobId,
+  "6000:T1:S2:TRAVEL:12441:3445:TRUCK_SWITCH_APPROACH"
+);
+
+console.log(JSON.stringify({ ok: true, tests: 50, jobTypes: jobs.map((job) => job.stopType), approachJobTypes: approachJobs.map((job) => job.stopType) }));

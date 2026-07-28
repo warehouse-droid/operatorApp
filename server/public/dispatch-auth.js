@@ -3,10 +3,20 @@ const DISPATCH_STAFF_TOKEN_KEY = "mbbs.staff.token";
 const DISPATCH_STAFF_ROLE_KEY = "mbbs.staff.role";
 const DISPATCH_STAFF_ROLES_KEY = "mbbs.staff.roles";
 const DISPATCH_AUTH_FALLBACK_TOKEN_KEYS = ["mbbs.control.token", "mbbs.operator.token"];
+const DISPATCH_PUBLIC_SALES_PAGE = window.location.pathname === "/sales" || window.location.pathname.startsWith("/sales/");
+const DISPATCH_PUBLIC_SALES_HEADER = "X-MBBS-Sales-Public";
 let dispatchAuthTokenKey = DISPATCH_AUTH_TOKEN_KEY;
 let dispatchAuthToken = readDispatchAuthToken();
 let dispatchAuthOperator = null;
 const dispatchNativeFetch = window.fetch.bind(window);
+
+function setDispatchAuthOperator(operator) {
+  dispatchAuthOperator = operator || null;
+  window.MBBS_DISPATCH_OPERATOR = dispatchAuthOperator;
+  window.dispatchEvent(new CustomEvent("mbbs-auth-operator-changed", {
+    detail: { operator: dispatchAuthOperator }
+  }));
+}
 
 function readDispatchAuthToken() {
   const primary = localStorage.getItem(DISPATCH_STAFF_TOKEN_KEY) || localStorage.getItem(DISPATCH_AUTH_TOKEN_KEY) || "";
@@ -43,9 +53,12 @@ function dispatchAuthHeaders(headers = {}) {
 window.fetch = (input, options = {}) => {
   const url = typeof input === "string" ? input : input?.url || "";
   if (String(url).startsWith("/api/dispatch") || String(url).startsWith("/api/scm") || String(url).startsWith("/api/sales")) {
+    const headers = DISPATCH_PUBLIC_SALES_PAGE && dispatchAuthOperator?.publicSales
+      ? { ...(options.headers || {}), [DISPATCH_PUBLIC_SALES_HEADER]: "1" }
+      : dispatchAuthHeaders(options.headers || {});
     return dispatchNativeFetch(input, {
       ...options,
-      headers: dispatchAuthHeaders(options.headers || {})
+      headers
     });
   }
   return dispatchNativeFetch(input, options);
@@ -82,7 +95,7 @@ function storeDispatchStaffSession(nextToken, nextOperator) {
   ]));
 }
 
-async function dispatchCheckSession(roles) {
+async function dispatchCheckSession(roles, { redirectOnForbidden = true } = {}) {
   dispatchAuthToken = readDispatchAuthToken();
   if (!dispatchAuthToken) return null;
   const response = await dispatchNativeFetch("/api/auth/me", {
@@ -95,10 +108,13 @@ async function dispatchCheckSession(roles) {
   const payload = await response.json();
   storeDispatchStaffSession(dispatchAuthToken, payload.operator);
   if (!dispatchCanAccess(payload.operator, roles)) {
-    window.location.replace(dispatchRoleHome(payload.operator?.role));
-    return { redirected: true };
+    if (redirectOnForbidden) {
+      window.location.replace(dispatchRoleHome(payload.operator?.role));
+      return { redirected: true };
+    }
+    return { forbidden: true, operator: payload.operator };
   }
-  dispatchAuthOperator = payload.operator;
+  setDispatchAuthOperator(payload.operator);
   return payload.operator;
 }
 
@@ -125,10 +141,31 @@ function renderDispatchLogin(mount, message = "") {
   `;
 }
 
-async function requireDispatchLogin({ mount, onReady, roles = ["dispatcher", "admin"] }) {
-  const existing = await dispatchCheckSession(roles).catch(() => null);
+async function dispatchPublicSalesSession() {
+  if (!DISPATCH_PUBLIC_SALES_PAGE) return null;
+  const response = await dispatchNativeFetch("/api/sales/public-access", {
+    headers: { [DISPATCH_PUBLIC_SALES_HEADER]: "1" }
+  });
+  if (!response.ok) return null;
+  const payload = await response.json();
+  return payload.enabled && payload.operator?.publicSales ? payload.operator : null;
+}
+
+async function requireDispatchLogin({ mount, onReady, roles = ["dispatcher", "admin"], allowPublicSales = true }) {
+  const existing = await dispatchCheckSession(roles, { redirectOnForbidden: !allowPublicSales }).catch(() => null);
   if (existing?.redirected) return;
-  if (existing) return onReady(existing);
+  if (existing && !existing.forbidden) return onReady(existing);
+  const publicOperator = allowPublicSales
+    ? await dispatchPublicSalesSession().catch(() => null)
+    : null;
+  if (publicOperator) {
+    setDispatchAuthOperator(publicOperator);
+    return onReady(publicOperator);
+  }
+  if (existing?.forbidden) {
+    window.location.replace(dispatchRoleHome(existing.operator?.role));
+    return;
+  }
   if (localStorage.getItem("mbbs.driver.token")) {
     window.location.replace("/driver");
     return;
@@ -155,17 +192,21 @@ async function requireDispatchLogin({ mount, onReady, roles = ["dispatcher", "ad
       }
       storeDispatchStaffSession(payload.token, payload.operator);
       dispatchAuthTokenKey = DISPATCH_AUTH_TOKEN_KEY;
-      dispatchAuthOperator = payload.operator;
+      setDispatchAuthOperator(payload.operator);
       await onReady(payload.operator);
     } catch (error) {
       clearDispatchAuthToken();
-      dispatchAuthOperator = null;
+      setDispatchAuthOperator(null);
       renderDispatchLogin(mount, error.message);
     }
   });
 }
 
 function dispatchLogout() {
+  if (DISPATCH_PUBLIC_SALES_PAGE && dispatchAuthOperator?.publicSales) {
+    location.href = "/sales";
+    return;
+  }
   if (dispatchAuthToken) {
     dispatchNativeFetch("/api/auth/logout", {
       method: "POST",
@@ -173,7 +214,7 @@ function dispatchLogout() {
     }).catch(() => {});
   }
   dispatchAuthToken = "";
-  dispatchAuthOperator = null;
+  setDispatchAuthOperator(null);
   clearDispatchAuthToken();
   location.href = "/";
 }

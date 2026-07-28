@@ -27,6 +27,34 @@ function printerNameList(value) {
   return names;
 }
 
+function inputBinValue(value, { strict = false, field = "Input bin" } = {}) {
+  if (value === undefined || value === null || String(value).trim() === "") return null;
+  const supportedType = typeof value === "number" || typeof value === "string";
+  const rawValue = supportedType ? String(value).trim() : "";
+  const inputBin = Number(rawValue);
+  if (/^\d+$/.test(rawValue) && Number.isInteger(inputBin) && inputBin >= 1 && inputBin <= 65535) return inputBin;
+  const error = new Error(`${field} must be a whole-number Windows RawKind value from 1 to 65535.`);
+  if (strict) error.status = 400;
+  throw error;
+}
+
+function printerTargetList(value) {
+  const values = Array.isArray(value) ? value : [];
+  const seen = new Set();
+  const targets = [];
+  for (const entry of values) {
+    const printerName = text(typeof entry === "string" ? entry : entry?.printerName ?? entry?.name);
+    const key = printerName.toLowerCase();
+    if (!printerName || seen.has(key)) continue;
+    seen.add(key);
+    targets.push({
+      printerName,
+      inputBin: typeof entry === "string" ? null : inputBinValue(entry?.inputBin)
+    });
+  }
+  return targets;
+}
+
 function yardPrinterDestinations(row = {}) {
   const settings = row.settings && typeof row.settings === "object" && !Array.isArray(row.settings)
     ? row.settings
@@ -40,6 +68,7 @@ function yardPrinterDestinations(row = {}) {
     return {
       slot,
       printerName: text(configuredPrinter?.printerName ?? configuredPrinter?.name ?? (slot === 1 ? legacyName : "")),
+      inputBin: inputBinValue(configuredPrinter?.inputBin),
       printTransferOrders: configuredPrinter
         ? Boolean(configuredPrinter.printTransferOrders)
         : isLegacyPrimary,
@@ -62,12 +91,14 @@ function normalizedPrinterDestinations(values, currentRow) {
       {
         slot: 1,
         printerName: text(values.printerName),
+        inputBin: null,
         printTransferOrders: true,
         printSalesOrders: true
       },
       {
         slot: 2,
         printerName: "",
+        inputBin: null,
         printTransferOrders: false,
         printSalesOrders: false
       }
@@ -90,6 +121,7 @@ function normalizedPrinterDestinations(values, currentRow) {
     return {
       slot,
       printerName: text(entry.printerName ?? entry.name),
+      inputBin: inputBinValue(entry.inputBin, { strict: true, field: `Printer ${slot} input bin` }),
       printTransferOrders: Boolean(entry.printTransferOrders),
       printSalesOrders: Boolean(entry.printSalesOrders)
     };
@@ -97,6 +129,9 @@ function normalizedPrinterDestinations(values, currentRow) {
   for (const printer of printers) {
     if (!printer.printerName && (printer.printTransferOrders || printer.printSalesOrders)) {
       throw Object.assign(new Error(`Enter a Windows printer name before assigning Printer ${printer.slot} to TO or SO printing.`), { status: 400 });
+    }
+    if (!printer.printerName && printer.inputBin !== null) {
+      throw Object.assign(new Error(`Enter a Windows printer name before setting Printer ${printer.slot}'s input bin.`), { status: 400 });
     }
   }
   const named = printers.filter((printer) => printer.printerName);
@@ -109,19 +144,44 @@ function normalizedPrinterDestinations(values, currentRow) {
   return printers;
 }
 
-function routedPrinterNames(row, documentType) {
+function routedPrinterTargets(row, documentType) {
   const printers = yardPrinterDestinations(row);
   if (TRANSFER_ORDER_DOCUMENT_TYPES.has(documentType)) {
-    return printerNameList(printers
+    return printerTargetList(printers
       .filter((printer) => printer.printTransferOrders)
-      .map((printer) => printer.printerName));
+      .map(({ printerName, inputBin }) => ({ printerName, inputBin })));
   }
   if (SALES_ORDER_DOCUMENT_TYPES.has(documentType)) {
-    return printerNameList(printers
+    return printerTargetList(printers
       .filter((printer) => printer.printSalesOrders)
-      .map((printer) => printer.printerName));
+      .map(({ printerName, inputBin }) => ({ printerName, inputBin })));
   }
   return [];
+}
+
+function configuredPrinterTargets(row, requestedNames = []) {
+  const byName = new Map(yardPrinterDestinations(row)
+    .filter((destination) => destination.printerName)
+    .map((destination) => [destination.printerName.toLowerCase(), {
+      printerName: destination.printerName,
+      inputBin: destination.inputBin
+    }]));
+  return printerNameList(requestedNames)
+    .map((printerName) => byName.get(printerName.toLowerCase()))
+    .filter(Boolean);
+}
+
+function safeAgentDiagnostics(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  try {
+    const serialized = JSON.stringify(value);
+    if (Buffer.byteLength(serialized, "utf8") > 30720) {
+      return { diagnosticsOmitted: "Printer-agent diagnostics exceeded 30 KB." };
+    }
+    return JSON.parse(serialized);
+  } catch {
+    return { diagnosticsOmitted: "Printer-agent diagnostics were not valid JSON." };
+  }
 }
 
 function hashToken(value) {
@@ -196,6 +256,7 @@ function publicPrinter(row) {
     transferOrderReady: enabled && hasToken && transferOrderPrinterNames.length === 2,
     salesOrderReady: enabled && hasToken && salesOrderPrinterNames.length === 1,
     agentId: row.agent_id,
+    agentVersion: Math.max(1, Number(row.agent_version || 1)),
     hasToken,
     enabled,
     status,
@@ -208,8 +269,16 @@ function publicPrinter(row) {
 }
 
 function publicJob(row) {
-  const printerNames = printerNameList(row.printer_names);
-  if (!printerNames.length && row.printer_name) printerNames.push(text(row.printer_name));
+  const legacyPrinterNames = printerNameList(row.printer_names);
+  if (!legacyPrinterNames.length && row.printer_name) legacyPrinterNames.push(text(row.printer_name));
+  const printerTargets = printerTargetList(row.printer_targets);
+  if (!printerTargets.length) {
+    printerTargets.push(...legacyPrinterNames.map((printerName) => ({ printerName, inputBin: null })));
+  }
+  const printerNames = printerTargets.map((target) => target.printerName);
+  const agentDiagnostics = row.agent_diagnostics && typeof row.agent_diagnostics === "object" && !Array.isArray(row.agent_diagnostics)
+    ? row.agent_diagnostics
+    : {};
   return {
     id: Number(row.id),
     jobKey: row.job_key,
@@ -218,6 +287,7 @@ function publicJob(row) {
     yardCode: row.yard_code,
     printerName: printerNames[0] || "",
     printerNames,
+    printerTargets,
     copyCount: printerNames.length,
     documentType: row.document_type,
     documentName: row.document_name,
@@ -225,6 +295,8 @@ function publicJob(row) {
     sourceOrderId: row.source_order_id === null || row.source_order_id === undefined ? null : Number(row.source_order_id),
     sourceOrderRef: row.source_order_ref || "",
     lineLocationId: row.line_location_id === null || row.line_location_id === undefined ? null : Number(row.line_location_id),
+    requestedCompanyName: row.requested_company_name || "",
+    requestedIpAddress: row.requested_ip_address || "",
     status: row.status,
     attempts: Number(row.attempts || 0),
     leasedBy: row.leased_by,
@@ -233,6 +305,7 @@ function publicJob(row) {
     queuedAt: row.queued_at,
     startedAt: row.started_at,
     printedAt: row.printed_at,
+    agentDiagnostics,
     updatedAt: row.updated_at
   };
 }
@@ -341,6 +414,8 @@ export async function queueSmartScmPrintJob({
   sourceOrderId = null,
   sourceOrderRef = "",
   lineLocationId = null,
+  requestedCompanyName = "",
+  requestedIpAddress = "",
   printerNames = null
 }, operatorId = null) {
   const id = Number(locationId);
@@ -354,9 +429,10 @@ export async function queueSmartScmPrintJob({
   if (requestedNames.some((name) => !configuredNames.some((configured) => configured.toLowerCase() === name.toLowerCase()))) {
     throw Object.assign(new Error("The requested printer is not configured for this yard."), { status: 400 });
   }
-  const targetPrinterNames = requestedNames.length
-    ? requestedNames
-    : routedPrinterNames(printerRow, documentType);
+  const targetPrinterTargets = requestedNames.length
+    ? configuredPrinterTargets(printerRow, requestedNames)
+    : routedPrinterTargets(printerRow, documentType);
+  const targetPrinterNames = targetPrinterTargets.map((target) => target.printerName);
   if (TRANSFER_ORDER_DOCUMENT_TYPES.has(documentType) && targetPrinterNames.length !== 2) {
     throw Object.assign(new Error(`${printerRow.yard_code} requires two different printers assigned to TO printing.`), { status: 409 });
   }
@@ -378,11 +454,11 @@ export async function queueSmartScmPrintJob({
     result = await query(
       `INSERT INTO scm_print_jobs (
          job_key, proposal_id, location_id, document_type, document_name, document_path, document_sha256,
-         source_order_id, source_order_ref, line_location_id, queued_by_operator_id, printer_names
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb)
+         source_order_id, source_order_ref, line_location_id, queued_by_operator_id,
+         requested_company_name, requested_ip_address, printer_names, printer_targets
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15::jsonb)
        ON CONFLICT (job_key) DO UPDATE
-         SET printer_names = CASE WHEN scm_print_jobs.status = 'printed' THEN scm_print_jobs.printer_names ELSE EXCLUDED.printer_names END,
-             updated_at = scm_print_jobs.updated_at
+         SET updated_at = scm_print_jobs.updated_at
        RETURNING *`,
       [
         resolvedKey,
@@ -396,7 +472,10 @@ export async function queueSmartScmPrintJob({
         text(sourceOrderRef) || null,
         lineLocationId ? Number(lineLocationId) : null,
         operatorId || null,
-        JSON.stringify(targetPrinterNames)
+        text(requestedCompanyName) || null,
+        text(requestedIpAddress) || null,
+        JSON.stringify(targetPrinterNames),
+        JSON.stringify(targetPrinterTargets)
       ]
     );
   } catch (error) {
@@ -404,8 +483,9 @@ export async function queueSmartScmPrintJob({
     throw error;
   }
   if (result.rows[0].document_path !== documentPath) await fs.unlink(documentPath).catch(() => null);
+  const queuedJob = publicJob({ ...result.rows[0], yard_code: printerRow.yard_code, printer_name: printerRow.printer_name });
   await writeAudit({
-    actorType: operatorId ? "operator" : "system",
+    actorType: operatorId ? "operator" : text(requestedCompanyName) ? "anonymous" : "system",
     actorOperatorId: operatorId,
     source: "smart_scm",
     action: "smart_scm.print.queued",
@@ -418,11 +498,14 @@ export async function queueSmartScmPrintJob({
       sourceOrderId: sourceOrderId ? Number(sourceOrderId) : null,
       sourceOrderRef: text(sourceOrderRef) || null,
       lineLocationId: lineLocationId ? Number(lineLocationId) : null,
-      printerNames: targetPrinterNames,
+      requestedCompanyName: text(requestedCompanyName) || null,
+      requestedIpAddress: text(requestedIpAddress) || null,
+      printerNames: queuedJob.printerNames,
+      printerTargets: queuedJob.printerTargets,
       sha256
     }
   });
-  return publicJob({ ...result.rows[0], yard_code: printerRow.yard_code, printer_name: printerRow.printer_name });
+  return queuedJob;
 }
 
 export async function queueYardPrinterTest(locationId, operatorId = null, printerSlot = 1) {
@@ -436,6 +519,7 @@ export async function queueYardPrinterTest(locationId, operatorId = null, printe
     "MBBS Smart SCM Printer Test",
     `Yard: ${row.yard_code}`,
     `Printer ${slot}: ${destination.printerName}`,
+    `Input bin: ${destination.inputBin ?? "queue default"}`,
     `Agent: ${row.agent_id}`,
     `Queued: ${new Date().toISOString()}`
   ]);
@@ -492,6 +576,12 @@ async function reclaimExpiredPrintJobs(locationId) {
 export async function leaseYardPrintJob(agentToken, agentId = "", agentVersion = 1) {
   const printer = await authenticateYardPrinterAgent(agentToken, agentId);
   if (!printer) throw Object.assign(new Error("Valid enabled printer-agent credentials are required."), { status: 401 });
+  const reportedAgentVersion = Math.min(1000, Math.max(1, Math.floor(Number(agentVersion) || 1)));
+  await query(
+    "UPDATE scm_yard_printers SET agent_version = $2 WHERE location_id = $1",
+    [printer.location_id, reportedAgentVersion]
+  );
+  printer.agent_version = reportedAgentVersion;
   await reclaimExpiredPrintJobs(printer.location_id);
   const lease = await withTransaction(async () => {
     const selected = await query(
@@ -504,23 +594,39 @@ export async function leaseYardPrintJob(agentToken, agentId = "", agentVersion =
     );
     if (!selected.rowCount) return { job: null, pollAfterSeconds: 10 };
     let selectedJob = selected.rows[0];
-    let targetNames = printerNameList(selectedJob.printer_names);
-    if (TRANSFER_ORDER_DOCUMENT_TYPES.has(selectedJob.document_type) && targetNames.length !== 2) {
-      const currentTargets = routedPrinterNames(printer, selectedJob.document_type);
+    let targetPrinters = printerTargetList(selectedJob.printer_targets);
+    if (!targetPrinters.length) {
+      targetPrinters = printerNameList(selectedJob.printer_names)
+        .map((printerName) => ({ printerName, inputBin: null }));
+    }
+    if (TRANSFER_ORDER_DOCUMENT_TYPES.has(selectedJob.document_type) && targetPrinters.length !== 2) {
+      const currentTargets = routedPrinterTargets(printer, selectedJob.document_type);
       if (currentTargets.length !== 2) {
         return {
           blocked: true,
           message: `${printer.yard_code} requires two different printers assigned to TO printing before this queued job can print.`
         };
       }
-      const rerouted = await query("UPDATE scm_print_jobs SET printer_names = $2::jsonb, updated_at = now() WHERE id = $1 RETURNING *", [selectedJob.id, JSON.stringify(currentTargets)]);
+      const rerouted = await query(
+        `UPDATE scm_print_jobs
+            SET printer_names = $2::jsonb, printer_targets = $3::jsonb, updated_at = now()
+          WHERE id = $1
+          RETURNING *`,
+        [selectedJob.id, JSON.stringify(currentTargets.map((target) => target.printerName)), JSON.stringify(currentTargets)]
+      );
       selectedJob = rerouted.rows[0];
-      targetNames = currentTargets;
+      targetPrinters = currentTargets;
     }
-    if (targetNames.length > 1 && Number(agentVersion || 1) < 2) {
+    if (targetPrinters.length > 1 && reportedAgentVersion < 2) {
       return {
         blocked: true,
         message: "Update the MBBS Yard Printer Agent before printing a two-printer TO job."
+      };
+    }
+    if (targetPrinters.some((target) => target.inputBin !== null) && reportedAgentVersion < 3) {
+      return {
+        blocked: true,
+        message: "Update the MBBS Yard Printer Agent to v3 before printing jobs with input-bin routing."
       };
     }
     const leaseToken = crypto.randomBytes(24).toString("base64url");
@@ -579,35 +685,50 @@ export async function updateLeasedPrintJob(jobId, agentToken, agentId, leaseToke
   if (!job) throw Object.assign(new Error("Print-job lease is invalid or expired."), { status: 409 });
   const actions = {
     started: { status: "printing", error: null, printed: false },
+    heartbeat: { status: "printing", error: null, printed: false },
     completed: { status: "printed", error: null, printed: true },
     failed: { status: "failed", error: text(details.error) || "Printer agent reported a failure.", printed: false },
     uncertain: { status: "uncertain", error: text(details.error) || "Printer result is uncertain.", printed: false }
   };
   const next = actions[action];
   if (!next) throw Object.assign(new Error("Invalid print-agent action."), { status: 400 });
+  const diagnostics = safeAgentDiagnostics({
+    ...safeAgentDiagnostics(details.diagnostics),
+    lastAction: action,
+    serverReportedAt: new Date().toISOString()
+  });
   const result = await query(
     `UPDATE scm_print_jobs
         SET status = $2,
             started_at = CASE WHEN $2 IN ('printing', 'printed') THEN COALESCE(started_at, now()) ELSE started_at END,
             printed_at = CASE WHEN $3 THEN now() ELSE printed_at END,
             last_error = $4,
+            agent_diagnostics = $5::jsonb,
             lease_expires_at = CASE WHEN $2 = 'printing' THEN now() + interval '10 minutes' ELSE NULL END,
             lease_token_hash = CASE WHEN $2 = 'printing' THEN lease_token_hash ELSE NULL END,
             leased_by = CASE WHEN $2 = 'printing' THEN leased_by ELSE NULL END,
             updated_at = now()
       WHERE id = $1
       RETURNING *`,
-    [job.id, next.status, next.printed, next.error]
+    [job.id, next.status, next.printed, next.error, JSON.stringify(diagnostics)]
   );
   if (next.status === "failed") {
     await query("UPDATE scm_yard_printers SET status = 'error', last_error = $2 WHERE location_id = $1", [printer.location_id, next.error]);
   }
-  await writeAudit({
-    actorType: "system",
-    source: "smart_scm",
-    action: `smart_scm.print.${action}`,
-    details: { printJobId: Number(job.id), yardCode: printer.yard_code, agentId: printer.agent_id, error: next.error }
-  });
+  if (action !== "heartbeat") {
+    await writeAudit({
+      actorType: "system",
+      source: "smart_scm",
+      action: `smart_scm.print.${action}`,
+      details: {
+        printJobId: Number(job.id),
+        yardCode: printer.yard_code,
+        agentId: printer.agent_id,
+        error: next.error,
+        diagnostics
+      }
+    });
+  }
   return publicJob({ ...result.rows[0], yard_code: printer.yard_code, printer_name: printer.printer_name });
 }
 
@@ -619,22 +740,28 @@ export async function retrySmartScmPrintJob(jobId, operatorId = null) {
       WHERE j.id = $1`,
     [Number(jobId)]
   );
-  const reroutedPrinterNames = current.rowCount
+  const reroutedPrinterTargets = current.rowCount
     && ["failed", "uncertain"].includes(current.rows[0].job_status)
     && TRANSFER_ORDER_DOCUMENT_TYPES.has(current.rows[0].document_type)
-    ? routedPrinterNames(current.rows[0], current.rows[0].document_type)
+    ? routedPrinterTargets(current.rows[0], current.rows[0].document_type)
     : null;
-  if (reroutedPrinterNames && reroutedPrinterNames.length !== 2) {
+  if (reroutedPrinterTargets && reroutedPrinterTargets.length !== 2) {
     throw Object.assign(new Error(`${current.rows[0].yard_code} requires two different printers assigned to TO printing before requeueing this job.`), { status: 409 });
   }
   const result = await query(
     `UPDATE scm_print_jobs
         SET status = 'queued', lease_token_hash = NULL, lease_expires_at = NULL, leased_by = NULL,
-            started_at = NULL, printed_at = NULL, last_error = NULL,
-            printer_names = COALESCE($2::jsonb, printer_names), updated_at = now()
+            started_at = NULL, printed_at = NULL, last_error = NULL, agent_diagnostics = '{}'::jsonb,
+            printer_names = COALESCE($2::jsonb, printer_names),
+            printer_targets = COALESCE($3::jsonb, printer_targets),
+            updated_at = now()
       WHERE id = $1 AND status IN ('failed', 'uncertain')
       RETURNING *`,
-    [Number(jobId), reroutedPrinterNames ? JSON.stringify(reroutedPrinterNames) : null]
+    [
+      Number(jobId),
+      reroutedPrinterTargets ? JSON.stringify(reroutedPrinterTargets.map((target) => target.printerName)) : null,
+      reroutedPrinterTargets ? JSON.stringify(reroutedPrinterTargets) : null
+    ]
   );
   if (!result.rowCount) throw Object.assign(new Error("Only failed or uncertain print jobs can be requeued."), { status: 409 });
   await writeAudit({

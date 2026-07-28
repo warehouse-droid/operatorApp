@@ -469,7 +469,7 @@ function renderScmSchedule() {
       <div class="topbar-actions">
         <span class="dispatch-user">${scmScheduleEscape(operator.display_name || operator.username || "")}</span>
         <button onclick="location.href='${scmScheduleSalesHost ? "/sales" : scmScheduleDispatchHost ? "/dispatch" : "/scm"}'" type="button">${scmScheduleSalesHost ? "Sales Menu" : scmScheduleDispatchHost ? "Dispatch Menu" : "SCM Menu"}</button>
-        <button onclick="dispatchLogout()" type="button">Logout</button>
+        ${operator.publicSales ? "" : `<button onclick="dispatchLogout()" type="button">Logout</button>`}
       </div>
     </header>
     ${scmScheduleNotice ? `<div class="route-notice scm-notice"><span>${scmScheduleEscape(scmScheduleNotice)}</span><button class="scm-notice-close" data-action="close-notice" type="button" aria-label="Close">x</button></div>` : ""}

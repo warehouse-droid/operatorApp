@@ -1,4 +1,13 @@
-# Dispatch V2 isolated NetSuite mirror
+# Retired: Dispatch V2 NetSuite mirror
+
+> This deployment design was retired when port 3099 moved to an independent
+> `codex/dockerVer` runtime using `docker/env/.env.old`. Do not run the commands
+> below. The source overlay and private `mbbs-sync` network are no longer part of
+> the active Compose configuration.
+
+See [dispatch-v2-local.md](dispatch-v2-local.md) for the current deployment.
+
+## Historical design (do not execute)
 
 Dispatch V2 runs as a separate Compose project on `127.0.0.1:3099`. It has its own PostgreSQL, application-data, and Ollama volumes. Its database is seeded once from the current application and then owns its planning, operator, driver, and photo state independently.
 

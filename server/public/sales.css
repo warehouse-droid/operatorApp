@@ -406,6 +406,7 @@
 
 .sales-preview-dialog > footer {
   justify-content: flex-end;
+  flex-wrap: wrap;
   border-top: 1px solid #d8e1e6;
 }
 
@@ -441,6 +442,21 @@
   margin-right: auto;
   color: #9f2018;
   font-weight: 700;
+}
+
+.sales-preview-error {
+  flex: 1 1 100%;
+  padding: 9px 11px;
+  border: 1px solid #e0aaa6;
+  border-radius: 7px;
+  background: #fff0ef;
+  color: #8f1d16;
+  font-weight: 800;
+}
+
+.sales-preview-dialog button:disabled {
+  cursor: not-allowed;
+  opacity: .45;
 }
 
 @media (max-width: 1100px) {

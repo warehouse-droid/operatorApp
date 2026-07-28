@@ -149,7 +149,10 @@ async function salesPrintPdf(path) {
     try { payload = text ? JSON.parse(text) : {}; } catch { payload = {}; }
     throw new Error(payload.error || text || "The picking-ticket snapshot could not load.");
   }
-  return response.blob();
+  return {
+    blob: await response.blob(),
+    previewToken: response.headers.get("x-mbbs-print-preview-token") || ""
+  };
 }
 
 function salesPrinter(locationId) {
@@ -224,12 +227,14 @@ function salesPrintHistoryModal() {
   if (!salesPrintHistory) return "";
   const rows = (salesPrintHistory.history || []).map((entry) => `
     <tr>
-      <td>#${salesPrintEscape(entry.jobId)}</td>
-      <td><strong>${salesPrintEscape(entry.requestedBy)}</strong><br><small>${salesPrintDate(entry.requestedAt)}</small></td>
-      <td>${salesPrintEscape(entry.lineYardCode || "—")}</td>
-      <td><strong>${salesPrintEscape(entry.printerYardCode || "—")}</strong><br><small>${salesPrintEscape(entry.printerName || "")}</small></td>
+      <td>${entry.historicalBaseline ? "Previous" : `#${salesPrintEscape(entry.jobId)}`}</td>
+      <td><strong>${salesPrintEscape(entry.requestedCompanyName || entry.requestedBy)}</strong><br><small>IP: ${salesPrintEscape(entry.requestedIpAddress || "Not recorded")}</small><br><small>${salesPrintDate(entry.requestedAt)}${entry.requestedCompanyName && entry.requestedBy && entry.requestedBy !== entry.requestedCompanyName ? ` · ${salesPrintEscape(entry.requestedBy)}` : ""}</small></td>
+      <td>${salesPrintEscape(entry.historicalBaseline ? "Previously handled" : entry.lineYardCode || "—")}</td>
+      <td><strong>${salesPrintEscape(entry.historicalBaseline ? "Other method" : entry.printerYardCode || "—")}</strong><br><small>${salesPrintEscape(entry.printerName || "")}</small></td>
       <td><span class="sales-status-pill ${salesPrintEscape(entry.status)}">${salesPrintEscape(entry.status)}</span>${entry.printedAt ? `<br><small>Printed ${salesPrintDate(entry.printedAt)}</small>` : ""}${entry.lastError ? `<br><small class="sales-history-error">${salesPrintEscape(entry.lastError)}</small>` : ""}</td>
-      <td><button data-action="view-snapshot" data-order-id="${salesPrintEscape(entry.orderId)}" data-job-id="${salesPrintEscape(entry.jobId)}" data-order-ref="${salesPrintEscape(entry.orderRef || salesPrintHistory.order.orderRef)}" data-line-yard="${salesPrintEscape(entry.lineYardCode)}" data-printer-yard="${salesPrintEscape(entry.printerYardCode)}" data-requested-by="${salesPrintEscape(entry.requestedBy)}" data-requested-at="${salesPrintEscape(entry.requestedAt)}" type="button" ${salesPrintBusy ? "disabled" : ""}>View snapshot</button></td>
+      <td>${entry.historicalBaseline
+        ? `<span class="muted">No stored snapshot</span>`
+        : `<button data-action="view-snapshot" data-order-id="${salesPrintEscape(entry.orderId)}" data-job-id="${salesPrintEscape(entry.jobId)}" data-order-ref="${salesPrintEscape(entry.orderRef || salesPrintHistory.order.orderRef)}" data-line-yard="${salesPrintEscape(entry.lineYardCode)}" data-printer-yard="${salesPrintEscape(entry.printerYardCode)}" data-requested-by="${salesPrintEscape(entry.requestedCompanyName || entry.requestedBy)}" data-requested-ip="${salesPrintEscape(entry.requestedIpAddress)}" data-requested-at="${salesPrintEscape(entry.requestedAt)}" type="button" ${salesPrintBusy ? "disabled" : ""}>View snapshot</button>`}</td>
     </tr>
   `).join("") || `<tr><td colspan="6">This Sales Order has no picking-ticket print history.</td></tr>`;
   return `
@@ -239,7 +244,7 @@ function salesPrintHistoryModal() {
           <div><p>Picking-ticket history</p><h2>${salesPrintEscape(salesPrintHistory.order.orderRef)}</h2><span>Every row keeps the exact PDF snapshot submitted at that time.</span></div>
           <button data-action="close-history" type="button">Close</button>
         </header>
-        <div class="sales-table-wrap"><table class="sales-table"><thead><tr><th>Job</th><th>Requested by / when</th><th>Line yard</th><th>Printer</th><th>Result</th><th>Snapshot</th></tr></thead><tbody>${rows}</tbody></table></div>
+        <div class="sales-table-wrap"><table class="sales-table"><thead><tr><th>Job</th><th>Requester / IP / when</th><th>Line yard</th><th>Printer</th><th>Result</th><th>Snapshot</th></tr></thead><tbody>${rows}</tbody></table></div>
       </section>
     </div>
   `;
@@ -258,12 +263,13 @@ function salesPrintPreviewModal() {
             <p>${snapshotOnly ? "Historical ticket snapshot" : "Picking ticket preview"}</p>
             <h2>${salesPrintEscape(salesPrintPreview.orderRef)}</h2>
             <span>Line yard: <strong>${salesPrintEscape(salesPrintPreview.lineYardCode || "—")}</strong> · Printer: <strong>${salesPrintEscape(salesPrintPreview.printerYardCode || printer?.yardCode || "—")}</strong></span>
-            ${snapshotOnly ? `<small>Requested by ${salesPrintEscape(salesPrintPreview.requestedBy || "—")} · ${salesPrintDate(salesPrintPreview.requestedAt)}</small>` : ""}
+            ${snapshotOnly ? `<small>Requested by ${salesPrintEscape(salesPrintPreview.requestedBy || "—")} · IP ${salesPrintEscape(salesPrintPreview.requestedIp || "Not recorded")} · ${salesPrintDate(salesPrintPreview.requestedAt)}</small>` : ""}
           </div>
           <button data-action="close-preview" type="button">Close</button>
         </header>
         <iframe src="${salesPrintEscape(salesPrintPreview.objectUrl)}" title="${salesPrintEscape(salesPrintPreview.orderRef)} picking ticket"></iframe>
         <footer>
+          ${salesPrintError ? `<span class="sales-preview-error" role="alert">${salesPrintEscape(salesPrintError)}</span>` : ""}
           ${snapshotOnly || ready ? "" : `<span class="sales-preview-warning">${salesPrintEscape(printer?.yardCode || "Selected yard")} printer setup is incomplete.</span>`}
           <button data-action="close-preview" type="button">${snapshotOnly ? "Close" : "Cancel"}</button>
           ${snapshotOnly ? "" : `<button class="primary" data-action="queue-preview" type="button" ${ready && !salesPrintBusy ? "" : "disabled"}>${salesPrintBusy === "queue-preview" ? "Queuing…" : `Print to ${salesPrintEscape(printer?.yardCode || "yard")}`}</button>`}
@@ -282,7 +288,7 @@ function renderSalesPrinting() {
       <div class="topbar-actions">
         <span class="dispatch-user">${salesPrintEscape(operator.display_name || operator.username || "")}</span>
         <button onclick="location.href='/sales'" type="button">Sales Menu</button>
-        <button onclick="dispatchLogout()" type="button">Logout</button>
+        ${operator.publicSales ? "" : `<button onclick="dispatchLogout()" type="button">Logout</button>`}
       </div>
     </header>
     <section class="sales-printing-page">
@@ -303,7 +309,7 @@ function renderSalesPrinting() {
           <div class="sales-table-wrap sales-order-table-wrap"><table class="sales-table sales-order-print-table" style="${salesPrintTableStyle()}">${salesPrintTableColgroup()}<thead><tr>${salesPrintTableHeaders()}</tr></thead><tbody>${salesPrintOrderRows()}</tbody></table></div>
         </section>
         <aside class="panel sales-print-jobs-panel">
-          <div class="sales-section-head"><div><h2>Recent print jobs</h2><p>Use an order's History for its user, time, and PDF snapshot.</p></div></div>
+          <div class="sales-section-head"><div><h2>Recent print jobs</h2><p>Use an order's History for requester, IP, time, and PDF snapshot.</p></div></div>
           <div class="sales-print-job-list">${salesPrintJobCards()}</div>
         </aside>
       </div>
@@ -318,10 +324,35 @@ function closeSalesPrintPreview() {
   salesPrintPreview = null;
 }
 
+function captureSalesPrintSearchFocus() {
+  const input = document.activeElement;
+  if (!input?.matches?.("[data-sales-search]")) return null;
+  return {
+    start: input.selectionStart,
+    end: input.selectionEnd,
+    direction: input.selectionDirection
+  };
+}
+
+function restoreSalesPrintSearchFocus(focus) {
+  if (!focus) return;
+  const input = salesPrintingApp.querySelector("[data-sales-search]");
+  if (!input) return;
+  input.focus({ preventScroll: true });
+  const length = input.value.length;
+  input.setSelectionRange(
+    Math.min(focus.start ?? length, length),
+    Math.min(focus.end ?? length, length),
+    focus.direction || "none"
+  );
+}
+
 async function loadSalesPrinting({ quiet = false } = {}) {
-  if (!quiet) salesPrintBusy = "loading";
+  if (!quiet) {
+    salesPrintBusy = "loading";
+    renderSalesPrinting();
+  }
   salesPrintError = "";
-  renderSalesPrinting();
   try {
     const params = new URLSearchParams({ limit: "2500" });
     if (salesPrintSearch.trim()) params.set("search", salesPrintSearch.trim());
@@ -337,7 +368,9 @@ async function loadSalesPrinting({ quiet = false } = {}) {
     salesPrintError = error.message;
   } finally {
     salesPrintBusy = "";
+    const searchFocus = quiet ? captureSalesPrintSearchFocus() : null;
     renderSalesPrinting();
+    restoreSalesPrintSearchFocus(searchFocus);
   }
 }
 
@@ -436,7 +469,7 @@ salesPrintingApp.addEventListener("click", async (event) => {
     salesPrintError = "";
     renderSalesPrinting();
     try {
-      const blob = await salesPrintPdf(`/api/sales/sales-orders/${encodeURIComponent(button.dataset.orderId)}/print-history/${encodeURIComponent(button.dataset.jobId)}/snapshot`);
+      const { blob } = await salesPrintPdf(`/api/sales/sales-orders/${encodeURIComponent(button.dataset.orderId)}/print-history/${encodeURIComponent(button.dataset.jobId)}/snapshot`);
       closeSalesPrintPreview();
       salesPrintHistory = null;
       salesPrintPreview = {
@@ -446,6 +479,7 @@ salesPrintingApp.addEventListener("click", async (event) => {
         lineYardCode: button.dataset.lineYard,
         printerYardCode: button.dataset.printerYard,
         requestedBy: button.dataset.requestedBy,
+        requestedIp: button.dataset.requestedIp,
         requestedAt: button.dataset.requestedAt,
         objectUrl: URL.createObjectURL(blob)
       };
@@ -468,7 +502,7 @@ salesPrintingApp.addEventListener("click", async (event) => {
     salesPrintNotice = "";
     renderSalesPrinting();
     try {
-      const blob = await salesPrintPdf(`/api/sales/sales-orders/${encodeURIComponent(orderId)}/picking-ticket-preview?lineLocationId=${encodeURIComponent(lineLocationId)}`);
+      const { blob, previewToken } = await salesPrintPdf(`/api/sales/sales-orders/${encodeURIComponent(orderId)}/picking-ticket-preview?lineLocationId=${encodeURIComponent(lineLocationId)}`);
       closeSalesPrintPreview();
       salesPrintPreview = {
         snapshotOnly: false,
@@ -478,6 +512,7 @@ salesPrintingApp.addEventListener("click", async (event) => {
         lineYardCode: lineYard.yardCode,
         printerLocationId: lineYard.printerLocationId,
         printerYardCode: salesPrinter(lineYard.printerLocationId)?.yardCode || "",
+        previewToken,
         objectUrl: URL.createObjectURL(blob)
       };
     } catch (error) {
@@ -497,7 +532,10 @@ salesPrintingApp.addEventListener("click", async (event) => {
   try {
     const result = await salesPrintApi(`/api/sales/sales-orders/${encodeURIComponent(preview.orderId)}/print`, {
       method: "POST",
-      body: JSON.stringify({ lineLocationId: Number(preview.lineLocationId) })
+      body: JSON.stringify({
+        lineLocationId: Number(preview.lineLocationId),
+        previewToken: preview.previewToken
+      })
     });
     closeSalesPrintPreview();
     salesPrintNotice = `${result.order.orderRef} ${result.lineYard.yardCode} ticket queued to ${result.printJob.yardCode} as print job #${result.printJob.id}.`;

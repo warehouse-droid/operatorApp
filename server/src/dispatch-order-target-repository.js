@@ -19,6 +19,7 @@ function dateOnly(value) {
 }
 
 function splitParentRef(order = {}) {
+  if (text(order?.type).toUpperCase() === "CUSTOM") return "";
   const explicit = text(order.originalOrderId);
   if (explicit) return explicit;
   const ref = text(order.id);

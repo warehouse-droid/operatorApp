@@ -1,4 +1,5 @@
 const yardPrinterApp = document.getElementById("yardPrinterApp");
+const printerAgentUpgradeCommand = String.raw`powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\Downloads\Install-MBBSYardPrinterAgent.ps1"`;
 
 const printerState = {
   operator: null,
@@ -23,6 +24,15 @@ function printerDate(value) {
   if (!value) return "Never";
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? String(value) : new Intl.DateTimeFormat("en-CA", { dateStyle: "medium", timeStyle: "short" }).format(date);
+}
+
+function printerDuration(value) {
+  if (value === null || value === undefined || String(value).trim() === "") return "—";
+  const milliseconds = Number(value);
+  if (!Number.isFinite(milliseconds) || milliseconds < 0) return "—";
+  if (milliseconds < 1000) return `${Math.round(milliseconds)} ms`;
+  if (milliseconds < 60000) return `${(milliseconds / 1000).toFixed(milliseconds < 10000 ? 2 : 1)} s`;
+  return `${(milliseconds / 60000).toFixed(2)} min`;
 }
 
 function printerRoles() {
@@ -83,7 +93,7 @@ function printerTokenPanel() {
   const command = `powershell -ExecutionPolicy Bypass -File .\\Install-MBBSYardPrinterAgent.ps1 -ServerUrl \"${window.location.origin}\" -AgentId \"${revealed.printer.agentId}\" -Token \"${revealed.token}\"`;
   return `<section class="printer-token-panel">
     <h3>Save the ${printerEscape(revealed.printer.yardCode)} agent token now</h3>
-    <p>This secret is shown once. One updated yard agent prints to both configured Windows printers. Rotating the token immediately invalidates the previous agent.</p>
+    <p>This secret is shown once. Yard agent v3 prints to both configured Windows printers, applies input-bin routing, and reports detailed timing. Rotating the token immediately invalidates the previous agent.</p>
     <div class="printer-secret"><code id="printerTokenValue">${printerEscape(revealed.token)}</code><button class="smart-button" data-printer-action="copy-token" type="button">Copy token</button></div>
     <div class="printer-secret"><code id="printerInstallCommand">${printerEscape(command)}</code><button class="smart-button" data-printer-action="copy-command" type="button">Copy setup command</button></div>
     <div class="smart-actions" style="margin-top:10px"><a class="smart-button blue" href="/tools/Install-MBBSYardPrinterAgent.ps1" download>Download Windows agent</a><button class="smart-button" data-printer-action="close-token" type="button">I saved it</button></div>
@@ -95,21 +105,24 @@ function printerDestinations(printer) {
     .find((destination) => Number(destination.slot) === slot) || {
       slot,
       printerName: slot === 1 ? printer.printerName || "" : "",
+      inputBin: null,
       printTransferOrders: slot === 1 && Boolean(printer.printerName),
       printSalesOrders: slot === 1 && Boolean(printer.printerName)
     });
 }
 
 function printerDestinationEditor(printer, destination) {
-  const canTest = printer.enabled && printer.hasToken && destination.printerName;
+  const needsV3 = destination.inputBin != null && Number(printer.agentVersion || 1) < 3;
+  const canTest = printer.enabled && printer.hasToken && destination.printerName && !needsV3;
   return `<fieldset class="printer-destination" data-printer-slot="${destination.slot}">
     <legend>Printer ${destination.slot}</legend>
     <label class="smart-field"><span>Windows printer name</span><input data-printer-name value="${printerEscape(destination.printerName || "")}" placeholder="Exact name from Get-Printer" ${printerCanWrite() ? "" : "disabled"} /></label>
+    <label class="smart-field"><span>Input bin (Windows RawKind)</span><input data-printer-bin type="number" min="1" max="65535" step="1" inputmode="numeric" value="${destination.inputBin ?? ""}" placeholder="Blank = queue default" ${printerCanWrite() ? "" : "disabled"} /><small class="smart-help">Use the value reported by this driver/queue; 256 is Tray 3 only for the verified 2967 setup. Blank uses the Windows queue default. A bin requires yard agent v3.</small></label>
     <div class="printer-route-options">
       <label class="smart-check"><input data-printer-to type="checkbox" ${destination.printTransferOrders ? "checked" : ""} ${printerCanWrite() ? "" : "disabled"} /> TO — one copy</label>
       <label class="smart-check"><input data-printer-so type="radio" name="so-printer-${printer.locationId}" ${destination.printSalesOrders ? "checked" : ""} ${printerCanWrite() ? "" : "disabled"} /> SO — one copy</label>
     </div>
-    ${printerCanWrite() ? `<button class="smart-button ${canTest ? "blue" : ""}" data-printer-action="test" data-printer-slot="${destination.slot}" type="button" ${canTest ? "" : "disabled"}>Test Printer ${destination.slot}</button>` : ""}
+    ${printerCanWrite() ? `<button class="smart-button ${canTest ? "blue" : ""}" data-printer-action="test" data-printer-slot="${destination.slot}" type="button" title="${needsV3 ? "Install yard agent v3 before testing an input bin." : "Tests use the last saved printer name and input bin."}" ${canTest ? "" : "disabled"}>Test Printer ${destination.slot}</button><div class="smart-help">${needsV3 ? "Blocked until this yard reports agent v3." : "Save routing before testing edited values."}</div>` : ""}
   </fieldset>`;
 }
 
@@ -117,10 +130,11 @@ function printerCard(printer) {
   const destinations = printerDestinations(printer);
   const toCount = destinations.filter((destination) => destination.printerName && destination.printTransferOrders).length;
   const soCount = destinations.filter((destination) => destination.printerName && destination.printSalesOrders).length;
+  const requiresAgentUpgrade = destinations.some((destination) => destination.inputBin != null) && Number(printer.agentVersion || 1) < 3;
   return `<article class="printer-card" data-printer-location="${printer.locationId}">
     <div class="printer-yard"><strong>${printerEscape(printer.yardCode)}</strong><span>Location ${printer.locationId}</span></div>
     <div class="printer-config">
-      <div class="printer-meta"><span>Agent <strong>${printerEscape(printer.agentId)}</strong></span>${printerPill(printer.status)}</div>
+      <div class="printer-meta"><span>Agent <strong>${printerEscape(printer.agentId)}</strong> · protocol v${Number(printer.agentVersion || 1)}</span>${printerPill(printer.status)}</div>
       <div class="printer-destinations">${destinations.map((destination) => printerDestinationEditor(printer, destination)).join("")}</div>
       <div class="printer-route-summary">
         <span class="${toCount === 2 ? "ready" : "incomplete"}">TO: ${toCount}/2 printers</span>
@@ -129,6 +143,7 @@ function printerCard(printer) {
       <label class="printer-no-so"><input data-printer-so-none type="radio" name="so-printer-${printer.locationId}" ${soCount === 0 ? "checked" : ""} ${printerCanWrite() ? "" : "disabled"} /> No SO printer assigned</label>
       <label class="smart-check"><input data-printer-enabled type="checkbox" ${printer.enabled ? "checked" : ""} ${printerCanWrite() ? "" : "disabled"} /> Enable this yard print queue</label>
       <div class="printer-meta"><span>${printer.hasToken ? "Agent token configured" : "Generate an agent token"}</span><span>Last seen: ${printerDate(printer.lastSeenAt)}</span></div>
+      ${requiresAgentUpgrade ? `<div class="smart-notice error">Input-bin jobs are fail-safe blocked at the head of this yard queue until agent v3 is installed.</div>` : ""}
       ${printer.lastError ? `<div class="smart-notice error">${printerEscape(printer.lastError)}</div>` : ""}
       ${printerCanWrite() ? `<div class="smart-actions"><button class="smart-button primary" data-printer-action="save" type="button">Save routing</button><button class="smart-button" data-printer-action="rotate-token" type="button">${printer.hasToken ? "Rotate" : "Generate"} token</button></div>` : ""}
     </div>
@@ -136,16 +151,54 @@ function printerCard(printer) {
 }
 
 function printerJobs() {
+  const jobPrinterText = (job) => {
+    const targets = Array.isArray(job.printerTargets) && job.printerTargets.length
+      ? job.printerTargets
+      : (job.printerNames || []).map((printerName) => ({ printerName, inputBin: null }));
+    return targets.map((target) => `${target.printerName}${target.inputBin == null ? "" : ` [bin ${target.inputBin}]`}`).join(" + ");
+  };
+  const jobTiming = (job) => {
+    const diagnostics = job.agentDiagnostics || {};
+    const millisecondsBetween = (end, start) => {
+      const endTime = new Date(end || "").getTime();
+      const startTime = new Date(start || "").getTime();
+      return Number.isFinite(endTime) && Number.isFinite(startTime) ? Math.max(0, endTime - startTime) : null;
+    };
+    const serverQueueMs = millisecondsBetween(job.startedAt, job.queuedAt);
+    const serverPrintingMs = millisecondsBetween(job.printedAt, job.startedAt);
+    const serverTiming = `Server queue ${printerDuration(serverQueueMs)} · printing ${printerDuration(serverPrintingMs)}`;
+    const hasDetailedTiming = diagnostics.receivedAt
+      || [diagnostics.queueWaitMs, diagnostics.downloadMs, diagnostics.processingMs, diagnostics.totalMs]
+        .some((value) => Number.isFinite(Number(value)));
+    if (!hasDetailedTiming) return `${serverTiming}<div class="smart-help">No v3 agent detail</div>`;
+    const targets = Array.isArray(diagnostics.targets) ? diagnostics.targets : [];
+    const targetTiming = targets
+      .filter((target) => target && typeof target === "object" && !Array.isArray(target))
+      .map((target) => `${target.printerName || "printer"}: ${printerDuration(target.waitMs ?? target.totalMs)}`)
+      .join(" · ");
+    return `${diagnostics.receivedAt ? `Received ${printerEscape(printerDate(diagnostics.receivedAt))}` : "Receive time unavailable"}
+      <div class="smart-help">Queue ${printerDuration(diagnostics.queueWaitMs)} · download ${printerDuration(diagnostics.downloadMs)} · process ${printerDuration(diagnostics.processingMs ?? diagnostics.totalMs)}</div>
+      <div class="smart-help">${serverTiming}</div>
+      ${targetTiming ? `<div class="smart-help">${printerEscape(targetTiming)}</div>` : ""}`;
+  };
   return `<section class="smart-section">
     <div class="smart-section-head"><div><h2>Print queue</h2><p>Jobs are leased once. If an agent disconnects after printing starts, the result becomes uncertain and requires a human check before retry.</p></div><button class="smart-button" data-printer-action="refresh" type="button">Refresh</button></div>
-    <div class="smart-table-wrap"><table class="smart-table"><thead><tr><th>Job</th><th>Yard</th><th>Printer</th><th>Document</th><th>Status</th><th>Attempts</th><th>Queued / printed</th><th>Error</th><th></th></tr></thead><tbody>
-      ${printerState.jobs.map((job) => `<tr><td>#${job.id}<div class="smart-help">${printerEscape(job.jobKey)}</div></td><td>${printerEscape(job.yardCode)}</td><td>${printerEscape((job.printerNames || []).join(" + ") || job.printerName || "—")}</td><td>${printerEscape(job.documentName)}<div class="smart-help">${printerEscape(job.documentType.replaceAll("_", " "))}</div></td><td>${printerPill(job.status)}</td><td>${job.attempts}</td><td>${printerDate(job.queuedAt)}<div class="smart-help">${job.printedAt ? `Printed ${printerDate(job.printedAt)}` : "Not confirmed printed"}</div></td><td>${printerEscape(job.lastError || "—")}</td><td>${printerCanWrite() && ["failed", "uncertain"].includes(job.status) ? `<button class="smart-button warn" data-printer-action="retry" data-job-id="${job.id}" type="button">Verify + requeue</button>` : ""}</td></tr>`).join("") || `<tr><td colspan="9" class="smart-empty">No Smart SCM print jobs.</td></tr>`}
+    <div class="smart-table-wrap"><table class="smart-table"><thead><tr><th>Job</th><th>Yard</th><th>Printer / bin</th><th>Document</th><th>Status</th><th>Attempts</th><th>Queued / printed</th><th>Agent timing</th><th>Error</th><th></th></tr></thead><tbody>
+      ${printerState.jobs.map((job) => `<tr><td>#${job.id}<div class="smart-help">${printerEscape(job.jobKey)}</div></td><td>${printerEscape(job.yardCode)}</td><td>${printerEscape(jobPrinterText(job) || job.printerName || "—")}</td><td>${printerEscape(job.documentName)}<div class="smart-help">${printerEscape(job.documentType.replaceAll("_", " "))}</div></td><td>${printerPill(job.status)}</td><td>${job.attempts}</td><td>${printerDate(job.queuedAt)}<div class="smart-help">${job.printedAt ? `Printed ${printerDate(job.printedAt)}` : "Not confirmed printed"}</div></td><td>${jobTiming(job)}</td><td>${printerEscape(job.lastError || "—")}</td><td>${printerCanWrite() && ["failed", "uncertain"].includes(job.status) ? `<button class="smart-button warn" data-printer-action="retry" data-job-id="${job.id}" type="button">Verify + requeue</button>` : ""}</td></tr>`).join("") || `<tr><td colspan="10" class="smart-empty">No Smart SCM print jobs.</td></tr>`}
     </tbody></table></div>
   </section>`;
 }
 
 function printerRender() {
-  yardPrinterApp.innerHTML = `${printerHeader()}<div class="smart-main">${printerState.error ? `<div class="smart-notice error">${printerEscape(printerState.error)}</div>` : ""}${printerState.notice ? `<div class="smart-notice">${printerEscape(printerState.notice)}</div>` : ""}${printerState.busy ? `<div class="smart-notice">${printerEscape(printerState.busy)}…</div>` : ""}${printerTokenPanel()}<section class="smart-section"><div class="smart-section-head"><div><h2>Two printers per yard</h2><p>Assign both named printers to TO for two copies. Assign exactly one named printer to SO for one copy. One updated Windows agent handles both destinations at the yard.</p></div></div><div class="smart-section-body printer-grid">${printerState.printers.map(printerCard).join("") || `<div class="smart-empty">Run the Smart SCM migrations to create yard printer records.</div>`}</div></section>${printerJobs()}</div>`;
+  yardPrinterApp.innerHTML = `${printerHeader()}<div class="smart-main">${printerState.error ? `<div class="smart-notice error">${printerEscape(printerState.error)}</div>` : ""}${printerState.notice ? `<div class="smart-notice">${printerEscape(printerState.notice)}</div>` : ""}${printerState.busy ? `<div class="smart-notice">${printerEscape(printerState.busy)}…</div>` : ""}${printerTokenPanel()}<section class="smart-section">
+    <div class="smart-section-head">
+      <div><h2>Windows yard agent v3</h2><p>Existing agent PC: download the script, open PowerShell as Administrator, then paste the command below. It preserves the existing token and settings and restarts as v3.</p></div>
+      <a class="smart-button blue" href="/tools/Install-MBBSYardPrinterAgent.ps1" download>Download agent v3</a>
+    </div>
+    <div class="smart-section-body">
+      <div class="printer-secret"><code id="printerAgentUpgradeCommand">${printerEscape(printerAgentUpgradeCommand)}</code><button class="smart-button" data-printer-action="copy-upgrade-command" type="button">Copy command</button></div>
+    </div>
+  </section><section class="smart-section"><div class="smart-section-head"><div><h2>Two printers per yard</h2><p>Assign both named printers to TO for two copies. Assign exactly one named printer to SO for one copy. Input bins are sent explicitly by yard agent v3, so multiple queues on the same physical printer can select different trays.</p></div></div><div class="smart-section-body printer-grid">${printerState.printers.map(printerCard).join("") || `<div class="smart-empty">Run the Smart SCM migrations to create yard printer records.</div>`}</div></section>${printerJobs()}</div>`;
 }
 
 async function printerWork(label, task, success = "Saved") {
@@ -179,6 +232,9 @@ yardPrinterApp.addEventListener("click", async (event) => {
       const printers = [...card.querySelectorAll(".printer-destination[data-printer-slot]")].map((destination) => ({
         slot: Number(destination.dataset.printerSlot),
         printerName: destination.querySelector("[data-printer-name]").value,
+        inputBin: destination.querySelector("[data-printer-bin]").value.trim() === ""
+          ? null
+          : Number(destination.querySelector("[data-printer-bin]").value),
         printTransferOrders: destination.querySelector("[data-printer-to]").checked,
         printSalesOrders: destination.querySelector("[data-printer-so]").checked
       }));
@@ -210,6 +266,10 @@ yardPrinterApp.addEventListener("click", async (event) => {
       await navigator.clipboard.writeText(document.getElementById("printerInstallCommand")?.textContent || "");
       printerState.notice = "Setup command copied";
       printerRender();
+    } else if (action === "copy-upgrade-command") {
+      await navigator.clipboard.writeText(printerAgentUpgradeCommand);
+      printerState.notice = "Agent v3 upgrade command copied";
+      printerRender();
     } else if (action === "close-token") {
       printerState.revealed = null;
       printerRender();
@@ -219,6 +279,17 @@ yardPrinterApp.addEventListener("click", async (event) => {
     printerState.error = error.message;
     printerRender();
   }
+});
+
+yardPrinterApp.addEventListener("input", (event) => {
+  if (!event.target.matches("[data-printer-name], [data-printer-bin], [data-printer-to], [data-printer-so], [data-printer-so-none], [data-printer-enabled]")) return;
+  const card = event.target.closest("[data-printer-location]");
+  if (!card) return;
+  card.querySelectorAll('[data-printer-action="test"]').forEach((button) => {
+    button.disabled = true;
+    button.classList.remove("blue");
+    button.title = "Save routing before testing edited values.";
+  });
 });
 
 window.addEventListener("mbbs-language-changed", printerRender);

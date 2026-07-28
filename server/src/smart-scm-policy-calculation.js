@@ -8,6 +8,7 @@ function positive(value, fallback = 0) {
 }
 
 const EPSILON = 0.000001;
+export const LOWER_STOCK_POLICY_MINIMUM_SAFETY_PALLETS = 1;
 
 export function calculateSmartScmOrderRequirement({
   positionPallets = 0,
@@ -54,6 +55,8 @@ function forecastQuantileForPolicy(forecast = {}, policy = {}) {
 
 export function calculateSmartScmPolicyLevels(policy = {}, forecast = null, settings = {}) {
   const forecastModel = String(forecast?.authoritative_model || "formula");
+  const lowerStockPolicyEnabled = policy.lower_stock_policy_enabled === true
+    || policy.lowerStockPolicyEnabled === true;
   const leadWeeks = Math.max(
     1 / 7,
     positive(policy.effective_lead_time_days || policy.lead_time_days || policy.purchase_lead_time_days || 7) / 7
@@ -65,43 +68,91 @@ export function calculateSmartScmPolicyLevels(policy = {}, forecast = null, sett
     ? Math.max(0, (positive(forecast?.p90_weekly) - positive(forecast?.p50_weekly)) / 1.282)
     : positive(forecast.formula_weekly_sd);
   const selectedServiceFactor = serviceFactor(policy, settings);
-  const formulaSafety = Math.max(
-    positive(policy.minimum_safety_pallets),
-    weeklyDemandSd * selectedServiceFactor * Math.sqrt(leadWeeks)
+  const configuredMinimumSafetyPallets = positive(
+    policy.minimum_safety_pallets ?? policy.minimumSafetyPallets
   );
+  const effectiveMinimumSafetyPallets = lowerStockPolicyEnabled
+    ? Math.min(configuredMinimumSafetyPallets, LOWER_STOCK_POLICY_MINIMUM_SAFETY_PALLETS)
+    : configuredMinimumSafetyPallets;
+  const variabilitySafetyPallets = weeklyDemandSd * selectedServiceFactor * Math.sqrt(leadWeeks);
+  const standardFormulaSafety = Math.max(
+    configuredMinimumSafetyPallets,
+    variabilitySafetyPallets
+  );
+  const formulaSafety = Math.max(
+    effectiveMinimumSafetyPallets,
+    variabilitySafetyPallets
+  );
+  const standardFormulaRop = Math.max(1, Math.round(standardFormulaSafety + (weeklyDemand * leadWeeks)));
   const formulaRop = Math.max(1, Math.round(formulaSafety + (weeklyDemand * leadWeeks)));
   const capacity = positive(policy.capacity_pallets, 25);
+  const standardFormulaPreferred = Math.min(capacity, Math.ceil(standardFormulaRop + (weeklyDemand * leadWeeks)));
   const formulaPreferred = Math.min(capacity, Math.ceil(formulaRop + (weeklyDemand * leadWeeks)));
   const usePrediction = Boolean(forecast && forecastModel !== "formula");
-  const predictedRop = Math.max(1, Math.ceil(forecastQuantileForPolicy(forecast || {}, policy)));
+  const standardPredictedRop = Math.max(1, Math.ceil(forecastQuantileForPolicy(forecast || {}, policy)));
   const predictedReview = number(policy.service_quantile) >= 0.95
     ? positive(forecast?.p95_weekly)
     : positive(forecast?.p90_weekly);
-  const predictedPreferred = Math.min(capacity, Math.ceil(predictedRop + predictedReview));
+  const standardPredictedSafety = Math.max(
+    configuredMinimumSafetyPallets,
+    standardPredictedRop - (weeklyDemand * leadWeeks)
+  );
+  const predictedSafety = Math.max(
+    effectiveMinimumSafetyPallets,
+    standardPredictedRop - (weeklyDemand * leadWeeks)
+  );
+  const standardPredictedPreferred = Math.min(capacity, Math.ceil(standardPredictedRop + predictedReview));
+  // A promoted prediction model's lead-time quantile is its service target.
+  // The optional floor may lower the safety-floor display, but it must not
+  // subtract from that quantile or silently weaken the selected service level.
+  const predictedRop = standardPredictedRop;
+  const predictedPreferred = standardPredictedPreferred;
+  const standardSafetyStockPallets = usePrediction ? standardPredictedSafety : standardFormulaSafety;
   const safetyStockPallets = usePrediction
-    ? Math.max(positive(policy.minimum_safety_pallets), predictedRop - (weeklyDemand * leadWeeks))
+    ? predictedSafety
     : formulaSafety;
+  const standardBaseReorderPointPallets = usePrediction ? standardPredictedRop : standardFormulaRop;
   const baseReorderPointPallets = usePrediction ? predictedRop : formulaRop;
+  const standardBasePreferredPallets = usePrediction ? standardPredictedPreferred : standardFormulaPreferred;
   const basePreferredPallets = usePrediction ? predictedPreferred : formulaPreferred;
   const zeroDemandCoverageApplied = Boolean(forecast?.zero_demand_coverage_applied);
   const coverageFloorPallets = zeroDemandCoverageApplied ? positive(forecast?.coverage_floor_pallets) : 0;
+  const standardReorderPointPallets = Math.max(standardBaseReorderPointPallets, coverageFloorPallets);
   const reorderPointPallets = Math.max(baseReorderPointPallets, coverageFloorPallets);
+  const standardPreferredPallets = Math.min(
+    capacity,
+    Math.max(standardBasePreferredPallets, standardReorderPointPallets)
+  );
   const preferredPallets = Math.min(capacity, Math.max(basePreferredPallets, reorderPointPallets));
+  const lowerStockPolicyApplied = lowerStockPolicyEnabled && (
+    safetyStockPallets < standardSafetyStockPallets - EPSILON
+    || reorderPointPallets < standardReorderPointPallets - EPSILON
+    || preferredPallets < standardPreferredPallets - EPSILON
+  );
 
   return {
     forecastModel,
     usesPrediction: usePrediction,
+    lowerStockPolicyEnabled,
+    lowerStockPolicyApplied,
+    configuredMinimumSafetyPallets,
+    effectiveMinimumSafetyPallets,
     leadWeeks,
     weeklyDemandPallets: weeklyDemand,
     weeklyDemandSdPallets: weeklyDemandSd,
     serviceFactor: selectedServiceFactor,
+    standardSafetyStockPallets,
     safetyStockPallets,
+    standardBaseReorderPointPallets,
     baseReorderPointPallets,
+    standardBasePreferredPallets,
     basePreferredPallets,
     zeroDemandCoverageApplied,
     coverageFloorPallets,
     capacityPallets: capacity,
+    standardReorderPointPallets,
     reorderPointPallets,
+    standardPreferredPallets,
     preferredPallets
   };
 }

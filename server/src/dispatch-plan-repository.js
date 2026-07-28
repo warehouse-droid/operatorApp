@@ -1,4 +1,5 @@
 import { query, withTransaction } from "./db.js";
+import { canonicalizeDispatchCustomOrdersInPlan } from "./dispatch-custom-order-repository.js";
 import { syncDispatchDeliveryGroupsFromPlan } from "./dispatch-delivery-group-repository.js";
 import {
   dispatchLoadAssignment,
@@ -236,14 +237,29 @@ export function dispatchPlannedAssignmentMap(plan = {}) {
     if (order?.childOrders?.length || order?.originalOrderId) {
       plannedDetails.plannedOrderSnapshot = order;
     }
-    addRef(orderId, plannedDetails);
-    if (!order || order.type === "CO") return;
-    addRef(order.originalOrderId, plannedDetails);
-    for (const childId of order.childOrders || []) addRef(childId, plannedDetails);
-    for (const child of order.childOrderDetails || []) {
-      addRef(child?.id, plannedDetails);
-      addRef(child?.originalOrderId, plannedDetails);
-    }
+    const visited = new Set();
+    const addExactOrderRefs = (value, snapshot = null) => {
+      const ref = String(value || "").trim();
+      if (!ref || visited.has(ref)) return;
+      visited.add(ref);
+      addRef(ref, plannedDetails);
+      const resolved = snapshot || orderById.get(ref);
+      if (!resolved || resolved.type === "CO") return;
+      const childDetails = new Map(
+        (resolved.childOrderDetails || [])
+          .map((child) => [String(child?.id || "").trim(), child])
+          .filter(([childId]) => childId)
+      );
+      const childIds = new Set([
+        ...(resolved.childOrders || []).map((childId) => String(childId || "").trim()),
+        ...childDetails.keys()
+      ]);
+      for (const childId of childIds) {
+        if (!childId) continue;
+        addExactOrderRefs(childId, orderById.get(childId) || childDetails.get(childId) || null);
+      }
+    };
+    addExactOrderRefs(orderId, order);
   };
   for (const truck of plan.trucks || []) {
     for (const load of truck.loads || []) {
@@ -264,6 +280,48 @@ export function dispatchPlannedAssignmentMap(plan = {}) {
     }
   }
   return assignments;
+}
+
+export function dispatchPlannedOrderRefs(plan = {}) {
+  return new Set(dispatchPlannedAssignmentMap(plan).keys());
+}
+
+function dispatchPlanOrderSnapshotMap(plan = {}) {
+  const snapshots = new Map();
+  const visit = (order) => {
+    const ref = String(order?.id || "").trim();
+    if (!ref) return;
+    if (!snapshots.has(ref)) snapshots.set(ref, order);
+    for (const child of order.childOrderDetails || []) visit(child);
+  };
+  for (const order of plan.orders || []) visit(order);
+  return snapshots;
+}
+
+function splitParentRef(order = {}) {
+  if (String(order?.type || "").trim().toUpperCase() === "CUSTOM") return "";
+  const explicit = String(order?.originalOrderId || "").trim();
+  if (explicit) return explicit;
+  const ref = String(order?.id || "").trim();
+  return /-S\d+$/i.test(ref) ? ref.replace(/-S\d+$/i, "") : "";
+}
+
+export function dispatchPlannedOrderConflictRefs(currentPlan = {}, otherPlan = {}) {
+  const currentRefs = dispatchPlannedOrderRefs(currentPlan);
+  const otherRefs = dispatchPlannedOrderRefs(otherPlan);
+  const currentSnapshots = dispatchPlanOrderSnapshotMap(currentPlan);
+  const otherSnapshots = dispatchPlanOrderSnapshotMap(otherPlan);
+  const conflicts = new Set([...currentRefs].filter((ref) => otherRefs.has(ref)));
+
+  for (const ref of currentRefs) {
+    const parentRef = splitParentRef(currentSnapshots.get(ref));
+    if (parentRef && otherRefs.has(parentRef)) conflicts.add(ref);
+  }
+  for (const ref of otherRefs) {
+    const parentRef = splitParentRef(otherSnapshots.get(ref));
+    if (parentRef && currentRefs.has(parentRef)) conflicts.add(parentRef);
+  }
+  return conflicts;
 }
 
 export function applyDispatchPlannedAssignment(order = {}, assignment = null) {
@@ -356,6 +414,57 @@ export class DispatchPlanDateMismatchError extends Error {
     this.payloadPlanDate = payloadPlanDate;
     this.status = 409;
   }
+}
+
+export class DispatchCustomOrderDateConflictError extends Error {
+  constructor(conflicts = []) {
+    const first = conflicts[0] || {};
+    super(first.orderRef
+      ? `${first.orderRef} is already planned on ${first.planDate}.`
+      : "A Custom Order is already planned on another date.");
+    this.name = "DispatchCustomOrderDateConflictError";
+    this.code = "DISPATCH_ORDER_ALREADY_PLANNED";
+    this.status = 409;
+    this.conflicts = conflicts;
+  }
+}
+
+async function assertCustomOrderPlanDateExclusivity(plan = {}) {
+  const plannedRefs = dispatchPlannedOrderRefs(plan);
+  const customRefs = (plan.orders || [])
+    .filter((order) => String(order?.type || "").trim().toUpperCase() === "CUSTOM")
+    .map((order) => String(order?.id || "").trim())
+    .filter((ref) => ref && plannedRefs.has(ref));
+  if (!customRefs.length) return;
+  const customByKey = new Map(customRefs.map((ref) => [ref.toLowerCase(), ref]));
+  const result = await query(
+    `SELECT p.id, p.plan_date::text AS plan_date, p.status, s.orders, s.trucks
+       FROM dispatch_plans p
+       JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+      WHERE p.id <> $1
+        AND p.status <> 'cancelled'
+        AND p.plan_date <> $2::date`,
+    [plan.id || plan.planId || 0, cleanPlanDate(plan.planDate)]
+  );
+  const conflicts = [];
+  for (const row of result.rows) {
+    for (const ref of dispatchPlannedOrderRefs({
+      id: row.id,
+      planDate: row.plan_date,
+      orders: row.orders || [],
+      trucks: row.trucks || []
+    })) {
+      const customRef = customByKey.get(String(ref || "").trim().toLowerCase());
+      if (!customRef) continue;
+      conflicts.push({
+        orderRef: customRef,
+        planId: String(row.id),
+        planDate: String(row.plan_date || "").slice(0, 10),
+        status: row.status || ""
+      });
+    }
+  }
+  if (conflicts.length) throw new DispatchCustomOrderDateConflictError(conflicts);
 }
 
 function collectPlanOrderRefs(plan) {
@@ -654,11 +763,27 @@ export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [
         payloadPlanDate
       });
     }
+    const canonicalPlan = await canonicalizeDispatchCustomOrdersInPlan({
+      id: String(planId),
+      planDate: expectedPlanDate,
+      orders: Array.isArray(orders) ? orders : [],
+      trucks: Array.isArray(trucks) ? trucks : [],
+      summary: summary || {}
+    }, {
+      previousPlan: {
+        id: String(planId),
+        planDate: expectedPlanDate,
+        orders: existingPlan.orders || [],
+        trucks: existingPlan.trucks || []
+      },
+      lockRows: true
+    });
+    await assertCustomOrderPlanDateExclusivity(canonicalPlan);
     await assertActiveDispatchFleetAssignments({
       id: planId,
       planDate: expectedPlanDate,
-      orders: Array.isArray(orders) ? orders : [],
-      trucks: Array.isArray(trucks) ? trucks : []
+      orders: canonicalPlan.orders || [],
+      trucks: canonicalPlan.trucks || []
     }, {
       previousPlan: {
         id: planId,
@@ -700,8 +825,8 @@ export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [
     const sanitizedPlan = await sanitizeDispatchPlan({
       id: String(planId),
       revision: Number(result.rows[0].revision || 0),
-      orders: Array.isArray(orders) ? orders : [],
-      trucks: Array.isArray(trucks) ? trucks : [],
+      orders: canonicalPlan.orders || [],
+      trucks: canonicalPlan.trucks || [],
       summary: summary || {}
     });
     const cleanPlan = {
@@ -830,9 +955,22 @@ export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" }
               || dispatchLoadAssignmentDefaults.ownYards
           })
     );
-    const cleanPlan = {
+    const canonicalPlan = await canonicalizeDispatchCustomOrdersInPlan({
       ...sanitizedPlan,
-      summary: dispatchPlanV2Summary(sanitizedPlan.summary || {}, {
+      planDate: currentDate
+    }, {
+      previousPlan: {
+        id: current.id,
+        planDate: currentDate,
+        orders: current.orders || [],
+        trucks: current.trucks || []
+      },
+      lockRows: true
+    });
+    await assertCustomOrderPlanDateExclusivity(canonicalPlan);
+    const cleanPlan = {
+      ...canonicalPlan,
+      summary: dispatchPlanV2Summary(canonicalPlan.summary || {}, {
         previousSummary: current.summary || {},
         source: isDispatchV2Plan(sourcePlan)
           ? sourcePlan.summary?.dispatchPlanFormat?.source || DISPATCH_PLAN_V2_SAVE_SOURCE
@@ -882,6 +1020,44 @@ export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" }
 export async function confirmDispatchPlan(planId, { note = "" } = {}) {
   return withTransaction(async () => {
     await lockDispatchFleetPlanning();
+    const currentResult = await query(
+      `SELECT p.id, p.plan_date::text AS plan_date, p.revision,
+              s.orders, s.trucks, s.summary, s.saved_at
+         FROM dispatch_plans p
+         LEFT JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+        WHERE p.id = $1
+        FOR UPDATE OF p`,
+      [planId]
+    );
+    const current = currentResult.rows[0];
+    if (!current) throw new Error("Dispatch plan not found.");
+    const currentPlan = {
+      id: String(current.id),
+      planDate: cleanPlanDate(current.plan_date),
+      orders: current.orders || [],
+      trucks: current.trucks || [],
+      summary: current.summary || {}
+    };
+    const canonicalPlan = await canonicalizeDispatchCustomOrdersInPlan(currentPlan, {
+      previousPlan: currentPlan,
+      lockRows: true
+    });
+    await assertCustomOrderPlanDateExclusivity(canonicalPlan);
+    const sanitizedPlan = await sanitizeDispatchPlan(canonicalPlan);
+    await assertActiveDispatchFleetAssignments(sanitizedPlan, { previousPlan: currentPlan });
+    await query(
+      `UPDATE dispatch_plan_snapshots
+          SET orders = $2::jsonb,
+              trucks = $3::jsonb,
+              summary = $4::jsonb
+        WHERE plan_id = $1`,
+      [
+        planId,
+        JSON.stringify(sanitizedPlan.orders || []),
+        JSON.stringify(sanitizedPlan.trucks || []),
+        JSON.stringify(sanitizedPlan.summary || {})
+      ]
+    );
     const result = await query(
       `UPDATE dispatch_plans
           SET status = 'confirmed',
@@ -895,7 +1071,6 @@ export async function confirmDispatchPlan(planId, { note = "" } = {}) {
     );
     if (!result.rows[0]) throw new Error("Dispatch plan not found.");
     const plan = await getDispatchPlan(planId);
-    await assertActiveDispatchFleetAssignments(plan, { previousPlan: plan });
     await syncDispatchPlanLoadAssignments(plan);
     return plan;
   });

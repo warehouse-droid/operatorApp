@@ -195,6 +195,95 @@ function yardAddress(value) {
   return YARD_ADDRESSES[String(value || "")] || value || "";
 }
 
+function normalizedPhysicalText(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function normalizedStreetAddressKey(value) {
+  const aliases = {
+    avenue: "ave",
+    boulevard: "blvd",
+    circle: "cir",
+    court: "ct",
+    crescent: "cres",
+    drive: "dr",
+    highway: "hwy",
+    lane: "ln",
+    parkway: "pkwy",
+    road: "rd",
+    street: "st",
+    trail: "trl"
+  };
+  const tokens = normalizedPhysicalText(value).split(" ").filter(Boolean);
+  if (tokens.length < 3 || !/^\d+[a-z]?$/.test(tokens[0])) return "";
+  const suffixIndex = tokens.findIndex((token, index) =>
+    index >= 2 && Boolean(aliases[token] || Object.values(aliases).includes(token))
+  );
+  if (suffixIndex < 2) return "";
+  return tokens.slice(0, suffixIndex + 1).map((token) => aliases[token] || token).join(" ");
+}
+
+function canadianPostalCode(value) {
+  const compact = String(value || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  return compact.match(/[abceghj-nprstvxy]\d[abceghj-nprstvwxyz]\d[abceghj-nprstvwxyz]\d$/)?.[0] || "";
+}
+
+function addressMunicipalityKey(value) {
+  const streetKey = normalizedStreetAddressKey(value);
+  if (!streetKey) return "";
+  const tokens = normalizedPhysicalText(value).split(" ").filter(Boolean);
+  const streetTokens = streetKey.split(" ");
+  const municipality = [];
+  for (const token of tokens.slice(streetTokens.length)) {
+    if (["on", "ontario", "canada"].includes(token) || /^[abceghj-nprstvxy]\d[abceghj-nprstvwxyz]$/i.test(token)) break;
+    municipality.push(token);
+  }
+  const key = municipality.join(" ");
+  return ["toronto", "scarborough", "north york", "etobicoke", "east york", "york"].includes(key)
+    ? "toronto"
+    : key;
+}
+
+function physicalAddressRegionCompatible(left, right) {
+  const leftPostal = canadianPostalCode(left);
+  const rightPostal = canadianPostalCode(right);
+  if (leftPostal && rightPostal && leftPostal !== rightPostal) return false;
+  const leftMunicipality = addressMunicipalityKey(left);
+  const rightMunicipality = addressMunicipalityKey(right);
+  return !leftMunicipality || !rightMunicipality || leftMunicipality === rightMunicipality;
+}
+
+function samePhysicalAddress(left, right) {
+  if ((left && typeof left === "object") || (right && typeof right === "object")) return false;
+  const leftKey = normalizedPhysicalText(left);
+  const rightKey = normalizedPhysicalText(right);
+  if (!leftKey || !rightKey) return false;
+  if (leftKey === rightKey) return true;
+  const leftStreet = normalizedStreetAddressKey(left);
+  const rightStreet = normalizedStreetAddressKey(right);
+  if (!leftStreet || leftStreet !== rightStreet || !physicalAddressRegionCompatible(left, right)) return false;
+  const matchingYards = Object.entries(YARD_ADDRESSES)
+    .filter(([, address]) => normalizedStreetAddressKey(address) === leftStreet)
+    .map(([code]) => code);
+  return new Set(matchingYards).size === 1;
+}
+
+function yardCodeForAddress(address) {
+  const exactKey = normalizedPhysicalText(address);
+  const exact = Object.entries(YARD_ADDRESSES)
+    .find(([, yard]) => normalizedPhysicalText(yard) === exactKey)?.[0];
+  if (exact) return exact;
+  const streetKey = normalizedStreetAddressKey(address);
+  if (!streetKey) return "";
+  const matches = Object.entries(YARD_ADDRESSES)
+    .filter(([, yard]) =>
+      normalizedStreetAddressKey(yard) === streetKey
+      && physicalAddressRegionCompatible(address, yard)
+    )
+    .map(([code]) => code);
+  return new Set(matches).size === 1 ? matches[0] : "";
+}
+
 function numberValue(value) {
   return Number(value || 0) || 0;
 }
@@ -279,7 +368,11 @@ function dropAddressForStop(stop = {}, order = {}) {
 
 function stopLocationLabel(plan, stop) {
   if (!stop) return "";
-  if (stop.type === "pick") return String(stop.location || "");
+  if (stop.type === "pick") {
+    const order = orderByRef(plan, stop.orderId) || {};
+    const override = String(order.pickupAddressOverride || "").trim();
+    return override ? yardCodeForAddress(override) || override : String(stop.location || "");
+  }
   const order = orderByRef(plan, stop.orderId) || {};
   return dropLocationForStop(stop, order);
 }
@@ -288,8 +381,8 @@ function pickupAddressForStop(plan, stop) {
   const order = orderByRef(plan, stop?.orderId) || {};
   return String(
     order.pickupAddressOverride
-    || order.sourceAddress
     || yardAddress(stop?.location)
+    || order.sourceAddress
     || ""
   );
 }
@@ -305,12 +398,13 @@ function loadEndPoint(plan, truck, load) {
   if (!load) return null;
   if (load.returnOnly) {
     const yard = String(load.returnYard || "12441");
-    return { location: yard, address: yardAddress(yard) };
+    return { location: yard, jobLocation: yard, address: yardAddress(yard) };
   }
   const stop = lastRoutedStop(load);
   if (!stop) return null;
   return {
     location: stopLocationLabel(plan, stop),
+    jobLocation: stop.type === "pick" ? String(stop.location || "") : stopLocationLabel(plan, stop),
     address: stopAddressLabel(plan, stop)
   };
 }
@@ -324,7 +418,7 @@ function loadEndOwnYard(plan, load) {
   const stop = lastRoutedStop(load);
   if (!stop) return "";
   if (stop.type === "pick") {
-    const yard = String(stop.location || "");
+    const yard = stopLocationLabel(plan, stop);
     return isOwnYard(plan, yard) ? yard : "";
   }
   const order = orderByRef(plan, stop.orderId) || {};
@@ -360,7 +454,7 @@ function buildTruckSwitchApproachJob(plan, previousAssignment, nextAssignment, s
       plan,
       previousAssignment.truck,
       load,
-      from.location,
+      from.jobLocation || from.location,
       switchYard,
       "TRUCK_SWITCH_APPROACH"
     ),
@@ -378,6 +472,7 @@ function buildTruckSwitchApproachJob(plan, previousAssignment, nextAssignment, s
     location: `${from.location} to ${switchYard}`,
     address: yardAddress(switchYard),
     fromLocation: from.location,
+    fromJobLocation: from.jobLocation || from.location,
     fromAddress: from.address || yardAddress(from.location),
     toLocation: switchYard,
     toAddress: yardAddress(switchYard),
@@ -397,38 +492,41 @@ function buildTruckSwitchApproachJob(plan, previousAssignment, nextAssignment, s
 function startTravelForLoad(plan, truck, load, loadIndex, previousAssignment = null) {
   const firstPickup = firstPickupStop(load);
   if (!firstPickup?.location) return null;
+  const physicalPickupLocation = stopLocationLabel(plan, firstPickup);
   const toAddress = stopAddressLabel(plan, firstPickup);
   let from = null;
   if (previousAssignment) {
     if (String(previousAssignment.truck?.plate || "") !== String(truck?.plate || "")) {
       const switchYard = String(load.switchYard || load.switch_yard || truck.base || "");
-      from = switchYard ? { location: switchYard, address: yardAddress(switchYard) } : null;
+      from = switchYard ? { location: switchYard, jobLocation: switchYard, address: yardAddress(switchYard) } : null;
     } else {
       from = loadEndPoint(plan, previousAssignment.truck, previousAssignment.load);
     }
   } else if (loadIndex <= 0) {
     if (!truck?.base) return null;
-    from = { location: String(truck.base), address: yardAddress(truck.base) };
+    from = { location: String(truck.base), jobLocation: String(truck.base), address: yardAddress(truck.base) };
   } else {
     from = loadEndPoint(plan, truck, (truck.loads || [])[loadIndex - 1]);
   }
   if (!from?.location) return null;
-  const sameLocation = String(from.location) === String(firstPickup.location);
-  const sameAddress = String(from.address || "").trim().toLowerCase() === String(toAddress || "").trim().toLowerCase();
-  if (sameLocation && sameAddress) return null;
+  if (samePhysicalAddress(from.address || from.location, toAddress || physicalPickupLocation)) return null;
   return {
     from: from.location,
+    fromJobLocation: from.jobLocation || from.location,
     fromAddress: from.address || yardAddress(from.location),
-    to: String(firstPickup.location),
-    toAddress
+    to: physicalPickupLocation,
+    toAddress,
+    toPickupLocation: String(firstPickup.location)
   };
 }
 
 function buildTravelJob(plan, truck, load, truckIndex, loadIndex, previousAssignment = null) {
   const travel = startTravelForLoad(plan, truck, load, loadIndex, previousAssignment);
   if (!travel) return null;
+  const jobStart = travel.fromJobLocation || travel.from;
+  const jobTarget = travel.toPickupLocation || travel.to;
   return {
-    jobId: travelJobId(plan, truck, load, travel.from, travel.to),
+    jobId: travelJobId(plan, truck, load, jobStart, jobTarget),
     planId: plan.id,
     planDate: plan.planDate,
     driverLogin: driverKey(truck.driverLogin || truck.driver),
@@ -438,14 +536,16 @@ function buildTravelJob(plan, truck, load, truckIndex, loadIndex, previousAssign
     parkingSpot: truck.parkingSpot || "",
     loadId: load.id || "",
     loadName: load.name || "",
-    stopId: `travel-${travel.from}-${travel.to}`,
+    stopId: `travel-${jobStart}-${jobTarget}`,
     stopType: "travel",
     location: `${travel.from} to ${travel.to}`,
     address: travel.toAddress,
     fromLocation: travel.from,
+    fromJobLocation: jobStart,
     fromAddress: travel.fromAddress,
     toLocation: travel.to,
     toAddress: travel.toAddress,
+    toPickupLocation: travel.toPickupLocation || "",
     windowStart: "",
     windowEnd: "",
     instructions: "Travel to the pickup yard before loading.",
@@ -469,10 +569,12 @@ function buildInterStopTravelJob(plan, truck, load, previousStop, stop, truckInd
   const to = stopLocationLabel(plan, stop);
   const fromAddress = stopAddressLabel(plan, previousStop);
   const toAddress = stopAddressLabel(plan, stop);
-  if (!from || !to || (String(from) === String(to) && String(fromAddress) === String(toAddress))) return null;
+  if (!from || !to || samePhysicalAddress(fromAddress || from, toAddress || to)) return null;
   const legKey = `${previousStop.id || stopIndex - 1}-${stop.id || stopIndex}`;
+  const fromIdentity = previousStop.type === "pick" ? String(previousStop.location || from) : from;
+  const toIdentity = stop.type === "pick" ? String(stop.location || to) : to;
   return {
-    jobId: travelJobId(plan, truck, load, from, to, legKey),
+    jobId: travelJobId(plan, truck, load, fromIdentity, toIdentity, legKey),
     planId: plan.id,
     planDate: plan.planDate,
     driverLogin: driverKey(truck.driverLogin || truck.driver),
@@ -505,15 +607,16 @@ function buildReturnJob(plan, truck, load, truckIndex, loadIndex, previousAssign
     && String(previousAssignment.truck?.plate || "") !== String(truck?.plate || "");
   const switchYard = String(load.switchYard || load.switch_yard || truck.base || "");
   const previous = changedTruck
-    ? { location: switchYard, address: yardAddress(switchYard) }
+    ? { location: switchYard, jobLocation: switchYard, address: yardAddress(switchYard) }
     : previousAssignment
       ? loadEndPoint(plan, previousAssignment.truck, previousAssignment.load)
     : loadEndPoint(plan, truck, (truck.loads || [])[loadIndex - 1]);
   const to = String(load.returnYard || "12441");
   const from = previous?.location || String(truck.base || "");
+  const fromJobLocation = previous?.jobLocation || from;
   if (!from || String(from) === to) return null;
   return {
-    jobId: returnJobId(plan, truck, load, from, to),
+    jobId: returnJobId(plan, truck, load, fromJobLocation, to),
     planId: plan.id,
     planDate: plan.planDate,
     driverLogin: driverKey(truck.driverLogin || truck.driver),
@@ -528,6 +631,7 @@ function buildReturnJob(plan, truck, load, truckIndex, loadIndex, previousAssign
     location: `${from} to ${to}`,
     address: yardAddress(to),
     fromLocation: from,
+    fromJobLocation,
     fromAddress: previous?.address || yardAddress(from),
     toLocation: to,
     toAddress: yardAddress(to),
@@ -603,6 +707,8 @@ function buildJob(plan, truck, load, stop, truckIndex, loadIndex, stopIndex) {
     : stopOrderRefs;
   const orderRefs = [...new Set([...expandOrderRefs(plan, ordinaryStopRefs), ...directTransferRefs])];
   const firstOrder = orderByRef(plan, stopOrderRefs[0]) || orderByRef(plan, orderRefs[0]) || {};
+  const pickupLocation = isPickup ? String(stop.location || "") : "";
+  const physicalPickupLocation = isPickup ? stopLocationLabel(plan, stop) : "";
   const dropLocation = isPickup ? "" : dropLocationForStop(stop, firstOrder);
   const dropAddress = isPickup ? "" : dropAddressForStop(stop, firstOrder);
   return {
@@ -618,9 +724,10 @@ function buildJob(plan, truck, load, stop, truckIndex, loadIndex, stopIndex) {
     loadName: load.name || "",
     stopId: stop.id || "",
     stopType: isPickup ? "pickup" : "dropoff",
-    location: isPickup ? stop.location : dropLocation,
+    location: isPickup ? physicalPickupLocation : dropLocation,
+    pickupLocation,
     address: isPickup
-      ? (firstOrder.pickupAddressOverride || firstOrder.sourceAddress || pickupAddressForStop(plan, stop))
+      ? pickupAddressForStop(plan, stop)
       : dropAddress,
     dropLocation,
     dropAddress,
@@ -1144,7 +1251,7 @@ export async function ensureDriverSamsaraDutyForJob(driverLogin, { samsaraUserna
     ? {
         id: job.truckId || "",
         plate: job.truckPlate,
-        base: job.switchYard || job.location || "",
+        base: job.switchYard || job.pickupLocation || job.location || "",
         parkingSpot: job.parkingSpot || ""
       }
     : assignment.truck || {};
@@ -1520,6 +1627,7 @@ function visibleUnitsFromPlanItem(item) {
 
 function planItemForPickup(item, context = {}) {
   if (context.stopType !== "pickup") return item;
+  if (String(context.orderType || "").trim().toUpperCase() === "CUSTOM") return item;
   const pickupLocation = String(context.pickupLocation || "").trim();
   const ownPickup = !pickupLocation || isOwnYard(context.plan, pickupLocation);
   if (ownPickup) {
@@ -1564,7 +1672,7 @@ function orderDetailsFromPlan(orderRef, planOrder = null, context = {}) {
     ? (planOrder?.items || []).filter((item) => requestedLineRowIds.has(String(item.lineRowId)))
     : (planOrder?.items || []);
   const items = sourceItems
-    .map((item) => planItemForPickup(item, context))
+    .map((item) => planItemForPickup(item, { ...context, orderType: planOrder?.type || context.orderType }))
     .filter(planItemHasQuantity);
   return {
     orderRef,
@@ -1580,6 +1688,9 @@ function orderDetailsFromPlan(orderRef, planOrder = null, context = {}) {
 }
 
 async function orderDetails(orderRef, typeHint = "", planOrder = null, context = {}) {
+  if (String(typeHint || "").trim().toUpperCase() === "CUSTOM") {
+    return orderDetailsFromPlan(orderRef, planOrder, { ...context, orderType: "CUSTOM" });
+  }
   const detail = typeHint === "PO"
     ? await detailsFromReceiving(orderRef, "PO", context)
     : typeHint === "CO"
@@ -1620,7 +1731,7 @@ export async function getNextDriverJob(driverLogin) {
     next.address = await locationAddress(next.toLocation || next.address);
     next.fromAddress = await locationAddress(next.fromLocation || next.fromAddress);
   } else if (next.stopType === "pickup") {
-    next.address = await locationAddress(next.location || next.address);
+    next.address = await locationAddress(next.address || next.location);
   }
   const details = await Promise.all(next.orderRefs.map((ref) => {
     const dependencyManifest = (next.dependencyPickupManifests || []).find((entry) => String(entry.transferOrderRef || "") === String(ref));
@@ -1648,13 +1759,47 @@ export async function getNextDriverJob(driverLogin) {
     return orderDetails(ref, hint, orderByRef(assignment.plan, ref), {
       plan: assignment.plan,
       stopType: next.stopType,
-      pickupLocation: next.stopType === "pickup" ? next.location : "",
+      pickupLocation: next.stopType === "pickup" ? next.pickupLocation || next.location : "",
       dropLocation: next.stopType === "dropoff" ? next.dropLocation || next.location : "",
       destinationLocationId: next.destinationLocationId ?? null,
       lineRowIds: next.stopType === "dropoff" ? next.lineRowIds || [] : []
     });
   }));
   return { ...next, orders: details };
+}
+
+function driverJobRecordDetails(job = {}) {
+  return {
+    schemaVersion: 1,
+    driverName: job.driverName || "",
+    parkingSpot: job.parkingSpot || "",
+    fromTruckPlate: job.fromTruckPlate || "",
+    nextTruckPlate: job.nextTruckPlate || "",
+    switchYard: job.switchYard || "",
+    location: job.location || "",
+    pickupLocation: job.pickupLocation || "",
+    address: job.address || "",
+    dropLocation: job.dropLocation || "",
+    dropAddress: job.dropAddress || "",
+    destinationLocationId: job.destinationLocationId ?? null,
+    lineRowIds: Array.isArray(job.lineRowIds) ? job.lineRowIds.map(String) : [],
+    windowStart: job.windowStart || "",
+    windowEnd: job.windowEnd || "",
+    instructions: job.instructions || "",
+    orderTypes: Array.isArray(job.orderTypes) ? job.orderTypes : [],
+    requiredPhotos: Math.max(0, Number(job.requiredPhotos || 0)),
+    orders: (Array.isArray(job.orders) ? job.orders : []).map((order) => ({
+      orderRef: order?.orderRef || "",
+      party: order?.party || "",
+      source: order?.source || "",
+      items: (Array.isArray(order?.items) ? order.items : []).map((item) => ({
+        itemName: item?.itemName || "",
+        sku: item?.sku || "",
+        description: item?.description || "",
+        units: Array.isArray(item?.units) ? item.units : []
+      }))
+    }))
+  };
 }
 
 export async function startDriverJob(driverLogin, jobIdValue, { job = null } = {}) {
@@ -1680,7 +1825,7 @@ export async function startDriverJob(driverLogin, jobIdValue, { job = null } = {
        stop_id = EXCLUDED.stop_id,
        stop_type = EXCLUDED.stop_type,
        order_refs = EXCLUDED.order_refs,
-       job_details = EXCLUDED.job_details
+       job_details = COALESCE(driver_job_records.job_details, '{}'::jsonb) || EXCLUDED.job_details
      RETURNING *`,
     [
       jobIdValue,
@@ -1694,12 +1839,7 @@ export async function startDriverJob(driverLogin, jobIdValue, { job = null } = {
       job?.stopId || "",
       job?.stopType || "",
       JSON.stringify(job?.orderRefs || []),
-      JSON.stringify({
-        fromTruckPlate: job?.fromTruckPlate || "",
-        nextTruckPlate: job?.nextTruckPlate || "",
-        switchYard: job?.switchYard || "",
-        parkingSpot: job?.parkingSpot || ""
-      })
+      JSON.stringify(driverJobRecordDetails(job || {}))
     ]
   );
   await query(
@@ -1841,7 +1981,7 @@ export async function recordDriverJobPhotos(driverLogin, jobIdValue, { photoData
        status = 'complete',
        started_at = COALESCE(driver_job_records.started_at, EXCLUDED.started_at, now()),
        completed_at = now(),
-       job_details = EXCLUDED.job_details
+       job_details = COALESCE(driver_job_records.job_details, '{}'::jsonb) || EXCLUDED.job_details
      RETURNING *`,
     [
       jobIdValue,
@@ -1857,12 +1997,7 @@ export async function recordDriverJobPhotos(driverLogin, jobIdValue, { photoData
       JSON.stringify(job?.orderRefs || []),
       JSON.stringify(photos),
       job?.startedAt || null,
-      JSON.stringify({
-        fromTruckPlate: job?.fromTruckPlate || "",
-        nextTruckPlate: job?.nextTruckPlate || "",
-        switchYard: job?.switchYard || "",
-        parkingSpot: job?.parkingSpot || ""
-      })
+      JSON.stringify(driverJobRecordDetails(job || {}))
     ]
   );
   await refreshProjectedLoadExecution({ ...job, driverLogin: driverKey(driverLogin) });

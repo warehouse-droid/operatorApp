@@ -1,15 +1,17 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
-const [server, page, client, control, sidebar, menu, repository, yardQuantity] = await Promise.all([
+const [server, page, client, control, sidebar, menu, sales, repository, yardQuantity, i18n] = await Promise.all([
   "server.js",
   "../public/dispatch-loaded-export.html",
   "../public/dispatch-loaded-export.js",
   "../public/control.js",
   "../public/app-sidebar.js",
   "../public/dispatch-menu.html",
+  "../public/sales.js",
   "yard-movement-repository.js",
-  "yard-quantity.js"
+  "yard-quantity.js",
+  "../public/i18n.js"
 ].map((file) => readFile(new URL(file, import.meta.url), "utf8")));
 
 function includesAll(source, values, label) {
@@ -17,12 +19,22 @@ function includesAll(source, values, label) {
 }
 
 includesAll(server, [
-  'app.get("/dispatch/loaded-export"',
+  'app.get(["/dispatch/loaded-export", "/dispatch/in-outbound-record"]',
   'app.get("/api/dispatch/loaded-orders"',
   'app.get("/api/dispatch/loaded-orders/detail"',
   'app.get("/api/dispatch/loaded-orders/export.csv"',
+  '"/control/in-outbound-record",',
   "sendLoadedOrdersCsv(req, res)"
-], "Dispatch loaded server routes");
+], "Canonical In/Outbound Record and legacy server routes");
+
+includesAll(server, [
+  'app.get("/sales/in-outbound-record"',
+  '"/api/sales/in-outbound-records"',
+  '"/api/sales/in-outbound-records/detail"',
+  '"/api/sales/in-outbound-records/export.csv"',
+  "operatorSalesYardLocationIds(req.operator)",
+  "allowedSalesStoreLocationIds"
+], "Sales In/Outbound Record routes and store scoping");
 
 includesAll(server, [
   "listYardMovements",
@@ -30,20 +42,26 @@ includesAll(server, [
   "listYardMovementCsvRows",
   "itemSearch: req.query.itemSearch",
   "yardMixedUnits",
-  '"direction", "type", "order", "processed at"',
+  '"direction", "type", "order", "yard processed at", "last activity", "delivered at"',
+  '"driver record only", "driver", "truck", "yard photos", "driver photos"',
   '"PLT", "LYR", "SEC", "PCS"'
 ], "Unified Yard movement server integration");
 
 includesAll(page, [
+  "<title>MBBS In/Outbound Record</title>",
   'id="dispatchLoadedApp"',
   '/dispatch-auth.js?v=',
   '/dispatch-loaded-export.js?v='
 ], "Dispatch loaded page");
 
 includesAll(client, [
-  "/api/dispatch/loaded-orders?",
-  "/api/dispatch/loaded-orders/detail?",
-  "/api/dispatch/loaded-orders/export.csv?",
+  'const loadedSalesHost = window.location.pathname === "/sales/in-outbound-record"',
+  'const loadedApiBase = loadedSalesHost ? "/api/sales/in-outbound-records" : "/api/dispatch/loaded-orders"',
+  'const loadedRoles = loadedSalesHost ? ["sales", "admin"] : ["dispatcher", "admin"]',
+  "loadedAllowedYards",
+  "`${loadedApiBase}/detail?",
+  "`${loadedApiBase}/export.csv?",
+  "in-outbound-record-",
   "/api/photo-upload/preview?ref=",
   'data-action="open-loaded-photo"',
   'id="dispatchLoadedSearch"',
@@ -59,7 +77,14 @@ includesAll(client, [
   "to_pcs",
   "movementMixedUnits",
   "movement-quantity-equation",
-  "Math.floor((remainder / definition.conversionQty) + 0.000001)"
+  "Math.floor((remainder / definition.conversionQty) + 0.000001)",
+  "driverRecords",
+  "driverPhotos",
+  "delivery_at",
+  "driver_only",
+  "renderDriverRecords",
+  "Driver delivery photos",
+  "In/Outbound Record"
 ], "Dispatch loaded client");
 
 includesAll(control, [
@@ -70,7 +95,13 @@ includesAll(control, [
   "movementMixedUnits",
   "movement-quantity-equation",
   "Math.floor((remainder / definition.conversionQty) + 0.000001)",
-  "processed_qty"
+  "processed_qty",
+  "driverRecords",
+  "driverPhotos",
+  "delivery_at",
+  "driver_only",
+  "Driver delivery photos",
+  "In/Outbound Record"
 ], "Control Yard movement client");
 
 assert.ok(
@@ -88,8 +119,13 @@ assert.ok(client.includes('title="${loadedEscape(movementTypeLabel(orderType))}"
 assert.ok(control.includes('title="${escapeHtml(movementTypeLabel(orderType))}" type="button">${movementTypeCode(orderType)}</button>'),
   "Control type tabs should display only their short codes");
 
-assert.ok(sidebar.includes('{ label: "Yard In/Outbound", href: "/dispatch/loaded-export"'), "Dispatch sidebar entry missing");
+assert.ok(sidebar.includes('{ label: "In/Outbound Record", href: "/dispatch/loaded-export"'), "Renamed Dispatch sidebar entry missing");
+assert.ok(sidebar.includes('{ label: "In/Outbound Record", href: "/control/yard-in-outbound"'), "Renamed Control sidebar entry missing");
+assert.ok(sidebar.includes('{ label: "In/Outbound Record", href: "/sales/in-outbound-record"'), "Sales sidebar entry missing");
 assert.ok(menu.includes("location.href='/dispatch/loaded-export'"), "Dispatch menu entry missing");
+assert.ok(menu.includes('"In/Outbound Record"'), "Dispatch menu must use the renamed module label");
+assert.ok(sales.includes("location.href='/sales/in-outbound-record'"), "Sales menu entry missing");
+assert.ok(sales.includes('"In/Outbound Record"'), "Sales menu must use the renamed module label");
 includesAll(repository, [
   "export async function listYardMovements",
   "export async function getYardMovementDetail",
@@ -111,8 +147,22 @@ includesAll(repository, [
   "processed_pallet_qty",
   "processed_layer_qty",
   "processed_section_qty",
-  "processed_piece_qty"
+  "processed_piece_qty",
+  "driver_job_records",
+  "driverRecords",
+  "driverPhotos",
+  "delivery_at",
+  "driver_only",
+  "salesStoreLocationIdSql",
+  "allowedSalesStoreLocationIds"
 ], "Unified Yard movement repository");
+
+includesAll(i18n, [
+  '"yard.driverOnly"',
+  '"yard.deliveryTime"',
+  '"yard.driverActivities"',
+  '"yard.driverDeliveryPhotos"'
+], "In/Outbound Record translations");
 
 includesAll(yardQuantity, [
   "export function yardMixedUnits",
@@ -121,4 +171,4 @@ includesAll(yardQuantity, [
   "remainder = Math.max(0, remainder - (value * definition.conversion))"
 ], "Shared Yard mixed-unit calculation");
 
-console.log("Yard In/Outbound harness passed.");
+console.log("In/Outbound Record harness passed.");

@@ -68,3 +68,17 @@ The script intentionally stops if the VM Git worktree contains local changes.
 Commit or stash those changes before running it.
 
 Do not use `docker compose down -v` during normal operation because `-v` deletes the PostgreSQL, app-data, and Ollama model volumes.
+
+## Independent localhost:3099
+
+The secondary Docker project uses the same working tree with
+`docker-compose.v2.yml`, loads `docker/env/.env.old`, and binds to
+`http://127.0.0.1:3099`. It does not use the retired NetSuite relay network.
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.v2.yml build app
+docker compose -f docker-compose.yml -f docker-compose.v2.yml run --rm --no-deps app npm run migrate
+docker compose -f docker-compose.yml -f docker-compose.v2.yml up -d --force-recreate app
+```
+
+See `docs/dispatch-v2-local.md` for the environment contract and isolation checks.

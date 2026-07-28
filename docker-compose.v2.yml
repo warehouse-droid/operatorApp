@@ -3,36 +3,29 @@ name: mbbs-operator-app-v2
 services:
   db:
     env_file: !override
-      - ./docker/env/.env.v2
+      - ./docker/env/.env.old
 
   app:
     environment:
-      MBBS_ENV_FILE: .env
+      MBBS_ENV_FILE: .env.old
       DISPATCH_DRIVER_ORIENTED_PLANNING: "true"
+      NETSUITE_MIRROR_ROLE: disabled
+      SAMSARA_WRITES_ENABLED: "false"
+      SMART_SCM_LIVE_EXECUTION_ENABLED: "false"
     volumes: !override
       - app_data:/app/data
-      - ./docker/env/.env.v2:/app/.env:ro
+      - ./docker/env/.env.old:/app/.env.old:ro
     ports: !override
       - "127.0.0.1:3099:3000"
-    networks:
-      mbbs:
-      mirror_sync:
-        aliases:
-          - mbbs-dispatch-v2-app
 
   migrate:
     environment:
-      MBBS_ENV_FILE: .env
+      MBBS_ENV_FILE: .env.old
     volumes: !override
       - app_data:/app/data
-      - ./docker/env/.env.v2:/app/.env:ro
+      - ./docker/env/.env.old:/app/.env.old:ro
 
   bootstrap-data:
     volumes:
       - ./server/data:/source:ro
       - app_data:/target
-
-networks:
-  mirror_sync:
-    name: ${MBBS_MIRROR_NETWORK:-mbbs-sync}
-    external: true

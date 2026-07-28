@@ -79,6 +79,70 @@ assert.match(queueSource, /forceSave[\s\S]*?await savePlanToServer\(payload,[\s\
 assert.match(queueSource, /return finalResult;/, "The queue must return the actual final save result to Save Now.");
 assert.doesNotMatch(queueSource, /Promise\.all/, "Plan writes must never race through Promise.all.");
 
+const makeBlockedSaveQueueFixture = Function(
+  `"use strict";
+  let saveTimer = null;
+  let saveInFlight = false;
+  let saveQueued = true;
+  let saveFlushPromise = null;
+  let forceNextPlanSave = false;
+  let localPlanGeneration = 1;
+  let lastSavedAt = "";
+  let isApplyingRemotePlan = false;
+  let firstSaveStartedResolve;
+  let firstSaveResponseResolve;
+  const firstSaveStarted = new Promise((resolve) => { firstSaveStartedResolve = resolve; });
+  const firstSaveResponse = new Promise((resolve) => { firstSaveResponseResolve = resolve; });
+  const saveGenerations = [];
+  const clearedGenerations = [];
+  function isDispatchPlanEditor() { return true; }
+  function autosaveDebug() {}
+  function shortHash(value) { return String(value || ""); }
+  function planPayload(savedAt) {
+    return { generation: localPlanGeneration, savedAt: savedAt.toISOString(), baseRevision: localPlanGeneration };
+  }
+  function stablePlanHashPayload(payload) { return String(payload.generation); }
+  function payloadRequiresSave() { return true; }
+  function clearLocalPlanDirty(_savedAt, generation) { clearedGenerations.push(generation); }
+  async function savePlanToServer(_payload, { saveGeneration }) {
+    saveGenerations.push(saveGeneration);
+    if (saveGenerations.length === 1) {
+      firstSaveStartedResolve();
+      return firstSaveResponse;
+    }
+    return { saved: true, latest: true };
+  }
+  ${queueSource}
+  return {
+    flushPlanSaveQueue,
+    firstSaveStarted,
+    queueNewerMutation() {
+      localPlanGeneration += 1;
+      saveQueued = true;
+    },
+    resolveFirstAsBlocked() {
+      firstSaveResponseResolve({ blocked: true, code: "DISPATCH_ORDER_DEPENDENCY_INVALID" });
+    },
+    state() {
+      return { saveGenerations: [...saveGenerations], clearedGenerations: [...clearedGenerations], saveQueued, saveInFlight };
+    }
+  };`
+);
+const blockedSaveQueue = makeBlockedSaveQueueFixture();
+const blockedSaveFlush = blockedSaveQueue.flushPlanSaveQueue();
+await blockedSaveQueue.firstSaveStarted;
+blockedSaveQueue.queueNewerMutation();
+blockedSaveQueue.resolveFirstAsBlocked();
+const blockedSaveResult = await blockedSaveFlush;
+assert.deepEqual(
+  blockedSaveQueue.state().saveGenerations,
+  [1, 2],
+  "A rejected older grouped save must not strand the newer ungroup mutation in the queue."
+);
+assert.equal(blockedSaveResult?.saved, true, "The flush result must reflect the newer successful ungroup save.");
+assert.equal(blockedSaveQueue.state().saveQueued, false, "The newer generation must be drained instead of remaining queued until hard refresh.");
+assert.equal(blockedSaveQueue.state().saveInFlight, false, "The serialized save queue must leave its in-flight state after draining.");
+
 const dirtySource = sourceSlice("function markLocalPlanDirty", "function resetLocalPlanDirty", "local save-generation guards");
 assert.match(dirtySource, /localPlanGeneration\s*\+=\s*1/, "Every local mutation must advance the generation.");
 assert.match(dirtySource, /if \(savedGeneration !== localPlanGeneration\) return;/, "An older response must not clear newer local edits.");

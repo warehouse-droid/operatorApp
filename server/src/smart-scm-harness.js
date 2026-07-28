@@ -396,7 +396,11 @@ assert(visiblePhysicalPallets.every((line) => line.officialLineItem && line.subm
     assert(Number.isFinite(Number(movedLine.reason.quantityAvailable)), "A destination change must capture the new yard's inventory components.");
     assert(destinationAdjusted.routeStops.length <= 2, "A destination edit must preserve the proposal route limit.");
     await query(
-      "UPDATE scm_smart_item_yard_policies SET eligible = false WHERE item_id = $1 AND location_id = $2",
+      `UPDATE scm_smart_item_yard_policies
+          SET eligible = false,
+              capacity_pallets = NULL
+        WHERE item_id = $1
+          AND location_id = $2`,
       [movedLine.itemId, movedLine.destinationLocationId]
     );
     await assert.rejects(
@@ -405,7 +409,11 @@ assert(visiblePhysicalPallets.every((line) => line.officialLineItem && line.subm
       "A same-yard quantity edit must reject an item or yard policy disabled after planning."
     );
     await query(
-      "UPDATE scm_smart_item_yard_policies SET eligible = true WHERE item_id = $1 AND location_id = $2",
+      `UPDATE scm_smart_item_yard_policies
+          SET eligible = true,
+              capacity_pallets = 25
+        WHERE item_id = $1
+          AND location_id = $2`,
       [movedLine.itemId, movedLine.destinationLocationId]
     );
 

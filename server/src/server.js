@@ -2,11 +2,12 @@ import express from "express";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { isIP } from "node:net";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { config, isNetSuiteSandboxEnvironment, listEnvFiles, selectEnvFile } from "./config.js";
 import { beginRollbackContext, pool, query, withTransaction } from "./db.js";
 import { fetchSalesOrderReferenceFromNetSuite, fetchTransactionReferenceByTranidFromNetSuite } from "./netsuite.js";
-import { buildAuthorizationUrl, exchangeCodeForToken, fetchDeliveryOrdersFromNetSuite, fetchDeliveryOrderFromNetSuite, fetchCustomerPickupOrderFromNetSuite, fetchDeliveryOrderDetailsFromNetSuite, fetchTransferDeliveryOrdersFromNetSuite, fetchTransferDeliveryOrderFromNetSuite, fetchTransferOrderDetailsFromNetSuite, fetchTransferOrderVerificationLinesFromNetSuite, fetchTransferOrderByIdFromNetSuite, findTransferOrdersByDependencyMarkerFromNetSuite, fetchPurchaseOrdersFromNetSuite, fetchPurchaseOrderFromNetSuite, fetchPurchaseOrderReferenceFromNetSuite, fetchPurchaseOrderDetailsFromNetSuite, fetchTransferReceivingOrdersFromNetSuite, fetchTransferReceivingOrderFromNetSuite, fetchInventoryBalanceForItemFromNetSuite, fetchInventoryBalancesFromNetSuite, fetchInventoryBalancesForItemsFromNetSuite, fetchItemFulfillmentFromNetSuite, fetchItemReceiptFromNetSuite, fetchTransactionProgressFromNetSuite, fetchTransactionStatusFromNetSuite, createPurchaseOrderInNetSuite, createTransferOrderInNetSuite, updateTransferOrderStatusInNetSuite, fetchPickingTicketFromNetSuite, resolveNetSuiteTransferLocations, resolveNetSuiteYardLocations, resolvePalletItemFromNetSuite, transformSalesOrderToItemFulfillment, transformTransferOrderToItemFulfillment, transformPurchaseOrderToItemReceipt, transformTransferOrderToItemReceipt } from "./netsuite.js";
+import { buildAuthorizationUrl, exchangeCodeForToken, fetchDeliveryOrdersFromNetSuite, fetchDeliveryOrderFromNetSuite, fetchCustomerPickupOrderFromNetSuite, fetchDeliveryOrderDetailsFromNetSuite, fetchDeliveryOrderDetailsBatchFromNetSuite, fetchTransferDeliveryOrdersFromNetSuite, fetchTransferDeliveryOrderFromNetSuite, fetchTransferOrderDetailsFromNetSuite, fetchTransferOrderVerificationLinesFromNetSuite, fetchTransferOrderByIdFromNetSuite, findTransferOrdersByDependencyMarkerFromNetSuite, fetchPurchaseOrdersFromNetSuite, fetchPurchaseOrderFromNetSuite, fetchPurchaseOrderReferenceFromNetSuite, fetchPurchaseOrderDetailsFromNetSuite, fetchTransferReceivingOrdersFromNetSuite, fetchTransferReceivingOrderFromNetSuite, fetchInventoryBalanceForItemFromNetSuite, fetchInventoryBalancesFromNetSuite, fetchInventoryBalancesForItemsFromNetSuite, fetchItemFulfillmentFromNetSuite, fetchItemReceiptFromNetSuite, fetchTransactionProgressFromNetSuite, fetchTransactionStatusFromNetSuite, createPurchaseOrderInNetSuite, createTransferOrderInNetSuite, updateTransferOrderStatusInNetSuite, fetchPickingTicketFromNetSuite, resolveNetSuiteTransferLocations, resolveNetSuiteYardLocations, resolvePalletItemFromNetSuite, transformSalesOrderToItemFulfillment, transformTransferOrderToItemFulfillment, transformPurchaseOrderToItemReceipt, transformTransferOrderToItemReceipt } from "./netsuite.js";
 import { buildTransferDependencyRestPayload, transferDependencyMemoMarker } from "./transfer-dependency-netsuite.js";
 import { syncTargetedNetSuiteOrder } from "./targeted-order-sync.js";
 import { listDeliveryOrders, listVrmaDeliveryPrepOrders, getDeliveryOrder, getFulfillableDeliveryOrder, buildItemFulfillmentPayload, markDeliveryPrepared, updateDeliveryStatus, confirmDeliveryLine, confirmDeliveryLines, setDeliveryLinePackedQuantity, unpackDeliveryLine, unpackDeliveryOrder, recordDeliveryFulfillment, recordDeliveryFulfillmentFailure, recordDeliveryLoad, listDeliveryFulfillments, getDeliveryBootstrap, getDeliveryPrepNotifications, resetDeliveryFulfillmentState, applyConfirmedDispatchPlanToDelivery, deactivateUnplannedDispatchSplitOrders, getNextDispatchSplitSuffix, getCurrentOperatorDeliveryDraft, releaseCurrentDeliveryDraft, listSavedDeliveryOrdersForOperator, listSavedDeliveryOrderKeysForOperator, saveDeliveryOrderForOperator, removeSavedDeliveryOrderForOperator, listDeliveryLoadTrucks, listDeliveryLoadOrders } from "./delivery-repository.js";
@@ -22,10 +23,11 @@ import { kickNetSuiteMirrorConsumer, localNetSuiteMirrorEventPage, localNetSuite
 import { listOperatorHistory, listRecordWarnings, reportOperatorRecordError, resolveRecordWarning } from "./history-repository.js";
 import { listDispatchOrders, enrichDispatchOrdersWithPoTargetAllocations, listScmPurchaseOrders, listScmSchedule, updateScmScheduleEntry, createScmScheduleGroup, cancelScmScheduleGroup, listScmViewPresets, upsertScmViewPreset, createScmVrmaOrder, getScmVrmaOrder, getScmVrmaOptions, searchScmVrmaItems, syncScmScheduleFromDispatchPlan, createScmPurchaseOrderSplit, updateScmPurchaseOrderSplitRef, updateScmPurchaseOrderSplitDestination, updateScmPurchaseOrderSplitPickupYard, updatePurchaseOrderDispatchRef, cancelScmPurchaseOrderSplit, refreshDispatchEnrichment, reparseMissingSalesOrderDispatch, searchSalesOrderMethodOverrides, setPurchaseOrderVendorYard, updateDispatchOrderDetails, updateSalesOrderLocalMethod, getSalesOrderPoAllocationOptions, createSalesOrderPoAllocation, createSalesOrderPoAllocations, cancelSalesOrderPoAllocation, createDispatchOperatorRequest, upsertLocalCoOrder, cancelLocalCoOrder, listDispatchOperatorRequests, resolveDispatchOperatorRequestsForOrder } from "./dispatch-repository.js";
 import { setPurchaseOrderBlanketFlag } from "./dispatch-repository.js";
+import { cancelDispatchCustomOrder, canonicalizeDispatchCustomOrdersInPlan, completeDispatchCustomOrders, createDispatchCustomOrder, dispatchOrderFromCustomOrder, getDispatchCustomOrderForUpdate, listDispatchCustomOrders, updateDispatchCustomOrder } from "./dispatch-custom-order-repository.js";
 import { DISPATCH_VENDOR_WEEK_DAYS, listDispatchVendorYards, listDispatchLocalVendors, saveDispatchVendorYardSchedule, updateDispatchVendorYard, upsertDispatchVendorYard, listDispatchParserRules, updateDispatchParserRule, listOllamaAudit, listDispatchVendorMappings, discoverDispatchVendorMappingsFromPurchaseOrders, updateDispatchVendorMapping, createDispatchLocalVendor, updateDispatchLocalVendor } from "./dispatch-enrichment.js";
 import { listDispatchAudit, writeDispatchAudit } from "./dispatch-audit-repository.js";
 import { runWithAuditContext } from "./audit-context.js";
-import { DispatchPlanDateMismatchError, StaleDispatchPlanSaveError, applyDispatchPlannedAssignment, confirmDispatchPlan, createDispatchPlan, dispatchPlannedAssignmentMap, getCurrentDispatchPlan, getDispatchPlan, getDispatchPlanRevision, getDispatchPlanSnapshot, listDispatchPlanSnapshots, listDispatchPlans, reopenDispatchPlan, restoreDispatchPlanSnapshot, saveDispatchPlanSnapshot } from "./dispatch-plan-repository.js";
+import { DispatchPlanDateMismatchError, StaleDispatchPlanSaveError, applyDispatchPlannedAssignment, confirmDispatchPlan, createDispatchPlan, dispatchPlannedAssignmentMap, dispatchPlannedOrderConflictRefs, dispatchPlannedOrderRefs, getCurrentDispatchPlan, getDispatchPlan, getDispatchPlanRevision, getDispatchPlanSnapshot, listDispatchPlanSnapshots, listDispatchPlans, reopenDispatchPlan, restoreDispatchPlanSnapshot, saveDispatchPlanSnapshot } from "./dispatch-plan-repository.js";
 import { DispatchPlanEditLeaseError, acquireDispatchPlanEditLease, assertDispatchPlanEditLease, getDispatchPlanEditLease, heartbeatDispatchPlanEditLease, releaseDispatchPlanEditLease } from "./dispatch-plan-lease-repository.js";
 import { getDispatchStatistics } from "./dispatch-statistics-repository.js";
 import { DISPATCH_FLEET_PLANNING_LOCK, dispatchFleetAssignmentStatusConflicts, dispatchFleetPlanConflicts, dispatchLegacyDriverRenameConflicts, unchangedCompletedDispatchLoadIds } from "./dispatch-fleet-status.js";
@@ -36,20 +38,22 @@ import { createPhotoReadToken, createPhotoUploadToken, isR2PhotoReference, publi
 import { getPhotoArchiveSettings, isPhotoArchiveRunning, photoArchiveAutoTick, readArchivedPhoto, recoverInterruptedPhotoArchive, runPhotoArchive, updatePhotoArchiveSettings } from "./photo-archive-repository.js";
 import { authenticateDispatchDriver, ensureDispatchFleetSetup, getDispatchDriverByLogin, listDispatchDrivers, listDispatchTrucks, replaceDispatchFleetSetup, setDispatchDriverActive, setDispatchTruckActive } from "./dispatch-setup-repository.js";
 import { assertNoActiveConsolidationClaimsByRefs, confirmConsolidationItem, getActiveConsolidationBatch, getSavedConsolidationQueue, packConsolidationOrder, releaseConsolidationBatch, startSavedConsolidationBatch, updateConsolidationLine } from "./delivery-consolidation-repository.js";
-import { DEPENDENCY_YARDS, assertNoActiveOrderDependenciesByRefs, cancelOrderDependency, completeDirectDependenciesForSalesOrderDrop, confirmTransferDependencyBatch, createOrderDependency, enrichDispatchOrdersWithDependencies, generateTransferDependencySuggestion, getDependencyInventoryMatrix, getDirectPickupDependencyExecutionBlock, getOrderDependencyOptions, getSalesOrderDependencyExecutionBlock, getTransferDependencyBatch, listOrderDependencies, listTransferDependencyCandidates, markDirectDependencyPickupCompleted, mergeTransferDependencyProposals, prepareTransferDependencyPalletItem, reconcileOrderDependency, removeTransferDependencyProposalLine, reopenTransferDependencyCandidate, retryTransferDependencyBatch, reviewTransferDependencyCandidate, syncDirectDependencyOperatorProgress, syncOrderDependenciesForTransferOrder, syncOrderDependenciesFromDispatchPlan, updateOrderDependencyMode, updateTransferDependencyBatch, validateDispatchPlanDependencies } from "./order-dependency-repository.js";
+import { DEPENDENCY_YARDS, assertNoActiveOrderDependenciesByRefs, cancelOrderDependency, completeDirectDependenciesForSalesOrderDrop, confirmTransferDependencyBatch, createOrderDependency, enrichDispatchOrdersWithDependencies, generateTransferDependencySuggestion, getDependencyInventoryMatrix, getDirectPickupDependencyExecutionBlock, getOrderDependencyOptions, getSalesOrderDependencyExecutionBlock, getTransferDependencyBatch, listOrderDependencies, listTransferDependencyCandidates, markDirectDependencyPickupCompleted, mergeTransferDependencyProposals, normalDispatchGroupTargets, prepareTransferDependencyPalletItem, reconcileOrderDependency, removeTransferDependencyProposalLine, reopenTransferDependencyCandidate, retryTransferDependencyBatch, reviewTransferDependencyCandidate, syncDirectDependencyOperatorProgress, syncOrderDependenciesForTransferOrder, syncOrderDependenciesFromDispatchPlan, updateOrderDependencyMode, updateTransferDependencyBatch, validateDispatchPlanDependencies } from "./order-dependency-repository.js";
 import { activateSmartScmInputFile, importSmartScmSalesCsv, listSmartScmInputFiles, parseSmartScmVendorResponseFile, smartScmInputDownload, storeSmartScmInputFile } from "./smart-scm-import-repository.js";
 import { getSmartScmBootstrap, getSmartScmSettings, getSmartScmPlanningRun, listSmartScmForecasts, listSmartScmForecastRuns, listSmartScmPlanningRuns, listSmartScmProposals, promoteSmartScmForecastSegment, runSmartScmForecast, runSmartScmPlan, smartScmAutoTick, updateSmartScmSettings } from "./smart-scm-repository.js";
-import { getSmartScmSyncStatus, listSmartScmItems, updateSmartScmItem } from "./smart-scm-item-repository.js";
+import { buildSmartScmItemMasterCsvTemplate, getSmartScmSyncStatus, importSmartScmItemMasterCsv, listSmartScmItems, updateSmartScmItem } from "./smart-scm-item-repository.js";
 import { refreshSmartScmLiveData } from "./smart-scm-sync-service.js";
 import { completeSmartScmTransferExecution, failSmartScmTransferExecution, getSmartScmProposal, markSmartScmTransferAttention, prepareSmartScmTransferExecution, recordSmartScmVendorResponses, setSmartScmPalletQuantityOverride, updateSmartScmProposal } from "./smart-scm-planning-repository.js";
 import { createSimplePdf, leaseYardPrintJob, listSmartScmPrintJobs, listYardPrinters, queueSmartScmPrintJob, queueYardPrinterTest, retrySmartScmPrintJob, rotateYardPrinterToken, updateLeasedPrintJob, updateYardPrinter, yardPrintJobDocument } from "./smart-scm-print-repository.js";
 import { addSmartScmVendorAlternativeLine, listSmartScmNetSuitePoReviewLoads, listSmartScmVendorReplyLoads, removeSmartScmVendorAlternativeLine, saveSmartScmVendorReplyLoad, searchSmartScmVendorAlternatives, stageSmartScmVendorReplyLoad, updateSmartScmNetSuitePoReviewPalletQuantity } from "./smart-scm-vendor-repository.js";
 import { addSmartScmProposalLine, createSmartScmManualLoad, groupSmartScmProposals, recalculateSmartScmPoProposal, removeSmartScmProposalLine, searchSmartScmManualLoadItems, searchSmartScmProposalItems, splitSmartScmProposalLine, updateSmartScmProposalLine } from "./smart-scm-proposal-editor.js";
+import { addTransferDependencyProposalLine, searchTransferDependencyProposalItems } from "./transfer-dependency-manual-items.js";
 import { listSmartScmRouteRules, upsertSmartScmRouteRule } from "./smart-scm-route-repository.js";
 import { changedLockedLoadAssignments, dispatchLoadAssignment, normalizeDispatchPlanLoadAssignments, validateDispatchLoadAssignments } from "./dispatch-load-assignment.js";
 
 import { executeSmartScmPurchaseProposal } from "./smart-scm-purchase-service.js";
 import { SALES_YARDS, getSalesOrderPrintCandidate, getSalesOrderPrintSnapshot, listSalesOrderPrintCandidates, listSalesOrderPrintHistory, normalizeSalesYardLocationIds } from "./sales-repository.js";
+import { getSalesPortalSettings, isPublicSalesAccessEnabled, updateSalesPortalSettings } from "./sales-settings-repository.js";
 const app = express();
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.resolve(dirname, "../public");
@@ -65,6 +69,8 @@ const driverSessions = new Map();
 const eventClients = new Set();
 const delayedTransactionStatusRefreshes = new Map();
 const driverGeocodeCache = new Map();
+const transferDependencyAllocationRefreshAt = new Map();
+let transferDependencyAllocationRefreshQueue = Promise.resolve();
 let eventSeq = 0;
 
 const defaultDispatchSetup = {
@@ -107,7 +113,10 @@ function csvCell(value) {
   return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
 }
 
-async function sendLoadedOrdersCsv(req, res) {
+async function sendLoadedOrdersCsv(req, res, {
+  allowedYardLocationIds,
+  allowedSalesStoreLocationIds
+} = {}) {
   const rows = await listYardMovementCsvRows({
     from: req.query.from,
     to: req.query.to,
@@ -115,10 +124,16 @@ async function sendLoadedOrdersCsv(req, res) {
     search: req.query.search,
     itemSearch: req.query.itemSearch,
     direction: req.query.direction,
-    orderType: req.query.orderType
+    orderType: req.query.orderType,
+    allowedYardLocationIds,
+    allowedSalesStoreLocationIds
   });
   const csv = [
-    ["direction", "type", "order", "processed at", "yard", "party", "item ID", "SKU", "item name", "description", "processed quantity", "UOM", "PLT", "LYR", "SEC", "PCS"].map(csvCell).join(","),
+    [
+      "direction", "type", "order", "yard processed at", "last activity", "delivered at",
+      "yard", "party", "driver record only", "driver", "truck", "yard photos", "driver photos",
+      "item ID", "SKU", "item name", "description", "processed quantity", "UOM", "PLT", "LYR", "SEC", "PCS"
+    ].map(csvCell).join(","),
     ...rows.map((row) => {
       const mixed = yardMixedUnits(row);
       const unitValues = Object.fromEntries(mixed.units.map((unit) => [unit.key, unit.value]));
@@ -127,8 +142,15 @@ async function sendLoadedOrdersCsv(req, res) {
         row.order_type,
         row.order_ref,
         row.processed_at,
+        row.last_activity_at,
+        row.delivery_at,
         row.yard_location,
         row.party,
+        row.driver_only ? "yes" : "no",
+        row.driver_name,
+        row.truck_plate,
+        row.yard_photo_count,
+        row.driver_photo_count,
         row.item_id,
         row.sku,
         row.item_name,
@@ -143,7 +165,7 @@ async function sendLoadedOrdersCsv(req, res) {
     })
   ].join("\r\n");
   res.setHeader("Content-Type", "text/csv; charset=utf-8");
-  res.setHeader("Content-Disposition", `attachment; filename="yard-in-outbound-${req.query.from || "from"}-${req.query.to || "to"}.csv"`);
+  res.setHeader("Content-Disposition", `attachment; filename="in-outbound-record-${req.query.from || "from"}-${req.query.to || "to"}.csv"`);
   res.send(csv);
 }
 
@@ -152,7 +174,8 @@ function orderTransactionType(orderRef, order = {}) {
   return {
     SO: "Sales Order",
     TO: "Transfer Order",
-    PO: "Purchase Order"
+    PO: "Purchase Order",
+    CUSTOM: "Custom Order"
   }[type] || "Sales Order";
 }
 
@@ -395,36 +418,6 @@ function mergeDispatchTruckSequence(latestTrucks = [], requestedTrucks = []) {
   return merged;
 }
 
-function dispatchPlannedOrderRefs(plan = {}) {
-  const orderById = new Map((plan.orders || []).map((order) => [String(order?.id || ""), order]));
-  const refs = new Set();
-  const addRef = (value) => {
-    const ref = String(value || "").trim();
-    if (ref) refs.add(ref);
-  };
-  const addOrderRefs = (orderId) => {
-    addRef(orderId);
-    const order = orderById.get(String(orderId || ""));
-    if (!order || order.type === "CO") return;
-    addRef(order.originalOrderId);
-    for (const childId of order.childOrders || []) addRef(childId);
-    for (const child of order.childOrderDetails || []) {
-      addRef(child?.id);
-      addRef(child?.originalOrderId);
-    }
-  };
-  for (const truck of plan.trucks || []) {
-    for (const load of truck.loads || []) {
-      if (load.returnOnly) continue;
-      for (const stop of load.stops || []) {
-        if (stop?.type !== "drop" || !stop.orderId) continue;
-        addOrderRefs(stop.orderId);
-      }
-    }
-  }
-  return refs;
-}
-
 async function dispatchPlannedAssignmentsFromSnapshots() {
   const result = await query(
     `SELECT p.id, p.plan_date::text AS plan_date, p.status, s.orders, s.trucks
@@ -487,6 +480,126 @@ async function listDispatchPlannedAssignments() {
   return [...plannedAssignments.entries()]
     .map(([orderRef, details]) => ({ orderRef, ...details }))
     .sort((a, b) => String(a.orderRef).localeCompare(String(b.orderRef)));
+}
+
+async function dispatchCustomOrderActivityMap(customOrders = []) {
+  const refs = [...new Set(
+    (customOrders || []).map((order) => String(order?.refNumber || "").trim().toLowerCase()).filter(Boolean)
+  )];
+  if (!refs.length) return new Map();
+  const result = await query(
+    `SELECT lower(btrim(ref.order_ref)) AS ref_key,
+            BOOL_OR(r.status = 'complete' AND r.stop_type = 'dropoff') AS completed_dropoff,
+            BOOL_OR(r.status IN ('in_progress', 'complete')) AS has_activity,
+            MAX(COALESCE(r.completed_at, r.started_at, r.created_at)) AS last_activity_at,
+            (ARRAY_AGG(r.driver_login ORDER BY COALESCE(r.completed_at, r.started_at, r.created_at) DESC, r.id DESC))[1] AS driver_login,
+            (ARRAY_AGG(r.truck_plate ORDER BY COALESCE(r.completed_at, r.started_at, r.created_at) DESC, r.id DESC))[1] AS truck_plate
+       FROM driver_job_records r
+       CROSS JOIN LATERAL jsonb_array_elements_text(
+         CASE
+           WHEN jsonb_typeof(COALESCE(r.order_refs, '[]'::jsonb)) = 'array'
+             THEN COALESCE(r.order_refs, '[]'::jsonb)
+           ELSE '[]'::jsonb
+         END
+       ) ref(order_ref)
+      WHERE lower(btrim(ref.order_ref)) = ANY($1::text[])
+        AND r.status IN ('in_progress', 'complete')
+      GROUP BY lower(btrim(ref.order_ref))`,
+    [refs]
+  );
+  return new Map(result.rows.map((row) => [row.ref_key, row]));
+}
+
+async function dispatchCustomOrdersForManagement({ includeCancelled = true, search = "" } = {}) {
+  const customOrders = await listDispatchCustomOrders({
+    includeCancelled,
+    includeCompleted: true,
+    search
+  });
+  const [assignments, activityByRef] = await Promise.all([
+    dispatchPlannedAssignmentsFromSnapshots(),
+    dispatchCustomOrderActivityMap(customOrders)
+  ]);
+  return customOrders.map((order) => {
+    const assignment = assignments.get(String(order.refNumber || "")) || null;
+    const activity = activityByRef.get(String(order.refNumber || "").trim().toLowerCase()) || null;
+    const completed = order.status === "completed" || Boolean(activity?.completed_dropoff);
+    const planned = Boolean(assignment);
+    const locked = order.status !== "open" || planned || Boolean(activity?.has_activity);
+    const status = order.status === "cancelled"
+      ? "cancelled"
+      : completed
+        ? "completed"
+        : planned || activity?.has_activity
+          ? "planned"
+          : "open";
+    const lockedReason = order.status === "cancelled"
+      ? "Cancelled Custom Orders are read-only."
+      : completed
+        ? "This Custom Order has been delivered and is read-only."
+        : activity?.has_activity
+          ? "Driver activity has started. This Custom Order can no longer be changed."
+          : planned
+            ? `Remove this Custom Order from ${assignment.dispatchPlanDate || "its dispatch plan"} before editing or cancelling it.`
+            : "";
+    return {
+      ...order,
+      status,
+      storageStatus: order.status,
+      planned,
+      planId: assignment?.dispatchPlanId || "",
+      planDate: assignment?.dispatchPlanDate || "",
+      truckPlate: assignment?.dispatchTruckPlate || activity?.truck_plate || "",
+      loadName: assignment?.dispatchLoadName || "",
+      parkingSpot: assignment?.dispatchParkingSpot || "",
+      driverLogin: assignment?.dispatchDriverLogin || activity?.driver_login || "",
+      driverName: assignment?.dispatchDriverName || activity?.driver_login || "",
+      driverActivity: Boolean(activity?.has_activity),
+      lastActivityAt: activity?.last_activity_at || null,
+      editable: !locked,
+      canCancel: !locked,
+      lockedReason
+    };
+  });
+}
+
+async function assertDispatchCustomOrderMutable(order) {
+  if (!order) return;
+  if (order.status !== "open") {
+    throw Object.assign(new Error(
+      order.status === "completed"
+        ? "This Custom Order has already been delivered and cannot be changed."
+        : "Cancelled Custom Orders cannot be changed."
+    ), { status: 409, code: "DISPATCH_CUSTOM_ORDER_NOT_EDITABLE" });
+  }
+  const assignments = await dispatchPlannedAssignmentsFromSnapshots();
+  const assignment = assignments.get(String(order.refNumber || ""));
+  if (assignment) {
+    throw Object.assign(new Error(
+      `Remove ${order.refNumber} from the ${assignment.dispatchPlanDate || "current"} dispatch plan before editing or cancelling it.`
+    ), {
+      status: 409,
+      code: "DISPATCH_CUSTOM_ORDER_PLANNED",
+      assignment
+    });
+  }
+  const activity = await dispatchCustomOrderActivityMap([order]);
+  if (activity.get(String(order.refNumber || "").trim().toLowerCase())?.has_activity) {
+    throw Object.assign(new Error(
+      `Driver activity has started for ${order.refNumber}. It can no longer be edited or cancelled.`
+    ), { status: 409, code: "DISPATCH_CUSTOM_ORDER_DRIVER_ACTIVITY" });
+  }
+}
+
+async function assertNoSnapshotDispatchRefCollision(refNumber) {
+  const refKey = String(refNumber || "").trim().toLowerCase();
+  if (!refKey) return;
+  const snapshotOrders = await listDispatchSnapshotDerivedOrders();
+  const collision = snapshotOrders.find((order) => String(order?.id || "").trim().toLowerCase() === refKey);
+  if (!collision) return;
+  throw Object.assign(new Error(
+    `Reference ${refNumber} is already used by dispatch order ${collision.id}. Choose a unique reference number.`
+  ), { status: 409, code: "DISPATCH_CUSTOM_ORDER_REF_EXISTS" });
 }
 
 function isSnapshotDerivedDispatchOrder(order = {}) {
@@ -583,12 +696,27 @@ function dispatchOrderMatchesSearch(order = {}, search = "") {
 
 async function listDispatchOrdersForResponse({ type = null, search = "" } = {}) {
   const searchTerm = String(search || "").trim().slice(0, 120);
-  const orders = await listDispatchOrders({ type, search: searchTerm });
-  const snapshotOrders = await listDispatchSnapshotDerivedOrders({ type });
+  const requestedType = String(type || "").trim().toUpperCase();
+  const includeCustom = !requestedType || requestedType === "TO" || requestedType === "CUSTOM";
+  const [orders, customOrders, snapshotOrders] = await Promise.all([
+    listDispatchOrders({ type, search: searchTerm }),
+    includeCustom
+      ? listDispatchCustomOrders({
+          includeCancelled: false,
+          includeCompleted: false,
+          search: searchTerm
+        })
+      : Promise.resolve([]),
+    listDispatchSnapshotDerivedOrders({ type })
+  ]);
+  const currentOrders = [
+    ...orders,
+    ...customOrders.map(dispatchOrderFromCustomOrder)
+  ];
   const derivedOrders = searchTerm
     ? snapshotOrders.filter((order) => dispatchOrderMatchesSearch(order, searchTerm))
     : snapshotOrders;
-  const assigned = await enrichDispatchOrdersWithPlanAssignments(mergeDispatchOrderFeedWithSnapshotDerivedOrders(orders, derivedOrders));
+  const assigned = await enrichDispatchOrdersWithPlanAssignments(mergeDispatchOrderFeedWithSnapshotDerivedOrders(currentOrders, derivedOrders));
   const poLinked = await enrichDispatchOrdersWithPoTargetAllocations(assigned);
   const enriched = await enrichDispatchOrdersWithDependencies(poLinked);
   return searchTerm ? enriched.filter((order) => dispatchOrderMatchesSearch(order, searchTerm)) : enriched;
@@ -614,6 +742,74 @@ async function transferDependencyRestPayload({ proposal, batch }) {
     intercompany: locations.intercompany,
     locations
   };
+}
+
+const TRANSFER_DEPENDENCY_ALLOCATION_TTL_MS = 60 * 1000;
+
+async function transferDependencyAllocationOrderIds(salesOrderId = null) {
+  const requestedId = Number(salesOrderId);
+  if (salesOrderId !== null && salesOrderId !== undefined && (!Number.isSafeInteger(requestedId) || requestedId <= 0)) {
+    throw Object.assign(new Error("A valid Sales Order ID is required."), { status: 400 });
+  }
+  const result = await query(
+    `SELECT DISTINCT o.netsuite_id
+       FROM sales_orders o
+       JOIN sales_order_lines l ON l.sales_order_id = o.netsuite_id
+      WHERE o.netsuite_id > 0
+        AND COALESCE(o.netsuite_active, true) = true
+        AND COALESCE(l.netsuite_active, true) = true
+        AND COALESCE(o.fulfillment_status, '') NOT IN ('fulfilled', 'shipped')
+        AND (
+          $1::bigint IS NOT NULL
+          OR COALESCE(l.netsuite_backordered_qty, 0) > 0.000001
+        )
+        AND ($1::bigint IS NULL OR o.netsuite_id = $1)
+      ORDER BY o.netsuite_id
+      LIMIT 500`,
+    [salesOrderId === null || salesOrderId === undefined ? null : requestedId]
+  );
+  return result.rows.map((row) => Number(row.netsuite_id)).filter(Number.isSafeInteger);
+}
+
+async function refreshTransferDependencySalesOrderAllocations({
+  salesOrderId = null,
+  force = false
+} = {}) {
+  if (!config.netsuite.directAccessEnabled) return { refreshed: 0, skipped: "direct_access_disabled" };
+  const ids = await transferDependencyAllocationOrderIds(salesOrderId);
+  const cutoff = Date.now() - TRANSFER_DEPENDENCY_ALLOCATION_TTL_MS;
+  const dueIds = ids.filter((id) => force || Number(transferDependencyAllocationRefreshAt.get(id) || 0) < cutoff);
+  if (!dueIds.length) return { refreshed: 0, cached: ids.length };
+
+  const run = async () => {
+    const stillDue = dueIds.filter((id) => force || Number(transferDependencyAllocationRefreshAt.get(id) || 0) < cutoff);
+    if (!stillDue.length) return { refreshed: 0, cached: dueIds.length };
+    const linesByOrderId = await fetchDeliveryOrderDetailsBatchFromNetSuite(stillDue);
+    for (const orderId of stillDue) {
+      const lines = linesByOrderId.get(orderId) || [];
+      await upsertSalesOrderLines(orderId, lines);
+      await markMissingOutboundOrderLines(orderId, lines.map((line) => line.line_id));
+      transferDependencyAllocationRefreshAt.set(orderId, Date.now());
+    }
+    return { refreshed: stillDue.length };
+  };
+  const result = transferDependencyAllocationRefreshQueue.then(run, run);
+  transferDependencyAllocationRefreshQueue = result.catch(() => {});
+  return result;
+}
+
+async function refreshTransferDependencyBatchSalesOrderAllocations(batchId, { force = true } = {}) {
+  const result = await query(
+    `SELECT sales_order_id
+       FROM scm_transfer_dependency_batches
+      WHERE id = $1`,
+    [Number(batchId)]
+  );
+  if (!result.rowCount) throw Object.assign(new Error("Dependency batch not found."), { status: 404 });
+  return refreshTransferDependencySalesOrderAllocations({
+    salesOrderId: result.rows[0].sales_order_id,
+    force
+  });
 }
 
 function transferDependencyExpectedItemQuantities(proposal = {}) {
@@ -1188,9 +1384,8 @@ async function findDispatchPlanDateConflicts({ planId, planDate, orders = [], tr
   );
   const conflicts = [];
   for (const row of result.rows) {
-    const otherRefs = dispatchPlannedOrderRefs({ orders: row.orders || [], trucks: row.trucks || [] });
-    for (const ref of currentRefs) {
-      if (!otherRefs.has(ref)) continue;
+    const otherPlan = { orders: row.orders || [], trucks: row.trucks || [] };
+    for (const ref of dispatchPlannedOrderConflictRefs({ orders, trucks }, otherPlan)) {
       conflicts.push({
         orderRef: ref,
         planId: String(row.id),
@@ -2343,6 +2538,90 @@ async function requireOperator(req, res, next) {
   }
 }
 
+function publicSalesOperator() {
+  return {
+    id: null,
+    username: "public-sales",
+    display_name: "Public Sales",
+    role: "sales",
+    roles: ["sales"],
+    yardLocationIds: SALES_YARDS.map((yard) => yard.locationId),
+    publicSales: true
+  };
+}
+
+const SALES_PRINT_PREVIEW_TTL_MS = 15 * 60 * 1000;
+const SALES_PRINT_PREVIEW_LIMIT = 30;
+const salesPrintPreviews = new Map();
+
+function pruneSalesPrintPreviews() {
+  const now = Date.now();
+  for (const [token, preview] of salesPrintPreviews) {
+    if (preview.expiresAt <= now) salesPrintPreviews.delete(token);
+  }
+}
+
+function storeSalesPrintPreview({ orderId, lineLocationId, document }) {
+  pruneSalesPrintPreviews();
+  while (salesPrintPreviews.size >= SALES_PRINT_PREVIEW_LIMIT) {
+    salesPrintPreviews.delete(salesPrintPreviews.keys().next().value);
+  }
+  const token = crypto.randomUUID();
+  salesPrintPreviews.set(token, {
+    orderId: String(orderId),
+    lineLocationId: Number(lineLocationId),
+    document: {
+      buffer: document.buffer,
+      contentType: document.contentType,
+      filename: document.filename,
+      locationApplied: document.locationApplied
+    },
+    expiresAt: Date.now() + SALES_PRINT_PREVIEW_TTL_MS
+  });
+  return token;
+}
+
+function getSalesPrintPreview(token, { orderId, lineLocationId }) {
+  pruneSalesPrintPreviews();
+  const key = String(token || "").trim();
+  const preview = salesPrintPreviews.get(key);
+  if (!preview
+      || preview.orderId !== String(orderId)
+      || preview.lineLocationId !== Number(lineLocationId)) {
+    throw Object.assign(new Error("This picking-ticket preview expired. Close it and preview the Sales Order again."), { status: 409 });
+  }
+  return preview.document;
+}
+
+async function requireOperatorOrPublicSalesRead(req, res, next) {
+  try {
+    const publicSalesRequest = req.method === "GET"
+      && req.get("x-mbbs-sales-public") === "1"
+      && await isPublicSalesAccessEnabled();
+    if (publicSalesRequest) {
+      req.operator = publicSalesOperator();
+      req.publicSalesAccess = true;
+      return next();
+    }
+    return requireOperator(req, res, next);
+  } catch (error) {
+    next(error);
+  }
+}
+
+async function requireSalesOperator(req, res, next) {
+  try {
+    if (!req.get("authorization") && await isPublicSalesAccessEnabled()) {
+      req.operator = publicSalesOperator();
+      req.publicSalesAccess = true;
+      return next();
+    }
+    return requireOperator(req, res, next);
+  } catch (error) {
+    next(error);
+  }
+}
+
 function requireAdmin(req, res, next) {
   if (!operatorHasAnyRole(req.operator, ["admin"])) return sendRoleForbidden(res, req.operator, "Admin account required");
   next();
@@ -2450,9 +2729,22 @@ function requireSalesAccess(req, res, next) {
   return sendRoleForbidden(res, req.operator, "Sales account required");
 }
 
+function requirePrivateSalesRecordAccess(req, res, next) {
+  if (req.publicSalesAccess || req.operator?.publicSales || !req.operator?.id) {
+    return res.status(403).json({ error: "Staff Sales login required.", redirect: "/sales" });
+  }
+  next();
+}
+
 function operatorSalesYardLocationIds(operator) {
   if (operatorHasAnyRole(operator, ["admin"])) return SALES_YARDS.map((yard) => yard.locationId);
   return normalizeSalesYardLocationIds(operator?.yardLocationIds || []);
+}
+
+function movementAllowedYardLocationIds(req) {
+  return operatorHasAnyRole(req.operator, ["sales"])
+    ? operatorSalesYardLocationIds(req.operator)
+    : undefined;
 }
 
 function operatorSalesYardCodes(operator) {
@@ -2470,6 +2762,30 @@ function requireSalesPrintDestination(value) {
     throw Object.assign(new Error("Select a valid Sales printer destination."), { status: 400 });
   }
   return locationId;
+}
+
+function optionalSalesPrintCompanyName(value) {
+  const companyName = String(value || "")
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (companyName.length > 120) {
+    throw Object.assign(new Error("Company name must be 120 characters or fewer."), { status: 400 });
+  }
+  return companyName;
+}
+
+function normalizedSalesPrintIp(value) {
+  const ip = String(value || "")
+    .trim()
+    .replace(/^::ffff:/i, "");
+  return isIP(ip) ? ip.slice(0, 128) : "";
+}
+
+function salesPrintRequestIp(req) {
+  return normalizedSalesPrintIp(req.get?.("cf-connecting-ip"))
+    || normalizedSalesPrintIp(req.ip)
+    || normalizedSalesPrintIp(req.socket?.remoteAddress);
 }
 
 async function salesOrderPrintContext(req, lineLocationValue) {
@@ -2858,10 +3174,10 @@ function dispatchOrderStructureState(plan = {}) {
   for (const order of plan.orders || []) {
     const id = String(order?.id || "").trim();
     if (!id) continue;
-    const childRefs = [
+    const childRefs = [...new Set([
       ...(order?.childOrders || []),
       ...(order?.childOrderDetails || []).flatMap((child) => [child?.id, child?.originalOrderId])
-    ].map((value) => String(value || "").trim()).filter(Boolean).sort();
+    ].map((value) => String(value || "").trim()).filter(Boolean))].sort();
     const parentRef = String(order?.originalOrderId || "").trim();
     if (childRefs.length) {
       const token = `group:${id}:${childRefs.join("|")}`;
@@ -2905,25 +3221,45 @@ function changedDispatchOrderStructureRefs(previousPlan = {}, nextPlan = {}) {
 }
 
 export function safeNormalDependencyGroupingRefs(previousPlan = {}, nextPlan = {}) {
+  return safeNormalDependencyGroupingTargets(previousPlan, nextPlan)
+    .map((target) => target.sourceOrderRef);
+}
+
+export function safeNormalDependencyGroupingTargets(previousPlan = {}, nextPlan = {}) {
   const before = dispatchOrderStructureState(previousPlan);
+  return [...normalDispatchGroupTargets(nextPlan).entries()]
+    .filter(([sourceOrderRef]) => before.membership.get(sourceOrderRef) === "normal")
+    .map(([sourceOrderRef, groupRef]) => ({ sourceOrderRef, groupRef }));
+}
+
+export function safeEstablishedDependencyUngroupingTargets(previousPlan = {}, nextPlan = {}) {
   const after = dispatchOrderStructureState(nextPlan);
-  const refs = [];
-  for (const [ref, beforeToken] of before.membership.entries()) {
-    const afterToken = after.membership.get(ref) || "";
-    if (beforeToken === "normal" && afterToken.startsWith("group:")) refs.push(ref);
-  }
-  return refs;
+  const nextGroupTargets = normalDispatchGroupTargets(nextPlan);
+  return [...normalDispatchGroupTargets(previousPlan).entries()]
+    .filter(([sourceOrderRef]) =>
+      after.membership.get(sourceOrderRef) === "normal"
+      && !nextGroupTargets.has(sourceOrderRef)
+    )
+    .map(([sourceOrderRef, groupRef]) => ({ sourceOrderRef, groupRef }));
 }
 
 async function assertNoConsolidationStructureConflict(previousPlan, nextPlan) {
   const changedRefs = changedDispatchOrderStructureRefs(previousPlan, nextPlan);
-  if (!changedRefs.length) return;
+  const safeGroupingTargets = safeNormalDependencyGroupingTargets(previousPlan, nextPlan);
+  const safeUngroupTargets = safeEstablishedDependencyUngroupingTargets(previousPlan, nextPlan);
+  const result = { safeGroupingTargets, safeUngroupTargets };
+  if (!changedRefs.length) return result;
   await assertNoActiveConsolidationClaimsByRefs(changedRefs, "group, ungroup, split, or unsplit these orders");
   await assertNoActiveOrderDependenciesByRefs(
     changedRefs,
     "group, ungroup, split, or unsplit these orders",
-    { allowNormalGroupingRefs: safeNormalDependencyGroupingRefs(previousPlan, nextPlan) }
+    {
+      allowNormalGroupingRefs: safeGroupingTargets.map((target) => target.sourceOrderRef),
+      allowEstablishedGroupTargets: safeGroupingTargets,
+      allowEstablishedUngroupTargets: safeUngroupTargets
+    }
   );
+  return result;
 }
 
 function normalizeOrderType(value) {
@@ -4635,7 +4971,7 @@ app.use((req, res, next) => {
     res.setHeader("Service-Worker-Allowed", "/");
   } else if (["/scm/netsuite-po", "/scm-netsuite-po.html", "/scm/vendors", "/scm-vendors.html"].includes(req.path)) {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-  } else if (req.path.endsWith(".webmanifest") || ["/", "/operator", "/driver", "/control", "/admin", "/admin/printers", "/dispatch", "/sales", "/sales/planning", "/sales/schedule", "/sales/monitor", "/sales/printing", "/dispatch/loaded-export", "/dispatch/po-to-schedule", "/scm/smart", "/scm/printers", "/scm/route-rules", "/operator.html", "/driver.html", "/control.html", "/admin.html", "/dispatch-menu.html", "/sales.html", "/sales-printing.html", "/dispatch-loaded-export.html", "/scm-smart.html", "/scm-printers.html", "/scm-route-rules.html"].includes(req.path)) {
+  } else if (req.path.endsWith(".webmanifest") || ["/", "/operator", "/driver", "/control", "/admin", "/admin/accounts", "/admin/sync", "/admin/printers", "/admin/photo-storage", "/admin/audit", "/dispatch", "/dispatch/custom-orders", "/sales", "/sales/planning", "/sales/schedule", "/sales/monitor", "/sales/printing", "/sales/in-outbound-record", "/dispatch/loaded-export", "/dispatch/in-outbound-record", "/control/in-outbound-record", "/dispatch/po-to-schedule", "/scm/smart", "/scm/printers", "/scm/route-rules", "/operator.html", "/driver.html", "/control.html", "/admin.html", "/dispatch-menu.html", "/dispatch-custom-orders.html", "/sales.html", "/sales-printing.html", "/dispatch-loaded-export.html", "/scm-smart.html", "/scm-printers.html", "/scm-route-rules.html"].includes(req.path)) {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   }
   next();
@@ -4706,14 +5042,14 @@ app.post("/api/scm/print-agent/jobs/:id/:action", async (req, res, next) => {
       req.params.action,
       req.body || {}
     );
-    if (job.documentType === "transfer_dependency_picking_ticket") {
+    if (req.params.action !== "heartbeat" && job.documentType === "transfer_dependency_picking_ticket") {
       emitAppEvent("scm.transfer_dependency.updated", {
         source: "transfer-dependency-print-agent",
         printJobId: job.id,
         printStatus: job.status
       });
     }
-    if (job.documentType === "sales_order_picking_ticket") {
+    if (req.params.action !== "heartbeat" && job.documentType === "sales_order_picking_ticket") {
       emitAppEvent("sales.printing.updated", {
         source: "sales-print-agent",
         printJobId: job.id,
@@ -4783,12 +5119,42 @@ app.post("/api/scm/smart/model-segments", requireSmartScmWriteAccess, async (req
   }
 });
 
+app.get("/api/scm/smart/items/csv-template", async (_req, res, next) => {
+  try {
+    const csv = await buildSmartScmItemMasterCsvTemplate();
+    res.type("text/csv");
+    res.setHeader("Content-Disposition", 'attachment; filename="smart-scm-item-master-template.csv"');
+    res.send(csv);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/smart/items/csv", requireSmartScmWriteAccess, smartScmRawUpload, async (req, res, next) => {
+  try {
+    const summary = await importSmartScmItemMasterCsv({
+      buffer: requiredRawUpload(req),
+      filename: req.get("x-file-name") || "smart-scm-item-master.csv",
+      operatorId: operatorId(req)
+    });
+    emitAppEvent("scm.smart.updated", {
+      source: "item-master-csv",
+      itemsUpdated: summary.itemsUpdated,
+      yardPoliciesUpdated: summary.yardPoliciesUpdated
+    });
+    res.json(summary);
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/scm/smart/items", async (req, res, next) => {
   try {
     res.json(await listSmartScmItems({
       search: req.query.search,
       enabled: req.query.enabled,
       vendorYard: req.query.vendorYard,
+      lowerStockPolicy: req.query.lowerStockPolicy,
       limit: req.query.limit,
       offset: req.query.offset
     }));
@@ -5343,9 +5709,22 @@ app.post("/api/scm/smart/print-jobs/:id/retry", requireSmartScmWriteAccess, asyn
   }
 });
 
+app.get("/api/sales/public-access", async (_req, res, next) => {
+  try {
+    const settings = await getSalesPortalSettings();
+    res.setHeader("Cache-Control", "no-store");
+    res.json({
+      enabled: settings.enabled,
+      operator: settings.enabled ? publicSalesOperator() : null
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.use("/api/scm", requireOperator, requireScmAccess);
-app.use("/api/dispatch", requireOperator, requireDispatchAccess);
-app.use("/api/sales", requireOperator, requireSalesAccess);
+app.use("/api/dispatch", requireOperatorOrPublicSalesRead, requireDispatchAccess);
+app.use("/api/sales", requireSalesOperator, requireSalesAccess);
 
 async function scmVendorManagementPayload() {
   const [vendors, yards] = await Promise.all([
@@ -5557,6 +5936,50 @@ function salesScheduleRowMatchesYards(row, yardCodes = []) {
   return yardCodes.some((yardCode) => new RegExp(`(^|[^0-9])${yardCode}([^0-9]|$)`).test(route));
 }
 
+app.get("/api/sales/in-outbound-records", requirePrivateSalesRecordAccess, async (req, res, next) => {
+  try {
+    res.json(await listYardMovements({
+      from: req.query.from,
+      to: req.query.to,
+      yard: req.query.yard,
+      search: req.query.search,
+      itemSearch: req.query.itemSearch,
+      direction: req.query.direction,
+      orderType: req.query.orderType,
+      allowedSalesStoreLocationIds: operatorSalesYardLocationIds(req.operator)
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/sales/in-outbound-records/detail", requirePrivateSalesRecordAccess, async (req, res, next) => {
+  try {
+    const detail = await getYardMovementDetail({
+      direction: req.query.direction,
+      orderType: req.query.orderType,
+      orderId: req.query.orderId,
+      from: req.query.from,
+      to: req.query.to,
+      allowedSalesStoreLocationIds: operatorSalesYardLocationIds(req.operator)
+    });
+    if (!detail) return res.status(404).json({ error: "In/Outbound record not found." });
+    return res.json(detail);
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.get("/api/sales/in-outbound-records/export.csv", requirePrivateSalesRecordAccess, async (req, res, next) => {
+  try {
+    await sendLoadedOrdersCsv(req, res, {
+      allowedSalesStoreLocationIds: operatorSalesYardLocationIds(req.operator)
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/sales/schedule-presets", async (req, res, next) => {
   try {
     const presets = await listScmViewPresets();
@@ -5692,6 +6115,11 @@ app.get("/api/sales/sales-orders/:id/picking-ticket-preview", async (req, res, n
     res.setHeader("Content-Disposition", `inline; filename="${filename}"`);
     res.setHeader("X-MBBS-Print-Yard", printer.yardCode || "");
     res.setHeader("X-MBBS-Line-Yard", lineYard.yardCode || "");
+    res.setHeader("X-MBBS-Print-Preview-Token", storeSalesPrintPreview({
+      orderId: candidate.orderId,
+      lineLocationId,
+      document: { ...document, filename }
+    }));
     res.send(document.buffer);
   } catch (error) {
     next(error);
@@ -5700,6 +6128,9 @@ app.get("/api/sales/sales-orders/:id/picking-ticket-preview", async (req, res, n
 
 app.post("/api/sales/sales-orders/:id/print", async (req, res, next) => {
   try {
+    const requestedCompanyName = optionalSalesPrintCompanyName(req.body?.companyName);
+    const requestedIpAddress = salesPrintRequestIp(req);
+    const previewToken = String(req.body?.previewToken || "").trim();
     const { candidate, lineYard, lineLocationId, printer, printerLocationId } = await salesOrderPrintContext(
       req,
       req.body?.lineLocationId ?? req.body?.printerLocationId ?? req.body?.locationId
@@ -5707,10 +6138,12 @@ app.post("/api/sales/sales-orders/:id/print", async (req, res, next) => {
     if (!printer.salesOrderReady) {
       throw Object.assign(new Error(`${printer.yardCode} requires exactly one printer assigned to SO printing, an enabled yard queue, and an agent token.`), { status: 409 });
     }
-    const document = await fetchPickingTicketFromNetSuite(candidate.orderId, {
-      locationId: lineLocationId,
-      filenamePrefix: candidate.orderRef || "SO"
-    });
+    const document = previewToken
+      ? getSalesPrintPreview(previewToken, { orderId: candidate.orderId, lineLocationId })
+      : await fetchPickingTicketFromNetSuite(candidate.orderId, {
+          locationId: lineLocationId,
+          filenamePrefix: candidate.orderRef || "SO"
+        });
     if (candidate.lineYards.length > 1 && !document.locationApplied) {
       throw Object.assign(new Error("NetSuite did not confirm the selected line-yard filter. Printing was blocked to prevent the wrong yard ticket."), { status: 409 });
     }
@@ -5722,10 +6155,14 @@ app.post("/api/sales/sales-orders/:id/print", async (req, res, next) => {
       jobKey: `sales:${candidate.orderId}:${lineLocationId}:${Date.now()}:${crypto.randomUUID()}`,
       sourceOrderId: candidate.orderId,
       sourceOrderRef: candidate.orderRef,
-      lineLocationId
-    }, req.operator.id);
+      lineLocationId,
+      requestedCompanyName,
+      requestedIpAddress
+    }, req.operator?.id || null);
+    if (previewToken) salesPrintPreviews.delete(previewToken);
     await writeAudit({
-      actorOperatorId: req.operator.id,
+      actorType: req.operator?.id ? "operator" : "anonymous",
+      actorOperatorId: req.operator?.id || null,
       source: "sales",
       action: "sales.sales_order_picking_ticket.queued",
       orderId: candidate.orderId,
@@ -5737,6 +6174,8 @@ app.post("/api/sales/sales-orders/:id/print", async (req, res, next) => {
         lineYardCode: lineYard.yardCode,
         printerLocationId,
         printerYardCode: printer.yardCode,
+        requestedCompanyName,
+        requestedIpAddress,
         printJobId: printJob.id
       }
     });
@@ -5947,12 +6386,19 @@ app.post("/api/dispatch/plan-snapshots/:snapshotId/restore", requireOperator, re
     if (!beforePlan) return res.status(404).json({ error: "Dispatch snapshot not found" });
     await requireDispatchPlanEditLease(req, beforePlan.planDate);
     const currentPlanBeforeRestore = await getDispatchPlan(beforePlan.planId);
-    const restoreCandidate = normalizeDispatchPlanLoadAssignments({
+    let restoreCandidate = normalizeDispatchPlanLoadAssignments({
       ...currentPlanBeforeRestore,
       planDate: beforePlan.planDate,
       orders: beforePlan.orders || [],
       trucks: beforePlan.rawTrucks || []
     });
+    restoreCandidate = await canonicalizeDispatchCustomOrdersInPlan(restoreCandidate, {
+      previousPlan: currentPlanBeforeRestore
+    });
+    const dependencyStructureChanges = await assertNoConsolidationStructureConflict(
+      currentPlanBeforeRestore,
+      restoreCandidate
+    );
     const assignmentConflicts = await dispatchLoadAssignmentConflicts(currentPlanBeforeRestore, restoreCandidate, {
       requireAssignments: String(currentPlanBeforeRestore?.status || "") === "confirmed"
     });
@@ -5963,7 +6409,9 @@ app.post("/api/dispatch/plan-snapshots/:snapshotId/restore", requireOperator, re
       sessionId: req.body?.audit?.sessionId || ""
     });
     const plan = restored.plan;
-    await syncOrderDependenciesFromDispatchPlan(plan);
+    await syncOrderDependenciesFromDispatchPlan(plan, {
+      allowEstablishedUngroupTargets: dependencyStructureChanges.safeUngroupTargets
+    });
     const coAssignments = await applyDispatchPlanCoAssignments(plan);
     const scmSchedule = await syncScmScheduleFromDispatchPlan(plan, { updatedBy: req.body?.audit?.sessionId || "dispatch-plan-save" }).catch(() => null);
     const changedOperatorRefs = [...dispatchOperatorAssignmentMap(plan).keys()];
@@ -6064,10 +6512,10 @@ app.put("/api/dispatch/plans/:id", requireOperator, requireDispatcher, async (re
       });
     }
     const saveMode = dispatchPlanSaveMode(req.body);
-    const requestedOrders = sanitizeDispatchPlanOrders(Array.isArray(req.body?.orders) ? req.body.orders : []);
+    const requestedOrders = Array.isArray(req.body?.orders) ? req.body.orders : [];
     const requestedTrucks = Array.isArray(req.body?.trucks) ? req.body.trucks : [];
-    const cleanOrders = saveMode === "truck_sequence" && previousPlan
-      ? sanitizeDispatchPlanOrders(previousPlan.orders || [])
+    let cleanOrders = saveMode === "truck_sequence" && previousPlan
+      ? previousPlan.orders || []
       : requestedOrders;
     let cleanTrucks = saveMode === "truck_sequence" && previousPlan
       ? mergeDispatchTruckSequence(previousPlan.trucks || [], requestedTrucks)
@@ -6075,9 +6523,20 @@ app.put("/api/dispatch/plans/:id", requireOperator, requireDispatcher, async (re
     if (config.dispatch?.driverOrientedPlanning) {
       cleanTrucks = normalizeDispatchPlanLoadAssignments({ ...previousPlan, trucks: cleanTrucks }).trucks;
     }
+    const canonicalCandidate = await canonicalizeDispatchCustomOrdersInPlan({
+      ...previousPlan,
+      planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date,
+      orders: cleanOrders,
+      trucks: cleanTrucks
+    }, { previousPlan });
+    cleanOrders = sanitizeDispatchPlanOrders(canonicalCandidate.orders || []);
+    cleanTrucks = canonicalCandidate.trucks || [];
     const duplicateDrivers = config.dispatch?.driverOrientedPlanning ? [] : dispatchDuplicateDriverAssignments(cleanTrucks);
     if (duplicateDrivers.length) return sendDispatchDuplicateDriverResponse(res, duplicateDrivers);
-    await assertNoConsolidationStructureConflict(previousPlan, { orders: cleanOrders });
+    const dependencyStructureChanges = await assertNoConsolidationStructureConflict(
+      previousPlan,
+      { orders: cleanOrders }
+    );
     const explicitOperatorAlertRefs = Array.isArray(req.body?.audit?.details?.operatorAlertRefs)
       ? req.body.audit.details.operatorAlertRefs.map((ref) => String(ref || "").trim()).filter(Boolean)
       : [];
@@ -6141,7 +6600,9 @@ app.put("/api/dispatch/plans/:id", requireOperator, requireDispatcher, async (re
       stage: "order_dependencies",
       code: "DISPATCH_PLAN_DEPENDENCY_SYNC_FAILED",
       label: "Order dependency synchronization"
-    }, () => syncOrderDependenciesFromDispatchPlan(plan));
+    }, () => syncOrderDependenciesFromDispatchPlan(plan, {
+      allowEstablishedUngroupTargets: dependencyStructureChanges.safeUngroupTargets
+    }));
     const coAssignments = await runDispatchPlanPostCommitFollowup({
       ...followupContext,
       stage: "co_assignments",
@@ -6255,6 +6716,7 @@ app.post("/api/dispatch/plans/:id/confirm", requireOperator, requireDispatcher, 
     await requireDispatchPlanEditLease(req, previousPlan.planDate);
     const hasSubmittedSnapshot = Array.isArray(req.body?.orders) || Array.isArray(req.body?.trucks);
     let planForConfirm = previousPlan;
+    let dependencyStructureChanges = { safeGroupingTargets: [], safeUngroupTargets: [] };
     if (hasSubmittedSnapshot) {
       const requestedPlanDate = String(req.body?.planDate || req.body?.date || previousPlan?.planDate || "").slice(0, 10);
       const existingPlanDate = String(previousPlan?.planDate || "").slice(0, 10);
@@ -6265,14 +6727,25 @@ app.post("/api/dispatch/plans/:id/confirm", requireOperator, requireDispatcher, 
           payloadPlanDate: requestedPlanDate
         });
       }
-      const requestedOrders = sanitizeDispatchPlanOrders(Array.isArray(req.body?.orders) ? req.body.orders : previousPlan.orders || []);
+      let requestedOrders = Array.isArray(req.body?.orders) ? req.body.orders : previousPlan.orders || [];
       let requestedTrucks = Array.isArray(req.body?.trucks) ? req.body.trucks : previousPlan.trucks || [];
       if (config.dispatch?.driverOrientedPlanning) {
         requestedTrucks = normalizeDispatchPlanLoadAssignments({ ...previousPlan, trucks: requestedTrucks }).trucks;
       }
+      const canonicalCandidate = await canonicalizeDispatchCustomOrdersInPlan({
+        ...previousPlan,
+        planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date,
+        orders: requestedOrders,
+        trucks: requestedTrucks
+      }, { previousPlan });
+      requestedOrders = sanitizeDispatchPlanOrders(canonicalCandidate.orders || []);
+      requestedTrucks = canonicalCandidate.trucks || [];
       const duplicateDrivers = config.dispatch?.driverOrientedPlanning ? [] : dispatchDuplicateDriverAssignments(requestedTrucks);
       if (duplicateDrivers.length) return sendDispatchDuplicateDriverResponse(res, duplicateDrivers);
-      await assertNoConsolidationStructureConflict(previousPlan, { orders: requestedOrders });
+      dependencyStructureChanges = await assertNoConsolidationStructureConflict(
+        previousPlan,
+        { orders: requestedOrders }
+      );
       const dateConflicts = await findNewDispatchPlanDateConflicts(previousPlan || {}, {
         id: req.params.id,
         planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date,
@@ -6335,7 +6808,9 @@ app.post("/api/dispatch/plans/:id/confirm", requireOperator, requireDispatcher, 
       stage: "order_dependencies",
       code: "DISPATCH_PLAN_DEPENDENCY_SYNC_FAILED",
       label: "Order dependency synchronization"
-    }, () => syncOrderDependenciesFromDispatchPlan(plan));
+    }, () => syncOrderDependenciesFromDispatchPlan(plan, {
+      allowEstablishedUngroupTargets: dependencyStructureChanges.safeUngroupTargets
+    }));
     const coAssignments = await runDispatchPlanPostCommitFollowup({
       ...followupContext,
       stage: "co_assignments",
@@ -6637,6 +7112,159 @@ app.get("/api/dispatch/orders", async (req, res, next) => {
   }
 });
 
+app.get("/api/dispatch/custom-orders", requireDispatcher, async (req, res, next) => {
+  try {
+    const includeCancelled = String(req.query.includeCancelled ?? "true").toLowerCase() !== "false";
+    res.json(await dispatchCustomOrdersForManagement({
+      includeCancelled,
+      search: req.query.search || ""
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+function dispatchCustomOrderId(value) {
+  const id = String(value || "").trim();
+  const numericId = Number(id);
+  if (!/^\d+$/.test(id) || !Number.isSafeInteger(numericId) || numericId <= 0) {
+    throw Object.assign(new Error("A valid Custom Order ID is required."), {
+      status: 400,
+      code: "DISPATCH_CUSTOM_ORDER_ID_INVALID"
+    });
+  }
+  return id;
+}
+
+app.post("/api/dispatch/custom-orders", requireDispatcher, async (req, res, next) => {
+  try {
+    const actor = req.operator?.display_name || req.operator?.username || operatorId(req);
+    const created = await withDispatchFleetPlanningLock(async () => {
+      await assertNoSnapshotDispatchRefCollision(req.body?.refNumber ?? req.body?.ref_number);
+      return createDispatchCustomOrder(req.body || {}, actor);
+    });
+    const managementRows = await dispatchCustomOrdersForManagement({
+      includeCancelled: true,
+      search: created.refNumber
+    });
+    const order = managementRows.find((row) => String(row.id) === String(created.id)) || created;
+    await writeDispatchAudit({
+      action: "dispatch_custom_order_created",
+      entityType: "custom_order",
+      entityId: created.id,
+      orderId: created.refNumber,
+      operatorId: req.operator?.id,
+      operatorName: actor,
+      source: "dispatch",
+      after: created,
+      details: {
+        pickupLocation: created.pickupLocation,
+        dropoffLocation: created.dropoffLocation,
+        weightLbs: created.weightLbs
+      }
+    }).catch(() => null);
+    emitAppEvent("dispatch.orders.updated", {
+      source: "custom-order",
+      change: "custom_order_created",
+      orderId: created.refNumber,
+      refreshOrderPool: true
+    });
+    res.status(201).json({ order: order || created });
+  } catch (error) {
+    next(error);
+  }
+});
+
+async function updateDispatchCustomOrderRoute(req, res, next) {
+  try {
+    const customOrderId = dispatchCustomOrderId(req.params.id);
+    const actor = req.operator?.display_name || req.operator?.username || operatorId(req);
+    const mutation = await withTransaction(async () => {
+      await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
+      const current = await getDispatchCustomOrderForUpdate(customOrderId);
+      if (!current) return { notFound: true };
+      await assertDispatchCustomOrderMutable(current);
+      const updated = await updateDispatchCustomOrder(customOrderId, req.body || {}, actor);
+      return { current, updated };
+    });
+    if (mutation.notFound) return res.status(404).json({ error: "Custom Order not found." });
+    const { current, updated } = mutation;
+    const managementRows = await dispatchCustomOrdersForManagement({
+      includeCancelled: true,
+      search: updated.refNumber
+    });
+    const order = managementRows.find((row) => String(row.id) === String(updated.id)) || updated;
+    await writeDispatchAudit({
+      action: "dispatch_custom_order_updated",
+      entityType: "custom_order",
+      entityId: updated.id,
+      orderId: updated.refNumber,
+      operatorId: req.operator?.id,
+      operatorName: actor,
+      source: "dispatch",
+      before: current,
+      after: updated
+    }).catch(() => null);
+    emitAppEvent("dispatch.orders.updated", {
+      source: "custom-order",
+      change: "custom_order_updated",
+      orderId: updated.refNumber,
+      refreshOrderPool: true
+    });
+    res.json({ order });
+  } catch (error) {
+    next(error);
+  }
+}
+
+app.put("/api/dispatch/custom-orders/:id", requireDispatcher, updateDispatchCustomOrderRoute);
+app.patch("/api/dispatch/custom-orders/:id", requireDispatcher, updateDispatchCustomOrderRoute);
+
+app.delete("/api/dispatch/custom-orders/:id", requireDispatcher, async (req, res, next) => {
+  try {
+    const customOrderId = dispatchCustomOrderId(req.params.id);
+    const actor = req.operator?.display_name || req.operator?.username || operatorId(req);
+    const mutation = await withTransaction(async () => {
+      await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
+      const current = await getDispatchCustomOrderForUpdate(customOrderId);
+      if (!current) return { notFound: true };
+      await assertDispatchCustomOrderMutable(current);
+      const cancelled = await cancelDispatchCustomOrder(customOrderId, actor);
+      return { current, cancelled };
+    });
+    if (mutation.notFound) return res.status(404).json({ error: "Custom Order not found." });
+    const { current, cancelled } = mutation;
+    if (!cancelled) {
+      return res.status(409).json({ error: "This Custom Order changed before cancellation completed. Refresh and try again." });
+    }
+    const managementRows = await dispatchCustomOrdersForManagement({
+      includeCancelled: true,
+      search: cancelled.refNumber
+    });
+    const order = managementRows.find((row) => String(row.id) === String(cancelled.id)) || cancelled;
+    await writeDispatchAudit({
+      action: "dispatch_custom_order_cancelled",
+      entityType: "custom_order",
+      entityId: cancelled.id,
+      orderId: cancelled.refNumber,
+      operatorId: req.operator?.id,
+      operatorName: actor,
+      source: "dispatch",
+      before: current,
+      after: cancelled
+    }).catch(() => null);
+    emitAppEvent("dispatch.orders.updated", {
+      source: "custom-order",
+      change: "custom_order_cancelled",
+      orderId: cancelled.refNumber,
+      refreshOrderPool: true
+    });
+    res.json({ order });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/dispatch/sales-order-methods", async (req, res, next) => {
   try {
     res.json(await searchSalesOrderMethodOverrides({
@@ -6750,6 +7378,9 @@ app.delete("/api/dispatch/order-dependencies/:id", async (req, res, next) => {
 
 app.get("/api/dispatch/loaded-orders", async (req, res, next) => {
   try {
+    if (req.publicSalesAccess || req.operator?.publicSales) {
+      return res.status(403).json({ error: "Staff Sales login required.", redirect: "/sales" });
+    }
     res.json(await listYardMovements({
       from: req.query.from,
       to: req.query.to,
@@ -6757,7 +7388,8 @@ app.get("/api/dispatch/loaded-orders", async (req, res, next) => {
       search: req.query.search,
       itemSearch: req.query.itemSearch,
       direction: req.query.direction,
-      orderType: req.query.orderType
+      orderType: req.query.orderType,
+      allowedYardLocationIds: movementAllowedYardLocationIds(req)
     }));
   } catch (error) {
     next(error);
@@ -6766,12 +7398,16 @@ app.get("/api/dispatch/loaded-orders", async (req, res, next) => {
 
 app.get("/api/dispatch/loaded-orders/detail", async (req, res, next) => {
   try {
+    if (req.publicSalesAccess || req.operator?.publicSales) {
+      return res.status(403).json({ error: "Staff Sales login required.", redirect: "/sales" });
+    }
     const detail = await getYardMovementDetail({
       direction: req.query.direction,
       orderType: req.query.orderType,
       orderId: req.query.orderId,
       from: req.query.from,
-      to: req.query.to
+      to: req.query.to,
+      allowedYardLocationIds: movementAllowedYardLocationIds(req)
     });
     if (!detail) return res.status(404).json({ error: "Yard movement not found." });
     return res.json(detail);
@@ -6782,7 +7418,12 @@ app.get("/api/dispatch/loaded-orders/detail", async (req, res, next) => {
 
 app.get("/api/dispatch/loaded-orders/export.csv", async (req, res, next) => {
   try {
-    await sendLoadedOrdersCsv(req, res);
+    if (req.publicSalesAccess || req.operator?.publicSales) {
+      return res.status(403).json({ error: "Staff Sales login required.", redirect: "/sales" });
+    }
+    await sendLoadedOrdersCsv(req, res, {
+      allowedYardLocationIds: movementAllowedYardLocationIds(req)
+    });
   } catch (error) {
     next(error);
   }
@@ -6790,6 +7431,9 @@ app.get("/api/dispatch/loaded-orders/export.csv", async (req, res, next) => {
 
 app.get("/api/scm/transfer-dependencies/candidates", async (req, res, next) => {
   try {
+    if ((req.query.reviewStatus || "open") === "open") {
+      await refreshTransferDependencySalesOrderAllocations();
+    }
     res.json(await listTransferDependencyCandidates({
       search: req.query.search || "",
       salesOrderId: req.query.salesOrderId || null,
@@ -6851,11 +7495,22 @@ app.post("/api/scm/transfer-dependencies/candidates/:salesOrderId/refresh-invent
     if (!operatorHasAnyRole(req.operator, ["admin", "scm", "scm_staff"])) {
       return res.status(403).json({ error: "SCM write access required." });
     }
+    await refreshTransferDependencySalesOrderAllocations({
+      salesOrderId: req.params.salesOrderId,
+      force: req.body?.force === true
+    });
     const candidates = await listTransferDependencyCandidates({ salesOrderId: req.params.salesOrderId });
-    const itemIds = [...new Set(candidates.flatMap((order) => order.lines || [])
+    const currentInventory = await getDependencyInventoryMatrix(req.params.salesOrderId);
+    const itemIds = [...new Set((currentInventory.orderLines || [])
       .map((line) => Number(line.itemId)).filter(Number.isInteger))];
     if (itemIds.length) await refreshTransferDependencyInventory(itemIds);
-    res.json(await getDependencyInventoryMatrix(req.params.salesOrderId));
+    const inventory = itemIds.length
+      ? await getDependencyInventoryMatrix(req.params.salesOrderId)
+      : currentInventory;
+    if (req.body?.includeCandidate === true) {
+      return res.json({ inventory, candidate: candidates[0] || null });
+    }
+    return res.json(inventory);
   } catch (error) {
     next(error);
   }
@@ -6876,6 +7531,10 @@ app.post("/api/scm/transfer-dependencies/suggestions", async (req, res, next) =>
     if (!operatorHasAnyRole(req.operator, ["admin", "scm", "scm_staff"])) {
       return res.status(403).json({ error: "SCM write access required." });
     }
+    await refreshTransferDependencySalesOrderAllocations({
+      salesOrderId: req.body?.salesOrderId,
+      force: true
+    });
     const candidates = await listTransferDependencyCandidates({ salesOrderId: req.body?.salesOrderId });
     const itemIds = candidates.flatMap((order) => order.lines || []).map((line) => Number(line.itemId)).filter(Number.isInteger);
     if (req.body?.refreshInventory !== false && itemIds.length) await refreshTransferDependencyInventory(itemIds);
@@ -6927,6 +7586,47 @@ app.post("/api/scm/transfer-dependencies/batches/:id/proposals/merge", async (re
   }
 });
 
+app.get("/api/scm/transfer-dependencies/batches/:id/proposals/:proposalId/items", async (req, res, next) => {
+  try {
+    res.json(await searchTransferDependencyProposalItems(
+      req.params.id,
+      req.params.proposalId,
+      {
+        search: req.query.search || "",
+        limit: req.query.limit
+      }
+    ));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/transfer-dependencies/batches/:id/proposals/:proposalId/lines", async (req, res, next) => {
+  try {
+    if (!operatorHasAnyRole(req.operator, ["admin", "scm", "scm_staff"])) {
+      return res.status(403).json({ error: "SCM write access required." });
+    }
+    await refreshTransferDependencyInventory([req.body?.itemId]);
+    await addTransferDependencyProposalLine(
+      req.params.id,
+      req.params.proposalId,
+      req.body || {},
+      req.operator?.id
+    );
+    const batch = await getTransferDependencyBatch(req.params.id);
+    emitAppEvent("scm.transfer_dependency.updated", {
+      source: "proposal-manual-item-added",
+      batchId: batch.id,
+      orderId: batch.salesOrderRef,
+      proposalId: Number(req.params.proposalId),
+      itemId: Number(req.body?.itemId)
+    });
+    return res.status(201).json(batch);
+  } catch (error) {
+    return next(error);
+  }
+});
+
 app.delete("/api/scm/transfer-dependencies/batches/:id/proposals/:proposalId/lines/:lineId", async (req, res, next) => {
   try {
     if (!operatorHasAnyRole(req.operator, ["admin", "scm", "scm_staff"])) {
@@ -6954,6 +7654,7 @@ app.post("/api/scm/transfer-dependencies/batches/:id/confirm", async (req, res, 
     if (!operatorHasAnyRole(req.operator, ["admin", "scm", "scm_staff"])) {
       return res.status(403).json({ error: "SCM write access required." });
     }
+    await refreshTransferDependencyBatchSalesOrderAllocations(req.params.id);
     await refreshTransferDependencyBatchInventory(req.params.id, req.operator?.id);
     const result = await confirmTransferDependencyBatch(req.params.id, {
       operatorId: req.operator?.id,
@@ -6976,6 +7677,7 @@ app.post("/api/scm/transfer-dependencies/batches/:id/proposals/:proposalId/confi
     if (!operatorHasAnyRole(req.operator, ["admin", "scm", "scm_staff"])) {
       return res.status(403).json({ error: "SCM write access required." });
     }
+    await refreshTransferDependencyBatchSalesOrderAllocations(req.params.id);
     await refreshTransferDependencyBatchInventory(req.params.id, req.operator?.id);
     const result = await confirmTransferDependencyBatch(req.params.id, {
       operatorId: req.operator?.id,
@@ -7024,6 +7726,7 @@ app.post("/api/scm/transfer-dependencies/batches/:id/retry", async (req, res, ne
     if (!operatorHasAnyRole(req.operator, ["admin", "scm", "scm_staff"])) {
       return res.status(403).json({ error: "SCM write access required." });
     }
+    await refreshTransferDependencyBatchSalesOrderAllocations(req.params.id);
     await refreshTransferDependencyBatchInventory(req.params.id, req.operator?.id);
     const result = await retryTransferDependencyBatch(req.params.id, {
       operatorId: req.operator?.id,
@@ -7974,15 +8677,15 @@ app.post("/api/dispatch/operator-requests", async (req, res, next) => {
 app.put("/api/dispatch/plan", async (req, res, next) => {
   try {
     const saveMode = dispatchPlanSaveMode(req.body);
-    const requestedOrders = sanitizeDispatchPlanOrders(Array.isArray(req.body?.orders) ? req.body.orders : []);
+    const requestedOrders = Array.isArray(req.body?.orders) ? req.body.orders : [];
     const requestedTrucks = Array.isArray(req.body?.trucks) ? req.body.trucks : [];
     const planDate = req.body?.planDate || req.body?.date || new Date().toISOString().slice(0, 10);
     await requireDispatchPlanEditLease(req, planDate);
     let plan = req.body?.planId ? await getDispatchPlan(req.body.planId) : await getCurrentDispatchPlan({ planDate });
     if (!plan) plan = await createDispatchPlan({ planDate });
     const previousPlan = plan;
-    const cleanOrders = saveMode === "truck_sequence" && previousPlan
-      ? sanitizeDispatchPlanOrders(previousPlan.orders || [])
+    let cleanOrders = saveMode === "truck_sequence" && previousPlan
+      ? previousPlan.orders || []
       : requestedOrders;
     let cleanTrucks = saveMode === "truck_sequence" && previousPlan
       ? mergeDispatchTruckSequence(previousPlan.trucks || [], requestedTrucks)
@@ -7990,6 +8693,14 @@ app.put("/api/dispatch/plan", async (req, res, next) => {
     if (config.dispatch?.driverOrientedPlanning) {
       cleanTrucks = normalizeDispatchPlanLoadAssignments({ ...previousPlan, trucks: cleanTrucks }).trucks;
     }
+    const canonicalCandidate = await canonicalizeDispatchCustomOrdersInPlan({
+      ...previousPlan,
+      planDate: plan.planDate || planDate,
+      orders: cleanOrders,
+      trucks: cleanTrucks
+    }, { previousPlan });
+    cleanOrders = sanitizeDispatchPlanOrders(canonicalCandidate.orders || []);
+    cleanTrucks = canonicalCandidate.trucks || [];
     const duplicateDrivers = config.dispatch?.driverOrientedPlanning ? [] : dispatchDuplicateDriverAssignments(cleanTrucks);
     if (duplicateDrivers.length) return sendDispatchDuplicateDriverResponse(res, duplicateDrivers);
     const payload = {
@@ -7997,6 +8708,10 @@ app.put("/api/dispatch/plan", async (req, res, next) => {
       orders: cleanOrders,
       trucks: cleanTrucks
     };
+    const dependencyStructureChanges = await assertNoConsolidationStructureConflict(
+      previousPlan,
+      { orders: payload.orders }
+    );
     const explicitOperatorAlertRefs = Array.isArray(req.body?.audit?.details?.operatorAlertRefs)
       ? req.body.audit.details.operatorAlertRefs.map((ref) => String(ref || "").trim()).filter(Boolean)
       : [];
@@ -8045,7 +8760,9 @@ app.put("/api/dispatch/plan", async (req, res, next) => {
       summary: await dispatchPlanSummaryWithSetup(req.body?.summary || {}),
       baseRevision: saveMode === "truck_sequence" ? null : req.body?.baseRevision
     });
-    await syncOrderDependenciesFromDispatchPlan(savedPlan);
+    await syncOrderDependenciesFromDispatchPlan(savedPlan, {
+      allowEstablishedUngroupTargets: dependencyStructureChanges.safeUngroupTargets
+    });
     const coAssignments = await applyDispatchPlanCoAssignments(savedPlan);
     const changedOperatorRefs = [
       ...new Set([...changedDispatchOperatorRefs(previousPlan || {}, savedPlan), ...explicitOperatorAlertRefs])
@@ -8057,7 +8774,11 @@ app.put("/api/dispatch/plan", async (req, res, next) => {
       operatorFlags = await applyConfirmedDispatchPlanToDelivery(savedPlan, { forceOrderRefs: changedOperatorRefs });
     }
     await fs.mkdir(dataDir, { recursive: true });
-    await fs.writeFile(dispatchPlanPath, JSON.stringify(payload, null, 2));
+    await fs.writeFile(dispatchPlanPath, JSON.stringify({
+      savedAt: savedPlan.savedAt || payload.savedAt,
+      orders: savedPlan.orders || [],
+      trucks: savedPlan.trucks || []
+    }, null, 2));
     if (req.body?.audit) {
       await writeDispatchAudit({
         ...req.body.audit,
@@ -8068,8 +8789,8 @@ app.put("/api/dispatch/plan", async (req, res, next) => {
         planDate: savedPlan.planDate,
         details: {
           ...(req.body.audit.details || {}),
-          orderCount: payload.orders.length,
-          truckCount: payload.trucks.length,
+          orderCount: (savedPlan.orders || []).length,
+          truckCount: (savedPlan.trucks || []).length,
           saveMode,
           coAssignments,
           operatorFlags,
@@ -8105,13 +8826,20 @@ app.get([
   "/control/vendor-mapping",
   "/control/operator-warnings",
   "/control/yard-in-outbound",
+  "/control/in-outbound-record",
   "/control/cycle-count-review",
   "/control/operator-load-records"
 ], (req, res) => {
   res.sendFile(path.join(publicDir, "control.html"));
 });
 
-app.get("/admin", (req, res) => {
+app.get([
+  "/admin",
+  "/admin/accounts",
+  "/admin/sync",
+  "/admin/photo-storage",
+  "/admin/audit"
+], (req, res) => {
   res.sendFile(path.join(publicDir, "admin.html"));
 });
 
@@ -8139,12 +8867,20 @@ app.get("/sales/printing", (req, res) => {
   res.sendFile(path.join(publicDir, "sales-printing.html"));
 });
 
+app.get("/sales/in-outbound-record", (req, res) => {
+  res.sendFile(path.join(publicDir, "dispatch-loaded-export.html"));
+});
+
 app.get("/dispatch", (req, res) => {
   res.sendFile(path.join(publicDir, "dispatch-menu.html"));
 });
 
 app.get("/dispatch/planning", (req, res) => {
   res.sendFile(path.join(publicDir, "dispatch.html"));
+});
+
+app.get("/dispatch/custom-orders", (req, res) => {
+  res.sendFile(path.join(publicDir, "dispatch-custom-orders.html"));
 });
 
 app.get("/dispatch/setup", (req, res) => {
@@ -8155,7 +8891,7 @@ app.get("/dispatch/sales-order-methods", (req, res) => {
   res.sendFile(path.join(publicDir, "dispatch-sales-order-methods.html"));
 });
 
-app.get("/dispatch/loaded-export", (req, res) => {
+app.get(["/dispatch/loaded-export", "/dispatch/in-outbound-record"], (req, res) => {
   res.sendFile(path.join(publicDir, "dispatch-loaded-export.html"));
 });
 
@@ -8942,6 +9678,7 @@ app.post("/api/driver/jobs/:jobId/photos", requireDriver, async (req, res, next)
         job
       });
       let dependencyUpdate = null;
+      let completedCustomOrders = [];
       if (job.stopType === "pickup") {
         const transferRefs = (job.dependencyPickupManifests || []).map((entry) => entry.transferOrderRef).filter(Boolean);
         dependencyUpdate = await markDirectDependencyPickupCompleted({
@@ -8958,10 +9695,14 @@ app.post("/api/driver/jobs/:jobId/photos", requireDriver, async (req, res, next)
           loadId: job.loadId,
           loadName: job.loadName
         });
+        completedCustomOrders = await completeDispatchCustomOrders(
+          job.orderRefs || [],
+          `driver:${req.driverLogin}`
+        );
       }
-      return { record, dependencyUpdate };
+      return { record, dependencyUpdate, completedCustomOrders };
     });
-    const { record, dependencyUpdate } = completion;
+    const { record, dependencyUpdate, completedCustomOrders } = completion;
     let nextJob = await getNextDriverJob(req.driverLogin);
     let rest = null;
     if (nextJob && req.body?.autoStartRest === true) {
@@ -8979,10 +9720,18 @@ app.post("/api/driver/jobs/:jobId/photos", requireDriver, async (req, res, next)
     if (dependencyUpdate && (Array.isArray(dependencyUpdate) ? dependencyUpdate.length : dependencyUpdate.completed?.length)) {
       emitAppEvent("dispatch.orders.updated", { source: "driver-order-dependency", refreshOrderPool: true });
     }
+    if (completedCustomOrders.length) {
+      emitAppEvent("dispatch.orders.updated", {
+        source: "driver-custom-order",
+        change: "custom_order_completed",
+        orderIds: completedCustomOrders.map((order) => order.refNumber),
+        refreshOrderPool: true
+      });
+    }
     const restSummary = await getDriverRestSummary(req.driverLogin, {
       planDate: rest?.planDate || nextJob?.planDate || job?.planDate || ""
     });
-    res.json({ record, nextJob, rest, restSummary, locationCheck, dependencyUpdate });
+    res.json({ record, nextJob, rest, restSummary, locationCheck, dependencyUpdate, completedCustomOrders });
   } catch (error) {
     next(error);
   }
@@ -8991,6 +9740,30 @@ app.post("/api/driver/jobs/:jobId/photos", requireDriver, async (req, res, next)
 app.get("/api/operators", requireOperator, requireAdmin, async (req, res, next) => {
   try {
     res.json(await listOperators());
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/admin/public-sales", requireOperator, requireAdmin, async (_req, res, next) => {
+  try {
+    res.setHeader("Cache-Control", "no-store");
+    res.json(await getSalesPortalSettings({ fresh: true }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/admin/public-sales", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    const settings = await updateSalesPortalSettings({ enabled: req.body?.enabled }, req.operator.id);
+    await writeAudit({
+      actorOperatorId: req.operator.id,
+      source: "admin",
+      action: "sales.public_access_update",
+      details: { enabled: settings.enabled }
+    });
+    res.json(settings);
   } catch (error) {
     next(error);
   }
@@ -10814,7 +11587,7 @@ app.use((error, req, res, next) => {
   });
 });
 
-export { app };
+export { app, salesPrintRequestIp };
 
 export async function startServer() {
   await recoverInterruptedSyncState();

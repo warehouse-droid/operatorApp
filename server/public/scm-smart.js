@@ -23,6 +23,7 @@ const smartState = {
   itemData: null,
   itemSearch: "",
   itemVendorYard: "",
+  itemLowerStockPolicy: "",
   itemEnabled: "true",
   itemOffset: 0,
   itemLimit: 150
@@ -139,6 +140,7 @@ async function smartLoadItems({ reset = false, quiet = false } = {}) {
     enabled: smartState.itemEnabled,
     limit: String(smartState.itemLimit),
     vendorYard: smartState.itemVendorYard,
+    lowerStockPolicy: smartState.itemLowerStockPolicy,
     offset: String(smartState.itemOffset)
   });
   smartState.itemData = await smartApi(`/api/scm/smart/items?${params}`);
@@ -214,15 +216,24 @@ function smartItemYard(item, locationId) {
     locationId,
     yardCode: String(locationId),
     eligible: false,
-    capacityPallets: 25,
+    capacityPallets: null,
     capacitySource: "default",
     capacityManuallyOverridden: false,
     serviceQuantile: Number(locationId) === 15 ? 0.95 : 0.90,
-    minimumSafetyPallets: 1
+    minimumSafetyPallets: 1,
+    lowerStockPolicyEnabled: false
   };
 }
 
 function smartCapacityProvenance(policy = {}) {
+  if (!policy.eligible) return "Not applicable · yard not planned";
+  const capacity = policy.capacityPallets;
+  if (capacity === null
+    || capacity === undefined
+    || String(capacity).trim() === ""
+    || !Number.isFinite(Number(capacity))) {
+    return "Capacity required";
+  }
   const source = String(policy.capacitySource || "default").trim().toLowerCase();
   if (policy.capacityManuallyOverridden || source === "manual") return "Manual override";
   if (source === "decision_workbook") {
@@ -267,6 +278,38 @@ function smartVendorYardFilterOptions(yards = []) {
   ].join("");
 }
 
+function smartLowerStockPolicyFilterOptions() {
+  const selected = String(smartState.itemLowerStockPolicy || "");
+  const options = [
+    ["", "All lower-stock settings"],
+    ["any", "Lower stock enabled · any yard"],
+    ["none", "Lower stock off · all yards"],
+    ["yard:3445", "Lower stock enabled · 3445"],
+    ["yard:2967", "Lower stock enabled · 2967"],
+    ["yard:12441", "Lower stock enabled · 12441"],
+    ["yard:150", "Lower stock enabled · 150"]
+  ];
+  return options
+    .map(([value, label]) => `<option value="${value}" ${selected === value ? "selected" : ""}>${label}</option>`)
+    .join("");
+}
+
+function smartItemCsvImportNotice(summary = {}, fallbackFilename = "CSV") {
+  const filename = String(summary.filename || fallbackFilename).trim() || fallbackFilename;
+  const rowsRead = Number(summary.rowsRead);
+  const itemsUpdated = Number(summary.itemsUpdated);
+  const unchangedRows = Number(summary.unchangedRows);
+  const yardPoliciesUpdated = Number(summary.yardPoliciesUpdated);
+  const details = [];
+  if (Number.isFinite(itemsUpdated)) details.push(`${smartNumber(itemsUpdated, 0)} item${itemsUpdated === 1 ? "" : "s"} updated`);
+  if (Number.isFinite(unchangedRows)) details.push(`${smartNumber(unchangedRows, 0)} unchanged`);
+  if (Number.isFinite(yardPoliciesUpdated) && yardPoliciesUpdated > 0) {
+    details.push(`${smartNumber(yardPoliciesUpdated, 0)} yard polic${yardPoliciesUpdated === 1 ? "y" : "ies"} updated`);
+  }
+  if (!details.length && Number.isFinite(rowsRead)) details.push(`${smartNumber(rowsRead, 0)} row${rowsRead === 1 ? "" : "s"} processed`);
+  return `${filename} imported${details.length ? `: ${details.join(" · ")}` : ""}.`;
+}
+
 function smartCaptureItemViewport(row) {
   const grid = row?.closest(".smart-item-grid-wrap");
   return {
@@ -302,12 +345,27 @@ function smartItemYardCell(item, yard) {
   const policy = smartItemYard(item, yard.locationId);
   const balance = smartItemBalance(item, yard.locationId);
   const pallets = Number(item.toPlt) > 0 ? Number(balance.quantityAvailable) / Number(item.toPlt) : null;
+  const eligible = Boolean(policy.eligible);
+  const lowerStockPolicyEnabled = Boolean(policy.lowerStockPolicyEnabled);
+  const capacityValue = eligible
+    && policy.capacityPallets !== null
+    && policy.capacityPallets !== undefined
+    && String(policy.capacityPallets).trim() !== ""
+    && Number.isFinite(Number(policy.capacityPallets))
+    ? policy.capacityPallets
+    : "";
+  const eligibleProvenance = smartCapacityProvenance({
+    ...policy,
+    eligible: true,
+    capacityPallets: capacityValue === "" ? null : capacityValue
+  });
   return `<td class="smart-yard-cell">
     <strong>${smartNumber(balance.quantityAvailable, 2)} ${smartEscape(item.stockUnit || "UOM")}</strong>
     <span>${pallets === null ? "No ToPLT" : `${smartNumber(pallets, 2)} PLT available`}</span>
-    <label><input data-item-yard-enabled="${yard.locationId}" data-service-quantile="${policy.serviceQuantile}" data-minimum-safety="${policy.minimumSafetyPallets}" type="checkbox" ${policy.eligible ? "checked" : ""} ${smartCanWrite() ? "" : "disabled"} /> Plan this yard</label>
-    <label class="smart-capacity">Capacity <input data-item-yard-capacity="${yard.locationId}" type="number" min="0" step="1" value="${smartEscape(policy.capacityPallets)}" ${smartCanWrite() ? "" : "disabled"} /> PLT</label>
-    <small class="smart-capacity-provenance">${smartEscape(smartCapacityProvenance(policy))}</small>
+    <label><input data-item-yard-enabled="${yard.locationId}" data-yard-code="${smartEscape(yard.code)}" data-service-quantile="${policy.serviceQuantile}" type="checkbox" ${eligible ? "checked" : ""} ${smartCanWrite() ? "" : "disabled"} /> Plan this yard</label>
+    <label class="smart-capacity">Capacity <input data-item-yard-capacity="${yard.locationId}" type="number" min="0" max="10000" step="any" value="${smartEscape(capacityValue)}" ${eligible ? "required" : "disabled"} ${smartCanWrite() ? "" : "disabled"} /> PLT</label>
+    <label class="smart-lower-stock-policy" title="Use the optional 1-PLT minimum safety floor, then recalculate safety stock, reorder point, and preferred stock for this item at this yard."><input data-item-yard-lower-stock="${yard.locationId}" type="checkbox" ${lowerStockPolicyEnabled ? "checked" : ""} ${eligible && smartCanWrite() ? "" : "disabled"} aria-label="Lower stock policy for ${smartEscape(item.itemName)}, yard ${smartEscape(yard.code)}" /> Lower stock policy (1-PLT floor)</label>
+    <small class="smart-capacity-provenance" data-item-yard-provenance="${yard.locationId}" data-eligible-text="${smartEscape(eligibleProvenance)}">${smartEscape(smartCapacityProvenance(policy))}</small>
   </td>`;
 }
 
@@ -333,9 +391,20 @@ function smartItemMaster() {
           ${smartCanWrite() ? `<button class="smart-button blue" data-smart-action="sync-live" type="button">Sync NetSuite items + inventory</button>` : ""}
         </div>
       </div>
+      <div class="smart-toolbar smart-item-csv-tools">
+        <div class="smart-item-csv-copy">
+          <strong>Bulk policy update</strong>
+          <span>Download the current CSV template and edit only Smart SCM policy columns. Keep policy_revision unchanged so stale files are detected. Blank editable cells leave values unchanged; enter CLEAR in lead_time_days, vendor_yard_id, or vendor_yard to remove that local override. NetSuite-owned item data is never changed.</span>
+        </div>
+        <div class="smart-actions">
+          <button class="smart-button" data-smart-action="download-item-template" type="button">Download CSV template</button>
+          ${smartCanWrite() ? `<input id="smartItemCsv" type="file" accept=".csv,text/csv" aria-label="Select Item Master CSV" /><button class="smart-button primary" data-smart-action="upload-item-csv" type="button">Upload CSV updates</button>` : ""}
+        </div>
+      </div>
       <div class="smart-toolbar">
         <input id="smartItemSearch" type="search" value="${smartEscape(smartState.itemSearch)}" placeholder="Search item, ID, vendor, or description" />
         <select id="smartItemEnabled"><option value="" ${smartState.itemEnabled === "" ? "selected" : ""}>All NetSuite items</option><option value="true" ${smartState.itemEnabled === "true" ? "selected" : ""}>Planning enabled</option><option value="false" ${smartState.itemEnabled === "false" ? "selected" : ""}>Planning disabled</option></select>
+        <select id="smartItemLowerStockPolicy" aria-label="Filter Item Master by lower-stock policy">${smartLowerStockPolicyFilterOptions()}</select>
         <select id="smartItemVendorYard">${smartVendorYardFilterOptions(data.vendorYards || [])}</select>
         <span class="smart-help">${first}–${last} of ${smartNumber(data.total, 0)}</span>
         <button class="smart-button" data-smart-action="item-prev" type="button" ${data.offset <= 0 ? "disabled" : ""}>Previous</button>
@@ -361,6 +430,22 @@ function smartForecastStockPolicy(row) {
   const calculationDriver = row.stockPolicyModel && row.stockPolicyModel !== "formula"
     ? `${smartEscape(row.stockPolicyModel)} quantile target`
     : `factor ${smartNumber(row.safetyFactor, 3)}`;
+  const standardSafety = Number.isFinite(Number(row.standardSafetyStockPallets))
+    ? Number(row.standardSafetyStockPallets)
+    : Number(row.safetyStockPallets);
+  const standardRop = Number.isFinite(Number(row.standardReorderPointPallets))
+    ? Number(row.standardReorderPointPallets)
+    : Number(row.reorderPointPallets);
+  const standardPreferred = Number.isFinite(Number(row.standardPreferredPallets))
+    ? Number(row.standardPreferredPallets)
+    : Number(row.preferredPallets);
+  const lowerStockExplanation = row.lowerStockPolicyEnabled
+    ? row.lowerStockPolicyApplied
+      ? `<span><strong>Lower stock policy applied · 1-PLT minimum safety floor</strong></span>
+        <small>Standard → lower: Safety ${smartNumber(standardSafety, 3)} → ${smartNumber(row.safetyStockPallets, 3)} PLT · ROP ${smartNumber(standardRop, 2)} → ${smartNumber(row.reorderPointPallets, 2)} PLT · Preferred ${smartNumber(standardPreferred, 2)} → ${smartNumber(row.preferredPallets, 2)} PLT.</small>`
+      : `<span><strong>Lower stock policy enabled · 1-PLT minimum safety floor</strong></span>
+        <small>Current demand variability or another active planning floor already controls these levels, so this forecast is unchanged.</small>`
+    : "";
   let formulaExplanation;
   if (row.stockPolicyModel && row.stockPolicyModel !== "formula") {
     formulaExplanation = `<small>ROP and preferred use the active ${smartEscape(row.stockPolicyModel)} quantiles and remain capped by ${smartNumber(row.capacityPallets, 2)} PLT capacity.</small>`;
@@ -376,6 +461,7 @@ function smartForecastStockPolicy(row) {
     <span>ROP <strong>${smartNumber(row.reorderPointPallets, 2)} PLT</strong></span>
     <span>Preferred stock level <strong>${smartNumber(row.preferredPallets, 2)} PLT</strong></span>
     <span>Capacity <strong>${smartNumber(row.capacityPallets, 2)} PLT</strong></span>
+    ${lowerStockExplanation}
     <small>${smartNumber(row.weeklyDemandPallets, 2)} PLT/week · SD ${smartNumber(row.weeklyDemandSdPallets, 3)} · ${smartNumber(row.leadWeeks, 2)} lead weeks · ${calculationDriver} · current policy/settings</small>
     ${formulaExplanation}
   </div>`;
@@ -582,6 +668,38 @@ smartScmApp.addEventListener("click", async (event) => {
       await smartLoadItems({ reset: true, quiet: true });
       smartState.tab = "items";
       smartRender();
+    } else if (action === "download-item-template") {
+      await smartWork(
+        "Preparing Item Master CSV template",
+        () => smartDownload("/api/scm/smart/items/csv-template", "smart-scm-item-master-template.csv"),
+        "Item Master CSV template downloaded"
+      );
+    } else if (action === "upload-item-csv") {
+      const file = document.getElementById("smartItemCsv")?.files?.[0];
+      if (!file) throw new Error("Select an Item Master CSV first.");
+      if (!file.name.toLowerCase().endsWith(".csv")) throw new Error("Item Master bulk updates require a CSV file.");
+      const summary = await smartWork("Validating and applying Item Master CSV", () => smartApi("/api/scm/smart/items/csv", {
+        method: "POST",
+        headers: { "Content-Type": "text/csv; charset=utf-8", "X-File-Name": file.name },
+        body: file
+      }), "Item Master CSV imported");
+      const refreshErrors = [];
+      try {
+        await smartLoadBootstrap({ quiet: true });
+      } catch (error) {
+        refreshErrors.push(error.message);
+      }
+      try {
+        await smartLoadItems({ reset: true, quiet: true });
+      } catch (error) {
+        refreshErrors.push(error.message);
+      }
+      smartState.error = "";
+      smartState.notice = `${smartItemCsvImportNotice(summary, file.name)}${refreshErrors.length
+        ? ` The import was applied, but the page refresh failed: ${refreshErrors.join(" · ")}. Use Refresh to reload the latest values.`
+        : ""}`;
+      smartState.tab = "items";
+      smartRender();
     } else if (action === "upload-sales-csv") {
       const file = document.getElementById("smartSalesCsv")?.files?.[0];
       if (!file) throw new Error("Select a raw sales CSV first.");
@@ -601,17 +719,33 @@ smartScmApp.addEventListener("click", async (event) => {
       const row = button.closest("[data-item-row]");
       if (!row) throw new Error("Item row is no longer available.");
       const viewport = smartCaptureItemViewport(row);
-      const yardPolicies = [...row.querySelectorAll("[data-item-yard-enabled]")].map((input) => {
+      const yardPolicies = [];
+      for (const input of row.querySelectorAll("[data-item-yard-enabled]")) {
         const locationId = Number(input.dataset.itemYardEnabled);
         const capacity = row.querySelector(`[data-item-yard-capacity="${locationId}"]`);
-        return {
+        const lowerStockPolicy = row.querySelector(`[data-item-yard-lower-stock="${locationId}"]`);
+        const capacityText = String(capacity?.value ?? "").trim();
+        const capacityPallets = Number(capacityText);
+        capacity?.setCustomValidity("");
+        if (input.checked
+          && (!capacityText
+            || !Number.isFinite(capacityPallets)
+            || capacityPallets < 0
+            || capacityPallets > 10000)) {
+          const yardCode = input.dataset.yardCode || locationId;
+          capacity?.setCustomValidity(`Enter a capacity from 0 to 10,000 pallets for yard ${yardCode}.`);
+          capacity?.focus();
+          capacity?.reportValidity();
+          return;
+        }
+        yardPolicies.push({
           locationId,
           eligible: input.checked,
-          capacityPallets: Number(capacity?.value || 0),
+          capacityPallets: input.checked ? capacityPallets : null,
           serviceQuantile: Number(input.dataset.serviceQuantile || 0.9),
-          minimumSafetyPallets: Number(input.dataset.minimumSafety || 1)
-        };
-      });
+          lowerStockPolicyEnabled: Boolean(lowerStockPolicy?.checked)
+        });
+      }
       const vendorYardSelect = row.querySelector('[data-item-field="vendorYardId"]');
       const vendorYardValue = vendorYardSelect?.value || "";
       const payload = {
@@ -719,8 +853,42 @@ smartScmApp.addEventListener("click", async (event) => {
 });
 
 smartScmApp.addEventListener("change", async (event) => {
-  if (event.target.id === "smartItemEnabled" || event.target.id === "smartItemVendorYard") {
+  if (event.target.matches("[data-item-yard-enabled]")) {
+    const toggle = event.target;
+    const locationId = toggle.dataset.itemYardEnabled;
+    const row = toggle.closest("[data-item-row]");
+    const capacity = row?.querySelector(`[data-item-yard-capacity="${locationId}"]`);
+    const lowerStockPolicy = row?.querySelector(`[data-item-yard-lower-stock="${locationId}"]`);
+    const provenance = row?.querySelector(`[data-item-yard-provenance="${locationId}"]`);
+    if (capacity) {
+      if (toggle.checked) {
+        capacity.disabled = !smartCanWrite();
+        capacity.required = true;
+        if (!capacity.value && capacity.dataset.eligibleValue) {
+          capacity.value = capacity.dataset.eligibleValue;
+        }
+      } else {
+        const currentValue = capacity.value.trim();
+        if (currentValue) capacity.dataset.eligibleValue = currentValue;
+        capacity.value = "";
+        capacity.required = false;
+        capacity.disabled = true;
+        capacity.setCustomValidity("");
+      }
+    }
+    if (lowerStockPolicy) lowerStockPolicy.disabled = !toggle.checked || !smartCanWrite();
+    if (provenance) {
+      provenance.textContent = toggle.checked
+        ? (provenance.dataset.eligibleText || "Capacity required")
+        : "Not applicable · yard not planned";
+    }
+    return;
+  }
+  if (event.target.id === "smartItemEnabled"
+    || event.target.id === "smartItemLowerStockPolicy"
+    || event.target.id === "smartItemVendorYard") {
     if (event.target.id === "smartItemEnabled") smartState.itemEnabled = event.target.value;
+    if (event.target.id === "smartItemLowerStockPolicy") smartState.itemLowerStockPolicy = event.target.value;
     if (event.target.id === "smartItemVendorYard") smartState.itemVendorYard = event.target.value;
     try {
       await smartLoadItems({ reset: true });

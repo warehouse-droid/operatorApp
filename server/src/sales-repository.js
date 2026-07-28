@@ -1,4 +1,5 @@
 import { query } from "./db.js";
+import { salesStoreLocationIdSql } from "./sales-store.js";
 
 export const SALES_YARDS = Object.freeze([
   { locationId: 1, yardCode: "3445" },
@@ -65,12 +66,7 @@ function publicCandidate(row) {
 
 const EFFECTIVE_ORDERING_LOCATION_SQL = `COALESCE(
   so.order_location_id,
-  CASE LEFT(UPPER(COALESCE(so.tranid, '')), 3)
-    WHEN 'SOB' THEN 1
-    WHEN 'SOA' THEN 28
-    WHEN 'SOM' THEN 26
-    ELSE NULL
-  END
+  ${salesStoreLocationIdSql("so.tranid")}
 )`;
 
 const ORDERING_YARD_CODE_SQL = `CASE ${EFFECTIVE_ORDERING_LOCATION_SQL}
@@ -154,12 +150,16 @@ export async function listSalesOrderPrintCandidates({ search = "", orderingLocat
             scope.ordering_location_id,
             scope.ordering_yard_code,
             COUNT(DISTINCT scope.line_pk) AS line_count,
-            (
+            ((
               SELECT COUNT(*)::integer
                 FROM scm_print_jobs history
                WHERE history.source_order_id = scope.order_id
                  AND history.document_type = 'sales_order_picking_ticket'
-            ) AS print_history_count,
+            ) + CASE WHEN EXISTS (
+              SELECT 1
+                FROM sales_print_history_baseline baseline
+               WHERE baseline.order_id = scope.order_id
+            ) THEN 1 ELSE 0 END) AS print_history_count,
             COALESCE(
               jsonb_agg(DISTINCT jsonb_build_object(
                 'locationId', scope.outbound_location_id,
@@ -187,6 +187,10 @@ export async function listSalesOrderPrintCandidates({ search = "", orderingLocat
            WHERE printed.source_order_id = scope.order_id
              AND printed.document_type = 'sales_order_picking_ticket'
              AND (LOWER(COALESCE(printed.status, '')) = 'printed' OR printed.printed_at IS NOT NULL)
+        ) AND NOT EXISTS (
+          SELECT 1
+            FROM sales_print_history_baseline baseline
+           WHERE baseline.order_id = scope.order_id
         ))
         AND ($2 = '' OR lower(concat_ws(
           ' ',
@@ -256,12 +260,16 @@ export async function getSalesOrderPrintCandidate({ orderId, allowedOrderingLoca
             scope.ordering_location_id,
             scope.ordering_yard_code,
             COUNT(DISTINCT scope.line_pk) AS line_count,
-            (
+            ((
               SELECT COUNT(*)::integer
                 FROM scm_print_jobs history
                WHERE history.source_order_id = scope.order_id
                  AND history.document_type = 'sales_order_picking_ticket'
-            ) AS print_history_count,
+            ) + CASE WHEN EXISTS (
+              SELECT 1
+                FROM sales_print_history_baseline baseline
+               WHERE baseline.order_id = scope.order_id
+            ) THEN 1 ELSE 0 END) AS print_history_count,
             COALESCE(
               jsonb_agg(DISTINCT jsonb_build_object(
                 'locationId', scope.outbound_location_id,
@@ -309,6 +317,8 @@ function publicPrintHistory(row) {
     printerName: printerNames.join(" + ") || row.printer_name || "",
     printerNames,
     requestedBy: row.requested_by || row.queued_by_operator_id || "System",
+    requestedCompanyName: row.requested_company_name || "",
+    requestedIpAddress: row.requested_ip_address || "",
     requestedAt: row.queued_at,
     status: row.status || "",
     attempts: Number(row.attempts || 0),
@@ -323,7 +333,7 @@ const SALES_PRINT_HISTORY_SELECT = `
   SELECT job.*,
          printer.yard_code AS printer_yard_code,
          printer.printer_name,
-         COALESCE(NULLIF(operator.display_name, ''), NULLIF(operator.username, ''), job.queued_by_operator_id, 'System') AS requested_by,
+         COALESCE(NULLIF(operator.display_name, ''), NULLIF(operator.username, ''), NULLIF(job.requested_company_name, ''), job.queued_by_operator_id, 'System') AS requested_by,
          CASE job.line_location_id
            WHEN 1 THEN '3445'
            WHEN 14 THEN '3445 Special'
@@ -342,14 +352,46 @@ export async function listSalesOrderPrintHistory(orderId) {
   if (!Number.isInteger(id) || id <= 0) {
     throw Object.assign(new Error("Select a valid Sales Order."), { status: 400 });
   }
-  const result = await query(
+  const [result, baseline] = await Promise.all([
+    query(
     `${SALES_PRINT_HISTORY_SELECT}
       WHERE job.source_order_id = $1
         AND job.document_type = 'sales_order_picking_ticket'
       ORDER BY job.queued_at DESC, job.id DESC`,
     [id]
-  );
-  return result.rows.map(publicPrintHistory);
+    ),
+    query(
+      `SELECT order_id, order_ref, marked_at, source
+         FROM sales_print_history_baseline
+        WHERE order_id = $1`,
+      [id]
+    )
+  ]);
+  return [
+    ...baseline.rows.map((row) => ({
+      jobId: null,
+      historicalBaseline: true,
+      orderId: Number(row.order_id),
+      orderRef: row.order_ref || "",
+      lineLocationId: null,
+      lineYardCode: "",
+      printerLocationId: null,
+      printerYardCode: "",
+      printerName: "",
+      printerNames: [],
+      requestedBy: "Printed before MBBS tracking",
+      requestedCompanyName: "",
+      requestedIpAddress: "",
+      requestedAt: row.marked_at,
+      status: "printed",
+      attempts: 0,
+      printedAt: row.marked_at,
+      lastError: "",
+      documentName: "",
+      documentSha256: ""
+    })),
+    ...result.rows.map(publicPrintHistory)
+  ];
 }
 
 export async function getSalesOrderPrintSnapshot({ orderId, jobId } = {}) {

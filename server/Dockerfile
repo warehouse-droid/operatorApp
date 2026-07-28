@@ -7,6 +7,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
 COPY migrations ./migrations
+COPY netsuite-smart-scm-picking-ticket-restlet.js ./
 COPY public ./public
 COPY src ./src
 

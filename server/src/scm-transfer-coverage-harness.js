@@ -5,6 +5,8 @@ import vm from "node:vm";
 const { preferredFullCoverageSourceYards } = await import("./order-dependency-repository.js");
 
 const source = fs.readFileSync(new URL("../public/scm-transfer-dependencies.js", import.meta.url), "utf8");
+const dependencyHtml = fs.readFileSync(new URL("../public/scm-transfer-dependencies.html", import.meta.url), "utf8");
+const dispatchCss = fs.readFileSync(new URL("../public/dispatch.css", import.meta.url), "utf8");
 const repositorySource = fs.readFileSync(new URL("./order-dependency-repository.js", import.meta.url), "utf8");
 const serverSource = fs.readFileSync(new URL("./server.js", import.meta.url), "utf8");
 const helperSource = source.match(/function depInventoryCoverage[\s\S]*?(?=\nfunction renderInventoryMatrix)/)?.[0] || "";
@@ -43,9 +45,38 @@ assert.equal(resultContext.result.length, 1);
 assert.equal(resultContext.result[0].undercovered, 25, "Source-yard inventory must not reduce unlinked SO undercoverage.");
 assert.equal(resultContext.result[0].sourceAvailable, 694, "Source availability remains a separate informational calculation.");
 assert.equal(resultContext.result[0].sourceShortfall, 0, "Available source stock should still indicate that a proposal is possible.");
+const allItemsContext = {
+  ...context,
+  order: {
+    outboundLocationId: 1,
+    lines: [{ salesLineId: 1, itemId: 100, quantity: 10, committedQuantity: 0, backorderedQuantity: 10, unresolvedQuantity: 10 }]
+  },
+  matrix: {
+    orderLines: [
+      { salesLineId: 1, itemId: 100, quantity: 10, committedQuantity: 0, backorderedQuantity: 10, unresolvedQuantity: 10 },
+      { salesLineId: 2, itemId: 200, quantity: 5, committedQuantity: 5, backorderedQuantity: 0, unresolvedQuantity: 0 }
+    ],
+    items: [
+      { itemId: 100, balances: [{ locationId: 28, effectiveAvailable: 10 }] },
+      { itemId: 200, balances: [{ locationId: 1, effectiveAvailable: 5 }] }
+    ]
+  },
+  result: null
+};
+vm.runInNewContext(`${helperSource}; result = depInventoryCoverage(order, matrix);`, allItemsContext);
+const fullyCommittedCoverage = allItemsContext.result.find((entry) => String(entry.line.itemId) === "200");
+assert.equal(allItemsContext.result.length, 2, "Shortage & Inventory must include every material Sales Order item.");
+assert.equal(fullyCommittedCoverage?.ordered, 5, "A fully committed item must retain its ordered quantity.");
+assert.equal(fullyCommittedCoverage?.committed, 5, "A fully committed item must retain its committed quantity.");
+assert.equal(fullyCommittedCoverage?.backordered, 0, "A fully committed item must show zero backorder.");
+assert.equal(fullyCommittedCoverage?.undercovered, 0, "A fully committed item must not increase undercoverage.");
 assert(source.includes("balance?.quantityAvailable"), "Yard columns must display the full available quantity.");
+assert(source.includes("Order item / quantity") && source.includes('"No backorder"'),
+  "The matrix must label fully committed items without implying that a linked TO covered them.");
 assert(source.includes("async function loadSelectedDependencyInventory"), "Selecting an undercovered order must use the automatic targeted inventory refresh helper.");
 assert(source.includes('shouldRefresh ? "refresh-inventory" : "inventory"'), "Open undercovered items must refresh inventory automatically instead of requiring the manual button.");
+assert(source.includes("Sales Order commitment and yard inventory refreshed from NetSuite."),
+  "The refresh action must tell users that both SO commitment and yard inventory were refreshed.");
 function mergeCard(id, { mode = "yard_replenishment", fromLocationId = 1, toLocationId = 15 } = {}) {
   const values = { mode, fromLocationId, toLocationId };
   return {
@@ -77,6 +108,48 @@ assert(source.includes('data-field="merge-proposal"'), "Draft proposal cards mus
 assert(source.includes('/proposals/merge`'), "The merge control must call the dedicated atomic endpoint.");
 assert(source.includes("dependencyState.batch = result.batch;"), "The merge response envelope must replace UI state with its batch payload.");
 assert(serverSource.includes('source: "proposals-merged"'), "The merge endpoint must emit a scoped SCM update event.");
+assert(source.includes('order.workflowStage === "created" ? "Mark Reviewed"'),
+  "Created orders must expose the same manual review completion action as Open orders.");
+assert(source.includes('order.completionType === "transfer_manually_reviewed"'),
+  "The UI must distinguish manual completion of a created TO from Reviewed - No Transfer.");
+assert(source.includes('dependencyState.reviewStatus = "created";')
+  && source.includes('dependencyState.mobilePanel = "proposals";')
+  && source.includes("loadDependencyCandidates({ preserveSelection: true, refreshInventory: false })"),
+"Successful TO creation must keep the same Sales Order selected and land phones on Verify, Approve & Print.");
+assert(source.includes('data-field="manual-item-search"')
+  && source.includes('data-action="select-manual-item"')
+  && source.includes('data-action="add-manual-item"'),
+"Draft proposals must expose free-type item autocomplete and an explicit add action.");
+assert(source.includes("/proposals/${proposalId}/items?search=")
+  && source.includes("/proposals/${proposalId}/lines"),
+"Manual item autocomplete and add actions must call dependency-specific endpoints.");
+assert(source.includes("}, 300);"), "Manual item autocomplete must be debounced.");
+assert(source.includes('const DEPENDENCY_PROPOSAL_LINE_SELECTOR = ".scm-dependency-proposal-line[data-proposal-line-id]";')
+  && source.includes("card.querySelectorAll(DEPENDENCY_PROPOSAL_LINE_SELECTOR)")
+  && !source.includes('card.querySelectorAll("[data-proposal-line-id]")'),
+"Saving a proposal must collect only proposal rows, never nested Remove line buttons with duplicate line IDs.");
+assert(source.includes("target.closest(DEPENDENCY_PROPOSAL_LINE_SELECTOR)?.dataset.salesLineId"),
+"Removing a manual line must inspect its containing proposal row instead of the Remove line button.");
+assert(dependencyHtml.includes('class="scm-transfer-dependencies-page"'), "Auto Transfer must expose a page-specific responsive scope.");
+assert(source.includes('data-action="set-mobile-panel"'), "Auto Transfer must expose phone workflow tabs.");
+assert(source.includes('data-mobile-panel="${depEscape(dependencyState.mobilePanel)}"'), "The selected phone workflow panel must be reflected in rendered markup.");
+assert(dispatchCss.includes("@media (max-width: 760px)"), "Auto Transfer must define a phone breakpoint.");
+assert(dispatchCss.includes('.scm-dependency-grid[data-mobile-panel="inventory"]'), "Phone layout must show one workflow panel at a time.");
+assert(dispatchCss.includes(".scm-transfer-dependencies-page .scm-dependency-shell"), "Phone layout must remove the desktop shell width constraint.");
+assert(dispatchCss.includes(".scm-transfer-dependencies-page .scm-dependency-manual-item-grid")
+  && dispatchCss.includes(".scm-dependency-manual-item-results"),
+"Manual-item search, results, quantity, and Add controls must have responsive phone styling.");
+assert(serverSource.includes("fetchDeliveryOrderDetailsBatchFromNetSuite")
+  && serverSource.includes("refreshTransferDependencySalesOrderAllocations"),
+"The Open dependency queue must refresh current committed/backordered quantities in one batched NetSuite query.");
+assert(serverSource.includes("force: req.body?.force === true"),
+  "The explicit refresh action must force a fresh SO allocation lookup.");
+assert(serverSource.includes("(currentInventory.orderLines || [])"),
+  "Refreshing Shortage & Inventory must refresh every displayed Sales Order item, not only shortage lines.");
+assert(repositorySource.includes("pl.line_source = 'shortage'"),
+  "Manual proposal items must not count as Sales Order shortage coverage.");
+assert(repositorySource.includes('"manual_transfer" : "sales_allocation"'),
+  "Created dependency records must distinguish manual material from SO allocations.");
 
 
 const preferred = preferredFullCoverageSourceYards(

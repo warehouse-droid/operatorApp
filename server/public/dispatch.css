@@ -1490,6 +1490,138 @@ button[data-action="enter-edit-mode"]:disabled:hover {
   font-weight: 900;
 }
 
+.scm-dependency-manual-badge {
+  display: inline-block;
+  margin-left: 7px;
+  padding: 2px 6px;
+  border: 1px solid #4d91b4;
+  border-radius: 999px;
+  background: #e8f5fb;
+  color: #185f82;
+  font-size: 9px;
+  line-height: 1.2;
+  text-transform: uppercase;
+  vertical-align: middle;
+}
+
+.scm-dependency-manual-item-editor {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px dashed #72a7a2;
+  border-radius: 7px;
+  background: #f0faf8;
+}
+
+.scm-dependency-manual-item-heading > div,
+.scm-dependency-manual-item-selected {
+  display: grid;
+  gap: 2px;
+}
+
+.scm-dependency-manual-item-heading small,
+.scm-dependency-manual-item-selected span,
+.scm-dependency-manual-item-selected small,
+.scm-dependency-manual-item-message {
+  color: #5d727c;
+  font-size: 10px;
+}
+
+.scm-dependency-manual-item-grid {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.4fr) minmax(160px, 1fr) minmax(120px, 0.7fr) minmax(100px, 0.6fr) auto;
+  gap: 7px;
+  align-items: end;
+}
+
+.scm-dependency-manual-item-grid > label {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+  color: #546a74;
+  font-size: 10px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.scm-dependency-manual-item-grid input,
+.scm-dependency-manual-item-grid select {
+  width: 100%;
+  min-width: 0;
+  min-height: 38px;
+}
+
+.scm-dependency-manual-item-search {
+  position: relative;
+}
+
+.scm-dependency-manual-item-results {
+  position: absolute;
+  z-index: 40;
+  top: calc(100% + 3px);
+  right: 0;
+  left: 0;
+  max-height: 270px;
+  overflow-y: auto;
+  border: 1px solid #8fa5af;
+  border-radius: 7px;
+  box-shadow: 0 12px 28px rgba(24, 49, 60, 0.2);
+  background: #fff;
+}
+
+.scm-dependency-manual-item-results button {
+  width: 100%;
+  min-height: 0;
+  display: grid;
+  gap: 2px;
+  padding: 9px 10px;
+  border: 0;
+  border-bottom: 1px solid #e0e8ec;
+  border-radius: 0;
+  background: #fff;
+  color: #17313c;
+  text-align: left;
+}
+
+.scm-dependency-manual-item-results button:hover,
+.scm-dependency-manual-item-results button:focus-visible {
+  background: #e9f7f4;
+}
+
+.scm-dependency-manual-item-results span {
+  color: #60747e;
+  font-size: 10px;
+}
+
+.scm-dependency-manual-item-results small {
+  color: #08766f;
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.scm-dependency-manual-item-message {
+  position: absolute;
+  z-index: 40;
+  top: calc(100% + 3px);
+  right: 0;
+  left: 0;
+  padding: 9px 10px;
+  border: 1px solid #aebec6;
+  border-radius: 7px;
+  background: #fff;
+  text-transform: none;
+}
+
+.scm-dependency-manual-item-message.error {
+  border-color: #d6a0a0;
+  color: #a32626;
+}
+
+.scm-dependency-manual-item-grid > button {
+  min-height: 38px;
+  white-space: nowrap;
+}
+
 .scm-dependency-pallet-summary {
   display: grid;
   grid-template-columns: minmax(130px, 0.7fr) minmax(190px, 1fr);
@@ -7795,4 +7927,278 @@ button.po-match-card:hover {
   top: 70px;
   left: 230px;
   right: 20px;
+}
+
+.scm-dependency-mobile-steps {
+  display: none;
+}
+
+@media (max-width: 760px) {
+  body.scm-transfer-dependencies-page {
+    overflow-x: hidden;
+    overflow-y: auto;
+    background: #eaf0f3;
+  }
+
+  .scm-transfer-dependencies-page .scm-dependency-shell {
+    width: 100%;
+    min-width: 0;
+    height: auto;
+    min-height: calc(100dvh - 72px);
+    display: block;
+    overflow: visible;
+  }
+
+  .scm-transfer-dependencies-page .dispatch-topbar {
+    position: relative;
+    z-index: 50;
+    min-height: 92px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "main language"
+      "actions actions";
+    gap: 6px 8px;
+    padding: 8px 10px;
+  }
+
+  .scm-transfer-dependencies-page .dispatch-topbar > div:first-child {
+    grid-area: main;
+    min-width: 0;
+  }
+
+  .scm-transfer-dependencies-page .dispatch-topbar h1 {
+    font-size: 22px;
+  }
+
+  .scm-transfer-dependencies-page .dispatch-user {
+    display: none;
+  }
+
+  .scm-transfer-dependencies-page .topbar-actions {
+    width: 100%;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    justify-self: stretch;
+  }
+
+  .scm-transfer-dependencies-page .topbar-actions button {
+    width: 100%;
+    min-height: 40px;
+    font-size: 14px;
+  }
+
+  .scm-transfer-dependencies-page .route-notice,
+  .scm-transfer-dependencies-page .dispatch-shell .route-notice {
+    top: 8px;
+    right: 8px;
+    left: 8px;
+    z-index: 120;
+  }
+
+  .scm-dependency-mobile-steps {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+    padding: 8px 8px 0;
+    background: #eaf0f3;
+  }
+
+  .scm-dependency-mobile-steps button {
+    min-height: 46px;
+    display: grid;
+    grid-template-columns: auto auto;
+    place-content: center;
+    gap: 5px;
+    padding: 6px;
+    border-color: #aebfc9;
+    background: #fff;
+    color: #304852;
+    font-size: 12px;
+  }
+
+  .scm-dependency-mobile-steps button span {
+    width: 20px;
+    height: 20px;
+    display: inline-grid;
+    place-items: center;
+    border-radius: 50%;
+    background: #e3ecef;
+    font-size: 11px;
+  }
+
+  .scm-dependency-mobile-steps button.active {
+    border-color: #007d75;
+    background: #e7f7f4;
+    color: #005e58;
+    box-shadow: inset 0 0 0 2px rgba(0, 125, 117, 0.12);
+  }
+
+  .scm-dependency-mobile-steps button.active span {
+    background: #007d75;
+    color: #fff;
+  }
+
+  .scm-transfer-dependencies-page .scm-dependency-toolbar {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 7px;
+    padding: 8px;
+  }
+
+  .scm-transfer-dependencies-page .scm-dependency-toolbar select {
+    width: 100%;
+    min-width: 0;
+    min-height: 44px;
+    grid-column: 1 / -1;
+    grid-row: 1;
+    font-size: 16px;
+  }
+
+  .scm-transfer-dependencies-page .scm-dependency-toolbar button {
+    width: 100%;
+    min-height: 44px;
+    padding-inline: 7px;
+    white-space: normal;
+  }
+
+  .scm-transfer-dependencies-page .scm-dependency-busy {
+    grid-column: 1 / -1;
+    min-height: 0;
+    margin-left: 0;
+    text-align: center;
+  }
+
+  .scm-transfer-dependencies-page .scm-dependency-grid {
+    height: auto;
+    min-height: 0;
+    display: block;
+    padding: 8px;
+    overflow: visible;
+  }
+
+  .scm-transfer-dependencies-page .scm-dependency-grid > .scm-dependency-panel {
+    display: none;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .scm-transfer-dependencies-page .scm-dependency-grid[data-mobile-panel="candidates"] > .scm-dependency-candidates,
+  .scm-transfer-dependencies-page .scm-dependency-grid[data-mobile-panel="inventory"] > .scm-dependency-inventory,
+  .scm-transfer-dependencies-page .scm-dependency-grid[data-mobile-panel="proposals"] > .scm-dependency-proposals {
+    display: grid;
+  }
+
+  .scm-transfer-dependencies-page .scm-dependency-panel-scroll,
+  .scm-transfer-dependencies-page .scm-dependency-order-list,
+  .scm-transfer-dependencies-page .scm-dependency-proposal-list {
+    max-height: none;
+    overflow-y: visible;
+  }
+
+  .scm-transfer-dependencies-page .scm-dependency-panel-scroll {
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+  }
+
+  .scm-transfer-dependencies-page .scm-dependency-candidate-title {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .scm-transfer-dependencies-page .scm-dependency-review-tabs {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .scm-transfer-dependencies-page .scm-dependency-review-tabs button {
+    min-height: 38px;
+  }
+
+  .scm-transfer-dependencies-page .scm-dependency-review-action {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: stretch;
+  }
+
+  .scm-transfer-dependencies-page .scm-dependency-review-action button {
+    width: 100%;
+    min-height: 42px;
+  }
+
+  .scm-transfer-dependencies-page .scm-dependency-order-summary {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .scm-transfer-dependencies-page .scm-dependency-order-summary strong {
+    overflow-wrap: anywhere;
+    white-space: normal;
+  }
+
+  .scm-transfer-dependencies-page .scm-dependency-proposal-route {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .scm-transfer-dependencies-page .scm-dependency-line-info {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: stretch;
+  }
+
+  .scm-transfer-dependencies-page .scm-dependency-line-controls {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .scm-transfer-dependencies-page .scm-dependency-line-info .link-sales-equivalent {
+    text-align: left;
+  }
+
+  .scm-transfer-dependencies-page .scm-dependency-remove-line {
+    width: 100%;
+    min-height: 38px;
+  }
+
+  .scm-transfer-dependencies-page .scm-dependency-proposal-line .link-quantity-units {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .scm-transfer-dependencies-page .scm-dependency-manual-item-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .scm-transfer-dependencies-page .scm-dependency-manual-item-grid > *,
+  .scm-transfer-dependencies-page .scm-dependency-manual-item-grid > button {
+    width: 100%;
+    min-width: 0;
+    min-height: 44px;
+  }
+
+  .scm-transfer-dependencies-page .scm-dependency-manual-item-grid input,
+  .scm-transfer-dependencies-page .scm-dependency-manual-item-grid select {
+    min-height: 44px;
+    font-size: 16px;
+  }
+
+  .scm-transfer-dependencies-page .scm-dependency-pallet-summary,
+  .scm-transfer-dependencies-page .scm-dependency-workflow {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .scm-transfer-dependencies-page .scm-dependency-pallet-summary small {
+    grid-column: 1;
+  }
+
+  .scm-transfer-dependencies-page .scm-dependency-proposal-actions {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .scm-transfer-dependencies-page .scm-dependency-proposal-actions button {
+    width: 100%;
+    min-width: 0;
+    min-height: 44px;
+  }
+
+  .scm-transfer-dependencies-page input,
+  .scm-transfer-dependencies-page select {
+    font-size: 16px;
+  }
 }

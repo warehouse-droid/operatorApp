@@ -13,6 +13,9 @@ const files = await Promise.all([
 ].map((file) => readFile(new URL(file, import.meta.url), "utf8")));
 
 const [server, control, login, operator, dispatchAuth, driver, sidebar, adminHtml] = files;
+const controlCss = await readFile(new URL("../public/control.css", import.meta.url), "utf8");
+const salesSettingsRepository = await readFile(new URL("sales-settings-repository.js", import.meta.url), "utf8");
+const salesSettingsMigration = await readFile(new URL("../migrations/064_sales_portal_settings.sql", import.meta.url), "utf8");
 
 function includesAll(source, values, label) {
   for (const value of values) {
@@ -21,7 +24,10 @@ function includesAll(source, values, label) {
 }
 
 includesAll(server, [
-  'app.get("/admin"',
+  '"/admin/accounts"',
+  '"/admin/sync"',
+  '"/admin/photo-storage"',
+  '"/admin/audit"',
   'if (role === "admin") return "/admin";',
   'if (role === "yard_manager") return "/control";',
   'operatorHasAnyRole(req.operator, ["admin", "yard_manager"])',
@@ -38,7 +44,11 @@ includesAll(server, [
   '"/control/yard-in-outbound"',
   '"/control/cycle-count-review"',
   '"/control/operator-load-records"',
-  'app.get("/api/admin/photo-archive"'
+  'app.get("/api/admin/photo-archive"',
+  'app.get("/api/admin/public-sales"',
+  'app.put("/api/admin/public-sales"',
+  'action: "sales.public_access_update"',
+  "await isPublicSalesAccessEnabled()"
 ], "server authorization");
 
 includesAll(control, [
@@ -46,6 +56,9 @@ includesAll(control, [
   'const STAFF_ROLES_KEY = "mbbs.staff.roles";',
   'const IS_ADMIN_PAGE = window.location.pathname.startsWith("/admin");',
   'const ADMIN_SECTIONS = new Set(["dashboard", "operators", "sync", "storage", "audit"]);',
+  'const ADMIN_SECTION_ROUTES = {',
+  'operators: "/admin/accounts"',
+  'storage: "/admin/photo-storage"',
   'const CONTROL_SECTION_ROUTES = {',
   'function sectionFromCurrentRoute()',
   'window.history.pushState({ controlSection: activeSection }, "", route);',
@@ -62,6 +75,10 @@ includesAll(control, [
   'data-action="new-account"',
   'renderOperatorDetail(selected)',
   'data-action="save-account-roles"',
+  'class="panel public-sales-access-card"',
+  'data-action="toggle-public-sales"',
+  'request("/api/admin/public-sales")',
+  'body: JSON.stringify({ enabled })',
   'method: "PUT"',
   '`/api/operators/${button.dataset.id}/roles`',
   'classifications = await request(`/api/inventory/classifications'
@@ -87,6 +104,7 @@ includesAll(operator, [
 includesAll(dispatchAuth, [
   'const DISPATCH_STAFF_TOKEN_KEY = "mbbs.staff.token";',
   'const DISPATCH_STAFF_ROLES_KEY = "mbbs.staff.roles";',
+  "DISPATCH_PUBLIC_SALES_PAGE && dispatchAuthOperator?.publicSales",
   'if (clean === "yard_manager") return "/control";',
   'localStorage.getItem("mbbs.driver.token")',
   'window.location.replace(dispatchRoleHome(payload.operator?.role));'
@@ -108,11 +126,46 @@ includesAll(sidebar, [
   '{ label: "Item Classification", href: "/control/item-classification"',
   '{ label: "Vendor Mapping", href: "/control/vendor-mapping"',
   '{ label: "Operator Warnings", href: "/control/operator-warnings"',
-  '{ label: "Yard In/Outbound", href: "/control/yard-in-outbound"',
+  '{ label: "In/Outbound Record", href: "/control/yard-in-outbound"',
   '{ label: "Cycle Count Review", href: "/control/cycle-count-review"',
   '{ label: "Operator Load Records", href: "/control/operator-load-records"',
-  '{ label: "Photo Storage", href: "/admin", controlSection: "storage"'
+  '{ label: "Accounts", href: "/admin/accounts", controlSection: "operators"',
+  '{ label: "Sync", href: "/admin/sync", controlSection: "sync"',
+  '{ label: "Photo Storage", href: "/admin/photo-storage", controlSection: "storage"',
+  '{ label: "Audit", href: "/admin/audit", controlSection: "audit"'
 ], "navigation");
+
+assert.ok(!sidebar.includes("event.preventDefault()"), "Sidebar section links must retain native navigation");
+includesAll(control, [
+  'document.body.classList.toggle("admin-sync-page", IS_ADMIN_PAGE && activeSection === "sync");'
+], "Admin Sync responsive scope");
+includesAll(controlCss, [
+  "@media (max-width: 760px)",
+  ".public-sales-access-card",
+  ".public-sales-access-control",
+  ".admin-sync-page .sync-mode-grid",
+  ".admin-sync-page .sync-status-grid",
+  ".admin-sync-page .panel > .actions"
+], "Admin Sync phone layout");
+
+includesAll(salesSettingsRepository, [
+  "export async function getSalesPortalSettings",
+  "export async function isPublicSalesAccessEnabled",
+  "export async function updateSalesPortalSettings",
+  "legacy_environment",
+  "typeof input.enabled !== \"boolean\""
+], "Public Sales persisted settings");
+
+includesAll(salesSettingsMigration, [
+  "CREATE TABLE IF NOT EXISTS sales_portal_settings",
+  "public_access_enabled boolean",
+  "sales_portal_settings_singleton"
+], "Public Sales settings migration");
+includesAll(sidebar, [
+  "body.admin-sync-page.has-app-sidebar",
+  "body.scm-transfer-dependencies-page.has-app-sidebar",
+  "inset: auto 0 0 0;"
+], "phone bottom navigation");
 
 includesAll(adminHtml, [
   '<title>MBBS Administration</title>',

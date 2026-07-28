@@ -934,7 +934,8 @@ export async function searchSmartScmVendorAlternatives(proposalId, { search = ""
             i.vendor_id, i.vendor, i.series, i.brand, i.product_type,
             i.to_plt, i.to_lyr, i.to_sec, i.to_pcs, i.item_weight,
             p.lead_time_days, p.purchase_lead_time_days,
-            y.location_id, y.yard_code, y.capacity_pallets, y.service_quantile, y.minimum_safety_pallets,
+            y.location_id, y.yard_code, y.capacity_pallets, y.service_quantile,
+            y.minimum_safety_pallets, y.lower_stock_policy_enabled,
             b.quantity_on_hand, b.quantity_available, b.synced_at AS inventory_synced_at,
             CASE
               WHEN NULLIF($3, '') IS NOT NULL AND LOWER(COALESCE(i.series, '')) = LOWER($3) THEN 4

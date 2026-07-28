@@ -1,7 +1,15 @@
 import { query } from "./db.js";
+import { salesStoreLocationIdSql } from "./sales-store.js";
 
 const VALID_DIRECTIONS = new Set(["inbound", "outbound"]);
-const VALID_ORDER_TYPES = new Set(["sales_order", "transfer_order", "purchase_order", "co_order", "vrma_order"]);
+const VALID_ORDER_TYPES = new Set(["sales_order", "transfer_order", "purchase_order", "co_order", "vrma_order", "custom_order"]);
+
+function salesModuleLocationIdSql(alias = "movement") {
+  return `CASE
+    WHEN ${alias}.order_type = 'sales_order' THEN ${salesStoreLocationIdSql(`${alias}.tranid`)}
+    ELSE ${alias}.yard_location_id
+  END`;
+}
 
 function normalizeDate(value, fallback = new Date()) {
   const text = String(value || "").trim();
@@ -29,6 +37,16 @@ function yardLocationIdSql(valueExpression) {
     WHEN ${valueExpression} ILIKE '%2967%' THEN 28::bigint
     WHEN ${valueExpression} ILIKE '%12441%' THEN 15::bigint
     WHEN ${valueExpression} ILIKE '%150%' THEN 26::bigint
+    ELSE NULL::bigint
+  END`;
+}
+
+function exactYardCodeLocationIdSql(valueExpression) {
+  return `CASE
+    WHEN BTRIM(COALESCE(${valueExpression}, '')) = '3445' THEN 1::bigint
+    WHEN BTRIM(COALESCE(${valueExpression}, '')) = '2967' THEN 28::bigint
+    WHEN BTRIM(COALESCE(${valueExpression}, '')) = '12441' THEN 15::bigint
+    WHEN BTRIM(COALESCE(${valueExpression}, '')) = '150' THEN 26::bigint
     ELSE NULL::bigint
   END`;
 }
@@ -137,6 +155,197 @@ function movementRecordsSql() {
   `;
 }
 
+function driverOrderCtes() {
+  const driverPhotoCount = photoCountSql("r.photo_data_urls");
+  return [
+    `driver_record_refs AS (
+      SELECT r.id AS driver_record_id,
+             r.job_id,
+             r.plan_id,
+             r.plan_date,
+             r.driver_login,
+             COALESCE(NULLIF(d.name, ''), r.driver_login) AS driver_name,
+             r.truck_id,
+             r.truck_plate,
+             r.load_id,
+             r.load_name,
+             r.stop_id,
+             r.stop_type,
+             r.order_refs,
+             r.photo_data_urls,
+             r.status,
+             r.started_at,
+             r.completed_at,
+             r.created_at,
+             r.job_details,
+             ref.order_ref,
+             ref.ref_index,
+             ${driverPhotoCount}::int AS driver_photo_count
+        FROM driver_job_records r
+        LEFT JOIN dispatch_drivers d
+          ON LOWER(BTRIM(d.login)) = LOWER(BTRIM(r.driver_login))
+        CROSS JOIN LATERAL jsonb_array_elements_text(
+          CASE
+            WHEN jsonb_typeof(COALESCE(r.order_refs, '[]'::jsonb)) = 'array'
+              THEN COALESCE(r.order_refs, '[]'::jsonb)
+            ELSE '[]'::jsonb
+          END
+        ) WITH ORDINALITY AS ref(order_ref, ref_index)
+       WHERE r.stop_type IN ('pickup', 'dropoff')
+         AND r.status IN ('in_progress', 'complete')
+         AND BTRIM(ref.order_ref) <> ''
+    )`,
+    `driver_order_matches AS (
+      SELECT refs.*,
+             'outbound'::text AS direction,
+             'sales_order'::text AS order_type,
+             o.netsuite_id AS order_id,
+             o.tranid,
+             o.customer AS party,
+             o.outbound_location_id AS yard_location_id,
+             o.outbound_location AS yard_location,
+             NULL::text AS source_location,
+             o.outbound_location AS destination_location,
+             10 AS match_priority
+        FROM driver_record_refs refs
+        JOIN sales_orders o
+          ON LOWER(BTRIM(o.tranid)) = LOWER(BTRIM(refs.order_ref))
+      UNION ALL
+      SELECT refs.*,
+             'inbound', 'purchase_order', o.netsuite_id,
+             COALESCE(NULLIF(o.dispatch_ref, ''), o.tranid), o.vendor,
+             o.destination_location_id, o.destination_location,
+             COALESCE(NULLIF(o.source_location, ''), o.vendor), o.destination_location,
+             20
+        FROM driver_record_refs refs
+        JOIN purchase_orders o
+          ON LOWER(BTRIM(refs.order_ref)) IN (
+            LOWER(BTRIM(COALESCE(o.tranid, ''))),
+            LOWER(BTRIM(COALESCE(o.dispatch_ref, '')))
+          )
+      UNION ALL
+      SELECT refs.*,
+             CASE WHEN refs.stop_type = 'dropoff' THEN 'inbound' ELSE 'outbound' END,
+             'transfer_order', o.netsuite_id, o.tranid,
+             CONCAT_WS(' → ', NULLIF(o.from_location, ''), NULLIF(o.to_location, '')),
+             CASE WHEN refs.stop_type = 'dropoff' THEN o.to_location_id ELSE o.from_location_id END,
+             CASE WHEN refs.stop_type = 'dropoff' THEN o.to_location ELSE o.from_location END,
+             o.from_location, o.to_location,
+             30
+        FROM driver_record_refs refs
+        JOIN transfer_orders o
+          ON LOWER(BTRIM(o.tranid)) = LOWER(BTRIM(refs.order_ref))
+      UNION ALL
+      SELECT refs.*,
+             CASE WHEN refs.stop_type = 'dropoff' THEN 'inbound' ELSE 'outbound' END,
+             'co_order', o.id, o.co_ref, o.source_order_ref,
+             CASE WHEN refs.stop_type = 'dropoff' THEN o.to_location_id ELSE o.from_location_id END,
+             CASE WHEN refs.stop_type = 'dropoff' THEN o.to_location ELSE o.from_location END,
+             o.from_location, o.to_location,
+             40
+        FROM driver_record_refs refs
+        JOIN local_co_orders o
+          ON LOWER(BTRIM(o.co_ref)) = LOWER(BTRIM(refs.order_ref))
+      UNION ALL
+      SELECT refs.*,
+             'outbound', 'vrma_order', o.id, o.vrma_ref,
+             COALESCE(NULLIF(o.local_vendor, ''), o.vendor),
+             ${yardLocationIdSql("COALESCE(o.pickup_location, '')")},
+             o.pickup_location, o.pickup_location, o.dropoff_location,
+             50
+        FROM driver_record_refs refs
+        JOIN scm_vrma_orders o
+          ON LOWER(BTRIM(o.vrma_ref)) = LOWER(BTRIM(refs.order_ref))
+      UNION ALL
+      SELECT refs.*,
+             'outbound', 'custom_order', o.id, o.ref_number,
+             'Custom Order',
+             ${exactYardCodeLocationIdSql("o.pickup_location")},
+             o.pickup_location, o.pickup_location, o.dropoff_location,
+             60
+        FROM driver_record_refs refs
+        JOIN dispatch_custom_orders o
+          ON LOWER(BTRIM(o.ref_number)) = LOWER(BTRIM(refs.order_ref))
+    )`,
+    `driver_order_events AS (
+      SELECT ranked.*
+        FROM (
+          SELECT matched.*,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY matched.driver_record_id, matched.ref_index
+                   ORDER BY matched.match_priority, matched.order_type, matched.order_id
+                 ) AS match_rank
+            FROM driver_order_matches matched
+        ) ranked
+       WHERE ranked.match_rank = 1
+    )`
+  ];
+}
+
+function recordEventsSql() {
+  return `
+    SELECT movement.direction,
+           movement.order_type,
+           movement.order_id,
+           movement.tranid,
+           movement.party,
+           movement.yard_location_id,
+           movement.yard_location,
+           movement.source_location,
+           movement.destination_location,
+           movement.movement_status,
+           CONCAT('yard:', movement.direction, ':', movement.order_type, ':', movement.record_id) AS event_key,
+           movement.processed_at AS activity_at,
+           1::int AS yard_activity_count,
+           movement.photo_count::int AS yard_photo_count,
+           0::int AS driver_activity_count,
+           0::int AS driver_photo_count,
+           NULL::timestamptz AS driver_completed_at,
+           NULL::timestamptz AS delivery_at,
+           NULL::text AS driver_name,
+           NULL::text AS driver_login,
+           NULL::text AS truck_plate,
+           NULL::text AS stop_type
+      FROM movement_records movement
+    UNION ALL
+    SELECT event.direction,
+           event.order_type,
+           event.order_id,
+           event.tranid,
+           event.party,
+           event.yard_location_id,
+           event.yard_location,
+           event.source_location,
+           event.destination_location,
+           CASE
+             WHEN event.status = 'complete' AND event.stop_type = 'dropoff' THEN 'delivered'
+             WHEN event.status = 'complete' AND event.stop_type = 'pickup' THEN 'pickup complete'
+             ELSE 'driver in progress'
+           END,
+           CONCAT('driver:', event.driver_record_id),
+           CASE
+             WHEN event.status = 'complete'
+               THEN COALESCE(event.completed_at, event.started_at, event.created_at)
+             ELSE COALESCE(event.started_at, event.created_at)
+           END,
+           0,
+           0,
+           1,
+           event.driver_photo_count,
+           CASE WHEN event.status = 'complete' THEN event.completed_at ELSE NULL END,
+           CASE
+             WHEN event.status = 'complete' AND event.stop_type = 'dropoff'
+               THEN event.completed_at
+             ELSE NULL
+           END,
+           event.driver_name,
+           event.driver_login,
+           event.truck_plate,
+           event.stop_type
+      FROM driver_order_events event
+  `;
+}
+
 function movementLinesSql() {
   const poReceived = receivedSalesSql("l");
   const toReceived = receivedSalesSql("l");
@@ -222,6 +431,13 @@ function movementLinesSql() {
            COALESCE(l.received_section_qty, 0), COALESCE(l.received_piece_qty, 0)
       FROM local_co_order_lines l
      WHERE ${coReceived} > 0
+    UNION ALL
+    SELECT 'outbound', 'custom_order', o.id, o.id, 1::bigint, NULL::bigint,
+           'Custom order', 'CUSTOM', o.order_details, 1::numeric,
+           'LOAD', 'LOAD', o.pickup_location,
+           NULL::numeric, NULL::numeric, NULL::numeric, NULL::numeric,
+           0::numeric, 0::numeric, 0::numeric, 0::numeric
+      FROM dispatch_custom_orders o
   `;
 }
 
@@ -237,7 +453,7 @@ function movementPhotosSql() {
   )`;
   return `
     SELECT 'outbound'::text AS direction, r.order_family AS order_type, r.order_id,
-           r.id, r.created_at, photo.photo_data_url, r.response
+           r.id, r.created_at, photo.photo_data_url, r.response, 'yard'::text AS source
       FROM operator_load_records r
       CROSS JOIN LATERAL ${arrayRows("r.photo_data_urls", "r.photo_data_url")} photo(photo_data_url)
      WHERE (r.order_family = 'sales_order' AND r.load_type IN ('sales_order_delivery_load', 'customer_pickup_load'))
@@ -245,7 +461,7 @@ function movementPhotosSql() {
         OR (r.order_family = 'vrma_order' AND r.load_type = 'vrma_local_load')
     UNION ALL
     SELECT 'outbound', 'co_order', o.id, r.id, r.created_at,
-           photo.photo_data_url, r.response
+           photo.photo_data_url, r.response, 'yard'
       FROM operator_load_records r
       JOIN local_co_orders o
         ON o.id = r.source_record_id
@@ -254,40 +470,54 @@ function movementPhotosSql() {
      WHERE r.load_type = 'local_co_load'
     UNION ALL
     SELECT 'inbound', 'purchase_order', r.order_id, r.id, r.created_at,
-           photo.photo_data_url, r.response
+           photo.photo_data_url, r.response, 'yard'
       FROM receiving_receipt_records r
       JOIN purchase_orders o ON o.netsuite_id = r.order_id
       CROSS JOIN LATERAL ${arrayRows("r.photo_data_urls")} photo(photo_data_url)
      WHERE r.receipt_status <> 'failed'
     UNION ALL
     SELECT 'inbound', 'transfer_order', r.order_id, r.id, r.created_at,
-           photo.photo_data_url, r.response
+           photo.photo_data_url, r.response, 'yard'
       FROM receiving_receipt_records r
       JOIN transfer_orders o ON o.netsuite_id = r.order_id
       CROSS JOIN LATERAL ${arrayRows("r.photo_data_urls")} photo(photo_data_url)
      WHERE r.receipt_status <> 'failed'
     UNION ALL
     SELECT 'inbound', 'co_order', r.co_id, r.id, r.created_at,
-           photo.photo_data_url, r.response
+           photo.photo_data_url, r.response, 'yard'
       FROM local_co_receipt_records r
       CROSS JOIN LATERAL ${arrayRows("r.photo_data_urls")} photo(photo_data_url)
   `;
 }
 
-function movementCtes({ lines = true, photos = false } = {}) {
-  const ctes = [`movement_records AS (${movementRecordsSql()})`];
+function movementCtes({ lines = true, photos = false, events = true } = {}) {
+  const ctes = [
+    `movement_records AS (${movementRecordsSql()})`,
+    ...driverOrderCtes()
+  ];
+  if (events) ctes.push(`record_events AS (${recordEventsSql()})`);
   if (lines) ctes.push(`movement_lines AS (${movementLinesSql()})`);
   if (photos) ctes.push(`movement_photos AS (${movementPhotosSql()})`);
   return `WITH ${ctes.join(",\n")}`;
 }
 
-function movementFilterParams({ from = "", to = "", yard = "all", search = "", itemSearch = "", direction = "", orderType = "" } = {}) {
+function movementFilterParams({
+  from = "",
+  to = "",
+  yard = "all",
+  search = "",
+  itemSearch = "",
+  direction = "",
+  orderType = "",
+  allowedYardLocationIds,
+  allowedSalesStoreLocationIds
+} = {}) {
   const fromDate = normalizeDate(from);
   const toDate = normalizeDate(to || fromDate);
   const params = [fromDate, toDate];
   const clauses = [
-    "movement.processed_at >= $1::date",
-    "movement.processed_at < ($2::date + interval '1 day')"
+    "movement.activity_at >= $1::date",
+    "movement.activity_at < ($2::date + interval '1 day')"
   ];
   const normalizedDirection = String(direction || "").trim().toLowerCase();
   if (VALID_DIRECTIONS.has(normalizedDirection)) {
@@ -299,9 +529,34 @@ function movementFilterParams({ from = "", to = "", yard = "all", search = "", i
     params.push(normalizedType);
     clauses.push(`movement.order_type = $${params.length}`);
   }
+  const salesStoreScoped = Array.isArray(allowedSalesStoreLocationIds);
+  const locationIdSql = salesStoreScoped
+    ? salesModuleLocationIdSql("movement")
+    : "movement.yard_location_id";
   if (yard && yard !== "all") {
     params.push(String(yard));
-    clauses.push(`movement.yard_location_id::text = $${params.length}`);
+    clauses.push(`(${locationIdSql})::text = $${params.length}`);
+  }
+  if (salesStoreScoped) {
+    const allowedStores = [...new Set(
+      allowedSalesStoreLocationIds.map(Number).filter((value) => Number.isInteger(value) && value > 0)
+    )];
+    if (!allowedStores.length) {
+      clauses.push("FALSE");
+    } else {
+      params.push(allowedStores);
+      clauses.push(`(${locationIdSql}) = ANY($${params.length}::bigint[])`);
+    }
+  } else if (Array.isArray(allowedYardLocationIds)) {
+    const allowedYards = [...new Set(
+      allowedYardLocationIds.map(Number).filter((value) => Number.isInteger(value) && value > 0)
+    )];
+    if (!allowedYards.length) {
+      clauses.push("FALSE");
+    } else {
+      params.push(allowedYards);
+      clauses.push(`movement.yard_location_id = ANY($${params.length}::bigint[])`);
+    }
   }
   const orderTerm = String(search || "").trim();
   if (orderTerm) {
@@ -334,36 +589,80 @@ function movementFilterParams({ from = "", to = "", yard = "all", search = "", i
   return { params, where: clauses.join("\n       AND "), fromDate, toDate };
 }
 
+function movementSummaryColumns(alias = "movement") {
+  return `
+    ${alias}.direction,
+    ${alias}.order_type,
+    ${alias}.order_id,
+    (ARRAY_AGG(${alias}.tranid ORDER BY ${alias}.activity_at DESC))[1] AS tranid,
+    (ARRAY_AGG(${alias}.party ORDER BY ${alias}.activity_at DESC))[1] AS party,
+    (ARRAY_AGG(${alias}.yard_location_id ORDER BY ${alias}.activity_at DESC))[1] AS yard_location_id,
+    (ARRAY_AGG(${alias}.yard_location ORDER BY ${alias}.activity_at DESC))[1] AS yard_location,
+    (ARRAY_AGG(${alias}.source_location ORDER BY ${alias}.activity_at DESC))[1] AS source_location,
+    (ARRAY_AGG(${alias}.destination_location ORDER BY ${alias}.activity_at DESC))[1] AS destination_location,
+    (ARRAY_AGG(${alias}.movement_status ORDER BY ${alias}.activity_at DESC))[1] AS movement_status,
+    MIN(${alias}.activity_at) FILTER (WHERE ${alias}.yard_activity_count > 0) AS first_processed_at,
+    MAX(${alias}.activity_at) FILTER (WHERE ${alias}.yard_activity_count > 0) AS last_processed_at,
+    MIN(${alias}.activity_at) AS first_activity_at,
+    MAX(${alias}.activity_at) AS last_activity_at,
+    COUNT(DISTINCT ${alias}.event_key) FILTER (WHERE ${alias}.yard_activity_count > 0)::int AS process_count,
+    COUNT(DISTINCT ${alias}.event_key) FILTER (WHERE ${alias}.yard_activity_count > 0)::int AS yard_activity_count,
+    COUNT(DISTINCT ${alias}.event_key) FILTER (WHERE ${alias}.driver_activity_count > 0)::int AS driver_activity_count,
+    COUNT(DISTINCT ${alias}.event_key) FILTER (WHERE ${alias}.driver_activity_count > 0)::int AS driver_record_count,
+    COALESCE(SUM(${alias}.yard_photo_count), 0)::int AS yard_photo_count,
+    COALESCE(SUM(${alias}.driver_photo_count), 0)::int AS driver_photo_count,
+    COALESCE(SUM(${alias}.yard_photo_count + ${alias}.driver_photo_count), 0)::int AS photo_count,
+    MAX(${alias}.driver_completed_at) AS last_driver_completed_at,
+    MAX(${alias}.delivery_at) AS delivery_at,
+    BOOL_OR(${alias}.yard_activity_count > 0) AS has_yard_record,
+    BOOL_OR(${alias}.driver_activity_count > 0) AS has_driver_record,
+    (
+      NOT BOOL_OR(${alias}.yard_activity_count > 0)
+      AND BOOL_OR(${alias}.driver_activity_count > 0)
+    ) AS driver_only,
+    (
+      ARRAY_AGG(NULLIF(${alias}.driver_name, '') ORDER BY ${alias}.activity_at DESC)
+        FILTER (WHERE COALESCE(${alias}.driver_name, '') <> '')
+    )[1] AS driver_name,
+    (
+      ARRAY_AGG(NULLIF(${alias}.truck_plate, '') ORDER BY ${alias}.activity_at DESC)
+        FILTER (WHERE COALESCE(${alias}.truck_plate, '') <> '')
+    )[1] AS truck_plate
+  `;
+}
+
 export async function listYardMovements(filters = {}) {
   const { params, where } = movementFilterParams(filters);
   const result = await query(
-    `${movementCtes()}
-     SELECT movement.direction,
-            movement.order_type,
-            movement.order_id,
-            movement.tranid,
-            movement.party,
-            movement.yard_location_id,
-            movement.yard_location,
-            movement.source_location,
-            movement.destination_location,
-            (ARRAY_AGG(movement.movement_status ORDER BY movement.processed_at DESC))[1] AS movement_status,
-            MIN(movement.processed_at) AS first_processed_at,
-            MAX(movement.processed_at) AS last_processed_at,
-            COUNT(DISTINCT movement.record_id)::int AS process_count,
-            SUM(movement.photo_count)::int AS photo_count
-       FROM movement_records movement
-      WHERE ${where}
-      GROUP BY movement.direction, movement.order_type, movement.order_id, movement.tranid,
-               movement.party, movement.yard_location_id, movement.yard_location,
-               movement.source_location, movement.destination_location
-      ORDER BY MAX(movement.processed_at) DESC, movement.tranid`,
+    `${movementCtes()},
+     matching_orders AS (
+       SELECT DISTINCT movement.direction, movement.order_type, movement.order_id
+         FROM record_events movement
+        WHERE ${where}
+     )
+     SELECT ${movementSummaryColumns()}
+       FROM record_events movement
+       JOIN matching_orders matched
+         ON matched.direction = movement.direction
+        AND matched.order_type = movement.order_type
+        AND matched.order_id = movement.order_id
+      GROUP BY movement.direction, movement.order_type, movement.order_id
+      ORDER BY MAX(movement.activity_at) DESC,
+               (ARRAY_AGG(movement.tranid ORDER BY movement.activity_at DESC))[1]`,
     params
   );
   return result.rows;
 }
 
-export async function getYardMovementDetail({ direction, orderType, orderId, from = "", to = "" } = {}) {
+export async function getYardMovementDetail({
+  direction,
+  orderType,
+  orderId,
+  from = "",
+  to = "",
+  allowedYardLocationIds,
+  allowedSalesStoreLocationIds
+} = {}) {
   const normalizedDirection = VALID_DIRECTIONS.has(String(direction || "").toLowerCase())
     ? String(direction).toLowerCase()
     : "outbound";
@@ -372,52 +671,145 @@ export async function getYardMovementDetail({ direction, orderType, orderId, fro
     : "sales_order";
   const fromDate = normalizeDate(from);
   const toDate = normalizeDate(to || fromDate);
+  const params = [normalizedDirection, normalizedType, String(orderId || ""), fromDate, toDate];
+  const allowedClauses = [];
+  const salesStoreScoped = Array.isArray(allowedSalesStoreLocationIds);
+  const allowedLocationIds = salesStoreScoped
+    ? allowedSalesStoreLocationIds
+    : allowedYardLocationIds;
+  if (Array.isArray(allowedLocationIds)) {
+    const allowedYards = [...new Set(
+      allowedLocationIds.map(Number).filter((value) => Number.isInteger(value) && value > 0)
+    )];
+    if (!allowedYards.length) {
+      allowedClauses.push("FALSE");
+    } else {
+      params.push(allowedYards);
+      const locationIdSql = salesStoreScoped
+        ? salesModuleLocationIdSql("movement")
+        : "movement.yard_location_id";
+      allowedClauses.push(`(${locationIdSql}) = ANY($${params.length}::bigint[])`);
+    }
+  }
   const orderResult = await query(
-    `${movementCtes({ lines: false })}
-     SELECT movement.direction, movement.order_type, movement.order_id, movement.tranid,
-            movement.party, movement.yard_location_id, movement.yard_location,
-            movement.source_location, movement.destination_location,
-            (ARRAY_AGG(movement.movement_status ORDER BY movement.processed_at DESC))[1] AS movement_status,
-            MIN(movement.processed_at) AS first_processed_at,
-            MAX(movement.processed_at) AS last_processed_at,
-            COUNT(DISTINCT movement.record_id)::int AS process_count,
-            SUM(movement.photo_count)::int AS photo_count
-       FROM movement_records movement
-      WHERE movement.direction = $1
-        AND movement.order_type = $2
-        AND movement.order_id = $3
-        AND movement.processed_at >= $4::date
-        AND movement.processed_at < ($5::date + interval '1 day')
-      GROUP BY movement.direction, movement.order_type, movement.order_id, movement.tranid,
-               movement.party, movement.yard_location_id, movement.yard_location,
-               movement.source_location, movement.destination_location`,
-    [normalizedDirection, normalizedType, orderId, fromDate, toDate]
+    `${movementCtes({ lines: false })},
+     matching_order AS (
+       SELECT DISTINCT movement.direction, movement.order_type, movement.order_id
+         FROM record_events movement
+        WHERE movement.direction = $1
+          AND movement.order_type = $2
+          AND movement.order_id::text = $3
+          AND movement.activity_at >= $4::date
+          AND movement.activity_at < ($5::date + interval '1 day')
+          ${allowedClauses.length ? `AND ${allowedClauses.join("\n          AND ")}` : ""}
+     )
+     SELECT ${movementSummaryColumns()}
+       FROM record_events movement
+       JOIN matching_order matched
+         ON matched.direction = movement.direction
+        AND matched.order_type = movement.order_type
+        AND matched.order_id = movement.order_id
+      GROUP BY movement.direction, movement.order_type, movement.order_id`,
+    params
   );
   if (!orderResult.rowCount) return null;
 
+  const detailParams = [normalizedDirection, normalizedType, String(orderId || "")];
   const lineResult = await query(
     `WITH movement_lines AS (${movementLinesSql()})
-     SELECT *
-       FROM movement_lines
-      WHERE direction = $1
-        AND order_type = $2
-        AND order_id = $3
-      ORDER BY line_id NULLS LAST, id`,
-    [normalizedDirection, normalizedType, orderId]
+       SELECT *
+         FROM movement_lines
+        WHERE direction = $1
+          AND order_type = $2
+          AND order_id::text = $3
+        ORDER BY line_id NULLS LAST, id`,
+    detailParams
   );
   const photoResult = await query(
     `WITH movement_photos AS (${movementPhotosSql()})
-     SELECT id, created_at, photo_data_url, response
-       FROM movement_photos
-      WHERE direction = $1
-        AND order_type = $2
-        AND order_id = $3
-        AND created_at >= $4::date
-        AND created_at < ($5::date + interval '1 day')
-      ORDER BY created_at DESC, id DESC`,
-    [normalizedDirection, normalizedType, orderId, fromDate, toDate]
+       SELECT id, created_at, photo_data_url, response, source
+         FROM movement_photos
+        WHERE direction = $1
+          AND order_type = $2
+          AND order_id::text = $3
+        ORDER BY created_at DESC, id DESC`,
+    detailParams
   );
-  return { order: orderResult.rows[0], lines: lineResult.rows, photos: photoResult.rows };
+  const driverResult = await query(
+    `${movementCtes({ lines: false, events: false })}
+       SELECT event.driver_record_id AS id,
+              event.job_id,
+              event.plan_id,
+              event.plan_date,
+              event.stop_id,
+              event.stop_type,
+              event.driver_login,
+              event.driver_name,
+              event.truck_id,
+              event.truck_plate,
+              event.load_id,
+              event.load_name,
+              event.status,
+              event.started_at,
+              event.completed_at,
+              event.created_at,
+              CASE
+                WHEN event.completed_at IS NOT NULL AND event.started_at IS NOT NULL
+                  THEN GREATEST(0, EXTRACT(EPOCH FROM event.completed_at - event.started_at))::int
+                ELSE NULL
+              END AS duration_seconds,
+              event.driver_photo_count AS photo_count,
+              event.photo_data_urls,
+              event.job_details,
+              CASE
+                WHEN event.status = 'complete' AND event.stop_type = 'dropoff'
+                  THEN event.completed_at
+                ELSE NULL
+              END AS delivery_at,
+              'driver'::text AS source
+         FROM driver_order_events event
+        WHERE event.direction = $1
+          AND event.order_type = $2
+          AND event.order_id::text = $3
+        ORDER BY COALESCE(event.completed_at, event.started_at, event.created_at) DESC,
+                 event.driver_record_id DESC`,
+    detailParams
+  );
+  const driverPhotoResult = await query(
+    `${movementCtes({ lines: false, events: false })}
+       SELECT CONCAT(event.driver_record_id, ':', photo.photo_index) AS id,
+              event.driver_record_id,
+              COALESCE(event.completed_at, event.started_at, event.created_at) AS created_at,
+              photo.photo_data_url,
+              'driver'::text AS source,
+              event.stop_type,
+              event.driver_login,
+              event.driver_name,
+              event.truck_plate
+         FROM driver_order_events event
+         CROSS JOIN LATERAL jsonb_array_elements_text(
+           CASE
+             WHEN jsonb_typeof(COALESCE(event.photo_data_urls, '[]'::jsonb)) = 'array'
+               THEN COALESCE(event.photo_data_urls, '[]'::jsonb)
+             ELSE '[]'::jsonb
+           END
+         ) WITH ORDINALITY AS photo(photo_data_url, photo_index)
+        WHERE event.direction = $1
+          AND event.order_type = $2
+          AND event.order_id::text = $3
+        ORDER BY COALESCE(event.completed_at, event.started_at, event.created_at) DESC,
+                 event.driver_record_id DESC,
+                 photo.photo_index`,
+    detailParams
+  );
+  return {
+    order: orderResult.rows[0],
+    lines: lineResult.rows,
+    photos: photoResult.rows,
+    driverRecords: driverResult.rows,
+    driverEvents: driverResult.rows,
+    driverPhotos: driverPhotoResult.rows
+  };
 }
 
 export async function listYardMovementCsvRows(filters = {}) {
@@ -429,19 +821,33 @@ export async function listYardMovementCsvRows(filters = {}) {
       orderType: order.order_type,
       orderId: order.order_id,
       from: filters.from,
-      to: filters.to
+      to: filters.to,
+      allowedYardLocationIds: filters.allowedYardLocationIds,
+      allowedSalesStoreLocationIds: filters.allowedSalesStoreLocationIds
     });
-    for (const line of detail?.lines || []) {
-      rows.push({
-        direction: order.direction,
-        order_type: order.order_type,
-        order_ref: order.tranid,
-        processed_at: order.last_processed_at,
-        yard_location: order.yard_location,
-        party: order.party,
-        ...line
-      });
+    const latestDelivery = (detail?.driverRecords || [])
+      .find((record) => record.stop_type === "dropoff" && record.status === "complete");
+    const common = {
+      direction: order.direction,
+      order_type: order.order_type,
+      order_ref: order.tranid,
+      processed_at: order.last_processed_at,
+      last_activity_at: order.last_activity_at,
+      delivery_at: order.delivery_at,
+      yard_location: order.yard_location,
+      party: order.party,
+      driver_only: order.driver_only,
+      driver_name: latestDelivery?.driver_name || order.driver_name || "",
+      truck_plate: latestDelivery?.truck_plate || order.truck_plate || "",
+      yard_photo_count: order.yard_photo_count,
+      driver_photo_count: order.driver_photo_count
+    };
+    const lines = detail?.lines || [];
+    if (!lines.length) {
+      rows.push(common);
+      continue;
     }
+    for (const line of lines) rows.push({ ...common, ...line });
   }
   return rows;
 }

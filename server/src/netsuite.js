@@ -559,42 +559,147 @@ export async function updateTransferOrderStatusInNetSuite(orderId, { intercompan
   return result;
 }
 
+function configuredPickingTicketRestletUrl() {
+  const endpoint = String(config.smartScm?.pickingTicketRestletUrl || "").trim();
+  if (!endpoint) throw new Error("SMART_SCM_PICKING_TICKET_RESTLET_URL is not configured.");
+  return new URL(endpoint);
+}
+
+function parsedRestletPayload(text) {
+  let payload;
+  try {
+    payload = JSON.parse(text);
+    if (typeof payload === "string") payload = JSON.parse(payload);
+  } catch {
+    return null;
+  }
+  return payload && typeof payload === "object" ? payload : null;
+}
+
+function restletErrorDetail(payload, text) {
+  const code = String(payload?.error?.code || payload?.code || "").trim();
+  const message = String(payload?.error?.message || payload?.message || "").trim();
+  const combined = [code, message].filter(Boolean).join(": ");
+  return combined || String(text || "").trim().slice(0, 2000) || "Unknown RESTlet error";
+}
+
+async function configuredRestletJson(params = {}) {
+  const url = configuredPickingTicketRestletUrl();
+  const request = Object.fromEntries(
+    Object.entries(params).filter(([, value]) => value !== undefined && value !== null && value !== "")
+  );
+  const accessToken = await getAccessToken();
+  const response = await netsuiteFetch(url, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${accessToken}`,
+      "Accept": "application/json",
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(request)
+  });
+  const text = await response.text();
+  const payload = parsedRestletPayload(text);
+  if (!response.ok) {
+    throw new Error(`NetSuite RESTlet failed: ${response.status} ${restletErrorDetail(payload, text)}`);
+  }
+  if (!payload) throw new Error("NetSuite RESTlet returned an invalid JSON response.");
+  if (payload.ok === false) throw new Error(`NetSuite RESTlet failed: ${restletErrorDetail(payload, text)}`);
+  return payload;
+}
+
+export async function probeNetSuiteRestlet({
+  entityId = null,
+  locationId = null,
+  requireSandbox = true
+} = {}) {
+  const hasEntity = entityId !== null && entityId !== undefined && String(entityId).trim() !== "";
+  const entity = hasEntity ? Number(entityId) : null;
+  const location = Number(locationId);
+  if (hasEntity && (!Number.isSafeInteger(entity) || entity <= 0)) {
+    throw new Error("A valid numeric NetSuite transaction ID is required for a picking-ticket probe.");
+  }
+  if (locationId !== null && locationId !== undefined && String(locationId).trim() !== ""
+      && (!Number.isSafeInteger(location) || location <= 0)) {
+    throw new Error("A valid numeric NetSuite location ID is required for a picking-ticket probe.");
+  }
+  const payload = await configuredRestletJson({
+    action: hasEntity ? "pickingTicket" : "health",
+    requireSandbox: requireSandbox ? "true" : "false",
+    entityId: hasEntity ? entity : null,
+    location: Number.isSafeInteger(location) && location > 0 ? location : null,
+    includeContent: hasEntity ? "false" : null
+  });
+  if (payload.ok !== true) throw new Error("NetSuite RESTlet did not return ok=true.");
+  if (requireSandbox && payload.sandbox !== true) {
+    throw new Error(`NetSuite RESTlet reported ${payload.environment || "a non-sandbox environment"}; sandbox was required.`);
+  }
+  if (hasEntity && (payload.action !== "pickingTicket" || Number(payload.entityId) !== entity)) {
+    throw new Error("NetSuite RESTlet picking-ticket probe returned the wrong transaction identity.");
+  }
+  return payload;
+}
+
+function verifiedPdfBuffer(contents) {
+  const buffer = Buffer.isBuffer(contents)
+    ? contents
+    : Buffer.from(String(contents || "").replace(/^data:application\/pdf;base64,/, ""), "base64");
+  if (buffer.length < 5 || buffer.subarray(0, 5).toString("ascii") !== "%PDF-") {
+    throw new Error("NetSuite picking-ticket RESTlet returned invalid PDF content.");
+  }
+  return buffer;
+}
+
 export async function fetchPickingTicketFromNetSuite(orderId, { locationId = null, filenamePrefix = "TO" } = {}) {
   const id = Number(orderId);
   if (!Number.isInteger(id) || id <= 0) throw new Error("A valid numeric NetSuite transaction ID is required.");
   const location = Number(locationId);
+  const requestedLocation = Number.isSafeInteger(location) && location > 0;
   const prefix = String(filenamePrefix || "transaction").trim().replace(/[^a-zA-Z0-9_-]+/g, "-") || "transaction";
-  const endpoint = String(config.smartScm?.pickingTicketRestletUrl || "").trim();
-  if (!endpoint) throw new Error("SMART_SCM_PICKING_TICKET_RESTLET_URL is not configured.");
-  const url = new URL(endpoint);
-  url.searchParams.set("entityId", String(id));
-  if (Number.isInteger(location) && location > 0) url.searchParams.set("location", String(location));
+  const url = configuredPickingTicketRestletUrl();
+  const request = {
+    action: "pickingTicket",
+    entityId: id,
+    includeContent: true
+  };
+  if (requestedLocation) request.location = location;
   const accessToken = await getAccessToken();
   const response = await netsuiteFetch(url, {
-    method: "GET",
+    method: "POST",
     headers: {
       "Authorization": `Bearer ${accessToken}`,
-      "Accept": "application/pdf, application/json"
-    }
+      "Accept": "application/pdf, application/json",
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(request)
   });
-  if (!response.ok) throw new Error(`NetSuite picking ticket failed: ${response.status} ${await response.text()}`);
   const contentType = response.headers.get("content-type") || "";
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`NetSuite picking ticket failed: ${response.status} ${restletErrorDetail(parsedRestletPayload(text), text)}`);
+  }
   if (contentType.includes("application/pdf")) {
     return {
-      buffer: Buffer.from(await response.arrayBuffer()),
+      buffer: verifiedPdfBuffer(Buffer.from(await response.arrayBuffer())),
       contentType: "application/pdf",
       filename: `${prefix}-${id}-picking-ticket.pdf`,
       locationApplied: false
     };
   }
-  const payload = await response.json();
+  const text = await response.text();
+  const payload = parsedRestletPayload(text);
+  if (!payload) throw new Error("NetSuite picking-ticket RESTlet returned an invalid JSON response.");
+  if (payload.ok === false) throw new Error(`NetSuite picking-ticket RESTlet failed: ${restletErrorDetail(payload, text)}`);
+  if (payload.entityId !== undefined && Number(payload.entityId) !== id) {
+    throw new Error("NetSuite picking-ticket RESTlet returned the wrong transaction identity.");
+  }
   const base64 = payload.contentBase64 || payload.base64 || payload.contents || "";
   if (!base64) throw new Error("NetSuite picking-ticket RESTlet returned no PDF content.");
   return {
-    buffer: Buffer.from(String(base64).replace(/^data:application\/pdf;base64,/, ""), "base64"),
+    buffer: verifiedPdfBuffer(base64),
     contentType: payload.contentType || "application/pdf",
     filename: `${prefix}-${id}-picking-ticket.pdf`,
-    locationApplied: payload.locationApplied === true && Number(payload.locationId) === location
+    locationApplied: requestedLocation && payload.locationApplied === true && Number(payload.locationId) === location
   };
 }
 
@@ -1107,6 +1212,74 @@ export async function fetchDeliveryOrderDetailsFromNetSuite(orderId, locationId 
 
   const result = await suiteql(detailQuery);
   return (result.items || []).map(normalizeOpenDeliveryLine);
+}
+
+export async function fetchDeliveryOrderDetailsBatchFromNetSuite(orderIds) {
+  if (orderIds === null || orderIds === undefined || typeof orderIds[Symbol.iterator] !== "function") {
+    throw new Error("NetSuite sales order IDs must be provided as an iterable.");
+  }
+  const requestedIds = [...orderIds];
+  const parsedIds = requestedIds.map((orderId) => Number(orderId));
+  if (parsedIds.some((orderId) => !Number.isSafeInteger(orderId) || orderId <= 0)) {
+    throw new Error("Every NetSuite sales order ID must be a valid positive integer.");
+  }
+  const ids = [...new Set(parsedIds)];
+  const linesByOrderId = new Map(ids.map((orderId) => [orderId, []]));
+  if (!ids.length) return linesByOrderId;
+
+  // Oracle-backed SuiteQL limits IN lists to 1,000 expressions. Normal requests
+  // use one query; unusually large refreshes are split below that hard limit.
+  const chunkSize = 900;
+  for (let offset = 0; offset < ids.length; offset += chunkSize) {
+    const chunk = ids.slice(offset, offset + chunkSize);
+    const rows = await suiteqlAll(`
+      SELECT
+        tl.transaction AS transaction_id,
+        tl.uniquekey AS line_id,
+        tl.item AS item_id,
+        BUILTIN.DF(tl.item) AS item_name,
+        i.itemtype AS item_type,
+        BUILTIN.DF(i.itemtype) AS item_type_text,
+        tl.memo AS item_description,
+        tl.quantity,
+        tl.quantitycommitted AS netsuite_committed_qty,
+        tl.quantitybackordered AS netsuite_backordered_qty,
+        tl.quantityshiprecv AS netsuite_received_qty,
+        BUILTIN.DF(tl.units) AS unit,
+        i.weight AS item_weight,
+        tl.location AS location_id,
+        BUILTIN.DF(tl.location) AS location,
+        tl.custcol_plt AS pallet_qty,
+        tl.custcol_lyr AS layer_qty,
+        tl.custcol_pcs AS piece_qty,
+        tl.custcol_sec AS section_qty,
+        i.custitem_toplt AS to_plt,
+        i.custitem_tolyr AS to_lyr,
+        i.custitem_tosec AS to_sec,
+        i.custitem_topcs AS to_pcs
+      FROM transactionline tl
+      LEFT JOIN item i ON i.id = tl.item
+      WHERE tl.transaction IN (${chunk.join(",")})
+        AND EXISTS (
+          SELECT 1
+            FROM transaction t
+           WHERE t.id = tl.transaction
+             AND t.type = 'SalesOrd'
+             ${excludedSalesOrderPrefixSql("t")}
+        )
+        AND tl.item IS NOT NULL
+        AND tl.mainline = 'F'
+        AND tl.taxline = 'F'
+        AND ${openLineFilterSql("tl")}
+      ORDER BY tl.transaction, tl.uniquekey
+    `);
+    for (const line of rows.map(normalizeOpenDeliveryLine)) {
+      const orderId = Number(line.transaction_id);
+      const groupedLines = linesByOrderId.get(orderId);
+      if (groupedLines) groupedLines.push(line);
+    }
+  }
+  return linesByOrderId;
 }
 
 export async function fetchTransferOrderDetailsFromNetSuite(orderId, locationId = null, { direction = "source" } = {}) {

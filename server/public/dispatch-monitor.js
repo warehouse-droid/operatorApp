@@ -646,7 +646,7 @@ function renderMonitorApp() {
         ${languageToggle()}
         <button onclick="location.href='${SALES_MONITOR_HOST ? "/sales" : "/dispatch"}'" type="button">Menu</button>
         <span class="dispatch-user">${escapeHtml(monitorOperator?.display_name || monitorOperator?.username || "")}</span>
-        <button onclick="dispatchLogout()" type="button">Logout</button>
+        ${monitorOperator?.publicSales ? "" : `<button onclick="dispatchLogout()" type="button">Logout</button>`}
       </div>
     </header>
     <section class="monitor-grid">

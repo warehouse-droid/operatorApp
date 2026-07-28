@@ -28,10 +28,7 @@
 
   function isActive(item) {
     if (item.controlSection) {
-      if (item.href.startsWith("/control")) return path === item.href;
-      const storageKey = item.href === "/admin" ? "mbbs.admin.section" : "mbbs.control.section";
-      const current = localStorage.getItem(storageKey) || "dashboard";
-      return path === item.href && current === item.controlSection;
+      return path === item.href;
     }
     if (item.href === "/control") return path.startsWith("/control");
     if (item.href === "/admin") return path.startsWith("/admin");
@@ -54,11 +51,12 @@
   const dispatchItems = [
     { label: "Menu", href: "/dispatch", icon: "MN" },
     { label: "Planning", href: "/dispatch/planning", icon: "PL" },
+    { label: "Custom Orders", href: "/dispatch/custom-orders", icon: "CU" },
     { label: "Monitor", href: "/dispatch/monitor", icon: "MO" },
     { label: "Statistics", href: "/dispatch/statistics", icon: "ST" },
     { label: "DVIR", href: "/dispatch/dvir", icon: "DV" },
     { label: "PO/TO Schedule", href: "/dispatch/po-to-schedule", icon: "PT" },
-    { label: "Yard In/Outbound", href: "/dispatch/loaded-export", icon: "YI" },
+    { label: "In/Outbound Record", href: "/dispatch/loaded-export", icon: "IR" },
     { label: "SO Method", href: "/dispatch/sales-order-methods", icon: "SO" },
     { label: "Snapshot", href: "/dispatch/snapshot", icon: "SN" },
     { label: "Setup", href: "/dispatch/setup", icon: "SE" }
@@ -81,7 +79,8 @@
     { label: "Planning View", href: "/sales/planning", icon: "PL" },
     { label: "PO/TO Schedule", href: "/sales/schedule", icon: "PT" },
     { label: "Truck Monitor", href: "/sales/monitor", icon: "MO" },
-    { label: "SO Printing", href: "/sales/printing", icon: "PR" }
+    { label: "SO Printing", href: "/sales/printing", icon: "PR" },
+    { label: "In/Outbound Record", href: "/sales/in-outbound-record", icon: "IR", staffOnly: true }
   ];
 
   const controlItems = [
@@ -90,21 +89,22 @@
     { label: "Item Classification", href: "/control/item-classification", controlSection: "classification", icon: "CL" },
     { label: "Vendor Mapping", href: "/control/vendor-mapping", controlSection: "vendor-mapping", icon: "VM" },
     { label: "Operator Warnings", href: "/control/operator-warnings", controlSection: "warnings", icon: "WN" },
-    { label: "Yard In/Outbound", href: "/control/yard-in-outbound", controlSection: "loaded-export", icon: "YI" },
+    { label: "In/Outbound Record", href: "/control/yard-in-outbound", controlSection: "loaded-export", icon: "IR" },
     { label: "Cycle Count Review", href: "/control/cycle-count-review", controlSection: "cycle-count", icon: "CC" },
     { label: "Operator Load Records", href: "/control/operator-load-records", controlSection: "fulfillment", icon: "LD" }
   ];
 
   const adminItems = [
     { label: "Overview", href: "/admin", controlSection: "dashboard", icon: "OV" },
-    { label: "Accounts", href: "/admin", controlSection: "operators", icon: "AC" },
-    { label: "Sync", href: "/admin", controlSection: "sync", icon: "SY" },
+    { label: "Accounts", href: "/admin/accounts", controlSection: "operators", icon: "AC" },
+    { label: "Sync", href: "/admin/sync", controlSection: "sync", icon: "SY" },
     { label: "Yard Printers", href: "/admin/printers", icon: "PR" },
-    { label: "Photo Storage", href: "/admin", controlSection: "storage", icon: "PS" },
-    { label: "Audit", href: "/admin", controlSection: "audit", icon: "AU" }
+    { label: "Photo Storage", href: "/admin/photo-storage", controlSection: "storage", icon: "PS" },
+    { label: "Audit", href: "/admin/audit", controlSection: "audit", icon: "AU" }
   ];
 
   function visibleMainItems() {
+    if (path.startsWith("/sales")) return mainItems.filter((item) => item.href === "/sales");
     const normalizeRole = (value) => String(value || "").trim().toLowerCase().replaceAll("-", "_").replaceAll(" ", "_");
     let savedRoles = [];
     try {
@@ -129,7 +129,13 @@
     if (path.startsWith("/admin")) return { title: "Admin", items: adminItems };
     if (path.startsWith("/dispatch")) return { title: "Dispatch", items: dispatchItems };
     if (path.startsWith("/scm")) return { title: "SCM", items: scmItems };
-    if (path.startsWith("/sales")) return { title: "Sales", items: salesItems };
+    if (path.startsWith("/sales")) {
+      const operator = window.MBBS_DISPATCH_OPERATOR;
+      return {
+        title: "Sales",
+        items: salesItems.filter((item) => !item.staffOnly || (operator && !operator.publicSales))
+      };
+    }
     return { title: "Control", items: controlItems };
   }
 
@@ -296,6 +302,91 @@
       body.app-sidebar-collapsed .app-sidebar-toggle {
         width: 42px;
       }
+      @media (max-width: 760px) {
+        body.admin-sync-page.has-app-sidebar,
+        body.scm-transfer-dependencies-page.has-app-sidebar {
+          --app-sidebar-width: 0px !important;
+          padding-left: 0 !important;
+          padding-bottom: calc(72px + env(safe-area-inset-bottom));
+        }
+        body.admin-sync-page.has-app-sidebar .dispatch-shell,
+        body.scm-transfer-dependencies-page.has-app-sidebar .dispatch-shell {
+          width: 100vw;
+          min-width: 0;
+        }
+        body.admin-sync-page .app-sidebar,
+        body.scm-transfer-dependencies-page .app-sidebar {
+          inset: auto 0 0 0;
+          width: 100%;
+          height: calc(72px + env(safe-area-inset-bottom));
+          display: block;
+          border-top: 1px solid #c6d3da;
+          border-right: 0;
+          box-shadow: 0 -8px 20px rgba(15, 37, 47, 0.18);
+        }
+        body.admin-sync-page .app-sidebar-head,
+        body.admin-sync-page .app-sidebar-foot,
+        body.scm-transfer-dependencies-page .app-sidebar-head,
+        body.scm-transfer-dependencies-page .app-sidebar-foot {
+          display: none;
+        }
+        body.admin-sync-page .app-sidebar-scroll,
+        body.scm-transfer-dependencies-page .app-sidebar-scroll,
+        body.admin-sync-page.app-sidebar-collapsed .app-sidebar-scroll,
+        body.scm-transfer-dependencies-page.app-sidebar-collapsed .app-sidebar-scroll {
+          height: 100%;
+          display: flex;
+          overflow-x: auto;
+          overflow-y: hidden;
+          padding: 5px 6px calc(5px + env(safe-area-inset-bottom));
+          overscroll-behavior-x: contain;
+          scrollbar-width: thin;
+        }
+        body.admin-sync-page .app-sidebar-section,
+        body.scm-transfer-dependencies-page .app-sidebar-section {
+          flex: 0 0 auto;
+          display: flex;
+          gap: 4px;
+          margin: 0;
+          padding-right: 7px;
+          border-right: 1px solid rgba(255, 255, 255, 0.18);
+        }
+        body.admin-sync-page .app-sidebar-section:nth-child(2),
+        body.scm-transfer-dependencies-page .app-sidebar-section:nth-child(2) {
+          order: -1;
+          margin-right: 4px;
+        }
+        body.admin-sync-page .app-sidebar-section-title,
+        body.scm-transfer-dependencies-page .app-sidebar-section-title {
+          display: none;
+        }
+        body.admin-sync-page .app-sidebar-link,
+        body.admin-sync-page.app-sidebar-collapsed .app-sidebar-link,
+        body.scm-transfer-dependencies-page .app-sidebar-link,
+        body.scm-transfer-dependencies-page.app-sidebar-collapsed .app-sidebar-link {
+          width: 68px;
+          min-height: 60px;
+          flex: 0 0 68px;
+          display: grid;
+          grid-template-columns: 1fr;
+          grid-template-rows: 30px 14px;
+          justify-items: center;
+          gap: 2px;
+          padding: 3px 4px;
+          scroll-snap-align: center;
+        }
+        body.admin-sync-page .app-sidebar-text,
+        body.admin-sync-page.app-sidebar-collapsed .app-sidebar-text,
+        body.scm-transfer-dependencies-page .app-sidebar-text,
+        body.scm-transfer-dependencies-page.app-sidebar-collapsed .app-sidebar-text {
+          width: 100%;
+          display: block;
+          color: #eaf2f5;
+          font-size: 9px;
+          line-height: 14px;
+          text-align: center;
+        }
+      }
     `;
   }
 
@@ -368,14 +459,6 @@
     const targetPath = new URL(link.href, window.location.origin).pathname;
     const sectionStorageKey = targetPath.startsWith("/admin") ? "mbbs.admin.section" : "mbbs.control.section";
     localStorage.setItem(sectionStorageKey, link.dataset.controlSection || "dashboard");
-    if (targetPath.startsWith("/control")) return;
-    if (path.startsWith("/admin") && targetPath.startsWith("/admin")) {
-      event.preventDefault();
-      window.dispatchEvent(new CustomEvent("mbbs-control-section", {
-        detail: { section: link.dataset.controlSection || "dashboard" }
-      }));
-      render();
-    }
   }
 
   function init() {
@@ -391,6 +474,7 @@
       handleControlSection(event);
     });
     window.addEventListener("mbbs-language-changed", render);
+    window.addEventListener("mbbs-auth-operator-changed", render);
     window.addEventListener("mbbs-sidebar-route-changed", () => {
       path = window.location.pathname;
       render();

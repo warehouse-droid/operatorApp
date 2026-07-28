@@ -1,5 +1,16 @@
 const dispatchLoadedApp = document.getElementById("dispatchLoadedApp");
 const loadedT = (key, fallback) => window.MBBS_I18N?.t(key, fallback) || fallback;
+const loadedSalesHost = window.location.pathname === "/sales/in-outbound-record"
+  || window.location.pathname.startsWith("/sales/in-outbound-record/");
+const loadedApiBase = loadedSalesHost ? "/api/sales/in-outbound-records" : "/api/dispatch/loaded-orders";
+const loadedHome = loadedSalesHost ? "/sales" : "/dispatch";
+const loadedRoles = loadedSalesHost ? ["sales", "admin"] : ["dispatcher", "admin"];
+const LOADED_YARDS = [
+  { locationId: 1, yardCode: "3445" },
+  { locationId: 28, yardCode: "2967" },
+  { locationId: 15, yardCode: "12441" },
+  { locationId: 26, yardCode: "150" }
+];
 
 function loadedToday() {
   const date = new Date();
@@ -19,7 +30,7 @@ const loadedState = {
     inbound: ["purchase_order", "transfer_order", "co_order"].includes(localStorage.getItem("mbbs.dispatch.loaded.inboundType"))
       ? localStorage.getItem("mbbs.dispatch.loaded.inboundType")
       : "purchase_order",
-    outbound: ["sales_order", "transfer_order", "co_order", "vrma_order"].includes(localStorage.getItem("mbbs.dispatch.loaded.outboundType"))
+    outbound: ["sales_order", "transfer_order", "co_order", "vrma_order", "custom_order"].includes(localStorage.getItem("mbbs.dispatch.loaded.outboundType"))
       ? localStorage.getItem("mbbs.dispatch.loaded.outboundType")
       : "sales_order"
   },
@@ -55,9 +66,39 @@ function loadedOrderKey(order) {
   return `${order.direction}:${order.order_type}:${order.order_id}`;
 }
 
+function loadedField(source, ...keys) {
+  for (const key of keys) {
+    if (source?.[key] !== undefined && source?.[key] !== null) return source[key];
+  }
+  return null;
+}
+
+function loadedNumber(source, keys, fallback = 0) {
+  const value = loadedField(source, ...keys);
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function loadedBoolean(source, ...keys) {
+  const value = loadedField(source, ...keys);
+  return value === true || value === 1 || String(value || "").toLowerCase() === "true";
+}
+
+function loadedOperatorRoles(operator = loadedState.operator) {
+  return new Set([...(operator?.roles || []), operator?.role]
+    .map((role) => String(role || "").trim().toLowerCase().replaceAll("-", "_").replaceAll(" ", "_"))
+    .filter(Boolean));
+}
+
+function loadedAllowedYards() {
+  if (!loadedSalesHost || loadedOperatorRoles().has("admin")) return LOADED_YARDS;
+  const allowed = new Set((loadedState.operator?.yardLocationIds || loadedState.operator?.yard_location_ids || []).map(Number));
+  return LOADED_YARDS.filter((yard) => allowed.has(yard.locationId));
+}
+
 const DISPATCH_YARD_TYPES = {
   inbound: ["purchase_order", "transfer_order", "co_order"],
-  outbound: ["sales_order", "transfer_order", "co_order", "vrma_order"]
+  outbound: ["sales_order", "transfer_order", "co_order", "vrma_order", "custom_order"]
 };
 
 function selectedMovementType() {
@@ -70,7 +111,8 @@ function movementTypeCode(orderType) {
     transfer_order: "TO",
     purchase_order: "PO",
     co_order: "CO",
-    vrma_order: "VRMA"
+    vrma_order: "VRMA",
+    custom_order: "Custom"
   }[orderType] || String(orderType || "").toUpperCase();
 }
 
@@ -80,7 +122,8 @@ function movementTypeLabel(orderType) {
     transfer_order: loadedT("yard.transferOrder", "Transfer Order"),
     purchase_order: loadedT("yard.purchaseOrder", "Purchase Order"),
     co_order: loadedT("yard.coOrder", "CO Order"),
-    vrma_order: "VRMA"
+    vrma_order: "VRMA",
+    custom_order: loadedT("dispatch.customOrders", "Custom Order")
   }[orderType] || orderType;
 }
 
@@ -207,11 +250,11 @@ async function loadSelectedDetail() {
   params.set("direction", selected.direction);
   params.set("orderType", selected.order_type);
   params.set("orderId", selected.order_id);
-  loadedState.detail = await loadedRequest(`/api/dispatch/loaded-orders/detail?${params.toString()}`);
+  loadedState.detail = await loadedRequest(`${loadedApiBase}/detail?${params.toString()}`);
 }
 
 async function loadLoadedOrders({ keepSelection = false } = {}) {
-  loadedState.orders = await loadedRequest(`/api/dispatch/loaded-orders?${loadedFilterQuery().toString()}`);
+  loadedState.orders = await loadedRequest(`${loadedApiBase}?${loadedFilterQuery().toString()}`);
   if (!keepSelection || !loadedState.orders.some((order) => loadedOrderKey(order) === loadedState.selectedKey)) {
     loadedState.selectedKey = loadedState.orders[0] ? loadedOrderKey(loadedState.orders[0]) : "";
   }
@@ -233,7 +276,7 @@ async function loadLoadedSearch() {
   }
   loadedState.searchLoading = true;
   updateLoadedPanels();
-  const results = await loadedRequest(`/api/dispatch/loaded-orders?${loadedSearchQuery().toString()}`);
+  const results = await loadedRequest(`${loadedApiBase}?${loadedSearchQuery().toString()}`);
   if (seq !== loadedState.searchSeq) return;
   loadedState.searchResults = results;
   loadedState.searchLoading = false;
@@ -263,12 +306,12 @@ function openLoadedPhoto(photoRef, label) {
 }
 
 async function downloadLoadedCsv() {
-  const response = await fetch(`/api/dispatch/loaded-orders/export.csv?${loadedFilterQuery().toString()}`);
+  const response = await fetch(`${loadedApiBase}/export.csv?${loadedFilterQuery().toString()}`);
   if (!response.ok) throw new Error(await response.text());
   const url = URL.createObjectURL(await response.blob());
   const link = document.createElement("a");
   link.href = url;
-  link.download = `yard-in-outbound-${loadedState.filters.from}-${loadedState.filters.to}.csv`;
+  link.download = `in-outbound-record-${loadedState.filters.from}-${loadedState.filters.to}.csv`;
   document.body.appendChild(link);
   link.click();
   link.remove();
@@ -280,34 +323,152 @@ function renderLoadedList() {
   return `
     <div class="dispatch-loaded-list-head"><strong>${orders.length}</strong><span>${loadedSearchActive() ? loadedT("yard.globalResults", "results across all directions and order types") : `${movementTypeCode(selectedMovementType())} · ${loadedT("yard.processed", "processed")}`}</span></div>
     ${loadedState.searchLoading ? `<div class="dispatch-loaded-notice">${loadedT("control.searching", "Searching...")} ${loadedT("yard.searchingHelp", "Checking all processed yard movements across every direction, type, yard, and date.")}</div>` : ""}
-    ${orders.map((order) => `<button class="dispatch-loaded-order ${loadedOrderKey(order) === loadedState.selectedKey ? "active" : ""}" data-action="select-loaded-order" data-key="${loadedEscape(loadedOrderKey(order))}" type="button">
-      <div class="dispatch-movement-card-head"><strong>${loadedEscape(order.tranid || order.order_id)}</strong><span class="dispatch-movement-badges"><i class="dispatch-movement-badge ${loadedEscape(order.direction)}">${loadedT(`yard.${order.direction}`, order.direction)}</i><i class="dispatch-movement-badge type">${movementTypeCode(order.order_type)}</i></span></div>
-      <span>${loadedEscape(order.yard_location || loadedT("common.yard", "Yard"))} | ${loadedEscape(order.movement_status || loadedT("yard.processed", "Processed"))}</span>
-      <em>${loadedFormatDate(order.last_processed_at)} | ${order.process_count || 0} ${loadedT("yard.activities", "activities")} | ${order.photo_count || 0} ${loadedT("common.photos", "photos")}</em>
-      ${order.party ? `<small>${loadedEscape(order.party)}</small>` : ""}
-    </button>`).join("") || (!loadedState.searchLoading ? `<div class="dispatch-loaded-notice">${loadedSearchActive() ? loadedT("yard.noSearchResults", "No order matched either search across all dates, yards, directions, and order types.") : loadedT("yard.noFilterResults", "No processed movement matched this direction, order type, date, and yard.")}</div>` : "")}
+    ${orders.map((order) => {
+      const driverOnly = loadedBoolean(order, "driver_only", "driverOnly");
+      const yardActivities = loadedNumber(order, ["yard_activity_count", "yardActivityCount"], loadedNumber(order, ["process_count", "processCount"]));
+      const driverActivities = loadedNumber(order, ["driver_activity_count", "driverActivityCount"]);
+      const yardPhotos = loadedNumber(order, ["yard_photo_count", "yardPhotoCount"], loadedNumber(order, ["photo_count", "photoCount"]));
+      const driverPhotos = loadedNumber(order, ["driver_photo_count", "driverPhotoCount"]);
+      const deliveryAt = loadedField(order, "delivery_at", "deliveryAt");
+      const lastActivityAt = loadedField(order, "last_activity_at", "lastActivityAt", "last_processed_at", "lastProcessedAt");
+      return `<button class="dispatch-loaded-order ${loadedOrderKey(order) === loadedState.selectedKey ? "active" : ""}" data-action="select-loaded-order" data-key="${loadedEscape(loadedOrderKey(order))}" type="button">
+        <div class="dispatch-movement-card-head"><strong>${loadedEscape(order.tranid || order.order_id)}</strong><span class="dispatch-movement-badges"><i class="dispatch-movement-badge ${loadedEscape(order.direction)}">${loadedT(`yard.${order.direction}`, order.direction)}</i><i class="dispatch-movement-badge type">${movementTypeCode(order.order_type)}</i>${driverOnly ? `<i class="dispatch-movement-badge type">${loadedT("yard.driverOnly", "Driver only")}</i>` : ""}</span></div>
+        <span>${loadedEscape(order.yard_location || loadedT("common.yard", "Yard"))} | ${loadedEscape(order.movement_status || (driverOnly ? loadedT("yard.driverComplete", "Driver complete") : loadedT("yard.processed", "Processed")))}</span>
+        <em>${deliveryAt ? `${loadedT("yard.deliveryTime", "Delivered")} ${loadedFormatDate(deliveryAt)}` : loadedFormatDate(lastActivityAt)} | ${loadedT("yard.yardActivities", "Yard")} ${yardActivities} · ${loadedT("yard.driverActivities", "Driver")} ${driverActivities} | ${yardPhotos + driverPhotos} ${loadedT("common.photos", "photos")}</em>
+        ${order.party ? `<small>${loadedEscape(order.party)}</small>` : ""}
+      </button>`;
+    }).join("") || (!loadedState.searchLoading ? `<div class="dispatch-loaded-notice">${loadedSearchActive() ? loadedT("yard.noSearchResults", "No order matched either search across all dates, yards, directions, and order types.") : loadedT("yard.noFilterResults", "No processed movement matched this direction, order type, date, and yard.")}</div>` : "")}
   `;
 }
 
+function loadedHumanLabel(value) {
+  return String(value || "")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replaceAll("_", " ")
+    .replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
+function loadedDetailValue(value) {
+  if (Array.isArray(value)) {
+    return value.some((item) => item && typeof item === "object")
+      ? JSON.stringify(value)
+      : value.filter(Boolean).join(", ");
+  }
+  if (value && typeof value === "object") return JSON.stringify(value);
+  return loadedValue(value);
+}
+
+function renderDriverJobDetails(record) {
+  const details = loadedField(record, "job_details", "jobDetails");
+  if (!details || typeof details !== "object" || Array.isArray(details)) return "";
+  const hiddenKeys = new Set(["schemaVersion", "orders", "orderTypes", "lineRowIds", "requiredPhotos"]);
+  const rows = Object.entries(details)
+    .filter(([key]) => !hiddenKeys.has(key))
+    .map(([key, value]) => [key, loadedDetailValue(value)])
+    .filter(([, value]) => value);
+  const orderRows = (Array.isArray(details.orders) ? details.orders : []).map((order) => {
+    const items = (Array.isArray(order?.items) ? order.items : [])
+      .map((item) => item?.sku || item?.itemName)
+      .filter(Boolean);
+    const label = [order?.orderRef, order?.party].filter(Boolean).join(" · ");
+    return [label, items.length ? `${items.length} item(s): ${items.join(", ")}` : ""].filter(Boolean).join(" — ");
+  }).filter(Boolean);
+  return [
+    ...rows.map(([key, value]) => `<em>${loadedEscape(loadedHumanLabel(key))}: ${loadedEscape(value)}</em>`),
+    ...orderRows.map((value) => `<em>${loadedEscape(value)}</em>`)
+  ].join("");
+}
+
+function loadedStopTypeLabel(value) {
+  const stopType = String(value || "").trim().toLowerCase();
+  if (stopType === "pickup") return loadedT("yard.pickupStop", "Pickup stop");
+  if (stopType === "dropoff") return loadedT("yard.dropoffStop", "Delivery stop");
+  if (stopType === "travel") return loadedT("yard.travelStop", "Travel");
+  if (stopType === "truck_switch") return loadedT("yard.truckSwitch", "Truck switch");
+  return loadedHumanLabel(stopType || loadedT("yard.driverActivity", "Driver activity"));
+}
+
+function renderDriverRecords(records = []) {
+  if (!records.length) return "";
+  return `<section class="dispatch-loaded-photos">
+    <h2>${loadedT("yard.driverActivities", "Driver activity")}</h2>
+    <div class="dispatch-loaded-lines">
+      ${records.map((record) => {
+        const driverName = loadedField(record, "driver_name", "driverName", "driver_login", "driverLogin") || loadedT("yard.driver", "Driver");
+        const driverLogin = loadedField(record, "driver_login", "driverLogin");
+        const truckPlate = loadedField(record, "truck_plate", "truckPlate");
+        const loadName = loadedField(record, "load_name", "loadName");
+        const stopType = loadedField(record, "stop_type", "stopType");
+        const status = loadedField(record, "status") || "";
+        const startedAt = loadedField(record, "started_at", "startedAt");
+        const completedAt = loadedField(record, "completed_at", "completedAt");
+        const photoCount = loadedNumber(record, ["photo_count", "photoCount"]);
+        return `<article class="dispatch-loaded-line">
+          <div>
+            <strong>${loadedEscape(driverName)}</strong>
+            ${driverLogin && String(driverLogin) !== String(driverName) ? `<span>${loadedEscape(driverLogin)}</span>` : ""}
+            <span>${loadedEscape(loadedStopTypeLabel(stopType))}${status ? ` · ${loadedEscape(status)}` : ""}</span>
+            ${truckPlate ? `<em>${loadedT("yard.truck", "Truck")}: ${loadedEscape(truckPlate)}</em>` : ""}
+            ${loadName ? `<em>${loadedT("yard.load", "Load")}: ${loadedEscape(loadName)}</em>` : ""}
+            ${renderDriverJobDetails(record)}
+          </div>
+          <div class="dispatch-loaded-qty">
+            <strong>${completedAt ? `${loadedT("yard.completedAt", "Completed")} ${loadedFormatDate(completedAt)}` : loadedT("yard.notCompleted", "Not completed")}</strong>
+            ${startedAt ? `<small>${loadedT("yard.startedAt", "Started")} ${loadedFormatDate(startedAt)}</small>` : ""}
+            <small>${photoCount} ${loadedT("common.photos", "photos")}</small>
+          </div>
+        </article>`;
+      }).join("")}
+    </div>
+  </section>`;
+}
+
+function renderLoadedPhotoSection(title, photos = [], source = "yard") {
+  const visiblePhotos = photos.filter((photo) => loadedField(photo, "photo_data_url", "photoDataUrl"));
+  return `<section class="dispatch-loaded-photos"><h2>${loadedEscape(title)}</h2><div class="dispatch-loaded-photo-grid">
+    ${visiblePhotos.map((photo) => {
+      const photoRef = loadedField(photo, "photo_data_url", "photoDataUrl");
+      const driverName = loadedField(photo, "driver_name", "driverName", "driver_login", "driverLogin");
+      const truckPlate = loadedField(photo, "truck_plate", "truckPlate");
+      const stopType = loadedField(photo, "stop_type", "stopType");
+      const createdAt = loadedField(photo, "created_at", "createdAt");
+      const sourceLabel = source === "driver"
+        ? `${driverName || loadedT("yard.driver", "Driver")}${stopType ? ` · ${loadedStopTypeLabel(stopType)}` : ""}`
+        : loadedT("yard.yardActivityPhoto", "Yard activity");
+      const photoLabel = `${sourceLabel} ${loadedField(photo, "id") || ""}`.trim();
+      return `<figure>
+        <button class="dispatch-loaded-photo" data-action="open-loaded-photo" data-photo-ref="${loadedEscape(photoRef)}" data-photo-label="${loadedEscape(photoLabel)}" type="button"><img src="${loadedEscape(loadedPhotoSrc(photoRef))}" alt="${loadedEscape(photoLabel)}" /></button>
+        <figcaption>${loadedEscape(sourceLabel)}${truckPlate ? ` · ${loadedT("yard.truck", "Truck")} ${loadedEscape(truckPlate)}` : ""}${createdAt ? `<br>${loadedFormatDate(createdAt)}` : ""}</figcaption>
+      </figure>`;
+    }).join("") || `<div class="dispatch-loaded-notice">${loadedT("common.noPhoto", "No photo")}</div>`}
+  </div></section>`;
+}
+
 function renderLoadedDetail() {
-  if (!loadedState.detail) return `<div class="dispatch-loaded-empty"><strong>${loadedT("common.selectOrder", "Select an order")}</strong><span>${loadedT("yard.selectMovementHelp", "Processed lines, converted UOM, and photo proof will show here.")}</span></div>`;
+  if (!loadedState.detail) return `<div class="dispatch-loaded-empty"><strong>${loadedT("common.selectOrder", "Select an order")}</strong><span>${loadedT("yard.selectMovementHelp", "Yard processing, driver delivery details, timestamps, and photo proof will show here.")}</span></div>`;
   const { order, lines = [], photos = [] } = loadedState.detail;
+  const driverRecords = loadedState.detail.driverRecords || loadedState.detail.driver_records || [];
+  const driverPhotos = loadedState.detail.driverPhotos || loadedState.detail.driver_photos || [];
+  const driverOnly = loadedBoolean(order, "driver_only", "driverOnly");
+  const yardActivities = loadedNumber(order, ["yard_activity_count", "yardActivityCount"], loadedNumber(order, ["process_count", "processCount"]));
+  const driverActivities = loadedNumber(order, ["driver_activity_count", "driverActivityCount"], driverRecords.length);
+  const deliveryAt = loadedField(order, "delivery_at", "deliveryAt");
+  const firstActivityAt = loadedField(order, "first_activity_at", "firstActivityAt", "first_processed_at", "firstProcessedAt");
+  const lastActivityAt = loadedField(order, "last_activity_at", "lastActivityAt", "last_processed_at", "lastProcessedAt");
+  const activityRange = [...new Set([firstActivityAt, lastActivityAt].filter(Boolean))].map(loadedFormatDate).filter(Boolean).join(" → ");
   const route = [order.source_location, order.destination_location].filter(Boolean).join(" → ");
   return `
     <div class="dispatch-loaded-detail-head">
-      <div><div class="dispatch-movement-detail-title"><h2>${loadedEscape(order.tranid || order.order_id)}</h2><span class="dispatch-movement-badges"><i class="dispatch-movement-badge ${loadedEscape(order.direction)}">${loadedT(`yard.${order.direction}`, order.direction)}</i><i class="dispatch-movement-badge type">${movementTypeCode(order.order_type)}</i></span></div><p>${loadedEscape(movementTypeLabel(order.order_type))} | ${loadedEscape(order.yard_location || "")} | ${loadedEscape(order.movement_status || loadedT("yard.processed", "Processed"))}</p>${route ? `<p>${loadedEscape(route)}</p>` : ""}${order.party ? `<p>${loadedEscape(order.party)}</p>` : ""}</div>
-      <strong>${lines.length} ${loadedT("control.lines", "line(s)")}</strong>
+      <div><div class="dispatch-movement-detail-title"><h2>${loadedEscape(order.tranid || order.order_id)}</h2><span class="dispatch-movement-badges"><i class="dispatch-movement-badge ${loadedEscape(order.direction)}">${loadedT(`yard.${order.direction}`, order.direction)}</i><i class="dispatch-movement-badge type">${movementTypeCode(order.order_type)}</i>${driverOnly ? `<i class="dispatch-movement-badge type">${loadedT("yard.driverOnly", "Driver only")}</i>` : ""}</span></div><p>${loadedEscape(movementTypeLabel(order.order_type))} | ${loadedEscape(order.yard_location || "")} | ${loadedEscape(order.movement_status || (driverOnly ? loadedT("yard.driverComplete", "Driver complete") : loadedT("yard.processed", "Processed")))}</p>${route ? `<p>${loadedEscape(route)}</p>` : ""}${order.party ? `<p>${loadedEscape(order.party)}</p>` : ""}${deliveryAt ? `<p><strong>${loadedT("yard.deliveryTime", "Delivered")}:</strong> ${loadedFormatDate(deliveryAt)}</p>` : ""}${activityRange ? `<p>${loadedT("yard.activityRange", "Activity")}: ${activityRange}</p>` : ""}</div>
+      <strong>${lines.length} ${loadedT("control.lines", "line(s)")} · ${loadedT("yard.yardActivities", "Yard")} ${yardActivities} · ${loadedT("yard.driverActivities", "Driver")} ${driverActivities}</strong>
     </div>
     <div class="dispatch-loaded-lines">${lines.map((line) => `<div class="dispatch-loaded-line">
       <div><strong>${loadedEscape(line.sku || line.item_name || "")}</strong><span>${loadedEscape(line.item_name || "")}</span>${line.item_description ? `<em>${loadedEscape(line.item_description)}</em>` : ""}</div>
       <div class="dispatch-loaded-qty">${renderMovementQuantityEquation(line)}<small>${loadedEscape(line.location || order.yard_location || "")}</small></div>
-    </div>`).join("") || `<div class="dispatch-loaded-notice">${loadedT("yard.noProcessedLines", "No processed lines")}</div>`}</div>
-    <section class="dispatch-loaded-photos"><h2>${loadedT("common.photos", "Photos")}</h2><div class="dispatch-loaded-photo-grid">
-      ${photos.filter((photo) => photo.photo_data_url).map((photo) => `<figure>
-        <button class="dispatch-loaded-photo" data-action="open-loaded-photo" data-photo-ref="${loadedEscape(photo.photo_data_url)}" data-photo-label="${loadedT("yard.activityPhoto", "Activity photo")} ${loadedEscape(photo.id)}" type="button"><img src="${loadedEscape(loadedPhotoSrc(photo.photo_data_url))}" alt="${loadedT("yard.activityPhoto", "Activity photo")} ${loadedEscape(photo.id)}" /></button>
-        <figcaption>${loadedFormatDate(photo.created_at)}</figcaption>
-      </figure>`).join("") || `<div class="dispatch-loaded-notice">${loadedT("common.noPhoto", "No photo")}</div>`}
-    </div></section>
+    </div>`).join("") || `<div class="dispatch-loaded-notice">${driverOnly ? loadedT("yard.noYardLinesYet", "No yard processing record yet. Driver delivery data is shown below.") : loadedT("yard.noProcessedLines", "No processed lines")}</div>`}</div>
+    ${renderDriverRecords(driverRecords)}
+    ${!driverOnly || photos.length ? renderLoadedPhotoSection(loadedT("yard.yardPhotos", "Yard photos"), photos, "yard") : ""}
+    ${driverRecords.length || driverPhotos.length || driverOnly ? renderLoadedPhotoSection(loadedT("yard.driverDeliveryPhotos", "Driver delivery photos"), driverPhotos, "driver") : ""}
   `;
 }
 
@@ -321,8 +482,10 @@ function updateLoadedPanels() {
 function renderDispatchLoaded() {
   const operator = loadedState.operator || {};
   const typeTabs = DISPATCH_YARD_TYPES[loadedState.direction] || [];
+  const yardOptions = loadedAllowedYards();
+  const homeLabel = loadedSalesHost ? loadedT("sales.menu", "Sales Menu") : loadedT("dispatch.menu", "Dispatch Menu");
   dispatchLoadedApp.innerHTML = `
-    <header class="dispatch-topbar"><div><p>MBBS Transportation</p><h1>${loadedT("control.loadedExportTitle", "Yard In/Outbound")}</h1></div><div class="topbar-language">${window.MBBS_I18N?.toggleHtml() || ""}</div><div class="topbar-actions"><span class="dispatch-user">${loadedEscape(operator.display_name || operator.username || "")}</span><button onclick="location.href='/dispatch'" type="button">${loadedT("dispatch.menu", "Dispatch Menu")}</button><button onclick="dispatchLogout()" type="button">${loadedT("common.logout", "Logout")}</button></div></header>
+    <header class="dispatch-topbar"><div><p>${loadedSalesHost ? "MBBS Operation" : "MBBS Transportation"}</p><h1>${loadedT("control.loadedExportTitle", "In/Outbound Record")}</h1></div><div class="topbar-language">${window.MBBS_I18N?.toggleHtml() || ""}</div><div class="topbar-actions"><span class="dispatch-user">${loadedEscape(operator.display_name || operator.username || "")}</span><button onclick="location.href='${loadedHome}'" type="button">${homeLabel}</button><button onclick="dispatchLogout()" type="button">${loadedT("common.logout", "Logout")}</button></div></header>
     <section class="dispatch-loaded-page">
       ${loadedState.error ? `<div class="dispatch-loaded-error">${loadedEscape(loadedState.error)}</div>` : ""}
       <aside class="dispatch-loaded-left panel">
@@ -337,7 +500,7 @@ function renderDispatchLoaded() {
         <div class="dispatch-loaded-filters">
           <label><span>${loadedT("common.from", "From")}</span><input id="dispatchLoadedFrom" type="date" value="${loadedEscape(loadedState.filters.from)}" /></label>
           <label><span>${loadedT("common.to", "To")}</span><input id="dispatchLoadedTo" type="date" value="${loadedEscape(loadedState.filters.to)}" /></label>
-          <label><span>${loadedT("common.yard", "Yard")}</span><select id="dispatchLoadedYard"><option value="all" ${loadedState.filters.yard === "all" ? "selected" : ""}>${loadedT("common.all", "All")}</option><option value="1" ${loadedState.filters.yard === "1" ? "selected" : ""}>3445</option><option value="28" ${loadedState.filters.yard === "28" ? "selected" : ""}>2967</option><option value="15" ${loadedState.filters.yard === "15" ? "selected" : ""}>12441</option><option value="26" ${loadedState.filters.yard === "26" ? "selected" : ""}>150</option></select></label>
+          <label><span>${loadedT("common.yard", "Yard")}</span><select id="dispatchLoadedYard"><option value="all" ${loadedState.filters.yard === "all" ? "selected" : ""}>${loadedT("common.all", "All")}</option>${yardOptions.map((yard) => `<option value="${yard.locationId}" ${loadedState.filters.yard === String(yard.locationId) ? "selected" : ""}>${loadedEscape(yard.yardCode)}</option>`).join("")}</select></label>
           <button class="primary" data-action="apply-loaded-filters" type="button">${loadedT("common.apply", "Apply")}</button>
           <button data-action="refresh-loaded-orders" type="button">${loadedT("common.refresh", "Refresh")}</button>
           <button data-action="export-loaded-csv" type="button" ${loadedState.orders.length ? "" : "disabled"}>${loadedT("common.exportCsv", "Export CSV")}</button>
@@ -456,8 +619,15 @@ window.addEventListener("mbbs-language-changed", renderDispatchLoaded);
 
 requireDispatchLogin({
   mount: dispatchLoadedApp,
+  roles: loadedRoles,
+  allowPublicSales: false,
   async onReady(operator) {
     loadedState.operator = operator;
+    const allowedYardIds = new Set(loadedAllowedYards().map((yard) => String(yard.locationId)));
+    if (loadedState.filters.yard !== "all" && !allowedYardIds.has(String(loadedState.filters.yard))) {
+      loadedState.filters.yard = "all";
+      localStorage.setItem("mbbs.dispatch.loaded.yard", "all");
+    }
     await runLoadedAction(loadedT("common.loading", "Loading..."), async () => {
       await loadLoadedOrders();
       if (loadedSearchActive()) await loadLoadedSearch();

@@ -142,6 +142,26 @@ assert.doesNotMatch(proposalContext.smartProposalDecisionEvidence(bh80Line), /lo
 assert.match(proposalContext.smartProposalDecisionEvidence(bh80Line), /Safety stock: 3\.002 PLT/);
 assert.match(proposalContext.smartProposalDecisionEvidence(bh80Line), /Vendor supply: available/);
 assert.match(proposalContext.smartProposalDecisionEvidence(bh80Line), /Imported vendor available: 243 PLT/);
+const lowerStockEvidence = proposalContext.smartProposalDecisionEvidence({
+  ...bh80Line,
+  reason: {
+    ...bh80Reason,
+    lowerStockPolicyEnabled: true,
+    lowerStockPolicyApplied: true,
+    configuredMinimumSafetyPallets: 3,
+    effectiveMinimumSafetyPallets: 1,
+    standardSafetyStockPallets: 3,
+    safetyStockPallets: 1,
+    standardReorderPointPallets: 11,
+    reorderPointPallets: 9,
+    standardPreferredPallets: 16,
+    preferredPallets: 14
+  }
+});
+assert.match(lowerStockEvidence, /Lower stock policy · 1-PLT floor/);
+assert.match(lowerStockEvidence, /Safety 3 → 1/);
+assert.match(lowerStockEvidence, /ROP 11 → 9/);
+assert.match(lowerStockEvidence, /Preferred 16 → 14 PLT/);
 
 const transferLine = {
   id: 71,
@@ -169,6 +189,12 @@ const transferLine = {
     sourceAvailablePallets: 2.5,
     sourceSafetyStockPallets: 1,
     sourceReorderPointPallets: 1,
+    sourcePreferredPallets: 2,
+    sourceLowerStockPolicyEnabled: true,
+    sourceLowerStockPolicyApplied: true,
+    sourceStandardSafetyStockPallets: 2,
+    sourceStandardReorderPointPallets: 2,
+    sourceStandardPreferredPallets: 3,
     sourceProtectedFloorPallets: 1,
     sourceMaximumTransferablePallets: 1
   }
@@ -189,6 +215,7 @@ const transferProposal = {
 };
 const transferHtml = proposalContext.smartProposalInventory(transferProposal, transferLine);
 assert.match(transferHtml, /12441 source protection/);
+assert.match(transferHtml, /Lower stock policy · 1-PLT floor: Safety 2 → 1 PLT · ROP 2 → 1 PLT · Preferred 3 → 2 PLT/);
 assert.match(transferHtml, /Protected floor = max\(1 safety stock, 1 ROP\) = 1 PLT/);
 assert.match(transferHtml, /Maximum transferable = floor\(max\(0, 2\.5 available − 1 protected\)\) = 1 PLT/);
 assert.match(transferHtml, /1 PLT transfer ≤ 1 PLT calculated limit → <strong>within source limit<\/strong>/);
@@ -273,7 +300,13 @@ assert.match(proposalCss, /\.smart-proposal-lines-one-detail-hidden \.smart-tabl
 assert.match(proposalCss, /\.smart-proposal-lines-compact \.smart-table\s*\{\s*min-width: 900px;/);
 assert.match(proposalCss, /\.smart-proposal-lines-compact \.smart-table td \{\s*padding-top: 5px;/);
 
-const appMount = { addEventListener() {}, innerHTML: "" };
+const appListeners = new Map();
+const appMount = {
+  addEventListener(type, listener) {
+    appListeners.set(type, listener);
+  },
+  innerHTML: ""
+};
 const forecastContext = vm.createContext({
   document: { getElementById: () => appMount, addEventListener() {}, createElement: () => ({ click() {}, remove() {} }), body: { appendChild() {} } },
   window: { addEventListener() {} },
@@ -293,6 +326,208 @@ const forecastContext = vm.createContext({
   clearTimeout
 });
 vm.runInContext(readPublic("scm-smart.js"), forecastContext, { filename: "scm-smart.js" });
+vm.runInContext("smartState.operator = { role: 'scm' };", forecastContext);
+forecastContext.__capturedItemsUrl = null;
+vm.runInContext(`
+  smartState.itemLowerStockPolicy = "yard:150";
+  smartApi = async (url) => {
+    __capturedItemsUrl = url;
+    return { items: [], total: 0, limit: 150, offset: 0, vendorYards: [] };
+  };
+  smartRender = () => {};
+`, forecastContext);
+await vm.runInContext("smartLoadItems({ reset: true, quiet: true })", forecastContext);
+const filteredItemsUrl = new URL(forecastContext.__capturedItemsUrl, "https://example.test");
+assert.equal(filteredItemsUrl.searchParams.get("lowerStockPolicy"), "yard:150");
+const lowerStockFilterOptions = vm.runInContext("smartLowerStockPolicyFilterOptions()", forecastContext);
+assert.match(lowerStockFilterOptions, /value="yard:150" selected>Lower stock enabled · 150<\/option>/);
+assert.match(lowerStockFilterOptions, /value="any" >Lower stock enabled · any yard<\/option>/);
+
+const itemYardHtml = vm.runInContext(`smartItemYardCell({
+  itemName: "LOWER-STOCK-TEST",
+  stockUnit: "EA",
+  toPlt: 100,
+  balances: [{ locationId: 28, quantityAvailable: 250 }],
+  yardPolicies: [{
+    locationId: 28,
+    yardCode: "2967",
+    eligible: false,
+    capacityPallets: null,
+    serviceQuantile: 0.9,
+    minimumSafetyPallets: 3,
+    lowerStockPolicyEnabled: true
+  }]
+}, { locationId: 28, code: "2967" })`, forecastContext);
+const itemYardLowerPolicyInput = itemYardHtml.match(/<input data-item-yard-lower-stock="28"[^>]*>/)?.[0] || "";
+assert.match(itemYardLowerPolicyInput, /type="checkbox"/);
+assert.match(itemYardLowerPolicyInput, /\bchecked\b/, "The optional policy must render its saved per-yard state.");
+assert.match(itemYardLowerPolicyInput, /aria-label="Lower stock policy for LOWER-STOCK-TEST, yard 2967"/);
+assert.match(
+  itemYardLowerPolicyInput,
+  /\bdisabled\b/,
+  "The lower-stock policy must remain visible but disabled while this yard is not planned."
+);
+const plannedItemYardHtml = vm.runInContext(`smartItemYardCell({
+  itemName: "LOWER-STOCK-TEST",
+  stockUnit: "EA",
+  toPlt: 100,
+  balances: [{ locationId: 28, quantityAvailable: 250 }],
+  yardPolicies: [{
+    locationId: 28,
+    yardCode: "2967",
+    eligible: true,
+    capacityPallets: 12,
+    serviceQuantile: 0.9,
+    minimumSafetyPallets: 3,
+    lowerStockPolicyEnabled: true
+  }]
+}, { locationId: 28, code: "2967" })`, forecastContext);
+const plannedItemYardLowerPolicyInput = plannedItemYardHtml.match(/<input data-item-yard-lower-stock="28"[^>]*>/)?.[0] || "";
+assert.match(plannedItemYardLowerPolicyInput, /\bchecked\b/);
+assert.doesNotMatch(plannedItemYardLowerPolicyInput, /\bdisabled\b/, "A write user must be able to select the optional policy for a planned yard.");
+const defaultOffItemYardHtml = vm.runInContext(`smartItemYardCell({
+  itemName: "DEFAULT-OFF-TEST",
+  stockUnit: "EA",
+  toPlt: 100,
+  balances: [{ locationId: 28, quantityAvailable: 250 }],
+  yardPolicies: [{
+    locationId: 28,
+    yardCode: "2967",
+    eligible: true,
+    capacityPallets: 12,
+    serviceQuantile: 0.9,
+    minimumSafetyPallets: 3,
+    lowerStockPolicyEnabled: false
+  }]
+}, { locationId: 28, code: "2967" })`, forecastContext);
+assert.doesNotMatch(
+  defaultOffItemYardHtml.match(/<input data-item-yard-lower-stock="28"[^>]*>/)?.[0] || "",
+  /\bchecked\b/,
+  "The optional policy must render unchecked when it has not been enabled."
+);
+assert.match(defaultOffItemYardHtml, /Lower stock policy \(1-PLT floor\)/, "Touch layouts need a visible policy explanation.");
+vm.runInContext("smartState.operator = { role: 'yard_manager' };", forecastContext);
+const readOnlyItemYardHtml = vm.runInContext(`smartItemYardCell({
+  itemName: "LOWER-STOCK-TEST",
+  stockUnit: "EA",
+  toPlt: 100,
+  balances: [{ locationId: 28, quantityAvailable: 250 }],
+  yardPolicies: [{
+    locationId: 28,
+    yardCode: "2967",
+    eligible: true,
+    capacityPallets: 12,
+    serviceQuantile: 0.9,
+    minimumSafetyPallets: 3,
+    lowerStockPolicyEnabled: true
+  }]
+}, { locationId: 28, code: "2967" })`, forecastContext);
+assert.match(
+  readOnlyItemYardHtml.match(/<input data-item-yard-lower-stock="28"[^>]*>/)?.[0] || "",
+  /\bdisabled\b/,
+  "Read-only roles must not be able to change the lower-stock policy."
+);
+vm.runInContext("smartState.operator = { role: 'scm' };", forecastContext);
+
+forecastContext.__capturedItemSave = null;
+vm.runInContext(`
+  smartApi = async (url, options = {}) => {
+    __capturedItemSave = { url, body: options.body };
+    return { itemId: 501 };
+  };
+  smartRender = () => {};
+  smartRestoreItemViewport = () => {};
+`, forecastContext);
+const itemSaveClick = appListeners.get("click");
+assert.equal(typeof itemSaveClick, "function");
+const capacityInput = {
+  value: "12",
+  dataset: {},
+  setCustomValidity(message) { this.validationMessage = message; },
+  focus() { this.focused = true; },
+  reportValidity() { this.reported = true; }
+};
+const lowerStockPolicyInput = { checked: true, disabled: false };
+const yardToggle = {
+  checked: true,
+  dataset: {
+    itemYardEnabled: "28",
+    yardCode: "2967",
+    serviceQuantile: "0.9"
+  },
+  matches(selector) {
+    return selector === "[data-item-yard-enabled]";
+  },
+  closest(selector) {
+    return selector === "[data-item-row]" ? itemRow : null;
+  }
+};
+const vendorYardSelect = { value: "", dataset: { sourceYard: "" } };
+const itemRow = {
+  dataset: { itemRow: "501" },
+  closest(selector) {
+    return selector === ".smart-item-grid-wrap"
+      ? { scrollLeft: 0, scrollTop: 0 }
+      : null;
+  },
+  getBoundingClientRect() {
+    return { top: 100 };
+  },
+  querySelectorAll(selector) {
+    return selector === "[data-item-yard-enabled]" ? [yardToggle] : [];
+  },
+  querySelector(selector) {
+    const fields = {
+      '[data-item-yard-capacity="28"]': capacityInput,
+      '[data-item-yard-lower-stock="28"]': lowerStockPolicyInput,
+      '[data-item-field="vendorYardId"]': vendorYardSelect,
+      '[data-item-field="planningEnabled"]': { checked: true },
+      '[data-item-field="leadTimeDays"]': { value: "14" }
+    };
+    return fields[selector] || null;
+  }
+};
+const itemYardChange = appListeners.get("change");
+assert.equal(typeof itemYardChange, "function");
+yardToggle.checked = false;
+await itemYardChange({ target: yardToggle });
+assert.equal(lowerStockPolicyInput.checked, true, "Disabling yard planning must preserve the optional policy selection.");
+assert.equal(lowerStockPolicyInput.disabled, true);
+assert.equal(capacityInput.value, "");
+yardToggle.checked = true;
+await itemYardChange({ target: yardToggle });
+assert.equal(lowerStockPolicyInput.checked, true, "Re-enabling yard planning must retain the policy selection.");
+assert.equal(lowerStockPolicyInput.disabled, false);
+assert.equal(capacityInput.value, "12", "Capacity's existing off/on restoration must remain intact.");
+
+const saveButton = {
+  dataset: { smartAction: "save-item", itemId: "501" },
+  disabled: false,
+  textContent: "Save",
+  closest(selector) {
+    if (selector === "[data-smart-action]") return this;
+    if (selector === "[data-item-row]") return itemRow;
+    return null;
+  }
+};
+await itemSaveClick({
+  target: {
+    closest(selector) {
+      if (selector === "[data-smart-tab]") return null;
+      if (selector === "[data-smart-action]") return saveButton;
+      return null;
+    }
+  }
+});
+assert.equal(forecastContext.__capturedItemSave.url, "/api/scm/smart/items/501");
+assert.equal(forecastContext.__capturedItemSave.body.yardPolicies[0].lowerStockPolicyEnabled, true);
+assert.equal(
+  Object.hasOwn(forecastContext.__capturedItemSave.body.yardPolicies[0], "minimumSafetyPallets"),
+  false,
+  "The checkbox save must leave the legacy configured floor untouched."
+);
+assert.equal(forecastContext.__capturedItemSave.body.yardPolicies[0].locationId, 28);
+
 const forecastPolicyHtml = vm.runInContext(`smartForecastStockPolicy({
   safetyStockPallets: 3.002221,
   baseReorderPointPallets: 11,
@@ -314,6 +549,30 @@ assert.match(forecastPolicyHtml, /Capacity <strong>16 PLT<\/strong>/);
 assert.match(forecastPolicyHtml, /4 PLT\/week · SD 1\.633 · 2 lead weeks · factor 1\.3 · current policy\/settings/);
 assert.match(forecastPolicyHtml, /ROP = round\(3\.002 safety \+ 4 demand × 2 lead\) = 11 PLT/);
 assert.match(forecastPolicyHtml, /Preferred = min\(16 capacity, ceil\(11 ROP \+ 4 demand × 2 lead\)\) = 16 PLT/);
+
+const lowerStockPolicyHtml = vm.runInContext(`smartForecastStockPolicy({
+  lowerStockPolicyEnabled: true,
+  lowerStockPolicyApplied: true,
+  standardSafetyStockPallets: 3,
+  safetyStockPallets: 1,
+  standardReorderPointPallets: 11,
+  baseReorderPointPallets: 9,
+  standardPreferredPallets: 16,
+  basePreferredPallets: 14,
+  reorderPointPallets: 9,
+  preferredPallets: 14,
+  weeklyDemandPallets: 4,
+  weeklyDemandSdPallets: 0,
+  leadWeeks: 2,
+  safetyFactor: 1.3,
+  stockPolicyModel: "formula",
+  capacityPallets: 20,
+  zeroDemandCoverageApplied: false
+})`, forecastContext);
+assert.match(lowerStockPolicyHtml, /Lower stock policy applied · 1-PLT minimum safety floor/);
+assert.match(lowerStockPolicyHtml, /Safety 3 → 1 PLT/);
+assert.match(lowerStockPolicyHtml, /ROP 11 → 9 PLT/);
+assert.match(lowerStockPolicyHtml, /Preferred 16 → 14 PLT/);
 
 const coveragePolicyHtml = vm.runInContext(`smartForecastStockPolicy({
   safetyStockPallets: 2,

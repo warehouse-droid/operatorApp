@@ -333,7 +333,7 @@ async function forecastPolicies() {
             COALESCE(i.to_plt, p.to_plt) AS to_plt,
             COALESCE(p.lead_time_days, i.netsuite_lead_time_days, p.purchase_lead_time_days, 7) AS effective_lead_time_days,
             y.location_id, y.yard_code, y.eligible, y.capacity_pallets,
-            y.service_quantile, y.minimum_safety_pallets,
+            y.service_quantile, y.minimum_safety_pallets, y.lower_stock_policy_enabled,
             COALESCE(b.quantity_available, 0) AS quantity_available
        FROM scm_smart_item_policies p
        JOIN scm_smart_item_yard_policies y ON y.item_id = p.item_id
@@ -563,8 +563,15 @@ function publicForecast(row, settings = {}) {
     weeklyDemandPallets: round(levels.weeklyDemandPallets),
     weeklyDemandSdPallets: round(levels.weeklyDemandSdPallets),
     safetyFactor: round(levels.serviceFactor),
+    lowerStockPolicyEnabled: levels.lowerStockPolicyEnabled,
+    lowerStockPolicyApplied: levels.lowerStockPolicyApplied,
+    configuredMinimumSafetyPallets: round(levels.configuredMinimumSafetyPallets),
+    effectiveMinimumSafetyPallets: round(levels.effectiveMinimumSafetyPallets),
+    standardSafetyStockPallets: round(levels.standardSafetyStockPallets),
     safetyStockPallets: round(levels.safetyStockPallets),
+    standardReorderPointPallets: round(levels.standardReorderPointPallets),
     baseReorderPointPallets: round(levels.baseReorderPointPallets),
+    standardPreferredPallets: round(levels.standardPreferredPallets),
     basePreferredPallets: round(levels.basePreferredPallets),
     reorderPointPallets: round(levels.reorderPointPallets),
     preferredPallets: round(levels.preferredPallets),
@@ -842,7 +849,8 @@ export async function listSmartScmForecasts({ runId = null, search = "", yard = 
     query(
     `SELECT f.*, p.item_name, p.series,
             COALESCE(p.lead_time_days, i.netsuite_lead_time_days, p.purchase_lead_time_days, 7) AS effective_lead_time_days,
-            y.capacity_pallets, y.service_quantile, y.minimum_safety_pallets
+            y.capacity_pallets, y.service_quantile, y.minimum_safety_pallets,
+            y.lower_stock_policy_enabled
        FROM scm_smart_forecasts f
        JOIN scm_smart_item_policies p ON p.item_id = f.item_id
        JOIN scm_smart_item_yard_policies y ON y.item_id = f.item_id AND y.location_id = f.location_id

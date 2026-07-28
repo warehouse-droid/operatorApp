@@ -755,7 +755,9 @@ function driverJobIdForStop(truck, load, stop) {
 function driverTravelJobIdForLoad(truck, load, startTravel) {
   if (!startTravel) return "";
   const assignedTruck = effectiveTruckForLoad(truck, load);
-  return [currentPlan?.id, assignedTruck.id || assignedTruck.plate, load.id, "TRAVEL", startTravel.from, startTravel.to].map((part) => encodeURIComponent(String(part || ""))).join(":");
+  const jobStart = startTravel.fromJobLocation || startTravel.from;
+  const jobTarget = startTravel.toPickupLocation || startTravel.to;
+  return [currentPlan?.id, assignedTruck.id || assignedTruck.plate, load.id, "TRAVEL", jobStart, jobTarget, ""].map((part) => encodeURIComponent(String(part || ""))).join(":");
 }
 
 function driverSwitchApproachJobIdForLoad(truck, load, handoffTravel) {
@@ -767,7 +769,7 @@ function driverSwitchApproachJobIdForLoad(truck, load, handoffTravel) {
     previousTruck?.id || previousTruck?.plate || "",
     load.id,
     "TRAVEL",
-    handoffTravel.from,
+    handoffTravel.fromJobLocation || handoffTravel.from,
     handoffTravel.to,
     "TRUCK_SWITCH_APPROACH"
   ].map((part) => encodeURIComponent(String(part || ""))).join(":");
@@ -785,7 +787,7 @@ function driverReturnJobIdForLoad(truck, load) {
     : previousEntry
       ? startPointAfterLoad(previousEntry.truck, previousEntry.load)
     : index > 0 ? startPointAfterLoad(truck, (truck.loads || [])[index - 1]) : null;
-  const from = previous?.label || assignedTruck?.base || "";
+  const from = previous?.jobLabel || previous?.label || assignedTruck?.base || "";
   const to = load.returnYard || "12441";
   if (!from || String(from) === String(to)) return "";
   return [currentPlan?.id, assignedTruck.id || assignedTruck.plate, load.id, "RETURN", from, to].map((part) => encodeURIComponent(String(part || ""))).join(":");
@@ -1654,6 +1656,7 @@ function directPickupAllocatedForItem(order = {}, item = {}) {
 }
 
 function itemForPickupLocation(item = {}, pickupLocation = "", order = {}) {
+  if (order?.type === "CUSTOM") return item;
   const location = String(pickupLocation || "").trim();
   if (!location) return item;
   if (isOwnYardCode(location)) {
@@ -2057,6 +2060,7 @@ function movementText(order) {
   }
   if (order.type === "TO") return `${order.sourceYard || order.pickupLocations?.[0] || "source yard"} to ${order.destinationYard || "destination yard"}`;
   if (order.type === "CO") return `${order.sourceYard || order.pickupLocations?.[0] || "source yard"} to ${order.destinationYard || "transit depot"}`;
+  if (order.type === "CUSTOM") return `${order.sourceYard || order.pickupLocations?.[0] || "pickup"} to ${order.destinationYard || order.address || "drop-off"}`;
   return order.address;
 }
 
@@ -2081,7 +2085,7 @@ function reviewOnlyText(order = {}) {
 }
 
 function orderTypeLabel(type) {
-  return ({ SO: "Sales Order", PO: "Purchase Order", TO: "Transfer Order", CO: "Transit Depot Order" })[type] || "Order";
+  return ({ SO: "Sales Order", PO: "Purchase Order", TO: "Transfer Order", CO: "Transit Depot Order", CUSTOM: "Custom Order" })[type] || "Order";
 }
 
 function splitBlockReason(order) {
@@ -2099,6 +2103,111 @@ function normalizedPlaceKey(value) {
   return normalizeText(value).replace(/\s+/g, " ");
 }
 
+function normalizedStreetAddressKey(value) {
+  const aliases = {
+    avenue: "ave",
+    boulevard: "blvd",
+    circle: "cir",
+    court: "ct",
+    crescent: "cres",
+    drive: "dr",
+    highway: "hwy",
+    lane: "ln",
+    parkway: "pkwy",
+    road: "rd",
+    street: "st",
+    trail: "trl"
+  };
+  const tokens = normalizedPlaceKey(value).split(" ").filter(Boolean);
+  if (tokens.length < 3 || !/^\d+[a-z]?$/.test(tokens[0])) return "";
+  const suffixIndex = tokens.findIndex((token, index) =>
+    index >= 2 && Boolean(aliases[token] || Object.values(aliases).includes(token))
+  );
+  if (suffixIndex < 2) return "";
+  return tokens.slice(0, suffixIndex + 1).map((token) => aliases[token] || token).join(" ");
+}
+
+function canadianPostalCode(value) {
+  const compact = String(value || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  return compact.match(/[abceghj-nprstvxy]\d[abceghj-nprstvwxyz]\d[abceghj-nprstvwxyz]\d$/)?.[0] || "";
+}
+
+function addressMunicipalityKey(value) {
+  const streetKey = normalizedStreetAddressKey(value);
+  if (!streetKey) return "";
+  const tokens = normalizedPlaceKey(value).split(" ").filter(Boolean);
+  const streetTokens = streetKey.split(" ");
+  const municipality = [];
+  for (const token of tokens.slice(streetTokens.length)) {
+    if (["on", "ontario", "canada"].includes(token) || /^[abceghj-nprstvxy]\d[abceghj-nprstvwxyz]$/i.test(token)) break;
+    municipality.push(token);
+  }
+  const key = municipality.join(" ");
+  return ["toronto", "scarborough", "north york", "etobicoke", "east york", "york"].includes(key)
+    ? "toronto"
+    : key;
+}
+
+function physicalAddressRegionCompatible(left, right) {
+  const leftPostal = canadianPostalCode(left);
+  const rightPostal = canadianPostalCode(right);
+  if (leftPostal && rightPostal && leftPostal !== rightPostal) return false;
+  const leftMunicipality = addressMunicipalityKey(left);
+  const rightMunicipality = addressMunicipalityKey(right);
+  return !leftMunicipality || !rightMunicipality || leftMunicipality === rightMunicipality;
+}
+
+function configuredOwnYardPlaces() {
+  const places = [];
+  const ownCodes = new Set();
+  for (const yard of ownYards || []) {
+    const code = String(yard.code || yard.name || "").trim();
+    const address = String(yard.address || "").trim();
+    if (!code || !address) continue;
+    ownCodes.add(code);
+    places.push({ key: `own:${code}`, address });
+  }
+  for (const [code, hub] of Object.entries(HUBS || {})) {
+    if (code === "Vendor" || ownCodes.has(code) || !String(hub?.address || "").trim()) continue;
+    places.push({ key: `own:${code}`, address: hub.address });
+  }
+  return places;
+}
+
+function samePhysicalAddress(left, right) {
+  const leftPoint = left && typeof left === "object"
+    ? { lat: Number(left.lat), lng: Number(left.lng) }
+    : null;
+  const rightPoint = right && typeof right === "object"
+    ? { lat: Number(right.lat), lng: Number(right.lng) }
+    : null;
+  if (leftPoint || rightPoint) {
+    return Boolean(
+      leftPoint
+      && rightPoint
+      && Number.isFinite(leftPoint.lat)
+      && Number.isFinite(leftPoint.lng)
+      && Number.isFinite(rightPoint.lat)
+      && Number.isFinite(rightPoint.lng)
+      && Math.abs(leftPoint.lat - rightPoint.lat) < 0.000001
+      && Math.abs(leftPoint.lng - rightPoint.lng) < 0.000001
+    );
+  }
+  const leftKey = normalizedPlaceKey(left);
+  const rightKey = normalizedPlaceKey(right);
+  if (!leftKey || !rightKey) return false;
+  if (leftKey === rightKey) return true;
+  const leftStreet = normalizedStreetAddressKey(left);
+  const rightStreet = normalizedStreetAddressKey(right);
+  if (!leftStreet || leftStreet !== rightStreet || !physicalAddressRegionCompatible(left, right)) return false;
+  const matchingPlaces = new Set(
+    configuredOwnYardPlaces()
+      .filter((place) => normalizedStreetAddressKey(place.address) === leftStreet)
+      .map((place) => place.key)
+  );
+  return matchingPlaces.size === 1;
+}
+
 function ownYardForLocation(location = "") {
   const key = normalizedPlaceKey(location);
   if (!key) return null;
@@ -2106,12 +2215,20 @@ function ownYardForLocation(location = "") {
     const hub = HUBS[String(location)];
     return { code: String(location), name: hub.name || String(location), address: hub.address || String(location), lat: hub.lat, lng: hub.lng };
   }
-  return ownYards.find((yard) => {
+  const exact = ownYards.find((yard) => {
     const code = normalizedPlaceKey(yard.code);
     const name = normalizedPlaceKey(yard.name);
     const address = normalizedPlaceKey(yard.address);
     return key === code || key === name || key === address;
-  }) || null;
+  });
+  if (exact) return exact;
+  const streetKey = normalizedStreetAddressKey(location);
+  if (!streetKey) return null;
+  const streetMatches = ownYards.filter((yard) =>
+    streetKey === normalizedStreetAddressKey(yard.address)
+    && physicalAddressRegionCompatible(location, yard.address)
+  );
+  return streetMatches.length === 1 ? streetMatches[0] : null;
 }
 
 function vendorYardForLocation(location = "", order = null) {
@@ -2122,7 +2239,10 @@ function vendorYardsForLocation(location = "", order = null) {
   const key = normalizedPlaceKey(location);
   if (!key) return [];
   const rows = dispatchVendorYards.filter((row) => String(row.address || "").trim());
-  const exact = rows.filter((row) => normalizedPlaceKey(row.yard) === key);
+  const exact = rows.filter((row) =>
+    normalizedPlaceKey(row.yard) === key
+    || normalizedPlaceKey(row.address) === key
+  );
   if (exact.length) return exact;
   const vendorFiltered = order
     ? rows.filter((row) => vendorMatchesOrder(row, order))
@@ -2210,6 +2330,7 @@ function canonicalDispatchOrderType(value, id = "") {
   if (["PO", "PURCHASE_ORDER", "PURCHASEORDER", "PURCH_ORD"].includes(text)) return "PO";
   if (["TO", "TRANSFER_ORDER", "TRANSFERORDER", "TRNFR_ORD"].includes(text)) return "TO";
   if (["CO", "CO_ORDER", "LOCAL_CO", "LOCAL_CO_ORDER"].includes(text)) return "CO";
+  if (["CUSTOM", "CUSTOM_ORDER", "LOCAL_CUSTOM", "LOCAL_CUSTOM_ORDER"].includes(text)) return "CUSTOM";
   const orderId = String(id || "").toUpperCase();
   if (orderId.startsWith("PO")) return "PO";
   if (orderId.startsWith("TO")) return "TO";
@@ -2289,7 +2410,83 @@ function flattenDispatchGroupMembers(order = {}) {
   };
 }
 
+function groupedOrderDependencies(groupItems = []) {
+  const dependenciesByKey = new Map();
+  const visited = new Set();
+  const dependencyKey = (dependency = {}) => {
+    const id = String(dependency.id ?? "").trim();
+    if (id) return `id:${id}`;
+    return [
+      dependency.transferOrderRef,
+      dependency.canonicalSalesOrderRef || dependency.salesOrderRef,
+      dependency.dispatchTargetRef,
+      dependency.mode
+    ].map((value) => String(value || "").trim().toLowerCase()).join("|");
+  };
+  const visit = (order = {}) => {
+    if (!order || typeof order !== "object" || visited.has(order)) return;
+    visited.add(order);
+    for (const child of Array.isArray(order.childOrderDetails) ? order.childOrderDetails : []) visit(child);
+    for (const dependency of Array.isArray(order.orderDependencies) ? order.orderDependencies : []) {
+      if (!dependency || dependency.status === "cancelled") continue;
+      const key = dependencyKey(dependency);
+      if (!key.replace(/\|/g, "")) continue;
+      const previous = dependenciesByKey.get(key) || {};
+      const merged = { ...previous, ...dependency };
+      if ((!Array.isArray(dependency.lines) || !dependency.lines.length) && Array.isArray(previous.lines)) {
+        merged.lines = previous.lines;
+      }
+      dependenciesByKey.set(key, merged);
+    }
+  };
+  for (const item of groupItems || []) visit(item);
+  return [...dependenciesByKey.values()].sort((left, right) =>
+    String(left.transferOrderRef || "").localeCompare(String(right.transferOrderRef || ""))
+    || String(left.canonicalSalesOrderRef || left.salesOrderRef || "").localeCompare(
+      String(right.canonicalSalesOrderRef || right.salesOrderRef || "")
+    )
+    || String(left.id ?? "").localeCompare(String(right.id ?? ""), undefined, { numeric: true })
+  );
+}
+
+function groupedOrderDependencyLabels(groupItems = [], dependencies = groupedOrderDependencies(groupItems)) {
+  const labels = [];
+  const seen = new Set();
+  const add = (value) => {
+    const label = String(value || "").trim();
+    const key = label.toLowerCase();
+    if (!label || seen.has(key)) return;
+    seen.add(key);
+    labels.push(label);
+  };
+  const visited = new Set();
+  const visit = (order = {}) => {
+    if (!order || typeof order !== "object" || visited.has(order)) return;
+    visited.add(order);
+    for (const child of Array.isArray(order.childOrderDetails) ? order.childOrderDetails : []) visit(child);
+    for (const label of Array.isArray(order.dependencyLabels) ? order.dependencyLabels : []) add(label);
+  };
+  for (const item of groupItems || []) visit(item);
+  for (const dependency of dependencies) {
+    if (dependency.transferOrderRef) add(`Requires ${dependency.transferOrderRef}`);
+  }
+  if (dependencies.some((dependency) => dependency.mode === "direct_to_customer")) add("Direct pickup");
+  if (dependencies.some((dependency) =>
+    dependency.mode === "yard_replenishment"
+    && !["delivered", "received_local"].includes(String(dependency.status || "").toLowerCase())
+  )) add("Waiting for transfer");
+  if (dependencies.some((dependency) => dependency.reconciliationStatus === "required")) {
+    add("NetSuite reconciliation required");
+  }
+  return labels;
+}
+
 function splitParentOrderId(order = {}) {
+  if (
+    String(order.type || "").trim().toUpperCase() === "CUSTOM"
+    || order.customOrder
+    || order.sourceTable === "dispatch_custom_orders"
+  ) return "";
   const explicitParent = String(order.originalOrderId || "").trim();
   if (explicitParent) return explicitParent;
   const orderId = String(order.id || "").trim();
@@ -2344,6 +2541,22 @@ function normalizeOrder(order) {
         childOrderDetails: Array.isArray(order.childOrderDetails) ? order.childOrderDetails : [],
         groupAliases: Array.isArray(order.groupAliases) ? order.groupAliases : []
       };
+  const groupedDependencySources = groupMembers.childOrders.length
+    ? [
+        ...groupMembers.childOrderDetails,
+        {
+          orderDependencies: order.orderDependencies,
+          dependencyLabels: order.dependencyLabels
+        }
+      ]
+    : [];
+  const orderDependencies = groupedDependencySources.length
+    ? groupedOrderDependencies(groupedDependencySources)
+    : order.orderDependencies;
+  const dependencyLabels = groupedDependencySources.length
+    ? groupedOrderDependencyLabels(groupedDependencySources, orderDependencies)
+    : order.dependencyLabels;
+  const dependencyChildren = groupedDependencySources.length ? groupMembers.childOrderDetails : [];
   const basePickupLocations = Array.isArray(order.pickupLocations) && order.pickupLocations.length
     ? order.pickupLocations
     : order.sourceYard
@@ -2356,7 +2569,9 @@ function normalizeOrder(order) {
   return {
     ...order,
     type,
-    originalOrderId: splitParentOrderId({ ...order, id }) || order.originalOrderId || "",
+    originalOrderId: type === "CUSTOM"
+      ? ""
+      : splitParentOrderId({ ...order, id, type }) || order.originalOrderId || "",
     committedQty: Number(order.committedQty ?? order.salesQty ?? 0),
     customer: order.customer || order.vendorYard || order.sourceYard || "",
     address: order.address || "",
@@ -2374,6 +2589,25 @@ function normalizeOrder(order) {
     childOrders: groupMembers.childOrders,
     childOrderDetails: groupMembers.childOrderDetails,
     groupAliases: groupMembers.groupAliases,
+    orderDependencies,
+    dependencyLabels,
+    dependencyDirectPickup: Boolean(order.dependencyDirectPickup
+      || dependencyChildren.some((child) => child.dependencyDirectPickup)
+      || orderDependencies?.some((dependency) => dependency.mode === "direct_to_customer")),
+    dependencyWaitingForTransfer: Boolean(order.dependencyWaitingForTransfer
+      || dependencyChildren.some((child) => child.dependencyWaitingForTransfer)
+      || orderDependencies?.some((dependency) =>
+        dependency.mode === "yard_replenishment"
+        && !["delivered", "received_local"].includes(String(dependency.status || "").toLowerCase())
+      )),
+    dependencyAttention: Boolean(order.dependencyAttention
+      || dependencyChildren.some((child) => child.dependencyAttention)
+      || orderDependencies?.some((dependency) => dependency.status === "attention")),
+    dependencyUncovered: Boolean(order.dependencyUncovered
+      || dependencyChildren.some((child) => child.dependencyUncovered)),
+    dependencyUncoveredQuantity: dependencyChildren.length
+      ? dependencyChildren.reduce((sum, child) => sum + Number(child.dependencyUncoveredQuantity || 0), 0)
+      : Number(order.dependencyUncoveredQuantity || 0),
     groupKey: order.groupKey || id,
     unloadMinutes: Number(order.unloadMinutes || 35),
     travelMinutes: Number(order.travelMinutes || 30)
@@ -2409,23 +2643,134 @@ function replenishmentDependencyComplete(dependency = {}, transferOrder = {}) {
     || ["received", "completed", "shipped"].includes(receivingStatus);
 }
 
+function replenishmentDependencyTargetRefs(dependency = {}, transferOrder = {}) {
+  return new Set([
+    dependency.dispatchTargetRef,
+    dependency.salesOrderRef,
+    dependency.canonicalSalesOrderRef,
+    transferOrder.dependentSalesOrderRef
+  ].map((value) => String(value || "").trim()).filter(Boolean));
+}
+
+function dispatchOrderMatchesRefs(order, refs = new Set()) {
+  if (!order || !refs.size) return false;
+  const orderRefs = dispatchGroupingRefs(order);
+  return [...refs].some((ref) => orderRefs.has(ref));
+}
+
+function replenishmentDependentPlacement(transferOrder, targetLoad) {
+  const dependency = transferOrder?.orderDependency;
+  if (
+    !targetLoad
+    || dependency?.mode !== "yard_replenishment"
+    || dependency?.status === "cancelled"
+    || replenishmentDependencyComplete(dependency, transferOrder)
+  ) return null;
+  const targetRefs = replenishmentDependencyTargetRefs(dependency, transferOrder);
+  if (!targetRefs.size) return null;
+  const dependentDropIndex = (targetLoad.stops || []).findIndex((stop) =>
+    stop.type === "drop" && dispatchOrderMatchesRefs(stopOrder(stop), targetRefs)
+  );
+  if (dependentDropIndex < 0) return null;
+  const dependentOrder = stopOrder(targetLoad.stops[dependentDropIndex]);
+  const pickupLocations = new Set(
+    requiredPickupLocations(dependentOrder).map(normalizedPickupLocation).filter(Boolean)
+  );
+  const dependentPickupIndex = (targetLoad.stops || []).findIndex((stop, index) =>
+    index < dependentDropIndex
+    && stop.type === "pick"
+    && pickupLocations.has(normalizedPickupLocation(stop.location))
+  );
+  return {
+    dependency,
+    dependentOrder,
+    dependentDropIndex,
+    dependentPickupIndex,
+    pickupBoundaryIndex: dependentPickupIndex >= 0 ? dependentPickupIndex : dependentDropIndex
+  };
+}
+
+function normalizeReplenishmentTransferInsertIndex(order, targetLoad, insertIndex = null) {
+  const placement = replenishmentDependentPlacement(order, targetLoad);
+  if (!placement) return insertIndex;
+  const requestedIndex = Number.isInteger(insertIndex) ? insertIndex : (targetLoad.stops || []).length;
+  return Math.min(requestedIndex, placement.pickupBoundaryIndex);
+}
+
+function replenishmentTransferCompletionInLoad(dependency = {}, targetLoad = null) {
+  if (!targetLoad) return null;
+  const transferRef = String(dependency.transferOrderRef || "").trim();
+  if (!transferRef) return null;
+  const transferRefs = new Set([transferRef]);
+  let completion = null;
+  for (const [index, stop] of (targetLoad.stops || []).entries()) {
+    if (stop.type !== "drop") continue;
+    const transferOrder = stopOrder(stop);
+    if (
+      String(stop.orderId || "") !== transferRef
+      && !dispatchOrderMatchesRefs(transferOrder, transferRefs)
+    ) continue;
+    completion = { index, stop, transferOrder };
+  }
+  return completion;
+}
+
+function normalizeReplenishmentDependentInsertIndex(order, targetLoad, insertIndex = null) {
+  if (!targetLoad) return insertIndex;
+  let completionBoundary = -1;
+  for (const dependency of order?.orderDependencies || []) {
+    if (dependency.mode !== "yard_replenishment" || dependency.status === "cancelled") continue;
+    const completion = replenishmentTransferCompletionInLoad(dependency, targetLoad);
+    if (!completion || replenishmentDependencyComplete(dependency, completion.transferOrder)) continue;
+    completionBoundary = Math.max(completionBoundary, completion.index + 1);
+  }
+  if (completionBoundary < 0) return insertIndex;
+  const requestedIndex = Number.isInteger(insertIndex) ? insertIndex : (targetLoad.stops || []).length;
+  return Math.max(requestedIndex, completionBoundary);
+}
+
+function replenishmentSequenceWarningsForStops(stops = []) {
+  const load = { stops };
+  const warnings = [];
+  const seen = new Set();
+  for (const [transferDropIndex, stop] of stops.entries()) {
+    if (stop.type !== "drop") continue;
+    const transferOrder = stopOrder(stop);
+    const placement = replenishmentDependentPlacement(transferOrder, load);
+    if (!placement || transferDropIndex < placement.pickupBoundaryIndex) continue;
+    const transferRef = String(placement.dependency.transferOrderRef || transferOrder?.id || stop.orderId || "");
+    const salesRef = String(placement.dependency.dispatchTargetRef
+      || placement.dependency.salesOrderRef
+      || transferOrder?.dependentSalesOrderRef
+      || placement.dependentOrder?.id
+      || "");
+    const warning = `${transferRef} must finish before ${salesRef} pickup.`;
+    if (!seen.has(warning)) {
+      seen.add(warning);
+      warnings.push(warning);
+    }
+  }
+  return warnings;
+}
+
 function replenishmentPlacementBlockMessage(order, targetTruck, targetLoad, insertIndex = null) {
   const dependencies = (order?.orderDependencies || []).filter((dependency) =>
     dependency.mode === "yard_replenishment" && dependency.status !== "cancelled"
   );
   for (const dependency of dependencies) {
+    if (String(dependency.status || "").toLowerCase() === "attention") {
+      return `${order.id}: ${dependency.attentionReason || `${dependency.transferOrderRef} requires attention`}.`;
+    }
     const transferOrder = orderById(dependency.transferOrderRef);
     if (replenishmentDependencyComplete(dependency, transferOrder)) continue;
-    const transferDate = String(transferOrder?.dispatchPlanDate || "").slice(0, 10);
-    if (transferDate && comparePlanDate(transferDate, currentPlanDate) < 0) continue;
     const assignment = orderAssignment(dependency.transferOrderRef);
     if (!assignment.load) {
+      const transferDate = String(transferOrder?.dispatchPlanDate || "").slice(0, 10);
+      if (transferOrder?.dispatchPlanned && transferDate && comparePlanDate(transferDate, currentPlanDate) < 0) continue;
       return `${order.id} requires ${dependency.transferOrderRef} to be planned before this delivery.`;
     }
     if (String(assignment.load.id || "") === String(targetLoad?.id || "")) {
-      const transferDropIndex = (assignment.load.stops || []).findIndex((stop) =>
-        stop.type === "drop" && String(stop.orderId || "") === String(dependency.transferOrderRef)
-      );
+      const transferDropIndex = replenishmentTransferCompletionInLoad(dependency, assignment.load)?.index ?? -1;
       const targetIndex = Number.isInteger(insertIndex) ? insertIndex : (targetLoad?.stops || []).length;
       if (transferDropIndex < 0 || transferDropIndex >= targetIndex) {
         return `${dependency.transferOrderRef} must be completed before ${order.id} pickup in this load.`;
@@ -2889,11 +3234,13 @@ function stopExecutionStatus(truck, load, stop) {
 }
 
 function driverRecordForTravel(truck, load, startTravel) {
+  const jobStart = startTravel?.fromJobLocation || startTravel?.from || "";
+  const jobTarget = startTravel?.toPickupLocation || startTravel?.to || "";
   return driverStatusByJobId().get(driverTravelJobIdForLoad(truck, load, startTravel))
     || (driverJobStatuses || []).find((item) =>
       String(item.load_id || item.loadId || "") === String(load?.id || "")
       && String(item.stop_type || item.stopType || "") === "travel"
-      && String(item.stop_id || item.stopId || "") === `travel-${startTravel?.from || ""}-${startTravel?.to || ""}`
+      && String(item.stop_id || item.stopId || "") === `travel-${jobStart}-${jobTarget}`
     )
     || null;
 }
@@ -3340,6 +3687,8 @@ function logDispatchAudit(entry = {}) {
 function isLocalDispatchOrder(order) {
   const id = String(order?.id || "");
   return order?.type === "CO"
+    || order?.type === "CUSTOM"
+    || order?.sourceTable === "dispatch_custom_orders"
     || id.startsWith("CO-")
     || id.startsWith("GRP-")
     || /^G[A-Z]+-/i.test(id)
@@ -3422,6 +3771,7 @@ function reconcileTransitCoSourceOrders() {
 }
 
 function shouldPreserveDuringFeedRefresh(order) {
+  if (order?.type === "CUSTOM" || order?.sourceTable === "dispatch_custom_orders") return false;
   if (isLocalDispatchOrder(order)) return true;
   return isNetSuiteDispatchOrder(order)
     && order?.netsuiteFeedMissing
@@ -3479,6 +3829,9 @@ function applySavedPlan(saved) {
   const defaultById = new Map(orderCatalog.map((order) => [order.id, normalizeOrder(order)]));
   const savedAssignedIds = assignedOrderIdsForTrucks(saved.trucks);
   const allowSavedOnlyOrder = (order) => {
+    if (order?.type === "CUSTOM" || order?.sourceTable === "dispatch_custom_orders") {
+      return savedAssignedIds.has(order.id);
+    }
     if (isLocalDispatchOrder(order)) return true;
     if (!isNetSuiteDispatchOrder(order)) return false;
     const localStatus = order.localDispatchStatus || (savedAssignedIds.has(order.id) ? "planned" : "open");
@@ -3493,7 +3846,9 @@ function applySavedPlan(saved) {
       childOrders: order.childOrders,
       childOrderDetails: order.childOrderDetails,
       consolidation: order.consolidation,
-      originalOrderId: splitParentOrderId(order) || order.originalOrderId,
+      originalOrderId: order.type === "CUSTOM"
+        ? ""
+        : splitParentOrderId(order) || order.originalOrderId,
       originalPallets: order.originalPallets,
       transitCo: order.transitCo,
       transitOriginalPickupLocations: order.transitOriginalPickupLocations
@@ -3796,7 +4151,18 @@ async function flushPlanSaveQueue() {
           continue;
         }
         staleRetryCount = 0;
-        if (result?.blocked || result?.failed) break;
+        if (result?.blocked || result?.failed) {
+          const newerMutationQueued = saveQueued && localPlanGeneration !== saveGeneration;
+          autosaveDebug("flushPlanSaveQueue:failedResult", {
+            blocked: Boolean(result?.blocked),
+            failed: Boolean(result?.failed),
+            saveGeneration,
+            localPlanGeneration,
+            newerMutationQueued
+          });
+          if (newerMutationQueued) continue;
+          break;
+        }
       }
       return finalResult;
     } finally {
@@ -4096,6 +4462,21 @@ function commitPlanMutation(actionName = "dispatch_plan_mutation", mutator = nul
   if (options.refreshOrderPool) requestOrderPoolRefreshOnNextSave();
   if (options.truckSequence) requestTruckSequenceSaveOnNextSave();
   normalizePlanBeforeSave();
+  const dependencySequenceWarning = options.validateDependencies === false
+    ? ""
+    : trucks
+      .flatMap((truck) => (truck.loads || []).flatMap((load) => replenishmentSequenceWarningsForStops(load.stops || [])))
+      .find(Boolean) || "";
+  if (dependencySequenceWarning) {
+    if (rollbackPacked) applyHistorySnapshot(unpackHistorySnapshot(rollbackPacked));
+    routeNotice = `Invalid dependency sequence: ${dependencySequenceWarning}`;
+    autosaveDebug("commitPlanMutation:dependencyRejected", {
+      actionName,
+      message: dependencySequenceWarning
+    });
+    render({ save: false });
+    return false;
+  }
   const assignmentConflict = options.validateAssignments === false || !DISPATCH_ASSIGNMENT_MUTATION_ACTIONS.has(actionName)
     ? null
     : localDispatchLoadAssignmentConflict();
@@ -4560,7 +4941,11 @@ function openOrders() {
     if (!term && isOrderPlannedOutsideCurrentPlan(order)) return false;
     if (!matchesSearch(order)) return false;
     if (dispatchDateFilter && order.type === "SO" && order.expectedDeliveryDate !== dispatchDateFilter) return false;
-    return term ? true : order.type === activeOrderType;
+    return term
+      ? true
+      : activeOrderType === "TO"
+        ? ["TO", "CUSTOM"].includes(order.type)
+        : order.type === activeOrderType;
   });
 }
 
@@ -4614,12 +4999,17 @@ function stopById(stopId) {
 function requiredPickupLocations(order) {
   const locations = order?.pickupLocations?.length ? order.pickupLocations : ["3445"];
   const seen = new Set();
-  return locations.filter((location) => {
+  const uniqueLocations = locations.filter((location) => {
     const key = normalizedPickupLocation(location);
     if (!key || seen.has(key)) return false;
     seen.add(key);
-    return tooltipItemsForOrder(order, { pickupLocation: location }).some(itemHasQuantity);
+    return true;
   });
+  const hasPickupAddressOverride = Boolean(String(order?.pickupAddressOverride || "").trim());
+  return uniqueLocations.filter((location, index) =>
+    (hasPickupAddressOverride && index === 0)
+      || tooltipItemsForOrder(order, { pickupLocation: location }).some(itemHasQuantity)
+  );
 }
 
 function sequenceWarningsForStops(stops) {
@@ -4635,6 +5025,9 @@ function sequenceWarningsForStops(stops) {
     if (!order) continue;
     const missing = requiredPickupLocations(order).filter((location) => !picked.has(String(location)));
     if (missing.length) warnings.push(`${order.id}: pickup ${missing.join(", ")} before drop.`);
+  }
+  for (const warning of replenishmentSequenceWarningsForStops(stops)) {
+    if (!warnings.includes(warning)) warnings.push(warning);
   }
   return warnings;
 }
@@ -4657,6 +5050,17 @@ function uniquePickupLocations(load, truck) {
   }
   if (!locations.length && truck?.base) locations.push(truck.base);
   return locations;
+}
+
+function uniquePickupDisplayLabels(load, truck) {
+  const labels = [];
+  for (const stop of load?.stops || []) {
+    if (stop.type !== "pick") continue;
+    const order = stopOrder(stop);
+    const label = pickupStopLabel(stop, order);
+    if (label && !labels.includes(label)) labels.push(label);
+  }
+  return labels.length ? labels : uniquePickupLocations(load, truck);
 }
 
 function pickupFootprintForLocation(load, location) {
@@ -4757,6 +5161,7 @@ function invalidateDriverRoutesFromLoad(loadId) {
 }
 
 function routeStopIsOwnYard(stop = {}) {
+  if (stop.kind === "own") return true;
   const keys = [
     stop.address,
     typeof stop.routeLocation === "string" ? stop.routeLocation : "",
@@ -4783,12 +5188,23 @@ function loadFinishText(truck, load, stats = loadStats(truck, load)) {
 
 function fallbackTravelMinutesBetweenStops(truck, previousStop, currentStop, previousOrder, currentOrder) {
   if (!previousStop) return 0;
-  const previousLocation = previousStop.type === "pick"
-    ? previousStop.location
-    : dropLocationForStop(previousStop, previousOrder) || previousOrder?.address || "";
-  const currentLocation = currentStop.type === "pick"
-    ? currentStop.location
-    : dropLocationForStop(currentStop, currentOrder) || currentOrder?.address || "";
+  const previousPlace = resolveStopPlace(previousStop, previousOrder);
+  const currentPlace = resolveStopPlace(currentStop, currentOrder);
+  if (
+    (previousPlace.kind === "own"
+      && currentPlace.kind === "own"
+      && String(previousPlace.key || "") === String(currentPlace.key || ""))
+    || samePhysicalAddress(
+      previousPlace.routeLocation || previousPlace.address,
+      currentPlace.routeLocation || currentPlace.address
+    )
+  ) return 0;
+  const previousLocation = previousPlace.kind === "own"
+    ? previousPlace.key
+    : previousPlace.address || previousPlace.key || "";
+  const currentLocation = currentPlace.kind === "own"
+    ? currentPlace.key
+    : currentPlace.address || currentPlace.key || "";
   let value = 30;
   if (HUBS[previousLocation] && HUBS[currentLocation]) value = yardTravelMinutes(previousLocation, currentLocation);
   else if (currentStop.type === "drop") value = Number(currentOrder?.travelMinutes || 30);
@@ -4910,9 +5326,10 @@ function loadStats(parentTruck, load) {
       let warningReason = "";
       const window = stopTimeWindow(stop, order);
       const hasTimeWindow = Boolean(window.start && window.end);
-      if (window.closed) warningReason = `${stop.location} closed on ${window.label || planWeekdayName()}.`;
-      else if (hasTimeWindow && arrival > minutes(window.end)) warningReason = `Pickup ${stop.location} late: arrives ${timeText(arrival)}, window ends ${window.end}`;
-      else if (hasTimeWindow && arrival < minutes(window.start)) warningReason = `Pickup ${stop.location} early: arrives ${timeText(arrival)}, window starts ${window.start}`;
+      const pickupLabel = pickupStopLabel(stop, order);
+      if (window.closed) warningReason = `${pickupLabel} closed on ${window.label || planWeekdayName()}.`;
+      else if (hasTimeWindow && arrival > minutes(window.end)) warningReason = `Pickup ${pickupLabel} late: arrives ${timeText(arrival)}, window ends ${window.end}`;
+      else if (hasTimeWindow && arrival < minutes(window.start)) warningReason = `Pickup ${pickupLabel} early: arrives ${timeText(arrival)}, window starts ${window.start}`;
       if (warningReason) {
         warningCount += 1;
         warnings.push(warningReason);
@@ -5217,9 +5634,16 @@ function syncReturnLoads() {
   if (!findLoad(selectedLoadId).load) selectedLoadId = trucks[0]?.loads[0]?.id || "";
 }
 
+function opaqueDispatchStopId() {
+  const randomUuid = globalThis.crypto?.randomUUID?.();
+  return randomUuid
+    ? `stop-${randomUuid}`
+    : `stop-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
 function makePickupStop(load, order, location) {
   return {
-    id: `${load.id}-${order.id}-PICK-${location}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    id: opaqueDispatchStopId(),
     loadId: load.id,
     orderId: order.id,
     type: "pick",
@@ -5628,11 +6052,12 @@ function switchApproachTravelForLoad(truck, load) {
   if (!from) return null;
   const switchPlace = placeForLocation(switchYard);
   const toAddress = switchPlace?.address || hubAddress(switchYard);
-  if (normalizedPlaceKey(from.routeLocation || from.address || from.label) === normalizedPlaceKey(toAddress || switchYard)) return null;
+  if (samePhysicalAddress(from.routeLocation || from.address || from.label, toAddress || switchYard)) return null;
 
   const previousTruck = effectiveTruckForLoad(previousEntry.truck, previousEntry.load);
   return {
     from: from.label || from.address || "Previous stop",
+    fromJobLocation: from.jobLabel || from.label || from.address || "Previous stop",
     fromAddress: from.address || String(from.label || ""),
     fromPosition: from.position,
     fromRouteLocation: from.routeLocation || from.address || from.position,
@@ -5726,6 +6151,7 @@ function startPointAfterLoad(truck, load) {
     const place = placeForLocation(yard);
     return {
       label: yard,
+      jobLabel: yard,
       address: place?.address || hubAddress(yard),
       position: placePosition(place) || hubPosition(yard),
       routeLocation: place?.address || hubAddress(yard),
@@ -5737,7 +6163,8 @@ function startPointAfterLoad(truck, load) {
   if (!stop) return null;
   const place = resolveStopPlace(stop, order);
   return {
-    label: stop.type === "pick" ? String(stop.location || "") : (order?.id || "Previous stop"),
+    label: stop.type === "pick" ? pickupStopLabel(stop, order) : (order?.id || "Previous stop"),
+    jobLabel: stop.type === "pick" ? String(stop.location || "") : (order?.id || "Previous stop"),
     address: place.address,
     position: { lat: place.lat, lng: place.lng },
     routeLocation: place.routeLocation,
@@ -5756,7 +6183,10 @@ function startTravelForLoad(truck, load) {
   const firstPickup = load.stops.find((stop) => stop.type === "pick");
   if (!firstPickup?.location) return null;
   const firstPickupOrder = stopOrder(firstPickup);
-  const pickupAddress = stopAddress(firstPickup, firstPickupOrder);
+  const pickupPlace = resolveStopPlace(firstPickup, firstPickupOrder);
+  const pickupAddress = pickupPlace.address;
+  const pickupLabel = pickupStopLabel(firstPickup, firstPickupOrder);
+  const pickupKey = pickupPlace.key || pickupLabel;
   const assignedTruck = effectiveTruckForLoad(truck, load);
   if (driverOrientedPlanningEnabled()) {
     const previousEntry = previousDriverLoad(truck, load);
@@ -5768,6 +6198,7 @@ function startTravelForLoad(truck, load) {
         const switchPlace = placeForLocation(switchYard);
         from = {
           label: switchYard,
+          jobLabel: switchYard,
           address: switchPlace?.address || hubAddress(switchYard),
           position: placePosition(switchPlace) || hubPosition(switchYard),
           routeLocation: switchPlace?.address || hubAddress(switchYard),
@@ -5781,6 +6212,7 @@ function startTravelForLoad(truck, load) {
       const startPlace = placeForLocation(startYard);
       from = {
         label: startYard,
+        jobLabel: startYard,
         address: startPlace?.address || hubAddress(startYard),
         position: placePosition(startPlace) || hubPosition(startYard),
         routeLocation: startPlace?.address || hubAddress(startYard),
@@ -5788,15 +6220,16 @@ function startTravelForLoad(truck, load) {
       };
     }
     if (!from) return null;
-    const sameLocation = String(from.label) === String(firstPickup.location);
-    if (sameLocation && normalizedPlaceKey(from.address) === normalizedPlaceKey(pickupAddress)) return null;
+    if (samePhysicalAddress(from.routeLocation || from.address, pickupPlace.routeLocation || pickupAddress)) return null;
     return {
       from: from.label || from.address || "Previous stop",
-      to: firstPickup.location,
+      fromJobLocation: from.jobLabel || from.label || from.address || "Previous stop",
+      to: pickupLabel,
+      toPickupLocation: String(firstPickup.location || ""),
       address: from.address,
       position: from.position,
       routeLocation: from.routeLocation,
-      minutes: sameLocation ? 30 : travelMinutesBetweenPoints(from, firstPickup.location)
+      minutes: travelMinutesBetweenPoints(from, pickupKey)
     };
   }
   const index = loadIndexInTruck(truck, load);
@@ -5804,29 +6237,37 @@ function startTravelForLoad(truck, load) {
     if (!truck?.base) return null;
     const basePlace = placeForLocation(truck.base);
     const baseAddress = basePlace?.address || hubAddress(truck.base);
-    const sameLocation = String(truck.base) === String(firstPickup.location);
-    if (sameLocation && normalizedPlaceKey(baseAddress) === normalizedPlaceKey(pickupAddress)) return null;
+    if (samePhysicalAddress(baseAddress, pickupPlace.routeLocation || pickupAddress)) return null;
     return {
       from: truck.base,
-      to: firstPickup.location,
+      fromJobLocation: truck.base,
+      to: pickupLabel,
+      toPickupLocation: String(firstPickup.location || ""),
       address: baseAddress,
       position: placePosition(basePlace) || hubPosition(truck.base),
       routeLocation: baseAddress,
-      minutes: sameLocation ? 30 : yardTravelMinutes(truck.base, firstPickup.location)
+      minutes: travelMinutesBetweenPoints({
+        label: truck.base,
+        address: baseAddress,
+        position: placePosition(basePlace) || hubPosition(truck.base),
+        routeLocation: baseAddress,
+        isHub: basePlace?.kind === "own"
+      }, pickupKey)
     };
   }
   const previous = truck.loads[index - 1];
   const from = startPointAfterLoad(truck, previous);
   if (!from) return null;
-  const sameLocation = String(from.label) === String(firstPickup.location);
-  if (sameLocation && normalizedPlaceKey(from.address) === normalizedPlaceKey(pickupAddress)) return null;
+  if (samePhysicalAddress(from.routeLocation || from.address, pickupPlace.routeLocation || pickupAddress)) return null;
   return {
     from: from.label || from.address || "Previous stop",
-    to: firstPickup.location,
+    fromJobLocation: from.jobLabel || from.label || from.address || "Previous stop",
+    to: pickupLabel,
+    toPickupLocation: String(firstPickup.location || ""),
     address: from.address,
     position: from.position,
     routeLocation: from.routeLocation,
-    minutes: sameLocation ? 30 : travelMinutesBetweenPoints(from, firstPickup.location)
+    minutes: travelMinutesBetweenPoints(from, pickupKey)
   };
 }
 
@@ -5866,7 +6307,10 @@ function loadEndOwnYard(load) {
   if (load?.returnOnly) return ownYardForLocation(load.returnYard)?.code || String(load.returnYard || "");
   const stop = lastRoutedStop(load);
   if (!stop) return "";
-  if (stop.type === "pick") return ownYardForLocation(stop.location)?.code || "";
+  if (stop.type === "pick") {
+    const place = resolveStopPlace(stop, stopOrder(stop));
+    return place.kind === "own" ? String(place.key || "") : "";
+  }
   const order = stopOrder(stop);
   return ownYardForLocation(order?.destinationYard || order?.address)?.code || "";
 }
@@ -5905,8 +6349,8 @@ function mapPins() {
     const order = stopOrder(stop);
     if (!order) return;
     if (stop.type === "pick") {
-      const place = placeForLocation(stop.location, order);
-      const hub = HUBS[place?.key] || HUBS[truck?.base] || { x: 50, y: 50 };
+      const place = resolveStopPlace(stop, order);
+      const hub = HUBS[place?.key] || { x: Number(order.x || 50), y: Number(order.y || 50) };
       pins.push({ label: String(index + 1), className: "pick", x: hub.x, y: hub.y });
     } else {
       const destination = dropLocationForStop(stop, order);
@@ -5997,8 +6441,10 @@ function resolveStopPlace(stop, order) {
     };
   }
   if (stop.type === "pick") {
-    const place = placeForLocation(stop.location, order);
-    const address = order?.pickupAddressOverride
+    const pickupAddressOverride = String(order?.pickupAddressOverride || "").trim();
+    const physicalLocation = pickupAddressOverride || stop.location;
+    const place = placeForLocation(physicalLocation, order);
+    const address = pickupAddressOverride
       || place?.address
       || order?.sourceAddress
       || (order?.type === "PO" ? "" : order?.address)
@@ -6006,12 +6452,13 @@ function resolveStopPlace(stop, order) {
     const position = placePosition(place) || fallbackPositionForAddress(address, order);
     return {
       kind: place?.kind || "pickup",
-      key: place?.key || String(stop.location || address || ""),
-      label: place?.label || String(stop.location || "Pickup"),
+      key: place?.key || String(physicalLocation || address || ""),
+      label: place?.label || String(physicalLocation || "Pickup"),
       address,
       routeLocation: address || position,
       lat: position.lat,
-      lng: position.lng
+      lng: position.lng,
+      logicalLocation: String(stop.location || "")
     };
   }
   const destinationYard = dropLocationForStop(stop, order);
@@ -6029,8 +6476,13 @@ function resolveStopPlace(stop, order) {
   };
 }
 
+function pickupStopLabel(stop, order) {
+  const place = resolveStopPlace(stop, order);
+  return String(place.label || place.address || stop?.location || "Pickup");
+}
+
 function stopIsOwnYard(stop, order) {
-  if (stop.type === "pick") return placeForLocation(stop.location, order)?.kind === "own";
+  if (stop.type === "pick") return resolveStopPlace(stop, order).kind === "own";
   const destinationYard = dropLocationForStop(stop, order);
   return Boolean(destinationYard && placeForLocation(destinationYard, order)?.kind === "own");
 }
@@ -6043,7 +6495,7 @@ function stopServiceType(stop, order) {
 
 function stopTimeWindow(stop, order) {
   if (!stop || !order || stopIsOwnYard(stop, order)) return { start: "", end: "" };
-  if (stop.type === "pick") return vendorWindowForLocation(stop.location, order);
+  if (stop.type === "pick") return vendorWindowForLocation(order.pickupAddressOverride || stop.location, order);
   if (stop.type === "drop") return { start: order.windowStart || "", end: order.windowEnd || "" };
   return { start: "", end: "" };
 }
@@ -6063,6 +6515,17 @@ function stopAddress(stop, order) {
 
 function stopRouteLocation(stop) {
   return stop.routeLocation || { lat: stop.lat, lng: stop.lng };
+}
+
+function samePhysicalRouteStop(left, right) {
+  if (!left || !right) return false;
+  if (
+    left.kind === "own"
+    && right.kind === "own"
+    && String(left.placeKey || left.key || "")
+    && String(left.placeKey || left.key || "") === String(right.placeKey || right.key || "")
+  ) return true;
+  return samePhysicalAddress(stopRouteLocation(left), stopRouteLocation(right));
 }
 
 function routeLocationForStop(stop, order, position, address) {
@@ -6150,15 +6613,18 @@ function mapStopsForLoad(load, truck) {
   const routedStops = (load?.stops || []).map((stop, index) => {
     const order = stopOrder(stop);
     if (!order) return null;
-    const position = stopPosition(stop, order);
-    const address = stopAddress(stop, order);
+    const place = resolveStopPlace(stop, order);
+    const position = { lat: place.lat, lng: place.lng };
+    const address = place.address;
     const sequence = index + 1 + handoffStops.length + startStops.length;
     return {
       ...position,
       address,
-      routeLocation: routeLocationForStop(stop, order, position, address),
+      routeLocation: place.routeLocation || routeLocationForStop(stop, order, position, address),
+      kind: place.kind,
+      placeKey: place.key,
       label: String(sequence),
-      title: stop.type === "pick" ? `${sequence}. Pickup ${stop.location}` : `${sequence}. Drop ${dropStopLabel(stop, order)}`,
+      title: stop.type === "pick" ? `${sequence}. Pickup ${pickupStopLabel(stop, order)}` : `${sequence}. Drop ${dropStopLabel(stop, order)}`,
       type: stop.type,
       stayMinutes: stop.type === "pick"
         ? truckStopMinutes(truck, stopServiceType(stop, order), pickupFootprintForLocation(load, stop.location))
@@ -6407,7 +6873,12 @@ async function geocodeMarkerStops(markerStops = []) {
 
 function routeEstimateFromGoogleLegs(load, stops, legs = [], truck = {}) {
   truck = effectiveTruckForLoad(findLoad(load?.id).truck || truck, load);
-  const rawLegMinutes = legs.map((leg) => Math.max(1, Math.round(Number((leg.duration_in_traffic || leg.duration)?.value || 0) / 60)));
+  const rawLegMinutes = legs.map((leg, index) => {
+    const from = stops[index];
+    const to = stops[index + 1];
+    if (samePhysicalRouteStop(from, to)) return 0;
+    return Math.max(1, Math.round(Number((leg.duration_in_traffic || leg.duration)?.value || 0) / 60));
+  });
   const legMinutes = rawLegMinutes.map((value) => adjustedTravelMinutesForTruck(truck, value));
   const rawDriveMinutes = rawLegMinutes.reduce((sum, value) => sum + value, 0);
   const driveMinutes = legMinutes.reduce((sum, value) => sum + value, 0);
@@ -6528,7 +6999,7 @@ async function renderGoogleMapPreview() {
         title: stop.title
       });
       const info = new google.maps.InfoWindow({
-        content: `<strong>${stop.title}</strong><br>${stop.type === "pick" ? "Pickup" : "Drop off"}<br>Stay ${stop.stayMinutes} min`
+        content: `<strong>${escapeHtml(stop.title)}</strong><br>${stop.type === "pick" ? "Pickup" : "Drop off"}<br>Stay ${Number(stop.stayMinutes || 0)} min`
       });
       marker.addListener("click", () => info.open({ anchor: marker, map }));
       bounds.extend(marker.getPosition());
@@ -6838,10 +7309,10 @@ function render(options = {}) {
 }
 
 function orderPoolSubtitle() {
-  if (!searchText.trim()) return orderTypeLabel(activeOrderType) + " list";
-  if (orderSearchLoading) return "Searching all valid SO, PO, TO, and CO orders...";
+  if (!searchText.trim()) return activeOrderType === "TO" ? "Transfer and Custom Order list" : orderTypeLabel(activeOrderType) + " list";
+  if (orderSearchLoading) return "Searching all valid SO, PO, TO, Custom, and CO orders...";
   if (orderSearchError) return "Server search unavailable: " + orderSearchError;
-  return "Search results across all valid SO, PO, TO, and CO orders.";
+  return "Search results across all valid SO, PO, TO, Custom, and CO orders.";
 }
 
 function renderOrderPool() {
@@ -6854,7 +7325,7 @@ function renderOrderPool() {
           <p>${orderPoolSubtitle()}</p>
         </div>
         <div class="order-tools">
-          <input id="orderSearch" value="${escapeHtml(searchText)}" placeholder="Search SO, PO, TO, CO, SKU, address" />
+          <input id="orderSearch" value="${escapeHtml(searchText)}" placeholder="Search SO, PO, TO, Custom, CO, SKU, address" />
           <label class="date-filter">
             <span>SO Date</span>
             <input id="dispatchDate" type="date" value="${escapeHtml(dispatchDateFilter)}" />
@@ -6900,6 +7371,7 @@ function renderSelectedOrderActions() {
   const order = selectedOrder();
   if (!order) return "";
   const selected = selectedOrders();
+  const includesCustomOrder = selected.some((item) => item.type === "CUSTOM");
   const label = selected.length > 1 ? `${selected.length} selected` : order.id;
   const groupedCount = order.childOrders?.length || 0;
   const reviewOnly = selected.some((item) => isReviewOnlyOrder(item));
@@ -6908,14 +7380,15 @@ function renderSelectedOrderActions() {
     <div class="selected-order-actions">
       <span>${escapeHtml(label)}</span>
       ${reviewOnly ? `<span>Loaded/shipped history</span>` : ""}
-      ${groupedCount ? `<button data-action="ungroup-order" data-order="${order.id}" ${blockedUngroup ? `disabled title="Cancel ${escapeHtml(blockedUngroup)} before ungrouping"` : ""} type="button">Ungroup</button>` : selected.length > 1 ? `<button data-action="open-group-modal" data-order="${order.id}" type="button">Group</button>` : ""}
+      ${groupedCount ? `<button data-action="ungroup-order" data-order="${escapeHtml(order.id)}" ${blockedUngroup ? `disabled title="Cancel ${escapeHtml(blockedUngroup)} before ungrouping"` : ""} type="button">Ungroup</button>` : selected.length > 1 && !includesCustomOrder ? `<button data-action="open-group-modal" data-order="${escapeHtml(order.id)}" type="button">Group</button>` : ""}
       ${blockedUngroup ? `<span>Cancel ${escapeHtml(blockedUngroup)} before ungrouping</span>` : ""}
-      ${!reviewOnly && order.type === "PO" && order.sourceTable !== "scm_vrma_orders" ? `<button data-action="open-po-yard-modal" data-order="${order.id}" type="button">Set Yard</button>` : ""}
-      ${!reviewOnly && order.type === "SO" ? `<button data-action="open-po-link-modal" data-order="${order.id}" type="button">Link PO</button>` : ""}
-      ${!reviewOnly && order.type === "SO" ? `<button data-action="open-to-link-modal" data-order="${order.id}" type="button">Link TO</button>` : ""}
-      ${!reviewOnly && order.type !== "CO" && order.sourceTable !== "scm_vrma_orders" && !order.originalOrderId ? `<button data-action="open-split-modal" data-order="${order.id}" type="button">Split</button>` : ""}
-      ${!reviewOnly && order.originalOrderId ? `<button data-action="unsplit-order" data-order="${order.id}" type="button">Unsplit</button>` : ""}
-      ${!reviewOnly && canConsolidatePick(order) ? `<button data-action="open-consolidate-modal" data-order="${order.id}" type="button">Consolidate Pick</button>` : ""}
+      ${order.type === "CUSTOM" ? `<button data-action="edit-custom-order" data-custom-order-id="${escapeHtml(order.customOrderId || "")}" type="button">Open Custom Order</button>` : ""}
+      ${!reviewOnly && order.type === "PO" && order.sourceTable !== "scm_vrma_orders" ? `<button data-action="open-po-yard-modal" data-order="${escapeHtml(order.id)}" type="button">Set Yard</button>` : ""}
+      ${!reviewOnly && order.type === "SO" ? `<button data-action="open-po-link-modal" data-order="${escapeHtml(order.id)}" type="button">Link PO</button>` : ""}
+      ${!reviewOnly && order.type === "SO" ? `<button data-action="open-to-link-modal" data-order="${escapeHtml(order.id)}" type="button">Link TO</button>` : ""}
+      ${!reviewOnly && !["CO", "CUSTOM"].includes(order.type) && order.sourceTable !== "scm_vrma_orders" && !order.originalOrderId ? `<button data-action="open-split-modal" data-order="${escapeHtml(order.id)}" type="button">Split</button>` : ""}
+      ${!reviewOnly && order.type !== "CUSTOM" && order.originalOrderId ? `<button data-action="unsplit-order" data-order="${escapeHtml(order.id)}" type="button">Unsplit</button>` : ""}
+      ${!reviewOnly && canConsolidatePick(order) ? `<button data-action="open-consolidate-modal" data-order="${escapeHtml(order.id)}" type="button">Consolidate Pick</button>` : ""}
     </div>
   `;
 }
@@ -6944,14 +7417,14 @@ function renderOrderCard(order) {
     ? `${assignment.truck?.plate || ""} ${assignment.load?.name || "Planned"}`
     : orderPlannedElsewhereText(order);
   return `
-    <article class="order-card status-${executionStatus} ${selectedOrderIds.has(order.id) ? "selected" : ""} ${planned ? "planned" : ""} ${plannedElsewhere ? "planned-elsewhere" : ""} ${dependencyLinked && !dependencyParentPlanned ? "dependency-linked" : ""} ${dependencyParentPlanned ? "dependency-parent-planned" : ""} ${reviewOnly ? "review-only" : ""} ${missingAddress || transitBlocked || order.dependencyAttention ? "warning" : ""}" draggable="${dragBlocked ? "false" : "true"}" data-order="${order.id}" data-planned="${anyPlanned ? "true" : "false"}" data-dependency-linked="${dependencyLinked ? "true" : "false"}" data-review-only="${reviewOnly ? "true" : "false"}" data-planned-elsewhere="${plannedElsewhere ? "true" : "false"}">
-      <strong>${order.id} | ${escapeHtml(order.customer)}</strong>
+    <article class="order-card status-${executionStatus} ${selectedOrderIds.has(order.id) ? "selected" : ""} ${planned ? "planned" : ""} ${plannedElsewhere ? "planned-elsewhere" : ""} ${dependencyLinked && !dependencyParentPlanned ? "dependency-linked" : ""} ${dependencyParentPlanned ? "dependency-parent-planned" : ""} ${reviewOnly ? "review-only" : ""} ${missingAddress || transitBlocked || order.dependencyAttention ? "warning" : ""}" draggable="${dragBlocked ? "false" : "true"}" data-order="${escapeHtml(order.id)}" data-planned="${anyPlanned ? "true" : "false"}" data-dependency-linked="${dependencyLinked ? "true" : "false"}" data-review-only="${reviewOnly ? "true" : "false"}" data-planned-elsewhere="${plannedElsewhere ? "true" : "false"}">
+      <strong>${escapeHtml(order.id)} | ${escapeHtml(order.customer)}</strong>
       <span>${plannedElsewhere ? escapeHtml(orderPlannedElsewhereText(order)) : missingAddress ? "Missing delivery address" : transitBlocked ? escapeHtml(transitMessage) : escapeHtml(movementText(order))}</span>
       <span class="order-compact-line">Pickup ${escapeHtml(orderPickupText(order))} | ${dateText}${order.windowStart || "--"}-${order.windowEnd || "--"}</span>
       <span class="order-compact-line">${orderUnitText(order)} | ${orderFootprintPallets(order)} pos | ${formatLbs(orderWeightLbs(order))}${packedText ? ` | Packed ${escapeHtml(packedText)}` : ""}</span>
       ${groupedCount ? `<span>Includes ${order.childOrders.join(", ")}</span>` : ""}
       <div class="chip-row">
-        <span class="chip">${order.type}</span>
+        <span class="chip">${order.type === "CUSTOM" ? "Custom" : order.type}</span>
         ${order.sourceTable === "scm_vrma_orders" ? `<span class="chip">Local VRMA</span>` : ""}
         ${executionStatus === "complete" ? `<span class="chip complete-chip">Completed</span>` : executionStatus === "in_progress" ? `<span class="chip progress-chip">In progress</span>` : ""}
         ${reviewOnly ? `<span class="chip complete-chip">${escapeHtml(reviewOnlyText(order))}</span>` : ""}
@@ -6985,35 +7458,35 @@ function renderTruck(truck, index = 0) {
   return `
     <article class="truck-row ${hasDriver ? "" : "driver-missing"}">
       <div class="truck-sequence-controls">
-        <button data-action="move-truck-up" data-truck="${truck.id}" ${index <= 0 ? "disabled" : ""} title="Move truck up" type="button">▲</button>
-        <button data-action="move-truck-down" data-truck="${truck.id}" ${index >= trucks.length - 1 ? "disabled" : ""} title="Move truck down" type="button">▼</button>
+        <button data-action="move-truck-up" data-truck="${escapeHtml(truck.id)}" ${index <= 0 ? "disabled" : ""} title="Move truck up" type="button">▲</button>
+        <button data-action="move-truck-down" data-truck="${escapeHtml(truck.id)}" ${index >= trucks.length - 1 ? "disabled" : ""} title="Move truck down" type="button">▼</button>
       </div>
       <div class="truck-label">
         <div>
-          <strong>${truck.plate}</strong>
+          <strong>${escapeHtml(truck.plate)}</strong>
           <span>${formatLbs(truckCapacityLbs(truck))} cap. | ${escapeHtml(travelAdjustmentText(truck))}</span>
           <label class="truck-start-yard">
             <span>Driver</span>
-            <select data-truck-driver="${truck.id}">${driverOptions(driverKey(selectedDriver) || truck.driverLogin || "", truck.id)}</select>
+            <select data-truck-driver="${escapeHtml(truck.id)}">${driverOptions(driverKey(selectedDriver) || truck.driverLogin || "", truck.id)}</select>
           </label>
           ${hasDriver ? "" : `<span class="truck-driver-warning">Assign driver first</span>`}
           <label class="truck-start-yard">
             <span>Start yard</span>
-            <select data-truck-start="${truck.id}">${yardOptions(truck.base || "12441")}</select>
+            <select data-truck-start="${escapeHtml(truck.id)}">${yardOptions(truck.base || "12441")}</select>
           </label>
           <label class="truck-start-yard">
             <span>Parking spot</span>
-            <input data-truck-parking="${truck.id}" value="${escapeHtml(truck.parkingSpot || "")}" placeholder="A1" />
+            <input data-truck-parking="${escapeHtml(truck.id)}" value="${escapeHtml(truck.parkingSpot || "")}" placeholder="A1" />
           </label>
         </div>
         <div class="truck-actions">
-          <button data-action="add-load" data-truck="${truck.id}" title="${hasDriver ? insertText : "Assign driver first"}" ${hasDriver ? "" : "disabled"} type="button">+ Load</button>
-          <button data-action="add-return-load" data-truck="${truck.id}" title="${hasDriver ? insertText : "Assign driver first"}" ${hasDriver ? "" : "disabled"} type="button">+ Return</button>
+          <button data-action="add-load" data-truck="${escapeHtml(truck.id)}" title="${hasDriver ? insertText : "Assign driver first"}" ${hasDriver ? "" : "disabled"} type="button">+ Load</button>
+          <button data-action="add-return-load" data-truck="${escapeHtml(truck.id)}" title="${hasDriver ? insertText : "Assign driver first"}" ${hasDriver ? "" : "disabled"} type="button">+ Return</button>
         </div>
       </div>
       <div class="truck-timeline">
         ${truck.loads.map((load) => renderLoad(truck, load)).join("")}
-        <div class="timeline-drop-zone ${hasDriver ? "" : "locked"}" data-load-create="${truck.id}">${hasDriver ? "Drop order here<br>to create new load" : "Assign driver first"}</div>
+        <div class="timeline-drop-zone ${hasDriver ? "" : "locked"}" data-load-create="${escapeHtml(truck.id)}">${hasDriver ? "Drop order here<br>to create new load" : "Assign driver first"}</div>
       </div>
     </article>
   `;
@@ -7144,21 +7617,21 @@ function renderLoad(parentTruck, load) {
     return `
       <section class="load-block return-only status-${executionStatus}" draggable="${canDragLoad}" data-driver-load-card="${escapeHtml(load.id)}">
         <div class="load-header">
-          <button class="load-title return-load-title" data-action="select-load" data-load="${load.id}" type="button">
+          <button class="load-title return-load-title" data-action="select-load" data-load="${escapeHtml(load.id)}" type="button">
             <strong>${load.manual ? "Manual Return" : "Return Load"}</strong>
             <span class="${finishText === "Route pending" ? "route-pending" : ""}">${finishText === "Route pending" ? finishText : `Finish ${finishText}`}</span>
           </button>
           <div class="load-header-actions">
             <span class="load-drag-handle" draggable="${canDragLoad}" title="Drag this whole load to another driver" aria-label="Drag whole load">&#8942;&#8942;</span>
             <button class="load-insert-return" data-action="insert-driver-return" data-after-load="${escapeHtml(load.id)}" data-driver-login="${escapeHtml(loadDriverKey(parentTruck, load))}" ${isLocked ? "disabled" : ""} title="Insert a return after this load" type="button">+R</button>
-            <button class="load-delete" data-action="delete-load" data-load="${load.id}" ${isLocked ? "disabled" : ""} title="${isLocked ? escapeHtml(loadActivityLockNotice(load)) : "Delete return load"}" type="button">x</button>
+            <button class="load-delete" data-action="delete-load" data-load="${escapeHtml(load.id)}" ${isLocked ? "disabled" : ""} title="${isLocked ? escapeHtml(loadActivityLockNotice(load)) : "Delete return load"}" type="button">x</button>
           </div>
         </div>
         ${renderLoadAssignmentControls(parentTruck, load)}
         <div class="return-yard-row">
           <label>
             <span>${t("dispatch.returnYard", "Return yard")}</span>
-            <select data-return-yard="${load.id}" ${isDispatchPlanEditor() && !isLocked ? "" : "disabled"}>${yardOptions(load.returnYard || "12441")}</select>
+            <select data-return-yard="${escapeHtml(load.id)}" ${isDispatchPlanEditor() && !isLocked ? "" : "disabled"}>${yardOptions(load.returnYard || "12441")}</select>
           </label>
         </div>
         <div class="stop-list">
@@ -7172,21 +7645,21 @@ function renderLoad(parentTruck, load) {
   const active = selectedLoadId === load.id;
   const finishText = loadFinishText(parentTruck, load, stats);
   return `
-    <section class="load-block ${stats.warningCount ? "warning" : ""} ${active ? "selected" : ""} ${isLocked ? "driver-active" : ""}" draggable="${canDragLoad}" data-driver-load-card="${escapeHtml(load.id)}" data-load-card="${load.id}">
+    <section class="load-block ${stats.warningCount ? "warning" : ""} ${active ? "selected" : ""} ${isLocked ? "driver-active" : ""}" draggable="${canDragLoad}" data-driver-load-card="${escapeHtml(load.id)}" data-load-card="${escapeHtml(load.id)}">
       ${stats.warningCount ? `<span class="load-warning-badge">${stats.warningCount}</span>` : ""}
       <div class="load-header">
-        <button class="load-title" data-action="select-load" data-load="${load.id}" type="button">
-          <strong>${load.name}</strong>
+        <button class="load-title" data-action="select-load" data-load="${escapeHtml(load.id)}" type="button">
+          <strong>${escapeHtml(load.name)}</strong>
           <span class="${finishText === "Route pending" ? "route-pending" : ""}">${finishText === "Route pending" ? finishText : `Finish ${finishText}`}</span>
         </button>
         <div class="load-header-actions">
           <span class="load-drag-handle" draggable="${canDragLoad}" title="Drag this whole load to another driver" aria-label="Drag whole load">&#8942;&#8942;</span>
           <button class="load-insert-return" data-action="insert-driver-return" data-after-load="${escapeHtml(load.id)}" data-driver-login="${escapeHtml(loadDriverKey(parentTruck, load))}" ${isLocked ? "disabled" : ""} title="Insert a return after this load" type="button">+R</button>
-          <button class="load-delete" data-action="delete-load" data-load="${load.id}" ${isLocked ? "disabled" : ""} title="${isLocked ? escapeHtml(loadActivityLockNotice(load)) : "Delete load"}" type="button">x</button>
+          <button class="load-delete" data-action="delete-load" data-load="${escapeHtml(load.id)}" ${isLocked ? "disabled" : ""} title="${isLocked ? escapeHtml(loadActivityLockNotice(load)) : "Delete load"}" type="button">x</button>
         </div>
       </div>
       ${renderLoadAssignmentControls(parentTruck, load)}
-      <div class="stop-list" data-load="${load.id}">
+      <div class="stop-list" data-load="${escapeHtml(load.id)}">
         ${stats.switchBefore ? "" : renderRestStop(stats)}
         ${renderStartTravelStop(parentTruck, load, stats.startTravel, stats.start)}
         ${load.stops.map((stop, index) => renderStop(parentTruck, load, stop, index, stats.rows[index])).join("") || `<div class="empty-drop">Drop order here</div>`}
@@ -7284,7 +7757,7 @@ function renderStartTravelStop(truck, load, startTravel, start) {
   return `
     <article class="stop-card compact travel-stop status-${executionStatus}">
       <div class="stop-main">
-        <strong>Travel ${startTravel.from} to ${startTravel.to}</strong>
+        <strong>Travel ${escapeHtml(startTravel.from)} to ${escapeHtml(startTravel.to)}</strong>
         <span>Empty truck reposition</span>
       </div>
       <div class="stop-time">${timingSummaryHtml({
@@ -7309,10 +7782,10 @@ function renderStop(truck, load, stop, index, row) {
   const showWarning = Boolean(row?.warning && executionStatus !== "complete");
   const removalLocked = loadHasDriverActivity(load);
   return `
-    <article class="stop-card compact status-${executionStatus} ${isPick ? "pick" : ""} ${selectedOrderId === order.id ? "selected-order-stop" : ""} ${showWarning ? "warning" : ""}" draggable="${isDispatchPlanEditor() && !removalLocked}" data-load="${stop.loadId}" data-stop="${stop.id}" data-order="${order.id}" data-index="${index}">
-      <button class="stop-remove" data-action="remove-stop" data-stop="${stop.id}" ${removalLocked ? "disabled" : ""} title="${removalLocked ? escapeHtml(stopActivityLockNotice(stop)) : "Remove stop"}" type="button">x</button>
+    <article class="stop-card compact status-${executionStatus} ${isPick ? "pick" : ""} ${selectedOrderId === order.id ? "selected-order-stop" : ""} ${showWarning ? "warning" : ""}" draggable="${isDispatchPlanEditor() && !removalLocked}" data-load="${escapeHtml(stop.loadId)}" data-stop="${escapeHtml(stop.id)}" data-order="${escapeHtml(order.id)}" data-index="${index}">
+      <button class="stop-remove" data-action="remove-stop" data-stop="${escapeHtml(stop.id)}" ${removalLocked ? "disabled" : ""} title="${removalLocked ? escapeHtml(stopActivityLockNotice(stop)) : "Remove stop"}" type="button">x</button>
       <div class="stop-main">
-        <strong>${index + 1}. ${escapeHtml(isPick ? `Pickup ${stop.location}` : dropStopLabel(stop, order))}</strong>
+        <strong>${index + 1}. ${escapeHtml(isPick ? `Pickup ${pickupStopLabel(stop, order)}` : dropStopLabel(stop, order))}</strong>
         <span>${escapeHtml(stopAddress(stop, order))}</span>
       </div>
       <div class="stop-time">${timingSummaryHtml({
@@ -7386,7 +7859,7 @@ function renderLoadTimingDetails(truck, load, stats) {
     if (!order || !row) continue;
     const record = driverRecordForStop(truck, load, stop);
     rows.push(timingDetailHtml({
-      title: stop.type === "pick" ? `Pickup ${stop.location}` : `Drop ${dropStopLabel(stop, order)}`,
+      title: stop.type === "pick" ? `Pickup ${pickupStopLabel(stop, order)}` : `Drop ${dropStopLabel(stop, order)}`,
       plannedStart: row.arrival || 0,
       plannedEnd: row.depart || row.arrival || 0,
       actualStart: recordStartedAt(record),
@@ -7405,7 +7878,7 @@ function renderLoadPreview() {
   const finishText = loadFinishText(parentTruck, load, stats);
   const isLocked = loadHasDriverActivity(load);
   const firstOrder = load.stops.map(stopOrder).find(Boolean);
-  const pickupLocations = load.stops.length ? uniquePickupLocations(load, truck) : [];
+  const pickupLocations = load.stops.length ? uniquePickupDisplayLabels(load, truck) : [];
   const pickupPoint = pickupLocations.join(", ") || firstOrder?.pickupLocations?.[0] || truck.base;
   const restOffset = stats.restBefore ? 1 : 0;
   const handoffOffset = stats.handoffTravel ? 1 : 0;
@@ -7420,8 +7893,8 @@ function renderLoadPreview() {
       <div class="load-preview-resize" title="Drag to resize"></div>
       <div class="load-preview-header">
         <div>
-          <h2>${truck.plate} | ${load.name}</h2>
-          <p>${load.returnOnly ? `Return to ${load.returnYard || "12441"}` : `${formatLbs(stats.weightTotalLbs)}/${formatLbs(stats.capacityLbs)} | ${stats.footprintTotal} pallet positions | Pickup ${pickupPoint}`}</p>
+          <h2>${escapeHtml(truck.plate)} | ${escapeHtml(load.name)}</h2>
+          <p>${load.returnOnly ? `Return to ${escapeHtml(load.returnYard || "12441")}` : `${formatLbs(stats.weightTotalLbs)}/${formatLbs(stats.capacityLbs)} | ${stats.footprintTotal} pallet positions | Pickup ${escapeHtml(pickupPoint)}`}</p>
         </div>
         <button data-action="close-load-preview" type="button">x</button>
       </div>
@@ -7432,7 +7905,7 @@ function renderLoadPreview() {
             <button class="sequence-toggle" data-action="toggle-sequence" type="button">${sequenceCollapsed ? "Expand" : "Collapse"}</button>
             <span>Drag stops to reorder. Multiple pick/drop is allowed.</span>
           </div>
-          <div class="preview-stop-list ${sequenceCollapsed ? "collapsed" : ""}" data-load="${load.id}">
+          <div class="preview-stop-list ${sequenceCollapsed ? "collapsed" : ""}" data-load="${escapeHtml(load.id)}">
             ${sequenceHtml || `<div class="empty-drop">No assigned orders yet.</div>`}
           </div>
         </section>
@@ -7480,14 +7953,14 @@ function renderLoadPreview() {
             ${[...new Set(load.stops.map((stop) => stop.orderId))].map((orderId) => {
               const order = orderById(orderId);
               if (!order) return "";
-              return `<div><strong>${order.id}</strong><span>${escapeHtml(order.customer)} | ${orderFootprintPallets(order)} pos | ${formatLbs(orderWeightLbs(order))}</span></div>`;
+              return `<div><strong>${escapeHtml(order.id)}</strong><span>${escapeHtml(order.customer)} | ${orderFootprintPallets(order)} pos | ${formatLbs(orderWeightLbs(order))}</span></div>`;
             }).join("") || `<div class="empty-drop">No assigned orders.</div>`}
           </div>
         </section>
       </div>
       <div class="load-preview-footer">
-        <button class="danger" data-action="delete-load" data-load="${load.id}" ${isLocked ? "disabled" : ""} title="${isLocked ? escapeHtml(loadActivityLockNotice(load)) : "Delete load"}" type="button">Delete Load</button>
-        <button class="danger" data-action="clear-load" data-load="${load.id}" ${isLocked ? "disabled" : ""} title="${isLocked ? escapeHtml(loadActivityLockNotice(load)) : "Clear load"}" type="button">Clear Load</button>
+        <button class="danger" data-action="delete-load" data-load="${escapeHtml(load.id)}" ${isLocked ? "disabled" : ""} title="${isLocked ? escapeHtml(loadActivityLockNotice(load)) : "Delete load"}" type="button">Delete Load</button>
+        <button class="danger" data-action="clear-load" data-load="${escapeHtml(load.id)}" ${isLocked ? "disabled" : ""} title="${isLocked ? escapeHtml(loadActivityLockNotice(load)) : "Clear load"}" type="button">Clear Load</button>
       </div>
     </aside>
   `;
@@ -7537,7 +8010,7 @@ function renderPreviewStartTravelStop(truck, load, startTravel, start, displayOf
   return `
     <article class="preview-stop travel status-${executionStatus}">
       <div class="stop-main">
-        <strong>${displayOffset + 1}. Travel | ${startTravel.from} to ${startTravel.to}</strong>
+        <strong>${displayOffset + 1}. Travel | ${escapeHtml(startTravel.from)} to ${escapeHtml(startTravel.to)}</strong>
         <span>Empty truck reposition</span>
       </div>
       <div class="stop-time">${timingSummaryHtml({
@@ -7580,17 +8053,17 @@ function renderPreviewTruckSwitchStop(truck, load, stats, displayOffset = 0) {
 function renderPreviewStop(truck, load, stop, index, row, displayIndex = index) {
   const order = stopOrder(stop);
   if (!order) return "";
-  const label = stop.type === "pick" ? `${displayIndex + 1}. Pickup | ${stop.location}` : `${displayIndex + 1}. Drop | ${dropStopLabel(stop, order)}`;
+  const label = stop.type === "pick" ? `${displayIndex + 1}. Pickup | ${pickupStopLabel(stop, order)}` : `${displayIndex + 1}. Drop | ${dropStopLabel(stop, order)}`;
   const sub = stopAddress(stop, order);
   const executionStatus = stopExecutionStatus(truck, load, stop);
   const record = driverRecordForStop(truck, load, stop);
   const showWarning = Boolean(row?.warning && executionStatus !== "complete");
   const removalLocked = loadHasDriverActivity(load);
   return `
-    <article class="preview-stop status-${executionStatus} ${stop.type} ${selectedOrderId === order.id ? "selected-order-stop" : ""} ${showWarning ? "warning" : ""}" draggable="true" data-load="${stop.loadId}" data-stop="${stop.id}" data-order="${order.id}" data-index="${index}">
-      <button class="stop-remove" data-action="remove-stop" data-stop="${stop.id}" ${removalLocked ? "disabled" : ""} title="${removalLocked ? escapeHtml(stopActivityLockNotice(stop)) : "Remove stop"}" type="button">x</button>
+    <article class="preview-stop status-${executionStatus} ${stop.type} ${selectedOrderId === order.id ? "selected-order-stop" : ""} ${showWarning ? "warning" : ""}" draggable="true" data-load="${escapeHtml(stop.loadId)}" data-stop="${escapeHtml(stop.id)}" data-order="${escapeHtml(order.id)}" data-index="${index}">
+      <button class="stop-remove" data-action="remove-stop" data-stop="${escapeHtml(stop.id)}" ${removalLocked ? "disabled" : ""} title="${removalLocked ? escapeHtml(stopActivityLockNotice(stop)) : "Remove stop"}" type="button">x</button>
       <div class="stop-main">
-        <strong>${label}</strong>
+        <strong>${escapeHtml(label)}</strong>
         <span>${escapeHtml(sub)}</span>
       </div>
       <div class="stop-time">${timingSummaryHtml({
@@ -7619,7 +8092,7 @@ function renderReturnPreviewStops(load, truck, stats) {
       ? `Leave ${timeText(stats.start)}`
       : `Arrive ${finish} | Return yard`;
     return `
-      <article class="preview-stop status-${executionStatus} ${isStart ? "drop" : "pick"}" data-load="${load.id}" data-index="${index}">
+      <article class="preview-stop status-${executionStatus} ${isStart ? "drop" : "pick"}" data-load="${escapeHtml(load.id)}" data-index="${index}">
         <div class="stop-main">
           <strong>${index + restOffset + 1}. ${escapeHtml(stop.title)}</strong>
           <span>${isStart ? "Return route start" : "Return yard"}</span>
@@ -7652,7 +8125,7 @@ function renderPreviewMap() {
       ${estimate ? routeEstimateSummaryHtml(estimate, truck) : `<strong>Calculating route...</strong><span>Google travel time, truck adjustment, plus driver stop time.</span>`}
     </div>
     <div class="route-option-row">
-      <button class="${allowTolls ? "" : "active"}" data-action="toggle-route-tolls" data-load="${load?.id || ""}" type="button">
+      <button class="${allowTolls ? "" : "active"}" data-action="toggle-route-tolls" data-load="${escapeHtml(load?.id || "")}" type="button">
         ${allowTolls ? "Tolls Allowed" : "Avoid Tolls"}
       </button>
       <span>${allowTolls ? "Google may use toll roads for faster ETA." : "Default: route avoids toll roads."}</span>
@@ -8317,7 +8790,7 @@ function renderModal() {
           <div class="modal-header">
             <div>
               <h2>Delete Load</h2>
-              <p>${truck?.plate || ""} ${load?.name || ""}</p>
+              <p>${escapeHtml(truck?.plate || "")} ${escapeHtml(load?.name || "")}</p>
             </div>
             <button data-action="close-modal" type="button">Close</button>
           </div>
@@ -8326,7 +8799,7 @@ function renderModal() {
           </div>
           <div class="modal-footer">
             <button data-action="close-modal" type="button">Cancel</button>
-            <button class="danger" data-action="confirm-delete-load" data-load="${load?.id || ""}" type="button">Delete Load</button>
+            <button class="danger" data-action="confirm-delete-load" data-load="${escapeHtml(load?.id || "")}" type="button">Delete Load</button>
           </div>
         </section>
       </div>
@@ -8482,7 +8955,7 @@ function addOrderToLoad(orderId, loadId, type = "drop", location = "", insertInd
   const { truck, load } = findLoad(loadId);
   const order = orderById(orderId);
   if (!load || !order) return false;
-  if (!truckHasDriver(truck)) {
+  if (!loadHasAssignedDriver(truck, load)) {
     routeNotice = driverLockNotice(truck);
     return false;
   }
@@ -8498,8 +8971,14 @@ function addOrderToLoad(orderId, loadId, type = "drop", location = "", insertInd
   if (type === "drop" && order.type === "PO" && !stopDetails.dropoffKey && order.dropoffs?.length) {
     return addPoDropoffsToLoad(order, loadId, insertIndex);
   }
+  const transferNormalizedInsertIndex = type === "drop"
+    ? normalizeReplenishmentTransferInsertIndex(order, load, insertIndex)
+    : insertIndex;
+  const normalizedInsertIndex = type === "drop"
+    ? normalizeReplenishmentDependentInsertIndex(order, load, transferNormalizedInsertIndex)
+    : transferNormalizedInsertIndex;
   const dependencyTimingMessage = type === "drop"
-    ? replenishmentPlacementBlockMessage(order, truck, load, insertIndex)
+    ? replenishmentPlacementBlockMessage(order, truck, load, normalizedInsertIndex)
     : "";
   if (dependencyTimingMessage) {
     selectedOrderId = orderId;
@@ -8522,7 +9001,7 @@ function addOrderToLoad(orderId, loadId, type = "drop", location = "", insertInd
     return false;
   }
   const beforeStops = (load.stops || []).map((stop) => ({ ...stop }));
-  let cleanInsertIndex = Number.isInteger(insertIndex) ? insertIndex : null;
+  let cleanInsertIndex = Number.isInteger(normalizedInsertIndex) ? normalizedInsertIndex : null;
   if (type === "drop") {
     const addedPickups = ensurePickupStops(load, order, cleanInsertIndex);
     if (Number.isInteger(cleanInsertIndex)) cleanInsertIndex += addedPickups;
@@ -8752,7 +9231,7 @@ function splitTotalsForPart(order, partIndex) {
 
 function splitOrder(orderId, parts = 2, startSuffix = 1) {
   const order = orderById(orderId);
-  if (!order) return;
+  if (!order || order.type === "CUSTOM") return;
   const cleanParts = Math.min(Math.max(Number(parts) || 2, 2), 10);
   const cleanStartSuffix = Math.max(Number(startSuffix) || 1, 1);
   const originalPallets = order.pallets;
@@ -8783,7 +9262,7 @@ function splitOrder(orderId, parts = 2, startSuffix = 1) {
 
 function prepareUnsplitOrder(splitOrderId) {
   const split = orderById(splitOrderId);
-  if (!split?.originalOrderId) {
+  if (split?.type === "CUSTOM" || !split?.originalOrderId) {
     routeNotice = "Select a split order before using Unsplit.";
     return null;
   }
@@ -8853,6 +9332,36 @@ function mixedYardGroupBlockReason(groupItems = []) {
   return `Cannot group orders from different yards: ${yardRows.map((row) => `${row.id} (${row.yard})`).join(", ")}.`;
 }
 
+function groupedOrderDependencyStructureBlockMessage(groupItems = []) {
+  for (const dependency of groupedOrderDependencies(groupItems)) {
+    const transferRef = String(dependency.transferOrderRef || "the linked Transfer Order");
+    const salesRef = String(
+      dependency.canonicalSalesOrderRef
+      || dependency.salesOrderRef
+      || dependency.dispatchTargetRef
+      || "this Sales Order"
+    );
+    const mode = String(dependency.mode || "");
+    const status = String(dependency.status || "active").toLowerCase();
+    const targetKind = String(dependency.dispatchTargetKind || "normal").toLowerCase();
+    const hasExecutionProgress = (dependency.lines || []).some((line) =>
+      Number(line.loadedQuantity ?? line.loaded_quantity ?? 0) > 0
+      || Number(line.deliveredQuantity ?? line.delivered_quantity ?? 0) > 0
+      || Number(line.locallyReceivedQuantity ?? line.locally_received_quantity ?? 0) > 0
+    );
+    if (mode !== "yard_replenishment") {
+      return `Cannot group ${salesRef}: ${transferRef} is a direct-pickup dependency. Change or unlink it first.`;
+    }
+    if (hasExecutionProgress) {
+      return `Cannot group ${salesRef}: processing has already started for ${transferRef}.`;
+    }
+    if (!["active", "attention"].includes(status) || targetKind !== "normal") {
+      return `Cannot group ${salesRef}: its dependency on ${transferRef} cannot be moved into a new group.`;
+    }
+  }
+  return "";
+}
+
 function dispatchGroupingRefs(order = {}) {
   return new Set([
     order.id,
@@ -8904,6 +9413,31 @@ function prepareGroupedOrderPlanning(groupItems = []) {
   };
 }
 
+function groupedOrderPlanningDependencyBlockMessage(grouped, planning = {}) {
+  const load = planning.load;
+  if (!load || !grouped?.orderDependencies?.length) return "";
+  const plannedDropIndexes = (load.stops || [])
+    .map((stop, index) => ({ stop, index }))
+    .filter(({ stop }) => stop.type === "drop" && planning.refs?.has(String(stop.orderId || "")))
+    .map(({ index }) => index);
+  if (!plannedDropIndexes.length) return "";
+  const firstDropIndex = Math.min(...plannedDropIndexes);
+  const pickupLocations = new Set(
+    requiredPickupLocations(grouped).map(normalizedPickupLocation).filter(Boolean)
+  );
+  const firstPickupIndex = (load.stops || []).findIndex((stop, index) =>
+    index < firstDropIndex
+    && stop.type === "pick"
+    && pickupLocations.has(normalizedPickupLocation(stop.location))
+  );
+  return replenishmentPlacementBlockMessage(
+    grouped,
+    planning.truck,
+    load,
+    firstPickupIndex >= 0 ? firstPickupIndex : firstDropIndex
+  );
+}
+
 function applyGroupedOrderPlanning(grouped, planning = {}) {
   const load = planning.load;
   if (!load || !planning.assignments?.length) return;
@@ -8949,6 +9483,10 @@ function groupOrder(orderId) {
     routeNotice = "Select at least two orders before grouping.";
     return false;
   }
+  if (groupItems.some((item) => item.type === "CUSTOM")) {
+    routeNotice = "Custom Orders cannot be grouped. Plan each Custom Order separately.";
+    return false;
+  }
   const blockReason = mixedYardGroupBlockReason(groupItems);
   if (blockReason) {
     routeNotice = blockReason;
@@ -8959,6 +9497,11 @@ function groupOrder(orderId) {
     selectedOrderId = dependencyBlockedOrder.id;
     selectedOrderIds = new Set([dependencyBlockedOrder.id]);
     routeNotice = `${dependencyBlockedOrder.id} is linked to ${dependencyBlockedOrder.dependentSalesOrderRef || "a Sales Order"} as direct pickup and cannot be grouped independently.`;
+    return false;
+  }
+  const dependencyStructureBlock = groupedOrderDependencyStructureBlockMessage(groupItems);
+  if (dependencyStructureBlock) {
+    routeNotice = dependencyStructureBlock;
     return false;
   }
   const planning = prepareGroupedOrderPlanning(groupItems);
@@ -8973,7 +9516,7 @@ function groupOrder(orderId) {
     ...flattenedMembers.groupAliases,
     ...groupItems.filter((item) => item.childOrders?.length).map((item) => item.id)
   ])];
-  const grouped = {
+  const grouped = normalizeOrder({
     ...groupItems[0],
     id: uniqueGroupedDispatchOrderId(leafItems),
     customer: `${leafItems.length} orders grouped`,
@@ -8990,7 +9533,12 @@ function groupOrder(orderId) {
     childOrderDetails: leafItems.map((item) => normalizeOrder({ ...item })),
     groupAliases,
     notes: `Grouped orders: ${flattenedMembers.childOrders.join(", ")}`
-  };
+  });
+  const dependencyTimingBlock = groupedOrderPlanningDependencyBlockMessage(grouped, planning);
+  if (dependencyTimingBlock) {
+    routeNotice = dependencyTimingBlock;
+    return false;
+  }
   const ids = new Set(groupItems.map((item) => item.id));
   const firstIndex = orders.findIndex((item) => ids.has(item.id));
   orders = orders.filter((item) => !ids.has(item.id));
@@ -9821,6 +10369,13 @@ app.addEventListener("click", (event) => {
   if (!button) return;
   const action = button.dataset.action;
   if (!action) return;
+  if (action === "edit-custom-order") {
+    const customOrderId = String(button.dataset.customOrderId || "").trim();
+    location.href = customOrderId
+      ? `/dispatch/custom-orders?edit=${encodeURIComponent(customOrderId)}`
+      : "/dispatch/custom-orders";
+    return;
+  }
   if (action === "enter-edit-mode") {
     enterDispatchEditMode().catch((error) => {
       routeNotice = `Cannot enter Edit Mode: ${error.message}`;
@@ -10531,11 +11086,17 @@ app.addEventListener("click", (event) => {
 });
 
 app.addEventListener("dblclick", (event) => {
-  if (!ensureDispatchPlanEditor()) return;
   const orderCard = event.target.closest("[data-order]");
   if (!orderCard) return;
   const order = orderById(orderCard.dataset.order);
   if (!order) return;
+  if (order.type === "CUSTOM") {
+    location.href = order.customOrderId
+      ? `/dispatch/custom-orders?edit=${encodeURIComponent(order.customOrderId)}`
+      : "/dispatch/custom-orders";
+    return;
+  }
+  if (!ensureDispatchPlanEditor()) return;
   clearTimeout(orderClickTimer);
   selectedOrderId = order.id;
   selectedOrderIds = new Set([order.id]);
@@ -10956,7 +11517,7 @@ function showOrderTooltip(event) {
     const row = stats.rows[foundStop.index];
     const record = driverRecordForStop(foundStop.truck, foundStop.load, stop);
     timingHtml = timingDetailHtml({
-      title: stop.type === "pick" ? `Pickup ${stop.location}` : `Drop ${dropStopLabel(stop, order)}`,
+      title: stop.type === "pick" ? `Pickup ${pickupStopLabel(stop, order)}` : `Drop ${dropStopLabel(stop, order)}`,
       plannedStart: row?.arrival || 0,
       plannedEnd: row?.depart || row?.arrival || 0,
       actualStart: recordStartedAt(record),
@@ -10970,10 +11531,10 @@ function showOrderTooltip(event) {
     ? `<span>Pickup address: ${escapeHtml(order.sourceAddress)}</span>`
     : "";
   const tooltipTitle = pickupLocation
-    ? `Pickup | ${escapeHtml(pickupLocation)}`
+    ? `Pickup | ${escapeHtml(pickupStopLabel(stop, pickupOrders[0] || order))}`
     : isDropStop
       ? `${escapeHtml(dropStopLabel(stop, order))} | ${escapeHtml(order.customer)}`
-      : `${order.id} | ${escapeHtml(order.customer)}`;
+      : `${escapeHtml(order.id)} | ${escapeHtml(order.customer)}`;
   const tooltipAddress = pickupLocation
     ? stopAddress(stop, pickupOrders[0] || order)
     : isDropStop
@@ -11273,6 +11834,7 @@ app.addEventListener("submit", (event) => {
         : cancelledCo
           ? `${cancelledCo.coId} cancelled. ${order.id} pickup restored.`
           : "Dispatch info updated.";
+      clearActiveRouteEstimates();
       commitPlanMutation("dispatch_order_details_updated");
     }).catch((error) => {
       if (submitButton) {

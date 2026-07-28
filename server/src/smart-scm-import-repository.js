@@ -220,12 +220,13 @@ function parseItemMaster(workbook) {
     itemById.set(itemId, item);
     for (const yard of YARDS) {
       const raw = rowValue(row, columns.yardEligibility[yard.code]);
+      const eligible = /^(yes|y|true|1)$/i.test(cleanText(raw));
       yardPoliciesByKey.set(`${itemId}:${yard.locationId}`, {
         item_id: itemId,
         location_id: yard.locationId,
         yard_code: yard.code,
-        eligible: /^(yes|y|true|1)$/i.test(cleanText(raw)),
-        capacity_pallets: 25,
+        eligible,
+        capacity_pallets: eligible ? 25 : null,
         service_quantile: yard.serviceQuantile,
         minimum_safety_pallets: yard.minimumSafetyPallets
       });
@@ -717,7 +718,7 @@ async function prepareWorkbookImport(file) {
 async function reconcileDecisionCapacities(file, prepared) {
   const reset = await query(
     `UPDATE scm_smart_item_yard_policies
-        SET capacity_pallets = 25,
+        SET capacity_pallets = CASE WHEN eligible THEN 25 ELSE NULL END,
             capacity_source = 'default',
             capacity_source_input_file_id = NULL,
             capacity_source_sheet = NULL,
@@ -771,6 +772,17 @@ async function reconcileDecisionCapacities(file, prepared) {
   );
   await query(
     `UPDATE scm_smart_capacity_import_rows imported
+        SET mapping_status = 'skipped_ineligible'
+       FROM scm_smart_item_yard_policies policy
+      WHERE imported.source_input_file_id = $1
+        AND imported.mapping_status = 'matched'
+        AND policy.item_id = imported.item_id
+        AND policy.location_id = imported.location_id
+        AND policy.eligible = false`,
+    [file.id]
+  );
+  await query(
+    `UPDATE scm_smart_capacity_import_rows imported
         SET mapping_status = 'skipped_manual_override'
        FROM scm_smart_item_yard_policies policy
       WHERE imported.source_input_file_id = $1
@@ -808,6 +820,7 @@ async function reconcileDecisionCapacities(file, prepared) {
               AS imported(item_id, location_id, capacity_pallets, source_sheet, source_row, match_method)
         WHERE policy.item_id = imported.item_id::bigint
           AND policy.location_id = imported.location_id::bigint
+          AND policy.eligible = true
           AND policy.capacity_manually_overridden = false`,
       params
     );
@@ -826,6 +839,7 @@ async function reconcileDecisionCapacities(file, prepared) {
     capacityRowsRecorded: provenanceRows.length,
     capacityApplied: Number(statuses.matched || 0),
     capacityManualOverridesSkipped: Number(statuses.skipped_manual_override || 0),
+    capacityIneligibleSkipped: Number(statuses.skipped_ineligible || 0),
     capacityPoliciesMissing: Number(statuses.unresolved_policy_missing || 0),
     capacityReconciliationStatuses: statuses
   };
@@ -884,6 +898,40 @@ async function applyPreparedImport(file, prepared) {
       suffix: `ON CONFLICT (item_id, location_id) DO UPDATE SET
         yard_code = EXCLUDED.yard_code,
         eligible = CASE WHEN scm_smart_item_yard_policies.manually_overridden THEN scm_smart_item_yard_policies.eligible ELSE EXCLUDED.eligible END,
+        capacity_pallets = CASE
+          WHEN NOT (CASE WHEN scm_smart_item_yard_policies.manually_overridden THEN scm_smart_item_yard_policies.eligible ELSE EXCLUDED.eligible END) THEN NULL
+          ELSE COALESCE(scm_smart_item_yard_policies.capacity_pallets, EXCLUDED.capacity_pallets, 25)
+        END,
+        capacity_manually_overridden = CASE
+          WHEN CASE WHEN scm_smart_item_yard_policies.manually_overridden THEN scm_smart_item_yard_policies.eligible ELSE EXCLUDED.eligible END
+            THEN scm_smart_item_yard_policies.capacity_manually_overridden
+          ELSE false
+        END,
+        capacity_source = CASE
+          WHEN CASE WHEN scm_smart_item_yard_policies.manually_overridden THEN scm_smart_item_yard_policies.eligible ELSE EXCLUDED.eligible END
+            THEN scm_smart_item_yard_policies.capacity_source
+          ELSE 'default'
+        END,
+        capacity_source_input_file_id = CASE
+          WHEN CASE WHEN scm_smart_item_yard_policies.manually_overridden THEN scm_smart_item_yard_policies.eligible ELSE EXCLUDED.eligible END
+            THEN scm_smart_item_yard_policies.capacity_source_input_file_id
+          ELSE NULL
+        END,
+        capacity_source_sheet = CASE
+          WHEN CASE WHEN scm_smart_item_yard_policies.manually_overridden THEN scm_smart_item_yard_policies.eligible ELSE EXCLUDED.eligible END
+            THEN scm_smart_item_yard_policies.capacity_source_sheet
+          ELSE NULL
+        END,
+        capacity_source_row = CASE
+          WHEN CASE WHEN scm_smart_item_yard_policies.manually_overridden THEN scm_smart_item_yard_policies.eligible ELSE EXCLUDED.eligible END
+            THEN scm_smart_item_yard_policies.capacity_source_row
+          ELSE NULL
+        END,
+        capacity_match_method = CASE
+          WHEN CASE WHEN scm_smart_item_yard_policies.manually_overridden THEN scm_smart_item_yard_policies.eligible ELSE EXCLUDED.eligible END
+            THEN scm_smart_item_yard_policies.capacity_match_method
+          ELSE NULL
+        END,
         service_quantile = CASE WHEN scm_smart_item_yard_policies.manually_overridden THEN scm_smart_item_yard_policies.service_quantile ELSE EXCLUDED.service_quantile END,
         minimum_safety_pallets = CASE WHEN scm_smart_item_yard_policies.manually_overridden THEN scm_smart_item_yard_policies.minimum_safety_pallets ELSE EXCLUDED.minimum_safety_pallets END,
         source_input_file_id = EXCLUDED.source_input_file_id,

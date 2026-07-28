@@ -32,8 +32,18 @@ const CONTROL_SECTION_ROUTES = {
   "cycle-count": "/control/cycle-count-review",
   fulfillment: "/control/operator-load-records"
 };
+const ADMIN_SECTION_ROUTES = {
+  dashboard: "/admin",
+  operators: "/admin/accounts",
+  sync: "/admin/sync",
+  storage: "/admin/photo-storage",
+  audit: "/admin/audit"
+};
 const CONTROL_ROUTE_SECTIONS = Object.fromEntries(
   Object.entries(CONTROL_SECTION_ROUTES).map(([section, route]) => [route, section])
+);
+const ADMIN_ROUTE_SECTIONS = Object.fromEntries(
+  Object.entries(ADMIN_SECTION_ROUTES).map(([section, route]) => [route, section])
 );
 const PAGE_SECTIONS = IS_ADMIN_PAGE ? ADMIN_SECTIONS : CONTROL_SECTIONS;
 const t = (key, fallback) => window.MBBS_I18N?.t(key, fallback) || fallback;
@@ -134,18 +144,20 @@ function normalizedSection(value) {
 }
 
 function sectionFromCurrentRoute() {
-  if (IS_ADMIN_PAGE) return null;
-  return CONTROL_ROUTE_SECTIONS[window.location.pathname] || null;
+  const routeSections = IS_ADMIN_PAGE ? ADMIN_ROUTE_SECTIONS : CONTROL_ROUTE_SECTIONS;
+  return routeSections[window.location.pathname] || null;
 }
 
 function routeForSection(section) {
-  return IS_ADMIN_PAGE ? "/admin" : (CONTROL_SECTION_ROUTES[normalizedSection(section)] || "/control");
+  const sectionRoutes = IS_ADMIN_PAGE ? ADMIN_SECTION_ROUTES : CONTROL_SECTION_ROUTES;
+  return sectionRoutes[normalizedSection(section)] || (IS_ADMIN_PAGE ? "/admin" : "/control");
 }
 
 function setActiveSection(section, { updateRoute = true } = {}) {
   activeSection = normalizedSection(section);
+  updateControlPageLayoutClass();
   localStorage.setItem(SECTION_STORAGE_KEY, activeSection);
-  if (updateRoute && !IS_ADMIN_PAGE) {
+  if (updateRoute) {
     const route = routeForSection(activeSection);
     if (window.location.pathname !== route) window.history.pushState({ controlSection: activeSection }, "", route);
     window.dispatchEvent(new Event("mbbs-sidebar-route-changed"));
@@ -156,6 +168,7 @@ function setActiveSection(section, { updateRoute = true } = {}) {
 let token = readStaffToken();
 let operator = null;
 let operators = [];
+let publicSalesSettings = { enabled: false, updatedBy: null, updatedAt: null };
 let selectedOperatorId = localStorage.getItem(ACCOUNT_SELECTION_KEY) || "";
 let audit = [];
 let classifications = [];
@@ -188,6 +201,12 @@ let bootstrapNeeded = false;
 let activeSection = normalizedSection(sectionFromCurrentRoute() || localStorage.getItem(SECTION_STORAGE_KEY) || "dashboard");
 let syncPollTimer = null;
 let photoArchivePollTimer = null;
+
+function updateControlPageLayoutClass() {
+  document.body.classList.toggle("admin-sync-page", IS_ADMIN_PAGE && activeSection === "sync");
+}
+
+updateControlPageLayoutClass();
 
 function todayKey() {
   const date = new Date();
@@ -587,7 +606,7 @@ function renderDashboardSection() {
         <em>${t("control.latestLoadRecords", "latest load records")}</em>
       </button>
       <button class="metric-card" data-action="control-section" data-section="loaded-export" type="button">
-        <span>${t("control.loadedExport", "Yard In/Outbound")}</span>
+        <span>${t("control.loadedExport", "In/Outbound Record")}</span>
         <strong>${loadedOrders.length}</strong>
         <em>${t("control.filteredLoaded", "processed movements in the selected tab")}</em>
       </button>
@@ -992,7 +1011,7 @@ async function downloadLoadedCsv() {
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
-  link.download = `yard-in-outbound-${loadedFilters.from || "from"}-${loadedFilters.to || "to"}.csv`;
+  link.download = `in-outbound-record-${loadedFilters.from || "from"}-${loadedFilters.to || "to"}.csv`;
   document.body.appendChild(link);
   link.click();
   link.remove();
@@ -1012,10 +1031,10 @@ function renderLoadedOrderList() {
       <button class="loaded-order-card ${loadedOrderKey(order) === selectedLoadedOrderKey ? "active" : ""}" data-action="select-loaded-order" data-key="${escapeHtml(loadedOrderKey(order))}" type="button">
         <div class="movement-card-head">
           <strong>${escapeHtml(order.tranid || order.order_id)}</strong>
-          <span class="movement-badges"><i class="movement-badge ${escapeHtml(order.direction)}">${t(`yard.${order.direction}`, order.direction)}</i><i class="movement-badge type">${movementTypeCode(order.order_type)}</i></span>
+          <span class="movement-badges"><i class="movement-badge ${escapeHtml(order.direction)}">${t(`yard.${order.direction}`, order.direction)}</i><i class="movement-badge type">${movementTypeCode(order.order_type)}</i>${order.driver_only ? `<i class="movement-badge type">${t("yard.driverOnly", "Driver only")}</i>` : ""}</span>
         </div>
         <span>${escapeHtml(order.yard_location || t("common.yard", "Yard"))} | ${escapeHtml(order.movement_status || t("yard.processed", "Processed"))}</span>
-        <em>${formatDate(order.last_processed_at)} | ${order.process_count || 0} ${t("yard.activities", "activities")} | ${order.photo_count || 0} ${t("common.photos", "photos")}</em>
+        <em>${formatDate(order.last_activity_at || order.last_processed_at)} | ${t("yard.yardActivities", "Yard")} ${order.yard_activity_count || order.process_count || 0} | ${t("yard.driverActivities", "Driver")} ${order.driver_activity_count || 0} | ${order.photo_count || 0} ${t("common.photos", "photos")}</em>
         ${order.party ? `<small>${escapeHtml(order.party)}</small>` : ""}
       </button>
     `).join("") || (!loadedSearchLoading ? `<div class="notice"><strong>${t("yard.noMovements", "No processed yard movements")}</strong><span>${searchActive ? t("yard.noSearchResults", "No order matched either search across all dates, yards, directions, and order types.") : t("yard.noFilterResults", "No processed movement matched this direction, order type, date, and yard.")}</span></div>` : "")}
@@ -1029,7 +1048,7 @@ function renderLoadedExportSection() {
     <section class="panel">
       <div class="section-heading">
         <div>
-          <h2>${t("control.loadedExportTitle", "Yard In/Outbound")}</h2>
+          <h2>${t("control.loadedExportTitle", "In/Outbound Record")}</h2>
           <p class="muted">${t("control.loadedExportHelp", "Review processed receipts and loads for PO, TO, CO, SO, and VRMA orders.")}</p>
         </div>
         <button data-action="refresh-loaded-orders" type="button">${t("common.refresh", "Refresh")}</button>
@@ -1094,19 +1113,22 @@ function renderLoadedExportSection() {
 
 function renderLoadedOrderDetail() {
   if (!loadedOrderDetail) {
-    return `<div class="empty-detail"><strong>${t("common.selectOrder", "Select an order")}</strong><span>${t("yard.selectMovementHelp", "Processed lines, converted UOM, and photo proof will show here.")}</span></div>`;
+    return `<div class="empty-detail"><strong>${t("common.selectOrder", "Select an order")}</strong><span>${t("yard.selectMovementHelp", "Yard processing, driver delivery details, timestamps, and photo proof will show here.")}</span></div>`;
   }
   const { order, lines = [], photos = [] } = loadedOrderDetail;
+  const driverRecords = loadedOrderDetail.driverRecords || loadedOrderDetail.driverEvents || [];
+  const driverPhotos = loadedOrderDetail.driverPhotos || [];
   const route = [order.source_location, order.destination_location].filter(Boolean).join(" → ");
   return `
     <div class="loaded-detail-head">
       <div>
-        <div class="movement-detail-title"><h3>${escapeHtml(order.tranid || order.order_id)}</h3><span class="movement-badges"><i class="movement-badge ${escapeHtml(order.direction)}">${t(`yard.${order.direction}`, order.direction)}</i><i class="movement-badge type">${movementTypeCode(order.order_type)}</i></span></div>
+        <div class="movement-detail-title"><h3>${escapeHtml(order.tranid || order.order_id)}</h3><span class="movement-badges"><i class="movement-badge ${escapeHtml(order.direction)}">${t(`yard.${order.direction}`, order.direction)}</i><i class="movement-badge type">${movementTypeCode(order.order_type)}</i>${order.driver_only ? `<i class="movement-badge type">${t("yard.driverOnly", "Driver only")}</i>` : ""}</span></div>
         <p class="muted">${escapeHtml(movementTypeLabel(order.order_type))} | ${escapeHtml(order.yard_location || "")} | ${escapeHtml(order.movement_status || t("yard.processed", "Processed"))}</p>
         ${route ? `<p class="muted">${escapeHtml(route)}</p>` : ""}
         ${order.party ? `<p class="muted">${escapeHtml(order.party)}</p>` : ""}
+        ${order.delivery_at ? `<p class="muted"><strong>${t("yard.deliveryTime", "Delivered")}:</strong> ${formatDate(order.delivery_at)}</p>` : ""}
       </div>
-      <strong>${lines.length} ${t("control.lines", "line(s)")}</strong>
+      <strong>${lines.length} ${t("control.lines", "line(s)")} · ${t("yard.yardActivities", "Yard")} ${order.yard_activity_count || order.process_count || 0} · ${t("yard.driverActivities", "Driver")} ${order.driver_activity_count || driverRecords.length}</strong>
     </div>
     <div class="loaded-lines">
       ${lines.map((line) => `
@@ -1121,10 +1143,36 @@ function renderLoadedOrderDetail() {
             <small>${escapeHtml(line.location || order.yard_location || "")}</small>
           </div>
         </div>
-      `).join("") || `<div class="notice"><strong>${t("yard.noProcessedLines", "No processed lines")}</strong><span>${t("yard.noProcessedLinesHelp", "This order has an activity record but no retained processed line quantity.")}</span></div>`}
+      `).join("") || `<div class="notice"><strong>${t("yard.noProcessedLines", "No processed lines")}</strong><span>${order.driver_only ? t("yard.noYardLinesYet", "No yard processing record yet. Driver delivery data is shown below.") : t("yard.noProcessedLinesHelp", "This order has an activity record but no retained processed line quantity.")}</span></div>`}
     </div>
+    ${driverRecords.length ? `
+      <div class="loaded-photo-section">
+        <h3>${t("yard.driverActivity", "Driver activity")}</h3>
+        <div class="loaded-lines">
+          ${driverRecords.map((record) => {
+            const details = record.job_details && typeof record.job_details === "object" ? record.job_details : {};
+            const detailLocation = [details.location || details.dropLocation, details.address || details.dropAddress].filter(Boolean).join(" · ");
+            const windowText = [details.windowStart, details.windowEnd].filter(Boolean).join(" – ");
+            return `<div class="loaded-line-card">
+              <div>
+                <strong>${escapeHtml(record.driver_name || record.driver_login || t("yard.driver", "Driver"))} · ${escapeHtml(record.stop_type === "dropoff" ? t("yard.dropoffStop", "Delivery stop") : t("yard.pickupStop", "Pickup stop"))}</strong>
+                <span>${escapeHtml([record.truck_plate, record.load_name].filter(Boolean).join(" · "))}</span>
+                ${detailLocation ? `<em>${escapeHtml(detailLocation)}</em>` : ""}
+                ${windowText ? `<em>${escapeHtml(windowText)}</em>` : ""}
+                ${details.instructions ? `<em>${escapeHtml(details.instructions)}</em>` : ""}
+              </div>
+              <div class="loaded-line-qty">
+                <strong>${record.completed_at ? formatDate(record.completed_at) : t("yard.notCompleted", "Not completed")}</strong>
+                ${record.started_at ? `<small>${t("yard.startedAt", "Started")} ${formatDate(record.started_at)}</small>` : ""}
+                <small>${record.photo_count || 0} ${t("common.photos", "photos")}</small>
+              </div>
+            </div>`;
+          }).join("")}
+        </div>
+      </div>
+    ` : ""}
     <div class="loaded-photo-section">
-      <h3>${t("common.photos", "Photos")}</h3>
+      <h3>${t("yard.yardPhotos", "Yard photos")}</h3>
       <div class="loaded-photo-grid">
         ${photos.filter((photo) => photo.photo_data_url).map((photo) => `
           <figure>
@@ -1136,6 +1184,21 @@ function renderLoadedOrderDetail() {
         `).join("") || `<div class="notice"><strong>${t("common.noPhoto", "No photo")}</strong><span>${t("yard.noPhotoHelp", "No photo proof is attached to this processed activity in the filtered date range.")}</span></div>`}
       </div>
     </div>
+    ${driverRecords.length || driverPhotos.length || order.driver_only ? `
+      <div class="loaded-photo-section">
+        <h3>${t("yard.driverDeliveryPhotos", "Driver delivery photos")}</h3>
+        <div class="loaded-photo-grid">
+          ${driverPhotos.filter((photo) => photo.photo_data_url).map((photo) => `
+            <figure>
+              <button class="photo-thumb-button" data-action="open-photo-lightbox" data-photo-ref="${escapeHtml(photo.photo_data_url)}" data-photo-label="${escapeHtml(photo.driver_name || photo.driver_login || t("yard.driver", "Driver"))} ${escapeHtml(photo.id)}" type="button">
+                <img src="${photoImgSrc(photo.photo_data_url)}" alt="${escapeHtml(photo.driver_name || photo.driver_login || t("yard.driver", "Driver"))} ${escapeHtml(photo.id)}" />
+              </button>
+              <figcaption>${escapeHtml([photo.driver_name || photo.driver_login, photo.truck_plate, photo.stop_type].filter(Boolean).join(" · "))}<br>${formatDate(photo.created_at)}</figcaption>
+            </figure>
+          `).join("") || `<div class="notice"><strong>${t("common.noPhoto", "No photo")}</strong></div>`}
+        </div>
+      </div>
+    ` : ""}
   `;
 }
 
@@ -1457,33 +1520,49 @@ function renderWarningsSection() {
 function renderOperatorsSection() {
   ensureOperatorSelection();
   const selected = operators.find((item) => String(item.id) === String(selectedOperatorId)) || null;
+  const publicSalesEnabled = publicSalesSettings.enabled === true;
   return `
-    <div class="account-management-layout">
-      <aside class="panel account-master-panel">
-        <div class="account-master-head">
-          <div>
-            <h2>${t("control.users", "Users")}</h2>
-            <p class="muted">${operators.length} ${t("control.accounts", "accounts")}</p>
-          </div>
-          <button class="primary" data-action="new-account" type="button">+ ${t("control.newUser", "New User")}</button>
+    <div class="account-management-page">
+      <section class="panel public-sales-access-card">
+        <div>
+          <p class="eyebrow">Sales portal</p>
+          <h2>Public Sales Access</h2>
+          <p class="muted">Allow customers to open Sales without a staff account. Turning this off requires a Sales or Admin login.</p>
         </div>
-        <div class="account-user-list" role="listbox" aria-label="${t("control.users", "Users")}">
-          ${operators.map((item) => `
-            <button class="account-user-option ${String(item.id) === String(selectedOperatorId) ? "selected" : ""}" data-action="select-account" data-id="${escapeHtml(item.id)}" type="button" role="option" aria-selected="${String(item.id) === String(selectedOperatorId)}">
-              <span class="account-user-avatar">${escapeHtml(String(item.display_name || item.username || "?").trim().slice(0, 1).toUpperCase())}</span>
-              <span class="account-user-copy">
-                <strong>${escapeHtml(item.display_name || item.username)}</strong>
-                <small>@${escapeHtml(item.username)} · ${escapeHtml(operatorRoleLabel(item.role))}</small>
-              </span>
-              <span class="account-status-dot ${item.active ? "active" : "disabled"}" title="${item.active ? t("common.active", "Active") : t("common.disabled", "Disabled")}"></span>
-              ${String(item.id) === String(operator?.id) ? `<em>${t("control.you", "You")}</em>` : ""}
-            </button>
-          `).join("") || `<p class="muted account-list-empty">${t("control.noUsers", "No users found.")}</p>`}
+        <div class="public-sales-access-control">
+          <span class="account-status-badge ${publicSalesEnabled ? "active" : "disabled"}">${publicSalesEnabled ? "On" : "Off"}</span>
+          <button class="${publicSalesEnabled ? "danger" : "primary"}" data-action="toggle-public-sales" data-enabled="${!publicSalesEnabled}" type="button">
+            Turn ${publicSalesEnabled ? "Off" : "On"}
+          </button>
         </div>
-      </aside>
-      <section class="panel account-detail-panel">
-        ${selectedOperatorId === "new" ? renderNewOperatorDetail() : renderOperatorDetail(selected)}
       </section>
+      <div class="account-management-layout">
+        <aside class="panel account-master-panel">
+          <div class="account-master-head">
+            <div>
+              <h2>${t("control.users", "Users")}</h2>
+              <p class="muted">${operators.length} ${t("control.accounts", "accounts")}</p>
+            </div>
+            <button class="primary" data-action="new-account" type="button">+ ${t("control.newUser", "New User")}</button>
+          </div>
+          <div class="account-user-list" role="listbox" aria-label="${t("control.users", "Users")}">
+            ${operators.map((item) => `
+              <button class="account-user-option ${String(item.id) === String(selectedOperatorId) ? "selected" : ""}" data-action="select-account" data-id="${escapeHtml(item.id)}" type="button" role="option" aria-selected="${String(item.id) === String(selectedOperatorId)}">
+                <span class="account-user-avatar">${escapeHtml(String(item.display_name || item.username || "?").trim().slice(0, 1).toUpperCase())}</span>
+                <span class="account-user-copy">
+                  <strong>${escapeHtml(item.display_name || item.username)}</strong>
+                  <small>@${escapeHtml(item.username)} · ${escapeHtml(operatorRoleLabel(item.role))}</small>
+                </span>
+                <span class="account-status-dot ${item.active ? "active" : "disabled"}" title="${item.active ? t("common.active", "Active") : t("common.disabled", "Disabled")}"></span>
+                ${String(item.id) === String(operator?.id) ? `<em>${t("control.you", "You")}</em>` : ""}
+              </button>
+            `).join("") || `<p class="muted account-list-empty">${t("control.noUsers", "No users found.")}</p>`}
+          </div>
+        </aside>
+        <section class="panel account-detail-panel">
+          ${selectedOperatorId === "new" ? renderNewOperatorDetail() : renderOperatorDetail(selected)}
+        </section>
+      </div>
     </div>
   `;
 }
@@ -1830,14 +1909,15 @@ async function loadAuditOptions() {
 
 async function loadControlData() {
   if (IS_ADMIN_PAGE) {
-    const [nextOperators, nextAuditOptions, nextAudit, nextSyncSettings, nextEnvSettings, nextPhotoArchiveSettings, nextMirrorStatus] = await Promise.all([
+    const [nextOperators, nextAuditOptions, nextAudit, nextSyncSettings, nextEnvSettings, nextPhotoArchiveSettings, nextMirrorStatus, nextPublicSalesSettings] = await Promise.all([
       request("/api/operators"),
       request(auditOptionsQueryString()),
       request(auditQueryString()),
       request("/api/control/sync-settings"),
       request("/api/control/env-settings"),
       request("/api/admin/photo-archive"),
-      request("/api/admin/netsuite-mirror")
+      request("/api/admin/netsuite-mirror"),
+      request("/api/admin/public-sales")
     ]);
     operators = nextOperators;
     auditOptions = nextAuditOptions;
@@ -1846,6 +1926,7 @@ async function loadControlData() {
     envSettings = nextEnvSettings;
     photoArchiveSettings = nextPhotoArchiveSettings;
     mirrorStatus = nextMirrorStatus;
+    publicSalesSettings = nextPublicSalesSettings;
   } else {
     classifications = await request(`/api/inventory/classifications?limit=300${classificationSearch ? `&search=${encodeURIComponent(classificationSearch)}` : ""}`);
     cycleRecords = await request("/api/cycle-count/records?limit=50");
@@ -2333,6 +2414,18 @@ app.addEventListener("click", async (event) => {
         body: JSON.stringify({ active: button.dataset.active === "true" })
       });
       return loadControlData();
+    }
+    if (button.dataset.action === "toggle-public-sales") {
+      const enabled = button.dataset.enabled === "true";
+      const action = enabled ? "turn on" : "turn off";
+      if (!confirm(`Are you sure you want to ${action} Public Sales access?`)) return;
+      button.disabled = true;
+      publicSalesSettings = await request("/api/admin/public-sales", {
+        method: "PUT",
+        body: JSON.stringify({ enabled })
+      });
+      alert(`Public Sales access is now ${enabled ? "on" : "off"}.`);
+      return render();
     }
     if (button.dataset.action === "save-account-roles") {
       const row = button.closest("[data-account-row]");

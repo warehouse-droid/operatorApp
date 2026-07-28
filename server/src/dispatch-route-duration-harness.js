@@ -54,6 +54,7 @@ const makeRouteHarness = Function(
   "cacheRouteEstimate",
   "truckTravelTimePercent",
   "truckStopMinutes",
+  "samePhysicalRouteStop",
   '"use strict"; let routeEstimates = {}; ' + helperSource + routeFunctionSource
     + "; return { routeEstimateFromGoogleLegs, routeEstimates };"
 );
@@ -63,7 +64,14 @@ const routeHarness = makeRouteHarness(
   (_truck, minutes) => Number(minutes),
   () => {},
   () => 0,
-  () => 45
+  () => 45,
+  (left, right) => Boolean(
+    left
+    && right
+    && left.kind === "own"
+    && right.kind === "own"
+    && String(left.placeKey || "") === String(right.placeKey || "")
+  )
 );
 
 const manualEstimate = routeHarness.routeEstimateFromGoogleLegs(
@@ -83,6 +91,22 @@ const legacyEstimate = routeHarness.routeEstimateFromGoogleLegs(
   {}
 );
 assert.equal(legacyEstimate.totalMinutes, 137, "The narrow fix must not alter legacy automatic-return timing.");
+
+const coLocatedStops = [
+  { type: "pick", kind: "own", placeKey: "2967", routeLocation: "2967 Kennedy Rd", stayMinutes: 12 },
+  { type: "pick", kind: "own", placeKey: "2967", routeLocation: "2967 Kennedy Road", stayMinutes: 18 },
+  { type: "drop", kind: "delivery", placeKey: "customer", routeLocation: "89 Remington Dr", stayMinutes: 30 }
+];
+const coLocatedEstimate = routeHarness.routeEstimateFromGoogleLegs(
+  { id: "co-located-pickups" },
+  coLocatedStops,
+  [{ duration: { value: 60 } }, { duration: { value: 1200 } }],
+  {}
+);
+assert.deepEqual(coLocatedEstimate.rawLegMinutes, [0, 20]);
+assert.equal(coLocatedEstimate.driveMinutes, 20, "A co-located pickup leg must not add the one-minute Google-leg floor.");
+assert.equal(coLocatedEstimate.stayMinutes, 60, "Both logical pickup service times must remain in the route total.");
+assert.equal(coLocatedEstimate.totalMinutes, 80);
 
 const signatureSource = sourceSlice("function routeSignature", "function loadPersistedRouteEstimateCache");
 const makeRouteSignature = Function('"use strict"; ' + signatureSource + "; return routeSignature;");

@@ -1,3 +1,5 @@
+import crypto from "node:crypto";
+import { TextDecoder } from "node:util";
 import { query, withTransaction } from "./db.js";
 import { writeAudit } from "./auth-repository.js";
 
@@ -9,6 +11,34 @@ export const SMART_SCM_YARDS = Object.freeze([
 ]);
 
 const YARD_BY_ID = new Map(SMART_SCM_YARDS.map((yard) => [String(yard.locationId), yard]));
+const ITEM_MASTER_CSV_REFERENCE_HEADERS = Object.freeze([
+  "item_id",
+  "item_name",
+  "vendor",
+  "policy_revision"
+]);
+const ITEM_MASTER_CSV_EDITABLE_HEADERS = Object.freeze([
+  "planning_enabled",
+  "vendor_yard_id",
+  "vendor_yard",
+  "lead_time_days",
+  ...SMART_SCM_YARDS.flatMap((yard) => [
+    `eligible_${yard.code}`,
+    `lower_stock_policy_enabled_${yard.code}`,
+    `capacity_pallets_${yard.code}`,
+    `service_quantile_${yard.code}`,
+    `minimum_safety_pallets_${yard.code}`
+  ])
+]);
+export const SMART_SCM_ITEM_MASTER_CSV_HEADERS = Object.freeze([
+  ...ITEM_MASTER_CSV_REFERENCE_HEADERS,
+  ...ITEM_MASTER_CSV_EDITABLE_HEADERS
+]);
+const ITEM_MASTER_CSV_HEADER_SET = new Set(SMART_SCM_ITEM_MASTER_CSV_HEADERS);
+const ITEM_MASTER_CSV_EDITABLE_HEADER_SET = new Set(ITEM_MASTER_CSV_EDITABLE_HEADERS);
+const ITEM_MASTER_CSV_CLEAR = "CLEAR";
+const ITEM_MASTER_CSV_MAX_ROWS = 50000;
+const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 
 function number(value, fallback = 0) {
   const parsed = Number(value);
@@ -67,7 +97,42 @@ export async function getSmartScmSyncStatus() {
   };
 }
 
-export async function syncSmartScmPoliciesFromInventoryItems() {
+function normalizedItemIdFilter(itemIds) {
+  if (!Array.isArray(itemIds)) return null;
+  return [...new Set(itemIds
+    .map(Number)
+    .filter((value) => Number.isSafeInteger(value) && value > 0))];
+}
+
+export async function syncSmartScmPoliciesFromInventoryItems({
+  itemIds = null,
+  updateExisting = true
+} = {}) {
+  const targetItemIds = normalizedItemIdFilter(itemIds);
+  if (targetItemIds && !targetItemIds.length) return { policiesTouched: 0 };
+  const conflictAction = updateExisting
+    ? `DO UPDATE SET
+       item_name = EXCLUDED.item_name,
+       item_description = EXCLUDED.item_description,
+       vendor = COALESCE(EXCLUDED.vendor, scm_smart_item_policies.vendor),
+       vendor_code = COALESCE(EXCLUDED.vendor_code, scm_smart_item_policies.vendor_code),
+       series = COALESCE(EXCLUDED.series, scm_smart_item_policies.series),
+       stock_unit = EXCLUDED.stock_unit,
+       to_plt = EXCLUDED.to_plt,
+       to_lyr = EXCLUDED.to_lyr,
+       to_sec = EXCLUDED.to_sec,
+       to_pcs = EXCLUDED.to_pcs,
+       pallet_weight_lbs = EXCLUDED.pallet_weight_lbs,
+       source_input_file_id = NULL,
+       updated_at = now()`
+    : "DO NOTHING";
+  const existingPolicyFilter = updateExisting
+    ? ""
+    : `AND NOT EXISTS (
+         SELECT 1
+           FROM scm_smart_item_policies existing
+          WHERE existing.item_id = i.item_id
+       )`;
   const inserted = await query(
     `INSERT INTO scm_smart_item_policies (
        item_id, item_name, item_description, vendor, vendor_code, series, stock_unit,
@@ -94,28 +159,18 @@ export async function syncSmartScmPoliciesFromInventoryItems() {
             NULL,
             now()
        FROM inventory_items i
-     ON CONFLICT (item_id) DO UPDATE SET
-       item_name = EXCLUDED.item_name,
-       item_description = EXCLUDED.item_description,
-       vendor = COALESCE(EXCLUDED.vendor, scm_smart_item_policies.vendor),
-       vendor_code = COALESCE(EXCLUDED.vendor_code, scm_smart_item_policies.vendor_code),
-       series = COALESCE(EXCLUDED.series, scm_smart_item_policies.series),
-       stock_unit = EXCLUDED.stock_unit,
-       to_plt = EXCLUDED.to_plt,
-       to_lyr = EXCLUDED.to_lyr,
-       to_sec = EXCLUDED.to_sec,
-       to_pcs = EXCLUDED.to_pcs,
-       pallet_weight_lbs = EXCLUDED.pallet_weight_lbs,
-       source_input_file_id = NULL,
-       updated_at = now()
-     RETURNING item_id`
+      WHERE ($1::bigint[] IS NULL OR i.item_id = ANY($1::bigint[]))
+        ${existingPolicyFilter}
+     ON CONFLICT (item_id) ${conflictAction}
+     RETURNING item_id`,
+    [targetItemIds]
   );
   await query(
     `INSERT INTO scm_smart_item_yard_policies (
        item_id, location_id, yard_code, eligible, capacity_pallets, service_quantile,
        minimum_safety_pallets, source_input_file_id
      )
-     SELECT p.item_id, yard.location_id, yard.yard_code, false, 25,
+     SELECT p.item_id, yard.location_id, yard.yard_code, false, NULL::numeric,
             CASE WHEN yard.yard_code = '12441' THEN 0.95 ELSE 0.90 END,
             1, NULL
        FROM scm_smart_item_policies p
@@ -125,7 +180,15 @@ export async function syncSmartScmPoliciesFromInventoryItems() {
          (15::bigint, '12441'::text),
          (26::bigint, '150'::text)
        ) AS yard(location_id, yard_code)
-     ON CONFLICT (item_id, location_id) DO NOTHING`
+      WHERE ($1::bigint[] IS NULL OR p.item_id = ANY($1::bigint[]))
+        AND NOT EXISTS (
+          SELECT 1
+            FROM scm_smart_item_yard_policies existing
+           WHERE existing.item_id = p.item_id
+             AND existing.location_id = yard.location_id
+        )
+     ON CONFLICT (item_id, location_id) DO NOTHING`,
+    [targetItemIds]
   );
   return { policiesTouched: inserted.rowCount };
 }
@@ -203,7 +266,8 @@ function publicItem(row) {
       locationId: Number(policy.locationId),
       yardCode: policy.yardCode,
       eligible: Boolean(policy.eligible),
-      capacityPallets: number(policy.capacityPallets, 25),
+      lowerStockPolicyEnabled: Boolean(policy.lowerStockPolicyEnabled),
+      capacityPallets: nullableNumber(policy.capacityPallets),
       capacitySource: policy.capacitySource || "default",
       capacityManuallyOverridden: Boolean(policy.capacityManuallyOverridden),
       capacitySourceInputFileId: policy.capacitySourceInputFileId === null || policy.capacitySourceInputFileId === undefined
@@ -220,7 +284,14 @@ function publicItem(row) {
   };
 }
 
-export async function listSmartScmItems({ search = "", enabled = "", vendorYard = "", limit = 150, offset = 0 } = {}) {
+export async function listSmartScmItems({
+  search = "",
+  enabled = "",
+  vendorYard = "",
+  lowerStockPolicy = "",
+  limit = 150,
+  offset = 0
+} = {}) {
   const params = [];
   const clauses = ["1 = 1"];
   const term = String(search || "").trim();
@@ -246,6 +317,36 @@ export async function listSmartScmItems({ search = "", enabled = "", vendorYard 
     }
     params.push(Number(match[1]));
     clauses.push("p.vendor_yard_id = $" + params.length);
+  }
+  const lowerStockPolicyFilter = String(lowerStockPolicy || "").trim().toLowerCase();
+  if (lowerStockPolicyFilter === "any") {
+    clauses.push(`EXISTS (
+      SELECT 1
+        FROM scm_smart_item_yard_policies lower_policy
+       WHERE lower_policy.item_id = i.item_id
+         AND lower_policy.lower_stock_policy_enabled = true
+    )`);
+  } else if (lowerStockPolicyFilter === "none") {
+    clauses.push(`NOT EXISTS (
+      SELECT 1
+        FROM scm_smart_item_yard_policies lower_policy
+       WHERE lower_policy.item_id = i.item_id
+         AND lower_policy.lower_stock_policy_enabled = true
+    )`);
+  } else if (lowerStockPolicyFilter) {
+    const match = lowerStockPolicyFilter.match(/^yard:(3445|2967|12441|150)$/);
+    if (!match) {
+      throw Object.assign(new Error("Select a valid lower-stock policy filter."), { status: 400 });
+    }
+    const yard = SMART_SCM_YARDS.find((candidate) => candidate.code === match[1]);
+    params.push(yard.locationId);
+    clauses.push(`EXISTS (
+      SELECT 1
+        FROM scm_smart_item_yard_policies lower_policy
+       WHERE lower_policy.item_id = i.item_id
+         AND lower_policy.location_id = $${params.length}
+         AND lower_policy.lower_stock_policy_enabled = true
+    )`);
   }
   const safeLimit = Math.min(500, Math.max(1, Number(limit) || 150));
   const safeOffset = Math.max(0, Number(offset) || 0);
@@ -280,6 +381,7 @@ export async function listSmartScmItems({ search = "", enabled = "", vendorYard 
                 'locationId', y.location_id,
                 'yardCode', y.yard_code,
                 'eligible', y.eligible,
+                'lowerStockPolicyEnabled', y.lower_stock_policy_enabled,
                 'capacityPallets', y.capacity_pallets,
                 'capacitySource', y.capacity_source,
                 'capacityManuallyOverridden', y.capacity_manually_overridden,
@@ -308,6 +410,883 @@ export async function listSmartScmItems({ search = "", enabled = "", vendorYard 
   };
 }
 
+function itemMasterCsvError(message, { row = null, column = "" } = {}) {
+  const location = row ? `Row ${row}${column ? ` (${column})` : ""}: ` : "";
+  return Object.assign(new Error(`${location}${message}`), {
+    status: 400,
+    csvRow: row,
+    csvColumn: column || null
+  });
+}
+
+function normalizeItemMasterCsvHeader(value) {
+  return String(value || "")
+    .replace(/^\uFEFF/, "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+}
+
+function parseItemMasterCsvMatrix(buffer) {
+  if (!Buffer.isBuffer(buffer) || !buffer.length) {
+    throw itemMasterCsvError("Select a non-empty Item Master CSV.");
+  }
+  let source;
+  try {
+    source = UTF8_DECODER.decode(buffer).replace(/^\uFEFF/, "");
+  } catch {
+    throw itemMasterCsvError("The Item Master CSV must be saved as UTF-8.");
+  }
+  if (source.includes("\0")) throw itemMasterCsvError("The Item Master CSV contains invalid binary data.");
+
+  const rows = [];
+  let row = [];
+  let value = "";
+  let quoted = false;
+  let closedQuote = false;
+  const pushValue = () => {
+    row.push(value);
+    value = "";
+    closedQuote = false;
+  };
+  const pushRow = () => {
+    pushValue();
+    rows.push(row);
+    row = [];
+  };
+
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    if (quoted) {
+      if (character === '"' && source[index + 1] === '"') {
+        value += '"';
+        index += 1;
+      } else if (character === '"') {
+        quoted = false;
+        closedQuote = true;
+      } else {
+        value += character;
+      }
+      continue;
+    }
+    if (closedQuote) {
+      if (character === ",") {
+        pushValue();
+      } else if (character === "\n" || character === "\r") {
+        if (character === "\r" && source[index + 1] === "\n") index += 1;
+        pushRow();
+      } else if (character !== " " && character !== "\t") {
+        throw itemMasterCsvError("Unexpected text after a closing quote.");
+      }
+      continue;
+    }
+    if (character === '"') {
+      if (value) throw itemMasterCsvError("A quoted value must start at the beginning of a CSV cell.");
+      quoted = true;
+    } else if (character === ",") {
+      pushValue();
+    } else if (character === "\n" || character === "\r") {
+      if (character === "\r" && source[index + 1] === "\n") index += 1;
+      pushRow();
+    } else {
+      value += character;
+    }
+  }
+  if (quoted) throw itemMasterCsvError("The Item Master CSV has an unterminated quoted value.");
+  if (closedQuote || value || row.length) pushRow();
+  return rows;
+}
+
+function parseSmartScmItemMasterCsv(buffer) {
+  const matrix = parseItemMasterCsvMatrix(buffer);
+  const headerRowIndex = matrix.findIndex((row) => row.some((value) => String(value || "").trim()));
+  if (headerRowIndex < 0) throw itemMasterCsvError("The Item Master CSV is empty.");
+  const headerRow = matrix[headerRowIndex];
+  const headers = [];
+  const headerIndexes = new Map();
+  headerRow.forEach((sourceHeader, index) => {
+    const header = normalizeItemMasterCsvHeader(sourceHeader);
+    if (!header) throw itemMasterCsvError(`Column ${index + 1} has no header.`);
+    if (!ITEM_MASTER_CSV_HEADER_SET.has(header)) {
+      throw itemMasterCsvError(`Unsupported column "${String(sourceHeader || "").trim()}". Download a new Item Master CSV template and try again.`);
+    }
+    if (headerIndexes.has(header)) throw itemMasterCsvError(`Duplicate column "${header}".`);
+    headers.push(header);
+    headerIndexes.set(header, index);
+  });
+  if (!headerIndexes.has("item_id")) throw itemMasterCsvError('Required column "item_id" was not found.');
+  if (!headerIndexes.has("policy_revision")) {
+    throw itemMasterCsvError('Required read-only column "policy_revision" was not found. Download a fresh Item Master CSV template.');
+  }
+  if (!headers.some((header) => ITEM_MASTER_CSV_EDITABLE_HEADER_SET.has(header))) {
+    throw itemMasterCsvError("The CSV has no editable Smart SCM policy columns.");
+  }
+
+  const records = [];
+  const seenItemIds = new Map();
+  for (let index = headerRowIndex + 1; index < matrix.length; index += 1) {
+    const sourceRow = matrix[index];
+    if (!sourceRow.some((value) => String(value || "").trim())) continue;
+    if (sourceRow.length > headerRow.length
+      && sourceRow.slice(headerRow.length).some((value) => String(value || "").trim())) {
+      throw itemMasterCsvError("This row contains values beyond the final CSV column. Check for an extra comma.", {
+        row: index + 1
+      });
+    }
+    if (records.length >= ITEM_MASTER_CSV_MAX_ROWS) {
+      throw itemMasterCsvError(`The Item Master CSV cannot contain more than ${ITEM_MASTER_CSV_MAX_ROWS.toLocaleString()} item rows.`);
+    }
+    const values = Object.fromEntries(headers.map((header) => [
+      header,
+      sourceRow[headerIndexes.get(header)] ?? ""
+    ]));
+    const itemIdText = String(values.item_id || "").trim();
+    if (!/^[1-9]\d*$/.test(itemIdText)) {
+      throw itemMasterCsvError("item_id must be a positive NetSuite item ID.", { row: index + 1, column: "item_id" });
+    }
+    const itemId = Number(itemIdText);
+    if (!Number.isSafeInteger(itemId)) {
+      throw itemMasterCsvError("item_id is outside the supported numeric range.", { row: index + 1, column: "item_id" });
+    }
+    if (seenItemIds.has(itemId)) {
+      throw itemMasterCsvError(`Duplicate item_id ${itemId}; it was already provided on row ${seenItemIds.get(itemId)}.`, {
+        row: index + 1,
+        column: "item_id"
+      });
+    }
+    seenItemIds.set(itemId, index + 1);
+    records.push({ rowNumber: index + 1, itemId, values });
+  }
+  if (!records.length) throw itemMasterCsvError("The Item Master CSV has no item rows.");
+  return { records, headers: new Set(headers) };
+}
+
+function protectItemMasterSpreadsheetText(value) {
+  const text = value === null || value === undefined ? "" : String(value);
+  return /^'|^[\t\r ]*[=+\-@]/.test(text) ? `'${text}` : text;
+}
+
+function itemMasterCsvCell(value, { protectSpreadsheetText = false } = {}) {
+  const text = protectSpreadsheetText
+    ? protectItemMasterSpreadsheetText(value)
+    : value === null || value === undefined ? "" : String(value);
+  return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+}
+
+function itemMasterCsvValue(record, header) {
+  if (!Object.hasOwn(record.values, header)) return { supplied: false, value: "" };
+  const value = String(record.values[header] ?? "").trim();
+  return { supplied: Boolean(value), value };
+}
+
+function itemMasterCsvTextValue(record, header) {
+  const cell = itemMasterCsvValue(record, header);
+  if (!cell.supplied) return cell;
+  if (cell.value.startsWith("''")) {
+    return { supplied: true, value: cell.value.slice(1) };
+  }
+  if (/^'[\t\r ]*[=+\-@]/.test(cell.value)) {
+    return { supplied: true, value: cell.value.slice(1).trim() };
+  }
+  return cell;
+}
+
+function isItemMasterCsvClear(value) {
+  return String(value || "").trim().toUpperCase() === ITEM_MASTER_CSV_CLEAR;
+}
+
+function parseItemMasterCsvBoolean(record, header) {
+  const cell = itemMasterCsvValue(record, header);
+  if (!cell.supplied) return { supplied: false, value: null };
+  const normalized = cell.value.toLowerCase();
+  if (["true", "yes", "1"].includes(normalized)) return { supplied: true, value: true };
+  if (["false", "no", "0"].includes(normalized)) return { supplied: true, value: false };
+  throw itemMasterCsvError(`${header} must be true/false, yes/no, or 1/0.`, {
+    row: record.rowNumber,
+    column: header
+  });
+}
+
+function parseItemMasterCsvNumber(record, header, options = {}) {
+  const {
+    minimum,
+    maximum,
+    exclusiveMinimum = false,
+    exclusiveMaximum = false,
+    clearable = false,
+    description = header
+  } = options;
+  const cell = itemMasterCsvValue(record, header);
+  if (!cell.supplied) return { supplied: false, value: null };
+  if (isItemMasterCsvClear(cell.value)) {
+    if (clearable) return { supplied: true, value: null };
+    throw itemMasterCsvError(`${description} cannot be cleared.`, { row: record.rowNumber, column: header });
+  }
+  const parsed = Number(cell.value);
+  if (!Number.isFinite(parsed)) {
+    throw itemMasterCsvError(`${description} must be a number.`, { row: record.rowNumber, column: header });
+  }
+  const below = minimum !== undefined && (exclusiveMinimum ? parsed <= minimum : parsed < minimum);
+  const above = maximum !== undefined && (exclusiveMaximum ? parsed >= maximum : parsed > maximum);
+  const matchesExistingValue = Object.hasOwn(options, "existingValue")
+    && parsed === options.existingValue;
+  if ((below || above) && !matchesExistingValue) {
+    const range = exclusiveMinimum || exclusiveMaximum
+      ? `between ${Number(minimum).toFixed(2)} and ${Number(maximum).toFixed(2)}`
+      : `between ${Number(minimum).toLocaleString()} and ${Number(maximum).toLocaleString()}`;
+    throw itemMasterCsvError(`${description} must be ${range}.`, { row: record.rowNumber, column: header });
+  }
+  return { supplied: true, value: parsed };
+}
+
+function normalizedText(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function itemMasterPolicyRevision(item, yardPolicyFor) {
+  const vendorYardId = item.vendor_yard_id ?? item.vendorYardId;
+  const snapshot = {
+    planningEnabled: Boolean(item.planning_enabled ?? item.planningEnabled),
+    vendorYardId: vendorYardId === null || vendorYardId === undefined ? null : Number(vendorYardId),
+    vendorYard: String(item.vendor_yard ?? item.vendorYard ?? "").trim() || null,
+    leadTimeDays: nullableNumber(item.lead_time_days ?? item.leadTimeDays),
+    yards: SMART_SCM_YARDS.map((yard) => {
+      const policy = yardPolicyFor(yard) || {};
+      const capacity = Object.hasOwn(policy, "capacity_pallets")
+        ? policy.capacity_pallets
+        : policy.capacityPallets;
+      return {
+        locationId: yard.locationId,
+        eligible: Boolean(policy.eligible),
+        lowerStockPolicyEnabled: Boolean(
+          policy.lower_stock_policy_enabled ?? policy.lowerStockPolicyEnabled
+        ),
+        capacityPallets: Boolean(policy.eligible) ? nullableNumber(capacity) : null,
+        serviceQuantile: number(
+          policy.service_quantile ?? policy.serviceQuantile,
+          yard.code === "12441" ? 0.95 : 0.9
+        ),
+        minimumSafetyPallets: number(
+          policy.minimum_safety_pallets ?? policy.minimumSafetyPallets,
+          1
+        )
+      };
+    })
+  };
+  return crypto.createHash("sha256").update(JSON.stringify(snapshot)).digest("hex");
+}
+
+function cleanItemMasterCsvFilename(value) {
+  const basename = String(value || "smart-scm-item-master.csv")
+    .split(/[\\/]/)
+    .pop()
+    .replace(/[\u0000-\u001f\u007f]/g, "")
+    .trim()
+    .slice(0, 180) || "smart-scm-item-master.csv";
+  if (!basename.toLowerCase().endsWith(".csv")) {
+    throw itemMasterCsvError("Item Master bulk updates require a .csv file.");
+  }
+  return basename;
+}
+
+function itemMasterCsvVendorNames(item, mappings = []) {
+  const names = new Set();
+  const canonicalVendor = normalizedText(item.vendor);
+  if (canonicalVendor) names.add(canonicalVendor);
+  const vendorId = String(item.vendor_id || "").trim();
+  for (const mapping of mappings) {
+    const matchesId = vendorId && String(mapping.netsuite_vendor_id || "").trim() === vendorId;
+    const matchesName = canonicalVendor
+      && normalizedText(mapping.netsuite_vendor_name) === canonicalVendor;
+    if ((matchesId || matchesName) && normalizedText(mapping.local_vendor)) {
+      names.add(normalizedText(mapping.local_vendor));
+    }
+  }
+  return names;
+}
+
+function resolveItemMasterCsvVendorYard(record, item, {
+  activeYardsById,
+  canonicalActiveYards,
+  vendorMappings
+}) {
+  const idCell = itemMasterCsvValue(record, "vendor_yard_id");
+  const nameCell = itemMasterCsvTextValue(record, "vendor_yard");
+  if (!idCell.supplied && !nameCell.supplied) return { supplied: false };
+  if (isItemMasterCsvClear(idCell.value) || isItemMasterCsvClear(nameCell.value)) {
+    return { supplied: true, vendorYardId: null, vendorYard: null };
+  }
+
+  const currentId = item.vendor_yard_id === null ? null : Number(item.vendor_yard_id);
+  const currentName = String(item.vendor_yard || "").trim() || null;
+  let requestedId = null;
+  if (idCell.supplied) {
+    if (!/^[1-9]\d*$/.test(idCell.value)) {
+      throw itemMasterCsvError("vendor_yard_id must be a positive active vendor-yard ID or CLEAR.", {
+        row: record.rowNumber,
+        column: "vendor_yard_id"
+      });
+    }
+    requestedId = Number(idCell.value);
+    if (!Number.isSafeInteger(requestedId)) {
+      throw itemMasterCsvError("vendor_yard_id is outside the supported numeric range.", {
+        row: record.rowNumber,
+        column: "vendor_yard_id"
+      });
+    }
+  }
+
+  const requestedName = nameCell.supplied ? nameCell.value : null;
+  const idMatchesCurrent = !idCell.supplied || requestedId === currentId;
+  const nameMatchesCurrent = !nameCell.supplied || normalizedText(requestedName) === normalizedText(currentName);
+  if (idMatchesCurrent && nameMatchesCurrent) {
+    return { supplied: false };
+  }
+
+  if (idCell.supplied && requestedId !== currentId) {
+    const selected = activeYardsById.get(requestedId);
+    if (!selected) {
+      throw itemMasterCsvError(`Vendor yard ID ${requestedId} is not active.`, {
+        row: record.rowNumber,
+        column: "vendor_yard_id"
+      });
+    }
+    if (nameCell.supplied
+      && !nameMatchesCurrent
+      && normalizedText(requestedName) !== normalizedText(selected.yard)) {
+      throw itemMasterCsvError(`vendor_yard "${requestedName}" does not match vendor_yard_id ${requestedId} (${selected.yard}).`, {
+        row: record.rowNumber,
+        column: "vendor_yard"
+      });
+    }
+    return {
+      supplied: true,
+      vendorYardId: requestedId,
+      vendorYard: String(selected.yard || "").trim()
+    };
+  }
+
+  if (nameCell.supplied && !nameMatchesCurrent) {
+    if (requestedName.length > 180) {
+      throw itemMasterCsvError("vendor_yard is too long.", { row: record.rowNumber, column: "vendor_yard" });
+    }
+    const requestedKey = normalizedText(requestedName);
+    const candidates = canonicalActiveYards.filter((yard) => normalizedText(yard.yard) === requestedKey);
+    const matchingVendors = itemMasterCsvVendorNames(item, vendorMappings);
+    const vendorCandidates = candidates.filter((yard) => matchingVendors.has(normalizedText(yard.vendor)));
+    const selectedCandidates = vendorCandidates.length ? vendorCandidates : candidates;
+    if (!selectedCandidates.length) {
+      throw itemMasterCsvError(`No active local vendor yard exactly matches "${requestedName}".`, {
+        row: record.rowNumber,
+        column: "vendor_yard"
+      });
+    }
+    if (selectedCandidates.length > 1) {
+      throw itemMasterCsvError(`Vendor yard "${requestedName}" is ambiguous; enter its vendor_yard_id instead.`, {
+        row: record.rowNumber,
+        column: "vendor_yard"
+      });
+    }
+    const selected = selectedCandidates[0];
+    return {
+      supplied: true,
+      vendorYardId: Number(selected.id),
+      vendorYard: String(selected.yard || "").trim()
+    };
+  }
+
+  if (idCell.supplied && requestedId === currentId) return { supplied: false };
+  return { supplied: false };
+}
+
+export async function buildSmartScmItemMasterCsvTemplate() {
+  const result = await query(
+    `SELECT i.item_id, i.item_name, i.vendor,
+            CASE WHEN p.item_id IS NULL THEN false ELSE p.planning_enabled END AS planning_enabled,
+            p.vendor_yard_id, p.vendor_yard,
+            CASE
+              WHEN p.item_id IS NULL THEN i.netsuite_lead_time_days
+              ELSE p.lead_time_days
+            END AS lead_time_days,
+            COALESCE(
+              jsonb_object_agg(
+                y.yard_code,
+                jsonb_build_object(
+                  'eligible', y.eligible,
+                  'lowerStockPolicyEnabled', y.lower_stock_policy_enabled,
+                  'capacityPallets', y.capacity_pallets,
+                  'serviceQuantile', y.service_quantile,
+                  'minimumSafetyPallets', y.minimum_safety_pallets
+                )
+              ) FILTER (WHERE y.item_id IS NOT NULL),
+              '{}'::jsonb
+            ) AS yard_policies
+       FROM inventory_items i
+       LEFT JOIN scm_smart_item_policies p ON p.item_id = i.item_id
+       LEFT JOIN scm_smart_item_yard_policies y
+         ON y.item_id = i.item_id
+        AND y.location_id = ANY($1::bigint[])
+      GROUP BY i.item_id, i.item_name, i.vendor,
+               i.netsuite_lead_time_days, p.item_id, p.planning_enabled,
+               p.vendor_yard_id, p.vendor_yard, p.lead_time_days
+      ORDER BY LOWER(i.item_name), i.item_name, i.item_id`,
+    [SMART_SCM_YARDS.map((yard) => yard.locationId)]
+  );
+  const lines = [
+    SMART_SCM_ITEM_MASTER_CSV_HEADERS.map(itemMasterCsvCell).join(","),
+    ...result.rows.map((row) => {
+      const values = {
+        item_id: row.item_id,
+        item_name: row.item_name,
+        vendor: row.vendor,
+        planning_enabled: Boolean(row.planning_enabled),
+        vendor_yard_id: row.vendor_yard_id,
+        vendor_yard: row.vendor_yard,
+        lead_time_days: row.lead_time_days
+      };
+      for (const yard of SMART_SCM_YARDS) {
+        const policy = row.yard_policies?.[yard.code] || {};
+        values[`eligible_${yard.code}`] = policy.eligible === undefined ? false : Boolean(policy.eligible);
+        values[`lower_stock_policy_enabled_${yard.code}`] = Boolean(policy.lowerStockPolicyEnabled);
+        values[`capacity_pallets_${yard.code}`] = policy.eligible
+          ? policy.capacityPallets ?? null
+          : null;
+        values[`service_quantile_${yard.code}`] = policy.serviceQuantile ?? (yard.code === "12441" ? 0.95 : 0.9);
+        values[`minimum_safety_pallets_${yard.code}`] = policy.minimumSafetyPallets ?? 1;
+      }
+      values.policy_revision = itemMasterPolicyRevision(
+        row,
+        (yard) => row.yard_policies?.[yard.code]
+      );
+      return SMART_SCM_ITEM_MASTER_CSV_HEADERS.map((header) => itemMasterCsvCell(values[header], {
+        protectSpreadsheetText: ["item_name", "vendor", "vendor_yard"].includes(header)
+      })).join(",");
+    })
+  ];
+  return Buffer.from(`\uFEFF${lines.join("\r\n")}\r\n`, "utf8");
+}
+
+export async function importSmartScmItemMasterCsv({
+  buffer,
+  filename = "smart-scm-item-master.csv",
+  operatorId = null
+} = {}) {
+  const cleanFilename = cleanItemMasterCsvFilename(filename);
+  const parsed = parseSmartScmItemMasterCsv(buffer);
+  const itemIds = parsed.records.map((record) => record.itemId);
+  const sha256 = crypto.createHash("sha256").update(buffer).digest("hex");
+
+  return withTransaction(async () => {
+    await query("SELECT pg_advisory_xact_lock(hashtext('smart-scm-item-master-csv-import'))");
+    await syncSmartScmPoliciesFromInventoryItems({ itemIds, updateExisting: false });
+    const itemResult = await query(
+      `SELECT i.item_id, i.vendor_id, i.vendor,
+              p.planning_enabled, p.vendor_yard_id, p.vendor_yard, p.lead_time_days
+         FROM inventory_items i
+         JOIN scm_smart_item_policies p ON p.item_id = i.item_id
+        WHERE i.item_id = ANY($1::bigint[])
+        ORDER BY i.item_id
+        FOR UPDATE OF p`,
+      [itemIds]
+    );
+    const yardResult = await query(
+      `SELECT item_id, location_id, yard_code, eligible, lower_stock_policy_enabled, capacity_pallets,
+              service_quantile, minimum_safety_pallets
+         FROM scm_smart_item_yard_policies
+        WHERE item_id = ANY($1::bigint[])
+          AND location_id = ANY($2::bigint[])
+        ORDER BY item_id, location_id
+        FOR UPDATE`,
+      [itemIds, SMART_SCM_YARDS.map((yard) => yard.locationId)]
+    );
+    const activeYardResult = await query(
+      `SELECT id, vendor, yard
+         FROM dispatch_vendor_yards
+        WHERE active = true
+        ORDER BY id
+        FOR SHARE`
+    );
+    const vendorMappingResult = await query(
+      `SELECT netsuite_vendor_id, netsuite_vendor_name, local_vendor
+         FROM dispatch_vendor_mappings
+        WHERE active = true
+          AND NULLIF(BTRIM(local_vendor), '') IS NOT NULL`
+    );
+
+    const itemsById = new Map(itemResult.rows.map((row) => [Number(row.item_id), row]));
+    for (const record of parsed.records) {
+      if (!itemsById.has(record.itemId)) {
+        throw itemMasterCsvError(`NetSuite item ${record.itemId} was not found in Item Master.`, {
+          row: record.rowNumber,
+          column: "item_id"
+        });
+      }
+    }
+    const yardPoliciesByItem = new Map();
+    for (const row of yardResult.rows) {
+      const itemId = Number(row.item_id);
+      if (!yardPoliciesByItem.has(itemId)) yardPoliciesByItem.set(itemId, new Map());
+      yardPoliciesByItem.get(itemId).set(Number(row.location_id), row);
+    }
+    const activeYardsById = new Map(activeYardResult.rows.map((row) => [Number(row.id), row]));
+    const canonicalYardsByKey = new Map();
+    for (const row of activeYardResult.rows) {
+      const key = `${normalizedText(row.vendor)}\0${normalizedText(row.yard)}`;
+      if (!canonicalYardsByKey.has(key)) canonicalYardsByKey.set(key, row);
+    }
+    const vendorResolution = {
+      activeYardsById,
+      canonicalActiveYards: [...canonicalYardsByKey.values()],
+      vendorMappings: vendorMappingResult.rows
+    };
+    const itemChanges = [];
+    const yardChanges = [];
+    const updatedItemIds = new Set();
+    const fieldCounts = {};
+    const countField = (header) => {
+      fieldCounts[header] = Number(fieldCounts[header] || 0) + 1;
+    };
+
+    for (const record of parsed.records) {
+      const current = itemsById.get(record.itemId);
+      const currentYards = yardPoliciesByItem.get(record.itemId) || new Map();
+      for (const yard of SMART_SCM_YARDS) {
+        if (!currentYards.has(yard.locationId)) {
+          throw itemMasterCsvError(`Smart SCM yard policy ${yard.code} is missing for this item.`, {
+            row: record.rowNumber,
+            column: `eligible_${yard.code}`
+          });
+        }
+      }
+      const revision = itemMasterCsvValue(record, "policy_revision");
+      if (!revision.supplied || !/^[a-f0-9]{64}$/i.test(revision.value)) {
+        throw itemMasterCsvError("policy_revision is missing or invalid. Download a fresh Item Master CSV template.", {
+          row: record.rowNumber,
+          column: "policy_revision"
+        });
+      }
+      const currentRevision = itemMasterPolicyRevision(
+        current,
+        (yard) => currentYards.get(yard.locationId)
+      );
+      if (revision.value.toLowerCase() !== currentRevision) {
+        throw itemMasterCsvError("This item changed after the CSV template was downloaded. Download a fresh template and reapply this row.", {
+          row: record.rowNumber,
+          column: "policy_revision"
+        });
+      }
+      const itemChange = {
+        item_id: record.itemId,
+        change_planning_enabled: false,
+        planning_enabled: null,
+        change_lead_time_days: false,
+        lead_time_days: null,
+        change_vendor_yard: false,
+        vendor_yard_id: null,
+        vendor_yard: null
+      };
+
+      const planning = parseItemMasterCsvBoolean(record, "planning_enabled");
+      if (planning.supplied && planning.value !== Boolean(current.planning_enabled)) {
+        itemChange.change_planning_enabled = true;
+        itemChange.planning_enabled = planning.value;
+        countField("planning_enabled");
+      }
+      const currentLeadTime = nullableNumber(current.lead_time_days);
+      const leadTime = parseItemMasterCsvNumber(record, "lead_time_days", {
+        minimum: 1,
+        maximum: 730,
+        clearable: true,
+        description: "Lead time",
+        existingValue: currentLeadTime
+      });
+      if (leadTime.supplied && leadTime.value !== currentLeadTime) {
+        itemChange.change_lead_time_days = true;
+        itemChange.lead_time_days = leadTime.value;
+        countField("lead_time_days");
+      }
+      const vendorYard = resolveItemMasterCsvVendorYard(record, current, vendorResolution);
+      if (vendorYard.supplied) {
+        const currentVendorYardId = current.vendor_yard_id === null ? null : Number(current.vendor_yard_id);
+        const changed = vendorYard.vendorYardId !== currentVendorYardId
+          || normalizedText(vendorYard.vendorYard) !== normalizedText(current.vendor_yard);
+        if (changed) {
+          itemChange.change_vendor_yard = true;
+          itemChange.vendor_yard_id = vendorYard.vendorYardId;
+          itemChange.vendor_yard = vendorYard.vendorYard;
+          countField("vendor_yard");
+        }
+      }
+      if (itemChange.change_planning_enabled || itemChange.change_lead_time_days || itemChange.change_vendor_yard) {
+        itemChanges.push(itemChange);
+        updatedItemIds.add(record.itemId);
+      }
+
+      for (const yard of SMART_SCM_YARDS) {
+        const currentYard = currentYards.get(yard.locationId);
+        const yardChange = {
+          item_id: record.itemId,
+          location_id: yard.locationId,
+          change_eligible: false,
+          eligible: null,
+          change_lower_stock_policy_enabled: false,
+          lower_stock_policy_enabled: null,
+          change_capacity_pallets: false,
+          capacity_pallets: null,
+          change_service_quantile: false,
+          service_quantile: null,
+          change_minimum_safety_pallets: false,
+          minimum_safety_pallets: null
+        };
+        const eligibleHeader = `eligible_${yard.code}`;
+        const eligible = parseItemMasterCsvBoolean(record, eligibleHeader);
+        const currentEligible = Boolean(currentYard.eligible);
+        const effectiveEligible = eligible.supplied ? eligible.value : currentEligible;
+        if (eligible.supplied && eligible.value !== currentEligible) {
+          yardChange.change_eligible = true;
+          yardChange.eligible = eligible.value;
+          countField(eligibleHeader);
+        }
+        const lowerStockHeader = `lower_stock_policy_enabled_${yard.code}`;
+        const lowerStockPolicy = parseItemMasterCsvBoolean(record, lowerStockHeader);
+        const currentLowerStockPolicy = Boolean(currentYard.lower_stock_policy_enabled);
+        if (lowerStockPolicy.supplied && lowerStockPolicy.value !== currentLowerStockPolicy) {
+          yardChange.change_lower_stock_policy_enabled = true;
+          yardChange.lower_stock_policy_enabled = lowerStockPolicy.value;
+          countField(lowerStockHeader);
+        }
+        const capacityHeader = `capacity_pallets_${yard.code}`;
+        const currentCapacity = nullableNumber(currentYard.capacity_pallets);
+        const capacity = parseItemMasterCsvNumber(record, capacityHeader, {
+          minimum: 0,
+          maximum: 10000,
+          clearable: true,
+          description: `Capacity for ${yard.code}`,
+          existingValue: currentCapacity
+        });
+        if (!effectiveEligible) {
+          const suppliedExistingCapacity = capacity.supplied
+            && capacity.value !== null
+            && currentEligible
+            && capacity.value === currentCapacity;
+          if (capacity.supplied && capacity.value !== null && !suppliedExistingCapacity) {
+            throw itemMasterCsvError(`Capacity for ${yard.code} must be blank when the yard is not eligible.`, {
+              row: record.rowNumber,
+              column: capacityHeader
+            });
+          }
+          if (currentCapacity !== null) {
+            yardChange.change_capacity_pallets = true;
+            yardChange.capacity_pallets = null;
+            countField(capacityHeader);
+          }
+        } else if (!capacity.supplied && currentCapacity === null) {
+          throw itemMasterCsvError(`Capacity for ${yard.code} is required when the yard is eligible.`, {
+            row: record.rowNumber,
+            column: capacityHeader
+          });
+        } else if (capacity.supplied && capacity.value === null) {
+          throw itemMasterCsvError(`Capacity for ${yard.code} cannot be cleared while the yard is eligible.`, {
+            row: record.rowNumber,
+            column: capacityHeader
+          });
+        } else if (capacity.supplied && capacity.value !== currentCapacity) {
+          yardChange.change_capacity_pallets = true;
+          yardChange.capacity_pallets = capacity.value;
+          countField(capacityHeader);
+        }
+        const quantileHeader = `service_quantile_${yard.code}`;
+        const currentQuantile = number(currentYard.service_quantile);
+        const quantile = parseItemMasterCsvNumber(record, quantileHeader, {
+          minimum: 0.5,
+          maximum: 1,
+          exclusiveMinimum: true,
+          exclusiveMaximum: true,
+          description: `Service quantile for ${yard.code}`,
+          existingValue: currentQuantile
+        });
+        if (quantile.supplied && quantile.value !== currentQuantile) {
+          yardChange.change_service_quantile = true;
+          yardChange.service_quantile = quantile.value;
+          countField(quantileHeader);
+        }
+        const safetyHeader = `minimum_safety_pallets_${yard.code}`;
+        const currentSafety = number(currentYard.minimum_safety_pallets);
+        const safety = parseItemMasterCsvNumber(record, safetyHeader, {
+          minimum: 0,
+          maximum: 10000,
+          description: `Minimum safety pallets for ${yard.code}`,
+          existingValue: currentSafety
+        });
+        if (safety.supplied && safety.value !== currentSafety) {
+          yardChange.change_minimum_safety_pallets = true;
+          yardChange.minimum_safety_pallets = safety.value;
+          countField(safetyHeader);
+        }
+        if (yardChange.change_eligible
+          || yardChange.change_lower_stock_policy_enabled
+          || yardChange.change_capacity_pallets
+          || yardChange.change_service_quantile
+          || yardChange.change_minimum_safety_pallets) {
+          yardChanges.push(yardChange);
+          updatedItemIds.add(record.itemId);
+        }
+      }
+    }
+
+    if (itemChanges.length) {
+      await query(
+        `WITH changes AS (
+           SELECT *
+             FROM jsonb_to_recordset($1::jsonb) AS change(
+               item_id bigint,
+               change_planning_enabled boolean,
+               planning_enabled boolean,
+               change_lead_time_days boolean,
+               lead_time_days numeric,
+               change_vendor_yard boolean,
+               vendor_yard_id bigint,
+               vendor_yard text
+             )
+         )
+         UPDATE scm_smart_item_policies policy
+            SET planning_enabled = CASE
+                  WHEN change.change_planning_enabled THEN change.planning_enabled
+                  ELSE policy.planning_enabled
+                END,
+                lead_time_days = CASE
+                  WHEN change.change_lead_time_days THEN change.lead_time_days
+                  ELSE policy.lead_time_days
+                END,
+                vendor_yard_id = CASE
+                  WHEN change.change_vendor_yard THEN change.vendor_yard_id
+                  ELSE policy.vendor_yard_id
+                END,
+                vendor_yard = CASE
+                  WHEN change.change_vendor_yard THEN change.vendor_yard
+                  ELSE policy.vendor_yard
+                END,
+                source_input_file_id = NULL,
+                updated_by = $2,
+                updated_at = now()
+           FROM changes change
+          WHERE policy.item_id = change.item_id`,
+        [JSON.stringify(itemChanges), operatorId]
+      );
+    }
+    if (yardChanges.length) {
+      await query(
+        `WITH changes AS (
+           SELECT *
+             FROM jsonb_to_recordset($1::jsonb) AS change(
+               item_id bigint,
+               location_id bigint,
+               change_eligible boolean,
+               eligible boolean,
+               change_lower_stock_policy_enabled boolean,
+               lower_stock_policy_enabled boolean,
+               change_capacity_pallets boolean,
+               capacity_pallets numeric,
+               change_service_quantile boolean,
+               service_quantile numeric,
+               change_minimum_safety_pallets boolean,
+               minimum_safety_pallets numeric
+             )
+         )
+         , resolved_changes AS (
+           SELECT change.*,
+                  CASE
+                    WHEN change.change_eligible THEN change.eligible
+                    ELSE policy.eligible
+                  END AS final_eligible
+             FROM changes change
+             JOIN scm_smart_item_yard_policies policy
+               ON policy.item_id = change.item_id
+              AND policy.location_id = change.location_id
+         )
+         UPDATE scm_smart_item_yard_policies policy
+            SET eligible = change.final_eligible,
+                lower_stock_policy_enabled = CASE
+                  WHEN change.change_lower_stock_policy_enabled THEN change.lower_stock_policy_enabled
+                  ELSE policy.lower_stock_policy_enabled
+                END,
+                capacity_pallets = CASE
+                  WHEN change.final_eligible = false THEN NULL
+                  WHEN change.change_capacity_pallets THEN change.capacity_pallets
+                  ELSE policy.capacity_pallets
+                END,
+                service_quantile = CASE
+                  WHEN change.change_service_quantile THEN change.service_quantile
+                  ELSE policy.service_quantile
+                END,
+                minimum_safety_pallets = CASE
+                  WHEN change.change_minimum_safety_pallets THEN change.minimum_safety_pallets
+                  ELSE policy.minimum_safety_pallets
+                END,
+                manually_overridden = policy.manually_overridden
+                  OR change.change_eligible
+                  OR change.change_service_quantile
+                  OR change.change_minimum_safety_pallets,
+                capacity_manually_overridden = CASE
+                  WHEN change.final_eligible = false THEN false
+                  ELSE policy.capacity_manually_overridden OR change.change_capacity_pallets
+                END,
+                capacity_source = CASE
+                  WHEN change.final_eligible = false THEN 'default'
+                  WHEN change.change_capacity_pallets THEN 'manual'
+                  ELSE policy.capacity_source
+                END,
+                capacity_source_input_file_id = CASE
+                  WHEN change.final_eligible = false OR change.change_capacity_pallets THEN NULL
+                  ELSE policy.capacity_source_input_file_id
+                END,
+                capacity_source_sheet = CASE
+                  WHEN change.final_eligible = false OR change.change_capacity_pallets THEN NULL
+                  ELSE policy.capacity_source_sheet
+                END,
+                capacity_source_row = CASE
+                  WHEN change.final_eligible = false OR change.change_capacity_pallets THEN NULL
+                  ELSE policy.capacity_source_row
+                END,
+                capacity_match_method = CASE
+                  WHEN change.final_eligible = false OR change.change_capacity_pallets THEN NULL
+                  ELSE policy.capacity_match_method
+                END,
+                source_input_file_id = NULL,
+                updated_by = $2,
+                updated_at = now()
+           FROM resolved_changes change
+          WHERE policy.item_id = change.item_id
+            AND policy.location_id = change.location_id`,
+        [JSON.stringify(yardChanges), operatorId]
+      );
+    }
+
+    const summary = {
+      filename: cleanFilename,
+      sha256,
+      bytes: buffer.length,
+      rowsRead: parsed.records.length,
+      itemsUpdated: updatedItemIds.size,
+      itemPoliciesUpdated: itemChanges.length,
+      yardPoliciesUpdated: yardChanges.length,
+      unchangedRows: parsed.records.length - updatedItemIds.size,
+      fieldCounts
+    };
+    await writeAudit({
+      actorOperatorId: operatorId,
+      source: "smart_scm",
+      action: "smart_scm.item_master.csv_import",
+      details: {
+        ...summary,
+        updatedItemIds: [...updatedItemIds].slice(0, 100),
+        updatedItemIdsTruncated: updatedItemIds.size > 100
+      }
+    });
+    return summary;
+  });
+}
+
 export async function updateSmartScmItem(itemId, values = {}, operatorId = null) {
   const id = Number(itemId);
   if (!Number.isInteger(id) || id <= 0) throw Object.assign(new Error("A valid item ID is required."), { status: 400 });
@@ -331,7 +1310,7 @@ export async function updateSmartScmItem(itemId, values = {}, operatorId = null)
   const planningEnabled = values.planningEnabled === undefined ? null : Boolean(values.planningEnabled);
   const yardPolicies = Array.isArray(values.yardPolicies) ? values.yardPolicies : [];
   const result = await withTransaction(async () => {
-    await syncSmartScmPoliciesFromInventoryItems();
+    await syncSmartScmPoliciesFromInventoryItems({ itemIds: [id] });
     const updated = await query(
       `UPDATE scm_smart_item_policies
           SET lead_time_days = $2,
@@ -349,49 +1328,97 @@ export async function updateSmartScmItem(itemId, values = {}, operatorId = null)
     for (const policy of yardPolicies) {
       const yard = YARD_BY_ID.get(String(policy.locationId));
       if (!yard) continue;
-      const capacity = number(policy.capacityPallets, 25);
+      if (typeof policy.eligible !== "boolean") {
+        throw Object.assign(new Error(`Eligibility for ${yard.code} must be true or false.`), { status: 400 });
+      }
+      const eligible = policy.eligible;
+      const hasLowerStockPolicy = Object.hasOwn(policy, "lowerStockPolicyEnabled");
+      if (hasLowerStockPolicy && typeof policy.lowerStockPolicyEnabled !== "boolean") {
+        throw Object.assign(new Error(`Lower-stock policy for ${yard.code} must be true or false.`), { status: 400 });
+      }
+      const lowerStockPolicyEnabled = hasLowerStockPolicy ? policy.lowerStockPolicyEnabled : null;
+      const capacity = eligible ? nullableNumber(policy.capacityPallets) : null;
       const quantile = number(policy.serviceQuantile, yard.code === "12441" ? 0.95 : 0.9);
-      const safety = number(policy.minimumSafetyPallets, 1);
+      const hasSafetyInput = Object.hasOwn(policy, "minimumSafetyPallets");
+      const safetyInput = policy.minimumSafetyPallets;
+      const safetyInputIsNumeric = (typeof safetyInput === "number" && Number.isFinite(safetyInput))
+        || (typeof safetyInput === "string"
+          && safetyInput.trim() !== ""
+          && Number.isFinite(Number(safetyInput)));
+      const safety = safetyInputIsNumeric ? Number(safetyInput) : null;
+      if (eligible && capacity === null) {
+        throw Object.assign(new Error(`Capacity for ${yard.code} is required when the yard is eligible.`), { status: 400 });
+      }
       if (capacity < 0 || capacity > 10000) throw Object.assign(new Error(`Capacity for ${yard.code} must be between 0 and 10,000 pallets.`), { status: 400 });
       if (quantile <= 0.5 || quantile >= 1) throw Object.assign(new Error(`Service quantile for ${yard.code} must be between 0.50 and 1.00.`), { status: 400 });
-      if (safety < 0 || safety > 10000) throw Object.assign(new Error(`Safety stock for ${yard.code} is invalid.`), { status: 400 });
+      if (hasSafetyInput && (safety === null || safety < 0 || safety > 10000)) {
+        throw Object.assign(new Error(`Safety floor for ${yard.code} must be between 0 and 10,000 pallets.`), { status: 400 });
+      }
       await query(
         `UPDATE scm_smart_item_yard_policies
             SET eligible = $3,
+                lower_stock_policy_enabled = CASE WHEN $7::boolean THEN $8 ELSE lower_stock_policy_enabled END,
                 manually_overridden = manually_overridden
                   OR eligible IS DISTINCT FROM $3::boolean
                   OR service_quantile IS DISTINCT FROM $5::numeric
-                  OR minimum_safety_pallets IS DISTINCT FROM $6::numeric,
-                capacity_manually_overridden = capacity_manually_overridden
-                  OR capacity_pallets IS DISTINCT FROM $4::numeric,
+                  OR ($9::boolean AND minimum_safety_pallets IS DISTINCT FROM $6::numeric),
+                capacity_manually_overridden = CASE
+                  WHEN $3::boolean = false THEN false
+                  ELSE capacity_manually_overridden
+                    OR capacity_pallets IS DISTINCT FROM $4::numeric
+                END,
                 capacity_source = CASE
+                  WHEN $3::boolean = false THEN 'default'
                   WHEN capacity_pallets IS DISTINCT FROM $4::numeric THEN 'manual'
                   ELSE capacity_source
                 END,
                 capacity_source_input_file_id = CASE
-                  WHEN capacity_pallets IS DISTINCT FROM $4::numeric THEN NULL
+                  WHEN $3::boolean = false
+                    OR capacity_pallets IS DISTINCT FROM $4::numeric THEN NULL
                   ELSE capacity_source_input_file_id
                 END,
                 capacity_source_sheet = CASE
-                  WHEN capacity_pallets IS DISTINCT FROM $4::numeric THEN NULL
+                  WHEN $3::boolean = false
+                    OR capacity_pallets IS DISTINCT FROM $4::numeric THEN NULL
                   ELSE capacity_source_sheet
                 END,
                 capacity_source_row = CASE
-                  WHEN capacity_pallets IS DISTINCT FROM $4::numeric THEN NULL
+                  WHEN $3::boolean = false
+                    OR capacity_pallets IS DISTINCT FROM $4::numeric THEN NULL
                   ELSE capacity_source_row
                 END,
                 capacity_match_method = CASE
-                  WHEN capacity_pallets IS DISTINCT FROM $4::numeric THEN NULL
+                  WHEN $3::boolean = false
+                    OR capacity_pallets IS DISTINCT FROM $4::numeric THEN NULL
                   ELSE capacity_match_method
                 END,
                 capacity_pallets = $4,
                 service_quantile = $5,
-                minimum_safety_pallets = $6,
+                minimum_safety_pallets = CASE WHEN $9::boolean THEN $6 ELSE minimum_safety_pallets END,
                 source_input_file_id = NULL,
-                updated_by = $7,
+                updated_by = $10,
                 updated_at = now()
-          WHERE item_id = $1 AND location_id = $2`,
-        [id, yard.locationId, Boolean(policy.eligible), capacity, quantile, safety, operatorId]
+          WHERE item_id = $1
+            AND location_id = $2
+            AND (
+              eligible IS DISTINCT FROM $3::boolean
+              OR capacity_pallets IS DISTINCT FROM $4::numeric
+              OR service_quantile IS DISTINCT FROM $5::numeric
+              OR ($7::boolean AND lower_stock_policy_enabled IS DISTINCT FROM $8::boolean)
+              OR ($9::boolean AND minimum_safety_pallets IS DISTINCT FROM $6::numeric)
+            )`,
+        [
+          id,
+          yard.locationId,
+          eligible,
+          capacity,
+          quantile,
+          safety,
+          hasLowerStockPolicy,
+          lowerStockPolicyEnabled,
+          hasSafetyInput,
+          operatorId
+        ]
       );
     }
     return updated.rows[0];

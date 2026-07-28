@@ -337,6 +337,36 @@ th {
   margin: 0;
 }
 
+.account-management-page {
+  display: grid;
+  gap: 16px;
+}
+
+.public-sales-access-card,
+.public-sales-access-control {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.public-sales-access-card h2 {
+  margin-bottom: 5px;
+}
+
+.public-sales-access-card .muted {
+  margin-bottom: 0;
+}
+
+.public-sales-access-control {
+  flex: 0 0 auto;
+}
+
+.public-sales-access-control button {
+  min-width: 92px;
+  white-space: nowrap;
+}
+
 .account-management-layout {
   display: grid;
   grid-template-columns: minmax(250px, 300px) minmax(0, 1fr);
@@ -582,6 +612,15 @@ th {
 }
 
 @media (max-width: 760px) {
+  .public-sales-access-card {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .public-sales-access-control {
+    justify-content: flex-end;
+  }
+
   .account-management-layout {
     grid-template-columns: 1fr;
   }
@@ -1314,4 +1353,112 @@ pre {
 
 .warn {
   color: #9a4d00;
+}
+
+@media (max-width: 760px) {
+  .admin-sync-page .shell {
+    min-height: calc(100dvh - 72px);
+    padding: 12px;
+  }
+
+  .admin-sync-page .topbar {
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: start;
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+
+  .admin-sync-page .topbar > div:first-child {
+    min-width: 0;
+  }
+
+  .admin-sync-page .topbar h1 {
+    font-size: 24px;
+    line-height: 1.1;
+  }
+
+  .admin-sync-page .topbar-language {
+    justify-self: end;
+  }
+
+  .admin-sync-page .topbar > .actions {
+    grid-column: 1 / -1;
+    width: 100%;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    justify-self: stretch;
+  }
+
+  .admin-sync-page .topbar > .actions button {
+    width: 100%;
+    min-width: 0;
+    padding-inline: 8px;
+    overflow-wrap: anywhere;
+  }
+
+  .admin-sync-page .topbar > .actions button:last-child {
+    grid-column: 1 / -1;
+  }
+
+  .admin-sync-page .control-content {
+    gap: 12px;
+  }
+
+  .admin-sync-page .panel {
+    gap: 10px;
+    padding: 12px;
+  }
+
+  .admin-sync-page .section-heading {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .admin-sync-page .section-heading > button {
+    width: 100%;
+  }
+
+  .admin-sync-page .sync-mode-grid,
+  .admin-sync-page .sync-status-grid,
+  .admin-sync-page .sync-setting-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .admin-sync-page .sync-mode-card {
+    min-height: 0;
+    padding: 14px;
+  }
+
+  .admin-sync-page .targeted-sync-form {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .admin-sync-page .panel > .actions {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .admin-sync-page .panel > .actions button,
+  .admin-sync-page .targeted-sync-form button {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .admin-sync-page button,
+  .admin-sync-page input,
+  .admin-sync-page select {
+    font-size: 16px;
+  }
+
+  .admin-sync-page .notice,
+  .admin-sync-page .muted,
+  .admin-sync-page .sync-status-grid strong {
+    overflow-wrap: anywhere;
+  }
+
+  .admin-sync-page .notice > span {
+    display: block;
+    margin-top: 5px;
+  }
 }

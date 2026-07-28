@@ -215,6 +215,31 @@ body {
   background: white;
 }
 
+.smart-item-csv-tools {
+  justify-content: space-between;
+}
+
+.smart-item-csv-copy {
+  display: grid;
+  gap: 2px;
+  max-width: 650px;
+}
+
+.smart-item-csv-copy span {
+  color: var(--smart-muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.smart-item-csv-tools input[type="file"] {
+  width: min(310px, 30vw);
+  min-height: 34px;
+  padding: 5px 7px;
+  border: 1px dashed #9aabb7;
+  border-radius: 6px;
+  background: white;
+}
+
 .smart-shell button,
 .smart-shell input,
 .smart-shell select,
@@ -895,6 +920,24 @@ body {
 }
 
 @media (max-width: 700px) {
+  .smart-shell {
+    min-width: 0;
+  }
+
+  .smart-item-csv-tools,
+  .smart-item-csv-tools .smart-actions {
+    width: 100%;
+    align-items: stretch;
+  }
+
+  .smart-item-csv-tools input[type="file"] {
+    width: 100%;
+  }
+
+  .smart-item-csv-tools .smart-button {
+    flex: 1 1 100%;
+  }
+
   .printer-card {
     grid-template-columns: 1fr;
   }

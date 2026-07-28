@@ -7,6 +7,8 @@ import {
   confirmDispatchPlan,
   createDispatchPlan,
   dispatchPlannedAssignmentMap,
+  dispatchPlannedOrderConflictRefs,
+  dispatchPlannedOrderRefs,
   getCurrentDispatchPlan,
   saveDispatchPlanSnapshot
 } from "./dispatch-plan-repository.js";
@@ -36,37 +38,8 @@ function countPlan(plan = {}) {
   };
 }
 
-function plannedOrderRefs(plan = {}) {
-  const orderById = new Map((plan.orders || []).map((order) => [String(order?.id || ""), order]));
-  const refs = new Set();
-  const add = (value) => {
-    const ref = String(value || "").trim();
-    if (ref) refs.add(ref);
-  };
-  const addOrder = (orderId) => {
-    add(orderId);
-    const order = orderById.get(String(orderId || ""));
-    if (!order || order.type === "CO") return;
-    add(order.originalOrderId);
-    for (const childId of order.childOrders || []) add(childId);
-    for (const child of order.childOrderDetails || []) {
-      add(child?.id);
-      add(child?.originalOrderId);
-    }
-  };
-  for (const truck of plan.trucks || []) {
-    for (const load of truck.loads || []) {
-      if (load.returnOnly) continue;
-      for (const stop of load.stops || []) {
-        if (stop?.type === "drop" && stop.orderId) addOrder(stop.orderId);
-      }
-    }
-  }
-  return refs;
-}
-
 async function findPlanDateConflicts(plan = {}) {
-  const currentRefs = plannedOrderRefs(plan);
+  const currentRefs = dispatchPlannedOrderRefs(plan);
   if (!currentRefs.size) return [];
   const result = await query(
     `SELECT p.id, p.plan_date::text AS plan_date, p.status, s.orders, s.trucks
@@ -78,9 +51,9 @@ async function findPlanDateConflicts(plan = {}) {
   );
   const conflicts = [];
   for (const row of result.rows) {
-    const otherRefs = plannedOrderRefs({ orders: row.orders || [], trucks: row.trucks || [] });
-    for (const ref of currentRefs) {
-      if (otherRefs.has(ref)) conflicts.push({ orderRef: ref, planId: String(row.id), planDate: row.plan_date });
+    const otherPlan = { orders: row.orders || [], trucks: row.trucks || [] };
+    for (const ref of dispatchPlannedOrderConflictRefs(plan, otherPlan)) {
+      conflicts.push({ orderRef: ref, planId: String(row.id), planDate: row.plan_date });
     }
   }
   return conflicts;
