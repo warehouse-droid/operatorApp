@@ -195,7 +195,7 @@
 }
 
 .smart-proposal-lines .smart-table {
-  min-width: 1260px;
+  min-width: 1420px;
 }
 
 .smart-proposal-lines [hidden] {
@@ -203,17 +203,42 @@
 }
 
 .smart-proposal-lines-one-detail-hidden .smart-table {
-  min-width: 1050px;
+  min-width: 1210px;
 }
 
 .smart-proposal-lines-compact .smart-table {
-  min-width: 900px;
+  min-width: 1060px;
 }
 
 .smart-proposal-lines-compact .smart-table th,
 .smart-proposal-lines-compact .smart-table td {
   padding-top: 5px;
   padding-bottom: 5px;
+}
+
+.smart-availability-summary {
+  display: grid;
+  min-width: 150px;
+  gap: 7px;
+}
+
+.smart-availability-summary span {
+  display: grid;
+  gap: 1px;
+}
+
+.smart-availability-summary small {
+  color: var(--smart-muted);
+  font-size: 9px;
+  font-weight: 800;
+  line-height: 1.25;
+}
+
+.smart-availability-summary strong {
+  color: var(--smart-navy);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .smart-manual-load-panel {

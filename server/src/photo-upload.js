@@ -176,6 +176,17 @@ export function isR2PhotoReference(value) {
   return String(value || "").startsWith("r2://");
 }
 
+export function isOperatorReturnPhotoForActor(value, actorId) {
+  const parts = normalizeR2Key(value).split("/");
+  return parts.length >= 7
+    && parts[0] === "operator"
+    && parts[1] === "operator-return-photo"
+    && /^\d{4}$/.test(parts[2])
+    && /^(0[1-9]|1[0-2])$/.test(parts[3])
+    && /^(0[1-9]|[12]\d|3[01])$/.test(parts[4])
+    && parts[5] === safePathSegment(actorId);
+}
+
 export function publicPhotoUploadConfig() {
   const settings = photoUploadSettings();
   return {
@@ -195,13 +206,25 @@ function buildKeyPrefix({ source, recordType, actor, metadata }) {
   const yyyy = String(date.getUTCFullYear());
   const mm = String(date.getUTCMonth() + 1).padStart(2, "0");
   const dd = String(date.getUTCDate()).padStart(2, "0");
+  const subject = metadata.orderRef || metadata.orderId || metadata.jobId || actor?.id || actor?.login || "general";
+  if (recordType === "operator-return-photo") {
+    return [
+      safePathSegment(source || "app"),
+      safePathSegment(recordType),
+      yyyy,
+      mm,
+      dd,
+      safePathSegment(actor?.id || actor?.login || "unknown"),
+      safePathSegment(subject)
+    ].filter(Boolean).join("/");
+  }
   return [
     safePathSegment(source || "app"),
     safePathSegment(recordType || "photo"),
     yyyy,
     mm,
     dd,
-    safePathSegment(metadata.orderRef || metadata.orderId || metadata.jobId || actor?.id || actor?.login || "general")
+    safePathSegment(subject)
   ].filter(Boolean).join("/");
 }
 

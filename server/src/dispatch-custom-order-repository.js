@@ -4,6 +4,7 @@ const MAX_REF_LENGTH = 100;
 const MAX_LOCATION_LENGTH = 500;
 const MAX_DETAILS_LENGTH = 5000;
 const MAX_WEIGHT_LBS = 1000000;
+const MAX_STOP_MINUTES = 1440;
 const UNSAFE_TEXT_CONTROL_CHARACTERS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const SAFE_REFERENCE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/#+-]*$/;
 
@@ -23,6 +24,15 @@ function requiredText(value, label, maxLength) {
     throw inputError(`${label} contains an unsupported control character.`);
   }
   return text;
+}
+
+function optionalStopMinutes(value) {
+  if (value === undefined || value === null || String(value).trim() === "") return null;
+  const minutes = Number(value);
+  if (!Number.isInteger(minutes) || minutes < 0 || minutes > MAX_STOP_MINUTES) {
+    throw inputError(`Destination stop time must be a whole number from 0 to ${MAX_STOP_MINUTES} minutes.`);
+  }
+  return minutes;
 }
 
 function customOrderInput(input = {}) {
@@ -54,12 +64,14 @@ function customOrderInput(input = {}) {
   if (weightLbs > MAX_WEIGHT_LBS) {
     throw inputError(`Weight must be ${MAX_WEIGHT_LBS.toLocaleString("en-CA")} lb or less.`);
   }
+  const stopMinutes = optionalStopMinutes(input.stopMinutes ?? input.stop_minutes);
   return {
     refNumber,
     pickupLocation,
     dropoffLocation,
     orderDetails,
-    weightLbs: Math.round(weightLbs * 1000) / 1000
+    weightLbs: Math.round(weightLbs * 1000) / 1000,
+    stopMinutes
   };
 }
 
@@ -71,6 +83,9 @@ function rowToCustomOrder(row = {}) {
     dropoffLocation: row.dropoff_location || "",
     orderDetails: row.order_details || "",
     weightLbs: Number(row.weight_lbs || 0),
+    stopMinutes: row.stop_minutes === null || row.stop_minutes === undefined
+      ? null
+      : Number(row.stop_minutes),
     status: row.status || "open",
     createdBy: row.created_by || "",
     updatedBy: row.updated_by || "",
@@ -188,8 +203,8 @@ export async function createDispatchCustomOrder(input = {}, actor = "") {
     const result = await query(
       `INSERT INTO dispatch_custom_orders (
          ref_number, pickup_location, dropoff_location, order_details,
-         weight_lbs, status, created_by, updated_by
-       ) VALUES ($1, $2, $3, $4, $5, 'open', $6, $6)
+         weight_lbs, stop_minutes, status, created_by, updated_by
+       ) VALUES ($1, $2, $3, $4, $5, $6, 'open', $7, $7)
        RETURNING *`,
       [
         normalized.refNumber,
@@ -197,6 +212,7 @@ export async function createDispatchCustomOrder(input = {}, actor = "") {
         normalized.dropoffLocation,
         normalized.orderDetails,
         normalized.weightLbs,
+        normalized.stopMinutes,
         String(actor || "")
       ]
     );
@@ -217,7 +233,8 @@ export async function updateDispatchCustomOrder(id, input = {}, actor = "") {
     pickupLocation: input.pickupLocation ?? input.pickup_location ?? current.pickupLocation,
     dropoffLocation: input.dropoffLocation ?? input.dropoff_location ?? current.dropoffLocation,
     orderDetails: input.orderDetails ?? input.order_details ?? current.orderDetails,
-    weightLbs: input.weightLbs ?? input.weight_lbs ?? current.weightLbs
+    weightLbs: input.weightLbs ?? input.weight_lbs ?? current.weightLbs,
+    stopMinutes: input.stopMinutes ?? input.stop_minutes ?? current.stopMinutes
   });
   const requestedRef = String(input.refNumber ?? input.ref_number ?? current.refNumber).trim();
   if (requestedRef.toLowerCase() !== current.refNumber.toLowerCase()) {
@@ -232,7 +249,8 @@ export async function updateDispatchCustomOrder(id, input = {}, actor = "") {
             dropoff_location = $3,
             order_details = $4,
             weight_lbs = $5,
-            updated_by = $6,
+            stop_minutes = $6,
+            updated_by = $7,
             updated_at = now()
       WHERE id = $1
         AND status = 'open'
@@ -243,6 +261,7 @@ export async function updateDispatchCustomOrder(id, input = {}, actor = "") {
       normalized.dropoffLocation,
       normalized.orderDetails,
       normalized.weightLbs,
+      normalized.stopMinutes,
       String(actor || "")
     ]
   );
@@ -331,6 +350,9 @@ export function dispatchOrderFromCustomOrder(customOrder = {}) {
     windowEnd: "",
     instructions: customOrder.orderDetails,
     notes: customOrder.orderDetails,
+    stopMinutes: customOrder.stopMinutes === null || customOrder.stopMinutes === undefined
+      ? null
+      : Number(customOrder.stopMinutes),
     pickupLocations: [pickupLocation],
     dropoffs: [],
     pallets: 0,
@@ -344,6 +366,9 @@ export function dispatchOrderFromCustomOrder(customOrder = {}) {
       custom_order_id: String(customOrder.id || ""),
       ref_number: customOrder.refNumber,
       status: customOrder.status,
+      stop_minutes: customOrder.stopMinutes === null || customOrder.stopMinutes === undefined
+        ? null
+        : Number(customOrder.stopMinutes),
       created_at: customOrder.createdAt,
       updated_at: customOrder.updatedAt
     },

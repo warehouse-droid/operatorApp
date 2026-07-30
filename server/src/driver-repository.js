@@ -37,10 +37,17 @@ function driverKey(value) {
   return String(value || "").trim().toLowerCase();
 }
 
-function normalizeSamsaraAccounts({ primaryUsername = "", secondaryUsername = "" } = {}) {
+function normalizeSamsaraAccounts(accounts = {}) {
+  const primaryUsername = accounts?.primaryUsername || "";
+  const secondaryUsername = accounts?.secondaryUsername || "";
+  const hasEnabledFlag = Object.hasOwn(accounts || {}, "enabled")
+    || Object.hasOwn(accounts || {}, "samsaraEnabled");
   return {
     primaryUsername: String(primaryUsername || "").trim(),
-    secondaryUsername: String(secondaryUsername || "").trim()
+    secondaryUsername: String(secondaryUsername || "").trim(),
+    enabled: hasEnabledFlag
+      ? accounts?.enabled === true || accounts?.samsaraEnabled === true
+      : true
   };
 }
 
@@ -1003,11 +1010,12 @@ async function clearUnconfirmedDvirIfNeeded(row) {
 
 export async function getDriverDayState(driverLogin, { samsaraUsername = "", samsaraAccounts = {} } = {}) {
   const normalizedSamsaraAccounts = samsaraAccountsFromLegacy(samsaraUsername, samsaraAccounts);
+  const samsaraEnabled = normalizedSamsaraAccounts.enabled === true;
   const assignment = await activeDriverAssignment(driverLogin);
   const plan = assignment?.plan || { id: null, planDate: todayLocalDate() };
   const initialTruck = assignment?.initialTruck || assignment?.truck || {};
   let row = await upsertDriverDayBase({ driverLogin, plan, truck: initialTruck, samsaraAccounts: normalizedSamsaraAccounts });
-  row = await clearUnconfirmedDvirIfNeeded(row);
+  if (samsaraEnabled) row = await clearUnconfirmedDvirIfNeeded(row);
   const jobs = assignment ? planJobsForDriver(plan, driverLogin) : [];
   const jobIds = jobs.map((job) => job.jobId);
   const completed = await completedJobIds(jobIds);
@@ -1037,16 +1045,18 @@ export async function getDriverDayState(driverLogin, { samsaraUsername = "", sam
       loadIds: [String(item.load.id || "")]
     });
   }
-  const switchAttentionResult = await query(
-    `SELECT job_id, from_truck_plate, to_truck_plate, switch_yard, parking_spot,
-            next_load_id, samsara_error, updated_at
-       FROM driver_truck_switch_records
-      WHERE driver_login = $1
-        AND plan_date = $2::date
-        AND status = 'attention'
-      ORDER BY updated_at DESC`,
-    [driverKey(driverLogin), plan?.planDate || todayLocalDate()]
-  ).catch(() => ({ rows: [] }));
+  const switchAttentionResult = samsaraEnabled
+    ? await query(
+        `SELECT job_id, from_truck_plate, to_truck_plate, switch_yard, parking_spot,
+                next_load_id, samsara_error, updated_at
+           FROM driver_truck_switch_records
+          WHERE driver_login = $1
+            AND plan_date = $2::date
+            AND status = 'attention'
+          ORDER BY updated_at DESC`,
+        [driverKey(driverLogin), plan?.planDate || todayLocalDate()]
+      ).catch(() => ({ rows: [] }))
+    : { rows: [] };
   return {
     planId: plan?.id || null,
     planDate: plan?.planDate || todayLocalDate(),
@@ -1067,11 +1077,18 @@ export async function getDriverDayState(driverLogin, { samsaraUsername = "", sam
       error: item.samsara_error,
       updatedAt: item.updated_at
     })),
+    samsaraEnabled,
     samsaraUsername: row.samsara_username || normalizedSamsaraAccounts.primaryUsername || "",
     samsaraSecondaryUsername: row.samsara_secondary_username || normalizedSamsaraAccounts.secondaryUsername || "",
     samsaraActiveAccount: row.samsara_active_account || "primary",
-    preDvirStatus: dvirStatus(row, "pre") === "complete" && isSamsaraDvirConfirmed(row, "pre") ? "complete" : "required",
-    postDvirStatus: dvirStatus(row, "post") === "complete" && isSamsaraDvirConfirmed(row, "post") ? "complete" : "required",
+    preDvirRequired: samsaraEnabled,
+    postDvirRequired: samsaraEnabled,
+    preDvirStatus: !samsaraEnabled
+      ? "complete"
+      : dvirStatus(row, "pre") === "complete" && isSamsaraDvirConfirmed(row, "pre") ? "complete" : "required",
+    postDvirStatus: !samsaraEnabled
+      ? "complete"
+      : dvirStatus(row, "post") === "complete" && isSamsaraDvirConfirmed(row, "post") ? "complete" : "required",
     preDvirCompletedAt: row.pre_dvir_completed_at || null,
     postDvirCompletedAt: row.post_dvir_completed_at || null,
     onDutyAt: row.on_duty_at || null,
@@ -1079,12 +1096,16 @@ export async function getDriverDayState(driverLogin, { samsaraUsername = "", sam
     primaryOffDutyAt: row.primary_off_duty_at || null,
     secondaryOnDutyAt: row.secondary_on_duty_at || null,
     secondaryOffDutyAt: row.secondary_off_duty_at || null,
-    samsaraOnDutyConfirmed: isSamsaraOnDutyConfirmed(row),
-    samsaraOffDutyConfirmed: isSamsaraOffDutyConfirmed(row),
-    samsaraPreDvirConfirmed: isSamsaraDvirConfirmed(row, "pre"),
-    samsaraPostDvirConfirmed: isSamsaraDvirConfirmed(row, "post"),
-    samsaraOnDutyError: row.samsara_on_duty_response?.error || row.samsara_on_duty_response?.clockError || "",
-    samsaraOffDutyError: row.samsara_off_duty_response?.error || row.samsara_off_duty_response?.clockError || "",
+    samsaraOnDutyConfirmed: !samsaraEnabled || isSamsaraOnDutyConfirmed(row),
+    samsaraOffDutyConfirmed: !samsaraEnabled || isSamsaraOffDutyConfirmed(row),
+    samsaraPreDvirConfirmed: !samsaraEnabled || isSamsaraDvirConfirmed(row, "pre"),
+    samsaraPostDvirConfirmed: !samsaraEnabled || isSamsaraDvirConfirmed(row, "post"),
+    samsaraOnDutyError: samsaraEnabled
+      ? row.samsara_on_duty_response?.error || row.samsara_on_duty_response?.clockError || ""
+      : "",
+    samsaraOffDutyError: samsaraEnabled
+      ? row.samsara_off_duty_response?.error || row.samsara_off_duty_response?.clockError || ""
+      : "",
     allJobsComplete,
     jobCount: jobs.length,
     completedJobCount: completed.size
@@ -1093,6 +1114,12 @@ export async function getDriverDayState(driverLogin, { samsaraUsername = "", sam
 
 export async function submitDriverDvir(driverLogin, { type = "pre", photoDataUrls = [], samsaraUsername = "", samsaraAccounts = {}, samsaraDvirAuthorId = "" } = {}) {
   const normalizedSamsaraAccounts = samsaraAccountsFromLegacy(samsaraUsername, samsaraAccounts);
+  if (!normalizedSamsaraAccounts.enabled) {
+    throw Object.assign(
+      new Error("Samsara and Driver PWA DVIR are disabled for this driver."),
+      { status: 409, code: "DRIVER_SAMSARA_DISABLED" }
+    );
+  }
   const assignment = await activeDriverAssignment(driverLogin);
   const plan = assignment?.plan || { id: null, planDate: todayLocalDate() };
   const initialTruck = assignment?.initialTruck || assignment?.truck || {};
@@ -1244,6 +1271,9 @@ export async function submitDriverDvir(driverLogin, { type = "pre", photoDataUrl
 
 export async function ensureDriverSamsaraDutyForJob(driverLogin, { samsaraUsername = "", samsaraAccounts = {}, job = null } = {}) {
   const normalizedSamsaraAccounts = samsaraAccountsFromLegacy(samsaraUsername, samsaraAccounts);
+  if (!normalizedSamsaraAccounts.enabled) {
+    return { switched: false, reason: "samsara_disabled", account: "" };
+  }
   const assignment = await activeDriverAssignment(driverLogin);
   if (!assignment) return { switched: false, reason: "no_assignment" };
   const plan = assignment.plan;
@@ -1342,7 +1372,17 @@ export async function ensureDriverSamsaraDutyForJob(driverLogin, { samsaraUserna
   };
 }
 
-export async function skipDriverDvirForTesting(driverLogin, { type = "pre", samsaraUsername = "" } = {}) {
+export async function skipDriverDvirForTesting(driverLogin, {
+  type = "pre",
+  samsaraUsername = "",
+  samsaraEnabled = true
+} = {}) {
+  if (samsaraEnabled !== true) {
+    throw Object.assign(
+      new Error("Driver PWA DVIR is disabled for this driver."),
+      { status: 409, code: "DRIVER_SAMSARA_DISABLED" }
+    );
+  }
   const assignment = await activeDriverAssignment(driverLogin);
   const plan = assignment?.plan || { id: null, planDate: todayLocalDate() };
   const initialTruck = assignment?.initialTruck || assignment?.truck || {};
@@ -2039,6 +2079,76 @@ async function writeTruckSwitchFailure(driverLogin, job, error) {
   );
 }
 
+async function completeDriverTruckSwitchLocally(driverLogin, job, dayRecordId) {
+  return withTransaction(async () => {
+    const switchResult = await query(
+      `INSERT INTO driver_truck_switch_records (
+         job_id, plan_id, plan_date, driver_login,
+         from_truck_id, from_truck_plate, to_truck_id, to_truck_plate,
+         switch_yard, parking_spot, next_load_id, planned_switch_minute,
+         status, samsara_response, samsara_error, confirmed_at, updated_at
+       ) VALUES (
+         $1, $2, $3::date, $4,
+         $5, $6, $7, $8,
+         $9, $10, $11, $12,
+         'complete', '{"disabled":true}'::jsonb, '', now(), now()
+       )
+       ON CONFLICT (job_id) DO UPDATE SET
+         status = 'complete',
+         samsara_username = '',
+         samsara_driver_id = '',
+         samsara_vehicle_id = '',
+         samsara_response = '{"disabled":true}'::jsonb,
+         samsara_error = '',
+         confirmed_at = now(),
+         updated_at = now()
+       RETURNING *`,
+      [
+        job.jobId,
+        job.planId || null,
+        job.planDate,
+        driverKey(driverLogin),
+        job.fromTruckId || "",
+        job.fromTruckPlate || "",
+        job.nextTruckId || job.truckId || "",
+        job.nextTruckPlate || job.truckPlate || "",
+        job.switchYard || "",
+        job.parkingSpot || "",
+        job.loadId || "",
+        job.plannedSwitchMinute
+      ]
+    );
+    const completedJob = await recordDriverJobPhotos(driverLogin, job.jobId, {
+      photoDataUrls: [],
+      job
+    });
+    await query(
+      `UPDATE driver_day_records
+          SET truck_id = $2,
+              truck_plate = $3,
+              current_truck_id = $2,
+              current_truck_plate = $3,
+              current_load_id = $4,
+              updated_at = now()
+        WHERE id = $1`,
+      [
+        dayRecordId,
+        job.nextTruckId || job.truckId || "",
+        job.nextTruckPlate || job.truckPlate || "",
+        job.loadId || ""
+      ]
+    );
+    return {
+      record: completedJob,
+      switchRecord: switchResult.rows[0],
+      samsaraAssignment: null,
+      samsaraDuty: null,
+      samsaraHandoff: { switched: false, reason: "samsara_disabled", account: "" },
+      samsaraDisabled: true
+    };
+  });
+}
+
 export async function confirmDriverTruckSwitch(driverLogin, job, { samsaraUsername = "", samsaraAccounts = {} } = {}) {
   if (!job || job.stopType !== "truck_switch") throw new Error("This is not an active truck-switch job.");
   const normalizedAccounts = samsaraAccountsFromLegacy(samsaraUsername, samsaraAccounts);
@@ -2046,6 +2156,9 @@ export async function confirmDriverTruckSwitch(driverLogin, job, { samsaraUserna
   if (!assignment || String(assignment.plan.id) !== String(job.planId)) throw new Error("The driver assignment changed. Refresh and try again.");
   const initialTruck = assignment.initialTruck || assignment.truck || {};
   let row = await upsertDriverDayBase({ driverLogin, plan: assignment.plan, truck: initialTruck, samsaraAccounts: normalizedAccounts });
+  if (!normalizedAccounts.enabled) {
+    return completeDriverTruckSwitchLocally(driverLogin, job, row.id);
+  }
   let samsaraHandoff = null;
   try {
     samsaraHandoff = await ensureDriverSamsaraDutyForJob(driverLogin, {

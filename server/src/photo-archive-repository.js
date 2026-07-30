@@ -23,7 +23,9 @@ const PHOTO_REFERENCE_TARGETS = [
   { table: "local_co_receipt_records", column: "photo_data_urls", kind: "jsonb" },
   { table: "driver_day_records", column: "pre_dvir_photo_data_urls", kind: "jsonb" },
   { table: "driver_day_records", column: "post_dvir_photo_data_urls", kind: "jsonb" },
-  { table: "driver_job_records", column: "photo_data_urls", kind: "jsonb" }
+  { table: "driver_job_records", column: "photo_data_urls", kind: "jsonb" },
+  { table: "return_drafts", column: "payload", kind: "jsonb_deep" },
+  { table: "return_photos", column: "photo_reference", kind: "text" }
 ];
 
 let activeArchiveRun = null;
@@ -100,7 +102,17 @@ export async function collectReferencedR2Keys({ includeTrackedPending = false } 
              FROM ${target.table}
             WHERE ${target.column} LIKE 'r2://%'`
         )
-      : await query(
+      : target.kind === "jsonb_deep"
+        ? await query(
+          `SELECT DISTINCT photo_value #>> '{}' AS photo_ref
+             FROM ${target.table}
+             CROSS JOIN LATERAL jsonb_path_query(
+               COALESCE(${target.column}, '{}'::jsonb),
+               '$.** ? (@.type() == "string")'
+             ) photo(photo_value)
+            WHERE photo_value #>> '{}' LIKE 'r2://%'`
+        )
+        : await query(
           `SELECT DISTINCT photo_ref
              FROM ${target.table}
              CROSS JOIN LATERAL jsonb_array_elements_text(

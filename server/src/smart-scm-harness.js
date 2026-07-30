@@ -4,8 +4,8 @@ import fs from "node:fs/promises";
 import { closeDb, query, withTransaction } from "./db.js";
 import { listSmartScmInputFiles } from "./smart-scm-import-repository.js";
 import { runSmartScmForecast, listSmartScmForecasts, smartScmCoverageFloor } from "./smart-scm-forecast-repository.js";
-import { consolidateCompatibleDrafts, getSmartScmPlanningRun, runSmartScmPlan, smartScmPackWholePalletLines, smartScmPhysicalPalletLines, smartScmProposalLineLoadWeightLbs, smartScmSourceTransferLimit, updateSmartScmProposal } from "./smart-scm-planning-repository.js";
-import { addSmartScmVendorAlternativeLine, listSmartScmNetSuitePoReviewLoads, listSmartScmVendorReplyLoads, removeSmartScmVendorAlternativeLine, searchSmartScmVendorAlternatives, stageSmartScmVendorReplyLoad } from "./smart-scm-vendor-repository.js";
+import { consolidateCompatibleDrafts, getSmartScmPlanningRun, runSmartScmPlan, smartScmConfirmationSourceTransferLimit, smartScmLineOverridesSourceStockFloor, smartScmPackWholePalletLines, smartScmPhysicalPalletLines, smartScmProposalLineLoadWeightLbs, smartScmSourceTransferLimit, updateSmartScmProposal } from "./smart-scm-planning-repository.js";
+import { addSmartScmVendorAlternativeLine, listSmartScmNetSuitePoReviewLoads, listSmartScmVendorReplyLoads, removeSmartScmNetSuitePoReviewLoad, removeSmartScmVendorAlternativeLine, searchSmartScmVendorAlternatives, stageSmartScmVendorReplyLoad } from "./smart-scm-vendor-repository.js";
 import { executeSmartScmPurchaseProposal } from "./smart-scm-purchase-service.js";
 import { createSimplePdf, leaseYardPrintJob, queueSmartScmPrintJob, queueYardPrinterTest, rotateYardPrinterToken, updateLeasedPrintJob, updateYardPrinter, yardPrintJobDocument } from "./smart-scm-print-repository.js";
 import { createSmartScmManualLoad, groupSmartScmProposals, recalculateSmartScmPoProposal, removeSmartScmProposalLine, smartScmAllocateProRata, splitSmartScmProposalLine, updateSmartScmProposalLine } from "./smart-scm-proposal-editor.js";
@@ -141,6 +141,70 @@ const reorderPointLimit = smartScmSourceTransferLimit({ availablePallets: 20, sa
 assert.equal(reorderPointLimit.maximumTransferablePallets, 8, "The higher reorder point must also remain protected.");
 const unavailableLimit = smartScmSourceTransferLimit({ availablePallets: 1, safetyStockPallets: 4, reorderPointPallets: 6 });
 assert.equal(unavailableLimit.maximumTransferablePallets, 0, "A yard below its protected floor cannot source a TO.");
+
+assert.equal(
+  smartScmLineOverridesSourceStockFloor({ reason: { manuallyAdded: true } }),
+  true,
+  "A manually added proposal line must override the source safety/ROP floor."
+);
+assert.equal(
+  smartScmLineOverridesSourceStockFloor({ reason: { manuallyAdjusted: true } }),
+  true,
+  "A quantity saved by the user must override the source safety/ROP floor."
+);
+assert.equal(
+  smartScmLineOverridesSourceStockFloor({ reason: { manualLoad: true } }),
+  true,
+  "A legacy manual-load marker must continue to override the source safety/ROP floor."
+);
+assert.equal(
+  smartScmLineOverridesSourceStockFloor({ reason: { manualSourceFloorOverride: true } }),
+  true,
+  "An explicit manual source-floor override marker must be honored."
+);
+assert.equal(
+  smartScmLineOverridesSourceStockFloor({
+    added_source: "manual",
+    reason: { manuallyGrouped: true }
+  }),
+  false,
+  "A grouped replacement line must not override source protection merely because its storage source is manual."
+);
+assert.equal(
+  smartScmLineOverridesSourceStockFloor({
+    addedSource: "manual",
+    reason: {}
+  }),
+  false,
+  "The public addedSource field alone must not be treated as a user quantity override."
+);
+
+const automaticConfirmationLimit = smartScmConfirmationSourceTransferLimit({
+  availablePallets: 12.08,
+  safetyStockPallets: 9,
+  reorderPointPallets: 7,
+  manualOverride: false
+});
+assert.equal(
+  automaticConfirmationLimit.maximumTransferablePallets,
+  3,
+  "An automatic TO must preserve the higher source safety/ROP floor."
+);
+const manualConfirmationLimit = smartScmConfirmationSourceTransferLimit({
+  availablePallets: 12.08,
+  safetyStockPallets: 9,
+  reorderPointPallets: 7,
+  manualOverride: true
+});
+assert.equal(
+  manualConfirmationLimit.maximumTransferablePallets,
+  12,
+  "A manual quantity may consume protected stock up to the whole-pallet quantity actually available."
+);
+assert(
+  13 > manualConfirmationLimit.maximumTransferablePallets,
+  "A manual override must still reject a quantity above actual unreserved source inventory."
+);
 
 const purchasePayload = buildSmartScmPurchaseOrderRestPayload({
   proposal: {
@@ -461,6 +525,24 @@ assert(visiblePhysicalPallets.every((line) => line.officialLineItem && line.subm
       assert.equal(staged.review.palletLines.reduce((sum, line) => sum + line.confirmedPallets, 0), staged.review.totalPallets);
       const pendingReviews = await listSmartScmNetSuitePoReviewLoads({ search: String(staged.reviewProposalId), view: "pending", limit: 50 });
       assert(pendingReviews.some((load) => load.id === staged.reviewProposalId), "Staged PO must appear in NetSuite PO review.");
+      const removedReview = await removeSmartScmNetSuitePoReviewLoad(staged.reviewProposalId, null);
+      assert.equal(removedReview.removed, true);
+      assert.equal(removedReview.review.status, "cancelled");
+      assert.equal(removedReview.review.poExecutionStatus, "removed");
+      assert.equal(removedReview.review.lines.length, staged.review.lines.length, "Removing a staged PO must retain its reviewed lines for audit.");
+      const pendingAfterRemoval = await listSmartScmNetSuitePoReviewLoads({ search: String(staged.reviewProposalId), view: "pending", limit: 50 });
+      assert(!pendingAfterRemoval.some((load) => load.id === staged.reviewProposalId), "Removed staged PO must leave the pending-insertion list.");
+      const removedHistory = await listSmartScmNetSuitePoReviewLoads({ search: String(staged.reviewProposalId), view: "removed", limit: 50 });
+      assert(removedHistory.some((load) => load.id === staged.reviewProposalId), "Removed staged PO must remain visible in audit history.");
+      await query(
+        `UPDATE scm_smart_proposals
+            SET status = 'confirmed',
+                vendor_response_status = 'confirmed',
+                po_execution_status = 'idle',
+                updated_at = now()
+          WHERE id = $1`,
+        [staged.reviewProposalId]
+      );
       const execution = await executeSmartScmPurchaseProposal(staged.reviewProposalId, null);
       assert.equal(execution.purchaseOrderRef, "MOCK-PO-" + staged.reviewProposalId);
       const completed = (await listSmartScmNetSuitePoReviewLoads({ search: String(staged.reviewProposalId), view: "completed", limit: 50 }))

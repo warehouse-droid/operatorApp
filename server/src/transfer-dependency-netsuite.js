@@ -21,6 +21,59 @@ export function transferDependencyMemoMarker(batchId, proposalId) {
   return `MBBS dependency batch ${batch} proposal ${proposal}`;
 }
 
+export function smartScmTransferOrderMemoMarker(proposalId) {
+  const proposal = Number(proposalId);
+  if (!Number.isInteger(proposal) || proposal <= 0) return "";
+  return `MBBS-SCM:${proposal}`;
+}
+
+export function selectSmartScmMarkerTransferOrder(rows = [], {
+  proposalId,
+  sourceLocationId = null,
+  destinationLocationId = null
+} = {}) {
+  const matches = Array.isArray(rows) ? rows : [];
+  if (matches.length > 1) {
+    const error = Object.assign(
+      new Error(`More than one NetSuite Transfer Order uses Smart SCM marker ${smartScmTransferOrderMemoMarker(proposalId)}. Reconcile the duplicates before retrying.`),
+      { smartScmAttention: true }
+    );
+    error.markerMatches = matches.map((row) => ({
+      id: Number(row.id) || null,
+      tranid: row.tranid || null
+    }));
+    throw error;
+  }
+  if (!matches.length) return null;
+  const match = matches[0];
+  const id = Number(match.id);
+  if (!Number.isInteger(id) || id <= 0) {
+    throw Object.assign(
+      new Error(`NetSuite returned an invalid TO ID for Smart SCM marker ${smartScmTransferOrderMemoMarker(proposalId)}.`),
+      { smartScmAttention: true }
+    );
+  }
+  const expectedSource = Number(sourceLocationId);
+  const actualSource = Number(match.source_location_id ?? match.sourceLocationId);
+  const expectedDestination = Number(destinationLocationId);
+  const actualDestination = Number(match.destination_location_id ?? match.destinationLocationId);
+  if (Number.isInteger(expectedSource) && expectedSource > 0
+      && Number.isInteger(actualSource) && actualSource > 0
+      && actualSource !== expectedSource) {
+    throw Object.assign(new Error("The Smart SCM TO marker exists under a different NetSuite source location."), {
+      smartScmAttention: true
+    });
+  }
+  if (Number.isInteger(expectedDestination) && expectedDestination > 0
+      && Number.isInteger(actualDestination) && actualDestination > 0
+      && actualDestination !== expectedDestination) {
+    throw Object.assign(new Error("The Smart SCM TO marker exists under a different NetSuite destination location."), {
+      smartScmAttention: true
+    });
+  }
+  return { ...match, id };
+}
+
 export function buildTransferDependencyRestPayload({ proposal, batch, locations }) {
   const palletItemId = Number(proposal.palletItemId);
   const materialItems = (proposal.lines || [])

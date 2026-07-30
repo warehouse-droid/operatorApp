@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import { query, withTransaction } from "./db.js";
 import { writeAudit } from "./auth-repository.js";
 import { getSmartScmPlanningRun, getSmartScmProposal, smartScmPackWholePalletLines,
-  smartScmNormalizePalletQuantityOverrides, smartScmPalletLoadWeightLbs, smartScmPhysicalPalletLines, smartScmProposalLineLoadWeightLbs } from "./smart-scm-planning-repository.js";
+  smartScmLineOverridesSourceStockFloor, smartScmNormalizePalletQuantityOverrides,
+  smartScmPalletLoadWeightLbs, smartScmPhysicalPalletLines, smartScmProposalLineLoadWeightLbs } from "./smart-scm-planning-repository.js";
 import { getSmartScmRouteRule } from "./smart-scm-route-repository.js";
 
 const EPSILON = 0.000001;
@@ -110,8 +111,11 @@ function combineLines(lines, next) {
   }
   existing.urgent = Boolean(existing.urgent || next.urgent);
   existing.provisional = Boolean(existing.provisional || next.provisional);
+  const manualSourceFloorOverride = smartScmLineOverridesSourceStockFloor(existing)
+    || smartScmLineOverridesSourceStockFloor(next);
   existing.reason = {
     ...(existing.reason || {}),
+    ...(manualSourceFloorOverride ? { manualSourceFloorOverride: true } : {}),
     urgent: existing.urgent,
     provisional: existing.provisional
   };
@@ -402,13 +406,13 @@ async function recordRevision(runId, reason, diff, operatorId) {
 async function insertGroupedDraft(runId, draft, { manuallyGrouped = true } = {}) {
   const proposal = await query(
     `INSERT INTO scm_smart_proposals (
-       run_id, proposal_key, proposal_type, phase, source_kind, source_location_id, source_name,
+       run_id, proposal_key, proposal_type, phase, source_kind, source_location_id, source_vendor_yard_id, source_name,
        destination_location_id, destination_name, vendor, plant, status, urgent, provisional,
        total_pallets, total_weight_lbs, utilization, memo, route_stops, pallet_quantity_overrides, manually_grouped
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19::jsonb,$20::jsonb,$21)
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20::jsonb,$21::jsonb,$22)
      RETURNING id`,
     [runId, draft.proposalKey, draft.proposalType, draft.phase, draft.sourceKind, draft.sourceLocationId,
-      draft.sourceName, draft.destinationLocationId, draft.destinationName, draft.vendor, draft.plant,
+      draft.sourceVendorYardId, draft.sourceName, draft.destinationLocationId, draft.destinationName, draft.vendor, draft.plant,
       draft.status, draft.urgent, draft.provisional, draft.totalPallets, draft.totalWeight,
       draft.utilization, draft.memo, JSON.stringify(draft.routeStops),
       JSON.stringify(smartScmNormalizePalletQuantityOverrides(draft.palletQuantityOverrides)), Boolean(manuallyGrouped)]
@@ -457,10 +461,13 @@ export async function groupSmartScmProposals(proposalIds = [], operatorId = null
         throw Object.assign(new Error("TO loads can be grouped only when source and destination yards are the same."), { status: 409 });
       }
     } else {
-      const pickup = normalized(first.plant || first.source_name);
+      const firstVendorYardId = first.source_vendor_yard_id === null ? null : Number(first.source_vendor_yard_id);
       const vendor = normalized(first.vendor);
-      if (selected.some((proposal) => normalized(proposal.plant || proposal.source_name) !== pickup
-        || normalized(proposal.vendor) !== vendor)) {
+      const mismatchedVendorYard = firstVendorYardId
+        ? selected.some((proposal) => Number(proposal.source_vendor_yard_id) !== firstVendorYardId)
+        : selected.some((proposal) => proposal.source_vendor_yard_id !== null
+          || normalized(proposal.plant || proposal.source_name) !== normalized(first.plant || first.source_name));
+      if (mismatchedVendorYard || selected.some((proposal) => normalized(proposal.vendor) !== vendor)) {
         throw Object.assign(new Error("PO loads can be grouped only when they use the same vendor and pickup point."), { status: 409 });
       }
       const vendors = await query(
@@ -514,6 +521,7 @@ export async function groupSmartScmProposals(proposalIds = [], operatorId = null
         phase: first.phase,
         sourceKind: first.source_kind,
         sourceLocationId: first.source_location_id,
+        sourceVendorYardId: first.source_vendor_yard_id,
         sourceName: first.source_name,
         destinationLocationId: routeStops[0].locationId,
         destinationName: routeStops[0].name,
@@ -610,6 +618,7 @@ export async function recalculateSmartScmPoProposal(proposalId, operatorId = nul
         phase: proposal.phase,
         sourceKind: proposal.source_kind,
         sourceLocationId: proposal.source_location_id,
+        sourceVendorYardId: proposal.source_vendor_yard_id,
         sourceName: proposal.source_name,
         destinationLocationId: routeStops[0].locationId,
         destinationName: routeStops[0].name,
@@ -652,7 +661,13 @@ async function itemPolicy(itemId, destinationLocationId) {
     `SELECT item.item_id, item.item_name, item.item_description, item.stock_unit, item.vendor_id,
             COALESCE(NULLIF(item.vendor, ''), NULLIF(policy.vendor, '')) AS vendor,
             policy.vendor_yard_id,
-            COALESCE(NULLIF(policy.vendor_yard, ''), NULLIF(policy.plant, ''), NULLIF(item.vendor, ''), NULLIF(policy.vendor, '')) AS vendor_yard,
+            COALESCE(
+              NULLIF(BTRIM(vendor_yard.yard), ''),
+              NULLIF(BTRIM(policy.vendor_yard), ''),
+              NULLIF(BTRIM(policy.plant), ''),
+              NULLIF(BTRIM(item.vendor), ''),
+              NULLIF(BTRIM(policy.vendor), '')
+            ) AS vendor_yard,
             policy.plant,
             COALESCE(item.to_plt, policy.to_plt) AS to_plt,
             COALESCE(item.to_lyr, policy.to_lyr) AS to_lyr,
@@ -663,6 +678,7 @@ async function itemPolicy(itemId, destinationLocationId) {
        FROM inventory_items item
        JOIN scm_smart_item_policies policy ON policy.item_id = item.item_id
        JOIN scm_smart_item_yard_policies yard ON yard.item_id = item.item_id AND yard.location_id = $2 AND yard.eligible = true
+       LEFT JOIN dispatch_vendor_yards vendor_yard ON vendor_yard.id = policy.vendor_yard_id
       WHERE item.item_id = $1 AND policy.planning_enabled = true AND policy.inactive = false AND policy.discontinued = false`,
     [Number(itemId), Number(destinationLocationId)]
   );
@@ -742,7 +758,7 @@ export async function searchSmartScmManualLoadItems({
   }
   const params = [destination.locationId, `%${text(search)}%`, Math.min(30, Math.max(1, Number(limit) || 12))];
   let compatibilityClause = `AND item.vendor_id IS NOT NULL
-    AND COALESCE(NULLIF(policy.vendor_yard, ''), NULLIF(policy.plant, ''),
+    AND COALESCE(NULLIF(vendor_yard.yard, ''), NULLIF(policy.vendor_yard, ''), NULLIF(policy.plant, ''),
                  NULLIF(item.vendor, ''), NULLIF(policy.vendor, '')) IS NOT NULL`;
   if (proposalType === "TO") {
     params.push(source.locationId);
@@ -754,7 +770,8 @@ export async function searchSmartScmManualLoadItems({
   const result = await query(
     `SELECT item.item_id, item.item_name, item.item_description, item.stock_unit, item.vendor_id,
             COALESCE(NULLIF(item.vendor, ''), NULLIF(policy.vendor, '')) AS vendor,
-            COALESCE(NULLIF(policy.vendor_yard, ''), NULLIF(policy.plant, ''), NULLIF(item.vendor, ''), NULLIF(policy.vendor, '')) AS source_name,
+            policy.vendor_yard_id,
+            COALESCE(NULLIF(BTRIM(vendor_yard.yard), ''), NULLIF(BTRIM(policy.vendor_yard), ''), NULLIF(BTRIM(policy.plant), ''), NULLIF(BTRIM(item.vendor), ''), NULLIF(BTRIM(policy.vendor), '')) AS source_name,
             COALESCE(item.to_plt, policy.to_plt) AS to_plt,
             CASE WHEN COALESCE(item.item_weight, 0) > 0 AND COALESCE(item.to_plt, policy.to_plt, 0) > 0
                  THEN item.item_weight * COALESCE(item.to_plt, policy.to_plt) ELSE policy.pallet_weight_lbs END AS pallet_weight_lbs
@@ -762,6 +779,7 @@ export async function searchSmartScmManualLoadItems({
        JOIN scm_smart_item_policies policy ON policy.item_id = item.item_id
        JOIN scm_smart_item_yard_policies yard
          ON yard.item_id = item.item_id AND yard.location_id = $1 AND yard.eligible = true
+       LEFT JOIN dispatch_vendor_yards vendor_yard ON vendor_yard.id = policy.vendor_yard_id
       WHERE policy.planning_enabled = true AND policy.inactive = false AND policy.discontinued = false
         AND COALESCE(item.to_plt, policy.to_plt, 0) > 0
         AND (CASE WHEN COALESCE(item.item_weight, 0) > 0 AND COALESCE(item.to_plt, policy.to_plt, 0) > 0
@@ -778,6 +796,7 @@ export async function searchSmartScmManualLoadItems({
     itemDescription: row.item_description,
     vendorId: row.vendor_id === null ? null : Number(row.vendor_id),
     vendor: row.vendor,
+    sourceVendorYardId: row.vendor_yard_id === null ? null : Number(row.vendor_yard_id),
     sourceName: proposalType === "TO" ? source.code : row.source_name,
     unit: row.stock_unit,
     toPlt: positive(row.to_plt),
@@ -841,6 +860,7 @@ export async function createSmartScmManualLoad(runId, values = {}, operatorId = 
       actualDestinationYard: destination.code,
       manuallyAdded: true,
       manualLoad: true,
+      manualSourceFloorOverride: proposalType === "TO",
       physicalPalletWeightLbs
     };
     const line = {
@@ -873,6 +893,7 @@ export async function createSmartScmManualLoad(runId, values = {}, operatorId = 
       phase: proposalType === "PO" ? "direct_vendor" : "internal_transfer",
       sourceKind: proposalType === "PO" ? "vendor" : "yard",
       sourceLocationId: proposalType === "TO" ? source.locationId : null,
+      sourceVendorYardId: proposalType === "PO" ? item.vendor_yard_id : null,
       sourceName,
       destinationLocationId: destination.locationId,
       destinationName: destination.code,
@@ -934,6 +955,10 @@ export async function searchSmartScmProposalItems(proposalId, { search = "", des
     );
     params.push(Number(vendor.rows[0]?.vendor_id || 0));
     vendorClause = `AND item.vendor_id = $${params.length}`;
+    if (proposal.source_vendor_yard_id !== null) {
+      params.push(Number(proposal.source_vendor_yard_id));
+      vendorClause += ` AND policy.vendor_yard_id = $${params.length}`;
+    }
   }
   const result = await query(
     `SELECT item.item_id, item.item_name, item.item_description, item.vendor, item.stock_unit,
@@ -976,7 +1001,13 @@ export async function addSmartScmProposalLine(proposalId, values = {}, operatorI
     if (toPlt <= EPSILON || palletWeight <= EPSILON) {
       throw Object.assign(new Error("The selected item needs a pallet conversion and pallet weight."), { status: 409 });
     }
-    if (proposal.proposal_type === "PO") await assertSamePoVendor(id, item.vendor_id);
+    if (proposal.proposal_type === "PO") {
+      await assertSamePoVendor(id, item.vendor_id);
+      if (proposal.source_vendor_yard_id !== null
+        && Number(item.vendor_yard_id) !== Number(proposal.source_vendor_yard_id)) {
+        throw Object.assign(new Error("This item uses a different vendor pickup yard from the selected PO load."), { status: 409 });
+      }
+    }
     if (proposal.proposal_type === "TO") {
       const sourcePolicy = await itemPolicy(itemId, proposal.source_location_id);
       if (!sourcePolicy) throw Object.assign(new Error("This item is not enabled at the TO source yard."), { status: 409 });
@@ -1011,6 +1042,7 @@ export async function addSmartScmProposalLine(proposalId, values = {}, operatorI
       destinationAvailablePallets: destinationInventory.availablePallets,
       destinationExpectedAvailablePallets: destinationInventory.expectedAvailablePallets,
       manuallyAdded: true,
+      manualSourceFloorOverride: proposal.proposal_type === "TO",
       physicalPalletWeightLbs
     };
     await query(
@@ -1067,7 +1099,11 @@ export async function updateSmartScmProposalLine(proposalId, lineId, values = {}
     let toPcs = positive(line.to_pcs);
     let palletWeight = positive(line.pallet_weight_lbs);
     let unit = line.unit;
-    let reason = { ...(line.reason || {}), manuallyAdjusted: true };
+    let reason = {
+      ...(line.reason || {}),
+      manuallyAdjusted: true,
+      ...(proposal.proposal_type === "TO" ? { manualSourceFloorOverride: true } : {})
+    };
     if (proposal.proposal_type === "PO") {
       const yard = YARD_BY_ID.get(destinationLocationId);
       const policy = await itemPolicy(line.item_id, destinationLocationId);
@@ -1253,6 +1289,7 @@ export async function splitSmartScmProposalLine(proposalId, lineId, _values = {}
       phase: proposal.phase,
       sourceKind: proposal.source_kind,
       sourceLocationId: proposal.source_location_id,
+      sourceVendorYardId: proposal.source_vendor_yard_id,
       sourceName: proposal.source_name,
       destinationLocationId: Number(line.destination_location_id),
       destinationName: line.destination_name,

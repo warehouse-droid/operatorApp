@@ -171,6 +171,10 @@ function smartProposalDestinationCalculation(proposal, line, movementLabel = "pr
 function smartProposalSourceCalculation(proposal, line) {
   const reason = line.reason || {};
   const proposed = smartReasonNumber(line, "proposedPallets") ?? 0;
+  const manualSourceFloorOverride = reason.manualSourceFloorOverride === true
+    || reason.manuallyAdjusted === true
+    || reason.manuallyAdded === true
+    || reason.manualLoad === true;
   const sourceAvailable = smartReasonNumber(reason, "sourceAvailablePallets");
   const sourceSafety = smartReasonNumber(reason, "sourceSafetyStockPallets");
   const sourceRop = smartReasonNumber(reason, "sourceReorderPointPallets");
@@ -184,7 +188,11 @@ function smartProposalSourceCalculation(proposal, line) {
   const calculatedMaximum = sourceAvailable !== null && calculatedProtectedFloor !== null
     ? Math.floor(Math.max(0, sourceAvailable - calculatedProtectedFloor) + 0.000001)
     : null;
-  const maximumTransferable = calculatedMaximum ?? storedMaximum;
+  const policyMaximumTransferable = calculatedMaximum ?? storedMaximum;
+  const usesActualAvailabilityLimit = manualSourceFloorOverride && sourceAvailable !== null;
+  const maximumTransferable = usesActualAvailabilityLimit
+    ? Math.floor(Math.max(0, sourceAvailable) + 0.000001)
+    : policyMaximumTransferable;
   const sourceAfterLine = sourceAvailable === null ? null : sourceAvailable - proposed;
   const hasSourceFormula = sourceAvailable !== null && sourceSafety !== null && sourceRop !== null
     && calculatedProtectedFloor !== null && calculatedMaximum !== null;
@@ -209,11 +217,13 @@ function smartProposalSourceCalculation(proposal, line) {
     ${hasSourceFormula ? `<span>Safety stock: <strong>${smartNumber(sourceSafety, 2)} PLT</strong> · ROP: <strong>${smartNumber(sourceRop, 2)} PLT</strong></span>
     <small>Protected floor = max(${smartNumber(sourceSafety, 2)} safety stock, ${smartNumber(sourceRop, 2)} ROP) = ${smartNumber(calculatedProtectedFloor, 2)} PLT</small>
     <small>Maximum transferable = floor(max(0, ${smartNumber(sourceAvailable, 2)} available − ${smartNumber(calculatedProtectedFloor, 2)} protected)) = ${smartNumber(calculatedMaximum, 2)} PLT</small>`
-      : maximumTransferable !== null ? `<small>Captured source transfer limit: ${smartNumber(maximumTransferable, 2)} PLT; formula inputs are unavailable.</small>` : ""}
+      : policyMaximumTransferable !== null ? `<small>Captured source transfer limit: ${smartNumber(policyMaximumTransferable, 2)} PLT; formula inputs are unavailable.</small>` : ""}
+    ${manualSourceFloorOverride ? `<span class="smart-replenishment-equation">User-entered quantity overrides the safety stock / ROP floor; actual unreserved source stock remains the limit.</span>` : ""}
+    ${usesActualAvailabilityLimit && policyMaximumTransferable === null ? `<span class="smart-replenishment-equation">Source safety/ROP calculation was not captured for this manual or legacy line.</span>` : ""}
     ${sourceSnapshotMismatch ? `<span class="smart-replenishment-equation"><strong>Saved source-limit fields are inconsistent; refresh and replan before confirmation.</strong></span>` : ""}
     ${withinLimit === null
       ? `<span class="smart-replenishment-equation">Source safety/ROP calculation was not captured for this manual or legacy line.</span>`
-      : `<span class="smart-replenishment-equation">${smartNumber(proposed, 2)} PLT transfer ≤ ${smartNumber(maximumTransferable, 2)} PLT ${hasSourceFormula ? "calculated" : "captured"} limit → <strong>${withinLimit ? "within source limit" : "exceeds source limit; refresh and replan"}</strong></span>`}
+      : `<span class="smart-replenishment-equation">${smartNumber(proposed, 2)} PLT ${usesActualAvailabilityLimit ? "user-entered transfer" : "transfer"} ≤ ${smartNumber(maximumTransferable, 2)} PLT ${usesActualAvailabilityLimit ? "actual available" : hasSourceFormula ? "calculated" : "captured"} limit → <strong>${withinLimit ? "within source limit" : usesActualAvailabilityLimit ? "exceeds actual source availability" : "exceeds source limit; refresh and replan"}</strong></span>`}
     <span>Source after this TO line: <strong>${smartOptionalNumber(sourceAfterLine, 2)} PLT</strong></span>
   </div>`;
 }
@@ -221,6 +231,49 @@ function smartProposalSourceCalculation(proposal, line) {
 function smartProposalInventory(proposal, line) {
   const destination = smartProposalDestinationCalculation(proposal, line, proposal.proposalType === "TO" ? "TO line" : "proposal");
   return `<div class="smart-inventory-context smart-replenishment-calculation">${proposal.proposalType === "TO" ? smartProposalSourceCalculation(proposal, line) : ""}${destination}</div>`;
+}
+
+function smartProposalDestinationAvailablePallets(line) {
+  const reason = line.reason || {};
+  const captured = smartReasonNumber(reason, "destinationAvailablePallets")
+    ?? smartReasonNumber(reason, "availablePallets");
+  if (captured !== null) return captured;
+  const toPlt = smartReasonNumber(line, "toPlt");
+  const available = smartReasonNumber(reason, "quantityAvailable");
+  const reserved = smartReasonNumber(reason, "quantityReservedOutbound") ?? 0;
+  if (toPlt === null || toPlt <= 0 || available === null) return null;
+  return Math.max(0, available - reserved) / toPlt;
+}
+
+function smartProposalExpectedInventoryPallets(line) {
+  const reason = line.reason || {};
+  const toPlt = smartReasonNumber(line, "toPlt");
+  const available = smartReasonNumber(reason, "quantityAvailable");
+  const onOrder = smartReasonNumber(reason, "quantityOnOrder");
+  const backordered = smartReasonNumber(reason, "quantityBackordered");
+  if (toPlt !== null && toPlt > 0 && available !== null && onOrder !== null && backordered !== null) {
+    return (available + onOrder - backordered) / toPlt;
+  }
+  return smartReasonNumber(reason, "destinationExpectedAvailablePallets");
+}
+
+function smartProposalAvailability(proposal, line) {
+  const reason = line.reason || {};
+  const destinationName = reason.actualDestinationYard || line.destinationName || proposal.destinationName || "Destination";
+  const destinationAvailable = smartProposalDestinationAvailablePallets(line);
+  if (proposal.proposalType === "TO") {
+    const sourceName = proposal.sourceName || "Source";
+    const sourceAvailable = smartReasonNumber(reason, "sourceAvailablePallets");
+    return `<div class="smart-availability-summary">
+      <span><small>${smartEscape(sourceName)} source available</small><strong>${smartOptionalNumber(sourceAvailable, 2)} PLT</strong></span>
+      <span><small>${smartEscape(destinationName)} destination available</small><strong>${smartOptionalNumber(destinationAvailable, 2)} PLT</strong></span>
+    </div>`;
+  }
+  const expected = smartProposalExpectedInventoryPallets(line);
+  return `<div class="smart-availability-summary">
+    <span><small>${smartEscape(destinationName)} available</small><strong>${smartOptionalNumber(destinationAvailable, 2)} PLT</strong></span>
+    <span><small>Expected inventory · AA + OO − BO</small><strong>${smartOptionalNumber(expected, 2)} PLT</strong></span>
+  </div>`;
 }
 
 function smartProposalDecisionEvidence(line) {
@@ -268,7 +321,7 @@ function smartProposalDecisionEvidence(line) {
 function smartProposalColumnControls() {
   return `<fieldset class="smart-proposal-column-controls">
     <legend>Show columns</legend>
-    <label><input data-smart-plan-detail="inventory" type="checkbox" ${smartState.planShowInventory ? "checked" : ""} /><span>Inventory</span></label>
+    <label><input data-smart-plan-detail="inventory" type="checkbox" ${smartState.planShowInventory ? "checked" : ""} /><span>Inventory calculation</span></label>
     <label><input data-smart-plan-detail="decision-evidence" type="checkbox" ${smartState.planShowDecisionEvidence ? "checked" : ""} /><span>Decision evidence</span></label>
   </fieldset>`;
 }
@@ -327,6 +380,7 @@ function smartProposalLineRow(proposal, line, editable) {
     <td>${editable ? `<div class="smart-line-quantity"><input data-smart-proposal-pallets type="number" min="1" step="1" value="${smartEscape(Math.max(1, Math.round(line.proposedPallets)))}" /><span>PLT</span><button class="smart-button" data-smart-action="save-proposal-line" data-proposal-id="${proposal.id}" data-line-id="${line.id}" type="button">Save</button>${Number.isInteger(Number(line.proposedPallets)) && Number(line.proposedPallets) > 0 ? `<button class="smart-button" data-smart-action="split-proposal-line" data-proposal-id="${proposal.id}" data-line-id="${line.id}" data-current-pallets="${line.proposedPallets}" type="button">Split to load</button>` : ""}<button class="smart-button danger" data-smart-action="remove-proposal-line" data-proposal-id="${proposal.id}" data-line-id="${line.id}" type="button">Remove</button></div>` : `<strong>${smartNumber(line.proposedPallets, 0)} PLT</strong>`}</td>
     <td class="numeric">${smartNumber(line.salesQuantity, 3)} ${smartEscape(line.unit || "UOM")}</td>
     <td class="numeric">${smartNumber(line.lineWeightLbs, 0)} lb</td>
+    <td data-smart-plan-column="availability">${smartProposalAvailability(proposal, line)}</td>
     <td data-smart-plan-column="inventory"${inventoryHidden}>${smartProposalInventory(proposal, line)}</td>
     <td data-smart-plan-column="decision-evidence"${evidenceHidden}>${smartCoverageEvidence(line)}${smartProposalDecisionEvidence(line)}</td>
   </tr>`;
@@ -347,6 +401,7 @@ function smartPhysicalPalletLineRow(proposal, line, editable) {
     <td>${editable ? `<div class="smart-line-quantity"><input data-smart-pallet-quantity type="number" min="0" step="0.01" value="${smartEscape(quantity)}" aria-label="Official PALLET quantity for ${smartEscape(line.destinationName || "destination")}" /><span>${smartEscape(unit)}</span><button class="smart-button" data-smart-action="save-pallet-line" data-proposal-id="${proposal.id}" data-destination-location-id="${line.destinationLocationId}" type="button">Save</button>${line.overridden ? `<button class="smart-button" data-smart-action="reset-pallet-line" data-proposal-id="${proposal.id}" data-destination-location-id="${line.destinationLocationId}" type="button">Reset auto</button>` : ""}</div>` : `<strong>${smartNumber(quantity, 2)} ${smartEscape(unit)}</strong><div class="smart-help">${line.overridden ? "Manual override" : "Automatic"}</div>`}</td>
     <td class="numeric">${smartNumber(quantity, 2)} ${smartEscape(unit)}</td>
     <td class="numeric">${itemWeight > 0 ? `<strong>${smartNumber(lineWeight, 0)} lb</strong><div class="smart-help">${smartNumber(itemWeight, 0)} lb / ${smartEscape(unit)} · NetSuite</div>` : `<span class="smart-help">NetSuite weight unavailable</span>`}</td>
+    <td data-smart-plan-column="availability"><span class="smart-help">Ancillary packaging item</span></td>
     <td data-smart-plan-column="inventory"${inventoryHidden}><span class="smart-help">Physical packaging item; its weight is included, but it does not add another PLT to the load count.</span></td>
     <td data-smart-plan-column="decision-evidence"${evidenceHidden}><span class="smart-help">Automatic: ${smartNumber(automaticQuantity, 2)}. Effective: ${smartNumber(quantity, 2)}. The effective quantity continues through Vendor Replies and is inserted into NetSuite once.</span></td>
   </tr>`;
@@ -370,7 +425,10 @@ smartProposalCard = function smartProposalCardV2(proposal) {
     : (proposal.netsuiteTransferOrderId || proposal.netsuiteTransferOrderRef));
   const locked = hasExecutionReference || ["confirmed", "executing", "completed", "superseded", "cancelled"].includes(proposal.status);
   const editable = smartProposalEditable(proposal);
-  const canConfirm = !hasExecutionReference && !isPo && ["draft", "reviewed"].includes(proposal.status);
+  const canConfirm = !hasExecutionReference && !isPo && ["draft", "reviewed", "executing", "failed", "attention"].includes(proposal.status);
+  const confirmTransferLabel = ["executing", "failed", "attention"].includes(proposal.status)
+    ? "Retry TO + print"
+    : "Confirm TO + print";
   let actions = "";
   if (smartCanWrite() && isPo && proposal.status === "held") {
     actions = `<button class="smart-button primary" data-smart-action="proposal-status" data-proposal-id="${proposal.id}" data-status="order_requested" type="button">Order Requested</button><button class="smart-button danger" data-smart-action="proposal-status" data-proposal-id="${proposal.id}" data-status="cancelled" type="button">Cancel</button>`;
@@ -390,10 +448,10 @@ smartProposalCard = function smartProposalCardV2(proposal) {
       <div class="smart-proposal-route"><strong>${smartEscape(smartProposalRoute(proposal))}</strong><span>#${proposal.id} · ${smartEscape(proposal.phase.replaceAll("_", " "))}${proposal.manuallyGrouped ? " · manually grouped" : ""}</span></div>
       <div class="smart-proposal-metric"><strong>${smartNumber(proposal.totalPallets, 0)} PLT</strong><span>Pallets</span></div>
       <div class="smart-proposal-metric"><strong>${smartNumber(proposal.totalWeightLbs, 0)} lb</strong><span>${smartPercent(proposal.utilization, 0)} truck</span></div>
-      <div class="smart-proposal-metric"><strong>${executionRef ? smartEscape(executionRef) : "—"}</strong><span>${isPo ? "PO load ref" : "TO / mock ref"}</span></div>
-      <div class="smart-actions">${recalculatePo}${actions}${smartCanWrite() && canConfirm ? `<button class="smart-button primary" data-smart-action="confirm-transfer" data-proposal-id="${proposal.id}" type="button">Confirm TO + print</button>` : ""}${smartCanWrite() && !isPo && hasExecutionReference && proposal.status === "attention" ? `<button class="smart-button warn" data-smart-action="retry-picking-ticket" data-proposal-id="${proposal.id}" type="button">Retry picking ticket</button>` : ""}</div>
+      <div class="smart-proposal-metric"><strong>${executionRef ? smartEscape(executionRef) : "—"}</strong><span>${isPo ? "PO load ref" : "NetSuite TO"}</span></div>
+      <div class="smart-actions">${recalculatePo}${actions}${smartCanWrite() && canConfirm ? `<button class="smart-button primary" data-smart-action="confirm-transfer" data-proposal-id="${proposal.id}" type="button">${confirmTransferLabel}</button>` : ""}${smartCanWrite() && !isPo && hasExecutionReference && proposal.status === "attention" ? `<button class="smart-button warn" data-smart-action="retry-picking-ticket" data-proposal-id="${proposal.id}" type="button">Retry picking ticket</button>` : ""}</div>
     </div>
-    <div class="smart-proposal-lines smart-table-wrap${smartProposalDetailClassName()}"><table class="smart-table"><thead><tr><th>Item</th><th>Destination</th><th class="numeric">Required</th><th>Proposed</th><th class="numeric">Sales quantity</th><th class="numeric">Line weight</th><th data-smart-plan-column="inventory"${smartState.planShowInventory ? "" : " hidden"}>Inventory</th><th data-smart-plan-column="decision-evidence"${smartState.planShowDecisionEvidence ? "" : " hidden"}>Decision evidence</th></tr></thead><tbody>${proposal.lines.map((line) => smartProposalLineRow(proposal, line, editable)).join("")}${(proposal.physicalPalletLines || []).map((line) => smartPhysicalPalletLineRow(proposal, line, editable)).join("")}</tbody></table></div>
+    <div class="smart-proposal-lines smart-table-wrap${smartProposalDetailClassName()}"><table class="smart-table"><thead><tr><th>Item</th><th>Destination</th><th class="numeric">Required</th><th>Proposed</th><th class="numeric">Sales quantity</th><th class="numeric">Line weight</th><th data-smart-plan-column="availability">Availability</th><th data-smart-plan-column="inventory"${smartState.planShowInventory ? "" : " hidden"}>Inventory calculation</th><th data-smart-plan-column="decision-evidence"${smartState.planShowDecisionEvidence ? "" : " hidden"}>Decision evidence</th></tr></thead><tbody>${proposal.lines.map((line) => smartProposalLineRow(proposal, line, editable)).join("")}${(proposal.physicalPalletLines || []).map((line) => smartPhysicalPalletLineRow(proposal, line, editable)).join("")}</tbody></table></div>
     ${smartProposalLineEditor(proposal)}
   </article>`;
 };

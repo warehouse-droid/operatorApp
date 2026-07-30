@@ -81,6 +81,17 @@ export async function executeSmartScmPurchaseProposal(proposalId, operatorId = n
   let recovered = false;
   try {
     const review = await getSmartScmNetSuitePoReviewLoad(proposalId);
+    if (review.status === "executing") {
+      const lastUpdate = new Date(review.updatedAt || 0).getTime();
+      const freshExecution = Number.isFinite(lastUpdate) && lastUpdate > 0
+        && Date.now() - lastUpdate < 5 * 60 * 1000;
+      if (freshExecution) {
+        throw Object.assign(
+          new Error("This PO insertion is already running. Wait for it to finish before retrying."),
+          { status: 409, smartScmStateRecorded: true }
+        );
+      }
+    }
     let markerMatch = null;
     const retryWithoutPersistedMode = review.persistedExecutionMode === null
       && ["failed", "executing"].includes(review.status);

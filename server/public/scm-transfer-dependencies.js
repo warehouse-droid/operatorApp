@@ -13,6 +13,7 @@ const dependencyState = {
   selectedSalesOrderId: null,
   inventory: null,
   batch: null,
+  reservationOverrideKeys: new Set(),
   selectedProposalIds: new Set(),
   search: "",
   reviewStatus: "open",
@@ -44,6 +45,41 @@ function depNumber(value) {
 function depQty(value) {
   const amount = depNumber(value);
   return new Intl.NumberFormat("en-CA", { maximumFractionDigits: 3 }).format(amount);
+}
+
+function depReservationOverrideKey(itemId, locationId) {
+  const item = Number(itemId);
+  const location = Number(locationId);
+  return Number.isSafeInteger(item) && item > 0 && Number.isSafeInteger(location) && location > 0
+    ? `${item}:${location}`
+    : "";
+}
+
+function depReservationOverrideApplied(item = {}, balance = {}) {
+  const key = depReservationOverrideKey(item.itemId, balance.locationId);
+  return Boolean(key && dependencyState.reservationOverrideKeys.has(key));
+}
+
+function depBalancePlanningAvailable(item = {}, balance = {}) {
+  return depReservationOverrideApplied(item, balance)
+    ? depNumber(balance.quantityAvailable)
+    : depNumber(balance.effectiveAvailable);
+}
+
+function depReservationOverridePayload() {
+  return [...dependencyState.reservationOverrideKeys].map((key) => {
+    const [itemId, locationId] = key.split(":").map(Number);
+    return { itemId, locationId };
+  }).filter((entry) => Number.isSafeInteger(entry.itemId) && Number.isSafeInteger(entry.locationId));
+}
+
+function syncDependencyReservationOverridesFromBatch(batch = null) {
+  dependencyState.reservationOverrideKeys = new Set((batch?.reservationOverrides || [])
+    .map((entry) => depReservationOverrideKey(
+      entry.itemId ?? entry.item_id,
+      entry.locationId ?? entry.location_id
+    ))
+    .filter(Boolean));
 }
 
 function depDate(value) {
@@ -264,6 +300,7 @@ async function loadSelectedDependencyInventory({ forceRefresh = false, refreshUn
   if (selectedOrder?.dependencyBatchId) {
     clearDependencyProposalSelection();
     dependencyState.batch = await depApi(`/api/scm/transfer-dependencies/batches/${selectedOrder.dependencyBatchId}`);
+    syncDependencyReservationOverridesFromBatch(dependencyState.batch);
   }
   const shouldRefresh = forceRefresh || (
     refreshUndercovered
@@ -425,7 +462,7 @@ function depInventoryCoverage(order = {}, matrix = {}) {
     const item = byItem.get(itemKey);
     const sourceAvailable = (item?.balances || [])
       .filter((balance) => String(balance.locationId) !== String(order.outboundLocationId))
-      .reduce((total, balance) => total + depNumber(balance.effectiveAvailable), 0);
+      .reduce((total, balance) => total + depBalancePlanningAvailable(item, balance), 0);
     return {
       ...entry,
       item,
@@ -443,6 +480,7 @@ function renderInventoryMatrix() {
   if (!matrix) return `<div class="empty-state">Loading inventory coverage...</div>`;
   const coverage = depInventoryCoverage(order, matrix);
   const impossible = coverage.filter((entry) => entry.sourceShortfall > 0.000001);
+  const reservationOverrideCount = dependencyState.reservationOverrideKeys.size;
   return `
     <div class="scm-dependency-order-summary">
       <div><span>Sales Order</span><strong>${depEscape(order.salesOrderRef)}</strong></div>
@@ -452,6 +490,10 @@ function renderInventoryMatrix() {
     ${impossible.length ? `<div class="scm-dependency-coverage-warning" role="alert">
       <strong>Cannot fully cover this Sales Order from the other yards</strong>
       <span>${impossible.map(({ line, required, sourceAvailable, sourceShortfall }) => `${depEscape(line.sku || line.itemName)}: required ${depQty(required)}, usable source stock ${depQty(sourceAvailable)}, source stock short ${depQty(sourceShortfall)}`).join("<br>")}</span>
+    </div>` : ""}
+    ${reservationOverrideCount ? `<div class="scm-dependency-reservation-warning" role="status">
+      <strong>NetSuite Available override selected</strong>
+      <span>${reservationOverrideCount} item-and-yard selection${reservationOverrideCount === 1 ? "" : "s"} will ignore other unsent local draft proposal reservations when the suggestion is regenerated. The override is saved and audited with the proposal.</span>
     </div>` : ""}
     <div class="scm-dependency-review-action">
       <span>${order.workflowStage === "created"
@@ -494,11 +536,35 @@ function renderInventoryMatrix() {
           ${DEPENDENCY_YARDS.map((yard) => {
             const balance = item?.balances?.find((entry) => String(entry.locationId) === String(yard.id));
             const reserved = depNumber(balance?.reservedQuantity);
-            const usable = depNumber(balance?.effectiveAvailable);
-            const availabilityNote = reserved > 0.000001
-              ? `${depQty(usable)} usable · ${depQty(reserved)} reserved`
-              : "Full available quantity";
-            return `<div class="${String(yard.id) === String(order.outboundLocationId) ? "outbound-yard" : ""}"><b>${depQty(balance?.quantityAvailable)}</b><small>${availabilityNote}</small></div>`;
+            const linkedTransfer = depNumber(balance?.linkedTransferQuantity);
+            const overrideApplied = depReservationOverrideApplied(item, balance);
+            const usable = depBalancePlanningAvailable(item, balance);
+            const linkedTransferNote = linkedTransfer > 0.000001
+              ? ` · ${depQty(linkedTransfer)} linked TO already protected by NetSuite`
+              : "";
+            const availabilityNote = overrideApplied
+              ? `${depQty(usable)} usable · ${depQty(reserved)} unsent draft reserved ignored${linkedTransferNote}`
+              : reserved > 0.000001
+              ? `${depQty(usable)} usable · ${depQty(reserved)} unsent draft reserved${linkedTransferNote}`
+              : linkedTransfer > 0.000001
+                ? `NetSuite available is usable${linkedTransferNote}`
+                : "Full available quantity";
+            const canOverride = reserved > 0.000001
+              && depNumber(balance?.quantityAvailable) > depNumber(balance?.effectiveAvailable) + 0.000001
+              && String(yard.id) !== String(order.outboundLocationId);
+            return `<div class="${String(yard.id) === String(order.outboundLocationId) ? "outbound-yard" : ""} ${overrideApplied ? "reservation-overridden" : ""}">
+              <b>${depQty(balance?.quantityAvailable)}</b>
+              <small>${availabilityNote}</small>
+              ${canOverride ? `<button class="scm-dependency-reservation-override ${overrideApplied ? "active" : ""}"
+                data-action="toggle-reservation-override"
+                data-item-id="${depEscape(item?.itemId)}"
+                data-item-name="${depEscape(line.sku || line.itemName)}"
+                data-location-id="${yard.id}"
+                data-location="${yard.code}"
+                data-available="${depNumber(balance?.quantityAvailable)}"
+                data-reserved="${reserved}"
+                type="button" ${dependencyState.busy ? "disabled" : ""}>${overrideApplied ? "Undo full-available override" : "Use full NetSuite available"}</button>` : ""}
+            </div>`;
           }).join("")}
         </div>`;
       }).join("")}
@@ -612,6 +678,9 @@ function renderProposal(proposal) {
 function renderDependencyProposals() {
   const batch = dependencyState.batch;
   if (!batch) return `<div class="empty-state">Generate a suggestion to create editable transfer proposals.</div>`;
+  const savedReservationOverrides = Array.isArray(batch.reservationOverrides)
+    ? batch.reservationOverrides
+    : [];
   pruneDependencyProposalSelection();
   const selectedProposals = [...dependencyState.selectedProposalIds]
     .map((proposalId) => batch.proposals.find((proposal) => Number(proposal.id) === Number(proposalId)))
@@ -626,6 +695,12 @@ function renderDependencyProposals() {
         <small data-merge-proposal-hint>${depEscape(mergeCompatibility.reason)}</small>
       </div>
     </div>
+    ${savedReservationOverrides.length ? `<div class="scm-dependency-reservation-warning" role="alert">
+      <strong>Creating with full NetSuite Available override</strong>
+      <span>${savedReservationOverrides.map((entry) =>
+        `${depEscape(entry.itemName || entry.itemId)} at ${depEscape(entry.location || entry.locationId)}: ${depQty(entry.quantityAvailable)} available; ${depQty(entry.reservedQuantity)} unsent draft reservation ignored`
+      ).join("<br>")}</span>
+    </div>` : ""}
     <div class="scm-dependency-proposal-list">${batch.proposals.map(renderProposal).join("") || `<div class="empty-state">No source yard has available stock.</div>`}</div>
     <label class="scm-dependency-incomplete">
       <input data-field="allow-incomplete" type="checkbox" ${batch.allowIncompleteCoverage ? "checked" : ""} />
@@ -712,6 +787,7 @@ async function loadDependencyCandidates({ preserveSelection = true, refreshInven
     dependencyState.selectedSalesOrderId = dependencyState.candidates[0]?.salesOrderId || null;
     clearDependencyProposalSelection();
     dependencyState.batch = null;
+    dependencyState.reservationOverrideKeys.clear();
   }
   const nextSelected = depSelectedOrder();
   const shortageChanged = previousSelected
@@ -935,6 +1011,7 @@ scmDependencyApp.addEventListener("click", async (event) => {
     clearDependencyProposalSelection();
     dependencyState.batch = null;
     dependencyState.inventory = null;
+    dependencyState.reservationOverrideKeys.clear();
     await runDependencyAction("Refreshing NetSuite inventory...", () => loadSelectedDependencyInventory());
     return;
   }
@@ -944,6 +1021,28 @@ scmDependencyApp.addEventListener("click", async (event) => {
     dependencyState.reviewStatus = status;
     dependencyState.mobilePanel = "candidates";
     await runDependencyAction("Loading shortages...", () => loadDependencyCandidates({ preserveSelection: false }));
+    return;
+  }
+  if (action === "toggle-reservation-override") {
+    const key = depReservationOverrideKey(target.dataset.itemId, target.dataset.locationId);
+    if (!key) return;
+    if (dependencyState.reservationOverrideKeys.has(key)) {
+      dependencyState.reservationOverrideKeys.delete(key);
+      dependencyState.notice = `Full-available override removed for ${target.dataset.itemName || target.dataset.itemId} at ${target.dataset.location || target.dataset.locationId}. Regenerate the suggestion to apply the change.`;
+      renderDependencyPage();
+      return;
+    }
+    const itemName = target.dataset.itemName || `Item ${target.dataset.itemId}`;
+    const location = target.dataset.location || target.dataset.locationId;
+    const available = depQty(target.dataset.available);
+    const reserved = depQty(target.dataset.reserved);
+    const confirmed = window.confirm(
+      `Use the full NetSuite Available quantity (${available}) for ${itemName} at ${location} and ignore ${reserved} reserved by other unsent local draft proposals?\n\nThis can allocate the same stock to more than one draft order. The override will be saved and audited with this proposal.`
+    );
+    if (!confirmed) return;
+    dependencyState.reservationOverrideKeys.add(key);
+    dependencyState.notice = `Full NetSuite Available selected for ${itemName} at ${location}. Regenerate the suggestion to apply and save this override.`;
+    renderDependencyPage();
     return;
   }
   if (action === "select-manual-item") {
@@ -1027,11 +1126,18 @@ scmDependencyApp.addEventListener("click", async (event) => {
       clearDependencyProposalSelection();
       dependencyState.batch = await depApi("/api/scm/transfer-dependencies/suggestions", {
         method: "POST",
-        body: JSON.stringify({ salesOrderId: dependencyState.selectedSalesOrderId, mode, refreshInventory: true })
+        body: JSON.stringify({
+          salesOrderId: dependencyState.selectedSalesOrderId,
+          mode,
+          refreshInventory: true,
+          reservationOverrides: depReservationOverridePayload()
+        })
       });
+      syncDependencyReservationOverridesFromBatch(dependencyState.batch);
       await loadSelectedDependencyInventory({ refreshUndercovered: false });
       dependencyState.mobilePanel = "proposals";
-      dependencyState.notice = `Suggestion created for ${dependencyState.batch.salesOrderRef}.`;
+      const overrideCount = dependencyState.batch.reservationOverrides?.length || 0;
+      dependencyState.notice = `Suggestion created for ${dependencyState.batch.salesOrderRef}.${overrideCount ? ` ${overrideCount} full-available override${overrideCount === 1 ? "" : "s"} saved.` : ""}`;
     });
     return;
   }

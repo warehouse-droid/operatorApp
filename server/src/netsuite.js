@@ -28,7 +28,13 @@ async function netsuiteFetch(url, options = {}) {
     return await fetch(url, { ...options, signal });
   } catch (error) {
     if (error.name === "AbortError" || error.name === "TimeoutError") {
-      throw new Error(`NetSuite request timed out after ${Math.round(timeoutMs / 1000)} seconds.`);
+      const timeoutError = new Error(
+        `NetSuite request timed out after ${Math.round(timeoutMs / 1000)} seconds.`
+      );
+      timeoutError.code = "NETSUITE_REQUEST_TIMEOUT";
+      timeoutError.timeoutMs = timeoutMs;
+      timeoutError.cause = error;
+      throw timeoutError;
     }
     throw error;
   }
@@ -463,7 +469,7 @@ async function netsuiteRest(path, { method = "GET", body = null, headers = {} } 
       throw lastError;
     }
     const location = response.headers.get("location") || "";
-    const idMatch = location.match(/\/(?:itemFulfillment|itemReceipt|transferOrder|intercompanyTransferOrder|purchaseOrder)\/(\d+)/i);
+    const idMatch = location.match(/\/(?:itemFulfillment|itemReceipt|transferOrder|intercompanyTransferOrder|purchaseOrder|returnAuthorization|creditMemo)\/(\d+)/i);
     return { status: response.status, location, id: idMatch ? Number(idMatch[1]) : null, data };
   }
   throw lastError;
@@ -544,6 +550,92 @@ export async function createPurchaseOrderInNetSuite(payload) {
   const result = restMutationQueue.then(run, run);
   restMutationQueue = result.catch(() => {});
   return result;
+}
+
+export async function createOrUpdateReturnAuthorizationInNetSuite({
+  salesOrderId,
+  returnAuthorizationId = null,
+  payload
+} = {}) {
+  const existingId = Number(returnAuthorizationId);
+  const sourceId = Number(salesOrderId);
+  if ((!Number.isInteger(existingId) || existingId <= 0)
+      && (!Number.isInteger(sourceId) || sourceId <= 0)) {
+    throw new Error("A valid Sales Order or Return Authorization ID is required.");
+  }
+  const path = Number.isInteger(existingId) && existingId > 0
+    ? `/record/v1/returnAuthorization/${existingId}?replace=item`
+    : `/record/v1/salesOrder/${sourceId}/!transform/returnAuthorization?replace=item`;
+  const run = () => netsuiteRest(path, {
+    method: Number.isInteger(existingId) && existingId > 0 ? "PATCH" : "POST",
+    body: payload
+  });
+  const result = restMutationQueue.then(run, run);
+  restMutationQueue = result.catch(() => {});
+  return result;
+}
+
+export async function createOrUpdateCreditMemoInNetSuite({
+  creditMemoId = null,
+  payload
+} = {}) {
+  const existingId = Number(creditMemoId);
+  const path = Number.isInteger(existingId) && existingId > 0
+    ? `/record/v1/creditMemo/${existingId}?replace=item`
+    : "/record/v1/creditMemo";
+  const run = () => netsuiteRest(path, {
+    method: Number.isInteger(existingId) && existingId > 0 ? "PATCH" : "POST",
+    body: payload
+  });
+  const result = restMutationQueue.then(run, run);
+  restMutationQueue = result.catch(() => {});
+  return result;
+}
+
+export async function fetchReturnAuthorizationFromNetSuite(returnAuthorizationId) {
+  const id = Number(returnAuthorizationId);
+  if (!Number.isInteger(id) || id <= 0) return null;
+  try {
+    const result = await netsuiteRest(`/record/v1/returnAuthorization/${id}?expandSubResources=true`, { method: "GET" });
+    return result.data || null;
+  } catch (error) {
+    if (String(error.message).includes("NetSuite REST failed: 404")) return null;
+    throw error;
+  }
+}
+
+export async function fetchCreditMemoFromNetSuite(creditMemoId) {
+  const id = Number(creditMemoId);
+  if (!Number.isInteger(id) || id <= 0) return null;
+  try {
+    const result = await netsuiteRest(`/record/v1/creditMemo/${id}?expandSubResources=true`, { method: "GET" });
+    return result.data || null;
+  } catch (error) {
+    if (String(error.message).includes("NetSuite REST failed: 404")) return null;
+    throw error;
+  }
+}
+
+export async function fetchCreditMemoMetadataFromNetSuite() {
+  const result = await netsuiteRest("/metadata-catalog/record/v1/creditMemo?expandSubResources=true", {
+    method: "GET",
+    headers: { Accept: "application/schema+json" }
+  });
+  return result.data || null;
+}
+
+export async function fetchSalesOrderReturnLinesFromNetSuite(salesOrderId) {
+  const id = Number(salesOrderId);
+  if (!Number.isInteger(id) || id <= 0) throw new Error("A valid Sales Order ID is required.");
+  const result = await netsuiteRest(`/record/v1/salesOrder/${id}?expandSubResources=true`, {
+    method: "GET"
+  });
+  const record = result.data || null;
+  const items = record?.item?.items;
+  if (!Array.isArray(items)) {
+    throw new Error("NetSuite Sales Order item subresource was not expanded.");
+  }
+  return items;
 }
 
 export async function updateTransferOrderStatusInNetSuite(orderId, { intercompany = false, statusId = "B" } = {}) {
@@ -1108,6 +1200,638 @@ export async function fetchTransactionProgressFromNetSuite(orderId, recordType =
     record_type: type,
     lines: rows.map((line) => deriveQuantitiesFromSalesQuantity(line, toNumber(line.quantity)))
   };
+}
+
+function positiveNetSuiteIds(values = []) {
+  return [...new Set((Array.isArray(values) ? values : [values])
+    .map((value) => Number(value))
+    .filter((value) => Number.isSafeInteger(value) && value > 0))];
+}
+
+function reconciliationSourceFilter({
+  orderIds = [],
+  kind = "",
+  modifiedSince = "2026-01-01",
+  includeOpen = true,
+  targetOnly = false
+} = {}) {
+  const ids = positiveNetSuiteIds(orderIds);
+  const cleanKind = String(kind || "").trim().toUpperCase();
+  const types = cleanKind === "PO"
+    ? ["PurchOrd"]
+    : cleanKind === "TO"
+      ? ["TrnfrOrd"]
+      : ["PurchOrd", "TrnfrOrd"];
+  const since = /^\d{4}-\d{2}-\d{2}$/.test(String(modifiedSince || ""))
+    ? String(modifiedSince)
+    : "2026-01-01";
+  const discovery = targetOnly && ids.length
+    ? [`t.id IN (${ids.join(",")})`]
+    : [
+      `t.lastmodifieddate >= TO_DATE('${since}', 'YYYY-MM-DD')`,
+      ...(ids.length ? [`t.id IN (${ids.join(",")})`] : []),
+      ...(includeOpen ? [
+        `UPPER(NVL(BUILTIN.DF(t.status), '')) LIKE '%PENDING%'`,
+        `UPPER(NVL(BUILTIN.DF(t.status), '')) LIKE '%PARTIALLY%'`
+      ] : [])
+    ];
+  return {
+    ids,
+    types,
+    sql: `t.type IN (${types.map((type) => `'${type}'`).join(",")})
+      AND (${discovery.join("\n        OR ")})`
+  };
+}
+
+function reconciliationIdentityNumber(value) {
+  const number = Number(String(value ?? 0).replaceAll(",", ""));
+  return Number.isFinite(number) ? String(number) : "0";
+}
+
+function reconciliationLineAlias(value) {
+  const alias = String(value ?? "").trim();
+  return alias && alias !== "0" && alias.toLowerCase() !== "null" ? alias : "";
+}
+
+function reconciliationAliasSort(left, right) {
+  const leftNumber = Number(left);
+  const rightNumber = Number(right);
+  if (Number.isSafeInteger(leftNumber) && Number.isSafeInteger(rightNumber)) {
+    return leftNumber - rightNumber;
+  }
+  return String(left).localeCompare(String(right), undefined, { numeric: true });
+}
+
+function reconciliationMirrorSignature(line, { includeProgress = false } = {}) {
+  return [
+    line.stage,
+    line.itemId ?? "",
+    reconciliationIdentityNumber(line.signedQuantity),
+    reconciliationIdentityNumber(line.quantity),
+    line.unit || "",
+    line.locationId ?? "",
+    line.itemDescription || "",
+    line.itemType || "",
+    reconciliationIdentityNumber(line.itemWeight),
+    reconciliationIdentityNumber(line.palletQty),
+    reconciliationIdentityNumber(line.layerQty),
+    reconciliationIdentityNumber(line.sectionQty),
+    reconciliationIdentityNumber(line.pieceQty),
+    reconciliationIdentityNumber(line.toPlt),
+    reconciliationIdentityNumber(line.toLyr),
+    reconciliationIdentityNumber(line.toSec),
+    reconciliationIdentityNumber(line.toPcs),
+    ...(includeProgress
+      ? [reconciliationIdentityNumber(line.cumulativeProgressQuantity)]
+      : [])
+  ].join("|");
+}
+
+function reconciliationTransferBaseSignature(line) {
+  return [
+    line.itemId ?? "",
+    reconciliationIdentityNumber(line.quantity),
+    String(line.unit || "").trim().toUpperCase()
+  ].join("|");
+}
+
+function reconciliationBoolean(value) {
+  if (value === true || value === 1) return true;
+  return ["T", "TRUE", "1", "Y", "YES"].includes(String(value ?? "").trim().toUpperCase());
+}
+
+function reconciliationLineSort(left, right) {
+  const leftSequence = Number(left.lineSequenceNumber);
+  const rightSequence = Number(right.lineSequenceNumber);
+  if (
+    Number.isFinite(leftSequence)
+    && Number.isFinite(rightSequence)
+    && leftSequence !== rightSequence
+  ) {
+    return leftSequence - rightSequence;
+  }
+  const leftOrderLine = reconciliationLineAlias(left.orderLine);
+  const rightOrderLine = reconciliationLineAlias(right.orderLine);
+  const orderLineDifference = reconciliationAliasSort(leftOrderLine, rightOrderLine);
+  if (orderLineDifference) return orderLineDifference;
+  return reconciliationAliasSort(
+    reconciliationLineAlias(left.sourceLineKey),
+    reconciliationLineAlias(right.sourceLineKey)
+  );
+}
+
+function collapseTransferMirrorRows(rows, {
+  identityStatus,
+  identityIssue = "",
+  mirrorSignature,
+  occurrence,
+  logicalLineIdentity = ""
+}) {
+  const sorted = [...rows].sort(reconciliationLineSort);
+  const aliases = [...new Set(sorted
+    .map((line) => reconciliationLineAlias(line.sourceLineKey))
+    .filter(Boolean))]
+    .sort(reconciliationAliasSort);
+  const orderLineAliases = [...new Set(sorted
+    .map((line) => reconciliationLineAlias(line.orderLine))
+    .filter(Boolean))]
+    .sort(reconciliationAliasSort);
+  const base = sorted.reduce(
+    (best, line) =>
+      toNumber(line.cumulativeProgressQuantity) > toNumber(best.cumulativeProgressQuantity)
+        ? line
+        : best,
+    sorted[0]
+  );
+  const canonicalKey = aliases[0] || orderLineAliases[0] || "";
+  const canonicalOrderLine = orderLineAliases[0] || reconciliationLineAlias(base.orderLine);
+  return {
+    ...base,
+    sourceLineKey: canonicalKey,
+    orderLine: Number(canonicalOrderLine) || canonicalOrderLine,
+    sourceLineAliases: aliases,
+    orderLineAliases,
+    identityStatus,
+    identityIssue,
+    mirrorRowCount: sorted.length,
+    mirrorSignature,
+    mirrorOccurrence: occurrence,
+    logicalLineIdentity: logicalLineIdentity || (
+      orderLineAliases.length === 1
+        ? `order-line:${orderLineAliases[0]}`
+        : `mirror:${mirrorSignature}:${occurrence}`
+    ),
+    cumulativeProgressQuantity: Math.max(
+      ...sorted.map((line) => toNumber(line.cumulativeProgressQuantity))
+    ),
+    cumulativeProgressObserved: sorted.some((line) =>
+      line.cumulativeProgressObserved !== false
+    ),
+    raw: {
+      ...(base.raw && typeof base.raw === "object" ? base.raw : {}),
+      sourceLineAliases: aliases,
+      orderLineAliases,
+      identityStatus,
+      identityIssue,
+      mirrorRowCount: sorted.length,
+      physicalRows: sorted.map((line) => line.raw || line)
+    }
+  };
+}
+
+function normalizeLegacyTransferMirrorRows(lines = []) {
+  const buckets = new Map();
+  for (const line of lines || []) {
+    const signature = reconciliationMirrorSignature(line);
+    if (!buckets.has(signature)) buckets.set(signature, []);
+    buckets.get(signature).push(line);
+  }
+
+  const normalized = [];
+  for (const [signature, bucket] of buckets) {
+    const byOrderLine = new Map();
+    for (const line of bucket) {
+      const orderLine = reconciliationLineAlias(line.orderLine);
+      if (!byOrderLine.has(orderLine)) byOrderLine.set(orderLine, []);
+      byOrderLine.get(orderLine).push(line);
+    }
+
+    const unresolved = [];
+    let occurrence = 0;
+    for (const [orderLine, candidates] of byOrderLine) {
+      if (
+        orderLine
+        && candidates.length === 2
+        && reconciliationMirrorSignature(candidates[0], { includeProgress: true })
+          === reconciliationMirrorSignature(candidates[1], { includeProgress: true })
+      ) {
+        normalized.push(collapseTransferMirrorRows(candidates, {
+          identityStatus: "exact",
+          mirrorSignature: signature,
+          occurrence
+        }));
+        occurrence += 1;
+      } else {
+        unresolved.push(...candidates);
+      }
+    }
+
+    unresolved.sort(reconciliationLineSort);
+    for (let index = 0; index < unresolved.length; index += 2) {
+      const pair = unresolved.slice(index, index + 2);
+      const isPair = pair.length === 2;
+      const duplicateOrderLine = isPair
+        && reconciliationLineAlias(pair[0].orderLine)
+        && reconciliationLineAlias(pair[0].orderLine) === reconciliationLineAlias(pair[1].orderLine);
+      normalized.push(collapseTransferMirrorRows(pair, {
+        identityStatus: "ambiguous",
+        identityIssue: isPair
+          ? duplicateOrderLine
+            ? "Transfer mirror rows share a line number but disagree on progress or line attributes."
+            : "Transfer mirror rows were paired by equal line values because NetSuite did not expose a shared line number."
+          : "A Transfer Order row has no exact physical/accounting mirror partner.",
+        mirrorSignature: signature,
+        occurrence
+      }));
+      occurrence += 1;
+    }
+  }
+  return normalized;
+}
+
+/**
+ * This NetSuite account exposes each logical TO item as a visible source row,
+ * a hidden source-progress row, and a hidden destination-progress row. Their
+ * line IDs are intentionally different. Use the visible row as the logical
+ * anchor, then align equal immutable item buckets by line-sequence occurrence.
+ * This retains repeated identical item lines without treating normal accounting
+ * rows as extra ordered quantity.
+ */
+export function normalizePoToReconciliationLines(lines = [], kind = "") {
+  const cleanKind = String(kind || "").trim().toUpperCase();
+  if (cleanKind !== "TO") {
+    return (lines || []).map((line) => {
+      const sourceLineKey = reconciliationLineAlias(line.sourceLineKey || line.orderLine);
+      const orderLine = reconciliationLineAlias(line.orderLine);
+      return {
+        ...line,
+        sourceLineKey,
+        sourceLineAliases: sourceLineKey ? [sourceLineKey] : [],
+        orderLineAliases: orderLine ? [orderLine] : [],
+        identityStatus: sourceLineKey ? "exact" : "missing",
+        identityIssue: sourceLineKey ? "" : "NetSuite did not return a unique source-line key.",
+        mirrorRowCount: 1,
+        logicalLineIdentity: orderLine ? `order-line:${orderLine}` : `source-line:${sourceLineKey}`
+      };
+    });
+  }
+
+  const hasTransferRoles = (lines || []).some((line) =>
+    line.doNotPrintLine !== undefined && line.doNotPrintLine !== null
+  );
+  if (!hasTransferRoles) {
+    return normalizeLegacyTransferMirrorRows(lines).sort((left, right) => {
+      const stageDifference = (left.stage === "outbound" ? 0 : 1) - (right.stage === "outbound" ? 0 : 1);
+      return stageDifference || reconciliationLineSort(left, right);
+    });
+  }
+
+  const buckets = new Map();
+  for (const line of lines || []) {
+    const signature = reconciliationTransferBaseSignature(line);
+    if (!buckets.has(signature)) buckets.set(signature, []);
+    buckets.get(signature).push(line);
+  }
+  const normalized = [];
+  for (const [signature, bucket] of buckets) {
+    const visibleSource = bucket
+      .filter((line) => line.stage === "outbound" && !reconciliationBoolean(line.doNotPrintLine))
+      .sort(reconciliationLineSort);
+    const hiddenSource = bucket
+      .filter((line) => line.stage === "outbound" && reconciliationBoolean(line.doNotPrintLine))
+      .sort(reconciliationLineSort);
+    const destination = bucket
+      .filter((line) => line.stage === "receiving")
+      .sort(reconciliationLineSort);
+    if (!visibleSource.length) {
+      normalized.push(...normalizeLegacyTransferMirrorRows(bucket).map((line) => ({
+        ...line,
+        identityStatus: "ambiguous",
+        identityIssue: line.identityIssue
+          || "Transfer rows could not be assigned to a visible source-line anchor."
+      })));
+      continue;
+    }
+
+    const aligned = visibleSource.length === hiddenSource.length
+      && visibleSource.length === destination.length;
+    for (let occurrence = 0; occurrence < visibleSource.length; occurrence += 1) {
+      const anchor = visibleSource[occurrence];
+      const sourceProgress = hiddenSource[occurrence];
+      const receipt = destination[occurrence];
+      const anchorIdentity = reconciliationLineAlias(anchor.sourceLineKey || anchor.orderLine);
+      const logicalLineIdentity = `transfer-anchor:${anchorIdentity || `${signature}:${occurrence}`}`;
+      const identityStatus = aligned && sourceProgress && receipt ? "exact" : "ambiguous";
+      const identityIssue = identityStatus === "exact"
+        ? ""
+        : "Transfer accounting rows could not be aligned one-to-one with the visible source line.";
+      normalized.push(collapseTransferMirrorRows(
+        [anchor, sourceProgress].filter(Boolean),
+        {
+          identityStatus,
+          identityIssue,
+          mirrorSignature: signature,
+          occurrence,
+          logicalLineIdentity
+        }
+      ));
+      if (receipt) {
+        normalized.push(collapseTransferMirrorRows([receipt], {
+          identityStatus,
+          identityIssue,
+          mirrorSignature: signature,
+          occurrence,
+          logicalLineIdentity
+        }));
+      }
+    }
+
+    // Extra hidden accounting rows are evidence of an identity problem, not
+    // additional logical order lines. `aligned` already marks every anchored
+    // line in this bucket ambiguous, so dropping extras prevents double-counting.
+  }
+
+  return normalized.sort((left, right) => {
+    const stageDifference = (left.stage === "outbound" ? 0 : 1) - (right.stage === "outbound" ? 0 : 1);
+    return stageDifference || reconciliationLineSort(left, right);
+  });
+}
+
+async function fetchPoToReconciliationOrdersBatch(options = {}) {
+  const filter = reconciliationSourceFilter(options);
+  const rows = await suiteqlAll(`
+    SELECT
+      t.id,
+      t.type AS record_type,
+      t.tranid,
+      t.trandate,
+      t.status,
+      BUILTIN.DF(t.status) AS status_text,
+      t.lastmodifieddate,
+      t.entity AS entity_id,
+      BUILTIN.DF(t.entity) AS entity,
+      t.memo,
+      t.foreigntotal,
+      t.custbody4 AS expected_delivery_date,
+      CASE WHEN t.type = 'TrnfrOrd' THEN t.location ELSE NULL END AS source_location_id,
+      CASE
+        WHEN t.type = 'TrnfrOrd' THEN BUILTIN.DF(t.location)
+        ELSE BUILTIN.DF(t.entity)
+      END AS source_location,
+      CASE
+        WHEN t.type = 'TrnfrOrd' THEN t.transferlocation
+        ELSE t.location
+      END AS destination_location_id,
+      CASE
+        WHEN t.type = 'TrnfrOrd' THEN BUILTIN.DF(t.transferlocation)
+        ELSE BUILTIN.DF(t.location)
+      END AS destination_location,
+      tl.id AS order_line_number,
+      tl.uniquekey AS source_line_key,
+      tl.donotprintline AS do_not_print_line,
+      tl.linesequencenumber AS line_sequence_number,
+      tl.item AS item_id,
+      BUILTIN.DF(tl.item) AS item_name,
+      tl.memo AS item_description,
+      i.itemtype AS item_type,
+      BUILTIN.DF(i.itemtype) AS item_type_text,
+      tl.quantity AS signed_quantity,
+      ABS(NVL(tl.quantity, 0)) AS ordered_quantity,
+      tl.quantityshiprecv AS cumulative_progress_raw,
+      ABS(NVL(tl.quantityshiprecv, 0)) AS cumulative_progress_quantity,
+      BUILTIN.DF(tl.units) AS unit,
+      tl.location AS line_location_id,
+      BUILTIN.DF(tl.location) AS line_location,
+      i.weight AS item_weight,
+      tl.custcol_plt AS pallet_qty,
+      tl.custcol_lyr AS layer_qty,
+      tl.custcol_pcs AS piece_qty,
+      tl.custcol_sec AS section_qty,
+      i.custitem_toplt AS to_plt,
+      i.custitem_tolyr AS to_lyr,
+      i.custitem_tosec AS to_sec,
+      i.custitem_topcs AS to_pcs
+    FROM transaction t
+    INNER JOIN transactionline tl ON tl.transaction = t.id
+    LEFT JOIN item i ON i.id = tl.item
+    WHERE ${filter.sql}
+      AND tl.item IS NOT NULL
+      AND tl.mainline = 'F'
+      AND (tl.taxline = 'F' OR tl.taxline IS NULL)
+    ORDER BY t.id, tl.id, tl.uniquekey
+  `);
+  const orders = new Map();
+  for (const row of rows) {
+    const id = Number(row.id);
+    const kind = String(row.record_type) === "PurchOrd" ? "PO" : "TO";
+    if (!orders.has(id)) {
+      orders.set(id, {
+        id,
+        kind,
+        recordType: row.record_type,
+        tranid: row.tranid || "",
+        trandate: row.trandate || null,
+        status: row.status || "",
+        statusText: row.status_text || "",
+        lastModifiedAt: row.lastmodifieddate || null,
+        entityId: Number(row.entity_id) || null,
+        entity: row.entity || "",
+        memo: row.memo || "",
+        foreignTotal: row.foreigntotal === null || row.foreigntotal === undefined ? null : Number(row.foreigntotal),
+        expectedDeliveryDate: row.expected_delivery_date || null,
+        sourceLocationId: Number(row.source_location_id) || null,
+        sourceLocation: row.source_location || "",
+        destinationLocationId: Number(row.destination_location_id) || null,
+        destinationLocation: row.destination_location || "",
+        lines: []
+      });
+    }
+    const signedQuantity = Number(String(row.signed_quantity || 0).replaceAll(",", "")) || 0;
+    orders.get(id).lines.push({
+      sourceLineKey: String(row.source_line_key || row.order_line_number || ""),
+      orderLine: Number(row.order_line_number),
+      doNotPrintLine: row.do_not_print_line,
+      lineSequenceNumber: Number(row.line_sequence_number),
+      stage: kind === "PO" ? "receiving" : signedQuantity < 0 ? "outbound" : "receiving",
+      itemId: Number(row.item_id) || null,
+      itemName: row.item_name || "",
+      itemDescription: row.item_description || "",
+      itemType: row.item_type || "",
+      itemTypeText: row.item_type_text || "",
+      signedQuantity,
+      quantity: toNumber(row.ordered_quantity),
+      cumulativeProgressQuantity: toNumber(row.cumulative_progress_quantity),
+      cumulativeProgressObserved: row.cumulative_progress_raw !== null
+        && row.cumulative_progress_raw !== undefined
+        && row.cumulative_progress_raw !== "",
+      unit: row.unit || "",
+      locationId: Number(row.line_location_id) || null,
+      location: row.line_location || "",
+      itemWeight: row.item_weight === null || row.item_weight === undefined ? null : Number(row.item_weight),
+      palletQty: toNumber(row.pallet_qty),
+      layerQty: toNumber(row.layer_qty),
+      sectionQty: toNumber(row.section_qty),
+      pieceQty: toNumber(row.piece_qty),
+      toPlt: toNumber(row.to_plt),
+      toLyr: toNumber(row.to_lyr),
+      toSec: toNumber(row.to_sec),
+      toPcs: toNumber(row.to_pcs),
+      raw: row
+    });
+  }
+  return [...orders.values()].map((order) => ({
+    ...order,
+    lines: normalizePoToReconciliationLines(order.lines, order.kind)
+  }));
+}
+
+const RECONCILIATION_SOURCE_ID_CHUNK_SIZE = 800;
+
+export async function fetchPoToReconciliationOrdersFromNetSuite(options = {}) {
+  const ids = positiveNetSuiteIds(options.orderIds);
+  if (options.targetOnly && !ids.length) return [];
+  if (ids.length <= RECONCILIATION_SOURCE_ID_CHUNK_SIZE) {
+    return fetchPoToReconciliationOrdersBatch({ ...options, orderIds: ids });
+  }
+
+  const orders = new Map();
+  const collect = (rows) => {
+    for (const order of rows || []) {
+      orders.set(`${order.kind}:${order.id}`, order);
+    }
+  };
+  if (!options.targetOnly) {
+    collect(await fetchPoToReconciliationOrdersBatch({
+      ...options,
+      orderIds: []
+    }));
+  }
+  for (let offset = 0; offset < ids.length; offset += RECONCILIATION_SOURCE_ID_CHUNK_SIZE) {
+    collect(await fetchPoToReconciliationOrdersBatch({
+      ...options,
+      orderIds: ids.slice(offset, offset + RECONCILIATION_SOURCE_ID_CHUNK_SIZE),
+      includeOpen: false,
+      targetOnly: true
+    }));
+  }
+  return [...orders.values()].sort((left, right) =>
+    left.kind.localeCompare(right.kind) || left.id - right.id
+  );
+}
+
+export function normalizePoToLinkedTransactionRows(rows = []) {
+  const transactionLines = new Map();
+  for (const row of rows || []) {
+    const key = [
+      row.sourceOrderId,
+      row.transactionType,
+      row.transactionId,
+      row.transactionLineKey
+    ].join("|");
+    if (!transactionLines.has(key)) {
+      transactionLines.set(key, {
+        ...row,
+        sourceLineAliases: [],
+        sourceOrderLineAliases: [],
+        sourceIdentityIssue: ""
+      });
+    }
+    const current = transactionLines.get(key);
+    const sourceLineKey = reconciliationLineAlias(row.sourceLineKey);
+    const sourceOrderLine = reconciliationLineAlias(row.sourceOrderLine);
+    if (sourceLineKey && !current.sourceLineAliases.includes(sourceLineKey)) {
+      current.sourceLineAliases.push(sourceLineKey);
+    }
+    if (sourceOrderLine && !current.sourceOrderLineAliases.includes(sourceOrderLine)) {
+      current.sourceOrderLineAliases.push(sourceOrderLine);
+    }
+    if (
+      current.itemId !== row.itemId
+      || reconciliationIdentityNumber(current.quantity) !== reconciliationIdentityNumber(row.quantity)
+    ) {
+      current.sourceIdentityIssue = "A linked IF/IR line resolved to conflicting Transfer Order source rows.";
+    }
+  }
+  return [...transactionLines.values()].map((row) => {
+    row.sourceLineAliases.sort(reconciliationAliasSort);
+    row.sourceOrderLineAliases.sort(reconciliationAliasSort);
+    if (row.sourceOrderLineAliases.length > 1 && !row.sourceIdentityIssue) {
+      row.sourceIdentityIssue = "A linked IF/IR line points to more than one Transfer Order line number.";
+    }
+    return {
+      ...row,
+      sourceLineKey: row.sourceLineAliases[0] || row.sourceLineKey,
+      sourceOrderLine: Number(row.sourceOrderLineAliases[0]) || row.sourceOrderLineAliases[0] || row.sourceOrderLine,
+      raw: {
+        ...(row.raw && typeof row.raw === "object" ? row.raw : {}),
+        sourceLineAliases: row.sourceLineAliases,
+        sourceOrderLineAliases: row.sourceOrderLineAliases,
+        sourceIdentityIssue: row.sourceIdentityIssue
+      }
+    };
+  });
+}
+
+export async function fetchPoToLinkedTransactionsFromNetSuite(orderIds = []) {
+  const ids = positiveNetSuiteIds(orderIds);
+  if (!ids.length) return [];
+  const allRows = [];
+  const chunkSize = 200;
+  for (let offset = 0; offset < ids.length; offset += chunkSize) {
+    const chunk = ids.slice(offset, offset + chunkSize);
+    const rows = await suiteqlAll(`
+      SELECT
+        link.previousdoc AS source_order_id,
+        source_t.type AS source_record_type,
+        source_t.tranid AS source_order_ref,
+        source_line.id AS source_order_line,
+        source_line.uniquekey AS source_line_key,
+        event_t.id AS transaction_id,
+        event_t.type AS transaction_type,
+        event_t.tranid AS transaction_ref,
+        event_t.status,
+        BUILTIN.DF(event_t.status) AS status_text,
+        event_t.trandate,
+        event_t.lastmodifieddate,
+        event_line.id AS transaction_line,
+        event_line.uniquekey AS transaction_line_key,
+        event_line.item AS item_id,
+        BUILTIN.DF(event_line.item) AS item_name,
+        ABS(NVL(event_line.quantity, 0)) AS quantity,
+        BUILTIN.DF(event_line.units) AS unit,
+        event_line.location AS location_id,
+        BUILTIN.DF(event_line.location) AS location
+      FROM NextTransactionLineLink link
+      INNER JOIN transaction source_t ON source_t.id = link.previousdoc
+      INNER JOIN transactionline source_line
+        ON source_line.transaction = link.previousdoc
+       AND source_line.id = link.previousline
+      INNER JOIN transaction event_t ON event_t.id = link.nextdoc
+      INNER JOIN transactionline event_line
+        ON event_line.transaction = link.nextdoc
+       AND event_line.id = link.nextline
+      WHERE link.previousdoc IN (${chunk.join(",")})
+        AND event_t.type IN ('ItemShip', 'ItemRcpt')
+        AND event_line.item IS NOT NULL
+        AND (event_line.taxline = 'F' OR event_line.taxline IS NULL)
+      ORDER BY link.previousdoc, event_t.id, event_line.id
+    `);
+    allRows.push(...rows);
+  }
+  const mapped = allRows.map((row) => ({
+    sourceOrderId: Number(row.source_order_id),
+    sourceRecordType: row.source_record_type || "",
+    sourceOrderRef: row.source_order_ref || "",
+    sourceOrderLine: Number(row.source_order_line),
+    sourceLineKey: String(row.source_line_key || row.source_order_line || ""),
+    transactionId: Number(row.transaction_id),
+    transactionType: row.transaction_type || "",
+    transactionRef: row.transaction_ref || "",
+    status: row.status || "",
+    statusText: row.status_text || "",
+    transactionDate: row.trandate || null,
+    lastModifiedAt: row.lastmodifieddate || null,
+    transactionLine: Number(row.transaction_line),
+    transactionLineKey: String(row.transaction_line_key || row.transaction_line || ""),
+    itemId: Number(row.item_id) || null,
+    itemName: row.item_name || "",
+    quantity: toNumber(row.quantity),
+    unit: row.unit || "",
+    locationId: Number(row.location_id) || null,
+    location: row.location || "",
+    raw: row
+  }));
+  return normalizePoToLinkedTransactionRows(mapped);
 }
 
 export async function fetchTransferDeliveryOrderFromNetSuite(orderId, locationId = null) {
@@ -1816,6 +2540,53 @@ export async function findTransferOrdersByDependencyMarkerFromNetSuite({
     WHERE t.type = 'TrnfrOrd'
       AND t.transferlocation = ${destination}
       AND ${markerFilter}
+    ORDER BY t.id DESC
+    FETCH FIRST 10 ROWS ONLY
+  `);
+  return result.items || [];
+}
+
+export async function findTransferOrdersBySmartScmMarkerFromNetSuite({
+  proposalId,
+  sourceLocationId,
+  destinationLocationId
+} = {}) {
+  const proposal = Number(proposalId);
+  const source = Number(sourceLocationId);
+  const destination = Number(destinationLocationId);
+  if (!Number.isInteger(proposal) || proposal <= 0) {
+    throw new Error("A valid Smart SCM proposal ID is required.");
+  }
+  if (!Number.isInteger(source) || source <= 0 || !Number.isInteger(destination) || destination <= 0) {
+    throw new Error("Valid NetSuite transfer locations are required to recover a Smart SCM Transfer Order.");
+  }
+  const marker = `MBBS-SCM:${proposal}`.toUpperCase();
+  const result = await suiteql(`
+    SELECT DISTINCT
+      t.id,
+      t.tranid,
+      t.trandate,
+      t.status,
+      BUILTIN.DF(t.status) AS status_text,
+      t.memo,
+      source_tl.location AS source_location_id,
+      BUILTIN.DF(source_tl.location) AS source_location,
+      t.transferlocation AS destination_location_id,
+      BUILTIN.DF(t.transferlocation) AS destination_location
+    FROM transaction t
+    INNER JOIN transactionline source_tl
+      ON source_tl.transaction = t.id
+     AND source_tl.item IS NOT NULL
+     AND source_tl.quantity < 0
+     AND source_tl.location = ${source}
+     AND source_tl.mainline = 'F'
+     AND source_tl.taxline = 'F'
+    WHERE t.type = 'TrnfrOrd'
+      AND t.transferlocation = ${destination}
+      AND (
+        UPPER(COALESCE(t.memo, '')) LIKE '%${marker} |%'
+        OR UPPER(COALESCE(t.memo, '')) LIKE '%${marker}'
+      )
     ORDER BY t.id DESC
     FETCH FIRST 10 ROWS ONLY
   `);

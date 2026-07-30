@@ -146,6 +146,22 @@ function pickupFootprintForLocation(plan, load, location) {
   return total;
 }
 
+function isLocalVrmaOrder(order = {}) {
+  return String(order.sourceTable || order.source_table || "") === "scm_vrma_orders"
+    || String(order.parseSource || order.parse_source || "") === "scm-vrma";
+}
+
+function customOrderStopMinutes(order = {}) {
+  const isCustomOrder = String(order.type || "").trim().toUpperCase() === "CUSTOM"
+    || order.customOrder === true
+    || String(order.sourceTable || order.source_table || "").trim().toLowerCase() === "dispatch_custom_orders";
+  if (!isCustomOrder) return null;
+  const value = order.stopMinutes ?? order.stop_minutes ?? order.raw?.stop_minutes;
+  if (value === null || value === undefined || String(value).trim() === "") return null;
+  const minutes = Number(value);
+  return Number.isInteger(minutes) && minutes >= 0 && minutes <= 1440 ? minutes : null;
+}
+
 function stopClass(plan, row, stop, order) {
   const type = String(row.stop_type || "");
   if (type === "travel") return "travel";
@@ -157,7 +173,8 @@ function stopClass(plan, row, stop, order) {
   }
   if (type === "dropoff") {
     const destination = String(stop?.dropLocation || stop?.destinationYard || order?.destinationYard || stop?.location || "");
-    return ownYards.has(destination) ? "own_yard" : "delivery";
+    if (ownYards.has(destination)) return "own_yard";
+    return isLocalVrmaOrder(order) ? "vendor_yard" : "delivery";
   }
   return "unknown";
 }
@@ -259,7 +276,8 @@ export function dispatchStatisticStopFromRow(row) {
     : currentClass === "delivery"
       ? orderFootprintPallets(order, stop?.lineRowIds)
       : orderFootprintPallets(order, stop?.lineRowIds);
-  const plannedMinutes = plannedStopMinutes(currentClass, planningProfile, pallets);
+  const customDropMinutes = row.stop_type === "dropoff" ? customOrderStopMinutes(order) : null;
+  const plannedMinutes = customDropMinutes ?? plannedStopMinutes(currentClass, planningProfile, pallets);
   const grossSeconds = row.status === "complete" ? secondsBetween(row.started_at, row.completed_at) : 0;
   const restSeconds = row.status === "complete"
     ? Math.min(grossSeconds, Math.max(0, numberValue(row.rest_seconds)))

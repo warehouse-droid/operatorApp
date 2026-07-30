@@ -87,6 +87,11 @@ function buildConfig(env) {
       requestTimeoutMs: Number(env.NETSUITE_REQUEST_TIMEOUT_MS || 120000),
       subsidiaryId: env.NETSUITE_SUBSIDIARY_ID || "",
       webhookSecret: env.NETSUITE_WEBHOOK_SECRET || "",
+      ifIrWebhookSecret: env.NETSUITE_IFIR_WEBHOOK_SECRET || "",
+      ifIrWebhookSignatureMaxAgeSeconds: Math.max(
+        30,
+        Number(env.NETSUITE_IFIR_WEBHOOK_SIGNATURE_MAX_AGE_SECONDS || 300)
+      ),
       directAccessEnabled: mirrorRole === "consumer" ? false : booleanValue(env.NETSUITE_DIRECT_ACCESS_ENABLED, true)
     },
     netSuiteMirror: {

@@ -70,12 +70,14 @@
     { label: "Auto Transfer", href: "/scm/transfer-dependencies", icon: "AT" },
     { label: "PO Split", href: "/scm/POsplit", icon: "PS" },
     { label: "PO/TO Schedule", href: "/scm/POTOschedule", icon: "PT" },
+    { label: "Schedule Formatting", href: "/scm/schedule-formatting", icon: "CF" },
     { label: "VRMA", href: "/scm/VRMA", icon: "VR" },
     { label: "PO Route Rules", href: "/scm/route-rules", icon: "RT" }
   ];
 
   const salesItems = [
     { label: "Sales Menu", href: "/sales", icon: "SM" },
+    { label: "Return Records", href: "/sales/returns", icon: "RR", staffOnly: true },
     { label: "Planning View", href: "/sales/planning", icon: "PL" },
     { label: "PO/TO Schedule", href: "/sales/schedule", icon: "PT" },
     { label: "Truck Monitor", href: "/sales/monitor", icon: "MO" },
@@ -85,6 +87,7 @@
 
   const controlItems = [
     { label: "Dashboard", href: "/control", controlSection: "dashboard", icon: "DB" },
+    { label: "Return Management", href: "/control/returns", controlSection: "returns", icon: "RM" },
     { label: "Order Locks", href: "/control/order-locks", controlSection: "locks", icon: "LK" },
     { label: "Item Classification", href: "/control/item-classification", controlSection: "classification", icon: "CL" },
     { label: "Vendor Mapping", href: "/control/vendor-mapping", controlSection: "vendor-mapping", icon: "VM" },
@@ -98,6 +101,8 @@
     { label: "Overview", href: "/admin", controlSection: "dashboard", icon: "OV" },
     { label: "Accounts", href: "/admin/accounts", controlSection: "operators", icon: "AC" },
     { label: "Sync", href: "/admin/sync", controlSection: "sync", icon: "SY" },
+    { label: "PO / TO Reconcile", href: "/admin/reconciliation", controlSection: "reconciliation", icon: "RC" },
+    { label: "Return Automation", href: "/admin/return-automation", controlSection: "return-automation", icon: "RA" },
     { label: "Yard Printers", href: "/admin/printers", icon: "PR" },
     { label: "Photo Storage", href: "/admin/photo-storage", controlSection: "storage", icon: "PS" },
     { label: "Audit", href: "/admin/audit", controlSection: "audit", icon: "AU" }

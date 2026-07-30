@@ -46,6 +46,110 @@ assert.match(
   "Ordinary pickup stops must continue to use configured service time."
 );
 
+const stopServiceTypeSource = sourceSlice("function stopServiceType", "function stopTimeWindow");
+const makeStopServiceType = Function(
+  "stopIsOwnYard",
+  "resolveStopPlace",
+  '"use strict"; ' + stopServiceTypeSource + "; return stopServiceType;"
+);
+const stopServiceType = makeStopServiceType(
+  (stop) => stop.placeKind === "own",
+  (stop) => ({ kind: stop.placeKind })
+);
+
+assert.equal(
+  stopServiceType({ type: "pick", placeKind: "own" }, {}),
+  "own",
+  "A VRMA pickup in our yard must use the driver's own-yard fixed time."
+);
+assert.equal(
+  stopServiceType({ type: "drop", placeKind: "vendor" }, { sourceTable: "scm_vrma_orders" }),
+  "vendor",
+  "A VRMA drop at a configured vendor yard must use vendor fixed time."
+);
+assert.equal(
+  stopServiceType({ type: "drop", placeKind: "delivery" }, { type: "SO" }),
+  "delivery",
+  "An ordinary customer drop must retain delivery timing."
+);
+assert.equal(
+  stopServiceType({ type: "drop", placeKind: "vendor" }, { type: "SO" }),
+  "delivery",
+  "An SO customer drop must not become vendor timing merely because its address matches a configured vendor yard."
+);
+
+const stopStayMinutesSource = sourceSlice("function explicitCustomDropStopMinutes", "function compactMinuteValue");
+const makeStopStayMinutes = Function(
+  "truckStopMinutes",
+  "stopServiceType",
+  "dropFootprintPallets",
+  "orderFootprintPallets",
+  '"use strict"; ' + stopStayMinutesSource + "; return stopStayMinutes;"
+);
+const configuredStopMinutes = (_truck, type, pallets) => {
+  if (type === "own") return 42;
+  if (type === "vendor") return 36;
+  return 35 + Number(pallets || 0);
+};
+const stopStayMinutes = makeStopStayMinutes(
+  configuredStopMinutes,
+  stopServiceType,
+  () => 10,
+  () => 10
+);
+const vrmaStopMinutes = stopStayMinutes(
+  { type: "pick", placeKind: "own" },
+  { sourceTable: "scm_vrma_orders" },
+  {}
+) + stopStayMinutes(
+  { type: "drop", placeKind: "vendor" },
+  { sourceTable: "scm_vrma_orders" },
+  {}
+);
+
+assert.equal(
+  vrmaStopMinutes,
+  78,
+  "A VRMA must total own-yard fixed plus vendor-yard fixed time without delivery pallet minutes."
+);
+assert.equal(
+  stopStayMinutes({ type: "drop", placeKind: "delivery" }, { type: "SO" }, {}),
+  45,
+  "A ten-pallet customer delivery must retain delivery fixed plus per-pallet time."
+);
+assert.equal(
+  stopStayMinutes(
+    { type: "drop", placeKind: "delivery" },
+    { type: "CUSTOM", customOrder: true, stopMinutes: 58 },
+    {}
+  ),
+  58,
+  "A Custom Order drop must use its dispatcher-entered destination stop time."
+);
+assert.equal(
+  stopStayMinutes(
+    { type: "pick", placeKind: "vendor" },
+    { type: "CUSTOM", customOrder: true, stopMinutes: 58 },
+    {}
+  ),
+  36,
+  "A Custom Order pickup must continue to use the configured vendor-yard time."
+);
+assert.equal(
+  stopStayMinutes(
+    { type: "drop", placeKind: "delivery" },
+    { type: "CUSTOM", customOrder: true, stopMinutes: null },
+    {}
+  ),
+  45,
+  "A legacy Custom Order without stop time must retain the per-driver delivery fallback."
+);
+assert.match(
+  source,
+  /current \+= stopStayMinutes\(stop, order, truck\)/,
+  "Load timeline departures must use the same Custom Order stop time as route estimates."
+);
+
 const routeFunctionSource = sourceSlice("function routeEstimateFromGoogleLegs", "function directionsRequestForLoad");
 const makeRouteHarness = Function(
   "findLoad",

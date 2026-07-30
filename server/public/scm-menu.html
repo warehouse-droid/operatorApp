@@ -10,7 +10,7 @@
   <body>
     <main class="dispatch-shell dispatch-menu-shell" id="scmMenuApp"></main>
     <script src="/i18n.js?v=20260716-yard-movements-v1"></script>
-    <script src="/app-sidebar.js?v=20260721-admin-printers-v1"></script>
+    <script src="/app-sidebar.js?v=20260730-schedule-formatting-v1"></script>
     <script src="/dispatch-auth.js?v=20260716-multi-role-v1"></script>
     <script>
       const scmMenuApp = document.getElementById("scmMenuApp");
@@ -71,8 +71,12 @@
               </button>` : ""}
               <button class="dispatch-menu-card ${yardOnly ? "primary-card" : ""}" onclick="location.href='/scm/POTOschedule'" type="button">
                 <strong>PO / TO Schedule</strong>
-                <span>Review queued, planned, completed, hold, priority, and yard inbound schedule views.</span>
+                <span>Review PO / TO arrivals, priorities, and yard inbound schedule views.</span>
               </button>
+              ${canEdit ? `<button class="dispatch-menu-card" onclick="location.href='/scm/schedule-formatting'" type="button">
+                <strong>Schedule Formatting</strong>
+                <span>Customize Status, Type, and Drop-off Point cell colors plus whole-row Status formatting.</span>
+              </button>` : ""}
               ${canEdit ? `<button class="dispatch-menu-card" onclick="location.href='/scm/VRMA'" type="button">
                 <strong>VRMA</strong>
                 <span>Create local vendor return orders for dispatch planning under the PO pool.</span>

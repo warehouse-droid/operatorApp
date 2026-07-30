@@ -4,6 +4,14 @@ import { query, withTransaction } from "./db.js";
 import { writeDispatchAudit } from "./dispatch-audit-repository.js";
 import { resolveDispatchSalesTarget } from "./dispatch-order-target-repository.js";
 import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
+import {
+  normalizeTransferDependencyReservationOverrides,
+  transferDependencyPlanningAvailability,
+  transferDependencyReservationContract,
+  transferDependencyReservationOverrideKey,
+  transferDependencyReservationOverrideSet,
+  transferDependencyReservationOverridesFromSnapshot
+} from "./transfer-dependency-reservation.js";
 
 export const DEPENDENCY_YARDS = Object.freeze([
   { code: "3445", locationId: 1, address: "3445 Kennedy Road, Toronto, ON", priority: 1, westPenaltyMinutes: 0 },
@@ -1065,13 +1073,13 @@ export async function getDependencyInventoryMatrix(salesOrderId) {
   const itemIds = [...new Set(lines.map((line) => Number(line.item_id)).filter(Number.isInteger))];
   if (!itemIds.length) return { items: [], orderLines, yards: DEPENDENCY_YARDS };
   const balances = await query(
-    `WITH reserved AS (
-       SELECT dl.item_id, d.source_location_id AS location_id, SUM(dl.allocated_quantity) AS reserved_quantity
+    `WITH linked_transfer AS (
+       SELECT dl.item_id, d.source_location_id AS location_id, SUM(dl.allocated_quantity) AS linked_transfer_quantity
          FROM order_dependency_lines dl
          JOIN order_dependencies d ON d.id = dl.dependency_id
-        WHERE d.status <> 'cancelled'
+        WHERE d.status NOT IN ('cancelled', 'delivered')
         GROUP BY dl.item_id, d.source_location_id
-       UNION ALL
+     ), draft_reserved AS (
        SELECT pl.item_id, p.from_location_id AS location_id, SUM(pl.proposed_quantity) AS reserved_quantity
          FROM scm_transfer_dependency_proposal_lines pl
          JOIN scm_transfer_dependency_proposals p ON p.id = pl.proposal_id
@@ -1085,21 +1093,25 @@ export async function getDependencyInventoryMatrix(salesOrderId) {
              LIMIT 1
           ), -1)
         GROUP BY pl.item_id, p.from_location_id
-     ), reserved_sum AS (
-       SELECT item_id, location_id, SUM(reserved_quantity) AS reserved_quantity
-         FROM reserved
-        GROUP BY item_id, location_id
      )
      SELECT i.item_id, i.item_name, i.stock_unit, i.to_plt, i.to_lyr, i.to_sec, i.to_pcs,
             y.location_id, y.location,
             COALESCE(b.quantity_on_hand, 0) AS quantity_on_hand,
             COALESCE(b.quantity_available, 0) AS quantity_available,
-            COALESCE(r.reserved_quantity, 0) AS reserved_quantity,
-            GREATEST(COALESCE(b.quantity_available, 0) - COALESCE(r.reserved_quantity, 0), 0) AS effective_available
+            COALESCE(draft.reserved_quantity, 0) AS reserved_quantity,
+            COALESCE(linked.linked_transfer_quantity, 0) AS linked_transfer_quantity,
+            GREATEST(
+              COALESCE(b.quantity_available, 0)
+              - COALESCE(draft.reserved_quantity, 0),
+              0
+            ) AS effective_available
        FROM inventory_items i
        CROSS JOIN (VALUES (1::bigint, '3445'::text), (28, '2967'), (15, '12441'), (26, '150')) y(location_id, location)
        LEFT JOIN inventory_balances b ON b.item_id = i.item_id AND b.location_id = y.location_id
-       LEFT JOIN reserved_sum r ON r.item_id = i.item_id AND r.location_id = y.location_id
+       LEFT JOIN draft_reserved draft
+         ON draft.item_id = i.item_id AND draft.location_id = y.location_id
+       LEFT JOIN linked_transfer linked
+         ON linked.item_id = i.item_id AND linked.location_id = y.location_id
       WHERE i.item_id = ANY($1::bigint[])
       ORDER BY i.item_name, y.location_id`,
     [itemIds, Number(salesOrderId)]
@@ -1125,10 +1137,71 @@ export async function getDependencyInventoryMatrix(salesOrderId) {
       quantityOnHand: number(row.quantity_on_hand),
       quantityAvailable: number(row.quantity_available),
       reservedQuantity: number(row.reserved_quantity),
+      linkedTransferQuantity: number(row.linked_transfer_quantity),
       effectiveAvailable: number(row.effective_available)
     });
   }
   return { items: [...items.values()], orderLines, yards: DEPENDENCY_YARDS };
+}
+
+function selectedTransferDependencyReservationOverrides(
+  requested,
+  matrix,
+  outboundLocationId,
+  operatorId
+) {
+  const normalized = normalizeTransferDependencyReservationOverrides(requested, { strict: true });
+  if (!normalized.length) return { entries: [], keys: new Set() };
+  const balances = new Map();
+  for (const item of matrix?.items || []) {
+    for (const balance of item.balances || []) {
+      balances.set(
+        transferDependencyReservationOverrideKey(item.itemId, balance.locationId),
+        { item, balance }
+      );
+    }
+  }
+  const entries = normalized.map((override) => {
+    const key = transferDependencyReservationOverrideKey(override.itemId, override.locationId);
+    const selected = balances.get(key);
+    if (!selected) {
+      throw Object.assign(
+        new Error("A selected reservation override no longer matches this Sales Order item and yard."),
+        { status: 409, code: "TRANSFER_DEPENDENCY_RESERVATION_OVERRIDE_STALE" }
+      );
+    }
+    if (String(override.locationId) === String(outboundLocationId)) {
+      throw Object.assign(
+        new Error("The outbound yard cannot be selected as a transfer source reservation override."),
+        { status: 400, code: "TRANSFER_DEPENDENCY_RESERVATION_OVERRIDE_OUTBOUND" }
+      );
+    }
+    const quantityAvailable = number(selected.balance.quantityAvailable);
+    const reservedQuantity = number(selected.balance.reservedQuantity);
+    const effectiveAvailable = number(selected.balance.effectiveAvailable);
+    if (reservedQuantity <= EPSILON || quantityAvailable <= effectiveAvailable + EPSILON) {
+      throw Object.assign(
+        new Error(`${selected.item.itemName || override.itemId} at ${selected.balance.location || override.locationId} no longer has an unsent draft reservation to override.`),
+        { status: 409, code: "TRANSFER_DEPENDENCY_RESERVATION_OVERRIDE_STALE" }
+      );
+    }
+    return {
+      itemId: Number(override.itemId),
+      itemName: selected.item.itemName || "",
+      locationId: Number(override.locationId),
+      location: selected.balance.location || YARD_BY_ID.get(String(override.locationId))?.code || "",
+      quantityAvailable,
+      reservedQuantity,
+      effectiveAvailable,
+      policy: transferDependencyReservationContract.policy,
+      selectedBy: text(operatorId),
+      selectedAt: new Date().toISOString()
+    };
+  });
+  return {
+    entries,
+    keys: transferDependencyReservationOverrideSet(entries)
+  };
 }
 
 async function googleRouteMinutes(origin, destination) {
@@ -1151,7 +1224,12 @@ async function googleRouteMinutes(origin, destination) {
   }
 }
 
-export async function generateTransferDependencySuggestion({ salesOrderId, mode = "yard_replenishment", operatorId = null } = {}) {
+export async function generateTransferDependencySuggestion({
+  salesOrderId,
+  mode = "yard_replenishment",
+  reservationOverrides = [],
+  operatorId = null
+} = {}) {
   const normalizedMode = normalizeMode(mode);
   const candidates = await listTransferDependencyCandidates({ salesOrderId });
   const order = candidates[0];
@@ -1159,6 +1237,26 @@ export async function generateTransferDependencySuggestion({ salesOrderId, mode 
   const destination = YARD_BY_ID.get(String(order.outboundLocationId));
   if (!destination) throw new Error("The Sales Order outbound location is not one of the four configured yards.");
   const matrix = await getDependencyInventoryMatrix(salesOrderId);
+  const selectedOverrides = selectedTransferDependencyReservationOverrides(
+    reservationOverrides,
+    matrix,
+    order.outboundLocationId,
+    operatorId
+  );
+  const planningItems = matrix.items.map((item) => ({
+    ...item,
+    balances: (item.balances || []).map((balance) => {
+      const availability = transferDependencyPlanningAvailability({
+        ...balance,
+        itemId: item.itemId
+      }, selectedOverrides.keys);
+      return {
+        ...balance,
+        effectiveAvailable: availability.planningAvailable,
+        reservationOverrideApplied: availability.overridden
+      };
+    })
+  }));
   const routeRows = await Promise.all(DEPENDENCY_YARDS.map(async (yard) => ({
     ...yard,
     routeMinutes: yard.locationId === destination.locationId
@@ -1172,12 +1270,12 @@ export async function generateTransferDependencySuggestion({ salesOrderId, mode 
       routeScore: yard.routeMinutes === null ? (10000 + yard.priority) : yard.routeMinutes + yard.westPenaltyMinutes
     }))
     .sort((left, right) => left.routeScore - right.routeScore || left.priority - right.priority);
-  const matrixByItem = new Map(matrix.items.map((item) => [String(item.itemId), item]));
-  const remainingAvailability = new Map(matrix.items.flatMap((item) => (item.balances || []).map((balance) => [
+  const matrixByItem = new Map(planningItems.map((item) => [String(item.itemId), item]));
+  const remainingAvailability = new Map(planningItems.flatMap((item) => (item.balances || []).map((balance) => [
     `${item.itemId}:${balance.locationId}`,
     number(balance.effectiveAvailable)
   ])));
-  const preferredSourceByItem = preferredFullCoverageSourceYards(order.lines, matrix.items, rankedYards);
+  const preferredSourceByItem = preferredFullCoverageSourceYards(order.lines, planningItems, rankedYards);
   const proposalGroups = new Map();
   let uncovered = 0;
   for (const line of order.lines) {
@@ -1237,7 +1335,9 @@ export async function generateTransferDependencySuggestion({ salesOrderId, mode 
   const inventorySnapshot = {
     capturedAt: new Date().toISOString(),
     salesOrderId: order.salesOrderId,
-    balances: matrix.items
+    balances: matrix.items,
+    reservationOverridePolicy: transferDependencyReservationContract.policy,
+    reservationOverrides: selectedOverrides.entries
   };
   return withTransaction(async () => {
     const prior = await query(
@@ -1312,7 +1412,18 @@ export async function generateTransferDependencySuggestion({ salesOrderId, mode 
         proposalCount: proposalGroups.size,
         uncoveredQuantity: uncovered,
         mode: normalizedMode,
-        fullCoverItemCount: preferredSourceByItem.size
+        fullCoverItemCount: preferredSourceByItem.size,
+        reservationOverrideCount: selectedOverrides.entries.length,
+        reservationOverrides: selectedOverrides.entries.map((entry) => ({
+          itemId: entry.itemId,
+          itemName: entry.itemName,
+          locationId: entry.locationId,
+          location: entry.location,
+          quantityAvailable: entry.quantityAvailable,
+          reservedQuantity: entry.reservedQuantity,
+          effectiveAvailable: entry.effectiveAvailable,
+          policy: entry.policy
+        }))
       }
     });
     return getTransferDependencyBatch(batchId);
@@ -1422,6 +1533,8 @@ export async function getTransferDependencyBatch(batchId) {
     status: batch.status,
     inventorySnapshot: batch.inventory_snapshot,
     inventorySnapshotAt: batch.inventory_snapshot_at,
+    reservationOverridePolicy: batch.inventory_snapshot?.reservationOverridePolicy || "",
+    reservationOverrides: transferDependencyReservationOverridesFromSnapshot(batch.inventory_snapshot),
     uncoveredShortageQuantity: number(batch.uncovered_shortage_qty),
     allowIncompleteCoverage: batch.allow_incomplete_coverage,
     createdAt: batch.created_at,
@@ -2061,7 +2174,7 @@ export async function mergeTransferDependencyProposals(batchId, input = {}, oper
   });
 }
 
-async function validateTransferDependencyBatchForCreation(batch, { proposalIds = null } = {}) {
+export async function validateTransferDependencyBatchForCreation(batch, { proposalIds = null } = {}) {
   const selectedIds = proposalIds ? new Set(proposalIds.map(String)) : null;
   const pendingProposals = (batch.proposals || []).filter((proposal) =>
     !["created", "attention", "cancelled"].includes(proposal.creationStatus)
@@ -2111,11 +2224,11 @@ async function validateTransferDependencyBatchForCreation(batch, { proposalIds =
   ]).filter(Number.isInteger))];
   const locationIds = [...new Set(pendingProposals.map((proposal) => Number(proposal.fromLocationId)).filter(Number.isInteger))];
   const availability = itemIds.length && locationIds.length ? await query(
-    `WITH dependency_reserved AS (
-       SELECT dl.item_id, d.source_location_id AS location_id, SUM(dl.allocated_quantity) AS reserved_quantity
+    `WITH linked_transfer AS (
+       SELECT dl.item_id, d.source_location_id AS location_id, SUM(dl.allocated_quantity) AS linked_transfer_quantity
          FROM order_dependency_lines dl
          JOIN order_dependencies d ON d.id = dl.dependency_id
-        WHERE d.status <> 'cancelled'
+        WHERE d.status NOT IN ('cancelled', 'delivered')
           AND dl.item_id = ANY($1::bigint[])
           AND d.source_location_id = ANY($2::bigint[])
         GROUP BY dl.item_id, d.source_location_id
@@ -2130,22 +2243,37 @@ async function validateTransferDependencyBatchForCreation(batch, { proposalIds =
         GROUP BY pl.item_id, p.from_location_id
      )
      SELECT item.item_id, yard.location_id,
+            COALESCE(balance.quantity_available, 0) AS quantity_available,
+            COALESCE(proposal.reserved_quantity, 0) AS reserved_quantity,
+            COALESCE(linked.linked_transfer_quantity, 0) AS linked_transfer_quantity,
             GREATEST(
               COALESCE(balance.quantity_available, 0)
-              - COALESCE(dependency.reserved_quantity, 0)
               - COALESCE(proposal.reserved_quantity, 0), 0
             ) AS effective_available
        FROM unnest($1::bigint[]) item(item_id)
        CROSS JOIN unnest($2::bigint[]) yard(location_id)
        LEFT JOIN inventory_balances balance
          ON balance.item_id = item.item_id AND balance.location_id = yard.location_id
-       LEFT JOIN dependency_reserved dependency
-         ON dependency.item_id = item.item_id AND dependency.location_id = yard.location_id
+       LEFT JOIN linked_transfer linked
+         ON linked.item_id = item.item_id AND linked.location_id = yard.location_id
        LEFT JOIN proposal_reserved proposal
          ON proposal.item_id = item.item_id AND proposal.location_id = yard.location_id`,
     [itemIds, locationIds, Number(batch.id)]
   ) : { rows: [] };
-  const availableBySource = new Map(availability.rows.map((row) => [`${row.item_id}:${row.location_id}`, number(row.effective_available)]));
+  const reservationOverrideKeys = transferDependencyReservationOverrideSet(batch.reservationOverrides);
+  const availableBySource = new Map(availability.rows.map((row) => {
+    const resolved = transferDependencyPlanningAvailability(row, reservationOverrideKeys);
+    return [
+      `${row.item_id}:${row.location_id}`,
+      {
+        available: number(resolved.planningAvailable),
+        overridden: resolved.overridden,
+        reservedQuantity: number(row.reserved_quantity),
+        linkedTransferQuantity: number(row.linked_transfer_quantity),
+        quantityAvailable: number(row.quantity_available)
+      }
+    ];
+  }));
   const requestedBySource = new Map();
   for (const proposal of pendingProposals) {
     for (const line of proposal.lines || []) {
@@ -2160,13 +2288,17 @@ async function validateTransferDependencyBatchForCreation(batch, { proposalIds =
     }
   }
   for (const [key, requested] of requestedBySource) {
-    const available = number(availableBySource.get(key));
+    const sourceAvailability = availableBySource.get(key) || {};
+    const available = number(sourceAvailability.available);
     if (requested > available + EPSILON) {
       const [itemId, locationId] = key.split(":");
       const yard = YARD_BY_ID.get(String(locationId));
       const item = pendingProposals.flatMap((proposal) => proposal.lines || []).find((line) => String(line.itemId) === itemId);
       const palletProposal = pendingProposals.find((proposal) => String(proposal.palletItemId) === itemId);
-      throw new Error(`${yard?.code || locationId} has ${available} available for ${item?.itemName || palletProposal?.palletItemName || itemId}, below the proposed ${requested}.`);
+      const policy = sourceAvailability.overridden
+        ? " after applying the selected full NetSuite Available override"
+        : "";
+      throw new Error(`${yard?.code || locationId} has ${available} available${policy} for ${item?.itemName || palletProposal?.palletItemName || itemId}, below the proposed ${requested}.`);
     }
   }
   const currentShortage = shortageRows.reduce((total, row) => total + number(row.unresolved_quantity), 0);
@@ -2410,7 +2542,23 @@ export async function confirmTransferDependencyBatch(batchId, {
     entityId: String(batchId),
     orderId: batch.salesOrderRef,
     operatorId,
-    details: { status, created, failed, attention, results }
+    details: {
+      status,
+      created,
+      failed,
+      attention,
+      results,
+      reservationOverrideCount: (batch.reservationOverrides || []).length,
+      reservationOverrides: (batch.reservationOverrides || []).map((entry) => ({
+        itemId: entry.itemId,
+        itemName: entry.itemName,
+        locationId: entry.locationId,
+        location: entry.location,
+        quantityAvailable: entry.quantityAvailable,
+        reservedQuantity: entry.reservedQuantity,
+        policy: entry.policy
+      }))
+    }
   });
   return { batch: await getTransferDependencyBatch(batchId), results };
 }
@@ -2785,6 +2933,8 @@ function loadSequenceIndex(plan = {}) {
           firstPickupSequence: pickupSequences.length ? Math.min(...pickupSequences) : sequence,
           firstPickupArrival: pickupArrivals.length ? Math.min(...pickupArrivals) : null,
           planDate: plan.planDate,
+          driverLogin: loadAssignment.driverLogin,
+          driverSequence: loadAssignment.driverSequence,
           truckPlate: loadAssignment.truckPlate,
           truckIndex,
           loadIndex: truckLoadSequence.get(`${truckIndex}:${loadIndex}`) ?? loadIndex,
@@ -2817,13 +2967,22 @@ function replenishmentTransferPrecedesSales(transferAssignment, salesAssignment)
   const transferFinish = dependencyTimingNumber(transferAssignment.loadFinish ?? transferAssignment.departure);
   const salesPickup = dependencyTimingNumber(salesAssignment.firstPickupArrival);
   const hasComparableTiming = Number.isFinite(transferFinish) && Number.isFinite(salesPickup);
-  const sameTruck = String(transferAssignment.truckPlate || "") === String(salesAssignment.truckPlate || "");
-  if (sameTruck) {
-    return hasComparableTiming
-      ? transferFinish <= salesPickup
-      : Number(transferAssignment.loadIndex) < Number(salesAssignment.loadIndex);
+  if (hasComparableTiming) return transferFinish <= salesPickup;
+  const sameDriver = transferAssignment.driverLogin
+    && String(transferAssignment.driverLogin) === String(salesAssignment.driverLogin);
+  if (sameDriver) {
+    const transferDriverSequence = dependencyTimingNumber(transferAssignment.driverSequence);
+    const salesDriverSequence = dependencyTimingNumber(salesAssignment.driverSequence);
+    if (
+      Number.isFinite(transferDriverSequence)
+      && Number.isFinite(salesDriverSequence)
+      && transferDriverSequence !== salesDriverSequence
+    ) {
+      return transferDriverSequence < salesDriverSequence;
+    }
   }
-  return hasComparableTiming && transferFinish <= salesPickup;
+  const sameTruck = String(transferAssignment.truckPlate || "") === String(salesAssignment.truckPlate || "");
+  return sameTruck && Number(transferAssignment.loadIndex) < Number(salesAssignment.loadIndex);
 }
 
 async function priorPlannedTransferRefs(transferRefs = [], plan = {}) {

@@ -13,7 +13,7 @@ import { calculateSmartScmOrderRequirement, calculateSmartScmPolicyLevels } from
 
 const EPSILON = 0.000001;
 const VENDOR_REPLY_LOAD_STATUSES = Object.freeze(["order_requested", "vendor_replied"]);
-const NETSUITE_PO_REVIEW_STATUSES = Object.freeze(["confirmed", "executing", "failed", "attention", "completed"]);
+const NETSUITE_PO_REVIEW_STATUSES = Object.freeze(["confirmed", "executing", "failed", "attention", "completed", "cancelled"]);
 
 function number(value, fallback = 0) {
   const parsed = Number(value);
@@ -397,7 +397,7 @@ async function createVendorResolutionChild(source, { kind, status, label, operat
   const proposalKey = `${source.proposalKey}:${label}:${sequence}`;
   const created = await query(
     `INSERT INTO scm_smart_proposals (
-       run_id, proposal_key, proposal_type, phase, source_kind, source_location_id, source_name,
+       run_id, proposal_key, proposal_type, phase, source_kind, source_location_id, source_vendor_yard_id, source_name,
        destination_location_id, destination_name, vendor, plant, status, urgent, provisional, memo,
        order_requested_at, order_requested_by, vendor_replied_at, vendor_replied_by,
        vendor_response_status, vendor_ready_date, vendor_reference, vendor_packing_number,
@@ -405,7 +405,7 @@ async function createVendorResolutionChild(source, { kind, status, label, operat
        pallet_quantity_overrides,
        parent_proposal_id, vendor_resolution_kind, price_snapshot_at, confirmed_at, confirmed_by
      )
-     SELECT run_id, $2, proposal_type, phase, source_kind, source_location_id, source_name,
+     SELECT run_id, $2, proposal_type, phase, source_kind, source_location_id, source_vendor_yard_id, source_name,
             destination_location_id, destination_name, vendor, plant, $3, urgent, provisional, memo,
             order_requested_at, order_requested_by, vendor_replied_at, vendor_replied_by,
             $4, vendor_ready_date, vendor_reference, vendor_packing_number,
@@ -425,7 +425,7 @@ async function createVendorHeldLineChild(source, line) {
   const proposalKey = `${source.proposalKey}:held-line:${line.id}`;
   const created = await query(
     `INSERT INTO scm_smart_proposals (
-       run_id, proposal_key, proposal_type, phase, source_kind, source_location_id, source_name,
+       run_id, proposal_key, proposal_type, phase, source_kind, source_location_id, source_vendor_yard_id, source_name,
        destination_location_id, destination_name, vendor, plant, status, urgent, provisional,
        vendor_reply_due_at, memo, execution_mode, route_stops, manually_grouped,
        order_requested_at, order_requested_by, vendor_replied_at, vendor_replied_by,
@@ -433,7 +433,7 @@ async function createVendorHeldLineChild(source, line) {
        vendor_credit_status, vendor_remarks, vendor_response_source,
        parent_proposal_id, vendor_resolution_kind, po_execution_status
      )
-     SELECT run_id, $2, proposal_type, phase, source_kind, source_location_id, source_name,
+     SELECT run_id, $2, proposal_type, phase, source_kind, source_location_id, source_vendor_yard_id, source_name,
             destination_location_id, destination_name, vendor, plant, 'vendor_replied', urgent, provisional,
             vendor_reply_due_at,
             CONCAT_WS(' · ', NULLIF(memo, ''), 'held vendor line ' || $3 || ' from load #' || id),
@@ -696,14 +696,23 @@ async function enrichSmartScmNetSuitePoReview(proposal) {
     lines
   };
   const reviewBlockers = smartScmPoReviewBlockers(enriched);
+  const executionUpdatedAt = new Date(enriched.updatedAt || 0).getTime();
+  const staleExecution = enriched.status === "executing"
+    && Number.isFinite(executionUpdatedAt)
+    && executionUpdatedAt > 0
+    && Date.now() - executionUpdatedAt >= 5 * 60 * 1000;
   return {
     ...enriched,
     reviewBlockers,
     blockers: reviewBlockers.map((blocker) => blocker.message),
-    canInsertIntoNetSuite: ["confirmed", "failed"].includes(enriched.status)
+    canInsertIntoNetSuite: (["confirmed", "failed"].includes(enriched.status) || staleExecution)
       && !enriched.netsuitePurchaseOrderId
       && !enriched.netsuitePurchaseOrderRef
       && reviewBlockers.length === 0,
+    canRemoveFromStaging: enriched.status === "confirmed"
+      && String(enriched.poExecutionStatus || "idle") === "idle"
+      && !enriched.netsuitePurchaseOrderId
+      && !enriched.netsuitePurchaseOrderRef,
     purchaseTotal: round([...lines, ...palletLines].reduce((sum, line) => sum + positive(line.purchaseAmount), 0), 2)
   };
 }
@@ -739,11 +748,81 @@ export async function updateSmartScmNetSuitePoReviewPalletQuantity(
   return getSmartScmNetSuitePoReviewLoad(review.id);
 }
 
+export async function removeSmartScmNetSuitePoReviewLoad(proposalId, operatorId = null) {
+  const id = Number(proposalId);
+  if (!Number.isInteger(id) || id <= 0) {
+    throw Object.assign(new Error("Select a valid staged PO review."), { status: 400 });
+  }
+  const outcome = await withTransaction(async () => {
+    const result = await query(
+      `SELECT id, run_id, status, vendor_resolution_kind, po_execution_status,
+              netsuite_purchase_order_id, netsuite_purchase_order_ref
+         FROM scm_smart_proposals
+        WHERE id = $1
+        FOR UPDATE`,
+      [id]
+    );
+    if (!result.rowCount) {
+      throw Object.assign(new Error("Smart SCM NetSuite PO review was not found."), { status: 404 });
+    }
+    const review = result.rows[0];
+    if (review.vendor_resolution_kind !== "netsuite_po_review") {
+      throw Object.assign(new Error("Only a staged NetSuite PO review can be removed here."), { status: 409 });
+    }
+    if (review.status === "cancelled" && review.po_execution_status === "removed") {
+      return { id, runId: Number(review.run_id), removed: false, reused: true };
+    }
+    if (review.netsuite_purchase_order_id || text(review.netsuite_purchase_order_ref)) {
+      throw Object.assign(new Error("This purchase order already has a NetSuite reference and cannot be removed locally."), { status: 409 });
+    }
+    if (review.status !== "confirmed" || review.po_execution_status !== "idle") {
+      throw Object.assign(
+        new Error("Only an unattempted staged PO can be removed. Failed, executing, or attention records must be reconciled with NetSuite first."),
+        { status: 409 }
+      );
+    }
+    await query(
+      `UPDATE scm_smart_proposals
+          SET status = 'cancelled',
+              vendor_response_status = 'cancelled',
+              po_execution_status = 'removed',
+              po_execution_error = NULL,
+              updated_at = now()
+        WHERE id = $1`,
+      [id]
+    );
+    await recordStructuralRevision(Number(review.run_id), "netsuite_po_review_removed", {
+      reviewProposalId: id,
+      previousStatus: review.status,
+      linesRetained: true
+    }, operatorId);
+    return { id, runId: Number(review.run_id), removed: true, reused: false };
+  });
+  if (outcome.removed) {
+    await writeAudit({
+      actorOperatorId: operatorId,
+      source: "smart_scm",
+      action: "smart_scm.purchase.staged_removed",
+      details: {
+        proposalId: outcome.id,
+        runId: outcome.runId,
+        linesRetained: true
+      }
+    });
+  }
+  return {
+    ...outcome,
+    review: await getSmartScmNetSuitePoReviewLoad(id)
+  };
+}
+
 export async function listSmartScmNetSuitePoReviewLoads({ search = "", view = "all", statuses = null, limit = 500 } = {}) {
   const requestedStatuses = Array.isArray(statuses)
     ? statuses.map(String).filter((status) => NETSUITE_PO_REVIEW_STATUSES.includes(status))
     : view === "completed"
       ? ["completed"]
+      : view === "removed"
+        ? ["cancelled"]
       : view === "pending"
         ? ["confirmed", "executing", "failed", "attention"]
         : [...NETSUITE_PO_REVIEW_STATUSES];

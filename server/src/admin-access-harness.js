@@ -26,6 +26,7 @@ function includesAll(source, values, label) {
 includesAll(server, [
   '"/admin/accounts"',
   '"/admin/sync"',
+  '"/admin/reconciliation"',
   '"/admin/photo-storage"',
   '"/admin/audit"',
   'if (role === "admin") return "/admin";',
@@ -55,9 +56,10 @@ includesAll(control, [
   'const STAFF_TOKEN_KEY = "mbbs.staff.token";',
   'const STAFF_ROLES_KEY = "mbbs.staff.roles";',
   'const IS_ADMIN_PAGE = window.location.pathname.startsWith("/admin");',
-  'const ADMIN_SECTIONS = new Set(["dashboard", "operators", "sync", "storage", "audit"]);',
+  'const ADMIN_SECTIONS = new Set(["dashboard", "operators", "sync", "reconciliation", "return-automation", "storage", "audit"]);',
   'const ADMIN_SECTION_ROUTES = {',
   'operators: "/admin/accounts"',
+  'reconciliation: "/admin/reconciliation"',
   'storage: "/admin/photo-storage"',
   'const CONTROL_SECTION_ROUTES = {',
   'function sectionFromCurrentRoute()',
@@ -131,22 +133,28 @@ includesAll(sidebar, [
   '{ label: "Operator Load Records", href: "/control/operator-load-records"',
   '{ label: "Accounts", href: "/admin/accounts", controlSection: "operators"',
   '{ label: "Sync", href: "/admin/sync", controlSection: "sync"',
+  '{ label: "PO / TO Reconcile", href: "/admin/reconciliation", controlSection: "reconciliation"',
   '{ label: "Photo Storage", href: "/admin/photo-storage", controlSection: "storage"',
   '{ label: "Audit", href: "/admin/audit", controlSection: "audit"'
 ], "navigation");
 
 assert.ok(!sidebar.includes("event.preventDefault()"), "Sidebar section links must retain native navigation");
 includesAll(control, [
-  'document.body.classList.toggle("admin-sync-page", IS_ADMIN_PAGE && activeSection === "sync");'
-], "Admin Sync responsive scope");
+  'IS_ADMIN_PAGE && ["sync", "reconciliation"].includes(activeSection)',
+  '"admin-reconciliation-page"',
+  'IS_ADMIN_PAGE && activeSection === "reconciliation"'
+], "Admin Sync and reconciliation responsive scope");
 includesAll(controlCss, [
   "@media (max-width: 760px)",
   ".public-sales-access-card",
   ".public-sales-access-control",
   ".admin-sync-page .sync-mode-grid",
   ".admin-sync-page .sync-status-grid",
-  ".admin-sync-page .panel > .actions"
-], "Admin Sync phone layout");
+  ".admin-sync-page .panel > .actions",
+  ".scm-reconciliation-workspace",
+  ".scm-reconciliation-run-browser",
+  ".scm-reconciliation-selected-detail"
+], "Admin Sync and reconciliation phone layout");
 
 includesAll(salesSettingsRepository, [
   "export async function getSalesPortalSettings",

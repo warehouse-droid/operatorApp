@@ -27,6 +27,7 @@ function cleanDriver(driver = {}, displayOrder = 0) {
     password: String(driver.password || ""),
     samsaraPrimaryLogin: String(driver.samsaraPrimaryLogin || "").trim(),
     samsaraSecondaryLogin: String(driver.samsaraSecondaryLogin || "").trim(),
+    samsaraEnabled: driver.samsaraEnabled === true || driver.connectSamsara === true,
     ownYardFixedMinutes: numberValue(driver.ownYardFixedMinutes ?? driver.loadMinutes, 40),
     vendorFixedMinutes: numberValue(driver.vendorFixedMinutes ?? driver.outsideFixedMinutes ?? driver.unloadMinutes, 35),
     deliveryFixedMinutes: numberValue(driver.deliveryFixedMinutes ?? driver.outsideFixedMinutes ?? driver.unloadMinutes, 35),
@@ -66,6 +67,7 @@ function publicDriver(row) {
     passwordConfigured: Boolean(row.password_hash && row.password_salt),
     samsaraPrimaryLogin: row.samsara_primary_login,
     samsaraSecondaryLogin: row.samsara_secondary_login,
+    samsaraEnabled: row.samsara_enabled === true,
     ownYardFixedMinutes,
     vendorFixedMinutes,
     deliveryFixedMinutes,
@@ -157,6 +159,7 @@ async function upsertDrivers(drivers, { deactivateMissing = true } = {}) {
       passwordSalt,
       driver.samsaraPrimaryLogin,
       driver.samsaraSecondaryLogin,
+      driver.samsaraEnabled,
       driver.ownYardFixedMinutes,
       driver.vendorFixedMinutes,
       driver.deliveryFixedMinutes,
@@ -174,23 +177,24 @@ async function upsertDrivers(drivers, { deactivateMissing = true } = {}) {
                password_salt = $6,
                samsara_primary_login = $7,
                samsara_secondary_login = $8,
-               own_yard_fixed_minutes = $9,
-               vendor_fixed_minutes = $10,
-               delivery_fixed_minutes = $11,
-               minutes_per_pallet = $12,
-               display_order = $13,
+               samsara_enabled = $9,
+               own_yard_fixed_minutes = $10,
+               vendor_fixed_minutes = $11,
+               delivery_fixed_minutes = $12,
+               minutes_per_pallet = $13,
+               display_order = $14,
                updated_at = now()
-           WHERE id = $14
+           WHERE id = $15
            RETURNING id`,
           [...params, existing.id]
         )
       : await query(
           `INSERT INTO dispatch_drivers (
              name, license_class, license_number, login, password_hash, password_salt,
-             samsara_primary_login, samsara_secondary_login, own_yard_fixed_minutes,
+             samsara_primary_login, samsara_secondary_login, samsara_enabled, own_yard_fixed_minutes,
              vendor_fixed_minutes, delivery_fixed_minutes, minutes_per_pallet, display_order, active
            )
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
            RETURNING id`,
           [...params, driver.active]
         );

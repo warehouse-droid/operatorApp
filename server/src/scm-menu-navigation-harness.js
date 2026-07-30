@@ -16,6 +16,11 @@ assert.match(
   "The SCM sidebar must expose the NetSuite PO review page."
 );
 assert.match(
+  sidebar,
+  /\{ label: "Schedule Formatting", href: "\/scm\/schedule-formatting", icon: "CF" \}/,
+  "The SCM sidebar must expose PO/TO Schedule formatting."
+);
+assert.match(
   menu,
   /<button class="dispatch-menu-card primary-card" onclick="location\.href='\/scm\/netsuite-po'" type="button">[\s\S]*?<strong>NetSuite PO<\/strong>/,
   "The visible SCM menu card grid must expose the NetSuite PO review page."
@@ -33,11 +38,22 @@ assert.ok(
     && server.includes('res.sendFile(path.join(publicDir, "scm-netsuite-po.html"));'),
   "The NetSuite PO menu target must have a server route."
 );
+assert.ok(
+  menu.includes("Schedule Formatting")
+    && menu.includes("location.href='/scm/schedule-formatting'"),
+  "The SCM menu must expose the company PO/TO Schedule formatting page."
+);
+assert.ok(
+  server.includes('app.get("/scm/schedule-formatting", (req, res) => {')
+    && server.includes('res.sendFile(path.join(publicDir, "scm-schedule-formatting.html"));'),
+  "The Schedule Formatting menu target must have a server route."
+);
 
 console.log(JSON.stringify({
   ok: true,
   sidebarEntry: true,
   scmMenuCard: true,
   authorizedRolesAligned: true,
-  routePresent: true
+  routePresent: true,
+  scheduleFormatting: true
 }));

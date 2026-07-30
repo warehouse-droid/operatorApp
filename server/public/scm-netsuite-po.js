@@ -169,6 +169,17 @@ function poLoadCard(load) {
   const calculatedAmount = lines.reduce((sum, line) => sum + Number(poLineAmount(line) || 0), 0);
   const amount = load.purchaseTotal !== null && load.purchaseTotal !== undefined && Number.isFinite(Number(load.purchaseTotal)) ? Number(load.purchaseTotal) : calculatedAmount;
   const canInsert = poCanWrite() && load.canInsertIntoNetSuite === true;
+  const canRemove = poCanWrite() && load.canRemoveFromStaging === true;
+  const insertAction = canInsert
+    ? `<button class="smart-button primary" data-po-action="insert" data-proposal-id="${load.id}" type="button">${load.status === "executing" ? "Recover PO insertion" : "Insert PO into NetSuite"}</button>`
+    : load.netsuitePurchaseOrderRef
+      ? poPill("completed", "Inserted")
+      : load.status === "cancelled"
+        ? poPill("cancelled", "Removed")
+        : `<button class="smart-button primary" type="button" disabled>Insert PO into NetSuite</button>`;
+  const removeAction = canRemove
+    ? `<button class="smart-button danger" data-po-action="remove" data-proposal-id="${load.id}" type="button">Remove staged PO</button>`
+    : "";
   return `<article class="smart-proposal smart-po-review-card" data-po-review-load="${load.id}">
     <div class="smart-proposal-head smart-po-review-head">
       <div><strong>PO</strong><div>${poPill(load.status)}</div></div>
@@ -176,7 +187,7 @@ function poLoadCard(load) {
       <div class="smart-proposal-metric"><strong>${poNumber(load.totalPallets ?? materialLines.reduce((sum, line) => sum + Number(line.confirmedPallets || 0), 0), 2)} PLT</strong><span>Confirmed</span></div>
       <div class="smart-proposal-metric"><strong>${poMoney(amount)}</strong><span>Estimated total</span></div>
       <div class="smart-proposal-metric"><strong>${poEscape(load.netsuitePurchaseOrderRef || "—")}</strong><span>NetSuite PO</span></div>
-      <div class="smart-po-review-action">${canInsert ? `<button class="smart-button primary" data-po-action="insert" data-proposal-id="${load.id}" type="button">Insert PO into NetSuite</button>` : load.netsuitePurchaseOrderRef ? poPill("completed", "Inserted") : `<button class="smart-button primary" type="button" disabled>Insert PO into NetSuite</button>`}</div>
+      <div class="smart-po-review-action">${insertAction}${removeAction}</div>
     </div>
     ${load.poExecutionError ? `<div class="smart-po-error">${poEscape(load.poExecutionError)}</div>` : ""}
     ${blockers.length ? `<div class="smart-po-blockers"><strong>Insertion blocked</strong>${blockers.map((blocker) => `<span>${poEscape(blocker)}</span>`).join("")}</div>` : ""}
@@ -201,7 +212,7 @@ function poRender() {
     ${netSuitePoState.busy ? `<div class="smart-notice">${poEscape(netSuitePoState.busy)}…</div>` : ""}
     <section class="smart-section">
       <div class="smart-section-head"><div><h2>Staged purchase orders</h2><p>Review vendor-confirmed quantities, adjust Official PALLET lines when needed, and verify snapshotted Last Purchase Price before any accounting record is inserted.</p></div><span class="smart-help">${loads.length} load(s)</span></div>
-      <div class="smart-toolbar smart-po-toolbar"><input id="smartPoSearch" type="search" value="${poEscape(netSuitePoState.search)}" placeholder="Search review, vendor, item, or yard" /><select id="smartPoView"><option value="pending" ${netSuitePoState.view === "pending" ? "selected" : ""}>Pending insertion</option><option value="completed" ${netSuitePoState.view === "completed" ? "selected" : ""}>Inserted</option><option value="all" ${netSuitePoState.view === "all" ? "selected" : ""}>All reviews</option></select><button class="smart-button" data-po-action="refresh" type="button">Refresh</button></div>
+      <div class="smart-toolbar smart-po-toolbar"><input id="smartPoSearch" type="search" value="${poEscape(netSuitePoState.search)}" placeholder="Search review, vendor, item, or yard" /><select id="smartPoView"><option value="pending" ${netSuitePoState.view === "pending" ? "selected" : ""}>Pending insertion</option><option value="completed" ${netSuitePoState.view === "completed" ? "selected" : ""}>Inserted</option><option value="removed" ${netSuitePoState.view === "removed" ? "selected" : ""}>Removed</option><option value="all" ${netSuitePoState.view === "all" ? "selected" : ""}>All reviews</option></select><button class="smart-button" data-po-action="refresh" type="button">Refresh</button></div>
       <div class="smart-proposals smart-po-review-list">${loads.map(poLoadCard).join("") || `<div class="smart-empty">No NetSuite PO review matches this filter. Confirm a vendor load to stage its confirmed lines here.</div>`}</div>
     </section>
   </div>`;
@@ -260,6 +271,24 @@ smartNetSuitePoApp.addEventListener("click", async (event) => {
       netSuitePoState.error = error.message;
     } finally {
       netSuitePoState.busy = "";
+      poRender();
+    }
+    return;
+  }
+  if (button.dataset.poAction === "remove") {
+    const proposalId = Number(button.dataset.proposalId);
+    if (!confirm(`Remove staged PO review #${proposalId}? No NetSuite record will be changed. The local review and its lines will remain in Removed for audit history.`)) return;
+    netSuitePoState.busy = "Removing staged purchase order";
+    netSuitePoState.error = "";
+    netSuitePoState.notice = "";
+    poRender();
+    try {
+      await poApi(`/api/scm/smart/netsuite-purchase-orders/${proposalId}`, { method: "DELETE" });
+      netSuitePoState.notice = `Staged PO review #${proposalId} removed. No NetSuite transaction was created or changed.`;
+      await poLoad({ quiet: true });
+    } catch (error) {
+      netSuitePoState.busy = "";
+      netSuitePoState.error = error.message;
       poRender();
     }
     return;

@@ -308,6 +308,71 @@ export async function listOperatorHistory({ operatorId, date = "", limit = 100 }
   );
   records.push(...cycle.rows.map(normalizeRecord));
 
+  const returnParams = [operatorId];
+  const returnDate = dateClause("r", date, returnParams);
+  const returns = await query(
+    `SELECT ('return-' || r.id) AS id,
+            CASE WHEN r.record_type = 'pallet' THEN 'pallet_return' ELSE 'stock_return' END AS type,
+            'returns.record.submit' AS action,
+            CASE
+              WHEN r.record_type = 'pallet' THEN 'PALLET Return'
+              WHEN r.stock_return_type = 'quality' THEN 'Quality Stock Return'
+              ELSE 'Normal Stock Return'
+            END AS title,
+            r.source_sales_order_id AS order_id,
+            COALESCE(r.source_sales_order_ref, '') AS tranid,
+            r.record_reference AS reference,
+            r.status,
+            r.submitted_at AS created_at,
+            jsonb_build_object(
+              'recordId', r.id,
+              'recordReference', r.record_reference,
+              'batchReference', b.batch_reference,
+              'recordType', r.record_type,
+              'stockReturnType', r.stock_return_type,
+              'customerId', r.customer_id,
+              'customerName', r.customer_name,
+              'receivingLocationId', r.receiving_location_id,
+              'receivingLocationName', r.receiving_location_name,
+              'vehiclePlate', r.vehicle_plate,
+              'palletQuantity', r.pallet_quantity,
+              'netSuiteSyncStatus', r.netsuite_sync_status,
+              'lines', COALESCE(lines.lines, '[]'::jsonb)
+            ) AS details,
+            COALESCE(photos.photos, '[]'::jsonb) AS photos
+       FROM return_records r
+       INNER JOIN return_batches b ON b.id = r.batch_id
+       LEFT JOIN LATERAL (
+         SELECT jsonb_agg(jsonb_build_object(
+           'lineId', l.id,
+           'itemName', l.item_name,
+           'description', l.item_description,
+           'pallets', l.returned_pallets,
+           'layers', l.returned_layers,
+           'sections', l.returned_sections,
+           'pieces', l.returned_pieces,
+           'salesQuantity', l.returned_sales_quantity,
+           'unit', l.sales_uom,
+           'reasonCode', l.reason_code,
+           'reasonLabel', l.reason_label,
+           'approvalStatus', l.approval_status
+         ) ORDER BY l.id) AS lines
+           FROM return_record_lines l
+          WHERE l.return_record_id = r.id
+       ) lines ON true
+       LEFT JOIN LATERAL (
+         SELECT jsonb_agg(p.photo_reference ORDER BY p.return_line_id NULLS FIRST, p.position) AS photos
+           FROM return_photos p
+          WHERE p.return_record_id = r.id
+       ) photos ON true
+      WHERE r.operator_id = $1
+        ${returnDate}
+      ORDER BY r.submitted_at DESC, r.id DESC
+      LIMIT ${safeLimit}`,
+    returnParams
+  );
+  records.push(...returns.rows.map(normalizeRecord));
+
   return records
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
     .slice(0, safeLimit);

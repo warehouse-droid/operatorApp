@@ -11,6 +11,15 @@ const LINE_PAGE_SIZE = 3;
 const COMPACT_LINE_PAGE_SIZE = 6;
 const HISTORY_PAGE_SIZE = 5;
 const PICKABLE_ITEM_TYPES = new Set(["InvtPart", "NonInvtPart"]);
+const RETURN_MAX_PHOTOS = 5;
+const RETURN_LINE_PAGE_SIZE = 3;
+const RETURN_HISTORY_PAGE_SIZE = 100;
+const RETURN_QUANTITY_EPSILON = 1e-6;
+const RETURN_ORDER_PREFIX_YARDS = Object.freeze({
+  SOA: { locationId: 28, yardCode: "2967" },
+  SOB: { locationId: 1, yardCode: "3445" },
+  SOM: { locationId: 26, yardCode: "150" }
+});
 
 const app = document.getElementById("app");
 const toast = document.getElementById("toast");
@@ -32,6 +41,8 @@ const RESTORABLE_MODULES = new Set([
   "delivery-consolidation",
   "receiving",
   "return-select",
+  "pallet-return",
+  "stock-return",
   "cycle-count",
   "personal-history",
   "customer-pickup-scan",
@@ -173,6 +184,75 @@ let pickupScanSubmitting = false;
 let pickupScanCandidate = "";
 let pickupScanCandidateHits = 0;
 let pickupScanCandidateAt = 0;
+
+let returnMode = initialOperatorState.returnMode === "stock" || currentModule === "stock-return" ? "stock"
+  : initialOperatorState.returnMode === "pallet" || currentModule === "pallet-return" ? "pallet"
+    : "";
+let returnStage = ["lookup", "form", "review", "success"].includes(initialOperatorState.returnStage)
+  ? initialOperatorState.returnStage
+  : "lookup";
+let returnView = ["workflow", "drafts", "history"].includes(initialOperatorState.returnView)
+  ? initialOperatorState.returnView
+  : "workflow";
+let returnType = initialOperatorState.returnType === "quality" ? "quality" : "normal";
+let returnLookupCode = String(initialOperatorState.returnLookupCode || "");
+let returnLookupMessage = "";
+let returnLookupData = null;
+let returnCustomerSearch = "";
+let returnCustomerResults = [];
+let returnCustomerSearchBusy = false;
+let returnCustomerSearchActive = false;
+let returnCustomerSearchPending = false;
+let returnCustomerSearchGeneration = 0;
+let returnSelectedCustomer = null;
+let returnPalletBalance = null;
+let returnPalletQuantity = 0;
+let returnVehiclePlate = "";
+let returnHeaderNote = "";
+let returnLineValues = {};
+let returnLinePage = 0;
+let returnActiveLineId = "";
+let returnRecordPhotos = [];
+let returnPalletPhotos = [];
+let returnPhotoTarget = { kind: "record", lineId: "" };
+let returnPhotoSlot = 0;
+let returnCameraStream = null;
+let returnCameraActive = false;
+let returnScannerStream = null;
+let returnScannerActive = false;
+let returnScannerTimer = null;
+let returnQrDecoder = null;
+let returnQrFrameBusy = false;
+let returnQuaggaActive = false;
+let returnScanSubmitting = false;
+let returnScanCandidate = "";
+let returnScanCandidateHits = 0;
+let returnScanCandidateAt = 0;
+let returnScannerBuffer = "";
+let returnScannerLastKeyAt = 0;
+let returnReasons = {
+  normalReason: { id: "10", label: "GD - Good Condition" },
+  qualityReasons: [
+    { id: "5", label: "R1 - Color Variation" },
+    { id: "6", label: "R2 - Efflorescence" },
+    { id: "7", label: "R3 - Chipping / Crack" },
+    { id: "8", label: "R4 - Surface" },
+    { id: "9", label: "R5 - Others" }
+  ]
+};
+let returnYardSettings = [];
+let returnDraftId = String(initialOperatorState.returnDraftId || "");
+let returnIdempotencyKey = "";
+let returnDrafts = [];
+let returnHistory = [];
+let returnHistoryOffset = 0;
+let returnHistoryTotal = 0;
+let returnHistoryDetail = null;
+let returnSelectedRecordId = "";
+let returnBusy = false;
+let returnDirty = false;
+let returnResult = null;
+let returnValidationMessage = "";
 
 let cycleStep = initialOperatorState.cycleStep || "type";
 let cycleSelection = initialOperatorState.cycleSelection || { productType: "", brand: "", series: "" };
@@ -607,33 +687,94 @@ function dataUrlToFile(dataUrl, filename = "photo.jpg") {
   return new File([bytes], filename, { type: mime });
 }
 
-function photoSrc(value) {
+function photoImgAttributes(value) {
   const text = String(value || "");
-  if (!text.startsWith("r2://")) return text;
-  return `/api/photo-upload/preview?ref=${encodeURIComponent(text)}&token=${encodeURIComponent(authToken || "")}`;
+  if (!text.startsWith("r2://")) return `src="${escapeHtml(text)}"`;
+  return `data-secure-photo-ref="${escapeHtml(text)}"`;
 }
 
-function photoImgSrc(value) {
-  return escapeHtml(photoSrc(value));
+function releaseSecurePhotoImage(image) {
+  if (!image) return;
+  image._securePhotoController?.abort();
+  image._securePhotoController = null;
+  if (image._securePhotoObjectUrl) URL.revokeObjectURL(image._securePhotoObjectUrl);
+  image._securePhotoObjectUrl = "";
+}
+
+function releaseSecurePhotoImages(root = app) {
+  if (!root) return;
+  const images = [
+    ...(root.matches?.("img[data-secure-photo-ref]") ? [root] : []),
+    ...root.querySelectorAll("img[data-secure-photo-ref]")
+  ];
+  images.forEach(releaseSecurePhotoImage);
+}
+
+async function hydrateSecurePhotoImage(image) {
+  const ref = String(image?.dataset?.securePhotoRef || "");
+  if (!ref || image.dataset.securePhotoState === "loading" || image.dataset.securePhotoState === "loaded") return;
+  const controller = new AbortController();
+  image._securePhotoController = controller;
+  image.dataset.securePhotoState = "loading";
+  try {
+    const response = await fetch(`/api/photo-upload/preview?ref=${encodeURIComponent(ref)}`, {
+      headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
+      cache: "no-store",
+      credentials: "same-origin",
+      signal: controller.signal
+    });
+    if (!response.ok) throw new Error(`Photo preview failed (${response.status})`);
+    const objectUrl = URL.createObjectURL(await response.blob());
+    if (!image.isConnected || image.dataset.securePhotoRef !== ref || controller.signal.aborted) {
+      URL.revokeObjectURL(objectUrl);
+      return;
+    }
+    image._securePhotoObjectUrl = objectUrl;
+    image.dataset.securePhotoState = "loaded";
+    const release = () => releaseSecurePhotoImage(image);
+    image.addEventListener("load", release, { once: true });
+    image.addEventListener("error", release, { once: true });
+    image.src = objectUrl;
+  } catch (error) {
+    if (error.name !== "AbortError") {
+      image.dataset.securePhotoState = "error";
+      image.title = error.message;
+    }
+  } finally {
+    if (image._securePhotoController === controller) image._securePhotoController = null;
+  }
+}
+
+function hydrateSecurePhotoImages(root = app) {
+  root?.querySelectorAll("img[data-secure-photo-ref]").forEach((image) => {
+    hydrateSecurePhotoImage(image);
+  });
 }
 
 function openPhotoLightbox(photoRef, label = "Photo preview") {
   const ref = String(photoRef || "");
   if (!ref) return;
-  const existing = document.querySelector(".photo-lightbox");
-  if (existing) existing.remove();
+  closePhotoLightbox();
   const modal = document.createElement("div");
   modal.className = "photo-lightbox";
   modal.innerHTML = `
     <div class="photo-lightbox-panel" role="dialog" aria-modal="true" aria-label="${escapeHtml(label)}">
       <button class="photo-lightbox-close" type="button">×</button>
-      <img src="${photoImgSrc(ref)}" alt="${escapeHtml(label)}" />
+      <img ${photoImgAttributes(ref)} alt="${escapeHtml(label)}" />
     </div>
   `;
   modal.addEventListener("click", (event) => {
-    if (event.target === modal || event.target.closest(".photo-lightbox-close")) modal.remove();
+    if (event.target === modal || event.target.closest(".photo-lightbox-close")) closePhotoLightbox();
   });
   document.body.appendChild(modal);
+  hydrateSecurePhotoImages(modal);
+}
+
+function closePhotoLightbox() {
+  const modal = document.querySelector(".photo-lightbox");
+  if (!modal) return;
+  releaseSecurePhotoImages(modal);
+  modal.remove();
 }
 
 async function uploadOperatorPhoto(photo, context = {}) {
@@ -1700,10 +1841,12 @@ function locationOptions() {
 }
 
 function shell(title, subtitle, body, actions = "") {
+  const returnLocationLocked = returnModuleActive() && (returnStage !== "lookup" || Boolean(returnDraftId));
+  releaseSecurePhotoImages(app);
   app.innerHTML = `
     <header class="topbar">
       <div class="topbar-location">
-        <button class="secondary-button location-button" data-action="toggle-location-dropdown" type="button">${t("common.location", "Location")} ${currentLocation()?.text || locationId || ""}</button>
+        <button class="secondary-button location-button" data-action="toggle-location-dropdown" ${returnLocationLocked ? "disabled" : ""} type="button">${t("common.location", "Location")} ${currentLocation()?.text || locationId || ""}${returnLocationLocked ? ` · ${t("operator.locked", "Locked")}` : ""}</button>
         ${locationDropdownOpen ? `
           <div class="location-dropdown">
             ${LOCATIONS.map((location) => `
@@ -1725,9 +1868,12 @@ function shell(title, subtitle, body, actions = "") {
   `;
   if (fulfillmentCameraActive) window.requestAnimationFrame(attachFulfillmentCamera);
   if (receiptCameraActive) window.requestAnimationFrame(attachReceiptCamera);
+  if (returnCameraActive) window.requestAnimationFrame(attachReturnCamera);
+  hydrateSecurePhotoImages(app);
 }
 
 function renderLogin(message = "") {
+  releaseSecurePhotoImages(app);
   app.innerHTML = `
     <section class="location-screen">
       <form class="location-panel login-panel" data-form="login">
@@ -1776,6 +1922,12 @@ function saveOperatorState() {
     orderPage,
     linePage,
     customerPickupScan,
+    returnMode,
+    returnStage,
+    returnView,
+    returnType,
+    returnLookupCode,
+    returnDraftId,
     receivingStep,
     receivingOrderType,
     receivingSelectedVendor,
@@ -1845,6 +1997,20 @@ async function restoreOperatorView() {
     }
     if (currentModule === "personal-history") {
       await loadPersonalHistory();
+      return;
+    }
+    if (currentModule === "pallet-return" || currentModule === "stock-return") {
+      returnMode = currentModule === "stock-return" ? "stock" : "pallet";
+      await loadReturnReasons().catch(() => {});
+      if (returnDraftId) {
+        await loadReturnDrafts({ renderAfter: false }).catch(() => {});
+        const draft = returnDrafts.find((item) => String(item.id) === String(returnDraftId));
+        if (draft) await resumeReturnDraft(draft, { renderAfter: false }).catch(() => {});
+        else resetReturnWorkflow(returnMode);
+      } else {
+        resetReturnWorkflow(returnMode);
+      }
+      render();
       return;
     }
   } catch (error) {
@@ -1945,6 +2111,7 @@ function render() {
   if (currentModule === "receiving") return renderReceiving();
   if (currentModule === "receiving-receipt") return renderReceiptScreen();
   if (currentModule === "return-select") return renderReturnSelect();
+  if (currentModule === "pallet-return" || currentModule === "stock-return") return renderReturnWorkflow();
   if (currentModule === "personal-history") return renderPersonalHistory();
   if (currentModule === "delivery-fulfill") return renderFulfillmentScreen();
   if (currentModule === "customer-pickup-load") return renderFulfillmentScreen();
@@ -1986,7 +2153,7 @@ function renderMenu() {
       </button>
       <button class="module-tile" data-action="open-module" data-module="personal-history" type="button">
         <strong>${t("operator.personalHistory", "Personal History")}</strong>
-        <span>${t("operator.personalHistoryDesc", "Review your submitted IF, IR and count records.")}</span>
+        <span>${t("operator.personalHistoryDesc", "Review your submitted IF, IR, count and return records.")}</span>
       </button>
     </section>
   `, `
@@ -2011,6 +2178,1217 @@ function renderReturnSelect() {
     <button class="secondary-button" data-action="main-menu" type="button">${t("common.menu", "Menu")}</button>
     <button class="secondary-button" data-action="logout" type="button">${operator.display_name}</button>
   `);
+}
+
+function returnModuleActive() {
+  return currentModule === "pallet-return" || currentModule === "stock-return";
+}
+
+function returnModuleTitle() {
+  return returnMode === "stock"
+    ? t("operator.stockReturn", "Stock Return")
+    : t("operator.palletReturn", "Pallet Return");
+}
+
+function returnOrder() {
+  return returnLookupData?.order || returnLookupData?.salesOrder || null;
+}
+
+function returnCustomer() {
+  return returnSelectedCustomer
+    || returnLookupData?.customer
+    || returnOrder()?.customer
+    || null;
+}
+
+function returnCustomerId(customer = returnCustomer()) {
+  return customer?.internalId || customer?.internal_id || customer?.id || customer?.netsuiteId || customer?.netsuite_id || "";
+}
+
+function returnCustomerCode(customer = returnCustomer()) {
+  return customer?.code || customer?.entityId || customer?.entity_id || customer?.customerCode || customer?.customer_code || "";
+}
+
+function returnCustomerName(customer = returnCustomer()) {
+  if (typeof customer === "string") return customer;
+  return customer?.name || customer?.companyName || customer?.company_name || customer?.customerName || customer?.customer_name || "";
+}
+
+function returnOrderId(order = returnOrder()) {
+  return order?.netsuiteId || order?.netsuite_id || order?.internalId || order?.internal_id || order?.id || "";
+}
+
+function returnOrderRef(order = returnOrder()) {
+  return order?.tranid || order?.orderNumber || order?.order_number || returnLookupCode || "";
+}
+
+function returnLines() {
+  const lines = returnLookupData?.lines || returnOrder()?.lines || [];
+  return lines.filter((line) => returnLinePolicy(line).effective !== "NOT_RETURNABLE"
+    && returnLineRemaining(line) > RETURN_QUANTITY_EPSILON);
+}
+
+function firstReturnLineId(lines = returnLines()) {
+  if (returnMode === "pallet" || !lines.length) return "PALLET";
+  const first = lines.find((line) => returnLinePolicy(line).effective !== "NOT_RETURNABLE") || lines[0];
+  return first ? returnSourceLineId(first) : "";
+}
+
+function returnSourceLineId(line) {
+  return String(line?.sourceLineId || line?.source_line_id || line?.lineId || line?.line_id || line?.id || "");
+}
+
+function returnLineName(line) {
+  return line?.itemName || line?.item_name || line?.sku || line?.item || line?.displayName || line?.display_name || returnSourceLineId(line);
+}
+
+function returnLineDescription(line) {
+  return line?.description || line?.itemDescription || line?.item_description || "";
+}
+
+function returnLinePolicy(line) {
+  const policy = line?.returnPolicy || line?.return_policy || {};
+  const effective = String(policy.effective || line?.returnPolicyEffective || line?.return_policy_effective || "NOT_RETURNABLE")
+    .trim()
+    .toUpperCase()
+    .replaceAll(" ", "_");
+  return {
+    effective,
+    requiresApproval: Boolean(policy.requiresApproval ?? policy.requires_approval ?? effective === "APPROVAL_REQUIRED")
+  };
+}
+
+function returnPolicyLabel(line) {
+  const effective = returnLinePolicy(line).effective;
+  if (effective === "ALLOWED") return t("operator.returnAllowed", "Allowed");
+  if (effective === "APPROVAL_REQUIRED") return t("operator.returnApprovalRequired", "Approval Required");
+  return t("operator.returnNotReturnable", "Not Returnable");
+}
+
+function returnPolicyClass(line) {
+  const effective = returnLinePolicy(line).effective;
+  if (effective === "ALLOWED") return "allowed";
+  if (effective === "APPROVAL_REQUIRED") return "approval";
+  return "blocked";
+}
+
+function returnBalanceValue(balance, camel, snake = "") {
+  return Number(balance?.[camel] ?? balance?.[snake || camel] ?? 0) || 0;
+}
+
+function currentPalletBalance() {
+  return returnPalletBalance || returnLookupData?.palletBalance || returnLookupData?.pallet_balance || null;
+}
+
+function returnBalanceAvailable(balance = currentPalletBalance()) {
+  return returnBalanceValue(balance, "available", "available");
+}
+
+function displayReturnQty(value, zero = "0") {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return zero;
+  return number.toLocaleString(undefined, { maximumFractionDigits: 6 });
+}
+
+function renderReturnBalance(balance, { unit = "PALLET" } = {}) {
+  if (!balance) {
+    return `<div class="sync-alert"><strong>${t("operator.balanceUnavailable", "Balance unavailable")}</strong><span>${t("operator.balanceUnavailableHelp", "A successful NetSuite lookup is required before submission.")}</span></div>`;
+  }
+  const lookedUpAt = balance.lookedUpAt || balance.looked_up_at || balance.lookupTimestamp || balance.lookup_timestamp;
+  return `
+    <div class="return-balance-grid">
+      <div><span>${t("operator.fulfilled", "Fulfilled")}</span><strong>${displayReturnQty(returnBalanceValue(balance, "fulfilled", "fulfilled"))} ${escapeHtml(unit)}</strong></div>
+      <div><span>${t("operator.netsuiteReturned", "NetSuite returned")}</span><strong>${displayReturnQty(returnBalanceValue(balance, "netsuiteReturned", "netsuite_returned"))} ${escapeHtml(unit)}</strong></div>
+      <div><span>${t("operator.localReserved", "Local reserved")}</span><strong>${displayReturnQty(returnBalanceValue(balance, "localReserved", "local_reserved"))} ${escapeHtml(unit)}</strong></div>
+      <div class="available"><span>${t("operator.availableToReturn", "Available to return")}</span><strong>${displayReturnQty(returnBalanceAvailable(balance))} ${escapeHtml(unit)}</strong></div>
+    </div>
+    ${lookedUpAt ? `<small class="return-lookup-time">${tf("operator.checkedAt", "Checked {time}", { time: formatDateTime(lookedUpAt) })}</small>` : ""}
+  `;
+}
+
+function returnYardName(value) {
+  if (!value) return "";
+  if (typeof value !== "object") return String(value);
+  return String(value.yardCode || value.yard_code || value.code || value.name || value.text || value.locationName || value.location_name || value.id || "");
+}
+
+function returnYardGate() {
+  const data = returnLookupData || {};
+  const blocked = returnMode === "stock" && (
+    data.crossYardBlocked === true
+    || data.cross_yard_blocked === true
+    || data.returnAllowed === false
+    || data.return_allowed === false
+  );
+  const required = data.requiredReturnLocation || data.required_return_location || data.defaultReturnLocation || data.default_return_location || null;
+  const requiredName = returnYardName(required);
+  return { blocked, requiredName: requiredName || "" };
+}
+
+function renderReturnYardBanner() {
+  const gate = returnYardGate();
+  if (gate.blocked) {
+    return `
+      <div class="sync-alert danger">
+        <strong>${t("operator.wrongReturnYard", "Wrong return yard")}</strong>
+        <span>${tf("operator.returnMustBeProcessedAt", "This return must be processed at {yard}.", { yard: gate.requiredName || "-" })}</span>
+      </div>
+    `;
+  }
+  const order = returnOrder();
+  if (!order) return "";
+  const orderingYard = returnLookupData?.defaultReturnLocationName
+    || returnLookupData?.default_return_location_name
+    || order.orderingLocationName
+    || order.ordering_location_name
+    || "";
+  return `
+    <div class="return-yard-banner">
+      <span>${t("operator.receivingYardLocked", "Receiving yard (locked)")}</span>
+      <strong>${escapeHtml(currentLocation()?.text || locationId)}</strong>
+      ${orderingYard ? `<em>${tf("operator.orderingYard", "Ordering yard: {yard}", { yard: orderingYard })}</em>` : ""}
+    </div>
+  `;
+}
+
+function normalizeReturnReason(reason, fallbackId = "") {
+  if (typeof reason === "string" || typeof reason === "number") {
+    return { id: String(fallbackId || reason), label: String(reason) };
+  }
+  return {
+    id: String(reason?.id || reason?.internalId || reason?.internal_id || reason?.value || fallbackId || ""),
+    label: String(reason?.label || reason?.text || reason?.name || "")
+  };
+}
+
+function applyReturnReasons(payload = {}) {
+  const normal = payload.normalReason || payload.normal_reason;
+  const quality = payload.qualityReasons || payload.quality_reasons || payload.reasons;
+  const yardSettings = payload.yardSettings || payload.yard_settings;
+  if (normal) returnReasons.normalReason = normalizeReturnReason(normal, "10");
+  if (Array.isArray(quality) && quality.length) {
+    returnReasons.qualityReasons = quality
+      .map((reason) => normalizeReturnReason(reason))
+      .filter((reason) => reason.id && reason.id !== String(returnReasons.normalReason.id));
+  }
+  if (Array.isArray(yardSettings)) returnYardSettings = yardSettings;
+}
+
+function returnOrderPrefixYard(orderRef) {
+  return RETURN_ORDER_PREFIX_YARDS[String(orderRef || "").trim().slice(0, 3).toUpperCase()] || null;
+}
+
+function currentReturnYardSetting() {
+  return returnYardSettings.find((setting) => Number(
+    setting?.locationId ?? setting?.location_id ?? setting?.id
+  ) === Number(locationId)) || null;
+}
+
+function currentYardAllowsCrossYardReturns() {
+  const setting = currentReturnYardSetting();
+  return setting?.allowCrossYardReturns === true || setting?.allow_cross_yard_returns === true;
+}
+
+function returnLookupYardPreflight(orderRef) {
+  const requiredYard = returnOrderPrefixYard(orderRef);
+  if (!requiredYard
+      || Number(requiredYard.locationId) === Number(locationId)
+      || currentYardAllowsCrossYardReturns()) {
+    return { blocked: false, requiredYard };
+  }
+  return { blocked: true, requiredYard };
+}
+
+function returnOrderNotFullyFulfilledMessage() {
+  return t(
+    "operator.orderNotFullyFulfilled",
+    "This Sales Order is not fully fulfilled. NetSuite status must show fully fulfilled before recording a return."
+  );
+}
+
+function returnLineEntryMode(line) {
+  const stated = String(line?.entryMode || line?.entry_mode || "").toLowerCase();
+  if (stated === "sales_uom" || stated === "sales" || stated === "fallback") return "sales_uom";
+  return returnLineUnits(line).length ? "physical" : "sales_uom";
+}
+
+function returnLineUnits(line) {
+  return [
+    { key: "pallets", label: "PLT", conversion: Number(line?.toPlt ?? line?.to_plt ?? 0) || 0 },
+    { key: "layers", label: "LYR", conversion: Number(line?.toLyr ?? line?.to_lyr ?? 0) || 0 },
+    { key: "sections", label: "SEC", conversion: Number(line?.toSec ?? line?.to_sec ?? 0) || 0 },
+    { key: "pieces", label: "PCS", conversion: Number(line?.toPcs ?? line?.to_pcs ?? 0) || 0 }
+  ].filter((unit) => unit.conversion > 0);
+}
+
+function returnLineSalesUom(line) {
+  return line?.salesUom || line?.sales_uom || line?.unit || line?.uom || t("operator.salesUnit", "Sales UOM");
+}
+
+function returnLineRemaining(line) {
+  return Number(line?.remainingReturnable ?? line?.remaining_returnable ?? 0) || 0;
+}
+
+function ensureReturnLineValue(line, rowKey = returnSourceLineId(line)) {
+  const sourceLineId = returnSourceLineId(line);
+  const key = String(rowKey || sourceLineId);
+  if (!returnLineValues[key]) {
+    returnLineValues[key] = {
+      clientRowKey: key,
+      sourceLineId,
+      pallets: 0,
+      layers: 0,
+      sections: 0,
+      pieces: 0,
+      salesQuantity: 0,
+      reasonId: "",
+      reasonLabel: "",
+      note: "",
+      photos: []
+    };
+  }
+  return returnLineValues[key];
+}
+
+function returnRowsForLine(line) {
+  const sourceLineId = returnSourceLineId(line);
+  const rows = Object.values(returnLineValues).filter((values) => String(values.sourceLineId || "") === sourceLineId);
+  if (!rows.length) rows.push(ensureReturnLineValue(line));
+  return rows;
+}
+
+function returnLineForValues(values) {
+  return returnLines().find((line) => returnSourceLineId(line) === String(values?.sourceLineId || ""));
+}
+
+function defaultReturnPhotoTarget({ open = true } = {}) {
+  if (returnMode === "pallet") return { kind: "pallet", lineId: "", open };
+  if (returnType === "quality") {
+    const rows = Object.values(returnLineValues);
+    const firstRow = rows.find((values) => {
+      const line = returnLineForValues(values);
+      return line && returnLinePolicy(line).effective !== "NOT_RETURNABLE";
+    }) || rows[0];
+    if (firstRow) return { kind: "line", lineId: String(firstRow.clientRowKey || ""), open };
+  }
+  return { kind: "record", lineId: "", open };
+}
+
+function returnLineCalculatedSalesQty(line, values = ensureReturnLineValue(line)) {
+  if (returnLineEntryMode(line) === "sales_uom") return Number(values.salesQuantity) || 0;
+  return returnLineUnits(line).reduce((total, unit) => total + ((Number(values[unit.key]) || 0) * unit.conversion), 0);
+}
+
+function returnLineHasQty(line, values = ensureReturnLineValue(line)) {
+  return returnLineCalculatedSalesQty(line, values) > 0;
+}
+
+function returnTargetPhotos(target = returnPhotoTarget) {
+  if (target?.kind === "pallet") return returnPalletPhotos;
+  if (target?.kind === "line") {
+    const values = returnLineValues[String(target.lineId || "")];
+    return values?.photos || [];
+  }
+  return returnRecordPhotos;
+}
+
+function setReturnTargetPhotos(photos, target = returnPhotoTarget) {
+  if (target?.kind === "pallet") {
+    returnPalletPhotos = photos;
+    return;
+  }
+  if (target?.kind === "line") {
+    const values = returnLineValues[String(target.lineId || "")];
+    if (values) values.photos = photos;
+    return;
+  }
+  returnRecordPhotos = photos;
+}
+
+function returnPhotoTargetLabel(target = returnPhotoTarget) {
+  if (target?.kind === "pallet") return t("operator.palletEvidence", "PALLET evidence");
+  if (target?.kind === "line") {
+    const line = returnLineForValues(returnLineValues[String(target.lineId || "")]);
+    return `${t("operator.qualityEvidence", "Quality evidence")} — ${returnLineName(line || {})}`;
+  }
+  return returnMode === "pallet"
+    ? t("operator.palletEvidence", "PALLET evidence")
+    : returnType === "quality"
+      ? t("operator.qualityEvidence", "Quality evidence")
+      : t("operator.normalReturnEvidence", "Normal return evidence");
+}
+
+function returnPhotoCount(kind, lineId = "") {
+  return returnTargetPhotos({ kind, lineId }).filter(Boolean).length;
+}
+
+function returnReviewPhotoTargets() {
+  const targets = [];
+  const selectedRows = returnSelectedRows();
+  if (returnMode === "stock" && selectedRows.length) {
+    if (returnType === "quality") {
+      selectedRows.forEach(({ line, values }, index) => {
+        const reason = returnReasons.qualityReasons
+          .find((item) => String(item.id) === String(values.reasonId));
+        targets.push({
+          kind: "line",
+          lineId: String(values.clientRowKey || ""),
+          label: returnLineName(line),
+          detail: reason?.label || tf("operator.returnReasonRow", "Return reason row {number}", { number: index + 1 })
+        });
+      });
+    } else {
+      targets.push({
+        kind: "record",
+        lineId: "",
+        label: t("operator.normalReturnEvidence", "Normal return evidence"),
+        detail: tf("operator.stockLineCount", "{count} stock line(s)", { count: selectedRows.length })
+      });
+    }
+  }
+  if (Number(returnPalletQuantity) > 0) {
+    targets.push({
+      kind: "pallet",
+      lineId: "",
+      label: t("operator.palletEvidence", "PALLET evidence"),
+      detail: tf("operator.palletCount", "{count} PALLET", { count: displayReturnQty(returnPalletQuantity) })
+    });
+  }
+  return targets;
+}
+
+function returnPhotoTargetsMatch(left, right) {
+  return String(left?.kind || "") === String(right?.kind || "")
+    && String(left?.lineId || "") === String(right?.lineId || "");
+}
+
+function selectReturnReviewPhotoTarget(target, { preferMissing = false } = {}) {
+  const targets = returnReviewPhotoTargets();
+  const requested = targets.find((candidate) => returnPhotoTargetsMatch(candidate, target));
+  const nextTarget = requested
+    || (preferMissing ? targets.find((candidate) => returnPhotoCount(candidate.kind, candidate.lineId) < 1) : null)
+    || targets[0]
+    || defaultReturnPhotoTarget({ open: false });
+  returnPhotoTarget = {
+    kind: nextTarget.kind,
+    lineId: String(nextTarget.lineId || ""),
+    open: returnCameraActive
+  };
+  const photos = returnTargetPhotos();
+  const firstEmpty = photos.findIndex((photo) => !photo);
+  returnPhotoSlot = firstEmpty >= 0 ? firstEmpty : Math.max(0, photos.length - 1);
+}
+
+function renderReturnPhotoWorkspace() {
+  const targets = returnReviewPhotoTargets();
+  const photos = returnTargetPhotos();
+  const selected = photos[returnPhotoSlot] || "";
+  const readyTargets = targets.filter((target) => returnPhotoCount(target.kind, target.lineId) > 0).length;
+  return `
+    <div class="fulfillment-card return-photo-workspace return-review-photo-card">
+      <span>${t("operator.photoProof", "Photo proof")}</span>
+      <strong>${escapeHtml(returnPhotoTargetLabel())}</strong>
+      <div class="return-evidence-heading">
+        <span>${t("operator.evidenceTargets", "Required evidence")}</span>
+        <b>${tf("operator.evidenceReady", "{ready} / {total} ready", { ready: readyTargets, total: targets.length })}</b>
+      </div>
+      <div class="return-evidence-targets">
+        ${targets.map((target) => {
+          const active = returnPhotoTargetsMatch(target, returnPhotoTarget);
+          const count = returnPhotoCount(target.kind, target.lineId);
+          return `
+            <button class="${active ? "active" : ""} ${count ? "ready" : ""}" data-action="return-select-evidence-target" data-photo-kind="${escapeHtml(target.kind)}" data-line="${escapeHtml(target.lineId)}" type="button">
+              <strong>${escapeHtml(target.label)}</strong>
+              <span>${escapeHtml(target.detail || "")}</span>
+              <b>${count} / ${RETURN_MAX_PHOTOS}</b>
+            </button>
+          `;
+        }).join("")}
+      </div>
+      <div class="camera-actions">
+        <button class="primary-button" data-action="return-start-camera" type="button">${returnCameraActive ? t("common.restartCamera", "Restart camera") : t("common.openCamera", "Open camera")}</button>
+        ${renderCameraSwitchButton("return-switch-camera")}
+        ${returnCameraActive ? `<button class="secondary-button" data-action="return-close-camera" type="button">${t("common.closeCamera", "Close camera")}</button>` : ""}
+      </div>
+      <div class="photo-slot-row return-photo-slots">
+        ${Array.from({ length: Math.max(1, photos.length) }, (_, index) => `
+          <button class="${index === returnPhotoSlot ? "active" : ""}" data-action="return-select-photo-slot" data-slot="${index}" type="button">
+            <strong>${t("common.photos", "Photo")} ${index + 1}</strong>
+            <span>${photos[index] ? t("common.ready", "Ready") : t("common.needed", "Needed")}</span>
+          </button>
+        `).join("")}
+      </div>
+      ${returnCameraActive ? `
+        <video class="camera-preview ${cameraCaptureMode() === "user" ? "mirrored" : ""}" id="returnCamera" autoplay muted playsinline></video>
+        <button class="primary-button" data-action="return-capture-photo" type="button">${t("operator.capturePhoto", "Capture photo")}</button>
+      ` : selected ? `
+        <img class="photo-preview" ${photoImgAttributes(selected)} alt="${escapeHtml(returnPhotoTargetLabel())}" />
+      ` : `
+        <div class="photo-placeholder">${t("operator.liveCameraOnly", "Use the live PWA camera to take return evidence.")}</div>
+      `}
+      <div class="photo-list-actions">
+        <button class="secondary-button" data-action="return-add-photo" ${photos.length >= RETURN_MAX_PHOTOS ? "disabled" : ""} type="button">${t("common.addAnotherPhoto", "Add another photo")}</button>
+        <button class="secondary-button danger-button" data-action="return-remove-photo" ${!selected ? "disabled" : ""} type="button">${t("common.removeSelected", "Remove selected")}</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderReturnLookup() {
+  const palletMode = returnMode === "pallet";
+  return `
+    <section class="return-lookup-grid">
+      <div class="return-card return-scanner-card">
+        <div class="return-panel-heading">
+          <div>
+            <span>${t("operator.scanSalesOrder", "Scan sales order")}</span>
+            <strong>${t("operator.allSalesOrders", "SOA / SOB / SOM")}</strong>
+          </div>
+        </div>
+        <div class="scanner-ready-banner">
+          <b>${t("operator.scannerReady", "Scanner ready")}</b>
+          <span>${t("operator.returnScannerHelp", "Scan the Sales Order barcode to identify the exact customer and ordering yard.")}</span>
+        </div>
+        <div class="camera-actions">
+          <button class="primary-button" data-action="return-start-scanner" ${returnBusy ? "disabled" : ""} type="button">${returnScannerActive ? t("common.restartCamera", "Restart camera") : t("common.openCamera", "Open camera")}</button>
+          ${renderCameraSwitchButton("return-switch-scanner-camera")}
+        </div>
+        ${returnScannerActive ? `
+          <div class="barcode-scanner-viewport${cameraFacingMode === "user" ? " mirrored" : ""}" id="returnScannerCamera">
+            <div class="barcode-scan-guide" aria-hidden="true"><span></span></div>
+          </div>
+        ` : `<div class="photo-placeholder">${t("operator.scannerHelp", "Use the camera for 1D/QR barcodes, the Zebra scanner, or type the sales order number.")}</div>`}
+      </div>
+      <div class="return-card return-lookup-card">
+        ${returnMode === "stock" ? `
+          <div class="return-type-toggle">
+            <button class="${returnType === "normal" ? "active" : ""}" data-action="return-set-type" data-return-type="normal" type="button">
+              <strong>${t("operator.normalStockReturn", "Normal Stock Return")}</strong>
+              <span>GD — ${t("operator.goodCondition", "Good Condition")}</span>
+            </button>
+            <button class="${returnType === "quality" ? "active" : ""}" data-action="return-set-type" data-return-type="quality" type="button">
+              <strong>${t("operator.qualityReturn", "Quality Issue Return")}</strong>
+              <span>R1–R5</span>
+            </button>
+          </div>
+        ` : ""}
+        <label class="return-field">
+          <span>${t("operator.manualInput", "Manual / Zebra input")}</span>
+          <input id="returnOrderLookup" value="${escapeHtml(returnLookupCode)}" placeholder="SOB115976" autocomplete="off" />
+        </label>
+        <button class="primary-button" data-action="return-lookup-order" ${returnBusy ? "disabled" : ""} type="button">${returnBusy ? t("common.loading", "Loading") : t("operator.findOrder", "Find Order")}</button>
+        ${returnLookupMessage ? `<div class="sync-alert danger"><strong>${t("common.notice", "Notice")}</strong><span>${escapeHtml(localizeMessage(returnLookupMessage))}</span></div>` : ""}
+        ${palletMode ? `
+          <div class="return-divider"><span>${t("operator.orSearchCustomer", "or search customer directly")}</span></div>
+          <label class="return-field">
+            <span>${t("operator.customerCodeNamePhone", "Customer code, name, or phone")}</span>
+            <input id="returnCustomerSearch" value="${escapeHtml(returnCustomerSearch)}" placeholder="${t("common.search", "Search")}" autocomplete="off" />
+          </label>
+          <div class="return-customer-results">
+            ${returnCustomerSearchBusy ? `<div class="empty-state small"><strong>${t("common.loading", "Loading")}</strong></div>` : returnCustomerResults.map((customer) => `
+              <button data-action="return-select-customer" data-customer-id="${escapeHtml(returnCustomerId(customer))}" type="button">
+                <strong>${escapeHtml([returnCustomerCode(customer), returnCustomerName(customer)].filter(Boolean).join(" — "))}</strong>
+                <span>${escapeHtml(customer.phone || customer.phoneNumber || customer.phone_number || "")}</span>
+                <em>${escapeHtml(customer.address || customer.primaryAddress || customer.primary_address || "")}</em>
+              </button>
+            `).join("") || (returnCustomerSearch.trim().length >= 2 ? `<div class="empty-state small"><strong>${t("operator.noActiveCustomers", "No active customers found")}</strong></div>` : "")}
+          </div>
+        ` : ""}
+      </div>
+    </section>
+  `;
+}
+
+function renderReturnCustomerSummary() {
+  const customer = returnCustomer();
+  const order = returnOrder();
+  return `
+    <div class="return-customer-summary">
+      <div>
+        <span>${t("operator.customer", "Customer")}</span>
+        <strong>${escapeHtml([returnCustomerCode(customer), returnCustomerName(customer)].filter(Boolean).join(" — ") || "-")}</strong>
+        <em>${escapeHtml(customer?.address || customer?.primaryAddress || customer?.primary_address || "")}</em>
+      </div>
+      ${order ? `
+        <div>
+          <span>${t("operator.salesOrder", "Sales Order")}</span>
+          <strong>${escapeHtml(returnOrderRef(order))}</strong>
+          <em>${t("operator.exactNetsuiteLines", "Exact NetSuite fulfillment lines")}</em>
+        </div>
+      ` : ""}
+      <div>
+        <span>${t("operator.receivingYard", "Receiving yard")}</span>
+        <strong>${escapeHtml(currentLocation()?.text || locationId)}</strong>
+        <em>${t("operator.yardLockedAfterStart", "Locked for this draft")}</em>
+      </div>
+    </div>
+  `;
+}
+
+function renderReturnPalletSection() {
+  const balance = currentPalletBalance();
+  const available = returnBalanceAvailable(balance);
+  const selected = returnActiveLineId === "PALLET";
+  const over = Number(returnPalletQuantity) > available + RETURN_QUANTITY_EPSILON;
+  return `
+    <button class="return-pallet-compact ${selected ? "active" : ""} ${over ? "over" : ""}" data-action="return-select-stock-line" data-source-line="PALLET" type="button">
+      <div class="return-pallet-identity">
+        <span>${t("operator.customerLevel", "Customer level")}</span>
+        <strong>${t("operator.palletReturn", "Pallet Return")}</strong>
+      </div>
+      <div class="return-pallet-compact-balance">
+        <span>${t("operator.availableToReturn", "Available to return")} <b>${balance ? displayReturnQty(available) : "—"}</b></span>
+        <span>${t("operator.palletsReturned", "PALLET returned")} <b data-return-pallet-proposed>${displayReturnQty(returnPalletQuantity)}</b></span>
+        <span>${t("common.photos", "Photos")} <b>${returnPalletPhotos.filter(Boolean).length} / ${RETURN_MAX_PHOTOS}</b></span>
+      </div>
+      <span class="return-policy-pill allowed">${t("operator.alwaysEligibleWithinQuota", "Allowed within quota")}</span>
+    </button>
+  `;
+}
+
+function renderReturnPalletEditor() {
+  const balance = currentPalletBalance();
+  const available = returnBalanceAvailable(balance);
+  const standalone = returnMode === "pallet";
+  return `
+    <aside class="return-selected-editor pallet-editor">
+      <div class="return-panel-heading">
+        <div>
+          <span>${t("operator.customerLevel", "Customer level")}</span>
+          <strong>${t("operator.palletReturn", "Pallet Return")}</strong>
+        </div>
+        <span class="return-policy-pill allowed">${t("operator.alwaysEligibleWithinQuota", "Allowed within quota")}</span>
+      </div>
+      ${renderReturnBalance(balance)}
+      <div class="return-selected-editor-controls">
+        <div class="return-quantity-field">
+          <span>${standalone ? t("operator.palletsReturned", "PALLET returned") : t("operator.optionalPalletsReturned", "Optional PALLET returned")}</span>
+          ${renderReturnQuantityStepper({
+            value: returnPalletQuantity,
+            kind: "pallet",
+            field: "palletQuantity",
+            label: standalone ? t("operator.palletsReturned", "PALLET returned") : t("operator.optionalPalletsReturned", "Optional PALLET returned")
+          })}
+        </div>
+      </div>
+      <div class="sync-alert danger" data-return-pallet-over ${Number(returnPalletQuantity) > available + RETURN_QUANTITY_EPSILON ? "" : "hidden"}>
+        <strong>${t("operator.overPalletQuota", "PALLET quantity exceeds quota")}</strong>
+        <span>${tf("operator.maximumReturnable", "Maximum returnable: {quantity}", { quantity: displayReturnQty(available) })}</span>
+      </div>
+    </aside>
+  `;
+}
+
+function renderReturnQuantityStepper({
+  value = 0,
+  kind = "line",
+  field = "",
+  lineId = "",
+  step = 1,
+  label = ""
+} = {}) {
+  const numericValue = Math.max(0, Number(value) || 0);
+  const shared = `
+    data-return-quantity-kind="${escapeHtml(kind)}"
+    data-return-quantity-field="${escapeHtml(field)}"
+    data-return-quantity-step="${escapeHtml(step)}"
+    ${kind === "pallet" ? 'data-return-input="palletQuantity"' : `data-return-line-input="${escapeHtml(field)}" data-line="${escapeHtml(lineId)}"`}
+  `;
+  return `
+    <div class="return-quantity-stepper" role="group" aria-label="${escapeHtml(label)}">
+      <button data-action="return-step-quantity" data-delta="-1" ${shared} ${numericValue <= 0 ? "disabled" : ""} type="button" aria-label="${t("operator.decreaseQuantity", "Decrease quantity")}">−</button>
+      <output data-return-quantity-value aria-live="polite">${displayReturnQty(numericValue)}</output>
+      <button data-action="return-step-quantity" data-delta="1" ${shared} type="button" aria-label="${t("operator.increaseQuantity", "Increase quantity")}">+</button>
+    </div>
+  `;
+}
+
+function renderReturnUnitInputs(line, values) {
+  const rowKey = values.clientRowKey;
+  if (returnLineEntryMode(line) === "sales_uom") {
+    return `
+      <div class="stepper-field return-unit-field sales-uom">
+        <span>${escapeHtml(returnLineSalesUom(line))}</span>
+        ${renderReturnQuantityStepper({
+          value: values.salesQuantity,
+          field: "salesQuantity",
+          lineId: rowKey,
+          label: returnLineSalesUom(line)
+        })}
+      </div>
+    `;
+  }
+  return returnLineUnits(line).map((unit) => `
+    <div class="stepper-field return-unit-field">
+      <span>${unit.label}</span>
+      ${renderReturnQuantityStepper({
+        value: values[unit.key],
+        field: unit.key,
+        lineId: rowKey,
+        label: unit.label
+      })}
+      <small>× ${displayReturnQty(unit.conversion)} ${escapeHtml(returnLineSalesUom(line))}</small>
+    </div>
+  `).join("");
+}
+
+function renderReturnStockRow(line, values, rowIndex) {
+  const rowKey = values.clientRowKey;
+  const calculated = returnLineCalculatedSalesQty(line, values);
+  const remaining = returnLineRemaining(line);
+  return `
+    <div class="return-line-entry-row" data-return-row="${escapeHtml(rowKey)}">
+      ${returnType === "quality" ? `
+        <div class="return-split-row-heading">
+          <strong>${tf("operator.returnReasonRow", "Return reason row {number}", { number: rowIndex + 1 })}</strong>
+          ${rowIndex > 0 ? `<button class="danger-button" data-action="return-remove-split-row" data-line="${escapeHtml(rowKey)}" type="button">${t("operator.removeRow", "Remove row")}</button>` : ""}
+        </div>
+      ` : ""}
+      <div class="return-line-inputs">${renderReturnUnitInputs(line, values)}</div>
+      <div class="return-calculated-qty ${calculated > remaining + RETURN_QUANTITY_EPSILON ? "over" : ""}" data-return-calculated>
+        <span>${t("operator.calculatedSalesQuantity", "Calculated Sales UOM quantity")}</span>
+        <strong data-return-calculated-value>${displayReturnQty(calculated)} ${escapeHtml(returnLineSalesUom(line))}</strong>
+        <em>${tf("operator.maximumReturnable", "Maximum returnable: {quantity}", { quantity: `${displayReturnQty(remaining)} ${returnLineSalesUom(line)}` })}</em>
+      </div>
+      ${returnType === "quality" ? `
+        <div class="return-quality-fields">
+          <label class="return-field">
+            <span>${t("operator.netsuiteReason", "NetSuite reason")}</span>
+            <select data-return-line-input="reasonId" data-line="${escapeHtml(rowKey)}">
+              <option value="">${t("operator.selectReason", "Select reason")}</option>
+              ${returnReasons.qualityReasons.map((reason) => `<option value="${escapeHtml(reason.id)}" ${String(values.reasonId) === String(reason.id) ? "selected" : ""}>${escapeHtml(reason.label)}</option>`).join("")}
+            </select>
+          </label>
+          <label class="return-field">
+            <span>${t("operator.shortNoteOptional", "Short note (optional)")}</span>
+            <input data-return-line-input="note" data-line="${escapeHtml(rowKey)}" value="${escapeHtml(values.note)}" maxlength="250" />
+          </label>
+        </div>
+      ` : ""}
+    </div>
+  `;
+}
+
+function renderReturnStockLine(line) {
+  const lineId = returnSourceLineId(line);
+  const rows = returnRowsForLine(line);
+  const policy = returnLinePolicy(line);
+  const disabled = policy.effective === "NOT_RETURNABLE";
+  const active = String(returnActiveLineId) === lineId;
+  const remaining = returnLineRemaining(line);
+  const proposedTotal = rows.reduce((total, values) => total + returnLineCalculatedSalesQty(line, values), 0);
+  const over = proposedTotal > remaining + RETURN_QUANTITY_EPSILON;
+  const fulfilled = Number(line.fulfilledQuantity ?? line.fulfilled_quantity ?? 0) || 0;
+  const netsuiteReturned = Number(line.netsuiteReturned ?? line.netsuite_returned ?? 0) || 0;
+  const localReserved = Number(line.localReserved ?? line.local_reserved ?? 0) || 0;
+  const selectedRows = rows.filter((values) => returnLineHasQty(line, values));
+  const photoCount = selectedRows.reduce((total, values) => total + values.photos.filter(Boolean).length, 0);
+  return `
+    <button class="return-line-card ${disabled ? "disabled" : ""} ${active ? "active" : ""} ${over ? "over" : ""}" data-return-line-card="${escapeHtml(lineId)}" data-action="return-select-stock-line" data-source-line="${escapeHtml(lineId)}" type="button">
+      <div class="return-line-identity">
+        <strong>${escapeHtml(returnLineName(line))}</strong>
+        <span>${escapeHtml(returnLineDescription(line))}</span>
+        <em>${tf("operator.sourceLine", "Source line {line}", { line: escapeHtml(lineId) })}</em>
+      </div>
+      <div class="return-line-card-measures">
+        <span>${t("operator.remaining", "Remaining")} <b>${displayReturnQty(remaining)} ${escapeHtml(returnLineSalesUom(line))}</b></span>
+        <span>${t("operator.returning", "Returning")} <b data-return-line-proposed>${displayReturnQty(proposedTotal)} ${escapeHtml(returnLineSalesUom(line))}</b></span>
+        <small>${t("operator.fulfilled", "Fulfilled")} ${displayReturnQty(fulfilled)} · ${t("operator.netsuiteReturned", "NetSuite returned")} ${displayReturnQty(netsuiteReturned)} · ${t("operator.localReserved", "Local reserved")} ${displayReturnQty(localReserved)}</small>
+      </div>
+      <div class="return-line-state">
+        <span class="return-policy-pill ${returnPolicyClass(line)}">${returnPolicyLabel(line)}</span>
+        ${returnType === "quality" && selectedRows.length ? `<small>${selectedRows.length} ${t("operator.reasonRows", "reason row(s)")} · ${photoCount} ${t("common.photos", "photos")}</small>` : ""}
+      </div>
+    </button>
+  `;
+}
+
+function returnSelectedStockLine() {
+  if (!returnActiveLineId || returnActiveLineId === "PALLET") return null;
+  return returnLines().find((line) => returnSourceLineId(line) === String(returnActiveLineId)) || null;
+}
+
+function renderReturnSelectedLineEditor() {
+  if (returnActiveLineId === "PALLET" || returnMode === "pallet") return renderReturnPalletEditor();
+  const line = returnSelectedStockLine();
+  if (!line) {
+    return `
+      <aside class="return-selected-editor">
+        <div class="empty-state">
+          <strong>${t("operator.selectStockLine", "Select an order item")}</strong>
+          <span>${t("operator.selectStockLineHelp", "Choose a line in the middle list to enter its returned quantity.")}</span>
+        </div>
+      </aside>
+    `;
+  }
+  const lineId = returnSourceLineId(line);
+  const rows = returnRowsForLine(line);
+  const disabled = returnLinePolicy(line).effective === "NOT_RETURNABLE";
+  const remaining = returnLineRemaining(line);
+  const proposedTotal = rows.reduce((total, values) => total + returnLineCalculatedSalesQty(line, values), 0);
+  const over = proposedTotal > remaining + RETURN_QUANTITY_EPSILON;
+  const fulfilled = Number(line.fulfilledQuantity ?? line.fulfilled_quantity ?? 0) || 0;
+  const netsuiteReturned = Number(line.netsuiteReturned ?? line.netsuite_returned ?? 0) || 0;
+  const localReserved = Number(line.localReserved ?? line.local_reserved ?? 0) || 0;
+  const primaryValues = rows[0] || ensureReturnLineValue(line);
+  const salesUom = returnLineSalesUom(line);
+  return `
+    <aside class="return-selected-editor" data-return-line-editor-card="${escapeHtml(lineId)}">
+      <div class="return-panel-heading">
+        <div>
+          <span>${t("operator.selectedReturnItem", "Selected return item")}</span>
+          <strong>${escapeHtml(returnLineName(line))}</strong>
+          <em>${escapeHtml(returnLineDescription(line))}</em>
+        </div>
+        <span class="return-policy-pill ${returnPolicyClass(line)}">${returnPolicyLabel(line)}</span>
+      </div>
+      <div class="return-balance-grid return-stock-balance-grid">
+        <div><span>${t("operator.fulfilled", "Fulfilled")}</span><strong>${displayReturnQty(fulfilled)} ${escapeHtml(salesUom)}</strong></div>
+        <div><span>${t("operator.netsuiteReturned", "NetSuite returned")}</span><strong>${displayReturnQty(netsuiteReturned)} ${escapeHtml(salesUom)}</strong></div>
+        <div><span>${t("operator.localReserved", "Local reserved")}</span><strong>${displayReturnQty(localReserved)} ${escapeHtml(salesUom)}</strong></div>
+        <div class="available"><span>${t("operator.remaining", "Remaining")}</span><strong>${displayReturnQty(remaining)} ${escapeHtml(salesUom)}</strong></div>
+      </div>
+      ${disabled ? `
+        <div class="sync-alert danger"><strong>${t("operator.returnNotReturnable", "Not Returnable")}</strong><span>${t("operator.itemPolicyBlocksReturn", "The company-wide Item Master policy blocks this product.")}</span></div>
+      ` : `
+        <div class="return-selected-line-editor">
+          ${rows.map((values, index) => renderReturnStockRow(line, values, index)).join("")}
+          ${returnType === "normal" ? `
+            <div class="return-normal-editor-fields">
+              <div class="return-fixed-reason"><span>${t("operator.netsuiteReason", "NetSuite reason")}</span><strong>${escapeHtml(returnReasons.normalReason.label || "GD - Good Condition")}</strong></div>
+              <label class="return-field">
+                <span>${t("operator.shortNoteOptional", "Short note (optional)")}</span>
+                <input data-return-line-input="note" data-line="${escapeHtml(primaryValues.clientRowKey)}" value="${escapeHtml(primaryValues.note)}" maxlength="250" />
+              </label>
+            </div>
+          ` : ""}
+          <div class="sync-alert danger" data-return-line-over ${over ? "" : "hidden"}>
+            <strong>${t("operator.overReturnableQuantity", "Quantity exceeds remaining returnable")}</strong>
+            <span data-return-line-over-value>${displayReturnQty(proposedTotal)} / ${displayReturnQty(remaining)} ${escapeHtml(returnLineSalesUom(line))}</span>
+          </div>
+          ${returnType === "quality" ? `<button class="secondary-button return-add-split" data-action="return-add-split-row" data-source-line="${escapeHtml(lineId)}" type="button">${t("operator.addAnotherReason", "Add another reason / quantity")}</button>` : ""}
+        </div>
+      `}
+    </aside>
+  `;
+}
+
+function updateReturnPhotoRequirement(kind, lineId, required) {
+  const button = [...app.querySelectorAll(`.return-photo-button[data-photo-kind="${kind}"]`)]
+    .find((candidate) => String(candidate.dataset.line || "") === String(lineId || ""));
+  if (!button) return;
+  button.dataset.photoRequired = required ? "true" : "false";
+  const label = button.querySelector("[data-return-photo-requirement]");
+  if (label) {
+    label.textContent = required
+      ? t("operator.photoRequired", "Photo required")
+      : t("common.optional", "Optional");
+  }
+}
+
+function stepReturnQuantity(button) {
+  const kind = String(button?.dataset?.returnQuantityKind || "");
+  const field = String(button?.dataset?.returnQuantityField || "");
+  const delta = Number(button?.dataset?.delta || 0);
+  const step = Math.max(0, Number(button?.dataset?.returnQuantityStep || 1)) || 1;
+  if (!delta || !field) return;
+
+  let currentValue = 0;
+  let values = null;
+  if (kind === "pallet" && field === "palletQuantity") {
+    currentValue = Number(returnPalletQuantity) || 0;
+  } else {
+    values = returnLineValues[String(button.dataset.line || "")];
+    if (!values || !["pallets", "layers", "sections", "pieces", "salesQuantity"].includes(field)) return;
+    currentValue = Number(values[field]) || 0;
+  }
+
+  const nextValue = Math.max(0, Math.round((currentValue + (delta * step)) * 1_000_000) / 1_000_000);
+  if (kind === "pallet") returnPalletQuantity = nextValue;
+  else values[field] = nextValue;
+  returnDirty = true;
+
+  const stepper = button.closest(".return-quantity-stepper");
+  const output = stepper?.querySelector("[data-return-quantity-value]");
+  if (output) output.textContent = displayReturnQty(nextValue);
+  const decrease = stepper?.querySelector('[data-action="return-step-quantity"][data-delta="-1"]');
+  if (decrease) decrease.disabled = nextValue <= 0;
+  refreshReturnQuantityFeedback(button);
+}
+
+function refreshReturnQuantityFeedback(target) {
+  if (target?.dataset?.returnInput === "palletQuantity") {
+    const balance = currentPalletBalance();
+    const over = Number(returnPalletQuantity) > returnBalanceAvailable(balance) + RETURN_QUANTITY_EPSILON;
+    const alert = app.querySelector("[data-return-pallet-over]");
+    if (alert) alert.hidden = !over;
+    const selector = app.querySelector(".return-pallet-compact");
+    selector?.classList.toggle("over", over);
+    const proposed = selector?.querySelector("[data-return-pallet-proposed]");
+    if (proposed) proposed.textContent = displayReturnQty(returnPalletQuantity);
+    updateReturnPhotoRequirement(
+      "pallet",
+      "",
+      returnMode === "pallet" || Number(returnPalletQuantity) > 0
+    );
+    return;
+  }
+  if (!target?.dataset?.returnLineInput) return;
+  const values = returnLineValues[String(target.dataset.line || "")];
+  const line = returnLineForValues(values);
+  if (!values || !line) return;
+  const calculated = returnLineCalculatedSalesQty(line, values);
+  const remaining = returnLineRemaining(line);
+  const row = target.closest("[data-return-row]");
+  const calculatedBox = row?.querySelector("[data-return-calculated]");
+  calculatedBox?.classList.toggle("over", calculated > remaining + RETURN_QUANTITY_EPSILON);
+  const calculatedValue = row?.querySelector("[data-return-calculated-value]");
+  if (calculatedValue) {
+    calculatedValue.textContent = `${displayReturnQty(calculated)} ${returnLineSalesUom(line)}`;
+  }
+  if (returnType === "quality") {
+    updateReturnPhotoRequirement("line", values.clientRowKey, calculated > 0);
+  } else {
+    updateReturnPhotoRequirement("record", "", returnSelectedRows().length > 0);
+  }
+  const proposedTotal = returnRowsForLine(line)
+    .reduce((total, candidate) => total + returnLineCalculatedSalesQty(line, candidate), 0);
+  const editor = target.closest("[data-return-line-editor-card]");
+  const overAlert = editor?.querySelector("[data-return-line-over]");
+  if (overAlert) overAlert.hidden = !(proposedTotal > remaining + RETURN_QUANTITY_EPSILON);
+  const overValue = editor?.querySelector("[data-return-line-over-value]");
+  if (overValue) {
+    overValue.textContent = `${displayReturnQty(proposedTotal)} / ${displayReturnQty(remaining)} ${returnLineSalesUom(line)}`;
+  }
+  const listCard = [...app.querySelectorAll("[data-return-line-card]")]
+    .find((candidate) => String(candidate.dataset.returnLineCard || "") === returnSourceLineId(line));
+  listCard?.classList.toggle("over", proposedTotal > remaining + RETURN_QUANTITY_EPSILON);
+  const proposedValue = listCard?.querySelector("[data-return-line-proposed]");
+  if (proposedValue) {
+    proposedValue.textContent = `${displayReturnQty(proposedTotal)} ${returnLineSalesUom(line)}`;
+  }
+}
+
+function renderReturnStockLines() {
+  const lines = returnLines();
+  const visible = pageItems(lines, returnLinePage, RETURN_LINE_PAGE_SIZE);
+  return `
+    <section class="return-stock-selector-panel">
+      <div class="return-section-heading">
+        <div>
+          <span>${returnType === "quality" ? t("operator.qualityReturn", "Quality Issue Return") : t("operator.normalStockReturn", "Normal Stock Return")}</span>
+          <h2>${t("operator.orderItems", "Order items")}</h2>
+        </div>
+        <span>${lines.length} ${t("common.lines", "lines")}</span>
+      </div>
+      <div class="return-line-list">
+        ${visible.map(renderReturnStockLine).join("") || `<div class="empty-state small"><strong>${t("operator.noReturnableOrderLines", "No stock lines found")}</strong></div>`}
+      </div>
+      <div class="pagination-row">
+        <button class="secondary-button" data-action="return-line-prev" ${returnLinePage <= 0 ? "disabled" : ""} type="button">${t("common.previous", "Previous")}</button>
+        <strong>${lines.length ? `${returnLinePage + 1} / ${pageCount(lines, RETURN_LINE_PAGE_SIZE)}` : "0 / 0"}</strong>
+        <button class="secondary-button" data-action="return-line-next" ${returnLinePage >= pageCount(lines, RETURN_LINE_PAGE_SIZE) - 1 ? "disabled" : ""} type="button">${t("common.next", "Next")}</button>
+      </div>
+      <div class="return-pallet-selector-footer">
+        ${renderReturnPalletSection()}
+      </div>
+    </section>
+  `;
+}
+
+function renderReturnPalletSelectorPanel() {
+  return `
+    <section class="return-stock-selector-panel pallet-only-selector">
+      <div class="return-section-heading">
+        <div>
+          <span>${t("operator.customerLevel", "Customer level")}</span>
+          <h2>${t("operator.returnItems", "Return items")}</h2>
+        </div>
+      </div>
+      <div class="return-pallet-selector-footer">
+        ${renderReturnPalletSection()}
+      </div>
+    </section>
+  `;
+}
+
+function renderReturnForm() {
+  return `
+    <section class="return-form-shell ${returnMode === "stock" ? "stock-return-form" : "pallet-return-form"}">
+      ${renderReturnCustomerSummary()}
+      ${renderReturnYardBanner()}
+      ${returnValidationMessage ? `<div class="sync-alert danger"><strong>${t("operator.returnNeedsAttention", "Return needs attention")}</strong><span>${escapeHtml(returnValidationMessage)}</span></div>` : ""}
+      <div class="return-form-grid return-quantity-grid">
+        ${returnMode === "stock" ? renderReturnStockLines() : renderReturnPalletSelectorPanel()}
+        ${renderReturnSelectedLineEditor()}
+      </div>
+      <div class="return-bottom-actions">
+        <button class="secondary-button" data-action="return-save-draft" ${returnBusy ? "disabled" : ""} type="button">${returnBusy ? t("common.saving", "Saving...") : t("operator.saveDraft", "Save Draft")}</button>
+        <button class="primary-button" data-action="return-open-review" ${returnBusy || returnYardGate().blocked ? "disabled" : ""} type="button">${t("operator.reviewReturn", "Review Return")}</button>
+      </div>
+    </section>
+  `;
+}
+
+function returnSelectedRows() {
+  return Object.values(returnLineValues)
+    .map((values) => ({ values, line: returnLineForValues(values) }))
+    .filter(({ line, values }) => line && returnLineHasQty(line, values));
+}
+
+function renderReturnReviewLine({ line, values }) {
+  const reason = returnType === "normal"
+    ? returnReasons.normalReason
+    : returnReasons.qualityReasons.find((item) => String(item.id) === String(values.reasonId)) || { label: values.reasonLabel || "-" };
+  return `
+    <div class="return-review-line">
+      <div>
+        <strong>${escapeHtml(returnLineName(line))}</strong>
+        <span class="return-review-reason">${escapeHtml(reason.label || "-")}</span>
+        ${values.note ? `<em>${escapeHtml(values.note)}</em>` : ""}
+      </div>
+      <b>${displayReturnQty(returnLineCalculatedSalesQty(line, values))} ${escapeHtml(returnLineSalesUom(line))}</b>
+      <span class="return-policy-pill ${returnPolicyClass(line)}">${returnPolicyLabel(line)}</span>
+      ${returnType === "quality" ? `<small>${values.photos.filter(Boolean).length} ${t("common.photos", "photos")}</small>` : ""}
+    </div>
+  `;
+}
+
+function renderReturnPalletReviewLine() {
+  if (Number(returnPalletQuantity) <= RETURN_QUANTITY_EPSILON) return "";
+  return `
+    <div class="return-review-line pallet-return-review-line">
+      <div>
+        <strong>${t("operator.palletReturn", "Pallet Return")}</strong>
+        <span>${t("operator.customerLevel", "Customer level")}</span>
+      </div>
+      <b>${displayReturnQty(returnPalletQuantity)} PALLET</b>
+      <span class="return-policy-pill allowed">${t("operator.alwaysEligibleWithinQuota", "Allowed within quota")}</span>
+      <small>${returnPalletPhotos.filter(Boolean).length} ${t("common.photos", "photos")}</small>
+    </div>
+  `;
+}
+
+function renderReturnPhotoSummary(photos, label) {
+  const visible = (photos || []).filter(Boolean);
+  if (!visible.length) return "";
+  return `
+    <div class="return-review-photos">
+      <strong>${escapeHtml(label)}</strong>
+      <div>
+        ${visible.map((photo, index) => `<button data-action="open-history-photo" data-photo-ref="${escapeHtml(photo)}" data-photo-label="${escapeHtml(label)} ${index + 1}" type="button"><img ${photoImgAttributes(photo)} alt="${escapeHtml(label)} ${index + 1}" /></button>`).join("")}
+      </div>
+    </div>
+  `;
+}
+
+function renderReturnReview() {
+  const selectedRows = returnSelectedRows();
+  const palletReviewLine = renderReturnPalletReviewLine();
+  const reviewReference = returnOrderRef() || returnCustomerName();
+  return `
+    <section class="fulfillment-screen return-review-screen">
+      ${renderReturnPhotoWorkspace()}
+      <div class="fulfillment-card return-review-details-card">
+        <span>${t("operator.finalReview", "Final review")}</span>
+        <div class="return-review-header">
+          <div>
+            <strong>${escapeHtml(reviewReference)}</strong>
+            <small>${returnMode === "stock" ? (returnType === "quality" ? t("operator.qualityReturn", "Quality Issue Return") : t("operator.normalStockReturn", "Normal Stock Return")) : t("operator.palletReturn", "Pallet Return")}</small>
+          </div>
+          <span class="status-pill open">${t("common.review", "Review")}</span>
+        </div>
+        <div class="return-review-detail-scroll">
+          ${renderReturnCustomerSummary()}
+          ${renderReturnYardBanner()}
+          ${returnValidationMessage ? `
+            <div class="sync-alert danger" data-return-review-validation>
+              <strong>${t("operator.returnNeedsAttention", "Return needs attention")}</strong>
+              <span>${escapeHtml(returnValidationMessage)}</span>
+            </div>
+          ` : ""}
+          ${selectedRows.length || palletReviewLine ? `
+            <div class="fulfillment-lines return-review-lines">
+              ${palletReviewLine}
+              ${selectedRows.map(renderReturnReviewLine).join("")}
+            </div>
+          ` : ""}
+          <div class="sync-alert">
+            <strong>${t("operator.finalValidationNotice", "Final validation runs when you confirm")}</strong>
+            <span>${t("operator.finalValidationHelp", "NetSuite and local reservations will be rechecked. Both linked records are saved atomically.")}</span>
+          </div>
+          <div class="return-review-entry-fields">
+            <label class="return-field">
+              <span>${t("operator.vehiclePlate", "Vehicle plate")} · ${t("operator.requiredBeforeConfirm", "Required before confirm")}</span>
+              <input data-return-input="vehiclePlate" value="${escapeHtml(returnVehiclePlate)}" autocomplete="off" maxlength="32" />
+              <small>${t("operator.vehiclePlateHelp", "Enter the plate of the vehicle that brought the return.")}</small>
+            </label>
+            <label class="return-field">
+              <span>${t("operator.returnNoteOptional", "Return note (optional)")}</span>
+              <textarea data-return-input="headerNote" maxlength="500" placeholder="${t("operator.returnNoteHelp", "Add a short note for this return or PALLET record.")}">${escapeHtml(returnHeaderNote)}</textarea>
+            </label>
+          </div>
+        </div>
+      </div>
+      <div class="selected-actions return-review-actions">
+        <button class="secondary-button" data-action="return-back-to-form" ${returnBusy ? "disabled" : ""} type="button">${t("common.back", "Back")}</button>
+        <button class="primary-button" data-action="return-confirm-submit" ${returnBusy ? "disabled" : ""} type="button">${returnBusy ? t("operator.confirming", "Confirming...") : t("operator.confirmReturn", "Confirm Return")}</button>
+      </div>
+    </section>
+  `;
+}
+
+function renderReturnSuccess() {
+  const batch = returnResult?.batchReference || returnResult?.batch_reference || "";
+  const stock = returnResult?.stockReturn || returnResult?.stock_return || null;
+  const pallet = returnResult?.palletReturn || returnResult?.pallet_return || null;
+  const referenceOf = (record) => record?.reference || record?.returnReference || record?.return_reference || "";
+  const statusOf = (record) => record?.status || "";
+  return `
+    <section class="return-success-shell">
+      <div class="return-success-mark">✓</div>
+      <span>${t("operator.returnRecorded", "Return recorded")}</span>
+      <h2>${escapeHtml(batch || referenceOf(stock) || referenceOf(pallet))}</h2>
+      <p>${t("operator.returnRecordedHelp", "The local records are saved in PostgreSQL. Inventory was not changed.")}</p>
+      <div class="return-created-records">
+        ${stock ? `<div><span>${t("operator.stockReturn", "Stock Return")}</span><strong>${escapeHtml(referenceOf(stock))}</strong><em>${escapeHtml(localizeMessage(statusOf(stock)))}</em></div>` : ""}
+        ${pallet ? `<div><span>${t("operator.palletReturn", "Pallet Return")}</span><strong>${escapeHtml(referenceOf(pallet))}</strong><em>${escapeHtml(localizeMessage(statusOf(pallet)))}</em></div>` : ""}
+      </div>
+      <div class="return-bottom-actions">
+        <button class="secondary-button" data-action="return-open-history-view" type="button">${t("common.history", "History")}</button>
+        <button class="primary-button" data-action="return-new" type="button">${t("operator.newReturn", "New Return")}</button>
+      </div>
+    </section>
+  `;
+}
+
+function returnRecordReference(record) {
+  return record?.batchReference || record?.batch_reference || record?.reference || record?.returnReference || record?.return_reference || record?.id || "";
+}
+
+function returnSavedPhotoReference(photo) {
+  return typeof photo === "string"
+    ? photo
+    : photo?.reference || photo?.photoReference || photo?.photo_reference || photo?.url || "";
+}
+
+function renderReturnHistoryDetails(record) {
+  const lines = record?.lines || [];
+  const headerPhotos = (record?.photos || []).map(returnSavedPhotoReference).filter(Boolean);
+  const palletQuantity = record?.palletQuantity ?? record?.pallet_quantity;
+  return `
+    ${palletQuantity !== null && palletQuantity !== undefined ? `
+      <div class="return-header-note">
+        <span>${t("operator.palletQuantity", "PALLET quantity")}</span>
+        <p>${displayReturnQty(palletQuantity)}</p>
+      </div>
+    ` : ""}
+    ${record?.note ? `
+      <div class="return-header-note">
+        <span>${t("operator.returnNote", "Return note")}</span>
+        <p>${escapeHtml(record.note)}</p>
+      </div>
+    ` : ""}
+    ${lines.length ? `
+      <div class="return-review-lines">
+        ${lines.map((line) => `
+          <div class="return-review-line">
+            <div>
+              <strong>${escapeHtml(line.itemName || line.item_name || line.sku || "-")}</strong>
+              <span>${escapeHtml(line.reasonLabel || line.reason_label || "")}</span>
+              ${line.note ? `<em>${escapeHtml(line.note)}</em>` : ""}
+            </div>
+            <b>${displayReturnQty(line.returnedSalesQuantity ?? line.returned_sales_quantity ?? line.salesQuantity ?? line.sales_quantity)} ${escapeHtml(line.salesUom || line.sales_uom || "")}</b>
+            <span class="return-policy-pill ${String(line.approvalStatus || line.approval_status || "").includes("pending") ? "approval" : "allowed"}">${escapeHtml(localizeMessage(line.approvalStatus || line.approval_status || ""))}</span>
+            <small>${(line.photos || []).length} ${t("common.photos", "photos")}</small>
+          </div>
+        `).join("")}
+      </div>
+    ` : ""}
+    ${renderReturnPhotoSummary(headerPhotos, t("common.photos", "Photos"))}
+    ${lines.map((line) => renderReturnPhotoSummary(
+      (line.photos || []).map(returnSavedPhotoReference).filter(Boolean),
+      line.itemName || line.item_name || t("common.line", "Line")
+    )).join("")}
+    ${(record.netSuiteTransactionRef || record.net_suite_transaction_ref || record.netSuiteSyncStatus || record.net_suite_sync_status) ? `
+      <div class="sync-alert">
+        <strong>${escapeHtml(record.netSuiteTransactionRef || record.net_suite_transaction_ref || t("operator.netsuiteSync", "NetSuite sync"))}</strong>
+        <span>${escapeHtml(localizeMessage(record.netSuiteSyncStatus || record.net_suite_sync_status || ""))}${record.netSuiteSyncError || record.net_suite_sync_error ? ` — ${escapeHtml(record.netSuiteSyncError || record.net_suite_sync_error)}` : ""}</span>
+      </div>
+    ` : ""}
+  `;
+}
+
+function renderReturnRecordList(records, type) {
+  const selected = records.find((record) => String(record.id) === String(returnSelectedRecordId)) || records[0] || null;
+  const detail = type === "history" && String(returnHistoryDetail?.id) === String(selected?.id)
+    ? returnHistoryDetail
+    : selected;
+  return `
+    <section class="return-records-shell">
+      <div class="return-record-list">
+        ${records.map((record) => `
+          <button class="${String(record.id) === String(selected?.id) ? "active" : ""}" data-action="return-select-${type}" data-record="${escapeHtml(record.id)}" type="button">
+            <span>${escapeHtml(record.returnType || record.return_type || record.type || "")}</span>
+            <strong>${escapeHtml(returnRecordReference(record))}</strong>
+            <em>${formatDateTime(record.submittedAt || record.submitted_at || record.updatedAt || record.updated_at || record.createdAt || record.created_at)}</em>
+            <b>${escapeHtml(localizeMessage(record.status || (type === "draft" ? t("operator.draft", "Draft") : "")))}</b>
+          </button>
+        `).join("") || `<div class="empty-state"><strong>${type === "draft" ? t("operator.noReturnDrafts", "No return drafts") : t("operator.noReturnHistory", "No return history")}</strong></div>`}
+        ${type === "history" ? `
+          <div class="pagination-row">
+            <button class="secondary-button" data-action="return-history-prev" ${returnHistoryOffset <= 0 ? "disabled" : ""} type="button">${t("common.previous", "Previous")}</button>
+            <strong>${returnHistoryTotal
+              ? `${returnHistoryOffset + 1}–${Math.min(returnHistoryOffset + records.length, returnHistoryTotal)} / ${returnHistoryTotal}`
+              : "0 / 0"}</strong>
+            <button class="secondary-button" data-action="return-history-next" ${returnHistoryOffset + records.length >= returnHistoryTotal ? "disabled" : ""} type="button">${t("common.next", "Next")}</button>
+          </div>
+        ` : ""}
+      </div>
+      <div class="return-record-detail">
+        ${detail ? `
+          <div class="return-review-header">
+            <div><span>${type === "draft" ? t("operator.draft", "Draft") : t("common.history", "History")}</span><h2>${escapeHtml(returnRecordReference(detail))}</h2></div>
+            <span class="status-pill open">${escapeHtml(localizeMessage(detail.status || ""))}</span>
+          </div>
+          <div class="return-review-meta">
+            <div><span>${t("operator.salesOrder", "Sales Order")}</span><strong>${escapeHtml(detail.sourceSalesOrderRef || detail.source_sales_order_ref || detail.orderRef || detail.order_ref || "-")}</strong></div>
+            <div><span>${t("operator.customer", "Customer")}</span><strong>${escapeHtml(detail.customerName || detail.customer_name || "-")}</strong></div>
+            <div><span>${t("operator.vehiclePlate", "Vehicle plate")}</span><strong>${escapeHtml(detail.vehiclePlate || detail.vehicle_plate || "-")}</strong></div>
+            ${(detail.palletQuantity ?? detail.pallet_quantity) !== null
+                && (detail.palletQuantity ?? detail.pallet_quantity) !== undefined
+              ? `<div><span>${t("operator.palletQuantity", "PALLET quantity")}</span><strong>${displayReturnQty(detail.palletQuantity ?? detail.pallet_quantity)}</strong></div>`
+              : ""}
+          </div>
+          ${type === "draft" && detail.note ? `<div class="return-header-note"><span>${t("operator.returnNote", "Return note")}</span><p>${escapeHtml(detail.note)}</p></div>` : ""}
+          ${type === "history" ? renderReturnHistoryDetails(detail) : ""}
+          ${type === "draft" ? `
+            <div class="return-bottom-actions">
+              <button class="danger-button" data-action="return-delete-draft" data-record="${escapeHtml(detail.id)}" type="button">${t("operator.discardDraft", "Discard Draft")}</button>
+              <button class="primary-button" data-action="return-resume-draft" data-record="${escapeHtml(detail.id)}" type="button">${t("operator.resumeDraft", "Resume Draft")}</button>
+            </div>
+          ` : ""}
+        ` : ""}
+      </div>
+    </section>
+  `;
+}
+
+function renderReturnWorkflow() {
+  const actions = `
+    <button class="secondary-button" data-action="return-back-select" type="button">${t("common.back", "Back")}</button>
+    <button class="${returnView === "drafts" ? "primary-button" : "secondary-button"}" data-action="return-open-drafts" type="button">${t("operator.drafts", "Drafts")}${returnDrafts.length ? ` (${returnDrafts.length})` : ""}</button>
+    <button class="${returnView === "history" ? "primary-button" : "secondary-button"}" data-action="return-open-history-view" type="button">${t("common.history", "History")}</button>
+    <button class="secondary-button" data-action="logout" type="button">${escapeHtml(operator.display_name)}</button>
+  `;
+  let body;
+  if (returnView === "drafts") body = renderReturnRecordList(returnDrafts, "draft");
+  else if (returnView === "history") body = renderReturnRecordList(returnHistory, "history");
+  else if (returnStage === "form") body = renderReturnForm();
+  else if (returnStage === "review") body = renderReturnReview();
+  else if (returnStage === "success") body = renderReturnSuccess();
+  else body = renderReturnLookup();
+  shell(returnModuleTitle(), `${t("common.location", "Location")} ${currentLocation()?.text || locationId}`, body, actions);
 }
 
 function renderDeliverySelect() {
@@ -4851,7 +6229,10 @@ function historyTypeLabel(type) {
     item_receipt: "IR",
     item_fulfillment: "IF",
     cycle_count: t("operator.cycleHistory", "Cycle"),
-    customer_return: t("operator.customerReturnHistory", "Customer Return")
+    customer_return: t("operator.customerReturnHistory", "Customer Return"),
+    stock_return: t("operator.stockReturn", "Stock Return"),
+    pallet_return: t("operator.palletReturn", "Pallet Return"),
+    return_batch: t("operator.returnBatch", "Return Batch")
   }[type] || type || t("operator.recordHistory", "Record");
 }
 
@@ -4862,7 +6243,7 @@ function renderHistoryPhotos(record) {
     <div class="history-photo-grid">
       ${photos.map((photo, index) => `
         <button class="history-photo-button" data-action="open-history-photo" data-photo-ref="${escapeHtml(photo)}" data-photo-label="${tf("operator.recordPhotoNumber", "Record photo {number}", { number: index + 1 })}" type="button">
-          <img src="${photoImgSrc(photo)}" alt="${tf("operator.recordPhotoNumber", "Record photo {number}", { number: index + 1 })}" />
+          <img ${photoImgAttributes(photo)} alt="${tf("operator.recordPhotoNumber", "Record photo {number}", { number: index + 1 })}" />
         </button>
       `).join("")}
     </div>
@@ -4896,6 +6277,12 @@ function renderHistoryLineDetails(record) {
           <div class="history-line-name">
             <strong>${escapeHtml(line.itemName || "")}</strong>
             ${line.description ? `<span>${escapeHtml(line.description)}</span>` : ""}
+            ${line.reasonLabel || line.reasonCode
+              ? `<span>${escapeHtml(line.reasonLabel || line.reasonCode)}</span>`
+              : ""}
+            ${line.approvalStatus
+              ? `<em>${escapeHtml(localizeMessage(line.approvalStatus))}</em>`
+              : ""}
           </div>
           ${units.map((unit) => `<span>${unit.label} ${unit.value}</span>`).join("")}
         </div>
@@ -4909,6 +6296,13 @@ function renderHistoryDetail(record) {
   if (!record) {
     return `<div class="empty-state small"><strong>${t("operator.selectRecord", "Select a record")}</strong><span>${t("operator.selectRecordHelp", "Tap one history record to view details.")}</span></div>`;
   }
+  const details = record.details || {};
+  const vehiclePlate = record.vehiclePlate || record.vehicle_plate || details.vehiclePlate || details.vehicle_plate || "";
+  const customerName = record.customerName || record.customer_name || details.customerName || details.customer_name || "";
+  const receivingYard = record.receivingYard || record.receiving_yard
+    || details.receivingLocationName || details.receiving_location_name || "";
+  const palletQuantity = record.palletQuantity ?? record.pallet_quantity
+    ?? details.palletQuantity ?? details.pallet_quantity;
   return `
     <div class="history-detail-card">
       <div class="detail-header">
@@ -4923,6 +6317,16 @@ function renderHistoryDetail(record) {
         <div><span>${t("operator.action", "Action")}</span><strong>${escapeHtml(localizeMessage(record.action || "-"))}</strong></div>
         <div><span>${t("common.order", "Order")}</span><strong>${escapeHtml(record.orderId || "-")}</strong></div>
       </div>
+      ${(vehiclePlate || customerName || receivingYard || (palletQuantity !== null && palletQuantity !== undefined)) ? `
+        <div class="progress-strip history-meta">
+          <div><span>${t("operator.vehiclePlate", "Vehicle plate")}</span><strong>${escapeHtml(vehiclePlate || "-")}</strong></div>
+          <div><span>${t("operator.customer", "Customer")}</span><strong>${escapeHtml(customerName || "-")}</strong></div>
+          <div><span>${t("operator.receivingYard", "Receiving yard")}</span><strong>${escapeHtml(receivingYard || "-")}</strong></div>
+          ${palletQuantity !== null && palletQuantity !== undefined
+            ? `<div><span>${t("operator.palletQuantity", "PALLET quantity")}</span><strong>${displayReturnQty(palletQuantity)}</strong></div>`
+            : ""}
+        </div>
+      ` : ""}
       ${renderHistoryPhotos(record)}
       ${renderHistoryLineDetails(record)}
       <div class="history-report-box">
@@ -4977,6 +6381,13 @@ function renderPersonalHistory() {
 }
 
 async function openModule(moduleName) {
+  if (moduleName === "pallet-return" || moduleName === "stock-return") {
+    resetReturnWorkflow(moduleName === "stock-return" ? "stock" : "pallet");
+    currentModule = moduleName;
+    selectRearCamera();
+    await loadReturnReasons().catch(() => {});
+    return render();
+  }
   if (moduleName === "customer-pickup") {
     selectRearCamera();
     currentModule = "customer-pickup-scan";
@@ -5037,6 +6448,842 @@ async function openModule(moduleName) {
     return render();
   }
   showToast(t("operator.moduleComingSoon", "This module is next."));
+}
+
+function createReturnIdempotencyKey() {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  return `return-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function resetReturnWorkflow(mode = returnMode || "pallet", { keepResult = false } = {}) {
+  stopReturnCamera();
+  stopReturnScannerCamera();
+  returnMode = mode === "stock" ? "stock" : "pallet";
+  returnStage = "lookup";
+  returnView = "workflow";
+  returnType = "normal";
+  returnLookupCode = "";
+  returnLookupMessage = "";
+  returnLookupData = null;
+  returnCustomerSearch = "";
+  returnCustomerResults = [];
+  returnCustomerSearchBusy = false;
+  returnCustomerSearchPending = false;
+  returnCustomerSearchGeneration += 1;
+  returnSelectedCustomer = null;
+  returnPalletBalance = null;
+  returnPalletQuantity = 0;
+  returnVehiclePlate = "";
+  returnHeaderNote = "";
+  returnLineValues = {};
+  returnLinePage = 0;
+  returnActiveLineId = "";
+  returnRecordPhotos = [];
+  returnPalletPhotos = [];
+  returnPhotoTarget = { kind: mode === "pallet" ? "pallet" : "record", lineId: "", open: false };
+  returnPhotoSlot = 0;
+  returnDraftId = "";
+  returnHistoryDetail = null;
+  returnDirty = false;
+  returnBusy = false;
+  returnValidationMessage = "";
+  returnIdempotencyKey = createReturnIdempotencyKey();
+  if (!keepResult) returnResult = null;
+}
+
+async function loadReturnReasons() {
+  const payload = await api("/api/returns/reasons");
+  applyReturnReasons(payload || {});
+  return returnReasons;
+}
+
+function normalizeReturnLookup(payload = {}) {
+  const order = payload.order || payload.salesOrder || payload.sales_order || null;
+  const customer = payload.customer || order?.customer || null;
+  const lines = Array.isArray(payload.lines)
+    ? payload.lines
+    : Array.isArray(order?.lines) ? order.lines : [];
+  return {
+    ...payload,
+    order,
+    customer,
+    lines,
+    palletBalance: payload.palletBalance || payload.pallet_balance || null
+  };
+}
+
+async function lookupReturnOrder(code = returnLookupCode) {
+  const clean = normalizedPickupCameraCode(code);
+  returnLookupCode = clean;
+  returnLookupMessage = "";
+  if (!/^SO(?:A|B|M)\d+$/i.test(clean)) {
+    returnLookupMessage = t("operator.validSalesOrderRequired", "Enter a valid SOA, SOB, or SOM Sales Order number.");
+    return render();
+  }
+  if (returnMode === "stock") {
+    const yardPreflight = returnLookupYardPreflight(clean);
+    if (yardPreflight.blocked) {
+      returnLookupMessage = tf(
+        "operator.returnMustBeProcessedAt",
+        "This return must be processed at {yard}.",
+        { yard: yardPreflight.requiredYard?.yardCode || "-" }
+      );
+      return render();
+    }
+  }
+  stopReturnScannerCamera();
+  returnBusy = true;
+  render();
+  try {
+    const payload = await api("/api/returns/orders/lookup", {
+      method: "POST",
+      body: JSON.stringify({ code: clean, receivingLocationId: locationId, mode: returnMode })
+    });
+    stopReturnScannerCamera();
+    returnLookupData = normalizeReturnLookup(payload);
+    returnSelectedCustomer = returnLookupData.customer;
+    returnPalletBalance = returnLookupData.palletBalance;
+    returnLineValues = {};
+    for (const line of returnLines()) ensureReturnLineValue(line);
+    returnActiveLineId = firstReturnLineId();
+    returnPalletQuantity = 0;
+    returnVehiclePlate = "";
+    returnHeaderNote = "";
+    returnRecordPhotos = [];
+    returnPalletPhotos = [];
+    returnLinePage = 0;
+    returnPhotoTarget = defaultReturnPhotoTarget();
+    returnPhotoSlot = 0;
+    returnDraftId = "";
+    returnIdempotencyKey = createReturnIdempotencyKey();
+    returnDirty = false;
+    returnStage = "form";
+    returnView = "workflow";
+    returnValidationMessage = "";
+  } catch (error) {
+    const code = String(error.payload?.code || "");
+    returnLookupMessage = code === "CROSS_YARD_RETURN_BLOCKED"
+      ? tf("operator.returnMustBeProcessedAt", "This return must be processed at {yard}.", { yard: returnYardName(error.payload.requiredReturnLocation) || "-" })
+      : code === "ORDER_NOT_FULLY_FULFILLED"
+        ? returnOrderNotFullyFulfilledMessage()
+        : error.message;
+  } finally {
+    returnBusy = false;
+    render();
+  }
+}
+
+async function searchReturnCustomers() {
+  if (returnCustomerSearchActive) {
+    returnCustomerSearchPending = true;
+    return;
+  }
+  returnCustomerSearchActive = true;
+  try {
+    while (true) {
+      returnCustomerSearchPending = false;
+      window.clearTimeout(app.returnCustomerSearchTimer);
+      app.returnCustomerSearchTimer = null;
+      const search = returnCustomerSearch.trim();
+      const generation = returnCustomerSearchGeneration;
+      if (returnMode !== "pallet" || search.length < 2) {
+        returnCustomerResults = [];
+        returnCustomerSearchBusy = false;
+        break;
+      }
+      stopReturnScannerCamera();
+      returnCustomerSearchBusy = true;
+      render();
+      try {
+        const params = new URLSearchParams({
+          search,
+          receivingLocationId: String(locationId)
+        });
+        const payload = await api(`/api/returns/customers?${params.toString()}`);
+        if (generation === returnCustomerSearchGeneration && search === returnCustomerSearch.trim()) {
+          returnCustomerResults = Array.isArray(payload) ? payload : payload.customers || [];
+        }
+      } catch (error) {
+        if (generation === returnCustomerSearchGeneration) {
+          returnLookupMessage = error.message;
+          returnCustomerResults = [];
+        }
+      }
+      if (!returnCustomerSearchPending && generation === returnCustomerSearchGeneration) break;
+    }
+  } finally {
+    returnCustomerSearchActive = false;
+    returnCustomerSearchBusy = false;
+    render();
+    window.requestAnimationFrame(() => {
+      const input = document.getElementById("returnCustomerSearch");
+      if (input) {
+        input.focus();
+        input.setSelectionRange(input.value.length, input.value.length);
+      }
+    });
+  }
+}
+
+async function selectReturnCustomer(customerId) {
+  const customer = returnCustomerResults.find((item) => String(returnCustomerId(item)) === String(customerId));
+  if (!customer) return;
+  returnBusy = true;
+  returnLookupMessage = "";
+  render();
+  try {
+    const params = new URLSearchParams({ receivingLocationId: String(locationId) });
+    const payload = await api(`/api/returns/customers/${encodeURIComponent(returnCustomerId(customer))}/pallet-balance?${params.toString()}`);
+    returnSelectedCustomer = payload.customer || customer;
+    returnPalletBalance = payload.balance || payload.palletBalance || payload.pallet_balance || null;
+    returnLookupData = normalizeReturnLookup({
+      ...payload,
+      customer: returnSelectedCustomer,
+      palletBalance: returnPalletBalance,
+      lines: []
+    });
+    returnPalletQuantity = 0;
+    returnVehiclePlate = "";
+    returnHeaderNote = "";
+    returnPalletPhotos = [];
+    returnActiveLineId = "PALLET";
+    returnPhotoTarget = defaultReturnPhotoTarget();
+    returnPhotoSlot = 0;
+    returnDraftId = "";
+    returnIdempotencyKey = createReturnIdempotencyKey();
+    returnDirty = false;
+    returnStage = "form";
+    returnView = "workflow";
+  } catch (error) {
+    returnLookupMessage = error.message;
+  } finally {
+    returnBusy = false;
+    render();
+  }
+}
+
+async function loadReturnDrafts({ renderAfter = true } = {}) {
+  const params = new URLSearchParams({ receivingLocationId: String(locationId) });
+  const payload = await api(`/api/returns/operator/drafts?${params.toString()}`);
+  returnDrafts = Array.isArray(payload) ? payload : payload.drafts || [];
+  if (!returnDrafts.some((item) => String(item.id) === String(returnSelectedRecordId))) {
+    returnSelectedRecordId = returnDrafts[0]?.id || "";
+  }
+  if (renderAfter) render();
+  return returnDrafts;
+}
+
+async function loadReturnHistory({ offset = returnHistoryOffset } = {}) {
+  returnHistoryOffset = Math.max(0, Number(offset) || 0);
+  const params = new URLSearchParams({
+    limit: String(RETURN_HISTORY_PAGE_SIZE),
+    offset: String(returnHistoryOffset)
+  });
+  const payload = await api(`/api/returns/operator/history?${params.toString()}`);
+  returnHistory = Array.isArray(payload) ? payload : payload.records || payload.returns || payload.history || [];
+  returnHistoryTotal = Array.isArray(payload)
+    ? returnHistory.length
+    : Number(payload.counts?.total ?? payload.total ?? returnHistory.length);
+  if (!returnHistory.some((item) => String(item.id) === String(returnSelectedRecordId))) {
+    returnSelectedRecordId = returnHistory[0]?.id || "";
+  }
+  returnHistoryDetail = null;
+  if (returnSelectedRecordId) await loadReturnHistoryDetail(returnSelectedRecordId, { renderAfter: false });
+  render();
+}
+
+async function loadReturnHistoryDetail(id, { renderAfter = true } = {}) {
+  if (!id) {
+    returnHistoryDetail = null;
+    if (renderAfter) render();
+    return null;
+  }
+  const payload = await api(`/api/returns/operator/history/${encodeURIComponent(id)}`);
+  returnHistoryDetail = payload.record || payload.return || payload;
+  if (renderAfter) render();
+  return returnHistoryDetail;
+}
+
+function draftReturnMode(draft) {
+  const type = String(draft?.returnMode || draft?.return_mode || draft?.mode || draft?.type || "").toLowerCase();
+  if (type.includes("pallet")) return "pallet";
+  if (type.includes("stock") || type.includes("combined")) return "stock";
+  return draft?.orderId || draft?.order_id ? "stock" : "pallet";
+}
+
+async function resumeReturnDraft(draft, { renderAfter = true } = {}) {
+  if (!draft) return;
+  stopReturnCamera();
+  stopReturnScannerCamera();
+  const mode = draftReturnMode(draft);
+  returnMode = mode;
+  currentModule = mode === "stock" ? "stock-return" : "pallet-return";
+  returnType = String(draft.stockReturnType || draft.stock_return_type || draft.returnType || draft.return_type || "normal").toLowerCase() === "quality"
+    ? "quality"
+    : "normal";
+  returnDraftId = String(draft.id || draft.draftId || draft.draft_id || "");
+  returnIdempotencyKey = String(draft.idempotencyKey || draft.idempotency_key || createReturnIdempotencyKey());
+  returnLookupCode = String(draft.orderRef || draft.order_ref || draft.tranid || "");
+  let lookup = draft.lookup || draft.lookupData || draft.lookup_data || null;
+  if (!lookup && returnLookupCode) {
+    lookup = await api("/api/returns/orders/lookup", {
+      method: "POST",
+      body: JSON.stringify({ code: returnLookupCode, receivingLocationId: locationId, mode })
+    });
+  }
+  if (!lookup && (draft.customerId || draft.customer_id)) {
+    const params = new URLSearchParams({ receivingLocationId: String(locationId) });
+    const payload = await api(`/api/returns/customers/${encodeURIComponent(draft.customerId || draft.customer_id)}/pallet-balance?${params.toString()}`);
+    lookup = { ...payload, palletBalance: payload.balance || payload.palletBalance };
+  }
+  returnLookupData = normalizeReturnLookup(lookup || draft);
+  returnSelectedCustomer = returnLookupData.customer || draft.customer || null;
+  returnPalletBalance = returnLookupData.palletBalance || draft.palletBalance || draft.pallet_balance || null;
+  returnPalletQuantity = Number(draft.palletQuantity ?? draft.pallet_quantity ?? 0) || 0;
+  returnVehiclePlate = draft.vehiclePlate || draft.vehicle_plate || "";
+  returnHeaderNote = draft.note || draft.headerNote || draft.header_note || "";
+  returnRecordPhotos = [...(draft.photos || draft.stockPhotos || draft.stock_photos || [])];
+  returnPalletPhotos = [...(draft.palletPhotos || draft.pallet_photos || [])];
+  returnLineValues = {};
+  const savedLines = draft.lines || [];
+  for (const line of returnLines()) ensureReturnLineValue(line);
+  const restoredSources = new Set();
+  for (const saved of savedLines) {
+    const sourceLineId = String(saved.sourceLineId || saved.source_line_id || saved.lineId || saved.line_id || "");
+    const source = returnLines().find((item) => returnSourceLineId(item) === sourceLineId);
+    if (!source) continue;
+    const firstForSource = !restoredSources.has(sourceLineId);
+    restoredSources.add(sourceLineId);
+    const rowKey = String(saved.clientRowKey || saved.client_row_key || (firstForSource ? sourceLineId : createReturnIdempotencyKey()));
+    if (firstForSource && rowKey !== sourceLineId) delete returnLineValues[sourceLineId];
+    returnLineValues[rowKey] = {
+      clientRowKey: rowKey,
+      sourceLineId,
+      pallets: Number(saved.pallets || 0),
+      layers: Number(saved.layers || 0),
+      sections: Number(saved.sections || 0),
+      pieces: Number(saved.pieces || 0),
+      salesQuantity: Number(saved.salesQuantity ?? saved.sales_quantity ?? 0),
+      reasonId: String(saved.reasonId || saved.reason_id || ""),
+      reasonLabel: saved.reasonLabel || saved.reason_label || "",
+      note: saved.note || "",
+      photos: [...(saved.photos || [])]
+    };
+  }
+  returnStage = "form";
+  returnView = "workflow";
+  returnLinePage = 0;
+  returnActiveLineId = firstReturnLineId();
+  returnDirty = false;
+  returnValidationMessage = "";
+  returnPhotoTarget = defaultReturnPhotoTarget();
+  returnPhotoSlot = 0;
+  if (renderAfter) render();
+}
+
+async function deleteReturnDraft(id) {
+  if (!id || !confirm(t("operator.discardDraftConfirm", "Discard this return draft?"))) return;
+  await api(`/api/returns/drafts/${encodeURIComponent(id)}`, { method: "DELETE" });
+  if (String(returnDraftId) === String(id)) resetReturnWorkflow(returnMode);
+  returnSelectedRecordId = "";
+  await loadReturnDrafts({ renderAfter: false });
+  returnView = "drafts";
+  showToast(t("operator.draftDiscarded", "Draft discarded"));
+  render();
+}
+
+function stopReturnCamera() {
+  if (returnCameraStream) returnCameraStream.getTracks().forEach((track) => track.stop());
+  returnCameraStream = null;
+  returnCameraActive = false;
+}
+
+function attachReturnCamera() {
+  const video = document.getElementById("returnCamera");
+  if (!video || !returnCameraStream) return;
+  video.srcObject = returnCameraStream;
+  video.play().catch(() => {});
+}
+
+async function startReturnCamera() {
+  if (!navigator.mediaDevices?.getUserMedia) return showToast(t("operator.cameraUnavailable", "Camera is not available in this browser."));
+  stopReturnScannerCamera();
+  stopReturnCamera();
+  try {
+    returnCameraStream = await openCameraStream();
+    returnCameraActive = true;
+    returnPhotoTarget.open = true;
+    render();
+  } catch (error) {
+    stopReturnCamera();
+    showToast(cameraErrorMessage(error));
+    render();
+  }
+}
+
+async function switchReturnCamera() {
+  const wasActive = returnCameraActive;
+  switchCameraFacing();
+  if (wasActive) return startReturnCamera();
+  render();
+}
+
+async function compressReturnPhoto(dataUrl, maxDimension = 1800) {
+  const image = new Image();
+  const loaded = new Promise((resolve, reject) => {
+    image.onload = resolve;
+    image.onerror = reject;
+  });
+  image.src = dataUrl;
+  await loaded;
+  const scale = Math.min(1, maxDimension / Math.max(image.naturalWidth || 1, image.naturalHeight || 1));
+  if (scale >= 1 && String(dataUrl).length < 2_000_000) return dataUrl;
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+  canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+  const context = canvas.getContext("2d");
+  if (!context) return dataUrl;
+  context.drawImage(image, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL("image/jpeg", 0.84);
+}
+
+async function captureReturnPhoto() {
+  const video = document.getElementById("returnCamera");
+  if (!video || !returnCameraStream) return showToast(t("operator.cameraPreviewNotReady", "Camera preview is not ready yet."));
+  try {
+    const captured = await captureCameraPhotoDataUrl(returnCameraStream, video);
+    const photo = await compressReturnPhoto(captured);
+    const photos = [...returnTargetPhotos()];
+    photos[returnPhotoSlot] = photo;
+    setReturnTargetPhotos(photos);
+    returnDirty = true;
+    const nextEmpty = photos.findIndex((item, index) => index > returnPhotoSlot && !item);
+    if (nextEmpty >= 0) returnPhotoSlot = nextEmpty;
+    render();
+  } catch (error) {
+    showToast(error.message || t("operator.photoCaptureFailed", "Photo capture failed."));
+  }
+}
+
+function openReturnPhotoTarget(kind, lineId = "") {
+  stopReturnScannerCamera();
+  stopReturnCamera();
+  returnPhotoTarget = { kind, lineId: String(lineId || ""), open: true };
+  const photos = returnTargetPhotos();
+  returnPhotoSlot = Math.max(0, photos.findIndex((photo) => !photo));
+  if (returnPhotoSlot < 0) returnPhotoSlot = 0;
+  render();
+}
+
+function addReturnPhotoSlot() {
+  const photos = [...returnTargetPhotos()];
+  if (photos.length >= RETURN_MAX_PHOTOS) return;
+  photos.push("");
+  setReturnTargetPhotos(photos);
+  returnPhotoSlot = photos.length - 1;
+  returnDirty = true;
+  render();
+}
+
+function removeReturnPhoto() {
+  const photos = [...returnTargetPhotos()];
+  if (!photos[returnPhotoSlot]) return;
+  photos.splice(returnPhotoSlot, 1);
+  setReturnTargetPhotos(photos);
+  returnPhotoSlot = Math.min(returnPhotoSlot, Math.max(0, photos.length - 1));
+  returnDirty = true;
+  render();
+}
+
+function stopReturnScannerCamera() {
+  window.clearInterval(returnScannerTimer);
+  returnScannerTimer = null;
+  returnQrDecoder = null;
+  returnQrFrameBusy = false;
+  if (returnQuaggaActive && window.Quagga) {
+    window.Quagga.offDetected(handleReturnBarcodeDetected);
+    try {
+      window.Quagga.stop();
+    } catch {
+      // Camera may already be released after navigation.
+    }
+  }
+  returnQuaggaActive = false;
+  if (returnScannerStream) returnScannerStream.getTracks().forEach((track) => track.stop());
+  returnScannerStream = null;
+  returnScannerActive = false;
+  returnScanCandidate = "";
+  returnScanCandidateHits = 0;
+  returnScanCandidateAt = 0;
+}
+
+async function acceptReturnCameraScan(value, { confirmRepeated = false } = {}) {
+  const code = normalizedPickupCameraCode(value);
+  if (!code || !returnScannerActive || returnScanSubmitting) return;
+  if (confirmRepeated && !/^SO[A-Z]?\d+$/i.test(code)) {
+    const now = Date.now();
+    if (code === returnScanCandidate && now - returnScanCandidateAt <= 1600) returnScanCandidateHits += 1;
+    else {
+      returnScanCandidate = code;
+      returnScanCandidateHits = 1;
+    }
+    returnScanCandidateAt = now;
+    if (returnScanCandidateHits < 2) return;
+  }
+  returnScanSubmitting = true;
+  returnLookupCode = code;
+  stopReturnScannerCamera();
+  try {
+    await lookupReturnOrder(code);
+  } finally {
+    returnScanSubmitting = false;
+  }
+}
+
+function handleReturnBarcodeDetected(result) {
+  void acceptReturnCameraScan(pickupQuaggaOrderCode(result), { confirmRepeated: true });
+}
+
+async function scanReturnQrFrame() {
+  if (!returnScannerActive || returnScanSubmitting || returnQrFrameBusy || !returnQrDecoder) return;
+  const video = document.querySelector("#returnScannerCamera video");
+  if (!video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
+  returnQrFrameBusy = true;
+  try {
+    const result = await returnQrDecoder.scanImage(video, {
+      returnDetailedScanResult: true,
+      alsoTryWithoutScanRegion: true
+    });
+    await acceptReturnCameraScan(result);
+  } catch {
+    // No QR code in this frame is normal.
+  } finally {
+    returnQrFrameBusy = false;
+  }
+}
+
+async function startReturnScannerCamera() {
+  stopReturnCamera();
+  stopReturnScannerCamera();
+  returnScanSubmitting = false;
+  try {
+    if (!navigator.mediaDevices?.getUserMedia) throw new Error(t("operator.cameraUnavailable", "Camera is not available in this browser."));
+    if (!window.Quagga) throw new Error(t("operator.scannerLoadFailed", "Barcode scanner could not load. Refresh the app and try again."));
+    returnScannerActive = true;
+    returnLookupMessage = t("operator.startingScanner", "Starting 1D / QR camera scanner...");
+    render();
+    await new Promise((resolve) => window.requestAnimationFrame(resolve));
+    const target = document.getElementById("returnScannerCamera");
+    if (!target) throw new Error(t("operator.cameraPreviewNotReady", "Camera preview is not ready yet."));
+    const scannerConstraints = await resolvePickupScannerVideoConstraints();
+    await new Promise((resolve, reject) => {
+      window.Quagga.init({
+        inputStream: {
+          name: "Operator return barcode camera",
+          type: "LiveStream",
+          target,
+          constraints: scannerConstraints
+        },
+        frequency: 8,
+        numOfWorkers: Math.min(4, Math.max(1, (navigator.hardwareConcurrency || 4) - 1)),
+        locate: true,
+        locator: { patchSize: "medium", halfSample: true },
+        decoder: {
+          readers: ["code_128_reader", "code_39_reader", "code_93_reader"],
+          multiple: false
+        }
+      }, (error) => error ? reject(error) : resolve());
+    });
+    window.Quagga.onDetected(handleReturnBarcodeDetected);
+    window.Quagga.start();
+    returnQuaggaActive = true;
+    const video = target.querySelector("video");
+    returnScannerStream = video?.srcObject || null;
+    if (returnScannerStream) rememberCameraStream(returnScannerStream);
+    try {
+      const { default: QrScanner } = await import("/vendor/qr-scanner/qr-scanner.min.js");
+      returnQrDecoder = QrScanner;
+      returnScannerTimer = window.setInterval(() => void scanReturnQrFrame(), 650);
+    } catch {
+      // 1D scanning remains available.
+    }
+    returnLookupMessage = "";
+    document.querySelector(".return-lookup-card .sync-alert")?.remove();
+  } catch (error) {
+    returnLookupMessage = cameraErrorMessage(error);
+    stopReturnScannerCamera();
+    render();
+  }
+}
+
+async function switchReturnScannerCamera() {
+  const wasActive = returnScannerActive;
+  switchCameraFacing();
+  if (wasActive) return startReturnScannerCamera();
+  render();
+}
+
+function returnScannerKeyActive() {
+  return returnModuleActive() && returnStage === "lookup" && returnView === "workflow";
+}
+
+async function handleReturnScannerKey(event) {
+  if (!returnScannerKeyActive() || event.defaultPrevented || event.ctrlKey || event.altKey || event.metaKey) return false;
+  const target = event.target;
+  if (target?.id === "returnOrderLookup") return false;
+  if (target?.closest?.("input, textarea, select, [contenteditable='true']")) return false;
+  const now = Date.now();
+  if (now - returnScannerLastKeyAt > 120) returnScannerBuffer = "";
+  returnScannerLastKeyAt = now;
+  if (event.key === "Enter" || event.key === "Tab") {
+    const code = returnScannerBuffer.trim();
+    returnScannerBuffer = "";
+    if (!code) return false;
+    event.preventDefault();
+    await lookupReturnOrder(code);
+    return true;
+  }
+  if (event.key === "Backspace") {
+    returnScannerBuffer = returnScannerBuffer.slice(0, -1);
+    event.preventDefault();
+    return true;
+  }
+  if (event.key?.length === 1) {
+    returnScannerBuffer += event.key;
+    event.preventDefault();
+    return true;
+  }
+  return false;
+}
+
+function addReturnSplitRow(sourceLineId) {
+  const line = returnLines().find((item) => returnSourceLineId(item) === String(sourceLineId));
+  if (!line || returnType !== "quality") return;
+  const rowKey = createReturnIdempotencyKey();
+  ensureReturnLineValue(line, rowKey);
+  returnDirty = true;
+  render();
+}
+
+function removeReturnSplitRow(rowKey) {
+  const values = returnLineValues[String(rowKey || "")];
+  if (!values) return;
+  const rows = Object.values(returnLineValues).filter((item) => item.sourceLineId === values.sourceLineId);
+  if (rows.length <= 1) return;
+  if (returnPhotoTarget.kind === "line" && returnPhotoTarget.lineId === rowKey) stopReturnCamera();
+  delete returnLineValues[rowKey];
+  const selectedRow = Object.values(returnLineValues)
+    .find((item) => String(item.sourceLineId || "") === String(returnActiveLineId));
+  returnPhotoTarget = returnType === "quality" && selectedRow
+    ? { kind: "line", lineId: String(selectedRow.clientRowKey || ""), open: true }
+    : defaultReturnPhotoTarget();
+  returnPhotoSlot = 0;
+  returnDirty = true;
+  render();
+}
+
+function returnPayloadLines({ includeEmpty = false } = {}) {
+  return Object.values(returnLineValues).flatMap((values) => {
+    const line = returnLineForValues(values);
+    if (!line || returnLinePolicy(line).effective === "NOT_RETURNABLE") return [];
+    const salesQuantity = returnLineCalculatedSalesQty(line, values);
+    const hasDraftData = salesQuantity > 0 || values.reasonId || values.note || values.photos.filter(Boolean).length;
+    if (!includeEmpty && salesQuantity <= 0) return [];
+    if (includeEmpty && !hasDraftData) return [];
+    const reason = returnType === "normal"
+      ? returnReasons.normalReason
+      : returnReasons.qualityReasons.find((item) => String(item.id) === String(values.reasonId)) || { id: values.reasonId, label: values.reasonLabel };
+    return [{
+      clientRowKey: values.clientRowKey,
+      sourceLineId: values.sourceLineId,
+      pallets: Number(values.pallets) || 0,
+      layers: Number(values.layers) || 0,
+      sections: Number(values.sections) || 0,
+      pieces: Number(values.pieces) || 0,
+      salesQuantity,
+      reasonId: String(reason?.id || ""),
+      reasonLabel: reason?.label || "",
+      note: values.note || "",
+      photos: values.photos.filter(Boolean)
+    }];
+  });
+}
+
+function buildReturnPayload({ draft = false } = {}) {
+  if (!returnIdempotencyKey) returnIdempotencyKey = createReturnIdempotencyKey();
+  return {
+    draftId: returnDraftId || undefined,
+    idempotencyKey: returnIdempotencyKey,
+    returnMode,
+    draftType: draft
+      ? returnMode === "pallet" ? "pallet" : Number(returnPalletQuantity) > 0 ? "combined" : "stock"
+      : undefined,
+    stockReturnType: returnMode === "stock" ? returnType : undefined,
+    receivingLocationId: locationId,
+    orderId: returnOrderId() || undefined,
+    orderRef: returnOrderRef() || undefined,
+    customerId: returnCustomerId(),
+    customer: draft ? returnCustomer() : undefined,
+    order: draft ? returnOrder() : undefined,
+    lookup: draft ? returnLookupData : undefined,
+    vehiclePlate: returnVehiclePlate.trim(),
+    note: returnHeaderNote.trim(),
+    lines: returnPayloadLines({ includeEmpty: draft }),
+    palletQuantity: Number(returnPalletQuantity) || 0,
+    palletPhotos: returnPalletPhotos.filter(Boolean),
+    photos: returnRecordPhotos.filter(Boolean)
+  };
+}
+
+function validateReturnForReview({ requireVehiclePlate = true, requirePhotos = true } = {}) {
+  if (!returnCustomerId()) return t("operator.customerRequired", "A NetSuite customer is required.");
+  if (returnMode === "stock" && !returnOrderId()) return t("operator.salesOrderRequired", "A Sales Order is required.");
+  if (returnYardGate().blocked) {
+    return tf("operator.returnMustBeProcessedAt", "This return must be processed at {yard}.", { yard: returnYardGate().requiredName || "-" });
+  }
+  if (requireVehiclePlate && !returnVehiclePlate.trim()) return t("operator.vehiclePlateRequired", "Vehicle plate is required.");
+
+  const palletQty = Number(returnPalletQuantity) || 0;
+  if (palletQty < 0 || !Number.isInteger(palletQty)) return t("operator.palletWholeNumber", "PALLET quantity must be a non-negative whole number.");
+  if (returnMode === "pallet" && palletQty <= 0) return t("operator.palletPositiveRequired", "Enter at least one PALLET.");
+  if (palletQty > 0 && !currentPalletBalance()) return t("operator.palletBalanceRequired", "A current PALLET balance is required.");
+  if (palletQty > returnBalanceAvailable() + RETURN_QUANTITY_EPSILON) return tf("operator.maximumReturnable", "Maximum returnable: {quantity}", { quantity: displayReturnQty(returnBalanceAvailable()) });
+  if (requirePhotos && palletQty > 0 && returnPalletPhotos.filter(Boolean).length < 1) {
+    return t("operator.palletPhotoRequired", "Take at least one live photo of the returned PALLET.");
+  }
+
+  const selectedRows = returnSelectedRows();
+  if (returnMode === "stock" && !selectedRows.length && palletQty <= 0) return t("operator.returnQuantityRequired", "Enter at least one stock or PALLET return quantity.");
+  for (const line of returnLines()) {
+    const rows = returnRowsForLine(line);
+    const total = rows.reduce((sum, values) => sum + returnLineCalculatedSalesQty(line, values), 0);
+    if (total > returnLineRemaining(line) + RETURN_QUANTITY_EPSILON) {
+      return `${returnLineName(line)}: ${tf("operator.maximumReturnable", "Maximum returnable: {quantity}", { quantity: `${displayReturnQty(returnLineRemaining(line))} ${returnLineSalesUom(line)}` })}`;
+    }
+    for (const values of rows) {
+      if (!returnLineHasQty(line, values)) continue;
+      if (returnLinePolicy(line).effective === "NOT_RETURNABLE") return `${returnLineName(line)}: ${t("operator.returnNotReturnable", "Not Returnable")}`;
+      if (returnLineEntryMode(line) === "physical") {
+        const invalid = returnLineUnits(line).some((unit) => {
+          const amount = Number(values[unit.key]) || 0;
+          return amount < 0 || !Number.isInteger(amount);
+        });
+        if (invalid) return `${returnLineName(line)}: ${t("operator.physicalWholeNumber", "PLT, LYR, SEC, and PCS must be non-negative whole numbers.")}`;
+      } else if ((Number(values.salesQuantity) || 0) < 0) {
+        return `${returnLineName(line)}: ${t("operator.nonNegativeQuantity", "Quantity cannot be negative.")}`;
+      }
+      if (returnType === "quality" && !values.reasonId) return `${returnLineName(line)}: ${t("operator.qualityReasonRequired", "Select a quality reason.")}`;
+      if (requirePhotos && returnType === "quality" && values.photos.filter(Boolean).length < 1) {
+        return `${returnLineName(line)}: ${t("operator.qualityPhotoRequired", "Take at least one live quality photo for this row.")}`;
+      }
+    }
+  }
+  if (requirePhotos && returnMode === "stock" && returnType === "normal" && selectedRows.length && returnRecordPhotos.filter(Boolean).length < 1) {
+    return t("operator.normalPhotoRequired", "Take at least one live photo for the Normal Stock Return.");
+  }
+  return "";
+}
+
+async function uploadReturnPhotoList(photos, recordType, suffix = "") {
+  const uploaded = [];
+  for (let index = 0; index < photos.length; index += 1) {
+    const photo = photos[index];
+    if (!photo) continue;
+    uploaded.push(await uploadOperatorPhoto(photo, {
+      recordType,
+      orderType: "customer_return",
+      orderId: returnOrderId() || returnCustomerId(),
+      orderRef: returnOrderRef() || returnCustomerCode(),
+      filename: `${recordType}${suffix ? `-${suffix}` : ""}-${index + 1}.jpg`
+    }));
+  }
+  return uploaded;
+}
+
+async function uploadReturnEvidence() {
+  returnRecordPhotos = await uploadReturnPhotoList(returnRecordPhotos.filter(Boolean), "operator-return-photo", "stock");
+  returnPalletPhotos = await uploadReturnPhotoList(returnPalletPhotos.filter(Boolean), "operator-return-photo", "pallet");
+  for (const values of Object.values(returnLineValues)) {
+    if (!values.photos?.some(Boolean)) continue;
+    values.photos = await uploadReturnPhotoList(values.photos.filter(Boolean), "operator-return-photo", `quality-${values.clientRowKey}`);
+  }
+}
+
+async function saveReturnDraft() {
+  if (returnBusy || !returnCustomerId()) return showToast(t("operator.lookupCustomerFirst", "Look up a customer before saving a draft."));
+  returnBusy = true;
+  returnValidationMessage = "";
+  render();
+  try {
+    await uploadReturnEvidence();
+    const payload = buildReturnPayload({ draft: true });
+    const result = await api("/api/returns/drafts", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+    const draft = result.draft || result;
+    returnDraftId = String(draft.id || draft.draftId || draft.draft_id || returnDraftId);
+    returnIdempotencyKey = String(draft.idempotencyKey || draft.idempotency_key || returnIdempotencyKey);
+    returnDirty = false;
+    showToast(t("operator.draftSaved", "Return draft saved"));
+  } catch (error) {
+    returnValidationMessage = error.message;
+    showToast(error.message);
+  } finally {
+    returnBusy = false;
+    render();
+  }
+}
+
+function openReturnReview() {
+  const error = validateReturnForReview({ requireVehiclePlate: false, requirePhotos: false });
+  returnValidationMessage = error;
+  if (error) return render();
+  stopReturnCamera();
+  stopReturnScannerCamera();
+  selectReturnReviewPhotoTarget(returnPhotoTarget, { preferMissing: true });
+  returnStage = "review";
+  render();
+}
+
+async function submitReturn() {
+  if (returnBusy) return;
+  const validation = validateReturnForReview();
+  if (validation) {
+    returnValidationMessage = validation;
+    returnStage = "review";
+    return render();
+  }
+  returnBusy = true;
+  render();
+  try {
+    await uploadReturnEvidence();
+    returnResult = await api("/api/returns/submit", {
+      method: "POST",
+      body: JSON.stringify(buildReturnPayload())
+    });
+    returnDirty = false;
+    returnDraftId = "";
+    returnStage = "success";
+    showToast(t("operator.returnRecorded", "Return recorded"));
+  } catch (error) {
+    const code = String(error.payload?.code || "");
+    returnValidationMessage = code === "CROSS_YARD_RETURN_BLOCKED"
+      ? tf("operator.returnMustBeProcessedAt", "This return must be processed at {yard}.", { yard: returnYardName(error.payload.requiredReturnLocation) || "-" })
+      : code === "ORDER_NOT_FULLY_FULFILLED"
+        ? returnOrderNotFullyFulfilledMessage()
+        : error.message;
+    returnStage = "form";
+    showToast(returnValidationMessage);
+  } finally {
+    returnBusy = false;
+    render();
+  }
+}
+
+async function confirmLeaveReturnWorkflow() {
+  if (!returnModuleActive() || !returnDirty || returnStage === "success") return true;
+  return confirm(t("operator.leaveUnsavedReturnConfirm", "Leave this return without saving the latest changes?"));
 }
 
 async function loadCycleData() {
@@ -5262,6 +7509,8 @@ app.addEventListener("click", async (event) => {
       return render();
     }
     if (button.dataset.action === "logout") {
+      stopReturnCamera();
+      stopReturnScannerCamera();
       await api("/api/auth/logout", { method: "POST" }).catch(() => ({}));
       operator = null;
       clearOperatorSession();
@@ -5280,10 +7529,17 @@ app.addEventListener("click", async (event) => {
         return render();
       }
       if (currentOrderBlocksMove()) return showToast("Pack current order before changing location.");
+      if (returnModuleActive()) {
+        if (returnStage !== "lookup" || returnDraftId || returnDirty) {
+          return showToast(t("operator.returnYardLocked", "The receiving yard is locked. Discard or finish this return before changing yard."));
+        }
+      }
       if (!(await confirmDiscardCustomerPickupDraft())) return;
       stopFulfillmentCamera();
       stopReceiptCamera();
       stopPickupScannerCamera();
+      stopReturnCamera();
+      stopReturnScannerCamera();
       locationId = value;
       locationDropdownOpen = false;
       localStorage.setItem("mbbs.operator.locationId", String(value));
@@ -5298,10 +7554,13 @@ app.addEventListener("click", async (event) => {
     }
     if (button.dataset.action === "main-menu") {
       locationDropdownOpen = false;
+      if (!(await confirmLeaveReturnWorkflow())) return;
       if (!(await confirmDiscardCustomerPickupDraft())) return;
       stopFulfillmentCamera();
       stopReceiptCamera();
       stopPickupScannerCamera();
+      stopReturnCamera();
+      stopReturnScannerCamera();
       currentModule = "menu";
       selectedId = null;
       selectedOrder = null;
@@ -5309,6 +7568,162 @@ app.addEventListener("click", async (event) => {
       return render();
     }
     if (button.dataset.action === "open-module") return openModule(button.dataset.module);
+    if (button.dataset.action === "return-back-select") {
+      if (!(await confirmLeaveReturnWorkflow())) return;
+      resetReturnWorkflow(returnMode);
+      currentModule = "return-select";
+      return render();
+    }
+    if (button.dataset.action === "return-set-type") {
+      const nextType = button.dataset.returnType === "quality" ? "quality" : "normal";
+      if (nextType === returnType) return;
+      if (returnLines().length && !confirm(t("operator.changeReturnTypeConfirm", "Changing return type clears entered stock quantities and line photos. Continue?"))) return;
+      returnType = nextType;
+      if (returnLines().length) {
+        returnLineValues = {};
+        for (const line of returnLines()) ensureReturnLineValue(line);
+        returnRecordPhotos = [];
+      }
+      returnActiveLineId = firstReturnLineId();
+      stopReturnCamera();
+      returnPhotoTarget = defaultReturnPhotoTarget();
+      returnPhotoSlot = 0;
+      returnDirty = Boolean(returnLines().length);
+      return render();
+    }
+    if (button.dataset.action === "return-start-scanner") return startReturnScannerCamera();
+    if (button.dataset.action === "return-switch-scanner-camera") return switchReturnScannerCamera();
+    if (button.dataset.action === "return-lookup-order") return lookupReturnOrder(document.getElementById("returnOrderLookup")?.value || returnLookupCode);
+    if (button.dataset.action === "return-select-customer") return selectReturnCustomer(button.dataset.customerId);
+    if (button.dataset.action === "return-step-quantity") return stepReturnQuantity(button);
+    if (button.dataset.action === "return-select-evidence-target") {
+      selectReturnReviewPhotoTarget({
+        kind: button.dataset.photoKind || "record",
+        lineId: button.dataset.line || ""
+      });
+      return render();
+    }
+    if (button.dataset.action === "return-open-camera") return openReturnPhotoTarget(button.dataset.photoKind || "record", button.dataset.line || "");
+    if (button.dataset.action === "return-close-camera") {
+      stopReturnCamera();
+      returnPhotoTarget.open = false;
+      return render();
+    }
+    if (button.dataset.action === "return-start-camera") return startReturnCamera();
+    if (button.dataset.action === "return-switch-camera") return switchReturnCamera();
+    if (button.dataset.action === "return-capture-photo") return captureReturnPhoto();
+    if (button.dataset.action === "return-add-photo") return addReturnPhotoSlot();
+    if (button.dataset.action === "return-remove-photo") return removeReturnPhoto();
+    if (button.dataset.action === "return-select-photo-slot") {
+      returnPhotoSlot = Number(button.dataset.slot) || 0;
+      return render();
+    }
+    if (button.dataset.action === "return-add-split-row") return addReturnSplitRow(button.dataset.sourceLine);
+    if (button.dataset.action === "return-remove-split-row") return removeReturnSplitRow(button.dataset.line);
+    if (button.dataset.action === "return-select-stock-line") {
+      returnActiveLineId = String(button.dataset.sourceLine || "");
+      if (returnActiveLineId === "PALLET") {
+        returnPhotoTarget = { kind: "pallet", lineId: "", open: true };
+      } else if (returnType === "quality") {
+        const row = Object.values(returnLineValues)
+          .find((values) => String(values.sourceLineId || "") === returnActiveLineId);
+        if (row) {
+          returnPhotoTarget = { kind: "line", lineId: String(row.clientRowKey || ""), open: true };
+        }
+      } else {
+        returnPhotoTarget = { kind: "record", lineId: "", open: true };
+      }
+      const photos = returnTargetPhotos();
+      returnPhotoSlot = Math.max(0, photos.findIndex((photo) => !photo));
+      if (returnPhotoSlot < 0) returnPhotoSlot = 0;
+      return render();
+    }
+    if (button.dataset.action === "return-line-prev") {
+      returnLinePage = Math.max(0, returnLinePage - 1);
+      return render();
+    }
+    if (button.dataset.action === "return-line-next") {
+      returnLinePage = Math.min(pageCount(returnLines(), RETURN_LINE_PAGE_SIZE) - 1, returnLinePage + 1);
+      return render();
+    }
+    if (button.dataset.action === "return-save-draft") return saveReturnDraft();
+    if (button.dataset.action === "return-open-review") return openReturnReview();
+    if (button.dataset.action === "return-back-to-form") {
+      stopReturnCamera();
+      returnStage = "form";
+      return render();
+    }
+    if (button.dataset.action === "return-confirm-submit") return submitReturn();
+    if (button.dataset.action === "return-new") {
+      const mode = returnMode;
+      resetReturnWorkflow(mode);
+      currentModule = mode === "stock" ? "stock-return" : "pallet-return";
+      return render();
+    }
+    if (button.dataset.action === "return-open-drafts") {
+      if (returnDirty && !confirm(t("operator.openDraftsUnsavedConfirm", "Open drafts without saving the latest changes?"))) return;
+      stopReturnCamera();
+      stopReturnScannerCamera();
+      returnView = "drafts";
+      returnSelectedRecordId = "";
+      returnBusy = true;
+      render();
+      try {
+        await loadReturnDrafts({ renderAfter: false });
+      } finally {
+        returnBusy = false;
+        render();
+      }
+      return;
+    }
+    if (button.dataset.action === "return-open-history-view") {
+      if (returnDirty && !confirm(t("operator.openHistoryUnsavedConfirm", "Open history without saving the latest changes?"))) return;
+      stopReturnCamera();
+      stopReturnScannerCamera();
+      returnView = "history";
+      returnSelectedRecordId = "";
+      returnHistoryOffset = 0;
+      returnBusy = true;
+      render();
+      try {
+        await loadReturnHistory();
+      } finally {
+        returnBusy = false;
+        render();
+      }
+      return;
+    }
+    if (button.dataset.action === "return-select-draft") {
+      returnSelectedRecordId = button.dataset.record || "";
+      return render();
+    }
+    if (button.dataset.action === "return-select-history") {
+      returnSelectedRecordId = button.dataset.record || "";
+      returnHistoryDetail = null;
+      render();
+      return loadReturnHistoryDetail(returnSelectedRecordId);
+    }
+    if (button.dataset.action === "return-history-prev" || button.dataset.action === "return-history-next") {
+      const delta = button.dataset.action === "return-history-next"
+        ? RETURN_HISTORY_PAGE_SIZE
+        : -RETURN_HISTORY_PAGE_SIZE;
+      returnSelectedRecordId = "";
+      returnHistoryDetail = null;
+      returnBusy = true;
+      render();
+      try {
+        await loadReturnHistory({ offset: returnHistoryOffset + delta });
+      } finally {
+        returnBusy = false;
+        render();
+      }
+      return;
+    }
+    if (button.dataset.action === "return-resume-draft") {
+      const draft = returnDrafts.find((item) => String(item.id) === String(button.dataset.record));
+      return resumeReturnDraft(draft);
+    }
+    if (button.dataset.action === "return-delete-draft") return deleteReturnDraft(button.dataset.record);
     if (button.dataset.action === "open-urgent-delivery-alert") return openUrgentDeliveryAlert();
     if (button.dataset.action === "dismiss-urgent-delivery-alert") {
       urgentDeliveryAlert = null;
@@ -5804,6 +8219,57 @@ app.addEventListener("click", async (event) => {
 });
 
 app.addEventListener("input", async (event) => {
+  if (event.target?.id === "returnOrderLookup") {
+    returnLookupCode = event.target.value;
+    returnLookupMessage = "";
+    return;
+  }
+  if (event.target?.id === "returnCustomerSearch") {
+    returnCustomerSearch = event.target.value;
+    returnCustomerSearchGeneration += 1;
+    returnLookupMessage = "";
+    window.clearTimeout(app.returnCustomerSearchTimer);
+    app.returnCustomerSearchTimer = window.setTimeout(() => {
+      searchReturnCustomers().catch((error) => showToast(error.message));
+    }, 300);
+    return;
+  }
+  if (event.target?.dataset?.returnInput === "vehiclePlate") {
+    returnVehiclePlate = event.target.value.toUpperCase();
+    returnDirty = true;
+    if (returnStage === "review" && returnVehiclePlate.trim()) {
+      returnValidationMessage = "";
+      app.querySelector("[data-return-review-validation]")?.remove();
+    }
+    return;
+  }
+  if (event.target?.dataset?.returnInput === "headerNote") {
+    returnHeaderNote = event.target.value;
+    returnDirty = true;
+    return;
+  }
+  if (event.target?.dataset?.returnInput === "palletQuantity") {
+    returnPalletQuantity = Math.max(0, Number(event.target.value) || 0);
+    returnDirty = true;
+    refreshReturnQuantityFeedback(event.target);
+    return;
+  }
+  if (event.target?.dataset?.returnLineInput) {
+    const values = returnLineValues[String(event.target.dataset.line || "")];
+    if (!values) return;
+    const field = event.target.dataset.returnLineInput;
+    if (["pallets", "layers", "sections", "pieces", "salesQuantity"].includes(field)) {
+      values[field] = Math.max(0, Number(event.target.value) || 0);
+    } else {
+      values[field] = event.target.value;
+      if (field === "reasonId") {
+        values.reasonLabel = returnReasons.qualityReasons.find((reason) => String(reason.id) === String(values.reasonId))?.label || "";
+      }
+    }
+    returnDirty = true;
+    refreshReturnQuantityFeedback(event.target);
+    return;
+  }
   if (event.target?.id === "consolidationSearch") {
     consolidationSearch = event.target.value;
     window.clearTimeout(app.consolidationSearchTimer);
@@ -5896,6 +8362,11 @@ app.addEventListener("input", async (event) => {
 });
 
 app.addEventListener("keydown", async (event) => {
+  if (event.target?.id === "returnOrderLookup" && event.key === "Enter") {
+    event.preventDefault();
+    await lookupReturnOrder(event.target.value);
+    return;
+  }
   if (event.target?.id === "customerPickupScan" && event.key === "Enter") {
     event.preventDefault();
     await submitCustomerPickupScanValue(event.target.value);
@@ -5904,14 +8375,19 @@ app.addEventListener("keydown", async (event) => {
 
 window.addEventListener("keydown", async (event) => {
   try {
+    if (await handleReturnScannerKey(event)) return;
     await handleCustomerPickupScannerKey(event);
   } catch (error) {
-    customerPickupMessage = error.message;
+    if (returnScannerKeyActive()) returnLookupMessage = error.message;
+    else customerPickupMessage = error.message;
     render();
   }
 }, true);
 
 app.addEventListener("change", async (event) => {
+  if (event.target?.dataset?.returnInput || event.target?.dataset?.returnLineInput) {
+    return render();
+  }
   if (event.target?.id === "historyDate") {
     personalHistoryDate = event.target.value || "";
     selectedHistoryId = "";
@@ -6039,6 +8515,8 @@ window.addEventListener("pagehide", () => {
   stopFulfillmentCamera();
   stopReceiptCamera();
   stopPickupScannerCamera();
+  stopReturnCamera();
+  stopReturnScannerCamera();
 });
 
 window.addEventListener("beforeinstallprompt", (event) => {
@@ -6055,5 +8533,11 @@ window.addEventListener("appinstalled", () => {
 });
 
 window.addEventListener("mbbs-language-changed", () => {
+  if (returnScannerActive) {
+    stopReturnScannerCamera();
+    render();
+    void startReturnScannerCamera();
+    return;
+  }
   render();
 });

@@ -302,7 +302,7 @@ try {
 
   const presets = await requestJson(baseUrl, "/api/sales/schedule-presets", { token });
   assert.equal(presets.response.status, 200);
-  assert.deepEqual(new Set(presets.payload.map((preset) => String(preset.name).toLowerCase())), new Set(["yard manager", "completed"]));
+  assert.deepEqual(new Set(presets.payload.map((preset) => String(preset.name).toLowerCase())), new Set(["yard manager"]));
 
   const schedule = await requestJson(baseUrl, "/api/sales/schedule?view=yard%20manager", { token });
   assert.equal(schedule.response.status, 200);
@@ -319,13 +319,14 @@ try {
   assert.ok(orders.payload.every((order) => order.itemLines.every((line) => line.itemName && line.quantity !== null)));
 
   if (orders.payload.length) {
-    const order = orders.payload[0];
+    const order = orders.payload.find((candidate) => candidate.lineYards.length === 1)
+      || orders.payload[0];
     const lineYard = order.lineYards[0];
     const readyPrinterIds = new Set(publicPrinters.payload
       .filter((printer) => printer.salesOrderReady)
       .map((printer) => Number(printer.locationId)));
-    const previewTokenOrder = orders.payload.find((candidate) => candidate.lineYards
-      .some((yard) => readyPrinterIds.has(Number(yard.printerLocationId))));
+    const previewTokenOrder = orders.payload.find((candidate) => candidate.lineYards.length === 1
+      && candidate.lineYards.some((yard) => readyPrinterIds.has(Number(yard.printerLocationId))));
     if (previewTokenOrder) {
       const previewTokenYard = previewTokenOrder.lineYards
         .find((yard) => readyPrinterIds.has(Number(yard.printerLocationId)));
@@ -389,13 +390,15 @@ try {
     assert.equal(searchedAfterPrint.response.status, 200);
     assert.ok(searchedAfterPrint.payload.some((candidate) => candidate.orderId === order.orderId), "Search must include Sales Orders that were printed before");
 
-    const otherYard = [1, 28, 15, 26].find((locationId) => locationId !== Number(lineYard.locationId));
-    const changedDestination = await requestJson(baseUrl, `/api/sales/sales-orders/${order.orderId}/print`, {
-      method: "POST",
-      token,
-      body: { lineLocationId: otherYard, companyName: "Harness Company" }
-    });
-    assert.equal(changedDestination.response.status, 400, "Sales cannot override the inventory line yard printer");
+    if (order.lineYards.length === 1) {
+      const otherYard = [1, 28, 15, 26].find((locationId) => locationId !== Number(lineYard.locationId));
+      const changedDestination = await requestJson(baseUrl, `/api/sales/sales-orders/${order.orderId}/print`, {
+        method: "POST",
+        token,
+        body: { lineLocationId: otherYard, companyName: "Harness Company" }
+      });
+      assert.equal(changedDestination.response.status, 400, "Sales cannot override the inventory line yard printer");
+    }
 
     const snapshotResponse = await requestJson(
       baseUrl,

@@ -81,6 +81,38 @@ assert.match(bh80Html, /10 &lt; ROP 11 → target gap 6 PLT → <strong>6 PLT de
 assert.match(bh80Html, /After current 6-PLT proposal: <strong>16 PLT<\/strong>/);
 assert.match(bh80Html, /Saved rule: min\(ceil\(max\(6 target gap, 3 minimum order\)\), floor\(16 capacity − 10 position\)\) = 6 PLT/);
 
+const bh80AvailabilityHtml = proposalContext.smartProposalAvailability(
+  { proposalType: "PO", destinationName: "12441" },
+  bh80Line
+);
+assert.match(bh80AvailabilityHtml, /<small>150 available<\/small><strong>0 PLT<\/strong>/);
+assert.match(bh80AvailabilityHtml, /Expected inventory · AA \+ OO − BO/);
+assert.match(bh80AvailabilityHtml, /<strong>10 PLT<\/strong>/);
+const reservedPoAvailabilityHtml = proposalContext.smartProposalAvailability(
+  { proposalType: "PO", destinationName: "2967" },
+  {
+    ...bh80Line,
+    toPlt: 30,
+    destinationName: "2967",
+    reason: {
+      quantityAvailable: 120,
+      quantityOnOrder: 60,
+      quantityBackordered: 30,
+      quantityReservedOutbound: 90
+    }
+  }
+);
+assert.match(
+  reservedPoAvailabilityHtml,
+  /<small>2967 available<\/small><strong>1 PLT<\/strong>/,
+  "Destination availability should remain the usable amount after active reservations."
+);
+assert.match(
+  reservedPoAvailabilityHtml,
+  /Expected inventory · AA \+ OO − BO<\/small><strong>5 PLT<\/strong>/,
+  "PO expected inventory must use AA + OO - BO without subtracting active reservations."
+);
+
 const reorderedReason = Object.fromEntries(Object.entries(bh80Reason).reverse());
 assert.equal(
   proposalContext.smartProposalInventory({ proposalType: "PO", destinationName: "12441" }, { ...bh80Line, reason: reorderedReason }),
@@ -227,6 +259,14 @@ assert.match(transferHtml, /This TO line carries: <strong>1 of 3 PLT calculated 
 assert.match(transferHtml, /After current 1-PLT TO line: <strong>2\.17 PLT<\/strong>/);
 assert.match(proposalContext.smartProposalDecisionEvidence(transferLine), /Source protected floor: 1 PLT/);
 assert.match(proposalContext.smartProposalDecisionEvidence(transferLine), /Source transfer limit: 1 PLT/);
+const transferAvailabilityHtml = proposalContext.smartProposalAvailability(transferProposal, transferLine);
+assert.match(transferAvailabilityHtml, /<small>12441 source available<\/small><strong>2\.5 PLT<\/strong>/);
+assert.match(transferAvailabilityHtml, /<small>150 destination available<\/small><strong>1\.17 PLT<\/strong>/);
+assert.doesNotMatch(
+  transferAvailabilityHtml,
+  /safety|reorder|protected/i,
+  "The quick availability column must not repeat the detailed inventory calculation."
+);
 
 const manualTransferHtml = proposalContext.smartProposalInventory(transferProposal, {
   ...transferLine,
@@ -243,6 +283,8 @@ const manualTransferHtml = proposalContext.smartProposalInventory(transferPropos
   }
 });
 assert.match(manualTransferHtml, /Source safety\/ROP calculation was not captured for this manual or legacy line/);
+assert.match(manualTransferHtml, /User-entered quantity overrides the safety stock \/ ROP floor/);
+assert.match(manualTransferHtml, /2 PLT user-entered transfer ≤ 5 PLT actual available limit → <strong>within source limit<\/strong>/);
 assert.match(manualTransferHtml, /Policy trigger and target were not captured for this manual or legacy line/);
 assert.match(manualTransferHtml, /Source after this TO line: <strong>3 PLT<\/strong>/);
 
@@ -279,8 +321,37 @@ proposalContext.smartState.planShowInventory = false;
 proposalContext.smartState.planShowDecisionEvidence = false;
 const compactTransferCard = proposalContext.smartProposalCard(transferProposal);
 assert.match(compactTransferCard, /smart-proposal-lines smart-table-wrap smart-proposal-lines-compact/);
+assert.match(compactTransferCard, /<th data-smart-plan-column="availability">Availability<\/th>/);
+assert.match(compactTransferCard, /<td data-smart-plan-column="availability"><div class="smart-availability-summary">/);
+assert.doesNotMatch(
+  compactTransferCard,
+  /data-smart-plan-column="availability" hidden/,
+  "Quick availability must remain visible when both detailed columns are hidden."
+);
 assert.match(compactTransferCard, /data-smart-plan-column="inventory" hidden/);
 assert.match(compactTransferCard, /data-smart-plan-column="decision-evidence" hidden/);
+const physicalPalletRowHtml = proposalContext.smartPhysicalPalletLineRow(transferProposal, {
+  id: "physical-26",
+  itemId: 4530789,
+  itemName: "PALLET",
+  destinationLocationId: 26,
+  destinationName: "150",
+  quantity: 1,
+  automaticQuantity: 1,
+  unit: "EACH",
+  itemWeightLbs: 40,
+  lineWeightLbs: 40
+}, false);
+assert.equal(
+  (physicalPalletRowHtml.match(/<td\b/g) || []).length,
+  9,
+  "Physical PALLET rows must stay aligned with the nine proposal-table columns."
+);
+assert.match(
+  physicalPalletRowHtml,
+  /<td data-smart-plan-column="availability"><span class="smart-help">Ancillary packaging item<\/span><\/td>/,
+  "Physical PALLET rows need an explicit non-inventory availability cell."
+);
 proposalContext.smartState.planShowInventory = true;
 const oneDetailHiddenCard = proposalContext.smartProposalCard(transferProposal);
 assert.match(oneDetailHiddenCard, /smart-proposal-lines smart-table-wrap smart-proposal-lines-one-detail-hidden/);
@@ -296,8 +367,9 @@ assert.equal(fallbackColumns.decisionEvidence, true);
 delete proposalContext.localStorage;
 
 const proposalCss = readPublic("scm-smart-proposals.css");
-assert.match(proposalCss, /\.smart-proposal-lines-one-detail-hidden \.smart-table\s*\{\s*min-width: 1050px;/);
-assert.match(proposalCss, /\.smart-proposal-lines-compact \.smart-table\s*\{\s*min-width: 900px;/);
+assert.match(proposalCss, /\.smart-proposal-lines \.smart-table\s*\{\s*min-width: 1420px;/);
+assert.match(proposalCss, /\.smart-proposal-lines-one-detail-hidden \.smart-table\s*\{\s*min-width: 1210px;/);
+assert.match(proposalCss, /\.smart-proposal-lines-compact \.smart-table\s*\{\s*min-width: 1060px;/);
 assert.match(proposalCss, /\.smart-proposal-lines-compact \.smart-table td \{\s*padding-top: 5px;/);
 
 const appListeners = new Map();
@@ -327,6 +399,28 @@ const forecastContext = vm.createContext({
 });
 vm.runInContext(readPublic("scm-smart.js"), forecastContext, { filename: "scm-smart.js" });
 vm.runInContext("smartState.operator = { role: 'scm' };", forecastContext);
+const floatingNoticesHtml = vm.runInContext(`
+  smartState.error = "Failed <unsafe>";
+  smartState.notice = "Saved";
+  smartState.busy = "Refreshing";
+  smartFloatingNotices();
+`, forecastContext);
+assert.match(floatingNoticesHtml, /^<div class="smart-floating-notices" aria-live="polite" aria-atomic="true">/);
+assert.match(floatingNoticesHtml, /<div class="smart-notice error" role="alert">Failed &lt;unsafe&gt;<\/div>/);
+assert.match(floatingNoticesHtml, /<div class="smart-notice">Saved<\/div>/);
+assert.match(floatingNoticesHtml, /<div class="smart-notice">Refreshing…<\/div>/);
+assert.equal(vm.runInContext(`
+  smartState.error = "";
+  smartState.notice = "";
+  smartState.busy = "";
+  smartFloatingNotices();
+`, forecastContext), "", "The floating notice layer must not render when there is no message.");
+const smartCss = readPublic("scm-smart.css");
+assert.match(
+  smartCss,
+  /\.smart-floating-notices\s*\{[\s\S]*?position:\s*fixed;[\s\S]*?top:\s*72px;[\s\S]*?z-index:\s*80;/,
+  "Top-level Smart SCM notices must remain fixed above the sticky header and plan controls."
+);
 forecastContext.__capturedItemsUrl = null;
 vm.runInContext(`
   smartState.itemLowerStockPolicy = "yard:150";

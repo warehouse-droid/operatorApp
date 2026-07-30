@@ -106,6 +106,118 @@ assert.equal(plannerResult.historicalLane?.driverName, "Old Driver", "Historical
 assert.deepEqual(plannerResult.resetOrder, ["alpha"], "A disabled historical driver leaked into fresh plan initialization.");
 assert.equal(plannerResult.audit.length, 1, "Marker reorder did not create exactly one lane-order audit record.");
 
+const renumberDriverLoadsSource = sourceRange(
+  plannerUi,
+  "function renumberDriverLoads",
+  "function renumberTruckLoads"
+);
+const renumberContext = vm.createContext({});
+vm.runInContext(`
+  const DEFAULT_FIRST_LOAD_START = "07:00";
+  function minutes(value) {
+    const [hours, minute] = String(value || DEFAULT_FIRST_LOAD_START).split(":").map(Number);
+    return (hours * 60) + minute;
+  }
+  function loadDriverKey(truck, load) {
+    return String(load?.driverLogin || truck?.driverLogin || "").trim().toLowerCase();
+  }
+  const trucks = [{
+    id: "LI-TRUCK",
+    driverLogin: "li",
+    start: "07:00",
+    loads: [
+      { id: "LI-L1", name: "Load 1", driverSequence: 0, start: "07:00" },
+      { id: "LI-L2", name: "Load 2", driverSequence: 2, start: "11:17" },
+      { id: "LI-SALES", name: "Load 3", driverSequence: 4, start: "16:34" },
+      { id: "LI-RETURN", name: "Return Load", returnOnly: true, driverSequence: 1, start: "10:44" },
+      { id: "LI-TRANSFER", name: "Load 4", driverSequence: 3, start: "14:00" }
+    ]
+  }];
+  ${renumberDriverLoadsSource}
+  renumberDriverLoads();
+  globalThis.result = Object.fromEntries(trucks[0].loads.map((load) => [load.id, load.name]));
+`, renumberContext);
+const renumberResult = JSON.parse(JSON.stringify(renumberContext.result));
+assert.equal(renumberResult["LI-TRANSFER"], "Load 3", "A load dragged earlier kept its stale later load number.");
+assert.equal(renumberResult["LI-SALES"], "Load 4", "The displaced later load did not receive the next load number.");
+assert.equal(renumberResult["LI-RETURN"], "Return Load", "Driver renumbering changed the Return Load label.");
+
+const replenishmentLoadPrecedenceSource = sourceRange(
+  plannerUi,
+  "function replenishmentLoadPrecedence",
+  "function comparePlanDate"
+);
+const replenishmentPrecedenceContext = vm.createContext({});
+vm.runInContext(`
+  const transferOrder = { id: "TOB00749" };
+  const orders = new Map([[transferOrder.id, transferOrder]]);
+  const transferLoad = {
+    id: "LI-TRANSFER",
+    name: "Load 4",
+    driverLogin: "li",
+    driverSequence: 3,
+    stops: [{ id: "to-drop", type: "drop", orderId: transferOrder.id }]
+  };
+  const salesLoad = {
+    id: "LI-SALES",
+    name: "Load 3",
+    driverLogin: "li",
+    driverSequence: 4,
+    stops: []
+  };
+  const truck = {
+    id: "LI-TRUCK",
+    plate: "CC46868",
+    loads: [salesLoad, transferLoad]
+  };
+  const trucks = [truck];
+  function driverOrientedPlanningEnabled() { return true; }
+  function loadDriverKey(parentTruck, load) {
+    return String(load?.driverLogin || parentTruck?.driverLogin || "").trim().toLowerCase();
+  }
+  function loadTruckPlate(parentTruck, load) {
+    return String(load?.truckPlate || parentTruck?.plate || "").replace(/\\s+/g, "").toUpperCase();
+  }
+  function driverLoadEntries(login) {
+    return trucks.flatMap((parentTruck) => (parentTruck.loads || []).map((load) => ({
+      truck: parentTruck,
+      load
+    }))).filter((entry) => loadDriverKey(entry.truck, entry.load) === login)
+      .sort((left, right) => Number(left.load.driverSequence || 0) - Number(right.load.driverSequence || 0));
+  }
+  function orderById(orderId) { return orders.get(String(orderId || "")) || null; }
+  function replenishmentDependencyComplete() { return false; }
+  function orderAssignment(orderId) {
+    return String(orderId || "") === transferOrder.id ? { truck, load: transferLoad } : {};
+  }
+  function replenishmentTransferCompletionInLoad() { return null; }
+  function comparePlanDate() { return 0; }
+  ${replenishmentLoadPrecedenceSource}
+  const groupedSales = {
+    id: "GOB-116372-116373",
+    orderDependencies: [{
+      mode: "yard_replenishment",
+      status: "active",
+      transferOrderRef: transferOrder.id
+    }]
+  };
+  const allowed = replenishmentPlacementBlockMessage(groupedSales, truck, salesLoad);
+  transferLoad.driverSequence = 5;
+  const blocked = replenishmentPlacementBlockMessage(groupedSales, truck, salesLoad);
+  globalThis.result = { allowed, blocked };
+`, replenishmentPrecedenceContext);
+const replenishmentPrecedenceResult = JSON.parse(JSON.stringify(replenishmentPrecedenceContext.result));
+assert.equal(
+  replenishmentPrecedenceResult.allowed,
+  "",
+  "The frontend rejected TOB00749 even though its displayed driver sequence is before the grouped SO load."
+);
+assert.match(
+  replenishmentPrecedenceResult.blocked,
+  /TOB00749 must be in an earlier load than GOB-116372-116373/,
+  "The frontend allowed the grouped SO when its prerequisite TO was actually later in the driver lane."
+);
+
 const replenishmentPlacementFunctions = sourceRange(
   plannerUi,
   "function replenishmentDependencyTargetRefs",
@@ -452,6 +564,7 @@ const loadEditFunctions = [
   sourceRange(plannerUi, "function loadDriverKey", "function loadDriver"),
   sourceRange(plannerUi, "function loadHasAssignedDriver", "function truckHasPlanningContent"),
   sourceRange(plannerUi, "function driverLockNotice", "function ownYardFixedMinutesFor"),
+  sourceRange(plannerUi, "function isScmReconciliationBlocked", "function orderTypeLabel"),
   sourceRange(plannerUi, "function poDropStopDetails", "function moveStop")
 ].join("\n");
 const loadEditContext = vm.createContext({});
@@ -571,6 +684,9 @@ assert(plannerUi.includes('${isHistorical ? "" : `data-driver-lane-drop="'), "Hi
 assert(plannerUi.includes("Disabled (historical plan)"), "Historical disabled lanes are not identified to the dispatcher.");
 assert(plannerUi.includes("normalizeReplenishmentTransferInsertIndex(order, load, insertIndex)"), "TO insertion does not use the replenishment pickup anchor.");
 assert(plannerUi.includes("normalizeReplenishmentDependentInsertIndex(order, load, transferNormalizedInsertIndex)"), "Dependent SO insertion does not use the prerequisite TO completion boundary.");
+assert(plannerUi.includes("reflowDriverLaneEntries(targetLogin, targetEntries, timingByLoad, found.load.id);\n  if (driverOrientedPlanningEnabled()) renumberDriverLoads();"), "A whole-load driver-lane drag does not renumber the affected lane.");
+assert(plannerUi.includes("if (driverOrientedPlanningEnabled()) renumberDriverLoads();\n}\n\nfunction driverLoadEntries"), "Restoring a saved plan does not repair stale driver load labels.");
+assert(plannerUi.includes("replenishmentLoadPrecedence(assignment.truck, assignment.load, targetTruck, targetLoad) === false"), "The frontend replenishment guard does not use canonical load precedence.");
 assert(plannerUi.includes("commitPlanMutation:dependencyRejected"), "Plan mutations do not block a locally invalid replenishment stop sequence.");
 assert(plannerUi.includes("const orderDependencies = groupedDependencySources.length")
   && plannerUi.includes("groupedOrderDependencies(groupedDependencySources)"),
@@ -580,8 +696,8 @@ const savedRestore = sourceRange(plannerUi, "function applySavedPlan", "function
 assert(savedRestore.indexOf("trucks = trucksFromFleetAndSavedPlan(saved.trucks);") < savedRestore.indexOf("ensureDriverLaneOrder(Array.isArray(saved.summary?.driverLaneOrder)"), "Saved lane order is restored before historical truck/load metadata.");
 assert(repository.includes("displayOrder: numberValue(row.display_order, 0)"), "Setup API does not expose persisted display order.");
 assert(repository.includes("cleanDriver(driver, index)"), "Driver request order is not explicitly persisted as display_order.");
-assert(setupHtml.includes("20260723-driver-order-v1"), "Dispatch Setup browser asset version was not bumped.");
-assert(plannerHtml.includes('/dispatch.js?v=20260728-custom-orders-v3'), "Dispatch planner browser asset version was not bumped.");
+assert(setupHtml.includes("20260729-driver-samsara-v1"), "Dispatch Setup browser asset version was not bumped.");
+assert(plannerHtml.includes('/dispatch.js?v=20260730-physical-visits-v3'), "Dispatch planner browser asset version was not bumped.");
 
 console.log(JSON.stringify({
   ok: true,
@@ -592,5 +708,7 @@ console.log(JSON.stringify({
   vrmaLoadDriverGuard: true,
   replenishmentSequenceGuard: true,
   dependentSalesAutoPlacement: true,
-  tests: 57
+  driverLoadRenumberAfterDrag: true,
+  canonicalReplenishmentLoadPrecedence: true,
+  tests: 65
 }));

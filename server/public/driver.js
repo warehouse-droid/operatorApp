@@ -127,6 +127,12 @@ function completeWaitSeconds(job) {
   return Math.max(0, Math.ceil((COMPLETE_DELAY_MS - (Date.now() - startedAt)) / 1000));
 }
 
+function driverUsesSamsaraWorkflow() {
+  if (typeof dayState?.samsaraEnabled === "boolean") return dayState.samsaraEnabled;
+  if (typeof driver?.samsaraEnabled === "boolean") return driver.samsaraEnabled;
+  return true;
+}
+
 function locationCheckApproved() {
   return locationCheck?.status === "ok" || locationOverrideAccepted;
 }
@@ -360,7 +366,7 @@ function renderLogin(message = "") {
 }
 
 function shell(content) {
-  const switchWarning = dayState?.truckSwitchAttention?.[0];
+  const switchWarning = driverUsesSamsaraWorkflow() ? dayState?.truckSwitchAttention?.[0] : null;
   app.innerHTML = `
     <section class="driver-shell">
       <div class="driver-language">${languageToggle()}</div>
@@ -373,7 +379,7 @@ function shell(content) {
 }
 
 function truckSwitchAttentionForJob(job) {
-  if (!job?.jobId || job.stopType !== "truck_switch") return null;
+  if (!driverUsesSamsaraWorkflow() || !job?.jobId || job.stopType !== "truck_switch") return null;
   return (dayState?.truckSwitchAttention || []).find((item) => item.jobId === job.jobId) || null;
 }
 
@@ -611,8 +617,8 @@ function renderJob() {
       <div class="job-actions ${isTruckSwitch ? "truck-switch-job-actions" : ""}">
         ${isTruckSwitch
           ? `<div class="truck-switch-action-set">
-              <button class="primary" data-action="confirm-truck-switch" type="button">${switchAttention ? t("driver.retryTruckSwitch", "Retry Samsara & Confirm") : t("driver.confirmTruckSwitch", "Confirm Truck Switch")}</button>
-              <button class="secondary danger-button skip-samsara-button" data-action="skip-samsara-switch" type="button">${t("driver.skipSamsara", "Skip Samsara & Confirm")}</button>
+              <button class="primary" data-action="confirm-truck-switch" type="button">${driverUsesSamsaraWorkflow() && switchAttention ? t("driver.retryTruckSwitch", "Retry Samsara & Confirm") : t("driver.confirmTruckSwitch", "Confirm Truck Switch")}</button>
+              ${driverUsesSamsaraWorkflow() ? `<button class="secondary danger-button skip-samsara-button" data-action="skip-samsara-switch" type="button">${t("driver.skipSamsara", "Skip Samsara & Confirm")}</button>` : ""}
             </div>`
           : isStarted
           ? `<button class="primary" data-action="${job.requiredPhotos ? "show-photo" : "complete-job"}" data-job-confirm data-gps-gate="begin" data-ready-label="${t("driver.confirm", "Confirm")}" ${confirmDisabled ? "disabled" : ""} type="button">${waitSeconds > 0 ? tf("driver.waitSeconds", "Wait {seconds}s", { seconds: waitSeconds }) : t("driver.confirm", "Confirm")}</button>`
@@ -757,7 +763,7 @@ async function loadNextJob() {
   clearRestTimer();
   const stateResult = await request("/api/driver/day-state");
   dayState = stateResult.state;
-  if (dayState?.truckPlate && (dayState.preDvirStatus !== "complete" || !dayState.samsaraOnDutyConfirmed || !dayState.samsaraPreDvirConfirmed)) {
+  if (driverUsesSamsaraWorkflow() && dayState?.truckPlate && (dayState.preDvirStatus !== "complete" || !dayState.samsaraOnDutyConfirmed || !dayState.samsaraPreDvirConfirmed)) {
     currentJob = null;
     dvirPhotos = [];
     const message = dayState.preDvirStatus === "complete" && (!dayState.samsaraOnDutyConfirmed || !dayState.samsaraPreDvirConfirmed)
@@ -773,9 +779,11 @@ async function loadNextJob() {
   } catch (error) {
     if (error.data?.state) {
       dayState = error.data.state;
-      currentJob = null;
-      dvirPhotos = [];
-      return renderDvir(dayState.preDvirStatus !== "complete" ? "pre" : "post", error.message);
+      if (driverUsesSamsaraWorkflow()) {
+        currentJob = null;
+        dvirPhotos = [];
+        return renderDvir(dayState.preDvirStatus !== "complete" ? "pre" : "post", error.message);
+      }
     }
     throw error;
   }
@@ -789,7 +797,7 @@ async function loadNextJob() {
   photoPromptOpen = false;
   locationCheck = null;
   locationOverrideAccepted = false;
-  if (!currentJob && dayState?.allJobsComplete && dayState.postDvirStatus !== "complete") {
+  if (driverUsesSamsaraWorkflow() && !currentJob && dayState?.allJobsComplete && dayState.postDvirStatus !== "complete") {
     return renderDvir("post", t("driver.postTripRequired", "All assigned jobs are complete. MBBS post-trip inspection is required before logout."));
   }
   renderJob();
@@ -815,6 +823,7 @@ function connectEvents() {
       "driver.truck.switched",
       "driver.truck.switch.overridden",
       "driver.truck.switch.samsara_skipped",
+      "dispatch.setup.updated",
       "driver.rest.started",
       "driver.rest.ended",
       "delivery.order.loaded"
@@ -868,7 +877,7 @@ app.addEventListener("click", async (event) => {
       if (error.data?.state) {
         dayState = error.data.state;
         dvirPhotos = [];
-        return renderDvir("post", error.message);
+        if (driverUsesSamsaraWorkflow()) return renderDvir("post", error.message);
       }
       showToast(error.message);
       return;

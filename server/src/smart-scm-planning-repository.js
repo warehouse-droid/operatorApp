@@ -2,7 +2,7 @@ import { query, withTransaction } from "./db.js";
 import { writeAudit } from "./auth-repository.js";
 import { latestSmartScmForecastRunId, smartScmForecastMap } from "./smart-scm-forecast-repository.js";
 import { calculateSmartScmOrderRequirement, calculateSmartScmPolicyLevels } from "./smart-scm-policy-calculation.js";
-import { smartScmBuiltInRouteRule, smartScmRouteRuleKey, smartScmRouteRuleMap } from "./smart-scm-route-repository.js";
+import { smartScmBuiltInRouteRule, smartScmIsGormleySource, smartScmRouteRuleKey, smartScmRouteRuleMap } from "./smart-scm-route-repository.js";
 
 const EPSILON = 0.000001;
 export const SMART_SCM_MAX_PALLET_OVERRIDE_QUANTITY = 1_000_000;
@@ -108,6 +108,35 @@ export function smartScmSourceTransferLimit({ availablePallets = 0, safetyStockP
   return { availablePallets: available, safetyStockPallets: safety, reorderPointPallets: reorderPoint, protectedFloorPallets, maximumTransferablePallets };
 }
 
+export function smartScmLineOverridesSourceStockFloor(line = {}) {
+  const reason = line?.reason;
+  if (!reason || typeof reason !== "object" || Array.isArray(reason)) return false;
+  return reason.manualSourceFloorOverride === true
+    || reason.manuallyAdjusted === true
+    || reason.manuallyAdded === true
+    || reason.manualLoad === true;
+}
+
+export function smartScmConfirmationSourceTransferLimit({
+  availablePallets = 0,
+  safetyStockPallets = 0,
+  reorderPointPallets = 0,
+  manualOverride = false
+} = {}) {
+  const policyLimit = smartScmSourceTransferLimit({
+    availablePallets,
+    safetyStockPallets,
+    reorderPointPallets
+  });
+  return {
+    ...policyLimit,
+    manualOverride: manualOverride === true,
+    maximumTransferablePallets: manualOverride === true
+      ? Math.floor(policyLimit.availablePallets + EPSILON)
+      : policyLimit.maximumTransferablePallets
+  };
+}
+
 function text(value) {
   return String(value ?? "").trim();
 }
@@ -151,7 +180,13 @@ async function planningPolicies() {
             COALESCE(i.to_sec, p.to_sec) AS to_sec,
             COALESCE(i.to_pcs, p.to_pcs) AS to_pcs,
             COALESCE(p.lead_time_days, i.netsuite_lead_time_days, p.purchase_lead_time_days, 7) AS effective_lead_time_days,
-            COALESCE(NULLIF(p.vendor_yard, ''), NULLIF(p.plant, ''), i.vendor, p.vendor) AS plant,
+            COALESCE(
+              NULLIF(BTRIM(vy.yard), ''),
+              NULLIF(BTRIM(p.vendor_yard), ''),
+              NULLIF(BTRIM(p.plant), ''),
+              NULLIF(BTRIM(i.vendor), ''),
+              NULLIF(BTRIM(p.vendor), '')
+            ) AS plant,
             CASE WHEN COALESCE(i.item_weight, 0) > 0 AND COALESCE(i.to_plt, 0) > 0
                  THEN i.item_weight * i.to_plt ELSE p.pallet_weight_lbs END AS pallet_weight_lbs,
             COALESCE((
@@ -166,6 +201,7 @@ async function planningPolicies() {
        FROM scm_smart_item_policies p
        JOIN scm_smart_item_yard_policies y ON y.item_id = p.item_id
        LEFT JOIN inventory_items i ON i.item_id = p.item_id
+       LEFT JOIN dispatch_vendor_yards vy ON vy.id = p.vendor_yard_id
       WHERE y.eligible = true
         AND p.planning_enabled = true
         AND p.inactive = false
@@ -474,7 +510,23 @@ function splitLineByTruck(line, truckCapacity) {
   return parts;
 }
 
-function createDraft({ type, phase, sourceKind, sourceLocationId = null, sourceName, destinationLocationId, destinationName, vendor = null, plant = null, urgent = false, provisional = false, line, status = null, keySuffix = "" }, settings) {
+function createDraft({
+  type,
+  phase,
+  sourceKind,
+  sourceLocationId = null,
+  sourceVendorYardId = null,
+  sourceName,
+  destinationLocationId,
+  destinationName,
+  vendor = null,
+  plant = null,
+  urgent = false,
+  provisional = false,
+  line,
+  status = null,
+  keySuffix = ""
+}, settings) {
   const classifiedLine = {
     ...line,
     urgent: Boolean(urgent),
@@ -491,12 +543,17 @@ function createDraft({ type, phase, sourceKind, sourceLocationId = null, sourceN
     else if (coverageReviewRequired) resolvedStatus = "held";
     else resolvedStatus = "draft";
   }
+  const vendorYardId = Number(sourceVendorYardId);
+  const sourceIdentity = sourceKind === "vendor" && Number.isInteger(vendorYardId) && vendorYardId > 0
+    ? `vendor-yard-${vendorYardId}`
+    : sourceLocationId || sourceName || "unknown";
   return {
-    proposalKey: [phase, sourceKind, sourceLocationId || sourceName || "unknown", destinationLocationId, line.itemId, keySuffix].join(":"),
+    proposalKey: [phase, sourceKind, sourceIdentity, destinationLocationId, line.itemId, keySuffix].join(":"),
     proposalType: type,
     phase,
     sourceKind,
     sourceLocationId,
+    sourceVendorYardId: Number.isInteger(vendorYardId) && vendorYardId > 0 ? vendorYardId : null,
     sourceName,
     destinationLocationId,
     destinationName,
@@ -582,9 +639,14 @@ function combineLoadLine(lines, next) {
 
 function compatibleLoadSignature(draft) {
   const destination = draft.proposalType === "PO" ? "multi-drop" : `${draft.destinationLocationId}|${draft.destinationName}`;
+  const vendorYardId = Number(draft.sourceVendorYardId);
+  const sourceIdentity = draft.sourceKind === "vendor" && Number.isInteger(vendorYardId) && vendorYardId > 0
+    ? `vendor-yard:${vendorYardId}`
+    : draft.sourceKind === "vendor"
+      ? `legacy-vendor:${text(draft.vendor).toLowerCase().replace(/[^a-z0-9]+/g, "")}:${text(draft.plant || draft.sourceName).toLowerCase().replace(/[^a-z0-9]+/g, "")}`
+      : `yard:${draft.sourceLocationId || text(draft.sourceName).toLowerCase().replace(/[^a-z0-9]+/g, "")}`;
   return [
-    draft.proposalType, draft.phase, draft.sourceKind, draft.sourceLocationId || "", draft.sourceName || "",
-    destination, draft.vendor || "", draft.plant || ""
+    draft.proposalType, draft.phase, draft.sourceKind, sourceIdentity, destination
   ].join("|");
 }
 
@@ -725,7 +787,7 @@ function partialRedirectAdjustedLoads(units = [], truckCapacity = 0, maxStops = 
               routeRuleSource: routeRule.sourceName,
               routeRuleOriginalDestinations: [originalDestination],
               actualDestinationYard: originalDestination,
-              ...(smartScmRouteRuleKey(routeRule.sourceName) === "gormley" ? {
+              ...(smartScmIsGormleySource(routeRule.sourceName) ? {
                 gormleyHubRedirected: true,
                 gormleyOriginalDestinations: [originalDestination]
               } : {})
@@ -905,6 +967,7 @@ function buildPlanningDrafts({ states, supplyMap, settings }) {
         type: "PO",
         phase: "direct_vendor",
         sourceKind: "vendor",
+        sourceVendorYardId: state.policy.vendor_yard_id,
         sourceName: state.policy.plant || state.policy.vendor || "Vendor confirmation required",
         destinationLocationId: Number(state.policy.location_id),
         destinationName: state.policy.yard_code,
@@ -939,6 +1002,7 @@ function buildPlanningDrafts({ states, supplyMap, settings }) {
           type: "PO",
           phase: "vendor_hub",
           sourceKind: "vendor",
+          sourceVendorYardId: state.policy.vendor_yard_id,
           sourceName: state.policy.plant || state.policy.vendor || "Vendor",
           destinationLocationId: hub.locationId,
           destinationName: hub.code,
@@ -975,14 +1039,14 @@ async function insertDrafts(runId, drafts = []) {
   for (const draft of drafts) {
     const proposal = await query(
       `INSERT INTO scm_smart_proposals (
-         run_id, proposal_key, proposal_type, phase, source_kind, source_location_id, source_name,
+         run_id, proposal_key, proposal_type, phase, source_kind, source_location_id, source_vendor_yard_id, source_name,
          destination_location_id, destination_name, vendor, plant, status, urgent, provisional,
          total_pallets, total_weight_lbs, utilization, vendor_reply_due_at, memo, route_stops, manually_grouped
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20::jsonb,$21)
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21::jsonb,$22)
        RETURNING id`,
       [
         runId, draft.proposalKey, draft.proposalType, draft.phase, draft.sourceKind, draft.sourceLocationId,
-        draft.sourceName, draft.destinationLocationId, draft.destinationName, draft.vendor, draft.plant,
+        draft.sourceVendorYardId, draft.sourceName, draft.destinationLocationId, draft.destinationName, draft.vendor, draft.plant,
         draft.status, draft.urgent, draft.provisional, draft.totalPallets, draft.totalWeight, draft.utilization,
         draft.vendorReplyDueAt, draft.memo, JSON.stringify(draft.routeStops || routeStopsForLines(draft.lines)), Boolean(draft.manuallyGrouped)
       ]
@@ -1133,6 +1197,9 @@ function publicProposal(row) {
     phase: row.phase,
     sourceKind: row.source_kind,
     sourceLocationId: row.source_location_id === null ? null : Number(row.source_location_id),
+    sourceVendorYardId: row.source_vendor_yard_id === null || row.source_vendor_yard_id === undefined
+      ? null
+      : Number(row.source_vendor_yard_id),
     sourceName: row.source_name,
     destinationLocationId: Number(row.destination_location_id),
     destinationName: row.destination_name,
@@ -1791,7 +1858,16 @@ export async function prepareSmartScmTransferExecution(proposalId, operatorId = 
     if (proposal.netsuite_transfer_order_id || proposal.netsuite_transfer_order_ref) {
       throw Object.assign(new Error("This proposal already has an execution reference. Use picking-ticket retry instead of creating another TO."), { status: 409 });
     }
-    if (!["draft", "reviewed", "held"].includes(proposal.status)) throw Object.assign(new Error("This TO proposal is not available for confirmation."), { status: 409 });
+    if (proposal.status === "executing") {
+      const lastUpdate = new Date(proposal.updated_at || 0).getTime();
+      const freshExecution = Number.isFinite(lastUpdate) && lastUpdate > 0
+        && Date.now() - lastUpdate < 5 * 60 * 1000;
+      if (freshExecution) {
+        throw Object.assign(new Error("This TO confirmation is already running. Wait for it to finish before retrying."), { status: 409 });
+      }
+    } else if (!["draft", "reviewed", "held", "failed", "attention"].includes(proposal.status)) {
+      throw Object.assign(new Error("This TO proposal is not available for confirmation."), { status: 409 });
+    }
     if (proposal.phase === "hub_store") {
       throw Object.assign(new Error("This legacy provisional TO depends on stock that has not been received. Run a new plan after the inventory is available at the source yard."), { status: 409 });
     }
@@ -1851,14 +1927,19 @@ export async function prepareSmartScmTransferExecution(proposalId, operatorId = 
       }
       const availableSales = Math.max(0, positive(balance.rows[0]?.available) - positive(reservations.rows[0]?.reserved));
       const availablePallets = availableSales / sourceState.toPlt;
-      const limit = smartScmSourceTransferLimit({
+      const manualSourceFloorOverride = smartScmLineOverridesSourceStockFloor(line);
+      const limit = smartScmConfirmationSourceTransferLimit({
         availablePallets,
         safetyStockPallets: sourceState.safety,
-        reorderPointPallets: sourceState.rop
+        reorderPointPallets: sourceState.rop,
+        manualOverride: manualSourceFloorOverride
       });
       const { protectedFloorPallets: protectedFloor, maximumTransferablePallets: maximumTransferable } = limit;
       if (positive(line.proposed_pallets) > maximumTransferable + EPSILON) {
-        throw Object.assign(new Error(`${line.item_name} can transfer at most ${maximumTransferable} PLT from ${proposal.source_name}: ${round(availablePallets, 2)} available and ${round(protectedFloor, 2)} protected (safety stock / reorder point). Refresh and replan.`), { status: 409 });
+        const message = manualSourceFloorOverride
+          ? `${line.item_name} has only ${round(availablePallets, 2)} unreserved PLT available at ${proposal.source_name}; the user-entered quantity can transfer at most ${maximumTransferable} whole PLT. Refresh inventory or reduce the quantity.`
+          : `${line.item_name} can transfer at most ${maximumTransferable} PLT from ${proposal.source_name}: ${round(availablePallets, 2)} available and ${round(protectedFloor, 2)} protected (safety stock / reorder point). Refresh and replan.`;
+        throw Object.assign(new Error(message), { status: 409 });
       }
     }
     await query(

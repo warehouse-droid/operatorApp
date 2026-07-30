@@ -3,6 +3,7 @@ import { closeDb } from "./db.js";
 import { buildSmartScmPurchaseOrderRestPayload, smartScmPurchaseOrderMemoMarker } from "./smart-scm-purchase-netsuite.js";
 import { selectSmartScmMarkerPurchaseOrder } from "./smart-scm-purchase-service.js";
 import { normalizeSmartScmVendorDecision } from "./smart-scm-vendor-repository.js";
+import { selectSmartScmMarkerTransferOrder, smartScmTransferOrderMemoMarker } from "./transfer-dependency-netsuite.js";
 
 try {
   const sourceLine = { id: 71, proposedPallets: 6 };
@@ -51,6 +52,34 @@ try {
   assert.throws(
     () => selectSmartScmMarkerPurchaseOrder([{ id: 901, vendor_id: 88 }], { proposalId: 501, vendorId: 77 }),
     /different NetSuite vendor/
+  );
+  assert.equal(smartScmTransferOrderMemoMarker(601), "MBBS-SCM:601");
+  assert.equal(selectSmartScmMarkerTransferOrder([], { proposalId: 601 }), null);
+  assert.equal(selectSmartScmMarkerTransferOrder([{
+    id: "9901",
+    tranid: "TOB09901",
+    source_location_id: "101",
+    destination_location_id: "128"
+  }], {
+    proposalId: 601,
+    sourceLocationId: 101,
+    destinationLocationId: 128
+  }).id, 9901);
+  assert.throws(
+    () => selectSmartScmMarkerTransferOrder([{ id: 9901 }, { id: 9902 }], { proposalId: 601 }),
+    (error) => error.smartScmAttention === true
+  );
+  assert.throws(
+    () => selectSmartScmMarkerTransferOrder([{
+      id: 9901,
+      source_location_id: 102,
+      destination_location_id: 128
+    }], {
+      proposalId: 601,
+      sourceLocationId: 101,
+      destinationLocationId: 128
+    }),
+    /different NetSuite source location/
   );
 
   const proposal = {
@@ -129,7 +158,7 @@ try {
   mismatchedUnit.lines[0].purchaseUnit = "Case";
   assert.throws(() => buildSmartScmPurchaseOrderRestPayload({ proposal: mismatchedUnit, locations }), /does not match purchase unit/);
 
-  console.log(JSON.stringify({ ok: true, materialLines: 3, automaticPalletLines: 2, manualOverride: 1.25, zeroOverride: true, exactlyOnce: true, markerRecoveryCovered: true }));
+  console.log(JSON.stringify({ ok: true, materialLines: 3, automaticPalletLines: 2, manualOverride: 1.25, zeroOverride: true, exactlyOnce: true, poMarkerRecoveryCovered: true, toMarkerRecoveryCovered: true }));
 } finally {
   await closeDb();
 }

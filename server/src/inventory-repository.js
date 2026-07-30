@@ -1,6 +1,7 @@
-import { query } from "./db.js";
+import { query, withTransaction } from "./db.js";
 import { writeAudit } from "./auth-repository.js";
 import { enqueueNetSuiteMirrorInventoryEvent } from "./netsuite-mirror-repository.js";
+import { defaultReturnPolicy, normalizeReturnPolicy } from "./return-policy.js";
 
 function normalizeNumber(value) {
   if (value === null || value === undefined || value === "") return 0;
@@ -265,6 +266,13 @@ export async function listInventoryClassifications({ search = null, limit = 300 
             i.item_type_text,
             i.stock_unit,
             i.product_type,
+            i.return_policy_override,
+            CASE
+              WHEN i.return_policy_override IS NOT NULL THEN i.return_policy_override
+              WHEN LOWER(REGEXP_REPLACE(REPLACE(BTRIM(COALESCE(i.product_type, '')), '_', ' '), '[[:space:]]+', ' ', 'g')) = 'interlocking' THEN 'ALLOWED'
+              WHEN LOWER(REGEXP_REPLACE(REPLACE(BTRIM(COALESCE(i.product_type, '')), '_', ' '), '[[:space:]]+', ' ', 'g')) = 'natural stone' THEN 'APPROVAL_REQUIRED'
+              ELSE 'NOT_RETURNABLE'
+            END AS return_policy_effective,
             i.brand,
             i.series,
             i.to_plt,
@@ -287,33 +295,127 @@ export async function listInventoryClassifications({ search = null, limit = 300 
   return result.rows;
 }
 
-export async function updateInventoryClassification(operatorId, itemId, values) {
-  const result = await query(
-    `UPDATE inventory_items
-     SET product_type = nullif($2, ''),
-         brand = nullif($3, ''),
-         series = nullif($4, ''),
-         classification_updated_at = now(),
-         classification_updated_by = $5
-     WHERE item_id = $1
-     RETURNING item_id, item_name, display_name, item_description, item_type_text,
-               stock_unit, product_type, brand, series, classification_updated_at`,
-    [
-      Number(itemId),
-      String(values.productType || "").trim(),
-      String(values.brand || "").trim(),
-      String(values.series || "").trim(),
-      operatorId
-    ]
-  );
-  if (!result.rowCount) throw new Error("Inventory item not found.");
-  await writeAudit({
-    actorOperatorId: operatorId,
-    source: "inventory",
-    action: "inventory.classification.update",
-    details: { itemId: Number(itemId), productType: values.productType || "", brand: values.brand || "", series: values.series || "" }
+export async function updateInventoryClassification(operatorId, itemId, values, {
+  allowReturnPolicyChange = false
+} = {}) {
+  return withTransaction(async () => {
+    const currentResult = await query(
+      `SELECT item_id, product_type, brand, series, return_policy_override
+         FROM inventory_items
+        WHERE item_id = $1
+        FOR UPDATE`,
+      [Number(itemId)]
+    );
+    if (!currentResult.rowCount) throw new Error("Inventory item not found.");
+    const current = currentResult.rows[0];
+    const hasProductType = Object.hasOwn(values || {}, "productType");
+    const hasBrand = Object.hasOwn(values || {}, "brand");
+    const hasSeries = Object.hasOwn(values || {}, "series");
+    const hasReturnPolicy = Object.hasOwn(values || {}, "returnPolicyOverride");
+    const expectedReturnPolicyContext = values?.expectedReturnPolicyContext;
+    if (expectedReturnPolicyContext !== undefined
+        && (!expectedReturnPolicyContext
+          || typeof expectedReturnPolicyContext !== "object"
+          || Array.isArray(expectedReturnPolicyContext))) {
+      throw Object.assign(new Error("Return Policy revision is invalid. Reload Item Classification and try again."), {
+        status: 400
+      });
+    }
+    if ((hasProductType || hasReturnPolicy) && expectedReturnPolicyContext) {
+      const expectedProductType = String(expectedReturnPolicyContext.productType || "").trim();
+      const expectedOverride = normalizeReturnPolicy(
+        expectedReturnPolicyContext.returnPolicyOverride,
+        { nullable: true }
+      );
+      if (expectedProductType !== String(current.product_type || "").trim()
+          || expectedOverride !== current.return_policy_override) {
+        throw Object.assign(new Error("Return Policy changed after this screen loaded. Reload Item Classification before saving."), {
+          status: 409,
+          code: "RETURN_POLICY_REVISION_CONFLICT"
+        });
+      }
+    }
+    const nextProductType = hasProductType
+      ? String(values.productType || "").trim()
+      : String(current.product_type || "").trim();
+    const nextBrand = hasBrand ? String(values.brand || "").trim() : String(current.brand || "").trim();
+    const nextSeries = hasSeries ? String(values.series || "").trim() : String(current.series || "").trim();
+    const returnPolicyOverride = hasReturnPolicy
+      ? normalizeReturnPolicy(values.returnPolicyOverride, { nullable: true })
+      : current.return_policy_override;
+    const classificationChanged = nextProductType !== String(current.product_type || "").trim()
+      || nextBrand !== String(current.brand || "").trim()
+      || nextSeries !== String(current.series || "").trim();
+    const returnPolicyChanged = hasReturnPolicy
+      && returnPolicyOverride !== current.return_policy_override;
+    const productTypeChangesReturnDefault = defaultReturnPolicy(current.product_type)
+      !== defaultReturnPolicy(nextProductType);
+    if (!allowReturnPolicyChange && (productTypeChangesReturnDefault || returnPolicyChanged)) {
+      throw Object.assign(new Error("Only an admin can change a product type or override that changes company-wide return eligibility."), {
+        status: 403
+      });
+    }
+    const result = await query(
+      `UPDATE inventory_items
+          SET product_type = CASE WHEN $6::boolean THEN nullif($2, '') ELSE product_type END,
+              brand = CASE WHEN $7::boolean THEN nullif($3, '') ELSE brand END,
+              series = CASE WHEN $8::boolean THEN nullif($4, '') ELSE series END,
+              classification_updated_at = CASE WHEN $9::boolean THEN now() ELSE classification_updated_at END,
+              classification_updated_by = CASE WHEN $9::boolean THEN $5 ELSE classification_updated_by END,
+              return_policy_override = CASE WHEN $10::boolean THEN $11::text ELSE return_policy_override END,
+              return_policy_updated_by = CASE
+                WHEN $10::boolean AND return_policy_override IS DISTINCT FROM $11::text THEN $5
+                ELSE return_policy_updated_by
+              END,
+              return_policy_updated_at = CASE
+                WHEN $10::boolean AND return_policy_override IS DISTINCT FROM $11::text THEN now()
+                ELSE return_policy_updated_at
+              END
+        WHERE item_id = $1
+        RETURNING item_id, item_name, display_name, item_description, item_type_text,
+                  stock_unit, product_type, brand, series, return_policy_override,
+                  CASE
+                    WHEN return_policy_override IS NOT NULL THEN return_policy_override
+                    WHEN LOWER(REGEXP_REPLACE(REPLACE(BTRIM(COALESCE(product_type, '')), '_', ' '), '[[:space:]]+', ' ', 'g')) = 'interlocking' THEN 'ALLOWED'
+                    WHEN LOWER(REGEXP_REPLACE(REPLACE(BTRIM(COALESCE(product_type, '')), '_', ' '), '[[:space:]]+', ' ', 'g')) = 'natural stone' THEN 'APPROVAL_REQUIRED'
+                    ELSE 'NOT_RETURNABLE'
+                  END AS return_policy_effective,
+                  classification_updated_at`,
+      [
+        Number(itemId),
+        nextProductType,
+        nextBrand,
+        nextSeries,
+        operatorId,
+        hasProductType,
+        hasBrand,
+        hasSeries,
+        classificationChanged,
+        hasReturnPolicy,
+        returnPolicyOverride
+      ]
+    );
+    if (classificationChanged || returnPolicyChanged) {
+      await writeAudit({
+        actorOperatorId: operatorId,
+        source: "inventory",
+        action: "inventory.classification.update",
+        details: {
+          itemId: Number(itemId),
+          before: current,
+          after: {
+            productType: nextProductType,
+            brand: nextBrand,
+            series: nextSeries,
+            returnPolicyOverride
+          },
+          classificationChanged,
+          returnPolicyChanged
+        }
+      });
+    }
+    return result.rows[0];
   });
-  return result.rows[0];
 }
 
 export async function listInventoryFacets({ locationId = null, productType = null, brand = null } = {}) {

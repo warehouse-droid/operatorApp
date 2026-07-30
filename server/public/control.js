@@ -20,10 +20,12 @@ const SALES_YARD_OPTIONS = [
 const IS_ADMIN_PAGE = window.location.pathname.startsWith("/admin");
 const SECTION_STORAGE_KEY = IS_ADMIN_PAGE ? "mbbs.admin.section" : "mbbs.control.section";
 const ACCOUNT_SELECTION_KEY = "mbbs.admin.selectedAccount";
-const ADMIN_SECTIONS = new Set(["dashboard", "operators", "sync", "storage", "audit"]);
-const CONTROL_SECTIONS = new Set(["dashboard", "locks", "classification", "vendor-mapping", "warnings", "loaded-export", "cycle-count", "fulfillment"]);
+const SCM_RECONCILIATION_SELECTED_RUN_KEY = "mbbs.admin.reconciliation.selectedRun";
+const ADMIN_SECTIONS = new Set(["dashboard", "operators", "sync", "reconciliation", "return-automation", "storage", "audit"]);
+const CONTROL_SECTIONS = new Set(["dashboard", "returns", "locks", "classification", "vendor-mapping", "warnings", "loaded-export", "cycle-count", "fulfillment"]);
 const CONTROL_SECTION_ROUTES = {
   dashboard: "/control",
+  returns: "/control/returns",
   locks: "/control/order-locks",
   classification: "/control/item-classification",
   "vendor-mapping": "/control/vendor-mapping",
@@ -36,6 +38,8 @@ const ADMIN_SECTION_ROUTES = {
   dashboard: "/admin",
   operators: "/admin/accounts",
   sync: "/admin/sync",
+  reconciliation: "/admin/reconciliation",
+  "return-automation": "/admin/return-automation",
   storage: "/admin/photo-storage",
   audit: "/admin/audit"
 };
@@ -68,6 +72,63 @@ function hasStaffAuthority(account, allowedRoles) {
 function operatorRoleLabel(role) {
   const option = ACCOUNT_ROLE_OPTIONS.find((entry) => entry.value === normalizedRole(role));
   return option ? t(option.labelKey, option.label) : String(role || "");
+}
+
+function classificationReturnPolicy(item = {}) {
+  const override = String(item.return_policy_override || item.returnPolicyOverride || "").trim().toUpperCase();
+  const productType = String(item.product_type || item.productType || "")
+    .trim()
+    .toLowerCase()
+    .replaceAll("_", " ")
+    .replace(/\s+/g, " ");
+  const defaultPolicy = productType === "interlocking"
+    ? "ALLOWED"
+    : productType === "natural stone"
+      ? "APPROVAL_REQUIRED"
+      : "NOT_RETURNABLE";
+  return {
+    override,
+    defaultPolicy,
+    effective: override || defaultPolicy
+  };
+}
+
+function classificationReturnPolicyOptions(item = {}) {
+  const policy = classificationReturnPolicy(item);
+  const labels = {
+    ALLOWED: "Allowed",
+    APPROVAL_REQUIRED: "Approval Required",
+    NOT_RETURNABLE: "Not Returnable"
+  };
+  return [
+    ["DEFAULT", `Default · ${labels[policy.defaultPolicy]}`],
+    ["ALLOWED", labels.ALLOWED],
+    ["APPROVAL_REQUIRED", labels.APPROVAL_REQUIRED],
+    ["NOT_RETURNABLE", labels.NOT_RETURNABLE]
+  ].map(([value, label]) => `
+    <option value="${value}" ${(policy.override || "DEFAULT") === value ? "selected" : ""}>${label}</option>
+  `).join("");
+}
+
+function refreshClassificationReturnPolicy(row) {
+  const productType = row?.querySelector('[data-field="productType"]')?.value || "";
+  const select = row?.querySelector('[data-field="returnPolicyOverride"]');
+  if (!select) return;
+  const labels = {
+    ALLOWED: "Allowed",
+    APPROVAL_REQUIRED: "Approval Required",
+    NOT_RETURNABLE: "Not Returnable"
+  };
+  const policy = classificationReturnPolicy({
+    productType,
+    returnPolicyOverride: select.value === "DEFAULT" ? null : select.value
+  });
+  const defaultOption = [...select.options].find((option) => option.value === "DEFAULT");
+  if (defaultOption) defaultOption.textContent = `Default · ${labels[policy.defaultPolicy]}`;
+  const source = row.querySelector('[data-field="returnPolicySource"]');
+  if (source) {
+    source.textContent = `Company-wide · ${select.value === "DEFAULT" ? "Product Type default" : "Admin override"}`;
+  }
 }
 
 function renderRoleOptions(selectedRole) {
@@ -184,6 +245,28 @@ let syncSettings = { mode: "manual", running: false, lastStatus: "idle" };
 let targetedSyncOrderRef = "";
 let targetedSyncBusy = false;
 let targetedSyncResult = null;
+const SCM_RECONCILIATION_TIME_ZONE = "America/Toronto";
+const SCM_RECONCILIATION_DEFAULT_SETTINGS = Object.freeze({
+  nightlyEnabled: false,
+  nightlyTime: "21:30",
+  timeZone: SCM_RECONCILIATION_TIME_ZONE,
+  initialBackfillSince: "2026-01-01",
+  initialDryRunApproved: false
+});
+let scmReconciliationSettings = { ...SCM_RECONCILIATION_DEFAULT_SETTINGS };
+let scmReconciliationSettingsLoaded = false;
+let scmReconciliationRuns = [];
+const scmReconciliationRunDetails = new Map();
+let scmReconciliationLoadError = "";
+let scmReconciliationBusy = false;
+const scmReconciliationDecisionBusyTargets = new Set();
+const scmReconciliationDecisionDrafts = new Map();
+let scmReconciliationScope = "all";
+let scmReconciliationOrderKind = "PO";
+let scmReconciliationOrderRef = "";
+let scmReconciliationIncludeTerminalOrders = false;
+let scmReconciliationDryRun = true;
+let scmReconciliationSelectedRunId = localStorage.getItem(SCM_RECONCILIATION_SELECTED_RUN_KEY) || "";
 let mirrorStatus = { role: "disabled", configured: false, source: {}, consumer: {} };
 let photoArchiveSettings = {
   mode: "off",
@@ -195,15 +278,42 @@ let photoArchiveSettings = {
 let envSettings = { activeEnvFile: ".env", selectedEnvFile: ".env", restartRequired: false, files: [] };
 let vendorMappings = { localVendors: [], mappings: [] };
 let vendorMappingTab = localStorage.getItem("mbbs.control.vendorMapping.tab") || "links";
+let returnRecords = [];
+let returnCounts = {};
+let returnDashboardCounts = {};
+let returnDetail = null;
+let selectedReturnId = localStorage.getItem("mbbs.control.returns.selected") || "";
+let returnLoadError = "";
+let returnSettingsError = "";
+let controlReturnSettings = [];
+let adminReturnSettings = [];
+const RETURN_RECORD_PAGE_SIZE = 100;
+let returnRecordOffset = 0;
+let returnFilters = {
+  search: localStorage.getItem("mbbs.control.returns.search") || "",
+  status: localStorage.getItem("mbbs.control.returns.status") || "",
+  type: localStorage.getItem("mbbs.control.returns.type") || "",
+  yardLocationId: localStorage.getItem("mbbs.control.returns.yard") || "",
+  from: localStorage.getItem("mbbs.control.returns.from") || "",
+  to: localStorage.getItem("mbbs.control.returns.to") || ""
+};
 const USE_NETSUITE_ADDRESS_VENDOR = "__USE_NETSUITE_ADDRESS__";
 let classificationSearch = "";
 let bootstrapNeeded = false;
 let activeSection = normalizedSection(sectionFromCurrentRoute() || localStorage.getItem(SECTION_STORAGE_KEY) || "dashboard");
 let syncPollTimer = null;
+let scmReconciliationPollTimer = null;
 let photoArchivePollTimer = null;
 
 function updateControlPageLayoutClass() {
-  document.body.classList.toggle("admin-sync-page", IS_ADMIN_PAGE && activeSection === "sync");
+  document.body.classList.toggle(
+    "admin-sync-page",
+    IS_ADMIN_PAGE && ["sync", "reconciliation"].includes(activeSection)
+  );
+  document.body.classList.toggle(
+    "admin-reconciliation-page",
+    IS_ADMIN_PAGE && activeSection === "reconciliation"
+  );
 }
 
 updateControlPageLayoutClass();
@@ -300,14 +410,68 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
-function photoSrc(value) {
+function photoImgAttributes(value) {
   const text = String(value || "");
-  if (!text.startsWith("r2://")) return text;
-  return `/api/photo-upload/preview?ref=${encodeURIComponent(text)}&token=${encodeURIComponent(token || "")}`;
+  if (!text.startsWith("r2://")) return `src="${escapeHtml(text)}"`;
+  return `data-secure-photo-ref="${escapeHtml(text)}"`;
 }
 
-function photoImgSrc(value) {
-  return escapeHtml(photoSrc(value));
+function releaseSecurePhotoImage(image) {
+  if (!image) return;
+  image._securePhotoController?.abort();
+  image._securePhotoController = null;
+  if (image?._securePhotoObjectUrl) URL.revokeObjectURL(image._securePhotoObjectUrl);
+  image._securePhotoObjectUrl = "";
+}
+
+function releaseSecurePhotoImages(root = app) {
+  if (!root) return;
+  const images = [
+    ...(root.matches?.("img[data-secure-photo-ref]") ? [root] : []),
+    ...root.querySelectorAll("img[data-secure-photo-ref]")
+  ];
+  images.forEach(releaseSecurePhotoImage);
+}
+
+async function hydrateSecurePhotoImage(image) {
+  const ref = String(image?.dataset?.securePhotoRef || "");
+  if (!ref || image.dataset.securePhotoState === "loading" || image.dataset.securePhotoState === "loaded") return;
+  const controller = new AbortController();
+  image._securePhotoController = controller;
+  image.dataset.securePhotoState = "loading";
+  try {
+    const response = await fetch(`/api/photo-upload/preview?ref=${encodeURIComponent(ref)}`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      cache: "no-store",
+      credentials: "same-origin",
+      signal: controller.signal
+    });
+    if (!response.ok) throw new Error(`Photo preview failed (${response.status})`);
+    const objectUrl = URL.createObjectURL(await response.blob());
+    if (!image.isConnected || image.dataset.securePhotoRef !== ref || controller.signal.aborted) {
+      URL.revokeObjectURL(objectUrl);
+      return;
+    }
+    image._securePhotoObjectUrl = objectUrl;
+    image.dataset.securePhotoState = "loaded";
+    const release = () => releaseSecurePhotoImage(image);
+    image.addEventListener("load", release, { once: true });
+    image.addEventListener("error", release, { once: true });
+    image.src = objectUrl;
+  } catch (error) {
+    if (error.name !== "AbortError") {
+      image.dataset.securePhotoState = "error";
+      image.title = error.message;
+    }
+  } finally {
+    if (image._securePhotoController === controller) image._securePhotoController = null;
+  }
+}
+
+function hydrateSecurePhotoImages(root = app) {
+  root?.querySelectorAll("img[data-secure-photo-ref]").forEach((image) => {
+    hydrateSecurePhotoImage(image);
+  });
 }
 
 function saveAuditFilters() {
@@ -347,24 +511,27 @@ function renderAuditSelectOptions(values, selectedValue, allLabel) {
 function openPhotoLightbox(photoRef, label = "Photo preview") {
   const ref = String(photoRef || "");
   if (!ref) return;
-  const existing = document.querySelector(".photo-lightbox");
-  if (existing) existing.remove();
+  closePhotoLightbox();
   const modal = document.createElement("div");
   modal.className = "photo-lightbox";
   modal.innerHTML = `
     <div class="photo-lightbox-panel" role="dialog" aria-modal="true" aria-label="${escapeHtml(label)}">
       <button class="photo-lightbox-close" data-action="close-photo-lightbox" type="button">×</button>
-      <img src="${photoImgSrc(ref)}" alt="${escapeHtml(label)}" />
+      <img ${photoImgAttributes(ref)} alt="${escapeHtml(label)}" />
     </div>
   `;
   modal.addEventListener("click", (event) => {
     if (event.target === modal || event.target.closest("[data-action='close-photo-lightbox']")) closePhotoLightbox();
   });
   document.body.appendChild(modal);
+  hydrateSecurePhotoImages(modal);
 }
 
 function closePhotoLightbox() {
-  document.querySelector(".photo-lightbox")?.remove();
+  const modal = document.querySelector(".photo-lightbox");
+  if (!modal) return;
+  releaseSecurePhotoImages(modal);
+  modal.remove();
 }
 
 function envFileLabel(file) {
@@ -402,6 +569,535 @@ async function pollSyncStatus() {
   }
 }
 
+function scmReconciliationBoolean(value, fallback = false) {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value === "string") return ["1", "true", "yes", "on", "enabled"].includes(value.trim().toLowerCase());
+  return Boolean(value);
+}
+
+function normalizeScmReconciliationOrderRefs(value) {
+  const values = Array.isArray(value) ? value : [value];
+  return [...new Set(values
+    .flatMap((entry) => String(entry || "").split(/[,\r\n]+/))
+    .map((entry) => entry.trim().toUpperCase())
+    .filter(Boolean))];
+}
+
+function scmReconciliationOrderRefsPreview(orderRefs = [], limit = 4) {
+  const refs = normalizeScmReconciliationOrderRefs(orderRefs);
+  if (!refs.length) return "";
+  const visible = refs.slice(0, Math.max(1, Number(limit) || 4));
+  return `${visible.join(", ")}${refs.length > visible.length ? ` +${refs.length - visible.length} more` : ""}`;
+}
+
+function normalizeScmReconciliationSettings(payload) {
+  const settings = payload?.settings && typeof payload.settings === "object" ? payload.settings : (payload || {});
+  return {
+    ...SCM_RECONCILIATION_DEFAULT_SETTINGS,
+    ...settings,
+    nightlyEnabled: scmReconciliationBoolean(
+      firstDefined(settings, ["nightlyEnabled", "nightly_enabled"], SCM_RECONCILIATION_DEFAULT_SETTINGS.nightlyEnabled),
+      SCM_RECONCILIATION_DEFAULT_SETTINGS.nightlyEnabled
+    ),
+    nightlyTime: String(firstDefined(settings, ["nightlyTime", "nightly_time"], SCM_RECONCILIATION_DEFAULT_SETTINGS.nightlyTime)),
+    timeZone: String(firstDefined(settings, ["timeZone", "timezone", "time_zone"], SCM_RECONCILIATION_TIME_ZONE)),
+    initialBackfillSince: String(firstDefined(
+      settings,
+      [
+        "initialBackfillSince",
+        "initial_backfill_since",
+        "initialBackfillModifiedSince",
+        "initial_backfill_modified_since"
+      ],
+      SCM_RECONCILIATION_DEFAULT_SETTINGS.initialBackfillSince
+    )),
+    initialDryRunApproved: scmReconciliationBoolean(firstDefined(settings, [
+      "initialDryRunApproved",
+      "initial_dry_run_approved",
+      "initialDryRunApplied",
+      "initial_dry_run_applied"
+    ], false))
+  };
+}
+
+function normalizeScmReconciliationRuns(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload?.runs)) return payload.runs;
+  if (Array.isArray(payload?.items)) return payload.items;
+  return [];
+}
+
+function scmReconciliationRunStatus(run) {
+  return String(firstDefined(run, ["status", "runStatus", "run_status"], "unknown"))
+    .trim()
+    .toLowerCase()
+    .replaceAll(" ", "_")
+    .replaceAll("-", "_");
+}
+
+function scmReconciliationRunIsActive(run) {
+  return ["queued", "waiting", "running", "processing", "applying"].includes(scmReconciliationRunStatus(run));
+}
+
+function scmReconciliationRunCanResume(run) {
+  const explicit = firstDefined(run, ["resumeAllowed", "resume_allowed"], undefined);
+  if (explicit !== undefined) return scmReconciliationBoolean(explicit);
+  return scmReconciliationRunStatus(run) === "interrupted";
+}
+
+function scmReconciliationRunStopRequested(run) {
+  return Boolean(firstDefined(run, [
+    "cancelRequestedAt",
+    "cancel_requested_at",
+    "stopRequestedAt",
+    "stop_requested_at"
+  ], ""));
+}
+
+function setScmReconciliationSelectedRunId(runId) {
+  scmReconciliationSelectedRunId = String(runId || "").trim();
+  if (scmReconciliationSelectedRunId) {
+    localStorage.setItem(SCM_RECONCILIATION_SELECTED_RUN_KEY, scmReconciliationSelectedRunId);
+  } else {
+    localStorage.removeItem(SCM_RECONCILIATION_SELECTED_RUN_KEY);
+  }
+  return scmReconciliationSelectedRunId;
+}
+
+function ensureScmReconciliationSelectedRun() {
+  const selectedExists = scmReconciliationRuns.some((run) =>
+    scmReconciliationRunId(run) === scmReconciliationSelectedRunId);
+  if (selectedExists) return scmReconciliationSelectedRunId;
+  return setScmReconciliationSelectedRunId(
+    scmReconciliationRunId(scmReconciliationRuns[0] || {})
+  );
+}
+
+function clearScmReconciliationPoll() {
+  clearTimeout(scmReconciliationPollTimer);
+  scmReconciliationPollTimer = null;
+}
+
+function scheduleScmReconciliationPoll() {
+  clearScmReconciliationPoll();
+  if (
+    !IS_ADMIN_PAGE
+    || !operator
+    || activeSection !== "reconciliation"
+    || !scmReconciliationRuns.some(scmReconciliationRunIsActive)
+  ) return;
+  scmReconciliationPollTimer = setTimeout(pollScmReconciliationRuns, 4000);
+}
+
+async function pollScmReconciliationRuns() {
+  if (!operator) return;
+  const previousSelectedRun = scmReconciliationRuns.find((run) =>
+    scmReconciliationRunId(run) === scmReconciliationSelectedRunId);
+  const previousSelectedWasActive = scmReconciliationRunIsActive(previousSelectedRun || {});
+  try {
+    const payload = await request("/api/control/scm-reconciliation/runs");
+    scmReconciliationRuns = normalizeScmReconciliationRuns(payload);
+    const selectedRunId = ensureScmReconciliationSelectedRun();
+    const selectedRun = scmReconciliationRuns.find((run) =>
+      scmReconciliationRunId(run) === selectedRunId);
+    const selectedBecameTerminal = previousSelectedWasActive
+      && selectedRun
+      && !scmReconciliationRunIsActive(selectedRun);
+    scmReconciliationLoadError = "";
+    if (activeSection === "reconciliation") {
+      if (selectedBecameTerminal) scmReconciliationRunDetails.delete(selectedRunId);
+      if (selectedRunId && !scmReconciliationRunDetails.has(selectedRunId)) {
+        await loadScmReconciliationRunDetails(selectedRunId);
+      } else {
+        render();
+      }
+    }
+  } catch (error) {
+    scmReconciliationLoadError = error.message;
+    if (activeSection === "reconciliation") render();
+  } finally {
+    scheduleScmReconciliationPoll();
+  }
+}
+
+async function loadScmReconciliationControl() {
+  const [settingsResult, runsResult] = await Promise.allSettled([
+    request("/api/control/scm-reconciliation/settings"),
+    request("/api/control/scm-reconciliation/runs")
+  ]);
+  const errors = [];
+  if (settingsResult.status === "fulfilled") {
+    scmReconciliationSettings = normalizeScmReconciliationSettings(settingsResult.value);
+    scmReconciliationSettingsLoaded = true;
+  } else {
+    scmReconciliationSettingsLoaded = false;
+    errors.push(settingsResult.reason?.message || "Settings could not be loaded.");
+  }
+  if (runsResult.status === "fulfilled") {
+    scmReconciliationRuns = normalizeScmReconciliationRuns(runsResult.value);
+    ensureScmReconciliationSelectedRun();
+  } else {
+    errors.push(runsResult.reason?.message || "Run history could not be loaded.");
+  }
+  scmReconciliationLoadError = [...new Set(errors)].join(" ");
+  if (
+    activeSection === "reconciliation"
+    && scmReconciliationSelectedRunId
+    && !scmReconciliationRunDetails.has(scmReconciliationSelectedRunId)
+  ) {
+    await loadScmReconciliationRunDetails(scmReconciliationSelectedRunId);
+  }
+}
+
+async function loadScmReconciliationRunDetails(runId, { append = false } = {}) {
+  const id = String(runId || "").trim();
+  if (!id) throw new Error("This reconciliation run is unavailable.");
+  const existing = scmReconciliationRunDetails.get(id) || {
+    loading: false,
+    targets: [],
+    targetCount: 0,
+    hasMore: false,
+    error: ""
+  };
+  const offset = append ? existing.targets.length : 0;
+  scmReconciliationRunDetails.set(id, {
+    ...existing,
+    loading: true,
+    error: ""
+  });
+  render();
+  try {
+    const payload = await request(
+      `/api/scm/reconciliation/runs/${encodeURIComponent(id)}?limit=100&offset=${offset}`
+    );
+    const incoming = Array.isArray(payload?.targets) ? payload.targets : [];
+    const targets = append
+      ? [...existing.targets, ...incoming].filter((target, index, all) =>
+          all.findIndex((candidate) => String(candidate.id) === String(target.id)) === index)
+      : incoming;
+    scmReconciliationRunDetails.set(id, {
+      loading: false,
+      targets,
+      targetCount: Number(payload?.targetCount || targets.length),
+      hasMore: payload?.hasMore === true,
+      error: ""
+    });
+    if (payload?.run) {
+      scmReconciliationRuns = scmReconciliationRuns.map((run) =>
+        scmReconciliationRunId(run) === id ? payload.run : run);
+    }
+  } catch (error) {
+    scmReconciliationRunDetails.set(id, {
+      ...existing,
+      loading: false,
+      error: error.message
+    });
+  }
+  render();
+}
+
+async function selectScmReconciliationRun(runId) {
+  const id = String(runId || "").trim();
+  if (!id) return;
+  if (!scmReconciliationRuns.some((run) => scmReconciliationRunId(run) === id)) return;
+  setScmReconciliationSelectedRunId(id);
+  render();
+  if (!scmReconciliationRunDetails.has(id)) {
+    await loadScmReconciliationRunDetails(id);
+  }
+}
+
+async function saveScmReconciliationSettings(form) {
+  if (!scmReconciliationSettingsLoaded) {
+    throw new Error("Reconciliation settings are not loaded. Refresh before saving.");
+  }
+  const nightlyEnabled = Boolean(form.elements.nightlyEnabled?.checked);
+  const nightlyTime = String(form.elements.nightlyTime?.value || "").trim();
+  const timeZone = String(form.elements.timeZone?.value || SCM_RECONCILIATION_TIME_ZONE).trim();
+  const initialBackfillSince = String(form.elements.initialBackfillSince?.value || "").trim();
+  if (!/^\d{2}:\d{2}$/.test(nightlyTime)) throw new Error("Enter a valid nightly start time.");
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(initialBackfillSince)) throw new Error("Enter a valid initial backfill date.");
+  scmReconciliationBusy = true;
+  render();
+  try {
+    const payload = await request("/api/control/scm-reconciliation/settings", {
+      method: "PUT",
+      body: JSON.stringify({
+        nightlyEnabled,
+        nightlyTime,
+        timeZone,
+        initialBackfillSince,
+        initialBackfillModifiedSince: initialBackfillSince
+      })
+    });
+    scmReconciliationSettings = normalizeScmReconciliationSettings(payload);
+    scmReconciliationSettingsLoaded = true;
+    scmReconciliationLoadError = "";
+    alert("PO / TO reconciliation settings saved.");
+  } finally {
+    scmReconciliationBusy = false;
+    render();
+  }
+}
+
+async function startScmReconciliationRun(form) {
+  const scope = String(form.elements.scope?.value || "all");
+  if (!["all", "PO", "TO", "order_family"].includes(scope)) throw new Error("Choose a valid reconciliation scope.");
+  const orderKind = String(form.elements.orderKind?.value || scmReconciliationOrderKind || "PO").toUpperCase();
+  const orderRefs = normalizeScmReconciliationOrderRefs(form.elements.orderRefs?.value || "");
+  if (scope === "order_family" && !["PO", "TO"].includes(orderKind)) throw new Error("Choose PO or TO for the targeted order families.");
+  if (scope === "order_family" && !orderRefs.length) throw new Error("Enter at least one source PO or TO reference.");
+  const includeTerminalOrders = scope !== "order_family"
+    && Boolean(form.elements.includeTerminalOrders?.checked);
+  const forceInitialDryRun = scope === "all" && !scmReconciliationInitialApproved();
+  const dryRun = forceInitialDryRun || Boolean(form.elements.dryRun?.checked);
+  const targetSummary = scope === "order_family"
+    ? `${orderRefs.length.toLocaleString()} ${orderKind} source order${orderRefs.length === 1 ? "" : "s"} (${scmReconciliationOrderRefsPreview(orderRefs)})`
+    : scope === "all"
+      ? "all PO / TO"
+      : `${scope} orders`;
+  if (!dryRun && !confirm(
+    `Apply ${targetSummary} reconciliation changes immediately?`
+    + `${includeTerminalOrders ? " This broad run includes locally terminal or skipped orders." : ""}`
+    + ` Conflicts will still go to Reconcile Review.`
+  )) return;
+  const body = { scope, dryRun, includeTerminalOrders };
+  if (scope === "order_family") {
+    body.orderKind = orderKind;
+    body.orderRefs = orderRefs;
+    body.orderRef = orderRefs.join(", ");
+  }
+  scmReconciliationScope = scope;
+  scmReconciliationOrderKind = orderKind;
+  scmReconciliationOrderRef = orderRefs.join("\n");
+  scmReconciliationIncludeTerminalOrders = includeTerminalOrders;
+  scmReconciliationDryRun = dryRun;
+  scmReconciliationBusy = true;
+  render();
+  try {
+    const payload = await request("/api/control/scm-reconciliation/run", {
+      method: "POST",
+      body: JSON.stringify(body)
+    });
+    const run = payload?.run || payload;
+    if (run && typeof run === "object" && scmReconciliationRunId(run)) {
+      const runId = scmReconciliationRunId(run);
+      scmReconciliationRuns = [
+        run,
+        ...scmReconciliationRuns.filter((item) => scmReconciliationRunId(item) !== runId)
+      ];
+      setScmReconciliationSelectedRunId(runId);
+      scmReconciliationRunDetails.delete(runId);
+      if (activeSection === "reconciliation") {
+        await loadScmReconciliationRunDetails(runId);
+      }
+    } else {
+      const runsPayload = await request("/api/control/scm-reconciliation/runs");
+      scmReconciliationRuns = normalizeScmReconciliationRuns(runsPayload);
+      ensureScmReconciliationSelectedRun();
+    }
+    scmReconciliationLoadError = "";
+    alert(`${dryRun ? "Dry run" : "Reconciliation"} started.`);
+  } finally {
+    scmReconciliationBusy = false;
+    render();
+  }
+}
+
+function scmReconciliationTargetDecisionKey(runId, targetId) {
+  return `${String(runId || "")}:${String(targetId || "")}`;
+}
+
+function scmReconciliationTargetDecisionControlId(runId, targetId) {
+  return `scm-reconciliation-decision-${String(runId || "")}-${String(targetId || "")}`;
+}
+
+function updateScmReconciliationTargetDecisionDraft(container) {
+  if (!container) return null;
+  const runId = String(container.dataset.runId || "");
+  const targetId = String(container.dataset.targetId || "");
+  if (!runId || !targetId) return null;
+  const draft = {
+    decision: String(container.querySelector("[data-review-decision]")?.value || ""),
+    note: String(container.querySelector("[data-review-decision-note]")?.value || "")
+  };
+  scmReconciliationDecisionDrafts.set(
+    scmReconciliationTargetDecisionKey(runId, targetId),
+    draft
+  );
+  return draft;
+}
+
+async function saveScmReconciliationTargetDecision(button) {
+  const runId = String(button.dataset.runId || "");
+  const targetId = String(button.dataset.targetId || "");
+  const container = button.closest("[data-reconciliation-target-decision]");
+  const draft = updateScmReconciliationTargetDecisionDraft(container) || {};
+  const decision = String(draft.decision || "");
+  const note = String(draft.note || "").trim();
+  const decisionKey = scmReconciliationTargetDecisionKey(runId, targetId);
+  const restoreSaveFocus = document.activeElement === button;
+  if (!runId || !targetId) throw new Error("This reviewed order is unavailable. Refresh and try again.");
+  if (scmReconciliationDecisionBusyTargets.has(decisionKey)) return;
+  if (!["accept_current", "skip", "keep_review"].includes(decision)) {
+    throw new Error("Choose an action for this reviewed order.");
+  }
+  if (["accept_current", "skip"].includes(decision) && !note) {
+    throw new Error("Enter an audit note before accepting or skipping this order.");
+  }
+  scmReconciliationDecisionBusyTargets.add(decisionKey);
+  render();
+  try {
+    const payload = await request(
+      `/api/control/scm-reconciliation/runs/${encodeURIComponent(runId)}`
+        + `/targets/${encodeURIComponent(targetId)}/decision`,
+      {
+        method: "PUT",
+        body: JSON.stringify({
+          decision,
+          note,
+          expectedUpdatedAt: button.dataset.targetUpdatedAt || ""
+        })
+      }
+    );
+    const detail = scmReconciliationRunDetails.get(runId);
+    if (detail && payload?.target) {
+      scmReconciliationRunDetails.set(runId, {
+        ...detail,
+        targets: detail.targets.map((target) =>
+          String(target.id) === targetId ? payload.target : target)
+      });
+    }
+    if (payload?.decisionSummary) {
+      scmReconciliationRuns = scmReconciliationRuns.map((run) =>
+        scmReconciliationRunId(run) === runId
+          ? { ...run, reviewDecisionSummary: payload.decisionSummary }
+          : run);
+    }
+    scmReconciliationDecisionDrafts.delete(decisionKey);
+  } finally {
+    scmReconciliationDecisionBusyTargets.delete(decisionKey);
+    render();
+    if (
+      restoreSaveFocus
+      && (!document.activeElement || document.activeElement === document.body)
+    ) {
+      document
+        .getElementById(`${scmReconciliationTargetDecisionControlId(runId, targetId)}-save`)
+        ?.focus({ preventScroll: true });
+    }
+  }
+}
+
+async function applyScmReconciliationRun(runId) {
+  const run = scmReconciliationRuns.find((item) => scmReconciliationRunId(item) === String(runId));
+  if (!run) throw new Error("This reconciliation run is no longer available. Refresh and try again.");
+  if (!scmReconciliationRunCanApply(run)) throw new Error("This dry run is not ready to apply.");
+  const pendingDecisions = scmReconciliationRunPendingDecisions(run);
+  if (pendingDecisions > 0) {
+    throw new Error(
+      `Choose an action for all reviewed orders before applying.`
+      + ` ${pendingDecisions.toLocaleString()} decision(s) remain.`
+    );
+  }
+  if (scmReconciliationRuns.some(scmReconciliationRunIsActive)) {
+    throw new Error("Wait for the active reconciliation run to finish before applying a dry run.");
+  }
+  const scope = String(firstDefined(run, ["scope"], "all")).toUpperCase();
+  const decisions = scmReconciliationRunDecisionSummary(run);
+  const reviewOrders = scmReconciliationRunReviewCount(run);
+  if (!confirm(
+    `Apply the ${scope} scope proposed by dry run #${runId}?\n\n`
+    + `This starts a fresh live reconciliation against current NetSuite data; it does not write the stored snapshot directly.`
+    + `${reviewOrders ? ` The dry run found ${reviewOrders.toLocaleString()} conflict order(s).` : ""}`
+    + `${Number(decisions.acceptedTargets || 0) ? ` ${Number(decisions.acceptedTargets).toLocaleString()} NetSuite outcome(s) will be accepted only if their evidence is unchanged.` : ""}`
+    + `${Number(decisions.skippedTargets || 0) ? ` ${Number(decisions.skippedTargets).toLocaleString()} order(s) will be skipped.` : ""}`
+    + `${Number(decisions.keptReviewTargets || 0) ? ` ${Number(decisions.keptReviewTargets).toLocaleString()} order(s) will remain in Review if their conflict is confirmed.` : ""}`
+    + `\n\nThis updates only the local PO / TO schedule and never writes back to NetSuite.`
+  )) return;
+  scmReconciliationBusy = true;
+  render();
+  try {
+    const payload = await request(`/api/control/scm-reconciliation/runs/${encodeURIComponent(runId)}/apply`, {
+      method: "POST",
+      body: "{}"
+    });
+    await loadScmReconciliationControl();
+    if (payload?.pending === true) {
+      alert(`Applying reconciliation run #${runId}. Progress will update in the run history.`);
+    } else {
+      alert(`Reconciliation run #${runId} was applied.`);
+    }
+  } finally {
+    scmReconciliationBusy = false;
+    render();
+  }
+}
+
+async function stopScmReconciliationRun(runId) {
+  const id = String(runId || "").trim();
+  const run = scmReconciliationRuns.find((item) => scmReconciliationRunId(item) === id);
+  if (!run || !scmReconciliationRunIsActive(run)) {
+    throw new Error("This reconciliation run is no longer active. Refresh and try again.");
+  }
+  if (!confirm(
+    `Stop reconciliation run #${id}?`
+    + ` The worker will preserve its recorded progress and stop before continuing when safe.`
+  )) return;
+  scmReconciliationBusy = true;
+  render();
+  try {
+    await request(`/api/control/scm-reconciliation/runs/${encodeURIComponent(id)}/stop`, {
+      method: "POST",
+      body: "{}"
+    });
+    await loadScmReconciliationControl();
+    alert(`Stop requested for reconciliation run #${id}.`);
+  } finally {
+    scmReconciliationBusy = false;
+    render();
+  }
+}
+
+async function resumeScmReconciliationRun(runId) {
+  const id = String(runId || "").trim();
+  const run = scmReconciliationRuns.find((item) => scmReconciliationRunId(item) === id);
+  if (!run || !scmReconciliationRunCanResume(run)) {
+    throw new Error("This reconciliation run cannot be resumed. Refresh and try again.");
+  }
+  if (scmReconciliationRuns.some(scmReconciliationRunIsActive)) {
+    throw new Error("Wait for the active reconciliation run to finish before resuming this one.");
+  }
+  if (!confirm(
+    `Resume reconciliation run #${id}?`
+    + ` Completed, reviewed, and skipped orders will remain untouched.`
+    + ` Only unfinished orders will continue; the request that was in flight will be repeated.`
+  )) return;
+  scmReconciliationBusy = true;
+  render();
+  try {
+    const payload = await request(
+      `/api/control/scm-reconciliation/runs/${encodeURIComponent(id)}/resume`,
+      { method: "POST", body: "{}" }
+    );
+    const resumed = payload?.run || payload;
+    if (resumed && scmReconciliationRunId(resumed)) {
+      scmReconciliationRuns = scmReconciliationRuns.map((item) =>
+        scmReconciliationRunId(item) === id ? resumed : item);
+      setScmReconciliationSelectedRunId(id);
+      scmReconciliationRunDetails.delete(id);
+      await loadScmReconciliationRunDetails(id);
+    } else {
+      await loadScmReconciliationControl();
+    }
+    alert(`Reconciliation run #${id} is resuming from its saved order progress.`);
+  } finally {
+    scmReconciliationBusy = false;
+    render();
+    scheduleScmReconciliationPoll();
+  }
+}
+
 function clearPhotoArchivePoll() {
   clearTimeout(photoArchivePollTimer);
   photoArchivePollTimer = null;
@@ -432,7 +1128,9 @@ async function pollPhotoArchiveStatus() {
 
 function renderLogin(message = "") {
   clearSyncPoll();
+  clearScmReconciliationPoll();
   clearPhotoArchivePoll();
+  releaseSecurePhotoImages(app);
   app.innerHTML = `
     <section class="panel login">
       <h1>${IS_ADMIN_PAGE ? "MBBS Administration" : t("control.operatorControl", "MBBS Yard Control")}</h1>
@@ -493,9 +1191,30 @@ function restoreControlFocus(state) {
   }
 }
 
+function captureControlScrollPositions() {
+  return [...app.querySelectorAll("[data-control-scroll]")].map((element) => ({
+    key: element.dataset.controlScroll,
+    left: element.scrollLeft,
+    top: element.scrollTop
+  }));
+}
+
+function restoreControlScrollPositions(positions) {
+  for (const position of positions || []) {
+    const element = app.querySelector(
+      `[data-control-scroll="${controlCssAttr(position.key)}"]`
+    );
+    if (!element) continue;
+    element.scrollLeft = position.left;
+    element.scrollTop = position.top;
+  }
+}
+
 function render() {
   if (!operator) return renderLogin();
   const focusState = captureControlFocus();
+  const scrollPositions = captureControlScrollPositions();
+  releaseSecurePhotoImages(app);
   app.innerHTML = `
     <section class="shell">
       <header class="topbar">
@@ -518,17 +1237,23 @@ function render() {
     </section>
   `;
   restoreControlFocus(focusState);
+  restoreControlScrollPositions(scrollPositions);
+  hydrateSecurePhotoImages(app);
   schedulePhotoArchivePoll();
   scheduleSyncPoll();
+  scheduleScmReconciliationPoll();
 }
 
 function renderActiveSection() {
   activeSection = normalizedSection(activeSection);
   if (activeSection === "operators") return renderOperatorsSection();
+  if (activeSection === "returns") return renderReturnManagementSection();
+  if (activeSection === "return-automation") return renderReturnAutomationSection();
   if (activeSection === "locks") return renderLocksSection();
   if (activeSection === "classification") return renderClassificationSection();
   if (activeSection === "vendor-mapping") return renderVendorMappingSection();
   if (activeSection === "storage") return renderStorageSection();
+  if (activeSection === "reconciliation") return renderScmReconciliationSection();
   if (activeSection === "sync") return renderSyncSection();
   if (activeSection === "warnings") return renderWarningsSection();
   if (activeSection === "loaded-export") return renderLoadedExportSection();
@@ -541,6 +1266,9 @@ function renderActiveSection() {
 function renderDashboardSection() {
   if (IS_ADMIN_PAGE) {
     const activeOperators = operators.filter((item) => item.active).length;
+    const automationYards = adminReturnSettings.filter((yard) =>
+      yard.autoCreateStockReturnAuthorization || yard.autoCreatePalletCreditMemo
+    ).length;
     return `
       <div class="dashboard-grid">
         <button class="metric-card" data-action="control-section" data-section="operators" type="button">
@@ -552,6 +1280,11 @@ function renderDashboardSection() {
           <span>${t("control.netsuiteSync", "NetSuite Sync")}</span>
           <strong>${syncSettings.mode === "auto" ? t("control.auto", "Auto") : t("control.manual", "Manual")}</strong>
           <em>${syncSettings.running ? t("control.syncRunning", "sync running") : syncSettings.lastStatus || "idle"}</em>
+        </button>
+        <button class="metric-card" data-action="control-section" data-section="return-automation" type="button">
+          <span>Return Automation</span>
+          <strong>${automationYards} / ${SALES_YARD_OPTIONS.length}</strong>
+          <em>yards with at least one NetSuite automation enabled</em>
         </button>
         <button class="metric-card" onclick="location.href='/admin/printers'" type="button">
           <span>Yard Printers</span>
@@ -578,8 +1311,18 @@ function renderDashboardSection() {
   }
   const classified = classifications.filter((item) => item.product_type || item.brand || item.series).length;
   const openWarnings = recordWarnings.filter((item) => item.status === "open").length;
+  const pendingReturns = Number(
+    returnDashboardCounts.pendingApproval ?? returnDashboardCounts.pending_approval ?? 0
+  ) + Number(
+    returnDashboardCounts.partiallyPending ?? returnDashboardCounts.partially_pending ?? 0
+  );
   return `
     <div class="dashboard-grid">
+      <button class="metric-card ${pendingReturns ? "warning" : ""}" data-action="control-section" data-section="returns" type="button">
+        <span>Return Management</span>
+        <strong>${pendingReturns}</strong>
+        <em>return records awaiting approval</em>
+      </button>
       <button class="metric-card" data-action="control-section" data-section="classification" type="button">
         <span>${t("control.itemClassification", "Item Classification")}</span>
         <strong>${classified} / ${classifications.length}</strong>
@@ -625,6 +1368,546 @@ function renderDashboardSection() {
       </div>
     </section>
 `;
+}
+
+function firstDefined(object, keys, fallback = "") {
+  for (const key of keys) {
+    if (object?.[key] !== undefined && object?.[key] !== null) return object[key];
+  }
+  if (object?.payload && typeof object.payload === "object") {
+    for (const key of keys) {
+      if (object.payload[key] !== undefined && object.payload[key] !== null) return object.payload[key];
+    }
+  }
+  return fallback;
+}
+
+function returnRecordId(record) {
+  return String(firstDefined(record, ["id", "returnId", "return_id"], ""));
+}
+
+function returnReference(record) {
+  if (record?.draftId || record?.draft_id) {
+    return `Draft ${String(record.draftId || record.draft_id).slice(0, 8).toUpperCase()}`;
+  }
+  return String(firstDefined(record, [
+    "reference",
+    "returnReference",
+    "return_reference",
+    "localReference",
+    "local_reference",
+    "stockReturnReference",
+    "stock_return_reference",
+    "palletReturnReference",
+    "pallet_return_reference"
+  ], returnRecordId(record) ? `Return #${returnRecordId(record)}` : "Return"));
+}
+
+function returnStatus(record) {
+  if (record?.draftId || record?.draft_id) return "draft";
+  const syncStatus = String(firstDefined(record, ["netSuiteSyncStatus", "netsuite_sync_status"], "")).toLowerCase();
+  if (syncStatus === "failed") {
+    return returnType(record) === "pallet" ? "credit_memo_creation_failed" : "ra_creation_failed";
+  }
+  return String(firstDefined(record, ["status", "returnStatus", "return_status", "approvalStatus", "approval_status"], "unknown"))
+    .trim()
+    .toLowerCase()
+    .replaceAll(" ", "_")
+    .replaceAll("-", "_");
+}
+
+function returnType(record) {
+  const recordType = String(firstDefined(record, ["returnType", "return_type", "recordType", "record_type", "type"], "stock")).trim().toLowerCase();
+  const stockType = String(firstDefined(record, ["stockReturnType", "stock_return_type"], "")).trim().toLowerCase();
+  if (recordType.includes("pallet")) return "pallet";
+  if (recordType.includes("combined")) return stockType.includes("quality") ? "combined_quality" : "combined_normal";
+  if (stockType.includes("quality") || recordType.includes("quality")) return "quality_stock";
+  if (stockType.includes("normal") || recordType.includes("normal") || recordType.includes("good")) return "normal_stock";
+  return recordType || "stock";
+}
+
+function returnTypeLabel(record) {
+  const type = returnType(record);
+  if (type === "pallet") return "PALLET Return";
+  if (type === "quality_stock") return "Quality Stock Return";
+  if (type === "normal_stock") return "Normal Stock Return";
+  if (type === "combined_quality") return "Combined Quality Stock + PALLET Draft";
+  if (type === "combined_normal") return "Combined Normal Stock + PALLET Draft";
+  return String(type || "Stock Return").replaceAll("_", " ");
+}
+
+function returnStatusLabel(value) {
+  const clean = typeof value === "string" ? value : returnStatus(value);
+  const labels = {
+    accepted: "Accepted",
+    pending_approval: "Pending Approval",
+    partially_pending: "Partially Pending Approval",
+    partially_pending_approval: "Partially Pending Approval",
+    approved: "Approved",
+    rejected: "Rejected",
+    partially_rejected: "Partially Rejected",
+    voided: "Voided",
+    draft: "Draft",
+    ra_creation_failed: "RA Creation Failed",
+    credit_memo_creation_failed: "Credit Memo Creation Failed",
+    sync_failed: "NetSuite Sync Failed",
+    synced: "Synced",
+    linked: "Linked",
+    not_required: "Accepted"
+  };
+  return labels[clean] || String(clean || "Unknown").replaceAll("_", " ");
+}
+
+function returnStatusPill(recordOrStatus) {
+  const status = typeof recordOrStatus === "string" ? recordOrStatus : returnStatus(recordOrStatus);
+  return `<span class="return-status-pill ${escapeHtml(status)}">${escapeHtml(returnStatusLabel(status))}</span>`;
+}
+
+function returnMoney(value) {
+  if (value === null || value === undefined || value === "") return "—";
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "—";
+  return new Intl.NumberFormat("en-CA", { style: "currency", currency: "CAD" }).format(number);
+}
+
+function returnYard(record, prefix) {
+  const code = firstDefined(record, [
+    `${prefix}YardCode`,
+    `${prefix}_yard_code`,
+    `${prefix}LocationName`,
+    `${prefix}_location_name`,
+    prefix === "receiving" ? "yardCode" : "",
+    prefix === "receiving" ? "yard_code" : ""
+  ].filter(Boolean), "");
+  const id = firstDefined(record, [
+    `${prefix}YardLocationId`,
+    `${prefix}_yard_location_id`,
+    `${prefix}LocationId`,
+    `${prefix}_location_id`,
+    prefix === "receiving" ? "yardLocationId" : "",
+    prefix === "receiving" ? "yard_location_id" : ""
+  ].filter(Boolean), "");
+  return String(code || SALES_YARD_OPTIONS.find((yard) => Number(yard.locationId) === Number(id))?.yardCode || id || "—");
+}
+
+function returnPhotoRef(photo) {
+  if (typeof photo === "string") return photo;
+  return String(firstDefined(photo, [
+    "photoDataUrl",
+    "photo_data_url",
+    "reference",
+    "photoReference",
+    "photo_reference",
+    "storageRef",
+    "storage_ref",
+    "objectRef",
+    "object_ref",
+    "url"
+  ], ""));
+}
+
+function returnLines(detail = returnDetail) {
+  return detail?.lines || detail?.returnLines || detail?.return_lines || detail?.return?.lines || detail?.payload?.lines || [];
+}
+
+function returnPhotos(detail = returnDetail) {
+  const header = returnHeader(detail);
+  if (returnStatus(header) === "draft") {
+    return [
+      ...(detail?.photos || []),
+      ...(detail?.palletPhotos || detail?.pallet_photos || []),
+      ...(detail?.payload?.photos || []),
+      ...(detail?.payload?.palletPhotos || detail?.payload?.pallet_photos || [])
+    ].filter((photo, index, all) =>
+      all.findIndex((candidate) => returnPhotoRef(candidate) === returnPhotoRef(photo)) === index);
+  }
+  return detail?.photos
+    || detail?.returnPhotos
+    || detail?.return_photos
+    || detail?.return?.photos
+    || [...(detail?.payload?.photos || []), ...(detail?.payload?.palletPhotos || [])];
+}
+
+function returnLinks(detail = returnDetail) {
+  const header = returnHeader(detail);
+  const links = [...(detail?.netSuiteLinks || detail?.netsuiteLinks || detail?.net_suite_links || detail?.links || [])];
+  const transactionId = firstDefined(header, ["netSuiteTransactionId", "netsuite_transaction_id"], "");
+  const transactionRef = firstDefined(header, ["netSuiteTransactionRef", "netsuite_transaction_ref"], "");
+  if ((transactionId || transactionRef) && !links.some((link) =>
+    String(firstDefined(link, ["netsuiteId", "netsuite_id", "internalId", "internal_id"], "")) === String(transactionId))) {
+    links.push({
+      transactionType: firstDefined(header, ["netSuiteStage", "netsuite_stage"], "transaction"),
+      netsuiteId: transactionId,
+      netsuiteTranid: transactionRef,
+      status: firstDefined(header, ["netSuiteTransactionStatus", "netsuite_transaction_status"], "")
+    });
+  }
+  const snapshot = header.netSuiteSnapshot || header.netsuite_snapshot || detail?.netSuiteSnapshot || detail?.netsuite_snapshot || {};
+  for (const credit of snapshot.creditMemos || snapshot.credit_memos || []) {
+    const id = credit.id || credit.internalId || credit.internal_id || "";
+    if (links.some((link) =>
+      String(firstDefined(link, ["netsuiteId", "netsuite_id", "internalId", "internal_id"], "")) === String(id))) continue;
+    links.push({
+      transactionType: "credit_memo",
+      netsuiteId: id,
+      netsuiteTranid: credit.tranid || credit.tranId || "",
+      status: credit.statusText || credit.status_text || credit.status || ""
+    });
+  }
+  return links;
+}
+
+function returnHeader(detail = returnDetail) {
+  const header = detail?.return || detail?.record || detail?.header || detail || {};
+  if (header?.draftId || header?.draft_id) {
+    return {
+      ...(header.payload || {}),
+      ...header,
+      status: "draft"
+    };
+  }
+  return header;
+}
+
+function saveReturnFilters() {
+  localStorage.setItem("mbbs.control.returns.search", returnFilters.search || "");
+  localStorage.setItem("mbbs.control.returns.status", returnFilters.status || "");
+  localStorage.setItem("mbbs.control.returns.type", returnFilters.type || "");
+  localStorage.setItem("mbbs.control.returns.yard", returnFilters.yardLocationId || "");
+  localStorage.setItem("mbbs.control.returns.from", returnFilters.from || "");
+  localStorage.setItem("mbbs.control.returns.to", returnFilters.to || "");
+}
+
+function returnListQuery() {
+  const params = new URLSearchParams({
+    limit: String(RETURN_RECORD_PAGE_SIZE),
+    offset: String(returnRecordOffset)
+  });
+  for (const [key, value] of Object.entries(returnFilters)) {
+    if (String(value || "").trim()) params.set(key, String(value).trim());
+  }
+  return params;
+}
+
+function renderReturnPhotoGrid(photos, emptyLabel = "No photos attached") {
+  const visible = (photos || []).filter((photo) => returnPhotoRef(photo));
+  if (!visible.length) return `<div class="return-empty-photo">${escapeHtml(emptyLabel)}</div>`;
+  return `<div class="return-photo-grid">${visible.map((photo, index) => {
+    const ref = returnPhotoRef(photo);
+    const label = firstDefined(photo, ["label", "caption", "kind", "photoKind", "photo_kind", "photoType", "photo_type"], `Return photo ${index + 1}`);
+    return `<figure>
+      <button class="photo-thumb-button" data-action="open-photo-lightbox" data-photo-ref="${escapeHtml(ref)}" data-photo-label="${escapeHtml(label)}" type="button">
+        <img ${photoImgAttributes(ref)} alt="${escapeHtml(label)}" />
+      </button>
+      <figcaption>${escapeHtml(label)}${firstDefined(photo, ["createdAt", "created_at"], "") ? `<br>${formatDate(firstDefined(photo, ["createdAt", "created_at"]))}` : ""}</figcaption>
+    </figure>`;
+  }).join("")}</div>`;
+}
+
+function renderReturnRecordList() {
+  if (returnLoadError) {
+    return `<div class="notice sync-error"><strong>Return records could not be loaded</strong><span>${escapeHtml(returnLoadError)}</span></div>`;
+  }
+  if (!returnRecords.length) {
+    return `<div class="return-empty"><strong>No return records</strong><span>No submitted return matches the selected filters.</span></div>`;
+  }
+  const cards = returnRecords.map((record) => {
+    const id = returnRecordId(record);
+    const sourceOrder = firstDefined(record, ["sourceSalesOrderRef", "source_sales_order_ref", "sourceOrderTranid", "source_order_tranid", "salesOrderTranid", "sales_order_tranid"], "");
+    const customer = firstDefined(record, ["customerName", "customer_name", "customerCode", "customer_code"], "");
+    const submittedAt = firstDefined(record, ["submittedAt", "submitted_at", "createdAt", "created_at"], "");
+    const batch = firstDefined(record, ["batchReference", "batch_reference"], "");
+    return `<button class="return-list-card ${id === String(selectedReturnId) ? "active" : ""}" data-action="select-return-record" data-id="${escapeHtml(id)}" type="button">
+      <span class="return-card-head"><strong>${escapeHtml(returnReference(record))}</strong>${returnStatusPill(record)}</span>
+      <span>${escapeHtml(returnTypeLabel(record))}${batch ? ` · ${escapeHtml(batch)}` : ""}</span>
+      <span>${escapeHtml([sourceOrder, customer].filter(Boolean).join(" · ") || "Customer-level return")}</span>
+      <small>${escapeHtml(returnYard(record, "receiving"))} · ${formatDate(submittedAt)}</small>
+    </button>`;
+  }).join("");
+  const total = Number(returnCounts.total);
+  const hasNext = Number.isFinite(total)
+    ? returnRecordOffset + returnRecords.length < total
+    : returnRecords.length === RETURN_RECORD_PAGE_SIZE;
+  return `${cards}
+    <div class="pagination-row">
+      <button data-action="return-page-prev" ${returnRecordOffset <= 0 ? "disabled" : ""} type="button">Previous</button>
+      <span>${returnRecordOffset + 1}–${returnRecordOffset + returnRecords.length}${Number.isFinite(total) ? ` of ${total}` : ""}</span>
+      <button data-action="return-page-next" ${hasNext ? "" : "disabled"} type="button">Next</button>
+    </div>`;
+}
+
+function renderReturnLineDecisionActions(line) {
+  if (returnStatus(returnHeader()) === "draft") return "";
+  const status = returnStatus(line);
+  const policy = String(firstDefined(line, [
+    "returnPolicyEffective",
+    "return_policy_effective",
+    "policySnapshot",
+    "policy_snapshot"
+  ], "")).toLowerCase();
+  const needsDecision = ["pending", "pending_approval", "approval_required"].includes(status)
+    || (policy.includes("approval") && !["approved", "accepted", "rejected", "voided"].includes(status));
+  if (!needsDecision) return "";
+  const lineId = String(firstDefined(line, ["id", "lineId", "line_id"], ""));
+  if (!lineId) return "";
+  return `<div class="return-line-actions">
+    <button class="primary" data-action="decide-return-line" data-decision="approved" data-line-id="${escapeHtml(lineId)}" type="button">Approve</button>
+    <button class="danger" data-action="decide-return-line" data-decision="rejected" data-line-id="${escapeHtml(lineId)}" type="button">Reject</button>
+  </div>`;
+}
+
+function renderReturnLine(line, index) {
+  const item = firstDefined(line, ["itemName", "item_name", "sku", "itemId", "item_id"], `Line ${index + 1}`);
+  const description = firstDefined(line, ["description", "itemDescription", "item_description"], "");
+  const salesQuantity = firstDefined(line, ["returnedSalesQuantity", "returned_sales_quantity", "salesQuantity", "sales_quantity", "quantity"], "");
+  const salesUom = firstDefined(line, ["salesUom", "sales_uom", "uom"], "");
+  const physical = [
+    ["PLT", firstDefined(line, ["pallets", "returnedPallets", "returned_pallets", "palletQuantity", "pallet_quantity", "plt"], 0)],
+    ["LYR", firstDefined(line, ["layers", "returnedLayers", "returned_layers", "layerQuantity", "layer_quantity", "lyr"], 0)],
+    ["SEC", firstDefined(line, ["sections", "returnedSections", "returned_sections", "sectionQuantity", "section_quantity", "sec"], 0)],
+    ["PCS", firstDefined(line, ["pieces", "returnedPieces", "returned_pieces", "pieceQuantity", "piece_quantity", "pcs"], 0)]
+  ].filter(([, value]) => Number(value) > 0).map(([unit, value]) => `${value} ${unit}`).join(" + ");
+  const reason = firstDefined(line, ["reasonLabel", "reason_label", "reasonCodeLabel", "reason_code_label"], "");
+  const note = firstDefined(line, ["note", "reasonNote", "reason_note"], "");
+  const decisionNote = firstDefined(line, ["approvalNote", "approval_note", "decisionNote", "decision_note"], "");
+  const decidedAt = firstDefined(line, ["decidedAt", "decided_at"], "");
+  const policy = firstDefined(line, ["returnPolicyEffective", "return_policy_effective", "policySnapshot", "policy_snapshot"], "");
+  const estimatedCredit = firstDefined(line, [
+    "estimatedCreditAmount",
+    "estimated_credit_amount",
+    "estimatedCredit",
+    "estimated_credit"
+  ], null);
+  const linePhotos = line.photos || line.returnPhotos || line.return_photos || [];
+  return `<article class="return-line-card">
+    <div class="return-line-heading">
+      <div><strong>${escapeHtml(item)}</strong>${description ? `<span>${escapeHtml(description)}</span>` : ""}</div>
+      ${returnStatusPill(returnStatus(line))}
+    </div>
+    <div class="return-line-facts">
+      <span><small>Returned</small><strong>${escapeHtml(physical || `${salesQuantity} ${salesUom}`.trim() || "—")}</strong></span>
+      <span><small>Sales quantity</small><strong>${escapeHtml(`${salesQuantity} ${salesUom}`.trim() || "—")}</strong></span>
+      <span><small>Reason</small><strong>${escapeHtml(reason || "—")}</strong></span>
+      <span><small>Policy snapshot</small><strong>${escapeHtml(String(policy || "—").replaceAll("_", " "))}</strong></span>
+      <span><small>Estimated credit</small><strong>${returnMoney(estimatedCredit)}</strong></span>
+    </div>
+    ${note ? `<p class="return-note">${escapeHtml(note)}</p>` : ""}
+    ${decisionNote ? `<p class="return-note"><strong>${returnStatus(line) === "rejected" ? "Rejection reason" : "Approval note"}:</strong> ${escapeHtml(decisionNote)}${decidedAt ? ` · ${formatDate(decidedAt)}` : ""}</p>` : ""}
+    ${renderReturnPhotoGrid(linePhotos, "No line photos")}
+    ${renderReturnLineDecisionActions(line)}
+  </article>`;
+}
+
+function renderReturnLinks(links, header) {
+  const normalized = [...(links || [])];
+  const headerRa = firstDefined(header, ["netSuiteRaTranid", "netsuite_ra_tranid", "raTranid", "ra_tranid"], "");
+  const headerCm = firstDefined(header, ["netSuiteCreditMemoTranid", "netsuite_credit_memo_tranid", "creditMemoTranid", "credit_memo_tranid"], "");
+  const headerTransaction = firstDefined(header, ["netSuiteTransactionRef", "netsuite_transaction_ref"], "");
+  const headerTransactionId = firstDefined(header, ["netSuiteTransactionId", "netsuite_transaction_id"], "");
+  const headerStage = firstDefined(header, ["netSuiteStage", "netsuite_stage"], "");
+  if (headerRa && !normalized.some((link) => String(firstDefined(link, ["transactionType", "transaction_type"], "")).includes("authorization"))) {
+    normalized.push({ transactionType: "return_authorization", netsuiteTranid: headerRa });
+  }
+  if (headerCm && !normalized.some((link) => String(firstDefined(link, ["transactionType", "transaction_type"], "")).includes("credit"))) {
+    normalized.push({ transactionType: "credit_memo", netsuiteTranid: headerCm });
+  }
+  if ((headerTransaction || headerTransactionId) && !normalized.length) {
+    normalized.push({
+      transactionType: headerStage || "transaction",
+      netsuiteTranid: headerTransaction,
+      netsuiteId: headerTransactionId,
+      status: firstDefined(header, ["netSuiteTransactionStatus", "netsuite_transaction_status"], "")
+    });
+  }
+  if (!normalized.length) return `<span class="muted">No NetSuite transaction linked.</span>`;
+  return `<div class="return-link-list">${normalized.map((link) => {
+    const type = String(firstDefined(link, ["transactionType", "transaction_type", "type"], "transaction")).replaceAll("_", " ");
+    const tranid = firstDefined(link, ["netsuiteTranid", "netsuite_tranid", "tranid", "transactionNumber"], "");
+    const id = firstDefined(link, ["netsuiteId", "netsuite_id", "internalId", "internal_id"], "");
+    const status = firstDefined(link, ["status", "transactionStatus", "transaction_status"], "");
+    return `<span><strong>${escapeHtml(type)}</strong> ${escapeHtml(tranid || `Internal ID ${id}`)}${status ? ` · ${escapeHtml(status)}` : ""}</span>`;
+  }).join("")}</div>`;
+}
+
+function renderReturnDetail() {
+  if (!returnDetail) {
+    return `<div class="return-empty return-detail-empty"><strong>Select a return record</strong><span>Quantities, approval status, photos, financial estimates, and NetSuite reconciliation will appear here.</span></div>`;
+  }
+  const header = returnHeader();
+  const id = returnRecordId(header) || String(selectedReturnId);
+  const lines = returnLines();
+  const photos = returnPhotos();
+  const status = returnStatus(header);
+  const batch = firstDefined(header, ["batchReference", "batch_reference"], "");
+  const sourceOrder = firstDefined(header, ["sourceSalesOrderRef", "source_sales_order_ref", "sourceOrderTranid", "source_order_tranid", "salesOrderTranid", "sales_order_tranid"], "");
+  const customer = [
+    firstDefined(header, ["customerCode", "customer_code"], ""),
+    firstDefined(header, ["customerName", "customer_name"], "")
+  ].filter(Boolean).join(" · ");
+  const vehiclePlate = firstDefined(header, ["vehiclePlate", "vehicle_plate"], "");
+  const orderingYard = returnYard(header, "ordering");
+  const receivingYard = returnYard(header, "receiving");
+  const estimated = firstDefined(header, ["estimatedCreditAmount", "estimated_credit_amount", "estimatedCredit", "estimated_credit"], null);
+  const actual = firstDefined(header, ["actualCreditAmount", "actual_credit_amount", "actualCredit", "actual_credit"], null);
+  const submittedAt = firstDefined(header, ["submittedAt", "submitted_at", "createdAt", "created_at"], "");
+  const submittedBy = firstDefined(header, ["operatorName", "operator_name", "submittedByName", "submitted_by_name"], "");
+  const syncError = firstDefined(header, ["netSuiteSyncError", "netsuite_sync_error", "syncError", "sync_error", "netSuiteError", "netsuite_error"], "");
+  const syncStatus = String(firstDefined(header, ["netSuiteSyncStatus", "netsuite_sync_status"], "")).toLowerCase();
+  const note = firstDefined(header, ["note", "returnNote", "return_note"], "");
+  const palletQuantity = firstDefined(header, ["palletQuantity", "pallet_quantity"], null);
+  const canVoid = !["voided", "draft"].includes(status);
+  const canRetry = hasStaffAuthority(operator, ["admin"])
+    && syncStatus === "failed";
+  const isDraft = status === "draft";
+  return `<div class="return-detail">
+    <div class="return-detail-head">
+      <div>
+        <div class="return-title-row"><h3>${escapeHtml(returnReference(header))}</h3>${returnStatusPill(header)}</div>
+        <p>${escapeHtml(returnTypeLabel(header))}${batch ? ` · ${escapeHtml(batch)}` : ""}</p>
+      </div>
+      <div class="return-detail-actions">
+        ${isDraft ? `<button class="danger" data-action="discard-return-draft" data-id="${escapeHtml(id)}" type="button">Discard Draft</button>` : ""}
+        ${canRetry ? `<button data-action="retry-return-sync" data-id="${escapeHtml(id)}" type="button">Retry NetSuite Sync</button>` : ""}
+        ${canVoid ? `<button class="danger" data-action="void-return" data-id="${escapeHtml(id)}" type="button">Void Return</button>` : ""}
+      </div>
+    </div>
+    ${syncError ? `<div class="notice sync-error"><strong>NetSuite processing failed</strong><span>${escapeHtml(syncError)}</span></div>` : ""}
+    <div class="return-summary-grid">
+      <span><small>Customer</small><strong>${escapeHtml(customer || "—")}</strong></span>
+      <span><small>Sales Order</small><strong>${escapeHtml(sourceOrder || "Customer-level")}</strong></span>
+      <span><small>Ordering yard</small><strong>${escapeHtml(orderingYard)}</strong></span>
+      <span><small>Receiving yard</small><strong>${escapeHtml(receivingYard)}</strong></span>
+      <span><small>Vehicle plate</small><strong>${escapeHtml(vehiclePlate || "—")}</strong></span>
+      ${palletQuantity !== null && palletQuantity !== undefined
+        ? `<span><small>PALLET quantity</small><strong>${escapeHtml(palletQuantity)}</strong></span>`
+        : ""}
+      <span><small>Submitted</small><strong>${formatDate(submittedAt)}${submittedBy ? `<br>${escapeHtml(submittedBy)}` : ""}</strong></span>
+      <span><small>Estimated credit</small><strong>${returnMoney(estimated)}</strong></span>
+      <span><small>Actual credit</small><strong>${returnMoney(actual)}</strong></span>
+    </div>
+    ${note ? `<p class="return-note"><strong>Return note:</strong> ${escapeHtml(note)}</p>` : ""}
+    <section class="return-detail-section">
+      <div class="return-subheading"><h4>Returned lines</h4><span>${lines.length} line(s)</span></div>
+      <div class="return-line-list">${lines.map(renderReturnLine).join("") || `<div class="return-empty"><span>No stock lines are attached to this return.</span></div>`}</div>
+    </section>
+    <section class="return-detail-section">
+      <div class="return-subheading"><h4>Record photos</h4><span>${photos.length} attachment(s)</span></div>
+      ${renderReturnPhotoGrid(photos)}
+    </section>
+    <section class="return-detail-section">
+      <div class="return-subheading"><h4>NetSuite reconciliation</h4></div>
+      ${isDraft ? `<span class="muted">Drafts reserve no quantity and cannot be linked to NetSuite. Only the creating operator can resume this draft in the Operator PWA.</span>` : renderReturnLinks(returnLinks(), header)}
+      ${!isDraft && hasStaffAuthority(operator, ["admin"]) ? `
+        <form class="return-link-form" data-form="manual-return-link" data-id="${escapeHtml(id)}">
+          <label><span>Transaction type</span><select name="transactionType"><option value="return_authorization">Return Authorization</option><option value="credit_memo">Credit Memo</option></select></label>
+          <label><span>NetSuite internal ID</span><input name="netsuiteId" inputmode="numeric" required /></label>
+          <label><span>Transaction number (optional)</span><input name="netsuiteTranid" placeholder="RA123 / CM123" /></label>
+          <button class="primary" type="submit">Link Existing Transaction</button>
+        </form>
+      ` : ""}
+    </section>
+  </div>`;
+}
+
+function renderCrossYardSettings() {
+  const canEdit = hasStaffAuthority(operator, ["admin"]);
+  return `<section class="panel return-yard-settings">
+    <div class="section-heading">
+      <div>
+        <h2>Cross-yard Return Acceptance</h2>
+        <p class="muted"><strong>Allowing cross-yard stock returns for this yard means this yard accepts stock from both its own orders and orders from other yards.</strong> When disabled, stock returns must be processed at the Sales Order's ordering yard. Customer-level PALLET returns are accepted at every yard.</p>
+      </div>
+      ${returnSettingsError ? "" : `<span class="return-access-label">${canEdit ? "Admin editable" : "Admin only"}</span>`}
+    </div>
+    ${returnSettingsError ? `<div class="notice sync-error"><strong>Yard settings could not be loaded</strong><span>${escapeHtml(returnSettingsError)}</span></div>` : `
+      <div class="return-yard-grid">
+        ${controlReturnSettings.map((yard) => `<article class="return-yard-card" data-return-yard="${Number(yard.locationId)}">
+          <div><strong>${escapeHtml(yard.yardCode || yard.locationId)}</strong><span>Receiving yard</span></div>
+          <label class="return-switch">
+            <input data-return-setting="allowCrossYardReturns" type="checkbox" ${yard.allowCrossYardReturns ? "checked" : ""} ${canEdit ? "" : "disabled"} />
+            <span>${yard.allowCrossYardReturns ? "Accepting other-yard stock orders" : "Own-yard stock orders only"}</span>
+          </label>
+          ${canEdit ? `<button class="primary" data-action="save-cross-yard-setting" data-location-id="${Number(yard.locationId)}" type="button">Save</button>` : ""}
+        </article>`).join("")}
+      </div>
+    `}
+  </section>`;
+}
+
+function renderReturnManagementSection() {
+  return `${renderCrossYardSettings()}
+    <section class="panel return-management">
+      <div class="section-heading">
+        <div>
+          <h2>Return Management</h2>
+          <p class="muted">Review submitted stock and PALLET returns, decide approval-required lines, inspect photo evidence, and reconcile NetSuite transactions.</p>
+        </div>
+        <button data-action="refresh-return-records" type="button">Refresh</button>
+      </div>
+      <div class="return-record-tabs" role="tablist" aria-label="Return record state">
+        <button class="${returnFilters.status === "draft" ? "" : "active"}" data-action="set-return-view" data-status="" type="button">Submitted Returns</button>
+        <button class="${returnFilters.status === "draft" ? "active" : ""}" data-action="set-return-view" data-status="draft" type="button">Drafts</button>
+      </div>
+      <div class="return-filter-grid">
+        <label><span>Search</span><input data-return-filter="search" type="search" value="${escapeHtml(returnFilters.search)}" placeholder="SR / PR / RB / SO / customer / plate" /></label>
+        <label><span>Status</span><select data-return-filter="status">
+          <option value="">All submitted statuses</option>
+          <option value="draft" ${returnFilters.status === "draft" ? "selected" : ""}>Drafts</option>
+          ${["pending_approval", "partially_pending", "partially_rejected", "accepted", "approved", "rejected", "voided", "sync_failed", "synced"].map((status) => `<option value="${status}" ${returnFilters.status === status ? "selected" : ""}>${escapeHtml(returnStatusLabel(status))}</option>`).join("")}
+        </select></label>
+        <label><span>Return type</span><select data-return-filter="type">
+          <option value="">Stock + PALLET</option>
+          <option value="normal_stock" ${returnFilters.type === "normal_stock" ? "selected" : ""}>Normal Stock</option>
+          <option value="quality_stock" ${returnFilters.type === "quality_stock" ? "selected" : ""}>Quality Stock</option>
+          <option value="pallet" ${returnFilters.type === "pallet" ? "selected" : ""}>PALLET</option>
+        </select></label>
+        <label><span>Receiving yard</span><select data-return-filter="yardLocationId"><option value="">All authorized yards</option>${SALES_YARD_OPTIONS.map((yard) => `<option value="${yard.locationId}" ${String(returnFilters.yardLocationId) === String(yard.locationId) ? "selected" : ""}>${yard.yardCode}</option>`).join("")}</select></label>
+        <label><span>From</span><input data-return-filter="from" type="date" value="${escapeHtml(returnFilters.from)}" /></label>
+        <label><span>To</span><input data-return-filter="to" type="date" value="${escapeHtml(returnFilters.to)}" /></label>
+        <div class="return-filter-actions"><button class="primary" data-action="apply-return-filters" type="button">Apply</button><button data-action="reset-return-filters" type="button">Reset</button></div>
+      </div>
+      <div class="return-management-layout">
+        <aside class="return-list-panel">${renderReturnRecordList()}</aside>
+        <section class="return-detail-panel">${renderReturnDetail()}</section>
+      </div>
+    </section>`;
+}
+
+function renderReturnAutomationSection() {
+  return `<section class="panel return-automation">
+    <div class="section-heading">
+      <div>
+        <h2>Return NetSuite Automation</h2>
+        <p class="muted">These settings are yard-specific and default to Off. The actual receiving yard controls automation, including approved cross-yard stock returns and customer-level PALLET returns.</p>
+      </div>
+      <button data-action="refresh-return-automation" type="button">Refresh</button>
+    </div>
+    <div class="notice">
+      <strong>Safe rollout</strong>
+      <span>Stock returns create Return Authorizations. PALLET returns create Credit Memos directly at $40 per Each. Keep both settings off until that yard is ready for live NetSuite transactions.</span>
+    </div>
+    <div class="notice">
+      <strong>Current NetSuite limitation</strong>
+      <span>A Quality Return that splits one Sales Order line across multiple reason codes remains local. Link its Return Authorization manually after creating it in NetSuite; automatic creation stays fail-safe for that record.</span>
+    </div>
+    ${returnSettingsError ? `<div class="notice sync-error"><strong>Return automation settings could not be loaded</strong><span>${escapeHtml(returnSettingsError)}</span></div>` : `
+      <div class="return-automation-grid">
+        ${adminReturnSettings.map((yard) => `<article class="return-automation-card" data-return-automation-yard="${Number(yard.locationId)}">
+          <header><div><strong>${escapeHtml(yard.yardCode || yard.locationId)}</strong><span>Actual receiving yard</span></div>${yard.autoCreateStockReturnAuthorization || yard.autoCreatePalletCreditMemo ? `<span class="return-status-pill accepted">Live automation enabled</span>` : `<span class="return-status-pill draft">Automation off</span>`}</header>
+          <label class="return-toggle-row">
+            <input data-return-setting="autoCreateStockReturnAuthorization" type="checkbox" ${yard.autoCreateStockReturnAuthorization ? "checked" : ""} />
+            <span><strong>Auto-create Stock Return Authorizations</strong><small>Allowed items create immediately. Approval-required returns wait until every line is resolved.</small></span>
+          </label>
+          <label class="return-toggle-row">
+            <input data-return-setting="autoCreatePalletCreditMemo" type="checkbox" ${yard.autoCreatePalletCreditMemo ? "checked" : ""} />
+            <span><strong>Auto-create PALLET Credit Memos</strong><small>Creates a PALLET Credit Memo directly using the receiving yard and $40 per Each.</small></span>
+          </label>
+          <div class="return-setting-meta">${firstDefined(yard, ["updatedAt", "updated_at"], "") ? `Last changed ${formatDate(firstDefined(yard, ["updatedAt", "updated_at"]))}` : "Default: both Off"}</div>
+          <button class="primary" data-action="save-return-automation" data-location-id="${Number(yard.locationId)}" type="button">Save Yard Settings</button>
+        </article>`).join("")}
+      </div>
+    `}
+  </section>`;
 }
 
 function orderTypeLabel(value) {
@@ -1177,7 +2460,7 @@ function renderLoadedOrderDetail() {
         ${photos.filter((photo) => photo.photo_data_url).map((photo) => `
           <figure>
             <button class="photo-thumb-button" data-action="open-photo-lightbox" data-photo-ref="${escapeHtml(photo.photo_data_url)}" data-photo-label="${t("yard.activityPhoto", "Activity photo")} ${escapeHtml(photo.id)}" type="button">
-              <img src="${photoImgSrc(photo.photo_data_url)}" alt="${t("yard.activityPhoto", "Activity photo")} ${escapeHtml(photo.id)}" />
+              <img ${photoImgAttributes(photo.photo_data_url)} alt="${t("yard.activityPhoto", "Activity photo")} ${escapeHtml(photo.id)}" />
             </button>
             <figcaption>${formatDate(photo.created_at)}</figcaption>
           </figure>
@@ -1191,7 +2474,7 @@ function renderLoadedOrderDetail() {
           ${driverPhotos.filter((photo) => photo.photo_data_url).map((photo) => `
             <figure>
               <button class="photo-thumb-button" data-action="open-photo-lightbox" data-photo-ref="${escapeHtml(photo.photo_data_url)}" data-photo-label="${escapeHtml(photo.driver_name || photo.driver_login || t("yard.driver", "Driver"))} ${escapeHtml(photo.id)}" type="button">
-                <img src="${photoImgSrc(photo.photo_data_url)}" alt="${escapeHtml(photo.driver_name || photo.driver_login || t("yard.driver", "Driver"))} ${escapeHtml(photo.id)}" />
+                <img ${photoImgAttributes(photo.photo_data_url)} alt="${escapeHtml(photo.driver_name || photo.driver_login || t("yard.driver", "Driver"))} ${escapeHtml(photo.id)}" />
               </button>
               <figcaption>${escapeHtml([photo.driver_name || photo.driver_login, photo.truck_plate, photo.stop_type].filter(Boolean).join(" · "))}<br>${formatDate(photo.created_at)}</figcaption>
             </figure>
@@ -1280,14 +2563,701 @@ function renderTargetedOrderSyncPanel() {
   `;
 }
 
+function humanizeScmReconciliationKey(value) {
+  return String(value || "")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replaceAll("_", " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function scmReconciliationRunId(run) {
+  return String(firstDefined(run, ["id", "runId", "run_id"], ""));
+}
+
+function scmReconciliationRunIsDry(run) {
+  const explicit = firstDefined(run, ["dryRun", "dry_run", "isDryRun", "is_dry_run"], null);
+  if (explicit !== null) return scmReconciliationBoolean(explicit);
+  return scmReconciliationRunStatus(run).includes("dry_run")
+    || String(firstDefined(run, ["mode"], "")).toLowerCase().includes("dry");
+}
+
+function scmReconciliationInitialApproved() {
+  return scmReconciliationSettings.initialDryRunApproved
+    || Boolean(firstDefined(scmReconciliationSettings, [
+      "initialDryRunApprovedAt",
+      "initial_dry_run_approved_at",
+      "initialDryRunAppliedAt",
+      "initial_dry_run_applied_at"
+    ], ""));
+}
+
+function scmReconciliationRunResumeId(run) {
+  const value = Number(firstDefined(run, [
+    "resumeOfRunId",
+    "resume_of_run_id"
+  ], 0));
+  return Number.isSafeInteger(value) && value > 0 ? String(value) : "";
+}
+
+function scmReconciliationAppliedRunFor(run) {
+  const runId = scmReconciliationRunId(run);
+  if (!runId) return null;
+  return scmReconciliationRuns.find((candidate) =>
+    !scmReconciliationRunIsDry(candidate)
+    && scmReconciliationRunResumeId(candidate) === runId
+    && ["queued", "running", "succeeded"].includes(scmReconciliationRunStatus(candidate))
+  ) || null;
+}
+
+function scmReconciliationRunCanApply(run) {
+  if (!scmReconciliationRunId(run) || !scmReconciliationRunIsDry(run)) return false;
+  const scope = String(firstDefined(run, ["scope"], "")).toLowerCase();
+  const status = scmReconciliationRunStatus(run);
+  if (!["succeeded", "awaiting_approval"].includes(status)) return false;
+  if (status === "awaiting_approval" && (scope !== "all" || scmReconciliationInitialApproved())) return false;
+  if (scmReconciliationBoolean(firstDefined(run, ["applied", "isApplied", "is_applied"], false))) return false;
+  if (firstDefined(run, ["appliedAt", "applied_at", "approvedAt", "approved_at"], "")) return false;
+  return !scmReconciliationAppliedRunFor(run);
+}
+
+function scmReconciliationRunSummary(run) {
+  const summary = firstDefined(run, ["summary", "result", "results", "stats"], {});
+  if (!summary || typeof summary !== "object" || Array.isArray(summary)) return {};
+  return summary;
+}
+
+function scmReconciliationRunDecisionSummary(run) {
+  const summary = firstDefined(run, [
+    "reviewDecisionSummary",
+    "review_decision_summary"
+  ], {});
+  return summary && typeof summary === "object" && !Array.isArray(summary)
+    ? summary
+    : {};
+}
+
+function scmReconciliationRunPendingDecisions(run) {
+  return Number(firstDefined(
+    scmReconciliationRunDecisionSummary(run),
+    ["pendingTargets", "pending_targets", "unresolvedTargets"],
+    0
+  )) || 0;
+}
+
+function scmReconciliationRunReviewCount(run) {
+  const decisionCount = Number(firstDefined(
+    scmReconciliationRunDecisionSummary(run),
+    ["reviewTargets", "review_targets"],
+    Number.NaN
+  ));
+  if (Number.isFinite(decisionCount)) return Math.max(0, decisionCount);
+  const summaryCount = Number(firstDefined(
+    scmReconciliationRunSummary(run),
+    ["reviewOrders", "review_orders"],
+    0
+  ));
+  return Number.isFinite(summaryCount) ? Math.max(0, summaryCount) : 0;
+}
+
+function scmReconciliationRunMetricHtml(run) {
+  const summary = scmReconciliationRunSummary(run);
+  const entries = Object.entries(summary)
+    .filter(([, value]) => ["string", "number", "boolean"].includes(typeof value))
+    .slice(0, 8);
+  if (!entries.length) return "";
+  return `
+    <div class="scm-reconciliation-result-grid">
+      ${entries.map(([key, value]) => `
+        <div>
+          <span>${escapeHtml(humanizeScmReconciliationKey(key))}</span>
+          <strong>${escapeHtml(typeof value === "number" ? value.toLocaleString() : value)}</strong>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function scmReconciliationRunProgressHtml(run) {
+  if (!scmReconciliationRunIsActive(run)) return "";
+  const checkpoint = firstDefined(run, ["checkpoint"], {});
+  if (!checkpoint || typeof checkpoint !== "object" || Array.isArray(checkpoint)) return "";
+  const phase = String(checkpoint.phase || "queued");
+  const phaseLabel = {
+    resolve_sources: "Resolving local orders",
+    fetch_sources: "Loading NetSuite orders",
+    direct_lookup: "Checking missing orders",
+    fetch_linked_transactions: "Loading IF / IR evidence",
+    reconcile: "Reconciling orders",
+    complete: "Finalizing run"
+  }[phase] || humanizeScmReconciliationKey(phase);
+  const isLinkedFetch = phase === "fetch_linked_transactions";
+  const processed = Number(isLinkedFetch
+    ? checkpoint.processedSourceOrders
+    : checkpoint.processed);
+  const total = Number(isLinkedFetch
+    ? checkpoint.totalSourceOrders
+    : checkpoint.total);
+  const progress = Number.isFinite(processed) && Number.isFinite(total) && total > 0
+    ? `${processed.toLocaleString()} of ${total.toLocaleString()} orders`
+    : "Worker heartbeat is active";
+  const batchAttempt = Number(checkpoint.linkedBatchAttempt);
+  const batchMaxAttempts = Number(checkpoint.linkedBatchMaxAttempts);
+  const batchSize = Number(checkpoint.linkedBatchSize);
+  const batchDetails = isLinkedFetch && Number.isFinite(batchSize) && batchSize > 0
+    ? [
+      `${batchSize.toLocaleString()} in current batch`,
+      Number.isFinite(batchAttempt) && Number.isFinite(batchMaxAttempts)
+        ? `attempt ${batchAttempt.toLocaleString()} of ${batchMaxAttempts.toLocaleString()}`
+        : "",
+      checkpoint.linkedBatchRetrying ? "retrying after timeout" : ""
+    ].filter(Boolean).join(" · ")
+    : "";
+  return `
+    <div class="notice">
+      <strong>${escapeHtml(phaseLabel)}</strong>
+      <span>${escapeHtml([progress, batchDetails].filter(Boolean).join(" · "))}</span>
+    </div>
+  `;
+}
+
+function scmReconciliationRunDetailsJson(run) {
+  const details = firstDefined(run, ["summary", "result", "results", "stats", "error", "lastError", "last_error"], null);
+  if (details === null || details === undefined || details === "") return "";
+  try {
+    return JSON.stringify(details, null, 2);
+  } catch {
+    return String(details);
+  }
+}
+
+function scmReconciliationTargetProposal(target = {}) {
+  const proposed = target.proposedChange && Object.keys(target.proposedChange).length
+    ? target.proposedChange
+    : target.result || {};
+  return proposed && typeof proposed === "object" ? proposed : {};
+}
+
+function scmReconciliationQuantityText(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric)
+    ? numeric.toLocaleString(undefined, { maximumFractionDigits: 6 })
+    : "—";
+}
+
+function scmReconciliationTargetCalculatedOutcome(target = {}, proposal = {}) {
+  const reconciliationStatus = String(
+    proposal.reconciliationStatus
+    || proposal.reconciliation_status
+    || ""
+  ).trim().toLowerCase();
+  if (reconciliationStatus === "missing") return "";
+  const explicit = String(
+    proposal.calculatedApplicationStatus
+    || proposal.authoritativeApplicationStatus
+    || ""
+  ).trim();
+  if (explicit) return explicit;
+  const applicationStatus = String(
+    proposal.applicationStatus
+    || proposal.application_status
+    || ""
+  ).trim();
+  if (applicationStatus && applicationStatus !== "Reconcile Review") {
+    return applicationStatus;
+  }
+  const quantities = proposal.quantities && typeof proposal.quantities === "object"
+    ? proposal.quantities
+    : {};
+  const ordered = Number(quantities.ordered || 0);
+  const fulfilled = Number(quantities.fulfilled || 0);
+  const received = Number(quantities.received || 0);
+  const abandoned = Number(quantities.abandoned || 0);
+  const kind = String(target.orderKind || proposal.orderKind || "").toUpperCase();
+  if (
+    ordered > 0
+    && received + abandoned >= ordered - 0.000001
+    && (kind !== "TO" || fulfilled + abandoned >= ordered - 0.000001)
+  ) {
+    return "Completed";
+  }
+  return "";
+}
+
+function scmReconciliationTargetReasonPresentation(reason, proposal = {}) {
+  const full = String(reason || "").trim();
+  if (!full) return { summary: "", full: "", collapsed: false, detailCount: 0 };
+  const explicitSummary = String(
+    proposal.reviewSummary
+    || proposal.review_summary
+    || proposal.reviewDiagnostics?.summary
+    || proposal.review_diagnostics?.summary
+    || ""
+  ).trim();
+  const parts = full.split(/(?<=[.!?])\s+/).filter(Boolean);
+  const collapsed = Boolean(explicitSummary)
+    ? explicitSummary !== full
+    : parts.length > 2 || full.length > 320;
+  let summary = explicitSummary || parts[0] || full;
+  if (!explicitSummary && summary.length > 260) {
+    summary = `${summary.slice(0, 257).trimEnd()}…`;
+  }
+  return {
+    summary: collapsed ? summary : full,
+    full,
+    collapsed,
+    detailCount: Math.max(parts.length, 1)
+  };
+}
+
+function renderScmReconciliationTargetDecision(target = {}, run = {}, proposal = {}) {
+  const runStatus = scmReconciliationRunStatus(run);
+  const targetStatus = String(target.status || "").toLowerCase();
+  if (
+    !scmReconciliationRunIsDry(run)
+    || !["succeeded", "awaiting_approval"].includes(runStatus)
+    || targetStatus !== "review"
+  ) {
+    return "";
+  }
+  const targetId = String(target.id || "");
+  const runId = scmReconciliationRunId(run);
+  const decisionKey = scmReconciliationTargetDecisionKey(runId, targetId);
+  const draft = scmReconciliationDecisionDrafts.get(decisionKey);
+  const hasSavedDecision = Boolean(target.reviewDecision);
+  const decision = String(draft?.decision ?? target.reviewDecision ?? "");
+  const note = String(draft?.note ?? target.reviewDecisionNote ?? "");
+  const outcome = scmReconciliationTargetCalculatedOutcome(target, proposal);
+  const busy = scmReconciliationDecisionBusyTargets.has(decisionKey);
+  const noteRequired = ["accept_current", "skip"].includes(decision);
+  const controlId = scmReconciliationTargetDecisionControlId(runId, targetId);
+  const headingId = `${controlId}-heading`;
+  const hintId = `${controlId}-hint`;
+  const actionId = `${controlId}-action`;
+  const noteId = `${controlId}-note`;
+  const saveId = `${controlId}-save`;
+  const orderLabel = `${target.orderKind || "Order"} ${target.orderRef || target.orderId || ""}`.trim();
+  return `
+    <section class="scm-reconciliation-target-decision"
+      data-reconciliation-target-decision="${escapeHtml(targetId)}"
+      data-run-id="${escapeHtml(runId)}"
+      data-target-id="${escapeHtml(targetId)}"
+      aria-labelledby="${escapeHtml(headingId)}"
+      aria-describedby="${escapeHtml(hintId)}">
+      <div>
+        <strong id="${escapeHtml(headingId)}">Decision before apply</strong>
+        <span id="${escapeHtml(hintId)}">The live apply will refetch NetSuite. A saved acceptance is ignored if the evidence changes.</span>
+      </div>
+      <label for="${escapeHtml(actionId)}">
+        <span>Action</span>
+        <select id="${escapeHtml(actionId)}" data-review-decision required aria-required="true" ${busy ? "disabled" : ""}>
+          <option value="" ${decision ? "" : "selected"}>Choose an action…</option>
+          ${outcome ? `<option value="accept_current" ${decision === "accept_current" ? "selected" : ""}>Accept NetSuite outcome — ${escapeHtml(outcome)}</option>` : ""}
+          <option value="skip" ${decision === "skip" ? "selected" : ""}>Skip this order and future broad runs</option>
+          <option value="keep_review" ${decision === "keep_review" ? "selected" : ""}>Apply normally; keep Review if conflict remains</option>
+        </select>
+      </label>
+      <label class="note" for="${escapeHtml(noteId)}">
+        <span>Audit note (${noteRequired ? "required" : "optional"})</span>
+        <textarea id="${escapeHtml(noteId)}" data-review-decision-note rows="2"
+          placeholder="Why is this action appropriate?"
+          ${noteRequired ? 'required aria-required="true"' : 'aria-required="false"'}
+          ${busy ? "disabled" : ""}>${escapeHtml(note)}</textarea>
+      </label>
+      <div class="actions">
+        <button class="primary" id="${escapeHtml(saveId)}"
+          data-action="save-scm-reconciliation-target-decision"
+          data-run-id="${escapeHtml(runId)}"
+          data-target-id="${escapeHtml(targetId)}"
+          data-target-updated-at="${escapeHtml(target.updatedAt || "")}"
+          aria-label="${escapeHtml(`${hasSavedDecision ? "Update" : "Save"} decision for ${orderLabel}`)}"
+          type="button" ${busy ? "disabled" : ""}>${busy ? "Saving…" : hasSavedDecision ? "Update decision" : "Save decision"}</button>
+        ${decision && !draft ? `<span class="scm-reconciliation-decision-saved" role="status" aria-live="polite">Saved: ${escapeHtml(humanizeScmReconciliationKey(decision))}${target.reviewDecidedAt ? ` · ${escapeHtml(formatDate(target.reviewDecidedAt))}` : ""}</span>` : ""}
+        ${draft ? `<span class="scm-reconciliation-decision-saved draft">Unsaved changes</span>` : ""}
+      </div>
+    </section>
+  `;
+}
+
+function renderScmReconciliationRunTarget(target = {}, run = {}) {
+  const proposal = scmReconciliationTargetProposal(target);
+  const quantities = proposal.quantities && typeof proposal.quantities === "object"
+    ? proposal.quantities
+    : {};
+  const status = String(target.status || proposal.reconciliationStatus || "pending").toLowerCase();
+  const applicationStatus = String(proposal.applicationStatus || proposal.application_status || "");
+  const calculatedOutcome = scmReconciliationTargetCalculatedOutcome(target, proposal);
+  const reason = String(target.error || proposal.reason || proposal.reconciliationReason || "");
+  const reasonPresentation = scmReconciliationTargetReasonPresentation(reason, proposal);
+  const detailJson = (() => {
+    try {
+      return JSON.stringify(proposal, null, 2);
+    } catch {
+      return String(proposal);
+    }
+  })();
+  const metrics = [
+    ["Ordered", quantities.ordered],
+    ["Fulfilled", quantities.fulfilled],
+    ["Received", quantities.received],
+    ["Abandoned", quantities.abandoned],
+    ["Remaining", quantities.remaining],
+    ["Destination remaining", quantities.destinationRemaining]
+  ].filter(([, value]) => value !== undefined && value !== null);
+  return `
+    <article class="scm-reconciliation-target-card ${escapeHtml(status)}">
+      <header>
+        <div>
+          <strong>${escapeHtml(target.orderKind || "Order")} ${escapeHtml(target.orderRef || target.orderId || "")}</strong>
+          ${applicationStatus ? `<span>Proposed: ${escapeHtml(applicationStatus)}</span>` : ""}
+          ${calculatedOutcome && calculatedOutcome !== applicationStatus ? `<span>Calculated NetSuite outcome: ${escapeHtml(calculatedOutcome)}</span>` : ""}
+        </div>
+        <span class="scm-reconciliation-status ${escapeHtml(status)}">${escapeHtml(humanizeScmReconciliationKey(status))}</span>
+      </header>
+      ${metrics.length ? `
+        <div class="scm-reconciliation-target-quantities">
+          ${metrics.map(([label, value]) => `
+            <span><small>${escapeHtml(label)}</small><strong>${escapeHtml(scmReconciliationQuantityText(value))}</strong></span>
+          `).join("")}
+        </div>
+      ` : ""}
+      ${reasonPresentation.summary ? `<p class="scm-reconciliation-target-reason">${escapeHtml(reasonPresentation.summary)}</p>` : ""}
+      ${renderScmReconciliationTargetDecision(target, run, proposal)}
+      ${reasonPresentation.collapsed ? `
+        <details class="scm-reconciliation-target-reason-details">
+          <summary>View all ${reasonPresentation.detailCount.toLocaleString()} review details</summary>
+          <p>${escapeHtml(reasonPresentation.full)}</p>
+        </details>
+      ` : ""}
+      ${detailJson && detailJson !== "{}"
+        ? `<details><summary>Full proposed result</summary><pre>${escapeHtml(detailJson)}</pre></details>`
+        : ""}
+    </article>
+  `;
+}
+
+function renderScmReconciliationRunTargets(runId) {
+  const detail = scmReconciliationRunDetails.get(String(runId));
+  const run = scmReconciliationRuns.find((candidate) =>
+    scmReconciliationRunId(candidate) === String(runId)) || {};
+  if (!detail) {
+    return `
+      <section class="scm-reconciliation-target-review" aria-busy="true">
+        <div class="scm-reconciliation-target-review-heading">
+          <strong>Order-by-order review</strong>
+          <span>Loading…</span>
+        </div>
+        <div class="notice"><strong>Loading proposed orders…</strong></div>
+      </section>
+    `;
+  }
+  return `
+    <section class="scm-reconciliation-target-review" aria-busy="${detail.loading ? "true" : "false"}">
+      <div class="scm-reconciliation-target-review-heading">
+        <strong>Order-by-order review</strong>
+        <span>${Number(detail.targetCount || detail.targets.length).toLocaleString()} target(s)</span>
+      </div>
+      ${detail.error ? `<div class="notice sync-error"><strong>Run details could not be loaded</strong><span>${escapeHtml(detail.error)}</span></div>` : ""}
+      ${detail.targets.map((target) => renderScmReconciliationRunTarget(target, run)).join("")
+        || (detail.loading
+          ? `<div class="notice"><strong>Loading proposed orders…</strong></div>`
+          : `<div class="notice"><strong>No order targets were recorded for this run.</strong></div>`)}
+      ${detail.hasMore
+        ? `<button data-action="load-more-scm-reconciliation-targets" data-run-id="${escapeHtml(runId)}" type="button" ${detail.loading ? "disabled" : ""}>${detail.loading ? "Loading…" : "Load more orders"}</button>`
+        : ""}
+    </section>
+  `;
+}
+
+function scmReconciliationRunScopeLabel(run) {
+  const scope = String(firstDefined(run, ["scope"], "all"));
+  const orderKind = String(firstDefined(run, ["orderKind", "order_kind", "targetOrderKind", "target_order_kind"], ""));
+  const orderRefs = normalizeScmReconciliationOrderRefs(firstDefined(
+    run,
+    ["orderRefs", "order_refs", "targetOrderRefs", "target_order_refs", "orderRef", "order_ref", "targetOrderRef", "target_order_ref"],
+    []
+  ));
+  const orderId = firstDefined(run, ["orderId", "order_id", "targetOrderId", "target_order_id"], "");
+  return scope === "order_family"
+    ? orderRefs.length > 1
+      ? `${orderKind || "Order"} · ${orderRefs.length.toLocaleString()} families`
+      : `${orderKind || "Order"} ${orderRefs[0] || (orderId ? `ID ${orderId}` : "family")}`
+    : scope.toUpperCase();
+}
+
+function renderScmReconciliationRunListItem(run) {
+  const id = scmReconciliationRunId(run);
+  const status = scmReconciliationRunStatus(run);
+  const startedAt = firstDefined(run, ["startedAt", "started_at", "createdAt", "created_at"], "");
+  const source = String(firstDefined(run, ["source", "trigger", "triggerSource", "trigger_source", "runSource", "run_source"], "manual"));
+  const pendingDecisions = scmReconciliationRunPendingDecisions(run);
+  const reviewCount = scmReconciliationRunReviewCount(run);
+  const selected = id && id === scmReconciliationSelectedRunId;
+  const scopeLabel = scmReconciliationRunScopeLabel(run);
+  return `
+    <button class="scm-reconciliation-run-list-item ${selected ? "selected" : ""} ${scmReconciliationRunIsActive(run) ? "active" : ""}"
+      data-action="select-scm-reconciliation-run"
+      data-run-id="${escapeHtml(id)}"
+      type="button"
+      aria-current="${selected ? "true" : "false"}"
+      aria-label="${escapeHtml(`Run ${id}, ${scopeLabel}, ${humanizeScmReconciliationKey(status)}`)}">
+      <span class="scm-reconciliation-run-list-heading">
+        <strong>#${escapeHtml(id)} · ${escapeHtml(scopeLabel)}</strong>
+        <span class="scm-reconciliation-status ${escapeHtml(status)}">${escapeHtml(humanizeScmReconciliationKey(status))}</span>
+      </span>
+      <span>${scmReconciliationRunIsDry(run) ? "Dry run" : "Live run"} · ${escapeHtml(source)}</span>
+      <small>${formatDate(startedAt) || "Not started"}</small>
+      ${reviewCount ? `<span class="scm-reconciliation-run-review-count ${pendingDecisions ? "pending" : ""}">${pendingDecisions
+        ? `${pendingDecisions.toLocaleString()} decision(s) pending`
+        : `${reviewCount.toLocaleString()} reviewed order(s)`}</span>` : ""}
+    </button>
+  `;
+}
+
+function renderScmReconciliationSelectedRun(run) {
+  const id = scmReconciliationRunId(run);
+  const status = scmReconciliationRunStatus(run);
+  const startedAt = firstDefined(run, ["startedAt", "started_at", "createdAt", "created_at"], "");
+  const finishedAt = firstDefined(run, ["finishedAt", "finished_at", "completedAt", "completed_at", "updatedAt", "updated_at"], "");
+  const source = String(firstDefined(run, ["source", "trigger", "triggerSource", "trigger_source", "runSource", "run_source"], "manual"));
+  const error = String(firstDefined(run, ["error", "lastError", "last_error"], ""));
+  const errorHeading = status === "interrupted"
+    ? "Run interrupted"
+    : status === "cancelled"
+      ? "Run cancelled"
+      : "Run failed";
+  const detailsJson = scmReconciliationRunDetailsJson(run);
+  const appliedRun = scmReconciliationAppliedRunFor(run);
+  const pendingDecisions = scmReconciliationRunPendingDecisions(run);
+  const reviewCount = scmReconciliationRunReviewCount(run);
+  const scopeLabel = scmReconciliationRunScopeLabel(run);
+  const hasStopRequest = scmReconciliationRunStopRequested(run);
+  const stopRequested = scmReconciliationRunIsActive(run) && hasStopRequest;
+  const stoppedSafely = status === "interrupted" && hasStopRequest;
+  return `
+    <article class="scm-reconciliation-run-card scm-reconciliation-selected-run ${scmReconciliationRunIsActive(run) ? "active" : ""}">
+      <header>
+        <div>
+          <strong>${escapeHtml(scopeLabel)}</strong>
+          <span>${scmReconciliationRunIsDry(run) ? "Dry run" : "Live run"} · ${escapeHtml(source)}</span>
+        </div>
+        <span class="scm-reconciliation-status ${escapeHtml(status)}">${escapeHtml(humanizeScmReconciliationKey(status))}</span>
+      </header>
+      <div class="scm-reconciliation-run-meta">
+        <span>Started <strong>${formatDate(startedAt) || "—"}</strong></span>
+        <span>Finished <strong>${formatDate(finishedAt) || "—"}</strong></span>
+        ${id ? `<span>Run <strong>#${escapeHtml(id)}</strong></span>` : ""}
+        ${appliedRun ? `<span>Applied by live run <strong>#${escapeHtml(scmReconciliationRunId(appliedRun))} · ${escapeHtml(humanizeScmReconciliationKey(scmReconciliationRunStatus(appliedRun)))}</strong></span>` : ""}
+      </div>
+      ${scmReconciliationRunProgressHtml(run)}
+      ${stopRequested ? `<div class="notice"><strong>Stop requested</strong><span>The worker will finish its current atomic step, preserve recorded progress, and then mark this run Interrupted.</span></div>` : ""}
+      ${stoppedSafely ? `<div class="notice"><strong>Stopped safely</strong><span>Recorded progress is preserved. Resume this run when you are ready to continue the remaining orders.</span></div>` : ""}
+      ${scmReconciliationRunMetricHtml(run)}
+      ${error ? `<div class="notice sync-error"><strong>${escapeHtml(errorHeading)}</strong><span>${escapeHtml(error)}</span></div>` : ""}
+      ${scmReconciliationRunCanApply(run) && pendingDecisions > 0 ? `
+        <div class="notice">
+          <strong>Review decisions required</strong>
+          <span>${pendingDecisions.toLocaleString()} of ${reviewCount.toLocaleString()} reviewed order(s) still need an action. Use the decision controls below before applying.</span>
+        </div>
+      ` : ""}
+      <div class="actions">
+        ${id && scmReconciliationRunIsActive(run)
+          ? `<button class="danger" data-action="stop-scm-reconciliation-run" data-run-id="${escapeHtml(id)}" type="button" ${scmReconciliationBusy || stopRequested ? "disabled" : ""}>${stopRequested ? "Stopping…" : "Stop run"}</button>`
+          : ""}
+        ${id && scmReconciliationRunCanResume(run)
+          ? `<button class="primary" data-action="resume-scm-reconciliation-run" data-run-id="${escapeHtml(id)}" type="button" ${scmReconciliationBusy || scmReconciliationRuns.some(scmReconciliationRunIsActive) ? "disabled" : ""}>Resume remaining orders</button>`
+          : ""}
+        ${scmReconciliationRunCanApply(run)
+          ? `<button class="primary" data-action="apply-scm-reconciliation-run" data-run-id="${escapeHtml(id)}" type="button" ${scmReconciliationBusy || pendingDecisions > 0 || scmReconciliationRuns.some(scmReconciliationRunIsActive) ? "disabled" : ""}>Apply dry-run scope</button>`
+          : ""}
+        ${id ? `<button data-action="refresh-scm-reconciliation-run-details" data-run-id="${escapeHtml(id)}" type="button" ${scmReconciliationRunDetails.get(String(id))?.loading ? "disabled" : ""}>Refresh order details</button>` : ""}
+        ${detailsJson ? `<details><summary>View result details</summary><pre>${escapeHtml(detailsJson)}</pre></details>` : ""}
+      </div>
+      ${id ? renderScmReconciliationRunTargets(id) : ""}
+    </article>
+  `;
+}
+
+function renderScmReconciliationSection() {
+  if (!hasStaffAuthority(operator, ["admin"])) return "";
+  const initialApproved = scmReconciliationInitialApproved();
+  const approvalAt = firstDefined(scmReconciliationSettings, [
+    "initialDryRunApprovedAt",
+    "initial_dry_run_approved_at",
+    "initialDryRunAppliedAt",
+    "initial_dry_run_applied_at"
+  ], "");
+  const activeRun = scmReconciliationRuns.some(scmReconciliationRunIsActive);
+  const fullRunMustBeDry = !initialApproved && scmReconciliationScope === "all";
+  const runDisabled = scmReconciliationBusy || activeRun;
+  const settingsDisabled = scmReconciliationBusy || !scmReconciliationSettingsLoaded;
+  const latestRun = scmReconciliationRuns[0] || null;
+  const selectedRun = scmReconciliationRuns.find((run) =>
+    scmReconciliationRunId(run) === scmReconciliationSelectedRunId) || null;
+  return `
+    <section class="panel scm-reconciliation-panel">
+      <div class="section-heading">
+        <div>
+          <h2>PO / TO Schedule Reconciliation</h2>
+          <p class="muted">Keep /POTOschedule aligned with current NetSuite PO receipts and TO fulfillment/receipts. Reconciliation runs one NetSuite request at a time and yields to operational work.</p>
+        </div>
+        <button data-action="refresh-scm-reconciliation" type="button" ${scmReconciliationBusy ? "disabled" : ""}>Refresh</button>
+      </div>
+      ${scmReconciliationLoadError ? `
+        <div class="notice sync-error" role="alert">
+          <strong>Reconciliation controls could not be fully loaded</strong>
+          <span>${escapeHtml(scmReconciliationLoadError)}</span>
+        </div>
+      ` : ""}
+      <div class="scm-reconciliation-manual-bar">
+        <div>
+          <h3>Manual reconciliation</h3>
+          <p class="muted">Run all orders, PO only, TO only, or targeted order families including their local splits.</p>
+        </div>
+        <form class="scm-reconciliation-run-form" data-form="scm-reconciliation-run">
+          <label>
+            <span>Scope</span>
+            <select name="scope" data-field="scm-reconciliation-scope" ${runDisabled ? "disabled" : ""}>
+              <option value="all" ${scmReconciliationScope === "all" ? "selected" : ""}>All PO / TO</option>
+              <option value="PO" ${scmReconciliationScope === "PO" ? "selected" : ""}>PO only</option>
+              <option value="TO" ${scmReconciliationScope === "TO" ? "selected" : ""}>TO only</option>
+              <option value="order_family" ${scmReconciliationScope === "order_family" ? "selected" : ""}>Target order families</option>
+            </select>
+          </label>
+          <label>
+            <span>Family type</span>
+            <select name="orderKind" data-field="scm-reconciliation-order-kind" ${scmReconciliationScope === "order_family" && !runDisabled ? "" : "disabled"}>
+              <option value="PO" ${scmReconciliationOrderKind === "PO" ? "selected" : ""}>PO</option>
+              <option value="TO" ${scmReconciliationOrderKind === "TO" ? "selected" : ""}>TO</option>
+            </select>
+          </label>
+          <label class="scm-reconciliation-family-ref">
+            <span>Source order references</span>
+            <textarea name="orderRefs" data-field="scm-reconciliation-order-ref" rows="3" maxlength="4096" autocomplete="off" spellcheck="false" placeholder="POB03581, POB03582&#10;or one reference per line" ${scmReconciliationScope === "order_family" && !runDisabled ? "" : "disabled"}>${escapeHtml(scmReconciliationOrderRef)}</textarea>
+          </label>
+          <div class="scm-reconciliation-run-options">
+            <label class="scm-reconciliation-toggle compact">
+              <input name="includeTerminalOrders" data-field="scm-reconciliation-include-terminal" type="checkbox" ${scmReconciliationScope !== "order_family" && scmReconciliationIncludeTerminalOrders ? "checked" : ""} ${scmReconciliationScope !== "order_family" && !runDisabled ? "" : "disabled"} />
+              <span><strong>Include locally terminal / skipped orders</strong><small>Broad runs exclude Completed, Cancelled/closed, Hold, and saved Skip decisions by default. Targeted order-family runs inherently override this filter.</small></span>
+            </label>
+            <label class="scm-reconciliation-toggle compact">
+              <input name="dryRun" data-field="scm-reconciliation-dry-run" type="checkbox" ${scmReconciliationDryRun || fullRunMustBeDry ? "checked" : ""} ${fullRunMustBeDry || runDisabled ? "disabled" : ""} />
+              <span><strong>Dry run</strong><small>Calculate and report changes without applying them.</small></span>
+            </label>
+          </div>
+          <button class="primary" type="submit" ${runDisabled ? "disabled" : ""}>${scmReconciliationBusy ? "Starting…" : activeRun ? "Run in progress" : "Start reconciliation"}</button>
+        </form>
+        <p class="muted" data-scm-reconciliation-run-help>${fullRunMustBeDry
+          ? "Initial safeguard: this full reconciliation must be reviewed as a dry run."
+          : "Uncheck Dry run only when you are ready to apply unambiguous results immediately."}</p>
+      </div>
+      <div class="notice ${initialApproved ? "sync-success" : ""}">
+        <strong>Initial full reconciliation: ${initialApproved ? "Approved and applied" : "Dry-run approval required"}</strong>
+        <span>${initialApproved
+          ? `Future unambiguous nightly results apply automatically.${approvalAt ? ` Approved ${formatDate(approvalAt)}.` : ""}`
+          : "The first All PO / TO run is forced to dry-run mode. Review its results and select Apply before nightly automation can update schedule state."}</span>
+      </div>
+      <details class="scm-reconciliation-settings-disclosure">
+        <summary>
+          <span><strong>Nightly reconciliation settings</strong><small>Runs after operational hours and waits when another NetSuite task is active.</small></span>
+          <span class="scm-reconciliation-settings-state">${scmReconciliationSettings.nightlyEnabled ? "Enabled" : "Disabled"}</span>
+        </summary>
+        <form class="scm-reconciliation-settings" data-form="scm-reconciliation-settings" aria-busy="${scmReconciliationBusy ? "true" : "false"}">
+          <label class="scm-reconciliation-toggle">
+            <input name="nightlyEnabled" type="checkbox" ${scmReconciliationSettings.nightlyEnabled ? "checked" : ""} ${settingsDisabled ? "disabled" : ""} />
+            <span><strong>Enable nightly reconciliation</strong><small>Apply future unambiguous results on schedule.</small></span>
+          </label>
+          <label>
+            <span>Nightly start time</span>
+            <input name="nightlyTime" type="time" required value="${escapeHtml(scmReconciliationSettings.nightlyTime || "21:30")}" ${settingsDisabled ? "disabled" : ""} />
+          </label>
+          <label>
+            <span>Time zone</span>
+            <input name="timeZone" value="${escapeHtml(scmReconciliationSettings.timeZone || SCM_RECONCILIATION_TIME_ZONE)}" readonly />
+          </label>
+          <label>
+            <span>Initial backfill since</span>
+            <input name="initialBackfillSince" type="date" required value="${escapeHtml(scmReconciliationSettings.initialBackfillSince || "2026-01-01")}" ${settingsDisabled ? "disabled" : ""} />
+          </label>
+          <button type="submit" ${settingsDisabled ? "disabled" : ""}>Save settings</button>
+        </form>
+      </details>
+      <div class="control-visually-hidden" role="status" aria-live="polite">${latestRun
+        ? `Latest reconciliation run ${escapeHtml(scmReconciliationRunId(latestRun))} is ${escapeHtml(humanizeScmReconciliationKey(scmReconciliationRunStatus(latestRun)))}.`
+        : "No reconciliation runs yet."}</div>
+      <div class="scm-reconciliation-workspace">
+        <aside class="scm-reconciliation-run-browser" aria-label="Reconciliation runs">
+          <div class="scm-reconciliation-run-browser-heading">
+            <div>
+              <h3>Run history</h3>
+              <span>${scmReconciliationRuns.length.toLocaleString()} recent run(s)</span>
+            </div>
+          </div>
+          <nav class="scm-reconciliation-run-list" data-control-scroll="reconciliation-run-list" aria-busy="${activeRun ? "true" : "false"}" aria-label="Select a reconciliation run">
+            ${scmReconciliationRuns.map(renderScmReconciliationRunListItem).join("")
+              || `<div class="notice"><strong>No reconciliation runs yet</strong><span>Start the initial full dry run above.</span></div>`}
+          </nav>
+        </aside>
+        <section class="scm-reconciliation-selected-detail" aria-live="polite">
+          ${selectedRun
+            ? renderScmReconciliationSelectedRun(selectedRun)
+            : `<div class="scm-reconciliation-empty-detail"><strong>Select a reconciliation run</strong><span>Run progress, results, reviewed orders, and apply controls will appear here.</span></div>`}
+        </section>
+      </div>
+    </section>
+  `;
+}
+
+function renderScmReconciliationSyncLink() {
+  return `
+    <section class="panel scm-reconciliation-link-panel">
+      <div class="section-heading">
+        <div>
+          <h2>PO / TO Schedule Reconciliation</h2>
+          <p class="muted">Manual runs, run history, dry-run decisions, and apply controls now have a dedicated review page.</p>
+        </div>
+        <a class="scm-reconciliation-page-link" href="/admin/reconciliation">Open reconciliation</a>
+      </div>
+    </section>
+  `;
+}
+
+function refreshScmReconciliationRunForm(form) {
+  if (!form) return;
+  const familyScope = scmReconciliationScope === "order_family";
+  const activeRun = scmReconciliationRuns.some(scmReconciliationRunIsActive);
+  const disabled = scmReconciliationBusy || activeRun;
+  const kind = form.querySelector('[data-field="scm-reconciliation-order-kind"]');
+  const orderRefs = form.querySelector('[data-field="scm-reconciliation-order-ref"]');
+  const includeTerminal = form.querySelector('[data-field="scm-reconciliation-include-terminal"]');
+  const dryRun = form.querySelector('[data-field="scm-reconciliation-dry-run"]');
+  const forceInitialDryRun = scmReconciliationScope === "all" && !scmReconciliationInitialApproved();
+  if (kind) kind.disabled = !familyScope || disabled;
+  if (orderRefs) orderRefs.disabled = !familyScope || disabled;
+  if (includeTerminal) {
+    includeTerminal.checked = !familyScope && scmReconciliationIncludeTerminalOrders;
+    includeTerminal.disabled = familyScope || disabled;
+  }
+  if (dryRun) {
+    dryRun.checked = forceInitialDryRun || scmReconciliationDryRun;
+    dryRun.disabled = forceInitialDryRun || disabled;
+  }
+  const help = app.querySelector("[data-scm-reconciliation-run-help]");
+  if (help) {
+    help.textContent = forceInitialDryRun
+      ? "Initial safeguard: this full reconciliation must be reviewed as a dry run."
+      : "Uncheck Dry run only when you are ready to apply unambiguous results immediately.";
+  }
+}
+
 function renderSyncSection() {
   const isAuto = syncSettings.mode === "auto";
   const savedMaxRunMinutes = Math.max(1, Math.round(Number(syncSettings.maxRunSeconds || 900) / 60));
   const maxRunMinutes = syncMaxRunMinutesDraft ?? savedMaxRunMinutes;
   const mirrorPanel = renderNetSuiteMirrorPanel();
-  if (mirrorStatus.role === "consumer") return mirrorPanel;
+  const reconciliationLink = renderScmReconciliationSyncLink();
+  if (mirrorStatus.role === "consumer") return `${mirrorPanel}${reconciliationLink}`;
   const targetedOrderPanel = renderTargetedOrderSyncPanel();
-  return `${mirrorPanel}${targetedOrderPanel}
+  return `${mirrorPanel}${reconciliationLink}${targetedOrderPanel}
     <section class="panel">
       <div class="section-heading">
         <div>
@@ -1355,7 +3325,6 @@ function renderSyncSection() {
         <button data-action="save-sync-settings" type="button">${t("control.saveSyncSettings", "Save Sync Settings")}</button>
         <button class="primary" data-action="run-sync-now" type="button" ${syncSettings.running ? "disabled" : ""}>${t("control.runSyncNow", "Run Sync Now")}</button>
         <button data-action="run-transfer-order-sync" type="button" ${syncSettings.running ? "disabled" : ""}>${t("control.runTransferOrderSync", "Sync TO/PO Only")}</button>
-        <button data-action="reconcile-netsuite-progress" type="button" ${syncSettings.running ? "disabled" : ""}>${t("control.reconcileProgress", "Reconcile NetSuite Progress")}</button>
         <button class="danger" data-action="stop-sync" type="button">${t("control.stopSync", "Stop / Clear Sync")}</button>
         <button data-action="refresh" type="button">${t("control.refreshStatus", "Refresh Status")}</button>
       </div>
@@ -1475,7 +3444,7 @@ function renderWarningPhotos(warning) {
   if (!photos.length) return "";
   return `
     <div class="warning-photo-grid">
-      ${photos.filter(Boolean).map((photo, index) => `<img src="${photoImgSrc(photo)}" alt="Warning photo ${index + 1}" />`).join("")}
+      ${photos.filter(Boolean).map((photo, index) => `<img ${photoImgAttributes(photo)} alt="Warning photo ${index + 1}" />`).join("")}
     </div>
   `;
 }
@@ -1852,6 +3821,7 @@ function renderClassifications() {
             <th>${t("control.onHand", "On Hand")}</th>
             <th>${t("control.available", "Available")}</th>
             <th>${t("common.type", "Type")}</th>
+            <th>Return Policy</th>
             <th>${t("control.brand", "Brand")}</th>
             <th>${t("control.series", "Series")}</th>
             <th></th>
@@ -1861,16 +3831,22 @@ function renderClassifications() {
           ${classifications.map((item) => `
             <tr data-item-row="${item.item_id}">
               <td><strong>${item.item_id}</strong></td>
-              <td><strong>${item.item_name || ""}</strong><br><span class="muted">${item.display_name || ""}</span></td>
-              <td>${item.item_description || ""}</td>
+              <td><strong>${escapeHtml(item.item_name || "")}</strong><br><span class="muted">${escapeHtml(item.display_name || "")}</span></td>
+              <td>${escapeHtml(item.item_description || "")}</td>
               <td>${valueText(item.total_on_hand)}</td>
               <td>${valueText(item.total_available)}</td>
-              <td><input data-field="productType" value="${valueText(item.product_type)}" /></td>
-              <td><input data-field="brand" value="${valueText(item.brand)}" /></td>
-              <td><input data-field="series" value="${valueText(item.series)}" /></td>
+              <td><input data-field="productType" data-original-value="${escapeHtml(valueText(item.product_type))}" value="${escapeHtml(valueText(item.product_type))}" /></td>
+              <td>
+                <select data-field="returnPolicyOverride" data-original-value="${escapeHtml(classificationReturnPolicy(item).override || "DEFAULT")}" ${hasStaffAuthority(operator, ["admin"]) ? "" : "disabled"}>
+                  ${classificationReturnPolicyOptions(item)}
+                </select>
+                <br><span class="muted" data-field="returnPolicySource">Company-wide · ${classificationReturnPolicy(item).override ? "Admin override" : "Product Type default"}</span>
+              </td>
+              <td><input data-field="brand" data-original-value="${escapeHtml(valueText(item.brand))}" value="${escapeHtml(valueText(item.brand))}" /></td>
+              <td><input data-field="series" data-original-value="${escapeHtml(valueText(item.series))}" value="${escapeHtml(valueText(item.series))}" /></td>
               <td><button class="primary" data-action="save-classification" data-item="${item.item_id}">${t("common.save", "Save")}</button></td>
             </tr>
-          `).join("") || `<tr><td colspan="9" class="muted">${t("control.noItems", "No items yet. Click Sync Inventory.")}</td></tr>`}
+          `).join("") || `<tr><td colspan="10" class="muted">${t("control.noItems", "No items yet. Click Sync Inventory.")}</td></tr>`}
         </tbody>
       </table>
     </div>
@@ -1907,6 +3883,106 @@ async function loadAuditOptions() {
   return auditOptions;
 }
 
+async function loadReturnDetail(id = selectedReturnId) {
+  if (!id) {
+    returnDetail = null;
+    return;
+  }
+  returnDetail = await request(`/api/returns/${encodeURIComponent(id)}`);
+}
+
+async function loadReturnRecords({ keepSelection = true } = {}) {
+  returnLoadError = "";
+  try {
+    const [payload, dashboardPayload] = await Promise.all([
+      request(`/api/returns?${returnListQuery()}`),
+      request("/api/returns?limit=1&offset=0").catch(() => null)
+    ]);
+    returnRecords = Array.isArray(payload) ? payload : (payload.records || payload.returns || []);
+    returnCounts = Array.isArray(payload) ? {} : (payload.counts || {});
+    if (dashboardPayload && !Array.isArray(dashboardPayload)) {
+      returnDashboardCounts = dashboardPayload.counts || {};
+    }
+    const availableIds = new Set(returnRecords.map(returnRecordId).filter(Boolean));
+    if (!keepSelection || !availableIds.has(String(selectedReturnId))) {
+      selectedReturnId = returnRecordId(returnRecords[0] || {});
+    }
+    if (selectedReturnId) {
+      localStorage.setItem("mbbs.control.returns.selected", selectedReturnId);
+      try {
+        await loadReturnDetail(selectedReturnId);
+      } catch (error) {
+        returnDetail = null;
+        returnLoadError = error.message;
+      }
+    } else {
+      returnDetail = null;
+    }
+  } catch (error) {
+    returnRecords = [];
+    returnCounts = {};
+    returnDetail = null;
+    returnLoadError = error.message;
+  }
+}
+
+async function loadControlReturnSettings() {
+  returnSettingsError = "";
+  try {
+    const payload = await request("/api/control/return-settings");
+    const settings = Array.isArray(payload) ? payload : (payload.settings || payload.yards || []);
+    controlReturnSettings = settings.map((rawSetting) => {
+      const setting = rawSetting.setting || rawSetting.yard || rawSetting;
+      const fallback = SALES_YARD_OPTIONS.find(
+        (yard) => Number(yard.locationId) === Number(setting.locationId ?? setting.location_id)
+      ) || {};
+      return {
+        ...fallback,
+        ...setting,
+        locationId: Number(setting.locationId ?? setting.location_id ?? fallback.locationId),
+        yardCode: setting.yardCode || setting.yard_code || fallback.yardCode,
+        allowCrossYardReturns: Boolean(setting.allowCrossYardReturns ?? setting.allow_cross_yard_returns)
+      };
+    });
+  } catch (error) {
+    controlReturnSettings = [];
+    returnSettingsError = error.message;
+  }
+}
+
+async function loadAdminReturnSettings() {
+  returnSettingsError = "";
+  try {
+    const payload = await request("/api/admin/return-settings");
+    const settings = Array.isArray(payload) ? payload : (payload.yards || payload.settings || []);
+    const byLocation = new Map(settings.map((setting) => [
+      Number(setting.locationId ?? setting.location_id),
+      setting
+    ]));
+    adminReturnSettings = SALES_YARD_OPTIONS.map((yard) => {
+      const setting = byLocation.get(yard.locationId) || {};
+      return {
+        ...yard,
+        ...setting,
+        locationId: yard.locationId,
+        yardCode: setting.yardCode || setting.yard_code || yard.yardCode,
+        autoCreateStockReturnAuthorization: Boolean(
+          setting.autoCreateStockReturnAuthorization
+          ?? setting.auto_create_stock_return_authorization
+          ?? setting.autoCreateStockRa
+          ?? setting.auto_create_stock_ra
+        ),
+        autoCreatePalletCreditMemo: Boolean(
+          setting.autoCreatePalletCreditMemo ?? setting.auto_create_pallet_credit_memo
+        )
+      };
+    });
+  } catch (error) {
+    adminReturnSettings = [];
+    returnSettingsError = error.message;
+  }
+}
+
 async function loadControlData() {
   if (IS_ADMIN_PAGE) {
     const [nextOperators, nextAuditOptions, nextAudit, nextSyncSettings, nextEnvSettings, nextPhotoArchiveSettings, nextMirrorStatus, nextPublicSalesSettings] = await Promise.all([
@@ -1927,6 +4003,10 @@ async function loadControlData() {
     photoArchiveSettings = nextPhotoArchiveSettings;
     mirrorStatus = nextMirrorStatus;
     publicSalesSettings = nextPublicSalesSettings;
+    await Promise.all([
+      loadAdminReturnSettings(),
+      loadScmReconciliationControl()
+    ]);
   } else {
     classifications = await request(`/api/inventory/classifications?limit=300${classificationSearch ? `&search=${encodeURIComponent(classificationSearch)}` : ""}`);
     cycleRecords = await request("/api/cycle-count/records?limit=50");
@@ -1936,6 +4016,10 @@ async function loadControlData() {
     vendorMappings = await request("/api/control/vendor-mappings");
     await loadLoadedOrders({ keepSelection: true });
     if (isLoadedSearchActive()) await loadLoadedSearchResults();
+    await Promise.all([
+      loadReturnRecords({ keepSelection: true }),
+      loadControlReturnSettings()
+    ]);
   }
   render();
 }
@@ -1945,6 +4029,33 @@ app.addEventListener("submit", async (event) => {
   if (!form) return;
   event.preventDefault();
   try {
+    if (form.dataset.form === "scm-reconciliation-settings") {
+      await saveScmReconciliationSettings(form);
+      return;
+    }
+    if (form.dataset.form === "scm-reconciliation-run") {
+      await startScmReconciliationRun(form);
+      return;
+    }
+    if (form.dataset.form === "manual-return-link") {
+      const formData = new FormData(form);
+      const netsuiteId = String(formData.get("netsuiteId") || "").trim();
+      const netsuiteTranid = String(formData.get("netsuiteTranid") || "").trim().toUpperCase();
+      if (!/^\d+$/.test(netsuiteId)) throw new Error("Enter the NetSuite numeric internal ID.");
+      if (!confirm(`Link this local return to ${netsuiteTranid || `NetSuite internal ID ${netsuiteId}`}? The server will validate the customer, quantities, and transaction type.`)) return;
+      await request(`/api/returns/${encodeURIComponent(form.dataset.id)}/netsuite-link`, {
+        method: "POST",
+        body: JSON.stringify({
+          transactionType: String(formData.get("transactionType") || ""),
+          netsuiteId,
+          netsuiteTranid: netsuiteTranid || undefined
+        })
+      });
+      await loadReturnRecords({ keepSelection: true });
+      render();
+      alert("NetSuite transaction linked.");
+      return;
+    }
     if (form.dataset.form === "targeted-order-sync") {
       targetedSyncOrderRef = String(form.elements.orderRef?.value || "").trim().toUpperCase();
       if (!targetedSyncOrderRef) {
@@ -2055,7 +4166,213 @@ app.addEventListener("click", async (event) => {
         : operators.find((item) => String(item.id) === String(operator?.id))?.id || operators[0]?.id || "new";
       return render();
     }
+    if (button.dataset.action === "refresh-scm-reconciliation") {
+      scmReconciliationBusy = true;
+      if (scmReconciliationSelectedRunId) {
+        scmReconciliationRunDetails.delete(scmReconciliationSelectedRunId);
+      }
+      render();
+      try {
+        await loadScmReconciliationControl();
+      } finally {
+        scmReconciliationBusy = false;
+        render();
+      }
+      return;
+    }
+    if (button.dataset.action === "select-scm-reconciliation-run") {
+      await selectScmReconciliationRun(button.dataset.runId);
+      return;
+    }
+    if (button.dataset.action === "apply-scm-reconciliation-run") {
+      await applyScmReconciliationRun(button.dataset.runId);
+      return;
+    }
+    if (button.dataset.action === "stop-scm-reconciliation-run") {
+      await stopScmReconciliationRun(button.dataset.runId);
+      return;
+    }
+    if (button.dataset.action === "resume-scm-reconciliation-run") {
+      await resumeScmReconciliationRun(button.dataset.runId);
+      return;
+    }
+    if (button.dataset.action === "save-scm-reconciliation-target-decision") {
+      await saveScmReconciliationTargetDecision(button);
+      return;
+    }
+    if (button.dataset.action === "refresh-scm-reconciliation-run-details") {
+      await loadScmReconciliationRunDetails(button.dataset.runId);
+      return;
+    }
+    if (button.dataset.action === "load-more-scm-reconciliation-targets") {
+      await loadScmReconciliationRunDetails(button.dataset.runId, { append: true });
+      return;
+    }
     if (button.dataset.action === "refresh") return loadControlData();
+    if (button.dataset.action === "refresh-return-records") {
+      await Promise.all([
+        loadReturnRecords({ keepSelection: true }),
+        loadControlReturnSettings()
+      ]);
+      return render();
+    }
+    if (button.dataset.action === "set-return-view") {
+      returnFilters.status = button.dataset.status || "";
+      returnRecordOffset = 0;
+      saveReturnFilters();
+      await loadReturnRecords({ keepSelection: false });
+      return render();
+    }
+    if (button.dataset.action === "apply-return-filters") {
+      app.querySelectorAll("[data-return-filter]").forEach((input) => {
+        returnFilters[input.dataset.returnFilter] = input.value || "";
+      });
+      saveReturnFilters();
+      returnRecordOffset = 0;
+      await loadReturnRecords({ keepSelection: false });
+      return render();
+    }
+    if (button.dataset.action === "reset-return-filters") {
+      returnFilters = { search: "", status: "", type: "", yardLocationId: "", from: "", to: "" };
+      returnRecordOffset = 0;
+      saveReturnFilters();
+      await loadReturnRecords({ keepSelection: false });
+      return render();
+    }
+    if (button.dataset.action === "return-page-prev" || button.dataset.action === "return-page-next") {
+      returnRecordOffset = Math.max(
+        0,
+        returnRecordOffset + (button.dataset.action === "return-page-next"
+          ? RETURN_RECORD_PAGE_SIZE
+          : -RETURN_RECORD_PAGE_SIZE)
+      );
+      await loadReturnRecords({ keepSelection: false });
+      return render();
+    }
+    if (button.dataset.action === "select-return-record") {
+      selectedReturnId = button.dataset.id || "";
+      if (selectedReturnId) localStorage.setItem("mbbs.control.returns.selected", selectedReturnId);
+      returnLoadError = "";
+      try {
+        await loadReturnDetail(selectedReturnId);
+      } catch (error) {
+        returnDetail = null;
+        returnLoadError = error.message;
+      }
+      return render();
+    }
+    if (button.dataset.action === "decide-return-line") {
+      if (!selectedReturnId) return;
+      const approved = button.dataset.decision === "approved";
+      const note = prompt(approved
+        ? "Optional approval note:"
+        : "Rejection reason (required):");
+      if (note === null) return;
+      if (!approved && !note.trim()) return alert("A rejection reason is required.");
+      if (!confirm(`${approved ? "Approve" : "Reject"} this full return-line quantity?`)) return;
+      await request(`/api/returns/${encodeURIComponent(selectedReturnId)}/lines/${encodeURIComponent(button.dataset.lineId)}/decision`, {
+        method: "POST",
+        body: JSON.stringify({ decision: button.dataset.decision, note: note.trim() || undefined })
+      });
+      await loadReturnRecords({ keepSelection: true });
+      return render();
+    }
+    if (button.dataset.action === "void-return") {
+      const reason = prompt("Void reason (required):");
+      if (reason === null) return;
+      if (!reason.trim()) return alert("A void reason is required.");
+      if (!confirm(`Void ${returnReference(returnHeader())}? Submitted details remain in the audit history.`)) return;
+      await request(`/api/returns/${encodeURIComponent(button.dataset.id)}/void`, {
+        method: "POST",
+        body: JSON.stringify({ reason: reason.trim() })
+      });
+      await loadReturnRecords({ keepSelection: true });
+      return render();
+    }
+    if (button.dataset.action === "discard-return-draft") {
+      const reason = prompt("Optional reason for discarding this draft:");
+      if (reason === null) return;
+      if (!confirm("Discard this server draft? It cannot be resumed after deletion.")) return;
+      await request(`/api/returns/drafts/${encodeURIComponent(button.dataset.id)}/discard`, {
+        method: "POST",
+        body: JSON.stringify({ reason: reason.trim() || undefined })
+      });
+      selectedReturnId = "";
+      localStorage.removeItem("mbbs.control.returns.selected");
+      await loadReturnRecords({ keepSelection: false });
+      return render();
+    }
+    if (button.dataset.action === "retry-return-sync") {
+      if (!confirm("Retry NetSuite processing using the existing idempotency key?")) return;
+      await request(`/api/returns/${encodeURIComponent(button.dataset.id)}/sync/retry`, {
+        method: "POST",
+        body: "{}"
+      });
+      await loadReturnRecords({ keepSelection: true });
+      return render();
+    }
+    if (button.dataset.action === "save-cross-yard-setting") {
+      const locationId = Number(button.dataset.locationId);
+      const card = app.querySelector(`[data-return-yard="${locationId}"]`);
+      const allowCrossYardReturns = Boolean(card?.querySelector('[data-return-setting="allowCrossYardReturns"]')?.checked);
+      const yardCode = SALES_YARD_OPTIONS.find((yard) => yard.locationId === locationId)?.yardCode || locationId;
+      const explanation = allowCrossYardReturns
+        ? `${yardCode} will accept stock from both its own orders and orders from other yards. PALLET returns remain accepted at every yard.`
+        : `${yardCode} will accept only its own ordering-yard stock returns. PALLET returns remain accepted at every yard.`;
+      if (!confirm(`${explanation} Save this setting?`)) return;
+      await request(`/api/control/return-settings/${locationId}`, {
+        method: "PUT",
+        body: JSON.stringify({ allowCrossYardReturns })
+      });
+      await loadControlReturnSettings();
+      return render();
+    }
+    if (button.dataset.action === "refresh-return-automation") {
+      await loadAdminReturnSettings();
+      return render();
+    }
+    if (button.dataset.action === "save-return-automation") {
+      const locationId = Number(button.dataset.locationId);
+      const card = app.querySelector(`[data-return-automation-yard="${locationId}"]`);
+      const autoCreateStockReturnAuthorization = Boolean(
+        card?.querySelector('[data-return-setting="autoCreateStockReturnAuthorization"]')?.checked
+      );
+      const autoCreatePalletCreditMemo = Boolean(
+        card?.querySelector('[data-return-setting="autoCreatePalletCreditMemo"]')?.checked
+      );
+      const yardCode = SALES_YARD_OPTIONS.find((yard) => yard.locationId === locationId)?.yardCode || locationId;
+      if ((autoCreateStockReturnAuthorization || autoCreatePalletCreditMemo)
+        && !confirm(`Enable live NetSuite return automation for yard ${yardCode}? Submitted returns may create real NetSuite transactions.`)) return;
+      const result = await request(`/api/admin/return-settings/${locationId}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          autoCreateStockRa: autoCreateStockReturnAuthorization,
+          autoCreateStockReturnAuthorization,
+          autoCreatePalletCreditMemo
+        })
+      });
+      const updated = result.setting || result.yard || result;
+      adminReturnSettings = adminReturnSettings.map((yard) => Number(yard.locationId) === locationId
+        ? {
+            ...yard,
+            ...updated,
+            autoCreateStockReturnAuthorization: Boolean(
+              updated.autoCreateStockReturnAuthorization
+              ?? updated.auto_create_stock_return_authorization
+              ?? updated.autoCreateStockRa
+              ?? updated.auto_create_stock_ra
+              ?? autoCreateStockReturnAuthorization
+            ),
+            autoCreatePalletCreditMemo: Boolean(
+              updated.autoCreatePalletCreditMemo
+              ?? updated.auto_create_pallet_credit_memo
+              ?? autoCreatePalletCreditMemo
+            )
+          }
+        : yard);
+      alert(`Return automation settings saved for ${yardCode}.`);
+      return render();
+    }
     if (button.dataset.action === "load-audit") {
       await loadAuditOptions();
       await loadAudit();
@@ -2382,13 +4699,41 @@ app.addEventListener("click", async (event) => {
     }
     if (button.dataset.action === "save-classification") {
       const row = app.querySelector(`[data-item-row="${button.dataset.item}"]`);
+      if (!row) throw new Error("Item row is no longer available. Reload Item Classification.");
+      const productTypeInput = row.querySelector('[data-field="productType"]');
+      const brandInput = row.querySelector('[data-field="brand"]');
+      const seriesInput = row.querySelector('[data-field="series"]');
+      const policyInput = row.querySelector('[data-field="returnPolicyOverride"]');
+      const selectedPolicy = policyInput?.value || "DEFAULT";
+      const originalPolicy = policyInput?.dataset.originalValue || "DEFAULT";
+      const payload = {};
+      for (const [field, input] of [
+        ["productType", productTypeInput],
+        ["brand", brandInput],
+        ["series", seriesInput]
+      ]) {
+        if (String(input?.value || "") !== String(input?.dataset.originalValue || "")) {
+          payload[field] = input?.value || "";
+        }
+      }
+      const policyChanged = hasStaffAuthority(operator, ["admin"])
+        && selectedPolicy !== originalPolicy;
+      if (policyChanged) {
+        payload.returnPolicyOverride = selectedPolicy === "DEFAULT" ? null : selectedPolicy;
+      }
+      if (Object.hasOwn(payload, "productType") || policyChanged) {
+        payload.expectedReturnPolicyContext = {
+          productType: productTypeInput?.dataset.originalValue || "",
+          returnPolicyOverride: originalPolicy === "DEFAULT" ? null : originalPolicy
+        };
+      }
+      if (!Object.keys(payload).length) {
+        alert("No Item Classification changes to save.");
+        return;
+      }
       await request(`/api/inventory/classifications/${button.dataset.item}`, {
         method: "PUT",
-        body: JSON.stringify({
-          productType: row.querySelector('[data-field="productType"]').value,
-          brand: row.querySelector('[data-field="brand"]').value,
-          series: row.querySelector('[data-field="series"]').value
-        })
+        body: JSON.stringify(payload)
       });
       return loadControlData();
     }
@@ -2405,6 +4750,7 @@ app.addEventListener("click", async (event) => {
       await request("/api/auth/logout", { method: "POST" }).catch(() => ({}));
       operator = null;
       clearSyncPoll();
+      clearScmReconciliationPoll();
       clearStaffSession();
       return renderLogin();
     }
@@ -2455,9 +4801,23 @@ window.addEventListener("popstate", () => {
 });
 
 app.addEventListener("input", (event) => {
+  if (event.target?.matches?.("[data-review-decision-note]")) {
+    updateScmReconciliationTargetDecisionDraft(
+      event.target.closest("[data-reconciliation-target-decision]")
+    );
+    return;
+  }
+  if (event.target?.dataset?.field === "productType") {
+    refreshClassificationReturnPolicy(event.target.closest("[data-item-row]"));
+    return;
+  }
   if (event.target?.id === "targetedSyncOrderRef") {
     targetedSyncOrderRef = event.target.value || "";
     targetedSyncResult = null;
+    return;
+  }
+  if (event.target?.dataset?.field === "scm-reconciliation-order-ref") {
+    scmReconciliationOrderRef = event.target.value || "";
     return;
   }
   if (event.target?.dataset?.field !== "sync-max-run-minutes") return;
@@ -2466,6 +4826,34 @@ app.addEventListener("input", (event) => {
 });
 
 app.addEventListener("change", (event) => {
+  if (event.target?.matches?.("[data-review-decision]")) {
+    updateScmReconciliationTargetDecisionDraft(
+      event.target.closest("[data-reconciliation-target-decision]")
+    );
+    render();
+    return;
+  }
+  if (event.target?.dataset?.field === "scm-reconciliation-scope") {
+    scmReconciliationScope = event.target.value || "all";
+    refreshScmReconciliationRunForm(event.target.closest("form"));
+    return;
+  }
+  if (event.target?.dataset?.field === "scm-reconciliation-order-kind") {
+    scmReconciliationOrderKind = event.target.value || "PO";
+    return;
+  }
+  if (event.target?.dataset?.field === "scm-reconciliation-include-terminal") {
+    scmReconciliationIncludeTerminalOrders = Boolean(event.target.checked);
+    return;
+  }
+  if (event.target?.dataset?.field === "scm-reconciliation-dry-run") {
+    scmReconciliationDryRun = Boolean(event.target.checked);
+    return;
+  }
+  if (event.target?.dataset?.field === "returnPolicyOverride") {
+    refreshClassificationReturnPolicy(event.target.closest("[data-item-row]"));
+    return;
+  }
   if (event.target?.id === "newRole") {
     const checkbox = document.querySelector(`[data-new-authority][value="${event.target.value}"]`);
     if (checkbox) checkbox.checked = true;

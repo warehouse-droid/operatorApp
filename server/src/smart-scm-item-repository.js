@@ -2,6 +2,11 @@ import crypto from "node:crypto";
 import { TextDecoder } from "node:util";
 import { query, withTransaction } from "./db.js";
 import { writeAudit } from "./auth-repository.js";
+import {
+  defaultReturnPolicy,
+  effectiveReturnPolicy,
+  normalizeReturnPolicy
+} from "./return-policy.js";
 
 export const SMART_SCM_YARDS = Object.freeze([
   { locationId: 1, code: "3445" },
@@ -18,6 +23,7 @@ const ITEM_MASTER_CSV_REFERENCE_HEADERS = Object.freeze([
   "policy_revision"
 ]);
 const ITEM_MASTER_CSV_EDITABLE_HEADERS = Object.freeze([
+  "return_policy",
   "planning_enabled",
   "vendor_yard_id",
   "vendor_yard",
@@ -49,6 +55,21 @@ function nullableNumber(value) {
   if (value === null || value === undefined || value === "") return null;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function smartItemReturnPolicyRevision(row = {}) {
+  const updatedAt = row.return_policy_updated_at;
+  const timestamp = updatedAt instanceof Date
+    ? updatedAt.toISOString()
+    : String(updatedAt || "");
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify({
+      productType: String(row.product_type || ""),
+      override: normalizeReturnPolicy(row.return_policy_override, { nullable: true }),
+      updatedAt: timestamp
+    }))
+    .digest("hex");
 }
 
 function publicSyncState(row = {}) {
@@ -229,12 +250,17 @@ export async function listSmartScmVendorYards() {
 function publicItem(row) {
   const toPlt = nullableNumber(row.to_plt);
   const itemWeight = nullableNumber(row.item_weight);
+  const returnPolicy = effectiveReturnPolicy({
+    productType: row.product_type,
+    override: row.return_policy_override
+  });
   return {
     itemId: Number(row.item_id),
     itemName: row.item_name || String(row.item_id),
     displayName: row.display_name || "",
     description: row.item_description || "",
     itemType: row.item_type_text || row.item_type || "",
+    productType: row.product_type || "",
     stockUnit: row.stock_unit || "",
     vendorId: row.vendor_id === null ? null : Number(row.vendor_id),
     vendor: row.vendor || "",
@@ -255,6 +281,11 @@ function publicItem(row) {
     updatedBy: row.updated_by || "",
     updatedAt: row.policy_updated_at || null,
     netSuiteSyncedAt: row.netsuite_synced_at || null,
+    returnPolicyOverride: returnPolicy.override,
+    returnPolicyDefault: returnPolicy.default,
+    returnPolicyEffective: returnPolicy.effective,
+    returnPolicySource: returnPolicy.source,
+    returnPolicyRevision: smartItemReturnPolicyRevision(row),
     balances: Array.isArray(row.balances) ? row.balances.map((balance) => ({
       locationId: Number(balance.locationId),
       yardCode: balance.yardCode,
@@ -289,6 +320,8 @@ export async function listSmartScmItems({
   enabled = "",
   vendorYard = "",
   lowerStockPolicy = "",
+  returnPolicy = "",
+  returnPolicyOverride = "",
   limit = 150,
   offset = 0
 } = {}) {
@@ -348,6 +381,28 @@ export async function listSmartScmItems({
          AND lower_policy.lower_stock_policy_enabled = true
     )`);
   }
+  const effectiveReturnPolicyFilter = String(returnPolicy || "").trim().toUpperCase();
+  if (effectiveReturnPolicyFilter) {
+    const policy = normalizeReturnPolicy(effectiveReturnPolicyFilter);
+    params.push(policy);
+    clauses.push(`COALESCE(
+      i.return_policy_override,
+      CASE
+        WHEN LOWER(REGEXP_REPLACE(REPLACE(BTRIM(COALESCE(i.product_type, '')), '_', ' '), '[[:space:]]+', ' ', 'g')) = 'interlocking' THEN 'ALLOWED'
+        WHEN LOWER(REGEXP_REPLACE(REPLACE(BTRIM(COALESCE(i.product_type, '')), '_', ' '), '[[:space:]]+', ' ', 'g')) = 'natural stone' THEN 'APPROVAL_REQUIRED'
+        ELSE 'NOT_RETURNABLE'
+      END
+    ) = $${params.length}`);
+  }
+  const overrideFilter = String(returnPolicyOverride || "").trim().toUpperCase();
+  if (overrideFilter === "ANY") {
+    clauses.push("i.return_policy_override IS NOT NULL");
+  } else if (overrideFilter === "NONE") {
+    clauses.push("i.return_policy_override IS NULL");
+  } else if (overrideFilter) {
+    params.push(normalizeReturnPolicy(overrideFilter));
+    clauses.push(`i.return_policy_override = $${params.length}`);
+  }
   const safeLimit = Math.min(500, Math.max(1, Number(limit) || 150));
   const safeOffset = Math.max(0, Number(offset) || 0);
   const countResult = await query(
@@ -360,6 +415,7 @@ export async function listSmartScmItems({
   params.push(safeLimit, safeOffset);
   const result = await query(
     `SELECT i.item_id, i.item_name, i.display_name, i.item_description, i.item_type, i.item_type_text,
+            i.product_type, i.return_policy_override, i.return_policy_updated_at,
             i.stock_unit, i.vendor_id, i.vendor, i.series, i.to_plt, i.to_lyr, i.to_sec, i.to_pcs,
             i.item_weight, i.netsuite_lead_time_days, i.netsuite_safety_stock_level,
             i.netsuite_seasonal_demand, i.synced_at AS netsuite_synced_at,
@@ -646,6 +702,13 @@ function normalizedText(value) {
 function itemMasterPolicyRevision(item, yardPolicyFor) {
   const vendorYardId = item.vendor_yard_id ?? item.vendorYardId;
   const snapshot = {
+    returnPolicyOverride: normalizeReturnPolicy(
+      item.return_policy_override ?? item.returnPolicyOverride,
+      { nullable: true }
+    ),
+    returnPolicyDefault: defaultReturnPolicy(
+      item.product_type ?? item.productType
+    ),
     planningEnabled: Boolean(item.planning_enabled ?? item.planningEnabled),
     vendorYardId: vendorYardId === null || vendorYardId === undefined ? null : Number(vendorYardId),
     vendorYard: String(item.vendor_yard ?? item.vendorYard ?? "").trim() || null,
@@ -801,7 +864,7 @@ function resolveItemMasterCsvVendorYard(record, item, {
 
 export async function buildSmartScmItemMasterCsvTemplate() {
   const result = await query(
-    `SELECT i.item_id, i.item_name, i.vendor,
+    `SELECT i.item_id, i.item_name, i.vendor, i.product_type, i.return_policy_override,
             CASE WHEN p.item_id IS NULL THEN false ELSE p.planning_enabled END AS planning_enabled,
             p.vendor_yard_id, p.vendor_yard,
             CASE
@@ -826,7 +889,7 @@ export async function buildSmartScmItemMasterCsvTemplate() {
        LEFT JOIN scm_smart_item_yard_policies y
          ON y.item_id = i.item_id
         AND y.location_id = ANY($1::bigint[])
-      GROUP BY i.item_id, i.item_name, i.vendor,
+      GROUP BY i.item_id, i.item_name, i.vendor, i.product_type, i.return_policy_override,
                i.netsuite_lead_time_days, p.item_id, p.planning_enabled,
                p.vendor_yard_id, p.vendor_yard, p.lead_time_days
       ORDER BY LOWER(i.item_name), i.item_name, i.item_id`,
@@ -839,6 +902,7 @@ export async function buildSmartScmItemMasterCsvTemplate() {
         item_id: row.item_id,
         item_name: row.item_name,
         vendor: row.vendor,
+        return_policy: row.return_policy_override || "DEFAULT",
         planning_enabled: Boolean(row.planning_enabled),
         vendor_yard_id: row.vendor_yard_id,
         vendor_yard: row.vendor_yard,
@@ -869,7 +933,8 @@ export async function buildSmartScmItemMasterCsvTemplate() {
 export async function importSmartScmItemMasterCsv({
   buffer,
   filename = "smart-scm-item-master.csv",
-  operatorId = null
+  operatorId = null,
+  allowReturnPolicyChange = false
 } = {}) {
   const cleanFilename = cleanItemMasterCsvFilename(filename);
   const parsed = parseSmartScmItemMasterCsv(buffer);
@@ -880,13 +945,13 @@ export async function importSmartScmItemMasterCsv({
     await query("SELECT pg_advisory_xact_lock(hashtext('smart-scm-item-master-csv-import'))");
     await syncSmartScmPoliciesFromInventoryItems({ itemIds, updateExisting: false });
     const itemResult = await query(
-      `SELECT i.item_id, i.vendor_id, i.vendor,
+      `SELECT i.item_id, i.vendor_id, i.vendor, i.product_type, i.return_policy_override,
               p.planning_enabled, p.vendor_yard_id, p.vendor_yard, p.lead_time_days
          FROM inventory_items i
          JOIN scm_smart_item_policies p ON p.item_id = i.item_id
         WHERE i.item_id = ANY($1::bigint[])
         ORDER BY i.item_id
-        FOR UPDATE OF p`,
+        FOR UPDATE OF p, i`,
       [itemIds]
     );
     const yardResult = await query(
@@ -977,6 +1042,8 @@ export async function importSmartScmItemMasterCsv({
       }
       const itemChange = {
         item_id: record.itemId,
+        change_return_policy: false,
+        return_policy_override: null,
         change_planning_enabled: false,
         planning_enabled: null,
         change_lead_time_days: false,
@@ -985,6 +1052,23 @@ export async function importSmartScmItemMasterCsv({
         vendor_yard_id: null,
         vendor_yard: null
       };
+
+      if (parsed.headers.has("return_policy")) {
+        const rawPolicy = String(record.values.return_policy ?? "").trim();
+        const requestedPolicy = normalizeReturnPolicy(rawPolicy, { nullable: true });
+        const currentPolicy = normalizeReturnPolicy(current.return_policy_override, { nullable: true });
+        if (requestedPolicy !== currentPolicy) {
+          if (!allowReturnPolicyChange) {
+            throw itemMasterCsvError("Only an admin can change the company-wide Return Policy.", {
+              row: record.rowNumber,
+              column: "return_policy"
+            });
+          }
+          itemChange.change_return_policy = true;
+          itemChange.return_policy_override = requestedPolicy;
+          countField("return_policy");
+        }
+      }
 
       const planning = parseItemMasterCsvBoolean(record, "planning_enabled");
       if (planning.supplied && planning.value !== Boolean(current.planning_enabled)) {
@@ -1017,7 +1101,7 @@ export async function importSmartScmItemMasterCsv({
           countField("vendor_yard");
         }
       }
-      if (itemChange.change_planning_enabled || itemChange.change_lead_time_days || itemChange.change_vendor_yard) {
+      if (itemChange.change_return_policy || itemChange.change_planning_enabled || itemChange.change_lead_time_days || itemChange.change_vendor_yard) {
         itemChanges.push(itemChange);
         updatedItemIds.add(record.itemId);
       }
@@ -1140,6 +1224,24 @@ export async function importSmartScmItemMasterCsv({
            SELECT *
              FROM jsonb_to_recordset($1::jsonb) AS change(
                item_id bigint,
+               change_return_policy boolean,
+               return_policy_override text
+             )
+         )
+         UPDATE inventory_items item
+            SET return_policy_override = change.return_policy_override,
+                return_policy_updated_by = $2,
+                return_policy_updated_at = now()
+           FROM changes change
+          WHERE item.item_id = change.item_id
+            AND change.change_return_policy = true`,
+        [JSON.stringify(itemChanges), operatorId]
+      );
+      await query(
+        `WITH changes AS (
+           SELECT *
+             FROM jsonb_to_recordset($1::jsonb) AS change(
+               item_id bigint,
                change_planning_enabled boolean,
                planning_enabled boolean,
                change_lead_time_days boolean,
@@ -1170,7 +1272,12 @@ export async function importSmartScmItemMasterCsv({
                 updated_by = $2,
                 updated_at = now()
            FROM changes change
-          WHERE policy.item_id = change.item_id`,
+          WHERE policy.item_id = change.item_id
+            AND (
+              change.change_planning_enabled
+              OR change.change_lead_time_days
+              OR change.change_vendor_yard
+            )`,
         [JSON.stringify(itemChanges), operatorId]
       );
     }
@@ -1268,7 +1375,12 @@ export async function importSmartScmItemMasterCsv({
       bytes: buffer.length,
       rowsRead: parsed.records.length,
       itemsUpdated: updatedItemIds.size,
-      itemPoliciesUpdated: itemChanges.length,
+      returnPoliciesUpdated: itemChanges.filter((change) => change.change_return_policy).length,
+      itemPoliciesUpdated: itemChanges.filter((change) => (
+        change.change_planning_enabled
+        || change.change_lead_time_days
+        || change.change_vendor_yard
+      )).length,
       yardPoliciesUpdated: yardChanges.length,
       unchangedRows: parsed.records.length - updatedItemIds.size,
       fieldCounts
@@ -1287,14 +1399,17 @@ export async function importSmartScmItemMasterCsv({
   });
 }
 
-export async function updateSmartScmItem(itemId, values = {}, operatorId = null) {
+export async function updateSmartScmItem(itemId, values = {}, operatorId = null, {
+  allowReturnPolicyChange = false
+} = {}) {
   const id = Number(itemId);
   if (!Number.isInteger(id) || id <= 0) throw Object.assign(new Error("A valid item ID is required."), { status: 400 });
+  const hasLeadTimeSource = Object.hasOwn(values, "leadTimeDays");
   const leadTimeDays = nullableNumber(values.leadTimeDays);
   if (leadTimeDays !== null && (leadTimeDays < 1 || leadTimeDays > 730)) {
     throw Object.assign(new Error("Lead time must be between 1 and 730 days."), { status: 400 });
   }
-  const hasVendorYardSource = Object.hasOwn(values, "vendorYard");
+  const hasVendorYardSource = Object.hasOwn(values, "vendorYard") || Object.hasOwn(values, "vendorYardId");
   let vendorYard = hasVendorYardSource ? String(values.vendorYard || "").trim() || null : null;
   if (vendorYard && vendorYard.length > 180) throw Object.assign(new Error("Vendor yard is too long."), { status: 400 });
   let vendorYardId = nullableNumber(values.vendorYardId);
@@ -1308,22 +1423,86 @@ export async function updateSmartScmItem(itemId, values = {}, operatorId = null)
     vendorYard = yardResult.rows[0].yard;
   }
   const planningEnabled = values.planningEnabled === undefined ? null : Boolean(values.planningEnabled);
+  const hasReturnPolicy = Object.hasOwn(values, "returnPolicyOverride");
+  if (hasReturnPolicy && !allowReturnPolicyChange) {
+    throw Object.assign(new Error("Only an admin can change the company-wide Return Policy."), { status: 403 });
+  }
+  const returnPolicyOverride = hasReturnPolicy
+    ? normalizeReturnPolicy(values.returnPolicyOverride, { nullable: true })
+    : null;
+  const expectedReturnPolicyRevision = hasReturnPolicy
+    ? String(values.expectedReturnPolicyRevision || "").trim().toLowerCase()
+    : "";
+  if (hasReturnPolicy && !/^[a-f0-9]{64}$/.test(expectedReturnPolicyRevision)) {
+    throw Object.assign(
+      new Error("Refresh Item Master before changing Return Policy, then try again."),
+      { status: 400, code: "RETURN_POLICY_REVISION_REQUIRED" }
+    );
+  }
   const yardPolicies = Array.isArray(values.yardPolicies) ? values.yardPolicies : [];
+  const hasSmartPolicyChange = hasLeadTimeSource
+    || hasVendorYardSource
+    || planningEnabled !== null;
+  let returnPolicyChanged = false;
   const result = await withTransaction(async () => {
-    await syncSmartScmPoliciesFromInventoryItems({ itemIds: [id] });
-    const updated = await query(
-      `UPDATE scm_smart_item_policies
-          SET lead_time_days = $2,
-              vendor_yard_id = $3,
-              vendor_yard = $4,
+    await syncSmartScmPoliciesFromInventoryItems({
+      itemIds: [id],
+      updateExisting: hasSmartPolicyChange
+    });
+    if (hasReturnPolicy) {
+      const currentPolicy = await query(
+        `SELECT item_id, product_type, return_policy_override, return_policy_updated_at
+           FROM inventory_items
+          WHERE item_id = $1
+          FOR UPDATE`,
+        [id]
+      );
+      if (!currentPolicy.rowCount) {
+        throw Object.assign(new Error("NetSuite item was not found in Item Master."), { status: 404 });
+      }
+      if (smartItemReturnPolicyRevision(currentPolicy.rows[0]) !== expectedReturnPolicyRevision) {
+        throw Object.assign(
+          new Error("Return Policy changed after this Item Master row was loaded. Refresh and review the current policy before saving."),
+          { status: 409, code: "RETURN_POLICY_CONFLICT" }
+        );
+      }
+      const policyUpdated = await query(
+        `UPDATE inventory_items
+            SET return_policy_override = $2,
+                return_policy_updated_by = $3,
+                return_policy_updated_at = now()
+          WHERE item_id = $1
+            AND return_policy_override IS DISTINCT FROM $2::text
+          RETURNING item_id`,
+        [id, returnPolicyOverride, operatorId]
+      );
+      if (!policyUpdated.rowCount) {
+        const exists = await query("SELECT 1 FROM inventory_items WHERE item_id = $1", [id]);
+        if (!exists.rowCount) {
+          throw Object.assign(new Error("NetSuite item was not found in Item Master."), { status: 404 });
+        }
+      } else {
+        returnPolicyChanged = true;
+      }
+    }
+    const updated = hasSmartPolicyChange
+      ? await query(
+        `UPDATE scm_smart_item_policies
+          SET lead_time_days = CASE WHEN $7::boolean THEN $2 ELSE lead_time_days END,
+              vendor_yard_id = CASE WHEN $8::boolean THEN $3 ELSE vendor_yard_id END,
+              vendor_yard = CASE WHEN $8::boolean THEN $4 ELSE vendor_yard END,
               planning_enabled = COALESCE($5, planning_enabled),
               source_input_file_id = NULL,
               updated_by = $6,
               updated_at = now()
         WHERE item_id = $1
         RETURNING item_id`,
-      [id, leadTimeDays, vendorYardId, vendorYard, planningEnabled, operatorId]
-    );
+        [id, leadTimeDays, vendorYardId, vendorYard, planningEnabled, operatorId, hasLeadTimeSource, hasVendorYardSource]
+      )
+      : await query(
+        "SELECT item_id FROM scm_smart_item_policies WHERE item_id = $1",
+        [id]
+      );
     if (!updated.rowCount) throw Object.assign(new Error("NetSuite item was not found in Item Master."), { status: 404 });
     for (const policy of yardPolicies) {
       const yard = YARD_BY_ID.get(String(policy.locationId));
@@ -1427,7 +1606,16 @@ export async function updateSmartScmItem(itemId, values = {}, operatorId = null)
     actorOperatorId: operatorId,
     source: "smart_scm",
     action: "smart_scm.item_master.update",
-    details: { itemId: id, leadTimeDays, vendorYardId, vendorYard, planningEnabled, yardPolicies }
+    details: {
+      itemId: id,
+      leadTimeDays,
+      vendorYardId,
+      vendorYard,
+      planningEnabled,
+      returnPolicyOverride: hasReturnPolicy ? returnPolicyOverride : undefined,
+      returnPolicyChanged,
+      yardPolicies
+    }
   });
   return result;
 }

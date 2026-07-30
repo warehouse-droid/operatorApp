@@ -23,7 +23,8 @@ function emptyCustomOrderDraft() {
     pickupLocation: "",
     dropoffLocation: "",
     orderDetails: "",
-    weightLbs: ""
+    weightLbs: "",
+    stopMinutes: "35"
   };
 }
 
@@ -89,6 +90,7 @@ function normalizeCustomOrder(raw) {
   const defaultMutable = displayStatus === "open" && !planned && !driverActivity;
   const editable = customOrderBoolean(raw, ["editable", "canEdit", "can_edit"], defaultMutable);
   const canCancel = customOrderBoolean(raw, ["canCancel", "can_cancel"], defaultMutable);
+  const rawStopMinutes = customOrderValue(raw, "stopMinutes", "stop_minutes", "destinationStopMinutes");
 
   return {
     raw,
@@ -98,6 +100,7 @@ function normalizeCustomOrder(raw) {
     dropoffLocation: String(customOrderValue(raw, "dropoffLocation", "dropOffLocation", "dropoffAddress", "drop_off_location", "dropoff_location", "dropoff_address") || "").trim(),
     orderDetails: String(customOrderValue(raw, "orderDetails", "details", "order_details", "description") || "").trim(),
     weightLbs: Number(customOrderValue(raw, "weightLbs", "weight", "weight_lbs", "totalWeight", "total_weight") || 0),
+    stopMinutes: rawStopMinutes === "" ? null : Number(rawStopMinutes),
     status: displayStatus,
     rawStatus,
     planned,
@@ -314,6 +317,7 @@ function customOrderCardHtml(order) {
       </div>
       <div class="custom-order-meta">
         <span>Type: Custom</span>
+        <span>Destination stop: ${order.stopMinutes === null ? "Driver timing rule" : `${customOrdersEscape(order.stopMinutes)} min`}</span>
         <span>${customOrdersEscape(createdMeta)}</span>
         ${updatedMeta ? `<span>${customOrdersEscape(updatedMeta)}</span>` : ""}
         ${customOrderAssignmentHtml(order)}
@@ -426,6 +430,21 @@ function customOrderFormHtml() {
             required
           />
         </label>
+        <label>
+          <span class="custom-order-field-label">Destination stop time (minutes) *</span>
+          <input
+            name="stopMinutes"
+            value="${customOrdersEscape(draft.stopMinutes)}"
+            type="number"
+            min="0"
+            max="1440"
+            step="1"
+            inputmode="numeric"
+            placeholder="e.g. 35"
+            required
+          />
+          <span class="custom-order-field-hint">Time planned at the drop-off. Pickup time still follows the driver's own-yard or vendor-yard rule.</span>
+        </label>
         <div class="custom-order-form-actions">
           ${editing ? `<button class="secondary-button" data-action="discard-edit" type="button" ${customOrdersState.saving ? "disabled" : ""}>Discard changes</button>` : `<button class="secondary-button" data-action="clear-form" type="button" ${customOrdersState.saving ? "disabled" : ""}>Clear</button>`}
           <button class="primary-action" type="submit" ${customOrdersState.saving ? "disabled" : ""}>${customOrdersState.saving ? "Saving…" : editing ? "Save changes" : "Create order"}</button>
@@ -497,7 +516,8 @@ function readCustomOrderDraft() {
     pickupLocation: String(data.get("pickupLocation") || "").trim(),
     dropoffLocation: String(data.get("dropoffLocation") || "").trim(),
     orderDetails: String(data.get("orderDetails") || "").trim(),
-    weightLbs: String(data.get("weightLbs") || "").trim()
+    weightLbs: String(data.get("weightLbs") || "").trim(),
+    stopMinutes: String(data.get("stopMinutes") || "").trim()
   };
 }
 
@@ -511,6 +531,15 @@ function validateCustomOrderDraft(draft) {
   if (!draft.orderDetails) throw new Error("Order details are required.");
   const weight = Number(draft.weightLbs);
   if (!Number.isFinite(weight) || weight <= 0) throw new Error("Weight must be greater than zero.");
+  const stopMinutes = Number(draft.stopMinutes);
+  if (
+    String(draft.stopMinutes ?? "").trim() === ""
+    || !Number.isInteger(stopMinutes)
+    || stopMinutes < 0
+    || stopMinutes > 1440
+  ) {
+    throw new Error("Destination stop time must be a whole number from 0 to 1440 minutes.");
+  }
   if (!customOrdersState.editingId) {
     const duplicate = customOrdersState.orders.find((order) => order.refNumber.toLowerCase() === draft.refNumber.toLowerCase());
     if (duplicate) throw new Error(`Reference number ${draft.refNumber} already exists.`);
@@ -520,7 +549,8 @@ function validateCustomOrderDraft(draft) {
     pickupLocation: draft.pickupLocation,
     dropoffLocation: draft.dropoffLocation,
     orderDetails: draft.orderDetails,
-    weightLbs: weight
+    weightLbs: weight,
+    stopMinutes
   };
 }
 
@@ -595,7 +625,8 @@ function beginCustomOrderEdit(id, { updateUrl = true } = {}) {
     pickupLocation: order.pickupLocation,
     dropoffLocation: order.dropoffLocation,
     orderDetails: order.orderDetails,
-    weightLbs: String(order.weightLbs || "")
+    weightLbs: String(order.weightLbs || ""),
+    stopMinutes: String(order.stopMinutes ?? 35)
   };
   customOrdersState.notice = null;
   renderCustomOrders();

@@ -8,6 +8,10 @@ assert(
   /function locationCheckApproved\(\)[\s\S]{0,160}locationCheck\?\.status === "ok" \|\| locationOverrideAccepted/.test(driverSource),
   "GPS approval must require an OK result or an explicit override."
 );
+assert(
+  !/function locationCheckApproved\(\)[\s\S]{0,160}driverUsesSamsaraWorkflow\(\)/.test(driverSource),
+  "The per-driver Samsara write-workflow setting must not bypass the frontend GPS gate."
+);
 
 const showPhotoHandler = driverSource.match(/if \(action === "show-photo"\) \{([\s\S]*?)\n  \}/)?.[1] || "";
 assert(showPhotoHandler, "Show-photo handler must exist.");
@@ -35,6 +39,11 @@ assert(completionRoute, "Driver photo completion endpoint must exist.");
 assert(
   completionRoute.indexOf("checkDriverJobLocation(job)") < completionRoute.indexOf("recordDriverJobPhotos"),
   "The server must keep its GPS check before committing stop completion."
+);
+assert(
+  !completionRoute.includes("driverSamsaraWorkflowEnabled(req.driver)")
+    && !completionRoute.includes("driverLocationCheckNotRequired(job)"),
+  "The per-driver Samsara write-workflow setting must not bypass the server GPS gate."
 );
 
 console.log("Driver GPS-before-photo gate harness passed.");

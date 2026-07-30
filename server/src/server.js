@@ -7,8 +7,38 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { config, isNetSuiteSandboxEnvironment, listEnvFiles, selectEnvFile } from "./config.js";
 import { beginRollbackContext, pool, query, withTransaction } from "./db.js";
 import { fetchSalesOrderReferenceFromNetSuite, fetchTransactionReferenceByTranidFromNetSuite } from "./netsuite.js";
-import { buildAuthorizationUrl, exchangeCodeForToken, fetchDeliveryOrdersFromNetSuite, fetchDeliveryOrderFromNetSuite, fetchCustomerPickupOrderFromNetSuite, fetchDeliveryOrderDetailsFromNetSuite, fetchDeliveryOrderDetailsBatchFromNetSuite, fetchTransferDeliveryOrdersFromNetSuite, fetchTransferDeliveryOrderFromNetSuite, fetchTransferOrderDetailsFromNetSuite, fetchTransferOrderVerificationLinesFromNetSuite, fetchTransferOrderByIdFromNetSuite, findTransferOrdersByDependencyMarkerFromNetSuite, fetchPurchaseOrdersFromNetSuite, fetchPurchaseOrderFromNetSuite, fetchPurchaseOrderReferenceFromNetSuite, fetchPurchaseOrderDetailsFromNetSuite, fetchTransferReceivingOrdersFromNetSuite, fetchTransferReceivingOrderFromNetSuite, fetchInventoryBalanceForItemFromNetSuite, fetchInventoryBalancesFromNetSuite, fetchInventoryBalancesForItemsFromNetSuite, fetchItemFulfillmentFromNetSuite, fetchItemReceiptFromNetSuite, fetchTransactionProgressFromNetSuite, fetchTransactionStatusFromNetSuite, createPurchaseOrderInNetSuite, createTransferOrderInNetSuite, updateTransferOrderStatusInNetSuite, fetchPickingTicketFromNetSuite, resolveNetSuiteTransferLocations, resolveNetSuiteYardLocations, resolvePalletItemFromNetSuite, transformSalesOrderToItemFulfillment, transformTransferOrderToItemFulfillment, transformPurchaseOrderToItemReceipt, transformTransferOrderToItemReceipt } from "./netsuite.js";
-import { buildTransferDependencyRestPayload, transferDependencyMemoMarker } from "./transfer-dependency-netsuite.js";
+import { buildAuthorizationUrl, exchangeCodeForToken, fetchDeliveryOrdersFromNetSuite, fetchDeliveryOrderFromNetSuite, fetchCustomerPickupOrderFromNetSuite, fetchDeliveryOrderDetailsFromNetSuite, fetchDeliveryOrderDetailsBatchFromNetSuite, fetchTransferDeliveryOrdersFromNetSuite, fetchTransferDeliveryOrderFromNetSuite, fetchTransferOrderDetailsFromNetSuite, fetchTransferOrderVerificationLinesFromNetSuite, fetchTransferOrderByIdFromNetSuite, findTransferOrdersByDependencyMarkerFromNetSuite, findTransferOrdersBySmartScmMarkerFromNetSuite, fetchPurchaseOrdersFromNetSuite, fetchPurchaseOrderFromNetSuite, fetchPurchaseOrderReferenceFromNetSuite, fetchPurchaseOrderDetailsFromNetSuite, fetchTransferReceivingOrdersFromNetSuite, fetchTransferReceivingOrderFromNetSuite, fetchInventoryBalanceForItemFromNetSuite, fetchInventoryBalancesFromNetSuite, fetchInventoryBalancesForItemsFromNetSuite, fetchItemFulfillmentFromNetSuite, fetchItemReceiptFromNetSuite, fetchTransactionProgressFromNetSuite, fetchTransactionStatusFromNetSuite, createPurchaseOrderInNetSuite, createTransferOrderInNetSuite, updateTransferOrderStatusInNetSuite, fetchPickingTicketFromNetSuite, resolveNetSuiteTransferLocations, resolveNetSuiteYardLocations, resolvePalletItemFromNetSuite, transformSalesOrderToItemFulfillment, transformTransferOrderToItemFulfillment, transformPurchaseOrderToItemReceipt, transformTransferOrderToItemReceipt } from "./netsuite.js";
+import { buildTransferDependencyRestPayload, selectSmartScmMarkerTransferOrder, smartScmTransferOrderMemoMarker, transferDependencyMemoMarker } from "./transfer-dependency-netsuite.js";
+import {
+  assertScmReconciliationOrderEditable,
+  cancelScmReconciliationRun,
+  enrichScmScheduleWithReconciliation,
+  getScmReconciliationRunDetails,
+  getScmReconciliationPreference,
+  getScmReconciliationSettings,
+  listScmPoSplitLineAdjustmentOptions,
+  listScmReconciliationRuns,
+  reassignScmPoSplitLineSource,
+  resolveScmReconciliationReview,
+  storeScmIfIrWebhook,
+  updateScmReconciliationPreference,
+  updateScmReconciliationRunTargetDecision,
+  updateScmReconciliationSettings,
+  verifyScmIfIrWebhookSignature
+} from "./scm-reconciliation-repository.js";
+import {
+  applyScmReconciliationRun,
+  cancelMissingScmPurchaseOrder,
+  executeScmReconciliationRun,
+  processScmIfIrWebhookResult,
+  resumeScmReconciliationRun,
+  retryScmReconciliationOrder,
+  scmReconciliationNightlyTick,
+  startScmReconciliationRun
+} from "./scm-reconciliation-service.js";
+import { getScmSchedulePreference, normalizeScmSchedulePreferenceSurface, updateScmSchedulePreference } from "./scm-schedule-preference-repository.js";
+import { getScmScheduleFormatting, updateScmScheduleFormatting } from "./scm-schedule-formatting-repository.js";
+import { canViewRestrictedScmOrders, filterRestrictedScmOrders } from "./scm-order-visibility.js";
 import { syncTargetedNetSuiteOrder } from "./targeted-order-sync.js";
 import { listDeliveryOrders, listVrmaDeliveryPrepOrders, getDeliveryOrder, getFulfillableDeliveryOrder, buildItemFulfillmentPayload, markDeliveryPrepared, updateDeliveryStatus, confirmDeliveryLine, confirmDeliveryLines, setDeliveryLinePackedQuantity, unpackDeliveryLine, unpackDeliveryOrder, recordDeliveryFulfillment, recordDeliveryFulfillmentFailure, recordDeliveryLoad, listDeliveryFulfillments, getDeliveryBootstrap, getDeliveryPrepNotifications, resetDeliveryFulfillmentState, applyConfirmedDispatchPlanToDelivery, deactivateUnplannedDispatchSplitOrders, getNextDispatchSplitSuffix, getCurrentOperatorDeliveryDraft, releaseCurrentDeliveryDraft, listSavedDeliveryOrdersForOperator, listSavedDeliveryOrderKeysForOperator, saveDeliveryOrderForOperator, removeSavedDeliveryOrderForOperator, listDeliveryLoadTrucks, listDeliveryLoadOrders } from "./delivery-repository.js";
 import { getYardMovementDetail, listYardMovementCsvRows, listYardMovements } from "./yard-movement-repository.js";
@@ -21,7 +51,7 @@ import { listExistingInboundOrderIds, listExistingOutboundOrderIds, markMissingI
 import { acceptNetSuiteMirrorEvents, enqueueNetSuiteMirrorOrderEvent, getNetSuiteMirrorStatus, isNetSuiteMirrorConsumer, isNetSuiteMirrorSource, listNetSuiteMirrorManifest, retryNetSuiteMirrorFailures } from "./netsuite-mirror-repository.js";
 import { kickNetSuiteMirrorConsumer, localNetSuiteMirrorEventPage, localNetSuiteMirrorInventorySnapshot, localNetSuiteMirrorOrderSnapshot, relayPendingNetSuiteMirrorEvents, requireNetSuiteMirrorSignature, runNetSuiteMirrorConsumerTick, runNetSuiteMirrorReconciliation, startNetSuiteMirrorWorkers } from "./netsuite-mirror-service.js";
 import { listOperatorHistory, listRecordWarnings, reportOperatorRecordError, resolveRecordWarning } from "./history-repository.js";
-import { listDispatchOrders, enrichDispatchOrdersWithPoTargetAllocations, listScmPurchaseOrders, listScmSchedule, updateScmScheduleEntry, createScmScheduleGroup, cancelScmScheduleGroup, listScmViewPresets, upsertScmViewPreset, createScmVrmaOrder, getScmVrmaOrder, getScmVrmaOptions, searchScmVrmaItems, syncScmScheduleFromDispatchPlan, createScmPurchaseOrderSplit, updateScmPurchaseOrderSplitRef, updateScmPurchaseOrderSplitDestination, updateScmPurchaseOrderSplitPickupYard, updatePurchaseOrderDispatchRef, cancelScmPurchaseOrderSplit, refreshDispatchEnrichment, reparseMissingSalesOrderDispatch, searchSalesOrderMethodOverrides, setPurchaseOrderVendorYard, updateDispatchOrderDetails, updateSalesOrderLocalMethod, getSalesOrderPoAllocationOptions, createSalesOrderPoAllocation, createSalesOrderPoAllocations, cancelSalesOrderPoAllocation, createDispatchOperatorRequest, upsertLocalCoOrder, cancelLocalCoOrder, listDispatchOperatorRequests, resolveDispatchOperatorRequestsForOrder } from "./dispatch-repository.js";
+import { listDispatchOrders, enrichDispatchOrdersWithPoTargetAllocations, listScmPurchaseOrders, listScmSchedule, updateScmScheduleEntry, createScmScheduleGroup, cancelScmScheduleGroup, listScmViewPresets, upsertScmViewPreset, completeScmVrmaOrderOverride, createScmVrmaOrder, getScmVrmaOrder, getScmVrmaOptions, searchScmVrmaItems, syncScmScheduleFromDispatchPlan, createScmPurchaseOrderSplit, updateScmPurchaseOrderSplitRef, updateScmPurchaseOrderSplitDestination, updateScmPurchaseOrderSplitPickupYard, updatePurchaseOrderDispatchRef, cancelScmPurchaseOrderSplit, refreshDispatchEnrichment, reparseMissingSalesOrderDispatch, searchSalesOrderMethodOverrides, setPurchaseOrderVendorYard, updateDispatchOrderDetails, updateSalesOrderLocalMethod, getSalesOrderPoAllocationOptions, createSalesOrderPoAllocation, createSalesOrderPoAllocations, cancelSalesOrderPoAllocation, createDispatchOperatorRequest, upsertLocalCoOrder, cancelLocalCoOrder, listDispatchOperatorRequests, resolveDispatchOperatorRequestsForOrder } from "./dispatch-repository.js";
 import { setPurchaseOrderBlanketFlag } from "./dispatch-repository.js";
 import { cancelDispatchCustomOrder, canonicalizeDispatchCustomOrdersInPlan, completeDispatchCustomOrders, createDispatchCustomOrder, dispatchOrderFromCustomOrder, getDispatchCustomOrderForUpdate, listDispatchCustomOrders, updateDispatchCustomOrder } from "./dispatch-custom-order-repository.js";
 import { DISPATCH_VENDOR_WEEK_DAYS, listDispatchVendorYards, listDispatchLocalVendors, saveDispatchVendorYardSchedule, updateDispatchVendorYard, upsertDispatchVendorYard, listDispatchParserRules, updateDispatchParserRule, listOllamaAudit, listDispatchVendorMappings, discoverDispatchVendorMappingsFromPurchaseOrders, updateDispatchVendorMapping, createDispatchLocalVendor, updateDispatchLocalVendor } from "./dispatch-enrichment.js";
@@ -45,7 +75,7 @@ import { buildSmartScmItemMasterCsvTemplate, getSmartScmSyncStatus, importSmartS
 import { refreshSmartScmLiveData } from "./smart-scm-sync-service.js";
 import { completeSmartScmTransferExecution, failSmartScmTransferExecution, getSmartScmProposal, markSmartScmTransferAttention, prepareSmartScmTransferExecution, recordSmartScmVendorResponses, setSmartScmPalletQuantityOverride, updateSmartScmProposal } from "./smart-scm-planning-repository.js";
 import { createSimplePdf, leaseYardPrintJob, listSmartScmPrintJobs, listYardPrinters, queueSmartScmPrintJob, queueYardPrinterTest, retrySmartScmPrintJob, rotateYardPrinterToken, updateLeasedPrintJob, updateYardPrinter, yardPrintJobDocument } from "./smart-scm-print-repository.js";
-import { addSmartScmVendorAlternativeLine, listSmartScmNetSuitePoReviewLoads, listSmartScmVendorReplyLoads, removeSmartScmVendorAlternativeLine, saveSmartScmVendorReplyLoad, searchSmartScmVendorAlternatives, stageSmartScmVendorReplyLoad, updateSmartScmNetSuitePoReviewPalletQuantity } from "./smart-scm-vendor-repository.js";
+import { addSmartScmVendorAlternativeLine, listSmartScmNetSuitePoReviewLoads, listSmartScmVendorReplyLoads, removeSmartScmNetSuitePoReviewLoad, removeSmartScmVendorAlternativeLine, saveSmartScmVendorReplyLoad, searchSmartScmVendorAlternatives, stageSmartScmVendorReplyLoad, updateSmartScmNetSuitePoReviewPalletQuantity } from "./smart-scm-vendor-repository.js";
 import { addSmartScmProposalLine, createSmartScmManualLoad, groupSmartScmProposals, recalculateSmartScmPoProposal, removeSmartScmProposalLine, searchSmartScmManualLoadItems, searchSmartScmProposalItems, splitSmartScmProposalLine, updateSmartScmProposalLine } from "./smart-scm-proposal-editor.js";
 import { addTransferDependencyProposalLine, searchTransferDependencyProposalItems } from "./transfer-dependency-manual-items.js";
 import { listSmartScmRouteRules, upsertSmartScmRouteRule } from "./smart-scm-route-repository.js";
@@ -54,6 +84,31 @@ import { changedLockedLoadAssignments, dispatchLoadAssignment, normalizeDispatch
 import { executeSmartScmPurchaseProposal } from "./smart-scm-purchase-service.js";
 import { SALES_YARDS, getSalesOrderPrintCandidate, getSalesOrderPrintSnapshot, listSalesOrderPrintCandidates, listSalesOrderPrintHistory, normalizeSalesYardLocationIds } from "./sales-repository.js";
 import { getSalesPortalSettings, isPublicSalesAccessEnabled, updateSalesPortalSettings } from "./sales-settings-repository.js";
+import { syncReturnCustomerDirectory } from "./return-customer-directory.js";
+import {
+  decideReturnLine,
+  deleteReturnDraft,
+  discardReturnDraftForControl,
+  getReturnDraftForControl,
+  getReturnReasons,
+  getReturnRecordDetail,
+  getReturnYardSettings,
+  linkReturnNetSuiteTransaction,
+  listReturnDrafts,
+  listReturnDraftsForControl,
+  listReturnRecords,
+  listReturnYardSettings,
+  lookupReturnCustomerPalletBalance,
+  lookupReturnSalesOrder,
+  processPendingReturnSyncs,
+  reconcileReturnRecords,
+  saveReturnDraft,
+  searchReturnCustomers,
+  submitReturnBatch,
+  syncReturnRecord,
+  updateReturnYardSettings,
+  voidReturnRecord
+} from "./return-repository.js";
 const app = express();
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.resolve(dirname, "../public");
@@ -212,6 +267,102 @@ function changedDispatchOperatorRefs(beforePlan = {}, afterPlan = {}) {
     if (before.get(orderRef) !== signature) changed.push(orderRef);
   }
   return changed;
+}
+
+function dispatchScmPlacementMap(plan = {}) {
+  const orderById = new Map(
+    (plan.orders || [])
+      .filter((order) => ["PO", "TO"].includes(String(order?.type || "").toUpperCase()))
+      .map((order) => [String(order.id || ""), order])
+  );
+  const placements = new Map();
+  for (const [orderRef, order] of orderById) {
+    placements.set(orderRef, {
+      kind: String(order.type || "").toUpperCase(),
+      order: {
+        id: orderRef,
+        sourceTable: order.sourceTable || "",
+        sourceId: order.sourceId || "",
+        pickup: order.pickup || order.pickupPoint || "",
+        dropoff: order.dropoff || order.dropoffPoint || "",
+        weight: order.weight || order.weightLbs || 0
+      },
+      stops: []
+    });
+  }
+  for (const [truckIndex, truck] of (plan.trucks || []).entries()) {
+    for (const [loadIndex, load] of (truck.loads || []).entries()) {
+      for (const [stopIndex, stop] of (load.stops || []).entries()) {
+        const ref = String(stop?.orderId || "");
+        const placement = placements.get(ref);
+        if (!placement) continue;
+        placement.stops.push({
+          truck: truck.id || truck.plate || truckIndex,
+          load: load.id || load.name || loadIndex,
+          stop: stopIndex,
+          type: stop.type || "",
+          location: stop.location || stop.address || ""
+        });
+      }
+    }
+  }
+  return new Map([...placements].map(([ref, placement]) => [
+    ref,
+    JSON.stringify(placement)
+  ]));
+}
+
+function changedDispatchScmRefs(beforePlan = {}, afterPlan = {}) {
+  const before = dispatchScmPlacementMap(beforePlan);
+  const after = dispatchScmPlacementMap(afterPlan);
+  return [...new Set([...before.keys(), ...after.keys()])]
+    .filter((ref) => before.get(ref) !== after.get(ref));
+}
+
+function dispatchPlacedScmRefs(plan = {}) {
+  const scmKindsByRef = new Map(
+    (plan.orders || [])
+      .filter((order) => ["PO", "TO"].includes(String(order?.type || "").toUpperCase()))
+      .map((order) => [String(order.id || ""), String(order.type || "").toUpperCase()])
+  );
+  const refs = new Set();
+  for (const truck of plan.trucks || []) {
+    for (const load of truck.loads || []) {
+      for (const stop of load.stops || []) {
+        const orderRef = String(stop?.orderId || "");
+        if (scmKindsByRef.has(orderRef)) refs.add(orderRef);
+      }
+    }
+  }
+  return [...refs];
+}
+
+function changedPlacedDispatchScmRefs(changedRefs = [], afterPlan = {}) {
+  const placed = new Set(dispatchPlacedScmRefs(afterPlan));
+  return (changedRefs || []).filter((ref) => placed.has(String(ref || "")));
+}
+
+async function assertNoRestrictedScmDispatchOrders(orderRefs = [], action = "plan") {
+  const requestedRefs = [...new Set((orderRefs || [])
+    .map((ref) => String(ref || "").trim())
+    .filter(Boolean))];
+  if (!requestedRefs.length) return;
+  const restrictedRefs = await listRestrictedScmDispatchOrderRefs();
+  const conflicts = requestedRefs
+    .filter((ref) => restrictedRefs.has(ref.toLowerCase()))
+    .map((orderRef) => ({
+      orderRef,
+      reason: `${orderRef} is Blanket, Hold, Complete, or Cancelled and cannot be added to Dispatch.`
+    }));
+  if (!conflicts.length) return;
+  throw Object.assign(
+    new Error(`Remove restricted PO/TO orders before you ${action}: ${conflicts.map((item) => item.orderRef).join(", ")}.`),
+    {
+      status: 409,
+      code: "DISPATCH_RESTRICTED_SCM_ORDER",
+      conflicts
+    }
+  );
 }
 
 function dispatchOperatorImpactSignature(plan = {}) {
@@ -610,6 +761,104 @@ function isSnapshotDerivedDispatchOrder(order = {}) {
   );
 }
 
+async function listRestrictedScmDispatchOrderRefs() {
+  const result = await query(
+    `WITH restricted_rows AS (
+       SELECT s.order_ref,
+              s.display_ref,
+              s.group_ref
+         FROM scm_transport_schedule s
+        WHERE LOWER(BTRIM(COALESCE(s.status, 'Queued'))) IN (
+          'hold', 'complete', 'completed', 'cancelled', 'canceled'
+        )
+       UNION ALL
+       SELECT po.tranid AS order_ref,
+              po.dispatch_ref AS display_ref,
+              NULL::text AS group_ref
+         FROM purchase_orders po
+        WHERE po.is_blanket_po = true
+           OR (
+             LOWER(BTRIM(COALESCE(po.initial_scm_status, 'Queued'))) IN (
+               'hold', 'complete', 'completed', 'cancelled', 'canceled'
+             )
+             AND NOT EXISTS (
+               SELECT 1
+                 FROM scm_transport_schedule current_schedule
+                WHERE current_schedule.order_kind = 'PO'
+                  AND (
+                    current_schedule.source_id = po.netsuite_id
+                    OR LOWER(BTRIM(current_schedule.order_ref)) = LOWER(BTRIM(po.tranid))
+                    OR LOWER(BTRIM(current_schedule.order_ref)) = LOWER(BTRIM(COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid)))
+                    OR LOWER(BTRIM(COALESCE(current_schedule.display_ref, ''))) = LOWER(BTRIM(po.tranid))
+                    OR LOWER(BTRIM(COALESCE(current_schedule.display_ref, ''))) = LOWER(BTRIM(COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid)))
+                  )
+             )
+             AND NOT EXISTS (
+               SELECT 1
+                 FROM scm_reconciliation_order_state current_state
+                WHERE current_state.order_kind = 'PO'
+                  AND (
+                    current_state.source_order_netsuite_id = po.netsuite_id
+                    OR LOWER(BTRIM(current_state.source_order_ref)) = LOWER(BTRIM(po.tranid))
+                  )
+                  AND current_state.reconciliation_status IS DISTINCT FROM 'pending'
+                  AND COALESCE(BTRIM(current_state.application_status), '') <> ''
+             )
+           )
+       UNION ALL
+       SELECT state.source_order_ref AS order_ref,
+              NULL::text AS display_ref,
+              NULL::text AS group_ref
+         FROM scm_reconciliation_order_state state
+        WHERE LOWER(BTRIM(COALESCE(state.application_status, 'Queued'))) IN (
+          'hold', 'complete', 'completed', 'cancelled', 'canceled'
+        )
+       UNION ALL
+       SELECT target.target_ref AS order_ref,
+              NULL::text AS display_ref,
+              NULL::text AS group_ref
+         FROM scm_reconciliation_order_state state
+         CROSS JOIN LATERAL JSONB_EACH(
+           CASE
+             WHEN JSONB_TYPEOF(state.quantity_summary->'targets') = 'object'
+               THEN state.quantity_summary->'targets'
+             ELSE '{}'::jsonb
+           END
+         ) target(target_ref, target_state)
+        WHERE LOWER(BTRIM(COALESCE(target.target_state->>'applicationStatus', 'Queued'))) IN (
+          'hold', 'complete', 'completed', 'cancelled', 'canceled'
+        )
+     )
+     SELECT DISTINCT LOWER(BTRIM(ref.value)) AS order_ref
+       FROM restricted_rows restricted_row
+       CROSS JOIN LATERAL UNNEST(ARRAY[
+         restricted_row.order_ref,
+         restricted_row.display_ref,
+         restricted_row.group_ref
+       ]) ref(value)
+      WHERE COALESCE(BTRIM(ref.value), '') <> ''`
+  );
+  return new Set(result.rows.map((row) => String(row.order_ref || "").trim()).filter(Boolean));
+}
+
+function dispatchOrderLogicalRefs(order = {}) {
+  return [
+    order.id,
+    order.dispatchRef,
+    order.originalPoRef,
+    order.originalOrderId,
+    order.sourceOrderId,
+    order.scm?.groupRef,
+    ...(Array.isArray(order.childOrders) ? order.childOrders : []),
+    ...(Array.isArray(order.groupAliases) ? order.groupAliases : []),
+    ...(Array.isArray(order.childOrderDetails)
+      ? order.childOrderDetails.flatMap((child) => [child?.id, child?.originalOrderId])
+      : [])
+  ]
+    .map((ref) => String(ref || "").trim().toLowerCase())
+    .filter(Boolean);
+}
+
 async function listDispatchSnapshotDerivedOrders({ type = null } = {}) {
   const sandbox = isNetSuiteSandboxEnvironment();
   const [result, inactiveSplits, blanketPurchaseOrders] = await Promise.all([
@@ -698,7 +947,7 @@ async function listDispatchOrdersForResponse({ type = null, search = "" } = {}) 
   const searchTerm = String(search || "").trim().slice(0, 120);
   const requestedType = String(type || "").trim().toUpperCase();
   const includeCustom = !requestedType || requestedType === "TO" || requestedType === "CUSTOM";
-  const [orders, customOrders, snapshotOrders] = await Promise.all([
+  const [orders, customOrders, snapshotOrders, restrictedScmRefs] = await Promise.all([
     listDispatchOrders({ type, search: searchTerm }),
     includeCustom
       ? listDispatchCustomOrders({
@@ -707,19 +956,111 @@ async function listDispatchOrdersForResponse({ type = null, search = "" } = {}) 
           search: searchTerm
         })
       : Promise.resolve([]),
-    listDispatchSnapshotDerivedOrders({ type })
+    listDispatchSnapshotDerivedOrders({ type }),
+    listRestrictedScmDispatchOrderRefs()
   ]);
-  const currentOrders = [
+  const currentOrders = filterRestrictedScmOrders([
     ...orders,
     ...customOrders.map(dispatchOrderFromCustomOrder)
-  ];
-  const derivedOrders = searchTerm
+  ], { includeRestricted: false }).filter((order) => {
+    if (!["PO", "TO", "VRMA"].includes(String(order?.type || "").trim().toUpperCase())) return true;
+    return !dispatchOrderLogicalRefs(order).some((ref) => restrictedScmRefs.has(ref));
+  });
+  const derivedCandidates = searchTerm
     ? snapshotOrders.filter((order) => dispatchOrderMatchesSearch(order, searchTerm))
     : snapshotOrders;
+  const derivedOrders = filterRestrictedScmOrders(derivedCandidates, {
+    includeRestricted: false
+  }).filter((order) => {
+    if (!["PO", "TO", "VRMA"].includes(String(order?.type || "").trim().toUpperCase())) return true;
+    return !dispatchOrderLogicalRefs(order).some((ref) => restrictedScmRefs.has(ref));
+  });
   const assigned = await enrichDispatchOrdersWithPlanAssignments(mergeDispatchOrderFeedWithSnapshotDerivedOrders(currentOrders, derivedOrders));
   const poLinked = await enrichDispatchOrdersWithPoTargetAllocations(assigned);
   const enriched = await enrichDispatchOrdersWithDependencies(poLinked);
-  return searchTerm ? enriched.filter((order) => dispatchOrderMatchesSearch(order, searchTerm)) : enriched;
+  const reconciliationRows = await enrichScmScheduleWithReconciliation(
+    enriched
+      .filter((order) => ["PO", "TO"].includes(String(order?.type || "").toUpperCase()))
+      .map((order) => ({
+        orderKind: String(order.type).toUpperCase(),
+        orderRef: order.id,
+        sourceRef: order.originalPoRef || order.originalOrderId || order.id,
+        sourceId: order.netsuiteId || order.sourceId || order.raw?.netsuite_id || null,
+        status: order.scm?.status || "Queued"
+      })),
+    { includeDetails: false, view: "dispatch" }
+  );
+  const reconciliationByRef = new Map(reconciliationRows.map((row) => [
+    `${row.orderKind}:${String(row.orderRef || "").toLowerCase()}`,
+    row
+  ]));
+  const withReconciliation = enriched.map((order) => {
+    const row = reconciliationByRef.get(
+      `${String(order.type || "").toUpperCase()}:${String(order.id || "").toLowerCase()}`
+    );
+    if (!row) return order;
+    return {
+      ...order,
+      reconciliationStatus: row.reconciliationStatus || "",
+      reconciliationReason: row.reconciliationReason || "",
+      reconciliationBlocked: String(row.reconciliationStatus || "").toLowerCase() === "review",
+      scm: {
+        ...(order.scm || {}),
+        status: row.status || order.scm?.status || "",
+        reconciliationApplicationStatus: row.reconciliationApplicationStatus || "",
+        reconciliationStatus: row.reconciliationStatus || "",
+        reconciliationReason: row.reconciliationReason || ""
+      }
+    };
+  });
+  const visibleOrders = filterRestrictedScmOrders(withReconciliation, {
+    includeRestricted: false
+  }).filter((order) => {
+    if (!["PO", "TO", "VRMA"].includes(String(order?.type || "").trim().toUpperCase())) return true;
+    return !dispatchOrderLogicalRefs(order).some((ref) => restrictedScmRefs.has(ref));
+  });
+  return searchTerm
+    ? visibleOrders.filter((order) => dispatchOrderMatchesSearch(order, searchTerm))
+    : visibleOrders;
+}
+
+async function listScmPurchaseOrdersForResponse(filters = {}, operator = null) {
+  const orders = await listScmPurchaseOrders(filters);
+  const reconciliationRows = await enrichScmScheduleWithReconciliation(
+    orders.map((order) => ({
+      orderKind: "PO",
+      orderRef: order.id,
+      sourceRef: order.sourcePoRef || order.originalPoRef || order.dispatchRef || order.id,
+      sourceId: order.netsuiteId || order.sourceId || order.raw?.netsuite_id || null,
+      status: order.scm?.status || "Queued"
+    })),
+    { includeDetails: false, view: "dispatch" }
+  );
+  const reconciliationByRef = new Map(reconciliationRows.map((row) => [
+    String(row.orderRef || "").toLowerCase(),
+    row
+  ]));
+  const reconciled = orders.map((order) => {
+    const row = reconciliationByRef.get(String(order.id || "").toLowerCase());
+    if (!row) return order;
+    return {
+      ...order,
+      reconciliationStatus: row.reconciliationStatus || "",
+      reconciliationReason: row.reconciliationReason || "",
+      reconciliationBlocked: String(row.reconciliationStatus || "").toLowerCase() === "review",
+      lastReconciledAt: row.lastReconciledAt || null,
+      scm: {
+        ...(order.scm || {}),
+        status: row.status || order.scm?.status || "",
+        reconciliationApplicationStatus: row.reconciliationApplicationStatus || "",
+        reconciliationStatus: row.reconciliationStatus || "",
+        reconciliationReason: row.reconciliationReason || ""
+      }
+    };
+  });
+  return filterRestrictedScmOrders(reconciled, {
+    includeRestricted: canViewRestrictedScmOrders(operator)
+  });
 }
 
 function sendDispatchDependencyConflictResponse(res, conflicts = []) {
@@ -1233,10 +1574,36 @@ async function approveAndPrintTransferDependencyProposal(batchId, proposalId, op
   }
 }
 
+async function recoverSmartScmTransferOrder({
+  proposalId,
+  locations,
+  attempts = 1,
+  delayMs = 650
+} = {}) {
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const rows = await findTransferOrdersBySmartScmMarkerFromNetSuite({
+      proposalId,
+      sourceLocationId: locations.source.netsuiteLocationId,
+      destinationLocationId: locations.destination.netsuiteLocationId
+    });
+    const match = selectSmartScmMarkerTransferOrder(rows, {
+      proposalId,
+      sourceLocationId: locations.source.netsuiteLocationId,
+      destinationLocationId: locations.destination.netsuiteLocationId
+    });
+    if (match) return match;
+    if (attempt < attempts) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs * attempt));
+    }
+  }
+  return null;
+}
+
 async function executeSmartScmTransferProposal(proposalId, operator) {
   const prepared = await prepareSmartScmTransferExecution(proposalId, operator?.id);
   let transferOrderId = null;
   let transferOrderRef = null;
+  let recovered = false;
   try {
     const printers = await listYardPrinters();
     const printer = printers.find((row) => Number(row.locationId) === Number(prepared.sourceLocationId));
@@ -1259,20 +1626,45 @@ async function executeSmartScmTransferProposal(proposalId, operator) {
           ? resolvePalletItemFromNetSuite()
           : Promise.resolve(null)
       ]);
-      const payload = buildTransferDependencyRestPayload({
-        proposal: {
-          lines: prepared.lines,
-          palletItemId: palletItem?.id ?? null,
-          palletTransferQuantity: prepared.palletTransferQuantity,
-          memo: `${prepared.memo || "Smart SCM replenishment"} | MBBS-SCM:${prepared.id}`
-        },
-        batch: { id: `smart-${prepared.id}`, salesOrderRef: `Smart SCM run ${prepared.runId}` },
+      let markerMatch = await recoverSmartScmTransferOrder({
+        proposalId: prepared.id,
         locations
       });
-      const created = await createTransferOrderInNetSuite(payload, { intercompany: locations.intercompany });
-      transferOrderId = Number(created.id);
-      if (!Number.isInteger(transferOrderId) || transferOrderId <= 0) {
-        throw new Error("NetSuite created the TO without returning a usable record ID; reconcile the MBBS-SCM memo before retrying.");
+      if (markerMatch) {
+        transferOrderId = markerMatch.id;
+        transferOrderRef = markerMatch.tranid || null;
+        recovered = true;
+      } else {
+        const payload = buildTransferDependencyRestPayload({
+          proposal: {
+            lines: prepared.lines,
+            palletItemId: palletItem?.id ?? null,
+            palletTransferQuantity: prepared.palletTransferQuantity,
+            memo: `${prepared.memo || "Smart SCM replenishment"} | ${smartScmTransferOrderMemoMarker(prepared.id)}`
+          },
+          batch: { id: `smart-${prepared.id}`, salesOrderRef: `Smart SCM run ${prepared.runId}` },
+          locations
+        });
+        let createError = null;
+        try {
+          const created = await createTransferOrderInNetSuite(payload, { intercompany: locations.intercompany });
+          transferOrderId = Number(created.id);
+        } catch (error) {
+          createError = error;
+        }
+        if (!Number.isInteger(transferOrderId) || transferOrderId <= 0) {
+          markerMatch = await recoverSmartScmTransferOrder({
+            proposalId: prepared.id,
+            locations,
+            attempts: 4
+          });
+          if (!markerMatch) {
+            throw createError || new Error("NetSuite did not return a TO ID and no matching Smart SCM memo marker was found. Retry is safe after the proposal returns to Failed.");
+          }
+          transferOrderId = markerMatch.id;
+          transferOrderRef = markerMatch.tranid || null;
+          recovered = true;
+        }
       }
       await updateTransferOrderStatusInNetSuite(transferOrderId, { intercompany: locations.intercompany, statusId: "B" });
       const hydrated = await hydrateCreatedDependencyTransferOrder(transferOrderId, {
@@ -1281,10 +1673,13 @@ async function executeSmartScmTransferProposal(proposalId, operator) {
         toLocationId: prepared.destinationLocationId,
         toLocation: prepared.destinationName
       });
-      transferOrderRef = hydrated.tranid || `TO-${transferOrderId}`;
+      transferOrderRef = hydrated.tranid || transferOrderRef || `TO-${transferOrderId}`;
       if (!hydrated.pendingFulfillment) throw new Error(`${transferOrderRef} was created but did not reach Pending Fulfillment.`);
       await completeSmartScmTransferExecution(prepared.id, { transferOrderId, transferOrderRef, mock: false }, operator?.id);
-      document = await fetchPickingTicketFromNetSuite(transferOrderId);
+      document = await fetchPickingTicketFromNetSuite(transferOrderId, {
+        locationId: locations.source.netsuiteLocationId,
+        filenamePrefix: transferOrderRef
+      });
     } else {
       transferOrderRef = `MOCK-TO-${prepared.id}`;
       await completeSmartScmTransferExecution(prepared.id, { transferOrderId: null, transferOrderRef, mock: true }, operator?.id);
@@ -1312,9 +1707,9 @@ async function executeSmartScmTransferProposal(proposalId, operator) {
     }, operator?.id);
     emitAppEvent("scm.smart.updated", { source: "smart-scm-transfer", proposalId: prepared.id, transferOrderId, transferOrderRef });
     if (transferOrderId) emitAppEvent("dispatch.orders.updated", { source: "smart-scm-transfer", refreshOrderPool: true });
-    return { proposalId: prepared.id, mode: prepared.mode, transferOrderId, transferOrderRef, printJob };
+    return { proposalId: prepared.id, mode: prepared.mode, transferOrderId, transferOrderRef, printJob, recovered };
   } catch (error) {
-    if (transferOrderId || transferOrderRef?.startsWith("MOCK-TO-")) {
+    if (transferOrderId || transferOrderRef?.startsWith("MOCK-TO-") || error.smartScmAttention) {
       await markSmartScmTransferAttention(prepared.id, { transferOrderId, transferOrderRef, error }, operator?.id);
     } else {
       await failSmartScmTransferExecution(prepared.id, error, operator?.id);
@@ -1335,21 +1730,47 @@ async function retrySmartScmTransferPrint(proposalId, operator) {
   if (!printer?.transferOrderReady) {
     throw Object.assign(new Error(`${proposal.sourceName} requires two different printers assigned to TO printing, an enabled yard queue, and an agent token.`), { status: 409 });
   }
-  const transferOrderRef = proposal.netsuiteTransferOrderRef || `TO-${proposal.netsuiteTransferOrderId}`;
-  const document = proposal.netsuiteTransferOrderId
-    ? await fetchPickingTicketFromNetSuite(proposal.netsuiteTransferOrderId)
-    : {
-        filename: `${transferOrderRef}-picking-ticket.pdf`,
-        buffer: createSimplePdf([
-          "MBBS Smart SCM — MOCK Picking Ticket",
-          `Reference: ${transferOrderRef}`,
-          `From: ${proposal.sourceName}`,
-          `To: ${proposal.destinationName}`,
-          `Pallets: ${proposal.totalPallets}`,
-          ...proposal.lines.map((line) => `${line.itemName}: ${line.proposedPallets} PLT`),
-          "No NetSuite record was created."
-        ])
-      };
+  let transferOrderRef = proposal.netsuiteTransferOrderRef || `TO-${proposal.netsuiteTransferOrderId}`;
+  let document;
+  if (proposal.netsuiteTransferOrderId) {
+    const locations = await resolveNetSuiteTransferLocations({
+      sourceLocationId: proposal.sourceLocationId,
+      sourceLocation: proposal.sourceName,
+      destinationLocationId: proposal.destinationLocationId,
+      destinationLocation: proposal.destinationName
+    });
+    await updateTransferOrderStatusInNetSuite(proposal.netsuiteTransferOrderId, {
+      intercompany: locations.intercompany,
+      statusId: "B"
+    });
+    const hydrated = await hydrateCreatedDependencyTransferOrder(proposal.netsuiteTransferOrderId, {
+      fromLocationId: proposal.sourceLocationId,
+      fromLocation: proposal.sourceName,
+      toLocationId: proposal.destinationLocationId,
+      toLocation: proposal.destinationName
+    });
+    transferOrderRef = hydrated.tranid || transferOrderRef;
+    if (!hydrated.pendingFulfillment) {
+      throw new Error(`${transferOrderRef} did not reach Pending Fulfillment before picking-ticket recovery.`);
+    }
+    document = await fetchPickingTicketFromNetSuite(proposal.netsuiteTransferOrderId, {
+      locationId: locations.source.netsuiteLocationId,
+      filenamePrefix: transferOrderRef
+    });
+  } else {
+    document = {
+      filename: `${transferOrderRef}-picking-ticket.pdf`,
+      buffer: createSimplePdf([
+        "MBBS Smart SCM — MOCK Picking Ticket",
+        `Reference: ${transferOrderRef}`,
+        `From: ${proposal.sourceName}`,
+        `To: ${proposal.destinationName}`,
+        `Pallets: ${proposal.totalPallets}`,
+        ...proposal.lines.map((line) => `${line.itemName}: ${line.proposedPallets} PLT`),
+        "No NetSuite record was created."
+      ])
+    };
+  }
   let printJob = await queueSmartScmPrintJob({
     proposalId: proposal.id,
     locationId: proposal.sourceLocationId,
@@ -1367,6 +1788,9 @@ async function retrySmartScmTransferPrint(proposalId, operator) {
     mock: !proposal.netsuiteTransferOrderId
   }, operator?.id);
   emitAppEvent("scm.smart.updated", { source: "smart-scm-print-retry", proposalId: proposal.id, printJobId: printJob.id });
+  if (proposal.netsuiteTransferOrderId) {
+    emitAppEvent("dispatch.orders.updated", { source: "smart-scm-print-retry", refreshOrderPool: true });
+  }
   return { proposalId: proposal.id, transferOrderId: proposal.netsuiteTransferOrderId, transferOrderRef, printJob };
 }
 
@@ -2430,16 +2854,22 @@ async function writeFallbackMutationAudit(req, statusCode, context) {
 
 function publicDriver(driver) {
   if (!driver) return null;
+  const samsaraEnabled = driver.samsaraEnabled === true;
   return {
     login: driver.login,
     name: driver.name,
     license: driver.license,
     number: driver.number,
+    samsaraEnabled,
     hasSamsaraPrimary: Boolean(String(driver.samsaraPrimaryLogin || "").trim()),
     hasSamsaraSecondary: Boolean(String(driver.samsaraSecondaryLogin || "").trim()),
     samsaraPrimaryUsername: String(driver.samsaraPrimaryLogin || "").trim(),
     samsaraSecondaryUsername: String(driver.samsaraSecondaryLogin || "").trim()
   };
+}
+
+function driverSamsaraWorkflowEnabled(driver) {
+  return driver?.samsaraEnabled === true;
 }
 
 function samsaraUsernameForDriver(driver, account = "primary") {
@@ -2450,9 +2880,17 @@ function samsaraUsernameForDriver(driver, account = "primary") {
 
 function samsaraAccountsForDriver(driver) {
   return {
+    enabled: driverSamsaraWorkflowEnabled(driver),
     primaryUsername: samsaraUsernameForDriver(driver, "primary"),
     secondaryUsername: samsaraUsernameForDriver(driver, "secondary")
   };
+}
+
+function driverSamsaraDisabledResponse(res) {
+  return res.status(409).json({
+    code: "DRIVER_SAMSARA_DISABLED",
+    error: "Samsara driver workflows are disabled for this driver in Dispatch Setup."
+  });
 }
 
 function publicSamsaraAuthResult(result = {}, { includeSecret = false } = {}) {
@@ -2501,6 +2939,7 @@ async function photoPreviewViewer(req) {
       username: operator.username,
       role: operator.role,
       roles: operator.roles,
+      yardLocationIds: operator.yardLocationIds,
       source: operatorHasAnyRole(operator, ["dispatcher", "admin"]) ? "dispatch" : "operator"
     };
   }
@@ -2525,6 +2964,74 @@ async function requirePhotoPreviewViewer(req, res, next) {
   } catch (error) {
     next(error);
   }
+}
+
+function returnPhotoActorId(value) {
+  const key = String(value || "").replace(/^r2:\/\//, "").trim();
+  const parts = key.split("/");
+  if (parts[0] !== "operator" || parts[1] !== "operator-return-photo") return "";
+  return parts[5] || "";
+}
+
+async function assertReturnPhotoPreviewAccess(viewer, value) {
+  const photoActorId = returnPhotoActorId(value);
+  if (!photoActorId) return;
+  if (operatorHasAnyRole(viewer, ["admin"])) return;
+
+  const roles = new Set(normalizedOperatorRoles(viewer));
+  if ((roles.has("operator") || roles.has("yard_manager")) && photoActorId === String(viewer.id || "")) {
+    return;
+  }
+  if (viewer.role === "driver") {
+    throw Object.assign(new Error("This return photo is outside your access."), { status: 403 });
+  }
+
+  const reference = String(value || "").startsWith("r2://")
+    ? String(value).trim()
+    : `r2://${String(value || "").trim()}`;
+  const matches = await query(
+    `SELECT 'record' AS source,
+            r.operator_id,
+            r.receiving_location_id,
+            COALESCE(r.ordering_location_id, r.receiving_location_id) AS sales_location_id
+       FROM return_photos p
+       INNER JOIN return_records r ON r.id = p.return_record_id
+      WHERE p.photo_reference = $1
+      UNION ALL
+     SELECT 'draft' AS source,
+            d.operator_id,
+            d.receiving_location_id,
+            NULL::bigint AS sales_location_id
+       FROM return_drafts d
+      WHERE d.expires_at > now()
+        AND (
+          COALESCE(d.payload->'photos', '[]'::jsonb) @> jsonb_build_array($1::text)
+          OR COALESCE(d.payload->'palletPhotos', d.payload->'pallet_photos', '[]'::jsonb)
+            @> jsonb_build_array($1::text)
+          OR EXISTS (
+            SELECT 1
+              FROM jsonb_array_elements(
+                CASE
+                  WHEN jsonb_typeof(d.payload->'lines') = 'array' THEN d.payload->'lines'
+                  ELSE '[]'::jsonb
+                END
+              ) draft_line
+             WHERE COALESCE(draft_line->'photos', '[]'::jsonb) @> jsonb_build_array($1::text)
+          )
+        )`,
+    [reference]
+  );
+
+  if (roles.has("yard_manager")) {
+    const allowed = new Set(returnControlYardLocationIds(viewer));
+    if (matches.rows.some((row) => allowed.has(Number(row.receiving_location_id)))) return;
+  }
+  if (roles.has("sales")) {
+    const allowed = new Set(operatorSalesYardLocationIds(viewer));
+    if (matches.rows.some((row) =>
+      row.source === "record" && allowed.has(Number(row.sales_location_id)))) return;
+  }
+  throw Object.assign(new Error("This return photo is outside your assigned records or yards."), { status: 403 });
 }
 
 async function requireOperator(req, res, next) {
@@ -2663,6 +3170,107 @@ function requireOperatorAccess(req, res, next) {
   next();
 }
 
+function returnControlYardLocationIds(operator) {
+  if (operatorHasAnyRole(operator, ["admin"])) return null;
+  const allowed = (operator?.yardLocationIds || [])
+    .map(Number)
+    .filter((value) => [1, 28, 15, 26].includes(value));
+  // An empty manager assignment must never degrade to unrestricted access.
+  return allowed.length ? allowed : [-1];
+}
+
+function assertReturnControlYard(operator, locationId) {
+  const allowed = returnControlYardLocationIds(operator);
+  if (allowed && !allowed.includes(Number(locationId))) {
+    throw Object.assign(new Error("This return yard is outside your assigned yards."), { status: 403 });
+  }
+}
+
+function assertReturnOperatorYard(operator, locationId) {
+  if (operatorHasAnyRole(operator, ["admin"]) || !operatorHasAnyRole(operator, ["yard_manager"])) return;
+  if (!locationId) {
+    throw Object.assign(new Error("Select an assigned receiving yard."), { status: 400 });
+  }
+  assertReturnControlYard(operator, locationId);
+}
+
+const OPERATOR_RETURN_PRIVATE_KEYS = new Set([
+  "actualcredit",
+  "balancesnapshot",
+  "currency",
+  "customersnapshot",
+  "estimatedcredit",
+  "externalid",
+  "externalids",
+  "foreignamount",
+  "netsuitelastsyncedat",
+  "netsuitelinesnapshot",
+  "netsuiteorderlinesnapshot",
+  "netsuiteorderline",
+  "netsuitereturntransactions",
+  "netsuitesnapshot",
+  "netsuitestage",
+  "netsuitesyncattempts",
+  "netsuitesyncerror",
+  "netsuitetransactionid",
+  "netsuitetransactionref",
+  "netsuitetransactionstatus",
+  "observedstockexternalids",
+  "observedstocktransactionids",
+  "rate",
+  "raw",
+  "sourcelinesnapshot",
+  "sourceordersnapshot",
+  "syncevents",
+  "transactionids"
+]);
+
+function operatorSafeReturnPayload(value) {
+  if (Array.isArray(value)) return value.map(operatorSafeReturnPayload);
+  if (!value || typeof value !== "object") return value;
+  const safe = {};
+  for (const [key, child] of Object.entries(value)) {
+    const normalizedKey = key.toLowerCase().replaceAll("_", "");
+    if (OPERATOR_RETURN_PRIVATE_KEYS.has(normalizedKey)) continue;
+    safe[key] = operatorSafeReturnPayload(child);
+  }
+  return safe;
+}
+
+function returnListFilters(req, extra = {}) {
+  const type = String(req.query.type || req.query.recordType || "").trim().toLowerCase();
+  const requestedStatus = String(req.query.status || "").trim().toLowerCase();
+  const mapped = type === "normal_stock"
+    ? { recordType: "stock", stockReturnType: "normal" }
+    : type === "quality_stock"
+      ? { recordType: "stock", stockReturnType: "quality" }
+      : type === "pallet"
+        ? { recordType: "pallet" }
+        : type === "stock"
+          ? { recordType: "stock" }
+          : {};
+  return {
+    ...mapped,
+    status: requestedStatus === "approved"
+      ? "accepted"
+      : ["sync_failed", "synced"].includes(requestedStatus)
+        ? ""
+        : requestedStatus,
+    netSuiteSyncStatus: requestedStatus === "sync_failed"
+      ? ["failed"]
+      : requestedStatus === "synced"
+        ? ["succeeded", "manual_linked"]
+        : null,
+    receivingLocationId: req.query.receivingLocationId || req.query.yardLocationId || req.query.yard || "",
+    from: req.query.from || "",
+    to: req.query.to || "",
+    search: req.query.search || "",
+    limit: req.query.limit,
+    offset: req.query.offset,
+    ...extra
+  };
+}
+
 function dispatchEditLeaseInput(req, planDate = "") {
   return {
     planDate: planDate || req.body?.planDate || req.body?.date || req.query?.planDate || req.query?.date || "",
@@ -2721,6 +3329,19 @@ function requireDispatchAccess(req, res, next) {
 
 function requireScmAccess(req, res, next) {
   if (operatorHasAnyRole(req.operator, ["admin", "dispatcher", "scm", "scm_staff"])) return next();
+  if (operatorHasAnyRole(req.operator, ["yard_manager"])) {
+    const requestPath = String(req.originalUrl || "").split("?")[0].replace(/\/+$/, "");
+    const yardManagerReadPaths = new Set([
+      "/api/scm/schedule",
+      "/api/scm/schedule-formatting",
+      "/api/scm/view-presets"
+    ]);
+    const schedulePreferencePath = /^\/api\/scm\/schedule-preferences\/scm$/i.test(requestPath);
+    if ((req.method === "GET" && (yardManagerReadPaths.has(requestPath) || schedulePreferencePath))
+        || (req.method === "PUT" && schedulePreferencePath)) {
+      return next();
+    }
+  }
   return sendRoleForbidden(res, req.operator, "SCM account required");
 }
 
@@ -2925,7 +3546,15 @@ async function writeDispatchSetup(patch = {}, { includeInactive = false } = {}) 
     ? patch.drivers.map((driver) => {
         const existing = currentDriversById.get(String(driver?.id || ""))
           || currentDriversByLogin.get(String(driver?.login || "").trim().toLowerCase());
-        return { ...driver, active: existing ? existing.active !== false : true };
+        const hasSamsaraSetting = Object.hasOwn(driver || {}, "connectSamsara")
+          || Object.hasOwn(driver || {}, "samsaraEnabled");
+        return {
+          ...driver,
+          samsaraEnabled: hasSamsaraSetting
+            ? driver?.connectSamsara === true || driver?.samsaraEnabled === true
+            : existing?.samsaraEnabled === true,
+          active: existing ? existing.active !== false : true
+        };
       })
     : current.drivers;
   const requestedTrucks = Array.isArray(patch.trucks)
@@ -3377,8 +4006,21 @@ const targetedOrderSyncDependencies = {
   emitEvent: emitAppEvent
 };
 
+function netSuiteJobMapHasRunningWork(jobs) {
+  for (const job of jobs.values()) {
+    if (String(job?.status || "").toLowerCase() === "running") return true;
+  }
+  return false;
+}
+
 function anyNetSuiteSyncRunning() {
-  return syncRunning || Boolean(activeSyncRun) || targetedSyncRunning;
+  return syncRunning
+    || Boolean(activeSyncRun)
+    || targetedSyncRunning
+    || netSuiteJobMapHasRunningWork(fulfillmentJobs)
+    || netSuiteJobMapHasRunningWork(receivingJobs)
+    || returnPendingSyncRunning
+    || returnReconciliationRunning;
 }
 
 class DispatchSyncStoppedError extends Error {
@@ -4905,6 +5547,71 @@ app.use((req, res, next) => {
   return runWithAuditContext(context, () => next());
 });
 
+app.post("/api/webhooks/netsuite/if-ir", async (req, res, next) => {
+  try {
+    const eventId = req.get("x-mbbs-ifir-event-id") || "";
+    const timestamp = req.get("x-mbbs-ifir-timestamp") || "";
+    const signature = req.get("x-mbbs-ifir-signature") || "";
+    const verified = verifyScmIfIrWebhookSignature({
+      rawBody: req.rawBody || "",
+      eventId,
+      timestamp,
+      signature,
+      secret: config.netsuite.ifIrWebhookSecret,
+      maxAgeSeconds: config.netsuite.ifIrWebhookSignatureMaxAgeSeconds
+    });
+    if (!verified.ok) {
+      return res.status(verified.status || 401).json({ error: verified.error || "Invalid IF/IR webhook signature." });
+    }
+    if (String(req.body?.schemaVersion || "") !== "mbbs.ifir.reconciliation.v1") {
+      return res.status(400).json({ error: "Unsupported IF/IR reconciliation webhook schema." });
+    }
+    if (req.body?.eventId && String(req.body.eventId) !== String(eventId)) {
+      return res.status(400).json({ error: "IF/IR webhook event ID does not match its signed header." });
+    }
+    const stored = await storeScmIfIrWebhook(req.body || {}, {
+      rawBody: req.rawBody || "",
+      eventId,
+      timestamp
+    });
+    res.status(202).json({
+      accepted: true,
+      duplicate: stored.duplicate === true,
+      ignored: stored.ignored === true,
+      stale: stored.stale === true,
+      eventId: stored.eventId || eventId
+    });
+    void processScmIfIrWebhookResult(stored, {
+      operationalSyncRunning: anyNetSuiteSyncRunning
+    }).then((result) => {
+      if (result?.reconciled) {
+        emitAppEvent("dispatch.orders.updated", {
+          source: "netsuite-if-ir-webhook",
+          orderId: stored.sourceOrderId,
+          orderRef: stored.sourceOrderRef || "",
+          orderKind: stored.sourceOrderKind || "",
+          refreshOrderPool: true
+        });
+      }
+    }).catch(async (error) => {
+      console.error("Background IF/IR reconciliation failed:", error);
+      await writeAudit({
+        actorType: "system",
+        source: "netsuite-webhook",
+        action: "netsuite.if_ir_reconciliation.failed",
+        details: {
+          eventId: stored.eventId || eventId,
+          sourceOrderKind: stored.sourceOrderKind || "",
+          sourceOrderId: stored.sourceOrderId || null,
+          error: error.message
+        }
+      }).catch(() => {});
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/webhooks/netsuite/order", async (req, res, next) => {
   try {
     if (isNetSuiteMirrorConsumer()) return res.status(403).json({ error: "NetSuite webhooks are disabled on the mirror consumer." });
@@ -4971,7 +5678,7 @@ app.use((req, res, next) => {
     res.setHeader("Service-Worker-Allowed", "/");
   } else if (["/scm/netsuite-po", "/scm-netsuite-po.html", "/scm/vendors", "/scm-vendors.html"].includes(req.path)) {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-  } else if (req.path.endsWith(".webmanifest") || ["/", "/operator", "/driver", "/control", "/admin", "/admin/accounts", "/admin/sync", "/admin/printers", "/admin/photo-storage", "/admin/audit", "/dispatch", "/dispatch/custom-orders", "/sales", "/sales/planning", "/sales/schedule", "/sales/monitor", "/sales/printing", "/sales/in-outbound-record", "/dispatch/loaded-export", "/dispatch/in-outbound-record", "/control/in-outbound-record", "/dispatch/po-to-schedule", "/scm/smart", "/scm/printers", "/scm/route-rules", "/operator.html", "/driver.html", "/control.html", "/admin.html", "/dispatch-menu.html", "/dispatch-custom-orders.html", "/sales.html", "/sales-printing.html", "/dispatch-loaded-export.html", "/scm-smart.html", "/scm-printers.html", "/scm-route-rules.html"].includes(req.path)) {
+  } else if (req.path.endsWith(".webmanifest") || ["/", "/operator", "/driver", "/control", "/control/returns", "/admin", "/admin/accounts", "/admin/sync", "/admin/reconciliation", "/admin/printers", "/admin/photo-storage", "/admin/audit", "/admin/return-automation", "/dispatch", "/dispatch/custom-orders", "/sales", "/sales/planning", "/sales/schedule", "/sales/monitor", "/sales/printing", "/sales/in-outbound-record", "/sales/returns", "/dispatch/loaded-export", "/dispatch/in-outbound-record", "/control/in-outbound-record", "/dispatch/po-to-schedule", "/scm/smart", "/scm/printers", "/scm/route-rules", "/scm/schedule-formatting", "/operator.html", "/driver.html", "/control.html", "/admin.html", "/dispatch-menu.html", "/dispatch-custom-orders.html", "/sales.html", "/sales-printing.html", "/dispatch-loaded-export.html", "/scm-smart.html", "/scm-printers.html", "/scm-route-rules.html", "/scm-schedule-formatting.html"].includes(req.path)) {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   }
   next();
@@ -5135,7 +5842,8 @@ app.post("/api/scm/smart/items/csv", requireSmartScmWriteAccess, smartScmRawUplo
     const summary = await importSmartScmItemMasterCsv({
       buffer: requiredRawUpload(req),
       filename: req.get("x-file-name") || "smart-scm-item-master.csv",
-      operatorId: operatorId(req)
+      operatorId: operatorId(req),
+      allowReturnPolicyChange: operatorHasAnyRole(req.operator, ["admin"])
     });
     emitAppEvent("scm.smart.updated", {
       source: "item-master-csv",
@@ -5155,6 +5863,8 @@ app.get("/api/scm/smart/items", async (req, res, next) => {
       enabled: req.query.enabled,
       vendorYard: req.query.vendorYard,
       lowerStockPolicy: req.query.lowerStockPolicy,
+      returnPolicy: req.query.returnPolicy,
+      returnPolicyOverride: req.query.returnPolicyOverride || (req.query.overrideOnly === "true" ? "any" : ""),
       limit: req.query.limit,
       offset: req.query.offset
     }));
@@ -5165,7 +5875,9 @@ app.get("/api/scm/smart/items", async (req, res, next) => {
 
 app.patch("/api/scm/smart/items/:itemId", requireSmartScmWriteAccess, async (req, res, next) => {
   try {
-    await updateSmartScmItem(req.params.itemId, req.body || {}, operatorId(req));
+    await updateSmartScmItem(req.params.itemId, req.body || {}, operatorId(req), {
+      allowReturnPolicyChange: operatorHasAnyRole(req.operator, ["admin"])
+    });
     const result = await listSmartScmItems({ search: String(req.params.itemId), limit: 10 });
     emitAppEvent("scm.smart.updated", { source: "item-master", itemId: Number(req.params.itemId) });
     res.json(result.items.find((item) => Number(item.itemId) === Number(req.params.itemId)) || null);
@@ -5592,6 +6304,20 @@ app.patch("/api/scm/smart/netsuite-purchase-orders/:id/pallets/:destinationLocat
   }
 });
 
+app.delete("/api/scm/smart/netsuite-purchase-orders/:id", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const result = await removeSmartScmNetSuitePoReviewLoad(req.params.id, operatorId(req));
+    emitAppEvent("scm.smart.updated", {
+      source: "netsuite-po-review-removed",
+      proposalId: result.id,
+      planningRunId: result.runId
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/scm/smart/netsuite-purchase-orders/:id/insert", requireSmartScmWriteAccess, async (req, res, next) => {
   try {
     const result = await executeSmartScmPurchaseProposal(req.params.id, operatorId(req));
@@ -5936,6 +6662,24 @@ function salesScheduleRowMatchesYards(row, yardCodes = []) {
   return yardCodes.some((yardCode) => new RegExp(`(^|[^0-9])${yardCode}([^0-9]|$)`).test(route));
 }
 
+function scmScheduleAudienceForOperator(operator) {
+  return canViewRestrictedScmOrders(operator) ? "scm" : "operations";
+}
+
+async function listScmScheduleForOperator(filters = {}, operator = null) {
+  const includeRestricted = canViewRestrictedScmOrders(operator);
+  const rows = await listScmSchedule({
+    ...filters,
+    audience: scmScheduleAudienceForOperator(operator)
+  });
+  const reconciled = await enrichScmScheduleWithReconciliation(rows, {
+    includeDetails: false,
+    view: filters.view || "",
+    reviewOnly: false
+  });
+  return filterRestrictedScmOrders(reconciled, { includeRestricted });
+}
+
 app.get("/api/sales/in-outbound-records", requirePrivateSalesRecordAccess, async (req, res, next) => {
   try {
     res.json(await listYardMovements({
@@ -5983,8 +6727,20 @@ app.get("/api/sales/in-outbound-records/export.csv", requirePrivateSalesRecordAc
 app.get("/api/sales/schedule-presets", async (req, res, next) => {
   try {
     const presets = await listScmViewPresets();
-    const allowed = new Set(["yard manager", "completed"]);
+    const allowed = new Set(canViewRestrictedScmOrders(req.operator)
+      ? ["yard manager", "completed"]
+      : ["yard manager"]);
     res.json(presets.filter((preset) => allowed.has(String(preset.name || "").trim().toLowerCase())));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/sales/schedule-formatting", async (_req, res, next) => {
+  try {
+    res.setHeader("Cache-Control", "no-store");
+    const formatting = await getScmScheduleFormatting();
+    res.json({ version: formatting.version, rules: formatting.rules });
   } catch (error) {
     next(error);
   }
@@ -5993,7 +6749,8 @@ app.get("/api/sales/schedule-presets", async (req, res, next) => {
 app.get("/api/sales/schedule", async (req, res, next) => {
   try {
     const requestedView = String(req.query.view || "yard manager").trim().toLowerCase();
-    const view = requestedView === "completed" ? "completed" : "yard manager";
+    const includeRestricted = canViewRestrictedScmOrders(req.operator);
+    const view = includeRestricted && requestedView === "completed" ? "completed" : "yard manager";
     const rows = await listScmSchedule({
       search: req.query.search || "",
       status: req.query.status || "",
@@ -6003,13 +6760,46 @@ app.get("/api/sales/schedule", async (req, res, next) => {
       brand: req.query.brand || "",
       from: req.query.from || "",
       to: req.query.to || "",
-      view
+      view,
+      audience: includeRestricted ? "scm" : "operations"
     });
     const yardCodes = operatorSalesYardCodes(req.operator);
     const scoped = rows.filter((row) => salesScheduleRowMatchesYards(row, yardCodes));
-    res.json(view === "completed"
-      ? scoped.filter((row) => String(row.status || "").toLowerCase() === "completed")
-      : scoped.filter((row) => !["cancelled", "hold"].includes(String(row.status || "").toLowerCase())));
+    const canSeeReconciliationDetails = operatorHasAnyRole(req.operator, ["admin"]);
+    const reconciliationPreference = canSeeReconciliationDetails
+      ? await getScmReconciliationPreference(req.operator?.id)
+      : { showDetails: false };
+    const reconciled = await enrichScmScheduleWithReconciliation(scoped, {
+      includeDetails: canSeeReconciliationDetails && reconciliationPreference.showDetails,
+      view,
+      reviewOnly: String(req.query.reconciliationStatus || "").toLowerCase() === "review"
+    });
+    const visibleRows = includeRestricted
+      ? reconciled
+      : filterRestrictedScmOrders(reconciled, { includeRestricted: false });
+    res.json(visibleRows);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/sales/schedule-preferences", async (req, res, next) => {
+  try {
+    if (!req.operator?.id) {
+      return res.json({ surface: "sales", kind: "", method: "", status: [], persisted: false });
+    }
+    res.json(await getScmSchedulePreference(req.operator.id, "sales"));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/sales/schedule-preferences", async (req, res, next) => {
+  try {
+    if (!req.operator?.id || req.publicSalesAccess || req.operator?.publicSales) {
+      return res.status(403).json({ error: "A signed-in Sales or Admin account is required to save schedule filters." });
+    }
+    res.json(await updateScmSchedulePreference(req.operator.id, "sales", req.body || {}));
   } catch (error) {
     next(error);
   }
@@ -6395,6 +7185,12 @@ app.post("/api/dispatch/plan-snapshots/:snapshotId/restore", requireOperator, re
     restoreCandidate = await canonicalizeDispatchCustomOrdersInPlan(restoreCandidate, {
       previousPlan: currentPlanBeforeRestore
     });
+    const changedScmRefs = changedDispatchScmRefs(currentPlanBeforeRestore, restoreCandidate);
+    await assertScmReconciliationOrderEditable({ orderRefs: changedScmRefs });
+    await assertNoRestrictedScmDispatchOrders(
+      changedPlacedDispatchScmRefs(changedScmRefs, restoreCandidate),
+      "restore this snapshot"
+    );
     const dependencyStructureChanges = await assertNoConsolidationStructureConflict(
       currentPlanBeforeRestore,
       restoreCandidate
@@ -6531,6 +7327,20 @@ app.put("/api/dispatch/plans/:id", requireOperator, requireDispatcher, async (re
     }, { previousPlan });
     cleanOrders = sanitizeDispatchPlanOrders(canonicalCandidate.orders || []);
     cleanTrucks = canonicalCandidate.trucks || [];
+    const changedScmRefs = changedDispatchScmRefs(previousPlan, {
+      ...previousPlan,
+      orders: cleanOrders,
+      trucks: cleanTrucks
+    });
+    await assertScmReconciliationOrderEditable({ orderRefs: changedScmRefs });
+    await assertNoRestrictedScmDispatchOrders(
+      changedPlacedDispatchScmRefs(changedScmRefs, {
+        ...previousPlan,
+        orders: cleanOrders,
+        trucks: cleanTrucks
+      }),
+      "save this plan"
+    );
     const duplicateDrivers = config.dispatch?.driverOrientedPlanning ? [] : dispatchDuplicateDriverAssignments(cleanTrucks);
     if (duplicateDrivers.length) return sendDispatchDuplicateDriverResponse(res, duplicateDrivers);
     const dependencyStructureChanges = await assertNoConsolidationStructureConflict(
@@ -6740,6 +7550,20 @@ app.post("/api/dispatch/plans/:id/confirm", requireOperator, requireDispatcher, 
       }, { previousPlan });
       requestedOrders = sanitizeDispatchPlanOrders(canonicalCandidate.orders || []);
       requestedTrucks = canonicalCandidate.trucks || [];
+      const changedScmRefs = changedDispatchScmRefs(previousPlan, {
+        ...previousPlan,
+        orders: requestedOrders,
+        trucks: requestedTrucks
+      });
+      await assertScmReconciliationOrderEditable({ orderRefs: changedScmRefs });
+      await assertNoRestrictedScmDispatchOrders(
+        changedPlacedDispatchScmRefs(changedScmRefs, {
+          ...previousPlan,
+          orders: requestedOrders,
+          trucks: requestedTrucks
+        }),
+        "confirm this plan"
+      );
       const duplicateDrivers = config.dispatch?.driverOrientedPlanning ? [] : dispatchDuplicateDriverAssignments(requestedTrucks);
       if (duplicateDrivers.length) return sendDispatchDuplicateDriverResponse(res, duplicateDrivers);
       dependencyStructureChanges = await assertNoConsolidationStructureConflict(
@@ -6788,6 +7612,9 @@ app.post("/api/dispatch/plans/:id/confirm", requireOperator, requireDispatcher, 
         });
       }
     }
+    const placedScmRefs = dispatchPlacedScmRefs(planForConfirm);
+    await assertScmReconciliationOrderEditable({ orderRefs: placedScmRefs });
+    await assertNoRestrictedScmDispatchOrders(placedScmRefs, "confirm this plan");
     const duplicateDrivers = config.dispatch?.driverOrientedPlanning ? [] : dispatchDuplicateDriverAssignments(planForConfirm?.trucks || []);
     if (duplicateDrivers.length) return sendDispatchDuplicateDriverResponse(res, duplicateDrivers);
     const finalAssignmentConflicts = await dispatchLoadAssignmentConflicts(previousPlan, planForConfirm, { requireAssignments: true });
@@ -7081,6 +7908,7 @@ app.post("/api/dispatch/samsara/driver-login-test", async (req, res, next) => {
     const setup = await readDispatchSetup();
     const driver = (setup.drivers || []).find((item) => String(item.login || "").trim().toLowerCase() === driverLogin);
     if (!driver) return res.status(404).json({ error: "Driver was not found in Dispatch Setup." });
+    if (!driverSamsaraWorkflowEnabled(driver)) return driverSamsaraDisabledResponse(res);
     const username = samsaraUsernameForDriver(driver, account);
     if (!username) return res.status(400).json({ error: `No Samsara ${account} login ID is saved for this driver.` });
     const samsaraDriver = await findSamsaraDriverByUsername(username);
@@ -7160,7 +7988,8 @@ app.post("/api/dispatch/custom-orders", requireDispatcher, async (req, res, next
       details: {
         pickupLocation: created.pickupLocation,
         dropoffLocation: created.dropoffLocation,
-        weightLbs: created.weightLbs
+        weightLbs: created.weightLbs,
+        stopMinutes: created.stopMinutes
       }
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", {
@@ -7541,6 +8370,7 @@ app.post("/api/scm/transfer-dependencies/suggestions", async (req, res, next) =>
     const batch = await generateTransferDependencySuggestion({
       salesOrderId: req.body?.salesOrderId,
       mode: req.body?.mode,
+      reservationOverrides: req.body?.reservationOverrides,
       operatorId: req.operator?.id
     });
     emitAppEvent("scm.transfer_dependency.updated", { batchId: batch.id, orderId: batch.salesOrderRef });
@@ -7757,7 +8587,8 @@ app.post("/api/scm/order-dependencies/:id/reconcile", async (req, res, next) => 
 
 app.get("/api/scm/schedule", async (req, res, next) => {
   try {
-    res.json(await listScmSchedule({
+    const includeRestricted = canViewRestrictedScmOrders(req.operator);
+    const rows = await listScmSchedule({
       search: req.query.search || "",
       status: req.query.status || "",
       method: req.query.method || "",
@@ -7766,8 +8597,310 @@ app.get("/api/scm/schedule", async (req, res, next) => {
       brand: req.query.brand || "",
       from: req.query.from || "",
       to: req.query.to || "",
-      view: req.query.view || ""
+      view: req.query.view || "",
+      audience: includeRestricted ? "scm" : "operations"
+    });
+    const canSeeDetails = operatorHasAnyRole(req.operator, ["admin", "scm", "scm_staff"]);
+    const preference = canSeeDetails
+      ? await getScmReconciliationPreference(req.operator?.id)
+      : { showDetails: false };
+    const reconciled = await enrichScmScheduleWithReconciliation(rows, {
+      includeDetails: canSeeDetails && preference.showDetails,
+      view: req.query.view || "",
+      reviewOnly: String(req.query.reconciliationStatus || "").toLowerCase() === "review"
+    });
+    res.json(filterRestrictedScmOrders(reconciled, { includeRestricted }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/schedule-formatting", async (_req, res, next) => {
+  try {
+    res.setHeader("Cache-Control", "no-store");
+    res.json(await getScmScheduleFormatting());
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/dispatch/schedule-formatting", async (_req, res, next) => {
+  try {
+    res.setHeader("Cache-Control", "no-store");
+    res.json(await getScmScheduleFormatting());
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/scm/schedule-formatting", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const formatting = await updateScmScheduleFormatting(req.body || {}, req.operator?.id);
+    await writeDispatchAudit({
+      action: "scm.schedule-formatting.updated",
+      entityType: "scm_schedule_formatting",
+      entityId: "company",
+      operatorId: req.operator?.id,
+      operatorName: req.operator?.display_name || req.operator?.username,
+      source: "scm",
+      after: formatting.rules
+    }).catch(() => null);
+    emitAppEvent("scm.schedule-formatting.updated", {
+      source: "scm-schedule-formatting",
+      updatedBy: req.operator?.id || ""
+    });
+    res.json(formatting);
+  } catch (error) {
+    next(error);
+  }
+});
+
+function scmStaffSchedulePreferenceSurface(value) {
+  const surface = normalizeScmSchedulePreferenceSurface(value);
+  if (!["scm", "dispatch"].includes(surface)) {
+    throw Object.assign(new Error("This endpoint supports SCM and Dispatch schedule preferences only."), { status: 400 });
+  }
+  return surface;
+}
+
+app.get("/api/scm/schedule-preferences/:surface", async (req, res, next) => {
+  try {
+    res.json(await getScmSchedulePreference(
+      req.operator?.id,
+      scmStaffSchedulePreferenceSurface(req.params.surface)
+    ));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/scm/schedule-preferences/:surface", async (req, res, next) => {
+  try {
+    res.json(await updateScmSchedulePreference(
+      req.operator?.id,
+      scmStaffSchedulePreferenceSurface(req.params.surface),
+      req.body || {}
+    ));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/reconciliation/preferences", async (req, res, next) => {
+  try {
+    if (!operatorHasAnyRole(req.operator, ["admin", "scm", "scm_staff"])) {
+      return res.status(403).json({ error: "SCM or Admin access is required for reconciliation details." });
+    }
+    res.json(await getScmReconciliationPreference(req.operator?.id));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/scm/reconciliation/preferences", async (req, res, next) => {
+  try {
+    if (!operatorHasAnyRole(req.operator, ["admin", "scm", "scm_staff"])) {
+      return res.status(403).json({ error: "SCM or Admin access is required for reconciliation details." });
+    }
+    res.json(await updateScmReconciliationPreference(
+      req.operator?.id,
+      req.body?.showDetails ?? req.body?.show_details
+    ));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/reconciliation/runs/:id", async (req, res, next) => {
+  try {
+    if (!operatorHasAnyRole(req.operator, ["admin", "scm", "scm_staff"])) {
+      return res.status(403).json({ error: "SCM or Admin access is required to view reconciliation runs." });
+    }
+    const runId = Number(req.params.id);
+    if (!Number.isSafeInteger(runId) || runId <= 0) {
+      return res.status(400).json({ error: "A valid reconciliation run ID is required." });
+    }
+    res.json(await getScmReconciliationRunDetails(runId, {
+      limit: req.query.limit,
+      offset: req.query.offset
     }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/reconciliation/retry", async (req, res, next) => {
+  try {
+    if (!operatorHasAnyRole(req.operator, ["admin", "scm", "scm_staff"])) {
+      return res.status(403).json({ error: "SCM or Admin access is required to retry reconciliation." });
+    }
+    const run = await retryScmReconciliationOrder({
+      kind: req.body?.orderKind ?? req.body?.kind,
+      orderId: req.body?.orderId,
+      orderRef: req.body?.orderRef,
+      actor: req.operator?.id,
+      includeTerminalOrders: operatorHasAnyRole(req.operator, ["admin"])
+    }, {
+      operationalSyncRunning: anyNetSuiteSyncRunning
+    });
+    if (run?.status === "interrupted") {
+      return res.status(409).json({
+        error: run.error || "Reconciliation yielded to an operational NetSuite synchronization.",
+        run
+      });
+    }
+    emitAppEvent("dispatch.orders.updated", {
+      source: "scm-reconciliation-retry",
+      orderId: req.body?.orderId || null,
+      orderRef: req.body?.orderRef || "",
+      orderKind: req.body?.orderKind || req.body?.kind || "",
+      refreshOrderPool: true
+    });
+    res.json({ run });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/reconciliation/close-missing-po", async (req, res, next) => {
+  try {
+    if (!operatorHasAnyRole(req.operator, ["admin"])) {
+      return res.status(403).json({
+        error: "Admin access is required to cancel a source-missing Purchase Order."
+      });
+    }
+    const resolution = await cancelMissingScmPurchaseOrder({
+      orderId: req.body?.orderId,
+      orderRef: req.body?.orderRef,
+      reviewCaseId: req.body?.reviewCaseId,
+      expectedLastDetectedAt: req.body?.expectedLastDetectedAt,
+      confirmed: req.body?.confirm === true,
+      note: req.body?.note,
+      actor: req.operator?.id
+    }, {
+      operationalSyncRunning: anyNetSuiteSyncRunning
+    });
+    emitAppEvent("dispatch.orders.updated", {
+      source: "scm-reconciliation-cancel-missing-po",
+      orderId: resolution.sourceOrderId,
+      orderRef: resolution.sourceOrderRef,
+      orderKind: "PO",
+      refreshOrderPool: true
+    });
+    res.json({ resolution });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/reconciliation/po-split-line-options", async (req, res, next) => {
+  try {
+    if (!operatorHasAnyRole(req.operator, ["admin"])) {
+      return res.status(403).json({
+        error: "Admin access is required to adjust a split PO source line."
+      });
+    }
+    res.json(await listScmPoSplitLineAdjustmentOptions({
+      orderRef: req.query?.orderRef,
+      orderId: req.query?.orderId
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/reconciliation/po-split-lines/:ledgerLineId/reassign", async (req, res, next) => {
+  try {
+    if (!operatorHasAnyRole(req.operator, ["admin"])) {
+      return res.status(403).json({
+        error: "Admin access is required to adjust a split PO source line."
+      });
+    }
+    const adjustment = await reassignScmPoSplitLineSource({
+      ledgerLineId: req.params.ledgerLineId,
+      expectedSourceLineId: req.body?.expectedSourceLineId,
+      newSourceLineId: req.body?.newSourceLineId,
+      note: req.body?.note,
+      allowBaselineReduction: req.body?.allowBaselineReduction === true,
+      expectedBaselineQty: req.body?.expectedBaselineQty,
+      actor: req.operator?.id
+    });
+    let run = null;
+    let rerunError = "";
+    try {
+      run = await retryScmReconciliationOrder({
+        kind: "PO",
+        orderId: adjustment.sourceOrderId,
+        orderRef: adjustment.sourceOrderRef,
+        actor: req.operator?.id,
+        includeTerminalOrders: true
+      }, {
+        background: true,
+        // The admin has explicitly confirmed this local lineage/baseline
+        // mutation with an audit note. Reconcile that one family live even
+        // while the company-wide initial proposal remains unapproved.
+        allowInitialApply: true,
+        operationalSyncRunning: anyNetSuiteSyncRunning
+      });
+    } catch (error) {
+      rerunError = error.message;
+    }
+    emitAppEvent("dispatch.orders.updated", {
+      source: "scm-reconciliation-po-split-source-reassigned",
+      orderId: adjustment.sourceOrderId,
+      orderRef: adjustment.sourceOrderRef,
+      orderKind: "PO",
+      refreshOrderPool: true
+    });
+    res.status(202).json({
+      adjustment,
+      pending: true,
+      run,
+      ...(rerunError ? { rerunError } : {})
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/reconciliation/resolve", async (req, res, next) => {
+  try {
+    if (!operatorHasAnyRole(req.operator, ["admin"])) {
+      return res.status(403).json({ error: "Admin access is required to resolve reconciliation review." });
+    }
+    const resolution = await resolveScmReconciliationReview({
+      kind: req.body?.orderKind ?? req.body?.kind,
+      orderRef: req.body?.orderRef,
+      resolution: req.body?.resolution,
+      note: req.body?.note,
+      allocations: req.body?.allocations,
+      actor: req.operator?.id,
+      actorRole: "admin"
+    });
+    if (resolution.rerunRequired) {
+      const run = await retryScmReconciliationOrder({
+        kind: resolution.orderKind,
+        orderId: resolution.sourceOrderId,
+        orderRef: resolution.sourceOrderRef,
+        actor: req.operator?.id
+      }, {
+        background: true,
+        operationalSyncRunning: anyNetSuiteSyncRunning
+      });
+      return res.status(202).json({
+        resolution,
+        pending: true,
+        run
+      });
+    }
+    emitAppEvent("dispatch.orders.updated", {
+      source: "scm-reconciliation-resolved",
+      orderId: resolution.sourceOrderId,
+      orderRef: resolution.sourceOrderRef,
+      orderKind: resolution.orderKind,
+      refreshOrderPool: true
+    });
+    res.json({ resolution, pending: false });
   } catch (error) {
     next(error);
   }
@@ -7778,6 +8911,7 @@ app.put("/api/scm/purchase-orders/:ref/blanket", async (req, res, next) => {
     if (!operatorHasAnyRole(req.operator, ["admin", "scm", "scm_staff"])) {
       return res.status(403).json({ error: "SCM write access required." });
     }
+    await assertScmReconciliationOrderEditable({ kind: "PO", orderRef: req.params.ref });
     const operator = req.operator || await getOperatorByToken(bearerToken(req)).catch(() => null);
     const isBlanket = req.body?.isBlanket === true || req.body?.is_blanket === true;
     const updated = await setPurchaseOrderBlanketFlag(req.params.ref, {
@@ -7807,9 +8941,49 @@ app.put("/api/scm/purchase-orders/:ref/blanket", async (req, res, next) => {
   }
 });
 
+async function refreshedScmScheduleRow(updated = {}, operator = null) {
+  const scheduleId = Number(updated.id);
+  if (!Number.isSafeInteger(scheduleId) || scheduleId <= 0) return null;
+  const identityResult = await query(
+    `SELECT order_kind, order_ref
+       FROM scm_transport_schedule
+      WHERE id = $1
+      LIMIT 1`,
+    [scheduleId]
+  );
+  const identity = identityResult.rows[0];
+  if (!identity?.order_ref) return null;
+  const rows = await listScmScheduleForOperator({
+    kind: identity.order_kind,
+    exactRef: identity.order_ref
+  }, operator);
+  const row = rows.find((candidate) =>
+    candidate.orderKind === identity.order_kind
+    && String(candidate.orderRef || "").toLowerCase() === String(identity.order_ref || "").toLowerCase()
+  ) || null;
+  if (!row) return null;
+  const canSeeDetails = operatorHasAnyRole(operator, ["admin", "scm", "scm_staff"]);
+  const preference = canSeeDetails
+    ? await getScmReconciliationPreference(operator?.id)
+    : { showDetails: false };
+  const enriched = await enrichScmScheduleWithReconciliation([row], {
+    includeDetails: canSeeDetails && preference.showDetails,
+    view: "",
+    reviewOnly: false
+  });
+  const visibleRows = filterRestrictedScmOrders(enriched, {
+    includeRestricted: canViewRestrictedScmOrders(operator)
+  });
+  return visibleRows[0] || null;
+}
+
 app.post("/api/scm/schedule", async (req, res, next) => {
   try {
     const operator = await getOperatorByToken(bearerToken(req)).catch(() => null);
+    await assertScmReconciliationOrderEditable({
+      kind: req.body?.orderKind || req.body?.order_kind,
+      orderRef: req.body?.orderRef || req.body?.order_ref
+    });
     const updated = await updateScmScheduleEntry({
       orderKind: req.body?.orderKind || req.body?.order_kind,
       orderRef: req.body?.orderRef || req.body?.order_ref,
@@ -7828,7 +9002,13 @@ app.post("/api/scm/schedule", async (req, res, next) => {
       after: updated
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { source: "scm-schedule", orderId: updated.order_ref });
-    res.json({ updated, ...(req.query.includeSchedule === "false" ? {} : { schedule: await listScmSchedule() }) });
+    const omitSchedule = req.query.includeSchedule === "false";
+    res.json({
+      updated,
+      ...(omitSchedule
+        ? { row: await refreshedScmScheduleRow(updated, operator) }
+        : { schedule: await listScmScheduleForOperator({}, req.operator) })
+    });
   } catch (error) {
     next(error);
   }
@@ -7837,6 +9017,10 @@ app.post("/api/scm/schedule", async (req, res, next) => {
 app.put("/api/scm/schedule/:id", async (req, res, next) => {
   try {
     const operator = await getOperatorByToken(bearerToken(req)).catch(() => null);
+    await assertScmReconciliationOrderEditable({
+      kind: req.body?.orderKind || req.body?.order_kind,
+      orderRef: req.params.id
+    });
     const updated = await updateScmScheduleEntry({
       orderKind: req.body?.orderKind || req.body?.order_kind,
       orderRef: req.params.id,
@@ -7855,7 +9039,13 @@ app.put("/api/scm/schedule/:id", async (req, res, next) => {
       after: updated
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { source: "scm-schedule", orderId: updated.order_ref });
-    res.json({ updated, ...(req.query.includeSchedule === "false" ? {} : { schedule: await listScmSchedule() }) });
+    const omitSchedule = req.query.includeSchedule === "false";
+    res.json({
+      updated,
+      ...(omitSchedule
+        ? { row: await refreshedScmScheduleRow(updated, operator) }
+        : { schedule: await listScmScheduleForOperator({}, req.operator) })
+    });
   } catch (error) {
     next(error);
   }
@@ -7864,6 +9054,7 @@ app.put("/api/scm/schedule/:id", async (req, res, next) => {
 app.post("/api/scm/schedule-groups", async (req, res, next) => {
   try {
     const operator = await getOperatorByToken(bearerToken(req)).catch(() => null);
+    await assertScmReconciliationOrderEditable({ orderRefs: req.body?.refs || [] });
     const grouped = await createScmScheduleGroup({
       refs: req.body?.refs || [],
       createdBy: operator?.id || req.body?.audit?.sessionId || ""
@@ -7880,7 +9071,12 @@ app.post("/api/scm/schedule-groups", async (req, res, next) => {
       after: grouped
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { source: "scm-group", orderId: grouped.groupRef });
-    res.json({ grouped, ...(req.query.includeSchedule === "false" ? {} : { schedule: await listScmSchedule() }) });
+    res.json({
+      grouped,
+      ...(req.query.includeSchedule === "false"
+        ? {}
+        : { schedule: await listScmScheduleForOperator({}, req.operator) })
+    });
   } catch (error) {
     next(error);
   }
@@ -7889,6 +9085,7 @@ app.post("/api/scm/schedule-groups", async (req, res, next) => {
 app.delete("/api/scm/schedule-groups/:groupRef", async (req, res, next) => {
   try {
     const operator = await getOperatorByToken(bearerToken(req)).catch(() => null);
+    await assertScmReconciliationOrderEditable({ orderRef: req.params.groupRef });
     const cancelled = await cancelScmScheduleGroup({
       groupRef: req.params.groupRef,
       cancelledBy: operator?.id || req.query.sessionId || ""
@@ -7905,7 +9102,7 @@ app.delete("/api/scm/schedule-groups/:groupRef", async (req, res, next) => {
       after: cancelled
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { source: "scm-group-cancel", orderId: cancelled.groupRef });
-    res.json({ cancelled, schedule: await listScmSchedule() });
+    res.json({ cancelled, schedule: await listScmScheduleForOperator({}, req.operator) });
   } catch (error) {
     next(error);
   }
@@ -7913,7 +9110,13 @@ app.delete("/api/scm/schedule-groups/:groupRef", async (req, res, next) => {
 
 app.get("/api/scm/view-presets", async (req, res, next) => {
   try {
-    res.json(await listScmViewPresets());
+    const presets = await listScmViewPresets();
+    if (canViewRestrictedScmOrders(req.operator)) return res.json(presets);
+    const allowed = new Set();
+    if (operatorHasAnyRole(req.operator, ["dispatcher"])) allowed.add("dispatch");
+    if (operatorHasAnyRole(req.operator, ["yard_manager"])) allowed.add("yard manager");
+    return res.json(presets.filter((preset) =>
+      allowed.has(String(preset.name || "").trim().toLowerCase())));
   } catch (error) {
     next(error);
   }
@@ -8011,7 +9214,10 @@ app.post("/api/scm/vrma-orders", async (req, res, next) => {
       details: { vrmaRef, lineCount: created?.lines?.length || 0 }
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { source: "scm-vrma", type: "PO", orderId: vrmaRef });
-    res.json({ created, schedule: await listScmSchedule({ kind: "VRMA" }) });
+    res.json({
+      created,
+      schedule: await listScmScheduleForOperator({ kind: "VRMA" }, req.operator)
+    });
   } catch (error) {
     next(error);
   }
@@ -8048,7 +9254,53 @@ app.put("/api/scm/vrma-orders/:id", async (req, res, next) => {
       after: updated,
       details: { vrmaRef: req.params.id, lineCount: updated?.lines?.length || 0 }
     }).catch(() => null);
-    res.json({ updated, schedule: await listScmSchedule({ kind: "VRMA" }) });
+    res.json({
+      updated,
+      schedule: await listScmScheduleForOperator({ kind: "VRMA" }, req.operator)
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/vrma-orders/:id/complete-override", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const note = String(req.body?.note || "").trim();
+    const result = await completeScmVrmaOrderOverride({
+      vrmaRef: req.params.id,
+      note,
+      actor: req.operator?.id,
+      expectedUpdatedAt: req.body?.expectedUpdatedAt ?? req.body?.expected_updated_at,
+      confirm: req.body?.confirm === true,
+      force: req.body?.force === true
+    });
+    if (!result.idempotent) {
+      await writeDispatchAudit({
+        action: "scm.vrma_order.completed_override",
+        entityType: "scm_vrma_order",
+        entityId: req.params.id,
+        orderId: req.params.id,
+        operatorId: req.operator?.id,
+        operatorName: req.operator?.display_name || req.operator?.username,
+        source: "scm",
+        before: result.before,
+        after: result.after,
+        details: {
+          note,
+          loadedComplete: result.loadedComplete,
+          forced: result.forced === true,
+          progress: result.progress || null,
+          netSuiteUpdated: false
+        }
+      }).catch(() => null);
+    }
+    emitAppEvent("dispatch.orders.updated", {
+      source: "scm-vrma-completed-override",
+      type: "VRMA",
+      orderId: req.params.id,
+      refreshOrderPool: true
+    });
+    res.json({ result });
   } catch (error) {
     next(error);
   }
@@ -8056,13 +9308,13 @@ app.put("/api/scm/vrma-orders/:id", async (req, res, next) => {
 
 app.get("/api/dispatch/scm/purchase-orders", async (req, res, next) => {
   try {
-    res.json(await listScmPurchaseOrders({
+    res.json(await listScmPurchaseOrdersForResponse({
       search: req.query.search || "",
       poType: req.query.poType || "",
       dropoff: req.query.dropoff || "",
       vendor: req.query.vendor || "",
       pickupPoint: req.query.pickupPoint || ""
-    }));
+    }, req.operator));
   } catch (error) {
     next(error);
   }
@@ -8071,6 +9323,10 @@ app.get("/api/dispatch/scm/purchase-orders", async (req, res, next) => {
 app.post("/api/dispatch/scm/purchase-order-splits", async (req, res, next) => {
   try {
     const operator = await getOperatorByToken(bearerToken(req)).catch(() => null);
+    await assertScmReconciliationOrderEditable({
+      kind: "PO",
+      orderRef: req.body?.sourcePoRef
+    });
     const created = await createScmPurchaseOrderSplit({
       sourcePoRef: req.body?.sourcePoRef,
       newPoRef: req.body?.newPoRef,
@@ -8100,7 +9356,7 @@ app.post("/api/dispatch/scm/purchase-order-splits", async (req, res, next) => {
       }
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { source: "scm-po-split", type: "PO", orderId: created.split?.splitPoRef });
-    res.json({ created, orders: await listScmPurchaseOrders() });
+    res.json({ created, orders: await listScmPurchaseOrdersForResponse({}, req.operator) });
   } catch (error) {
     next(error);
   }
@@ -8109,6 +9365,7 @@ app.post("/api/dispatch/scm/purchase-order-splits", async (req, res, next) => {
 app.put("/api/dispatch/scm/purchase-orders/:ref/ref", async (req, res, next) => {
   try {
     const operator = await getOperatorByToken(bearerToken(req)).catch(() => null);
+    await assertScmReconciliationOrderEditable({ kind: "PO", orderRef: req.params.ref });
     const updated = await updatePurchaseOrderDispatchRef({
       poRef: req.params.ref,
       newRef: req.body?.newRef,
@@ -8132,7 +9389,7 @@ app.put("/api/dispatch/scm/purchase-orders/:ref/ref", async (req, res, next) => 
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { source: "scm-po-ref", type: "PO", orderId: updated.displayRef });
     emitAppEvent("receiving.order.updated", { source: "scm-po-ref", type: "PO", orderId: updated.poId });
-    res.json({ updated, orders: await listScmPurchaseOrders() });
+    res.json({ updated, orders: await listScmPurchaseOrdersForResponse({}, req.operator) });
   } catch (error) {
     next(error);
   }
@@ -8141,6 +9398,7 @@ app.put("/api/dispatch/scm/purchase-orders/:ref/ref", async (req, res, next) => 
 app.put("/api/dispatch/scm/purchase-order-splits/:ref", async (req, res, next) => {
   try {
     const operator = await getOperatorByToken(bearerToken(req)).catch(() => null);
+    await assertScmReconciliationOrderEditable({ kind: "PO", orderRef: req.params.ref });
     const updated = await updateScmPurchaseOrderSplitRef({
       splitPoRef: req.params.ref,
       newPoRef: req.body?.newPoRef,
@@ -8163,7 +9421,7 @@ app.put("/api/dispatch/scm/purchase-order-splits/:ref", async (req, res, next) =
       }
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { source: "scm-po-split-rename", type: "PO", orderId: updated.newPoRef });
-    res.json({ updated, orders: await listScmPurchaseOrders() });
+    res.json({ updated, orders: await listScmPurchaseOrdersForResponse({}, req.operator) });
   } catch (error) {
     next(error);
   }
@@ -8172,6 +9430,7 @@ app.put("/api/dispatch/scm/purchase-order-splits/:ref", async (req, res, next) =
 app.put("/api/dispatch/scm/purchase-order-splits/:ref/destination", async (req, res, next) => {
   try {
     const operator = await getOperatorByToken(bearerToken(req)).catch(() => null);
+    await assertScmReconciliationOrderEditable({ kind: "PO", orderRef: req.params.ref });
     const updated = await updateScmPurchaseOrderSplitDestination({
       splitPoRef: req.params.ref,
       destinationLocationId: req.body?.destinationLocationId,
@@ -8200,7 +9459,7 @@ app.put("/api/dispatch/scm/purchase-order-splits/:ref/destination", async (req, 
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { source: "scm-po-split-destination", type: "PO", orderId: updated.splitPoRef });
     emitAppEvent("receiving.order.updated", { source: "scm-po-split-destination", type: "PO", orderId: updated.splitPoId });
-    res.json({ updated, orders: await listScmPurchaseOrders() });
+    res.json({ updated, orders: await listScmPurchaseOrdersForResponse({}, req.operator) });
   } catch (error) {
     next(error);
   }
@@ -8209,6 +9468,7 @@ app.put("/api/dispatch/scm/purchase-order-splits/:ref/destination", async (req, 
 app.put("/api/dispatch/scm/purchase-order-splits/:ref/pickup", async (req, res, next) => {
   try {
     const operator = await getOperatorByToken(bearerToken(req)).catch(() => null);
+    await assertScmReconciliationOrderEditable({ kind: "PO", orderRef: req.params.ref });
     const updated = await updateScmPurchaseOrderSplitPickupYard({
       splitPoRef: req.params.ref,
       pickupPoint: req.body?.pickupPoint,
@@ -8231,7 +9491,7 @@ app.put("/api/dispatch/scm/purchase-order-splits/:ref/pickup", async (req, res, 
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { source: "scm-po-split-pickup", type: "PO", orderId: updated.splitPoRef });
     emitAppEvent("receiving.order.updated", { source: "scm-po-split-pickup", type: "PO", orderId: updated.splitPoId });
-    res.json({ updated, orders: await listScmPurchaseOrders() });
+    res.json({ updated, orders: await listScmPurchaseOrdersForResponse({}, req.operator) });
   } catch (error) {
     next(error);
   }
@@ -8240,6 +9500,7 @@ app.put("/api/dispatch/scm/purchase-order-splits/:ref/pickup", async (req, res, 
 app.delete("/api/dispatch/scm/purchase-order-splits/:ref", async (req, res, next) => {
   try {
     const operator = await getOperatorByToken(bearerToken(req)).catch(() => null);
+    await assertScmReconciliationOrderEditable({ kind: "PO", orderRef: req.params.ref });
     const cancelled = await cancelScmPurchaseOrderSplit({
       splitPoRef: req.params.ref,
       cancelledBy: operator?.id || req.query.sessionId || ""
@@ -8261,7 +9522,7 @@ app.delete("/api/dispatch/scm/purchase-order-splits/:ref", async (req, res, next
       }
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { source: "scm-po-split-cancelled", type: "PO", orderId: cancelled.splitPoRef });
-    res.json({ cancelled, orders: await listScmPurchaseOrders() });
+    res.json({ cancelled, orders: await listScmPurchaseOrdersForResponse({}, req.operator) });
   } catch (error) {
     next(error);
   }
@@ -8559,6 +9820,13 @@ app.delete("/api/dispatch/po-allocations/:allocationId", async (req, res, next) 
 app.post("/api/dispatch/split-orders/unsplit", async (req, res, next) => {
   try {
     await requireDispatchPlanEditLease(req);
+    await assertScmReconciliationOrderEditable({
+      kind: req.body?.orderType,
+      orderRefs: [
+        req.body?.originalOrderId,
+        ...(req.body?.splitOrderIds || [])
+      ]
+    });
     await assertNoActiveOrderDependenciesByRefs([
       req.body?.originalOrderId,
       ...(req.body?.splitOrderIds || [])
@@ -8701,6 +9969,20 @@ app.put("/api/dispatch/plan", async (req, res, next) => {
     }, { previousPlan });
     cleanOrders = sanitizeDispatchPlanOrders(canonicalCandidate.orders || []);
     cleanTrucks = canonicalCandidate.trucks || [];
+    const changedScmRefs = changedDispatchScmRefs(previousPlan, {
+      ...previousPlan,
+      orders: cleanOrders,
+      trucks: cleanTrucks
+    });
+    await assertScmReconciliationOrderEditable({ orderRefs: changedScmRefs });
+    await assertNoRestrictedScmDispatchOrders(
+      changedPlacedDispatchScmRefs(changedScmRefs, {
+        ...previousPlan,
+        orders: cleanOrders,
+        trucks: cleanTrucks
+      }),
+      "save this plan"
+    );
     const duplicateDrivers = config.dispatch?.driverOrientedPlanning ? [] : dispatchDuplicateDriverAssignments(cleanTrucks);
     if (duplicateDrivers.length) return sendDispatchDuplicateDriverResponse(res, duplicateDrivers);
     const payload = {
@@ -8821,6 +10103,7 @@ app.get("/driver", (req, res) => {
 
 app.get([
   "/control",
+  "/control/returns",
   "/control/order-locks",
   "/control/item-classification",
   "/control/vendor-mapping",
@@ -8837,8 +10120,10 @@ app.get([
   "/admin",
   "/admin/accounts",
   "/admin/sync",
+  "/admin/reconciliation",
   "/admin/photo-storage",
-  "/admin/audit"
+  "/admin/audit",
+  "/admin/return-automation"
 ], (req, res) => {
   res.sendFile(path.join(publicDir, "admin.html"));
 });
@@ -8847,7 +10132,7 @@ app.get("/admin/printers", (req, res) => {
   res.sendFile(path.join(publicDir, "scm-printers.html"));
 });
 
-app.get("/sales", (req, res) => {
+app.get(["/sales", "/sales/returns"], (req, res) => {
   res.sendFile(path.join(publicDir, "sales.html"));
 });
 
@@ -8913,6 +10198,10 @@ app.get("/scm/POsplit", (req, res) => {
 
 app.get("/scm/POTOschedule", (req, res) => {
   res.sendFile(path.join(publicDir, "scm-schedule.html"));
+});
+
+app.get("/scm/schedule-formatting", (req, res) => {
+  res.sendFile(path.join(publicDir, "scm-schedule-formatting.html"));
 });
 
 app.get("/scm/transfer-dependencies", (req, res) => {
@@ -9057,6 +10346,7 @@ app.get("/api/photo-upload/preview", requirePhotoPreviewViewer, async (req, res,
     if (!isR2PhotoReference(ref) && !String(req.query.key || "")) {
       return res.status(400).json({ error: "R2 photo reference is required." });
     }
+    await assertReturnPhotoPreviewAccess(req.photoViewer, ref || req.query.key);
     const archived = await readArchivedPhoto(ref || req.query.key);
     if (archived?.available) {
       res.setHeader("Content-Type", archived.contentType);
@@ -9194,6 +10484,15 @@ app.get("/api/driver/me", requireDriver, (req, res) => {
 app.post("/api/driver/photo-upload-token", requireDriver, async (req, res, next) => {
   try {
     const body = req.body || {};
+    if (
+      !driverSamsaraWorkflowEnabled(req.driver)
+      && (
+        String(body.recordType || "").toLowerCase().includes("dvir")
+        || ["pre", "post"].includes(String(body.dvirType || "").toLowerCase())
+      )
+    ) {
+      return driverSamsaraDisabledResponse(res);
+    }
     res.json(createPhotoUploadToken({
       actor: {
         id: req.driverLogin,
@@ -9250,7 +10549,11 @@ app.post("/api/driver/logout", requireDriver, async (req, res, next) => {
     const state = await getDriverDayState(req.driverLogin, {
       samsaraAccounts: samsaraAccountsForDriver(req.driver)
     });
-    if (state.preDvirStatus === "complete" && state.postDvirStatus !== "complete") {
+    if (
+      state.samsaraEnabled
+      && state.preDvirStatus === "complete"
+      && state.postDvirStatus !== "complete"
+    ) {
       return res.status(409).json({ error: "MBBS post-trip inspection is required before logout.", state });
     }
     driverSessions.delete(driverToken(req));
@@ -9262,6 +10565,7 @@ app.post("/api/driver/logout", requireDriver, async (req, res, next) => {
 
 app.post("/api/driver/dvir", requireDriver, async (req, res, next) => {
   try {
+    if (!driverSamsaraWorkflowEnabled(req.driver)) return driverSamsaraDisabledResponse(res);
     const type = req.body?.type === "post" ? "post" : "pre";
     const photoDataUrls = requiredPhotoDataUrls(req.body?.photoDataUrls, 4);
     const samsaraAccounts = samsaraAccountsForDriver(req.driver);
@@ -9302,10 +10606,12 @@ app.post("/api/driver/dvir", requireDriver, async (req, res, next) => {
 
 app.post("/api/driver/dvir/skip", requireDriver, async (req, res, next) => {
   try {
+    if (!driverSamsaraWorkflowEnabled(req.driver)) return driverSamsaraDisabledResponse(res);
     const type = req.body?.type === "post" ? "post" : "pre";
     const result = await skipDriverDvirForTesting(req.driverLogin, {
       type,
-      samsaraUsername: samsaraUsernameForDriver(req.driver, "primary")
+      samsaraUsername: samsaraUsernameForDriver(req.driver, "primary"),
+      samsaraEnabled: true
     });
     writeAudit({
       actorType: "driver",
@@ -9330,6 +10636,7 @@ app.post("/api/driver/dvir/skip", requireDriver, async (req, res, next) => {
 
 app.post("/api/driver/samsara-auth-token", requireDriver, async (req, res, next) => {
   try {
+    if (!driverSamsaraWorkflowEnabled(req.driver)) return driverSamsaraDisabledResponse(res);
     const account = req.body?.account === "secondary" ? "secondary" : "primary";
     const username = samsaraUsernameForDriver(req.driver, account);
     if (!username) return res.status(400).json({ error: `No Samsara ${account} login ID is saved for your driver profile.` });
@@ -9346,6 +10653,7 @@ app.post("/api/driver/samsara-auth-token", requireDriver, async (req, res, next)
 
 app.post("/api/driver/samsara-duty-status", requireDriver, async (req, res, next) => {
   try {
+    if (!driverSamsaraWorkflowEnabled(req.driver)) return driverSamsaraDisabledResponse(res);
     const account = req.body?.account === "secondary" ? "secondary" : "primary";
     const username = samsaraUsernameForDriver(req.driver, account);
     if (!username) return res.status(400).json({ error: `No Samsara ${account} username is saved for your driver profile.` });
@@ -9431,7 +10739,11 @@ app.get("/api/driver/next-job", requireDriver, async (req, res, next) => {
     const state = await getDriverDayState(req.driverLogin, {
       samsaraAccounts: samsaraAccountsForDriver(req.driver)
     });
-    if (state.truckPlate && (state.preDvirStatus !== "complete" || !state.samsaraOnDutyConfirmed || !state.samsaraPreDvirConfirmed)) {
+    if (
+      state.samsaraEnabled
+      && state.truckPlate
+      && (state.preDvirStatus !== "complete" || !state.samsaraOnDutyConfirmed || !state.samsaraPreDvirConfirmed)
+    ) {
       const suffix = state.preDvirStatus === "complete"
         ? " Samsara DVIR and On Duty confirmation are required."
         : "";
@@ -9572,10 +10884,19 @@ app.post("/api/driver/jobs/:jobId/skip-samsara", requireDriver, async (req, res,
     if (!job || job.jobId !== req.params.jobId || job.stopType !== "truck_switch") {
       return res.status(409).json({ error: "This is no longer the next assigned truck switch. Refresh and try again." });
     }
-    const reason = "Driver skipped Samsara truck assignment.";
-    const result = await skipDriverTruckSwitchSamsara(job.jobId, req.driverLogin, { reason, job });
+    const samsaraEnabled = driverSamsaraWorkflowEnabled(req.driver);
+    const reason = samsaraEnabled
+      ? "Driver skipped Samsara truck assignment."
+      : "Samsara is disabled for this driver; truck switch completed locally.";
+    const result = samsaraEnabled
+      ? await skipDriverTruckSwitchSamsara(job.jobId, req.driverLogin, { reason, job })
+      : await confirmDriverTruckSwitch(req.driverLogin, job, {
+          samsaraAccounts: samsaraAccountsForDriver(req.driver)
+        });
     await writeDispatchAudit({
-      action: "driver_truck_switch_samsara_skipped",
+      action: samsaraEnabled
+        ? "driver_truck_switch_samsara_skipped"
+        : "driver_truck_switch_confirmed_samsara_disabled",
       entityType: "driver_job",
       entityId: job.jobId,
       planId: job.planId,
@@ -9848,6 +11169,385 @@ app.put("/api/operators/:id/roles", requireOperator, requireAdmin, async (req, r
   }
 });
 
+// Return workflow operator endpoints. These routes intentionally use explicit
+// staff middleware because /api/returns has no broader role middleware.
+app.get("/api/returns/reasons", requireOperator, requireOperatorAccess, async (req, res, next) => {
+  try {
+    res.setHeader("Cache-Control", "no-store");
+    const [reasons, settings] = await Promise.all([
+      getReturnReasons({ refresh: req.query.refresh === "true" }),
+      listReturnYardSettings()
+    ]);
+    res.json({
+      ...reasons,
+      yardSettings: settings.map((setting) => ({
+        locationId: setting.locationId,
+        yardCode: setting.yardCode,
+        allowCrossYardReturns: setting.allowCrossYardReturns
+      }))
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/returns/orders/lookup", requireOperator, requireOperatorAccess, async (req, res, next) => {
+  try {
+    assertReturnOperatorYard(req.operator, req.body?.receivingLocationId || req.body?.yardLocationId);
+    const returnMode = String(req.body?.mode || req.body?.returnMode || "").trim().toLowerCase();
+    res.setHeader("Cache-Control", "no-store");
+    res.json(operatorSafeReturnPayload(await lookupReturnSalesOrder({
+      code: req.body?.code || req.body?.orderCode || req.body?.orderId,
+      receivingLocationId: req.body?.receivingLocationId || req.body?.yardLocationId,
+      includeStockReturns: returnMode !== "pallet",
+      includeNetSuiteOrderLines: false,
+      enforceYardRestriction: returnMode !== "pallet"
+    })));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/returns/customers", requireOperator, requireOperatorAccess, async (req, res, next) => {
+  try {
+    res.setHeader("Cache-Control", "no-store");
+    res.json({
+      customers: await searchReturnCustomers(req.query.search, { limit: req.query.limit })
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/returns/customers/:customerId/pallet-balance", requireOperator, requireOperatorAccess, async (req, res, next) => {
+  try {
+    res.setHeader("Cache-Control", "no-store");
+    const result = await lookupReturnCustomerPalletBalance(req.params.customerId);
+    res.json(operatorSafeReturnPayload({ customer: result.customer, balance: result }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/returns/operator/drafts", requireOperator, requireOperatorAccess, async (req, res, next) => {
+  try {
+    assertReturnOperatorYard(req.operator, req.query.receivingLocationId || req.query.yardLocationId);
+    res.json(operatorSafeReturnPayload({
+      drafts: await listReturnDrafts({
+        operatorId: req.operator.id,
+        receivingLocationId: req.query.receivingLocationId || req.query.yardLocationId
+      })
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/returns/operator/history", requireOperator, requireOperatorAccess, async (req, res, next) => {
+  try {
+    const result = await listReturnRecords(returnListFilters(req, {
+      operatorId: req.operator.id
+    }));
+    const safe = operatorSafeReturnPayload(result);
+    res.json({ ...safe, returns: safe.records });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/returns/operator/history/:id", requireOperator, requireOperatorAccess, async (req, res, next) => {
+  try {
+    const record = await getReturnRecordDetail(req.params.id, { operatorId: req.operator.id });
+    if (!record) return res.status(404).json({ error: "Return record was not found." });
+    res.json(operatorSafeReturnPayload(record));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/returns/drafts", requireOperator, requireOperatorAccess, async (req, res, next) => {
+  try {
+    assertReturnOperatorYard(req.operator, req.body?.receivingLocationId || req.body?.yardLocationId);
+    res.json(operatorSafeReturnPayload({
+      draft: await saveReturnDraft({ operatorId: req.operator.id, input: req.body || {} })
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete("/api/returns/drafts/:draftId", requireOperator, requireOperatorAccess, async (req, res, next) => {
+  try {
+    const result = await deleteReturnDraft({
+      draftId: req.params.draftId,
+      operatorId: req.operator.id
+    });
+    if (!result.deleted) return res.status(404).json({ error: "Return draft was not found." });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/returns/submit", requireOperator, requireOperatorAccess, async (req, res, next) => {
+  try {
+    assertReturnOperatorYard(req.operator, req.body?.receivingLocationId || req.body?.yardLocationId);
+    const result = await submitReturnBatch({
+      operatorId: req.operator.id,
+      input: req.body || {}
+    });
+    emitAppEvent("returns.updated", {
+      source: "operator-submit",
+      batchReference: result.batchReference,
+      recordIds: result.records?.map((record) => record.id) || []
+    });
+    res.status(result.idempotentReplay ? 200 : 201).json(operatorSafeReturnPayload(result));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/control/return-settings", requireOperator, requireControlAccess, async (req, res, next) => {
+  try {
+    const allowed = returnControlYardLocationIds(req.operator);
+    const settings = await listReturnYardSettings();
+    res.json({ settings: allowed ? settings.filter((item) => allowed.includes(item.locationId)) : settings });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/control/return-settings/:locationId", requireOperator, requireControlAccess, async (req, res, next) => {
+  try {
+    assertReturnControlYard(req.operator, req.params.locationId);
+    res.json(await getReturnYardSettings(req.params.locationId));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/control/return-settings/:locationId", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    res.json(await updateReturnYardSettings(req.params.locationId, {
+      allowCrossYardReturns: req.body?.allowCrossYardReturns
+    }, {
+      operatorId: req.operator.id,
+      allowCrossYard: true,
+      allowAutomation: false
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/admin/return-settings", requireOperator, requireAdmin, async (_req, res, next) => {
+  try {
+    res.json({ settings: await listReturnYardSettings() });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/admin/return-settings/:locationId", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    res.json(await updateReturnYardSettings(req.params.locationId, {
+      ...(Object.hasOwn(req.body || {}, "allowCrossYardReturns")
+        ? { allowCrossYardReturns: req.body.allowCrossYardReturns }
+        : {}),
+      ...(Object.hasOwn(req.body || {}, "autoCreateStockRa")
+        ? { autoCreateStockRa: req.body.autoCreateStockRa }
+        : Object.hasOwn(req.body || {}, "autoCreateStockReturnAuthorizations")
+          ? { autoCreateStockRa: req.body.autoCreateStockReturnAuthorizations }
+          : {}),
+      ...(Object.hasOwn(req.body || {}, "autoCreatePalletCreditMemo")
+        ? { autoCreatePalletCreditMemo: req.body.autoCreatePalletCreditMemo }
+        : Object.hasOwn(req.body || {}, "autoCreatePalletCreditMemos")
+          ? { autoCreatePalletCreditMemo: req.body.autoCreatePalletCreditMemos }
+          : {})
+    }, {
+      operatorId: req.operator.id,
+      allowCrossYard: true,
+      allowAutomation: true
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/returns/drafts/:draftId", requireOperator, requireControlAccess, async (req, res, next) => {
+  try {
+    const draft = await getReturnDraftForControl(req.params.draftId, {
+      receivingLocationIds: returnControlYardLocationIds(req.operator)
+    });
+    if (!draft) return res.status(404).json({ error: "Return draft was not found." });
+    res.json(draft);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/returns/drafts/:draftId/discard", requireOperator, requireControlAccess, async (req, res, next) => {
+  try {
+    res.json(await discardReturnDraftForControl({
+      draftId: req.params.draftId,
+      actorOperatorId: req.operator.id,
+      receivingLocationIds: returnControlYardLocationIds(req.operator),
+      reason: req.body?.reason
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/returns", requireOperator, requireControlAccess, async (req, res, next) => {
+  try {
+    const receivingLocationIds = returnControlYardLocationIds(req.operator);
+    if (String(req.query.status || "").toLowerCase() === "draft") {
+      const result = await listReturnDraftsForControl({
+        receivingLocationIds,
+        receivingLocationId: req.query.receivingLocationId || req.query.yardLocationId,
+        search: req.query.search,
+        returnType: req.query.type || req.query.recordType,
+        from: req.query.from,
+        to: req.query.to,
+        limit: req.query.limit,
+        offset: req.query.offset
+      });
+      return res.json({ records: result.records, counts: { total: result.total } });
+    }
+    res.json(await listReturnRecords(returnListFilters(req, { receivingLocationIds })));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/returns/:id", requireOperator, requireControlAccess, async (req, res, next) => {
+  try {
+    if (/^[0-9a-f-]{36}$/i.test(req.params.id)) {
+      const draft = await getReturnDraftForControl(req.params.id, {
+        receivingLocationIds: returnControlYardLocationIds(req.operator)
+      });
+      if (!draft) return res.status(404).json({ error: "Return draft was not found." });
+      return res.json(draft);
+    }
+    const record = await getReturnRecordDetail(req.params.id, {
+      receivingLocationIds: returnControlYardLocationIds(req.operator)
+    });
+    if (!record) return res.status(404).json({ error: "Return record was not found." });
+    res.json(record);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/returns/:id/lines/:lineId/decision", requireOperator, requireControlAccess, async (req, res, next) => {
+  try {
+    const record = await decideReturnLine({
+      recordId: req.params.id,
+      lineId: req.params.lineId,
+      decision: req.body?.decision,
+      note: req.body?.note ?? req.body?.reason,
+      actorOperatorId: req.operator.id,
+      allowedReceivingLocationIds: returnControlYardLocationIds(req.operator)
+    });
+    emitAppEvent("returns.updated", { source: "approval-decision", recordId: record.id });
+    res.json(record);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/returns/:id/void", requireOperator, requireControlAccess, async (req, res, next) => {
+  try {
+    const record = await voidReturnRecord({
+      recordId: req.params.id,
+      reason: req.body?.reason,
+      actorOperatorId: req.operator.id,
+      allowedReceivingLocationIds: returnControlYardLocationIds(req.operator)
+    });
+    emitAppEvent("returns.updated", { source: "void", recordId: record.id });
+    res.json(record);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/returns/:id/sync/retry", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    const current = await getReturnRecordDetail(req.params.id, {
+      receivingLocationIds: returnControlYardLocationIds(req.operator)
+    });
+    if (!current) return res.status(404).json({ error: "Return record was not found." });
+    if (current.netSuiteSyncStatus !== "failed") {
+      return res.status(409).json({ error: "Only a failed NetSuite return synchronization can be retried." });
+    }
+    res.json(await syncReturnRecord({
+      recordId: current.id,
+      actorOperatorId: req.operator.id,
+      force: true
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+async function linkReturnNetSuiteRoute(req, res, next) {
+  try {
+    res.json(await linkReturnNetSuiteTransaction({
+      recordId: req.params.id,
+      transactionType: req.body?.transactionType,
+      netsuiteId: req.body?.netsuiteId,
+      netsuiteTranid: req.body?.netsuiteTranid,
+      actorOperatorId: req.operator.id
+    }));
+  } catch (error) {
+    next(error);
+  }
+}
+
+app.post("/api/returns/:id/netsuite-link", requireOperator, requireAdmin, linkReturnNetSuiteRoute);
+app.post("/api/returns/:id/net-suite-link", requireOperator, requireAdmin, linkReturnNetSuiteRoute);
+
+app.post("/api/admin/returns/reconcile", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    res.json(await reconcileReturnRecords({
+      limit: req.body?.limit,
+      actorOperatorId: req.operator.id
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/sales/returns", requirePrivateSalesRecordAccess, async (req, res, next) => {
+  try {
+    const authorized = operatorSalesYardLocationIds(req.operator);
+    const requestedYard = Number(req.query.orderingLocationId || req.query.yardLocationId || req.query.yard);
+    const orderingLocationIds = Number.isInteger(requestedYard) && requestedYard > 0
+      ? authorized.filter((locationId) => locationId === requestedYard)
+      : authorized;
+    res.json(await listReturnRecords(returnListFilters(req, {
+      receivingLocationId: "",
+      orderingLocationIds: orderingLocationIds.length ? orderingLocationIds : [-1]
+    })));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/sales/returns/:id", requirePrivateSalesRecordAccess, async (req, res, next) => {
+  try {
+    const authorized = operatorSalesYardLocationIds(req.operator);
+    const record = await getReturnRecordDetail(req.params.id, {
+      orderingLocationIds: authorized.length ? authorized : [-1]
+    });
+    if (!record) return res.status(404).json({ error: "Return record was not found." });
+    res.json(record);
+  } catch (error) {
+    next(error);
+  }
+});
+
 async function listOperatorOrderLocks() {
   const result = await query(
     `WITH lock_source AS (
@@ -10085,6 +11785,149 @@ app.post("/api/admin/netsuite-mirror/reconcile", requireOperator, requireAdmin, 
       details: result
     });
     res.json({ result, status: await getNetSuiteMirrorStatus() });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/control/scm-reconciliation/settings", requireOperator, requireAdmin, async (_req, res, next) => {
+  try {
+    res.json({ settings: await getScmReconciliationSettings() });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/control/scm-reconciliation/settings", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    const settings = await updateScmReconciliationSettings(req.body || {}, req.operator?.id);
+    res.json({ settings });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/control/scm-reconciliation/runs", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    res.json({ runs: await listScmReconciliationRuns({ limit: req.query.limit || 30 }) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put(
+  "/api/control/scm-reconciliation/runs/:runId/targets/:targetId/decision",
+  requireOperator,
+  requireAdmin,
+  async (req, res, next) => {
+    try {
+      const result = await updateScmReconciliationRunTargetDecision({
+        runId: req.params.runId,
+        targetId: req.params.targetId,
+        decision: req.body?.decision,
+        note: req.body?.note,
+        expectedUpdatedAt: req.body?.expectedUpdatedAt ?? req.body?.expected_updated_at,
+        actor: req.operator?.id
+      });
+      res.json(result);
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+app.post("/api/control/scm-reconciliation/run", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    const requestedScope = String(req.body?.scope || "").trim();
+    const targetedScope = /^order[_ -]?family$/i.test(requestedScope);
+    const run = await startScmReconciliationRun({
+      scope: requestedScope,
+      targetOrderKind: req.body?.orderKind ?? req.body?.targetOrderKind,
+      targetOrderId: req.body?.orderId ?? req.body?.targetOrderId,
+      targetOrderRef: req.body?.orderRef ?? req.body?.targetOrderRef,
+      targetOrderRefs: req.body?.orderRefs ?? req.body?.targetOrderRefs,
+      includeTerminalOrders: targetedScope
+        ? true
+        : (req.body?.includeTerminalOrders ?? req.body?.include_terminal_orders),
+      dryRun: req.body?.dryRun ?? req.body?.dry_run,
+      applyUnambiguous: true,
+      triggerSource: "manual",
+      requestedBy: req.operator?.id
+    }, {
+      background: true,
+      operationalSyncRunning: anyNetSuiteSyncRunning
+    });
+    res.status(202).json({ started: true, run });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post(
+  "/api/control/scm-reconciliation/runs/:id/stop",
+  requireOperator,
+  requireAdmin,
+  async (req, res, next) => {
+    try {
+      const result = await cancelScmReconciliationRun(
+        req.params.id,
+        req.operator?.id,
+        req.body?.note
+      );
+      emitAppEvent("dispatch.orders.updated", {
+        source: "scm-reconciliation-stop",
+        runId: Number(req.params.id) || null
+      });
+      res.json(result);
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+app.post(
+  "/api/control/scm-reconciliation/runs/:id/resume",
+  requireOperator,
+  requireAdmin,
+  async (req, res, next) => {
+    try {
+      const run = await resumeScmReconciliationRun(
+        req.params.id,
+        req.operator?.id,
+        {
+          background: true,
+          operationalSyncRunning: anyNetSuiteSyncRunning
+        }
+      );
+      emitAppEvent("dispatch.orders.updated", {
+        source: "scm-reconciliation-resume",
+        runId: Number(req.params.id) || null
+      });
+      res.status(202).json({ started: true, run });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+app.post("/api/control/scm-reconciliation/runs/:id/apply", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    const result = await applyScmReconciliationRun(
+      req.params.id,
+      req.operator?.id,
+      {
+        background: true,
+        operationalSyncRunning: anyNetSuiteSyncRunning
+      }
+    );
+    if (result.pending) return res.status(202).json(result);
+    if (!result.applied) {
+      return res.status(409).json({
+        ...result,
+        error: result.applyRun?.error || "The reconciliation apply did not succeed."
+      });
+    }
+    res.json(result);
   } catch (error) {
     next(error);
   }
@@ -11502,7 +13345,9 @@ app.get("/api/inventory/classifications", requireControlAccess, async (req, res,
 
 app.put("/api/inventory/classifications/:itemId", requireControlAccess, async (req, res, next) => {
   try {
-    res.json(await updateInventoryClassification(req.operator.id, req.params.itemId, req.body || {}));
+    res.json(await updateInventoryClassification(req.operator.id, req.params.itemId, req.body || {}, {
+      allowReturnPolicyChange: operatorHasAnyRole(req.operator, ["admin"])
+    }));
   } catch (error) {
     next(error);
   }
@@ -11583,11 +13428,140 @@ app.use((error, req, res, next) => {
   res.status(error.status || 500).json({
     error: error.message,
     ...(error.code ? { code: error.code } : {}),
-    ...(Array.isArray(error.conflicts) ? { conflicts: error.conflicts } : {})
+    ...(Array.isArray(error.conflicts) ? { conflicts: error.conflicts } : {}),
+    ...(error.requiredReturnLocation ? { requiredReturnLocation: error.requiredReturnLocation } : {}),
+    ...(error.available !== undefined ? { available: error.available } : {}),
+    ...(error.sourceLineId !== undefined ? { sourceLineId: error.sourceLineId } : {})
   });
 });
 
 export { app, salesPrintRequestIp };
+
+let returnReconciliationRunning = false;
+let returnPendingSyncRunning = false;
+let scmReconciliationScheduledTickRunning = false;
+
+async function recoverStaleScmReconciliationRuns() {
+  return withTransaction(async () => {
+    const stale = await query(
+      `UPDATE scm_reconciliation_runs
+          SET status = 'interrupted',
+              error = CASE
+                WHEN cancel_requested_at IS NOT NULL
+                  THEN COALESCE(NULLIF(cancel_request_note, ''), 'Stopped by an administrator.')
+                ELSE COALESCE(NULLIF(error, ''), 'Recovered after a stale reconciliation worker stopped reporting progress.')
+              END,
+              checkpoint = checkpoint || jsonb_build_object(
+                'staleRecoveryAt', now()::text,
+                'resumable', true
+              ),
+              completed_at = now(),
+              updated_at = now()
+        WHERE status = 'running'
+          AND COALESCE(heartbeat_at, started_at, created_at) < now() - interval '30 minutes'
+        RETURNING id, status`
+    );
+    const runIds = stale.rows.map((row) => Number(row.id)).filter(Number.isSafeInteger);
+    if (runIds.length) {
+      await query(
+        `UPDATE scm_reconciliation_run_targets target
+            SET status = 'pending',
+                error = NULL,
+                completed_at = NULL,
+                updated_at = now()
+           FROM scm_reconciliation_runs run
+          WHERE target.run_id = run.id
+            AND target.run_id = ANY($1::bigint[])
+            AND target.status IN ('pending', 'running')`,
+        [runIds]
+      );
+      console.warn(`Recovered ${runIds.length} stale running PO/TO reconciliation run(s).`);
+    }
+    return runIds;
+  });
+}
+
+async function scmReconciliationScheduledTick() {
+  if (scmReconciliationScheduledTickRunning) return;
+  scmReconciliationScheduledTickRunning = true;
+  try {
+    await recoverStaleScmReconciliationRuns();
+    if (!anyNetSuiteSyncRunning()) {
+      const queued = await query(
+        `SELECT queued.id
+           FROM scm_reconciliation_runs queued
+          WHERE queued.status = 'queued'
+            AND NOT EXISTS (
+              SELECT 1
+                FROM scm_reconciliation_runs running
+               WHERE running.status = 'running'
+            )
+          ORDER BY queued.created_at, queued.id
+          LIMIT 1`
+      );
+      if (queued.rows[0]?.id) {
+        const completed = await executeScmReconciliationRun(
+          Number(queued.rows[0].id),
+          {
+            operationalSyncRunning: anyNetSuiteSyncRunning
+          }
+        );
+        if (
+          completed?.status === "succeeded"
+          && completed?.triggerSource === "webhook"
+        ) {
+          emitAppEvent("dispatch.orders.updated", {
+            source: "netsuite-if-ir-webhook-queued",
+            orderId: completed.targetOrderId || null,
+            orderRef: completed.targetOrderRef || "",
+            orderKind: completed.targetOrderKind || "",
+            refreshOrderPool: true
+          });
+        }
+        return;
+      }
+    }
+    await scmReconciliationNightlyTick({
+      operationalSyncRunning: anyNetSuiteSyncRunning
+    });
+  } catch (error) {
+    console.error("Scheduled PO/TO reconciliation tick failed:", error.message);
+  } finally {
+    scmReconciliationScheduledTickRunning = false;
+  }
+}
+
+async function returnPendingSyncTick() {
+  if (returnPendingSyncRunning) return;
+  returnPendingSyncRunning = true;
+  try {
+    await processPendingReturnSyncs({ limit: 25 });
+  } catch (error) {
+    console.error("Scheduled pending return synchronization failed:", error.message);
+  } finally {
+    returnPendingSyncRunning = false;
+  }
+}
+
+async function returnReconciliationTick() {
+  if (returnReconciliationRunning) return;
+  returnReconciliationRunning = true;
+  try {
+    await reconcileReturnRecords({ limit: 100 });
+  } catch (error) {
+    console.error("Scheduled return reconciliation failed:", error.message);
+  } finally {
+    returnReconciliationRunning = false;
+  }
+}
+
+async function returnCustomerDirectorySyncTick() {
+  try {
+    await syncReturnCustomerDirectory();
+  } catch (error) {
+    console.error("Scheduled Return customer directory refresh failed:", error.message);
+  }
+}
 
 export async function startServer() {
   await recoverInterruptedSyncState();
@@ -11604,6 +13578,14 @@ export async function startServer() {
       () => void smartScmAutoTick().catch((error) => console.error("Smart SCM scheduled tick failed:", error)),
       Math.max(1, Number(config.smartScm.forecastIntervalMinutes) || 5) * 60000
     );
+    setTimeout(() => void returnReconciliationTick(), 30000);
+    setTimeout(() => void returnPendingSyncTick(), 5000);
+    setTimeout(() => void returnCustomerDirectorySyncTick(), 15000);
+    void scmReconciliationScheduledTick();
+    setInterval(() => void returnPendingSyncTick(), 60000);
+    setInterval(() => void returnReconciliationTick(), 15 * 60 * 1000);
+    setInterval(() => void returnCustomerDirectorySyncTick(), 5 * 60 * 1000);
+    setInterval(() => void scmReconciliationScheduledTick(), 60000);
   });
 }
 

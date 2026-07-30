@@ -22,20 +22,26 @@ import { dispatchPlannedOrderConflictRefs } from "./dispatch-plan-repository.js"
 
 const [
   migrationSource,
+  stopMinutesMigrationSource,
   planningSource,
   driverRepositorySource,
   planRepositorySource,
   serverSource,
   dispatchMenuSource,
-  sidebarSource
+  sidebarSource,
+  customOrdersUiSource,
+  customOrdersHtmlSource
 ] = await Promise.all([
   fs.readFile(new URL("../migrations/069_dispatch_custom_orders.sql", import.meta.url), "utf8"),
+  fs.readFile(new URL("../migrations/086_dispatch_custom_order_stop_minutes.sql", import.meta.url), "utf8"),
   fs.readFile(new URL("../public/dispatch.js", import.meta.url), "utf8"),
   fs.readFile(new URL("./driver-repository.js", import.meta.url), "utf8"),
   fs.readFile(new URL("./dispatch-plan-repository.js", import.meta.url), "utf8"),
   fs.readFile(new URL("./server.js", import.meta.url), "utf8"),
   fs.readFile(new URL("../public/dispatch-menu.html", import.meta.url), "utf8"),
-  fs.readFile(new URL("../public/app-sidebar.js", import.meta.url), "utf8")
+  fs.readFile(new URL("../public/app-sidebar.js", import.meta.url), "utf8"),
+  fs.readFile(new URL("../public/dispatch-custom-orders.js", import.meta.url), "utf8"),
+  fs.readFile(new URL("../public/dispatch-custom-orders.html", import.meta.url), "utf8")
 ]);
 
 function assertStaticIntegration() {
@@ -127,6 +133,26 @@ function assertStaticIntegration() {
     /\{\s*label:\s*"Custom Orders"\s*,\s*href:\s*"\/dispatch\/custom-orders"/,
     "The Dispatch sidebar must link to Custom Orders."
   );
+  assert.match(
+    stopMinutesMigrationSource,
+    /ADD COLUMN IF NOT EXISTS stop_minutes integer[\s\S]*CHECK \(stop_minutes IS NULL OR stop_minutes BETWEEN 0 AND 1440\)/,
+    "Custom Order destination stop time must be nullable for legacy rows and constrained to 0-1440 minutes."
+  );
+  assert.match(
+    customOrdersUiSource,
+    /name="stopMinutes"[\s\S]{0,300}min="0"[\s\S]{0,300}max="1440"[\s\S]{0,300}required/,
+    "The Custom Order editor must require a destination stop-time value from 0 to 1440 minutes."
+  );
+  assert.match(
+    customOrdersHtmlSource,
+    /dispatch-custom-orders\.js\?v=20260730-stop-time-v1/,
+    "The Custom Order editor must cache-bust the stop-time UI."
+  );
+  assert.match(
+    planningSource,
+    /current \+= stopStayMinutes\(stop, order, truck\)/,
+    "The planning timeline must use the same Custom Order stop-time calculation as the route estimate."
+  );
 }
 
 function validInput(refNumber, overrides = {}) {
@@ -136,6 +162,7 @@ function validInput(refNumber, overrides = {}) {
     dropoffLocation: "Customer Site, 702 Destination Avenue, Toronto ON",
     orderDetails: "Two wrapped sample racks; call the receiving supervisor before unloading.",
     weightLbs: 2750.1256,
+    stopMinutes: 47,
     ...overrides
   };
 }
@@ -161,6 +188,7 @@ async function verifyRepositoryCrud(runId) {
   assert.equal(created.status, "open");
   assert.equal(created.createdBy, "custom-order-harness");
   assert.equal(created.weightLbs, 2750.126, "Weight must be normalized to the table's three-decimal precision.");
+  assert.equal(created.stopMinutes, 47);
 
   const fetched = await getDispatchCustomOrder(created.id);
   assert.deepEqual(fetched, created, "A newly created Custom Order must round-trip through the repository.");
@@ -188,6 +216,8 @@ async function verifyRepositoryCrud(runId) {
   assert.equal(mapped.destinationYard, created.dropoffLocation);
   assert.equal(mapped.instructions, created.orderDetails);
   assert.equal(mapped.weight, created.weightLbs);
+  assert.equal(mapped.stopMinutes, 47);
+  assert.equal(mapped.raw.stop_minutes, 47);
   assert.equal(mapped.items.length, 1, "A free-typed Custom Order must expose one dispatch LOAD detail line.");
   assert.equal(mapped.items[0].unit, "LOAD");
   assert.equal(mapped.items[0].quantity, 1);
@@ -200,13 +230,15 @@ async function verifyRepositoryCrud(runId) {
     pickupLocation: "Temporary Vendor Dock, 9 Unmapped Lane, Guelph ON",
     dropoffLocation: "Trade Show Hall C, 40 Convention Way, Toronto ON",
     orderDetails: "One display crate and loose signs. Ask for booth 403.",
-    weightLbs: 812.5
+    weightLbs: 812.5,
+    stopMinutes: 62
   }), "custom-order-editor");
   assert.equal(updated.refNumber, primaryRef, "The reference must stay stable after an edit.");
   assert.equal(updated.pickupLocation, "Temporary Vendor Dock, 9 Unmapped Lane, Guelph ON");
   assert.equal(updated.dropoffLocation, "Trade Show Hall C, 40 Convention Way, Toronto ON");
   assert.equal(updated.orderDetails, "One display crate and loose signs. Ask for booth 403.");
   assert.equal(updated.weightLbs, 812.5);
+  assert.equal(updated.stopMinutes, 62);
   assert.equal(updated.updatedBy, "custom-order-editor");
 
   await assert.rejects(
@@ -273,6 +305,32 @@ async function verifyRepositoryCrud(runId) {
     validInput(`${primaryRef}-HUGE-WEIGHT`, { weightLbs: 1000000.001 }),
     /Weight must be .* or less/i,
     "Unreasonably large weight must be rejected."
+  );
+  await expectInputError(
+    validInput(`${primaryRef}-NEGATIVE-STOP`, { stopMinutes: -1 }),
+    /Destination stop time must be a whole number from 0 to 1440 minutes/i,
+    "Negative destination stop time must be rejected."
+  );
+  await expectInputError(
+    validInput(`${primaryRef}-FRACTIONAL-STOP`, { stopMinutes: 12.5 }),
+    /Destination stop time must be a whole number from 0 to 1440 minutes/i,
+    "Fractional destination stop time must be rejected."
+  );
+  await expectInputError(
+    validInput(`${primaryRef}-HUGE-STOP`, { stopMinutes: 1441 }),
+    /Destination stop time must be a whole number from 0 to 1440 minutes/i,
+    "Destination stop time above one day must be rejected."
+  );
+
+  const legacy = await createDispatchCustomOrder(
+    validInput(`${primaryRef}-LEGACY`, { stopMinutes: undefined }),
+    "legacy-custom-order-client"
+  );
+  assert.equal(legacy.stopMinutes, null, "Older clients may omit destination stop time.");
+  assert.equal(
+    dispatchOrderFromCustomOrder(legacy).stopMinutes,
+    null,
+    "Legacy Custom Orders must retain the planner's per-driver delivery timing fallback."
   );
 
   return { created, updated };
@@ -367,6 +425,7 @@ function submittedCustomPlan(customOrder, {
     destinationYard: "Attacker drop-off",
     instructions: "Attacker supplied details",
     notes: "Attacker supplied details",
+    stopMinutes: 1,
     weight: 999999,
     items: [{
       lineRowId: "attacker-line",
@@ -479,6 +538,7 @@ async function verifyBackendCanonicalization(runId) {
   assert.equal(canonical.destinationYard, stored.dropoffLocation);
   assert.equal(canonical.instructions, stored.orderDetails);
   assert.equal(canonical.notes, stored.orderDetails);
+  assert.equal(canonical.stopMinutes, stored.stopMinutes, "The stored destination stop time must defeat a client plan override.");
   assert.equal(canonical.weight, stored.weightLbs);
   assert.equal(canonical.items.length, 1);
   assert.equal(canonical.items[0].description, stored.orderDetails);
@@ -961,6 +1021,7 @@ try {
   await rollback.run(async () => {
     await query("SELECT pg_advisory_xact_lock(hashtext('dispatch-custom-order-harness'))");
     await query(migrationSource);
+    await query(stopMinutesMigrationSource);
 
     const runId = `${Date.now()}-${Math.floor(Math.random() * 100000)}`;
     await verifyRepositoryCrud(runId);
@@ -974,6 +1035,8 @@ try {
       repositoryCrud: true,
       validationAndCaseInsensitiveDuplicates: true,
       customDispatchMapper: true,
+      customDestinationStopTime: true,
+      legacyStopTimeFallback: true,
       backendCanonicalization: true,
       immutableReferenceGuard: true,
       crossDateAssignmentExclusivity: true,

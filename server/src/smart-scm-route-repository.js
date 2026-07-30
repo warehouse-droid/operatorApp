@@ -19,6 +19,14 @@ export function smartScmRouteRuleKey(value) {
   return text(value).toLowerCase().replace(/[^a-z0-9]+/g, "");
 }
 
+function sourceNameHasToken(value, token) {
+  return text(value).toLowerCase().split(/[^a-z0-9]+/).includes(token);
+}
+
+export function smartScmIsGormleySource(value) {
+  return sourceNameHasToken(value, "gormley");
+}
+
 function integerList(value, fallback = []) {
   const input = Array.isArray(value) ? value : fallback;
   return [...new Set(input.map(Number).filter(Number.isInteger))];
@@ -26,9 +34,10 @@ function integerList(value, fallback = []) {
 
 export function smartScmBuiltInRouteRule(sourceName = "") {
   const sourceKey = smartScmRouteRuleKey(sourceName);
-  const isUxbridge = sourceKey.endsWith("uxbridge") || sourceKey.endsWith("uxbrige");
-  const isWoodbridge = sourceKey.endsWith("woodbridge") || sourceKey.endsWith("woodbrige");
-  const specialOrder = sourceKey === "gormley" || isUxbridge || isWoodbridge
+  const isGormley = smartScmIsGormleySource(sourceName);
+  const isUxbridge = sourceNameHasToken(sourceName, "uxbridge") || sourceNameHasToken(sourceName, "uxbrige");
+  const isWoodbridge = sourceNameHasToken(sourceName, "woodbridge") || sourceNameHasToken(sourceName, "woodbrige");
+  const specialOrder = isGormley || isUxbridge || isWoodbridge
     ? [15, 1, 28, 26]
     : [...DEFAULT_STOP_ORDER];
   return {
@@ -38,10 +47,10 @@ export function smartScmBuiltInRouteRule(sourceName = "") {
     enabled: true,
     maxDrops: 2,
     stopOrder: specialOrder,
-    partialRedirectEnabled: sourceKey === "gormley",
+    partialRedirectEnabled: isGormley,
     partialRedirectDestinationIds: [...SHOP_IDS],
-    partialRedirectHubLocationId: sourceKey === "gormley" ? 15 : null,
-    notes: sourceKey === "gormley"
+    partialRedirectHubLocationId: isGormley ? 15 : null,
+    notes: isGormley
       ? "Partial direct-shop quantities route through 12441."
       : isUxbridge || isWoodbridge
         ? "150 is the last stop whenever another yard is on the route."
@@ -78,9 +87,20 @@ function publicRule(row, sourceName = row?.source_name || "") {
 export async function listSmartScmRouteRules() {
   const [configured, sources] = await Promise.all([
     query("SELECT * FROM scm_smart_route_rules ORDER BY source_name"),
-    query(`SELECT DISTINCT COALESCE(NULLIF(BTRIM(vendor_yard), ''), NULLIF(BTRIM(plant), ''), NULLIF(BTRIM(vendor), '')) AS source_name
-             FROM scm_smart_item_policies
-            WHERE COALESCE(NULLIF(BTRIM(vendor_yard), ''), NULLIF(BTRIM(plant), ''), NULLIF(BTRIM(vendor), '')) IS NOT NULL
+    query(`SELECT DISTINCT COALESCE(
+                    NULLIF(BTRIM(vy.yard), ''),
+                    NULLIF(BTRIM(policy.vendor_yard), ''),
+                    NULLIF(BTRIM(policy.plant), ''),
+                    NULLIF(BTRIM(policy.vendor), '')
+                  ) AS source_name
+             FROM scm_smart_item_policies policy
+             LEFT JOIN dispatch_vendor_yards vy ON vy.id = policy.vendor_yard_id
+            WHERE COALESCE(
+                    NULLIF(BTRIM(vy.yard), ''),
+                    NULLIF(BTRIM(policy.vendor_yard), ''),
+                    NULLIF(BTRIM(policy.plant), ''),
+                    NULLIF(BTRIM(policy.vendor), '')
+                  ) IS NOT NULL
             ORDER BY 1`)
   ]);
   const byKey = new Map(configured.rows.map((row) => [row.source_key, publicRule(row)]));

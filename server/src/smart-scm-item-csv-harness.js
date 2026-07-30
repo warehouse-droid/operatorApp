@@ -3,7 +3,9 @@ import fs from "node:fs/promises";
 import { closeDb, query, withTransaction } from "./db.js";
 import {
   buildSmartScmItemMasterCsvTemplate,
-  importSmartScmItemMasterCsv
+  importSmartScmItemMasterCsv,
+  listSmartScmItems,
+  updateSmartScmItem
 } from "./smart-scm-item-repository.js";
 
 const capacityNullMigration = await fs.readFile(
@@ -12,6 +14,10 @@ const capacityNullMigration = await fs.readFile(
 );
 const lowerStockPolicyMigration = await fs.readFile(
   new URL("../migrations/070_smart_scm_lower_stock_policy.sql", import.meta.url),
+  "utf8"
+);
+const returnMigration = await fs.readFile(
+  new URL("../migrations/071_returns.sql", import.meta.url),
   "utf8"
 );
 
@@ -27,6 +33,7 @@ const CSV_HEADERS = [
   "item_name",
   "vendor",
   "policy_revision",
+  "return_policy",
   "planning_enabled",
   "vendor_yard_id",
   "vendor_yard",
@@ -163,6 +170,7 @@ try {
     // the live schema: the surrounding transaction always rolls this back.
     await query(capacityNullMigration);
     await query(lowerStockPolicyMigration);
+    await query(returnMigration);
     const idResult = await query(
       "SELECT GREATEST(COALESCE(MAX(item_id), 0), 9000000) + 1000 AS item_id FROM inventory_items"
     );
@@ -705,6 +713,93 @@ try {
     policy = await itemPolicy(itemId);
     assert.equal(policy.planning_enabled, false, "A row with a nonblank extra cell must not be applied.");
 
+    const listedBeforeReturnPolicyChange = await listSmartScmItems({
+      search: String(itemId),
+      limit: 10
+    });
+    const returnPolicyItem = listedBeforeReturnPolicyChange.items.find(
+      (item) => Number(item.itemId) === itemId
+    );
+    assert(returnPolicyItem, "The Smart Item Master list must include the return-policy fixture.");
+    assert.match(returnPolicyItem.returnPolicyRevision, /^[a-f0-9]{64}$/);
+    await assert.rejects(
+      updateSmartScmItem(itemId, {
+        returnPolicyOverride: "ALLOWED",
+        expectedReturnPolicyRevision: returnPolicyItem.returnPolicyRevision
+      }, null),
+      (error) => error?.status === 403
+    );
+    await assert.rejects(
+      updateSmartScmItem(itemId, {
+        returnPolicyOverride: "ALLOWED"
+      }, null, { allowReturnPolicyChange: true }),
+      (error) => error?.status === 400 && error?.code === "RETURN_POLICY_REVISION_REQUIRED"
+    );
+    await updateSmartScmItem(itemId, {
+      returnPolicyOverride: "ALLOWED",
+      expectedReturnPolicyRevision: returnPolicyItem.returnPolicyRevision
+    }, null, { allowReturnPolicyChange: true });
+    let listedAfterReturnPolicyChange = await listSmartScmItems({
+      search: String(itemId),
+      limit: 10
+    });
+    let changedReturnPolicyItem = listedAfterReturnPolicyChange.items.find(
+      (item) => Number(item.itemId) === itemId
+    );
+    assert.equal(changedReturnPolicyItem.returnPolicyOverride, "ALLOWED");
+    assert.notEqual(
+      changedReturnPolicyItem.returnPolicyRevision,
+      returnPolicyItem.returnPolicyRevision,
+      "An explicit Return Policy update must issue a new row revision."
+    );
+
+    const staleReturnPolicyRevision = changedReturnPolicyItem.returnPolicyRevision;
+    await query(
+      "UPDATE inventory_items SET product_type = 'Natural Stone' WHERE item_id = $1",
+      [itemId]
+    );
+    await assert.rejects(
+      updateSmartScmItem(itemId, {
+        returnPolicyOverride: "NOT_RETURNABLE",
+        expectedReturnPolicyRevision: staleReturnPolicyRevision
+      }, null, { allowReturnPolicyChange: true }),
+      (error) => error?.status === 409 && error?.code === "RETURN_POLICY_CONFLICT"
+    );
+    const preservedReturnPolicy = await query(
+      "SELECT return_policy_override FROM inventory_items WHERE item_id = $1",
+      [itemId]
+    );
+    assert.equal(
+      preservedReturnPolicy.rows[0].return_policy_override,
+      "ALLOWED",
+      "A stale policy edit must not overwrite a newer Product Type or Return Policy."
+    );
+
+    listedAfterReturnPolicyChange = await listSmartScmItems({
+      search: String(itemId),
+      limit: 10
+    });
+    changedReturnPolicyItem = listedAfterReturnPolicyChange.items.find(
+      (item) => Number(item.itemId) === itemId
+    );
+    assert.notEqual(
+      changedReturnPolicyItem.returnPolicyRevision,
+      staleReturnPolicyRevision,
+      "A Product Type change must invalidate an already-rendered Return Policy revision."
+    );
+    await updateSmartScmItem(itemId, {
+      planningEnabled: true
+    }, null);
+    const unchangedReturnPolicy = await query(
+      "SELECT return_policy_override FROM inventory_items WHERE item_id = $1",
+      [itemId]
+    );
+    assert.equal(
+      unchangedReturnPolicy.rows[0].return_policy_override,
+      "ALLOWED",
+      "An ordinary Item Master save without a Return Policy field must preserve the policy."
+    );
+
     console.log(JSON.stringify({
       ok: true,
       templatePrefilled: true,
@@ -724,6 +819,9 @@ try {
       spreadsheetFormulaProtection: true,
       extraCellsRejected: true,
       duplicateRowsRejected: true,
+      returnPolicyAdminOnly: true,
+      returnPolicyCasProtected: true,
+      ordinarySavePreservesReturnPolicy: true,
       rolledBack: true
     }));
   }, { rollback: true });

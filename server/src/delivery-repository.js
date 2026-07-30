@@ -2314,9 +2314,257 @@ async function materializeSalesSplitOrder(order, parent) {
   return splitId;
 }
 
-async function materializeTransferSplitOrder(order, parent) {
+function explicitTransferSplitIdentity(values = []) {
+  return values.find((value) => value !== null && value !== undefined && String(value).trim() !== "");
+}
+
+async function resolveTransferSplitSourceLine(item, parentId, orderRef) {
+  const sourceRowId = explicitTransferSplitIdentity([
+    item.lineRowId,
+    item.line_row_id,
+    item.sourceLineId,
+    item.source_line_id,
+    item.id
+  ]);
+  const netsuiteLineKey = explicitTransferSplitIdentity([item.lineId, item.line_id]);
+
+  if (sourceRowId !== undefined) {
+    const byRow = await query(
+      `SELECT *
+         FROM transfer_order_lines
+        WHERE transfer_order_id = $1
+          AND line_stage = 'outbound'
+          AND id::text = $2
+        LIMIT 1`,
+      [parentId, String(sourceRowId).trim()]
+    );
+    if (byRow.rows[0]) {
+      const source = byRow.rows[0];
+      if (netsuiteLineKey !== undefined && String(source.line_id ?? "") !== String(netsuiteLineKey).trim()) {
+        throw new Error(
+          `Selected TO line ${sourceRowId} does not match NetSuite line ${netsuiteLineKey} on ${orderRef}.`
+        );
+      }
+      return source;
+    }
+  }
+
+  if (netsuiteLineKey !== undefined) {
+    const byLineKey = await query(
+      `SELECT *
+         FROM transfer_order_lines
+        WHERE transfer_order_id = $1
+          AND line_stage = 'outbound'
+          AND line_id::text = $2
+        ORDER BY id
+        LIMIT 2`,
+      [parentId, String(netsuiteLineKey).trim()]
+    );
+    if (byLineKey.rowCount > 1) {
+      throw new Error(`NetSuite line ${netsuiteLineKey} is ambiguous on ${orderRef}.`);
+    }
+    if (byLineKey.rows[0]) return byLineKey.rows[0];
+  }
+
+  const identity = sourceRowId ?? netsuiteLineKey ?? "(missing)";
+  throw new Error(`Selected TO line ${identity} was not found on ${orderRef}.`);
+}
+
+function transferSplitPlannedQuantities(item = {}) {
+  const quantities = {
+    pallets: itemNumber(item.pallets ?? item.pallet_qty),
+    layers: itemNumber(item.layers ?? item.layer_qty),
+    sections: itemNumber(item.sections ?? item.section_qty),
+    pieces: itemNumber(item.pieces ?? item.piece_qty),
+    salesQty: splitLineSalesQuantity(item)
+  };
+  if (Object.values(quantities).some((value) => value < 0)) {
+    throw new Error("Transfer split quantities cannot be negative.");
+  }
+  return quantities;
+}
+
+async function upsertTransferSplitLedgerHeader({ order, parent, splitId }) {
+  const parentId = String(parent?.netsuite_id ?? "").trim();
+  const parentRef = String(parent?.tranid || order.originalOrderId || "").trim();
+  const splitRef = String(order.id || "").trim();
+  if (!/^\d+$/.test(parentId) || BigInt(parentId) <= 0n) {
+    throw new Error(`Transfer split ${splitRef || "(missing)"} requires a positive NetSuite parent ID.`);
+  }
+  if (!parentRef || !splitRef) throw new Error("Transfer split parent and child references are required.");
+
+  const details = {
+    materializedBy: "dispatch-plan",
+    lastMaterializedAt: new Date().toISOString()
+  };
+  const result = await query(
+    `INSERT INTO dispatch_scm_to_splits (
+       source_to_id, source_to_ref, split_to_id, split_to_ref,
+       status, created_by, cancelled_at, details
+     ) VALUES (
+       $1, $2, $3, $4,
+       'active', $5, NULL, $6::jsonb
+     )
+     ON CONFLICT (split_to_id) DO UPDATE
+       SET source_to_ref = EXCLUDED.source_to_ref,
+           split_to_ref = EXCLUDED.split_to_ref,
+           status = 'active',
+           created_by = COALESCE(dispatch_scm_to_splits.created_by, EXCLUDED.created_by),
+           cancelled_at = NULL,
+           details = COALESCE(dispatch_scm_to_splits.details, '{}'::jsonb) || EXCLUDED.details
+       WHERE dispatch_scm_to_splits.source_to_id = EXCLUDED.source_to_id
+     RETURNING id`,
+    [
+      parentId,
+      parentRef,
+      splitId,
+      splitRef,
+      String(order.createdBy || order.created_by || "").trim() || null,
+      JSON.stringify(details)
+    ]
+  );
+  if (!result.rows[0]) {
+    throw new Error(`Transfer split ${splitRef} is already linked to a different NetSuite parent.`);
+  }
+  return result.rows[0].id;
+}
+
+async function upsertMaterializedTransferSplitLine({
+  order,
+  parentId,
+  splitId,
+  splitLedgerId,
+  sourceLine,
+  quantities
+}) {
+  const childLineId = syntheticOrderId(`transfer-line:${order.id}:${sourceLine.id}`);
+  const conflictTarget = sourceLine.line_id == null
+    ? `(line_stage, id) DO UPDATE`
+    : `(transfer_order_id, line_stage, line_id) WHERE line_id IS NOT NULL DO UPDATE`;
+  const child = await query(
+    `INSERT INTO transfer_order_lines (
+       line_stage, transfer_order_id, id, line_id, item_id, item_name, sku,
+       item_description, quantity, unit, pallet_qty, layer_qty, section_qty,
+       piece_qty, loaded_qty, loaded_uom, netsuite_active, synced_at,
+       item_type, item_type_text, location_id, location, to_plt, to_lyr,
+       to_sec, to_pcs, item_weight, confirmed, fulfilled_pallet_qty,
+       fulfilled_layer_qty, fulfilled_piece_qty, fulfilled_section_qty
+     )
+     SELECT 'outbound', $1, $2, line_id, item_id, item_name, sku,
+            item_description, $3, unit, $4, $5, $6,
+            $7, 0, unit, true, now(),
+            item_type, item_type_text, location_id, location, to_plt, to_lyr,
+            to_sec, to_pcs, item_weight, false, 0,
+            0, 0, 0
+       FROM transfer_order_lines
+      WHERE transfer_order_id = $8
+        AND line_stage = 'outbound'
+        AND id = $9
+     ON CONFLICT ${conflictTarget}
+       SET line_id = EXCLUDED.line_id,
+           item_id = EXCLUDED.item_id,
+           item_name = EXCLUDED.item_name,
+           sku = EXCLUDED.sku,
+           item_description = EXCLUDED.item_description,
+           item_type = EXCLUDED.item_type,
+           item_type_text = EXCLUDED.item_type_text,
+           quantity = EXCLUDED.quantity,
+           unit = EXCLUDED.unit,
+           pallet_qty = EXCLUDED.pallet_qty,
+           layer_qty = EXCLUDED.layer_qty,
+           section_qty = EXCLUDED.section_qty,
+           piece_qty = EXCLUDED.piece_qty,
+           location_id = EXCLUDED.location_id,
+           location = EXCLUDED.location,
+           to_plt = EXCLUDED.to_plt,
+           to_lyr = EXCLUDED.to_lyr,
+           to_sec = EXCLUDED.to_sec,
+           to_pcs = EXCLUDED.to_pcs,
+           item_weight = EXCLUDED.item_weight,
+           netsuite_active = true,
+           synced_at = now()
+       WHERE transfer_order_lines.transfer_order_id = EXCLUDED.transfer_order_id
+     RETURNING id, line_stage, line_id, item_id, item_name, sku, unit`,
+    [
+      splitId,
+      childLineId,
+      quantities.salesQty,
+      quantities.pallets,
+      quantities.layers,
+      quantities.sections,
+      quantities.pieces,
+      parentId,
+      sourceLine.id
+    ]
+  );
+  const splitLine = child.rows[0];
+  if (!splitLine) {
+    throw new Error(`Could not materialize TO split line ${sourceLine.id} for ${order.id}.`);
+  }
+
+  await query(
+    `INSERT INTO dispatch_scm_to_split_lines (
+       split_id, source_line_stage, source_line_id,
+       split_line_stage, split_line_id, netsuite_source_line_key,
+       item_id, sku, item_name,
+       pallet_qty, layer_qty, section_qty, piece_qty, sales_qty,
+       requested_pallet_qty, requested_layer_qty, requested_section_qty,
+       requested_piece_qty, requested_sales_qty, unit
+     ) VALUES (
+       $1, 'outbound', $2,
+       'outbound', $3, $4,
+       $5, $6, $7,
+       $8, $9, $10, $11, $12,
+       $8, $9, $10, $11, $12, $13
+     )
+     ON CONFLICT (split_id, split_line_stage, split_line_id) DO UPDATE
+       SET source_line_stage = EXCLUDED.source_line_stage,
+           source_line_id = EXCLUDED.source_line_id,
+           netsuite_source_line_key = EXCLUDED.netsuite_source_line_key,
+           item_id = EXCLUDED.item_id,
+           sku = EXCLUDED.sku,
+           item_name = EXCLUDED.item_name,
+           pallet_qty = EXCLUDED.pallet_qty,
+           layer_qty = EXCLUDED.layer_qty,
+           section_qty = EXCLUDED.section_qty,
+           piece_qty = EXCLUDED.piece_qty,
+           sales_qty = EXCLUDED.sales_qty,
+           requested_pallet_qty = EXCLUDED.requested_pallet_qty,
+           requested_layer_qty = EXCLUDED.requested_layer_qty,
+           requested_section_qty = EXCLUDED.requested_section_qty,
+           requested_piece_qty = EXCLUDED.requested_piece_qty,
+           requested_sales_qty = EXCLUDED.requested_sales_qty,
+           unit = EXCLUDED.unit,
+           updated_at = now()`,
+    [
+      splitLedgerId,
+      sourceLine.id,
+      splitLine.id,
+      sourceLine.line_id == null ? null : String(sourceLine.line_id),
+      splitLine.item_id,
+      splitLine.sku,
+      splitLine.item_name,
+      quantities.pallets,
+      quantities.layers,
+      quantities.sections,
+      quantities.pieces,
+      quantities.salesQty,
+      splitLine.unit
+    ]
+  );
+  return splitLine.id;
+}
+
+async function materializeTransferSplitOrderInTransaction(order, parent) {
   const splitId = syntheticOrderId(`transfer:${order.id}`);
   const splitItems = Array.isArray(order.items) ? order.items.filter(Boolean) : [];
+  if (!splitItems.length) {
+    throw new Error(`TO split ${order.id || "(missing)"} must include at least one item.`);
+  }
+  const parentId = String(parent?.netsuite_id ?? "").trim();
+  if (!/^\d+$/.test(parentId) || BigInt(parentId) <= 0n) {
+    throw new Error(`Transfer split ${order.id || "(missing)"} requires a positive NetSuite parent ID.`);
+  }
   await query(
     `INSERT INTO transfer_orders (
        netsuite_id, tranid, trandate, status, status_text, from_location_id,
@@ -2344,69 +2592,57 @@ async function materializeTransferSplitOrder(order, parent) {
            dispatch_instructions = EXCLUDED.dispatch_instructions,
            netsuite_active = true,
            synced_at = now()`,
-    [splitId, order.id, order.notes || `Split from ${order.originalOrderId}`, dateOnly(order.expectedDeliveryDate || order.expected_delivery_date), parent.netsuite_id]
+    [splitId, order.id, order.notes || `Split from ${order.originalOrderId}`, dateOnly(order.expectedDeliveryDate || order.expected_delivery_date), parentId]
   );
-  if (!splitItems.length) return splitId;
-  await query("DELETE FROM transfer_order_lines WHERE transfer_order_id = $1 AND COALESCE(loaded_qty, 0) = 0 AND COALESCE(packed_pallet_qty, 0) = 0 AND COALESCE(packed_layer_qty, 0) = 0 AND COALESCE(packed_section_qty, 0) = 0 AND COALESCE(packed_piece_qty, 0) = 0", [splitId]);
+  const splitLedgerId = await upsertTransferSplitLedgerHeader({ order, parent, splitId });
+  const selectedSourceLineIds = new Set();
+  const selectedSplitLineIds = [];
   for (const item of splitItems) {
-    await query(
-      `INSERT INTO transfer_order_lines (
-         line_stage, transfer_order_id, id, line_id, item_id, item_name, sku,
-         item_description, quantity, unit, pallet_qty, layer_qty, section_qty,
-         piece_qty, loaded_qty, loaded_uom, netsuite_active, synced_at,
-         item_type, item_type_text, location_id, location, to_plt, to_lyr,
-         to_sec, to_pcs, item_weight, confirmed, fulfilled_pallet_qty,
-         fulfilled_layer_qty, fulfilled_piece_qty, fulfilled_section_qty
-       )
-       SELECT 'outbound', $1, $2, $3, item_id, item_name, sku,
-              item_description, $4, unit, $5, $6, $7,
-              $8, 0, unit, true, now(),
-              item_type, item_type_text, location_id, location, to_plt, to_lyr,
-              to_sec, to_pcs, item_weight, false, 0,
-              0, 0, 0
-         FROM transfer_order_lines
-        WHERE transfer_order_id = $10
-          AND line_stage = 'outbound'
-          AND (
-            id = $9
-            OR ($13::text IS NOT NULL AND line_id::text = $13::text)
-            OR ($11::text <> '' AND sku = $11::text)
-            OR ($12::text <> '' AND item_id::text = $12::text)
-          )
-        ORDER BY CASE
-          WHEN id = $9 THEN 0
-          WHEN $13::text IS NOT NULL AND line_id::text = $13::text THEN 1
-          WHEN $11::text <> '' AND sku = $11::text THEN 2
-          WHEN $12::text <> '' AND item_id::text = $12::text THEN 3
-          ELSE 4
-        END
-        LIMIT 1
-       ON CONFLICT (transfer_order_id, line_stage, line_id) WHERE line_id IS NOT NULL DO UPDATE
-         SET quantity = EXCLUDED.quantity,
-             pallet_qty = EXCLUDED.pallet_qty,
-             layer_qty = EXCLUDED.layer_qty,
-             section_qty = EXCLUDED.section_qty,
-             piece_qty = EXCLUDED.piece_qty,
-             netsuite_active = true,
-             synced_at = now()`,
-      [
-        splitId,
-        syntheticOrderId(`transfer-line:${order.id}:${item.lineRowId || item.lineId || item.sku}`),
-        item.lineId || item.line_id || null,
-        splitLineSalesQuantity(item),
-        itemNumber(item.pallets),
-        itemNumber(item.layers),
-        itemNumber(item.sections),
-        itemNumber(item.pieces),
-        item.lineRowId || item.id,
-        parent.netsuite_id,
-        item.sku || item.itemName || "",
-        item.itemId || item.item_id || "",
-        item.lineId || item.line_id || null
-      ]
-    );
+    const sourceLine = await resolveTransferSplitSourceLine(item, parentId, parent.tranid || order.originalOrderId);
+    const sourceLineIdentity = String(sourceLine.id);
+    if (selectedSourceLineIds.has(sourceLineIdentity)) {
+      throw new Error(`TO split ${order.id} contains source line ${sourceLine.id} more than once.`);
+    }
+    selectedSourceLineIds.add(sourceLineIdentity);
+    selectedSplitLineIds.push(await upsertMaterializedTransferSplitLine({
+      order,
+      parentId,
+      splitId,
+      splitLedgerId,
+      sourceLine,
+      quantities: transferSplitPlannedQuantities(item)
+    }));
   }
+
+  await query(
+    `DELETE FROM transfer_order_lines
+      WHERE transfer_order_id = $1
+        AND line_stage = 'outbound'
+        AND NOT (id = ANY($2::bigint[]))
+        AND COALESCE(loaded_qty, 0) = 0
+        AND COALESCE(packed_pallet_qty, 0) = 0
+        AND COALESCE(packed_layer_qty, 0) = 0
+        AND COALESCE(packed_section_qty, 0) = 0
+        AND COALESCE(packed_piece_qty, 0) = 0
+        AND COALESCE(packed_sales_qty, 0) = 0
+        AND COALESCE(fulfilled_pallet_qty, 0) = 0
+        AND COALESCE(fulfilled_layer_qty, 0) = 0
+        AND COALESCE(fulfilled_section_qty, 0) = 0
+        AND COALESCE(fulfilled_piece_qty, 0) = 0
+        AND COALESCE(received_pallet_qty, 0) = 0
+        AND COALESCE(received_layer_qty, 0) = 0
+        AND COALESCE(received_section_qty, 0) = 0
+        AND COALESCE(received_piece_qty, 0) = 0
+        AND COALESCE(received_sales_qty, 0) = 0
+        AND COALESCE(netsuite_received_qty, 0) = 0
+        AND COALESCE(confirmed, false) = false`,
+    [splitId, selectedSplitLineIds]
+  );
   return splitId;
+}
+
+async function materializeTransferSplitOrder(order, parent) {
+  return withTransaction(() => materializeTransferSplitOrderInTransaction(order, parent));
 }
 
 async function materializeDispatchSplitOrders(plan) {
@@ -2424,12 +2660,69 @@ async function materializeDispatchSplitOrders(plan) {
     [plan.planDate, activeSplitRefs]
   );
   await query(
-    `UPDATE transfer_orders
-        SET netsuite_active = false,
-            dispatch_planned = false
-      WHERE tranid LIKE '%-S%'
-        AND dispatch_plan_date = $1::date
-        AND NOT (tranid = ANY($2::text[]))`,
+    `WITH deactivated AS (
+       UPDATE transfer_orders candidate
+          SET netsuite_active = false,
+              dispatch_planned = false
+        WHERE candidate.tranid LIKE '%-S%'
+          AND candidate.dispatch_plan_date = $1::date
+          AND NOT (candidate.tranid = ANY($2::text[]))
+          AND LOWER(COALESCE(candidate.local_yard_order_status, 'open'))
+              NOT IN ('loaded', 'shipped', 'packed')
+          AND NOT EXISTS (
+            SELECT 1
+              FROM transfer_order_lines line
+             WHERE line.transfer_order_id = candidate.netsuite_id
+               AND (
+                 COALESCE(line.loaded_qty, 0)
+                 + COALESCE(line.packed_pallet_qty, 0)
+                 + COALESCE(line.packed_layer_qty, 0)
+                 + COALESCE(line.packed_section_qty, 0)
+                 + COALESCE(line.packed_piece_qty, 0)
+                 + COALESCE(line.packed_sales_qty, 0)
+                 + COALESCE(line.fulfilled_pallet_qty, 0)
+                 + COALESCE(line.fulfilled_layer_qty, 0)
+                 + COALESCE(line.fulfilled_section_qty, 0)
+                 + COALESCE(line.fulfilled_piece_qty, 0)
+                 + COALESCE(line.received_pallet_qty, 0)
+                 + COALESCE(line.received_layer_qty, 0)
+                 + COALESCE(line.received_section_qty, 0)
+                 + COALESCE(line.received_piece_qty, 0)
+                 + COALESCE(line.received_sales_qty, 0)
+                 + COALESCE(line.netsuite_received_qty, 0)
+                 + CASE WHEN COALESCE(line.confirmed, false) THEN 1 ELSE 0 END
+               ) > 0
+          )
+          AND NOT EXISTS (
+            SELECT 1
+              FROM dispatch_scm_to_splits split
+              JOIN dispatch_scm_to_split_lines split_line
+                ON split_line.split_id = split.id
+              JOIN scm_reconciliation_allocations allocation
+                ON allocation.to_split_line_id = split_line.id
+               AND allocation.active = true
+               AND allocation.quantity > 0
+             WHERE split.split_to_id = candidate.netsuite_id
+          )
+       RETURNING netsuite_id
+     ),
+     deactivated_lines AS (
+       UPDATE transfer_order_lines line
+          SET netsuite_active = false,
+              synced_at = now()
+        WHERE line.transfer_order_id IN (SELECT netsuite_id FROM deactivated)
+       RETURNING line.transfer_order_id
+     )
+     UPDATE dispatch_scm_to_splits split
+        SET status = 'cancelled',
+            cancelled_at = COALESCE(split.cancelled_at, now()),
+            details = COALESCE(split.details, '{}'::jsonb)
+              || jsonb_build_object(
+                   'cancelledBy', 'dispatch-plan',
+                   'cancelledReason', 'omitted-from-plan',
+                   'lastCancelledAt', now()
+                 )
+      WHERE split.split_to_id IN (SELECT netsuite_id FROM deactivated)`,
     [plan.planDate, activeSplitRefs]
   );
 
@@ -2438,7 +2731,7 @@ async function materializeDispatchSplitOrders(plan) {
       const parent = await query("SELECT netsuite_id FROM sales_orders WHERE tranid = $1 LIMIT 1", [split.originalOrderId]);
       if (parent.rows[0]) await materializeSalesSplitOrder(split, parent.rows[0]);
     } else {
-      const parent = await query("SELECT netsuite_id FROM transfer_orders WHERE tranid = $1 LIMIT 1", [split.originalOrderId]);
+      const parent = await query("SELECT netsuite_id, tranid FROM transfer_orders WHERE tranid = $1 AND netsuite_id > 0 LIMIT 1", [split.originalOrderId]);
       if (parent.rows[0]) await materializeTransferSplitOrder(split, parent.rows[0]);
     }
   }
@@ -2535,7 +2828,7 @@ export async function applyConfirmedDispatchPlanToDelivery(plan, { forceOrderRef
   return { planned: plannedRows.length, ...materializedSplits };
 }
 
-export async function deactivateUnplannedDispatchSplitOrders({ originalOrderId = "", orderType = "", splitOrderIds = [] } = {}) {
+async function deactivateUnplannedDispatchSplitOrdersInTransaction({ originalOrderId = "", orderType = "", splitOrderIds = [] } = {}) {
   const originalRef = String(originalOrderId || "").trim();
   const requestedRefs = (Array.isArray(splitOrderIds) ? splitOrderIds : [])
     .map((ref) => String(ref || "").trim())
@@ -2547,6 +2840,13 @@ export async function deactivateUnplannedDispatchSplitOrders({ originalOrderId =
   const tableName = isSales ? "sales_orders" : "transfer_orders";
   const lineTableName = isSales ? "sales_order_lines" : "transfer_order_lines";
   const lineOrderIdColumn = isSales ? "sales_order_id" : "transfer_order_id";
+  const receiptActivitySql = isSales ? "" : `
+              + COALESCE(l.received_pallet_qty, 0)
+              + COALESCE(l.received_layer_qty, 0)
+              + COALESCE(l.received_section_qty, 0)
+              + COALESCE(l.received_piece_qty, 0)
+              + COALESCE(l.received_sales_qty, 0)
+              + COALESCE(l.netsuite_received_qty, 0)`;
   const splitPattern = `${originalRef}-S%`;
 
   const existing = await query(
@@ -2568,6 +2868,13 @@ export async function deactivateUnplannedDispatchSplitOrders({ originalOrderId =
               + COALESCE(l.packed_layer_qty, 0)
               + COALESCE(l.packed_section_qty, 0)
               + COALESCE(l.packed_piece_qty, 0)
+              + COALESCE(l.packed_sales_qty, 0)
+              + COALESCE(l.fulfilled_pallet_qty, 0)
+              + COALESCE(l.fulfilled_layer_qty, 0)
+              + COALESCE(l.fulfilled_section_qty, 0)
+              + COALESCE(l.fulfilled_piece_qty, 0)
+              + CASE WHEN COALESCE(l.confirmed, false) THEN 1 ELSE 0 END
+              ${receiptActivitySql}
             ) AS activity_qty
        FROM ${tableName} o
        LEFT JOIN ${lineTableName} l ON l.${lineOrderIdColumn} = o.netsuite_id
@@ -2576,6 +2883,25 @@ export async function deactivateUnplannedDispatchSplitOrders({ originalOrderId =
     [refs]
   );
   const activityByRef = new Map(lineActivity.rows.map((row) => [String(row.tranid || ""), Number(row.activity_qty || 0)]));
+  if (!isSales) {
+    const reconciliationActivity = await query(
+      `SELECT split.split_to_ref AS tranid,
+              SUM(allocation.quantity) AS activity_qty
+         FROM dispatch_scm_to_splits split
+         JOIN dispatch_scm_to_split_lines split_line ON split_line.split_id = split.id
+         JOIN scm_reconciliation_allocations allocation
+           ON allocation.to_split_line_id = split_line.id
+          AND allocation.active = true
+          AND allocation.quantity > 0
+        WHERE split.split_to_ref = ANY($1::text[])
+        GROUP BY split.split_to_ref`,
+      [refs]
+    );
+    for (const row of reconciliationActivity.rows) {
+      const ref = String(row.tranid || "");
+      activityByRef.set(ref, (activityByRef.get(ref) || 0) + Number(row.activity_qty || 0));
+    }
+  }
   const blocked = existing.rows.filter((row) =>
     row.dispatch_planned === true
     || row.dispatch_plan_date
@@ -2587,13 +2913,28 @@ export async function deactivateUnplannedDispatchSplitOrders({ originalOrderId =
     throw new Error(`Unsplit blocked. Unplan or clear these split orders first: ${blocked.map((row) => row.tranid).join(", ")}.`);
   }
 
-  const deleted = await query(
-    `DELETE FROM ${lineTableName}
-      WHERE ${lineOrderIdColumn} IN (
-        SELECT netsuite_id FROM ${tableName} WHERE tranid = ANY($1::text[])
-      )`,
-    [refs]
-  );
+  const deleted = isSales
+    ? await query(
+        `DELETE FROM ${lineTableName}
+          WHERE ${lineOrderIdColumn} IN (
+            SELECT netsuite_id FROM ${tableName} WHERE tranid = ANY($1::text[])
+          )`,
+        [refs]
+      )
+    : { rowCount: 0 };
+  if (!isSales) {
+    await query(
+      `UPDATE transfer_order_lines
+          SET netsuite_active = false,
+              synced_at = now()
+        WHERE transfer_order_id IN (
+          SELECT netsuite_id
+            FROM transfer_orders
+           WHERE tranid = ANY($1::text[])
+        )`,
+      [refs]
+    );
+  }
   await query(
     `UPDATE ${tableName}
         SET netsuite_active = false,
@@ -2608,6 +2949,25 @@ export async function deactivateUnplannedDispatchSplitOrders({ originalOrderId =
       WHERE tranid = ANY($1::text[])`,
     [refs]
   );
+  if (!isSales) {
+    await query(
+      `UPDATE dispatch_scm_to_splits split
+          SET status = 'cancelled',
+              cancelled_at = COALESCE(split.cancelled_at, now()),
+              details = COALESCE(split.details, '{}'::jsonb)
+                || jsonb_build_object(
+                     'cancelledBy', 'dispatch-unsplit',
+                     'cancelledReason', 'unplanned-split-deactivated',
+                     'lastCancelledAt', now()
+                   )
+        WHERE split.split_to_id IN (
+          SELECT netsuite_id
+            FROM transfer_orders
+           WHERE tranid = ANY($1::text[])
+        )`,
+      [refs]
+    );
+  }
   await query(
     `UPDATE dispatch_plan_snapshots
         SET orders = (
@@ -2624,6 +2984,10 @@ export async function deactivateUnplannedDispatchSplitOrders({ originalOrderId =
     deactivated: refs,
     deletedLines: deleted.rowCount || 0
   };
+}
+
+export async function deactivateUnplannedDispatchSplitOrders(options = {}) {
+  return withTransaction(() => deactivateUnplannedDispatchSplitOrdersInTransaction(options));
 }
 
 export async function getNextDispatchSplitSuffix({ originalOrderId = "", orderType = "" } = {}) {

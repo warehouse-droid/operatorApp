@@ -922,6 +922,7 @@ function normalizeLoadAssignments() {
       sequenceByDriver.set(login, Math.max(sequence, Number(load.driverSequence || 0)) + 1);
     }
   }
+  if (driverOrientedPlanningEnabled()) renumberDriverLoads();
 }
 
 function driverLoadEntries(driverLogin = null) {
@@ -2084,6 +2085,23 @@ function reviewOnlyText(order = {}) {
   return localStatus || statusText || "Review only";
 }
 
+function isScmReconciliationBlocked(order = {}) {
+  return ["PO", "TO"].includes(String(order.type || "").toUpperCase())
+    && (
+      order.reconciliationBlocked === true
+      || String(order.reconciliationStatus || "").toLowerCase() === "review"
+      || String(order.scm?.status || "").toLowerCase() === "reconcile review"
+    );
+}
+
+function scmReconciliationBlockText(order = {}) {
+  return String(
+    order.reconciliationReason
+      || order.scm?.reconciliationReason
+      || "Resolve this PO/TO in NetSuite Reconcile Review before changing its plan."
+  ).trim();
+}
+
 function orderTypeLabel(type) {
   return ({ SO: "Sales Order", PO: "Purchase Order", TO: "Transfer Order", CO: "Transit Depot Order", CUSTOM: "Custom Order" })[type] || "Order";
 }
@@ -2753,6 +2771,41 @@ function replenishmentSequenceWarningsForStops(stops = []) {
   return warnings;
 }
 
+function replenishmentLoadPrecedence(transferTruck, transferLoad, targetTruck, targetLoad) {
+  if (!transferLoad || !targetLoad) return null;
+  if (String(transferLoad.id || "") === String(targetLoad.id || "")) return true;
+
+  const transferDriver = loadDriverKey(transferTruck, transferLoad);
+  const targetDriver = loadDriverKey(targetTruck, targetLoad);
+  if (driverOrientedPlanningEnabled() && transferDriver && transferDriver === targetDriver) {
+    const entries = driverLoadEntries(targetDriver);
+    const transferIndex = entries.findIndex((entry) => String(entry.load.id || "") === String(transferLoad.id || ""));
+    const targetIndex = entries.findIndex((entry) => String(entry.load.id || "") === String(targetLoad.id || ""));
+    if (transferIndex >= 0 && targetIndex >= 0) return transferIndex < targetIndex;
+  }
+
+  const transferPlate = loadTruckPlate(transferTruck, transferLoad);
+  const targetPlate = loadTruckPlate(targetTruck, targetLoad);
+  if (transferPlate && transferPlate === targetPlate) {
+    const physicalLoads = [];
+    for (const truck of trucks) {
+      for (const load of truck.loads || []) {
+        if (loadTruckPlate(truck, load) === targetPlate) physicalLoads.push(load);
+      }
+    }
+    const transferIndex = physicalLoads.findIndex((load) => String(load.id || "") === String(transferLoad.id || ""));
+    const targetIndex = physicalLoads.findIndex((load) => String(load.id || "") === String(targetLoad.id || ""));
+    if (transferIndex >= 0 && targetIndex >= 0) return transferIndex < targetIndex;
+  }
+
+  if (String(transferTruck?.id || "") === String(targetTruck?.id || "")) {
+    const transferIndex = (targetTruck?.loads || []).findIndex((load) => String(load.id || "") === String(transferLoad.id || ""));
+    const targetIndex = (targetTruck?.loads || []).findIndex((load) => String(load.id || "") === String(targetLoad.id || ""));
+    if (transferIndex >= 0 && targetIndex >= 0) return transferIndex < targetIndex;
+  }
+  return null;
+}
+
 function replenishmentPlacementBlockMessage(order, targetTruck, targetLoad, insertIndex = null) {
   const dependencies = (order?.orderDependencies || []).filter((dependency) =>
     dependency.mode === "yard_replenishment" && dependency.status !== "cancelled"
@@ -2777,12 +2830,8 @@ function replenishmentPlacementBlockMessage(order, targetTruck, targetLoad, inse
       }
       continue;
     }
-    if (String(assignment.truck?.id || "") === String(targetTruck?.id || "")) {
-      const transferLoadIndex = (targetTruck?.loads || []).findIndex((load) => load.id === assignment.load.id);
-      const targetLoadIndex = (targetTruck?.loads || []).findIndex((load) => load.id === targetLoad?.id);
-      if (transferLoadIndex >= targetLoadIndex) {
-        return `${dependency.transferOrderRef} must be in an earlier load than ${order.id}.`;
-      }
+    if (replenishmentLoadPrecedence(assignment.truck, assignment.load, targetTruck, targetLoad) === false) {
+      return `${dependency.transferOrderRef} must be in an earlier load than ${order.id}.`;
     }
   }
   return "";
@@ -5343,7 +5392,7 @@ function loadStats(parentTruck, load) {
     const arrival = current;
     const dropFootprint = dropFootprintPallets(order, stop);
     const dropWeight = dropWeightLbs(order, stop);
-    current += truckStopMinutes(truck, stopServiceType(stop, order), dropFootprint);
+    current += stopStayMinutes(stop, order, truck);
     palletTotal += dropPallets(order, stop);
     footprintTotal += dropFootprint;
     processedWeightLbs += dropWeight;
@@ -5833,31 +5882,35 @@ function loadIndexInTruck(truck, load) {
   return truck?.loads?.findIndex((item) => item.id === load?.id) ?? -1;
 }
 
+function renumberDriverLoads() {
+  const byDriver = new Map();
+  for (const parentTruck of trucks) {
+    for (const load of parentTruck.loads || []) {
+      const login = loadDriverKey(parentTruck, load);
+      if (!byDriver.has(login)) byDriver.set(login, []);
+      byDriver.get(login).push({ truck: parentTruck, load });
+    }
+  }
+  for (const entries of byDriver.values()) {
+    entries.sort((left, right) =>
+      Number(left.load.driverSequence || 0) - Number(right.load.driverSequence || 0)
+        || minutes(left.load.start || left.truck.start || DEFAULT_FIRST_LOAD_START) - minutes(right.load.start || right.truck.start || DEFAULT_FIRST_LOAD_START)
+    );
+    let number = 1;
+    for (const entry of entries) {
+      if (entry.load.returnOnly) {
+        entry.load.name = entry.load.name || "Return Load";
+        continue;
+      }
+      entry.load.name = `Load ${number}`;
+      number += 1;
+    }
+  }
+}
+
 function renumberTruckLoads(truck) {
   if (driverOrientedPlanningEnabled()) {
-    const byDriver = new Map();
-    for (const parentTruck of trucks) {
-      for (const load of parentTruck.loads || []) {
-        const login = loadDriverKey(parentTruck, load);
-        if (!byDriver.has(login)) byDriver.set(login, []);
-        byDriver.get(login).push({ truck: parentTruck, load });
-      }
-    }
-    for (const entries of byDriver.values()) {
-      entries.sort((left, right) =>
-        Number(left.load.driverSequence || 0) - Number(right.load.driverSequence || 0)
-          || minutes(left.load.start || left.truck.start || DEFAULT_FIRST_LOAD_START) - minutes(right.load.start || right.truck.start || DEFAULT_FIRST_LOAD_START)
-      );
-      let number = 1;
-      for (const entry of entries) {
-        if (entry.load.returnOnly) {
-          entry.load.name = entry.load.name || "Return Load";
-          continue;
-        }
-        entry.load.name = `Load ${number}`;
-        number += 1;
-      }
-    }
+    renumberDriverLoads();
     return;
   }
   let number = 1;
@@ -6005,6 +6058,7 @@ function moveLoadToDriverLane(loadId, targetDriverLogin, { targetLoadId = "", in
     });
   }
   reflowDriverLaneEntries(targetLogin, targetEntries, timingByLoad, found.load.id);
+  if (driverOrientedPlanningEnabled()) renumberDriverLoads();
   return { ...found, sourceLogin, targetLogin, targetEntries };
 }
 
@@ -6489,6 +6543,9 @@ function stopIsOwnYard(stop, order) {
 
 function stopServiceType(stop, order) {
   if (stopIsOwnYard(stop, order)) return "own";
+  const isLocalVrma = String(order?.sourceTable || order?.source_table || "") === "scm_vrma_orders"
+    || String(order?.parseSource || order?.parse_source || "") === "scm-vrma";
+  if (stop.type === "drop" && isLocalVrma) return "vendor";
   if (stop.type === "pick") return "vendor";
   return "delivery";
 }
@@ -6500,8 +6557,67 @@ function stopTimeWindow(stop, order) {
   return { start: "", end: "" };
 }
 
+function explicitCustomDropStopMinutes(stop, order) {
+  const customStopMinutes = order?.stopMinutes ?? order?.raw?.stop_minutes;
+  const isCustomOrder = String(order?.type || "").trim().toUpperCase() === "CUSTOM"
+    || order?.customOrder === true
+    || String(order?.sourceTable || "").trim().toLowerCase() === "dispatch_custom_orders";
+  if (
+    stop?.type === "drop"
+    && isCustomOrder
+    && customStopMinutes !== null
+    && customStopMinutes !== undefined
+    && String(customStopMinutes).trim() !== ""
+    && Number.isInteger(Number(customStopMinutes))
+    && Number(customStopMinutes) >= 0
+    && Number(customStopMinutes) <= 1440
+  ) {
+    return Number(customStopMinutes);
+  }
+  return null;
+}
+
 function stopStayMinutes(stop, order, truck) {
+  const customStopMinutes = explicitCustomDropStopMinutes(stop, order);
+  if (customStopMinutes !== null) return customStopMinutes;
   return truckStopMinutes(truck, stopServiceType(stop, order), stop.type === "drop" ? dropFootprintPallets(order, stop) : orderFootprintPallets(order));
+}
+
+function compactMinuteValue(value) {
+  const minutesValue = Math.max(0, Number(value || 0));
+  return `${Number.isInteger(minutesValue) ? minutesValue : Number(minutesValue.toFixed(1))} min`;
+}
+
+function stopTimingBasisText(stop, order, parentTruck, load) {
+  if (!stop || !order) return "";
+  const customStopMinutes = explicitCustomDropStopMinutes(stop, order);
+  if (customStopMinutes !== null) {
+    return `Custom order setting: ${compactMinuteValue(customStopMinutes)}`;
+  }
+  const truck = effectiveTruckForLoad(parentTruck, load);
+  const driverName = String(truck?.driver || load?.driverName || "Assigned driver");
+  const serviceType = stopServiceType(stop, order);
+  const sharedOrderCount = stop.type === "pick"
+    ? new Set(pickupOrdersForStop(load, stop).map((pickupOrder) => String(pickupOrder.id || ""))).size
+    : 1;
+  const sharedText = sharedOrderCount > 1
+    ? ` · ${sharedOrderCount} orders, applied once`
+    : "";
+  if (serviceType === "own") {
+    return `Own-yard fixed · ${driverName}: ${compactMinuteValue(truckOwnYardFixedMinutes(truck))}${sharedText}`;
+  }
+  if (serviceType === "vendor") {
+    return `Vendor fixed · ${driverName}: ${compactMinuteValue(truckVendorFixedMinutes(truck))}${sharedText}`;
+  }
+  const fixedMinutes = truckDeliveryFixedMinutes(truck);
+  const minutesPerPallet = truckMinutesPerPallet(truck);
+  const footprint = stop.type === "drop"
+    ? dropFootprintPallets(order, stop)
+    : pickupFootprintForLocation(load, stop.location);
+  const variableText = footprint > 0 && minutesPerPallet > 0
+    ? ` + ${compactMinuteValue(minutesPerPallet)}/pos × ${Number(footprint.toFixed(2))}`
+    : "";
+  return `Delivery · ${driverName}: ${compactMinuteValue(fixedMinutes)} fixed${variableText}${sharedText}`;
 }
 
 function stopPosition(stop, order) {
@@ -6778,8 +6894,8 @@ function plannedDepartureDate(startMinutes) {
 
 function mapMarkerIcon(stop) {
   const color = stop.type === "pick" ? "#155eef" : "#0f8f4f";
-  const label = String(stop.label || "").slice(0, 3);
-  const fontSize = label.length > 2 ? 13 : 16;
+  const label = String(stop.label || "").slice(0, 5);
+  const fontSize = label.length > 3 ? 9 : label.length > 2 ? 13 : 16;
   if (stop.fanPin) {
     const dx = Number(stop.fanPin.dx || 0);
     const dy = Number(stop.fanPin.dy || 0);
@@ -6812,6 +6928,37 @@ function mapMarkerIcon(stop) {
     anchor: new google.maps.Point(21, 48),
     labelOrigin: new google.maps.Point(21, 19)
   };
+}
+
+function mergeConsecutiveExactDropMarkers(markerStops = []) {
+  const merged = [];
+  for (const original of markerStops || []) {
+    const stop = { ...original };
+    const addressKey = stop.type === "drop" && String(stop.orderId || "").trim()
+      ? normalizedPlaceKey(stop.address)
+      : "";
+    const previous = merged[merged.length - 1];
+    if (addressKey && previous?.addressKey === addressKey && previous.type === "drop") {
+      previous.sourceStops.push(stop);
+      previous.orderIds.push(String(stop.orderId));
+      previous.stayMinutes += Number(stop.stayMinutes || 0);
+      previous.endLabel = String(stop.label || previous.endLabel || previous.label || "");
+      previous.label = previous.endLabel && previous.endLabel !== previous.startLabel
+        ? `${previous.startLabel}-${previous.endLabel}`
+        : `${previous.startLabel}+`;
+      previous.title = `${previous.label}. Drop ${previous.orderIds.join(" + ")}`;
+      continue;
+    }
+    merged.push({
+      ...stop,
+      addressKey,
+      startLabel: String(stop.label || ""),
+      endLabel: String(stop.label || ""),
+      sourceStops: [stop],
+      orderIds: String(stop.orderId || "").trim() ? [String(stop.orderId)] : []
+    });
+  }
+  return merged.map(({ addressKey, startLabel, endLabel, ...stop }) => stop);
 }
 
 function spreadOverlappingMarkers(markerStops) {
@@ -6991,7 +7138,7 @@ async function renderGoogleMapPreview() {
   const routeSummary = document.getElementById("routeEstimateSummary");
   const bounds = new google.maps.LatLngBounds();
   const drawStopMarkers = (markerStops) => {
-    spreadOverlappingMarkers(markerStops).forEach((stop) => {
+    spreadOverlappingMarkers(mergeConsecutiveExactDropMarkers(markerStops)).forEach((stop) => {
       const marker = new google.maps.Marker({
         position: { lat: stop.lat, lng: stop.lng },
         map,
@@ -6999,9 +7146,11 @@ async function renderGoogleMapPreview() {
         title: stop.title
       });
       const info = new google.maps.InfoWindow({
-        content: `<strong>${escapeHtml(stop.title)}</strong><br>${stop.type === "pick" ? "Pickup" : "Drop off"}<br>Stay ${Number(stop.stayMinutes || 0)} min`
+        content: `<strong>${escapeHtml(stop.title)}</strong><br>${stop.type === "pick" ? "Pickup" : "Drop off"}${stop.orderIds?.length > 1 ? `<br>${stop.orderIds.length} orders at one physical stop` : ""}<br>Stay ${Number(stop.stayMinutes || 0)} min`
       });
       marker.addListener("click", () => info.open({ anchor: marker, map }));
+      marker.addListener("mouseover", () => info.open({ anchor: marker, map }));
+      marker.addListener("mouseout", () => info.close());
       bounds.extend(marker.getPosition());
     });
     if (markerStops.length) map.fitBounds(bounds, 36);
@@ -7375,19 +7524,21 @@ function renderSelectedOrderActions() {
   const label = selected.length > 1 ? `${selected.length} selected` : order.id;
   const groupedCount = order.childOrders?.length || 0;
   const reviewOnly = selected.some((item) => isReviewOnlyOrder(item));
+  const reconciliationBlocked = selected.some((item) => isScmReconciliationBlocked(item));
   const blockedUngroup = groupedCount && groupedOrderTransitCoId(order);
   return `
     <div class="selected-order-actions">
       <span>${escapeHtml(label)}</span>
       ${reviewOnly ? `<span>Loaded/shipped history</span>` : ""}
-      ${groupedCount ? `<button data-action="ungroup-order" data-order="${escapeHtml(order.id)}" ${blockedUngroup ? `disabled title="Cancel ${escapeHtml(blockedUngroup)} before ungrouping"` : ""} type="button">Ungroup</button>` : selected.length > 1 && !includesCustomOrder ? `<button data-action="open-group-modal" data-order="${escapeHtml(order.id)}" type="button">Group</button>` : ""}
+      ${reconciliationBlocked ? `<span class="chip warn">${escapeHtml(scmReconciliationBlockText(selected.find(isScmReconciliationBlocked)))}</span>` : ""}
+      ${reconciliationBlocked ? "" : groupedCount ? `<button data-action="ungroup-order" data-order="${escapeHtml(order.id)}" ${blockedUngroup ? `disabled title="Cancel ${escapeHtml(blockedUngroup)} before ungrouping"` : ""} type="button">Ungroup</button>` : selected.length > 1 && !includesCustomOrder ? `<button data-action="open-group-modal" data-order="${escapeHtml(order.id)}" type="button">Group</button>` : ""}
       ${blockedUngroup ? `<span>Cancel ${escapeHtml(blockedUngroup)} before ungrouping</span>` : ""}
       ${order.type === "CUSTOM" ? `<button data-action="edit-custom-order" data-custom-order-id="${escapeHtml(order.customOrderId || "")}" type="button">Open Custom Order</button>` : ""}
-      ${!reviewOnly && order.type === "PO" && order.sourceTable !== "scm_vrma_orders" ? `<button data-action="open-po-yard-modal" data-order="${escapeHtml(order.id)}" type="button">Set Yard</button>` : ""}
+      ${!reviewOnly && !reconciliationBlocked && order.type === "PO" && order.sourceTable !== "scm_vrma_orders" ? `<button data-action="open-po-yard-modal" data-order="${escapeHtml(order.id)}" type="button">Set Yard</button>` : ""}
       ${!reviewOnly && order.type === "SO" ? `<button data-action="open-po-link-modal" data-order="${escapeHtml(order.id)}" type="button">Link PO</button>` : ""}
       ${!reviewOnly && order.type === "SO" ? `<button data-action="open-to-link-modal" data-order="${escapeHtml(order.id)}" type="button">Link TO</button>` : ""}
-      ${!reviewOnly && !["CO", "CUSTOM"].includes(order.type) && order.sourceTable !== "scm_vrma_orders" && !order.originalOrderId ? `<button data-action="open-split-modal" data-order="${escapeHtml(order.id)}" type="button">Split</button>` : ""}
-      ${!reviewOnly && order.type !== "CUSTOM" && order.originalOrderId ? `<button data-action="unsplit-order" data-order="${escapeHtml(order.id)}" type="button">Unsplit</button>` : ""}
+      ${!reviewOnly && !reconciliationBlocked && !["CO", "CUSTOM"].includes(order.type) && order.sourceTable !== "scm_vrma_orders" && !order.originalOrderId ? `<button data-action="open-split-modal" data-order="${escapeHtml(order.id)}" type="button">Split</button>` : ""}
+      ${!reviewOnly && !reconciliationBlocked && order.type !== "CUSTOM" && order.originalOrderId ? `<button data-action="unsplit-order" data-order="${escapeHtml(order.id)}" type="button">Unsplit</button>` : ""}
       ${!reviewOnly && canConsolidatePick(order) ? `<button data-action="open-consolidate-modal" data-order="${escapeHtml(order.id)}" type="button">Consolidate Pick</button>` : ""}
     </div>
   `;
@@ -7409,7 +7560,8 @@ function renderOrderCard(order) {
   const dependentSalesAssignment = dependentSalesOrder ? orderAssignment(dependentSalesOrder.id) : {};
   const dependencyParentPlanned = dependencyLinked && Boolean(dependentSalesAssignment.load || dependentSalesOrder?.dispatchPlanned);
   const anyPlanned = planned || plannedElsewhere;
-  const dragBlocked = anyPlanned || dependencyLinked;
+  const reconciliationBlocked = isScmReconciliationBlocked(order);
+  const dragBlocked = anyPlanned || dependencyLinked || reconciliationBlocked;
   const reviewOnly = isReviewOnlyOrder(order);
   const packedText = packedUnitText(order);
   const executionStatus = orderExecutionStatus(order.id);
@@ -7417,7 +7569,7 @@ function renderOrderCard(order) {
     ? `${assignment.truck?.plate || ""} ${assignment.load?.name || "Planned"}`
     : orderPlannedElsewhereText(order);
   return `
-    <article class="order-card status-${executionStatus} ${selectedOrderIds.has(order.id) ? "selected" : ""} ${planned ? "planned" : ""} ${plannedElsewhere ? "planned-elsewhere" : ""} ${dependencyLinked && !dependencyParentPlanned ? "dependency-linked" : ""} ${dependencyParentPlanned ? "dependency-parent-planned" : ""} ${reviewOnly ? "review-only" : ""} ${missingAddress || transitBlocked || order.dependencyAttention ? "warning" : ""}" draggable="${dragBlocked ? "false" : "true"}" data-order="${escapeHtml(order.id)}" data-planned="${anyPlanned ? "true" : "false"}" data-dependency-linked="${dependencyLinked ? "true" : "false"}" data-review-only="${reviewOnly ? "true" : "false"}" data-planned-elsewhere="${plannedElsewhere ? "true" : "false"}">
+    <article class="order-card status-${executionStatus} ${selectedOrderIds.has(order.id) ? "selected" : ""} ${planned ? "planned" : ""} ${plannedElsewhere ? "planned-elsewhere" : ""} ${dependencyLinked && !dependencyParentPlanned ? "dependency-linked" : ""} ${dependencyParentPlanned ? "dependency-parent-planned" : ""} ${reviewOnly ? "review-only" : ""} ${reconciliationBlocked || missingAddress || transitBlocked || order.dependencyAttention ? "warning" : ""}" draggable="${dragBlocked ? "false" : "true"}" data-order="${escapeHtml(order.id)}" data-planned="${anyPlanned ? "true" : "false"}" data-dependency-linked="${dependencyLinked ? "true" : "false"}" data-review-only="${reviewOnly ? "true" : "false"}" data-reconciliation-blocked="${reconciliationBlocked ? "true" : "false"}" data-planned-elsewhere="${plannedElsewhere ? "true" : "false"}">
       <strong>${escapeHtml(order.id)} | ${escapeHtml(order.customer)}</strong>
       <span>${plannedElsewhere ? escapeHtml(orderPlannedElsewhereText(order)) : missingAddress ? "Missing delivery address" : transitBlocked ? escapeHtml(transitMessage) : escapeHtml(movementText(order))}</span>
       <span class="order-compact-line">Pickup ${escapeHtml(orderPickupText(order))} | ${dateText}${order.windowStart || "--"}-${order.windowEnd || "--"}</span>
@@ -7428,6 +7580,7 @@ function renderOrderCard(order) {
         ${order.sourceTable === "scm_vrma_orders" ? `<span class="chip">Local VRMA</span>` : ""}
         ${executionStatus === "complete" ? `<span class="chip complete-chip">Completed</span>` : executionStatus === "in_progress" ? `<span class="chip progress-chip">In progress</span>` : ""}
         ${reviewOnly ? `<span class="chip complete-chip">${escapeHtml(reviewOnlyText(order))}</span>` : ""}
+        ${reconciliationBlocked ? `<span class="chip warn" title="${escapeHtml(scmReconciliationBlockText(order))}">Reconcile Review</span>` : ""}
         ${anyPlanned ? `<span class="chip planned-chip">${escapeHtml(plannedText)}</span>` : ""}
         ${missingAddress ? `<span class="chip warn">Update address</span>` : ""}
         ${order.netsuiteFeedMissing ? `<span class="chip warn">NetSuite status changed</span>` : ""}
@@ -7869,6 +8022,125 @@ function renderLoadTimingDetails(truck, load, stats) {
   return rows.join("") || `<div class="empty-drop">No stop timing available.</div>`;
 }
 
+function consecutiveExactDropVisits(stops = [], rows = []) {
+  const visits = [];
+  for (let index = 0; index < stops.length; index += 1) {
+    const stop = stops[index];
+    const order = stopOrder(stop);
+    if (!order) continue;
+    const address = stopAddress(stop, order);
+    const addressKey = stop.type === "drop" ? normalizedPlaceKey(address) : "";
+    const entry = { stop, order, row: rows[index] || null, index };
+    const previous = visits[visits.length - 1];
+    if (addressKey && previous?.type === "drop" && previous.addressKey === addressKey) {
+      previous.entries.push(entry);
+      continue;
+    }
+    visits.push({
+      type: stop.type,
+      address,
+      addressKey,
+      entries: [entry]
+    });
+  }
+  return visits;
+}
+
+function previewVisitTiming(visit = {}) {
+  const entries = visit.entries || [];
+  const first = entries[0] || {};
+  const last = entries[entries.length - 1] || first;
+  const arrival = Number(first.row?.arrival || 0);
+  const depart = Number(last.row?.depart ?? last.row?.arrival ?? arrival);
+  return {
+    arrival,
+    depart,
+    duration: Math.max(0, depart - arrival)
+  };
+}
+
+function previewVisitContainingStop(load, stats, stopId) {
+  const target = String(stopId || "");
+  if (!target) return null;
+  return consecutiveExactDropVisits(load?.stops || [], stats?.rows || [])
+    .find((visit) => visit.entries.some((entry) => String(entry.stop?.id || "") === target))
+    || null;
+}
+
+function previewVisitExecutionStatus(truck, load, visit = {}) {
+  const statuses = (visit.entries || []).map((entry) => stopExecutionStatus(truck, load, entry.stop));
+  if (statuses.length && statuses.every((status) => status === "complete")) return "complete";
+  if (statuses.some((status) => status === "complete" || status === "in_progress")) return "in_progress";
+  return "pending";
+}
+
+function renderPreviewDropVisit(truck, load, visit, displayOffset = 0) {
+  const entries = visit.entries || [];
+  if (entries.length < 2) {
+    const entry = entries[0];
+    return entry ? renderPreviewStop(truck, load, entry.stop, entry.index, entry.row, entry.index + displayOffset) : "";
+  }
+  const first = entries[0];
+  const last = entries[entries.length - 1];
+  const firstDisplay = first.index + displayOffset + 1;
+  const lastDisplay = last.index + displayOffset + 1;
+  const refs = entries.map((entry) => entry.order.id);
+  const timing = previewVisitTiming(visit);
+  const executionStatus = previewVisitExecutionStatus(truck, load, visit);
+  const firstRecord = driverRecordForStop(truck, load, first.stop);
+  const lastRecord = driverRecordForStop(truck, load, last.stop);
+  const showWarning = entries.some((entry) => entry.row?.warning) && executionStatus !== "complete";
+  const selected = entries.some((entry) => selectedOrderId === entry.order.id);
+  const removalLocked = loadHasDriverActivity(load);
+  return `
+    <article class="preview-stop merged-drop-visit status-${executionStatus} drop ${selected ? "selected-order-stop" : ""} ${showWarning ? "warning" : ""}" data-preview-visit="true" data-load="${escapeHtml(load.id)}" data-stop="${escapeHtml(first.stop.id)}" data-order="${escapeHtml(first.order.id)}" data-index="${first.index}" data-start-index="${first.index}" data-end-index="${last.index}">
+      <div class="stop-main">
+        <strong>${firstDisplay}-${lastDisplay}. Drop | ${escapeHtml(refs.join(" + "))}</strong>
+        <span>${escapeHtml(visit.address)}</span>
+        <span class="merged-visit-note">${entries.length} orders · one physical stop</span>
+      </div>
+      <div class="stop-time">
+        ${timingSummaryHtml({
+          startLabel: "Arr",
+          endLabel: "LV",
+          plannedStart: timing.arrival,
+          plannedEnd: timing.depart,
+          actualStart: recordStartedAt(firstRecord),
+          actualEnd: recordCompletedAt(lastRecord),
+          showActual: executionStatus === "complete"
+        })}
+        <span class="preview-stop-duration">Stop time ${durationText(timing.duration)}</span>
+      </div>
+      <div class="merged-visit-orders">
+        ${entries.map((entry) => {
+          const childStatus = stopExecutionStatus(truck, load, entry.stop);
+          const childWarning = Boolean(entry.row?.warning && childStatus !== "complete");
+          return `
+            <div class="preview-stop-child status-${childStatus} ${selectedOrderId === entry.order.id ? "selected" : ""} ${childWarning ? "warning" : ""}" draggable="${!removalLocked}" data-load="${escapeHtml(load.id)}" data-stop="${escapeHtml(entry.stop.id)}" data-order="${escapeHtml(entry.order.id)}" data-index="${entry.index}">
+              <div>
+                <strong>${escapeHtml(entry.order.id)}</strong>
+                <span>${escapeHtml(entry.order.customer || orderTypeLabel(entry.order.type))}</span>
+              </div>
+              <span class="preview-stop-child-sequence">Stop ${entry.index + displayOffset + 1}</span>
+              <button class="stop-remove" data-action="remove-stop" data-stop="${escapeHtml(entry.stop.id)}" ${removalLocked ? "disabled" : ""} title="${removalLocked ? escapeHtml(stopActivityLockNotice(entry.stop)) : `Remove ${escapeHtml(entry.order.id)}`}" type="button">x</button>
+            </div>
+          `;
+        }).join("")}
+      </div>
+    </article>
+  `;
+}
+
+function renderPreviewStopSequence(truck, load, stats, displayOffset = 0) {
+  return consecutiveExactDropVisits(load?.stops || [], stats?.rows || [])
+    .map((visit) => {
+      if (visit.entries.length > 1) return renderPreviewDropVisit(truck, load, visit, displayOffset);
+      const entry = visit.entries[0];
+      return renderPreviewStop(truck, load, entry.stop, entry.index, entry.row, entry.index + displayOffset);
+    })
+    .join("");
+}
+
 function renderLoadPreview() {
   if (!loadPreviewOpen) return "";
   const { truck: parentTruck, load } = selectedLoad();
@@ -7887,7 +8159,7 @@ function renderLoadPreview() {
   const stopOffset = restOffset + handoffOffset + switchOffset + travelOffset;
   const sequenceHtml = load.returnOnly
     ? renderReturnPreviewStops(load, parentTruck, stats)
-    : `${renderPreviewRestStop(stats)}${renderPreviewSwitchApproachTravelStop(parentTruck, load, stats, restOffset)}${renderPreviewTruckSwitchStop(parentTruck, load, stats, restOffset + handoffOffset)}${renderPreviewStartTravelStop(parentTruck, load, stats.startTravel, stats.start, restOffset + handoffOffset + switchOffset)}${load.stops.map((stop, index) => renderPreviewStop(parentTruck, load, stop, index, stats.rows[index], index + stopOffset)).join("")}`;
+    : `${renderPreviewRestStop(stats)}${renderPreviewSwitchApproachTravelStop(parentTruck, load, stats, restOffset)}${renderPreviewTruckSwitchStop(parentTruck, load, stats, restOffset + handoffOffset)}${renderPreviewStartTravelStop(parentTruck, load, stats.startTravel, stats.start, restOffset + handoffOffset + switchOffset)}${renderPreviewStopSequence(parentTruck, load, stats, stopOffset)}`;
   return `
     <aside class="load-preview-panel" style="width:${Math.min(Math.max(loadPreviewWidth, 390), Math.round(window.innerWidth * 0.92))}px">
       <div class="load-preview-resize" title="Drag to resize"></div>
@@ -8059,6 +8331,7 @@ function renderPreviewStop(truck, load, stop, index, row, displayIndex = index) 
   const record = driverRecordForStop(truck, load, stop);
   const showWarning = Boolean(row?.warning && executionStatus !== "complete");
   const removalLocked = loadHasDriverActivity(load);
+  const timingBasis = stopTimingBasisText(stop, order, truck, load);
   return `
     <article class="preview-stop status-${executionStatus} ${stop.type} ${selectedOrderId === order.id ? "selected-order-stop" : ""} ${showWarning ? "warning" : ""}" draggable="true" data-load="${escapeHtml(stop.loadId)}" data-stop="${escapeHtml(stop.id)}" data-order="${escapeHtml(order.id)}" data-index="${index}">
       <button class="stop-remove" data-action="remove-stop" data-stop="${escapeHtml(stop.id)}" ${removalLocked ? "disabled" : ""} title="${removalLocked ? escapeHtml(stopActivityLockNotice(stop)) : "Remove stop"}" type="button">x</button>
@@ -8066,15 +8339,19 @@ function renderPreviewStop(truck, load, stop, index, row, displayIndex = index) 
         <strong>${escapeHtml(label)}</strong>
         <span>${escapeHtml(sub)}</span>
       </div>
-      <div class="stop-time">${timingSummaryHtml({
-        startLabel: "Arr",
-        endLabel: "LV",
-        plannedStart: row?.arrival || 0,
-        plannedEnd: row?.depart || row?.arrival || 0,
-        actualStart: recordStartedAt(record),
-        actualEnd: recordCompletedAt(record),
-        showActual: executionStatus === "complete"
-      })}</div>
+      <div class="stop-time">
+        ${timingSummaryHtml({
+          startLabel: "Arr",
+          endLabel: "LV",
+          plannedStart: row?.arrival || 0,
+          plannedEnd: row?.depart || row?.arrival || 0,
+          actualStart: recordStartedAt(record),
+          actualEnd: recordCompletedAt(record),
+          showActual: executionStatus === "complete"
+        })}
+        <span class="preview-stop-duration">Stop time ${durationText(Math.max(0, Number(row?.depart || 0) - Number(row?.arrival || 0)))}</span>
+        ${timingBasis ? `<span class="preview-stop-basis">${escapeHtml(timingBasis)}</span>` : ""}
+      </div>
     </article>
   `;
 }
@@ -8955,6 +9232,12 @@ function addOrderToLoad(orderId, loadId, type = "drop", location = "", insertInd
   const { truck, load } = findLoad(loadId);
   const order = orderById(orderId);
   if (!load || !order) return false;
+  if (type === "drop" && isScmReconciliationBlocked(order)) {
+    selectedOrderId = orderId;
+    selectedOrderIds = new Set([orderId]);
+    routeNotice = `${order.id} is blocked by NetSuite Reconcile Review. ${scmReconciliationBlockText(order)}`;
+    return false;
+  }
   if (!loadHasAssignedDriver(truck, load)) {
     routeNotice = driverLockNotice(truck);
     return false;
@@ -9172,11 +9455,15 @@ function insertIndexFromDrop(event, targetStop, targetLoad) {
   if (!targetStop) return null;
   const baseIndex = Number(targetStop.dataset.index);
   if (!Number.isInteger(baseIndex)) return null;
+  const startIndex = Number(targetStop.dataset.startIndex);
+  const endIndex = Number(targetStop.dataset.endIndex);
+  const boundedStartIndex = Number.isInteger(startIndex) ? startIndex : baseIndex;
+  const boundedEndIndex = Number.isInteger(endIndex) ? endIndex : baseIndex;
   const rect = targetStop.getBoundingClientRect();
   const ratio = rect.height ? (event.clientY - rect.top) / rect.height : 0;
-  if (ratio < 0.33) return baseIndex;
-  if (ratio > 0.66) return baseIndex + 1;
-  return baseIndex;
+  if (ratio < 0.33) return boundedStartIndex;
+  if (ratio > 0.66) return boundedEndIndex + 1;
+  return boundedStartIndex;
 }
 
 function ensureSplitDraft(order, force = false) {
@@ -9971,6 +10258,12 @@ app.addEventListener("dragstart", (event) => {
     event.dataTransfer.setData("text/plain", found.load.id);
   } else if (orderCard) {
     const order = orderById(orderCard.dataset.order);
+    if (orderCard.dataset.reconciliationBlocked === "true" || isScmReconciliationBlocked(order)) {
+      event.preventDefault();
+      dragged = null;
+      routeNotice = `${order?.id || orderCard.dataset.order} is blocked by NetSuite Reconcile Review. ${scmReconciliationBlockText(order)}`;
+      return render({ save: false });
+    }
     if (orderCard.dataset.planned === "true") {
       event.preventDefault();
       dragged = null;
@@ -10130,7 +10423,7 @@ app.addEventListener("dragover", (event) => {
     return;
   }
   const list = event.target.closest(".stop-list, .preview-stop-list");
-  const stopCard = event.target.closest(".stop-card, .preview-stop");
+  const stopCard = event.target.closest(".preview-stop-child, .stop-card, .preview-stop");
   const createZone = event.target.closest(".timeline-drop-zone");
   const driverLane = event.target.closest("[data-driver-lane-drop]");
   if (!list && !createZone && !stopCard && !driverLane) return;
@@ -10147,7 +10440,7 @@ app.addEventListener("dragover", (event) => {
 app.addEventListener("dragleave", (event) => {
   event.target.closest("[data-po-map-po]")?.classList.remove("drag-over");
   event.target.closest(".stop-list, .preview-stop-list")?.classList.remove("drag-over");
-  event.target.closest(".stop-card, .preview-stop")?.classList.remove("drag-over", "insert-before", "insert-after");
+  event.target.closest(".preview-stop-child, .stop-card, .preview-stop")?.classList.remove("drag-over", "insert-before", "insert-after");
   event.target.closest(".timeline-drop-zone")?.classList.remove("drag-over");
   event.target.closest("[data-driver-lane-drop]")?.classList.remove("drag-over");
   event.target.closest("[data-driver-lane]")?.classList.remove("driver-lane-drag-before", "driver-lane-drag-after");
@@ -10185,7 +10478,7 @@ app.addEventListener("drop", (event) => {
     }
     return;
   }
-  const targetStop = event.target.closest(".stop-card, .preview-stop");
+  const targetStop = event.target.closest(".preview-stop-child, .stop-card, .preview-stop");
   const list = event.target.closest(".stop-list, .preview-stop-list");
   const createZone = event.target.closest(".timeline-drop-zone");
   const driverLane = event.target.closest("[data-driver-lane-drop]");
@@ -11514,15 +11807,36 @@ function showOrderTooltip(event) {
   let timingHtml = "";
   if (foundStop?.truck && foundStop?.load && stop) {
     const stats = loadStats(foundStop.truck, foundStop.load);
-    const row = stats.rows[foundStop.index];
-    const record = driverRecordForStop(foundStop.truck, foundStop.load, stop);
-    timingHtml = timingDetailHtml({
-      title: stop.type === "pick" ? `Pickup ${pickupStopLabel(stop, order)}` : `Drop ${dropStopLabel(stop, order)}`,
-      plannedStart: row?.arrival || 0,
-      plannedEnd: row?.depart || row?.arrival || 0,
-      actualStart: recordStartedAt(record),
-      actualEnd: recordCompletedAt(record)
-    });
+    const visit = previewVisitContainingStop(foundStop.load, stats, stop.id);
+    const entries = visit?.entries?.length
+      ? visit.entries
+      : [{ stop, order, row: stats.rows[foundStop.index] || null, index: foundStop.index }];
+    const firstEntry = entries[0];
+    const lastEntry = entries[entries.length - 1];
+    const timing = previewVisitTiming({ entries });
+    const firstRecord = driverRecordForStop(foundStop.truck, foundStop.load, firstEntry.stop);
+    const lastRecord = driverRecordForStop(foundStop.truck, foundStop.load, lastEntry.stop);
+    const combinedRefs = entries.map((entry) => entry.order.id);
+    const combined = combinedRefs.length > 1;
+    const timingBasis = combined
+      ? `${combinedRefs.length} orders · one physical visit`
+      : stopTimingBasisText(stop, order, foundStop.truck, foundStop.load);
+    timingHtml = `
+      <div class="tooltip-stop-duration">
+        <b>Stop time</b>
+        <span>${durationText(timing.duration)}${combined ? ` · combined visit for ${escapeHtml(combinedRefs.join(" + "))}` : ""}</span>
+        ${timingBasis ? `<small>${escapeHtml(timingBasis)}</small>` : ""}
+      </div>
+      ${timingDetailHtml({
+        title: combined
+          ? `Combined drop ${combinedRefs.join(" + ")}`
+          : stop.type === "pick" ? `Pickup ${pickupStopLabel(stop, order)}` : `Drop ${dropStopLabel(stop, order)}`,
+        plannedStart: timing.arrival,
+        plannedEnd: timing.depart,
+        actualStart: recordStartedAt(firstRecord),
+        actualEnd: recordCompletedAt(lastRecord)
+      })}
+    `;
   }
   const itemRows = pickupOrders.length
     ? pickupOrders.map((pickupOrder) => tooltipItemRowsForOrder(pickupOrder, { pickupLocation, includeOrderHeader: true })).join("")
@@ -11586,12 +11900,19 @@ function showLoadTooltip(event) {
   `;
 }
 
+function dispatchTooltipOwner(target) {
+  return target?.closest?.("[data-preview-visit='true']")
+    || target?.closest?.("[data-order], [data-load-card]")
+    || null;
+}
+
 function showDispatchTooltip(event) {
+  const owner = dispatchTooltipOwner(event.target);
+  if (!owner || owner.contains(event.relatedTarget)) return;
   if (event.target.closest("[data-order]")) return showOrderTooltip(event);
   if (event.target.closest("[data-load-card]")) return showLoadTooltip(event);
 }
 
-app.addEventListener("mouseover", showDispatchTooltip);
 app.addEventListener("pointerover", showDispatchTooltip);
 
 app.addEventListener("mousemove", (event) => {
@@ -11602,13 +11923,13 @@ app.addEventListener("mousemove", (event) => {
 });
 
 function hideDispatchTooltip(event) {
-  if (!event.target.closest("[data-order], [data-load-card]")) return;
+  const owner = dispatchTooltipOwner(event.target);
+  if (!owner || owner.contains(event.relatedTarget)) return;
   const tooltip = document.getElementById("orderTooltip");
   tooltip.className = "";
   tooltip.innerHTML = "";
 }
 
-app.addEventListener("mouseout", hideDispatchTooltip);
 app.addEventListener("pointerout", hideDispatchTooltip);
 
 app.addEventListener("submit", (event) => {

@@ -367,7 +367,7 @@ function renderDrivers() {
           <button class="registration-card driver-setup-card ${setupRecordActive(driver) ? "" : "is-disabled"} ${selectedSetupIndex === canonicalIndex ? "selected" : ""}" data-action="select-setup-record" data-index="${canonicalIndex}" data-driver-index="${canonicalIndex}" draggable="${setupRecordActive(driver) ? "true" : "false"}" type="button">
             <span class="setup-card-title"><strong>${escapeHtml(driver.name)} | ${escapeHtml(driver.license || "-")}</strong><span class="setup-status-pill ${setupRecordActive(driver) ? "active" : "disabled"}">${setupRecordActive(driver) ? "Active" : "Disabled"}</span></span>
             <span class="muted">License ${escapeHtml(driver.number)} | Login ${escapeHtml(driver.login)}</span>
-            ${samsaraLoginSummary(driver) ? `<span class="muted">Samsara ${escapeHtml(samsaraLoginSummary(driver))}</span>` : ""}
+            <span class="muted">Samsara ${driver.samsaraEnabled === true ? `Connected${samsaraLoginSummary(driver) ? ` | ${escapeHtml(samsaraLoginSummary(driver))}` : ""}` : "Off"}</span>
             <span class="muted">Own yard ${ownYardFixedMinutesFor(driver)}m | Vendor ${vendorFixedMinutesFor(driver)}m | Delivery ${deliveryFixedMinutesFor(driver)}m + ${minutesPerPalletFor(driver)}m/PLT</span>
           </button>
         `).join("")}
@@ -382,8 +382,8 @@ function renderDrivers() {
         </div>` : ""}
         <div class="form-action-row">
           <button data-action="test-samsara-api" type="button">Test Samsara API</button>
-          ${selected ? `<button data-action="test-samsara-login" data-account="primary" type="button" ${selectedActive ? "" : "disabled"}>Find Primary Driver</button>` : ""}
-          ${selected ? `<button data-action="test-samsara-login" data-account="secondary" type="button" ${selectedActive ? "" : "disabled"}>Find Secondary Driver</button>` : ""}
+          ${selected ? `<button data-action="test-samsara-login" data-account="primary" type="button" ${selectedActive && selected.samsaraEnabled === true ? "" : "disabled"}>Find Primary Driver</button>` : ""}
+          ${selected ? `<button data-action="test-samsara-login" data-account="secondary" type="button" ${selectedActive && selected.samsaraEnabled === true ? "" : "disabled"}>Find Secondary Driver</button>` : ""}
         </div>
         <label><span>Driver name</span><input name="name" value="${escapeHtml(selected?.name || "")}" required /></label>
         <label><span>License class</span><select name="license">
@@ -393,6 +393,13 @@ function renderDrivers() {
         <label><span>License number</span><input name="number" value="${escapeHtml(selected?.number || "")}" required /></label>
         <label><span>${selected?.id ? "Login (fixed after registration)" : "Login"}</span><input name="login" value="${escapeHtml(selected?.login || "")}" ${selected?.id ? "readonly" : ""} required /></label>
         <label><span>${selected ? "New password optional" : "Password"}</span><input name="password" type="password" ${selected ? "" : "required"} /></label>
+        <label class="setup-samsara-toggle">
+          <input name="samsaraEnabled" type="checkbox" ${selected?.samsaraEnabled === true ? "checked" : ""} />
+          <span>
+            <strong>Connect this driver to Samsara</strong>
+            <small>Off by default. When off, Driver PWA skips pre/post DVIR, vehicle assignment, duty-status writes, and primary/secondary account handoff. Read-only GPS location verification remains active.</small>
+          </span>
+        </label>
         <label><span>Samsara primary username</span><input name="samsaraPrimaryLogin" autocomplete="off" value="${escapeHtml(selected?.samsaraPrimaryLogin || "")}" /></label>
         <label><span>Samsara secondary username</span><input name="samsaraSecondaryLogin" autocomplete="off" value="${escapeHtml(selected?.samsaraSecondaryLogin || "")}" /></label>
         <label><span>Fixed stop time in own yard</span><input name="ownYardFixedMinutes" type="number" value="${ownYardFixedMinutesFor(selected)}" required /></label>
@@ -1141,6 +1148,7 @@ setupApp.addEventListener("submit", (event) => {
       id: existingDriver?.id || null,
       active: existingDriver?.active !== false,
       password: data.password || "",
+      samsaraEnabled: data.samsaraEnabled === "on",
       samsaraPrimaryLogin: String(data.samsaraPrimaryLogin || "").trim(),
       samsaraSecondaryLogin: String(data.samsaraSecondaryLogin || "").trim(),
       ownYardFixedMinutes: Number(data.ownYardFixedMinutes || data.loadMinutes || 40),

@@ -1,5 +1,9 @@
 import { query, withTransaction } from "./db.js";
 import { writeDispatchAudit } from "./dispatch-audit-repository.js";
+import {
+  transferDependencyPlanningAvailability,
+  transferDependencyReservationOverrideSetFromSnapshot
+} from "./transfer-dependency-reservation.js";
 
 const EPSILON = 0.000001;
 const EDITABLE_PROPOSAL_STATUSES = new Set(["draft", "failed"]);
@@ -71,13 +75,13 @@ function isPalletItem(row = {}) {
     .some((value) => text(value).toUpperCase() === "PALLET");
 }
 
-function itemResult(row = {}) {
+function itemResult(row = {}, reservationOverrideKeys = new Set()) {
   const conversions = conversionsFor(row);
   const quantityAvailable = positive(row.quantity_available);
   const reservedQuantity = positive(row.reserved_quantity);
-  const effectiveAvailable = Math.max(0, roundQuantity(
-    row.effective_available ?? quantityAvailable - reservedQuantity
-  ));
+  const linkedTransferQuantity = positive(row.linked_transfer_quantity);
+  const availability = transferDependencyPlanningAvailability(row, reservationOverrideKeys);
+  const effectiveAvailable = Math.max(0, roundQuantity(availability.planningAvailable));
   return {
     itemId: Number(row.item_id),
     itemName: row.item_name,
@@ -90,7 +94,9 @@ function itemResult(row = {}) {
     quantityOnHand: positive(row.quantity_on_hand),
     quantityAvailable,
     reservedQuantity,
+    linkedTransferQuantity,
     effectiveAvailable,
+    reservationOverrideApplied: availability.overridden,
     inventorySyncedAt: row.balance_synced_at || null
   };
 }
@@ -101,6 +107,7 @@ async function dependencyProposalHeader(batchId, proposalId, { lock = false } = 
             batch.sales_order_id,
             batch.sales_order_ref,
             batch.status AS batch_status,
+            batch.inventory_snapshot,
             proposal.id AS proposal_id,
             proposal.creation_status,
             proposal.from_location_id,
@@ -124,6 +131,10 @@ async function dependencyProposalHeader(batchId, proposalId, { lock = false } = 
     throw conflict("This transfer proposal can no longer be edited.");
   }
   return header;
+}
+
+function headerReservationOverrideKeys(header = {}) {
+  return transferDependencyReservationOverrideSetFromSnapshot(header.inventory_snapshot);
 }
 
 function normalizedSelectedQuantities(input = {}, item = {}) {
@@ -252,11 +263,11 @@ async function recalculateProposalPallets(proposalId) {
 
 async function sourceItemRow(header, itemId, { excludeCurrentProposal = true } = {}) {
   const result = await query(
-    `WITH dependency_reserved AS (
+    `WITH linked_transfer AS (
        SELECT COALESCE(SUM(line.allocated_quantity), 0) AS quantity
         FROM order_dependency_lines line
          JOIN order_dependencies dependency ON dependency.id = line.dependency_id
-        WHERE dependency.status <> 'cancelled'
+        WHERE dependency.status NOT IN ('cancelled', 'delivered')
           AND dependency.source_location_id = $1
           AND line.item_id = $2
      ), proposal_reserved AS (
@@ -269,20 +280,21 @@ async function sourceItemRow(header, itemId, { excludeCurrentProposal = true } =
           AND (NOT $3::boolean OR proposal.id <> $4)
      )
      SELECT item.*,
+            $1::bigint AS location_id,
             balance.quantity_on_hand,
             balance.quantity_available,
             balance.synced_at AS balance_synced_at,
-            dependency_reserved.quantity + proposal_reserved.quantity AS reserved_quantity,
+            proposal_reserved.quantity AS reserved_quantity,
+            linked_transfer.quantity AS linked_transfer_quantity,
             GREATEST(
               COALESCE(balance.quantity_available, 0)
-              - dependency_reserved.quantity
               - proposal_reserved.quantity,
               0
             ) AS effective_available
        FROM inventory_items item
        JOIN inventory_balances balance
          ON balance.item_id = item.item_id AND balance.location_id = $1
-       CROSS JOIN dependency_reserved
+       CROSS JOIN linked_transfer
        CROSS JOIN proposal_reserved
       WHERE item.item_id = $2
         AND UPPER(COALESCE(NULLIF(item.raw ->> 'isinactive', ''), 'F')) <> 'T'`,
@@ -293,7 +305,17 @@ async function sourceItemRow(header, itemId, { excludeCurrentProposal = true } =
       Number(header.proposal_id)
     ]
   );
-  return result.rows[0] || null;
+  const row = result.rows[0] || null;
+  if (!row) return null;
+  const availability = transferDependencyPlanningAvailability(
+    row,
+    headerReservationOverrideKeys(header)
+  );
+  return {
+    ...row,
+    effective_available: availability.planningAvailable,
+    reservation_override_applied: availability.overridden
+  };
 }
 
 export async function searchTransferDependencyProposalItems(
@@ -307,11 +329,11 @@ export async function searchTransferDependencyProposalItems(
   const cleanLimit = Math.min(30, Math.max(1, Number(limit) || 12));
   const match = `%${term}%`;
   const result = await query(
-    `WITH dependency_reserved AS (
+    `WITH linked_transfer AS (
        SELECT line.item_id, SUM(line.allocated_quantity) AS quantity
          FROM order_dependency_lines line
          JOIN order_dependencies dependency ON dependency.id = line.dependency_id
-        WHERE dependency.status <> 'cancelled'
+        WHERE dependency.status NOT IN ('cancelled', 'delivered')
           AND dependency.source_location_id = $1
         GROUP BY line.item_id
      ), proposal_reserved AS (
@@ -324,21 +346,21 @@ export async function searchTransferDependencyProposalItems(
         GROUP BY line.item_id
      )
      SELECT item.*,
+            $1::bigint AS location_id,
             balance.quantity_on_hand,
             balance.quantity_available,
             balance.synced_at AS balance_synced_at,
-            COALESCE(dependency_reserved.quantity, 0)
-              + COALESCE(proposal_reserved.quantity, 0) AS reserved_quantity,
+            COALESCE(proposal_reserved.quantity, 0) AS reserved_quantity,
+            COALESCE(linked_transfer.quantity, 0) AS linked_transfer_quantity,
             GREATEST(
               COALESCE(balance.quantity_available, 0)
-              - COALESCE(dependency_reserved.quantity, 0)
               - COALESCE(proposal_reserved.quantity, 0),
               0
             ) AS effective_available
        FROM inventory_items item
        JOIN inventory_balances balance
          ON balance.item_id = item.item_id AND balance.location_id = $1
-       LEFT JOIN dependency_reserved ON dependency_reserved.item_id = item.item_id
+       LEFT JOIN linked_transfer ON linked_transfer.item_id = item.item_id
        LEFT JOIN proposal_reserved ON proposal_reserved.item_id = item.item_id
       WHERE UPPER(COALESCE(NULLIF(item.raw ->> 'isinactive', ''), 'F')) <> 'T'
         AND UPPER(COALESCE(item.item_name, '')) <> 'PALLET'
@@ -361,7 +383,6 @@ export async function searchTransferDependencyProposalItems(
                END,
                CASE WHEN GREATEST(
                  COALESCE(balance.quantity_available, 0)
-                 - COALESCE(dependency_reserved.quantity, 0)
                  - COALESCE(proposal_reserved.quantity, 0),
                  0
                ) > 0 THEN 0 ELSE 1 END,
@@ -370,7 +391,8 @@ export async function searchTransferDependencyProposalItems(
       LIMIT $5`,
     [Number(header.from_location_id), Number(header.proposal_id), match, term, cleanLimit]
   );
-  return result.rows.map(itemResult);
+  const reservationOverrideKeys = headerReservationOverrideKeys(header);
+  return result.rows.map((row) => itemResult(row, reservationOverrideKeys));
 }
 
 export async function addTransferDependencyProposalLine(
@@ -459,6 +481,7 @@ export async function addTransferDependencyProposalLine(
         },
         sourceLocationId: Number(header.from_location_id),
         sourceLocation: header.from_location,
+        reservationOverrideApplied: item.reservation_override_applied === true,
         effectiveAvailableBefore: roundQuantity(effectiveAvailable),
         effectiveAvailableAfter: roundQuantity(effectiveAvailable - selected.proposedQuantity)
       }
@@ -485,6 +508,7 @@ export async function addTransferDependencyProposalLine(
       sourceAvailability: {
         locationId: Number(header.from_location_id),
         location: header.from_location,
+        reservationOverrideApplied: item.reservation_override_applied === true,
         before: roundQuantity(effectiveAvailable),
         after: roundQuantity(effectiveAvailable - selected.proposedQuantity)
       }

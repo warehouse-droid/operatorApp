@@ -811,7 +811,9 @@ export async function listDispatchOrders({
         )
         AND (
           $1::boolean
-          OR COALESCE(scm.status, o.initial_scm_status, 'Queued') NOT IN ('Cancelled', 'Hold')
+          OR LOWER(BTRIM(COALESCE(scm.status, o.initial_scm_status, 'Queued'))) NOT IN (
+            'hold', 'complete', 'completed', 'cancelled', 'canceled'
+          )
         )
         AND (
           o.status_text ILIKE '%Pending Receipt%'
@@ -1007,7 +1009,9 @@ export async function listDispatchOrders({
         )
         AND (
           $1::boolean
-          OR COALESCE(scm.status, v.status, 'Queued') NOT IN ('Cancelled', 'Hold')
+          OR LOWER(BTRIM(COALESCE(scm.status, v.status, 'Queued'))) NOT IN (
+            'hold', 'complete', 'completed', 'cancelled', 'canceled'
+          )
         )
       GROUP BY v.id, scm.id, vrma_yard.address, vrma_yard.window_start, vrma_yard.window_end, vrma_yard.instructions
     ),
@@ -2052,7 +2056,8 @@ async function listScmVrmaSchedule({
   brand = "",
   from = "",
   to = "",
-  view = ""
+  view = "",
+  audience = "scm"
 } = {}) {
   const params = [
     String(search || "").trim().toLowerCase(),
@@ -2062,7 +2067,8 @@ async function listScmVrmaSchedule({
     normalizeScmScheduleFilterValues(brand, { lowercase: true }),
     String(from || "").trim() || null,
     String(to || "").trim() || null,
-    String(view || "").trim()
+    String(view || "").trim(),
+    String(audience || "").trim().toLowerCase() !== "operations"
   ];
   const result = await query(
     `WITH line_summary AS (
@@ -2158,6 +2164,12 @@ async function listScmVrmaSchedule({
         AND ($7::date IS NULL OR eta_date <= $7::date)
         AND ($8 <> 'dispatch' OR (method = 'MBT' AND status NOT IN ('Cancelled', 'Hold')))
         AND ($8 <> 'completed' OR status = 'Completed')
+        AND (
+          $9::boolean
+          OR LOWER(BTRIM(COALESCE(status, 'Queued'))) NOT IN (
+            'hold', 'complete', 'completed', 'cancelled', 'canceled'
+          )
+        )
       ORDER BY
         CASE status
           WHEN 'Urgent' THEN 0
@@ -2217,20 +2229,25 @@ export async function listScmSchedule({
   brand = "",
   from = "",
   to = "",
-  view = ""
+  view = "",
+  exactRef = "",
+  audience = "scm"
 } = {}) {
   const globalSearch = String(search || "").trim().toLowerCase();
-  const cleanKind = String(kind || "").trim().toUpperCase();
+  const rawKind = String(kind || "").trim().toUpperCase();
+  const cleanKind = rawKind === "SP.O" ? "Sp.O" : rawKind;
+  const cleanExactRef = String(exactRef || "").trim();
   if (!globalSearch && cleanKind === "VRMA") {
     return listScmVrmaSchedule({
-      search: "",
+      search: cleanExactRef,
       status,
       method,
       yard,
       brand,
       from,
       to,
-      view
+      view,
+      audience
     });
   }
   const params = [
@@ -2242,7 +2259,9 @@ export async function listScmSchedule({
     globalSearch ? [] : normalizeScmScheduleFilterValues(brand, { lowercase: true }),
     globalSearch ? null : String(from || "").trim() || null,
     globalSearch ? null : String(to || "").trim() || null,
-    String(view || "").trim().toLowerCase()
+    String(view || "").trim().toLowerCase(),
+    cleanExactRef,
+    String(audience || "").trim().toLowerCase() !== "operations"
   ];
   const result = await query(
     `
@@ -2308,12 +2327,35 @@ export async function listScmSchedule({
         ON active_group.status = 'active'
        AND lower(active_group.group_ref) = lower(COALESCE(member_schedule.group_ref, ''))
       LEFT JOIN purchase_order_lines l ON l.purchase_order_id = po.netsuite_id AND l.netsuite_active = true
-      WHERE po.netsuite_active = true
+      WHERE (po.netsuite_active = true OR $9 = 'completed')
+        AND (
+          $10 = ''
+          OR lower(po.tranid) = lower($10)
+          OR lower(COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid)) = lower($10)
+        )
         AND (
           active_group.id IS NULL
           OR lower(COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid)) = lower(active_group.group_ref)
         )
       GROUP BY po.netsuite_id, active_split.source_po_ref
+    ),
+    unique_to_line_locations AS MATERIALIZED (
+      SELECT line.transfer_order_id,
+             line.line_stage,
+             CASE
+               WHEN COUNT(DISTINCT line.location_id) FILTER (WHERE line.location_id IS NOT NULL) = 1
+               THEN MIN(line.location_id) FILTER (WHERE line.location_id IS NOT NULL)
+               ELSE NULL
+             END AS location_id,
+             CASE
+               WHEN COUNT(DISTINCT line.location_id) FILTER (WHERE line.location_id IS NOT NULL) = 1
+               THEN MAX(NULLIF(BTRIM(line.location), '')) FILTER (WHERE line.location_id IS NOT NULL)
+               ELSE NULL
+             END AS location
+        FROM transfer_order_lines line
+       WHERE line.netsuite_active = true
+         AND line.line_stage IN ('outbound', 'receiving')
+       GROUP BY line.transfer_order_id, line.line_stage
     ),
     base_to AS (
       SELECT
@@ -2323,9 +2365,19 @@ export async function listScmSchedule({
         t.tranid AS source_ref,
         t.tranid AS order_ref,
         NULL::text AS dispatch_ref,
-        COALESCE(t.from_location, 'Transfer Order') AS party,
-        t.from_location AS pickup_point,
-        t.to_location AS dropoff_point,
+        COALESCE(
+          NULLIF(BTRIM(t.from_location), ''),
+          NULLIF(BTRIM(outbound_location.location), ''),
+          'Transfer Order'
+        ) AS party,
+        COALESCE(
+          NULLIF(BTRIM(t.from_location), ''),
+          NULLIF(BTRIM(outbound_location.location), '')
+        ) AS pickup_point,
+        COALESCE(
+          NULLIF(BTRIM(t.to_location), ''),
+          NULLIF(BTRIM(receiving_location.location), '')
+        ) AS dropoff_point,
         'Transfer'::text AS brand,
         string_agg(
           CASE
@@ -2367,10 +2419,23 @@ export async function listScmSchedule({
         'Queued'::text AS initial_scm_status,
         false AS is_blanket_po
       FROM transfer_orders t
-      LEFT JOIN transfer_order_lines l ON l.transfer_order_id = t.netsuite_id AND l.netsuite_active = true
-      WHERE t.netsuite_active = true
-        AND t.to_location_id IS NOT NULL
-      GROUP BY t.netsuite_id
+      LEFT JOIN transfer_order_lines l
+        ON l.transfer_order_id = t.netsuite_id
+       AND l.line_stage = 'outbound'
+       AND l.netsuite_active = true
+      LEFT JOIN unique_to_line_locations outbound_location
+        ON outbound_location.transfer_order_id = t.netsuite_id
+       AND outbound_location.line_stage = 'outbound'
+      LEFT JOIN unique_to_line_locations receiving_location
+        ON receiving_location.transfer_order_id = t.netsuite_id
+       AND receiving_location.line_stage = 'receiving'
+      WHERE (t.netsuite_active = true OR $9 = 'completed')
+        AND COALESCE(t.to_location_id, receiving_location.location_id) IS NOT NULL
+        AND ($10 = '' OR lower(t.tranid) = lower($10))
+      GROUP BY t.netsuite_id,
+               outbound_location.location,
+               receiving_location.location,
+               receiving_location.location_id
     ),
     base_vrma AS (
       SELECT
@@ -2411,6 +2476,7 @@ export async function listScmSchedule({
         false AS is_blanket_po
       FROM scm_vrma_orders v
       LEFT JOIN scm_vrma_order_lines l ON l.vrma_order_id = v.id
+      WHERE ($10 = '' OR lower(v.vrma_ref) = lower($10))
       GROUP BY v.id
     ),
     base AS (
@@ -2515,7 +2581,10 @@ export async function listScmSchedule({
       COALESCE(NULLIF(s.packing_slip_ref, ''), b.dispatch_ref, '') AS packing_slip_ref,
       COALESCE(s.group_ref, '') AS group_ref,
       CASE
-        WHEN COALESCE(s.status, b.initial_scm_status, '') IN ('Completed', 'Cancelled', 'Hold') THEN COALESCE(s.status, b.initial_scm_status)
+        WHEN COALESCE(s.status, b.initial_scm_status, '') IN (
+          'Completed', 'Cancelled', 'Hold', 'In Transit',
+          'Partially Done', 'Reconcile Review'
+        ) THEN COALESCE(s.status, b.initial_scm_status)
         WHEN planned.order_ref IS NOT NULL THEN 'Planned'
         ELSE COALESCE(s.status, b.initial_scm_status, 'Queued')
       END AS status,
@@ -2540,15 +2609,31 @@ export async function listScmSchedule({
     WHERE ($1 = '' OR lower(concat_ws(' ', b.order_ref, b.source_ref, b.dispatch_ref, b.party, b.pickup_point, b.dropoff_point, b.brand, b.content, s.packing_slip_ref, s.group_ref)) LIKE '%' || $1 || '%')
       AND ($9 = 'blanket' OR NOT COALESCE(b.is_blanket_po, false))
       AND ($9 <> 'blanket' OR b.order_kind = 'PO')
+      AND (
+        $11::boolean
+        OR (
+          NOT COALESCE(b.is_blanket_po, false)
+          AND LOWER(BTRIM(COALESCE(s.status, b.initial_scm_status, 'Queued'))) NOT IN (
+            'hold', 'complete', 'completed', 'cancelled', 'canceled'
+          )
+        )
+      )
       AND (cardinality($2::text[]) = 0 OR (
         CASE
-          WHEN COALESCE(s.status, b.initial_scm_status, '') IN ('Completed', 'Cancelled', 'Hold') THEN COALESCE(s.status, b.initial_scm_status)
+          WHEN COALESCE(s.status, b.initial_scm_status, '') IN (
+            'Completed', 'Cancelled', 'Hold', 'In Transit',
+            'Partially Done', 'Reconcile Review'
+          ) THEN COALESCE(s.status, b.initial_scm_status)
           WHEN planned.order_ref IS NOT NULL THEN 'Planned'
           ELSE COALESCE(s.status, b.initial_scm_status, 'Queued')
         END
       ) = ANY($2::text[]))
       AND ($3 = '' OR COALESCE(s.method, 'MBT') = $3)
-      AND ($4 = '' OR b.order_kind = $4)
+      AND (
+        $4 = ''
+        OR ($4 = 'Sp.O' AND b.order_kind = 'PO' AND COALESCE(s.is_special_order, false))
+        OR ($4 <> 'Sp.O' AND b.order_kind = $4)
+      )
       AND (
         $5 = ''
         OR COALESCE(s.dropoff_point, b.dropoff_point, '') = $5
@@ -2562,7 +2647,10 @@ export async function listScmSchedule({
         OR $9 <> 'dispatch'
         OR (COALESCE(s.method, 'MBT') = 'MBT' AND (
           CASE
-            WHEN COALESCE(s.status, b.initial_scm_status, '') IN ('Completed', 'Cancelled', 'Hold') THEN COALESCE(s.status, b.initial_scm_status)
+            WHEN COALESCE(s.status, b.initial_scm_status, '') IN (
+              'Completed', 'Cancelled', 'Hold', 'In Transit',
+              'Partially Done', 'Reconcile Review'
+            ) THEN COALESCE(s.status, b.initial_scm_status)
             WHEN planned.order_ref IS NOT NULL THEN 'Planned'
             ELSE COALESCE(s.status, b.initial_scm_status, 'Queued')
           END
@@ -2571,26 +2659,38 @@ export async function listScmSchedule({
       AND (
         $9 = ''
         OR $9 <> 'completed'
-        OR COALESCE(s.status, b.initial_scm_status, 'Queued') = 'Completed'
+        OR COALESCE(s.status, b.initial_scm_status, 'Queued') IN ('Completed', 'Cancelled')
       )
     ORDER BY
-      CASE (
-        CASE
-          WHEN COALESCE(s.status, b.initial_scm_status, '') IN ('Completed', 'Cancelled', 'Hold') THEN COALESCE(s.status, b.initial_scm_status)
-          WHEN planned.order_ref IS NOT NULL THEN 'Planned'
-          ELSE COALESCE(s.status, b.initial_scm_status, 'Queued')
+      CASE WHEN $9 = 'completed' THEN 0 ELSE
+        CASE (
+          CASE
+            WHEN COALESCE(s.status, b.initial_scm_status, '') IN (
+              'Completed', 'Cancelled', 'Hold', 'In Transit',
+              'Partially Done', 'Reconcile Review'
+            ) THEN COALESCE(s.status, b.initial_scm_status)
+            WHEN planned.order_ref IS NOT NULL THEN 'Planned'
+            ELSE COALESCE(s.status, b.initial_scm_status, 'Queued')
+          END
+        )
+          WHEN 'Urgent' THEN 0
+          WHEN 'Priority' THEN 1
+          WHEN 'Queued' THEN 2
+          WHEN 'Book Appt' THEN 3
+          WHEN 'Surplus Only' THEN 4
+          WHEN 'Planned' THEN 5
+          WHEN 'Partially Done' THEN 6
+          WHEN 'In Transit' THEN 7
+          WHEN 'Reconcile Review' THEN 8
+          WHEN 'Completed' THEN 9
+          WHEN 'Hold' THEN 10
+          ELSE 11
         END
-      )
-        WHEN 'Urgent' THEN 0
-        WHEN 'Priority' THEN 1
-        WHEN 'Queued' THEN 2
-        WHEN 'Book Appt' THEN 3
-        WHEN 'Surplus Only' THEN 4
-        WHEN 'Planned' THEN 5
-        WHEN 'Completed' THEN 6
-        WHEN 'Hold' THEN 7
-        ELSE 9
       END,
+      CASE
+        WHEN COALESCE(s.status, b.initial_scm_status, '') IN ('Completed', 'Cancelled')
+        THEN COALESCE(s.last_reconciled_at, s.updated_at, b.queued_at)
+      END DESC NULLS LAST,
       COALESCE(s.eta_date, planned.eta_date, b.expected_delivery_date) NULLS LAST,
       b.order_ref
     LIMIT 1000
@@ -3086,7 +3186,14 @@ export async function createScmScheduleGroup({ refs = [], createdBy = "" } = {})
          brand = EXCLUDED.brand,
          packing_slip_ref = EXCLUDED.packing_slip_ref,
          group_ref = EXCLUDED.group_ref,
-         status = CASE WHEN scm_transport_schedule.status IN ('Completed', 'Cancelled', 'Hold') THEN scm_transport_schedule.status ELSE EXCLUDED.status END,
+         status = CASE
+           WHEN scm_transport_schedule.reconciliation_blocked = true THEN 'Reconcile Review'
+           WHEN scm_transport_schedule.status IN (
+             'Completed', 'Cancelled', 'Hold', 'In Transit',
+             'Partially Done', 'Reconcile Review'
+           ) THEN scm_transport_schedule.status
+           ELSE EXCLUDED.status
+         END,
          content = EXCLUDED.content,
          weight_lbs = EXCLUDED.weight_lbs,
          updated_by = EXCLUDED.updated_by,
@@ -3283,7 +3390,9 @@ export async function getScmVrmaOrder(vrmaRef = "") {
   if (!ref) return null;
   const headerResult = await query(
     `SELECT id, vrma_ref, vendor, local_vendor, pickup_location, dropoff_location,
-            status, method, notes, created_at, updated_at
+            status, method, notes, operator_status, local_yard_order_status,
+            loaded_at, completed_at, completed_by, completion_note,
+            completion_source, created_at, updated_at
        FROM scm_vrma_orders
       WHERE LOWER(vrma_ref) = LOWER($1)
       LIMIT 1`,
@@ -3312,6 +3421,13 @@ export async function getScmVrmaOrder(vrmaRef = "") {
     status: header.status || "Queued",
     method: header.method || "MBT",
     notes: header.notes || "",
+    operatorStatus: header.operator_status || "open",
+    localYardOrderStatus: header.local_yard_order_status || "Open",
+    loadedAt: header.loaded_at || null,
+    completedAt: header.completed_at || null,
+    completedBy: header.completed_by || "",
+    completionNote: header.completion_note || "",
+    completionSource: header.completion_source || "",
     createdAt: header.created_at,
     updatedAt: header.updated_at,
     lines: lineResult.rows.map((line) => ({
@@ -3335,6 +3451,186 @@ export async function getScmVrmaOrder(vrmaRef = "") {
       itemWeight: positiveQuantity(line.item_weight)
     }))
   };
+}
+
+export async function completeScmVrmaOrderOverride({
+  vrmaRef = "",
+  note = "",
+  actor = "",
+  expectedUpdatedAt = "",
+  confirm = false,
+  force = false
+} = {}) {
+  const ref = String(vrmaRef || "").trim();
+  const cleanNote = String(note || "").trim();
+  const cleanActor = String(actor || "").trim();
+  const expected = expectedUpdatedAt ? new Date(expectedUpdatedAt) : null;
+  if (!ref) throw Object.assign(new Error("VRMA ref is required."), { status: 400 });
+  if (!cleanActor) throw Object.assign(new Error("SCM or Admin identity is required."), { status: 401 });
+  if (!cleanNote) throw Object.assign(new Error("An audit note is required to complete a VRMA."), { status: 400 });
+  if (confirm !== true) {
+    throw Object.assign(new Error("Confirm that this local VRMA should be marked Completed."), { status: 400 });
+  }
+  if (!expected || Number.isNaN(expected.getTime())) {
+    throw Object.assign(new Error("Refresh this VRMA before marking it Completed."), {
+      status: 409,
+      code: "SCM_VRMA_STALE"
+    });
+  }
+
+  return withTransaction(async () => {
+    const selected = await query(
+      `SELECT *
+         FROM scm_vrma_orders
+        WHERE lower(vrma_ref) = lower($1)
+        LIMIT 1
+        FOR UPDATE`,
+      [ref]
+    );
+    const header = selected.rows[0];
+    if (!header) throw Object.assign(new Error("VRMA order not found."), { status: 404 });
+    const scheduleResult = await query(
+      `SELECT *
+         FROM scm_transport_schedule
+        WHERE order_kind = 'VRMA'
+          AND lower(order_ref) = lower($1)
+        LIMIT 1
+        FOR UPDATE`,
+      [header.vrma_ref]
+    );
+    const schedule = scheduleResult.rows[0] || null;
+    const current = {
+      ...header,
+      schedule_id: schedule?.id || null,
+      schedule_status: schedule?.status || null,
+      schedule_updated_at: schedule?.updated_at || null,
+      schedule_driver: schedule?.driver || null,
+      schedule_eta_date: schedule?.eta_date || null,
+      schedule_eta_time: schedule?.eta_time || null
+    };
+
+    const concurrencyTimestamp = current.schedule_updated_at || current.updated_at;
+    if (
+      !concurrencyTimestamp
+      || new Date(concurrencyTimestamp).getTime() !== expected.getTime()
+    ) {
+      throw Object.assign(new Error("This VRMA changed after it was opened. Refresh and try again."), {
+        status: 409,
+        code: "SCM_VRMA_STALE"
+      });
+    }
+    const status = String(current.schedule_status || current.status || "Queued").trim();
+    if (status === "Completed" || String(current.status || "").trim() === "Completed") {
+      return {
+        completed: true,
+        idempotent: true,
+        loadedComplete: String(current.operator_status || "").toLowerCase() === "loaded",
+        before: current,
+        after: current
+      };
+    }
+    if (["Cancelled", "Hold"].includes(status) || ["Cancelled", "Hold"].includes(String(current.status || "").trim())) {
+      throw Object.assign(new Error(`A ${status || current.status} VRMA cannot be marked Completed.`), { status: 409 });
+    }
+
+    const lineProgress = await query(
+      `SELECT COUNT(*)::int AS line_count,
+              COUNT(*) FILTER (
+                WHERE COALESCE(loaded_qty, 0) + 0.000001 >= COALESCE(quantity, 0)
+              )::int AS fully_loaded_count,
+              COALESCE(SUM(quantity), 0) AS ordered_qty,
+              COALESCE(SUM(loaded_qty), 0) AS loaded_qty
+         FROM scm_vrma_order_lines
+        WHERE vrma_order_id = $1`,
+      [current.id]
+    );
+    const progress = lineProgress.rows[0] || {};
+    const loadedComplete = Number(progress.line_count || 0) > 0
+      && Number(progress.fully_loaded_count || 0) === Number(progress.line_count || 0);
+    if (!loadedComplete && force !== true) {
+      throw Object.assign(
+        new Error("Operator loading is not complete. Confirm the forced completion after reviewing this VRMA."),
+        {
+          status: 409,
+          code: "SCM_VRMA_FORCE_CONFIRMATION_REQUIRED",
+          loadedComplete: false,
+          progress: {
+            lineCount: Number(progress.line_count || 0),
+            fullyLoadedCount: Number(progress.fully_loaded_count || 0),
+            orderedQty: Number(progress.ordered_qty || 0),
+            loadedQty: Number(progress.loaded_qty || 0)
+          }
+        }
+      );
+    }
+
+    const headerResult = await query(
+      `UPDATE scm_vrma_orders
+          SET status = 'Completed',
+              completed_at = COALESCE(completed_at, now()),
+              completed_by = $2,
+              completion_note = $3,
+              completion_source = 'scm_override',
+              updated_by = $2,
+              status_updated_at = now(),
+              updated_at = now()
+        WHERE id = $1
+        RETURNING *`,
+      [current.id, cleanActor, cleanNote]
+    );
+    const completedScheduleResult = await query(
+      `INSERT INTO scm_transport_schedule (
+         order_kind, source_table, source_id, order_ref, method,
+         pickup_point, dropoff_point, brand, content, weight_lbs,
+         status, notes, created_by, updated_by, created_at, updated_at
+       )
+       SELECT 'VRMA', 'scm_vrma_orders', v.id, v.vrma_ref, COALESCE(v.method, 'MBT'),
+              v.pickup_location, v.dropoff_location, COALESCE(v.local_vendor, v.vendor),
+              COALESCE(string_agg(
+                trim(concat_ws(' ', COALESCE(line.sku, line.item_name), line.quantity, line.unit)),
+                '; ' ORDER BY line.id
+              ), ''),
+              COALESCE(SUM(line.weight_lbs), 0),
+              'Completed', NULLIF(v.notes, ''), $2, $2, now(), now()
+         FROM scm_vrma_orders v
+         LEFT JOIN scm_vrma_order_lines line ON line.vrma_order_id = v.id
+        WHERE v.id = $1
+        GROUP BY v.id
+       ON CONFLICT (order_kind, order_ref) DO UPDATE SET
+         status = 'Completed',
+         updated_by = EXCLUDED.updated_by,
+         updated_at = now()
+       RETURNING *`,
+      [current.id, cleanActor]
+    );
+    return {
+      completed: true,
+      idempotent: false,
+      loadedComplete,
+      forced: !loadedComplete,
+      progress: {
+        lineCount: Number(progress.line_count || 0),
+        fullyLoadedCount: Number(progress.fully_loaded_count || 0),
+        orderedQty: Number(progress.ordered_qty || 0),
+        loadedQty: Number(progress.loaded_qty || 0)
+      },
+      before: {
+        vrma: current,
+        schedule: current.schedule_id ? {
+          id: current.schedule_id,
+          status: current.schedule_status,
+          updatedAt: current.schedule_updated_at,
+          driver: current.schedule_driver,
+          etaDate: current.schedule_eta_date,
+          etaTime: current.schedule_eta_time
+        } : null
+      },
+      after: {
+        vrma: headerResult.rows[0],
+        schedule: completedScheduleResult.rows[0]
+      }
+    };
+  });
 }
 
 function vrmaUnit(value) {
@@ -3377,7 +3673,7 @@ export async function createScmVrmaOrder({
   if (!requestedDropoff) throw new Error("Vendor drop-off yard is required.");
   return withTransaction(async () => {
     const existingActivity = await query(
-      `SELECT v.id, v.operator_status, v.preparing_operator_id, v.loaded_at,
+      `SELECT v.id, v.status, v.operator_status, v.preparing_operator_id, v.loaded_at,
               EXISTS (
                 SELECT 1
                   FROM scm_vrma_order_lines line
@@ -3398,12 +3694,17 @@ export async function createScmVrmaOrder({
     );
     const activity = existingActivity.rows[0];
     if (activity && (
-      activity.operator_status !== "open"
+      activity.status === "Completed"
+      || activity.operator_status !== "open"
       || activity.preparing_operator_id
       || activity.loaded_at
       || activity.has_operator_activity
     )) {
-      const error = new Error("This VRMA can no longer be edited because Operator packing or loading has started.");
+      const error = new Error(
+        activity.status === "Completed"
+          ? "This VRMA can no longer be edited because SCM marked it Completed."
+          : "This VRMA can no longer be edited because Operator packing or loading has started."
+      );
       error.status = 409;
       throw error;
     }
@@ -3641,7 +3942,11 @@ export async function syncScmScheduleFromDispatchPlan(plan, { updatedBy = "dispa
        ON CONFLICT (order_kind, order_ref) DO UPDATE SET
          method = CASE WHEN scm_transport_schedule.method IS NULL THEN 'MBT' ELSE scm_transport_schedule.method END,
          status = CASE
-           WHEN scm_transport_schedule.status IN ('Completed', 'Cancelled', 'Hold') THEN scm_transport_schedule.status
+           WHEN scm_transport_schedule.reconciliation_blocked = true THEN 'Reconcile Review'
+           WHEN scm_transport_schedule.status IN (
+             'Completed', 'Cancelled', 'Hold', 'In Transit',
+             'Partially Done', 'Reconcile Review'
+           ) THEN scm_transport_schedule.status
            ELSE 'Planned'
          END,
          eta_date = EXCLUDED.eta_date,

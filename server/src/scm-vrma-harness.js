@@ -9,6 +9,7 @@ import {
   updateDeliveryStatus
 } from "./delivery-repository.js";
 import {
+  completeScmVrmaOrderOverride,
   createScmVrmaOrder,
   getScmVrmaOrder,
   getScmVrmaOptions,
@@ -394,6 +395,46 @@ try {
         && loadRecords.rows[0]?.order_family === "vrma_order",
       "Loading a VRMA must create a local proof-backed record without NetSuite or inventory activity.",
       { loadResult, loadedDetail, loadRecord: loadRecords.rows[0] });
+
+    const completionSchedule = (await listScmSchedule({ kind: "VRMA", search: ref }))
+      .find((entry) => entry.orderRef === ref);
+    assert(completionSchedule?.updatedAt,
+      "VRMA completion requires the current schedule revision.",
+      { completionSchedule });
+    await assertRejects(
+      () => completeScmVrmaOrderOverride({
+        vrmaRef: ref,
+        note: "Stale completion attempt",
+        actor: "scm-vrma-harness",
+        expectedUpdatedAt: "2026-01-01T00:00:00.000Z",
+        confirm: true
+      }),
+      /changed after it was opened/i,
+      "VRMA completion must reject a stale schedule revision."
+    );
+    const completed = await completeScmVrmaOrderOverride({
+      vrmaRef: ref,
+      note: "Harness confirmed local VRMA delivery completion.",
+      actor: "scm-vrma-harness",
+      expectedUpdatedAt: completionSchedule.updatedAt,
+      confirm: true
+    });
+    const completedHeader = await getScmVrmaOrder(ref);
+    const completedSchedule = (await listScmSchedule({
+      kind: "VRMA",
+      search: ref,
+      view: "completed"
+    })).find((entry) => entry.orderRef === ref);
+    const activeDispatchAfterCompletion = await listDispatchOrders({ search: ref });
+    assert(completed.completed === true
+        && completed.loadedComplete === true
+        && completedHeader?.status === "Completed"
+        && completedHeader?.completionSource === "scm_override"
+        && completedHeader?.completionNote.includes("Harness confirmed")
+        && completedSchedule?.status === "Completed"
+        && !activeDispatchAfterCompletion.some((entry) => entry.id === ref),
+      "SCM completion must atomically complete both VRMA status layers and remove it from the active dispatch pool.",
+      { completed, completedHeader, completedSchedule, activeDispatchAfterCompletion });
 
     await assertRejects(
       () => createScmVrmaOrder(payload({ notes: "Must not overwrite Operator progress" })),

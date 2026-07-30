@@ -21,7 +21,7 @@ function includesAll(source, values, label) {
 
 includesAll(schedule, [
   'return !scmScheduleDispatchHost && scmScheduleFilters.view === "scm working";',
-  'if (scmScheduleDispatchHost) return ["dispatch", "completed"];',
+  'if (scmScheduleDispatchHost) return canViewRestricted ? ["dispatch", "completed"] : ["dispatch"];',
   'if (scmScheduleDispatchHost) return "dispatch";'
 ], "Dispatch-hosted schedule restriction");
 
@@ -115,7 +115,7 @@ includesAll(enrichment, [
   "options.allowOllama !== false"
 ], "Reusable PO enrichment context");
 assert.equal((server.match(/req\.query\.includeSchedule === "false"/g) || []).length, 3, "Schedule mutations must support omitting unused full-list responses.");
-assert.ok(scheduleHtml.includes("/scm-schedule.js?v=20260723-blanket-po-v1"), "Schedule cache bust missing.");
+assert.ok(scheduleHtml.includes("/scm-schedule.js?v=20260730-status-visibility-v1"), "Schedule cache bust missing.");
 assert.ok(poHtml.includes("/dispatch-scm.js?v=20260723-po-type-filters-v1"), "PO Split cache bust missing.");
 assert.ok(vrmaHtml.includes("/scm-vrma.js?v=20260718-scm-item-weight-v1"), "VRMA cache bust missing.");
 

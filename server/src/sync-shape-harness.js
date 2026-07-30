@@ -635,6 +635,10 @@ async function runRepositorySimulation(checks) {
   await upsertInboundTransferOrders([{
     ...transferOrder,
     status_text: "Pending Receipt",
+    source_location_id: null,
+    source_location: "",
+    outbound_location_id: null,
+    outbound_location: "",
     destination_location_id: 15,
     destination_location: "12441"
   }]);

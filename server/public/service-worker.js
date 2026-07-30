@@ -1,16 +1,16 @@
-const CACHE_NAME = "mbbs-yard-operator-v122-delivery-batches-v1";
+const CACHE_NAME = "mbbs-yard-operator-v132-driver-samsara-v1";
 const APP_SHELL = [
   "/operator",
   "/operator.html",
-  "/operator.css?v=20260722-unified-v1",
+  "/operator.css?v=20260729-returns-v9",
   "/i18n.css?v=20260701-i18n-v2",
   "/vendor/quagga2/quagga.min.js?v=1.12.1",
-  "/i18n.js?v=20260722-unified-v1",
-  "/operator.js?v=20260723-delivery-batches-v1",
+  "/i18n.js?v=20260729-returns-v9",
+  "/operator.js?v=20260729-returns-v9",
   "/driver",
   "/driver.html",
   "/driver.css?v=20260722-unified-v1",
-  "/driver.js?v=20260722-unified-v1",
+  "/driver.js?v=20260729-driver-samsara-v1",
   "/manifest.webmanifest",
   "/driver-manifest.webmanifest",
   "/icons/mbbs-yard-192.png",

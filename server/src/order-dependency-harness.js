@@ -1225,6 +1225,45 @@ try {
       "A grouped SO should be valid when its TO completes before the group pickup in the same load.",
       { groupedOrderedConflicts });
 
+    const stalePhysicalOrderPlan = {
+      id: 0,
+      planDate: "2097-07-13",
+      orders: groupedDependencyPlanOrders,
+      trucks: [{
+        id: "LI-TRUCK",
+        plate: "CC46868",
+        loads: [{
+          id: "LI-SALES-LOAD",
+          name: "Load 3",
+          driverLogin: "li",
+          driverSequence: 4,
+          stops: [
+            { id: "li-group-pick", type: "pick", orderId: groupedDependencyRef, location: "12441" },
+            { id: "li-group-drop", type: "drop", orderId: groupedDependencyRef, location: "Customer" }
+          ]
+        }, {
+          id: "LI-TRANSFER-LOAD",
+          name: "Load 4",
+          driverLogin: "li",
+          driverSequence: 3,
+          stops: [
+            { id: "li-to-pick", type: "pick", orderId: dependency.transferOrderRef, location: dependency.sourceLocation },
+            { id: "li-to-drop", type: "drop", orderId: dependency.transferOrderRef, location: "12441" }
+          ]
+        }]
+      }]
+    };
+    const stalePhysicalOrderConflicts = await validateDispatchPlanDependencies(stalePhysicalOrderPlan);
+    check(stalePhysicalOrderConflicts.length === 0,
+      "Backend fallback ignored the driver's canonical sequence when raw truck load order was stale.",
+      { stalePhysicalOrderConflicts });
+    const reversedDriverSequencePlan = structuredClone(stalePhysicalOrderPlan);
+    reversedDriverSequencePlan.trucks[0].loads[1].driverSequence = 5;
+    const reversedDriverSequenceConflicts = await validateDispatchPlanDependencies(reversedDriverSequencePlan);
+    check(reversedDriverSequenceConflicts.some((message) => message.includes(dependency.transferOrderRef)),
+      "Backend fallback allowed a grouped SO before its prerequisite TO in the same driver lane.",
+      { reversedDriverSequenceConflicts });
+
     const sharedTruckPlan = {
       id: 0,
       planDate: "2097-07-13",

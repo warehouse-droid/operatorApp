@@ -24,6 +24,8 @@ const smartState = {
   itemSearch: "",
   itemVendorYard: "",
   itemLowerStockPolicy: "",
+  itemReturnPolicy: "",
+  itemReturnPolicyOverride: "",
   itemEnabled: "true",
   itemOffset: 0,
   itemLimit: 150
@@ -73,6 +75,10 @@ function smartRoles() {
 function smartCanWrite() {
   const roles = smartRoles();
   return ["admin", "scm", "scm_staff"].some((role) => roles.has(role));
+}
+
+function smartCanManageReturnPolicy() {
+  return smartRoles().has("admin");
 }
 
 function smartPill(value, label = null) {
@@ -141,6 +147,8 @@ async function smartLoadItems({ reset = false, quiet = false } = {}) {
     limit: String(smartState.itemLimit),
     vendorYard: smartState.itemVendorYard,
     lowerStockPolicy: smartState.itemLowerStockPolicy,
+    returnPolicy: smartState.itemReturnPolicy,
+    returnPolicyOverride: smartState.itemReturnPolicyOverride,
     offset: String(smartState.itemOffset)
   });
   smartState.itemData = await smartApi(`/api/scm/smart/items?${params}`);
@@ -294,6 +302,58 @@ function smartLowerStockPolicyFilterOptions() {
     .join("");
 }
 
+function smartReturnPolicyLabel(value) {
+  const policy = String(value || "").trim().toUpperCase();
+  if (policy === "ALLOWED") return "Allowed";
+  if (policy === "APPROVAL_REQUIRED") return "Approval Required";
+  if (policy === "NOT_RETURNABLE") return "Not Returnable";
+  return "Default";
+}
+
+function smartReturnPolicyFilterOptions() {
+  const selected = String(smartState.itemReturnPolicy || "").toUpperCase();
+  return [
+    ["", "All effective return policies"],
+    ["ALLOWED", "Return: Allowed"],
+    ["APPROVAL_REQUIRED", "Return: Approval Required"],
+    ["NOT_RETURNABLE", "Return: Not Returnable"]
+  ].map(([value, label]) => `<option value="${value}" ${selected === value ? "selected" : ""}>${label}</option>`).join("");
+}
+
+function smartReturnPolicyOverrideFilterOptions() {
+  const selected = String(smartState.itemReturnPolicyOverride || "").toLowerCase();
+  return [
+    ["", "Default + overrides"],
+    ["any", "Return policy overrides only"],
+    ["none", "Default return policies only"]
+  ].map(([value, label]) => `<option value="${value}" ${selected === value ? "selected" : ""}>${label}</option>`).join("");
+}
+
+function smartReturnPolicyOptions(item) {
+  const override = String(item.returnPolicyOverride || item.return_policy_override || "").toUpperCase();
+  const defaultPolicy = String(item.returnPolicyDefault || item.return_policy_default || "NOT_RETURNABLE").toUpperCase();
+  return [
+    ["DEFAULT", `Default · ${smartReturnPolicyLabel(defaultPolicy)}`],
+    ["ALLOWED", "Allowed"],
+    ["APPROVAL_REQUIRED", "Approval Required"],
+    ["NOT_RETURNABLE", "Not Returnable"]
+  ].map(([value, label]) => `<option value="${value}" ${(override || "DEFAULT") === value ? "selected" : ""}>${smartEscape(label)}</option>`).join("");
+}
+
+function smartReturnPolicyCell(item) {
+  const override = String(item.returnPolicyOverride || item.return_policy_override || "").toUpperCase();
+  const effective = String(item.returnPolicyEffective || item.return_policy_effective || item.returnPolicyDefault || item.return_policy_default || "NOT_RETURNABLE").toUpperCase();
+  const source = String(item.returnPolicySource || item.return_policy_source || (override ? "OVERRIDE" : "DEFAULT")).toUpperCase();
+  const selected = override || "DEFAULT";
+  const revision = String(item.returnPolicyRevision || item.return_policy_revision || "");
+  return `<td class="smart-return-policy-cell">
+    <select data-item-field="returnPolicyOverride" data-original-return-policy="${smartEscape(selected)}" data-return-policy-revision="${smartEscape(revision)}" aria-label="Return policy for ${smartEscape(item.itemName)}" ${smartCanManageReturnPolicy() ? "" : "disabled"}>${smartReturnPolicyOptions(item)}</select>
+    <span class="smart-return-effective ${smartEscape(effective.toLowerCase())}">Effective: ${smartEscape(smartReturnPolicyLabel(effective))}</span>
+    <small>${source === "OVERRIDE" ? "Company-wide admin override" : "Default from Product Type"}</small>
+    ${smartCanManageReturnPolicy() && override ? `<button class="smart-link-button" data-smart-action="reset-return-policy" data-item-id="${item.itemId}" type="button">Reset to default</button>` : ""}
+  </td>`;
+}
+
 function smartItemCsvImportNotice(summary = {}, fallbackFilename = "CSV") {
   const filename = String(summary.filename || fallbackFilename).trim() || fallbackFilename;
   const rowsRead = Number(summary.rowsRead);
@@ -394,7 +454,7 @@ function smartItemMaster() {
       <div class="smart-toolbar smart-item-csv-tools">
         <div class="smart-item-csv-copy">
           <strong>Bulk policy update</strong>
-          <span>Download the current CSV template and edit only Smart SCM policy columns. Keep policy_revision unchanged so stale files are detected. Blank editable cells leave values unchanged; enter CLEAR in lead_time_days, vendor_yard_id, or vendor_yard to remove that local override. NetSuite-owned item data is never changed.</span>
+          <span>Download the current CSV template and edit only policy columns. Keep policy_revision unchanged so stale files are detected. For return_policy use ALLOWED, APPROVAL_REQUIRED, NOT_RETURNABLE, or DEFAULT/blank to reset to the Product Type default. Enter CLEAR in lead_time_days, vendor_yard_id, or vendor_yard to remove those overrides. NetSuite-owned item data is never changed.</span>
         </div>
         <div class="smart-actions">
           <button class="smart-button" data-smart-action="download-item-template" type="button">Download CSV template</button>
@@ -405,15 +465,18 @@ function smartItemMaster() {
         <input id="smartItemSearch" type="search" value="${smartEscape(smartState.itemSearch)}" placeholder="Search item, ID, vendor, or description" />
         <select id="smartItemEnabled"><option value="" ${smartState.itemEnabled === "" ? "selected" : ""}>All NetSuite items</option><option value="true" ${smartState.itemEnabled === "true" ? "selected" : ""}>Planning enabled</option><option value="false" ${smartState.itemEnabled === "false" ? "selected" : ""}>Planning disabled</option></select>
         <select id="smartItemLowerStockPolicy" aria-label="Filter Item Master by lower-stock policy">${smartLowerStockPolicyFilterOptions()}</select>
+        <select id="smartItemReturnPolicy" aria-label="Filter Item Master by effective return policy">${smartReturnPolicyFilterOptions()}</select>
+        <select id="smartItemReturnPolicyOverride" aria-label="Filter Item Master by return policy override">${smartReturnPolicyOverrideFilterOptions()}</select>
         <select id="smartItemVendorYard">${smartVendorYardFilterOptions(data.vendorYards || [])}</select>
         <span class="smart-help">${first}–${last} of ${smartNumber(data.total, 0)}</span>
         <button class="smart-button" data-smart-action="item-prev" type="button" ${data.offset <= 0 ? "disabled" : ""}>Previous</button>
         <button class="smart-button" data-smart-action="item-next" type="button" ${data.offset + rows.length >= data.total ? "disabled" : ""}>Next</button>
       </div>
-      <div class="smart-table-wrap smart-item-grid-wrap"><table class="smart-table smart-item-table"><thead><tr><th>Plan</th><th>NetSuite item</th><th>Vendor</th><th>Vendor yard override</th><th>Lead time</th><th>Conversion / weight</th>${yards.map((yard) => `<th>${yard.code} availability / policy</th>`).join("")}<th>NetSuite sync</th><th></th></tr></thead><tbody>
+      <div class="smart-table-wrap smart-item-grid-wrap"><table class="smart-table smart-item-table"><thead><tr><th>Plan</th><th>NetSuite item</th><th>Return policy</th><th>Vendor</th><th>Vendor yard override</th><th>Lead time</th><th>Conversion / weight</th>${yards.map((yard) => `<th>${yard.code} availability / policy</th>`).join("")}<th>NetSuite sync</th><th></th></tr></thead><tbody>
         ${rows.map((item) => `<tr data-item-row="${item.itemId}">
           <td><input data-item-field="planningEnabled" type="checkbox" ${item.planningEnabled ? "checked" : ""} ${smartCanWrite() ? "" : "disabled"} /></td>
           <td class="smart-item-name"><strong>${smartEscape(item.itemName)}</strong><span>ID ${item.itemId} · ${smartEscape(item.description || item.displayName || item.itemType)}</span></td>
+          ${smartReturnPolicyCell(item)}
           <td><strong>${smartEscape(item.vendor || "—")}</strong><span class="smart-help">NetSuite-owned</span></td>
           <td><select data-item-field="vendorYardId" data-source-yard="${smartEscape(item.vendorYard || "")}" ${smartCanWrite() ? "" : "disabled"}>${smartVendorYardOptions(item, data.vendorYards || [])}</select>${item.vendorYard && !item.vendorYardId ? `<span class="smart-help">Source value retained until a matching local vendor yard is selected.</span>` : ""}</td>
           <td><input class="smart-lead-input" data-item-field="leadTimeDays" type="number" min="1" max="730" step="1" value="${smartEscape(item.leadTimeDays ?? item.netSuiteLeadTimeDays ?? 14)}" ${smartCanWrite() ? "" : "disabled"} /><span class="smart-help">days${item.netSuiteLeadTimeDays ? ` · NetSuite ${smartNumber(item.netSuiteLeadTimeDays, 0)}` : ""}</span></td>
@@ -421,7 +484,7 @@ function smartItemMaster() {
           ${yards.map((yard) => smartItemYardCell(item, yard)).join("")}
           <td>${smartDate(item.netSuiteSyncedAt, true)}</td>
           <td>${smartCanWrite() ? `<button class="smart-button primary" data-smart-action="save-item" data-item-id="${item.itemId}" type="button">Save</button>` : ""}</td>
-        </tr>`).join("") || `<tr><td colspan="12" class="smart-empty">No NetSuite item matches this search.</td></tr>`}
+        </tr>`).join("") || `<tr><td colspan="13" class="smart-empty">No NetSuite item matches this search and return-policy filter.</td></tr>`}
       </tbody></table></div>
     </section>`;
 }
@@ -512,7 +575,10 @@ function smartProposalCard(proposal) {
     ? (proposal.netsuitePurchaseOrderId || proposal.netsuitePurchaseOrderRef)
     : (proposal.netsuiteTransferOrderId || proposal.netsuiteTransferOrderRef));
   const locked = hasExecutionReference || ["confirmed", "executing", "completed", "superseded", "cancelled"].includes(proposal.status);
-  const canConfirm = !hasExecutionReference && !isPo && ["draft", "reviewed"].includes(proposal.status);
+  const canConfirm = !hasExecutionReference && !isPo && ["draft", "reviewed", "executing", "failed", "attention"].includes(proposal.status);
+  const confirmTransferLabel = ["executing", "failed", "attention"].includes(proposal.status)
+    ? "Retry TO + print"
+    : "Confirm TO + print";
   let actions = "";
   if (smartCanWrite() && isPo && proposal.status === "held") {
     actions = `<button class="smart-button primary" data-smart-action="proposal-status" data-proposal-id="${proposal.id}" data-status="order_requested" type="button">Order Requested</button><button class="smart-button danger" data-smart-action="proposal-status" data-proposal-id="${proposal.id}" data-status="cancelled" type="button">Cancel</button>`;
@@ -529,10 +595,10 @@ function smartProposalCard(proposal) {
       <div class="smart-proposal-route"><strong>${smartEscape(proposal.sourceName || proposal.vendor || "Vendor")} → ${smartEscape(proposal.destinationName)}</strong><span>#${proposal.id} · ${smartEscape(proposal.phase.replaceAll("_", " "))}${proposal.provisional ? " · provisional" : ""}${proposal.urgent ? " · urgent" : ""}</span></div>
       <div class="smart-proposal-metric"><strong>${smartNumber(proposal.totalPallets, 2)} PLT</strong><span>Pallets</span></div>
       <div class="smart-proposal-metric"><strong>${smartNumber(proposal.totalWeightLbs, 0)} lb</strong><span>${smartPercent(proposal.utilization, 0)} truck</span></div>
-      <div class="smart-proposal-metric"><strong>${executionRef ? smartEscape(executionRef) : "—"}</strong><span>${isPo ? "PO load ref" : "TO / mock ref"}</span></div>
+      <div class="smart-proposal-metric"><strong>${executionRef ? smartEscape(executionRef) : "—"}</strong><span>${isPo ? "PO load ref" : "NetSuite TO"}</span></div>
       <div class="smart-actions">
         ${actions}
-        ${smartCanWrite() && canConfirm ? `<button class="smart-button primary" data-smart-action="confirm-transfer" data-proposal-id="${proposal.id}" type="button">Confirm TO + print</button>` : ""}
+        ${smartCanWrite() && canConfirm ? `<button class="smart-button primary" data-smart-action="confirm-transfer" data-proposal-id="${proposal.id}" type="button">${confirmTransferLabel}</button>` : ""}
         ${smartCanWrite() && !isPo && hasExecutionReference && proposal.status === "attention" ? `<button class="smart-button warn" data-smart-action="retry-picking-ticket" data-proposal-id="${proposal.id}" type="button">Retry picking ticket</button>` : ""}
       </div>
     </div>
@@ -572,7 +638,7 @@ function smartSettings() {
     <form class="smart-section" id="smartSettingsForm">
       <div class="smart-section-head"><div><h2>Smart SCM controls</h2><p>Live execution is guarded by both this setting and a server environment flag. Daily planning uses the configured Toronto-local schedule.</p></div>${smartCanWrite() ? `<button class="smart-button primary" type="submit">Save settings</button>` : ""}</div>
       <div class="smart-section-body smart-form-grid">
-        <label class="smart-field"><span>Execution mode</span><select name="executionMode" ${smartCanWrite() ? "" : "disabled"}><option value="mock" ${settings.executionMode === "mock" ? "selected" : ""}>Mock — no NetSuite write</option><option value="live" ${settings.executionMode === "live" ? "selected" : ""}>Live — guarded NetSuite TO</option></select><small>Start in mock and validate proposals, reservations, and print routing first.</small></label>
+        <label class="smart-field"><span>Execution mode</span><select name="executionMode" ${smartCanWrite() ? "" : "disabled"}><option value="mock" ${settings.executionMode === "mock" ? "selected" : ""}>Mock — no NetSuite write</option><option value="live" ${settings.executionMode === "live" ? "selected" : ""}>Live — guarded NetSuite PO + TO</option></select><small>Live mode inserts confirmed POs and TOs into NetSuite; TO confirmation also queues the NetSuite picking ticket.</small></label>
         <label class="smart-field"><span>Forecast mode</span><select name="forecastMode" ${smartCanWrite() ? "" : "disabled"}><option value="formula" ${settings.forecastMode === "formula" ? "selected" : ""}>Formula only</option><option value="shadow" ${settings.forecastMode === "shadow" ? "selected" : ""}>Formula + shadow comparison</option><option value="hybrid" ${settings.forecastMode === "hybrid" ? "selected" : ""}>Promoted prediction segments</option></select><small>Hybrid uses prediction only for explicitly promoted yard/series segments.</small></label>
         <label class="smart-field"><span>Daily run time</span><input name="dailyTime" type="time" value="${smartEscape(settings.dailyTime || "06:00")}" ${smartCanWrite() ? "" : "disabled"} /><small>${smartEscape(settings.timeZone || "America/Toronto")}</small></label>
         <label class="smart-field"><span>Daily automation</span><span class="smart-check"><input name="dailyEnabled" type="checkbox" ${settings.dailyEnabled ? "checked" : ""} ${smartCanWrite() ? "" : "disabled"} /> Run one forecast and plan per local day</span></label>
@@ -605,8 +671,19 @@ function smartContent() {
   return smartOverview();
 }
 
+function smartFloatingNotices() {
+  const notices = [
+    smartState.error ? `<div class="smart-notice error" role="alert">${smartEscape(smartState.error)}</div>` : "",
+    smartState.notice ? `<div class="smart-notice">${smartEscape(smartState.notice)}</div>` : "",
+    smartState.busy ? `<div class="smart-notice">${smartEscape(smartState.busy)}…</div>` : ""
+  ].filter(Boolean);
+  return notices.length
+    ? `<div class="smart-floating-notices" aria-live="polite" aria-atomic="true">${notices.join("")}</div>`
+    : "";
+}
+
 function smartRender() {
-  smartScmApp.innerHTML = `${smartHeader()}<div class="smart-main">${smartState.error ? `<div class="smart-notice error">${smartEscape(smartState.error)}</div>` : ""}${smartState.notice ? `<div class="smart-notice">${smartEscape(smartState.notice)}</div>` : ""}${smartState.busy ? `<div class="smart-notice">${smartEscape(smartState.busy)}…</div>` : ""}${smartTabs()}${smartContent()}</div>`;
+  smartScmApp.innerHTML = `${smartHeader()}${smartFloatingNotices()}<div class="smart-main">${smartTabs()}${smartContent()}</div>`;
 }
 
 async function smartWork(label, task, success = "Saved") {
@@ -715,6 +792,29 @@ smartScmApp.addEventListener("click", async (event) => {
       smartRender();
     } else if (action === "download-sales-template") {
       await smartDownload("/api/scm/smart/sales-csv/template", "smart-scm-raw-sales-template.csv");
+    } else if (action === "reset-return-policy") {
+      if (!smartCanManageReturnPolicy()) throw new Error("Only an admin can change the company-wide Return Policy.");
+      const row = button.closest("[data-item-row]");
+      if (!row) throw new Error("Item row is no longer available.");
+      const viewport = smartCaptureItemViewport(row);
+      if (!confirm("Reset this item's company-wide Return Policy to its Product Type default?")) return;
+      const policySelect = row.querySelector('[data-item-field="returnPolicyOverride"]');
+      button.disabled = true;
+      button.textContent = "Resetting…";
+      const updated = await smartApi(`/api/scm/smart/items/${button.dataset.itemId}`, {
+        method: "PATCH",
+        body: {
+          returnPolicyOverride: null,
+          expectedReturnPolicyRevision: policySelect?.dataset.returnPolicyRevision || ""
+        }
+      });
+      if (updated && smartState.itemData) {
+        smartState.itemData.items = smartState.itemData.items.map((item) => Number(item.itemId) === Number(updated.itemId) ? updated : item);
+      }
+      smartState.notice = "Return Policy reset to the Product Type default";
+      smartRender();
+      smartRestoreItemViewport(viewport);
+      return;
     } else if (action === "save-item") {
       const row = button.closest("[data-item-row]");
       if (!row) throw new Error("Item row is no longer available.");
@@ -748,12 +848,23 @@ smartScmApp.addEventListener("click", async (event) => {
       }
       const vendorYardSelect = row.querySelector('[data-item-field="vendorYardId"]');
       const vendorYardValue = vendorYardSelect?.value || "";
+      const returnPolicySelect = row.querySelector('[data-item-field="returnPolicyOverride"]');
+      const returnPolicyValue = returnPolicySelect?.value || "DEFAULT";
+      const originalReturnPolicyValue = returnPolicySelect?.dataset.originalReturnPolicy || "DEFAULT";
+      const returnPolicyChanged = smartCanManageReturnPolicy()
+        && returnPolicyValue !== originalReturnPolicyValue;
       const payload = {
         planningEnabled: Boolean(row.querySelector('[data-item-field="planningEnabled"]')?.checked),
         leadTimeDays: Number(row.querySelector('[data-item-field="leadTimeDays"]')?.value || 0),
         vendorYardId: /^\d+$/.test(vendorYardValue) ? Number(vendorYardValue) : null,
         vendorYard: vendorYardValue === "__source__" ? (vendorYardSelect?.dataset.sourceYard || "") : vendorYardValue ? undefined : "",
-        yardPolicies
+        yardPolicies,
+        ...(returnPolicyChanged
+          ? {
+            returnPolicyOverride: returnPolicyValue === "DEFAULT" ? null : returnPolicyValue,
+            expectedReturnPolicyRevision: returnPolicySelect?.dataset.returnPolicyRevision || ""
+          }
+          : {})
       };
       button.disabled = true;
       button.textContent = "Saving…";
@@ -819,9 +930,12 @@ smartScmApp.addEventListener("click", async (event) => {
       smartState.plan = await smartApi(`/api/scm/smart/planning-runs/${smartState.plan.id}`);
       smartRender();
     } else if (action === "confirm-transfer") {
-      if (!confirm("Confirm this TO, reserve source inventory, and queue its picking ticket to the source yard printer?")) return;
+      if (!confirm("Create or recover this TO in NetSuite, reserve source inventory, and queue the NetSuite picking ticket to both source-yard TO printers?")) return;
       const result = await smartWork("Creating and verifying transfer order", () => smartApi(`/api/scm/smart/proposals/${button.dataset.proposalId}/confirm-transfer`, { method: "POST", body: {} }), "TO confirmed and print job queued");
-      smartState.notice = `${result.transferOrderRef} confirmed; print job #${result.printJob.id} queued.`;
+      const transferOutcome = result.mode === "live"
+        ? (result.recovered ? "recovered from NetSuite" : "created in NetSuite")
+        : "confirmed in mock mode";
+      smartState.notice = `${result.transferOrderRef} ${transferOutcome}; print job #${result.printJob.id} queued.`;
       smartState.plan = await smartApi(`/api/scm/smart/planning-runs/${smartState.plan.id}`);
       smartRender();
     } else if (action === "retry-picking-ticket") {
@@ -886,9 +1000,13 @@ smartScmApp.addEventListener("change", async (event) => {
   }
   if (event.target.id === "smartItemEnabled"
     || event.target.id === "smartItemLowerStockPolicy"
+    || event.target.id === "smartItemReturnPolicy"
+    || event.target.id === "smartItemReturnPolicyOverride"
     || event.target.id === "smartItemVendorYard") {
     if (event.target.id === "smartItemEnabled") smartState.itemEnabled = event.target.value;
     if (event.target.id === "smartItemLowerStockPolicy") smartState.itemLowerStockPolicy = event.target.value;
+    if (event.target.id === "smartItemReturnPolicy") smartState.itemReturnPolicy = event.target.value;
+    if (event.target.id === "smartItemReturnPolicyOverride") smartState.itemReturnPolicyOverride = event.target.value;
     if (event.target.id === "smartItemVendorYard") smartState.itemVendorYard = event.target.value;
     try {
       await smartLoadItems({ reset: true });
