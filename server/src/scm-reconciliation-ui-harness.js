@@ -123,7 +123,7 @@ includesAll(css, [
 ], "reconciliation schedule styling");
 
 assert.ok(html.includes("/dispatch.css?v=20260730-column-header-filters-v1"), "Reconciliation CSS cache bust is missing.");
-assert.ok(html.includes("/scm-schedule.js?v=20260730-status-visibility-v1"), "Reconciliation client cache bust is missing.");
+assert.ok(html.includes("/scm-schedule.js?v=20260801-conjunctive-filters-v1"), "Reconciliation client cache bust is missing.");
 
 const payloadStart = schedule.indexOf("function normalizeScmSchedulePayload");
 const payloadEnd = schedule.indexOf("function loadScmSchedulePresetsOnce", payloadStart);

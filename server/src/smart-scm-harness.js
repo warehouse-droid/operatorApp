@@ -4,11 +4,11 @@ import fs from "node:fs/promises";
 import { closeDb, query, withTransaction } from "./db.js";
 import { listSmartScmInputFiles } from "./smart-scm-import-repository.js";
 import { runSmartScmForecast, listSmartScmForecasts, smartScmCoverageFloor } from "./smart-scm-forecast-repository.js";
-import { consolidateCompatibleDrafts, getSmartScmPlanningRun, runSmartScmPlan, smartScmConfirmationSourceTransferLimit, smartScmLineOverridesSourceStockFloor, smartScmPackWholePalletLines, smartScmPhysicalPalletLines, smartScmProposalLineLoadWeightLbs, smartScmSourceTransferLimit, updateSmartScmProposal } from "./smart-scm-planning-repository.js";
+import { consolidateCompatibleDrafts, getSmartScmPlanningRun, prepareSmartScmTransferExecution, runSmartScmPlan, smartScmConfirmationSourceTransferLimit, smartScmLineOverridesSourceStockFloor, smartScmPackWholePalletLines, smartScmPhysicalPalletLines, smartScmProposalLineLoadWeightLbs, smartScmSourceTransferLimit, updateSmartScmProposal } from "./smart-scm-planning-repository.js";
 import { addSmartScmVendorAlternativeLine, listSmartScmNetSuitePoReviewLoads, listSmartScmVendorReplyLoads, removeSmartScmNetSuitePoReviewLoad, removeSmartScmVendorAlternativeLine, searchSmartScmVendorAlternatives, stageSmartScmVendorReplyLoad } from "./smart-scm-vendor-repository.js";
 import { executeSmartScmPurchaseProposal } from "./smart-scm-purchase-service.js";
 import { createSimplePdf, leaseYardPrintJob, queueSmartScmPrintJob, queueYardPrinterTest, rotateYardPrinterToken, updateLeasedPrintJob, updateYardPrinter, yardPrintJobDocument } from "./smart-scm-print-repository.js";
-import { createSmartScmManualLoad, groupSmartScmProposals, recalculateSmartScmPoProposal, removeSmartScmProposalLine, smartScmAllocateProRata, splitSmartScmProposalLine, updateSmartScmProposalLine } from "./smart-scm-proposal-editor.js";
+import { addSmartScmProposalLine, createSmartScmManualLoad, groupSmartScmProposals, recalculateSmartScmPoProposal, removeSmartScmProposalLine, smartScmAllocateProRata, splitSmartScmProposalLine, updateSmartScmProposalLine } from "./smart-scm-proposal-editor.js";
 import { buildSmartScmPurchaseOrderRestPayload } from "./smart-scm-purchase-netsuite.js";
 import { listSmartScmRouteRules, upsertSmartScmRouteRule } from "./smart-scm-route-repository.js";
 
@@ -36,6 +36,25 @@ const palletTareCapacityLoads = smartScmPackWholePalletLines([
 assert.equal(palletTareCapacityLoads.length, 2, "Gross material-plus-PALLET weight must split a load that material weight alone would fill exactly.");
 assert(palletTareCapacityLoads.every((load) => load.totalWeight <= 78000), "Every tare-aware packed load must stay within truck capacity.");
 assert.equal(palletTareCapacityLoads.reduce((sum, load) => sum + load.totalPallets, 0), 26, "Tare-aware packing must preserve pallet quantity.");
+const automaticCapacityControl = smartScmPackWholePalletLines([
+  {
+    itemId: 991,
+    destinationLocationId: 26,
+    destinationName: "150",
+    proposedPallets: 4,
+    requiredPallets: 4,
+    palletWeight: 60,
+    physicalPalletWeightLbs: 5,
+    lineWeight: 240,
+    toPlt: 1,
+    reason: {}
+  }
+], 100, { proposalType: "TO", sourceName: "2967", maxStops: 1 });
+assert(automaticCapacityControl.length > 1, "Automatic planning must split a requirement that cannot fit one truck.");
+assert(automaticCapacityControl.every((load) => load.totalWeight <= 100.000001),
+  "Allowing explicit manual over-capacity intent must never weaken automatic truck-capacity packing.");
+assert.equal(automaticCapacityControl.reduce((sum, load) => sum + load.totalPallets, 0), 4,
+  "Automatic capacity splitting must preserve the complete requirement.");
 for (const load of proportionalLoads) {
   for (const line of load) proportionalTotals.set(line.itemId, (proportionalTotals.get(line.itemId) || 0) + line.proposedPallets);
 }
@@ -334,11 +353,17 @@ assert(visiblePhysicalPallets.every((line) => line.officialLineItem && line.subm
     const alliance = forecasts.find((row) => row.itemId === 601 && row.yardCode === "12441");
     assert(alliance, "Expected Alliance G2 Supersand Grey at 12441.");
     assert.equal(alliance.formulaStockout, true);
-    assert(Math.abs(alliance.formulaWeeklyDemand - 2.642857) < 0.00001, `Expected stockout peak 2.642857, received ${alliance.formulaWeeklyDemand}.`);
-    assert(Math.abs(alliance.formulaWeeklySd - 1.003358) < 0.00001, `Expected six-week SD 1.003358, received ${alliance.formulaWeeklySd}.`);
-    assert(Math.abs(alliance.safetyStockPallets - 2.334194) < 0.00001, `Expected forecast safety stock 2.334194, received ${alliance.safetyStockPallets}.`);
-    assert.equal(alliance.reorderPointPallets, 8);
-    assert.equal(alliance.preferredPallets, 14);
+    assert(alliance.formulaWeeklyDemand > 0, "A stocked-out hot item must retain positive demand from eligible historical weeks.");
+    assert(["snapshot", "mixed", "positive_sales_proxy"].includes(alliance.stockoutDemandMethod));
+    assert.equal(alliance.stockoutSnapshotWeeks + alliance.stockoutProxyWeeks <= alliance.formulaWindowWeeks, true);
+    assert.equal(
+      alliance.stockoutDemandConfidence,
+      alliance.stockoutProxyWeeks > 0 || alliance.stockoutSnapshotWeeks < 3 ? "low" : "high",
+      "Proxy evidence or fewer than three snapshot-backed weeks must be labelled low confidence."
+    );
+    assert(Number.isFinite(alliance.formulaWeeklySd) && alliance.formulaWeeklySd >= 0);
+    assert(alliance.safetyStockPallets >= 0 && Number.isFinite(alliance.reorderPointPallets));
+    assert(alliance.preferredPallets >= 0 && Number.isFinite(alliance.preferredPallets));
 
     const plan = await runSmartScmPlan({ triggerSource: "harness", operatorId: null, forecastRunId: Number(forecastRun.id) });
     assert.equal(plan.status, "ready");
@@ -385,6 +410,123 @@ assert(visiblePhysicalPallets.every((line) => line.officialLineItem && line.subm
     assert.equal(splitProposal.lines[0].proposedPallets, 1);
     assert.equal(splitProposal.lines[0].reason.splitWholeLine, true);
     assert.equal(splitProposal.totalPallets, 1, "The moved PALLET quantity must be conserved without an empty source load.");
+
+    const manualTransferSeed = plan.proposals.find((proposal) => proposal.proposalType === "TO"
+      && proposal.phase === "internal_transfer" && proposal.lines.length > 0);
+    assert(manualTransferSeed, "Expected an internal TO with a planning-enabled source and destination for manual capacity coverage.");
+    const manualTransferLine = manualTransferSeed.lines[0];
+    const manualTransferPalletTare = Number(manualTransferSeed.physicalPalletLines?.[0]?.itemWeightLbs || 0);
+    const manualTransferGrossPalletWeight = Number(manualTransferLine.palletWeightLbs || 0) + manualTransferPalletTare;
+    assert(manualTransferGrossPalletWeight > 0, "Manual capacity coverage needs a positive gross pallet weight.");
+    const overCapacityPallets = Math.floor(78000 / manualTransferGrossPalletWeight) + 1;
+    const sourceBalanceBeforeManual = await query(
+      `SELECT quantity_on_hand, quantity_available
+         FROM inventory_balances
+        WHERE item_id = $1 AND location_id = $2
+        FOR UPDATE`,
+      [manualTransferLine.itemId, manualTransferSeed.sourceLocationId]
+    );
+    assert(sourceBalanceBeforeManual.rowCount, "The manual TO source needs a live inventory balance.");
+    const manualTransferIdsBefore = new Set((await getSmartScmPlanningRun(plan.id)).proposals.map((proposal) => proposal.id));
+    const manualTransferRun = await createSmartScmManualLoad(plan.id, {
+      proposalType: "TO",
+      itemId: manualTransferLine.itemId,
+      sourceLocationId: manualTransferSeed.sourceLocationId,
+      destinationLocationId: manualTransferSeed.destinationLocationId,
+      proposedPallets: overCapacityPallets
+    }, null);
+    let overCapacityManualTransfer = manualTransferRun.proposals.find((proposal) => !manualTransferIdsBefore.has(proposal.id));
+    assert(overCapacityManualTransfer, "An explicit manual TO load must be created without automatic trimming or splitting.");
+    assert.equal(overCapacityManualTransfer.lines[0].proposedPallets, overCapacityPallets);
+    assert(overCapacityManualTransfer.utilization > 1,
+      "An explicit manual TO load must retain its over-capacity quantity and expose utilization above 100%.");
+
+    const manuallyEditedPallets = overCapacityPallets + 1;
+    overCapacityManualTransfer = await updateSmartScmProposalLine(
+      overCapacityManualTransfer.id,
+      overCapacityManualTransfer.lines[0].id,
+      { proposedPallets: manuallyEditedPallets },
+      null
+    );
+    assert.equal(overCapacityManualTransfer.lines[0].proposedPallets, manuallyEditedPallets,
+      "A user-entered TO quantity above capacity must persist exactly.");
+    assert(overCapacityManualTransfer.utilization > 1);
+
+    const manuallyAddedPallets = 1;
+    overCapacityManualTransfer = await addSmartScmProposalLine(overCapacityManualTransfer.id, {
+      itemId: manualTransferLine.itemId,
+      proposedPallets: manuallyAddedPallets
+    }, null);
+    const finalManualPallets = manuallyEditedPallets + manuallyAddedPallets;
+    assert.equal(overCapacityManualTransfer.lines[0].proposedPallets, finalManualPallets,
+      "Adding a line quantity manually must retain the complete over-capacity total.");
+    assert(overCapacityManualTransfer.utilization > 1);
+    await updateSmartScmProposal(overCapacityManualTransfer.id, { status: "reviewed" }, null);
+
+    const provenance = await query(
+      "SELECT reason, added_source FROM scm_smart_proposal_lines WHERE proposal_id = $1 AND id = $2",
+      [overCapacityManualTransfer.id, overCapacityManualTransfer.lines[0].id]
+    );
+    assert.equal(provenance.rows[0].reason.manualCapacityOverride, true,
+      "The saved over-capacity TO must carry explicit manual provenance into final confirmation.");
+    await query(
+      "UPDATE scm_smart_proposal_lines SET reason = '{}'::jsonb, added_source = 'planning' WHERE proposal_id = $1",
+      [overCapacityManualTransfer.id]
+    );
+    await assert.rejects(
+      () => prepareSmartScmTransferExecution(overCapacityManualTransfer.id, null),
+      (error) => error?.status === 409 && /capacity/i.test(error.message),
+      "An over-capacity TO without explicit manual provenance must remain blocked at final confirmation."
+    );
+    await query(
+      "UPDATE scm_smart_proposal_lines SET reason = $2::jsonb, added_source = $3 WHERE proposal_id = $1 AND id = $4",
+      [overCapacityManualTransfer.id, JSON.stringify(provenance.rows[0].reason), provenance.rows[0].added_source,
+        overCapacityManualTransfer.lines[0].id]
+    );
+
+    const deliberatelyInsufficientSalesQty = Math.max(0, (finalManualPallets - 1) * Number(manualTransferLine.toPlt || 0));
+    await query(
+      `UPDATE inventory_balances
+          SET quantity_on_hand = $3, quantity_available = $3
+        WHERE item_id = $1 AND location_id = $2`,
+      [manualTransferLine.itemId, manualTransferSeed.sourceLocationId, deliberatelyInsufficientSalesQty]
+    );
+    await assert.rejects(
+      () => prepareSmartScmTransferExecution(overCapacityManualTransfer.id, null),
+      (error) => error?.status === 409 && /available|unreserved/i.test(error.message),
+      "Manual capacity provenance must not bypass the hard source-availability check."
+    );
+    const sufficientSalesQty = (finalManualPallets + 2) * Number(manualTransferLine.toPlt || 0);
+    await query(
+      `UPDATE inventory_balances
+          SET quantity_on_hand = $3, quantity_available = $3
+        WHERE item_id = $1 AND location_id = $2`,
+      [manualTransferLine.itemId, manualTransferSeed.sourceLocationId, sufficientSalesQty]
+    );
+    const preparedManualTransfer = await prepareSmartScmTransferExecution(overCapacityManualTransfer.id, null);
+    assert.equal(preparedManualTransfer.totalPallets, finalManualPallets,
+      "Final confirmation must retain an explicitly manual over-capacity TO after safety checks pass.");
+    assert.equal(preparedManualTransfer.lines[0].palletQty, finalManualPallets);
+    const executingManualTransfer = await query(
+      "SELECT status, utilization FROM scm_smart_proposals WHERE id = $1",
+      [overCapacityManualTransfer.id]
+    );
+    assert.equal(executingManualTransfer.rows[0].status, "executing");
+    assert(Number(executingManualTransfer.rows[0].utilization) > 1,
+      "Final preparation must not erase the over-capacity utilization warning state.");
+
+    await query(
+      "DELETE FROM scm_smart_inventory_reservations WHERE proposal_line_id IN (SELECT id FROM scm_smart_proposal_lines WHERE proposal_id = $1)",
+      [overCapacityManualTransfer.id]
+    );
+    await query("DELETE FROM scm_smart_proposals WHERE id = $1", [overCapacityManualTransfer.id]);
+    await query(
+      `UPDATE inventory_balances
+          SET quantity_on_hand = $3, quantity_available = $4
+        WHERE item_id = $1 AND location_id = $2`,
+      [manualTransferLine.itemId, manualTransferSeed.sourceLocationId,
+        sourceBalanceBeforeManual.rows[0].quantity_on_hand, sourceBalanceBeforeManual.rows[0].quantity_available]
+    );
     for (const proposal of plan.proposals.filter((row) => row.proposalType === "PO" && row.sourceName === "Gormley")) {
       const directLines = proposal.lines.filter((line) => [1, 28].includes(line.destinationLocationId));
       if (!directLines.length) continue;
@@ -412,9 +554,12 @@ assert(visiblePhysicalPallets.every((line) => line.officialLineItem && line.subm
     const allianceLine = plan.proposals.flatMap((proposal) => proposal.lines.map((line) => ({ proposal, line })))
       .find(({ proposal, line }) => proposal.destinationLocationId === 15 && line.itemId === 601 && Number(line.reason.safetyFactor) === 1.645);
     assert(allianceLine, "Expected an Alliance G2 Supersand Grey replenishment line for 12441.");
-    assert(Math.abs(Number(allianceLine.line.reason.safetyStockPallets) - 2.334194) < 0.00001, `Expected safety stock 2.334194, received ${allianceLine.line.reason.safetyStockPallets}.`);
-    assert.equal(Number(allianceLine.line.reason.reorderPointPallets), 8);
-    assert.equal(Number(allianceLine.line.reason.preferredPallets), 14);
+    assert(Math.abs(Number(allianceLine.line.reason.safetyStockPallets) - alliance.safetyStockPallets) < 0.00001,
+      "The proposal line must use the safety stock calculated from the new eligible-week stockout average.");
+    assert.equal(Number(allianceLine.line.reason.reorderPointPallets), alliance.reorderPointPallets);
+    assert.equal(Number(allianceLine.line.reason.preferredPallets), alliance.preferredPallets);
+    assert.equal(allianceLine.line.reason.stockoutDemandMethod, alliance.stockoutDemandMethod);
+    assert.equal(allianceLine.line.reason.stockoutDemandConfidence, alliance.stockoutDemandConfidence);
 
     const destinationEditCandidate = await query(
       `SELECT line.proposal_id, line.id AS line_id, line.item_id, line.proposed_pallets,

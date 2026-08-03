@@ -20,6 +20,7 @@ import {
   recordScmReconciliationMissingLookup,
   reconcileScmOrderFamily,
   resolveScmReconciliationReview,
+  scmScheduleEffectiveReconciliationStatus,
   scmReconciliationProposedOutcome,
   scmReconciliationReviewFingerprint,
   clearScmReconciliationMissingLookup,
@@ -32,6 +33,56 @@ import {
 } from "./scm-reconciliation-repository.js";
 import { applyScmReconciliationRun } from "./scm-reconciliation-service.js";
 import { listScmSchedule } from "./dispatch-repository.js";
+
+const olderReconciliationAt = "2026-08-01T17:21:00.000Z";
+const newerScheduleAt = "2026-08-01T17:50:00.000Z";
+const newerReconciliationAt = "2026-08-01T18:05:00.000Z";
+
+assert.equal(scmScheduleEffectiveReconciliationStatus({
+  scheduleStatus: "Hold",
+  scheduleId: 101,
+  scheduleUpdatedAt: newerScheduleAt,
+  reconciliationStatus: "current",
+  reconciliationReconciledAt: olderReconciliationAt,
+  reconciliationApplicationStatus: "Queued"
+}), "Hold", "A newer persisted Hold must win over an older Queued reconciliation snapshot.");
+
+assert.equal(scmScheduleEffectiveReconciliationStatus({
+  scheduleStatus: "Queued",
+  scheduleId: 102,
+  scheduleUpdatedAt: newerScheduleAt,
+  reconciliationStatus: "current",
+  reconciliationReconciledAt: olderReconciliationAt,
+  reconciliationApplicationStatus: "Hold"
+}), "Queued", "A newer persisted un-Hold must win over an older Hold reconciliation snapshot.");
+
+assert.equal(scmScheduleEffectiveReconciliationStatus({
+  scheduleStatus: "Hold",
+  scheduleId: 103,
+  scheduleUpdatedAt: newerScheduleAt,
+  reconciliationStatus: "current",
+  reconciliationReconciledAt: newerReconciliationAt,
+  reconciliationApplicationStatus: "Queued"
+}), "Queued", "A newer reconciliation snapshot must supersede an older persisted schedule status.");
+
+assert.equal(scmScheduleEffectiveReconciliationStatus({
+  scheduleStatus: "Hold",
+  scheduleId: 104,
+  scheduleUpdatedAt: newerScheduleAt,
+  reconciliationStatus: "pending",
+  reconciliationReconciledAt: newerReconciliationAt,
+  reconciliationApplicationStatus: "Queued"
+}), "Hold", "Pending reconciliation must retain the persisted schedule status.");
+
+assert.equal(scmScheduleEffectiveReconciliationStatus({
+  scheduleStatus: "Hold",
+  scheduleId: 105,
+  scheduleUpdatedAt: newerScheduleAt,
+  reconciliationStatus: "pending",
+  reconciliationReconciledAt: olderReconciliationAt,
+  reconciliationApplicationStatus: "Queued",
+  blockingReview: true
+}), "Reconcile Review", "A blocking review must take precedence over pending and schedule statuses.");
 
 const rollback = await beginRollbackContext();
 const seed = Number(String(Date.now()).slice(-8));
@@ -1449,6 +1500,8 @@ try {
     assert.equal(enriched.length, 2);
     assert.equal(enriched[0].reconciliation.quantities.received, 6);
     assert.equal(enriched[1].status, "In Transit");
+    assert.ok(enriched.every((row) => row.reconciliationApplicationStatus === row.status),
+      "Schedule and reconciliation application statuses must expose the same effective status.");
     assert.ok(enriched.every((row) => Array.isArray(row.reconciliation.lines)));
     assert.ok(enriched.every((row) => Array.isArray(row.reconciliation.allocationTargets)));
 

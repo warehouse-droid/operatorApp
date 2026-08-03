@@ -10,7 +10,7 @@ const migration = read("migrations/087_smart_scm_live_execution.sql");
 const server = read("src/server.js");
 const netSuite = read("src/netsuite.js");
 const repository = read("src/smart-scm-vendor-repository.js");
-const poUi = read("public/scm-netsuite-po.js");
+const vendorUi = read("public/scm-smart-vendor.js");
 const proposalUi = read("public/scm-smart-proposals.js");
 const smartUi = read("public/scm-smart.js");
 
@@ -30,9 +30,9 @@ assert.match(
 assert.match(repository, /SET status = 'cancelled'/);
 assert.match(repository, /po_execution_status = 'removed'/);
 assert.match(repository, /canRemoveFromStaging:/);
-assert.match(poUi, /data-po-action="remove"/);
-assert.match(poUi, /method: "DELETE"/);
-assert.match(poUi, /value="removed"/);
+assert.match(vendorUi, /data-smart-action="remove-vendor-load"/);
+assert.match(vendorUi, /vendor-reply-loads\/\$\{proposalId\}/);
+assert.match(vendorUi, /method: "DELETE"/);
 
 assert.match(proposalUi, /"Confirm TO \+ print"/);
 assert.match(proposalUi, /"Retry TO \+ print"/);

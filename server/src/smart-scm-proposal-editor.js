@@ -3,10 +3,17 @@ import { query, withTransaction } from "./db.js";
 import { writeAudit } from "./auth-repository.js";
 import { getSmartScmPlanningRun, getSmartScmProposal, smartScmPackWholePalletLines,
   smartScmLineOverridesSourceStockFloor, smartScmNormalizePalletQuantityOverrides,
-  smartScmPalletLoadWeightLbs, smartScmPhysicalPalletLines, smartScmProposalLineLoadWeightLbs } from "./smart-scm-planning-repository.js";
+  smartScmPalletLoadWeightLbs, smartScmPhysicalPalletLines, smartScmProposalLineLoadWeightLbs,
+  smartScmUrgencyLevel, smartScmUrgencyRank, smartScmUrgencySummary } from "./smart-scm-planning-repository.js";
 import { getSmartScmRouteRule } from "./smart-scm-route-repository.js";
 
 const EPSILON = 0.000001;
+const MANUAL_CAPACITY_REASON_KEYS = Object.freeze([
+  "manualCapacityOverride",
+  "manualCapacityOverrideSource",
+  "manualCapacityOverrideWeightLbs",
+  "manualCapacityOverrideTruckCapacityLbs"
+]);
 const EDITABLE_STATUSES = new Set(["draft", "held", "reviewed", "attention"]);
 const YARDS = Object.freeze([
   { locationId: 1, code: "3445" },
@@ -31,12 +38,33 @@ function round(value, places = 6) {
   return Math.round((number(value) + Number.EPSILON) * factor) / factor;
 }
 
+function urgencyScore(value, urgent = false) {
+  return urgent ? round(Math.min(100, Math.max(0, number(value))), 4) : 0;
+}
+
 function text(value) {
   return String(value ?? "").trim();
 }
 
 function normalized(value) {
   return text(value).toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function withManualCapacityEvidence(reason = {}, {
+  overCapacity = false,
+  source = "manual",
+  totalWeightLbs = 0,
+  truckCapacityLbs = 0
+} = {}) {
+  const next = { ...(reason || {}) };
+  for (const key of MANUAL_CAPACITY_REASON_KEYS) delete next[key];
+  if (overCapacity) {
+    next.manualCapacityOverride = true;
+    next.manualCapacityOverrideSource = source;
+    next.manualCapacityOverrideWeightLbs = round(totalWeightLbs);
+    next.manualCapacityOverrideTruckCapacityLbs = round(truckCapacityLbs);
+  }
+  return next;
 }
 
 function hasExecutionReference(proposal) {
@@ -46,6 +74,9 @@ function hasExecutionReference(proposal) {
 
 function assertEditableProposal(proposal) {
   if (!proposal) throw Object.assign(new Error("Smart SCM proposal was not found."), { status: 404 });
+  if (proposal.proposal_origin === "blanket") {
+    throw Object.assign(new Error("Blanket pool proposals must be edited from the Blanket order tab so their source allocation stays exact."), { status: 409 });
+  }
   if (!EDITABLE_STATUSES.has(proposal.status)) {
     throw Object.assign(new Error("Only an unrequested draft, held, reviewed, or attention load can be edited."), { status: 409 });
   }
@@ -94,6 +125,8 @@ function draftLine(row, physicalPalletWeightLbs = 0) {
     toPcs: positive(row.to_pcs),
     manualPlanningRequired: Boolean(row.manual_planning_required),
     urgent: Boolean(row.urgent),
+    urgencyLevel: smartScmUrgencyLevel(row.urgency_level, row.urgent),
+    urgencyScore: urgencyScore(row.urgency_score, row.urgent),
     provisional: Boolean(row.provisional),
     reason: row.reason || {}
   };
@@ -109,7 +142,10 @@ function combineLines(lines, next) {
   for (const key of ["requiredPallets", "proposedPallets", "confirmedPallets", "residualPallets", "salesQuantity", "lineWeight"]) {
     existing[key] = round(positive(existing[key]) + positive(next[key]));
   }
-  existing.urgent = Boolean(existing.urgent || next.urgent);
+  const priority = smartScmUrgencySummary([existing, next]);
+  existing.urgent = priority.urgent;
+  existing.urgencyLevel = priority.urgencyLevel;
+  existing.urgencyScore = priority.urgencyScore;
   existing.provisional = Boolean(existing.provisional || next.provisional);
   const manualSourceFloorOverride = smartScmLineOverridesSourceStockFloor(existing)
     || smartScmLineOverridesSourceStockFloor(next);
@@ -117,6 +153,8 @@ function combineLines(lines, next) {
     ...(existing.reason || {}),
     ...(manualSourceFloorOverride ? { manualSourceFloorOverride: true } : {}),
     urgent: existing.urgent,
+    urgencyLevel: existing.urgencyLevel,
+    urgencyScore: existing.urgencyScore,
     provisional: existing.provisional
   };
 }
@@ -226,7 +264,7 @@ function allocatedLine(line, pallets, requestedPallets, capacityRatio) {
     salesQuantity: round(pallets * positive(line.toPlt)),
     lineWeight: round(pallets * positive(line.palletWeight)),
     reason: {
-      ...(line.reason || {}),
+      ...withManualCapacityEvidence(line.reason, { overCapacity: false }),
       manuallyGrouped: true,
       proportionalAllocationPart: 1,
       groupingRoundedFromPallets: round(positive(line.proposedPallets)),
@@ -281,7 +319,12 @@ export function smartScmAllocateProRata(lines = [], capacityLbs = 0) {
       const leftCost = Math.abs((left.allocatedPallets + 1) - left.idealPallets) - Math.abs(left.allocatedPallets - left.idealPallets);
       const rightCost = Math.abs((right.allocatedPallets + 1) - right.idealPallets) - Math.abs(right.allocatedPallets - right.idealPallets);
       if (Math.abs(leftCost - rightCost) > EPSILON) return leftCost - rightCost;
-      if (Boolean(left.line.urgent) !== Boolean(right.line.urgent)) return left.line.urgent ? -1 : 1;
+      const levelDifference = smartScmUrgencyRank(right.line.urgencyLevel, right.line.urgent)
+        - smartScmUrgencyRank(left.line.urgencyLevel, left.line.urgent);
+      if (levelDifference) return levelDifference;
+      const scoreDifference = urgencyScore(right.line.urgencyScore, right.line.urgent)
+        - urgencyScore(left.line.urgencyScore, left.line.urgent);
+      if (Math.abs(scoreDifference) > EPSILON) return scoreDifference;
       const leftShare = left.allocatedPallets / left.requestedPallets;
       const rightShare = right.allocatedPallets / right.requestedPallets;
       if (Math.abs(leftShare - rightShare) > EPSILON) return leftShare - rightShare;
@@ -354,6 +397,7 @@ async function updateDerivedProposal(proposalId) {
   const palletQuantityOverrides = prunePalletOverrides(proposal?.pallet_quantity_overrides, lines);
   const totalPallets = round(lines.reduce((sum, line) => sum + positive(line.proposed_pallets), 0));
   const totalWeight = proposalLoadWeight(lines, palletQuantityOverrides, settings.physical_pallet_weight_lbs);
+  const capacity = positive(settings.truck_capacity_lbs);
   await query(
     `UPDATE scm_smart_proposals
         SET destination_location_id = $2,
@@ -364,13 +408,52 @@ async function updateDerivedProposal(proposalId) {
             utilization = CASE WHEN $7::numeric > 0 THEN $6::numeric / $7::numeric ELSE 0 END,
             pallet_quantity_overrides = $8::jsonb,
             urgent = EXISTS (SELECT 1 FROM scm_smart_proposal_lines line WHERE line.proposal_id = $1 AND line.urgent),
+            urgency_level = COALESCE((
+              SELECT line.urgency_level
+                FROM scm_smart_proposal_lines line
+               WHERE line.proposal_id = $1
+               ORDER BY CASE line.urgency_level
+                          WHEN 'ultimate_urgent' THEN 3
+                          WHEN 'super_urgent' THEN 2
+                          WHEN 'urgent' THEN 1
+                          ELSE 0
+                        END DESC,
+                        line.urgency_score DESC, line.id
+               LIMIT 1
+            ), 'normal'),
+            urgency_score = COALESCE((
+              SELECT line.urgency_score
+                FROM scm_smart_proposal_lines line
+               WHERE line.proposal_id = $1
+               ORDER BY CASE line.urgency_level
+                          WHEN 'ultimate_urgent' THEN 3
+                          WHEN 'super_urgent' THEN 2
+                          WHEN 'urgent' THEN 1
+                          ELSE 0
+                        END DESC,
+                        line.urgency_score DESC, line.id
+               LIMIT 1
+            ), 0),
             provisional = EXISTS (SELECT 1 FROM scm_smart_proposal_lines line WHERE line.proposal_id = $1 AND line.provisional),
             updated_at = now()
       WHERE id = $1`,
     [Number(proposalId), routeStops[0].locationId, routeStops[0].name, JSON.stringify(routeStops), totalPallets, totalWeight,
-      positive(settings.truck_capacity_lbs), JSON.stringify(palletQuantityOverrides)]
+      capacity, JSON.stringify(palletQuantityOverrides)]
   );
-  return { totalPallets, totalWeight, capacity: positive(settings.truck_capacity_lbs), routeStops, palletQuantityOverrides };
+  if (totalWeight <= capacity + EPSILON) {
+    await query(
+      `UPDATE scm_smart_proposal_lines
+          SET reason = COALESCE(reason, '{}'::jsonb) - $2::text[], updated_at = now()
+        WHERE proposal_id = $1
+          AND COALESCE(reason, '{}'::jsonb) ?| $2::text[]`,
+      [Number(proposalId), MANUAL_CAPACITY_REASON_KEYS]
+    );
+  }
+  return { totalPallets, totalWeight, capacity, routeStops, palletQuantityOverrides };
+}
+
+export async function refreshSmartScmProposalDerived(proposalId) {
+  return updateDerivedProposal(proposalId);
 }
 
 async function recordRevision(runId, reason, diff, operatorId) {
@@ -403,18 +486,23 @@ async function recordRevision(runId, reason, diff, operatorId) {
   return numberValue;
 }
 
+export async function recordSmartScmProposalRevision(runId, reason, diff, operatorId) {
+  return recordRevision(runId, reason, diff, operatorId);
+}
+
 async function insertGroupedDraft(runId, draft, { manuallyGrouped = true } = {}) {
+  const priority = smartScmUrgencySummary(draft.lines);
   const proposal = await query(
     `INSERT INTO scm_smart_proposals (
        run_id, proposal_key, proposal_type, phase, source_kind, source_location_id, source_vendor_yard_id, source_name,
-       destination_location_id, destination_name, vendor, plant, status, urgent, provisional,
+       destination_location_id, destination_name, vendor, plant, status, urgent, urgency_level, urgency_score, provisional,
        total_pallets, total_weight_lbs, utilization, memo, route_stops, pallet_quantity_overrides, manually_grouped
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20::jsonb,$21::jsonb,$22)
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22::jsonb,$23::jsonb,$24)
      RETURNING id`,
     [runId, draft.proposalKey, draft.proposalType, draft.phase, draft.sourceKind, draft.sourceLocationId,
       draft.sourceVendorYardId, draft.sourceName, draft.destinationLocationId, draft.destinationName, draft.vendor, draft.plant,
-      draft.status, draft.urgent, draft.provisional, draft.totalPallets, draft.totalWeight,
-      draft.utilization, draft.memo, JSON.stringify(draft.routeStops),
+      draft.status, priority.urgent, priority.urgencyLevel, priority.urgencyScore, draft.provisional,
+      draft.totalPallets, draft.totalWeight, draft.utilization, draft.memo, JSON.stringify(draft.routeStops),
       JSON.stringify(smartScmNormalizePalletQuantityOverrides(draft.palletQuantityOverrides)), Boolean(manuallyGrouped)]
   );
   for (const line of draft.lines) {
@@ -423,13 +511,16 @@ async function insertGroupedDraft(runId, draft, { manuallyGrouped = true } = {})
          proposal_id, item_id, item_name, item_description, unit, required_pallets, proposed_pallets,
          confirmed_pallets, residual_pallets, sales_quantity, pallet_weight_lbs, line_weight_lbs,
          to_plt, to_lyr, to_sec, to_pcs, manual_planning_required, reason,
-         destination_location_id, destination_name, added_source, added_by, urgent, provisional
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,0,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17,$18,'manual',$19,$20,$21)`,
+         destination_location_id, destination_name, added_source, added_by,
+         urgent, urgency_level, urgency_score, provisional
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,0,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17,$18,'manual',$19,$20,$21,$22,$23)`,
       [proposal.rows[0].id, line.itemId, line.itemName, line.itemDescription, line.unit,
         line.requiredPallets, line.proposedPallets, line.salesQuantity, line.palletWeight,
         line.lineWeight, line.toPlt, line.toLyr, line.toSec, line.toPcs,
         line.manualPlanningRequired, JSON.stringify(line.reason || {}), line.destinationLocationId,
-        line.destinationName, draft.operatorId, Boolean(line.urgent), Boolean(line.provisional)]
+        line.destinationName, draft.operatorId, Boolean(line.urgent),
+        smartScmUrgencyLevel(line.urgencyLevel, line.urgent), urgencyScore(line.urgencyScore, line.urgent),
+        Boolean(line.provisional)]
     );
   }
   return Number(proposal.rows[0].id);
@@ -486,10 +577,14 @@ export async function groupSmartScmProposals(proposalIds = [], operatorId = null
     const palletProfile = palletOverrideProfile(selected, rawLines);
     const combined = [];
     rawLines.map((line) => draftLine(line, settings.physical_pallet_weight_lbs)).forEach((line) => combineLines(combined, line));
-    if (first.proposal_type === "PO" && new Set(combined.map((line) => line.destinationLocationId)).size > 2) {
-      throw Object.assign(new Error("A grouped PO truck may have at most two destination yards. Select loads with no more than two combined drops."), { status: 409 });
-    }
     const routeRule = await getSmartScmRouteRule(first.source_name);
+    const maximumDrops = routeRule.enabled === false
+      ? 2
+      : Math.max(1, Math.min(2, Number(routeRule.maxDrops) || 2));
+    if (first.proposal_type === "PO"
+      && new Set(combined.map((line) => line.destinationLocationId)).size > maximumDrops) {
+      throw Object.assign(new Error(`A grouped PO truck from ${first.source_name || "this source"} may have at most ${maximumDrops} destination${maximumDrops === 1 ? "" : "s"}. Select fewer combined drops.`), { status: 409 });
+    }
     const weightedCombined = applyPalletOverrideWeight(combined, palletProfile, settings.physical_pallet_weight_lbs);
     const allocations = smartScmAllocateProRata(weightedCombined, settings.truck_capacity_lbs);
     const allocationOverrides = distributePalletOverrides(palletProfile, allocations);
@@ -656,7 +751,7 @@ export async function recalculateSmartScmPoProposal(proposalId, operatorId = nul
   return getSmartScmPlanningRun(outcome.runId);
 }
 
-async function itemPolicy(itemId, destinationLocationId) {
+async function itemPolicy(itemId, destinationLocationId, { allowExcluded = false } = {}) {
   const result = await query(
     `SELECT item.item_id, item.item_name, item.item_description, item.stock_unit, item.vendor_id,
             COALESCE(NULLIF(item.vendor, ''), NULLIF(policy.vendor, '')) AS vendor,
@@ -679,8 +774,16 @@ async function itemPolicy(itemId, destinationLocationId) {
        JOIN scm_smart_item_policies policy ON policy.item_id = item.item_id
        JOIN scm_smart_item_yard_policies yard ON yard.item_id = item.item_id AND yard.location_id = $2 AND yard.eligible = true
        LEFT JOIN dispatch_vendor_yards vendor_yard ON vendor_yard.id = policy.vendor_yard_id
-      WHERE item.item_id = $1 AND policy.planning_enabled = true AND policy.inactive = false AND policy.discontinued = false`,
-    [Number(itemId), Number(destinationLocationId)]
+      WHERE item.item_id = $1 AND policy.planning_enabled = true AND policy.inactive = false AND policy.discontinued = false
+        AND ($3::boolean OR NOT EXISTS (
+          SELECT 1
+            FROM scm_smart_planning_exclusions exclusion
+           WHERE exclusion.item_id = item.item_id
+             AND exclusion.deactivated_at IS NULL
+             AND (exclusion.expires_at IS NULL OR exclusion.expires_at > now())
+        ))
+      FOR KEY SHARE OF policy`,
+    [Number(itemId), Number(destinationLocationId), allowExcluded]
   );
   return result.rows[0] || null;
 }
@@ -729,6 +832,14 @@ async function inventorySnapshot(itemId, locationId, toPlt) {
   };
 }
 
+export async function getSmartScmProposalItemPolicy(itemId, destinationLocationId, options = {}) {
+  return itemPolicy(itemId, destinationLocationId, options);
+}
+
+export async function getSmartScmProposalInventorySnapshot(itemId, locationId, toPlt) {
+  return inventorySnapshot(itemId, locationId, toPlt);
+}
+
 function manualProposalType(value) {
   const proposalType = text(value).toUpperCase();
   if (!new Set(["PO", "TO"]).has(proposalType)) {
@@ -757,11 +868,19 @@ export async function searchSmartScmManualLoadItems({
     throw Object.assign(new Error("TO source and destination yards must be different."), { status: 400 });
   }
   const params = [destination.locationId, `%${text(search)}%`, Math.min(30, Math.max(1, Number(limit) || 12))];
+  let planningExclusionClause = `AND NOT EXISTS (
+    SELECT 1
+      FROM scm_smart_planning_exclusions exclusion
+     WHERE exclusion.item_id = item.item_id
+       AND exclusion.deactivated_at IS NULL
+       AND (exclusion.expires_at IS NULL OR exclusion.expires_at > now())
+  )`;
   let compatibilityClause = `AND item.vendor_id IS NOT NULL
     AND COALESCE(NULLIF(vendor_yard.yard, ''), NULLIF(policy.vendor_yard, ''), NULLIF(policy.plant, ''),
                  NULLIF(item.vendor, ''), NULLIF(policy.vendor, '')) IS NOT NULL`;
   if (proposalType === "TO") {
     params.push(source.locationId);
+    planningExclusionClause = "";
     compatibilityClause = `AND EXISTS (
       SELECT 1 FROM scm_smart_item_yard_policies source_yard
        WHERE source_yard.item_id = item.item_id AND source_yard.location_id = $4 AND source_yard.eligible = true
@@ -781,6 +900,7 @@ export async function searchSmartScmManualLoadItems({
          ON yard.item_id = item.item_id AND yard.location_id = $1 AND yard.eligible = true
        LEFT JOIN dispatch_vendor_yards vendor_yard ON vendor_yard.id = policy.vendor_yard_id
       WHERE policy.planning_enabled = true AND policy.inactive = false AND policy.discontinued = false
+        ${planningExclusionClause}
         AND COALESCE(item.to_plt, policy.to_plt, 0) > 0
         AND (CASE WHEN COALESCE(item.item_weight, 0) > 0 AND COALESCE(item.to_plt, policy.to_plt, 0) > 0
                   THEN item.item_weight * COALESCE(item.to_plt, policy.to_plt) ELSE COALESCE(policy.pallet_weight_lbs, 0) END) > 0
@@ -826,7 +946,8 @@ export async function createSmartScmManualLoad(runId, values = {}, operatorId = 
   const outcome = await withTransaction(async () => {
     const run = await rawPlanningRun(targetRunId, { lock: true });
     assertReadyPlanningRun(run);
-    const item = await itemPolicy(itemId, destination.locationId);
+    const allowExcluded = proposalType === "TO";
+    const item = await itemPolicy(itemId, destination.locationId, { allowExcluded });
     if (!item) throw Object.assign(new Error("This item is not enabled for planning at the selected destination yard."), { status: 409 });
     const toPlt = positive(item.to_plt);
     const palletWeight = positive(item.pallet_weight_lbs);
@@ -834,7 +955,7 @@ export async function createSmartScmManualLoad(runId, values = {}, operatorId = 
       throw Object.assign(new Error("The selected item needs a pallet conversion and pallet weight."), { status: 409 });
     }
     if (proposalType === "TO") {
-      const sourcePolicy = await itemPolicy(itemId, source.locationId);
+      const sourcePolicy = await itemPolicy(itemId, source.locationId, { allowExcluded: true });
       if (!sourcePolicy) throw Object.assign(new Error("This item is not enabled for planning at the TO source yard."), { status: 409 });
     } else if (!Number.isInteger(Number(item.vendor_id)) || Number(item.vendor_id) <= 0) {
       throw Object.assign(new Error("This item has no NetSuite vendor ID. Refresh Item Master before creating a PO load."), { status: 409 });
@@ -849,10 +970,9 @@ export async function createSmartScmManualLoad(runId, values = {}, operatorId = 
     const lineWeight = round(pallets * palletWeight);
     const physicalPalletWeightLbs = positive(settings.physical_pallet_weight_lbs);
     const loadWeight = round(lineWeight + (pallets * physicalPalletWeightLbs));
-    if (proposalType === "TO" && loadWeight > positive(settings.truck_capacity_lbs) + EPSILON) {
-      throw Object.assign(new Error("This manual TO load would exceed the configured truck capacity."), { status: 409 });
-    }
-    const reason = {
+    const truckCapacityLbs = positive(settings.truck_capacity_lbs);
+    const manualCapacityOverride = proposalType === "TO" && loadWeight > truckCapacityLbs + EPSILON;
+    const reason = withManualCapacityEvidence({
       ...destinationInventory,
       sourceAvailablePallets: sourceInventory?.availablePallets ?? null,
       destinationAvailablePallets: destinationInventory.availablePallets,
@@ -862,7 +982,12 @@ export async function createSmartScmManualLoad(runId, values = {}, operatorId = 
       manualLoad: true,
       manualSourceFloorOverride: proposalType === "TO",
       physicalPalletWeightLbs
-    };
+    }, {
+      overCapacity: manualCapacityOverride,
+      source: "manual_load",
+      totalWeightLbs: loadWeight,
+      truckCapacityLbs
+    });
     const line = {
       itemId,
       itemName: item.item_name,
@@ -904,7 +1029,7 @@ export async function createSmartScmManualLoad(runId, values = {}, operatorId = 
       provisional: false,
       totalPallets: pallets,
       totalWeight: loadWeight,
-      utilization: round(loadWeight / positive(settings.truck_capacity_lbs)),
+      utilization: round(loadWeight / truckCapacityLbs),
       memo: `manually added ${proposalType} load · ${item.item_name}`,
       routeStops: [{ locationId: destination.locationId, name: destination.code, sequence: 1 }],
       lines: [line],
@@ -913,9 +1038,12 @@ export async function createSmartScmManualLoad(runId, values = {}, operatorId = 
     const revision = await recordRevision(targetRunId, "Manual proposal load added", {
       createdProposalId, proposalType, itemId, pallets,
       sourceLocationId: source?.locationId ?? null,
-      destinationLocationId: destination.locationId
+      destinationLocationId: destination.locationId,
+      totalWeightLbs: loadWeight,
+      truckCapacityLbs,
+      manualCapacityOverride
     }, operatorId);
-    return { createdProposalId, revision };
+    return { createdProposalId, revision, totalWeightLbs: loadWeight, truckCapacityLbs, manualCapacityOverride };
   });
   await writeAudit({
     actorOperatorId: operatorId,
@@ -946,6 +1074,13 @@ export async function searchSmartScmProposalItems(proposalId, { search = "", des
   const destination = proposal.proposal_type === "PO" ? Number(destinationLocationId || proposal.destination_location_id) : Number(proposal.destination_location_id);
   if (!YARD_BY_ID.has(destination)) throw Object.assign(new Error("Select a valid destination yard."), { status: 400 });
   const params = [destination, `%${term}%`, Math.min(30, Math.max(1, Number(limit) || 12))];
+  const planningExclusionClause = proposal.proposal_type === "PO" ? `AND NOT EXISTS (
+    SELECT 1
+      FROM scm_smart_planning_exclusions exclusion
+     WHERE exclusion.item_id = item.item_id
+       AND exclusion.deactivated_at IS NULL
+       AND (exclusion.expires_at IS NULL OR exclusion.expires_at > now())
+  )` : "";
   let vendorClause = "";
   if (proposal.proposal_type === "PO") {
     const vendor = await query(
@@ -969,6 +1104,7 @@ export async function searchSmartScmProposalItems(proposalId, { search = "", des
        JOIN scm_smart_item_policies policy ON policy.item_id = item.item_id
        JOIN scm_smart_item_yard_policies yard ON yard.item_id = item.item_id AND yard.location_id = $1 AND yard.eligible = true
       WHERE policy.planning_enabled = true AND policy.inactive = false AND policy.discontinued = false
+        ${planningExclusionClause}
         AND (item.item_name ILIKE $2 OR item.item_description ILIKE $2 OR item.item_id::text ILIKE $2)
         ${vendorClause}
       ORDER BY item.item_name, item.item_id LIMIT $3`,
@@ -994,7 +1130,8 @@ export async function addSmartScmProposalLine(proposalId, values = {}, operatorI
       : Number(proposal.destination_location_id);
     const yard = YARD_BY_ID.get(destinationLocationId);
     if (!yard) throw Object.assign(new Error("Select a valid destination yard."), { status: 400 });
-    const item = await itemPolicy(itemId, destinationLocationId);
+    const allowExcluded = proposal.proposal_type === "TO";
+    const item = await itemPolicy(itemId, destinationLocationId, { allowExcluded });
     if (!item) throw Object.assign(new Error("This item is not enabled for planning at the selected destination yard."), { status: 409 });
     const toPlt = positive(item.to_plt);
     const palletWeight = positive(item.pallet_weight_lbs);
@@ -1009,7 +1146,7 @@ export async function addSmartScmProposalLine(proposalId, values = {}, operatorI
       }
     }
     if (proposal.proposal_type === "TO") {
-      const sourcePolicy = await itemPolicy(itemId, proposal.source_location_id);
+      const sourcePolicy = await itemPolicy(itemId, proposal.source_location_id, { allowExcluded: true });
       if (!sourcePolicy) throw Object.assign(new Error("This item is not enabled at the TO source yard."), { status: 409 });
     }
     const [destinationInventory, sourceInventory, settings] = await Promise.all([
@@ -1033,10 +1170,10 @@ export async function addSmartScmProposalLine(proposalId, values = {}, operatorI
         proposed_pallets: pallets, pallet_weight_lbs: palletWeight, line_weight_lbs: addedWeight
       }];
     const candidateWeight = proposalLoadWeight(candidateLines, proposal.pallet_quantity_overrides, physicalPalletWeightLbs);
-    if (proposal.proposal_type !== "PO" && candidateWeight > positive(settings.truck_capacity_lbs) + EPSILON) {
-      throw Object.assign(new Error("Adding this quantity would exceed the configured truck capacity."), { status: 409 });
-    }
-    const reason = {
+    const truckCapacityLbs = positive(settings.truck_capacity_lbs);
+    const manualCapacityOverride = proposal.proposal_type === "TO"
+      && candidateWeight > truckCapacityLbs + EPSILON;
+    const reason = withManualCapacityEvidence({
       ...destinationInventory,
       sourceAvailablePallets: sourceInventory?.availablePallets ?? null,
       destinationAvailablePallets: destinationInventory.availablePallets,
@@ -1044,7 +1181,12 @@ export async function addSmartScmProposalLine(proposalId, values = {}, operatorI
       manuallyAdded: true,
       manualSourceFloorOverride: proposal.proposal_type === "TO",
       physicalPalletWeightLbs
-    };
+    }, {
+      overCapacity: manualCapacityOverride,
+      source: "proposal_line_add",
+      totalWeightLbs: candidateWeight,
+      truckCapacityLbs
+    });
     await query(
       `INSERT INTO scm_smart_proposal_lines (
          proposal_id, item_id, item_name, item_description, unit, required_pallets, proposed_pallets,
@@ -1064,8 +1206,22 @@ export async function addSmartScmProposalLine(proposalId, values = {}, operatorI
         positive(item.to_sec), positive(item.to_pcs), JSON.stringify(reason), destinationLocationId, yard.code, operatorId]
     );
     await updateDerivedProposal(id);
-    const revision = await recordRevision(proposal.run_id, "Proposal line added", { proposalId: id, itemId, pallets, destinationLocationId }, operatorId);
-    return { runId: Number(proposal.run_id), revision };
+    const revision = await recordRevision(proposal.run_id, "Proposal line added", {
+      proposalId: id,
+      itemId,
+      pallets,
+      destinationLocationId,
+      totalWeightLbs: candidateWeight,
+      truckCapacityLbs,
+      manualCapacityOverride
+    }, operatorId);
+    return {
+      runId: Number(proposal.run_id),
+      revision,
+      totalWeightLbs: candidateWeight,
+      truckCapacityLbs,
+      manualCapacityOverride
+    };
   });
   await writeAudit({ actorOperatorId: operatorId, source: "smart_scm", action: "smart_scm.proposal_line.add", details: { proposalId: id, itemId, pallets, ...result } });
   return getSmartScmProposal(id);
@@ -1106,7 +1262,7 @@ export async function updateSmartScmProposalLine(proposalId, lineId, values = {}
     };
     if (proposal.proposal_type === "PO") {
       const yard = YARD_BY_ID.get(destinationLocationId);
-      const policy = await itemPolicy(line.item_id, destinationLocationId);
+      const policy = await itemPolicy(line.item_id, destinationLocationId, { allowExcluded: true });
       if (!policy) {
         throw Object.assign(new Error(`${line.item_name} is not enabled for Smart SCM planning at ${yard.code}.`), { status: 409 });
       }
@@ -1178,9 +1334,15 @@ export async function updateSmartScmProposalLine(proposalId, lineId, values = {}
       destination_name: destinationName
     } : current);
     const proposalWeight = proposalLoadWeight(candidateLines, proposal.pallet_quantity_overrides, physicalPalletWeightLbs);
-    if (proposal.proposal_type !== "PO" && proposalWeight > positive(settings.truck_capacity_lbs) + EPSILON) {
-      throw Object.assign(new Error("This quantity would exceed the configured truck capacity."), { status: 409 });
-    }
+    const truckCapacityLbs = positive(settings.truck_capacity_lbs);
+    const manualCapacityOverride = proposal.proposal_type === "TO"
+      && proposalWeight > truckCapacityLbs + EPSILON;
+    reason = withManualCapacityEvidence(reason, {
+      overCapacity: manualCapacityOverride,
+      source: "proposal_line_update",
+      totalWeightLbs: proposalWeight,
+      truckCapacityLbs
+    });
     await query(
       `UPDATE scm_smart_proposal_lines
           SET proposed_pallets = $3, residual_pallets = $3, confirmed_pallets = 0,
@@ -1200,9 +1362,20 @@ export async function updateSmartScmProposalLine(proposalId, lineId, values = {}
       beforePallets: positive(line.proposed_pallets),
       afterPallets: pallets,
       beforeDestinationLocationId,
-      destinationLocationId
+      destinationLocationId,
+      totalWeightLbs: proposalWeight,
+      truckCapacityLbs,
+      manualCapacityOverride
     }, operatorId);
-    return { runId: Number(proposal.run_id), revision, beforeDestinationLocationId, destinationLocationId };
+    return {
+      runId: Number(proposal.run_id),
+      revision,
+      beforeDestinationLocationId,
+      destinationLocationId,
+      totalWeightLbs: proposalWeight,
+      truckCapacityLbs,
+      manualCapacityOverride
+    };
   });
   await writeAudit({ actorOperatorId: operatorId, source: "smart_scm", action: "smart_scm.proposal_line.update", details: { proposalId: id, lineId: targetLineId, pallets, ...outcome } });
   return getSmartScmProposal(id);

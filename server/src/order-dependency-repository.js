@@ -38,13 +38,24 @@ function text(value) {
   return String(value ?? "").trim();
 }
 
+function dateText(value) {
+  if (!value) return "";
+  if (value instanceof Date) return value.toISOString().slice(0, 10);
+  return String(value).slice(0, 10);
+}
+
+function normalizedToken(value) {
+  return text(value).replace(/\s+/g, "").toUpperCase();
+}
+
 function normalizeMode(value) {
   return value === "direct_to_customer" ? "direct_to_customer" : "yard_replenishment";
 }
 
 function terminalTransferOrderStatus(row = {}) {
-  const status = text(row.transfer_status ?? row.status).toUpperCase();
-  const statusText = text(row.transfer_status_text ?? row.status_text);
+  const transfer = row || {};
+  const status = text(transfer.transfer_status ?? transfer.status).toUpperCase();
+  const statusText = text(transfer.transfer_status_text ?? transfer.status_text);
   const combined = `${status} ${statusText}`;
   if (status === "H" || /closed|cancel/i.test(combined)) return statusText || "Closed";
   if (status === "C" || /reject/i.test(combined)) return statusText || "Rejected";
@@ -474,6 +485,447 @@ export async function getSalesOrderDependencyExecutionBlock(orderRefs = []) {
   };
 }
 
+export async function completeYardDependenciesForTransferDrop({
+  transferOrderRefs = [],
+  driverJobId,
+  driverLogin = "",
+  planId = null,
+  planDate = "",
+  truckPlate = "",
+  loadId = "",
+  loadName = "",
+  destinationLocationId = null,
+  expectedSourceOfflineEventId = "",
+  requireAppliedEvidence = false,
+  completedBefore = null,
+  beforeDeviceId = "",
+  beforeClientSequence = null,
+  salesOrderRefs = []
+} = {}) {
+  const refs = [...new Set((transferOrderRefs || []).map(text).filter(Boolean))];
+  const targetRefs = [...new Set((salesOrderRefs || []).map(text).filter(Boolean))];
+  const jobId = text(driverJobId);
+  if (!refs.length || !jobId) return { completed: [], alreadyCompleted: [], skipped: [] };
+
+  return withTransaction(async () => {
+    const completedJobResult = await query(
+      `SELECT r.job_id, r.plan_id, r.plan_date, r.driver_login, r.truck_id, r.truck_plate,
+              r.load_id, r.load_name, r.stop_id, r.stop_type, r.order_refs,
+              r.photo_data_urls, r.completed_at, r.source_offline_event_id::text,
+              r.job_details, e.status AS source_event_status, e.device_id AS source_device_id,
+              e.client_sequence AS source_client_sequence
+         FROM driver_job_records r
+         LEFT JOIN driver_offline_events e ON e.event_id = r.source_offline_event_id
+        WHERE r.job_id = $1
+          AND r.status = 'complete'
+        LIMIT 1
+        FOR UPDATE OF r`,
+      [jobId]
+    );
+    if (!completedJobResult.rowCount || completedJobResult.rows[0].stop_type !== "dropoff") {
+      throw new Error("Yard replenishment delivery requires a completed transfer drop job.");
+    }
+    const completedJob = completedJobResult.rows[0];
+    const completedRefs = new Set((completedJob.order_refs || []).map(text).filter(Boolean));
+    const matchingRefs = refs.filter((ref) => completedRefs.has(ref));
+    if (!matchingRefs.length) {
+      throw new Error("The completed transfer drop does not contain the expected Transfer Order.");
+    }
+    if (driverLogin && text(completedJob.driver_login).toLowerCase() !== text(driverLogin).toLowerCase()) {
+      throw new Error("The completed transfer drop belongs to another driver.");
+    }
+    if (planId !== null && planId !== undefined && text(completedJob.plan_id) !== text(planId)) {
+      throw new Error("The completed transfer drop belongs to another dispatch plan.");
+    }
+    if (planDate && dateText(completedJob.plan_date) !== dateText(planDate)) {
+      throw new Error("The completed transfer drop belongs to another plan date.");
+    }
+    if (truckPlate && normalizedToken(completedJob.truck_plate) !== normalizedToken(truckPlate)) {
+      throw new Error("The completed transfer drop belongs to another truck.");
+    }
+    if (loadId && text(completedJob.load_id) !== text(loadId)) {
+      throw new Error("The completed transfer drop belongs to another load.");
+    }
+    const sourceEventId = text(completedJob.source_offline_event_id);
+    if (
+      expectedSourceOfflineEventId
+      && sourceEventId !== text(expectedSourceOfflineEventId)
+    ) {
+      throw new Error("The completed transfer drop is linked to another offline event.");
+    }
+
+    const skipped = [];
+    if (requireAppliedEvidence) {
+      const photoCount = Array.isArray(completedJob.photo_data_urls)
+        ? completedJob.photo_data_urls.length
+        : 0;
+      if (photoCount < 2) {
+        skipped.push({
+          driverJobId: jobId,
+          reason: "completed_transfer_drop_photos_missing"
+        });
+      }
+      if (sourceEventId && completedJob.source_event_status !== "applied") {
+        skipped.push({
+          driverJobId: jobId,
+          reason: "completed_transfer_drop_event_not_applied"
+        });
+      }
+      const cutoff = completedBefore ? new Date(completedBefore) : null;
+      if (
+        cutoff
+        && Number.isFinite(cutoff.getTime())
+        && completedJob.completed_at
+        && new Date(completedJob.completed_at).getTime() > cutoff.getTime()
+      ) {
+        skipped.push({
+          driverJobId: jobId,
+          reason: "completed_transfer_drop_occurs_after_start"
+        });
+      }
+      if (
+        beforeDeviceId
+        && completedJob.source_device_id === beforeDeviceId
+        && beforeClientSequence !== null
+        && beforeClientSequence !== undefined
+        && beforeClientSequence !== ""
+        && Number.isFinite(Number(beforeClientSequence))
+        && Number(completedJob.source_client_sequence) >= Number(beforeClientSequence)
+      ) {
+        skipped.push({
+          driverJobId: jobId,
+          reason: "completed_transfer_drop_sequence_not_prior"
+        });
+      }
+      if (skipped.length) return { completed: [], alreadyCompleted: [], skipped };
+    }
+
+    const dependencies = await query(
+      `SELECT d.*, t.receiving_status AS transfer_receiving_status,
+              t.netsuite_active AS transfer_active,
+              t.status AS transfer_status, t.status_text AS transfer_status_text
+         FROM order_dependencies d
+         JOIN transfer_orders t ON t.netsuite_id = d.transfer_order_id
+        WHERE d.transfer_order_ref = ANY($1::text[])
+          AND d.dependency_mode = 'yard_replenishment'
+          AND d.status <> 'cancelled'
+          AND (
+            cardinality($2::text[]) = 0
+            OR d.dispatch_target_ref = ANY($2::text[])
+            OR d.sales_order_ref = ANY($2::text[])
+          )
+        ORDER BY d.id
+        FOR UPDATE OF d`,
+      [matchingRefs, targetRefs]
+    );
+    const completed = [];
+    const alreadyCompleted = [];
+    const recordedDestinationId = text(completedJob.job_details?.destinationLocationId);
+    const recordedDestinationLabel = text(
+      completedJob.job_details?.dropLocation || completedJob.job_details?.location
+    );
+    const expectedDestinationId = text(destinationLocationId);
+
+    for (const dependency of dependencies.rows) {
+      const prior = await query(
+        `SELECT driver_job_id, result
+           FROM order_dependency_receipts
+          WHERE dependency_id = $1
+            AND result ->> 'reason' = 'yard_replenishment_physical_delivery'
+          ORDER BY id
+          LIMIT 1`,
+        [dependency.id]
+      );
+      if (prior.rowCount) {
+        alreadyCompleted.push({
+          dependencyId: dependency.id,
+          transferOrderRef: dependency.transfer_order_ref,
+          driverJobId: prior.rows[0].driver_job_id,
+          result: prior.rows[0].result
+        });
+        continue;
+      }
+      if (dependency.status === "received_local") {
+        alreadyCompleted.push({
+          dependencyId: dependency.id,
+          transferOrderRef: dependency.transfer_order_ref,
+          driverJobId: jobId,
+          result: null
+        });
+        continue;
+      }
+      const formalReceiptComplete = ["received", "completed", "shipped"].includes(
+        text(dependency.transfer_receiving_status).toLowerCase()
+      );
+      if (dependency.status === "attention") {
+        skipped.push({
+          dependencyId: dependency.id,
+          transferOrderRef: dependency.transfer_order_ref,
+          driverJobId: jobId,
+          reason: "dependency_requires_attention"
+        });
+        continue;
+      }
+      const terminalStatus = terminalTransferOrderStatus(dependency);
+      if (!formalReceiptComplete && (dependency.transfer_active === false || terminalStatus)) {
+        skipped.push({
+          dependencyId: dependency.id,
+          transferOrderRef: dependency.transfer_order_ref,
+          driverJobId: jobId,
+          reason: terminalStatus ? "transfer_order_terminal" : "transfer_order_inactive"
+        });
+        continue;
+      }
+      if (
+        dependency.planned_plan_id !== null
+        && completedJob.plan_id !== null
+        && text(dependency.planned_plan_id) !== text(completedJob.plan_id)
+      ) {
+        skipped.push({
+          dependencyId: dependency.id,
+          transferOrderRef: dependency.transfer_order_ref,
+          driverJobId: jobId,
+          reason: "dependency_plan_mismatch"
+        });
+        continue;
+      }
+      if (
+        dependency.planned_date
+        && completedJob.plan_date
+        && dateText(dependency.planned_date) !== dateText(completedJob.plan_date)
+      ) {
+        skipped.push({
+          dependencyId: dependency.id,
+          transferOrderRef: dependency.transfer_order_ref,
+          driverJobId: jobId,
+          reason: "dependency_plan_date_mismatch"
+        });
+        continue;
+      }
+      const dependencyDestinationId = text(dependency.accounting_destination_location_id);
+      const dependencyDestinationLabel = text(dependency.accounting_destination_location);
+      const actualDestinationId = recordedDestinationId || expectedDestinationId;
+      if (
+        dependencyDestinationId
+        && actualDestinationId
+        && dependencyDestinationId !== actualDestinationId
+      ) {
+        skipped.push({
+          dependencyId: dependency.id,
+          transferOrderRef: dependency.transfer_order_ref,
+          driverJobId: jobId,
+          reason: "dependency_destination_mismatch"
+        });
+        continue;
+      }
+      if (
+        !actualDestinationId
+        && dependencyDestinationLabel
+        && recordedDestinationLabel
+        && normalizedToken(dependencyDestinationLabel) !== normalizedToken(recordedDestinationLabel)
+      ) {
+        skipped.push({
+          dependencyId: dependency.id,
+          transferOrderRef: dependency.transfer_order_ref,
+          driverJobId: jobId,
+          reason: "dependency_destination_mismatch"
+        });
+        continue;
+      }
+
+      const lines = await query(
+        `SELECT id, allocated_quantity, delivered_quantity
+           FROM order_dependency_lines
+          WHERE dependency_id = $1
+          ORDER BY id
+          FOR UPDATE`,
+        [dependency.id]
+      );
+      const deliveredQuantity = Number(lines.rows.reduce(
+        (total, line) => total + number(line.allocated_quantity),
+        0
+      ).toFixed(6));
+      await query(
+        `UPDATE order_dependency_lines
+            SET delivered_quantity = GREATEST(
+                  COALESCE(delivered_quantity, 0),
+                  allocated_quantity
+                ),
+                updated_at = now()
+          WHERE dependency_id = $1`,
+        [dependency.id]
+      );
+      const updatedDependency = await query(
+        `UPDATE order_dependencies
+            SET status = 'delivered',
+                local_completed_at = COALESCE(local_completed_at, $2::timestamptz, now()),
+                reconciliation_status = CASE
+                  WHEN $3 THEN CASE
+                    WHEN reconciliation_status = 'reconciled' THEN 'reconciled'
+                    ELSE 'not_required'
+                  END
+                  ELSE 'required'
+                END,
+                reconciled_at = CASE WHEN $3 THEN reconciled_at ELSE null END,
+                updated_at = now()
+          WHERE id = $1
+          RETURNING status, reconciliation_status`,
+        [dependency.id, completedJob.completed_at, formalReceiptComplete]
+      );
+      const persistedReconciliationStatus = updatedDependency.rows[0]?.reconciliation_status
+        || (formalReceiptComplete ? "not_required" : "required");
+      const result = {
+        dependencyId: dependency.id,
+        salesOrderRef: dependency.dispatch_target_ref || dependency.sales_order_ref,
+        transferOrderRef: dependency.transfer_order_ref,
+        deliveredQuantity,
+        reason: "yard_replenishment_physical_delivery",
+        physicalDeliveryOnly: true,
+        formalReceiptPending: !formalReceiptComplete,
+        driverJobId: jobId,
+        sourceOfflineEventId: sourceEventId || "",
+        transferDropStopId: completedJob.stop_id || ""
+      };
+      const receipt = await query(
+        `INSERT INTO order_dependency_receipts (
+           dependency_id, driver_job_id, sales_order_ref, transfer_order_ref,
+           plan_id, plan_date, truck_plate, load_id, load_name, received_quantity, result
+         ) VALUES ($1, $2, $3, $4, $5, $6::date, $7, $8, $9, $10, $11::jsonb)
+         ON CONFLICT (dependency_id, driver_job_id) DO NOTHING
+         RETURNING id`,
+        [
+          dependency.id,
+          jobId,
+          dependency.dispatch_target_ref || dependency.sales_order_ref,
+          dependency.transfer_order_ref,
+          completedJob.plan_id,
+          completedJob.plan_date,
+          completedJob.truck_plate,
+          completedJob.load_id,
+          completedJob.load_name || loadName || "",
+          deliveredQuantity,
+          JSON.stringify(result)
+        ]
+      );
+      if (!receipt.rowCount) {
+        const existing = await query(
+          `SELECT driver_job_id, result
+             FROM order_dependency_receipts
+            WHERE dependency_id = $1 AND driver_job_id = $2`,
+          [dependency.id, jobId]
+        );
+        alreadyCompleted.push({
+          dependencyId: dependency.id,
+          transferOrderRef: dependency.transfer_order_ref,
+          driverJobId: existing.rows[0]?.driver_job_id || jobId,
+          result: existing.rows[0]?.result || result
+        });
+        continue;
+      }
+      await writeDispatchAudit({
+        action: "driver.yard_replenishment.delivered",
+        source: "driver",
+        entityType: "order_dependency",
+        entityId: String(dependency.id),
+        orderId: dependency.transfer_order_ref,
+        loadId: completedJob.load_id,
+        truckId: completedJob.truck_id || completedJob.truck_plate,
+        planId: completedJob.plan_id,
+        planDate: dateText(completedJob.plan_date),
+        before: {
+          status: dependency.status,
+          reconciliationStatus: dependency.reconciliation_status
+        },
+        after: {
+          status: "delivered",
+          reconciliationStatus: persistedReconciliationStatus
+        },
+        details: {
+          driverJobId: jobId,
+          driverLogin: completedJob.driver_login,
+          sourceOfflineEventId: sourceEventId || "",
+          salesOrderRef: dependency.dispatch_target_ref || dependency.sales_order_ref,
+          transferOrderRef: dependency.transfer_order_ref,
+          deliveredQuantity,
+          physicalDeliveryOnly: true,
+          formalReceivingStatusUnchanged: dependency.transfer_receiving_status || ""
+        }
+      });
+      completed.push(result);
+    }
+    return { completed, alreadyCompleted, skipped };
+  });
+}
+
+export async function reconcileCompletedYardTransfersForSalesOrderStart({
+  salesOrderRefs = [],
+  currentJob = null,
+  routeJobs = [],
+  driverLogin = "",
+  event = null
+} = {}) {
+  const refs = [...new Set((salesOrderRefs || []).map(text).filter(Boolean))];
+  const jobs = Array.isArray(routeJobs) ? routeJobs : [];
+  if (!refs.length || !currentJob?.jobId || !jobs.length) {
+    return { completed: [], alreadyCompleted: [], skipped: [] };
+  }
+  const currentIndex = jobs.findIndex((job) => text(job?.jobId) === text(currentJob.jobId));
+  if (currentIndex <= 0) return { completed: [], alreadyCompleted: [], skipped: [] };
+
+  const blocking = await query(
+    `SELECT d.transfer_order_ref
+       FROM order_dependencies d
+       JOIN transfer_orders t ON t.netsuite_id = d.transfer_order_id
+      WHERE (d.dispatch_target_ref = ANY($1::text[]) OR d.sales_order_ref = ANY($1::text[]))
+        AND d.dependency_mode = 'yard_replenishment'
+        AND d.status NOT IN ('cancelled', 'attention', 'delivered', 'received_local')
+        AND NOT (
+          LOWER(COALESCE(t.receiving_status, '')) IN ('received', 'completed', 'shipped')
+        )
+      ORDER BY d.id`,
+    [refs]
+  );
+  if (!blocking.rowCount) return { completed: [], alreadyCompleted: [], skipped: [] };
+  const requiredTransfers = new Set(blocking.rows.map((row) => text(row.transfer_order_ref)));
+  const currentPlanId = text(currentJob.planId);
+  const currentPlanDate = dateText(currentJob.planDate);
+  const currentDriver = text(driverLogin || currentJob.driverLogin).toLowerCase();
+  const candidates = jobs.slice(0, currentIndex).filter((job) =>
+    job?.stopType === "dropoff"
+    && text(job.planId) === currentPlanId
+    && dateText(job.planDate) === currentPlanDate
+    && text(job.driverLogin).toLowerCase() === currentDriver
+    && (job.orderRefs || []).some((ref) => requiredTransfers.has(text(ref)))
+  );
+  const aggregate = { completed: [], alreadyCompleted: [], skipped: [] };
+  for (const candidate of candidates) {
+    const transferRefs = (candidate.orderRefs || [])
+      .map(text)
+      .filter((ref) => requiredTransfers.has(ref));
+    if (!transferRefs.length) continue;
+    const applied = await completeYardDependenciesForTransferDrop({
+      transferOrderRefs: transferRefs,
+      driverJobId: candidate.jobId,
+      driverLogin: currentDriver,
+      planId: candidate.planId,
+      planDate: candidate.planDate,
+      truckPlate: candidate.truckPlate,
+      loadId: candidate.loadId,
+      loadName: candidate.loadName,
+      destinationLocationId: candidate.destinationLocationId,
+      requireAppliedEvidence: true,
+      completedBefore: event?.occurredAt || currentJob.startedAt || new Date().toISOString(),
+      beforeDeviceId: event?.deviceId || "",
+      beforeClientSequence: event?.clientSequence ?? null,
+      salesOrderRefs: refs
+    });
+    aggregate.completed.push(...applied.completed);
+    aggregate.alreadyCompleted.push(...applied.alreadyCompleted);
+    aggregate.skipped.push(...applied.skipped);
+  }
+  return aggregate;
+}
+
 export async function getDirectPickupDependencyExecutionBlock(transferOrderRefs = []) {
   const refs = [...new Set((transferOrderRefs || []).map(text).filter(Boolean))];
   if (!refs.length) return null;
@@ -565,6 +1017,7 @@ export async function syncDirectDependencyOperatorProgress(transferOrderId) {
 
 export async function getOrderDependencyOptions({ dispatchTargetRef = "", salesOrderRef = "", transferOrderRef = "", planDate = "" } = {}) {
   const targetRef = text(dispatchTargetRef || salesOrderRef);
+  const existingLinks = targetRef ? await loadDependencies({ salesOrderRef: targetRef }) : [];
   const transferOrders = await query(
     `SELECT t.netsuite_id, t.tranid, t.from_location, t.to_location,
             t.dispatch_planned, t.fulfillment_status, t.status, t.status_text,
@@ -584,13 +1037,22 @@ export async function getOrderDependencyOptions({ dispatchTargetRef = "", salesO
     : null;
   const requestedTerminalStatus = terminalTransferOrderStatus(requestedTransfer);
   const transfer = requestedTerminalStatus ? null : requestedTransfer;
-  const resolved = targetRef
-    ? await resolveDispatchSalesTarget({ dispatchTargetRef: targetRef, planDate })
-    : null;
+  let resolved = null;
+  let targetResolutionError = "";
+  if (targetRef) {
+    try {
+      resolved = await resolveDispatchSalesTarget({ dispatchTargetRef: targetRef, planDate });
+    } catch (error) {
+      if (!existingLinks.length) throw error;
+      targetResolutionError = text(error?.message || error);
+    }
+  }
   let matchingLines = [];
-  let matchError = requestedTerminalStatus
-    ? `${text(transferOrderRef)} is ${requestedTerminalStatus} and cannot be linked.`
-    : "";
+  let matchError = targetResolutionError
+    ? `${targetRef} is no longer available in the selected dispatch plan. Existing links can still be unlinked, but new links are disabled.`
+    : requestedTerminalStatus
+      ? `${text(transferOrderRef)} is ${requestedTerminalStatus} and cannot be linked.`
+      : "";
   if (transferOrderRef && !transfer && !requestedTerminalStatus) matchError = `Transfer Order ${text(transferOrderRef)} was not found.`;
   if (resolved && transfer) {
     const transferLines = await query(
@@ -656,7 +1118,6 @@ export async function getOrderDependencyOptions({ dispatchTargetRef = "", salesO
       }
     }
   }
-  const existingLinks = targetRef ? await loadDependencies({ salesOrderRef: targetRef }) : [];
   return {
     dispatchTargetRef: resolved?.target?.ref || targetRef,
     dispatchTargetKind: resolved?.target?.kind || "normal",
@@ -682,6 +1143,8 @@ export async function getOrderDependencyOptions({ dispatchTargetRef = "", salesO
     })),
     matchingLines,
     matchError,
+    targetUnavailable: Boolean(targetResolutionError),
+    targetResolutionError,
     existingLinks
   };
 }
@@ -2691,6 +3154,8 @@ export async function createOrderDependency({
       entityType: "order_dependency",
       entityId: String(inserted.rows[0].id),
       orderId: resolved.target.ref,
+      planId: resolved.target.planId || null,
+      planDate: resolved.target.planDate || planDate || null,
       operatorId,
       details: {
         transferOrderRef: transfer.rows[0].tranid,
@@ -2704,28 +3169,153 @@ export async function createOrderDependency({
   });
 }
 
-export async function updateOrderDependencyMode(dependencyId, mode, operatorId = null) {
-  const normalizedMode = normalizeMode(mode);
+async function loadDependencyMutationContext(
+  dependencyId,
+  requestedPlanDate,
+  { allowHistoricalGroupTarget = false } = {}
+) {
   const result = await query(
-    `UPDATE order_dependencies
-        SET dependency_mode = $2, same_load_required = ($2 = 'direct_to_customer'),
-            updated_by = $3, updated_at = now()
+    `SELECT id, status, dispatch_target_ref, dispatch_target_kind,
+            planned_plan_id, planned_date::text AS planned_date
+       FROM order_dependencies
       WHERE id = $1
-        AND status IN ('active', 'attention')
-        AND NOT EXISTS (
-          SELECT 1 FROM order_dependency_lines l
-           WHERE l.dependency_id = order_dependencies.id
-             AND (l.loaded_quantity > 0 OR l.delivered_quantity > 0 OR l.locally_received_quantity > 0)
-        )
-      RETURNING *`,
-    [Number(dependencyId), normalizedMode, operatorId]
+      FOR UPDATE`,
+    [Number(dependencyId)]
   );
-  if (!result.rowCount) throw new Error("This dependency has already started and its mode cannot be changed.");
-  return (await loadDependencies({ salesOrderRef: result.rows[0].dispatch_target_ref || result.rows[0].sales_order_ref })).find((row) => String(row.id) === String(dependencyId));
+  if (!result.rowCount) {
+    const error = new Error("Order dependency was not found.");
+    error.status = 404;
+    throw error;
+  }
+  const dependency = result.rows[0];
+  if (
+    dependency.status === "cancelled"
+    || dependency.dispatch_target_kind !== "group"
+    || !["active", "attention"].includes(dependency.status)
+  ) {
+    return dependency;
+  }
+  const requestedDate = dispatchPlanDateKey(requestedPlanDate);
+  if (!requestedDate) {
+    const error = new Error("Load the owning dispatch plan before changing this grouped dependency.");
+    error.status = 409;
+    error.code = "ORDER_DEPENDENCY_PLAN_MISMATCH";
+    throw error;
+  }
+  const currentTarget = await query(
+    `SELECT plan_id, plan_date
+       FROM (
+         SELECT plan.id AS plan_id, plan.plan_date::text AS plan_date, 1 AS priority
+           FROM dispatch_plans plan
+           JOIN dispatch_plan_snapshots snapshot ON snapshot.plan_id = plan.id
+          WHERE plan.status <> 'cancelled'
+            AND plan.plan_date = $2::date
+            AND EXISTS (
+              SELECT 1
+                FROM jsonb_array_elements(COALESCE(snapshot.orders, '[]'::jsonb)) candidate
+               WHERE candidate ->> 'id' = $1
+            )
+         UNION ALL
+         SELECT projected.plan_id, projected.plan_date::text, 2 AS priority
+           FROM dispatch_delivery_groups projected
+          WHERE projected.group_ref = $1
+            AND projected.active = true
+            AND projected.plan_date = $2::date
+       ) owned
+      ORDER BY priority
+      LIMIT 1`,
+    [dependency.dispatch_target_ref, requestedDate]
+  );
+  if (currentTarget.rowCount) return dependency;
+
+  let ownerDate = "";
+  if (allowHistoricalGroupTarget) {
+    const currentProjection = await query(
+      `SELECT plan_date::text AS plan_date
+         FROM dispatch_delivery_groups
+        WHERE group_ref = $1 AND active = true
+        LIMIT 1`,
+      [dependency.dispatch_target_ref]
+    );
+    ownerDate = dispatchPlanDateKey(currentProjection.rows[0]?.plan_date);
+    if (!ownerDate) ownerDate = dispatchPlanDateKey(dependency.planned_date);
+    if (!ownerDate) {
+      const auditOwner = await query(
+        `SELECT plan_date::text AS plan_date
+           FROM dispatch_audit_log
+          WHERE entity_type = 'order_dependency'
+            AND entity_id = $1
+            AND order_id = $2
+            AND action IN (
+              'dispatch.order_dependency.group_target_moved',
+              'dispatch.order_dependency.linked'
+            )
+            AND plan_date IS NOT NULL
+          ORDER BY created_at DESC, id DESC
+          LIMIT 1`,
+        [String(dependency.id), dependency.dispatch_target_ref]
+      );
+      ownerDate = dispatchPlanDateKey(auditOwner.rows[0]?.plan_date);
+    }
+    if (ownerDate === requestedDate) return dependency;
+  }
+  const ownerHint = ownerDate
+    ? ` It belongs to the ${ownerDate} plan.`
+    : "";
+  const error = new Error(
+    allowHistoricalGroupTarget
+      ? `This grouped dependency cannot be changed from the selected dispatch plan.${ownerHint} Load its owning plan and try again.`
+      : "This grouped order is no longer available in the selected dispatch plan. Its dependency mode cannot be changed."
+  );
+  error.status = 409;
+  error.code = allowHistoricalGroupTarget
+    ? "ORDER_DEPENDENCY_PLAN_MISMATCH"
+    : "ORDER_DEPENDENCY_TARGET_UNAVAILABLE";
+  throw error;
 }
 
-export async function cancelOrderDependency(dependencyId, operatorId = null) {
+export async function updateOrderDependencyMode(
+  dependencyId,
+  mode,
+  operatorId = null,
+  planDate = ""
+) {
   return withTransaction(async () => {
+    await loadDependencyMutationContext(dependencyId, planDate);
+    const normalizedMode = normalizeMode(mode);
+    const result = await query(
+      `UPDATE order_dependencies
+          SET dependency_mode = $2, same_load_required = ($2 = 'direct_to_customer'),
+              updated_by = $3, updated_at = now()
+        WHERE id = $1
+          AND status IN ('active', 'attention')
+          AND NOT EXISTS (
+            SELECT 1 FROM order_dependency_lines l
+             WHERE l.dependency_id = order_dependencies.id
+               AND (l.loaded_quantity > 0 OR l.delivered_quantity > 0 OR l.locally_received_quantity > 0)
+          )
+        RETURNING *`,
+      [Number(dependencyId), normalizedMode, operatorId]
+    );
+    if (!result.rowCount) throw new Error("This dependency has already started and its mode cannot be changed.");
+    return (await loadDependencies({ salesOrderRef: result.rows[0].dispatch_target_ref || result.rows[0].sales_order_ref })).find((row) => String(row.id) === String(dependencyId));
+  });
+}
+
+export async function cancelOrderDependency(
+  dependencyId,
+  operatorId = null,
+  planDate = ""
+) {
+  return withTransaction(async () => {
+    const context = await loadDependencyMutationContext(
+      dependencyId,
+      planDate,
+      { allowHistoricalGroupTarget: true }
+    );
+    if (context.status === "cancelled") {
+      return { cancelled: true, id: Number(dependencyId), alreadyCancelled: true };
+    }
     const result = await query(
       `UPDATE order_dependencies
           SET status = 'cancelled', updated_by = $2, updated_at = now()
@@ -2739,7 +3329,30 @@ export async function cancelOrderDependency(dependencyId, operatorId = null) {
         RETURNING *`,
       [Number(dependencyId), operatorId]
     );
-    if (!result.rowCount) throw new Error("This dependency has already started and cannot be unlinked.");
+    if (!result.rowCount) {
+      const existing = await query(
+        `SELECT id, status,
+                EXISTS (
+                  SELECT 1
+                    FROM order_dependency_lines line
+                   WHERE line.dependency_id = dependency.id
+                     AND (
+                       COALESCE(line.loaded_quantity, 0) > $2
+                       OR COALESCE(line.delivered_quantity, 0) > $2
+                       OR COALESCE(line.locally_received_quantity, 0) > $2
+                     )
+                ) AS has_execution_progress
+           FROM order_dependencies dependency
+          WHERE id = $1`,
+        [Number(dependencyId), EPSILON]
+      );
+      if (existing.rows[0].status === "cancelled") {
+        return { cancelled: true, id: Number(dependencyId), alreadyCancelled: true };
+      }
+      const error = new Error("This dependency has already started and cannot be unlinked.");
+      error.status = 409;
+      throw error;
+    }
     await writeDispatchAudit({
       action: "dispatch.order_dependency.unlinked",
       entityType: "order_dependency",
@@ -2959,6 +3572,55 @@ function dependencyTimingNumber(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function dispatchPlanDateKey(value) {
+  if (!value) return "";
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    return value.toISOString().slice(0, 10);
+  }
+  const raw = String(value).trim();
+  const iso = raw.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (iso) return iso[1];
+  const parsed = new Date(raw);
+  return Number.isNaN(parsed.getTime())
+    ? ""
+    : parsed.toISOString().slice(0, 10);
+}
+
+function directDependencyRemainsOnPlannedAssignment(
+  dependency = {},
+  plan = {},
+  salesAssignment = {}
+) {
+  const plannedPlanId = Number(dependency.plannedPlanId);
+  const candidatePlanId = Number(plan.id);
+  if (
+    !Number.isSafeInteger(plannedPlanId)
+    || plannedPlanId <= 0
+    || !Number.isSafeInteger(candidatePlanId)
+    || candidatePlanId !== plannedPlanId
+  ) {
+    return false;
+  }
+  const plannedDate = dispatchPlanDateKey(dependency.plannedDate);
+  const candidateDate = dispatchPlanDateKey(plan.planDate);
+  if (!plannedDate || !candidateDate || plannedDate !== candidateDate) {
+    return false;
+  }
+  if (
+    !text(dependency.plannedLoadId)
+    || text(dependency.plannedLoadId) !== text(salesAssignment.loadId)
+  ) {
+    return false;
+  }
+  const plannedTruck = text(dependency.plannedTruckPlate)
+    .replace(/\s+/g, "")
+    .toUpperCase();
+  const candidateTruck = text(salesAssignment.truckPlate)
+    .replace(/\s+/g, "")
+    .toUpperCase();
+  return !plannedTruck || plannedTruck === candidateTruck;
+}
+
 function replenishmentTransferPrecedesSales(transferAssignment, salesAssignment) {
   if (!transferAssignment || !salesAssignment) return false;
   if (String(transferAssignment.loadId || "") === String(salesAssignment.loadId || "")) {
@@ -3055,7 +3717,18 @@ export async function validateDispatchPlanDependencies(plan = {}) {
       if (row?.dispatch_planned && String(row.dispatch_plan_date || "") !== String(plan.planDate || "")) {
         conflicts.push(`${dependency.transferOrderRef} is planned independently. Unplan it before direct pickup with ${plannedSalesRef}.`);
       }
-      if (["loaded", "fulfilled", "shipped"].includes(String(row?.fulfillment_status || "").toLowerCase()) && dependency.status === "active") {
+      const remainsOnPlannedAssignment = directDependencyRemainsOnPlannedAssignment(
+        dependency,
+        plan,
+        salesAssignment
+      );
+      if (
+        ["loaded", "fulfilled", "shipped"].includes(
+          String(row?.fulfillment_status || "").toLowerCase()
+        )
+        && dependency.status === "active"
+        && !remainsOnPlannedAssignment
+      ) {
         conflicts.push(`${dependency.transferOrderRef} has already started and cannot be attached as a new direct pickup.`);
       }
       continue;
@@ -3063,7 +3736,7 @@ export async function validateDispatchPlanDependencies(plan = {}) {
     const transferAssignment = current.get(dependency.transferOrderRef);
     const transferRow = transferById.get(String(dependency.transferOrderId)) || {};
     const complete = ["received", "completed", "shipped"].includes(String(transferRow.receiving_status || "").toLowerCase())
-      || dependency.status === "received_local";
+      || ["delivered", "received_local"].includes(dependency.status);
     if (complete) continue;
     if (replenishmentTransferPrecedesSales(transferAssignment, salesAssignment)) continue;
     if (priorTransferRefs.has(dependency.transferOrderRef)) continue;

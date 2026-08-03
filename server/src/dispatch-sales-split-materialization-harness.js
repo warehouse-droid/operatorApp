@@ -10,6 +10,24 @@ const splitRef = `${parentRef}-S1`;
 const lineId = 880000 + (seed % 100000);
 const planDate = "2098-12-29";
 
+function plannedTrucks(orderRef) {
+  return [{
+    id: `HARNESS-SALES-TRUCK-${seed}`,
+    plate: "HARNESS",
+    driver: "Harness",
+    loads: [{
+      id: `HARNESS-SALES-LOAD-${seed}`,
+      name: "Load 1",
+      stops: [{
+        id: `HARNESS-SALES-DROP-${orderRef}`,
+        type: "drop",
+        orderId: orderRef,
+        location: "12441"
+      }]
+    }]
+  }];
+}
+
 function splitPlan({ lineRowId, pieces }) {
   return {
     id: `split-materialization-${seed}`,
@@ -28,7 +46,7 @@ function splitPlan({ lineRowId, pieces }) {
         toPcs: 1
       }]
     }],
-    trucks: []
+    trucks: plannedTrucks(splitRef)
   };
 }
 

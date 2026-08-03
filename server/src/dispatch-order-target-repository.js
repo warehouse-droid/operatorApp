@@ -101,7 +101,11 @@ async function findSnapshotTarget(targetRef, planDate = "") {
   } : null;
 }
 
-async function projectedGroupTarget(targetRef) {
+async function projectedGroupTarget(targetRef, planDate = "") {
+  const params = [text(targetRef)];
+  const date = dateOnly(planDate);
+  const dateClause = date ? "AND g.plan_date = $2::date" : "";
+  if (date) params.push(date);
   const result = await query(
     `SELECT g.plan_id, g.plan_date::text AS plan_date,
             COALESCE(jsonb_agg(m.member_order_ref ORDER BY m.position)
@@ -109,9 +113,10 @@ async function projectedGroupTarget(targetRef) {
        FROM dispatch_delivery_groups g
        LEFT JOIN dispatch_delivery_group_members m ON m.group_ref = g.group_ref
       WHERE g.group_ref = $1 AND g.active = true
+        ${dateClause}
       GROUP BY g.group_ref
       LIMIT 1`,
-    [text(targetRef)]
+    params
   );
   if (!result.rowCount) return null;
   return {
@@ -272,7 +277,7 @@ async function applyExistingAllocations(targetRef, lines) {
 export async function resolveDispatchSalesTarget({ dispatchTargetRef = "", planDate = "" } = {}) {
   const ref = text(dispatchTargetRef);
   if (!ref) throw new Error("Dispatch Sales Order target is required.");
-  const snapshot = await findSnapshotTarget(ref, planDate) || await projectedGroupTarget(ref);
+  const snapshot = await findSnapshotTarget(ref, planDate) || await projectedGroupTarget(ref, planDate);
   const initialRefs = [ref, splitParentRef(snapshot?.order || { id: ref })];
   let canonical = await loadCanonicalOrders(initialRefs);
   const exactCanonical = canonical.headers.get(ref) || null;

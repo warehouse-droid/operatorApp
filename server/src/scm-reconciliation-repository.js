@@ -34,8 +34,37 @@ function dateValue(value) {
   return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
 }
 
+function timestampValue(value) {
+  if (!value) return null;
+  const timestamp = new Date(value).getTime();
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
 function bool(value) {
   return value === true || /^(1|true|yes|on)$/i.test(text(value));
+}
+
+export function scmScheduleEffectiveReconciliationStatus({
+  scheduleStatus = "Queued",
+  scheduleId = 0,
+  scheduleUpdatedAt = null,
+  reconciliationStatus = "",
+  reconciliationReconciledAt = null,
+  reconciliationApplicationStatus = "",
+  blockingReview = false
+} = {}) {
+  const currentScheduleStatus = text(scheduleStatus) || "Queued";
+  const currentReconciliationStatus = text(reconciliationStatus).toLowerCase();
+  if (blockingReview || currentReconciliationStatus === "review") return "Reconcile Review";
+  if (currentReconciliationStatus === "pending") return currentScheduleStatus;
+
+  const scheduleUpdatedTimestamp = timestampValue(scheduleUpdatedAt);
+  const reconciliationTimestamp = timestampValue(reconciliationReconciledAt);
+  const scheduleIsNewer = Number(scheduleId) > 0
+    && scheduleUpdatedTimestamp !== null
+    && (reconciliationTimestamp === null || scheduleUpdatedTimestamp > reconciliationTimestamp);
+  if (scheduleIsNewer) return currentScheduleStatus;
+  return text(reconciliationApplicationStatus) || currentScheduleStatus;
 }
 
 export function scmReconciliationProposedOutcome(proposal = {}) {
@@ -5258,19 +5287,22 @@ export async function enrichScmScheduleWithReconciliation(rows = [], {
     const currentTargetStatus = target.applicationStatus === "Reconcile Review"
       ? state.application_status
       : target.applicationStatus;
+    const effectiveStatus = scmScheduleEffectiveReconciliationStatus({
+      scheduleStatus: row.status,
+      scheduleId: row.scheduleId,
+      scheduleUpdatedAt: row.updatedAt,
+      reconciliationStatus: state.reconciliation_status,
+      reconciliationReconciledAt: state.reconciled_at,
+      reconciliationApplicationStatus: currentTargetStatus || state.application_status,
+      blockingReview: isReview
+    });
     const displayedReason = isReview
       ? state.reconciliation_reason || target.reason || ""
       : "";
     enriched.push({
       ...row,
-      status: isPending
-        ? row.status
-        : isReview
-          ? "Reconcile Review"
-          : currentTargetStatus || state.application_status || row.status,
-      reconciliationApplicationStatus: isPending
-        ? ""
-        : currentTargetStatus || state.application_status || "",
+      status: effectiveStatus,
+      reconciliationApplicationStatus: effectiveStatus,
       reconciliationStatus: isReview ? "review" : isPending ? "unreconciled" : "ok",
       reconciliationReason: isPending ? "" : displayedReason,
       lastReconciledAt: state.reconciled_at,

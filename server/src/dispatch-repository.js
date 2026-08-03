@@ -1840,38 +1840,90 @@ export async function setPurchaseOrderBlanketFlag(orderRef, {
   const ref = String(orderRef || "").trim();
   if (!ref) throw Object.assign(new Error("Purchase order reference is required."), { status: 400 });
   const flagged = isBlanket === true;
-  const result = await query(
-    `UPDATE purchase_orders
-        SET is_blanket_po = $2,
-            blanket_flagged_at = CASE WHEN $2 THEN now() ELSE NULL END,
-            blanket_flagged_by = CASE WHEN $2 THEN NULLIF($3, '') ELSE NULL END
-      WHERE netsuite_id = (
-        SELECT netsuite_id
-          FROM purchase_orders
-         WHERE lower(COALESCE(tranid, '')) = lower($1)
-            OR lower(COALESCE(dispatch_ref, '')) = lower($1)
-            OR netsuite_id::text = $1
-         ORDER BY CASE
-           WHEN lower(COALESCE(tranid, '')) = lower($1) THEN 0
-           WHEN lower(COALESCE(dispatch_ref, '')) = lower($1) THEN 1
-           ELSE 2
-         END
-         LIMIT 1
-      )
-      RETURNING netsuite_id, tranid, dispatch_ref, is_blanket_po,
-                blanket_flagged_at, blanket_flagged_by`,
-    [ref, flagged, String(updatedBy || "").trim()]
-  );
-  const row = result.rows[0];
-  if (!row) throw Object.assign(new Error(`Purchase order ${ref} was not found.`), { status: 404 });
-  return {
-    netsuiteId: row.netsuite_id,
-    orderRef: row.tranid || ref,
-    dispatchRef: row.dispatch_ref || "",
-    isBlanket: row.is_blanket_po === true,
-    flaggedAt: row.blanket_flagged_at,
-    flaggedBy: row.blanket_flagged_by || ""
-  };
+  return withTransaction(async () => {
+    const sourceResult = await query(
+      `SELECT *
+         FROM purchase_orders
+        WHERE lower(COALESCE(tranid, '')) = lower($1)
+           OR lower(COALESCE(dispatch_ref, '')) = lower($1)
+           OR netsuite_id::text = $1
+        ORDER BY CASE
+          WHEN lower(COALESCE(tranid, '')) = lower($1) THEN 0
+          WHEN lower(COALESCE(dispatch_ref, '')) = lower($1) THEN 1
+          ELSE 2
+        END
+        LIMIT 1
+        FOR UPDATE`,
+      [ref]
+    );
+    const source = sourceResult.rows[0];
+    if (!source) throw Object.assign(new Error(`Purchase order ${ref} was not found.`), { status: 404 });
+    const conflicts = await query(
+      `SELECT
+         EXISTS (
+           SELECT 1 FROM dispatch_scm_po_splits split
+            WHERE split.split_po_id = $1
+         ) AS is_split_child,
+         EXISTS (
+           SELECT 1 FROM dispatch_scm_po_splits split
+            WHERE split.source_po_id = $1 AND split.status = 'active'
+         ) AS has_active_splits,
+         EXISTS (
+           SELECT 1 FROM scm_smart_blanket_releases release
+            WHERE release.source_po_id = $1
+              AND release.status IN ('reserved', 'partially_released', 'held')
+         ) AS has_pending_releases`,
+      [source.netsuite_id]
+    );
+    const conflict = conflicts.rows[0] || {};
+    if (flagged && conflict.is_split_child) {
+      throw Object.assign(
+        new Error("Only a source purchase order can be flagged as Blanket; a local split child cannot become a Blanket parent."),
+        { status: 409, code: "SCM_BLANKET_SOURCE_REQUIRED" }
+      );
+    }
+    const openForReceipt = source.netsuite_active === true
+      && (/Pending Receipt/i.test(String(source.status_text || ""))
+        || /Partially Received/i.test(String(source.status_text || "")));
+    if (flagged && !openForReceipt) {
+      throw Object.assign(
+        new Error("Only an active Pending Receipt or Partially Received source PO can be flagged as Blanket."),
+        { status: 409, code: "SCM_BLANKET_SOURCE_NOT_OPEN" }
+      );
+    }
+    if (!flagged && (conflict.has_active_splits || conflict.has_pending_releases)) {
+      throw Object.assign(
+        new Error("This Blanket PO has an active split or reserved release and cannot be unflagged."),
+        {
+          status: 409,
+          code: "SCM_BLANKET_UNFLAG_UNSAFE",
+          conflicts: {
+            activeSplits: conflict.has_active_splits === true,
+            pendingReleases: conflict.has_pending_releases === true
+          }
+        }
+      );
+    }
+    const result = await query(
+      `UPDATE purchase_orders
+          SET is_blanket_po = $2,
+              blanket_flagged_at = CASE WHEN $2 THEN now() ELSE NULL END,
+              blanket_flagged_by = CASE WHEN $2 THEN NULLIF($3, '') ELSE NULL END
+        WHERE netsuite_id = $1
+        RETURNING netsuite_id, tranid, dispatch_ref, is_blanket_po,
+                  blanket_flagged_at, blanket_flagged_by`,
+      [source.netsuite_id, flagged, String(updatedBy || "").trim()]
+    );
+    const row = result.rows[0];
+    return {
+      netsuiteId: row.netsuite_id,
+      orderRef: row.tranid || ref,
+      dispatchRef: row.dispatch_ref || "",
+      isBlanket: row.is_blanket_po === true,
+      flaggedAt: row.blanket_flagged_at,
+      flaggedBy: row.blanket_flagged_by || ""
+    };
+  });
 }
 
 function scmOrderVendorLabel(order = {}) {
@@ -2252,13 +2304,13 @@ export async function listScmSchedule({
   }
   const params = [
     globalSearch,
-    globalSearch ? [] : normalizeScmScheduleFilterValues(status),
-    globalSearch ? "" : String(method || "").trim(),
-    globalSearch ? "" : cleanKind,
-    globalSearch ? "" : String(yard || "").trim(),
-    globalSearch ? [] : normalizeScmScheduleFilterValues(brand, { lowercase: true }),
-    globalSearch ? null : String(from || "").trim() || null,
-    globalSearch ? null : String(to || "").trim() || null,
+    normalizeScmScheduleFilterValues(status),
+    String(method || "").trim(),
+    cleanKind,
+    String(yard || "").trim(),
+    normalizeScmScheduleFilterValues(brand, { lowercase: true }),
+    String(from || "").trim() || null,
+    String(to || "").trim() || null,
     String(view || "").trim().toLowerCase(),
     cleanExactRef,
     String(audience || "").trim().toLowerCase() !== "operations"
@@ -3389,12 +3441,18 @@ export async function getScmVrmaOrder(vrmaRef = "") {
   const ref = String(vrmaRef || "").trim();
   if (!ref) return null;
   const headerResult = await query(
-    `SELECT id, vrma_ref, vendor, local_vendor, pickup_location, dropoff_location,
-            status, method, notes, operator_status, local_yard_order_status,
-            loaded_at, completed_at, completed_by, completion_note,
-            completion_source, created_at, updated_at
-       FROM scm_vrma_orders
-      WHERE LOWER(vrma_ref) = LOWER($1)
+    `SELECT v.id, v.vrma_ref, v.vendor, v.local_vendor, v.pickup_location, v.dropoff_location,
+            v.status, v.method, v.notes, v.operator_status, v.local_yard_order_status,
+            v.loaded_at, v.completed_at, v.completed_by, v.completion_note,
+            v.completion_source, v.cancelled_at, v.cancelled_by, v.cancellation_note,
+            v.cancellation_source, v.created_at, v.updated_at,
+            schedule.updated_at AS schedule_updated_at,
+            GREATEST(v.updated_at, schedule.updated_at) AS concurrency_updated_at
+       FROM scm_vrma_orders v
+       LEFT JOIN scm_transport_schedule schedule
+         ON schedule.order_kind = 'VRMA'
+        AND LOWER(schedule.order_ref) = LOWER(v.vrma_ref)
+      WHERE LOWER(v.vrma_ref) = LOWER($1)
       LIMIT 1`,
     [ref]
   );
@@ -3428,8 +3486,14 @@ export async function getScmVrmaOrder(vrmaRef = "") {
     completedBy: header.completed_by || "",
     completionNote: header.completion_note || "",
     completionSource: header.completion_source || "",
+    cancelledAt: header.cancelled_at || null,
+    cancelledBy: header.cancelled_by || "",
+    cancellationNote: header.cancellation_note || "",
+    cancellationSource: header.cancellation_source || "",
     createdAt: header.created_at,
     updatedAt: header.updated_at,
+    scheduleUpdatedAt: header.schedule_updated_at || null,
+    concurrencyUpdatedAt: header.concurrency_updated_at || header.updated_at,
     lines: lineResult.rows.map((line) => ({
       id: line.id,
       itemId: line.item_id,
@@ -3451,6 +3515,268 @@ export async function getScmVrmaOrder(vrmaRef = "") {
       itemWeight: positiveQuantity(line.item_weight)
     }))
   };
+}
+
+export async function removeScmVrmaOrder({
+  vrmaRef = "",
+  note = "",
+  actor = "",
+  expectedUpdatedAt = "",
+  confirm = false
+} = {}) {
+  const ref = String(vrmaRef || "").trim();
+  const cleanNote = String(note || "").trim();
+  const cleanActor = String(actor || "").trim();
+  const expected = expectedUpdatedAt ? new Date(expectedUpdatedAt) : null;
+  if (!ref) throw Object.assign(new Error("VRMA ref is required."), { status: 400 });
+  if (!cleanActor) throw Object.assign(new Error("SCM or Admin identity is required."), { status: 401 });
+  if (!cleanNote) throw Object.assign(new Error("An audit note is required to remove a VRMA."), { status: 400 });
+  if (confirm !== true) {
+    throw Object.assign(new Error("Confirm that this local VRMA should be removed."), { status: 400 });
+  }
+  if (!expected || Number.isNaN(expected.getTime())) {
+    throw Object.assign(new Error("Refresh this VRMA before removing it."), {
+      status: 409,
+      code: "SCM_VRMA_REMOVE_STALE"
+    });
+  }
+
+  return withTransaction(async () => {
+    const selected = await query(
+      `SELECT *
+         FROM scm_vrma_orders
+        WHERE LOWER(vrma_ref) = LOWER($1)
+        LIMIT 1
+        FOR UPDATE`,
+      [ref]
+    );
+    const header = selected.rows[0];
+    if (!header) throw Object.assign(new Error("VRMA order not found."), { status: 404 });
+
+    const scheduleResult = await query(
+      `SELECT *
+         FROM scm_transport_schedule
+        WHERE order_kind = 'VRMA'
+          AND LOWER(order_ref) = LOWER($1)
+        LIMIT 1
+        FOR UPDATE`,
+      [header.vrma_ref]
+    );
+    const schedule = scheduleResult.rows[0] || null;
+    const before = { vrma: header, schedule };
+    const headerStatus = String(header.status || "").trim();
+    const scheduleStatus = String(schedule?.status || "").trim();
+    const normalizedHeaderStatus = headerStatus.toLowerCase();
+    const normalizedScheduleStatus = scheduleStatus.toLowerCase();
+
+    if (normalizedHeaderStatus === "cancelled" && (!schedule || normalizedScheduleStatus === "cancelled")) {
+      return {
+        removed: true,
+        idempotent: true,
+        before,
+        after: before
+      };
+    }
+    if (normalizedHeaderStatus === "completed" || normalizedScheduleStatus === "completed") {
+      throw Object.assign(new Error("A Completed VRMA cannot be removed."), {
+        status: 409,
+        code: "SCM_VRMA_REMOVE_BLOCKED",
+        conflicts: [{ type: "completed", message: "The VRMA is already Completed." }]
+      });
+    }
+
+    const concurrencyTimestamp = [header.updated_at, schedule?.updated_at]
+      .filter(Boolean)
+      .reduce((latest, value) => (
+        !latest || new Date(value).getTime() > new Date(latest).getTime() ? value : latest
+      ), null);
+    if (
+      !concurrencyTimestamp
+      || new Date(concurrencyTimestamp).getTime() !== expected.getTime()
+    ) {
+      throw Object.assign(new Error("This VRMA changed after it was opened. Refresh and try again."), {
+        status: 409,
+        code: "SCM_VRMA_REMOVE_STALE"
+      });
+    }
+
+    const lineResult = await query(
+      `SELECT *
+         FROM scm_vrma_order_lines
+        WHERE vrma_order_id = $1
+        ORDER BY id
+        FOR UPDATE`,
+      [header.id]
+    );
+    const assignmentResult = await query(
+      `SELECT assignment.*, plan.status AS plan_status
+         FROM dispatch_vrma_plan_assignments assignment
+         JOIN dispatch_plans plan ON plan.id = assignment.plan_id
+        WHERE LOWER(assignment.order_ref) = LOWER($1)
+        FOR UPDATE OF assignment, plan`,
+      [header.vrma_ref]
+    );
+    const snapshotResult = await query(
+      `SELECT snapshot.plan_id, plan.status AS plan_status
+         FROM dispatch_plan_snapshots snapshot
+         JOIN dispatch_plans plan ON plan.id = snapshot.plan_id
+        WHERE (
+          EXISTS (
+            SELECT 1
+              FROM jsonb_array_elements(COALESCE(snapshot.orders, '[]'::jsonb)) plan_order(value)
+             WHERE LOWER(COALESCE(plan_order.value->>'id', '')) = LOWER($1)
+               AND (
+                 plan_order.value->>'sourceTable' = 'scm_vrma_orders'
+                 OR UPPER(COALESCE(plan_order.value->>'type', '')) = 'VRMA'
+               )
+          )
+          OR EXISTS (
+            SELECT 1
+              FROM jsonb_array_elements(COALESCE(snapshot.trucks, '[]'::jsonb)) truck(value)
+              CROSS JOIN LATERAL jsonb_array_elements(COALESCE(truck.value->'loads', '[]'::jsonb)) load(value)
+              CROSS JOIN LATERAL jsonb_array_elements(COALESCE(load.value->'stops', '[]'::jsonb)) stop(value)
+             WHERE LOWER(COALESCE(stop.value->>'orderId', '')) = LOWER($1)
+          )
+        )
+        FOR UPDATE OF snapshot, plan`,
+      [header.vrma_ref]
+    );
+    const loadHistoryResult = await query(
+      `SELECT id, load_type, order_family, order_id, order_ref, source_table, source_record_id, created_at
+         FROM operator_load_records
+        WHERE (
+          order_family = 'vrma_order'
+          AND (
+            order_id = $1
+            OR LOWER(COALESCE(order_ref, '')) = LOWER($2)
+          )
+        )
+        OR (
+          source_table = 'scm_vrma_orders'
+          AND source_record_id = $1
+        )
+        FOR UPDATE`,
+      [header.id, header.vrma_ref]
+    );
+    const groupResult = await query(
+      `SELECT member.id, group_header.group_ref
+         FROM scm_schedule_group_members member
+         JOIN scm_schedule_groups group_header ON group_header.id = member.group_id
+        WHERE LOWER(group_header.status) = 'active'
+          AND LOWER(member.order_ref) = LOWER($1)
+        FOR UPDATE OF member, group_header`,
+      [header.vrma_ref]
+    );
+
+    const activeAssignments = assignmentResult.rows.filter(
+      (row) => String(row.plan_status || "").trim().toLowerCase() !== "cancelled"
+    );
+    const activeSnapshots = snapshotResult.rows.filter(
+      (row) => String(row.plan_status || "").trim().toLowerCase() !== "cancelled"
+    );
+    const hasHeaderActivity = String(header.operator_status || "open").trim().toLowerCase() !== "open"
+      || Boolean(header.preparing_operator_id)
+      || Boolean(header.preparing_started_at)
+      || Boolean(header.loaded_at)
+      || !["", "open"].includes(String(header.local_yard_order_status || "").trim().toLowerCase());
+    const hasLineActivity = lineResult.rows.some((line) => (
+      positiveQuantity(line.packed_pallet_qty) > 0
+      || positiveQuantity(line.packed_layer_qty) > 0
+      || positiveQuantity(line.packed_section_qty) > 0
+      || positiveQuantity(line.packed_piece_qty) > 0
+      || positiveQuantity(line.packed_sales_qty) > 0
+      || positiveQuantity(line.loaded_qty) > 0
+      || line.confirmed === true
+      || Boolean(line.confirmed_at)
+    ));
+    const conflicts = [];
+    if (activeAssignments.length || activeSnapshots.length) {
+      conflicts.push({
+        type: "dispatch_plan",
+        message: "Remove this VRMA from every active Dispatch plan first.",
+        planIds: [...new Set([
+          ...activeAssignments.map((row) => Number(row.plan_id)),
+          ...activeSnapshots.map((row) => Number(row.plan_id))
+        ])]
+      });
+    }
+    if (groupResult.rows.length) {
+      conflicts.push({
+        type: "active_group",
+        message: "Ungroup this VRMA before removing it.",
+        groupRefs: groupResult.rows.map((row) => row.group_ref)
+      });
+    }
+    if (hasHeaderActivity || hasLineActivity) {
+      conflicts.push({
+        type: "operator_activity",
+        message: "Operator packing or loading has already started."
+      });
+    }
+    if (loadHistoryResult.rows.length) {
+      conflicts.push({
+        type: "operator_load_history",
+        message: "This VRMA has retained Operator load history and cannot be removed.",
+        recordIds: loadHistoryResult.rows.map((row) => Number(row.id))
+      });
+    }
+    if (conflicts.length) {
+      throw Object.assign(new Error(conflicts[0].message), {
+        status: 409,
+        code: "SCM_VRMA_REMOVE_BLOCKED",
+        conflicts
+      });
+    }
+
+    const cancelledHeaderResult = await query(
+      `UPDATE scm_vrma_orders
+          SET status = 'Cancelled',
+              cancelled_at = now(),
+              cancelled_by = $2,
+              cancellation_note = $3,
+              cancellation_source = 'scm_remove',
+              updated_by = $2,
+              status_updated_at = now(),
+              updated_at = now()
+        WHERE id = $1
+        RETURNING *`,
+      [header.id, cleanActor, cleanNote]
+    );
+    const cancelledScheduleResult = await query(
+      `INSERT INTO scm_transport_schedule (
+         order_kind, source_table, source_id, order_ref, method,
+         pickup_point, dropoff_point, brand, content, weight_lbs,
+         status, notes, created_by, updated_by, created_at, updated_at
+       )
+       SELECT 'VRMA', 'scm_vrma_orders', v.id, v.vrma_ref, COALESCE(v.method, 'MBT'),
+              v.pickup_location, v.dropoff_location, COALESCE(v.local_vendor, v.vendor),
+              COALESCE(string_agg(
+                trim(concat_ws(' ', COALESCE(line.sku, line.item_name), line.quantity, line.unit)),
+                '; ' ORDER BY line.id
+              ), ''),
+              COALESCE(SUM(line.weight_lbs), 0),
+              'Cancelled', NULLIF(v.notes, ''), $2, $2, now(), now()
+         FROM scm_vrma_orders v
+         LEFT JOIN scm_vrma_order_lines line ON line.vrma_order_id = v.id
+        WHERE v.id = $1
+        GROUP BY v.id
+       ON CONFLICT (order_kind, order_ref) DO UPDATE SET
+         status = 'Cancelled',
+         updated_by = EXCLUDED.updated_by,
+         updated_at = now()
+       RETURNING *`,
+      [header.id, cleanActor]
+    );
+    return {
+      removed: true,
+      idempotent: false,
+      before,
+      after: {
+        vrma: cancelledHeaderResult.rows[0],
+        schedule: cancelledScheduleResult.rows[0]
+      }
+    };
+  });
 }
 
 export async function completeScmVrmaOrderOverride({
@@ -3668,12 +3994,17 @@ export async function createScmVrmaOrder({
   const pickup = String(pickupLocation || "").trim();
   const selectedVendor = String(localVendor || vendor || "").trim();
   const requestedDropoff = String(dropoffLocation || "").trim();
+  const requestedStatus = normalizeManualScmStatus(status);
+  if (requestedStatus === "Cancelled") {
+    throw Object.assign(new Error("Use Delete VRMA so cancellation is validated and audited."), { status: 400 });
+  }
   if (!SCM_VRMA_OWN_YARD_CODES.has(pickup)) throw new Error("VRMA pickup must be one of our local yards.");
   if (!selectedVendor) throw new Error("Local vendor is required.");
   if (!requestedDropoff) throw new Error("Vendor drop-off yard is required.");
   return withTransaction(async () => {
     const existingActivity = await query(
       `SELECT v.id, v.status, v.operator_status, v.preparing_operator_id, v.loaded_at,
+              v.cancelled_at, v.cancellation_source,
               EXISTS (
                 SELECT 1
                   FROM scm_vrma_order_lines line
@@ -3695,6 +4026,8 @@ export async function createScmVrmaOrder({
     const activity = existingActivity.rows[0];
     if (activity && (
       activity.status === "Completed"
+      || activity.cancelled_at
+      || activity.cancellation_source === "scm_remove"
       || activity.operator_status !== "open"
       || activity.preparing_operator_id
       || activity.loaded_at
@@ -3703,6 +4036,8 @@ export async function createScmVrmaOrder({
       const error = new Error(
         activity.status === "Completed"
           ? "This VRMA can no longer be edited because SCM marked it Completed."
+          : activity.cancelled_at || activity.cancellation_source === "scm_remove"
+            ? "This VRMA was removed and can no longer be edited."
           : "This VRMA can no longer be edited because Operator packing or loading has started."
       );
       error.status = 409;
@@ -3803,7 +4138,7 @@ export async function createScmVrmaOrder({
         selectedVendor,
         pickup,
         vendorYard.yard,
-        normalizeManualScmStatus(status),
+        requestedStatus,
         "MBT",
         String(notes || "").trim(),
         createdBy || null
@@ -3869,7 +4204,7 @@ export async function createScmVrmaOrder({
         vendorYard.yard,
         selectedVendor,
         normalizedLines.map(vrmaLineContent).join("; "),
-        normalizeManualScmStatus(status),
+        requestedStatus,
         String(notes || "").trim(),
         createdBy || null
       ]
@@ -4437,7 +4772,9 @@ export async function createScmPurchaseOrderSplit({
   destinationLocationId = null,
   lines = [],
   createdBy = "",
-  details = {}
+  details = {},
+  blanketReleaseId = null,
+  extendSplitId = null
 } = {}) {
   const sourceRef = String(sourcePoRef || "").trim();
   const splitRef = String(newPoRef || "").trim();
@@ -4448,31 +4785,34 @@ export async function createScmPurchaseOrderSplit({
     .map((line) => ({
       ...line,
       lineRowId: Number(line.lineRowId || line.id || 0),
+      destinationLocationId: normalizeScmDestinationLocationId(
+        line.destinationLocationId ?? line.destination_location_id ?? destinationLocationId
+      ),
       quantities: splitLineQuantityPayload(line)
     }))
     .filter((line) => line.lineRowId && hasRequestedSplitQuantity(line.quantities));
   if (!requestedLines.length) throw new Error("Select at least one PO line quantity to split.");
 
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const sourceOrder = await client.query(
+  return withTransaction(async () => {
+    const sourceOrder = await query(
       `SELECT *
          FROM purchase_orders
         WHERE tranid = $1 OR dispatch_ref = $1 OR netsuite_id::text = $1
         ORDER BY CASE WHEN dispatch_ref = $1 THEN 0 ELSE 1 END, netsuite_active DESC, synced_at DESC NULLS LAST
-        LIMIT 1`,
+        LIMIT 1
+        FOR UPDATE`,
       [sourceRef]
     );
     const source = sourceOrder.rows[0];
     if (!source) throw new Error(`Blanket PO ${sourceRef} was not found.`);
     const splitDestinationLocationId = normalizeScmDestinationLocationId(destinationLocationId)
+      || requestedLines.map((line) => line.destinationLocationId).find(Boolean)
       || normalizeScmDestinationLocationId(source.destination_location_id)
       || normalizeScmDestinationLocationId(source.destination_location);
     if (!splitDestinationLocationId) throw new Error("Destination yard is required for the split PO.");
     const splitDestinationLocation = locationTextFromId(splitDestinationLocationId);
     const selectedPickupYard = String(pickupPoint || "").trim()
-      ? await resolveScmPurchaseOrderPickupYard(client, source, pickupPoint)
+      ? await resolveScmPurchaseOrderPickupYard(query, source, pickupPoint)
       : null;
     const splitPickupPoint = selectedPickupYard?.yard || source.dispatch_vendor_yard || source.source_location || source.vendor || "";
     const splitPickupAddress = selectedPickupYard?.address || source.dispatch_address || "";
@@ -4480,18 +4820,89 @@ export async function createScmPurchaseOrderSplit({
     const splitPickupWindowEnd = selectedPickupYard?.windowEnd || source.dispatch_window_end || "";
     const splitPickupInstructions = selectedPickupYard ? vendorYardInstructions(selectedPickupYard) : source.dispatch_instructions || "";
     const splitPickupParseSource = selectedPickupYard ? "manual-scm-po-yard" : source.dispatch_parse_source || "scm-split";
-    const existing = await client.query(
-      `SELECT tranid FROM purchase_orders WHERE lower(tranid) = lower($1)
-       UNION
-       SELECT dispatch_ref AS tranid FROM purchase_orders WHERE lower(dispatch_ref) = lower($1)
-       UNION
-       SELECT split_po_ref AS tranid FROM dispatch_scm_po_splits WHERE lower(split_po_ref) = lower($1)`,
-      [splitRef]
-    );
-    if (existing.rowCount) throw new Error(`PO ref ${splitRef} already exists.`);
+    const requestedExtensionId = Number(extendSplitId) || null;
+    let extendingSplit = null;
+    if (requestedExtensionId) {
+      const extension = await query(
+        `SELECT split.*
+           FROM dispatch_scm_po_splits split
+           JOIN purchase_orders child ON child.netsuite_id = split.split_po_id
+          WHERE split.id = $1
+            AND split.source_po_id = $2
+            AND split.status = 'active'
+          FOR UPDATE OF split, child`,
+        [requestedExtensionId, source.netsuite_id]
+      );
+      extendingSplit = extension.rows[0] || null;
+      if (!extendingSplit) throw new Error("The existing Blanket split is no longer active.");
+      if (String(extendingSplit.split_po_ref || "").trim().toLowerCase() !== splitRef.toLowerCase()) {
+        throw new Error(`Held Blanket quantities must extend the existing split ref ${extendingSplit.split_po_ref}.`);
+      }
+      const releaseIdentity = Number(extendingSplit.details?.blanketReleaseId);
+      if (Number(blanketReleaseId) && releaseIdentity && releaseIdentity !== Number(blanketReleaseId)) {
+        throw new Error("The existing Blanket split belongs to another release.");
+      }
+      const operationalUse = await query(
+        `SELECT
+           EXISTS (
+             SELECT 1
+               FROM purchase_order_lines line
+              WHERE line.purchase_order_id = $1
+                AND (
+                  COALESCE(line.received_pallet_qty, 0) > 0
+                  OR COALESCE(line.received_layer_qty, 0) > 0
+                  OR COALESCE(line.received_section_qty, 0) > 0
+                  OR COALESCE(line.received_piece_qty, 0) > 0
+                  OR COALESCE(line.netsuite_received_qty, 0) > 0
+                  OR line.confirmed_at IS NOT NULL
+                )
+           ) AS has_receiving_activity,
+           EXISTS (
+             SELECT 1
+               FROM driver_job_records job
+              WHERE job.status IN ('in_progress', 'complete')
+                AND job.order_refs ? $2
+           ) AS has_driver_activity,
+           EXISTS (
+             SELECT 1
+               FROM dispatch_plan_snapshots snapshot
+               JOIN dispatch_plans plan ON plan.id = snapshot.plan_id
+              WHERE plan.status <> 'cancelled'
+                AND snapshot.trucks::text LIKE $3
+           ) AS is_scheduled`,
+        [extendingSplit.split_po_id, splitRef, `%"${splitRef.replaceAll('"', '\\"')}"%`]
+      );
+      const use = operationalUse.rows[0] || {};
+      if (use.has_receiving_activity || use.has_driver_activity || use.is_scheduled) {
+        throw Object.assign(
+          new Error(
+            `Held quantities cannot extend ${splitRef} after it has been scheduled or used. Remove it from the active dispatch plan before confirming the held quantity, or cancel that held quantity.`
+          ),
+          {
+            status: 409,
+            code: "SCM_BLANKET_SPLIT_OPERATIONAL",
+            conflicts: {
+              receivingActivity: use.has_receiving_activity === true,
+              driverActivity: use.has_driver_activity === true,
+              scheduled: use.is_scheduled === true
+            }
+          }
+        );
+      }
+    } else {
+      const existing = await query(
+        `SELECT tranid FROM purchase_orders WHERE lower(tranid) = lower($1)
+         UNION
+         SELECT dispatch_ref AS tranid FROM purchase_orders WHERE lower(dispatch_ref) = lower($1)
+         UNION
+         SELECT split_po_ref AS tranid FROM dispatch_scm_po_splits WHERE lower(split_po_ref) = lower($1)`,
+        [splitRef]
+      );
+      if (existing.rowCount) throw new Error(`PO ref ${splitRef} already exists.`);
+    }
 
     const lineIds = requestedLines.map((line) => line.lineRowId);
-    const sourceLines = await client.query(
+    const sourceLines = await query(
       `WITH po_alloc AS (
          SELECT po_line_id,
                 SUM(allocated_pallet_qty) AS allocated_pallet_qty,
@@ -4514,117 +4925,155 @@ export async function createScmPurchaseOrderSplit({
            JOIN dispatch_scm_po_splits s ON s.id = sl.split_id
           WHERE s.status = 'active'
           GROUP BY sl.source_line_id
+       ), blanket_alloc AS (
+         SELECT allocation.source_line_id,
+                SUM(CASE WHEN allocation.status = 'reserved' THEN allocation.reserved_pallets ELSE allocation.held_pallets END) AS blanket_pallet_qty,
+                SUM(CASE WHEN allocation.status = 'reserved' THEN allocation.reserved_sales_qty ELSE allocation.held_sales_qty END) AS blanket_sales_qty
+           FROM scm_smart_blanket_allocations allocation
+          WHERE allocation.status IN ('reserved', 'held')
+            AND ($3::bigint IS NULL OR allocation.release_id <> $3::bigint)
+          GROUP BY allocation.source_line_id
        )
        SELECT l.*,
-              COALESCE(pa.allocated_pallet_qty, 0) + COALESCE(sa.split_pallet_qty, 0) AS allocated_pallet_qty,
+              COALESCE(pa.allocated_pallet_qty, 0) + COALESCE(sa.split_pallet_qty, 0) + COALESCE(ba.blanket_pallet_qty, 0) AS allocated_pallet_qty,
               COALESCE(pa.allocated_layer_qty, 0) + COALESCE(sa.split_layer_qty, 0) AS allocated_layer_qty,
               COALESCE(pa.allocated_section_qty, 0) + COALESCE(sa.split_section_qty, 0) AS allocated_section_qty,
               COALESCE(pa.allocated_piece_qty, 0) + COALESCE(sa.split_piece_qty, 0) AS allocated_piece_qty,
-              COALESCE(pa.allocated_sales_qty, 0) + COALESCE(sa.split_sales_qty, 0) AS allocated_sales_qty
+              COALESCE(pa.allocated_sales_qty, 0) + COALESCE(sa.split_sales_qty, 0) + COALESCE(ba.blanket_sales_qty, 0) AS allocated_sales_qty
          FROM purchase_order_lines l
          LEFT JOIN po_alloc pa ON pa.po_line_id = l.id
          LEFT JOIN scm_alloc sa ON sa.source_line_id = l.id
+         LEFT JOIN blanket_alloc ba ON ba.source_line_id = l.id
         WHERE l.purchase_order_id = $1
           AND l.id = ANY($2::bigint[])
-          AND l.netsuite_active = true`,
-      [source.netsuite_id, lineIds]
+          AND l.netsuite_active = true
+        FOR UPDATE OF l`,
+      [source.netsuite_id, lineIds, Number(blanketReleaseId) || null]
     );
     const sourceLineById = new Map(sourceLines.rows.map((row) => [Number(row.id), row]));
     const selected = [];
+    const selectedQuantityBySourceLine = new Map();
     for (const request of requestedLines) {
       const sourceLine = sourceLineById.get(request.lineRowId);
       if (!sourceLine) throw new Error(`Selected PO line ${request.lineRowId} was not found on ${source.tranid}.`);
       const qtys = request.quantities;
       const salesQty = roundDispatchQuantity(lineSalesQty(sourceLine, qtys));
+      const alreadySelected = selectedQuantityBySourceLine.get(request.lineRowId) || {
+        pallets: 0,
+        layers: 0,
+        sections: 0,
+        pieces: 0,
+        salesQty: 0
+      };
       const label = sourceLine.sku || sourceLine.item_name || `line ${sourceLine.line_id || sourceLine.id}`;
       if (hasConversion(sourceLine)) {
         const unitChecks = [
-          ["pallet", qtys.pallets, "PLT"],
-          ["layer", qtys.layers, "LYR"],
-          ["section", qtys.sections, "SEC"],
-          ["piece", qtys.pieces, "PCS"]
+          ["pallet", "pallets", qtys.pallets, "PLT"],
+          ["layer", "layers", qtys.layers, "LYR"],
+          ["section", "sections", qtys.sections, "SEC"],
+          ["piece", "pieces", qtys.pieces, "PCS"]
         ];
-        for (const [unit, value, unitLabel] of unitChecks) {
+        for (const [unit, selectedKey, value, unitLabel] of unitChecks) {
           if (!value) continue;
-          const available = availableUnitQty(sourceLine, unit);
+          const available = Math.max(availableUnitQty(sourceLine, unit) - positiveQuantity(alreadySelected[selectedKey]), 0);
           if (value > available + 0.000001) {
             throw new Error(`${label}: blanket PO only has ${available} ${unitLabel} remaining.`);
           }
         }
       }
       const salesRemaining = Math.max(
-        positiveQuantity(sourceLine.quantity) - purchaseOrderReceivedBaseline(sourceLine) - positiveQuantity(sourceLine.allocated_sales_qty),
+        positiveQuantity(sourceLine.quantity) - purchaseOrderReceivedBaseline(sourceLine)
+          - positiveQuantity(sourceLine.allocated_sales_qty) - positiveQuantity(alreadySelected.salesQty),
         0
       );
       if (salesQty <= 0) throw new Error(`${label}: selected quantity is zero.`);
       if (salesQty > salesRemaining + 0.000001) {
         throw new Error(`${label}: blanket PO only has ${salesRemaining} ${sourceLine.unit || "UOM"} remaining.`);
       }
-      selected.push({ sourceLine, qtys, salesQty });
+      const lineDestinationLocationId = request.destinationLocationId || splitDestinationLocationId;
+      const lineDestinationLocation = locationTextFromId(lineDestinationLocationId);
+      selected.push({
+        sourceLine,
+        qtys,
+        salesQty,
+        destinationLocationId: lineDestinationLocationId,
+        destinationLocation: lineDestinationLocation
+      });
+      selectedQuantityBySourceLine.set(request.lineRowId, {
+        pallets: roundDispatchQuantity(positiveQuantity(alreadySelected.pallets) + positiveQuantity(qtys.pallets)),
+        layers: roundDispatchQuantity(positiveQuantity(alreadySelected.layers) + positiveQuantity(qtys.layers)),
+        sections: roundDispatchQuantity(positiveQuantity(alreadySelected.sections) + positiveQuantity(qtys.sections)),
+        pieces: roundDispatchQuantity(positiveQuantity(alreadySelected.pieces) + positiveQuantity(qtys.pieces)),
+        salesQty: roundDispatchQuantity(positiveQuantity(alreadySelected.salesQty) + salesQty)
+      });
     }
 
-    const splitOrderId = syntheticPurchaseOrderId(`scm-po:${source.netsuite_id}:${splitRef}`);
-    await client.query(
-      `INSERT INTO purchase_orders (
-         netsuite_id, tranid, trandate, vendor_id, vendor, status, status_text, foreign_total,
-         destination_location_id, destination_location, memo, dispatch_vendor_yard, dispatch_address,
-         dispatch_window_start, dispatch_window_end, dispatch_instructions, receipt_status,
-         netsuite_active, synced_at, source_location_id, source_location, expected_delivery_date,
-         dispatch_parse_source, dispatch_note_hash, dispatch_parsed_at, netsuite_missing_at,
-         last_item_receipt_id, last_item_receipt_tranid, received_at, status_updated_at,
-         dispatch_ref, dispatch_ref_updated_at, dispatch_ref_updated_by
-       )
-       SELECT
-         $1, $2, trandate, vendor_id, vendor, status, status_text, foreign_total,
-          $5::bigint, $6::text,
-          CONCAT(COALESCE(memo, ''), CASE WHEN COALESCE(memo, '') = '' THEN '' ELSE E'\n' END, 'SCM split from ', tranid),
-          $7::text, $8::text,
-         $9::text, $10::text, $11::text, receipt_status,
-         true, now(), source_location_id, source_location, expected_delivery_date,
-         $12::text, dispatch_note_hash, now(), null,
-         null, null, null, now(),
-          $2, now(), $4
-         FROM purchase_orders
-        WHERE netsuite_id = $3`,
-      [
-        splitOrderId,
-        splitRef,
-        source.netsuite_id,
-        createdBy || null,
-        splitDestinationLocationId,
-        splitDestinationLocation,
-        splitPickupPoint,
-        splitPickupAddress,
-        splitPickupWindowStart,
-        splitPickupWindowEnd,
-        splitPickupInstructions,
-        splitPickupParseSource
-      ]
-    );
+    let splitOrderId = extendingSplit?.split_po_id || null;
+    let split = extendingSplit;
+    if (!split) {
+      splitOrderId = syntheticPurchaseOrderId(`scm-po:${source.netsuite_id}:${splitRef}`);
+      await query(
+        `INSERT INTO purchase_orders (
+           netsuite_id, tranid, trandate, vendor_id, vendor, status, status_text, foreign_total,
+           destination_location_id, destination_location, memo, dispatch_vendor_yard, dispatch_address,
+           dispatch_window_start, dispatch_window_end, dispatch_instructions, receipt_status,
+           netsuite_active, synced_at, source_location_id, source_location, expected_delivery_date,
+           dispatch_parse_source, dispatch_note_hash, dispatch_parsed_at, netsuite_missing_at,
+           last_item_receipt_id, last_item_receipt_tranid, received_at, status_updated_at,
+           dispatch_ref, dispatch_ref_updated_at, dispatch_ref_updated_by
+         )
+         SELECT
+           $1, $2, trandate, vendor_id, vendor, status, status_text, foreign_total,
+            $5::bigint, $6::text,
+            CONCAT(COALESCE(memo, ''), CASE WHEN COALESCE(memo, '') = '' THEN '' ELSE E'\n' END, 'SCM split from ', tranid),
+            $7::text, $8::text,
+           $9::text, $10::text, $11::text, receipt_status,
+           true, now(), source_location_id, source_location, expected_delivery_date,
+           $12::text, dispatch_note_hash, now(), null,
+           null, null, null, now(),
+            $2, now(), $4
+           FROM purchase_orders
+          WHERE netsuite_id = $3`,
+        [
+          splitOrderId,
+          splitRef,
+          source.netsuite_id,
+          createdBy || null,
+          splitDestinationLocationId,
+          splitDestinationLocation,
+          splitPickupPoint,
+          splitPickupAddress,
+          splitPickupWindowStart,
+          splitPickupWindowEnd,
+          splitPickupInstructions,
+          splitPickupParseSource
+        ]
+      );
 
-    const splitHeader = await client.query(
-      `INSERT INTO dispatch_scm_po_splits (
-         source_po_id, source_po_ref, split_po_id, split_po_ref, created_by, details
-       ) VALUES ($1, $2, $3, $4, $5, $6::jsonb)
-       RETURNING *`,
-      [
-        source.netsuite_id,
-        source.tranid,
-        splitOrderId,
-        splitRef,
-        createdBy,
-        JSON.stringify({
-          ...(details || {}),
-          pickupPoint: splitPickupPoint,
-          pickupAddress: splitPickupAddress,
-          destinationLocationId: splitDestinationLocationId,
-          destinationLocation: splitDestinationLocation
-        })
-      ]
-    );
-    const split = splitHeader.rows[0];
+      const splitHeader = await query(
+        `INSERT INTO dispatch_scm_po_splits (
+           source_po_id, source_po_ref, split_po_id, split_po_ref, created_by, details
+         ) VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+         RETURNING *`,
+        [
+          source.netsuite_id,
+          source.tranid,
+          splitOrderId,
+          splitRef,
+          createdBy,
+          JSON.stringify({
+            ...(details || {}),
+            pickupPoint: splitPickupPoint,
+            pickupAddress: splitPickupAddress,
+            destinationLocationId: splitDestinationLocationId,
+            destinationLocation: splitDestinationLocation
+          })
+        ]
+      );
+      split = splitHeader.rows[0];
+    }
     if (splitPickupPoint) {
-      await client.query(
+      await query(
         `INSERT INTO scm_transport_schedule (
            order_kind, order_ref, pickup_point, brand, updated_by, created_by
          ) VALUES ('PO', $1, $2, NULLIF($3, ''), $4, $4)
@@ -4637,11 +5086,78 @@ export async function createScmPurchaseOrderSplit({
       );
     }
     const createdLines = [];
+    const existingChildLines = await query(
+      `SELECT ledger.id AS ledger_id, ledger.source_line_id, ledger.split_line_id,
+              child.location_id, child.line_id
+         FROM dispatch_scm_po_split_lines ledger
+         JOIN purchase_order_lines child ON child.id = ledger.split_line_id
+        WHERE ledger.split_id = $1
+        FOR UPDATE OF ledger, child`,
+      [split.id]
+    );
+    const existingChildBySourceDestination = new Map(existingChildLines.rows.map((row) => [
+      `${row.source_line_id}:${normalizeScmDestinationLocationId(row.location_id)}`,
+      row
+    ]));
+    const usedChildLineKeys = new Set(existingChildLines.rows.map((row) => String(row.line_id)));
     for (const selection of selected) {
       const sourceLine = selection.sourceLine;
       const qtys = selection.qtys;
-      const splitLineId = syntheticPurchaseOrderId(`scm-po-line:${splitRef}:${sourceLine.id}`);
-      const inserted = await client.query(
+      const childLineIdentity = `${sourceLine.id}:${selection.destinationLocationId}`;
+      const existingChild = existingChildBySourceDestination.get(childLineIdentity);
+      if (existingChild) {
+        const extended = await query(
+          `UPDATE purchase_order_lines
+              SET quantity = COALESCE(quantity, 0) + $2,
+                  pallet_qty = COALESCE(pallet_qty, 0) + $3,
+                  layer_qty = COALESCE(layer_qty, 0) + $4,
+                  section_qty = COALESCE(section_qty, 0) + $5,
+                  piece_qty = COALESCE(piece_qty, 0) + $6,
+                  synced_at = now(),
+                  raw = COALESCE(raw, '{}'::jsonb) || jsonb_build_object(
+                    'blanketExtension', true,
+                    'blanketExtensionAt', now(),
+                    'blanketReleaseId', $7::bigint
+                  )
+            WHERE id = $1
+            RETURNING *`,
+          [existingChild.split_line_id, selection.salesQty,
+            hasConversion(sourceLine) ? qtys.pallets : 0,
+            hasConversion(sourceLine) ? qtys.layers : 0,
+            hasConversion(sourceLine) ? qtys.sections : 0,
+            hasConversion(sourceLine) ? qtys.pieces : 0,
+            Number(blanketReleaseId) || null]
+        );
+        await query(
+          `UPDATE dispatch_scm_po_split_lines
+              SET pallet_qty = pallet_qty + $2,
+                  layer_qty = layer_qty + $3,
+                  section_qty = section_qty + $4,
+                  piece_qty = piece_qty + $5,
+                  sales_qty = sales_qty + $6,
+                  requested_pallet_qty = COALESCE(requested_pallet_qty, 0) + $2,
+                  requested_layer_qty = COALESCE(requested_layer_qty, 0) + $3,
+                  requested_section_qty = COALESCE(requested_section_qty, 0) + $4,
+                  requested_piece_qty = COALESCE(requested_piece_qty, 0) + $5,
+                  requested_sales_qty = COALESCE(requested_sales_qty, 0) + $6
+            WHERE id = $1`,
+          [existingChild.ledger_id,
+            hasConversion(sourceLine) ? qtys.pallets : 0,
+            hasConversion(sourceLine) ? qtys.layers : 0,
+            hasConversion(sourceLine) ? qtys.sections : 0,
+            hasConversion(sourceLine) ? qtys.pieces : 0,
+            selection.salesQty]
+        );
+        createdLines.push({ ...extended.rows[0], source_line_id: sourceLine.id });
+        continue;
+      }
+      const splitLineId = syntheticPurchaseOrderId(`scm-po-line:${splitRef}:${childLineIdentity}`);
+      const originalLineKey = Number(sourceLine.line_id);
+      const childLineKey = !usedChildLineKeys.has(String(originalLineKey))
+        ? sourceLine.line_id
+        : syntheticPurchaseOrderId(`scm-po-line-key:${splitRef}:${childLineIdentity}`);
+      usedChildLineKeys.add(String(childLineKey));
+      const inserted = await query(
         `INSERT INTO purchase_order_lines (
            id, purchase_order_id, line_id, item_id, item_name, sku, item_description, item_type,
            item_type_text, quantity, unit, location_id, location, pallet_qty, layer_qty,
@@ -4661,7 +5177,7 @@ export async function createScmPurchaseOrderSplit({
         [
           splitLineId,
           splitOrderId,
-          sourceLine.line_id,
+          childLineKey,
           sourceLine.item_id,
           sourceLine.item_name,
           sourceLine.sku,
@@ -4670,8 +5186,8 @@ export async function createScmPurchaseOrderSplit({
           sourceLine.item_type_text,
           selection.salesQty,
           sourceLine.unit,
-          splitDestinationLocationId,
-          splitDestinationLocation,
+          selection.destinationLocationId,
+          selection.destinationLocation,
           hasConversion(sourceLine) ? qtys.pallets : 0,
           hasConversion(sourceLine) ? qtys.layers : 0,
           hasConversion(sourceLine) ? qtys.sections : 0,
@@ -4686,15 +5202,16 @@ export async function createScmPurchaseOrderSplit({
             sourcePoRef: source.tranid,
             sourcePoId: source.netsuite_id,
             sourceLineId: sourceLine.id,
-            destinationLocationId: splitDestinationLocationId,
-            destinationLocation: splitDestinationLocation,
+            sourceLineKey: sourceLine.line_id,
+            destinationLocationId: selection.destinationLocationId,
+            destinationLocation: selection.destinationLocation,
             selected: qtys
           })
         ]
       );
       const splitLine = inserted.rows[0];
-      createdLines.push(splitLine);
-      await client.query(
+      createdLines.push({ ...splitLine, source_line_id: sourceLine.id });
+      await query(
         `INSERT INTO dispatch_scm_po_split_lines (
            split_id, source_line_id, split_line_id, item_id, sku, item_name,
            pallet_qty, layer_qty, section_qty, piece_qty, sales_qty, unit,
@@ -4720,7 +5237,6 @@ export async function createScmPurchaseOrderSplit({
         ]
       );
     }
-    await client.query("COMMIT");
     return {
       split: {
         id: split.id,
@@ -4740,20 +5256,18 @@ export async function createScmPurchaseOrderSplit({
         itemId: line.item_id,
         sku: line.sku || line.item_name,
         itemName: line.item_name,
+        sourceLineId: Number(line.source_line_id),
         quantity: positiveQuantity(line.quantity),
         unit: line.unit || "",
         pallets: positiveQuantity(line.pallet_qty),
         layers: positiveQuantity(line.layer_qty),
         sections: positiveQuantity(line.section_qty),
-        pieces: positiveQuantity(line.piece_qty)
+        pieces: positiveQuantity(line.piece_qty),
+        destinationLocationId: normalizeScmDestinationLocationId(line.location_id),
+        destinationLocation: line.location || locationTextFromId(line.location_id)
       }))
     };
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => null);
-    throw error;
-  } finally {
-    client.release();
-  }
+  });
 }
 
 const MBBS_SPECIAL_ITEM_ID = 2055;

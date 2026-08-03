@@ -12,11 +12,44 @@ const parentId = 9960000000 + seed;
 const parentRef = `HARNESS-TO-${seed}`;
 const splitRef = `${parentRef}-S1`;
 const rowOnlySplitRef = `${parentRef}-S2`;
+const unplacedEmptySplitRef = `${parentRef}-S8`;
 const invalidSplitRef = `${parentRef}-S9`;
 const firstLineKey = 780000 + (seed % 100000);
 const secondLineKey = firstLineKey + 1;
 const planDate = "2098-12-28";
 const sharedSku = `HARNESS-TO-SKU-${seed}`;
+
+function plannedTrucks(orderRef) {
+  return [{
+    id: `HARNESS-TRUCK-${seed}`,
+    plate: "HARNESS",
+    driver: "Harness",
+    loads: [{
+      id: `HARNESS-LOAD-${seed}`,
+      name: "Load 1",
+      stops: [{
+        id: `HARNESS-DROP-${orderRef}`,
+        type: "drop",
+        orderId: orderRef,
+        location: "3445"
+      }]
+    }]
+  }];
+}
+
+async function clearSplitDispatchAssignment(orderRef) {
+  await query(
+    `UPDATE transfer_orders
+        SET dispatch_planned = false,
+            dispatch_plan_date = null,
+            dispatch_truck_plate = null,
+            dispatch_load_name = null,
+            dispatch_parking_spot = null,
+            dispatch_planned_at = null
+      WHERE tranid = $1`,
+    [orderRef]
+  );
+}
 
 async function ensureTransferSplitLedgerSchema() {
   const existing = await query(
@@ -63,7 +96,7 @@ function splitPlan({
       originalOrderId: parentRef,
       items: [item]
     }],
-    trucks: []
+    trucks: plannedTrucks(orderRef)
   };
 }
 
@@ -103,6 +136,28 @@ try {
     const selectedSource = sourceLines.rows.find((line) => Number(line.line_id) === secondLineKey);
     const rowOnlySource = sourceLines.rows.find((line) => line.line_id == null);
     assert(firstSource && selectedSource && rowOnlySource, "source TO test lines should be created");
+
+    await applyConfirmedDispatchPlanToDelivery({
+      id: `transfer-unplaced-empty-split-${seed}`,
+      planDate,
+      status: "confirmed",
+      orders: [{
+        id: unplacedEmptySplitRef,
+        type: "TO",
+        originalOrderId: parentRef,
+        items: []
+      }],
+      trucks: []
+    });
+    const unplacedEmptyChild = await query(
+      "SELECT netsuite_id FROM transfer_orders WHERE tranid = $1",
+      [unplacedEmptySplitRef]
+    );
+    assert.equal(
+      unplacedEmptyChild.rowCount,
+      0,
+      "An unplaced empty split cached in the order pool must not be materialized."
+    );
 
     await assert.rejects(
       applyConfirmedDispatchPlanToDelivery(splitPlan({
@@ -228,7 +283,7 @@ try {
           originalOrderId: parentRef,
           items: []
         }],
-        trucks: []
+        trucks: plannedTrucks(splitRef)
       }),
       /must include at least one item/i,
       "An empty active TO split must fail instead of deleting its materialized lines."
@@ -283,6 +338,7 @@ try {
     assert.equal(Number(rematerialized.rows[0].requested_piece_qty), 6);
     assert.equal(Number(rematerialized.rows[0].requested_sales_qty), 6);
 
+    await clearSplitDispatchAssignment(splitRef);
     const deactivated = await deactivateUnplannedDispatchSplitOrders({
       originalOrderId: parentRef,
       orderType: "TO",
@@ -356,6 +412,7 @@ try {
         splitRef
       ]
     );
+    await clearSplitDispatchAssignment(splitRef);
     await assert.rejects(
       deactivateUnplannedDispatchSplitOrders({
         originalOrderId: parentRef,

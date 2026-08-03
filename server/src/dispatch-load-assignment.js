@@ -1,5 +1,11 @@
 const DEFAULT_SWITCH_MINUTES = 10;
 const DEFAULT_OWN_YARDS = ["3445", "2967", "12441", "150"];
+const DEFAULT_OWN_YARD_ADDRESSES = {
+  "3445": "3445 Kennedy Road, Toronto, ON",
+  "2967": "2967 Kennedy Road, Toronto, ON",
+  "12441": "12441 Woodbine Avenue, Whitchurch-Stouffville, ON",
+  "150": "150 Clark Blvd, Brampton, ON L6T 4Y8, Canada"
+};
 
 function text(value) {
   return String(value ?? "").trim();
@@ -111,6 +117,647 @@ export function flattenDispatchPlanLoads(plan = {}) {
   return rows;
 }
 
+function dispatchOrderByRef(plan = {}, orderRef = "") {
+  const wanted = text(orderRef);
+  if (!wanted) return null;
+  const visit = (order = {}) => {
+    if (text(order.id) === wanted || text(order.originalOrderId) === wanted) return order;
+    for (const child of order.childOrderDetails || []) {
+      const match = visit(child);
+      if (match) return match;
+    }
+    return null;
+  };
+  for (const order of plan.orders || []) {
+    const match = visit(order);
+    if (match) return match;
+  }
+  return null;
+}
+
+function normalizedPhysicalVisitText(value) {
+  return text(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function dispatchDropLocation(stop = {}, order = {}) {
+  return text(
+    stop.dropLocation
+    || stop.drop_location
+    || stop.destinationYard
+    || stop.destination_yard
+    || order.destinationYard
+    || order.destination_yard
+    || order.toLocation
+    || order.to_location
+    || stop.location
+    || stop.yard
+  );
+}
+
+function dispatchStopPhysicalAddress(stop = {}, order = {}) {
+  const stopType = text(stop.type).toLowerCase();
+  if (["pick", "pickup"].includes(stopType)) {
+    return text(
+      stop.address
+      || order.pickupAddressOverride
+      || order.pickup_address_override
+      || order.sourceAddress
+      || order.source_address
+      || order.defaultSourceAddress
+      || stop.location
+      || stop.yard
+    );
+  }
+  return text(
+    stop.dropAddress
+    || stop.drop_address
+    || stop.address
+    || order.destinationAddress
+    || order.destination_address
+    || order.dropAddress
+    || order.drop_address
+    || order.address
+    || dispatchDropLocation(stop, order)
+  );
+}
+
+function dispatchStopPhysicalAddressKey(plan = {}, stop = {}, order = {}) {
+  const dropLocation = dispatchDropLocation(stop, order);
+  const ownYards = new Set(dispatchOwnYardCodes(plan).map((value) => normalizedPhysicalVisitText(value)));
+  if (ownYards.has(normalizedPhysicalVisitText(dropLocation))) {
+    const configuredYards = [
+      ...(Array.isArray(plan.ownYards) ? plan.ownYards : []),
+      ...(Array.isArray(plan.summary?.ownYards) ? plan.summary.ownYards : []),
+      ...(Array.isArray(plan.summary?.dispatchPlanFormat?.ownYards) ? plan.summary.dispatchPlanFormat.ownYards : [])
+    ];
+    const configuredYard = configuredYards.find((yard) =>
+      yard && typeof yard === "object"
+      && normalizedPhysicalVisitText(yard.code || yard.name || yard.id) === normalizedPhysicalVisitText(dropLocation)
+    );
+    const address = text(configuredYard?.address || DEFAULT_OWN_YARD_ADDRESSES[dropLocation]);
+    return normalizedPhysicalVisitText(address) || `own:${normalizedPhysicalVisitText(dropLocation)}`;
+  }
+  return normalizedPhysicalVisitText(dispatchStopPhysicalAddress(stop, order));
+}
+
+function dispatchDropoffForStop(order = {}, stop = {}) {
+  const dropoffs = Array.isArray(order.dropoffs) ? order.dropoffs : [];
+  const dropoffKey = text(stop.dropoffKey ?? stop.dropoff_key);
+  if (dropoffKey) {
+    const exact = dropoffs.find((dropoff) => text(dropoff?.key) === dropoffKey);
+    if (exact) return exact;
+  }
+  const destinationYard = text(stop.dropLocation ?? stop.drop_location);
+  if (destinationYard) {
+    const exact = dropoffs.find((dropoff) => text(dropoff?.destinationYard ?? dropoff?.destination_yard) === destinationYard);
+    if (exact) return exact;
+  }
+  return dropoffs.length === 1 ? dropoffs[0] : null;
+}
+
+function dispatchLineRowId(item = {}) {
+  return text(item.lineRowId ?? item.line_row_id ?? item.id);
+}
+
+function dispatchDropItemsForStop(order = {}, stop = {}) {
+  const stopLineRowIds = Array.isArray(stop.lineRowIds ?? stop.line_row_ids)
+    ? (stop.lineRowIds ?? stop.line_row_ids).map(text).filter(Boolean)
+    : [];
+  const dropoffLineRowIds = dispatchDropoffForStop(order, stop)?.lineRowIds
+    ?? dispatchDropoffForStop(order, stop)?.line_row_ids
+    ?? [];
+  const selectedIds = new Set((stopLineRowIds.length ? stopLineRowIds : dropoffLineRowIds).map(text).filter(Boolean));
+  if (!selectedIds.size) return (order.dropoffs || []).length > 1 ? [] : order.items || [];
+  return (order.items || []).filter((item) => selectedIds.has(dispatchLineRowId(item)));
+}
+
+function dispatchNumber(value) {
+  return finiteNumber(value) ?? 0;
+}
+
+function dispatchDropPallets(order = {}, stop = {}) {
+  const dropoff = dispatchDropoffForStop(order, stop) || {};
+  const explicit = stop.dropPallets
+    ?? stop.drop_pallets
+    ?? dropoff.pallets
+    ?? dropoff.pallet_qty;
+  if (explicit !== undefined && explicit !== null && finiteNumber(explicit) !== null) {
+    return Math.max(0, Number(explicit));
+  }
+  const itemPallets = dispatchDropItemsForStop(order, stop)
+    .reduce((sum, item) => sum + dispatchNumber(item?.pallets ?? item?.pallet_qty), 0);
+  if (itemPallets > 0) return itemPallets;
+  return (order.dropoffs || []).length > 1
+    ? 0
+    : dispatchNumber(order.pallets ?? order.pallet_qty);
+}
+
+function dispatchDropFootprintPallets(order = {}, stop = {}) {
+  const dropoff = dispatchDropoffForStop(order, stop) || {};
+  const items = dispatchDropItemsForStop(order, stop);
+  const pallets = dispatchDropPallets(order, stop);
+  const hasLoose = dispatchNumber(stop.dropLayers ?? stop.drop_layers ?? dropoff.layers ?? dropoff.layer_qty) > 0
+    || dispatchNumber(stop.dropSections ?? stop.drop_sections ?? dropoff.sections ?? dropoff.section_qty) > 0
+    || dispatchNumber(stop.dropPieces ?? stop.drop_pieces ?? dropoff.pieces ?? dropoff.piece_qty) > 0
+    || items.some((item) =>
+      dispatchNumber(item?.layers ?? item?.layer_qty) > 0
+      || dispatchNumber(item?.sections ?? item?.section_qty) > 0
+      || dispatchNumber(item?.pieces ?? item?.piece_qty) > 0
+    );
+  return pallets + (hasLoose ? 1 : 0);
+}
+
+function normalizedDispatchPickupLocation(value) {
+  return text(value).toLowerCase();
+}
+
+function dispatchPickupEntriesForLocation(order = {}, field, location = "") {
+  const wanted = normalizedDispatchPickupLocation(location);
+  return (Array.isArray(order[field]) ? order[field] : [])
+    .filter((entry) => normalizedDispatchPickupLocation(entry?.location) === wanted);
+}
+
+function dispatchDirectPickupItemsForLocation(order = {}, location = "") {
+  return dispatchPickupEntriesForLocation(order, "directPickupManifest", location)
+    .flatMap((entry) => (entry.items || []).map((item) => ({
+      ...item,
+      pallets: dispatchNumber(item.palletQty ?? item.pallet_qty),
+      layers: dispatchNumber(item.layerQty ?? item.layer_qty),
+      sections: dispatchNumber(item.sectionQty ?? item.section_qty),
+      pieces: dispatchNumber(item.pieceQty ?? item.piece_qty),
+      quantity: dispatchNumber(item.quantity),
+      salesQty: dispatchNumber(item.quantity)
+    })));
+}
+
+function dispatchPoPickupItemsForLocation(order = {}, location = "") {
+  return dispatchPickupEntriesForLocation(order, "poPickupManifest", location)
+    .flatMap((entry) => (entry.items || []).map((item) => ({
+      ...item,
+      salesQty: dispatchNumber(item.quantity)
+    })));
+}
+
+function dispatchDirectPickupAllocatedForItem(order = {}, item = {}) {
+  const itemId = text(item.itemId ?? item.item_id);
+  const sku = text(item.sku || item.itemName || item.name).toLowerCase();
+  const matches = (order.directPickupManifest || []).flatMap((entry) => entry.items || []).filter((entry) => {
+    if (itemId && text(entry.itemId ?? entry.item_id) === itemId) return true;
+    return sku && text(entry.sku || entry.itemName).toLowerCase() === sku;
+  });
+  return matches.reduce((total, entry) => ({
+    pallets: total.pallets + dispatchNumber(entry.palletQty ?? entry.pallet_qty),
+    layers: total.layers + dispatchNumber(entry.layerQty ?? entry.layer_qty),
+    sections: total.sections + dispatchNumber(entry.sectionQty ?? entry.section_qty),
+    pieces: total.pieces + dispatchNumber(entry.pieceQty ?? entry.piece_qty),
+    quantity: total.quantity + dispatchNumber(entry.quantity)
+  }), { pallets: 0, layers: 0, sections: 0, pieces: 0, quantity: 0 });
+}
+
+function dispatchOwnYardLocationKeys(plan = {}) {
+  const values = [
+    ...dispatchOwnYardCodes(plan),
+    ...Object.entries(DEFAULT_OWN_YARD_ADDRESSES).map(([code, address]) => ({ code, address })),
+    ...(Array.isArray(plan.ownYards) ? plan.ownYards : []),
+    ...(Array.isArray(plan.summary?.ownYards) ? plan.summary.ownYards : [])
+  ];
+  const keys = new Set();
+  for (const value of values) {
+    if (value && typeof value === "object") {
+      for (const candidate of [value.code, value.name, value.address, value.id]) {
+        const candidateKey = normalizedPhysicalVisitText(candidate);
+        if (candidateKey) keys.add(candidateKey);
+      }
+    } else {
+      const candidateKey = normalizedPhysicalVisitText(value);
+      if (candidateKey) keys.add(candidateKey);
+    }
+  }
+  return keys;
+}
+
+function dispatchItemForPickupLocation(plan = {}, order = {}, item = {}, location = "") {
+  if (text(order.type).toUpperCase() === "CUSTOM") return item;
+  const ownYard = dispatchOwnYardLocationKeys(plan).has(normalizedPhysicalVisitText(location));
+  if (ownYard) {
+    const source = text(order.sourceYard || order.outboundLocation);
+    const direct = source === text(location)
+      ? dispatchDirectPickupAllocatedForItem(order, item)
+      : { pallets: 0, layers: 0, sections: 0, pieces: 0, quantity: 0 };
+    const balance = (value, allocated) => Math.max(dispatchNumber(value) - dispatchNumber(allocated), 0);
+    return {
+      ...item,
+      pallets: balance(item.pallets, dispatchNumber(item.poAllocatedPallets) + direct.pallets),
+      layers: balance(item.layers, dispatchNumber(item.poAllocatedLayers) + direct.layers),
+      sections: balance(item.sections, dispatchNumber(item.poAllocatedSections) + direct.sections),
+      pieces: balance(item.pieces, dispatchNumber(item.poAllocatedPieces) + direct.pieces),
+      quantity: balance(item.quantity ?? item.salesQty, dispatchNumber(item.poAllocatedSalesQty) + direct.quantity),
+      salesQty: balance(item.salesQty ?? item.quantity, dispatchNumber(item.poAllocatedSalesQty) + direct.quantity)
+    };
+  }
+  return {
+    ...item,
+    pallets: dispatchNumber(item.poAllocatedPallets),
+    layers: dispatchNumber(item.poAllocatedLayers),
+    sections: dispatchNumber(item.poAllocatedSections),
+    pieces: dispatchNumber(item.poAllocatedPieces),
+    quantity: dispatchNumber(item.poAllocatedSalesQty),
+    salesQty: dispatchNumber(item.poAllocatedSalesQty)
+  };
+}
+
+function dispatchItemHasQuantity(item = {}) {
+  return Boolean(
+    dispatchNumber(item.pallets ?? item.pallet_qty)
+    || dispatchNumber(item.layers ?? item.layer_qty)
+    || dispatchNumber(item.sections ?? item.section_qty)
+    || dispatchNumber(item.pieces ?? item.piece_qty)
+    || dispatchNumber(item.quantity ?? item.salesQty ?? item.sales_qty)
+  );
+}
+
+function dispatchPickupItemsForLocation(plan = {}, order = {}, location = "") {
+  if (text(order.type).toUpperCase() === "PO") return (order.items || []).filter(dispatchItemHasQuantity);
+  const directItems = dispatchDirectPickupItemsForLocation(order, location);
+  if (directItems.length && text(order.sourceYard || order.outboundLocation) !== text(location)) {
+    return directItems.filter(dispatchItemHasQuantity);
+  }
+  const poItems = dispatchPoPickupItemsForLocation(order, location);
+  const ownYard = dispatchOwnYardLocationKeys(plan).has(normalizedPhysicalVisitText(location));
+  if (poItems.length && !ownYard) return poItems.filter(dispatchItemHasQuantity);
+  return (order.items || [])
+    .map((item) => dispatchItemForPickupLocation(plan, order, item, location))
+    .filter(dispatchItemHasQuantity);
+}
+
+function dispatchPickupFootprintForOrderLocation(plan = {}, order = {}, location = "") {
+  const items = dispatchPickupItemsForLocation(plan, order, location);
+  if (!items.length) return 0;
+  const pallets = items.reduce((sum, item) => sum + dispatchNumber(item.pallets ?? item.pallet_qty), 0);
+  const hasLoose = items.some((item) =>
+    dispatchNumber(item.layers ?? item.layer_qty) > 0
+    || dispatchNumber(item.sections ?? item.section_qty) > 0
+    || dispatchNumber(item.pieces ?? item.piece_qty) > 0
+  );
+  if (pallets || hasLoose) return pallets + (hasLoose ? 1 : 0);
+  const directEntries = dispatchPickupEntriesForLocation(order, "directPickupManifest", location);
+  if (directEntries.length) {
+    return directEntries.reduce((sum, entry) => sum + (entry.items || [])
+      .reduce((itemSum, item) => itemSum + dispatchNumber(item.palletQty ?? item.pallet_qty), 0), 0);
+  }
+  return dispatchNumber(order.pallets ?? order.pallet_qty)
+    + (dispatchNumber(order.layers ?? order.layer_qty) > 0 ? 1 : 0);
+}
+
+function dispatchRequiredPickupLocations(plan = {}, order = {}) {
+  const locations = Array.isArray(order.pickupLocations) && order.pickupLocations.length
+    ? order.pickupLocations
+    : ["3445"];
+  const seen = new Set();
+  const uniqueLocations = locations.filter((location) => {
+    const locationKey = normalizedDispatchPickupLocation(location);
+    if (!locationKey || seen.has(locationKey)) return false;
+    seen.add(locationKey);
+    return true;
+  });
+  const hasPickupAddressOverride = Boolean(text(order.pickupAddressOverride));
+  return uniqueLocations.filter((location, index) =>
+    (hasPickupAddressOverride && index === 0)
+    || dispatchPickupItemsForLocation(plan, order, location).some(dispatchItemHasQuantity)
+  );
+}
+
+function dispatchPickupFootprintForLocation(plan = {}, load = {}, location = "") {
+  const pickupLocation = text(location);
+  const countedOrders = new Set();
+  let total = 0;
+  for (const stop of load.stops || []) {
+    if (!["drop", "dropoff"].includes(text(stop.type).toLowerCase())) continue;
+    const orderId = text(stop.orderId);
+    if (!orderId || countedOrders.has(orderId)) continue;
+    const order = dispatchOrderByRef(plan, orderId);
+    if (!order) continue;
+    if (!dispatchRequiredPickupLocations(plan, order).map(text).includes(pickupLocation)) continue;
+    countedOrders.add(orderId);
+    total += dispatchPickupFootprintForOrderLocation(plan, order, pickupLocation);
+  }
+  return total;
+}
+
+function isLocalDispatchVrmaOrder(order = {}) {
+  return text(order.sourceTable || order.source_table).toLowerCase() === "scm_vrma_orders"
+    || text(order.parseSource || order.parse_source).toLowerCase() === "scm-vrma";
+}
+
+function dispatchCustomOrderStopMinutes(stop = {}, order = {}) {
+  const isCustom = text(order.type).toUpperCase() === "CUSTOM"
+    || order.customOrder === true
+    || text(order.sourceTable || order.source_table).toLowerCase() === "dispatch_custom_orders";
+  if (!["drop", "dropoff"].includes(text(stop.type).toLowerCase()) || !isCustom) return null;
+  const raw = order.stopMinutes ?? order.stop_minutes ?? order.raw?.stop_minutes;
+  if (raw === null || raw === undefined || text(raw) === "") return null;
+  const minutes = finiteNumber(raw);
+  return Number.isInteger(minutes) && minutes >= 0 && minutes <= 1440 ? minutes : null;
+}
+
+function dispatchStopOverrideState(stop = {}) {
+  if (!Object.prototype.hasOwnProperty.call(stop, "stopTimeOverrideMinutes")) {
+    return { provided: false, valid: true, value: null };
+  }
+  const raw = stop.stopTimeOverrideMinutes;
+  if (raw === null) return { provided: true, valid: true, value: null };
+  return {
+    provided: true,
+    valid: typeof raw === "number" && Number.isInteger(raw) && raw >= 0 && raw <= 1440,
+    value: typeof raw === "number" && Number.isInteger(raw) && raw >= 0 && raw <= 1440 ? raw : null
+  };
+}
+
+export function isValidDispatchStopTimeOverrideMinutes(value, { allowUndefined = true } = {}) {
+  if (value === undefined) return Boolean(allowUndefined);
+  return value === null || (typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 1440);
+}
+
+function dispatchVisitServiceType(plan = {}, entries = []) {
+  const ownYards = dispatchOwnYardLocationKeys(plan);
+  const types = entries.map(({ stop, order }) => {
+    const stopType = text(stop.type).toLowerCase();
+    const pickup = stopType === "pick" || stopType === "pickup";
+    const pickupAddressOverride = pickup
+      ? text(order.pickupAddressOverride || order.pickup_address_override)
+      : "";
+    const location = pickup
+      ? pickupAddressOverride || text(stop.location || stop.yard)
+      : dispatchDropLocation(stop, order);
+    if (ownYards.has(normalizedPhysicalVisitText(location))) return "own_yard";
+    if (pickup || isLocalDispatchVrmaOrder(order)) return "vendor_yard";
+    return "delivery";
+  });
+  if (types.includes("delivery")) return "delivery";
+  if (types.includes("vendor_yard")) return "vendor_yard";
+  return "own_yard";
+}
+
+function dispatchProfileMinute(profile = {}, fields = [], fallback = 0) {
+  for (const field of fields) {
+    const value = finiteNumber(profile[field]);
+    if (value !== null) return value;
+  }
+  return fallback;
+}
+
+function dispatchVisitAutomaticMinutes(serviceType, profile = {}, pallets = 0) {
+  if (serviceType === "own_yard") {
+    return Math.round(dispatchProfileMinute(profile, ["ownYardFixedMinutes", "loadMinutes"], 40));
+  }
+  if (serviceType === "vendor_yard") {
+    return Math.round(dispatchProfileMinute(profile, ["vendorFixedMinutes", "outsideFixedMinutes", "unloadMinutes"], 35));
+  }
+  const fixed = dispatchProfileMinute(profile, ["deliveryFixedMinutes", "outsideFixedMinutes", "unloadMinutes"], 35);
+  const perPallet = dispatchProfileMinute(profile, ["minutesPerPallet"], 1);
+  return Math.round(fixed + (Math.max(0, Number(pallets || 0)) * perPallet));
+}
+
+/**
+ * Materialize the logical stops in one load as physical visits.
+ *
+ * Only adjacent drop-offs at the exact normalized address merge. Pickups stay
+ * independent because they can represent distinct loading workflows even when
+ * their address is shared. The returned planned duration is one driver rule per
+ * physical visit, with a dispatcher override taking precedence.
+ */
+export function dispatchPhysicalStopVisits(plan = {}, parentTruck = {}, load = {}, {
+  planningProfile = null
+} = {}) {
+  const profile = { ...parentTruck, ...load, ...(planningProfile || {}) };
+  const visits = [];
+  for (const [index, stop] of (load.stops || []).entries()) {
+    if (!["pick", "pickup", "drop", "dropoff"].includes(text(stop?.type).toLowerCase())) continue;
+    const order = dispatchOrderByRef(plan, stop.orderId) || {};
+    const stopType = ["drop", "dropoff"].includes(text(stop.type).toLowerCase()) ? "drop" : "pick";
+    const address = dispatchStopPhysicalAddress(stop, order);
+    const addressKey = stopType === "drop" ? dispatchStopPhysicalAddressKey(plan, stop, order) : "";
+    const entry = {
+      stop,
+      order,
+      index,
+      stopId: text(stop.id),
+      address,
+      addressKey,
+      pallets: stopType === "drop"
+        ? dispatchDropFootprintPallets(order, stop)
+        : dispatchPickupFootprintForLocation(plan, load, stop.location || stop.yard),
+      customStopMinutes: dispatchCustomOrderStopMinutes(stop, order),
+      override: dispatchStopOverrideState(stop)
+    };
+    const previous = visits[visits.length - 1];
+    if (addressKey && previous?.type === "drop" && previous.addressKey === addressKey) {
+      previous.entries.push(entry);
+      continue;
+    }
+    visits.push({
+      id: text(stop.id) || `${text(load.id)}-visit-${index}`,
+      loadId: text(load.id),
+      type: stopType,
+      address,
+      addressKey,
+      entries: [entry]
+    });
+  }
+
+  return visits.map((visit) => {
+    const serviceType = dispatchVisitServiceType(plan, visit.entries);
+    const pallets = visit.entries.reduce((sum, entry) => sum + Number(entry.pallets || 0), 0);
+    const automaticMinutes = dispatchVisitAutomaticMinutes(serviceType, profile, pallets);
+    const customValues = visit.entries.map((entry) => entry.customStopMinutes).filter(Number.isInteger);
+    const customMinutes = customValues.length ? Math.max(...customValues) : null;
+    const validOverrideValues = visit.entries
+      .filter((entry) => entry.override.valid)
+      .map((entry) => entry.override.value);
+    const distinctOverrideValues = [...new Set(validOverrideValues.map((value) => value === null ? "automatic" : String(value)))];
+    const overrideConflict = distinctOverrideValues.length > 1;
+    const overrideMinutes = !overrideConflict && distinctOverrideValues.length === 1
+      ? (distinctOverrideValues[0] === "automatic" ? null : Number(distinctOverrideValues[0]))
+      : null;
+    const mixedVisit = visit.entries.length > 1;
+    const ruleMinutes = customMinutes === null
+      ? automaticMinutes
+      : mixedVisit
+        ? Math.max(automaticMinutes, customMinutes)
+        : customMinutes;
+    return {
+      ...visit,
+      stopIds: visit.entries.map((entry) => entry.stopId).filter(Boolean),
+      firstIndex: visit.entries[0]?.index ?? -1,
+      lastIndex: visit.entries[visit.entries.length - 1]?.index ?? -1,
+      serviceType,
+      pallets,
+      automaticMinutes,
+      customMinutes,
+      overrideMinutes,
+      overrideConflict,
+      invalidOverrideStopIds: visit.entries.filter((entry) => !entry.override.valid).map((entry) => entry.stopId),
+      plannedMinutes: overrideMinutes ?? ruleMinutes
+    };
+  });
+}
+
+const LOCKED_LOAD_DERIVED_SCHEDULE_FIELDS = [
+  "start",
+  "startMode",
+  "start_mode",
+  "plannedStartMinute",
+  "plannedFinishMinute",
+  "scheduledStartMinute",
+  "handoffTravelMinutes",
+  "handoffTravelFrom",
+  "handoffTravelTo",
+  "ownYardFixedMinutes",
+  "vendorFixedMinutes",
+  "deliveryFixedMinutes",
+  "minutesPerPallet",
+  "truckSwitchMinutes",
+  "timing"
+];
+
+const LOCKED_STOP_DERIVED_SCHEDULE_FIELDS = [
+  "arriveTime",
+  "departTime",
+  "plannedArrive",
+  "plannedDepart",
+  "plannedArrival",
+  "plannedDeparture",
+  "timing"
+];
+
+const LOCKED_LOAD_EXECUTED_PREFIX_FIELDS = [
+  "start",
+  "startMode",
+  "start_mode",
+  "plannedStartMinute",
+  "scheduledStartMinute",
+  "handoffTravelMinutes",
+  "handoffTravelFrom",
+  "handoffTravelTo",
+  "ownYardFixedMinutes",
+  "vendorFixedMinutes",
+  "deliveryFixedMinutes",
+  "minutesPerPallet",
+  "truckSwitchMinutes"
+];
+
+const LOCKED_LOAD_TIMING_PREFIX_FIELDS = [
+  "start",
+  "scheduledStart",
+  "previousFinish",
+  "restBefore",
+  "handoffStart",
+  "switchStart",
+  "switchMinutes",
+  "handoffTravel"
+];
+
+function clonedScheduleValue(value) {
+  if (Array.isArray(value)) return value.map(clonedScheduleValue);
+  if (!value || typeof value !== "object") return value;
+  return Object.keys(value).reduce((copy, field) => {
+    copy[field] = clonedScheduleValue(value[field]);
+    return copy;
+  }, {});
+}
+
+function overlayFields(target = {}, source = {}, fields = []) {
+  const overlaid = { ...target };
+  for (const field of fields) {
+    if (Object.prototype.hasOwnProperty.call(source, field)) {
+      overlaid[field] = clonedScheduleValue(source[field]);
+    } else {
+      delete overlaid[field];
+    }
+  }
+  return overlaid;
+}
+
+function overlayExecutedPrefixLoadFields(target = {}, source = {}) {
+  const overlaid = overlayFields(target, source, LOCKED_LOAD_EXECUTED_PREFIX_FIELDS);
+  if (source.timing || target.timing) {
+    overlaid.timing = overlayFields(target.timing || {}, source.timing || {}, LOCKED_LOAD_TIMING_PREFIX_FIELDS);
+  }
+  return overlaid;
+}
+
+/**
+ * Keep the server's already-published schedule for loads with driver activity.
+ *
+ * Browser route estimates are intentionally not persisted in the plan. A route
+ * cache miss can therefore recalculate load and stop timing while the dispatcher
+ * is editing an unrelated load. Only derived scheduling fields are restored here;
+ * every incoming assignment, stop, order, location, and sequence field remains
+ * untouched so changedLockedLoadAssignments can still reject structural edits.
+ * With activityStatuses, only the executed physical-visit prefix is restored;
+ * callers that omit statuses retain the legacy whole-load overlay.
+ */
+export function overlayLockedLoadDerivedSchedule(previousPlan = {}, nextPlan = {}, lockedLoadIds = new Set(), {
+  activityStatuses = []
+} = {}) {
+  const lockedSource = lockedLoadIds && typeof lockedLoadIds[Symbol.iterator] === "function"
+    ? lockedLoadIds
+    : [];
+  const locked = new Set([...lockedSource].map(text).filter(Boolean));
+  const activityScopes = activityStatuses?.length
+    ? activeTimingScopes(previousPlan, activityStatuses)
+    : new Map();
+  for (const loadId of activityScopes.keys()) locked.add(loadId);
+  if (!locked.size) return nextPlan;
+  const previousLoads = new Map(flattenDispatchPlanLoads(previousPlan)
+    .map((row) => [text(row.load.id), row.load])
+    .filter(([loadId]) => loadId));
+  return {
+    ...nextPlan,
+    trucks: (nextPlan.trucks || []).map((truck) => ({
+      ...truck,
+      loads: (truck.loads || []).map((load) => {
+        const loadId = text(load.id);
+        const previousLoad = locked.has(loadId) ? previousLoads.get(loadId) : null;
+        if (!previousLoad) return load;
+        const previousStopsById = new Map((previousLoad.stops || [])
+          .map((stop) => [text(stop.id), stop])
+          .filter(([stopId]) => stopId));
+        const activityScope = activityScopes.get(loadId);
+        const useExecutedPrefix = Boolean(activityScope && !activityScope.fullLoad);
+        let activityBoundary = -1;
+        if (useExecutedPrefix) {
+          for (const stopId of activityScope.activeStopIds) {
+            const visit = activityScope.visitsByStopId.get(stopId);
+            if (!visit) {
+              activityBoundary = Number.MAX_SAFE_INTEGER;
+              break;
+            }
+            activityBoundary = Math.max(activityBoundary, visit.lastIndex);
+          }
+        }
+        const overlaid = useExecutedPrefix
+          ? overlayExecutedPrefixLoadFields(load, previousLoad)
+          : overlayFields(load, previousLoad, LOCKED_LOAD_DERIVED_SCHEDULE_FIELDS);
+        overlaid.stops = (load.stops || []).map((stop, index) => {
+          const stopId = text(stop.id);
+          const previousStop = stopId
+            ? previousStopsById.get(stopId)
+            : (!text(previousLoad.stops?.[index]?.id) ? previousLoad.stops?.[index] : null);
+          if (useExecutedPrefix && index > activityBoundary) return stop;
+          return previousStop
+            ? overlayFields(stop, previousStop, LOCKED_STOP_DERIVED_SCHEDULE_FIELDS)
+            : stop;
+        });
+        return overlaid;
+      })
+    }))
+  };
+}
+
 export function driverLoadLanes(plan = {}, configuredDrivers = []) {
   const rows = flattenDispatchPlanLoads(plan);
   const laneByLogin = new Map();
@@ -195,10 +842,171 @@ function intervalsOverlap(left, right) {
   return left.start < right.finish && right.start < left.finish;
 }
 
+function visitOverrideSignature(visit = null) {
+  if (!visit) return "missing";
+  if (visit.invalidOverrideStopIds?.length) return "invalid";
+  if (visit.overrideConflict) return "conflict";
+  return visit.overrideMinutes === null ? "automatic" : `override:${visit.overrideMinutes}`;
+}
+
+function activeTimingScopes(previousPlan = {}, statuses = []) {
+  const rowsByLoad = new Map(flattenDispatchPlanLoads(previousPlan).map((row) => [text(row.load.id), row]));
+  const scopes = new Map();
+  for (const record of statuses || []) {
+    if (!ACTIVE_DRIVER_ACTIVITY_STATUSES.has(text(record.status).toLowerCase())) continue;
+    const loadId = text(record.load_id || record.loadId);
+    if (!loadId) continue;
+    const scope = scopes.get(loadId) || { loadId, fullLoad: false, activeStopIds: new Set() };
+    const stopType = text(record.stop_type || record.stopType).toLowerCase();
+    if (PHYSICAL_DRIVER_STOP_TYPES.has(stopType)) {
+      const stopId = text(record.stop_id || record.stopId);
+      if (stopId) scope.activeStopIds.add(stopId);
+      else scope.fullLoad = true;
+    } else if (!SYNTHETIC_DRIVER_STOP_TYPES.has(stopType)) {
+      scope.fullLoad = true;
+    }
+    scopes.set(loadId, scope);
+  }
+  for (const scope of scopes.values()) {
+    const row = rowsByLoad.get(scope.loadId);
+    scope.row = row || null;
+    scope.visits = row ? dispatchPhysicalStopVisits(previousPlan, row.truck, row.load) : [];
+    scope.visitsByStopId = new Map(scope.visits.flatMap((visit) => visit.stopIds.map((stopId) => [stopId, visit])));
+    if (!row || [...scope.activeStopIds].some((stopId) => !scope.visitsByStopId.has(stopId))) {
+      scope.fullLoad = true;
+    }
+  }
+  return scopes;
+}
+
+/**
+ * Validate the JSON-only timing metadata added to a dispatch plan.
+ *
+ * This stays separate from route estimation so old plan snapshots remain valid
+ * without a migration. When previousPlan and statuses are supplied, only an
+ * already-started physical visit is locked; later untouched visits remain
+ * editable even though their load has driver activity.
+ */
+export function validateDispatchPlanTimingMetadata(plan = {}, {
+  previousPlan = null,
+  statuses = []
+} = {}) {
+  const conflicts = [];
+  const rows = flattenDispatchPlanLoads(plan);
+
+  for (const row of rows) {
+    for (const stop of row.load.stops || []) {
+      if (!Object.prototype.hasOwnProperty.call(stop, "stopTimeOverrideMinutes")) continue;
+      if (isValidDispatchStopTimeOverrideMinutes(stop.stopTimeOverrideMinutes, { allowUndefined: false })) continue;
+      conflicts.push(conflict(
+        "DISPATCH_STOP_TIME_OVERRIDE_INVALID",
+        `${row.load.name || row.load.id} has a stop-time override that must be a whole number from 0 to 1440, or Automatic.`,
+        {
+          loadId: text(row.load.id),
+          stopId: text(stop.id),
+          value: stop.stopTimeOverrideMinutes,
+          reason: "invalid_stop_time_override"
+        }
+      ));
+    }
+    for (const visit of dispatchPhysicalStopVisits(plan, row.truck, row.load)) {
+      if (!visit.overrideConflict) continue;
+      conflicts.push(conflict(
+        "DISPATCH_GROUPED_STOP_TIME_OVERRIDE_CONFLICT",
+        `${row.load.name || row.load.id} has different stop-time overrides within one physical visit.`,
+        {
+          loadId: text(row.load.id),
+          stopIds: visit.stopIds,
+          reason: "conflicting_grouped_stop_time_override"
+        }
+      ));
+    }
+  }
+
+  const endingByDriver = new Map();
+  const laneByLoadId = new Map();
+  for (const lane of driverLoadLanes(plan)) {
+    const planningLoads = lane.loads.filter((row) => loadHasPlanningContent(row.load));
+    for (const row of planningLoads) laneByLoadId.set(text(row.load.id), { lane, planningLoads });
+  }
+  for (const row of rows) {
+    const hasEndingTrip = Object.prototype.hasOwnProperty.call(row.load, "endingTrip");
+    if (hasEndingTrip && typeof row.load.endingTrip !== "boolean") {
+      conflicts.push(conflict(
+        "DISPATCH_ENDING_TRIP_INVALID",
+        `${row.load.name || row.load.id} has an invalid Ending trip value.`,
+        { loadId: text(row.load.id), reason: "invalid_ending_trip_value" }
+      ));
+      continue;
+    }
+    if (row.load.endingTrip !== true) continue;
+    const laneInfo = laneByLoadId.get(text(row.load.id));
+    const manualReturn = row.load.returnOnly === true && row.load.manual === true;
+    if (!manualReturn) {
+      conflicts.push(conflict(
+        "DISPATCH_ENDING_TRIP_INVALID",
+        `${row.load.name || row.load.id} can only be marked Ending trip when it is a manual return.`,
+        { loadId: text(row.load.id), driverLogin: row.driverLogin, reason: "not_manual_return" }
+      ));
+    }
+    const finalLoadId = text(laneInfo?.planningLoads?.[laneInfo.planningLoads.length - 1]?.load?.id);
+    if (!row.driverLogin || !laneInfo || finalLoadId !== text(row.load.id)) {
+      conflicts.push(conflict(
+        "DISPATCH_ENDING_TRIP_INVALID",
+        `${row.load.name || row.load.id} can only be marked Ending trip when it is the driver's final load.`,
+        { loadId: text(row.load.id), driverLogin: row.driverLogin, finalLoadId, reason: "not_final_driver_load" }
+      ));
+    }
+    if (!endingByDriver.has(row.driverLogin)) endingByDriver.set(row.driverLogin, []);
+    endingByDriver.get(row.driverLogin).push(text(row.load.id));
+  }
+  for (const [driverLogin, loadIds] of endingByDriver.entries()) {
+    if (!driverLogin || loadIds.length <= 1) continue;
+    conflicts.push(conflict(
+      "DISPATCH_ENDING_TRIP_INVALID",
+      `${driverLogin} can only have one Ending trip.`,
+      { driverLogin, loadIds, reason: "multiple_ending_trips" }
+    ));
+  }
+
+  if (!previousPlan) return conflicts;
+  const nextRows = new Map(rows.map((row) => [text(row.load.id), row]));
+  for (const scope of activeTimingScopes(previousPlan, statuses).values()) {
+    const nextRow = nextRows.get(scope.loadId);
+    if (!scope.row || !nextRow) continue;
+    const nextVisits = dispatchPhysicalStopVisits(plan, nextRow.truck, nextRow.load);
+    const nextVisitsByStopId = new Map(nextVisits.flatMap((visit) => visit.stopIds.map((stopId) => [stopId, visit])));
+    const changedVisitIds = new Set();
+    const candidates = scope.fullLoad
+      ? scope.visits
+      : [...scope.activeStopIds].map((stopId) => scope.visitsByStopId.get(stopId)).filter(Boolean);
+    for (const previousVisit of candidates) {
+      const leadStopId = previousVisit.stopIds[0] || "";
+      const currentVisit = previousVisit.stopIds.map((stopId) => nextVisitsByStopId.get(stopId)).find(Boolean) || null;
+      if (visitOverrideSignature(previousVisit) === visitOverrideSignature(currentVisit)) continue;
+      if (changedVisitIds.has(previousVisit.id)) continue;
+      changedVisitIds.add(previousVisit.id);
+      conflicts.push(conflict(
+        "DISPATCH_STOP_TIME_OVERRIDE_LOCKED",
+        `${scope.row.load.name || scope.loadId} cannot change the stop time for a visit with driver activity.`,
+        {
+          loadId: scope.loadId,
+          stopId: leadStopId,
+          stopIds: previousVisit.stopIds,
+          reason: "active_physical_visit_override"
+        }
+      ));
+    }
+  }
+  return conflicts;
+}
+
 export function validateDispatchLoadAssignments(plan = {}, {
   switchMinutes = DEFAULT_SWITCH_MINUTES,
   ownYards = null,
-  requireAssignments = false
+  requireAssignments = false,
+  previousPlan = null,
+  activityStatuses = []
 } = {}) {
   const rows = flattenDispatchPlanLoads(plan).filter((row) => loadHasPlanningContent(row.load));
   const conflicts = [];
@@ -344,7 +1152,111 @@ export function validateDispatchLoadAssignments(plan = {}, {
       }
     }
   }
+  conflicts.push(...validateDispatchPlanTimingMetadata(plan, {
+    previousPlan,
+    statuses: activityStatuses
+  }));
   return conflicts;
+}
+
+const ALLOCATION_MEASURE_FIELDS = {
+  quantity: ["quantity", "salesQty", "sales_qty"],
+  pallets: ["pallets", "palletQty", "pallet_qty"],
+  layers: ["layers", "layerQty", "layer_qty"],
+  sections: ["sections", "sectionQty", "section_qty"],
+  pieces: ["pieces", "pieceQty", "piece_qty"],
+  splitQty: ["splitQty", "split_qty"]
+};
+
+function allocationItemIdentity(item = {}) {
+  const itemId = text(item.itemId ?? item.item_id).toLowerCase();
+  const sku = text(item.sku).toLowerCase();
+  const itemName = text(item.itemName ?? item.item_name ?? item.name).toLowerCase();
+  const unit = text(item.unit ?? item.uom ?? item.uomName ?? item.uom_name).toLowerCase();
+  const destinationLocationId = text(
+    item.destinationLocationId
+    ?? item.destination_location_id
+    ?? item.locationId
+    ?? item.location_id
+  ).toLowerCase();
+  const destinationYard = text(
+    item.destinationYard
+    ?? item.destination_yard
+    ?? item.toLocation
+    ?? item.to_location
+  ).toLowerCase();
+  const destination = destinationLocationId
+    ? `location:${destinationLocationId}`
+    : destinationYard
+      ? `yard:${destinationYard}`
+      : "";
+  const splitUnit = text(item.splitUnit ?? item.split_unit).toLowerCase();
+  const businessIdentity = itemId
+    ? `item:${itemId}`
+    : sku
+      ? `sku:${sku}`
+      : itemName
+        ? `name:${itemName}`
+        : "";
+  if (businessIdentity) return `${businessIdentity}|unit:${unit}|destination:${destination}|split:${splitUnit}`;
+  const rowIdentity = text(
+    item.lineRowId
+    ?? item.line_row_id
+    ?? item.lineId
+    ?? item.line_id
+    ?? item.id
+  ).toLowerCase();
+  return `line:${rowIdentity}|unit:${unit}|destination:${destination}|split:${splitUnit}`;
+}
+
+function allocationMeasureValue(item = {}, fields = []) {
+  const value = fields
+    .map((field) => item[field])
+    .find((candidate) => candidate !== null && candidate !== undefined && text(candidate) !== "");
+  if (value === undefined || text(value) === "") return 0;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : text(value);
+}
+
+function aggregateAllocationMeasure(items = [], fields = []) {
+  let total = 0;
+  const invalidValues = [];
+  for (const item of items) {
+    const value = allocationMeasureValue(item, fields);
+    if (typeof value === "number") total += value;
+    else invalidValues.push(value);
+  }
+  const canonicalTotal = Number(total.toFixed(9));
+  return invalidValues.length
+    ? { total: canonicalTotal, values: invalidValues.sort() }
+    : canonicalTotal;
+}
+
+function semanticAllocationItems(items = []) {
+  const grouped = new Map();
+  for (const item of items || []) {
+    const identity = allocationItemIdentity(item);
+    if (!grouped.has(identity)) grouped.set(identity, []);
+    grouped.get(identity).push(item);
+  }
+  return [...grouped.entries()]
+    .map(([id, rows]) => ({
+      id,
+      ...Object.fromEntries(Object.entries(ALLOCATION_MEASURE_FIELDS)
+        .map(([field, aliases]) => [field, aggregateAllocationMeasure(rows, aliases)]))
+    }))
+    .sort((left, right) => left.id.localeCompare(right.id));
+}
+
+function semanticOrderAllocation(order = {}) {
+  return {
+    id: text(order.id),
+    childOrders: [...new Set((order.childOrders || []).map(text).filter(Boolean))].sort(),
+    items: semanticAllocationItems(order.items || []),
+    children: (order.childOrderDetails || [])
+      .map(semanticOrderAllocation)
+      .sort((left, right) => left.id.localeCompare(right.id))
+  };
 }
 
 export function changedLockedLoadAssignments(previousPlan = {}, nextPlan = {}, lockedLoadIds = new Set()) {
@@ -354,19 +1266,8 @@ export function changedLockedLoadAssignments(previousPlan = {}, nextPlan = {}, l
     const refs = new Set((row?.load?.stops || []).map((stop) => text(stop.orderId)).filter(Boolean));
     return (plan.orders || [])
       .filter((order) => refs.has(text(order.id)))
-      .map((order) => ({
-        id: text(order.id),
-        childOrders: order.childOrders || [],
-        items: (order.items || []).map((item) => ({
-          id: text(item.id || item.lineId || item.line_id || item.sku || item.itemName),
-          quantity: item.quantity ?? item.salesQty ?? null,
-          pallets: item.pallets ?? item.pallet_qty ?? null,
-          layers: item.layers ?? item.layer_qty ?? null,
-          sections: item.sections ?? item.section_qty ?? null,
-          pieces: item.pieces ?? item.piece_qty ?? null,
-          splitQty: item.splitQty ?? null
-        }))
-      }));
+      .map(semanticOrderAllocation)
+      .sort((left, right) => left.id.localeCompare(right.id));
   };
   const stopSignature = (stop = {}) => ({
     id: text(stop.id),
@@ -422,6 +1323,253 @@ export function changedLockedLoadAssignments(previousPlan = {}, nextPlan = {}, l
     const previousSignature = lockedSignature(previousPlan, previous);
     const currentSignature = lockedSignature(nextPlan, current);
     if (previousSignature !== currentSignature) changes.push({ loadId: text(loadId), previous, current });
+  }
+  return changes;
+}
+
+const ACTIVE_DRIVER_ACTIVITY_STATUSES = new Set(["in_progress", "complete"]);
+const PHYSICAL_DRIVER_STOP_TYPES = new Set(["pickup", "dropoff", "pick", "drop"]);
+const SYNTHETIC_DRIVER_STOP_TYPES = new Set(["travel", "truck_switch"]);
+
+function activeDriverActivityStatus(record = {}) {
+  return ACTIVE_DRIVER_ACTIVITY_STATUSES.has(text(record.status).toLowerCase());
+}
+
+function driverActivityStopType(record = {}) {
+  return text(record.stop_type || record.stopType).toLowerCase();
+}
+
+function driverActivityOrderRefs(record = {}) {
+  const refs = record.order_refs ?? record.orderRefs;
+  return Array.isArray(refs) ? refs.map(text).filter(Boolean) : [];
+}
+
+function driverActivityAssignmentSignature(row = null) {
+  if (!row) return "";
+  return JSON.stringify({
+    driverLogin: row.driverLogin,
+    truckId: row.truckId,
+    truckPlate: row.truckPlate
+  });
+}
+
+function driverActivityOrderForRef(plan = {}, orderRef = "") {
+  const wanted = text(orderRef);
+  if (!wanted) return null;
+  const visit = (order = {}) => {
+    if (text(order.id) === wanted || text(order.originalOrderId) === wanted) return order;
+    for (const child of order.childOrderDetails || []) {
+      const match = visit(child);
+      if (match) return match;
+    }
+    return null;
+  };
+  for (const order of plan.orders || []) {
+    const match = visit(order);
+    if (match) return match;
+  }
+  return null;
+}
+
+function driverActivityStopSignature(plan = {}, stop = null) {
+  if (!stop) return "";
+  const order = driverActivityOrderForRef(plan, stop.orderId) || {};
+  const pickup = ["pick", "pickup"].includes(text(stop.type).toLowerCase());
+  return JSON.stringify({
+    id: text(stop.id),
+    type: text(stop.type),
+    orderId: text(stop.orderId),
+    location: text(stop.location),
+    address: text(stop.address),
+    yard: text(stop.yard),
+    dropoffKey: text(stop.dropoffKey),
+    dropLocation: text(stop.dropLocation),
+    dropAddress: text(stop.dropAddress),
+    destinationYard: text(stop.destinationYard || stop.destination_yard),
+    destinationLocationId: text(stop.destinationLocationId || stop.destination_location_id),
+    lineRowIds: [...new Set((stop.lineRowIds || []).map(text).filter(Boolean))].sort(),
+    dropPallets: stop.dropPallets ?? stop.pallets ?? null,
+    dropLayers: stop.dropLayers ?? stop.layers ?? null,
+    dropSections: stop.dropSections ?? stop.sections ?? null,
+    dropPieces: stop.dropPieces ?? stop.pieces ?? null,
+    dropSalesQty: stop.dropSalesQty ?? stop.salesQty ?? null,
+    dropWeight: stop.dropWeight ?? stop.weight ?? null,
+    effectiveOrderLocation: pickup
+      ? text(stop.location || stop.yard || order.sourceYard || order.source_yard)
+      : text(
+        stop.dropLocation
+        || stop.location
+        || stop.destinationYard
+        || stop.destination_yard
+        || order.destinationYard
+        || order.destination_yard
+        || order.toLocation
+        || order.to_location
+      ),
+    effectiveOrderAddress: pickup
+      ? text(stop.address || order.pickupAddressOverride || order.sourceAddress || order.defaultSourceAddress)
+      : text(stop.dropAddress || stop.address || order.address || order.dropAddress),
+    arriveTime: text(stop.arriveTime || stop.plannedArrive),
+    departTime: text(stop.departTime || stop.plannedDepart),
+    timing: {
+      arrival: dispatchMinute(stop.timing?.arrival),
+      depart: dispatchMinute(stop.timing?.depart)
+    }
+  });
+}
+
+function driverActivityOrderReferenceSet(order = {}) {
+  const refs = new Set();
+  const visit = (candidate = {}) => {
+    for (const value of [candidate.id, candidate.originalOrderId]) {
+      const ref = text(value);
+      if (ref) refs.add(ref);
+    }
+    for (const value of candidate.childOrders || []) {
+      const ref = text(value);
+      if (ref) refs.add(ref);
+    }
+    for (const child of candidate.childOrderDetails || []) visit(child);
+  };
+  visit(order);
+  return refs;
+}
+
+function driverActivityAllocationSignature(plan = {}, lockedOrderRefs = new Set()) {
+  const wanted = new Set([...(lockedOrderRefs || [])].map(text).filter(Boolean));
+  if (!wanted.size) return "[]";
+  const allocations = (plan.orders || [])
+    .filter((order) => {
+      const refs = driverActivityOrderReferenceSet(order);
+      return [...wanted].some((ref) => refs.has(ref));
+    })
+    .map(semanticOrderAllocation)
+    .sort((left, right) => left.id.localeCompare(right.id));
+  return JSON.stringify(allocations);
+}
+
+/**
+ * Report edits that would rewrite evidence already recorded by the Driver PWA.
+ *
+ * Every active record keeps its load and driver/truck identity stable. Only a
+ * physical pickup/drop record locks a plan stop and that stop's order
+ * allocation. Synthetic travel and truck-switch records intentionally do not
+ * freeze downstream, unstarted stops or orders. Unknown legacy activity fails
+ * closed through the existing whole-load comparison.
+ */
+export function changedDriverActivityAssignments(previousPlan = {}, nextPlan = {}, statuses = []) {
+  const scopes = new Map();
+  for (const record of statuses || []) {
+    if (!activeDriverActivityStatus(record)) continue;
+    const loadId = text(record.load_id || record.loadId);
+    if (!loadId) continue;
+    const scope = scopes.get(loadId) || {
+      loadId,
+      fullLoad: false,
+      stopIds: new Set(),
+      orderRefs: new Set()
+    };
+    const stopType = driverActivityStopType(record);
+    if (PHYSICAL_DRIVER_STOP_TYPES.has(stopType)) {
+      const stopId = text(record.stop_id || record.stopId);
+      if (!stopId) {
+        scope.fullLoad = true;
+      } else {
+        scope.stopIds.add(stopId);
+        for (const ref of driverActivityOrderRefs(record)) scope.orderRefs.add(ref);
+      }
+    } else if (!SYNTHETIC_DRIVER_STOP_TYPES.has(stopType)) {
+      scope.fullLoad = true;
+    }
+    scopes.set(loadId, scope);
+  }
+  if (!scopes.size) return [];
+
+  const before = new Map(flattenDispatchPlanLoads(previousPlan).map((row) => [text(row.load.id), row]));
+  const after = new Map(flattenDispatchPlanLoads(nextPlan).map((row) => [text(row.load.id), row]));
+  const fullLoadChanges = new Map(changedLockedLoadAssignments(
+    previousPlan,
+    nextPlan,
+    new Set([...scopes.values()].filter((scope) => scope.fullLoad).map((scope) => scope.loadId))
+  ).map((change) => [text(change.loadId), change]));
+  const changes = [];
+
+  for (const scope of scopes.values()) {
+    const previous = before.get(scope.loadId);
+    const current = after.get(scope.loadId);
+    const reasons = [];
+    const changedStopIds = [];
+    const changedOrderRefs = [];
+
+    if (scope.fullLoad) {
+      const fullLoadChange = fullLoadChanges.get(scope.loadId);
+      if (fullLoadChange) {
+        changes.push({
+          ...fullLoadChange,
+          reasons: ["full_load"],
+          stopIds: [...scope.stopIds],
+          orderRefs: [...scope.orderRefs]
+        });
+      }
+      continue;
+    }
+
+    if (!previous || !current) {
+      reasons.push("load");
+    } else {
+      if (driverActivityAssignmentSignature(previous) !== driverActivityAssignmentSignature(current)) {
+        reasons.push("assignment");
+      }
+      const previousStopList = previous.load.stops || [];
+      const currentStopList = current.load.stops || [];
+      const previousStops = new Map(previousStopList.map((stop, index) => [text(stop.id), { stop, index }]));
+      const currentStops = new Map(currentStopList.map((stop, index) => [text(stop.id), { stop, index }]));
+      const previousActivityIndexes = [...scope.stopIds]
+        .map((stopId) => previousStops.get(stopId)?.index)
+        .filter(Number.isInteger);
+      const activityBoundary = previousActivityIndexes.length ? Math.max(...previousActivityIndexes) : -1;
+      const previousPrefix = previousStopList.slice(0, activityBoundary + 1).map((stop) => text(stop.id));
+      const currentPrefix = currentStopList.slice(0, activityBoundary + 1).map((stop) => text(stop.id));
+      const sequenceChanged = activityBoundary >= 0
+        && JSON.stringify(previousPrefix) !== JSON.stringify(currentPrefix);
+      for (const stopId of scope.stopIds) {
+        const previousEntry = previousStops.get(stopId);
+        const currentEntry = currentStops.get(stopId);
+        const previousStop = previousEntry?.stop;
+        const currentStop = currentEntry?.stop;
+        if (
+          !previousEntry
+          || !currentEntry
+          || driverActivityStopSignature(previousPlan, previousStop)
+            !== driverActivityStopSignature(nextPlan, currentStop)
+          || previousEntry?.index !== currentEntry?.index
+          || sequenceChanged
+        ) {
+          changedStopIds.push(stopId);
+        }
+        const canonicalOrderRef = text(previousStop?.orderId);
+        if (canonicalOrderRef) scope.orderRefs.add(canonicalOrderRef);
+      }
+      if (changedStopIds.length) reasons.push("stop");
+      if (
+        driverActivityAllocationSignature(previousPlan, scope.orderRefs)
+        !== driverActivityAllocationSignature(nextPlan, scope.orderRefs)
+      ) {
+        changedOrderRefs.push(...scope.orderRefs);
+        reasons.push("order_allocation");
+      }
+    }
+
+    if (reasons.length) {
+      changes.push({
+        loadId: scope.loadId,
+        previous,
+        current,
+        reasons,
+        stopIds: changedStopIds,
+        orderRefs: changedOrderRefs
+      });
+    }
   }
   return changes;
 }

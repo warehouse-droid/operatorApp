@@ -78,6 +78,18 @@ assert.match(queueSource, /const forceSave\s*=\s*forceNextPlanSave;[\s\S]*?force
 assert.match(queueSource, /forceSave[\s\S]*?await savePlanToServer\(payload,[\s\S]*?forceSave/, "The serialized queue must forward the Save Now force flag to the server.");
 assert.match(queueSource, /return finalResult;/, "The queue must return the actual final save result to Save Now.");
 assert.doesNotMatch(queueSource, /Promise\.all/, "Plan writes must never race through Promise.all.");
+assert.match(queueSource, /activeSaveGeneration\s*=\s*saveGeneration;/,
+  "The save queue must expose which local generation the active request is already persisting.");
+assert.match(queueSource, /finally\s*{\s*activeSaveGeneration\s*=\s*null;/,
+  "The active save generation must be cleared even when a request fails.");
+
+const saveNowSource = sourceSlice("async function saveCurrentPlanNow", "async function forceSaveCurrentPlan", "Save Now in-flight coordination");
+assert.match(saveNowSource, /!localPlanDirty\s*&&\s*!saveQueued\s*&&\s*!saveInFlight/,
+  "Save Now must return immediately when the current plan is already durably saved.");
+assert.match(saveNowSource, /activeSaveGeneration\s*===\s*localPlanGeneration[\s\S]*?await saveFlushPromise/,
+  "Save Now must join an autosave of the same generation instead of issuing a duplicate forced save.");
+assert.match(saveNowSource, /if \(!joinsCurrentGeneration\)[\s\S]*?forceNextPlanSave\s*=\s*true/,
+  "A genuine unsaved generation must retain the explicit one-shot Save Now behavior.");
 
 const makeBlockedSaveQueueFixture = Function(
   `"use strict";
@@ -85,6 +97,7 @@ const makeBlockedSaveQueueFixture = Function(
   let saveInFlight = false;
   let saveQueued = true;
   let saveFlushPromise = null;
+  let activeSaveGeneration = null;
   let forceNextPlanSave = false;
   let localPlanGeneration = 1;
   let lastSavedAt = "";
@@ -170,8 +183,99 @@ assert.match(planEventSource, /pollServerPlan\(\);/, "A plan event must verify t
 assert.doesNotMatch(planEventSource.slice(0, planEventSource.indexOf('if (event.type === "dispatch.setup.updated")')), /sse:blockedByDirty|Remote update available/,
   "A source event alone must not claim that another editor changed the plan.");
 
+const linkModalResetSource = sourceSlice(
+  "function resetActiveLinkModalState",
+  "function renderActiveLinkModalInPlace",
+  "plan-scoped Link modal reset"
+);
+assert.match(linkModalResetSource, /orderDependencyAbortController\?\.abort\(\)/,
+  "Switching plans must abort a stale Link TO request.");
+assert.match(linkModalResetSource, /orderDependencyRequestSequence\s*\+=\s*1/,
+  "Switching plans must invalidate an already-returning Link TO request.");
+const planLoadSource = sourceSlice("async function loadPlanForDate", "async function restoreServerPlan", "plan switching");
+assert.match(planLoadSource, /resetActiveLinkModalState\(\)/,
+  "Loading another plan date must close its plan-scoped Link modal.");
+const unlinkActionSource = sourceSlice(
+  'if (action === "unlink-dependency")',
+  'if (action === "undo-plan")',
+  "dependency unlink action"
+);
+assert.match(unlinkActionSource, /removeLocalOrderDependency\(dependencyId\)/,
+  "A successful unlink must remove the stale dependency from local grouped-order copies immediately.");
+assert.doesNotMatch(unlinkActionSource, /loadOrderDependencyOptions/,
+  "A successful unlink must not resurrect a stale grouped dependency through an immediate failing refresh.");
+const groupOrderSource = sourceSlice("function groupOrder", "function groupedDispatchOrderId", "group plan ownership");
+assert.match(groupOrderSource, /groupPlanId:\s*currentPlan\?\.id/,
+  "A local group must retain the plan that owns its dependency structure.");
+assert.match(groupOrderSource, /groupPlanDate:\s*currentPlanDate/,
+  "A local group must retain its owning plan date.");
+const openToLinkSource = sourceSlice(
+  'if (action === "open-to-link-modal")',
+  'if (action === "order-type-tab")',
+  "Link TO modal ownership guard"
+);
+assert.match(openToLinkSource, /belongs to the \$\{groupPlanDate \|\| "other"\} plan/,
+  "A grouped order copied from another plan must block dependency mutation until its owning plan is loaded.");
+assert.match(openToLinkSource, /groupPlanId\s*!==\s*currentPlanId/,
+  "A grouped order copied from another same-date plan must be blocked by its owning plan id.");
+const dependencyLinksSource = sourceSlice(
+  "function renderDependencyLinks",
+  "function renderToLinkModal",
+  "unavailable dependency controls"
+);
+assert.match(dependencyLinksSource, /unlinkOnly\s*\?\s*""\s*:\s*`<select/,
+  "An unavailable grouped target must hide dependency mode controls and remain unlink-only.");
+const dependencyLinkRenderSource = sourceSlice(
+  "function renderToLinkModal",
+  "function renderPoLinkMatchBoard",
+  "dependency link rendering"
+);
+assert.match(dependencyLinkRenderSource, /unlinkOnly:\s*options\.targetUnavailable\s*===\s*true/,
+  "The Link TO modal must enable unlink-only rendering when the server cannot resolve its target.");
+
 for (const eventName of ["conflict", "server-response", "saved-with-followup-warning", "exception"]) {
   assert.match(saveSource, new RegExp(`reportDispatchSaveError\\(\\s*"${eventName}"`), `The ${eventName} path must report actionable details in the browser console.`);
 }
+
+const serverSource = await readFile(new URL("./server.js", import.meta.url), "utf8");
+const dateValidationStart = serverSource.indexOf("async function findNewDispatchPlanDateConflicts");
+const dateValidationEnd = serverSource.indexOf("function dispatchDateCompare", dateValidationStart);
+const dateValidationSource = serverSource.slice(dateValidationStart, dateValidationEnd);
+assert.ok(dateValidationStart >= 0 && dateValidationEnd > dateValidationStart, "Expected incremental plan-date validation source was not found.");
+assert.match(dateValidationSource, /newlyPlannedRefs[\s\S]*?if \(!newlyPlannedRefs\.size\) return \[\];/,
+  "An ordinary edit must not reload every historical plan when it adds no new order assignment.");
+assert.doesNotMatch(dateValidationSource, /previousConflicts/,
+  "Date validation must not load the complete historical snapshot set twice.");
+assert.match(dateValidationSource, /inferredParentRef[\s\S]*?replace\(\/-S\\d\+\$\/i, ""\)/,
+  "Incremental date validation must preserve legacy split-parent identity.");
+const coValidationStart = serverSource.indexOf("async function findChangedDispatchCoSequenceConflicts");
+const coValidationEnd = serverSource.indexOf("function sendDispatchPlanDateConflictResponse", coValidationStart);
+const coValidationSource = serverSource.slice(coValidationStart, coValidationEnd);
+assert.ok(coValidationStart >= 0 && coValidationEnd > coValidationStart, "Expected changed-CO validation source was not found.");
+assert.match(coValidationSource, /nextPlan\.orders[\s\S]*?transitCo[\s\S]*?return \[\];/,
+  "Plans without transit CO dependencies must skip cross-plan CO validation.");
+const coRowsStart = serverSource.indexOf("async function dispatchPlansForCoValidation");
+const coRowsEnd = serverSource.indexOf("async function findDispatchCoSequenceConflicts", coRowsStart);
+const coRowsSource = serverSource.slice(coRowsStart, coRowsEnd);
+assert.match(coRowsSource, /SELECT DISTINCT ON[\s\S]*?AS co_ref[\s\S]*?AS finish/,
+  "Cross-plan CO validation must fetch compact occurrence rows.");
+assert.doesNotMatch(coRowsSource, /s\.orders,\s*s\.trucks/,
+  "Cross-plan CO validation must not transfer complete historical plan snapshots.");
+const saveEndpointStart = serverSource.indexOf('app.put("/api/dispatch/plans/:id"');
+const saveEndpointEnd = serverSource.indexOf('app.post("/api/dispatch/plans/:id/confirm"', saveEndpointStart);
+const saveEndpointSource = serverSource.slice(saveEndpointStart, saveEndpointEnd);
+assert.match(serverSource, /function reportDispatchSaveTiming[\s\S]*?\[dispatch-save-timing\][\s\S]*?durationMs/,
+  "Dispatch saves must emit a measured server duration for launch monitoring.");
+assert.ok(
+  saveEndpointSource.indexOf("dispatchLoadAssignmentConflicts") < saveEndpointSource.indexOf("findNewDispatchPlanDateConflicts"),
+  "A protected started-stop edit must fail before any cross-plan validation query."
+);
+
+const repositorySource = await readFile(new URL("./dispatch-plan-repository.js", import.meta.url), "utf8");
+const customValidationStart = repositorySource.indexOf("async function assertCustomOrderPlanDateExclusivity");
+const customValidationEnd = repositorySource.indexOf("function collectPlanOrderRefs", customValidationStart);
+const customValidationSource = repositorySource.slice(customValidationStart, customValidationEnd);
+assert.match(customValidationSource, /previousRefs[\s\S]*?filter\(\(ref\) => !previousRefs\.has\(ref\)\)[\s\S]*?if \(!customRefs\.length\) return;/,
+  "Unchanged custom-order placement must not rescan every historical plan during an ordinary save.");
 
 console.log("Dispatch save coordination and browser diagnostics checks passed.");

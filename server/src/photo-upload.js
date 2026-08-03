@@ -54,6 +54,12 @@ export function createPhotoUploadToken({ actor, source, recordType, metadata = {
   const now = Math.floor(Date.now() / 1000);
   const expiresAt = now + ttlMinutes * 60;
   const maxBytes = Math.min(settings.maxBytes, saneNumber(options.maxBytes || settings.maxBytes, settings.maxBytes, 1, settings.maxBytes));
+  const allowedTypes = Array.isArray(options.allowedTypes)
+    ? [...new Set(options.allowedTypes
+        .map((value) => cleanValue(value, 120).toLowerCase())
+        .filter((value) => settings.allowedTypes.includes(value)))]
+    : settings.allowedTypes;
+  if (!allowedTypes.length) throw httpError(400, "At least one supported upload MIME type is required.");
 
   const claims = compactClaims({
     aud: "mbbs-r2-upload",
@@ -74,8 +80,15 @@ export function createPhotoUploadToken({ actor, source, recordType, metadata = {
     loadId: metadata.loadId,
     jobId: metadata.jobId,
     dvirType: metadata.dvirType,
+    manifestId: metadata.manifestId,
+    eventId: metadata.eventId,
+    photoId: metadata.photoId,
+    deviceId: metadata.deviceId,
+    sha256: metadata.sha256,
+    declaredByteSize: metadata.byteSize,
+    declaredMimeType: metadata.mimeType,
     keyPrefix: buildKeyPrefix({ source: source || role, recordType: normalizedRecordType, actor, metadata }),
-    allowedTypes: settings.allowedTypes,
+    allowedTypes,
     maxBytes,
     iat: now,
     nbf: now - 5,
@@ -92,14 +105,61 @@ export function createPhotoUploadToken({ actor, source, recordType, metadata = {
     ttlSeconds: ttlMinutes * 60,
     maxBytes,
     maxMb: Math.floor(maxBytes / 1024 / 1024),
-    allowedTypes: settings.allowedTypes,
+    allowedTypes,
     publicBaseUrl: settings.publicBaseUrl,
     metadata: {
       recordType: claims.recordType,
       keyPrefix: claims.keyPrefix,
-      source: claims.source
+      source: claims.source,
+      manifestId: claims.manifestId || "",
+      eventId: claims.eventId || "",
+      photoId: claims.photoId || ""
     }
   };
+}
+
+export function isJpegEvidenceBytes(value) {
+  const bytes = Buffer.isBuffer(value)
+    ? value
+    : value instanceof Uint8Array
+      ? value
+      : null;
+  if (
+    !bytes
+    || bytes.length < 12
+    || bytes[0] !== 0xff
+    || bytes[1] !== 0xd8
+    || bytes[bytes.length - 2] !== 0xff
+    || bytes[bytes.length - 1] !== 0xd9
+  ) {
+    return false;
+  }
+
+  const startOfFrameMarkers = new Set([
+    0xc0, 0xc1, 0xc2, 0xc3,
+    0xc5, 0xc6, 0xc7,
+    0xc9, 0xca, 0xcb,
+    0xcd, 0xce, 0xcf
+  ]);
+  let offset = 2;
+  let foundStartOfFrame = false;
+  while (offset < bytes.length - 2) {
+    if (bytes[offset] !== 0xff) return false;
+    while (offset < bytes.length - 2 && bytes[offset] === 0xff) offset += 1;
+    const marker = bytes[offset];
+    offset += 1;
+    if (marker === 0x00 || marker === 0xd8 || marker === 0xd9) return false;
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+    if (offset + 2 > bytes.length - 2) return false;
+    const segmentLength = (bytes[offset] << 8) | bytes[offset + 1];
+    if (segmentLength < 2 || offset + segmentLength > bytes.length - 2) return false;
+    if (startOfFrameMarkers.has(marker)) foundStartOfFrame = true;
+    if (marker === 0xda) {
+      return foundStartOfFrame && offset + segmentLength < bytes.length - 2;
+    }
+    offset += segmentLength;
+  }
+  return false;
 }
 
 export function createPhotoReadToken({ actor, key, options = {} } = {}) {
@@ -206,7 +266,13 @@ function buildKeyPrefix({ source, recordType, actor, metadata }) {
   const yyyy = String(date.getUTCFullYear());
   const mm = String(date.getUTCMonth() + 1).padStart(2, "0");
   const dd = String(date.getUTCDate()).padStart(2, "0");
-  const subject = metadata.orderRef || metadata.orderId || metadata.jobId || actor?.id || actor?.login || "general";
+  const subject = metadata.photoId
+    || metadata.orderRef
+    || metadata.orderId
+    || metadata.jobId
+    || actor?.id
+    || actor?.login
+    || "general";
   if (recordType === "operator-return-photo") {
     return [
       safePathSegment(source || "app"),

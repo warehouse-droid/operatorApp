@@ -19,12 +19,14 @@ const smartEscape = (value) => String(value ?? "")
 
 const proposalContext = vm.createContext({
   smartState: {
-    planSearch: "", planType: "", planStatus: "", planSource: "", planDestination: "", planSort: "destination",
+    planSearch: "", planType: "", planStatus: "", planVendor: "", planSource: "", planDestination: "", planSort: "destination",
     selectedProposalIds: new Set(), plan: null, data: { planningRuns: [] }, busy: ""
   },
   smartCanWrite: () => true,
   smartNumber,
   smartPercent: (value) => `${Math.round(Number(value || 0) * 100)}%`,
+  smartDate: (value) => String(value || "date"),
+  smartDate: () => "date",
   smartEscape,
   smartPill: () => "",
   smartCoverageEvidence: () => "",
@@ -42,6 +44,9 @@ const proposalContext = vm.createContext({
   Intl
 });
 vm.runInContext(readPublic("scm-smart-proposals.js"), proposalContext, { filename: "scm-smart-proposals.js" });
+vm.runInContext(readPublic("scm-smart-exclusions.js"), proposalContext, { filename: "scm-smart-exclusions.js" });
+assert.equal(proposalContext.smartState.planCompact, true, "Compact should be the default proposal view for a new browser.");
+proposalContext.smartState.planCompact = false;
 
 const bh80Reason = {
   preferredPallets: 16,
@@ -315,14 +320,36 @@ assert.match(inconsistentSourceHtml, /1 PLT transfer ≤ 3 PLT calculated limit/
 
 assert.equal(proposalContext.smartState.planShowInventory, true, "Inventory should be visible by default.");
 assert.equal(proposalContext.smartState.planShowDecisionEvidence, true, "Decision evidence should be visible by default.");
-assert.match(proposalContext.smartProposalColumnControls(), /data-smart-plan-detail="inventory" type="checkbox" checked/);
-assert.match(proposalContext.smartProposalColumnControls(), /data-smart-plan-detail="decision-evidence" type="checkbox" checked/);
-proposalContext.smartState.planShowInventory = false;
-proposalContext.smartState.planShowDecisionEvidence = false;
-const compactTransferCard = proposalContext.smartProposalCard(transferProposal);
+assert.match(proposalContext.smartProposalColumnControls(), /data-smart-proposal-view="compact"/);
+assert.match(proposalContext.smartProposalColumnControls(), /data-smart-proposal-view="detailed"/);
+assert.match(proposalContext.smartProposalColumnControls(), /data-smart-plan-detail="inventory"[^>]*\bchecked\b/);
+assert.match(proposalContext.smartProposalColumnControls(), /data-smart-plan-detail="decision-evidence"[^>]*\bchecked\b/);
+proposalContext.smartState.planCompact = true;
+const compactTransferCard = proposalContext.smartProposalCard({
+  ...transferProposal,
+  urgencyLevel: "ultimate_urgent",
+  urgencyScore: 98,
+  lines: [{ ...transferLine, urgencyLevel: "ultimate_urgent", urgencyScore: 98 }]
+});
+proposalContext.smartPill = (_status, label) => label || "";
+const overCapacityTransferCard = proposalContext.smartProposalCard({
+  ...transferProposal,
+  utilization: 1.08
+});
+assert.match(overCapacityTransferCard, /Over capacity · manual/,
+  "A manually overloaded TO must be clearly flagged instead of appearing capacity-safe.");
+proposalContext.smartPill = () => "";
 assert.match(compactTransferCard, /smart-proposal-lines smart-table-wrap smart-proposal-lines-compact/);
 assert.match(compactTransferCard, /<th data-smart-plan-column="availability">Availability<\/th>/);
-assert.match(compactTransferCard, /<td data-smart-plan-column="availability"><div class="smart-availability-summary">/);
+assert.match(compactTransferCard, /<td data-smart-plan-column="availability"><div class="smart-availability-summary smart-availability-inline">/);
+assert.match(compactTransferCard, /class="smart-urgency-ultimate_urgent"/);
+assert.match(compactTransferCard, /Ultimate Urgent urgency\.<\/span>/);
+assert.match(compactTransferCard, /class="smart-proposal-identity"/);
+assert.match(compactTransferCard, /class="smart-proposal-badges"/);
+assert.match(compactTransferCard, /class="smart-proposal-line-editor-controls"/);
+assert.match(compactTransferCard, /data-smart-line-results="700" aria-live="polite"><\/div>/);
+assert.doesNotMatch(compactTransferCard, /ID 2298/, "Compact material rows must omit the item ID.");
+assert.doesNotMatch(compactTransferCard, /Generated TO line/, "Compact material rows must omit the description.");
 assert.doesNotMatch(
   compactTransferCard,
   /data-smart-plan-column="availability" hidden/,
@@ -352,7 +379,9 @@ assert.match(
   /<td data-smart-plan-column="availability"><span class="smart-help">Ancillary packaging item<\/span><\/td>/,
   "Physical PALLET rows need an explicit non-inventory availability cell."
 );
+proposalContext.smartState.planCompact = false;
 proposalContext.smartState.planShowInventory = true;
+proposalContext.smartState.planShowDecisionEvidence = false;
 const oneDetailHiddenCard = proposalContext.smartProposalCard(transferProposal);
 assert.match(oneDetailHiddenCard, /smart-proposal-lines smart-table-wrap smart-proposal-lines-one-detail-hidden/);
 assert.doesNotMatch(oneDetailHiddenCard, /data-smart-plan-column="inventory" hidden/);
@@ -362,26 +391,221 @@ proposalContext.localStorage = { setItem() { throw new Error("quota exceeded"); 
 assert.equal(proposalContext.smartSaveProposalColumnPreferences(), false, "Storage quota failures must not block column changes.");
 proposalContext.localStorage = { getItem() { throw new Error("storage unavailable"); } };
 const fallbackColumns = proposalContext.smartLoadProposalColumnPreferences();
+assert.equal(fallbackColumns.compact, true);
 assert.equal(fallbackColumns.inventory, true);
 assert.equal(fallbackColumns.decisionEvidence, true);
 delete proposalContext.localStorage;
+
+assert.equal(
+  proposalContext.smartUrgencyLevel("normal", true),
+  "urgent",
+  "A legacy urgent flag must not be erased by a default normal level."
+);
+assert.equal(proposalContext.smartProposalUrgencyScore({
+  lines: [
+    { urgencyLevel: "ultimate_urgent", urgencyScore: 61 },
+    { urgencyLevel: "urgent", urgencyScore: 99 }
+  ]
+}), 61, "Proposal score fallback must use only lines at the proposal's highest tier.");
+const stockoutEvidenceHtml = proposalContext.smartProposalDecisionEvidence({
+  ...transferLine,
+  urgencyLevel: "super_urgent",
+  urgencyScore: 76,
+  reason: {
+    ...transferLine.reason,
+    stockoutDemandMethod: "mixed",
+    stockoutDemandConfidence: "low",
+    stockoutSnapshotWeeks: 2,
+    stockoutProxyWeeks: 4,
+    stockoutEvidenceStartWeek: "2026-05-04",
+    stockoutEvidenceEndWeek: "2026-07-20",
+    demandDataCutoff: "2026-07-27"
+  }
+});
+assert.match(stockoutEvidenceHtml, /Stockout demand: snapshots \+ positive-sales proxy · low confidence · 6 eligible weeks · 2 snapshot · 4 proxy · 2026-05-04 to 2026-07-20 · sales cutoff 2026-07-27/);
+assert.match(stockoutEvidenceHtml, /Urgency: Super Urgent · score 76/);
+
+proposalContext.smartState.plan = {
+  proposals: [
+    { ...transferProposal, id: 10, proposalType: "PO", vendor: "  Vendor   A ", urgencyLevel: "urgent", urgencyScore: 35 },
+    { ...transferProposal, id: 11, proposalType: "PO", vendor: "Vendor A", urgencyLevel: "ultimate_urgent", urgencyScore: 92 },
+    { ...transferProposal, id: 12, proposalType: "PO", vendor: "Vendor B", urgencyLevel: "super_urgent", urgencyScore: 70 },
+    { ...transferProposal, id: 13, proposalType: "TO", vendor: "", sourceName: "2967", urgencyLevel: "urgent", urgencyScore: 40 }
+  ]
+};
+proposalContext.smartState.planType = "";
+proposalContext.smartState.planVendor = "vendor a";
+proposalContext.smartState.planShowInventory = true;
+proposalContext.smartState.planShowDecisionEvidence = true;
+assert.deepEqual(
+  [...proposalContext.smartFilteredProposals()].map((proposal) => proposal.id),
+  [11, 10],
+  "The combined-view vendor filter must retain matching POs, reject TOs, normalize vendor names, and sort higher urgency first."
+);
+const poPlansHtml = proposalContext.smartPlans();
+assert.match(poPlansHtml, /<select id="smartPlanVendor" aria-label="PO vendor" >/);
+assert.equal((poPlansHtml.match(/value="vendor a"/g) || []).length, 1, "Duplicate vendor spellings must produce one filter option.");
+assert.match(poPlansHtml, /value="vendor a" selected>Vendor A<\/option>/);
+assert.doesNotMatch(poPlansHtml, /id="smartPlanVendor"[^>]*hidden disabled/, "The vendor filter must be visible in PO + TO view.");
+proposalContext.smartState.planType = "PO";
+assert.deepEqual([...proposalContext.smartFilteredProposals()].map((proposal) => proposal.id), [11, 10]);
+proposalContext.smartState.planType = "TO";
+proposalContext.smartState.planVendor = "";
+assert.deepEqual([...proposalContext.smartFilteredProposals()].map((proposal) => proposal.id), [13]);
+assert.match(proposalContext.smartPlans(), /id="smartPlanVendor"[^>]*hidden disabled/);
+
+proposalContext.smartState.planType = "";
+proposalContext.smartState.planVendor = "";
+proposalContext.smartState.data.planningExclusions = {
+  items: [{
+    id: 81,
+    itemId: 24023,
+    itemName: "TH-COV60T-3045-BEI",
+    vendor: "Vendor A",
+    reason: "Vendor out of stock",
+    expiresAt: null,
+    createdAt: "2026-08-01T12:00:00Z",
+    active: true
+  }],
+  activeCount: 1,
+  blanketItems: [{
+    itemId: 24024,
+    itemName: "BLANKET-COVERED-SKU",
+    vendor: "Vendor B",
+    availablePallets: 12,
+    availableSalesQty: 1200,
+    sourcePoRefs: ["PO-BLANKET-81"],
+    active: true,
+    automatic: true,
+    pauseKind: "blanket_po"
+  }],
+  blanketCount: 1,
+  combinedActiveCount: 2
+};
+vm.runInContext("smartPlanningExclusionState.open = true", proposalContext);
+const exclusionPlansHtml = proposalContext.smartPlans();
+assert.match(exclusionPlansHtml, /Paused items \(2\)/);
+assert.match(exclusionPlansHtml, /TH-COV60T-3045-BEI/);
+assert.match(exclusionPlansHtml, /Vendor out of stock/);
+assert.match(exclusionPlansHtml, /Automatic — Blanket balance/);
+assert.match(exclusionPlansHtml, /BLANKET-COVERED-SKU/);
+assert.match(exclusionPlansHtml, /Blanket PO covered · 12 PLT remaining/);
+assert.match(exclusionPlansHtml, /Source PO-BLANKET-81/);
+assert.match(exclusionPlansHtml, /TO remains available/);
+assert.match(exclusionPlansHtml, /Manual pauses exclude an item only from new vendor PO planning/i);
+assert.match(exclusionPlansHtml, /Generated and manually added TO loads remain available/i);
+const exclusionUiSource = readPublic("scm-smart-exclusions.js");
+const addExclusionBranch = exclusionUiSource.slice(
+  exclusionUiSource.indexOf('action === "add-planning-exclusion"'),
+  exclusionUiSource.indexOf('action === "remove-planning-exclusion"')
+);
+assert.doesNotMatch(addExclusionBranch, /smartPlanningExclusionState\.search\s*=\s*""/,
+  "Pausing one SKU must retain the current item search.");
+assert.doesNotMatch(addExclusionBranch, /smartPlanningExclusionState\.candidates\s*=\s*\[\]/,
+  "Pausing one SKU must retain the current result list for multi-SKU pausing.");
+assert.doesNotMatch(addExclusionBranch, /smartPlanningExclusionState\.expiresAt\s*=\s*""/,
+  "Pausing one SKU must retain the shared reason and expiry for the remaining results.");
+assert.match(exclusionUiSource, /excluded \? "Already paused for PO" : blanketCovered \? "Add manual PO pause" : "Pause vendor PO"/,
+  "The retained list must mark each newly PO-paused SKU without removing the other results.");
+
+const priorityProposal = (id, urgencyLevel, urgencyScore, yard, sourceName = "Vendor") => ({
+  ...transferProposal,
+  id,
+  sourceName,
+  destinationName: yard,
+  urgencyLevel,
+  urgencyScore,
+  routeStops: [{ locationId: id + 100, name: yard }],
+  lines: [{ ...transferLine, destinationName: yard, urgencyLevel, urgencyScore }]
+});
+proposalContext.smartState.plan = {
+  proposals: [
+    priorityProposal(201, "normal", 99, "3445"),
+    priorityProposal(202, "urgent", 99, "150"),
+    priorityProposal(203, "urgent", 1, "3445"),
+    priorityProposal(204, "ultimate_urgent", 1, "150"),
+    priorityProposal(205, "super_urgent", 1, "2967"),
+    priorityProposal(206, "urgent", 50, "12441"),
+    priorityProposal(207, "urgent", 50, "2967"),
+    priorityProposal(208, "normal", 1, "12441")
+  ]
+};
+proposalContext.smartState.planType = "";
+proposalContext.smartState.planVendor = "";
+proposalContext.smartState.planSource = "";
+proposalContext.smartState.planDestination = "";
+proposalContext.smartState.planSort = "source";
+assert.deepEqual(
+  [...proposalContext.smartFilteredProposals()].map((proposal) => proposal.id),
+  [204, 205, 203, 206, 207, 202, 201, 208],
+  "Loads must sort by urgency tier, then 3445, 12441, 2967, and 150 before score or route tie-breakers."
+);
+assert.equal(
+  proposalContext.smartProposalDestinationPriority({
+    ...transferProposal,
+    routeStops: [{ name: "150" }, { name: "12441 delivery yard" }]
+  }),
+  1,
+  "A multi-stop load must use its highest-priority destination yard."
+);
 
 const proposalCss = readPublic("scm-smart-proposals.css");
 assert.match(proposalCss, /\.smart-proposal-lines \.smart-table\s*\{\s*min-width: 1420px;/);
 assert.match(proposalCss, /\.smart-proposal-lines-one-detail-hidden \.smart-table\s*\{\s*min-width: 1210px;/);
 assert.match(proposalCss, /\.smart-proposal-lines-compact \.smart-table\s*\{\s*min-width: 1060px;/);
 assert.match(proposalCss, /\.smart-proposal-lines-compact \.smart-table td \{\s*padding-top: 5px;/);
+assert.match(
+  proposalCss,
+  /\.smart-proposal-head\s*\{[\s\S]*?grid-template-columns:\s*max-content minmax\(170px, 1fr\) repeat\(3, max-content\) max-content;[\s\S]*?padding:\s*6px 10px;/,
+  "Proposal headers must remain one compact desktop row."
+);
+assert.match(
+  proposalCss,
+  /\.smart-proposal-line-editor-controls\s*\{[\s\S]*?grid-template-columns:\s*max-content minmax\(135px, 190px\) minmax\(240px, 1fr\);/,
+  "Add-line controls must remain one compact desktop row."
+);
+assert.match(proposalCss, /\.smart-proposal-item-results:empty\s*\{\s*display:\s*none;/);
+assert.match(proposalCss, /\.smart-table tr\.smart-urgency-ultimate_urgent/);
+assert.match(proposalCss, /\.smart-availability-inline\s*\{[\s\S]*?display: flex;[\s\S]*?white-space: nowrap;/);
+assert.match(
+  proposalCss,
+  /\.smart-plan-sticky\s*\{[\s\S]*?top:\s*calc\(var\(--smart-topbar-height\) \+ var\(--smart-tabs-height\)\);[\s\S]*?z-index:\s*20;/,
+  "The proposal controls must stick below the application tabs."
+);
 
 const appListeners = new Map();
 const appMount = {
+  focusedControl: null,
   addEventListener(type, listener) {
     appListeners.set(type, listener);
   },
+  contains(element) {
+    return element?._insideSmartScm === true;
+  },
+  querySelector() {
+    return this.focusedControl;
+  },
+  querySelectorAll() {
+    return this.focusedControl ? [this.focusedControl] : [];
+  },
   innerHTML: ""
 };
+const focusDocument = {
+  activeElement: null,
+  getElementById: () => appMount,
+  addEventListener() {},
+  createElement: () => ({ click() {}, remove() {} }),
+  body: { appendChild() {} }
+};
+const focusComputedStyle = (element) => ({
+  display: element?.hidden || element?._ancestorHidden ? "none" : "block",
+  visibility: element?.hidden || element?._ancestorHidden ? "hidden" : "visible"
+});
 const forecastContext = vm.createContext({
-  document: { getElementById: () => appMount, addEventListener() {}, createElement: () => ({ click() {}, remove() {} }), body: { appendChild() {} } },
-  window: { addEventListener() {} },
+  document: focusDocument,
+  window: { addEventListener() {}, getComputedStyle: focusComputedStyle },
+  getComputedStyle: focusComputedStyle,
+  CSS: { escape: (value) => String(value).replace(/[^a-zA-Z0-9_-]/g, (character) => `\\${character}`) },
   requireDispatchLogin() {},
   dispatchLogout() {},
   fetch: async () => { throw new Error("Unexpected fetch in UI harness."); },
@@ -397,8 +621,169 @@ const forecastContext = vm.createContext({
   setTimeout,
   clearTimeout
 });
-vm.runInContext(readPublic("scm-smart.js"), forecastContext, { filename: "scm-smart.js" });
+const smartCoreUiSource = readPublic("scm-smart.js");
+const smartBlanketUiSource = readPublic("scm-smart-blanket.js");
+const smartVendorUiSource = readPublic("scm-smart-vendor.js");
+vm.runInContext(smartCoreUiSource, forecastContext, { filename: "scm-smart.js" });
 vm.runInContext("smartState.operator = { role: 'scm' };", forecastContext);
+
+const smartNoticeDismissSource = smartCoreUiSource.slice(
+  smartCoreUiSource.indexOf("function smartScheduleNoticeDismissal()"),
+  smartCoreUiSource.indexOf("function smartRender()")
+);
+assert.doesNotMatch(
+  smartNoticeDismissSource,
+  /\bsmartRender\s*\(/,
+  "Automatic notice dismissal must not redraw the whole Smart SCM workspace and interrupt an active editor."
+);
+const smartRenderSource = smartCoreUiSource.slice(
+  smartCoreUiSource.indexOf("function smartRender()"),
+  smartCoreUiSource.indexOf("async function smartWork")
+);
+const smartCaptureIndex = smartRenderSource.indexOf("smartCaptureFocusedControl(");
+const smartInnerHtmlIndex = smartRenderSource.indexOf("smartScmApp.innerHTML");
+const smartRestoreIndex = smartRenderSource.indexOf("smartRestoreFocusedControl(");
+assert.ok(
+  smartCaptureIndex >= 0 && smartCaptureIndex < smartInnerHtmlIndex
+    && smartInnerHtmlIndex < smartRestoreIndex,
+  "smartRender must capture the active control before replacing innerHTML and restore it afterward."
+);
+assert.doesNotMatch(
+  smartBlanketUiSource,
+  /setSelectionRange\s*\(\s*input\.value\.length\s*,\s*input\.value\.length\s*\)/,
+  "Blanket search must rely on the shared exact-caret restoration instead of forcing the caret to the end."
+);
+assert.doesNotMatch(
+  smartVendorUiSource,
+  /setSelectionRange\s*\(\s*input\.value\.length\s*,\s*input\.value\.length\s*\)/,
+  "Vendor Replies search must rely on the shared exact-caret restoration instead of forcing the caret to the end."
+);
+assert.match(
+  smartCoreUiSource,
+  /addEventListener\("compositionstart"[\s\S]*?smartCompositionDepth \+= 1/,
+  "Smart SCM must defer destructive redraws while an IME composition is active."
+);
+assert.match(
+  smartCoreUiSource,
+  /addEventListener\("compositionend"[\s\S]*?smartScheduleItemSearchRefresh\(\)[\s\S]*?smartRender\(\)/,
+  "Ending an IME composition must resume Item Master search and any deferred redraw."
+);
+
+function focusHarnessControl({
+  id = "smartFocusHarness",
+  inside = true,
+  disabled = false,
+  hidden = false,
+  ancestorHidden = false,
+  selectionStart = 2,
+  selectionEnd = 5,
+  throwOnSelection = false
+} = {}) {
+  const attributes = new Map([["id", id], ["type", "search"]]);
+  return {
+    id,
+    type: "search",
+    tagName: "INPUT",
+    dataset: {},
+    parentElement: null,
+    isConnected: true,
+    _insideSmartScm: inside,
+    _ancestorHidden: ancestorHidden,
+    disabled,
+    hidden,
+    selectionStart,
+    selectionEnd,
+    offsetParent: hidden || ancestorHidden ? null : {},
+    focusCount: 0,
+    hasAttribute(name) { return attributes.has(name); },
+    getAttribute(name) { return attributes.get(name) ?? null; },
+    matches(selector) {
+      if (selector.includes(":disabled") && this.disabled) return true;
+      if (selector.includes("[hidden]") && this.hidden) return true;
+      return /input|select|textarea|button|contenteditable/i.test(selector);
+    },
+    closest(selector) {
+      if (this._ancestorHidden && /hidden|aria-hidden/.test(selector)) return { hidden: true };
+      return null;
+    },
+    checkVisibility() { return !this.hidden && !this._ancestorHidden; },
+    getClientRects() { return this.hidden || this._ancestorHidden ? [] : [{}]; },
+    focus(options) {
+      this.focusCount += 1;
+      this.focusOptions = options;
+    },
+    setSelectionRange(start, end) {
+      if (throwOnSelection) throw new Error("Selection is unavailable for this input type.");
+      this.restoredSelection = { start, end };
+    }
+  };
+}
+
+const originalFocusedControl = focusHarnessControl({ selectionStart: 3, selectionEnd: 7 });
+focusDocument.activeElement = originalFocusedControl;
+appMount.focusedControl = originalFocusedControl;
+const focusedControlSnapshot = forecastContext.smartCaptureFocusedControl();
+const replacementFocusedControl = focusHarnessControl({ selectionStart: 0, selectionEnd: 0 });
+appMount.focusedControl = replacementFocusedControl;
+forecastContext.smartRestoreFocusedControl(focusedControlSnapshot);
+assert.equal(replacementFocusedControl.focusCount, 1, "A surviving active input must regain focus after a shared redraw.");
+assert.equal(replacementFocusedControl.focusOptions?.preventScroll, true, "Focus restoration must not jump the workspace scroll position.");
+assert.deepEqual(
+  replacementFocusedControl.restoredSelection,
+  { start: 3, end: 7 },
+  "Focus restoration must preserve the exact caret or selected text range."
+);
+
+focusDocument.activeElement = focusHarnessControl({ inside: false });
+appMount.focusedControl = focusDocument.activeElement;
+assert.ok(
+  forecastContext.smartCaptureFocusedControl() == null,
+  "An editor outside Smart SCM must never be captured or receive stolen focus."
+);
+
+focusDocument.activeElement = originalFocusedControl;
+appMount.focusedControl = originalFocusedControl;
+const missingControlSnapshot = forecastContext.smartCaptureFocusedControl();
+appMount.focusedControl = null;
+assert.doesNotThrow(() => forecastContext.smartRestoreFocusedControl(missingControlSnapshot));
+
+for (const replacement of [
+  focusHarnessControl({ disabled: true }),
+  focusHarnessControl({ hidden: true }),
+  focusHarnessControl({ ancestorHidden: true })
+]) {
+  appMount.focusedControl = replacement;
+  assert.doesNotThrow(() => forecastContext.smartRestoreFocusedControl(missingControlSnapshot));
+  assert.equal(replacement.focusCount, 0, "Removed, disabled, or hidden controls must not regain focus after a redraw.");
+}
+
+const throwingSelectionControl = focusHarnessControl({ throwOnSelection: true });
+appMount.focusedControl = throwingSelectionControl;
+assert.doesNotThrow(
+  () => forecastContext.smartRestoreFocusedControl(missingControlSnapshot),
+  "A control-specific selection API failure must not break the shared Smart SCM render."
+);
+assert.equal(throwingSelectionControl.focusCount, 1, "Selection failure must not undo successful focus restoration.");
+
+forecastContext.__itemResponses = [];
+vm.runInContext(`
+  smartState.itemSearch = "first";
+  smartState.itemData = null;
+  smartRender = () => {};
+  smartApi = () => new Promise((resolve) => __itemResponses.push(resolve));
+`, forecastContext);
+const firstItemLoad = vm.runInContext("smartLoadItems({ quiet: true })", forecastContext);
+vm.runInContext('smartState.itemSearch = "second"', forecastContext);
+const secondItemLoad = vm.runInContext("smartLoadItems({ quiet: true })", forecastContext);
+forecastContext.__itemResponses[1]({ marker: "newest", items: [] });
+await secondItemLoad;
+forecastContext.__itemResponses[0]({ marker: "stale", items: [] });
+await firstItemLoad;
+assert.equal(
+  vm.runInContext("smartState.itemData.marker", forecastContext),
+  "newest",
+  "An older Item Master response must never replace results for a newer search."
+);
 const floatingNoticesHtml = vm.runInContext(`
   smartState.error = "Failed <unsafe>";
   smartState.notice = "Saved";
@@ -406,8 +791,9 @@ const floatingNoticesHtml = vm.runInContext(`
   smartFloatingNotices();
 `, forecastContext);
 assert.match(floatingNoticesHtml, /^<div class="smart-floating-notices" aria-live="polite" aria-atomic="true">/);
-assert.match(floatingNoticesHtml, /<div class="smart-notice error" role="alert">Failed &lt;unsafe&gt;<\/div>/);
-assert.match(floatingNoticesHtml, /<div class="smart-notice">Saved<\/div>/);
+assert.match(floatingNoticesHtml, /<div class="smart-notice error smart-dismissible-notice" role="alert"><span>Failed &lt;unsafe&gt;<\/span>/);
+assert.match(floatingNoticesHtml, /<div class="smart-notice smart-dismissible-notice"><span>Saved<\/span>/);
+assert.match(floatingNoticesHtml, /data-smart-action="dismiss-smart-notice"/);
 assert.match(floatingNoticesHtml, /<div class="smart-notice">Refreshing…<\/div>/);
 assert.equal(vm.runInContext(`
   smartState.error = "";
@@ -421,6 +807,17 @@ assert.match(
   /\.smart-floating-notices\s*\{[\s\S]*?position:\s*fixed;[\s\S]*?top:\s*72px;[\s\S]*?z-index:\s*80;/,
   "Top-level Smart SCM notices must remain fixed above the sticky header and plan controls."
 );
+assert.match(
+  smartCss,
+  /\.smart-tabs\s*\{[\s\S]*?position:\s*sticky;[\s\S]*?top:\s*var\(--smart-topbar-height\);[\s\S]*?overflow-x:\s*auto;/,
+  "Smart SCM tabs must remain sticky and horizontally scrollable."
+);
+assert.match(
+  smartCss,
+  /@media \(max-width: 1500px\)\s*\{[\s\S]*?--smart-topbar-height:\s*96px;/,
+  "Sticky offsets must follow the two-row Smart SCM topbar at common viewport widths."
+);
+assert.match(readPublic("scm-smart.js"), /<span>Stockout average period<\/span>[\s\S]*?positive-sales proxy weeks averaged/);
 forecastContext.__capturedItemsUrl = null;
 vm.runInContext(`
   smartState.itemLowerStockPolicy = "yard:150";
@@ -643,6 +1040,18 @@ assert.match(forecastPolicyHtml, /Capacity <strong>16 PLT<\/strong>/);
 assert.match(forecastPolicyHtml, /4 PLT\/week · SD 1\.633 · 2 lead weeks · factor 1\.3 · current policy\/settings/);
 assert.match(forecastPolicyHtml, /ROP = round\(3\.002 safety \+ 4 demand × 2 lead\) = 11 PLT/);
 assert.match(forecastPolicyHtml, /Preferred = min\(16 capacity, ceil\(11 ROP \+ 4 demand × 2 lead\)\) = 16 PLT/);
+
+const stockoutForecastEvidence = vm.runInContext(`smartForecastStockoutEvidence({
+  stockoutDemandMethod: "mixed",
+  stockoutDemandConfidence: "low",
+  stockoutSnapshotWeeks: 2,
+  stockoutProxyWeeks: 4,
+  stockoutEvidenceStartWeek: "2026-05-04",
+  stockoutEvidenceEndWeek: "2026-07-20",
+  demandDataCutoff: "2026-07-27"
+})`, forecastContext);
+assert.match(stockoutForecastEvidence, /snapshots \+ positive-sales proxy · low confidence/);
+assert.match(stockoutForecastEvidence, /6 eligible weeks · 2 snapshot · 4 proxy · 2026-05-04 to 2026-07-20 · sales cutoff 2026-07-27/);
 
 const lowerStockPolicyHtml = vm.runInContext(`smartForecastStockPolicy({
   lowerStockPolicyEnabled: true,

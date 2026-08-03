@@ -10,12 +10,28 @@
   <body>
     <main class="dispatch-shell dispatch-menu-shell" id="dispatchMenuApp"></main>
     <script src="/i18n.js?v=20260728-custom-orders-v1"></script>
-    <script src="/app-sidebar.js?v=20260728-custom-orders-v1"></script>
+    <script src="/app-sidebar.js?v=20260731-driver-pwa-v2"></script>
     <script src="/dispatch-auth.js?v=20260725-private-record-v1"></script>
     <script>
       let dispatchMenuOperator = null;
+      let dispatchMenuOfflineReviewCount = null;
       const dispatchMenuApp = document.getElementById("dispatchMenuApp");
       const mt = (key, fallback) => MBBS_I18N.t(key, fallback);
+      const escapeDispatchMenuHtml = (value) => String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+      function paintDispatchMenuOfflineReviewCount() {
+        const badge = document.getElementById("dispatchMenuOfflineReviewCount");
+        if (!badge) return;
+        const count = Number(dispatchMenuOfflineReviewCount);
+        const visible = Number.isFinite(count) && count > 0;
+        badge.hidden = !visible;
+        badge.textContent = visible ? (count > 99 ? "99+" : String(Math.floor(count))) : "";
+        badge.setAttribute("aria-label", visible ? `${Math.floor(count)} open Driver PWA sync records` : "No open Driver PWA sync records");
+      }
       function renderDispatchMenu() {
         const operator = dispatchMenuOperator || {};
         dispatchMenuApp.innerHTML = `
@@ -26,7 +42,7 @@
               </div>
               <div class="topbar-language">${MBBS_I18N.toggleHtml()}</div>
               <div class="topbar-actions">
-                <span class="dispatch-user">${operator.display_name || operator.username}</span>
+                <span class="dispatch-user">${escapeDispatchMenuHtml(operator.display_name || operator.username || "")}</span>
                 <button onclick="dispatchLogout()" type="button">${mt("common.logout", "Logout")}</button>
               </div>
             </header>
@@ -60,6 +76,13 @@
                   <strong>${mt("dispatch.dvirPhotos", "DVIR Photos")}</strong>
                   <span>${mt("dispatch.dvirDesc", "Review pre-trip and post-trip photos captured in the MBBS driver PWA.")}</span>
                 </button>
+                <button class="dispatch-menu-card" onclick="location.href='/dispatch/driver-pwa'" type="button">
+                  <strong class="dispatch-offline-review-card-title">
+                    <span class="dispatch-offline-review-card-label">${mt("dispatch.driverPwa", "Driver PWA")}</span>
+                    <span class="dispatch-offline-review-menu-badge" id="dispatchMenuOfflineReviewCount" hidden aria-live="polite"></span>
+                  </strong>
+                  <span>${mt("dispatch.driverPwaDesc", "Review Driver PWA stops, safely reopen a stop for driver recapture, and resolve sync conflicts while preserving evidence.")}</span>
+                </button>
                 <button class="dispatch-menu-card" onclick="location.href='/dispatch/loaded-export'" type="button">
                   <strong>${mt("control.loadedExport", "In/Outbound Record")}</strong>
                   <span>${mt("control.loadedExportHelp", "Review yard processing, driver delivery timestamps, details, and photo proof.")}</span>
@@ -79,8 +102,14 @@
               </div>
             </section>
           `;
+        paintDispatchMenuOfflineReviewCount();
       }
       window.addEventListener("mbbs-language-changed", renderDispatchMenu);
+      window.addEventListener("mbbs-offline-review-count-updated", (event) => {
+        const count = Number(event.detail?.count);
+        dispatchMenuOfflineReviewCount = Number.isFinite(count) && count >= 0 ? Math.floor(count) : null;
+        paintDispatchMenuOfflineReviewCount();
+      });
       requireDispatchLogin({
         mount: dispatchMenuApp,
         onReady(operator) {

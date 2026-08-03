@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { closeDb } from "./db.js";
-import { dispatchStatisticStopFromRow } from "./dispatch-statistics-repository.js";
+import {
+  dispatchStatisticStopFromRow,
+  dispatchStatisticStopsFromRows
+} from "./dispatch-statistics-repository.js";
 
 const planPayload = {
   plan_id: "991",
@@ -93,6 +96,16 @@ try {
   assert.equal(pickup.truckPlate, "ASSIGNED-B");
   assert.equal(pickup.pallets, 7);
   assert.equal(pickup.plannedMinutes, 57, "The load's driver timing must win over both parent and assigned-truck defaults.");
+  const currentDriverProfilePickup = dispatchStatisticStopFromRow(row(), {
+    driverProfile: {
+      login: "driver-v2",
+      ownYardFixedMinutes: 30,
+      vendorFixedMinutes: 28,
+      deliveryFixedMinutes: 32,
+      minutesPerPallet: 1
+    }
+  });
+  assert.equal(currentDriverProfilePickup.plannedMinutes, 30, "The assigned driver's current configured rule must win over a stale plan snapshot.");
 
   const drop = dispatchStatisticStopFromRow(row({
     stop_id: "DROP-LINE-101",
@@ -154,7 +167,91 @@ try {
   assert.equal(truckSwitch.stopClass, "truck_switch");
   assert.equal(truckSwitch.plannedMinutes, 12);
 
-  console.log(JSON.stringify({ ok: true, tests: 16 }));
+  const groupedOrders = [{
+    id: "GROUPED-SO",
+    type: "SO",
+    address: "100 Main Street, Toronto, ON",
+    items: [{ lineRowId: "GS", pallets: 2, layers: 0 }]
+  }, {
+    id: "GROUPED-CUSTOM",
+    type: "CUSTOM",
+    customOrder: true,
+    sourceTable: "dispatch_custom_orders",
+    stopMinutes: 64,
+    address: "100 MAIN STREET TORONTO ON",
+    items: [{ lineRowId: "GC", pallets: 3, layers: 0 }]
+  }];
+  const groupedTrucks = [{
+    id: "GROUPED-TRUCK",
+    plate: "GROUPED-TRUCK",
+    loads: [{
+      id: "GROUPED-LOAD",
+      name: "Grouped physical visit",
+      driverLogin: "driver-v2",
+      truckId: "GROUPED-TRUCK",
+      truckPlate: "GROUPED-TRUCK",
+      deliveryFixedMinutes: 33,
+      minutesPerPallet: 2,
+      stops: [
+        { id: "GROUPED-DROP-A", type: "drop", orderId: "GROUPED-SO", lineRowIds: ["GS"], stopTimeOverrideMinutes: 45 },
+        { id: "GROUPED-DROP-B", type: "drop", orderId: "GROUPED-CUSTOM", lineRowIds: ["GC"], stopTimeOverrideMinutes: 45 }
+      ]
+    }]
+  }];
+  const groupedRow = (overrides = {}) => row({
+    orders: groupedOrders,
+    trucks: groupedTrucks,
+    truck_id: "GROUPED-TRUCK",
+    truck_plate: "GROUPED-TRUCK",
+    load_id: "GROUPED-LOAD",
+    load_name: "Grouped physical visit",
+    stop_id: "GROUPED-DROP-A",
+    stop_type: "dropoff",
+    order_refs: ["GROUPED-SO"],
+    started_at: "2026-07-22T12:00:00.000Z",
+    completed_at: "2026-07-22T12:20:00.000Z",
+    ...overrides
+  });
+  const groupedStops = dispatchStatisticStopsFromRows([
+    groupedRow(),
+    groupedRow({
+      job_id: "JOB-V2-B",
+      stop_id: "GROUPED-DROP-B",
+      order_refs: ["GROUPED-CUSTOM"],
+      started_at: "2026-07-22T12:20:00.000Z",
+      completed_at: "2026-07-22T12:50:00.000Z"
+    })
+  ]);
+  assert.equal(groupedStops.length, 1, "Statistics must count adjacent same-address orders as one physical visit.");
+  assert.deepEqual(groupedStops[0].stopIds, ["GROUPED-DROP-A", "GROUPED-DROP-B"]);
+  assert.equal(groupedStops[0].plannedMinutes, 45, "A visit override must be counted exactly once in Statistics.");
+  assert.equal(groupedStops[0].actualMinutes, 50);
+  assert.equal(groupedStops[0].overrunMinutes, 5);
+  assert.equal(groupedStops[0].pallets, 5);
+  assert.deepEqual(groupedStops[0].orderRefs, ["GROUPED-SO", "GROUPED-CUSTOM"]);
+  const partiallyRecordedVisit = dispatchStatisticStopsFromRows([groupedRow()]);
+  assert.equal(partiallyRecordedVisit[0].status, "in_progress", "A physical visit remains in progress until every logical job is complete.");
+  assert.equal(partiallyRecordedVisit[0].plannedMinutes, 45);
+  assert.equal(partiallyRecordedVisit[0].overrunMinutes, 0);
+
+  const automaticGroupedTrucks = structuredClone(groupedTrucks);
+  for (const stop of automaticGroupedTrucks[0].loads[0].stops) delete stop.stopTimeOverrideMinutes;
+  const automaticGrouped = dispatchStatisticStopsFromRows([
+    groupedRow({ trucks: automaticGroupedTrucks }),
+    groupedRow({
+      trucks: automaticGroupedTrucks,
+      job_id: "JOB-V2-B-AUTO",
+      stop_id: "GROUPED-DROP-B",
+      order_refs: ["GROUPED-CUSTOM"]
+    })
+  ]);
+  assert.equal(
+    automaticGrouped[0].plannedMinutes,
+    64,
+    "A mixed Custom visit must use max(driver grouped rule, Custom duration), never sum both logical stops."
+  );
+
+  console.log(JSON.stringify({ ok: true, tests: 29 }));
 } finally {
   await closeDb();
 }

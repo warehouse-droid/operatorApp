@@ -1,5 +1,10 @@
 import { query } from "./db.js";
-import { dispatchLoadAssignment, dispatchOwnYardCodes } from "./dispatch-load-assignment.js";
+import {
+  dispatchLoadAssignment,
+  dispatchOwnYardCodes,
+  dispatchPhysicalStopVisits
+} from "./dispatch-load-assignment.js";
+import { listDispatchDrivers } from "./dispatch-setup-repository.js";
 
 function todayLocalDate() {
   const parts = new Intl.DateTimeFormat("en-CA", {
@@ -253,7 +258,7 @@ function classLabel(stopClassValue) {
   return "Unknown";
 }
 
-export function dispatchStatisticStopFromRow(row) {
+export function dispatchStatisticStopFromRow(row, { driverProfile = null } = {}) {
   const plan = {
     id: row.plan_id,
     planDate: String(row.plan_date || "").slice(0, 10),
@@ -267,17 +272,21 @@ export function dispatchStatisticStopFromRow(row) {
     truckId: row.truck_id || assignment.truckId,
     truckPlate: row.truck_plate || assignment.truckPlate
   });
-  const planningProfile = { ...assignedTruck, ...parentTruck, ...load };
+  const planningProfile = { ...assignedTruck, ...parentTruck, ...load, ...(driverProfile || {}) };
   const stop = findStop(load, row);
   const order = primaryOrder(plan, row);
-  const currentClass = stopClass(plan, row, stop, order);
+  const physicalVisit = dispatchPhysicalStopVisits(plan, planningProfile, load, { planningProfile: driverProfile })
+    .find((visit) => visit.stopIds.includes(String(stop?.id || row.stop_id || ""))) || null;
+  const currentClass = physicalVisit?.serviceType || stopClass(plan, row, stop, order);
   const pallets = row.stop_type === "pickup"
     ? pickupFootprintForLocation(plan, load, stop?.location)
     : currentClass === "delivery"
       ? orderFootprintPallets(order, stop?.lineRowIds)
       : orderFootprintPallets(order, stop?.lineRowIds);
   const customDropMinutes = row.stop_type === "dropoff" ? customOrderStopMinutes(order) : null;
-  const plannedMinutes = customDropMinutes ?? plannedStopMinutes(currentClass, planningProfile, pallets);
+  const plannedMinutes = physicalVisit?.plannedMinutes
+    ?? customDropMinutes
+    ?? plannedStopMinutes(currentClass, planningProfile, pallets);
   const grossSeconds = row.status === "complete" ? secondsBetween(row.started_at, row.completed_at) : 0;
   const restSeconds = row.status === "complete"
     ? Math.min(grossSeconds, Math.max(0, numberValue(row.rest_seconds)))
@@ -293,6 +302,7 @@ export function dispatchStatisticStopFromRow(row) {
     truckPlate: row.truck_plate || assignment.truckPlate || assignedTruck.plate || parentTruck.plate || "",
     loadName: row.load_name || load.name || "",
     stopId: row.stop_id || "",
+    stopIds: physicalVisit?.stopIds || [row.stop_id || ""].filter(Boolean),
     stopType: row.stop_type || "",
     stopClass: currentClass,
     stopClassLabel: classLabel(currentClass),
@@ -306,8 +316,83 @@ export function dispatchStatisticStopFromRow(row) {
     overrunMinutes: row.status === "complete" ? Math.max(actualMinutes - plannedMinutes, 0) : 0,
     pallets,
     orderRefs: orderRefs(row),
-    photoCount: Array.isArray(row.photo_data_urls) ? row.photo_data_urls.filter(Boolean).length : 0
+    photoCount: Array.isArray(row.photo_data_urls) ? row.photo_data_urls.filter(Boolean).length : 0,
+    physicalVisitKey: physicalVisit
+      ? `${String(row.plan_id || "")}|${String(load.id || row.load_id || "")}|${physicalVisit.id}`
+      : "",
+    physicalVisitStopIds: physicalVisit?.stopIds || [],
+    physicalVisitFirstIndex: physicalVisit?.firstIndex ?? null,
+    physicalVisitLastIndex: physicalVisit?.lastIndex ?? null,
+    physicalVisitPlannedMinutes: physicalVisit?.plannedMinutes ?? null,
+    stopIndex: (load.stops || []).findIndex((candidate) => String(candidate?.id || "") === String(row.stop_id || ""))
   };
+}
+
+function firstDateValue(values = []) {
+  const dates = values.map((value) => value ? new Date(value) : null)
+    .filter((value) => value && Number.isFinite(value.getTime()))
+    .sort((left, right) => left.getTime() - right.getTime());
+  return dates[0]?.toISOString() || null;
+}
+
+function lastDateValue(values = []) {
+  const dates = values.map((value) => value ? new Date(value) : null)
+    .filter((value) => value && Number.isFinite(value.getTime()))
+    .sort((left, right) => right.getTime() - left.getTime());
+  return dates[0]?.toISOString() || null;
+}
+
+/**
+ * Collapse logical Driver PWA jobs that belong to one planned physical visit.
+ * This keeps stop statistics from applying the same grouped visit duration once
+ * per order while preserving every order and photo reference in the result.
+ */
+export function dispatchStatisticStopsFromRows(rows = [], { driverProfiles = [] } = {}) {
+  const profileByLogin = new Map((driverProfiles || []).map((driver) => [String(driver?.login || "").trim().toLowerCase(), driver]));
+  const mapped = (rows || []).map((row) => dispatchStatisticStopFromRow(row, {
+    driverProfile: profileByLogin.get(String(row?.driver_login || "").trim().toLowerCase()) || null
+  }));
+  const groups = [];
+  const groupByKey = new Map();
+  for (const stop of mapped) {
+    const key = stop.physicalVisitKey || `job:${stop.jobId || `${stop.planId}|${stop.loadName}|${stop.stopId}`}`;
+    if (!groupByKey.has(key)) {
+      const group = { key, members: [] };
+      groupByKey.set(key, group);
+      groups.push(group);
+    }
+    groupByKey.get(key).members.push(stop);
+  }
+  return groups.map(({ members }) => {
+    if (members.length === 1 && !members[0].physicalVisitKey) return members[0];
+    const ordered = [...members].sort((left, right) => left.stopIndex - right.stopIndex);
+    const representative = ordered[0];
+    const expectedStopIds = representative.physicalVisitStopIds || [];
+    const recordedStopIds = new Set(members.map((member) => String(member.stopId || "")).filter(Boolean));
+    const complete = expectedStopIds.length > 0
+      && expectedStopIds.every((stopId) => recordedStopIds.has(String(stopId)))
+      && members.every((member) => member.status === "complete");
+    const actualMinutes = members.reduce((sum, member) => sum + numberValue(member.actualMinutes), 0);
+    const grossMinutes = members.reduce((sum, member) => sum + numberValue(member.grossMinutes), 0);
+    const restMinutes = members.reduce((sum, member) => sum + numberValue(member.restMinutes), 0);
+    const plannedMinutes = numberValue(representative.physicalVisitPlannedMinutes ?? representative.plannedMinutes);
+    const pallets = members.reduce((sum, member) => sum + numberValue(member.pallets), 0);
+    return {
+      ...representative,
+      status: complete ? "complete" : "in_progress",
+      startedAt: firstDateValue(members.map((member) => member.startedAt)),
+      completedAt: complete ? lastDateValue(members.map((member) => member.completedAt)) : null,
+      actualMinutes,
+      grossMinutes,
+      restMinutes,
+      plannedMinutes,
+      overrunMinutes: complete ? Math.max(actualMinutes - plannedMinutes, 0) : 0,
+      pallets,
+      photoCount: members.reduce((sum, member) => sum + numberValue(member.photoCount), 0),
+      stopIds: expectedStopIds.length ? expectedStopIds : ordered.map((member) => member.stopId).filter(Boolean),
+      orderRefs: [...new Set(members.flatMap((member) => member.orderRefs || []))]
+    };
+  });
 }
 
 function aggregateBy(stops, keyFn, labelFn = keyFn) {
@@ -364,7 +449,7 @@ export async function getDispatchStatistics({ from = "", to = "", driver = "" } 
   const params = [fromDate, toDate];
   const driverClause = driver ? `AND r.driver_login = $3` : "";
   if (driver) params.push(String(driver).trim().toLowerCase());
-  const result = await query(
+  const [result, driverProfiles] = await Promise.all([query(
     `SELECT r.job_id, r.plan_id, r.plan_date::text AS plan_date,
             r.driver_login, r.truck_id, r.truck_plate, r.load_id, r.load_name,
             r.stop_id, r.stop_type, COALESCE(r.order_refs, '[]'::jsonb) AS order_refs,
@@ -391,8 +476,8 @@ export async function getDispatchStatistics({ from = "", to = "", driver = "" } 
         ${driverClause}
       ORDER BY r.plan_date DESC, r.driver_login, r.started_at DESC NULLS LAST`,
     params
-  );
-  const stops = result.rows.map(dispatchStatisticStopFromRow);
+  ), listDispatchDrivers({ activeOnly: false })]);
+  const stops = dispatchStatisticStopsFromRows(result.rows, { driverProfiles });
   const completed = stops.filter((stop) => stop.status === "complete");
   const byDriver = aggregateBy(stops, (stop) => stop.driverLogin || "unknown");
   const byStopClass = aggregateBy(completed, (stop) => stop.stopClass, (stop) => stop.stopClassLabel)

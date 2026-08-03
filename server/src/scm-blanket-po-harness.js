@@ -10,12 +10,14 @@ import {
 import { upsertPurchaseOrders } from "./order-sync-repository.js";
 
 const migrationUrl = new URL("../migrations/059_scm_blanket_purchase_orders.sql", import.meta.url);
+const workflowMigrationUrl = new URL("../migrations/097_smart_scm_blanket_orders.sql", import.meta.url);
 const scheduleUiUrl = new URL("../public/scm-schedule.js", import.meta.url);
 const dispatchRepositoryUrl = new URL("./dispatch-repository.js", import.meta.url);
 const orderSyncRepositoryUrl = new URL("./order-sync-repository.js", import.meta.url);
 
-const [migrationSource, scheduleUiSource, dispatchRepositorySource, orderSyncRepositorySource] = await Promise.all([
+const [migrationSource, workflowMigrationSource, scheduleUiSource, dispatchRepositorySource, orderSyncRepositorySource] = await Promise.all([
   fs.readFile(migrationUrl, "utf8"),
+  fs.readFile(workflowMigrationUrl, "utf8"),
   fs.readFile(scheduleUiUrl, "utf8"),
   fs.readFile(dispatchRepositoryUrl, "utf8"),
   fs.readFile(orderSyncRepositoryUrl, "utf8")
@@ -90,6 +92,7 @@ try {
     // Migrations are transactional in PostgreSQL. Applying this idempotent migration here lets
     // the harness run before deployment and guarantees the live schema is restored by rollback.
     await query(migrationSource);
+    await query(workflowMigrationSource);
 
     const blanketPreset = (await listScmViewPresets())
       .find((preset) => String(preset.name || "").toLowerCase() === "blanket");
@@ -276,10 +279,27 @@ try {
     assert(hasRef(diagnosticNewSyncDispatch, newSyncRef),
       "The new PO fixture must otherwise be dispatch-eligible; Hold filtering cannot pass vacuously.");
 
-    await setPurchaseOrderBlanketFlag(parentRef, {
-      isBlanket: false,
-      updatedBy: actor
-    });
+    await assert.rejects(
+      setPurchaseOrderBlanketFlag(parentRef, { isBlanket: false, updatedBy: actor }),
+      (error) => error.code === "SCM_BLANKET_UNFLAG_UNSAFE",
+      "A Blanket parent with an active split must not be unflagged."
+    );
+    await assert.rejects(
+      setPurchaseOrderBlanketFlag(childRef, { isBlanket: true, updatedBy: actor }),
+      (error) => error.code === "SCM_BLANKET_SOURCE_REQUIRED",
+      "A local split child must never become a Blanket source parent."
+    );
+    await query(
+      "UPDATE purchase_orders SET status_text = 'Purchase Order : Fully Billed' WHERE netsuite_id = $1",
+      [newSyncId]
+    );
+    await assert.rejects(
+      setPurchaseOrderBlanketFlag(newSyncRef, { isBlanket: true, updatedBy: actor }),
+      (error) => error.code === "SCM_BLANKET_SOURCE_NOT_OPEN",
+      "A completed/non-open source PO must not be flaggable as Blanket."
+    );
+    await query("UPDATE dispatch_scm_po_splits SET status = 'cancelled' WHERE id = $1", [splitHeaderId]);
+    await setPurchaseOrderBlanketFlag(parentRef, { isBlanket: false, updatedBy: actor });
     const unflagged = await query(
       "SELECT is_blanket_po FROM purchase_orders WHERE netsuite_id = $1",
       [parentId]

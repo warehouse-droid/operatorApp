@@ -1,11 +1,12 @@
 import { query } from "./db.js";
 import { writeAudit } from "./auth-repository.js";
 import { listSmartScmForecastRuns, listSmartScmForecasts, runSmartScmForecast } from "./smart-scm-forecast-repository.js";
-import { getSmartScmPlanningRun, listSmartScmPlanningRuns, listSmartScmProposals, runSmartScmPlan } from "./smart-scm-planning-repository.js";
+import { getSmartScmPlanningRun, listSmartScmBlanketPlanningPauses, listSmartScmPlanningRuns, listSmartScmProposals, runSmartScmPlan } from "./smart-scm-planning-repository.js";
 import { listSmartScmPrintJobs, listYardPrinters } from "./smart-scm-print-repository.js";
 import { getSmartScmSyncStatus } from "./smart-scm-item-repository.js";
+import { listSmartScmActivePlanningExclusionItemIds, listSmartScmPlanningExclusions } from "./smart-scm-planning-exclusion-repository.js";
 import { refreshSmartScmLiveData } from "./smart-scm-sync-service.js";
-import { listSmartScmVendorReplyLoads } from "./smart-scm-vendor-repository.js";
+import { listSmartScmVendorWorkflowLoads } from "./smart-scm-vendor-workflow-repository.js";
 
 let smartScmTickRunning = false;
 
@@ -176,14 +177,15 @@ export async function promoteSmartScmForecastSegment({ yardCode, series = "*", a
 }
 
 export async function getSmartScmBootstrap({ proposalLimit = 200 } = {}) {
-  const [settings, syncStatus, forecastRuns, planningRuns, printers, printJobs, vendorReplyLoads] = await Promise.all([
+  const [settings, syncStatus, forecastRuns, planningRuns, printers, printJobs, vendorReplyLoads, planningExclusions] = await Promise.all([
     getSmartScmSettings(),
     getSmartScmSyncStatus(),
     listSmartScmForecastRuns({ limit: 10 }),
     listSmartScmPlanningRuns({ limit: 10 }),
     listYardPrinters(),
     listSmartScmPrintJobs({ limit: 50 }),
-    listSmartScmVendorReplyLoads({ limit: 500 })
+    listSmartScmVendorWorkflowLoads({ limit: 500 }),
+    listSmartScmPlanningPauses({ limit: 500 })
   ]);
   const latestRun = planningRuns[0]?.id ? await getSmartScmPlanningRun(planningRuns[0].id) : null;
   const latestForecasts = forecastRuns[0]?.id
@@ -198,7 +200,26 @@ export async function getSmartScmBootstrap({ proposalLimit = 200 } = {}) {
     latestForecasts,
     printers,
     printJobs,
-    vendorReplyLoads
+    vendorReplyLoads,
+    planningExclusions
+  };
+}
+
+export async function listSmartScmPlanningPauses(options = {}) {
+  const [manual, blanketItems, manualActiveItemIds] = await Promise.all([
+    listSmartScmPlanningExclusions(options),
+    listSmartScmBlanketPlanningPauses({ search: options.search }),
+    listSmartScmActivePlanningExclusionItemIds({ search: options.search })
+  ]);
+  const activeItemIds = new Set([
+    ...manualActiveItemIds,
+    ...blanketItems.map((item) => Number(item.itemId))
+  ].filter(Number.isInteger));
+  return {
+    ...manual,
+    blanketItems,
+    blanketCount: blanketItems.length,
+    combinedActiveCount: activeItemIds.size
   };
 }
 

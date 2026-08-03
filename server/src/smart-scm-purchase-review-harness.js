@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { closeDb } from "./db.js";
 import { buildSmartScmPurchaseOrderRestPayload, smartScmPurchaseOrderMemoMarker } from "./smart-scm-purchase-netsuite.js";
-import { selectSmartScmMarkerPurchaseOrder } from "./smart-scm-purchase-service.js";
+import {
+  selectSmartScmMarkerPurchaseOrder,
+  smartScmNetSuiteCreateFailureIsAmbiguous
+} from "./smart-scm-purchase-service.js";
 import { normalizeSmartScmVendorDecision } from "./smart-scm-vendor-repository.js";
 import { selectSmartScmMarkerTransferOrder, smartScmTransferOrderMemoMarker } from "./transfer-dependency-netsuite.js";
 
@@ -53,6 +56,9 @@ try {
     () => selectSmartScmMarkerPurchaseOrder([{ id: 901, vendor_id: 88 }], { proposalId: 501, vendorId: 77 }),
     /different NetSuite vendor/
   );
+  assert.equal(smartScmNetSuiteCreateFailureIsAmbiguous(new Error("network timeout")), true);
+  assert.equal(smartScmNetSuiteCreateFailureIsAmbiguous(Object.assign(new Error("upstream failed"), { status: 503 })), true);
+  assert.equal(smartScmNetSuiteCreateFailureIsAmbiguous(Object.assign(new Error("request rejected"), { status: 400 })), false);
   assert.equal(smartScmTransferOrderMemoMarker(601), "MBBS-SCM:601");
   assert.equal(selectSmartScmMarkerTransferOrder([], { proposalId: 601 }), null);
   assert.equal(selectSmartScmMarkerTransferOrder([{

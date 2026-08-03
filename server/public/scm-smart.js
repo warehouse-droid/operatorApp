@@ -13,11 +13,15 @@ const smartState = {
   planSearch: "",
   planType: "",
   planStatus: "",
+  planVendor: "",
   planSource: "",
   planDestination: "",
   planSort: "destination",
   selectedProposalIds: new Set(),
   vendorSearch: "",
+  blanketWorkspace: null,
+  blanketSearch: "",
+  blanketSidebarTab: "blanket",
   forecastSearch: "",
   forecastYard: "",
   itemData: null,
@@ -32,8 +36,15 @@ const smartState = {
 };
 
 let smartItemSearchTimer = null;
+let smartItemLoadRequestSequence = 0;
 const smartVendorSearchTimers = new Map();
 const smartProposalSearchTimers = new Map();
+let smartNoticeDismissTimer = null;
+let smartNoticeDismissSignature = "";
+let smartCompositionDepth = 0;
+let smartDeferredRender = false;
+let smartCompositionFlushTimer = null;
+let smartRenderedTab = smartState.tab;
 
 function smartEscape(value) {
   return String(value ?? "")
@@ -136,6 +147,7 @@ async function smartLoadBootstrap({ quiet = false } = {}) {
 }
 
 async function smartLoadItems({ reset = false, quiet = false } = {}) {
+  const requestSequence = ++smartItemLoadRequestSequence;
   if (reset) smartState.itemOffset = 0;
   if (!quiet) {
     smartState.busy = "Loading Item Master";
@@ -151,9 +163,18 @@ async function smartLoadItems({ reset = false, quiet = false } = {}) {
     returnPolicyOverride: smartState.itemReturnPolicyOverride,
     offset: String(smartState.itemOffset)
   });
-  smartState.itemData = await smartApi(`/api/scm/smart/items?${params}`);
+  let itemData;
+  try {
+    itemData = await smartApi(`/api/scm/smart/items?${params}`);
+  } catch (error) {
+    if (requestSequence !== smartItemLoadRequestSequence) return smartState.itemData;
+    throw error;
+  }
+  if (requestSequence !== smartItemLoadRequestSequence) return smartState.itemData;
+  smartState.itemData = itemData;
   smartState.busy = "";
   smartRender();
+  return smartState.itemData;
 }
 
 function smartHeader() {
@@ -180,6 +201,7 @@ function smartTabs() {
     ["items", "Item Master"],
     ["forecasts", "Forecast evidence"],
     ["plans", "PO / TO proposals"],
+    ["blankets", "Blanket order"],
     ["vendors", "Vendor replies"],
     ["settings", "Settings"]
   ];
@@ -489,6 +511,25 @@ function smartItemMaster() {
     </section>`;
 }
 
+function smartForecastStockoutEvidence(row) {
+  const method = row.stockoutDemandMethod;
+  if (!method || method === "none") return "";
+  const labels = {
+    snapshot: "inventory snapshots",
+    mixed: "snapshots + positive-sales proxy",
+    positive_sales_proxy: "positive-sales proxy"
+  };
+  const snapshotWeeks = Number.isFinite(Number(row.stockoutSnapshotWeeks)) ? Number(row.stockoutSnapshotWeeks) : null;
+  const proxyWeeks = Number.isFinite(Number(row.stockoutProxyWeeks)) ? Number(row.stockoutProxyWeeks) : null;
+  const evidenceWeeks = snapshotWeeks !== null || proxyWeeks !== null ? (snapshotWeeks || 0) + (proxyWeeks || 0) : null;
+  const start = row.stockoutEvidenceStartWeek;
+  const end = row.stockoutEvidenceEndWeek;
+  return `<div class="smart-stockout-demand-evidence">
+    <span><strong>Stockout demand evidence</strong> · ${smartEscape(labels[method] || String(method).replaceAll("_", " "))}${row.stockoutDemandConfidence ? ` · ${smartEscape(row.stockoutDemandConfidence)} confidence` : ""}</span>
+    <small>${evidenceWeeks !== null ? `${smartNumber(evidenceWeeks, 0)} eligible weeks · ` : ""}${snapshotWeeks !== null ? `${smartNumber(snapshotWeeks, 0)} snapshot · ` : ""}${proxyWeeks !== null ? `${smartNumber(proxyWeeks, 0)} proxy · ` : ""}${start || end ? `${smartEscape(start || "?")} to ${smartEscape(end || "?")} · ` : ""}${row.demandDataCutoff ? `sales cutoff ${smartEscape(row.demandDataCutoff)}` : ""}</small>
+  </div>`;
+}
+
 function smartForecastStockPolicy(row) {
   const calculationDriver = row.stockPolicyModel && row.stockPolicyModel !== "formula"
     ? `${smartEscape(row.stockPolicyModel)} quantile target`
@@ -526,6 +567,7 @@ function smartForecastStockPolicy(row) {
     <span>Capacity <strong>${smartNumber(row.capacityPallets, 2)} PLT</strong></span>
     ${lowerStockExplanation}
     <small>${smartNumber(row.weeklyDemandPallets, 2)} PLT/week · SD ${smartNumber(row.weeklyDemandSdPallets, 3)} · ${smartNumber(row.leadWeeks, 2)} lead weeks · ${calculationDriver} · current policy/settings</small>
+    ${smartForecastStockoutEvidence(row)}
     ${formulaExplanation}
   </div>`;
 }
@@ -643,7 +685,7 @@ function smartSettings() {
         <label class="smart-field"><span>Daily run time</span><input name="dailyTime" type="time" value="${smartEscape(settings.dailyTime || "06:00")}" ${smartCanWrite() ? "" : "disabled"} /><small>${smartEscape(settings.timeZone || "America/Toronto")}</small></label>
         <label class="smart-field"><span>Daily automation</span><span class="smart-check"><input name="dailyEnabled" type="checkbox" ${settings.dailyEnabled ? "checked" : ""} ${smartCanWrite() ? "" : "disabled"} /> Run one forecast and plan per local day</span></label>
         <label class="smart-field"><span>Formula average period</span><input name="formulaAverageWeeks" type="number" min="2" max="52" step="1" value="${smartEscape(settings.formulaAverageWeeks || 6)}" ${smartCanWrite() ? "" : "disabled"} /><small>Completed weeks used for normal average demand and SD.</small></label>
-        <label class="smart-field"><span>Stockout peak period</span><input name="stockoutBenchmarkWeeks" type="number" min="2" max="52" step="1" value="${smartEscape(settings.stockoutBenchmarkWeeks || 6)}" ${smartCanWrite() ? "" : "disabled"} /><small>Completed weeks searched for maximum demand when less than one pallet is available.</small></label>
+        <label class="smart-field"><span>Stockout average period</span><input name="stockoutBenchmarkWeeks" type="number" min="2" max="52" step="1" value="${smartEscape(settings.stockoutBenchmarkWeeks || 6)}" ${smartCanWrite() ? "" : "disabled"} /><small>Most recent eligible available-stock or positive-sales proxy weeks averaged when less than one pallet is available.</small></label>
         <label class="smart-field"><span>12441 / delivery safety factor</span><input name="deliverySafetyFactor" type="number" min="0.01" max="5" step="0.001" value="${smartEscape(settings.deliverySafetyFactor || 1.645)}" ${smartCanWrite() ? "" : "disabled"} /><small>Default 1.645.</small></label>
         <label class="smart-field"><span>Pickup-yard safety factor</span><input name="pickupSafetyFactor" type="number" min="0.01" max="5" step="0.001" value="${smartEscape(settings.pickupSafetyFactor || 1.3)}" ${smartCanWrite() ? "" : "disabled"} /><small>Applies to 3445, 2967, and 150. Default 1.3.</small></label>
         <label class="smart-field"><span>Zero-demand coverage</span><span class="smart-check"><input name="zeroDemandCoverageEnabled" type="checkbox" ${settings.zeroDemandCoverageEnabled ? "checked" : ""} ${smartCanWrite() ? "" : "disabled"} /> Apply an order-count ROP floor only when recent formula demand is zero</span><small>Borrowed low-sample proposals remain on Hold for review.</small></label>
@@ -666,6 +708,7 @@ function smartContent() {
   if (smartState.tab === "items") return smartItemMaster();
   if (smartState.tab === "forecasts") return smartForecasts();
   if (smartState.tab === "plans") return smartPlans();
+  if (smartState.tab === "blankets") return smartBlanketOrders();
   if (smartState.tab === "vendors") return smartVendorReplies();
   if (smartState.tab === "settings") return smartSettings();
   return smartOverview();
@@ -673,8 +716,8 @@ function smartContent() {
 
 function smartFloatingNotices() {
   const notices = [
-    smartState.error ? `<div class="smart-notice error" role="alert">${smartEscape(smartState.error)}</div>` : "",
-    smartState.notice ? `<div class="smart-notice">${smartEscape(smartState.notice)}</div>` : "",
+    smartState.error ? `<div class="smart-notice error smart-dismissible-notice" role="alert"><span>${smartEscape(smartState.error)}</span><button data-smart-action="dismiss-smart-notice" type="button" aria-label="Close error message">×</button></div>` : "",
+    smartState.notice ? `<div class="smart-notice smart-dismissible-notice"><span>${smartEscape(smartState.notice)}</span><button data-smart-action="dismiss-smart-notice" type="button" aria-label="Close message">×</button></div>` : "",
     smartState.busy ? `<div class="smart-notice">${smartEscape(smartState.busy)}…</div>` : ""
   ].filter(Boolean);
   return notices.length
@@ -682,8 +725,172 @@ function smartFloatingNotices() {
     : "";
 }
 
+function smartFocusedControlDataAttributes(element) {
+  if (!element?.attributes) return [];
+  return Array.from(element.attributes)
+    .filter((attribute) => attribute.name.startsWith("data-") && attribute.name !== "data-smart-focus-key")
+    .map((attribute) => [attribute.name, attribute.value])
+    .sort(([left], [right]) => left.localeCompare(right));
+}
+
+function smartFocusedControlKey(control) {
+  if (!control) return "";
+  const explicitKey = control.getAttribute?.("data-smart-focus-key");
+  if (explicitKey) return JSON.stringify(["focus", explicitKey]);
+  if (control.id) return JSON.stringify(["id", control.id]);
+
+  const ancestry = [];
+  let element = control;
+  while (element && element !== smartScmApp) {
+    const name = element.getAttribute?.("name") || "";
+    const id = element.id || "";
+    const data = smartFocusedControlDataAttributes(element);
+    if (id || name || data.length) {
+      ancestry.push([
+        String(element.tagName || "").toLowerCase(),
+        id,
+        name,
+        data
+      ]);
+    }
+    element = element.parentElement;
+  }
+  if (!ancestry.length) return "";
+  return JSON.stringify(["ancestry", ancestry]);
+}
+
+function smartCaptureFocusedControl() {
+  const control = document.activeElement;
+  const tagName = String(control?.tagName || "").toUpperCase();
+  if (!control || !["INPUT", "TEXTAREA", "SELECT"].includes(tagName)) return null;
+  if (typeof smartScmApp.contains !== "function" || !smartScmApp.contains(control)) return null;
+  const key = smartFocusedControlKey(control);
+  if (!key) return null;
+
+  const snapshot = {
+    key,
+    tab: smartRenderedTab,
+    tagName,
+    type: String(control.type || "").toLowerCase(),
+    value: control.value,
+    checked: typeof control.checked === "boolean" ? control.checked : null,
+    selectionStart: null,
+    selectionEnd: null,
+    selectionDirection: null
+  };
+  try {
+    if (typeof control.selectionStart === "number" && typeof control.selectionEnd === "number") {
+      snapshot.selectionStart = control.selectionStart;
+      snapshot.selectionEnd = control.selectionEnd;
+      snapshot.selectionDirection = control.selectionDirection || "none";
+    }
+  } catch {
+    // Number, date, and browser-managed inputs may not expose text selection.
+  }
+  return snapshot;
+}
+
+function smartFocusedControlIsHidden(control) {
+  if (!control || control.disabled || control.hidden || String(control.type || "").toLowerCase() === "hidden") return true;
+  if (control.closest?.('[hidden], [aria-hidden="true"]')) return true;
+  if (typeof window !== "undefined" && typeof window.getComputedStyle === "function") {
+    const style = window.getComputedStyle(control);
+    if (style.display === "none" || style.visibility === "hidden") return true;
+  }
+  if (typeof control.checkVisibility === "function") {
+    try {
+      if (!control.checkVisibility()) return true;
+    } catch {
+      // Older engines may expose the method without supporting every element.
+    }
+  } else if (control.isConnected === true && typeof control.getClientRects === "function") {
+    try {
+      if (control.getClientRects().length === 0) return true;
+    } catch {
+      // A layout check must not prevent restoring an otherwise valid control.
+    }
+  }
+  return false;
+}
+
+function smartRestoreFocusedControl(snapshot) {
+  if (!snapshot || snapshot.tab !== smartState.tab || typeof smartScmApp.querySelectorAll !== "function") return false;
+  const matches = Array.from(smartScmApp.querySelectorAll("input, textarea, select"))
+    .filter((control) => smartFocusedControlKey(control) === snapshot.key);
+  if (matches.length !== 1 || smartFocusedControlIsHidden(matches[0])) return false;
+  const control = matches[0];
+  if (String(control.tagName || "").toUpperCase() !== snapshot.tagName
+    || String(control.type || "").toLowerCase() !== snapshot.type) return false;
+
+  if (snapshot.type !== "file") {
+    try {
+      control.value = snapshot.value;
+    } catch {
+      // Some browser-managed controls reject programmatic values.
+    }
+  }
+  if (snapshot.checked !== null && typeof control.checked === "boolean") control.checked = snapshot.checked;
+  if (typeof control.focus !== "function") return false;
+  try {
+    control.focus({ preventScroll: true });
+  } catch {
+    control.focus();
+  }
+  if (snapshot.selectionStart !== null && typeof control.setSelectionRange === "function") {
+    try {
+      control.setSelectionRange(snapshot.selectionStart, snapshot.selectionEnd, snapshot.selectionDirection);
+    } catch {
+      // Selection ranges are unsupported for inputs such as number and date.
+    }
+  }
+  return true;
+}
+
+function smartUpdateFloatingNotices() {
+  if (typeof smartScmApp.querySelector !== "function") return;
+  const markup = smartFloatingNotices();
+  const current = smartScmApp.querySelector(".smart-floating-notices");
+  if (current) {
+    if (markup) current.outerHTML = markup;
+    else current.remove();
+    return;
+  }
+  if (!markup || typeof smartScmApp.insertAdjacentHTML !== "function") return;
+  const header = smartScmApp.querySelector(".dispatch-topbar");
+  if (header?.insertAdjacentHTML) header.insertAdjacentHTML("afterend", markup);
+  else smartScmApp.insertAdjacentHTML("afterbegin", markup);
+}
+
+function smartScheduleNoticeDismissal() {
+  const signature = `${smartState.error || ""}\u0000${smartState.notice || ""}`;
+  if (signature === smartNoticeDismissSignature) return;
+  smartNoticeDismissSignature = signature;
+  clearTimeout(smartNoticeDismissTimer);
+  smartNoticeDismissTimer = null;
+  if (!smartState.error && !smartState.notice) return;
+  smartNoticeDismissTimer = setTimeout(() => {
+    const current = `${smartState.error || ""}\u0000${smartState.notice || ""}`;
+    if (current !== smartNoticeDismissSignature) return;
+    smartNoticeDismissTimer = null;
+    smartState.error = "";
+    smartState.notice = "";
+    smartNoticeDismissSignature = "";
+    smartUpdateFloatingNotices();
+  }, 10000);
+}
+
 function smartRender() {
+  if (smartCompositionDepth > 0) {
+    smartDeferredRender = true;
+    return false;
+  }
+  smartDeferredRender = false;
+  const focusedControl = smartCaptureFocusedControl();
   smartScmApp.innerHTML = `${smartHeader()}${smartFloatingNotices()}<div class="smart-main">${smartTabs()}${smartContent()}</div>`;
+  smartRenderedTab = smartState.tab;
+  smartRestoreFocusedControl(focusedControl);
+  smartScheduleNoticeDismissal();
+  return true;
 }
 
 async function smartWork(label, task, success = "Saved") {
@@ -719,13 +926,33 @@ smartScmApp.addEventListener("click", async (event) => {
         smartRender();
       }
     }
+    if (smartState.tab === "blankets") {
+      try {
+        await smartLoadBlanketWorkspace();
+      } catch (error) {
+        smartState.busy = "";
+        smartState.error = error.message;
+        smartRender();
+      }
+    }
+    if (smartState.tab === "vendors") {
+      try {
+        await smartWork("Refreshing Vendor Replies", smartReloadVendorLoads, "");
+      } catch {
+        // smartWork already exposes the error.
+      }
+    }
     return;
   }
   const button = event.target.closest("[data-smart-action]");
   if (!button || smartState.busy) return;
   const action = button.dataset.smartAction;
   try {
-    if (action === "refresh") {
+    if (action === "dismiss-smart-notice") {
+      smartState.error = "";
+      smartState.notice = "";
+      smartRender();
+    } else if (action === "refresh") {
       await smartLoadBootstrap();
     } else if (action === "run-forecast") {
       await smartWork("Running backtests and forecasts", () => smartApi("/api/scm/smart/forecasts", { method: "POST", body: {} }), "Forecast completed");
@@ -921,6 +1148,7 @@ smartScmApp.addEventListener("click", async (event) => {
       smartState.planSearch = document.getElementById("smartPlanSearch")?.value || "";
       smartState.planType = document.getElementById("smartPlanType")?.value || "";
       smartState.planStatus = document.getElementById("smartPlanStatus")?.value || "";
+      smartState.planVendor = smartState.planType === "TO" ? "" : (document.getElementById("smartPlanVendor")?.value || "");
       smartState.planSource = document.getElementById("smartPlanSource")?.value || "";
       smartState.planDestination = document.getElementById("smartPlanDestination")?.value || "";
       smartState.planSort = document.getElementById("smartPlanSort")?.value || "destination";
@@ -1027,9 +1255,7 @@ smartScmApp.addEventListener("change", async (event) => {
   }
 });
 
-smartScmApp.addEventListener("input", (event) => {
-  if (event.target.id !== "smartItemSearch") return;
-  smartState.itemSearch = event.target.value;
+function smartScheduleItemSearchRefresh() {
   clearTimeout(smartItemSearchTimer);
   smartItemSearchTimer = setTimeout(async () => {
     try {
@@ -1040,6 +1266,44 @@ smartScmApp.addEventListener("input", (event) => {
       smartRender();
     }
   }, 300);
+}
+
+smartScmApp.addEventListener("input", (event) => {
+  if (event.target.id !== "smartItemSearch") return;
+  smartState.itemSearch = event.target.value;
+  smartItemLoadRequestSequence += 1;
+  clearTimeout(smartItemSearchTimer);
+  smartItemSearchTimer = null;
+  if (event.isComposing || smartCompositionDepth > 0) return;
+  smartScheduleItemSearchRefresh();
+});
+
+smartScmApp.addEventListener("compositionstart", (event) => {
+  if (!event.target.matches?.("input, textarea")) return;
+  if (event.target.id === "smartItemSearch") {
+    smartItemLoadRequestSequence += 1;
+    clearTimeout(smartItemSearchTimer);
+    smartItemSearchTimer = null;
+  }
+  clearTimeout(smartCompositionFlushTimer);
+  smartCompositionFlushTimer = null;
+  smartCompositionDepth += 1;
+});
+
+smartScmApp.addEventListener("compositionend", (event) => {
+  if (!event.target.matches?.("input, textarea")) return;
+  smartCompositionDepth = Math.max(0, smartCompositionDepth - 1);
+  if (event.target.id === "smartItemSearch") {
+    smartState.itemSearch = event.target.value;
+    smartItemLoadRequestSequence += 1;
+    smartScheduleItemSearchRefresh();
+  }
+  if (smartCompositionDepth > 0 || !smartDeferredRender) return;
+  clearTimeout(smartCompositionFlushTimer);
+  smartCompositionFlushTimer = setTimeout(() => {
+    smartCompositionFlushTimer = null;
+    if (smartCompositionDepth === 0 && smartDeferredRender) smartRender();
+  }, 0);
 });
 
 smartScmApp.addEventListener("submit", async (event) => {

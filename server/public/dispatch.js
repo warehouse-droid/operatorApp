@@ -454,7 +454,12 @@ let driverLaneOrder = [];
 let assignmentAdvisoryByLoad = new Map();
 let dispatchVendorYards = [];
 let driverJobStatuses = [];
+let driverJobStatusesLoadedPlanId = "";
 let driverTruckSwitchAttention = [];
+let dispatchForecast = null;
+let dispatchForecastRequestSequence = 0;
+let dispatchForecastInFlight = false;
+let dispatchForecastPollTimer = null;
 let googleMapsPromise = null;
 let routeEstimates = {};
 let routeCache = {};
@@ -474,6 +479,7 @@ let saveTimer = null;
 let saveInFlight = false;
 let saveQueued = false;
 let saveFlushPromise = null;
+let activeSaveGeneration = null;
 let forceNextPlanSave = false;
 let confirmInFlight = false;
 let minimumPlanRevisionToApply = { planId: "", revision: 0 };
@@ -951,6 +957,50 @@ function driverLoadEntries(driverLogin = null) {
   );
 }
 
+function endingTripRouteEntries(driverLogin) {
+  return driverLoadEntries(driverLogin)
+    .filter((entry) => loadHasPlanningContentForAssignment(entry.load))
+    .map((entry) => ({ ...entry, plannedStart: Number(loadStats(entry.truck, entry.load).start || 0) }))
+    .sort((left, right) =>
+      left.plannedStart - right.plannedStart
+      || Number(left.load.driverSequence || 0) - Number(right.load.driverSequence || 0)
+    );
+}
+
+function isFinalManualReturnForDriver(truck, load) {
+  if (!load?.returnOnly || !load?.manual) return false;
+  const login = loadDriverKey(truck, load);
+  if (!login) return false;
+  return endingTripRouteEntries(login).at(-1)?.load?.id === load.id;
+}
+
+function clearInvalidEndingTrips({ notify = false, audit = false } = {}) {
+  const cleared = [];
+  for (const truck of trucks || []) {
+    for (const load of truck.loads || []) {
+      if (!load.endingTrip || isFinalManualReturnForDriver(truck, load)) continue;
+      const before = summarizeLoad(load);
+      load.endingTrip = false;
+      cleared.push({ truck, load });
+      if (audit) {
+        logDispatchAudit({
+          action: "ending_trip_cleared_after_route_change",
+          entityType: "load",
+          entityId: load.id,
+          loadId: load.id,
+          before,
+          after: summarizeLoad(load),
+          details: { reason: "A later driver load exists or the return is no longer final." }
+        });
+      }
+    }
+  }
+  if (notify && cleared.length) {
+    routeNotice = `${cleared.map((entry) => entry.load.name || "Manual Return").join(", ")} is no longer the driver's final trip, so Ending trip was cleared.`;
+  }
+  return cleared;
+}
+
 function normalizedDriverLaneOrder(values = []) {
   const next = [];
   for (const login of Array.isArray(values) ? values : []) {
@@ -1316,7 +1366,9 @@ function makeTruckFromFleet(vehicle, index, saved = {}) {
       : truckTravelTimePercent(saved),
     loadMinutes: Number(saved.ownYardFixedMinutes || saved.loadMinutes || driver.ownYardFixedMinutes || driver.loadMinutes || 40),
     unloadMinutes: Number(saved.deliveryFixedMinutes || driver.deliveryFixedMinutes || saved.outsideFixedMinutes || saved.unloadMinutes || driver.outsideFixedMinutes || driver.unloadMinutes || 35),
-    loads: Array.isArray(saved.loads) ? saved.loads : [{ id: `${id}-L1`, name: "Load 1", stops: [] }]
+    loads: Array.isArray(saved.loads)
+      ? saved.loads.map((load) => ({ ...load, endingTrip: Boolean(load.endingTrip || load.ending_trip) }))
+      : [{ id: `${id}-L1`, name: "Load 1", stops: [] }]
   };
 }
 
@@ -2467,6 +2519,34 @@ function groupedOrderDependencies(groupItems = []) {
   );
 }
 
+function removeLocalOrderDependency(dependencyId) {
+  const targetId = String(dependencyId ?? "").trim();
+  if (!targetId) return;
+  const scrub = (order = {}) => {
+    const dependencies = Array.isArray(order.orderDependencies)
+      ? order.orderDependencies.filter((dependency) => String(dependency?.id ?? "").trim() !== targetId)
+      : order.orderDependencies;
+    const childOrderDetails = Array.isArray(order.childOrderDetails)
+      ? order.childOrderDetails.map((child) => scrub(child))
+      : order.childOrderDetails;
+    return {
+      ...order,
+      ...(Array.isArray(dependencies) ? { orderDependencies: dependencies } : {}),
+      ...(Array.isArray(childOrderDetails) ? { childOrderDetails } : {})
+    };
+  };
+  orders = orders.map((order) => scrub(order));
+  orderCatalog = orderCatalog.map((order) => scrub(order));
+  if (Array.isArray(orderDependencyOptions?.existingLinks)) {
+    orderDependencyOptions = {
+      ...orderDependencyOptions,
+      existingLinks: orderDependencyOptions.existingLinks.filter(
+        (dependency) => String(dependency?.id ?? "").trim() !== targetId
+      )
+    };
+  }
+}
+
 function groupedOrderDependencyLabels(groupItems = [], dependencies = groupedOrderDependencies(groupItems)) {
   const labels = [];
   const seen = new Set();
@@ -3003,17 +3083,180 @@ async function loadDispatchSetup() {
   }
 }
 
+function activePhysicalOrderEvidence(truckList = trucks, planId = currentPlan?.id) {
+  const evidence = { all: new Set(), pickups: new Set(), drops: new Set() };
+  const expectedPlanId = String(planId || "");
+  if (!expectedPlanId || driverJobStatusesLoadedPlanId !== expectedPlanId) return evidence;
+  const loadsById = new Map((truckList || []).flatMap((truck) =>
+    (truck.loads || []).map((load) => [String(load.id || "").trim().toLowerCase(), load])
+  ));
+  const addRef = (set, value) => {
+    const ref = String(value || "").trim().toLowerCase();
+    if (ref) set.add(ref);
+  };
+  for (const record of driverJobStatuses || []) {
+    const status = String(record.status || "").trim().toLowerCase();
+    const recordType = String(record.stop_type || record.stopType || "").trim().toLowerCase();
+    if (!["in_progress", "complete"].includes(status) || !["pickup", "dropoff", "pick", "drop"].includes(recordType)) continue;
+    const recordRefs = record.order_refs ?? record.orderRefs;
+    const refs = new Set();
+    for (const ref of Array.isArray(recordRefs) ? recordRefs : []) addRef(refs, ref);
+    const load = loadsById.get(String(record.load_id || record.loadId || "").trim().toLowerCase());
+    const stopId = String(record.stop_id || record.stopId || "").trim().toLowerCase();
+    const stop = stopId
+      ? (load?.stops || []).find((candidate) => String(candidate.id || "").trim().toLowerCase() === stopId)
+      : null;
+    if (stop?.orderId) addRef(refs, stop.orderId);
+    if (!stop) {
+      for (const candidate of load?.stops || []) addRef(refs, candidate.orderId);
+    }
+    const planType = String(stop?.type || "").trim().toLowerCase();
+    const scope = ["pickup", "pick"].includes(recordType) || planType === "pick"
+      ? evidence.pickups
+      : evidence.drops;
+    for (const ref of refs) {
+      evidence.all.add(ref);
+      scope.add(ref);
+    }
+  }
+  return evidence;
+}
+
+function orderMatchesActivityRefs(order = {}, refs = new Set()) {
+  if (!refs?.size) return false;
+  const orderRefs = new Set();
+  const visit = (candidate = {}) => {
+    for (const value of [candidate.id, candidate.originalOrderId, ...(candidate.childOrders || []), ...(candidate.groupAliases || [])]) {
+      const ref = String(value || "").trim().toLowerCase();
+      if (ref) orderRefs.add(ref);
+    }
+    for (const child of candidate.childOrderDetails || []) visit(child);
+  };
+  visit(order);
+  return [...orderRefs].some((ref) => refs.has(ref));
+}
+
+function preserveActiveOrderEvidence(previousOrder = {}, refreshedOrder = {}, evidence = {}) {
+  if (!orderMatchesActivityRefs(previousOrder, evidence.all)) return refreshedOrder;
+  const preserved = { ...refreshedOrder };
+  const preserveFields = (fields) => {
+    for (const field of fields) {
+      if (Object.prototype.hasOwnProperty.call(previousOrder, field)) preserved[field] = previousOrder[field];
+      else delete preserved[field];
+    }
+  };
+  preserveFields([
+    "items",
+    "pallets",
+    "layers",
+    "sections",
+    "pieces",
+    "salesQty",
+    "weight",
+    "committedQty",
+    "salesQuantities",
+    "childOrders",
+    "childOrderDetails",
+    "groupAliases",
+    "consolidation",
+    "originalOrderId"
+  ]);
+  if (orderMatchesActivityRefs(previousOrder, evidence.pickups)) {
+    preserveFields([
+      "pickupLocations",
+      "sourceYard",
+      "source_yard",
+      "sourceAddress",
+      "source_address",
+      "defaultSourceAddress",
+      "pickupAddressOverride",
+      "directPickupManifest",
+      "poPickupManifest"
+    ]);
+  }
+  if (orderMatchesActivityRefs(previousOrder, evidence.drops)) {
+    preserveFields([
+      "address",
+      "dropAddress",
+      "destinationAddress",
+      "destinationYard",
+      "destinationLocationId",
+      "toLocation"
+    ]);
+  }
+  return preserved;
+}
+
+function reapplyActiveOrderEvidence(orderList = [], baselines = new Map(), evidence = {}) {
+  return (orderList || []).map((order) => {
+    const baseline = baselines.get(String(order.id || "").trim().toLowerCase());
+    return baseline ? normalizeOrder(preserveActiveOrderEvidence(baseline, order, evidence)) : order;
+  });
+}
+
+function dispatchOperationalOrderSignature(order = {}, stop = {}) {
+  return [
+    order.id,
+    stop.type,
+    stop.location,
+    stop.dropoffKey,
+    stop.dropLocation,
+    stopAddress(stop, order),
+    order.pickupAddressOverride,
+    (order.pickupLocations || []).join(","),
+    dropFootprintPallets(order, stop),
+    order.pallets,
+    order.layers,
+    order.stopMinutes ?? order.raw?.stop_minutes ?? "",
+    stop.stopTimeOverrideMinutes ?? ""
+  ].join("|");
+}
+
+function captureOperationalLoadSignatures() {
+  const signatures = new Map();
+  for (const truck of trucks || []) {
+    for (const load of truck.loads || []) {
+      signatures.set(String(load.id || ""), (load.stops || []).map((stop) => {
+        const order = stopOrder(stop);
+        return order ? dispatchOperationalOrderSignature(order, stop) : `${stop.id}|missing:${stop.orderId}|${stop.location || ""}`;
+      }).join(">"));
+    }
+  }
+  return signatures;
+}
+
+function invalidateRoutesChangedByOrderFeed(beforeSignatures = new Map()) {
+  const afterSignatures = captureOperationalLoadSignatures();
+  for (const [loadId, signature] of afterSignatures) {
+    if (beforeSignatures.get(loadId) !== signature) invalidateDriverRoutesFromLoad(loadId);
+  }
+}
+
 function applyDispatchOrderFeed(feed) {
+  const routeSignaturesBefore = captureOperationalLoadSignatures();
+  const activityEvidence = activePhysicalOrderEvidence();
   const nextOrders = Array.isArray(feed) ? feed.map(normalizeOrder).filter((order) => order.id) : [];
   orderCatalog = nextOrders;
   const byId = new Map(orders.map((order) => [order.id, order]));
-  const localOrders = orders.filter((order) => shouldPreserveDuringFeedRefresh(order));
+  const evidenceBaselines = new Map([...byId.entries()]
+    .filter(([, order]) => orderMatchesActivityRefs(order, activityEvidence.all))
+    .map(([, order]) => [String(order.id || "").trim().toLowerCase(), order]));
+  const localOrders = orders.filter((order) =>
+    shouldPreserveDuringFeedRefresh(order)
+    || orderMatchesActivityRefs(order, activityEvidence.all)
+  );
   const nextIds = new Set(orderCatalog.map((order) => order.id));
   orders = [
-    ...orderCatalog.map((order) => normalizeOrder({ ...(byId.get(order.id) || {}), ...order })),
+    ...orderCatalog.map((order) => {
+      const previous = byId.get(order.id) || {};
+      return normalizeOrder(preserveActiveOrderEvidence(previous, { ...previous, ...order }, activityEvidence));
+    }),
     ...localOrders.filter((order) => !nextIds.has(order.id)).map(normalizeOrder)
   ];
   reconcileTransitCoSourceOrders();
+  orders = reapplyActiveOrderEvidence(orders, evidenceBaselines, activityEvidence);
+  reconcilePickupStopRepresentatives({ audit: true });
+  invalidateRoutesChangedByOrderFeed(routeSignaturesBefore);
   selectedOrderId = orders.find((order) => order.id === selectedOrderId)?.id || orders[0]?.id || "";
   selectedOrderIds = new Set([...selectedOrderIds].filter((id) => orders.some((order) => order.id === id)));
   if (!selectedOrderIds.size && selectedOrderId) selectedOrderIds.add(selectedOrderId);
@@ -3022,6 +3265,11 @@ function applyDispatchOrderFeed(feed) {
 function mergeDispatchOrderSearchFeed(feed) {
   const candidates = Array.isArray(feed) ? feed.map(normalizeOrder).filter((order) => order.id) : [];
   if (!candidates.length) return;
+  const routeSignaturesBefore = captureOperationalLoadSignatures();
+  const activityEvidence = activePhysicalOrderEvidence();
+  const evidenceBaselines = new Map(orders
+    .filter((order) => orderMatchesActivityRefs(order, activityEvidence.all))
+    .map((order) => [String(order.id || "").trim().toLowerCase(), order]));
   const catalogById = new Map(orderCatalog.map((order) => [order.id, order]));
   const ordersById = new Map(orders.map((order) => [order.id, order]));
   for (const candidate of candidates) {
@@ -3035,6 +3283,9 @@ function mergeDispatchOrderSearchFeed(feed) {
   orders = [...ordersById.values()];
   orderCatalog = [...catalogById.values()];
   reconcileTransitCoSourceOrders();
+  orders = reapplyActiveOrderEvidence(orders, evidenceBaselines, activityEvidence);
+  reconcilePickupStopRepresentatives({ audit: true });
+  invalidateRoutesChangedByOrderFeed(routeSignaturesBefore);
 }
 
 function cancelDispatchOrderSearch() {
@@ -3199,6 +3450,29 @@ function captureActiveLinkModalDraft() {
   }
 }
 
+function resetActiveLinkModalState() {
+  if (!["po-link", "to-link"].includes(modalType)) return false;
+  const closingType = modalType;
+  const closingOrderRef = modalOrderId;
+  captureActiveLinkModalDraft();
+  if (closingType === "po-link") clearLinkModalDraft("po", closingOrderRef);
+  if (closingType === "to-link") clearLinkModalDraft("to", closingOrderRef);
+  orderDependencyAbortController?.abort();
+  poAllocationAbortController?.abort();
+  orderDependencyRequestSequence += 1;
+  poAllocationRequestSequence += 1;
+  modalType = "";
+  modalOrderId = "";
+  modalLoadId = "";
+  poAllocationOptions = null;
+  poAllocationLoading = false;
+  poAllocationError = "";
+  orderDependencyOptions = null;
+  orderDependencyLoading = false;
+  orderDependencyError = "";
+  return true;
+}
+
 function renderActiveLinkModalInPlace() {
   const current = app.querySelector('.modal-backdrop[data-link-modal="true"]');
   const order = orderById(modalOrderId);
@@ -3245,23 +3519,201 @@ async function loadPoAllocationOptions(orderId) {
 }
 
 async function loadDriverJobStatuses() {
+  const requestedPlanId = String(currentPlan?.id || "");
+  const preserveExisting = Boolean(requestedPlanId && driverJobStatusesLoadedPlanId === requestedPlanId);
   try {
     const url = new URL("/api/dispatch/driver-job-statuses", window.location.origin);
     if (currentPlan?.id) url.searchParams.set("planId", currentPlan.id);
     else if (currentPlanDate) url.searchParams.set("planDate", currentPlanDate);
     const response = await fetch(url.pathname + url.search);
     if (!response.ok) throw new Error(await response.text());
-    driverJobStatuses = await response.json();
-    if (currentPlan?.id) {
-      const attentionResponse = await fetch(`/api/dispatch/driver-truck-switches/attention?planId=${encodeURIComponent(currentPlan.id)}`);
-      driverTruckSwitchAttention = attentionResponse.ok ? await attentionResponse.json() : [];
+    const nextStatuses = await response.json();
+    if (String(currentPlan?.id || "") !== requestedPlanId) {
+      if (driverJobStatusesLoadedPlanId !== String(currentPlan?.id || "")) {
+        driverJobStatuses = [];
+        driverJobStatusesLoadedPlanId = "";
+        driverTruckSwitchAttention = [];
+      }
+      return false;
+    }
+    driverJobStatuses = nextStatuses;
+    driverJobStatusesLoadedPlanId = requestedPlanId;
+    if (requestedPlanId) {
+      try {
+        const attentionResponse = await fetch(`/api/dispatch/driver-truck-switches/attention?planId=${encodeURIComponent(requestedPlanId)}`);
+        if (attentionResponse.ok) {
+          const nextAttention = await attentionResponse.json();
+          if (String(currentPlan?.id || "") === requestedPlanId) driverTruckSwitchAttention = nextAttention;
+        } else if (!preserveExisting) {
+          driverTruckSwitchAttention = [];
+        }
+      } catch {
+        if (!preserveExisting) driverTruckSwitchAttention = [];
+      }
     } else {
       driverTruckSwitchAttention = [];
     }
+    if (String(currentPlan?.id || "") !== requestedPlanId) {
+      if (driverJobStatusesLoadedPlanId === requestedPlanId) {
+        driverJobStatuses = [];
+        driverJobStatusesLoadedPlanId = "";
+        driverTruckSwitchAttention = [];
+      }
+      return false;
+    }
+    return true;
   } catch {
-    driverJobStatuses = [];
-    driverTruckSwitchAttention = [];
+    if (!preserveExisting) {
+      driverJobStatuses = [];
+      driverJobStatusesLoadedPlanId = "";
+      driverTruckSwitchAttention = [];
+    }
+    return false;
   }
+}
+
+function forecastMatchesCurrentPlan(forecast = dispatchForecast) {
+  if (!forecast || !currentPlan?.id || localPlanDirty) return false;
+  return String(forecast.planId || "") === String(currentPlan.id || "")
+    && Number(forecast.planRevision ?? forecast.revision ?? 0) === Number(currentPlan.revision ?? 0);
+}
+
+function dispatchBackgroundRenderBlocked() {
+  const active = document.activeElement;
+  const editing = Boolean(active && app.contains(active) && active.matches?.("input, textarea, select, [contenteditable='true']"));
+  return editing || Boolean(modalType || dragged || pointerDraggedLoadId || isResizingPreview);
+}
+
+async function loadDispatchForecast({ renderAfter = false } = {}) {
+  const planId = String(currentPlan?.id || "");
+  const revision = Number(currentPlan?.revision ?? 0);
+  if (!planId || localPlanDirty || dispatchForecastInFlight) return false;
+  const sequence = ++dispatchForecastRequestSequence;
+  dispatchForecastInFlight = true;
+  try {
+    const response = await fetch(`/api/dispatch/forecast?planId=${encodeURIComponent(planId)}`);
+    if (!response.ok) throw new Error(await response.text());
+    const forecast = await response.json();
+    if (
+      sequence !== dispatchForecastRequestSequence
+      || localPlanDirty
+      || String(currentPlan?.id || "") !== planId
+      || Number(currentPlan?.revision ?? 0) !== revision
+      || String(forecast?.planId || "") !== planId
+      || Number(forecast?.planRevision ?? forecast?.revision ?? 0) !== revision
+    ) return false;
+    dispatchForecast = forecast;
+    if (renderAfter && !dispatchBackgroundRenderBlocked()) render({ save: false });
+    return true;
+  } catch {
+    // Forecast is advisory. Keep the last revision-matched response on transient failures.
+    return false;
+  } finally {
+    if (sequence === dispatchForecastRequestSequence) dispatchForecastInFlight = false;
+  }
+}
+
+function clearDispatchForecast() {
+  dispatchForecast = null;
+  dispatchForecastRequestSequence += 1;
+  dispatchForecastInFlight = false;
+}
+
+function forecastStopIndex() {
+  const byStopId = new Map();
+  if (!forecastMatchesCurrentPlan()) return byStopId;
+  for (const record of dispatchForecast?.stops || []) {
+    const stopIds = new Set([record.stopId, ...(record.visitStopIds || [])].map(String).filter(Boolean));
+    for (const stopId of stopIds) byStopId.set(stopId, record);
+  }
+  return byStopId;
+}
+
+function forecastRecordForStop(stop) {
+  return forecastStopIndex().get(String(stop?.id || "")) || null;
+}
+
+function forecastLoadRecord(load) {
+  if (!forecastMatchesCurrentPlan()) return null;
+  return (dispatchForecast?.loads || []).find((record) => String(record.loadId || "") === String(load?.id || "")) || null;
+}
+
+function forecastTravelRecordsForLoad(load) {
+  if (!forecastMatchesCurrentPlan()) return [];
+  return (dispatchForecast?.travelLegs || []).filter((record) => String(record.loadId || "") === String(load?.id || ""));
+}
+
+function forecastTravelRecordForKind(load, kind, jobId = "") {
+  const records = forecastTravelRecordsForLoad(load);
+  const expectedJobId = String(jobId || "");
+  return records.find((record) => expectedJobId && String(record.jobId || "") === expectedJobId)
+    || records.find((record) => String(record.kind || "") === String(kind || ""))
+    || null;
+}
+
+function forecastTimelineRecordsForLoad(load) {
+  if (!forecastMatchesCurrentPlan()) return [];
+  return (dispatchForecast?.timelineEvents || [])
+    .filter((record) => String(record.loadId || "") === String(load?.id || ""));
+}
+
+function forecastTimelineRecordForKind(load, kind) {
+  return forecastTimelineRecordsForLoad(load)
+    .find((record) => String(record.kind || "") === String(kind || ""))
+    || null;
+}
+
+function timestampMinuteOr(value, fallback = 0) {
+  const minute = actualMinuteOfDay(value);
+  return minute === null ? Number(fallback || 0) : minute;
+}
+
+function forecastTimingForStop(stop, record = null) {
+  record ||= forecastRecordForStop(stop);
+  return {
+    plannedStart: record?.plannedArrival || "",
+    plannedEnd: record?.plannedLeave || "",
+    forecastStart: record?.forecastArrival || "",
+    forecastEnd: record?.forecastLeave || "",
+    actualStart: record?.actualArrival || "",
+    actualEnd: record?.actualLeave || ""
+  };
+}
+
+function interStopForecastLegs(load) {
+  return forecastTravelRecordsForLoad(load).filter((record) => String(record.kind || "") === "inter_stop");
+}
+
+function travelLegForVisitPair(load, previousVisit, nextVisit, pairIndex = -1) {
+  const previousStopIds = new Set((previousVisit?.entries || []).map((entry) => String(entry.stop.id || "")));
+  const nextStopIds = new Set((nextVisit?.entries || []).map((entry) => String(entry.stop.id || "")));
+  const previousRecord = forecastRecordForStop(previousVisit?.entries?.at(-1)?.stop);
+  const nextRecord = forecastRecordForStop(nextVisit?.entries?.[0]?.stop);
+  const exact = interStopForecastLegs(load).find((leg) =>
+    previousRecord?.plannedLeave
+    && nextRecord?.plannedArrival
+    && String(leg.plannedLeave || "") === String(previousRecord.plannedLeave)
+    && String(leg.plannedArrival || "") === String(nextRecord.plannedArrival)
+  );
+  if (exact) return exact;
+  return interStopForecastLegs(load).find((leg) => {
+    const text = `${leg.legId || ""} ${leg.from || ""} ${leg.to || ""}`;
+    return [...previousStopIds].some((id) => id && text.includes(id))
+      && [...nextStopIds].some((id) => id && text.includes(id));
+  }) || (pairIndex >= 0 ? interStopForecastLegs(load)[pairIndex] : null) || null;
+}
+
+async function refreshDriverExecutionAndForecast({ renderAfter = true } = {}) {
+  await Promise.all([loadDriverJobStatuses(), loadDispatchForecast()]);
+  if (renderAfter && !dispatchBackgroundRenderBlocked()) render({ save: false });
+}
+
+function scheduleDispatchForecastPolling() {
+  window.clearInterval(dispatchForecastPollTimer);
+  dispatchForecastPollTimer = window.setInterval(() => {
+    if (document.visibilityState !== "visible") return;
+    refreshDriverExecutionAndForecast({ renderAfter: true }).catch(() => null);
+  }, 15000);
 }
 
 function driverStatusByJobId() {
@@ -3279,7 +3731,7 @@ function executionStatusFromRecord(record) {
 }
 
 function stopExecutionStatus(truck, load, stop) {
-  return executionStatusFromRecord(driverRecordForStop(truck, load, stop));
+  return String(forecastRecordForStop(stop)?.status || executionStatusFromRecord(driverRecordForStop(truck, load, stop)));
 }
 
 function driverRecordForTravel(truck, load, startTravel) {
@@ -3323,81 +3775,180 @@ function actualTimeText(value) {
   if (!value) return "--";
   const date = new Date(value);
   if (!Number.isFinite(date.getTime())) return "--";
-  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+  return date.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+    timeZone: dispatchForecast?.timeZone || "America/Toronto"
+  });
 }
 
 function actualMinuteOfDay(value) {
   if (!value) return null;
   const date = new Date(value);
   if (!Number.isFinite(date.getTime())) return null;
-  return (date.getHours() * 60) + date.getMinutes();
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: dispatchForecast?.timeZone || "America/Toronto",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23"
+  }).formatToParts(date);
+  const hour = Number(parts.find((part) => part.type === "hour")?.value || 0);
+  const minute = Number(parts.find((part) => part.type === "minute")?.value || 0);
+  return (hour * 60) + minute;
 }
 
-function varianceMinutes(actualValue, plannedMinutes) {
+function planTimelineTimeText(forecastValue, plannedMinutes) {
+  const shifted = actualTimeText(forecastValue);
+  return shifted === "--" ? timeText(plannedMinutes) : shifted;
+}
+
+function originalPlanTimeText(originalValue, plannedMinutes) {
+  const original = actualTimeText(originalValue);
+  return original === "--" ? timeText(plannedMinutes) : original;
+}
+
+function actualTimelineText(startLabel, startValue, endLabel, endValue) {
+  const parts = [];
+  const startText = actualTimeText(startValue);
+  const endText = actualTimeText(endValue);
+  if (startText !== "--") parts.push(`${startLabel} ${startText}`);
+  if (endText !== "--") parts.push(`${endLabel} ${endText}`);
+  return parts.join(" / ");
+}
+
+function timelineTimestampEpoch(value) {
+  if (!value || (typeof value !== "string" && !(value instanceof Date))) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isFinite(date.getTime()) ? date.getTime() : null;
+}
+
+function varianceMinutes(actualValue, originalPlannedValue, fallbackPlannedMinutes = originalPlannedValue) {
+  const actualEpoch = timelineTimestampEpoch(actualValue);
+  const plannedEpoch = timelineTimestampEpoch(originalPlannedValue);
+  if (actualEpoch !== null && plannedEpoch !== null) {
+    return Math.round((actualEpoch - plannedEpoch) / 60000);
+  }
   const actual = actualMinuteOfDay(actualValue);
   if (actual === null) return null;
-  let diff = actual - (((Math.round(Number(plannedMinutes || 0)) % 1440) + 1440) % 1440);
+  const planned = Number(fallbackPlannedMinutes);
+  if (!Number.isFinite(planned)) return null;
+  let diff = actual - (((Math.round(planned) % 1440) + 1440) % 1440);
+  // Use the closest occurrence of the planned clock time so a route crossing
+  // midnight does not appear almost 24 hours early or late.
   if (diff > 720) diff -= 1440;
   if (diff < -720) diff += 1440;
   return diff;
 }
 
 function varianceText(diff) {
-  if (diff === null || diff === undefined) return "--";
-  if (Math.abs(diff) < 1) return "0";
-  const value = Math.round(diff);
-  const sign = value > 0 ? "+" : value < 0 ? "-" : "";
+  if (diff === null || diff === undefined || !Number.isFinite(Number(diff))) return "--";
+  const value = Math.round(Number(diff));
+  if (value === 0) return "0";
+  const sign = value > 0 ? "+" : "-";
   const absolute = Math.abs(value);
   const hours = Math.floor(absolute / 60);
-  const minutesPart = absolute % 60;
-  if (!hours) return `${sign}${minutesPart}m`;
-  return `${sign}${hours}h${String(minutesPart).padStart(2, "0")}m`;
+  const minutes = absolute % 60;
+  return hours
+    ? `${sign}${hours}h${String(minutes).padStart(2, "0")}m`
+    : `${sign}${minutes}m`;
 }
 
 function varianceValueHtml(label, diff) {
   const number = diff === null || diff === undefined ? null : Number(diff);
-  const status = number === null || !Number.isFinite(number) || number === 0 ? "neutral" : number > 0 ? "late" : "early";
-  return `<span class="variance-value ${status}">${label} ${varianceText(diff)}</span>`;
+  if (number === null || !Number.isFinite(number)) return "";
+  const status = number === 0 ? "neutral" : number > 0 ? "late" : "early";
+  return `<span class="variance-value ${status}">${escapeHtml(label)} ${varianceText(number)}</span>`;
 }
 
-function varianceClass(diff) {
-  if (diff === null || diff === undefined) return "";
-  if (Math.abs(diff) <= 10) return "ok";
-  if (Math.abs(diff) <= 30) return "minor";
-  return "major";
+function varianceTimelineHtml({
+  startLabel,
+  startValue,
+  originalStart,
+  plannedStart,
+  endLabel,
+  endValue,
+  originalEnd,
+  plannedEnd
+} = {}) {
+  const parts = [
+    varianceValueHtml(startLabel, varianceMinutes(startValue, originalStart, plannedStart)),
+    varianceValueHtml(endLabel, varianceMinutes(endValue, originalEnd, plannedEnd))
+  ].filter(Boolean);
+  return parts.join(" / ");
 }
 
-function plannedTimeHtml({ startLabel = "Arr", endLabel = "Lv", plannedStart = 0, plannedEnd = 0 } = {}) {
-  const labelText = (label) => {
-    const text = String(label || "");
-    if (text.toLowerCase() === "arr") return "Arrive";
-    if (text.toLowerCase() === "lv") return "Leave";
-    return text;
-  };
-  return `<span>${labelText(startLabel)} ${timeText(plannedStart)}</span><span>${labelText(endLabel)} ${timeText(plannedEnd)}</span>`;
+function timelineDisplayStatus(status, actualStart, actualEnd) {
+  const normalized = String(status || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  const hasActual = actualTimeText(actualStart) !== "--" || actualTimeText(actualEnd) !== "--";
+  if (["complete", "completed"].includes(normalized)) return hasActual ? "complete" : "pending";
+  if (["in_progress", "started"].includes(normalized)) return "in_progress";
+  if (normalized === "pending") return "pending";
+  if (actualTimeText(actualEnd) !== "--") return "complete";
+  if (actualTimeText(actualStart) !== "--") return "in_progress";
+  return "pending";
 }
 
-function timingSummaryHtml({ startLabel = "Arr", endLabel = "LV", plannedStart = 0, plannedEnd = 0, actualStart = "", actualEnd = "", showActual = false } = {}) {
-  if (!showActual) return plannedTimeHtml({ startLabel, endLabel, plannedStart, plannedEnd });
-  const startDiff = varianceMinutes(actualStart, plannedStart);
-  const endDiff = varianceMinutes(actualEnd, plannedEnd);
+function timingSummaryHtml({
+  startLabel = "Arr",
+  endLabel = "LV",
+  plannedStart = 0,
+  plannedEnd = 0,
+  originalStart = "",
+  originalEnd = "",
+  forecastStart = "",
+  forecastEnd = "",
+  actualStart = "",
+  actualEnd = "",
+  status = ""
+} = {}) {
+  const actualText = actualTimelineText(startLabel, actualStart, endLabel, actualEnd);
+  const displayStatus = timelineDisplayStatus(status, actualStart, actualEnd);
+  const showActual = displayStatus !== "pending" && Boolean(actualText);
+  const varianceHtml = showActual ? varianceTimelineHtml({
+    startLabel,
+    startValue: actualStart,
+    originalStart,
+    plannedStart,
+    endLabel,
+    endValue: actualEnd,
+    originalEnd,
+    plannedEnd
+  }) : "";
+  const planStartText = planTimelineTimeText(forecastStart, plannedStart);
+  const planEndText = planTimelineTimeText(forecastEnd, plannedEnd);
   return `
-    <div class="time-compare ${varianceClass(endDiff || startDiff)}">
-      <span class="time-label">Plan</span><span>${startLabel} ${timeText(plannedStart)} / ${endLabel} ${timeText(plannedEnd)}</span>
-      <span class="time-label">Real</span><span>${startLabel} ${actualTimeText(actualStart)} / ${endLabel} ${actualTimeText(actualEnd)}</span>
-      <span class="time-label">Var</span><span class="variance-row">${varianceValueHtml(startLabel, startDiff)} / ${varianceValueHtml(endLabel, endDiff)}</span>
+    <div class="time-compare">
+      ${displayStatus === "complete" ? "" : `<span class="time-label">Plan</span><span>${startLabel} ${planStartText} / ${endLabel} ${planEndText}</span>`}
+      ${showActual ? `<span class="time-label actual-label">Actual</span><span>${actualText}</span>` : ""}
+      ${varianceHtml ? `<span class="time-label variance-label">Var</span><span class="variance-row">${varianceHtml}</span>` : ""}
     </div>
   `;
 }
 
-function timingDetailHtml({ title = "Timing", startLabel = "Arrive", endLabel = "Leave", plannedStart = 0, plannedEnd = 0, actualStart = "", actualEnd = "" } = {}) {
-  const startDiff = varianceMinutes(actualStart, plannedStart);
-  const endDiff = varianceMinutes(actualEnd, plannedEnd);
+function timingDetailHtml({ title = "Timing", startLabel = "Arrive", endLabel = "Leave", plannedStart = 0, plannedEnd = 0, originalStart = "", originalEnd = "", forecastStart = "", forecastEnd = "", actualStart = "", actualEnd = "", status = "" } = {}) {
+  const originalStartText = originalPlanTimeText(originalStart, plannedStart);
+  const originalEndText = originalPlanTimeText(originalEnd, plannedEnd);
+  const planStartText = planTimelineTimeText(forecastStart, plannedStart);
+  const planEndText = planTimelineTimeText(forecastEnd, plannedEnd);
+  const actualStartText = actualTimeText(actualStart);
+  const actualEndText = actualTimeText(actualEnd);
+  const varianceStartHtml = varianceValueHtml(
+    startLabel,
+    varianceMinutes(actualStart, originalStart, plannedStart)
+  ) || `<span class="variance-value neutral">${escapeHtml(startLabel)} --</span>`;
+  const varianceEndHtml = varianceValueHtml(
+    endLabel,
+    varianceMinutes(actualEnd, originalEnd, plannedEnd)
+  ) || `<span class="variance-value neutral">${escapeHtml(endLabel)} --</span>`;
+  const displayStatus = timelineDisplayStatus(status, actualStart, actualEnd);
   return `
-    <div class="timing-detail">
+    <div class="timing-detail status-${escapeHtml(displayStatus)}">
       <b>${escapeHtml(title)}</b>
-      <span>Planned ${startLabel}: ${timeText(plannedStart)} | Actual: ${actualTimeText(actualStart)} | ${varianceText(startDiff)}</span>
-      <span>Planned ${endLabel}: ${timeText(plannedEnd)} | Actual: ${actualTimeText(actualEnd)} | ${varianceText(endDiff)}</span>
+      <span><strong>Plan</strong> ${startLabel}: ${originalStartText} | ${endLabel}: ${originalEndText}</span>
+      <span><strong class="timing-forecast">Forecast</strong> ${startLabel}: ${planStartText} | ${endLabel}: ${planEndText}</span>
+      <span><strong>Actual</strong> ${startLabel}: ${actualStartText} | ${endLabel}: ${actualEndText}</span>
+      <span><strong>Var</strong> <span class="variance-row">${varianceStartHtml} / ${varianceEndHtml}</span></span>
     </div>
   `;
 }
@@ -3416,7 +3967,12 @@ function loadHasDriverActivity(load) {
 }
 
 function loadActivityLockNotice(load) {
-  return `${load?.name || "This load"} already has driver activity. Its driver, truck, stops, and orders are locked.`;
+  return `${load?.name || "This load"} already has driver activity. Its assigned driver and truck cannot be changed, and the load cannot be deleted.`;
+}
+
+function isPhysicalDriverActivityRecord(record = {}) {
+  const type = String(record.stop_type || record.stopType || "").toLowerCase();
+  return ["pickup", "dropoff", "pick", "drop"].includes(type);
 }
 
 function stopDriverActivityRecords(foundOrLoad, stopValue = null) {
@@ -3425,15 +3981,20 @@ function stopDriverActivityRecords(foundOrLoad, stopValue = null) {
   const loadId = String(load?.id || "");
   const stopId = String(stop?.id || "");
   const orderId = String(stop?.orderId || "");
-  const currentStopIds = new Set((load?.stops || []).map((item) => String(item.id || "")));
   if (!loadId || (!stopId && !orderId)) return [];
   return (driverJobStatuses || []).filter((record) => {
     const status = executionStatusFromRecord(record);
     const recordStopId = String(record.stop_id || record.stopId || "");
     if (status !== "in_progress" && status !== "complete") return false;
     if (String(record.load_id || record.loadId || "") !== loadId) return false;
+    if (!isPhysicalDriverActivityRecord(record)) return false;
     if (stopId && recordStopId === stopId) return true;
-    return orderId && currentStopIds.has(recordStopId) && (record.order_refs || record.orderRefs || []).map(String).includes(orderId);
+    if (recordStopId || !orderId) return false;
+    const recordType = String(record.stop_type || record.stopType || "").toLowerCase();
+    const planType = String(stop.type || "").toLowerCase();
+    const sameType = (planType === "pick" && ["pick", "pickup"].includes(recordType))
+      || (planType === "drop" && ["drop", "dropoff"].includes(recordType));
+    return sameType && (record.order_refs || record.orderRefs || []).map(String).includes(orderId);
   });
 }
 
@@ -3444,11 +4005,39 @@ function stopHasDriverActivity(foundOrLoad, stopValue = null) {
 function orderHasDriverActivityInLoad(load, orderId) {
   const id = String(orderId || "");
   if (!load || !id) return false;
-  return (load.stops || []).some((stop) => String(stop.orderId || "") === id && stopHasDriverActivity(load, stop));
+  const order = orderById(id) || { id };
+  const wantedRefs = dispatchGroupingRefs(order);
+  wantedRefs.add(id);
+  return loadDriverActivityRecords(load).some((record) => {
+    if (!isPhysicalDriverActivityRecord(record)) return false;
+    const recordStopId = String(record.stop_id || record.stopId || "");
+    const recordedStop = (load.stops || []).find((stop) => String(stop.id || "") === recordStopId);
+    if (recordedStop && wantedRefs.has(String(recordedStop.orderId || ""))) return true;
+    return (record.order_refs || record.orderRefs || []).map(String).some((ref) => wantedRefs.has(ref));
+  });
+}
+
+function loadHasPhysicalStopActivity(load) {
+  return (load?.stops || []).some((stop) => stopHasDriverActivity(load, stop));
+}
+
+function physicalActivityPositionChanged(load, nextStops = []) {
+  const currentStops = load?.stops || [];
+  const activityIndexes = currentStops
+    .map((stop, index) => stopHasDriverActivity(load, stop) ? index : -1)
+    .filter((index) => index >= 0);
+  if (!activityIndexes.length) return false;
+  const boundary = Math.max(...activityIndexes);
+  const stopIds = (stops) => stops.slice(0, boundary + 1).map((stop) => String(stop?.id || ""));
+  return JSON.stringify(stopIds(currentStops)) !== JSON.stringify(stopIds(nextStops));
 }
 
 function stopActivityLockNotice(stop) {
-  return `${stop?.orderId || "This stop"} has already started in this load. It can be reordered, but cannot be removed from the load.`;
+  return `${stop?.orderId || "This stop"} has already started. Its recorded stop and related order allocation cannot be removed or changed.`;
+}
+
+function stopSequenceActivityLockNotice() {
+  return "Cannot insert, remove, or move work before a started stop. Future stops after the driver's completed work remain editable.";
 }
 
 function driverStatusesForOrder(orderId) {
@@ -3530,7 +4119,7 @@ function trucksWithTimingMetadata() {
       const assignment = assignLoadFields(truck, savedLoad);
       const startMode = resolvedLoadStartMode(load);
       const effectiveTruck = effectiveTruckForLoad(truck, assignment);
-      const rowsByStopId = new Map((stats.rows || []).map((row) => [String(row.stop?.id || ""), row]));
+      const rowsByStopId = new Map((stats.rows || []).filter(Boolean).map((row) => [String(row.stop?.id || ""), row]));
       return {
         ...assignment,
         startMode,
@@ -3565,12 +4154,12 @@ function trucksWithTimingMetadata() {
         },
         stops: (load.stops || []).map((stop) => {
           const row = rowsByStopId.get(String(stop.id || ""));
-          return {
-            ...stop,
-            timing: row
-              ? { arrival: row.arrival, depart: row.depart }
-              : { arrival: stats.start, depart: stats.start }
-          };
+          const priorTiming = stop.timing && Number.isFinite(Number(stop.timing.arrival)) && Number.isFinite(Number(stop.timing.depart))
+            ? { arrival: Number(stop.timing.arrival), depart: Number(stop.timing.depart) }
+            : null;
+          return row
+            ? { ...stop, timing: { arrival: row.arrival, depart: row.depart } }
+            : priorTiming ? { ...stop, timing: priorTiming } : { ...stop };
         })
       };
     })
@@ -3582,6 +4171,7 @@ function normalizePlanBeforeSave() {
   collapseGroupedOrderStops();
   cleanupOrphanPickupStops();
   syncPickupStops();
+  reconcilePickupStopRepresentatives();
   syncReturnLoads();
 }
 
@@ -3672,7 +4262,8 @@ function summarizeStop(stop) {
     loadId: stop.loadId,
     orderId: stop.orderId,
     type: stop.type,
-    location: stop.location
+    location: stop.location,
+    stopTimeOverrideMinutes: normalizedStopTimeOverride(stop)
   };
 }
 
@@ -3683,6 +4274,7 @@ function summarizeLoad(load) {
     name: load.name,
     returnOnly: Boolean(load.returnOnly),
     manual: Boolean(load.manual),
+    endingTrip: Boolean(load.endingTrip),
     allowTolls: Boolean(load.allowTolls),
     returnYard: load.returnYard,
     start: load.start,
@@ -3875,6 +4467,10 @@ function splitOrderPlanningBlock(splits = []) {
 function applySavedPlan(saved) {
   if (!Array.isArray(saved?.orders) || !Array.isArray(saved?.trucks)) return false;
   clearActiveRouteEstimates();
+  const activityEvidence = activePhysicalOrderEvidence(saved.trucks, saved.id || saved.planId);
+  const evidenceBaselines = new Map(saved.orders
+    .filter((order) => orderMatchesActivityRefs(order, activityEvidence.all))
+    .map((order) => [String(order.id || "").trim().toLowerCase(), order]));
   const defaultById = new Map(orderCatalog.map((order) => [order.id, normalizeOrder(order)]));
   const savedAssignedIds = assignedOrderIdsForTrucks(saved.trucks);
   const allowSavedOnlyOrder = (order) => {
@@ -3906,13 +4502,13 @@ function applySavedPlan(saved) {
       keepPlanningFields.items = order.items;
       keepPlanningFields.raw = order.raw;
     }
-    const merged = {
+    const merged = preserveActiveOrderEvidence(order, {
       ...order,
       ...base,
       ...Object.fromEntries(Object.entries(keepPlanningFields).filter(([, value]) => value !== undefined)),
       shortageAvailability: base.shortageAvailability || order.shortageAvailability,
       committedQty: base.shortageAvailability ? base.committedQty : order.committedQty
-    };
+    }, activityEvidence);
     return [order.id, normalizeOrder(merged)];
   }));
   const hiddenOrderIds = new Set([
@@ -3928,10 +4524,13 @@ function applySavedPlan(saved) {
   normalizeLoadAssignments();
   ensureDriverLaneOrder(Array.isArray(saved.summary?.driverLaneOrder) ? saved.summary.driverLaneOrder : defaultDriverLaneOrder());
   reconcileTransitCoSourceOrders();
+  orders = reapplyActiveOrderEvidence(orders, evidenceBaselines, activityEvidence);
   expandScmGroupedPoStops();
   collapseGroupedOrderStops();
   syncPickupStops();
   cleanupOrphanPickupStops();
+  reconcilePickupStopRepresentatives();
+  if (!forecastMatchesCurrentPlan()) clearDispatchForecast();
   selectedOrderId = orders.find((order) => order.id === selectedOrderId)?.id || orders[0]?.id || "";
   selectedLoadId = trucks.flatMap((truck) => truck.loads).find((load) => load.id === selectedLoadId)?.id || trucks[0]?.loads[0]?.id || "";
   selectedOrderIds = new Set(selectedOrderId ? [selectedOrderId] : []);
@@ -4079,7 +4678,10 @@ async function savePlanToServer(payload, { retryOnStale = true, forceSave = fals
       });
       return { saved: true, ignoredOlderResult: true };
     }
-    if (saveTargetsCurrentView) currentPlan = compactCurrentPlan(result);
+    if (saveTargetsCurrentView) {
+      currentPlan = compactCurrentPlan(result);
+      clearDispatchForecast();
+    }
     lastServerSavedAt = result.savedAt || payload.savedAt;
     lastSavedPlanHash = payloadHash;
     const savedLatestLocal = saveGeneration === localPlanGeneration;
@@ -4098,6 +4700,7 @@ async function savePlanToServer(payload, { retryOnStale = true, forceSave = fals
         if (refreshOrderPool) nextSaveNeedsOrderPoolRefresh = false;
         if (saveMode === "truck_sequence") nextPlanSaveMode = "";
         clearLocalPlanDirty(payload.savedAt, saveGeneration);
+        loadDispatchForecast({ renderAfter: true }).catch(() => null);
       } else {
         saveQueued = true;
       }
@@ -4120,6 +4723,7 @@ async function savePlanToServer(payload, { retryOnStale = true, forceSave = fals
       if (refreshOrderPool) nextSaveNeedsOrderPoolRefresh = false;
       if (saveMode === "truck_sequence") nextPlanSaveMode = "";
       clearLocalPlanDirty(payload.savedAt, saveGeneration);
+      loadDispatchForecast({ renderAfter: true }).catch(() => null);
       operatorAlertRefs.forEach((ref) => pendingOperatorAlertRefs.delete(ref));
     } else {
       saveQueued = true;
@@ -4187,12 +4791,18 @@ async function flushPlanSaveQueue() {
           continue;
         }
         lastSavedAt = savedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-        const result = await savePlanToServer(payload, {
-          retryOnStale: staleRetryCount < 1,
-          payloadHash,
-          saveGeneration,
-          forceSave
-        });
+        activeSaveGeneration = saveGeneration;
+        let result;
+        try {
+          result = await savePlanToServer(payload, {
+            retryOnStale: staleRetryCount < 1,
+            payloadHash,
+            saveGeneration,
+            forceSave
+          });
+        } finally {
+          activeSaveGeneration = null;
+        }
         finalResult = result;
         if (result?.staleRetryQueued) {
           autosaveDebug("flushPlanSaveQueue:staleRetryQueued", { staleRetryCount });
@@ -4217,6 +4827,7 @@ async function flushPlanSaveQueue() {
     } finally {
       saveInFlight = false;
       saveFlushPromise = null;
+      activeSaveGeneration = null;
       autosaveDebug("flushPlanSaveQueue:end", { saveQueued });
     }
   })();
@@ -4408,9 +5019,17 @@ function autoSavePlan() {
 async function saveCurrentPlanNow({ forceSave = false } = {}) {
   if (!ensureDispatchPlanEditor()) throw new Error(dispatchEditModeMessage());
   clearTimeout(saveTimer);
-  if (forceSave) forceNextPlanSave = true;
-  saveQueued = true;
-  const result = await flushPlanSaveQueue();
+  if (!localPlanDirty && !saveQueued && !saveInFlight) return;
+  const joinsCurrentGeneration = saveInFlight
+    && activeSaveGeneration === localPlanGeneration
+    && !saveQueued;
+  if (!joinsCurrentGeneration) {
+    if (forceSave) forceNextPlanSave = true;
+    saveQueued = true;
+  }
+  const result = joinsCurrentGeneration
+    ? await saveFlushPromise
+    : await flushPlanSaveQueue();
   if (result?.failed || result?.blocked) {
     throw result.error instanceof Error ? result.error : new Error(result.error || routeNotice || "Dispatch plan save failed.");
   }
@@ -4511,6 +5130,17 @@ function commitPlanMutation(actionName = "dispatch_plan_mutation", mutator = nul
   if (options.refreshOrderPool) requestOrderPoolRefreshOnNextSave();
   if (options.truckSequence) requestTruckSequenceSaveOnNextSave();
   normalizePlanBeforeSave();
+  const overrideConflict = trucks
+    .flatMap((truck) => (truck.loads || []).flatMap((load) => physicalVisitsForLoad(load)
+      .filter((visit) => physicalVisitOverrideState(visit).conflict)
+      .map((visit) => ({ load, visit }))))
+    .find(Boolean);
+  if (overrideConflict) {
+    if (rollbackPacked) applyHistorySnapshot(unpackHistorySnapshot(rollbackPacked));
+    routeNotice = `${overrideConflict.load.name || "Load"} has conflicting stop-time overrides in one grouped physical visit. Choose one value or Automatic.`;
+    render({ save: false });
+    return false;
+  }
   const dependencySequenceWarning = options.validateDependencies === false
     ? ""
     : trucks
@@ -4540,8 +5170,10 @@ function commitPlanMutation(actionName = "dispatch_plan_mutation", mutator = nul
     render({ save: false });
     return false;
   }
+  clearInvalidEndingTrips({ notify: true, audit: true });
   const planChanged = captureUndoPointIfNeeded(true);
   if (planChanged || options.forceSave) {
+    if (planChanged) clearDispatchForecast();
     markLocalPlanDirty();
     autoSavePlan();
   }
@@ -4624,7 +5256,10 @@ async function resetDispatchAfterOrderDataClear() {
 }
 
 async function loadPlanForDate(planDate = currentPlanDate, { createIfMissing = true } = {}) {
-  if (String(planDate || "") !== String(currentPlanDate || "")) driverNewTruckSelections.clear();
+  if (String(planDate || "") !== String(currentPlanDate || "")) {
+    driverNewTruckSelections.clear();
+    resetActiveLinkModalState();
+  }
   const response = await fetch(`/api/dispatch/plans/current?date=${encodeURIComponent(planDate)}`);
   if (!response.ok) throw new Error(await response.text());
   let plan = await response.json();
@@ -4645,25 +5280,28 @@ async function loadPlanForDate(planDate = currentPlanDate, { createIfMissing = t
     routeNotice = `Edit Mode status is temporarily unavailable: ${error.message}`;
   }
   if (Array.isArray(currentPlan?.orders) && Array.isArray(currentPlan?.trucks)) {
+    await loadDriverJobStatuses();
     applySavedPlan(currentPlan);
     currentPlan = compactCurrentPlan(currentPlan);
     lastServerSavedAt = currentPlan.savedAt || currentPlan.updatedAt || lastServerSavedAt;
-    await loadDriverJobStatuses();
     resetUndoHistory();
     resetLocalPlanDirty();
+    await loadDispatchForecast();
     return { loaded: true, created, hasSnapshot: true };
   }
-    currentPlan = compactCurrentPlan(currentPlan);
+  currentPlan = compactCurrentPlan(currentPlan);
   if (currentPlan?.id) {
     resetPlanningBoard();
     lastServerSavedAt = currentPlan.savedAt || currentPlan.updatedAt || lastServerSavedAt;
     await loadDriverJobStatuses();
     resetUndoHistory();
     resetLocalPlanDirty();
+    await loadDispatchForecast();
     return { loaded: true, created, hasSnapshot: false };
   }
   resetPlanningBoard();
   await loadDriverJobStatuses();
+  clearDispatchForecast();
   resetUndoHistory();
   resetLocalPlanDirty();
   return { loaded: false, created, hasSnapshot: false };
@@ -4673,7 +5311,10 @@ async function loadPlanById(planId) {
   const response = await fetch(`/api/dispatch/plans/${encodeURIComponent(planId)}`);
   if (!response.ok) throw new Error(await response.text());
   const plan = await response.json();
-  if (String(plan.planDate || "") !== String(currentPlanDate || "")) driverNewTruckSelections.clear();
+  if (String(plan.planDate || "") !== String(currentPlanDate || "")) {
+    driverNewTruckSelections.clear();
+    resetActiveLinkModalState();
+  }
   currentPlan = plan;
   currentPlanDate = plan.planDate || currentPlanDate;
   dispatchStorageSet(DISPATCH_PLAN_DATE_KEY, currentPlanDate);
@@ -4684,13 +5325,14 @@ async function loadPlanById(planId) {
     leaveDispatchEditMode({ clearLease: true });
     routeNotice = `Edit Mode status is temporarily unavailable: ${error.message}`;
   }
+  await loadDriverJobStatuses();
   currentPlan = compactCurrentPlan(plan);
   if (Array.isArray(plan.orders) && Array.isArray(plan.trucks)) applySavedPlan(plan);
   lastServerSavedAt = plan.savedAt || plan.updatedAt || lastServerSavedAt;
   await loadPlanHistory();
-  await loadDriverJobStatuses();
   resetUndoHistory();
   resetLocalPlanDirty();
+  await loadDispatchForecast();
   return plan;
 }
 
@@ -4714,9 +5356,10 @@ async function restoreServerPlan() {
     }
     isApplyingRemotePlan = true;
     currentPlanDate = saved.planDate || currentPlanDate;
+    await loadDriverJobStatuses();
     const applied = applySavedPlan(saved);
     currentPlan = compactCurrentPlan(saved);
-    await loadDriverJobStatuses();
+    await loadDispatchForecast();
     if (applied) resetUndoHistory();
     isApplyingRemotePlan = false;
     return applied;
@@ -4862,6 +5505,17 @@ function connectEvents() {
     }
 
     if ([
+      "driver.job.started",
+      "driver.job.completed",
+      "driver.truck.switched",
+      "driver.truck.switch.attention",
+      "driver.truck.switch.overridden"
+    ].includes(event.type)) {
+      refreshDriverExecutionAndForecast({ renderAfter: true }).catch(() => null);
+      return;
+    }
+
+    if ([
       "delivery.order.unpacked",
       "delivery.order.loaded",
       "delivery.order.updated",
@@ -4870,11 +5524,6 @@ function connectEvents() {
       "dispatch.operator_request.created",
       "dispatch.orders.updated",
       "dispatch.co.updated",
-      "driver.job.started",
-      "driver.job.completed",
-      "driver.truck.switched",
-      "driver.truck.switch.attention",
-      "driver.truck.switch.overridden",
       "receiving.order.received"
     ].includes(event.type)) {
       queueRemoteRefresh(event.type === "delivery.order.unpacked" ? "Operator unpacked an order. Split can continue." : "Order data updated.");
@@ -5024,7 +5673,7 @@ function groupCandidates(order) {
   return orders.filter((item) => item.childOrders?.includes(order.id) || (order.childOrders || []).includes(item.id));
 }
 
-function stopOrder(stop) {
+function directOrderForStop(stop) {
   const orderId = String(stop?.orderId || "");
   if (!orderId) return null;
   const directPlanOrder = orders.find((order) => String(order?.id || "") === orderId);
@@ -5032,6 +5681,70 @@ function stopOrder(stop) {
   const catalogOrder = orderCatalog.find((order) => String(order?.id || "") === orderId);
   if (catalogOrder) return catalogOrder;
   return orders.find((order) => dispatchGroupingRefs(order).has(orderId)) || null;
+}
+
+function loadContainingStop(stop) {
+  const loadId = String(stop?.loadId || "");
+  if (loadId) {
+    const found = findLoad(loadId);
+    if (found.load) return found.load;
+  }
+  const stopId = String(stop?.id || "");
+  if (!stopId) return null;
+  return trucks.flatMap((truck) => truck.loads || [])
+    .find((load) => (load.stops || []).some((candidate) => String(candidate.id || "") === stopId)) || null;
+}
+
+function pickupRepresentativeOrder(load, stop) {
+  if (!load || stop?.type !== "pick") return null;
+  const location = normalizedPickupLocation(stop.location);
+  for (const candidate of load.stops || []) {
+    if (candidate.type !== "drop") continue;
+    const order = directOrderForStop(candidate);
+    if (!order) continue;
+    if (requiredPickupLocations(order).some((value) => normalizedPickupLocation(value) === location)) return order;
+  }
+  return null;
+}
+
+function stopOrder(stop) {
+  const direct = directOrderForStop(stop);
+  if (stop?.type !== "pick") return direct;
+  if (direct && orderRequiresPickupLocation(direct, stop.location)) return direct;
+  return pickupRepresentativeOrder(loadContainingStop(stop), stop) || direct;
+}
+
+function reconcilePickupStopRepresentatives({ audit = false } = {}) {
+  const rekeyedLoads = new Set();
+  for (const truck of trucks || []) {
+    for (const load of truck.loads || []) {
+      for (const stop of load.stops || []) {
+        if (stop.type !== "pick") continue;
+        const direct = directOrderForStop(stop);
+        const directStillUsesPickup = direct && orderRequiresPickupLocation(direct, stop.location);
+        if (directStillUsesPickup) continue;
+        const replacement = pickupRepresentativeOrder(load, stop);
+        if (!replacement || String(replacement.id || "") === String(stop.orderId || "")) continue;
+        // Started jobs retain their original identity; display and timing still resolve through the related drops.
+        if (stopHasDriverActivity(load, stop)) continue;
+        const beforeOrderId = stop.orderId;
+        stop.orderId = replacement.id;
+        rekeyedLoads.add(load.id);
+        if (audit) {
+          logDispatchAudit({
+            action: "pickup_representative_rekeyed",
+            entityType: "stop",
+            entityId: stop.id,
+            loadId: load.id,
+            before: { orderId: beforeOrderId, stopId: stop.id },
+            after: { orderId: replacement.id, stopId: stop.id },
+            details: { pickupLocation: stop.location || "" }
+          });
+        }
+      }
+    }
+  }
+  return rekeyedLoads;
 }
 
 function stopById(stopId) {
@@ -5232,7 +5945,14 @@ function routePendingForLoad(truck, load) {
 }
 
 function loadFinishText(truck, load, stats = loadStats(truck, load)) {
+  const forecast = forecastLoadRecord(load);
+  if (forecast?.forecastFinish) return actualTimeText(forecast.forecastFinish);
   return routePendingForLoad(truck, load) ? "Route pending" : timeText(stats.finish);
+}
+
+function loadFinishLabel(load, finishText) {
+  if (finishText === "Route pending") return finishText;
+  return `Finish ${finishText}`;
 }
 
 function fallbackTravelMinutesBetweenStops(truck, previousStop, currentStop, previousOrder, currentOrder) {
@@ -5259,6 +5979,77 @@ function fallbackTravelMinutesBetweenStops(truck, previousStop, currentStop, pre
   else if (currentStop.type === "drop") value = Number(currentOrder?.travelMinutes || 30);
   else value = Number(previousOrder?.travelMinutes || currentOrder?.travelMinutes || 30);
   return adjustedTravelMinutesForTruck(truck, value);
+}
+
+function normalizedStopTimeOverride(stop = {}) {
+  const value = stop.stopTimeOverrideMinutes ?? stop.stop_time_override_minutes;
+  if (value === null || value === undefined || String(value).trim() === "") return null;
+  const minutesValue = Number(value);
+  return Number.isInteger(minutesValue) && minutesValue >= 0 && minutesValue <= 1440 ? minutesValue : null;
+}
+
+function physicalDropVisitKey(stop = {}, order = {}) {
+  return normalizedPlaceKey(stopAddress(stop, order));
+}
+
+function physicalVisitsForLoad(load, rows = []) {
+  const visits = [];
+  for (const [index, stop] of (load?.stops || []).entries()) {
+    const order = stopOrder(stop);
+    if (!order) continue;
+    const address = stopAddress(stop, order);
+    const addressKey = stop.type === "drop" ? physicalDropVisitKey(stop, order) : "";
+    const entry = { stop, order, row: rows[index] || null, index };
+    const previous = visits[visits.length - 1];
+    if (addressKey && previous?.type === "drop" && previous.addressKey === addressKey) {
+      previous.entries.push(entry);
+      continue;
+    }
+    visits.push({
+      type: stop.type,
+      address,
+      addressKey,
+      entries: [entry]
+    });
+  }
+  return visits;
+}
+
+function physicalVisitOverrideState(visit = {}) {
+  const states = (visit.entries || []).map((entry) => {
+    const value = normalizedStopTimeOverride(entry.stop);
+    return value === null ? "automatic" : String(value);
+  });
+  const unique = [...new Set(states)];
+  return {
+    conflict: unique.length > 1,
+    value: unique.length === 1 && unique[0] !== "automatic" ? Number(unique[0]) : null
+  };
+}
+
+function physicalVisitStayMinutes(visit = {}, truck) {
+  const entries = visit.entries || [];
+  if (!entries.length) return 0;
+  const overrideState = physicalVisitOverrideState(visit);
+  if (!overrideState.conflict && overrideState.value !== null) return overrideState.value;
+  const first = entries[0];
+  if (visit.type === "pick") {
+    return truckStopMinutes(
+      truck,
+      stopServiceType(first.stop, first.order),
+      pickupFootprintForLocation(loadContainingStop(first.stop), first.stop.location)
+    );
+  }
+  const serviceTypes = entries.map((entry) => stopServiceType(entry.stop, entry.order));
+  let normalMinutes;
+  if (serviceTypes.includes("delivery")) {
+    const footprint = entries.reduce((sum, entry) => sum + dropFootprintPallets(entry.order, entry.stop), 0);
+    normalMinutes = Math.round(truckDeliveryFixedMinutes(truck) + (footprint * truckMinutesPerPallet(truck)));
+  } else if (serviceTypes.includes("vendor")) normalMinutes = Math.round(truckVendorFixedMinutes(truck));
+  else normalMinutes = Math.round(truckOwnYardFixedMinutes(truck));
+  const customMinutes = entries.map((entry) => explicitCustomDropStopMinutes(entry.stop, entry.order)).filter((value) => value !== null);
+  if (entries.length === 1 && customMinutes.length === 1) return customMinutes[0];
+  return Math.max(normalMinutes, ...customMinutes, 0);
 }
 
 function loadStats(parentTruck, load) {
@@ -5309,7 +6100,7 @@ function loadStats(parentTruck, load) {
     current += startTravelMinutes;
     routeLegIndex += 1;
   }
-  const rows = [];
+  const rows = new Array((load.stops || []).length);
   let palletTotal = 0;
   let footprintTotal = 0;
   let processedWeightLbs = 0;
@@ -5318,6 +6109,11 @@ function loadStats(parentTruck, load) {
   let travelTotal = 0;
   let warningCount = startWarnings.length;
   const warnings = [...startWarnings];
+  for (const unresolvedStop of load.stops || []) {
+    if (stopOrder(unresolvedStop)) continue;
+    warningCount += 1;
+    warnings.push(`${unresolvedStop.orderId || unresolvedStop.id || "Stop"}: order details are temporarily unavailable. Refresh orders before saving this stop timing.`);
+  }
   const sequenceWarnings = sequenceWarningsForStops(load.stops);
   const pickedLocations = new Set();
   const onboardOrderIds = new Set();
@@ -5345,16 +6141,26 @@ function loadStats(parentTruck, load) {
     peakWeightLbs = currentWeightLbs;
   }
 
-  let previousStop = null;
-  let previousOrder = null;
-  for (const stop of load.stops) {
-    const order = stopOrder(stop);
-    if (!order) continue;
-    if (previousStop) {
-      current += Number(routeLegMinutes[routeLegIndex] ?? fallbackTravelMinutesBetweenStops(truck, previousStop, stop, previousOrder, order));
+  let previousVisit = null;
+  for (const visit of physicalVisitsForLoad(load)) {
+    if (physicalVisitOverrideState(visit).conflict) {
+      const refs = visit.entries.map((entry) => entry.order.id).join(" + ");
+      const warning = `${refs}: grouped physical visit has conflicting stop-time overrides. Choose one value or Automatic.`;
+      warningCount += 1;
+      warnings.push(warning);
+    }
+    const firstEntry = visit.entries[0];
+    const stop = firstEntry.stop;
+    const order = firstEntry.order;
+    if (previousVisit) {
+      const previousEntry = previousVisit.entries.at(-1);
+      const travelMinutes = Number(routeLegMinutes[routeLegIndex]
+        ?? fallbackTravelMinutesBetweenStops(truck, previousEntry.stop, stop, previousEntry.order, order));
+      current += travelMinutes;
+      travelTotal += travelMinutes;
       routeLegIndex += 1;
     }
-    if (stop.type === "pick") {
+    if (visit.type === "pick") {
       pickedLocations.add(String(stop.location));
       let pickedFootprint = 0;
       const pickedOrderIdsAtLocation = new Set();
@@ -5371,7 +6177,7 @@ function loadStats(parentTruck, load) {
         peakWeightLbs = Math.max(peakWeightLbs, currentWeightLbs);
       }
       const arrival = current;
-      current += truckStopMinutes(truck, stopServiceType(stop, order), pickedFootprint);
+      current += physicalVisitStayMinutes(visit, truck);
       let warningReason = "";
       const window = stopTimeWindow(stop, order);
       const hasTimeWindow = Boolean(window.start && window.end);
@@ -5383,43 +6189,44 @@ function loadStats(parentTruck, load) {
         warningCount += 1;
         warnings.push(warningReason);
       }
-      rows.push({ stop, order, arrival, depart: current, warning: Boolean(warningReason), warningReason });
-      previousStop = stop;
-      previousOrder = order;
+      rows[firstEntry.index] = { stop, order, arrival, depart: current, warning: Boolean(warningReason), warningReason, visit };
+      previousVisit = visit;
       continue;
     }
-    const missingPickupLocations = requiredPickupLocations(order).filter((location) => !pickedLocations.has(String(location)));
     const arrival = current;
-    const dropFootprint = dropFootprintPallets(order, stop);
-    const dropWeight = dropWeightLbs(order, stop);
-    current += stopStayMinutes(stop, order, truck);
-    palletTotal += dropPallets(order, stop);
-    footprintTotal += dropFootprint;
-    processedWeightLbs += dropWeight;
-    if (onboardOrderIds.has(order.id)) {
-      currentWeightLbs = Math.max(0, currentWeightLbs - dropWeight);
-      const remainingDrops = Math.max(Number(remainingDropCounts.get(String(order.id)) || 1) - 1, 0);
-      remainingDropCounts.set(String(order.id), remainingDrops);
-      if (!remainingDrops) {
-        onboardOrderIds.delete(order.id);
-        droppedOrderIds.add(order.id);
+    current += physicalVisitStayMinutes(visit, truck);
+    for (const entry of visit.entries) {
+      const entryStop = entry.stop;
+      const entryOrder = entry.order;
+      const missingPickupLocations = requiredPickupLocations(entryOrder).filter((location) => !pickedLocations.has(String(location)));
+      const dropFootprint = dropFootprintPallets(entryOrder, entryStop);
+      const dropWeight = dropWeightLbs(entryOrder, entryStop);
+      palletTotal += dropPallets(entryOrder, entryStop);
+      footprintTotal += dropFootprint;
+      processedWeightLbs += dropWeight;
+      if (onboardOrderIds.has(entryOrder.id)) {
+        currentWeightLbs = Math.max(0, currentWeightLbs - dropWeight);
+        const remainingDrops = Math.max(Number(remainingDropCounts.get(String(entryOrder.id)) || 1) - 1, 0);
+        remainingDropCounts.set(String(entryOrder.id), remainingDrops);
+        if (!remainingDrops) {
+          onboardOrderIds.delete(entryOrder.id);
+          droppedOrderIds.add(entryOrder.id);
+        }
       }
+      let warningReason = "";
+      const window = stopTimeWindow(entryStop, entryOrder);
+      const hasTimeWindow = Boolean(window.start && window.end);
+      if (missingPickupLocations.length) warningReason = `${entryOrder.id}: pickup ${missingPickupLocations.join(", ")} before drop.`;
+      else if (window.closed) warningReason = `${entryOrder.id} ${entryStop.type} location closed on ${window.label || planWeekdayName()}.`;
+      else if (hasTimeWindow && arrival > minutes(window.end)) warningReason = `${entryOrder.id} ${entryStop.type} late: arrives ${timeText(arrival)}, window ends ${window.end}`;
+      else if (hasTimeWindow && arrival < minutes(window.start) - 45) warningReason = `${entryOrder.id} ${entryStop.type} early: arrives ${timeText(arrival)}, window starts ${window.start}`;
+      if (warningReason) {
+        warningCount += 1;
+        warnings.push(warningReason);
+      }
+      rows[entry.index] = { stop: entryStop, order: entryOrder, arrival, depart: current, warning: Boolean(warningReason), warningReason, visit };
     }
-    travelTotal += Number(routeLegMinutes[Math.max(routeLegIndex - 1, 0)] ?? order.travelMinutes ?? 0);
-    let warningReason = "";
-    const window = stopTimeWindow(stop, order);
-    const hasTimeWindow = Boolean(window.start && window.end);
-    if (missingPickupLocations.length) warningReason = `${order.id}: pickup ${missingPickupLocations.join(", ")} before drop.`;
-    else if (window.closed) warningReason = `${order.id} ${stop.type} location closed on ${window.label || planWeekdayName()}.`;
-    else if (hasTimeWindow && arrival > minutes(window.end)) warningReason = `${order.id} ${stop.type} late: arrives ${timeText(arrival)}, window ends ${window.end}`;
-    else if (hasTimeWindow && arrival < minutes(window.start) - 45) warningReason = `${order.id} ${stop.type} early: arrives ${timeText(arrival)}, window starts ${window.start}`;
-    if (warningReason) {
-      warningCount += 1;
-      warnings.push(warningReason);
-    }
-    rows.push({ stop, order, arrival, depart: current, warning: Boolean(warningReason), warningReason });
-    previousStop = stop;
-    previousOrder = order;
+    previousVisit = visit;
   }
   for (const warning of sequenceWarnings) {
     if (!warnings.includes(warning)) {
@@ -5428,7 +6235,8 @@ function loadStats(parentTruck, load) {
     }
   }
 
-  const returnTrip = Math.max(22, Math.round(travelTotal / Math.max(load.stops.filter((stop) => stop.type === "drop").length, 1) * 0.8));
+  const physicalDropCount = physicalVisitsForLoad(load).filter((visit) => visit.type === "drop").length;
+  const returnTrip = Math.max(22, Math.round(travelTotal / Math.max(physicalDropCount, 1) * 0.8));
   const capacityLbs = truckCapacityLbs(truck);
   const weightTotalLbs = Math.max(peakWeightLbs, explicitPickCount ? 0 : processedWeightLbs);
   const fullLoad = weightTotalLbs >= capacityLbs;
@@ -5957,7 +6765,7 @@ function addLoadToTruck(truck, insertIndex = truck?.loads?.length || 0, assigned
 function addReturnLoadToTruck(truck, insertIndex = truck?.loads?.length || 0, assignedDriver = null) {
   const driver = assignedDriver || truckDriver(truck);
   const sequence = nextDriverSequence(driver ? driverKey(driver) : "");
-  const load = { id: `${truck.id}-MR${Date.now()}-${Math.random().toString(16).slice(2)}`, name: "Return Load", returnOnly: true, manual: true, returnYard: "12441", stops: [], ...newLoadStartFields(truck, driver) };
+  const load = { id: `${truck.id}-MR${Date.now()}-${Math.random().toString(16).slice(2)}`, name: "Return Load", returnOnly: true, manual: true, endingTrip: false, returnYard: "12441", stops: [], ...newLoadStartFields(truck, driver) };
   assignLoadFields(truck, load, { driver, sequence });
   truck.loads.splice(Math.max(0, Math.min(insertIndex, truck.loads.length)), 0, load);
   renumberTruckLoads(truck);
@@ -6578,6 +7386,8 @@ function explicitCustomDropStopMinutes(stop, order) {
 }
 
 function stopStayMinutes(stop, order, truck) {
+  const overrideMinutes = normalizedStopTimeOverride(stop);
+  if (overrideMinutes !== null) return overrideMinutes;
   const customStopMinutes = explicitCustomDropStopMinutes(stop, order);
   if (customStopMinutes !== null) return customStopMinutes;
   return truckStopMinutes(truck, stopServiceType(stop, order), stop.type === "drop" ? dropFootprintPallets(order, stop) : orderFootprintPallets(order));
@@ -6590,6 +7400,8 @@ function compactMinuteValue(value) {
 
 function stopTimingBasisText(stop, order, parentTruck, load) {
   if (!stop || !order) return "";
+  const overrideMinutes = normalizedStopTimeOverride(stop);
+  if (overrideMinutes !== null) return `Dispatcher override: ${compactMinuteValue(overrideMinutes)}`;
   const customStopMinutes = explicitCustomDropStopMinutes(stop, order);
   if (customStopMinutes !== null) {
     return `Custom order setting: ${compactMinuteValue(customStopMinutes)}`;
@@ -6726,13 +7538,19 @@ function mapStopsForLoad(load, truck) {
     stayMinutes: 0,
     orderId: ""
   }] : [];
-  const routedStops = (load?.stops || []).map((stop, index) => {
-    const order = stopOrder(stop);
-    if (!order) return null;
+  const routedStops = physicalVisitsForLoad(load).map((visit, visitIndex) => {
+    const firstEntry = visit.entries[0];
+    const lastEntry = visit.entries.at(-1);
+    const stop = firstEntry.stop;
+    const order = firstEntry.order;
     const place = resolveStopPlace(stop, order);
     const position = { lat: place.lat, lng: place.lng };
     const address = place.address;
-    const sequence = index + 1 + handoffStops.length + startStops.length;
+    const sequence = visitIndex + 1 + handoffStops.length + startStops.length;
+    const refs = visit.entries.map((entry) => entry.order.id);
+    const title = stop.type === "pick"
+      ? `${sequence}. Pickup ${pickupStopLabel(stop, order)}`
+      : `${sequence}. Drop ${refs.join(" + ") || dropStopLabel(stop, order)}`;
     return {
       ...position,
       address,
@@ -6740,14 +7558,16 @@ function mapStopsForLoad(load, truck) {
       kind: place.kind,
       placeKey: place.key,
       label: String(sequence),
-      title: stop.type === "pick" ? `${sequence}. Pickup ${pickupStopLabel(stop, order)}` : `${sequence}. Drop ${dropStopLabel(stop, order)}`,
+      title,
       type: stop.type,
-      stayMinutes: stop.type === "pick"
-        ? truckStopMinutes(truck, stopServiceType(stop, order), pickupFootprintForLocation(load, stop.location))
-        : stopStayMinutes(stop, order, truck),
-      orderId: order.id
+      stayMinutes: physicalVisitStayMinutes(visit, truck),
+      orderId: order.id,
+      orderIds: refs,
+      sourceStopIds: visit.entries.map((entry) => entry.stop.id),
+      logicalStartIndex: firstEntry.index,
+      logicalEndIndex: lastEntry.index
     };
-  }).filter(Boolean);
+  });
   return [...handoffStops, ...startStops, ...routedStops];
 }
 
@@ -6955,7 +7775,9 @@ function mergeConsecutiveExactDropMarkers(markerStops = []) {
       startLabel: String(stop.label || ""),
       endLabel: String(stop.label || ""),
       sourceStops: [stop],
-      orderIds: String(stop.orderId || "").trim() ? [String(stop.orderId)] : []
+      orderIds: Array.isArray(stop.orderIds)
+        ? stop.orderIds.map(String).filter(Boolean)
+        : String(stop.orderId || "").trim() ? [String(stop.orderId)] : []
     });
   }
   return merged.map(({ addressKey, startLabel, endLabel, ...stop }) => stop);
@@ -7340,6 +8162,9 @@ function selectorForElement(element) {
     "data-load-switch-yard",
     "data-load-parking",
     "data-return-yard",
+    "data-stop-time-override",
+    "data-ending-trip",
+    "data-load-id",
     "data-po-match-scroll",
     "data-driver-lane",
     "data-driver-lane-drop"
@@ -7351,10 +8176,14 @@ function selectorForElement(element) {
 
 function captureRenderUiState() {
   const active = document.activeElement;
+  const activeEditable = active?.matches?.("input, textarea, select, [contenteditable='true']") ? active : null;
   return {
     focusSelector: selectorForElement(active),
     selectionStart: typeof active?.selectionStart === "number" ? active.selectionStart : null,
     selectionEnd: typeof active?.selectionEnd === "number" ? active.selectionEnd : null,
+    activeValue: activeEditable && "value" in activeEditable ? activeEditable.value : null,
+    activeChecked: activeEditable && "checked" in activeEditable ? Boolean(activeEditable.checked) : null,
+    activeText: activeEditable?.isContentEditable ? activeEditable.textContent : null,
     scrolls: [...app.querySelectorAll(".order-list, .truck-board, .truck-timeline, .date-truck-yard-list, .load-preview-body, .preview-stop-list, .stop-list, .modal-body, .po-link-lines, .order-dependency-match-lines, [data-po-match-scroll]")]
       .map((element) => ({
         selector: selectorForElement(element) || `.${[...element.classList].join(".")}`,
@@ -7377,7 +8206,10 @@ function restoreRenderUiState(state = {}, sequence = renderUiSequence) {
   restoreScrolls();
   if (state.focusSelector) {
     const element = app.querySelector(state.focusSelector);
-    if (element && typeof element.focus === "function") {
+    if (element && !element.disabled && typeof element.focus === "function") {
+      if (state.activeValue !== null && "value" in element) element.value = state.activeValue;
+      if (state.activeChecked !== null && "checked" in element) element.checked = state.activeChecked;
+      if (state.activeText !== null && element.isContentEditable) element.textContent = state.activeText;
       element.focus({ preventScroll: true });
       if (state.selectionStart !== null && typeof element.setSelectionRange === "function") {
         element.setSelectionRange(state.selectionStart, state.selectionEnd ?? state.selectionStart);
@@ -7765,18 +8597,20 @@ function renderLoad(parentTruck, load) {
   const canDragLoad = isDispatchPlanEditor() && !isLocked;
   if (load.returnOnly) {
     const stats = loadStats(parentTruck, load);
-    const executionStatus = returnExecutionStatus(parentTruck, load);
+    const returnRecord = driverRecordForReturn(parentTruck, load);
+    const returnForecast = forecastTravelRecordForKind(load, "return", returnRecord?.job_id || returnRecord?.jobId || "");
+    const executionStatus = String(returnForecast?.status || returnExecutionStatus(parentTruck, load));
     const finishText = loadFinishText(parentTruck, load, stats);
     return `
       <section class="load-block return-only status-${executionStatus}" draggable="${canDragLoad}" data-driver-load-card="${escapeHtml(load.id)}">
         <div class="load-header">
           <button class="load-title return-load-title" data-action="select-load" data-load="${escapeHtml(load.id)}" type="button">
-            <strong>${load.manual ? "Manual Return" : "Return Load"}</strong>
-            <span class="${finishText === "Route pending" ? "route-pending" : ""}">${finishText === "Route pending" ? finishText : `Finish ${finishText}`}</span>
+            <strong>${load.manual ? "Manual Return" : "Return Load"}${load.endingTrip ? ` <span class="ending-trip-badge">Ending trip</span>` : ""}</strong>
+            <span class="${finishText === "Route pending" ? "route-pending" : ""}">${loadFinishLabel(load, finishText)}</span>
           </button>
           <div class="load-header-actions">
             <span class="load-drag-handle" draggable="${canDragLoad}" title="Drag this whole load to another driver" aria-label="Drag whole load">&#8942;&#8942;</span>
-            <button class="load-insert-return" data-action="insert-driver-return" data-after-load="${escapeHtml(load.id)}" data-driver-login="${escapeHtml(loadDriverKey(parentTruck, load))}" ${isLocked ? "disabled" : ""} title="Insert a return after this load" type="button">+R</button>
+            <button class="load-insert-return" data-action="insert-driver-return" data-after-load="${escapeHtml(load.id)}" data-driver-login="${escapeHtml(loadDriverKey(parentTruck, load))}" title="Insert a return after this load" type="button">+R</button>
             <button class="load-delete" data-action="delete-load" data-load="${escapeHtml(load.id)}" ${isLocked ? "disabled" : ""} title="${isLocked ? escapeHtml(loadActivityLockNotice(load)) : "Delete return load"}" type="button">x</button>
           </div>
         </div>
@@ -7786,9 +8620,13 @@ function renderLoad(parentTruck, load) {
             <span>${t("dispatch.returnYard", "Return yard")}</span>
             <select data-return-yard="${escapeHtml(load.id)}" ${isDispatchPlanEditor() && !isLocked ? "" : "disabled"}>${yardOptions(load.returnYard || "12441")}</select>
           </label>
+          ${load.manual ? `<label class="ending-trip-control">
+            <input data-ending-trip="${escapeHtml(load.id)}" type="checkbox" ${load.endingTrip ? "checked" : ""} ${isDispatchPlanEditor() && isFinalManualReturnForDriver(parentTruck, load) ? "" : "disabled"} />
+            <span>Ending trip</span>
+          </label>` : ""}
         </div>
         <div class="stop-list">
-          ${stats.switchBefore ? "" : renderRestStop(stats)}
+          ${stats.switchBefore ? "" : renderRestStop(parentTruck, load, stats)}
           <div class="empty-drop return-helper status-${executionStatus}">Return from previous load last stop</div>
         </div>
       </section>
@@ -7803,19 +8641,19 @@ function renderLoad(parentTruck, load) {
       <div class="load-header">
         <button class="load-title" data-action="select-load" data-load="${escapeHtml(load.id)}" type="button">
           <strong>${escapeHtml(load.name)}</strong>
-          <span class="${finishText === "Route pending" ? "route-pending" : ""}">${finishText === "Route pending" ? finishText : `Finish ${finishText}`}</span>
+          <span class="${finishText === "Route pending" ? "route-pending" : ""}">${loadFinishLabel(load, finishText)}</span>
         </button>
         <div class="load-header-actions">
           <span class="load-drag-handle" draggable="${canDragLoad}" title="Drag this whole load to another driver" aria-label="Drag whole load">&#8942;&#8942;</span>
-          <button class="load-insert-return" data-action="insert-driver-return" data-after-load="${escapeHtml(load.id)}" data-driver-login="${escapeHtml(loadDriverKey(parentTruck, load))}" ${isLocked ? "disabled" : ""} title="Insert a return after this load" type="button">+R</button>
+          <button class="load-insert-return" data-action="insert-driver-return" data-after-load="${escapeHtml(load.id)}" data-driver-login="${escapeHtml(loadDriverKey(parentTruck, load))}" title="Insert a return after this load" type="button">+R</button>
           <button class="load-delete" data-action="delete-load" data-load="${escapeHtml(load.id)}" ${isLocked ? "disabled" : ""} title="${isLocked ? escapeHtml(loadActivityLockNotice(load)) : "Delete load"}" type="button">x</button>
         </div>
       </div>
       ${renderLoadAssignmentControls(parentTruck, load)}
       <div class="stop-list" data-load="${escapeHtml(load.id)}">
-        ${stats.switchBefore ? "" : renderRestStop(stats)}
+        ${stats.switchBefore ? "" : renderRestStop(parentTruck, load, stats)}
         ${renderStartTravelStop(parentTruck, load, stats.startTravel, stats.start)}
-        ${load.stops.map((stop, index) => renderStop(parentTruck, load, stop, index, stats.rows[index])).join("") || `<div class="empty-drop">Drop order here</div>`}
+        ${renderCompactStopSequence(parentTruck, load, stats) || `<div class="empty-drop">Drop order here</div>`}
       </div>
     </section>
   `;
@@ -7842,7 +8680,7 @@ function renderTruckSwitchTransition(previousEntry, currentEntry) {
         <label><span>${t("dispatch.parking", "Parking")}</span><input data-load-parking="${escapeHtml(currentEntry.load.id)}" value="${escapeHtml(loadParkingSpot(currentEntry.truck, currentEntry.load))}" placeholder="A1" ${disabled} /></label>
       </div>
       <div class="truck-switch-transition-steps">
-        ${renderRestStop(stats)}
+        ${renderRestStop(currentEntry.truck, currentEntry.load, stats)}
         ${renderSwitchApproachTravelStop(currentEntry.truck, currentEntry.load, stats)}
         ${renderTruckSwitchStop(currentEntry.truck, currentEntry.load, stats)}
       </div>
@@ -7854,7 +8692,8 @@ function renderSwitchApproachTravelStop(truck, load, stats) {
   const travel = stats?.handoffTravel;
   if (!travel) return "";
   const record = driverRecordForSwitchApproach(truck, load, travel);
-  const executionStatus = executionStatusFromRecord(record);
+  const forecast = forecastTravelRecordForKind(load, "handoff", record?.job_id || record?.jobId || "");
+  const executionStatus = String(forecast?.status || executionStatusFromRecord(record));
   return `
     <article class="stop-card compact travel-stop truck-switch-approach status-${executionStatus}">
       <div class="stop-main">
@@ -7862,13 +8701,17 @@ function renderSwitchApproachTravelStop(truck, load, stats) {
         <span>Reposition to the truck switch yard</span>
       </div>
       <div class="stop-time">${timingSummaryHtml({
+        status: executionStatus,
         startLabel: "LV",
         endLabel: "Arr",
         plannedStart: stats.handoffStart,
         plannedEnd: stats.handoffFinish,
-        actualStart: recordStartedAt(record),
-        actualEnd: recordCompletedAt(record),
-        showActual: executionStatus === "complete"
+        originalStart: forecast?.plannedLeave,
+        originalEnd: forecast?.plannedArrival,
+        forecastStart: forecast?.forecastLeave,
+        forecastEnd: forecast?.forecastArrival,
+        actualStart: forecast?.actualLeave || recordStartedAt(record),
+        actualEnd: forecast?.actualArrival || recordCompletedAt(record)
       })}</div>
     </article>
   `;
@@ -7878,26 +8721,55 @@ function renderTruckSwitchStop(truck, load, stats) {
   if (!stats?.switchBefore) return "";
   const previous = previousDriverLoad(truck, load);
   const previousPlate = previous ? loadTruckPlate(previous.truck, previous.load) : "";
+  const timeline = forecastTimelineRecordForKind(load, "truck_switch");
+  const record = driverStatusByJobId().get(driverTruckSwitchJobIdForLoad(truck, load));
+  const executionStatus = String(timeline?.status || executionStatusFromRecord(record));
   return `
-    <article class="stop-card compact truck-switch-stop">
+    <article class="stop-card compact truck-switch-stop status-${escapeHtml(executionStatus)}" data-timeline-event="${escapeHtml(timeline?.eventId || "")}">
       <div class="stop-main">
         <strong>${tf("dispatch.switchTruck", "Switch {from} to {to}", { from: escapeHtml(previousPlate), to: escapeHtml(loadTruckPlate(truck, load)) })}</strong>
         <span>${escapeHtml(loadSwitchYard(truck, load))} | Parking ${escapeHtml(loadParkingSpot(truck, load) || "--")}</span>
       </div>
-      <div class="stop-time"><span>${timeText(stats.switchStart || stats.previousFinish)}</span><span>${durationText(stats.switchMinutes)}</span></div>
+      <div class="stop-time">${timingSummaryHtml({
+        status: executionStatus,
+        startLabel: "Start",
+        endLabel: "End",
+        plannedStart: stats.switchStart || stats.previousFinish,
+        plannedEnd: (stats.switchStart || stats.previousFinish) + stats.switchMinutes,
+        originalStart: timeline?.plannedStart,
+        originalEnd: timeline?.plannedEnd,
+        forecastStart: timeline?.forecastStart,
+        forecastEnd: timeline?.forecastEnd,
+        actualStart: timeline?.actualStart || recordStartedAt(record),
+        actualEnd: timeline?.actualEnd || recordCompletedAt(record)
+      })}</div>
     </article>
   `;
 }
 
-function renderRestStop(stats) {
+function renderRestStop(truck, load, stats) {
   if (!Number(stats?.restBefore || 0)) return "";
+  const timeline = forecastTimelineRecordForKind(load, "rest");
+  const executionStatus = String(timeline?.status || "pending");
   return `
-    <article class="stop-card compact rest-stop">
+    <article class="stop-card compact rest-stop status-${escapeHtml(executionStatus)}" data-timeline-event="${escapeHtml(timeline?.eventId || "")}">
       <div class="stop-main">
         <strong>Rest / Wait</strong>
         <span>Gap before next load</span>
       </div>
-      <div class="stop-time"><span>${timeText(stats.previousFinish)}</span><span>${durationText(stats.restBefore)}</span></div>
+      <div class="stop-time">${timingSummaryHtml({
+        status: executionStatus,
+        startLabel: "Start",
+        endLabel: "End",
+        plannedStart: stats.previousFinish,
+        plannedEnd: stats.handoffStart ?? stats.switchStart ?? stats.start,
+        originalStart: timeline?.plannedStart,
+        originalEnd: timeline?.plannedEnd,
+        forecastStart: timeline?.forecastStart,
+        forecastEnd: timeline?.forecastEnd,
+        actualStart: timeline?.actualStart,
+        actualEnd: timeline?.actualEnd
+      })}</div>
     </article>
   `;
 }
@@ -7905,8 +8777,9 @@ function renderRestStop(stats) {
 function renderStartTravelStop(truck, load, startTravel, start) {
   if (!startTravel) return "";
   const arrival = start + startTravel.minutes;
-  const executionStatus = travelExecutionStatus(truck, load, startTravel);
   const record = driverRecordForTravel(truck, load, startTravel);
+  const forecast = forecastTravelRecordForKind(load, "start", record?.job_id || record?.jobId || "");
+  const executionStatus = String(forecast?.status || travelExecutionStatus(truck, load, startTravel));
   return `
     <article class="stop-card compact travel-stop status-${executionStatus}">
       <div class="stop-main">
@@ -7914,13 +8787,17 @@ function renderStartTravelStop(truck, load, startTravel, start) {
         <span>Empty truck reposition</span>
       </div>
       <div class="stop-time">${timingSummaryHtml({
+        status: executionStatus,
         startLabel: "LV",
         endLabel: "Arr",
         plannedStart: start,
         plannedEnd: arrival,
-        actualStart: recordStartedAt(record),
-        actualEnd: recordCompletedAt(record),
-        showActual: executionStatus === "complete"
+        originalStart: forecast?.plannedLeave,
+        originalEnd: forecast?.plannedArrival,
+        forecastStart: forecast?.forecastLeave,
+        forecastEnd: forecast?.forecastArrival,
+        actualStart: forecast?.actualLeave || recordStartedAt(record),
+        actualEnd: forecast?.actualArrival || recordCompletedAt(record)
       })}</div>
     </article>
   `;
@@ -7932,118 +8809,274 @@ function renderStop(truck, load, stop, index, row) {
   const isPick = stop.type === "pick";
   const executionStatus = stopExecutionStatus(truck, load, stop);
   const record = driverRecordForStop(truck, load, stop);
+  const forecast = forecastTimingForStop(stop);
   const showWarning = Boolean(row?.warning && executionStatus !== "complete");
-  const removalLocked = loadHasDriverActivity(load);
+  const removalLocked = orderHasDriverActivityInLoad(load, order.id);
   return `
-    <article class="stop-card compact status-${executionStatus} ${isPick ? "pick" : ""} ${selectedOrderId === order.id ? "selected-order-stop" : ""} ${showWarning ? "warning" : ""}" draggable="${isDispatchPlanEditor() && !removalLocked}" data-load="${escapeHtml(stop.loadId)}" data-stop="${escapeHtml(stop.id)}" data-order="${escapeHtml(order.id)}" data-index="${index}">
+    <article class="stop-card compact status-${executionStatus} ${isPick ? "pick" : ""} ${selectedOrderId === order.id ? "selected-order-stop" : ""} ${showWarning ? "warning" : ""}" draggable="${isDispatchPlanEditor()}" data-load="${escapeHtml(stop.loadId)}" data-stop="${escapeHtml(stop.id)}" data-order="${escapeHtml(order.id)}" data-index="${index}">
       <button class="stop-remove" data-action="remove-stop" data-stop="${escapeHtml(stop.id)}" ${removalLocked ? "disabled" : ""} title="${removalLocked ? escapeHtml(stopActivityLockNotice(stop)) : "Remove stop"}" type="button">x</button>
       <div class="stop-main">
         <strong>${index + 1}. ${escapeHtml(isPick ? `Pickup ${pickupStopLabel(stop, order)}` : dropStopLabel(stop, order))}</strong>
         <span>${escapeHtml(stopAddress(stop, order))}</span>
       </div>
       <div class="stop-time">${timingSummaryHtml({
+        status: executionStatus,
         startLabel: "Arr",
         endLabel: "LV",
         plannedStart: row?.arrival || 0,
         plannedEnd: row?.depart || row?.arrival || 0,
-        actualStart: recordStartedAt(record),
-        actualEnd: recordCompletedAt(record),
-        showActual: executionStatus === "complete"
+        originalStart: forecast.plannedStart,
+        originalEnd: forecast.plannedEnd,
+        forecastStart: forecast.forecastStart,
+        forecastEnd: forecast.forecastEnd,
+        actualStart: forecast.actualStart || recordStartedAt(record),
+        actualEnd: forecast.actualEnd || recordCompletedAt(record)
       })}</div>
     </article>
   `;
 }
 
+function renderCompactDropVisit(truck, load, visit) {
+  const entries = visit.entries || [];
+  const first = entries[0];
+  const last = entries.at(-1) || first;
+  if (!first) return "";
+  if (entries.length === 1) return renderStop(truck, load, first.stop, first.index, first.row);
+  const refs = entries.map((entry) => entry.order.id);
+  const timing = previewVisitTiming(visit);
+  const executionStatus = previewVisitExecutionStatus(truck, load, visit);
+  const firstRecord = driverRecordForStop(truck, load, first.stop);
+  const lastRecord = driverRecordForStop(truck, load, last.stop);
+  const forecast = forecastTimingForStop(first.stop);
+  const showWarning = entries.some((entry) => entry.row?.warning) && executionStatus !== "complete";
+  return `
+    <article class="stop-card compact merged-drop-visit status-${executionStatus} ${showWarning ? "warning" : ""}" draggable="${isDispatchPlanEditor()}" data-load="${escapeHtml(load.id)}" data-stop="${escapeHtml(first.stop.id)}" data-order="${escapeHtml(first.order.id)}" data-index="${first.index}">
+      <div class="stop-main">
+        <strong>${first.index + 1}-${last.index + 1}. ${escapeHtml(refs.join(" + "))}</strong>
+        <span>${escapeHtml(visit.address)}</span>
+        <span class="merged-visit-note">${entries.length} orders · one physical stop</span>
+      </div>
+      <div class="stop-time">${timingSummaryHtml({
+        status: executionStatus,
+        startLabel: "Arr",
+        endLabel: "LV",
+        plannedStart: timing.arrival,
+        plannedEnd: timing.depart,
+        originalStart: forecast.plannedStart,
+        originalEnd: forecast.plannedEnd,
+        forecastStart: forecast.forecastStart,
+        forecastEnd: forecast.forecastEnd,
+        actualStart: forecast.actualStart || recordStartedAt(firstRecord),
+        actualEnd: forecast.actualEnd || recordCompletedAt(lastRecord)
+      })}</div>
+    </article>
+  `;
+}
+
+function travelLegExecutionStatus(leg = {}) {
+  const status = String(leg?.status || "").trim().toLowerCase();
+  if (["complete", "completed"].includes(status) || leg?.actualArrival) return "complete";
+  if (["in_progress", "in-progress", "started"].includes(status) || leg?.actualLeave) return "in_progress";
+  return "pending";
+}
+
+function renderInterStopTravelCard(load, previousVisit, nextVisit, pairIndex, { preview = false, displayIndex = null } = {}) {
+  const previousEntry = previousVisit?.entries?.at(-1);
+  const nextEntry = nextVisit?.entries?.[0];
+  if (!previousEntry || !nextEntry) return "";
+  const leg = travelLegForVisitPair(load, previousVisit, nextVisit, pairIndex);
+  if (!leg && samePhysicalAddress(previousVisit.address, nextVisit.address)) return "";
+  const plannedLeave = Number(previousEntry.row?.depart ?? previousEntry.row?.arrival ?? 0);
+  const plannedArrival = Number(nextEntry.row?.arrival ?? plannedLeave);
+  const status = travelLegExecutionStatus(leg);
+  const titlePrefix = displayIndex === null ? "Travel" : `${displayIndex}. Travel`;
+  const from = leg?.from || previousVisit.address || previousEntry.order.id;
+  const to = leg?.to || nextVisit.address || nextEntry.order.id;
+  const className = preview ? "preview-stop" : "stop-card compact";
+  return `
+    <article class="${className} travel travel-stop inter-stop-travel status-${escapeHtml(status)}" draggable="false" data-travel-leg="${escapeHtml(leg?.legId || `${load.id}-inter-${pairIndex}`)}" data-execution-status="${escapeHtml(status)}">
+      <div class="stop-main">
+        <strong>${escapeHtml(titlePrefix)} | ${escapeHtml(from)} to ${escapeHtml(to)}</strong>
+        <span>Inter-stop travel</span>
+      </div>
+      <div class="stop-time">${timingSummaryHtml({
+        status,
+        startLabel: "LV",
+        endLabel: "Arr",
+        plannedStart: timestampMinuteOr(leg?.plannedLeave, plannedLeave),
+        plannedEnd: timestampMinuteOr(leg?.plannedArrival, plannedArrival),
+        originalStart: leg?.plannedLeave || "",
+        originalEnd: leg?.plannedArrival || "",
+        forecastStart: leg?.forecastLeave || "",
+        forecastEnd: leg?.forecastArrival || "",
+        actualStart: leg?.actualLeave || "",
+        actualEnd: leg?.actualArrival || ""
+      })}</div>
+    </article>
+  `;
+}
+
+function renderCompactStopSequence(truck, load, stats) {
+  const visits = physicalVisitsForLoad(load, stats?.rows || []);
+  return visits.map((visit, index) => {
+    const travel = index > 0 ? renderInterStopTravelCard(load, visits[index - 1], visit, index - 1) : "";
+    const stop = visit.entries.length > 1
+      ? renderCompactDropVisit(truck, load, visit)
+      : renderStop(truck, load, visit.entries[0].stop, visit.entries[0].index, visit.entries[0].row);
+    return `${travel}${stop}`;
+  }).join("");
+}
+
 function renderLoadTimingDetails(truck, load, stats) {
   const rows = [];
+  if (Number(stats.restBefore || 0)) {
+    const timeline = forecastTimelineRecordForKind(load, "rest");
+    const executionStatus = String(timeline?.status || "pending");
+    rows.push(timingDetailHtml({
+      status: executionStatus,
+      title: "Rest / Wait",
+      startLabel: "Start",
+      endLabel: "End",
+      plannedStart: stats.previousFinish,
+      plannedEnd: stats.handoffStart ?? stats.switchStart ?? stats.start,
+      originalStart: timeline?.plannedStart,
+      originalEnd: timeline?.plannedEnd,
+      forecastStart: timeline?.forecastStart,
+      forecastEnd: timeline?.forecastEnd,
+      actualStart: timeline?.actualStart,
+      actualEnd: timeline?.actualEnd
+    }));
+  }
   if (stats.handoffTravel) {
     const record = driverRecordForSwitchApproach(truck, load, stats.handoffTravel);
+    const forecast = forecastTravelRecordForKind(load, "handoff", record?.job_id || record?.jobId || "");
+    const executionStatus = String(forecast?.status || executionStatusFromRecord(record));
     rows.push(timingDetailHtml({
+      status: executionStatus,
       title: `Travel ${stats.handoffTravel.from} to ${stats.handoffTravel.to}`,
       startLabel: "Leave",
       endLabel: "Arrive",
       plannedStart: stats.handoffStart,
       plannedEnd: stats.handoffFinish,
-      actualStart: recordStartedAt(record),
-      actualEnd: recordCompletedAt(record)
+      originalStart: forecast?.plannedLeave,
+      originalEnd: forecast?.plannedArrival,
+      forecastStart: forecast?.forecastLeave,
+      forecastEnd: forecast?.forecastArrival,
+      actualStart: forecast?.actualLeave || recordStartedAt(record),
+      actualEnd: forecast?.actualArrival || recordCompletedAt(record)
     }));
   }
   if (stats.switchBefore) {
     const previous = previousDriverLoad(truck, load);
     const record = driverStatusByJobId().get(driverTruckSwitchJobIdForLoad(truck, load));
+    const timeline = forecastTimelineRecordForKind(load, "truck_switch");
+    const executionStatus = String(timeline?.status || executionStatusFromRecord(record));
     rows.push(timingDetailHtml({
+      status: executionStatus,
       title: `Switch ${loadTruckPlate(previous?.truck, previous?.load)} to ${loadTruckPlate(truck, load)}`,
       plannedStart: stats.switchStart || stats.previousFinish,
       plannedEnd: (stats.switchStart || stats.previousFinish) + stats.switchMinutes,
-      actualStart: recordStartedAt(record),
-      actualEnd: recordCompletedAt(record)
+      originalStart: timeline?.plannedStart,
+      originalEnd: timeline?.plannedEnd,
+      forecastStart: timeline?.forecastStart,
+      forecastEnd: timeline?.forecastEnd,
+      actualStart: timeline?.actualStart || recordStartedAt(record),
+      actualEnd: timeline?.actualEnd || recordCompletedAt(record)
     }));
   }
   if (load.returnOnly) {
     const estimate = estimateForLoad(load);
     const record = driverRecordForReturn(truck, load);
+    const forecast = forecastTravelRecordForKind(load, "return", record?.job_id || record?.jobId || "");
+    const executionStatus = String(forecast?.status || returnExecutionStatus(truck, load));
     rows.push(timingDetailHtml({
+      status: executionStatus,
       title: `Return ${load.returnYard || "12441"}`,
       startLabel: "Leave",
       endLabel: "Arrive",
       plannedStart: stats.start,
       plannedEnd: estimate ? stats.start + estimate.totalMinutes : stats.finish,
-      actualStart: recordStartedAt(record),
-      actualEnd: recordCompletedAt(record)
+      originalStart: forecast?.plannedLeave,
+      originalEnd: forecast?.plannedArrival,
+      forecastStart: forecast?.forecastLeave,
+      forecastEnd: forecast?.forecastArrival,
+      actualStart: forecast?.actualLeave || recordStartedAt(record),
+      actualEnd: forecast?.actualArrival || recordCompletedAt(record)
     }));
     return rows.join("");
   }
   if (stats.startTravel) {
     const record = driverRecordForTravel(truck, load, stats.startTravel);
+    const forecast = forecastTravelRecordForKind(load, "start", record?.job_id || record?.jobId || "");
+    const executionStatus = String(forecast?.status || travelExecutionStatus(truck, load, stats.startTravel));
     rows.push(timingDetailHtml({
+      status: executionStatus,
       title: `Travel ${stats.startTravel.from} to ${stats.startTravel.to}`,
       startLabel: "Leave",
       endLabel: "Arrive",
       plannedStart: stats.start,
       plannedEnd: stats.start + stats.startTravel.minutes,
-      actualStart: recordStartedAt(record),
-      actualEnd: recordCompletedAt(record)
+      originalStart: forecast?.plannedLeave,
+      originalEnd: forecast?.plannedArrival,
+      forecastStart: forecast?.forecastLeave,
+      forecastEnd: forecast?.forecastArrival,
+      actualStart: forecast?.actualLeave || recordStartedAt(record),
+      actualEnd: forecast?.actualArrival || recordCompletedAt(record)
     }));
   }
-  for (let index = 0; index < (load.stops || []).length; index += 1) {
-    const stop = load.stops[index];
-    const order = stopOrder(stop);
-    const row = stats.rows[index];
-    if (!order || !row) continue;
-    const record = driverRecordForStop(truck, load, stop);
+  const visits = physicalVisitsForLoad(load, stats.rows || []);
+  for (const [visitIndex, visit] of visits.entries()) {
+    if (visitIndex > 0) {
+      const previousVisit = visits[visitIndex - 1];
+      const leg = travelLegForVisitPair(load, previousVisit, visit, visitIndex - 1);
+      const previousRow = previousVisit.entries.at(-1)?.row;
+      const nextRow = visit.entries[0]?.row;
+      if (leg || !samePhysicalAddress(previousVisit.address, visit.address)) {
+        const executionStatus = travelLegExecutionStatus(leg);
+        rows.push(timingDetailHtml({
+          status: executionStatus,
+          title: `Travel ${leg?.from || previousVisit.address} to ${leg?.to || visit.address}`,
+          startLabel: "Leave",
+          endLabel: "Arrive",
+          plannedStart: timestampMinuteOr(leg?.plannedLeave, previousRow?.depart || previousRow?.arrival || 0),
+          plannedEnd: timestampMinuteOr(leg?.plannedArrival, nextRow?.arrival || 0),
+          originalStart: leg?.plannedLeave || "",
+          originalEnd: leg?.plannedArrival || "",
+          forecastStart: leg?.forecastLeave,
+          forecastEnd: leg?.forecastArrival,
+          actualStart: leg?.actualLeave,
+          actualEnd: leg?.actualArrival
+        }));
+      }
+    }
+    const first = visit.entries[0];
+    const last = visit.entries.at(-1) || first;
+    const stop = first.stop;
+    const order = first.order;
+    const timing = previewVisitTiming(visit);
+    const firstRecord = driverRecordForStop(truck, load, first.stop);
+    const lastRecord = driverRecordForStop(truck, load, last.stop);
+    const forecast = forecastTimingForStop(first.stop);
+    const refs = visit.entries.map((entry) => entry.order.id);
+    const executionStatus = previewVisitExecutionStatus(truck, load, visit);
     rows.push(timingDetailHtml({
-      title: stop.type === "pick" ? `Pickup ${pickupStopLabel(stop, order)}` : `Drop ${dropStopLabel(stop, order)}`,
-      plannedStart: row.arrival || 0,
-      plannedEnd: row.depart || row.arrival || 0,
-      actualStart: recordStartedAt(record),
-      actualEnd: recordCompletedAt(record)
+      status: executionStatus,
+      title: stop.type === "pick" ? `Pickup ${pickupStopLabel(stop, order)}` : `Drop ${refs.join(" + ") || dropStopLabel(stop, order)}`,
+      plannedStart: timing.arrival,
+      plannedEnd: timing.depart,
+      originalStart: forecast.plannedStart,
+      originalEnd: forecast.plannedEnd,
+      forecastStart: forecast.forecastStart,
+      forecastEnd: forecast.forecastEnd,
+      actualStart: forecast.actualStart || recordStartedAt(firstRecord),
+      actualEnd: forecast.actualEnd || recordCompletedAt(lastRecord)
     }));
   }
   return rows.join("") || `<div class="empty-drop">No stop timing available.</div>`;
 }
 
 function consecutiveExactDropVisits(stops = [], rows = []) {
-  const visits = [];
-  for (let index = 0; index < stops.length; index += 1) {
-    const stop = stops[index];
-    const order = stopOrder(stop);
-    if (!order) continue;
-    const address = stopAddress(stop, order);
-    const addressKey = stop.type === "drop" ? normalizedPlaceKey(address) : "";
-    const entry = { stop, order, row: rows[index] || null, index };
-    const previous = visits[visits.length - 1];
-    if (addressKey && previous?.type === "drop" && previous.addressKey === addressKey) {
-      previous.entries.push(entry);
-      continue;
-    }
-    visits.push({
-      type: stop.type,
-      address,
-      addressKey,
-      entries: [entry]
-    });
-  }
-  return visits;
+  return physicalVisitsForLoad({ stops }, rows);
 }
 
 function previewVisitTiming(visit = {}) {
@@ -8074,6 +9107,71 @@ function previewVisitExecutionStatus(truck, load, visit = {}) {
   return "pending";
 }
 
+function physicalVisitHasDriverActivity(load, visit = {}) {
+  return (visit.entries || []).some((entry) => stopHasDriverActivity(load, entry.stop));
+}
+
+function renderVisitStopTimeOverride(load, visit = {}) {
+  const first = visit.entries?.[0];
+  if (!first) return "";
+  const state = physicalVisitOverrideState(visit);
+  const disabled = !isDispatchPlanEditor() || physicalVisitHasDriverActivity(load, visit);
+  const disabledText = disabled ? "disabled" : "";
+  const value = state.conflict ? "" : (state.value ?? "");
+  return `
+    <div class="visit-stop-time-override ${state.conflict ? "conflict" : ""}">
+      <label>
+        <span>${state.conflict ? "Conflicting override" : "Stop time override"}</span>
+        <input data-stop-time-override="${escapeHtml(first.stop.id)}" data-load-id="${escapeHtml(load.id)}" type="number" min="0" max="1440" step="1" inputmode="numeric" value="${escapeHtml(value)}" placeholder="Automatic" ${disabledText} />
+      </label>
+      <button data-action="clear-stop-time-override" data-stop="${escapeHtml(first.stop.id)}" data-load="${escapeHtml(load.id)}" ${disabledText} type="button">Automatic</button>
+    </div>
+  `;
+}
+
+function updatePhysicalVisitStopTimeOverride(loadId, stopId, value) {
+  if (!ensureDispatchPlanEditor()) return false;
+  const found = findLoad(loadId);
+  if (!found.load) return false;
+  const stats = loadStats(found.truck, found.load);
+  const visit = previewVisitContainingStop(found.load, stats, stopId);
+  if (!visit) return false;
+  if (physicalVisitHasDriverActivity(found.load, visit)) {
+    routeNotice = "This physical visit already has driver activity. Its stop time cannot be changed.";
+    render({ save: false });
+    return false;
+  }
+  const normalized = value === null || value === undefined || String(value).trim() === ""
+    ? null
+    : Number(value);
+  if (normalized !== null && (!Number.isInteger(normalized) || normalized < 0 || normalized > 1440)) {
+    routeNotice = "Stop time override must be a whole number from 0 to 1440 minutes.";
+    render({ save: false });
+    return false;
+  }
+  const before = visit.entries.map((entry) => ({ stopId: entry.stop.id, stopTimeOverrideMinutes: normalizedStopTimeOverride(entry.stop) }));
+  for (const entry of visit.entries) {
+    delete entry.stop.stop_time_override_minutes;
+    if (normalized === null) delete entry.stop.stopTimeOverrideMinutes;
+    else entry.stop.stopTimeOverrideMinutes = normalized;
+  }
+  invalidateDriverRoutesFromLoad(found.load.id);
+  logDispatchAudit({
+    action: normalized === null ? "physical_visit_stop_time_override_cleared" : "physical_visit_stop_time_overridden",
+    entityType: "stop",
+    entityId: visit.entries[0].stop.id,
+    loadId: found.load.id,
+    before,
+    after: visit.entries.map((entry) => ({ stopId: entry.stop.id, stopTimeOverrideMinutes: normalized })),
+    details: { stopIds: visit.entries.map((entry) => entry.stop.id), minutes: normalized }
+  });
+  routeNotice = normalized === null
+    ? "Physical visit stop time returned to Automatic."
+    : `Physical visit stop time set to ${normalized} minutes.`;
+  commitPlanMutation(normalized === null ? "stop_time_override_cleared" : "stop_time_override_updated", null, { validateAssignments: false });
+  return true;
+}
+
 function renderPreviewDropVisit(truck, load, visit, displayOffset = 0) {
   const entries = visit.entries || [];
   if (entries.length < 2) {
@@ -8089,9 +9187,9 @@ function renderPreviewDropVisit(truck, load, visit, displayOffset = 0) {
   const executionStatus = previewVisitExecutionStatus(truck, load, visit);
   const firstRecord = driverRecordForStop(truck, load, first.stop);
   const lastRecord = driverRecordForStop(truck, load, last.stop);
+  const forecast = forecastTimingForStop(first.stop);
   const showWarning = entries.some((entry) => entry.row?.warning) && executionStatus !== "complete";
   const selected = entries.some((entry) => selectedOrderId === entry.order.id);
-  const removalLocked = loadHasDriverActivity(load);
   return `
     <article class="preview-stop merged-drop-visit status-${executionStatus} drop ${selected ? "selected-order-stop" : ""} ${showWarning ? "warning" : ""}" data-preview-visit="true" data-load="${escapeHtml(load.id)}" data-stop="${escapeHtml(first.stop.id)}" data-order="${escapeHtml(first.order.id)}" data-index="${first.index}" data-start-index="${first.index}" data-end-index="${last.index}">
       <div class="stop-main">
@@ -8101,28 +9199,33 @@ function renderPreviewDropVisit(truck, load, visit, displayOffset = 0) {
       </div>
       <div class="stop-time">
         ${timingSummaryHtml({
+          status: executionStatus,
           startLabel: "Arr",
           endLabel: "LV",
           plannedStart: timing.arrival,
           plannedEnd: timing.depart,
-          actualStart: recordStartedAt(firstRecord),
-          actualEnd: recordCompletedAt(lastRecord),
-          showActual: executionStatus === "complete"
+          originalStart: forecast.plannedStart,
+          originalEnd: forecast.plannedEnd,
+          forecastStart: forecast.forecastStart,
+          forecastEnd: forecast.forecastEnd,
+          actualStart: forecast.actualStart || recordStartedAt(firstRecord),
+          actualEnd: forecast.actualEnd || recordCompletedAt(lastRecord)
         })}
         <span class="preview-stop-duration">Stop time ${durationText(timing.duration)}</span>
+        ${renderVisitStopTimeOverride(load, visit)}
       </div>
       <div class="merged-visit-orders">
         ${entries.map((entry) => {
           const childStatus = stopExecutionStatus(truck, load, entry.stop);
           const childWarning = Boolean(entry.row?.warning && childStatus !== "complete");
           return `
-            <div class="preview-stop-child status-${childStatus} ${selectedOrderId === entry.order.id ? "selected" : ""} ${childWarning ? "warning" : ""}" draggable="${!removalLocked}" data-load="${escapeHtml(load.id)}" data-stop="${escapeHtml(entry.stop.id)}" data-order="${escapeHtml(entry.order.id)}" data-index="${entry.index}">
+            <div class="preview-stop-child status-${childStatus} ${selectedOrderId === entry.order.id ? "selected" : ""} ${childWarning ? "warning" : ""}" draggable="true" data-load="${escapeHtml(load.id)}" data-stop="${escapeHtml(entry.stop.id)}" data-order="${escapeHtml(entry.order.id)}" data-index="${entry.index}">
               <div>
                 <strong>${escapeHtml(entry.order.id)}</strong>
                 <span>${escapeHtml(entry.order.customer || orderTypeLabel(entry.order.type))}</span>
               </div>
               <span class="preview-stop-child-sequence">Stop ${entry.index + displayOffset + 1}</span>
-              <button class="stop-remove" data-action="remove-stop" data-stop="${escapeHtml(entry.stop.id)}" ${removalLocked ? "disabled" : ""} title="${removalLocked ? escapeHtml(stopActivityLockNotice(entry.stop)) : `Remove ${escapeHtml(entry.order.id)}`}" type="button">x</button>
+              <button class="stop-remove" data-action="remove-stop" data-stop="${escapeHtml(entry.stop.id)}" ${orderHasDriverActivityInLoad(load, entry.order.id) ? "disabled" : ""} title="${orderHasDriverActivityInLoad(load, entry.order.id) ? escapeHtml(stopActivityLockNotice(entry.stop)) : `Remove ${escapeHtml(entry.order.id)}`}" type="button">x</button>
             </div>
           `;
         }).join("")}
@@ -8132,11 +9235,15 @@ function renderPreviewDropVisit(truck, load, visit, displayOffset = 0) {
 }
 
 function renderPreviewStopSequence(truck, load, stats, displayOffset = 0) {
-  return consecutiveExactDropVisits(load?.stops || [], stats?.rows || [])
-    .map((visit) => {
-      if (visit.entries.length > 1) return renderPreviewDropVisit(truck, load, visit, displayOffset);
+  const visits = consecutiveExactDropVisits(load?.stops || [], stats?.rows || []);
+  return visits
+    .map((visit, visitIndex) => {
+      const travel = visitIndex > 0
+        ? renderInterStopTravelCard(load, visits[visitIndex - 1], visit, visitIndex - 1, { preview: true })
+        : "";
+      if (visit.entries.length > 1) return `${travel}${renderPreviewDropVisit(truck, load, visit, displayOffset)}`;
       const entry = visit.entries[0];
-      return renderPreviewStop(truck, load, entry.stop, entry.index, entry.row, entry.index + displayOffset);
+      return `${travel}${renderPreviewStop(truck, load, entry.stop, entry.index, entry.row, entry.index + displayOffset)}`;
     })
     .join("");
 }
@@ -8149,6 +9256,7 @@ function renderLoadPreview() {
   const stats = loadStats(parentTruck, load);
   const finishText = loadFinishText(parentTruck, load, stats);
   const isLocked = loadHasDriverActivity(load);
+  const clearLocked = loadHasPhysicalStopActivity(load);
   const firstOrder = load.stops.map(stopOrder).find(Boolean);
   const pickupLocations = load.stops.length ? uniquePickupDisplayLabels(load, truck) : [];
   const pickupPoint = pickupLocations.join(", ") || firstOrder?.pickupLocations?.[0] || truck.base;
@@ -8159,13 +9267,13 @@ function renderLoadPreview() {
   const stopOffset = restOffset + handoffOffset + switchOffset + travelOffset;
   const sequenceHtml = load.returnOnly
     ? renderReturnPreviewStops(load, parentTruck, stats)
-    : `${renderPreviewRestStop(stats)}${renderPreviewSwitchApproachTravelStop(parentTruck, load, stats, restOffset)}${renderPreviewTruckSwitchStop(parentTruck, load, stats, restOffset + handoffOffset)}${renderPreviewStartTravelStop(parentTruck, load, stats.startTravel, stats.start, restOffset + handoffOffset + switchOffset)}${renderPreviewStopSequence(parentTruck, load, stats, stopOffset)}`;
+    : `${renderPreviewRestStop(parentTruck, load, stats)}${renderPreviewSwitchApproachTravelStop(parentTruck, load, stats, restOffset)}${renderPreviewTruckSwitchStop(parentTruck, load, stats, restOffset + handoffOffset)}${renderPreviewStartTravelStop(parentTruck, load, stats.startTravel, stats.start, restOffset + handoffOffset + switchOffset)}${renderPreviewStopSequence(parentTruck, load, stats, stopOffset)}`;
   return `
     <aside class="load-preview-panel" style="width:${Math.min(Math.max(loadPreviewWidth, 390), Math.round(window.innerWidth * 0.92))}px">
       <div class="load-preview-resize" title="Drag to resize"></div>
       <div class="load-preview-header">
         <div>
-          <h2>${escapeHtml(truck.plate)} | ${escapeHtml(load.name)}</h2>
+          <h2>${escapeHtml(truck.plate)} | ${escapeHtml(load.name)}${load.endingTrip ? ` <span class="ending-trip-badge">Ending trip</span>` : ""}</h2>
           <p>${load.returnOnly ? `Return to ${escapeHtml(load.returnYard || "12441")}` : `${formatLbs(stats.weightTotalLbs)}/${formatLbs(stats.capacityLbs)} | ${stats.footprintTotal} pallet positions | Pickup ${escapeHtml(pickupPoint)}`}</p>
         </div>
         <button data-action="close-load-preview" type="button">x</button>
@@ -8192,19 +9300,20 @@ function renderLoadPreview() {
           <div class="preview-section-title"><strong>Load Details</strong></div>
           <div class="preview-details-grid">
             ${renderLoadStartControl(parentTruck, load, { disabled: !isDispatchPlanEditor() || loadHasDriverActivity(load), preview: true })}
-            <div><span>Finish</span><strong class="${finishText === "Route pending" ? "route-pending" : ""}">${finishText}</strong></div>
+            <div><span>Plan finish</span><strong class="${finishText === "Route pending" ? "route-pending" : ""}">${finishText}</strong></div>
             <div><span>Rest before</span><strong>${stats.restBefore ? durationText(stats.restBefore) : "None"}</strong></div>
             <div><span>${load.returnOnly ? "Return route" : "Drive buffer"}</span><strong>${durationText(stats.returnTrip)}</strong></div>
             <div><span>Weight</span><strong>${formatLbs(stats.weightTotalLbs)}</strong></div>
             <div><span>Capacity</span><strong>${formatLbs(stats.capacityLbs)}</strong></div>
             <div><span>Pallet space</span><strong>${stats.footprintTotal} pos</strong></div>
             <div><span>Status</span><strong>${stats.capacityWarning ? "Over capacity" : stats.fullLoad ? "Full load" : "Open"}</strong></div>
+            ${load.returnOnly && load.manual ? `<label class="preview-ending-trip-control"><span>Ending trip</span><input data-ending-trip="${escapeHtml(load.id)}" type="checkbox" ${load.endingTrip ? "checked" : ""} ${isDispatchPlanEditor() && isFinalManualReturnForDriver(parentTruck, load) ? "" : "disabled"} /></label>` : ""}
           </div>
         </section>
         <section class="preview-section">
           <div class="preview-section-title">
-            <strong>Planned vs Actual</strong>
-            <span>Arrival/leave variance from driver PWA records.</span>
+            <strong>Plan, Forecast, Actual and Variance</strong>
+            <span>Plan is the original baseline. Forecast shifts with driver activity; variance always compares Actual with Plan.</span>
           </div>
           <div class="timing-detail-list">
             ${renderLoadTimingDetails(truck, load, stats)}
@@ -8232,21 +9341,35 @@ function renderLoadPreview() {
       </div>
       <div class="load-preview-footer">
         <button class="danger" data-action="delete-load" data-load="${escapeHtml(load.id)}" ${isLocked ? "disabled" : ""} title="${isLocked ? escapeHtml(loadActivityLockNotice(load)) : "Delete load"}" type="button">Delete Load</button>
-        <button class="danger" data-action="clear-load" data-load="${escapeHtml(load.id)}" ${isLocked ? "disabled" : ""} title="${isLocked ? escapeHtml(loadActivityLockNotice(load)) : "Clear load"}" type="button">Clear Load</button>
+        <button class="danger" data-action="clear-load" data-load="${escapeHtml(load.id)}" ${clearLocked ? "disabled" : ""} title="${clearLocked ? "Reopen started stops before clearing this load" : "Clear load"}" type="button">Clear Load</button>
       </div>
     </aside>
   `;
 }
 
-function renderPreviewRestStop(stats) {
+function renderPreviewRestStop(truck, load, stats) {
   if (!Number(stats?.restBefore || 0)) return "";
+  const timeline = forecastTimelineRecordForKind(load, "rest");
+  const executionStatus = String(timeline?.status || "pending");
   return `
-    <article class="preview-stop rest">
+    <article class="preview-stop rest status-${escapeHtml(executionStatus)}" data-timeline-event="${escapeHtml(timeline?.eventId || "")}">
       <div class="stop-main">
         <strong>1. Rest / Wait</strong>
         <span>Gap between previous load finish and this load start</span>
       </div>
-      <div class="stop-time"><span>From ${timeText(stats.previousFinish)}</span><span>Leave ${timeText(stats.handoffStart ?? stats.switchStart ?? stats.start)}</span></div>
+      <div class="stop-time">${timingSummaryHtml({
+        status: executionStatus,
+        startLabel: "Start",
+        endLabel: "End",
+        plannedStart: stats.previousFinish,
+        plannedEnd: stats.handoffStart ?? stats.switchStart ?? stats.start,
+        originalStart: timeline?.plannedStart,
+        originalEnd: timeline?.plannedEnd,
+        forecastStart: timeline?.forecastStart,
+        forecastEnd: timeline?.forecastEnd,
+        actualStart: timeline?.actualStart,
+        actualEnd: timeline?.actualEnd
+      })}</div>
     </article>
   `;
 }
@@ -8255,7 +9378,8 @@ function renderPreviewSwitchApproachTravelStop(truck, load, stats, displayOffset
   const travel = stats?.handoffTravel;
   if (!travel) return "";
   const record = driverRecordForSwitchApproach(truck, load, travel);
-  const executionStatus = executionStatusFromRecord(record);
+  const forecast = forecastTravelRecordForKind(load, "handoff", record?.job_id || record?.jobId || "");
+  const executionStatus = String(forecast?.status || executionStatusFromRecord(record));
   return `
     <article class="preview-stop travel truck-switch-approach status-${executionStatus}">
       <div class="stop-main">
@@ -8263,13 +9387,17 @@ function renderPreviewSwitchApproachTravelStop(truck, load, stats, displayOffset
         <span>Reposition to the truck switch yard</span>
       </div>
       <div class="stop-time">${timingSummaryHtml({
+        status: executionStatus,
         startLabel: "LV",
         endLabel: "Arr",
         plannedStart: stats.handoffStart,
         plannedEnd: stats.handoffFinish,
-        actualStart: recordStartedAt(record),
-        actualEnd: recordCompletedAt(record),
-        showActual: executionStatus === "complete"
+        originalStart: forecast?.plannedLeave,
+        originalEnd: forecast?.plannedArrival,
+        forecastStart: forecast?.forecastLeave,
+        forecastEnd: forecast?.forecastArrival,
+        actualStart: forecast?.actualLeave || recordStartedAt(record),
+        actualEnd: forecast?.actualArrival || recordCompletedAt(record)
       })}</div>
     </article>
   `;
@@ -8277,8 +9405,9 @@ function renderPreviewSwitchApproachTravelStop(truck, load, stats, displayOffset
 
 function renderPreviewStartTravelStop(truck, load, startTravel, start, displayOffset = 0) {
   if (!startTravel) return "";
-  const executionStatus = travelExecutionStatus(truck, load, startTravel);
   const record = driverRecordForTravel(truck, load, startTravel);
+  const forecast = forecastTravelRecordForKind(load, "start", record?.job_id || record?.jobId || "");
+  const executionStatus = String(forecast?.status || travelExecutionStatus(truck, load, startTravel));
   return `
     <article class="preview-stop travel status-${executionStatus}">
       <div class="stop-main">
@@ -8286,13 +9415,17 @@ function renderPreviewStartTravelStop(truck, load, startTravel, start, displayOf
         <span>Empty truck reposition</span>
       </div>
       <div class="stop-time">${timingSummaryHtml({
+        status: executionStatus,
         startLabel: "LV",
         endLabel: "Arr",
         plannedStart: start,
         plannedEnd: start + startTravel.minutes,
-        actualStart: recordStartedAt(record),
-        actualEnd: recordCompletedAt(record),
-        showActual: executionStatus === "complete"
+        originalStart: forecast?.plannedLeave,
+        originalEnd: forecast?.plannedArrival,
+        forecastStart: forecast?.forecastLeave,
+        forecastEnd: forecast?.forecastArrival,
+        actualStart: forecast?.actualLeave || recordStartedAt(record),
+        actualEnd: forecast?.actualArrival || recordCompletedAt(record)
       })}</div>
     </article>
   `;
@@ -8302,21 +9435,26 @@ function renderPreviewTruckSwitchStop(truck, load, stats, displayOffset = 0) {
   if (!stats?.switchBefore) return "";
   const previous = previousDriverLoad(truck, load);
   const record = driverStatusByJobId().get(driverTruckSwitchJobIdForLoad(truck, load));
-  const executionStatus = executionStatusFromRecord(record);
+  const timeline = forecastTimelineRecordForKind(load, "truck_switch");
+  const executionStatus = String(timeline?.status || executionStatusFromRecord(record));
   return `
-    <article class="preview-stop truck-switch status-${executionStatus}">
+    <article class="preview-stop truck-switch status-${escapeHtml(executionStatus)}" data-timeline-event="${escapeHtml(timeline?.eventId || "")}">
       <div class="stop-main">
         <strong>${displayOffset + 1}. Truck switch | ${escapeHtml(loadTruckPlate(previous?.truck, previous?.load))} to ${escapeHtml(loadTruckPlate(truck, load))}</strong>
         <span>${escapeHtml(loadSwitchYard(truck, load))} | Parking ${escapeHtml(loadParkingSpot(truck, load) || "--")}</span>
       </div>
       <div class="stop-time">${timingSummaryHtml({
+        status: executionStatus,
         startLabel: "Start",
         endLabel: "End",
         plannedStart: stats.switchStart || stats.previousFinish,
         plannedEnd: (stats.switchStart || stats.previousFinish) + stats.switchMinutes,
-        actualStart: recordStartedAt(record),
-        actualEnd: recordCompletedAt(record),
-        showActual: executionStatus === "complete"
+        originalStart: timeline?.plannedStart,
+        originalEnd: timeline?.plannedEnd,
+        forecastStart: timeline?.forecastStart,
+        forecastEnd: timeline?.forecastEnd,
+        actualStart: timeline?.actualStart || recordStartedAt(record),
+        actualEnd: timeline?.actualEnd || recordCompletedAt(record)
       })}</div>
     </article>
   `;
@@ -8329,8 +9467,10 @@ function renderPreviewStop(truck, load, stop, index, row, displayIndex = index) 
   const sub = stopAddress(stop, order);
   const executionStatus = stopExecutionStatus(truck, load, stop);
   const record = driverRecordForStop(truck, load, stop);
+  const forecast = forecastTimingForStop(stop);
+  const visit = row?.visit || { type: stop.type, address: sub, entries: [{ stop, order, row, index }] };
   const showWarning = Boolean(row?.warning && executionStatus !== "complete");
-  const removalLocked = loadHasDriverActivity(load);
+  const removalLocked = orderHasDriverActivityInLoad(load, order.id);
   const timingBasis = stopTimingBasisText(stop, order, truck, load);
   return `
     <article class="preview-stop status-${executionStatus} ${stop.type} ${selectedOrderId === order.id ? "selected-order-stop" : ""} ${showWarning ? "warning" : ""}" draggable="true" data-load="${escapeHtml(stop.loadId)}" data-stop="${escapeHtml(stop.id)}" data-order="${escapeHtml(order.id)}" data-index="${index}">
@@ -8341,16 +9481,21 @@ function renderPreviewStop(truck, load, stop, index, row, displayIndex = index) 
       </div>
       <div class="stop-time">
         ${timingSummaryHtml({
+          status: executionStatus,
           startLabel: "Arr",
           endLabel: "LV",
           plannedStart: row?.arrival || 0,
           plannedEnd: row?.depart || row?.arrival || 0,
-          actualStart: recordStartedAt(record),
-          actualEnd: recordCompletedAt(record),
-          showActual: executionStatus === "complete"
+          originalStart: forecast.plannedStart,
+          originalEnd: forecast.plannedEnd,
+          forecastStart: forecast.forecastStart,
+          forecastEnd: forecast.forecastEnd,
+          actualStart: forecast.actualStart || recordStartedAt(record),
+          actualEnd: forecast.actualEnd || recordCompletedAt(record)
         })}
         <span class="preview-stop-duration">Stop time ${durationText(Math.max(0, Number(row?.depart || 0) - Number(row?.arrival || 0)))}</span>
         ${timingBasis ? `<span class="preview-stop-basis">${escapeHtml(timingBasis)}</span>` : ""}
+        ${renderVisitStopTimeOverride(load, visit)}
       </div>
     </article>
   `;
@@ -8361,8 +9506,9 @@ function renderReturnPreviewStops(load, truck, stats) {
   const estimate = estimateForLoad(load);
   const finish = estimate ? timeText(stats.start + estimate.totalMinutes) : "Calculating";
   const restOffset = (stats.restBefore ? 1 : 0) + (stats.switchBefore ? 1 : 0);
-  const executionStatus = returnExecutionStatus(truck, load);
   const record = driverRecordForReturn(truck, load);
+  const forecast = forecastTravelRecordForKind(load, "return", record?.job_id || record?.jobId || "");
+  const executionStatus = String(forecast?.status || returnExecutionStatus(truck, load));
   const stopHtml = stops.map((stop, index) => {
     const isStart = index === 0;
     const sub = isStart
@@ -8376,19 +9522,23 @@ function renderReturnPreviewStops(load, truck, stats) {
         </div>
         <div class="stop-time">${isStart
           ? timingSummaryHtml({
+              status: executionStatus,
               startLabel: "LV",
               endLabel: "Arr",
               plannedStart: stats.start,
               plannedEnd: estimate ? stats.start + estimate.totalMinutes : stats.finish,
-              actualStart: recordStartedAt(record),
-              actualEnd: recordCompletedAt(record),
-              showActual: executionStatus === "complete"
+              originalStart: forecast?.plannedLeave,
+              originalEnd: forecast?.plannedArrival,
+              forecastStart: forecast?.forecastLeave,
+              forecastEnd: forecast?.forecastArrival,
+              actualStart: forecast?.actualLeave || recordStartedAt(record),
+              actualEnd: forecast?.actualArrival || recordCompletedAt(record)
             })
           : `<span>${escapeHtml(sub)}</span>`}</div>
       </article>
     `;
   }).join("") || `<div class="empty-drop">No previous stop available for return route.</div>`;
-  return `${renderPreviewRestStop(stats)}${renderPreviewTruckSwitchStop(truck, load, stats, stats.restBefore ? 1 : 0)}${stopHtml}`;
+  return `${renderPreviewRestStop(truck, load, stats)}${renderPreviewTruckSwitchStop(truck, load, stats, stats.restBefore ? 1 : 0)}${stopHtml}`;
 }
 
 function renderPreviewMap() {
@@ -8510,7 +9660,7 @@ async function loadOrderDependencyOptions(order, { transferOrderRef = "" } = {})
   }
 }
 
-function renderDependencyLinks(links = []) {
+function renderDependencyLinks(links = [], { unlinkOnly = false } = {}) {
   if (!links.length) return `<div class="muted">No active linked Transfer Order.</div>`;
   return links.map((dependency) => `
     <div class="order-dependency-linked">
@@ -8518,11 +9668,11 @@ function renderDependencyLinks(links = []) {
         <strong>${escapeHtml(dependency.transferOrderRef)} linked with ${escapeHtml(dependency.dispatchTargetRef || dependency.salesOrderRef)}</strong>
         <span>${escapeHtml(dependency.status)} | ${escapeHtml(dependency.reconciliationStatus || "pending")}</span>
       </div>
-      <select data-dependency-mode="${dependency.id}">
+      ${unlinkOnly ? "" : `<select data-dependency-mode="${dependency.id}">
         <option value="direct_to_customer" ${dependency.mode === "direct_to_customer" ? "selected" : ""}>Direct pickup</option>
         <option value="yard_replenishment" ${dependency.mode === "yard_replenishment" ? "selected" : ""}>Replenishment</option>
       </select>
-      <button class="dependency-action-button" data-action="update-dependency-mode" data-dependency="${dependency.id}" type="button">Update</button>
+      <button class="dependency-action-button" data-action="update-dependency-mode" data-dependency="${dependency.id}" type="button">Update</button>`}
       <button class="danger-text dependency-action-button" data-action="unlink-dependency" data-dependency="${dependency.id}" type="button">Unlink</button>
     </div>
     <div class="order-dependency-lines">
@@ -8560,7 +9710,7 @@ function renderToLinkModal(order) {
             <div class="order-dependency-head">
               <div><strong>Active links</strong><span>One TO can allocate several item lines from this dispatch order.</span></div>
             </div>
-            ${renderDependencyLinks(links)}
+            ${renderDependencyLinks(links, { unlinkOnly: options.targetUnavailable === true })}
           </section>
           <form class="po-link-form" data-form="to-link">
             <div class="order-dependency-link-grid">
@@ -9293,12 +10443,8 @@ function addOrderToLoad(orderId, loadId, type = "drop", location = "", insertInd
   const stopLocation = location || order.pickupLocations[0] || "3445";
   const existing = pullExistingStop(orderId, type, stopLocation, stopDetails);
   if (existing?.locked) {
-    if (existing.load.id !== load.id) {
-      routeNotice = stopActivityLockNotice(existing.stop);
-      return false;
-    }
-    existing.stops.splice(existing.index, 1);
-    existing.locked = false;
+    routeNotice = stopActivityLockNotice(existing.stop);
+    return false;
   }
   const sameLoadMove = existing?.load?.id === load.id && Number.isInteger(cleanInsertIndex) && existing.index < cleanInsertIndex;
   const stop = existing?.stop || {
@@ -9365,7 +10511,7 @@ function pullExistingStop(orderId, type, location, stopDetails = {}) {
       });
       if (index >= 0) {
         const found = { truck, load, stops: load.stops, stop: load.stops[index], index };
-        if (orderHasDriverActivityInLoad(load, orderId)) return { ...found, locked: true };
+        if (stopHasDriverActivity(load, found.stop)) return { ...found, locked: true };
         const [stop] = load.stops.splice(index, 1);
         return { truck, load, stop, index };
       }
@@ -9685,7 +10831,7 @@ function prepareGroupedOrderPlanning(groupItems = []) {
     return null;
   }
   const activeAssignment = assignments.find((entry) =>
-    loadHasDriverActivity(entry.load) || stopHasDriverActivity(entry.load, entry.stop)
+    orderHasDriverActivityInLoad(entry.load, entry.stop.orderId)
   );
   if (activeAssignment) {
     routeNotice = `Cannot group orders in ${activeAssignment.truck.plate} ${activeAssignment.load.name} because driver activity has already started.`;
@@ -9806,6 +10952,8 @@ function groupOrder(orderId) {
   const grouped = normalizeOrder({
     ...groupItems[0],
     id: uniqueGroupedDispatchOrderId(leafItems),
+    groupPlanId: currentPlan?.id || "",
+    groupPlanDate: currentPlanDate,
     customer: `${leafItems.length} orders grouped`,
     address: groupItems[0].address,
     pallets: groupItems.reduce((sum, item) => sum + Number(item.pallets || 0), 0),
@@ -10149,10 +11297,16 @@ function cancelTransitCoForOrder(orderId) {
 function optimizeSelectedRoute() {
   const { load } = selectedLoad();
   if (!load) return;
-  load.stops.sort((a, b) => {
+  const activityIndexes = (load.stops || [])
+    .map((stop, index) => stopHasDriverActivity(load, stop) ? index : -1)
+    .filter((index) => index >= 0);
+  const boundary = activityIndexes.length ? Math.max(...activityIndexes) : -1;
+  const lockedPrefix = load.stops.slice(0, boundary + 1);
+  const editableSuffix = load.stops.slice(boundary + 1).sort((a, b) => {
     if (a.type !== b.type) return a.type === "pick" ? -1 : 1;
     return minutes(stopOrder(a)?.windowStart || "23:59") - minutes(stopOrder(b)?.windowStart || "23:59");
   });
+  load.stops = [...lockedPrefix, ...editableSuffix];
 }
 
 function escapeHtml(value) {
@@ -10239,11 +11393,12 @@ app.addEventListener("dragstart", (event) => {
   const loadCard = event.target.closest("[data-driver-load-card]");
   if (stopCard) {
     const found = findStop(stopCard.dataset.stop);
-    if (found?.load && loadHasDriverActivity(found.load)) {
+    if (found && stopHasDriverActivity(found.load, found.stop)) {
       event.preventDefault();
       dragged = null;
-      routeNotice = loadActivityLockNotice(found.load);
-      return render({ save: false });
+      routeNotice = stopActivityLockNotice(found.stop);
+      render({ save: false });
+      return;
     }
     dragged = { type: "stop", stopId: stopCard.dataset.stop };
     event.dataTransfer.setData("text/plain", stopCard.dataset.stop);
@@ -10546,11 +11701,6 @@ app.addEventListener("drop", (event) => {
   const targetLoadId = targetStop?.dataset.load || list.dataset.load;
   const targetFound = findLoad(targetLoadId);
   const targetLoad = targetFound.load;
-  if (targetLoad && loadHasDriverActivity(targetLoad)) {
-    routeNotice = loadActivityLockNotice(targetLoad);
-    dragged = null;
-    return render({ save: false });
-  }
   if (!loadHasAssignedDriver(targetFound.truck, targetLoad)) {
     routeNotice = driverLockNotice(targetFound.truck);
     dragged = null;
@@ -10558,14 +11708,35 @@ app.addEventListener("drop", (event) => {
   }
   const insertIndex = insertIndexFromDrop(event, targetStop, targetLoad);
   if (dragged.type === "order") {
+    if (
+      Number.isInteger(insertIndex)
+      && physicalActivityPositionChanged(targetLoad, [
+        ...(targetLoad.stops || []).slice(0, insertIndex),
+        { id: `pending-order-${dragged.orderId}` },
+        ...(targetLoad.stops || []).slice(insertIndex)
+      ])
+    ) {
+      routeNotice = stopSequenceActivityLockNotice();
+      dragged = null;
+      return render({ save: false });
+    }
     const added = addOrderToLoad(dragged.orderId, targetLoadId, "drop", "", Number.isInteger(insertIndex) ? insertIndex : null);
     if (added) routeNotice = "";
   } else if (dragged.type === "stop") {
     const found = findStop(dragged.stopId);
     const target = findLoad(targetLoadId).load;
     if (found && target) {
-      if (found.load.id !== target.id && orderHasDriverActivityInLoad(found.load, found.stop.orderId)) {
+      if (stopHasDriverActivity(found.load, found.stop)) {
         routeNotice = stopActivityLockNotice(found.stop);
+        dragged = null;
+        return render({ save: false });
+      }
+      const activityPreview = previewStopMove(found, target, insertIndex);
+      if (
+        physicalActivityPositionChanged(found.load, activityPreview.sourceDraft)
+        || (found.load.id !== target.id && physicalActivityPositionChanged(target, activityPreview.targetDraft))
+      ) {
+        routeNotice = stopSequenceActivityLockNotice();
         dragged = null;
         return render({ save: false });
       }
@@ -10609,13 +11780,7 @@ app.addEventListener("drop", (event) => {
 
 app.addEventListener("click", (event) => {
   if (event.target.dataset?.action === "close-modal") {
-    const closingType = modalType;
-    const closingOrderRef = modalOrderId;
-    captureActiveLinkModalDraft();
-    if (closingType === "po-link") clearLinkModalDraft("po", closingOrderRef);
-    if (closingType === "to-link") clearLinkModalDraft("to", closingOrderRef);
-    orderDependencyAbortController?.abort();
-    poAllocationAbortController?.abort();
+    resetActiveLinkModalState();
     modalType = "";
     modalOrderId = "";
     modalLoadId = "";
@@ -10662,6 +11827,10 @@ app.addEventListener("click", (event) => {
   if (!button) return;
   const action = button.dataset.action;
   if (!action) return;
+  if (action === "clear-stop-time-override") {
+    updatePhysicalVisitStopTimeOverride(button.dataset.load, button.dataset.stop, null);
+    return;
+  }
   if (action === "edit-custom-order") {
     const customOrderId = String(button.dataset.customOrderId || "").trim();
     location.href = customOrderId
@@ -10793,11 +11962,11 @@ app.addEventListener("click", (event) => {
       return response.json();
     }).then(async (payload) => {
       if (Array.isArray(payload.orders)) applyDispatchOrderFeed(payload.orders);
-      orderDependencyOptions = null;
+      removeLocalOrderDependency(dependencyId);
+      orderDependencyError = "";
       routeNotice = "Order dependency unlinked.";
       requestOrderPoolRefreshOnNextSave();
       commitPlanMutation("to_link_cancelled");
-      await loadOrderDependencyOptions(orderById(modalOrderId));
     }).catch((error) => {
       routeNotice = `Dependency unlink failed: ${error.message}`;
       render({ save: false });
@@ -10887,6 +12056,22 @@ app.addEventListener("click", (event) => {
     return;
   }
   if (action === "open-to-link-modal") {
+    const targetOrder = orderById(button.dataset.order);
+    const groupPlanId = Number(targetOrder?.groupPlanId || 0);
+    const currentPlanId = Number(currentPlan?.id || 0);
+    const groupPlanDate = String(
+      targetOrder?.groupPlanDate
+      || (targetOrder?.childOrders?.length ? targetOrder?.dispatchPlanDate : "")
+      || ""
+    ).slice(0, 10);
+    if (
+      (groupPlanId && currentPlanId && groupPlanId !== currentPlanId)
+      || (groupPlanDate && groupPlanDate !== String(currentPlanDate || "").slice(0, 10))
+    ) {
+      routeNotice = `${targetOrder.id} belongs to the ${groupPlanDate || "other"} plan. Load that plan before managing linked Transfer Orders.`;
+      render({ save: false });
+      return;
+    }
     modalType = "to-link";
     modalOrderId = button.dataset.order;
     orderDependencyOptions = null;
@@ -11170,8 +12355,8 @@ app.addEventListener("click", (event) => {
   if (action === "clear-load") {
     const { load } = findLoad(button.dataset.load);
     if (load) {
-      if (loadHasDriverActivity(load)) {
-        routeNotice = loadActivityLockNotice(load);
+      if (loadHasPhysicalStopActivity(load)) {
+        routeNotice = `${load.name || "This load"} contains a started stop. Reopen that stop before clearing the load.`;
         return render({ save: false });
       }
       const before = summarizeLoad(load);
@@ -11289,12 +12474,17 @@ app.addEventListener("click", (event) => {
     const found = findStop(button.dataset.stop);
     if (found) {
       const orderId = found.stop.orderId;
-      const warning = loadHasDriverActivity(found.load) ? loadActivityLockNotice(found.load) : "";
+      const warning = orderHasDriverActivityInLoad(found.load, orderId) ? stopActivityLockNotice(found.stop) : "";
       if (warning) routeNotice = `Cannot remove stop: ${warning}`;
       else {
+        const remainingStops = found.load.stops.filter((stop) => stop.orderId !== orderId);
+        if (physicalActivityPositionChanged(found.load, remainingStops)) {
+          routeNotice = stopSequenceActivityLockNotice();
+          return render({ save: false });
+        }
         const before = summarizeLoad(found.load);
         const removed = found.load.stops.filter((stop) => stop.orderId === orderId).map(summarizeStop);
-        found.load.stops = found.load.stops.filter((stop) => stop.orderId !== orderId);
+        found.load.stops = remainingStops;
         syncPickupStops();
         cleanupOrphanPickupStops();
         routeNotice = "";
@@ -11486,6 +12676,41 @@ app.addEventListener("keydown", (event) => {
 app.addEventListener("change", (event) => {
   if (["po-link", "to-link"].includes(modalType) && event.target.closest('[data-link-modal="true"]')) {
     captureActiveLinkModalDraft();
+    return;
+  }
+  if (event.target?.dataset?.stopTimeOverride !== undefined) {
+    updatePhysicalVisitStopTimeOverride(
+      event.target.dataset.loadId,
+      event.target.dataset.stopTimeOverride,
+      event.target.value
+    );
+    return;
+  }
+  if (event.target?.dataset?.endingTrip !== undefined) {
+    if (!ensureDispatchPlanEditor()) return;
+    const found = findLoad(event.target.dataset.endingTrip);
+    if (!found.load?.manual || !found.load?.returnOnly) return render({ save: false });
+    if (event.target.checked && !isFinalManualReturnForDriver(found.truck, found.load)) {
+      routeNotice = "Ending trip can only be selected on the driver's final manual return.";
+      return render({ save: false });
+    }
+    const before = summarizeLoad(found.load);
+    if (event.target.checked) {
+      for (const entry of driverLoadEntries(loadDriverKey(found.truck, found.load))) {
+        if (entry.load.id !== found.load.id) entry.load.endingTrip = false;
+      }
+    }
+    found.load.endingTrip = Boolean(event.target.checked);
+    logDispatchAudit({
+      action: found.load.endingTrip ? "ending_trip_marked" : "ending_trip_cleared",
+      entityType: "load",
+      entityId: found.load.id,
+      loadId: found.load.id,
+      before,
+      after: summarizeLoad(found.load)
+    });
+    routeNotice = found.load.endingTrip ? "This manual return is marked as the driver's Ending trip." : "Ending trip marker cleared.";
+    commitPlanMutation("ending_trip_updated", null, { validateAssignments: false });
     return;
   }
   if (event.target?.id === "planDateInput") {
@@ -11816,6 +13041,8 @@ function showOrderTooltip(event) {
     const timing = previewVisitTiming({ entries });
     const firstRecord = driverRecordForStop(foundStop.truck, foundStop.load, firstEntry.stop);
     const lastRecord = driverRecordForStop(foundStop.truck, foundStop.load, lastEntry.stop);
+    const forecast = forecastTimingForStop(firstEntry.stop);
+    const executionStatus = previewVisitExecutionStatus(foundStop.truck, foundStop.load, { entries });
     const combinedRefs = entries.map((entry) => entry.order.id);
     const combined = combinedRefs.length > 1;
     const timingBasis = combined
@@ -11828,13 +13055,18 @@ function showOrderTooltip(event) {
         ${timingBasis ? `<small>${escapeHtml(timingBasis)}</small>` : ""}
       </div>
       ${timingDetailHtml({
+        status: executionStatus,
         title: combined
           ? `Combined drop ${combinedRefs.join(" + ")}`
           : stop.type === "pick" ? `Pickup ${pickupStopLabel(stop, order)}` : `Drop ${dropStopLabel(stop, order)}`,
         plannedStart: timing.arrival,
         plannedEnd: timing.depart,
-        actualStart: recordStartedAt(firstRecord),
-        actualEnd: recordCompletedAt(lastRecord)
+        originalStart: forecast.plannedStart,
+        originalEnd: forecast.plannedEnd,
+        forecastStart: forecast.forecastStart,
+        forecastEnd: forecast.forecastEnd,
+        actualStart: forecast.actualStart || recordStartedAt(firstRecord),
+        actualEnd: forecast.actualEnd || recordCompletedAt(lastRecord)
       })}
     `;
   }
@@ -12198,7 +13430,6 @@ async function initDispatch() {
     await loadDispatchOrders();
     await loadPlanHistory();
     const restoredServer = await loadPlanForDate(currentPlanDate, { createIfMissing: false });
-    await loadDriverJobStatuses();
     if (!restoredServer.loaded) resetPlanningBoard();
   } catch (error) {
     console.error("Dispatch planner initialization failed", error);
@@ -12207,6 +13438,7 @@ async function initDispatch() {
   }
   render({ save: false });
   connectEvents();
+  scheduleDispatchForecastPolling();
   setInterval(pollServerPlan, 1000);
 }
 
@@ -12214,7 +13446,18 @@ window.addEventListener("mbbs-language-changed", () => {
   render({ save: false });
 });
 
+window.addEventListener("focus", () => {
+  refreshDriverExecutionAndForecast({ renderAfter: true }).catch(() => null);
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
+    refreshDriverExecutionAndForecast({ renderAfter: true }).catch(() => null);
+  }
+});
+
 window.addEventListener("pagehide", () => {
+  window.clearInterval(dispatchForecastPollTimer);
   flushPersistedRouteEstimateCache();
   if (!isDispatchPlanEditor()) return;
   fetch("/api/dispatch/plan-edit-lease/release", {

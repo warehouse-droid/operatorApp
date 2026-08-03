@@ -8,7 +8,7 @@ let scmVrmaEditingRef = "";
 let scmVrmaSearch = "";
 let scmVrmaBusy = false;
 const scmVrmaSearchTimers = new Map();
-const SCM_VRMA_MANUAL_STATUSES = ["Queued", "Urgent", "Cancelled", "Hold", "Priority", "Surplus Only", "Book Appt"];
+const SCM_VRMA_MANUAL_STATUSES = ["Queued", "Urgent", "Hold", "Priority", "Surplus Only", "Book Appt"];
 
 function newVrmaLine() {
   return {
@@ -33,6 +33,7 @@ function newVrmaDraft() {
     dropoffLocation: "",
     status: "Queued",
     notes: "",
+    concurrencyUpdatedAt: "",
     lines: [newVrmaLine()]
   };
 }
@@ -109,8 +110,14 @@ function vrmaDraftFromOrder(order = {}) {
     dropoffLocation: order.dropoffLocation || "",
     status: SCM_VRMA_MANUAL_STATUSES.includes(order.status) ? order.status : "Queued",
     notes: order.notes || "",
+    concurrencyUpdatedAt: order.concurrencyUpdatedAt || order.scheduleUpdatedAt || order.updatedAt || "",
     lines: Array.isArray(order.lines) && order.lines.length ? order.lines.map(vrmaLineFromOrder) : [newVrmaLine()]
   };
+}
+
+function activeVrmaRows(rows = []) {
+  return (Array.isArray(rows) ? rows : []).filter((row) =>
+    String(row.status || "").trim().toLowerCase() !== "cancelled");
 }
 
 function clearVrmaSearchTimers() {
@@ -160,7 +167,7 @@ async function loadVrma() {
       vrmaApi("/api/scm/schedule?kind=VRMA"),
       vrmaApi("/api/scm/vrma-options")
     ]);
-    scmVrmaRows = rows;
+    scmVrmaRows = activeVrmaRows(rows);
     scmVrmaOptions = options;
     if (!scmVrmaOptions.ownYards.some((yard) => yard.code === scmVrmaDraft.pickupLocation)) {
       scmVrmaDraft.pickupLocation = scmVrmaOptions.ownYards[0]?.code || "3445";
@@ -347,6 +354,7 @@ function renderVrma() {
           <div><p>Local Vendor Return</p><h2>${scmVrmaEditingRef ? `Edit ${vrmaEscape(scmVrmaEditingRef)}` : "Create VRMA"}</h2></div>
           <div class="vrma-form-actions">
             ${scmVrmaEditingRef ? `<button class="secondary" data-action="new-vrma" type="button">New VRMA</button>` : ""}
+            ${scmVrmaEditingRef ? `<button class="danger" data-action="delete-vrma" type="button">Delete VRMA</button>` : ""}
             <button data-action="save-vrma" type="button">${scmVrmaEditingRef ? "Update VRMA" : "Save VRMA"}</button>
           </div>
         </div>
@@ -498,6 +506,47 @@ scmVrmaApp.addEventListener("click", async (event) => {
     return;
   }
   if (scmVrmaBusy) return;
+  if (target.dataset.action === "delete-vrma" && scmVrmaEditingRef) {
+    const ref = scmVrmaEditingRef;
+    const note = window.prompt(
+      `Why should ${ref} be deleted?\n\nThe record and audit history will be retained, but it will be cancelled and removed from active VRMA lists.`
+    );
+    if (note === null) return;
+    if (!String(note).trim()) {
+      scmVrmaNotice = "Delete failed: enter an audit note explaining why this VRMA should be removed.";
+      renderVrma();
+      return;
+    }
+    if (!window.confirm(`Delete ${ref} from active VRMA?\n\nThis cannot proceed if Dispatch planning, packing, or loading has started.`)) return;
+    setVrmaBusy(`Deleting ${ref}…`);
+    try {
+      const result = await vrmaApi(`/api/scm/vrma-orders/${encodeURIComponent(ref)}`, {
+        method: "DELETE",
+        body: JSON.stringify({
+          confirm: true,
+          note: String(note).trim(),
+          expectedUpdatedAt: scmVrmaDraft.concurrencyUpdatedAt,
+          audit: { sessionId: sessionStorage.getItem("mbbs.dispatch.sessionId") || "" }
+        })
+      });
+      if (Array.isArray(result.schedule)) {
+        scmVrmaRows = activeVrmaRows(result.schedule.filter((row) => row.orderKind === "VRMA"));
+      } else {
+        scmVrmaRows = scmVrmaRows.filter((row) =>
+          String(row.orderRef || "").trim().toLowerCase() !== ref.toLowerCase());
+      }
+      clearVrmaSearchTimers();
+      scmVrmaEditingRef = "";
+      scmVrmaDraft = newVrmaDraft();
+      scmVrmaNotice = `Deleted ${ref} from active VRMA. Its audit and Operator history were retained.`;
+    } catch (error) {
+      scmVrmaNotice = `Delete failed: ${error.message}`;
+    } finally {
+      scmVrmaBusy = false;
+      renderVrma();
+    }
+    return;
+  }
   if (target.dataset.action === "add-line") {
     scmVrmaDraft.lines.push(newVrmaLine());
     renderVrmaLineRegion();
@@ -538,7 +587,7 @@ scmVrmaApp.addEventListener("click", async (event) => {
         body: JSON.stringify(payload)
       });
       if (Array.isArray(result.schedule)) {
-        scmVrmaRows = result.schedule.filter((row) => row.orderKind === "VRMA");
+        scmVrmaRows = activeVrmaRows(result.schedule.filter((row) => row.orderKind === "VRMA"));
       }
       const savedRef = String(payload.vrmaRef || "").trim();
       if (wasEditing) {

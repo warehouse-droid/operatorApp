@@ -74,7 +74,10 @@ function standardDeviation(values = []) {
 }
 
 function mondayUtc(value) {
-  const date = new Date(`${String(value).slice(0, 10)}T00:00:00Z`);
+  const datePart = value instanceof Date && !Number.isNaN(value.getTime())
+    ? value.toISOString().slice(0, 10)
+    : String(value).slice(0, 10);
+  const date = new Date(`${datePart}T00:00:00Z`);
   if (Number.isNaN(date.getTime())) return null;
   const day = date.getUTCDay() || 7;
   date.setUTCDate(date.getUTCDate() - day + 1);
@@ -87,13 +90,16 @@ function weekKey(date) {
 function latestCompletedWeek(value) {
   const monday = mondayUtc(value);
   if (!monday) return null;
-  const date = new Date(`${String(value).slice(0, 10)}T00:00:00Z`);
+  const datePart = value instanceof Date && !Number.isNaN(value.getTime())
+    ? value.toISOString().slice(0, 10)
+    : String(value).slice(0, 10);
+  const date = new Date(`${datePart}T00:00:00Z`);
   if ((date.getUTCDay() || 7) !== 7) monday.setUTCDate(monday.getUTCDate() - 7);
   return monday;
 }
 
 
-function weeklyTimeline(facts = [], completedThrough = null, padThroughCompletedWeek = false) {
+export function smartScmWeeklyTimeline(facts = [], completedThrough = null) {
   if (!facts.length) return { dates: [], values: [] };
   const weekly = new Map();
   const end = completedThrough ? new Date(completedThrough) : null;
@@ -107,7 +113,7 @@ function weeklyTimeline(facts = [], completedThrough = null, padThroughCompleted
   const dates = [...weekly.keys()].map((key) => new Date(`${key}T00:00:00Z`)).sort((a, b) => a - b);
   if (!dates.length) return { dates: [], values: [] };
   const latestItemWeek = dates[dates.length - 1];
-  const last = end && end < latestItemWeek ? end : (padThroughCompletedWeek && end ? end : latestItemWeek);
+  const last = end || latestItemWeek;
   const values = [];
   const keys = [];
   for (let cursor = new Date(dates[0]); cursor <= last; cursor.setUTCDate(cursor.getUTCDate() + 7)) {
@@ -128,23 +134,112 @@ function fixedWindow(values = [], weeks = 6) {
   return selected.length < count ? [...Array(count - selected.length).fill(0), ...selected] : selected;
 }
 
-function formulaDemandEvidence(policy, values = [], settings = {}) {
+export function smartScmInventoryWeekStatus({ observedDays = 0, availableDays = 0 } = {}) {
+  const observed = Math.max(0, Math.round(number(observedDays)));
+  const available = Math.min(observed, Math.max(0, Math.round(number(availableDays))));
+  if (observed < 4) return "unknown";
+  return available * 2 > observed ? "in_stock" : "stockout";
+}
+
+function shiftedWeek(value, weeks) {
+  const date = mondayUtc(value);
+  if (!date) return null;
+  date.setUTCDate(date.getUTCDate() + (weeks * 7));
+  return weekKey(date);
+}
+
+export function smartScmStockoutDemandWindow({
+  dates = [],
+  values = [],
+  inventoryWeeks = new Map(),
+  completedThrough = null,
+  targetWeeks = 6
+} = {}) {
+  const target = wholeWeeks(targetWeeks, 6);
+  const completedMonday = completedThrough ? mondayUtc(completedThrough) : null;
+  const endKey = completedMonday ? weekKey(completedMonday) : dates.at(-1) || null;
+  if (!endKey) {
+    return {
+      values: [],
+      method: "none",
+      confidence: "low",
+      snapshotWeeks: 0,
+      proxyWeeks: 0,
+      evidenceStartWeek: null,
+      evidenceEndWeek: null
+    };
+  }
+  const salesByWeek = new Map(dates.map((date, index) => [String(date).slice(0, 10), Math.max(0, number(values[index]))]));
+  const snapshotCandidates = [];
+  const proxyCandidates = [];
+  for (let offset = -51; offset <= 0; offset += 1) {
+    const date = shiftedWeek(endKey, offset);
+    const sales = number(salesByWeek.get(date));
+    const observation = inventoryWeeks instanceof Map ? inventoryWeeks.get(date) : inventoryWeeks?.[date];
+    const status = observation?.status || smartScmInventoryWeekStatus(observation);
+    if (status === "in_stock") {
+      snapshotCandidates.push({ date, value: sales, source: "snapshot" });
+    } else if (status !== "stockout" && sales > EPSILON) {
+      proxyCandidates.push({ date, value: sales, source: "proxy" });
+    }
+  }
+  const selectedSnapshots = snapshotCandidates.slice(-target);
+  const selected = selectedSnapshots.length >= target
+    ? selectedSnapshots
+    : [...snapshotCandidates, ...proxyCandidates]
+        .sort((left, right) => left.date.localeCompare(right.date))
+        .slice(-target);
+  const snapshotWeeks = selected.filter((week) => week.source === "snapshot").length;
+  const proxyWeeks = selected.filter((week) => week.source === "proxy").length;
+  const method = snapshotWeeks && proxyWeeks
+    ? "mixed"
+    : snapshotWeeks
+      ? "snapshot"
+      : proxyWeeks
+        ? "positive_sales_proxy"
+        : "none";
+  return {
+    values: selected.map((week) => week.value),
+    method,
+    confidence: proxyWeeks > 0 || snapshotWeeks < 3 ? "low" : "high",
+    snapshotWeeks,
+    proxyWeeks,
+    evidenceStartWeek: selected[0]?.date || null,
+    evidenceEndWeek: selected.at(-1)?.date || null
+  };
+}
+
+export function smartScmFormulaDemandEvidence(
+  policy,
+  { dates = [], values = [] } = {},
+  settings = {},
+  inventoryWeeks = new Map(),
+  completedThrough = null
+) {
   const averageWeeks = wholeWeeks(settings.formula_average_weeks, 6);
   const stockoutWeeks = wholeWeeks(settings.stockout_benchmark_weeks, 6);
   const toPlt = number(policy.to_plt);
   const availablePallets = toPlt > EPSILON ? Math.max(0, number(policy.quantity_available)) / toPlt : 0;
-  const stockout = toPlt > EPSILON && availablePallets < 1 - EPSILON;
+  const stockout = toPlt > EPSILON && availablePallets < 1;
   const windowWeeks = stockout ? stockoutWeeks : averageWeeks;
-  const selected = fixedWindow(values, windowWeeks);
+  const stockoutWindow = stockout
+    ? smartScmStockoutDemandWindow({ dates, values, inventoryWeeks, completedThrough, targetWeeks: stockoutWeeks })
+    : null;
+  const selected = stockout ? stockoutWindow.values : fixedWindow(values, windowWeeks);
   const multiplier = expectedDemandMultiplier(policy.expected_demand_change);
   const average = trailingAverage(selected, windowWeeks);
-  const peak = selected.length ? Math.max(...selected) : 0;
   return {
-    demand: Math.max(0, stockout ? peak : average) * multiplier,
+    demand: Math.max(0, average) * multiplier,
     standardDeviation: standardDeviation(selected) * multiplier,
     stockout,
     windowWeeks,
-    availablePallets
+    availablePallets,
+    method: stockoutWindow?.method || "none",
+    evidenceConfidence: stockoutWindow?.confidence || "none",
+    snapshotWeeks: stockoutWindow?.snapshotWeeks || 0,
+    proxyWeeks: stockoutWindow?.proxyWeeks || 0,
+    evidenceStartWeek: stockoutWindow?.evidenceStartWeek || null,
+    evidenceEndWeek: stockoutWindow?.evidenceEndWeek || null
   };
 }
 
@@ -373,6 +468,62 @@ async function salesFactsForPolicies(policies = []) {
   return result.rows;
 }
 
+export async function loadSmartScmInventoryWeekEvidence(policies = [], completedThrough = null) {
+  if (!policies.length || !completedThrough) return new Map();
+  const itemIds = [...new Set(policies.map((policy) => Number(policy.item_id)).filter(Number.isInteger))];
+  const endWeek = weekKey(completedThrough);
+  const startWeek = shiftedWeek(endWeek, -51);
+  const result = await query(
+    `WITH daily_ranked AS (
+       SELECT snapshot.item_id,
+              snapshot.location_id,
+              (sync_run.observed_at AT TIME ZONE 'America/Toronto')::date AS observation_day,
+              date_trunc('week', sync_run.observed_at AT TIME ZONE 'America/Toronto')::date AS week_start,
+              snapshot.quantity_available,
+              row_number() OVER (
+                PARTITION BY snapshot.item_id,
+                             snapshot.location_id,
+                             (sync_run.observed_at AT TIME ZONE 'America/Toronto')::date
+                ORDER BY sync_run.observed_at DESC, sync_run.id DESC
+              ) AS daily_rank
+         FROM scm_smart_inventory_snapshots snapshot
+         JOIN scm_smart_inventory_sync_runs sync_run ON sync_run.id = snapshot.run_id
+        WHERE sync_run.status = 'completed'
+          AND sync_run.observed_at IS NOT NULL
+          AND snapshot.item_id = ANY($1::bigint[])
+          AND (sync_run.observed_at AT TIME ZONE 'America/Toronto')::date >= $2::date
+          AND (sync_run.observed_at AT TIME ZONE 'America/Toronto')::date < ($3::date + 7)
+     ), daily AS (
+       SELECT item_id, location_id, week_start, quantity_available
+         FROM daily_ranked
+        WHERE daily_rank = 1
+     )
+     SELECT item_id,
+            location_id,
+            week_start::text,
+            COUNT(*)::int AS observed_days,
+            COUNT(*) FILTER (WHERE quantity_available > 0)::int AS available_days
+       FROM daily
+      GROUP BY item_id, location_id, week_start
+      ORDER BY item_id, location_id, week_start`,
+    [itemIds, startWeek, endWeek]
+  );
+  const evidenceByPolicy = new Map();
+  for (const row of result.rows) {
+    const key = `${row.item_id}:${row.location_id}`;
+    if (!evidenceByPolicy.has(key)) evidenceByPolicy.set(key, new Map());
+    const evidence = {
+      observedDays: Number(row.observed_days || 0),
+      availableDays: Number(row.available_days || 0)
+    };
+    evidenceByPolicy.get(key).set(String(row.week_start).slice(0, 10), {
+      ...evidence,
+      status: smartScmInventoryWeekStatus(evidence)
+    });
+  }
+  return evidenceByPolicy;
+}
+
 function blendEvidence(observed, prior, samples, strength) {
   if (!(observed > EPSILON)) return Math.max(0, number(prior));
   if (!(prior > EPSILON)) return Math.max(0, number(observed));
@@ -506,6 +657,8 @@ async function insertForecastRows(rows = []) {
     "lead_time_p50", "lead_time_p75", "lead_time_p90", "lead_time_p95", "wape", "bias",
     "formula_weekly_demand", "formula_weekly_sd", "formula_stockout", "formula_window_weeks",
     "current_available_pallets",
+    "stockout_demand_method", "stockout_demand_confidence", "stockout_snapshot_weeks", "stockout_proxy_weeks",
+    "stockout_evidence_start_week", "stockout_evidence_end_week", "demand_data_cutoff",
     "representative_order_pallets", "coverage_order_count", "coverage_floor_pallets", "coverage_source",
     "coverage_local_samples", "coverage_donor_samples", "zero_demand_coverage_applied",
     "coverage_capacity_shortfall",
@@ -542,6 +695,13 @@ function publicForecast(row, settings = {}) {
     formulaStockout: Boolean(row.formula_stockout),
     formulaWindowWeeks: Number(row.formula_window_weeks || 0),
     currentAvailablePallets: number(row.current_available_pallets),
+    stockoutDemandMethod: row.stockout_demand_method || "none",
+    stockoutDemandConfidence: row.stockout_demand_confidence || "none",
+    stockoutSnapshotWeeks: Number(row.stockout_snapshot_weeks || 0),
+    stockoutProxyWeeks: Number(row.stockout_proxy_weeks || 0),
+    stockoutEvidenceStartWeek: row.stockout_evidence_start_week || null,
+    stockoutEvidenceEndWeek: row.stockout_evidence_end_week || null,
+    demandDataCutoff: row.demand_data_cutoff || null,
     representativeOrderPallets: number(row.representative_order_pallets),
     coverageOrderCount: Number(row.coverage_order_count || 0),
     coverageFloorPallets: number(row.coverage_floor_pallets),
@@ -610,18 +770,19 @@ export async function runSmartScmForecast({ triggerSource = "manual", operatorId
       factsByKey.get(key).push({ ...fact, pallet_quantity: number(fact.quantity) / toPlt });
     }
     const completedThrough = latestCompletedWeek(dataCutoff);
-    const coverageByKey = coverageOrderEvidence(policies, facts, completedThrough, settings);
+    const [coverageByKey, inventoryEvidenceByKey] = await Promise.all([
+      Promise.resolve(coverageOrderEvidence(policies, facts, completedThrough, settings)),
+      loadSmartScmInventoryWeekEvidence(policies, completedThrough)
+    ]);
     const formulaWeeks = wholeWeeks(settings.formula_average_weeks, 6);
     const records = policies.map((policy) => {
       const key = `${policy.item_id}:${policy.location_id}`;
-      const timeline = weeklyTimeline(factsByKey.get(key) || [], completedThrough);
-      const recentTimeline = weeklyTimeline(factsByKey.get(key) || [], completedThrough, true);
+      const timeline = smartScmWeeklyTimeline(factsByKey.get(key) || [], completedThrough);
       return {
         policy,
         key,
         dates: timeline.dates,
         series: timeline.values,
-        recentSeries: recentTimeline.values,
         baseline: formulaAverageForecast(timeline.values, formulaWeeks)
       };
     });
@@ -642,20 +803,29 @@ export async function runSmartScmForecast({ triggerSource = "manual", operatorId
       stockoutBenchmarks: 0,
       zeroDemandCoverageCandidates: 0,
       zeroDemandCoverageApplied: 0,
-      borrowedCoverageApplied: 0
+      borrowedCoverageApplied: 0,
+      stockoutSnapshotEvidence: 0,
+      stockoutMixedEvidence: 0,
+      stockoutProxyEvidence: 0,
+      stockoutNoEvidence: 0,
+      stockoutLowConfidence: 0
     };
     let baselineWapeSum = 0;
     let selectedWapeSum = 0;
     let scored = 0;
     for (const record of records) {
-      const { policy, series, recentSeries, dates } = record;
+      const { policy, series, dates } = record;
       const groupKey = `${policy.yard_code}:${String(policy.series || policy.vendor || "all").toLowerCase()}`;
       const groupMedian = median(groupedBaselines.get(groupKey) || []);
       const targetDate = dateAfterLastWeek(dates);
       const profile = seasonalProfile(dates, series);
-      const legacyFormulaEvidence = formulaDemandEvidence(policy, series, settings);
-      const recentFormulaEvidence = formulaDemandEvidence(policy, recentSeries, settings);
-      const formulaEvidence = recentFormulaEvidence.demand <= EPSILON ? recentFormulaEvidence : legacyFormulaEvidence;
+      const formulaEvidence = smartScmFormulaDemandEvidence(
+        policy,
+        { dates, values: series },
+        settings,
+        inventoryEvidenceByKey.get(record.key) || new Map(),
+        completedThrough
+      );
       const coverage = coverageByKey.get(record.key) || {
         representativeOrderPallets: 0,
         coverageOrderCount: 0,
@@ -719,6 +889,13 @@ export async function runSmartScmForecast({ triggerSource = "manual", operatorId
         formula_stockout: formulaEvidence.stockout,
         formula_window_weeks: formulaEvidence.windowWeeks,
         current_available_pallets: round(formulaEvidence.availablePallets),
+        stockout_demand_method: formulaEvidence.method,
+        stockout_demand_confidence: formulaEvidence.evidenceConfidence,
+        stockout_snapshot_weeks: formulaEvidence.snapshotWeeks,
+        stockout_proxy_weeks: formulaEvidence.proxyWeeks,
+        stockout_evidence_start_week: formulaEvidence.evidenceStartWeek,
+        stockout_evidence_end_week: formulaEvidence.evidenceEndWeek,
+        demand_data_cutoff: dataCutoff,
         representative_order_pallets: coverage.representativeOrderPallets,
         coverage_order_count: coverage.coverageOrderCount,
         coverage_floor_pallets: coverage.coverageFloorPallets,
@@ -729,10 +906,14 @@ export async function runSmartScmForecast({ triggerSource = "manual", operatorId
         coverage_capacity_shortfall: coverage.coverageCapacityShortfall,
         eligible_for_promotion: eligible,
         drivers: [
-          { label: formulaEvidence.stockout ? `Stockout peak (${formulaEvidence.windowWeeks} completed weeks)` : `Recent average (${formulaEvidence.windowWeeks} completed weeks)`, value: round(formulaEvidence.demand) },
+          { label: formulaEvidence.stockout ? `Stockout eligible-week average (up to ${formulaEvidence.windowWeeks} weeks)` : `Recent average (${formulaEvidence.windowWeeks} completed weeks)`, value: round(formulaEvidence.demand) },
           { label: "Formula weekly standard deviation", value: round(formulaEvidence.standardDeviation) },
           { label: "Current available pallets", value: round(formulaEvidence.availablePallets) },
-          { label: "Corrected recent-demand gate", value: round(recentFormulaEvidence.demand) },
+          { label: "Stockout demand evidence", value: formulaEvidence.method },
+          { label: "Stockout evidence confidence", value: formulaEvidence.evidenceConfidence },
+          { label: "Stockout snapshot / proxy weeks", value: `${formulaEvidence.snapshotWeeks} / ${formulaEvidence.proxyWeeks}` },
+          { label: "Stockout evidence range", value: formulaEvidence.evidenceStartWeek && formulaEvidence.evidenceEndWeek ? `${formulaEvidence.evidenceStartWeek} to ${formulaEvidence.evidenceEndWeek}` : "None" },
+          { label: "Sales data cutoff", value: dataCutoff || "None" },
           { label: `Representative order P${Math.round(number(settings.coverage_order_percentile, 0.5) * 100)}`, value: coverage.representativeOrderPallets },
           { label: "Zero-demand order coverage", value: coverage.coverageOrderCount },
           { label: "Zero-demand ROP floor", value: coverage.coverageFloorPallets },
@@ -749,7 +930,14 @@ export async function runSmartScmForecast({ triggerSource = "manual", operatorId
       });
       summary.forecasts += 1;
       summary[`${confidence}Confidence`] += 1;
-      if (formulaEvidence.stockout) summary.stockoutBenchmarks += 1;
+      if (formulaEvidence.stockout) {
+        summary.stockoutBenchmarks += 1;
+        if (formulaEvidence.method === "snapshot") summary.stockoutSnapshotEvidence += 1;
+        else if (formulaEvidence.method === "mixed") summary.stockoutMixedEvidence += 1;
+        else if (formulaEvidence.method === "positive_sales_proxy") summary.stockoutProxyEvidence += 1;
+        else summary.stockoutNoEvidence += 1;
+        if (formulaEvidence.evidenceConfidence === "low") summary.stockoutLowConfidence += 1;
+      }
       if (coverageCandidate) summary.zeroDemandCoverageCandidates += 1;
       if (coverageApplied) summary.zeroDemandCoverageApplied += 1;
       if (coverageApplied && coverage.coverageLocalSamples < boundedInteger(settings.coverage_prior_strength_orders, 8, 1, 100)) summary.borrowedCoverageApplied += 1;

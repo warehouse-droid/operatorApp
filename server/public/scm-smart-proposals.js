@@ -1,12 +1,13 @@
 const SMART_PROPOSAL_COLUMN_PREFERENCES_KEY = "mbbs.smartScm.proposalColumns.v1";
 
 function smartLoadProposalColumnPreferences() {
-  const defaults = { inventory: true, decisionEvidence: true };
+  const defaults = { compact: true, inventory: true, decisionEvidence: true };
   try {
     const saved = globalThis.localStorage?.getItem(SMART_PROPOSAL_COLUMN_PREFERENCES_KEY);
     if (!saved) return defaults;
     const parsed = JSON.parse(saved);
     return {
+      compact: typeof parsed?.compact === "boolean" ? parsed.compact : defaults.compact,
       inventory: typeof parsed?.inventory === "boolean" ? parsed.inventory : defaults.inventory,
       decisionEvidence: typeof parsed?.decisionEvidence === "boolean" ? parsed.decisionEvidence : defaults.decisionEvidence
     };
@@ -20,6 +21,7 @@ function smartSaveProposalColumnPreferences() {
     const storage = globalThis.localStorage;
     if (!storage) return false;
     storage.setItem(SMART_PROPOSAL_COLUMN_PREFERENCES_KEY, JSON.stringify({
+      compact: smartState.planCompact,
       inventory: smartState.planShowInventory,
       decisionEvidence: smartState.planShowDecisionEvidence
     }));
@@ -31,8 +33,60 @@ function smartSaveProposalColumnPreferences() {
 }
 
 const smartInitialProposalColumns = smartLoadProposalColumnPreferences();
+if (typeof smartState.planCompact !== "boolean") smartState.planCompact = smartInitialProposalColumns.compact;
 if (typeof smartState.planShowInventory !== "boolean") smartState.planShowInventory = smartInitialProposalColumns.inventory;
 if (typeof smartState.planShowDecisionEvidence !== "boolean") smartState.planShowDecisionEvidence = smartInitialProposalColumns.decisionEvidence;
+if (typeof smartState.planVendor !== "string") smartState.planVendor = "";
+
+const SMART_URGENCY_LEVELS = ["normal", "urgent", "super_urgent", "ultimate_urgent"];
+const SMART_PROPOSAL_YARD_SEQUENCE = ["3445", "12441", "2967", "150"];
+const SMART_PROPOSAL_YARD_RANK = new Map(SMART_PROPOSAL_YARD_SEQUENCE.map((yard, index) => [yard, index]));
+
+function smartUrgencyLevel(value, urgent = false) {
+  const normalized = String(value || "").trim().toLowerCase().replaceAll("-", "_").replaceAll(" ", "_");
+  if (normalized === "normal" && urgent) return "urgent";
+  return SMART_URGENCY_LEVELS.includes(normalized) ? normalized : urgent ? "urgent" : "normal";
+}
+
+function smartUrgencyRank(level) {
+  return SMART_URGENCY_LEVELS.indexOf(smartUrgencyLevel(level));
+}
+
+function smartUrgencyLabel(level) {
+  return smartUrgencyLevel(level).split("_").map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`).join(" ");
+}
+
+function smartLineUrgencyLevel(line = {}) {
+  return smartUrgencyLevel(line.urgencyLevel ?? line.reason?.urgencyLevel, Boolean(line.urgent || line.reason?.urgent));
+}
+
+function smartProposalUrgencyLevel(proposal = {}) {
+  const explicit = smartUrgencyLevel(proposal.urgencyLevel, Boolean(proposal.urgent));
+  return (proposal.lines || []).reduce((highest, line) => {
+    const level = smartLineUrgencyLevel(line);
+    return smartUrgencyRank(level) > smartUrgencyRank(highest) ? level : highest;
+  }, explicit);
+}
+
+function smartProposalUrgencyScore(proposal = {}) {
+  if (proposal.urgencyScore !== null && proposal.urgencyScore !== undefined && proposal.urgencyScore !== ""
+    && Number.isFinite(Number(proposal.urgencyScore))) return Number(proposal.urgencyScore);
+  const highestLevel = smartProposalUrgencyLevel(proposal);
+  const candidates = (proposal.lines || [])
+    .filter((line) => smartLineUrgencyLevel(line) === highestLevel)
+    .flatMap((line) => [line.urgencyScore, line.reason?.urgencyScore])
+    .map(Number)
+    .filter(Number.isFinite);
+  return candidates.length ? Math.max(...candidates) : 0;
+}
+
+function smartNormalizedVendor(value) {
+  return String(value || "").trim().replace(/\s+/g, " ").toLocaleLowerCase();
+}
+
+function smartProposalVendor(proposal = {}) {
+  return String(proposal.vendor || proposal.sourceName || "").trim().replace(/\s+/g, " ");
+}
 
 function smartReasonNumber(reason, key) {
   const value = reason?.[key];
@@ -56,6 +110,18 @@ function smartProposalStops(proposal) {
       return list;
     }, []);
   return stops;
+}
+
+function smartProposalYardCode(value) {
+  const match = String(value || "").match(/(?:^|\D)(3445|12441|2967|150)(?:\D|$)/);
+  return match?.[1] || "";
+}
+
+function smartProposalDestinationPriority(proposal = {}) {
+  const ranks = smartProposalStops(proposal)
+    .map((stop) => SMART_PROPOSAL_YARD_RANK.get(smartProposalYardCode(stop.name)))
+    .filter(Number.isInteger);
+  return ranks.length ? Math.min(...ranks) : SMART_PROPOSAL_YARD_SEQUENCE.length;
 }
 
 function smartProposalRoute(proposal) {
@@ -264,12 +330,24 @@ function smartProposalAvailability(proposal, line) {
   if (proposal.proposalType === "TO") {
     const sourceName = proposal.sourceName || "Source";
     const sourceAvailable = smartReasonNumber(reason, "sourceAvailablePallets");
+    if (smartState.planCompact) {
+      return `<div class="smart-availability-summary smart-availability-inline">
+        <span><small>${smartEscape(sourceName)} source</small><strong>${smartOptionalNumber(sourceAvailable, 2)} PLT</strong></span>
+        <span><small>${smartEscape(destinationName)} destination</small><strong>${smartOptionalNumber(destinationAvailable, 2)} PLT</strong></span>
+      </div>`;
+    }
     return `<div class="smart-availability-summary">
       <span><small>${smartEscape(sourceName)} source available</small><strong>${smartOptionalNumber(sourceAvailable, 2)} PLT</strong></span>
       <span><small>${smartEscape(destinationName)} destination available</small><strong>${smartOptionalNumber(destinationAvailable, 2)} PLT</strong></span>
     </div>`;
   }
   const expected = smartProposalExpectedInventoryPallets(line);
+  if (smartState.planCompact) {
+    return `<div class="smart-availability-summary smart-availability-inline">
+      <span><small>${smartEscape(destinationName)} available</small><strong>${smartOptionalNumber(destinationAvailable, 2)} PLT</strong></span>
+      <span><small>Expected</small><strong>${smartOptionalNumber(expected, 2)} PLT</strong></span>
+    </div>`;
+  }
   return `<div class="smart-availability-summary">
     <span><small>${smartEscape(destinationName)} available</small><strong>${smartOptionalNumber(destinationAvailable, 2)} PLT</strong></span>
     <span><small>Expected inventory · AA + OO − BO</small><strong>${smartOptionalNumber(expected, 2)} PLT</strong></span>
@@ -313,22 +391,46 @@ function smartProposalDecisionEvidence(line) {
     labels.push(`<span>Imported vendor available: ${smartNumber(reason.importedVendorAvailablePallets, 2)} PLT</span>`);
   }
   if (reason.zeroDemandCoverageApplied && !destinationPolicyInvalid) labels.push(`<span>Coverage floor: ${smartNumber(reason.coverageFloorPallets, 2)} PLT · ${smartEscape(reason.coverageSource || "unknown")}</span>`);
-  if (reason.urgent) labels.push("<span>Urgent</span>");
+  const stockoutDemandMethod = reason.stockoutDemandMethod || reason.demandEvidenceMethod || reason.formulaDemandMethod;
+  if (stockoutDemandMethod && stockoutDemandMethod !== "none" && !destinationPolicyInvalid) {
+    const methodLabels = {
+      snapshot: "inventory snapshots",
+      mixed: "snapshots + positive-sales proxy",
+      positive_sales_proxy: "positive-sales proxy"
+    };
+    const snapshotWeeks = smartReasonNumber(reason, "stockoutSnapshotWeeks") ?? smartReasonNumber(reason, "snapshotWeekCount");
+    const proxyWeeks = smartReasonNumber(reason, "stockoutProxyWeeks") ?? smartReasonNumber(reason, "proxyWeekCount");
+    const explicitEligibleWeeks = smartReasonNumber(reason, "stockoutEligibleWeeks") ?? smartReasonNumber(reason, "eligibleWeekCount");
+    const eligibleWeeks = explicitEligibleWeeks ?? (snapshotWeeks !== null || proxyWeeks !== null ? (snapshotWeeks || 0) + (proxyWeeks || 0) : null);
+    const historyStart = reason.stockoutEvidenceStartWeek || reason.stockoutHistoryStart || reason.historyStart;
+    const historyEnd = reason.stockoutEvidenceEndWeek || reason.stockoutHistoryEnd || reason.historyEnd;
+    const confidence = reason.stockoutDemandConfidence;
+    labels.push(`<span>Stockout demand: ${smartEscape(methodLabels[stockoutDemandMethod] || String(stockoutDemandMethod).replaceAll("_", " "))}${confidence ? ` · ${smartEscape(confidence)} confidence` : ""}${eligibleWeeks !== null ? ` · ${smartNumber(eligibleWeeks, 0)} eligible weeks` : ""}${snapshotWeeks !== null ? ` · ${smartNumber(snapshotWeeks, 0)} snapshot` : ""}${proxyWeeks !== null ? ` · ${smartNumber(proxyWeeks, 0)} proxy` : ""}${historyStart || historyEnd ? ` · ${smartEscape(historyStart || "?")} to ${smartEscape(historyEnd || "?")}` : ""}${reason.demandDataCutoff ? ` · sales cutoff ${smartEscape(reason.demandDataCutoff)}` : ""}</span>`);
+  }
+  const urgencyLevel = smartLineUrgencyLevel(line);
+  if (urgencyLevel !== "normal") {
+    const urgencyScore = smartReasonNumber(line, "urgencyScore") ?? smartReasonNumber(reason, "urgencyScore");
+    labels.push(`<span>Urgency: ${smartEscape(smartUrgencyLabel(urgencyLevel))}${urgencyScore !== null ? ` · score ${smartNumber(urgencyScore, 1)}` : ""}</span>`);
+  }
   if (reason.provisional) labels.push("<span>Provisional</span>");
   return `<div class="smart-reason">${labels.join("")}</div>`;
 }
 
 function smartProposalColumnControls() {
-  return `<fieldset class="smart-proposal-column-controls">
+  return `<div class="smart-proposal-view-controls" role="group" aria-label="Proposal table view">
+    <button class="smart-button ${smartState.planCompact ? "active" : ""}" data-smart-action="proposal-view" data-smart-proposal-view="compact" type="button" aria-pressed="${smartState.planCompact}">Compact</button>
+    <button class="smart-button ${smartState.planCompact ? "" : "active"}" data-smart-action="proposal-view" data-smart-proposal-view="detailed" type="button" aria-pressed="${!smartState.planCompact}">Detailed</button>
+  </div>${smartState.planCompact ? "" : `<fieldset class="smart-proposal-column-controls">
     <legend>Show columns</legend>
-    <label><input data-smart-plan-detail="inventory" type="checkbox" ${smartState.planShowInventory ? "checked" : ""} /><span>Inventory calculation</span></label>
-    <label><input data-smart-plan-detail="decision-evidence" type="checkbox" ${smartState.planShowDecisionEvidence ? "checked" : ""} /><span>Decision evidence</span></label>
-  </fieldset>`;
+    <label><input data-smart-plan-detail="inventory" type="checkbox" ${smartState.planShowInventory ? "checked" : ""} data-smart-focus-key="proposal-view:inventory-column" /><span>Inventory calculation</span></label>
+    <label><input data-smart-plan-detail="decision-evidence" type="checkbox" ${smartState.planShowDecisionEvidence ? "checked" : ""} data-smart-focus-key="proposal-view:decision-evidence-column" /><span>Decision evidence</span></label>
+  </fieldset>`}`;
 }
 
 function smartProposalDetailClassName() {
+  if (smartState.planCompact) return " smart-proposal-lines-compact";
   const hiddenCount = Number(!smartState.planShowInventory) + Number(!smartState.planShowDecisionEvidence);
-  if (hiddenCount === 2) return " smart-proposal-lines-compact";
+  if (hiddenCount === 2) return " smart-proposal-lines-details-hidden";
   if (hiddenCount === 1) return " smart-proposal-lines-one-detail-hidden";
   return "";
 }
@@ -336,15 +438,17 @@ function smartProposalDetailClassName() {
 function smartApplyProposalColumnVisibility(root = document) {
   if (!root || typeof root.querySelectorAll !== "function") return;
   const visibility = {
-    inventory: smartState.planShowInventory,
-    "decision-evidence": smartState.planShowDecisionEvidence
+    inventory: !smartState.planCompact && smartState.planShowInventory,
+    "decision-evidence": !smartState.planCompact && smartState.planShowDecisionEvidence
   };
   Object.entries(visibility).forEach(([column, visible]) => {
     root.querySelectorAll(`[data-smart-plan-column="${column}"]`).forEach((cell) => { cell.hidden = !visible; });
   });
   root.querySelectorAll(".smart-proposal-lines").forEach((wrapper) => {
-    wrapper.classList.toggle("smart-proposal-lines-one-detail-hidden", Number(!smartState.planShowInventory) + Number(!smartState.planShowDecisionEvidence) === 1);
-    wrapper.classList.toggle("smart-proposal-lines-compact", !smartState.planShowInventory && !smartState.planShowDecisionEvidence);
+    const hiddenCount = Number(!smartState.planShowInventory) + Number(!smartState.planShowDecisionEvidence);
+    wrapper.classList.toggle("smart-proposal-lines-one-detail-hidden", !smartState.planCompact && hiddenCount === 1);
+    wrapper.classList.toggle("smart-proposal-lines-details-hidden", !smartState.planCompact && hiddenCount === 2);
+    wrapper.classList.toggle("smart-proposal-lines-compact", smartState.planCompact);
   });
 }
 
@@ -354,6 +458,8 @@ smartFilteredProposals = function smartFilteredProposalsV2() {
     if (smartState.planType && proposal.proposalType !== smartState.planType) return false;
     if (smartState.planStatus && proposal.status !== smartState.planStatus) return false;
     if (smartState.planSource && (proposal.sourceName || proposal.vendor || "") !== smartState.planSource) return false;
+    if (smartState.planVendor && (proposal.proposalType !== "PO"
+      || smartNormalizedVendor(smartProposalVendor(proposal)) !== smartState.planVendor)) return false;
     if (smartState.planDestination && !smartProposalStops(proposal).some((stop) => stop.name === smartState.planDestination)) return false;
     if (!search) return true;
     return [smartProposalRoute(proposal), proposal.vendor, proposal.plant, proposal.memo,
@@ -366,18 +472,26 @@ smartFilteredProposals = function smartFilteredProposalsV2() {
   const secondary = smartState.planSort === "source"
     ? (proposal) => smartProposalStops(proposal).map((stop) => stop.name).join("|")
     : (proposal) => proposal.sourceName || proposal.vendor || "";
-  return proposals.sort((left, right) => primary(left).localeCompare(primary(right), undefined, { numeric: true })
+  return proposals.sort((left, right) => smartUrgencyRank(smartProposalUrgencyLevel(right)) - smartUrgencyRank(smartProposalUrgencyLevel(left))
+    || smartProposalDestinationPriority(left) - smartProposalDestinationPriority(right)
+    || smartProposalUrgencyScore(right) - smartProposalUrgencyScore(left)
+    || primary(left).localeCompare(primary(right), undefined, { numeric: true })
     || secondary(left).localeCompare(secondary(right), undefined, { numeric: true }) || left.id - right.id);
 };
 
 function smartProposalLineRow(proposal, line, editable) {
-  const inventoryHidden = smartState.planShowInventory ? "" : " hidden";
-  const evidenceHidden = smartState.planShowDecisionEvidence ? "" : " hidden";
-  return `<tr data-smart-proposal-line="${line.id}">
-    <td><strong>${smartEscape(line.itemName)}</strong><div class="smart-help">ID ${line.itemId} · ${smartEscape(line.itemDescription || line.unit || "")}</div><div class="smart-line-flags">${line.urgent ? smartPill("attention", "Urgent") : ""}${line.provisional ? smartPill("held", "Provisional") : ""}${line.reason?.gormleyHubRedirected ? smartPill("held", `Gormley hub for ${smartEscape((line.reason.gormleyOriginalDestinations || [line.reason.actualDestinationYard]).filter(Boolean).join(", "))}`) : ""}${Number(line.reason?.groupingDeferredPallets) > 0 ? smartPill("held", `${smartNumber(line.reason.groupingDeferredPallets, 0)} PLT deferred`) : ""}${line.manualPlanningRequired ? smartPill("attention", "Missing conversion / weight") : ""}</div></td>
-    <td>${editable && proposal.proposalType === "PO" ? `<select class="smart-line-destination-select" data-smart-proposal-destination aria-label="Line destination yard">${smartProposalYardOptions(line.destinationLocationId || proposal.destinationLocationId)}</select>` : `<strong>${smartEscape(line.destinationName || proposal.destinationName)}</strong>`}</td>
+  const inventoryHidden = !smartState.planCompact && smartState.planShowInventory ? "" : " hidden";
+  const evidenceHidden = !smartState.planCompact && smartState.planShowDecisionEvidence ? "" : " hidden";
+  const urgencyLevel = smartLineUrgencyLevel(line);
+  const urgencyLabel = smartUrgencyLabel(urgencyLevel);
+  const itemContent = smartState.planCompact
+    ? `<strong>${smartEscape(line.itemName)}</strong><span class="smart-sr-only">${smartEscape(urgencyLabel)} urgency.</span>`
+    : `<strong>${smartEscape(line.itemName)}</strong><div class="smart-help">ID ${line.itemId} · ${smartEscape(line.itemDescription || line.unit || "")}</div><div class="smart-line-flags">${urgencyLevel !== "normal" ? smartPill("attention", urgencyLabel) : ""}${line.provisional ? smartPill("held", "Provisional") : ""}${line.reason?.gormleyHubRedirected ? smartPill("held", `Gormley hub for ${smartEscape((line.reason.gormleyOriginalDestinations || [line.reason.actualDestinationYard]).filter(Boolean).join(", "))}`) : ""}${Number(line.reason?.groupingDeferredPallets) > 0 ? smartPill("held", `${smartNumber(line.reason.groupingDeferredPallets, 0)} PLT deferred`) : ""}${line.manualPlanningRequired ? smartPill("attention", "Missing conversion / weight") : ""}</div>`;
+  return `<tr class="smart-urgency-${urgencyLevel}" data-smart-urgency="${urgencyLevel}" data-smart-proposal-line="${line.id}" aria-label="${smartEscape(line.itemName)}. ${smartEscape(urgencyLabel)} urgency.">
+    <td>${itemContent}</td>
+    <td>${editable && proposal.proposalType === "PO" ? `<select class="smart-line-destination-select" data-smart-proposal-destination data-smart-focus-key="proposal:${smartEscape(proposal.id)}:line:${smartEscape(line.id)}:destination" aria-label="Line destination yard">${smartProposalYardOptions(line.destinationLocationId || proposal.destinationLocationId)}</select>` : `<strong>${smartEscape(line.destinationName || proposal.destinationName)}</strong>`}</td>
     <td class="numeric">${smartNumber(line.requiredPallets, 2)} PLT</td>
-    <td>${editable ? `<div class="smart-line-quantity"><input data-smart-proposal-pallets type="number" min="1" step="1" value="${smartEscape(Math.max(1, Math.round(line.proposedPallets)))}" /><span>PLT</span><button class="smart-button" data-smart-action="save-proposal-line" data-proposal-id="${proposal.id}" data-line-id="${line.id}" type="button">Save</button>${Number.isInteger(Number(line.proposedPallets)) && Number(line.proposedPallets) > 0 ? `<button class="smart-button" data-smart-action="split-proposal-line" data-proposal-id="${proposal.id}" data-line-id="${line.id}" data-current-pallets="${line.proposedPallets}" type="button">Split to load</button>` : ""}<button class="smart-button danger" data-smart-action="remove-proposal-line" data-proposal-id="${proposal.id}" data-line-id="${line.id}" type="button">Remove</button></div>` : `<strong>${smartNumber(line.proposedPallets, 0)} PLT</strong>`}</td>
+    <td>${editable ? `<div class="smart-line-quantity"><input data-smart-proposal-pallets data-smart-focus-key="proposal:${smartEscape(proposal.id)}:line:${smartEscape(line.id)}:pallets" type="number" min="1" step="1" value="${smartEscape(Math.max(1, Math.round(line.proposedPallets)))}" /><span>PLT</span><button class="smart-button" data-smart-action="save-proposal-line" data-proposal-id="${proposal.id}" data-line-id="${line.id}" type="button">Save</button>${Number.isInteger(Number(line.proposedPallets)) && Number(line.proposedPallets) > 0 ? `<button class="smart-button" data-smart-action="split-proposal-line" data-proposal-id="${proposal.id}" data-line-id="${line.id}" data-current-pallets="${line.proposedPallets}" type="button">Split to load</button>` : ""}<button class="smart-button danger" data-smart-action="remove-proposal-line" data-proposal-id="${proposal.id}" data-line-id="${line.id}" type="button">Remove</button></div>` : `<strong>${smartNumber(line.proposedPallets, 0)} PLT</strong>`}</td>
     <td class="numeric">${smartNumber(line.salesQuantity, 3)} ${smartEscape(line.unit || "UOM")}</td>
     <td class="numeric">${smartNumber(line.lineWeightLbs, 0)} lb</td>
     <td data-smart-plan-column="availability">${smartProposalAvailability(proposal, line)}</td>
@@ -387,18 +501,20 @@ function smartProposalLineRow(proposal, line, editable) {
 }
 
 function smartPhysicalPalletLineRow(proposal, line, editable) {
-  const inventoryHidden = smartState.planShowInventory ? "" : " hidden";
-  const evidenceHidden = smartState.planShowDecisionEvidence ? "" : " hidden";
+  const inventoryHidden = !smartState.planCompact && smartState.planShowInventory ? "" : " hidden";
+  const evidenceHidden = !smartState.planCompact && smartState.planShowDecisionEvidence ? "" : " hidden";
   const quantity = Number(line.quantity ?? line.salesQuantity ?? 0);
   const automaticQuantity = Number(line.automaticQuantity ?? quantity);
   const unit = line.unit || "EACH";
   const itemWeight = Number(line.itemWeightLbs || 0);
   const lineWeight = Number(line.lineWeightLbs || 0);
   return `<tr class="smart-physical-pallet-line" data-smart-physical-pallet-line="${smartEscape(line.id)}">
-    <td><strong>${smartEscape(line.itemName || "PALLET")}</strong> ${smartPill("reviewed", "Official PALLET")} ${line.overridden ? smartPill("attention", "Manual override") : smartPill("reviewed", "Automatic")}<div class="smart-help">${line.itemId ? `ID ${smartEscape(line.itemId)} · ` : ""}Official ancillary item; saved separately from material PLT</div></td>
+    <td>${smartState.planCompact
+      ? `<strong>${smartEscape(line.itemName || "PALLET")}</strong><span class="smart-sr-only">Ancillary packaging item.</span>`
+      : `<strong>${smartEscape(line.itemName || "PALLET")}</strong> ${smartPill("reviewed", "Official PALLET")} ${line.overridden ? smartPill("attention", "Manual override") : smartPill("reviewed", "Automatic")}<div class="smart-help">${line.itemId ? `ID ${smartEscape(line.itemId)} · ` : ""}Official ancillary item; saved separately from material PLT</div>`}</td>
     <td><strong>${smartEscape(line.destinationName || "—")}</strong></td>
     <td class="numeric">${smartNumber(automaticQuantity, 2)} ${smartEscape(unit)}<div class="smart-help">Automatic from material PLT</div></td>
-    <td>${editable ? `<div class="smart-line-quantity"><input data-smart-pallet-quantity type="number" min="0" step="0.01" value="${smartEscape(quantity)}" aria-label="Official PALLET quantity for ${smartEscape(line.destinationName || "destination")}" /><span>${smartEscape(unit)}</span><button class="smart-button" data-smart-action="save-pallet-line" data-proposal-id="${proposal.id}" data-destination-location-id="${line.destinationLocationId}" type="button">Save</button>${line.overridden ? `<button class="smart-button" data-smart-action="reset-pallet-line" data-proposal-id="${proposal.id}" data-destination-location-id="${line.destinationLocationId}" type="button">Reset auto</button>` : ""}</div>` : `<strong>${smartNumber(quantity, 2)} ${smartEscape(unit)}</strong><div class="smart-help">${line.overridden ? "Manual override" : "Automatic"}</div>`}</td>
+    <td>${editable ? `<div class="smart-line-quantity"><input data-smart-pallet-quantity data-smart-focus-key="proposal:${smartEscape(proposal.id)}:pallet-destination:${smartEscape(line.destinationLocationId)}:quantity" type="number" min="0" step="0.01" value="${smartEscape(quantity)}" aria-label="Official PALLET quantity for ${smartEscape(line.destinationName || "destination")}" /><span>${smartEscape(unit)}</span><button class="smart-button" data-smart-action="save-pallet-line" data-proposal-id="${proposal.id}" data-destination-location-id="${line.destinationLocationId}" type="button">Save</button>${line.overridden ? `<button class="smart-button" data-smart-action="reset-pallet-line" data-proposal-id="${proposal.id}" data-destination-location-id="${line.destinationLocationId}" type="button">Reset auto</button>` : ""}</div>` : `<strong>${smartNumber(quantity, 2)} ${smartEscape(unit)}</strong><div class="smart-help">${line.overridden ? "Manual override" : "Automatic"}</div>`}</td>
     <td class="numeric">${smartNumber(quantity, 2)} ${smartEscape(unit)}</td>
     <td class="numeric">${itemWeight > 0 ? `<strong>${smartNumber(lineWeight, 0)} lb</strong><div class="smart-help">${smartNumber(itemWeight, 0)} lb / ${smartEscape(unit)} · NetSuite</div>` : `<span class="smart-help">NetSuite weight unavailable</span>`}</td>
     <td data-smart-plan-column="availability"><span class="smart-help">Ancillary packaging item</span></td>
@@ -410,15 +526,22 @@ function smartPhysicalPalletLineRow(proposal, line, editable) {
 function smartProposalLineEditor(proposal) {
   if (!smartProposalEditable(proposal)) return "";
   return `<div class="smart-proposal-line-editor" data-smart-line-editor="${proposal.id}">
-    <strong>Add order line</strong>
-    ${proposal.proposalType === "PO" ? `<select data-smart-line-destination aria-label="Destination yard">${smartProposalYardOptions(proposal.destinationLocationId)}</select>` : `<span class="smart-help">Destination ${smartEscape(proposal.destinationName)}</span>`}
-    <input data-smart-line-search="${proposal.id}" type="search" placeholder="Search item ID, name, or description" autocomplete="off" />
-    <div class="smart-proposal-item-results" data-smart-line-results="${proposal.id}"><span class="smart-help">Enter an item to add.</span></div>
+    <div class="smart-proposal-line-editor-controls">
+      <strong>Add line</strong>
+      ${proposal.proposalType === "PO"
+        ? `<label class="smart-proposal-line-destination"><span>To</span><select data-smart-line-destination data-smart-focus-key="proposal:${smartEscape(proposal.id)}:add-line:destination" aria-label="Destination yard">${smartProposalYardOptions(proposal.destinationLocationId)}</select></label>`
+        : `<span class="smart-proposal-line-destination smart-proposal-line-destination-static"><span>To</span><strong>${smartEscape(proposal.destinationName)}</strong></span>`}
+      <input data-smart-line-search="${proposal.id}" data-smart-focus-key="proposal:${smartEscape(proposal.id)}:add-line:search" type="search" placeholder="Search item ID, name, or description" aria-label="Search item to add" autocomplete="off" />
+    </div>
+    <div class="smart-proposal-item-results" data-smart-line-results="${proposal.id}" aria-live="polite"></div>
   </div>`;
 }
 
 smartProposalCard = function smartProposalCardV2(proposal) {
   const isPo = proposal.proposalType === "PO";
+  const overCapacity = Number(proposal.utilization) > 1.000001;
+  const urgencyLevel = smartProposalUrgencyLevel(proposal);
+  const urgencyLabel = smartUrgencyLabel(urgencyLevel);
   const executionRef = isPo ? proposal.netsuitePurchaseOrderRef : proposal.netsuiteTransferOrderRef;
   const hasExecutionReference = Boolean(isPo
     ? (proposal.netsuitePurchaseOrderId || proposal.netsuitePurchaseOrderRef)
@@ -440,18 +563,20 @@ smartProposalCard = function smartProposalCardV2(proposal) {
     actions = `<button class="smart-button ${proposal.status === "held" ? "" : "warn"}" data-smart-action="proposal-status" data-proposal-id="${proposal.id}" data-status="${proposal.status === "held" ? "reviewed" : "held"}" type="button">${proposal.status === "held" ? "Release" : "Hold"}</button><button class="smart-button danger" data-smart-action="proposal-status" data-proposal-id="${proposal.id}" data-status="cancelled" type="button">Cancel</button>`;
   }
   const selected = smartState.selectedProposalIds.has(Number(proposal.id));
-  const needsPoRecalculation = isPo && Number(proposal.utilization) > 1.000001;
+  const capacityAttention = overCapacity
+    ? smartPill("attention", isPo ? "Needs Re-Calculate" : "Over capacity · manual")
+    : "";
   const recalculatePo = editable && isPo ? `<button class="smart-button blue" data-smart-action="recalculate-po" data-proposal-id="${proposal.id}" type="button">Re-Calculate PO</button>` : "";
-  return `<article class="smart-proposal ${selected ? "selected" : ""}" data-smart-proposal="${proposal.id}">
+  return `<article class="smart-proposal ${selected ? "selected" : ""}" data-smart-proposal="${proposal.id}" data-smart-urgency="${urgencyLevel}">
     <div class="smart-proposal-head">
-      <div>${editable ? `<label class="smart-proposal-select"><input data-smart-proposal-select="${proposal.id}" type="checkbox" ${selected ? "checked" : ""} /><span>Group</span></label>` : ""}<strong>${smartEscape(proposal.proposalType)}</strong><div>${smartPill(proposal.status)}${needsPoRecalculation ? smartPill("attention", "Needs Re-Calculate") : ""}</div></div>
+      <div class="smart-proposal-identity">${editable ? `<label class="smart-proposal-select"><input data-smart-proposal-select="${proposal.id}" data-smart-focus-key="proposal:${smartEscape(proposal.id)}:group-selected" type="checkbox" ${selected ? "checked" : ""} /><span>Group</span></label>` : ""}<strong class="smart-proposal-type">${smartEscape(proposal.proposalType)}</strong><div class="smart-proposal-badges">${smartPill(proposal.status)}${urgencyLevel !== "normal" ? smartPill("attention", urgencyLabel) : ""}${capacityAttention}</div></div>
       <div class="smart-proposal-route"><strong>${smartEscape(smartProposalRoute(proposal))}</strong><span>#${proposal.id} · ${smartEscape(proposal.phase.replaceAll("_", " "))}${proposal.manuallyGrouped ? " · manually grouped" : ""}</span></div>
       <div class="smart-proposal-metric"><strong>${smartNumber(proposal.totalPallets, 0)} PLT</strong><span>Pallets</span></div>
       <div class="smart-proposal-metric"><strong>${smartNumber(proposal.totalWeightLbs, 0)} lb</strong><span>${smartPercent(proposal.utilization, 0)} truck</span></div>
       <div class="smart-proposal-metric"><strong>${executionRef ? smartEscape(executionRef) : "—"}</strong><span>${isPo ? "PO load ref" : "NetSuite TO"}</span></div>
       <div class="smart-actions">${recalculatePo}${actions}${smartCanWrite() && canConfirm ? `<button class="smart-button primary" data-smart-action="confirm-transfer" data-proposal-id="${proposal.id}" type="button">${confirmTransferLabel}</button>` : ""}${smartCanWrite() && !isPo && hasExecutionReference && proposal.status === "attention" ? `<button class="smart-button warn" data-smart-action="retry-picking-ticket" data-proposal-id="${proposal.id}" type="button">Retry picking ticket</button>` : ""}</div>
     </div>
-    <div class="smart-proposal-lines smart-table-wrap${smartProposalDetailClassName()}"><table class="smart-table"><thead><tr><th>Item</th><th>Destination</th><th class="numeric">Required</th><th>Proposed</th><th class="numeric">Sales quantity</th><th class="numeric">Line weight</th><th data-smart-plan-column="availability">Availability</th><th data-smart-plan-column="inventory"${smartState.planShowInventory ? "" : " hidden"}>Inventory calculation</th><th data-smart-plan-column="decision-evidence"${smartState.planShowDecisionEvidence ? "" : " hidden"}>Decision evidence</th></tr></thead><tbody>${proposal.lines.map((line) => smartProposalLineRow(proposal, line, editable)).join("")}${(proposal.physicalPalletLines || []).map((line) => smartPhysicalPalletLineRow(proposal, line, editable)).join("")}</tbody></table></div>
+    <div class="smart-proposal-lines smart-table-wrap${smartProposalDetailClassName()}"><table class="smart-table"><thead><tr><th>Item</th><th>Destination</th><th class="numeric">Required</th><th>Proposed</th><th class="numeric">${smartState.planCompact ? "Sales qty" : "Sales quantity"}</th><th class="numeric">${smartState.planCompact ? "Weight" : "Line weight"}</th><th data-smart-plan-column="availability">Availability</th><th data-smart-plan-column="inventory"${!smartState.planCompact && smartState.planShowInventory ? "" : " hidden"}>Inventory calculation</th><th data-smart-plan-column="decision-evidence"${!smartState.planCompact && smartState.planShowDecisionEvidence ? "" : " hidden"}>Decision evidence</th></tr></thead><tbody>${proposal.lines.map((line) => smartProposalLineRow(proposal, line, editable)).join("")}${(proposal.physicalPalletLines || []).map((line) => smartPhysicalPalletLineRow(proposal, line, editable)).join("")}</tbody></table></div>
     ${smartProposalLineEditor(proposal)}
   </article>`;
 };
@@ -460,7 +585,7 @@ function smartManualLoadItemResults(items = smartManualLoadState.items) {
   if (!items.length) return `<div class="smart-empty smart-empty-compact">Search for a planning-enabled item for the selected yard route.</div>`;
   return items.map((item) => `<div class="smart-manual-load-item" data-smart-manual-load-item="${item.itemId}">
     <div><strong>${smartEscape(item.itemName)}</strong><div class="smart-help">ID ${item.itemId} · ${smartEscape(item.vendor || item.itemDescription || item.unit || "")} · source ${smartEscape(item.sourceName || "selected yard")} · ${smartNumber(item.palletWeightLbs, 0)} lb / PLT</div></div>
-    <label><span>PLT</span><input data-smart-manual-load-pallets type="number" min="1" step="1" value="1" /></label>
+    <label><span>PLT</span><input data-smart-manual-load-pallets data-smart-focus-key="manual-load:item:${smartEscape(item.itemId)}:pallets" type="number" min="1" step="1" value="1" /></label>
     <button class="smart-button primary" data-smart-action="create-manual-load" data-item-id="${item.itemId}" type="button">Create held load</button>
   </div>`).join("");
 }
@@ -470,14 +595,14 @@ function smartManualLoadPanel(plan) {
   const isTo = smartManualLoadState.proposalType === "TO";
   const routeInvalid = isTo && Number(smartManualLoadState.sourceLocationId) === Number(smartManualLoadState.destinationLocationId);
   return `<section class="smart-manual-load-panel" aria-label="Add a manual PO or TO load">
-    <div class="smart-manual-load-head"><div><h3>Add load manually</h3><p>The initial line and its conversion define a new held load. Review it before release or vendor request.</p></div><button class="smart-button" data-smart-action="close-manual-load" type="button">Close</button></div>
+    <div class="smart-manual-load-head"><div><h3>Add load manually</h3><p>The initial line and its conversion define a new held load. Manual quantities may exceed configured truck capacity and will be flagged for review.</p></div><button class="smart-button" data-smart-action="close-manual-load" type="button">Close</button></div>
     <div class="smart-manual-load-fields">
-      <label><span>Load type</span><select data-smart-manual-load-field="proposalType"><option value="TO" ${isTo ? "selected" : ""}>Transfer order</option><option value="PO" ${isTo ? "" : "selected"}>Purchase order</option></select></label>
+      <label><span>Load type</span><select data-smart-manual-load-field="proposalType" data-smart-focus-key="manual-load:proposal-type"><option value="TO" ${isTo ? "selected" : ""}>Transfer order</option><option value="PO" ${isTo ? "" : "selected"}>Purchase order</option></select></label>
       ${isTo
-        ? `<label><span>From yard</span><select data-smart-manual-load-field="sourceLocationId">${smartProposalYardOptions(smartManualLoadState.sourceLocationId)}</select></label>`
+        ? `<label><span>From yard</span><select data-smart-manual-load-field="sourceLocationId" data-smart-focus-key="manual-load:source-location">${smartProposalYardOptions(smartManualLoadState.sourceLocationId)}</select></label>`
         : `<label><span>Vendor source</span><strong>Derived from selected item</strong></label>`}
-      <label><span>To yard</span><select data-smart-manual-load-field="destinationLocationId">${smartProposalYardOptions(smartManualLoadState.destinationLocationId)}</select></label>
-      <label class="smart-manual-load-search"><span>Initial item</span><input data-smart-manual-load-search type="search" value="${smartEscape(smartManualLoadState.search)}" placeholder="Item ID, name, or description" autocomplete="off" /></label>
+      <label><span>To yard</span><select data-smart-manual-load-field="destinationLocationId" data-smart-focus-key="manual-load:destination-location">${smartProposalYardOptions(smartManualLoadState.destinationLocationId)}</select></label>
+      <label class="smart-manual-load-search"><span>Initial item</span><input data-smart-manual-load-search data-smart-focus-key="manual-load:item-search" type="search" value="${smartEscape(smartManualLoadState.search)}" placeholder="Item ID, name, or description" autocomplete="off" /></label>
       <button class="smart-button" data-smart-action="search-manual-load-items" type="button" ${routeInvalid ? "disabled" : ""}>Search items</button>
     </div>
     ${routeInvalid ? `<div class="smart-notice error">TO source and destination yards must be different.</div>` : ""}
@@ -486,28 +611,46 @@ function smartManualLoadPanel(plan) {
   </section>`;
 }
 
+function smartUrgencyLegend() {
+  return `<div class="smart-urgency-legend" aria-label="Proposal urgency colours">
+    ${SMART_URGENCY_LEVELS.map((level) => `<span class="smart-urgency-key smart-urgency-${level}"><i aria-hidden="true"></i>${smartEscape(smartUrgencyLabel(level))}</span>`).join("")}
+  </div>`;
+}
+
 smartPlans = function smartPlansV2() {
   const plan = smartState.plan;
   const runs = smartState.data.planningRuns || [];
   const all = plan?.proposals || [];
   const proposals = smartFilteredProposals();
   const sources = [...new Set(all.map((proposal) => proposal.sourceName || proposal.vendor).filter(Boolean))].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  const vendorsByKey = new Map();
+  all.filter((proposal) => proposal.proposalType === "PO").forEach((proposal) => {
+    const vendor = smartProposalVendor(proposal);
+    const key = smartNormalizedVendor(vendor);
+    if (key && !vendorsByKey.has(key)) vendorsByKey.set(key, vendor);
+  });
+  const vendors = [...vendorsByKey.entries()].sort((left, right) => left[1].localeCompare(right[1], undefined, { numeric: true }));
   const destinations = [...new Set(all.flatMap((proposal) => smartProposalStops(proposal).map((stop) => stop.name)).filter(Boolean))].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
   const selectedCount = smartState.selectedProposalIds.size;
+  const exclusionCount = typeof smartPlanningExclusionCount === "function" ? smartPlanningExclusionCount() : 0;
+  const exclusionPanel = typeof smartPlanningExclusionPanel === "function" ? smartPlanningExclusionPanel() : "";
   return `<section class="smart-section smart-plan-section">
     <div class="smart-plan-sticky">
-    <div class="smart-section-head"><div><h2>PO / TO proposal review</h2><p>Group creates one capacity-limited truck. Split moves the selected item line into its own held load; Add load creates a new held PO or TO.</p></div><div class="smart-actions smart-plan-header-actions">${smartProposalColumnControls()}${smartCanWrite() ? `${plan?.status === "ready" ? `<button class="smart-button" data-smart-action="open-manual-load" type="button">Add load</button>` : ""}<button class="smart-button" data-smart-action="group-proposals" type="button" ${selectedCount < 2 ? "disabled" : ""}>Group selected (${selectedCount})</button><button class="smart-button primary" data-smart-action="run-plan" type="button">Build new plan</button>` : ""}</div></div>
+    <div class="smart-section-head"><div><h2>PO / TO proposal review</h2><p>Automatic packing respects configured truck capacity. Manual quantities may exceed it and will be flagged; Split moves a line into its own held load.</p></div><div class="smart-actions smart-plan-header-actions">${smartProposalColumnControls()}<button class="smart-button warn" data-smart-action="toggle-planning-exclusions" type="button">Paused items (${smartNumber(exclusionCount, 0)})</button>${smartCanWrite() ? `${plan?.status === "ready" ? `<button class="smart-button" data-smart-action="open-manual-load" type="button">Add load</button>` : ""}<button class="smart-button" data-smart-action="group-proposals" type="button" ${selectedCount < 2 ? "disabled" : ""}>Group selected (${selectedCount})</button><button class="smart-button primary" data-smart-action="run-plan" type="button">Build new plan</button>` : ""}</div></div>
     <div class="smart-toolbar smart-plan-toolbar">
       <select id="smartPlanRun"><option value="">Select a run</option>${runs.map((run) => `<option value="${run.id}" ${Number(plan?.id) === Number(run.id) ? "selected" : ""}>#${run.id} · ${smartDate(run.completedAt, true)} · r${run.revision}</option>`).join("")}</select>
       <input id="smartPlanSearch" type="search" value="${smartEscape(smartState.planSearch)}" placeholder="Item, vendor, yard, or memo" />
       <select id="smartPlanType"><option value="">PO + TO</option><option value="PO" ${smartState.planType === "PO" ? "selected" : ""}>PO only</option><option value="TO" ${smartState.planType === "TO" ? "selected" : ""}>TO only</option></select>
       <select id="smartPlanStatus"><option value="">All statuses</option>${["draft", "held", "order_requested", "vendor_replied", "reviewed", "attention", "executing", "completed", "failed", "superseded", "cancelled"].map((status) => `<option value="${status}" ${smartState.planStatus === status ? "selected" : ""}>${status.replaceAll("_", " ")}</option>`).join("")}</select>
+      <select id="smartPlanVendor" aria-label="PO vendor" ${smartState.planType === "TO" ? "hidden disabled" : ""}><option value="">All PO vendors</option>${vendors.map(([key, vendor]) => `<option value="${smartEscape(key)}" ${smartState.planVendor === key ? "selected" : ""}>${smartEscape(vendor)}</option>`).join("")}</select>
       <select id="smartPlanSource"><option value="">All source yards / vendors</option>${sources.map((source) => `<option value="${smartEscape(source)}" ${smartState.planSource === source ? "selected" : ""}>${smartEscape(source)}</option>`).join("")}</select>
       <select id="smartPlanDestination"><option value="">All destination yards</option>${destinations.map((yard) => `<option value="${smartEscape(yard)}" ${smartState.planDestination === yard ? "selected" : ""}>${smartEscape(yard)}</option>`).join("")}</select>
-      <select id="smartPlanSort"><option value="destination" ${smartState.planSort === "destination" ? "selected" : ""}>Sort: destination yard</option><option value="source" ${smartState.planSort === "source" ? "selected" : ""}>Sort: source yard / vendor</option></select>
+      <select id="smartPlanSort"><option value="destination" ${smartState.planSort === "destination" ? "selected" : ""}>Tie-break: destination route</option><option value="source" ${smartState.planSort === "source" ? "selected" : ""}>Tie-break: source yard / vendor</option></select>
       <button class="smart-button" data-smart-action="filter-plan" type="button">Apply</button><span class="smart-help">${proposals.length} proposal(s)</span>
     </div>
+    ${smartUrgencyLegend()}
     </div>
+    ${exclusionPanel}
     ${smartManualLoadPanel(plan)}
     ${plan ? `<div class="smart-proposals">${proposals.map(smartProposalCard).join("") || `<div class="smart-empty">No proposal matches this filter.</div>`}</div>` : `<div class="smart-empty">No planning run exists. Configure Item Master, upload sales history, then build a plan; live NetSuite inventory is refreshed automatically.</div>`}
   </section>`;
@@ -515,7 +658,7 @@ smartPlans = function smartPlansV2() {
 
 function smartProposalItemResults(proposalId, items = []) {
   if (!items.length) return `<div class="smart-empty smart-empty-compact">No compatible planning item matches.</div>`;
-  return items.map((item) => `<div class="smart-proposal-item-result" data-smart-proposal-item="${item.itemId}"><div><strong>${smartEscape(item.itemName)}</strong><div class="smart-help">ID ${item.itemId} · ${smartEscape(item.vendor || item.itemDescription || item.unit || "")} · ${smartNumber(item.palletWeightLbs, 0)} lb / PLT</div></div><label><span>PLT</span><input data-smart-add-pallets type="number" min="1" step="1" value="1" /></label><button class="smart-button primary" data-smart-action="add-proposal-line" data-proposal-id="${proposalId}" data-item-id="${item.itemId}" type="button">Add</button></div>`).join("");
+  return items.map((item) => `<div class="smart-proposal-item-result" data-smart-proposal-item="${item.itemId}"><div><strong>${smartEscape(item.itemName)}</strong><div class="smart-help">ID ${item.itemId} · ${smartEscape(item.vendor || item.itemDescription || item.unit || "")} · ${smartNumber(item.palletWeightLbs, 0)} lb / PLT</div></div><label><span>PLT</span><input data-smart-add-pallets data-smart-focus-key="proposal:${smartEscape(proposalId)}:add-item:${smartEscape(item.itemId)}:pallets" type="number" min="1" step="1" value="1" /></label><button class="smart-button primary" data-smart-action="add-proposal-line" data-proposal-id="${proposalId}" data-item-id="${item.itemId}" type="button">Add</button></div>`).join("");
 }
 
 async function smartSearchProposalItems(proposalId, search) {
@@ -569,6 +712,16 @@ async function smartSearchManualLoadItems() {
 }
 
 smartScmApp.addEventListener("change", (event) => {
+  if (event.target.id === "smartPlanType") {
+    const vendorFilter = document.getElementById("smartPlanVendor");
+    const toOnly = event.target.value === "TO";
+    if (vendorFilter) {
+      vendorFilter.hidden = toOnly;
+      vendorFilter.disabled = toOnly;
+      if (toOnly) vendorFilter.value = "";
+    }
+    return;
+  }
   const manualLoadField = event.target.dataset.smartManualLoadField;
   if (["proposalType", "sourceLocationId", "destinationLocationId"].includes(manualLoadField)) {
     smartManualLoadState[manualLoadField] = manualLoadField === "proposalType"
@@ -627,9 +780,13 @@ smartScmApp.addEventListener("click", async (event) => {
   if (!button || smartState.busy) return;
   const action = button.dataset.smartAction;
   if (action === "filter-plan") {
-    smartState.planSource = document.getElementById("smartPlanSource")?.value || "";
-    smartState.planDestination = document.getElementById("smartPlanDestination")?.value || "";
-    smartState.planSort = document.getElementById("smartPlanSort")?.value || "destination";
+    // The base Smart SCM handler owns filter state and rendering. Keeping this
+    // override passive avoids a second render that can disturb control focus.
+    return;
+  }
+  if (action === "proposal-view") {
+    smartState.planCompact = button.dataset.smartProposalView !== "detailed";
+    smartSaveProposalColumnPreferences();
     smartRender();
     return;
   }

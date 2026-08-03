@@ -429,41 +429,41 @@ export class DispatchCustomOrderDateConflictError extends Error {
   }
 }
 
-async function assertCustomOrderPlanDateExclusivity(plan = {}) {
+function plannedCustomOrderRefs(plan = {}) {
   const plannedRefs = dispatchPlannedOrderRefs(plan);
-  const customRefs = (plan.orders || [])
+  return new Set((plan.orders || [])
     .filter((order) => String(order?.type || "").trim().toUpperCase() === "CUSTOM")
     .map((order) => String(order?.id || "").trim())
-    .filter((ref) => ref && plannedRefs.has(ref));
+    .filter((ref) => ref && plannedRefs.has(ref)));
+}
+
+async function assertCustomOrderPlanDateExclusivity(plan = {}, { previousPlan = null } = {}) {
+  const previousRefs = previousPlan ? plannedCustomOrderRefs(previousPlan) : new Set();
+  const customRefs = [...plannedCustomOrderRefs(plan)].filter((ref) => !previousRefs.has(ref));
   if (!customRefs.length) return;
-  const customByKey = new Map(customRefs.map((ref) => [ref.toLowerCase(), ref]));
   const result = await query(
-    `SELECT p.id, p.plan_date::text AS plan_date, p.status, s.orders, s.trucks
+    `SELECT DISTINCT p.id, p.plan_date::text AS plan_date, p.status,
+            candidate.ref AS order_ref
        FROM dispatch_plans p
        JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+       CROSS JOIN LATERAL jsonb_array_elements(COALESCE(s.trucks, '[]'::jsonb)) truck(value)
+       CROSS JOIN LATERAL jsonb_array_elements(COALESCE(truck.value -> 'loads', '[]'::jsonb)) load(value)
+       CROSS JOIN LATERAL jsonb_array_elements(COALESCE(load.value -> 'stops', '[]'::jsonb)) stop(value)
+       CROSS JOIN LATERAL unnest($3::text[]) candidate(ref)
       WHERE p.id <> $1
         AND p.status <> 'cancelled'
-        AND p.plan_date <> $2::date`,
-    [plan.id || plan.planId || 0, cleanPlanDate(plan.planDate)]
+        AND p.plan_date <> $2::date
+        AND lower(COALESCE(load.value ->> 'returnOnly', 'false')) <> 'true'
+        AND stop.value ->> 'type' = 'drop'
+        AND lower(stop.value ->> 'orderId') = lower(candidate.ref)`,
+    [plan.id || plan.planId || 0, cleanPlanDate(plan.planDate), customRefs]
   );
-  const conflicts = [];
-  for (const row of result.rows) {
-    for (const ref of dispatchPlannedOrderRefs({
-      id: row.id,
-      planDate: row.plan_date,
-      orders: row.orders || [],
-      trucks: row.trucks || []
-    })) {
-      const customRef = customByKey.get(String(ref || "").trim().toLowerCase());
-      if (!customRef) continue;
-      conflicts.push({
-        orderRef: customRef,
-        planId: String(row.id),
-        planDate: String(row.plan_date || "").slice(0, 10),
-        status: row.status || ""
-      });
-    }
-  }
+  const conflicts = result.rows.map((row) => ({
+    orderRef: String(row.order_ref || ""),
+    planId: String(row.id),
+    planDate: String(row.plan_date || "").slice(0, 10),
+    status: row.status || ""
+  }));
   if (conflicts.length) throw new DispatchCustomOrderDateConflictError(conflicts);
 }
 
@@ -778,7 +778,14 @@ export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [
       },
       lockRows: true
     });
-    await assertCustomOrderPlanDateExclusivity(canonicalPlan);
+    await assertCustomOrderPlanDateExclusivity(canonicalPlan, {
+      previousPlan: {
+        id: String(planId),
+        planDate: expectedPlanDate,
+        orders: existingPlan.orders || [],
+        trucks: existingPlan.trucks || []
+      }
+    });
     await assertActiveDispatchFleetAssignments({
       id: planId,
       planDate: expectedPlanDate,
@@ -967,7 +974,14 @@ export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" }
       },
       lockRows: true
     });
-    await assertCustomOrderPlanDateExclusivity(canonicalPlan);
+    await assertCustomOrderPlanDateExclusivity(canonicalPlan, {
+      previousPlan: {
+        id: current.id,
+        planDate: currentDate,
+        orders: current.orders || [],
+        trucks: current.trucks || []
+      }
+    });
     const cleanPlan = {
       ...canonicalPlan,
       summary: dispatchPlanV2Summary(canonicalPlan.summary || {}, {
@@ -1042,7 +1056,7 @@ export async function confirmDispatchPlan(planId, { note = "" } = {}) {
       previousPlan: currentPlan,
       lockRows: true
     });
-    await assertCustomOrderPlanDateExclusivity(canonicalPlan);
+    await assertCustomOrderPlanDateExclusivity(canonicalPlan, { previousPlan: currentPlan });
     const sanitizedPlan = await sanitizeDispatchPlan(canonicalPlan);
     await assertActiveDispatchFleetAssignments(sanitizedPlan, { previousPlan: currentPlan });
     await query(
@@ -1077,17 +1091,20 @@ export async function confirmDispatchPlan(planId, { note = "" } = {}) {
 }
 
 export async function reopenDispatchPlan(planId, { note = "" } = {}) {
-  const result = await query(
-    `UPDATE dispatch_plans
-        SET status = 'draft',
-            note = COALESCE(NULLIF($2, ''), note),
-            confirmed_at = NULL,
-            revision = revision + 1,
-            updated_at = now()
-      WHERE id = $1
-      RETURNING *`,
-    [planId, note || ""]
-  );
-  if (!result.rows[0]) throw new Error("Dispatch plan not found.");
-  return getDispatchPlan(planId);
+  return withTransaction(async () => {
+    await lockDispatchFleetPlanning();
+    const result = await query(
+      `UPDATE dispatch_plans
+          SET status = 'draft',
+              note = COALESCE(NULLIF($2, ''), note),
+              confirmed_at = NULL,
+              revision = revision + 1,
+              updated_at = now()
+        WHERE id = $1
+        RETURNING *`,
+      [planId, note || ""]
+    );
+    if (!result.rows[0]) throw new Error("Dispatch plan not found.");
+    return getDispatchPlan(planId);
+  });
 }

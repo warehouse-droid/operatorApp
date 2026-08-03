@@ -10,10 +10,22 @@ import {
   smartScmMinimumOrderMap
 } from "./smart-scm-planning-repository.js";
 import { calculateSmartScmOrderRequirement, calculateSmartScmPolicyLevels } from "./smart-scm-policy-calculation.js";
+import {
+  getSmartScmProposalInventorySnapshot,
+  getSmartScmProposalItemPolicy,
+  refreshSmartScmProposalDerived
+} from "./smart-scm-proposal-editor.js";
+import { getSmartScmRouteRule } from "./smart-scm-route-repository.js";
 
 const EPSILON = 0.000001;
 const VENDOR_REPLY_LOAD_STATUSES = Object.freeze(["order_requested", "vendor_replied"]);
 const NETSUITE_PO_REVIEW_STATUSES = Object.freeze(["confirmed", "executing", "failed", "attention", "completed", "cancelled"]);
+const VENDOR_REPLY_DESTINATIONS = Object.freeze(new Map([
+  [1, "3445"],
+  [28, "2967"],
+  [15, "12441"],
+  [26, "150"]
+]));
 
 function number(value, fallback = 0) {
   const parsed = Number(value);
@@ -354,6 +366,22 @@ async function refreshVendorResolutionProposal(proposalId, { confirmed = false }
     `WITH totals AS (
        SELECT COALESCE(SUM(${quantityColumn}), 0) AS pallets,
               COALESCE(BOOL_OR(urgent), false) AS urgent,
+              COALESCE((ARRAY_AGG(urgency_level ORDER BY
+                CASE urgency_level
+                  WHEN 'ultimate_urgent' THEN 3
+                  WHEN 'super_urgent' THEN 2
+                  WHEN 'urgent' THEN 1
+                  ELSE 0
+                END DESC,
+                urgency_score DESC, id))[1], 'normal') AS urgency_level,
+              COALESCE((ARRAY_AGG(urgency_score ORDER BY
+                CASE urgency_level
+                  WHEN 'ultimate_urgent' THEN 3
+                  WHEN 'super_urgent' THEN 2
+                  WHEN 'urgent' THEN 1
+                  ELSE 0
+                END DESC,
+                urgency_score DESC, id))[1], 0) AS urgency_score,
               COALESCE(BOOL_OR(provisional), false) AS provisional
          FROM scm_smart_proposal_lines
         WHERE proposal_id = $1
@@ -377,6 +405,8 @@ async function refreshVendorResolutionProposal(proposalId, { confirmed = false }
             total_weight_lbs = $2,
             utilization = CASE WHEN settings.truck_capacity_lbs > 0 THEN $2::numeric / settings.truck_capacity_lbs ELSE 0 END,
             urgent = totals.urgent,
+            urgency_level = totals.urgency_level,
+            urgency_score = totals.urgency_score,
             provisional = totals.provisional,
             route_stops = stops.route_stops,
             updated_at = now()
@@ -398,7 +428,7 @@ async function createVendorResolutionChild(source, { kind, status, label, operat
   const created = await query(
     `INSERT INTO scm_smart_proposals (
        run_id, proposal_key, proposal_type, phase, source_kind, source_location_id, source_vendor_yard_id, source_name,
-       destination_location_id, destination_name, vendor, plant, status, urgent, provisional, memo,
+       destination_location_id, destination_name, vendor, plant, status, urgent, urgency_level, urgency_score, provisional, memo,
        order_requested_at, order_requested_by, vendor_replied_at, vendor_replied_by,
        vendor_response_status, vendor_ready_date, vendor_reference, vendor_packing_number,
        vendor_credit_status, vendor_remarks, vendor_response_source,
@@ -406,7 +436,7 @@ async function createVendorResolutionChild(source, { kind, status, label, operat
        parent_proposal_id, vendor_resolution_kind, price_snapshot_at, confirmed_at, confirmed_by
      )
      SELECT run_id, $2, proposal_type, phase, source_kind, source_location_id, source_vendor_yard_id, source_name,
-            destination_location_id, destination_name, vendor, plant, $3, urgent, provisional, memo,
+            destination_location_id, destination_name, vendor, plant, $3, urgent, urgency_level, urgency_score, provisional, memo,
             order_requested_at, order_requested_by, vendor_replied_at, vendor_replied_by,
             $4, vendor_ready_date, vendor_reference, vendor_packing_number,
             vendor_credit_status, vendor_remarks, vendor_response_source,
@@ -426,7 +456,7 @@ async function createVendorHeldLineChild(source, line) {
   const created = await query(
     `INSERT INTO scm_smart_proposals (
        run_id, proposal_key, proposal_type, phase, source_kind, source_location_id, source_vendor_yard_id, source_name,
-       destination_location_id, destination_name, vendor, plant, status, urgent, provisional,
+       destination_location_id, destination_name, vendor, plant, status, urgent, urgency_level, urgency_score, provisional,
        vendor_reply_due_at, memo, execution_mode, route_stops, manually_grouped,
        order_requested_at, order_requested_by, vendor_replied_at, vendor_replied_by,
        vendor_response_status, vendor_ready_date, vendor_reference, vendor_packing_number,
@@ -434,7 +464,7 @@ async function createVendorHeldLineChild(source, line) {
        parent_proposal_id, vendor_resolution_kind, po_execution_status
      )
      SELECT run_id, $2, proposal_type, phase, source_kind, source_location_id, source_vendor_yard_id, source_name,
-            destination_location_id, destination_name, vendor, plant, 'vendor_replied', urgent, provisional,
+            destination_location_id, destination_name, vendor, plant, 'vendor_replied', urgent, urgency_level, urgency_score, provisional,
             vendor_reply_due_at,
             CONCAT_WS(' · ', NULLIF(memo, ''), 'held vendor line ' || $3 || ' from load #' || id),
             execution_mode, '[]'::jsonb, false,
@@ -502,14 +532,14 @@ async function splitHeldVendorLine({ source, line, decision, cancelledProposalId
          required_pallets, proposed_pallets, confirmed_pallets, residual_pallets,
          sales_quantity, pallet_weight_lbs, line_weight_lbs, to_plt, to_lyr, to_sec, to_pcs,
          manual_planning_required, reason, destination_location_id, destination_name,
-         urgent, provisional, is_alternative, alternative_for_line_id, added_source, added_by,
+         urgent, urgency_level, urgency_score, provisional, is_alternative, alternative_for_line_id, added_source, added_by,
          vendor_decision, last_purchase_price, last_purchase_price_synced_at, purchase_unit
        )
        SELECT $1, item_id, item_name, item_description, unit,
               $3, $4, 0, $4,
               0, pallet_weight_lbs, 0, to_plt, to_lyr, to_sec, to_pcs,
               manual_planning_required, $5::jsonb, destination_location_id, destination_name,
-              urgent, provisional, is_alternative, alternative_for_line_id, added_source, added_by,
+              urgent, urgency_level, urgency_score, provisional, is_alternative, alternative_for_line_id, added_source, added_by,
               'cancel', last_purchase_price, last_purchase_price_synced_at, purchase_unit
          FROM scm_smart_proposal_lines WHERE id = $2
        RETURNING id`,
@@ -861,6 +891,74 @@ export async function listSmartScmVendorReplyLoads({ search = "", limit = 500 } 
   });
 }
 
+export async function removeSmartScmVendorReplyLoad(proposalId, operatorId = null) {
+  const id = Number(proposalId);
+  if (!Number.isInteger(id) || id <= 0) {
+    throw Object.assign(new Error("Select a valid vendor reply load."), { status: 400 });
+  }
+  const outcome = await withTransaction(async () => {
+    const result = await query(
+      `SELECT id, run_id, proposal_type, status, vendor_resolution_kind,
+              po_execution_status, netsuite_purchase_order_id, netsuite_purchase_order_ref
+         FROM scm_smart_proposals
+        WHERE id = $1
+        FOR UPDATE`,
+      [id]
+    );
+    if (!result.rowCount) {
+      throw Object.assign(new Error("Smart SCM vendor reply load was not found."), { status: 404 });
+    }
+    const load = result.rows[0];
+    if (load.proposal_type !== "PO" || load.vendor_resolution_kind !== null) {
+      throw Object.assign(new Error("Only an original Vendor Replies PO load can be removed here."), { status: 409 });
+    }
+    if (load.status === "cancelled") {
+      return { id, runId: Number(load.run_id), removed: false, reused: true };
+    }
+    if (!VENDOR_REPLY_LOAD_STATUSES.includes(load.status)) {
+      throw Object.assign(new Error("Only an active Order Requested or Vendor Replied load can be removed."), { status: 409 });
+    }
+    if (load.netsuite_purchase_order_id || text(load.netsuite_purchase_order_ref)) {
+      throw Object.assign(new Error("This load already has a NetSuite purchase-order reference and cannot be removed locally."), { status: 409 });
+    }
+    if (text(load.po_execution_status || "idle") !== "idle") {
+      throw Object.assign(new Error("This load has NetSuite execution activity and must be reconciled before removal."), { status: 409 });
+    }
+    await query(
+      `UPDATE scm_smart_proposals
+          SET status = 'cancelled',
+              vendor_response_status = 'cancelled',
+              vendor_reply_due_at = NULL,
+              po_execution_error = NULL,
+              updated_at = now()
+        WHERE id = $1`,
+      [id]
+    );
+    await recordStructuralRevision(Number(load.run_id), "vendor_reply_load_removed", {
+      proposalId: id,
+      previousStatus: load.status,
+      linesRetained: true
+    }, operatorId);
+    return { id, runId: Number(load.run_id), removed: true, reused: false };
+  });
+  if (outcome.removed) {
+    await writeAudit({
+      actorOperatorId: operatorId,
+      source: "smart_scm",
+      action: "smart_scm.vendor_reply.load_removed",
+      details: {
+        proposalId: outcome.id,
+        runId: outcome.runId,
+        linesRetained: true
+      }
+    });
+  }
+  return {
+    ...outcome,
+    load: await getSmartScmProposal(id)
+  };
+}
+
 async function smartScmAlternativeEvidence(rows = [], destinationLocationId) {
   const itemIds = rows.map((row) => Number(row.item_id)).filter(Number.isInteger);
   if (!itemIds.length) return new Map();
@@ -1101,8 +1199,8 @@ export async function addSmartScmVendorAlternativeLine(proposalId, values = {}, 
            sales_quantity, pallet_weight_lbs, line_weight_lbs,
            to_plt, to_lyr, to_sec, to_pcs, manual_planning_required, reason,
            is_alternative, alternative_for_line_id, added_source, added_by, destination_location_id, destination_name,
-           urgent, provisional
-         ) VALUES ($1,$2,$3,$4,$5,0,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,false,$16::jsonb,true,$17,$18,$19,$20,$21,$22,$23)
+           urgent, urgency_level, urgency_score, provisional
+         ) VALUES ($1,$2,$3,$4,$5,0,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,false,$16::jsonb,true,$17,$18,$19,$20,$21,$22,$23,$24,$25)
          RETURNING id`,
         [
           id, item.item_id, item.item_name, item.item_description, item.stock_unit,
@@ -1111,7 +1209,10 @@ export async function addSmartScmVendorAlternativeLine(proposalId, values = {}, 
           item.to_plt, item.to_lyr, item.to_sec, item.to_pcs,
           JSON.stringify({ alternative: true, alternativeForLineId, vendorId: vendor.vendorId }),
           alternativeForLineId, text(values.source) === "system" ? "system" : "manual", operatorId, destinationLocationId, destinationName,
-          Boolean(originalLine?.urgent || proposal.urgent), Boolean(originalLine?.provisional || proposal.provisional)
+          Boolean(originalLine?.urgent || proposal.urgent),
+          originalLine?.urgencyLevel || proposal.urgencyLevel || (originalLine?.urgent || proposal.urgent ? "urgent" : "normal"),
+          Math.min(100, positive(originalLine?.urgencyScore ?? proposal.urgencyScore)),
+          Boolean(originalLine?.provisional || proposal.provisional)
         ]
       );
     } catch (error) {
@@ -1188,6 +1289,136 @@ export async function removeSmartScmVendorAlternativeLine(proposalId, lineId, op
   return getSmartScmProposal(id);
 }
 
+async function updateVendorReplyLineDestinations(proposal, inputs = [], operatorId = null) {
+  const proposalId = Number(proposal.id);
+  const linesResult = await query(
+    `SELECT *
+       FROM scm_smart_proposal_lines
+      WHERE proposal_id = $1
+      ORDER BY id
+      FOR UPDATE`,
+    [proposalId]
+  );
+  const storedById = new Map(linesResult.rows.map((line) => [Number(line.id), line]));
+  const inputById = new Map();
+  for (const input of inputs) {
+    const lineId = Number(input.proposalLineId || input.lineId);
+    if (inputById.has(lineId)) {
+      throw Object.assign(new Error("Each vendor reply line can appear only once."), { status: 400 });
+    }
+    inputById.set(lineId, input);
+  }
+  if ([...inputById.keys()].some((lineId) => !storedById.has(lineId))) {
+    throw Object.assign(new Error("One or more reply lines do not belong to this PO load."), { status: 400 });
+  }
+
+  const changes = [];
+  const nextLines = linesResult.rows.map((line) => {
+    const input = inputById.get(Number(line.id));
+    const requested = input && Object.hasOwn(input, "destinationLocationId")
+      ? Number(input.destinationLocationId)
+      : Number(line.destination_location_id);
+    if (requested === Number(line.destination_location_id)) return { line, destinationLocationId: requested };
+    const destinationName = VENDOR_REPLY_DESTINATIONS.get(requested);
+    if (!Number.isInteger(requested) || !destinationName) {
+      throw Object.assign(new Error("Select a valid destination yard for every changed vendor reply line."), { status: 400 });
+    }
+    const change = {
+      line,
+      lineId: Number(line.id),
+      itemId: Number(line.item_id),
+      itemName: line.item_name,
+      beforeDestinationLocationId: Number(line.destination_location_id),
+      beforeDestinationName: line.destination_name,
+      destinationLocationId: requested,
+      destinationName
+    };
+    changes.push(change);
+    return { line, destinationLocationId: requested };
+  });
+  if (!changes.length) return [];
+
+  const duplicateKeys = new Map();
+  for (const entry of nextLines) {
+    const key = `${Number(entry.line.item_id)}:${entry.destinationLocationId}`;
+    if (duplicateKeys.has(key)) {
+      const destinationName = VENDOR_REPLY_DESTINATIONS.get(entry.destinationLocationId)
+        || entry.line.destination_name || entry.destinationLocationId;
+      throw Object.assign(new Error(`${entry.line.item_name} already has a ${destinationName} line in this load. Keep only one item line per destination.`), { status: 409 });
+    }
+    duplicateKeys.set(key, Number(entry.line.id));
+  }
+  const routeRule = await getSmartScmRouteRule(proposal.sourceName);
+  const maximumDrops = routeRule.enabled === false
+    ? 2
+    : Math.max(1, Math.min(2, Number(routeRule.maxDrops) || 2));
+  const nextDestinations = new Set(nextLines.map((entry) => entry.destinationLocationId));
+  if (nextDestinations.size > maximumDrops) {
+    throw Object.assign(new Error(`${proposal.sourceName || "This source"} allows at most ${maximumDrops} destination${maximumDrops === 1 ? "" : "s"} per load.`), { status: 409 });
+  }
+
+  for (const change of changes) {
+    const policy = await getSmartScmProposalItemPolicy(change.itemId, change.destinationLocationId, { allowExcluded: true });
+    if (!policy) {
+      throw Object.assign(new Error(`${change.itemName} is not enabled for Smart SCM planning at ${change.destinationName}.`), { status: 409 });
+    }
+    const toPlt = positive(policy.to_plt);
+    const palletWeight = positive(policy.pallet_weight_lbs);
+    if (toPlt <= EPSILON || palletWeight <= EPSILON) {
+      throw Object.assign(new Error(`${change.itemName} needs a pallet conversion and pallet weight at ${change.destinationName}.`), { status: 409 });
+    }
+    const inventory = await getSmartScmProposalInventorySnapshot(change.itemId, change.destinationLocationId, toPlt);
+    const reason = {
+      ...(change.line.reason || {}),
+      vendorReplyDestination: {
+        changedBy: operatorId,
+        changedAt: new Date().toISOString(),
+        previousLocationId: change.beforeDestinationLocationId,
+        previousLocationName: change.beforeDestinationName,
+        locationId: change.destinationLocationId,
+        locationName: change.destinationName,
+        availablePallets: inventory.availablePallets,
+        expectedAvailablePallets: inventory.expectedAvailablePallets
+      }
+    };
+    await query(
+      `UPDATE scm_smart_proposal_lines
+          SET destination_location_id = $3,
+              destination_name = $4,
+              unit = $5,
+              to_plt = $6,
+              to_lyr = $7,
+              to_sec = $8,
+              to_pcs = $9,
+              pallet_weight_lbs = $10,
+              sales_quantity = proposed_pallets * $6::numeric,
+              line_weight_lbs = proposed_pallets * $10::numeric,
+              reason = $11::jsonb,
+              updated_at = now()
+        WHERE id = $1 AND proposal_id = $2`,
+      [change.lineId, proposalId, change.destinationLocationId, change.destinationName,
+        policy.stock_unit || change.line.unit, toPlt, positive(policy.to_lyr), positive(policy.to_sec),
+        positive(policy.to_pcs), palletWeight, JSON.stringify(reason)]
+    );
+    change.toPlt = toPlt;
+    change.palletWeightLbs = palletWeight;
+  }
+  const derived = await refreshSmartScmProposalDerived(proposalId);
+  await recordStructuralRevision(proposal.runId, "vendor_reply_destination_changed", {
+    proposalId,
+    changes: changes.map((change) => ({
+      lineId: change.lineId,
+      itemId: change.itemId,
+      beforeDestinationLocationId: change.beforeDestinationLocationId,
+      destinationLocationId: change.destinationLocationId,
+      toPlt: change.toPlt,
+      palletWeightLbs: change.palletWeightLbs
+    })),
+    routeStops: derived.routeStops
+  }, operatorId);
+  return changes;
+}
+
 export async function saveSmartScmVendorReplyLoad(proposalId, values = {}, operatorId = null) {
   const id = Number(proposalId);
   return withTransaction(async () => {
@@ -1204,6 +1435,7 @@ export async function saveSmartScmVendorReplyLoad(proposalId, values = {}, opera
   }
   const inputs = Array.isArray(values.lines) ? values.lines : [];
   if (!inputs.length) throw Object.assign(new Error("Enter at least one vendor reply line."), { status: 400 });
+  const destinationChanges = await updateVendorReplyLineDestinations(proposal, inputs, operatorId);
   const inputByLine = new Map(inputs.map((input) => [Number(input.proposalLineId || input.lineId), input]));
   const readyDate = validIsoDate(values.readyDate);
   const metadata = {
@@ -1279,6 +1511,12 @@ export async function saveSmartScmVendorReplyLoad(proposalId, values = {}, opera
         heldPallets: positive(response.heldPallets),
         remainderPallets: positive(response.remainderPallets)
       })),
+      destinationChanges: destinationChanges.map((change) => ({
+        proposalLineId: change.lineId,
+        itemId: change.itemId,
+        beforeDestinationLocationId: change.beforeDestinationLocationId,
+        destinationLocationId: change.destinationLocationId
+      })),
       ...metadata
     }
   });
@@ -1292,6 +1530,12 @@ export async function stageSmartScmVendorReplyLoad(proposalId, values = {}, oper
     await query("SELECT id FROM scm_smart_proposals WHERE id = $1 FOR UPDATE", [id]);
     const source = await getSmartScmProposal(id);
     ensureEditableVendorLoad(source);
+    if (source.proposalOrigin === "blanket") {
+      throw Object.assign(
+        new Error("Blanket vendor decisions must finalize the reserved source PO as a local split; they cannot enter NetSuite PO staging."),
+        { status: 409 }
+      );
+    }
     const suppliedLines = Array.isArray(values.lines) ? values.lines : [];
     const suppliedByLine = new Map(suppliedLines.map((line) => [Number(line.proposalLineId || line.lineId), line]));
     const sourceLineIds = new Set(source.lines.map((line) => Number(line.id)));

@@ -1,338 +1,412 @@
-const smartNetSuitePoApp = document.getElementById("smartNetSuitePoApp");
+const poApp = document.getElementById("smartNetSuitePoApp");
 
-const netSuitePoState = {
+const poState = {
   operator: null,
-  loads: [],
-  search: "",
-  view: "pending",
+  records: [],
+  options: { vendors: [], vendorYards: [], destinations: [] },
+  filters: { search: "", createdFrom: "", createdTo: "", vendorId: "", vendorYard: "", destinationLocationId: "" },
+  page: 1,
+  pageSize: 25,
+  total: 0,
+  totalPages: 1,
   busy: "",
   notice: "",
-  error: ""
+  error: "",
+  syncWarning: "",
+  pdf: null,
+  events: null,
+  dirtyIds: new Set(),
+  drafts: new Map(),
+  remoteSyncRunning: false,
+  loadSequence: 0,
+  filtersDirty: false
 };
 
-function poEscape(value) {
-  return String(value ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
+function esc(value) {
+  return String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;");
 }
 
-function poNumber(value, places = 2) {
-  const amount = Number(value);
-  if (!Number.isFinite(amount)) return "—";
-  return new Intl.NumberFormat("en-CA", { minimumFractionDigits: 0, maximumFractionDigits: places }).format(amount);
+function num(value, places = 2) {
+  const number = Number(value);
+  return Number.isFinite(number) ? new Intl.NumberFormat("en-CA", { maximumFractionDigits: places }).format(number) : "—";
 }
 
-function poMoney(value) {
-  const amount = Number(value);
-  if (!Number.isFinite(amount)) return "—";
-  return new Intl.NumberFormat("en-CA", { style: "currency", currency: "CAD" }).format(amount);
+function money(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? new Intl.NumberFormat("en-CA", { style: "currency", currency: "CAD" }).format(number) : "—";
 }
 
-function poDate(value, withTime = false) {
+function date(value, withTime = false) {
   if (!value) return "—";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return poEscape(value);
-  return new Intl.DateTimeFormat("en-CA", withTime
-    ? { dateStyle: "medium", timeStyle: "short" }
-    : { dateStyle: "medium" }).format(date);
+  const parsed = new Date(value);
+  return Number.isFinite(parsed.getTime()) ? new Intl.DateTimeFormat("en-CA", withTime ? { dateStyle: "medium", timeStyle: "short" } : { dateStyle: "medium" }).format(parsed) : esc(value);
 }
 
-function poPill(value, label = null) {
-  const css = String(value || "unknown").toLowerCase().replace(/[^a-z0-9_]+/g, "_");
-  return `<span class="smart-pill ${css}">${poEscape(label || String(value || "unknown").replaceAll("_", " "))}</span>`;
+function dateInput(value) {
+  if (!value) return "";
+  const match = String(value).match(/^\d{4}-\d{2}-\d{2}/);
+  return match ? match[0] : "";
 }
 
-function poRoles() {
-  return new Set([
-    ...(Array.isArray(netSuitePoState.operator?.roles) ? netSuitePoState.operator.roles : []),
-    netSuitePoState.operator?.role
-  ].map((role) => String(role || "").trim().toLowerCase().replaceAll("-", "_").replaceAll(" ", "_")).filter(Boolean));
+function sameNumber(left, right) {
+  const a = Number(left);
+  const b = Number(right);
+  return Number.isFinite(a) && Number.isFinite(b) && Math.abs(a - b) < 0.000001;
 }
 
-function poCanWrite() {
-  const roles = poRoles();
-  return ["admin", "scm", "scm_staff"].some((role) => roles.has(role));
+function activeEditor() {
+  const active = document.activeElement;
+  return Boolean(active && poApp.contains(active) && /^(INPUT|TEXTAREA|SELECT)$/.test(active.tagName));
 }
 
-function poCanEditPallets(load) {
-  return poCanWrite()
-    && ["confirmed", "failed"].includes(String(load.status || ""))
-    && !load.netsuitePurchaseOrderId
-    && !load.netsuitePurchaseOrderRef;
+function quietRefreshBlocked() {
+  return poState.dirtyIds.size > 0 || poState.filtersDirty || activeEditor() || poState.busy || poState.pdf;
 }
 
-async function poApi(url, options = {}) {
+function roles() {
+  return new Set([...(poState.operator?.roles || []), poState.operator?.role].map((role) => String(role || "").toLowerCase().replaceAll("-", "_").replaceAll(" ", "_")).filter(Boolean));
+}
+
+function canWrite() {
+  return ["admin", "scm", "scm_staff"].some((role) => roles().has(role));
+}
+
+function recordCanWrite(record) {
+  const status = `${record.current.status || ""} ${record.current.statusText || ""}`;
+  return canWrite() && record.current.active !== false
+    && !/closed|cancelled|canceled|fully received/i.test(status)
+    && !(record.current.lines || []).some((line) => line.closed || Number(line.receivedQuantity || 0) > 0);
+}
+
+async function api(url, options = {}) {
   const headers = { ...(options.headers || {}) };
   if (options.body && typeof options.body === "object") {
     headers["Content-Type"] = "application/json";
     options = { ...options, body: JSON.stringify(options.body) };
   }
   const response = await fetch(url, { ...options, headers });
-  const type = response.headers.get("content-type") || "";
-  const payload = type.includes("application/json") ? await response.json() : await response.text();
-  if (!response.ok) throw new Error(payload?.error || payload || `Request failed (${response.status})`);
+  const payload = (response.headers.get("content-type") || "").includes("application/json") ? await response.json() : await response.text();
+  if (!response.ok) {
+    const error = new Error(payload?.error || payload || `Request failed (${response.status})`);
+    error.status = response.status;
+    throw error;
+  }
   return payload;
 }
 
-function poLinePrice(line) {
-  const value = line.lastPurchasePrice ?? line.last_purchase_price;
-  return value === null || value === undefined || value === "" ? null : Number(value);
+function optionList(rows, selected, emptyLabel) {
+  return `<option value="">${esc(emptyLabel)}</option>${rows.map((row) => {
+    const value = typeof row === "string" ? row : row.id;
+    const label = typeof row === "string" ? row : row.name;
+    return `<option value="${esc(value)}" ${String(value) === String(selected) ? "selected" : ""}>${esc(label)}</option>`;
+  }).join("")}`;
 }
 
-function poLineQuantity(line) {
-  return Number(line.purchaseQuantity ?? line.salesQuantity ?? line.quantity ?? 0);
+function statusPill(record) {
+  const label = record.current.statusText || record.current.status || "Unknown";
+  const css = /closed|cancel/i.test(label) ? "cancelled" : /pending|open|receive/i.test(label) ? "confirmed" : "reviewed";
+  return `<span class="smart-pill ${css}">${esc(label)}</span>`;
 }
 
-function poLineAmount(line) {
-  const stagedAmount = line.purchaseAmount;
-  if (stagedAmount !== null && stagedAmount !== undefined && Number.isFinite(Number(stagedAmount))) return Number(stagedAmount);
-  const price = poLinePrice(line);
-  return price === null || !Number.isFinite(price) ? null : poLineQuantity(line) * price;
-}
-
-function poMaterialLines(load) {
-  return (load.lines || []).filter((line) => Number(line.confirmedPallets ?? line.confirmed_pallets ?? 0) > 0);
-}
-
-function poPalletLines(load) {
-  if (Array.isArray(load.palletLines)) return load.palletLines;
-  if (!load.palletItem) return [];
-  const grouped = new Map();
-  for (const line of poMaterialLines(load)) {
-    const locationId = Number(line.destinationLocationId || load.destinationLocationId);
-    const key = String(locationId);
-    const current = grouped.get(key) || {
-      itemId: load.palletItem.itemId || load.palletItem.id,
-      itemName: load.palletItem.itemName || "PALLET",
-      destinationLocationId: locationId,
-      destinationName: line.destinationName || load.destinationName,
-      confirmedPallets: 0,
-      salesQuantity: 0,
-      purchaseUnit: load.palletItem.purchaseUnit || load.palletItem.unit || "EACH",
-      lastPurchasePrice: load.palletItem.lastPurchasePrice ?? null,
-      lastPurchasePriceSyncedAt: load.palletItem.lastPurchasePriceSyncedAt || null,
-      ancillaryPallet: true
-    };
-    const pallets = Number(line.confirmedPallets ?? line.confirmed_pallets ?? 0);
-    current.confirmedPallets += pallets;
-    current.salesQuantity += pallets;
-    grouped.set(key, current);
-  }
-  return [...grouped.values()];
-}
-
-function poRoute(load) {
-  const stops = Array.isArray(load.routeStops) ? load.routeStops.map((stop) => stop.name).filter(Boolean) : [];
-  return [load.sourceName || load.vendor || "Vendor", ...(stops.length ? stops : [load.destinationName])].filter(Boolean).join(" → ");
-}
-
-function poLoadBlockers(load) {
-  if (Array.isArray(load.reviewBlockers)) {
-    return [...new Set(load.reviewBlockers.map((blocker) => String(blocker?.message || "")).filter(Boolean))];
-  }
-  const explicit = Array.isArray(load.blockers) ? load.blockers.map(String).filter(Boolean) : [];
-  const lines = [...poMaterialLines(load), ...poPalletLines(load)];
-  if (lines.some((line) => !(poLinePrice(line) > 0))) explicit.push("Every PO item, including PALLET, needs a positive Last Purchase Price.");
-  if (lines.some((line) => line.purchaseUnitMismatch)) explicit.push("At least one item purchase unit does not match the staged purchase quantity unit.");
-  return [...new Set(explicit)];
-}
-
-function poLineRow(line, load) {
-  const price = poLinePrice(line);
-  const amount = poLineAmount(line);
-  const pallets = Number(line.confirmedPallets ?? line.confirmed_pallets ?? 0);
-  const syncedAt = line.lastPurchasePriceSyncedAt || line.priceSyncedAt || line.last_purchase_price_synced_at;
-  const purchaseUnit = line.purchaseUnit || "";
-  const canEditPallet = line.ancillaryPallet && poCanEditPallets(load);
-  const automaticQuantity = Number(line.automaticQuantity ?? pallets);
-  const palletQuantityControl = line.ancillaryPallet
-    ? `<div class="smart-po-pallet-editor"><input data-po-pallet-quantity type="number" min="0" step="0.01" value="${poEscape(poLineQuantity(line))}" ${canEditPallet ? "" : "disabled"} aria-label="Official PALLET quantity for ${poEscape(line.destinationName || "destination")}" />${canEditPallet ? `<button class="smart-button blue" data-po-action="save-pallet" data-proposal-id="${load.id}" data-destination-location-id="${line.destinationLocationId}" type="button">Save</button><button class="smart-button" data-po-action="reset-pallet" data-proposal-id="${load.id}" data-destination-location-id="${line.destinationLocationId}" type="button" ${line.overridden ? "" : "disabled"}>Use automatic</button>` : ""}<span class="smart-po-line-meta">Automatic ${poNumber(automaticQuantity, 2)}${line.overridden ? " · manual override active" : ""}</span></div>`
-    : `${poNumber(poLineQuantity(line), 4)} ${purchaseUnit ? poEscape(purchaseUnit) : "unit missing"}`;
-  return `<tr class="${line.ancillaryPallet ? "smart-po-pallet-line" : ""}">
-    <td><strong>${poEscape(line.itemName || line.item_name || line.itemId)}</strong>${line.ancillaryPallet ? ` ${poPill("reviewed", "Official PALLET")}` : ""}<span class="smart-po-line-meta">ID ${poEscape(line.itemId || line.item_id || "—")}${line.ancillaryPallet ? " · inserted once from confirmed material PLT" : ""}</span></td>
-    <td><strong>${poEscape(line.destinationName || line.destination_name || "—")}</strong></td>
-    <td class="numeric">${poNumber(pallets, 2)} PLT</td>
-    <td class="numeric ${purchaseUnit ? "" : "smart-po-unit-missing"}">${palletQuantityControl}</td>
-    <td class="numeric ${price > 0 ? "" : "smart-po-price-missing"}">${price > 0 ? poMoney(price) : "Missing"}<span class="smart-po-line-meta">${syncedAt ? `synced ${poDate(syncedAt, true)}` : "not synced"}</span></td>
-    <td class="numeric">${amount === null ? "—" : poMoney(amount)}</td>
+function lineRow(record, line) {
+  const editable = recordCanWrite(record) && line.editable;
+  const draft = (poState.drafts.get(record.id)?.lines || []).find((row) => Number(row.lineId) === Number(line.lineId)) || {};
+  const quantity = Object.prototype.hasOwnProperty.call(draft, "quantity") ? draft.quantity : line.quantity;
+  const rate = Object.prototype.hasOwnProperty.call(draft, "rate") ? draft.rate : line.rate ?? 0;
+  const destinationLocationId = Object.prototype.hasOwnProperty.call(draft, "destinationLocationId") ? draft.destinationLocationId : line.destinationLocationId;
+  const destinations = poState.options.destinations.some((row) => Number(row.id) === Number(line.destinationLocationId))
+    ? poState.options.destinations
+    : [{ id: line.destinationLocationId, name: line.destination || `Location ${line.destinationLocationId}` }, ...poState.options.destinations];
+  return `<tr data-po-line="${line.lineId}">
+    <td><strong>${esc(line.itemName || line.itemId)}</strong><small>ID ${esc(line.itemId)} · ${esc(line.description || "No description")}</small></td>
+    <td><input data-line-field="quantity" type="number" min="0.000001" step="0.0001" value="${esc(quantity)}" ${editable ? "" : "disabled"}><small>${esc(line.unit || "unit")}</small></td>
+    <td><input data-line-field="rate" type="number" min="0" step="0.0001" value="${esc(rate)}" ${editable ? "" : "disabled"}></td>
+    <td>${money(line.amount)}</td>
+    <td><select data-line-field="destinationLocationId" ${editable ? "" : "disabled"}>${optionList(destinations, destinationLocationId, line.destination || "Destination")}</select><small>${esc(line.destination || "—")}</small></td>
+    <td>${num(line.receivedQuantity, 4)}${line.closed ? `<small class="po-lock">Closed</small>` : line.receivedQuantity > 0 ? `<small class="po-lock">Received · locked</small>` : ""}</td>
   </tr>`;
 }
 
-function poLoadCard(load) {
-  const materialLines = poMaterialLines(load);
-  const palletLines = poPalletLines(load);
-  const lines = [...materialLines, ...palletLines];
-  const blockers = poLoadBlockers(load);
-  const calculatedAmount = lines.reduce((sum, line) => sum + Number(poLineAmount(line) || 0), 0);
-  const amount = load.purchaseTotal !== null && load.purchaseTotal !== undefined && Number.isFinite(Number(load.purchaseTotal)) ? Number(load.purchaseTotal) : calculatedAmount;
-  const canInsert = poCanWrite() && load.canInsertIntoNetSuite === true;
-  const canRemove = poCanWrite() && load.canRemoveFromStaging === true;
-  const insertAction = canInsert
-    ? `<button class="smart-button primary" data-po-action="insert" data-proposal-id="${load.id}" type="button">${load.status === "executing" ? "Recover PO insertion" : "Insert PO into NetSuite"}</button>`
-    : load.netsuitePurchaseOrderRef
-      ? poPill("completed", "Inserted")
-      : load.status === "cancelled"
-        ? poPill("cancelled", "Removed")
-        : `<button class="smart-button primary" type="button" disabled>Insert PO into NetSuite</button>`;
-  const removeAction = canRemove
-    ? `<button class="smart-button danger" data-po-action="remove" data-proposal-id="${load.id}" type="button">Remove staged PO</button>`
-    : "";
-  return `<article class="smart-proposal smart-po-review-card" data-po-review-load="${load.id}">
-    <div class="smart-proposal-head smart-po-review-head">
-      <div><strong>PO</strong><div>${poPill(load.status)}</div></div>
-      <div class="smart-proposal-route"><strong>${poEscape(poRoute(load))}</strong><span>Review #${load.id}${load.parentProposalId ? ` · vendor load #${load.parentProposalId}` : ""} · plan #${load.runId || "—"}</span><span>Vendor ref ${poEscape(load.vendorReference || "—")} · ready ${poDate(load.vendorReadyDate || load.readyDate)}</span></div>
-      <div class="smart-proposal-metric"><strong>${poNumber(load.totalPallets ?? materialLines.reduce((sum, line) => sum + Number(line.confirmedPallets || 0), 0), 2)} PLT</strong><span>Confirmed</span></div>
-      <div class="smart-proposal-metric"><strong>${poMoney(amount)}</strong><span>Estimated total</span></div>
-      <div class="smart-proposal-metric"><strong>${poEscape(load.netsuitePurchaseOrderRef || "—")}</strong><span>NetSuite PO</span></div>
-      <div class="smart-po-review-action">${insertAction}${removeAction}</div>
+function snapshotSummary(record) {
+  const snapshot = record.creationSnapshot || {};
+  const lines = Array.isArray(snapshot.lines) ? snapshot.lines : [];
+  return `<details class="po-snapshot"><summary>Creation snapshot (${lines.length} lines)</summary><pre>${esc(JSON.stringify(snapshot, null, 2))}</pre></details>`;
+}
+
+function card(record) {
+  const writable = recordCanWrite(record);
+  const current = record.current;
+  const headerDraft = poState.drafts.get(record.id)?.header || {};
+  const headValue = (field, original) => Object.prototype.hasOwnProperty.call(headerDraft, field) ? headerDraft[field] : original;
+  return `<article class="po-history-card" data-history-id="${record.id}" data-version="${esc(record.remoteLastModifiedAt || "")}">
+    <header class="po-history-head">
+      <div><span class="po-kicker">APP-CREATED NETSUITE PO</span><h2>${esc(current.tranid || record.purchaseOrderRef)}</h2></div>
+      <div class="po-history-route"><strong>${esc(current.vendor || record.creationSnapshot?.vendor || "Unknown vendor")}</strong><span>${esc(current.vendorYard || "Vendor yard not set")} → ${esc([...new Set((current.lines || []).map((line) => line.destination).filter(Boolean))].join(", ") || "Destination not set")}</span></div>
+      <div><strong>${money(current.total)}</strong><span>Current total</span></div>
+      <div>${statusPill(record)}<span>NetSuite status</span></div>
+      <div class="po-card-actions"><button class="smart-button" data-action="pdf">Preview PDF</button><button class="smart-button" data-action="refresh">Sync now</button>${writable ? `<button class="smart-button primary" data-action="save">Save to NetSuite</button>` : ""}${canWrite() ? `<button class="smart-button danger" data-action="unarchive">Return to Vendor Replies</button>` : ""}</div>
+    </header>
+    ${record.lastSyncError ? `<div class="smart-notice error">${esc(record.lastSyncError)}</div>` : ""}
+    <div class="po-meta-grid">
+      <label>Transaction date<input data-head-field="transactionDate" type="date" value="${esc(headValue("transactionDate", dateInput(current.transactionDate)))}" ${writable ? "" : "disabled"}></label>
+      <label>Expected date<input data-head-field="expectedDeliveryDate" type="date" value="${esc(headValue("expectedDeliveryDate", dateInput(current.expectedDeliveryDate)))}" ${writable ? "" : "disabled"}></label>
+      <label>Vendor reference<input data-head-field="vendorReference" value="${esc(headValue("vendorReference", current.vendorReference || ""))}" maxlength="300" ${writable ? "" : "disabled"}></label>
+      <label class="po-memo">Memo<textarea data-head-field="memo" maxlength="4000" ${writable ? "" : "disabled"}>${esc(headValue("memo", current.memo || ""))}</textarea></label>
     </div>
-    ${load.poExecutionError ? `<div class="smart-po-error">${poEscape(load.poExecutionError)}</div>` : ""}
-    ${blockers.length ? `<div class="smart-po-blockers"><strong>Insertion blocked</strong>${blockers.map((blocker) => `<span>${poEscape(blocker)}</span>`).join("")}</div>` : ""}
-    <div class="smart-proposal-lines smart-table-wrap"><table class="smart-table smart-po-lines"><thead><tr><th>Item</th><th>Destination</th><th class="numeric">Confirmed</th><th class="numeric">Purchase quantity</th><th class="numeric">Last Purchase Price</th><th class="numeric">Amount</th></tr></thead><tbody>${lines.map((line) => poLineRow(line, load)).join("")}</tbody></table></div>
-    <div class="smart-po-review-foot"><span>Last Purchase Price is snapshotted when the vendor load is confirmed. NetSuite remains the accounting source of truth.</span><strong>${lines.length} PO line${lines.length === 1 ? "" : "s"}</strong></div>
+    <div class="smart-table-wrap"><table class="smart-table po-lines"><thead><tr><th>Item</th><th>Quantity</th><th>Rate</th><th>Amount</th><th>Destination</th><th>Received</th></tr></thead><tbody>${(current.lines || []).map((line) => lineRow(record, line)).join("") || `<tr><td colspan="6">No current NetSuite lines were mirrored.</td></tr>`}</tbody></table></div>
+    <footer><span>Created ${date(record.appCreatedAt, true)} · Archived ${date(record.archivedAt, true)}</span><span>NetSuite synced ${date(record.lastSyncedAt, true)} · Version ${date(record.remoteLastModifiedAt, true)}</span></footer>
+    ${snapshotSummary(record)}
   </article>`;
 }
 
-function poHeader() {
-  return `<header class="dispatch-topbar">
-    <div class="smart-brand"><div class="smart-brand-mark">PO</div><div><p>Smart SCM accounting handoff</p><h1>NetSuite PO</h1></div></div>
-    <span class="smart-mode">review before insert</span>
-    <div class="topbar-actions"><span class="dispatch-user">${poEscape(netSuitePoState.operator?.display_name || netSuitePoState.operator?.username || "")}</span><button type="button" onclick="location.href='/scm/smart'">Smart SCM</button><button type="button" onclick="location.href='/scm'">SCM menu</button><button type="button" onclick="dispatchLogout()">Logout</button></div>
-  </header>`;
-}
-
-function poRender() {
-  const loads = netSuitePoState.loads || [];
-  smartNetSuitePoApp.innerHTML = `${poHeader()}<div class="smart-main">
-    ${netSuitePoState.error ? `<div class="smart-notice error">${poEscape(netSuitePoState.error)}</div>` : ""}
-    ${netSuitePoState.notice ? `<div class="smart-notice">${poEscape(netSuitePoState.notice)}</div>` : ""}
-    ${netSuitePoState.busy ? `<div class="smart-notice">${poEscape(netSuitePoState.busy)}…</div>` : ""}
-    <section class="smart-section">
-      <div class="smart-section-head"><div><h2>Staged purchase orders</h2><p>Review vendor-confirmed quantities, adjust Official PALLET lines when needed, and verify snapshotted Last Purchase Price before any accounting record is inserted.</p></div><span class="smart-help">${loads.length} load(s)</span></div>
-      <div class="smart-toolbar smart-po-toolbar"><input id="smartPoSearch" type="search" value="${poEscape(netSuitePoState.search)}" placeholder="Search review, vendor, item, or yard" /><select id="smartPoView"><option value="pending" ${netSuitePoState.view === "pending" ? "selected" : ""}>Pending insertion</option><option value="completed" ${netSuitePoState.view === "completed" ? "selected" : ""}>Inserted</option><option value="removed" ${netSuitePoState.view === "removed" ? "selected" : ""}>Removed</option><option value="all" ${netSuitePoState.view === "all" ? "selected" : ""}>All reviews</option></select><button class="smart-button" data-po-action="refresh" type="button">Refresh</button></div>
-      <div class="smart-proposals smart-po-review-list">${loads.map(poLoadCard).join("") || `<div class="smart-empty">No NetSuite PO review matches this filter. Confirm a vendor load to stage its confirmed lines here.</div>`}</div>
+function render() {
+  poApp.innerHTML = `<header class="dispatch-topbar"><div class="smart-brand"><div class="smart-brand-mark">PO</div><div><p>Smart SCM accounting history</p><h1>NetSuite PO history</h1></div></div><span class="smart-mode">live NetSuite data</span><div class="topbar-actions"><span class="dispatch-user">${esc(poState.operator?.display_name || poState.operator?.username || "")}</span><button onclick="location.href='/scm/smart'">Smart SCM</button><button onclick="location.href='/scm'">SCM menu</button><button onclick="dispatchLogout()">Logout</button></div></header>
+  <div class="smart-main">
+    ${poState.error ? `<div class="smart-notice error">${esc(poState.error)}</div>` : ""}${poState.syncWarning ? `<div class="smart-notice po-sync-warning">${esc(poState.syncWarning)}</div>` : ""}${poState.notice ? `<div class="smart-notice">${esc(poState.notice)}</div>` : ""}${poState.busy ? `<div class="smart-notice">${esc(poState.busy)}…</div>` : ""}
+    <section class="smart-section"><div class="smart-section-head"><div><h2>Archived application-created POs</h2><p>Creation evidence is preserved while current status, prices, quantities, dates and destinations come from NetSuite.</p></div><span class="smart-help">${poState.total} PO(s)</span></div>
+      <div class="po-filters">
+        <input id="poSearch" type="search" value="${esc(poState.filters.search)}" placeholder="Search PO, vendor, item or yard">
+        <label>Created from<input id="poCreatedFrom" type="date" value="${esc(poState.filters.createdFrom)}"></label>
+        <label>Created to<input id="poCreatedTo" type="date" value="${esc(poState.filters.createdTo)}"></label>
+        <select id="poVendor">${optionList(poState.options.vendors, poState.filters.vendorId, "All vendors")}</select>
+        <select id="poVendorYard">${optionList(poState.options.vendorYards, poState.filters.vendorYard, "All vendor yards")}</select>
+        <select id="poDestination">${optionList(poState.options.destinations, poState.filters.destinationLocationId, "All destination yards")}</select>
+        <button class="smart-button primary" data-action="filter">Apply</button><button class="smart-button" data-action="clear">Clear</button>
+      </div>
+      <div class="po-history-list">${poState.records.map(card).join("") || `<div class="smart-empty">No archived application-created PO matches these filters.</div>`}</div>
+      <nav class="po-pagination"><button class="smart-button" data-action="previous" ${poState.page <= 1 ? "disabled" : ""}>Previous</button><span>Page ${poState.page} of ${poState.totalPages}</span><button class="smart-button" data-action="next" ${poState.page >= poState.totalPages ? "disabled" : ""}>Next</button></nav>
     </section>
-  </div>`;
+  </div>${poState.pdf ? `<div class="po-modal" role="dialog" aria-modal="true"><div class="po-modal-card"><header><strong>${esc(poState.pdf.label)}</strong><button data-action="close-pdf" aria-label="Close">×</button></header><iframe src="${esc(poState.pdf.url)}" title="NetSuite PO PDF"></iframe></div></div>` : ""}`;
 }
 
-async function poLoad({ quiet = false } = {}) {
-  if (!quiet) netSuitePoState.busy = "Loading staged purchase orders";
-  netSuitePoState.error = "";
-  poRender();
+function readFilters() {
+  poState.filters = {
+    search: document.getElementById("poSearch")?.value.trim() || "",
+    createdFrom: document.getElementById("poCreatedFrom")?.value || "",
+    createdTo: document.getElementById("poCreatedTo")?.value || "",
+    vendorId: document.getElementById("poVendor")?.value || "",
+    vendorYard: document.getElementById("poVendorYard")?.value || "",
+    destinationLocationId: document.getElementById("poDestination")?.value || ""
+  };
+  poState.filtersDirty = false;
+}
+
+async function load({ quiet = false, force = false } = {}) {
+  if (quiet && !force && quietRefreshBlocked()) return false;
+  const sequence = ++poState.loadSequence;
+  let discardQuietResponse = false;
+  if (!quiet) poState.busy = "Loading PO history";
+  poState.error = "";
+  if (!quiet) render();
   try {
-    const params = new URLSearchParams({ search: netSuitePoState.search, view: netSuitePoState.view, limit: "500" });
-    const payload = await poApi(`/api/scm/smart/netsuite-purchase-orders?${params}`);
-    netSuitePoState.loads = Array.isArray(payload) ? payload : (payload.loads || []);
+    const params = new URLSearchParams({ ...poState.filters, page: String(poState.page), pageSize: String(poState.pageSize) });
+    const payload = await api(`/api/scm/netsuite-po-history?${params}`);
+    if (sequence !== poState.loadSequence) return false;
+    if (quiet && !force && quietRefreshBlocked()) {
+      discardQuietResponse = true;
+      return false;
+    }
+    poState.records = payload.records || [];
+    poState.page = payload.page || 1;
+    poState.total = payload.total || 0;
+    poState.totalPages = payload.totalPages || 1;
   } catch (error) {
-    netSuitePoState.error = error.message;
+    if (sequence !== poState.loadSequence) return false;
+    if (quiet && !force && quietRefreshBlocked()) {
+      discardQuietResponse = true;
+      return false;
+    }
+    poState.error = error.message;
   } finally {
-    netSuitePoState.busy = "";
-    poRender();
+    if (sequence === poState.loadSequence && !discardQuietResponse) {
+      poState.busy = "";
+      render();
+    }
+  }
+  return true;
+}
+
+function changesForCard(cardElement, record) {
+  const current = record.current;
+  const header = {};
+  for (const input of cardElement.querySelectorAll("[data-head-field]")) {
+    const field = input.dataset.headField;
+    const original = field === "transactionDate" || field === "expectedDeliveryDate"
+      ? dateInput(current[field])
+      : String(current[field] || "");
+    if (input.value !== original) header[field] = input.value;
+  }
+  const currentByLine = new Map((current.lines || []).map((line) => [Number(line.lineId), line]));
+  const lines = [];
+  for (const row of cardElement.querySelectorAll("[data-po-line]")) {
+    const firstField = row.querySelector("[data-line-field]");
+    if (!firstField || firstField.disabled) continue;
+    const original = currentByLine.get(Number(row.dataset.poLine));
+    if (!original) continue;
+    const requested = { lineId: Number(row.dataset.poLine), itemId: original.itemId };
+    const quantity = row.querySelector('[data-line-field="quantity"]');
+    const rate = row.querySelector('[data-line-field="rate"]');
+    const destination = row.querySelector('[data-line-field="destinationLocationId"]');
+    if (quantity && !sameNumber(quantity.value, original.quantity)) requested.quantity = Number(quantity.value);
+    if (rate && !sameNumber(rate.value, original.rate ?? 0)) requested.rate = Number(rate.value);
+    if (destination && String(destination.value) !== String(original.destinationLocationId ?? "")) {
+      requested.destinationLocationId = Number(destination.value);
+    }
+    if (Object.keys(requested).length > 2) lines.push(requested);
+  }
+  return { header, lines };
+}
+
+async function reconcileFromNetSuite() {
+  if (poState.remoteSyncRunning || !poState.records.length || quietRefreshBlocked() || document.visibilityState !== "visible") return;
+  poState.remoteSyncRunning = true;
+  const oldest = [...poState.records].sort((left, right) => new Date(left.lastSyncedAt || 0) - new Date(right.lastSyncedAt || 0))[0];
+  try {
+    // One bounded server request reconciles the requested PO plus up to 24
+    // oldest stale app-created POs in a single SuiteQL batch.
+    await api(`/api/scm/netsuite-po-history/${oldest.id}/refresh`, { method: "POST", body: {} });
+    poState.syncWarning = "";
+    await load({ quiet: true });
+  } catch (error) {
+    poState.syncWarning = `Live NetSuite refresh delayed: ${error.message} Local history remains available.`;
+    if (!quietRefreshBlocked()) render();
+  } finally {
+    poState.remoteSyncRunning = false;
   }
 }
 
-smartNetSuitePoApp.addEventListener("click", async (event) => {
-  const button = event.target.closest("[data-po-action]");
-  if (!button || netSuitePoState.busy) return;
-  if (button.dataset.poAction === "refresh") {
-    netSuitePoState.search = document.getElementById("smartPoSearch")?.value || "";
-    netSuitePoState.view = document.getElementById("smartPoView")?.value || "pending";
-    await poLoad();
+async function act(button) {
+  const action = button.dataset.action;
+  if (poState.filtersDirty && !["filter", "clear"].includes(action)) readFilters();
+  if (action === "close-pdf") { poState.pdf = null; render(); return; }
+  if (["filter", "clear", "previous", "next"].includes(action) && poState.dirtyIds.size && !confirm("Discard unsaved PO edits and continue?")) return;
+  if (["filter", "clear", "previous", "next"].includes(action)) { poState.dirtyIds.clear(); poState.drafts.clear(); }
+  if (action === "filter") { readFilters(); poState.page = 1; await load(); return; }
+  if (action === "clear") { poState.filters = { search: "", createdFrom: "", createdTo: "", vendorId: "", vendorYard: "", destinationLocationId: "" }; poState.filtersDirty = false; poState.page = 1; await load(); return; }
+  if (action === "previous" || action === "next") { poState.page += action === "next" ? 1 : -1; await load(); return; }
+  const cardElement = button.closest("[data-history-id]");
+  if (!cardElement) return;
+  const id = Number(cardElement.dataset.historyId);
+  const record = poState.records.find((row) => row.id === id);
+  if (action === "pdf") { poState.pdf = { label: record.purchaseOrderRef, url: `/api/scm/netsuite-po-history/${id}/pdf` }; render(); return; }
+  if (action === "unarchive" && !confirm(`${record.purchaseOrderRef} will return to Vendor Replies and disappear from this history. Continue?`)) return;
+  const changes = action === "save" ? changesForCard(cardElement, record) : null;
+  if (action === "save" && !Object.keys(changes.header).length && !changes.lines.length) {
+    poState.notice = `${record.purchaseOrderRef} has no unsaved changes.`;
+    poState.dirtyIds.delete(id);
+    poState.drafts.delete(id);
+    render();
     return;
   }
-  if (["save-pallet", "reset-pallet"].includes(button.dataset.poAction)) {
-    const proposalId = Number(button.dataset.proposalId);
-    const destinationLocationId = Number(button.dataset.destinationLocationId);
-    const row = button.closest(".smart-po-pallet-line");
-    const rawQuantity = row?.querySelector("[data-po-pallet-quantity]")?.value || "";
-    const quantity = rawQuantity.trim() === "" ? Number.NaN : Number(rawQuantity);
-    if (button.dataset.poAction === "save-pallet" && (!Number.isFinite(quantity) || quantity < 0)) {
-      netSuitePoState.error = "PALLET quantity must be a number at or above zero.";
-      poRender();
-      return;
-    }
-    netSuitePoState.busy = button.dataset.poAction === "reset-pallet" ? "Restoring automatic PALLET quantity" : "Saving PALLET override";
-    netSuitePoState.error = "";
-    netSuitePoState.notice = "";
-    poRender();
-    try {
-      const updated = await poApi(`/api/scm/smart/netsuite-purchase-orders/${proposalId}/pallets/${destinationLocationId}`, {
-        method: "PATCH",
-        body: button.dataset.poAction === "reset-pallet" ? { reset: true } : { quantity }
-      });
-      netSuitePoState.loads = netSuitePoState.loads.map((load) => Number(load.id) === proposalId ? updated : load);
-      netSuitePoState.notice = button.dataset.poAction === "reset-pallet"
-        ? `Official PALLET for ${updated.palletLines?.find((line) => Number(line.destinationLocationId) === destinationLocationId)?.destinationName || destinationLocationId} now follows the automatic quantity.`
-        : `Official PALLET override saved at ${poNumber(quantity, 2)}.`;
-    } catch (error) {
-      netSuitePoState.error = error.message;
-    } finally {
-      netSuitePoState.busy = "";
-      poRender();
-    }
-    return;
-  }
-  if (button.dataset.poAction === "remove") {
-    const proposalId = Number(button.dataset.proposalId);
-    if (!confirm(`Remove staged PO review #${proposalId}? No NetSuite record will be changed. The local review and its lines will remain in Removed for audit history.`)) return;
-    netSuitePoState.busy = "Removing staged purchase order";
-    netSuitePoState.error = "";
-    netSuitePoState.notice = "";
-    poRender();
-    try {
-      await poApi(`/api/scm/smart/netsuite-purchase-orders/${proposalId}`, { method: "DELETE" });
-      netSuitePoState.notice = `Staged PO review #${proposalId} removed. No NetSuite transaction was created or changed.`;
-      await poLoad({ quiet: true });
-    } catch (error) {
-      netSuitePoState.busy = "";
-      netSuitePoState.error = error.message;
-      poRender();
-    }
-    return;
-  }
-  if (button.dataset.poAction !== "insert") return;
-  const proposalId = Number(button.dataset.proposalId);
-  if (!confirm(`Insert staged PO review #${proposalId} into NetSuite using the displayed Last Purchase Prices?`)) return;
-  netSuitePoState.busy = "Inserting purchase order into NetSuite";
-  netSuitePoState.error = "";
-  netSuitePoState.notice = "";
-  poRender();
+  poState.error = "";
+  poState.notice = "";
+  poState.busy = action === "save" ? "Saving changes to NetSuite" : action === "refresh" ? "Refreshing from NetSuite" : "Returning PO to Vendor Replies";
+  render();
   try {
-    const result = await poApi(`/api/scm/smart/netsuite-purchase-orders/${proposalId}/insert`, { method: "POST", body: {} });
-    netSuitePoState.notice = `${result.purchaseOrderRef || `PO review #${proposalId}`} inserted successfully.`;
-    await poLoad({ quiet: true });
+    if (action === "save") {
+      const saved = await api(`/api/scm/netsuite-po-history/${id}`, { method: "PATCH", body: { expectedLastModifiedAt: cardElement.dataset.version, ...changes } });
+      poState.dirtyIds.delete(id);
+      poState.drafts.delete(id);
+      poState.notice = saved.readbackPending
+        ? `${record.purchaseOrderRef} was accepted by NetSuite. Readback is still pending and will reconcile automatically.`
+        : `${record.purchaseOrderRef} was updated in NetSuite and read back successfully.`;
+    } else if (action === "refresh") {
+      await api(`/api/scm/netsuite-po-history/${id}/refresh`, { method: "POST", body: {} });
+      poState.notice = `${record.purchaseOrderRef} refreshed from NetSuite.`;
+    } else if (action === "unarchive") {
+      await api(`/api/scm/netsuite-po-history/${id}/unarchive`, { method: "POST", body: {} });
+      poState.dirtyIds.delete(id);
+      poState.drafts.delete(id);
+      poState.notice = `${record.purchaseOrderRef} returned to Vendor Replies.`;
+    }
+    poState.busy = "";
+    await load({ quiet: true, force: true });
   } catch (error) {
-    netSuitePoState.busy = "";
-    netSuitePoState.error = error.message;
-    poRender();
+    poState.error = error.status === 409 ? `${error.message} No local values were changed.` : error.message;
+    poState.busy = "";
+    render();
+  }
+}
+
+poApp.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-action]");
+  if (button && !poState.busy) act(button);
+});
+
+poApp.addEventListener("keydown", (event) => {
+  if (event.target.id === "poSearch" && event.key === "Enter") {
+    event.preventDefault();
+    if (poState.dirtyIds.size && !confirm("Discard unsaved PO edits and search?")) return;
+    poState.dirtyIds.clear();
+    poState.drafts.clear();
+    readFilters();
+    poState.page = 1;
+    load();
   }
 });
 
-smartNetSuitePoApp.addEventListener("change", async (event) => {
-  if (event.target.id !== "smartPoView") return;
-  netSuitePoState.view = event.target.value;
-  netSuitePoState.search = document.getElementById("smartPoSearch")?.value || "";
-  await poLoad();
+poApp.addEventListener("input", (event) => {
+  if (event.target.closest(".po-filters")) poState.filtersDirty = true;
+  const cardElement = event.target.closest("[data-history-id]");
+  if (cardElement && (event.target.matches("[data-head-field]") || event.target.matches("[data-line-field]"))) {
+    const id = Number(cardElement.dataset.historyId);
+    const record = poState.records.find((row) => row.id === id);
+    const draft = record ? changesForCard(cardElement, record) : { header: {}, lines: [] };
+    if (Object.keys(draft.header).length || draft.lines.length) {
+      poState.dirtyIds.add(id);
+      poState.drafts.set(id, draft);
+    } else {
+      poState.dirtyIds.delete(id);
+      poState.drafts.delete(id);
+    }
+  }
 });
 
-smartNetSuitePoApp.addEventListener("keydown", async (event) => {
-  if (event.target.id !== "smartPoSearch" || event.key !== "Enter") return;
-  event.preventDefault();
-  netSuitePoState.search = event.target.value;
-  await poLoad();
+poApp.addEventListener("change", (event) => {
+  if (event.target.closest(".po-filters")) poState.filtersDirty = true;
+  const cardElement = event.target.closest("[data-history-id]");
+  if (cardElement && (event.target.matches("[data-head-field]") || event.target.matches("[data-line-field]"))) {
+    const id = Number(cardElement.dataset.historyId);
+    const record = poState.records.find((row) => row.id === id);
+    const draft = record ? changesForCard(cardElement, record) : { header: {}, lines: [] };
+    if (Object.keys(draft.header).length || draft.lines.length) {
+      poState.dirtyIds.add(id);
+      poState.drafts.set(id, draft);
+    } else {
+      poState.dirtyIds.delete(id);
+      poState.drafts.delete(id);
+    }
+  }
 });
 
-window.addEventListener("mbbs-language-changed", poRender);
+function startEvents() {
+  if (!("EventSource" in window) || poState.events) return;
+  poState.events = new EventSource("/api/events?client=scm-netsuite-po-history");
+  poState.events.addEventListener("app-event", (message) => {
+    try {
+      const event = JSON.parse(message.data || "{}");
+      if (event.type === "scm.smart.updated" || event.type === "receiving.order.updated") load({ quiet: true });
+    } catch { /* malformed events are ignored; timed refresh remains active */ }
+  });
+}
+
+setInterval(() => { if (poState.operator) reconcileFromNetSuite(); }, 60000);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && poState.operator && !poState.busy) {
+    load({ quiet: true }).then(() => reconcileFromNetSuite());
+  }
+});
+window.addEventListener("beforeunload", () => poState.events?.close());
 
 requireDispatchLogin({
-  mount: smartNetSuitePoApp,
-  roles: ["admin", "scm", "scm_staff", "dispatcher", "yard_manager"],
+  mount: poApp,
+  roles: ["admin", "scm", "scm_staff"],
   async onReady(operator) {
-    netSuitePoState.operator = operator;
-    poRender();
-    await poLoad();
+    poState.operator = operator;
+    render();
+    try { poState.options = await api("/api/scm/netsuite-po-history/options"); } catch (error) { poState.error = error.message; }
+    startEvents();
+    await load();
+    void reconcileFromNetSuite();
   }
 });

@@ -132,11 +132,59 @@ function sortedPlans(rows) {
     id: row.id,
     planDate: planDateValue(row.plan_date),
     status: row.status,
+    revision: Number(row.revision || 0),
     summary: row.summary || {},
     ownYardCodes: Array.isArray(row.own_yard_codes) ? row.own_yard_codes : undefined,
     orders: Array.isArray(row.orders) ? row.orders : [],
     trucks: Array.isArray(row.trucks) ? row.trucks : []
   }));
+}
+
+async function overlayLiveVrmaRouteDetails(plans = []) {
+  const refs = [...new Set(plans.flatMap((plan) =>
+    (plan.orders || []).map((order) => String(order?.id || "").trim()).filter(Boolean)
+  ))];
+  if (!refs.length) return plans;
+  const result = await query(
+    `SELECT vrma_ref, pickup_location
+       FROM scm_vrma_orders
+      WHERE lower(vrma_ref) = ANY($1::text[])
+        AND cancelled_at IS NULL
+        AND lower(COALESCE(status, '')) <> 'cancelled'`,
+    [refs.map((ref) => ref.toLowerCase())]
+  );
+  const liveByRef = new Map(result.rows.map((row) => [
+    String(row.vrma_ref || "").trim().toLowerCase(),
+    String(row.pickup_location || "").trim()
+  ]));
+  if (!liveByRef.size) return plans;
+
+  for (const plan of plans) {
+    for (const order of plan.orders || []) {
+      const pickup = liveByRef.get(String(order?.id || "").trim().toLowerCase());
+      if (!pickup) continue;
+      const address = yardAddress(pickup);
+      order.sourceYard = pickup;
+      order.pickupLocations = [pickup];
+      order.sourceAddress = address;
+      order.defaultSourceAddress = address;
+      order.raw = {
+        ...(order.raw && typeof order.raw === "object" && !Array.isArray(order.raw) ? order.raw : {}),
+        pickup_location: pickup,
+        source_address: address
+      };
+    }
+    for (const truck of plan.trucks || []) {
+      for (const load of truck.loads || []) {
+        for (const stop of load.stops || []) {
+          if (stop?.type !== "pick") continue;
+          const pickup = liveByRef.get(String(stop.orderId || "").trim().toLowerCase());
+          if (pickup) stop.location = pickup;
+        }
+      }
+    }
+  }
+  return plans;
 }
 
 function assignedTruckForLoad(truck = {}, load = {}) {
@@ -260,7 +308,7 @@ function physicalAddressRegionCompatible(left, right) {
   return !leftMunicipality || !rightMunicipality || leftMunicipality === rightMunicipality;
 }
 
-function samePhysicalAddress(left, right) {
+export function samePhysicalAddress(left, right) {
   if ((left && typeof left === "object") || (right && typeof right === "object")) return false;
   const leftKey = normalizedPhysicalText(left);
   const rightKey = normalizedPhysicalText(right);
@@ -386,10 +434,13 @@ function stopLocationLabel(plan, stop) {
 
 function pickupAddressForStop(plan, stop) {
   const order = orderByRef(plan, stop?.orderId) || {};
+  const pickupLocation = String(stop?.location || "");
   return String(
     order.pickupAddressOverride
-    || yardAddress(stop?.location)
+    || YARD_ADDRESSES[pickupLocation]
     || order.sourceAddress
+    || order.defaultSourceAddress
+    || pickupLocation
     || ""
   );
 }
@@ -776,15 +827,17 @@ async function jobStatusMap(jobIds) {
   return new Map(result.rows.map((row) => [row.job_id, row]));
 }
 
-async function confirmedPlans() {
+async function confirmedPlans({ startDate = "" } = {}) {
   const result = await query(
-    `SELECT p.id, p.plan_date, p.status, s.orders, s.trucks, s.summary
+    `SELECT p.id, p.plan_date, p.status, p.revision, s.orders, s.trucks, s.summary
        FROM dispatch_plans p
        INNER JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
       WHERE p.status = 'confirmed'
-      ORDER BY p.plan_date ASC, p.updated_at ASC`
+        AND ($1 = '' OR p.plan_date >= $1::date)
+      ORDER BY p.plan_date ASC, p.updated_at ASC`,
+    [String(startDate || "").trim()]
   );
-  return sortedPlans(result.rows);
+  return overlayLiveVrmaRouteDetails(sortedPlans(result.rows));
 }
 
 function planJobsForTruck(plan, truck, truckIndex) {
@@ -870,12 +923,13 @@ export function planJobsForDriver(plan, driverLogin) {
   return jobs;
 }
 
-async function activeDriverAssignment(driverLogin) {
+async function activeDriverAssignment(driverLogin, date = "") {
   const login = driverKey(driverLogin);
-  const today = todayLocalDate();
+  const requestedDate = planDateValue(date);
+  const today = requestedDate || todayLocalDate();
   const matches = [];
-  for (const plan of await confirmedPlans()) {
-    if (plan.planDate < today) continue;
+  for (const plan of await confirmedPlans({ startDate: today })) {
+    if (requestedDate && planDateValue(plan.planDate) !== requestedDate) continue;
     const assignments = driverLoadAssignments(plan, login);
     if (!assignments.length) continue;
     matches.push({
@@ -1008,11 +1062,16 @@ async function clearUnconfirmedDvirIfNeeded(row) {
   return result.rows[0] || row;
 }
 
-export async function getDriverDayState(driverLogin, { samsaraUsername = "", samsaraAccounts = {} } = {}) {
+export async function getDriverDayState(driverLogin, {
+  samsaraUsername = "",
+  samsaraAccounts = {},
+  date = ""
+} = {}) {
   const normalizedSamsaraAccounts = samsaraAccountsFromLegacy(samsaraUsername, samsaraAccounts);
   const samsaraEnabled = normalizedSamsaraAccounts.enabled === true;
-  const assignment = await activeDriverAssignment(driverLogin);
-  const plan = assignment?.plan || { id: null, planDate: todayLocalDate() };
+  const requestedDate = planDateValue(date);
+  const assignment = await activeDriverAssignment(driverLogin, requestedDate);
+  const plan = assignment?.plan || { id: null, planDate: requestedDate || todayLocalDate() };
   const initialTruck = assignment?.initialTruck || assignment?.truck || {};
   let row = await upsertDriverDayBase({ driverLogin, plan, truck: initialTruck, samsaraAccounts: normalizedSamsaraAccounts });
   if (samsaraEnabled) row = await clearUnconfirmedDvirIfNeeded(row);
@@ -1316,19 +1375,25 @@ export async function ensureDriverSamsaraDutyForJob(driverLogin, { samsaraUserna
       remark: `MBBS automatic 8-hour handoff from primary account with ${truck.plate}`
     });
   } catch (error) {
+    const failure = error instanceof Error ? error : new Error(String(error || "Samsara duty handoff failed."));
+    failure.samsaraPartialOutcome = {
+      secondaryAssignment,
+      secondaryDuty,
+      primaryOffDuty
+    };
     await query(
       `UPDATE driver_day_records
           SET samsara_handoff_response = $2::jsonb,
               updated_at = now()
         WHERE id = $1`,
       [row.id, JSON.stringify({
-        error: error.message,
+        error: failure.message,
         secondaryAssignment,
         secondaryDuty,
         primaryOffDuty
       })]
     );
-    throw error;
+    throw failure;
   }
 
   await query(
@@ -1754,27 +1819,22 @@ async function orderDetails(orderRef, typeHint = "", planOrder = null, context =
   };
 }
 
-export async function getNextDriverJob(driverLogin) {
-  const assignment = await activeDriverAssignment(driverLogin);
-  if (!assignment) return null;
-  const jobs = planJobsForDriver(assignment.plan, driverLogin);
-  const jobIds = jobs.map((job) => job.jobId);
-  const completed = await completedJobIds(jobIds);
-  const statuses = await jobStatusMap(jobIds);
-  const next = jobs.find((job) => !completed.has(job.jobId));
-  if (!next) return null;
-  const status = statuses.get(next.jobId);
-  next.status = status?.status || "pending";
-  next.startedAt = status?.started_at || null;
-  next.completedAt = status?.completed_at || null;
-  if (next.stopType === "travel") {
-    next.address = await locationAddress(next.toLocation || next.address);
-    next.fromAddress = await locationAddress(next.fromLocation || next.fromAddress);
-  } else if (next.stopType === "pickup") {
-    next.address = await locationAddress(next.address || next.location);
+async function materializeDriverJob(plan, job, status = null) {
+  const materialized = {
+    ...job,
+    status: status?.status || "pending",
+    startedAt: status?.started_at || null,
+    completedAt: status?.completed_at || null
+  };
+  if (materialized.stopType === "travel") {
+    materialized.address = await locationAddress(materialized.toLocation || materialized.address);
+    materialized.fromAddress = await locationAddress(materialized.fromLocation || materialized.fromAddress);
+  } else if (materialized.stopType === "pickup") {
+    materialized.address = await locationAddress(materialized.address || materialized.location);
   }
-  const details = await Promise.all(next.orderRefs.map((ref) => {
-    const dependencyManifest = (next.dependencyPickupManifests || []).find((entry) => String(entry.transferOrderRef || "") === String(ref));
+  materialized.orders = await Promise.all(materialized.orderRefs.map((ref) => {
+    const dependencyManifest = (materialized.dependencyPickupManifests || [])
+      .find((entry) => String(entry.transferOrderRef || "") === String(ref));
     if (dependencyManifest) {
       return {
         orderRef: dependencyManifest.transferOrderRef,
@@ -1795,21 +1855,95 @@ export async function getNextDriverJob(driverLogin) {
         }))
       };
     }
-    const hint = orderByRef(assignment.plan, ref)?.type || (next.orderTypes.length === 1 ? next.orderTypes[0] : "");
-    return orderDetails(ref, hint, orderByRef(assignment.plan, ref), {
-      plan: assignment.plan,
-      stopType: next.stopType,
-      pickupLocation: next.stopType === "pickup" ? next.pickupLocation || next.location : "",
-      dropLocation: next.stopType === "dropoff" ? next.dropLocation || next.location : "",
-      destinationLocationId: next.destinationLocationId ?? null,
-      lineRowIds: next.stopType === "dropoff" ? next.lineRowIds || [] : []
+    const hint = orderByRef(plan, ref)?.type
+      || (materialized.orderTypes.length === 1 ? materialized.orderTypes[0] : "");
+    return orderDetails(ref, hint, orderByRef(plan, ref), {
+      plan,
+      stopType: materialized.stopType,
+      pickupLocation: materialized.stopType === "pickup"
+        ? materialized.pickupLocation || materialized.location
+        : "",
+      dropLocation: materialized.stopType === "dropoff"
+        ? materialized.dropLocation || materialized.location
+        : "",
+      destinationLocationId: materialized.destinationLocationId ?? null,
+      lineRowIds: materialized.stopType === "dropoff" ? materialized.lineRowIds || [] : []
     });
   }));
-  return { ...next, orders: details };
+  return materialized;
 }
 
-function driverJobRecordDetails(job = {}) {
+export async function getDriverDayJobs(driverLogin, { date = "" } = {}) {
+  const planDate = planDateValue(date) || todayLocalDate();
+  const login = driverKey(driverLogin);
+  const plans = await confirmedPlans({ startDate: planDate });
+  const plan = plans.find((candidate) =>
+    candidate.planDate === planDate
+    && driverLoadAssignments(candidate, login).length > 0
+  );
+  if (!plan) {
+    return {
+      planId: null,
+      planDate,
+      revision: 0,
+      jobs: []
+    };
+  }
+  const jobs = planJobsForDriver(plan, login);
+  const statuses = await jobStatusMap(jobs.map((job) => job.jobId));
   return {
+    planId: plan.id,
+    planDate: plan.planDate,
+    revision: Number(plan.revision || 0),
+    jobs: await Promise.all(jobs.map((job) => materializeDriverJob(plan, job, statuses.get(job.jobId))))
+  };
+}
+
+export async function getDriverNextJobContext(driverLogin) {
+  const assignment = await activeDriverAssignment(driverLogin);
+  if (!assignment) {
+    return {
+      planId: null,
+      planDate: "",
+      revision: 0,
+      jobs: [],
+      job: null
+    };
+  }
+  const jobs = planJobsForDriver(assignment.plan, driverLogin);
+  const jobIds = jobs.map((job) => job.jobId);
+  const completed = await completedJobIds(jobIds);
+  const statuses = await jobStatusMap(jobIds);
+  const next = jobs.find((job) => !completed.has(job.jobId));
+  return {
+    planId: assignment.plan.id,
+    planDate: assignment.plan.planDate,
+    revision: Number(assignment.plan.revision || 0),
+    jobs,
+    job: next
+      ? await materializeDriverJob(assignment.plan, next, statuses.get(next.jobId))
+      : null
+  };
+}
+
+export async function getNextDriverJob(driverLogin) {
+  return (await getDriverNextJobContext(driverLogin)).job;
+}
+
+function driverRemarkValue(value) {
+  if (value === undefined || value === null) return undefined;
+  const remark = String(value).trim();
+  if (remark.length > 1000) {
+    throw Object.assign(new Error("Driver remark is too long."), {
+      status: 400,
+      code: "DRIVER_REMARK_TOO_LONG"
+    });
+  }
+  return remark;
+}
+
+function driverJobRecordDetails(job = {}, { driverRemark } = {}) {
+  const details = {
     schemaVersion: 1,
     driverName: job.driverName || "",
     parkingSpot: job.parkingSpot || "",
@@ -1840,9 +1974,16 @@ function driverJobRecordDetails(job = {}) {
       }))
     }))
   };
+  const normalizedRemark = driverRemarkValue(driverRemark);
+  if (normalizedRemark !== undefined) details.driverRemark = normalizedRemark;
+  return details;
 }
 
-export async function startDriverJob(driverLogin, jobIdValue, { job = null } = {}) {
+export async function startDriverJob(driverLogin, jobIdValue, {
+  job = null,
+  occurredAt = null,
+  offlineTrace = null
+} = {}) {
   if (!job) throw new Error("Driver job is no longer available.");
   const result = await query(
     `INSERT INTO driver_job_records (
@@ -1850,11 +1991,11 @@ export async function startDriverJob(driverLogin, jobIdValue, { job = null } = {
        stop_id, stop_type, order_refs, photo_data_urls, status, started_at, completed_at, job_details
      ) VALUES (
        $1, $2, $3, $4, $5, $6, $7, $8,
-       $9, $10, $11::jsonb, '[]'::jsonb, 'in_progress', now(), NULL, $12::jsonb
+       $9, $10, $11::jsonb, '[]'::jsonb, 'in_progress', COALESCE($13::timestamptz, now()), NULL, $12::jsonb
      )
      ON CONFLICT (job_id) DO UPDATE SET
        status = CASE WHEN driver_job_records.status = 'complete' THEN driver_job_records.status ELSE 'in_progress' END,
-       started_at = COALESCE(driver_job_records.started_at, now()),
+       started_at = COALESCE(driver_job_records.started_at, EXCLUDED.started_at, now()),
        plan_id = EXCLUDED.plan_id,
        plan_date = EXCLUDED.plan_date,
        driver_login = EXCLUDED.driver_login,
@@ -1879,9 +2020,31 @@ export async function startDriverJob(driverLogin, jobIdValue, { job = null } = {
       job?.stopId || "",
       job?.stopType || "",
       JSON.stringify(job?.orderRefs || []),
-      JSON.stringify(driverJobRecordDetails(job || {}))
+      JSON.stringify(driverJobRecordDetails(job || {})),
+      occurredAt || null
     ]
   );
+  if (offlineTrace?.eventId) {
+    await query(
+      `UPDATE driver_job_records
+          SET source_offline_event_id = $2::uuid,
+              device_occurred_at = COALESCE($3::timestamptz, device_occurred_at),
+              server_received_at = COALESCE($4::timestamptz, server_received_at),
+              server_applied_at = COALESCE($5::timestamptz, now()),
+              location_status = COALESCE(NULLIF($6, ''), location_status),
+              location_details = COALESCE(location_details, '{}'::jsonb) || $7::jsonb
+        WHERE job_id = $1`,
+      [
+        jobIdValue,
+        offlineTrace.eventId,
+        occurredAt || offlineTrace.occurredAt || null,
+        offlineTrace.receivedAt || null,
+        offlineTrace.appliedAt || null,
+        offlineTrace.locationStatus || "",
+        JSON.stringify(offlineTrace.locationDetails || {})
+      ]
+    );
+  }
   await query(
     `UPDATE dispatch_plan_load_assignments
         SET started = true, updated_at = now()
@@ -1942,7 +2105,12 @@ export async function getDriverRestSummary(driverLogin, { planDate = "" } = {}) 
   };
 }
 
-export async function startDriverRest(driverLogin, { nextJob = null } = {}) {
+export async function startDriverRest(driverLogin, {
+  nextJob = null,
+  restId = "",
+  occurredAt = null,
+  offlineTrace = null
+} = {}) {
   if (!nextJob) throw new Error("No next job is available for rest.");
   const login = driverKey(driverLogin);
   const active = await getActiveDriverRest(login);
@@ -1962,11 +2130,11 @@ export async function startDriverRest(driverLogin, { nextJob = null } = {}) {
        load_id, load_name, previous_job_id, next_job_id, status, started_at
      ) VALUES (
        $1, $2, $3, $4, $5, $6,
-       $7, $8, $9, $10, 'active', now()
+       $7, $8, $9, $10, 'active', COALESCE($11::timestamptz, now())
      )
      RETURNING *`,
     [
-      crypto.randomUUID(),
+      String(restId || crypto.randomUUID()),
       nextJob.planId || null,
       nextJob.planDate || null,
       login,
@@ -1975,34 +2143,88 @@ export async function startDriverRest(driverLogin, { nextJob = null } = {}) {
       nextJob.loadId || "",
       nextJob.loadName || "",
       previous.rows[0]?.job_id || "",
-      nextJob.jobId || ""
+      nextJob.jobId || "",
+      occurredAt || null
     ]
   );
+  if (offlineTrace?.eventId && inserted.rows[0]?.id) {
+    await query(
+      `UPDATE driver_rest_records
+          SET source_offline_event_id = $2::uuid,
+              device_occurred_at = COALESCE($3::timestamptz, device_occurred_at),
+              server_received_at = COALESCE($4::timestamptz, server_received_at),
+              server_applied_at = COALESCE($5::timestamptz, now()),
+              location_status = COALESCE(NULLIF($6, ''), location_status),
+              location_details = COALESCE(location_details, '{}'::jsonb) || $7::jsonb
+        WHERE id = $1`,
+      [
+        inserted.rows[0].id,
+        offlineTrace.eventId,
+        occurredAt || offlineTrace.occurredAt || null,
+        offlineTrace.receivedAt || null,
+        offlineTrace.appliedAt || null,
+        offlineTrace.locationStatus || "",
+        JSON.stringify(offlineTrace.locationDetails || {})
+      ]
+    );
+  }
   return mapRestRecord(inserted.rows[0]);
 }
 
-export async function endDriverRest(driverLogin) {
+export async function endDriverRest(driverLogin, {
+  restId = "",
+  occurredAt = null,
+  offlineTrace = null
+} = {}) {
   const result = await query(
     `UPDATE driver_rest_records
         SET status = 'complete',
-            ended_at = now(),
+            ended_at = COALESCE($3::timestamptz, now()),
             updated_at = now()
       WHERE id = (
         SELECT id
           FROM driver_rest_records
          WHERE driver_login = $1
+           AND ($2 = '' OR rest_id = $2)
            AND status = 'active'
            AND ended_at IS NULL
          ORDER BY started_at DESC
          LIMIT 1
       )
       RETURNING *`,
-    [driverKey(driverLogin)]
+    [driverKey(driverLogin), String(restId || ""), occurredAt || null]
   );
+  if (offlineTrace?.eventId && result.rows[0]?.id) {
+    await query(
+      `UPDATE driver_rest_records
+          SET source_offline_event_id = $2::uuid,
+              device_occurred_at = COALESCE($3::timestamptz, device_occurred_at),
+              server_received_at = COALESCE($4::timestamptz, server_received_at),
+              server_applied_at = COALESCE($5::timestamptz, now()),
+              location_status = COALESCE(NULLIF($6, ''), location_status),
+              location_details = COALESCE(location_details, '{}'::jsonb) || $7::jsonb
+        WHERE id = $1`,
+      [
+        result.rows[0].id,
+        offlineTrace.eventId,
+        occurredAt || offlineTrace.occurredAt || null,
+        offlineTrace.receivedAt || null,
+        offlineTrace.appliedAt || null,
+        offlineTrace.locationStatus || "",
+        JSON.stringify(offlineTrace.locationDetails || {})
+      ]
+    );
+  }
   return mapRestRecord(result.rows[0]);
 }
 
-export async function recordDriverJobPhotos(driverLogin, jobIdValue, { photoDataUrls = [], job = null } = {}) {
+export async function recordDriverJobPhotos(driverLogin, jobIdValue, {
+  photoDataUrls = [],
+  job = null,
+  occurredAt = null,
+  offlineTrace = null,
+  driverRemark = undefined
+} = {}) {
   const photos = Array.isArray(photoDataUrls) ? photoDataUrls.filter(isPhotoReference) : [];
   const requiredPhotos = job && Number(job.requiredPhotos) === 0
     ? 0
@@ -2014,13 +2236,15 @@ export async function recordDriverJobPhotos(driverLogin, jobIdValue, { photoData
        stop_id, stop_type, order_refs, photo_data_urls, status, started_at, completed_at, job_details
      ) VALUES (
        $1, $2, $3, $4, $5, $6, $7, $8,
-       $9, $10, $11::jsonb, $12::jsonb, 'complete', COALESCE($13::timestamptz, now()), now(), $14::jsonb
+       $9, $10, $11::jsonb, $12::jsonb, 'complete',
+       COALESCE($13::timestamptz, $14::timestamptz, now()),
+       COALESCE($14::timestamptz, now()), $15::jsonb
      )
      ON CONFLICT (job_id) DO UPDATE SET
        photo_data_urls = EXCLUDED.photo_data_urls,
        status = 'complete',
        started_at = COALESCE(driver_job_records.started_at, EXCLUDED.started_at, now()),
-       completed_at = now(),
+       completed_at = COALESCE(driver_job_records.completed_at, EXCLUDED.completed_at, now()),
        job_details = COALESCE(driver_job_records.job_details, '{}'::jsonb) || EXCLUDED.job_details
      RETURNING *`,
     [
@@ -2037,9 +2261,31 @@ export async function recordDriverJobPhotos(driverLogin, jobIdValue, { photoData
       JSON.stringify(job?.orderRefs || []),
       JSON.stringify(photos),
       job?.startedAt || null,
-      JSON.stringify(driverJobRecordDetails(job || {}))
+      occurredAt || null,
+      JSON.stringify(driverJobRecordDetails(job || {}, { driverRemark }))
     ]
   );
+  if (offlineTrace?.eventId) {
+    await query(
+      `UPDATE driver_job_records
+          SET source_offline_event_id = $2::uuid,
+              device_occurred_at = COALESCE($3::timestamptz, device_occurred_at),
+              server_received_at = COALESCE($4::timestamptz, server_received_at),
+              server_applied_at = COALESCE($5::timestamptz, now()),
+              location_status = COALESCE(NULLIF($6, ''), location_status),
+              location_details = COALESCE(location_details, '{}'::jsonb) || $7::jsonb
+        WHERE job_id = $1`,
+      [
+        jobIdValue,
+        offlineTrace.eventId,
+        occurredAt || offlineTrace.occurredAt || null,
+        offlineTrace.receivedAt || null,
+        offlineTrace.appliedAt || null,
+        offlineTrace.locationStatus || "",
+        JSON.stringify(offlineTrace.locationDetails || {})
+      ]
+    );
+  }
   await refreshProjectedLoadExecution({ ...job, driverLogin: driverKey(driverLogin) });
   return result.rows[0];
 }
@@ -2079,7 +2325,10 @@ async function writeTruckSwitchFailure(driverLogin, job, error) {
   );
 }
 
-async function completeDriverTruckSwitchLocally(driverLogin, job, dayRecordId) {
+async function completeDriverTruckSwitchLocally(driverLogin, job, dayRecordId, {
+  occurredAt = null,
+  offlineTrace = null
+} = {}) {
   return withTransaction(async () => {
     const switchResult = await query(
       `INSERT INTO driver_truck_switch_records (
@@ -2091,7 +2340,7 @@ async function completeDriverTruckSwitchLocally(driverLogin, job, dayRecordId) {
          $1, $2, $3::date, $4,
          $5, $6, $7, $8,
          $9, $10, $11, $12,
-         'complete', '{"disabled":true}'::jsonb, '', now(), now()
+         'complete', '{"disabled":true}'::jsonb, '', COALESCE($13::timestamptz, now()), now()
        )
        ON CONFLICT (job_id) DO UPDATE SET
          status = 'complete',
@@ -2100,7 +2349,7 @@ async function completeDriverTruckSwitchLocally(driverLogin, job, dayRecordId) {
          samsara_vehicle_id = '',
          samsara_response = '{"disabled":true}'::jsonb,
          samsara_error = '',
-         confirmed_at = now(),
+         confirmed_at = COALESCE(driver_truck_switch_records.confirmed_at, EXCLUDED.confirmed_at),
          updated_at = now()
        RETURNING *`,
       [
@@ -2115,13 +2364,37 @@ async function completeDriverTruckSwitchLocally(driverLogin, job, dayRecordId) {
         job.switchYard || "",
         job.parkingSpot || "",
         job.loadId || "",
-        job.plannedSwitchMinute
+        job.plannedSwitchMinute,
+        occurredAt || offlineTrace?.occurredAt || null
       ]
     );
     const completedJob = await recordDriverJobPhotos(driverLogin, job.jobId, {
       photoDataUrls: [],
-      job
+      job,
+      occurredAt,
+      offlineTrace
     });
+    if (offlineTrace?.eventId && switchResult.rows[0]?.id) {
+      await query(
+        `UPDATE driver_truck_switch_records
+            SET source_offline_event_id = $2::uuid,
+                device_occurred_at = COALESCE($3::timestamptz, device_occurred_at),
+                server_received_at = COALESCE($4::timestamptz, server_received_at),
+                server_applied_at = COALESCE($5::timestamptz, now()),
+                location_status = COALESCE(NULLIF($6, ''), location_status),
+                location_details = COALESCE(location_details, '{}'::jsonb) || $7::jsonb
+          WHERE id = $1`,
+        [
+          switchResult.rows[0].id,
+          offlineTrace.eventId,
+          occurredAt || offlineTrace.occurredAt || null,
+          offlineTrace.receivedAt || null,
+          offlineTrace.appliedAt || null,
+          offlineTrace.locationStatus || "",
+          JSON.stringify(offlineTrace.locationDetails || {})
+        ]
+      );
+    }
     await query(
       `UPDATE driver_day_records
           SET truck_id = $2,
@@ -2149,7 +2422,12 @@ async function completeDriverTruckSwitchLocally(driverLogin, job, dayRecordId) {
   });
 }
 
-export async function confirmDriverTruckSwitch(driverLogin, job, { samsaraUsername = "", samsaraAccounts = {} } = {}) {
+export async function confirmDriverTruckSwitch(driverLogin, job, {
+  samsaraUsername = "",
+  samsaraAccounts = {},
+  occurredAt = null,
+  offlineTrace = null
+} = {}) {
   if (!job || job.stopType !== "truck_switch") throw new Error("This is not an active truck-switch job.");
   const normalizedAccounts = samsaraAccountsFromLegacy(samsaraUsername, samsaraAccounts);
   const assignment = await activeDriverAssignment(driverLogin);
@@ -2157,7 +2435,10 @@ export async function confirmDriverTruckSwitch(driverLogin, job, { samsaraUserna
   const initialTruck = assignment.initialTruck || assignment.truck || {};
   let row = await upsertDriverDayBase({ driverLogin, plan: assignment.plan, truck: initialTruck, samsaraAccounts: normalizedAccounts });
   if (!normalizedAccounts.enabled) {
-    return completeDriverTruckSwitchLocally(driverLogin, job, row.id);
+    return completeDriverTruckSwitchLocally(driverLogin, job, row.id, {
+      occurredAt,
+      offlineTrace
+    });
   }
   let samsaraHandoff = null;
   try {
@@ -2274,7 +2555,10 @@ export async function confirmDriverTruckSwitch(driverLogin, job, { samsaraUserna
   });
 }
 
-async function finalizeDriverTruckSwitchWithoutSamsara(row) {
+async function finalizeDriverTruckSwitchWithoutSamsara(row, {
+  occurredAt = null,
+  offlineTrace = null
+} = {}) {
   const job = {
     jobId: row.job_id,
     planId: row.plan_id,
@@ -2295,7 +2579,12 @@ async function finalizeDriverTruckSwitchWithoutSamsara(row) {
     orderRefs: [],
     requiredPhotos: 0
   };
-  const completedJob = await recordDriverJobPhotos(row.driver_login, row.job_id, { photoDataUrls: [], job });
+  const completedJob = await recordDriverJobPhotos(row.driver_login, row.job_id, {
+    photoDataUrls: [],
+    job,
+    occurredAt,
+    offlineTrace
+  });
   await query(
     `UPDATE driver_day_records
         SET truck_id = $3,
@@ -2401,6 +2690,73 @@ export async function skipDriverTruckSwitchSamsara(jobIdValue, driverLogin, {
     const row = result.rows[0];
     if (!row) throw new Error("This truck switch can no longer be skipped. Refresh and try again.");
     return finalizeDriverTruckSwitchWithoutSamsara(row);
+  });
+}
+
+export async function recordOfflineDriverTruckSwitch(driverLogin, job, {
+  occurredAt = null,
+  offlineTrace = null,
+  samsaraReconciliationRequired = true
+} = {}) {
+  if (!job || job.stopType !== "truck_switch") {
+    throw new Error("This is not a truck-switch job.");
+  }
+  if (!samsaraReconciliationRequired) {
+    const initialTruck = {
+      id: job.fromTruckId || job.truckId || "",
+      plate: job.fromTruckPlate || job.truckPlate || ""
+    };
+    const dayRecord = await upsertDriverDayBase({
+      driverLogin,
+      plan: {
+        id: job.planId || null,
+        planDate: job.planDate
+      },
+      truck: initialTruck,
+      samsaraAccounts: { enabled: false }
+    });
+    return completeDriverTruckSwitchLocally(driverLogin, job, dayRecord.id, {
+      occurredAt,
+      offlineTrace
+    });
+  }
+  return withTransaction(async () => {
+    await writeTruckSwitchFailure(
+      driverLogin,
+      job,
+      new Error("Physical truck switch was recorded offline. Samsara reconciliation is required.")
+    );
+    const result = await query(
+      `SELECT *
+         FROM driver_truck_switch_records
+        WHERE job_id = $1
+          AND lower(driver_login) = lower($2)
+        FOR UPDATE`,
+      [job.jobId, driverKey(driverLogin)]
+    );
+    if (!result.rowCount) throw new Error("The offline truck switch could not be recorded.");
+    if (offlineTrace?.eventId) {
+      await query(
+        `UPDATE driver_truck_switch_records
+            SET source_offline_event_id = $2::uuid,
+                device_occurred_at = COALESCE($3::timestamptz, device_occurred_at),
+                server_received_at = COALESCE($4::timestamptz, server_received_at),
+                server_applied_at = COALESCE($5::timestamptz, now()),
+                location_status = COALESCE(NULLIF($6, ''), location_status),
+                location_details = COALESCE(location_details, '{}'::jsonb) || $7::jsonb
+          WHERE job_id = $1`,
+        [
+          job.jobId,
+          offlineTrace.eventId,
+          occurredAt || offlineTrace.occurredAt || null,
+          offlineTrace.receivedAt || null,
+          offlineTrace.appliedAt || null,
+          offlineTrace.locationStatus || "",
+          JSON.stringify(offlineTrace.locationDetails || {})
+        ]
+      );
+    }
+    return finalizeDriverTruckSwitchWithoutSamsara(result.rows[0], { occurredAt, offlineTrace });
   });
 }
 
@@ -2515,6 +2871,7 @@ export async function listDriverHistory(driverLogin, { date = "", limit = 100 } 
             truck_id, truck_plate, load_id, load_name, stop_id, stop_type,
             COALESCE(order_refs, '[]'::jsonb) AS order_refs,
             COALESCE(photo_data_urls, '[]'::jsonb) AS photos,
+            COALESCE(job_details, '{}'::jsonb) AS job_details,
             status, started_at, completed_at, created_at
        FROM driver_job_records
       WHERE driver_login = $1
@@ -2542,6 +2899,7 @@ export async function listDriverHistory(driverLogin, { date = "", limit = 100 } 
         loadName: row.load_name,
         stopType: row.stop_type,
         orderRefs: row.order_refs || [],
+        driverRemark: row.job_details?.driverRemark || "",
         startedAt: row.started_at,
         completedAt: row.completed_at
       }

@@ -42,6 +42,44 @@ includesAll(schedule, [
   'params.set("search", search);',
   "scmScheduleLoadRequestId"
 ], "Resizable schedule grid, multi-select filters, and global onchange search");
+const scheduleQueryStart = schedule.indexOf("function scmScheduleQuery");
+const scheduleQueryEnd = schedule.indexOf("function normalizeScmSchedulePayload", scheduleQueryStart);
+assert(scheduleQueryStart >= 0 && scheduleQueryEnd > scheduleQueryStart,
+  "The PO/TO Schedule query builder could not be isolated.");
+const scheduleQueryContext = {
+  scmScheduleFilters: {
+    view: "scm working",
+    search: "cement",
+    status: ["Hold", "Queued"],
+    method: "Vendor",
+    kind: "PO",
+    dropoffPoint: "3445",
+    brand: ["Acme"],
+    from: "2026-08-01",
+    to: "2026-08-31"
+  },
+  scmScheduleReviewOnly: true,
+  scmScheduleCanShowScmWorkingControls: () => true,
+  URLSearchParams
+};
+vm.runInNewContext(
+  `${schedule.slice(scheduleQueryStart, scheduleQueryEnd)}; result = scmScheduleQuery();`,
+  scheduleQueryContext
+);
+const combinedScheduleParams = new URLSearchParams(String(scheduleQueryContext.result).replace(/^\?/, ""));
+assert.equal(combinedScheduleParams.get("search"), "cement");
+assert.deepEqual(combinedScheduleParams.getAll("status"), ["Hold", "Queued"]);
+for (const [key, value] of [
+  ["view", "scm working"],
+  ["method", "Vendor"],
+  ["kind", "PO"],
+  ["dropoffPoint", "3445"],
+  ["brand", "Acme"],
+  ["from", "2026-08-01"],
+  ["to", "2026-08-31"],
+  ["reconciliationStatus", "review"]
+]) assert.equal(combinedScheduleParams.get(key), value,
+  `${key} must remain active alongside global search.`);
 
 includesAll(poSplit, [
   "function scmLineSalesQuantity",
@@ -73,8 +111,16 @@ includesAll(vrma, [
   "vrmaLineSalesQuantity(line) * vrmaNumber(line.item?.itemWeight)",
   "Unit weight:",
   "data-vrma-line-weight",
-  "updateVrmaLineWeightDisplay(line)"
-], "VRMA weight UI");
+  "updateVrmaLineWeightDisplay(line)",
+  'data-action="delete-vrma"',
+  'method: "DELETE"',
+  "expectedUpdatedAt: scmVrmaDraft.concurrencyUpdatedAt",
+  "function activeVrmaRows"
+], "VRMA weight and safe-delete UI");
+assert.ok(
+  !/SCM_VRMA_MANUAL_STATUSES\s*=\s*\[[^\]]*"Cancelled"/.test(vrma),
+  "VRMA cancellation must use the audited Delete VRMA workflow."
+);
 
 includesAll(repository, [
   "'itemWeight', COALESCE(l.item_weight, 0)",
@@ -101,13 +147,22 @@ includesAll(repository, [
   "cardinality($2::text[]) = 0",
   "status = ANY($2::text[])",
   "cardinality($6::text[]) = 0",
-  "globalSearch ? [] : normalizeScmScheduleFilterValues(status)",
+  "normalizeScmScheduleFilterValues(status)",
   'String(view || "").trim().toLowerCase()',
   "load.value->>'driverName'",
   "load.value->>'truckPlate'",
   "NULLIF(s.dispatch_assignment_note, '')",
   "dispatch_assignment_note = EXCLUDED.dispatch_assignment_note"
-], "Batched enrichment, type-safe planning, multi-value filters, and view-preserving global search");
+], "Batched enrichment, type-safe planning, multi-value filters, and conjunctive global search");
+const scheduleParamsStart = repository.indexOf("const params = [", repository.indexOf("export async function listScmSchedule"));
+const scheduleParamsEnd = repository.indexOf("const result = await query", scheduleParamsStart);
+assert(scheduleParamsStart >= 0 && scheduleParamsEnd > scheduleParamsStart,
+  "The PO/TO Schedule repository filter parameters could not be isolated.");
+assert.doesNotMatch(
+  repository.slice(scheduleParamsStart, scheduleParamsEnd),
+  /globalSearch\s*\?/,
+  "Global search must not clear structured schedule filters before the SQL query."
+);
 includesAll(enrichment, [
   "export async function createPurchaseOrderDispatchEnricher",
   "Array.isArray(options.vendorYards)",
@@ -115,9 +170,9 @@ includesAll(enrichment, [
   "options.allowOllama !== false"
 ], "Reusable PO enrichment context");
 assert.equal((server.match(/req\.query\.includeSchedule === "false"/g) || []).length, 3, "Schedule mutations must support omitting unused full-list responses.");
-assert.ok(scheduleHtml.includes("/scm-schedule.js?v=20260730-status-visibility-v1"), "Schedule cache bust missing.");
+assert.ok(scheduleHtml.includes("/scm-schedule.js?v=20260801-conjunctive-filters-v1"), "Schedule cache bust missing.");
 assert.ok(poHtml.includes("/dispatch-scm.js?v=20260723-po-type-filters-v1"), "PO Split cache bust missing.");
-assert.ok(vrmaHtml.includes("/scm-vrma.js?v=20260718-scm-item-weight-v1"), "VRMA cache bust missing.");
+assert.ok(vrmaHtml.includes("/scm-vrma.js?v=20260730-vrma-delete-v1"), "VRMA cache bust missing.");
 
 const poStart = poSplit.indexOf("function scmNumber");
 const poEnd = poSplit.indexOf("function scmHasConversion");

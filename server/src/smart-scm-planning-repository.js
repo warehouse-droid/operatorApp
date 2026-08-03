@@ -3,9 +3,16 @@ import { writeAudit } from "./auth-repository.js";
 import { latestSmartScmForecastRunId, smartScmForecastMap } from "./smart-scm-forecast-repository.js";
 import { calculateSmartScmOrderRequirement, calculateSmartScmPolicyLevels } from "./smart-scm-policy-calculation.js";
 import { smartScmBuiltInRouteRule, smartScmIsGormleySource, smartScmRouteRuleKey, smartScmRouteRuleMap } from "./smart-scm-route-repository.js";
+import { listSmartScmActivePlanningExclusionItemIds } from "./smart-scm-planning-exclusion-repository.js";
 
 const EPSILON = 0.000001;
 export const SMART_SCM_MAX_PALLET_OVERRIDE_QUANTITY = 1_000_000;
+const MANUAL_CAPACITY_REASON_KEYS = Object.freeze([
+  "manualCapacityOverride",
+  "manualCapacityOverrideSource",
+  "manualCapacityOverrideWeightLbs",
+  "manualCapacityOverrideTruckCapacityLbs"
+]);
 const YARDS = Object.freeze([
   { code: "3445", locationId: 1, priority: 2 },
   { code: "2967", locationId: 28, priority: 3 },
@@ -14,6 +21,8 @@ const YARDS = Object.freeze([
 ]);
 const YARD_BY_ID = new Map(YARDS.map((yard) => [String(yard.locationId), yard]));
 const PO_STOP_PRIORITY = new Map([[26, 0], [15, 1], [1, 2], [28, 3]]);
+const URGENCY_LEVELS = Object.freeze(["normal", "urgent", "super_urgent", "ultimate_urgent"]);
+const URGENCY_RANK = new Map(URGENCY_LEVELS.map((level, index) => [level, index]));
 
 function number(value, fallback = 0) {
   const parsed = Number(value);
@@ -27,6 +36,72 @@ function positive(value, fallback = 0) {
 function round(value, places = 6) {
   const factor = 10 ** places;
   return Math.round((number(value) + Number.EPSILON) * factor) / factor;
+}
+
+export function smartScmUrgencyLevel(value, urgent = false) {
+  const level = String(value || "").trim().toLowerCase();
+  if (URGENCY_RANK.has(level)) return level === "normal" && urgent ? "urgent" : level;
+  return urgent ? "urgent" : "normal";
+}
+
+export function smartScmUrgencyRank(value, urgent = false) {
+  return URGENCY_RANK.get(smartScmUrgencyLevel(value, urgent)) || 0;
+}
+
+function urgencyScore(value, urgent = false) {
+  return urgent ? round(Math.min(100, Math.max(0, number(value))), 4) : 0;
+}
+
+export function smartScmUrgencySummary(lines = []) {
+  let level = "normal";
+  let score = 0;
+  for (const line of lines) {
+    const lineUrgent = Boolean(line?.urgent) || smartScmUrgencyRank(line?.urgencyLevel ?? line?.urgency_level) > 0;
+    const lineLevel = smartScmUrgencyLevel(line?.urgencyLevel ?? line?.urgency_level, lineUrgent);
+    const lineScore = urgencyScore(line?.urgencyScore ?? line?.urgency_score, lineUrgent);
+    const rankDifference = smartScmUrgencyRank(lineLevel) - smartScmUrgencyRank(level);
+    if (rankDifference > 0 || (rankDifference === 0 && lineScore > score)) {
+      level = lineLevel;
+      score = lineScore;
+    }
+  }
+  return { urgent: smartScmUrgencyRank(level) > 0, urgencyLevel: level, urgencyScore: score };
+}
+
+function empiricalPercentRank(value, sortedValues = []) {
+  if (!sortedValues.length || value <= EPSILON) return 0;
+  if (sortedValues.length === 1) return 100;
+  let first = sortedValues.findIndex((candidate) => candidate >= value - EPSILON);
+  if (first < 0) first = sortedValues.length - 1;
+  let last = first;
+  while (last + 1 < sortedValues.length && Math.abs(sortedValues[last + 1] - value) <= EPSILON) last += 1;
+  return round((((first + last) / 2) / (sortedValues.length - 1)) * 100, 4);
+}
+
+export function classifySmartScmUrgency(states = []) {
+  const demandByYard = new Map();
+  for (const state of states) {
+    const yardId = Number(state?.policy?.location_id ?? state?.locationId);
+    const demand = positive(state?.weeklyDemand);
+    if (!Number.isInteger(yardId) || demand <= EPSILON) continue;
+    if (!demandByYard.has(yardId)) demandByYard.set(yardId, []);
+    demandByYard.get(yardId).push(demand);
+  }
+  for (const demands of demandByYard.values()) demands.sort((left, right) => left - right);
+  for (const state of states) {
+    const yardId = Number(state?.policy?.location_id ?? state?.locationId);
+    const score = empiricalPercentRank(positive(state?.weeklyDemand), demandByYard.get(yardId) || []);
+    const isUrgent = Boolean(state?.urgent);
+    let level = "normal";
+    if (isUrgent) {
+      if (number(state?.rawAvailableSales ?? state?.availableSales) > 0 || score < 50) level = "urgent";
+      else if (score < 80) level = "super_urgent";
+      else level = "ultimate_urgent";
+    }
+    state.urgencyLevel = level;
+    state.urgencyScore = urgencyScore(score, isUrgent);
+  }
+  return states;
 }
 
 export function smartScmNormalizePalletQuantityOverrides(value = {}) {
@@ -167,8 +242,127 @@ async function settingsRow() {
   return result.rows[0];
 }
 
-async function planningPolicies() {
+export async function smartScmAvailableBlanketBalanceByItem() {
   const result = await query(
+    `WITH sales_alloc AS (
+       SELECT po_line_id,
+              SUM(allocated_pallet_qty) AS pallet_qty,
+              SUM(allocated_sales_qty) AS sales_qty
+         FROM dispatch_so_po_allocations
+        WHERE status = 'active'
+        GROUP BY po_line_id
+     ), split_alloc AS (
+       SELECT split_line.source_line_id,
+              SUM(split_line.pallet_qty) AS pallet_qty,
+              SUM(split_line.sales_qty) AS sales_qty
+         FROM dispatch_scm_po_split_lines split_line
+         JOIN dispatch_scm_po_splits split_header
+           ON split_header.id = split_line.split_id
+          AND split_header.status = 'active'
+        GROUP BY split_line.source_line_id
+     ), blanket_alloc AS (
+       SELECT source_line_id,
+              SUM(CASE WHEN status = 'reserved' THEN reserved_pallets ELSE held_pallets END) AS pallet_qty,
+              SUM(CASE WHEN status = 'reserved' THEN reserved_sales_qty ELSE held_sales_qty END) AS sales_qty
+         FROM scm_smart_blanket_allocations
+        WHERE status IN ('reserved', 'held')
+        GROUP BY source_line_id
+     ), net_lines AS (
+       SELECT line.item_id,
+              po.tranid AS source_po_ref,
+              line.to_plt,
+              line.pallet_qty,
+              GREATEST(
+                COALESCE(line.quantity, 0)
+                - COALESCE(line.netsuite_received_baseline_qty, line.netsuite_received_qty, 0)
+                - COALESCE(sales.sales_qty, 0)
+                - COALESCE(split.sales_qty, 0)
+                - COALESCE(blanket.sales_qty, 0),
+                0
+              ) AS available_sales_qty,
+              COALESCE(sales.pallet_qty, 0) + COALESCE(split.pallet_qty, 0) + COALESCE(blanket.pallet_qty, 0) AS allocated_pallets
+         FROM purchase_orders po
+         JOIN purchase_order_lines line
+           ON line.purchase_order_id = po.netsuite_id
+          AND line.netsuite_active = true
+         LEFT JOIN sales_alloc sales ON sales.po_line_id = line.id
+         LEFT JOIN split_alloc split ON split.source_line_id = line.id
+         LEFT JOIN blanket_alloc blanket ON blanket.source_line_id = line.id
+        WHERE po.netsuite_active = true
+          AND po.is_blanket_po = true
+          AND line.item_id IS NOT NULL
+          AND COALESCE(line.to_plt, 0) > 0
+          AND COALESCE(line.item_weight, 0) > 0
+          AND (po.status_text ILIKE '%Pending Receipt%' OR po.status_text ILIKE '%Partially Received%')
+          AND NOT EXISTS (
+            SELECT 1 FROM dispatch_scm_po_splits child_split
+             WHERE child_split.split_po_id = po.netsuite_id
+          )
+     ), item_balance AS (
+       SELECT item_id,
+              ARRAY_AGG(DISTINCT source_po_ref ORDER BY source_po_ref) AS source_po_refs,
+              SUM(available_sales_qty) AS available_sales_qty,
+              SUM(GREATEST(LEAST(
+                FLOOR((available_sales_qty / to_plt) + 0.000001),
+                CASE WHEN COALESCE(pallet_qty, 0) > 0
+                  THEN GREATEST(COALESCE(pallet_qty, 0) - allocated_pallets, 0)
+                  ELSE FLOOR((available_sales_qty / to_plt) + 0.000001)
+                END
+              ), 0)) AS available_pallets
+         FROM net_lines
+        GROUP BY item_id
+     )
+     SELECT item_id, source_po_refs, available_sales_qty, available_pallets
+       FROM item_balance
+      WHERE available_pallets > 0`
+  );
+  return new Map(result.rows.map((row) => [String(row.item_id), {
+    availableSalesQty: positive(row.available_sales_qty),
+    availablePallets: positive(row.available_pallets),
+    sourcePoRefs: Array.isArray(row.source_po_refs) ? row.source_po_refs.filter(Boolean) : []
+  }]));
+}
+
+export async function listSmartScmBlanketPlanningPauses({ search = "" } = {}) {
+  const balances = await smartScmAvailableBlanketBalanceByItem();
+  const itemIds = [...balances.keys()].map(Number).filter(Number.isInteger);
+  if (!itemIds.length) return [];
+  const searchText = text(search);
+  const result = await query(
+    `SELECT item.item_id,
+            item.item_name,
+            item.item_description,
+            COALESCE(NULLIF(item.vendor, ''), NULLIF(policy.vendor, '')) AS vendor,
+            policy.vendor_code
+       FROM inventory_items item
+       LEFT JOIN scm_smart_item_policies policy ON policy.item_id = item.item_id
+      WHERE item.item_id = ANY($1::bigint[])
+        AND ($2 = '' OR concat_ws(' ', item.item_id::text, item.item_name,
+              item.item_description, item.vendor, policy.vendor, policy.vendor_code) ILIKE '%' || $2 || '%')
+      ORDER BY item.item_name, item.item_id`,
+    [itemIds, searchText]
+  );
+  return result.rows.map((row) => {
+    const balance = balances.get(String(row.item_id)) || {};
+    return {
+      itemId: Number(row.item_id),
+      itemName: row.item_name || "",
+      itemDescription: row.item_description || "",
+      vendor: row.vendor || "",
+      vendorCode: row.vendor_code || "",
+      reason: "Covered by remaining Blanket PO quantity",
+      availablePallets: positive(balance.availablePallets),
+      availableSalesQty: positive(balance.availableSalesQty),
+      sourcePoRefs: Array.isArray(balance.sourcePoRefs) ? balance.sourcePoRefs : [],
+      active: true,
+      automatic: true,
+      pauseKind: "blanket_po"
+    };
+  });
+}
+
+export async function loadSmartScmPlanningPolicies({ includeTemporarilyExcluded = false } = {}) {
+  const [result, blanketBalanceByItem] = await Promise.all([query(
     `SELECT p.*,
             COALESCE(i.item_name, p.item_name) AS item_name,
             COALESCE(i.item_description, p.item_description) AS item_description,
@@ -197,18 +391,38 @@ async function planningPolicies() {
                LIMIT 1
             ), 0) AS physical_pallet_weight_lbs,
             y.location_id, y.yard_code, y.eligible, y.capacity_pallets,
-            y.service_quantile, y.minimum_safety_pallets, y.lower_stock_policy_enabled
+            y.service_quantile, y.minimum_safety_pallets, y.lower_stock_policy_enabled,
+            (active_exclusion.item_id IS NOT NULL) AS temporarily_excluded
        FROM scm_smart_item_policies p
        JOIN scm_smart_item_yard_policies y ON y.item_id = p.item_id
        LEFT JOIN inventory_items i ON i.item_id = p.item_id
        LEFT JOIN dispatch_vendor_yards vy ON vy.id = p.vendor_yard_id
+       LEFT JOIN LATERAL (
+         SELECT exclusion.item_id
+           FROM scm_smart_planning_exclusions exclusion
+          WHERE exclusion.item_id = p.item_id
+            AND exclusion.deactivated_at IS NULL
+            AND (exclusion.expires_at IS NULL OR exclusion.expires_at > now())
+          ORDER BY exclusion.id DESC
+          LIMIT 1
+       ) active_exclusion ON true
       WHERE y.eligible = true
         AND p.planning_enabled = true
         AND p.inactive = false
         AND p.discontinued = false
-      ORDER BY p.item_id, y.location_id`
-  );
-  return result.rows;
+        AND ($1::boolean OR active_exclusion.item_id IS NULL)
+      ORDER BY p.item_id, y.location_id`,
+    [includeTemporarilyExcluded]
+  ), smartScmAvailableBlanketBalanceByItem()]);
+  return result.rows.map((row) => {
+    const blanket = blanketBalanceByItem.get(String(row.item_id)) || {};
+    return {
+      ...row,
+      blanket_available_sales_qty: positive(blanket.availableSalesQty),
+      blanket_available_pallets: positive(blanket.availablePallets),
+      blanket_po_planning_excluded: positive(blanket.availablePallets) > EPSILON
+    };
+  });
 }
 
 async function inventoryState() {
@@ -222,6 +436,7 @@ async function inventoryState() {
            JOIN purchase_orders o ON o.netsuite_id = l.purchase_order_id
           WHERE l.netsuite_active = true
             AND o.netsuite_active = true
+            AND NOT COALESCE(o.is_blanket_po, false)
             AND l.item_id IS NOT NULL
             AND COALESCE(l.location_id, o.destination_location_id) IS NOT NULL
           GROUP BY l.item_id, COALESCE(l.location_id, o.destination_location_id)
@@ -237,9 +452,24 @@ async function inventoryState() {
             AND l.item_id IS NOT NULL
             AND o.to_location_id IS NOT NULL
           GROUP BY l.item_id, o.to_location_id
+       ), blanket_reservation AS (
+         SELECT allocation.item_id,
+                allocation.destination_location_id AS location_id,
+                SUM(CASE
+                  WHEN allocation.status = 'reserved' THEN allocation.reserved_sales_qty
+                  WHEN allocation.status = 'held' THEN allocation.held_sales_qty
+                  ELSE 0
+                END) AS quantity
+           FROM scm_smart_blanket_allocations allocation
+          WHERE allocation.status IN ('reserved', 'held')
+          GROUP BY allocation.item_id, allocation.destination_location_id
        )
        SELECT item_id, location_id, SUM(quantity) AS quantity
-         FROM (SELECT * FROM open_po UNION ALL SELECT * FROM open_to) inbound
+         FROM (
+           SELECT * FROM open_po
+           UNION ALL SELECT * FROM open_to
+           UNION ALL SELECT * FROM blanket_reservation
+         ) inbound
         GROUP BY item_id, location_id`
   );
   const backorders = await query(
@@ -324,7 +554,8 @@ function calculatePolicyState(policy, forecast, inventory, minimumOrder, setting
   const toPlt = positive(policy.to_plt);
   const balance = inventory.balanceMap.get(key) || {};
   const onHandSales = positive(balance.quantity_on_hand);
-  const availableSales = positive(balance.quantity_available);
+  const rawAvailableSales = number(balance.quantity_available);
+  const availableSales = positive(rawAvailableSales);
   const onOrderSales = positive(inventory.inboundMap.get(key)) + positive(inventory.inboundReservationMap.get(key));
   const backorderedSales = positive(inventory.backorderMap.get(key));
   const reservedOutboundSales = positive(inventory.outboundReservationMap.get(key));
@@ -370,6 +601,7 @@ function calculatePolicyState(policy, forecast, inventory, minimumOrder, setting
     toPlt,
     manualPlanningRequired: toPlt <= EPSILON || positive(policy.pallet_weight_lbs) <= EPSILON,
     onHandSales,
+    rawAvailableSales,
     availableSales,
     availablePallets,
     onOrderSales,
@@ -411,11 +643,13 @@ function calculatePolicyState(policy, forecast, inventory, minimumOrder, setting
     weeksOfCover: Number.isFinite(weeksOfCover) ? round(weeksOfCover) : null,
     leadWeeks: round(leadWeeks),
     inventorySyncedAt: balance.synced_at || null,
-    urgent
+    urgent,
+    urgencyLevel: urgent ? "urgent" : "normal",
+    urgencyScore: 0
   };
 }
 
-function proposalLine(state, pallets, extraReason = {}) {
+export function smartScmProposalLineForState(state, pallets, extraReason = {}) {
   const policy = state.policy;
   const proposedPallets = round(pallets);
   const palletWeight = positive(policy.pallet_weight_lbs);
@@ -440,6 +674,9 @@ function proposalLine(state, pallets, extraReason = {}) {
     toSec: positive(policy.to_sec),
     toPcs: positive(policy.to_pcs),
     manualPlanningRequired: state.manualPlanningRequired,
+    urgent: Boolean(state.urgent),
+    urgencyLevel: smartScmUrgencyLevel(state.urgencyLevel, state.urgent),
+    urgencyScore: urgencyScore(state.urgencyScore, state.urgent),
     reason: {
       ...extraReason,
       quantityOnHand: state.onHandSales,
@@ -483,7 +720,17 @@ function proposalLine(state, pallets, extraReason = {}) {
       weeksOfCover: state.weeksOfCover,
       inventorySyncedAt: state.inventorySyncedAt,
       forecastModel: state.forecast?.authoritative_model || "formula",
+      stockoutDemandMethod: state.forecast?.stockout_demand_method || "none",
+      stockoutDemandConfidence: state.forecast?.stockout_demand_confidence || "none",
+      stockoutSnapshotWeeks: Math.max(0, Math.round(number(state.forecast?.stockout_snapshot_weeks))),
+      stockoutProxyWeeks: Math.max(0, Math.round(number(state.forecast?.stockout_proxy_weeks))),
+      stockoutEvidenceStartWeek: state.forecast?.stockout_evidence_start_week || null,
+      stockoutEvidenceEndWeek: state.forecast?.stockout_evidence_end_week || null,
+      demandDataCutoff: state.forecast?.demand_data_cutoff || null,
       physicalPalletWeightLbs,
+      urgent: Boolean(state.urgent),
+      urgencyLevel: smartScmUrgencyLevel(state.urgencyLevel, state.urgent),
+      urgencyScore: urgencyScore(state.urgencyScore, state.urgent),
     }
   };
 }
@@ -527,11 +774,20 @@ function createDraft({
   status = null,
   keySuffix = ""
 }, settings) {
+  const priority = smartScmUrgencySummary([{ ...line, urgent: Boolean(urgent || line.urgent) }]);
   const classifiedLine = {
     ...line,
-    urgent: Boolean(urgent),
+    urgent: priority.urgent,
+    urgencyLevel: priority.urgencyLevel,
+    urgencyScore: priority.urgencyScore,
     provisional: Boolean(provisional),
-    reason: { ...(line.reason || {}), urgent: Boolean(urgent), provisional: Boolean(provisional) }
+    reason: {
+      ...(line.reason || {}),
+      urgent: priority.urgent,
+      urgencyLevel: priority.urgencyLevel,
+      urgencyScore: priority.urgencyScore,
+      provisional: Boolean(provisional)
+    }
   };
   const weight = smartScmProposalLineLoadWeightLbs(classifiedLine);
   const utilization = weight > 0 ? weight / positive(settings.truck_capacity_lbs, 78000) : 0;
@@ -560,7 +816,9 @@ function createDraft({
     vendor,
     plant,
     status: resolvedStatus,
-    urgent,
+    urgent: priority.urgent,
+    urgencyLevel: priority.urgencyLevel,
+    urgencyScore: priority.urgencyScore,
     provisional,
     totalPallets: classifiedLine.proposedPallets,
     totalWeight: weight,
@@ -623,11 +881,16 @@ function combineLoadLine(lines, next) {
   existing.residualPallets = round(positive(existing.residualPallets) + positive(next.residualPallets));
   existing.salesQuantity = round(positive(existing.salesQuantity) + positive(next.salesQuantity));
   existing.lineWeight = round(positive(existing.lineWeight) + positive(next.lineWeight));
-  existing.urgent = Boolean(existing.urgent || next.urgent);
+  const priority = smartScmUrgencySummary([existing, next]);
+  existing.urgent = priority.urgent;
+  existing.urgencyLevel = priority.urgencyLevel;
+  existing.urgencyScore = priority.urgencyScore;
   existing.provisional = Boolean(existing.provisional || next.provisional);
   existing.reason = {
     ...(existing.reason || {}),
     urgent: existing.urgent,
+    urgencyLevel: existing.urgencyLevel,
+    urgencyScore: existing.urgencyScore,
     provisional: existing.provisional,
     ...((existing.reason?.gormleyOriginalDestinations || next.reason?.gormleyOriginalDestinations)
       ? { gormleyOriginalDestinations: [...new Set([
@@ -683,14 +946,24 @@ function loadDestinationIds(load) {
 }
 
 function proposalUnitSort(left, right) {
-  if (Boolean(left.line.urgent) !== Boolean(right.line.urgent)) return left.line.urgent ? -1 : 1;
+  const levelDifference = smartScmUrgencyRank(right.line.urgencyLevel, right.line.urgent)
+    - smartScmUrgencyRank(left.line.urgencyLevel, left.line.urgent);
+  if (levelDifference) return levelDifference;
+  const scoreDifference = urgencyScore(right.line.urgencyScore, right.line.urgent)
+    - urgencyScore(left.line.urgencyScore, left.line.urgent);
+  if (Math.abs(scoreDifference) > EPSILON) return scoreDifference;
   return smartScmProposalLineLoadWeightLbs(right.line) - smartScmProposalLineLoadWeightLbs(left.line);
 }
 
 function proposalUnitWeightSort(left, right) {
   const weightDifference = smartScmProposalLineLoadWeightLbs(right.line) - smartScmProposalLineLoadWeightLbs(left.line);
   if (Math.abs(weightDifference) > EPSILON) return weightDifference;
-  if (Boolean(left.line.urgent) !== Boolean(right.line.urgent)) return left.line.urgent ? -1 : 1;
+  const levelDifference = smartScmUrgencyRank(right.line.urgencyLevel, right.line.urgent)
+    - smartScmUrgencyRank(left.line.urgencyLevel, left.line.urgent);
+  if (levelDifference) return levelDifference;
+  const scoreDifference = urgencyScore(right.line.urgencyScore, right.line.urgent)
+    - urgencyScore(left.line.urgencyScore, left.line.urgent);
+  if (Math.abs(scoreDifference) > EPSILON) return scoreDifference;
   return 0;
 }
 
@@ -800,6 +1073,72 @@ function partialRedirectAdjustedLoads(units = [], truckCapacity = 0, maxStops = 
   return [...directLoads, ...destinationFirstProposalLoads(repackUnits.sort(proposalUnitWeightSort), truckCapacity, maxStops)];
 }
 
+function criticalProposalUnitSort(left, right) {
+  const levelDifference = smartScmUrgencyRank(right.line.urgencyLevel, right.line.urgent)
+    - smartScmUrgencyRank(left.line.urgencyLevel, left.line.urgent);
+  if (levelDifference) return levelDifference;
+  const destinationDifference = Number(left.line.destinationLocationId) - Number(right.line.destinationLocationId);
+  if (destinationDifference) return destinationDifference;
+  const scoreDifference = urgencyScore(right.line.urgencyScore, right.line.urgent)
+    - urgencyScore(left.line.urgencyScore, left.line.urgent);
+  if (Math.abs(scoreDifference) > EPSILON) return scoreDifference;
+  return smartScmProposalLineLoadWeightLbs(right.line) - smartScmProposalLineLoadWeightLbs(left.line);
+}
+
+function conservedPackedLines(loads = []) {
+  const totals = new Map();
+  for (const line of loads.flatMap((load) => load.lines || [])) {
+    const key = `${Number(line.itemId)}:${Number(line.destinationLocationId)}`;
+    const current = totals.get(key) || { required: 0, proposed: 0, residual: 0, sales: 0, weight: 0 };
+    current.required += positive(line.requiredPallets);
+    current.proposed += positive(line.proposedPallets);
+    current.residual += positive(line.residualPallets);
+    current.sales += positive(line.salesQuantity);
+    current.weight += positive(line.lineWeight);
+    totals.set(key, current);
+  }
+  return totals;
+}
+
+function samePackedLineTotals(leftLoads = [], rightLoads = []) {
+  const left = conservedPackedLines(leftLoads);
+  const right = conservedPackedLines(rightLoads);
+  if (left.size !== right.size) return false;
+  for (const [key, expected] of left) {
+    const actual = right.get(key);
+    if (!actual) return false;
+    if (["required", "proposed", "residual", "sales", "weight"]
+      .some((field) => Math.abs(expected[field] - actual[field]) > EPSILON)) return false;
+  }
+  return true;
+}
+
+function criticalAffinityProposalLoads(baselineLoads = [], truckCapacity = 0, maxStops = 2, routeRule = {}) {
+  const finalizedLines = baselineLoads.flatMap((load) => load.lines || []);
+  if (!finalizedLines.some((line) => smartScmUrgencyRank(line.urgencyLevel, line.urgent) >= 2)) return baselineLoads;
+  const units = finalizedLines.flatMap((line) => palletUnits({ lines: [line] }));
+  const critical = units
+    .filter((unit) => smartScmUrgencyRank(unit.line.urgencyLevel, unit.line.urgent) >= 2)
+    .sort(criticalProposalUnitSort);
+  const lower = units
+    .filter((unit) => smartScmUrgencyRank(unit.line.urgencyLevel, unit.line.urgent) < 2)
+    .sort(proposalUnitWeightSort);
+  const candidate = packProposalUnits([...critical, ...lower], truckCapacity, maxStops);
+  if (candidate.length > baselineLoads.length) return baselineLoads;
+  if (candidate.some((load) => load.totalWeight > truckCapacity + EPSILON || loadDestinationIds(load).size > maxStops)) {
+    return baselineLoads;
+  }
+  const baselineWeight = baselineLoads.reduce((sum, load) => sum + positive(load.totalWeight), 0);
+  const candidateWeight = candidate.reduce((sum, load) => sum + positive(load.totalWeight), 0);
+  if (Math.abs(baselineWeight - candidateWeight) > EPSILON || !samePackedLineTotals(baselineLoads, candidate)) {
+    return baselineLoads;
+  }
+  return candidate.map((load) => ({
+    ...load,
+    routeStops: routeStopsForLines(load.lines, routeRule)
+  }));
+}
+
 export function smartScmPackWholePalletLines(lines = [], truckCapacityLbs = 0, { proposalType = "PO", sourceName = "", maxStops = 2, routeRule } = {}) {
   const truckCapacity = positive(truckCapacityLbs);
   if (truckCapacity <= EPSILON) throw new Error("Truck capacity must be greater than zero.");
@@ -814,16 +1153,17 @@ export function smartScmPackWholePalletLines(lines = [], truckCapacityLbs = 0, {
     .sort(proposalUnitSort);
   const routing = activeRouteRule(sourceName, maxStops, routeRule);
   const stopLimit = proposalType === "PO" ? routing.maxDrops : 1;
-  const routed = proposalType === "PO" && routing.partialRedirectEnabled
+  const baseline = proposalType === "PO" && routing.partialRedirectEnabled
     ? partialRedirectAdjustedLoads(units, truckCapacity, stopLimit, routing)
     : proposalType === "PO"
       ? destinationFirstProposalLoads(units, truckCapacity, stopLimit)
       : packProposalUnits(units, truckCapacity, stopLimit);
+  const routed = criticalAffinityProposalLoads(baseline, truckCapacity, stopLimit, routing);
   return routed.map((load) => ({
     lines: load.lines,
     totalWeight: round(load.totalWeight),
     totalPallets: round(load.lines.reduce((sum, line) => sum + positive(line.proposedPallets), 0)),
-    routeStops: routeStopsForLines(load.lines, routing)
+    routeStops: load.routeStops || routeStopsForLines(load.lines, routing)
   }));
 }
 
@@ -853,7 +1193,7 @@ export function consolidateCompatibleDrafts(drafts = [], settings = {}, namespac
     loads.forEach((load, index) => {
       const totalPallets = round(load.lines.reduce((sum, line) => sum + positive(line.proposedPallets), 0));
       const utilization = round(load.totalWeight / truckCapacity);
-      const urgent = load.lines.some((line) => Boolean(line.urgent));
+      const priority = smartScmUrgencySummary(load.lines);
       const provisional = load.lines.some((line) => Boolean(line.provisional));
       const coverageReviewRequired = load.lines.some((line) => Boolean(line.reason?.coverageReviewRequired));
       const routeStops = load.routeStops || routeStopsForLines(load.lines, activeRouteRule(base.sourceName, 2, routeRule));
@@ -864,7 +1204,9 @@ export function consolidateCompatibleDrafts(drafts = [], settings = {}, namespac
         ...base,
         proposalKey: `load:${namespace}:${base.phase}:${planningKeyHash(signature)}:${index + 1}`,
         status,
-        urgent,
+        urgent: priority.urgent,
+        urgencyLevel: priority.urgencyLevel,
+        urgencyScore: priority.urgencyScore,
         provisional,
         statusLocked: coverageReviewRequired,
         destinationLocationId: routeStops[0]?.locationId || base.destinationLocationId,
@@ -907,7 +1249,7 @@ function internalTransferDrafts({ state, requestedPallets, stateByKey, settings,
   for (const { source, sourceState, protectedFloor, transferable } of sources) {
     if (remaining <= EPSILON) break;
     const pallets = Math.min(remaining, transferable);
-    const baseLine = proposalLine(state, pallets, {
+    const baseLine = smartScmProposalLineForState(state, pallets, {
       sourceAvailablePallets: sourceState.availablePallets,
       sourceSafetyStockPallets: sourceState.safety,
       sourceReorderPointPallets: sourceState.rop,
@@ -944,21 +1286,24 @@ function internalTransferDrafts({ state, requestedPallets, stateByKey, settings,
   return { drafts, remaining };
 }
 
-function buildPlanningDrafts({ states, supplyMap, settings }) {
+export function smartScmBuildPlanningDrafts({ states, supplyMap, settings }) {
   const drafts = [];
   const stateByKey = new Map(states.map((state) => [state.key, state]));
   const exceptions = [];
   for (const state of states.filter((entry) => entry.requiredPallets > 0)) {
+    const manualPurchasePlanningExcluded = state.policy.temporarily_excluded === true;
+    const blanketPurchasePlanningExcluded = state.policy.blanket_po_planning_excluded === true;
+    const purchasePlanningExcluded = manualPurchasePlanningExcluded || blanketPurchasePlanningExcluded;
     const supply = supplyMap.get(String(state.policy.item_id));
     const supplyStatus = supply?.status || "unknown";
     const vendorAvailable = positive(supply?.available_pallets);
-    const directPallets = supplyStatus === "out_of_stock" || supplyStatus === "credit_hold"
+    const directPallets = purchasePlanningExcluded || supplyStatus === "out_of_stock" || supplyStatus === "credit_hold"
       ? 0
       : supplyStatus === "partial"
         ? Math.min(state.requiredPallets, vendorAvailable)
         : state.requiredPallets;
     if (directPallets > 0) {
-      const directLine = proposalLine(state, directPallets, {
+      const directLine = smartScmProposalLineForState(state, directPallets, {
         vendorSupplyStatus: supplyStatus,
         importedVendorAvailablePallets: vendorAvailable,
         vendorConfirmationRequired: true
@@ -985,12 +1330,13 @@ function buildPlanningDrafts({ states, supplyMap, settings }) {
       provisional = true;
     }
     if (["out_of_stock", "credit_hold"].includes(supplyStatus)) transferNeed = state.requiredPallets;
+    if (purchasePlanningExcluded) transferNeed = state.requiredPallets;
     if (transferNeed > EPSILON) {
       const internal = internalTransferDrafts({ state, requestedPallets: transferNeed, stateByKey, settings, provisional, keyPrefix: "initial" });
       drafts.push(...internal.drafts);
-      if (internal.remaining > EPSILON) {
+      if (internal.remaining > EPSILON && !purchasePlanningExcluded) {
         const hub = YARDS.find((yard) => yard.code === "12441");
-        const vendorHubLine = proposalLine(state, internal.remaining, {
+        const vendorHubLine = smartScmProposalLineForState(state, internal.remaining, {
           vendorSupplyStatus: supplyStatus,
           residualAfterInternalTransferPallets: internal.remaining,
           consolidationRequired: true,
@@ -1013,6 +1359,19 @@ function buildPlanningDrafts({ states, supplyMap, settings }) {
           status: "held",
           keySuffix: `${state.policy.yard_code}-${index + 1}`
         }, settings)));
+      }
+      if (internal.remaining > EPSILON && purchasePlanningExcluded) {
+        exceptions.push({
+          itemId: Number(state.policy.item_id),
+          yard: state.policy.yard_code,
+          reason: blanketPurchasePlanningExcluded
+            ? "Vendor PO planning is paused while this item has available Blanket-order balance; available internal transfers remain planned"
+            : "Vendor PO planning is temporarily paused; available internal transfers remain planned",
+          blanketAvailablePallets: blanketPurchasePlanningExcluded
+            ? round(positive(state.policy.blanket_available_pallets))
+            : 0,
+          deferredVendorPallets: round(internal.remaining)
+        });
       }
     }
     if (state.manualPlanningRequired) exceptions.push({ itemId: Number(state.policy.item_id), yard: state.policy.yard_code, reason: "Missing ToPLT or pallet weight" });
@@ -1040,14 +1399,15 @@ async function insertDrafts(runId, drafts = []) {
     const proposal = await query(
       `INSERT INTO scm_smart_proposals (
          run_id, proposal_key, proposal_type, phase, source_kind, source_location_id, source_vendor_yard_id, source_name,
-         destination_location_id, destination_name, vendor, plant, status, urgent, provisional,
+         destination_location_id, destination_name, vendor, plant, status, urgent, urgency_level, urgency_score, provisional,
          total_pallets, total_weight_lbs, utilization, vendor_reply_due_at, memo, route_stops, manually_grouped
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21::jsonb,$22)
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23::jsonb,$24)
        RETURNING id`,
       [
         runId, draft.proposalKey, draft.proposalType, draft.phase, draft.sourceKind, draft.sourceLocationId,
         draft.sourceVendorYardId, draft.sourceName, draft.destinationLocationId, draft.destinationName, draft.vendor, draft.plant,
-        draft.status, draft.urgent, draft.provisional, draft.totalPallets, draft.totalWeight, draft.utilization,
+        draft.status, draft.urgent, smartScmUrgencyLevel(draft.urgencyLevel, draft.urgent),
+        urgencyScore(draft.urgencyScore, draft.urgent), draft.provisional, draft.totalPallets, draft.totalWeight, draft.utilization,
         draft.vendorReplyDueAt, draft.memo, JSON.stringify(draft.routeStops || routeStopsForLines(draft.lines)), Boolean(draft.manuallyGrouped)
       ]
     );
@@ -1057,15 +1417,16 @@ async function insertDrafts(runId, drafts = []) {
            proposal_id, item_id, item_name, item_description, unit, required_pallets, proposed_pallets,
            confirmed_pallets, residual_pallets, sales_quantity, pallet_weight_lbs, line_weight_lbs,
            to_plt, to_lyr, to_sec, to_pcs, manual_planning_required, reason, destination_location_id, destination_name,
-           urgent, provisional
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18::jsonb,$19,$20,$21,$22)`,
+           urgent, urgency_level, urgency_score, provisional
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18::jsonb,$19,$20,$21,$22,$23,$24)`,
         [
           proposal.rows[0].id, line.itemId, line.itemName, line.itemDescription, line.unit,
           line.requiredPallets, line.proposedPallets, line.confirmedPallets, line.residualPallets,
           line.salesQuantity, line.palletWeight, line.lineWeight, line.toPlt, line.toLyr, line.toSec,
           line.toPcs, line.manualPlanningRequired, JSON.stringify(line.reason || {}),
           line.destinationLocationId || draft.destinationLocationId, line.destinationName || draft.destinationName,
-          Boolean(line.urgent), Boolean(line.provisional)
+          Boolean(line.urgent), smartScmUrgencyLevel(line.urgencyLevel, line.urgent),
+          urgencyScore(line.urgencyScore, line.urgent), Boolean(line.provisional)
         ]
       );
     }
@@ -1095,6 +1456,8 @@ function publicProposalLine(row) {
     toPcs: positive(row.to_pcs),
     manualPlanningRequired: Boolean(row.manual_planning_required),
     urgent: Boolean(row.urgent),
+    urgencyLevel: smartScmUrgencyLevel(row.urgency_level, row.urgent),
+    urgencyScore: urgencyScore(row.urgency_score, row.urgent),
     provisional: Boolean(row.provisional),
     isAlternative: Boolean(row.is_alternative),
     alternativeForLineId: row.alternative_for_line_id === null ? null : Number(row.alternative_for_line_id),
@@ -1194,6 +1557,11 @@ function publicProposal(row) {
     runId: Number(row.run_id),
     proposalKey: row.proposal_key,
     proposalType: row.proposal_type,
+    proposalOrigin: row.proposal_origin || "inventory",
+    blanketSourcePoId: row.blanket_source_po_id === null || row.blanket_source_po_id === undefined
+      ? null
+      : Number(row.blanket_source_po_id),
+    blanketSourcePoRef: row.blanket_source_po_ref || null,
     phase: row.phase,
     sourceKind: row.source_kind,
     sourceLocationId: row.source_location_id === null ? null : Number(row.source_location_id),
@@ -1207,6 +1575,8 @@ function publicProposal(row) {
     plant: row.plant,
     status: row.status,
     urgent: Boolean(row.urgent),
+    urgencyLevel: smartScmUrgencyLevel(row.urgency_level, row.urgent),
+    urgencyScore: urgencyScore(row.urgency_score, row.urgent),
     provisional: Boolean(row.provisional),
     totalPallets: positive(row.total_pallets),
     materialWeightLbs,
@@ -1278,7 +1648,7 @@ async function proposalRows({ proposalId = null, runId = null, status = "", stat
   }
   if (search) {
     params.push(`%${text(search)}%`);
-    clauses.push(`(p.id::text ILIKE $${params.length} OR p.source_name ILIKE $${params.length} OR p.destination_name ILIKE $${params.length} OR p.vendor ILIKE $${params.length} OR EXISTS (
+    clauses.push(`(p.id::text ILIKE $${params.length} OR p.source_name ILIKE $${params.length} OR p.destination_name ILIKE $${params.length} OR p.vendor ILIKE $${params.length} OR p.blanket_source_po_ref ILIKE $${params.length} OR EXISTS (
       SELECT 1 FROM scm_smart_proposal_lines search_line WHERE search_line.proposal_id = p.id
         AND (search_line.item_name ILIKE $${params.length} OR search_line.item_id::text ILIKE $${params.length})
     ))`);
@@ -1311,38 +1681,68 @@ async function proposalRows({ proposalId = null, runId = null, status = "", stat
        FROM scm_smart_proposals p
        LEFT JOIN scm_smart_planning_runs planning_run ON planning_run.id = p.run_id
       ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
-      ORDER BY ${vendorQueue ? "p.order_requested_at DESC NULLS LAST, p.id DESC" : "p.run_id DESC, p.urgent DESC, p.id"}
+      ORDER BY ${vendorQueue ? "p.order_requested_at DESC NULLS LAST, p.id DESC" : `p.run_id DESC,
+        CASE p.urgency_level
+          WHEN 'ultimate_urgent' THEN 3
+          WHEN 'super_urgent' THEN 2
+          WHEN 'urgent' THEN 1
+          ELSE 0
+        END DESC,
+        p.urgency_score DESC, p.id`}
       LIMIT $${params.length}`,
     params
   );
   return result.rows;
 }
 
-export async function runSmartScmPlan({ triggerSource = "manual", operatorId = null, forecastRunId = null } = {}) {
+export async function loadSmartScmPlanningDemandStates({
+  forecastRunId = null,
+  includeTemporarilyExcluded = true
+} = {}) {
   const selectedForecastRunId = forecastRunId || await latestSmartScmForecastRunId();
   const settings = await settingsRow();
-  const policies = await planningPolicies();
+  const policies = await loadSmartScmPlanningPolicies({ includeTemporarilyExcluded });
   const inventory = await inventoryState();
   const supplyMap = await latestVendorSupplyMap();
   const forecasts = await smartScmForecastMap(selectedForecastRunId);
   const routeRules = await smartScmRouteRuleMap();
   const minimumOrders = await smartScmMinimumOrderMap(policies);
+  const states = classifySmartScmUrgency(policies.map((policy) => calculatePolicyState(
+    policy,
+    forecasts.get(`${policy.item_id}:${policy.location_id}`),
+    inventory,
+    minimumOrders.get(`${policy.item_id}:${policy.location_id}`),
+    settings
+  )));
+  return {
+    forecastRunId: selectedForecastRunId,
+    settings,
+    policies,
+    states,
+    supplyMap,
+    forecasts,
+    routeRules,
+    minimumOrders
+  };
+}
+
+export async function runSmartScmPlan({ triggerSource = "manual", operatorId = null, forecastRunId = null } = {}) {
+  const planning = await loadSmartScmPlanningDemandStates({
+    forecastRunId,
+    includeTemporarilyExcluded: true
+  });
+  const selectedForecastRunId = planning.forecastRunId;
+  const { settings, states, supplyMap, routeRules } = planning;
+  const temporarilyExcludedItemIds = await listSmartScmActivePlanningExclusionItemIds();
   const created = await query(
-    `INSERT INTO scm_smart_planning_runs (trigger_source, forecast_run_id, settings_snapshot, created_by)
-     VALUES ($1, $2, $3::jsonb, $4)
+    `INSERT INTO scm_smart_planning_runs (trigger_source, forecast_run_id, settings_snapshot, created_by, plan_kind)
+     VALUES ($1, $2, $3::jsonb, $4, 'inventory')
      RETURNING *`,
     [triggerSource, selectedForecastRunId, JSON.stringify(settings), operatorId]
   );
   const run = created.rows[0];
   try {
-    const states = policies.map((policy) => calculatePolicyState(
-      policy,
-      forecasts.get(`${policy.item_id}:${policy.location_id}`),
-      inventory,
-      minimumOrders.get(`${policy.item_id}:${policy.location_id}`),
-      settings
-    ));
-    const calculated = buildPlanningDrafts({ states, supplyMap, settings });
+    const calculated = smartScmBuildPlanningDrafts({ states, supplyMap, settings });
     const drafts = consolidateCompatibleDrafts(calculated.drafts, settings, "initial", routeRules);
     const { exceptions } = calculated;
     await withTransaction(async () => {
@@ -1356,6 +1756,8 @@ export async function runSmartScmPlan({ triggerSource = "manual", operatorId = n
         toProposals: drafts.filter((draft) => draft.proposalType === "TO").length,
         urgent: drafts.filter((draft) => draft.urgent).length,
         held: drafts.filter((draft) => draft.status === "held").length,
+        temporarilyExcludedItems: temporarilyExcludedItemIds.length,
+        temporarilyExcludedItemIds,
         exceptions
       };
       await query(
@@ -1370,7 +1772,15 @@ export async function runSmartScmPlan({ triggerSource = "manual", operatorId = n
       actorOperatorId: operatorId,
       source: "smart_scm",
       action: "smart_scm.plan.completed",
-      details: { runId: Number(run.id), forecastRunId: selectedForecastRunId, triggerSource, proposalCount: drafts.length, exceptions }
+      details: {
+        runId: Number(run.id),
+        forecastRunId: selectedForecastRunId,
+        triggerSource,
+        proposalCount: drafts.length,
+        temporarilyExcludedItems: temporarilyExcludedItemIds.length,
+        temporarilyExcludedItemIds,
+        exceptions
+      }
     });
     return getSmartScmPlanningRun(run.id);
   } catch (error) {
@@ -1386,15 +1796,21 @@ export async function runSmartScmPlan({ triggerSource = "manual", operatorId = n
   }
 }
 
-export async function listSmartScmPlanningRuns({ limit = 30 } = {}) {
+export async function listSmartScmPlanningRuns({ limit = 30, planKind = "inventory" } = {}) {
+  const kind = String(planKind || "inventory").trim().toLowerCase();
   const result = await query(
-    `SELECT * FROM scm_smart_planning_runs ORDER BY id DESC LIMIT $1`,
-    [Math.min(100, Math.max(1, Number(limit) || 30))]
+    `SELECT *
+       FROM scm_smart_planning_runs
+      WHERE ($2 = '' OR plan_kind = $2)
+      ORDER BY id DESC
+      LIMIT $1`,
+    [Math.min(100, Math.max(1, Number(limit) || 30)), kind]
   );
   return result.rows.map((row) => ({
     id: Number(row.id),
     status: row.status,
     triggerSource: row.trigger_source,
+    planKind: row.plan_kind || "inventory",
     forecastRunId: row.forecast_run_id === null ? null : Number(row.forecast_run_id),
     revision: Number(row.revision || 1),
     totals: row.totals || {},
@@ -1415,6 +1831,7 @@ export async function getSmartScmPlanningRun(id) {
     id: Number(row.id),
     status: row.status,
     triggerSource: row.trigger_source,
+    planKind: row.plan_kind || "inventory",
     forecastRunId: row.forecast_run_id === null ? null : Number(row.forecast_run_id),
     revision: Number(row.revision || 1),
     settingsSnapshot: row.settings_snapshot || {},
@@ -1514,9 +1931,21 @@ export async function setSmartScmPalletQuantityOverride(proposalId, destinationL
     const settings = await settingsRow();
     const capacity = positive(current.settings_snapshot?.truck_capacity_lbs)
       || positive(settings.truck_capacity_lbs);
-    if (current.proposal_type === "TO" && capacity > EPSILON && totalWeight > capacity + EPSILON) {
-      throw Object.assign(new Error("This PALLET quantity would exceed the configured truck capacity."), { status: 409 });
-    }
+    const automaticPalletLines = smartScmPhysicalPalletLines({
+      id,
+      destinationLocationId: current.destination_location_id,
+      destinationName: current.destination_name,
+      lines: linesResult.rows,
+      palletQuantityOverrides: {},
+      useConfirmedPallets
+    }, palletItemResult.rows[0] || null);
+    const automaticTotalWeight = round(materialWeight
+      + automaticPalletLines.reduce((sum, line) => sum + positive(line.lineWeightLbs), 0));
+    const overCapacity = current.proposal_type === "TO" && capacity > EPSILON
+      && totalWeight > capacity + EPSILON;
+    const palletOverrideMakesOverCapacity = overCapacity
+      && Object.keys(overrides).length > 0
+      && automaticTotalWeight <= capacity + EPSILON;
     await query(
       `UPDATE scm_smart_proposals
           SET pallet_quantity_overrides = $2::jsonb,
@@ -1526,7 +1955,24 @@ export async function setSmartScmPalletQuantityOverride(proposalId, destinationL
         WHERE id = $1`,
       [id, JSON.stringify(overrides), totalWeight, capacity]
     );
-    return { runId: Number(current.run_id), overrides, totalWeight };
+    if (totalWeight <= capacity + EPSILON) {
+      await query(
+        `UPDATE scm_smart_proposal_lines
+            SET reason = COALESCE(reason, '{}'::jsonb) - $2::text[], updated_at = now()
+          WHERE proposal_id = $1
+            AND COALESCE(reason, '{}'::jsonb) ?| $2::text[]`,
+        [id, MANUAL_CAPACITY_REASON_KEYS]
+      );
+    }
+    return {
+      runId: Number(current.run_id),
+      overrides,
+      totalWeight,
+      capacity,
+      automaticTotalWeight,
+      overCapacity,
+      palletOverrideMakesOverCapacity
+    };
   });
   await writeAudit({
     actorOperatorId: operatorId,
@@ -1537,7 +1983,11 @@ export async function setSmartScmPalletQuantityOverride(proposalId, destinationL
       destinationLocationId: destinationId,
       quantity: reset ? null : round(quantity),
       reset,
-      totalWeightLbs: outcome.totalWeight
+      totalWeightLbs: outcome.totalWeight,
+      automaticTotalWeightLbs: outcome.automaticTotalWeight,
+      truckCapacityLbs: outcome.capacity,
+      overCapacity: outcome.overCapacity,
+      palletOverrideMakesOverCapacity: outcome.palletOverrideMakesOverCapacity
     }
   });
   return getSmartScmProposal(id);
@@ -1705,16 +2155,20 @@ async function vendorResponseTransferRevision({ runId, line, response, revision,
   );
   let created = 0;
   if (shouldTransfer) {
-    const policies = await planningPolicies();
+    const policies = await loadSmartScmPlanningPolicies({ includeTemporarilyExcluded: true });
     const inventory = await inventoryState();
     const forecastMap = await smartScmForecastMap();
     const minimumOrders = await smartScmMinimumOrderMap(policies);
     const policy = policies.find((candidate) => String(candidate.item_id) === String(line.item_id) && String(candidate.location_id) === String(line.destination_location_id));
     if (policy) {
-      const stateByKey = new Map(policies.map((candidate) => {
-        const state = calculatePolicyState(candidate, forecastMap.get(`${candidate.item_id}:${candidate.location_id}`), inventory, minimumOrders.get(`${candidate.item_id}:${candidate.location_id}`), settings);
-        return [state.key, state];
-      }));
+      const refreshedStates = classifySmartScmUrgency(policies.map((candidate) => calculatePolicyState(
+        candidate,
+        forecastMap.get(`${candidate.item_id}:${candidate.location_id}`),
+        inventory,
+        minimumOrders.get(`${candidate.item_id}:${candidate.location_id}`),
+        settings
+      )));
+      const stateByKey = new Map(refreshedStates.map((state) => [state.key, state]));
       const state = stateByKey.get(`${line.item_id}:${line.destination_location_id}`);
       state.requiredPallets = Math.ceil(transferResidual);
       const transfer = internalTransferDrafts({ state, requestedPallets: transferResidual, stateByKey, settings, provisional: false, keyPrefix: `reply-${line.id}-${revision}` });
@@ -1874,12 +2328,20 @@ export async function prepareSmartScmTransferExecution(proposalId, operatorId = 
     if (proposal.status === "held") throw Object.assign(new Error("Review and release this held load before confirming it."), { status: 409 });
     if (proposal.lines.some((line) => line.manual_planning_required)) throw Object.assign(new Error("Resolve missing conversion or pallet weight before confirming this load."), { status: 409 });
     const settings = await settingsRow();
+    const palletQuantityOverrides = smartScmNormalizePalletQuantityOverrides(proposal.pallet_quantity_overrides);
     const palletTransferQuantity = round(smartScmPhysicalPalletLines({
       id: proposal.id,
       destinationLocationId: proposal.destination_location_id,
       destinationName: proposal.destination_name,
       lines: proposal.lines,
-      palletQuantityOverrides: proposal.pallet_quantity_overrides
+      palletQuantityOverrides
+    }).reduce((sum, line) => sum + positive(line.quantity), 0));
+    const automaticPalletTransferQuantity = round(smartScmPhysicalPalletLines({
+      id: proposal.id,
+      destinationLocationId: proposal.destination_location_id,
+      destinationName: proposal.destination_name,
+      lines: proposal.lines,
+      palletQuantityOverrides: {}
     }).reduce((sum, line) => sum + positive(line.quantity), 0));
     const palletWeightResult = await query(
       `SELECT COALESCE(item_weight, 0) AS item_weight
@@ -1894,12 +2356,27 @@ export async function prepareSmartScmTransferExecution(proposalId, operatorId = 
         { status: 409 }
       );
     }
-    const grossWeight = round(proposal.lines.reduce((sum, line) => sum + positive(line.line_weight_lbs), 0)
-      + (palletTransferQuantity * physicalPalletWeightLbs));
-    if (grossWeight > positive(settings.truck_capacity_lbs) + EPSILON) {
-      throw Object.assign(new Error("This TO exceeds truck capacity after applying the official PALLET quantity. Adjust the load before confirming."), { status: 409 });
+    const materialWeight = round(proposal.lines.reduce((sum, line) => sum + positive(line.line_weight_lbs), 0));
+    const grossWeight = round(materialWeight + (palletTransferQuantity * physicalPalletWeightLbs));
+    const automaticGrossWeight = round(materialWeight
+      + (automaticPalletTransferQuantity * physicalPalletWeightLbs));
+    const truckCapacityLbs = positive(settings.truck_capacity_lbs);
+    const overCapacity = grossWeight > truckCapacityLbs + EPSILON;
+    const manualCapacityOverride = proposal.lines.some((line) => line.reason?.manualCapacityOverride === true);
+    const palletOverrideMakesOverCapacity = Object.keys(palletQuantityOverrides).length > 0
+      && overCapacity
+      && automaticGrossWeight <= truckCapacityLbs + EPSILON;
+    if (overCapacity && !manualCapacityOverride && !palletOverrideMakesOverCapacity) {
+      throw Object.assign(
+        new Error("This TO exceeds truck capacity without an explicit manual capacity override. Save the intended manual quantity before confirming."),
+        { status: 409 }
+      );
     }
-    const [policies, inventory, forecastMap] = await Promise.all([planningPolicies(), inventoryState(), smartScmForecastMap()]);
+    const [policies, inventory, forecastMap] = await Promise.all([
+      loadSmartScmPlanningPolicies({ includeTemporarilyExcluded: true }),
+      inventoryState(),
+      smartScmForecastMap()
+    ]);
     const minimumOrders = await smartScmMinimumOrderMap(policies);
     const sourceStates = new Map(policies
       .filter((policy) => Number(policy.location_id) === Number(proposal.source_location_id))
@@ -1973,6 +2450,11 @@ export async function prepareSmartScmTransferExecution(proposalId, operatorId = 
       memo: proposal.memo,
       totalPallets: positive(proposal.total_pallets),
       palletTransferQuantity,
+      grossWeightLbs: grossWeight,
+      automaticGrossWeightLbs: automaticGrossWeight,
+      truckCapacityLbs,
+      overCapacity,
+      manualCapacityOverride: overCapacity && (manualCapacityOverride || palletOverrideMakesOverCapacity),
       lines: proposal.lines.map((line) => ({
         id: Number(line.id),
         itemId: Number(line.item_id),

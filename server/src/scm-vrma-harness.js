@@ -131,6 +131,11 @@ try {
       /must be PLT, SQFT, or PC/i,
       "A no-conversion VRMA item must only accept PLT, SQFT, or PC."
     );
+    await assertRejects(
+      () => createScmVrmaOrder(payload({ status: "Cancelled" })),
+      /Use Delete VRMA/i,
+      "VRMA cancellation must use the guarded, audited removal workflow."
+    );
 
     const created = await createScmVrmaOrder(payload());
     assert(created.vrma.pickup_location === "3445"

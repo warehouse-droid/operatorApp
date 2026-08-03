@@ -1,4 +1,5 @@
-const CACHE_NAME = "mbbs-yard-operator-v132-driver-samsara-v1";
+const CACHE_NAME = "mbbs-yard-operator-v134-driver-cache-isolation-v1";
+const OPERATOR_CACHE_PREFIX = "mbbs-yard-operator-";
 const APP_SHELL = [
   "/operator",
   "/operator.html",
@@ -7,12 +8,7 @@ const APP_SHELL = [
   "/vendor/quagga2/quagga.min.js?v=1.12.1",
   "/i18n.js?v=20260729-returns-v9",
   "/operator.js?v=20260729-returns-v9",
-  "/driver",
-  "/driver.html",
-  "/driver.css?v=20260722-unified-v1",
-  "/driver.js?v=20260729-driver-samsara-v1",
   "/manifest.webmanifest",
-  "/driver-manifest.webmanifest",
   "/icons/mbbs-yard-192.png",
   "/icons/mbbs-yard-512.png",
   "/icons/mbbs-yard.svg"
@@ -26,7 +22,9 @@ self.addEventListener("install", (event) => {
 self.addEventListener("activate", (event) => {
   event.waitUntil((async () => {
     const names = await caches.keys();
-    await Promise.all(names.filter((name) => name !== CACHE_NAME).map((name) => caches.delete(name)));
+    await Promise.all(names
+      .filter((name) => name.startsWith(OPERATOR_CACHE_PREFIX) && name !== CACHE_NAME)
+      .map((name) => caches.delete(name)));
     await self.clients.claim();
   })());
 });
@@ -63,7 +61,14 @@ self.addEventListener("notificationclick", (event) => {
 
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
-  if (event.request.method !== "GET" || url.pathname.startsWith("/api/")) return;
+  const driverAsset = url.pathname === "/driver"
+    || url.pathname === "/driver.html"
+    || url.pathname === "/driver.css"
+    || url.pathname === "/driver.js"
+    || url.pathname === "/driver-manifest.webmanifest"
+    || url.pathname === "/driver-service-worker.js"
+    || url.pathname.startsWith("/driver-offline-");
+  if (event.request.method !== "GET" || url.pathname.startsWith("/api/") || driverAsset) return;
 
   event.respondWith(
     fetch(event.request)
@@ -72,6 +77,6 @@ self.addEventListener("fetch", (event) => {
         caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
         return response;
       })
-      .catch(() => caches.match(event.request).then((cached) => cached || caches.match(url.pathname.startsWith("/driver") ? "/driver" : "/operator")))
+      .catch(() => caches.match(event.request).then((cached) => cached || caches.match("/operator")))
   );
 });

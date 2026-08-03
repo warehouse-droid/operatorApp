@@ -3,10 +3,14 @@ import fs from "node:fs";
 
 const driverSource = fs.readFileSync(new URL("../public/driver.js", import.meta.url), "utf8");
 const serverSource = fs.readFileSync(new URL("./server.js", import.meta.url), "utf8");
+const offlineServiceSource = fs.readFileSync(
+  new URL("./driver-offline-service.js", import.meta.url),
+  "utf8"
+);
 
 assert(
-  /function locationCheckApproved\(\)[\s\S]{0,160}locationCheck\?\.status === "ok" \|\| locationOverrideAccepted/.test(driverSource),
-  "GPS approval must require an OK result or an explicit override."
+  /function locationCheckApproved\(\)[\s\S]{0,220}locationCheck\?\.status === "ok"[\s\S]{0,120}locationCheck\?\.status === "not_checked_offline"[\s\S]{0,120}locationOverrideAccepted/.test(driverSource),
+  "GPS approval must require an OK result, a genuine offline marker, or an explicit override."
 );
 assert(
   !/function locationCheckApproved\(\)[\s\S]{0,160}driverUsesSamsaraWorkflow\(\)/.test(driverSource),
@@ -37,8 +41,63 @@ assert(
 const completionRoute = serverSource.match(/app\.post\("\/api\/driver\/jobs\/:jobId\/photos"[\s\S]*?\n\}\);/)?.[0] || "";
 assert(completionRoute, "Driver photo completion endpoint must exist.");
 assert(
-  completionRoute.indexOf("checkDriverJobLocation(job)") < completionRoute.indexOf("recordDriverJobPhotos"),
+  completionRoute.indexOf("checkDriverJobLocation(job)") < completionRoute.indexOf("completeDriverJobOperationalEffects"),
   "The server must keep its GPS check before committing stop completion."
+);
+const completionEffectsStart = serverSource.indexOf("async function completeDriverJobOperationalEffects");
+const completionEffectsEnd = serverSource.indexOf("async function applyDriverOfflineEvent", completionEffectsStart);
+const completionEffects = completionEffectsStart >= 0 && completionEffectsEnd > completionEffectsStart
+  ? serverSource.slice(completionEffectsStart, completionEffectsEnd)
+  : "";
+assert(
+  completionEffects.includes("recordDriverJobPhotos"),
+  "The shared completion function must durably record the required stop photos."
+);
+assert(
+  completionEffects.includes("completeYardDependenciesForTransferDrop"),
+  "The shared online/offline completion function must record physical yard-replenishment deliveries."
+);
+
+const offlineApplyStart = serverSource.indexOf("async function applyDriverOfflineEvent");
+const offlineCompletionBranch = serverSource.indexOf(
+  'if (event.eventType === "job_completed")',
+  offlineApplyStart
+);
+const offlineStartBranch = offlineApplyStart >= 0 && offlineCompletionBranch > offlineApplyStart
+  ? serverSource.slice(offlineApplyStart, offlineCompletionBranch)
+  : "";
+assert(
+  offlineStartBranch.indexOf("reconcileCompletedYardTransfersForSalesOrderStart")
+    < offlineStartBranch.indexOf("getSalesOrderDependencyExecutionBlock"),
+  "Offline job start must reconcile an earlier physical TO drop before enforcing the Sales Order dependency gate."
+);
+
+const onlineStartRoute = serverSource.match(
+  /app\.post\("\/api\/driver\/jobs\/:jobId\/start"[\s\S]*?\n\}\);/
+)?.[0] || "";
+assert(onlineStartRoute, "Driver start endpoint must exist.");
+assert(
+  onlineStartRoute.indexOf("reconcileCompletedYardTransfersForSalesOrderStart")
+    < onlineStartRoute.indexOf("getSalesOrderDependencyExecutionBlock"),
+  "Online job start must reconcile an earlier physical TO drop before enforcing the Sales Order dependency gate."
+);
+assert(
+  offlineServiceSource.includes("routeJobs: currentPlan.jobs || []"),
+  "Normal offline application must pass the locked current route into dependency recovery."
+);
+const reviewResolutionStart = serverSource.indexOf(
+  "async function applyDriverOfflineReviewResolution"
+);
+const reviewResolutionEnd = serverSource.indexOf(
+  "function emitAppEvent",
+  reviewResolutionStart
+);
+const reviewResolution = reviewResolutionStart >= 0 && reviewResolutionEnd > reviewResolutionStart
+  ? serverSource.slice(reviewResolutionStart, reviewResolutionEnd)
+  : "";
+assert(
+  reviewResolution.includes("routeJobs: currentPlan.jobs || []"),
+  "Dispatch Apply Original/reattach must pass the current route into dependency recovery."
 );
 assert(
   !completionRoute.includes("driverSamsaraWorkflowEnabled(req.driver)")

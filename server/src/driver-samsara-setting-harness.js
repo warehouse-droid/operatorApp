@@ -103,8 +103,18 @@ const dvirUploadTokenRoute = sourceSection(
 );
 assert.match(
   dvirUploadTokenRoute,
-  /!driverSamsaraWorkflowEnabled\(req\.driver\)[\s\S]{0,220}recordType[\s\S]{0,220}dvir/,
+  /const offlineUpload = Boolean\(req\.driverOfflineAuthorization \|\| body\.offlineEventUpload === true\);[\s\S]{0,180}&& !offlineUpload[\s\S]{0,180}!driverSamsaraWorkflowEnabled\(req\.driver\)[\s\S]{0,220}recordType[\s\S]{0,220}dvir/,
   "A stale Driver PWA can still obtain a DVIR photo-upload token while the workflow is off."
+);
+assert.match(
+  dvirUploadTokenRoute,
+  /if \(offlineUpload\) \{[\s\S]{0,180}authorizeOfflinePhotoUpload\(/,
+  "Manifest-scoped offline DVIR evidence must be authorized instead of blocked by the current workflow setting."
+);
+assert.match(
+  dvirUploadTokenRoute,
+  /options: offlineUpload[\s\S]{0,120}allowedTypes: \["image\/jpeg"\]/,
+  "Manifest-scoped offline evidence tokens must be restricted to JPEG uploads."
 );
 
 const locationRoute = sourceSection(
@@ -114,7 +124,7 @@ const locationRoute = sourceSection(
 );
 assert.match(
   locationRoute,
-  /res\.json\(await checkDriverJobLocation\(job\)\);/,
+  /const locationCheck = await checkDriverJobLocation\(job\);[\s\S]{0,700}res\.json\(\{ \.\.\.locationCheck, verificationId:/,
   "The location endpoint must always perform the read-only Samsara GPS verification."
 );
 assert.doesNotMatch(
@@ -181,6 +191,21 @@ const loadNextJobUi = sourceSection(
   "async function loadNextJob()",
   "function connectEvents()"
 );
+assert.doesNotMatch(
+  loadNextJobUi,
+  /\/api\/driver\/day-state/,
+  "Driver PWA still performs a duplicate day-state request before every next-job request."
+);
+assert.match(
+  loadNextJobUi,
+  /if \(result\?\.state\) dayState = result\.state;/,
+  "Driver PWA does not reuse the day state returned with the next job."
+);
+assert.match(
+  loadNextJobUi,
+  /if \(nextJobLoadPromise\) return nextJobLoadPromise;/,
+  "Concurrent live refreshes can still start duplicate next-job request chains."
+);
 assert.match(
   loadNextJobUi,
   /if \(driverUsesSamsaraWorkflow\(\) && dayState\?\.truckPlate &&/,
@@ -188,13 +213,23 @@ assert.match(
 );
 assert.match(
   loadNextJobUi,
-  /return renderDvir\("pre", message\);/,
+  /renderDvir\("pre", message\);[\s\S]{0,400}saveRouteBootstrap\(result\)[\s\S]{0,300}return;/,
   "Driver PWA no longer renders the enabled pre-DVIR gate."
 );
 assert.match(
   loadNextJobUi,
-  /if \(driverUsesSamsaraWorkflow\(\) && !currentJob && dayState\?\.allJobsComplete[\s\S]{0,220}return renderDvir\("post"/,
+  /if \(driverUsesSamsaraWorkflow\(\) && !currentJob && dayState\?\.allJobsComplete[\s\S]{0,300}renderDvir\("post", message\);[\s\S]{0,400}saveRouteBootstrap\(result\)[\s\S]{0,300}return;/,
   "Driver PWA post-DVIR is not gated by the setting."
+);
+assert.match(
+  loadNextJobUi,
+  /function eventTargetsCurrentDriver\([\s\S]*eventDriver[\s\S]*driver\?\.login/,
+  "Driver-scoped live events are not filtered to the signed-in driver."
+);
+assert.match(
+  loadNextJobUi,
+  /function queueLiveRefresh\(\)[\s\S]*LIVE_REFRESH_DEBOUNCE_MS/,
+  "Burst live events are not coalesced before refreshing the Driver PWA."
 );
 assert.match(
   driverUiSource,
@@ -203,7 +238,7 @@ assert.match(
 );
 assert.match(
   driverUiSource,
-  /showToast\("Job started"\);\s*checkCurrentJobLocation\(\)\.catch/,
+  /showToast\(t\("driver\.jobStarted", "Job started"\)\);\s*checkCurrentJobLocation\(\)\.catch/,
   "Driver PWA must run GPS verification after every job start, even when write workflows are off."
 );
 assert.match(
@@ -239,11 +274,11 @@ const truckSwitch = sourceSection(
 );
 assert.match(
   truckSwitch,
-  /if \(!normalizedAccounts\.enabled\) \{\s*return completeDriverTruckSwitchLocally\(driverLogin, job, row\.id\);\s*\}/,
+  /if \(!normalizedAccounts\.enabled\) \{\s*return completeDriverTruckSwitchLocally\(driverLogin, job, row\.id,\s*\{[\s\S]{0,160}occurredAt,[\s\S]{0,80}offlineTrace[\s\S]{0,80}\}\s*\);\s*\}/,
   "A disabled driver does not take the local-only truck-switch path."
 );
 assert.ok(
-  truckSwitch.indexOf("return completeDriverTruckSwitchLocally(driverLogin, job, row.id);")
+  truckSwitch.indexOf("return completeDriverTruckSwitchLocally(driverLogin, job, row.id,")
     < truckSwitch.indexOf("createSamsaraDriverVehicleAssignment({"),
   "The truck-switch write guard must run before any Samsara vehicle assignment."
 );
@@ -256,6 +291,21 @@ assert.match(
   driverRepositorySource,
   /samsaraOnDutyConfirmed:\s*!samsaraEnabled \|\|/,
   "Disabled day state can still fail the legacy Samsara confirmation gate."
+);
+const confirmedPlanLoader = sourceSection(
+  driverRepositorySource,
+  "async function confirmedPlans(",
+  "function planJobsForTruck("
+);
+assert.match(
+  confirmedPlanLoader,
+  /p\.plan_date >= \$1::date/,
+  "Driver PWA state still downloads every historical confirmed dispatch snapshot."
+);
+assert.match(
+  driverRepositorySource,
+  /confirmedPlans\(\{ startDate: today \}\)/,
+  "Active driver assignment does not constrain confirmed plans to today and future dates."
 );
 
 const rollback = await beginRollbackContext();

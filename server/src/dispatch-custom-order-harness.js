@@ -150,8 +150,13 @@ function assertStaticIntegration() {
   );
   assert.match(
     planningSource,
-    /current \+= stopStayMinutes\(stop, order, truck\)/,
-    "The planning timeline must use the same Custom Order stop-time calculation as the route estimate."
+    /current \+= physicalVisitStayMinutes\(visit, truck\)/,
+    "The planning timeline must use the same physical-visit stop-time calculation as the route estimate."
+  );
+  assert.match(
+    planningSource,
+    /stayMinutes:\s*physicalVisitStayMinutes\(visit, truck\)/,
+    "Route estimation and the planning timeline must share the same Custom Order-aware visit duration."
   );
 }
 

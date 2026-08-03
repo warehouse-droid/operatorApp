@@ -592,6 +592,8 @@ vm.runInContext(`
   };
   function driverOrientedPlanningEnabled() { return true; }
   function truckHasDriver(truck) { return Boolean(truck?.driverLogin); }
+  function stopHasDriverActivity() { return false; }
+  function stopActivityLockNotice() { return "This stop has already started."; }
   function findLoad(loadId) {
     for (const truck of trucks) {
       const load = (truck.loads || []).find((item) => item.id === loadId);
@@ -694,10 +696,213 @@ assert(plannerUi.includes("const orderDependencies = groupedDependencySources.le
 assert(plannerUi.includes("const grouped = normalizeOrder({"), "New groups bypass grouped dependency normalization.");
 const savedRestore = sourceRange(plannerUi, "function applySavedPlan", "function compactCurrentPlan");
 assert(savedRestore.indexOf("trucks = trucksFromFleetAndSavedPlan(saved.trucks);") < savedRestore.indexOf("ensureDriverLaneOrder(Array.isArray(saved.summary?.driverLaneOrder)"), "Saved lane order is restored before historical truck/load metadata.");
+const activityEvidenceFunctions = sourceRange(plannerUi, "function activePhysicalOrderEvidence", "function applyDispatchOrderFeed");
+const activityEvidenceContext = vm.createContext({});
+vm.runInContext(`
+  let driverJobStatusesLoadedPlanId = "183";
+  let currentPlan = { id: 183 };
+  let trucks = [];
+  let driverJobStatuses = [{
+    load_id: "SETY-L3",
+    stop_id: "RP-PICK",
+    stop_type: "pickup",
+    status: "complete",
+    order_refs: ["RP-BWS-WOODBRIGE-0730-2-v2"]
+  }];
+  function dispatchGroupingRefs(order = {}) {
+    return new Set([order.id, ...(order.childOrders || []), ...(order.groupAliases || [])]
+      .map((value) => String(value || ""))
+      .filter(Boolean));
+  }
+  function normalizeOrder(order) { return order; }
+  ${activityEvidenceFunctions}
+  const planTrucks = [{ loads: [{
+    id: "SETY-L3",
+    stops: [{ id: "RP-PICK", type: "pick", orderId: "RP-BWS-WOODBRIGE-0730-2-v2", location: "12441" }]
+  }] }];
+  const previous = {
+    id: "RP-BWS-WOODBRIGE-0730-2-v2",
+    sourceYard: "12441",
+    pickupLocations: ["12441"],
+    address: "Old future drop",
+    items: [{ lineRowId: 119, itemId: 1784, sku: "PALLET", quantity: 300 }]
+  };
+  const refreshed = {
+    ...previous,
+    sourceYard: "3445",
+    pickupLocations: ["3445"],
+    address: "Updated future drop",
+    items: [{ lineRowId: 159, itemId: 1784, sku: "PALLET", quantity: 300 }]
+  };
+  const evidence = activePhysicalOrderEvidence(planTrucks, 183);
+  const protectedOrder = preserveActiveOrderEvidence(previous, refreshed, evidence);
+  const unstartedPrevious = { id: "UNSTARTED", items: [{ lineRowId: 10, quantity: 1 }] };
+  const unstartedRefreshed = { id: "UNSTARTED", items: [{ lineRowId: 11, quantity: 2 }] };
+  const unstartedOrder = preserveActiveOrderEvidence(unstartedPrevious, unstartedRefreshed, evidence);
+  const reconciledOrder = reapplyActiveOrderEvidence(
+    [{ ...protectedOrder, sourceYard: "3445", pickupLocations: ["3445"] }],
+    new Map([[previous.id.toLowerCase(), previous]]),
+    evidence
+  )[0];
+
+  driverJobStatuses = [{
+    load_id: "GROUP-L1",
+    stop_id: "GROUP-PICK",
+    stop_type: "pickup",
+    status: "complete",
+    order_refs: ["CHILD-A"]
+  }];
+  const groupTrucks = [{ loads: [{
+    id: "GROUP-L1",
+    stops: [{ id: "GROUP-PICK", type: "pick", orderId: "GROUP-A", location: "12441" }]
+  }] }];
+  const groupedPrevious = {
+    id: "GROUP-A",
+    childOrders: ["CHILD-A"],
+    childOrderDetails: [{ id: "CHILD-A", items: [{ lineRowId: 21, itemId: 1784, quantity: 10 }] }],
+    items: [{ lineRowId: 21, itemId: 1784, quantity: 10 }]
+  };
+  const groupedRefreshed = {
+    ...groupedPrevious,
+    items: [{ lineRowId: 22, itemId: 1784, quantity: 10 }]
+  };
+  const groupedEvidence = activePhysicalOrderEvidence(groupTrucks, 183);
+  const groupedProtected = preserveActiveOrderEvidence(groupedPrevious, groupedRefreshed, groupedEvidence);
+
+  driverJobStatuses = [{ load_id: "SETY-L3", stop_id: "RP-PICK", stop_type: "pickup", status: "reopened", order_refs: [previous.id] }];
+  const reopenedEvidence = activePhysicalOrderEvidence(planTrucks, 183);
+  const reopenedOrder = preserveActiveOrderEvidence(previous, refreshed, reopenedEvidence);
+  driverJobStatuses = [{ load_id: "SETY-L3", stop_id: "TRAVEL", stop_type: "travel", status: "complete", order_refs: [previous.id] }];
+  const travelEvidence = activePhysicalOrderEvidence(planTrucks, 183);
+  const travelOrder = preserveActiveOrderEvidence(previous, refreshed, travelEvidence);
+
+  driverJobStatuses = [{ load_id: "DROP-L1", stop_id: "DROP-A", stop_type: "dropoff", status: "complete", order_refs: ["PO-DROP"] }];
+  const dropTrucks = [{ loads: [{ id: "DROP-L1", stops: [{ id: "DROP-A", type: "drop", orderId: "PO-DROP" }] }] }];
+  const dropPrevious = {
+    id: "PO-DROP",
+    address: "Recorded drop",
+    destinationYard: "12441",
+    dropoffs: [{ key: "done", address: "Recorded drop" }],
+    notes: "Old note",
+    items: [{ lineRowId: 31, itemId: 1784, quantity: 10 }]
+  };
+  const dropRefreshed = {
+    ...dropPrevious,
+    address: "Changed recorded drop",
+    destinationYard: "2967",
+    dropoffs: [{ key: "future", address: "Updated future drop" }],
+    notes: "New note",
+    items: [{ lineRowId: 32, itemId: 1784, quantity: 10 }]
+  };
+  const dropEvidence = activePhysicalOrderEvidence(dropTrucks, 183);
+  const dropProtected = preserveActiveOrderEvidence(dropPrevious, dropRefreshed, dropEvidence);
+  globalThis.result = {
+    protectedOrder,
+    unstartedOrder,
+    reconciledOrder,
+    groupedProtected,
+    reopenedOrder,
+    travelOrder,
+    dropProtected
+  };
+`, activityEvidenceContext);
+const activityEvidenceResult = JSON.parse(JSON.stringify(activityEvidenceContext.result));
+assert.equal(activityEvidenceResult.protectedOrder.items[0].lineRowId, 119,
+  "A live feed refresh replaced the saved item-row evidence for an active order.");
+assert.equal(activityEvidenceResult.protectedOrder.sourceYard, "12441",
+  "A live feed refresh replaced the materialized source yard for an active pickup.");
+assert.deepEqual(activityEvidenceResult.protectedOrder.pickupLocations, ["12441"],
+  "A live feed refresh replaced the materialized pickup locations for an active pickup.");
+assert.equal(activityEvidenceResult.protectedOrder.address, "Updated future drop",
+  "Protecting active pickup evidence prevented a future drop detail from refreshing.");
+assert.equal(activityEvidenceResult.unstartedOrder.items[0].lineRowId, 11,
+  "An unstarted order did not receive its latest live-feed details.");
+assert.equal(activityEvidenceResult.reconciledOrder.sourceYard, "12441",
+  "Transit reconciliation overwrote active pickup evidence after the feed merge.");
+assert.equal(activityEvidenceResult.groupedProtected.items[0].lineRowId, 21,
+  "A child-order activity reference did not protect its grouped root allocation.");
+assert.equal(activityEvidenceResult.reopenedOrder.items[0].lineRowId, 159,
+  "A reopened record incorrectly froze an order feed snapshot.");
+assert.equal(activityEvidenceResult.travelOrder.items[0].lineRowId, 159,
+  "Travel-only activity incorrectly froze a physical order allocation.");
+assert.equal(activityEvidenceResult.dropProtected.address, "Recorded drop",
+  "A completed drop's materialized destination was replaced by a feed refresh.");
+assert.equal(activityEvidenceResult.dropProtected.dropoffs[0].key, "future",
+  "Protecting one completed drop prevented later multi-drop feed details from refreshing.");
+assert.equal(activityEvidenceResult.dropProtected.notes, "New note",
+  "Protecting drop evidence prevented an unrelated order note from refreshing.");
+const applyFeedSource = sourceRange(plannerUi, "function applyDispatchOrderFeed", "function mergeDispatchOrderSearchFeed");
+assert(applyFeedSource.includes("|| orderMatchesActivityRefs(order, activityEvidence.all)"),
+  "An active planned order can disappear when a partial feed omits it.");
+assert(applyFeedSource.indexOf("reconcileTransitCoSourceOrders();") < applyFeedSource.indexOf("reapplyActiveOrderEvidence"),
+  "The main order feed does not restore active evidence after transit reconciliation.");
+const searchFeedSource = sourceRange(plannerUi, "function mergeDispatchOrderSearchFeed", "function cancelDispatchOrderSearch");
+assert(searchFeedSource.indexOf("reconcileTransitCoSourceOrders();") < searchFeedSource.indexOf("reapplyActiveOrderEvidence"),
+  "The search order feed does not restore active evidence after transit reconciliation.");
+const planForDateLoader = sourceRange(plannerUi, "async function loadPlanForDate", "async function loadPlanById");
+assert(planForDateLoader.indexOf("await loadDriverJobStatuses();") < planForDateLoader.indexOf("applySavedPlan(currentPlan);"),
+  "Plan startup merges the live feed before loading driver evidence.");
+const planByIdLoader = sourceRange(plannerUi, "async function loadPlanById", "async function restoreServerPlan");
+assert(planByIdLoader.indexOf("await loadDriverJobStatuses();") < planByIdLoader.indexOf("applySavedPlan(plan)"),
+  "Historical plan loading merges the live feed before loading driver evidence.");
+const restoreLoader = sourceRange(plannerUi, "async function restoreServerPlan", "async function pollServerPlan");
+assert(restoreLoader.indexOf("await loadDriverJobStatuses();") < restoreLoader.indexOf("applySavedPlan(saved)"),
+  "Remote plan refresh merges the live feed before loading driver evidence.");
+assert(savedRestore.indexOf("reconcileTransitCoSourceOrders();") < savedRestore.indexOf("reapplyActiveOrderEvidence"),
+  "Saved-plan restore does not reapply active evidence after transit reconciliation.");
+const initDispatchSource = sourceRange(plannerUi, "async function initDispatch", "window.addEventListener(\"mbbs-language-changed\"");
+assert.equal((initDispatchSource.match(/loadDriverJobStatuses\(/g) || []).length, 0,
+  "Dispatch initialization repeats the status request already owned by plan loading.");
 assert(repository.includes("displayOrder: numberValue(row.display_order, 0)"), "Setup API does not expose persisted display order.");
 assert(repository.includes("cleanDriver(driver, index)"), "Driver request order is not explicitly persisted as display_order.");
 assert(setupHtml.includes("20260729-driver-samsara-v1"), "Dispatch Setup browser asset version was not bumped.");
-assert(plannerHtml.includes('/dispatch.js?v=20260730-physical-visits-v3'), "Dispatch planner browser asset version was not bumped.");
+assert(plannerHtml.includes('/dispatch.js?v=20260801-preview-timing-v1'), "Dispatch planner browser asset version was not bumped.");
+
+const activityPositionSource = sourceRange(
+  plannerUi,
+  "function physicalActivityPositionChanged",
+  "function stopActivityLockNotice"
+);
+const physicalActivityPositionChanged = Function(
+  "stopHasDriverActivity",
+  `"use strict"; ${activityPositionSource}; return physicalActivityPositionChanged;`
+)((_load, stop) => stop?.id === "ACTIVE");
+const activityLoad = { stops: [{ id: "EARLY-A" }, { id: "EARLY-B" }, { id: "ACTIVE" }, { id: "FUTURE-A" }, { id: "FUTURE-B" }] };
+assert.equal(physicalActivityPositionChanged(activityLoad, [{ id: "EARLY-B" }, { id: "EARLY-A" }, { id: "ACTIVE" }, { id: "FUTURE-A" }, { id: "FUTURE-B" }]), true,
+  "Equal-count edits before a started stop must not rewrite the executed prefix.");
+assert.equal(physicalActivityPositionChanged(activityLoad, [{ id: "EARLY-A" }, { id: "EARLY-B" }, { id: "ACTIVE" }, { id: "FUTURE-B" }, { id: "FUTURE-A" }]), false,
+  "Future stops after the activity boundary must remain reorderable.");
+assert.equal(physicalActivityPositionChanged(activityLoad, [{ id: "EARLY-A" }, { id: "ACTIVE" }, { id: "FUTURE-A" }, { id: "FUTURE-B" }]), true,
+  "Removing a stop before active evidence must be blocked.");
+
+const optimizeSource = sourceRange(plannerUi, "function optimizeSelectedRoute", "function escapeHtml");
+const optimizeLoad = {
+  stops: [
+    { id: "EARLY-A", type: "drop", windowStart: "12:00" },
+    { id: "ACTIVE", type: "drop", windowStart: "11:00" },
+    { id: "FUTURE-LATE", type: "drop", windowStart: "15:00" },
+    { id: "FUTURE-PICK", type: "pick", windowStart: "16:00" },
+    { id: "FUTURE-EARLY", type: "drop", windowStart: "13:00" }
+  ]
+};
+const optimizeSelectedRoute = Function(
+  "selectedLoad",
+  "stopHasDriverActivity",
+  "stopOrder",
+  "minutes",
+  `"use strict"; ${optimizeSource}; return optimizeSelectedRoute;`
+)(
+  () => ({ load: optimizeLoad }),
+  (_load, stop) => stop?.id === "ACTIVE",
+  (stop) => stop,
+  (value) => Number(String(value).split(":")[0]) * 60 + Number(String(value).split(":")[1])
+);
+optimizeSelectedRoute();
+assert.deepEqual(optimizeLoad.stops.map((stop) => stop.id), ["EARLY-A", "ACTIVE", "FUTURE-PICK", "FUTURE-EARLY", "FUTURE-LATE"],
+  "Route optimization must preserve the executed prefix and sort only future stops.");
+const addOrderSource = sourceRange(plannerUi, "function addOrderToLoad", "function pullExistingStop");
+assert.match(addOrderSource, /if \(existing\?\.locked\)\s*{\s*routeNotice\s*=\s*stopActivityLockNotice\(existing\.stop\);\s*return false;/,
+  "An active stop must never be removed and reinserted by same-load order placement.");
 
 console.log(JSON.stringify({
   ok: true,
@@ -710,5 +915,5 @@ console.log(JSON.stringify({
   dependentSalesAutoPlacement: true,
   driverLoadRenumberAfterDrag: true,
   canonicalReplenishmentLoadPrecedence: true,
-  tests: 65
+  tests: 90
 }));

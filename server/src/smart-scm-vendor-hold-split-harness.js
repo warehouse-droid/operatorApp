@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { closeDb, query, withTransaction } from "./db.js";
 import {
   listSmartScmVendorReplyLoads,
+  removeSmartScmVendorReplyLoad,
   stageSmartScmVendorReplyLoad
 } from "./smart-scm-vendor-repository.js";
 
@@ -32,9 +33,9 @@ async function insertLine(proposalId, itemId, itemName, pallets) {
        $5::numeric, $5::numeric, 0, $5::numeric,
        $5::numeric * 10, 100, $5::numeric * 100,
        10, 0, 0, 0, false, $6::jsonb,
-       987654, $7, false, false
+       15, $7, false, false
      ) RETURNING id`,
-    [proposalId, itemId, itemName, `${token} integration line`, pallets, JSON.stringify({ harness: token }), `${token} yard`]
+    [proposalId, itemId, itemName, `${token} integration line`, pallets, JSON.stringify({ harness: token }), "12441"]
   );
   return Number(result.rows[0].id);
 }
@@ -58,11 +59,11 @@ try {
          memo, order_requested_at, order_requested_by, vendor_response_status
        ) VALUES (
          $1, $2, 'PO', 'direct_vendor', 'vendor', $3,
-         987654, $4, $5, 'order_requested',
+         15, $4, $5, 'order_requested',
          13, 1300, 0.1, now() + interval '1 day',
          $6, now(), $7, 'awaiting'
        ) RETURNING id`,
-      [runId, proposalKey, `${token} source`, `${token} yard`, `${token} vendor`, `${token} source load`, token]
+      [runId, proposalKey, `${token} source`, "12441", `${token} vendor`, `${token} source load`, token]
     );
     const sourceProposalId = Number(sourceResult.rows[0].id);
     const lineIds = {
@@ -71,14 +72,36 @@ try {
       fullHold: await insertLine(sourceProposalId, itemIds.fullHold, `${token} full hold`, 3),
       cancel: await insertLine(sourceProposalId, itemIds.cancel, `${token} cancel`, 1)
     };
+    await query(
+      `INSERT INTO inventory_items (
+         item_id, item_name, display_name, item_description, stock_unit,
+         to_plt, to_lyr, to_sec, to_pcs, item_weight, vendor_id, vendor
+       ) VALUES ($1,$2,$2,$3,'EA',10,0,0,0,10,$4,$5)`,
+      [itemIds.partialHold, `${token} partial hold`, `${token} destination fixture`, itemIds.partialHold, `${token} vendor`]
+    );
+    await query(
+      `INSERT INTO scm_smart_item_policies (
+         item_id, item_name, item_description, vendor, vendor_code, stock_unit,
+         to_plt, to_lyr, to_sec, to_pcs, lead_time_days, pallet_weight_lbs,
+         inactive, discontinued, planning_enabled, updated_by
+       ) VALUES ($1,$2,$3,$4,$5,'EA',10,0,0,0,7,100,false,false,true,$6)`,
+      [itemIds.partialHold, `${token} partial hold`, `${token} destination fixture`, `${token} vendor`, String(itemIds.partialHold), token]
+    );
+    await query(
+      `INSERT INTO scm_smart_item_yard_policies (
+         item_id, location_id, yard_code, eligible, capacity_pallets,
+         service_quantile, minimum_safety_pallets, updated_by
+       ) VALUES ($1,1,'3445',true,50,0.90,1,$2)`,
+      [itemIds.partialHold, token]
+    );
 
     const staged = await stageSmartScmVendorReplyLoad(sourceProposalId, {
       responseSource: "hold_split_harness",
       remarks: token,
-      palletQuantityOverrides: { 987654: 2.75 },
+      palletQuantityOverrides: { 15: 2.75 },
       lines: [
         { proposalLineId: lineIds.confirm, decision: "confirm", decisionPallets: 5 },
-        { proposalLineId: lineIds.partialHold, decision: "hold", decisionPallets: 2 },
+        { proposalLineId: lineIds.partialHold, destinationLocationId: 1, decision: "hold", decisionPallets: 2 },
         { proposalLineId: lineIds.fullHold, decision: "hold", decisionPallets: 3 },
         { proposalLineId: lineIds.cancel, decision: "cancel", decisionPallets: 0 }
       ]
@@ -96,7 +119,9 @@ try {
     assert.equal(staged.source.lines.length, 0, "The staged source load must not retain hidden held lines.");
     assert.equal(staged.review.lines.length, 1);
     assert.equal(staged.review.lines[0].confirmedPallets, 5);
-    assert.equal(staged.review.palletQuantityOverrides["987654"], 2.75);
+    assert.equal(staged.review.lines[0].destinationLocationId, 15);
+    assert.equal(staged.review.lines[0].destinationName, "12441");
+    assert.equal(staged.review.palletQuantityOverrides["15"], 2.75);
     assert.equal(staged.review.palletLines.length, 1);
     assert.equal(staged.review.palletLines[0].automaticQuantity, 5);
     assert.equal(staged.review.palletLines[0].overrideQuantity, 2.75);
@@ -108,6 +133,9 @@ try {
     const partialHeld = staged.heldLoads.flatMap((load) => load.lines)
       .find((line) => line.itemId === itemIds.partialHold);
     assert.ok(partialHeld);
+    assert.equal(partialHeld.destinationLocationId, 1,
+      "A destination changed in Vendor Replies must persist into its held follow-up load.");
+    assert.equal(partialHeld.destinationName, "3445");
     assert.equal(partialHeld.proposedPallets, 2);
     assert.equal(partialHeld.confirmedPallets, 0);
     assert.equal(partialHeld.residualPallets, 2);
@@ -131,6 +159,42 @@ try {
       [...staged.heldProposalIds].sort((a, b) => a - b),
       "Only the separate held child loads should remain visible in Vendor Replies."
     );
+    const removedLoadId = staged.heldProposalIds[0];
+    const removedBefore = staged.heldLoads.find((load) => load.id === removedLoadId);
+    const removed = await removeSmartScmVendorReplyLoad(removedLoadId, null);
+    assert.equal(removed.removed, true);
+    assert.equal(removed.reused, false);
+    assert.equal(removed.load.status, "cancelled");
+    assert.equal(removed.load.vendorResponseStatus, "cancelled");
+    assert.equal(removed.load.vendorReplyDueAt, null);
+    assert.deepEqual(
+      removed.load.lines.map((line) => ({
+        id: line.id,
+        itemId: line.itemId,
+        pallets: line.proposedPallets,
+        destinationLocationId: line.destinationLocationId,
+        destinationName: line.destinationName,
+        lineWeightLbs: line.lineWeightLbs
+      })),
+      removedBefore.lines.map((line) => ({
+        id: line.id,
+        itemId: line.itemId,
+        pallets: line.proposedPallets,
+        destinationLocationId: line.destinationLocationId,
+        destinationName: line.destinationName,
+        lineWeightLbs: line.lineWeightLbs
+      })),
+      "Removing a Vendor Replies load must retain its lines, destination, quantity, and weight for audit."
+    );
+    const repeatedRemoval = await removeSmartScmVendorReplyLoad(removedLoadId, null);
+    assert.equal(repeatedRemoval.removed, false);
+    assert.equal(repeatedRemoval.reused, true);
+    const queueAfterRemoval = await listSmartScmVendorReplyLoads({ search: token, limit: 20 });
+    assert.deepEqual(
+      queueAfterRemoval.map((load) => load.id),
+      staged.heldProposalIds.filter((id) => id !== removedLoadId),
+      "A removed load must leave Vendor Replies without deleting its retained history."
+    );
 
     const children = await query(
       `SELECT id, parent_proposal_id, vendor_resolution_kind, status
@@ -141,7 +205,12 @@ try {
     );
     assert.equal(children.rowCount, 4);
     const heldChildren = children.rows.filter((row) => row.vendor_resolution_kind === null && row.status === "vendor_replied");
-    assert.equal(heldChildren.length, 2);
+    assert.equal(heldChildren.length, 1);
+    assert(children.rows.some((row) =>
+      Number(row.id) === Number(removedLoadId)
+      && row.vendor_resolution_kind === null
+      && row.status === "cancelled"
+    ));
 
     const conserved = await query(
       `SELECT line.item_id, SUM(line.proposed_pallets)::numeric AS accounted_pallets
@@ -169,6 +238,28 @@ try {
     assert.equal(revision.rowCount, 1);
     assert.equal(revision.rows[0].diff.heldProposalIds.length, 2);
     assert(revision.rows[0].diff.conservation.every((entry) => entry.conserved));
+    const destinationRevision = await query(
+      `SELECT diff
+         FROM scm_smart_plan_revisions
+        WHERE run_id = $1 AND reason = 'vendor_reply_destination_changed'
+        ORDER BY revision DESC
+        LIMIT 1`,
+      [runId]
+    );
+    assert.equal(destinationRevision.rowCount, 1);
+    assert.equal(Number(destinationRevision.rows[0].diff.changes[0].lineId), lineIds.partialHold);
+    assert.equal(Number(destinationRevision.rows[0].diff.changes[0].destinationLocationId), 1);
+    const removalRevision = await query(
+      `SELECT diff
+         FROM scm_smart_plan_revisions
+        WHERE run_id = $1 AND reason = 'vendor_reply_load_removed'
+        ORDER BY revision DESC
+        LIMIT 1`,
+      [runId]
+    );
+    assert.equal(removalRevision.rowCount, 1);
+    assert.equal(Number(removalRevision.rows[0].diff.proposalId), removedLoadId);
+    assert.equal(removalRevision.rows[0].diff.linesRetained, true);
 
     return { proposalKey, sourceProposalId, heldProposalIds: staged.heldProposalIds };
   }, { rollback: true });

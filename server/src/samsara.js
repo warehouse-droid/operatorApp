@@ -2,6 +2,14 @@ import crypto from "node:crypto";
 import { config } from "./config.js";
 
 const SAMSARA_BASE_URL = "https://api.samsara.com";
+const SAMSARA_GET_TIMEOUT_MS = 5_000;
+const SAMSARA_LOCATION_VEHICLE_CACHE_TTL_MS = 60_000;
+
+const locationVehicleRosterCache = {
+  expiresAt: 0,
+  vehicles: [],
+  pending: null
+};
 
 function samsaraToken() {
   return String(config.samsara?.apiToken || "").trim();
@@ -14,21 +22,45 @@ function requireSamsaraToken() {
 }
 
 async function samsaraRequest(path, { method = "GET", body = null, includeMeta = false } = {}) {
-  if (String(method || "GET").toUpperCase() !== "GET" && !config.samsara?.writesEnabled) {
+  const normalizedMethod = String(method || "GET").toUpperCase();
+  if (normalizedMethod !== "GET" && !config.samsara?.writesEnabled) {
     const error = new Error("Samsara writes are disabled on this application.");
     error.status = 409;
     throw error;
   }
   const token = requireSamsaraToken();
-  const response = await fetch(`${SAMSARA_BASE_URL}${path}`, {
-    method,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      ...(body ? { "Content-Type": "application/json" } : {})
-    },
-    ...(body ? { body: JSON.stringify(body) } : {})
-  });
-  const text = await response.text();
+  const timeoutController = normalizedMethod === "GET" ? new AbortController() : null;
+  const timeoutId = timeoutController
+    ? setTimeout(() => timeoutController.abort(), SAMSARA_GET_TIMEOUT_MS)
+    : null;
+  timeoutId?.unref?.();
+  let response;
+  let text = "";
+  try {
+    response = await fetch(`${SAMSARA_BASE_URL}${path}`, {
+      method: normalizedMethod,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        ...(body ? { "Content-Type": "application/json" } : {})
+      },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+      ...(timeoutController ? { signal: timeoutController.signal } : {})
+    });
+    text = await response.text();
+  } catch (error) {
+    if (timeoutController?.signal.aborted) {
+      const timeoutError = new Error(
+        `Samsara GET request timed out after ${Math.round(SAMSARA_GET_TIMEOUT_MS / 1000)} seconds.`
+      );
+      timeoutError.code = "SAMSARA_REQUEST_TIMEOUT";
+      timeoutError.timeoutMs = SAMSARA_GET_TIMEOUT_MS;
+      timeoutError.cause = error;
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
   let payload = {};
   if (text) {
     try {
@@ -62,6 +94,27 @@ export async function listSamsaraVehicles() {
     after = payload.pagination?.hasNextPage ? payload.pagination?.endCursor || "" : "";
   } while (after);
   return vehicles;
+}
+
+async function listSamsaraLocationVehicles() {
+  if (locationVehicleRosterCache.expiresAt > Date.now()) {
+    return locationVehicleRosterCache.vehicles;
+  }
+  if (locationVehicleRosterCache.pending) return locationVehicleRosterCache.pending;
+
+  const pending = listSamsaraVehicles()
+    .then((vehicles) => {
+      locationVehicleRosterCache.vehicles = vehicles;
+      locationVehicleRosterCache.expiresAt = Date.now() + SAMSARA_LOCATION_VEHICLE_CACHE_TTL_MS;
+      return vehicles;
+    })
+    .finally(() => {
+      if (locationVehicleRosterCache.pending === pending) {
+        locationVehicleRosterCache.pending = null;
+      }
+    });
+  locationVehicleRosterCache.pending = pending;
+  return pending;
 }
 
 export async function findSamsaraVehicleByPlate(plate) {
@@ -113,11 +166,12 @@ function normalizeLocationRow(row = {}, vehicle = {}) {
 }
 
 export async function listSamsaraVehicleLocations({ plates = [] } = {}) {
-  const vehicles = await listSamsaraVehicles();
+  const vehicles = await listSamsaraLocationVehicles();
   const wantedPlates = new Set((plates || []).map(normalizedPlate).filter(Boolean));
   const filteredVehicles = wantedPlates.size
     ? vehicles.filter((vehicle) => wantedPlates.has(normalizedPlate(vehicle.licensePlate)))
     : vehicles;
+  if (wantedPlates.size && !filteredVehicles.length) return [];
   const vehicleIds = filteredVehicles.map((vehicle) => vehicle.id).filter(Boolean);
   const locations = [];
   let after = "";

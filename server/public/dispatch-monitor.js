@@ -542,6 +542,16 @@ function monitorTimeRange(start, end, formatter) {
   return `${startText}–${endText}`;
 }
 
+function monitorOrderPlanTime(order = {}) {
+  const forecastStart = formatActualTime(order.forecastStart);
+  const forecastEnd = formatActualTime(order.forecastEnd);
+  const startText = forecastStart !== "--" ? forecastStart : formatPlannedMinute(order.plannedStart);
+  const endText = forecastEnd !== "--" ? forecastEnd : formatPlannedMinute(order.plannedEnd);
+  if (startText === "--" && endText === "--") return "--";
+  if (endText === "--" || startText === endText) return startText;
+  return `${startText}–${endText}`;
+}
+
 function renderMonitorOrderList() {
   if (monitorLoading) return `<div class="monitor-empty">Loading today's planned orders...</div>`;
   if (monitorError) return `<div class="monitor-empty warning">${escapeHtml(monitorError)}</div>`;
@@ -549,8 +559,9 @@ function renderMonitorOrderList() {
   if (!monitorData.plan) return `<div class="monitor-empty">No plan is available for today.</div>`;
   if (!visible.length) return `<div class="monitor-empty">${monitorOrderSearch.trim() ? "No planned orders match this search." : "No orders are assigned to today's trucks."}</div>`;
   return visible.map((order) => {
-    const plannedTime = monitorTimeRange(order.plannedStart, order.plannedEnd, formatPlannedMinute);
+    const planTime = monitorOrderPlanTime(order);
     const actualTime = monitorTimeRange(order.actualStart, order.actualEnd, formatActualTime);
+    const actualTimeMarkup = actualTime === "--" ? "" : `<span><b>Actual</b> ${escapeHtml(actualTime)}</span>`;
     return `
       <article class="monitor-order-card status-${escapeHtml(order.status || "pending")} ${String(order.key) === String(selectedMonitorOrderKey) ? "selected" : ""}" role="button" tabindex="0" data-monitor-order-key="${escapeHtml(order.key)}" data-monitor-order-truck="${escapeHtml(order.truckPlate || order.vehiclePlate || "")}">
         <div class="monitor-order-head">
@@ -559,7 +570,7 @@ function renderMonitorOrderList() {
         </div>
         <div class="monitor-order-route"><b>From</b><span>${escapeHtml(order.fromLocation || "—")}</span><b>To</b><span>${escapeHtml(order.destination || "—")}</span></div>
         <div class="monitor-order-assignment"><span>Driver <b>${escapeHtml(order.driver || "—")}</b></span><span>Vehicle <b>${escapeHtml(order.vehiclePlate || "—")}</b></span>${order.parkingSpot ? `<span>Parking <b>${escapeHtml(order.parkingSpot)}</b></span>` : ""}</div>
-        <div class="monitor-order-times"><span><b>Planned</b> ${escapeHtml(plannedTime)}</span><span><b>Actual</b> ${escapeHtml(actualTime)}</span></div>
+        <div class="monitor-order-times"><span><b>Plan</b> ${escapeHtml(planTime)}</span>${actualTimeMarkup}</div>
       </article>
     `;
   }).join("");

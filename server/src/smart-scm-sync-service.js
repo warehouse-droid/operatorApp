@@ -60,6 +60,44 @@ async function updateSyncState(sql, params = []) {
   await query(`UPDATE scm_smart_sync_state SET ${sql}, updated_at = now() WHERE id = 1`, params);
 }
 
+function inventoryQuantity(value) {
+  if (value === null || value === undefined || value === "") return 0;
+  const parsed = Number(String(value).replaceAll(",", ""));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+async function insertInventorySnapshotRows(runId, rows = []) {
+  const uniqueRows = [...new Map((rows || []).map((row) => [
+    `${Number(row.item_id)}:${Number(row.location_id)}`,
+    row
+  ])).values()].filter((row) => Number.isInteger(Number(row.item_id)) && Number.isInteger(Number(row.location_id)));
+  for (let offset = 0; offset < uniqueRows.length; offset += 300) {
+    const group = uniqueRows.slice(offset, offset + 300);
+    const params = [];
+    const values = group.map((row) => {
+      const fields = [
+        Number(runId),
+        Number(row.item_id),
+        Number(row.location_id),
+        String(row.location || ""),
+        inventoryQuantity(row.quantity_on_hand),
+        inventoryQuantity(row.quantity_available)
+      ];
+      return `(${fields.map((field) => {
+        params.push(field);
+        return `$${params.length}`;
+      }).join(", ")})`;
+    });
+    await query(
+      `INSERT INTO scm_smart_inventory_snapshots (
+         run_id, item_id, location_id, yard_code, quantity_on_hand, quantity_available
+       ) VALUES ${values.join(", ")}`,
+      params
+    );
+  }
+  return uniqueRows.length;
+}
+
 function canonicalInventoryRows(rows, yards, requestedItemIds = []) {
   const localByNetSuiteId = new Map(yards.map((yard) => [String(yard.netsuiteLocationId), yard]));
   const canonical = [];
@@ -107,7 +145,18 @@ function canonicalInventoryRows(rows, yards, requestedItemIds = []) {
 }
 
 async function performInventorySync({ fullCatalog = false, operatorId = null, triggerSource = "manual" } = {}) {
-  await updateSyncState("inventory_status = 'running', inventory_started_at = now(), inventory_error = NULL");
+  const started = await withTransaction(async () => {
+    await updateSyncState("inventory_status = 'running', inventory_started_at = now(), inventory_error = NULL");
+    return query(
+      `INSERT INTO scm_smart_inventory_sync_runs (
+         trigger_source, full_catalog, created_by
+       ) VALUES ($1, $2, $3)
+       RETURNING id`,
+      [triggerSource, Boolean(fullCatalog), operatorId]
+    );
+  });
+  const snapshotRunId = Number(started.rows[0].id);
+  let result;
   try {
     const yards = await resolvedYards();
     let requestedItemIds = [];
@@ -125,24 +174,62 @@ async function performInventorySync({ fullCatalog = false, operatorId = null, tr
       }
     }
     const canonical = canonicalInventoryRows(rows, yards, requestedItemIds);
-    const saved = await upsertInventoryBalancesBulk(canonical);
-    const policies = await syncSmartScmPoliciesFromInventoryItems();
-    await updateSyncState(
-      "inventory_status = 'ready', inventory_synced_at = now(), inventory_item_count = $1, inventory_balance_count = $2, inventory_error = NULL",
-      [saved.items, saved.balances]
-    );
-    await writeAudit({
-      actorType: operatorId ? "operator" : "system",
-      actorOperatorId: operatorId,
-      source: "smart_scm",
-      action: "smart_scm.inventory.sync",
-      details: { triggerSource, fullCatalog, items: saved.items, balances: saved.balances, policiesTouched: policies.policiesTouched }
+    const observedAt = new Date().toISOString();
+    result = await withTransaction(async () => {
+      const saved = await upsertInventoryBalancesBulk(canonical);
+      const policies = await syncSmartScmPoliciesFromInventoryItems();
+      const snapshotBalances = await insertInventorySnapshotRows(snapshotRunId, canonical);
+      const requestedCount = fullCatalog
+        ? new Set(canonical.map((row) => Number(row.item_id))).size
+        : requestedItemIds.length;
+      await query(
+        `UPDATE scm_smart_inventory_sync_runs
+            SET status = 'completed',
+                requested_item_count = $2,
+                item_count = $3,
+                balance_count = $4,
+                observed_at = $5::timestamptz,
+                completed_at = now(),
+                error = NULL
+          WHERE id = $1`,
+        [snapshotRunId, requestedCount, saved.items, snapshotBalances, observedAt]
+      );
+      await updateSyncState(
+        "inventory_status = 'ready', inventory_synced_at = now(), inventory_item_count = $1, inventory_balance_count = $2, inventory_error = NULL",
+        [saved.items, saved.balances]
+      );
+      return { ...saved, ...policies, snapshotRunId, snapshotBalances };
     });
-    return { ...saved, ...policies, fullCatalog, syncedAt: new Date().toISOString() };
   } catch (error) {
-    await updateSyncState("inventory_status = 'failed', inventory_error = $1", [String(error.message || error).slice(0, 2000)]).catch(() => null);
+    const message = String(error.message || error).slice(0, 2000);
+    await withTransaction(async () => {
+      await query(
+        `UPDATE scm_smart_inventory_sync_runs
+            SET status = 'failed', error = $2, completed_at = now()
+          WHERE id = $1
+            AND status = 'running'`,
+        [snapshotRunId, message]
+      );
+      await updateSyncState("inventory_status = 'failed', inventory_error = $1", [message]);
+    }).catch(() => null);
     throw error;
   }
+  await writeAudit({
+    actorType: operatorId ? "operator" : "system",
+    actorOperatorId: operatorId,
+    source: "smart_scm",
+    action: "smart_scm.inventory.sync",
+    details: {
+      triggerSource,
+      fullCatalog,
+      items: result.items,
+      balances: result.balances,
+      snapshotRunId: result.snapshotRunId,
+      snapshotBalances: result.snapshotBalances,
+      policiesTouched: result.policiesTouched
+    }
+  });
+  return { ...result, fullCatalog, syncedAt: new Date().toISOString() };
 }
 
 export async function syncSmartScmInventory(options = {}) {

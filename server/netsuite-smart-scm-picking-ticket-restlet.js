@@ -9,12 +9,15 @@
  *   Renders a transaction picking ticket. For backward compatibility, omitting
  *   action while supplying entityId also renders a picking ticket.
  *
+ * POST action=purchaseOrderPdf renders the current native transaction PDF.
+ * POST action=updatePurchaseOrder applies narrowly scoped, version-checked PO edits.
+ *
  * @NApiVersion 2.1
  * @NScriptType Restlet
  * @NModuleScope SameAccount
  */
-define(["N/error", "N/log", "N/render", "N/runtime"], (error, log, render, runtime) => {
-  const VERSION = "2.0.0";
+define(["N/error", "N/log", "N/record", "N/render", "N/runtime"], (error, log, record, render, runtime) => {
+  const VERSION = "3.0.0";
   const MAX_BASE64_CHARS = 9 * 1024 * 1024;
 
   function booleanValue(value, fallback = false) {
@@ -86,6 +89,8 @@ define(["N/error", "N/log", "N/render", "N/runtime"], (error, log, render, runti
       capabilities: {
         health: true,
         pickingTicket: true,
+        purchaseOrderPdf: true,
+        updatePurchaseOrder: true,
         locationFilter: true,
         metadataOnly: true,
         methods: ["GET", "POST"]
@@ -161,6 +166,159 @@ define(["N/error", "N/log", "N/render", "N/runtime"], (error, log, render, runti
     };
   }
 
+  function purchaseOrderPdf(request, id) {
+    const details = runtimeDetails();
+    assertRequestedEnvironment(request, details);
+    const entityId = positiveInteger(request.entityId, "entityId");
+    const includeContent = booleanValue(request.includeContent, true);
+    // render.transaction accepts several transaction types. Loading explicitly
+    // as a PO prevents this narrowly scoped endpoint from rendering an
+    // unrelated transaction when a caller supplies the wrong internal ID.
+    record.load({ type: record.Type.PURCHASE_ORDER, id: entityId, isDynamic: false });
+    const pdf = render.transaction({ entityId, printMode: render.PrintMode.PDF });
+    const contentBase64 = includeContent ? String(pdf.getContents() || "") : "";
+    if (includeContent && !contentBase64) {
+      throw error.create({ name: "MBBS_EMPTY_PDF", message: `NetSuite rendered no PO PDF for transaction ${entityId}.`, notifyOff: true });
+    }
+    if (contentBase64.length > MAX_BASE64_CHARS) {
+      throw error.create({ name: "MBBS_PDF_TOO_LARGE", message: `The PO PDF for transaction ${entityId} exceeds the safe response limit.`, notifyOff: true });
+    }
+    return {
+      ok: true,
+      action: "purchaseOrderPdf",
+      version: VERSION,
+      requestId: id,
+      generatedAt: new Date().toISOString(),
+      accountId: details.accountId,
+      environment: details.environment,
+      sandbox: details.sandbox,
+      entityId,
+      filename: safeFilename(pdf.name, `PO-${entityId}.pdf`),
+      contentType: "application/pdf",
+      contentEncoding: "base64",
+      contentIncluded: includeContent,
+      contentLength: contentBase64.length,
+      fileSize: Number.isFinite(Number(pdf.size)) ? Number(pdf.size) : null,
+      contentBase64
+    };
+  }
+
+  function comparableInstant(value) {
+    if (!value) return "";
+    const date = value instanceof Date ? value : new Date(value);
+    return Number.isFinite(date.getTime()) ? String(Math.floor(date.getTime() / 1000)) : String(value).trim();
+  }
+
+  function dateValue(value, fieldName) {
+    if (value === null || value === undefined || value === "") return null;
+    const match = String(value).trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (!match) throw error.create({ name: "MBBS_INVALID_ARGUMENT", message: `${fieldName} must use YYYY-MM-DD.`, notifyOff: true });
+    return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]), 12, 0, 0);
+  }
+
+  function numericValue(value, fieldName, { positive = false } = {}) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || (positive ? parsed <= 0 : parsed < 0)) {
+      throw error.create({ name: "MBBS_INVALID_ARGUMENT", message: `${fieldName} is invalid.`, notifyOff: true });
+    }
+    return parsed;
+  }
+
+  function updatePurchaseOrder(request, id) {
+    const details = runtimeDetails();
+    assertRequestedEnvironment(request, details);
+    const entityId = positiveInteger(request.entityId, "entityId");
+    const po = record.load({ type: record.Type.PURCHASE_ORDER, id: entityId, isDynamic: false });
+    const expected = String(request.expectedLastModifiedAt || "").trim();
+    const actual = po.getValue({ fieldId: "lastmodifieddate" });
+    if (!expected || comparableInstant(expected) !== comparableInstant(actual)) {
+      throw error.create({ name: "MBBS_PO_VERSION_CONFLICT", message: `Purchase order ${entityId} changed in NetSuite. Refresh before saving.`, notifyOff: true });
+    }
+
+    let statusText = "";
+    try {
+      statusText = String(po.getText({ fieldId: "orderstatus" }) || "");
+    } catch (lookupError) {
+      // Line-level receipt/closed checks below remain authoritative when a
+      // custom form does not expose orderstatus text.
+    }
+    const lineCount = po.getLineCount({ sublistId: "item" }) || 0;
+    let hasLockedLine = false;
+    for (let current = 0; current < lineCount; current += 1) {
+      const received = Number(po.getSublistValue({ sublistId: "item", fieldId: "quantityreceived", line: current })
+        || po.getSublistValue({ sublistId: "item", fieldId: "quantityshiprecv", line: current }) || 0);
+      const closedValue = po.getSublistValue({ sublistId: "item", fieldId: "isclosed", line: current });
+      if (received > 0 || /^(t|true|yes|1)$/i.test(String(closedValue || ""))) {
+        hasLockedLine = true;
+        break;
+      }
+    }
+    if (hasLockedLine || /closed|cancelled|canceled|fully received/i.test(statusText)) {
+      throw error.create({ name: "MBBS_PO_READ_ONLY", message: `Purchase order ${entityId} is received, closed, cancelled, or read-only.`, notifyOff: true });
+    }
+
+    const header = request.header && typeof request.header === "object" ? request.header : {};
+    if (Object.prototype.hasOwnProperty.call(header, "transactionDate")) {
+      po.setValue({ fieldId: "trandate", value: dateValue(header.transactionDate, "transactionDate") });
+    }
+    if (Object.prototype.hasOwnProperty.call(header, "expectedDeliveryDate")) {
+      po.setValue({ fieldId: "custbody4", value: dateValue(header.expectedDeliveryDate, "expectedDeliveryDate") || "" });
+    }
+    if (Object.prototype.hasOwnProperty.call(header, "memo")) {
+      po.setValue({ fieldId: "memo", value: String(header.memo || "").slice(0, 4000) });
+    }
+    if (Object.prototype.hasOwnProperty.call(header, "vendorReference")) {
+      po.setValue({ fieldId: "otherrefnum", value: String(header.vendorReference || "").slice(0, 300) });
+    }
+
+    const requestedLines = Array.isArray(request.lines) ? request.lines : [];
+    const requestedLineIds = new Set();
+    requestedLines.forEach((requested, index) => {
+      const lineId = positiveInteger(requested.lineId, `lines[${index}].lineId`);
+      if (requestedLineIds.has(lineId)) {
+        throw error.create({ name: "MBBS_DUPLICATE_PO_LINE", message: `Purchase-order line ${lineId} appears more than once in this update.`, notifyOff: true });
+      }
+      requestedLineIds.add(lineId);
+      let line = -1;
+      for (let current = 0; current < lineCount; current += 1) {
+        if (Number(po.getSublistValue({ sublistId: "item", fieldId: "lineuniquekey", line: current })) === lineId) {
+          line = current;
+          break;
+        }
+      }
+      if (line < 0) throw error.create({ name: "MBBS_PO_LINE_MISSING", message: `Purchase-order line ${lineId} no longer exists.`, notifyOff: true });
+      const currentItemId = Number(po.getSublistValue({ sublistId: "item", fieldId: "item", line }));
+      if (requested.itemId && Number(requested.itemId) !== currentItemId) {
+        throw error.create({ name: "MBBS_PO_ITEM_LOCKED", message: `Item identity on line ${lineId} cannot be changed.`, notifyOff: true });
+      }
+      const received = Number(po.getSublistValue({ sublistId: "item", fieldId: "quantityreceived", line })
+        || po.getSublistValue({ sublistId: "item", fieldId: "quantityshiprecv", line }) || 0);
+      const closed = /^(t|true|yes|1)$/i.test(String(po.getSublistValue({ sublistId: "item", fieldId: "isclosed", line }) || ""));
+      if (received > 0 || closed) {
+        throw error.create({ name: "MBBS_PO_LINE_LOCKED", message: `Received or closed line ${lineId} cannot be edited.`, notifyOff: true });
+      }
+      if (Object.prototype.hasOwnProperty.call(requested, "quantity")) {
+        po.setSublistValue({ sublistId: "item", fieldId: "quantity", line, value: numericValue(requested.quantity, `lines[${index}].quantity`, { positive: true }) });
+      }
+      if (Object.prototype.hasOwnProperty.call(requested, "rate")) {
+        po.setSublistValue({ sublistId: "item", fieldId: "rate", line, value: numericValue(requested.rate, `lines[${index}].rate`) });
+      }
+      if (Object.prototype.hasOwnProperty.call(requested, "locationId")) {
+        po.setSublistValue({ sublistId: "item", fieldId: "location", line, value: positiveInteger(requested.locationId, `lines[${index}].locationId`) });
+      }
+    });
+    const savedId = po.save({ enableSourcing: true, ignoreMandatoryFields: false });
+    return {
+      ok: true,
+      action: "updatePurchaseOrder",
+      version: VERSION,
+      requestId: id,
+      entityId: Number(savedId),
+      previousLastModifiedAt: actual instanceof Date ? actual.toISOString() : String(actual || ""),
+      updatedAt: new Date().toISOString()
+    };
+  }
+
   function normalizedAction(request) {
     const explicit = String(request.action || "").trim().toLowerCase().replace(/[^a-z]/g, "");
     if (!explicit) return request.entityId ? "pickingticket" : "health";
@@ -185,9 +343,11 @@ define(["N/error", "N/log", "N/render", "N/runtime"], (error, log, render, runti
       });
       if (action === "health") return health(request, id);
       if (action === "pickingticket") return pickingTicket(request, id);
+      if (action === "purchaseorderpdf") return purchaseOrderPdf(request, id);
+      if (action === "updatepurchaseorder") return updatePurchaseOrder(request, id);
       throw error.create({
         name: "MBBS_UNSUPPORTED_ACTION",
-        message: `Unsupported action "${String(request.action || "")}". Use health or pickingTicket.`,
+        message: `Unsupported action "${String(request.action || "")}". Use health, pickingTicket, purchaseOrderPdf, or updatePurchaseOrder.`,
         notifyOff: true
       });
     } catch (caught) {

@@ -42,8 +42,8 @@ assert.match(
 );
 assert.match(
   source,
-  /stayMinutes: stop\.type === "pick"\s*\? truckStopMinutes\(truck, stopServiceType\(stop, order\), pickupFootprintForLocation\(load, stop\.location\)\)/,
-  "Ordinary pickup stops must continue to use configured service time."
+  /stayMinutes: physicalVisitStayMinutes\(visit, truck\)/,
+  "Every routed physical visit, including pickups, must use the canonical configured service-time helper."
 );
 
 const stopServiceTypeSource = sourceSlice("function stopServiceType", "function stopTimeWindow");
@@ -84,6 +84,7 @@ const makeStopStayMinutes = Function(
   "stopServiceType",
   "dropFootprintPallets",
   "orderFootprintPallets",
+  "normalizedStopTimeOverride",
   '"use strict"; ' + stopStayMinutesSource + "; return stopStayMinutes;"
 );
 const configuredStopMinutes = (_truck, type, pallets) => {
@@ -95,7 +96,8 @@ const stopStayMinutes = makeStopStayMinutes(
   configuredStopMinutes,
   stopServiceType,
   () => 10,
-  () => 10
+  () => 10,
+  () => null
 );
 const vrmaStopMinutes = stopStayMinutes(
   { type: "pick", placeKind: "own" },
@@ -146,8 +148,8 @@ assert.equal(
 );
 assert.match(
   source,
-  /current \+= stopStayMinutes\(stop, order, truck\)/,
-  "Load timeline departures must use the same Custom Order stop time as route estimates."
+  /current \+= physicalVisitStayMinutes\(visit, truck\)/,
+  "Load timeline departures must use the same canonical physical-visit time as route estimates."
 );
 
 const routeFunctionSource = sourceSlice("function routeEstimateFromGoogleLegs", "function directionsRequestForLoad");

@@ -5,7 +5,7 @@ import path from "node:path";
 import { isIP } from "node:net";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { config, isNetSuiteSandboxEnvironment, listEnvFiles, selectEnvFile } from "./config.js";
-import { beginRollbackContext, pool, query, withTransaction } from "./db.js";
+import { afterTransactionCommit, beginRollbackContext, pool, query, withTransaction } from "./db.js";
 import { fetchSalesOrderReferenceFromNetSuite, fetchTransactionReferenceByTranidFromNetSuite } from "./netsuite.js";
 import { buildAuthorizationUrl, exchangeCodeForToken, fetchDeliveryOrdersFromNetSuite, fetchDeliveryOrderFromNetSuite, fetchCustomerPickupOrderFromNetSuite, fetchDeliveryOrderDetailsFromNetSuite, fetchDeliveryOrderDetailsBatchFromNetSuite, fetchTransferDeliveryOrdersFromNetSuite, fetchTransferDeliveryOrderFromNetSuite, fetchTransferOrderDetailsFromNetSuite, fetchTransferOrderVerificationLinesFromNetSuite, fetchTransferOrderByIdFromNetSuite, findTransferOrdersByDependencyMarkerFromNetSuite, findTransferOrdersBySmartScmMarkerFromNetSuite, fetchPurchaseOrdersFromNetSuite, fetchPurchaseOrderFromNetSuite, fetchPurchaseOrderReferenceFromNetSuite, fetchPurchaseOrderDetailsFromNetSuite, fetchTransferReceivingOrdersFromNetSuite, fetchTransferReceivingOrderFromNetSuite, fetchInventoryBalanceForItemFromNetSuite, fetchInventoryBalancesFromNetSuite, fetchInventoryBalancesForItemsFromNetSuite, fetchItemFulfillmentFromNetSuite, fetchItemReceiptFromNetSuite, fetchTransactionProgressFromNetSuite, fetchTransactionStatusFromNetSuite, createPurchaseOrderInNetSuite, createTransferOrderInNetSuite, updateTransferOrderStatusInNetSuite, fetchPickingTicketFromNetSuite, resolveNetSuiteTransferLocations, resolveNetSuiteYardLocations, resolvePalletItemFromNetSuite, transformSalesOrderToItemFulfillment, transformTransferOrderToItemFulfillment, transformPurchaseOrderToItemReceipt, transformTransferOrderToItemReceipt } from "./netsuite.js";
 import { buildTransferDependencyRestPayload, selectSmartScmMarkerTransferOrder, smartScmTransferOrderMemoMarker, transferDependencyMemoMarker } from "./transfer-dependency-netsuite.js";
@@ -51,7 +51,7 @@ import { listExistingInboundOrderIds, listExistingOutboundOrderIds, markMissingI
 import { acceptNetSuiteMirrorEvents, enqueueNetSuiteMirrorOrderEvent, getNetSuiteMirrorStatus, isNetSuiteMirrorConsumer, isNetSuiteMirrorSource, listNetSuiteMirrorManifest, retryNetSuiteMirrorFailures } from "./netsuite-mirror-repository.js";
 import { kickNetSuiteMirrorConsumer, localNetSuiteMirrorEventPage, localNetSuiteMirrorInventorySnapshot, localNetSuiteMirrorOrderSnapshot, relayPendingNetSuiteMirrorEvents, requireNetSuiteMirrorSignature, runNetSuiteMirrorConsumerTick, runNetSuiteMirrorReconciliation, startNetSuiteMirrorWorkers } from "./netsuite-mirror-service.js";
 import { listOperatorHistory, listRecordWarnings, reportOperatorRecordError, resolveRecordWarning } from "./history-repository.js";
-import { listDispatchOrders, enrichDispatchOrdersWithPoTargetAllocations, listScmPurchaseOrders, listScmSchedule, updateScmScheduleEntry, createScmScheduleGroup, cancelScmScheduleGroup, listScmViewPresets, upsertScmViewPreset, completeScmVrmaOrderOverride, createScmVrmaOrder, getScmVrmaOrder, getScmVrmaOptions, searchScmVrmaItems, syncScmScheduleFromDispatchPlan, createScmPurchaseOrderSplit, updateScmPurchaseOrderSplitRef, updateScmPurchaseOrderSplitDestination, updateScmPurchaseOrderSplitPickupYard, updatePurchaseOrderDispatchRef, cancelScmPurchaseOrderSplit, refreshDispatchEnrichment, reparseMissingSalesOrderDispatch, searchSalesOrderMethodOverrides, setPurchaseOrderVendorYard, updateDispatchOrderDetails, updateSalesOrderLocalMethod, getSalesOrderPoAllocationOptions, createSalesOrderPoAllocation, createSalesOrderPoAllocations, cancelSalesOrderPoAllocation, createDispatchOperatorRequest, upsertLocalCoOrder, cancelLocalCoOrder, listDispatchOperatorRequests, resolveDispatchOperatorRequestsForOrder } from "./dispatch-repository.js";
+import { listDispatchOrders, enrichDispatchOrdersWithPoTargetAllocations, listScmPurchaseOrders, listScmSchedule, updateScmScheduleEntry, createScmScheduleGroup, cancelScmScheduleGroup, listScmViewPresets, upsertScmViewPreset, completeScmVrmaOrderOverride, createScmVrmaOrder, getScmVrmaOrder, getScmVrmaOptions, removeScmVrmaOrder, searchScmVrmaItems, syncScmScheduleFromDispatchPlan, createScmPurchaseOrderSplit, updateScmPurchaseOrderSplitRef, updateScmPurchaseOrderSplitDestination, updateScmPurchaseOrderSplitPickupYard, updatePurchaseOrderDispatchRef, cancelScmPurchaseOrderSplit, refreshDispatchEnrichment, reparseMissingSalesOrderDispatch, searchSalesOrderMethodOverrides, setPurchaseOrderVendorYard, updateDispatchOrderDetails, updateSalesOrderLocalMethod, getSalesOrderPoAllocationOptions, createSalesOrderPoAllocation, createSalesOrderPoAllocations, cancelSalesOrderPoAllocation, createDispatchOperatorRequest, upsertLocalCoOrder, cancelLocalCoOrder, listDispatchOperatorRequests, resolveDispatchOperatorRequestsForOrder } from "./dispatch-repository.js";
 import { setPurchaseOrderBlanketFlag } from "./dispatch-repository.js";
 import { cancelDispatchCustomOrder, canonicalizeDispatchCustomOrdersInPlan, completeDispatchCustomOrders, createDispatchCustomOrder, dispatchOrderFromCustomOrder, getDispatchCustomOrderForUpdate, listDispatchCustomOrders, updateDispatchCustomOrder } from "./dispatch-custom-order-repository.js";
 import { DISPATCH_VENDOR_WEEK_DAYS, listDispatchVendorYards, listDispatchLocalVendors, saveDispatchVendorYardSchedule, updateDispatchVendorYard, upsertDispatchVendorYard, listDispatchParserRules, updateDispatchParserRule, listOllamaAudit, listDispatchVendorMappings, discoverDispatchVendorMappingsFromPurchaseOrders, updateDispatchVendorMapping, createDispatchLocalVendor, updateDispatchLocalVendor } from "./dispatch-enrichment.js";
@@ -60,28 +60,122 @@ import { runWithAuditContext } from "./audit-context.js";
 import { DispatchPlanDateMismatchError, StaleDispatchPlanSaveError, applyDispatchPlannedAssignment, confirmDispatchPlan, createDispatchPlan, dispatchPlannedAssignmentMap, dispatchPlannedOrderConflictRefs, dispatchPlannedOrderRefs, getCurrentDispatchPlan, getDispatchPlan, getDispatchPlanRevision, getDispatchPlanSnapshot, listDispatchPlanSnapshots, listDispatchPlans, reopenDispatchPlan, restoreDispatchPlanSnapshot, saveDispatchPlanSnapshot } from "./dispatch-plan-repository.js";
 import { DispatchPlanEditLeaseError, acquireDispatchPlanEditLease, assertDispatchPlanEditLease, getDispatchPlanEditLease, heartbeatDispatchPlanEditLease, releaseDispatchPlanEditLease } from "./dispatch-plan-lease-repository.js";
 import { getDispatchStatistics } from "./dispatch-statistics-repository.js";
+import { buildDispatchForecast } from "./dispatch-forecast-service.js";
 import { DISPATCH_FLEET_PLANNING_LOCK, dispatchFleetAssignmentStatusConflicts, dispatchFleetPlanConflicts, dispatchLegacyDriverRenameConflicts, unchangedCompletedDispatchLoadIds } from "./dispatch-fleet-status.js";
 import { syncDispatchPlanLoadAssignments } from "./dispatch-load-assignment-repository.js";
-import { confirmDriverTruckSwitch, endDriverRest, ensureDriverSamsaraDutyForJob, getActiveDriverRest, getDriverDayState, getDriverRestSummary, getNextDriverJob, listDriverHistory, listDriverJobStatuses, listDriverTruckSwitchAttention, overrideDriverTruckSwitch, recordDriverJobPhotos, skipDriverDvirForTesting, skipDriverTruckSwitchSamsara, startDriverJob, startDriverRest, submitDriverDvir } from "./driver-repository.js";
+import { confirmDriverTruckSwitch, endDriverRest, ensureDriverSamsaraDutyForJob, getActiveDriverRest, getDriverDayJobs, getDriverDayState, getDriverNextJobContext, getDriverRestSummary, getNextDriverJob, listDriverHistory, listDriverJobStatuses, listDriverTruckSwitchAttention, overrideDriverTruckSwitch, recordDriverJobPhotos, recordOfflineDriverTruckSwitch, skipDriverDvirForTesting, skipDriverTruckSwitchSamsara, startDriverJob, startDriverRest, submitDriverDvir } from "./driver-repository.js";
+import {
+  authorizeDriverOfflineSync,
+  authorizeOfflinePhotoUpload,
+  beginDriverOfflineRetry,
+  completeDriverOfflineRetry,
+  createDriverSession,
+  createDriverLocationVerification,
+  driverOfflineManifestMatchesJobs,
+  findDriverOfflineRebaseCandidates,
+  failDriverOfflineRetry,
+  getDriverOfflineEvent,
+  getDriverOfflinePhotoRegistration,
+  getDriverOfflineManifest,
+  getDriverOfflineReview,
+  getDriverOfflineReviewCounts,
+  getDriverSession,
+  getLatestDriverOfflineManifest,
+  getDriverOfflineSyncSummary,
+  driverOfflineRouteBootstrap,
+  dismissDriverClientSyncIssue,
+  issueDriverOfflineSyncGrant,
+  listDriverClientSyncIssues,
+  listDriverOfflineReviews,
+  markDriverOfflinePhotoDurable,
+  materializeDriverOfflineJobs,
+  normalizeDriverDeviceId,
+  normalizePlanDate,
+  persistDriverOfflineBootstrap,
+  persistDriverOfflineDayPlan,
+  registerDriverOfflineSync,
+  recordDriverClientSyncStatus,
+  recordDriverOfflinePhotoVerificationFailure,
+  resolveDriverOfflineReview,
+  revokeDriverOfflineGrants,
+  revokeDriverSession,
+  revokeDriverSessionsForLogin
+} from "./driver-offline-repository.js";
+import { listDriverPwaStops, reopenDriverPwaStop } from "./driver-pwa-repository.js";
+import { processDriverOfflineQueue } from "./driver-offline-service.js";
+import {
+  DRIVER_PWA_VERSION_HEADER,
+  driverPwaVersionDetails,
+  driverPwaVersionGate
+} from "./driver-client-version.js";
+import {
+  beginDriverOfflineReconciliationReceipt,
+  completeDriverOfflineReconciliationReceipt,
+  driverOfflineReconciliationDateSafety,
+  getDriverOfflineReconciliationReceipt,
+  markDriverOfflineReconciliationReceiptUncertain,
+  releaseDriverOfflineReconciliationReceipt
+} from "./driver-offline-reconciliation-repository.js";
 import { createSamsaraDriverAuthToken, createSamsaraDriverVehicleAssignment, findSamsaraDriverByUsername, listSamsaraVehicleLocations, setSamsaraDriverDutyStatus, testSamsaraConnection } from "./samsara.js";
-import { createPhotoReadToken, createPhotoUploadToken, isR2PhotoReference, publicPhotoUploadConfig } from "./photo-upload.js";
+import { createPhotoReadToken, createPhotoUploadToken, isJpegEvidenceBytes, isR2PhotoReference, publicPhotoUploadConfig } from "./photo-upload.js";
 import { getPhotoArchiveSettings, isPhotoArchiveRunning, photoArchiveAutoTick, readArchivedPhoto, recoverInterruptedPhotoArchive, runPhotoArchive, updatePhotoArchiveSettings } from "./photo-archive-repository.js";
 import { authenticateDispatchDriver, ensureDispatchFleetSetup, getDispatchDriverByLogin, listDispatchDrivers, listDispatchTrucks, replaceDispatchFleetSetup, setDispatchDriverActive, setDispatchTruckActive } from "./dispatch-setup-repository.js";
 import { assertNoActiveConsolidationClaimsByRefs, confirmConsolidationItem, getActiveConsolidationBatch, getSavedConsolidationQueue, packConsolidationOrder, releaseConsolidationBatch, startSavedConsolidationBatch, updateConsolidationLine } from "./delivery-consolidation-repository.js";
-import { DEPENDENCY_YARDS, assertNoActiveOrderDependenciesByRefs, cancelOrderDependency, completeDirectDependenciesForSalesOrderDrop, confirmTransferDependencyBatch, createOrderDependency, enrichDispatchOrdersWithDependencies, generateTransferDependencySuggestion, getDependencyInventoryMatrix, getDirectPickupDependencyExecutionBlock, getOrderDependencyOptions, getSalesOrderDependencyExecutionBlock, getTransferDependencyBatch, listOrderDependencies, listTransferDependencyCandidates, markDirectDependencyPickupCompleted, mergeTransferDependencyProposals, normalDispatchGroupTargets, prepareTransferDependencyPalletItem, reconcileOrderDependency, removeTransferDependencyProposalLine, reopenTransferDependencyCandidate, retryTransferDependencyBatch, reviewTransferDependencyCandidate, syncDirectDependencyOperatorProgress, syncOrderDependenciesForTransferOrder, syncOrderDependenciesFromDispatchPlan, updateOrderDependencyMode, updateTransferDependencyBatch, validateDispatchPlanDependencies } from "./order-dependency-repository.js";
+import { DEPENDENCY_YARDS, assertNoActiveOrderDependenciesByRefs, cancelOrderDependency, completeDirectDependenciesForSalesOrderDrop, completeYardDependenciesForTransferDrop, confirmTransferDependencyBatch, createOrderDependency, enrichDispatchOrdersWithDependencies, generateTransferDependencySuggestion, getDependencyInventoryMatrix, getDirectPickupDependencyExecutionBlock, getOrderDependencyOptions, getSalesOrderDependencyExecutionBlock, getTransferDependencyBatch, listOrderDependencies, listTransferDependencyCandidates, markDirectDependencyPickupCompleted, mergeTransferDependencyProposals, normalDispatchGroupTargets, prepareTransferDependencyPalletItem, reconcileCompletedYardTransfersForSalesOrderStart, reconcileOrderDependency, removeTransferDependencyProposalLine, reopenTransferDependencyCandidate, retryTransferDependencyBatch, reviewTransferDependencyCandidate, syncDirectDependencyOperatorProgress, syncOrderDependenciesForTransferOrder, syncOrderDependenciesFromDispatchPlan, updateOrderDependencyMode, updateTransferDependencyBatch, validateDispatchPlanDependencies } from "./order-dependency-repository.js";
 import { activateSmartScmInputFile, importSmartScmSalesCsv, listSmartScmInputFiles, parseSmartScmVendorResponseFile, smartScmInputDownload, storeSmartScmInputFile } from "./smart-scm-import-repository.js";
-import { getSmartScmBootstrap, getSmartScmSettings, getSmartScmPlanningRun, listSmartScmForecasts, listSmartScmForecastRuns, listSmartScmPlanningRuns, listSmartScmProposals, promoteSmartScmForecastSegment, runSmartScmForecast, runSmartScmPlan, smartScmAutoTick, updateSmartScmSettings } from "./smart-scm-repository.js";
+import { getSmartScmBootstrap, getSmartScmSettings, getSmartScmPlanningRun, listSmartScmForecasts, listSmartScmForecastRuns, listSmartScmPlanningPauses, listSmartScmPlanningRuns, listSmartScmProposals, promoteSmartScmForecastSegment, runSmartScmForecast, runSmartScmPlan, smartScmAutoTick, updateSmartScmSettings } from "./smart-scm-repository.js";
 import { buildSmartScmItemMasterCsvTemplate, getSmartScmSyncStatus, importSmartScmItemMasterCsv, listSmartScmItems, updateSmartScmItem } from "./smart-scm-item-repository.js";
 import { refreshSmartScmLiveData } from "./smart-scm-sync-service.js";
+import { addSmartScmPlanningExclusion, deactivateSmartScmPlanningExclusion } from "./smart-scm-planning-exclusion-repository.js";
+import {
+  addSmartScmBlanketAlternativeLine,
+  buildSmartScmBlanketPlan,
+  cancelSmartScmBlanketReservation,
+  cancelSmartScmBlanketReservationForProposal,
+  confirmSmartScmBlanketProposal,
+  finalizeSmartScmBlanketVendorWorkflow,
+  listSmartScmBlanketWorkspace,
+  removeSmartScmBlanketAlternativeLine,
+  saveSmartScmBlanketVendorReplyDraft,
+  searchSmartScmBlanketAlternatives,
+  updateSmartScmBlanketProposalLine
+} from "./smart-scm-blanket-repository.js";
 import { completeSmartScmTransferExecution, failSmartScmTransferExecution, getSmartScmProposal, markSmartScmTransferAttention, prepareSmartScmTransferExecution, recordSmartScmVendorResponses, setSmartScmPalletQuantityOverride, updateSmartScmProposal } from "./smart-scm-planning-repository.js";
 import { createSimplePdf, leaseYardPrintJob, listSmartScmPrintJobs, listYardPrinters, queueSmartScmPrintJob, queueYardPrinterTest, retrySmartScmPrintJob, rotateYardPrinterToken, updateLeasedPrintJob, updateYardPrinter, yardPrintJobDocument } from "./smart-scm-print-repository.js";
-import { addSmartScmVendorAlternativeLine, listSmartScmNetSuitePoReviewLoads, listSmartScmVendorReplyLoads, removeSmartScmNetSuitePoReviewLoad, removeSmartScmVendorAlternativeLine, saveSmartScmVendorReplyLoad, searchSmartScmVendorAlternatives, stageSmartScmVendorReplyLoad, updateSmartScmNetSuitePoReviewPalletQuantity } from "./smart-scm-vendor-repository.js";
+import { addSmartScmVendorAlternativeLine, listSmartScmNetSuitePoReviewLoads, removeSmartScmNetSuitePoReviewLoad, removeSmartScmVendorAlternativeLine, removeSmartScmVendorReplyLoad, saveSmartScmVendorReplyLoad, searchSmartScmVendorAlternatives, stageSmartScmVendorReplyLoad, updateSmartScmNetSuitePoReviewPalletQuantity } from "./smart-scm-vendor-repository.js";
+import {
+  getSmartScmVendorWorkflow,
+  getSmartScmVendorWorkflowActionTarget,
+  getSmartScmVendorWorkflowForProposal,
+  findSmartScmVendorWorkflowByPurchaseOrder,
+  ensureSmartScmVendorWorkflow,
+  linkSmartScmVendorWorkflowReview,
+  listSmartScmVendorWorkflowLoads,
+  recordSmartScmVendorWorkflowAttention,
+  recordSmartScmVendorWorkflowBlanketSplit,
+  recordSmartScmVendorWorkflowPurchaseResult,
+  saveSmartScmVendorEmailDraft
+} from "./smart-scm-vendor-workflow-repository.js";
 import { addSmartScmProposalLine, createSmartScmManualLoad, groupSmartScmProposals, recalculateSmartScmPoProposal, removeSmartScmProposalLine, searchSmartScmManualLoadItems, searchSmartScmProposalItems, splitSmartScmProposalLine, updateSmartScmProposalLine } from "./smart-scm-proposal-editor.js";
 import { addTransferDependencyProposalLine, searchTransferDependencyProposalItems } from "./transfer-dependency-manual-items.js";
 import { listSmartScmRouteRules, upsertSmartScmRouteRule } from "./smart-scm-route-repository.js";
-import { changedLockedLoadAssignments, dispatchLoadAssignment, normalizeDispatchPlanLoadAssignments, validateDispatchLoadAssignments } from "./dispatch-load-assignment.js";
+import { changedDriverActivityAssignments, dispatchLoadAssignment, normalizeDispatchPlanLoadAssignments, overlayLockedLoadDerivedSchedule, validateDispatchLoadAssignments } from "./dispatch-load-assignment.js";
 
 import { executeSmartScmPurchaseProposal } from "./smart-scm-purchase-service.js";
+import {
+  findScmNetSuitePoHistoryByNetSuiteId,
+  getScmNetSuitePoHistory,
+  listScmNetSuitePoHistory,
+  listScmNetSuitePoHistoryFilterOptions,
+  setScmNetSuitePoHistoryArchived
+} from "./scm-netsuite-po-history-repository.js";
+import {
+  getScmNetSuitePoHistoryPdf,
+  processScmNetSuitePoHistoryWebhook,
+  refreshScmNetSuitePoHistory,
+  registerScmNetSuitePoHistoryCreation,
+  updateScmNetSuitePoHistory
+} from "./scm-netsuite-po-history-service.js";
 import { SALES_YARDS, getSalesOrderPrintCandidate, getSalesOrderPrintSnapshot, listSalesOrderPrintCandidates, listSalesOrderPrintHistory, normalizeSalesYardLocationIds } from "./sales-repository.js";
 import { getSalesPortalSettings, isPublicSalesAccessEnabled, updateSalesPortalSettings } from "./sales-settings-repository.js";
 import { syncReturnCustomerDirectory } from "./return-customer-directory.js";
@@ -120,11 +214,11 @@ const dispatchSetupPath = path.join(dataDir, "dispatch-setup.json");
 const deliveryLocations = [1, 28, 15, 26];
 const fulfillmentJobs = new Map();
 const receivingJobs = new Map();
-const driverSessions = new Map();
 const eventClients = new Set();
 const delayedTransactionStatusRefreshes = new Map();
 const driverGeocodeCache = new Map();
 const transferDependencyAllocationRefreshAt = new Map();
+const DRIVER_GEOCODE_TIMEOUT_MS = 5_000;
 let transferDependencyAllocationRefreshQueue = Promise.resolve();
 let eventSeq = 0;
 
@@ -469,6 +563,24 @@ function sendDispatchDuplicateDriverResponse(res, duplicates = []) {
   });
 }
 
+function dispatchDriverActivityLockedLoadIds(statuses = []) {
+  return new Set((statuses || [])
+    .filter((status) => ["in_progress", "complete"].includes(String(status.status || "")))
+    .map((status) => String(status.load_id || status.loadId || ""))
+    .filter(Boolean));
+}
+
+async function overlayDispatchLockedLoadSchedule(previousPlan = {}, nextPlan = {}) {
+  if (!config.dispatch?.driverOrientedPlanning || !previousPlan?.id) return nextPlan;
+  const statuses = await listDriverJobStatuses({ planId: previousPlan.id });
+  return overlayLockedLoadDerivedSchedule(
+    previousPlan,
+    nextPlan,
+    dispatchDriverActivityLockedLoadIds(statuses),
+    { activityStatuses: statuses }
+  );
+}
+
 async function dispatchLoadAssignmentConflicts(previousPlan = {}, nextPlan = {}, { requireAssignments = false } = {}) {
   if (!config.dispatch?.driverOrientedPlanning) return [];
   const setup = await readDispatchSetup({ includeInactive: true });
@@ -493,7 +605,9 @@ async function dispatchLoadAssignmentConflicts(previousPlan = {}, nextPlan = {},
   const conflicts = validateDispatchLoadAssignments(normalized, {
     switchMinutes: setup.planning?.truckSwitchMinutes ?? 10,
     ownYards: (setup.ownYards || []).map((yard) => String(yard.code || yard.name || "")).filter(Boolean),
-    requireAssignments
+    requireAssignments,
+    previousPlan,
+    activityStatuses: statuses
   });
   conflicts.push(...dispatchFleetAssignmentStatusConflicts(normalized, {
     drivers: setup.drivers,
@@ -502,15 +616,19 @@ async function dispatchLoadAssignmentConflicts(previousPlan = {}, nextPlan = {},
     allowedInactiveLoadIds
   }));
   if (!previousPlan?.id) return conflicts;
-  const lockedLoadIds = new Set(statuses
-    .filter((status) => ["in_progress", "complete"].includes(String(status.status || "")))
-    .map((status) => String(status.load_id || status.loadId || ""))
-    .filter(Boolean));
-  for (const change of changedLockedLoadAssignments(previousPlan, normalized, lockedLoadIds)) {
+  for (const change of changedDriverActivityAssignments(previousPlan, normalized, statuses)) {
+    const changedScope = change.reasons?.includes("assignment") || change.reasons?.includes("load")
+      ? "its assigned driver or truck"
+      : change.reasons?.includes("full_load")
+        ? "its recorded route"
+        : "a started stop or its related order allocation";
     conflicts.push({
       code: "DISPATCH_ACTIVE_LOAD_LOCKED",
-      message: `${change.previous?.load?.name || change.loadId} has driver activity and cannot change driver, truck, stops, or orders.`,
-      loadId: change.loadId
+      message: `${change.previous?.load?.name || change.loadId} has driver activity and cannot change ${changedScope}.`,
+      loadId: change.loadId,
+      reasons: change.reasons || [],
+      stopIds: change.stopIds || [],
+      orderRefs: change.orderRefs || []
     });
   }
   return conflicts;
@@ -1794,10 +1912,64 @@ async function retrySmartScmTransferPrint(proposalId, operator) {
   return { proposalId: proposal.id, transferOrderId: proposal.netsuiteTransferOrderId, transferOrderRef, printJob };
 }
 
-async function findDispatchPlanDateConflicts({ planId, planDate, orders = [], trucks = [] } = {}) {
+async function findDispatchPlanDateConflicts({
+  planId,
+  planDate,
+  orders = [],
+  trucks = [],
+  candidateRefs = []
+} = {}) {
   const currentRefs = dispatchPlannedOrderRefs({ orders, trucks });
   if (!currentRefs.size) return [];
-  const result = await query(
+  const searchRefs = [...new Set((candidateRefs || []).map((ref) => String(ref || "").trim()).filter(Boolean))];
+  const result = searchRefs.length ? await query(
+    `SELECT p.id, p.plan_date::text AS plan_date, p.status, s.orders, s.trucks
+       FROM dispatch_plans p
+       JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+       CROSS JOIN LATERAL (
+         SELECT COALESCE(array_agg(assigned_order.value ->> 'id')
+                  FILTER (WHERE COALESCE(assigned_order.value ->> 'id', '') <> ''), ARRAY[]::text[]) AS order_ids
+           FROM jsonb_array_elements(COALESCE(s.orders, '[]'::jsonb)) assigned_order(value)
+          WHERE assigned_order.value ->> 'id' = ANY($3::text[])
+             OR assigned_order.value ->> 'originalOrderId' = ANY($3::text[])
+             OR (
+               upper(COALESCE(assigned_order.value ->> 'type', '')) <> 'CUSTOM'
+               AND assigned_order.value ->> 'id' ~* '-S[0-9]+$'
+               AND regexp_replace(assigned_order.value ->> 'id', '-S[0-9]+$', '', 'i') = ANY($3::text[])
+             )
+             OR COALESCE(assigned_order.value -> 'childOrders', '[]'::jsonb) ?| $3::text[]
+             OR EXISTS (
+               SELECT 1
+                 FROM unnest($3::text[]) candidate(ref)
+                WHERE jsonb_path_exists(
+                        COALESCE(assigned_order.value -> 'childOrderDetails', '[]'::jsonb),
+                        '$.**.id ? (@ == $ref)',
+                        jsonb_build_object('ref', candidate.ref)
+                      )
+                   OR jsonb_path_exists(
+                        COALESCE(assigned_order.value -> 'childOrderDetails', '[]'::jsonb),
+                        '$.**.originalOrderId ? (@ == $ref)',
+                        jsonb_build_object('ref', candidate.ref)
+                      )
+             )
+       ) related_orders
+      WHERE p.id <> $1
+        AND p.status <> 'cancelled'
+        AND p.plan_date <> $2::date
+        AND EXISTS (
+          SELECT 1
+            FROM jsonb_array_elements(COALESCE(s.trucks, '[]'::jsonb)) truck(value)
+            CROSS JOIN LATERAL jsonb_array_elements(COALESCE(truck.value -> 'loads', '[]'::jsonb)) load(value)
+            CROSS JOIN LATERAL jsonb_array_elements(COALESCE(load.value -> 'stops', '[]'::jsonb)) stop(value)
+           WHERE lower(COALESCE(load.value ->> 'returnOnly', 'false')) <> 'true'
+             AND stop.value ->> 'type' = 'drop'
+             AND (
+               stop.value ->> 'orderId' = ANY($3::text[])
+               OR stop.value ->> 'orderId' = ANY(related_orders.order_ids)
+             )
+        )`,
+    [planId, planDate, searchRefs]
+  ) : await query(
     `SELECT p.id, p.plan_date::text AS plan_date, p.status, s.orders, s.trucks
        FROM dispatch_plans p
        JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
@@ -1821,29 +1993,32 @@ async function findDispatchPlanDateConflicts({ planId, planDate, orders = [], tr
   return conflicts.sort((a, b) => `${a.planDate}|${a.orderRef}`.localeCompare(`${b.planDate}|${b.orderRef}`));
 }
 
-function dispatchPlanDateConflictKey(conflict = {}) {
-  return [
-    String(conflict.orderRef || ""),
-    String(conflict.planId || ""),
-    String(conflict.planDate || "")
-  ].join("|");
-}
-
 async function findNewDispatchPlanDateConflicts(previousPlan = {}, nextPlan = {}) {
-  const previousConflicts = await findDispatchPlanDateConflicts({
-    planId: previousPlan.id || nextPlan.id,
-    planDate: previousPlan.planDate || nextPlan.planDate,
-    orders: previousPlan.orders || [],
-    trucks: previousPlan.trucks || []
-  });
-  const previousKeys = new Set(previousConflicts.map(dispatchPlanDateConflictKey));
+  const previousRefs = dispatchPlannedOrderRefs(previousPlan);
+  const nextRefs = dispatchPlannedOrderRefs(nextPlan);
+  const newlyPlannedRefs = new Set([...nextRefs].filter((ref) => !previousRefs.has(ref)));
+  if (!newlyPlannedRefs.size) return [];
+  const conflictSearchRefs = new Set(newlyPlannedRefs);
+  for (const order of nextPlan.orders || []) {
+    const orderRef = String(order?.id || "").trim();
+    const explicitParentRef = String(order?.originalOrderId || "").trim();
+    const inferredParentRef = String(order?.type || "").trim().toUpperCase() !== "CUSTOM" && /-S\d+$/i.test(orderRef)
+      ? orderRef.replace(/-S\d+$/i, "")
+      : "";
+    const parentRef = explicitParentRef || inferredParentRef;
+    if (orderRef && parentRef && (newlyPlannedRefs.has(orderRef) || newlyPlannedRefs.has(parentRef))) {
+      conflictSearchRefs.add(orderRef);
+      conflictSearchRefs.add(parentRef);
+    }
+  }
   const nextConflicts = await findDispatchPlanDateConflicts({
     planId: nextPlan.id || previousPlan.id,
     planDate: nextPlan.planDate || previousPlan.planDate,
     orders: nextPlan.orders || [],
-    trucks: nextPlan.trucks || []
+    trucks: nextPlan.trucks || [],
+    candidateRefs: [...conflictSearchRefs]
   });
-  return nextConflicts.filter((conflict) => !previousKeys.has(dispatchPlanDateConflictKey(conflict)));
+  return nextConflicts.filter((conflict) => newlyPlannedRefs.has(String(conflict.orderRef || "")));
 }
 
 function dispatchDateCompare(a, b) {
@@ -1886,29 +2061,62 @@ function dispatchCoFinishMinute(occurrence = {}) {
     ?? dispatchTimingNumber(occurrence.stop?.timing?.depart);
 }
 
-async function dispatchPlansForCoValidation(nextPlan = {}) {
+async function dispatchPlansForCoValidation(nextPlan = {}, requiredCoRefs = []) {
+  const refs = [...new Set((requiredCoRefs || []).map((ref) => String(ref || "").trim()).filter(Boolean))];
+  if (!refs.length) return [nextPlan];
   const result = await query(
-    `SELECT p.id, p.plan_date::text AS plan_date, p.status, s.orders, s.trucks
+    `SELECT DISTINCT ON (p.id, stop.value ->> 'orderId')
+            p.id,
+            p.plan_date::text AS plan_date,
+            stop.value ->> 'orderId' AS co_ref,
+            CASE
+              WHEN COALESCE(load.value -> 'timing' ->> 'finish', '') ~ '^-?[0-9]+([.][0-9]+)?$'
+                THEN (load.value -> 'timing' ->> 'finish')::numeric
+              WHEN COALESCE(stop.value -> 'timing' ->> 'depart', '') ~ '^-?[0-9]+([.][0-9]+)?$'
+                THEN (stop.value -> 'timing' ->> 'depart')::numeric
+              ELSE NULL
+            END AS finish
        FROM dispatch_plans p
        JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+       CROSS JOIN LATERAL jsonb_array_elements(COALESCE(s.trucks, '[]'::jsonb))
+         WITH ORDINALITY AS truck(value, position)
+       CROSS JOIN LATERAL jsonb_array_elements(COALESCE(truck.value -> 'loads', '[]'::jsonb))
+         WITH ORDINALITY AS load(value, position)
+       CROSS JOIN LATERAL jsonb_array_elements(COALESCE(load.value -> 'stops', '[]'::jsonb))
+         WITH ORDINALITY AS stop(value, position)
       WHERE p.status <> 'cancelled'
-        AND p.id <> $1`,
-    [nextPlan.id || 0]
+        AND p.id <> $1
+        AND lower(COALESCE(load.value ->> 'returnOnly', 'false')) <> 'true'
+        AND stop.value ->> 'type' = 'drop'
+        AND stop.value ->> 'orderId' = ANY($2::text[])
+      ORDER BY p.id, stop.value ->> 'orderId', truck.position, load.position, stop.position`,
+    [nextPlan.id || 0, refs]
   );
   return [
     nextPlan,
     ...result.rows.map((row) => ({
       id: String(row.id || ""),
       planDate: row.plan_date,
-      orders: row.orders || [],
-      trucks: row.trucks || []
+      orders: [{ id: String(row.co_ref || ""), type: "CO" }],
+      trucks: [{ loads: [{
+        timing: row.finish === null || row.finish === undefined ? {} : { finish: Number(row.finish) },
+        stops: [{
+          type: "drop",
+          orderId: String(row.co_ref || ""),
+          timing: row.finish === null || row.finish === undefined ? {} : { depart: Number(row.finish) }
+        }]
+      }] }]
     }))
   ];
 }
 
 async function findDispatchCoSequenceConflicts(nextPlan = {}) {
   const sourcePlanDate = String(nextPlan.planDate || "").slice(0, 10);
-  const candidatePlans = await dispatchPlansForCoValidation(nextPlan);
+  const requiredCoRefs = [...new Set((nextPlan.orders || [])
+    .map((order) => String(order?.transitCo?.id || "").trim())
+    .filter(Boolean))];
+  if (!requiredCoRefs.length) return [];
+  const candidatePlans = await dispatchPlansForCoValidation(nextPlan, requiredCoRefs);
   const coOccurrences = new Map();
   for (const plan of candidatePlans) {
     const planDate = String(plan.planDate || "").slice(0, 10);
@@ -1970,6 +2178,11 @@ async function findDispatchCoSequenceConflicts(nextPlan = {}) {
     }
   }
   return conflicts;
+}
+
+async function findChangedDispatchCoSequenceConflicts(_previousPlan = {}, nextPlan = {}) {
+  if (!(nextPlan.orders || []).some((order) => String(order?.transitCo?.id || "").trim())) return [];
+  return findDispatchCoSequenceConflicts(nextPlan);
 }
 
 function sendDispatchPlanDateConflictResponse(res, conflicts = []) {
@@ -2267,7 +2480,17 @@ function monitorOrderExecutionStatus(plan = {}, orderRef = "", driverJobStatuses
   return "pending";
 }
 
-export function monitorPlannedOrders(plan, driverJobStatuses = []) {
+function monitorForecastForStop(forecast = null, load = {}, stop = {}) {
+  if (!forecast || !Array.isArray(forecast.stops)) return null;
+  const loadId = String(load.id || "");
+  const stopId = String(stop.id || "");
+  return forecast.stops.find((item) =>
+    String(item.loadId || "") === loadId
+    && (item.visitStopIds || [item.stopId]).map(String).includes(stopId)
+  ) || null;
+}
+
+export function monitorPlannedOrders(plan, driverJobStatuses = [], forecast = null) {
   if (!plan) return [];
   const rows = [];
   for (const truck of plan.trucks || []) {
@@ -2288,6 +2511,7 @@ export function monitorPlannedOrders(plan, driverJobStatuses = []) {
           ...fallbackPickups
         ].map((value) => String(value || "").trim()).filter(Boolean))];
         const record = monitorStopRecord(driverJobStatuses, assignment, load, stop);
+        const stopForecast = monitorForecastForStop(forecast, load, stop);
         rows.push({
           key: `${assignment.truckId || assignment.truckPlate || truck.id || truck.plate || "truck"}:${load.id || "load"}:${stop.id || stopIndex}`,
           orderRef: String(stop.orderId || ""),
@@ -2314,6 +2538,8 @@ export function monitorPlannedOrders(plan, driverJobStatuses = []) {
             ?? dispatchTimingNumber(load.timing?.finish),
           actualStart: record?.started_at || record?.startedAt || "",
           actualEnd: record?.completed_at || record?.completedAt || "",
+          forecastStart: stopForecast?.forecastArrival || null,
+          forecastEnd: stopForecast?.forecastLeave || null,
           status: monitorOrderExecutionStatus(plan, stop.orderId, driverJobStatuses),
           items: monitorPlannedItemLines(order, stop)
         });
@@ -2563,6 +2789,16 @@ function localDateDaysAgo(days = 0) {
 }
 
 function validCoordinate(latitude, longitude) {
+  if (
+    latitude === null
+    || latitude === undefined
+    || longitude === null
+    || longitude === undefined
+    || String(latitude).trim() === ""
+    || String(longitude).trim() === ""
+  ) {
+    return false;
+  }
   return Number.isFinite(Number(latitude)) && Number.isFinite(Number(longitude));
 }
 
@@ -2576,8 +2812,34 @@ async function geocodeStopAddress(address) {
   url.searchParams.set("region", "ca");
   url.searchParams.set("components", "country:CA");
   url.searchParams.set("key", config.googleMapsApiKey);
-  const response = await fetch(url);
-  const payload = await response.json().catch(() => ({}));
+  const timeoutController = new AbortController();
+  const timeoutId = setTimeout(() => timeoutController.abort(), DRIVER_GEOCODE_TIMEOUT_MS);
+  timeoutId.unref?.();
+  let payload = {};
+  try {
+    const response = await fetch(url, { signal: timeoutController.signal });
+    const responseText = await response.text();
+    if (responseText) {
+      try {
+        payload = JSON.parse(responseText);
+      } catch {
+        payload = {};
+      }
+    }
+  } catch (error) {
+    if (timeoutController.signal.aborted) {
+      const timeoutError = new Error(
+        `Google geocoding timed out after ${Math.round(DRIVER_GEOCODE_TIMEOUT_MS / 1000)} seconds.`
+      );
+      timeoutError.code = "DRIVER_GEOCODE_TIMEOUT";
+      timeoutError.timeoutMs = DRIVER_GEOCODE_TIMEOUT_MS;
+      timeoutError.cause = error;
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
   const location = payload.results?.[0]?.geometry?.location;
   const point = validCoordinate(location?.lat, location?.lng)
     ? { latitude: Number(location.lat), longitude: Number(location.lng), source: "google_geocode" }
@@ -2631,7 +2893,34 @@ async function samsaraLocationForDriverJob(job) {
 }
 
 async function checkDriverJobLocation(job) {
-  const truckLocation = await samsaraLocationForDriverJob(job);
+  const expectedAddress = job?.stopType === "travel"
+    ? job?.toAddress || job?.address || ""
+    : job?.address || job?.toAddress || job?.location || "";
+  const [truckLookup, expectedLookup] = await Promise.allSettled([
+    samsaraLocationForDriverJob(job),
+    expectedPointForDriverJob(job)
+  ]);
+  const truckLocation = truckLookup.status === "fulfilled" ? truckLookup.value : null;
+  const expected = expectedLookup.status === "fulfilled"
+    ? expectedLookup.value
+    : { address: expectedAddress, source: "unavailable" };
+  const lookupErrors = [
+    truckLookup.status === "rejected"
+      ? `Samsara GPS: ${String(truckLookup.reason?.message || truckLookup.reason || "lookup failed")}`
+      : "",
+    expectedLookup.status === "rejected"
+      ? `Expected stop: ${String(expectedLookup.reason?.message || expectedLookup.reason || "lookup failed")}`
+      : ""
+  ].filter(Boolean);
+  if (lookupErrors.length) {
+    return {
+      status: "unavailable",
+      message: "Location verification service was unavailable. Recheck or confirm override.",
+      truckPlate: job?.truckPlate || "",
+      expectedAddress: expected?.address || expectedAddress,
+      verificationError: lookupErrors.join(" ")
+    };
+  }
   const latitude = Number(truckLocation?.latitude);
   const longitude = Number(truckLocation?.longitude);
   if (!validCoordinate(latitude, longitude)) {
@@ -2641,7 +2930,6 @@ async function checkDriverJobLocation(job) {
       truckPlate: job?.truckPlate || ""
     };
   }
-  const expected = await expectedPointForDriverJob(job);
   if (!validCoordinate(expected.latitude, expected.longitude)) {
     return {
       status: "unavailable",
@@ -2674,21 +2962,440 @@ async function checkDriverJobLocation(job) {
   };
 }
 
-function emitAppEvent(type, payload = {}) {
-  const event = {
-    id: ++eventSeq,
-    type,
-    at: new Date().toISOString(),
-    payload
-  };
-  const body = `id: ${event.id}\nevent: app-event\ndata: ${JSON.stringify(event)}\n\n`;
-  for (const client of eventClients) {
-    try {
-      client.res.write(body);
-    } catch {
-      eventClients.delete(client);
+async function completeDriverJobOperationalEffects({
+  driverLogin,
+  job,
+  photoDataUrls = [],
+  occurredAt = null,
+  offlineTrace = null,
+  driverRemark = undefined
+} = {}) {
+  if (!job?.jobId) throw new Error("Driver job is no longer available.");
+  return withTransaction(async () => {
+    const record = await recordDriverJobPhotos(driverLogin, job.jobId, {
+      photoDataUrls,
+      job,
+      occurredAt,
+      offlineTrace,
+      driverRemark
+    });
+    let dependencyUpdate = null;
+    let completedCustomOrders = [];
+    if (job.stopType === "pickup") {
+      const transferRefs = (job.dependencyPickupManifests || [])
+        .map((entry) => entry.transferOrderRef)
+        .filter(Boolean);
+      dependencyUpdate = await markDirectDependencyPickupCompleted({
+        transferOrderRefs: transferRefs,
+        driverJobId: job.jobId
+      });
+    } else if (job.stopType === "dropoff") {
+      const yardReplenishment = await completeYardDependenciesForTransferDrop({
+        transferOrderRefs: job.orderRefs || [],
+        driverJobId: job.jobId,
+        driverLogin,
+        planId: job.planId,
+        planDate: job.planDate,
+        truckPlate: job.truckPlate,
+        loadId: job.loadId,
+        loadName: job.loadName,
+        destinationLocationId: job.destinationLocationId,
+        expectedSourceOfflineEventId: offlineTrace?.eventId || ""
+      });
+      if (yardReplenishment.skipped.length) {
+        const conflicts = yardReplenishment.skipped.map((item) => ({
+          transferOrderRef: item.transferOrderRef || "",
+          reason: item.reason || "yard_dependency_delivery_not_applied"
+        }));
+        throw Object.assign(
+          new Error(
+            `The Transfer Order drop evidence needs dependency review: ${
+              conflicts.map((item) =>
+                `${item.transferOrderRef || "Transfer Order"} (${item.reason})`
+              ).join(", ")
+            }`
+          ),
+          {
+            status: 409,
+            code: "YARD_DEPENDENCY_DELIVERY_REVIEW_REQUIRED",
+            conflicts
+          }
+        );
+      }
+      const directToCustomer = await completeDirectDependenciesForSalesOrderDrop({
+        salesOrderRefs: job.orderRefs || [],
+        driverJobId: job.jobId,
+        planId: job.planId,
+        planDate: job.planDate,
+        truckPlate: job.truckPlate,
+        loadId: job.loadId,
+        loadName: job.loadName
+      });
+      dependencyUpdate = {
+        completed: [
+          ...yardReplenishment.completed,
+          ...directToCustomer.completed
+        ],
+        alreadyCompleted: [
+          ...yardReplenishment.alreadyCompleted,
+          ...directToCustomer.alreadyCompleted
+        ],
+        skipped: yardReplenishment.skipped,
+        yardReplenishment,
+        directToCustomer
+      };
+      completedCustomOrders = await completeDispatchCustomOrders(
+        job.orderRefs || [],
+        `driver:${driverLogin}`
+      );
     }
+    return { record, dependencyUpdate, completedCustomOrders };
+  });
+}
+
+async function applyDriverOfflineEvent({
+  event,
+  job,
+  manifest,
+  rebased,
+  photoReferences,
+  offlineTrace,
+  routeJobs = [],
+  emissionSource = "offline_sync"
+}) {
+  const driverLogin = event.driverLogin;
+  if (event.eventType === "job_started") {
+    if (!job) throw new Error("The job to start is unavailable.");
+    if (job.stopType === "pickup" || job.stopType === "dropoff") {
+      await reconcileCompletedYardTransfersForSalesOrderStart({
+        salesOrderRefs: job.orderRefs || [],
+        currentJob: job,
+        routeJobs,
+        driverLogin,
+        event
+      });
+      const dependencyBlock = await getSalesOrderDependencyExecutionBlock(job.orderRefs || []);
+      if (dependencyBlock) throw Object.assign(new Error(dependencyBlock.message), {
+        code: "OFFLINE_DEPENDENCY_BLOCKED"
+      });
+      if (job.stopType === "pickup") {
+        const directTransferRefs = (job.dependencyPickupManifests || [])
+          .map((entry) => entry.transferOrderRef)
+          .filter(Boolean);
+        const directPickupBlock = await getDirectPickupDependencyExecutionBlock(directTransferRefs);
+        if (directPickupBlock) throw Object.assign(new Error(directPickupBlock.message), {
+          code: "OFFLINE_DIRECT_PICKUP_BLOCKED"
+        });
+      }
+    }
+    const record = await startDriverJob(driverLogin, job.jobId, {
+      job,
+      occurredAt: event.occurredAt,
+      offlineTrace
+    });
+    emitAppEvent("driver.job.started", {
+      driverLogin,
+      eventId: event.eventId,
+      source: emissionSource,
+      jobId: job.jobId,
+      stopType: job.stopType,
+      orderRefs: job.orderRefs || [],
+      offline: true
+    });
+    return {
+      recordId: record?.id || null,
+      samsaraDutyPendingOnline: manifest?.samsaraWorkflowEnabled === true,
+      samsaraDutyReconciled: manifest?.samsaraWorkflowEnabled !== true
+    };
   }
+  if (event.eventType === "job_completed") {
+    if (!job) throw new Error("The job to complete is unavailable.");
+    const completion = await completeDriverJobOperationalEffects({
+      driverLogin,
+      job,
+      photoDataUrls: photoReferences,
+      occurredAt: event.occurredAt,
+      offlineTrace,
+      driverRemark: event.details?.driverRemark
+    });
+    emitAppEvent("driver.job.completed", {
+      driverLogin,
+      eventId: event.eventId,
+      source: emissionSource,
+      jobId: job.jobId,
+      stopType: job.stopType,
+      offline: true,
+      dependencyUpdate: completion.dependencyUpdate
+    });
+    if (
+      completion.dependencyUpdate
+      && (
+        Array.isArray(completion.dependencyUpdate)
+          ? completion.dependencyUpdate.length
+          : completion.dependencyUpdate.completed?.length
+      )
+    ) {
+      emitAppEvent("dispatch.orders.updated", {
+        source: "driver-offline-order-dependency",
+        refreshOrderPool: true
+      });
+    }
+    if (completion.completedCustomOrders.length) {
+      emitAppEvent("dispatch.orders.updated", {
+        source: "driver-offline-custom-order",
+        change: "custom_order_completed",
+        orderIds: completion.completedCustomOrders.map((order) => order.refNumber),
+        refreshOrderPool: true
+      });
+    }
+    return {
+      recordId: completion.record?.id || null,
+      dependencyUpdated: Boolean(completion.dependencyUpdate),
+      completedCustomOrderCount: completion.completedCustomOrders.length
+    };
+  }
+  if (event.eventType === "rest_started") {
+    const nextJobId = event.details?.nextJobId || "";
+    const nextJob = job
+      || (manifest?.jobs || []).find((candidate) =>
+        String(candidate.jobId) === String(nextJobId)
+      )
+      || (manifest?.jobs || []).find((candidate) =>
+        !candidate.completedAt && candidate.stopType !== "truck_switch"
+      );
+    if (!nextJob) throw new Error("The next route job for this rest event is unavailable.");
+    const rest = await startDriverRest(driverLogin, {
+      nextJob,
+      restId: event.details?.restId || event.eventId,
+      occurredAt: event.occurredAt,
+      offlineTrace
+    });
+    emitAppEvent("driver.rest.started", {
+      driverLogin,
+      eventId: event.eventId,
+      source: emissionSource,
+      restId: rest?.restId || event.details?.restId || "",
+      nextJobId: nextJob.jobId,
+      offline: true
+    });
+    return { restId: rest?.restId || event.details?.restId || "" };
+  }
+  if (event.eventType === "rest_ended") {
+    const rest = await endDriverRest(driverLogin, {
+      restId: event.details?.restId || "",
+      occurredAt: event.occurredAt,
+      offlineTrace
+    });
+    if (!rest) throw new Error("The active rest record could not be found.");
+    emitAppEvent("driver.rest.ended", {
+      driverLogin,
+      eventId: event.eventId,
+      source: emissionSource,
+      restId: rest.restId,
+      offline: true
+    });
+    return { restId: rest.restId };
+  }
+  if (event.eventType === "truck_switched_physical") {
+    if (!job) throw new Error("The truck-switch job is unavailable.");
+    const samsaraReconciliationRequired = manifest?.samsaraWorkflowEnabled === true;
+    const result = await recordOfflineDriverTruckSwitch(driverLogin, job, {
+      occurredAt: event.occurredAt,
+      offlineTrace,
+      samsaraReconciliationRequired
+    });
+    await writeDispatchAudit({
+      action: samsaraReconciliationRequired
+        ? "driver_truck_switch_recorded_offline"
+        : "driver_truck_switch_confirmed_samsara_disabled",
+      entityType: "driver_job",
+      entityId: job.jobId,
+      planId: job.planId,
+      planDate: job.planDate,
+      operatorName: driverLogin,
+      source: "driver",
+      details: {
+        driverLogin,
+        fromTruckPlate: job.fromTruckPlate || "",
+        toTruckPlate: job.nextTruckPlate || job.truckPlate || "",
+        switchYard: job.switchYard || "",
+        eventId: event.eventId,
+        samsaraReconciliationRequired
+      }
+    });
+    emitAppEvent(
+      samsaraReconciliationRequired
+        ? "driver.truck.switch.attention"
+        : "driver.truck.switched",
+      {
+        driverLogin,
+        eventId: event.eventId,
+        source: emissionSource,
+        jobId: job.jobId,
+        offline: true,
+        ...(samsaraReconciliationRequired
+          ? { error: "Physical switch recorded offline; Samsara reconciliation is required." }
+          : { truckPlate: job.nextTruckPlate || job.truckPlate || "" })
+      }
+    );
+    return {
+      recordId: result.record?.id || null,
+      samsaraReconciliationRequired
+    };
+  }
+  if (event.eventType === "dvir_captured") {
+    emitAppEvent("driver.dvir.pending_online", {
+      driverLogin,
+      type: event.details?.dvirType || "pre",
+      eventId: event.eventId,
+      source: emissionSource,
+      offline: true
+    });
+    return {
+      pendingOnline: true,
+      interactiveSamsaraSubmissionRequired: true,
+      dvirType: event.details?.dvirType || "pre",
+      photoCount: photoReferences.length,
+      rebased: rebased === true
+    };
+  }
+  throw Object.assign(new Error("Unsupported offline driver event."), {
+    code: "OFFLINE_EVENT_TYPE_INVALID"
+  });
+}
+
+async function driverOfflineReviewWithCurrentPlan(eventId) {
+  const detail = await getDriverOfflineReview(eventId);
+  if (!detail?.case) return null;
+  const reviewCase = detail.case;
+  const currentPlan = await getDriverDayJobs(reviewCase.driverLogin, {
+    date: reviewCase.planDate
+  });
+  const entries = materializeDriverOfflineJobs(
+    currentPlan.jobs || [],
+    reviewCase.driverLogin
+  );
+  const originalJobId = reviewCase.originalJob?.jobId || reviewCase.originalJobId || "";
+  const currentEntry = entries.find((entry) =>
+    String(entry.snapshot.jobId) === String(originalJobId)
+  );
+  const manifestEvent = {
+    driverLogin: reviewCase.driverLogin,
+    jobFingerprint: reviewCase.originalJob?.fingerprint
+      || reviewCase.payload?.jobFingerprint
+      || "",
+    predecessorFingerprint: reviewCase.originalJob?.predecessorFingerprint
+      || reviewCase.payload?.predecessorFingerprint
+      || ""
+  };
+  const candidates = findDriverOfflineRebaseCandidates(
+    manifestEvent,
+    currentPlan.jobs || [],
+    reviewCase.driverLogin
+  ).map(({ job, ...candidate }) => ({
+    ...candidate,
+    snapshot: job
+  }));
+  return {
+    case: {
+      ...reviewCase,
+      currentJob: currentEntry
+        ? {
+            jobId: currentEntry.snapshot.jobId,
+            fingerprint: currentEntry.fingerprint,
+            predecessorFingerprint: currentEntry.predecessorFingerprint,
+            compatible: currentEntry.fingerprint === manifestEvent.jobFingerprint
+              && currentEntry.predecessorFingerprint === manifestEvent.predecessorFingerprint,
+            snapshot: currentEntry.snapshot
+          }
+        : null,
+      candidates,
+      photos: (reviewCase.photos || []).map((photo) => ({
+        ...photo,
+        previewUrl: `/api/dispatch/offline-review/${encodeURIComponent(reviewCase.eventId)}/photos/${encodeURIComponent(photo.photoId)}`
+      }))
+    }
+  };
+}
+
+async function applyDriverOfflineReviewResolution({ event, action, effectiveJobId }) {
+  const detail = await driverOfflineReviewWithCurrentPlan(event.eventId);
+  if (!detail?.case) throw Object.assign(new Error("Offline review case was not found."), { status: 404 });
+  const currentPlan = await getDriverDayJobs(event.driverLogin, {
+    date: event.planDate
+  });
+  let job = null;
+  if (action === "apply_original") {
+    job = detail.case.originalJob?.snapshot || null;
+  } else if (action === "reattach") {
+    const candidate = (detail.case.candidates || []).find((entry) =>
+      entry.compatible && String(entry.jobId) === String(effectiveJobId)
+    );
+    if (!candidate) {
+      throw Object.assign(new Error("The selected current stop is not a validated match."), {
+        status: 409,
+        code: "OFFLINE_REATTACH_TARGET_INVALID"
+      });
+    }
+    job = candidate.snapshot;
+  }
+  const manifest = await getDriverOfflineManifest(event.manifestId, {
+    driverLogin: event.driverLogin,
+    deviceId: event.deviceId,
+    touch: false
+  });
+  const photoReferences = (event.photos || [])
+    .filter((photo) => photo.durableReceipt)
+    .map((photo) => photo.objectReference);
+  const requiredPhotoCount = event.eventType === "dvir_captured"
+    ? 4
+    : event.eventType === "job_completed"
+      ? Math.max(0, Number(job?.requiredPhotos || 0))
+      : 0;
+  if (photoReferences.length < requiredPhotoCount) {
+    throw Object.assign(
+      new Error(`${requiredPhotoCount} durably received photo${requiredPhotoCount === 1 ? " is" : "s are"} required before applying this event.`),
+      { status: 409, code: "OFFLINE_REQUIRED_PHOTOS_MISSING" }
+    );
+  }
+  return applyDriverOfflineEvent({
+    event,
+    job,
+    manifest,
+    rebased: action === "reattach" && event.jobId !== effectiveJobId,
+    photoReferences,
+    routeJobs: currentPlan.jobs || [],
+    emissionSource: "offline_review_resolution",
+    offlineTrace: {
+      eventId: event.eventId,
+      occurredAt: event.occurredAt,
+      receivedAt: event.receivedAt,
+      locationStatus: event.locationStatus,
+      locationDetails: {
+        resolvedByDispatcher: true,
+        resolutionAction: action
+      }
+    }
+  });
+}
+
+function emitAppEvent(type, payload = {}) {
+  afterTransactionCommit(() => {
+    const event = {
+      id: ++eventSeq,
+      type,
+      at: new Date().toISOString(),
+      payload
+    };
+    const body = `id: ${event.id}\nevent: app-event\ndata: ${JSON.stringify(event)}\n\n`;
+    for (const client of eventClients) {
+      try {
+        client.res.write(body);
+      } catch {
+        eventClients.delete(client);
+      }
+    }
+  });
 }
 
 function updateFulfillmentJob(jobId, patch) {
@@ -2732,6 +3439,53 @@ function requiredPhotoDataUrls(values, minimum = 2) {
     throw error;
   }
   return photos;
+}
+
+async function requireRegisteredForegroundDvirEvidence(req, type, photoReferences) {
+  const eventId = String(req.body?.eventId || "").trim().toLowerCase();
+  if (!eventId) return null;
+  const event = await getDriverOfflineEvent(eventId);
+  const deviceId = driverDeviceId(req, { required: true });
+  const expectedType = type === "post" ? "post" : "pre";
+  const compatible = event
+    && event.eventType === "dvir_captured"
+    && String(event.driverLogin).toLowerCase() === String(req.driverLogin).toLowerCase()
+    && String(event.deviceId) === deviceId
+    && String(event.manifestId) === String(req.body?.manifestId || "")
+    && String(event.details?.dvirType === "post" ? "post" : "pre") === expectedType
+    && canonicalDriverForegroundOccurrence(event.occurredAt)
+      === canonicalDriverForegroundOccurrence(req.body?.deviceOccurredAt);
+  if (!compatible || event.status !== "applied") {
+    throw Object.assign(
+      new Error(event?.reviewReason || "The registered inspection event is not ready for an online Samsara action."),
+      { status: 409, code: "DRIVER_FOREGROUND_DVIR_NOT_READY" }
+    );
+  }
+  const durableReferences = (event.photos || [])
+    .filter((photo) => photo.durableReceipt)
+    .map((photo) => String(photo.objectReference || ""));
+  const submittedReferences = photoReferences.map((reference) => String(reference || ""));
+  if (
+    durableReferences.length < 4
+    || durableReferences.length !== submittedReferences.length
+    || new Set(submittedReferences).size !== submittedReferences.length
+    || durableReferences.some((reference, index) => reference !== submittedReferences[index])
+  ) {
+    throw Object.assign(
+      new Error("Inspection photos do not match this event's durably verified evidence."),
+      { status: 409, code: "DRIVER_FOREGROUND_DVIR_EVIDENCE_MISMATCH" }
+    );
+  }
+  if (
+    event.result?.pendingOnline !== true
+    && event.result?.samsaraReconciled !== true
+  ) {
+    throw Object.assign(
+      new Error("The inspection event is not pending an online Samsara action."),
+      { status: 409, code: "DRIVER_FOREGROUND_DVIR_NOT_READY" }
+    );
+  }
+  return event;
 }
 
 function auditOrderId(value) {
@@ -2912,19 +3666,323 @@ function driverToken(req) {
   return req.body?.token || req.query.token || "";
 }
 
+function driverDeviceId(req, { required = false, allowBody = true } = {}) {
+  const value = String(
+    req.get("x-mbbs-driver-device")
+    || (allowBody ? req.body?.deviceId : "")
+    || ""
+  ).trim();
+  if (!value && !required) return "";
+  return normalizeDriverDeviceId(value);
+}
+
+function driverOfflineGrantToken(req) {
+  return String(req.get("x-mbbs-offline-grant") || req.body?.offlineSyncGrant || "").trim();
+}
+
+const DRIVER_FOREGROUND_EVENT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function canonicalDriverForegroundOccurrence(value) {
+  const parsed = value instanceof Date ? value : new Date(value);
+  return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : "";
+}
+
+async function beginDriverForegroundAction(req, actionType, targetId = "") {
+  const eventId = String(req.body?.eventId || "").trim().toLowerCase();
+  if (!eventId) return null;
+  if (!DRIVER_FOREGROUND_EVENT_ID_PATTERN.test(eventId)) {
+    throw Object.assign(new Error("Foreground event ID is invalid."), { status: 400 });
+  }
+  const deviceId = driverDeviceId(req, { required: true });
+  const occurredAtValue = req.body?.deviceOccurredAt ? new Date(req.body.deviceOccurredAt) : null;
+  const occurredAt = occurredAtValue && Number.isFinite(occurredAtValue.getTime())
+    ? occurredAtValue.toISOString()
+    : null;
+  if (!occurredAt) {
+    throw Object.assign(
+      new Error("The device occurrence time is required for a local-first online action."),
+      { status: 400, code: "DRIVER_FOREGROUND_OCCURRENCE_REQUIRED" }
+    );
+  }
+  const manifestId = String(req.body?.manifestId || "").trim();
+  if (!manifestId) {
+    throw Object.assign(
+      new Error("The offline route manifest is required for a local-first online action."),
+      { status: 400, code: "DRIVER_FOREGROUND_MANIFEST_REQUIRED" }
+    );
+  }
+  const manifest = await getDriverOfflineManifest(manifestId, {
+    driverLogin: req.driverLogin,
+    deviceId,
+    touch: false
+  });
+  if (!manifest) {
+    throw Object.assign(new Error("The offline route manifest was not found."), {
+      status: 404,
+      code: "DRIVER_FOREGROUND_MANIFEST_NOT_FOUND"
+    });
+  }
+  const manifestJob = targetId && actionType !== "dvir_captured"
+    ? (manifest.jobs || []).find((job) => String(job.jobId) === String(targetId))
+    : null;
+  if (targetId && actionType !== "dvir_captured" && !manifestJob) {
+    throw Object.assign(new Error("The action target is not part of this offline route."), {
+      status: 409,
+      code: "DRIVER_FOREGROUND_TARGET_MISMATCH"
+    });
+  }
+  if (
+    req.body?.jobFingerprint
+    && String(req.body.jobFingerprint) !== String(manifestJob?.fingerprint || "")
+  ) {
+    throw Object.assign(new Error("The action job fingerprint does not match its route manifest."), {
+      status: 409,
+      code: "DRIVER_FOREGROUND_TARGET_MISMATCH"
+    });
+  }
+  if (
+    req.body?.predecessorFingerprint
+    && String(req.body.predecessorFingerprint) !== String(manifestJob?.predecessorFingerprint || "")
+  ) {
+    throw Object.assign(new Error("The action predecessor does not match its route manifest."), {
+      status: 409,
+      code: "DRIVER_FOREGROUND_TARGET_MISMATCH"
+    });
+  }
+  const capturedTruckPlate = String(
+    req.body?.truckPlate
+    || manifestJob?.truckPlate
+    || manifest?.dayState?.truckPlate
+    || ""
+  ).trim();
+  const eventContext = {
+    manifestId: manifest.manifestId,
+    planId: manifest.planId,
+    planDate: manifest.planDate,
+    planRevision: Number(manifest.planRevision || 0),
+    clientSequence: Number(req.body?.clientSequence || 0),
+    jobFingerprint: manifestJob?.fingerprint || "",
+    predecessorFingerprint: manifestJob?.predecessorFingerprint || "",
+    truckPlate: capturedTruckPlate
+  };
+  return withTransaction(async () => {
+    await query("SELECT pg_advisory_xact_lock(hashtext($1))", [`driver-foreground:${eventId}`]);
+    const existing = await query(
+      `SELECT *
+         FROM driver_foreground_action_receipts
+        WHERE event_id = $1::uuid
+        FOR UPDATE`,
+      [eventId]
+    );
+    if (existing.rowCount) {
+      const row = existing.rows[0];
+      if (
+        String(row.driver_login).toLowerCase() !== String(req.driverLogin).toLowerCase()
+        || String(row.device_id) !== deviceId
+        || String(row.action_type) !== String(actionType)
+        || String(row.target_id || "") !== String(targetId || "")
+        || String(row.event_context?.manifestId || "") !== manifest.manifestId
+        || canonicalDriverForegroundOccurrence(row.device_occurred_at) !== occurredAt
+      ) {
+        throw Object.assign(
+          new Error("This foreground event ID was already used for a different action."),
+          { status: 409, code: "DRIVER_FOREGROUND_IDEMPOTENCY_CONFLICT" }
+        );
+      }
+      if (row.status === "applied") {
+        return {
+          eventId,
+          deviceId,
+          driverLogin: req.driverLogin,
+          eventContext: row.event_context || eventContext,
+          replay: true,
+          result: row.result || {}
+        };
+      }
+      throw Object.assign(
+        new Error(row.status === "executing"
+          ? "The previous online action has an uncertain outcome and requires review."
+          : row.error_message || "The previous online action failed."),
+        {
+          status: 409,
+          code: row.status === "executing"
+            ? "DRIVER_FOREGROUND_OUTCOME_UNCERTAIN"
+            : row.error_code || "DRIVER_FOREGROUND_ACTION_FAILED"
+        }
+      );
+    }
+    const manifestExpiry = new Date(manifest.expiresAt).getTime();
+    if (
+      !Number.isFinite(manifestExpiry)
+      || Date.now() >= manifestExpiry
+      || new Date(occurredAt).getTime() > manifestExpiry
+    ) {
+      throw Object.assign(
+        new Error("This offline route has expired. Reconnect and download the current route before recording another action."),
+        { status: 409, code: "DRIVER_FOREGROUND_MANIFEST_EXPIRED" }
+      );
+    }
+    await query(
+      `INSERT INTO driver_foreground_action_receipts (
+         event_id, driver_login, device_id, action_type, target_id,
+         event_context, device_occurred_at, status
+       ) VALUES ($1::uuid, $2, $3, $4, $5, $6::jsonb, $7::timestamptz, 'executing')`,
+      [
+        eventId,
+        req.driverLogin,
+        deviceId,
+        actionType,
+        String(targetId || ""),
+        JSON.stringify(eventContext),
+        occurredAt
+      ]
+    );
+    return {
+      eventId,
+      deviceId,
+      driverLogin: req.driverLogin,
+      eventContext,
+      replay: false
+    };
+  });
+}
+
+async function runDriverForegroundAction(receipt, callback) {
+  if (!receipt) return callback();
+  if (receipt.replay) return receipt.result;
+  try {
+    return await withTransaction(async () => {
+      await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
+      await query(
+        "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
+        [String(receipt.driverLogin).toLowerCase(), String(receipt.eventContext.planDate).slice(0, 10)]
+      );
+      const planResult = await query(
+        `SELECT status, revision, plan_date::text AS plan_date
+           FROM dispatch_plans
+          WHERE id = $1
+          LIMIT 1`,
+        [receipt.eventContext.planId]
+      );
+      const plan = planResult.rows[0];
+      if (
+        !plan
+        || plan.status !== "confirmed"
+        || String(plan.plan_date) !== String(receipt.eventContext.planDate)
+        || Number(plan.revision || 0) !== Number(receipt.eventContext.planRevision || 0)
+      ) {
+        throw Object.assign(
+          new Error("The dispatch plan changed before the online action could be applied."),
+          { status: 409, code: "DRIVER_FOREGROUND_PLAN_CHANGED" }
+        );
+      }
+      const result = await callback();
+      const updated = await query(
+        `UPDATE driver_foreground_action_receipts
+            SET status = 'applied',
+                result = $2::jsonb,
+                completed_at = now(),
+                updated_at = now()
+          WHERE event_id = $1::uuid
+            AND status = 'executing'
+          RETURNING event_id`,
+        [receipt.eventId, JSON.stringify(result || {})]
+      );
+      if (!updated.rowCount) {
+        throw Object.assign(new Error("Foreground action receipt changed while applying."), {
+          status: 409,
+          code: "DRIVER_FOREGROUND_STATE_CONFLICT"
+        });
+      }
+      return result;
+    });
+  } catch (error) {
+    await query(
+      `UPDATE driver_foreground_action_receipts
+          SET status = 'failed',
+              error_code = $2,
+              error_message = $3,
+              completed_at = now(),
+              updated_at = now()
+        WHERE event_id = $1::uuid
+          AND status = 'executing'`,
+      [
+        receipt.eventId,
+        String(error?.code || "DRIVER_FOREGROUND_ACTION_FAILED").slice(0, 160),
+        String(error?.message || error || "Foreground action failed.").slice(0, 2000)
+      ]
+    ).catch(() => null);
+    throw Object.assign(
+      new Error("The online action did not finish cleanly. Its saved event must synchronize for review before it is retried."),
+      {
+        status: 409,
+        code: "DRIVER_FOREGROUND_OUTCOME_UNCERTAIN",
+        cause: error
+      }
+    );
+  }
+}
+
 async function requireDriver(req, res, next) {
   try {
     const token = driverToken(req);
-    const session = driverSessions.get(token);
+    const session = await getDriverSession(token);
     if (!session) return res.status(401).json({ error: "Driver login required" });
-    const driver = await getDispatchDriverByLogin(session.login);
+    const driver = await getDispatchDriverByLogin(session.driverLogin);
     if (!driver) {
-      driverSessions.delete(token);
+      await revokeDriverSession(token);
       return res.status(401).json({ error: "Driver login required" });
     }
     req.driver = driver;
-    req.driverLogin = session.login;
+    req.driverLogin = session.driverLogin;
+    req.driverSession = session;
     next();
+  } catch (error) {
+    next(error);
+  }
+}
+
+async function requireDriverOrOfflineGrant(req, res, next) {
+  try {
+    const token = driverToken(req);
+    const session = token ? await getDriverSession(token) : null;
+    if (session) {
+      const driver = await getDispatchDriverByLogin(session.driverLogin);
+      if (driver) {
+        req.driver = driver;
+        req.driverLogin = session.driverLogin;
+        req.driverSession = session;
+        return next();
+      }
+      await revokeDriverSession(token);
+    }
+    const manifestId = req.body?.manifestId || req.query?.manifestId || "";
+    const deviceId = driverDeviceId(req, { required: true });
+    const authorization = await authorizeDriverOfflineSync({
+      manifestId,
+      deviceId,
+      offlineGrant: driverOfflineGrantToken(req)
+    });
+    if (!authorization) {
+      return res.status(401).json({
+        code: "DRIVER_OFFLINE_AUTH_REQUIRED",
+        error: "Driver login or a valid offline-sync grant is required."
+      });
+    }
+    req.driverLogin = authorization.driverLogin;
+    req.driverOfflineAuthorization = authorization;
+    req.driver = await getDispatchDriverByLogin(authorization.driverLogin);
+    if (!req.driver) {
+      await revokeDriverOfflineGrants({
+        driverLogin: authorization.driverLogin,
+        deviceId
+      }).catch(() => null);
+      return res.status(401).json({
+        code: "DRIVER_OFFLINE_AUTH_REQUIRED",
+        error: "This driver account is no longer active. Sign in again before synchronizing."
+      });
+    }
+    return next();
   } catch (error) {
     next(error);
   }
@@ -2943,11 +4001,11 @@ async function photoPreviewViewer(req) {
       source: operatorHasAnyRole(operator, ["dispatcher", "admin"]) ? "dispatch" : "operator"
     };
   }
-  const session = driverSessions.get(token);
+  const session = await getDriverSession(token);
   if (session) {
     return {
-      id: session.login,
-      login: session.login,
+      id: session.driverLogin,
+      login: session.driverLogin,
       role: "driver",
       source: "driver"
     };
@@ -3032,6 +4090,76 @@ async function assertReturnPhotoPreviewAccess(viewer, value) {
       row.source === "record" && allowed.has(Number(row.sales_location_id)))) return;
   }
   throw Object.assign(new Error("This return photo is outside your assigned records or yards."), { status: 403 });
+}
+
+async function verifyDriverOfflinePhotoObject(photo, actor) {
+  if (!photo?.objectReference) throw new Error("Uploaded photo reference is missing.");
+  const ticket = createPhotoReadToken({
+    actor: actor || { id: "driver-offline-sync", role: "system" },
+    key: photo.objectReference
+  });
+  const response = await fetch(ticket.objectUrl, {
+    headers: { Authorization: `Bearer ${ticket.token}` }
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw Object.assign(new Error(text || "Uploaded photo could not be read back from durable storage."), {
+      status: 409,
+      code: "OFFLINE_PHOTO_READBACK_FAILED"
+    });
+  }
+  const declaredLength = Number(response.headers.get("content-length") || 0);
+  if (declaredLength > 2 * 1024 * 1024) {
+    throw Object.assign(new Error("Uploaded offline photo exceeds 2 MB."), {
+      status: 409,
+      code: "OFFLINE_PHOTO_TOO_LARGE"
+    });
+  }
+  const bytes = Buffer.from(await response.arrayBuffer());
+  if (bytes.length > 2 * 1024 * 1024) {
+    throw Object.assign(new Error("Uploaded offline photo exceeds 2 MB."), {
+      status: 409,
+      code: "OFFLINE_PHOTO_TOO_LARGE"
+    });
+  }
+  const registeredBytes = Number(photo.byteSize);
+  if (bytes.length !== registeredBytes) {
+    throw Object.assign(
+      new Error(`Uploaded photo contains ${bytes.length} byte${bytes.length === 1 ? "" : "s"}; the registered evidence requires ${registeredBytes} bytes.`),
+      { status: 409, code: "OFFLINE_PHOTO_SIZE_MISMATCH" }
+    );
+  }
+  const sha256 = crypto.createHash("sha256").update(bytes).digest("hex");
+  if (sha256 !== photo.sha256) {
+    throw Object.assign(new Error("Uploaded photo bytes do not match the locally registered evidence."), {
+      status: 409,
+      code: "OFFLINE_PHOTO_HASH_MISMATCH"
+    });
+  }
+  if (!isJpegEvidenceBytes(bytes)) {
+    throw Object.assign(new Error("Uploaded offline evidence is not a valid JPEG image."), {
+      status: 409,
+      code: "OFFLINE_PHOTO_JPEG_INVALID"
+    });
+  }
+  const contentType = String(response.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+  if (contentType && !["image/jpeg", "image/jpg", "application/octet-stream"].includes(contentType)) {
+    throw Object.assign(new Error("Uploaded offline evidence is not a JPEG image."), {
+      status: 409,
+      code: "OFFLINE_PHOTO_TYPE_MISMATCH"
+    });
+  }
+  return {
+    verifiedByteSize: bytes.length,
+    verifiedSha256: sha256,
+    receipt: {
+      provider: "r2_worker",
+      objectReference: photo.objectReference,
+      contentType: contentType || "image/jpeg",
+      etag: response.headers.get("etag") || "",
+      verifiedAt: new Date().toISOString()
+    }
+  };
 }
 
 async function requireOperator(req, res, next) {
@@ -3782,11 +4910,12 @@ async function dispatchFleetDisableConflicts({ driver = null, truck = null } = {
   });
 }
 
-function revokeDispatchDriverSessions(login) {
-  const normalizedLogin = String(login || "").trim().toLowerCase();
-  for (const [token, session] of driverSessions.entries()) {
-    if (String(session?.login || "").trim().toLowerCase() === normalizedLogin) driverSessions.delete(token);
-  }
+async function revokeDispatchDriverSessions(login) {
+  const [sessionCount, grantCount] = await Promise.all([
+    revokeDriverSessionsForLogin(login),
+    revokeDriverOfflineGrants({ driverLogin: login })
+  ]);
+  return { sessionCount, grantCount };
 }
 
 async function withDispatchFleetPlanningLock(callback) {
@@ -5623,7 +6752,18 @@ app.post("/api/webhooks/netsuite/order", async (req, res, next) => {
     if (providedBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(providedBuffer, expectedBuffer)) {
       return res.status(401).json({ error: "Invalid webhook secret." });
     }
-    res.json(await withTransaction(() => processNetSuiteOrderWebhook(req.body)));
+    const result = await withTransaction(async () => {
+      const order = await processNetSuiteOrderWebhook(req.body);
+      const poHistory = await processScmNetSuitePoHistoryWebhook(req.body);
+      if (poHistory.event) {
+        afterTransactionCommit(() => emitAppEvent(poHistory.event.name, poHistory.event.data));
+      }
+      return {
+        ...order,
+        appCreatedPoHistoryMatched: poHistory.matched === true
+      };
+    });
+    res.json(result);
   } catch (error) {
     await writeAudit({
       actorType: "system",
@@ -5673,12 +6813,12 @@ app.get("/api/events", (req, res) => {
 });
 
 app.use((req, res, next) => {
-  if (req.path === "/service-worker.js") {
+  if (["/service-worker.js", "/driver-service-worker.js"].includes(req.path)) {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
     res.setHeader("Service-Worker-Allowed", "/");
   } else if (["/scm/netsuite-po", "/scm-netsuite-po.html", "/scm/vendors", "/scm-vendors.html"].includes(req.path)) {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-  } else if (req.path.endsWith(".webmanifest") || ["/", "/operator", "/driver", "/control", "/control/returns", "/admin", "/admin/accounts", "/admin/sync", "/admin/reconciliation", "/admin/printers", "/admin/photo-storage", "/admin/audit", "/admin/return-automation", "/dispatch", "/dispatch/custom-orders", "/sales", "/sales/planning", "/sales/schedule", "/sales/monitor", "/sales/printing", "/sales/in-outbound-record", "/sales/returns", "/dispatch/loaded-export", "/dispatch/in-outbound-record", "/control/in-outbound-record", "/dispatch/po-to-schedule", "/scm/smart", "/scm/printers", "/scm/route-rules", "/scm/schedule-formatting", "/operator.html", "/driver.html", "/control.html", "/admin.html", "/dispatch-menu.html", "/dispatch-custom-orders.html", "/sales.html", "/sales-printing.html", "/dispatch-loaded-export.html", "/scm-smart.html", "/scm-printers.html", "/scm-route-rules.html", "/scm-schedule-formatting.html"].includes(req.path)) {
+  } else if (req.path.endsWith(".webmanifest") || ["/", "/operator", "/driver", "/control", "/control/returns", "/admin", "/admin/accounts", "/admin/sync", "/admin/reconciliation", "/admin/printers", "/admin/photo-storage", "/admin/audit", "/admin/return-automation", "/dispatch", "/dispatch/custom-orders", "/dispatch/driver-pwa", "/dispatch/offline-review", "/sales", "/sales/planning", "/sales/schedule", "/sales/monitor", "/sales/printing", "/sales/in-outbound-record", "/sales/returns", "/dispatch/loaded-export", "/dispatch/in-outbound-record", "/control/in-outbound-record", "/dispatch/po-to-schedule", "/scm/smart", "/scm/printers", "/scm/route-rules", "/scm/schedule-formatting", "/operator.html", "/driver.html", "/control.html", "/admin.html", "/dispatch-menu.html", "/dispatch-custom-orders.html", "/dispatch-offline-review.html", "/sales.html", "/sales-printing.html", "/dispatch-loaded-export.html", "/scm-smart.html", "/scm-printers.html", "/scm-route-rules.html", "/scm-schedule-formatting.html"].includes(req.path)) {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   }
   next();
@@ -5881,6 +7021,123 @@ app.patch("/api/scm/smart/items/:itemId", requireSmartScmWriteAccess, async (req
     const result = await listSmartScmItems({ search: String(req.params.itemId), limit: 10 });
     emitAppEvent("scm.smart.updated", { source: "item-master", itemId: Number(req.params.itemId) });
     res.json(result.items.find((item) => Number(item.itemId) === Number(req.params.itemId)) || null);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/smart/planning-exclusions", async (req, res, next) => {
+  try {
+    res.json(await listSmartScmPlanningPauses({
+      includeInactive: req.query.includeInactive === "true",
+      search: req.query.search,
+      limit: req.query.limit,
+      offset: req.query.offset
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/smart/planning-exclusions", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const exclusion = await addSmartScmPlanningExclusion(req.body || {}, operatorId(req));
+    emitAppEvent("scm.smart.updated", { source: "planning-exclusion", exclusionId: exclusion.id, itemId: exclusion.itemId });
+    res.status(201).json(exclusion);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete("/api/scm/smart/planning-exclusions/:id", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const exclusion = await deactivateSmartScmPlanningExclusion(req.params.id, req.body || {}, operatorId(req));
+    emitAppEvent("scm.smart.updated", { source: "planning-exclusion", exclusionId: exclusion.id, itemId: exclusion.itemId });
+    res.json(exclusion);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/smart/blanket-orders", async (req, res, next) => {
+  try {
+    res.json(await listSmartScmBlanketWorkspace({
+      search: req.query.search,
+      limit: req.query.limit,
+      offset: req.query.offset
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/smart/blanket-plans", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    await refreshSmartScmLiveData({
+      fullCatalog: false,
+      includeSales: false,
+      operatorId: operatorId(req),
+      triggerSource: "blanket-planning"
+    });
+    await runSmartScmForecast({ triggerSource: "blanket-planning", operatorId: operatorId(req) });
+    const run = await buildSmartScmBlanketPlan(operatorId(req));
+    emitAppEvent("scm.smart.updated", {
+      source: "blanket-planning",
+      planningRunId: run.id,
+      planKind: "blanket"
+    });
+    res.status(201).json(run);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/smart/blanket-proposals/:id/confirm", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const result = await confirmSmartScmBlanketProposal(req.params.id, operatorId(req), {
+      idempotencyKey: req.body?.idempotencyKey || req.get("idempotency-key") || ""
+    });
+    const workflow = await getSmartScmVendorWorkflowForProposal(result.proposal.id);
+    emitAppEvent("scm.smart.updated", {
+      source: "blanket-reserved",
+      proposalId: result.proposal.id,
+      releaseId: result.release.id,
+      workflowId: workflow.workflowId
+    });
+    res.status(201).json({ ...result, workflow });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.patch("/api/scm/smart/blanket-proposals/:id/lines/:lineId", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const proposal = await updateSmartScmBlanketProposalLine(
+      req.params.id,
+      req.params.lineId,
+      req.body || {},
+      operatorId(req)
+    );
+    emitAppEvent("scm.smart.updated", {
+      source: "blanket-proposal-line",
+      proposalId: proposal.id,
+      lineId: Number(req.params.lineId)
+    });
+    res.json(proposal);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete("/api/scm/smart/blanket-releases/:id", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const result = await cancelSmartScmBlanketReservation(req.params.id, req.body || {}, operatorId(req));
+    emitAppEvent("scm.smart.updated", {
+      source: "blanket-reservation-cancelled",
+      proposalId: result.proposal.id,
+      releaseId: result.release.id
+    });
+    res.json(result);
   } catch (error) {
     next(error);
   }
@@ -6122,6 +7379,9 @@ app.patch("/api/scm/smart/proposals/:id/pallets/:destinationLocationId", require
 app.patch("/api/scm/smart/proposals/:id", requireSmartScmWriteAccess, async (req, res, next) => {
   try {
     const proposal = await updateSmartScmProposal(req.params.id, req.body || {}, operatorId(req));
+    if (proposal.proposalType === "PO" && proposal.status === "order_requested") {
+      await ensureSmartScmVendorWorkflow(proposal.id, operatorId(req));
+    }
     emitAppEvent("scm.smart.updated", { source: "proposal", proposalId: proposal.id });
     res.json(proposal);
   } catch (error) {
@@ -6197,9 +7457,328 @@ app.post("/api/scm/smart/proposals/:id/retry-picking-ticket", requireSmartScmWri
   }
 });
 
+app.use("/api/scm/netsuite-po-history", requireOperator, requireSmartScmWriteAccess);
+
+app.get("/api/scm/netsuite-po-history/options", async (_req, res, next) => {
+  try {
+    res.json(await listScmNetSuitePoHistoryFilterOptions());
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/netsuite-po-history", async (req, res, next) => {
+  try {
+    res.json(await listScmNetSuitePoHistory({
+      search: req.query.search,
+      createdFrom: req.query.createdFrom,
+      createdTo: req.query.createdTo,
+      vendorId: req.query.vendorId,
+      vendorYard: req.query.vendorYard,
+      destinationLocationId: req.query.destinationLocationId,
+      page: req.query.page,
+      pageSize: req.query.pageSize
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/netsuite-po-history/:id", async (req, res, next) => {
+  try {
+    res.json(await getScmNetSuitePoHistory(req.params.id, { includeUnarchived: false }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.patch("/api/scm/netsuite-po-history/:id", async (req, res, next) => {
+  try {
+    const history = await updateScmNetSuitePoHistory(req.params.id, req.body || {}, operatorId(req));
+    emitAppEvent("scm.smart.updated", {
+      source: "netsuite-po-history-edit",
+      historyId: history.id,
+      purchaseOrderId: history.purchaseOrderId,
+      purchaseOrderRef: history.purchaseOrderRef
+    });
+    emitAppEvent("receiving.order.updated", {
+      source: "netsuite-po-history-edit",
+      orderId: history.purchaseOrderId,
+      orderRef: history.purchaseOrderRef
+    });
+    res.json(history);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/netsuite-po-history/:id/refresh", async (req, res, next) => {
+  try {
+    const history = await refreshScmNetSuitePoHistory(req.params.id, {
+      source: "reconciliation",
+      operatorId: operatorId(req)
+    });
+    emitAppEvent("scm.smart.updated", {
+      source: "netsuite-po-history-refresh",
+      historyId: history.id,
+      purchaseOrderId: history.purchaseOrderId,
+      purchaseOrderRef: history.purchaseOrderRef
+    });
+    res.json(history);
+  } catch (error) {
+    next(error);
+  }
+});
+
+for (const archived of [true, false]) {
+  app.post(`/api/scm/netsuite-po-history/:id/${archived ? "archive" : "unarchive"}`, async (req, res, next) => {
+    try {
+      const history = await setScmNetSuitePoHistoryArchived(req.params.id, archived, operatorId(req));
+      emitAppEvent("scm.smart.updated", {
+        source: archived ? "netsuite-po-history-archive" : "netsuite-po-history-unarchive",
+        historyId: history.id,
+        purchaseOrderId: history.purchaseOrderId,
+        purchaseOrderRef: history.purchaseOrderRef
+      });
+      res.json(history);
+    } catch (error) {
+      next(error);
+    }
+  });
+}
+
+app.get("/api/scm/netsuite-po-history/:id/pdf", async (req, res, next) => {
+  try {
+    const document = await getScmNetSuitePoHistoryPdf(req.params.id);
+    res.type(document.contentType || "application/pdf");
+    res.setHeader("Content-Disposition", `inline; filename="${String(document.filename || "purchase-order.pdf").replace(/[\r\n\"]/g, "-")}"`);
+    res.send(document.buffer);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/smart/vendor-workflows/:id", async (req, res, next) => {
+  try {
+    res.json(await getSmartScmVendorWorkflow(req.params.id));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/scm/smart/vendor-workflows/:id/email-draft", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const workflow = await saveSmartScmVendorEmailDraft(req.params.id, req.body || {}, operatorId(req));
+    emitAppEvent("scm.smart.updated", {
+      source: "vendor-email-draft",
+      workflowId: workflow.workflowId,
+      proposalId: workflow.sourceProposalId
+    });
+    res.json(workflow);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/scm/smart/vendor-workflows/:id/create-purchase-order", requireSmartScmWriteAccess, async (req, res, next) => {
+  let target = null;
+  try {
+    target = await getSmartScmVendorWorkflowActionTarget(req.params.id);
+    if (target.workflowKind !== "regular_po") {
+      throw Object.assign(new Error("Blanket releases create a local split PO and never create another NetSuite purchase order."), { status: 409 });
+    }
+    if (target.netsuitePurchaseOrderId || target.netsuitePurchaseOrderRef) {
+      const review = target.reviewProposalId
+        ? await getSmartScmNetSuitePoReviewLoad(target.reviewProposalId)
+        : null;
+      if (!review || review.status === "completed") {
+        let history = target.netsuitePurchaseOrderId
+          ? await findScmNetSuitePoHistoryByNetSuiteId(target.netsuitePurchaseOrderId)
+          : null;
+        if (!history && target.netsuitePurchaseOrderId) {
+          history = await registerScmNetSuitePoHistoryCreation({
+            proposalId: target.reviewProposalId || target.sourceProposalId,
+            purchaseOrderId: target.netsuitePurchaseOrderId,
+            purchaseOrderRef: target.netsuitePurchaseOrderRef
+          }, operatorId(req));
+        }
+        const workflow = await recordSmartScmVendorWorkflowPurchaseResult(target.workflowId, {
+          reviewProposalId: target.reviewProposalId,
+          purchaseOrderId: target.netsuitePurchaseOrderId,
+          purchaseOrderRef: target.netsuitePurchaseOrderRef
+        }, operatorId(req));
+        return res.json({
+          reused: true,
+          proposalId: target.reviewProposalId,
+          purchaseOrderId: target.netsuitePurchaseOrderId,
+          purchaseOrderRef: target.netsuitePurchaseOrderRef,
+          workflow,
+          history
+        });
+      }
+    }
+    let reviewProposalId = target.reviewProposalId;
+    if (!reviewProposalId) {
+      const vendorReply = req.body?.vendorReply || req.body || {};
+      const hasConfirmedLine = Array.isArray(vendorReply.lines) && vendorReply.lines.some((line) =>
+        String(line?.decision || "").toLowerCase() === "confirm"
+        && Number(line?.decisionPallets ?? line?.confirmedPallets) > 0
+      );
+      if (!hasConfirmedLine) {
+        throw Object.assign(new Error("Confirm at least one vendor line above 0 PLT before creating a NetSuite purchase order."), { status: 400 });
+      }
+      const staged = await stageSmartScmVendorReplyLoad(
+        target.sourceProposalId,
+        vendorReply,
+        operatorId(req)
+      );
+      if (!staged.reviewProposalId) {
+        throw Object.assign(new Error("At least one vendor line must be confirmed before creating a NetSuite purchase order."), { status: 409 });
+      }
+      reviewProposalId = staged.reviewProposalId;
+      await linkSmartScmVendorWorkflowReview(target.workflowId, reviewProposalId, operatorId(req));
+    }
+    const result = await executeSmartScmPurchaseProposal(reviewProposalId, operatorId(req));
+    const history = result.purchaseOrderId
+      ? await registerScmNetSuitePoHistoryCreation({
+          proposalId: result.proposalId || reviewProposalId,
+          purchaseOrderId: result.purchaseOrderId,
+          purchaseOrderRef: result.purchaseOrderRef
+        }, operatorId(req))
+      : null;
+    const workflow = await recordSmartScmVendorWorkflowPurchaseResult(target.workflowId, {
+      ...result,
+      reviewProposalId
+    }, operatorId(req));
+    emitAppEvent("scm.smart.updated", {
+      source: "vendor-workflow-purchase-created",
+      workflowId: workflow.workflowId,
+      proposalId: result.proposalId || reviewProposalId,
+      purchaseOrderId: result.purchaseOrderId,
+      purchaseOrderRef: result.purchaseOrderRef
+    });
+    if (result.purchaseOrderId) {
+      emitAppEvent("dispatch.orders.updated", {
+        source: "vendor-workflow-purchase-created",
+        refreshOrderPool: true,
+        orderId: result.purchaseOrderId,
+        orderRef: result.purchaseOrderRef
+      });
+    }
+    res.status(result.reused ? 200 : 201).json({ ...result, workflow, history });
+  } catch (error) {
+    if (target?.workflowId) {
+      await recordSmartScmVendorWorkflowAttention(target.workflowId, error, operatorId(req)).catch(() => null);
+    }
+    next(error);
+  }
+});
+
+app.post("/api/scm/smart/vendor-workflows/:id/create-blanket-split", requireSmartScmWriteAccess, async (req, res, next) => {
+  let target = null;
+  try {
+    target = await getSmartScmVendorWorkflowActionTarget(req.params.id);
+    if (target.workflowKind !== "blanket_po") {
+      throw Object.assign(new Error("Only a Blanket Vendor Replies workflow can create a local split purchase order."), { status: 409 });
+    }
+    if (target.splitPurchaseOrderRef && target.workflowStatus === "split_created") {
+      return res.json({
+        reused: true,
+        splitPurchaseOrderId: target.splitPurchaseOrderId,
+        splitPurchaseOrderRef: target.splitPurchaseOrderRef,
+        workflow: await getSmartScmVendorWorkflow(target.workflowId)
+      });
+    }
+    const result = await finalizeSmartScmBlanketVendorWorkflow(
+      target.sourceProposalId,
+      req.body || {},
+      operatorId(req)
+    );
+    const workflow = await recordSmartScmVendorWorkflowBlanketSplit(
+      target.workflowId,
+      result,
+      operatorId(req)
+    );
+    const splitPurchaseOrderRef = result.release?.splitPoRef
+      || result.split?.split?.splitPoRef
+      || workflow.splitPurchaseOrderRef
+      || "";
+    emitAppEvent("scm.smart.updated", {
+      source: "blanket-split-created",
+      workflowId: workflow.workflowId,
+      proposalId: result.proposal?.id || target.sourceProposalId,
+      releaseId: result.release?.id,
+      splitPurchaseOrderRef,
+      releaseStatus: result.release?.status
+    });
+    emitAppEvent("dispatch.orders.updated", {
+      source: "blanket-split-created",
+      refreshOrderPool: true,
+      orderRef: splitPurchaseOrderRef
+    });
+    res.status(result.idempotent ? 200 : 201).json({
+      ...result,
+      splitPurchaseOrderRef,
+      workflow
+    });
+  } catch (error) {
+    if (target?.workflowId) {
+      await recordSmartScmVendorWorkflowAttention(target.workflowId, error, operatorId(req)).catch(() => null);
+    }
+    next(error);
+  }
+});
+
+app.patch("/api/scm/smart/vendor-workflows/:id/archive", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const workflow = await getSmartScmVendorWorkflow(req.params.id);
+    if (workflow.workflowKind !== "regular_po" || !workflow.netsuitePurchaseOrderId) {
+      throw Object.assign(new Error("Only a created regular NetSuite purchase order can move to PO history."), { status: 409 });
+    }
+    let history = await findScmNetSuitePoHistoryByNetSuiteId(workflow.netsuitePurchaseOrderId);
+    if (!history) {
+      history = await registerScmNetSuitePoHistoryCreation({
+        proposalId: workflow.reviewProposalId || workflow.sourceProposalId,
+        purchaseOrderId: workflow.netsuitePurchaseOrderId,
+        purchaseOrderRef: workflow.netsuitePurchaseOrderRef
+      }, operatorId(req));
+    }
+    const archived = req.body?.archived !== false;
+    history = await setScmNetSuitePoHistoryArchived(history.id, archived, operatorId(req));
+    const updatedWorkflow = await getSmartScmVendorWorkflow(req.params.id);
+    emitAppEvent("scm.smart.updated", {
+      source: archived ? "vendor-workflow-archived" : "vendor-workflow-unarchived",
+      workflowId: updatedWorkflow.workflowId,
+      historyId: history.id,
+      purchaseOrderId: history.purchaseOrderId,
+      purchaseOrderRef: history.purchaseOrderRef
+    });
+    res.json({ workflow: updatedWorkflow, history });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/scm/smart/vendor-workflows/:id/purchase-order.pdf", async (req, res, next) => {
+  try {
+    const workflow = await getSmartScmVendorWorkflow(req.params.id);
+    if (!workflow.netsuitePurchaseOrderId) {
+      throw Object.assign(new Error("This workflow does not have a real NetSuite purchase order to preview."), { status: 409 });
+    }
+    const history = await findScmNetSuitePoHistoryByNetSuiteId(workflow.netsuitePurchaseOrderId);
+    if (!history) throw Object.assign(new Error("The app-created purchase order is not registered in PO history yet."), { status: 409 });
+    const document = await getScmNetSuitePoHistoryPdf(history.id);
+    res.type(document.contentType || "application/pdf");
+    res.setHeader("Content-Disposition", `inline; filename="${String(document.filename || "purchase-order.pdf").replace(/[\r\n\"]/g, "-")}"`);
+    res.send(document.buffer);
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/scm/smart/vendor-reply-loads", async (req, res, next) => {
   try {
-    res.json(await listSmartScmVendorReplyLoads({ search: req.query.search, limit: req.query.limit }));
+    res.json(await listSmartScmVendorWorkflowLoads({ search: req.query.search, limit: req.query.limit }));
   } catch (error) {
     next(error);
   }
@@ -6207,9 +7786,45 @@ app.get("/api/scm/smart/vendor-reply-loads", async (req, res, next) => {
 
 app.put("/api/scm/smart/vendor-reply-loads/:id", requireSmartScmWriteAccess, async (req, res, next) => {
   try {
-    const proposal = await saveSmartScmVendorReplyLoad(req.params.id, req.body || {}, operatorId(req));
+    const current = await getSmartScmProposal(req.params.id);
+    if (!current) return res.status(404).json({ error: "Vendor Replies proposal was not found." });
+    const proposal = current.proposalOrigin === "blanket"
+      ? await saveSmartScmBlanketVendorReplyDraft(req.params.id, req.body || {}, operatorId(req))
+      : await saveSmartScmVendorReplyLoad(req.params.id, req.body || {}, operatorId(req));
     emitAppEvent("scm.smart.updated", { source: "vendor-reply-load", proposalId: proposal.id, planningRunId: proposal.runId });
-    res.json(proposal);
+    res.json(await getSmartScmVendorWorkflowForProposal(proposal.id));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete("/api/scm/smart/vendor-reply-loads/:id", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const current = await getSmartScmProposal(req.params.id);
+    if (!current) return res.status(404).json({ error: "Vendor Replies proposal was not found." });
+    if (current.proposalOrigin === "blanket") {
+      const result = await cancelSmartScmBlanketReservationForProposal(req.params.id, req.body || {}, operatorId(req));
+      const currentWorkflow = await getSmartScmVendorWorkflowForProposal(current.id);
+      const workflow = await recordSmartScmVendorWorkflowBlanketSplit(
+        currentWorkflow.workflowId,
+        result,
+        operatorId(req)
+      );
+      emitAppEvent("scm.smart.updated", {
+        source: "blanket-vendor-load-removed",
+        proposalId: current.id,
+        releaseId: result.release?.id,
+        workflowId: workflow.workflowId
+      });
+      return res.json({ ...result, workflow });
+    }
+    const result = await removeSmartScmVendorReplyLoad(req.params.id, operatorId(req));
+    emitAppEvent("scm.smart.updated", {
+      source: "vendor-reply-load-removed",
+      proposalId: result.id,
+      planningRunId: result.runId
+    });
+    res.json(result);
   } catch (error) {
     next(error);
   }
@@ -6217,11 +7832,18 @@ app.put("/api/scm/smart/vendor-reply-loads/:id", requireSmartScmWriteAccess, asy
 
 app.get("/api/scm/smart/vendor-reply-loads/:id/alternatives", async (req, res, next) => {
   try {
-    res.json(await searchSmartScmVendorAlternatives(req.params.id, {
-      search: req.query.search,
-      lineId: req.query.lineId,
-      limit: req.query.limit
-    }));
+    const proposal = await getSmartScmProposal(req.params.id);
+    if (!proposal) return res.status(404).json({ error: "Vendor Replies proposal was not found." });
+    res.json(proposal.proposalOrigin === "blanket"
+      ? await searchSmartScmBlanketAlternatives(req.params.id, {
+          search: req.query.search,
+          limit: req.query.limit
+        })
+      : await searchSmartScmVendorAlternatives(req.params.id, {
+          search: req.query.search,
+          lineId: req.query.lineId,
+          limit: req.query.limit
+        }));
   } catch (error) {
     next(error);
   }
@@ -6229,9 +7851,15 @@ app.get("/api/scm/smart/vendor-reply-loads/:id/alternatives", async (req, res, n
 
 app.post("/api/scm/smart/vendor-reply-loads/:id/lines", requireSmartScmWriteAccess, async (req, res, next) => {
   try {
-    const proposal = await addSmartScmVendorAlternativeLine(req.params.id, req.body || {}, operatorId(req));
+    const current = await getSmartScmProposal(req.params.id);
+    if (!current) return res.status(404).json({ error: "Vendor Replies proposal was not found." });
+    const result = current.proposalOrigin === "blanket"
+      ? await addSmartScmBlanketAlternativeLine(req.params.id, req.body || {}, operatorId(req))
+      : await addSmartScmVendorAlternativeLine(req.params.id, req.body || {}, operatorId(req));
+    const proposal = result.proposal || result;
+    const workflow = await getSmartScmVendorWorkflowForProposal(proposal.id);
     emitAppEvent("scm.smart.updated", { source: "vendor-alternative-add", proposalId: proposal.id, planningRunId: proposal.runId });
-    res.status(201).json(proposal);
+    res.status(201).json(workflow);
   } catch (error) {
     next(error);
   }
@@ -6239,9 +7867,15 @@ app.post("/api/scm/smart/vendor-reply-loads/:id/lines", requireSmartScmWriteAcce
 
 app.delete("/api/scm/smart/vendor-reply-loads/:id/lines/:lineId", requireSmartScmWriteAccess, async (req, res, next) => {
   try {
-    const proposal = await removeSmartScmVendorAlternativeLine(req.params.id, req.params.lineId, operatorId(req));
+    const current = await getSmartScmProposal(req.params.id);
+    if (!current) return res.status(404).json({ error: "Vendor Replies proposal was not found." });
+    const result = current.proposalOrigin === "blanket"
+      ? await removeSmartScmBlanketAlternativeLine(req.params.id, req.params.lineId, operatorId(req))
+      : await removeSmartScmVendorAlternativeLine(req.params.id, req.params.lineId, operatorId(req));
+    const proposal = result.proposal || result;
+    const workflow = await getSmartScmVendorWorkflowForProposal(proposal.id);
     emitAppEvent("scm.smart.updated", { source: "vendor-alternative-remove", proposalId: proposal.id, planningRunId: proposal.runId });
-    res.json(proposal);
+    res.json(workflow);
   } catch (error) {
     next(error);
   }
@@ -6249,7 +7883,29 @@ app.delete("/api/scm/smart/vendor-reply-loads/:id/lines/:lineId", requireSmartSc
 
 app.post("/api/scm/smart/vendor-reply-loads/:id/confirm", requireSmartScmWriteAccess, async (req, res, next) => {
   try {
+    const current = await getSmartScmProposal(req.params.id);
+    if (!current) return res.status(404).json({ error: "Vendor Replies proposal was not found." });
+    if (current.proposalOrigin === "blanket") {
+      const result = await finalizeSmartScmBlanketVendorWorkflow(req.params.id, req.body || {}, operatorId(req));
+      const currentWorkflow = await getSmartScmVendorWorkflowForProposal(current.id);
+      const workflow = await recordSmartScmVendorWorkflowBlanketSplit(
+        currentWorkflow.workflowId,
+        result,
+        operatorId(req)
+      );
+      emitAppEvent("scm.smart.updated", {
+        source: "blanket-vendor-finalized",
+        proposalId: current.id,
+        releaseId: result.release?.id,
+        workflowId: workflow.workflowId
+      });
+      return res.status(result.idempotent ? 200 : 201).json({ ...result, workflow });
+    }
     const result = await stageSmartScmVendorReplyLoad(req.params.id, req.body || {}, operatorId(req));
+    const workflow = await getSmartScmVendorWorkflowForProposal(result.sourceProposalId);
+    if (result.reviewProposalId) {
+      await linkSmartScmVendorWorkflowReview(workflow.workflowId || workflow.id, result.reviewProposalId, operatorId(req));
+    }
     const messages = [];
     if (result.reviewProposalId) messages.push("Confirmed lines were staged for NetSuite PO review.");
     else messages.push("Vendor decisions were applied. No NetSuite PO review was created.");
@@ -6321,9 +7977,26 @@ app.delete("/api/scm/smart/netsuite-purchase-orders/:id", requireSmartScmWriteAc
 app.post("/api/scm/smart/netsuite-purchase-orders/:id/insert", requireSmartScmWriteAccess, async (req, res, next) => {
   try {
     const result = await executeSmartScmPurchaseProposal(req.params.id, operatorId(req));
+    const history = result.purchaseOrderId
+      ? await registerScmNetSuitePoHistoryCreation({
+          proposalId: result.proposalId || Number(req.params.id),
+          purchaseOrderId: result.purchaseOrderId,
+          purchaseOrderRef: result.purchaseOrderRef
+        }, operatorId(req))
+      : null;
+    const workflow = await findSmartScmVendorWorkflowByPurchaseOrder({
+      purchaseOrderId: result.purchaseOrderId,
+      reviewProposalId: result.proposalId || Number(req.params.id)
+    });
+    if (workflow) {
+      await recordSmartScmVendorWorkflowPurchaseResult(workflow.id, {
+        ...result,
+        reviewProposalId: result.proposalId || Number(req.params.id)
+      }, operatorId(req));
+    }
     emitAppEvent("scm.smart.updated", { source: "smart-scm-purchase", proposalId: result.proposalId, purchaseOrderId: result.purchaseOrderId, purchaseOrderRef: result.purchaseOrderRef });
     if (result.purchaseOrderId) emitAppEvent("dispatch.orders.updated", { source: "smart-scm-purchase", refreshOrderPool: true });
-    res.status(201).json(result);
+    res.status(result.reused ? 200 : 201).json({ ...result, history });
   } catch (error) {
     next(error);
   }
@@ -6452,6 +8125,520 @@ app.use("/api/scm", requireOperator, requireScmAccess);
 app.use("/api/dispatch", requireOperatorOrPublicSalesRead, requireDispatchAccess);
 app.use("/api/sales", requireSalesOperator, requireSalesAccess);
 
+app.get("/api/dispatch/offline-review/count", requireDispatcher, async (_req, res, next) => {
+  try {
+    const [serverCounts, clientSyncIssues] = await Promise.all([
+      getDriverOfflineReviewCounts(),
+      listDriverClientSyncIssues({ limit: 500 })
+    ]);
+    const clientSyncIssueCount = clientSyncIssues.length;
+    res.setHeader("Cache-Control", "no-store");
+    res.json({
+      count: serverCounts.serverSyncCount + clientSyncIssueCount,
+      serverSyncCount: serverCounts.serverSyncCount,
+      clientSyncIssueCount,
+      actionRequiredCount: serverCounts.actionRequiredCount + clientSyncIssueCount,
+      serverActionRequiredCount: serverCounts.actionRequiredCount,
+      syncInProgressCount: serverCounts.syncInProgressCount,
+      byStatus: serverCounts.byStatus,
+      photoCounts: serverCounts.photoCounts
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/dispatch/offline-review/device-issues/:sessionId/dismiss", requireDispatcher, async (req, res, next) => {
+  try {
+    const operatorName = req.operator?.username
+      || req.operator?.display_name
+      || String(req.operator?.id || "dispatcher");
+    const result = await withTransaction(async () => {
+      const dismissal = await dismissDriverClientSyncIssue({
+        sessionId: req.params.sessionId,
+        expectedReportedAt: req.body?.expectedReportedAt
+          || req.body?.expectedReportTimestamp
+          || req.body?.reportedAt,
+        auditNote: req.body?.auditNote,
+        dismissedBy: operatorName
+      });
+      if (!dismissal.idempotentReplay) {
+        const issue = dismissal.issue;
+        await writeDispatchAudit({
+          action: "driver_client_sync_issue_dismissed",
+          entityType: "driver_session",
+          entityId: issue.sessionId,
+          sessionId: issue.sessionId,
+          planDate: issue.planDate || null,
+          operatorId: req.operator?.id || null,
+          operatorName,
+          source: "dispatch_offline_review",
+          before: {
+            state: issue.state,
+            errorName: issue.errorName,
+            errorCode: issue.errorCode,
+            errorMessage: issue.errorMessage,
+            manifestId: issue.manifestId,
+            pendingEventCount: issue.pendingEventCount,
+            reviewRequiredCount: issue.reviewRequiredCount,
+            unsyncedPhotoCount: issue.unsyncedPhotoCount,
+            clientOccurredAt: issue.clientOccurredAt,
+            reportedAt: issue.reportedAt
+          },
+          after: {
+            dismissed: true,
+            reportReceivedAt: issue.dismissal?.reportReceivedAt,
+            dismissedAt: issue.dismissal?.dismissedAt,
+            dismissedBy: issue.dismissal?.dismissedBy
+          },
+          details: {
+            auditNote: issue.dismissal?.auditNote,
+            driverLogin: issue.driverLogin,
+            deviceId: issue.deviceId,
+            telemetryPreserved: true
+          }
+        });
+      }
+      return dismissal;
+    });
+    if (!result.idempotentReplay) {
+      emitAppEvent("driver.offline.device_issue.dismissed", {
+        sessionId: result.issue.sessionId,
+        driverLogin: result.issue.driverLogin,
+        deviceId: result.issue.deviceId,
+        reportedAt: result.issue.reportedAt
+      });
+    }
+    res.setHeader("Cache-Control", "no-store");
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/dispatch/driver-pwa/stops", requireDispatcher, async (req, res, next) => {
+  try {
+    const planDate = req.query.planDate || req.query.date || "";
+    const driverLogin = req.query.driverLogin || "";
+    const [result, clientSyncIssues] = await Promise.all([
+      listDriverPwaStops({
+        planDate,
+        driverLogin,
+        limit: req.query.limit || 200
+      }),
+      listDriverClientSyncIssues({
+        planDate,
+        driverLogin,
+        limit: req.query.limit || 200
+      })
+    ]);
+    res.setHeader("Cache-Control", "no-store");
+    res.json({
+      ...result,
+      clientSyncIssues,
+      clientSyncIssueCount: clientSyncIssues.length
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/dispatch/driver-pwa/stops/:recordId/reopen", requireDispatcher, async (req, res, next) => {
+  try {
+    const result = await reopenDriverPwaStop({
+      recordId: req.params.recordId,
+      expectedStateHash: req.body?.expectedStateHash,
+      auditNote: req.body?.auditNote,
+      idempotencyId: req.body?.idempotencyId,
+      reopenedBy: req.operator?.username
+        || req.operator?.display_name
+        || String(req.operator?.id || "dispatcher")
+    });
+    emitAppEvent("driver.job.reopened", {
+      source: "driver_pwa",
+      driverLogin: result.driverLogin,
+      planDate: result.planDate,
+      jobId: result.jobId,
+      correctionId: result.correctionId
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/dispatch/offline-review", requireDispatcher, async (req, res, next) => {
+  try {
+    const status = req.query.status || "open";
+    const driverLogin = req.query.driverLogin || "";
+    const planDate = req.query.planDate || "";
+    const [result, clientSyncIssues] = await Promise.all([
+      listDriverOfflineReviews({
+        status,
+        limit: req.query.limit || 100,
+        offset: req.query.offset || req.query.cursor || 0,
+        driverLogin,
+        planDate
+      }),
+      status === "open" || status === "all"
+        ? listDriverClientSyncIssues({
+            planDate,
+            driverLogin,
+            limit: 500
+          })
+        : Promise.resolve([])
+    ]);
+    res.setHeader("Cache-Control", "no-store");
+    res.json({
+      ...result,
+      clientSyncIssues,
+      clientSyncIssueCount: clientSyncIssues.length,
+      nextCursor: result.nextOffset === null ? null : String(result.nextOffset)
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/dispatch/offline-review/:eventId/photos/:photoId", requireDispatcher, async (req, res, next) => {
+  try {
+    const detail = await getDriverOfflineReview(req.params.eventId);
+    if (!detail?.case) return res.status(404).json({ error: "Offline review case was not found." });
+    const photo = (detail.case.photos || []).find((entry) =>
+      String(entry.photoId) === String(req.params.photoId)
+    );
+    if (!photo) return res.status(404).json({ error: "Offline evidence photo was not found." });
+    if (!photo.durableReceipt || !photo.objectReference) {
+      return res.status(409).json({ error: "Offline evidence photo has not been durably received." });
+    }
+    const archived = await readArchivedPhoto(photo.objectReference);
+    if (archived?.available) {
+      res.setHeader("Content-Type", archived.contentType);
+      res.setHeader("Content-Length", String(archived.byteSize));
+      res.setHeader("ETag", `"${archived.sha256}"`);
+      res.setHeader("Cache-Control", "private, no-store");
+      return res.send(archived.bytes);
+    }
+    const readTicket = createPhotoReadToken({
+      actor: {
+        id: req.operator?.id,
+        username: req.operator?.username,
+        role: req.operator?.role
+      },
+      key: photo.objectReference
+    });
+    const response = await fetch(readTicket.objectUrl, {
+      headers: { Authorization: `Bearer ${readTicket.token}` }
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      return res.status(response.status).json({ error: text || "Offline evidence photo could not be read." });
+    }
+    const bytes = Buffer.from(await response.arrayBuffer());
+    res.setHeader("Content-Type", response.headers.get("content-type") || photo.mimeType || "image/jpeg");
+    res.setHeader("Content-Length", String(bytes.length));
+    res.setHeader("Cache-Control", "private, no-store");
+    res.send(bytes);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/dispatch/offline-review/:eventId", requireDispatcher, async (req, res, next) => {
+  try {
+    const detail = await driverOfflineReviewWithCurrentPlan(req.params.eventId);
+    if (!detail) return res.status(404).json({ error: "Offline review case was not found." });
+    res.setHeader("Cache-Control", "no-store");
+    res.json(detail);
+  } catch (error) {
+    next(error);
+  }
+});
+
+function publicDriverOfflineQueueResults(events = []) {
+  return (events || []).map((event) => ({
+    eventId: event.eventId,
+    clientSequence: Number(event.clientSequence || 0),
+    status: event.status,
+    effectiveJobId: event.effectiveJobId || "",
+    reviewReason: event.reviewReason || "",
+    result: event.result || {}
+  }));
+}
+
+async function drainDriverOfflineDeviceStream({
+  driverLogin,
+  planDate,
+  deviceId,
+  emissionSource
+}) {
+  const events = await processDriverOfflineQueue({
+    driverLogin,
+    planDate,
+    deviceId,
+    allowBlocked: true,
+    applyEvent: (context) => applyDriverOfflineEvent({
+      ...context,
+      emissionSource
+    })
+  });
+  return publicDriverOfflineQueueResults(events);
+}
+
+app.post("/api/dispatch/offline-review/:eventId/retry", requireDispatcher, async (req, res, next) => {
+  let activeRetryId = "";
+  try {
+    const operatorName = req.operator?.username
+      || req.operator?.display_name
+      || String(req.operator?.id || "dispatcher");
+    const retryId = String(req.body?.retryId || req.body?.idempotencyId || "").trim().toLowerCase();
+    const alternateRetryId = String(req.body?.idempotencyId || req.body?.retryId || "").trim().toLowerCase();
+    if (retryId && alternateRetryId && retryId !== alternateRetryId) {
+      throw Object.assign(new Error("Retry ID and idempotency ID must match."), {
+        status: 400,
+        code: "OFFLINE_RETRY_IDEMPOTENCY_CONFLICT"
+      });
+    }
+    const caseVersion = req.body?.caseVersion ?? req.body?.expectedVersion;
+    if (
+      req.body?.caseVersion !== undefined
+      && req.body?.expectedVersion !== undefined
+      && Number(req.body.caseVersion) !== Number(req.body.expectedVersion)
+    ) {
+      throw Object.assign(new Error("Case version and expected version must match."), {
+        status: 400,
+        code: "OFFLINE_RETRY_VERSION_CONFLICT"
+      });
+    }
+    const prepared = await beginDriverOfflineRetry({
+      eventId: req.params.eventId,
+      caseVersion,
+      retryId,
+      requestedBy: operatorName
+    });
+    if (prepared.replay) {
+      const replayPayload = {
+        ...(prepared.result || {}),
+        retryId: prepared.retry.retryId,
+        idempotentReplay: true
+      };
+      return prepared.retry.status === "failed"
+        ? res.status(409).json(replayPayload)
+        : res.json(replayPayload);
+    }
+    activeRetryId = prepared.retry.retryId;
+    const event = prepared.event;
+    const sourceStatus = event.status;
+    const results = [];
+    for (const photo of event.photos || []) {
+      if (photo.durableReceipt) {
+        results.push({
+          photoId: photo.photoId,
+          status: "already_durable",
+          verificationAttemptCount: Number(photo.verificationAttemptCount || 0)
+        });
+        continue;
+      }
+      if (!photo.objectReference) {
+        const errorCode = "OFFLINE_PHOTO_UPLOAD_MISSING";
+        const errorMessage = "No uploaded object is available. The Driver device must reconnect with its retained local photo, or Dispatch must close the stale event as evidence only.";
+        const stored = await recordDriverOfflinePhotoVerificationFailure(photo.photoId, {
+          errorCode,
+          errorMessage
+        });
+        results.push({
+          photoId: photo.photoId,
+          status: "missing_upload",
+          errorCode,
+          error: errorMessage,
+          verificationAttemptCount: stored.verificationAttemptCount,
+          attemptedAt: stored.lastVerificationAttemptAt
+        });
+        continue;
+      }
+      try {
+        const verified = await verifyDriverOfflinePhotoObject(photo, {
+          id: req.operator?.id || operatorName,
+          username: req.operator?.username || "",
+          role: req.operator?.role || "dispatcher"
+        });
+        const stored = await markDriverOfflinePhotoDurable(photo.photoId, {
+          objectReference: photo.objectReference,
+          ...verified
+        });
+        results.push({
+          photoId: photo.photoId,
+          status: "verified",
+          byteSize: stored.byteSize,
+          sha256: stored.sha256,
+          verificationAttemptCount: stored.verificationAttemptCount,
+          attemptedAt: stored.lastVerificationAttemptAt
+        });
+      } catch (error) {
+        const errorCode = String(error?.code || "OFFLINE_PHOTO_VERIFICATION_FAILED").slice(0, 160);
+        const errorMessage = String(error?.message || error || "Photo durability verification failed.").slice(0, 2000);
+        const stored = await recordDriverOfflinePhotoVerificationFailure(photo.photoId, {
+          errorCode,
+          errorMessage
+        });
+        results.push({
+          photoId: photo.photoId,
+          status: "failed",
+          errorCode,
+          error: errorMessage,
+          verificationAttemptCount: stored.verificationAttemptCount,
+          attemptedAt: stored.lastVerificationAttemptAt
+        });
+      }
+    }
+
+    let drained = [];
+    let drainError = null;
+    try {
+      drained = await drainDriverOfflineDeviceStream({
+        driverLogin: event.driverLogin,
+        planDate: event.planDate,
+        deviceId: event.deviceId,
+        emissionSource: "offline_review_retry"
+      });
+    } catch (error) {
+      drainError = {
+        code: String(error?.code || "OFFLINE_QUEUE_RETRY_FAILED").slice(0, 160),
+        error: String(error?.message || error || "The device event queue could not be retried.").slice(0, 2000)
+      };
+    }
+    const refreshedEvent = await getDriverOfflineEvent(event.eventId);
+    const summary = {
+      total: results.length,
+      alreadyDurable: results.filter((photo) => photo.status === "already_durable").length,
+      verified: results.filter((photo) => photo.status === "verified").length,
+      failed: results.filter((photo) => photo.status === "failed").length,
+      missingUploads: results.filter((photo) => photo.status === "missing_upload").length,
+      results
+    };
+    await writeDispatchAudit({
+      action: "driver_offline_sync_retry",
+      entityType: "driver_offline_event",
+      entityId: event.eventId,
+      planDate: event.planDate,
+      operatorId: req.operator?.id || null,
+      operatorName,
+      source: "dispatch_offline_review",
+      before: { status: sourceStatus },
+      after: { status: refreshedEvent?.status || sourceStatus },
+      details: {
+        driverLogin: event.driverLogin,
+        deviceId: event.deviceId,
+        retryId: activeRetryId,
+        photoVerifiedCount: summary.verified,
+        photoFailedCount: summary.failed,
+        photoMissingUploadCount: summary.missingUploads,
+        resultingQueueStatuses: drained.map((entry) => ({
+          eventId: entry.eventId,
+          status: entry.status
+        })),
+        drainError
+      }
+    });
+    const responsePayload = {
+      retryId: activeRetryId,
+      idempotentReplay: false,
+      eventId: event.eventId,
+      driverLogin: event.driverLogin,
+      planDate: event.planDate,
+      deviceId: event.deviceId,
+      sourceStatus,
+      status: refreshedEvent?.status || sourceStatus,
+      photos: summary,
+      drained,
+      ...(drainError ? { drainError } : {}),
+      event: refreshedEvent
+    };
+    await completeDriverOfflineRetry(activeRetryId, responsePayload);
+    emitAppEvent("driver.offline.review.retried", {
+      eventId: event.eventId,
+      driverLogin: event.driverLogin,
+      deviceId: event.deviceId,
+      sourceStatus,
+      status: refreshedEvent?.status || sourceStatus,
+      verifiedPhotoCount: summary.verified,
+      failedPhotoCount: summary.failed,
+      missingUploadPhotoCount: summary.missingUploads
+    });
+    res.json(responsePayload);
+  } catch (error) {
+    if (activeRetryId) await failDriverOfflineRetry(activeRetryId, error).catch(() => null);
+    next(error);
+  }
+});
+
+app.post("/api/dispatch/offline-review/:eventId/resolve", requireDispatcher, async (req, res, next) => {
+  try {
+    const result = await resolveDriverOfflineReview({
+      eventId: req.params.eventId,
+      action: req.body?.action,
+      targetJobId: req.body?.targetJobId || "",
+      auditNote: req.body?.auditNote,
+      caseVersion: req.body?.caseVersion ?? req.body?.expectedVersion,
+      idempotencyId: req.body?.idempotencyId || req.body?.resolutionId,
+      resolvedBy: req.operator?.username || req.operator?.display_name || String(req.operator?.id || "dispatcher"),
+      confirmed: req.body?.confirmed === true
+    }, {
+      applyResolution: applyDriverOfflineReviewResolution,
+      replayBlocked: async ({ driverLogin, planDate, deviceId, blockedEvents }) => {
+        const blockedEventIds = new Set(blockedEvents.map((event) => String(event.eventId)));
+        const replayed = await processDriverOfflineQueue({
+          driverLogin,
+          planDate,
+          deviceId,
+          applyEvent: (context) => applyDriverOfflineEvent({
+            ...context,
+            emissionSource: "offline_review_resolution"
+          }),
+          allowBlocked: true
+        });
+        return replayed
+          .filter((event) => blockedEventIds.has(String(event.eventId)))
+          .map((event) => ({
+            eventId: event.eventId,
+            status: event.status,
+            effectiveJobId: event.effectiveJobId || "",
+            reason: event.reviewReason || "",
+            result: event.result || {}
+          }));
+      }
+    });
+    let drained = [];
+    let drainError = null;
+    try {
+      drained = await drainDriverOfflineDeviceStream({
+        driverLogin: result.driverLogin,
+        planDate: result.planDate,
+        deviceId: result.deviceId,
+        emissionSource: "offline_review_resolution"
+      });
+    } catch (error) {
+      drainError = {
+        code: String(error?.code || "OFFLINE_QUEUE_RETRY_FAILED").slice(0, 160),
+        error: String(error?.message || error || "The remaining device event queue could not be retried.").slice(0, 2000)
+      };
+    }
+    emitAppEvent("driver.offline.review.resolved", {
+      eventId: req.params.eventId,
+      source: "offline_review_resolution",
+      action: req.body?.action,
+      resolvedBy: req.operator?.username || req.operator?.id || ""
+    });
+    res.json({
+      ...result,
+      drained,
+      ...(drainError ? { drainError } : {})
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 async function scmVendorManagementPayload() {
   const [vendors, yards] = await Promise.all([
     listDispatchLocalVendors(),
@@ -6559,6 +8746,23 @@ app.get("/api/dispatch/config", (req, res) => {
   });
 });
 
+app.get("/api/dispatch/forecast", async (req, res, next) => {
+  try {
+    const planId = String(req.query.planId || "").trim();
+    if (!/^\d+$/.test(planId)) return res.status(400).json({ error: "A valid dispatch plan ID is required." });
+    const plan = await getDispatchPlan(planId);
+    if (!plan) return res.status(404).json({ error: "Dispatch plan not found." });
+    const [driverJobStatuses, setup] = await Promise.all([
+      listDriverJobStatuses({ planId: plan.id }),
+      readDispatchSetup()
+    ]);
+    res.setHeader("Cache-Control", "no-store");
+    res.json(buildDispatchForecast(plan, driverJobStatuses, { driverProfiles: setup.drivers }));
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/dispatch/monitor", async (req, res, next) => {
   try {
     const planDate = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.date || ""))
@@ -6567,6 +8771,9 @@ app.get("/api/dispatch/monitor", async (req, res, next) => {
     const setup = await readDispatchSetup();
     const plan = await getCurrentDispatchPlan({ planDate });
     const driverJobStatuses = plan?.id ? await listDriverJobStatuses({ planId: plan.id }) : [];
+    const forecast = plan
+      ? buildDispatchForecast(plan, driverJobStatuses, { driverProfiles: setup.drivers })
+      : null;
     const truckSwitchAttention = plan?.id ? await listDriverTruckSwitchAttention({ planId: plan.id }) : [];
     const switchAttentionByPlate = new Map();
     for (const item of truckSwitchAttention) {
@@ -6642,7 +8849,8 @@ app.get("/api/dispatch/monitor", async (req, res, next) => {
       planDate,
       refreshSeconds: 10,
       plan: plan ? { id: plan.id, status: plan.status, planDate: plan.planDate } : null,
-      plannedOrders: monitorPlannedOrders(plan, driverJobStatuses),
+      plannedOrders: monitorPlannedOrders(plan, driverJobStatuses, forecast),
+      forecastGeneratedAt: forecast?.generatedAt || null,
       trucks,
       trails,
       yards: [...ownYards, ...vendorYards],
@@ -7291,7 +9499,21 @@ app.get("/api/dispatch/plans/:id/revision", async (req, res, next) => {
   }
 });
 
-app.put("/api/dispatch/plans/:id", requireOperator, requireDispatcher, async (req, res, next) => {
+function reportDispatchSaveTiming(req, res, next) {
+  const startedAt = Date.now();
+  res.once("finish", () => {
+    console.info("[dispatch-save-timing]", JSON.stringify({
+      planId: String(req.params?.id || ""),
+      status: res.statusCode,
+      durationMs: Date.now() - startedAt,
+      saveMode: dispatchPlanSaveMode(req.body),
+      forceSave: req.body?.forceSave === true
+    }));
+  });
+  next();
+}
+
+app.put("/api/dispatch/plans/:id", reportDispatchSaveTiming, requireOperator, requireDispatcher, async (req, res, next) => {
   let previousPlan = null;
   try {
     previousPlan = await getDispatchPlan(req.params.id);
@@ -7327,6 +9549,13 @@ app.put("/api/dispatch/plans/:id", requireOperator, requireDispatcher, async (re
     }, { previousPlan });
     cleanOrders = sanitizeDispatchPlanOrders(canonicalCandidate.orders || []);
     cleanTrucks = canonicalCandidate.trucks || [];
+    const scheduleCandidate = await overlayDispatchLockedLoadSchedule(previousPlan, {
+      ...previousPlan,
+      planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date,
+      orders: cleanOrders,
+      trucks: cleanTrucks
+    });
+    cleanTrucks = scheduleCandidate.trucks || [];
     const changedScmRefs = changedDispatchScmRefs(previousPlan, {
       ...previousPlan,
       orders: cleanOrders,
@@ -7361,14 +9590,20 @@ app.put("/api/dispatch/plans/:id", requireOperator, requireDispatcher, async (re
     ) {
       return res.json({ ...previousPlan, operatorFlags: null, noChange: true });
     }
-    const dateConflicts = await findNewDispatchPlanDateConflicts(previousPlan || {}, {
-      id: req.params.id,
+    const nextPlanForValidation = {
+      ...previousPlan,
       planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date,
       orders: cleanOrders,
       trucks: cleanTrucks
+    };
+    const assignmentConflicts = await dispatchLoadAssignmentConflicts(previousPlan, nextPlanForValidation);
+    if (assignmentConflicts.length) return sendDispatchLoadAssignmentConflictResponse(res, assignmentConflicts);
+    const dateConflicts = await findNewDispatchPlanDateConflicts(previousPlan || {}, {
+      ...nextPlanForValidation,
+      id: req.params.id
     });
     if (dateConflicts.length) return sendDispatchPlanDateConflictResponse(res, dateConflicts);
-    const coSequenceConflicts = await findDispatchCoSequenceConflicts({
+    const coSequenceConflicts = await findChangedDispatchCoSequenceConflicts(previousPlan, {
       id: req.params.id,
       planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date,
       orders: cleanOrders,
@@ -7382,13 +9617,6 @@ app.put("/api/dispatch/plans/:id", requireOperator, requireDispatcher, async (re
       trucks: cleanTrucks
     });
     if (dependencyConflicts.length) return sendDispatchDependencyConflictResponse(res, dependencyConflicts);
-    const assignmentConflicts = await dispatchLoadAssignmentConflicts(previousPlan, {
-      ...previousPlan,
-      planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date,
-      orders: cleanOrders,
-      trucks: cleanTrucks
-    });
-    if (assignmentConflicts.length) return sendDispatchLoadAssignmentConflictResponse(res, assignmentConflicts);
     const plan = await saveDispatchPlanSnapshot(req.params.id, {
       orders: cleanOrders,
       trucks: cleanTrucks,
@@ -7550,6 +9778,13 @@ app.post("/api/dispatch/plans/:id/confirm", requireOperator, requireDispatcher, 
       }, { previousPlan });
       requestedOrders = sanitizeDispatchPlanOrders(canonicalCandidate.orders || []);
       requestedTrucks = canonicalCandidate.trucks || [];
+      const scheduleCandidate = await overlayDispatchLockedLoadSchedule(previousPlan, {
+        ...previousPlan,
+        planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date,
+        orders: requestedOrders,
+        trucks: requestedTrucks
+      });
+      requestedTrucks = scheduleCandidate.trucks || [];
       const changedScmRefs = changedDispatchScmRefs(previousPlan, {
         ...previousPlan,
         orders: requestedOrders,
@@ -7570,14 +9805,24 @@ app.post("/api/dispatch/plans/:id/confirm", requireOperator, requireDispatcher, 
         previousPlan,
         { orders: requestedOrders }
       );
-      const dateConflicts = await findNewDispatchPlanDateConflicts(previousPlan || {}, {
-        id: req.params.id,
+      const submittedPlanForValidation = {
+        ...previousPlan,
         planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date,
         orders: requestedOrders,
         trucks: requestedTrucks
+      };
+      const assignmentConflicts = await dispatchLoadAssignmentConflicts(
+        previousPlan,
+        submittedPlanForValidation,
+        { requireAssignments: true }
+      );
+      if (assignmentConflicts.length) return sendDispatchLoadAssignmentConflictResponse(res, assignmentConflicts);
+      const dateConflicts = await findNewDispatchPlanDateConflicts(previousPlan || {}, {
+        ...submittedPlanForValidation,
+        id: req.params.id
       });
       if (dateConflicts.length) return sendDispatchPlanDateConflictResponse(res, dateConflicts);
-      const coSequenceConflicts = await findDispatchCoSequenceConflicts({
+      const coSequenceConflicts = await findChangedDispatchCoSequenceConflicts(previousPlan, {
         id: req.params.id,
         planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date,
         orders: requestedOrders,
@@ -7591,13 +9836,6 @@ app.post("/api/dispatch/plans/:id/confirm", requireOperator, requireDispatcher, 
         trucks: requestedTrucks
       });
       if (dependencyConflicts.length) return sendDispatchDependencyConflictResponse(res, dependencyConflicts);
-      const assignmentConflicts = await dispatchLoadAssignmentConflicts(previousPlan, {
-        ...previousPlan,
-        planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date,
-        orders: requestedOrders,
-        trucks: requestedTrucks
-      }, { requireAssignments: true });
-      if (assignmentConflicts.length) return sendDispatchLoadAssignmentConflictResponse(res, assignmentConflicts);
       if (dispatchPlanDataChanged(
         { orders: previousPlan.orders || [], trucks: previousPlan.trucks || [] },
         { orders: requestedOrders, trucks: requestedTrucks }
@@ -7823,7 +10061,7 @@ app.patch("/api/dispatch/setup/drivers/:id/active", requireDispatcher, async (re
     }
     const { result } = change;
     if (!result) return res.status(404).json({ error: "Driver not found." });
-    if (!result.driver.active) revokeDispatchDriverSessions(result.driver.login);
+    if (!result.driver.active) await revokeDispatchDriverSessions(result.driver.login);
     await writeDispatchAudit({
       action: result.driver.active ? "dispatch_driver_enabled" : "dispatch_driver_disabled",
       entityType: "dispatch_driver",
@@ -8183,8 +10421,14 @@ app.post("/api/dispatch/order-dependencies", async (req, res, next) => {
 
 app.patch("/api/dispatch/order-dependencies/:id/mode", async (req, res, next) => {
   try {
-    await requireDispatchPlanEditLease(req, req.body?.planDate || req.body?.date || "");
-    const dependency = await updateOrderDependencyMode(req.params.id, req.body?.mode, req.operator?.id);
+    const planDate = req.body?.planDate || req.body?.date || "";
+    await requireDispatchPlanEditLease(req, planDate);
+    const dependency = await updateOrderDependencyMode(
+      req.params.id,
+      req.body?.mode,
+      req.operator?.id,
+      planDate
+    );
     emitAppEvent("dispatch.orders.updated", { source: "order-dependency-mode", orderId: dependency.salesOrderRef, refreshOrderPool: true });
     res.json({ dependency, orders: await listDispatchOrdersForResponse() });
   } catch (error) {
@@ -8195,8 +10439,9 @@ app.patch("/api/dispatch/order-dependencies/:id/mode", async (req, res, next) =>
 
 app.delete("/api/dispatch/order-dependencies/:id", async (req, res, next) => {
   try {
-    await requireDispatchPlanEditLease(req, req.body?.planDate || req.query?.planDate || "");
-    const cancelled = await cancelOrderDependency(req.params.id, req.operator?.id);
+    const planDate = req.body?.planDate || req.query?.planDate || "";
+    await requireDispatchPlanEditLease(req, planDate);
+    const cancelled = await cancelOrderDependency(req.params.id, req.operator?.id, planDate);
     emitAppEvent("dispatch.orders.updated", { source: "order-dependency-unlink", refreshOrderPool: true });
     res.json({ cancelled, orders: await listDispatchOrdersForResponse() });
   } catch (error) {
@@ -9263,6 +11508,50 @@ app.put("/api/scm/vrma-orders/:id", async (req, res, next) => {
   }
 });
 
+app.delete("/api/scm/vrma-orders/:id", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const note = String(req.body?.note || "").trim();
+    const result = await removeScmVrmaOrder({
+      vrmaRef: req.params.id,
+      note,
+      actor: req.operator?.id,
+      expectedUpdatedAt: req.body?.expectedUpdatedAt ?? req.body?.expected_updated_at,
+      confirm: req.body?.confirm === true
+    });
+    if (!result.idempotent) {
+      await writeDispatchAudit({
+        action: "scm.vrma_order.removed",
+        entityType: "scm_vrma_order",
+        entityId: req.params.id,
+        orderId: req.params.id,
+        operatorId: req.operator?.id,
+        operatorName: req.operator?.display_name || req.operator?.username,
+        sessionId: req.body?.audit?.sessionId,
+        source: "scm",
+        before: result.before,
+        after: result.after,
+        details: {
+          note,
+          softCancelled: true,
+          netSuiteUpdated: false
+        }
+      }).catch(() => null);
+    }
+    emitAppEvent("dispatch.orders.updated", {
+      source: "scm-vrma-removed",
+      type: "VRMA",
+      orderId: req.params.id,
+      refreshOrderPool: true
+    });
+    res.json({
+      result,
+      schedule: await listScmScheduleForOperator({ kind: "VRMA" }, req.operator)
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/scm/vrma-orders/:id/complete-override", requireSmartScmWriteAccess, async (req, res, next) => {
   try {
     const note = String(req.body?.note || "").trim();
@@ -9969,6 +12258,13 @@ app.put("/api/dispatch/plan", async (req, res, next) => {
     }, { previousPlan });
     cleanOrders = sanitizeDispatchPlanOrders(canonicalCandidate.orders || []);
     cleanTrucks = canonicalCandidate.trucks || [];
+    const scheduleCandidate = await overlayDispatchLockedLoadSchedule(previousPlan, {
+      ...previousPlan,
+      planDate: plan.planDate || planDate,
+      orders: cleanOrders,
+      trucks: cleanTrucks
+    });
+    cleanTrucks = scheduleCandidate.trucks || [];
     const changedScmRefs = changedDispatchScmRefs(previousPlan, {
       ...previousPlan,
       orders: cleanOrders,
@@ -10008,14 +12304,20 @@ app.put("/api/dispatch/plan", async (req, res, next) => {
     ) {
       return res.json({ ...previousPlan, operatorFlags: null, noChange: true });
     }
-    const dateConflicts = await findNewDispatchPlanDateConflicts(previousPlan || {}, {
-      id: plan.id,
+    const nextPlanForValidation = {
+      ...previousPlan,
       planDate: plan.planDate || planDate,
       orders: payload.orders,
       trucks: payload.trucks
+    };
+    const assignmentConflicts = await dispatchLoadAssignmentConflicts(previousPlan, nextPlanForValidation);
+    if (assignmentConflicts.length) return sendDispatchLoadAssignmentConflictResponse(res, assignmentConflicts);
+    const dateConflicts = await findNewDispatchPlanDateConflicts(previousPlan || {}, {
+      ...nextPlanForValidation,
+      id: plan.id
     });
     if (dateConflicts.length) return sendDispatchPlanDateConflictResponse(res, dateConflicts);
-    const coSequenceConflicts = await findDispatchCoSequenceConflicts({
+    const coSequenceConflicts = await findChangedDispatchCoSequenceConflicts(previousPlan, {
       id: plan.id,
       planDate: plan.planDate || planDate,
       orders: payload.orders,
@@ -10029,13 +12331,6 @@ app.put("/api/dispatch/plan", async (req, res, next) => {
       trucks: payload.trucks
     });
     if (dependencyConflicts.length) return sendDispatchDependencyConflictResponse(res, dependencyConflicts);
-    const assignmentConflicts = await dispatchLoadAssignmentConflicts(previousPlan, {
-      ...previousPlan,
-      planDate: plan.planDate || planDate,
-      orders: payload.orders,
-      trucks: payload.trucks
-    });
-    if (assignmentConflicts.length) return sendDispatchLoadAssignmentConflictResponse(res, assignmentConflicts);
     const savedPlan = await saveDispatchPlanSnapshot(plan.id, {
       orders: payload.orders,
       trucks: payload.trucks,
@@ -10166,6 +12461,10 @@ app.get("/dispatch/planning", (req, res) => {
 
 app.get("/dispatch/custom-orders", (req, res) => {
   res.sendFile(path.join(publicDir, "dispatch-custom-orders.html"));
+});
+
+app.get(["/dispatch/driver-pwa", "/dispatch/offline-review"], (req, res) => {
+  res.sendFile(path.join(publicDir, "dispatch-offline-review.html"));
 });
 
 app.get("/dispatch/setup", (req, res) => {
@@ -10444,6 +12743,29 @@ app.post("/api/operator/photo-upload-token", requireOperator, async (req, res, n
   }
 });
 
+app.use("/api/driver", (_req, res, next) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("Pragma", "no-cache");
+  next();
+});
+
+app.use("/api/driver", driverPwaVersionGate);
+
+app.get("/api/driver/client-version", (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Vary", DRIVER_PWA_VERSION_HEADER);
+  res.json({
+    ...driverPwaVersionDetails(req.get(DRIVER_PWA_VERSION_HEADER)),
+    preserveLocalEvidence: true,
+    guidance: "If reopenRequired is true, do not clear browser data. Close every Driver PWA window, then reopen it to load the latest version."
+  });
+});
+
+app.get("/api/driver/network-health", (_req, res) => {
+  res.json({ ok: true, checkedAt: new Date().toISOString() });
+});
+
 app.post("/api/driver/login", async (req, res, next) => {
   try {
     const login = String(req.body?.username || req.body?.login || "").trim().toLowerCase();
@@ -10462,8 +12784,13 @@ app.post("/api/driver/login", async (req, res, next) => {
       }
       return res.status(401).json({ error: "Invalid driver login." });
     }
-    const token = crypto.randomBytes(32).toString("base64url");
-    driverSessions.set(token, { login, createdAt: new Date().toISOString() });
+    const sessionResult = await createDriverSession(login, {
+      deviceId: req.get("x-mbbs-driver-device") || req.body?.deviceId || "",
+      metadata: {
+        ip: req.ip || "",
+        userAgent: req.get("user-agent") || ""
+      }
+    });
     const dayState = await getDriverDayState(login, { samsaraAccounts: samsaraAccountsForDriver(driver) });
     await writeAudit({
       actorType: "driver",
@@ -10471,7 +12798,7 @@ app.post("/api/driver/login", async (req, res, next) => {
       action: "driver.login",
       details: { login, ip: req.ip || "", userAgent: req.get("user-agent") || "" }
     });
-    res.json({ token, driver: publicDriver(driver), dayState });
+    res.json({ token: sessionResult.token, driver: publicDriver(driver), dayState });
   } catch (error) {
     next(error);
   }
@@ -10481,17 +12808,126 @@ app.get("/api/driver/me", requireDriver, (req, res) => {
   res.json({ driver: publicDriver(req.driver) });
 });
 
-app.post("/api/driver/photo-upload-token", requireDriver, async (req, res, next) => {
+app.post("/api/driver/sync-status", requireDriver, async (req, res, next) => {
+  try {
+    // Telemetry identity comes only from the authenticated session plus the
+    // device header. Payload fields describe state and cannot select a device.
+    const deviceId = driverDeviceId(req, { required: true, allowBody: false });
+    const result = await recordDriverClientSyncStatus({
+      sessionId: req.driverSession.sessionId,
+      driverLogin: req.driverLogin,
+      deviceId,
+      status: req.body || {}
+    });
+    emitAppEvent("driver.offline.sync-status", {
+      driverLogin: req.driverLogin,
+      deviceId,
+      state: result.syncStatus.state,
+      planDate: result.syncStatus.planDate,
+      reportedAt: result.syncStatus.serverReceivedAt
+    });
+    res.json({ ok: true, syncStatus: result.syncStatus });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/driver/day-plan", requireDriver, async (req, res, next) => {
+  try {
+    const deviceId = driverDeviceId(req, { required: true });
+    const requestedDate = req.query.date ? normalizePlanDate(req.query.date) : "";
+    const dayState = await getDriverDayState(req.driverLogin, {
+      samsaraAccounts: samsaraAccountsForDriver(req.driver),
+      date: requestedDate
+    });
+    const planDate = requestedDate || normalizePlanDate(dayState.planDate);
+    const materialized = await getDriverDayJobs(req.driverLogin, { date: planDate });
+    if (!materialized.planId || !materialized.jobs.length) {
+      return res.status(404).json({
+        code: "DRIVER_PLAN_NOT_FOUND",
+        error: "No confirmed route is assigned to this driver for that date."
+      });
+    }
+    const latest = await getLatestDriverOfflineManifest(req.driverLogin, deviceId, planDate);
+    const forceRefresh = String(req.query.forceRefresh || "") === "1";
+    let manifest;
+    if (
+      !forceRefresh
+      && latest?.complete
+      && String(latest.planId ?? "") === String(materialized.planId)
+      && Number(latest.planRevision || 0) === Number(materialized.revision || 0)
+      && new Date(latest.expiresAt).getTime() > Date.now()
+      && driverOfflineManifestMatchesJobs(
+        latest,
+        materialized.jobs,
+        req.driverLogin,
+        { requireComplete: true }
+      )
+    ) {
+      const grant = await issueDriverOfflineSyncGrant(latest.manifestId, {
+        driverLogin: req.driverLogin,
+        deviceId
+      });
+      manifest = {
+        ...latest,
+        driver: publicDriver(req.driver),
+        dayState,
+        samsaraWorkflowEnabled: driverSamsaraWorkflowEnabled(req.driver),
+        offlineSyncGrant: grant.token
+      };
+    } else {
+      manifest = await persistDriverOfflineDayPlan({
+        driverLogin: req.driverLogin,
+        deviceId,
+        planMetadata: {
+          planId: materialized.planId,
+          planDate: materialized.planDate,
+          planRevision: materialized.revision
+        },
+        jobs: materialized.jobs,
+        driverProfile: publicDriver(req.driver),
+        dayState,
+        samsaraWorkflowEnabled: driverSamsaraWorkflowEnabled(req.driver)
+      });
+    }
+    res.json(manifest);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/driver/photo-upload-token", requireDriverOrOfflineGrant, async (req, res, next) => {
   try {
     const body = req.body || {};
+    const offlineUpload = Boolean(req.driverOfflineAuthorization || body.offlineEventUpload === true);
     if (
-      !driverSamsaraWorkflowEnabled(req.driver)
+      req.driver
+      && !offlineUpload
+      && !driverSamsaraWorkflowEnabled(req.driver)
       && (
         String(body.recordType || "").toLowerCase().includes("dvir")
         || ["pre", "post"].includes(String(body.dvirType || "").toLowerCase())
       )
     ) {
       return driverSamsaraDisabledResponse(res);
+    }
+    const declaredBytes = Number(body.byteSize || 0);
+    if (offlineUpload && (!Number.isInteger(declaredBytes) || declaredBytes < 1 || declaredBytes > 2 * 1024 * 1024)) {
+      return res.status(400).json({ error: "Offline photo size must be between 1 byte and 2 MB." });
+    }
+    let registeredPhoto = null;
+    if (offlineUpload) {
+      registeredPhoto = await authorizeOfflinePhotoUpload({
+        photoId: body.photoId,
+        driverLogin: req.driverLogin,
+        deviceId: driverDeviceId(req, { required: true }),
+        manifestId: body.manifestId,
+        eventId: body.eventId,
+        recordType: body.recordType,
+        mimeType: body.mimeType,
+        byteSize: declaredBytes,
+        sha256: body.sha256
+      });
     }
     res.json(createPhotoUploadToken({
       actor: {
@@ -10501,7 +12937,7 @@ app.post("/api/driver/photo-upload-token", requireDriver, async (req, res, next)
         role: "driver"
       },
       source: "driver",
-      recordType: body.recordType || "driver-stop-photo",
+      recordType: registeredPhoto?.recordType || body.recordType || "driver-stop-photo",
       metadata: {
         orderType: body.orderType,
         orderId: body.orderId,
@@ -10510,10 +12946,107 @@ app.post("/api/driver/photo-upload-token", requireDriver, async (req, res, next)
         stopId: body.stopId,
         planId: body.planId,
         loadId: body.loadId,
-        jobId: body.jobId,
-        dvirType: body.dvirType
-      }
+        jobId: registeredPhoto?.jobId || body.jobId,
+        dvirType: registeredPhoto?.dvirType || body.dvirType,
+        manifestId: body.manifestId,
+        eventId: body.eventId,
+        photoId: body.photoId,
+        deviceId: driverDeviceId(req),
+        sha256: body.sha256,
+        byteSize: declaredBytes || undefined,
+        mimeType: body.mimeType
+      },
+      options: offlineUpload
+        ? { maxBytes: declaredBytes, allowedTypes: ["image/jpeg"] }
+        : {}
     }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/driver/offline-sync", requireDriverOrOfflineGrant, async (req, res, next) => {
+  try {
+    const manifestId = String(req.body?.manifestId || "");
+    const deviceId = driverDeviceId(req, { required: true });
+    if (req.body?.deviceId && String(req.body.deviceId).trim() !== deviceId) {
+      return res.status(409).json({
+        code: "DRIVER_DEVICE_MISMATCH",
+        error: "The offline sync body and device header do not match."
+      });
+    }
+    const registration = await registerDriverOfflineSync({
+      driverLogin: req.driverLogin,
+      deviceId,
+      manifestId,
+      events: Array.isArray(req.body?.events) ? req.body.events : [],
+      photoReceipts: Array.isArray(req.body?.photoReceipts) ? req.body.photoReceipts : []
+    });
+    const photoResults = [];
+    for (const photo of registration.photos || []) {
+      if (photo.durableReceipt || photo.status === "durably_received") {
+        photoResults.push(photo);
+        continue;
+      }
+      try {
+        const verified = await verifyDriverOfflinePhotoObject(photo, {
+          id: req.driverLogin,
+          login: req.driverLogin,
+          role: "driver"
+        });
+        photoResults.push(await markDriverOfflinePhotoDurable(photo.photoId, {
+          objectReference: photo.objectReference,
+          ...verified
+        }));
+      } catch (error) {
+        const errorCode = String(error?.code || "OFFLINE_PHOTO_VERIFICATION_FAILED").slice(0, 160);
+        const errorMessage = String(error?.message || error || "Photo read-back verification failed.").slice(0, 2000);
+        const failed = await recordDriverOfflinePhotoVerificationFailure(photo.photoId, {
+          errorCode,
+          errorMessage
+        });
+        photoResults.push({
+          ...failed,
+          status: "uploaded_unverified",
+          durableReceipt: false,
+          errorCode,
+          error: errorMessage
+        });
+      }
+    }
+    const manifest = req.driverOfflineAuthorization?.manifest
+      || await getDriverOfflineManifest(manifestId, {
+        driverLogin: req.driverLogin,
+        deviceId,
+        touch: false
+      });
+    const queueResults = await processDriverOfflineQueue({
+      driverLogin: req.driverLogin,
+      planDate: manifest.planDate,
+      deviceId,
+      applyEvent: applyDriverOfflineEvent
+    });
+    const eventResults = [];
+    for (const submitted of Array.isArray(req.body?.events) ? req.body.events : []) {
+      const stored = await getDriverOfflineEvent(submitted.eventId);
+      if (stored) eventResults.push(stored);
+    }
+    const summary = await getDriverOfflineSyncSummary(manifestId);
+    const payload = {
+      manifestId,
+      receivedAt: registration.receivedAt,
+      events: eventResults,
+      photos: photoResults,
+      ...summary
+    };
+    if (queueResults.some((event) => event?.foregroundExecuting)) {
+      return res.status(425).json({
+        ...payload,
+        code: "DRIVER_FOREGROUND_ACTION_IN_PROGRESS",
+        error: "The online driver action is still finishing. Synchronization will retry."
+      });
+    }
+    res.json(payload);
   } catch (error) {
     next(error);
   }
@@ -10546,17 +13079,22 @@ app.get("/api/driver/history", requireDriver, async (req, res, next) => {
 
 app.post("/api/driver/logout", requireDriver, async (req, res, next) => {
   try {
-    const state = await getDriverDayState(req.driverLogin, {
-      samsaraAccounts: samsaraAccountsForDriver(req.driver)
-    });
-    if (
-      state.samsaraEnabled
-      && state.preDvirStatus === "complete"
-      && state.postDvirStatus !== "complete"
-    ) {
-      return res.status(409).json({ error: "MBBS post-trip inspection is required before logout.", state });
-    }
-    driverSessions.delete(driverToken(req));
+    await Promise.all([
+      revokeDriverSession(driverToken(req)),
+      revokeDriverOfflineGrants({
+        driverLogin: req.driverLogin,
+        deviceId: req.driverSession?.deviceId || driverDeviceId(req)
+      })
+    ]);
+    await writeAudit({
+      actorType: "driver",
+      source: "auth",
+      action: "driver.logout",
+      details: {
+        login: req.driverLogin,
+        deviceId: req.driverSession?.deviceId || ""
+      }
+    }).catch(() => null);
     res.json({ ok: true });
   } catch (error) {
     next(error);
@@ -10573,31 +13111,986 @@ app.post("/api/driver/dvir", requireDriver, async (req, res, next) => {
     if (type === "post" && !state.allJobsComplete) {
       return res.status(409).json({ error: "MBBS post-trip inspection is only available after all assigned stops are complete.", state });
     }
-    const result = await submitDriverDvir(req.driverLogin, {
+    const foregroundDvirEvent = await requireRegisteredForegroundDvirEvidence(
+      req,
       type,
-      photoDataUrls,
-      samsaraAccounts,
-      samsaraDvirAuthorId: (await readDispatchSetup()).samsara?.dvirAuthorId || config.samsara.dvirAuthorId || ""
-    });
-    writeAudit({
-      actorType: "driver",
-      source: "samsara",
-      action: type === "post" ? "driver.post_dvir.submitted" : "driver.pre_dvir.submitted",
-      details: {
-        driverLogin: req.driverLogin,
-        samsaraUsername: result.samsaraUsername || "",
-        samsaraAccount: result.samsaraAccount || "",
-        truckPlate: result.state?.truckPlate || "",
-        planDate: result.state?.planDate || "",
-        samsaraError: result.samsaraError || ""
+      photoDataUrls
+    );
+    const receipt = await beginDriverForegroundAction(req, "dvir_captured", type);
+    const result = await runDriverForegroundAction(receipt, async () => {
+      const liveState = await getDriverDayState(req.driverLogin, { samsaraAccounts });
+      if (foregroundDvirEvent) {
+        const lockedEvent = await getDriverOfflineEvent(foregroundDvirEvent.eventId);
+        if (lockedEvent?.result?.samsaraReconciled === true) {
+          return {
+            state: liveState,
+            samsaraError: "",
+            alreadyReconciled: true,
+            foregroundEventId: receipt?.eventId || "",
+            pendingOnline: false,
+            samsaraReconciled: true
+          };
+        }
+        const competingOfflineReceipt = await getDriverOfflineReconciliationReceipt(
+          foregroundDvirEvent.eventId
+        );
+        if (competingOfflineReceipt) {
+          throw Object.assign(
+            new Error(
+              competingOfflineReceipt.status === "executing"
+                ? "A Samsara inspection reconciliation is already running or has an uncertain outcome."
+                : "This inspection already has a competing Samsara reconciliation receipt."
+            ),
+            {
+              status: 409,
+              code: "DRIVER_DVIR_COMPETING_RECONCILIATION",
+              competingReceiptStatus: competingOfflineReceipt.status
+            }
+          );
+        }
+        if (
+          lockedEvent?.status !== "applied"
+          || lockedEvent.result?.pendingOnline !== true
+        ) {
+          throw Object.assign(
+            new Error("The registered inspection event changed before its Samsara action could run."),
+            { status: 409, code: "DRIVER_FOREGROUND_STATE_CONFLICT" }
+          );
+        }
       }
-    }).catch(() => {});
-    emitAppEvent("driver.dvir.submitted", {
-      driverLogin: req.driverLogin,
-      type,
-      truckPlate: result.state?.truckPlate || "",
-      samsaraError: result.samsaraError || ""
+      if (
+        receipt
+        &&
+        normalizedPlate(receipt.eventContext.truckPlate)
+        !== normalizedPlate(liveState.truckPlate)
+      ) {
+        throw Object.assign(
+          new Error("The assigned truck changed after these inspection photos were captured."),
+          { status: 409, code: "DRIVER_FOREGROUND_TRUCK_CHANGED" }
+        );
+      }
+      if (type === "post" && !liveState.allJobsComplete) {
+        throw Object.assign(
+          new Error("MBBS post-trip inspection is only available after all assigned stops are complete."),
+          { status: 409, code: "DRIVER_POST_DVIR_TOO_EARLY" }
+        );
+      }
+      const submitted = await submitDriverDvir(req.driverLogin, {
+        type,
+        photoDataUrls,
+        samsaraAccounts,
+        samsaraDvirAuthorId: (await readDispatchSetup()).samsara?.dvirAuthorId || config.samsara.dvirAuthorId || ""
+      });
+      if (receipt && submitted.samsaraError) {
+        throw Object.assign(new Error(submitted.samsaraError), {
+          status: 409,
+          code: "DRIVER_SAMSARA_DVIR_NOT_CONFIRMED"
+        });
+      }
+      if (foregroundDvirEvent) {
+        const confirmed = type === "post"
+          ? submitted.state?.samsaraPostDvirConfirmed === true
+          : submitted.state?.samsaraPreDvirConfirmed === true;
+        if (!confirmed) {
+          throw Object.assign(new Error("Samsara did not durably confirm the inspection."), {
+            status: 409,
+            code: "DRIVER_SAMSARA_DVIR_NOT_CONFIRMED"
+          });
+        }
+        const updatedEvent = await query(
+          `UPDATE driver_offline_events
+              SET application_result = COALESCE(application_result, '{}'::jsonb) || $2::jsonb,
+                  updated_at = now()
+            WHERE event_id = $1::uuid
+              AND status = 'applied'
+              AND event_type = 'dvir_captured'
+          RETURNING event_id`,
+          [
+            foregroundDvirEvent.eventId,
+            JSON.stringify({
+              pendingOnline: false,
+              interactiveSamsaraSubmissionRequired: false,
+              samsaraReconciled: true,
+              samsaraReconciledAt: new Date().toISOString()
+            })
+          ]
+        );
+        if (!updatedEvent.rowCount) {
+          throw Object.assign(new Error("The registered inspection event changed while Samsara was being updated."), {
+            status: 409,
+            code: "DRIVER_FOREGROUND_STATE_CONFLICT"
+          });
+        }
+      }
+      await writeAudit({
+        actorType: "driver",
+        source: "samsara",
+        action: type === "post" ? "driver.post_dvir.submitted" : "driver.pre_dvir.submitted",
+        details: {
+          driverLogin: req.driverLogin,
+          samsaraUsername: submitted.samsaraUsername || "",
+          samsaraAccount: submitted.samsaraAccount || "",
+          truckPlate: submitted.state?.truckPlate || "",
+          planDate: submitted.state?.planDate || "",
+          samsaraError: submitted.samsaraError || "",
+          eventId: receipt?.eventId || ""
+        }
+      }).catch(() => {});
+      emitAppEvent("driver.dvir.submitted", {
+        driverLogin: req.driverLogin,
+        type,
+        truckPlate: submitted.state?.truckPlate || "",
+        samsaraError: submitted.samsaraError || ""
+      });
+      return {
+        ...submitted,
+        ...(receipt ? {
+          foregroundEventId: receipt.eventId,
+          pendingOnline: false,
+          samsaraReconciled: true
+        } : {})
+      };
     });
+    res.json(result);
+  } catch (error) {
+    const eventId = String(req.body?.eventId || "").trim().toLowerCase();
+    if (
+      eventId
+      && [
+        "DRIVER_FOREGROUND_OUTCOME_UNCERTAIN",
+        "DRIVER_FOREGROUND_DVIR_EVIDENCE_MISMATCH"
+      ].includes(String(error?.code || ""))
+    ) {
+      const event = await getDriverOfflineEvent(eventId).catch(() => null);
+      if (
+        event
+        && event.eventType === "dvir_captured"
+        && String(event.driverLogin).toLowerCase() === String(req.driverLogin).toLowerCase()
+      ) {
+        const reviewed = await markAppliedDriverOfflineReconciliationReview(
+          event,
+          String(error?.message || "The online Samsara inspection outcome requires review."),
+          {
+            code: String(error?.code || "DRIVER_FOREGROUND_OUTCOME_UNCERTAIN"),
+            pendingOnline: false,
+            interactiveSamsaraSubmissionRequired: false,
+            reconciliationOutcomeUncertain: true
+          }
+        ).catch(() => null);
+        if (reviewed) {
+          return res.status(409).json({
+            error: reviewed.error || error.message,
+            code: error.code,
+            reviewRequired: true,
+            eventId: reviewed.eventId
+          });
+        }
+      }
+    }
+    next(error);
+  }
+});
+
+const DRIVER_OFFLINE_RECONCILIATION_EXECUTING_MS = 5 * 60 * 1000;
+
+async function markAppliedDriverOfflineReconciliationReview(event, reason, result = {}) {
+  await query(
+    `UPDATE driver_offline_events
+        SET status = 'review_required',
+            review_reason = $2,
+            application_result = COALESCE(application_result, '{}'::jsonb) || $3::jsonb,
+            case_version = case_version + 1,
+            updated_at = now()
+      WHERE event_id = $1::uuid
+        AND status = 'applied'`,
+    [event.eventId, String(reason || "Samsara reconciliation requires review."), JSON.stringify(result || {})]
+  );
+  return {
+    reviewRequired: true,
+    eventId: event.eventId,
+    error: String(reason || "Samsara reconciliation requires review.")
+  };
+}
+
+async function mergeAppliedDriverOfflineReconciliationResult(eventId, result, completionMarker) {
+  const updated = await query(
+    `UPDATE driver_offline_events
+        SET application_result = COALESCE(application_result, '{}'::jsonb) || $2::jsonb,
+            updated_at = now()
+      WHERE event_id = $1::uuid
+        AND status = 'applied'
+        AND NOT (COALESCE(application_result, '{}'::jsonb) @> $3::jsonb)
+    RETURNING event_id`,
+    [eventId, JSON.stringify(result || {}), JSON.stringify(completionMarker || {})]
+  );
+  return updated.rowCount > 0;
+}
+
+function recentExecutingDriverOfflineReconciliation(receipt) {
+  return receipt?.status === "executing"
+    && Date.now() - new Date(receipt.startedAt || 0).getTime()
+      < DRIVER_OFFLINE_RECONCILIATION_EXECUTING_MS;
+}
+
+async function lockDriverOfflineReconciliation(event) {
+  await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
+  await query(
+    "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
+    [String(event.driverLogin).toLowerCase(), String(event.planDate).slice(0, 10)]
+  );
+}
+
+app.post("/api/driver/offline-events/:eventId/reconcile-dvir", requireDriver, async (req, res, next) => {
+  try {
+    if (!driverSamsaraWorkflowEnabled(req.driver)) return driverSamsaraDisabledResponse(res);
+    const samsaraAccounts = samsaraAccountsForDriver(req.driver);
+    const preparation = await withTransaction(async () => {
+      const event = await getDriverOfflineEvent(req.params.eventId);
+      if (
+        !event
+        || event.eventType !== "dvir_captured"
+        || String(event.driverLogin).toLowerCase() !== String(req.driverLogin).toLowerCase()
+      ) {
+        throw Object.assign(new Error("Pending offline inspection was not found."), { status: 404 });
+      }
+      await lockDriverOfflineReconciliation(event);
+      const lockedEvent = await getDriverOfflineEvent(req.params.eventId);
+      if (lockedEvent.result?.samsaraReconciled === true) {
+        return { response: {
+          alreadyReconciled: true,
+          state: await getDriverDayState(req.driverLogin, {
+            samsaraAccounts,
+            date: lockedEvent.planDate
+          }),
+          reconciliation: lockedEvent.result
+        } };
+      }
+      if (lockedEvent.status !== "applied" || lockedEvent.result?.pendingOnline !== true) {
+        throw Object.assign(
+          new Error("This inspection is not ready for online Samsara reconciliation."),
+          { status: 409, code: "DRIVER_OFFLINE_DVIR_NOT_READY" }
+        );
+      }
+      const dateSafety = driverOfflineReconciliationDateSafety(
+        lockedEvent.planDate,
+        localDateDaysAgo(0)
+      );
+      if (!dateSafety.allowed) {
+        return {
+          response: await markAppliedDriverOfflineReconciliationReview(
+            lockedEvent,
+            dateSafety.reason,
+            {
+              pendingOnline: false,
+              interactiveSamsaraSubmissionRequired: false,
+              reconciliationConflict: true,
+              reconciliationDateBlocked: true
+            }
+          ),
+          status: 409
+        };
+      }
+      const [manifest, currentPlan] = await Promise.all([
+        getDriverOfflineManifest(lockedEvent.manifestId, {
+          driverLogin: lockedEvent.driverLogin,
+          deviceId: lockedEvent.deviceId,
+          touch: false
+        }),
+        getDriverDayJobs(req.driverLogin, { date: lockedEvent.planDate })
+      ]);
+      const currentState = await getDriverDayState(req.driverLogin, {
+        samsaraAccounts,
+        date: lockedEvent.planDate
+      });
+      const capturedTruckPlate = lockedEvent.details?.truckPlate
+        || manifest?.dayState?.truckPlate
+        || "";
+      const planMatches = String(manifest?.planId ?? "") === String(currentPlan?.planId ?? "")
+        && Number(manifest?.planRevision || 0) === Number(currentPlan?.revision || 0);
+      const truckMatches = Boolean(capturedTruckPlate)
+        && normalizedPlate(capturedTruckPlate) === normalizedPlate(currentState.truckPlate);
+      if (!planMatches || !truckMatches) {
+        const reason = !planMatches
+          ? "The dispatch plan changed after this offline inspection was captured."
+          : `The inspection was captured for ${capturedTruckPlate}, but the current assigned truck is ${currentState.truckPlate || "unknown"}.`;
+        return {
+          response: await markAppliedDriverOfflineReconciliationReview(
+            lockedEvent,
+            reason,
+            {
+              pendingOnline: false,
+              interactiveSamsaraSubmissionRequired: false,
+              reconciliationConflict: true,
+              capturedTruckPlate,
+              currentTruckPlate: currentState.truckPlate || "",
+              currentPlanId: currentPlan.planId,
+              currentPlanRevision: currentPlan.revision
+            }
+          ),
+          status: 409
+        };
+      }
+      const photoReferences = requiredPhotoDataUrls(
+        (lockedEvent.photos || [])
+          .filter((photo) => photo.durableReceipt)
+          .map((photo) => photo.objectReference),
+        4
+      );
+      const type = lockedEvent.details?.dvirType === "post" ? "post" : "pre";
+      if (type === "post" && !currentState.allJobsComplete) {
+        throw Object.assign(
+          new Error("The saved post-trip inspection cannot be submitted until all assigned stops are complete."),
+          { status: 409, code: "DRIVER_POST_DVIR_TOO_EARLY" }
+        );
+      }
+      return {
+        event: lockedEvent,
+        manifest,
+        currentPlan,
+        currentState,
+        capturedTruckPlate,
+        photoReferences,
+        type
+      };
+    });
+    if (preparation.response) {
+      return res.status(preparation.status || 200).json(preparation.response);
+    }
+
+    let receiptStart;
+    try {
+      receiptStart = await beginDriverOfflineReconciliationReceipt({
+        eventId: preparation.event.eventId,
+        driverLogin: preparation.event.driverLogin,
+        deviceId: preparation.event.deviceId,
+        actionType: "dvir",
+        context: {
+          manifestId: preparation.event.manifestId,
+          planId: preparation.manifest.planId,
+          planDate: preparation.event.planDate,
+          planRevision: preparation.manifest.planRevision,
+          dvirType: preparation.type,
+          truckPlate: preparation.capturedTruckPlate,
+          photos: (preparation.event.photos || []).map((photo) => ({
+            photoId: photo.photoId,
+            sha256: photo.sha256,
+            objectReference: photo.objectReference
+          }))
+        }
+      });
+    } catch (error) {
+      if (error?.code !== "DRIVER_OFFLINE_RECONCILIATION_IDEMPOTENCY_CONFLICT") throw error;
+      const review = await markAppliedDriverOfflineReconciliationReview(
+        preparation.event,
+        "The saved inspection evidence no longer matches its Samsara reconciliation receipt.",
+        {
+          pendingOnline: false,
+          interactiveSamsaraSubmissionRequired: false,
+          reconciliationOutcomeUncertain: true
+        }
+      );
+      return res.status(409).json({ ...review, code: error.code });
+    }
+    let result = null;
+    let eventChanged = false;
+    if (!receiptStart.execute) {
+      if (receiptStart.receipt.status === "applied") {
+        result = receiptStart.receipt.result;
+      } else if (recentExecutingDriverOfflineReconciliation(receiptStart.receipt)) {
+        return res.status(425).json({
+          code: "DRIVER_OFFLINE_RECONCILIATION_IN_PROGRESS",
+          error: "The Samsara inspection reconciliation is still running."
+        });
+      } else {
+        if (receiptStart.receipt.status === "executing") {
+          await markDriverOfflineReconciliationReceiptUncertain(
+            receiptStart.receipt.receiptId,
+            Object.assign(new Error("A previous Samsara inspection attempt ended without a durable outcome."), {
+              code: "DRIVER_OFFLINE_RECONCILIATION_STALE_EXECUTION"
+            })
+          );
+        }
+        const review = await markAppliedDriverOfflineReconciliationReview(
+          preparation.event,
+          receiptStart.receipt.errorMessage
+            || "A previous Samsara inspection attempt has an uncertain outcome.",
+          {
+            pendingOnline: false,
+            interactiveSamsaraSubmissionRequired: false,
+            reconciliationOutcomeUncertain: true
+          }
+        );
+        return res.status(409).json(review);
+      }
+    } else {
+      let attempt;
+      try {
+        attempt = await withTransaction(async () => {
+          await lockDriverOfflineReconciliation(preparation.event);
+          const finalizeReview = async (reason, reviewResult) => {
+            await releaseDriverOfflineReconciliationReceipt(receiptStart.receipt.receiptId);
+            return {
+              reviewResponse: await markAppliedDriverOfflineReconciliationReview(
+                preparation.event,
+                reason,
+                reviewResult
+              )
+            };
+          };
+          const lockedEvent = await getDriverOfflineEvent(preparation.event.eventId);
+          if (lockedEvent?.result?.samsaraReconciled === true) {
+            const alreadyResult = {
+              alreadyReconciled: true,
+              reconciliation: lockedEvent.result
+            };
+            await completeDriverOfflineReconciliationReceipt(
+              receiptStart.receipt.receiptId,
+              alreadyResult
+            );
+            return { result: alreadyResult };
+          }
+          const competingForegroundReceipt = await query(
+            `SELECT status, error_code, error_message
+               FROM driver_foreground_action_receipts
+              WHERE event_id = $1::uuid
+              LIMIT 1
+              FOR UPDATE`,
+            [preparation.event.eventId]
+          );
+          if (competingForegroundReceipt.rowCount) {
+            const competing = competingForegroundReceipt.rows[0];
+            return finalizeReview(
+              competing.status === "executing"
+                ? "The online Samsara inspection is still running or ended without a durable outcome."
+                : competing.error_message
+                  || "The online Samsara inspection has a competing durable receipt.",
+              {
+                pendingOnline: false,
+                interactiveSamsaraSubmissionRequired: false,
+                reconciliationConflict: true,
+                reconciliationOutcomeUncertain: true,
+                competingReceipt: "foreground",
+                competingReceiptStatus: competing.status,
+                competingReceiptErrorCode: competing.error_code || ""
+              }
+            );
+          }
+          if (
+            lockedEvent?.status !== "applied"
+            || lockedEvent.result?.pendingOnline !== true
+          ) {
+            return finalizeReview(
+              "The offline inspection changed while Samsara reconciliation was being prepared.",
+              {
+                pendingOnline: false,
+                interactiveSamsaraSubmissionRequired: false,
+                reconciliationConflict: true
+              }
+            );
+          }
+          const dateSafety = driverOfflineReconciliationDateSafety(
+            lockedEvent.planDate,
+            localDateDaysAgo(0)
+          );
+          if (!dateSafety.allowed) {
+            return finalizeReview(
+              dateSafety.reason,
+              {
+                pendingOnline: false,
+                interactiveSamsaraSubmissionRequired: false,
+                reconciliationConflict: true,
+                reconciliationDateBlocked: true
+              }
+            );
+          }
+          const currentPlan = await getDriverDayJobs(req.driverLogin, {
+            date: lockedEvent.planDate
+          });
+          const currentState = await getDriverDayState(req.driverLogin, {
+            samsaraAccounts,
+            date: lockedEvent.planDate
+          });
+          const capturedTruckPlate = lockedEvent.details?.truckPlate
+            || preparation.manifest?.dayState?.truckPlate
+            || "";
+          const lockedPhotoReferences = requiredPhotoDataUrls(
+            (lockedEvent.photos || [])
+              .filter((photo) => photo.durableReceipt)
+              .map((photo) => photo.objectReference),
+            4
+          );
+          const planMatches = String(preparation.manifest?.planId ?? "") === String(currentPlan?.planId ?? "")
+            && Number(preparation.manifest?.planRevision || 0) === Number(currentPlan?.revision || 0);
+          const truckMatches = Boolean(capturedTruckPlate)
+            && normalizedPlate(capturedTruckPlate) === normalizedPlate(currentState.truckPlate);
+          const evidenceMatches = preparation.type === (lockedEvent.details?.dvirType === "post" ? "post" : "pre")
+            && normalizedPlate(capturedTruckPlate) === normalizedPlate(preparation.capturedTruckPlate)
+            && JSON.stringify(lockedPhotoReferences) === JSON.stringify(preparation.photoReferences);
+          if (!planMatches || !truckMatches || !evidenceMatches) {
+            return finalizeReview(
+              !planMatches
+                ? "The dispatch plan changed before the saved inspection reached Samsara."
+                : !truckMatches
+                  ? "The assigned truck changed before the saved inspection reached Samsara."
+                  : "The saved inspection evidence changed before it reached Samsara.",
+              {
+                pendingOnline: false,
+                interactiveSamsaraSubmissionRequired: false,
+                reconciliationConflict: true,
+                capturedTruckPlate,
+                currentTruckPlate: currentState.truckPlate || "",
+                currentPlanId: currentPlan.planId,
+                currentPlanRevision: currentPlan.revision
+              }
+            );
+          }
+          if (preparation.type === "post" && !currentState.allJobsComplete) {
+            return finalizeReview(
+              "The route changed before its saved post-trip inspection reached Samsara.",
+              {
+                pendingOnline: false,
+                interactiveSamsaraSubmissionRequired: false,
+                reconciliationConflict: true
+              }
+            );
+          }
+          const dvir = await submitDriverDvir(req.driverLogin, {
+            type: preparation.type,
+            photoDataUrls: lockedPhotoReferences,
+            samsaraAccounts,
+            samsaraDvirAuthorId: (await readDispatchSetup()).samsara?.dvirAuthorId || config.samsara.dvirAuthorId || ""
+          });
+          const confirmed = preparation.type === "post"
+            ? dvir.state?.samsaraPostDvirConfirmed === true
+            : dvir.state?.samsaraPreDvirConfirmed === true;
+          const reconciliation = {
+            pendingOnline: !confirmed,
+            interactiveSamsaraSubmissionRequired: !confirmed,
+            samsaraReconciled: confirmed,
+            samsaraReconciledAt: confirmed ? new Date().toISOString() : null,
+            samsaraLastAttemptAt: new Date().toISOString(),
+            samsaraError: dvir.samsaraError || "",
+            dvirType: preparation.type,
+            photoCount: lockedPhotoReferences.length
+          };
+          const attemptResult = { ...dvir, reconciliation };
+          if (!confirmed || dvir.samsaraError) {
+            throw Object.assign(
+              new Error(dvir.samsaraError || "Samsara did not durably confirm the inspection."),
+              {
+                code: "DRIVER_OFFLINE_DVIR_OUTCOME_UNCERTAIN",
+                reconciliationResult: attemptResult
+              }
+            );
+          }
+          const eventChanged = await mergeAppliedDriverOfflineReconciliationResult(
+            preparation.event.eventId,
+            reconciliation,
+            { samsaraReconciled: true }
+          );
+          if (!eventChanged) {
+            throw Object.assign(
+              new Error("The offline inspection changed while its confirmed Samsara result was being saved."),
+              {
+                code: "DRIVER_OFFLINE_DVIR_OUTCOME_UNCERTAIN",
+                reconciliationResult: attemptResult
+              }
+            );
+          }
+          await completeDriverOfflineReconciliationReceipt(
+            receiptStart.receipt.receiptId,
+            attemptResult
+          );
+          return { result: attemptResult, eventChanged: true };
+        });
+      } catch (error) {
+        const uncertainResult = error?.reconciliationResult || {};
+        await markDriverOfflineReconciliationReceiptUncertain(
+          receiptStart.receipt.receiptId,
+          error,
+          uncertainResult
+        );
+        const reconciliation = uncertainResult.reconciliation || {};
+        const review = await markAppliedDriverOfflineReconciliationReview(
+          preparation.event,
+          "The Samsara inspection attempt did not finish cleanly and will not be replayed automatically.",
+          {
+            ...reconciliation,
+            pendingOnline: false,
+            interactiveSamsaraSubmissionRequired: false,
+            reconciliationOutcomeUncertain: true,
+            reconciliationError: String(error?.message || error || "")
+          }
+        );
+        return res.status(409).json(review);
+      }
+      if (attempt.reviewResponse) {
+        return res.status(409).json(attempt.reviewResponse);
+      }
+      result = attempt.result;
+      eventChanged = attempt.eventChanged === true;
+    }
+
+    if (!result?.reconciliation?.samsaraReconciled) {
+      const review = await markAppliedDriverOfflineReconciliationReview(
+        preparation.event,
+        "The stored Samsara inspection receipt is not a confirmed reconciliation.",
+        {
+          pendingOnline: false,
+          interactiveSamsaraSubmissionRequired: false,
+          reconciliationOutcomeUncertain: true
+        }
+      );
+      return res.status(409).json(review);
+    }
+    const changed = eventChanged || await mergeAppliedDriverOfflineReconciliationResult(
+      preparation.event.eventId,
+      result.reconciliation,
+      { samsaraReconciled: true }
+    );
+    if (changed) {
+      await writeAudit({
+        actorType: "driver",
+        source: "samsara",
+        action: preparation.type === "post"
+          ? "driver.post_dvir.offline_reconciled"
+          : "driver.pre_dvir.offline_reconciled",
+        details: {
+          driverLogin: req.driverLogin,
+          eventId: preparation.event.eventId,
+          planDate: preparation.event.planDate,
+          truckPlate: result.state?.truckPlate || ""
+        }
+      }).catch(() => null);
+      emitAppEvent("driver.dvir.offline_reconciled", {
+        driverLogin: req.driverLogin,
+        eventId: preparation.event.eventId,
+        type: preparation.type
+      });
+    }
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/driver/offline-events/:eventId/reconcile-duty", requireDriver, async (req, res, next) => {
+  try {
+    if (!driverSamsaraWorkflowEnabled(req.driver)) return driverSamsaraDisabledResponse(res);
+    const samsaraAccounts = samsaraAccountsForDriver(req.driver);
+    const preparation = await withTransaction(async () => {
+      const event = await getDriverOfflineEvent(req.params.eventId);
+      if (
+        !event
+        || event.eventType !== "job_started"
+        || String(event.driverLogin).toLowerCase() !== String(req.driverLogin).toLowerCase()
+      ) {
+        throw Object.assign(new Error("Pending offline duty action was not found."), { status: 404 });
+      }
+      await lockDriverOfflineReconciliation(event);
+      const lockedEvent = await getDriverOfflineEvent(req.params.eventId);
+      if (lockedEvent.result?.samsaraDutyReconciled === true) {
+        return {
+          response: {
+            alreadyReconciled: true,
+            reconciliation: lockedEvent.result
+          }
+        };
+      }
+      if (lockedEvent.status !== "applied" || lockedEvent.result?.samsaraDutyPendingOnline !== true) {
+        throw Object.assign(
+          new Error("This duty action is not ready for online reconciliation."),
+          { status: 409, code: "DRIVER_OFFLINE_DUTY_NOT_READY" }
+        );
+      }
+      const dateSafety = driverOfflineReconciliationDateSafety(
+        lockedEvent.planDate,
+        localDateDaysAgo(0)
+      );
+      if (!dateSafety.allowed) {
+        return {
+          response: await markAppliedDriverOfflineReconciliationReview(
+            lockedEvent,
+            dateSafety.reason,
+            {
+              samsaraDutyPendingOnline: false,
+              samsaraDutyReconciliationConflict: true,
+              reconciliationDateBlocked: true
+            }
+          ),
+          status: 409
+        };
+      }
+      const currentPlan = await getDriverDayJobs(req.driverLogin, { date: lockedEvent.planDate });
+      const effectiveJobId = lockedEvent.effectiveJobId || lockedEvent.jobId;
+      const currentEntry = materializeDriverOfflineJobs(
+        currentPlan.jobs || [],
+        req.driverLogin
+      ).find((entry) => String(entry.snapshot.jobId) === String(effectiveJobId));
+      const identityMatches = currentEntry
+        && currentEntry.fingerprint === lockedEvent.jobFingerprint
+        && currentEntry.predecessorFingerprint === lockedEvent.predecessorFingerprint;
+      if (!identityMatches) {
+        const reason = "The job, predecessor, driver, or truck changed before its Samsara duty action could be reconciled.";
+        return {
+          response: await markAppliedDriverOfflineReconciliationReview(
+            lockedEvent,
+            reason,
+            {
+              samsaraDutyPendingOnline: false,
+              samsaraDutyReconciliationConflict: true,
+              currentPlanId: currentPlan.planId,
+              currentPlanRevision: currentPlan.revision
+            }
+          ),
+          status: 409
+        };
+      }
+      return {
+        event: lockedEvent,
+        currentPlan,
+        currentEntry,
+        effectiveJobId
+      };
+    });
+    if (preparation.response) {
+      return res.status(preparation.status || 200).json(preparation.response);
+    }
+
+    const job = preparation.currentEntry.snapshot;
+    let receiptStart;
+    try {
+      receiptStart = await beginDriverOfflineReconciliationReceipt({
+        eventId: preparation.event.eventId,
+        driverLogin: preparation.event.driverLogin,
+        deviceId: preparation.event.deviceId,
+        actionType: "duty",
+        context: {
+          manifestId: preparation.event.manifestId,
+          planDate: preparation.event.planDate,
+          jobId: preparation.event.jobId,
+          effectiveJobId: preparation.effectiveJobId,
+          jobFingerprint: preparation.event.jobFingerprint,
+          predecessorFingerprint: preparation.event.predecessorFingerprint,
+          truckPlate: job.truckPlate || ""
+        }
+      });
+    } catch (error) {
+      if (error?.code !== "DRIVER_OFFLINE_RECONCILIATION_IDEMPOTENCY_CONFLICT") throw error;
+      const review = await markAppliedDriverOfflineReconciliationReview(
+        preparation.event,
+        "The saved duty evidence no longer matches its Samsara reconciliation receipt.",
+        {
+          samsaraDutyPendingOnline: false,
+          samsaraDutyReconciliationConflict: true,
+          reconciliationOutcomeUncertain: true
+        }
+      );
+      return res.status(409).json({ ...review, code: error.code });
+    }
+    let result = null;
+    if (!receiptStart.execute) {
+      if (receiptStart.receipt.status === "applied") {
+        result = receiptStart.receipt.result;
+      } else if (recentExecutingDriverOfflineReconciliation(receiptStart.receipt)) {
+        return res.status(425).json({
+          code: "DRIVER_OFFLINE_RECONCILIATION_IN_PROGRESS",
+          error: "The Samsara duty reconciliation is still running."
+        });
+      } else {
+        if (receiptStart.receipt.status === "executing") {
+          await markDriverOfflineReconciliationReceiptUncertain(
+            receiptStart.receipt.receiptId,
+            Object.assign(new Error("A previous Samsara duty attempt ended without a durable outcome."), {
+              code: "DRIVER_OFFLINE_RECONCILIATION_STALE_EXECUTION"
+            })
+          );
+        }
+        const review = await markAppliedDriverOfflineReconciliationReview(
+          preparation.event,
+          receiptStart.receipt.errorMessage
+            || "A previous Samsara duty attempt has an uncertain outcome.",
+          {
+            samsaraDutyPendingOnline: false,
+            samsaraDutyReconciliationConflict: true,
+            reconciliationOutcomeUncertain: true
+          }
+        );
+        return res.status(409).json(review);
+      }
+    } else {
+      let attempt;
+      try {
+        attempt = await withTransaction(async () => {
+          await lockDriverOfflineReconciliation(preparation.event);
+          const finalizeReview = async (reason, reviewResult) => {
+            await releaseDriverOfflineReconciliationReceipt(receiptStart.receipt.receiptId);
+            return {
+              reviewResponse: await markAppliedDriverOfflineReconciliationReview(
+                preparation.event,
+                reason,
+                reviewResult
+              )
+            };
+          };
+          const lockedEvent = await getDriverOfflineEvent(preparation.event.eventId);
+          if (
+            lockedEvent?.status !== "applied"
+            || lockedEvent.result?.samsaraDutyPendingOnline !== true
+          ) {
+            return finalizeReview(
+              "The offline duty action changed while Samsara reconciliation was being prepared.",
+              {
+                samsaraDutyPendingOnline: false,
+                samsaraDutyReconciliationConflict: true
+              }
+            );
+          }
+          const dateSafety = driverOfflineReconciliationDateSafety(
+            lockedEvent.planDate,
+            localDateDaysAgo(0)
+          );
+          if (!dateSafety.allowed) {
+            return finalizeReview(
+              dateSafety.reason,
+              {
+                samsaraDutyPendingOnline: false,
+                samsaraDutyReconciliationConflict: true,
+                reconciliationDateBlocked: true
+              }
+            );
+          }
+          const currentPlan = await getDriverDayJobs(req.driverLogin, {
+            date: lockedEvent.planDate
+          });
+          const effectiveJobId = lockedEvent.effectiveJobId || lockedEvent.jobId;
+          const currentEntry = materializeDriverOfflineJobs(
+            currentPlan.jobs || [],
+            req.driverLogin
+          ).find((entry) => String(entry.snapshot.jobId) === String(effectiveJobId));
+          const identityMatches = currentEntry
+            && currentEntry.fingerprint === lockedEvent.jobFingerprint
+            && currentEntry.predecessorFingerprint === lockedEvent.predecessorFingerprint
+            && normalizedPlate(currentEntry.snapshot.truckPlate)
+              === normalizedPlate(job.truckPlate);
+          if (!identityMatches) {
+            return finalizeReview(
+              "The job, predecessor, driver, or truck changed before its Samsara duty action ran.",
+              {
+                samsaraDutyPendingOnline: false,
+                samsaraDutyReconciliationConflict: true,
+                currentPlanId: currentPlan.planId,
+                currentPlanRevision: currentPlan.revision
+              }
+            );
+          }
+          const handoff = await ensureDriverSamsaraDutyForJob(req.driverLogin, {
+            samsaraAccounts,
+            job: currentEntry.snapshot
+          });
+          const pendingReasons = new Set(["pre_dvir_not_complete", "no_assignment", "no_truck"]);
+          const reconciled = !pendingReasons.has(String(handoff?.reason || ""));
+          const reconciliation = {
+            samsaraDutyPendingOnline: !reconciled,
+            samsaraDutyReconciled: reconciled,
+            samsaraDutyReconciledAt: reconciled ? new Date().toISOString() : null,
+            samsaraDutyLastAttemptAt: new Date().toISOString(),
+            samsaraDutyResult: handoff || {}
+          };
+          const attemptResult = { reconciliation };
+          if (!reconciled) {
+            await releaseDriverOfflineReconciliationReceipt(receiptStart.receipt.receiptId);
+            await query(
+              `UPDATE driver_offline_events
+                  SET application_result = COALESCE(application_result, '{}'::jsonb) || $2::jsonb,
+                      updated_at = now()
+                WHERE event_id = $1::uuid
+                  AND status = 'applied'`,
+              [preparation.event.eventId, JSON.stringify(reconciliation)]
+            );
+            return { pending: true, result: attemptResult };
+          }
+          await completeDriverOfflineReconciliationReceipt(
+            receiptStart.receipt.receiptId,
+            attemptResult
+          );
+          return { result: attemptResult };
+        });
+      } catch (error) {
+        const reconciliation = error?.samsaraPartialOutcome
+          ? {
+              samsaraDutyPendingOnline: false,
+              samsaraDutyReconciled: false,
+              samsaraDutyLastAttemptAt: new Date().toISOString(),
+              samsaraDutyResult: error.samsaraPartialOutcome
+            }
+          : {};
+        await markDriverOfflineReconciliationReceiptUncertain(
+          receiptStart.receipt.receiptId,
+          error,
+          { reconciliation }
+        );
+        const review = await markAppliedDriverOfflineReconciliationReview(
+          preparation.event,
+          "The Samsara duty attempt did not finish cleanly and will not be replayed automatically.",
+          {
+            ...reconciliation,
+            samsaraDutyPendingOnline: false,
+            samsaraDutyReconciliationConflict: true,
+            reconciliationOutcomeUncertain: true,
+            reconciliationError: String(error?.message || error || "")
+          }
+        );
+        return res.status(409).json(review);
+      }
+      if (attempt.reviewResponse) {
+        return res.status(409).json(attempt.reviewResponse);
+      }
+      result = attempt.result;
+      if (attempt.pending) {
+        return res.status(409).json({
+          ...result,
+          error: "Complete the pending Samsara inspection/duty setup, then retry."
+        });
+      }
+    }
+
+    if (!result?.reconciliation?.samsaraDutyReconciled) {
+      const review = await markAppliedDriverOfflineReconciliationReview(
+        preparation.event,
+        "The stored Samsara duty receipt is not a confirmed reconciliation.",
+        {
+          samsaraDutyPendingOnline: false,
+          samsaraDutyReconciliationConflict: true,
+          reconciliationOutcomeUncertain: true
+        }
+      );
+      return res.status(409).json(review);
+    }
+    const changed = await mergeAppliedDriverOfflineReconciliationResult(
+      preparation.event.eventId,
+      result.reconciliation,
+      { samsaraDutyReconciled: true }
+    );
+    if (changed) {
+      await writeAudit({
+        actorType: "driver",
+        source: "samsara",
+        action: "driver.offline_duty.reconciled",
+        details: {
+          driverLogin: req.driverLogin,
+          eventId: preparation.event.eventId,
+          jobId: preparation.effectiveJobId,
+          switchedAccount: result.reconciliation.samsaraDutyResult?.switched === true,
+          account: result.reconciliation.samsaraDutyResult?.account || ""
+        }
+      }).catch(() => null);
+      emitAppEvent("driver.offline.duty_reconciled", {
+        driverLogin: req.driverLogin,
+        eventId: preparation.event.eventId,
+        jobId: preparation.effectiveJobId
+      });
+    }
     res.json(result);
   } catch (error) {
     next(error);
@@ -10734,11 +14227,87 @@ app.get("/api/dispatch/driver-job-statuses", async (req, res, next) => {
   }
 });
 
+async function nextJobOfflineRouteBootstrap(req, state, context) {
+  const deviceId = driverDeviceId(req);
+  if (!deviceId || !context?.planId || !context?.planDate || !Array.isArray(context.jobs) || !context.jobs.length) {
+    return null;
+  }
+  let manifest = await getLatestDriverOfflineManifest(req.driverLogin, deviceId, context.planDate);
+  // /next-job materializes only the actionable job for fast first paint, while
+  // /day-plan materializes every job (addresses, order lines, UOM, etc.). Compare
+  // the current job using that materialized snapshot but retain the raw full
+  // sequence so its predecessor fingerprint remains canonical. Comparing a
+  // complete manifest to context.jobs directly would falsely report every
+  // materialized stop as a Dispatch edit.
+  const comparisonJobs = context.job?.jobId
+    ? context.jobs.map((job) =>
+        String(job.jobId) === String(context.job.jobId)
+          ? { ...job, ...context.job }
+          : job
+      )
+    : context.jobs;
+  const currentContentMatches = context.job?.jobId
+    ? driverOfflineManifestMatchesJobs(
+        manifest,
+        comparisonJobs,
+        req.driverLogin,
+        { requireComplete: false, requiredJobId: context.job.jobId }
+      )
+    : manifest?.complete === true;
+  const reusable = manifest
+    && String(manifest.planId ?? "") === String(context.planId)
+    && Number(manifest.planRevision || 0) === Number(context.revision || 0)
+    && new Date(manifest.expiresAt).getTime() > Date.now()
+    && currentContentMatches
+    && (
+      manifest.complete
+      || !context.job?.jobId
+      || (manifest.jobs || []).some((job) => String(job.jobId) === String(context.job.jobId))
+    );
+  if (reusable) {
+    const grant = await issueDriverOfflineSyncGrant(manifest.manifestId, {
+      driverLogin: req.driverLogin,
+      deviceId
+    });
+    manifest = { ...manifest, offlineSyncGrant: grant.token };
+  } else {
+    const currentIndex = context.job?.jobId
+      ? context.jobs.findIndex((job) => String(job.jobId) === String(context.job.jobId))
+      : -1;
+    const bootstrapJobs = currentIndex >= 0
+      ? comparisonJobs.slice(Math.max(0, currentIndex - 1), currentIndex + 1)
+      : context.jobs.slice(-1);
+    manifest = await persistDriverOfflineBootstrap({
+      driverLogin: req.driverLogin,
+      deviceId,
+      planMetadata: {
+        planId: context.planId,
+        planDate: context.planDate,
+        planRevision: context.revision
+      },
+      // Keep first paint O(1): only the current raw job and its predecessor are
+      // needed to establish the current job's true immutable route identity. The
+      // complete, fully materialized route is fetched by /day-plan in background.
+      jobs: bootstrapJobs,
+      driverProfile: publicDriver(req.driver),
+      dayState: state,
+      samsaraWorkflowEnabled: driverSamsaraWorkflowEnabled(req.driver)
+    });
+  }
+  return driverOfflineRouteBootstrap(manifest, context.job?.jobId || "");
+}
+
 app.get("/api/driver/next-job", requireDriver, async (req, res, next) => {
   try {
-    const state = await getDriverDayState(req.driverLogin, {
-      samsaraAccounts: samsaraAccountsForDriver(req.driver)
-    });
+    const [state, jobContext, rest] = await Promise.all([
+      getDriverDayState(req.driverLogin, {
+        samsaraAccounts: samsaraAccountsForDriver(req.driver)
+      }),
+      getDriverNextJobContext(req.driverLogin),
+      getActiveDriverRest(req.driverLogin)
+    ]);
+    const job = jobContext.job;
+    const routeBootstrap = await nextJobOfflineRouteBootstrap(req, state, jobContext);
     if (
       state.samsaraEnabled
       && state.truckPlate
@@ -10747,16 +14316,17 @@ app.get("/api/driver/next-job", requireDriver, async (req, res, next) => {
       const suffix = state.preDvirStatus === "complete"
         ? " Samsara DVIR and On Duty confirmation are required."
         : "";
-      return res.status(428).json({ error: `MBBS pre-trip inspection must be received by Samsara before assigned jobs.${suffix}`, state });
+      return res.status(428).json({
+        error: `MBBS pre-trip inspection must be received by Samsara before assigned jobs.${suffix}`,
+        state,
+        job,
+        routeBootstrap
+      });
     }
-    const [job, rest] = await Promise.all([
-      getNextDriverJob(req.driverLogin),
-      getActiveDriverRest(req.driverLogin)
-    ]);
     const restSummary = await getDriverRestSummary(req.driverLogin, {
       planDate: rest?.planDate || job?.planDate || ""
     });
-    res.json({ job, rest, restSummary });
+    res.json({ state, job, rest, restSummary, routeBootstrap });
   } catch (error) {
     next(error);
   }
@@ -10794,12 +14364,24 @@ app.post("/api/driver/jobs/:jobId/start", requireDriver, async (req, res, next) 
   try {
     const activeRest = await getActiveDriverRest(req.driverLogin);
     if (activeRest) return res.status(409).json({ error: "End rest time before starting the next job.", rest: activeRest });
-    const job = await getNextDriverJob(req.driverLogin);
+    const jobContext = await getDriverNextJobContext(req.driverLogin);
+    const job = jobContext.job;
     if (!job || job.jobId !== req.params.jobId) return res.status(409).json({ error: "This is no longer the next assigned job. Refresh and try again." });
     if (job.stopType === "truck_switch") {
       return res.status(409).json({ error: "Confirm the truck switch with the dedicated Switch Truck action." });
     }
     if (job.stopType === "pickup" || job.stopType === "dropoff") {
+      await reconcileCompletedYardTransfersForSalesOrderStart({
+        salesOrderRefs: job.orderRefs || [],
+        currentJob: job,
+        routeJobs: jobContext.jobs || [],
+        driverLogin: req.driverLogin,
+        event: {
+          occurredAt: req.body?.deviceOccurredAt || new Date().toISOString(),
+          deviceId: driverDeviceId(req),
+          clientSequence: req.body?.clientSequence ?? null
+        }
+      });
       const dependencyBlock = await getSalesOrderDependencyExecutionBlock(job.orderRefs || []);
       if (dependencyBlock) return res.status(409).json({ error: dependencyBlock.message, dependencyBlock });
       if (job.stopType === "pickup") {
@@ -10808,13 +14390,75 @@ app.post("/api/driver/jobs/:jobId/start", requireDriver, async (req, res, next) 
         if (directPickupBlock) return res.status(409).json({ error: directPickupBlock.message, dependencyBlock: directPickupBlock });
       }
     }
-    const samsaraHandoff = await ensureDriverSamsaraDutyForJob(req.driverLogin, {
-      samsaraAccounts: samsaraAccountsForDriver(req.driver),
-      job
+    const receipt = await beginDriverForegroundAction(req, "job_started", job.jobId);
+    const response = await runDriverForegroundAction(receipt, async () => {
+      const liveContext = await getDriverNextJobContext(req.driverLogin);
+      const liveJob = liveContext.job;
+      if (!liveJob || liveJob.jobId !== job.jobId || liveJob.stopType === "truck_switch") {
+        throw Object.assign(new Error("This is no longer the next assigned job."), {
+          status: 409,
+          code: "DRIVER_FOREGROUND_TARGET_CHANGED"
+        });
+      }
+      if (liveJob.stopType === "pickup" || liveJob.stopType === "dropoff") {
+        await reconcileCompletedYardTransfersForSalesOrderStart({
+          salesOrderRefs: liveJob.orderRefs || [],
+          currentJob: liveJob,
+          routeJobs: liveContext.jobs || [],
+          driverLogin: req.driverLogin,
+          event: {
+            occurredAt: req.body?.deviceOccurredAt || new Date().toISOString(),
+            deviceId: driverDeviceId(req),
+            clientSequence: req.body?.clientSequence ?? null
+          }
+        });
+        const liveDependencyBlock = await getSalesOrderDependencyExecutionBlock(
+          liveJob.orderRefs || []
+        );
+        if (liveDependencyBlock) {
+          throw Object.assign(new Error(liveDependencyBlock.message), {
+            status: 409,
+            code: "DRIVER_DEPENDENCY_BLOCKED"
+          });
+        }
+        if (liveJob.stopType === "pickup") {
+          const liveDirectTransferRefs = (liveJob.dependencyPickupManifests || [])
+            .map((entry) => entry.transferOrderRef)
+            .filter(Boolean);
+          const liveDirectPickupBlock = await getDirectPickupDependencyExecutionBlock(
+            liveDirectTransferRefs
+          );
+          if (liveDirectPickupBlock) {
+            throw Object.assign(new Error(liveDirectPickupBlock.message), {
+              status: 409,
+              code: "DRIVER_DIRECT_PICKUP_BLOCKED"
+            });
+          }
+        }
+      }
+      const samsaraHandoff = await ensureDriverSamsaraDutyForJob(req.driverLogin, {
+        samsaraAccounts: samsaraAccountsForDriver(req.driver),
+        job: liveJob
+      });
+      const record = await startDriverJob(req.driverLogin, req.params.jobId, {
+        job: liveJob,
+        occurredAt: req.body?.deviceOccurredAt || null
+      });
+      emitAppEvent("driver.job.started", {
+        driverLogin: req.driverLogin,
+        jobId: req.params.jobId,
+        stopType: liveJob.stopType,
+        orderRefs: liveJob.orderRefs || [],
+        samsaraHandoff
+      });
+      return {
+        record,
+        job: await getNextDriverJob(req.driverLogin),
+        samsaraHandoff,
+        ...(receipt ? { foregroundEventId: receipt.eventId } : {})
+      };
     });
-    const record = await startDriverJob(req.driverLogin, req.params.jobId, { job });
-    emitAppEvent("driver.job.started", { driverLogin: req.driverLogin, jobId: req.params.jobId, stopType: job.stopType, orderRefs: job.orderRefs || [], samsaraHandoff });
-    res.json({ record, job: await getNextDriverJob(req.driverLogin), samsaraHandoff });
+    res.json(response);
   } catch (error) {
     next(error);
   }
@@ -10828,40 +14472,57 @@ app.post("/api/driver/jobs/:jobId/confirm-truck-switch", requireDriver, async (r
     if (!job || job.jobId !== req.params.jobId || job.stopType !== "truck_switch") {
       return res.status(409).json({ error: "This is no longer the next assigned truck switch. Refresh and try again." });
     }
-    const result = await confirmDriverTruckSwitch(req.driverLogin, job, {
-      samsaraAccounts: samsaraAccountsForDriver(req.driver)
-    });
-    await writeDispatchAudit({
-      action: "driver_truck_switch_confirmed",
-      entityType: "driver_job",
-      entityId: job.jobId,
-      planId: job.planId,
-      planDate: job.planDate,
-      operatorName: req.driverLogin,
-      source: "driver",
-      details: {
-        driverLogin: req.driverLogin,
-        fromTruckPlate: job.fromTruckPlate || "",
-        toTruckPlate: job.nextTruckPlate || job.truckPlate || "",
-        switchYard: job.switchYard || "",
-        nextLoadId: job.loadId || "",
-        samsaraAccountHandoff: Boolean(result.samsaraHandoff?.switched)
+    const receipt = await beginDriverForegroundAction(req, "truck_switched_physical", job.jobId);
+    const response = await runDriverForegroundAction(receipt, async () => {
+      const liveJob = await getNextDriverJob(req.driverLogin);
+      if (!liveJob || liveJob.jobId !== job.jobId || liveJob.stopType !== "truck_switch") {
+        throw Object.assign(new Error("This is no longer the next assigned truck switch."), {
+          status: 409,
+          code: "DRIVER_FOREGROUND_TARGET_CHANGED"
+        });
       }
-    }).catch(() => null);
-    let nextJob = await getNextDriverJob(req.driverLogin);
-    if (nextJob && nextJob.stopType !== "truck_switch") {
-      await startDriverJob(req.driverLogin, nextJob.jobId, { job: nextJob });
-      nextJob = await getNextDriverJob(req.driverLogin);
-    }
-    const state = await getDriverDayState(req.driverLogin, { samsaraAccounts: samsaraAccountsForDriver(req.driver) });
-    emitAppEvent("driver.truck.switched", {
-      driverLogin: req.driverLogin,
-      jobId: job.jobId,
-      fromTruckPlate: job.fromTruckPlate,
-      truckPlate: job.nextTruckPlate || job.truckPlate,
-      nextLoadId: job.loadId
+      const result = await confirmDriverTruckSwitch(req.driverLogin, liveJob, {
+        samsaraAccounts: samsaraAccountsForDriver(req.driver)
+      });
+      await writeDispatchAudit({
+        action: "driver_truck_switch_confirmed",
+        entityType: "driver_job",
+        entityId: job.jobId,
+        planId: job.planId,
+        planDate: job.planDate,
+        operatorName: req.driverLogin,
+        source: "driver",
+        details: {
+          driverLogin: req.driverLogin,
+          fromTruckPlate: job.fromTruckPlate || "",
+          toTruckPlate: job.nextTruckPlate || job.truckPlate || "",
+          switchYard: job.switchYard || "",
+          nextLoadId: job.loadId || "",
+          samsaraAccountHandoff: Boolean(result.samsaraHandoff?.switched),
+          eventId: receipt?.eventId || ""
+        }
+      }).catch(() => null);
+      let nextJob = await getNextDriverJob(req.driverLogin);
+      if (!receipt && nextJob && nextJob.stopType !== "truck_switch") {
+        await startDriverJob(req.driverLogin, nextJob.jobId, { job: nextJob });
+        nextJob = await getNextDriverJob(req.driverLogin);
+      }
+      const state = await getDriverDayState(req.driverLogin, { samsaraAccounts: samsaraAccountsForDriver(req.driver) });
+      emitAppEvent("driver.truck.switched", {
+        driverLogin: req.driverLogin,
+        jobId: job.jobId,
+        fromTruckPlate: job.fromTruckPlate,
+        truckPlate: job.nextTruckPlate || job.truckPlate,
+        nextLoadId: job.loadId
+      });
+      return {
+        ...result,
+        job: nextJob,
+        state,
+        ...(receipt ? { foregroundEventId: receipt.eventId } : {})
+      };
     });
-    res.json({ ...result, job: nextJob, state });
+    res.json(response);
   } catch (error) {
     await writeDispatchAudit({
       action: "driver_truck_switch_failed",
@@ -10888,45 +14549,62 @@ app.post("/api/driver/jobs/:jobId/skip-samsara", requireDriver, async (req, res,
     const reason = samsaraEnabled
       ? "Driver skipped Samsara truck assignment."
       : "Samsara is disabled for this driver; truck switch completed locally.";
-    const result = samsaraEnabled
-      ? await skipDriverTruckSwitchSamsara(job.jobId, req.driverLogin, { reason, job })
-      : await confirmDriverTruckSwitch(req.driverLogin, job, {
-          samsaraAccounts: samsaraAccountsForDriver(req.driver)
+    const receipt = await beginDriverForegroundAction(req, "truck_switched_samsara_skipped", job.jobId);
+    const response = await runDriverForegroundAction(receipt, async () => {
+      const liveJob = await getNextDriverJob(req.driverLogin);
+      if (!liveJob || liveJob.jobId !== job.jobId || liveJob.stopType !== "truck_switch") {
+        throw Object.assign(new Error("This is no longer the next assigned truck switch."), {
+          status: 409,
+          code: "DRIVER_FOREGROUND_TARGET_CHANGED"
         });
-    await writeDispatchAudit({
-      action: samsaraEnabled
-        ? "driver_truck_switch_samsara_skipped"
-        : "driver_truck_switch_confirmed_samsara_disabled",
-      entityType: "driver_job",
-      entityId: job.jobId,
-      planId: job.planId,
-      planDate: job.planDate,
-      operatorName: req.driverLogin,
-      source: "driver",
-      details: {
-        driverLogin: req.driverLogin,
-        fromTruckPlate: job.fromTruckPlate || "",
-        toTruckPlate: job.nextTruckPlate || job.truckPlate || "",
-        switchYard: job.switchYard || "",
-        nextLoadId: job.loadId || "",
-        samsaraError: result.switchRecord?.samsara_error || "",
-        reason
       }
-    }).catch(() => null);
-    let nextJob = await getNextDriverJob(req.driverLogin);
-    if (nextJob && nextJob.stopType !== "truck_switch") {
-      await startDriverJob(req.driverLogin, nextJob.jobId, { job: nextJob });
-      nextJob = await getNextDriverJob(req.driverLogin);
-    }
-    const state = await getDriverDayState(req.driverLogin, { samsaraAccounts: samsaraAccountsForDriver(req.driver) });
-    emitAppEvent("driver.truck.switch.samsara_skipped", {
-      driverLogin: req.driverLogin,
-      jobId: job.jobId,
-      fromTruckPlate: job.fromTruckPlate || "",
-      truckPlate: job.nextTruckPlate || job.truckPlate || "",
-      nextLoadId: job.loadId || ""
+      const result = samsaraEnabled
+        ? await skipDriverTruckSwitchSamsara(liveJob.jobId, req.driverLogin, { reason, job: liveJob })
+        : await confirmDriverTruckSwitch(req.driverLogin, liveJob, {
+            samsaraAccounts: samsaraAccountsForDriver(req.driver)
+          });
+      await writeDispatchAudit({
+        action: samsaraEnabled
+          ? "driver_truck_switch_samsara_skipped"
+          : "driver_truck_switch_confirmed_samsara_disabled",
+        entityType: "driver_job",
+        entityId: job.jobId,
+        planId: job.planId,
+        planDate: job.planDate,
+        operatorName: req.driverLogin,
+        source: "driver",
+        details: {
+          driverLogin: req.driverLogin,
+          fromTruckPlate: job.fromTruckPlate || "",
+          toTruckPlate: job.nextTruckPlate || job.truckPlate || "",
+          switchYard: job.switchYard || "",
+          nextLoadId: job.loadId || "",
+          samsaraError: result.switchRecord?.samsara_error || "",
+          reason,
+          eventId: receipt?.eventId || ""
+        }
+      }).catch(() => null);
+      let nextJob = await getNextDriverJob(req.driverLogin);
+      if (!receipt && nextJob && nextJob.stopType !== "truck_switch") {
+        await startDriverJob(req.driverLogin, nextJob.jobId, { job: nextJob });
+        nextJob = await getNextDriverJob(req.driverLogin);
+      }
+      const state = await getDriverDayState(req.driverLogin, { samsaraAccounts: samsaraAccountsForDriver(req.driver) });
+      emitAppEvent("driver.truck.switch.samsara_skipped", {
+        driverLogin: req.driverLogin,
+        jobId: job.jobId,
+        fromTruckPlate: job.fromTruckPlate || "",
+        truckPlate: job.nextTruckPlate || job.truckPlate || "",
+        nextLoadId: job.loadId || ""
+      });
+      return {
+        ...result,
+        job: nextJob,
+        state,
+        ...(receipt ? { foregroundEventId: receipt.eventId } : {})
+      };
     });
-    res.json({ ...result, job: nextJob, state });
+    res.json(response);
   } catch (error) {
     next(error);
   }
@@ -10965,7 +14643,21 @@ app.post("/api/driver/jobs/:jobId/location-check", requireDriver, async (req, re
   try {
     const job = await getNextDriverJob(req.driverLogin);
     if (!job || job.jobId !== req.params.jobId) return res.status(409).json({ error: "This is no longer the next assigned job. Refresh and try again." });
-    res.json(await checkDriverJobLocation(job));
+    const locationCheck = await checkDriverJobLocation(job);
+    const verification = await createDriverLocationVerification({
+      driverLogin: req.driverLogin,
+      deviceId: driverDeviceId(req) || req.driverSession?.deviceId || "",
+      jobId: job.jobId,
+      status: locationCheck.status === "ok"
+        ? "verified"
+        : locationCheck.status === "warning"
+          ? "warning"
+          : "override_allowed",
+      source: "samsara",
+      details: locationCheck,
+      ttlSeconds: 300
+    });
+    res.json({ ...locationCheck, verificationId: verification.verificationId, expiresAt: verification.expiresAt });
   } catch (error) {
     next(error);
   }
@@ -10993,35 +14685,11 @@ app.post("/api/driver/jobs/:jobId/photos", requireDriver, async (req, res, next)
         locationCheck
       });
     }
-    const completion = await withTransaction(async () => {
-      const record = await recordDriverJobPhotos(req.driverLogin, req.params.jobId, {
-        photoDataUrls,
-        job
-      });
-      let dependencyUpdate = null;
-      let completedCustomOrders = [];
-      if (job.stopType === "pickup") {
-        const transferRefs = (job.dependencyPickupManifests || []).map((entry) => entry.transferOrderRef).filter(Boolean);
-        dependencyUpdate = await markDirectDependencyPickupCompleted({
-          transferOrderRefs: transferRefs,
-          driverJobId: req.params.jobId
-        });
-      } else if (job.stopType === "dropoff") {
-        dependencyUpdate = await completeDirectDependenciesForSalesOrderDrop({
-          salesOrderRefs: job.orderRefs || [],
-          driverJobId: req.params.jobId,
-          planId: job.planId,
-          planDate: job.planDate,
-          truckPlate: job.truckPlate,
-          loadId: job.loadId,
-          loadName: job.loadName
-        });
-        completedCustomOrders = await completeDispatchCustomOrders(
-          job.orderRefs || [],
-          `driver:${req.driverLogin}`
-        );
-      }
-      return { record, dependencyUpdate, completedCustomOrders };
+    const completion = await completeDriverJobOperationalEffects({
+      driverLogin: req.driverLogin,
+      job,
+      photoDataUrls,
+      driverRemark: req.body?.driverRemark
     });
     const { record, dependencyUpdate, completedCustomOrders } = completion;
     let nextJob = await getNextDriverJob(req.driverLogin);

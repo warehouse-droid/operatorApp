@@ -462,6 +462,8 @@ async function netsuiteRest(path, { method = "GET", body = null, headers = {} } 
     }
     if (!response.ok) {
       lastError = new Error(`NetSuite REST failed: ${response.status} ${typeof data === "string" ? data : JSON.stringify(data)}`);
+      lastError.status = response.status;
+      lastError.netsuiteResponseReceived = true;
       if (isConcurrencyLimit(response.status, text) && attempt < 3) {
         await delay(2000 * (attempt + 1));
         continue;
@@ -732,12 +734,12 @@ export async function probeNetSuiteRestlet({
   return payload;
 }
 
-function verifiedPdfBuffer(contents) {
+function verifiedPdfBuffer(contents, documentName = "PDF") {
   const buffer = Buffer.isBuffer(contents)
     ? contents
     : Buffer.from(String(contents || "").replace(/^data:application\/pdf;base64,/, ""), "base64");
   if (buffer.length < 5 || buffer.subarray(0, 5).toString("ascii") !== "%PDF-") {
-    throw new Error("NetSuite picking-ticket RESTlet returned invalid PDF content.");
+    throw new Error(`NetSuite ${documentName} RESTlet returned invalid PDF content.`);
   }
   return buffer;
 }
@@ -793,6 +795,50 @@ export async function fetchPickingTicketFromNetSuite(orderId, { locationId = nul
     filename: `${prefix}-${id}-picking-ticket.pdf`,
     locationApplied: requestedLocation && payload.locationApplied === true && Number(payload.locationId) === location
   };
+}
+
+export async function fetchPurchaseOrderPdfFromNetSuite(orderId, { filenamePrefix = "PO" } = {}) {
+  const id = Number(orderId);
+  if (!Number.isInteger(id) || id <= 0) throw new Error("A valid numeric NetSuite purchase order ID is required.");
+  const prefix = String(filenamePrefix || "PO").trim().replace(/[^a-zA-Z0-9_-]+/g, "-") || "PO";
+  const payload = await configuredRestletJson({
+    action: "purchaseOrderPdf",
+    entityId: id,
+    includeContent: true
+  });
+  if (payload.action !== "purchaseOrderPdf" || Number(payload.entityId) !== id) {
+    throw new Error("NetSuite purchase-order PDF RESTlet returned the wrong transaction identity.");
+  }
+  const base64 = payload.contentBase64 || payload.base64 || payload.contents || "";
+  if (!base64) throw new Error("NetSuite purchase-order PDF RESTlet returned no PDF content.");
+  return {
+    buffer: verifiedPdfBuffer(base64, "purchase-order PDF"),
+    contentType: payload.contentType || "application/pdf",
+    filename: String(payload.filename || `${prefix}-${id}.pdf`).replace(/[^a-zA-Z0-9_.-]+/g, "-")
+  };
+}
+
+export async function updatePurchaseOrderHistoryInNetSuite(orderId, {
+  expectedLastModifiedAt,
+  header = {},
+  lines = []
+} = {}) {
+  const id = Number(orderId);
+  if (!Number.isInteger(id) || id <= 0) throw new Error("A valid numeric NetSuite purchase order ID is required.");
+  const run = () => configuredRestletJson({
+    action: "updatePurchaseOrder",
+    entityId: id,
+    expectedLastModifiedAt: String(expectedLastModifiedAt || "").trim(),
+    header,
+    lines
+  });
+  const result = restMutationQueue.then(run, run);
+  restMutationQueue = result.catch(() => {});
+  const response = await result;
+  if (response.action !== "updatePurchaseOrder" || Number(response.entityId) !== id) {
+    throw new Error("NetSuite purchase-order update RESTlet returned the wrong transaction identity.");
+  }
+  return response;
 }
 
 export async function resolvePalletItemFromNetSuite() {
@@ -2192,6 +2238,199 @@ export async function fetchPurchaseOrderDetailsFromNetSuite(orderId, locationId 
     ORDER BY tl.uniquekey
   `);
   return (result.items || []).map(normalizeOpenDeliveryLine);
+}
+
+function purchaseOrderHistorySnapshotFromRows(rows) {
+  if (!rows.length) return null;
+  const first = rows[0];
+  return {
+    id: Number(first.id),
+    tranid: first.tranid || "",
+    trandate: first.trandate || null,
+    createdAt: first.createddate || null,
+    lastModifiedAt: first.lastmodifieddate || null,
+    vendorId: Number(first.vendor_id) || null,
+    vendor: first.vendor || "",
+    status: first.status || "",
+    statusText: first.status_text || "",
+    memo: first.memo || "",
+    vendorReference: first.vendor_reference || "",
+    expectedDeliveryDate: first.expected_delivery_date || null,
+    foreignTotal: first.foreigntotal === null || first.foreigntotal === undefined ? null : Number(first.foreigntotal),
+    lines: rows.filter((row) => row.line_id !== null && row.line_id !== undefined).map((row) => ({
+      lineId: Number(row.line_id),
+      itemId: Number(row.item_id) || null,
+      itemName: row.item_name || "",
+      itemType: row.item_type || "",
+      itemTypeText: row.item_type_text || "",
+      description: row.item_description || "",
+      quantity: Number(row.quantity) || 0,
+      receivedQuantity: Number(row.received_quantity) || 0,
+      rate: row.rate === null || row.rate === undefined ? null : Number(row.rate),
+      amount: row.amount === null || row.amount === undefined ? null : Number(row.amount),
+      closed: /^(t|true|yes|1)$/i.test(String(row.line_closed || "")),
+      unit: row.unit || "",
+      itemWeight: row.item_weight === null || row.item_weight === undefined ? null : Number(row.item_weight),
+      locationId: Number(row.location_id) || null,
+      location: row.location || "",
+      palletQuantity: Number(row.pallet_qty) || 0,
+      layerQuantity: Number(row.layer_qty) || 0,
+      sectionQuantity: Number(row.section_qty) || 0,
+      pieceQuantity: Number(row.piece_qty) || 0,
+      toPlt: row.to_plt === null || row.to_plt === undefined ? null : Number(row.to_plt),
+      toLyr: row.to_lyr === null || row.to_lyr === undefined ? null : Number(row.to_lyr),
+      toSec: row.to_sec === null || row.to_sec === undefined ? null : Number(row.to_sec),
+      toPcs: row.to_pcs === null || row.to_pcs === undefined ? null : Number(row.to_pcs)
+    }))
+  };
+}
+
+export async function fetchPurchaseOrderHistorySnapshotsFromNetSuite(orderIds = []) {
+  const ids = [...new Set((orderIds || []).map(Number).filter((id) => Number.isInteger(id) && id > 0))];
+  if (!ids.length) return [];
+  if (ids.length > 50) throw new Error("At most 50 NetSuite purchase orders can be reconciled at once.");
+  const rows = await suiteqlAll(`
+    SELECT
+      t.id,
+      t.tranid,
+      t.trandate,
+      t.createddate,
+      t.lastmodifieddate,
+      t.entity AS vendor_id,
+      BUILTIN.DF(t.entity) AS vendor,
+      t.status,
+      BUILTIN.DF(t.status) AS status_text,
+      t.memo,
+      t.otherrefnum AS vendor_reference,
+      t.custbody4 AS expected_delivery_date,
+      t.foreigntotal,
+      tl.uniquekey AS line_id,
+      tl.item AS item_id,
+      BUILTIN.DF(tl.item) AS item_name,
+      i.itemtype AS item_type,
+      BUILTIN.DF(i.itemtype) AS item_type_text,
+      tl.memo AS item_description,
+      ABS(NVL(tl.quantity, 0)) AS quantity,
+      ABS(NVL(tl.quantityshiprecv, 0)) AS received_quantity,
+      tl.rate,
+      ABS(NVL(tl.foreignamount, 0)) AS amount,
+      tl.isclosed AS line_closed,
+      BUILTIN.DF(tl.units) AS unit,
+      i.weight AS item_weight,
+      tl.location AS location_id,
+      BUILTIN.DF(tl.location) AS location,
+      tl.custcol_plt AS pallet_qty,
+      tl.custcol_lyr AS layer_qty,
+      tl.custcol_sec AS section_qty,
+      tl.custcol_pcs AS piece_qty,
+      i.custitem_toplt AS to_plt,
+      i.custitem_tolyr AS to_lyr,
+      i.custitem_tosec AS to_sec,
+      i.custitem_topcs AS to_pcs
+    FROM transaction t
+    LEFT JOIN transactionline tl
+      ON tl.transaction = t.id
+     AND tl.item IS NOT NULL
+     AND tl.mainline = 'F'
+     AND (tl.taxline = 'F' OR tl.taxline IS NULL)
+    LEFT JOIN item i ON i.id = tl.item
+    WHERE t.id IN (${ids.join(", ")})
+      AND t.type = 'PurchOrd'
+    ORDER BY t.id, tl.uniquekey
+  `);
+  const byId = new Map();
+  for (const row of rows) {
+    const id = Number(row.id);
+    if (!byId.has(id)) byId.set(id, []);
+    byId.get(id).push(row);
+  }
+  return ids.map((id) => purchaseOrderHistorySnapshotFromRows(byId.get(id) || [])).filter(Boolean);
+}
+
+export async function fetchPurchaseOrderHistorySnapshotFromNetSuite(orderId) {
+  const id = Number(orderId);
+  if (!Number.isInteger(id) || id <= 0) {
+    throw new Error("A valid numeric NetSuite purchase order ID is required.");
+  }
+  const snapshots = await fetchPurchaseOrderHistorySnapshotsFromNetSuite([id]);
+  return snapshots[0] || null;
+}
+
+export async function fetchVendorItemCodesFromNetSuite({ vendorId, itemIds = [], subsidiaryId = null } = {}) {
+  const vendor = Number(vendorId);
+  if (!Number.isInteger(vendor) || vendor <= 0) throw new Error("A valid numeric NetSuite vendor ID is required.");
+  const items = [...new Set((itemIds || []).map(Number).filter((id) => Number.isInteger(id) && id > 0))];
+  if (!items.length) return [];
+  const subsidiary = Number(subsidiaryId);
+  const subsidiaryFilter = Number.isInteger(subsidiary) && subsidiary > 0
+    ? `AND (iv.subsidiary = ${subsidiary} OR iv.subsidiary IS NULL)`
+    : "";
+  try {
+    const rows = await suiteqlAll(`
+      SELECT
+        iv.item AS item_id,
+        iv.vendor AS vendor_id,
+        iv.subsidiary AS subsidiary_id,
+        iv.vendorcode AS vendor_code,
+        iv.preferredvendor AS preferred_vendor
+      FROM itemvendor iv
+      WHERE iv.vendor = ${vendor}
+        AND iv.item IN (${items.join(",")})
+        ${subsidiaryFilter}
+      ORDER BY iv.item, iv.preferredvendor DESC, iv.subsidiary
+    `);
+    const found = new Map();
+    for (const row of rows) {
+      const itemId = Number(row.item_id);
+      const vendorCode = String(row.vendor_code || "").trim();
+      if (!vendorCode || found.has(itemId)) continue;
+      found.set(itemId, {
+        itemId,
+        vendorId: vendor,
+        subsidiaryId: Number(row.subsidiary_id) || 0,
+        vendorCode,
+        preferredVendor: /^(t|true|yes|1)$/i.test(String(row.preferred_vendor || "")),
+        source: "item_vendor"
+      });
+    }
+    if (found.size === items.length) return [...found.values()];
+    const missing = items.filter((itemId) => !found.has(itemId));
+    const fallback = await suiteqlAll(`
+      SELECT i.id AS item_id, i.vendorname AS vendor_code, i.vendor AS vendor_id
+        FROM item i
+       WHERE i.id IN (${missing.join(",")})
+         AND i.vendor = ${vendor}
+    `);
+    for (const row of fallback) {
+      const vendorCode = String(row.vendor_code || "").trim();
+      if (!vendorCode) continue;
+      found.set(Number(row.item_id), {
+        itemId: Number(row.item_id),
+        vendorId: vendor,
+        subsidiaryId: 0,
+        vendorCode,
+        preferredVendor: true,
+        source: "single_vendor_fallback"
+      });
+    }
+    return [...found.values()];
+  } catch (itemVendorError) {
+    const fallback = await suiteqlAll(`
+      SELECT i.id AS item_id, i.vendorname AS vendor_code, i.vendor AS vendor_id
+        FROM item i
+       WHERE i.id IN (${items.join(",")})
+         AND i.vendor = ${vendor}
+    `);
+    return fallback.map((row) => ({
+      itemId: Number(row.item_id),
+      vendorId: vendor,
+      subsidiaryId: 0,
+      vendorCode: String(row.vendor_code || "").trim(),
+      preferredVendor: true,
+      source: "single_vendor_fallback",
+      itemVendorLookupError: itemVendorError.message
+    })).filter((row) => row.vendorCode);
+  }
 }
 
 export async function fetchTransferReceivingOrdersFromNetSuite({ sourceLocationId = null, destinationLocationId = null } = {}) {

@@ -25,6 +25,17 @@ function wait(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+function durableReviewIdentity(review = {}) {
+  const purchaseOrderId = validRecordId(review.netsuitePurchaseOrderId);
+  const purchaseOrderRef = String(review.netsuitePurchaseOrderRef || "").trim() || null;
+  return { purchaseOrderId, purchaseOrderRef };
+}
+
+export function smartScmNetSuiteCreateFailureIsAmbiguous(error) {
+  const status = Number(error?.status);
+  return !Number.isInteger(status) || status === 408 || status === 409 || status === 429 || status >= 500;
+}
+
 export function selectSmartScmMarkerPurchaseOrder(rows = [], { proposalId, vendorId = null } = {}) {
   const matches = Array.isArray(rows) ? rows : [];
   if (matches.length > 1) {
@@ -81,6 +92,50 @@ export async function executeSmartScmPurchaseProposal(proposalId, operatorId = n
   let recovered = false;
   try {
     const review = await getSmartScmNetSuitePoReviewLoad(proposalId);
+    const durableIdentity = durableReviewIdentity(review);
+    if (review.status === "completed" && (durableIdentity.purchaseOrderId || durableIdentity.purchaseOrderRef)) {
+      return {
+        proposalId: review.id,
+        mode: review.executionMode,
+        purchaseOrderId: durableIdentity.purchaseOrderId,
+        purchaseOrderRef: durableIdentity.purchaseOrderRef,
+        recovered: false,
+        reused: true
+      };
+    }
+    if (review.status === "attention") {
+      prepared = review;
+      let markerMatch = null;
+      if (!durableIdentity.purchaseOrderId) {
+        markerMatch = await recoverPurchaseOrderByMarker({
+          proposalId: review.id,
+          vendorId: review.vendorId,
+          attempts: 4
+        });
+      }
+      purchaseOrderId = durableIdentity.purchaseOrderId || markerMatch?.id || null;
+      purchaseOrderRef = durableIdentity.purchaseOrderRef || markerMatch?.tranid || null;
+      if (!purchaseOrderId) {
+        throw Object.assign(
+          new Error("The earlier NetSuite PO request has an uncertain outcome and no matching PO is visible yet. No second PO was created. Reconcile or retry after NetSuite search catches up."),
+          { status: 409, smartScmStateRecorded: true }
+        );
+      }
+      purchaseOrderRef = await hydrateSmartScmPurchaseOrder(prepared, purchaseOrderId, purchaseOrderRef);
+      await completeSmartScmPurchaseExecution(prepared.id, {
+        purchaseOrderId,
+        purchaseOrderRef,
+        mock: false
+      }, operatorId);
+      return {
+        proposalId: prepared.id,
+        mode: prepared.executionMode,
+        purchaseOrderId,
+        purchaseOrderRef,
+        recovered: true,
+        reused: true
+      };
+    }
     if (review.status === "executing") {
       const lastUpdate = new Date(review.updatedAt || 0).getTime();
       const freshExecution = Number.isFinite(lastUpdate) && lastUpdate > 0
@@ -149,7 +204,13 @@ export async function executeSmartScmPurchaseProposal(proposalId, operatorId = n
             attempts: 4
           });
           if (recoveredMatch === null) {
-            throw createError || new Error("NetSuite did not return a PO ID and no matching Smart SCM memo marker was found. Retry is safe after the review returns to Failed.");
+            const failure = createError || new Error("NetSuite accepted the PO request without returning a durable PO ID, and no matching Smart SCM memo marker is visible yet.");
+            if (!createError || smartScmNetSuiteCreateFailureIsAmbiguous(createError)) {
+              failure.smartScmAttention = true;
+              failure.status = 409;
+              failure.message = `${failure.message} The outcome is uncertain, so Smart SCM will not submit another PO automatically.`;
+            }
+            throw failure;
           }
           purchaseOrderId = recoveredMatch.id;
           purchaseOrderRef = recoveredMatch.tranid || null;

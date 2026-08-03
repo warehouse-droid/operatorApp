@@ -10,7 +10,9 @@ import { buildTransferDependencyRestPayload } from "./transfer-dependency-netsui
 import {
   assertNoActiveOrderDependenciesByRefs,
   calculateTransferProposalPallets,
+  cancelOrderDependency,
   completeDirectDependenciesForSalesOrderDrop,
+  completeYardDependenciesForTransferDrop,
   confirmTransferDependencyBatch,
   enrichDispatchOrdersWithDependencies,
   generateTransferDependencySuggestion,
@@ -25,6 +27,7 @@ import {
   mergeTransferDependencyProposals,
   normalDispatchGroupTargets,
   prepareTransferDependencyPalletItem,
+  reconcileCompletedYardTransfersForSalesOrderStart,
   removeTransferDependencyProposalLine,
   reopenTransferDependencyCandidate,
   sortTransferDependencyCandidatesByCompletedAt,
@@ -35,6 +38,7 @@ import {
   syncOrderDependenciesFromDispatchPlan,
   transferProposalConversionSelection,
   updateTransferDependencyBatch,
+  updateOrderDependencyMode,
   validateDispatchPlanDependencies
 } from "./order-dependency-repository.js";
 import {
@@ -1427,6 +1431,80 @@ try {
     const listedByGroup = await listOrderDependencies({ salesOrderRef: groupRef });
     check(listedByGroup.filter((entry) => String(entry.id) === String(dependency.id)).length === 1,
       "The moved dependency must be listed exactly once under its group.", { listedByGroup });
+    const managementOnlyOptions = await getOrderDependencyOptions({
+      dispatchTargetRef: groupRef,
+      planDate: "2097-07-14"
+    });
+    check(
+      managementOnlyOptions.targetUnavailable === true
+      && managementOnlyOptions.target === null
+      && managementOnlyOptions.matchingLines.length === 0
+      && managementOnlyOptions.existingLinks.some((entry) => String(entry.id) === String(dependency.id)),
+      "An unresolved historical group must still return its persisted links for unlink-only management.",
+      { managementOnlyOptions }
+    );
+    let crossPlanUnlinkBlocked = false;
+    try {
+      await cancelOrderDependency(dependency.id, null, "2097-07-14");
+    } catch (error) {
+      crossPlanUnlinkBlocked = error.status === 409
+        && error.code === "ORDER_DEPENDENCY_PLAN_MISMATCH";
+    }
+    check(crossPlanUnlinkBlocked,
+      "A grouped dependency must not be unlinked while editing a different plan date.");
+    let unavailableGroupModeBlocked = false;
+    try {
+      await updateOrderDependencyMode(
+        dependency.id,
+        "direct_to_customer",
+        null,
+        "2097-07-13"
+      );
+    } catch (error) {
+      unavailableGroupModeBlocked = error.status === 409
+        && error.code === "ORDER_DEPENDENCY_TARGET_UNAVAILABLE";
+    }
+    check(unavailableGroupModeBlocked,
+      "An unavailable historical group must remain unlink-only and reject mode changes.");
+    const cancelledGroupedDependency = await cancelOrderDependency(
+      dependency.id,
+      null,
+      "2097-07-13"
+    );
+    check(
+      cancelledGroupedDependency.cancelled === true
+      && cancelledGroupedDependency.alreadyCancelled !== true,
+      "An unstarted grouped dependency must be unlinkable.",
+      { cancelledGroupedDependency }
+    );
+    const repeatedGroupedCancellation = await cancelOrderDependency(dependency.id);
+    check(
+      repeatedGroupedCancellation.cancelled === true
+      && repeatedGroupedCancellation.alreadyCancelled === true,
+      "Repeating a successful unlink must be idempotent instead of reporting false execution progress.",
+      { repeatedGroupedCancellation }
+    );
+    const manualUnlinkAudit = await query(
+      `SELECT COUNT(*)::int AS count
+         FROM dispatch_audit_log
+        WHERE action = 'dispatch.order_dependency.unlinked'
+          AND entity_id = $1`,
+      [String(dependency.id)]
+    );
+    check(manualUnlinkAudit.rows[0].count === 1,
+      "An idempotent repeated unlink must not write a duplicate audit.", { manualUnlinkAudit: manualUnlinkAudit.rows[0] });
+    let missingDependencyStatus = 0;
+    try {
+      await cancelOrderDependency(-987654321);
+    } catch (error) {
+      missingDependencyStatus = Number(error.status || 0);
+    }
+    check(missingDependencyStatus === 404,
+      "A missing dependency must be reported distinctly from a started dependency.");
+    await query(
+      "UPDATE order_dependencies SET status = 'active', updated_at = now() WHERE id = $1",
+      [dependency.id]
+    );
     const secondGroupSync = await syncOrderDependenciesFromDispatchPlan(groupedPlanFixture);
     check(secondGroupSync.remapped.length === 0,
       "Repeating grouped-plan synchronization must not move the same dependency twice.", { secondGroupSync });
@@ -1614,6 +1692,15 @@ try {
         )`,
       [dependency.id]
     );
+    let progressedCancelBlocked = false;
+    try {
+      await cancelOrderDependency(dependency.id, null, "2097-07-13");
+    } catch (error) {
+      progressedCancelBlocked = error.status === 409
+        && /already started/i.test(error.message);
+    }
+    check(progressedCancelBlocked,
+      "A grouped dependency with execution progress must still reject unlink.");
     let progressedUngroupBlocked = false;
     try {
       await assertNoActiveOrderDependenciesByRefs(
@@ -1685,6 +1772,412 @@ try {
       "A received replenishment TO must release SO driver execution.", { completedReplenishmentBlock });
     await query("UPDATE transfer_orders SET receiving_status = 'open' WHERE netsuite_id = $1", [dependency.transferOrderId]);
     await query("UPDATE order_dependencies SET status = 'active', reconciliation_status = 'pending' WHERE id = $1", [dependency.id]);
+
+    const yardDropJobId = `yard-dependency-drop-${suffix}`;
+    const yardLoadId = `yard-dependency-load-${suffix}`;
+    const yardDriverLogin = `yard-dependency-driver-${suffix}`;
+    await query(
+      `INSERT INTO driver_job_records (
+         job_id, plan_id, plan_date, driver_login, truck_id, truck_plate,
+         load_id, load_name, stop_id, stop_type, order_refs, photo_data_urls,
+         status, started_at, completed_at, job_details
+       ) VALUES (
+         $1, null, DATE '2097-07-13', $2, 'YARD-TRUCK', 'YARD-TRUCK',
+         $3, 'Load 1', 'yard-transfer-drop', 'dropoff', $4::jsonb, $5::jsonb,
+         'complete', now() - interval '3 minutes', now() - interval '2 minutes',
+         $6::jsonb
+       )`,
+      [
+        yardDropJobId,
+        yardDriverLogin,
+        yardLoadId,
+        JSON.stringify([dependency.transferOrderRef]),
+        JSON.stringify(["r2://yard-proof-1", "r2://yard-proof-2"]),
+        JSON.stringify({ destinationLocationId: 15, dropLocation: "12441" })
+      ]
+    );
+    const formalReceivingBeforeYardDrop = await query(
+      `SELECT receiving_status, received_at
+         FROM transfer_orders
+        WHERE netsuite_id = $1`,
+      [dependency.transferOrderId]
+    );
+    const yardDelivery = await completeYardDependenciesForTransferDrop({
+      transferOrderRefs: [dependency.transferOrderRef],
+      driverJobId: yardDropJobId,
+      driverLogin: yardDriverLogin,
+      planDate: "2097-07-13",
+      truckPlate: "YARD-TRUCK",
+      loadId: yardLoadId,
+      loadName: "Load 1",
+      destinationLocationId: 15
+    });
+    check(yardDelivery.completed.length === 1,
+      "A completed yard Transfer Order drop must record one physical dependency delivery.",
+      { yardDelivery });
+    const deliveredYardDependency = (await listOrderDependencies({ salesOrderRef }))[0];
+    check(
+      deliveredYardDependency.status === "delivered"
+      && deliveredYardDependency.reconciliationStatus === "required",
+      "A physical yard drop must release execution while keeping formal receipt reconciliation pending.",
+      { deliveredYardDependency }
+    );
+    const deliveredYardLines = await query(
+      `SELECT allocated_quantity, delivered_quantity, locally_received_quantity
+         FROM order_dependency_lines
+        WHERE dependency_id = $1
+        ORDER BY id`,
+      [dependency.id]
+    );
+    check(
+      deliveredYardLines.rows.every((line) =>
+        Number(line.delivered_quantity) === Number(line.allocated_quantity)
+        && Number(line.locally_received_quantity) === 0),
+      "A physical yard drop must advance delivered quantities without fabricating local Receiving quantities.",
+      { deliveredYardLines: deliveredYardLines.rows }
+    );
+    const formalReceivingAfterYardDrop = await query(
+      `SELECT receiving_status, received_at
+         FROM transfer_orders
+        WHERE netsuite_id = $1`,
+      [dependency.transferOrderId]
+    );
+    check(
+      formalReceivingAfterYardDrop.rows[0].receiving_status
+        === formalReceivingBeforeYardDrop.rows[0].receiving_status
+      && String(formalReceivingAfterYardDrop.rows[0].received_at || "")
+        === String(formalReceivingBeforeYardDrop.rows[0].received_at || ""),
+      "Driver physical delivery must not mutate formal Transfer Order Receiving state.",
+      {
+        before: formalReceivingBeforeYardDrop.rows[0],
+        after: formalReceivingAfterYardDrop.rows[0]
+      }
+    );
+    check(await getSalesOrderDependencyExecutionBlock([salesOrderRef]) === null,
+      "A physically delivered yard dependency must release the Sales Order start gate.");
+    const deliveredPlanConflicts = await validateDispatchPlanDependencies({
+      id: 0,
+      planDate: "2097-07-13",
+      orders: [{ id: salesOrderRef, pickupLocations: ["12441"] }],
+      trucks: [{
+        plate: "YARD-TRUCK",
+        loads: [{
+          id: yardLoadId,
+          stops: [
+            { id: "yard-so-pick", type: "pick", orderId: salesOrderRef, location: "12441" },
+            { id: "yard-so-drop", type: "drop", orderId: salesOrderRef, location: "Customer" }
+          ]
+        }]
+      }]
+    });
+    check(deliveredPlanConflicts.length === 0,
+      "A physically delivered yard dependency must not require the Transfer Order to be replanned.",
+      { deliveredPlanConflicts });
+    const repeatedYardDelivery = await completeYardDependenciesForTransferDrop({
+      transferOrderRefs: [dependency.transferOrderRef],
+      driverJobId: yardDropJobId,
+      driverLogin: yardDriverLogin,
+      planDate: "2097-07-13",
+      truckPlate: "YARD-TRUCK",
+      loadId: yardLoadId,
+      destinationLocationId: 15
+    });
+    check(
+      repeatedYardDelivery.completed.length === 0
+      && repeatedYardDelivery.alreadyCompleted.length === 1,
+      "An exact yard-drop retry must return the existing result without repeating side effects.",
+      { repeatedYardDelivery }
+    );
+    const yardReceiptCount = await query(
+      `SELECT COUNT(*)::int AS count
+         FROM order_dependency_receipts
+        WHERE dependency_id = $1
+          AND result ->> 'reason' = 'yard_replenishment_physical_delivery'`,
+      [dependency.id]
+    );
+    const yardAuditCount = await query(
+      `SELECT COUNT(*)::int AS count
+         FROM dispatch_audit_log
+        WHERE action = 'driver.yard_replenishment.delivered'
+          AND entity_id = $1`,
+      [String(dependency.id)]
+    );
+    check(
+      yardReceiptCount.rows[0].count === 1 && yardAuditCount.rows[0].count === 1,
+      "Yard-drop retries must preserve one receipt and one audit record.",
+      { yardReceiptCount: yardReceiptCount.rows[0], yardAuditCount: yardAuditCount.rows[0] }
+    );
+
+    await query(
+      `DELETE FROM order_dependency_receipts
+        WHERE dependency_id = $1
+          AND result ->> 'reason' = 'yard_replenishment_physical_delivery'`,
+      [dependency.id]
+    );
+    await query(
+      `DELETE FROM dispatch_audit_log
+        WHERE action = 'driver.yard_replenishment.delivered'
+          AND entity_id = $1`,
+      [String(dependency.id)]
+    );
+    await query(
+      `UPDATE order_dependencies
+          SET status = 'active', local_completed_at = null,
+              reconciliation_status = 'pending', reconciled_at = null
+        WHERE id = $1`,
+      [dependency.id]
+    );
+    await query(
+      `UPDATE order_dependency_lines
+          SET delivered_quantity = 0
+        WHERE dependency_id = $1`,
+      [dependency.id]
+    );
+    const yardCurrentJob = {
+      jobId: `yard-sales-pick-${suffix}`,
+      planId: null,
+      planDate: "2097-07-13",
+      driverLogin: yardDriverLogin,
+      truckPlate: "YARD-TRUCK",
+      loadId: yardLoadId,
+      stopType: "pickup",
+      orderRefs: [salesOrderRef]
+    };
+    const yardDropRouteJob = {
+      jobId: yardDropJobId,
+      planId: null,
+      planDate: "2097-07-13",
+      driverLogin: yardDriverLogin,
+      truckPlate: "YARD-TRUCK",
+      loadId: yardLoadId,
+      stopType: "dropoff",
+      orderRefs: [dependency.transferOrderRef],
+      destinationLocationId: 15
+    };
+    await query(
+      `UPDATE driver_job_records
+          SET photo_data_urls = $2::jsonb
+        WHERE job_id = $1`,
+      [yardDropJobId, JSON.stringify(["r2://yard-proof-1"])]
+    );
+    const missingPhotoRecovery = await reconcileCompletedYardTransfersForSalesOrderStart({
+      salesOrderRefs: [salesOrderRef],
+      currentJob: yardCurrentJob,
+      driverLogin: yardDriverLogin,
+      routeJobs: [yardDropRouteJob, yardCurrentJob],
+      event: { occurredAt: new Date().toISOString() }
+    });
+    check(
+      missingPhotoRecovery.skipped.some((item) =>
+        item.reason === "completed_transfer_drop_photos_missing")
+      && (await getSalesOrderDependencyExecutionBlock([salesOrderRef])) !== null,
+      "Start-time recovery must reject a prior drop without its required durable photo evidence.",
+      { missingPhotoRecovery }
+    );
+    await query(
+      `UPDATE driver_job_records
+          SET photo_data_urls = $2::jsonb,
+              completed_at = now() + interval '1 minute'
+        WHERE job_id = $1`,
+      [
+        yardDropJobId,
+        JSON.stringify(["r2://yard-proof-1", "r2://yard-proof-2"])
+      ]
+    );
+    const lateDropRecovery = await reconcileCompletedYardTransfersForSalesOrderStart({
+      salesOrderRefs: [salesOrderRef],
+      currentJob: yardCurrentJob,
+      driverLogin: yardDriverLogin,
+      routeJobs: [yardDropRouteJob, yardCurrentJob],
+      event: { occurredAt: new Date().toISOString() }
+    });
+    check(
+      lateDropRecovery.skipped.some((item) =>
+        item.reason === "completed_transfer_drop_occurs_after_start")
+      && (await getSalesOrderDependencyExecutionBlock([salesOrderRef])) !== null,
+      "Start-time recovery must reject a Transfer Order completion occurring after the dependent start.",
+      { lateDropRecovery }
+    );
+    await query(
+      `UPDATE driver_job_records
+          SET completed_at = now() - interval '2 minutes'
+        WHERE job_id = $1`,
+      [yardDropJobId]
+    );
+    const wrongPlanRecovery = await reconcileCompletedYardTransfersForSalesOrderStart({
+      salesOrderRefs: [salesOrderRef],
+      currentJob: yardCurrentJob,
+      driverLogin: yardDriverLogin,
+      routeJobs: [
+        { ...yardDropRouteJob, planId: 999999 },
+        yardCurrentJob
+      ],
+      event: { occurredAt: new Date().toISOString() }
+    });
+    check(
+      wrongPlanRecovery.completed.length === 0
+      && (await getSalesOrderDependencyExecutionBlock([salesOrderRef])) !== null,
+      "Start-time recovery must not accept a Transfer Order drop from another plan.",
+      { wrongPlanRecovery }
+    );
+    const earlierYardLoadId = `${yardLoadId}-EARLIER`;
+    await query(
+      `UPDATE driver_job_records
+          SET load_id = $2, load_name = 'Earlier Load'
+        WHERE job_id = $1`,
+      [yardDropJobId, earlierYardLoadId]
+    );
+    const earlierLoadRecovery = await reconcileCompletedYardTransfersForSalesOrderStart({
+      salesOrderRefs: [salesOrderRef],
+      currentJob: yardCurrentJob,
+      driverLogin: yardDriverLogin,
+      routeJobs: [
+        { ...yardDropRouteJob, loadId: earlierYardLoadId, loadName: "Earlier Load" },
+        yardCurrentJob
+      ],
+      event: { occurredAt: new Date().toISOString() }
+    });
+    check(
+      earlierLoadRecovery.completed.length === 1
+      && await getSalesOrderDependencyExecutionBlock([salesOrderRef]) === null,
+      "Start-time recovery must accept a validated Transfer Order drop from an earlier load on the same driver route.",
+      { earlierLoadRecovery }
+    );
+    await query(
+      `DELETE FROM order_dependency_receipts
+        WHERE dependency_id = $1
+          AND result ->> 'reason' = 'yard_replenishment_physical_delivery'`,
+      [dependency.id]
+    );
+    await query(
+      `DELETE FROM dispatch_audit_log
+        WHERE action = 'driver.yard_replenishment.delivered'
+          AND entity_id = $1`,
+      [String(dependency.id)]
+    );
+    await query(
+      `UPDATE order_dependencies
+          SET status = 'active', local_completed_at = null,
+              reconciliation_status = 'pending', reconciled_at = null
+        WHERE id = $1`,
+      [dependency.id]
+    );
+    await query(
+      `UPDATE order_dependency_lines
+          SET delivered_quantity = 0
+        WHERE dependency_id = $1`,
+      [dependency.id]
+    );
+    await query(
+      `UPDATE driver_job_records
+          SET load_id = $2, load_name = 'Load 1'
+        WHERE job_id = $1`,
+      [yardDropJobId, yardLoadId]
+    );
+    const recoveredYardDelivery = await reconcileCompletedYardTransfersForSalesOrderStart({
+      salesOrderRefs: [salesOrderRef],
+      currentJob: yardCurrentJob,
+      driverLogin: yardDriverLogin,
+      routeJobs: [yardDropRouteJob, yardCurrentJob],
+      event: { occurredAt: new Date().toISOString() }
+    });
+    check(
+      recoveredYardDelivery.completed.length === 1
+      && await getSalesOrderDependencyExecutionBlock([salesOrderRef]) === null,
+      "The start gate must recover an already-completed same-load Transfer Order drop from an older server.",
+      { recoveredYardDelivery }
+    );
+    await query(
+      `DELETE FROM order_dependency_receipts
+        WHERE dependency_id = $1
+          AND result ->> 'reason' = 'yard_replenishment_physical_delivery'`,
+      [dependency.id]
+    );
+    await query(
+      `DELETE FROM dispatch_audit_log
+        WHERE action = 'driver.yard_replenishment.delivered'
+          AND entity_id = $1`,
+      [String(dependency.id)]
+    );
+    await query(
+      `UPDATE transfer_orders
+          SET status = 'H', status_text = 'Closed', receiving_status = 'received'
+        WHERE netsuite_id = $1`,
+      [dependency.transferOrderId]
+    );
+    await query(
+      `UPDATE order_dependencies
+          SET status = 'delivered', local_completed_at = null,
+              reconciliation_status = 'reconciled', reconciled_at = now()
+        WHERE id = $1`,
+      [dependency.id]
+    );
+    await query(
+      `UPDATE order_dependency_lines
+          SET delivered_quantity = 0
+        WHERE dependency_id = $1`,
+      [dependency.id]
+    );
+    const formalFirstYardDelivery = await completeYardDependenciesForTransferDrop({
+      transferOrderRefs: [dependency.transferOrderRef],
+      driverJobId: yardDropJobId,
+      driverLogin: yardDriverLogin,
+      planDate: "2097-07-13",
+      truckPlate: "YARD-TRUCK",
+      loadId: yardLoadId,
+      destinationLocationId: 15
+    });
+    const formalFirstAudit = await query(
+      `SELECT after_state ->> 'reconciliationStatus' AS reconciliation_status
+         FROM dispatch_audit_log
+        WHERE action = 'driver.yard_replenishment.delivered'
+          AND entity_id = $1
+        ORDER BY id DESC
+        LIMIT 1`,
+      [String(dependency.id)]
+    );
+    check(
+      formalFirstYardDelivery.completed.length === 1
+      && formalFirstYardDelivery.skipped.length === 0
+      && formalFirstYardDelivery.completed[0].formalReceiptPending === false
+      && formalFirstAudit.rows[0]?.reconciliation_status === "reconciled",
+      "A formally received/closed TO must still record later physical evidence and audit its persisted reconciliation state.",
+      { formalFirstYardDelivery, formalFirstAudit: formalFirstAudit.rows[0] }
+    );
+    await query(
+      `DELETE FROM order_dependency_receipts
+        WHERE dependency_id = $1
+          AND result ->> 'reason' = 'yard_replenishment_physical_delivery'`,
+      [dependency.id]
+    );
+    await query(
+      `DELETE FROM dispatch_audit_log
+        WHERE action = 'driver.yard_replenishment.delivered'
+          AND entity_id = $1`,
+      [String(dependency.id)]
+    );
+    await query(
+      `UPDATE transfer_orders
+          SET status = 'B', status_text = 'Pending Fulfillment',
+              receiving_status = 'open', received_at = null
+        WHERE netsuite_id = $1`,
+      [dependency.transferOrderId]
+    );
+    await query("DELETE FROM driver_job_records WHERE job_id = $1", [yardDropJobId]);
+    await query(
+      `UPDATE order_dependencies
+          SET status = 'active', local_completed_at = null,
+              reconciliation_status = 'pending', reconciled_at = null
+        WHERE id = $1`,
+      [dependency.id]
+    );
+    await query(
+      `UPDATE order_dependency_lines
+          SET delivered_quantity = 0
+        WHERE dependency_id = $1`,
+      [dependency.id]
+    );
+
     const palletOutboundLine = await query(
       `SELECT transfer_outbound_line_id, allocated_quantity
          FROM order_dependency_lines
@@ -1769,6 +2262,14 @@ try {
     check(closedOptions.matchError.includes("cannot be linked")
         && !closedOptions.transferOrders.some((row) => row.ref === dependency.transferOrderRef),
       "Closed TOs must be excluded from dependency choices and rejected when requested directly.", { closedOptions });
+    const missingTransferRef = `HARNESS-MISSING-TO-${suffix}`;
+    const missingOptions = await getOrderDependencyOptions({
+      salesOrderRef,
+      transferOrderRef: missingTransferRef,
+      planDate: "2097-07-13"
+    });
+    check(missingOptions.matchError === `Transfer Order ${missingTransferRef} was not found.`,
+      "A missing requested TO must return a validation message instead of throwing.", { missingOptions });
 
     await query(
       `UPDATE transfer_orders SET status = 'B', status_text = 'Pending Fulfillment' WHERE netsuite_id = $1`,
@@ -1828,6 +2329,147 @@ try {
 
     const planId = 9876000000 + suffix;
     const loadId = `DEP-LOAD-${suffix}`;
+    const startedDirectTransferState = await query(
+      `SELECT fulfillment_status, dispatch_planned, dispatch_plan_date
+         FROM transfer_orders
+        WHERE netsuite_id = $1`,
+      [dependency.transferOrderId]
+    );
+    const startedDirectDependencyState = await query(
+      `SELECT planned_plan_id, planned_date, planned_truck_plate, planned_load_id, planned_load_name
+         FROM order_dependencies
+        WHERE id = $1`,
+      [dependency.id]
+    );
+    const buildStartedDirectPlan = ({
+      id = planId,
+      planDate = "2097-07-13",
+      candidateLoadId = loadId
+    } = {}) => ({
+      id,
+      planDate,
+      orders: [{ id: salesOrderRef, type: "SO", pickupLocations: ["12441"] }],
+      trucks: [{
+        plate: "DEP-TRUCK",
+        loads: [{
+          id: candidateLoadId,
+          name: "Load 1",
+          stops: [
+            {
+              id: "started-direct-pick",
+              type: "pick",
+              orderId: salesOrderRef,
+              location: dependency.sourceLocation
+            },
+            {
+              id: "started-direct-drop",
+              type: "drop",
+              orderId: salesOrderRef,
+              location: "Customer"
+            }
+          ]
+        }]
+      }]
+    });
+    const hasStartedDirectAttachmentConflict = (messages = []) =>
+      messages.some((message) => message.includes(
+        `${dependency.transferOrderRef} has already started and cannot be attached as a new direct pickup.`
+      ));
+
+    await query(
+      `UPDATE transfer_orders
+          SET fulfillment_status = 'fulfilled',
+              dispatch_planned = false,
+              dispatch_plan_date = null
+        WHERE netsuite_id = $1`,
+      [dependency.transferOrderId]
+    );
+    await query(
+      `UPDATE order_dependencies
+          SET planned_plan_id = null,
+              planned_date = null,
+              planned_truck_plate = null,
+              planned_load_id = null,
+              planned_load_name = null
+        WHERE id = $1`,
+      [dependency.id]
+    );
+    const newStartedDirectAttachmentConflicts = await validateDispatchPlanDependencies(
+      buildStartedDirectPlan()
+    );
+    check(
+      hasStartedDirectAttachmentConflict(newStartedDirectAttachmentConflicts),
+      "A fulfilled direct TO without a persisted assignment must be rejected as a new attachment.",
+      { newStartedDirectAttachmentConflicts }
+    );
+
+    await query(
+      `UPDATE order_dependencies
+          SET planned_plan_id = $2,
+              planned_date = DATE '2097-07-13',
+              planned_truck_plate = 'DEP-TRUCK',
+              planned_load_id = $3,
+              planned_load_name = 'Load 1'
+        WHERE id = $1`,
+      [dependency.id, planId, loadId]
+    );
+    const unchangedStartedDirectAssignmentConflicts = await validateDispatchPlanDependencies(
+      buildStartedDirectPlan()
+    );
+    check(
+      !hasStartedDirectAttachmentConflict(unchangedStartedDirectAssignmentConflicts),
+      "A fulfilled direct TO must remain valid when saved in its persisted plan, date, and load.",
+      { unchangedStartedDirectAssignmentConflicts }
+    );
+
+    const movedLoadStartedDirectConflicts = await validateDispatchPlanDependencies(
+      buildStartedDirectPlan({ candidateLoadId: `${loadId}-MOVED` })
+    );
+    check(
+      hasStartedDirectAttachmentConflict(movedLoadStartedDirectConflicts),
+      "A fulfilled direct TO must not move from its persisted load.",
+      { movedLoadStartedDirectConflicts }
+    );
+
+    const movedPlanStartedDirectConflicts = await validateDispatchPlanDependencies(
+      buildStartedDirectPlan({ id: planId + 1 })
+    );
+    check(
+      hasStartedDirectAttachmentConflict(movedPlanStartedDirectConflicts),
+      "A fulfilled direct TO must not move from its persisted plan.",
+      { movedPlanStartedDirectConflicts }
+    );
+
+    await query(
+      `UPDATE transfer_orders
+          SET fulfillment_status = $2,
+              dispatch_planned = $3,
+              dispatch_plan_date = $4
+        WHERE netsuite_id = $1`,
+      [
+        dependency.transferOrderId,
+        startedDirectTransferState.rows[0].fulfillment_status,
+        startedDirectTransferState.rows[0].dispatch_planned,
+        startedDirectTransferState.rows[0].dispatch_plan_date
+      ]
+    );
+    await query(
+      `UPDATE order_dependencies
+          SET planned_plan_id = $2,
+              planned_date = $3,
+              planned_truck_plate = $4,
+              planned_load_id = $5,
+              planned_load_name = $6
+        WHERE id = $1`,
+      [
+        dependency.id,
+        startedDirectDependencyState.rows[0].planned_plan_id,
+        startedDirectDependencyState.rows[0].planned_date,
+        startedDirectDependencyState.rows[0].planned_truck_plate,
+        startedDirectDependencyState.rows[0].planned_load_id,
+        startedDirectDependencyState.rows[0].planned_load_name
+      ]
+    );
     await query(
       `INSERT INTO dispatch_plans (id, plan_date, status, note)
        VALUES ($1, DATE '2097-07-13', 'confirmed', 'Dependency rollback harness')`,

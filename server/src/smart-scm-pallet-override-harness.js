@@ -115,6 +115,16 @@ assert.match(
   /palletTransferQuantity > EPSILON && physicalPalletWeightLbs <= EPSILON/,
   "A positive TO PALLET quantity must require a trusted positive PALLET weight."
 );
+assert.match(
+  repositorySource,
+  /palletOverrideMakesOverCapacity[\s\S]*automaticTotalWeight <= capacity \+ EPSILON/,
+  "An explicit PALLET override may cross truck capacity only when the automatic PALLET quantity was capacity-safe."
+);
+assert.doesNotMatch(
+  repositorySource,
+  /This PALLET quantity would exceed the configured truck capacity/,
+  "The PALLET override endpoint must retain a deliberate over-capacity quantity instead of rejecting it."
+);
 
 const proposalEditorSource = await fs.readFile(
   new URL("./smart-scm-proposal-editor.js", import.meta.url),
@@ -123,7 +133,7 @@ const proposalEditorSource = await fs.readFile(
 assert.match(
   proposalEditorSource,
   /candidateLines[\s\S]*destination_location_id: destinationLocationId[\s\S]*proposalLoadWeight\(candidateLines/,
-  "TO capacity validation must evaluate PALLET overrides against the edited destination."
+  "Manual capacity evidence must evaluate PALLET overrides against the edited destination."
 );
 
 console.log("Smart SCM PALLET override harness passed.");

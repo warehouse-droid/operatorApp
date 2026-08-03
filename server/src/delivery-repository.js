@@ -2645,11 +2645,36 @@ async function materializeTransferSplitOrder(order, parent) {
   return withTransaction(() => materializeTransferSplitOrderInTransaction(order, parent));
 }
 
+function placedDeliveryOrderRefs(plan = {}) {
+  const refs = new Set();
+  for (const truck of plan.trucks || []) {
+    for (const load of truck.loads || []) {
+      if (load.returnOnly) continue;
+      for (const stop of load.stops || []) {
+        if (stop?.type !== "drop") continue;
+        const orderRef = String(stop.orderId || "").trim();
+        if (orderRef) refs.add(orderRef);
+      }
+    }
+  }
+  return refs;
+}
+
 async function materializeDispatchSplitOrders(plan) {
-  const splits = (plan.orders || [])
-    .filter((order) => isSplitOrder(order) && ["SO", "TO"].includes(order.type))
+  const placedOrderRefs = placedDeliveryOrderRefs(plan);
+  const allSplits = (plan.orders || [])
+    .filter((order) =>
+      isSplitOrder(order)
+      && ["SO", "TO"].includes(order.type)
+    )
     .map((order) => ({ ...order, originalOrderId: splitParentOrderId(order) }));
-  const activeSplitRefs = splits.map((order) => String(order.id || ""));
+  const activeSplitRefs = allSplits.map((order) => String(order.id || ""));
+  // Plan snapshots cache unplaced order-pool rows. Preserve their split identity,
+  // but do not let an empty legacy row block materialization for the placed loads.
+  const splits = allSplits.filter((order) =>
+    placedOrderRefs.has(String(order.id || "").trim())
+    || (Array.isArray(order.items) && order.items.some(Boolean))
+  );
   await query(
     `UPDATE sales_orders
         SET netsuite_active = false,
@@ -2736,13 +2761,22 @@ async function materializeDispatchSplitOrders(plan) {
     }
   }
 
-  return { splits: splits.length, splitRefs: activeSplitRefs };
+  return {
+    splits: splits.length,
+    splitRefs: activeSplitRefs,
+    splitParentRefs: [...new Set(
+      allSplits
+        .filter((order) => placedOrderRefs.has(String(order.id || "").trim()))
+        .map(splitParentOrderId)
+        .filter(Boolean)
+    )]
+  };
 }
 
 export async function applyConfirmedDispatchPlanToDelivery(plan, { forceOrderRefs = [] } = {}) {
   if (!plan?.planDate || !Array.isArray(plan.trucks)) return { planned: 0 };
   const materializedSplits = await materializeDispatchSplitOrders(plan);
-  const splitParentRefs = new Set((plan.orders || []).filter(isSplitOrder).map(splitParentOrderId));
+  const splitParentRefs = new Set(materializedSplits.splitParentRefs || []);
   const forceRefs = new Set((forceOrderRefs || []).map((ref) => String(ref || "").trim()).filter(Boolean));
   const plannedRows = [];
   for (const truck of plan.trucks || []) {

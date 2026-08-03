@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 
 const { monitorPlannedOrders } = await import("./server.js");
 const { closeDb } = await import("./db.js");
@@ -51,6 +52,24 @@ try {
   assert.equal(pending[0].plannedStart, 500);
   assert.equal(pending[0].plannedEnd, 515);
   assert.deepEqual(pending[0].items.map((item) => [item.itemName, item.quantity, item.unit]), [["Included line", 25.5, "SQFT"]]);
+
+  const withForecast = monitorPlannedOrders(plan, [], {
+    stops: [{
+      loadId: "L1",
+      stopId: "D1",
+      visitStopIds: ["D1"],
+      forecastArrival: "2026-07-21T12:40:00.000Z",
+      forecastLeave: "2026-07-21T12:55:00.000Z"
+    }]
+  })[0];
+  assert.equal(withForecast.forecastStart, "2026-07-21T12:40:00.000Z");
+  assert.equal(withForecast.forecastEnd, "2026-07-21T12:55:00.000Z");
+
+  const monitorClientSource = await readFile(new URL("../public/dispatch-monitor.js", import.meta.url), "utf8");
+  assert.match(monitorClientSource, /function monitorOrderPlanTime\(order = \{\}\)/, "The monitor should render one moving plan range.");
+  assert.match(monitorClientSource, /<b>Plan<\/b>/, "The moving target should be labelled Plan.");
+  assert.doesNotMatch(monitorClientSource, /<b>Forecast<\/b>/, "Forecast must not render as a second target.");
+  assert.match(monitorClientSource, /actualTime === "--" \? ""/, "Untouched orders must not render an empty Actual value.");
 
   const staleLinePlan = structuredClone(plan);
   staleLinePlan.trucks[0].loads[0].stops[1].lineRowIds = [999999];

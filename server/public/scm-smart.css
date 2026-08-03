@@ -1,4 +1,6 @@
 :root {
+  --smart-topbar-height: 62px;
+  --smart-tabs-height: 44px;
   --smart-navy: #17324d;
   --smart-blue: #1d5fa7;
   --smart-teal: #087f73;
@@ -25,7 +27,7 @@ body {
 .smart-shell .dispatch-topbar {
   position: sticky;
   top: 0;
-  z-index: 20;
+  z-index: 40;
   min-height: 62px;
   grid-template-columns: minmax(350px, 1fr) auto minmax(350px, 1fr);
   box-shadow: 0 2px 9px rgb(24 51 72 / 8%);
@@ -107,6 +109,27 @@ body {
   pointer-events: auto;
 }
 
+.smart-dismissible-notice {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px;
+  align-items: center;
+  gap: 10px;
+}
+
+.smart-dismissible-notice > button {
+  width: 28px;
+  min-width: 28px;
+  height: 28px;
+  min-height: 28px;
+  padding: 0;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  color: inherit;
+  background: rgb(255 255 255 / 65%);
+  font-size: 18px;
+  line-height: 1;
+}
+
 .smart-mode {
   display: inline-flex;
   align-items: center;
@@ -129,16 +152,23 @@ body {
 }
 
 .smart-tabs {
-  display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
-  overflow: hidden;
+  position: sticky;
+  top: var(--smart-topbar-height);
+  z-index: 30;
+  display: flex;
+  min-height: var(--smart-tabs-height);
+  overflow-x: auto;
+  overflow-y: hidden;
   margin-bottom: 14px;
   border: 1px solid var(--smart-border);
   border-radius: 9px;
   background: white;
+  box-shadow: 0 3px 10px rgb(23 50 77 / 10%);
+  scrollbar-width: thin;
 }
 
 .smart-tabs button {
+  flex: 1 0 128px;
   min-height: 42px;
   border: 0;
   border-right: 1px solid var(--smart-border);
@@ -148,6 +178,18 @@ body {
   font-size: 12px;
 }
 
+.smart-sr-only {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0, 0, 0, 0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}
+
 .smart-tabs button:last-child {
   border-right: 0;
 }
@@ -155,6 +197,16 @@ body {
 .smart-tabs button.active {
   color: white;
   background: var(--smart-navy);
+}
+
+@media (max-width: 1500px) {
+  :root {
+    --smart-topbar-height: 96px;
+  }
+
+  .smart-shell .dispatch-topbar {
+    min-height: var(--smart-topbar-height);
+  }
 }
 
 .smart-section,

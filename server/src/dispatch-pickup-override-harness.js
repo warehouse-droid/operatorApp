@@ -263,7 +263,7 @@ assert.match(
 );
 assert.match(
   source,
-  /title:\s*stop\.type === "pick" \? `\$\{sequence\}\. Pickup \$\{pickupStopLabel\(stop, order\)\}`/,
+  /const title = stop\.type === "pick"\s*\? `\$\{sequence\}\. Pickup \$\{pickupStopLabel\(stop, order\)\}`/,
   "Map route titles must use the resolved physical pickup label."
 );
 

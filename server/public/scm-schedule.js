@@ -404,12 +404,7 @@ function scmScheduleRowFormatting(status) {
 function scmScheduleQuery() {
   const params = new URLSearchParams();
   const search = String(scmScheduleFilters.search || "").trim();
-  if (search) {
-    params.set("search", search);
-    params.set("view", scmScheduleFilters.view || (scmScheduleSalesHost ? "yard manager" : "scm working"));
-    if (scmScheduleReviewOnly) params.set("reconciliationStatus", "review");
-    return `?${params.toString()}`;
-  }
+  if (search) params.set("search", search);
   Object.entries(scmScheduleFilters).forEach(([key, value]) => {
     if (key === "search") return;
     if ((key === "kind" || key === "method") && !scmScheduleCanShowScmWorkingControls()) return;
@@ -925,26 +920,25 @@ function scmScheduleRowMatchesCurrentFilters(row = {}) {
       row.groupRef
     ].join(" ").toLowerCase();
     if (!searchable.includes(search)) return false;
-  } else {
-    const statuses = scmScheduleFilterValues(scmScheduleFilters.status);
-    if (statuses.length && !statuses.includes(String(row.status || ""))) return false;
-    if (scmScheduleFilters.method && row.method !== scmScheduleFilters.method) return false;
-    if (scmScheduleFilters.kind === "Sp.O" && !(row.orderKind === "PO" && row.isSpecialOrder)) return false;
-    if (scmScheduleFilters.kind && scmScheduleFilters.kind !== "Sp.O" && row.orderKind !== scmScheduleFilters.kind) return false;
-    if (scmScheduleFilters.dropoffPoint) {
-      const dropoffPoints = String(row.dropoffPoint || "")
-        .replace(/\s+/g, "")
-        .split("+")
-        .filter(Boolean);
-      if (!dropoffPoints.includes(scmScheduleFilters.dropoffPoint)) return false;
-    }
-    const brands = scmScheduleFilterValues(scmScheduleFilters.brand)
-      .map((brand) => brand.toLowerCase());
-    if (brands.length && !brands.includes(String(row.brand || "").trim().toLowerCase())) return false;
-    const etaDate = String(row.etaDate || "").slice(0, 10);
-    if (scmScheduleFilters.from && (!etaDate || etaDate < scmScheduleFilters.from)) return false;
-    if (scmScheduleFilters.to && (!etaDate || etaDate > scmScheduleFilters.to)) return false;
   }
+  const statuses = scmScheduleFilterValues(scmScheduleFilters.status);
+  if (statuses.length && !statuses.includes(String(row.status || ""))) return false;
+  if (scmScheduleFilters.method && row.method !== scmScheduleFilters.method) return false;
+  if (scmScheduleFilters.kind === "Sp.O" && !(row.orderKind === "PO" && row.isSpecialOrder)) return false;
+  if (scmScheduleFilters.kind && scmScheduleFilters.kind !== "Sp.O" && row.orderKind !== scmScheduleFilters.kind) return false;
+  if (scmScheduleFilters.dropoffPoint) {
+    const dropoffPoints = String(row.dropoffPoint || "")
+      .replace(/\s+/g, "")
+      .split("+")
+      .filter(Boolean);
+    if (!dropoffPoints.includes(scmScheduleFilters.dropoffPoint)) return false;
+  }
+  const brands = scmScheduleFilterValues(scmScheduleFilters.brand)
+    .map((brand) => brand.toLowerCase());
+  if (brands.length && !brands.includes(String(row.brand || "").trim().toLowerCase())) return false;
+  const etaDate = String(row.etaDate || "").slice(0, 10);
+  if (scmScheduleFilters.from && (!etaDate || etaDate < scmScheduleFilters.from)) return false;
+  if (scmScheduleFilters.to && (!etaDate || etaDate > scmScheduleFilters.to)) return false;
 
   const view = String(scmScheduleFilters.view || "").toLowerCase();
   if (view !== "blanket" && row.isBlanket) return false;

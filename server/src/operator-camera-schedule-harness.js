@@ -73,7 +73,7 @@ includesAll(operatorHtml, [
   "/vendor/quagga2/quagga.min.js?v=1.12.1",
   "/operator.js?v=20260729-returns-v9"
 ], "Operator camera cache busting");
-assert.ok(serviceWorker.includes("mbbs-yard-operator-v132-driver-samsara-v1"), "Operator service-worker cache must advance.");
+assert.ok(serviceWorker.includes("mbbs-yard-operator-v134-driver-cache-isolation-v1"), "Operator service-worker cache must advance.");
 assert.ok(serviceWorker.includes("/vendor/quagga2/quagga.min.js?v=1.12.1"), "The offline PWA shell must cache the 1D scanner.");
 assert.ok(server.includes('app.use("/vendor/quagga2", express.static(quaggaScannerDir))'), "Server must expose the installed 1D scanner bundle.");
 
@@ -89,11 +89,13 @@ assert.equal(barcodeHelpers.normalizedPickupCameraCode("[object Object]"), "");
 const quaggaHelpers = Function(`${operator.slice(barcodeHelperStart, barcodeHelperEnd)}; return { pickupQuaggaOrderCode };`)();
 assert.equal(quaggaHelpers.pickupQuaggaOrderCode([{ codeResult: { code: "SOB115348" } }]), "SOB115348");
 includesAll(serviceWorker, [
-  "mbbs-yard-operator-v132-driver-samsara-v1",
+  "mbbs-yard-operator-v134-driver-cache-isolation-v1",
   "/i18n.js?v=20260729-returns-v9",
   "/operator.js?v=20260729-returns-v9",
-  "/driver.js?v=20260729-driver-samsara-v1"
-], "Merged Operator and Driver service-worker cache");
+  'url.pathname === "/driver"',
+  'url.pathname.startsWith("/driver-offline-")'
+], "Isolated Operator service-worker cache");
+assert.ok(!serviceWorker.includes("/driver.js?"), "The Operator shell must not cache the Driver application.");
 
 includesAll(server, [
   'app.get(["/dispatch/po-to-schedule", "/dispatch/POTOschedule"]',
@@ -108,6 +110,6 @@ includesAll(schedule, [
   ': ["admin", "scm", "scm_staff", "dispatcher", "yard_manager"]',
   'if (role === "dispatcher") return ["dispatch"];'
 ], "Shared schedule host and dispatcher access");
-assert.ok(scheduleHtml.includes("/scm-schedule.js?v=20260730-status-visibility-v1"), "Shared schedule client cache busting missing.");
+assert.ok(scheduleHtml.includes("/scm-schedule.js?v=20260801-conjunctive-filters-v1"), "Shared schedule client cache busting missing.");
 
 console.log("Operator camera and Dispatch PO/TO Schedule harness passed.");
