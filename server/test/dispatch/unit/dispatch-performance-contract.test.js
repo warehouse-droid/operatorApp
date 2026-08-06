@@ -173,6 +173,51 @@ test("DP-10 a stale digest is rejected even when the numeric revision still matc
   );
 });
 
+test("DP-27 an acknowledged command digest remains valid after PostgreSQL-style JSON persistence", () => {
+  const createdAt = new Date("2026-08-05T14:30:00.000Z");
+  const initial = planWithOrders(
+    [order("CUSTOM-1", {
+      type: "CUSTOM",
+      customOrderId: "81",
+      createdAt,
+      raw: { custom_order_id: "81", created_at: createdAt }
+    })],
+    [{ id: "drop-custom-1", type: "drop", orderId: "CUSTOM-1" }]
+  );
+  const first = applyDispatchPlanCommand({
+    plan: initial,
+    command: {
+      commandId: "persist-custom-date",
+      baseRevision: initial.revision,
+      baseDigest: digestDispatchPlan(initial),
+      type: "replace_plan",
+      payload: {
+        planDate: initial.planDate,
+        orders: initial.orders,
+        trucks: initial.trucks,
+        summary: { ...initial.summary, savedOnce: true }
+      }
+    }
+  });
+
+  // jsonb receives the JSON representation and the pg client parses that value
+  // again on the next command. The acknowledgement must survive that boundary.
+  const reloaded = JSON.parse(JSON.stringify(first.plan));
+  const second = applyDispatchPlanCommand({
+    plan: reloaded,
+    command: {
+      commandId: "remove-custom-after-reload",
+      baseRevision: first.revision,
+      baseDigest: first.acknowledgement.digest,
+      type: "remove_order",
+      payload: { orderRef: "CUSTOM-1" }
+    }
+  });
+
+  assert.equal(second.revision, first.revision + 1);
+  assert.equal(second.plan.trucks[0].loads[0].stops.length, 0);
+});
+
 test("DP-05/DP-16 replace_plan atomically acknowledges the browser's already-validated compact board", () => {
   const initial = planWithOrders(
     [order("A"), order("B")],

@@ -5,6 +5,10 @@ import test, { after, before } from "node:test";
 
 import { createDispatchV2Fixture } from "../support/dispatch-v2-fixture.js";
 import { query } from "../../../src/db.js";
+import {
+  createDispatchCustomOrder,
+  dispatchOrderFromCustomOrder
+} from "../../../src/dispatch-custom-order-repository.js";
 
 let fixture;
 
@@ -192,6 +196,63 @@ test("DP-05/DP-16: the browser compact-board replacement uses the durable fast p
   assert.equal(replay.response.status, 200, JSON.stringify(replay.payload));
   assert.equal(replay.response.headers.get("x-dispatch-idempotent-replay"), "true");
   assert.equal(replay.payload.plan.revision, first.payload.plan.revision);
+});
+
+test("DP-27: consecutive Custom Order saves accept the digest acknowledged before the jsonb reload", async () => {
+  const custom = await createDispatchCustomOrder({
+    refNumber: "DP-DATE-CUSTOM",
+    pickupLocation: "3445",
+    dropoffLocation: "27 Persistence Test Road",
+    orderDetails: "Exercise database Date serialization",
+    weightLbs: 1200,
+    stopMinutes: 30
+  }, "dispatch-v2-command-flow");
+  const seeded = await fixture.seedPlan({ date: "2025-02-23", refs: [custom.refNumber] });
+  const snapshot = dispatchOrderFromCustomOrder(custom);
+  snapshot.localDispatchStatus = "planned";
+  const trucks = [{
+    plate: "DP-V2-TEST",
+    id: "DP-V2-TEST",
+    loads: [{
+      id: "dp-v2-load-1",
+      name: "Load 1",
+      stops: [{
+        id: "dp-v2-custom-drop",
+        type: "drop",
+        orderId: custom.refNumber,
+        location: custom.dropoffLocation
+      }]
+    }]
+  }];
+  await query(
+    "UPDATE dispatch_plan_snapshots SET orders = $2::jsonb, trucks = $3::jsonb, saved_at = now() WHERE plan_id = $1",
+    [seeded.id, JSON.stringify([snapshot]), JSON.stringify(trucks)]
+  );
+
+  const lease = await fixture.acquireLease({ planDate: seeded.plan_date, sessionId: "dispatch-v2-date-digest" });
+  let current = await bootstrap(seeded.id, seeded.plan_date);
+  let result = await command(current, seeded.id, lease, "dp27-save-one", "replace_plan", {
+    planDate: seeded.plan_date,
+    orders: current.plan.assignedOrderSnapshots,
+    trucks: current.plan.trucks,
+    summary: { ...current.plan.summary, saveSequence: 1 },
+    affectedOrderRefs: [custom.refNumber],
+    actionName: "dispatch_plan_autosaved"
+  });
+  assert.equal(result.response.status, 200, JSON.stringify(result.payload));
+  current = result.payload;
+
+  result = await command(current, seeded.id, lease, "dp27-save-two", "replace_plan", {
+    planDate: seeded.plan_date,
+    orders: current.plan.assignedOrderSnapshots,
+    trucks: current.plan.trucks,
+    summary: { ...current.plan.summary, saveSequence: 2 },
+    affectedOrderRefs: [custom.refNumber],
+    actionName: "dispatch_plan_undo"
+  });
+  assert.equal(result.response.status, 200, JSON.stringify(result.payload));
+  assert.equal(result.payload.plan.revision, current.plan.revision + 1);
+  assert.equal(result.payload.plan.summary.saveSequence, 2);
 });
 
 test("DP-07: compact-board replacement cannot bypass cross-date order ownership", async () => {

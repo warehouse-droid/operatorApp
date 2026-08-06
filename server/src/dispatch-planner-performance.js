@@ -105,6 +105,10 @@ function compactOrderRefs(plan = {}) {
 }
 
 function stableValue(value) {
+  // Dispatch snapshots are persisted as jsonb. Match JSON serialization before
+  // hashing so database-backed Date values and their reloaded ISO strings have
+  // one canonical representation across consecutive commands.
+  if (value instanceof Date) {return value.toJSON();}
   if (Array.isArray(value)) {return value.map(stableValue);}
   if (!value || typeof value !== "object") {return value;}
   return Object.fromEntries(

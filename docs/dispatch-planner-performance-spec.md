@@ -149,6 +149,10 @@ Given completed or active loads whose authoritative intervals differ from the br
 
 Given a successful planner mutation, when the dispatcher chooses Undo or Redo, the browser saves the restored history snapshot even though its in-memory history fingerprint was deliberately reset to that same snapshot. The operation must advance the durable plan revision and survive reload; it must never remain a browser-only visual change.
 
+### DP-27 — Acknowledged digests survive JSON persistence
+
+Given a compact plan containing canonical Custom Order timestamps represented as JavaScript `Date` values, when a command is acknowledged, stored as PostgreSQL `jsonb`, reloaded, and followed by another guarded command, the acknowledged digest must still match the reloaded plan. JSON-backed values use their serialized representation for canonical hashing so a server-issued acknowledgement can never become stale merely because it crossed the database boundary.
+
 ## Setup and gauntlet plan
 
 - Reuse Node 20, `node:test`, Playwright, c8, TypeScript, ESLint, PostgreSQL, and the existing isolated Docker test environment.
