@@ -5657,7 +5657,10 @@ function undoDispatchChange() {
     details: { planDate: currentPlanDate }
   });
   isApplyingHistory = false;
-  commitPlanMutation("dispatch_plan_undo");
+  // historyCurrentState intentionally points at the restored snapshot already,
+  // so normal fingerprint detection sees no new change here. Force persistence
+  // or Undo would only alter this browser until the next reload.
+  commitPlanMutation("dispatch_plan_undo", null, { forceSave: true });
   return true;
 }
 
@@ -5683,7 +5686,7 @@ function redoDispatchChange() {
     details: { planDate: currentPlanDate }
   });
   isApplyingHistory = false;
-  commitPlanMutation("dispatch_plan_redo");
+  commitPlanMutation("dispatch_plan_redo", null, { forceSave: true });
   return true;
 }
 
@@ -5850,7 +5853,7 @@ function commitPlanMutation(actionName = "dispatch_plan_mutation", mutator = nul
   clearInvalidEndingTrips({ notify: true, audit: true });
   const planChanged = captureUndoPointIfNeeded(true);
   if (planChanged || options.forceSave) {
-    if (planChanged) clearDispatchForecast();
+    clearDispatchForecast();
     pendingPlanMutationAction = actionName || "dispatch_plan_mutation";
     markLocalPlanDirty();
     autoSavePlan();

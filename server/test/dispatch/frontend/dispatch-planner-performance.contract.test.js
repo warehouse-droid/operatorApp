@@ -229,6 +229,19 @@ test("DP-24 frontend: incomplete compact order snapshots never delete executed c
   );
 });
 
+test("DP-26 frontend: planner undo and redo are persisted even after resetting the history fingerprint", () => {
+  assert.match(
+    functionBody("undoDispatchChange"),
+    /commitPlanMutation\(\s*["']dispatch_plan_undo["']\s*,\s*null\s*,\s*\{\s*forceSave:\s*true\s*\}\s*\)/u,
+    "Undo must force a server save because its history fingerprint already describes the restored state."
+  );
+  assert.match(
+    functionBody("redoDispatchChange"),
+    /commitPlanMutation\(\s*["']dispatch_plan_redo["']\s*,\s*null\s*,\s*\{\s*forceSave:\s*true\s*\}\s*\)/u,
+    "Redo must force a server save because its history fingerprint already describes the restored state."
+  );
+});
+
 test("DP-15: successful popup persistence never replaces the dispatch planner root", () => {
   const coPersistence = functionBody("persistTransitCoInBackground");
   assert.doesNotMatch(coPersistence, /render\(\{\s*save:\s*false\s*\}\)/u);

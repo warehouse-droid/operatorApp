@@ -145,6 +145,10 @@ Given a historical grouped order whose child order document is absent from the c
 
 Given completed or active loads whose authoritative intervals differ from the browser's stale recalculation, when dispatch appends an order or load after the protected prefix, the server first restores the protected intervals and then shifts each overlapping unlocked later load as one interval. Stop timing, previous-finish metadata, handoff travel, and truck-switch timing move by the same offset. Protected loads remain unchanged, and an explicit fixed future start is never rewritten merely to hide a genuine conflict.
 
+### DP-26 — Undo and redo persist their restored state
+
+Given a successful planner mutation, when the dispatcher chooses Undo or Redo, the browser saves the restored history snapshot even though its in-memory history fingerprint was deliberately reset to that same snapshot. The operation must advance the durable plan revision and survive reload; it must never remain a browser-only visual change.
+
 ## Setup and gauntlet plan
 
 - Reuse Node 20, `node:test`, Playwright, c8, TypeScript, ESLint, PostgreSQL, and the existing isolated Docker test environment.

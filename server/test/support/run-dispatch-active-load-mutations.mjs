@@ -43,6 +43,20 @@ const mutants = [
     before: "  return rebaseMutableLaneSuffixes(overlaidPlan, restoredLoadIds, locked);",
     after: "  return overlaidPlan;",
     command: ["src/dispatch-load-assignment-harness.js"]
+  },
+  {
+    name: "keeps planner undo as a browser-only history change",
+    file: "public/dispatch.js",
+    before: "  commitPlanMutation(\"dispatch_plan_undo\", null, { forceSave: true });",
+    after: "  commitPlanMutation(\"dispatch_plan_undo\");",
+    command: ["--test", "test/dispatch/frontend/dispatch-planner-performance.contract.test.js"]
+  },
+  {
+    name: "keeps planner redo as a browser-only history change",
+    file: "public/dispatch.js",
+    before: "  commitPlanMutation(\"dispatch_plan_redo\", null, { forceSave: true });",
+    after: "  commitPlanMutation(\"dispatch_plan_redo\");",
+    command: ["--test", "test/dispatch/frontend/dispatch-planner-performance.contract.test.js"]
   }
 ];
 
