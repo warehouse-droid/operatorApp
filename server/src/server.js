@@ -12540,7 +12540,23 @@ app.put("/api/dispatch/orders/:id/vendor-yard", async (req, res, next) => {
   }
 });
 
-app.put("/api/dispatch/orders/:id/details", async (req, res, next) => {
+function reportDispatchCoTiming(phase) {
+  return (req, res, next) => {
+    const startedAt = Date.now();
+    res.once("finish", () => {
+      console.info("[dispatch-co-timing]", JSON.stringify({
+        phase,
+        orderRef: String(req.params?.id || req.body?.sourceOrderRef || ""),
+        responseMode: String(req.query?.response || "legacy"),
+        status: res.statusCode,
+        durationMs: Date.now() - startedAt
+      }));
+    });
+    next();
+  };
+}
+
+app.put("/api/dispatch/orders/:id/details", reportDispatchCoTiming("details_update"), async (req, res, next) => {
   try {
     await requireDispatchPlanEditLease(req);
     const updated = await updateDispatchOrderDetails(req.params.id, req.body || {});
@@ -12563,6 +12579,10 @@ app.put("/api/dispatch/orders/:id/details", async (req, res, next) => {
       }
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { orderId: req.params.id, change: "details", sourceSessionId: req.body?.audit?.sessionId });
+    if (req.query.response === "ack") {
+      dispatchPrivateNoStore(res);
+      return res.json({ updated });
+    }
     if (req.query.response === "targeted") {
       const order = (await targetedDispatchMutationOrders([req.params.id]))[0] || null;
       return res.json({ updated, order });
@@ -12704,7 +12724,7 @@ app.post("/api/dispatch/split-orders/unsplit", async (req, res, next) => {
   }
 });
 
-app.post("/api/dispatch/co-orders", async (req, res, next) => {
+app.post("/api/dispatch/co-orders", reportDispatchCoTiming("co_upsert"), async (req, res, next) => {
   try {
     await requireDispatchPlanEditLease(req);
     const co = await upsertLocalCoOrder({

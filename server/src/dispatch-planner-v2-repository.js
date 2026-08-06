@@ -67,12 +67,14 @@ function rowPlan(row = {}) {
 function slimAssignedOrder(order = {}) {
   const keys = [
     "id", "orderId", "orderRef", "tranid", "refNumber", "type", "status", "statusText",
+    "customOrderId", "customOrder", "localDispatchStatus",
     "customer", "customerName", "address", "pickupAddress", "pickupAddressOverride",
     "sourceAddress", "defaultSourceAddress", "dropoffLocation", "pickupLocation",
-    "pickupLocations", "sourceYard", "destinationYard", "destinationLocationId",
+    "pickupLocations", "sourceYard", "destinationYard", "destinationAddress", "destinationLocationId",
     "expectedDeliveryDate", "windowStart", "windowEnd", "items", "pallets", "layers",
-    "salesQty", "committedQty", "weight", "totalWeightLbs", "unloadMinutes", "travelMinutes",
-    "notes", "originalOrderId", "sourceOrderId", "relatedSoId", "originalPoRef", "childOrders",
+    "salesQty", "salesQuantities", "committedQty", "packed", "weight", "totalWeightLbs",
+    "unloadMinutes", "travelMinutes", "stopMinutes", "instructions", "notes",
+    "originalOrderId", "sourceOrderId", "relatedSoId", "originalPoRef", "childOrders",
     "childOrderDetails", "groupAliases", "transitCo", "planOwned", "isSplit", "isGrouped",
     "sourceTable", "netsuiteId", "dispatchRef", "dependency", "dependencies", "mbt"
   ];

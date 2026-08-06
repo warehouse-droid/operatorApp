@@ -156,6 +156,37 @@ test("DP-03/DP-11: SO, PO, TO, and CO popup mutations request targeted order res
   assert.doesNotMatch(targetedServer, /listDispatchOrdersForResponse\(\s*\)/u);
 });
 
+test("DP-18 frontend: CO initiation blocks only on the lightweight details acknowledgement", () => {
+  assert.match(
+    dispatchSource,
+    /orders\/\$\{encodeURIComponent\(order\.id\)\}\/details\?response=ack/u,
+    "CO initiation must not wait for targeted/global order hydration before it advances the UI."
+  );
+  const detailsRoute = (() => {
+    const start = serverSource.indexOf('app.put("/api/dispatch/orders/:id/details"');
+    assert.notEqual(start, -1, "Expected the dispatch details route.");
+    return serverSource.slice(start, start + 3_000);
+  })();
+  const acknowledgement = detailsRoute.indexOf('req.query.response === "ack"');
+  const targetedHydration = detailsRoute.indexOf("targetedDispatchMutationOrders");
+  assert.ok(acknowledgement >= 0, "The details route must implement response=ack.");
+  assert.ok(
+    targetedHydration < 0 || acknowledgement < targetedHydration,
+    "The acknowledgement must return before targeted order hydration."
+  );
+});
+
+test("DP-19 frontend: completed travel evidence survives local mutations while stale forecasts stay hidden", () => {
+  const rememberEvidence = functionBody("rememberDispatchTravelExecutionEvidence");
+  assert.match(rememberEvidence, /actualLeave|actualArrival|status/u);
+  assert.match(rememberEvidence, /kind[^\n]+inter_stop/u);
+  const clearForecast = functionBody("clearDispatchForecast");
+  assert.match(clearForecast, /rememberDispatchTravelExecutionEvidence\(dispatchForecast\)/u);
+  const travelForPair = functionBody("travelLegForVisitPair");
+  assert.match(travelForPair, /interStopExecutionEvidenceForLoad/u);
+  assert.match(travelForPair, /travelLegMatchesVisitPair/u);
+});
+
 test("DP-15: successful popup persistence never replaces the dispatch planner root", () => {
   const coPersistence = functionBody("persistTransitCoInBackground");
   assert.doesNotMatch(coPersistence, /render\(\{\s*save:\s*false\s*\}\)/u);

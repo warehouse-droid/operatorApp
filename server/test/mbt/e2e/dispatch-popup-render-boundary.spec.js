@@ -160,3 +160,171 @@ test("DP-15 browser: group and split popups preserve the planner root, focus, sc
   expect(await rootHandle.evaluate((element) => element === globalThis.document.querySelector("[data-dispatch-planner-root]"))).toBe(true);
   expect(requestsAfterInitialLoad).not.toContain("GET /api/dispatch/plans/current");
 });
+
+test("DP-17/DP-19 browser: compact Custom Order startup keeps completed travel styling through a failed save", async ({ page, request }) => {
+  const compactOrder = {
+    id: "DP-UI-CUSTOM",
+    customOrderId: "120",
+    customOrder: true,
+    type: "CUSTOM",
+    sourceTable: "dispatch_custom_orders",
+    dispatchRef: "DP-UI-CUSTOM",
+    customer: "Custom Order",
+    address: "88 Compact Test Road",
+    destinationAddress: "88 Compact Test Road",
+    sourceYard: "3445",
+    sourceAddress: "3445 Kennedy Road, Toronto, ON",
+    defaultSourceAddress: "3445 Kennedy Road, Toronto, ON",
+    pickupLocations: ["3445"],
+    stopMinutes: 47,
+    instructions: "Compact browser evidence",
+    notes: "Compact browser evidence",
+    items: [{ sku: "CUSTOM", quantity: 1, unit: "LOAD" }],
+    salesQty: 1,
+    salesQuantities: [{ unit: "LOAD", quantity: 1 }],
+    packed: { pallets: 0, layers: 0, sections: 0, pieces: 0 },
+    weight: 2300
+  };
+  const compactPlan = {
+    id: "777",
+    planId: "777",
+    planDate,
+    revision: 4,
+    digest: "dp-compact-browser-digest",
+    status: "draft",
+    summary: { driverLaneOrder: ["compact-driver"] },
+    assignedOrderSnapshots: [compactOrder],
+    trucks: [{
+      id: "DP-TRAVEL-TRUCK",
+      plate: "DP-TRAVEL-TRUCK",
+      driver: "Compact Driver",
+      driverLogin: "compact-driver",
+      base: "3445",
+      loads: [{
+        id: "dp-travel-load",
+        name: "Load 1",
+        driverName: "Compact Driver",
+        driverLogin: "compact-driver",
+        truckId: "DP-TRAVEL-TRUCK",
+        truckPlate: "DP-TRAVEL-TRUCK",
+        startMode: "auto",
+        stops: [
+          { id: "dp-travel-pick", loadId: "dp-travel-load", type: "pick", orderId: compactOrder.id, location: "3445" },
+          { id: "dp-travel-drop", loadId: "dp-travel-load", type: "drop", orderId: compactOrder.id, location: compactOrder.address }
+        ]
+      }]
+    }]
+  };
+  const forecast = {
+    planId: "777",
+    planRevision: 4,
+    loads: [],
+    timelineEvents: [],
+    stops: [
+      {
+        stopId: "dp-travel-pick",
+        plannedArrival: "2038-11-14T07:00:00.000Z",
+        plannedLeave: "2038-11-14T07:40:00.000Z"
+      },
+      {
+        stopId: "dp-travel-drop",
+        plannedArrival: "2038-11-14T08:10:00.000Z",
+        plannedLeave: "2038-11-14T08:57:00.000Z"
+      }
+    ],
+    travelLegs: [{
+      kind: "inter_stop",
+      loadId: "dp-travel-load",
+      legId: "dp-travel-pick-to-dp-travel-drop",
+      from: "3445 Kennedy Road, Toronto, ON",
+      to: "88 Compact Test Road",
+      plannedLeave: "2038-11-14T07:40:00.000Z",
+      plannedArrival: "2038-11-14T08:10:00.000Z",
+      actualLeave: "2038-11-14T07:42:00.000Z",
+      actualArrival: "2038-11-14T08:12:00.000Z",
+      status: "complete"
+    }]
+  };
+  let failedSaveRequests = 0;
+  const routePayloads = new Map([
+    ["/api/dispatch/v2/bootstrap", { exists: true, plan: compactPlan }],
+    ["/api/dispatch/config", { googleMapsApiKey: "", driverOrientedPlanning: true }],
+    ["/api/dispatch/setup", {
+      drivers: [{ name: "Compact Driver", login: "compact-driver", license: "AZ", ownYardFixedMinutes: 40, deliveryFixedMinutes: 35, minutesPerPallet: 1 }],
+      trucks: [{ plate: "DP-TRAVEL-TRUCK", capacityLbs: 48_000, baseYard: "3445" }],
+      ownYards: [{ code: "3445", name: "3445", address: "3445 Kennedy Road, Toronto, ON" }],
+      planning: { truckSwitchMinutes: 10 }
+    }],
+    ["/api/dispatch/forecast", forecast],
+    ["/api/dispatch/driver-job-statuses", []],
+    ["/api/dispatch/driver-truck-switches/attention", []],
+    ["/api/dispatch/plans", []],
+    ["/api/dispatch/plan-edit-lease", { lease: null }],
+    ["/api/dispatch/plan-edit-lease/heartbeat", { released: true }],
+    ["/api/dispatch/plan-edit-lease/release", { released: true }]
+  ]);
+  await page.route("**/api/dispatch/**", async (route) => {
+    const requestInfo = route.request();
+    const path = new URL(requestInfo.url()).pathname;
+    if (path === "/api/dispatch/orders") {
+      return route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ error: "full feed unavailable in compact-start test" }) });
+    }
+    if (routePayloads.has(path)) {
+      return json(route, routePayloads.get(path));
+    }
+    if (path === "/api/dispatch/plan-edit-lease/acquire") {
+      const body = requestInfo.postDataJSON();
+      return json(route, {
+        lease: { active: true, sessionId: body.sessionId, operatorName: "Compact browser" },
+        editLeaseToken: "compact-browser-lease"
+      });
+    }
+    if (path === "/api/dispatch/v2/plans/777/commands") {
+      failedSaveRequests += 1;
+      return route.fulfill({
+        status: 409,
+        contentType: "application/json",
+        body: JSON.stringify({ error: "Injected save rejection", code: "DISPATCH_TEST_SAVE_REJECTED" })
+      });
+    }
+    return json(route, dispatchFixture(path));
+  });
+  await page.route("**/api/mbt/status", (route) => json(route, { capabilities: { binDispatch: { enabled: false } } }));
+
+  const token = await loginToken(request);
+  await page.goto("/");
+  await page.evaluate(({ token: value, date }) => {
+    globalThis.localStorage.setItem("mbbs.staff.token", value);
+    globalThis.localStorage.setItem("mbbs.staff.role", "dispatcher");
+    globalThis.localStorage.setItem("mbbs.staff.roles", JSON.stringify(["dispatcher"]));
+    globalThis.localStorage.setItem("mbbs.dispatch.token", value);
+    globalThis.localStorage.setItem("mbbs.dispatch.planDate", date);
+  }, { token, date: planDate });
+  await page.goto("/dispatch/planning");
+
+  const root = page.locator("[data-dispatch-planner-root]");
+  const rootHandle = await root.elementHandle();
+  const travel = page.locator('[data-travel-leg="dp-travel-pick-to-dp-travel-drop"]');
+  await expect(travel).toHaveClass(/inter-stop-travel.*status-complete/);
+  const style = await travel.evaluate((element) => {
+    const computed = globalThis.getComputedStyle(element);
+    const main = element.querySelector(".stop-main").getBoundingClientRect();
+    const timing = element.querySelector(".stop-time").getBoundingClientRect();
+    return {
+      backgroundColor: computed.backgroundColor,
+      borderTopStyle: computed.borderTopStyle,
+      timingRightAligned: timing.left > main.left
+    };
+  });
+  expect(style).toEqual({
+    backgroundColor: "rgb(207, 215, 221)",
+    borderTopStyle: "dashed",
+    timingRightAligned: true
+  });
+
+  await page.getByRole("button", { name: "Enter Edit Mode" }).dispatchEvent("click");
+  await page.locator('[data-load-start-mode="dp-travel-load"]').selectOption("fixed");
+  await expect.poll(() => failedSaveRequests).toBeGreaterThan(0);
+  await expect(travel).toHaveClass(/inter-stop-travel.*status-complete/);
+  expect(await rootHandle.evaluate((element) => element === globalThis.document.querySelector("[data-dispatch-planner-root]"))).toBe(true);
+});

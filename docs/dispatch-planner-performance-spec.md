@@ -105,6 +105,20 @@ Every performance test records individual samples, median, P95, maximum, and res
 - No production database or production NetSuite/Samsara endpoint may be used by tests.
 - Existing snapshot history must not be destructively pruned during migration; retention runs separately in bounded batches after the new code is live.
 
+## 2026-08-06 regression addendum — compact CO identity and initiation latency
+
+### DP-17 — Compact assigned Custom Orders remain saveable
+
+Given an assigned Custom Order whose durable `dispatch_custom_orders.id` is present in the current snapshot, when the compact v2 bootstrap is rendered before the full order feed and the browser submits that compact board unchanged, then the assigned order retains its stable Custom Order ID, predecessor/relationship fields, address, and stop-duration fields. The save succeeds without `DISPATCH_CUSTOM_ORDER_PLAN_INVALID`, and a rejected save must never blank or replace the last valid planner board.
+
+### DP-18 — Custom Order initiation uses a bounded acknowledgement
+
+Given a dispatcher editing one source order while hundreds of orders and large historical snapshots exist, when dispatch details are saved as the first step of Custom Order initiation, then the blocking response contains only the persisted update acknowledgement and does not hydrate the global dispatch order feed or scan plan snapshots. The isolated HTTP response is below 25 KB and completes below 500 ms. Targeted and legacy response modes remain available for older clients.
+
+### DP-19 — Compact travel cards remain operationally complete
+
+Given the full order feed is delayed or unavailable, when an assigned compact plan contains completed travel legs and custom stop durations, then the travel card retains its travel/status classes, completed grey treatment, address, and timing layout. A subsequent failed save leaves the same planner root and travel card visible.
+
 ## Setup and gauntlet plan
 
 - Reuse Node 20, `node:test`, Playwright, c8, TypeScript, ESLint, PostgreSQL, and the existing isolated Docker test environment.

@@ -464,6 +464,7 @@ let driverJobStatuses = [];
 let driverJobStatusesLoadedPlanId = "";
 let driverTruckSwitchAttention = [];
 let dispatchForecast = null;
+let dispatchTravelExecutionEvidence = { planId: "", planDate: "", travelLegs: [] };
 let dispatchForecastRequestSequence = 0;
 let dispatchForecastInFlight = false;
 let dispatchForecastPollTimer = null;
@@ -3948,6 +3949,36 @@ function forecastMatchesCurrentPlan(forecast = dispatchForecast) {
     && Number(forecast.planRevision ?? forecast.revision ?? 0) === Number(currentPlan.revision ?? 0);
 }
 
+function rememberDispatchTravelExecutionEvidence(forecast) {
+  forecast ||= {};
+  const planId = String(forecast?.planId || "");
+  if (!planId) return;
+  dispatchTravelExecutionEvidence = {
+    planId,
+    planDate: String(forecast?.planDate || currentPlanDate || "").slice(0, 10),
+    travelLegs: (forecast?.travelLegs || []).filter((leg) =>
+      String(leg?.kind || "") === "inter_stop"
+      && (
+        Boolean(leg?.actualLeave || leg?.actualArrival)
+        || ["complete", "completed", "in_progress", "in-progress", "started"].includes(String(leg?.status || "").toLowerCase())
+      )
+    ).map((leg) => ({ ...leg }))
+  };
+}
+
+function interStopExecutionEvidenceForLoad(load) {
+  if (
+    !currentPlan?.id
+    || String(dispatchTravelExecutionEvidence.planId || "") !== String(currentPlan.id)
+    || (
+      dispatchTravelExecutionEvidence.planDate
+      && String(dispatchTravelExecutionEvidence.planDate) !== String(currentPlanDate || "").slice(0, 10)
+    )
+  ) return [];
+  return (dispatchTravelExecutionEvidence.travelLegs || [])
+    .filter((record) => String(record.loadId || "") === String(load?.id || ""));
+}
+
 function dispatchBackgroundRenderBlocked() {
   const active = document.activeElement;
   const editing = Boolean(active && app.contains(active) && active.matches?.("input, textarea, select, [contenteditable='true']"));
@@ -3973,6 +4004,7 @@ async function loadDispatchForecast({ renderAfter = false } = {}) {
       || Number(forecast?.planRevision ?? forecast?.revision ?? 0) !== revision
     ) return false;
     dispatchForecast = forecast;
+    rememberDispatchTravelExecutionEvidence(forecast);
     if (renderAfter && !dispatchBackgroundRenderBlocked()) {
       if (renderAfter === "planner") renderDispatchPlannerPatch();
       else render({ save: false });
@@ -3987,6 +4019,7 @@ async function loadDispatchForecast({ renderAfter = false } = {}) {
 }
 
 function clearDispatchForecast() {
+  rememberDispatchTravelExecutionEvidence(dispatchForecast);
   dispatchForecast = null;
   dispatchForecastRequestSequence += 1;
   dispatchForecastInFlight = false;
@@ -4057,6 +4090,30 @@ function interStopForecastLegs(load) {
   return forecastTravelRecordsForLoad(load).filter((record) => String(record.kind || "") === "inter_stop");
 }
 
+function travelLegEndpointMatchesVisit(value, visit) {
+  const candidates = [
+    visit?.address,
+    ...(visit?.entries || []).flatMap((entry) => [
+      entry?.stop?.location,
+      entry?.order?.address,
+      entry?.order?.sourceAddress,
+      entry?.order?.destinationAddress,
+      entry?.order?.sourceYard,
+      entry?.order?.destinationYard
+    ])
+  ].map((candidate) => String(candidate || "").trim()).filter(Boolean);
+  const endpoint = String(value || "").trim();
+  return Boolean(endpoint) && candidates.some((candidate) =>
+    normalizedPlaceKey(candidate) === normalizedPlaceKey(endpoint)
+    || samePhysicalAddress(candidate, endpoint)
+  );
+}
+
+function travelLegMatchesVisitPair(leg, previousVisit, nextVisit) {
+  return travelLegEndpointMatchesVisit(leg?.from, previousVisit)
+    && travelLegEndpointMatchesVisit(leg?.to, nextVisit);
+}
+
 function travelLegForVisitPair(load, previousVisit, nextVisit, pairIndex = -1) {
   const previousStopIds = new Set((previousVisit?.entries || []).map((entry) => String(entry.stop.id || "")));
   const nextStopIds = new Set((nextVisit?.entries || []).map((entry) => String(entry.stop.id || "")));
@@ -4069,11 +4126,16 @@ function travelLegForVisitPair(load, previousVisit, nextVisit, pairIndex = -1) {
     && String(leg.plannedArrival || "") === String(nextRecord.plannedArrival)
   );
   if (exact) return exact;
-  return interStopForecastLegs(load).find((leg) => {
+  const identified = interStopForecastLegs(load).find((leg) => {
     const text = `${leg.legId || ""} ${leg.from || ""} ${leg.to || ""}`;
     return [...previousStopIds].some((id) => id && text.includes(id))
       && [...nextStopIds].some((id) => id && text.includes(id));
-  }) || (pairIndex >= 0 ? interStopForecastLegs(load)[pairIndex] : null) || null;
+  });
+  if (identified) return identified;
+  const indexed = pairIndex >= 0 ? interStopForecastLegs(load)[pairIndex] : null;
+  if (indexed) return indexed;
+  return interStopExecutionEvidenceForLoad(load)
+    .find((leg) => travelLegMatchesVisitPair(leg, previousVisit, nextVisit)) || null;
 }
 
 async function refreshDriverExecutionAndForecast({ renderAfter = true } = {}) {
@@ -14215,7 +14277,7 @@ app.addEventListener("submit", (event) => {
     setEditFormStatus(form, "Saving dispatch info...", "info");
     const saveDetails = isLocalDispatchOrder(order)
       ? Promise.resolve({ orders: null })
-          : fetch(`/api/dispatch/orders/${encodeURIComponent(order.id)}/details?response=targeted`, {
+          : fetch(`/api/dispatch/orders/${encodeURIComponent(order.id)}/details?response=ack`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(dispatchLeaseRequestPayload({
