@@ -28,14 +28,15 @@ includesAll(control, [
 ], "reconciliation settings and loading");
 
 includesAll(control, [
-  '["all", "PO", "TO", "order_family"]',
+  '["all", "SO", "PO", "TO", "order_family"]',
   "body.orderKind = orderKind",
   "normalizeScmReconciliationOrderRefs",
   "body.orderRefs = orderRefs",
   'body.orderRef = orderRefs.join(", ")',
   "const body = { scope, dryRun, includeTerminalOrders }",
   "scmReconciliationIncludeTerminalOrders",
-  "scope === \"all\" && !scmReconciliationInitialApproved()",
+  "scmReconciliationScopeApproved(scope, orderKind)",
+  "scmReconciliationSoInitialApproved",
   "const dryRun = forceInitialDryRun",
   '"succeeded", "awaiting_approval"',
   "scmReconciliationAppliedRunFor",
@@ -220,8 +221,10 @@ includesAll(resumeAction, [
 ], "manual resume confirmation and request");
 
 includesAll(control, [
-  "PO / TO Schedule Reconciliation",
+  "SO / PO / TO Reconciliation",
   "Initial full reconciliation:",
+  "SO only",
+  "All SO / PO / TO",
   'reconciliation: "/admin/reconciliation"',
   "SCM_RECONCILIATION_SELECTED_RUN_KEY",
   "ensureScmReconciliationSelectedRun",
@@ -481,7 +484,7 @@ assert.ok(
   "Admin reconciliation CSS cache bust is missing."
 );
 assert.ok(
-  adminHtml.includes("/control.js?v=20260730-reconciliation-resume-v1"),
+  adminHtml.includes("/control.js?v=20260805-so-type-filter-v2"),
   "Admin reconciliation client cache bust is missing."
 );
 assert.ok(
@@ -489,17 +492,17 @@ assert.ok(
   "Control reconciliation CSS cache bust is missing."
 );
 assert.ok(
-  controlHtml.includes("/control.js?v=20260730-reconciliation-resume-v1"),
+  controlHtml.includes("/control.js?v=20260805-so-type-filter-v2"),
   "Control reconciliation client cache bust is missing."
 );
 includesAll(sidebar, [
-  '{ label: "PO / TO Reconcile", href: "/admin/reconciliation", controlSection: "reconciliation", icon: "RC" }'
+  '{ label: "SO / PO / TO Reconcile", href: "/admin/reconciliation", controlSection: "reconciliation", icon: "RC" }'
 ], "dedicated reconciliation sidebar navigation");
 for (const html of [adminHtml, controlHtml]) {
   assert.ok(
-    html.includes("/app-sidebar.js?v=20260729-scm-reconciliation-page-v1"),
+    html.includes("/app-sidebar.js?v=20260805-so-type-filter-v2"),
     "Reconciliation sidebar cache bust is missing."
   );
 }
 
-console.log("Admin PO/TO reconciliation UI harness passed.");
+console.log("Admin SO/PO/TO reconciliation UI harness passed.");

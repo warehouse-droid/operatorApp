@@ -15,6 +15,7 @@ import {
   dismissDriverClientSyncIssue,
   fingerprintDriverOfflineJob,
   fingerprintDriverOfflineJobContent,
+  findOpenDriverOfflineJobCompletion,
   getDriverOfflineEvent,
   getDriverOfflineReview,
   getDriverOfflineSyncQueue,
@@ -56,14 +57,18 @@ const suffix = crypto.randomBytes(6).toString("hex");
 const driverLogin = `offline-harness-${suffix}`;
 const deviceId = `offline-device-${suffix}`;
 const secondDeviceId = `offline-device-2-${suffix}`;
+const duplicateDeviceId = `offline-duplicate-device-${suffix}`;
 const manifestId = crypto.randomUUID();
 const secondManifestId = crypto.randomUUID();
+const duplicateManifestId = crypto.randomUUID();
 const startedEventId = crypto.randomUUID();
 const completedEventId = crypto.randomUUID();
+const duplicateCompletionEventId = crypto.randomUUID();
 const reviewEventId = crypto.randomUUID();
 const crossDeviceBlockedEventId = crypto.randomUUID();
 const blockedEventId = crypto.randomUUID();
 const photoId = crypto.randomUUID();
+const duplicatePhotoId = crypto.randomUUID();
 const missingPhotoDriverLogin = `offline-missing-photo-${suffix}`;
 const missingPhotoDeviceId = `offline-missing-photo-device-${suffix}`;
 const missingPhotoManifestId = crypto.randomUUID();
@@ -378,6 +383,20 @@ try {
         planDate,
         pendingEventCount: 2,
         unsyncedPhotoCount: 1,
+        photoFailures: Array.from({ length: 12 }, (_, index) => ({
+          photoId: `photo-${index}`,
+          eventId: `event-${index}`,
+          phase: index === 0 ? "upload" : "ticket",
+          byteSize: 1000000 + index,
+          attemptCount: index + 1,
+          retryable: index !== 1,
+          errorCode: index === 0 ? "upstream_timeout" : "ticket_failed",
+          httpStatus: index === 0 ? 503 : 0,
+          message: index === 0
+            ? `<gateway> ${"x".repeat(1200)}`
+            : `Photo ${index} failed.`,
+          privateBlob: "must not be retained"
+        })),
         clientOccurredAt: new Date().toISOString()
       }
     });
@@ -385,6 +404,23 @@ try {
     assert.equal(clientSyncIssues.length, 1);
     assert.equal(clientSyncIssues[0].errorMessage, "IndexedDB transaction failed.");
     assert.equal(clientSyncIssues[0].pendingEventCount, 2);
+    assert.equal(clientSyncIssues[0].photoFailures.length, 10, "Photo diagnostics must have a hard record limit.");
+    assert.deepEqual(
+      clientSyncIssues[0].photoFailures[0],
+      {
+        photoId: "photo-0",
+        eventId: "event-0",
+        phase: "upload",
+        byteSize: 1000000,
+        attemptCount: 1,
+        retryable: true,
+        errorCode: "upstream_timeout",
+        httpStatus: 503,
+        message: `<gateway> ${"x".repeat(990)}`
+      },
+      "Dispatch must receive only the bounded diagnostic allowlist."
+    );
+    assert.equal("privateBlob" in clientSyncIssues[0].photoFailures[0], false);
     assert.equal(
       (await getDriverSession(createdSession.token, { touch: false }))?.metadata?.harness,
       true,
@@ -604,6 +640,16 @@ try {
       }),
       null
     );
+    const duplicateDeviceManifest = await persistDriverOfflineDayPlan({
+      manifestId: duplicateManifestId,
+      driverLogin,
+      deviceId: duplicateDeviceId,
+      planMetadata: { planId: null, planDate, planRevision: 7 },
+      jobs: [baseJob],
+      driverProfile: { login: driverLogin, name: "Offline Harness" },
+      dayState: { planDate, truckPlate: "TEST-101", preDvirStatus: "complete" },
+      samsaraWorkflowEnabled: false
+    });
 
     const missingPhotoJob = {
       ...baseJob,
@@ -807,6 +853,73 @@ try {
       "Receiving door was closed.",
       "The durable offline event must retain its driver remark for later synchronization."
     );
+    const pendingCompletionFromAnotherDevice = await findOpenDriverOfflineJobCompletion({
+      driverLogin,
+      deviceId: secondDeviceId,
+      planDate,
+      jobId: baseJob.jobId,
+      jobFingerprint: job.fingerprint,
+      jobPredecessorFingerprint: job.predecessorFingerprint
+    });
+    assert.equal(pendingCompletionFromAnotherDevice?.eventId, completedEventId);
+    assert.equal(pendingCompletionFromAnotherDevice?.status, "waiting_photos");
+    assert.equal(
+      await findOpenDriverOfflineJobCompletion({
+        driverLogin,
+        deviceId,
+        planDate,
+        jobId: baseJob.jobId,
+        jobFingerprint: job.fingerprint,
+        jobPredecessorFingerprint: job.predecessorFingerprint
+      }),
+      null,
+      "A device must not report its own open completion as a cross-device conflict."
+    );
+    assert.equal(
+      await findOpenDriverOfflineJobCompletion({
+        driverLogin,
+        deviceId: secondDeviceId,
+        planDate,
+        jobId: baseJob.jobId,
+        jobFingerprint: "b".repeat(64),
+        jobPredecessorFingerprint: job.predecessorFingerprint
+      }),
+      null,
+      "An older completion snapshot must not block a revised authoritative job."
+    );
+    assert.equal(
+      await findOpenDriverOfflineJobCompletion({
+        driverLogin,
+        deviceId: secondDeviceId,
+        planDate,
+        jobId: baseJob.jobId,
+        jobFingerprint: job.fingerprint,
+        jobPredecessorFingerprint: "reordered-predecessor"
+      }),
+      null,
+      "A completion from an older route position must not block the reordered authoritative job."
+    );
+    await assert.rejects(
+      registerDriverOfflineEvents({
+        driverLogin,
+        deviceId: duplicateDeviceId,
+        manifestId: duplicateManifestId,
+        events: [{
+          ...completed,
+          eventId: duplicateCompletionEventId,
+          clientSequence: 1,
+          jobFingerprint: duplicateDeviceManifest.jobs[0].fingerprint,
+          predecessorFingerprint: duplicateDeviceManifest.jobs[0].predecessorFingerprint,
+          photos: [{
+            ...completed.photos[0],
+            photoId: duplicatePhotoId
+          }]
+        }]
+      }),
+      (error) => error.status === 409
+        && error.code === "DRIVER_OFFLINE_CROSS_DEVICE_COMPLETION_CONFLICT",
+      "A second device must lose the registration race with a stable conflict code."
+    );
     const uncertainReceiptInput = {
       eventId: completedEventId,
       driverLogin,
@@ -909,6 +1022,18 @@ try {
     assert.equal(queue.find((event) => event.eventId === completedEventId)?.status, "pending");
     await markDriverOfflineEventApplied(startedEventId, { effectiveJobId: baseJob.jobId });
     await markDriverOfflineEventApplied(completedEventId, { effectiveJobId: baseJob.jobId });
+    assert.equal(
+      await findOpenDriverOfflineJobCompletion({
+        driverLogin,
+        deviceId: secondDeviceId,
+        planDate,
+        jobId: baseJob.jobId,
+        jobFingerprint: job.fingerprint,
+        jobPredecessorFingerprint: job.predecessorFingerprint
+      }),
+      null,
+      "An applied completion must stop blocking another device."
+    );
 
     await query(
       `INSERT INTO driver_job_records (

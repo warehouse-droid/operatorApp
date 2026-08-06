@@ -96,6 +96,12 @@ try {
   assert.equal(pickup.truckPlate, "ASSIGNED-B");
   assert.equal(pickup.pallets, 7);
   assert.equal(pickup.plannedMinutes, 57, "The load's driver timing must win over both parent and assigned-truck defaults.");
+  const childLocationPlan = structuredClone(planPayload);
+  childLocationPlan.orders[0].pickupLocations = ["CUSTOM-YARD : Special inventory"];
+  childLocationPlan.trucks[0].loads[0].stops[0].location = "CUSTOM-YARD : Special inventory";
+  const childLocationPickup = dispatchStatisticStopFromRow(row(childLocationPlan));
+  assert.equal(childLocationPickup.stopClass, "own_yard", "A child location must inherit its parent yard timing class.");
+  assert.equal(childLocationPickup.pallets, 7, "A child pickup must retain its parent-yard order footprint.");
   const currentDriverProfilePickup = dispatchStatisticStopFromRow(row(), {
     driverProfile: {
       login: "driver-v2",

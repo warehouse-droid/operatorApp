@@ -1,0 +1,530 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MBT Configuration · MBBS Operations</title>
+    <link rel="stylesheet" href="/mbt-shell.css" />
+  </head>
+  <body data-mbt-surface="config">
+    <main id="mbtApp" class="dispatch-shell mbt-shell" aria-labelledby="mbtTitle">
+      <header class="mbt-app-topbar">
+        <div class="mbt-app-brand">
+          <span class="mbt-app-mark" aria-hidden="true">CF</span>
+          <div>
+            <p>MBT Bin Operations · Local setup</p>
+            <h1 id="mbtTitle">Configuration</h1>
+          </div>
+        </div>
+        <span class="mbt-app-mode">No external writes</span>
+      </header>
+      <p class="mbt-lead">Configure MBT items locally now. Future NetSuite setup remains separate, read-only, and optional.</p>
+      <section class="mbt-status" aria-live="polite" aria-busy="true">
+        <h2>Loading controlled status</h2>
+        <p>Checking your live authority and the server safety gates.</p>
+      </section>
+      <div class="mbt-tabs" role="tablist" aria-label="Configuration sections">
+        <button
+          id="localItemSettingsTab"
+          type="button"
+          role="tab"
+          aria-selected="true"
+          aria-controls="localItemSettingsPanel"
+          tabindex="0"
+        >Local Items</button>
+        <button
+          id="customerSyncTab"
+          type="button"
+          role="tab"
+          aria-selected="false"
+          aria-controls="customerSyncPanel"
+          aria-label="Customer Sync & Import"
+          tabindex="-1"
+        >Customer Sync &amp; Import</button>
+        <button
+          id="materialsDumpSitesTab"
+          type="button"
+          role="tab"
+          aria-selected="false"
+          aria-controls="materialsDumpSitesPanel"
+          aria-label="Dump Sites"
+          tabindex="-1"
+        >Dump Sites</button>
+        <button
+          id="rateCardsTab"
+          type="button"
+          role="tab"
+          aria-selected="false"
+          aria-controls="rateCardsPanel"
+          tabindex="-1"
+        >Rate Cards</button>
+        <button
+          id="netSuiteReadinessTab"
+          type="button"
+          role="tab"
+          aria-selected="false"
+          aria-controls="netSuiteReadinessPanel"
+          tabindex="-1"
+        >Future NetSuite Setup</button>
+      </div>
+      <section
+        id="customerSyncPanel"
+        class="mbt-readiness"
+        role="tabpanel"
+        aria-labelledby="customerSyncTab"
+        tabindex="0"
+        hidden
+      >
+        <div class="mbt-readiness-heading">
+          <div>
+            <p class="mbt-eyebrow">Canonical customer directory</p>
+            <h2>Customer Sync &amp; Import</h2>
+            <p>Sync from the approved read-only NetSuite source, or preview an approved export for bootstrap and recovery.</p>
+          </div>
+          <span class="mbt-local-badge">No external write</span>
+        </div>
+        <p id="customerSyncMessage" class="mbt-message" role="status" aria-live="polite">Customer evidence has not loaded.</p>
+        <div class="mbt-config-columns">
+          <section class="mbt-editor" aria-labelledby="netSuiteCustomerSyncTitle">
+            <h3 id="netSuiteCustomerSyncTitle">Sync from NetSuite</h3>
+            <p>This primary action reads customer, subsidiary, address, and contact data. It never writes to NetSuite.</p>
+            <label>Audit reason<textarea id="customerSyncReason" maxlength="2000" rows="3">Refresh canonical customer directory</textarea></label>
+            <div class="mbt-form-actions">
+              <button id="syncCustomersButton" type="button">Sync from NetSuite</button>
+              <button id="refreshCustomerEvidenceButton" type="button" class="mbt-button-secondary">Refresh evidence</button>
+            </div>
+          </section>
+          <section class="mbt-editor" aria-labelledby="customerImportTitle">
+            <h3 id="customerImportTitle">Upload NetSuite export</h3>
+            <p>CSV or supported XML SpreadsheetML <code>.xls</code> files are previewed before any local apply.</p>
+            <div class="mbt-form-grid">
+              <label class="mbt-form-wide">Export file<input id="customerImportFile" type="file" accept=".csv,text/csv,.xls,application/vnd.ms-excel" /></label>
+              <label>Source account<input id="customerImportAccount" autocomplete="off" /></label>
+              <label>Approved subsidiary<input id="customerImportSubsidiary" autocomplete="off" /></label>
+              <label>Default currency<input id="customerImportCurrency" value="CAD" maxlength="3" autocomplete="off" /></label>
+              <label>Exported at<input id="customerImportExportedAt" type="datetime-local" /></label>
+              <label class="mbt-form-wide">Import note (optional)<textarea id="customerImportReason" maxlength="2000" rows="3" placeholder="Add context only when useful"></textarea></label>
+            </div>
+            <div class="mbt-form-actions">
+              <button id="previewCustomerImportButton" type="button">Preview import</button>
+              <button id="applyCustomerImportButton" type="button" class="mbt-button-secondary" disabled>Apply approved preview</button>
+            </div>
+            <pre id="customerImportPreview" class="mbt-json-summary" aria-label="Aggregate-only import preview">No preview.</pre>
+          </section>
+        </div>
+        <section aria-labelledby="customerEvidenceTitle">
+          <div class="mbt-section-heading">
+            <div>
+              <h3 id="customerEvidenceTitle">Source provenance and freshness</h3>
+              <p>Recent synchronization and import evidence is shown without raw upload data.</p>
+            </div>
+          </div>
+          <div class="mbt-table-wrap" tabindex="0">
+            <table aria-label="Customer synchronization runs">
+              <thead><tr><th>Source</th><th>Status</th><th>Records</th><th>Completed</th></tr></thead>
+              <tbody id="customerSyncRunRows"><tr><td colspan="4">No synchronization evidence loaded.</td></tr></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+      <section
+        id="localItemSettingsPanel"
+        class="mbt-readiness mbt-local-items"
+        role="tabpanel"
+        aria-labelledby="localItemSettingsTab"
+        tabindex="0"
+      >
+        <div class="mbt-readiness-heading">
+          <div>
+            <p class="mbt-eyebrow">Local-first configuration</p>
+            <h2>Local Item Settings</h2>
+            <p>Items are the base billing identity. Choose a type and the application applies its matching charging model.</p>
+          </div>
+          <span class="mbt-local-badge">No external write</span>
+        </div>
+
+        <div class="mbt-local-pricing" role="group" aria-label="Pricing ownership">
+          <span><strong>Bin</strong> fixed rental period (14 days by default)</span>
+          <span><strong>Surcharge</strong> added manually</span>
+          <span><strong>Dump</strong> charged per tonne</span>
+          <span><strong>Delivery fee</strong> charged by item-specific distance bands</span>
+        </div>
+
+        <p id="localItemMessage" class="mbt-message" role="status" aria-live="polite">Loading local item settings.</p>
+
+        <div class="mbt-config-columns">
+          <form id="customLocalItemForm" class="mbt-editor" aria-labelledby="customLocalItemTitle">
+            <h3 id="customLocalItemTitle">Create custom local item</h3>
+            <p>Identity and pricing behavior stay local. No NetSuite item is required.</p>
+            <div class="mbt-form-grid">
+              <label>Item code<input id="customLocalItemCode" required maxlength="64" autocomplete="off" /></label>
+              <label>Display name<input id="customLocalItemName" required maxlength="160" autocomplete="off" /></label>
+              <label>Item type<select id="customLocalItemType"><option value="bin">Bin</option><option value="surcharge">Surcharge</option><option value="dump">Dump</option><option value="delivery_fee">Delivery fee</option></select></label>
+              <label data-bin-item-field>Capacity (cubic yards)<input id="customLocalItemBinCapacityYards" type="number" min="1" step="1" inputmode="numeric" placeholder="For example, 50" /></label>
+              <label data-bin-item-field>Rental period (days)<input id="customLocalItemRentalDays" type="number" min="1" step="1" value="14" /></label>
+              <label class="mbt-checkbox"><input id="customLocalItemActive" type="checkbox" checked /><span>Active</span></label>
+              <label class="mbt-form-wide">Description<textarea id="customLocalItemDescription" maxlength="2000" rows="3"></textarea></label>
+            </div>
+            <button type="submit">Create custom item</button>
+          </form>
+          <section class="mbt-editor" data-import-resource="local_items" aria-labelledby="localItemImportTitle">
+            <h3 id="localItemImportTitle">Import local items by CSV</h3>
+            <p>Download the versioned template, then preview exact server validation before applying.</p>
+            <a data-mbt-template-download href="/api/mbt/config/imports/local-items/template" download>Download local-items template</a>
+            <label>CSV file<input id="localItemImportFile" type="file" accept=".csv,text/csv" /></label>
+            <label>Import note (optional)<textarea id="localItemImportReason" maxlength="2000" rows="2" placeholder="Add context only when useful"></textarea></label>
+            <div class="mbt-form-actions">
+              <button id="previewLocalItemImportButton" type="button">Preview CSV</button>
+              <button id="applyLocalItemImportButton" type="button" class="mbt-button-secondary" disabled>Apply preview</button>
+            </div>
+            <pre id="localItemImportPreview" class="mbt-json-summary" aria-label="Local-item import preview">No preview.</pre>
+          </section>
+        </div>
+
+        <section aria-labelledby="localItemTableTitle">
+          <div class="mbt-section-heading">
+            <div>
+              <h3 id="localItemTableTitle">Billable local concepts</h3>
+              <p>Identity and pricing behavior are server-owned. Use Inactivate to hide a record reversibly, or Delete only when it has no linked history.</p>
+            </div>
+          </div>
+          <div class="mbt-table-wrap" tabindex="0" aria-label="Local item settings">
+            <table aria-label="Local item settings">
+              <thead>
+                <tr>
+                  <th scope="col">Local item</th>
+                  <th scope="col">Identity</th>
+                  <th scope="col">Pricing behavior</th>
+                  <th scope="col">Readiness</th>
+                  <th scope="col">Action</th>
+                </tr>
+              </thead>
+              <tbody id="localItemRows">
+                <tr><td colspan="5">Loading local item settings.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="localItemEditor" class="mbt-editor" aria-labelledby="localItemEditorTitle" hidden>
+          <div class="mbt-section-heading">
+            <div>
+              <p class="mbt-eyebrow">Local presentation only</p>
+              <h3 id="localItemEditorTitle">Edit local item</h3>
+            </div>
+            <button id="cancelLocalItemButton" type="button" class="mbt-button-secondary">Cancel</button>
+          </div>
+          <p id="localItemIdentityHelp" class="mbt-semantic-help"></p>
+          <form id="localItemForm">
+            <input id="localItemCode" type="hidden" />
+            <input id="localItemRevision" type="hidden" />
+            <div class="mbt-form-grid">
+              <label>Display name<input id="localItemDisplayName" required maxlength="160" autocomplete="off" /></label>
+              <label class="mbt-checkbox">
+                <input id="localItemActive" type="checkbox" />
+                <span>Active</span>
+              </label>
+              <label class="mbt-form-wide">Description<textarea id="localItemDescription" maxlength="2000" rows="4"></textarea></label>
+              <label class="mbt-form-wide">Audit reason<textarea id="localItemReason" required maxlength="2000" rows="3"></textarea></label>
+            </div>
+            <div class="mbt-form-actions">
+              <button id="saveLocalItemButton" type="submit">Save local item</button>
+            </div>
+          </form>
+        </section>
+      </section>
+      <section
+        id="materialsDumpSitesPanel"
+        class="mbt-readiness"
+        role="tabpanel"
+        aria-labelledby="materialsDumpSitesTab"
+        tabindex="0"
+        hidden
+      >
+        <div class="mbt-readiness-heading">
+          <div><p class="mbt-eyebrow">Local reference data</p><h2>Dump Sites</h2><p>Choose the local dump items accepted by each site. Inactivate is reversible; Delete is blocked when operational history exists.</p></div>
+          <button id="refreshMaterialsButton" type="button" class="mbt-button-secondary">Refresh</button>
+        </div>
+        <p id="masterDataMessage" class="mbt-message" role="status" aria-live="polite">Dump sites have not loaded.</p>
+        <div class="mbt-config-columns mbt-config-columns-wide">
+          <form id="dumpSiteForm" class="mbt-editor">
+            <div class="mbt-section-heading">
+              <div><h3>Dump-site editor</h3><p id="dumpSiteEditorMode">Creating a new dump site.</p></div>
+              <button id="newDumpSiteButton" type="button" class="mbt-button-secondary">New dump site</button>
+            </div>
+            <label>Code<input id="dumpSiteCode" required autocomplete="off" /></label>
+            <label>Name<input id="dumpSiteName" required autocomplete="off" /></label>
+            <label>Address<input id="dumpSiteAddress" autocomplete="off" /></label>
+            <label>City<input id="dumpSiteCity" autocomplete="off" /></label>
+            <label>Region<input id="dumpSiteRegion" value="ON" autocomplete="off" /></label>
+            <label>Postal code<input id="dumpSitePostal" autocomplete="off" /></label>
+            <fieldset class="mbt-dump-config-group">
+              <legend>Accepted dump items</legend>
+              <p class="mbt-field-help">Select every dump item this site accepts and whether a scale ticket is required.</p>
+              <div id="dumpSiteItemAcceptances" class="mbt-dump-acceptance-list" data-dump-acceptance-items></div>
+            </fieldset>
+            <fieldset class="mbt-dump-config-group">
+              <legend>Opening days and hours</legend>
+              <p class="mbt-field-help">Each selected day has one same-day opening interval.</p>
+              <div class="mbt-dump-hours-list">
+                <div class="mbt-dump-hours-row"><label class="mbt-checkbox"><input type="checkbox" value="1" data-dump-opening-day checked /><span>Monday</span></label><label>Open<input type="time" value="07:00" data-dump-opens /></label><label>Close<input type="time" value="17:00" data-dump-closes /></label></div>
+                <div class="mbt-dump-hours-row"><label class="mbt-checkbox"><input type="checkbox" value="2" data-dump-opening-day checked /><span>Tuesday</span></label><label>Open<input type="time" value="07:00" data-dump-opens /></label><label>Close<input type="time" value="17:00" data-dump-closes /></label></div>
+                <div class="mbt-dump-hours-row"><label class="mbt-checkbox"><input type="checkbox" value="3" data-dump-opening-day checked /><span>Wednesday</span></label><label>Open<input type="time" value="07:00" data-dump-opens /></label><label>Close<input type="time" value="17:00" data-dump-closes /></label></div>
+                <div class="mbt-dump-hours-row"><label class="mbt-checkbox"><input type="checkbox" value="4" data-dump-opening-day checked /><span>Thursday</span></label><label>Open<input type="time" value="07:00" data-dump-opens /></label><label>Close<input type="time" value="17:00" data-dump-closes /></label></div>
+                <div class="mbt-dump-hours-row"><label class="mbt-checkbox"><input type="checkbox" value="5" data-dump-opening-day checked /><span>Friday</span></label><label>Open<input type="time" value="07:00" data-dump-opens /></label><label>Close<input type="time" value="17:00" data-dump-closes /></label></div>
+                <div class="mbt-dump-hours-row"><label class="mbt-checkbox"><input type="checkbox" value="6" data-dump-opening-day /><span>Saturday</span></label><label>Open<input type="time" value="08:00" data-dump-opens /></label><label>Close<input type="time" value="13:00" data-dump-closes /></label></div>
+                <div class="mbt-dump-hours-row"><label class="mbt-checkbox"><input type="checkbox" value="7" data-dump-opening-day /><span>Sunday</span></label><label>Open<input type="time" value="08:00" data-dump-opens /></label><label>Close<input type="time" value="13:00" data-dump-closes /></label></div>
+              </div>
+            </fieldset>
+            <label class="mbt-checkbox"><input id="dumpSiteActive" type="checkbox" checked /><span>Active dump site</span></label>
+            <input id="dumpSiteRevision" type="hidden" />
+            <label id="dumpSiteReasonField" hidden>Update note<textarea id="dumpSiteReason" rows="2" maxlength="2000" placeholder="Required when updating an existing dump site"></textarea></label>
+            <button id="saveDumpSiteButton" type="submit">Create dump site</button>
+          </form>
+          <section class="mbt-editor" aria-labelledby="dumpSiteListTitle"><h3 id="dumpSiteListTitle">Dump sites</h3><div class="mbt-table-wrap"><table><thead><tr><th>Dump site</th><th>Accepted dump items</th><th>Opening hours</th><th>Action</th></tr></thead><tbody id="dumpSiteRows"><tr><td colspan="4">Load dump sites to edit.</td></tr></tbody></table></div></section>
+        </div>
+        <section class="mbt-editor" aria-labelledby="localMasterImportTitle">
+          <h3 id="localMasterImportTitle">Import dump sites by CSV</h3>
+          <p>The versioned template chooses accepted local dump items by item code.</p>
+          <div class="mbt-form-grid">
+            <input id="localMasterImportResource" type="hidden" value="dump_sites" />
+            <label>CSV file<input id="localMasterImportFile" type="file" accept=".csv,text/csv" /></label>
+            <label class="mbt-form-wide">Import note (optional)<textarea id="localMasterImportReason" maxlength="2000" rows="2" placeholder="Add context only when useful"></textarea></label>
+          </div>
+          <div class="mbt-form-actions">
+            <a id="localMasterTemplateLink" data-mbt-template-download href="/api/mbt/config/imports/dump-sites/template" download>Download dump-sites template</a>
+            <button id="previewLocalMasterImportButton" type="button">Preview CSV</button>
+            <button id="applyLocalMasterImportButton" type="button" class="mbt-button-secondary" disabled>Apply preview</button>
+          </div>
+          <pre id="localMasterImportPreview" class="mbt-json-summary" aria-label="Local reference import preview">No preview.</pre>
+        </section>
+        <details>
+          <summary>Advanced dump-site evidence</summary>
+          <pre id="materialsDumpSummary" class="mbt-json-summary">No dump-site data loaded.</pre>
+        </details>
+      </section>
+      <section
+        id="rateCardsPanel"
+        class="mbt-readiness"
+        role="tabpanel"
+        aria-labelledby="rateCardsTab"
+        tabindex="0"
+        hidden
+      >
+        <div class="mbt-readiness-heading"><div><p class="mbt-eyebrow">Local-only pricing</p><h2>Rate Cards</h2><p>One named rate card can price multiple local items and origin-yard groups. Select each pricing item to reveal its charging mechanism. Inactivate is reversible; Delete is blocked once linked evidence exists.</p></div><button id="refreshRateCardsButton" type="button" class="mbt-button-secondary">Refresh rate cards</button></div>
+        <p id="rateCardsMessage" class="mbt-message" role="status" aria-live="polite">Rate cards have not loaded.</p>
+        <div class="mbt-config-columns mbt-rate-card">
+          <form id="rateCardForm" class="mbt-editor" aria-labelledby="rateCardEditorTitle">
+            <h3 id="rateCardEditorTitle">Item pricing setup</h3>
+            <p>Configure one or more local items inside this card. Switch items freely—their draft prices remain together until you save.</p>
+            <div class="mbt-form-grid">
+              <label>Rate card code<input id="rateCardCode" required maxlength="64" autocomplete="off" /></label>
+              <label>Display name<input id="rateCardDisplayName" required maxlength="160" autocomplete="off" /></label>
+              <label>Effective from (Toronto time)<input id="rateCardEffectiveFrom" type="datetime-local" required /></label>
+              <label class="mbt-form-wide">Setup notes<textarea id="rateCardNotes" maxlength="2000" rows="2">Fixed 14 Toronto calendar day rental.</textarea></label>
+            </div>
+            <label>Pricing item<select id="ratePricingItem"><option value="">Select a local item</option></select></label>
+            <section id="rateItemEditor" class="mbt-rate-section" aria-live="polite">
+              <p>Select an item to configure its price.</p>
+            </section>
+            <div class="mbt-form-grid">
+              <label id="rateCardReasonField" class="mbt-form-wide" hidden>Update note<textarea id="rateCardReason" maxlength="2000" rows="2" placeholder="Required when updating an existing draft"></textarea></label>
+            </div>
+            <button type="submit">Save draft</button>
+          </form>
+          <section class="mbt-editor" aria-labelledby="rateCardLifecycleTitle">
+            <h3 id="rateCardLifecycleTitle">Draft lifecycle</h3>
+            <p>Select a named rate card to validate, activate, or clone. Used versions are cloned rather than edited.</p>
+            <label>Edit selected rate<select id="rateCardVersionSelect"><option value="">No rate card selected</option></select></label>
+            <input id="rateCardVersionId" type="hidden" />
+            <button id="newRateCardButton" type="button" class="mbt-button-secondary">Create new rate card</button>
+            <input id="rateCardExpectedRevision" type="hidden" />
+            <label>Audit reason<textarea id="rateCardLifecycleReason" required maxlength="2000" rows="2">Approve local rate-card version</textarea></label>
+            <div class="mbt-form-actions">
+              <button id="validateRateCardButton" type="button">Validate draft</button>
+              <button id="activateRateCardButton" type="button">Activate version</button>
+              <button id="cloneRateCardButton" type="button" class="mbt-button-secondary">Clone as new draft</button>
+            </div>
+          </section>
+        </div>
+        <section class="mbt-editor mbt-rate-card-import" aria-labelledby="rateCardImportTitle">
+          <h3 id="rateCardImportTitle">Atomic multi-CSV draft</h3>
+          <p>Select the five related files together. Preview checks that the complete graph is present before an audited server command.</p>
+          <div class="mbt-form-grid">
+            <label>rate_cards.csv<input id="rateCardHeaderCsv" type="file" accept=".csv,text/csv" /></label>
+            <label>distance_bands.csv<input id="rateCardBandsCsv" type="file" accept=".csv,text/csv" /></label>
+            <label>components.csv<input id="rateCardComponentsCsv" type="file" accept=".csv,text/csv" /></label>
+            <label>dump_tariffs.csv<input id="rateCardTariffsCsv" type="file" accept=".csv,text/csv" /></label>
+            <label>deposit_rules.csv<input id="rateCardDepositsCsv" type="file" accept=".csv,text/csv" /></label>
+          </div>
+          <label>Import note (optional)<textarea id="rateCardCsvReason" maxlength="2000" rows="2" placeholder="Add context only when useful"></textarea></label>
+          <div class="mbt-form-actions">
+            <button id="previewRateCardCsvButton" type="button">Preview complete graph</button>
+            <button id="applyRateCardCsvButton" type="button" disabled>Apply five-file draft</button>
+          </div>
+          <pre id="rateCardCsvPreview" class="mbt-json-summary" aria-label="Rate-card CSV aggregate preview">No files selected.</pre>
+        </section>
+        <section class="mbt-editor mbt-saved-rate-cards" aria-labelledby="savedRateCardsTitle">
+          <h3 id="savedRateCardsTitle">Saved rate cards</h3>
+          <p>Select Edit to load an unused draft. Active or already-used versions can be cloned safely.</p>
+          <div class="mbt-table-wrap" tabindex="0">
+            <table aria-label="Saved local rate cards">
+              <thead><tr><th>Rate card</th><th>Version</th><th>Status</th><th>Effective</th><th>Action</th></tr></thead>
+              <tbody id="rateCardRows"><tr><td colspan="5">No rate cards loaded.</td></tr></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+      <section
+        id="netSuiteReadinessPanel"
+        class="mbt-readiness"
+        role="tabpanel"
+        aria-labelledby="netSuiteReadinessTab"
+        aria-label="NetSuite Readiness"
+        tabindex="0"
+        hidden
+      >
+        <div class="mbt-readiness-heading">
+          <div>
+            <p class="mbt-eyebrow">Read-only sandbox verification</p>
+            <h2>NetSuite Readiness</h2>
+            <p>Mappings and evidence on this page cannot create or update a NetSuite transaction.</p>
+          </div>
+          <button id="runPreflightButton" type="button" disabled>Run read-only preflight</button>
+        </div>
+
+        <section
+          class="mbt-gates"
+          data-testid="mbt-operational-gates"
+          data-state="closed"
+          aria-labelledby="operationalGatesTitle"
+        >
+          <h3 id="operationalGatesTitle">Operational gates · Closed</h3>
+          <ul>
+            <li>MBT operational workflows are disabled.</li>
+            <li>NetSuite writes and posting are disabled.</li>
+            <li>Preflight performs metadata GET requests only.</li>
+          </ul>
+        </section>
+
+        <section
+          class="mbt-runtime-binding"
+          role="region"
+          aria-labelledby="sandboxRuntimeBindingTitle"
+        >
+          <div>
+            <p class="mbt-eyebrow">Current non-secret server configuration</p>
+            <h3 id="sandboxRuntimeBindingTitle">Sandbox runtime binding</h3>
+            <p>The read-only preflight is bound to these values for the current request.</p>
+          </div>
+          <dl>
+            <div><dt>Account</dt> <dd id="runtimeAccountId">Unavailable</dd></div>
+            <div><dt>Environment</dt> <dd id="runtimeEnvironment">Unavailable</dd></div>
+            <div class="mbt-runtime-wide"><dt>Normalized REST root</dt> <dd id="runtimeRestRoot">Unavailable</dd></div>
+            <div><dt>Direct access</dt> <dd id="runtimeDirectAccess">Unavailable</dd></div>
+            <div><dt>Allowlist</dt> <dd id="runtimeAllowlistStatus">Unavailable</dd></div>
+            <div class="mbt-runtime-wide"><dt>Sandbox account allowlist</dt> <dd id="runtimeAllowlist">Unavailable</dd></div>
+            <div><dt>Read timeout</dt> <dd id="runtimeReadTimeout">Unavailable</dd></div>
+            <div><dt>Effective preflight lease</dt> <dd id="runtimePreflightLease">Unavailable</dd></div>
+          </dl>
+        </section>
+
+        <p id="readinessMessage" class="mbt-message" role="status" aria-live="polite">Loading NetSuite readiness.</p>
+
+        <section aria-labelledby="mappingTitle">
+          <div class="mbt-section-heading">
+            <div>
+              <h3 id="mappingTitle">Required mappings</h3>
+              <p id="configurationHash">Configuration hash unavailable.</p>
+            </div>
+          </div>
+          <div class="mbt-table-wrap" tabindex="0" aria-label="NetSuite readiness mapping results">
+            <table aria-label="NetSuite readiness mappings">
+              <thead>
+                <tr>
+                  <th scope="col">Requirement</th>
+                  <th scope="col">NetSuite mapping</th>
+                  <th scope="col">Status</th>
+                  <th scope="col">Action</th>
+                </tr>
+              </thead>
+              <tbody id="mappingRows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="mappingEditor" class="mbt-editor" aria-labelledby="mappingEditorTitle" hidden>
+          <div class="mbt-section-heading">
+            <h3 id="mappingEditorTitle">Edit mapping</h3>
+            <button id="cancelMappingButton" type="button" class="mbt-button-secondary">Cancel</button>
+          </div>
+          <p id="mappingSemanticHelp" class="mbt-semantic-help" hidden></p>
+          <form id="mappingForm">
+            <input id="mappingType" type="hidden" />
+            <input id="mappingLocalKey" type="hidden" />
+            <input id="mappingRevision" type="hidden" />
+            <div class="mbt-form-grid">
+              <label>NetSuite internal ID<input id="mappingExternalId" required autocomplete="off" /></label>
+              <label>NetSuite display name<input id="mappingExternalName" required autocomplete="off" /></label>
+              <label>NetSuite record type<input id="mappingRecordType" required autocomplete="off" /></label>
+              <label>NetSuite script ID<input id="mappingScriptId" autocomplete="off" /></label>
+              <label>
+                Subsidiary internal ID
+                <span id="mappingSubsidiaryHelp" class="mbt-field-help">Not required for this mapping.</span>
+                <input
+                  id="mappingSubsidiaryId"
+                  inputmode="numeric"
+                  autocomplete="off"
+                  aria-describedby="mappingSubsidiaryHelp"
+                />
+              </label>
+              <label class="mbt-form-wide">
+                Verification configuration (JSON)
+                <span class="mbt-field-help">Enter one JSON object. Server-owned requirements still apply.</span>
+                <textarea id="mappingConfiguration" required rows="8" spellcheck="false"></textarea>
+              </label>
+              <label class="mbt-form-wide">Mapping audit reason<textarea id="mappingReason" required rows="3"></textarea></label>
+            </div>
+            <div class="mbt-form-actions">
+              <button type="submit">Save mapping</button>
+            </div>
+          </form>
+        </section>
+
+        <section aria-labelledby="latestRunTitle">
+          <div class="mbt-section-heading">
+            <div>
+              <h3 id="latestRunTitle">Latest preflight</h3>
+              <p id="latestRunSummary">No preflight evidence is available.</p>
+            </div>
+            <div id="reportLinks" class="mbt-report-links" hidden>
+              <a id="jsonReportLink">Export JSON</a>
+              <a id="csvReportLink">Export CSV</a>
+            </div>
+          </div>
+          <div class="mbt-table-wrap" tabindex="0" aria-label="NetSuite preflight check results">
+            <table aria-label="NetSuite preflight checks">
+              <thead>
+                <tr>
+                  <th scope="col">Check</th>
+                  <th scope="col">Severity</th>
+                  <th scope="col">Result</th>
+                  <th scope="col">Message</th>
+                </tr>
+              </thead>
+              <tbody id="preflightRows">
+                <tr><td colspan="4">No preflight has run.</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <form id="signoffForm" class="mbt-signoff">
+            <label>Signoff audit note<textarea id="signoffNote" required rows="3"></textarea></label>
+            <button id="signoffButton" type="submit" disabled>Sign off current preflight</button>
+          </form>
+        </section>
+      </section>
+    </main>
+    <script src="/app-sidebar.js"></script>
+    <script src="/mbt-shell.js" type="module"></script>
+  </body>
+</html>

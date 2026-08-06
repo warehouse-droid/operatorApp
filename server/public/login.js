@@ -8,7 +8,9 @@ const STAFF_TOKEN_KEYS = {
   scm: "mbbs.dispatch.token",
   scm_staff: "mbbs.dispatch.token",
   yard_manager: "mbbs.control.token",
-  sales: "mbbs.dispatch.token"
+  sales: "mbbs.dispatch.token",
+  mbt_frontdesk: "mbbs.staff.token",
+  mbt_billing: "mbbs.staff.token"
 };
 const STAFF_TOKEN_KEY = "mbbs.staff.token";
 const STAFF_ROLE_KEY = "mbbs.staff.role";
@@ -26,6 +28,8 @@ function routeForStaffRole(role) {
   if (clean === "scm" || clean === "scm_staff") return "/scm";
   if (clean === "yard_manager") return "/control";
   if (clean === "sales") return "/sales";
+  if (clean === "mbt_frontdesk") return "/mbt/frontdesk";
+  if (clean === "mbt_billing") return "/mbt/billing";
   return "";
 }
 
@@ -95,13 +99,20 @@ async function postJson(path, body) {
 async function loginStaff(data) {
   const payload = await postJson("/api/auth/login", data);
   const role = cleanRole(payload.operator?.role);
-  const route = routeForStaffRole(role);
-  const tokenKey = STAFF_TOKEN_KEYS[role];
-  if (!route || !tokenKey) throw new Error("This account does not have an application route.");
+  const roles = [...new Set([
+    ...(Array.isArray(payload.operator?.roles) ? payload.operator.roles : []),
+    role
+  ].map(cleanRole).filter(Boolean))];
+  const route = String(payload.operator?.homeRoute || routeForStaffRole(role));
+  const routeRole = roles.find((candidate) => routeForStaffRole(candidate) === route);
+  const tokenKey = STAFF_TOKEN_KEYS[routeRole];
+  if (!route || !routeRole || !tokenKey) {
+    throw new Error("This account does not have an application route.");
+  }
   clearModuleTokens();
   localStorage.setItem(STAFF_TOKEN_KEY, payload.token);
   localStorage.setItem(STAFF_ROLE_KEY, role);
-  localStorage.setItem(STAFF_ROLES_KEY, JSON.stringify([...new Set([...(Array.isArray(payload.operator?.roles) ? payload.operator.roles : []), role].filter(Boolean))]));
+  localStorage.setItem(STAFF_ROLES_KEY, JSON.stringify(roles));
   localStorage.setItem(tokenKey, payload.token);
   location.href = route;
 }

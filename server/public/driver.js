@@ -7,11 +7,15 @@ const STAFF_TOKEN_KEY = "mbbs.staff.token";
 const STAFF_ROLE_KEY = "mbbs.staff.role";
 const STAFF_ROLES_KEY = "mbbs.staff.roles";
 const CAMERA_FACING_KEY = "mbbs.camera.facingMode";
-const DRIVER_PWA_CLIENT_VERSION = "2026.08.01.2";
+const DRIVER_PWA_CLIENT_VERSION = "2026.08.05.3";
 const DRIVER_PWA_VERSION_HEADER = "X-MBBS-Driver-Version";
 const DRIVER_PWA_UPDATE_MARKER_KEY = "mbbs.driver.requiredPwaVersion";
 const DRIVER_PWA_VERIFIED_VERSION_KEY = "mbbs.driver.verifiedPwaVersion";
+const DRIVER_OFFLINE_SESSION_KEY = "mbbs.driver.offlineObserved";
+const DRIVER_OFFLINE_MODE_KEY = "mbbs.driver.offlineModeEnabled";
+const DRIVER_DEVICE_ID_KEY = "mbbs.driver.deviceId";
 const DRIVER_PWA_VERSION_CHECK_MS = 60000;
+const DRIVER_OFFLINE_RECOVERY_CHECK_MS = 2000;
 const t = (key, fallback) => window.MBBS_I18N?.t(key, fallback) || fallback;
 const tf = (key, fallback, variables = {}) => window.MBBS_I18N?.format(key, fallback, variables) || fallback;
 const localizeMessage = (message) => window.MBBS_I18N?.message(message) || String(message || "");
@@ -24,6 +28,8 @@ let dayState = null;
 let photos = [];
 let driverRemark = "";
 let driverRemarkSavePromise = Promise.resolve();
+let binDraft = null;
+let binDraftSavePromise = Promise.resolve();
 let dvirPhotos = [];
 let dvirMode = "";
 let orderPages = {};
@@ -54,8 +60,11 @@ const quietSyncEventIds = new Map();
 let driverInteractionEpoch = 0;
 let photoCaptureInProgress = false;
 let photoCaptureResetTimer = null;
+let driverOfflineModeEnabled = false;
+let driverOfflineModeKnown = false;
+let driverOfflineModeRevision = null;
 let offlineStorageAvailable = false;
-let offlineDeviceId = "";
+let offlineDeviceId = browserDriverDeviceId();
 let offlinePartition = null;
 let offlineManifest = null;
 let offlineDeferredManifest = null;
@@ -65,6 +74,8 @@ let offlineShellReady = false;
 let offlineSyncing = false;
 let offlineStatusOpen = false;
 let offlineCachedView = false;
+let browserOfflineObserved = !navigator.onLine || readDriverOfflineSessionMarker();
+let driverOfflineRecoveryRunning = false;
 let offlineHealth = null;
 let offlineSyncState = null;
 let offlineRetainedClientError = null;
@@ -90,6 +101,7 @@ let driverPwaVersionCheckComplete = false;
 let driverPwaVersionCheckPromise = null;
 let driverServiceWorkerRegistration = null;
 const activeForegroundEventIds = new Set();
+const onlineBinEventAttempts = new Map();
 const ITEMS_PER_PAGE = 5;
 const COMPLETE_DELAY_MS = 10000;
 const LIVE_REFRESH_DEBOUNCE_MS = 180;
@@ -126,6 +138,100 @@ const DRIVER_INTERACTION_ACTIONS = new Set([
   "skip-samsara-switch",
   "complete-job"
 ]);
+
+function browserDriverDeviceId() {
+  try {
+    const existing = String(localStorage.getItem(DRIVER_DEVICE_ID_KEY) || "").trim();
+    if (existing.length >= 8) return existing;
+    const created = globalThis.crypto?.randomUUID?.()
+      || `driver-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    localStorage.setItem(DRIVER_DEVICE_ID_KEY, created);
+    return created;
+  } catch {
+    return globalThis.crypto?.randomUUID?.()
+      || `driver-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  }
+}
+
+function restoreDriverOfflineMode() {
+  try {
+    const stored = localStorage.getItem(DRIVER_OFFLINE_MODE_KEY);
+    if (stored !== "true" && stored !== "false") return;
+    driverOfflineModeEnabled = stored === "true";
+    driverOfflineModeKnown = true;
+  } catch {
+    // A missing saved mode fails closed to online-only until the server replies.
+  }
+}
+
+function publishDriverOfflineMode() {
+  const message = {
+    type: "DRIVER_OFFLINE_MODE",
+    enabled: driverOfflineModeEnabled,
+    revision: driverOfflineModeRevision
+  };
+  navigator.serviceWorker?.controller?.postMessage(message);
+  driverServiceWorkerRegistration?.active?.postMessage?.(message);
+}
+
+function applyDriverOfflineMode(payload = {}) {
+  if (typeof payload.offlineEnabled !== "boolean") return false;
+  const changed = driverOfflineModeKnown
+    && driverOfflineModeEnabled !== payload.offlineEnabled;
+  driverOfflineModeEnabled = payload.offlineEnabled;
+  driverOfflineModeKnown = true;
+  driverOfflineModeRevision = payload.offlineModeRevision ?? null;
+  try {
+    localStorage.setItem(DRIVER_OFFLINE_MODE_KEY, String(driverOfflineModeEnabled));
+  } catch {
+    // The live server value remains authoritative for this document.
+  }
+  publishDriverOfflineMode();
+  if (changed) {
+    offlineCachedView = false;
+    onlineRouteLastValidatedAt = 0;
+    if (!driverOfflineModeEnabled) {
+      offlineRouteDownloading = false;
+      onlineRouteUpdatePending = false;
+      offlineManifestUpdateDeferred = false;
+    }
+    renderOfflineStatus();
+    applyDriverActionProtectionGate();
+    if (driver && authToken && navigator.onLine && !photoInteractionActive()) {
+      void loadNextJob().catch((error) => showToast(error.message));
+    }
+  }
+  return changed;
+}
+
+restoreDriverOfflineMode();
+
+function readDriverOfflineSessionMarker() {
+  try {
+    return sessionStorage.getItem(DRIVER_OFFLINE_SESSION_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function markDriverBrowserOffline() {
+  browserOfflineObserved = true;
+  try {
+    sessionStorage.setItem(DRIVER_OFFLINE_SESSION_KEY, "1");
+  } catch {
+    // The in-memory marker still protects the current document when session
+    // storage is disabled by the browser.
+  }
+}
+
+function markDriverBrowserOnline() {
+  browserOfflineObserved = false;
+  try {
+    sessionStorage.removeItem(DRIVER_OFFLINE_SESSION_KEY);
+  } catch {
+    // The in-memory marker is authoritative for the current document.
+  }
+}
 const DRIVER_MUTATION_ACTIONS = new Set([
   "start-rest",
   "end-rest",
@@ -266,11 +372,13 @@ async function checkDriverPwaVersion({ force = false, reason = "periodic" } = {}
         status: response.status,
         data: payload
       });
+      markDriverBrowserOnline();
       const serverVersion = String(payload.currentVersion || "").trim();
       if (!serverVersion) throw new Error(t("driver.pwaVersionIncomplete", "The Driver PWA version response was incomplete."));
       if (serverVersion !== DRIVER_PWA_CLIENT_VERSION || payload.isCurrent !== true) {
         return requireDriverPwaUpdate(payload, { reason });
       }
+      applyDriverOfflineMode(payload);
       driverPwaVersionCheckComplete = true;
       try {
         localStorage.setItem(DRIVER_PWA_VERIFIED_VERSION_KEY, DRIVER_PWA_CLIENT_VERSION);
@@ -378,6 +486,10 @@ function localDate() {
 }
 
 function markDriverInteraction() {
+  // Chromium can report online again immediately after an offline shell
+  // reload. Persist the trustworthy pre-reload signal during any offline
+  // interaction so GPS remains suppressed after that navigation.
+  if (!navigator.onLine) markDriverBrowserOffline();
   driverInteractionEpoch += 1;
   return driverInteractionEpoch;
 }
@@ -432,6 +544,7 @@ function photoInteractionActive() {
     photoCaptureInProgress
     || photoPromptOpen
     || dvirMode
+    || (isDriverBinJob() && (driverBinDraftHasContent() || photos.some(Boolean)))
   );
 }
 
@@ -439,6 +552,18 @@ function manifestJobFor(jobId, manifest = offlineManifest) {
   const id = String(jobId || "");
   if (!id || !manifest?.manifestId) return null;
   return (manifest.jobs || []).find((job) => String(job.jobId || "") === id) || null;
+}
+
+function isDriverBinJob(job = currentJob) {
+  return Boolean(window.DriverBinUI?.isBinJob?.(job));
+}
+
+function hasProtectedDriverShell() {
+  return Boolean(
+    offlineShellReady
+    || navigator.serviceWorker?.controller
+    || driverServiceWorkerRegistration?.active
+  );
 }
 
 function driverActionProtectionState() {
@@ -454,6 +579,39 @@ function driverActionProtectionState() {
       message: t("driver.actionGateCheckingVersion", "Checking that this Driver PWA is the latest safe version. Actions will unlock automatically.")
     };
   }
+  if (!driverOfflineModeKnown) {
+    return {
+      ready: false,
+      message: t("driver.actionGateCheckingMode", "Checking whether Admin requires online-only or offline-capable operation.")
+    };
+  }
+  if (!driverOfflineModeEnabled) {
+    if (!navigator.onLine) {
+      return {
+        ready: false,
+        message: t("driver.onlineOnlyConnectionRequired", "Admin has set this Driver PWA to online-only mode. Reconnect to record an action.")
+      };
+    }
+    if (!driverIdentityValidated) {
+      return {
+        ready: false,
+        message: t("driver.actionGateVerifyingDriver", "Verifying this Driver. Actions will unlock automatically.")
+      };
+    }
+    if (
+      isDriverBinJob(currentJob)
+      && !window.DriverBinUI.clientVersionSatisfies(
+        DRIVER_PWA_CLIENT_VERSION,
+        currentJob.mbt?.minimumClientVersion
+      )
+    ) {
+      return {
+        ready: false,
+        message: t("driver.binUpdateRequired", "Close and reopen the Driver PWA to load the version required for this BIN work order.")
+      };
+    }
+    return { ready: true, message: "" };
+  }
   if (!offlineStorageAvailable || !window.DriverOfflineDB) {
     return {
       ready: false,
@@ -466,10 +624,22 @@ function driverActionProtectionState() {
       message: t("driver.actionGateVerifyingDriver", "Verifying this Driver and preparing secure local storage. Actions will unlock automatically.")
     };
   }
+  if (!offlineShellReady && !hasProtectedDriverShell()) {
+    return {
+      ready: false,
+      message: t("driver.actionGateSavingShell", "Saving the Driver app for offline reopening. Actions will unlock automatically when the app shell is protected.")
+    };
+  }
   if (!offlineManifest?.manifestId) {
     return {
       ready: false,
       message: t("driver.actionGateSavingRoute", "Saving the current route to this device. Actions will unlock automatically when this screen is protected.")
+    };
+  }
+  if (!offlineManifest.complete) {
+    return {
+      ready: false,
+      message: t("driver.actionGateDownloadingRoute", "Downloading and protecting the complete assigned route. Actions will unlock automatically when Offline ready appears.")
     };
   }
   if (routeManifestExpired()) {
@@ -486,6 +656,18 @@ function driverActionProtectionState() {
     };
   }
   if (currentJob?.jobId) {
+    if (
+      isDriverBinJob(currentJob)
+      && !window.DriverBinUI.clientVersionSatisfies(
+        DRIVER_PWA_CLIENT_VERSION,
+        currentJob.mbt?.minimumClientVersion
+      )
+    ) {
+      return {
+        ready: false,
+        message: t("driver.binUpdateRequired", "Close and reopen the Driver PWA to load the version required for this BIN work order.")
+      };
+    }
     const savedJob = manifestJobFor(currentJob.jobId);
     if (!savedJob?.jobId || !savedJob.fingerprint || !savedJob.predecessorFingerprint) {
       return {
@@ -632,6 +814,37 @@ function comparableJobDetails(job = {}) {
   });
 }
 
+const DRIVER_ROUTE_RECONCILIATION = Object.freeze({
+  unchanged: "unchanged",
+  localProgressPending: "local_progress_pending",
+  localProgressReview: "local_progress_review",
+  dispatchRouteChanged: "dispatch_route_changed",
+  serverExecutionChanged: "server_execution_changed"
+});
+const DRIVER_LOCAL_COMPLETION_PENDING_STATUSES = new Set([
+  "foreground_pending",
+  "pending",
+  "registered",
+  "waiting_photos",
+  "receipt_pending",
+  "applying",
+  "syncing"
+]);
+const DRIVER_LOCAL_COMPLETION_REVIEW_STATUSES = new Set([
+  "review_required",
+  "blocked",
+  "resolution_pending"
+]);
+const DRIVER_CROSS_DEVICE_COMPLETION_STATUSES = new Set([
+  "registered",
+  "waiting_photos",
+  "pending",
+  "applying",
+  "review_required",
+  "blocked",
+  "resolution_pending"
+]);
+
 function authoritativeJobIdentity(result = {}) {
   const job = result.job || null;
   const bootstrap = result.routeBootstrap || {};
@@ -670,11 +883,92 @@ function authoritativeJobChanged(previousJob, result = {}) {
   return JSON.stringify(comparableJobDetails(previousJob)) !== JSON.stringify(comparableJobDetails(authoritative.job));
 }
 
+function localCompletionReconciliationStatus(event) {
+  if (event?.eventType !== "job_completed") return "";
+  const status = String(event.status || "").toLowerCase();
+  if (
+    event.reviewRequired === true
+    || event.blocked === true
+    || DRIVER_LOCAL_COMPLETION_REVIEW_STATUSES.has(status)
+  ) return DRIVER_ROUTE_RECONCILIATION.localProgressReview;
+  if (DRIVER_LOCAL_COMPLETION_PENDING_STATUSES.has(status)) {
+    return DRIVER_ROUTE_RECONCILIATION.localProgressPending;
+  }
+  return "";
+}
+
+function localCompletionBridge(previousJob, authoritativeJob, manifest, events = []) {
+  const previousJobId = String(previousJob?.jobId || "");
+  const authoritativeJobId = String(authoritativeJob?.jobId || "");
+  const jobs = manifest?.jobs || [];
+  if (!previousJobId || !authoritativeJobId || previousJobId === authoritativeJobId || !jobs.length) return "";
+  const authoritativeIndex = jobs.findIndex((job) => String(job.jobId || "") === authoritativeJobId);
+  const previousIndex = jobs.findIndex((job) => String(job.jobId || "") === previousJobId);
+  if (authoritativeIndex < 0 || previousIndex <= authoritativeIndex || jobIsComplete(jobs[previousIndex])) return "";
+
+  const completionsByJobId = new Map();
+  for (const event of events || []) {
+    const reconciliation = localCompletionReconciliationStatus(event);
+    if (!reconciliation) continue;
+    const eventJobId = String(event.effectiveJobId || event.jobId || "");
+    if (!eventJobId) continue;
+    if (!completionsByJobId.has(eventJobId)) completionsByJobId.set(eventJobId, []);
+    completionsByJobId.get(eventJobId).push(reconciliation);
+  }
+
+  const authoritativeCompletionStatuses = completionsByJobId.get(authoritativeJobId) || [];
+  if (!authoritativeCompletionStatuses.length) return "";
+  let bridgeStatus = authoritativeCompletionStatuses.includes(DRIVER_ROUTE_RECONCILIATION.localProgressReview)
+    ? DRIVER_ROUTE_RECONCILIATION.localProgressReview
+    : DRIVER_ROUTE_RECONCILIATION.localProgressPending;
+  for (const job of jobs.slice(authoritativeIndex + 1, previousIndex)) {
+    if (jobIsComplete(job)) continue;
+    const completionStatuses = completionsByJobId.get(String(job.jobId || "")) || [];
+    if (!completionStatuses.length) return "";
+    if (completionStatuses.includes(DRIVER_ROUTE_RECONCILIATION.localProgressReview)) {
+      bridgeStatus = DRIVER_ROUTE_RECONCILIATION.localProgressReview;
+    }
+  }
+  return bridgeStatus;
+}
+
+function classifyAuthoritativeRoute(previousJob, result = {}, {
+  manifest = null,
+  events = [],
+  dispatchRouteChanged = false
+} = {}) {
+  if (dispatchRouteChanged) return DRIVER_ROUTE_RECONCILIATION.dispatchRouteChanged;
+  if (!authoritativeJobChanged(previousJob, result)) return DRIVER_ROUTE_RECONCILIATION.unchanged;
+  const bridge = localCompletionBridge(previousJob, authoritativeJobIdentity(result).job, manifest, events);
+  return bridge || DRIVER_ROUTE_RECONCILIATION.serverExecutionChanged;
+}
+
+function crossDevicePendingCompletionMatchesJob(completion, job) {
+  if (
+    completion?.eventType !== "job_completed"
+    || !DRIVER_CROSS_DEVICE_COMPLETION_STATUSES.has(String(completion.status || "").toLowerCase())
+  ) return false;
+  const completionJobId = String(completion.jobId || "");
+  const expectedJobId = String(job?.jobId || "");
+  if (!completionJobId || !expectedJobId || completionJobId !== expectedJobId) return false;
+  const completionFingerprint = String(completion.jobFingerprint || "");
+  const expectedFingerprint = String(job?.fingerprint || "");
+  if (completionFingerprint && expectedFingerprint && completionFingerprint !== expectedFingerprint) return false;
+  const completionPredecessor = String(completion.predecessorFingerprint || "");
+  const expectedPredecessor = String(job?.predecessorFingerprint || "");
+  return !completionPredecessor
+    || !expectedPredecessor
+    || completionPredecessor === expectedPredecessor;
+}
+
 function jobEventRequiresManifestIdentity(eventType) {
   return ["job_started", "job_completed", "truck_switched_physical"].includes(eventType);
 }
 
 function shouldRetryOfflineSyncError(error) {
+  if (Array.isArray(error?.photoFailures) && error.photoFailures.length) {
+    return error.photoFailures.some((failure) => failure?.retryable === true);
+  }
   if (error?.isNetworkError || !navigator.onLine) return true;
   const status = Number(error?.status || 0);
   const code = String(error?.code || "");
@@ -836,7 +1130,7 @@ function normalizedDriverRemark(value = driverRemark) {
 
 function persistDriverRemarkDraft(value = driverRemark) {
   const key = currentDriverRemarkDraftKey();
-  if (!offlineStorageAvailable || !key || !window.DriverOfflineDB?.setMeta) return Promise.resolve();
+  if (!driverOfflineModeEnabled || !offlineStorageAvailable || !key || !window.DriverOfflineDB?.setMeta) return Promise.resolve();
   const remark = String(value || "").slice(0, DRIVER_REMARK_MAX_LENGTH);
   driverRemarkSavePromise = driverRemarkSavePromise
     .catch(() => {})
@@ -848,18 +1142,89 @@ async function restoreDriverRemarkDraft() {
   driverRemark = "";
   const key = currentDriverRemarkDraftKey();
   const restoreEpoch = driverInteractionEpoch;
-  if (!offlineStorageAvailable || !key || !window.DriverOfflineDB?.getMeta) return;
+  if (!driverOfflineModeEnabled || !offlineStorageAvailable || !key || !window.DriverOfflineDB?.getMeta) return;
   const saved = await window.DriverOfflineDB.getMeta(key).catch(() => null);
   if (key !== currentDriverRemarkDraftKey() || restoreEpoch !== driverInteractionEpoch) return;
   driverRemark = String(saved?.remark || "").slice(0, DRIVER_REMARK_MAX_LENGTH);
 }
 
 function clearDriverRemarkDraft(key = currentDriverRemarkDraftKey()) {
-  if (!offlineStorageAvailable || !key || !window.DriverOfflineDB?.setMeta) return Promise.resolve();
+  if (!driverOfflineModeEnabled || !offlineStorageAvailable || !key || !window.DriverOfflineDB?.setMeta) return Promise.resolve();
   driverRemarkSavePromise = driverRemarkSavePromise
     .catch(() => {})
     .then(() => window.DriverOfflineDB.setMeta(key, null));
   return driverRemarkSavePromise;
+}
+
+function currentDriverBinDraftKey(job = currentJob) {
+  if (!isDriverBinJob(job)) return "";
+  const partitionKey = offlinePartition?.partitionKey || "";
+  const manifestId = offlineManifest?.manifestId || "";
+  const jobId = job?.jobId || "";
+  if (!partitionKey || !manifestId || !jobId) return "";
+  return window.DriverBinUI.draftKey(partitionKey, manifestId, jobId);
+}
+
+function normalizedDriverBinDraft(job = currentJob, value = binDraft) {
+  if (!isDriverBinJob(job)) return null;
+  return window.DriverBinUI.normalizeDraft(job, value || window.DriverBinUI.createDraft(job));
+}
+
+function ensureDriverBinDraft(job = currentJob) {
+  if (!isDriverBinJob(job)) {
+    binDraft = null;
+    return null;
+  }
+  binDraft = normalizedDriverBinDraft(job, binDraft);
+  return binDraft;
+}
+
+function driverBinDraftHasContent(job = currentJob, value = binDraft) {
+  if (!isDriverBinJob(job) || !value) return false;
+  const draft = normalizedDriverBinDraft(job, value);
+  return [
+    ...Object.values(draft.scans || {}),
+    ...Object.values(draft.notes || {}),
+    ...Object.values(draft.signatures || {}).map((signature) => signature?.signedBy),
+    ...Object.values(draft.receipt || {})
+  ].some((entry) => String(entry || "").trim());
+}
+
+function persistDriverBinDraft(value = binDraft, job = currentJob) {
+  const key = currentDriverBinDraftKey(job);
+  if (!driverOfflineModeEnabled || !offlineStorageAvailable || !key || !window.DriverOfflineDB?.setMeta) return Promise.resolve();
+  const draft = normalizedDriverBinDraft(job, value);
+  binDraftSavePromise = binDraftSavePromise
+    .catch(() => {})
+    .then(() => window.DriverOfflineDB.setMeta(key, draft));
+  return binDraftSavePromise;
+}
+
+async function restoreDriverBinDraft(job = currentJob) {
+  if (!isDriverBinJob(job)) {
+    binDraft = null;
+    return;
+  }
+  const key = currentDriverBinDraftKey(job);
+  const restoreEpoch = driverInteractionEpoch;
+  const expectedJobId = String(job?.jobId || "");
+  binDraft = window.DriverBinUI.createDraft(job);
+  if (!driverOfflineModeEnabled || !offlineStorageAvailable || !key || !window.DriverOfflineDB?.getMeta) return;
+  const saved = await window.DriverOfflineDB.getMeta(key).catch(() => null);
+  if (
+    key !== currentDriverBinDraftKey()
+    || expectedJobId !== String(currentJob?.jobId || "")
+    || restoreEpoch !== driverInteractionEpoch
+  ) return;
+  binDraft = window.DriverBinUI.normalizeDraft(currentJob, saved || {});
+}
+
+function clearDriverBinDraft(key = currentDriverBinDraftKey()) {
+  if (!driverOfflineModeEnabled || !offlineStorageAvailable || !key || !window.DriverOfflineDB?.setMeta) return Promise.resolve();
+  binDraftSavePromise = binDraftSavePromise
+    .catch(() => {})
+    .then(() => window.DriverOfflineDB.setMeta(key, null));
+  return binDraftSavePromise;
 }
 
 function routeManifestExpired() {
@@ -871,7 +1236,8 @@ function canUseOfflineLedger() {
   const manifestHasJob = !currentJob?.jobId
     || (offlineManifest?.jobs || []).some((job) => String(job.jobId) === String(currentJob.jobId));
   return Boolean(
-    offlineStorageAvailable
+    driverOfflineModeEnabled
+    && offlineStorageAvailable
     && offlinePartition?.partitionKey
     && offlineManifest?.manifestId
     && driverIdentityValidated
@@ -974,6 +1340,7 @@ function formatBytes(value) {
 }
 
 function offlineRouteWarning() {
+  if (!driverOfflineModeEnabled) return "";
   if (!offlineStorageAvailable || !driver) return "";
   if (onlineRouteUpdatePending) {
     return `<div class="offline-route-warning offline-route-expired">${t("driver.routeUpdatedProtected", "Dispatch updated this route. Finish or close the current protected screen, then review the refreshed stop before continuing.")}</div>`;
@@ -996,14 +1363,56 @@ function renderOfflineStatus() {
     offlineStatus.hidden = true;
     return;
   }
-  if (!driver || !offlineStorageAvailable) {
+  if (!driver) {
     offlineStatus.hidden = true;
     return;
   }
   const health = offlineHealth || {};
   const pending = Number(health.pendingEventCount || 0);
   const review = Number(health.reviewRequiredCount || 0);
-  const ready = Boolean(offlineManifest?.complete && offlineShellReady);
+  if (!driverOfflineModeEnabled) {
+    const retained = pending + review + Number(
+      health.partitionUnsyncedPhotoCount ?? health.unsyncedPhotoCount ?? 0
+    );
+    const state = review ? "review"
+      : retained && offlineSyncing ? "syncing"
+        : retained ? "pending"
+          : navigator.onLine ? "ready" : "error";
+    const label = review
+      ? t("driver.reviewRequired", "Review required")
+      : retained && offlineSyncing
+        ? t("driver.syncing", "Syncing retained evidence")
+        : retained
+          ? tf("driver.syncPendingCount", "Recovery sync · {count}", { count: retained })
+          : navigator.onLine
+            ? t("driver.onlineOnly", "Online only")
+            : t("driver.connectionRequired", "Connection required");
+    offlineStatus.hidden = false;
+    offlineStatus.dataset.state = state;
+    offlineStatus.innerHTML = `
+      <button class="offline-status-button" data-offline-action="toggle" type="button" aria-expanded="${offlineStatusOpen ? "true" : "false"}">${escapeHtml(label)}</button>
+      <section class="offline-status-panel" ${offlineStatusOpen ? "" : "hidden"}>
+        <h2>${escapeHtml(label)}</h2>
+        <p>${t("driver.onlineOnlyHelp", "Admin has disabled offline operation. New routes, actions, and photos are sent online and are not saved for offline use on this device.")}</p>
+        ${retained ? `<div class="offline-route-warning">${t("driver.retainedEvidenceRecovery", "Evidence saved before online-only mode remains protected and will continue synchronizing while this PWA is open and online.")}</div>` : ""}
+        ${offlineStatus.dataset.lastError ? `<div class="offline-route-warning offline-route-expired">${escapeHtml(localizeMessage(offlineStatus.dataset.lastError))}</div>` : ""}
+        ${retained ? `<div class="offline-status-grid">
+          <span>${t("driver.pendingEvents", "Pending events")}</span><strong>${pending}</strong>
+          <span>${t("driver.unsyncedPhotos", "Unsynced photos")}</span><strong>${Number(health.unsyncedPhotoCount || 0)}</strong>
+        </div>
+        <div class="offline-status-actions">
+          <button class="primary" data-offline-action="sync" ${offlineSyncing || !navigator.onLine ? "disabled" : ""} type="button">${t("driver.syncNow", "Sync now")}</button>
+        </div>` : ""}
+      </section>
+    `;
+    applyDriverActionProtectionGate();
+    return;
+  }
+  if (!offlineStorageAvailable) {
+    offlineStatus.hidden = true;
+    return;
+  }
+  const ready = Boolean(offlineManifest?.complete && hasProtectedDriverShell());
   const expired = routeManifestExpired();
   const lastError = offlineStatus.dataset.lastError || "";
   let state = "ready";
@@ -1247,7 +1656,11 @@ function completeWaitSeconds(job) {
   if (!job?.startedAt) return 0;
   const startedAt = new Date(job.startedAt).getTime();
   if (!Number.isFinite(startedAt)) return 0;
-  return Math.max(0, Math.ceil((COMPLETE_DELAY_MS - (Date.now() - startedAt)) / 1000));
+  // A server/device clock skew must not turn the ten-second double-tap guard
+  // into a permanent lockout. Server idempotency remains the durable guard.
+  if (startedAt > Date.now()) return 0;
+  const elapsed = Date.now() - startedAt;
+  return Math.max(0, Math.ceil((COMPLETE_DELAY_MS - elapsed) / 1000));
 }
 
 function driverUsesSamsaraWorkflow() {
@@ -1315,10 +1728,11 @@ function updateCountdownButtons(job) {
   const waitSeconds = completeWaitSeconds(job);
   app.querySelectorAll("[data-job-confirm]").forEach((button) => {
     const photosReady = button.dataset.photoRequired !== "true" || photos.filter(Boolean).length >= Number(job.requiredPhotos || 0);
+    const binEvidenceReady = !isDriverBinJob(job) || driverBinEvidenceReady(job);
     const gpsReady = button.dataset.gpsGate === "complete"
       ? canCompleteCurrentJob(job)
       : canBeginJobConfirmation(job);
-    button.disabled = waitSeconds > 0 || !gpsReady || !photosReady;
+    button.disabled = waitSeconds > 0 || !gpsReady || !photosReady || !binEvidenceReady;
     button.textContent = waitSeconds > 0
       ? tf("driver.waitSeconds", "Wait {seconds}s", { seconds: waitSeconds })
       : button.dataset.readyLabel || t("driver.confirm", "Confirm");
@@ -1344,7 +1758,12 @@ function scheduleRestRender() {
 
 async function checkCurrentJobLocation({ render = true } = {}) {
   if (!currentJob?.jobId) return null;
-  if (!navigator.onLine && canUseOfflineLedger()) {
+  const usingSavedOfflineBinRoute = isDriverBinJob(currentJob) && offlineCachedView;
+  // An offline browser must never attempt a GPS/Samsara request. This guard is
+  // deliberately independent of IndexedDB readiness: storage preparation and
+  // location verification are separate concerns, and a temporarily unavailable
+  // ledger is not permission to leak an online-only request.
+  if (!navigator.onLine || browserOfflineObserved || usingSavedOfflineBinRoute) {
     locationCheck = {
       status: "not_checked_offline",
       locationStatus: "not_checked_offline",
@@ -1415,6 +1834,7 @@ async function request(path, options = {}) {
   } catch {
     data = {};
   }
+  applyDriverOfflineMode(data);
   const advertisedVersion = String(response.headers?.get?.("X-MBBS-Driver-Current-Version") || "");
   if (advertisedVersion && advertisedVersion !== DRIVER_PWA_CLIENT_VERSION) {
     requireDriverPwaUpdate({
@@ -1533,6 +1953,36 @@ async function uploadDriverPhotos(photoValues, context = {}) {
   return uploaded;
 }
 
+function onlineBinEventAttempt(job, eventType) {
+  const key = `${String(job?.jobId || "")}::${eventType}`;
+  let attempt = onlineBinEventAttempts.get(key);
+  if (!attempt) {
+    attempt = {
+      key,
+      eventId: window.DriverOfflineDB?.createUuid?.()
+        || globalThis.crypto?.randomUUID?.(),
+      clientSequence: Date.now()
+    };
+    onlineBinEventAttempts.set(key, attempt);
+  }
+  return attempt;
+}
+
+function finishOnlineBinEventAttempt(attempt) {
+  if (attempt?.key) onlineBinEventAttempts.delete(attempt.key);
+}
+
+function onlineBinPhotoDescriptors(photoValues) {
+  return (photoValues || []).filter(Boolean).map((photo, index) => ({
+    photoId: String(photo.photoId || ""),
+    ordinal: Number(photo.ordinal ?? index),
+    objectReference: String(photo.objectReference || ""),
+    sha256: String(photo.sha256 || ""),
+    byteSize: Number(photo.byteSize || photo.blob?.size || 0),
+    mimeType: String(photo.mimeType || photo.blob?.type || "image/jpeg")
+  }));
+}
+
 async function clearLegacyDraftPhotos(photoValues) {
   for (const photo of photoValues || []) {
     if (photo?.photoId && offlineStorageAvailable) {
@@ -1628,6 +2078,7 @@ function clearDriverSessionMemory() {
   dayState = null;
   photos = [];
   driverRemark = "";
+  binDraft = null;
   dvirPhotos = [];
   dvirMode = "";
   orderPages = {};
@@ -1725,7 +2176,7 @@ function renderNoJob() {
   if (activeRest) scheduleRestRender();
   else clearRestTimer();
   shell(`
-    <section class="empty-panel">
+    <section class="empty-panel" data-driver-no-job>
       <h2>${t("driver.noJob", "No assigned job")}</h2>
       <p>${t("driver.noJobHelp", "No pending stop was found for your login in the confirmed dispatch plans.")}</p>
       <div class="empty-actions">
@@ -1872,6 +2323,213 @@ function renderLocationCheck(job) {
   `;
 }
 
+function binEvidenceLabel(requirement) {
+  const code = String(requirement?.evidenceCode || "");
+  const labels = {
+    outgoing_bin_scan: t("driver.binOutgoingScan", "Outgoing BIN scan"),
+    incoming_bin_scan: t("driver.binIncomingScan", "Incoming BIN scan"),
+    expected_bin_scan: t("driver.binExpectedScan", "Assigned BIN scan"),
+    placement_photo: t("driver.binPlacementPhoto", "Placement photo"),
+    condition_photo: t("driver.binConditionPhoto", "Condition photo"),
+    load_photo: t("driver.binLoadPhoto", "Load photo"),
+    dump_receipt_photo: t("driver.binReceiptPhoto", "Dump receipt photo"),
+    condition_note: t("driver.binConditionNote", "Condition note"),
+    site_signature: t("driver.binSiteSignature", "Site signature")
+  };
+  if (labels[code]) return labels[code];
+  return code
+    .split("_")
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ") || t("driver.binEvidence", "Required evidence");
+}
+
+function binAssetRoleLabel(role) {
+  if (role === "outgoing") return t("driver.binOutgoingAsset", "Outgoing BIN");
+  if (role === "incoming") return t("driver.binIncomingAsset", "Incoming BIN");
+  return t("driver.binExpectedAsset", "Assigned BIN");
+}
+
+function driverBinActionLabel(job) {
+  const action = String(job?.mbt?.serviceAction || job?.mbt?.actionCode || "").toLowerCase();
+  const labels = {
+    delivery: t("driver.binActionDelivery", "Delivery"),
+    deliver_bin: t("driver.binActionDelivery", "Delivery"),
+    pickup: t("driver.binActionPickup", "Pickup"),
+    return_bin: t("driver.binActionPickup", "Pickup"),
+    collect_empty_bin: t("driver.binActionCollectEmpty", "Collect empty BIN"),
+    pickup_loaded_bin: t("driver.binActionCollectLoaded", "Collect loaded BIN"),
+    exchange: t("driver.binActionExchange", "Exchange"),
+    exchange_bin: t("driver.binActionExchange", "Exchange"),
+    dump: t("driver.binActionDump", "Dump"),
+    dump_bin: t("driver.binActionDump", "Dump")
+  };
+  return labels[action] || action.replaceAll("_", " ") || t("driver.binWorkOrder", "BIN work order");
+}
+
+function driverBinErrorMessage(error, job = currentJob) {
+  const requirement = window.DriverBinUI?.requirements?.(job)
+    .find(({ evidenceCode }) => evidenceCode === error?.evidenceCode);
+  if (error?.code === "DRIVER_BIN_EVIDENCE_MISSING") {
+    return tf("driver.binMissingEvidence", "Complete {evidence} before finishing this BIN stop.", {
+      evidence: binEvidenceLabel(requirement || { evidenceCode: error.evidenceCode })
+    });
+  }
+  if (["DRIVER_BIN_ASSET_MISMATCH", "DRIVER_BIN_ASSET_IDENTITY_MISSING"].includes(error?.code)) {
+    return t("driver.binAssetMismatch", "The scanned BIN does not match the exact asset assigned to this visit.");
+  }
+  if (error?.code === "DRIVER_BIN_RECEIPT_TOTAL_MISMATCH") {
+    return t("driver.binReceiptTotalMismatch", "Receipt total must equal subtotal plus tax.");
+  }
+  if (["DRIVER_BIN_RECEIPT_INCOMPLETE", "DRIVER_BIN_RECEIPT_IDENTITY_MISSING"].includes(error?.code)) {
+    return t("driver.binReceiptIncomplete", "Complete the frozen dump site, material, ticket, weight or quantity, unit, amounts, and receipt photo.");
+  }
+  if (["DRIVER_BIN_RECEIPT_AMOUNT_INVALID", "DRIVER_BIN_RECEIPT_INVALID"].includes(error?.code)) {
+    return t("driver.binReceiptAmountInvalid", "Enter each receipt amount with no more than two decimal places.");
+  }
+  return localizeMessage(error?.message || t("driver.binEvidenceInvalid", "Review the required BIN evidence."));
+}
+
+function driverBinEvidenceReady(job = currentJob) {
+  if (!isDriverBinJob(job)) return true;
+  try {
+    window.DriverBinUI.buildCompletionDetails(job, ensureDriverBinDraft(job), photos);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function updateDriverBinCompletionButton(job = currentJob) {
+  if (!isDriverBinJob(job)) return;
+  const button = app.querySelector("[data-driver-bin-complete]");
+  if (!button) return;
+  const ready = driverBinEvidenceReady(job) && canBeginJobConfirmation(job);
+  button.disabled = !ready;
+  button.setAttribute("aria-disabled", ready ? "false" : "true");
+  applyDriverActionProtectionGate();
+}
+
+function renderDriverBinPhotoSlot(slot, requirement) {
+  const photo = photos[slot.ordinal];
+  const label = binEvidenceLabel(requirement);
+  return `
+    <div class="photo-slot driver-bin-photo-slot" data-bin-photo-slot="${escapeHtml(slot.evidenceCode)}">
+      <input data-photo-index="${slot.ordinal}" data-photo-source="camera" data-bin-evidence-code="${escapeHtml(slot.evidenceCode)}" ${routeProtectedControlAttributes()} type="file" accept="image/*" capture="${cameraCaptureMode()}" />
+      <input data-photo-index="${slot.ordinal}" data-photo-source="gallery" data-bin-evidence-code="${escapeHtml(slot.evidenceCode)}" ${routeProtectedControlAttributes()} type="file" accept="image/*" />
+      <div class="photo-preview">${photo
+        ? `<img src="${escapeHtml(photoValueUrl(photo))}" alt="${escapeHtml(label)}" />`
+        : `<span>${escapeHtml(label)}${requirement.required ? " *" : ""}</span>`}
+      </div>
+      <div class="photo-source-actions">
+        <button data-action="take-photo" data-photo-index="${slot.ordinal}" ${routeProtectedControlAttributes()} type="button">${t("common.camera", "Camera")}</button>
+        <button data-action="choose-gallery-photo" data-photo-index="${slot.ordinal}" ${routeProtectedControlAttributes()} type="button">${t("common.gallery", "Gallery")}</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderDriverBinReceipt(job, requirements) {
+  const receiptRequired = requirements.some(({ evidenceType }) => ["receipt", "weight", "quantity"].includes(evidenceType))
+    || String(job.mbt?.actionCode || "").includes("dump");
+  if (!receiptRequired) return "";
+  const receipt = ensureDriverBinDraft(job).receipt;
+  return `
+    <section class="driver-bin-receipt">
+      <div class="driver-bin-section-head">
+        <div><span>${t("driver.binDumpEvidence", "Dump evidence")}</span><h3>${t("driver.binCompleteReceipt", "Complete dump receipt")}</h3></div>
+        <span class="driver-bin-required-badge">${t("common.required", "Required")}</span>
+      </div>
+      <div class="driver-bin-frozen-grid">
+        <div><span>${t("driver.binDumpSite", "Dump site")}</span><strong>${escapeHtml(job.mbt.dumpSite?.displayName || job.mbt.dumpSite?.code || job.mbt.dumpSiteId || "-")}</strong></div>
+        <div><span>${t("driver.binMaterial", "Material")}</span><strong>${escapeHtml(job.mbt.material?.displayName || job.mbt.material?.code || job.mbt.materialId || "-")}</strong></div>
+      </div>
+      <div class="driver-bin-receipt-grid">
+        <label><span>${t("driver.binReceiptTicket", "Ticket number")} *</span><input data-bin-receipt="ticketNumber" ${routeProtectedControlAttributes()} maxlength="200" value="${escapeHtml(receipt.ticketNumber)}" /></label>
+        <label><span>${t("driver.binReceiptUom", "Unit of measure")} *</span><input data-bin-receipt="unitOfMeasure" ${routeProtectedControlAttributes()} maxlength="40" value="${escapeHtml(receipt.unitOfMeasure)}" placeholder="TONNE" /></label>
+        <label><span>${t("driver.binReceiptWeight", "Weight")}</span><input data-bin-receipt="weight" ${routeProtectedControlAttributes()} inputmode="decimal" maxlength="80" value="${escapeHtml(receipt.weight)}" /></label>
+        <label><span>${t("driver.binReceiptQuantity", "Quantity")}</span><input data-bin-receipt="quantity" ${routeProtectedControlAttributes()} inputmode="decimal" maxlength="80" value="${escapeHtml(receipt.quantity)}" /></label>
+        <label><span>${t("driver.binReceiptSubtotal", "Subtotal")} *</span><input data-bin-receipt="subtotal" ${routeProtectedControlAttributes()} inputmode="decimal" maxlength="40" value="${escapeHtml(receipt.subtotal)}" placeholder="0.00" /></label>
+        <label><span>${t("driver.binReceiptTax", "Tax")} *</span><input data-bin-receipt="tax" ${routeProtectedControlAttributes()} inputmode="decimal" maxlength="40" value="${escapeHtml(receipt.tax)}" placeholder="0.00" /></label>
+        <label><span>${t("driver.binReceiptTotal", "Total CAD")} *</span><input data-bin-receipt="total" ${routeProtectedControlAttributes()} inputmode="decimal" maxlength="40" value="${escapeHtml(receipt.total)}" placeholder="0.00" /></label>
+      </div>
+      <small>${t("driver.binReceiptBalanceHelp", "Total must equal subtotal plus tax. Enter either weight or quantity.")}</small>
+    </section>
+  `;
+}
+
+function renderDriverBinEvidence(job) {
+  const draft = ensureDriverBinDraft(job);
+  const requirements = window.DriverBinUI.requirements(job);
+  const slots = window.DriverBinUI.photoSlots(job);
+  while (photos.length < slots.length) photos.push("");
+  const photoRequirements = new Map(requirements.map((requirement) => [requirement.evidenceCode, requirement]));
+  const scanFields = requirements.filter(({ evidenceType }) => evidenceType === "bin_scan").map((requirement) => {
+    const asset = requirement.asset || {};
+    return `
+      <label class="driver-bin-scan-field">
+        <span>${escapeHtml(binEvidenceLabel(requirement))}${requirement.required ? " *" : ""}</span>
+        <input data-bin-scan="${escapeHtml(requirement.evidenceCode)}" ${routeProtectedControlAttributes()} autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="200" value="${escapeHtml(draft.scans[requirement.evidenceCode])}" placeholder="${t("driver.binScanPlaceholder", "Scan or enter the exact BIN code")}" />
+        <small>${t("driver.binExpected", "Expected")}: ${escapeHtml(asset.assetCode || asset.qrCode || asset.assetId || "-")}</small>
+      </label>
+    `;
+  }).join("");
+  const noteFields = requirements.filter(({ evidenceType }) => evidenceType === "note").map((requirement) => `
+    <label class="driver-bin-note-field">
+      <span>${escapeHtml(binEvidenceLabel(requirement))}${requirement.required ? " *" : ""}</span>
+      <textarea data-bin-note="${escapeHtml(requirement.evidenceCode)}" ${routeProtectedControlAttributes()} maxlength="2000" placeholder="${t("driver.binNotePlaceholder", "Record the required condition or site note")}">${escapeHtml(draft.notes[requirement.evidenceCode])}</textarea>
+    </label>
+  `).join("");
+  const signatureFields = requirements.filter(({ evidenceType }) => evidenceType === "signature").map((requirement) => `
+    <label class="driver-bin-signature-field">
+      <span>${escapeHtml(binEvidenceLabel(requirement))} · ${t("driver.binSignerName", "Signer name")}${requirement.required ? " *" : ""}</span>
+      <input data-bin-signature="${escapeHtml(requirement.evidenceCode)}" ${routeProtectedControlAttributes()} maxlength="300" value="${escapeHtml(draft.signatures[requirement.evidenceCode]?.signedBy || "")}" placeholder="${t("driver.binSignerPlaceholder", "Enter the person who signed")}" />
+    </label>
+  `).join("");
+  const photoFields = slots.map((slot) => renderDriverBinPhotoSlot(slot, photoRequirements.get(slot.evidenceCode) || slot)).join("");
+  return `
+    <section class="driver-bin-evidence" aria-label="${t("driver.binRequiredEvidence", "Required BIN evidence")}">
+      <div class="driver-bin-section-head">
+        <div><span>${t("driver.binSavedOnDevice", "Saved on this device")}</span><h3>${t("driver.binRequiredEvidence", "Required BIN evidence")}</h3></div>
+        ${renderCameraSwitchButton()}
+      </div>
+      ${scanFields ? `<div class="driver-bin-field-grid">${scanFields}</div>` : ""}
+      ${photoFields ? `<div class="photo-grid driver-bin-photo-grid">${photoFields}</div>` : ""}
+      ${noteFields ? `<div class="driver-bin-field-grid">${noteFields}</div>` : ""}
+      ${signatureFields ? `<div class="driver-bin-field-grid">${signatureFields}</div>` : ""}
+      ${renderDriverBinReceipt(job, requirements)}
+      <p class="driver-bin-local-first-note">${t("driver.binLocalFirstHelp", "Each action and required photo is saved on this device before the screen advances. Offline location is recorded as not checked.")}</p>
+    </section>
+  `;
+}
+
+function renderDriverBinSummary(job) {
+  const assets = Object.entries(job.mbt?.exactAssets || {}).filter(([, asset]) => asset?.assetId);
+  const requirements = window.DriverBinUI.requirements(job);
+  return `
+    <section class="driver-bin-work-order" data-driver-bin-job>
+      <div class="driver-bin-work-head">
+        <div><span>${t("driver.binWorkOrder", "BIN work order")}</span><h3>${escapeHtml(job.mbt?.visitReference || job.mbt?.contractNumber || job.jobId)}</h3></div>
+        <span class="driver-bin-type-badge">${escapeHtml(job.mbt?.binTypeCode || "BIN")}</span>
+      </div>
+      <div class="driver-bin-frozen-grid">
+        <div><span>${t("driver.binAction", "Action")}</span><strong>${escapeHtml(driverBinActionLabel(job))}</strong></div>
+        <div><span>${t("driver.binVisit", "Visit")}</span><strong>${escapeHtml(job.mbt?.visitReference || "-")}</strong></div>
+      </div>
+      ${assets.length ? `<div class="driver-bin-assets">${assets.map(([role, asset]) => `
+        <div data-bin-asset-role="${escapeHtml(role)}">
+          <span>${escapeHtml(binAssetRoleLabel(role))}</span>
+          <strong>${escapeHtml(asset.assetCode || asset.qrCode || asset.assetId)}</strong>
+          <small>${escapeHtml(asset.binTypeCode || job.mbt?.binTypeCode || "")}</small>
+        </div>
+      `).join("")}</div>` : ""}
+      ${job.status === "in_progress"
+        ? renderDriverBinEvidence(job)
+        : `<div class="driver-bin-requirements-preview"><strong>${t("driver.binAfterStart", "After Start, record:")}</strong><span>${requirements.map(binEvidenceLabel).map(escapeHtml).join(" · ") || t("driver.binNoExtraEvidence", "No additional evidence")}</span></div>`}
+    </section>
+  `;
+}
+
 function renderPhotoSlots(job) {
   if (!job.requiredPhotos) {
     return `
@@ -1927,6 +2585,7 @@ function renderJob() {
   const isPickup = job.stopType === "pickup";
   const isTravel = job.stopType === "travel";
   const isTruckSwitch = job.stopType === "truck_switch";
+  const isBin = isDriverBinJob(job);
   const switchAttention = truckSwitchAttentionForJob(job);
   const isStarted = job.status === "in_progress";
   const typeText = isTruckSwitch ? t("driver.truckSwitch", "Truck Switch") : isTravel ? t("driver.travel", "Travel") : isPickup ? t("driver.pickup", "Pickup") : t("driver.dropoff", "Drop Off");
@@ -1970,7 +2629,7 @@ function renderJob() {
         <div><span>${t("driver.nextTruck", "Next truck")}</span><strong>${escapeHtml(job.nextTruckPlate || job.truckPlate || "-")}</strong></div>
         <p>${escapeHtml(job.instructions || t("driver.switchInstruction", "Park the current truck and confirm after entering the next truck."))}</p>
       </section>` : renderLocationCheck(job)}
-      ${isTravel || isTruckSwitch ? "" : renderOrders(job)}
+      ${isTravel || isTruckSwitch ? "" : isBin ? renderDriverBinSummary(job) : renderOrders(job)}
       <div class="job-actions ${isTruckSwitch ? "truck-switch-job-actions" : ""}">
         ${isTruckSwitch
           ? `<div class="truck-switch-action-set">
@@ -1978,7 +2637,9 @@ function renderJob() {
               ${driverUsesSamsaraWorkflow() ? `<button class="secondary danger-button skip-samsara-button" data-action="skip-samsara-switch" ${routeProtectedControlAttributes()} type="button">${t("driver.skipSamsara", "Skip Samsara & Confirm")}</button>` : ""}
             </div>`
           : isStarted
-          ? `<button class="primary" data-action="${job.requiredPhotos ? "show-photo" : "complete-job"}" ${routeProtectedControlAttributes()} data-job-confirm data-gps-gate="begin" data-ready-label="${t("driver.confirm", "Confirm")}" ${confirmDisabled ? "disabled" : ""} type="button">${waitSeconds > 0 ? tf("driver.waitSeconds", "Wait {seconds}s", { seconds: waitSeconds }) : t("driver.confirm", "Confirm")}</button>`
+          ? isBin
+            ? `<button class="primary driver-bin-complete" data-action="complete-job" data-driver-bin-complete ${routeProtectedControlAttributes()} data-job-confirm data-gps-gate="begin" data-ready-label="${t("driver.binCompleteStop", "Complete BIN Stop")}" ${confirmDisabled || !driverBinEvidenceReady(job) ? "disabled" : ""} type="button">${waitSeconds > 0 ? tf("driver.waitSeconds", "Wait {seconds}s", { seconds: waitSeconds }) : t("driver.binCompleteStop", "Complete BIN Stop")}</button>`
+            : `<button class="primary" data-action="${job.requiredPhotos ? "show-photo" : "complete-job"}" ${routeProtectedControlAttributes()} data-job-confirm data-gps-gate="begin" data-ready-label="${t("driver.confirm", "Confirm")}" ${confirmDisabled ? "disabled" : ""} type="button">${waitSeconds > 0 ? tf("driver.waitSeconds", "Wait {seconds}s", { seconds: waitSeconds }) : t("driver.confirm", "Confirm")}</button>`
           : `<button class="primary" data-action="start-job" ${routeProtectedControlAttributes()} type="button">${t("common.start", "Start")}</button>`}
         <button class="secondary compact" data-action="refresh" type="button">${t("common.refresh", "Refresh")}</button>
         <button class="secondary compact" data-action="open-history" type="button">${t("common.history", "History")}</button>
@@ -2146,7 +2807,7 @@ function projectOfflineRoute(manifest, events) {
 }
 
 async function restoreDraftPhotos(kind = "job", suffix = "") {
-  if (!offlineStorageAvailable || !offlinePartition?.partitionKey || !offlineManifest?.manifestId) return;
+  if (!driverOfflineModeEnabled || !offlineStorageAvailable || !offlinePartition?.partitionKey || !offlineManifest?.manifestId) return;
   const partitionKey = offlinePartition.partitionKey;
   const manifestId = offlineManifest.manifestId;
   const expectedJobId = String(currentJob?.jobId || "");
@@ -2198,6 +2859,7 @@ async function renderOfflineProjection(manifest = offlineManifest) {
   pendingDvirPhotos = projectedPendingDvirPhotos;
   photos = [];
   driverRemark = "";
+  binDraft = null;
   dvirPhotos = [];
   orderPages = {};
   photoPromptOpen = false;
@@ -2232,7 +2894,8 @@ async function renderOfflineProjection(manifest = offlineManifest) {
   if (currentJob) {
     await Promise.all([
       restoreDraftPhotos("job"),
-      restoreDriverRemarkDraft()
+      restoreDriverRemarkDraft(),
+      restoreDriverBinDraft()
     ]);
   }
   if (routeRefreshWasSuperseded(projectionEpoch)) return false;
@@ -2241,7 +2904,7 @@ async function renderOfflineProjection(manifest = offlineManifest) {
 }
 
 async function loadCachedRoute() {
-  if (!offlineStorageAvailable) return false;
+  if (!driverOfflineModeEnabled || !offlineStorageAvailable) return false;
   const active = offlinePartition || await window.DriverOfflineDB.getActiveProfile();
   if (!active || active.locked) return false;
   offlinePartition = active;
@@ -2264,6 +2927,12 @@ async function ensureDriverIdentityValidated() {
 }
 
 async function prepareOfflineRecord() {
+  if (!driverOfflineModeEnabled) {
+    await ensureDriverIdentityValidated();
+    if (driverIdentityValidated && navigator.onLine) return true;
+    showToast(t("driver.onlineOnlyConnectionRequired", "Admin has set this Driver PWA to online-only mode. Reconnect to record an action."));
+    return false;
+  }
   if (canUseOfflineLedger()) return true;
   showToast(t("driver.preparingOfflineRecord", "Preparing offline record..."));
   await ensureDriverIdentityValidated();
@@ -2285,7 +2954,7 @@ async function prepareOfflineRecord() {
 
 async function saveRouteBootstrap(result, { activate } = {}) {
   if (!(await ensureDriverIdentityValidated())) return null;
-  if (!offlineStorageAvailable || !offlinePartition?.partitionKey || !result?.routeBootstrap?.manifestId) return null;
+  if (!driverOfflineModeEnabled || !offlineStorageAvailable || !offlinePartition?.partitionKey || !result?.routeBootstrap?.manifestId) return null;
   const shouldActivate = activate ?? !(await shouldDeferIncomingManifest(result.routeBootstrap));
   const saved = await window.DriverOfflineDB.saveBootstrap(
     offlinePartition.partitionKey,
@@ -2306,6 +2975,7 @@ async function saveRouteBootstrap(result, { activate } = {}) {
 }
 
 async function fetchDriverDayPlanPayload(date = "", { forceRefresh = false } = {}) {
+  if (!driverOfflineModeEnabled) return null;
   const planDate = String(date || dayState?.planDate || currentJob?.planDate || localDate()).slice(0, 10);
   const params = new URLSearchParams({ date: planDate });
   if (forceRefresh) params.set("forceRefresh", "1");
@@ -2321,6 +2991,7 @@ async function fetchDriverDayPlanPayload(date = "", { forceRefresh = false } = {
 }
 
 async function saveDriverDayPlanPayload(payload, { activate: requestedActivation } = {}) {
+  if (!driverOfflineModeEnabled || !payload) return { saved: null, activate: false };
   const activate = requestedActivation ?? !(await shouldDeferIncomingManifest(payload));
   const saved = await window.DriverOfflineDB.saveManifestAtomic(
     offlinePartition.partitionKey,
@@ -2341,6 +3012,7 @@ async function saveDriverDayPlanPayload(payload, { activate: requestedActivation
 }
 
 async function downloadDayPlan(date = "", { forceRefresh = false } = {}) {
+  if (!driverOfflineModeEnabled) return null;
   if (savedRouteClearRunning) return null;
   if (!(await ensureDriverIdentityValidated())) return null;
   if (!offlineStorageAvailable || !offlinePartition?.partitionKey || !authToken) return null;
@@ -2403,9 +3075,10 @@ async function revalidateOnlineRoute({
   source = "background"
 } = {}) {
   if (savedRouteClearRunning) return !beforeAction;
-  if (!navigator.onLine || !driver || !authToken || !offlineStorageAvailable || !offlinePartition?.partitionKey) {
+  if (!navigator.onLine || !driver || !authToken) {
     return true;
   }
+  if (driverOfflineModeEnabled && (!offlineStorageAvailable || !offlinePartition?.partitionKey)) return true;
   if (!beforeAction && (quietSyncActive() || activeRest || photoInteractionActive())) {
     onlineRouteRevalidationQueued = true;
     return true;
@@ -2414,11 +3087,52 @@ async function revalidateOnlineRoute({
     const result = await onlineRouteValidationPromise;
     return beforeAction ? result : true;
   }
-  const partitionKey = offlinePartition.partitionKey;
+  const partitionKey = driverOfflineModeEnabled ? offlinePartition.partitionKey : "";
   onlineRouteValidationPromise = (async () => {
     try {
       const authoritative = await request(`/api/driver/next-job?revalidate=${encodeURIComponent(Date.now())}`);
-      if (partitionKey !== offlinePartition?.partitionKey) throw driverSessionChangedError();
+      if (partitionKey && partitionKey !== offlinePartition?.partitionKey) throw driverSessionChangedError();
+      if (crossDevicePendingCompletionMatchesJob(authoritative.pendingCompletion, expectedJob)) {
+        onlineRouteLastValidatedAt = Date.now();
+        if (beforeAction) {
+          showToast(t(
+            "driver.stopAlreadySavedAnotherDevice",
+            "This stop has pending evidence under another device storage ID. A browser storage error can cause this even when nobody else logged in. Keep the original PWA open and use Sync now, or request Dispatch review."
+          ));
+        }
+        return false;
+      }
+      if (!driverOfflineModeEnabled) {
+        const currentChanged = authoritativeJobChanged(expectedJob, authoritative);
+        onlineRouteLastValidatedAt = Date.now();
+        onlineRouteUpdatePending = false;
+        onlineRouteRevalidationQueued = false;
+        if (authoritative.state) dayState = authoritative.state;
+        if (currentChanged) {
+          if (activeRest || photoInteractionActive()) {
+            onlineRouteUpdatePending = true;
+            onlineRouteRevalidationQueued = true;
+            if (beforeAction) {
+              showToast(t("driver.stopUpdatedReview", "The server stop changed. Finish the open screen, refresh, and review it before continuing."));
+            }
+            return false;
+          }
+          await loadNextJob();
+          if (beforeAction) showToast(t("driver.stopUpdatedReview", "The server stop changed. Review it, then tap the action again."));
+          return false;
+        }
+        const authoritativeIdentity = authoritativeJobIdentity(authoritative);
+        if (currentJob && authoritativeIdentity.job && String(currentJob.jobId) === String(authoritativeIdentity.job.jobId)) {
+          currentJob = withManifestJobIdentity({
+            ...currentJob,
+            fingerprint: authoritativeIdentity.fingerprint || currentJob.fingerprint,
+            predecessorFingerprint: authoritativeIdentity.predecessorFingerprint || currentJob.predecessorFingerprint,
+            contentFingerprint: authoritativeIdentity.contentFingerprint || currentJob.contentFingerprint
+          }, authoritative.routeBootstrap);
+        }
+        renderOfflineStatus();
+        return true;
+      }
       const planDate = manifestPlanDate(authoritative.routeBootstrap)
         || authoritative.state?.planDate
         || authoritative.job?.planDate
@@ -2426,19 +3140,58 @@ async function revalidateOnlineRoute({
       const payload = await fetchDriverDayPlanPayload(planDate, { forceRefresh });
       if (partitionKey !== offlinePartition?.partitionKey) throw driverSessionChangedError();
       const currentChanged = authoritativeJobChanged(expectedJob, authoritative);
+      const dispatchRouteChanged = manifestRevisionChanged(offlineManifest, payload);
+      const projectionEvents = currentChanged && !dispatchRouteChanged && offlineManifest?.manifestId
+        ? await window.DriverOfflineDB.getProjectionEvents(partitionKey, offlineManifest)
+        : [];
+      if (partitionKey !== offlinePartition?.partitionKey) throw driverSessionChangedError();
+      const routeReconciliation = classifyAuthoritativeRoute(expectedJob, authoritative, {
+        manifest: offlineManifest,
+        events: projectionEvents,
+        dispatchRouteChanged
+      });
       const protectedInteraction = Boolean(activeRest || photoInteractionActive());
       const routeChanged = incomingRouteDiffers(payload);
-      const requestedActivation = protectedInteraction && (currentChanged || routeChanged)
-        ? false
-        : undefined;
+      const requestedActivation = routeReconciliation === "local_progress_pending"
+        ? true
+        : protectedInteraction && (currentChanged || routeChanged)
+          ? false
+          : undefined;
       const { activate } = await saveDriverDayPlanPayload(payload, { activate: requestedActivation });
       if (partitionKey !== offlinePartition?.partitionKey) throw driverSessionChangedError();
+      if (routeReconciliation === "local_progress_pending") {
+        onlineRouteLastValidatedAt = Date.now();
+        onlineRouteUpdatePending = false;
+        onlineRouteRevalidationQueued = false;
+        renderOfflineStatus();
+        if (beforeAction) {
+          showToast(t(
+            "driver.previousStopPhotosSyncing",
+            "Previous stop saved locally. Its photos are still synchronizing; you can continue with this route."
+          ));
+        }
+        return true;
+      }
+      if (routeReconciliation === "local_progress_review") {
+        onlineRouteUpdatePending = true;
+        onlineRouteRevalidationQueued = true;
+        renderOfflineStatus();
+        if (beforeAction) {
+          showToast(t(
+            "driver.previousStopReviewRequired",
+            "The previous stop needs Dispatch review before you can continue."
+          ));
+        }
+        return false;
+      }
       if (!activate && currentChanged) {
         onlineRouteUpdatePending = true;
         onlineRouteRevalidationQueued = true;
         renderOfflineStatus();
         if (beforeAction) {
-          showToast(t("driver.stopUpdatedProtected", "Dispatch updated this stop. Close the protected screen, refresh, and review it before continuing."));
+          showToast(routeReconciliation === "server_execution_changed"
+            ? t("driver.serverStopMovedProtected", "The server is on a different stop. Close the protected screen, refresh, and review it before continuing.")
+            : t("driver.stopUpdatedProtected", "Dispatch updated this stop. Close the protected screen, refresh, and review it before continuing."));
         }
         return false;
       }
@@ -2453,7 +3206,7 @@ async function revalidateOnlineRoute({
       onlineRouteUpdatePending = false;
       onlineRouteRevalidationQueued = false;
       offlineStatus.dataset.lastError = "";
-      if (currentChanged) {
+      if (routeReconciliation !== "unchanged") {
         if (protectedInteraction) {
           onlineRouteUpdatePending = true;
           onlineRouteRevalidationQueued = true;
@@ -2461,9 +3214,15 @@ async function revalidateOnlineRoute({
           return false;
         }
         await loadNextJob();
-        showToast(beforeAction
-          ? t("driver.stopUpdatedReview", "Dispatch updated this stop. Review it, then tap the action again.")
-          : t("driver.routeUpdated", "Route updated by Dispatch"));
+        if (routeReconciliation === "server_execution_changed") {
+          showToast(beforeAction
+            ? t("driver.serverStopMovedReview", "The server is on a different stop. Review it, then tap the action again.")
+            : t("driver.serverRouteMoved", "The server route moved to another stop."));
+        } else {
+          showToast(beforeAction
+            ? t("driver.stopUpdatedReview", "Dispatch updated this stop. Review it, then tap the action again.")
+            : t("driver.routeUpdated", "Route updated by Dispatch"));
+        }
         return false;
       }
       if (authoritative.state) dayState = authoritative.state;
@@ -2490,7 +3249,7 @@ async function revalidateOnlineRoute({
       else if (source !== "poll") showToast(error.message);
       return false;
     } finally {
-      if (partitionKey === offlinePartition?.partitionKey) scheduleOnlineRouteRevalidation();
+      if (!partitionKey || partitionKey === offlinePartition?.partitionKey) scheduleOnlineRouteRevalidation();
     }
   })();
   try {
@@ -2594,6 +3353,19 @@ async function syncCapturedPartition(context) {
 async function reportDriverClientSyncStatus(state, { error = null, health = null } = {}) {
   if (!authToken || !offlineDeviceId || !navigator.onLine) return false;
   const snapshot = health || offlineHealth || {};
+  const photoFailures = Array.isArray(error?.photoFailures)
+    ? error.photoFailures.slice(0, 10).map((failure) => ({
+        photoId: String(failure?.photoId || "").slice(0, 160),
+        eventId: String(failure?.eventId || "").slice(0, 160),
+        phase: String(failure?.phase || "").slice(0, 80),
+        byteSize: Math.max(0, Number(failure?.byteSize || 0)),
+        attemptCount: Math.max(0, Number(failure?.attemptCount || 0)),
+        retryable: failure?.retryable === true,
+        errorCode: String(failure?.errorCode || failure?.code || "").slice(0, 160),
+        httpStatus: Math.max(0, Number(failure?.httpStatus || failure?.status || 0)),
+        message: String(failure?.message || "Photo upload failed.").slice(0, 1000)
+      }))
+    : [];
   const payload = {
     state,
     errorName: error ? String(error.name || "").slice(0, 160) : "",
@@ -2611,6 +3383,7 @@ async function reportDriverClientSyncStatus(state, { error = null, health = null
     unsyncedPhotoCount: Math.max(0, Number(
       snapshot.partitionUnsyncedPhotoCount ?? snapshot.unsyncedPhotoCount ?? 0
     )),
+    photoFailures,
     clientOccurredAt: new Date().toISOString()
   };
   try {
@@ -2672,14 +3445,23 @@ async function renderQuietSyncFinalState(context) {
   return !quietSyncRefreshQueued;
 }
 
+function retainedPhotoRecoveryRunsInBackground(health = offlineHealth) {
+  return Number(
+    health?.partitionUnsyncedPhotoCount ?? health?.unsyncedPhotoCount ?? 0
+  ) > 0;
+}
+
 async function prepareQuietSyncHoldForSavedWork() {
   if (!navigator.onLine || !offlineStorageAvailable || !offlinePartition?.partitionKey) return null;
   const partitionKey = offlinePartition.partitionKey;
   const health = await window.DriverOfflineDB.getStorageHealth(partitionKey).catch(() => null);
   if (!health || offlinePartition?.partitionKey !== partitionKey) return null;
   offlineHealth = health;
+  // Large retained photos drain sequentially and can take minutes on a weak
+  // connection. Keep the local route usable while that evidence uploads.
+  if (retainedPhotoRecoveryRunsInBackground(health)) return null;
   const hasSavedWork = Number(health.pendingEventCount || 0) > 0
-    || Number(health.partitionUnsyncedPhotoCount || 0) > 0;
+    || Number(health.reviewRequiredCount || 0) > 0;
   return hasSavedWork
     ? beginQuietSync({ holdScreen: true, immediate: true })
     : null;
@@ -2751,6 +3533,14 @@ async function triggerOfflineSync({
     await reconcilePendingDutyEvents({ refreshFirst: false });
     finalStateRendered = await renderQuietSyncFinalState(context);
     syncSucceeded = true;
+    // A completed upload of an actual ledger event is a stronger connectivity
+    // signal than navigator.onLine after a service-worker reload. A no-op sync
+    // must not erase the offline marker while the driver is still drafting.
+    const synchronizedOfflineEvidence = savedEvents.some((event) => (
+      event?.locationStatus === "not_checked_offline"
+      && ["pending", "syncing", "foreground_pending"].includes(String(event?.status || "pending"))
+    ));
+    if (synchronizedOfflineEvidence && retainedWorkCount === 0) markDriverBrowserOnline();
     if (retainedError) void reportDriverClientSyncStatus("error", { error: retainedError, health: returnedHealth });
     else void reportDriverClientSyncStatus("ok", { health: returnedHealth });
     if (userInitiated) {
@@ -3311,6 +4101,7 @@ async function loadNextJob() {
     restSummary = result.restSummary || null;
     photos = [];
     driverRemark = "";
+    binDraft = null;
     dvirMode = "";
     dvirPhotos = [];
     orderPages = {};
@@ -3356,11 +4147,12 @@ async function loadNextJob() {
         currentJob = withManifestJobIdentity(currentJob, result.routeBootstrap);
         await Promise.all([
           restoreDraftPhotos("job"),
-          restoreDriverRemarkDraft()
+          restoreDriverRemarkDraft(),
+          restoreDriverBinDraft()
         ]);
         if (
           renderedEpoch === driverInteractionEpoch
-          && (photos.some(Boolean) || Boolean(driverRemark))
+          && (photos.some(Boolean) || Boolean(driverRemark) || driverBinDraftHasContent())
           && currentJob?.jobId === result.job?.jobId
         ) renderJob();
       }
@@ -3938,6 +4730,26 @@ app.addEventListener("click", async (event) => {
     if (!(await prepareOfflineRecord())) return renderJob();
     if (canUseOfflineLedger()) {
       const startedJob = currentJob;
+      if (isDriverBinJob(startedJob)) {
+        try {
+          await queueDriverEvent("job_started", {
+            job: startedJob,
+            details: {
+              truckPlate: dayState?.truckPlate || startedJob?.truckPlate || null
+            },
+            deferSync: false
+          });
+          locationCheck = null;
+          locationOverrideAccepted = false;
+          renderJob();
+          showToast(t("driver.binJobStarted", "BIN stop saved on this device"));
+          if (navigator.onLine) checkCurrentJobLocation().catch((error) => showToast(error.message));
+        } catch (error) {
+          showToast(error.message);
+          renderJob();
+        }
+        return;
+      }
       let foregroundEvent = null;
       try {
         foregroundEvent = await queueDriverEvent("job_started", {
@@ -3990,6 +4802,34 @@ app.addEventListener("click", async (event) => {
         await loadNextJob().catch(() => renderJob());
         return;
       }
+    }
+    if (isDriverBinJob(currentJob)) {
+      const startedJob = currentJob;
+      const attempt = onlineBinEventAttempt(startedJob, "job_started");
+      try {
+        const result = await request(`/api/driver/jobs/${encodeURIComponent(startedJob.jobId)}/bin/start`, {
+          method: "POST",
+          body: JSON.stringify({
+            eventId: attempt.eventId,
+            clientSequence: attempt.clientSequence,
+            details: {
+              truckPlate: dayState?.truckPlate || startedJob?.truckPlate || null
+            }
+          })
+        });
+        finishOnlineBinEventAttempt(attempt);
+        dayState = result.state || dayState;
+        currentJob = withManifestJobIdentity(result.job) || currentJob;
+        locationCheck = null;
+        locationOverrideAccepted = false;
+        renderJob();
+        showToast(t("driver.binJobStartedOnline", "BIN stop started online"));
+        checkCurrentJobLocation().catch((error) => showToast(error.message));
+      } catch (error) {
+        showToast(error.message);
+        await loadNextJob().catch(() => renderJob());
+      }
+      return;
     }
     try {
       const result = await request(`/api/driver/jobs/${encodeURIComponent(currentJob.jobId)}/start`, {
@@ -4103,9 +4943,19 @@ app.addEventListener("click", async (event) => {
   }
   if (action === "complete-job" && currentJob) {
     const completedJob = currentJob;
-    const submittedJobPhotos = photos.filter(Boolean).slice();
+    const submittedJobPhotos = isDriverBinJob(completedJob) ? photos.slice() : photos.filter(Boolean).slice();
     const submittedDriverRemark = normalizedDriverRemark();
     const submittedRemarkDraftKey = currentDriverRemarkDraftKey();
+    const submittedBinDraftKey = currentDriverBinDraftKey(completedJob);
+    let submittedBinDetails = null;
+    if (isDriverBinJob(completedJob)) {
+      try {
+        submittedBinDetails = window.DriverBinUI.buildCompletionDetails(completedJob, binDraft, submittedJobPhotos);
+      } catch (error) {
+        showToast(driverBinErrorMessage(error, completedJob));
+        return renderJob();
+      }
+    }
     if (!(await ensureAuthoritativeJobBeforeAction(completedJob))) return;
     if (!canBeginJobConfirmation(completedJob)) {
       if (completeWaitSeconds(completedJob) > 0) {
@@ -4136,12 +4986,15 @@ app.addEventListener("click", async (event) => {
             stopId: completedJob.stopId || null,
             loadId: completedJob.loadId || null,
             planId: completedJob.planId || offlineManifest.planId || null,
-            driverRemark: submittedDriverRemark
+            driverRemark: submittedDriverRemark,
+            ...(submittedBinDetails ? { mbt: submittedBinDetails } : {})
           }
         });
         photos = [];
         driverRemark = "";
+        binDraft = null;
         void clearDriverRemarkDraft(submittedRemarkDraftKey).catch(() => {});
+        void clearDriverBinDraft(submittedBinDraftKey).catch(() => {});
         orderPages = {};
         photoPromptOpen = false;
         locationCheck = null;
@@ -4153,6 +5006,56 @@ app.addEventListener("click", async (event) => {
         showToast(error.message);
         return renderJob();
       }
+    }
+    if (isDriverBinJob(completedJob)) {
+      const attempt = onlineBinEventAttempt(completedJob, "job_completed");
+      try {
+        if (locationCheckBlocksConfirmation() || !locationCheckApproved()) {
+          showToast(t("driver.recheckOrOverride", "Recheck location or confirm override first."));
+          return renderJob();
+        }
+        await uploadDriverPhotos(submittedJobPhotos, {
+          recordType: "driver-stop-photo",
+          jobId: completedJob.jobId,
+          stopId: completedJob.stopId,
+          planId: completedJob.planId,
+          loadId: completedJob.loadId
+        });
+        button.textContent = t("common.saving", "Saving...");
+        const result = await request(`/api/driver/jobs/${encodeURIComponent(completedJob.jobId)}/bin/complete`, {
+          method: "POST",
+          body: JSON.stringify({
+            eventId: attempt.eventId,
+            clientSequence: attempt.clientSequence,
+            photos: onlineBinPhotoDescriptors(submittedJobPhotos),
+            details: {
+              stopType: completedJob.stopType,
+              stopId: completedJob.stopId || null,
+              loadId: completedJob.loadId || null,
+              planId: completedJob.planId || null,
+              driverRemark: submittedDriverRemark,
+              mbt: submittedBinDetails
+            }
+          })
+        });
+        finishOnlineBinEventAttempt(attempt);
+        await clearLegacyDraftPhotos(submittedJobPhotos);
+        dayState = result.state || dayState;
+        currentJob = withManifestJobIdentity(result.job);
+        photos = [];
+        driverRemark = "";
+        binDraft = null;
+        orderPages = {};
+        photoPromptOpen = false;
+        locationCheck = null;
+        locationOverrideAccepted = false;
+        renderJob();
+        showToast(t("driver.binStopCompletedOnline", "BIN stop completed online"));
+      } catch (error) {
+        showToast(error.message);
+        await loadNextJob().catch(() => renderJob());
+      }
+      return;
     }
     try {
       if (locationCheckBlocksConfirmation() || !locationCheckApproved()) {
@@ -4210,6 +5113,29 @@ app.addEventListener("click", async (event) => {
 });
 
 app.addEventListener("input", (event) => {
+  const binScan = event.target.closest("[data-bin-scan]");
+  const binNote = event.target.closest("[data-bin-note]");
+  const binSignature = event.target.closest("[data-bin-signature]");
+  const binReceipt = event.target.closest("[data-bin-receipt]");
+  if (binScan || binNote || binSignature || binReceipt) {
+    if (!driverActionProtectionState().ready || !isDriverBinJob()) {
+      applyDriverActionProtectionGate();
+      return;
+    }
+    markDriverInteraction();
+    const draft = ensureDriverBinDraft();
+    if (binScan) draft.scans[binScan.dataset.binScan] = String(binScan.value || "").slice(0, 200);
+    if (binNote) draft.notes[binNote.dataset.binNote] = String(binNote.value || "").slice(0, 2000);
+    if (binSignature) {
+      draft.signatures[binSignature.dataset.binSignature] = {
+        signedBy: String(binSignature.value || "").slice(0, 300)
+      };
+    }
+    if (binReceipt) draft.receipt[binReceipt.dataset.binReceipt] = String(binReceipt.value || "").slice(0, 200);
+    void persistDriverBinDraft(draft).catch(() => {});
+    updateDriverBinCompletionButton();
+    return;
+  }
   const remarkInput = event.target.closest("[data-driver-photo-remark]");
   if (!remarkInput) return;
   if (!driverActionProtectionState().ready) {
@@ -4241,10 +5167,12 @@ app.addEventListener("change", async (event) => {
   beginPhotoCapture();
   try {
     if (!file) return;
-    if (!(await prepareOfflineRecord()) || !canUseOfflineLedger()) return;
+    if (!(await prepareOfflineRecord())) return;
     const isDvir = Boolean(dvirInput);
     const index = Number((isDvir ? dvirInput.dataset.dvirPhotoIndex : input.dataset.photoIndex) || 0);
-    const capturePartitionKey = offlinePartition?.partitionKey || "";
+    const capturePartitionKey = driverOfflineModeEnabled
+      ? (offlinePartition?.partitionKey || "")
+      : "";
     const captureJobId = String(currentJob?.jobId || "");
     const captureDvirMode = dvirMode || "pre";
     const captureDraftKey = currentPhotoDraftKey(
@@ -4261,7 +5189,7 @@ app.addEventListener("change", async (event) => {
           : "driver-stop-photo";
     app.classList.add("photo-processing");
     let captured;
-    if (offlineStorageAvailable && capturePartitionKey) {
+    if (driverOfflineModeEnabled && offlineStorageAvailable && capturePartitionKey) {
       captured = await window.DriverOfflinePhotos.captureAndStore({
         file,
         partitionKey: capturePartitionKey,
@@ -4279,7 +5207,10 @@ app.addEventListener("change", async (event) => {
         ...compressed
       });
     }
-    const captureStillCurrent = capturePartitionKey === (offlinePartition?.partitionKey || "")
+    const activeCapturePartitionKey = driverOfflineModeEnabled
+      ? (offlinePartition?.partitionKey || "")
+      : "";
+    const captureStillCurrent = capturePartitionKey === activeCapturePartitionKey
       && (isDvir
         ? captureDvirMode === (dvirMode || "pre")
         : captureJobId === String(currentJob?.jobId || ""));
@@ -4291,7 +5222,9 @@ app.addEventListener("change", async (event) => {
     if (isDvir) dvirPhotos[index] = captured;
     else {
       photos[index] = captured;
-      photoPromptOpen = true;
+      // BIN evidence is rendered inline against immutable requirement codes;
+      // opening the ordinary photo modal would duplicate and obscure it.
+      photoPromptOpen = !isDriverBinJob();
     }
     await refreshOfflineHealth();
     if (isDvir) {
@@ -4335,6 +5268,13 @@ app.addEventListener("submit", async (event) => {
     dayState = result.dayState || null;
     localStorage.setItem(TOKEN_KEY, authToken);
     if (offlineStorageAvailable) {
+      const recoveredIdentity = await window.DriverOfflineDB.recoverDriverDeviceIdentity(driver);
+      offlineDeviceId = recoveredIdentity.deviceId || offlineDeviceId;
+      try {
+        localStorage.setItem(DRIVER_DEVICE_ID_KEY, offlineDeviceId);
+      } catch {
+        // IndexedDB remains authoritative for this session.
+      }
       offlinePartition = await window.DriverOfflineDB.unlockPartition(driver);
       offlineDeviceId = offlinePartition.deviceId;
       await window.DriverOfflineDB.releaseStaleForegroundEvents(offlinePartition.partitionKey);
@@ -4344,10 +5284,16 @@ app.addEventListener("submit", async (event) => {
       void requestPersistentStorage();
     }
     const preparedSyncToken = await prepareQuietSyncHoldForSavedWork();
+    const backgroundPhotoRecovery = retainedPhotoRecoveryRunsInBackground();
     connectEvents();
     let initialSyncResult = null;
     if (offlineStorageAvailable && offlinePartition?.partitionKey) {
-      initialSyncResult = await triggerOfflineSync({ preparedToken: preparedSyncToken });
+      if (backgroundPhotoRecovery) {
+        await loadNextJob();
+        void triggerOfflineSync({ suppressHold: true });
+      } else {
+        initialSyncResult = await triggerOfflineSync({ preparedToken: preparedSyncToken });
+      }
     } else {
       await loadNextJob();
     }
@@ -4366,6 +5312,11 @@ async function initializeOfflineStorage() {
   try {
     await window.DriverOfflineDB.open();
     offlineDeviceId = await window.DriverOfflineDB.getDeviceId();
+    try {
+      localStorage.setItem(DRIVER_DEVICE_ID_KEY, offlineDeviceId);
+    } catch {
+      // The IndexedDB identity still protects this open session.
+    }
     offlinePartition = await window.DriverOfflineDB.getActiveProfile();
     if (offlinePartition) await window.DriverOfflineDB.releaseStaleForegroundEvents(offlinePartition.partitionKey);
     offlineManifest = offlinePartition
@@ -4417,14 +5368,14 @@ async function recoverStaleForegroundEvents() {
 
 async function init() {
   restoreDriverPwaUpdateMarker();
-  const versionCheck = driverPwaUpdateRequired
-    ? Promise.resolve(false)
-    : checkDriverPwaVersion({ reason: "startup" });
-  await initializeOfflineStorage();
-  if (!(await versionCheck)) {
+  const versionCurrent = driverPwaUpdateRequired
+    ? false
+    : await checkDriverPwaVersion({ reason: "startup" });
+  if (!versionCurrent) {
     renderDriverPwaUpdateRequired();
     return;
   }
+  await initializeOfflineStorage();
   if (!authToken) {
     const offlineProbe = !navigator.onLine
       || await isGenuineNetworkFailure(Object.assign(new Error("Offline probe"), { isNetworkError: true }));
@@ -4437,12 +5388,20 @@ async function init() {
     driverSessionInvalidated = false;
     driverIdentityValidated = false;
     preparedSyncToken = await prepareQuietSyncHoldForSavedWork();
+    const backgroundPhotoRecovery = retainedPhotoRecoveryRunsInBackground();
     let identityError = null;
     driverIdentityValidationPromise = (async () => {
       try {
         const result = await request("/api/driver/me");
         driver = result.driver;
         if (offlineStorageAvailable) {
+          const recoveredIdentity = await window.DriverOfflineDB.recoverDriverDeviceIdentity(driver);
+          offlineDeviceId = recoveredIdentity.deviceId || offlineDeviceId;
+          try {
+            localStorage.setItem(DRIVER_DEVICE_ID_KEY, offlineDeviceId);
+          } catch {
+            // IndexedDB remains authoritative for this session.
+          }
           offlinePartition = await window.DriverOfflineDB.unlockPartition(driver);
           offlineDeviceId = offlinePartition.deviceId;
           await window.DriverOfflineDB.releaseStaleForegroundEvents(offlinePartition.partitionKey);
@@ -4466,7 +5425,11 @@ async function init() {
     }
     if (nextJobError) throw nextJobError;
     connectEvents();
-    await triggerOfflineSync({ preparedToken: preparedSyncToken });
+    if (backgroundPhotoRecovery) {
+      void triggerOfflineSync({ suppressHold: true });
+    } else {
+      await triggerOfflineSync({ preparedToken: preparedSyncToken });
+    }
     preparedSyncToken = null;
     scheduleOnlineRouteRevalidation(1000);
   } catch (error) {
@@ -4541,8 +5504,15 @@ window.addEventListener("online", () => {
 });
 
 window.addEventListener("offline", () => {
+  markDriverBrowserOffline();
   stopOnlineRouteRevalidation();
+  renderOfflineStatus();
+  applyDriverActionProtectionGate();
   void refreshOfflineHealth();
+});
+
+window.addEventListener("pagehide", () => {
+  if (!navigator.onLine) markDriverBrowserOffline();
 });
 
 window.addEventListener("storage", (event) => {
@@ -4581,6 +5551,24 @@ window.setInterval(() => {
   }
 }, DRIVER_PWA_VERSION_CHECK_MS);
 
+window.setInterval(() => {
+  if (
+    driverOfflineRecoveryRunning
+    || !browserOfflineObserved
+    || !navigator.onLine
+    || !driver
+    || !authToken
+    || driverPwaUpdateRequired
+    || document.visibilityState !== "visible"
+  ) return;
+  driverOfflineRecoveryRunning = true;
+  void resumeOnlineDriver("offline_recovery", { synchronizeProtectedScreen: true })
+    .catch(() => false)
+    .finally(() => {
+      driverOfflineRecoveryRunning = false;
+    });
+}, DRIVER_OFFLINE_RECOVERY_CHECK_MS);
+
 if ("serviceWorker" in navigator) {
   const requestDriverWorkerVersion = () => {
     navigator.serviceWorker.controller?.postMessage({ type: "DRIVER_VERSION_REQUEST" });
@@ -4597,7 +5585,14 @@ if ("serviceWorker" in navigator) {
     }
   });
   navigator.serviceWorker.addEventListener("controllerchange", () => {
+    offlineShellReady = Boolean(
+      navigator.serviceWorker.controller
+      || driverServiceWorkerRegistration?.active
+    );
+    renderOfflineStatus();
+    applyDriverActionProtectionGate();
     window.setTimeout(requestDriverWorkerVersion, 0);
+    window.setTimeout(publishDriverOfflineMode, 0);
   });
   navigator.serviceWorker.register("/driver-service-worker.js", {
     scope: "/driver",
@@ -4605,13 +5600,17 @@ if ("serviceWorker" in navigator) {
   })
     .then(async (registration) => {
       driverServiceWorkerRegistration = registration;
-      offlineShellReady = Boolean(registration.active || registration.waiting);
+      offlineShellReady = Boolean(navigator.serviceWorker.controller || registration.active);
       const observeInstallingWorker = (installingWorker) => {
         if (!installingWorker) return;
         installingWorker.addEventListener("statechange", () => {
-          offlineShellReady = ["installed", "activating", "activated"].includes(installingWorker.state)
-            || Boolean(registration.active || registration.waiting);
+          offlineShellReady = Boolean(
+            navigator.serviceWorker.controller
+            || registration.active
+            || installingWorker.state === "activated"
+          );
           renderOfflineStatus();
+          applyDriverActionProtectionGate();
           if (installingWorker.state === "activated") requestDriverWorkerVersion();
         });
       };
@@ -4620,8 +5619,10 @@ if ("serviceWorker" in navigator) {
         observeInstallingWorker(registration.installing);
       });
       requestDriverWorkerVersion();
+      publishDriverOfflineMode();
       void registration.update().catch(() => {});
       renderOfflineStatus();
+      applyDriverActionProtectionGate();
     })
     .catch((error) => {
       offlineShellReady = false;

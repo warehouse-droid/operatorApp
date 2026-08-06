@@ -9,7 +9,7 @@
   let offlineReviewCountTimer = null;
   let offlineReviewRefreshTimer = null;
   let offlineReviewEventSource = null;
-  if (!path.startsWith("/admin") && !path.startsWith("/control") && !path.startsWith("/dispatch") && !path.startsWith("/scm") && !path.startsWith("/sales")) return;
+  if (!path.startsWith("/admin") && !path.startsWith("/control") && !path.startsWith("/dispatch") && !path.startsWith("/scm") && !path.startsWith("/sales") && !path.startsWith("/mbt")) return;
 
   function t(key, fallback) {
     return window.MBBS_I18N?.t?.(key, fallback) || fallback;
@@ -52,6 +52,7 @@
     { label: "Dispatch", href: "/dispatch", icon: "DP" },
     { label: "SCM", href: "/scm", icon: "SC" },
     { label: "Sales", href: "/sales", icon: "SA" },
+    { label: "MBT", href: "/mbt", icon: "MB" },
     { label: "Operator", href: "/operator", icon: "OP" },
     { label: "Driver", href: "/driver", icon: "DR" }
   ];
@@ -110,11 +111,20 @@
     { label: "Overview", href: "/admin", controlSection: "dashboard", icon: "OV" },
     { label: "Accounts", href: "/admin/accounts", controlSection: "operators", icon: "AC" },
     { label: "Sync", href: "/admin/sync", controlSection: "sync", icon: "SY" },
-    { label: "PO / TO Reconcile", href: "/admin/reconciliation", controlSection: "reconciliation", icon: "RC" },
+    { label: "SO / PO / TO Reconcile", href: "/admin/reconciliation", controlSection: "reconciliation", icon: "RC" },
     { label: "Return Automation", href: "/admin/return-automation", controlSection: "return-automation", icon: "RA" },
     { label: "Yard Printers", href: "/admin/printers", icon: "PR" },
     { label: "Photo Storage", href: "/admin/photo-storage", controlSection: "storage", icon: "PS" },
+    { label: "Feature Gates", href: "/admin/mbt-gates", icon: "FG" },
     { label: "Audit", href: "/admin/audit", controlSection: "audit", icon: "AU" }
+  ];
+
+  const mbtItems = [
+    { label: "Overview", href: "/mbt", icon: "OV", mbtRoles: ["admin", "dispatcher", "mbt_frontdesk", "mbt_billing"] },
+    { label: "Front Desk", href: "/mbt/frontdesk", icon: "FD", mbtRole: "mbt_frontdesk" },
+    { label: "Billing", href: "/mbt/billing", icon: "BL", mbtRole: "mbt_billing" },
+    { label: "Assets", href: "/mbt/assets", icon: "BA", mbtRoles: ["admin", "dispatcher"] },
+    { label: "Configuration", href: "/mbt/config", icon: "CF", mbtRole: "admin" }
   ];
 
   function staffRoleSet() {
@@ -140,12 +150,13 @@
   }
 
   function visibleMainItems() {
+    if (path.startsWith("/mbt")) return visibleMbtItems();
     if (path.startsWith("/sales")) return mainItems.filter((item) => item.href === "/sales");
     const roles = staffRoleSet();
     if (roles.has("admin")) return mainItems.filter((item) => item.href !== "/driver");
     const visiblePaths = new Set();
     if (roles.has("yard_manager")) ["/control", "/operator"].forEach((href) => visiblePaths.add(href));
-    if (roles.has("dispatcher")) ["/dispatch", "/scm"].forEach((href) => visiblePaths.add(href));
+    if (roles.has("dispatcher")) ["/dispatch", "/scm", "/mbt"].forEach((href) => visiblePaths.add(href));
     if (roles.has("scm") || roles.has("scm_staff")) visiblePaths.add("/scm");
     if (roles.has("sales")) visiblePaths.add("/sales");
     if (roles.has("operator")) visiblePaths.add("/operator");
@@ -153,7 +164,18 @@
     return mainItems;
   }
 
+  function visibleMbtItems() {
+    const roles = staffRoleSet();
+    if (roles.has("admin")) return mbtItems;
+    return mbtItems.filter((item) =>
+      (item.mbtRole === "mbt_frontdesk" && roles.has("mbt_frontdesk"))
+      || (item.mbtRole === "mbt_billing" && roles.has("mbt_billing"))
+      || (Array.isArray(item.mbtRoles) && item.mbtRoles.some((role) => roles.has(role)))
+    );
+  }
+
   function currentItems() {
+    if (path.startsWith("/mbt")) return { title: "MBT Bin Operations", items: visibleMbtItems() };
     if (path.startsWith("/admin")) return { title: "Admin", items: adminItems };
     if (path.startsWith("/dispatch")) return { title: "Dispatch", items: dispatchItems };
     if (path.startsWith("/scm")) return {
@@ -558,7 +580,11 @@
 
   function render() {
     const scoped = currentItems();
-    const collapsed = localStorage.getItem(STORAGE_KEY) === "true";
+    const storedCollapsed = localStorage.getItem(STORAGE_KEY);
+    const collapsed = storedCollapsed === "true"
+      || (storedCollapsed === null
+        && path.startsWith("/mbt")
+        && window.matchMedia("(max-width: 760px)").matches);
     document.body.classList.toggle("app-sidebar-collapsed", collapsed);
     document.body.classList.add("has-app-sidebar");
     document.body.style.setProperty("--app-sidebar-width", `${collapsed ? COLLAPSED_WIDTH : WIDTH}px`);
@@ -580,10 +606,12 @@
         <button class="app-sidebar-toggle" data-sidebar-toggle type="button" title="${collapsed ? "Expand" : "Collapse"}">${collapsed ? ">" : "<"}</button>
       </div>
       <div class="app-sidebar-scroll">
-        <nav class="app-sidebar-section" aria-label="Main modules">
-          <div class="app-sidebar-section-title">Modules</div>
-          ${visibleMainItems().map(linkHtml).join("")}
-        </nav>
+        ${path.startsWith("/mbt") ? "" : `
+          <nav class="app-sidebar-section" aria-label="Main modules">
+            <div class="app-sidebar-section-title">Modules</div>
+            ${visibleMainItems().map(linkHtml).join("")}
+          </nav>
+        `}
         <nav class="app-sidebar-section" aria-label="${escapeHtml(scoped.title)} pages">
           <div class="app-sidebar-section-title">${escapeHtml(scoped.title)}</div>
           ${scoped.items.map(linkHtml).join("")}
@@ -620,7 +648,8 @@
     render();
     document.addEventListener("click", (event) => {
       if (event.target.closest?.("[data-sidebar-toggle]")) {
-        const next = !(localStorage.getItem(STORAGE_KEY) === "true");
+        const currentlyCollapsed = document.body.classList.contains("app-sidebar-collapsed");
+        const next = !currentlyCollapsed;
         localStorage.setItem(STORAGE_KEY, next ? "true" : "false");
         render();
         return;

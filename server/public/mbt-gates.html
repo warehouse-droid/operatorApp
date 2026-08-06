@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Feature Gates · Admin</title>
+    <link rel="stylesheet" href="/mbt-shell.css" />
+  </head>
+  <body data-mbt-surface="gates">
+    <main id="mbtApp" class="dispatch-shell mbt-shell" aria-labelledby="mbtTitle">
+      <header class="mbt-app-topbar">
+        <div class="mbt-app-brand">
+          <span class="mbt-app-mark" aria-hidden="true">FG</span>
+          <div>
+            <p>MBBS · Admin safety controls</p>
+            <h1 id="mbtTitle">Feature gates</h1>
+          </div>
+        </div>
+        <span class="mbt-app-mode">Deployment ceiling enforced</span>
+      </header>
+      <p class="mbt-lead">
+        Control Driver offline operation and local MBT testing modules. Deployment
+        ceilings still apply to MBT capabilities; Driver offline mode is directly Admin-controlled.
+      </p>
+
+      <section class="mbt-status" aria-live="polite" aria-busy="true" data-tone="safe">
+        <h2>Loading gate controls</h2>
+        <p>Checking your live Admin authority and the server-owned gate revisions.</p>
+      </section>
+
+      <section class="mbt-gate-controls" aria-labelledby="gateControlsTitle">
+        <div class="mbt-gate-controls-heading">
+          <div>
+            <h2 id="gateControlsTitle">Operational controls</h2>
+            <p>Each change is durable, revision-protected, idempotent, and written to the MBT audit log.</p>
+          </div>
+          <button id="refreshGates" class="mbt-button-secondary" type="button">Refresh</button>
+        </div>
+
+        <label class="mbt-gate-reason" for="gateReason">
+          Audit reason for your next change
+          <textarea
+            id="gateReason"
+            rows="2"
+            maxlength="500"
+            placeholder="Example: Open local master-data imports for the August pilot"
+          ></textarea>
+        </label>
+        <p class="mbt-gate-help">
+          Turning Driver offline mode off requires a live connection for new Driver actions. Previously saved evidence is retained and can still synchronize. Devices already disconnected learn the change when they reconnect. Live customer synchronization and NetSuite posting remain locked.
+        </p>
+
+        <div id="gateList" class="mbt-gate-list" aria-live="polite"></div>
+      </section>
+    </main>
+    <script src="/app-sidebar.js"></script>
+    <script src="/mbt-gates.js" type="module"></script>
+  </body>
+</html>

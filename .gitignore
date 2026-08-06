@@ -6,6 +6,7 @@ server/.env.*
 !server/.env.example
 server/data/env-selection.json
 server/node_modules/
+server/test-artifacts/
 
 env.old.backup
 docker/env/

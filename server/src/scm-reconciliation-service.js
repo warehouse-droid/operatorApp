@@ -2,6 +2,7 @@ import { query, withTransaction } from "./db.js";
 import {
   fetchPoToLinkedTransactionsFromNetSuite,
   fetchPoToReconciliationOrdersFromNetSuite,
+  fetchScmReconciliationOrdersFromNetSuite,
   fetchTransactionProgressFromNetSuite,
   fetchTransactionReferenceByTranidFromNetSuite,
   fetchTransactionStatusFromNetSuite
@@ -16,6 +17,10 @@ import {
   upsertPurchaseOrderLines,
   upsertPurchaseOrders
 } from "./order-sync-repository.js";
+import {
+  filterDbBackedSalesOrderReconciliationCandidates,
+  normalizeSalesOrderReconciliationType
+} from "./sales-order-reconciliation.js";
 import {
   approveInitialScmReconciliationRun,
   assertScmReconciliationRunReadyToApply,
@@ -41,9 +46,10 @@ import {
   storeLinkedScmReconciliationTransactions,
   updateScmReconciliationRunTarget
 } from "./scm-reconciliation-repository.js";
+import { reconcileSalesOrderFromNetSuite } from "./sales-order-reconciliation-repository.js";
 
-const VALID_KINDS = new Set(["PO", "TO"]);
-const VALID_SCOPES = new Set(["all", "PO", "TO", "order_family"]);
+const VALID_KINDS = new Set(["SO", "PO", "TO"]);
+const VALID_SCOPES = new Set(["all", "SO", "PO", "TO", "order_family"]);
 const VALID_TRIGGERS = new Set(["nightly", "manual", "webhook", "backfill", "resume"]);
 const TORONTO_TIME_ZONE = "America/Toronto";
 const RUN_FINAL_STATUSES = new Set([
@@ -232,6 +238,7 @@ function normalizeKind(value) {
 function normalizeScope(value) {
   const raw = text(value);
   if (!raw) return "all";
+  if (/^so$/i.test(raw)) return "SO";
   if (/^po$/i.test(raw)) return "PO";
   if (/^to$/i.test(raw)) return "TO";
   if (/^order[_ -]?family$/i.test(raw)) return "order_family";
@@ -241,6 +248,38 @@ function normalizeScope(value) {
 function normalizeTrigger(value) {
   const trigger = text(value).toLowerCase();
   return VALID_TRIGGERS.has(trigger) ? trigger : "manual";
+}
+
+function reconciliationApprovalPresent(settings = {}, {
+  scope = "all",
+  targetOrderKind = "",
+  soOrderType = "all"
+} = {}) {
+  const normalizedScope = normalizeScope(scope);
+  const kind = normalizeKind(targetOrderKind);
+  const normalizedSoOrderType = normalizeSalesOrderReconciliationType(soOrderType, "all") || "all";
+  if (normalizedScope === "order_family" && kind === "SO") {
+    return Boolean(settings.soInitialDryRunApprovedAt);
+  }
+  if (["all", "SO"].includes(normalizedScope) && normalizedSoOrderType === "pickup") {
+    return false;
+  }
+  if (normalizedScope === "SO") return Boolean(settings.soInitialDryRunApprovedAt);
+  if (normalizedScope === "all") {
+    return Boolean(settings.initialDryRunApprovedAt && settings.soInitialDryRunApprovedAt);
+  }
+  return Boolean(settings.initialDryRunApprovedAt);
+}
+
+function broadInitialApprovalRequired(settings = {}, run = {}) {
+  const scope = normalizeScope(run.scope);
+  const soOrderType = normalizeSalesOrderReconciliationType(run.soOrderType, "all") || "all";
+  if (["all", "SO"].includes(scope) && soOrderType === "pickup") return false;
+  if (scope === "SO") return !settings.soInitialDryRunApprovedAt;
+  if (scope === "all") {
+    return !settings.initialDryRunApprovedAt || !settings.soInitialDryRunApprovedAt;
+  }
+  return false;
 }
 
 export function normalizeScmReconciliationTargetRefs(...values) {
@@ -317,6 +356,10 @@ function mapRunRow(row = {}) {
     runKey: row.run_key || row.runKey || "",
     triggerSource: row.trigger_source || row.triggerSource || "manual",
     scope: row.scope_kind || row.scope || "all",
+    soOrderType: normalizeSalesOrderReconciliationType(
+      row.so_order_type_filter ?? row.soOrderType,
+      "all"
+    ) || "all",
     targetOrderKind: row.target_order_kind || row.targetOrderKind || "",
     targetOrderId: row.target_order_netsuite_id || row.targetOrderId || null,
     targetOrderRef: row.target_order_ref || row.targetOrderRef || "",
@@ -355,7 +398,7 @@ async function loadRun(runOrId) {
     [id]
   );
   if (!result.rows[0]) {
-    throw Object.assign(new Error("The PO/TO reconciliation run was not found."), { status: 404 });
+    throw Object.assign(new Error("The SO/PO/TO reconciliation run was not found."), { status: 404 });
   }
   return mapRunRow(result.rows[0]);
 }
@@ -481,6 +524,8 @@ function normalizeFetchedOrder(order = {}) {
       identityIssue: text(line.identityIssue),
       stage: kind === "PO"
         ? "receiving"
+        : kind === "SO"
+          ? "outbound"
         : text(line.stage).toLowerCase() === "receiving"
           ? "receiving"
           : "outbound"
@@ -496,7 +541,7 @@ function legacyProgressOrder(progress, kind) {
   return normalizeFetchedOrder({
     id,
     kind: cleanKind,
-    recordType: cleanKind === "PO" ? "PurchOrd" : "TrnfrOrd",
+    recordType: cleanKind === "SO" ? "SalesOrd" : cleanKind === "PO" ? "PurchOrd" : "TrnfrOrd",
     tranid: progress.tranid || "",
     trandate: progress.trandate || null,
     status: progress.status || "",
@@ -511,6 +556,8 @@ function legacyProgressOrder(progress, kind) {
       orderLine: line.order_line ?? line.line_id,
       stage: cleanKind === "PO"
         ? "receiving"
+        : cleanKind === "SO"
+          ? "outbound"
         : Number(line.quantity) < 0
           ? "outbound"
           : "receiving",
@@ -540,7 +587,10 @@ function legacyProgressOrder(progress, kind) {
 
 async function syncFetchedSourceOrder(order) {
   const normalized = normalizeFetchedOrder(order);
-  if (!normalized) throw new Error("NetSuite returned an invalid PO/TO source order.");
+  if (!normalized) throw new Error("NetSuite returned an invalid SO/PO/TO source order.");
+  if (normalized.kind === "SO") {
+    throw new Error("Sales Orders must use the dedicated SO reconciliation path.");
+  }
   const header = mappedOrderHeader(normalized);
   if (normalized.kind === "PO") {
     const lines = normalized.lines.map(mappedOrderLine);
@@ -584,6 +634,14 @@ async function resolveSingleOrderFamilySource({
     orderRef
   });
   if (local) return { source: local, apiRequests: 0 };
+  if (normalizeKind(kind) === "SO") {
+    const identifier = text(orderRef).toUpperCase()
+      || (positiveId(orderId) ? `internal ID ${positiveId(orderId)}` : "the requested Sales Order");
+    throw Object.assign(
+      new Error(`${identifier} is not available in the local Sales Order database.`),
+      { code: "SO_RECONCILIATION_LOCAL_SOURCE_MISSING", status: 404 }
+    );
+  }
   const directId = positiveId(orderId);
   if (directId) {
     return {
@@ -593,11 +651,11 @@ async function resolveSingleOrderFamilySource({
   }
   const cleanOrderRef = text(orderRef).toUpperCase();
   if (!cleanOrderRef) {
-    throw Object.assign(new Error("Enter a PO/TO number or internal ID."), { status: 400 });
+    throw Object.assign(new Error("Enter an SO, PO, or TO number or internal ID."), { status: 400 });
   }
   const reference = await fetchTransactionReferenceByTranidFromNetSuite(
     cleanOrderRef,
-    kind === "PO" ? "PurchOrd" : "TrnfrOrd"
+    kind === "SO" ? "SalesOrd" : kind === "PO" ? "PurchOrd" : "TrnfrOrd"
   );
   if (!reference?.id) {
     throw Object.assign(new Error(`${cleanOrderRef} was not found in NetSuite.`), { status: 404 });
@@ -615,7 +673,7 @@ async function resolveSingleOrderFamilySource({
 async function resolveOrderFamilySources(run, workerLeaseToken) {
   const kind = normalizeKind(run.targetOrderKind);
   if (!kind) {
-    throw Object.assign(new Error("Select PO or TO for this reconciliation."), { status: 400 });
+    throw Object.assign(new Error("Select SO, PO, or TO for this reconciliation."), { status: 400 });
   }
   const directId = positiveId(run.targetOrderId);
   const refs = normalizeScmReconciliationTargetRefs(run.targetOrderRef);
@@ -627,7 +685,7 @@ async function resolveOrderFamilySources(run, workerLeaseToken) {
   }
   if (!directId && !refs.length) {
     throw Object.assign(
-      new Error("Enter one or more PO/TO numbers or one internal ID."),
+      new Error("Enter one or more SO/PO/TO numbers or one internal ID."),
       { status: 400 }
     );
   }
@@ -683,14 +741,15 @@ async function resolveRunSources(run, workerLeaseToken) {
     resolutionErrors = resolved.resolutionErrors || [];
   } else {
     sources = await listLocalScmReconciliationSources({
-      kind: scope === "PO" || scope === "TO" ? scope : "",
-      includeTerminalOrders: run.includeTerminalOrders
+      kind: ["SO", "PO", "TO"].includes(scope) ? scope : "",
+      includeTerminalOrders: run.includeTerminalOrders,
+      soOrderType: run.soOrderType
     });
   }
   const excludedSources = run.includeTerminalOrders
     ? []
     : await listScmReconciliationBroadExcludedSources({
-      kind: scope === "PO" || scope === "TO"
+      kind: ["SO", "PO", "TO"].includes(scope)
         ? scope
         : scope === "order_family"
           ? normalizeKind(run.targetOrderKind)
@@ -710,7 +769,7 @@ async function resolveRunSources(run, workerLeaseToken) {
 }
 
 async function directFetchSource(source) {
-  const orders = await fetchPoToReconciliationOrdersFromNetSuite({
+  const orders = await fetchScmReconciliationOrdersFromNetSuite({
     orderIds: [source.id],
     kind: source.kind,
     modifiedSince: "1900-01-01",
@@ -727,7 +786,7 @@ async function directFetchSource(source) {
   // fallback distinguishes that case from a genuinely deleted/missing record.
   const progress = await fetchTransactionProgressFromNetSuite(
     source.id,
-    source.kind === "PO" ? "PurchOrd" : "TrnfrOrd"
+    source.kind === "SO" ? "SalesOrd" : source.kind === "PO" ? "PurchOrd" : "TrnfrOrd"
   );
   return {
     order: legacyProgressOrder(progress, source.kind),
@@ -1039,7 +1098,7 @@ function startRunHeartbeat(runId, workerLeaseToken) {
       })
       .catch((error) => {
         console.error(
-          `PO/TO reconciliation heartbeat failed for run ${runId}:`,
+          `SO/PO/TO reconciliation heartbeat failed for run ${runId}:`,
           error
         );
       });
@@ -1192,7 +1251,7 @@ async function executeRunCore(runOrId, {
   // automation.
   const durableLiveApplyIntent = run.dryRun === false
     && Boolean(run.resumeOfRunId);
-  const forcedInitialDryRun = !settings.initialDryRunApprovedAt
+  const forcedInitialDryRun = !reconciliationApprovalPresent(settings, run)
     && allowInitialApply !== true
     && !durableLiveApplyIntent;
   const effectiveDryRun = forcedInitialDryRun || run.dryRun === true;
@@ -1401,17 +1460,22 @@ async function executeRunCore(runOrId, {
         broadExcludedKeys.size
       )
       : broadExcludedKeys.size;
-    const localSources = uniqueSources(resolved.sources);
+    const resolvedSources = uniqueSources(resolved.sources);
     const localPresenceSources = resumeUsesFrozenTargets
       ? await listLocalScmReconciliationSources({
-        kind: scope === "PO" || scope === "TO"
+        kind: ["SO", "PO", "TO"].includes(scope)
           ? scope
           : scope === "order_family"
             ? normalizeKind(run.targetOrderKind)
             : "",
-        includeTerminalOrders: true
+        includeTerminalOrders: true,
+        soOrderType: run.soOrderType
       })
-      : localSources;
+      : resolvedSources;
+    const localSources = filterDbBackedSalesOrderReconciliationCandidates(
+      resolvedSources,
+      localPresenceSources
+    );
     const localKeys = new Set(localPresenceSources.map(sourceKey));
     checkpoint.phase = "fetch_sources";
     checkpoint.total = reusableTargets.length || localSources.length;
@@ -1429,8 +1493,9 @@ async function executeRunCore(runOrId, {
     }
 
     const targetOnly = scope === "order_family"
+      || scope === "SO"
       || resumeUsesFrozenTargets;
-    const fetchKind = scope === "PO" || scope === "TO"
+    const fetchKind = ["SO", "PO", "TO"].includes(scope)
       ? scope
       : targetOnly
         ? normalizeKind(run.targetOrderKind)
@@ -1443,7 +1508,7 @@ async function executeRunCore(runOrId, {
         error.code = "SCM_RECONCILIATION_YIELD";
         throw error;
       }
-      const rows = await fetchPoToReconciliationOrdersFromNetSuite(options);
+      const rows = await fetchScmReconciliationOrdersFromNetSuite(options);
       apiRequestCount += 1;
       await assertScmReconciliationRunActive(run.id, workerLeaseToken);
       fetched.push(...(rows || []));
@@ -1456,7 +1521,8 @@ async function executeRunCore(runOrId, {
         kind: fetchKind,
         modifiedSince: settings.initialBackfillModifiedSince || "2026-01-01",
         includeOpen: !targetOnly,
-        targetOnly
+        targetOnly,
+        soOrderType: targetOnly ? "all" : run.soOrderType
       });
     } else {
       // Discover all open/recent orders once, then fetch older tracked sources
@@ -1467,7 +1533,8 @@ async function executeRunCore(runOrId, {
         kind: fetchKind,
         modifiedSince: settings.initialBackfillModifiedSince || "2026-01-01",
         includeOpen: true,
-        targetOnly: false
+        targetOnly: false,
+        soOrderType: run.soOrderType
       });
       for (let offset = 0; offset < trackedIds.length; offset += 200) {
         await fetchSourceBatch({
@@ -1475,15 +1542,20 @@ async function executeRunCore(runOrId, {
           kind: fetchKind,
           modifiedSince: settings.initialBackfillModifiedSince || "2026-01-01",
           includeOpen: false,
-          targetOnly: true
+          targetOnly: true,
+          soOrderType: "all"
         });
       }
     }
     await assertScmReconciliationRunActive(run.id, workerLeaseToken);
     const ordersByKey = new Map();
-    for (const fetchedOrder of fetched || []) {
-      const order = normalizeFetchedOrder(fetchedOrder);
-      if (!order) continue;
+    const normalizedFetchedOrders = (fetched || [])
+      .map(normalizeFetchedOrder)
+      .filter(Boolean);
+    for (const order of filterDbBackedSalesOrderReconciliationCandidates(
+      normalizedFetchedOrders,
+      localPresenceSources
+    )) {
       if (broadExcludedKeys.has(sourceKey(order))) continue;
       ordersByKey.set(sourceKey(order), order);
     }
@@ -1577,6 +1649,26 @@ async function executeRunCore(runOrId, {
         summary.decisionKeptReviewOrders += 1;
       }
       await updateOwnedRunTarget(source, { status: "running" });
+      if (source.kind === "SO") {
+        const reason = "The Sales Order was not returned by the authoritative NetSuite header/line lookup; local SO data was not changed.";
+        await updateOwnedRunTarget(source, {
+          status: "review",
+          proposedChange: {
+            orderKind: "SO",
+            sourceOrderId: source.id,
+            sourceOrderRef: source.tranid,
+            reconciliationStatus: "review",
+            reason
+          },
+          result: { dryRun: effectiveDryRun, reason, missingLookupCount: 1 }
+        });
+        summary.reviewOrders += 1;
+        summary.missingFirstLookup += 1;
+        missingProcessed += 1;
+        checkpoint.processed = missingProcessed;
+        await updateRunCheckpoint(run.id, checkpoint, apiRequestCount, summary);
+        continue;
+      }
       try {
         const sourceName = reconciliationSourceName(run.triggerSource);
         const missing = await withTransaction(async () => {
@@ -1648,13 +1740,23 @@ async function executeRunCore(runOrId, {
     const fetchedOrders = [...ordersByKey.values()].sort((left, right) =>
       left.kind.localeCompare(right.kind) || left.id - right.id
     );
-    const fetchedIds = fetchedOrders.map((order) => order.id);
+    const salesOrders = fetchedOrders.filter((order) => order.kind === "SO");
+    const linkedSourceOrders = fetchedOrders.filter((order) => order.kind !== "SO");
+    const fetchedIds = linkedSourceOrders.map((order) => order.id);
     const fetchedOrdersById = new Map(
-      fetchedOrders.map((order) => [order.id, order])
+      linkedSourceOrders.map((order) => [order.id, order])
     );
     const authoritativeLinkedSnapshot = run.triggerSource !== "webhook";
     let processed = completedTargets.length + failedTargets.length + missingSources.length;
     let linkedProcessed = 0;
+    if (salesOrders.length) {
+      checkpoint.phase = "reconcile";
+      await updateRunCheckpoint(run.id, checkpoint, apiRequestCount);
+      const noLinkedTransactions = new Map();
+      for (const order of salesOrders) {
+        await reconcileFetchedOrder(order, noLinkedTransactions, null);
+      }
+    }
     if (fetchedIds.length && authoritativeLinkedSnapshot) {
       checkpoint.phase = "fetch_linked_transactions";
       checkpoint.processedSourceOrders = 0;
@@ -1738,11 +1840,11 @@ async function executeRunCore(runOrId, {
           await updateRunCheckpoint(run.id, checkpoint, apiRequestCount);
         }
       });
-    } else if (fetchedOrders.length) {
+    } else if (linkedSourceOrders.length) {
       checkpoint.phase = "reconcile";
       await updateRunCheckpoint(run.id, checkpoint, apiRequestCount);
       const linkedBySource = new Map();
-      for (const order of fetchedOrders) {
+      for (const order of linkedSourceOrders) {
         await reconcileFetchedOrder(order, linkedBySource, null);
       }
     }
@@ -1802,6 +1904,27 @@ async function executeRunCore(runOrId, {
       await updateOwnedRunTarget(source, { status: "running" });
       try {
         const recovered = !localKeys.has(sourceKey(source));
+        if (order.kind === "SO") {
+          const result = await reconcileSalesOrderFromNetSuite({
+            order,
+            runId: run.id,
+            source: reconciliationSourceName(run.triggerSource),
+            dryRun: effectiveDryRun
+          });
+          await updateOwnedRunTarget(source, {
+            status: result.reconciliationStatus === "review" ? "review" : "succeeded",
+            proposedChange: effectiveDryRun ? result : {},
+            result,
+            checkpoint: { reconciledAt: new Date().toISOString() }
+          });
+          summary.reconciledOrders += 1;
+          if (recovered) summary.recoveredOrders += 1;
+          if (result.reconciliationStatus === "review") summary.reviewOrders += 1;
+          processed += 1;
+          checkpoint.processed = processed;
+          await updateRunCheckpoint(run.id, checkpoint, apiRequestCount, summary);
+          return;
+        }
         for (const line of order.lines || []) exactLineKey(line);
         const sourceName = reconciliationSourceName(run.triggerSource);
         const applied = await withTransaction(async () => {
@@ -2028,8 +2151,7 @@ async function executeRunCore(runOrId, {
     const failed = summary.failedOrders > 0;
     const awaitingInitialApproval = !failed
       && effectiveDryRun
-      && !settings.initialDryRunApprovedAt
-      && normalizeScope(run.scope) === "all";
+      && broadInitialApprovalRequired(settings, run);
     return finishOwnedRun({
       status: failed
         ? "failed"
@@ -2039,7 +2161,7 @@ async function executeRunCore(runOrId, {
       summary,
       checkpoint,
       error: failed
-        ? `${summary.failedOrders} PO/TO order(s) could not be reconciled.`
+        ? `${summary.failedOrders} SO/PO/TO order(s) could not be reconciled.`
         : "",
       apiRequestCount
     });
@@ -2139,16 +2261,31 @@ export function executeScmReconciliationRun(runOrId, options = {}) {
 export async function startScmReconciliationRun(input = {}, options = {}) {
   const scope = normalizeScope(input.scope);
   const settings = await getScmReconciliationSettings();
-  const initialAllDryRun = !settings.initialDryRunApprovedAt && scope === "all";
-  const requestedDryRun = input.dryRun ?? input.dry_run;
-  const dryRun = initialAllDryRun
-    ? true
-    : requestedDryRun === undefined
-      ? !settings.initialDryRunApprovedAt
-      : booleanValue(requestedDryRun);
   const targetOrderKind = normalizeKind(
     input.targetOrderKind ?? input.orderKind ?? input.target_order_kind
   );
+  const rawSoOrderType = input.soOrderType ?? input.so_order_type;
+  const soOrderType = ["all", "SO"].includes(scope)
+    ? normalizeSalesOrderReconciliationType(rawSoOrderType, "delivery")
+    : "all";
+  if (["all", "SO"].includes(scope) && !["delivery", "pickup"].includes(soOrderType)) {
+    throw Object.assign(
+      new Error("Select Delivery or Pick-Up for Sales Order reconciliation."),
+      { status: 400 }
+    );
+  }
+  const approvalPresent = reconciliationApprovalPresent(settings, {
+    scope,
+    targetOrderKind,
+    soOrderType
+  });
+  const initialBroadDryRun = (scope === "all" || scope === "SO") && !approvalPresent;
+  const requestedDryRun = input.dryRun ?? input.dry_run;
+  const dryRun = initialBroadDryRun
+    ? true
+    : requestedDryRun === undefined
+      ? !approvalPresent
+      : booleanValue(requestedDryRun);
   const targetOrderId = positiveId(input.targetOrderId ?? input.orderId ?? input.target_order_id);
   const targetOrderRefs = scope === "order_family"
     ? normalizeScmReconciliationTargetRefs(
@@ -2163,7 +2300,7 @@ export async function startScmReconciliationRun(input = {}, options = {}) {
   );
   if (scope === "order_family" && (!targetOrderKind || (!targetOrderId && !targetOrderRef))) {
     throw Object.assign(
-      new Error("Select a PO/TO order family by transaction number or internal ID."),
+      new Error("Select an SO/PO/TO order family by transaction number or internal ID."),
       { status: 400 }
     );
   }
@@ -2176,19 +2313,20 @@ export async function startScmReconciliationRun(input = {}, options = {}) {
   const run = await createScmReconciliationRun({
     triggerSource: normalizeTrigger(input.triggerSource ?? input.trigger_source),
     scope,
+    soOrderType,
     targetOrderKind: targetOrderKind || null,
     targetOrderId,
     targetOrderRef,
     includeTerminalOrders,
     dryRun,
-    applyUnambiguous: !dryRun && settings.initialDryRunApprovedAt
+    applyUnambiguous: !dryRun && approvalPresent
       ? booleanValue(input.applyUnambiguous, true)
       : false,
     requestedBy: text(input.requestedBy ?? input.actor ?? input.requested_by)
   });
   if (options.background === true) {
     void executeScmReconciliationRun(run, options).catch((error) => {
-      console.error(`Background PO/TO reconciliation run ${run.id} failed:`, error);
+      console.error(`Background SO/PO/TO reconciliation run ${run.id} failed:`, error);
     });
     return run;
   }
@@ -2223,7 +2361,7 @@ export async function resumeScmReconciliationRun(
       const proposalRun = await loadRun(run.resumeOfRunId);
       if (
         proposalRun.status === "awaiting_approval"
-        && normalizeScope(proposalRun.scope) === "all"
+        && ["all", "SO"].includes(normalizeScope(proposalRun.scope))
       ) {
         await approveInitialScmReconciliationRun(proposalRun.id, actor);
       }
@@ -2233,7 +2371,7 @@ export async function resumeScmReconciliationRun(
   if (options.background === true) {
     if (run.status === "queued") {
       void executeResume().catch((error) => {
-        console.error(`Background PO/TO reconciliation resume ${run.id} failed:`, error);
+        console.error(`Background SO/PO/TO reconciliation resume ${run.id} failed:`, error);
       });
     }
     return run;
@@ -2256,7 +2394,7 @@ export async function applyScmReconciliationRun(
 ) {
   const proposalRun = await loadRun(runId);
   const scope = normalizeScope(proposalRun.scope);
-  const initialCompanyWideApply = scope === "all"
+  const initialCompanyWideApply = ["all", "SO"].includes(scope)
     && proposalRun.status === "awaiting_approval";
   const eligibleStatus = proposalRun.status === "succeeded"
     || initialCompanyWideApply;
@@ -2277,7 +2415,7 @@ export async function applyScmReconciliationRun(
     const lockedProposal = lockedProposalResult.rows[0]
       ? mapRunRow(lockedProposalResult.rows[0])
       : null;
-    const lockedInitialCompanyWideApply = normalizeScope(lockedProposal?.scope) === "all"
+    const lockedInitialCompanyWideApply = ["all", "SO"].includes(normalizeScope(lockedProposal?.scope))
       && lockedProposal?.status === "awaiting_approval";
     if (
       lockedProposal?.dryRun !== true
@@ -2310,6 +2448,7 @@ export async function applyScmReconciliationRun(
     const createdApply = await createScmReconciliationRun({
       triggerSource: "manual",
       scope,
+      soOrderType: proposalRun.soOrderType,
       targetOrderKind: proposalRun.targetOrderKind || null,
       targetOrderId: proposalRun.targetOrderId,
       targetOrderRef: proposalRun.targetOrderRef,
@@ -2349,7 +2488,7 @@ export async function applyScmReconciliationRun(
           await approveInitialScmReconciliationRun(runId, actor);
         }
       })().catch((error) => {
-        console.error(`Background PO/TO reconciliation apply ${appliedRun.id} failed:`, error);
+        console.error(`Background SO/PO/TO reconciliation apply ${appliedRun.id} failed:`, error);
       });
       return {
         applied: false,
@@ -2416,7 +2555,7 @@ export async function retryScmReconciliationOrder(
 ) {
   const orderKind = normalizeKind(kind);
   if (!orderKind) {
-    throw Object.assign(new Error("Select PO or TO to retry reconciliation."), { status: 400 });
+    throw Object.assign(new Error("Select SO, PO, or TO to retry reconciliation."), { status: 400 });
   }
   const source = await findScmReconciliationSource({
     kind: orderKind,
@@ -2435,7 +2574,7 @@ export async function retryScmReconciliationOrder(
       throw Object.assign(
         new Error(
           `${exclusionCandidate.tranid || orderRef || orderId} is locally terminal or skipped. `
-          + "An Admin can run it explicitly from PO / TO Schedule Reconciliation."
+          + "An Admin can run it explicitly from SO / PO / TO Reconciliation."
         ),
         {
           status: 409,
@@ -2575,8 +2714,8 @@ export async function scmReconciliationNightlyTick({
   try {
     const settings = await getScmReconciliationSettings();
     if (!settings.nightlyEnabled) return { started: false, reason: "disabled" };
-    if (!settings.initialDryRunApprovedAt) {
-      return { started: false, reason: "initial_dry_run_not_approved" };
+    if (!settings.initialDryRunApprovedAt || !settings.soInitialDryRunApprovedAt) {
+      return { started: false, reason: "initial_dry_runs_not_approved" };
     }
     const clock = scmReconciliationTorontoClock(now, settings.timeZone || TORONTO_TIME_ZONE);
     if (clock.localTime < settings.nightlyTime) {

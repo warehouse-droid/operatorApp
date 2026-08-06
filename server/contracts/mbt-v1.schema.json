@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mbbs.example/contracts/mbt-v1.schema.json",
+  "title": "MBT Phase 1 public contracts",
+  "oneOf": [
+    { "$ref": "#/$defs/dispatchOrder" },
+    { "$ref": "#/$defs/errorEnvelope" }
+  ],
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    },
+    "errorEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["error", "code", "details", "correlationId"],
+      "properties": {
+        "error": { "type": "string", "minLength": 1 },
+        "code": { "type": "string", "minLength": 1, "pattern": "^MBT_[A-Z0-9_]+$" },
+        "details": { "type": "object" },
+        "correlationId": { "type": "string", "minLength": 1 }
+      }
+    },
+    "expectedAsset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reservationSlot", "assetId", "assetCode", "binTypeId"],
+      "properties": {
+        "reservationSlot": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "assetId": { "$ref": "#/$defs/uuid" },
+        "assetCode": { "type": "string", "minLength": 1 },
+        "binTypeId": { "$ref": "#/$defs/uuid" }
+      }
+    },
+    "evidenceRequirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "kind", "minimumCount"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["photo", "structured", "scan", "signature"]
+        },
+        "minimumCount": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "reservationSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revision", "capturedAt"],
+      "properties": {
+        "revision": { "type": "integer", "minimum": 1 },
+        "capturedAt": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{3})?Z$"
+        }
+      }
+    },
+    "mbtStopSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["visitId", "visitRevision", "stepId", "evidenceRequirements"],
+      "properties": {
+        "visitId": { "$ref": "#/$defs/uuid" },
+        "visitRevision": { "type": "integer", "minimum": 1 },
+        "stepId": { "$ref": "#/$defs/uuid" },
+        "evidenceRequirements": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/evidenceRequirement" }
+        }
+      }
+    },
+    "dispatchStop": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "serviceAction", "mbt"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "serviceAction": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "mbt": { "$ref": "#/$defs/mbtStopSnapshot" }
+      }
+    },
+    "mbtDispatchSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contractId",
+        "visitId",
+        "visitRevision",
+        "templateVersionId",
+        "stepId",
+        "reservationSnapshot",
+        "expectedAssets",
+        "materialCode",
+        "dumpSiteId",
+        "evidenceRequirements"
+      ],
+      "properties": {
+        "contractId": { "$ref": "#/$defs/uuid" },
+        "visitId": { "$ref": "#/$defs/uuid" },
+        "visitRevision": { "type": "integer", "minimum": 1 },
+        "templateVersionId": { "$ref": "#/$defs/uuid" },
+        "stepId": { "$ref": "#/$defs/uuid" },
+        "reservationSnapshot": { "$ref": "#/$defs/reservationSnapshot" },
+        "expectedAssets": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/expectedAsset" }
+        },
+        "materialCode": { "type": "string", "minLength": 1 },
+        "dumpSiteId": {
+          "oneOf": [
+            { "$ref": "#/$defs/uuid" },
+            { "type": "null" }
+          ]
+        },
+        "evidenceRequirements": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/evidenceRequirement" }
+        }
+      }
+    },
+    "dispatchOrder": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "serviceAction", "stops", "mbt"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^BIN-[A-Za-z0-9_-]+-V[A-Za-z0-9_-]+$"
+        },
+        "type": { "const": "BIN" },
+        "serviceAction": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "stops": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/dispatchStop" }
+        },
+        "mbt": { "$ref": "#/$defs/mbtDispatchSnapshot" }
+      }
+    }
+  }
+}

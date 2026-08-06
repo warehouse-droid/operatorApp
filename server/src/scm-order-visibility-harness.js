@@ -5,6 +5,7 @@ import {
   filterRestrictedScmOrders,
   isRestrictedScmOrder
 } from "./scm-order-visibility.js";
+import { changedPlacedDispatchScmAssignmentRefs } from "./dispatch-scm-placement.js";
 
 const serverSource = await readFile(new URL("./server.js", import.meta.url), "utf8");
 
@@ -141,6 +142,90 @@ assert.deepEqual(
 assert.equal(mixedRows.length, normalRows.length + restrictedRows.length,
   "Filtering must not mutate the source row collection.");
 
+const historicPlan = {
+  orders: [
+    { id: "SOB114411", type: "SO" },
+    { id: "TOB00603", type: "TO", weight: 28 },
+    { id: "POB03530", type: "PO", weight: 2804.34 }
+  ],
+  trucks: [
+    {
+      id: "T2",
+      loads: [{
+        id: "T2-LOAD",
+        stops: [
+          { id: "so-pick", orderId: "SOB114411", type: "pick", location: "3445" },
+          { id: "so-drop", orderId: "SOB114411", type: "drop", location: "Customer" }
+        ]
+      }]
+    },
+    {
+      id: "T5",
+      loads: [{
+        id: "T5-LOAD",
+        stops: [
+          { id: "po-pick-old", orderId: "POB03530", type: "pick", location: "Vendor" },
+          { id: "to-pick-redundant", orderId: "TOB00603", type: "pick", location: "Vendor" },
+          { id: "to-drop", orderId: "TOB00603", type: "drop", location: "12441" },
+          { id: "po-drop", orderId: "POB03530", type: "drop", location: "12441" }
+        ]
+      }]
+    }
+  ]
+};
+const unrelatedSalesRemoval = structuredClone(historicPlan);
+unrelatedSalesRemoval.orders = unrelatedSalesRemoval.orders
+  .filter((order) => order.id !== "SOB114411")
+  .map((order) => ({ ...order, weight: Number(order.weight || 0), localDispatchStatus: "planned" }));
+unrelatedSalesRemoval.trucks[0].loads[0].stops = [];
+unrelatedSalesRemoval.trucks[1].loads[0].stops = unrelatedSalesRemoval.trucks[1].loads[0].stops
+  .filter((stop) => stop.id !== "to-pick-redundant")
+  .map((stop) => stop.id === "po-pick-old" ? { ...stop, id: "po-pick-regenerated" } : stop);
+assert.deepEqual(
+  changedPlacedDispatchScmAssignmentRefs(historicPlan, unrelatedSalesRemoval),
+  [],
+  "Removing an unrelated SO must not revalidate unchanged completed PO/TO load assignments."
+);
+
+const movedRestrictedOrder = structuredClone(historicPlan);
+movedRestrictedOrder.trucks[1].loads.push({
+  id: "T5-LOAD-2",
+  stops: [movedRestrictedOrder.trucks[1].loads[0].stops.shift()]
+});
+const movedToDrop = movedRestrictedOrder.trucks[1].loads[0].stops
+  .find((stop) => stop.orderId === "TOB00603" && stop.type === "drop");
+movedRestrictedOrder.trucks[1].loads[0].stops = movedRestrictedOrder.trucks[1].loads[0].stops
+  .filter((stop) => stop !== movedToDrop);
+movedRestrictedOrder.trucks[1].loads[1].stops.push(movedToDrop);
+assert.deepEqual(
+  changedPlacedDispatchScmAssignmentRefs(historicPlan, movedRestrictedOrder),
+  ["TOB00603"],
+  "Moving a restricted PO/TO to another load must still be rejected."
+);
+
+const newlyPlacedOrder = structuredClone(historicPlan);
+newlyPlacedOrder.orders.push({ id: "TOB00999", type: "TO" });
+newlyPlacedOrder.trucks[1].loads[0].stops.push({
+  id: "new-to-drop",
+  orderId: "TOB00999",
+  type: "drop",
+  location: "12441"
+});
+assert.deepEqual(
+  changedPlacedDispatchScmAssignmentRefs(historicPlan, newlyPlacedOrder),
+  ["TOB00999"],
+  "Newly placed restricted PO/TO orders must remain subject to the guard."
+);
+
+const removedRestrictedOrder = structuredClone(historicPlan);
+removedRestrictedOrder.trucks[1].loads[0].stops = removedRestrictedOrder.trucks[1].loads[0].stops
+  .filter((stop) => stop.orderId !== "TOB00603");
+assert.deepEqual(
+  changedPlacedDispatchScmAssignmentRefs(historicPlan, removedRestrictedOrder),
+  [],
+  "Removing a restricted PO/TO from Dispatch must remain allowed."
+);
+
 const dispatchResponse = sourceSection(
   serverSource,
   "async function listDispatchOrdersForResponse",
@@ -150,6 +235,17 @@ const dispatchResponse = sourceSection(
 assertLateVisibilityGate(dispatchResponse, "Dispatch order response", {
   requiresUnprivilegedGate: true
 });
+
+const purchaseOrderResponse = sourceSection(
+  serverSource,
+  "async function listScmPurchaseOrdersForResponse",
+  "function sendDispatchDependencyConflictResponse",
+  "Purchase order split response"
+);
+assert.match(purchaseOrderResponse, /scheduleId:\s*order\.scm\?\.scheduleId/,
+  "PO split reconciliation must receive the persisted schedule ID.");
+assert.match(purchaseOrderResponse, /updatedAt:\s*order\.scm\?\.updatedAt/,
+  "PO split reconciliation must receive the persisted schedule update time.");
 
 const salesScheduleResponse = sourceSection(
   serverSource,
@@ -183,13 +279,17 @@ assert(
 
 assert(
   serverSource.includes("async function assertNoRestrictedScmDispatchOrders")
-    && serverSource.includes("function changedPlacedDispatchScmRefs")
+    && serverSource.includes("changedPlacedDispatchScmAssignmentRefs")
     && serverSource.includes('"DISPATCH_RESTRICTED_SCM_ORDER"'),
   "Dispatch must reject stale attempts to save restricted PO/TO orders."
 );
 assert(
   (serverSource.match(/assertNoRestrictedScmDispatchOrders\(/g) || []).length >= 6,
   "Dispatch save, confirm, restore, and legacy save paths must enforce the restricted-order guard."
+);
+assert(
+  (serverSource.match(/changedPlacedDispatchScmAssignmentRefs/g) || []).length >= 5,
+  "Dispatch save, submitted-confirm, restore, and legacy save paths must scope the guard to real PO/TO assignment changes."
 );
 const restrictedRefSource = sourceSection(
   serverSource,

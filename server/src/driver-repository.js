@@ -1,8 +1,19 @@
 import crypto from "node:crypto";
 import { query, withTransaction } from "./db.js";
+import { assertNoDriverBinMaterialization } from "./mbt/dispatch-bin-safety.js";
 import { config } from "./config.js";
+import {
+  DRIVER_PWA_CURRENT_VERSION,
+  DRIVER_PWA_MINIMUM_VERSION
+} from "./driver-client-version.js";
 import { createSamsaraDriverVehicleAssignment, createSamsaraMechanicDvir, findSamsaraDvirForVehicle, setSamsaraDriverDutyStatus } from "./samsara.js";
 import { dispatchLoadAssignment, dispatchOwnYardCodes, flattenDispatchPlanLoads, normalizeDispatchPlanLoadAssignments } from "./dispatch-load-assignment.js";
+import {
+  dispatchLocationKey,
+  dispatchLocationRoot,
+  dispatchLocationsShareYard,
+  uniqueDispatchLocations
+} from "./dispatch-location.js";
 
 const YARD_ADDRESSES = {
   "3445": "3445 Kennedy Road, Toronto, ON",
@@ -12,7 +23,7 @@ const YARD_ADDRESSES = {
 };
 const SAMSARA_ACCOUNT_LIMIT_MS = 8 * 60 * 60 * 1000;
 
-function ownYardCodeSet(plan = {}) {
+function ownYardCodeMap(plan = {}) {
   const planHasOwnYards = [
     plan.ownYardCodes,
     plan.ownYards,
@@ -21,11 +32,17 @@ function ownYardCodeSet(plan = {}) {
     plan.summary?.dispatchPlanFormat?.ownYardCodes
   ].some((candidate) => Array.isArray(candidate) && candidate.length);
   const configuredOwnYards = planHasOwnYards ? null : config.dispatch?.ownYardCodes;
-  return new Set(dispatchOwnYardCodes(plan, configuredOwnYards));
+  return new Map(dispatchOwnYardCodes(plan, configuredOwnYards)
+    .map((yard) => [dispatchLocationKey(yard), yard])
+    .filter(([yardKey]) => Boolean(yardKey)));
+}
+
+function ownYardCode(plan = {}, value = "") {
+  return ownYardCodeMap(plan).get(dispatchLocationKey(value)) || "";
 }
 
 function isOwnYard(plan = {}, value = "") {
-  return ownYardCodeSet(plan).has(String(value || "").trim());
+  return Boolean(ownYardCode(plan, value));
 }
 
 function isPhotoReference(value) {
@@ -104,7 +121,9 @@ function todayLocalDate() {
 }
 
 function requiredPickupLocations(order) {
-  if (Array.isArray(order?.pickupLocations) && order.pickupLocations.length) return order.pickupLocations.map(String);
+  if (Array.isArray(order?.pickupLocations) && order.pickupLocations.length) {
+    return uniqueDispatchLocations(order.pickupLocations.map(String));
+  }
   if (order?.sourceYard) return [String(order.sourceYard)];
   return ["3445"];
 }
@@ -215,6 +234,25 @@ function driverLoadAssignments(plan, driverLogin) {
     });
 }
 
+function assignedDriverSafetyPlan(plan, driverLogin) {
+  const assignments = driverLoadAssignments(plan, driverLogin);
+  const assignedStops = assignments.flatMap(({ load }) => Array.isArray(load?.stops) ? load.stops : []);
+  const referencedOrderIds = new Set(assignedStops.flatMap((stop) => [
+    stop?.orderId,
+    ...(Array.isArray(stop?.orderIds) ? stop.orderIds : []),
+    ...(Array.isArray(stop?.orderRefs) ? stop.orderRefs : [])
+  ]).map((value) => String(value || "").trim()).filter(Boolean));
+  const assignedOrders = (Array.isArray(plan?.orders) ? plan.orders : []).filter((order) => {
+    if (referencedOrderIds.has(String(order?.id || ""))) return true;
+    return (Array.isArray(order?.childOrderDetails) ? order.childOrderDetails : [])
+      .some((child) => referencedOrderIds.has(String(child?.id || "")));
+  });
+  return {
+    orders: assignedOrders,
+    trucks: assignments.map(({ truck, load }) => ({ ...truck, loads: [load] }))
+  };
+}
+
 function orderByRef(plan, ref) {
   const direct = (plan.orders || []).find((order) => String(order.id) === String(ref));
   if (direct) return direct;
@@ -247,7 +285,8 @@ function expandOrderRefs(plan, refs) {
 }
 
 function yardAddress(value) {
-  return YARD_ADDRESSES[String(value || "")] || value || "";
+  const location = String(value || "");
+  return YARD_ADDRESSES[dispatchLocationRoot(location)] || location;
 }
 
 function normalizedPhysicalText(value) {
@@ -350,7 +389,8 @@ function positiveBalance(value, allocated) {
 async function locationAddress(value) {
   const text = String(value || "").trim();
   if (!text) return "";
-  if (YARD_ADDRESSES[text]) return YARD_ADDRESSES[text];
+  const ownYardAddress = YARD_ADDRESSES[dispatchLocationRoot(text)];
+  if (ownYardAddress) return ownYardAddress;
   const result = await query(
     `SELECT address
        FROM dispatch_vendor_yards
@@ -367,7 +407,7 @@ function dropStopsForPickup(plan, load, location) {
   return (load.stops || []).filter((stop) => {
     if (stop.type !== "drop" || !stop.orderId) return false;
     const order = orderByRef(plan, stop.orderId);
-    return requiredPickupLocations(order).map(String).includes(String(location));
+    return requiredPickupLocations(order).some((candidate) => dispatchLocationsShareYard(candidate, location));
   });
 }
 
@@ -437,7 +477,7 @@ function pickupAddressForStop(plan, stop) {
   const pickupLocation = String(stop?.location || "");
   return String(
     order.pickupAddressOverride
-    || YARD_ADDRESSES[pickupLocation]
+    || YARD_ADDRESSES[dispatchLocationRoot(pickupLocation)]
     || order.sourceAddress
     || order.defaultSourceAddress
     || pickupLocation
@@ -471,24 +511,24 @@ function loadEndOwnYard(plan, load) {
   if (!load) return "";
   if (load.returnOnly) {
     const yard = String(load.returnYard || "");
-    return isOwnYard(plan, yard) ? yard : "";
+    return ownYardCode(plan, yard);
   }
   const stop = lastRoutedStop(load);
   if (!stop) return "";
   if (stop.type === "pick") {
     const yard = stopLocationLabel(plan, stop);
-    return isOwnYard(plan, yard) ? yard : "";
+    return ownYardCode(plan, yard);
   }
   const order = orderByRef(plan, stop.orderId) || {};
   const location = dropLocationForStop(stop, order).trim();
-  return isOwnYard(plan, location) ? location : "";
+  return ownYardCode(plan, location);
 }
 
 function buildTruckSwitchApproachJob(plan, previousAssignment, nextAssignment, sequenceIndex) {
   const load = nextAssignment.load;
   const switchYard = String(load.switchYard || load.switch_yard || nextAssignment.truck?.base || "");
   if (!switchYard) return null;
-  if (loadEndOwnYard(plan, previousAssignment.load) === switchYard) return null;
+  if (dispatchLocationsShareYard(loadEndOwnYard(plan, previousAssignment.load), switchYard)) return null;
   const from = loadEndPoint(plan, previousAssignment.truck, previousAssignment.load);
   if (!from?.location) return null;
   const normalizedFromAddress = String(from.address || "").trim().toLowerCase();
@@ -751,16 +791,18 @@ function buildJob(plan, truck, load, stop, truckIndex, loadIndex, stopIndex) {
     ? relatedStops.flatMap((relatedStop) => {
         const order = orderByRef(plan, relatedStop.orderId) || {};
         return (order.directPickupManifest || [])
-          .filter((entry) => String(entry.location || "") === String(stop.location || ""))
+          .filter((entry) => dispatchLocationsShareYard(entry.location, stop.location))
           .map((entry) => ({ ...entry, salesOrderRef: entry.salesOrderRef || String(relatedStop.orderId || "") }));
       })
     : [];
   const directTransferRefs = dependencyPickupManifests.map((entry) => String(entry.transferOrderRef || "")).filter(Boolean);
   const ordinaryStopRefs = isPickup
-    ? stopOrderRefs.filter((ref) => {
+      ? stopOrderRefs.filter((ref) => {
         const order = orderByRef(plan, ref) || {};
-        const hasDirectHere = (order.directPickupManifest || []).some((entry) => String(entry.location || "") === String(stop.location || ""));
-        return !hasDirectHere || String(order.sourceYard || order.outboundLocation || "") === String(stop.location || "");
+        const hasDirectHere = (order.directPickupManifest || []).some((entry) =>
+          dispatchLocationsShareYard(entry.location, stop.location)
+        );
+        return !hasDirectHere || dispatchLocationsShareYard(order.sourceYard || order.outboundLocation, stop.location);
       })
     : stopOrderRefs;
   const orderRefs = [...new Set([...expandOrderRefs(plan, ordinaryStopRefs), ...directTransferRefs])];
@@ -799,6 +841,50 @@ function buildJob(plan, truck, load, stop, truckIndex, loadIndex, stopIndex) {
     dependencyPickupManifests,
     requiredPhotos: 2,
     sequence: { truckIndex, loadIndex, stopIndex }
+  };
+}
+
+function buildBinJob(plan, truck, load, stop, truckIndex, loadIndex, stopIndex) {
+  const isPickup = ["pick", "pickup"].includes(String(stop.type || "").toLowerCase());
+  const location = String(
+    stop.yardCode
+    || stop.location
+    || stop.displayName
+    || stop.siteProfileId
+    || ""
+  );
+  return {
+    jobId: jobId(plan, truck, load, stop),
+    planId: plan.id,
+    planDate: plan.planDate,
+    driverLogin: driverKey(truck.driverLogin || truck.driver),
+    driverName: truck.driver || "",
+    truckId: truck.id || "",
+    truckPlate: truck.plate || "",
+    parkingSpot: truck.parkingSpot || "",
+    loadId: load.id || "",
+    loadName: load.name || "",
+    stopId: stop.id || "",
+    stopType: isPickup ? "pickup" : "dropoff",
+    location,
+    pickupLocation: isPickup ? location : "",
+    address: location,
+    dropLocation: isPickup ? "" : location,
+    dropAddress: isPickup ? "" : location,
+    destinationLocationId: null,
+    lineRowIds: [],
+    windowStart: "",
+    windowEnd: "",
+    instructions: String(stop.displayName || ""),
+    orderRefs: [],
+    orderTypes: ["BIN"],
+    dependencyPickupManifests: [],
+    requiredPhotos: (Array.isArray(stop.evidenceRequirements) ? stop.evidenceRequirements : [])
+      .filter((requirement) => String(requirement?.type || requirement?.evidenceType || "") === "photo")
+      .reduce((sum, requirement) => sum + Math.max(0, Number(requirement.minimumCount || 0)), 0),
+    sequence: { truckIndex, loadIndex, stopIndex },
+    mbt: { ...stop.mbt, actionCode: String(stop.actionCode || stop.mbt?.actionCode || "") },
+    mbtDispatchStop: stop
   };
 }
 
@@ -890,7 +976,7 @@ async function refreshProjectedLoadExecution(job = {}) {
   ).catch(() => null);
 }
 
-export function planJobsForDriver(plan, driverLogin) {
+function materializePlanJobsForDriver(plan, driverLogin, { allowBin = false } = {}) {
   const assignments = driverLoadAssignments(plan, driverLogin);
   const jobs = [];
   assignments.forEach((assignment, assignmentIndex) => {
@@ -911,6 +997,11 @@ export function planJobsForDriver(plan, driverLogin) {
     const requireInterStopTravel = loadHasDirectDependency(plan, load);
     let previousRoutedStop = null;
     (load.stops || []).forEach((stop, stopIndex) => {
+      if (allowBin && stop?.mbt) {
+        jobs.push(buildBinJob(plan, truck, load, stop, truckIndex, assignmentIndex, stopIndex));
+        previousRoutedStop = stop;
+        return;
+      }
       if (!["pick", "drop"].includes(stop.type)) return;
       if (requireInterStopTravel && previousRoutedStop) {
         const legJob = buildInterStopTravelJob(plan, truck, load, previousRoutedStop, stop, truckIndex, assignmentIndex, stopIndex);
@@ -921,6 +1012,29 @@ export function planJobsForDriver(plan, driverLogin) {
     });
   });
   return jobs;
+}
+
+export function planJobsForDriver(plan, driverLogin, { allowBin = false } = {}) {
+  if (!allowBin) {
+    assertNoDriverBinMaterialization(assignedDriverSafetyPlan(plan, driverLogin));
+  }
+  return materializePlanJobsForDriver(plan, driverLogin, { allowBin });
+}
+
+export function planJobsForDrivers(plan, driverLogins = [], { allowBin = false } = {}) {
+  if (!allowBin) {
+    assertNoDriverBinMaterialization(plan);
+  }
+  const uniqueDriverLogins = [...new Set(
+    (Array.isArray(driverLogins) ? driverLogins : [])
+      .map(driverKey)
+      .filter(Boolean)
+  )];
+  if (!uniqueDriverLogins.length) return new Map();
+  return new Map(uniqueDriverLogins.map((driverLogin) => [
+    driverLogin,
+    materializePlanJobsForDriver(plan, driverLogin, { allowBin })
+  ]));
 }
 
 async function activeDriverAssignment(driverLogin, date = "") {
@@ -1065,7 +1179,8 @@ async function clearUnconfirmedDvirIfNeeded(row) {
 export async function getDriverDayState(driverLogin, {
   samsaraUsername = "",
   samsaraAccounts = {},
-  date = ""
+  date = "",
+  allowBin = false
 } = {}) {
   const normalizedSamsaraAccounts = samsaraAccountsFromLegacy(samsaraUsername, samsaraAccounts);
   const samsaraEnabled = normalizedSamsaraAccounts.enabled === true;
@@ -1075,7 +1190,7 @@ export async function getDriverDayState(driverLogin, {
   const initialTruck = assignment?.initialTruck || assignment?.truck || {};
   let row = await upsertDriverDayBase({ driverLogin, plan, truck: initialTruck, samsaraAccounts: normalizedSamsaraAccounts });
   if (samsaraEnabled) row = await clearUnconfirmedDvirIfNeeded(row);
-  const jobs = assignment ? planJobsForDriver(plan, driverLogin) : [];
+  const jobs = assignment ? planJobsForDriver(plan, driverLogin, { allowBin }) : [];
   const jobIds = jobs.map((job) => job.jobId);
   const completed = await completedJobIds(jobIds);
   const allJobsComplete = jobs.length > 0 && jobs.every((job) => completed.has(job.jobId));
@@ -1615,7 +1730,9 @@ async function detailsFromDelivery(orderRef, typeHint = "", context = {}) {
   if (context.stopType !== "pickup" || order.rows[0].order_type !== "sales_order") {
     return { ...order.rows[0], source: "delivery", lines: lines.rows };
   }
-  const ownPickup = !pickupLocation || isOwnYard(context.plan, pickupLocation) || String(order.rows[0].outbound_location || "") === pickupLocation;
+  const ownPickup = !pickupLocation
+    || isOwnYard(context.plan, pickupLocation)
+    || dispatchLocationsShareYard(order.rows[0].outbound_location, pickupLocation);
   const adjustedLines = lines.rows.map((line) => ownPickup
     ? {
         ...line,
@@ -1873,7 +1990,23 @@ async function materializeDriverJob(plan, job, status = null) {
   return materialized;
 }
 
-export async function getDriverDayJobs(driverLogin, { date = "" } = {}) {
+async function enrichMbtDriverJob(job, {
+  allowBin = false,
+  clientVersion = DRIVER_PWA_CURRENT_VERSION,
+  minimumClientVersion = DRIVER_PWA_MINIMUM_VERSION
+} = {}) {
+  if (!job?.mbt) return job;
+  if (!allowBin) assertNoDriverBinMaterialization({ orders: [], trucks: [{ loads: [{ stops: [job] }] }] });
+  const { materializeMbtDriverBinJob } = await import("./mbt/driver-bin-execution-service.js");
+  return materializeMbtDriverBinJob(job, { clientVersion, minimumClientVersion });
+}
+
+export async function getDriverDayJobs(driverLogin, {
+  date = "",
+  allowBin = false,
+  clientVersion = DRIVER_PWA_CURRENT_VERSION,
+  minimumClientVersion = DRIVER_PWA_MINIMUM_VERSION
+} = {}) {
   const planDate = planDateValue(date) || todayLocalDate();
   const login = driverKey(driverLogin);
   const plans = await confirmedPlans({ startDate: planDate });
@@ -1889,18 +2022,27 @@ export async function getDriverDayJobs(driverLogin, { date = "" } = {}) {
       jobs: []
     };
   }
-  const jobs = planJobsForDriver(plan, login);
+  const jobs = planJobsForDriver(plan, login, { allowBin });
   const statuses = await jobStatusMap(jobs.map((job) => job.jobId));
   return {
     planId: plan.id,
     planDate: plan.planDate,
     revision: Number(plan.revision || 0),
-    jobs: await Promise.all(jobs.map((job) => materializeDriverJob(plan, job, statuses.get(job.jobId))))
+    jobs: await Promise.all(jobs.map(async (job) => materializeDriverJob(
+      plan,
+      await enrichMbtDriverJob(job, { allowBin, clientVersion, minimumClientVersion }),
+      statuses.get(job.jobId)
+    )))
   };
 }
 
-export async function getDriverNextJobContext(driverLogin) {
-  const assignment = await activeDriverAssignment(driverLogin);
+export async function getDriverNextJobContext(driverLogin, {
+  allowBin = false,
+  clientVersion = DRIVER_PWA_CURRENT_VERSION,
+  minimumClientVersion = DRIVER_PWA_MINIMUM_VERSION,
+  date = ""
+} = {}) {
+  const assignment = await activeDriverAssignment(driverLogin, date);
   if (!assignment) {
     return {
       planId: null,
@@ -1910,24 +2052,35 @@ export async function getDriverNextJobContext(driverLogin) {
       job: null
     };
   }
-  const jobs = planJobsForDriver(assignment.plan, driverLogin);
-  const jobIds = jobs.map((job) => job.jobId);
+  const baseJobs = planJobsForDriver(assignment.plan, driverLogin, { allowBin });
+  const jobIds = baseJobs.map((job) => job.jobId);
   const completed = await completedJobIds(jobIds);
   const statuses = await jobStatusMap(jobIds);
-  const next = jobs.find((job) => !completed.has(job.jobId));
+  const next = baseJobs.find((job) => !completed.has(job.jobId));
   return {
     planId: assignment.plan.id,
     planDate: assignment.plan.planDate,
     revision: Number(assignment.plan.revision || 0),
-    jobs,
+    // Keep the ordered route raw for predecessor identity and authorization.
+    // /day-plan materializes the complete route in the background; first paint
+    // enriches only the one actionable BIN stop.
+    jobs: baseJobs,
     job: next
-      ? await materializeDriverJob(assignment.plan, next, statuses.get(next.jobId))
+      ? await materializeDriverJob(
+          assignment.plan,
+          await enrichMbtDriverJob(next, {
+            allowBin,
+            clientVersion,
+            minimumClientVersion
+          }),
+          statuses.get(next.jobId)
+        )
       : null
   };
 }
 
-export async function getNextDriverJob(driverLogin) {
-  return (await getDriverNextJobContext(driverLogin)).job;
+export async function getNextDriverJob(driverLogin, options = {}) {
+  return (await getDriverNextJobContext(driverLogin, options)).job;
 }
 
 function driverRemarkValue(value) {
@@ -1972,7 +2125,8 @@ function driverJobRecordDetails(job = {}, { driverRemark } = {}) {
         description: item?.description || "",
         units: Array.isArray(item?.units) ? item.units : []
       }))
-    }))
+    })),
+    ...(job.mbt?.schemaVersion ? { mbt: job.mbt } : {})
   };
   const normalizedRemark = driverRemarkValue(driverRemark);
   if (normalizedRemark !== undefined) details.driverRemark = normalizedRemark;
@@ -2226,9 +2380,11 @@ export async function recordDriverJobPhotos(driverLogin, jobIdValue, {
   driverRemark = undefined
 } = {}) {
   const photos = Array.isArray(photoDataUrls) ? photoDataUrls.filter(isPhotoReference) : [];
-  const requiredPhotos = job && Number(job.requiredPhotos) === 0
-    ? 0
-    : Math.max(2, Number(job?.requiredPhotos || 2));
+  const requiredPhotos = job?.mbt?.schemaVersion
+    ? Math.max(0, Number(job.requiredPhotos || 0))
+    : job && Number(job.requiredPhotos) === 0
+      ? 0
+      : Math.max(2, Number(job?.requiredPhotos || 2));
   if (photos.length < requiredPhotos) throw new Error(`${requiredPhotos} photo${requiredPhotos > 1 ? "s are" : " is"} required.`);
   const result = await query(
     `INSERT INTO driver_job_records (
@@ -2286,7 +2442,9 @@ export async function recordDriverJobPhotos(driverLogin, jobIdValue, {
       ]
     );
   }
-  await refreshProjectedLoadExecution({ ...job, driverLogin: driverKey(driverLogin) });
+  if (!job?.mbt?.schemaVersion) {
+    await refreshProjectedLoadExecution({ ...job, driverLogin: driverKey(driverLogin) });
+  }
   return result.rows[0];
 }
 

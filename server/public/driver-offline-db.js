@@ -14,6 +14,68 @@
   let openPromise = null;
   let openConnection = null;
 
+  function photoHasLocalBytes(photo) {
+    return Boolean(
+      (photo?.blob instanceof Blob && photo.blob.size > 0)
+      || (photoBinaryBuffer(photo?.blobBytes)?.byteLength || 0) > 0
+    );
+  }
+
+  function photoBinaryBuffer(value) {
+    if (value instanceof ArrayBuffer) return value;
+    if (ArrayBuffer.isView(value)) {
+      return value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+    }
+    return null;
+  }
+
+  function photoByteSize(photo) {
+    return Math.max(0, Number(
+      photo?.byteSize
+      || photo?.blob?.size
+      || photoBinaryBuffer(photo?.blobBytes)?.byteLength
+      || 0
+    ));
+  }
+
+  async function photoRecordForStorage(photo) {
+    if (!photo) return photo;
+    const { blob, objectUrl: _objectUrl, ...stored } = photo;
+    const blobBytes = photoBinaryBuffer(stored.blobBytes)
+      || (blob instanceof Blob ? await blob.arrayBuffer() : null);
+    return {
+      ...stored,
+      blobBytes,
+      byteSize: Math.max(0, Number(stored.byteSize || blobBytes?.byteLength || blob?.size || 0))
+    };
+  }
+
+  function photoRecordForRuntime(photo) {
+    if (!photo || photo.blob instanceof Blob) return photo;
+    const blobBytes = photoBinaryBuffer(photo.blobBytes);
+    if (!blobBytes?.byteLength) return photo;
+    return {
+      ...photo,
+      blob: new Blob([blobBytes], { type: photo.mimeType || "image/jpeg" })
+    };
+  }
+
+  function photoRecordForIndexedDb(photo) {
+    if (!photo) return photo;
+    const { blob, objectUrl: _objectUrl, ...stored } = photo;
+    if (blob instanceof Blob && !photoBinaryBuffer(stored.blobBytes)?.byteLength) {
+      throw offlineRepairError(
+        "Photo bytes must be converted before updating offline storage.",
+        "driver_offline_photo_binary_conversion_required"
+      );
+    }
+    return stored;
+  }
+
+  function putPhotoRecord(store, photo) {
+    return requestResult(store.put(photoRecordForIndexedDb(photo)));
+  }
+
   function eventRequiresOnlineReconciliation(event) {
     const result = event?.result || {};
     const dvirPending = result.pendingOnline === true && result.samsaraReconciled !== true;
@@ -78,6 +140,60 @@
         cursor.continue();
       };
     });
+  }
+
+  async function upgradePhotoRecordsToBinary(photoIds = []) {
+    const ids = [...new Set((photoIds || []).map((value) => String(value || "")).filter(Boolean))];
+    if (!ids.length) return 0;
+    const db = await open();
+    const readTransaction = db.transaction("photos", "readonly");
+    const readCompletion = transactionDone(readTransaction);
+    const readStore = readTransaction.objectStore("photos");
+    const records = await Promise.all(ids.map((photoId) => requestResult(readStore.get(photoId))));
+    await readCompletion;
+    const conversions = new Map();
+    for (const record of records) {
+      if (
+        !record?.photoId
+        || photoBinaryBuffer(record.blobBytes)?.byteLength
+        || !(record.blob instanceof Blob)
+      ) continue;
+      conversions.set(record.photoId, await record.blob.arrayBuffer());
+    }
+    if (!conversions.size) return 0;
+
+    const writeTransaction = db.transaction("photos", "readwrite");
+    const writeCompletion = transactionDone(writeTransaction);
+    const writeStore = writeTransaction.objectStore("photos");
+    let upgraded = 0;
+    for (const [photoId, blobBytes] of conversions) {
+      const current = await requestResult(writeStore.get(photoId));
+      if (!current || photoBinaryBuffer(current.blobBytes)?.byteLength) continue;
+      await putPhotoRecord(writeStore, { ...current, blobBytes });
+      upgraded += 1;
+    }
+    await writeCompletion;
+    return upgraded;
+  }
+
+  async function upgradePartitionPhotosToBinary(partitionKey) {
+    if (!partitionKey) return 0;
+    const db = await open();
+    const transaction = db.transaction("photos", "readonly");
+    const completion = transactionDone(transaction);
+    const photos = await getAll(transaction.objectStore("photos").index("byPartition"), partitionKey);
+    await completion;
+    return upgradePhotoRecordsToBinary(photos.map((photo) => photo.photoId));
+  }
+
+  async function upgradeEventPhotosToBinary(eventId) {
+    if (!eventId) return 0;
+    const db = await open();
+    const transaction = db.transaction("photos", "readonly");
+    const completion = transactionDone(transaction);
+    const photos = await getAll(transaction.objectStore("photos").index("byEvent"), eventId);
+    await completion;
+    return upgradePhotoRecordsToBinary(photos.map((photo) => photo.photoId));
   }
 
   function createUuid() {
@@ -218,6 +334,51 @@
     if (!current) store.put({ key: DEVICE_ID_KEY, value: deviceId, updatedAt: new Date().toISOString() });
     await transactionDone(transaction);
     return deviceId;
+  }
+
+  async function recoverDriverDeviceIdentity(profile) {
+    const driverLogin = normalizeDriverLogin(
+      profile?.login || profile?.driverLogin || profile?.username
+    );
+    if (!driverLogin) return { deviceId: await getDeviceId(), recovered: false };
+    const db = await open();
+    const readTransaction = db.transaction("profiles", "readonly");
+    const readCompletion = transactionDone(readTransaction);
+    const profiles = await getAll(
+      readTransaction.objectStore("profiles").index("byDriver"),
+      driverLogin
+    );
+    await readCompletion;
+    const retained = [];
+    for (const candidate of profiles) {
+      const health = await getStorageHealth(candidate.partitionKey);
+      const retainedCount = Number(health.pendingEventCount || 0)
+        + Number(health.reviewRequiredCount || 0)
+        + Number(
+          health.partitionUnsyncedPhotoCount
+          ?? health.unsyncedPhotoCount
+          ?? 0
+        );
+      if (retainedCount > 0) retained.push({ profile: candidate, retainedCount });
+    }
+    if (!retained.length) return { deviceId: await getDeviceId(), recovered: false };
+    retained.sort((left, right) => (
+      right.retainedCount - left.retainedCount
+      || String(right.profile.lastUsedAt || right.profile.authenticatedAt || "")
+        .localeCompare(String(left.profile.lastUsedAt || left.profile.authenticatedAt || ""))
+      || String(left.profile.partitionKey).localeCompare(String(right.profile.partitionKey))
+    ));
+    const recovered = retained[0].profile;
+    const transaction = db.transaction("meta", "readwrite");
+    const store = transaction.objectStore("meta");
+    store.put({ key: DEVICE_ID_KEY, value: recovered.deviceId, updatedAt: new Date().toISOString() });
+    await transactionDone(transaction);
+    return {
+      deviceId: recovered.deviceId,
+      partitionKey: recovered.partitionKey,
+      retainedCount: retained[0].retainedCount,
+      recovered: true
+    };
   }
 
   async function unlockPartition(profile) {
@@ -420,7 +581,7 @@
     }
     const blockingEvents = events.filter((event) => !eventIsRetainedTerminal(event));
     const protectedPhotos = photos.filter((photo) =>
-      Boolean(photo.blob)
+      photoHasLocalBytes(photo)
       || photo.status !== "durably_received"
       || !photo.eventId
     );
@@ -567,7 +728,7 @@
     ).length;
     const photos = await getAll(transaction.objectStore("photos").index("byPartition"), partitionKey);
     const draftPhotoCount = photos.filter((photo) => {
-      if (photo.eventId || !photo.blob || !photo.draftKey) return false;
+      if (photo.eventId || !photoHasLocalBytes(photo) || !photo.draftKey) return false;
       const parts = String(photo.draftKey).split(":");
       return compatibleManifestIds.has(parts[1]);
     }).length;
@@ -580,7 +741,7 @@
   }
 
   async function saveDraftPhoto(partitionKey, draftKey, photo, { replacePhotoId = "" } = {}) {
-    const record = {
+    const record = await photoRecordForStorage({
       ...photo,
       photoId: photo.photoId || createUuid(),
       partitionKey,
@@ -589,7 +750,7 @@
       status: "draft",
       createdAt: photo.createdAt || new Date().toISOString(),
       updatedAt: new Date().toISOString()
-    };
+    });
     const db = await open();
     const transaction = db.transaction("photos", "readwrite");
     const store = transaction.objectStore("photos");
@@ -631,13 +792,13 @@
     ]);
     const unsyncedPhotos = photos.filter((candidate) =>
       !replacementIds.has(candidate.photoId)
-      && candidate.blob
+      && photoHasLocalBytes(candidate)
       && candidate.status !== "durably_received"
     );
     const nextBytes = unsyncedPhotos.reduce(
-      (sum, candidate) => sum + Number(candidate.byteSize || candidate.blob?.size || 0),
+      (sum, candidate) => sum + photoByteSize(candidate),
       0
-    ) + Number(record.byteSize || record.blob?.size || 0);
+    ) + photoByteSize(record);
     const nextCount = unsyncedPhotos.length + 1;
     if (nextBytes > MAX_EVIDENCE_BYTES || nextCount > MAX_UNSYNCED_PHOTOS) {
       await transactionDone(transaction);
@@ -645,12 +806,12 @@
         ? "Offline photo storage has reached 250 MB. Synchronize before taking more required photos."
         : "There are already 100 unsynchronized photos. Synchronize before taking more required photos.");
     }
-    store.put(record);
+    await putPhotoRecord(store, record);
     for (const replacementId of replacementIds) {
       if (replacementId !== record.photoId) store.delete(replacementId);
     }
     await transactionDone(transaction);
-    return record;
+    return photoRecordForRuntime(record);
   }
 
   async function getDraftPhotos(partitionKey, draftKey) {
@@ -660,7 +821,9 @@
       transaction.objectStore("photos").index("byDraft"),
       global.IDBKeyRange.only([partitionKey, draftKey])
     );
-    return records.sort((left, right) => Number(left.ordinal || 0) - Number(right.ordinal || 0));
+    return records
+      .sort((left, right) => Number(left.ordinal || 0) - Number(right.ordinal || 0))
+      .map(photoRecordForRuntime);
   }
 
   async function getCompatibleDraftPhotos(partitionKey, activeManifest, kind, suffix) {
@@ -686,7 +849,9 @@
       })
       .sort((left, right) => String(left.updatedAt || "").localeCompare(String(right.updatedAt || "")))
       .forEach((photo) => byOrdinal.set(Number(photo.ordinal || 0), photo));
-    return [...byOrdinal.values()].sort((left, right) => Number(left.ordinal || 0) - Number(right.ordinal || 0));
+    return [...byOrdinal.values()]
+      .sort((left, right) => Number(left.ordinal || 0) - Number(right.ordinal || 0))
+      .map(photoRecordForRuntime);
   }
 
   async function deleteDraftPhoto(photoId) {
@@ -700,6 +865,9 @@
   }
 
   async function queueEvent(partitionKey, input) {
+    await upgradePhotoRecordsToBinary((input.photos || []).map((photo) =>
+      typeof photo === "string" ? photo : photo?.photoId
+    ));
     const db = await open();
     const transaction = db.transaction(["events", "photos", "meta"], "readwrite");
     const completion = transactionDone(transaction);
@@ -742,13 +910,42 @@
       transaction.abort();
       throw new Error("The required photo count is invalid.");
     }
+    if (input.eventType === "job_completed") {
+      const requestedJobId = String(input.jobId || "");
+      const requestedFingerprint = String(input.jobFingerprint || "");
+      const requestedPredecessor = String(input.predecessorFingerprint || "");
+      const openCompletion = partitionEvents.find((candidate) =>
+        candidate.eventType === "job_completed"
+        && !eventIsRetainedTerminal(candidate)
+        && String(candidate.jobId || "") === requestedJobId
+        && String(candidate.jobFingerprint || "") === requestedFingerprint
+        && String(candidate.predecessorFingerprint || "") === requestedPredecessor
+      );
+      if (openCompletion) {
+        if (String(openCompletion.eventId || "") === String(eventId)) {
+          await completion;
+          return openCompletion;
+        }
+        transaction.abort();
+        const error = offlineRepairError(
+          "This stop completion is already saved on this device and still needs synchronization.",
+          "driver_completion_already_saved"
+        );
+        error.existingEvent = {
+          eventId: openCompletion.eventId,
+          status: openCompletion.status,
+          jobId: openCompletion.jobId
+        };
+        throw error;
+      }
+    }
     if (input.enforcePhotoCompletionLimit) {
       const allPhotos = await getAll(photosStore);
       const unsyncedPhotos = allPhotos.filter((photo) =>
-        photo.blob && photo.status !== "durably_received"
+        photoHasLocalBytes(photo) && photo.status !== "durably_received"
       );
       const evidenceBytes = unsyncedPhotos.reduce(
-        (sum, photo) => sum + Number(photo.byteSize || photo.blob?.size || 0),
+        (sum, photo) => sum + photoByteSize(photo),
         0
       );
       if (
@@ -802,7 +999,7 @@
     }
     const ownershipUpdatedAt = new Date().toISOString();
     for (const existing of photoRecords) {
-      photosStore.put({
+      await putPhotoRecord(photosStore, {
         ...existing,
         eventId,
         draftKey: null,
@@ -830,7 +1027,7 @@
           photoId: photo.photoId,
           ordinal: Number(photo.ordinal || 0),
           mimeType: photo.mimeType || "image/jpeg",
-          byteSize: Number(photo.byteSize || photo.blob?.size || 0),
+          byteSize: photoByteSize(photo),
           sha256: photo.sha256,
           recordType: photo.recordType || "driver-stop-photo"
         }))
@@ -884,6 +1081,7 @@
         "driver_offline_event_identity_missing"
       );
     }
+    await upgradePartitionPhotosToBinary(expectedPartition);
     const db = await open();
     const transaction = db.transaction(["events", "manifests", "jobs", "photos"], "readwrite");
     const completion = transactionDone(transaction);
@@ -1097,7 +1295,7 @@
           usedOrdinals.add(ordinal);
           nextOrdinal = Math.max(nextOrdinal, ordinal + 1);
           canonicalPhotoIds.push(photo.photoId);
-          photosStore.put({
+          await putPhotoRecord(photosStore, {
             ...photo,
             eventId: canonical.eventId,
             draftKey: null,
@@ -1330,43 +1528,80 @@
   async function getEventPhotos(eventId) {
     const db = await open();
     const transaction = db.transaction("photos", "readonly");
-    return getAll(transaction.objectStore("photos").index("byEvent"), eventId);
+    return (await getAll(transaction.objectStore("photos").index("byEvent"), eventId))
+      .map(photoRecordForRuntime);
   }
 
   async function getPendingPhotos(partitionKey) {
     const db = await open();
     const transaction = db.transaction("photos", "readonly");
     const photos = await getAll(transaction.objectStore("photos").index("byPartition"), partitionKey);
-    return photos.filter((photo) => photo.eventId && photo.status !== "durably_received");
+    return photos
+      .filter((photo) => photo.eventId && photo.status !== "durably_received")
+      .map(photoRecordForRuntime);
+  }
+
+  async function updatePhotoRecord(photoId, update) {
+    await upgradePhotoRecordsToBinary([photoId]);
+    const db = await open();
+    const transaction = db.transaction("photos", "readwrite");
+    const store = transaction.objectStore("photos");
+    const existing = await requestResult(store.get(photoId));
+    if (existing) await putPhotoRecord(store, update(existing));
+    await transactionDone(transaction);
+  }
+
+  async function markPhotoAttempt(photoId, phase = "ticketing") {
+    const now = new Date().toISOString();
+    await updatePhotoRecord(photoId, (existing) => ({
+      ...existing,
+      attemptCount: Number(existing.attemptCount || 0) + 1,
+      uploadPhase: String(phase || "ticketing"),
+      lastAttemptAt: now,
+      nextAttemptAt: null,
+      lastError: null,
+      lastErrorCode: "",
+      lastHttpStatus: 0,
+      retryable: false,
+      updatedAt: now
+    }));
+  }
+
+  async function markPhotoPhase(photoId, phase) {
+    await updatePhotoRecord(photoId, (existing) => ({
+      ...existing,
+      uploadPhase: String(phase || existing.uploadPhase || "upload"),
+      updatedAt: new Date().toISOString()
+    }));
   }
 
   async function markPhotoUploaded(photoId, objectReference) {
-    const db = await open();
-    const transaction = db.transaction("photos", "readwrite");
-    const store = transaction.objectStore("photos");
-    const existing = await requestResult(store.get(photoId));
-    if (existing) store.put({
+    await updatePhotoRecord(photoId, (existing) => ({
       ...existing,
       objectReference,
       status: "uploaded_unverified",
+      uploadPhase: "uploaded_unverified",
+      nextAttemptAt: null,
       lastError: null,
+      lastErrorCode: "",
+      lastHttpStatus: 0,
+      retryable: false,
       updatedAt: new Date().toISOString()
-    });
-    await transactionDone(transaction);
+    }));
   }
 
   async function markPhotoError(photoId, error) {
-    const db = await open();
-    const transaction = db.transaction("photos", "readwrite");
-    const store = transaction.objectStore("photos");
-    const existing = await requestResult(store.get(photoId));
-    if (existing) store.put({
+    await updatePhotoRecord(photoId, (existing) => ({
       ...existing,
       status: existing.objectReference ? "uploaded_unverified" : "local",
+      uploadPhase: String(error?.phase || error?.uploadPhase || "upload"),
       lastError: String(error?.message || error || "Photo upload failed."),
+      lastErrorCode: String(error?.code || ""),
+      lastHttpStatus: Math.max(0, Number(error?.status || error?.httpStatus || 0)),
+      retryable: error?.retryable === true,
+      nextAttemptAt: error?.nextAttemptAt || null,
       updatedAt: new Date().toISOString()
-    });
-    await transactionDone(transaction);
+    }));
   }
 
   async function releaseForegroundEvent(eventId) {
@@ -1421,6 +1656,7 @@
   }
 
   async function cancelForegroundEvent(eventId, draftKey = "") {
+    await upgradeEventPhotosToBinary(eventId);
     const db = await open();
     const transaction = db.transaction(["events", "photos"], "readwrite");
     const eventsStore = transaction.objectStore("events");
@@ -1435,13 +1671,15 @@
         updatedAt: now
       });
       const photos = await getAll(photosStore.index("byEvent"), eventId);
-      photos.forEach((photo) => photosStore.put({
-        ...photo,
-        eventId: null,
-        draftKey: draftKey || photo.draftKey,
-        status: "draft",
-        updatedAt: now
-      }));
+      for (const photo of photos) {
+        await putPhotoRecord(photosStore, {
+          ...photo,
+          eventId: null,
+          draftKey: draftKey || photo.draftKey,
+          status: "draft",
+          updatedAt: now
+        });
+      }
     }
     await transactionDone(transaction);
   }
@@ -1487,6 +1725,8 @@
   }
 
   async function applySyncResponse(partitionKey, payload) {
+    await upgradePhotoRecordsToBinary((payload?.photos || payload?.photoReceipts || [])
+      .map((result) => result?.photoId || result?.id));
     const db = await open();
     const transaction = db.transaction(["events", "photos", "meta"], "readwrite");
     const eventsStore = transaction.objectStore("events");
@@ -1522,21 +1762,30 @@
       const photoId = result.photoId || result.id;
       const existing = photoId ? await requestResult(photosStore.get(photoId)) : null;
       if (!existing || existing.partitionKey !== partitionKey) continue;
-      const durable = Boolean(result.durableReceipt || result.status === "durably_received" || result.status === "received");
-      const verificationFailed = !durable && Boolean(result.error) && Boolean(existing.blob);
-      photosStore.put({
+      const durable = Boolean(result.durableReceipt || result.status === "durably_received");
+      const verificationFailed = !durable && Boolean(result.error) && photoHasLocalBytes(existing);
+      await putPhotoRecord(photosStore, {
         ...existing,
         objectReference: verificationFailed
           ? null
           : result.objectReference || result.photoRef || existing.objectReference || null,
         durableReceipt: durable,
+        uploadPhase: durable
+          ? "durable"
+          : verificationFailed
+            ? "local"
+            : result.status || existing.uploadPhase || existing.status,
         status: durable
           ? "durably_received"
           : verificationFailed
             ? "local"
             : result.status || existing.status,
-        blob: durable ? null : existing.blob,
+        blobBytes: durable ? null : existing.blobBytes,
+        nextAttemptAt: durable ? null : existing.nextAttemptAt || null,
+        retryable: durable ? false : existing.retryable === true,
         lastError: result.error || null,
+        lastErrorCode: durable ? "" : String(result.errorCode || existing.lastErrorCode || ""),
+        lastHttpStatus: durable ? 0 : Math.max(0, Number(result.httpStatus || existing.lastHttpStatus || 0)),
         updatedAt: now
       });
     }
@@ -1577,11 +1826,13 @@
     // must remain protected, so another driver cannot silently exceed the guard.
     const photos = await getAll(transaction.objectStore("photos"));
     const events = await getAll(transaction.objectStore("events").index("byPartition"), partitionKey);
-    const unsyncedPhotos = photos.filter((photo) => photo.blob && photo.status !== "durably_received");
+    const unsyncedPhotos = photos.filter((photo) =>
+      photoHasLocalBytes(photo) && photo.status !== "durably_received"
+    );
     const partitionUnsyncedPhotos = unsyncedPhotos.filter((photo) => photo.partitionKey === partitionKey);
-    const evidenceBytes = unsyncedPhotos.reduce((sum, photo) => sum + Number(photo.byteSize || photo.blob?.size || 0), 0);
+    const evidenceBytes = unsyncedPhotos.reduce((sum, photo) => sum + photoByteSize(photo), 0);
     const partitionEvidenceBytes = partitionUnsyncedPhotos.reduce(
-      (sum, photo) => sum + Number(photo.byteSize || photo.blob?.size || 0),
+      (sum, photo) => sum + photoByteSize(photo),
       0
     );
     const pendingEvents = events.filter((event) => !eventIsRetainedTerminal(event));
@@ -1678,14 +1929,14 @@
     const photos = await getAll(photosStore.index("byPartition"), partitionKey);
     for (const photo of photos) {
       const timestamp = new Date(photo.updatedAt || photo.createdAt || 0).getTime();
-      if (!photo.blob && photo.status === "durably_received" && Number.isFinite(timestamp) && timestamp < cutoff) {
+      if (!photoHasLocalBytes(photo) && photo.status === "durably_received" && Number.isFinite(timestamp) && timestamp < cutoff) {
         if (!photo.eventId || removedEventIds.has(photo.eventId)) photosStore.delete(photo.photoId);
       }
     }
     const protectedManifestIds = new Set(events
       .filter((event) => !eventIsRetainedTerminal(event))
       .map((event) => String(event.manifestId || "")));
-    for (const photo of photos.filter((item) => item.blob)) {
+    for (const photo of photos.filter(photoHasLocalBytes)) {
       const match = String(photo.draftKey || "").match(/^(?:job|dvir):([^:]+)/);
       if (match?.[1]) protectedManifestIds.add(match[1]);
     }
@@ -1723,6 +1974,7 @@
     getMeta,
     setMeta,
     getDeviceId,
+    recoverDriverDeviceIdentity,
     unlockPartition,
     getProfile,
     getActiveProfile,
@@ -1749,6 +2001,8 @@
     getPendingEvents,
     getEventPhotos,
     getPendingPhotos,
+    markPhotoAttempt,
+    markPhotoPhase,
     markPhotoUploaded,
     markPhotoError,
     releaseForegroundEvent,

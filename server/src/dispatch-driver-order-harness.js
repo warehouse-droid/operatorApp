@@ -855,8 +855,8 @@ assert.equal((initDispatchSource.match(/loadDriverJobStatuses\(/g) || []).length
   "Dispatch initialization repeats the status request already owned by plan loading.");
 assert(repository.includes("displayOrder: numberValue(row.display_order, 0)"), "Setup API does not expose persisted display order.");
 assert(repository.includes("cleanDriver(driver, index)"), "Driver request order is not explicitly persisted as display_order.");
-assert(setupHtml.includes("20260729-driver-samsara-v1"), "Dispatch Setup browser asset version was not bumped.");
-assert(plannerHtml.includes('/dispatch.js?v=20260801-preview-timing-v1'), "Dispatch planner browser asset version was not bumped.");
+assert(setupHtml.includes("20260803-mbt-bin-trucks-v1"), "Dispatch Setup browser asset version was not bumped.");
+assert(plannerHtml.includes('/dispatch.js?v=20260805-mbbs-special-po-link-location-hierarchy-v2'), "Dispatch planner browser asset version was not bumped.");
 
 const activityPositionSource = sourceRange(
   plannerUi,

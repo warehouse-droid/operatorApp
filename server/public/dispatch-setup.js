@@ -220,6 +220,44 @@ function truckBaseYardOptions(selected = "") {
   ].join("");
 }
 
+function normalizedTruckType(truck) {
+  return String(truck?.truckType || "flatbed").trim().toLowerCase() === "bin" ? "bin" : "flatbed";
+}
+
+function supportedBinTypeCodesFor(truck) {
+  return new Set(Array.isArray(truck?.supportedBinTypeCodes)
+    ? truck.supportedBinTypeCodes.map((code) => String(code || "").trim().toUpperCase())
+    : []);
+}
+
+function truckCapabilityCommandId() {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  return `dispatch-truck-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+async function saveTruckCapabilities(truck, { expectedRevision, reason }) {
+  const result = await api(`/api/dispatch/setup/trucks/${encodeURIComponent(truck.id)}/capabilities`, {
+    method: "PUT",
+    headers: {
+      "Idempotency-Key": truckCapabilityCommandId(),
+      "X-Correlation-Id": truckCapabilityCommandId()
+    },
+    body: JSON.stringify({
+      expectedRevision,
+      capability: {
+        truckType: normalizedTruckType(truck),
+        capacityLbs: truck.capacityLbs,
+        travelTimePercent: truck.travelTimePercent,
+        baseYard: truck.baseYard,
+        binSlotCapacity: normalizedTruckType(truck) === "bin" ? truck.binSlotCapacity : 0,
+        supportedBinTypeCodes: normalizedTruckType(truck) === "bin" ? truck.supportedBinTypeCodes : []
+      },
+      reason
+    })
+  });
+  return result.truck;
+}
+
 function ownYardFixedMinutesFor(driver) {
   return Number(driver?.ownYardFixedMinutes || driver?.loadMinutes || 40);
 }
@@ -415,6 +453,8 @@ function renderDrivers() {
 function renderTrucks() {
   const selected = Number.isInteger(selectedSetupIndex) ? trucks[selectedSetupIndex] : null;
   const selectedActive = setupRecordActive(selected);
+  const selectedType = normalizedTruckType(selected);
+  const selectedBinTypes = supportedBinTypeCodesFor(selected);
   return `
     <div class="setup-content">
       <div class="setup-list-column">
@@ -430,13 +470,15 @@ function renderTrucks() {
           <button class="registration-card truck-setup-card ${setupRecordActive(truck) ? "" : "is-disabled"} ${selectedSetupIndex === index ? "selected" : ""}" data-action="select-setup-record" data-index="${index}" data-truck-index="${index}" draggable="${setupRecordActive(truck) ? "true" : "false"}" type="button">
             <span class="setup-card-title"><strong>${escapeHtml(truck.plate)}</strong><span class="setup-status-pill ${setupRecordActive(truck) ? "active" : "disabled"}">${setupRecordActive(truck) ? "Active" : "Disabled"}</span></span>
             <span class="muted">Capacity ${formatLbs(truckCapacityLbs(truck))}</span>
+            <span class="muted">Type ${normalizedTruckType(truck) === "bin" ? "Bin" : "Flatbed"}${normalizedTruckType(truck) === "bin" ? ` · ${Number(truck.binSlotCapacity || 0)} slot${Number(truck.binSlotCapacity || 0) === 1 ? "" : "s"}` : ""}</span>
+            ${normalizedTruckType(truck) === "bin" ? `<span class="muted">BIN sizes ${escapeHtml([...supportedBinTypeCodesFor(truck)].join(", ") || "Not configured")}</span>` : ""}
             <span class="muted">Google travel time +${truckTravelTimePercent(truck)}%</span>
             <span class="muted">Base yard ${escapeHtml(truck.baseYard || "Unknown")}</span>
           </button>
         `).join("")}
         </div>
       </div>
-      <form class="registration-form setup-form" data-form="truck">
+      <form class="registration-form setup-form" data-form="truck" data-existing-truck-type="${selectedType}">
         <h3>${selected ? "Update Truck" : "Register Truck"}</h3>
         ${selected ? `<div class="setup-record-status-row">
           <span class="setup-status-pill ${selectedActive ? "active" : "disabled"}">${selectedActive ? "Active" : "Disabled"}</span>
@@ -445,9 +487,23 @@ function renderTrucks() {
         </div>` : ""}
         <label><span>${t("dispatch.truckSwitchMinutes", "Truck switch time (minutes)")}</span><input name="truckSwitchMinutes" type="number" min="0" max="120" step="1" value="${Number(planningSettings.truckSwitchMinutes ?? 10)}" required /></label>
         <label><span>${selected?.id ? "Vehicle plate (fixed after registration)" : "Vehicle plate number"}</span><input name="plate" value="${escapeHtml(selected?.plate || "")}" ${selected?.id ? "readonly" : ""} required /></label>
+        <input name="expectedRevision" type="hidden" value="${Number(selected?.revision || 1)}" />
+        <label><span>Truck type</span><select name="truckType">
+          <option value="flatbed" ${selectedType === "flatbed" ? "selected" : ""}>Flatbed</option>
+          <option value="bin" ${selectedType === "bin" ? "selected" : ""}>Bin</option>
+        </select></label>
         <label><span>Load capacity (lb)</span><input name="capacityLbs" type="number" value="${truckCapacityLbs(selected)}" required /></label>
         <label><span>Google travel time + %</span><input name="travelTimePercent" type="number" min="0" max="300" step="1" value="${truckTravelTimePercent(selected)}" required /></label>
         <label><span>Default base yard</span><select name="baseYard">${truckBaseYardOptions(selected?.baseYard || "")}</select></label>
+        <fieldset data-bin-capability-fields ${selectedType === "bin" ? "" : "hidden"}>
+          <legend>BIN capability</legend>
+          <label><span>BIN slot capacity</span><input name="binSlotCapacity" type="number" min="1" step="1" value="${Math.max(1, Number(selected?.binSlotCapacity || 1))}" ${selectedType === "bin" ? "required" : "disabled"} /></label>
+          <span>Supported bin sizes</span>
+          <label><input name="supportedBinTypeCodes" type="checkbox" value="14YD" ${selectedBinTypes.has("14YD") ? "checked" : ""} ${selectedType === "bin" ? "" : "disabled"} /> 14YD</label>
+          <label><input name="supportedBinTypeCodes" type="checkbox" value="20YD" ${selectedBinTypes.has("20YD") ? "checked" : ""} ${selectedType === "bin" ? "" : "disabled"} /> 20YD</label>
+          <label><input name="supportedBinTypeCodes" type="checkbox" value="40YD" ${selectedBinTypes.has("40YD") ? "checked" : ""} ${selectedType === "bin" ? "" : "disabled"} /> 40YD</label>
+        </fieldset>
+        <label data-truck-capability-reason ${selectedType === "bin" ? "" : "hidden"}><span>Capability change reason</span><input name="capabilityReason" value="" maxlength="500" ${selectedType === "bin" ? "required" : "disabled"} placeholder="Required for audited BIN capability changes" /></label>
         <button class="primary" type="submit">${selected ? "Update Truck" : "Register Truck"}</button>
       </form>
     </div>
@@ -1042,7 +1098,8 @@ setupApp.addEventListener("submit", (event) => {
   if (!form) return;
   if (form.dataset.form === "dispatch-login") return;
   event.preventDefault();
-  const data = Object.fromEntries(new FormData(form).entries());
+  const formData = new FormData(form);
+  const data = Object.fromEntries(formData.entries());
   if (form.dataset.form === "vendor-hours") {
     const vendorName = String(data.vendor || "").trim();
     const yardName = String(data.yard || "").trim();
@@ -1175,21 +1232,77 @@ setupApp.addEventListener("submit", (event) => {
   }
   if (form.dataset.form === "truck") {
     const existingTruck = Number.isInteger(selectedSetupIndex) ? trucks[selectedSetupIndex] : null;
+    const requestedType = String(data.truckType || "flatbed").trim().toLowerCase() === "bin" ? "bin" : "flatbed";
+    const supportedBinTypeCodes = requestedType === "bin"
+      ? formData.getAll("supportedBinTypeCodes").map((code) => String(code).trim().toUpperCase())
+      : [];
+    const requiresCapabilityCommand = requestedType === "bin" || normalizedTruckType(existingTruck) === "bin";
+    const capabilityReason = String(data.capabilityReason || "").trim();
+    if (requestedType === "bin" && !String(data.baseYard || "").trim()) {
+      setupNotice = "A Bin truck requires a confirmed base yard.";
+      renderSetup();
+      return;
+    }
+    if (requestedType === "bin" && supportedBinTypeCodes.length === 0) {
+      setupNotice = "Select at least one supported BIN size.";
+      renderSetup();
+      return;
+    }
+    if (requiresCapabilityCommand && !capabilityReason) {
+      setupNotice = "Enter a reason for the audited truck capability change.";
+      renderSetup();
+      return;
+    }
     const truck = {
+      ...(existingTruck || {}),
       id: existingTruck?.id || null,
       active: existingTruck?.active !== false,
       plate: data.plate,
       capacityLbs: Number(data.capacityLbs || 48000),
       travelTimePercent: Math.max(0, Number(data.travelTimePercent || 0)),
-      baseYard: String(data.baseYard || "").trim()
+      baseYard: String(data.baseYard || "").trim(),
+      truckType: requestedType,
+      binServiceEnabled: requestedType === "bin",
+      binSlotCapacity: requestedType === "bin" ? Number(data.binSlotCapacity || 0) : 0,
+      supportedBinTypeCodes
     };
     planningSettings.truckSwitchMinutes = Math.max(0, Math.round(Number(data.truckSwitchMinutes ?? 10)));
-    if (Number.isInteger(selectedSetupIndex)) trucks[selectedSetupIndex] = truck;
-    else {
+    const selectedIndex = Number.isInteger(selectedSetupIndex) ? selectedSetupIndex : null;
+    (async () => {
+      validateUniqueDriverLogins();
+      if (selectedIndex !== null && existingTruck?.id) {
+        if (requiresCapabilityCommand) {
+          const capabilityTruck = await saveTruckCapabilities(truck, {
+            expectedRevision: Number(data.expectedRevision || existingTruck.revision),
+            reason: capabilityReason
+          });
+          trucks[selectedIndex] = { ...truck, ...capabilityTruck, baseYard: truck.baseYard };
+        } else {
+          trucks[selectedIndex] = truck;
+        }
+        await saveDispatchSetup();
+        return;
+      }
+
       trucks.push(truck);
       selectedSetupIndex = trucks.length - 1;
-    }
-    saveDispatchSetup().then(() => {
+      await saveDispatchSetup();
+      const registeredIndex = trucks.findIndex((savedTruck) => String(savedTruck.plate || "").trim().toUpperCase() === String(truck.plate || "").trim().toUpperCase());
+      const registered = registeredIndex >= 0 ? trucks[registeredIndex] : null;
+      if (!registered?.id) throw new Error("The registered truck could not be reloaded.");
+      selectedSetupIndex = registeredIndex;
+      if (requestedType === "bin") {
+        try {
+          const capabilityTruck = await saveTruckCapabilities({ ...registered, ...truck, id: registered.id }, {
+            expectedRevision: Number(registered.revision || 1),
+            reason: capabilityReason
+          });
+          trucks[registeredIndex] = { ...registered, ...capabilityTruck };
+        } catch (error) {
+          throw new Error(`The truck was registered safely as Flatbed, but BIN capabilities were not applied: ${error.message}`);
+        }
+      }
+    })().then(() => {
       setupNotice = "Truck setup saved.";
       renderSetup();
     }).catch((error) => {
@@ -1201,6 +1314,25 @@ setupApp.addEventListener("submit", (event) => {
 });
 
 setupApp.addEventListener("change", (event) => {
+  if (event.target?.name === "truckType") {
+    const form = event.target.closest("form[data-form='truck']");
+    const isBin = event.target.value === "bin";
+    const needsCapabilityReason = isBin || form?.dataset.existingTruckType === "bin";
+    const fields = form?.querySelector("[data-bin-capability-fields]");
+    const reason = form?.querySelector("[data-truck-capability-reason]");
+    if (fields) fields.hidden = !isBin;
+    fields?.querySelectorAll("input").forEach((input) => {
+      input.disabled = !isBin;
+      if (input.name === "binSlotCapacity") input.required = isBin;
+    });
+    if (reason) reason.hidden = !needsCapabilityReason;
+    const reasonInput = reason?.querySelector("input");
+    if (reasonInput) {
+      reasonInput.disabled = !needsCapabilityReason;
+      reasonInput.required = needsCapabilityReason;
+    }
+    return;
+  }
   if (event.target?.id === "vendorSelect") {
     selectedVendor = event.target.value;
     selectedYard = vendorYards.find((row) => row.vendor === selectedVendor)?.yard || "";

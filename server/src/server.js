@@ -5,6 +5,10 @@ import path from "node:path";
 import { isIP } from "node:net";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { config, isNetSuiteSandboxEnvironment, listEnvFiles, selectEnvFile } from "./config.js";
+import { createMbtRouter } from "./mbt/router.js";
+import { confirmMbtBinDispatchPlan } from "./mbt/bin-dispatch-service.js";
+import { binDispatchOrders } from "./mbt/dispatch-bin-safety.js";
+import { authorizeMbtPhase3Capability } from "./mbt/phase3-authorization.js";
 import { afterTransactionCommit, beginRollbackContext, pool, query, withTransaction } from "./db.js";
 import { fetchSalesOrderReferenceFromNetSuite, fetchTransactionReferenceByTranidFromNetSuite } from "./netsuite.js";
 import { buildAuthorizationUrl, exchangeCodeForToken, fetchDeliveryOrdersFromNetSuite, fetchDeliveryOrderFromNetSuite, fetchCustomerPickupOrderFromNetSuite, fetchDeliveryOrderDetailsFromNetSuite, fetchDeliveryOrderDetailsBatchFromNetSuite, fetchTransferDeliveryOrdersFromNetSuite, fetchTransferDeliveryOrderFromNetSuite, fetchTransferOrderDetailsFromNetSuite, fetchTransferOrderVerificationLinesFromNetSuite, fetchTransferOrderByIdFromNetSuite, findTransferOrdersByDependencyMarkerFromNetSuite, findTransferOrdersBySmartScmMarkerFromNetSuite, fetchPurchaseOrdersFromNetSuite, fetchPurchaseOrderFromNetSuite, fetchPurchaseOrderReferenceFromNetSuite, fetchPurchaseOrderDetailsFromNetSuite, fetchTransferReceivingOrdersFromNetSuite, fetchTransferReceivingOrderFromNetSuite, fetchInventoryBalanceForItemFromNetSuite, fetchInventoryBalancesFromNetSuite, fetchInventoryBalancesForItemsFromNetSuite, fetchItemFulfillmentFromNetSuite, fetchItemReceiptFromNetSuite, fetchTransactionProgressFromNetSuite, fetchTransactionStatusFromNetSuite, createPurchaseOrderInNetSuite, createTransferOrderInNetSuite, updateTransferOrderStatusInNetSuite, fetchPickingTicketFromNetSuite, resolveNetSuiteTransferLocations, resolveNetSuiteYardLocations, resolvePalletItemFromNetSuite, transformSalesOrderToItemFulfillment, transformTransferOrderToItemFulfillment, transformPurchaseOrderToItemReceipt, transformTransferOrderToItemReceipt } from "./netsuite.js";
@@ -36,15 +40,21 @@ import {
   scmReconciliationNightlyTick,
   startScmReconciliationRun
 } from "./scm-reconciliation-service.js";
+import {
+  isBilledSalesOrderIdentifier,
+  listBilledSalesOrderFamilyRefs
+} from "./sales-order-reconciliation-repository.js";
+import { isNetSuiteSalesOrderBilled } from "./sales-order-reconciliation.js";
 import { getScmSchedulePreference, normalizeScmSchedulePreferenceSurface, updateScmSchedulePreference } from "./scm-schedule-preference-repository.js";
 import { getScmScheduleFormatting, updateScmScheduleFormatting } from "./scm-schedule-formatting-repository.js";
 import { canViewRestrictedScmOrders, filterRestrictedScmOrders } from "./scm-order-visibility.js";
+import { changedPlacedDispatchScmAssignmentRefs } from "./dispatch-scm-placement.js";
 import { syncTargetedNetSuiteOrder } from "./targeted-order-sync.js";
 import { listDeliveryOrders, listVrmaDeliveryPrepOrders, getDeliveryOrder, getFulfillableDeliveryOrder, buildItemFulfillmentPayload, markDeliveryPrepared, updateDeliveryStatus, confirmDeliveryLine, confirmDeliveryLines, setDeliveryLinePackedQuantity, unpackDeliveryLine, unpackDeliveryOrder, recordDeliveryFulfillment, recordDeliveryFulfillmentFailure, recordDeliveryLoad, listDeliveryFulfillments, getDeliveryBootstrap, getDeliveryPrepNotifications, resetDeliveryFulfillmentState, applyConfirmedDispatchPlanToDelivery, deactivateUnplannedDispatchSplitOrders, getNextDispatchSplitSuffix, getCurrentOperatorDeliveryDraft, releaseCurrentDeliveryDraft, listSavedDeliveryOrdersForOperator, listSavedDeliveryOrderKeysForOperator, saveDeliveryOrderForOperator, removeSavedDeliveryOrderForOperator, listDeliveryLoadTrucks, listDeliveryLoadOrders } from "./delivery-repository.js";
 import { getYardMovementDetail, listYardMovementCsvRows, listYardMovements } from "./yard-movement-repository.js";
 import { yardMixedUnits } from "./yard-quantity.js";
 import { clearCustomerPickupDraft, confirmCustomerPickupLine, findCustomerPickupOrder, isPendingApprovalStatus, isPickupDeliveryMethod, recordCustomerPickupLoad } from "./customer-pickup-repository.js";
-import { createOperator, getOperatorByToken, hasOperators, listAudit, listAuditOptions, listOperators, loginOperator, logoutToken, setOperatorActive, updateOperatorPassword, updateOperatorRoles, writeAudit } from "./auth-repository.js";
+import { createOperator, getOperatorByToken, hasOperators, listAudit, listAuditOptions, listOperators, loginOperator, logoutToken, operatorHomeRoute, setOperatorActive, updateOperatorPassword, updateOperatorRoles, writeAudit } from "./auth-repository.js";
 import { applyInventoryClassificationRules, confirmCycleCountLine, getCycleCountDraft, listCycleCountRecords, listInventoryClassifications, listInventoryFacets, listInventoryItems, submitCycleCount, updateInventoryClassification, upsertInventoryBalances } from "./inventory-repository.js";
 import { listReceivingVendors, listReceivingSources, listReceivingOrders, getReceivingOrder, searchReceivingItems, confirmReceivingLine, unconfirmReceivingLine, getReceivableReceivingOrder, buildItemReceiptPayload, recordReceivingReceipt, recordReceivingReceiptFailure, listReceivingReceipts, listLocalCoSources, listLocalCoReceivingOrders, searchLocalCoItems, getLocalCoReceivingOrder, confirmLocalCoReceivingLine, unconfirmLocalCoReceivingLine, receiveLocalCoOrder } from "./receiving-repository.js";
 import { listExistingInboundOrderIds, listExistingOutboundOrderIds, markMissingInboundOrderLines, markMissingInboundOrders, markMissingOutboundOrderLines, markOutboundOrderMissing, updatePurchaseOrderNetSuiteStatus, updateSalesOrderNetSuiteStatus, upsertInboundTransferOrderLines, upsertInboundTransferOrders, upsertOutboundTransferOrderLines, upsertOutboundTransferOrders, upsertPurchaseOrderLines, upsertPurchaseOrders, upsertSalesOrderLines, upsertSalesOrders } from "./order-sync-repository.js";
@@ -57,7 +67,7 @@ import { cancelDispatchCustomOrder, canonicalizeDispatchCustomOrdersInPlan, comp
 import { DISPATCH_VENDOR_WEEK_DAYS, listDispatchVendorYards, listDispatchLocalVendors, saveDispatchVendorYardSchedule, updateDispatchVendorYard, upsertDispatchVendorYard, listDispatchParserRules, updateDispatchParserRule, listOllamaAudit, listDispatchVendorMappings, discoverDispatchVendorMappingsFromPurchaseOrders, updateDispatchVendorMapping, createDispatchLocalVendor, updateDispatchLocalVendor } from "./dispatch-enrichment.js";
 import { listDispatchAudit, writeDispatchAudit } from "./dispatch-audit-repository.js";
 import { runWithAuditContext } from "./audit-context.js";
-import { DispatchPlanDateMismatchError, StaleDispatchPlanSaveError, applyDispatchPlannedAssignment, confirmDispatchPlan, createDispatchPlan, dispatchPlannedAssignmentMap, dispatchPlannedOrderConflictRefs, dispatchPlannedOrderRefs, getCurrentDispatchPlan, getDispatchPlan, getDispatchPlanRevision, getDispatchPlanSnapshot, listDispatchPlanSnapshots, listDispatchPlans, reopenDispatchPlan, restoreDispatchPlanSnapshot, saveDispatchPlanSnapshot } from "./dispatch-plan-repository.js";
+import { DispatchPlanDateMismatchError, StaleDispatchPlanSaveError, applyDispatchPlannedAssignment, cleanupBilledSalesOrderFamiliesFromDispatchPlan, confirmDispatchPlan, createDispatchPlan, dispatchPlannedAssignmentMap, dispatchPlannedOrderConflictRefs, dispatchPlannedOrderRefs, getCurrentDispatchPlan, getDispatchPlan, getDispatchPlanRevision, getDispatchPlanSnapshot, listDispatchPlanSnapshots, listDispatchPlans, reopenDispatchPlan, restoreDispatchPlanSnapshot, saveDispatchPlanSnapshot } from "./dispatch-plan-repository.js";
 import { DispatchPlanEditLeaseError, acquireDispatchPlanEditLease, assertDispatchPlanEditLease, getDispatchPlanEditLease, heartbeatDispatchPlanEditLease, releaseDispatchPlanEditLease } from "./dispatch-plan-lease-repository.js";
 import { getDispatchStatistics } from "./dispatch-statistics-repository.js";
 import { buildDispatchForecast } from "./dispatch-forecast-service.js";
@@ -73,6 +83,7 @@ import {
   createDriverLocationVerification,
   driverOfflineManifestMatchesJobs,
   findDriverOfflineRebaseCandidates,
+  findOpenDriverOfflineJobCompletion,
   failDriverOfflineRetry,
   getDriverOfflineEvent,
   getDriverOfflinePhotoRegistration,
@@ -104,10 +115,18 @@ import {
 import { listDriverPwaStops, reopenDriverPwaStop } from "./driver-pwa-repository.js";
 import { processDriverOfflineQueue } from "./driver-offline-service.js";
 import {
+  DRIVER_PWA_CURRENT_VERSION,
+  DRIVER_PWA_MINIMUM_VERSION,
   DRIVER_PWA_VERSION_HEADER,
   driverPwaVersionDetails,
   driverPwaVersionGate
 } from "./driver-client-version.js";
+import { getDriverOfflineMode } from "./driver-mode-repository.js";
+import {
+  assertMbtDriverBinProjectionScope,
+  authorizeMbtDriverBinProjection
+} from "./mbt/driver-bin-authorization.js";
+import { applyMbtDriverBinOfflineEvent } from "./mbt/driver-bin-offline-application.js";
 import {
   beginDriverOfflineReconciliationReceipt,
   completeDriverOfflineReconciliationReceipt,
@@ -119,7 +138,7 @@ import {
 import { createSamsaraDriverAuthToken, createSamsaraDriverVehicleAssignment, findSamsaraDriverByUsername, listSamsaraVehicleLocations, setSamsaraDriverDutyStatus, testSamsaraConnection } from "./samsara.js";
 import { createPhotoReadToken, createPhotoUploadToken, isJpegEvidenceBytes, isR2PhotoReference, publicPhotoUploadConfig } from "./photo-upload.js";
 import { getPhotoArchiveSettings, isPhotoArchiveRunning, photoArchiveAutoTick, readArchivedPhoto, recoverInterruptedPhotoArchive, runPhotoArchive, updatePhotoArchiveSettings } from "./photo-archive-repository.js";
-import { authenticateDispatchDriver, ensureDispatchFleetSetup, getDispatchDriverByLogin, listDispatchDrivers, listDispatchTrucks, replaceDispatchFleetSetup, setDispatchDriverActive, setDispatchTruckActive } from "./dispatch-setup-repository.js";
+import { authenticateDispatchDriver, ensureDispatchFleetSetup, getDispatchDriverByLogin, listDispatchDrivers, listDispatchTrucks, replaceDispatchFleetSetup, setDispatchDriverActive, setDispatchTruckActive, updateDispatchTruckCapabilities } from "./dispatch-setup-repository.js";
 import { assertNoActiveConsolidationClaimsByRefs, confirmConsolidationItem, getActiveConsolidationBatch, getSavedConsolidationQueue, packConsolidationOrder, releaseConsolidationBatch, startSavedConsolidationBatch, updateConsolidationLine } from "./delivery-consolidation-repository.js";
 import { DEPENDENCY_YARDS, assertNoActiveOrderDependenciesByRefs, cancelOrderDependency, completeDirectDependenciesForSalesOrderDrop, completeYardDependenciesForTransferDrop, confirmTransferDependencyBatch, createOrderDependency, enrichDispatchOrdersWithDependencies, generateTransferDependencySuggestion, getDependencyInventoryMatrix, getDirectPickupDependencyExecutionBlock, getOrderDependencyOptions, getSalesOrderDependencyExecutionBlock, getTransferDependencyBatch, listOrderDependencies, listTransferDependencyCandidates, markDirectDependencyPickupCompleted, mergeTransferDependencyProposals, normalDispatchGroupTargets, prepareTransferDependencyPalletItem, reconcileCompletedYardTransfersForSalesOrderStart, reconcileOrderDependency, removeTransferDependencyProposalLine, reopenTransferDependencyCandidate, retryTransferDependencyBatch, reviewTransferDependencyCandidate, syncDirectDependencyOperatorProgress, syncOrderDependenciesForTransferOrder, syncOrderDependenciesFromDispatchPlan, updateOrderDependencyMode, updateTransferDependencyBatch, validateDispatchPlanDependencies } from "./order-dependency-repository.js";
 import { activateSmartScmInputFile, importSmartScmSalesCsv, listSmartScmInputFiles, parseSmartScmVendorResponseFile, smartScmInputDownload, storeSmartScmInputFile } from "./smart-scm-import-repository.js";
@@ -160,6 +179,7 @@ import { addSmartScmProposalLine, createSmartScmManualLoad, groupSmartScmProposa
 import { addTransferDependencyProposalLine, searchTransferDependencyProposalItems } from "./transfer-dependency-manual-items.js";
 import { listSmartScmRouteRules, upsertSmartScmRouteRule } from "./smart-scm-route-repository.js";
 import { changedDriverActivityAssignments, dispatchLoadAssignment, normalizeDispatchPlanLoadAssignments, overlayLockedLoadDerivedSchedule, validateDispatchLoadAssignments } from "./dispatch-load-assignment.js";
+import { dispatchLocationsShareYard } from "./dispatch-location.js";
 
 import { executeSmartScmPurchaseProposal } from "./smart-scm-purchase-service.js";
 import {
@@ -431,11 +451,6 @@ function dispatchPlacedScmRefs(plan = {}) {
   return [...refs];
 }
 
-function changedPlacedDispatchScmRefs(changedRefs = [], afterPlan = {}) {
-  const placed = new Set(dispatchPlacedScmRefs(afterPlan));
-  return (changedRefs || []).filter((ref) => placed.has(String(ref || "")));
-}
-
 async function assertNoRestrictedScmDispatchOrders(orderRefs = [], action = "plan") {
   const requestedRefs = [...new Set((orderRefs || [])
     .map((ref) => String(ref || "").trim())
@@ -519,6 +534,33 @@ function dispatchPlanDataSignature({ orders = [], trucks = [] } = {}) {
 
 function dispatchPlanDataChanged(previousPlan = {}, nextPlan = {}) {
   return dispatchPlanDataSignature(previousPlan || {}) !== dispatchPlanDataSignature(nextPlan || {});
+}
+
+function dispatchBinConfirmComparisonValue(plan = {}) {
+  const value = structuredClone({
+    orders: Array.isArray(plan?.orders) ? plan.orders : [],
+    trucks: Array.isArray(plan?.trucks) ? plan.trucks : []
+  });
+  for (const truck of value.trucks) {
+    for (const load of Array.isArray(truck?.loads) ? truck.loads : []) {
+      for (const stop of Array.isArray(load?.stops) ? load.stops : []) {
+        if (!stop?.mbt || typeof stop.mbt !== "object" || Array.isArray(stop.mbt)) continue;
+        delete stop.loadId;
+        delete stop.timing;
+      }
+    }
+  }
+  return value;
+}
+
+function dispatchConfirmPlanDataChanged(previousPlan = {}, nextPlan = {}) {
+  const previousHasBin = binDispatchOrders(previousPlan).length > 0;
+  const nextHasBin = binDispatchOrders(nextPlan).length > 0;
+  if (!previousHasBin || !nextHasBin) {
+    return dispatchPlanDataChanged(previousPlan, nextPlan);
+  }
+  return dispatchPlanDataSignature(dispatchBinConfirmComparisonValue(previousPlan))
+    !== dispatchPlanDataSignature(dispatchBinConfirmComparisonValue(nextPlan));
 }
 
 function dispatchPlanSaveMode(body = {}) {
@@ -1065,7 +1107,7 @@ async function listDispatchOrdersForResponse({ type = null, search = "" } = {}) 
   const searchTerm = String(search || "").trim().slice(0, 120);
   const requestedType = String(type || "").trim().toUpperCase();
   const includeCustom = !requestedType || requestedType === "TO" || requestedType === "CUSTOM";
-  const [orders, customOrders, snapshotOrders, restrictedScmRefs] = await Promise.all([
+  const [orders, customOrders, snapshotOrders, restrictedScmRefs, billedSalesOrders] = await Promise.all([
     listDispatchOrders({ type, search: searchTerm }),
     includeCustom
       ? listDispatchCustomOrders({
@@ -1075,12 +1117,21 @@ async function listDispatchOrdersForResponse({ type = null, search = "" } = {}) 
         })
       : Promise.resolve([]),
     listDispatchSnapshotDerivedOrders({ type }),
-    listRestrictedScmDispatchOrderRefs()
+    listRestrictedScmDispatchOrderRefs(),
+    listBilledSalesOrderFamilyRefs()
   ]);
+  const billedSalesOrderRefs = new Set(billedSalesOrders.flatMap((order) => [order.ref, order.id])
+    .map((ref) => String(ref || "").trim().toLowerCase())
+    .filter(Boolean));
+  const isBilledSalesOrderFamily = (order) => {
+    const type = String(order?.type || "").trim().toUpperCase();
+    if (type !== "SO" && !Array.isArray(order?.childOrders)) return false;
+    return dispatchOrderLogicalRefs(order).some((ref) => billedSalesOrderRefs.has(ref));
+  };
   const currentOrders = filterRestrictedScmOrders([
     ...orders,
     ...customOrders.map(dispatchOrderFromCustomOrder)
-  ], { includeRestricted: false }).filter((order) => {
+  ], { includeRestricted: false }).filter((order) => !isBilledSalesOrderFamily(order)).filter((order) => {
     if (!["PO", "TO", "VRMA"].includes(String(order?.type || "").trim().toUpperCase())) return true;
     return !dispatchOrderLogicalRefs(order).some((ref) => restrictedScmRefs.has(ref));
   });
@@ -1089,7 +1140,7 @@ async function listDispatchOrdersForResponse({ type = null, search = "" } = {}) 
     : snapshotOrders;
   const derivedOrders = filterRestrictedScmOrders(derivedCandidates, {
     includeRestricted: false
-  }).filter((order) => {
+  }).filter((order) => !isBilledSalesOrderFamily(order)).filter((order) => {
     if (!["PO", "TO", "VRMA"].includes(String(order?.type || "").trim().toUpperCase())) return true;
     return !dispatchOrderLogicalRefs(order).some((ref) => restrictedScmRefs.has(ref));
   });
@@ -1133,7 +1184,7 @@ async function listDispatchOrdersForResponse({ type = null, search = "" } = {}) 
   });
   const visibleOrders = filterRestrictedScmOrders(withReconciliation, {
     includeRestricted: false
-  }).filter((order) => {
+  }).filter((order) => !isBilledSalesOrderFamily(order)).filter((order) => {
     if (!["PO", "TO", "VRMA"].includes(String(order?.type || "").trim().toUpperCase())) return true;
     return !dispatchOrderLogicalRefs(order).some((ref) => restrictedScmRefs.has(ref));
   });
@@ -1150,7 +1201,9 @@ async function listScmPurchaseOrdersForResponse(filters = {}, operator = null) {
       orderRef: order.id,
       sourceRef: order.sourcePoRef || order.originalPoRef || order.dispatchRef || order.id,
       sourceId: order.netsuiteId || order.sourceId || order.raw?.netsuite_id || null,
-      status: order.scm?.status || "Queued"
+      status: order.scm?.status || "Hold",
+      scheduleId: order.scm?.scheduleId || null,
+      updatedAt: order.scm?.updatedAt || null
     })),
     { includeDetails: false, view: "dispatch" }
   );
@@ -2855,7 +2908,10 @@ async function expectedPointForDriverJob(job) {
     .filter(Boolean);
   for (const candidate of ownCandidates) {
     const yard = (setup.ownYards || []).find((item) =>
-      [item.code, item.name, item.address].some((value) => normalizedLocationText(value) === normalizedLocationText(candidate))
+      [item.code, item.name, item.address].some((value) =>
+        normalizedLocationText(value) === normalizedLocationText(candidate)
+        || dispatchLocationsShareYard(value, candidate)
+      )
     );
     if (yard && validCoordinate(yard.lat, yard.lng)) {
       return {
@@ -2971,7 +3027,7 @@ async function completeDriverJobOperationalEffects({
   driverRemark = undefined
 } = {}) {
   if (!job?.jobId) throw new Error("Driver job is no longer available.");
-  return withTransaction(async () => {
+  const completion = await withTransaction(async () => {
     const record = await recordDriverJobPhotos(driverLogin, job.jobId, {
       photoDataUrls,
       job,
@@ -3051,6 +3107,85 @@ async function completeDriverJobOperationalEffects({
     }
     return { record, dependencyUpdate, completedCustomOrders };
   });
+  let billedSalesOrderPlanCleanup = null;
+  let billedSalesOrderPlanCleanupWarning = "";
+  if (job.planId) {
+    try {
+      billedSalesOrderPlanCleanup = await cleanupBilledSalesOrderFamiliesFromDispatchPlan({
+        planId: job.planId,
+        actor: `driver:${driverLogin}`
+      });
+      if (billedSalesOrderPlanCleanup.changedPlans.length) {
+        emitAppEvent("dispatch.plan.saved", {
+          planId: job.planId,
+          planDate: job.planDate || "",
+          source: "billed-so-driver-completion-cleanup",
+          refreshOrderPool: true
+        });
+      }
+    } catch (error) {
+      billedSalesOrderPlanCleanupWarning = String(error?.message || error);
+      console.error("Billed SO plan cleanup after driver completion failed:", error);
+    }
+  }
+  return {
+    ...completion,
+    billedSalesOrderPlanCleanup,
+    billedSalesOrderPlanCleanupWarning
+  };
+}
+
+function driverRequestClientVersion(req) {
+  return String(req.get?.(DRIVER_PWA_VERSION_HEADER) || DRIVER_PWA_CURRENT_VERSION).trim();
+}
+
+async function authorizedDriverDayJobs(req, planDate) {
+  const options = {
+    date: planDate,
+    clientVersion: driverRequestClientVersion(req),
+    minimumClientVersion: DRIVER_PWA_MINIMUM_VERSION
+  };
+  try {
+    return {
+      allowBin: false,
+      boundary: null,
+      result: await getDriverDayJobs(req.driverLogin, options)
+    };
+  } catch (error) {
+    if (error?.code !== "MBT_DRIVER_BIN_DISABLED") throw error;
+  }
+  const boundary = await authorizeMbtDriverBinProjection({
+    driverLogin: req.driverLogin,
+    planDate
+  });
+  const result = await getDriverDayJobs(req.driverLogin, { ...options, allowBin: true });
+  assertMbtDriverBinProjectionScope(result.jobs, boundary);
+  return { allowBin: true, boundary, result };
+}
+
+async function authorizedDriverNextJobContext(req, { date = "" } = {}) {
+  const options = {
+    date,
+    clientVersion: driverRequestClientVersion(req),
+    minimumClientVersion: DRIVER_PWA_MINIMUM_VERSION
+  };
+  try {
+    return {
+      allowBin: false,
+      boundary: null,
+      context: await getDriverNextJobContext(req.driverLogin, options)
+    };
+  } catch (error) {
+    if (error?.code !== "MBT_DRIVER_BIN_DISABLED") throw error;
+  }
+  const planDate = normalizePlanDate(date || localDateDaysAgo(0));
+  const boundary = await authorizeMbtDriverBinProjection({
+    driverLogin: req.driverLogin,
+    planDate
+  });
+  const context = await getDriverNextJobContext(req.driverLogin, { ...options, allowBin: true });
+  assertMbtDriverBinProjectionScope(context.jobs, boundary);
+  return { allowBin: true, boundary, context };
 }
 
 async function applyDriverOfflineEvent({
@@ -3064,6 +3199,15 @@ async function applyDriverOfflineEvent({
   emissionSource = "offline_sync"
 }) {
   const driverLogin = event.driverLogin;
+  const mbtApplication = await applyMbtDriverBinOfflineEvent({
+    event,
+    job,
+    manifest,
+    photoReferences
+  });
+  if (mbtApplication) {
+    return mbtApplication;
+  }
   if (event.eventType === "job_started") {
     if (!job) throw new Error("The job to start is unavailable.");
     if (job.stopType === "pickup" || job.stopType === "dropoff") {
@@ -3269,7 +3413,8 @@ async function driverOfflineReviewWithCurrentPlan(eventId) {
   if (!detail?.case) return null;
   const reviewCase = detail.case;
   const currentPlan = await getDriverDayJobs(reviewCase.driverLogin, {
-    date: reviewCase.planDate
+    date: reviewCase.planDate,
+    allowBin: true
   });
   const entries = materializeDriverOfflineJobs(
     currentPlan.jobs || [],
@@ -3322,7 +3467,8 @@ async function applyDriverOfflineReviewResolution({ event, action, effectiveJobI
   const detail = await driverOfflineReviewWithCurrentPlan(event.eventId);
   if (!detail?.case) throw Object.assign(new Error("Offline review case was not found."), { status: 404 });
   const currentPlan = await getDriverDayJobs(event.driverLogin, {
-    date: event.planDate
+    date: event.planDate,
+    allowBin: true
   });
   let job = null;
   if (action === "apply_original") {
@@ -4165,7 +4311,10 @@ async function verifyDriverOfflinePhotoObject(photo, actor) {
 async function requireOperator(req, res, next) {
   try {
     const operator = await getOperatorByToken(bearerToken(req));
-    if (!operator) return res.status(401).json({ error: "Login required" });
+    if (!operator) {
+      res.setHeader("cache-control", "no-store");
+      return res.status(401).json({ error: "Login required" });
+    }
     req.operator = operator;
     next();
   } catch (error) {
@@ -4270,17 +4419,11 @@ function requireDispatcher(req, res, next) {
 }
 
 function roleHomeRoute(operator) {
-  const role = normalizedOperatorRole(operator);
-  if (role === "admin") return "/admin";
-  if (role === "dispatcher") return "/dispatch";
-  if (["scm", "scm_staff"].includes(role)) return "/scm";
-  if (role === "yard_manager") return "/control";
-  if (role === "sales") return "/sales";
-  if (role === "operator") return "/operator";
-  return "/";
+  return operatorHomeRoute(operator);
 }
 
 function sendRoleForbidden(res, operator, message) {
+  res.setHeader("cache-control", "no-store");
   return res.status(403).json({ error: message, redirect: roleHomeRoute(operator) });
 }
 
@@ -6818,7 +6961,9 @@ app.use((req, res, next) => {
     res.setHeader("Service-Worker-Allowed", "/");
   } else if (["/scm/netsuite-po", "/scm-netsuite-po.html", "/scm/vendors", "/scm-vendors.html"].includes(req.path)) {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-  } else if (req.path.endsWith(".webmanifest") || ["/", "/operator", "/driver", "/control", "/control/returns", "/admin", "/admin/accounts", "/admin/sync", "/admin/reconciliation", "/admin/printers", "/admin/photo-storage", "/admin/audit", "/admin/return-automation", "/dispatch", "/dispatch/custom-orders", "/dispatch/driver-pwa", "/dispatch/offline-review", "/sales", "/sales/planning", "/sales/schedule", "/sales/monitor", "/sales/printing", "/sales/in-outbound-record", "/sales/returns", "/dispatch/loaded-export", "/dispatch/in-outbound-record", "/control/in-outbound-record", "/dispatch/po-to-schedule", "/scm/smart", "/scm/printers", "/scm/route-rules", "/scm/schedule-formatting", "/operator.html", "/driver.html", "/control.html", "/admin.html", "/dispatch-menu.html", "/dispatch-custom-orders.html", "/dispatch-offline-review.html", "/sales.html", "/sales-printing.html", "/dispatch-loaded-export.html", "/scm-smart.html", "/scm-printers.html", "/scm-route-rules.html", "/scm-schedule-formatting.html"].includes(req.path)) {
+  } else if (req.path === "/mbt" || req.path.startsWith("/mbt/")) {
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  } else if (req.path.endsWith(".webmanifest") || ["/", "/operator", "/driver", "/control", "/control/returns", "/admin", "/admin/accounts", "/admin/sync", "/admin/reconciliation", "/admin/printers", "/admin/photo-storage", "/admin/audit", "/admin/return-automation", "/admin/mbt-gates", "/dispatch", "/dispatch/custom-orders", "/dispatch/driver-pwa", "/dispatch/offline-review", "/sales", "/sales/planning", "/sales/schedule", "/sales/monitor", "/sales/printing", "/sales/in-outbound-record", "/sales/returns", "/dispatch/loaded-export", "/dispatch/in-outbound-record", "/control/in-outbound-record", "/dispatch/po-to-schedule", "/scm/smart", "/scm/printers", "/scm/route-rules", "/scm/schedule-formatting", "/operator.html", "/driver.html", "/control.html", "/admin.html", "/dispatch-menu.html", "/dispatch-custom-orders.html", "/dispatch-offline-review.html", "/sales.html", "/sales-printing.html", "/dispatch-loaded-export.html", "/scm-smart.html", "/scm-printers.html", "/scm-route-rules.html", "/scm-schedule-formatting.html"].includes(req.path)) {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   }
   next();
@@ -8124,6 +8269,7 @@ app.get("/api/sales/public-access", async (_req, res, next) => {
 app.use("/api/scm", requireOperator, requireScmAccess);
 app.use("/api/dispatch", requireOperatorOrPublicSalesRead, requireDispatchAccess);
 app.use("/api/sales", requireSalesOperator, requireSalesAccess);
+app.use("/api/mbt", requireOperator, createMbtRouter());
 
 app.get("/api/dispatch/offline-review/count", requireDispatcher, async (_req, res, next) => {
   try {
@@ -9396,7 +9542,7 @@ app.post("/api/dispatch/plan-snapshots/:snapshotId/restore", requireOperator, re
     const changedScmRefs = changedDispatchScmRefs(currentPlanBeforeRestore, restoreCandidate);
     await assertScmReconciliationOrderEditable({ orderRefs: changedScmRefs });
     await assertNoRestrictedScmDispatchOrders(
-      changedPlacedDispatchScmRefs(changedScmRefs, restoreCandidate),
+      changedPlacedDispatchScmAssignmentRefs(currentPlanBeforeRestore, restoreCandidate),
       "restore this snapshot"
     );
     const dependencyStructureChanges = await assertNoConsolidationStructureConflict(
@@ -9563,7 +9709,7 @@ app.put("/api/dispatch/plans/:id", reportDispatchSaveTiming, requireOperator, re
     });
     await assertScmReconciliationOrderEditable({ orderRefs: changedScmRefs });
     await assertNoRestrictedScmDispatchOrders(
-      changedPlacedDispatchScmRefs(changedScmRefs, {
+      changedPlacedDispatchScmAssignmentRefs(previousPlan, {
         ...previousPlan,
         orders: cleanOrders,
         trucks: cleanTrucks
@@ -9792,7 +9938,7 @@ app.post("/api/dispatch/plans/:id/confirm", requireOperator, requireDispatcher, 
       });
       await assertScmReconciliationOrderEditable({ orderRefs: changedScmRefs });
       await assertNoRestrictedScmDispatchOrders(
-        changedPlacedDispatchScmRefs(changedScmRefs, {
+        changedPlacedDispatchScmAssignmentRefs(previousPlan, {
           ...previousPlan,
           orders: requestedOrders,
           trucks: requestedTrucks
@@ -9836,7 +9982,7 @@ app.post("/api/dispatch/plans/:id/confirm", requireOperator, requireDispatcher, 
         trucks: requestedTrucks
       });
       if (dependencyConflicts.length) return sendDispatchDependencyConflictResponse(res, dependencyConflicts);
-      if (dispatchPlanDataChanged(
+      if (dispatchConfirmPlanDataChanged(
         { orders: previousPlan.orders || [], trucks: previousPlan.trucks || [] },
         { orders: requestedOrders, trucks: requestedTrucks }
       )) {
@@ -9859,7 +10005,27 @@ app.post("/api/dispatch/plans/:id/confirm", requireOperator, requireDispatcher, 
     if (finalAssignmentConflicts.length) return sendDispatchLoadAssignmentConflictResponse(res, finalAssignmentConflicts);
     const finalDependencyConflicts = await validateDispatchPlanDependencies(planForConfirm);
     if (finalDependencyConflicts.length) return sendDispatchDependencyConflictResponse(res, finalDependencyConflicts);
-    const plan = await confirmDispatchPlan(req.params.id, { note: req.body?.note || "" });
+    const binConfirmationRequired = binDispatchOrders(planForConfirm).length > 0;
+    let binConfirmationCapability = null;
+    if (binConfirmationRequired) {
+      const pilotAuthorized = operatorHasAnyRole(req.operator, ["admin", "dispatcher"]);
+      await authorizeMbtPhase3Capability({ capability: "binDispatch", pilotAuthorized });
+      binConfirmationCapability = {
+        environmentEnabled: true,
+        databaseEnabled: true,
+        pilotAuthorized: true
+      };
+    }
+    const plan = binConfirmationRequired
+      ? await confirmMbtBinDispatchPlan({
+          actor: {
+            operatorId: String(req.operator?.id || ""),
+            roles: normalizedOperatorRoles(req.operator)
+          },
+          planId: req.params.id,
+          note: req.body?.note || ""
+        }, { capability: binConfirmationCapability })
+      : await confirmDispatchPlan(req.params.id, { note: req.body?.note || "" });
     const followupWarnings = [];
     const followupContext = {
       plan,
@@ -10033,6 +10199,43 @@ app.put("/api/dispatch/setup", requireDispatcher, async (req, res, next) => {
       truckCount: payload.trucks.filter((truck) => truck.active !== false).length
     });
     res.json(payload);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put("/api/dispatch/setup/trucks/:id/capabilities", requireDispatcher, async (req, res, next) => {
+  res.setHeader("cache-control", "no-store");
+  try {
+    const idempotencyKey = String(req.get("idempotency-key") || "").trim();
+    if (!idempotencyKey) {
+      return res.status(400).json({
+        code: "MBT_IDEMPOTENCY_KEY_REQUIRED",
+        error: "An Idempotency-Key header is required."
+      });
+    }
+    const suppliedCorrelationId = String(req.get("x-correlation-id") || "").trim();
+    const suppliedRequestId = String(req.get("x-request-id") || "").trim();
+    const result = await withDispatchFleetPlanningLock(() => updateDispatchTruckCapabilities({
+      actor: {
+        operatorId: String(req.operator?.id || "").trim(),
+        roles: normalizedOperatorRoles(req.operator)
+      },
+      truckId: req.params.id,
+      expectedRevision: req.body?.expectedRevision,
+      capability: req.body?.capability,
+      reason: req.body?.reason,
+      idempotencyKey,
+      correlationId: suppliedCorrelationId && suppliedCorrelationId.length <= 160 ? suppliedCorrelationId : crypto.randomUUID(),
+      requestId: suppliedRequestId && suppliedRequestId.length <= 160 ? suppliedRequestId : crypto.randomUUID()
+    }));
+    res.setHeader("x-mbt-idempotent-replay", String(result.replayed));
+    emitAppEvent("dispatch.setup.updated", {
+      resourceType: "truck",
+      resourceId: req.params.id,
+      capabilityChanged: true
+    });
+    res.status(result.status).json(result.body);
   } catch (error) {
     next(error);
   }
@@ -12272,7 +12475,7 @@ app.put("/api/dispatch/plan", async (req, res, next) => {
     });
     await assertScmReconciliationOrderEditable({ orderRefs: changedScmRefs });
     await assertNoRestrictedScmDispatchOrders(
-      changedPlacedDispatchScmRefs(changedScmRefs, {
+      changedPlacedDispatchScmAssignmentRefs(previousPlan, {
         ...previousPlan,
         orders: cleanOrders,
         trucks: cleanTrucks
@@ -12427,6 +12630,10 @@ app.get("/admin/printers", (req, res) => {
   res.sendFile(path.join(publicDir, "scm-printers.html"));
 });
 
+app.get("/admin/mbt-gates", (_req, res) => {
+  res.sendFile(path.join(publicDir, "mbt-gates.html"));
+});
+
 app.get(["/sales", "/sales/returns"], (req, res) => {
   res.sendFile(path.join(publicDir, "sales.html"));
 });
@@ -12521,6 +12728,26 @@ app.get("/scm/netsuite-po", (req, res) => {
 
 app.get("/scm/vendors", (req, res) => {
   res.sendFile(path.join(publicDir, "scm-vendors.html"));
+});
+
+app.get("/mbt", (_req, res) => {
+  res.sendFile(path.join(publicDir, "mbt-home.html"));
+});
+
+app.get("/mbt/config", (_req, res) => {
+  res.sendFile(path.join(publicDir, "mbt-config.html"));
+});
+
+app.get("/mbt/frontdesk", (_req, res) => {
+  res.sendFile(path.join(publicDir, "mbt-frontdesk.html"));
+});
+
+app.get("/mbt/billing", (_req, res) => {
+  res.sendFile(path.join(publicDir, "mbt-billing.html"));
+});
+
+app.get("/mbt/assets", (_req, res) => {
+  res.sendFile(path.join(publicDir, "mbt-assets.html"));
 });
 
 app.get("/scm/printers", (req, res) => {
@@ -12751,15 +12978,23 @@ app.use("/api/driver", (_req, res, next) => {
 
 app.use("/api/driver", driverPwaVersionGate);
 
-app.get("/api/driver/client-version", (req, res) => {
-  res.setHeader("Cache-Control", "no-store");
-  res.setHeader("Pragma", "no-cache");
-  res.setHeader("Vary", DRIVER_PWA_VERSION_HEADER);
-  res.json({
-    ...driverPwaVersionDetails(req.get(DRIVER_PWA_VERSION_HEADER)),
-    preserveLocalEvidence: true,
-    guidance: "If reopenRequired is true, do not clear browser data. Close every Driver PWA window, then reopen it to load the latest version."
-  });
+app.get("/api/driver/client-version", async (req, res, next) => {
+  try {
+    const mode = await getDriverOfflineMode();
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Vary", DRIVER_PWA_VERSION_HEADER);
+    res.json({
+      ...driverPwaVersionDetails(req.get(DRIVER_PWA_VERSION_HEADER)),
+      offlineEnabled: mode.enabled,
+      offlineModeRevision: mode.revision,
+      offlineModeUpdatedAt: mode.updatedAt,
+      preserveLocalEvidence: true,
+      guidance: "If reopenRequired is true, do not clear browser data. Close every Driver PWA window, then reopen it to load the latest version."
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.get("/api/driver/network-health", (_req, res) => {
@@ -12791,21 +13026,44 @@ app.post("/api/driver/login", async (req, res, next) => {
         userAgent: req.get("user-agent") || ""
       }
     });
-    const dayState = await getDriverDayState(login, { samsaraAccounts: samsaraAccountsForDriver(driver) });
+    const [dayState, driverMode] = await Promise.all([
+      getDriverDayState(login, {
+        samsaraAccounts: samsaraAccountsForDriver(driver),
+        // Day-state contains no BIN evidence snapshot; allowing the typed stop
+        // internally prevents a closed execution gate from breaking login.
+        allowBin: true
+      }),
+      getDriverOfflineMode()
+    ]);
     await writeAudit({
       actorType: "driver",
       source: "auth",
       action: "driver.login",
       details: { login, ip: req.ip || "", userAgent: req.get("user-agent") || "" }
     });
-    res.json({ token: sessionResult.token, driver: publicDriver(driver), dayState });
+    res.json({
+      token: sessionResult.token,
+      driver: publicDriver(driver),
+      dayState,
+      offlineEnabled: driverMode.enabled,
+      offlineModeRevision: driverMode.revision
+    });
   } catch (error) {
     next(error);
   }
 });
 
-app.get("/api/driver/me", requireDriver, (req, res) => {
-  res.json({ driver: publicDriver(req.driver) });
+app.get("/api/driver/me", requireDriver, async (req, res, next) => {
+  try {
+    const mode = await getDriverOfflineMode();
+    res.json({
+      driver: publicDriver(req.driver),
+      offlineEnabled: mode.enabled,
+      offlineModeRevision: mode.revision
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.post("/api/driver/sync-status", requireDriver, async (req, res, next) => {
@@ -12834,14 +13092,22 @@ app.post("/api/driver/sync-status", requireDriver, async (req, res, next) => {
 
 app.get("/api/driver/day-plan", requireDriver, async (req, res, next) => {
   try {
+    const mode = await getDriverOfflineMode();
+    if (!mode.enabled) {
+      return res.status(409).json({
+        code: "DRIVER_OFFLINE_MODE_DISABLED",
+        error: "Admin has set the Driver PWA to online-only mode. A saved offline route is not available."
+      });
+    }
     const deviceId = driverDeviceId(req, { required: true });
     const requestedDate = req.query.date ? normalizePlanDate(req.query.date) : "";
     const dayState = await getDriverDayState(req.driverLogin, {
       samsaraAccounts: samsaraAccountsForDriver(req.driver),
-      date: requestedDate
+      date: requestedDate,
+      allowBin: true
     });
     const planDate = requestedDate || normalizePlanDate(dayState.planDate);
-    const materialized = await getDriverDayJobs(req.driverLogin, { date: planDate });
+    const { result: materialized } = await authorizedDriverDayJobs(req, planDate);
     if (!materialized.planId || !materialized.jobs.length) {
       return res.status(404).json({
         code: "DRIVER_PLAN_NOT_FOUND",
@@ -13056,7 +13322,8 @@ app.get("/api/driver/day-state", requireDriver, async (req, res, next) => {
   try {
     res.json({
       state: await getDriverDayState(req.driverLogin, {
-        samsaraAccounts: samsaraAccountsForDriver(req.driver)
+        samsaraAccounts: samsaraAccountsForDriver(req.driver),
+        allowBin: true
       })
     });
   } catch (error) {
@@ -13107,7 +13374,7 @@ app.post("/api/driver/dvir", requireDriver, async (req, res, next) => {
     const type = req.body?.type === "post" ? "post" : "pre";
     const photoDataUrls = requiredPhotoDataUrls(req.body?.photoDataUrls, 4);
     const samsaraAccounts = samsaraAccountsForDriver(req.driver);
-    const state = await getDriverDayState(req.driverLogin, { samsaraAccounts });
+    const state = await getDriverDayState(req.driverLogin, { samsaraAccounts, allowBin: true });
     if (type === "post" && !state.allJobsComplete) {
       return res.status(409).json({ error: "MBBS post-trip inspection is only available after all assigned stops are complete.", state });
     }
@@ -13118,7 +13385,7 @@ app.post("/api/driver/dvir", requireDriver, async (req, res, next) => {
     );
     const receipt = await beginDriverForegroundAction(req, "dvir_captured", type);
     const result = await runDriverForegroundAction(receipt, async () => {
-      const liveState = await getDriverDayState(req.driverLogin, { samsaraAccounts });
+      const liveState = await getDriverDayState(req.driverLogin, { samsaraAccounts, allowBin: true });
       if (foregroundDvirEvent) {
         const lockedEvent = await getDriverOfflineEvent(foregroundDvirEvent.eventId);
         if (lockedEvent?.result?.samsaraReconciled === true) {
@@ -13360,7 +13627,8 @@ app.post("/api/driver/offline-events/:eventId/reconcile-dvir", requireDriver, as
           alreadyReconciled: true,
           state: await getDriverDayState(req.driverLogin, {
             samsaraAccounts,
-            date: lockedEvent.planDate
+            date: lockedEvent.planDate,
+            allowBin: true
           }),
           reconciliation: lockedEvent.result
         } };
@@ -13396,11 +13664,12 @@ app.post("/api/driver/offline-events/:eventId/reconcile-dvir", requireDriver, as
           deviceId: lockedEvent.deviceId,
           touch: false
         }),
-        getDriverDayJobs(req.driverLogin, { date: lockedEvent.planDate })
+        getDriverDayJobs(req.driverLogin, { date: lockedEvent.planDate, allowBin: true })
       ]);
       const currentState = await getDriverDayState(req.driverLogin, {
         samsaraAccounts,
-        date: lockedEvent.planDate
+        date: lockedEvent.planDate,
+        allowBin: true
       });
       const capturedTruckPlate = lockedEvent.details?.truckPlate
         || manifest?.dayState?.truckPlate
@@ -13604,11 +13873,13 @@ app.post("/api/driver/offline-events/:eventId/reconcile-dvir", requireDriver, as
             );
           }
           const currentPlan = await getDriverDayJobs(req.driverLogin, {
-            date: lockedEvent.planDate
+            date: lockedEvent.planDate,
+            allowBin: true
           });
           const currentState = await getDriverDayState(req.driverLogin, {
             samsaraAccounts,
-            date: lockedEvent.planDate
+            date: lockedEvent.planDate,
+            allowBin: true
           });
           const capturedTruckPlate = lockedEvent.details?.truckPlate
             || preparation.manifest?.dayState?.truckPlate
@@ -13821,7 +14092,10 @@ app.post("/api/driver/offline-events/:eventId/reconcile-duty", requireDriver, as
           status: 409
         };
       }
-      const currentPlan = await getDriverDayJobs(req.driverLogin, { date: lockedEvent.planDate });
+      const currentPlan = await getDriverDayJobs(req.driverLogin, {
+        date: lockedEvent.planDate,
+        allowBin: true
+      });
       const effectiveJobId = lockedEvent.effectiveJobId || lockedEvent.jobId;
       const currentEntry = materializeDriverOfflineJobs(
         currentPlan.jobs || [],
@@ -13961,7 +14235,8 @@ app.post("/api/driver/offline-events/:eventId/reconcile-duty", requireDriver, as
             );
           }
           const currentPlan = await getDriverDayJobs(req.driverLogin, {
-            date: lockedEvent.planDate
+            date: lockedEvent.planDate,
+            allowBin: true
           });
           const effectiveJobId = lockedEvent.effectiveJobId || lockedEvent.jobId;
           const currentEntry = materializeDriverOfflineJobs(
@@ -14299,15 +14574,52 @@ async function nextJobOfflineRouteBootstrap(req, state, context) {
 
 app.get("/api/driver/next-job", requireDriver, async (req, res, next) => {
   try {
-    const [state, jobContext, rest] = await Promise.all([
-      getDriverDayState(req.driverLogin, {
-        samsaraAccounts: samsaraAccountsForDriver(req.driver)
-      }),
-      getDriverNextJobContext(req.driverLogin),
-      getActiveDriverRest(req.driverLogin)
+    const [driverMode, { state, jobContext, rest }] = await Promise.all([
+      getDriverOfflineMode(),
+      (async () => {
+      try {
+        const [state, jobContext, rest] = await Promise.all([
+          getDriverDayState(req.driverLogin, {
+            samsaraAccounts: samsaraAccountsForDriver(req.driver),
+            allowBin: false
+          }),
+          getDriverNextJobContext(req.driverLogin, {
+            clientVersion: driverRequestClientVersion(req),
+            minimumClientVersion: DRIVER_PWA_MINIMUM_VERSION
+          }),
+          getActiveDriverRest(req.driverLogin)
+        ]);
+        return { state, jobContext, rest };
+      } catch (error) {
+        if (error?.code !== "MBT_DRIVER_BIN_DISABLED") throw error;
+      }
+
+      const [{ allowBin, context: jobContext }, rest] = await Promise.all([
+        authorizedDriverNextJobContext(req),
+        getActiveDriverRest(req.driverLogin)
+      ]);
+      const state = await getDriverDayState(req.driverLogin, {
+        samsaraAccounts: samsaraAccountsForDriver(req.driver),
+        allowBin
+      });
+      return { state, jobContext, rest };
+      })()
     ]);
     const job = jobContext.job;
     const routeBootstrap = await nextJobOfflineRouteBootstrap(req, state, jobContext);
+    const deviceId = driverDeviceId(req);
+    const pendingCompletion = job?.jobId
+      && routeBootstrap?.currentJobFingerprint
+      && deviceId
+      ? await findOpenDriverOfflineJobCompletion({
+          driverLogin: req.driverLogin,
+          deviceId,
+          planDate: jobContext.planDate || job.planDate,
+          jobId: job.jobId,
+          jobFingerprint: routeBootstrap.currentJobFingerprint,
+          jobPredecessorFingerprint: routeBootstrap.predecessorFingerprint
+        })
+      : null;
     if (
       state.samsaraEnabled
       && state.truckPlate
@@ -14320,13 +14632,274 @@ app.get("/api/driver/next-job", requireDriver, async (req, res, next) => {
         error: `MBBS pre-trip inspection must be received by Samsara before assigned jobs.${suffix}`,
         state,
         job,
-        routeBootstrap
+        pendingCompletion,
+        routeBootstrap,
+        offlineEnabled: driverMode.enabled,
+        offlineModeRevision: driverMode.revision
       });
     }
     const restSummary = await getDriverRestSummary(req.driverLogin, {
       planDate: rest?.planDate || job?.planDate || ""
     });
-    res.json({ state, job, rest, restSummary, routeBootstrap });
+    res.json({
+      state,
+      job,
+      rest,
+      restSummary,
+      pendingCompletion,
+      routeBootstrap,
+      offlineEnabled: driverMode.enabled,
+      offlineModeRevision: driverMode.revision
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+function driverOnlineBinEventId(value) {
+  const eventId = String(value || "").trim().toLowerCase();
+  if (!DRIVER_FOREGROUND_EVENT_ID_PATTERN.test(eventId)) {
+    throw Object.assign(new Error("A valid online BIN event ID is required."), {
+      status: 400,
+      code: "DRIVER_ONLINE_BIN_EVENT_ID_INVALID"
+    });
+  }
+  return eventId;
+}
+
+function driverOnlineBinPhotos(value) {
+  if (!Array.isArray(value)) {
+    throw Object.assign(new Error("Online BIN photo evidence must be an array."), {
+      status: 400,
+      code: "DRIVER_ONLINE_BIN_PHOTOS_INVALID"
+    });
+  }
+  return value.map((photo, index) => {
+    const descriptor = {
+      photoId: String(photo?.photoId || "").trim().toLowerCase(),
+      ordinal: Number(photo?.ordinal ?? index),
+      objectReference: String(photo?.objectReference || "").trim(),
+      sha256: String(photo?.sha256 || "").trim().toLowerCase(),
+      byteSize: Number(photo?.byteSize || 0),
+      mimeType: String(photo?.mimeType || "image/jpeg").trim().toLowerCase()
+    };
+    const referenceParts = descriptor.objectReference.replace(/^r2:\/\//u, "").split("/");
+    if (
+      !DRIVER_FOREGROUND_EVENT_ID_PATTERN.test(descriptor.photoId)
+      || !Number.isSafeInteger(descriptor.ordinal)
+      || descriptor.ordinal < 0
+      || referenceParts[0] !== "driver"
+      || String(referenceParts[5] || "").toLowerCase() !== descriptor.photoId
+    ) {
+      throw Object.assign(new Error("Online BIN photo evidence is outside its upload scope."), {
+        status: 409,
+        code: "DRIVER_ONLINE_BIN_PHOTO_SCOPE_INVALID"
+      });
+    }
+    return descriptor;
+  });
+}
+
+async function applyDriverOnlineBinEvent(req, eventType) {
+  const deviceId = driverDeviceId(req, { required: true });
+  const eventId = driverOnlineBinEventId(req.body?.eventId);
+  const clientSequence = Number(req.body?.clientSequence);
+  if (!Number.isSafeInteger(clientSequence) || clientSequence < 1) {
+    throw Object.assign(new Error("A positive online BIN client sequence is required."), {
+      status: 400,
+      code: "DRIVER_ONLINE_BIN_SEQUENCE_INVALID"
+    });
+  }
+  const photos = eventType === "job_completed"
+    ? driverOnlineBinPhotos(req.body?.photos)
+    : [];
+  const existingResult = await query(
+    `SELECT source_event_id::text, manifest_id::text, client_sequence,
+            event_type, driver_login, device_id, job_id,
+            device_occurred_at, server_received_at
+       FROM mbt_driver_bin_event_applications
+      WHERE source_event_id = $1::uuid
+      LIMIT 1`,
+    [eventId]
+  );
+  const existing = existingResult.rows[0];
+  if (existing) {
+    if (
+      String(existing.driver_login).toLowerCase() !== String(req.driverLogin).toLowerCase()
+      || String(existing.device_id) !== deviceId
+      || String(existing.event_type) !== eventType
+      || String(existing.job_id) !== String(req.params.jobId)
+      || Number(existing.client_sequence) !== clientSequence
+    ) {
+      throw Object.assign(new Error("This online BIN event ID was already used for another action."), {
+        status: 409,
+        code: "DRIVER_ONLINE_BIN_EVENT_ID_CONFLICT"
+      });
+    }
+    const manifest = await getDriverOfflineManifest(existing.manifest_id, {
+      driverLogin: req.driverLogin,
+      deviceId,
+      touch: false
+    });
+    const job = manifest?.jobs?.find(
+      (candidate) => String(candidate.jobId) === String(existing.job_id)
+    );
+    if (!manifest || !job) {
+      throw Object.assign(new Error("The durable online BIN receipt cannot be replayed safely."), {
+        status: 409,
+        code: "DRIVER_ONLINE_BIN_REPLAY_UNAVAILABLE"
+      });
+    }
+    const application = await applyMbtDriverBinOfflineEvent({
+      event: {
+        eventId,
+        eventType,
+        driverLogin: req.driverLogin,
+        deviceId,
+        manifestId: manifest.manifestId,
+        clientSequence,
+        jobId: job.jobId,
+        occurredAt: existing.device_occurred_at,
+        receivedAt: existing.server_received_at,
+        details: req.body?.details && typeof req.body.details === "object"
+          ? req.body.details
+          : {},
+        photos
+      },
+      job,
+      manifest,
+      photoReferences: photos.map((photo) => photo.objectReference)
+    });
+    const next = await authorizedDriverNextJobContext(req);
+    const state = await getDriverDayState(req.driverLogin, {
+      samsaraAccounts: samsaraAccountsForDriver(req.driver),
+      allowBin: next.allowBin
+    });
+    return {
+      application,
+      eventId,
+      job: next.context.job,
+      state
+    };
+  }
+  const target = await authorizedDriverNextJobContext(req);
+  const currentJob = target.context.job;
+  if (!currentJob || String(currentJob.jobId) !== String(req.params.jobId)) {
+    throw Object.assign(new Error("This is no longer the next assigned BIN stop. Refresh and try again."), {
+      status: 409,
+      code: "DRIVER_ONLINE_BIN_TARGET_CHANGED"
+    });
+  }
+  if (!currentJob.mbt?.schemaVersion) {
+    throw Object.assign(new Error("The requested stop is not a BIN Driver job."), {
+      status: 409,
+      code: "DRIVER_ONLINE_BIN_JOB_REQUIRED"
+    });
+  }
+
+  const planDate = normalizePlanDate(target.context.planDate || currentJob.planDate);
+  const [dayState, dayJobs] = await Promise.all([
+    getDriverDayState(req.driverLogin, {
+      samsaraAccounts: samsaraAccountsForDriver(req.driver),
+      date: planDate,
+      allowBin: true
+    }),
+    authorizedDriverDayJobs(req, planDate)
+  ]);
+  const manifest = await persistDriverOfflineDayPlan({
+    // The action ID also owns its server-side manifest. A concurrent retry
+    // therefore receives the same generation time and immutable event clock.
+    manifestId: eventId,
+    driverLogin: req.driverLogin,
+    deviceId,
+    planMetadata: {
+      planId: dayJobs.result.planId,
+      planDate: dayJobs.result.planDate,
+      planRevision: dayJobs.result.revision
+    },
+    jobs: dayJobs.result.jobs,
+    driverProfile: publicDriver(req.driver),
+    dayState,
+    samsaraWorkflowEnabled: driverSamsaraWorkflowEnabled(req.driver)
+  });
+  const job = manifest.jobs.find((candidate) => String(candidate.jobId) === String(currentJob.jobId));
+  if (!job) {
+    throw Object.assign(new Error("The current BIN stop is missing from the live route."), {
+      status: 409,
+      code: "DRIVER_ONLINE_BIN_MANIFEST_INVALID"
+    });
+  }
+
+  for (const photo of photos) {
+    await verifyDriverOfflinePhotoObject(photo, {
+      id: req.driverLogin,
+      login: req.driverLogin,
+      role: "driver"
+    });
+  }
+  const manifestGeneratedAt = new Date(manifest.generatedAt).getTime();
+  const occurredAt = new Date(manifestGeneratedAt + 1);
+  const receivedAt = new Date(Math.max(Date.now(), occurredAt.getTime()));
+  const event = {
+    eventId,
+    eventType,
+    driverLogin: req.driverLogin,
+    deviceId,
+    manifestId: manifest.manifestId,
+    clientSequence,
+    jobId: job.jobId,
+    occurredAt: occurredAt.toISOString(),
+    receivedAt: receivedAt.toISOString(),
+    details: req.body?.details && typeof req.body.details === "object"
+      ? req.body.details
+      : {},
+    photos
+  };
+  const application = await applyMbtDriverBinOfflineEvent({
+    event,
+    job,
+    manifest,
+    photoReferences: photos.map((photo) => photo.objectReference)
+  });
+  const next = await authorizedDriverNextJobContext(req);
+  const state = await getDriverDayState(req.driverLogin, {
+    samsaraAccounts: samsaraAccountsForDriver(req.driver),
+    allowBin: next.allowBin
+  });
+  return {
+    application,
+    eventId,
+    job: next.context.job,
+    state
+  };
+}
+
+app.post("/api/driver/jobs/:jobId/bin/start", requireDriver, async (req, res, next) => {
+  try {
+    const result = await applyDriverOnlineBinEvent(req, "job_started");
+    emitAppEvent("driver.job.started", {
+      driverLogin: req.driverLogin,
+      jobId: req.params.jobId,
+      stopType: "bin",
+      source: "online"
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/driver/jobs/:jobId/bin/complete", requireDriver, async (req, res, next) => {
+  try {
+    const result = await applyDriverOnlineBinEvent(req, "job_completed");
+    emitAppEvent("driver.job.completed", {
+      driverLogin: req.driverLogin,
+      jobId: req.params.jobId,
+      stopType: "bin",
+      nextJobId: result.job?.jobId || null,
+      source: "online"
+    });
+    res.json(result);
   } catch (error) {
     next(error);
   }
@@ -14507,7 +15080,10 @@ app.post("/api/driver/jobs/:jobId/confirm-truck-switch", requireDriver, async (r
         await startDriverJob(req.driverLogin, nextJob.jobId, { job: nextJob });
         nextJob = await getNextDriverJob(req.driverLogin);
       }
-      const state = await getDriverDayState(req.driverLogin, { samsaraAccounts: samsaraAccountsForDriver(req.driver) });
+      const state = await getDriverDayState(req.driverLogin, {
+        samsaraAccounts: samsaraAccountsForDriver(req.driver),
+        allowBin: true
+      });
       emitAppEvent("driver.truck.switched", {
         driverLogin: req.driverLogin,
         jobId: job.jobId,
@@ -14589,7 +15165,10 @@ app.post("/api/driver/jobs/:jobId/skip-samsara", requireDriver, async (req, res,
         await startDriverJob(req.driverLogin, nextJob.jobId, { job: nextJob });
         nextJob = await getNextDriverJob(req.driverLogin);
       }
-      const state = await getDriverDayState(req.driverLogin, { samsaraAccounts: samsaraAccountsForDriver(req.driver) });
+      const state = await getDriverDayState(req.driverLogin, {
+        samsaraAccounts: samsaraAccountsForDriver(req.driver),
+        allowBin: true
+      });
       emitAppEvent("driver.truck.switch.samsara_skipped", {
         driverLogin: req.driverLogin,
         jobId: job.jobId,
@@ -15510,6 +16089,7 @@ app.post("/api/control/scm-reconciliation/run", requireOperator, requireAdmin, a
     const targetedScope = /^order[_ -]?family$/i.test(requestedScope);
     const run = await startScmReconciliationRun({
       scope: requestedScope,
+      soOrderType: req.body?.soOrderType ?? req.body?.so_order_type,
       targetOrderKind: req.body?.orderKind ?? req.body?.targetOrderKind,
       targetOrderId: req.body?.orderId ?? req.body?.targetOrderId,
       targetOrderRef: req.body?.orderRef ?? req.body?.targetOrderRef,
@@ -16017,6 +16597,9 @@ app.use("/api/cycle-count", requireOperator, requireOperatorAccess);
 
 app.use("/api/delivery/orders/:id", async (req, res, next) => {
   try {
+    if (await isBilledSalesOrderIdentifier(req.params.id)) {
+      return res.status(404).json({ error: "Delivery order not found." });
+    }
     if (isNetSuiteSandboxEnvironment()) return next();
     const orderId = String(req.params.id || "").trim();
     const fixture = await query(
@@ -16034,6 +16617,17 @@ app.use("/api/delivery/orders/:id", async (req, res, next) => {
   }
 });
 
+app.use("/api/customer-pickup/orders/:id", async (req, res, next) => {
+  try {
+    if (await isBilledSalesOrderIdentifier(req.params.id)) {
+      return res.status(404).json({ error: "Pickup sales order not found." });
+    }
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/customer-pickup/lookup", async (req, res, next) => {
   try {
     const code = String(req.body?.code || "").trim();
@@ -16043,6 +16637,9 @@ app.post("/api/customer-pickup/lookup", async (req, res, next) => {
     if (!orderId) {
       const order = await fetchCustomerPickupOrderFromNetSuite(code, locationId);
       if (!order) return res.status(404).json({ error: "Pickup sales order not found for this location." });
+      if (isNetSuiteSalesOrderBilled(order)) {
+        return res.status(404).json({ error: "Pickup sales order not found for this location." });
+      }
       if (isPendingApprovalStatus(order.status, order.status_text)) {
         return res.status(409).json({ error: "This pickup sales order is still pending approval in NetSuite." });
       }
@@ -16220,6 +16817,9 @@ app.get("/api/delivery/saved-order-keys", async (req, res, next) => {
 
 app.post("/api/delivery/saved-orders", async (req, res, next) => {
   try {
+    if (await isBilledSalesOrderIdentifier(req.body?.orderId)) {
+      return res.status(404).json({ error: "Delivery order not found." });
+    }
     res.json(await saveDeliveryOrderForOperator(operatorId(req), {
       locationId: req.body?.locationId || req.query.locationId,
       orderId: req.body?.orderId
@@ -17143,7 +17743,7 @@ async function recoverStaleScmReconciliationRuns() {
             AND target.status IN ('pending', 'running')`,
         [runIds]
       );
-      console.warn(`Recovered ${runIds.length} stale running PO/TO reconciliation run(s).`);
+      console.warn(`Recovered ${runIds.length} stale running SO/PO/TO reconciliation run(s).`);
     }
     return runIds;
   });
@@ -17193,7 +17793,7 @@ async function scmReconciliationScheduledTick() {
       operationalSyncRunning: anyNetSuiteSyncRunning
     });
   } catch (error) {
-    console.error("Scheduled PO/TO reconciliation tick failed:", error.message);
+    console.error("Scheduled SO/PO/TO reconciliation tick failed:", error.message);
   } finally {
     scmReconciliationScheduledTickRunning = false;
   }

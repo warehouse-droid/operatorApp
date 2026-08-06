@@ -1218,6 +1218,7 @@ function driverPwaRenderClientSyncIssues(issues = driverPwaClientSyncIssues, {
           const pendingEvents = Number(offlineReviewFirst(issue, "pendingEventCount", "pending_event_count") || 0);
           const reviewEvents = Number(offlineReviewFirst(issue, "reviewRequiredCount", "review_required_count") || 0);
           const unsyncedPhotos = Number(offlineReviewFirst(issue, "unsyncedPhotoCount", "unsynced_photo_count") || 0);
+          const photoFailures = offlineReviewArray(issue.photoFailures || issue.photo_failures).slice(0, 10);
           const errorIdentity = [errorName, errorCode].filter(Boolean).join(" · ");
           const dismissDraft = sessionId ? offlineReviewDeviceDismissDraft(sessionId) : { auditNote: "", confirmed: false };
           const dismissOpen = allowDismiss && sessionId && offlineReviewDeviceDismissOpenId === sessionId;
@@ -1229,6 +1230,43 @@ function driverPwaRenderClientSyncIssues(issues = driverPwaClientSyncIssues, {
                 <span title="${offlineReviewEscape(deviceId)}">Device ${offlineReviewEscape(offlineReviewShortId(deviceId))}</span>
               </div>
               <p class="driver-pwa-client-sync-error">${offlineReviewEscape(errorMessage)}</p>
+              ${photoFailures.length ? `
+                <div class="driver-pwa-client-photo-failures">
+                  <strong>${photoFailures.length} photo failure${photoFailures.length === 1 ? "" : "s"} reported by this device</strong>
+                  <ol>
+                    ${photoFailures.map((failure) => {
+                      const photoId = offlineReviewFirst(failure, "photoId", "photo_id");
+                      const eventId = offlineReviewFirst(failure, "eventId", "event_id");
+                      const phase = offlineReviewFirst(failure, "phase");
+                      const byteSize = Number(offlineReviewFirst(failure, "byteSize", "byteCount", "byte_size", "bytes") || 0);
+                      const attemptCount = Number(offlineReviewFirst(failure, "attemptCount", "attempts", "attempt_count") || 0);
+                      const retryable = offlineReviewBoolean(offlineReviewFirst(failure, "retryable"));
+                      const failureCode = offlineReviewFirst(failure, "errorCode", "error_code", "code");
+                      const httpStatus = Number(offlineReviewFirst(failure, "httpStatus", "http_status", "status") || 0);
+                      const failureMessage = offlineReviewFirst(failure, "message", "errorMessage", "error_message", "error")
+                        || "No detailed message was reported.";
+                      const failureMeta = [
+                        phase ? offlineReviewEventLabel(phase) : "",
+                        byteSize > 0 ? offlineReviewFormatBytes(byteSize) : "",
+                        attemptCount > 0 ? `Attempt ${attemptCount}` : "",
+                        retryable ? "Retryable" : "Manual review may be needed",
+                        failureCode ? `Code ${failureCode}` : "",
+                        httpStatus > 0 ? `HTTP ${httpStatus}` : ""
+                      ].filter(Boolean);
+                      return `
+                        <li>
+                          <div>
+                            <strong title="${offlineReviewEscape(photoId)}">Photo ${offlineReviewEscape(offlineReviewShortId(photoId) || "unknown")}</strong>
+                            ${eventId ? `<span title="${offlineReviewEscape(eventId)}">Event ${offlineReviewEscape(offlineReviewShortId(eventId))}</span>` : ""}
+                          </div>
+                          <span>${failureMeta.map(offlineReviewEscape).join(" · ")}</span>
+                          <p>${offlineReviewEscape(failureMessage)}</p>
+                        </li>
+                      `;
+                    }).join("")}
+                  </ol>
+                </div>
+              ` : ""}
               <div class="driver-pwa-client-sync-meta">
                 ${errorIdentity ? `<span>${offlineReviewEscape(errorIdentity)}</span>` : ""}
                 ${planDate ? `<span>Route ${offlineReviewEscape(offlineReviewFormatPlanDate(planDate))}</span>` : ""}

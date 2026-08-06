@@ -1,20 +1,21 @@
 import { query, withTransaction } from "./db.js";
 import { flattenDispatchPlanLoads, normalizeDispatchPlanLoadAssignments } from "./dispatch-load-assignment.js";
-import { planJobsForDriver } from "./driver-repository.js";
+import { planJobsForDrivers } from "./driver-repository.js";
 
 function text(value) {
   return String(value ?? "").trim();
 }
 
-export async function syncDispatchPlanLoadAssignments(plan = {}) {
+export async function syncDispatchPlanLoadAssignments(plan = {}, { allowBin = false } = {}) {
   const normalized = normalizeDispatchPlanLoadAssignments(plan);
   const planId = normalized.id ?? normalized.planId;
   if (!planId) return normalized;
   const rows = flattenDispatchPlanLoads(normalized).filter((row) => text(row.load.id));
   const expectedJobIdsByLoad = new Map(rows.map((row) => [text(row.load.id), new Set()]));
   const driverLogins = [...new Set(rows.map((row) => text(row.driverLogin).toLowerCase()).filter(Boolean))];
+  const jobsByDriver = planJobsForDrivers(normalized, driverLogins, { allowBin });
   for (const driverLogin of driverLogins) {
-    for (const job of planJobsForDriver(normalized, driverLogin)) {
+    for (const job of jobsByDriver.get(driverLogin) || []) {
       const loadId = text(job.loadId);
       const jobId = text(job.jobId);
       if (!loadId || !jobId || !expectedJobIdsByLoad.has(loadId)) continue;

@@ -12,16 +12,16 @@ import {
 } from "./driver-client-version.js";
 
 assert.equal(DRIVER_PWA_VERSION_HEADER, "X-MBBS-Driver-Version");
-assert.equal(DRIVER_PWA_CURRENT_VERSION, "2026.08.01.2");
+assert.equal(DRIVER_PWA_CURRENT_VERSION, "2026.08.05.3");
 assert.equal(DRIVER_PWA_MINIMUM_VERSION, DRIVER_PWA_CURRENT_VERSION);
-assert.equal(compareDriverPwaVersions("2026.08.01.2", "2026.08.01.2"), 0);
-assert.equal(compareDriverPwaVersions("2026.08.01.3", "2026.08.01.2"), 1);
-assert.equal(compareDriverPwaVersions("2026.08.01.1", "2026.08.01.2"), -1);
-assert.equal(compareDriverPwaVersions("not-a-version", "2026.08.01.2"), null);
-assert.equal(compareDriverPwaVersions("999999999999999999999.1", "2026.08.01.2"), null);
+assert.equal(compareDriverPwaVersions("2026.08.05.3", "2026.08.05.3"), 0);
+assert.equal(compareDriverPwaVersions("2026.08.05.4", "2026.08.05.3"), 1);
+assert.equal(compareDriverPwaVersions("2026.08.03.1", "2026.08.05.3"), -1);
+assert.equal(compareDriverPwaVersions("not-a-version", "2026.08.05.3"), null);
+assert.equal(compareDriverPwaVersions("999999999999999999999.1", "2026.08.05.3"), null);
 assert.equal(driverPwaVersionIsSupported(DRIVER_PWA_CURRENT_VERSION), true);
-assert.equal(driverPwaVersionIsSupported("2026.08.01.3"), true);
-assert.equal(driverPwaVersionIsSupported("2026.08.01.0"), false);
+assert.equal(driverPwaVersionIsSupported("2026.08.05.3"), true);
+assert.equal(driverPwaVersionIsSupported("2026.08.03.1"), false);
 assert.equal(driverPwaVersionIsSupported(""), false);
 assert.deepEqual(driverPwaVersionDetails(""), {
   currentVersion: DRIVER_PWA_CURRENT_VERSION,
@@ -102,7 +102,7 @@ for (const path of [
   assert.equal(missing.response.body.preserveLocalEvidence, true);
   assert.match(missing.response.body.guidance, /Do not clear browser data/);
 
-  const old = runGate(path, "2026.08.01.0");
+  const old = runGate(path, "2026.08.03.0");
   assert.equal(old.nextCalled, false, `${path} must reject an old version.`);
   assert.equal(old.response.statusCode, 426);
 
@@ -133,7 +133,7 @@ const driverHtml = fs.readFileSync(new URL("../public/driver.html", import.meta.
 const driverCss = fs.readFileSync(new URL("../public/driver.css", import.meta.url), "utf8");
 
 for (const source of [driverSource, offlineSyncSource, workerSource]) {
-  assert.match(source, /DRIVER_PWA_CLIENT_VERSION\s*=\s*"2026\.08\.01\.2"/);
+  assert.match(source, /DRIVER_PWA_CLIENT_VERSION\s*=\s*"2026\.08\.05\.3"/);
 }
 assert.match(driverSource, /DRIVER_PWA_VERSION_HEADER\s*=\s*"X-MBBS-Driver-Version"/);
 assert.match(
@@ -159,15 +159,19 @@ assert.match(driverSource, /navigator\.serviceWorker\.addEventListener\("control
 assert.match(driverSource, /updateViaCache: "none"/);
 assert.match(driverSource, /String\(savedJob\.fingerprint\) !== currentFingerprint/);
 assert.match(offlineSyncSource, /\[DRIVER_PWA_VERSION_HEADER\]: DRIVER_PWA_CLIENT_VERSION/);
-assert.match(workerSource, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v15`/);
+assert.match(workerSource, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v19`/);
 assert.match(workerSource, /DRIVER_VERSION_REQUEST/);
 assert.match(workerSource, /type: "DRIVER_VERSION", version: DRIVER_PWA_CLIENT_VERSION/);
-assert.match(workerSource, /driver-offline-sync\.js\?v=20260801-driver-chinese-v1/);
-assert.match(workerSource, /driver\.js\?v=20260801-driver-chinese-v1/);
-assert.match(driverHtml, /driver\.css\?v=20260801-action-readiness-v1/);
-assert.match(driverHtml, /i18n\.js\?v=20260801-driver-chinese-v1/);
-assert.match(driverHtml, /driver-offline-sync\.js\?v=20260801-driver-chinese-v1/);
-assert.match(driverHtml, /driver\.js\?v=20260801-driver-chinese-v1/);
+assert.match(workerSource, /driver-photo-hash\.js\?v=20260805-online-mode-v3/);
+assert.match(workerSource, /driver-offline-sync\.js\?v=20260805-online-mode-v3/);
+assert.match(workerSource, /driver-bin-ui\.js\?v=20260803-bin-pwa-v1/);
+assert.match(workerSource, /driver\.js\?v=20260805-online-mode-v3/);
+assert.match(driverHtml, /driver\.css\?v=20260803-bin-pwa-v1/);
+assert.match(driverHtml, /i18n\.js\?v=20260803-bin-pwa-v1/);
+assert.match(driverHtml, /driver-photo-hash\.js\?v=20260805-online-mode-v3/);
+assert.match(driverHtml, /driver-offline-sync\.js\?v=20260805-online-mode-v3/);
+assert.match(driverHtml, /driver-bin-ui\.js\?v=20260803-bin-pwa-v1/);
+assert.match(driverHtml, /driver\.js\?v=20260805-online-mode-v3/);
 assert.match(driverCss, /\.driver-pwa-update-screen[\s\S]*\.driver-pwa-update-card/);
 
 const mountedApp = express();

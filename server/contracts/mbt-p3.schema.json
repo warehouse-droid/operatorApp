@@ -1,0 +1,234 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mbbs.example/contracts/mbt-p3.schema.json",
+  "title": "MBT Phase 3 BIN dispatch contracts",
+  "$ref": "#/$defs/binDispatchFeed",
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,6})?Z$"
+    },
+    "nullableUuid": {
+      "oneOf": [
+        { "$ref": "#/$defs/uuid" },
+        { "type": "null" }
+      ]
+    },
+    "nullableText": {
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "null" }
+      ]
+    },
+    "scheduledWindow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["startAt", "endAt"],
+      "properties": {
+        "startAt": { "$ref": "#/$defs/timestamp" },
+        "endAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "evidenceRequirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "type", "minimumCount"],
+      "properties": {
+        "code": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "type": { "type": "string", "enum": ["photo", "receipt", "bin_scan", "weight", "quantity", "signature", "note"] },
+        "minimumCount": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "binStop": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "sequence", "type", "actionCode", "locationRole", "yardId", "yardCode", "siteProfileId", "evidenceRequirements"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "sequence": { "type": "integer", "minimum": 1 },
+        "type": { "type": "string", "enum": ["pickup", "drop", "travel"] },
+        "actionCode": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "locationRole": { "type": "string", "minLength": 1 },
+        "yardId": { "$ref": "#/$defs/nullableUuid" },
+        "yardCode": { "$ref": "#/$defs/nullableText" },
+        "siteProfileId": { "$ref": "#/$defs/nullableUuid" },
+        "evidenceRequirements": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/evidenceRequirement" }
+        }
+      }
+    },
+    "frontLeg": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["predecessorVisitId", "predecessorTerminal", "dispatchable"],
+      "properties": {
+        "predecessorVisitId": { "$ref": "#/$defs/nullableUuid" },
+        "predecessorTerminal": { "const": true },
+        "dispatchable": { "const": true }
+      }
+    },
+    "assetRequirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reservationSlot", "exactAssetId", "exactAssetCode", "expectedStateRevision"],
+      "properties": {
+        "reservationSlot": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "exactAssetId": { "$ref": "#/$defs/uuid" },
+        "exactAssetCode": { "type": "string", "minLength": 1 },
+        "expectedStateRevision": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "eligibleAsset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["assetId", "assetCode", "stateRevision"],
+      "properties": {
+        "assetId": { "$ref": "#/$defs/uuid" },
+        "assetCode": { "type": "string", "minLength": 1 },
+        "stateRevision": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "assetChoice": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reservationSlot", "eligibleAssets"],
+      "properties": {
+        "reservationSlot": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "eligibleAssets": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100,
+          "items": { "$ref": "#/$defs/eligibleAsset" }
+        }
+      }
+    },
+    "truckRequirements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["truckType", "minimumSlots", "supportedBinTypeCode"],
+      "properties": {
+        "truckType": { "const": "bin" },
+        "minimumSlots": { "type": "integer", "minimum": 1 },
+        "supportedBinTypeCode": { "type": "string", "minLength": 1 }
+      }
+    },
+    "sharedYard": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "yardId", "yardCode", "dispatchLocationId"],
+      "properties": {
+        "role": { "type": "string", "enum": ["origin", "return", "service"] },
+        "yardId": { "$ref": "#/$defs/uuid" },
+        "yardCode": { "type": "string", "minLength": 1 },
+        "dispatchLocationId": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "timelineVisit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["visitId", "visitNumber", "serviceAction", "status", "relation", "locked"],
+      "properties": {
+        "visitId": { "$ref": "#/$defs/uuid" },
+        "visitNumber": { "type": "integer", "minimum": 1 },
+        "serviceAction": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "status": { "type": "string", "enum": ["tentative", "ready", "planned", "in_progress", "evidence_pending", "completed", "cancelled"] },
+        "relation": { "type": "string", "enum": ["completed", "current", "future"] },
+        "locked": { "type": "boolean" }
+      }
+    },
+    "binMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "assetRequirements": { "type": "array", "minItems": 1 }
+          }
+        },
+        {
+          "required": ["assetChoices"],
+          "properties": {
+            "assetRequirements": { "type": "array", "maxItems": 0 },
+            "assetChoices": { "type": "array" }
+          }
+        }
+      ],
+      "required": ["snapshotVersion", "contractId", "contractNumber", "visitId", "visitReference", "visitNumber", "visitRevision", "status", "frontLeg", "templateVersionId", "templateRevision", "binTypeId", "binTypeCode", "assetRequirements", "truckRequirements", "sharedYards", "timeline"],
+      "properties": {
+        "snapshotVersion": { "const": 1 },
+        "contractId": { "$ref": "#/$defs/uuid" },
+        "contractNumber": { "type": "string", "minLength": 1 },
+        "visitId": { "$ref": "#/$defs/uuid" },
+        "visitReference": { "type": "string", "minLength": 1 },
+        "visitNumber": { "type": "integer", "minimum": 1 },
+        "visitRevision": { "type": "integer", "minimum": 1 },
+        "status": { "const": "ready" },
+        "frontLeg": { "$ref": "#/$defs/frontLeg" },
+        "templateVersionId": { "$ref": "#/$defs/uuid" },
+        "templateRevision": { "type": "integer", "minimum": 1 },
+        "binTypeId": { "$ref": "#/$defs/uuid" },
+        "binTypeCode": { "type": "string", "minLength": 1 },
+        "assetRequirements": {
+          "type": "array",
+          "minItems": 0,
+          "items": { "$ref": "#/$defs/assetRequirement" }
+        },
+        "assetChoices": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": { "$ref": "#/$defs/assetChoice" }
+        },
+        "truckRequirements": { "$ref": "#/$defs/truckRequirements" },
+        "sharedYards": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/sharedYard" }
+        },
+        "timeline": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/timelineVisit" }
+        }
+      }
+    },
+    "binFrontLegCard": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "serviceAction", "customer", "address", "scheduledWindow", "stops", "mbt"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "type": { "const": "BIN" },
+        "serviceAction": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "customer": { "type": "string", "minLength": 1 },
+        "address": { "type": "string", "minLength": 1 },
+        "scheduledWindow": { "$ref": "#/$defs/scheduledWindow" },
+        "stops": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/binStop" }
+        },
+        "mbt": { "$ref": "#/$defs/binMetadata" }
+      }
+    },
+    "binDispatchFeed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "planDate", "items"],
+      "properties": {
+        "schemaVersion": { "const": "mbt-bin-dispatch-feed-v1" },
+        "planDate": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+        "items": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/binFrontLegCard" }
+        }
+      }
+    }
+  }
+}

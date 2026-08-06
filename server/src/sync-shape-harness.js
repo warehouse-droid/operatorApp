@@ -395,9 +395,18 @@ async function runRepositorySimulation(checks) {
     counts.set(order.type, Number(counts.get(order.type) || 0) + 1);
     return counts;
   }, new Map());
-  check(cappedTypeCounts.size >= 2 && [...cappedTypeCounts.values()].every((count) => count === 1),
-    "Dispatch pool limits must be applied independently per order type.",
-    { cappedTypeCounts: Object.fromEntries(cappedTypeCounts) });
+  const cappedUnplannedTypeCounts = perTypeCappedOrders
+    .filter((order) => !order.dispatchPlanned)
+    .reduce((counts, order) => {
+      counts.set(order.type, Number(counts.get(order.type) || 0) + 1);
+      return counts;
+    }, new Map());
+  check(cappedUnplannedTypeCounts.size >= 2 && [...cappedUnplannedTypeCounts.values()].every((count) => count === 1),
+    "Dispatch pool limits must be applied independently to unplanned orders; planned assignments may bypass the cap.",
+    {
+      cappedTypeCounts: Object.fromEntries(cappedTypeCounts),
+      cappedUnplannedTypeCounts: Object.fromEntries(cappedUnplannedTypeCounts)
+    });
   const searchedDispatchOrders = await dispatchRepository.listDispatchOrders({
     includeHiddenScm: true,
     perTypeLimit: 1,
@@ -406,7 +415,7 @@ async function runRepositorySimulation(checks) {
   check(searchedDispatchOrders.some((order) => order.id === `SIM-SO-${runId}`),
     "Backend dispatch search must return a valid order even when it falls outside the normal pool cap.",
     { searchedDispatchOrders: searchedDispatchOrders.map((order) => order.id) });
-  checks.push("dispatch per-type pool limit + backend search bypass");
+  checks.push("dispatch per-type unplanned pool limit + planned assignment bypass + backend search bypass");
   const dispatchOrders = await dispatchRepository.listDispatchOrders({ includeHiddenScm: true });
   const dispatchPurchase = dispatchOrders.find((order) => order.id === `SIM-PO-${runId}`);
   check(number(dispatchPurchase?.salesQty) === 220, "Dispatch did not use the fixed PO receipt baseline.", { dispatchPurchase });

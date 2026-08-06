@@ -1,0 +1,427 @@
+body[data-mbt-surface="frontdesk"] {
+  background: #eef2f3;
+}
+
+body[data-mbt-surface="frontdesk"] .mbt-frontdesk-shell.dispatch-shell {
+  width: 100%;
+  min-height: 100vh;
+  margin: 0;
+  padding: 0 22px 40px;
+  background: #eef2f3;
+}
+
+body.has-app-sidebar[data-mbt-surface="frontdesk"] .mbt-frontdesk-shell.dispatch-shell {
+  width: calc(100vw - var(--app-sidebar-width));
+}
+
+body[data-mbt-surface="frontdesk"] .mbt-frontdesk-shell .mbt-lead {
+  max-width: 960px;
+  margin: 0 0 20px;
+}
+
+.mbt-frontdesk-shell .mbt-app-topbar {
+  margin-bottom: 20px;
+}
+
+.mbt-frontdesk-shell .mbt-message {
+  margin: 0 0 18px;
+  padding: 10px 12px;
+  border: 1px solid #b8cabe;
+  border-radius: 10px;
+  background: #f9fcfa;
+  color: #214c36;
+  font-weight: 700;
+}
+
+.mbt-frontdesk-shell .mbt-message[data-tone="attention"] {
+  border-color: #d6a851;
+  background: #fff9e9;
+  color: #67460c;
+}
+
+.mbt-frontdesk-grid {
+  display: grid;
+  grid-template-columns: minmax(290px, 0.46fr) minmax(0, 1.54fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.mbt-frontdesk-panel {
+  min-width: 0;
+  padding: 20px;
+  border: 1px solid #c1cdd1;
+  border-radius: 12px;
+  background: #fff;
+  box-shadow: 0 10px 28px rgba(34, 65, 79, 0.06);
+}
+
+.mbt-frontdesk-section-heading,
+.mbt-dialog-heading,
+.mbt-dialog-actions,
+.mbt-quote-actions {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.mbt-frontdesk-section-heading h2,
+.mbt-frontdesk-panel h3,
+.mbt-dialog-card h2 {
+  margin-top: 0;
+}
+
+.mbt-frontdesk-section-heading h2,
+.mbt-dialog-card h2 {
+  margin-bottom: 4px;
+}
+
+.mbt-frontdesk-panel h3 {
+  margin: 18px 0 8px;
+  font-size: 1rem;
+}
+
+.mbt-frontdesk-form,
+.mbt-service-line-editor {
+  display: grid;
+  gap: 14px;
+}
+
+.mbt-frontdesk-form {
+  margin-top: 22px;
+}
+
+.mbt-service-line {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid #cbd7da;
+  border-radius: 9px;
+  background: #f8fafb;
+}
+
+.mbt-service-line legend {
+  padding: 0 5px;
+  color: #52616a;
+  font-size: 0.76rem;
+  font-weight: 850;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.mbt-field-pair {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.mbt-bin-estimate-grid,
+.mbt-surcharge-row {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  align-items: end;
+  gap: 10px;
+}
+
+.mbt-surcharge-editor {
+  display: grid;
+  gap: 8px;
+}
+
+.mbt-pricing-origin-choice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid #b8c9c0;
+  border-radius: 8px;
+  background: #fff;
+  color: #214c36;
+  cursor: pointer;
+}
+
+.mbt-pricing-origin-choice input {
+  width: 1.1rem;
+  height: 1.1rem;
+  margin: 2px 0 0;
+  flex: 0 0 auto;
+  accent-color: #24563e;
+}
+
+.mbt-pricing-origin-choice span {
+  display: grid;
+  gap: 3px;
+}
+
+.mbt-pricing-origin-choice small {
+  color: #596b61;
+  font-weight: 500;
+  line-height: 1.35;
+}
+
+.mbt-surcharge-row {
+  grid-template-columns: minmax(0, 1.4fr) minmax(8rem, 0.8fr) auto;
+  padding: 9px;
+  border: 1px solid #d8e1e3;
+  border-radius: 8px;
+  background: #fff;
+}
+
+#newContractDialog {
+  width: min(820px, calc(100% - 24px));
+}
+
+.mbt-line-site-fields {
+  display: grid;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid #d8e1e3;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.mbt-line-site-fields[hidden] {
+  display: none;
+}
+
+.mbt-site-location-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(90px, 0.65fr) minmax(120px, 0.8fr) minmax(70px, 0.45fr);
+  gap: 10px;
+}
+
+.mbt-field {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+  color: #344d59;
+  font-size: 0.8rem;
+  font-weight: 750;
+}
+
+.mbt-field input,
+.mbt-field select,
+.mbt-field textarea {
+  width: 100%;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid #aebdc3;
+  border-radius: 8px;
+  background: #fff;
+  color: #16231d;
+  font: inherit;
+  font-weight: 500;
+}
+
+.mbt-choice-list {
+  display: grid;
+  gap: 7px;
+  margin-top: 9px;
+}
+
+.mbt-choice-list button,
+.mbt-contract-master button {
+  width: 100%;
+  padding: 10px 11px;
+  border: 1px solid #bdcbd1;
+  border-radius: 8px;
+  background: #f6f9fa;
+  color: #214c36;
+  text-align: left;
+}
+
+.mbt-choice-list button:hover,
+.mbt-choice-list button[aria-selected="true"],
+.mbt-contract-master button:hover,
+.mbt-contract-master button[aria-pressed="true"] {
+  border-color: #16706b;
+  background: #e5f2f0;
+}
+
+.mbt-choice-detail {
+  display: block;
+  margin-top: 3px;
+  color: #596b72;
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+
+.mbt-frontdesk-muted {
+  color: #596b61;
+  line-height: 1.5;
+}
+
+.mbt-contract-master-detail {
+  display: grid;
+  grid-template-columns: minmax(190px, 0.34fr) minmax(0, 0.66fr);
+  min-height: 430px;
+  border: 1px solid #d0dadd;
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.mbt-contract-master {
+  display: grid;
+  align-content: start;
+  gap: 7px;
+  padding: 12px;
+  border-right: 1px solid #d0dadd;
+  background: #f5f8f9;
+}
+
+.mbt-contract-detail {
+  min-width: 0;
+  padding: 16px;
+}
+
+.mbt-quote-summary,
+.mbt-contract-summary {
+  display: grid;
+  gap: 13px;
+}
+
+.mbt-price-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.mbt-price-grid > div {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid #d3dfe1;
+  border-radius: 8px;
+  background: #f7faf8;
+}
+
+.mbt-price-grid dt {
+  color: #66776e;
+  font-size: 0.67rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.mbt-price-grid dd {
+  margin: 4px 0 0;
+  color: #173e2b;
+  font-size: 1rem;
+  font-weight: 850;
+}
+
+.mbt-pricing-lines,
+.mbt-timeline {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.mbt-pricing-lines li,
+.mbt-visit-card,
+.mbt-amendment-card,
+.mbt-service-line-card {
+  padding: 11px 12px;
+  border: 1px solid #d2ded6;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.mbt-pricing-lines li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.mbt-visit-card h3,
+.mbt-amendment-card h3,
+.mbt-service-line-card h3 {
+  margin: 0 0 4px;
+}
+
+.mbt-visit-card p,
+.mbt-amendment-card p,
+.mbt-service-line-card p {
+  margin: 4px 0 0;
+  color: #596b61;
+  line-height: 1.4;
+}
+
+.mbt-visit-status {
+  color: #145543 !important;
+  font-size: 0.8rem;
+  font-weight: 800;
+}
+
+.mbt-amendment-card {
+  border-color: #d7b971;
+  background: #fff9e9;
+}
+
+.mbt-service-line-card[data-confirmation="required"] {
+  border-color: #d6a851;
+  background: #fff9e9;
+}
+
+.mbt-service-line-list {
+  display: grid;
+  gap: 8px;
+}
+
+.mbt-service-line-list > h3 {
+  margin: 2px 0 0;
+}
+
+.mbt-quote-actions {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  padding-top: 4px;
+}
+
+.mbt-button-secondary {
+  border-color: #789393;
+  background: #fff;
+  color: #214c36;
+}
+
+.mbt-button-secondary:hover {
+  background: #eef5f0;
+}
+
+dialog {
+  width: min(560px, calc(100% - 24px));
+  max-height: calc(100vh - 32px);
+  margin: auto;
+  padding: 0;
+  overflow: auto;
+  border: 0;
+  border-radius: 14px;
+  color: #16231d;
+  box-shadow: 0 28px 90px rgba(15, 43, 28, 0.3);
+}
+
+dialog::backdrop { background: rgba(18, 38, 27, 0.56); }
+
+.mbt-dialog-card { display: grid; gap: 16px; min-width: 0; padding: 24px; }
+#extensionFields,
+#serviceLineActionFields { display: grid; gap: 14px; min-width: 0; }
+.mbt-dialog-card > p { margin: 0; color: #596b61; line-height: 1.5; }
+.mbt-dialog-actions { justify-content: flex-end; }
+
+@media (max-width: 900px) {
+  .mbt-frontdesk-grid { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 650px) {
+  body[data-mbt-surface="frontdesk"] .mbt-frontdesk-shell.dispatch-shell { padding: 0 12px 30px; }
+  .mbt-frontdesk-shell .mbt-app-topbar { margin-right: -12px; margin-left: -12px; padding-right: 12px; padding-left: 12px; }
+  .mbt-contract-master-detail { grid-template-columns: 1fr; }
+  .mbt-contract-master { border-right: 0; border-bottom: 1px solid #d0dadd; }
+  .mbt-field-pair, .mbt-site-location-grid, .mbt-price-grid,
+  .mbt-bin-estimate-grid, .mbt-surcharge-row { grid-template-columns: 1fr; }
+  .mbt-frontdesk-section-heading, .mbt-dialog-heading { align-items: stretch; flex-direction: column; }
+  .mbt-dialog-actions > button { width: 100%; }
+}

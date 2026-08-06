@@ -194,6 +194,48 @@
   font-weight: 900;
 }
 
+.driver-pwa-client-photo-failures {
+  min-width: 0;
+  border: 1px solid #f0cbc7;
+  border-radius: 6px;
+  background: #fff8f7;
+  color: #74504d;
+  padding: 7px;
+  display: grid;
+  gap: 5px;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.driver-pwa-client-photo-failures ol {
+  max-height: 230px;
+  margin: 0;
+  padding-left: 22px;
+  display: grid;
+  gap: 6px;
+  overflow-y: auto;
+}
+
+.driver-pwa-client-photo-failures li,
+.driver-pwa-client-photo-failures p,
+.driver-pwa-client-photo-failures span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.driver-pwa-client-photo-failures li > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.driver-pwa-client-photo-failures p {
+  margin: 2px 0 0;
+  color: #8f1f17;
+  font-weight: 800;
+}
+
 .driver-pwa-client-sync-actions {
   display: flex;
   justify-content: flex-end;

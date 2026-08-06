@@ -151,6 +151,13 @@ function currentJobEntries(currentPlan, driverLogin) {
   }));
 }
 
+function manifestProjectionClientVersion(manifest) {
+  const versions = [...new Set((manifest?.jobs || [])
+    .map((job) => String(job?.mbt?.minimumClientVersion || "").trim())
+    .filter(Boolean))];
+  return versions.length === 1 ? versions[0] : "";
+}
+
 function resolveEffectiveJob({ event, manifest, currentPlan, currentEntries, driverLogin }) {
   if (!event.jobId) {
     const revisionUnchanged = String(currentPlan?.planId ?? "") === String(manifest?.planId ?? "")
@@ -447,8 +454,6 @@ export async function processDriverOfflineQueue({
         "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
         [String(driverLogin).trim().toLowerCase(), String(planDate).slice(0, 10)]
       );
-      const currentPlan = await getDriverDayJobs(driverLogin, { date: planDate });
-      const currentEntries = currentJobEntries(currentPlan, driverLogin);
       let event = await getDriverOfflineEvent(queued.eventId);
       if (!event) return queued;
       if (["applied", "evidence_only", "rejected"].includes(event.status)) return event;
@@ -485,6 +490,22 @@ export async function processDriverOfflineQueue({
           reason: "The event manifest is no longer available."
         });
       }
+      const manifestHasBinJobs = (manifest.jobs || []).some((job) => job?.mbt?.schemaVersion);
+      const projectionClientVersion = manifestProjectionClientVersion(manifest);
+      const currentPlan = await getDriverDayJobs(driverLogin, {
+        date: planDate,
+        // An already issued manifest is the recovery authority. This read does
+        // not release new work and must remain available after a gate closes.
+        allowBin: manifestHasBinJobs,
+        // Client compatibility is presentation metadata stamped by the server.
+        // Re-project with the version frozen into this manifest so a PWA
+        // deployment cannot make an otherwise unchanged saved stop look edited.
+        ...(projectionClientVersion ? {
+          clientVersion: projectionClientVersion,
+          minimumClientVersion: projectionClientVersion
+        } : {})
+      });
+      const currentEntries = currentJobEntries(currentPlan, driverLogin);
       const correction = await supersedingDriverPwaCorrection(event, manifest);
       if (correction) {
         return markDriverOfflineEventEvidenceOnly(event.eventId, {

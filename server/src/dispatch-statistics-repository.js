@@ -4,6 +4,10 @@ import {
   dispatchOwnYardCodes,
   dispatchPhysicalStopVisits
 } from "./dispatch-load-assignment.js";
+import {
+  dispatchLocationKey,
+  uniqueDispatchLocations
+} from "./dispatch-location.js";
 import { listDispatchDrivers } from "./dispatch-setup-repository.js";
 
 function todayLocalDate() {
@@ -115,7 +119,9 @@ function primaryOrder(plan, row) {
 }
 
 function requiredPickupLocations(order) {
-  if (Array.isArray(order?.pickupLocations) && order.pickupLocations.length) return order.pickupLocations.map(String);
+  if (Array.isArray(order?.pickupLocations) && order.pickupLocations.length) {
+    return uniqueDispatchLocations(order.pickupLocations.map(String));
+  }
   if (order?.sourceYard) return [String(order.sourceYard)];
   return ["3445"];
 }
@@ -137,14 +143,14 @@ function orderFootprintPallets(order, lineRowIds = []) {
 }
 
 function pickupFootprintForLocation(plan, load, location) {
-  const pickupLocation = String(location || "");
+  const pickupLocation = dispatchLocationKey(location);
   const countedOrders = new Set();
   let total = 0;
   for (const stop of load.stops || []) {
     if (stop?.type !== "drop" || countedOrders.has(stop.orderId)) continue;
     const order = orderByRef(plan, stop.orderId);
     if (!order) continue;
-    if (!requiredPickupLocations(order).includes(pickupLocation)) continue;
+    if (!requiredPickupLocations(order).some((candidate) => dispatchLocationKey(candidate) === pickupLocation)) continue;
     countedOrders.add(stop.orderId);
     total += orderFootprintPallets(order);
   }
@@ -171,14 +177,14 @@ function stopClass(plan, row, stop, order) {
   const type = String(row.stop_type || "");
   if (type === "travel") return "travel";
   if (type === "truck_switch") return "truck_switch";
-  const ownYards = new Set(dispatchOwnYardCodes(plan));
+  const ownYards = new Set(dispatchOwnYardCodes(plan).map(dispatchLocationKey));
   if (type === "pickup") {
     const location = String(stop?.location || row.location || "");
-    return ownYards.has(location) ? "own_yard" : "vendor_yard";
+    return ownYards.has(dispatchLocationKey(location)) ? "own_yard" : "vendor_yard";
   }
   if (type === "dropoff") {
     const destination = String(stop?.dropLocation || stop?.destinationYard || order?.destinationYard || stop?.location || "");
-    if (ownYards.has(destination)) return "own_yard";
+    if (ownYards.has(dispatchLocationKey(destination))) return "own_yard";
     return isLocalVrmaOrder(order) ? "vendor_yard" : "delivery";
   }
   return "unknown";
@@ -470,7 +476,34 @@ export async function getDispatchStatistics({ from = "", to = "", driver = "" } 
             COALESCE(s.trucks, '[]'::jsonb) AS trucks,
             COALESCE(s.summary, '{}'::jsonb) AS summary
        FROM driver_job_records r
-       LEFT JOIN dispatch_plan_snapshots s ON s.plan_id::text = r.plan_id::text
+       LEFT JOIN LATERAL (
+         SELECT candidate.orders, candidate.trucks, candidate.summary
+           FROM (
+             SELECT current_snapshot.orders,
+                    current_snapshot.trucks,
+                    current_snapshot.summary,
+                    0 AS source_rank,
+                    current_snapshot.saved_at AS observed_at
+               FROM dispatch_plan_snapshots current_snapshot
+              WHERE current_snapshot.plan_id::text = r.plan_id::text
+             UNION ALL
+             SELECT history.orders,
+                    history.trucks,
+                    history.summary,
+                    1 AS source_rank,
+                    history.archived_at AS observed_at
+               FROM dispatch_plan_snapshot_history history
+              WHERE history.plan_id::text = r.plan_id::text
+           ) candidate
+          ORDER BY CASE
+                     WHEN COALESCE(candidate.trucks, '[]'::jsonb)::text LIKE
+                          ('%' || COALESCE(r.stop_id, '') || '%')
+                     THEN 0 ELSE 1
+                   END,
+                   candidate.source_rank,
+                   candidate.observed_at DESC
+          LIMIT 1
+       ) s ON true
       WHERE r.plan_date BETWEEN $1::date AND $2::date
         AND r.status IN ('in_progress', 'complete')
         ${driverClause}

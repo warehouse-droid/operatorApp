@@ -582,11 +582,11 @@ try {
       `INSERT INTO purchase_orders (
          netsuite_id, tranid, trandate, status, status_text,
          vendor_id, vendor, destination_location_id, destination_location,
-         receipt_status, netsuite_active, synced_at
+         receipt_status, initial_scm_status, netsuite_active, synced_at
        ) VALUES (
          $1, $2, DATE '2026-07-29', 'B', 'Pending Receipt',
          5001, 'Harness Vendor', 1, 'Destination Yard',
-         'not_received', true, now()
+         'not_received', 'Hold', true, now()
        )`,
       [poId, poRef]
     );
@@ -619,6 +619,19 @@ try {
       destinationLocationId: 1,
       destinationLocation: "Destination Yard"
     };
+    const initialPo = await loadLocalScmReconciliationOrder("PO", poId);
+    assert.equal(initialPo.localStatus, "Hold",
+      "A newly discovered NetSuite PO must expose its initial Hold status to reconciliation.");
+    const initialPoReconciliation = await reconcileScmOrderFamily({
+      kind: "PO",
+      sourceOrderId: poId,
+      source: "manual",
+      dryRun: true
+    });
+    assert.equal(initialPoReconciliation.applicationStatus, "Hold",
+      "The first reconciliation pass must preserve a new PO's Hold status.");
+    assert.equal(initialPoReconciliation.targets[poRef]?.applicationStatus, "Hold",
+      "The source PO target must also preserve Hold before any receiving progress.");
     const firstReceipt = linkedTransaction({
       sourceOrderId: poId,
       sourceOrderRef: poRef,

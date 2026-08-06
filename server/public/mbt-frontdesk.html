@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MBT Front Desk · MBBS Operations</title>
+    <link rel="stylesheet" href="/mbt-shell.css" />
+    <link rel="stylesheet" href="/mbt-frontdesk.css" />
+  </head>
+  <body data-mbt-surface="frontdesk">
+    <main id="mbtApp" class="dispatch-shell mbt-shell mbt-frontdesk-shell" aria-labelledby="mbtTitle">
+      <header class="mbt-app-topbar">
+        <div class="mbt-app-brand">
+          <span class="mbt-app-mark" aria-hidden="true">FD</span>
+          <div>
+            <p>MBT Bin Operations · Local pilot</p>
+            <h1 id="mbtTitle">Front Desk</h1>
+          </div>
+        </div>
+        <span class="mbt-app-mode">Local only · posting disabled</span>
+      </header>
+      <p class="mbt-lead">
+        Select a customer, review their active bin contracts, and build a quoted contract with one independently planned service line per physical bin.
+      </p>
+
+      <div id="frontdeskMessage" class="mbt-message" role="status" aria-live="polite">
+        Loading the controlled Front Desk configuration…
+      </div>
+
+      <div class="mbt-frontdesk-grid">
+        <section class="mbt-frontdesk-panel" aria-labelledby="customerHeading">
+          <div class="mbt-frontdesk-section-heading">
+            <div>
+              <p class="mbt-eyebrow">Customer</p>
+              <h2 id="customerHeading">Find a customer</h2>
+            </div>
+          </div>
+          <label class="mbt-field" for="customerSearch">
+            <span>Search customers</span>
+            <input
+              id="customerSearch"
+              type="search"
+              role="combobox"
+              aria-autocomplete="list"
+              aria-controls="customerResults"
+              aria-expanded="false"
+              autocomplete="off"
+              placeholder="Customer name or phone number"
+            />
+          </label>
+          <div id="customerResults" class="mbt-choice-list" role="listbox" aria-label="Customer search results"></div>
+
+        </section>
+
+        <section id="workspace" class="mbt-frontdesk-panel mbt-frontdesk-workspace" aria-labelledby="workspaceHeading">
+          <div class="mbt-frontdesk-section-heading">
+            <div>
+              <p class="mbt-eyebrow">Customer contracts</p>
+              <h2 id="workspaceHeading">Master and detail</h2>
+            </div>
+            <button id="openNewContractOrder" type="button">Add new order</button>
+          </div>
+          <div class="mbt-contract-master-detail">
+            <aside id="contractMaster" class="mbt-contract-master" aria-label="Customer contract list">
+              <p class="mbt-frontdesk-muted">Select a customer to view their current contracts.</p>
+            </aside>
+            <section id="contractDetail" class="mbt-contract-detail" aria-label="Selected contract details">
+              <div id="workspaceEmpty">
+                <p class="mbt-frontdesk-muted">Choose a customer, then select a contract or create a new quoted order.</p>
+              </div>
+              <div id="quoteCard" hidden></div>
+              <div id="contractCard" hidden></div>
+            </section>
+          </div>
+        </section>
+      </div>
+    </main>
+
+    <dialog id="newContractDialog" aria-labelledby="newContractTitle">
+      <form id="quoteForm" class="mbt-dialog-card mbt-frontdesk-form">
+        <div class="mbt-dialog-heading">
+          <div>
+            <p class="mbt-eyebrow">New local order</p>
+            <h2 id="newContractTitle">Choose the work type</h2>
+          </div>
+          <button id="closeNewContractOrder" class="mbt-button-secondary" type="button" aria-label="Close new contract order">Close</button>
+        </div>
+        <p id="newContractCustomer" class="mbt-frontdesk-muted">Choose a customer before creating an order.</p>
+        <label class="mbt-field" for="orderKind">
+          <span>Order type</span>
+          <select id="orderKind" required>
+            <option value="">Select an order type</option>
+            <option value="delivery">Delivery</option>
+            <option value="bin">BIN</option>
+          </select>
+        </label>
+        <section id="binOrderFields" aria-label="BIN order fields" hidden>
+        <fieldset class="mbt-service-line mbt-contract-site">
+          <legend>1. Contract service site</legend>
+          <label class="mbt-field" for="contractServiceSite">
+            <span>BIN service site</span>
+            <select id="contractServiceSite" required>
+              <option value="__new__">Enter a new service site</option>
+            </select>
+          </label>
+          <div id="contractNewSiteFields" class="mbt-line-site-fields" data-contract-new-site>
+            <div class="mbt-field-pair">
+              <label class="mbt-field" for="siteLabel">
+                <span>Site name</span>
+                <input id="siteLabel" data-contract-site-label maxlength="200" placeholder="Project or site name" required />
+              </label>
+              <label class="mbt-field" for="addressLine1">
+                <span>Street address</span>
+                <input id="addressLine1" data-contract-address-one maxlength="500" autocomplete="street-address" required />
+              </label>
+            </div>
+            <label class="mbt-field" for="addressLine2">
+              <span>Address details</span>
+              <input id="addressLine2" data-contract-address-two maxlength="500" placeholder="Unit, entrance, gate" />
+            </label>
+            <div class="mbt-site-location-grid">
+              <label class="mbt-field" for="siteCity"><span>City</span><input id="siteCity" data-contract-city maxlength="200" required /></label>
+              <label class="mbt-field" for="siteRegion"><span>Province</span><input id="siteRegion" data-contract-region maxlength="100" value="ON" required /></label>
+              <label class="mbt-field" for="sitePostalCode"><span>Postal code</span><input id="sitePostalCode" data-contract-postal-code maxlength="30" autocomplete="postal-code" required /></label>
+              <label class="mbt-field" for="siteCountry"><span>Country</span><input id="siteCountry" data-contract-country maxlength="2" value="CA" required /></label>
+            </div>
+            <label class="mbt-field" for="siteInstructions"><span>Driver site instructions</span><textarea id="siteInstructions" data-contract-site-instructions rows="2" maxlength="2000"></textarea></label>
+          </div>
+        </fieldset>
+        <fieldset class="mbt-service-line">
+          <legend>2. Delivery and optional surcharges</legend>
+          <p class="mbt-frontdesk-muted">Estimate = BIN base rental + estimated dump tonnes × dump-item unit price + one-way delivery fee + any manual surcharge.</p>
+          <div class="mbt-field-pair">
+            <label class="mbt-field" for="serviceCode">
+              <span>BIN workflow</span>
+              <select id="serviceCode" required><option value="">Select a service</option></select>
+            </label>
+            <label class="mbt-field" for="binDeliveryItemCode">
+              <span>One-way delivery fee</span>
+              <select id="binDeliveryItemCode" required><option value="">Select a Delivery fee item</option></select>
+            </label>
+          </div>
+          <label class="mbt-pricing-origin-choice" for="orderFrom150">
+            <input id="orderFrom150" type="checkbox" />
+            <span>
+              <strong>Order from 150</strong>
+              <small>Apply the 150-yard delivery price. Leave unchecked for the standard 3445 / 2967 price.</small>
+            </span>
+          </label>
+          <div id="orderSurchargeEditor" class="mbt-surcharge-editor" aria-live="polite"></div>
+          <button id="addOrderSurcharge" class="mbt-button-secondary" type="button">Add surcharge</button>
+        </fieldset>
+        <h3>3. Physical bins</h3>
+        <div id="serviceLineEditor" class="mbt-service-line-editor" aria-live="polite">
+          <fieldset class="mbt-service-line" data-service-line>
+            <legend>Bin 1</legend>
+            <div class="mbt-bin-estimate-grid">
+              <label class="mbt-field" for="binType">
+                <span>BIN item</span>
+                <select id="binType" data-line-bin required>
+                  <option value="">Select a bin</option>
+                </select>
+              </label>
+              <label class="mbt-field" for="dumpItemCode">
+                <span>Dump item</span>
+                <select id="dumpItemCode" data-line-dump-item required><option value="">Select contents</option></select>
+              </label>
+              <label class="mbt-field" for="estimatedTonnes">
+                <span>Estimated tonnes</span>
+                <input id="estimatedTonnes" data-line-estimated-tonnes type="number" min="0.001" max="100" step="0.001" required />
+              </label>
+            </div>
+            <label class="mbt-field" for="deliveryAt">
+              <span>Delivery date and time</span>
+              <input id="deliveryAt" data-line-delivery type="datetime-local" required />
+            </label>
+            <label class="mbt-field" for="returnAt">
+              <span>Return date and time</span>
+              <input id="returnAt" data-line-return type="datetime-local" required />
+            </label>
+          </fieldset>
+        </div>
+        </section>
+        <section id="deliveryOrderFields" class="mbt-service-line-editor" aria-label="Delivery order fields" hidden>
+          <fieldset class="mbt-service-line">
+            <legend>Normal A-to-B delivery</legend>
+            <label class="mbt-field" for="deliveryItemCode">
+              <span>Delivery fee</span>
+              <select id="deliveryItemCode" required>
+                <option value="">Select a Delivery fee item</option>
+              </select>
+            </label>
+            <div class="mbt-field-pair">
+              <label class="mbt-field" for="deliveryPickup">
+                <span>Pickup location (A)</span>
+                <input id="deliveryPickup" maxlength="500" autocomplete="off" required />
+              </label>
+              <label class="mbt-field" for="deliveryDropoff">
+                <span>Drop-off location (B)</span>
+                <input id="deliveryDropoff" maxlength="500" autocomplete="off" required />
+              </label>
+            </div>
+            <label class="mbt-field" for="deliveryDetails">
+              <span>Delivery details</span>
+              <textarea id="deliveryDetails" rows="3" maxlength="5000" required></textarea>
+            </label>
+            <div class="mbt-field-pair">
+              <label class="mbt-field" for="deliveryWeightLbs">
+                <span>Weight (lb)</span>
+                <input id="deliveryWeightLbs" type="number" min="1" max="1000000" step="1" required />
+              </label>
+              <label class="mbt-field" for="deliveryStopMinutes">
+                <span>Stop time (minutes)</span>
+                <input id="deliveryStopMinutes" type="number" min="0" max="1440" step="1" value="30" required />
+              </label>
+            </div>
+          </fieldset>
+        </section>
+        <div class="mbt-dialog-actions">
+          <button id="addServiceLine" class="mbt-button-secondary" type="button" hidden>Add bin</button>
+          <button id="createQuoteButton" type="submit" disabled>Create order</button>
+        </div>
+        <p id="orderKindHelp" class="mbt-frontdesk-muted">Select Delivery for normal A-to-B work, or BIN for a contract with one or more physical bins.</p>
+      </form>
+    </dialog>
+
+    <dialog id="extensionDialog" aria-labelledby="extensionTitle">
+      <form id="extensionForm" class="mbt-dialog-card">
+        <div class="mbt-dialog-heading">
+          <div>
+            <p class="mbt-eyebrow">Approved amendment</p>
+            <h2 id="extensionTitle">Extend return visit</h2>
+          </div>
+          <button id="closeExtension" class="mbt-button-secondary" type="button" aria-label="Close extension dialog">Close</button>
+        </div>
+        <p>Only this unstarted physical bin’s collection visit will move. Other bins and their ready legs remain unchanged.</p>
+        <div id="extensionFields"></div>
+        <div class="mbt-dialog-actions">
+          <button type="submit">Approve extension</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="serviceLineActionDialog" aria-labelledby="serviceLineActionTitle">
+      <form id="serviceLineActionForm" class="mbt-dialog-card">
+        <div class="mbt-dialog-heading">
+          <div>
+            <p class="mbt-eyebrow">Physical bin service</p>
+            <h2 id="serviceLineActionTitle">Update service line</h2>
+          </div>
+          <button id="closeServiceLineAction" class="mbt-button-secondary" type="button" aria-label="Close service line action dialog">Close</button>
+        </div>
+        <p id="serviceLineActionHelp"></p>
+        <div id="serviceLineActionFields"></div>
+        <div class="mbt-dialog-actions">
+          <button id="serviceLineActionSubmit" type="submit">Save service line action</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script src="/app-sidebar.js"></script>
+    <script src="/mbt-shell.js" type="module"></script>
+    <script src="/mbt-frontdesk.js" type="module"></script>
+  </body>
+</html>

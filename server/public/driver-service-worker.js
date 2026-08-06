@@ -1,23 +1,27 @@
 /* global DriverOfflineSync */
 "use strict";
 
-importScripts("/driver-offline-db.js?v=20260801-immutable-payload-v1");
-importScripts("/driver-offline-sync.js?v=20260801-driver-chinese-v1");
+importScripts("/driver-offline-db.js?v=20260805-online-mode-v3");
+importScripts("/driver-photo-hash.js?v=20260805-online-mode-v3");
+importScripts("/driver-offline-sync.js?v=20260805-online-mode-v3");
 
-const DRIVER_PWA_CLIENT_VERSION = "2026.08.01.2";
+const DRIVER_PWA_CLIENT_VERSION = "2026.08.05.3";
 const DRIVER_CACHE_PREFIX = "mbbs-driver-shell-";
-const DRIVER_CACHE_NAME = `${DRIVER_CACHE_PREFIX}v15`;
-const DRIVER_REFRESH_CACHE_NAME = `${DRIVER_CACHE_PREFIX}refresh-v15`;
+const DRIVER_CACHE_NAME = `${DRIVER_CACHE_PREFIX}v19`;
+const DRIVER_REFRESH_CACHE_NAME = `${DRIVER_CACHE_PREFIX}refresh-v19`;
+const DRIVER_OFFLINE_MODE_REQUEST = "/__mbbs_driver_offline_mode__";
 const DRIVER_SHELL = [
   "/driver",
   "/driver.html",
-  "/driver.css?v=20260801-action-readiness-v1",
+  "/driver.css?v=20260803-bin-pwa-v1",
   "/i18n.css?v=20260701-i18n-v2",
-  "/i18n.js?v=20260801-driver-chinese-v1",
-  "/driver-offline-db.js?v=20260801-immutable-payload-v1",
-  "/driver-offline-photos.js?v=20260731-offline-v8",
-  "/driver-offline-sync.js?v=20260801-driver-chinese-v1",
-  "/driver.js?v=20260801-driver-chinese-v1",
+  "/i18n.js?v=20260803-bin-pwa-v1",
+  "/driver-offline-db.js?v=20260805-online-mode-v3",
+  "/driver-photo-hash.js?v=20260805-online-mode-v3",
+  "/driver-offline-photos.js?v=20260805-online-mode-v3",
+  "/driver-offline-sync.js?v=20260805-online-mode-v3",
+  "/driver-bin-ui.js?v=20260803-bin-pwa-v1",
+  "/driver.js?v=20260805-online-mode-v3",
   "/driver-manifest.webmanifest",
   "/icons/mbbs-yard-192.png",
   "/icons/mbbs-yard-512.png",
@@ -26,9 +30,27 @@ const DRIVER_SHELL = [
 const DRIVER_SHELL_URLS = new Set(DRIVER_SHELL.map((value) => new URL(value, self.location.origin).href));
 
 self.addEventListener("install", (event) => {
-  event.waitUntil(caches.open(DRIVER_CACHE_NAME).then((cache) => cache.addAll(DRIVER_SHELL)));
+  event.waitUntil(caches.open(DRIVER_CACHE_NAME).then(async (cache) => {
+    await cache.addAll(DRIVER_SHELL);
+    await cache.put(DRIVER_OFFLINE_MODE_REQUEST, new Response("false", {
+      headers: { "content-type": "text/plain", "cache-control": "no-store" }
+    }));
+  }));
   self.skipWaiting();
 });
+
+async function driverOfflineModeEnabled() {
+  const cache = await caches.open(DRIVER_CACHE_NAME);
+  const response = await cache.match(DRIVER_OFFLINE_MODE_REQUEST);
+  return response ? (await response.text()) === "true" : false;
+}
+
+async function saveDriverOfflineMode(enabled) {
+  const cache = await caches.open(DRIVER_CACHE_NAME);
+  await cache.put(DRIVER_OFFLINE_MODE_REQUEST, new Response(String(enabled === true), {
+    headers: { "content-type": "text/plain", "cache-control": "no-store" }
+  }));
+}
 
 self.addEventListener("activate", (event) => {
   event.waitUntil((async () => {
@@ -48,6 +70,9 @@ self.addEventListener("message", (event) => {
   if (event.data?.type === "SKIP_WAITING") self.skipWaiting();
   if (event.data?.type === "DRIVER_VERSION_REQUEST") {
     event.source?.postMessage({ type: "DRIVER_VERSION", version: DRIVER_PWA_CLIENT_VERSION });
+  }
+  if (event.data?.type === "DRIVER_OFFLINE_MODE") {
+    event.waitUntil(saveDriverOfflineMode(event.data.enabled === true));
   }
   if (event.data?.type === "DRIVER_SYNC_NOW") {
     event.waitUntil(DriverOfflineSync.syncAll());
@@ -100,6 +125,7 @@ self.addEventListener("fetch", (event) => {
           return response;
         })
         .catch(async () => {
+          if (!(await driverOfflineModeEnabled())) return Response.error();
           const cache = await caches.open(DRIVER_CACHE_NAME);
           return (await cache.match("/driver")) || (await cache.match("/driver.html"));
         })

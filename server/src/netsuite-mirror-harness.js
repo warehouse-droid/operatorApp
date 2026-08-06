@@ -8,7 +8,7 @@ import { createNetSuiteMirrorSignature } from "./netsuite-mirror-service.js";
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(process.env.MBBS_REPO_ROOT || path.resolve(dirname, "../.."));
-const serverRoot = path.join(repoRoot, "server");
+const serverRoot = path.resolve(process.env.MBBS_SERVER_ROOT || path.join(repoRoot, "server"));
 const secret = "mirror-harness-secret";
 const timestamp = "1784419200";
 const method = "POST";

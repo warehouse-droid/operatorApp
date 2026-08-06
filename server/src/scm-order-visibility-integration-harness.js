@@ -8,6 +8,7 @@ const seed = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
 const prefix = `VISIBILITY-${seed}`;
 const password = "Rollback123";
 const baseId = -(800000000000000 + Number(seed.slice(-9)) * 20);
+const staleHoldId = Math.abs(baseId) + 1000;
 const vendorId = 700000000 + Number(seed.slice(-7));
 const itemId = 600000000 + Number(seed.slice(-7));
 
@@ -17,6 +18,13 @@ const purchaseFixtures = [
   { id: baseId - 3, ref: `${prefix}-PO-HOLD`, status: "Hold" },
   { id: baseId - 4, ref: `${prefix}-PO-COMPLETED`, status: "Completed" },
   { id: baseId - 5, ref: `${prefix}-PO-CANCELLED`, status: "Cancelled" },
+  {
+    id: staleHoldId,
+    ref: `${prefix}-PO-STALE-RECON-HOLD`,
+    status: "Hold",
+    initialStatus: "Hold",
+    scheduleStatus: "Hold"
+  },
   {
     id: baseId - 6,
     ref: `${prefix}-PO-INITIAL-HOLD-QUEUED`,
@@ -277,6 +285,32 @@ try {
   for (const [index, fixture] of transferFixtures.entries()) {
     await insertTransferFixture(fixture, index);
   }
+  const staleHoldRef = `${prefix}-PO-STALE-RECON-HOLD`;
+  await query(
+    `INSERT INTO scm_reconciliation_order_state (
+       order_kind, source_order_netsuite_id, source_order_ref,
+       application_status, reconciliation_status, reconciliation_source,
+       ordered_qty, remaining_qty, quantity_summary, reconciled_at
+     ) VALUES (
+       'PO', $1, $2,
+       'Queued', 'ok', 'manual',
+       10, 10, $3::jsonb, now() - interval '10 minutes'
+     )`,
+    [
+      staleHoldId,
+      staleHoldRef,
+      JSON.stringify({
+        family: { ordered: 10, remaining: 10, applicationStatus: "Queued" },
+        targets: {
+          [staleHoldRef]: {
+            ordered: 10,
+            remaining: 10,
+            applicationStatus: "Queued"
+          }
+        }
+      })
+    ]
+  );
 
   const accountSpecs = [
     { key: "dispatcher", role: "dispatcher", yardLocationIds: [] },
@@ -306,6 +340,25 @@ try {
   for (const [key, account] of Object.entries(accounts)) {
     tokens[key] = await login(baseUrl, account);
   }
+
+  const mismatchedGroupRefs = [
+    `${prefix}-PO-QUEUED`,
+    `${prefix}-PO-HOLD`
+  ];
+  const mismatchedGroup = await requestJson(baseUrl, "/api/scm/schedule-groups?includeSchedule=false", {
+    method: "POST",
+    token: tokens.scm,
+    body: { refs: mismatchedGroupRefs }
+  });
+  assert.equal(mismatchedGroup.response.status, 400,
+    "SCM grouping must reject purchase orders with different effective statuses.");
+  assert.equal(mismatchedGroup.payload?.code, "SCM_GROUP_STATUS_MISMATCH");
+  assert.match(String(mismatchedGroup.payload?.error || ""), /different SCM statuses/i);
+  const rejectedGroupRef = `PGOB-${mismatchedGroupRefs.join("-")}`;
+  assert.equal((await query(
+    "SELECT count(*)::int AS count FROM scm_schedule_groups WHERE group_ref = $1",
+    [rejectedGroupRef]
+  )).rows[0].count, 0, "A status-mismatched group must roll back without creating a group row.");
 
   for (const [role, token] of [
     ["Dispatcher", tokens.dispatcher],
@@ -389,6 +442,19 @@ try {
     );
   }
 
+  const poSplitResponse = await requestJson(
+    baseUrl,
+    `/api/dispatch/scm/purchase-orders?search=${encodeURIComponent(staleHoldRef)}`,
+    { token: tokens.scm }
+  );
+  assert.equal(poSplitResponse.response.status, 200,
+    "SCM PO Split source request should succeed.");
+  const staleHoldRow = fixtureRows(poSplitResponse.payload)
+    .find((row) => String(row.id) === staleHoldRef);
+  assert(staleHoldRow, "The stale-reconciliation PO fixture must be returned to SCM.");
+  assert.equal(staleHoldRow.scm?.status, "Hold",
+    "A newer saved Hold must override an older Queued reconciliation snapshot on PO Split.");
+
   console.log("SCM restricted-order DB/API integration harness passed.");
 } finally {
   if (server) {
@@ -398,6 +464,10 @@ try {
   const purchaseIds = purchaseFixtures.map((fixture) => fixture.id);
   const transferIds = transferFixtures.map((fixture) => fixture.id);
   const refs = allFixtures.map((fixture) => fixture.ref);
+  await query(
+    "DELETE FROM scm_reconciliation_order_state WHERE order_kind = 'PO' AND source_order_netsuite_id = $1",
+    [staleHoldId]
+  ).catch(() => null);
   await query("DELETE FROM scm_transport_schedule WHERE order_ref = ANY($1::text[])", [refs]).catch(() => null);
   await query("DELETE FROM transfer_order_lines WHERE transfer_order_id = ANY($1::bigint[])", [transferIds]).catch(() => null);
   await query("DELETE FROM transfer_orders WHERE netsuite_id = ANY($1::bigint[])", [transferIds]).catch(() => null);

@@ -74,8 +74,8 @@ assert.match(
 );
 assert.match(
   nextJobRoute,
-  /res\.json\(\{ state, job, rest, restSummary, routeBootstrap \}\)/,
-  "The next-job response must return the day state and fast offline bootstrap metadata."
+  /res\.json\(\{ state, job, rest, restSummary, pendingCompletion, routeBootstrap \}\)/,
+  "The next-job response must return the day state, cross-device completion guard, and fast offline bootstrap metadata."
 );
 
 assert.match(

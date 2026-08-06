@@ -5,6 +5,7 @@ import { isNetSuiteSandboxEnvironment } from "./config.js";
 import { writeAudit } from "./auth-repository.js";
 import { getDispatchDeliveryGroup, listDispatchDeliveryGroups } from "./dispatch-delivery-group-repository.js";
 import { remapDispatchLinksToMaterializedSplit } from "./dispatch-order-target-repository.js";
+import { isNetSuiteSalesOrderBilled } from "./sales-order-reconciliation.js";
 
 function normalizeNumber(value) {
   if (value === null || value === undefined || value === "") return null;
@@ -40,6 +41,47 @@ function roundQuantity(value) {
 }
 
 const LOAD_SALES_QTY_TOLERANCE = 0.1;
+
+function exactBilledSalesOrderSql(alias) {
+  return `(
+    UPPER(BTRIM(COALESCE(${alias}.status, ''))) = 'G'
+    OR UPPER(REGEXP_REPLACE(
+         REGEXP_REPLACE(BTRIM(COALESCE(${alias}.status_text, '')), '\\s*:\\s*', ':', 'g'),
+         '\\s+', ' ', 'g'
+       ))
+       IN ('BILLED', 'SALES ORDER:BILLED')
+  )`;
+}
+
+function billedSalesOrderFamilySql(alias) {
+  return `(
+    ${exactBilledSalesOrderSql(alias)}
+    OR EXISTS (
+      SELECT 1
+        FROM dispatch_scm_so_splits family_membership
+        JOIN sales_orders billed_source
+          ON billed_source.netsuite_id = family_membership.source_so_id
+       WHERE (
+         family_membership.source_so_id = ${alias}.netsuite_id
+         OR family_membership.split_so_id = ${alias}.netsuite_id
+       )
+         AND ${exactBilledSalesOrderSql("billed_source")}
+    )
+    OR EXISTS (
+      SELECT 1
+        FROM dispatch_scm_so_splits family_membership
+        JOIN dispatch_scm_so_splits billed_membership
+          ON billed_membership.source_so_id = family_membership.source_so_id
+        JOIN sales_orders billed_split
+          ON billed_split.netsuite_id = billed_membership.split_so_id
+       WHERE (
+         family_membership.source_so_id = ${alias}.netsuite_id
+         OR family_membership.split_so_id = ${alias}.netsuite_id
+       )
+         AND ${exactBilledSalesOrderSql("billed_split")}
+    )
+  )`;
+}
 
 function syntheticOrderId(value) {
   const hex = crypto.createHash("sha1").update(String(value || "")).digest("hex").slice(0, 12);
@@ -1562,6 +1604,7 @@ export async function listDeliveryOrders({ locationId = null, status = "active",
               NULL::bigint AS destination_location_id, NULL::text AS destination_location
        FROM sales_orders
        WHERE sales_order_type <> '${CUSTOMER_PICKUP_DELIVERY_METHOD.replaceAll("'", "''")}'
+         AND NOT ${billedSalesOrderFamilySql("sales_orders")}
          AND (COALESCE(is_test_fixture, false) = false OR ${sandboxSql})
        UNION ALL
        SELECT netsuite_id, tranid, trandate, NULL::bigint AS customer_id, NULL::text AS customer,
@@ -1853,6 +1896,7 @@ export async function listSavedDeliveryOrdersForOperator(operatorId, { locationI
   for (const item of saved.rows) {
     const order = orderByKey.get(String(item.order_key));
     if (!order) continue;
+    if (order.order_type === "sales_order" && isNetSuiteSalesOrderBilled(order)) continue;
     if (isFullyLoadedDeliveryOrder(order)) continue;
     rows.push({
       ...order,
@@ -1867,11 +1911,21 @@ export async function listSavedDeliveryOrdersForOperator(operatorId, { locationI
 export async function listSavedDeliveryOrderKeysForOperator(operatorId, { locationId } = {}) {
   if (!operatorId || !locationId) return [];
   const result = await query(
-    `SELECT order_key
-       FROM operator_saved_delivery_orders
-      WHERE operator_id = $1
-        AND location_id = $2
-      ORDER BY created_at DESC`,
+    `SELECT saved.order_key
+       FROM operator_saved_delivery_orders saved
+      WHERE saved.operator_id = $1
+        AND saved.location_id = $2
+        AND NOT EXISTS (
+          SELECT 1
+            FROM sales_orders sales_order
+           WHERE saved.order_type = 'sales_order'
+             AND (
+               sales_order.netsuite_id::text = saved.order_key
+               OR upper(sales_order.tranid) = upper(saved.order_ref)
+             )
+             AND ${billedSalesOrderFamilySql("sales_order")}
+        )
+      ORDER BY saved.created_at DESC`,
     [operatorId, locationId]
   );
   return result.rows.map((row) => String(row.order_key));
@@ -2204,6 +2258,7 @@ export async function findCustomerPickupOrder(code, { locationId = null } = {}) 
         ${locationClause}
         AND sales_order_type = $${params.length + 1}
         AND NOT (status = 'A' OR status_text ILIKE '%Pending Approval%')
+        AND NOT ${billedSalesOrderFamilySql("sales_orders")}
         AND LOWER(COALESCE(local_yard_order_status, 'Open')) IN ('open', 'partial_loaded', 'partially loaded', 'loaded')
          AND netsuite_active = true
          AND COALESCE(is_test_fixture, false) = false
@@ -2246,6 +2301,26 @@ async function materializeSalesSplitOrder(order, parent) {
            netsuite_active = true,
            synced_at = now()`,
     [splitId, order.id, order.notes || `Split from ${order.originalOrderId}`, dateOnly(order.expectedDeliveryDate || order.expected_delivery_date), parent.netsuite_id]
+  );
+  await query(
+    `INSERT INTO dispatch_scm_so_splits (
+       source_so_id, source_so_ref, split_so_id, split_so_ref,
+       status, created_by, created_at, cancelled_at, details
+     ) VALUES ($1, $2, $3, $4, 'active', 'dispatch-plan', now(), NULL, $5::jsonb)
+     ON CONFLICT (split_so_ref) DO UPDATE SET
+       source_so_id = EXCLUDED.source_so_id,
+       source_so_ref = EXCLUDED.source_so_ref,
+       split_so_id = EXCLUDED.split_so_id,
+       status = 'active',
+       cancelled_at = NULL,
+       details = dispatch_scm_so_splits.details || EXCLUDED.details`,
+    [
+      parent.netsuite_id,
+      order.originalOrderId,
+      splitId,
+      order.id,
+      JSON.stringify({ materializedBy: "dispatch-plan", originalOrderId: order.originalOrderId })
+    ]
   );
   if (!splitItems.length) return splitId;
   await query("DELETE FROM sales_order_lines WHERE sales_order_id = $1 AND COALESCE(loaded_qty, 0) = 0 AND COALESCE(packed_pallet_qty, 0) = 0 AND COALESCE(packed_layer_qty, 0) = 0 AND COALESCE(packed_section_qty, 0) = 0 AND COALESCE(packed_piece_qty, 0) = 0", [splitId]);
@@ -2685,6 +2760,21 @@ async function materializeDispatchSplitOrders(plan) {
     [plan.planDate, activeSplitRefs]
   );
   await query(
+    `UPDATE dispatch_scm_so_splits split
+        SET status = 'cancelled',
+            cancelled_at = COALESCE(split.cancelled_at, now()),
+            details = COALESCE(split.details, '{}'::jsonb)
+              || jsonb_build_object(
+                   'cancelledBy', 'dispatch-plan',
+                   'cancelledReason', 'omitted-from-plan',
+                   'lastCancelledAt', now()
+                 )
+       FROM sales_orders split_order
+      WHERE split_order.netsuite_id = split.split_so_id
+        AND split_order.netsuite_active = false
+        AND split.status = 'active'`
+  );
+  await query(
     `WITH deactivated AS (
        UPDATE transfer_orders candidate
           SET netsuite_active = false,
@@ -2983,7 +3073,21 @@ async function deactivateUnplannedDispatchSplitOrdersInTransaction({ originalOrd
       WHERE tranid = ANY($1::text[])`,
     [refs]
   );
-  if (!isSales) {
+  if (isSales) {
+    await query(
+      `UPDATE dispatch_scm_so_splits split
+          SET status = 'cancelled',
+              cancelled_at = COALESCE(split.cancelled_at, now()),
+              details = COALESCE(split.details, '{}'::jsonb)
+                || jsonb_build_object(
+                     'cancelledBy', 'dispatch-unsplit',
+                     'cancelledReason', 'unplanned-split-deactivated',
+                     'lastCancelledAt', now()
+                   )
+        WHERE split.split_so_ref = ANY($1::text[])`,
+      [refs]
+    );
+  } else {
     await query(
       `UPDATE dispatch_scm_to_splits split
           SET status = 'cancelled',
@@ -4713,6 +4817,7 @@ export async function getCurrentOperatorDeliveryDraft(operatorId, { locationId =
            LEFT JOIN sales_order_lines l ON l.sales_order_id = o.netsuite_id
           WHERE o.preparing_operator_id::text = $1
             AND COALESCE(o.sales_order_type, '') <> '${CUSTOMER_PICKUP_DELIVERY_METHOD.replaceAll("'", "''")}'
+            AND NOT ${billedSalesOrderFamilySql("o")}
             AND NOT EXISTS (
               SELECT 1
                 FROM operator_consolidation_claims consolidation_claim

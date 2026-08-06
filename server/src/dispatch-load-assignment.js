@@ -1,3 +1,10 @@
+import {
+  dispatchLocationKey,
+  dispatchLocationRoot,
+  dispatchLocationsShareYard,
+  uniqueDispatchLocations
+} from "./dispatch-location.js";
+
 const DEFAULT_SWITCH_MINUTES = 10;
 const DEFAULT_OWN_YARDS = ["3445", "2967", "12441", "150"];
 const DEFAULT_OWN_YARD_ADDRESSES = {
@@ -142,18 +149,32 @@ function normalizedPhysicalVisitText(value) {
     .trim();
 }
 
+function normalizedYardLocationText(value) {
+  return normalizedPhysicalVisitText(dispatchLocationRoot(value));
+}
+
+function scopedPurchaseOrderDropLocation(stop = {}, order = {}) {
+  const orderType = text(order.type || order.orderType || order.order_type).toUpperCase();
+  const purchaseOrder = orderType === "PO" || orderType === "PURCHASE_ORDER";
+  const lineRowIds = stop.lineRowIds ?? stop.line_row_ids;
+  const lineScoped = Array.isArray(lineRowIds) && lineRowIds.length > 0;
+  const dropoffScoped = Boolean(text(stop.dropoffKey || stop.dropoff_key));
+  return purchaseOrder && (lineScoped || dropoffScoped) ? text(stop.location) : "";
+}
+
 function dispatchDropLocation(stop = {}, order = {}) {
   return text(
     stop.dropLocation
     || stop.drop_location
     || stop.destinationYard
     || stop.destination_yard
+    || dispatchDropoffForStop(order, stop)?.destinationYard
+    || dispatchDropoffForStop(order, stop)?.destination_yard
+    || scopedPurchaseOrderDropLocation(stop, order)
     || order.destinationYard
     || order.destination_yard
     || order.toLocation
     || order.to_location
-    || stop.location
-    || stop.yard
   );
 }
 
@@ -181,13 +202,16 @@ function dispatchStopPhysicalAddress(stop = {}, order = {}) {
     || order.drop_address
     || order.address
     || dispatchDropLocation(stop, order)
+    || stop.location
+    || stop.yard
   );
 }
 
 function dispatchStopPhysicalAddressKey(plan = {}, stop = {}, order = {}) {
   const dropLocation = dispatchDropLocation(stop, order);
   const ownYards = new Set(dispatchOwnYardCodes(plan).map((value) => normalizedPhysicalVisitText(value)));
-  if (ownYards.has(normalizedPhysicalVisitText(dropLocation))) {
+  const rootLocation = dispatchLocationRoot(dropLocation);
+  if (ownYards.has(normalizedPhysicalVisitText(rootLocation))) {
     const configuredYards = [
       ...(Array.isArray(plan.ownYards) ? plan.ownYards : []),
       ...(Array.isArray(plan.summary?.ownYards) ? plan.summary.ownYards : []),
@@ -195,10 +219,10 @@ function dispatchStopPhysicalAddressKey(plan = {}, stop = {}, order = {}) {
     ];
     const configuredYard = configuredYards.find((yard) =>
       yard && typeof yard === "object"
-      && normalizedPhysicalVisitText(yard.code || yard.name || yard.id) === normalizedPhysicalVisitText(dropLocation)
+      && dispatchLocationsShareYard(yard.code || yard.name || yard.id, dropLocation)
     );
-    const address = text(configuredYard?.address || DEFAULT_OWN_YARD_ADDRESSES[dropLocation]);
-    return normalizedPhysicalVisitText(address) || `own:${normalizedPhysicalVisitText(dropLocation)}`;
+    const address = text(configuredYard?.address || DEFAULT_OWN_YARD_ADDRESSES[rootLocation]);
+    return normalizedPhysicalVisitText(address) || `own:${normalizedPhysicalVisitText(rootLocation)}`;
   }
   return normalizedPhysicalVisitText(dispatchStopPhysicalAddress(stop, order));
 }
@@ -271,7 +295,7 @@ function dispatchDropFootprintPallets(order = {}, stop = {}) {
 }
 
 function normalizedDispatchPickupLocation(value) {
-  return text(value).toLowerCase();
+  return dispatchLocationKey(value);
 }
 
 function dispatchPickupEntriesForLocation(order = {}, field, location = "") {
@@ -330,10 +354,14 @@ function dispatchOwnYardLocationKeys(plan = {}) {
       for (const candidate of [value.code, value.name, value.address, value.id]) {
         const candidateKey = normalizedPhysicalVisitText(candidate);
         if (candidateKey) keys.add(candidateKey);
+        const rootKey = normalizedYardLocationText(candidate);
+        if (rootKey) keys.add(rootKey);
       }
     } else {
       const candidateKey = normalizedPhysicalVisitText(value);
       if (candidateKey) keys.add(candidateKey);
+      const rootKey = normalizedYardLocationText(value);
+      if (rootKey) keys.add(rootKey);
     }
   }
   return keys;
@@ -341,10 +369,10 @@ function dispatchOwnYardLocationKeys(plan = {}) {
 
 function dispatchItemForPickupLocation(plan = {}, order = {}, item = {}, location = "") {
   if (text(order.type).toUpperCase() === "CUSTOM") return item;
-  const ownYard = dispatchOwnYardLocationKeys(plan).has(normalizedPhysicalVisitText(location));
+  const ownYard = dispatchOwnYardLocationKeys(plan).has(normalizedYardLocationText(location));
   if (ownYard) {
     const source = text(order.sourceYard || order.outboundLocation);
-    const direct = source === text(location)
+    const direct = dispatchLocationsShareYard(source, location)
       ? dispatchDirectPickupAllocatedForItem(order, item)
       : { pallets: 0, layers: 0, sections: 0, pieces: 0, quantity: 0 };
     const balance = (value, allocated) => Math.max(dispatchNumber(value) - dispatchNumber(allocated), 0);
@@ -382,11 +410,11 @@ function dispatchItemHasQuantity(item = {}) {
 function dispatchPickupItemsForLocation(plan = {}, order = {}, location = "") {
   if (text(order.type).toUpperCase() === "PO") return (order.items || []).filter(dispatchItemHasQuantity);
   const directItems = dispatchDirectPickupItemsForLocation(order, location);
-  if (directItems.length && text(order.sourceYard || order.outboundLocation) !== text(location)) {
+  if (directItems.length && !dispatchLocationsShareYard(order.sourceYard || order.outboundLocation, location)) {
     return directItems.filter(dispatchItemHasQuantity);
   }
   const poItems = dispatchPoPickupItemsForLocation(order, location);
-  const ownYard = dispatchOwnYardLocationKeys(plan).has(normalizedPhysicalVisitText(location));
+  const ownYard = dispatchOwnYardLocationKeys(plan).has(normalizedYardLocationText(location));
   if (poItems.length && !ownYard) return poItems.filter(dispatchItemHasQuantity);
   return (order.items || [])
     .map((item) => dispatchItemForPickupLocation(plan, order, item, location))
@@ -416,13 +444,7 @@ function dispatchRequiredPickupLocations(plan = {}, order = {}) {
   const locations = Array.isArray(order.pickupLocations) && order.pickupLocations.length
     ? order.pickupLocations
     : ["3445"];
-  const seen = new Set();
-  const uniqueLocations = locations.filter((location) => {
-    const locationKey = normalizedDispatchPickupLocation(location);
-    if (!locationKey || seen.has(locationKey)) return false;
-    seen.add(locationKey);
-    return true;
-  });
+  const uniqueLocations = uniqueDispatchLocations(locations);
   const hasPickupAddressOverride = Boolean(text(order.pickupAddressOverride));
   return uniqueLocations.filter((location, index) =>
     (hasPickupAddressOverride && index === 0)
@@ -431,7 +453,7 @@ function dispatchRequiredPickupLocations(plan = {}, order = {}) {
 }
 
 function dispatchPickupFootprintForLocation(plan = {}, load = {}, location = "") {
-  const pickupLocation = text(location);
+  const pickupLocation = dispatchLocationKey(location);
   const countedOrders = new Set();
   let total = 0;
   for (const stop of load.stops || []) {
@@ -440,7 +462,8 @@ function dispatchPickupFootprintForLocation(plan = {}, load = {}, location = "")
     if (!orderId || countedOrders.has(orderId)) continue;
     const order = dispatchOrderByRef(plan, orderId);
     if (!order) continue;
-    if (!dispatchRequiredPickupLocations(plan, order).map(text).includes(pickupLocation)) continue;
+    if (!dispatchRequiredPickupLocations(plan, order)
+      .some((candidate) => dispatchLocationKey(candidate) === pickupLocation)) continue;
     countedOrders.add(orderId);
     total += dispatchPickupFootprintForOrderLocation(plan, order, pickupLocation);
   }
@@ -492,7 +515,7 @@ function dispatchVisitServiceType(plan = {}, entries = []) {
     const location = pickup
       ? pickupAddressOverride || text(stop.location || stop.yard)
       : dispatchDropLocation(stop, order);
-    if (ownYards.has(normalizedPhysicalVisitText(location))) return "own_yard";
+    if (ownYards.has(normalizedYardLocationText(location))) return "own_yard";
     if (pickup || isLocalDispatchVrmaOrder(order)) return "vendor_yard";
     return "delivery";
   });
@@ -805,10 +828,13 @@ function lastRoutedStop(load = {}) {
 }
 
 export function loadEndYard(load = {}, ownYards = null, plan = {}) {
-  const own = new Set(dispatchOwnYardCodes(plan, ownYards));
+  const ownByKey = new Map(dispatchOwnYardCodes(plan, ownYards)
+    .map((yard) => [dispatchLocationKey(yard), yard])
+    .filter(([yardKey]) => Boolean(yardKey)));
+  const ownYardFor = (value) => ownByKey.get(dispatchLocationKey(value)) || "";
   if (load.returnOnly) {
     const yard = text(load.returnYard || load.return_yard);
-    return own.has(yard) ? yard : "";
+    return ownYardFor(yard);
   }
   const stop = lastRoutedStop(load);
   const order = stop?.type === "drop"
@@ -829,9 +855,9 @@ export function loadEndYard(load = {}, ownYards = null, plan = {}) {
         order?.destination_yard,
         order?.toLocation,
         order?.to_location
-      ];
+  ];
   const normalizedCandidates = candidates.map(text).filter(Boolean);
-  return normalizedCandidates.find((candidate) => own.has(candidate)) || "";
+  return normalizedCandidates.map(ownYardFor).find(Boolean) || "";
 }
 
 function conflict(code, message, details = {}) {
@@ -1013,7 +1039,7 @@ export function validateDispatchLoadAssignments(plan = {}, {
   const parsedSwitchMinutes = Number(switchMinutes);
   const cleanSwitchMinutes = Math.max(0, Math.round(Number.isFinite(parsedSwitchMinutes) ? parsedSwitchMinutes : DEFAULT_SWITCH_MINUTES));
   const resolvedOwnYards = dispatchOwnYardCodes(plan, ownYards);
-  const own = new Set(resolvedOwnYards);
+  const own = new Set(resolvedOwnYards.map(dispatchLocationKey).filter(Boolean));
 
   for (const row of rows) {
     if (requireAssignments && (!row.driverLogin || !row.truckPlate)) {
@@ -1066,8 +1092,8 @@ export function validateDispatchLoadAssignments(plan = {}, {
       const switchYard = text(current.switchYard);
       const handoffFrom = text(current.handoffTravelFrom);
       const handoffTo = text(current.handoffTravelTo);
-      const hasPlannedApproach = handoffMinutes > 0 && handoffFrom && handoffTo === switchYard;
-      if (requireAssignments && (!own.has(switchYard) || ((!previousEndYard || previousEndYard !== switchYard) && !hasPlannedApproach))) {
+      const hasPlannedApproach = handoffMinutes > 0 && handoffFrom && dispatchLocationsShareYard(handoffTo, switchYard);
+      if (requireAssignments && (!own.has(dispatchLocationKey(switchYard)) || ((!previousEndYard || !dispatchLocationsShareYard(previousEndYard, switchYard)) && !hasPlannedApproach))) {
         conflicts.push(conflict("DISPATCH_TRUCK_HANDOFF_INVALID", `Truck switch for ${previous.driverName || driverLogin} needs a travel leg to the same own yard before the switch.`, {
           driverLogin,
           previousLoadId: text(previous.load.id),
@@ -1100,7 +1126,7 @@ export function validateDispatchLoadAssignments(plan = {}, {
       const targetAvailableYard = previousTargetUse
         ? loadEndYard(previousTargetUse.load, resolvedOwnYards, plan)
         : text(current.truck?.base);
-      if (requireAssignments && ((previousTargetUse && !targetAvailableYard) || (targetAvailableYard && targetAvailableYard !== switchYard))) {
+      if (requireAssignments && ((previousTargetUse && !targetAvailableYard) || (targetAvailableYard && !dispatchLocationsShareYard(targetAvailableYard, switchYard)))) {
         conflicts.push(conflict("DISPATCH_TRUCK_HANDOFF_INVALID", targetAvailableYard
           ? `${current.truckPlate} is available at ${targetAvailableYard}, not ${switchYard}, for this truck switch.`
           : `${current.truckPlate} did not finish its previous load at an own yard. Add a return load before this truck switch.`, {
@@ -1139,7 +1165,7 @@ export function validateDispatchLoadAssignments(plan = {}, {
       if (!previous.isHandoffTravel && !current.isHandoffTravel && previous.driverLogin && current.driverLogin && previous.driverLogin !== current.driverLogin) {
         const previousEndYard = loadEndYard(previous.load, resolvedOwnYards, plan);
         const handoffYard = text(current.switchYard);
-        if (requireAssignments && (!previousEndYard || !own.has(handoffYard) || previousEndYard !== handoffYard)) {
+        if (requireAssignments && (!previousEndYard || !own.has(dispatchLocationKey(handoffYard)) || !dispatchLocationsShareYard(previousEndYard, handoffYard))) {
           conflicts.push(conflict("DISPATCH_TRUCK_HANDOFF_INVALID", `${truckPlate} must finish at ${handoffYard || "the next start yard"} before it can be handed to ${current.driverName || current.driverLogin}.`, {
             truckPlate,
             driverLogins: [previous.driverLogin, current.driverLogin],

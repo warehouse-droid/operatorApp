@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MBT Bin Operations · MBBS Operations</title>
+    <link rel="stylesheet" href="/mbt-shell.css" />
+  </head>
+  <body data-mbt-surface="home">
+    <main id="mbtApp" class="dispatch-shell mbt-shell" aria-labelledby="mbtTitle">
+      <header class="mbt-app-topbar">
+        <div class="mbt-app-brand">
+          <span class="mbt-app-mark" aria-hidden="true">MB</span>
+          <div>
+            <p>Mr Bin Trucking · Local pilot</p>
+            <h1 id="mbtTitle">MBT Bin Operations</h1>
+          </div>
+        </div>
+        <span class="mbt-app-mode">Local-only workspace</span>
+      </header>
+      <p class="mbt-lead">
+        Configure local master data, manage bin assets, prepare contracts,
+        dispatch BIN work, complete Driver PWA visits, and review local billing evidence.
+      </p>
+
+      <section class="mbt-status" aria-live="polite" aria-busy="true" data-tone="safe">
+        <h2>Loading local testing status</h2>
+        <p>Checking your live authority and server-owned capability gates.</p>
+      </section>
+
+      <section class="mbt-menu-panel" aria-labelledby="mbtMenuTitle">
+        <h2 id="mbtMenuTitle">MBT menu</h2>
+        <p>Only modules permitted by your current staff roles are shown.</p>
+        <nav id="mbtMenu" class="mbt-menu-grid" aria-label="MBT modules"></nav>
+      </section>
+    </main>
+    <script src="/app-sidebar.js"></script>
+    <script src="/mbt-home.js" type="module"></script>
+  </body>
+</html>

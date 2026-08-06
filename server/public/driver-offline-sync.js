@@ -1,9 +1,17 @@
 (function driverOfflineSync(global) {
   "use strict";
 
-  const DRIVER_PWA_CLIENT_VERSION = "2026.08.01.2";
+  const DRIVER_PWA_CLIENT_VERSION = "2026.08.05.3";
   const DRIVER_PWA_VERSION_HEADER = "X-MBBS-Driver-Version";
   const LEASE_TTL_MS = 120000;
+  const LEASE_HEARTBEAT_MS = 30000;
+  const PHOTO_MEBIBYTE = 1024 * 1024;
+  const PHOTO_TRANSFER_BASE_TIMEOUT_MS = 60000;
+  const PHOTO_TRANSFER_CHUNK_TIMEOUT_MS = 30000;
+  const PHOTO_TRANSFER_CHUNK_BYTES = 256 * 1024;
+  const PHOTO_TRANSFER_MAX_TIMEOUT_MS = 6 * 60 * 1000;
+  const PHOTO_RETRY_BASE_MS = 15000;
+  const PHOTO_RETRY_MAX_MS = 15 * 60 * 1000;
   const JOB_BOUND_EVENT_TYPES = new Set(["job_started", "job_completed", "truck_switched_physical"]);
   const ownerId = `sync-${global.DriverOfflineDB.createUuid()}`;
   let configuration = {
@@ -12,9 +20,45 @@
     onUpdated: () => {}
   };
   const activeRuns = new Map();
+  const partitionRetryTimers = new Map();
 
   function configure(options = {}) {
     configuration = { ...configuration, ...options };
+  }
+
+  function clearPartitionRetryTimer(partitionKey) {
+    const timers = partitionRetryTimers.get(partitionKey);
+    for (const timer of timers || []) clearTimeout(timer);
+    partitionRetryTimers.delete(partitionKey);
+  }
+
+  function schedulePartitionRetry(partitionKey, failures = [], { continueDrain = false } = {}) {
+    const retryTimes = failures
+      .filter((failure) => failure?.retryable === true)
+      .map((failure) => Date.parse(failure.nextAttemptAt || ""))
+      .filter(Number.isFinite);
+    if (!partitionKey || (!retryTimes.length && !continueDrain)) return false;
+    clearPartitionRetryTimer(partitionKey);
+    const timers = new Set();
+    const schedule = (delay) => {
+      const timer = setTimeout(() => {
+        timers.delete(timer);
+        if (!timers.size) partitionRetryTimers.delete(partitionKey);
+        void syncPartition(partitionKey).catch(() => {});
+      }, delay);
+      timers.add(timer);
+    };
+    // If a transfer broke the loop, immediately run another pass while that
+    // photo is in backoff. This lets later retained photos make progress.
+    if (continueDrain) schedule(1000);
+    if (retryTimes.length) {
+      schedule(Math.max(
+        1000,
+        Math.min(PHOTO_RETRY_MAX_MS, Math.min(...retryTimes) - Date.now())
+      ));
+    }
+    partitionRetryTimers.set(partitionKey, timers);
+    return true;
   }
 
   async function assertPartitionSession(profile) {
@@ -80,6 +124,128 @@
       throw error;
     }
     return payload;
+  }
+
+  function photoTransferTimeoutMs(photo) {
+    const bytes = Math.max(1, Number(photo?.byteSize || photo?.blob?.size || 0));
+    const chunks = Math.max(1, Math.ceil(bytes / PHOTO_TRANSFER_CHUNK_BYTES));
+    return Math.min(
+      PHOTO_TRANSFER_MAX_TIMEOUT_MS,
+      PHOTO_TRANSFER_BASE_TIMEOUT_MS + chunks * PHOTO_TRANSFER_CHUNK_TIMEOUT_MS
+    );
+  }
+
+  function retryablePhotoError(error) {
+    if (typeof error?.retryable === "boolean") return error.retryable;
+    const code = String(error?.code || "");
+    if ([
+      "driver_offline_photo_blob_missing",
+      "driver_offline_photo_blob_size_mismatch",
+      "driver_offline_photo_blob_hash_mismatch"
+    ].includes(code)) return false;
+    const status = Number(error?.status || error?.httpStatus || 0);
+    if (status) return status === 408 || status === 425 || status === 429 || status >= 500;
+    return Boolean(error?.isNetworkError || error?.name === "AbortError" || code === "driver_photo_upload_timeout")
+      || !code.startsWith("driver_offline_photo_blob_");
+  }
+
+  function photoRetryDelayMs(photo, attemptCount) {
+    const sizeUnits = Math.max(1, Math.ceil(
+      Number(photo?.byteSize || photo?.blob?.size || 0) / PHOTO_MEBIBYTE
+    ));
+    const exponent = Math.min(5, Math.max(0, Number(attemptCount || 1) - 1));
+    return Math.min(PHOTO_RETRY_MAX_MS, PHOTO_RETRY_BASE_MS * sizeUnits * (2 ** exponent));
+  }
+
+  function decoratePhotoError(error, photo, { phase, attemptCount }) {
+    const decorated = error && typeof error === "object"
+      ? error
+      : new Error(String(error || "Photo upload failed."));
+    decorated.phase = String(decorated.phase || phase || "upload");
+    decorated.status = Math.max(0, Number(decorated.status || decorated.httpStatus || 0));
+    decorated.retryable = retryablePhotoError(decorated);
+    decorated.attemptCount = Math.max(0, Number(attemptCount || 0));
+    decorated.nextAttemptAt = decorated.retryable
+      ? new Date(Date.now() + photoRetryDelayMs(photo, decorated.attemptCount)).toISOString()
+      : null;
+    return decorated;
+  }
+
+  function photoFailure(photo, error) {
+    return {
+      photoId: String(photo?.photoId || ""),
+      eventId: String(photo?.eventId || ""),
+      phase: String(error?.phase || "upload"),
+      byteSize: Math.max(0, Number(photo?.byteSize || photo?.blob?.size || 0)),
+      attemptCount: Math.max(0, Number(error?.attemptCount ?? photo?.attemptCount ?? 0)),
+      retryable: error?.retryable === true,
+      nextAttemptAt: error?.nextAttemptAt || null,
+      errorCode: String(error?.code || ""),
+      httpStatus: Math.max(0, Number(error?.status || error?.httpStatus || 0)),
+      message: String(error?.message || error || "Photo upload failed.")
+    };
+  }
+
+  async function withPhotoTransferGuard(partitionKey, photo, outerSignal, task) {
+    const controller = new AbortController();
+    let settled = false;
+    let heartbeatTimer = null;
+    let rejectGuard = null;
+    const guard = new Promise((_, reject) => {
+      rejectGuard = reject;
+    });
+    const fail = (error) => {
+      if (settled) return;
+      controller.abort();
+      rejectGuard(error);
+    };
+    const onOuterAbort = () => {
+      const error = new Error("Driver photo synchronization was cancelled.");
+      error.name = "AbortError";
+      error.code = "driver_photo_upload_cancelled";
+      fail(error);
+    };
+    if (outerSignal?.aborted) onOuterAbort();
+    else outerSignal?.addEventListener?.("abort", onOuterAbort, { once: true });
+
+    const timeout = setTimeout(() => {
+      const error = new Error(
+        `Photo upload did not finish within ${Math.ceil(photoTransferTimeoutMs(photo) / 60000)} minutes.`
+      );
+      error.code = "driver_photo_upload_timeout";
+      error.isNetworkError = true;
+      fail(error);
+    }, photoTransferTimeoutMs(photo));
+
+    const heartbeat = async () => {
+      if (settled) return;
+      try {
+        const renewed = await global.DriverOfflineDB.acquireLease(partitionKey, ownerId, LEASE_TTL_MS);
+        if (!renewed) {
+          const error = new Error("Driver synchronization lease was lost during a photo upload.");
+          error.code = "sync_lease_lost";
+          fail(error);
+          return;
+        }
+      } catch (cause) {
+        const error = new Error("Driver synchronization lease could not be renewed during a photo upload.");
+        error.code = "sync_lease_lost";
+        error.cause = cause;
+        fail(error);
+        return;
+      }
+      if (!settled) heartbeatTimer = setTimeout(heartbeat, LEASE_HEARTBEAT_MS);
+    };
+    heartbeatTimer = setTimeout(heartbeat, LEASE_HEARTBEAT_MS);
+
+    try {
+      return await Promise.race([task(controller.signal), guard]);
+    } finally {
+      settled = true;
+      clearTimeout(timeout);
+      clearTimeout(heartbeatTimer);
+      outerSignal?.removeEventListener?.("abort", onOuterAbort);
+    }
   }
 
   async function buildEventPayload(event, { repair = true } = {}) {
@@ -163,11 +329,7 @@
       error.code = "driver_offline_photo_blob_size_mismatch";
       throw error;
     }
-    const bytes = await photo.blob.arrayBuffer();
-    const digest = await global.crypto.subtle.digest("SHA-256", bytes);
-    const actualSha256 = Array.from(new Uint8Array(digest))
-      .map((value) => value.toString(16).padStart(2, "0"))
-      .join("");
+    const actualSha256 = await global.DriverPhotoHash.sha256(photo.blob);
     if (!photo.sha256 || actualSha256 !== String(photo.sha256).toLowerCase()) {
       const error = new Error("The saved photo no longer matches its registered SHA-256 evidence descriptor.");
       error.code = "driver_offline_photo_blob_hash_mismatch";
@@ -176,9 +338,13 @@
     return { expectedBytes, actualSha256 };
   }
 
-  async function uploadPhoto(manifest, profile, photo, event, signal) {
+  async function uploadPhoto(manifest, profile, photo, event, signal, transferState) {
     const currentProfile = await assertPartitionSession(profile);
+    transferState.phase = "verifying";
+    await global.DriverOfflineDB.markPhotoPhase?.(photo.photoId, transferState.phase);
     const { expectedBytes } = await verifyLocalPhotoBlob(photo);
+    transferState.phase = "ticketing";
+    await global.DriverOfflineDB.markPhotoPhase?.(photo.photoId, transferState.phase);
     const ticketPayload = {
       offlineEventUpload: true,
       manifestId: manifest.manifestId,
@@ -203,6 +369,8 @@
     if (!ticket.uploadUrl || !ticket.token) throw new Error("Photo upload authorization is incomplete.");
     const uploadName = `${photo.recordType || "driver-photo"}-${Number(photo.ordinal || 0) + 1}.jpg`;
     await assertPartitionSession(profile);
+    transferState.phase = "uploading";
+    await global.DriverOfflineDB.markPhotoPhase?.(photo.photoId, transferState.phase);
     let response;
     try {
       response = await fetch(ticket.uploadUrl, {
@@ -229,7 +397,12 @@
     } catch {
       payload = {};
     }
-    if (!response.ok) throw new Error(payload.error || text || "Photo upload failed.");
+    if (!response.ok) {
+      const error = new Error(payload.error || text || "Photo upload failed.");
+      error.status = response.status;
+      error.code = String(payload.code || "");
+      throw error;
+    }
     const reportedBytes = Number(payload.byteSize ?? payload.bytes ?? payload.size);
     if (Number.isFinite(reportedBytes) && reportedBytes !== expectedBytes) {
       throw new Error(`Photo upload stored ${reportedBytes} of ${expectedBytes} registered bytes.`);
@@ -243,6 +416,36 @@
       byteSize: expectedBytes,
       sha256: photo.sha256
     };
+  }
+
+  async function confirmPhotoReceipt(
+    manifest,
+    profile,
+    partitionKey,
+    photo,
+    receipt,
+    signal,
+    transferState
+  ) {
+    transferState.phase = "confirming";
+    await global.DriverOfflineDB.markPhotoPhase?.(photo.photoId, transferState.phase);
+    const result = await postSync(manifest, profile, [], [receipt], signal);
+    await global.DriverOfflineDB.applySyncResponse(partitionKey, result);
+    const confirmation = (result.photos || result.photoReceipts || [])
+      .find((candidate) => String(candidate.photoId || candidate.id || "") === String(photo.photoId));
+    if (!confirmation) {
+      const error = new Error("The server did not acknowledge this photo receipt.");
+      error.code = "driver_photo_receipt_missing";
+      throw error;
+    }
+    if (!confirmation.durableReceipt && confirmation.status !== "durably_received") {
+      const error = new Error(
+        confirmation.error || "Photo durability verification failed; the retained Blob will be retried."
+      );
+      error.code = String(confirmation.errorCode || "driver_photo_not_durable");
+      throw error;
+    }
+    return confirmation;
   }
 
   async function registerForegroundEvent(partitionKey, eventId) {
@@ -361,6 +564,7 @@
         group.eventIds.add(owner.eventId);
       }
       const photoFailures = [];
+      let drainInterrupted = false;
       for (const [manifestId, group] of groups) {
         const groupedEvents = group.events;
         const manifest = await global.DriverOfflineDB.getManifest(partitionKey, manifestId);
@@ -377,7 +581,7 @@
           await global.DriverOfflineDB.applySyncResponse(partitionKey, registration);
         }
 
-        const receipts = [];
+        let confirmedReceiptCount = 0;
         for (const photo of allPendingPhotos.filter((item) => group.eventIds.has(item.eventId))) {
           await assertPartitionSession(profile);
           const renewed = await global.DriverOfflineDB.acquireLease(partitionKey, ownerId, LEASE_TTL_MS);
@@ -386,42 +590,68 @@
             error.code = "sync_lease_lost";
             throw error;
           }
-          if (photo.objectReference) {
-            receipts.push({
-              photoId: photo.photoId,
-              objectReference: photo.objectReference,
-              byteSize: Number(photo.byteSize || photo.blob?.size || 0),
-              sha256: photo.sha256
-            });
+          const scheduledRetryAt = Date.parse(photo.nextAttemptAt || "");
+          if (Number.isFinite(scheduledRetryAt) && scheduledRetryAt > Date.now()) {
+            photoFailures.push(photoFailure(photo, {
+              phase: "backoff",
+              attemptCount: Number(photo.attemptCount || 0),
+              retryable: true,
+              nextAttemptAt: new Date(scheduledRetryAt).toISOString(),
+              code: "driver_photo_retry_deferred",
+              message: `Photo retry is scheduled for ${new Date(scheduledRetryAt).toISOString()}.`
+            }));
             continue;
           }
+          const attemptCount = Number(photo.attemptCount || 0) + 1;
+          const transferState = {
+            phase: photo.objectReference ? "confirming" : "verifying"
+          };
           try {
-            receipts.push(await uploadPhoto(manifest, profile, photo, eventsById.get(photo.eventId), signal));
+            await global.DriverOfflineDB.markPhotoAttempt(photo.photoId, transferState.phase);
+            await withPhotoTransferGuard(partitionKey, photo, signal, async (transferSignal) => {
+              const receipt = photo.objectReference
+                ? {
+                    photoId: photo.photoId,
+                    objectReference: photo.objectReference,
+                    byteSize: Number(photo.byteSize || photo.blob?.size || 0),
+                    sha256: photo.sha256
+                  }
+                : await uploadPhoto(
+                    manifest,
+                    profile,
+                    photo,
+                    eventsById.get(photo.eventId),
+                    transferSignal,
+                    transferState
+                  );
+              return confirmPhotoReceipt(
+                manifest,
+                profile,
+                partitionKey,
+                photo,
+                receipt,
+                transferSignal,
+                transferState
+              );
+            });
+            confirmedReceiptCount += 1;
           } catch (error) {
-            await global.DriverOfflineDB.markPhotoError(photo.photoId, error);
-            if (error.isNetworkError) throw error;
-            photoFailures.push({
-              photoId: photo.photoId,
-              message: String(error?.message || error || "Photo upload failed.")
+            const decorated = decoratePhotoError(error, photo, {
+              phase: transferState.phase,
+              attemptCount
             });
-          }
-        }
-        if (receipts.length) {
-          const receiptResult = await postSync(manifest, profile, [], receipts, signal);
-          await global.DriverOfflineDB.applySyncResponse(partitionKey, receiptResult);
-          for (const failed of (receiptResult.photos || []).filter((photo) =>
-            !photo.durableReceipt && photo.status !== "durably_received"
-          )) {
-            photoFailures.push({
-              photoId: failed.photoId,
-              message: String(failed.error || "Photo durability verification failed; the local Blob will be re-uploaded.")
-            });
+            await global.DriverOfflineDB.markPhotoError(photo.photoId, decorated);
+            photoFailures.push(photoFailure(photo, decorated));
+            if (decorated.isNetworkError || decorated.code === "sync_lease_lost") {
+              drainInterrupted = true;
+              break;
+            }
           }
         }
 
         // A receipt can make an event newly applicable. An exact retry asks the
         // server to drain it without uploading an already-successful photo again.
-        if (receipts.length) {
+        if (confirmedReceiptCount && !drainInterrupted) {
           const remaining = (await global.DriverOfflineDB.getPendingEvents(partitionKey))
             .filter((event) => event.manifestId === manifestId);
           if (remaining.length) {
@@ -431,14 +661,21 @@
             await global.DriverOfflineDB.applySyncResponse(partitionKey, drained);
           }
         }
+        if (drainInterrupted) break;
       }
       if (photoFailures.length) {
         const error = new Error(
           `${photoFailures.length} photo${photoFailures.length === 1 ? "" : "s"} could not be synchronized. Successful uploads were preserved and the remaining photo${photoFailures.length === 1 ? "" : "s"} will be retried.`
         );
+        error.code = "driver_photo_sync_partial";
+        error.retryable = photoFailures.some((failure) => failure.retryable);
         error.photoFailures = photoFailures;
+        schedulePartitionRetry(partitionKey, photoFailures, {
+          continueDrain: drainInterrupted
+        });
         throw error;
       }
+      clearPartitionRetryTimer(partitionKey);
       await global.DriverOfflineDB.cleanupSynced(partitionKey).catch(() => {});
       const health = await global.DriverOfflineDB.getStorageHealth(partitionKey);
       const reviewRequired = Number(health.reviewRequiredCount || 0) > 0;
@@ -457,6 +694,7 @@
 
   function syncPartition(partitionKey) {
     if (!partitionKey) return Promise.resolve({ skipped: "no_partition" });
+    clearPartitionRetryTimer(partitionKey);
     const active = activeRuns.get(partitionKey);
     if (active) {
       active.rerunRequested = true;
@@ -476,6 +714,7 @@
   }
 
   function cancelPartition(partitionKey) {
+    clearPartitionRetryTimer(partitionKey);
     const active = activeRuns.get(partitionKey);
     if (!active) return false;
     active.rerunRequested = false;

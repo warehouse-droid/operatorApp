@@ -1,0 +1,35 @@
+name: MBT Phase 3 Gauntlet
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+      - dockerVer
+  push:
+    branches:
+      - main
+      - dockerVer
+
+permissions:
+  contents: read
+
+jobs:
+  gauntlet:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      MBT_GAUNTLET_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false # secret-scan: allow non-secret GitHub setting
+      - run: bash server/tools/mbt-gauntlet.sh P3
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: ${{ always() }}
+        with:
+          name: mbt-phase-3-gauntlet
+          path: server/test-artifacts/
+          if-no-files-found: error
+          retention-days: 14

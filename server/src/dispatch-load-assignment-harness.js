@@ -11,6 +11,22 @@ import {
   validateDispatchPlanTimingMetadata,
   validateDispatchLoadAssignments
 } from "./dispatch-load-assignment.js";
+import {
+  dispatchLocationKey,
+  dispatchLocationRoot,
+  dispatchLocationsShareYard,
+  uniqueDispatchLocations
+} from "./dispatch-location.js";
+
+assert.equal(dispatchLocationRoot("3445 : 3445 Special"), "3445");
+assert.equal(dispatchLocationKey(" 3445 : 3445 Special "), "3445");
+assert.equal(dispatchLocationsShareYard("3445", "3445 : 3445 Special"), true);
+assert.equal(dispatchLocationsShareYard("3445 : Seasonal", "3445 : 3445 Special"), true);
+assert.equal(dispatchLocationsShareYard("2967", "3445 : 3445 Special"), false);
+assert.deepEqual(
+  uniqueDispatchLocations(["3445 : 3445 Special", "3445", "2967"]),
+  ["3445 : 3445 Special", "2967"]
+);
 
 function load(id, overrides = {}) {
   return {
@@ -128,6 +144,21 @@ configuredOwnYardHandoff.trucks[0].loads[0].stops = [{ id: "DROP-CUSTOM", type: 
 configuredOwnYardHandoff.trucks[0].loads[1].switchYard = "CUSTOM-YARD";
 assert.deepEqual(dispatchOwnYardCodes(configuredOwnYardHandoff), ["CUSTOM-YARD"]);
 assert.deepEqual(validateDispatchLoadAssignments(configuredOwnYardHandoff, { requireAssignments: true }), []);
+
+const childOwnYardHandoff = structuredClone(sequentialTruckShare);
+childOwnYardHandoff.orders = [{ id: "TO-CHILD", destinationYard: "3445 : 3445 Special" }];
+childOwnYardHandoff.trucks[0].base = "3445";
+childOwnYardHandoff.trucks[0].loads[0].stops = [{
+  id: "DROP-CHILD",
+  type: "drop",
+  orderId: "TO-CHILD"
+}];
+childOwnYardHandoff.trucks[0].loads[1].switchYard = "3445";
+assert.deepEqual(
+  validateDispatchLoadAssignments(childOwnYardHandoff, { requireAssignments: true }),
+  [],
+  "A load ending at a child location must be available at its parent yard."
+);
 
 const invalidHandoff = structuredClone(switchPlan);
 invalidHandoff.trucks[0].loads[0].returnOnly = false;
@@ -616,6 +647,120 @@ assert.equal(physicalVisits[0].plannedMinutes, 40, "An own-yard visit must apply
 assert.deepEqual(physicalVisits[1].stopIds, ["DELIVERY-A", "DELIVERY-B"]);
 assert.equal(physicalVisits[1].automaticMinutes, 40, "A grouped delivery must aggregate pallets under one fixed charge.");
 assert.equal(physicalVisits[1].plannedMinutes, 55, "A mixed Custom visit must use the greater Custom duration without summing it.");
+
+const customerDropsWithSharedPickupYardPlan = normalizeDispatchPlanLoadAssignments({
+  id: 884,
+  planDate: "2026-08-05",
+  ownYardCodes: ["12441"],
+  orders: [
+    {
+      id: "GOA-6369-6373",
+      type: "SO",
+      destinationAddress: "10 First Customer Road, Toronto, ON",
+      items: [{ lineRowId: "GOA", pallets: 2 }]
+    },
+    {
+      id: "GOB-116349-116350",
+      type: "SO",
+      destinationAddress: "20 Second Customer Avenue, Brampton, ON",
+      items: [{ lineRowId: "GOB", pallets: 3 }]
+    }
+  ],
+  trucks: [truck("CUSTOMER-DROP-TRUCK", "CE94487", "dao", [load("CUSTOMER-DROP-LOAD", {
+    ownYardFixedMinutes: 40,
+    deliveryFixedMinutes: 20,
+    minutesPerPallet: 1,
+    timing: { start: 530, finish: 684 },
+    stops: [
+      { id: "GOA-DROP", type: "drop", orderId: "GOA-6369-6373", location: "12441" },
+      { id: "GOB-DROP", type: "drop", orderId: "GOB-116349-116350", location: "12441" }
+    ]
+  })])]
+});
+const customerDropsWithSharedPickupYardVisits = dispatchPhysicalStopVisits(
+  customerDropsWithSharedPickupYardPlan,
+  customerDropsWithSharedPickupYardPlan.trucks[0],
+  customerDropsWithSharedPickupYardPlan.trucks[0].loads[0]
+);
+assert.equal(
+  customerDropsWithSharedPickupYardVisits.length,
+  2,
+  "Distinct customer destination addresses must not merge when both stops retain the same pickup-yard location metadata."
+);
+assert.deepEqual(
+  customerDropsWithSharedPickupYardVisits.map((visit) => visit.serviceType),
+  ["delivery", "delivery"],
+  "Customer destinations must use delivery dwell rules even when stop.location names an own yard."
+);
+assert.deepEqual(
+  customerDropsWithSharedPickupYardVisits.map((visit) => visit.address),
+  ["10 First Customer Road, Toronto, ON", "20 Second Customer Avenue, Brampton, ON"],
+  "Physical visits must retain each customer's resolved destination address."
+);
+
+const legacyCustomerAddressPlan = normalizeDispatchPlanLoadAssignments({
+  id: 886,
+  planDate: "2026-08-05",
+  ownYardCodes: ["12441"],
+  orders: [{ id: "SO-LEGACY-ADDRESS", type: "SO", items: [{ lineRowId: "SO-LINE", pallets: 1 }] }],
+  trucks: [truck("LEGACY-CUSTOMER-TRUCK", "SO100", "dao", [load("LEGACY-CUSTOMER-LOAD", {
+    deliveryFixedMinutes: 20,
+    minutesPerPallet: 1,
+    timing: { start: 420, finish: 441 },
+    stops: [{
+      id: "LEGACY-CUSTOMER-DROP",
+      type: "drop",
+      orderId: "SO-LEGACY-ADDRESS",
+      location: "99 Legacy Customer Road, Toronto, ON"
+    }]
+  })])]
+});
+const legacyCustomerAddressVisit = dispatchPhysicalStopVisits(
+  legacyCustomerAddressPlan,
+  legacyCustomerAddressPlan.trucks[0],
+  legacyCustomerAddressPlan.trucks[0].loads[0]
+)[0];
+assert.equal(
+  legacyCustomerAddressVisit.address,
+  "99 Legacy Customer Road, Toronto, ON",
+  "A legacy customer stop may use stop.location as a physical address without treating it as a destination-yard identity."
+);
+assert.equal(legacyCustomerAddressVisit.serviceType, "delivery");
+
+const legacyScopedPoLocationPlan = normalizeDispatchPlanLoadAssignments({
+  id: 885,
+  planDate: "2026-08-05",
+  ownYardCodes: ["12441"],
+  orders: [{
+    id: "PO-LEGACY-SCOPED",
+    type: "PO",
+    address: "Legacy purchase-order label",
+    items: [{ lineRowId: "PO-LINE", pallets: 2 }]
+  }],
+  trucks: [truck("LEGACY-PO-TRUCK", "PO100", "dao", [load("LEGACY-PO-LOAD", {
+    ownYardFixedMinutes: 40,
+    deliveryFixedMinutes: 20,
+    minutesPerPallet: 1,
+    timing: { start: 420, finish: 460 },
+    stops: [{
+      id: "LEGACY-PO-DROP",
+      type: "drop",
+      orderId: "PO-LEGACY-SCOPED",
+      location: "12441",
+      line_row_ids: ["PO-LINE"]
+    }]
+  })])]
+});
+const legacyScopedPoLocationVisit = dispatchPhysicalStopVisits(
+  legacyScopedPoLocationPlan,
+  legacyScopedPoLocationPlan.trucks[0],
+  legacyScopedPoLocationPlan.trucks[0].loads[0]
+)[0];
+assert.equal(
+  legacyScopedPoLocationVisit.serviceType,
+  "own_yard",
+  "A legacy line-scoped PO may still use stop.location as its explicit destination yard."
+);
 
 const mixedOwnYardAddressPlan = normalizeDispatchPlanLoadAssignments({
   id: 880,

@@ -9,6 +9,8 @@ const ACCOUNT_ROLE_OPTIONS = [
   { value: "scm", labelKey: "control.roleScm", label: "SCM Staff" },
   { value: "yard_manager", labelKey: "control.roleYardManager", label: "Yard Manager" },
   { value: "sales", labelKey: "control.roleSales", label: "Sales" },
+  { value: "mbt_frontdesk", labelKey: "control.roleMbtFrontdesk", label: "MBT Front Desk" },
+  { value: "mbt_billing", labelKey: "control.roleMbtBilling", label: "MBT Billing" },
   { value: "admin", labelKey: "control.roleAdmin", label: "Admin" }
 ];
 const SALES_YARD_OPTIONS = [
@@ -251,7 +253,8 @@ const SCM_RECONCILIATION_DEFAULT_SETTINGS = Object.freeze({
   nightlyTime: "21:30",
   timeZone: SCM_RECONCILIATION_TIME_ZONE,
   initialBackfillSince: "2026-01-01",
-  initialDryRunApproved: false
+  initialDryRunApproved: false,
+  soInitialDryRunApproved: false
 });
 let scmReconciliationSettings = { ...SCM_RECONCILIATION_DEFAULT_SETTINGS };
 let scmReconciliationSettingsLoaded = false;
@@ -262,6 +265,7 @@ let scmReconciliationBusy = false;
 const scmReconciliationDecisionBusyTargets = new Set();
 const scmReconciliationDecisionDrafts = new Map();
 let scmReconciliationScope = "all";
+let scmReconciliationSoOrderType = "delivery";
 let scmReconciliationOrderKind = "PO";
 let scmReconciliationOrderRef = "";
 let scmReconciliationIncludeTerminalOrders = false;
@@ -616,6 +620,10 @@ function normalizeScmReconciliationSettings(payload) {
       "initial_dry_run_approved",
       "initialDryRunApplied",
       "initial_dry_run_applied"
+    ], false)),
+    soInitialDryRunApproved: scmReconciliationBoolean(firstDefined(settings, [
+      "soInitialDryRunApproved",
+      "so_initial_dry_run_approved"
     ], false))
   };
 }
@@ -833,7 +841,7 @@ async function saveScmReconciliationSettings(form) {
     scmReconciliationSettings = normalizeScmReconciliationSettings(payload);
     scmReconciliationSettingsLoaded = true;
     scmReconciliationLoadError = "";
-    alert("PO / TO reconciliation settings saved.");
+    alert("SO / PO / TO reconciliation settings saved.");
   } finally {
     scmReconciliationBusy = false;
     render();
@@ -842,32 +850,47 @@ async function saveScmReconciliationSettings(form) {
 
 async function startScmReconciliationRun(form) {
   const scope = String(form.elements.scope?.value || "all");
-  if (!["all", "PO", "TO", "order_family"].includes(scope)) throw new Error("Choose a valid reconciliation scope.");
+  if (!["all", "SO", "PO", "TO", "order_family"].includes(scope)) throw new Error("Choose a valid reconciliation scope.");
+  const broadSoScope = scope === "all" || scope === "SO";
+  const soOrderType = String(
+    form.elements.soOrderType?.value || scmReconciliationSoOrderType || "delivery"
+  ).toLowerCase();
+  if (broadSoScope && !["delivery", "pickup"].includes(soOrderType)) {
+    throw new Error("Choose Delivery or Pick-Up for the Sales Order filter.");
+  }
   const orderKind = String(form.elements.orderKind?.value || scmReconciliationOrderKind || "PO").toUpperCase();
   const orderRefs = normalizeScmReconciliationOrderRefs(form.elements.orderRefs?.value || "");
-  if (scope === "order_family" && !["PO", "TO"].includes(orderKind)) throw new Error("Choose PO or TO for the targeted order families.");
-  if (scope === "order_family" && !orderRefs.length) throw new Error("Enter at least one source PO or TO reference.");
+  if (scope === "order_family" && !["SO", "PO", "TO"].includes(orderKind)) throw new Error("Choose SO, PO, or TO for the targeted order families.");
+  if (scope === "order_family" && !orderRefs.length) throw new Error("Enter at least one source SO, PO, or TO reference.");
   const includeTerminalOrders = scope !== "order_family"
     && Boolean(form.elements.includeTerminalOrders?.checked);
-  const forceInitialDryRun = scope === "all" && !scmReconciliationInitialApproved();
+  const scopeApproved = broadSoScope
+    ? scmReconciliationScopeApproved(scope, orderKind, soOrderType)
+    : scmReconciliationScopeApproved(scope, orderKind);
+  const forceInitialDryRun = !scopeApproved;
   const dryRun = forceInitialDryRun || Boolean(form.elements.dryRun?.checked);
+  const soOrderTypeLabel = soOrderType === "pickup" ? "Pick-Up" : "Delivery";
   const targetSummary = scope === "order_family"
     ? `${orderRefs.length.toLocaleString()} ${orderKind} source order${orderRefs.length === 1 ? "" : "s"} (${scmReconciliationOrderRefsPreview(orderRefs)})`
     : scope === "all"
-      ? "all PO / TO"
-      : `${scope} orders`;
+      ? `${soOrderTypeLabel} SO plus all PO / TO orders`
+      : scope === "SO"
+        ? `${soOrderTypeLabel} SO orders`
+        : `${scope} orders`;
   if (!dryRun && !confirm(
     `Apply ${targetSummary} reconciliation changes immediately?`
     + `${includeTerminalOrders ? " This broad run includes locally terminal or skipped orders." : ""}`
     + ` Conflicts will still go to Reconcile Review.`
   )) return;
   const body = { scope, dryRun, includeTerminalOrders };
+  if (broadSoScope) body.soOrderType = soOrderType;
   if (scope === "order_family") {
     body.orderKind = orderKind;
     body.orderRefs = orderRefs;
     body.orderRef = orderRefs.join(", ");
   }
   scmReconciliationScope = scope;
+  if (broadSoScope) scmReconciliationSoOrderType = soOrderType;
   scmReconciliationOrderKind = orderKind;
   scmReconciliationOrderRef = orderRefs.join("\n");
   scmReconciliationIncludeTerminalOrders = includeTerminalOrders;
@@ -1013,7 +1036,7 @@ async function applyScmReconciliationRun(runId) {
     + `${Number(decisions.acceptedTargets || 0) ? ` ${Number(decisions.acceptedTargets).toLocaleString()} NetSuite outcome(s) will be accepted only if their evidence is unchanged.` : ""}`
     + `${Number(decisions.skippedTargets || 0) ? ` ${Number(decisions.skippedTargets).toLocaleString()} order(s) will be skipped.` : ""}`
     + `${Number(decisions.keptReviewTargets || 0) ? ` ${Number(decisions.keptReviewTargets).toLocaleString()} order(s) will remain in Review if their conflict is confirmed.` : ""}`
-    + `\n\nThis updates only the local PO / TO schedule and never writes back to NetSuite.`
+    + `\n\nThis updates only local SO / PO / TO operational state and never writes back to NetSuite.`
   )) return;
   scmReconciliationBusy = true;
   render();
@@ -2591,6 +2614,31 @@ function scmReconciliationInitialApproved() {
     ], ""));
 }
 
+function scmReconciliationSoInitialApproved() {
+  return scmReconciliationSettings.soInitialDryRunApproved
+    || Boolean(firstDefined(scmReconciliationSettings, [
+      "soInitialDryRunApprovedAt",
+      "so_initial_dry_run_approved_at"
+    ], ""));
+}
+
+function scmReconciliationScopeApproved(scope = "all", orderKind = "", soOrderType = "all") {
+  const cleanScope = String(scope || "all").toUpperCase();
+  const cleanKind = String(orderKind || "").toUpperCase();
+  const cleanSoOrderType = String(soOrderType || "all")
+    .toLowerCase()
+    .replace(/[\s_-]+/g, "");
+  if (cleanScope === "ORDER_FAMILY" && cleanKind === "SO") {
+    return scmReconciliationSoInitialApproved();
+  }
+  if (["ALL", "SO"].includes(cleanScope) && cleanSoOrderType === "pickup") return false;
+  if (cleanScope === "SO") return scmReconciliationSoInitialApproved();
+  if (cleanScope === "ALL") {
+    return scmReconciliationInitialApproved() && scmReconciliationSoInitialApproved();
+  }
+  return scmReconciliationInitialApproved();
+}
+
 function scmReconciliationRunResumeId(run) {
   const value = Number(firstDefined(run, [
     "resumeOfRunId",
@@ -2614,7 +2662,7 @@ function scmReconciliationRunCanApply(run) {
   const scope = String(firstDefined(run, ["scope"], "")).toLowerCase();
   const status = scmReconciliationRunStatus(run);
   if (!["succeeded", "awaiting_approval"].includes(status)) return false;
-  if (status === "awaiting_approval" && (scope !== "all" || scmReconciliationInitialApproved())) return false;
+  if (status === "awaiting_approval" && !["all", "so"].includes(scope)) return false;
   if (scmReconciliationBoolean(firstDefined(run, ["applied", "isApplied", "is_applied"], false))) return false;
   if (firstDefined(run, ["appliedAt", "applied_at", "approvedAt", "approved_at"], "")) return false;
   return !scmReconciliationAppliedRunFor(run);
@@ -2970,6 +3018,16 @@ function renderScmReconciliationRunTargets(runId) {
 
 function scmReconciliationRunScopeLabel(run) {
   const scope = String(firstDefined(run, ["scope"], "all"));
+  const soOrderType = String(firstDefined(
+    run,
+    ["soOrderType", "so_order_type", "so_order_type_filter"],
+    "all"
+  )).toLowerCase();
+  const soOrderTypeLabel = soOrderType === "delivery"
+    ? "Delivery"
+    : soOrderType === "pickup"
+      ? "Pick-Up"
+      : "All SO types";
   const orderKind = String(firstDefined(run, ["orderKind", "order_kind", "targetOrderKind", "target_order_kind"], ""));
   const orderRefs = normalizeScmReconciliationOrderRefs(firstDefined(
     run,
@@ -2981,7 +3039,13 @@ function scmReconciliationRunScopeLabel(run) {
     ? orderRefs.length > 1
       ? `${orderKind || "Order"} · ${orderRefs.length.toLocaleString()} families`
       : `${orderKind || "Order"} ${orderRefs[0] || (orderId ? `ID ${orderId}` : "family")}`
-    : scope.toUpperCase();
+    : scope === "SO"
+      ? `SO · ${soOrderTypeLabel}`
+      : scope === "all"
+        ? soOrderType === "all"
+          ? "ALL · All SO types"
+          : `ALL · ${soOrderTypeLabel} SO`
+        : scope.toUpperCase();
 }
 
 function renderScmReconciliationRunListItem(run) {
@@ -3079,7 +3143,9 @@ function renderScmReconciliationSelectedRun(run) {
 
 function renderScmReconciliationSection() {
   if (!hasStaffAuthority(operator, ["admin"])) return "";
-  const initialApproved = scmReconciliationInitialApproved();
+  const poToInitialApproved = scmReconciliationInitialApproved();
+  const soInitialApproved = scmReconciliationSoInitialApproved();
+  const initialApproved = poToInitialApproved && soInitialApproved;
   const approvalAt = firstDefined(scmReconciliationSettings, [
     "initialDryRunApprovedAt",
     "initial_dry_run_approved_at",
@@ -3087,7 +3153,12 @@ function renderScmReconciliationSection() {
     "initial_dry_run_applied_at"
   ], "");
   const activeRun = scmReconciliationRuns.some(scmReconciliationRunIsActive);
-  const fullRunMustBeDry = !initialApproved && scmReconciliationScope === "all";
+  const broadSoScope = ["all", "SO"].includes(scmReconciliationScope);
+  const fullRunMustBeDry = !scmReconciliationScopeApproved(
+    scmReconciliationScope,
+    scmReconciliationOrderKind,
+    scmReconciliationSoOrderType
+  );
   const runDisabled = scmReconciliationBusy || activeRun;
   const settingsDisabled = scmReconciliationBusy || !scmReconciliationSettingsLoaded;
   const latestRun = scmReconciliationRuns[0] || null;
@@ -3097,8 +3168,8 @@ function renderScmReconciliationSection() {
     <section class="panel scm-reconciliation-panel">
       <div class="section-heading">
         <div>
-          <h2>PO / TO Schedule Reconciliation</h2>
-          <p class="muted">Keep /POTOschedule aligned with current NetSuite PO receipts and TO fulfillment/receipts. Reconciliation runs one NetSuite request at a time and yields to operational work.</p>
+          <h2>SO / PO / TO Reconciliation</h2>
+          <p class="muted">Keep dispatch/operator Sales Orders and the PO/TO schedule aligned with current NetSuite headers, quantities, fulfillment, receipts, and exact Billed state. Reconciliation runs one NetSuite request at a time and yields to operational work.</p>
         </div>
         <button data-action="refresh-scm-reconciliation" type="button" ${scmReconciliationBusy ? "disabled" : ""}>Refresh</button>
       </div>
@@ -3111,28 +3182,38 @@ function renderScmReconciliationSection() {
       <div class="scm-reconciliation-manual-bar">
         <div>
           <h3>Manual reconciliation</h3>
-          <p class="muted">Run all orders, PO only, TO only, or targeted order families including their local splits.</p>
+          <p class="muted">Run all orders, SO/PO/TO only, or targeted order families including their local splits.</p>
         </div>
         <form class="scm-reconciliation-run-form" data-form="scm-reconciliation-run">
           <label>
             <span>Scope</span>
             <select name="scope" data-field="scm-reconciliation-scope" ${runDisabled ? "disabled" : ""}>
-              <option value="all" ${scmReconciliationScope === "all" ? "selected" : ""}>All PO / TO</option>
+              <option value="all" ${scmReconciliationScope === "all" ? "selected" : ""}>All SO / PO / TO</option>
+              <option value="SO" ${scmReconciliationScope === "SO" ? "selected" : ""}>SO only</option>
               <option value="PO" ${scmReconciliationScope === "PO" ? "selected" : ""}>PO only</option>
               <option value="TO" ${scmReconciliationScope === "TO" ? "selected" : ""}>TO only</option>
               <option value="order_family" ${scmReconciliationScope === "order_family" ? "selected" : ""}>Target order families</option>
             </select>
           </label>
           <label>
+            <span>SO type</span>
+            <select name="soOrderType" data-field="scm-reconciliation-so-order-type" ${broadSoScope && !runDisabled ? "" : "disabled"}>
+              <option value="delivery" ${scmReconciliationSoOrderType === "delivery" ? "selected" : ""}>Delivery</option>
+              <option value="pickup" ${scmReconciliationSoOrderType === "pickup" ? "selected" : ""}>Pick-Up</option>
+            </select>
+            <small>For All, this filters only SO; PO and TO remain included.</small>
+          </label>
+          <label>
             <span>Family type</span>
             <select name="orderKind" data-field="scm-reconciliation-order-kind" ${scmReconciliationScope === "order_family" && !runDisabled ? "" : "disabled"}>
+              <option value="SO" ${scmReconciliationOrderKind === "SO" ? "selected" : ""}>SO</option>
               <option value="PO" ${scmReconciliationOrderKind === "PO" ? "selected" : ""}>PO</option>
               <option value="TO" ${scmReconciliationOrderKind === "TO" ? "selected" : ""}>TO</option>
             </select>
           </label>
           <label class="scm-reconciliation-family-ref">
             <span>Source order references</span>
-            <textarea name="orderRefs" data-field="scm-reconciliation-order-ref" rows="3" maxlength="4096" autocomplete="off" spellcheck="false" placeholder="POB03581, POB03582&#10;or one reference per line" ${scmReconciliationScope === "order_family" && !runDisabled ? "" : "disabled"}>${escapeHtml(scmReconciliationOrderRef)}</textarea>
+            <textarea name="orderRefs" data-field="scm-reconciliation-order-ref" rows="3" maxlength="4096" autocomplete="off" spellcheck="false" placeholder="SOB116645, POB03581&#10;or one reference per line" ${scmReconciliationScope === "order_family" && !runDisabled ? "" : "disabled"}>${escapeHtml(scmReconciliationOrderRef)}</textarea>
           </label>
           <div class="scm-reconciliation-run-options">
             <label class="scm-reconciliation-toggle compact">
@@ -3147,14 +3228,16 @@ function renderScmReconciliationSection() {
           <button class="primary" type="submit" ${runDisabled ? "disabled" : ""}>${scmReconciliationBusy ? "Starting…" : activeRun ? "Run in progress" : "Start reconciliation"}</button>
         </form>
         <p class="muted" data-scm-reconciliation-run-help>${fullRunMustBeDry
-          ? "Initial safeguard: this full reconciliation must be reviewed as a dry run."
+          ? scmReconciliationSoOrderType === "pickup" && broadSoScope
+            ? "Pick-Up reconciliation starts as a dry run. Review it, then use Apply dry-run scope."
+            : "Initial safeguard: this full reconciliation must be reviewed as a dry run."
           : "Uncheck Dry run only when you are ready to apply unambiguous results immediately."}</p>
       </div>
       <div class="notice ${initialApproved ? "sync-success" : ""}">
         <strong>Initial full reconciliation: ${initialApproved ? "Approved and applied" : "Dry-run approval required"}</strong>
         <span>${initialApproved
-          ? `Future unambiguous nightly results apply automatically.${approvalAt ? ` Approved ${formatDate(approvalAt)}.` : ""}`
-          : "The first All PO / TO run is forced to dry-run mode. Review its results and select Apply before nightly automation can update schedule state."}</span>
+          ? `Future unambiguous nightly Delivery SO / PO / TO results apply automatically.${approvalAt ? ` Approved ${formatDate(approvalAt)}.` : ""}`
+          : `Approval state: SO Delivery ${soInitialApproved ? "approved" : "required"}; PO / TO ${poToInitialApproved ? "approved" : "required"}. A broad Delivery SO or All run must be reviewed and applied before nightly automation can update that scope.`}</span>
       </div>
       <details class="scm-reconciliation-settings-disclosure">
         <summary>
@@ -3212,7 +3295,7 @@ function renderScmReconciliationSyncLink() {
     <section class="panel scm-reconciliation-link-panel">
       <div class="section-heading">
         <div>
-          <h2>PO / TO Schedule Reconciliation</h2>
+          <h2>SO / PO / TO Reconciliation</h2>
           <p class="muted">Manual runs, run history, dry-run decisions, and apply controls now have a dedicated review page.</p>
         </div>
         <a class="scm-reconciliation-page-link" href="/admin/reconciliation">Open reconciliation</a>
@@ -3224,14 +3307,24 @@ function renderScmReconciliationSyncLink() {
 function refreshScmReconciliationRunForm(form) {
   if (!form) return;
   const familyScope = scmReconciliationScope === "order_family";
+  const broadSoScope = ["all", "SO"].includes(scmReconciliationScope);
   const activeRun = scmReconciliationRuns.some(scmReconciliationRunIsActive);
   const disabled = scmReconciliationBusy || activeRun;
   const kind = form.querySelector('[data-field="scm-reconciliation-order-kind"]');
+  const soOrderType = form.querySelector('[data-field="scm-reconciliation-so-order-type"]');
   const orderRefs = form.querySelector('[data-field="scm-reconciliation-order-ref"]');
   const includeTerminal = form.querySelector('[data-field="scm-reconciliation-include-terminal"]');
   const dryRun = form.querySelector('[data-field="scm-reconciliation-dry-run"]');
-  const forceInitialDryRun = scmReconciliationScope === "all" && !scmReconciliationInitialApproved();
+  const forceInitialDryRun = !scmReconciliationScopeApproved(
+    scmReconciliationScope,
+    scmReconciliationOrderKind,
+    scmReconciliationSoOrderType
+  );
   if (kind) kind.disabled = !familyScope || disabled;
+  if (soOrderType) {
+    soOrderType.value = scmReconciliationSoOrderType;
+    soOrderType.disabled = !broadSoScope || disabled;
+  }
   if (orderRefs) orderRefs.disabled = !familyScope || disabled;
   if (includeTerminal) {
     includeTerminal.checked = !familyScope && scmReconciliationIncludeTerminalOrders;
@@ -3244,7 +3337,9 @@ function refreshScmReconciliationRunForm(form) {
   const help = app.querySelector("[data-scm-reconciliation-run-help]");
   if (help) {
     help.textContent = forceInitialDryRun
-      ? "Initial safeguard: this full reconciliation must be reviewed as a dry run."
+      ? scmReconciliationSoOrderType === "pickup" && broadSoScope
+        ? "Pick-Up reconciliation starts as a dry run. Review it, then use Apply dry-run scope."
+        : "Initial safeguard: this full reconciliation must be reviewed as a dry run."
       : "Uncheck Dry run only when you are ready to apply unambiguous results immediately.";
   }
 }
@@ -4835,6 +4930,11 @@ app.addEventListener("change", (event) => {
   }
   if (event.target?.dataset?.field === "scm-reconciliation-scope") {
     scmReconciliationScope = event.target.value || "all";
+    refreshScmReconciliationRunForm(event.target.closest("form"));
+    return;
+  }
+  if (event.target?.dataset?.field === "scm-reconciliation-so-order-type") {
+    scmReconciliationSoOrderType = event.target.value === "pickup" ? "pickup" : "delivery";
     refreshScmReconciliationRunForm(event.target.closest("form"));
     return;
   }

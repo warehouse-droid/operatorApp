@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import vm from "node:vm";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -11,6 +12,7 @@ const service = read("src/scm-netsuite-po-history-service.js");
 const vendorCodes = read("src/smart-scm-vendor-code-service.js");
 const netsuite = read("src/netsuite.js");
 const worker = read("netsuite-order-webhook-scheduled.js");
+const directWebhook = read("netsuite-order-webhook-user-event-direct.js");
 const restlet = read("netsuite-smart-scm-picking-ticket-restlet.js");
 const ui = read("public/scm-netsuite-po.js");
 
@@ -37,6 +39,94 @@ assert.match(netsuite, /i\.vendorname AS vendor_code/);
 assert.match(worker, /lastModifiedDate/);
 assert.match(worker, /vendorReference/);
 assert.match(worker, /closed:/);
+assert.match(directWebhook, /context\.UserEventType\.APPROVE/,
+  "The one-script webhook must identify native manual approval events.");
+assert.match(directWebhook, /MBBS webhook invoked/,
+  "The one-script webhook must log entry before payload construction for deployment diagnostics.");
+assert.match(directWebhook, /executionContext:\s*runtime\.executionContext/,
+  "The one-script webhook must record which NetSuite execution context invoked it.");
+assert.match(directWebhook, /const response = https\.post/,
+  "The simple webhook option must post directly without a Scheduled Script worker.");
+assert.match(directWebhook, /Webhook failures are logged but must not cancel the user's approval/,
+  "A webhook failure must not roll back a successful manual approval.");
+
+let directModule = null;
+let postedRequest = null;
+const directAuditTitles = [];
+const recordValues = {
+  tranid: "SO-DIRECT-APPROVE",
+  orderstatus: "B",
+  status: "B",
+  entity: 55,
+  custbody3: 2,
+  location: 1
+};
+const loadedRecord = {
+  id: 321,
+  getValue: ({ fieldId }) => recordValues[fieldId] || "",
+  getText: ({ fieldId }) => fieldId === "status"
+    ? "Sales Order : Pending Fulfillment"
+    : "",
+  getLineCount: () => 0
+};
+const suiteScriptMocks = {
+  "N/https": {
+    post: (request) => {
+      postedRequest = request;
+      return { code: 200, body: "ok" };
+    }
+  },
+  "N/log": {
+    audit: (title) => directAuditTitles.push(title),
+    error: () => {},
+    debug: () => {}
+  },
+  "N/record": {
+    Type: {
+      SALES_ORDER: "salesorder",
+      PURCHASE_ORDER: "purchaseorder",
+      TRANSFER_ORDER: "transferorder"
+    },
+    load: () => loadedRecord
+  },
+  "N/runtime": {
+    executionContext: "USERINTERFACE",
+    getCurrentScript: () => ({
+      id: "customscript_mbbs_direct",
+      deploymentId: "customdeploy_mbbs_direct",
+      getParameter: ({ name }) => name === "custscriptmbbs_webhook_url"
+        ? "https://example.test/api/webhooks/netsuite/order"
+        : name === "custscriptwh_webhook_secret_i"
+          ? "harness-secret"
+          : ""
+    })
+  },
+  "N/search": { lookupFields: () => ({}) }
+};
+vm.runInNewContext(directWebhook, {
+  define: (dependencies, factory) => {
+    directModule = factory(...dependencies.map((dependency) => suiteScriptMocks[dependency]));
+  }
+});
+directModule.afterSubmit({
+  type: "approve",
+  UserEventType: { APPROVE: "approve", DELETE: "delete" },
+  newRecord: {
+    id: 321,
+    type: "salesorder",
+    getValue: ({ fieldId }) => recordValues[fieldId] || "",
+    getText: ({ fieldId }) => fieldId === "status"
+      ? "Sales Order : Pending Fulfillment"
+      : ""
+  }
+});
+assert(postedRequest, "A native manual approval must make the direct webhook request.");
+const postedPayload = JSON.parse(postedRequest.body);
+assert.equal(postedPayload.eventType, "approve");
+assert.equal(postedPayload.manualApproval, true);
+assert.equal(postedPayload.executionContext, "USERINTERFACE");
+assert.equal(postedPayload.statusText, "Sales Order : Pending Fulfillment");
+assert.deepEqual(directAuditTitles, ["MBBS webhook invoked", "MBBS webhook sent"]);
 assert.match(restlet, /render\.transaction/);
 assert.match(restlet, /MBBS_PO_VERSION_CONFLICT/);
 assert.match(restlet, /quantityreceived/);

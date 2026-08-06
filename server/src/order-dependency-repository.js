@@ -5,6 +5,10 @@ import { writeDispatchAudit } from "./dispatch-audit-repository.js";
 import { resolveDispatchSalesTarget } from "./dispatch-order-target-repository.js";
 import { dispatchLoadAssignment } from "./dispatch-load-assignment.js";
 import {
+  dispatchLocationsShareYard,
+  uniqueDispatchLocations
+} from "./dispatch-location.js";
+import {
   normalizeTransferDependencyReservationOverrides,
   transferDependencyPlanningAvailability,
   transferDependencyReservationContract,
@@ -3408,10 +3412,10 @@ export async function enrichDispatchOrdersWithDependencies(orders = []) {
       }));
       return {
         ...order,
-        pickupLocations: [...new Set([
+        pickupLocations: uniqueDispatchLocations([
           ...(Array.isArray(order.pickupLocations) ? order.pickupLocations : [order.sourceYard].filter(Boolean)),
           ...directPickupManifest.map((entry) => entry.location).filter(Boolean)
-        ])],
+        ]),
         orderDependencies: salesDependencies,
         dependencyDirectPickup: direct.length > 0,
         dependencyWaitingForTransfer: replenishment.some((dependency) => !["received_local", "delivered"].includes(dependency.status)),
@@ -3529,16 +3533,16 @@ function loadSequenceIndex(plan = {}) {
         });
         if (stop.type !== "drop") continue;
         const order = orderByRef.get(String(stop.orderId)) || { id: stop.orderId };
-        const pickupLocations = [...new Set((Array.isArray(order.pickupLocations) && order.pickupLocations.length
+        const pickupLocations = uniqueDispatchLocations((Array.isArray(order.pickupLocations) && order.pickupLocations.length
           ? order.pickupLocations
-          : [order.sourceYard || order.outboundLocation].filter(Boolean)).map(text).filter(Boolean))];
+          : [order.sourceYard || order.outboundLocation].filter(Boolean)).map(text).filter(Boolean));
         const pickupSequences = sequencedStops
           .filter((entry) => entry.stop.type === "pick"
-            && pickupLocations.some((location) => location.toLowerCase() === text(entry.stop.location).toLowerCase()))
+            && pickupLocations.some((location) => dispatchLocationsShareYard(location, entry.stop.location)))
           .map((entry) => entry.sequence);
         const pickupArrivals = sequencedStops
           .filter((entry) => entry.stop.type === "pick"
-            && pickupLocations.some((location) => location.toLowerCase() === text(entry.stop.location).toLowerCase()))
+            && pickupLocations.some((location) => dispatchLocationsShareYard(location, entry.stop.location)))
           .map((entry) => entry.arrival)
           .filter(Number.isFinite);
         const assignment = {
@@ -3705,7 +3709,7 @@ export async function validateDispatchPlanDependencies(plan = {}) {
         return order ? dispatchOrderRefs(order).includes(plannedSalesRef) : String(stop.orderId || "") === plannedSalesRef;
       });
       const pickupIndex = (assignedLoad?.stops || []).findIndex((stop) =>
-        stop.type === "pick" && text(stop.location).toLowerCase() === text(dependency.sourceLocation).toLowerCase()
+        stop.type === "pick" && dispatchLocationsShareYard(stop.location, dependency.sourceLocation)
       );
       if (pickupIndex < 0 || dropIndex < 0 || pickupIndex > dropIndex) {
         conflicts.push(`${plannedSalesRef} requires direct pickup ${dependency.transferOrderRef} at ${dependency.sourceLocation} before the customer drop.`);

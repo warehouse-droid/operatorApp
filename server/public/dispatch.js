@@ -420,6 +420,13 @@ let pointerDraggedLoadId = "";
 let supportTab = "drivers";
 let searchText = "";
 let activeOrderType = "SO";
+let mbtBinDispatchEnabled = false;
+let mbtBinDispatchFeed = { schemaVersion: "mbt-bin-dispatch-feed-v1", planDate: "", items: [] };
+let mbtBinDispatchLoading = false;
+let mbtBinDispatchError = "";
+let mbtBinDispatchRequestSequence = 0;
+const mbtBinAssetSelectionByVisit = new Map();
+const mbtBinLoadSelectionByVisit = new Map();
 let orderSearchTimer = null;
 let orderSearchSequence = 0;
 let orderSearchLoading = false;
@@ -1350,6 +1357,15 @@ function makeTruckFromFleet(vehicle, index, saved = {}) {
     id,
     plate: vehicle.plate,
     capacityLbs: truckCapacityLbs(vehicle),
+    truckType: String(vehicle.truckType || saved.truckType || "flatbed").trim().toLowerCase() === "bin"
+      ? "bin"
+      : "flatbed",
+    binServiceEnabled: vehicle.binServiceEnabled === true || saved.binServiceEnabled === true,
+    binSlotCapacity: Math.max(0, Number(vehicle.binSlotCapacity ?? saved.binSlotCapacity ?? 0)),
+    supportedBinTypeCodes: [...new Set([
+      ...(Array.isArray(vehicle.supportedBinTypeCodes) ? vehicle.supportedBinTypeCodes : []),
+      ...(Array.isArray(saved.supportedBinTypeCodes) ? saved.supportedBinTypeCodes : [])
+    ].map((code) => String(code || "").trim().toUpperCase()).filter(Boolean))],
     driverLogin: savedDriverKey || "",
     driver: driver.name || saved.driver || "Unassigned",
     license: driver.license || saved.license || "-",
@@ -1438,7 +1454,7 @@ function dropoffForStop(order = {}, stop = {}) {
   }
   const yard = String(stop.dropLocation || "");
   if (yard) {
-    const exact = dropoffs.find((dropoff) => String(dropoff.destinationYard || "") === yard);
+    const exact = dropoffs.find((dropoff) => sameDispatchLocation(dropoff.destinationYard, yard));
     if (exact) return exact;
   }
   return dropoffs.length === 1 ? dropoffs[0] : null;
@@ -1494,9 +1510,9 @@ function orderFootprintPallets(order) {
 }
 
 function yardTravelMinutes(from, to) {
-  if (!from || !to || String(from) === String(to)) return 0;
-  const fromHub = HUBS[from];
-  const toHub = HUBS[to];
+  if (!from || !to || sameDispatchLocation(from, to)) return 0;
+  const fromHub = HUBS[dispatchLocationHierarchyRoot(from)];
+  const toHub = HUBS[dispatchLocationHierarchyRoot(to)];
   if (!fromHub || !toHub) return 30;
   const latKm = (fromHub.lat - toHub.lat) * 111;
   const lngKm = (fromHub.lng - toHub.lng) * 111 * Math.cos(((fromHub.lat + toHub.lat) / 2) * Math.PI / 180);
@@ -1713,7 +1729,7 @@ function itemForPickupLocation(item = {}, pickupLocation = "", order = {}) {
   const location = String(pickupLocation || "").trim();
   if (!location) return item;
   if (isOwnYardCode(location)) {
-    const direct = String(order.sourceYard || order.outboundLocation || "") === location
+    const direct = sameDispatchLocation(order.sourceYard || order.outboundLocation, location)
       ? directPickupAllocatedForItem(order, item)
       : { pallets: 0, layers: 0, sections: 0, pieces: 0, quantity: 0 };
     return {
@@ -1737,8 +1753,30 @@ function itemForPickupLocation(item = {}, pickupLocation = "", order = {}) {
   };
 }
 
+function dispatchLocationHierarchyRoot(value) {
+  const location = String(value || "").trim();
+  if (!location) return "";
+  return location.split(/\s*:\s*/u, 1)[0].trim();
+}
+
 function normalizedPickupLocation(value) {
-  return String(value || "").trim().toLowerCase();
+  return dispatchLocationHierarchyRoot(value).toLowerCase();
+}
+
+function sameDispatchLocation(left, right) {
+  const leftKey = normalizedPickupLocation(left);
+  const rightKey = normalizedPickupLocation(right);
+  return Boolean(leftKey && rightKey && leftKey === rightKey);
+}
+
+function uniqueDispatchLocationLabels(values = []) {
+  const seen = new Set();
+  return (Array.isArray(values) ? values : []).filter((value) => {
+    const locationKey = normalizedPickupLocation(value);
+    if (!locationKey || seen.has(locationKey)) return false;
+    seen.add(locationKey);
+    return true;
+  });
 }
 
 function orderRequiresPickupLocation(order = {}, pickupLocation = "") {
@@ -1764,6 +1802,20 @@ function pickupOrdersForStop(load, stop) {
   return ordersForLocation;
 }
 
+function isMbbsSpecialLinkLine(line = {}) {
+  return line.isSpecial === true
+    || line.salesQuantityOnly === true
+    || Number(line.itemId ?? line.item_id) === 2055;
+}
+
+function isOperationalDispatchItem(item = {}) {
+  if (isMbbsSpecialLinkLine(item)) return true;
+  const itemLabel = `${item.sku || ""} ${item.itemName || item.item_name || ""}`.trim();
+  const itemType = `${item.itemType || item.item_type || ""} ${item.itemTypeText || item.item_type_text || ""}`.trim();
+  if (/delivery\s*(charge|fee)|shipping\s*(charge|fee)|sales\s*credit|discount/i.test(itemLabel)) return false;
+  return !/oth\s*charge|other\s*charge|service|discount|description|subtotal|payment|markup/i.test(itemType);
+}
+
 function itemHasQuantity(item = {}) {
   return Number(item.pallets || 0)
     || Number(item.layers || 0)
@@ -1773,24 +1825,25 @@ function itemHasQuantity(item = {}) {
 }
 
 function tooltipItemsForOrder(order, { pickupLocation = "", stop = null } = {}) {
-  if (stop?.type === "drop") return dropItemsForStop(order, stop).filter(itemHasQuantity);
+  if (stop?.type === "drop") return dropItemsForStop(order, stop).filter(isOperationalDispatchItem).filter(itemHasQuantity);
   if (pickupLocation && order?.type === "PO") {
-    return (order.items || []).filter(itemHasQuantity);
+    return (order.items || []).filter(isOperationalDispatchItem).filter(itemHasQuantity);
   }
   const directItems = pickupLocation ? directPickupItemsForLocation(order, pickupLocation) : [];
-  if (directItems.length && String(order.sourceYard || order.outboundLocation || "") !== String(pickupLocation || "")) {
-    return directItems.filter(itemHasQuantity);
+  if (directItems.length && !sameDispatchLocation(order.sourceYard || order.outboundLocation, pickupLocation)) {
+    return directItems.filter(isOperationalDispatchItem).filter(itemHasQuantity);
   }
   const poItems = pickupLocation ? poPickupItemsForLocation(order, pickupLocation) : [];
-  if (poItems.length && !isOwnYardCode(pickupLocation)) return poItems.filter(itemHasQuantity);
+  if (poItems.length && !isOwnYardCode(pickupLocation)) return poItems.filter(isOperationalDispatchItem).filter(itemHasQuantity);
   return (order.items || [])
+    .filter(isOperationalDispatchItem)
     .map((item) => pickupLocation ? itemForPickupLocation(item, pickupLocation, order) : item)
     .filter(itemHasQuantity);
 }
 
 function tooltipItemRowsForOrder(order, { pickupLocation = "", stop = null, includeOrderHeader = false } = {}) {
   const directEntries = pickupLocation ? directPickupEntriesForLocation(order, pickupLocation) : [];
-  if (directEntries.length && String(order.sourceYard || order.outboundLocation || "") !== String(pickupLocation || "")) {
+  if (directEntries.length && !sameDispatchLocation(order.sourceYard || order.outboundLocation, pickupLocation)) {
     return directEntries.map((entry) => `
       <div>
         <b>${escapeHtml(entry.transferOrderRef || order.id)}</b>
@@ -1845,6 +1898,11 @@ function tooltipItemRowsForOrder(order, { pickupLocation = "", stop = null, incl
 
 function availableUnitsForLine(line = {}) {
   const available = line.available || {};
+  if (isMbbsSpecialLinkLine(line)) {
+    const salesQty = Number(available.salesQty || 0);
+    const salesUom = String(line.required?.unit || "").trim();
+    return salesQty > 0 ? [["salesQty", `Sales Qty${salesUom ? ` (${salesUom})` : ""}`, salesQty]] : [];
+  }
   const units = [
     ["pallets", "PLT", available.pallets],
     ["layers", "LYR", available.layers],
@@ -1864,6 +1922,9 @@ function linkQuantityInputStep() {
 }
 
 function availableQtyTextForLine(line = {}) {
+  if (isMbbsSpecialLinkLine(line)) {
+    return `${qtyText(line.available?.salesQty || 0)} ${line.required?.unit || "Qty"}`;
+  }
   return itemQtyText({ ...(line.available || {}), unit: line.required?.unit || "Qty" });
 }
 
@@ -2279,11 +2340,12 @@ function samePhysicalAddress(left, right) {
 }
 
 function ownYardForLocation(location = "") {
-  const key = normalizedPlaceKey(location);
+  const hierarchyRoot = dispatchLocationHierarchyRoot(location);
+  const key = normalizedPlaceKey(hierarchyRoot);
   if (!key) return null;
-  if (HUBS[String(location)] && String(location) !== "Vendor") {
-    const hub = HUBS[String(location)];
-    return { code: String(location), name: hub.name || String(location), address: hub.address || String(location), lat: hub.lat, lng: hub.lng };
+  if (HUBS[hierarchyRoot] && hierarchyRoot !== "Vendor") {
+    const hub = HUBS[hierarchyRoot];
+    return { code: hierarchyRoot, name: hub.name || hierarchyRoot, address: hub.address || hierarchyRoot, lat: hub.lat, lng: hub.lng };
   }
   const exact = ownYards.find((yard) => {
     const code = normalizedPlaceKey(yard.code);
@@ -2616,7 +2678,7 @@ function normalizePoDropoffs(order = {}, type = "", items = []) {
       key,
       destinationLocationId,
       destinationYard,
-      address: dropoff.address || HUBS[destinationYard]?.address || order.destinationAddress || order.address || destinationYard,
+      address: dropoff.address || HUBS[dispatchLocationHierarchyRoot(destinationYard)]?.address || order.destinationAddress || order.address || destinationYard,
       lineRowIds: (dropoff.lineRowIds || []).map(String),
       pallets: Number(dropoff.pallets || 0),
       layers: Number(dropoff.layers || 0),
@@ -2662,7 +2724,9 @@ function normalizeOrder(order) {
       : type === "SO"
         ? ["3445"]
         : [];
-  const pickupLocations = order.transitCo?.toYard ? [order.transitCo.toYard] : basePickupLocations;
+  const pickupLocations = uniqueDispatchLocationLabels(
+    order.transitCo?.toYard ? [order.transitCo.toYard] : basePickupLocations
+  );
   const dropoffs = normalizePoDropoffs(order, type, items);
   return {
     ...order,
@@ -3390,6 +3454,233 @@ async function loadDispatchOrders({ sync = false } = {}) {
   } catch (error) {
     routeNotice = sync ? `Order refresh failed: ${error.message}` : routeNotice;
     applyDispatchOrderFeed(orderCatalog);
+    return false;
+  }
+}
+
+async function loadMbtBinDispatchCapability() {
+  mbtBinDispatchEnabled = false;
+  try {
+    const response = await fetch("/api/mbt/status", {
+      headers: { Accept: "application/json" },
+      cache: "no-store"
+    });
+    if (!response.ok) return false;
+    const status = await response.json();
+    mbtBinDispatchEnabled = status?.capabilities?.binDispatch?.enabled === true;
+  } catch {
+    mbtBinDispatchEnabled = false;
+  }
+  if (!mbtBinDispatchEnabled && activeOrderType === "BIN") {
+    activeOrderType = "SO";
+  }
+  return mbtBinDispatchEnabled;
+}
+
+async function loadMbtBinFrontLegs({ renderAfter = false } = {}) {
+  if (!mbtBinDispatchEnabled) {
+    mbtBinDispatchLoading = false;
+    mbtBinDispatchError = "";
+    mbtBinDispatchFeed = {
+      schemaVersion: "mbt-bin-dispatch-feed-v1",
+      planDate: "",
+      items: []
+    };
+    return false;
+  }
+  const sequence = ++mbtBinDispatchRequestSequence;
+  mbtBinDispatchLoading = true;
+  mbtBinDispatchError = "";
+  try {
+    const params = new URLSearchParams({ planDate: currentPlanDate, limit: "100" });
+    if (searchText.trim() && activeOrderType === "BIN") params.set("search", searchText.trim());
+    const response = await fetch(`/api/mbt/dispatch/front-legs?${params.toString()}`, {
+      headers: { Accept: "application/json" },
+      cache: "no-store"
+    });
+    if (!response.ok) throw new Error(await dispatchErrorMessage(response));
+    const feed = await response.json();
+    if (sequence !== mbtBinDispatchRequestSequence) return false;
+    mbtBinDispatchFeed = {
+      schemaVersion: String(feed.schemaVersion || "mbt-bin-dispatch-feed-v1"),
+      planDate: String(feed.planDate || currentPlanDate),
+      items: Array.isArray(feed.items) ? feed.items : []
+    };
+    return true;
+  } catch (error) {
+    if (sequence !== mbtBinDispatchRequestSequence) return false;
+    mbtBinDispatchError = error.message || "BIN contract legs are unavailable.";
+    mbtBinDispatchFeed = {
+      schemaVersion: "mbt-bin-dispatch-feed-v1",
+      planDate: currentPlanDate,
+      items: []
+    };
+    return false;
+  } finally {
+    if (sequence === mbtBinDispatchRequestSequence) {
+      mbtBinDispatchLoading = false;
+      if (renderAfter) render({ save: false });
+    }
+  }
+}
+
+function mbtBinFrontLeg(visitId) {
+  return (mbtBinDispatchFeed.items || []).find(
+    (card) => String(card?.mbt?.visitId || "") === String(visitId || "")
+  ) || null;
+}
+
+function mbtIdempotencyKey(visitId, loadId) {
+  const random = window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return `mbt-bin-assign-${visitId}-${loadId}-${random}`;
+}
+
+function mbtEligibleAssetChoice(card) {
+  const choice = (card?.mbt?.assetChoices || []).find(
+    (candidate) => candidate?.reservationSlot === "outgoing"
+  );
+  return choice ? (choice.eligibleAssets || []) : [];
+}
+
+function mbtSelectedEligibleAsset(card) {
+  const visitId = String(card?.mbt?.visitId || "");
+  const choices = mbtEligibleAssetChoice(card);
+  if (!visitId || !choices.length) return null;
+  let selectedId = String(mbtBinAssetSelectionByVisit.get(visitId) || "");
+  if (!selectedId && choices.length === 1) {
+    selectedId = String(choices[0].assetId || "");
+    if (selectedId) mbtBinAssetSelectionByVisit.set(visitId, selectedId);
+  }
+  const selected = choices.find((candidate) => String(candidate?.assetId || "") === selectedId) || null;
+  if (selectedId && !selected) mbtBinAssetSelectionByVisit.delete(visitId);
+  return selected;
+}
+
+function mbtAssetAssignmentsForCard(card) {
+  const requirements = card?.mbt?.assetRequirements || [];
+  if (requirements.length) {
+    return requirements.map((requirement) => ({
+      reservationSlot: requirement.reservationSlot,
+      assetId: requirement.exactAssetId,
+      expectedStateRevision: Number(requirement.expectedStateRevision)
+    }));
+  }
+  const selected = mbtSelectedEligibleAsset(card);
+  return selected ? [{
+    reservationSlot: "outgoing",
+    assetId: selected.assetId,
+    expectedStateRevision: Number(selected.stateRevision)
+  }] : [];
+}
+
+function mbtBinFrontLegDraggable(card) {
+  return card?.mbt?.frontLeg?.dispatchable === true
+    && mbtAssetAssignmentsForCard(card).length > 0;
+}
+
+function mbtAssignableLoadChoices(card) {
+  const requiredBinType = String(card?.mbt?.binTypeCode || "").trim().toUpperCase();
+  return trucks.flatMap((truck) => {
+    const supportedBinTypes = new Set(
+      (Array.isArray(truck?.supportedBinTypeCodes) ? truck.supportedBinTypeCodes : [])
+        .map((code) => String(code || "").trim().toUpperCase())
+        .filter(Boolean)
+    );
+    const compatible = String(truck?.truckType || "").trim().toLowerCase() === "bin"
+      && truck?.binServiceEnabled === true
+      && Number(truck?.binSlotCapacity || 0) >= 1
+      && Boolean(requiredBinType)
+      && supportedBinTypes.has(requiredBinType);
+    if (!compatible) return [];
+    return (Array.isArray(truck.loads) ? truck.loads : [])
+      .filter((load) => loadHasAssignedDriver(truck, load) && !loadHasDriverActivity(load))
+      .map((load) => ({
+        loadId: String(load.id || ""),
+        label: `${String(truck.plate || truck.id || "BIN truck")} · ${String(load.name || load.id || "Load")}`,
+        truck,
+        load
+      }))
+      .filter(({ loadId }) => Boolean(loadId));
+  });
+}
+
+function mbtSelectedAssignableLoad(card) {
+  const visitId = String(card?.mbt?.visitId || "");
+  const choices = mbtAssignableLoadChoices(card);
+  if (!visitId || !choices.length) return null;
+  let selectedId = String(mbtBinLoadSelectionByVisit.get(visitId) || "");
+  if (!selectedId && choices.length === 1) {
+    selectedId = choices[0].loadId;
+    mbtBinLoadSelectionByVisit.set(visitId, selectedId);
+  }
+  const selected = choices.find((choice) => choice.loadId === selectedId) || null;
+  if (selectedId && !selected) mbtBinLoadSelectionByVisit.delete(visitId);
+  return selected;
+}
+
+async function assignMbtBinFrontLegToLoad(visitId, loadId) {
+  const card = mbtBinFrontLeg(visitId);
+  const found = findLoad(loadId);
+  if (!card || !found.load || !currentPlan?.id) {
+    routeNotice = "The BIN contract leg or target load changed. Refresh the plan and try again.";
+    render({ save: false });
+    return false;
+  }
+  const assetAssignments = mbtAssetAssignmentsForCard(card);
+  if (!assetAssignments.length) {
+    routeNotice = "Choose the exact BIN asset before assigning this contract leg.";
+    render({ save: false });
+    return false;
+  }
+  const loadName = found.load.name || loadId;
+  routeNotice = `Assigning ${card.mbt.contractNumber} leg ${card.mbt.visitNumber} to ${loadName}...`;
+  render({ save: false });
+  try {
+    const response = await fetch("/api/mbt/dispatch/assignments", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Idempotency-Key": mbtIdempotencyKey(visitId, loadId)
+      },
+      body: JSON.stringify({
+        planId: String(currentPlan.id),
+        planDate: currentPlanDate,
+        loadId: String(loadId),
+        visitId: String(visitId),
+        expectedVisitRevision: Number(card.mbt.visitRevision),
+        expectedPlanRevision: Number(currentPlan.revision),
+        assetAssignments,
+        reason: `Assign current BIN contract leg to ${loadName}`
+      })
+    });
+    if (!response.ok) throw new Error(await dispatchErrorMessage(response));
+    const assignment = await response.json();
+    const latest = findLoad(loadId);
+    if (!latest.load) throw new Error("The target load is no longer visible.");
+    latest.load.stops = [
+      ...(latest.load.stops || []).filter(
+        (stop) => String(stop?.mbt?.visitId || "") !== String(visitId)
+      ),
+      ...(assignment.stops || []).map((stop) => ({ ...stop, loadId: String(loadId) }))
+    ];
+    currentPlan.revision = Number(assignment.planRevision || currentPlan.revision);
+    minimumPlanRevisionToApply = {
+      planId: String(currentPlan.id || ""),
+      revision: Number(currentPlan.revision || 0)
+    };
+    mbtBinDispatchFeed.items = (mbtBinDispatchFeed.items || []).filter(
+      (candidate) => String(candidate?.mbt?.visitId || "") !== String(visitId)
+    );
+    mbtBinAssetSelectionByVisit.delete(String(visitId));
+    mbtBinLoadSelectionByVisit.delete(String(visitId));
+    selectedLoadId = String(loadId);
+    routeNotice = `${card.mbt.contractNumber} leg ${card.mbt.visitNumber} assigned to ${loadName}.`;
+    render({ save: false });
+    return true;
+  } catch (error) {
+    routeNotice = `BIN assignment failed: ${error.message}`;
+    await loadMbtBinFrontLegs();
+    render({ save: false });
     return false;
   }
 }
@@ -4366,7 +4657,7 @@ function applyTransitPickupToOrder(order, { coId, fromYard, toYard, createdAt } 
   if (!order || !fromYard || !toYard) return order;
   const originalPickupLocations = order.transitOriginalPickupLocations?.length
     ? order.transitOriginalPickupLocations
-    : (order.pickupLocations || []).filter((location) => String(location) !== String(toYard));
+    : (order.pickupLocations || []).filter((location) => !sameDispatchLocation(location, toYard));
   order.transitOriginalPickupLocations = originalPickupLocations.length ? originalPickupLocations : [fromYard];
   if (order.transitOriginalSourceYard === undefined) order.transitOriginalSourceYard = order.sourceYard || fromYard;
   order.transitCo = {
@@ -4447,6 +4738,25 @@ function splitParentOrderIds(orderList = orders) {
     .filter(Boolean));
 }
 
+function catalogStructureConflictsWithSavedPlan(catalogOrder = {}, savedPlan = {}) {
+  const sourcePlanId = String(catalogOrder.dispatchSnapshotSourcePlanId || "").trim();
+  const savedPlanId = String(savedPlan.id || savedPlan.planId || "").trim();
+  if (!sourcePlanId || !savedPlanId || sourcePlanId === savedPlanId) return false;
+  const savedOrderIds = new Set((savedPlan.orders || [])
+    .map((order) => String(order?.id || "").trim())
+    .filter(Boolean));
+  const catalogOrderId = String(catalogOrder.id || "").trim();
+  if (!catalogOrderId || savedOrderIds.has(catalogOrderId)) return false;
+  const groupedRefs = [
+    ...(catalogOrder.childOrders || []),
+    ...(catalogOrder.groupAliases || []),
+    ...(catalogOrder.childOrderDetails || []).flatMap((child) => [child?.id, child?.originalOrderId])
+  ].map((ref) => String(ref || "").trim()).filter(Boolean);
+  if (groupedRefs.some((ref) => savedOrderIds.has(ref))) return true;
+  const parentRef = String(catalogOrder.originalOrderId || "").trim();
+  return Boolean(parentRef && savedOrderIds.has(parentRef));
+}
+
 function splitSiblingsForOrder(order = {}) {
   const originalOrderId = splitParentOrderId(order);
   if (!originalOrderId) return [];
@@ -4517,6 +4827,7 @@ function applySavedPlan(saved) {
   ]);
   for (const order of orderCatalog) {
     if (hiddenOrderIds.has(order.id)) continue;
+    if (catalogStructureConflictsWithSavedPlan(order, saved)) continue;
     if (!savedById.has(order.id)) savedById.set(order.id, normalizeOrder(order));
   }
   orders = [...savedById.values()].filter((order) => !hiddenOrderIds.has(order.id));
@@ -5760,13 +6071,7 @@ function stopById(stopId) {
 
 function requiredPickupLocations(order) {
   const locations = order?.pickupLocations?.length ? order.pickupLocations : ["3445"];
-  const seen = new Set();
-  const uniqueLocations = locations.filter((location) => {
-    const key = normalizedPickupLocation(location);
-    if (!key || seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+  const uniqueLocations = uniqueDispatchLocationLabels(locations);
   const hasPickupAddressOverride = Boolean(String(order?.pickupAddressOverride || "").trim());
   return uniqueLocations.filter((location, index) =>
     (hasPickupAddressOverride && index === 0)
@@ -5779,13 +6084,13 @@ function sequenceWarningsForStops(stops) {
   const warnings = [];
   for (const stop of stops) {
     if (stop.type === "pick") {
-      picked.add(String(stop.location));
+      picked.add(normalizedPickupLocation(stop.location));
       continue;
     }
     if (stop.type !== "drop") continue;
     const order = stopOrder(stop);
     if (!order) continue;
-    const missing = requiredPickupLocations(order).filter((location) => !picked.has(String(location)));
+    const missing = requiredPickupLocations(order).filter((location) => !picked.has(normalizedPickupLocation(location)));
     if (missing.length) warnings.push(`${order.id}: pickup ${missing.join(", ")} before drop.`);
   }
   for (const warning of replenishmentSequenceWarningsForStops(stops)) {
@@ -5800,17 +6105,24 @@ function sequenceIsValid(stops) {
 
 function uniquePickupLocations(load, truck) {
   const locations = [];
+  const seen = new Set();
+  const append = (location) => {
+    const key = normalizedPickupLocation(location);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    locations.push(location);
+  };
   for (const stop of load.stops) {
     if (stop.type === "pick") {
-      if (stop.location && !locations.includes(stop.location)) locations.push(stop.location);
+      append(stop.location);
       continue;
     }
     const order = stopOrder(stop);
     for (const location of order?.pickupLocations || [truck.base]) {
-      if (location && !locations.includes(location)) locations.push(location);
+      append(location);
     }
   }
-  if (!locations.length && truck?.base) locations.push(truck.base);
+  if (!locations.length) append(truck?.base);
   return locations;
 }
 
@@ -5826,14 +6138,14 @@ function uniquePickupDisplayLabels(load, truck) {
 }
 
 function pickupFootprintForLocation(load, location) {
-  const pickupLocation = String(location || "");
+  const pickupLocation = normalizedPickupLocation(location);
   const countedOrders = new Set();
   let total = 0;
   for (const stop of load.stops || []) {
     if (stop.type !== "drop" || countedOrders.has(stop.orderId)) continue;
     const order = stopOrder(stop);
     if (!order) continue;
-    if (!requiredPickupLocations(order).map(String).includes(pickupLocation)) continue;
+    if (!requiredPickupLocations(order).some((candidate) => normalizedPickupLocation(candidate) === pickupLocation)) continue;
     countedOrders.add(stop.orderId);
     total += pickupFootprintForOrderLocation(order, pickupLocation);
   }
@@ -5862,8 +6174,8 @@ function directPickupWeight(order = {}, entries = order.directPickupManifest || 
 function pickupWeightForOrderLocation(order, location) {
   const direct = directPickupEntriesForLocation(order, location);
   const source = String(order.sourceYard || order.outboundLocation || "");
-  if (direct.length && source !== String(location || "")) return directPickupWeight(order, direct);
-  if (source === String(location || "") && (order.directPickupManifest || []).length) {
+  if (direct.length && !sameDispatchLocation(source, location)) return directPickupWeight(order, direct);
+  if (sameDispatchLocation(source, location) && (order.directPickupManifest || []).length) {
     return Math.max(0, orderWeightLbs(order) - directPickupWeight(order));
   }
   return orderWeightLbs(order);
@@ -5924,17 +6236,13 @@ function invalidateDriverRoutesFromLoad(loadId) {
 
 function routeStopIsOwnYard(stop = {}) {
   if (stop.kind === "own") return true;
-  const keys = [
+  const locations = [
     stop.address,
     typeof stop.routeLocation === "string" ? stop.routeLocation : "",
     stop.title,
     stop.label
-  ].map(normalizedPlaceKey).filter(Boolean);
-  if (!keys.length) return false;
-  return ownYards.some((yard) => {
-    const yardKeys = [yard.code, yard.name, yard.address].map(normalizedPlaceKey).filter(Boolean);
-    return yardKeys.some((yardKey) => keys.includes(yardKey));
-  });
+  ].filter(Boolean);
+  return locations.some((location) => Boolean(ownYardForLocation(location)));
 }
 
 function routePendingForLoad(truck, load) {
@@ -6110,6 +6418,7 @@ function loadStats(parentTruck, load) {
   let warningCount = startWarnings.length;
   const warnings = [...startWarnings];
   for (const unresolvedStop of load.stops || []) {
+    if (unresolvedStop?.mbt?.visitId) continue;
     if (stopOrder(unresolvedStop)) continue;
     warningCount += 1;
     warnings.push(`${unresolvedStop.orderId || unresolvedStop.id || "Stop"}: order details are temporarily unavailable. Refresh orders before saving this stop timing.`);
@@ -6129,7 +6438,7 @@ function loadStats(parentTruck, load) {
   const explicitPickCount = load.stops.filter((stop) => stop.type === "pick").length;
   if (!explicitPickCount) {
     for (const location of uniquePickupLocations(load, truck)) {
-      current += truckStopMinutes(truck, HUBS[location] ? "own" : "vendor", pickupFootprintForLocation(load, location));
+      current += truckStopMinutes(truck, isOwnYardCode(location) ? "own" : "vendor", pickupFootprintForLocation(load, location));
     }
     for (const stop of load.stops) {
       if (stop.type !== "drop" || onboardOrderIds.has(stop.orderId)) continue;
@@ -6161,7 +6470,7 @@ function loadStats(parentTruck, load) {
       routeLegIndex += 1;
     }
     if (visit.type === "pick") {
-      pickedLocations.add(String(stop.location));
+      pickedLocations.add(normalizedPickupLocation(stop.location));
       let pickedFootprint = 0;
       const pickedOrderIdsAtLocation = new Set();
       for (const dropStop of load.stops) {
@@ -6169,7 +6478,8 @@ function loadStats(parentTruck, load) {
         if (pickedOrderIdsAtLocation.has(String(dropStop.orderId))) continue;
         const dropOrder = stopOrder(dropStop);
         if (!dropOrder) continue;
-        if (!requiredPickupLocations(dropOrder).map(String).includes(String(stop.location))) continue;
+        if (!requiredPickupLocations(dropOrder)
+          .some((location) => sameDispatchLocation(location, stop.location))) continue;
         currentWeightLbs += pickupWeightForOrderLocation(dropOrder, stop.location);
         pickedFootprint += pickupFootprintForOrderLocation(dropOrder, stop.location);
         pickedOrderIdsAtLocation.add(String(dropStop.orderId));
@@ -6198,7 +6508,8 @@ function loadStats(parentTruck, load) {
     for (const entry of visit.entries) {
       const entryStop = entry.stop;
       const entryOrder = entry.order;
-      const missingPickupLocations = requiredPickupLocations(entryOrder).filter((location) => !pickedLocations.has(String(location)));
+      const missingPickupLocations = requiredPickupLocations(entryOrder)
+        .filter((location) => !pickedLocations.has(normalizedPickupLocation(location)));
       const dropFootprint = dropFootprintPallets(entryOrder, entryStop);
       const dropWeight = dropWeightLbs(entryOrder, entryStop);
       palletTotal += dropPallets(entryOrder, entryStop);
@@ -6404,7 +6715,7 @@ function buildLocalAssignmentAdvisories() {
       const switchYard = loadSwitchYard(current.truck, current.load);
       const previousEndYard = loadEndOwnYard(previous.load);
       const handoffTravel = switchApproachTravelForLoad(current.truck, current.load);
-      if (!handoffTravel && previousEndYard && previousEndYard !== switchYard) {
+      if (!handoffTravel && previousEndYard && !sameDispatchLocation(previousEndYard, switchYard)) {
         addLocalAssignmentAdvisory(
           advisories,
           current.load.id,
@@ -6433,7 +6744,7 @@ function buildLocalAssignmentAdvisories() {
         "TRUCK_LOCATION_UNKNOWN",
         `${first.truckPlate} starting location is unknown. This plan assumes it is available at ${firstSwitchYard}; verify or set its starting yard for this date.`
       );
-    } else if (configuredStartYard !== firstSwitchYard) {
+    } else if (!sameDispatchLocation(configuredStartYard, firstSwitchYard)) {
       addLocalAssignmentAdvisory(
         advisories,
         first.load.id,
@@ -6447,7 +6758,7 @@ function buildLocalAssignmentAdvisories() {
       if (previous.driverLogin === current.driverLogin) continue;
       const handoffYard = loadSwitchYard(current.truck, current.load);
       const previousEndYard = loadEndOwnYard(previous.load);
-      if (!previousEndYard || previousEndYard !== handoffYard) {
+      if (!previousEndYard || !sameDispatchLocation(previousEndYard, handoffYard)) {
         addLocalAssignmentAdvisory(
           advisories,
           current.load.id,
@@ -6511,7 +6822,10 @@ function makePickupStop(load, order, location) {
 function ensurePickupStops(load, order, insertIndex = null) {
   let added = 0;
   for (const location of requiredPickupLocations(order)) {
-    const exists = load.stops.some((stop) => stop.type === "pick" && String(stop.location) === String(location));
+    const exists = load.stops.some((stop) =>
+      stop.type === "pick"
+      && normalizedPickupLocation(stop.location) === normalizedPickupLocation(location)
+    );
     if (exists) continue;
     const stop = makePickupStop(load, order, location);
     if (Number.isInteger(insertIndex)) {
@@ -6632,9 +6946,9 @@ function cleanupOrphanPickupStops() {
         if (stop.type !== "drop") continue;
         const order = stopOrder(stop);
         if (!order) continue;
-        for (const location of requiredPickupLocations(order)) needed.add(String(location));
+        for (const location of requiredPickupLocations(order)) needed.add(normalizedPickupLocation(location));
       }
-      load.stops = load.stops.filter((stop) => stop.type !== "pick" || needed.has(String(stop.location)));
+      load.stops = load.stops.filter((stop) => stop.type !== "pick" || needed.has(normalizedPickupLocation(stop.location)));
     }
   }
 }
@@ -6828,7 +7142,7 @@ function reflowDriverLaneEntries(driverLogin, orderedEntries, timingByLoad, move
       const switchYard = loadSwitchYard(entry.truck, entry.load);
       const previousEndYard = loadEndOwnYard(previous.load);
       const previousPoint = startPointAfterLoad(previous.truck, previous.load);
-      const handoffMinutes = changedTruck && previousPoint && previousEndYard !== switchYard
+      const handoffMinutes = changedTruck && previousPoint && !sameDispatchLocation(previousEndYard, switchYard)
         ? adjustedTravelMinutesForTruck(
           effectiveTruckForLoad(previous.truck, previous.load),
           travelMinutesBetweenPoints(previousPoint, switchYard)
@@ -6909,7 +7223,7 @@ function switchApproachTravelForLoad(truck, load) {
 
   const switchYard = loadSwitchYard(truck, load);
   const previousOwnYard = loadEndOwnYard(previousEntry.load);
-  if (previousOwnYard && previousOwnYard === switchYard) return null;
+  if (previousOwnYard && sameDispatchLocation(previousOwnYard, switchYard)) return null;
   const from = startPointAfterLoad(previousEntry.truck, previousEntry.load);
   if (!from) return null;
   const switchPlace = placeForLocation(switchYard);
@@ -7216,7 +7530,7 @@ function mapPins() {
       pins.push({ label: String(index + 1), className: "pick", x: hub.x, y: hub.y });
     } else {
       const destination = dropLocationForStop(stop, order);
-      const hub = HUBS[destination];
+      const hub = HUBS[dispatchLocationHierarchyRoot(destination)];
       if (hub) pins.push({ label: `${index + 1}`, className: "", x: hub.x, y: hub.y });
       else pins.push({ label: `${index + 1}`, className: "", x: order.x, y: order.y });
     }
@@ -7227,12 +7541,12 @@ function mapPins() {
 function hubPosition(location) {
   const place = placeForLocation(location);
   if (placePosition(place)) return placePosition(place);
-  const hub = HUBS[location] || HUBS["3445"];
+  const hub = HUBS[dispatchLocationHierarchyRoot(location)] || HUBS["3445"];
   return { lat: hub.lat, lng: hub.lng };
 }
 
 function hubAddress(location) {
-  return placeForLocation(location)?.address || HUBS[location]?.address || location;
+  return placeForLocation(location)?.address || HUBS[dispatchLocationHierarchyRoot(location)]?.address || location;
 }
 
 function orderPosition(order) {
@@ -7266,7 +7580,7 @@ function dropAddressForStop(stop = {}, order = {}) {
   const location = dropLocationForStop(stop, order);
   return stop.dropAddress
     || dropoffForStop(order, stop)?.address
-    || HUBS[location]?.address
+    || HUBS[dispatchLocationHierarchyRoot(location)]?.address
     || order?.destinationAddress
     || order?.address
     || location;
@@ -8290,6 +8604,11 @@ function render(options = {}) {
 }
 
 function orderPoolSubtitle() {
+  if (activeOrderType === "BIN") {
+    if (mbtBinDispatchLoading) return "Loading current BIN contract legs...";
+    if (mbtBinDispatchError) return `BIN contract legs unavailable: ${mbtBinDispatchError}`;
+    return "Current ready contract legs; later legs stay locked in the contract timeline.";
+  }
   if (!searchText.trim()) return activeOrderType === "TO" ? "Transfer and Custom Order list" : orderTypeLabel(activeOrderType) + " list";
   if (orderSearchLoading) return "Searching all valid SO, PO, TO, Custom, and CO orders...";
   if (orderSearchError) return "Server search unavailable: " + orderSearchError;
@@ -8316,14 +8635,115 @@ function renderOrderPool() {
       </div>
       <div class="order-type-tabs">
         ${["SO", "PO", "TO", "CO"].map((type) => `<button class="${!searching && activeOrderType === type ? "active" : ""}" data-action="order-type-tab" data-type="${type}" type="button">${type}</button>`).join("")}
+        ${mbtBinDispatchEnabled ? `<button class="${!searching && activeOrderType === "BIN" ? "active" : ""}" data-action="order-type-tab" data-type="BIN" type="button">BIN</button>` : ""}
       </div>
-      <div class="order-list">${renderOrderList()}</div>
+      <div class="order-list" ${activeOrderType === "BIN" ? 'role="region" aria-label="BIN contract legs"' : ""}>${renderOrderList()}</div>
     </section>
   `;
 }
 
 function renderOrderList() {
+  if (activeOrderType === "BIN") return renderMbtBinFrontLegList();
   return openOrders().map(renderOrderCard).join("") || `<div class="empty-drop">No open orders match the filter.</div>`;
+}
+
+function mbtBinActionLabel(actionCode, binTypeCode) {
+  const binType = String(binTypeCode || "BIN");
+  const labels = {
+    collect_empty_bin: `Collect empty ${binType} bin`,
+    deliver_bin: `Deliver empty ${binType} bin`,
+    pickup_bin: `Pickup ${binType} bin`,
+    return_bin: `Return ${binType} bin`
+  };
+  return labels[actionCode] || String(actionCode || "BIN stop").replaceAll("_", " ");
+}
+
+function mbtTimelineLabel(item) {
+  if (item.serviceAction === "return_bin") return "Final pickup";
+  if (item.serviceAction === "delivery") return "Initial delivery";
+  return String(item.serviceAction || "Contract leg").replaceAll("_", " ");
+}
+
+function mbtRouteLabel(card) {
+  const locations = [...(card?.stops || [])]
+    .sort((left, right) => Number(left?.sequence || 0) - Number(right?.sequence || 0))
+    .map((stop) => String(stop?.yardCode || (stop?.siteProfileId ? card?.address : "") || "").trim())
+    .filter(Boolean)
+    .filter((location, index, values) => index === 0 || location !== values[index - 1]);
+  return locations.length > 1 ? locations.join(" → ") : locations[0] || String(card?.address || "Service route");
+}
+
+function renderMbtBinFrontLegCard(card) {
+  const mbt = card?.mbt || {};
+  const binType = mbt.binTypeCode || "BIN";
+  const route = mbtRouteLabel(card);
+  const action = card.serviceAction === "delivery"
+    ? `Deliver empty ${binType}`
+    : mbtBinActionLabel((card.stops || [])[0]?.actionCode, binType).replace(/ bin$/i, "");
+  const eligibleAssets = mbtEligibleAssetChoice(card);
+  const selectedAsset = mbtSelectedEligibleAsset(card);
+  const draggable = mbtBinFrontLegDraggable(card);
+  const assignableLoads = mbtAssignableLoadChoices(card);
+  const selectedLoad = mbtSelectedAssignableLoad(card);
+  const selectedLoadId = String(selectedLoad?.loadId || "");
+  const assignable = draggable && Boolean(selectedLoadId);
+  const assetSelector = eligibleAssets.length ? `
+    <label class="mbt-bin-asset-choice">
+      <span>Exact asset</span>
+      <select data-mbt-asset-choice="${escapeHtml(mbt.visitId)}" aria-label="Asset for ${escapeHtml(mbt.contractNumber)} leg ${escapeHtml(mbt.visitNumber)}">
+        ${eligibleAssets.length > 1 ? '<option value="">Choose exact asset</option>' : ""}
+        ${eligibleAssets.map((asset) => `
+          <option value="${escapeHtml(asset.assetId)}" ${String(selectedAsset?.assetId || "") === String(asset.assetId || "") ? "selected" : ""}>${escapeHtml(asset.assetCode)}</option>
+        `).join("")}
+      </select>
+    </label>
+  ` : "";
+  const loadAssignment = `
+    <div class="mbt-bin-assignment-controls">
+      <label>
+        <span>Target truck and load</span>
+        <select data-mbt-load-choice="${escapeHtml(mbt.visitId)}" aria-label="Target load for ${escapeHtml(mbt.contractNumber)} leg ${escapeHtml(mbt.visitNumber)}">
+          <option value="">${assignableLoads.length ? "Choose truck and load" : "Create a compatible BIN load first"}</option>
+          ${assignableLoads.map((choice) => `
+            <option value="${escapeHtml(choice.loadId)}" ${selectedLoadId === choice.loadId ? "selected" : ""}>${escapeHtml(choice.label)}</option>
+          `).join("")}
+        </select>
+      </label>
+      <button class="primary" data-action="assign-mbt-bin-front-leg" data-mbt-assign-visit-id="${escapeHtml(mbt.visitId)}" ${assignable ? "" : "disabled"} type="button">Assign to load</button>
+      ${assignable ? "" : `<small>Choose the exact BIN asset and target load before assigning.</small>`}
+    </div>
+  `;
+  return `
+    <article class="order-card mbt-bin-front-leg" draggable="${draggable}" data-mbt-visit-id="${escapeHtml(mbt.visitId)}" data-mbt-dispatchable="${draggable}">
+      <div class="mbt-bin-card-heading">
+        <div>
+          <h3>BIN Contract ${escapeHtml(mbt.contractNumber)} · Leg ${escapeHtml(mbt.visitNumber)}</h3>
+          <strong>${escapeHtml(action)}</strong>
+        </div>
+        <span class="mbt-bin-type">${escapeHtml(binType)}</span>
+      </div>
+      <p class="mbt-bin-route">${escapeHtml(route)}</p>
+      <div class="mbt-bin-route-stops" aria-label="Mandatory route stops">
+        ${(card.stops || []).map((stop) => `<span data-mbt-route-stop>${escapeHtml(mbtBinActionLabel(stop.actionCode, binType))}</span>`).join("")}
+      </div>
+      <div class="mbt-bin-timeline" aria-label="Contract timeline">
+        ${(mbt.timeline || []).map((item) => `
+          <span data-mbt-timeline-visit="${escapeHtml(item.visitId)}" data-relation="${escapeHtml(item.relation)}" data-locked="${item.locked === true}" aria-disabled="${item.locked === true}">
+            ${escapeHtml(mbtTimelineLabel(item))}
+          </span>
+        `).join("")}
+      </div>
+      ${assetSelector}
+      ${loadAssignment}
+    </article>
+  `;
+}
+
+function renderMbtBinFrontLegList() {
+  if (mbtBinDispatchLoading) return `<div class="empty-drop">Loading current BIN contract legs...</div>`;
+  if (mbtBinDispatchError) return `<div class="empty-drop">${escapeHtml(mbtBinDispatchError)}</div>`;
+  return (mbtBinDispatchFeed.items || []).map(renderMbtBinFrontLegCard).join("")
+    || `<div class="empty-drop">No ready BIN contract leg is available for this date.</div>`;
 }
 
 function refreshOrderPoolForSearch() {
@@ -8349,6 +8769,7 @@ function refreshOrderPoolForSearch() {
 }
 
 function renderSelectedOrderActions() {
+  if (activeOrderType === "BIN") return "";
   const order = selectedOrder();
   if (!order) return "";
   const selected = selectedOrders();
@@ -8591,6 +9012,22 @@ function renderLoadAssignmentControls(parentTruck, load) {
   `;
 }
 
+function renderMbtAssignedStops(load) {
+  return (load?.stops || [])
+    .filter((stop) => stop?.mbt?.visitId)
+    .sort((left, right) => Number(left?.mbt?.stopSequence || left.sequence || 0) - Number(right?.mbt?.stopSequence || right.sequence || 0))
+    .map((stop) => {
+      const visitId = String(stop.mbt.visitId || "");
+      const binType = stop.mbt.capabilitySnapshot?.binTypeCode || "BIN";
+      const label = stop.displayName || mbtBinActionLabel(stop.actionCode, binType);
+      return `
+        <article class="stop-card compact mbt-bin-assigned-stop" draggable="false" data-mbt-stop-group="${escapeHtml(stop.mbt.stopGroupId || visitId)}" data-mbt-mandatory="${stop.mbt.mandatory === true}">
+          <strong>${escapeHtml(label)}</strong>
+        </article>
+      `;
+    }).join("");
+}
+
 function renderLoad(parentTruck, load) {
   const truck = effectiveTruckForLoad(parentTruck, load);
   const isLocked = loadHasDriverActivity(load);
@@ -8635,6 +9072,7 @@ function renderLoad(parentTruck, load) {
   const stats = loadStats(parentTruck, load);
   const active = selectedLoadId === load.id;
   const finishText = loadFinishText(parentTruck, load, stats);
+  const mbtAssignedStops = renderMbtAssignedStops(load);
   return `
     <section class="load-block ${stats.warningCount ? "warning" : ""} ${active ? "selected" : ""} ${isLocked ? "driver-active" : ""}" draggable="${canDragLoad}" data-driver-load-card="${escapeHtml(load.id)}" data-load-card="${escapeHtml(load.id)}">
       ${stats.warningCount ? `<span class="load-warning-badge">${stats.warningCount}</span>` : ""}
@@ -8653,7 +9091,8 @@ function renderLoad(parentTruck, load) {
       <div class="stop-list" data-load="${escapeHtml(load.id)}">
         ${stats.switchBefore ? "" : renderRestStop(parentTruck, load, stats)}
         ${renderStartTravelStop(parentTruck, load, stats.startTravel, stats.start)}
-        ${renderCompactStopSequence(parentTruck, load, stats) || `<div class="empty-drop">Drop order here</div>`}
+        ${mbtAssignedStops}
+        ${renderCompactStopSequence(parentTruck, load, stats) || (mbtAssignedStops ? "" : `<div class="empty-drop">Drop order here</div>`)}
       </div>
     </section>
   `;
@@ -9928,7 +10367,7 @@ function renderPoLinkModal(order) {
               `; }).join("")}
             </div>
             <div class="warning-detail">
-              Item code controls which cards can connect. For MBBS-Special, description and sales unit identify an exact match; when either differs, the connection is clearly saved as a manual line match. Physical quantities and sales quantity remain independent.
+              Item code controls which cards can connect. MBBS-Special requires the same sales/purchase UOM and always links by Sales Qty. Manual PLT/LYR/SEC/PCS remain operational display quantities and follow the linked Sales Qty coverage.
             </div>
             <div class="modal-status" data-modal-status></div>
             <div class="modal-footer">
@@ -10498,7 +10937,7 @@ function pullExistingStop(orderId, type, location, stopDetails = {}) {
     for (const load of truck.loads) {
       const index = load.stops.findIndex((stop) => {
         if (stop.orderId !== orderId || stop.type !== type) return false;
-        if (type === "pick") return String(stop.location) === String(location);
+        if (type === "pick") return sameDispatchLocation(stop.location, location);
         if (!stopDetails.dropoffKey) return true;
         if (String(stop.dropoffKey || "") === String(stopDetails.dropoffKey)) return true;
         if (stop.dropLocation && String(stop.dropLocation) === String(stopDetails.dropLocation || "")) return true;
@@ -10758,9 +11197,10 @@ function orderGroupYard(order) {
 function mixedYardGroupBlockReason(groupItems = []) {
   const yardRows = groupItems.map((order) => ({
     id: order?.id || "",
-    yard: orderGroupYard(order) || "Unknown"
+    yard: orderGroupYard(order) || "Unknown",
+    yardKey: normalizedPickupLocation(orderGroupYard(order)) || "unknown"
   }));
-  const yards = [...new Set(yardRows.map((row) => row.yard))];
+  const yards = [...new Set(yardRows.map((row) => row.yardKey))];
   if (yards.length <= 1) return "";
   return `Cannot group orders from different yards: ${yardRows.map((row) => `${row.id} (${row.yard})`).join(", ")}.`;
 }
@@ -10962,7 +11402,7 @@ function groupOrder(orderId) {
     weight: groupItems.reduce((sum, item) => sum + Number(item.weight || 0), 0),
     unloadMinutes: groupItems.reduce((sum, item) => sum + Number(item.unloadMinutes || 0), 0),
     travelMinutes: Math.max(...groupItems.map((item) => Number(item.travelMinutes || 0))),
-    pickupLocations: [...new Set(groupItems.flatMap((item) => item.pickupLocations || []))],
+    pickupLocations: uniqueDispatchLocationLabels(groupItems.flatMap((item) => item.pickupLocations || [])),
     items: groupItems.flatMap((item) => item.items || []),
     childOrders: flattenedMembers.childOrders,
     childOrderDetails: leafItems.map((item) => normalizeOrder({ ...item })),
@@ -11118,8 +11558,8 @@ function consolidatePick(orderId, sourceYard) {
       travelMinutes: 36,
       groupKey: `${sourceYard} to ${targetYard}`,
       notes: `Draft TO created for shortage on ${order.id}. Move ${shortage} units one day before delivery.`,
-      x: HUBS[targetYard]?.x || 50,
-      y: HUBS[targetYard]?.y || 50
+      x: HUBS[dispatchLocationHierarchyRoot(targetYard)]?.x || 50,
+      y: HUBS[dispatchLocationHierarchyRoot(targetYard)]?.y || 50
     });
   }
   order.notes = `Consolidate ${shortage} units from ${sourceYard} to ${targetYard} one day before. ${order.notes}`;
@@ -11132,7 +11572,7 @@ function consolidatePick(orderId, sourceYard) {
 function upsertTransitCoForOrder(orderId, fromYard, toYard) {
   const order = orderById(orderId);
   if (!order || !supportsTransitCoForOrder(order)) return null;
-  if (!fromYard || !toYard || String(fromYard) === String(toYard)) return null;
+  if (!fromYard || !toYard || sameDispatchLocation(fromYard, toYard)) return null;
   const beforeOrder = summarizeOrder(order);
   const coId = order.transitCo?.id || `CO-${order.id}`;
   const beforeCo = summarizeOrder(orderById(coId));
@@ -11388,6 +11828,21 @@ app.addEventListener("dragstart", (event) => {
     event.dataTransfer.setData("text/plain", poMapSo.dataset.targetLineKey);
     return;
   }
+  const mbtFrontLegCard = event.target.closest("[data-mbt-visit-id]");
+  if (mbtFrontLegCard) {
+    const visitId = String(mbtFrontLegCard.dataset.mbtVisitId || "");
+    const card = mbtBinFrontLeg(visitId);
+    if (!card || !mbtBinFrontLegDraggable(card)) {
+      event.preventDefault();
+      dragged = null;
+      return;
+    }
+    dragged = { type: "mbt-front-leg", visitId };
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", `mbt-visit:${visitId}`);
+    mbtFrontLegCard.classList.add("dragging");
+    return;
+  }
   const orderCard = event.target.closest("[data-order]");
   const stopCard = event.target.closest("[data-stop]");
   const loadCard = event.target.closest("[data-driver-load-card]");
@@ -11438,6 +11893,8 @@ app.addEventListener("dragend", () => {
     (card) => card.classList.remove("dragging", "drag-over")
   );
   clearDriverLaneDragStyles();
+  document.querySelectorAll(".mbt-bin-front-leg.dragging, [data-load-card].mbt-bin-drag-over")
+    .forEach((element) => element.classList.remove("dragging", "mbt-bin-drag-over"));
   dragged = null;
 });
 
@@ -11557,6 +12014,14 @@ window.addEventListener("keydown", (event) => {
 });
 
 app.addEventListener("dragover", (event) => {
+  if (dragged?.type === "mbt-front-leg") {
+    const targetLoad = event.target.closest("[data-load-card]");
+    if (!targetLoad) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+    targetLoad.classList.add("mbt-bin-drag-over");
+    return;
+  }
   if (dragged?.type === "driver-lane-order") {
     const targetLane = event.target.closest('[data-driver-lane][data-driver-lane-reorderable="true"]');
     const targetLogin = String(targetLane?.dataset.driverLane || "").trim().toLowerCase();
@@ -11593,6 +12058,7 @@ app.addEventListener("dragover", (event) => {
 });
 
 app.addEventListener("dragleave", (event) => {
+  event.target.closest("[data-load-card]")?.classList.remove("mbt-bin-drag-over");
   event.target.closest("[data-po-map-po]")?.classList.remove("drag-over");
   event.target.closest(".stop-list, .preview-stop-list")?.classList.remove("drag-over");
   event.target.closest(".preview-stop-child, .stop-card, .preview-stop")?.classList.remove("drag-over", "insert-before", "insert-after");
@@ -11604,6 +12070,17 @@ app.addEventListener("dragleave", (event) => {
 app.addEventListener("drop", (event) => {
   if (!ensureDispatchPlanEditor()) {
     event.preventDefault();
+    return;
+  }
+  if (dragged?.type === "mbt-front-leg") {
+    const targetLoad = event.target.closest("[data-load-card]");
+    if (!targetLoad) return;
+    event.preventDefault();
+    targetLoad.classList.remove("mbt-bin-drag-over");
+    const visitId = dragged.visitId;
+    const loadId = targetLoad.dataset.loadCard;
+    dragged = null;
+    assignMbtBinFrontLegToLoad(visitId, loadId);
     return;
   }
   if (dragged?.type === "driver-lane-order") {
@@ -11827,6 +12304,18 @@ app.addEventListener("click", (event) => {
   if (!button) return;
   const action = button.dataset.action;
   if (!action) return;
+  if (action === "assign-mbt-bin-front-leg") {
+    const visitId = String(button.dataset.mbtAssignVisitId || "");
+    const card = mbtBinFrontLeg(visitId);
+    const selectedLoad = mbtSelectedAssignableLoad(card);
+    if (!card || !mbtBinFrontLegDraggable(card) || !selectedLoad) {
+      routeNotice = "Choose the exact BIN asset and target load before assigning.";
+      render({ save: false });
+      return;
+    }
+    assignMbtBinFrontLegToLoad(visitId, selectedLoad.loadId);
+    return;
+  }
   if (action === "clear-stop-time-override") {
     updatePhysicalVisitStopTimeOverride(button.dataset.load, button.dataset.stop, null);
     return;
@@ -12086,8 +12575,15 @@ app.addEventListener("click", (event) => {
     searchText = "";
     cancelDispatchOrderSearch();
     selectedOrderIds = new Set();
-    selectedOrderId = openOrders()[0]?.id || selectedOrderId;
-    if (selectedOrderId) selectedOrderIds.add(selectedOrderId);
+    if (activeOrderType === "BIN") {
+      selectedOrderId = "";
+      if (mbtBinDispatchFeed.planDate !== currentPlanDate) {
+        loadMbtBinFrontLegs({ renderAfter: true }).catch(() => null);
+      }
+    } else {
+      selectedOrderId = openOrders()[0]?.id || selectedOrderId;
+      if (selectedOrderId) selectedOrderIds.add(selectedOrderId);
+    }
   }
   if (action === "open-plan-history") {
     loadPlanHistory().then(() => {
@@ -12538,7 +13034,7 @@ app.addEventListener("click", (event) => {
   if (action === "refresh-orders") {
     searchText = "";
     cancelDispatchOrderSearch();
-    loadDispatchOrders().then(() => restoreServerPlan()).then((applied) => {
+    Promise.all([loadDispatchOrders(), loadMbtBinFrontLegs()]).then(() => restoreServerPlan()).then((applied) => {
       if (applied) render({ save: false });
       else render({ save: false });
     });
@@ -12653,6 +13149,16 @@ app.addEventListener("input", (event) => {
   }
   if (event.target?.id !== "orderSearch") return;
   searchText = event.target.value;
+  if (activeOrderType === "BIN") {
+    if (orderSearchTimer) clearTimeout(orderSearchTimer);
+    mbtBinDispatchLoading = true;
+    orderSearchTimer = setTimeout(() => {
+      orderSearchTimer = null;
+      loadMbtBinFrontLegs({ renderAfter: true }).catch(() => null);
+    }, 300);
+    refreshOrderPoolForSearch();
+    return;
+  }
   scheduleDispatchOrderSearch();
   refreshOrderPoolForSearch();
 });
@@ -12674,6 +13180,22 @@ app.addEventListener("keydown", (event) => {
 });
 
 app.addEventListener("change", (event) => {
+  if (event.target?.dataset?.mbtLoadChoice !== undefined) {
+    const visitId = String(event.target.dataset.mbtLoadChoice || "");
+    const selectedLoadId = String(event.target.value || "");
+    if (visitId && selectedLoadId) mbtBinLoadSelectionByVisit.set(visitId, selectedLoadId);
+    else if (visitId) mbtBinLoadSelectionByVisit.delete(visitId);
+    render({ save: false });
+    return;
+  }
+  if (event.target?.dataset?.mbtAssetChoice !== undefined) {
+    const visitId = String(event.target.dataset.mbtAssetChoice || "");
+    const selectedAssetId = String(event.target.value || "");
+    if (visitId && selectedAssetId) mbtBinAssetSelectionByVisit.set(visitId, selectedAssetId);
+    else if (visitId) mbtBinAssetSelectionByVisit.delete(visitId);
+    render({ save: false });
+    return;
+  }
   if (["po-link", "to-link"].includes(modalType) && event.target.closest('[data-link-modal="true"]')) {
     captureActiveLinkModalDraft();
     return;
@@ -12725,7 +13247,9 @@ app.addEventListener("change", (event) => {
           clearTimeout(saveTimer);
         }
         if (isDispatchPlanEditor()) await releaseDispatchEditMode();
-        return loadPlanForDate(nextDate, { createIfMissing: false });
+        const result = await loadPlanForDate(nextDate, { createIfMissing: false });
+        await loadMbtBinFrontLegs();
+        return result;
       })
       .then((result) => {
       routeNotice = result.created
@@ -13318,7 +13842,7 @@ app.addEventListener("submit", (event) => {
     const wantsTransitCo = supportsTransitCo && data.createTransitCo === "on";
     const transitFromYard = data.transitFromYard || order.pickupLocations?.[0] || "3445";
     const transitToYard = data.transitToYard || "12441";
-    if (wantsTransitCo && String(transitFromYard) === String(transitToYard)) {
+    if (wantsTransitCo && sameDispatchLocation(transitFromYard, transitToYard)) {
       setEditFormStatus(form, "CO pick-from yard and transit depot must be different.", "error");
       return;
     }
@@ -13438,6 +13962,11 @@ async function initDispatch() {
   }
   render({ save: false });
   connectEvents();
+  loadMbtBinDispatchCapability().then(async (enabled) => {
+    if (!enabled) return;
+    await loadMbtBinFrontLegs();
+    render({ save: false });
+  }).catch(() => null);
   scheduleDispatchForecastPolling();
   setInterval(pollServerPlan, 1000);
 }

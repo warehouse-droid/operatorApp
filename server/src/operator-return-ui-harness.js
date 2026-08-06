@@ -299,6 +299,9 @@ for (const asset of [
   assert.ok(html.includes(asset), `operator HTML cachebuster is missing ${asset}`);
   assert.ok(serviceWorker.includes(asset), `service worker shell is missing ${asset}`);
 }
-assert.ok(serviceWorker.includes("mbbs-yard-operator-v131-returns-v9"), "service worker cache name was not bumped");
+assert.ok(
+  serviceWorker.includes("mbbs-yard-operator-v134-driver-cache-isolation-v1"),
+  "service worker cache name must retain the current driver-cache isolation version"
+);
 
 console.log("operator return UI harness passed");

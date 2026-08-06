@@ -5,7 +5,16 @@ import { trackSemanticAudit } from "./audit-context.js";
 
 const scrypt = promisify(crypto.scrypt);
 const SESSION_DAYS = 14;
-export const OPERATOR_ROLES = Object.freeze(["operator", "dispatcher", "admin", "scm", "yard_manager", "sales"]);
+export const OPERATOR_ROLES = Object.freeze([
+  "operator",
+  "dispatcher",
+  "admin",
+  "scm",
+  "yard_manager",
+  "sales",
+  "mbt_frontdesk",
+  "mbt_billing"
+]);
 export const SALES_YARD_LOCATION_IDS = Object.freeze([1, 28, 15, 26]);
 
 function normalizeRole(value) {
@@ -31,6 +40,24 @@ function normalizeYardLocationIds(values = []) {
   return SALES_YARD_LOCATION_IDS.filter((value) => normalized.includes(value));
 }
 
+export function operatorHomeRoute(value) {
+  const role = normalizeRole(typeof value === "object" ? value?.role : value);
+  const roles = new Set((typeof value === "object" && Array.isArray(value?.roles)
+    ? value.roles
+    : [role]).map(normalizeRole));
+  if (role === "admin") return "/admin";
+  if (role === "dispatcher") return "/dispatch";
+  if (role === "scm" || role === "scm_staff") return "/scm";
+  if (role === "yard_manager") return "/control";
+  if (role === "sales") return "/sales";
+  if (role === "operator" && roles.has("mbt_frontdesk")) return "/mbt/frontdesk";
+  if (role === "operator" && roles.has("mbt_billing")) return "/mbt/billing";
+  if (role === "operator") return "/operator";
+  if (role === "mbt_frontdesk") return "/mbt/frontdesk";
+  if (role === "mbt_billing") return "/mbt/billing";
+  return "/";
+}
+
 function publicOperator(row) {
   if (!row) return null;
   const authority = normalizeAuthorities(row.roles, row.role);
@@ -40,6 +67,7 @@ function publicOperator(row) {
     display_name: row.display_name,
     role: authority.role,
     roles: authority.roles,
+    homeRoute: operatorHomeRoute(authority),
     yardLocationIds: normalizeYardLocationIds(row.yard_location_ids),
     active: row.active,
     created_at: row.created_at,
@@ -220,7 +248,8 @@ export async function writeAudit({
 
 const UNIFIED_AUDIT_CTE = `WITH unified_audit AS (
   SELECT
-    a.id,
+    a.id::text AS id,
+    a.id AS legacy_sort_id,
     'delivery'::text AS audit_stream,
     a.actor_type,
     a.actor_operator_id,
@@ -244,7 +273,8 @@ const UNIFIED_AUDIT_CTE = `WITH unified_audit AS (
   FROM delivery_audit_log a
   UNION ALL
   SELECT
-    a.id,
+    a.id::text AS id,
+    a.id AS legacy_sort_id,
     'dispatch'::text AS audit_stream,
     COALESCE(NULLIF(a.operator_name, ''), 'operator') AS actor_type,
     a.operator_id AS actor_operator_id,
@@ -266,6 +296,40 @@ const UNIFIED_AUDIT_CTE = `WITH unified_audit AS (
     COALESCE(a.details, '{}'::jsonb) AS details,
     a.created_at
   FROM dispatch_audit_log a
+  UNION ALL
+  SELECT
+    a.audit_event_id::text AS id,
+    NULL::bigint AS legacy_sort_id,
+    'mbt'::text AS audit_stream,
+    a.actor_type,
+    a.actor_operator_id,
+    a.actor_operator_id AS actor_name,
+    a.source,
+    a.action,
+    NULL::text AS order_id,
+    NULL::bigint AS numeric_order_id,
+    NULL::bigint AS line_id,
+    a.entity_type,
+    a.entity_id,
+    NULL::text AS load_id,
+    NULL::text AS truck_id,
+    NULL::text AS session_id,
+    NULL::bigint AS plan_id,
+    NULL::date AS plan_date,
+    a.before_state,
+    a.after_state,
+    jsonb_strip_nulls(jsonb_build_object(
+      'auditEventId', a.audit_event_id,
+      'actorRoles', a.actor_roles,
+      'reason', a.reason,
+      'revisionBefore', a.revision_before,
+      'revisionAfter', a.revision_after,
+      'correlationId', a.correlation_id,
+      'requestId', a.request_id,
+      'idempotencyKey', a.idempotency_key
+    )) AS details,
+    a.occurred_at AS created_at
+  FROM mbt_audit_events a
 ), resolved_audit AS (
   SELECT
     a.*,
@@ -347,7 +411,7 @@ export async function listAudit({
        SELECT a.*
        FROM resolved_audit a
        ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
-       ORDER BY a.created_at DESC, a.id DESC
+       ORDER BY a.created_at DESC, a.legacy_sort_id DESC NULLS LAST, a.id DESC
        LIMIT $${params.length}
      )
      SELECT
@@ -379,7 +443,7 @@ export async function listAudit({
          'after', a.after_state
        )) || COALESCE(a.details, '{}'::jsonb) AS details
      FROM limited_audit a
-     ORDER BY a.created_at DESC, a.id DESC`,
+     ORDER BY a.created_at DESC, a.legacy_sort_id DESC NULLS LAST, a.id DESC`,
     params
   );
   return result.rows;

@@ -73,8 +73,8 @@ assert.doesNotMatch(control, /photo-upload\/preview\?ref=[^\n]+token=/, "Control
 assert.match(controlCss, /\.return-management-layout/);
 assert.match(controlCss, /\.return-photo-grid/);
 assert.match(controlCss, /\.return-automation-grid/);
-assert.match(controlHtml, /control\.js\?v=20260729-return-management-v2/);
-assert.match(adminHtml, /control\.js\?v=20260729-return-automation-v2/);
+assert.match(controlHtml, /control\.js\?v=20260730-reconciliation-resume-v1/);
+assert.match(adminHtml, /control\.js\?v=20260730-reconciliation-resume-v1/);
 
 assert.match(sales, /SALES_RETURNS_PAGE = window\.location\.pathname === "\/sales\/returns"/);
 assert.match(sales, /allowPublicSales:\s*!SALES_RETURNS_PAGE/);
@@ -106,7 +106,7 @@ assert.match(smart, /data-item-field="returnPolicyOverride"/);
 assert.match(smart, /returnPolicyOverride:\s*null,[\s\S]+expectedReturnPolicyRevision:/);
 assert.match(smartCss, /\.smart-return-policy-cell/);
 assert.match(smartCss, /\.smart-return-effective\.approval_required/);
-assert.match(smartHtml, /scm-smart\.css\?v=20260729-return-policy-v1/);
-assert.match(smartHtml, /scm-smart\.js\?v=20260729-return-policy-v1/);
+assert.match(smartHtml, /scm-smart\.css\?v=20260801-blanket-ui-v2/);
+assert.match(smartHtml, /scm-smart\.js\?v=20260801-focus-preservation-v1/);
 
 console.log("Return portal UI harness passed.");

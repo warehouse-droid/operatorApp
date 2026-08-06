@@ -31,8 +31,8 @@ const tooltipSource = dispatchSource.slice(
 );
 assert(
   /function tooltipItemsForOrder\(order, \{ pickupLocation = "", stop = null \}/.test(dispatchSource)
-    && /if \(stop\?\.type === "drop"\) return dropItemsForStop\(order, stop\)\.filter\(itemHasQuantity\);/.test(dispatchSource),
-  "Dispatch drop tooltips must filter items by the hovered stop."
+    && /if \(stop\?\.type === "drop"\) return dropItemsForStop\(order, stop\)\.filter\(isOperationalDispatchItem\)\.filter\(itemHasQuantity\);/.test(dispatchSource),
+  "Dispatch drop tooltips must filter operational items by the hovered stop."
 );
 assert(
   /stopLineRowIds\.length \? stopLineRowIds : dropoffLineRowIds/.test(dispatchSource)

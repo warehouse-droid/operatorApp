@@ -3,6 +3,10 @@ import { query, withTransaction } from "./db.js";
 import { normalizeDispatchPlanLoadAssignments } from "./dispatch-load-assignment.js";
 import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
 import { planJobsForDriver } from "./driver-repository.js";
+import {
+  MBT_DRIVER_BIN_JOB_SCHEMA,
+  normalizeMbtDriverEventDetails
+} from "./mbt/driver-bin-contract.js";
 
 export const DRIVER_OFFLINE_SCHEMA_VERSION = 1;
 export const DRIVER_OFFLINE_FINGERPRINT_VERSION = 1;
@@ -255,6 +259,169 @@ function sanitizeOrder(order = {}) {
   });
 }
 
+function stripEmptyMbtValues(value) {
+  if (Array.isArray(value)) return value.map(stripEmptyMbtValues);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value)
+    .filter(([, item]) => item !== undefined && item !== "")
+    .map(([key, item]) => [key, stripEmptyMbtValues(item)]));
+}
+
+function sanitizeMbtDriverAsset(asset) {
+  if (!asset || typeof asset !== "object" || Array.isArray(asset)) return null;
+  return stripEmptyMbtValues(compactObject({
+    assetId: optionalText(asset.assetId, { maxLength: 64 }),
+    assetCode: optionalText(asset.assetCode, { maxLength: 200 }),
+    qrCode: optionalText(asset.qrCode, { maxLength: 500 }),
+    binTypeId: optionalText(asset.binTypeId, { maxLength: 64 }),
+    binTypeCode: optionalText(asset.binTypeCode, { maxLength: 80 }),
+    lifecycleStatus: optionalText(asset.lifecycleStatus, { maxLength: 80 }),
+    locationKind: optionalText(asset.locationKind, { maxLength: 80 }),
+    locationReference: optionalText(asset.locationReference, { maxLength: 500 }),
+    stateRevision: Number.isSafeInteger(Number(asset.stateRevision))
+      ? Number(asset.stateRevision)
+      : undefined
+  }));
+}
+
+function sanitizeMbtOperationalParty(value = {}) {
+  return stripEmptyMbtValues(compactObject({
+    displayName: optionalText(value.displayName, { maxLength: 300 }),
+    name: optionalText(value.name, { maxLength: 300 }),
+    customerNumber: optionalText(value.customerNumber, { maxLength: 120 }),
+    contactName: optionalText(value.contactName, { maxLength: 300 }),
+    phone: optionalText(value.phone, { maxLength: 100 }),
+    email: optionalText(value.email, { maxLength: 320 })
+  }));
+}
+
+function sanitizeMbtOperationalSite(value = {}) {
+  return stripEmptyMbtValues(compactObject({
+    siteProfileId: optionalText(value.siteProfileId, { maxLength: 64 }),
+    displayName: optionalText(value.displayName, { maxLength: 300 }),
+    addressLine1: optionalText(value.addressLine1, { maxLength: 500 }),
+    addressLine2: optionalText(value.addressLine2, { maxLength: 500 }),
+    city: optionalText(value.city, { maxLength: 200 }),
+    province: optionalText(value.province, { maxLength: 100 }),
+    state: optionalText(value.state, { maxLength: 100 }),
+    postalCode: optionalText(value.postalCode, { maxLength: 40 }),
+    country: optionalText(value.country, { maxLength: 100 }),
+    accessInstructions: optionalText(value.accessInstructions, { maxLength: 2000 }),
+    contactName: optionalText(value.contactName, { maxLength: 300 }),
+    contactPhone: optionalText(value.contactPhone, { maxLength: 100 }),
+    latitude: Number.isFinite(Number(value.latitude)) ? Number(value.latitude) : undefined,
+    longitude: Number.isFinite(Number(value.longitude)) ? Number(value.longitude) : undefined
+  }));
+}
+
+function sanitizeMbtDumpSite(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return stripEmptyMbtValues({
+    dumpSiteId: optionalText(value.dumpSiteId, { maxLength: 64 }),
+    code: optionalText(value.code, { maxLength: 120 }),
+    displayName: optionalText(value.displayName, { maxLength: 300 }),
+    address: optionalText(value.address, { maxLength: 1000 })
+  });
+}
+
+function sanitizeMbtMaterial(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return stripEmptyMbtValues({
+    materialId: optionalText(value.materialId, { maxLength: 64 }),
+    code: optionalText(value.code, { maxLength: 120 }),
+    displayName: optionalText(value.displayName, { maxLength: 300 }),
+    description: optionalText(value.description, { maxLength: 1000 })
+  });
+}
+
+function sanitizeMbtDriverJob(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  if (String(value.schemaVersion || "") !== MBT_DRIVER_BIN_JOB_SCHEMA) {
+    throw repositoryError("The BIN Driver job schema is unsupported.", 409, "MBT_DRIVER_BIN_JOB_INVALID");
+  }
+  const requirements = Array.isArray(value.evidenceRequirements)
+    ? value.evidenceRequirements.slice(0, 100).map((requirement) => compactObject({
+        requirementId: optionalText(requirement?.requirementId, { maxLength: 64 }),
+        evidenceCode: optionalText(requirement?.evidenceCode, { maxLength: 80 }),
+        evidenceType: optionalText(requirement?.evidenceType, { maxLength: 40 }),
+        minimumCount: Number.isSafeInteger(Number(requirement?.minimumCount))
+          ? Number(requirement.minimumCount)
+          : undefined,
+        required: requirement?.required === true
+      }))
+    : [];
+  return stripEmptyMbtValues(compactObject({
+    schemaVersion: MBT_DRIVER_BIN_JOB_SCHEMA,
+    minimumClientVersion: optionalText(value.minimumClientVersion, { maxLength: 80 }),
+    contractId: optionalText(value.contractId, { maxLength: 64 }),
+    contractNumber: optionalText(value.contractNumber, { maxLength: 180 }),
+    visitId: optionalText(value.visitId, { maxLength: 64 }),
+    visitReference: optionalText(value.visitReference, { maxLength: 180 }),
+    visitNumber: Number.isSafeInteger(Number(value.visitNumber)) ? Number(value.visitNumber) : undefined,
+    issuedVisitRevision: Number.isSafeInteger(Number(value.issuedVisitRevision))
+      ? Number(value.issuedVisitRevision)
+      : undefined,
+    serviceAction: optionalText(value.serviceAction, { maxLength: 80 }),
+    actionCode: optionalText(value.actionCode, { maxLength: 80 }),
+    visitStepId: optionalText(value.visitStepId, { maxLength: 64 }),
+    stepSequence: Number.isSafeInteger(Number(value.stepSequence)) ? Number(value.stepSequence) : undefined,
+    stopGroupId: optionalText(value.stopGroupId, { maxLength: 180 }),
+    stopSequence: Number.isSafeInteger(Number(value.stopSequence)) ? Number(value.stopSequence) : undefined,
+    mandatory: value.mandatory === true,
+    serviceTemplateVersionId: optionalText(value.serviceTemplateVersionId, { maxLength: 64 }),
+    templateRevision: Number.isSafeInteger(Number(value.templateRevision))
+      ? Number(value.templateRevision)
+      : undefined,
+    binTypeId: optionalText(value.binTypeId, { maxLength: 64 }),
+    binTypeCode: optionalText(value.binTypeCode, { maxLength: 80 }),
+    exactAssets: {
+      expected: sanitizeMbtDriverAsset(value.exactAssets?.expected),
+      outgoing: sanitizeMbtDriverAsset(value.exactAssets?.outgoing),
+      incoming: sanitizeMbtDriverAsset(value.exactAssets?.incoming)
+    },
+    dumpSiteId: value.dumpSiteId ? optionalText(value.dumpSiteId, { maxLength: 64 }) : null,
+    materialId: value.materialId ? optionalText(value.materialId, { maxLength: 64 }) : null,
+    dumpSite: value.dumpSite === undefined ? undefined : sanitizeMbtDumpSite(value.dumpSite),
+    material: value.material === undefined ? undefined : sanitizeMbtMaterial(value.material),
+    customerSiteProfileId: optionalText(value.customerSiteProfileId, { maxLength: 64 }),
+    customer: sanitizeMbtOperationalParty(value.customer),
+    site: sanitizeMbtOperationalSite(value.site),
+    evidenceRequirements: requirements,
+    movementExpectation: compactObject({
+      beforeStatus: value.movementExpectation?.beforeStatus === null
+        ? null
+        : optionalText(value.movementExpectation?.beforeStatus, { maxLength: 80 }),
+      afterStatus: value.movementExpectation?.afterStatus === null
+        ? null
+        : optionalText(value.movementExpectation?.afterStatus, { maxLength: 80 })
+    }),
+    capabilitySnapshot: compactObject({
+      truckType: optionalText(value.capabilitySnapshot?.truckType, { maxLength: 40 }),
+      binTypeCode: optionalText(value.capabilitySnapshot?.binTypeCode, { maxLength: 80 }),
+      baseYardId: optionalText(value.capabilitySnapshot?.baseYardId, { maxLength: 64 }),
+      baseYardCode: optionalText(value.capabilitySnapshot?.baseYardCode, { maxLength: 80 })
+    }),
+    assignment: compactObject({
+      planId: value.assignment?.planId === null
+        ? null
+        : optionalText(value.assignment?.planId, { maxLength: 180 }),
+      planRevision: Number.isSafeInteger(Number(value.assignment?.planRevision))
+        ? Number(value.assignment.planRevision)
+        : undefined,
+      loadId: value.assignment?.loadId === null
+        ? null
+        : optionalText(value.assignment?.loadId, { maxLength: 180 }),
+      truckId: value.assignment?.truckId === null
+        ? null
+        : optionalText(value.assignment?.truckId, { maxLength: 180 }),
+      driverId: value.assignment?.driverId === null
+        ? null
+        : optionalText(value.assignment?.driverId, { maxLength: 180 })
+    }),
+    executionSnapshotHash: optionalText(value.executionSnapshotHash, { maxLength: 64 })
+  }));
+}
+
 export function sanitizeDriverOfflineJob(job = {}) {
   const sanitized = pick(job, [
     "jobId",
@@ -336,7 +503,32 @@ export function sanitizeDriverOfflineJob(job = {}) {
   });
   sanitized.orders = Array.isArray(job.orders) ? job.orders.slice(0, 500).map(sanitizeOrder) : [];
   sanitized.requiredPhotos = Math.max(0, Math.min(100, Number(sanitized.requiredPhotos) || 0));
+  if (job.mbt !== undefined && job.mbt !== null) sanitized.mbt = sanitizeMbtDriverJob(job.mbt);
   return sanitized;
+}
+
+/**
+ * Asset lifecycle/location/revision fields are execution progress, not route
+ * identity. Keep the complete values in the manifest for offline display, but
+ * exclude only those mutable fields when comparing a later stop against the
+ * current server projection. Asset IDs, codes, visit/template/assignment
+ * identity, and the server execution snapshot hash remain protected.
+ * @param {Record<string, any>} mbt
+ */
+function stableMbtOfflineFingerprint(mbt) {
+  const stable = structuredClone(mbt);
+  const exactAssets = stable.exactAssets && typeof stable.exactAssets === "object"
+    ? stable.exactAssets
+    : {};
+  for (const role of ["expected", "outgoing", "incoming"]) {
+    const asset = exactAssets[role];
+    if (!asset || typeof asset !== "object" || Array.isArray(asset)) continue;
+    delete asset.lifecycleStatus;
+    delete asset.locationKind;
+    delete asset.locationReference;
+    delete asset.stateRevision;
+  }
+  return stable;
 }
 
 export function canonicalDriverOfflineJobIdentity(job = {}) {
@@ -359,7 +551,8 @@ export function canonicalDriverOfflineJobIdentity(job = {}) {
     dropLocation: normalizeScalar(snapshot.dropLocation),
     fromLocation: normalizeScalar(snapshot.fromJobLocation || snapshot.fromLocation),
     toLocation: normalizeScalar(snapshot.toPickupLocation || snapshot.toLocation),
-    requiredPhotos: snapshot.requiredPhotos
+    requiredPhotos: snapshot.requiredPhotos,
+    ...(snapshot.mbt ? { mbt: stableMbtOfflineFingerprint(snapshot.mbt) } : {})
   };
 }
 
@@ -375,6 +568,7 @@ export function fingerprintDriverOfflineJobContent(job = {}) {
   delete snapshot.status;
   delete snapshot.startedAt;
   delete snapshot.completedAt;
+  if (snapshot.mbt) snapshot.mbt = stableMbtOfflineFingerprint(snapshot.mbt);
   return hashCanonical(snapshot);
 }
 
@@ -565,9 +759,50 @@ function normalizeDriverClientSyncStatus(value = {}) {
     pendingEventCount: integerValue(value.pendingEventCount ?? 0, "Pending event count", { min: 0, max: 1000000 }),
     reviewRequiredCount: integerValue(value.reviewRequiredCount ?? 0, "Review-required event count", { min: 0, max: 1000000 }),
     unsyncedPhotoCount: integerValue(value.unsyncedPhotoCount ?? 0, "Unsynchronized photo count", { min: 0, max: 1000000 }),
+    photoFailures: state === "error" ? normalizeDriverClientPhotoFailures(value.photoFailures) : [],
     clientOccurredAt: value.clientOccurredAt ? isoTimestamp(value.clientOccurredAt, "Client sync status time") : "",
     serverReceivedAt: new Date().toISOString()
   };
+}
+
+function boundedDriverDiagnosticText(value, maxLength) {
+  return String(value ?? "").trim().slice(0, maxLength);
+}
+
+function boundedDriverDiagnosticInteger(value, { max = Number.MAX_SAFE_INTEGER } = {}) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < 0) return 0;
+  return Math.min(max, Math.floor(number));
+}
+
+function normalizeDriverClientPhotoFailures(value) {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 10)
+    .filter((failure) => failure && typeof failure === "object" && !Array.isArray(failure))
+    .map((failure) => ({
+      photoId: boundedDriverDiagnosticText(failure.photoId ?? failure.photo_id, 160),
+      eventId: boundedDriverDiagnosticText(failure.eventId ?? failure.event_id, 160),
+      phase: boundedDriverDiagnosticText(failure.phase, 80),
+      byteSize: boundedDriverDiagnosticInteger(
+        failure.byteSize ?? failure.byteCount ?? failure.byte_size ?? failure.bytes
+      ),
+      attemptCount: boundedDriverDiagnosticInteger(
+        failure.attemptCount ?? failure.attempts ?? failure.attempt_count,
+        { max: 1000000 }
+      ),
+      retryable: failure.retryable === true
+        || failure.retryable === 1
+        || String(failure.retryable || "").trim().toLowerCase() === "true",
+      errorCode: boundedDriverDiagnosticText(failure.errorCode ?? failure.error_code ?? failure.code, 160),
+      httpStatus: boundedDriverDiagnosticInteger(
+        failure.httpStatus ?? failure.http_status ?? failure.status,
+        { max: 599 }
+      ),
+      message: boundedDriverDiagnosticText(
+        failure.message ?? failure.errorMessage ?? failure.error_message ?? failure.error,
+        1000
+      )
+    }));
 }
 
 export async function recordDriverClientSyncStatus({
@@ -678,6 +913,7 @@ function mapDriverClientSyncIssue(row) {
     pendingEventCount: Number(status.pendingEventCount || 0),
     reviewRequiredCount: Number(status.reviewRequiredCount || 0),
     unsyncedPhotoCount: Number(status.unsyncedPhotoCount || 0),
+    photoFailures: normalizeDriverClientPhotoFailures(status.photoFailures),
     clientOccurredAt: status.clientOccurredAt || "",
     reportedAt: status.serverReceivedAt || "",
     sessionCreatedAt: row.created_at,
@@ -1399,6 +1635,9 @@ export function sanitizeDriverOfflineEventDetails(eventType, details = {}) {
       locationOverrideReason: optionalText(source.locationOverrideReason, { maxLength: 1000 }),
       driverRemark: eventType === "job_completed"
         ? optionalText(source.driverRemark ?? source.remark, { maxLength: 1000 })
+        : undefined,
+      mbt: eventType === "job_completed" && source.mbt !== undefined
+        ? normalizeMbtDriverEventDetails(source.mbt)
         : undefined
     });
   }
@@ -1751,6 +1990,46 @@ export async function registerDriverOfflineEvents({
         }
         eventRow = existing.rows[0];
       } else {
+        if (event.eventType === "job_completed") {
+          const conflictingCompletion = await query(
+            `SELECT event_id, device_id, status
+               FROM driver_offline_events
+              WHERE lower(driver_login) = $1
+                AND plan_date = $2::date
+                AND device_id <> $3
+                AND event_type = 'job_completed'
+                AND original_job_id = $4
+                AND job_fingerprint = $5
+                AND predecessor_fingerprint = $6
+                AND status NOT IN ('evidence_only', 'rejected')
+              ORDER BY server_received_at, id
+              LIMIT 1
+              FOR UPDATE`,
+            [
+              login,
+              planDate,
+              normalizedDevice,
+              event.jobId,
+              event.jobFingerprint,
+              event.predecessorFingerprint
+            ]
+          );
+          if (conflictingCompletion.rowCount) {
+            const conflict = conflictingCompletion.rows[0];
+            throw Object.assign(
+              repositoryError(
+                "This stop was already saved on another Driver device. Synchronize that device or ask Dispatch to review it before retrying.",
+                409,
+                "DRIVER_OFFLINE_CROSS_DEVICE_COMPLETION_CONFLICT"
+              ),
+              {
+                conflictingEventId: conflict.event_id,
+                conflictingDeviceId: conflict.device_id,
+                conflictingStatus: conflict.status
+              }
+            );
+          }
+        }
         const inserted = await query(
           `INSERT INTO driver_offline_events (
              event_id, manifest_id, manifest_job_id, driver_login, device_id, plan_date,
@@ -2118,6 +2397,74 @@ export async function recordDriverOfflinePhotoVerificationFailure(photoId, {
     );
     return mapOfflinePhoto(updated.rows[0]);
   });
+}
+
+export async function findOpenDriverOfflineJobCompletion({
+  driverLogin,
+  deviceId,
+  planDate,
+  jobId,
+  jobFingerprint,
+  jobPredecessorFingerprint
+}) {
+  const login = normalizeDriverLogin(driverLogin);
+  const currentDeviceId = normalizeDriverDeviceId(deviceId);
+  const date = normalizePlanDate(planDate);
+  const authoritativeJobId = requiredText(jobId, "Driver job ID", { maxLength: 1000 });
+  const authoritativeFingerprint = sha256Value(jobFingerprint, "Driver job fingerprint");
+  const authoritativePredecessorFingerprint = requiredText(
+    jobPredecessorFingerprint,
+    "Driver job predecessor fingerprint",
+    { maxLength: 160 }
+  );
+  const openStatuses = [
+    "registered",
+    "waiting_photos",
+    "pending",
+    "applying",
+    "review_required",
+    "blocked",
+    "resolution_pending"
+  ];
+  const result = await query(
+    `SELECT event_id, device_id, original_job_id, job_fingerprint,
+            predecessor_fingerprint, status,
+            server_received_at, review_reason
+       FROM driver_offline_events
+      WHERE lower(driver_login) = $1
+        AND plan_date = $2::date
+        AND device_id <> $3
+        AND event_type = 'job_completed'
+        AND original_job_id = $4
+        AND job_fingerprint = $5
+        AND predecessor_fingerprint = $6
+        AND status = ANY($7::text[])
+      ORDER BY server_received_at, id
+      LIMIT 1`,
+    [
+      login,
+      date,
+      currentDeviceId,
+      authoritativeJobId,
+      authoritativeFingerprint,
+      authoritativePredecessorFingerprint,
+      openStatuses
+    ]
+  );
+  if (!result.rowCount) return null;
+  const row = result.rows[0];
+  return {
+    eventId: row.event_id,
+    eventType: "job_completed",
+    deviceId: row.device_id,
+    jobId: row.original_job_id,
+    jobFingerprint: row.job_fingerprint,
+    predecessorFingerprint: row.predecessor_fingerprint,
+    status: row.status,
+    reviewRequired: ["review_required", "blocked", "resolution_pending"].includes(row.status),
+    reviewReason: row.review_reason || "",
+    receivedAt: row.server_received_at
+  };
 }
 
 export async function getDriverOfflineSyncQueue(driverLogin, planDate, {

@@ -1,6 +1,8 @@
+import { readFile } from "node:fs/promises";
 import { beginRollbackContext, closeDb, query } from "./db.js";
 import {
   createSalesOrderPoAllocations,
+  enrichDispatchOrdersWithPoTargetAllocations,
   getSalesOrderPoAllocationOptions
 } from "./dispatch-repository.js";
 import { resolveDispatchSalesTarget } from "./dispatch-order-target-repository.js";
@@ -73,6 +75,80 @@ function snapshotItem(line, quantity) {
     unit: line.unit
   };
 }
+
+const dispatchSource = await readFile(new URL("../public/dispatch.js", import.meta.url), "utf8");
+const pickupLinkHelperStart = dispatchSource.indexOf("function isMbbsSpecialLinkLine");
+const pickupLinkHelperEnd = dispatchSource.indexOf("function linkQuantityInputStep", pickupLinkHelperStart);
+assert(pickupLinkHelperStart >= 0 && pickupLinkHelperEnd > pickupLinkHelperStart,
+  "Dispatch MBBS-Special pickup/link helpers must be present.");
+const pickupLinkHelpers = Function(
+  '"use strict"; '
+    + dispatchSource.slice(pickupLinkHelperStart, pickupLinkHelperEnd)
+    + "; return { isOperationalDispatchItem, availableUnitsForLine };"
+)();
+const specialUiUnits = pickupLinkHelpers.availableUnitsForLine({
+  itemId: 2055,
+  isSpecial: true,
+  required: { unit: "PC" },
+  available: { pallets: 34, salesQty: 1088 }
+});
+assert(JSON.stringify(specialUiUnits) === JSON.stringify([["salesQty", "Sales Qty (PC)", 1088]]),
+  "MBBS-Special PO linking must expose only Sales Qty in the sales/purchase UOM.", { specialUiUnits });
+assert(!pickupLinkHelpers.isOperationalDispatchItem({ sku: "Delivery Charge", quantity: 1 }),
+  "Delivery Charge must not be treated as an operational pickup item.");
+assert(!pickupLinkHelpers.isOperationalDispatchItem({ sku: "Handling", itemType: "OthCharge", quantity: 1 }),
+  "Other Charge item types must not be treated as operational pickup items.");
+assert(pickupLinkHelpers.isOperationalDispatchItem({ itemId: 2055, sku: "MBBS-Special Order", itemType: "NonInvtPart" }),
+  "MBBS-Special must remain operational even when NetSuite classifies it as non-inventory.");
+
+const pickupAllocationStart = dispatchSource.indexOf("function positiveBalance");
+const pickupAllocationEnd = dispatchSource.indexOf("function orderRequiresPickupLocation", pickupAllocationStart);
+assert(pickupAllocationStart >= 0 && pickupAllocationEnd > pickupAllocationStart,
+  "Dispatch pickup-allocation helpers must be present.");
+const pickupAllocationHelpers = Function(
+  "ownYardForLocation",
+  '"use strict"; '
+    + dispatchSource.slice(pickupAllocationStart, pickupAllocationEnd)
+    + "; return { directPickupItemsForLocation, poPickupItemsForLocation, isOwnYardCode, itemForPickupLocation, normalizedPickupLocation, sameDispatchLocation, uniqueDispatchLocationLabels };"
+)((value) => ["3445", "2967", "12441", "150"].includes(String(value || "")) ? { code: String(value) } : null);
+const tooltipItemsStart = dispatchSource.indexOf("function tooltipItemsForOrder");
+const tooltipItemsEnd = dispatchSource.indexOf("function tooltipItemRowsForOrder", tooltipItemsStart);
+const itemHasQuantityForHarness = (item) => Number(item?.pallets || 0) || Number(item?.layers || 0)
+  || Number(item?.sections || 0) || Number(item?.pieces || 0) || Number(item?.quantity || item?.salesQty || 0);
+const tooltipItemsForOrder = Function(
+  "dropItemsForStop",
+  "itemHasQuantity",
+  "directPickupItemsForLocation",
+  "poPickupItemsForLocation",
+  "isOwnYardCode",
+  "itemForPickupLocation",
+  "isOperationalDispatchItem",
+  "sameDispatchLocation",
+  '"use strict"; ' + dispatchSource.slice(tooltipItemsStart, tooltipItemsEnd) + "; return tooltipItemsForOrder;"
+)(
+  (order) => order.items || [],
+  itemHasQuantityForHarness,
+  pickupAllocationHelpers.directPickupItemsForLocation,
+  pickupAllocationHelpers.poPickupItemsForLocation,
+  pickupAllocationHelpers.isOwnYardCode,
+  pickupAllocationHelpers.itemForPickupLocation,
+  pickupLinkHelpers.isOperationalDispatchItem,
+  pickupAllocationHelpers.sameDispatchLocation
+);
+const requiredPickupStart = dispatchSource.indexOf("function requiredPickupLocations");
+const requiredPickupEnd = dispatchSource.indexOf("function sequenceWarningsForStops", requiredPickupStart);
+const requiredPickupLocations = Function(
+  "normalizedPickupLocation",
+  "tooltipItemsForOrder",
+  "itemHasQuantity",
+  "uniqueDispatchLocationLabels",
+  '"use strict"; ' + dispatchSource.slice(requiredPickupStart, requiredPickupEnd) + "; return requiredPickupLocations;"
+)(
+  pickupAllocationHelpers.normalizedPickupLocation,
+  tooltipItemsForOrder,
+  itemHasQuantityForHarness,
+  pickupAllocationHelpers.uniqueDispatchLocationLabels
+);
 
 const rollback = await beginRollbackContext();
 try {
@@ -251,10 +327,18 @@ try {
     const specialLine = await insertSalesOrder(specialOrderId, specialOrderRef, 5, base + 104);
     await query(
       "UPDATE sales_order_lines SET item_id = 2055, item_name = 'MBBS-Special', sku = 'MBBS-Special', "
-        + "item_description = 'Custom coping - charcoal', unit = 'PC', pallet_qty = 2, layer_qty = 0, "
+        + "item_description = 'Custom coping - charcoal', item_type = 'NonInvtPart', item_type_text = 'Non-inventory Item', "
+        + "unit = 'PC', pallet_qty = 2, layer_qty = 0, "
         + "section_qty = 0, piece_qty = 4, to_plt = NULL, to_lyr = NULL, to_sec = NULL, to_pcs = NULL, "
         + "pack_quantity_source = 'netsuite_manual' WHERE id = $1",
       [specialLine.id]
+    );
+    await query(
+      "INSERT INTO sales_order_lines (sales_order_id, line_id, item_id, item_name, sku, item_type, item_type_text, "
+        + "quantity, unit, netsuite_committed_qty, netsuite_backordered_qty, netsuite_active, location_id, location) "
+        + "VALUES ($1, $2, 1987, 'Delivery Charge', 'Delivery Charge', 'OthCharge', 'Other Charge', "
+        + "1, '', 0, 0, true, 15, '12441')",
+      [specialOrderId, base + 109]
     );
     const specialPoLines = await query(
       "INSERT INTO purchase_order_lines (purchase_order_id, line_id, item_id, item_name, sku, item_type, "
@@ -264,19 +348,31 @@ try {
         + "'Custom coping - charcoal', 5, 'PC', 2, 0, 0, 4, 'netsuite_manual', 0, true, 15, '12441'), "
         + "($1, $3, 2055, 'MBBS-Special', 'MBBS-Special', 'InvtPart', 'Inventory Item', "
         + "'Custom coping - manual override', 5, 'PC', 2, 0, 0, 4, 'netsuite_manual', 0, true, 15, '12441') "
-        + "RETURNING id, item_description",
-      [poId, base + 302, base + 303]
+        + ", ($1, $4, 2055, 'MBBS-Special', 'MBBS-Special', 'InvtPart', 'Inventory Item', "
+        + "'Custom coping - charcoal', 5, 'SQFT', 2, 0, 0, 4, 'netsuite_manual', 0, true, 15, '12441') "
+        + "RETURNING id, item_description, unit",
+      [poId, base + 302, base + 303, base + 304]
     );
     const specialOptions = await getSalesOrderPoAllocationOptions(specialOrderRef, { planDate });
+    assert(specialOptions.salesLines.length === 1
+        && !specialOptions.salesLines.some((line) => /delivery charge/i.test(line.sku || line.itemName || "")),
+      "Link PO options must exclude Delivery Charge and other non-operational lines.", { specialOptions });
     const specialSalesLine = specialOptions.salesLines[0];
     const harnessCandidates = specialSalesLine.poCandidates.filter((candidate) => candidate.poRef === poRef);
     const exactCandidate = harnessCandidates.find((candidate) => candidate.exactMatch);
     const mismatchCandidate = harnessCandidates.find((candidate) => !candidate.exactMatch);
-    assert(specialSalesLine.isSpecial && specialSalesLine.independentSalesQty,
-      "MBBS-Special must expose independent manual and sales quantities.", { specialSalesLine });
+    const uomMismatchLine = specialPoLines.rows.find((line) => line.unit === "SQFT");
+    assert(specialSalesLine.isSpecial && specialSalesLine.salesQuantityOnly && !specialSalesLine.independentSalesQty,
+      "MBBS-Special must expose sales quantity only.", { specialSalesLine });
+    assert(Number(specialSalesLine.available.salesQty) === 5
+        && ["pallets", "layers", "sections", "pieces"].every((field) => Number(specialSalesLine.available[field]) === 0),
+      "MBBS-Special physical quantities must not be independently selectable in Link PO.", { specialSalesLine });
     assert(harnessCandidates.length === 2 && exactCandidate && mismatchCandidate,
-      "MBBS-Special PO candidates must distinguish exact description/unit matches from manual overrides.",
+      "MBBS-Special PO candidates must distinguish exact descriptions while retaining the same sales/purchase UOM.",
       { harnessCandidates, specialPoLines: specialPoLines.rows });
+    assert(uomMismatchLine && !harnessCandidates.some((candidate) => Number(candidate.poLineId) === Number(uomMismatchLine.id)),
+      "A different MBBS-Special purchase UOM must not be offered as a compatible candidate.",
+      { harnessCandidates, uomMismatchLine });
 
     let missingLineRejected = false;
     try {
@@ -285,7 +381,7 @@ try {
         poRef,
         planDate,
         targetSignature: specialOptions.order.targetSignature,
-        lines: [{ targetLineKey: specialSalesLine.targetLineKey, quantities: { pallets: 2, pieces: 4 } }],
+        lines: [{ targetLineKey: specialSalesLine.targetLineKey, quantities: { salesQty: 5 } }],
         createdBy: "dispatch-link-harness"
       });
     } catch (error) {
@@ -293,7 +389,7 @@ try {
     }
     assert(missingLineRejected, "MBBS-Special linking must require an explicit PO line selection.");
 
-    let partialSalesRejected = false;
+    let physicalOnlyRejected = false;
     try {
       await createSalesOrderPoAllocations({
         dispatchTargetRef: specialOrderRef,
@@ -308,9 +404,28 @@ try {
         createdBy: "dispatch-link-harness"
       });
     } catch (error) {
-      partialSalesRejected = /sales-unit quantity/i.test(error.message);
+      physicalOnlyRejected = /Sales Qty/i.test(error.message);
     }
-    assert(partialSalesRejected, "Partial manual MBBS-Special quantity must require an explicit sales quantity.");
+    assert(physicalOnlyRejected, "MBBS-Special physical input without Sales Qty must be rejected.");
+
+    let uomMismatchRejected = false;
+    try {
+      await createSalesOrderPoAllocations({
+        dispatchTargetRef: specialOrderRef,
+        poRef,
+        planDate,
+        targetSignature: specialOptions.order.targetSignature,
+        lines: [{
+          targetLineKey: specialSalesLine.targetLineKey,
+          poLineId: uomMismatchLine.id,
+          quantities: { salesQty: 5 }
+        }],
+        createdBy: "dispatch-link-harness"
+      });
+    } catch (error) {
+      uomMismatchRejected = error.code === "DISPATCH_MBBS_SPECIAL_UOM_MISMATCH";
+    }
+    assert(uomMismatchRejected, "MBBS-Special linking must reject a different purchase UOM.");
 
     const specialAllocation = await createSalesOrderPoAllocations({
       dispatchTargetRef: specialOrderRef,
@@ -320,15 +435,66 @@ try {
       lines: [{
         targetLineKey: specialSalesLine.targetLineKey,
         poLineId: mismatchCandidate.poLineId,
-        quantities: { pallets: 2, pieces: 4 }
+        quantities: { pallets: 2, pieces: 4, salesQty: 5 }
       }],
       createdBy: "dispatch-link-harness"
     });
     assert(specialAllocation.length === 1
         && Number(specialAllocation[0].poLineId) === Number(mismatchCandidate.poLineId)
-        && Number(specialAllocation[0].salesQty) === 5,
-      "A deliberate mismatched-description selection must link the selected PO line and map full physical completion to sales quantity.",
+        && Number(specialAllocation[0].salesQty) === 5
+        && Number(specialAllocation[0].pallets) === 0
+        && Number(specialAllocation[0].pieces) === 0,
+      "A deliberate same-UOM description override must persist Sales Qty only, even from a stale client that submits physical fields.",
       { specialAllocation, mismatchCandidate });
+
+    const [enrichedSpecial] = await enrichDispatchOrdersWithPoTargetAllocations([{
+      id: specialOrderRef,
+      type: "SO",
+      sourceYard: "12441",
+      pickupLocations: ["12441"],
+      items: [{
+        lineRowId: specialLine.id,
+        itemId: 2055,
+        sku: "MBBS-Special",
+        itemName: "MBBS-Special",
+        quantity: 5,
+        salesQty: 5,
+        unit: "PC",
+        pallets: 2,
+        layers: 0,
+        sections: 0,
+        pieces: 4
+      }, {
+        lineRowId: specialLine.id + 1,
+        itemId: 1987,
+        sku: "Delivery Charge",
+        itemName: "Delivery Charge",
+        itemType: "OthCharge",
+        itemTypeText: "Other Charge",
+        quantity: 1,
+        salesQty: 1,
+        unit: "",
+        pallets: 0,
+        layers: 0,
+        sections: 0,
+        pieces: 0
+      }]
+    }]);
+    const enrichedSpecialLine = enrichedSpecial.items[0];
+    const specialManifestLine = enrichedSpecial.poPickupManifest?.[0]?.items?.[0];
+    assert(Number(enrichedSpecialLine.poAllocatedSalesQty) === 5
+        && Number(enrichedSpecialLine.poAllocatedPallets) === 2
+        && Number(enrichedSpecialLine.poAllocatedPieces) === 4,
+      "Sales Qty coverage must move the same MBBS-Special line's operational physical quantities away from the source yard.",
+      { enrichedSpecialLine });
+    assert(Number(specialManifestLine?.quantity) === 5
+        && Number(specialManifestLine?.pallets) === 0
+        && Number(specialManifestLine?.pieces) === 0,
+      "The vendor pickup manifest must display MBBS-Special Sales Qty/UOM instead of duplicate physical quantities.",
+      { specialManifestLine });
+    assert(JSON.stringify(requiredPickupLocations(enrichedSpecial)) === JSON.stringify(["Link Target Yard"]),
+      "A fully PO-linked MBBS-Special line plus Delivery Charge must require only the vendor pickup, not 12441.",
+      { pickupLocations: enrichedSpecial.pickupLocations, requiredPickupLocations: requiredPickupLocations(enrichedSpecial) });
 
     const normalOrderId = base + 5;
     const normalOrderRef = "LINK-SO-NORMAL-" + suffix;

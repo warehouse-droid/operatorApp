@@ -10,6 +10,18 @@ function sourceSlice(startMarker, endMarker) {
   return source.slice(start, end);
 }
 
+const hierarchySource = sourceSlice(
+  "function dispatchLocationHierarchyRoot",
+  "function orderRequiresPickupLocation"
+);
+const locationHelpers = Function(
+  '"use strict"; ' + hierarchySource + "; return { dispatchLocationHierarchyRoot, normalizedPickupLocation, sameDispatchLocation, uniqueDispatchLocationLabels };"
+)();
+assert.equal(locationHelpers.dispatchLocationHierarchyRoot("3445 : 3445 Special"), "3445");
+assert.equal(locationHelpers.normalizedPickupLocation("3445 : 3445 Special"), "3445");
+assert.equal(locationHelpers.sameDispatchLocation("3445", "3445 : 3445 Special"), true);
+assert.equal(locationHelpers.sameDispatchLocation("2967", "3445 : 3445 Special"), false);
+
 const requiredPickupSource = sourceSlice(
   "function requiredPickupLocations",
   "function sequenceWarningsForStops"
@@ -18,15 +30,17 @@ const makeRequiredPickupLocations = Function(
   "normalizedPickupLocation",
   "tooltipItemsForOrder",
   "itemHasQuantity",
+  "uniqueDispatchLocationLabels",
   '"use strict"; ' + requiredPickupSource + "; return requiredPickupLocations;"
 );
 
 const quantityLocations = new Set(["3445"]);
 const requiredPickupLocations = makeRequiredPickupLocations(
-  (value) => String(value || "").trim().toLowerCase(),
+  locationHelpers.normalizedPickupLocation,
   (_order, { pickupLocation = "" } = {}) =>
-    quantityLocations.has(String(pickupLocation)) ? [{ quantity: 1 }] : [],
-  (item) => Number(item?.quantity || 0) > 0
+    quantityLocations.has(locationHelpers.normalizedPickupLocation(pickupLocation)) ? [{ quantity: 1 }] : [],
+  (item) => Number(item?.quantity || 0) > 0,
+  locationHelpers.uniqueDispatchLocationLabels
 );
 
 const externalPickupOrder = {
@@ -53,19 +67,49 @@ assert.deepEqual(
   ["195", "3445"],
   "The explicit external pickup and any additional allocated yard pickups must both remain required."
 );
+assert.deepEqual(
+  requiredPickupLocations({ pickupLocations: ["3445 : 3445 Special", "3445"] }),
+  ["3445 : 3445 Special"],
+  "A NetSuite child location and its parent must produce one physical pickup."
+);
 
 const pickupStopSource = sourceSlice("function opaqueDispatchStopId", "function isScmGroupedPoOrder");
 const makeEnsurePickupStops = Function(
   "requiredPickupLocations",
+  "normalizedPickupLocation",
   '"use strict"; ' + pickupStopSource + "; return ensurePickupStops;"
 );
-const ensurePickupStops = makeEnsurePickupStops(requiredPickupLocations);
+const ensurePickupStops = makeEnsurePickupStops(requiredPickupLocations, locationHelpers.normalizedPickupLocation);
 const load = { id: "LOAD-1", stops: [] };
 assert.equal(ensurePickupStops(load, externalPickupOrder, 0), 1);
 assert.equal(load.stops.length, 1);
 assert.equal(load.stops[0].type, "pick");
 assert.equal(load.stops[0].orderId, "SOV02265");
 assert.equal(load.stops[0].location, "195");
+const relatedYardLoad = { id: "LOAD-2", stops: [{ id: "PARENT", type: "pick", location: "3445" }] };
+assert.equal(
+  ensurePickupStops(relatedYardLoad, { pickupLocations: ["3445 : 3445 Special"] }),
+  0,
+  "An existing parent-yard stop must satisfy a child-location pickup."
+);
+assert.equal(relatedYardLoad.stops.length, 1);
+
+const groupingSource = sourceSlice(
+  "function orderGroupYard",
+  "function groupedOrderDependencyStructureBlockMessage"
+);
+const mixedYardGroupBlockReason = Function(
+  "normalizedPickupLocation",
+  '"use strict"; ' + groupingSource + "; return mixedYardGroupBlockReason;"
+)(locationHelpers.normalizedPickupLocation);
+assert.equal(mixedYardGroupBlockReason([
+  { id: "SOB117067", pickupLocations: ["3445 : 3445 Special"] },
+  { id: "SOB117068", pickupLocations: ["3445"] }
+]), "", "A child NetSuite location must be groupable with its parent yard.");
+assert.match(mixedYardGroupBlockReason([
+  { id: "SOB117067", pickupLocations: ["3445 : 3445 Special"] },
+  { id: "SOB117069", pickupLocations: ["2967"] }
+]), /Cannot group orders from different yards/u);
 
 const physicalAddressSource = sourceSlice(
   "function normalizedStreetAddressKey",
@@ -134,6 +178,7 @@ const makeOwnYardForLocation = Function(
   "physicalAddressRegionCompatible",
   "HUBS",
   "ownYards",
+  "dispatchLocationHierarchyRoot",
   '"use strict"; ' + ownYardSource + "; return ownYardForLocation;"
 );
 const configuredYards = [{
@@ -164,7 +209,13 @@ const ownYardForLocation = makeOwnYardForLocation(
     return !leftMunicipality || !rightMunicipality || leftMunicipality === rightMunicipality;
   },
   {},
-  configuredYards
+  configuredYards,
+  locationHelpers.dispatchLocationHierarchyRoot
+);
+assert.equal(
+  ownYardForLocation("2967 : Seasonal inventory")?.code,
+  "2967",
+  "A child location must inherit its configured parent yard and address."
 );
 assert.equal(
   ownYardForLocation("2967 Kennedy Rd, Scarborough, ON M1V 1S9")?.code,

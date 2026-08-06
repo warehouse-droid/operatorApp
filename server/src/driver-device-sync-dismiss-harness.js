@@ -6,6 +6,14 @@ const repositorySource = await fs.readFile(
   "utf8"
 );
 const serverSource = await fs.readFile(new URL("./server.js", import.meta.url), "utf8");
+const reviewUiSource = await fs.readFile(
+  new URL("../public/dispatch-offline-review.js", import.meta.url),
+  "utf8"
+);
+const reviewCssSource = await fs.readFile(
+  new URL("../public/dispatch-offline-review.css", import.meta.url),
+  "utf8"
+);
 
 const repositoryStart = repositorySource.indexOf("export async function dismissDriverClientSyncIssue");
 const repositoryEnd = repositorySource.indexOf("export async function revokeDriverSession", repositoryStart);
@@ -23,6 +31,22 @@ assert.match(
   /COALESCE\(sync_status->'dispatchDismissal'->>'reportReceivedAt', ''\)[\s\S]*<> sync_status->>'serverReceivedAt'/,
   "Only the exact dismissed telemetry report may be hidden from active device issues."
 );
+assert.match(
+  repositorySource,
+  /photoFailures:[\s\S]*slice\(0,\s*10\)[\s\S]*photoId[\s\S]*eventId[\s\S]*phase[\s\S]*byteSize[\s\S]*attemptCount[\s\S]*retryable[\s\S]*errorCode[\s\S]*httpStatus[\s\S]*message/,
+  "Client photo failure telemetry must be allowlisted and limited before storage."
+);
+
+const issueRenderStart = reviewUiSource.indexOf("function driverPwaRenderClientSyncIssues");
+const issueRenderEnd = reviewUiSource.indexOf("function driverPwaRenderReopen", issueRenderStart);
+const issueRenderSource = reviewUiSource.slice(issueRenderStart, issueRenderEnd);
+assert.ok(issueRenderStart >= 0 && issueRenderEnd > issueRenderStart);
+assert.match(issueRenderSource, /photoFailures/);
+assert.match(issueRenderSource, /offlineReviewFormatBytes/);
+assert.match(issueRenderSource, /attempt/);
+assert.match(issueRenderSource, /retryable/);
+assert.match(issueRenderSource, /offlineReviewEscape\(failureMessage\)/);
+assert.match(reviewCssSource, /\.driver-pwa-client-photo-failures[\s\S]*overflow-wrap:\s*anywhere/);
 
 const routeStart = serverSource.indexOf(
   'app.post("/api/dispatch/offline-review/device-issues/:sessionId/dismiss"'

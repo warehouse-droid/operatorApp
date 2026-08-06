@@ -8,12 +8,13 @@ const menu = readPublic("scm-menu.html");
 const page = readPublic("scm-netsuite-po.js");
 const server = fs.readFileSync(new URL("server.js", import.meta.url), "utf8");
 
-const allowedRoles = 'roles: ["admin", "scm", "scm_staff", "dispatcher", "yard_manager"]';
+const menuRoles = 'roles: ["admin", "scm", "scm_staff", "dispatcher", "yard_manager"]';
+const purchaseOrderRoles = 'roles: ["admin", "scm", "scm_staff"]';
 
 assert.match(
   sidebar,
-  /\{ label: "NetSuite PO", href: "\/scm\/netsuite-po", icon: "PO" \}/,
-  "The SCM sidebar must expose the NetSuite PO review page."
+  /\{ label: "NetSuite PO history", href: "\/scm\/netsuite-po", icon: "PO", scmWriteOnly: true \}/,
+  "The SCM sidebar must expose the role-gated NetSuite PO history page."
 );
 assert.match(
   sidebar,
@@ -22,16 +23,16 @@ assert.match(
 );
 assert.match(
   menu,
-  /<button class="dispatch-menu-card primary-card" onclick="location\.href='\/scm\/netsuite-po'" type="button">[\s\S]*?<strong>NetSuite PO<\/strong>/,
-  "The visible SCM menu card grid must expose the NetSuite PO review page."
+  /<button class="dispatch-menu-card primary-card" onclick="location\.href='\/scm\/netsuite-po'" type="button">[\s\S]*?<strong>NetSuite PO history<\/strong>/,
+  "The visible SCM menu card grid must expose the NetSuite PO history page."
 );
 assert.ok(
-  menu.includes(allowedRoles),
+  menu.includes(menuRoles),
   "The SCM menu must admit the complete NetSuite PO read/review role set."
 );
 assert.ok(
-  page.includes(allowedRoles),
-  "The NetSuite PO page role set must stay aligned with the SCM menu."
+  page.includes(purchaseOrderRoles),
+  "The NetSuite PO history page must remain limited to purchase-order writers."
 );
 assert.ok(
   server.includes('app.get("/scm/netsuite-po", (req, res) => {')

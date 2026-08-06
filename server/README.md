@@ -135,8 +135,33 @@ For Sales Orders, the server also schedules a lightweight NetSuite status check
 change the order from Pending Approval to Pending Fulfillment shortly after the
 User Event webhook fires.
 
-The webhook uses two SuiteScripts so external HTTP never blocks transaction
-approval workflows:
+For the simplest one-script setup, upload
+`server/netsuite-order-webhook-user-event-direct.js` and deploy it as a User
+Event Script on Sales Order, Purchase Order, and Transfer Order. Add these two
+script parameters:
+
+```text
+custscriptmbbs_webhook_url=https://your-server.example/api/webhooks/netsuite/order
+custscriptwh_webhook_secret_i=<NETSUITE_WEBHOOK_SECRET>
+```
+
+For a manual Sales Order approval, open the User Event deployment's **Context
+Filtering** tab and ensure:
+
+- Event Type includes `Approve` (using all event types is also valid).
+- Execution Context includes `User Interface`.
+- The deployment is Released, applies to Sales Order, and is not restricted to
+  an audience that excludes the approving user.
+
+After one manual approval, the NetSuite execution log should contain `MBBS
+webhook invoked` followed by `MBBS webhook sent`. If `invoked` is absent, the
+deployment did not run; check the filters above. If `invoked` exists without
+`sent`, open the `MBBS webhook missing parameters`, `failed`, or `exception` log
+detail. The direct option makes HTTPS synchronously, so the approval waits for
+the request to finish.
+
+For higher transaction volume, the optional two-script setup avoids holding the
+approval request open while NetSuite calls the external server:
 
 1. Upload `server/netsuite-order-webhook-scheduled.js` and create a Scheduled
    Script with script ID `customscript_mbbs_order_webhook_worker`.
@@ -160,7 +185,7 @@ custscriptmbbs_wh_secret
 - Purchase Order
 - Transfer Order
 
-Script parameters:
+User Event script parameters:
 
 ```text
 custscriptmbbs_webhook_url=https://your-server.example/api/webhooks/netsuite/order

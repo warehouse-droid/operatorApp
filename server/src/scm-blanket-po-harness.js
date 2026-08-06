@@ -39,6 +39,12 @@ assert.match(dispatchRepositorySource, /NOT COALESCE\([^\n]*is_blanket_po[^\n]*f
   "Normal dispatch/schedule queries must explicitly exclude flagged blanket parents.");
 assert.match(orderSyncRepositorySource, /'not_received',\s*'Hold'/i,
   "New NetSuite PO inserts must explicitly start at Hold.");
+assert.match(dispatchRepositorySource, /COALESCE\(scm\.status,\s*o\.initial_scm_status,\s*'Hold'\) AS scm_status/i,
+  "A NetSuite PO with no schedule row must surface its Hold arrival status.");
+assert.match(dispatchRepositorySource, /scm\.id AS scm_schedule_id/i,
+  "PO response rows must retain the schedule identity used for status freshness.");
+assert.match(dispatchRepositorySource, /scm\.updated_at AS scm_updated_at/i,
+  "PO response rows must retain the schedule update time used for status freshness.");
 
 const seed = Date.now() % 100000000;
 const baseId = 800000000000 + (seed * 20);

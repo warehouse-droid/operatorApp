@@ -1,0 +1,26 @@
+{
+  "all": true,
+  "branches": 90,
+  "check-coverage": true,
+  "exclude": [
+    "src/mbt/**/*-harness.js",
+    "test/**"
+  ],
+  "extension": [
+    ".js",
+    ".mjs"
+  ],
+  "functions": 95,
+  "include": [
+    "src/mbt/**/*.js"
+  ],
+  "lines": 95,
+  "report-dir": "test-artifacts/coverage",
+  "reporter": [
+    "text",
+    "json-summary",
+    "lcov"
+  ],
+  "statements": 95,
+  "temp-directory": "test-artifacts/.c8"
+}

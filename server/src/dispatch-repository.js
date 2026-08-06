@@ -10,6 +10,10 @@ import {
   useNetSuiteAddressMappingValue
 } from "./dispatch-enrichment.js";
 import { resolveDispatchSalesTarget } from "./dispatch-order-target-repository.js";
+import {
+  dispatchLocationsShareYard,
+  uniqueDispatchLocations
+} from "./dispatch-location.js";
 
 function toNumber(value) {
   return Number(value || 0) || 0;
@@ -26,6 +30,47 @@ const SCM_VRMA_OWN_YARDS = [
 ];
 const SCM_VRMA_OWN_YARD_CODES = new Set(SCM_VRMA_OWN_YARDS.map((yard) => yard.code));
 const SCM_VRMA_FALLBACK_UNITS = new Set(["PLT", "SQFT", "PC"]);
+
+function exactBilledSalesOrderSql(alias) {
+  return `(
+    UPPER(BTRIM(COALESCE(${alias}.status, ''))) = 'G'
+    OR UPPER(REGEXP_REPLACE(
+         REGEXP_REPLACE(BTRIM(COALESCE(${alias}.status_text, '')), '\\s*:\\s*', ':', 'g'),
+         '\\s+', ' ', 'g'
+       ))
+       IN ('BILLED', 'SALES ORDER:BILLED')
+  )`;
+}
+
+function billedSalesOrderFamilySql(alias) {
+  return `(
+    ${exactBilledSalesOrderSql(alias)}
+    OR EXISTS (
+      SELECT 1
+        FROM dispatch_scm_so_splits family_membership
+        JOIN sales_orders billed_source
+          ON billed_source.netsuite_id = family_membership.source_so_id
+       WHERE (
+         family_membership.source_so_id = ${alias}.netsuite_id
+         OR family_membership.split_so_id = ${alias}.netsuite_id
+       )
+         AND ${exactBilledSalesOrderSql("billed_source")}
+    )
+    OR EXISTS (
+      SELECT 1
+        FROM dispatch_scm_so_splits family_membership
+        JOIN dispatch_scm_so_splits billed_membership
+          ON billed_membership.source_so_id = family_membership.source_so_id
+        JOIN sales_orders billed_split
+          ON billed_split.netsuite_id = billed_membership.split_so_id
+       WHERE (
+         family_membership.source_so_id = ${alias}.netsuite_id
+         OR family_membership.split_so_id = ${alias}.netsuite_id
+       )
+         AND ${exactBilledSalesOrderSql("billed_split")}
+    )
+  )`;
+}
 
 function dispatchItemHasConversion(item) {
   return toNumber(item.toPlt) > 0 || toNumber(item.toLyr) > 0 || toNumber(item.toSec) > 0 || toNumber(item.toPcs) > 0;
@@ -152,7 +197,7 @@ function rowToDispatchOrder(row) {
   const basePickup = row.pickup_location ? [row.pickup_location] : [];
   const pickupLocations = row.transit_co_to_yard
     ? [row.transit_co_to_yard]
-    : [...new Set([...basePickup, ...allocationPickups])];
+    : uniqueDispatchLocations([...basePickup, ...allocationPickups]);
   const address = row.dispatch_type === "PO"
     ? row.drop_address || row.dispatch_address || row.source_address || ""
     : row.drop_address || row.dispatch_address || "";
@@ -235,7 +280,13 @@ function rowToDispatchOrder(row) {
     childOrders: Array.isArray(row.scm_child_orders) ? row.scm_child_orders.filter(Boolean) : [],
     scm: {
       method: row.scm_method || "MBT",
-      status: row.scm_status || "Queued",
+      status: row.scm_status || (
+        row.dispatch_type === "PO" && row.source_table === "purchase_orders"
+          ? "Hold"
+          : "Queued"
+      ),
+      scheduleId: Number(row.scm_schedule_id) || null,
+      updatedAt: row.scm_updated_at || null,
       isSpecialOrder: Boolean(row.scm_is_special_order),
       groupRef: row.scm_group_ref || "",
       packingSlipRef: row.scm_packing_slip_ref || "",
@@ -355,6 +406,7 @@ export async function listDispatchOrders({
         CASE WHEN $2::boolean AND COALESCE(is_test_fixture, false) THEN true ELSE netsuite_active END AS netsuite_active
       FROM sales_orders
       WHERE sales_order_type <> '${CUSTOMER_PICKUP_DELIVERY_METHOD.replaceAll("'", "''")}'
+        AND NOT ${billedSalesOrderFamilySql("sales_orders")}
         AND (COALESCE(is_test_fixture, false) = false OR $2::boolean)
       UNION ALL
       SELECT
@@ -396,6 +448,8 @@ export async function listDispatchOrders({
         item_name,
         sku,
         item_description,
+        item_type,
+        item_type_text,
         quantity,
         unit,
         item_weight,
@@ -423,6 +477,8 @@ export async function listDispatchOrders({
         item_name,
         sku,
         item_description,
+        item_type,
+        item_type_text,
         quantity,
         unit,
         item_weight,
@@ -603,6 +659,8 @@ export async function listDispatchOrders({
         o.netsuite_active,
         'MBT'::text AS scm_method,
         'Queued'::text AS scm_status,
+        NULL::bigint AS scm_schedule_id,
+        NULL::timestamptz AS scm_updated_at,
         false AS scm_is_special_order,
         NULL::text AS scm_group_ref,
         NULL::text AS scm_packing_slip_ref,
@@ -625,6 +683,8 @@ export async function listDispatchOrders({
           'sku', COALESCE(l.sku, l.item_name),
           'itemName', l.item_name,
           'description', l.item_description,
+          'itemType', l.item_type,
+          'itemTypeText', l.item_type_text,
           'pallets', COALESCE(l.pallet_qty, 0),
           'layers', COALESCE(l.layer_qty, 0),
           'sections', COALESCE(l.section_qty, 0),
@@ -732,7 +792,9 @@ export async function listDispatchOrders({
         o.status_text,
         o.netsuite_active,
         COALESCE(scm.method, 'MBT') AS scm_method,
-        COALESCE(scm.status, o.initial_scm_status, 'Queued') AS scm_status,
+        COALESCE(scm.status, o.initial_scm_status, 'Hold') AS scm_status,
+        scm.id AS scm_schedule_id,
+        scm.updated_at AS scm_updated_at,
         COALESCE(scm.is_special_order, false) AS scm_is_special_order,
         scm.group_ref AS scm_group_ref,
         scm.packing_slip_ref AS scm_packing_slip_ref,
@@ -811,7 +873,7 @@ export async function listDispatchOrders({
         )
         AND (
           $1::boolean
-          OR LOWER(BTRIM(COALESCE(scm.status, o.initial_scm_status, 'Queued'))) NOT IN (
+          OR LOWER(BTRIM(COALESCE(scm.status, o.initial_scm_status, 'Hold'))) NOT IN (
             'hold', 'complete', 'completed', 'cancelled', 'canceled'
           )
         )
@@ -836,7 +898,7 @@ export async function listDispatchOrders({
                o.dispatch_instructions, o.dispatch_parse_source, o.dispatch_plan_date,
                o.dispatch_truck_plate, o.dispatch_load_name, o.dispatch_parking_spot,
                o.status_text, o.initial_scm_status, o.is_blanket_po, o.netsuite_active,
-               scm.method, scm.status, scm.is_special_order,
+               scm.id, scm.updated_at, scm.method, scm.status, scm.is_special_order,
                scm.group_ref, scm.packing_slip_ref, scm.pickup_point, scm.dropoff_point,
                scm.eta_date, scm.eta_time, scm.driver, scm.notes,
                schedule_pickup_yard.address, schedule_pickup_yard.window_start, schedule_pickup_yard.window_end,
@@ -882,6 +944,8 @@ export async function listDispatchOrders({
         true AS netsuite_active,
         'MBT'::text AS scm_method,
         'Queued'::text AS scm_status,
+        NULL::bigint AS scm_schedule_id,
+        NULL::timestamptz AS scm_updated_at,
         false AS scm_is_special_order,
         NULL::text AS scm_group_ref,
         NULL::text AS scm_packing_slip_ref,
@@ -953,6 +1017,8 @@ export async function listDispatchOrders({
         true AS netsuite_active,
         COALESCE(scm.method, v.method, 'MBT') AS scm_method,
         COALESCE(scm.status, v.status, 'Queued') AS scm_status,
+        scm.id AS scm_schedule_id,
+        scm.updated_at AS scm_updated_at,
         false AS scm_is_special_order,
         scm.group_ref AS scm_group_ref,
         scm.packing_slip_ref AS scm_packing_slip_ref,
@@ -1055,7 +1121,9 @@ export async function listDispatchOrders({
                 AND lower(g.group_ref) = lower(COALESCE(NULLIF(orders.dispatch_ref, ''), orders.tranid))
            ), '[]'::jsonb) AS scm_child_orders
     FROM ranked_orders orders
-    WHERE $3::text <> '' OR orders.dispatch_type_rank <= $4
+    WHERE $3::text <> ''
+       OR orders.dispatch_type_rank <= $4
+       OR orders.dispatch_planned = true
     ORDER BY CASE WHEN $2::boolean AND tranid LIKE 'TSTDEP-SO-%' THEN 0 ELSE 1 END,
              dispatch_window_start NULLS LAST, tranid DESC
     LIMIT CASE WHEN $3::text <> '' THEN 200 ELSE NULL END
@@ -2997,7 +3065,8 @@ export async function createScmScheduleGroup({ refs = [], createdBy = "" } = {})
       const row = await client.query(
         `SELECT po.*,
                 s.pickup_point AS schedule_pickup_point,
-                s.dropoff_point AS schedule_dropoff_point
+                s.dropoff_point AS schedule_dropoff_point,
+                s.status AS schedule_status
            FROM purchase_orders po
            LEFT JOIN scm_transport_schedule s
              ON s.order_kind = 'PO'
@@ -3044,6 +3113,7 @@ export async function createScmScheduleGroup({ refs = [], createdBy = "" } = {})
       members.push({
         ...po,
         order_ref: po.dispatch_ref || po.tranid,
+        scm_status: String(po.schedule_status || po.initial_scm_status || "Queued").trim() || "Queued",
         pickup_point: schedulePickupPoint || enriched.dispatch_vendor_yard || po.dispatch_vendor_yard || po.source_location || po.vendor || "",
         dropoff_point: scheduleDropoffPoint || po.destination_location || "",
         dropoff_location_id: normalizeScmDestinationLocationId(scheduleDropoffPoint) || po.destination_location_id || null,
@@ -3054,6 +3124,13 @@ export async function createScmScheduleGroup({ refs = [], createdBy = "" } = {})
           ? `${pickupYard.day_label || ""}${pickupYard.instructions ? ` | ${pickupYard.instructions}` : ""}`.trim()
           : enriched.dispatch_instructions || po.dispatch_instructions || ""
       });
+    }
+    const statusKeys = [...new Set(members.map((member) => String(member.scm_status || "Queued").trim().toLowerCase()))];
+    if (statusKeys.length !== 1) {
+      throw Object.assign(
+        new Error(`Cannot group orders with different SCM statuses: ${members.map((member) => `${member.order_ref}=${member.scm_status || "Queued"}`).join(", ")}`),
+        { status: 400, code: "SCM_GROUP_STATUS_MISMATCH" }
+      );
     }
     const pickupKeys = [...new Set(members.map((member) => String(member.pickup_point || "").trim().toLowerCase()).filter(Boolean))];
     if (pickupKeys.length !== 1) {
@@ -5276,6 +5353,25 @@ function isMbbsSpecialLine(line = {}) {
   return Number(line.item_id ?? line.itemId) === MBBS_SPECIAL_ITEM_ID;
 }
 
+function isDispatchOperationalLine(line = {}) {
+  if (isMbbsSpecialLine(line)) return true;
+  const itemLabel = `${line.sku || ""} ${line.item_name || line.itemName || ""}`.trim();
+  const itemType = `${line.item_type || line.itemType || ""} ${line.item_type_text || line.itemTypeText || ""}`.trim();
+  if (/delivery\s*(charge|fee)|shipping\s*(charge|fee)|sales\s*credit|discount/i.test(itemLabel)) return false;
+  return !/oth\s*charge|other\s*charge|service|discount|description|subtotal|payment|markup/i.test(itemType);
+}
+
+function salesQuantityOnlyAvailability(line = {}) {
+  const available = availableUnitSelection(line);
+  return {
+    pallets: 0,
+    layers: 0,
+    sections: 0,
+    pieces: 0,
+    salesQty: positiveQuantity(available.salesQty)
+  };
+}
+
 function normalizedSpecialDescription(value, itemName = "") {
   const normalize = (text) => String(text || "").normalize("NFKC").trim().toLowerCase().replace(/\s+/g, " ");
   const itemLabel = normalize(itemName);
@@ -5298,6 +5394,7 @@ function lineMatches(left, right) {
 }
 
 function normalizeAllocationRow(row) {
+  const salesQuantityOnly = isMbbsSpecialLine(row);
   return {
     id: row.id,
     salesOrderId: row.sales_order_id,
@@ -5312,11 +5409,12 @@ function normalizeAllocationRow(row) {
     itemId: row.item_id,
     itemName: row.item_name,
     sku: row.sku,
-    pallets: positiveQuantity(row.allocated_pallet_qty),
-    layers: positiveQuantity(row.allocated_layer_qty),
-    sections: positiveQuantity(row.allocated_section_qty),
-    pieces: positiveQuantity(row.allocated_piece_qty),
+    pallets: salesQuantityOnly ? 0 : positiveQuantity(row.allocated_pallet_qty),
+    layers: salesQuantityOnly ? 0 : positiveQuantity(row.allocated_layer_qty),
+    sections: salesQuantityOnly ? 0 : positiveQuantity(row.allocated_section_qty),
+    pieces: salesQuantityOnly ? 0 : positiveQuantity(row.allocated_piece_qty),
     salesQty: positiveQuantity(row.allocated_sales_qty),
+    salesQuantityOnly,
     status: row.status,
     createdBy: row.created_by,
     createdAt: row.created_at,
@@ -5344,6 +5442,16 @@ function allocationMatchesDispatchItem(allocation = {}, item = {}, sourceRefs = 
   return !sources.length || sources.some((source) => key.includes(`::${source}::`));
 }
 
+function allocatedDispatchPhysicalQuantity(item = {}, field, explicitAllocated, allocatedSalesQty) {
+  const explicit = positiveQuantity(explicitAllocated);
+  if (!isMbbsSpecialLine(item)) return explicit;
+  const totalPhysical = positiveQuantity(item[field]);
+  const totalSales = positiveQuantity(item.quantity ?? item.salesQty);
+  if (!totalPhysical || !totalSales) return Math.min(totalPhysical || explicit, explicit);
+  const salesCoverage = Math.min(positiveQuantity(allocatedSalesQty) / totalSales, 1);
+  return Number(Math.min(totalPhysical, Math.max(explicit, totalPhysical * salesCoverage)).toFixed(6));
+}
+
 function applyTargetPoAllocationsToOrder(order = {}, allocations = []) {
   const applyItems = (candidate) => {
     const sources = [candidate.id, candidate.originalOrderId];
@@ -5353,13 +5461,34 @@ function applyTargetPoAllocationsToOrder(order = {}, allocations = []) {
       : (candidate.items || []).map((item) => {
           const matches = allocations.filter((allocation) => allocationMatchesDispatchItem(allocation, item, sources));
           if (!matches.length) return item;
+          const allocatedSalesQty = matches.reduce((sum, row) => sum + positiveQuantity(row.allocated_sales_qty), 0);
           return {
             ...item,
-            poAllocatedPallets: matches.reduce((sum, row) => sum + positiveQuantity(row.allocated_pallet_qty), 0),
-            poAllocatedLayers: matches.reduce((sum, row) => sum + positiveQuantity(row.allocated_layer_qty), 0),
-            poAllocatedSections: matches.reduce((sum, row) => sum + positiveQuantity(row.allocated_section_qty), 0),
-            poAllocatedPieces: matches.reduce((sum, row) => sum + positiveQuantity(row.allocated_piece_qty), 0),
-            poAllocatedSalesQty: matches.reduce((sum, row) => sum + positiveQuantity(row.allocated_sales_qty), 0)
+            poAllocatedPallets: allocatedDispatchPhysicalQuantity(
+              item,
+              "pallets",
+              matches.reduce((sum, row) => sum + positiveQuantity(row.allocated_pallet_qty), 0),
+              allocatedSalesQty
+            ),
+            poAllocatedLayers: allocatedDispatchPhysicalQuantity(
+              item,
+              "layers",
+              matches.reduce((sum, row) => sum + positiveQuantity(row.allocated_layer_qty), 0),
+              allocatedSalesQty
+            ),
+            poAllocatedSections: allocatedDispatchPhysicalQuantity(
+              item,
+              "sections",
+              matches.reduce((sum, row) => sum + positiveQuantity(row.allocated_section_qty), 0),
+              allocatedSalesQty
+            ),
+            poAllocatedPieces: allocatedDispatchPhysicalQuantity(
+              item,
+              "pieces",
+              matches.reduce((sum, row) => sum + positiveQuantity(row.allocated_piece_qty), 0),
+              allocatedSalesQty
+            ),
+            poAllocatedSalesQty: allocatedSalesQty
           };
         });
     return { ...candidate, childOrderDetails, items };
@@ -5376,15 +5505,16 @@ function applyTargetPoAllocationsToOrder(order = {}, allocations = []) {
       address: allocation.po_address || "",
       items: []
     };
+    const salesQuantityOnly = isMbbsSpecialLine(allocation);
     entry.items.push({
       itemId: allocation.item_id,
       itemName: allocation.item_name,
       sku: allocation.sku,
       unit: allocation.unit || "",
-      pallets: positiveQuantity(allocation.allocated_pallet_qty),
-      layers: positiveQuantity(allocation.allocated_layer_qty),
-      sections: positiveQuantity(allocation.allocated_section_qty),
-      pieces: positiveQuantity(allocation.allocated_piece_qty),
+      pallets: salesQuantityOnly ? 0 : positiveQuantity(allocation.allocated_pallet_qty),
+      layers: salesQuantityOnly ? 0 : positiveQuantity(allocation.allocated_layer_qty),
+      sections: salesQuantityOnly ? 0 : positiveQuantity(allocation.allocated_section_qty),
+      pieces: salesQuantityOnly ? 0 : positiveQuantity(allocation.allocated_piece_qty),
       quantity: positiveQuantity(allocation.allocated_sales_qty)
     });
     manifestByLocation.set(key, entry);
@@ -5392,10 +5522,10 @@ function applyTargetPoAllocationsToOrder(order = {}, allocations = []) {
   const poPickupManifest = [...manifestByLocation.values()];
   return {
     ...enriched,
-    pickupLocations: [...new Set([
+    pickupLocations: uniqueDispatchLocations([
       ...(enriched.pickupLocations || []),
       ...poPickupManifest.map((entry) => entry.location).filter(Boolean)
-    ])],
+    ]),
     poPickupManifest
   };
 }
@@ -5434,6 +5564,8 @@ function targetLineAsAllocationRow(line = {}) {
     sku: line.sku,
     item_name: line.itemName,
     item_description: line.description,
+    item_type: line.itemType,
+    item_type_text: line.itemTypeText,
     unit: line.unit,
     quantity: line.quantity,
     pallet_qty: line.pallets,
@@ -5455,7 +5587,8 @@ function targetLineAsAllocationRow(line = {}) {
 
 export async function getSalesOrderPoAllocationOptions(orderRef, { planDate = "" } = {}) {
   const resolved = await resolveDispatchSalesTarget({ dispatchTargetRef: orderRef, planDate });
-  const salesLines = resolved.lines.map(targetLineAsAllocationRow);
+  const operationalTargetLines = resolved.lines.filter(isDispatchOperationalLine);
+  const salesLines = operationalTargetLines.map(targetLineAsAllocationRow);
   const itemIds = [...new Set(salesLines.map((line) => line.item_id).filter(Boolean))];
   const itemNames = [...new Set(salesLines.map((line) => String(line.sku || line.item_name || "").trim()).filter(Boolean))];
   const poParams = [itemIds, itemNames];
@@ -5516,11 +5649,14 @@ export async function getSalesOrderPoAllocationOptions(orderRef, { planDate = ""
       outboundLocation: resolved.target.outboundLocation || "",
       targetSignature: resolved.signature
     },
-    salesLines: resolved.lines.map((targetLine) => {
+    salesLines: operationalTargetLines.map((targetLine) => {
       const line = targetLineAsAllocationRow(targetLine);
       const special = isMbbsSpecialLine(line);
       const normalizedDescription = normalizedSpecialDescription(line.item_description, line.item_name || line.sku);
-      const lineCandidates = poLines.rows.filter((poLine) => lineMatches(line, poLine)).map((poLine) => ({
+      const lineCandidates = poLines.rows.filter((poLine) =>
+        lineMatches(line, poLine)
+        && (!special || normalizedSpecialUnit(line.unit) === normalizedSpecialUnit(poLine.unit))
+      ).map((poLine) => ({
         poLineId: poLine.id,
         poRef: poLine.po_ref,
         descriptionMatch: Boolean(normalizedDescription) && normalizedDescription === normalizedSpecialDescription(poLine.item_description, poLine.item_name || poLine.sku),
@@ -5537,7 +5673,8 @@ export async function getSalesOrderPoAllocationOptions(orderRef, { planDate = ""
       itemName: line.item_name,
       description: line.item_description || "",
       isSpecial: special,
-      independentSalesQty: !hasConversion(line) && hasCustomQuantity(line),
+      independentSalesQty: !special && !hasConversion(line) && hasCustomQuantity(line),
+      salesQuantityOnly: special,
       poCandidates: lineCandidates,
       required: {
         pallets: positiveQuantity(line.pallet_qty),
@@ -5554,7 +5691,7 @@ export async function getSalesOrderPoAllocationOptions(orderRef, { planDate = ""
         pieces: positiveQuantity(line.allocated_piece_qty),
         salesQty: positiveQuantity(line.allocated_sales_qty)
       },
-      available: availableUnitSelection(line),
+      available: special ? salesQuantityOnlyAvailability(line) : availableUnitSelection(line),
       conversions: {
         pallets: positiveQuantity(line.to_plt),
         layers: positiveQuantity(line.to_lyr),
@@ -5562,7 +5699,9 @@ export async function getSalesOrderPoAllocationOptions(orderRef, { planDate = ""
         pieces: positiveQuantity(line.to_pcs)
       }
     }; }),
-    poLines: poLines.rows.map((line) => ({
+    poLines: poLines.rows.map((line) => {
+      const special = isMbbsSpecialLine(line);
+      return {
       id: line.id,
       orderId: line.purchase_order_id,
       poRef: line.po_ref,
@@ -5574,6 +5713,8 @@ export async function getSalesOrderPoAllocationOptions(orderRef, { planDate = ""
       sku: line.sku || line.item_name,
       itemName: line.item_name,
       description: line.item_description || "",
+      isSpecial: special,
+      salesQuantityOnly: special,
       statusText: line.po_status_text || "",
       required: {
         pallets: positiveQuantity(line.pallet_qty),
@@ -5590,8 +5731,9 @@ export async function getSalesOrderPoAllocationOptions(orderRef, { planDate = ""
         pieces: positiveQuantity(line.allocated_piece_qty),
         salesQty: positiveQuantity(line.allocated_sales_qty)
       },
-      available: availableUnitSelection(line)
-    })),
+      available: special ? salesQuantityOnlyAvailability(line) : availableUnitSelection(line)
+    };
+    }),
     allocations: allocations.rows.map(normalizeAllocationRow)
   };
 }
@@ -5621,6 +5763,12 @@ async function createSalesOrderPoAllocationWithExecutor(executor, {
     throw new Error("Select the exact PO line for MBBS-Special before connecting quantity.");
   }
   if (!salesLine) throw new Error("Sales order line not found.");
+  if (!isDispatchOperationalLine(salesLine)) {
+    throw Object.assign(new Error(`${salesLine.sku || salesLine.item_name || "This line"} is not an operational inventory pickup and cannot be linked to a PO.`), {
+      status: 400,
+      code: "DISPATCH_PO_LINK_NON_OPERATIONAL_LINE"
+    });
+  }
 
   const poParams = poLineId ? [poLineId] : [String(poRef || "").trim(), salesLine.item_id || null, salesLine.sku || salesLine.item_name || ""];
   const poWhere = poLineId
@@ -5668,13 +5816,37 @@ async function createSalesOrderPoAllocationWithExecutor(executor, {
   }
   if (!lineMatches(salesLine, poLine)) throw new Error("Selected PO line item does not match the SO line item.");
 
-  const pallets = positiveQuantity(quantities.pallets);
-  const layers = positiveQuantity(quantities.layers);
-  const sections = positiveQuantity(quantities.sections);
-  const pieces = positiveQuantity(quantities.pieces);
-  const independentSalesQty = !hasConversion(salesLine) && hasCustomQuantity(salesLine);
-  const conversionLine = independentSalesQty || isMbbsSpecialLine(salesLine) ? salesLine : hasConversion(salesLine) ? salesLine : poLine;
-  let salesQty = lineSalesQty(conversionLine, { ...quantities, pallets, layers, sections, pieces });
+  const specialSalesQuantityOnly = isMbbsSpecialLine(salesLine);
+  if (specialSalesQuantityOnly) {
+    const salesUnit = normalizedSpecialUnit(salesLine.unit);
+    const purchaseUnit = normalizedSpecialUnit(poLine.unit);
+    if (!salesUnit || salesUnit !== purchaseUnit) {
+      throw Object.assign(
+        new Error(`MBBS-Special sales UOM ${salesUnit || "blank"} does not match PO ${poLine.po_order_ref} purchase UOM ${purchaseUnit || "blank"}.`),
+        { status: 400, code: "DISPATCH_MBBS_SPECIAL_UOM_MISMATCH" }
+      );
+    }
+  }
+
+  const submittedPallets = positiveQuantity(quantities.pallets);
+  const submittedLayers = positiveQuantity(quantities.layers);
+  const submittedSections = positiveQuantity(quantities.sections);
+  const submittedPieces = positiveQuantity(quantities.pieces);
+  const pallets = specialSalesQuantityOnly ? 0 : submittedPallets;
+  const layers = specialSalesQuantityOnly ? 0 : submittedLayers;
+  const sections = specialSalesQuantityOnly ? 0 : submittedSections;
+  const pieces = specialSalesQuantityOnly ? 0 : submittedPieces;
+  const independentSalesQty = !specialSalesQuantityOnly && !hasConversion(salesLine) && hasCustomQuantity(salesLine);
+  const conversionLine = independentSalesQty ? salesLine : hasConversion(salesLine) ? salesLine : poLine;
+  let salesQty = specialSalesQuantityOnly
+    ? positiveQuantity(quantities.salesQty)
+    : lineSalesQty(conversionLine, { ...quantities, pallets, layers, sections, pieces });
+  if (specialSalesQuantityOnly && salesQty <= 0) {
+    throw Object.assign(
+      new Error(`MBBS-Special PO links require Sales Qty in ${salesLine.unit || "the sales UOM"}; PLT/LYR/SEC/PCS are operational display only.`),
+      { status: 400, code: "DISPATCH_MBBS_SPECIAL_SALES_QTY_REQUIRED" }
+    );
+  }
   if (pallets + layers + sections + pieces + salesQty <= 0) throw new Error("Allocation quantity is required.");
 
   const checks = [
@@ -5810,7 +5982,7 @@ export async function cancelSalesOrderPoAllocation(allocationId, { cancelledBy =
 
 function localCoChildSourceYards(child = {}) {
   const raw = child.raw && typeof child.raw === "object" ? child.raw : {};
-  const normalized = (values) => [...new Set(values.map(locationTextFromId).filter(Boolean))];
+  const normalized = (values) => uniqueDispatchLocations(values.map(locationTextFromId).filter(Boolean));
   const rawYards = normalized([
     raw.pickup_location,
     raw.outbound_location,
@@ -5844,7 +6016,7 @@ function localCoSourceItems(order = {}, fromYard = "") {
   const fromText = locationTextFromId(fromYard);
   const selectedChildren = children.filter((child) => {
     const yards = localCoChildSourceYards(child);
-    return !yards.length || yards.includes(fromText);
+    return !yards.length || yards.some((yard) => dispatchLocationsShareYard(yard, fromText));
   });
   const childItems = selectedChildren.flatMap((child) => (
     Array.isArray(child.items) && child.items.length
@@ -5865,7 +6037,9 @@ export async function upsertLocalCoOrder({ sourceOrderRef, fromYard, toYard, ord
   const fromText = locationTextFromId(fromYard || order.sourceYard || order.pickupLocations?.[0]);
   const toText = locationTextFromId(toYard || "12441");
   if (!sourceRef) throw new Error("Source order is required for CO.");
-  if (!fromText || !toText || fromText === toText) throw new Error("CO source and destination yard must be different.");
+  if (!fromText || !toText || dispatchLocationsShareYard(fromText, toText)) {
+    throw new Error("CO source and destination yard must be different.");
+  }
   const coRef = String(order.transitCo?.id || `CO-${sourceRef}`).trim();
   const details = {
     customer: order.customer || "",

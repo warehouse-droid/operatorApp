@@ -1,0 +1,25 @@
+name: MBT Phase 2 Gauntlet
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  gauntlet:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      MBT_GAUNTLET_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false # secret-scan: allow non-secret GitHub setting
+      - run: bash server/tools/mbt-gauntlet.sh P2

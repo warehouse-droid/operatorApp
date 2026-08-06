@@ -9,10 +9,11 @@ const files = await Promise.all([
   "../public/dispatch-auth.js",
   "../public/driver.js",
   "../public/app-sidebar.js",
-  "../public/admin.html"
+  "../public/admin.html",
+  "auth-repository.js"
 ].map((file) => readFile(new URL(file, import.meta.url), "utf8")));
 
-const [server, control, login, operator, dispatchAuth, driver, sidebar, adminHtml] = files;
+const [server, control, login, operator, dispatchAuth, driver, sidebar, adminHtml, authRepository] = files;
 const controlCss = await readFile(new URL("../public/control.css", import.meta.url), "utf8");
 const salesSettingsRepository = await readFile(new URL("sales-settings-repository.js", import.meta.url), "utf8");
 const salesSettingsMigration = await readFile(new URL("../migrations/064_sales_portal_settings.sql", import.meta.url), "utf8");
@@ -29,8 +30,7 @@ includesAll(server, [
   '"/admin/reconciliation"',
   '"/admin/photo-storage"',
   '"/admin/audit"',
-  'if (role === "admin") return "/admin";',
-  'if (role === "yard_manager") return "/control";',
+  'return operatorHomeRoute(operator);',
   'operatorHasAnyRole(req.operator, ["admin", "yard_manager"])',
   'operatorHasAnyRole(req.operator, ["admin", "operator", "yard_manager"])',
   'action: "operator.login"',
@@ -51,6 +51,15 @@ includesAll(server, [
   'action: "sales.public_access_update"',
   "await isPublicSalesAccessEnabled()"
 ], "server authorization");
+
+includesAll(authRepository, [
+  'if (role === "admin") return "/admin";',
+  'if (role === "dispatcher") return "/dispatch";',
+  'if (role === "scm" || role === "scm_staff") return "/scm";',
+  'if (role === "yard_manager") return "/control";',
+  'if (role === "sales") return "/sales";',
+  'if (role === "operator") return "/operator";'
+], "shared staff home routing");
 
 includesAll(control, [
   'const STAFF_TOKEN_KEY = "mbbs.staff.token";',

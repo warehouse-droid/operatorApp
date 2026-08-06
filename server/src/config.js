@@ -33,11 +33,37 @@ function buildConfig(env) {
     if (value === undefined || value === null || value === "") return fallback;
     return /^(1|true|yes|on)$/i.test(String(value).trim());
   };
+  const commaSeparatedValues = (value) => [...new Set(String(value || "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean))];
+  const boundedInteger = (value, fallback, minimum, maximum) => {
+    if (value === undefined || value === null || String(value).trim() === "") {
+      return fallback;
+    }
+    const parsed = Number(value);
+    return Number.isFinite(parsed)
+      ? Math.min(maximum, Math.max(minimum, Math.trunc(parsed)))
+      : fallback;
+  };
   return {
     port: Number(env.PORT || 3000),
     appBaseUrl: env.APP_BASE_URL || "http://localhost:3000",
     databaseUrl: env.DATABASE_URL,
     googleMapsApiKey: env.GOOGLE_MAPS_API_KEY || "",
+    mbt: {
+      enabled: booleanValue(env.MBT_ENABLED, false),
+      netSuiteWritesEnabled: booleanValue(env.MBT_NETSUITE_WRITES_ENABLED, false)
+    },
+    mbtPhase3: {
+      customerSyncEnabled: booleanValue(env.MBT_CUSTOMER_SYNC_ENABLED, false),
+      masterDataEnabled: booleanValue(env.MBT_MASTER_DATA_ENABLED, false),
+      assetManagementEnabled: booleanValue(env.MBT_ASSET_MANAGEMENT_ENABLED, false),
+      frontdeskOperationsEnabled: booleanValue(env.MBT_FRONTDESK_OPERATIONS_ENABLED, false),
+      binDispatchEnabled: booleanValue(env.MBT_BIN_DISPATCH_ENABLED, false),
+      driverExecutionEnabled: booleanValue(env.MBT_DRIVER_EXECUTION_ENABLED, false),
+      billingOperationsEnabled: booleanValue(env.MBT_BILLING_OPERATIONS_ENABLED, false)
+    },
     dispatch: {
       driverOrientedPlanning: ["1", "true", "yes", "on"].includes(String(env.DISPATCH_DRIVER_ORIENTED_PLANNING ?? "false").trim().toLowerCase())
     },
@@ -87,6 +113,16 @@ function buildConfig(env) {
       requestTimeoutMs: Number(env.NETSUITE_REQUEST_TIMEOUT_MS || 120000),
       subsidiaryId: env.NETSUITE_SUBSIDIARY_ID || "",
       webhookSecret: env.NETSUITE_WEBHOOK_SECRET || "",
+      mbtSandboxAccountAllowlist: commaSeparatedValues(
+        env.MBT_NETSUITE_SANDBOX_ACCOUNT_ALLOWLIST
+      ),
+      mbtReadTimeoutMs: boundedInteger(env.MBT_NETSUITE_READ_TIMEOUT_MS, 10000, 1000, 60000),
+      mbtPreflightLeaseSeconds: boundedInteger(
+        env.MBT_NETSUITE_PREFLIGHT_LEASE_SECONDS,
+        120,
+        15,
+        900
+      ),
       ifIrWebhookSecret: env.NETSUITE_IFIR_WEBHOOK_SECRET || "",
       ifIrWebhookSignatureMaxAgeSeconds: Math.max(
         30,
@@ -114,6 +150,8 @@ function replaceConfig(target, next) {
   target.appBaseUrl = next.appBaseUrl;
   target.databaseUrl = next.databaseUrl;
   target.googleMapsApiKey = next.googleMapsApiKey;
+  target.mbt = { ...next.mbt };
+  target.mbtPhase3 = { ...next.mbtPhase3 };
   target.dispatch = { ...next.dispatch };
   target.sales = { ...next.sales };
   target.transferDependency = { ...next.transferDependency };
@@ -127,6 +165,20 @@ function replaceConfig(target, next) {
 
 export let activeEnvFile = readSelectedEnvFileSync();
 export let activeEnvPath = path.join(serverRoot, activeEnvFile);
+
+function parseEnvFileSync(filePath) {
+  try {
+    return dotenv.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+let activeEnvValues = parseEnvFileSync(activeEnvPath);
+let activeEnvAmbientValues = new Map(Object.keys(activeEnvValues).map((key) => [
+  key,
+  process.env[key]
+]));
 
 dotenv.config({ path: activeEnvPath, override: true });
 
@@ -182,12 +234,39 @@ export async function applyEnvFile(envFile) {
   const file = path.basename(String(envFile || "").trim());
   if (!isSelectableEnvFile(file)) throw new Error("Select a valid env file.");
   const parsed = dotenv.parse(await fsp.readFile(path.join(serverRoot, file), "utf8"));
-  const nextEnv = { ...process.env, ...parsed };
+  const nextEnv = { ...process.env };
+  for (const key of Object.keys(activeEnvValues)) {
+    if (!Object.hasOwn(parsed, key)) {
+      const ambientValue = activeEnvAmbientValues.get(key);
+      if (ambientValue === undefined) {
+        delete nextEnv[key];
+      } else {
+        nextEnv[key] = ambientValue;
+      }
+    }
+  }
+  Object.assign(nextEnv, parsed);
   const nextConfig = buildConfig(nextEnv);
   if (String(nextConfig.databaseUrl || "") !== String(config.databaseUrl || "")) {
     throw new Error("DATABASE_URL is different. Restart the server to switch database connections safely.");
   }
+  const nextAmbientValues = new Map(Object.keys(parsed).map((key) => [
+    key,
+    Object.hasOwn(activeEnvValues, key) ? activeEnvAmbientValues.get(key) : process.env[key]
+  ]));
+  for (const key of Object.keys(activeEnvValues)) {
+    if (!Object.hasOwn(parsed, key)) {
+      const ambientValue = activeEnvAmbientValues.get(key);
+      if (ambientValue === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = ambientValue;
+      }
+    }
+  }
   Object.assign(process.env, parsed);
+  activeEnvValues = parsed;
+  activeEnvAmbientValues = nextAmbientValues;
   replaceConfig(config, nextConfig);
   activeEnvFile = file;
   activeEnvPath = path.join(serverRoot, file);

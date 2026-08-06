@@ -1,6 +1,8 @@
 import crypto from "node:crypto";
 import { config, requireConfig } from "./config.js";
 import { query } from "./db.js";
+import { assertSandboxNetSuiteEnvironment } from "./mbt/netsuite-readonly-adapter.js";
+import { normalizeSalesOrderReconciliationType } from "./sales-order-reconciliation.js";
 
 let suiteqlQueue = Promise.resolve();
 let restMutationQueue = Promise.resolve();
@@ -38,6 +40,173 @@ async function netsuiteFetch(url, options = {}) {
     }
     throw error;
   }
+}
+
+const MBT_NETSUITE_READ_RESPONSE_LIMIT = 1024 * 1024;
+const MBT_NETSUITE_READ_ACCEPT_TYPES = new Set([
+  "application/json",
+  "application/schema+json"
+]);
+
+function mbtNetSuiteRecordBaseUrl() {
+  requireConfig(["netsuite.restBaseUrl", "netsuite.accountId"]);
+  const configured = String(config.netsuite.restBaseUrl || "").replace(/\/+$/, "");
+  const recordRoot = configured.endsWith("/record/v1")
+    ? configured
+    : `${configured}/record/v1`;
+  const accountId = String(config.netsuite.accountId || "");
+  const sandbox = assertSandboxNetSuiteEnvironment({
+    directAccessEnabled: config.netsuite.directAccessEnabled === true,
+    configuredAccountId: accountId,
+    runtimeAccountId: accountId,
+    sandboxAccountAllowlist: Array.isArray(config.netsuite.mbtSandboxAccountAllowlist)
+      ? config.netsuite.mbtSandboxAccountAllowlist
+      : [],
+    restBaseUrl: recordRoot
+  });
+  return new URL(`${sandbox.restBaseUrl}/`);
+}
+
+function mbtNetSuiteReadTarget(path) {
+  const base = mbtNetSuiteRecordBaseUrl();
+  const target = new URL(String(path || ""), base);
+  if (target.origin !== base.origin
+      || !target.pathname.startsWith(base.pathname)
+      || target.username
+      || target.password
+      || target.search
+      || target.hash) {
+    const error = new Error("The MBT NetSuite metadata path is outside the configured record service.");
+    error.code = "MBT_NETSUITE_READ_PATH_REFUSED";
+    error.status = 409;
+    throw error;
+  }
+  return target;
+}
+
+async function getUnexpiredMbtNetSuiteAccessToken() {
+  const result = await query(
+    "SELECT access_token, expires_at FROM netsuite_tokens WHERE id = 1"
+  );
+  const token = result.rows[0];
+  const accessToken = String(token?.access_token || "");
+  const expiresAt = token?.expires_at ? new Date(token.expires_at).getTime() : 0;
+  if (!accessToken || !expiresAt || expiresAt - Date.now() <= 120000) {
+    const error = new Error("An unexpired stored NetSuite access token is required for MBT readiness.");
+    error.code = "MBT_NETSUITE_TOKEN_UNAVAILABLE";
+    error.status = 502;
+    throw error;
+  }
+  return accessToken;
+}
+
+function mbtResponseTooLarge() {
+  const error = new Error("NetSuite returned an oversized MBT readiness response.");
+  error.code = "MBT_NETSUITE_RESPONSE_TOO_LARGE";
+  error.status = 502;
+  return error;
+}
+
+async function cancelResponseBody(response) {
+  try {
+    await response?.body?.cancel?.();
+  } catch {
+    // The connection is already closed or the stream is locked; the response
+    // is rejected either way and no evidence is persisted.
+  }
+}
+
+async function boundedMbtResponseText(response) {
+  const declaredLength = Number(response?.headers?.get?.("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > MBT_NETSUITE_READ_RESPONSE_LIMIT) {
+    await cancelResponseBody(response);
+    throw mbtResponseTooLarge();
+  }
+  const reader = response?.body?.getReader?.();
+  if (!reader) {
+    const fallback = await response.text();
+    if (Buffer.byteLength(fallback, "utf8") > MBT_NETSUITE_READ_RESPONSE_LIMIT) {
+      throw mbtResponseTooLarge();
+    }
+    return fallback;
+  }
+  const chunks = [];
+  let totalBytes = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    const chunk = Buffer.from(value);
+    totalBytes += chunk.byteLength;
+    if (totalBytes > MBT_NETSUITE_READ_RESPONSE_LIMIT) {
+      try {
+        await reader.cancel();
+      } catch {
+        // Rejecting the response is authoritative even if cancellation races
+        // the remote close.
+      }
+      throw mbtResponseTooLarge();
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks, totalBytes).toString("utf8");
+}
+
+/**
+ * Narrow OAuth-backed transport for MBT readiness. It accepts one explicit
+ * GET request shape and returns parsed response evidence; no generic NetSuite
+ * request or write capability crosses the MBT boundary.
+ *
+ * @param {{method?: unknown, path?: unknown, signal?: AbortSignal, accept?: unknown}} request
+ */
+export async function netSuiteReadOnlyGetTransport({ method, path, signal, accept = "application/json" } = {}) {
+  if (String(method || "").toUpperCase() !== "GET") {
+    const error = new Error("MBT NetSuite readiness permits GET requests only.");
+    error.code = "MBT_NETSUITE_READ_METHOD_REFUSED";
+    error.status = 409;
+    throw error;
+  }
+  const acceptedType = String(accept || "");
+  if (!MBT_NETSUITE_READ_ACCEPT_TYPES.has(acceptedType)) {
+    const error = new Error("MBT NetSuite readiness permits only approved JSON response types.");
+    error.code = "MBT_NETSUITE_READ_ACCEPT_REFUSED";
+    error.status = 409;
+    throw error;
+  }
+  const target = mbtNetSuiteReadTarget(path);
+  const accessToken = await getUnexpiredMbtNetSuiteAccessToken();
+  const response = await netsuiteFetch(target, {
+    method: "GET",
+    redirect: "error",
+    signal,
+    headers: {
+      "Authorization": `Bearer ${accessToken}`,
+      "Accept": acceptedType
+    }
+  });
+  if (response.redirected) {
+    const error = new Error("NetSuite redirected an MBT readiness metadata request.");
+    error.code = "MBT_NETSUITE_REDIRECT_REFUSED";
+    error.status = 502;
+    throw error;
+  }
+  const text = await boundedMbtResponseText(response);
+  let body = null;
+  if (text) {
+    try {
+      body = JSON.parse(text);
+    } catch {
+      body = text;
+    }
+  }
+  return {
+    status: response.status,
+    headers: { "content-type": response.headers.get("content-type") || "" },
+    body,
+    redirected: response.redirected === true,
+    url: response.url
+  };
 }
 
 function isConcurrencyLimit(status, text) {
@@ -1259,15 +1428,28 @@ function reconciliationSourceFilter({
   kind = "",
   modifiedSince = "2026-01-01",
   includeOpen = true,
-  targetOnly = false
+  targetOnly = false,
+  includeSalesOrders = true,
+  soOrderType = "all"
 } = {}) {
   const ids = positiveNetSuiteIds(orderIds);
   const cleanKind = String(kind || "").trim().toUpperCase();
-  const types = cleanKind === "PO"
-    ? ["PurchOrd"]
-    : cleanKind === "TO"
-      ? ["TrnfrOrd"]
-      : ["PurchOrd", "TrnfrOrd"];
+  const cleanSoOrderType = normalizeSalesOrderReconciliationType(soOrderType, "all");
+  if (!cleanSoOrderType) {
+    throw Object.assign(
+      new Error("Select Delivery or Pick-Up for Sales Order reconciliation."),
+      { status: 400 }
+    );
+  }
+  const types = cleanKind === "SO"
+    ? ["SalesOrd"]
+    : cleanKind === "PO"
+      ? ["PurchOrd"]
+      : cleanKind === "TO"
+        ? ["TrnfrOrd"]
+        : includeSalesOrders === false
+          ? ["PurchOrd", "TrnfrOrd"]
+          : ["SalesOrd", "PurchOrd", "TrnfrOrd"];
   const since = /^\d{4}-\d{2}-\d{2}$/.test(String(modifiedSince || ""))
     ? String(modifiedSince)
     : "2026-01-01";
@@ -1281,10 +1463,20 @@ function reconciliationSourceFilter({
         `UPPER(NVL(BUILTIN.DF(t.status), '')) LIKE '%PARTIALLY%'`
       ] : [])
     ];
+  const salesOrderTypeFilter = types.includes("SalesOrd")
+    && ["delivery", "pickup"].includes(cleanSoOrderType)
+    ? `AND (
+        t.type <> 'SalesOrd'
+        ${ids.length && !targetOnly ? `OR t.id IN (${ids.join(",")})` : ""}
+        OR UPPER(TRIM(NVL(BUILTIN.DF(t.custbody3), ''))) = '${cleanSoOrderType === "delivery" ? "DELIVERY" : "PICK-UP"}'
+      )`
+    : "";
   return {
     ids,
     types,
     sql: `t.type IN (${types.map((type) => `'${type}'`).join(",")})
+      ${types.includes("SalesOrd") ? excludedSalesOrderPrefixSql("t") : ""}
+      ${salesOrderTypeFilter}
       AND (${discovery.join("\n        OR ")})`
   };
 }
@@ -1593,7 +1785,7 @@ export function normalizePoToReconciliationLines(lines = [], kind = "") {
   });
 }
 
-async function fetchPoToReconciliationOrdersBatch(options = {}) {
+async function fetchScmReconciliationOrdersBatch(options = {}) {
   const filter = reconciliationSourceFilter(options);
   const rows = await suiteqlAll(`
     SELECT
@@ -1609,18 +1801,29 @@ async function fetchPoToReconciliationOrdersBatch(options = {}) {
       t.memo,
       t.foreigntotal,
       t.custbody4 AS expected_delivery_date,
-      CASE WHEN t.type = 'TrnfrOrd' THEN t.location ELSE NULL END AS source_location_id,
+      t.location AS order_location_id,
+      BUILTIN.DF(t.location) AS order_location,
+      t.custbody3 AS delivery_method_id,
+      BUILTIN.DF(t.custbody3) AS delivery_method,
+      CASE
+        WHEN t.type = 'TrnfrOrd' THEN t.location
+        WHEN t.type = 'SalesOrd' THEN NVL(tl.location, t.location)
+        ELSE NULL
+      END AS source_location_id,
       CASE
         WHEN t.type = 'TrnfrOrd' THEN BUILTIN.DF(t.location)
+        WHEN t.type = 'SalesOrd' THEN NVL(BUILTIN.DF(tl.location), BUILTIN.DF(t.location))
         ELSE BUILTIN.DF(t.entity)
       END AS source_location,
       CASE
         WHEN t.type = 'TrnfrOrd' THEN t.transferlocation
-        ELSE t.location
+        WHEN t.type = 'PurchOrd' THEN tl.location
+        ELSE NULL
       END AS destination_location_id,
       CASE
         WHEN t.type = 'TrnfrOrd' THEN BUILTIN.DF(t.transferlocation)
-        ELSE BUILTIN.DF(t.location)
+        WHEN t.type = 'PurchOrd' THEN BUILTIN.DF(tl.location)
+        ELSE NULL
       END AS destination_location,
       tl.id AS order_line_number,
       tl.uniquekey AS source_line_key,
@@ -1659,7 +1862,11 @@ async function fetchPoToReconciliationOrdersBatch(options = {}) {
   const orders = new Map();
   for (const row of rows) {
     const id = Number(row.id);
-    const kind = String(row.record_type) === "PurchOrd" ? "PO" : "TO";
+    const kind = String(row.record_type) === "SalesOrd"
+      ? "SO"
+      : String(row.record_type) === "PurchOrd"
+        ? "PO"
+        : "TO";
     if (!orders.has(id)) {
       orders.set(id, {
         id,
@@ -1675,6 +1882,10 @@ async function fetchPoToReconciliationOrdersBatch(options = {}) {
         memo: row.memo || "",
         foreignTotal: row.foreigntotal === null || row.foreigntotal === undefined ? null : Number(row.foreigntotal),
         expectedDeliveryDate: row.expected_delivery_date || null,
+        orderLocationId: Number(row.order_location_id) || null,
+        orderLocation: row.order_location || "",
+        deliveryMethodId: Number(row.delivery_method_id) || null,
+        deliveryMethod: row.delivery_method || "",
         sourceLocationId: Number(row.source_location_id) || null,
         sourceLocation: row.source_location || "",
         destinationLocationId: Number(row.destination_location_id) || null,
@@ -1688,7 +1899,7 @@ async function fetchPoToReconciliationOrdersBatch(options = {}) {
       orderLine: Number(row.order_line_number),
       doNotPrintLine: row.do_not_print_line,
       lineSequenceNumber: Number(row.line_sequence_number),
-      stage: kind === "PO" ? "receiving" : signedQuantity < 0 ? "outbound" : "receiving",
+      stage: kind === "PO" ? "receiving" : kind === "SO" ? "outbound" : signedQuantity < 0 ? "outbound" : "receiving",
       itemId: Number(row.item_id) || null,
       itemName: row.item_name || "",
       itemDescription: row.item_description || "",
@@ -1723,11 +1934,11 @@ async function fetchPoToReconciliationOrdersBatch(options = {}) {
 
 const RECONCILIATION_SOURCE_ID_CHUNK_SIZE = 800;
 
-export async function fetchPoToReconciliationOrdersFromNetSuite(options = {}) {
+export async function fetchScmReconciliationOrdersFromNetSuite(options = {}) {
   const ids = positiveNetSuiteIds(options.orderIds);
   if (options.targetOnly && !ids.length) return [];
   if (ids.length <= RECONCILIATION_SOURCE_ID_CHUNK_SIZE) {
-    return fetchPoToReconciliationOrdersBatch({ ...options, orderIds: ids });
+    return fetchScmReconciliationOrdersBatch({ ...options, orderIds: ids });
   }
 
   const orders = new Map();
@@ -1737,13 +1948,13 @@ export async function fetchPoToReconciliationOrdersFromNetSuite(options = {}) {
     }
   };
   if (!options.targetOnly) {
-    collect(await fetchPoToReconciliationOrdersBatch({
+    collect(await fetchScmReconciliationOrdersBatch({
       ...options,
       orderIds: []
     }));
   }
   for (let offset = 0; offset < ids.length; offset += RECONCILIATION_SOURCE_ID_CHUNK_SIZE) {
-    collect(await fetchPoToReconciliationOrdersBatch({
+    collect(await fetchScmReconciliationOrdersBatch({
       ...options,
       orderIds: ids.slice(offset, offset + RECONCILIATION_SOURCE_ID_CHUNK_SIZE),
       includeOpen: false,
@@ -1753,6 +1964,16 @@ export async function fetchPoToReconciliationOrdersFromNetSuite(options = {}) {
   return [...orders.values()].sort((left, right) =>
     left.kind.localeCompare(right.kind) || left.id - right.id
   );
+}
+
+// Compatibility export for the existing PO/TO callers. The generic fetcher
+// adds SO only when the caller requests SO or leaves kind unscoped.
+export async function fetchPoToReconciliationOrdersFromNetSuite(options = {}) {
+  const rows = await fetchScmReconciliationOrdersFromNetSuite({
+    ...options,
+    includeSalesOrders: false
+  });
+  return rows.filter((order) => order.kind === "PO" || order.kind === "TO");
 }
 
 export function normalizePoToLinkedTransactionRows(rows = []) {

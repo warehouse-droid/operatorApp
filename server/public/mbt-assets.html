@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MBT Asset Registry · MBBS Operations</title>
+    <link rel="stylesheet" href="/mbt-shell.css" />
+  </head>
+  <body data-mbt-surface="assets">
+    <main id="mbtApp" class="dispatch-shell mbt-shell" aria-labelledby="mbtTitle">
+      <header class="mbt-app-topbar">
+        <div class="mbt-app-brand">
+          <span class="mbt-app-mark" aria-hidden="true">BA</span>
+          <div>
+            <p>MBT Bin Operations · Local asset evidence</p>
+            <h1 id="mbtTitle">Bin asset registry</h1>
+          </div>
+        </div>
+        <span class="mbt-app-mode">Append-only evidence</span>
+      </header>
+      <p class="mbt-lead">
+        Register opening assets, review current state and append-only timeline,
+        and retain manual reconciliation evidence without changing the original ledger.
+      </p>
+
+      <section class="mbt-status" aria-live="polite" aria-busy="true" data-tone="safe">
+        <h2>Loading asset registry</h2>
+        <p>Checking your live authority and retained local evidence.</p>
+      </section>
+
+      <section class="mbt-panel" aria-labelledby="assetRegistryTitle">
+        <div class="mbt-panel-heading">
+          <div>
+            <h2 id="assetRegistryTitle">Asset registry and current state</h2>
+            <p>Search by asset code, Bin item, current address, or lifecycle status. Inactivate is reversible; Delete is limited to an unused opening registration.</p>
+          </div>
+          <button id="assetReload" type="button">Reload</button>
+        </div>
+        <form id="assetSearchForm" class="mbt-form-row" role="search">
+          <label for="assetSearch">Search assets</label>
+          <input id="assetSearch" name="query" type="search" autocomplete="off" />
+          <button type="submit">Search</button>
+        </form>
+        <p id="assetListMessage" class="mbt-inline-message" aria-live="polite"></p>
+        <div class="mbt-table-wrap" tabindex="0" aria-label="Asset registry table">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Asset</th>
+                <th scope="col">Bin item</th>
+                <th scope="col">Current state</th>
+                <th scope="col">Current address</th>
+                <th scope="col">Revision</th>
+                <th scope="col">Action</th>
+              </tr>
+            </thead>
+            <tbody id="assetRows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <div class="mbt-grid mbt-grid-two">
+        <section class="mbt-panel" aria-labelledby="registerAssetTitle">
+          <h2 id="registerAssetTitle">Manual opening registration</h2>
+          <p>
+            Registration commits the asset, sequence-1 movement, current state,
+            audit, and receipt together. IDs must reference active local master data.
+          </p>
+          <form id="assetRegistrationForm" class="mbt-form-stack">
+            <label for="assetCode">Asset code</label>
+            <input id="assetCode" name="assetCode" required maxlength="160" />
+            <label for="assetItemCode">Bin item</label>
+            <select id="assetItemCode" name="itemCode" required disabled>
+              <option value="">Loading active Bin items…</option>
+            </select>
+            <label for="assetCurrentLocationId">Current address</label>
+            <select id="assetCurrentLocationId" name="currentLocationId" disabled>
+              <option value="">Loading known local addresses…</option>
+            </select>
+            <label for="assetCurrentAddress">Or enter a customer-site address</label>
+            <input id="assetCurrentAddress" name="currentAddress" maxlength="500" autocomplete="street-address" placeholder="Street, city, province, postal code" />
+            <label for="assetOccurredAt">Opening inventory time</label>
+            <input id="assetOccurredAt" name="occurredAt" type="datetime-local" required />
+            <button type="submit">Register asset atomically</button>
+          </form>
+          <p id="assetRegistrationMessage" class="mbt-inline-message" aria-live="polite"></p>
+        </section>
+
+        <section class="mbt-panel" aria-labelledby="assetTimelineTitle">
+          <h2 id="assetTimelineTitle">Append-only timeline</h2>
+          <p id="assetTimelineSummary">Select an asset to inspect every movement.</p>
+          <ol id="assetTimeline" class="mbt-timeline"></ol>
+        </section>
+      </div>
+
+      <section class="mbt-panel" aria-labelledby="openingInventoryTitle">
+        <h2 id="openingInventoryTitle">CSV opening inventory and reconciliation</h2>
+        <p>
+          CSV opening inventory uses the shared server-owned Preview and Apply workflow.
+          Manual movement comparison retains independent application and manual snapshots;
+          a variance decision never edits an original movement.
+        </p>
+        <p>
+          <a id="assetCsvTemplate" href="/api/mbt/assets/import/template" download>
+            Download asset CSV template
+          </a>
+        </p>
+        <div class="mbt-form-row">
+          <label for="assetCsvFile">Opening inventory CSV</label>
+          <input id="assetCsvFile" type="file" accept=".csv,text/csv" />
+          <button id="assetCsvPreview" type="button" disabled>Preview on server</button>
+        </div>
+        <p id="assetReconciliationMessage" class="mbt-inline-message" aria-live="polite">
+          Server preview is required before any CSV row can be applied.
+        </p>
+        <div class="mbt-table-wrap" tabindex="0" aria-label="Asset CSV server preview">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Row</th>
+                <th scope="col">Asset</th>
+                <th scope="col">Bin item</th>
+                <th scope="col">Current address</th>
+                <th scope="col">Opening state</th>
+                <th scope="col">Movement time</th>
+              </tr>
+            </thead>
+            <tbody id="assetCsvPreviewRows">
+              <tr><td colspan="6">Choose a CSV file to create a private server preview.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="mbt-form-row">
+          <label for="assetCsvReason">Import note (optional)</label>
+          <textarea id="assetCsvReason" rows="2" placeholder="Add context only when useful"></textarea>
+          <button id="assetCsvApply" type="button" disabled>Apply preview atomically</button>
+        </div>
+      </section>
+    </main>
+    <script src="/app-sidebar.js"></script>
+    <script src="/mbt-assets.js" type="module"></script>
+  </body>
+</html>

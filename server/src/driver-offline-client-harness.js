@@ -77,8 +77,8 @@ const routeProtectionStateSource = sourceSection(
 );
 assert.match(
   routeProtectionStateSource,
-  /offlineStorageAvailable[\s\S]*driverIdentityValidated[\s\S]*offlinePartition\?\.partitionKey[\s\S]*offlineManifest\?\.manifestId[\s\S]*routeManifestExpired\(\)/,
-  "The visible action gate must require usable local storage, the authenticated partition, and a current unexpired manifest."
+  /offlineStorageAvailable[\s\S]*driverIdentityValidated[\s\S]*offlinePartition\?\.partitionKey[\s\S]*offlineShellReady[\s\S]*offlineManifest\?\.manifestId[\s\S]*offlineManifest\.complete[\s\S]*routeManifestExpired\(\)/,
+  "The visible action gate must require local storage, the authenticated partition, a controlled app shell, and a complete current manifest."
 );
 assert.match(
   routeProtectionStateSource,
@@ -447,16 +447,16 @@ const markUploadedStart = offlineDbSource.indexOf("async function markPhotoUploa
 const markUploadedEnd = offlineDbSource.indexOf("async function markPhotoError", markUploadedStart);
 const markUploadedSource = offlineDbSource.slice(markUploadedStart, markUploadedEnd);
 assert.match(markUploadedSource, /status: "uploaded_unverified"/);
-assert.doesNotMatch(markUploadedSource, /blob:\s*null/, "Upload acknowledgement alone must retain photo evidence.");
+assert.doesNotMatch(markUploadedSource, /blobBytes:\s*null/, "Upload acknowledgement alone must retain photo evidence.");
 assert.match(
   offlineDbSource,
-  /const durable = Boolean\([\s\S]{0,800}blob: durable \? null : existing\.blob/,
-  "A local photo Blob may be removed only after a durable server receipt."
+  /const durable = Boolean\([\s\S]{0,800}blobBytes: durable \? null : existing\.blobBytes/,
+  "Local photo bytes may be removed only after a durable server receipt."
 );
 assert.match(
   offlineDbSource,
   /const verificationFailed[\s\S]{0,240}objectReference: verificationFailed[\s\S]{0,80}\? null/,
-  "Failed readback must clear the upload reference so the retained Blob can be re-uploaded."
+  "Failed readback must clear the upload reference so the retained photo bytes can be re-uploaded."
 );
 assert.match(
   offlineDbSource,
@@ -477,7 +477,7 @@ assert.ok(
     && saveDraftSource.indexOf("const photos = await getAll(store)")
       < saveDraftSource.indexOf("nextBytes > MAX_EVIDENCE_BYTES")
     && saveDraftSource.indexOf("nextBytes > MAX_EVIDENCE_BYTES")
-      < saveDraftSource.indexOf("store.put(record)"),
+      < saveDraftSource.indexOf("putPhotoRecord(store, record)"),
   "The evidence cap must be checked and written atomically in one IndexedDB transaction."
 );
 assert.match(
@@ -487,7 +487,7 @@ assert.match(
 );
 assert.match(
   saveDraftSource,
-  /const replacementIds = new Set\(\[[\s\S]*slotReplacements\.map\(\(candidate\) => candidate\.photoId\)[\s\S]*store\.put\(record\);[\s\S]*for \(const replacementId of replacementIds\)[\s\S]*store\.delete\(replacementId\)/,
+  /const replacementIds = new Set\(\[[\s\S]*slotReplacements\.map\(\(candidate\) => candidate\.photoId\)[\s\S]*putPhotoRecord\(store, record\);[\s\S]*for \(const replacementId of replacementIds\)[\s\S]*store\.delete\(replacementId\)/,
   "Saving a draft slot must replace all unbound duplicates after writing the new record."
 );
 assert.match(
@@ -556,8 +556,8 @@ assert.match(
 );
 assert.match(
   photoChangeSource,
-  /if \(isDvir\) dvirPhotos\[index\] = captured;[\s\S]*else \{[\s\S]*photos\[index\] = captured;[\s\S]*photoPromptOpen = true;[\s\S]*renderJob\(\);/,
-  "A completed capture must write to the current photo array and keep the job photo modal open."
+  /if \(isDvir\) dvirPhotos\[index\] = captured;[\s\S]*else \{[\s\S]*photos\[index\] = captured;[\s\S]*photoPromptOpen = !isDriverBinJob\(\);[\s\S]*renderJob\(\);/,
+  "A completed capture must update the current photo array, preserving the ordinary photo modal while BIN evidence stays inline."
 );
 assert.doesNotMatch(
   photoChangeSource,
@@ -572,8 +572,8 @@ assert.match(
 
 const cameraInputs = driverSource.match(/<input[^>]*data-photo-source="camera"[^>]*>/g) || [];
 const galleryInputs = driverSource.match(/<input[^>]*data-photo-source="gallery"[^>]*>/g) || [];
-assert.equal(cameraInputs.length, 2, "Job and DVIR photo slots must each retain a camera input.");
-assert.equal(galleryInputs.length, 2, "Job and DVIR photo slots must each expose a gallery input.");
+assert.equal(cameraInputs.length, 3, "Ordinary job, BIN evidence, and DVIR slots must each retain a camera input.");
+assert.equal(galleryInputs.length, 3, "Ordinary job, BIN evidence, and DVIR slots must each expose a gallery input.");
 assert.ok(cameraInputs.every((input) => /\bcapture=/.test(input)), "Camera inputs must retain the mobile capture hint.");
 assert.ok(galleryInputs.every((input) => !/\bcapture=/.test(input)), "Gallery inputs must omit capture so the native library can open.");
 assert.match(
@@ -908,6 +908,181 @@ assert.match(
   /function authoritativeJobChanged[\s\S]*previousFingerprint[\s\S]*authoritative\.fingerprint[\s\S]*previousContent[\s\S]*authoritative\.contentFingerprint[\s\S]*comparableJobDetails/,
   "Online route checks must compare both fingerprints and a full stop-detail fallback."
 );
+const routeReconciliationSource = sourceSection(
+  driverSource,
+  "const DRIVER_ROUTE_RECONCILIATION = Object.freeze({",
+  "function jobEventRequiresManifestIdentity("
+);
+const buildRouteReconciliationHarness = new Function(
+  "manifestJobFor",
+  "comparableJobDetails",
+  "jobIsComplete",
+  `${routeReconciliationSource}\nreturn { classifyAuthoritativeRoute };`
+);
+let routeReconciliationManifest = null;
+const { classifyAuthoritativeRoute } = buildRouteReconciliationHarness(
+  (jobId) => (routeReconciliationManifest?.jobs || []).find((job) => String(job.jobId) === String(jobId)) || null,
+  (job) => ({
+    jobId: job?.jobId || "",
+    planId: job?.planId ?? null,
+    planDate: job?.planDate || "",
+    stopId: job?.stopId || "",
+    address: job?.address || "",
+    requiredPhotos: Number(job?.requiredPhotos || 0)
+  }),
+  (job) => ["complete", "completed", "done"].includes(String(job?.status || "").toLowerCase())
+);
+routeReconciliationManifest = {
+  manifestId: "manifest-sety-r41",
+  planId: 208,
+  planDate: "2026-08-05",
+  planRevision: 41,
+  jobs: [
+    {
+      jobId: "sety-pickup",
+      planId: 208,
+      planDate: "2026-08-05",
+      status: "in_progress",
+      fingerprint: "pickup-fingerprint",
+      predecessorFingerprint: "route-start",
+      stopId: "pickup-stop",
+      address: "12441 Woodbine Ave",
+      requiredPhotos: 2
+    },
+    {
+      jobId: "sety-dropoff",
+      planId: 208,
+      planDate: "2026-08-05",
+      status: "pending",
+      fingerprint: "dropoff-fingerprint",
+      predecessorFingerprint: "pickup-fingerprint",
+      stopId: "dropoff-stop",
+      address: "8821 Weston Rd",
+      requiredPhotos: 2
+    },
+    {
+      jobId: "sety-later-stop",
+      planId: 208,
+      planDate: "2026-08-05",
+      status: "pending",
+      fingerprint: "later-fingerprint",
+      predecessorFingerprint: "dropoff-fingerprint",
+      stopId: "later-stop",
+      address: "Later",
+      requiredPhotos: 0
+    }
+  ]
+};
+const setyLocalSuccessor = { ...routeReconciliationManifest.jobs[1] };
+const setyAuthoritativePredecessor = {
+  job: { ...routeReconciliationManifest.jobs[0] },
+  routeBootstrap: {
+    currentJobFingerprint: "pickup-fingerprint",
+    predecessorFingerprint: "route-start"
+  }
+};
+const completionEvent = (status, overrides = {}) => ({
+  eventId: `completion-${status}`,
+  eventType: "job_completed",
+  jobId: "sety-pickup",
+  effectiveJobId: "sety-pickup",
+  status,
+  ...overrides
+});
+for (const status of ["pending", "registered", "waiting_photos", "foreground_pending", "receipt_pending"]) {
+  assert.equal(
+    classifyAuthoritativeRoute(setyLocalSuccessor, setyAuthoritativePredecessor, {
+      manifest: routeReconciliationManifest,
+      events: [completionEvent(status)],
+      dispatchRouteChanged: false
+    }),
+    "local_progress_pending",
+    `${status} predecessor completion must preserve Sety's locally projected successor.`
+  );
+}
+for (const status of ["review_required", "blocked", "resolution_pending"]) {
+  assert.equal(
+    classifyAuthoritativeRoute(setyLocalSuccessor, setyAuthoritativePredecessor, {
+      manifest: routeReconciliationManifest,
+      events: [completionEvent(status)],
+      dispatchRouteChanged: false
+    }),
+    "local_progress_review",
+    `${status} predecessor completion must stop local progress for review without claiming Dispatch changed the route.`
+  );
+}
+assert.equal(
+  classifyAuthoritativeRoute(setyLocalSuccessor, setyAuthoritativePredecessor, {
+    manifest: routeReconciliationManifest,
+    events: [completionEvent("waiting_photos")],
+    dispatchRouteChanged: true
+  }),
+  "dispatch_route_changed",
+  "A real plan revision must take precedence over a same-device pending completion."
+);
+assert.equal(
+  classifyAuthoritativeRoute(setyLocalSuccessor, setyAuthoritativePredecessor, {
+    manifest: routeReconciliationManifest,
+    events: [],
+    dispatchRouteChanged: false
+  }),
+  "server_execution_changed",
+  "A different server stop without a local completion bridge must be reported as unexplained server movement."
+);
+assert.equal(
+  classifyAuthoritativeRoute(setyLocalSuccessor, setyAuthoritativePredecessor, {
+    manifest: routeReconciliationManifest,
+    events: [completionEvent("applied")],
+    dispatchRouteChanged: false
+  }),
+  "server_execution_changed",
+  "An already-applied completion cannot justify preserving a divergent local successor."
+);
+assert.equal(
+  classifyAuthoritativeRoute(setyLocalSuccessor, setyAuthoritativePredecessor, {
+    manifest: routeReconciliationManifest,
+    events: [completionEvent("waiting_photos", { reviewRequired: true })],
+    dispatchRouteChanged: false
+  }),
+  "local_progress_review",
+  "An explicit review flag must override an otherwise retryable completion status."
+);
+const completedBaseManifest = {
+  ...routeReconciliationManifest,
+  jobs: routeReconciliationManifest.jobs.map((job, index) => index === 0 ? { ...job, status: "completed" } : job)
+};
+routeReconciliationManifest = completedBaseManifest;
+assert.equal(
+  classifyAuthoritativeRoute(setyLocalSuccessor, setyAuthoritativePredecessor, {
+    manifest: completedBaseManifest,
+    events: [],
+    dispatchRouteChanged: false
+  }),
+  "server_execution_changed",
+  "Completed base manifest rows without a retained completion event cannot fabricate a local-progress bridge."
+);
+routeReconciliationManifest = {
+  ...completedBaseManifest,
+  jobs: completedBaseManifest.jobs.map((job, index) => index === 0 ? { ...job, status: "in_progress" } : job)
+};
+assert.equal(
+  classifyAuthoritativeRoute(routeReconciliationManifest.jobs[2], setyAuthoritativePredecessor, {
+    manifest: routeReconciliationManifest,
+    events: [completionEvent("waiting_photos")],
+    dispatchRouteChanged: false
+  }),
+  "server_execution_changed",
+  "A pending predecessor completion cannot skip an incomplete intervening stop."
+);
+assert.equal(
+  classifyAuthoritativeRoute(routeReconciliationManifest.jobs[0], setyAuthoritativePredecessor, {
+    manifest: routeReconciliationManifest,
+    events: [],
+    dispatchRouteChanged: false
+  }),
+  "unchanged",
+  "Matching authoritative and local stops must remain unchanged."
+);
 const onlineRevalidationSource = driverSource.slice(
   driverSource.indexOf("async function revalidateOnlineRoute"),
   driverSource.indexOf("function captureQuietSyncContext")
@@ -921,6 +1096,21 @@ assert.match(
   onlineRevalidationSource,
   /protectedInteraction[\s\S]*requestedActivation[\s\S]*onlineRouteUpdatePending = true[\s\S]*return false/,
   "A changed stop must be held without replacing an active rest or photo screen."
+);
+assert.match(
+  onlineRevalidationSource,
+  /local_progress_pending[\s\S]*Previous stop saved locally[\s\S]*photos are still synchronizing[\s\S]*return true/,
+  "A same-plan pending completion must keep the local successor actionable and explain that photo sync is still running."
+);
+assert.match(
+  onlineRevalidationSource,
+  /local_progress_review[\s\S]*needs Dispatch review[\s\S]*return false/,
+  "A reviewed predecessor completion must block the successor with review wording rather than a false route-change warning."
+);
+assert.match(
+  onlineRevalidationSource,
+  /server_execution_changed[\s\S]*server is on a different stop/,
+  "Unexplained server movement must use neutral server-state wording instead of blaming Dispatch."
 );
 for (const [start, end, label] of [
   ['if (action === "start-job"', 'if (action === "confirm-truck-switch"', "Job start"],
@@ -1068,11 +1258,19 @@ assert.match(
   driverSource,
   /lastError \? t\("driver\.retrySync", "Retry sync"\) : t\("driver\.syncNow", "Sync now"\)/
 );
-assert.match(driverHtml, /driver-offline-db\.js\?v=20260801-immutable-payload-v1/);
-assert.match(driverHtml, /driver-offline-sync\.js\?v=20260801-driver-chinese-v1/);
-assert.match(driverWorker, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v15`/);
-assert.match(driverWorker, /driver-offline-db\.js\?v=20260801-immutable-payload-v1/);
-assert.match(driverWorker, /driver-offline-sync\.js\?v=20260801-driver-chinese-v1/);
+assert.match(driverHtml, /driver-offline-db\.js\?v=20260805-online-mode-v3/);
+assert.match(driverHtml, /driver-photo-hash\.js\?v=20260805-online-mode-v3/);
+assert.match(driverHtml, /driver-offline-photos\.js\?v=20260805-online-mode-v3/);
+assert.match(driverHtml, /driver-offline-sync\.js\?v=20260805-online-mode-v3/);
+assert.match(driverHtml, /driver-bin-ui\.js\?v=20260803-bin-pwa-v1/);
+assert.match(driverHtml, /driver\.js\?v=20260805-online-mode-v3/);
+assert.match(driverWorker, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v19`/);
+assert.match(driverWorker, /driver-offline-db\.js\?v=20260805-online-mode-v3/);
+assert.match(driverWorker, /driver-photo-hash\.js\?v=20260805-online-mode-v3/);
+assert.match(driverWorker, /driver-offline-photos\.js\?v=20260805-online-mode-v3/);
+assert.match(driverWorker, /driver-offline-sync\.js\?v=20260805-online-mode-v3/);
+assert.match(driverWorker, /driver-bin-ui\.js\?v=20260803-bin-pwa-v1/);
+assert.match(driverWorker, /driver\.js\?v=20260805-online-mode-v3/);
 assert.match(
   offlineSyncSource,
   /if \(!response\.ok\)[\s\S]*error\.status = response\.status;[\s\S]*error\.code = String\(payload\.code \|\| ""\)/,

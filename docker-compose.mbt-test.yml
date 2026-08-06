@@ -1,0 +1,173 @@
+name: mbbs-mbt-p1-test
+
+x-test-environment: &test-environment
+  NODE_ENV: test
+  MBT_TEST_ISOLATED: "1"
+  MBBS_ENV_FILE: .env.mbt-test-does-not-exist
+  PORT: "3000"
+  APP_BASE_URL: http://app:3000
+  MBBS_REPO_ROOT: /workspace
+  DATABASE_URL: postgres://mbt_test:mbt_test_password@db:5432/mbt_test
+  MBT_ENABLED: "true"
+  MBT_CUSTOMER_SYNC_ENABLED: "false"
+  MBT_MASTER_DATA_ENABLED: "false"
+  MBT_ASSET_MANAGEMENT_ENABLED: "false"
+  MBT_FRONTDESK_OPERATIONS_ENABLED: "false"
+  MBT_BIN_DISPATCH_ENABLED: "false"
+  MBT_DRIVER_EXECUTION_ENABLED: "false"
+  MBT_BILLING_OPERATIONS_ENABLED: "false"
+  MBT_NETSUITE_WRITES_ENABLED: "false"
+  NETSUITE_ACCOUNT_ID: ""
+  NETSUITE_CLIENT_ID: ""
+  NETSUITE_CLIENT_SECRET: ""
+  NETSUITE_DIRECT_ACCESS_ENABLED: "false"
+  NETSUITE_MIRROR_ROLE: disabled
+  NETSUITE_MIRROR_SHARED_SECRET: ""
+  SMART_SCM_LIVE_EXECUTION_ENABLED: "false"
+  SMART_SCM_PICKING_TICKET_RESTLET_URL: ""
+  SAMSARA_API_TOKEN: ""
+  SAMSARA_WRITES_ENABLED: "false"
+  GOOGLE_MAPS_API_KEY: ""
+  PHOTO_UPLOAD_PROVIDER: local_data_url
+  PHOTO_UPLOAD_TOKEN_SECRET: ""
+  PHOTO_UPLOAD_WORKER_URL: ""
+  SALES_PUBLIC_ACCESS_ENABLED: "false"
+  OLLAMA_BASE_URL: http://127.0.0.1:9
+
+x-test-service: &test-service
+  image: mbbs-mbt-p1-test-test:latest
+  build:
+    context: ./server
+    dockerfile: Dockerfile.test
+    target: test-base
+  environment: *test-environment
+  depends_on:
+    db:
+      condition: service_healthy
+  networks:
+    - mbt_test_internal
+  read_only: true
+  tmpfs:
+    - /app/data:uid=1000,gid=1000,mode=0700
+    - /tmp:uid=1000,gid=1000,mode=1777
+  volumes:
+    - ./server/test-artifacts:/app/test-artifacts
+    - ./.github/workflows:/workspace/.github/workflows:ro
+    - ./docker-compose.mbt-test.yml:/workspace/docker-compose.mbt-test.yml:ro
+  restart: "no"
+
+services:
+  db:
+    image: postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+    environment:
+      POSTGRES_DB: mbt_test
+      POSTGRES_USER: mbt_test
+      POSTGRES_PASSWORD: mbt_test_password
+      PGDATA: /var/lib/postgresql/data
+    networks:
+      - mbt_test_internal
+    tmpfs:
+      - /var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mbt_test -d mbt_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: "no"
+
+  migrate:
+    <<: *test-service
+    command: ["npm", "run", "migrate"]
+    profiles: ["tools"]
+
+  test:
+    <<: *test-service
+    command: ["npm", "run", "test:mbt"]
+    profiles: ["tools"]
+
+  mutation:
+    <<: *test-service
+    image: mbbs-mbt-p1-test-mutation:latest
+    command: ["npm", "run", "mutate:mbt"]
+    read_only: false
+    profiles: ["tools"]
+
+  mutation-p3:
+    <<: *test-service
+    image: mbbs-mbt-p1-test-mutation-p3:latest
+    build:
+      context: ./server
+      dockerfile: Dockerfile.test
+      target: test-e2e
+    command: ["npm", "run", "mutate:mbt:p3:extended"]
+    read_only: false
+    profiles: ["tools"]
+
+  baseline:
+    <<: *test-service
+    command: ["npm", "run", "test:baseline:mbt:full"]
+    environment:
+      <<: *test-environment
+      MBBS_REPO_ROOT: /workspace
+      MBBS_SERVER_ROOT: /app
+    volumes:
+      - ./server/test-artifacts:/app/test-artifacts
+      - ./docker-compose.v2.yml:/workspace/docker-compose.v2.yml:ro
+      - ./docker/v2.env.example:/workspace/docker/v2.env.example:ro
+    profiles: ["tools"]
+
+  app:
+    <<: *test-service
+    image: mbbs-mbt-p1-runtime-check:latest
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    command: ["npm", "start"]
+    environment:
+      <<: *test-environment
+      NODE_ENV: "production"
+      MBT_ENABLED: "false"
+      MBT_NETSUITE_WRITES_ENABLED: "false"
+    networks:
+      mbt_test_internal:
+        aliases:
+          - mbt-web
+    volumes:
+      - ./server/test-artifacts:/app/test-artifacts
+    profiles: ["runtime"]
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:3000/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  e2e:
+    <<: *test-service
+    image: mbbs-mbt-p1-test-e2e:latest
+    build:
+      context: ./server
+      dockerfile: Dockerfile.test
+      target: test-e2e
+    command: ["npm", "run", "test:mbt:e2e"]
+    environment:
+      <<: *test-environment
+      MBT_TEST_BASE_URL: http://127.0.0.1:3100
+      MBT_TEST_TRUSTED_PROXY_TARGET: http://mbt-web:3000
+      MBT_TEST_TRUSTED_PROXY_PORT: "3100"
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+    depends_on:
+      app:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    volumes:
+      - ./server/test-artifacts:/app/test-artifacts
+    profiles: ["e2e"]
+
+networks:
+  mbt_test_internal:
+    internal: true

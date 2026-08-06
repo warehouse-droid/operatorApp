@@ -191,6 +191,7 @@ function normalizedTargetLine({ targetRef, kind, sourceRef, item = null, line })
     sku: line.sku || item?.sku || line.item_name || "",
     description: line.item_description || item?.description || "",
     itemType: line.item_type || "",
+    itemTypeText: line.item_type_text || "",
     unit: line.unit || item?.unit || "",
     quantity: quantities.quantity,
     shortageQuantity: Math.max(shortage, 0),

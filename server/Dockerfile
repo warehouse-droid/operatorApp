@@ -8,9 +8,12 @@ RUN npm ci --omit=dev && npm cache clean --force
 
 COPY migrations ./migrations
 COPY netsuite-smart-scm-picking-ticket-restlet.js ./
+COPY netsuite-order-webhook-user-event.js ./
+COPY netsuite-order-webhook-user-event-direct.js ./
 COPY netsuite-order-webhook-scheduled.js ./
 COPY public ./public
 COPY src ./src
+COPY tools/mbt-predeploy-readiness.mjs ./tools/mbt-predeploy-readiness.mjs
 
 RUN mkdir -p /app/data && chown -R node:node /app
 

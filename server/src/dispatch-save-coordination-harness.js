@@ -10,6 +10,254 @@ function sourceSlice(startMarker, endMarker, description = startMarker) {
   return source.slice(start, end);
 }
 
+const catalogStructureSource = sourceSlice(
+  "function catalogStructureConflictsWithSavedPlan",
+  "function splitSiblingsForOrder",
+  "saved-plan catalog structure guard"
+);
+const catalogStructureConflictsWithSavedPlan = Function(
+  `"use strict"; ${catalogStructureSource}; return catalogStructureConflictsWithSavedPlan;`
+)();
+const historicalPlan = {
+  id: 36,
+  planDate: "2026-07-10",
+  orders: [
+    { id: "SOA04857", type: "SO" },
+    { id: "SOA04893", type: "SO" },
+    { id: "SOB114411", type: "SO" }
+  ]
+};
+assert.equal(
+  catalogStructureConflictsWithSavedPlan({
+    id: "GOA-4857-4893",
+    type: "SO",
+    childOrders: ["SOA04857", "SOA04893"],
+    dispatchSnapshotSourcePlanId: "52",
+    dispatchSnapshotSourcePlanDate: "2026-07-16"
+  }, historicalPlan),
+  true,
+  "A group copied from a later plan must not replace normal orders in a historical saved plan."
+);
+assert.equal(
+  catalogStructureConflictsWithSavedPlan({
+    id: "SOA04857-S1",
+    type: "SO",
+    originalOrderId: "SOA04857",
+    dispatchSnapshotSourcePlanId: "52",
+    dispatchSnapshotSourcePlanDate: "2026-07-16"
+  }, historicalPlan),
+  true,
+  "A split copied from another plan must not replace its normal parent in a historical saved plan."
+);
+assert.equal(
+  catalogStructureConflictsWithSavedPlan({
+    id: "GOA-4857-4893",
+    type: "SO",
+    childOrders: ["SOA04857", "SOA04893"],
+    dispatchSnapshotSourcePlanId: "36",
+    dispatchSnapshotSourcePlanDate: "2026-07-10"
+  }, historicalPlan),
+  false,
+  "Structure sourced from the loaded plan itself must remain eligible for restoration."
+);
+assert.equal(
+  catalogStructureConflictsWithSavedPlan({
+    id: "GO-UNRELATED",
+    type: "SO",
+    childOrders: ["SO-NEW-A", "SO-NEW-B"],
+    dispatchSnapshotSourcePlanId: "52"
+  }, historicalPlan),
+  false,
+  "An unrelated catalog structure must still be available in the order pool."
+);
+assert.equal(
+  catalogStructureConflictsWithSavedPlan({ id: "SO-NEW", type: "SO" }, historicalPlan),
+  false,
+  "Ordinary catalog orders must continue to merge into a saved plan."
+);
+assert.equal(
+  catalogStructureConflictsWithSavedPlan({
+    id: "GO-LOCAL-DRAFT",
+    type: "SO",
+    childOrders: ["SOA04857", "SOA04893"]
+  }, historicalPlan),
+  false,
+  "A local group without foreign snapshot provenance must remain eligible for an intentional grouping."
+);
+for (let index = 0; index < 25; index += 1) {
+  const savedRef = `SO-SAVED-${index}`;
+  const generatedPlan = { id: `PLAN-${index}`, orders: [{ id: savedRef }] };
+  assert.equal(
+    catalogStructureConflictsWithSavedPlan({
+      id: `GROUP-${index}`,
+      childOrders: [savedRef],
+      dispatchSnapshotSourcePlanId: `OTHER-${index}`
+    }, generatedPlan),
+    true,
+    "Every foreign group that overlaps a saved normal order must be rejected."
+  );
+  assert.equal(
+    catalogStructureConflictsWithSavedPlan({
+      id: `GROUP-DISJOINT-${index}`,
+      childOrders: [`SO-OTHER-${index}`],
+      dispatchSnapshotSourcePlanId: `OTHER-${index}`
+    }, generatedPlan),
+    false,
+    "Foreign structures disjoint from the saved plan must remain mergeable."
+  );
+}
+const mutationFixtures = [
+  {
+    catalogOrder: {
+      id: "GOA-4857-4893",
+      childOrders: ["SOA04857", "SOA04893"],
+      dispatchSnapshotSourcePlanId: "52"
+    },
+    savedPlan: historicalPlan,
+    expected: true
+  },
+  {
+    catalogOrder: {
+      id: "SOA04857-S1",
+      originalOrderId: "SOA04857",
+      dispatchSnapshotSourcePlanId: "52"
+    },
+    savedPlan: historicalPlan,
+    expected: true
+  },
+  {
+    catalogOrder: {
+      id: "GOA-4857-4893",
+      childOrders: ["SOA04857", "SOA04893"],
+      dispatchSnapshotSourcePlanId: "36"
+    },
+    savedPlan: historicalPlan,
+    expected: false
+  },
+  {
+    catalogOrder: { id: "GO-LOCAL-DRAFT", childOrders: ["SOA04857"] },
+    savedPlan: historicalPlan,
+    expected: false
+  }
+];
+const catalogStructureMutants = [
+  [
+    "accept group overlap",
+    [
+      "if (groupedRefs.some((ref) => savedOrderIds.has(ref))) return true;",
+      "if (false) return true;"
+    ]
+  ],
+  [
+    "accept split-parent overlap",
+    [
+      "return Boolean(parentRef && savedOrderIds.has(parentRef));",
+      "return false;"
+    ]
+  ],
+  [
+    "reject the loaded plan's own structure",
+    ["sourcePlanId === savedPlanId", "sourcePlanId !== savedPlanId"]
+  ],
+  [
+    "treat local drafts as foreign",
+    [
+      "if (!sourcePlanId || !savedPlanId || sourcePlanId === savedPlanId) return false;",
+      "if (!savedPlanId || sourcePlanId === savedPlanId) return false;"
+    ]
+  ]
+];
+for (const [name, [before, after]] of catalogStructureMutants) {
+  const mutantSource = catalogStructureSource.replace(before, after);
+  assert.notEqual(mutantSource, catalogStructureSource, `Mutation setup failed: ${name}`);
+  const mutant = Function(`"use strict"; ${mutantSource}; return catalogStructureConflictsWithSavedPlan;`)();
+  assert.equal(
+    mutationFixtures.some(({ catalogOrder, savedPlan, expected }) => mutant(catalogOrder, savedPlan) !== expected),
+    true,
+    `Regression suite did not kill mutation: ${name}`
+  );
+}
+const savedPlanRestoreSource = sourceSlice(
+  "function applySavedPlan",
+  "function compactCurrentPlan",
+  "saved-plan restore"
+);
+assert.match(
+  savedPlanRestoreSource,
+  /catalogStructureConflictsWithSavedPlan\(order, saved\)/,
+  "Saved-plan restoration must apply the catalog structure guard before merging missing orders."
+);
+const historicalRestore = Function(
+  `"use strict";
+  let orderCatalog = [
+    { id: "SOA04857", type: "SO" },
+    { id: "SOA04893", type: "SO" },
+    { id: "SOB114411", type: "SO" },
+    {
+      id: "GOA-4857-4893",
+      type: "SO",
+      childOrders: ["SOA04857", "SOA04893"],
+      dispatchSnapshotSourcePlanId: "52"
+    }
+  ];
+  let orders = [];
+  let trucks = [];
+  let selectedOrderId = "";
+  let selectedOrderIds = new Set();
+  let selectedLoadId = "";
+  let lastSavedAt = "";
+  let lastServerSavedAt = "";
+  let lastSavedPlanHash = "";
+  function clearActiveRouteEstimates() {}
+  function activePhysicalOrderEvidence() { return { all: new Set(), pickups: new Set(), drops: new Set() }; }
+  function orderMatchesActivityRefs() { return false; }
+  function assignedOrderIdsForTrucks() { return new Set(); }
+  function isLocalDispatchOrder() { return false; }
+  function isNetSuiteDispatchOrder() { return true; }
+  function splitParentOrderId(order = {}) { return String(order.originalOrderId || ""); }
+  function normalizeOrder(order = {}) {
+    return {
+      ...order,
+      childOrders: [...(order.childOrders || [])],
+      childOrderDetails: [...(order.childOrderDetails || [])],
+      groupAliases: [...(order.groupAliases || [])]
+    };
+  }
+  function preserveActiveOrderEvidence(_previous, refreshed) { return refreshed; }
+  function groupedChildOrderIds(orderList = []) {
+    return new Set(orderList.flatMap((order) => [...(order.childOrders || []), ...(order.groupAliases || [])]));
+  }
+  function splitParentOrderIds(orderList = []) {
+    return new Set(orderList.map(splitParentOrderId).filter(Boolean));
+  }
+  function trucksFromFleetAndSavedPlan(savedTrucks) { return savedTrucks; }
+  function normalizeLoadAssignments() {}
+  function ensureDriverLaneOrder() {}
+  function defaultDriverLaneOrder() { return []; }
+  function reconcileTransitCoSourceOrders() {}
+  function reapplyActiveOrderEvidence(list) { return list; }
+  function expandScmGroupedPoStops() {}
+  function collapseGroupedOrderStops() {}
+  function syncPickupStops() {}
+  function cleanupOrphanPickupStops() {}
+  function reconcilePickupStopRepresentatives() {}
+  function forecastMatchesCurrentPlan() { return true; }
+  function clearDispatchForecast() {}
+  function savedPlanHash() { return "saved"; }
+  ${catalogStructureSource}
+  ${savedPlanRestoreSource}
+  const saved = ${JSON.stringify(historicalPlan)};
+  saved.trucks = [];
+  const applied = applySavedPlan(saved);
+  return { applied, ids: orders.map((order) => order.id) };`
+)();
+assert.equal(historicalRestore.applied, true);
+assert.deepEqual(
+  historicalRestore.ids,
+  ["SOA04857", "SOA04893", "SOB114411"],
+  "Opening the July 10 plan must not inject the later GOA group or hide its historical child orders."
+);
+
 const fingerprintSource = sourceSlice("function compactStringFingerprint", "function payloadRequiresSave", "compact save fingerprint helpers");
 const makeFingerprintHelpers = Function(
   "currentPlanDate",

@@ -1,0 +1,41 @@
+FROM node:20-bookworm-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0 AS test-base
+
+ENV NODE_ENV=development
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci && npm cache clean --force
+
+COPY Dockerfile Dockerfile.test ./
+COPY .c8rc.json eslint.mbt.config.js tsconfig.mbt.json ./
+COPY contracts ./contracts
+COPY migrations ./migrations
+COPY public ./public
+COPY src ./src
+COPY test ./test
+COPY tools ./tools
+COPY *.js ./
+
+RUN mkdir -p /app/data /app/test-artifacts \
+    && chown -R node:node \
+      /app/data \
+      /app/migrations \
+      /app/public \
+      /app/src \
+      /app/test-artifacts \
+      /app/test/support \
+      /app/tools
+
+USER node
+
+CMD ["npm", "run", "test:mbt:infrastructure"]
+
+FROM test-base AS test-e2e
+
+USER root
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN npx playwright install --with-deps chromium webkit \
+    && chmod -R a+rX /ms-playwright
+USER node
+
+CMD ["npm", "run", "test:mbt:e2e"]

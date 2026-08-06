@@ -2,6 +2,8 @@ import crypto from "node:crypto";
 import { promisify } from "node:util";
 import { query, withTransaction } from "./db.js";
 
+export { updateDispatchTruckCapabilities } from "./mbt/dispatch-truck-capability-repository.js";
+
 const scrypt = promisify(crypto.scrypt);
 
 function numberValue(value, fallback = 0) {
@@ -88,7 +90,14 @@ function publicTruck(row) {
     capacityLbs: numberValue(row.capacity_lbs, 48000),
     travelTimePercent: numberValue(row.travel_time_percent, 0),
     baseYard: String(row.base_yard || "").trim(),
-    displayOrder: numberValue(row.display_order, 0)
+    displayOrder: numberValue(row.display_order, 0),
+    truckType: row.truck_type === "bin" ? "bin" : "flatbed",
+    revision: numberValue(row.revision, 1),
+    binServiceEnabled: row.truck_type === "bin" && row.bin_service_enabled === true,
+    binSlotCapacity: numberValue(row.bin_slot_capacity, 0),
+    supportedBinTypeCodes: Array.isArray(row.supported_bin_type_codes)
+      ? row.supported_bin_type_codes.map((code) => String(code))
+      : []
   };
 }
 
@@ -124,12 +133,47 @@ async function driverRows({ activeOnly = true } = {}) {
 
 async function truckRows({ activeOnly = true } = {}) {
   const result = await query(
-    `SELECT *
-     FROM dispatch_trucks
-     ${activeOnly ? "WHERE active = true" : ""}
-     ORDER BY display_order ASC, id ASC`
+    `SELECT truck.*,
+            COALESCE(supported.codes, ARRAY[]::text[]) AS supported_bin_type_codes
+       FROM dispatch_trucks truck
+       LEFT JOIN LATERAL (
+         SELECT array_agg(bin_type.type_code ORDER BY bin_type.type_code) AS codes
+           FROM dispatch_truck_bin_types capability
+           JOIN mbt_bin_types bin_type ON bin_type.bin_type_id = capability.bin_type_id
+          WHERE capability.truck_id = truck.id
+            AND capability.active
+       ) supported ON true
+      ${activeOnly ? "WHERE truck.active = true" : ""}
+      ORDER BY truck.display_order ASC, truck.id ASC`
   );
   return result.rows;
+}
+
+export async function listDispatchOwnYards({ activeOnly = true } = {}) {
+  const result = await query(
+    `SELECT yard_code,
+            display_name,
+            dispatch_location_id,
+            address_line_1,
+            latitude,
+            longitude
+       FROM mbt_yards
+      ${activeOnly ? "WHERE active = true" : ""}
+      ORDER BY dispatch_location_id ASC, yard_code ASC`
+  );
+  return result.rows.map((row) => {
+    const yard = {
+      code: String(row.yard_code),
+      name: String(row.display_name),
+      locationId: Number(row.dispatch_location_id),
+      address: String(row.address_line_1 || "")
+    };
+    if (row.latitude !== null && row.longitude !== null) {
+      yard.lat = Number(row.latitude);
+      yard.lng = Number(row.longitude);
+    }
+    return yard;
+  });
 }
 
 async function upsertDrivers(drivers, { deactivateMissing = true } = {}) {
@@ -242,7 +286,9 @@ async function upsertTrucks(trucks, { deactivateMissing = true } = {}) {
            SET plate = $1,
                capacity_lbs = $2,
                travel_time_percent = $3,
-               base_yard = $4,
+               -- A Bin truck's text yard is a compatibility projection of
+               -- base_yard_id. Only the audited capability command may move it.
+               base_yard = CASE WHEN truck_type = 'bin' THEN base_yard ELSE $4 END,
                display_order = $5,
                updated_at = now()
            WHERE id = $6

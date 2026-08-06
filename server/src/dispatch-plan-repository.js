@@ -7,11 +7,13 @@ import {
   normalizeDispatchPlanLoadAssignments
 } from "./dispatch-load-assignment.js";
 import { syncDispatchPlanLoadAssignments } from "./dispatch-load-assignment-repository.js";
+import { assertBinDispatchCapability } from "./mbt/dispatch-bin-safety.js";
 import {
   DISPATCH_FLEET_PLANNING_LOCK,
   dispatchFleetAssignmentStatusConflicts,
   unchangedCompletedDispatchLoadIds
 } from "./dispatch-fleet-status.js";
+import { scrubBilledSalesOrderFamilyFromPlan } from "./sales-order-reconciliation.js";
 
 const CUSTOMER_PICKUP_DELIVERY_METHOD = "Pick-Up";
 const DISPATCH_PLAN_V2_VERSION = 2;
@@ -469,19 +471,145 @@ async function assertCustomOrderPlanDateExclusivity(plan = {}, { previousPlan = 
 
 function collectPlanOrderRefs(plan) {
   const refs = new Set();
-  for (const order of plan?.orders || []) {
-    const id = String(order?.id || "").trim();
-    if (id) refs.add(id);
-  }
+  const add = (value) => {
+    const ref = String(value || "").trim();
+    if (ref) refs.add(ref);
+  };
+  const visitOrder = (order = {}) => {
+    add(order.id);
+    add(order.tranid);
+    add(order.orderId);
+    add(order.orderRef);
+    add(order.originalOrderId);
+    for (const ref of order.childOrders || []) add(ref);
+    for (const child of order.childOrderDetails || []) visitOrder(child);
+  };
+  for (const order of plan?.orders || []) visitOrder(order);
   for (const truck of plan?.trucks || []) {
     for (const load of truck?.loads || []) {
+      for (const ref of loadOrderRefs(load)) add(ref);
       for (const stop of load?.stops || []) {
-        const id = String(stop?.orderId || "").trim();
-        if (id) refs.add(id);
+        add(stop?.orderId);
+        for (const ref of stop?.orderRefs || []) add(ref);
       }
     }
   }
   return [...refs];
+}
+
+function exactBilledSalesOrderSql(alias) {
+  return `(
+    UPPER(BTRIM(COALESCE(${alias}.status, ''))) = 'G'
+    OR UPPER(REGEXP_REPLACE(
+         REGEXP_REPLACE(BTRIM(COALESCE(${alias}.status_text, '')), '\\s*:\\s*', ':', 'g'),
+         '\\s+', ' ', 'g'
+       ))
+       IN ('BILLED', 'SALES ORDER:BILLED')
+  )`;
+}
+
+async function billedSalesOrderFamiliesInPlan(plan = {}) {
+  const refs = collectPlanOrderRefs(plan).map((ref) => ref.toUpperCase());
+  if (!refs.length) return [];
+  const result = await query(
+    `WITH matched_canonical AS (
+       SELECT DISTINCT COALESCE(own_split.source_so_id, candidate.netsuite_id) AS source_so_id
+         FROM sales_orders candidate
+         LEFT JOIN dispatch_scm_so_splits own_split
+           ON own_split.split_so_id = candidate.netsuite_id
+        WHERE upper(candidate.tranid) = ANY($1::text[])
+          AND (candidate.netsuite_id > 0 OR own_split.source_so_id IS NOT NULL)
+     ),
+     billed_canonical AS (
+       SELECT source_order.netsuite_id AS source_so_id,
+              source_order.tranid AS source_so_ref
+         FROM matched_canonical matched
+         JOIN sales_orders source_order
+           ON source_order.netsuite_id = matched.source_so_id
+        WHERE ${exactBilledSalesOrderSql("source_order")}
+           OR EXISTS (
+             SELECT 1
+               FROM dispatch_scm_so_splits billed_split
+               JOIN sales_orders split_order
+                 ON split_order.netsuite_id = billed_split.split_so_id
+              WHERE billed_split.source_so_id = source_order.netsuite_id
+                AND ${exactBilledSalesOrderSql("split_order")}
+           )
+     )
+     SELECT billed.source_so_id,
+            billed.source_so_ref,
+            child.split_so_ref
+       FROM billed_canonical billed
+       LEFT JOIN dispatch_scm_so_splits child
+         ON child.source_so_id = billed.source_so_id
+      ORDER BY billed.source_so_id, child.created_at, child.id`,
+    [refs]
+  );
+  const families = new Map();
+  for (const row of result.rows) {
+    const key = String(row.source_so_id);
+    if (!families.has(key)) {
+      families.set(key, {
+        canonicalRef: String(row.source_so_ref || "").toUpperCase(),
+        familyRefs: []
+      });
+    }
+    const family = families.get(key);
+    family.familyRefs = uniqueTextValues([
+      ...family.familyRefs,
+      row.source_so_ref,
+      row.split_so_ref
+    ]).map((ref) => ref.toUpperCase());
+  }
+  return [...families.values()];
+}
+
+async function activeDriverJobsForSalesOrderFamily(refs = []) {
+  const familyRefs = uniqueTextValues(refs).map((ref) => ref.toUpperCase());
+  if (!familyRefs.length) return [];
+  const result = await query(
+    `SELECT job.job_id, job.plan_id, job.load_id, job.stop_id, job.order_refs
+       FROM driver_job_records job
+      WHERE job.status = 'in_progress'
+        AND (
+          EXISTS (
+            SELECT 1
+              FROM jsonb_array_elements_text(COALESCE(job.order_refs, '[]'::jsonb)) ref(value)
+             WHERE upper(BTRIM(ref.value)) = ANY($1::text[])
+          )
+          OR EXISTS (
+            SELECT 1
+              FROM dispatch_plan_snapshots snapshot,
+                   LATERAL jsonb_array_elements(COALESCE(snapshot.trucks, '[]'::jsonb)) truck,
+                   LATERAL jsonb_array_elements(COALESCE(truck->'loads', '[]'::jsonb)) load
+             WHERE snapshot.plan_id::text = job.plan_id::text
+               AND NULLIF(BTRIM(job.load_id), '') IS NOT NULL
+               AND upper(BTRIM(COALESCE(load->>'id', ''))) = upper(BTRIM(job.load_id))
+               AND EXISTS (
+                 SELECT 1
+                   FROM unnest($2::text[]) token(value)
+                  WHERE strpos(upper(load::text), token.value) > 0
+               )
+          )
+        )
+      ORDER BY job.started_at, job.id`,
+    [familyRefs, familyRefs.map((ref) => JSON.stringify(ref).toUpperCase())]
+  );
+  return result.rows;
+}
+
+async function scrubBilledSalesOrderFamiliesFromPlan(plan = {}) {
+  let cleanPlan = plan;
+  for (const family of await billedSalesOrderFamiliesInPlan(plan)) {
+    const activeJobs = await activeDriverJobsForSalesOrderFamily(family.familyRefs);
+    const scrubbed = scrubBilledSalesOrderFamilyFromPlan(cleanPlan, {
+      canonicalRef: family.canonicalRef,
+      familyRefs: family.familyRefs,
+      inProgressOrderRefs: activeJobs.length ? family.familyRefs : []
+    });
+    cleanPlan = scrubbed.plan;
+  }
+  return cleanPlan;
 }
 
 async function pickupSalesOrderRefs(plan) {
@@ -575,9 +703,7 @@ async function sanitizeDispatchPlan(plan) {
   const normalizedPlan = normalizeDispatchPlanLoadAssignments(plan);
   const pickupRefs = await pickupSalesOrderRefs(normalizedPlan);
   const enrichedPlan = await enrichDispatchPlanWeights(normalizedPlan);
-  if (!pickupRefs.size) return enrichedPlan;
-
-  return {
+  const pickupSanitizedPlan = !pickupRefs.size ? enrichedPlan : {
     ...enrichedPlan,
     orders: (enrichedPlan.orders || []).filter((order) => !pickupRefs.has(String(order?.id || ""))),
     trucks: (enrichedPlan.trucks || []).map((truck) => ({
@@ -594,6 +720,7 @@ async function sanitizeDispatchPlan(plan) {
       ]
     }
   };
+  return scrubBilledSalesOrderFamiliesFromPlan(pickupSanitizedPlan);
 }
 
 export async function listDispatchPlans({ limit = 80 } = {}) {
@@ -670,6 +797,147 @@ export async function getCurrentDispatchPlan({ planDate } = {}) {
     [cleanDate]
   );
   return sanitizeDispatchPlan(planRow(result.rows[0]));
+}
+
+export async function cleanupBilledSalesOrderFamilyFromDispatchPlans({
+  canonicalRef = "",
+  familyRefs = [],
+  actor = "scm-reconciliation"
+} = {}) {
+  const refs = uniqueTextValues([canonicalRef, ...(familyRefs || [])]).map((ref) => ref.toUpperCase());
+  if (!refs.length) return { changedPlans: [], deferred: false, familyRefs: [] };
+  return withTransaction(async () => {
+    await lockDispatchFleetPlanning();
+    const activeJobs = await activeDriverJobsForSalesOrderFamily(refs);
+    if (activeJobs.length) {
+      return {
+        changedPlans: [],
+        deferred: true,
+        familyRefs: refs,
+        activeJobs: activeJobs.map((row) => ({
+          jobId: row.job_id,
+          planId: row.plan_id,
+          loadId: row.load_id,
+          stopId: row.stop_id,
+          orderRefs: row.order_refs || []
+        }))
+      };
+    }
+
+    const snapshots = await query(
+      `SELECT p.id, p.plan_date::text AS plan_date, p.revision,
+              s.orders, s.trucks, s.summary, s.saved_at
+         FROM dispatch_plans p
+         JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+        WHERE p.status <> 'cancelled'
+        ORDER BY p.plan_date, p.id
+        FOR UPDATE OF p, s`
+    );
+    const changedPlans = [];
+    for (const row of snapshots.rows) {
+      const scrubbed = scrubBilledSalesOrderFamilyFromPlan({
+        id: String(row.id),
+        planDate: row.plan_date,
+        orders: row.orders || [],
+        trucks: row.trucks || [],
+        summary: row.summary || {}
+      }, {
+        canonicalRef,
+        familyRefs: refs
+      });
+      if (!scrubbed.changed) continue;
+      await query(
+        `INSERT INTO dispatch_plan_snapshot_history (
+           plan_id, plan_date, revision, orders, trucks, summary,
+           original_saved_at, archive_reason, session_id
+         ) VALUES (
+           $1, $2::date, $3, $4::jsonb, $5::jsonb, $6::jsonb,
+           $7, 'before_billed_so_reconciliation', $8
+         )`,
+        [
+          row.id,
+          row.plan_date,
+          row.revision,
+          JSON.stringify(row.orders || []),
+          JSON.stringify(row.trucks || []),
+          JSON.stringify(row.summary || {}),
+          row.saved_at,
+          String(actor || "scm-reconciliation")
+        ]
+      );
+      const updated = await query(
+        `UPDATE dispatch_plans
+            SET revision = revision + 1,
+                updated_at = now()
+          WHERE id = $1
+          RETURNING revision`,
+        [row.id]
+      );
+      await query(
+        `UPDATE dispatch_plan_snapshots
+            SET orders = $2::jsonb,
+                trucks = $3::jsonb,
+                summary = $4::jsonb,
+                saved_at = now()
+          WHERE plan_id = $1`,
+        [
+          row.id,
+          JSON.stringify(scrubbed.plan.orders || []),
+          JSON.stringify(scrubbed.plan.trucks || []),
+          JSON.stringify(scrubbed.plan.summary || {})
+        ]
+      );
+      const cleanPlan = {
+        ...scrubbed.plan,
+        id: row.id,
+        planDate: row.plan_date,
+        revision: Number(updated.rows[0]?.revision || row.revision || 0)
+      };
+      await syncDispatchDeliveryGroupsFromPlan(cleanPlan);
+      await syncDispatchPlanLoadAssignments(cleanPlan);
+      changedPlans.push({
+        planId: String(row.id),
+        planDate: row.plan_date,
+        revision: cleanPlan.revision,
+        removedOrderRefs: scrubbed.removedOrderRefs
+      });
+    }
+    return { changedPlans, deferred: false, familyRefs: refs };
+  });
+}
+
+export async function cleanupBilledSalesOrderFamiliesFromDispatchPlan({
+  planId,
+  actor = "driver-completion"
+} = {}) {
+  const result = await query(
+    `SELECT p.id, p.plan_date::text AS plan_date, p.status, p.revision,
+            s.orders, s.trucks, s.summary, s.saved_at
+       FROM dispatch_plans p
+       JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+      WHERE p.id = $1
+      LIMIT 1`,
+    [planId]
+  );
+  const plan = planRow(result.rows[0]);
+  if (!plan) return { changedPlans: [], deferredFamilies: [], familyCount: 0 };
+  const families = await billedSalesOrderFamiliesInPlan(plan);
+  const changedPlans = [];
+  const deferredFamilies = [];
+  for (const family of families) {
+    const cleanup = await cleanupBilledSalesOrderFamilyFromDispatchPlans({
+      canonicalRef: family.canonicalRef,
+      familyRefs: family.familyRefs,
+      actor
+    });
+    changedPlans.push(...(cleanup.changedPlans || []));
+    if (cleanup.deferred) deferredFamilies.push(family.familyRefs);
+  }
+  return {
+    changedPlans,
+    deferredFamilies,
+    familyCount: families.length
+  };
 }
 
 export async function listDispatchPlanSnapshots({ planDate } = {}) {
@@ -754,6 +1022,13 @@ export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [
     );
     const existingPlan = currentPlan.rows[0];
     if (!existingPlan) throw new Error("Dispatch plan not found.");
+    const previousPlan = {
+      id: String(planId),
+      planDate: cleanPlanDate(existingPlan.plan_date),
+      orders: existingPlan.orders || [],
+      trucks: existingPlan.trucks || [],
+      summary: existingPlan.summary || {}
+    };
     const payloadPlanDate = cleanPlanDate(planDate || existingPlan.plan_date);
     const expectedPlanDate = cleanPlanDate(existingPlan.plan_date);
     if (payloadPlanDate !== expectedPlanDate) {
@@ -763,6 +1038,10 @@ export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [
         payloadPlanDate
       });
     }
+    assertBinDispatchCapability({
+      orders: [...(previousPlan.orders || []), ...(Array.isArray(orders) ? orders : [])],
+      trucks: [...(previousPlan.trucks || []), ...(Array.isArray(trucks) ? trucks : [])]
+    }, { operation: "save" });
     const canonicalPlan = await canonicalizeDispatchCustomOrdersInPlan({
       id: String(planId),
       planDate: expectedPlanDate,
@@ -770,21 +1049,11 @@ export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [
       trucks: Array.isArray(trucks) ? trucks : [],
       summary: summary || {}
     }, {
-      previousPlan: {
-        id: String(planId),
-        planDate: expectedPlanDate,
-        orders: existingPlan.orders || [],
-        trucks: existingPlan.trucks || []
-      },
+      previousPlan,
       lockRows: true
     });
     await assertCustomOrderPlanDateExclusivity(canonicalPlan, {
-      previousPlan: {
-        id: String(planId),
-        planDate: expectedPlanDate,
-        orders: existingPlan.orders || [],
-        trucks: existingPlan.trucks || []
-      }
+      previousPlan
     });
     await assertActiveDispatchFleetAssignments({
       id: planId,
@@ -792,12 +1061,7 @@ export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [
       orders: canonicalPlan.orders || [],
       trucks: canonicalPlan.trucks || []
     }, {
-      previousPlan: {
-        id: planId,
-        planDate: expectedPlanDate,
-        orders: existingPlan.orders || [],
-        trucks: existingPlan.trucks || []
-      }
+      previousPlan
     });
     const hasBaseRevision = baseRevision !== null && baseRevision !== undefined && baseRevision !== "";
     const expectedRevision = Number(baseRevision);
@@ -911,6 +1175,10 @@ export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" }
     );
     const current = currentResult.rows[0];
     if (!current) throw new Error("Dispatch plan was not found.");
+    assertBinDispatchCapability({
+      orders: [...(current.orders || []), ...(source.orders || [])],
+      trucks: [...(current.trucks || []), ...(source.trucks || [])]
+    }, { operation: "restore" });
     const sourceDate = cleanPlanDate(source.plan_date);
     const currentDate = cleanPlanDate(current.plan_date);
     if (sourceDate !== currentDate) {
@@ -1031,11 +1299,21 @@ export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" }
   });
 }
 
-export async function confirmDispatchPlan(planId, { note = "" } = {}) {
+/**
+ * Keep the legacy/default confirmation seam fail-closed for BIN snapshots.
+ * The only opt-in is the dedicated service callback, which executes after the
+ * existing plan lock and before any status/snapshot write in this transaction.
+ *
+ * @param {string | number} planId
+ * @param {object} [options]
+ * @param {string} [options.note]
+ * @param {null | {validate: Function, hooks?: Record<string, Function>}} [options.binBoundary]
+ */
+async function confirmDispatchPlanTransaction(planId, { note = "", binBoundary = null } = {}) {
   return withTransaction(async () => {
     await lockDispatchFleetPlanning();
     const currentResult = await query(
-      `SELECT p.id, p.plan_date::text AS plan_date, p.revision,
+      `SELECT p.id, p.plan_date::text AS plan_date, p.status, p.revision,
               s.orders, s.trucks, s.summary, s.saved_at
          FROM dispatch_plans p
          LEFT JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
@@ -1048,10 +1326,27 @@ export async function confirmDispatchPlan(planId, { note = "" } = {}) {
     const currentPlan = {
       id: String(current.id),
       planDate: cleanPlanDate(current.plan_date),
+      status: String(current.status),
+      revision: Number(current.revision),
       orders: current.orders || [],
       trucks: current.trucks || [],
       summary: current.summary || {}
     };
+    if (binBoundary === null) {
+      assertBinDispatchCapability(currentPlan, { operation: "confirm" });
+    } else {
+      if (typeof binBoundary.validate !== "function") {
+        throw new TypeError("A locked BIN confirmation validator is required.");
+      }
+      await binBoundary.validate({
+        plan: currentPlan,
+        status: String(current.status),
+        revision: Number(current.revision)
+      });
+      if (String(current.status) === "confirmed") {
+        return getDispatchPlan(planId);
+      }
+    }
     const canonicalPlan = await canonicalizeDispatchCustomOrdersInPlan(currentPlan, {
       previousPlan: currentPlan,
       lockRows: true
@@ -1084,9 +1379,42 @@ export async function confirmDispatchPlan(planId, { note = "" } = {}) {
       [planId, note || ""]
     );
     if (!result.rows[0]) throw new Error("Dispatch plan not found.");
+    if (typeof binBoundary?.hooks?.afterStatusUpdate === "function") {
+      await binBoundary.hooks.afterStatusUpdate({
+        planId: String(planId),
+        revision: Number(result.rows[0].revision)
+      });
+    }
     const plan = await getDispatchPlan(planId);
-    await syncDispatchPlanLoadAssignments(plan);
+    await syncDispatchPlanLoadAssignments(plan, { allowBin: binBoundary !== null });
     return plan;
+  });
+}
+
+export async function confirmDispatchPlan(planId, { note = "" } = {}) {
+  return confirmDispatchPlanTransaction(planId, { note });
+}
+
+/**
+ * Internal repository seam for the capability-authorized BIN confirmation
+ * service. Callers cannot bypass validation: omission of the locked validator
+ * fails before any plan mutation, while all legacy callers retain the default
+ * path above.
+ *
+ * @param {string | number} planId
+ * @param {{note?: string, validate: Function, hooks?: Record<string, Function>}} options
+ */
+export async function confirmValidatedBinDispatchPlan(planId, {
+  note = "",
+  validate,
+  hooks = {}
+} = /** @type {any} */ ({})) {
+  if (typeof validate !== "function") {
+    throw new TypeError("A locked BIN confirmation validator is required.");
+  }
+  return confirmDispatchPlanTransaction(planId, {
+    note,
+    binBoundary: { validate, hooks }
   });
 }
 
