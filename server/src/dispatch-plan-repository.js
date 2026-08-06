@@ -14,6 +14,7 @@ import {
   unchangedCompletedDispatchLoadIds
 } from "./dispatch-fleet-status.js";
 import { scrubBilledSalesOrderFamilyFromPlan } from "./sales-order-reconciliation.js";
+import { buildCompactDispatchSnapshot, digestDispatchPlan, dispatchPlanBoard } from "./dispatch-planner-performance.js";
 
 const CUSTOMER_PICKUP_DELIVERY_METHOD = "Pick-Up";
 const DISPATCH_PLAN_V2_VERSION = 2;
@@ -177,7 +178,7 @@ function cleanPlanDate(value) {
 
 function planRow(row) {
   if (!row) return null;
-  return {
+  const plan = {
     id: row.id,
     revision: Number(row.revision || 0),
     planDate: row.plan_date instanceof Date ? row.plan_date.toISOString().slice(0, 10) : String(row.plan_date || "").slice(0, 10),
@@ -191,6 +192,7 @@ function planRow(row) {
     trucks: row.trucks || [],
     summary: row.summary || {}
   };
+  return { ...plan, digest: digestDispatchPlan(plan) };
 }
 
 function countPlanLoads(trucks = []) {
@@ -370,6 +372,7 @@ function truckSnapshotSummary(trucks = []) {
 function snapshotSummary(row, { current = false } = {}) {
   const orders = Array.isArray(row.orders) ? row.orders : [];
   const trucks = normalizedSnapshotTrucks(row);
+  const hasStoredMetadata = row.schema_version !== undefined && row.schema_version !== null;
   return {
     id: current ? `current-${row.plan_id || row.id}` : String(row.id),
     snapshotId: current ? null : String(row.id),
@@ -384,11 +387,13 @@ function snapshotSummary(row, { current = false } = {}) {
     archivedAt: row.archived_at || "",
     archiveReason: row.archive_reason || (current ? "current" : ""),
     sessionId: row.session_id || "",
-    orderCount: orders.length,
-    truckCount: trucks.length,
-    loadCount: countPlanLoads(trucks),
-    loadOrderCount: countPlanLoadOrders(trucks),
-    stopCount: countPlanStops(trucks),
+    schemaVersion: Number(row.schema_version || 1),
+    digest: row.plan_digest || "",
+    orderCount: hasStoredMetadata ? Number(row.order_count || 0) : orders.length,
+    truckCount: hasStoredMetadata ? Number(row.truck_count || 0) : trucks.length,
+    loadCount: hasStoredMetadata ? Number(row.load_count || 0) : countPlanLoads(trucks),
+    loadOrderCount: hasStoredMetadata ? Number(row.order_count || 0) : countPlanLoadOrders(trucks),
+    stopCount: hasStoredMetadata ? Number(row.stop_count || 0) : countPlanStops(trucks),
     summary: row.summary || {},
     trucks: truckSnapshotSummary(trucks)
   };
@@ -747,18 +752,31 @@ export async function createDispatchPlan({ planDate, note = "", status = "draft"
     [cleanDate, status, note || ""]
   );
   const plan = result.rows[0];
+  const initialDigest = digestDispatchPlan({
+    id: String(plan.id),
+    planDate: cleanDate,
+    status: plan.status || status,
+    note: plan.note || note || "",
+    revision: Number(plan.revision || 0),
+    orders: [],
+    trucks: [],
+    summary: {}
+  });
   await query(
-    `INSERT INTO dispatch_plan_snapshots (plan_id, orders, trucks, summary)
-     VALUES ($1, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb)
+    `INSERT INTO dispatch_plan_snapshots (
+       plan_id, orders, trucks, summary, schema_version, plan_digest,
+       order_count, truck_count, load_count, stop_count
+     )
+     VALUES ($1, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb, 2, $2, 0, 0, 0, 0)
      ON CONFLICT (plan_id) DO NOTHING`,
-    [plan.id]
+    [plan.id, initialDigest]
   );
   return getDispatchPlan(plan.id);
 }
 
 export async function getDispatchPlan(planId) {
   const result = await query(
-    `SELECT p.*, s.saved_at, s.orders, s.trucks, s.summary
+    `SELECT p.*, s.saved_at, s.orders, s.trucks, s.summary, s.plan_digest
        FROM dispatch_plans p
        LEFT JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
       WHERE p.id = $1`,
@@ -789,7 +807,7 @@ export async function getDispatchPlanRevision(planId) {
 export async function getCurrentDispatchPlan({ planDate } = {}) {
   const cleanDate = cleanPlanDate(planDate);
   const result = await query(
-    `SELECT p.*, s.saved_at, s.orders, s.trucks, s.summary
+    `SELECT p.*, s.saved_at, s.orders, s.trucks, s.summary, s.plan_digest
        FROM dispatch_plans p
        LEFT JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
       WHERE p.plan_date = $1
@@ -944,7 +962,9 @@ export async function listDispatchPlanSnapshots({ planDate } = {}) {
   const cleanDate = cleanPlanDate(planDate);
   const current = await query(
     `SELECT p.id AS plan_id, p.plan_date::text AS plan_date, p.status, p.revision,
-            s.orders, s.trucks, s.summary, s.saved_at,
+            NULL::jsonb AS orders, NULL::jsonb AS trucks, s.summary, s.saved_at,
+            s.schema_version, s.plan_digest, s.order_count, s.truck_count,
+            s.load_count, s.stop_count,
             NULL::bigint AS id, NULL::timestamptz AS archived_at,
             NULL::text AS archive_reason, NULL::text AS session_id,
             NULL::timestamptz AS original_saved_at
@@ -956,12 +976,15 @@ export async function listDispatchPlanSnapshots({ planDate } = {}) {
   );
   const history = await query(
     `SELECT h.id, h.plan_id, h.plan_date::text AS plan_date, p.status, h.revision,
-            h.orders, h.trucks, h.summary, h.original_saved_at, h.archived_at,
+            NULL::jsonb AS orders, NULL::jsonb AS trucks, h.summary, h.original_saved_at, h.archived_at,
+            h.schema_version, h.plan_digest, h.order_count, h.truck_count,
+            h.load_count, h.stop_count,
             h.archive_reason, h.session_id, NULL::timestamptz AS saved_at
        FROM dispatch_plan_snapshot_history h
        JOIN dispatch_plans p ON p.id = h.plan_id
       WHERE h.plan_date = $1::date
-      ORDER BY h.archived_at DESC, h.id DESC`,
+      ORDER BY h.archived_at DESC, h.id DESC
+      LIMIT 200`,
     [cleanDate]
   );
   return {
@@ -1102,19 +1125,30 @@ export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [
     });
     const cleanPlan = {
       ...sanitizedPlan,
+      id: String(planId),
+      planDate: expectedPlanDate,
+      status: result.rows[0].status || "draft",
+      note: result.rows[0].note || "",
+      revision: Number(result.rows[0].revision || 0),
       summary: dispatchPlanV2Summary(sanitizedPlan.summary || {}, {
         previousSummary: existingPlan.summary || {},
         source: DISPATCH_PLAN_V2_SAVE_SOURCE
       })
     };
+    const storedPlan = buildCompactDispatchSnapshot(cleanPlan);
+    const storedDigest = digestDispatchPlan(storedPlan);
+    const storedCounts = dispatchPlanBoard(storedPlan);
     if (existingPlan.saved_at) {
+      const previousCounts = dispatchPlanBoard(previousPlan);
       await query(
         `INSERT INTO dispatch_plan_snapshot_history (
            plan_id, plan_date, revision, orders, trucks, summary,
-           original_saved_at, archive_reason, session_id
+           original_saved_at, archive_reason, session_id,
+           schema_version, plan_digest, order_count, truck_count, load_count, stop_count
          )
          VALUES ($1, $2::date, $3, COALESCE($4::jsonb, '[]'::jsonb), COALESCE($5::jsonb, '[]'::jsonb),
-                 COALESCE($6::jsonb, '{}'::jsonb), $7, 'before_save', $8)`,
+                 COALESCE($6::jsonb, '{}'::jsonb), $7, 'before_save', $8,
+                 2, $9, $10, $11, $12, $13)`,
         [
           planId,
           expectedPlanDate,
@@ -1123,28 +1157,52 @@ export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [
           JSON.stringify(existingPlan.trucks || []),
           JSON.stringify(existingPlan.summary || {}),
           existingPlan.saved_at,
-          sessionId || ""
+          sessionId || "",
+          digestDispatchPlan(previousPlan),
+          (previousPlan.orders || []).length,
+          previousCounts.truckCount,
+          previousCounts.loadCount,
+          previousCounts.stopCount
         ]
       );
     }
     await query(
-      `INSERT INTO dispatch_plan_snapshots (plan_id, orders, trucks, summary, saved_at)
-       VALUES ($1, $2::jsonb, $3::jsonb, $4::jsonb, now())
+      `INSERT INTO dispatch_plan_snapshots (
+         plan_id, orders, trucks, summary, saved_at, schema_version, plan_digest,
+         order_count, truck_count, load_count, stop_count
+       )
+       VALUES ($1, $2::jsonb, $3::jsonb, $4::jsonb, now(), 2, $5, $6, $7, $8, $9)
        ON CONFLICT (plan_id) DO UPDATE
          SET orders = EXCLUDED.orders,
              trucks = EXCLUDED.trucks,
              summary = EXCLUDED.summary,
+             schema_version = EXCLUDED.schema_version,
+             plan_digest = EXCLUDED.plan_digest,
+             order_count = EXCLUDED.order_count,
+             truck_count = EXCLUDED.truck_count,
+             load_count = EXCLUDED.load_count,
+             stop_count = EXCLUDED.stop_count,
              saved_at = now()`,
-      [planId, JSON.stringify(cleanPlan.orders), JSON.stringify(cleanPlan.trucks), JSON.stringify(cleanPlan.summary || {})]
+      [
+        planId,
+        JSON.stringify(storedPlan.orders),
+        JSON.stringify(storedPlan.trucks),
+        JSON.stringify(storedPlan.summary || {}),
+        storedDigest,
+        (storedPlan.orders || []).length,
+        storedCounts.truckCount,
+        storedCounts.loadCount,
+        storedCounts.stopCount
+      ]
     );
     await syncDispatchDeliveryGroupsFromPlan({
       id: planId,
       planDate: expectedPlanDate,
-      orders: cleanPlan.orders,
-      trucks: cleanPlan.trucks
+      orders: storedPlan.orders,
+      trucks: storedPlan.trucks
     });
     await syncDispatchPlanLoadAssignments({
-      ...cleanPlan,
+      ...storedPlan,
       id: planId,
       planDate: expectedPlanDate
     });

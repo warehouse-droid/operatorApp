@@ -68,6 +68,19 @@ import { DISPATCH_VENDOR_WEEK_DAYS, listDispatchVendorYards, listDispatchLocalVe
 import { listDispatchAudit, writeDispatchAudit } from "./dispatch-audit-repository.js";
 import { runWithAuditContext } from "./audit-context.js";
 import { DispatchPlanDateMismatchError, StaleDispatchPlanSaveError, applyDispatchPlannedAssignment, cleanupBilledSalesOrderFamiliesFromDispatchPlan, confirmDispatchPlan, createDispatchPlan, dispatchPlannedAssignmentMap, dispatchPlannedOrderConflictRefs, dispatchPlannedOrderRefs, getCurrentDispatchPlan, getDispatchPlan, getDispatchPlanRevision, getDispatchPlanSnapshot, listDispatchPlanSnapshots, listDispatchPlans, reopenDispatchPlan, restoreDispatchPlanSnapshot, saveDispatchPlanSnapshot } from "./dispatch-plan-repository.js";
+import {
+  advanceDispatchV2Followup,
+  applyDispatchV2Command,
+  completeDispatchV2Followup,
+  failDispatchV2Followup,
+  getDispatchV2CommandReplay,
+  getDispatchV2Bootstrap,
+  getDispatchV2Checkpoint,
+  listDispatchV2Checkpoints,
+  pendingDispatchV2Followups,
+  pruneExpiredDispatchV2Checkpoints
+} from "./dispatch-planner-v2-repository.js";
+import { evaluateExecutedPrefixPolicy } from "./dispatch-planner-performance.js";
 import { DispatchPlanEditLeaseError, acquireDispatchPlanEditLease, assertDispatchPlanEditLease, getDispatchPlanEditLease, heartbeatDispatchPlanEditLease, releaseDispatchPlanEditLease } from "./dispatch-plan-lease-repository.js";
 import { getDispatchStatistics } from "./dispatch-statistics-repository.js";
 import { buildDispatchForecast } from "./dispatch-forecast-service.js";
@@ -178,7 +191,7 @@ import {
 import { addSmartScmProposalLine, createSmartScmManualLoad, groupSmartScmProposals, recalculateSmartScmPoProposal, removeSmartScmProposalLine, searchSmartScmManualLoadItems, searchSmartScmProposalItems, splitSmartScmProposalLine, updateSmartScmProposalLine } from "./smart-scm-proposal-editor.js";
 import { addTransferDependencyProposalLine, searchTransferDependencyProposalItems } from "./transfer-dependency-manual-items.js";
 import { listSmartScmRouteRules, upsertSmartScmRouteRule } from "./smart-scm-route-repository.js";
-import { changedDriverActivityAssignments, dispatchLoadAssignment, normalizeDispatchPlanLoadAssignments, overlayLockedLoadDerivedSchedule, validateDispatchLoadAssignments } from "./dispatch-load-assignment.js";
+import { dispatchLoadAssignment, normalizeDispatchPlanLoadAssignments, overlayLockedLoadDerivedSchedule, validateDispatchLoadAssignments } from "./dispatch-load-assignment.js";
 import { dispatchLocationsShareYard } from "./dispatch-location.js";
 
 import { executeSmartScmPurchaseProposal } from "./smart-scm-purchase-service.js";
@@ -658,21 +671,12 @@ async function dispatchLoadAssignmentConflicts(previousPlan = {}, nextPlan = {},
     allowedInactiveLoadIds
   }));
   if (!previousPlan?.id) return conflicts;
-  for (const change of changedDriverActivityAssignments(previousPlan, normalized, statuses)) {
-    const changedScope = change.reasons?.includes("assignment") || change.reasons?.includes("load")
-      ? "its assigned driver or truck"
-      : change.reasons?.includes("full_load")
-        ? "its recorded route"
-        : "a started stop or its related order allocation";
-    conflicts.push({
-      code: "DISPATCH_ACTIVE_LOAD_LOCKED",
-      message: `${change.previous?.load?.name || change.loadId} has driver activity and cannot change ${changedScope}.`,
-      loadId: change.loadId,
-      reasons: change.reasons || [],
-      stopIds: change.stopIds || [],
-      orderRefs: change.orderRefs || []
-    });
-  }
+  const executionPolicy = evaluateExecutedPrefixPolicy({
+    previousPlan,
+    nextPlan: normalized,
+    activity: statuses
+  });
+  conflicts.push(...executionPolicy.conflicts);
   return conflicts;
 }
 
@@ -1019,15 +1023,18 @@ function dispatchOrderLogicalRefs(order = {}) {
     .filter(Boolean);
 }
 
-async function listDispatchSnapshotDerivedOrders({ type = null } = {}) {
+async function listDispatchSnapshotDerivedOrders({ type = null, search = "" } = {}) {
   const sandbox = isNetSuiteSandboxEnvironment();
+  const snapshotSearch = String(search || "").trim().slice(0, 120);
   const [result, inactiveSplits, blanketPurchaseOrders] = await Promise.all([
     query(
     `SELECT p.id, p.plan_date::text AS plan_date, p.updated_at, s.orders
        FROM dispatch_plans p
        JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
       WHERE p.status <> 'cancelled'
-      ORDER BY p.updated_at DESC, p.plan_date DESC`
+        AND ($1::text = '' OR s.orders::text ILIKE ('%' || $1 || '%'))
+      ORDER BY p.updated_at DESC, p.plan_date DESC`,
+      [snapshotSearch]
     ),
     query(
       `SELECT tranid FROM sales_orders WHERE tranid LIKE '%-S%' AND netsuite_active = false
@@ -1116,7 +1123,7 @@ async function listDispatchOrdersForResponse({ type = null, search = "" } = {}) 
           search: searchTerm
         })
       : Promise.resolve([]),
-    listDispatchSnapshotDerivedOrders({ type }),
+    listDispatchSnapshotDerivedOrders({ type, search: searchTerm }),
     listRestrictedScmDispatchOrderRefs(),
     listBilledSalesOrderFamilyRefs()
   ]);
@@ -1191,6 +1198,31 @@ async function listDispatchOrdersForResponse({ type = null, search = "" } = {}) 
   return searchTerm
     ? visibleOrders.filter((order) => dispatchOrderMatchesSearch(order, searchTerm))
     : visibleOrders;
+}
+
+async function targetedDispatchMutationOrders(orderRefs = []) {
+  const refs = [...new Set((orderRefs || [])
+    .map((ref) => String(ref || "").trim().toLowerCase())
+    .filter(Boolean))];
+  if (!refs.length) return [];
+  const feeds = await Promise.all(refs.map((search) => listDispatchOrdersForResponse({ search })));
+  const byId = new Map();
+  for (const feed of feeds) {
+    for (const order of feed || []) {
+      if (!dispatchOrderLogicalRefs(order).some((ref) => refs.includes(ref))) continue;
+      const key = String(order?.id || "").trim().toLowerCase();
+      if (key && !byId.has(key)) byId.set(key, order);
+    }
+  }
+  return [...byId.values()];
+}
+
+async function dispatchMutationOrderResponse(req, orderRefs = [], { legacyType = null } = {}) {
+  if (req.query?.response === "targeted") {
+    dispatchPrivateNoStore(req.res);
+    return { orders: await targetedDispatchMutationOrders(orderRefs) };
+  }
+  return { orders: await listDispatchOrdersForResponse({ type: legacyType }) };
 }
 
 async function listScmPurchaseOrdersForResponse(filters = {}, operator = null) {
@@ -4558,6 +4590,19 @@ async function requireDispatchPlanEditLease(req, planDate = "") {
     input.planDate = input.planDate || "2099-12-31";
     const acquired = await acquireDispatchPlanEditLease(input);
     input.token = acquired.token;
+  }
+  return assertDispatchPlanEditLease(input);
+}
+
+async function requireDispatchV2PlanEditLease(req, planDate = "") {
+  const input = dispatchEditLeaseInput(req, planDate);
+  const lease = await getDispatchPlanEditLease(input.planDate);
+  if (
+    input.token
+    && lease?.active
+    && String(lease.operatorId || "") === String(req.operator?.id || "")
+  ) {
+    return assertDispatchPlanEditLease({ ...input, sessionId: lease.sessionId });
   }
   return assertDispatchPlanEditLease(input);
 }
@@ -9394,6 +9439,279 @@ app.get("/api/dispatch/statistics", requireOperator, requireDispatcher, async (r
   }
 });
 
+function dispatchPrivateNoStore(res) {
+  res.setHeader("Cache-Control", "private, no-store, max-age=0");
+  res.setHeader("Pragma", "no-cache");
+}
+
+app.get("/api/dispatch/v2/bootstrap", requireOperator, requireDispatcher, async (req, res, next) => {
+  try {
+    dispatchPrivateNoStore(res);
+    res.json(await getDispatchV2Bootstrap({
+      planId: req.query.planId || "",
+      date: req.query.date || req.query.planDate || ""
+    }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/dispatch/v2/order-feed/:id", requireOperator, requireDispatcher, async (req, res, next) => {
+  try {
+    dispatchPrivateNoStore(res);
+    const order = (await targetedDispatchMutationOrders([req.params.id]))[0] || null;
+    if (!order) return res.status(404).json({ error: "Dispatch order not found", code: "DISPATCH_ORDER_NOT_FOUND" });
+    res.json({ order });
+  } catch (error) {
+    next(error);
+  }
+});
+
+function dispatchV2CandidateConflict(code, message, conflicts = []) {
+  return Object.assign(new Error(message), { code, status: 409, conflicts });
+}
+
+async function prepareDispatchV2ReplaceCommand(previousPlan = {}, command = {}) {
+  const payload = command.payload || {};
+  const requestedPlanDate = String(payload.planDate || previousPlan.planDate || "").slice(0, 10);
+  const existingPlanDate = String(previousPlan.planDate || "").slice(0, 10);
+  if (requestedPlanDate && existingPlanDate && requestedPlanDate !== existingPlanDate) {
+    throw Object.assign(new Error("The replacement board belongs to a different plan date."), {
+      code: "DISPATCH_PLAN_DATE_MISMATCH",
+      status: 409,
+      expectedPlanDate: existingPlanDate,
+      payloadPlanDate: requestedPlanDate
+    });
+  }
+  if (!Array.isArray(payload.orders) || !Array.isArray(payload.trucks)) {
+    throw Object.assign(new Error("A compact order list and truck board are required."), {
+      code: "DISPATCH_COMMAND_INVALID",
+      status: 400
+    });
+  }
+
+  let cleanOrders = payload.orders;
+  let cleanTrucks = payload.trucks;
+  if (config.dispatch?.driverOrientedPlanning) {
+    cleanTrucks = normalizeDispatchPlanLoadAssignments({ ...previousPlan, trucks: cleanTrucks }).trucks;
+  }
+  const canonicalCandidate = await canonicalizeDispatchCustomOrdersInPlan({
+    ...previousPlan,
+    planDate: existingPlanDate,
+    orders: cleanOrders,
+    trucks: cleanTrucks
+  }, { previousPlan });
+  cleanOrders = sanitizeDispatchPlanOrders(canonicalCandidate.orders || []);
+  cleanTrucks = canonicalCandidate.trucks || [];
+  const scheduleCandidate = await overlayDispatchLockedLoadSchedule(previousPlan, {
+    ...previousPlan,
+    planDate: existingPlanDate,
+    orders: cleanOrders,
+    trucks: cleanTrucks
+  });
+  cleanTrucks = scheduleCandidate.trucks || [];
+  const candidate = {
+    ...previousPlan,
+    planDate: existingPlanDate,
+    orders: cleanOrders,
+    trucks: cleanTrucks
+  };
+
+  const changedScmRefs = changedDispatchScmRefs(previousPlan, candidate);
+  await assertScmReconciliationOrderEditable({ orderRefs: changedScmRefs });
+  await assertNoRestrictedScmDispatchOrders(
+    changedPlacedDispatchScmAssignmentRefs(previousPlan, candidate),
+    "save this plan"
+  );
+  const duplicateDrivers = config.dispatch?.driverOrientedPlanning ? [] : dispatchDuplicateDriverAssignments(cleanTrucks);
+  if (duplicateDrivers.length) {
+    throw dispatchV2CandidateConflict(
+      "DISPATCH_DRIVER_DUPLICATE",
+      "One driver can only be assigned to one truck.",
+      duplicateDrivers
+    );
+  }
+  const dependencyStructureChanges = await assertNoConsolidationStructureConflict(previousPlan, candidate);
+  const assignmentConflicts = await dispatchLoadAssignmentConflicts(previousPlan, candidate);
+  if (assignmentConflicts.length) {
+    const first = assignmentConflicts[0] || {};
+    throw dispatchV2CandidateConflict(
+      first.code || "DISPATCH_DRIVER_TIME_CONFLICT",
+      first.message || "Driver or truck assignment is invalid.",
+      assignmentConflicts
+    );
+  }
+  const dateConflicts = await findNewDispatchPlanDateConflicts(previousPlan, candidate);
+  if (dateConflicts.length) {
+    const preview = dateConflicts.slice(0, 5).map((item) => `${item.orderRef} on ${item.planDate}`).join(", ");
+    throw dispatchV2CandidateConflict(
+      "DISPATCH_ORDER_ALREADY_PLANNED",
+      `Some orders are already planned on another date${preview ? `: ${preview}` : "."}`,
+      dateConflicts
+    );
+  }
+  const coSequenceConflicts = await findChangedDispatchCoSequenceConflicts(previousPlan, candidate);
+  if (coSequenceConflicts.length) {
+    throw dispatchV2CandidateConflict(
+      "DISPATCH_CO_SEQUENCE_INVALID",
+      coSequenceConflicts.slice(0, 3).map((item) => item.reason).join(" ") || "CO must be planned before the original order pickup.",
+      coSequenceConflicts
+    );
+  }
+  const dependencyConflicts = await validateDispatchPlanDependencies(candidate);
+  if (dependencyConflicts.length) {
+    throw dispatchV2CandidateConflict(
+      "DISPATCH_ORDER_DEPENDENCY_CONFLICT",
+      String(dependencyConflicts[0] || "Order dependency timing is invalid."),
+      dependencyConflicts
+    );
+  }
+
+  const explicitOperatorAlertRefs = [...new Set((payload.operatorAlertRefs || [])
+    .map((ref) => String(ref || "").trim())
+    .filter(Boolean))];
+  const beforePlanned = dispatchPlannedOrderRefs(previousPlan);
+  const afterPlanned = dispatchPlannedOrderRefs(candidate);
+  const placementChanges = [...new Set([...beforePlanned, ...afterPlanned])]
+    .filter((ref) => beforePlanned.has(ref) !== afterPlanned.has(ref));
+  const affectedOrderRefs = [...new Set([
+    ...placementChanges,
+    ...changedScmRefs,
+    ...changedDispatchOperatorRefs(previousPlan, candidate),
+    ...changedDispatchOrderStructureRefs(previousPlan, candidate),
+    ...explicitOperatorAlertRefs,
+    ...(payload.affectedOrderRefs || [])
+  ].map((ref) => String(ref || "").trim()).filter(Boolean))];
+  return {
+    ...command,
+    payload: {
+      ...payload,
+      planDate: existingPlanDate,
+      orders: cleanOrders,
+      trucks: cleanTrucks,
+      summary: await dispatchPlanSummaryWithSetup(payload.summary || {}),
+      affectedOrderRefs,
+      operatorAlertRefs: explicitOperatorAlertRefs,
+      safeUngroupTargets: dependencyStructureChanges.safeUngroupTargets || []
+    }
+  };
+}
+
+app.post("/api/dispatch/v2/plans/:id/commands", requireOperator, requireDispatcher, async (req, res, next) => {
+  try {
+    dispatchPrivateNoStore(res);
+    const previousPlan = await getDispatchPlan(req.params.id);
+    if (!previousPlan) return res.status(404).json({ error: "Dispatch plan not found", code: "DISPATCH_PLAN_NOT_FOUND" });
+    await requireDispatchV2PlanEditLease(req, previousPlan.planDate);
+    const submittedCommand = {
+      ...(req.body || {}),
+      sourceRequestHash: crypto.createHash("sha256").update(JSON.stringify(stableJsonValue({
+        commandId: String(req.body?.commandId || ""),
+        baseRevision: Number(req.body?.baseRevision),
+        baseDigest: String(req.body?.baseDigest || ""),
+        commandType: String(req.body?.commandType || req.body?.type || ""),
+        payload: req.body?.payload || {}
+      }))).digest("hex")
+    };
+    const stored = await getDispatchV2CommandReplay({ command: submittedCommand });
+    if (stored) {
+      res.setHeader("X-Dispatch-Idempotent-Replay", "true");
+      return res.json(stored.payload);
+    }
+    const command = String(submittedCommand.commandType || submittedCommand.type || "") === "replace_plan"
+      ? await prepareDispatchV2ReplaceCommand(previousPlan, submittedCommand)
+      : submittedCommand;
+    const result = await applyDispatchV2Command({
+      planId: req.params.id,
+      command,
+      actorId: req.operator?.id || null
+    });
+    if (result.replay) res.setHeader("X-Dispatch-Idempotent-Replay", "true");
+    if (!result.replay) {
+      emitAppEvent("dispatch.plan.saved", {
+        planId: result.payload.plan.id,
+        planDate: result.payload.plan.planDate,
+        revision: result.payload.plan.revision,
+        savedAt: result.payload.plan.savedAt,
+        sourceSessionId: command.sessionId || "",
+        commandType: command.commandType || command.type || "",
+        affectedOrderRefs: dispatchV2PatchOrderRefs(result.payload.patch || {})
+      });
+      void writeDispatchAudit({
+        action: `dispatch_plan_${String(result.payload.patch?.actionName || command.commandType || command.type || "command")}`,
+        entityType: "plan",
+        entityId: String(result.payload.plan.id),
+        planId: result.payload.plan.id,
+        planDate: result.payload.plan.planDate,
+        operatorId: req.operator?.id,
+        operatorName: req.operator?.display_name || req.operator?.username,
+        sessionId: command.sessionId || "",
+        after: result.payload.patch,
+        details: {
+          commandId: command.commandId || "",
+          revision: result.payload.plan.revision,
+          incremental: true
+        }
+      }).catch(() => null);
+    }
+    res.json(result.payload);
+  } catch (error) {
+    if (error instanceof DispatchPlanEditLeaseError) return sendDispatchPlanEditLeaseError(res, error);
+    next(error);
+  }
+});
+
+app.get("/api/dispatch/v2/plans/:id/checkpoints", requireOperator, requireDispatcher, async (req, res, next) => {
+  try {
+    dispatchPrivateNoStore(res);
+    res.json({ checkpoints: await listDispatchV2Checkpoints({ planId: req.params.id, date: req.query.date || "" }) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/dispatch/v2/plans/:id/checkpoints/:checkpointId", requireOperator, requireDispatcher, async (req, res, next) => {
+  try {
+    dispatchPrivateNoStore(res);
+    const checkpoint = await getDispatchV2Checkpoint({
+      planId: req.params.id,
+      checkpointId: req.params.checkpointId
+    });
+    if (!checkpoint) return res.status(404).json({ error: "Dispatch checkpoint not found" });
+    res.json({ checkpoint });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/dispatch/v2/plans/:id/changes", requireOperator, requireDispatcher, async (req, res, next) => {
+  try {
+    dispatchPrivateNoStore(res);
+    const sinceRevision = Math.max(0, Number(req.query.sinceRevision) || 0);
+    const result = await query(
+      `SELECT command_id, command_type, base_revision, applied_revision, result, created_at
+         FROM dispatch_plan_commands
+        WHERE plan_id = $1
+          AND applied_revision > $2
+        ORDER BY applied_revision
+        LIMIT 200`,
+      [req.params.id, sinceRevision]
+    );
+    res.json({
+      changes: result.rows.map((row) => ({
+        commandId: row.command_id,
+        commandType: row.command_type,
+        baseRevision: Number(row.base_revision),
+        revision: Number(row.applied_revision),
+        patch: row.result?.patch || {},
+        createdAt: row.created_at
+      }))
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/dispatch/plans", async (req, res, next) => {
   try {
     res.json(await listDispatchPlans({ limit: req.query.limit }));
@@ -9496,7 +9814,9 @@ app.post("/api/dispatch/plans", requireOperator, requireDispatcher, async (req, 
 app.get("/api/dispatch/plans/current", async (req, res, next) => {
   try {
     const plan = await getCurrentDispatchPlan({ planDate: req.query.date });
-    res.json(plan || { savedAt: "", orders: [], trucks: [], planDate: req.query.date || new Date().toISOString().slice(0, 10) });
+    res.json(plan
+      ? { ...plan, exists: true }
+      : { exists: false, savedAt: "", orders: [], trucks: [], planDate: req.query.date || new Date().toISOString().slice(0, 10) });
   } catch (error) {
     if (error instanceof DispatchPlanEditLeaseError) return sendDispatchPlanEditLeaseError(res, error);
     next(error);
@@ -10615,7 +10935,14 @@ app.post("/api/dispatch/order-dependencies", async (req, res, next) => {
       operatorId: req.operator?.id
     });
     emitAppEvent("dispatch.orders.updated", { source: "order-dependency", orderId: dependency.salesOrderRef, refreshOrderPool: true });
-    res.status(201).json({ dependency, orders: await listDispatchOrdersForResponse() });
+    res.status(201).json({
+      dependency,
+      ...await dispatchMutationOrderResponse(req, [
+        dependency.dispatchTargetRef,
+        dependency.salesOrderRef,
+        dependency.transferOrderRef
+      ])
+    });
   } catch (error) {
     if (error instanceof DispatchPlanEditLeaseError) return sendDispatchPlanEditLeaseError(res, error);
     next(error);
@@ -10633,7 +10960,14 @@ app.patch("/api/dispatch/order-dependencies/:id/mode", async (req, res, next) =>
       planDate
     );
     emitAppEvent("dispatch.orders.updated", { source: "order-dependency-mode", orderId: dependency.salesOrderRef, refreshOrderPool: true });
-    res.json({ dependency, orders: await listDispatchOrdersForResponse() });
+    res.json({
+      dependency,
+      ...await dispatchMutationOrderResponse(req, [
+        dependency.dispatchTargetRef,
+        dependency.salesOrderRef,
+        dependency.transferOrderRef
+      ])
+    });
   } catch (error) {
     if (error instanceof DispatchPlanEditLeaseError) return sendDispatchPlanEditLeaseError(res, error);
     next(error);
@@ -10646,7 +10980,10 @@ app.delete("/api/dispatch/order-dependencies/:id", async (req, res, next) => {
     await requireDispatchPlanEditLease(req, planDate);
     const cancelled = await cancelOrderDependency(req.params.id, req.operator?.id, planDate);
     emitAppEvent("dispatch.orders.updated", { source: "order-dependency-unlink", refreshOrderPool: true });
-    res.json({ cancelled, orders: await listDispatchOrdersForResponse() });
+    res.json({
+      cancelled,
+      ...await dispatchMutationOrderResponse(req, req.body?.orderRefs || [])
+    });
   } catch (error) {
     if (error instanceof DispatchPlanEditLeaseError) return sendDispatchPlanEditLeaseError(res, error);
     next(error);
@@ -12196,7 +12533,8 @@ app.put("/api/dispatch/orders/:id/vendor-yard", async (req, res, next) => {
       details: { vendorYardId: req.body?.vendorYardId }
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { orderId: req.params.id, type: "PO", change: "vendor_yard", sourceSessionId: req.body?.audit?.sessionId });
-    res.json({ updated, orders: await listDispatchOrdersForResponse({ type: "PO" }) });
+    const orderResponse = await dispatchMutationOrderResponse(req, [req.params.id], { legacyType: "PO" });
+    res.json({ updated, order: req.query.response === "targeted" ? orderResponse.orders[0] || null : undefined, ...orderResponse });
   } catch (error) {
     next(error);
   }
@@ -12225,6 +12563,10 @@ app.put("/api/dispatch/orders/:id/details", async (req, res, next) => {
       }
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { orderId: req.params.id, change: "details", sourceSessionId: req.body?.audit?.sessionId });
+    if (req.query.response === "targeted") {
+      const order = (await targetedDispatchMutationOrders([req.params.id]))[0] || null;
+      return res.json({ updated, order });
+    }
     res.json({ updated, orders: await listDispatchOrdersForResponse() });
   } catch (error) {
     next(error);
@@ -12281,7 +12623,12 @@ app.post("/api/dispatch/orders/:id/po-allocations", async (req, res, next) => {
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { orderId: req.params.id, change: "so_po_allocation", sourceSessionId: req.body?.audit?.sessionId });
     emitAppEvent("delivery.order.updated", { orderRef: req.params.id, change: "so_po_allocation", sourceSessionId: req.body?.audit?.sessionId });
-    res.json({ allocations, allocation: allocations[0] || null, options: await getSalesOrderPoAllocationOptions(req.params.id, { planDate: req.body?.planDate || "" }), orders: await listDispatchOrdersForResponse() });
+    res.json({
+      allocations,
+      allocation: allocations[0] || null,
+      options: await getSalesOrderPoAllocationOptions(req.params.id, { planDate: req.body?.planDate || "" }),
+      ...await dispatchMutationOrderResponse(req, [req.params.id, req.body?.poRef || allocations[0]?.poOrderRef])
+    });
   } catch (error) {
     next(error);
   }
@@ -12303,7 +12650,11 @@ app.delete("/api/dispatch/po-allocations/:allocationId", async (req, res, next) 
     const targetRef = cancelled.dispatchTargetRef || cancelled.salesOrderRef;
     emitAppEvent("dispatch.orders.updated", { orderId: targetRef, change: "so_po_allocation_cancelled", sourceSessionId: req.query.sessionId });
     emitAppEvent("delivery.order.updated", { orderRef: targetRef, change: "so_po_allocation_cancelled", sourceSessionId: req.query.sessionId });
-    res.json({ cancelled, options: await getSalesOrderPoAllocationOptions(targetRef, { planDate: req.query.planDate || "" }), orders: await listDispatchOrdersForResponse() });
+    res.json({
+      cancelled,
+      options: await getSalesOrderPoAllocationOptions(targetRef, { planDate: req.query.planDate || "" }),
+      ...await dispatchMutationOrderResponse(req, [targetRef, cancelled.poOrderRef])
+    });
   } catch (error) {
     next(error);
   }
@@ -12402,7 +12753,10 @@ app.delete("/api/dispatch/co-orders/:coRef", async (req, res, next) => {
     }).catch(() => null);
     emitAppEvent("dispatch.co.updated", { coRef: req.params.coRef, cancelled: true, sourceSessionId: req.query.sessionId });
     emitAppEvent("delivery.order.updated", { coRef: req.params.coRef, cancelled: true, source: "dispatch-co" });
-    res.json({ cancelled, orders: await listDispatchOrdersForResponse() });
+    res.json({
+      cancelled,
+      ...await dispatchMutationOrderResponse(req, [cancelled.source_order_ref || cancelled.sourceOrderRef])
+    });
   } catch (error) {
     next(error);
   }
@@ -17697,6 +18051,12 @@ app.use((error, req, res, next) => {
     error: error.message,
     ...(error.code ? { code: error.code } : {}),
     ...(Array.isArray(error.conflicts) ? { conflicts: error.conflicts } : {}),
+    ...(error.expectedRevision !== undefined ? { expectedRevision: error.expectedRevision } : {}),
+    ...(error.currentRevision !== undefined ? { currentRevision: error.currentRevision } : {}),
+    ...(error.expectedDigest ? { expectedDigest: error.expectedDigest } : {}),
+    ...(error.currentDigest ? { currentDigest: error.currentDigest } : {}),
+    ...(error.expectedPlanDate ? { expectedPlanDate: error.expectedPlanDate } : {}),
+    ...(error.payloadPlanDate ? { payloadPlanDate: error.payloadPlanDate } : {}),
     ...(error.requiredReturnLocation ? { requiredReturnLocation: error.requiredReturnLocation } : {}),
     ...(error.available !== undefined ? { available: error.available } : {}),
     ...(error.sourceLineId !== undefined ? { sourceLineId: error.sourceLineId } : {})
@@ -17831,6 +18191,95 @@ async function returnCustomerDirectorySyncTick() {
   }
 }
 
+let dispatchV2FollowupTickRunning = false;
+let dispatchV2CheckpointRetentionRunning = false;
+
+function dispatchV2PatchOrderRefs(patch = {}) {
+  return [...new Set([
+    ...(patch.affectedOrderRefs || []),
+    ...(patch.operatorAlertRefs || []),
+    ...(patch.removedOrderRefs || []),
+    ...(patch.assignedOrderRefs || []),
+    ...(patch.ungroupedOrderRefs || []),
+    ...(patch.group?.orderRefs || []),
+    patch.group?.ref,
+    patch.split?.sourceOrderRef,
+    ...(patch.split?.parts || []).map((part) => part?.refNumber || part?.id),
+    patch.sourceOrder?.refNumber || patch.sourceOrder?.id,
+    patch.co?.refNumber || patch.co?.id
+  ].map((value) => String(value || "").trim()).filter(Boolean))];
+}
+
+export async function dispatchV2FollowupTick() {
+  if (dispatchV2FollowupTickRunning) return { skipped: true, claimed: 0, completed: 0, failed: 0 };
+  dispatchV2FollowupTickRunning = true;
+  const summary = { skipped: false, claimed: 0, completed: 0, failed: 0 };
+  try {
+    const rows = await pendingDispatchV2Followups({ limit: 25 });
+    summary.claimed = rows.length;
+    for (const row of rows) {
+      try {
+        const plan = await getDispatchPlan(String(row.plan_id || ""));
+        if (!plan) throw new Error(`Dispatch plan ${row.plan_id || "unknown"} no longer exists.`);
+        const updatedBy = `dispatch-v2:${String(row.command_id || "")}`;
+        const completedStages = new Set(Object.entries(row.progress || {})
+          .filter(([, state]) => Boolean(state?.completedAt))
+          .map(([stage]) => stage));
+        if (!completedStages.has("order_dependencies")) {
+          await syncOrderDependenciesFromDispatchPlan(plan, {
+            allowEstablishedUngroupTargets: row.result?.patch?.safeUngroupTargets || []
+          });
+          await advanceDispatchV2Followup(row.id, "order_dependencies");
+        }
+        if (!completedStages.has("co_assignments")) {
+          await applyDispatchPlanCoAssignments(plan);
+          await advanceDispatchV2Followup(row.id, "co_assignments");
+        }
+        if (!completedStages.has("scm_schedule")) {
+          await syncScmScheduleFromDispatchPlan(plan, { updatedBy });
+          await advanceDispatchV2Followup(row.id, "scm_schedule");
+        }
+        const changedOrderRefs = dispatchV2PatchOrderRefs(row.result?.patch || {});
+        if (!completedStages.has("delivery_materialization")) {
+          if (plan.status === "confirmed") {
+            await applyConfirmedDispatchPlanToDelivery(plan, { forceOrderRefs: changedOrderRefs });
+          }
+          await advanceDispatchV2Followup(row.id, "delivery_materialization");
+        }
+        await completeDispatchV2Followup(row.id);
+        summary.completed += 1;
+        emitAppEvent("dispatch.plan.followups.completed", {
+          planId: plan.id,
+          planDate: plan.planDate,
+          commandId: row.command_id,
+          commandType: row.command_type,
+          changedOrderRefs
+        });
+      } catch (error) {
+        summary.failed += 1;
+        await failDispatchV2Followup(row.id, error);
+        console.error(`Dispatch v2 follow-up failed for command ${row.command_id || "unknown"}:`, error.message);
+      }
+    }
+    return summary;
+  } finally {
+    dispatchV2FollowupTickRunning = false;
+  }
+}
+
+export async function dispatchV2CheckpointRetentionTick() {
+  if (dispatchV2CheckpointRetentionRunning) return { skipped: true, deleted: 0, checkpointIds: [] };
+  dispatchV2CheckpointRetentionRunning = true;
+  try {
+    return { skipped: false, ...await pruneExpiredDispatchV2Checkpoints({ retentionDays: 7, batchSize: 500 }) };
+  } catch (error) {
+    console.error("Dispatch v2 checkpoint retention failed:", error.message);
+    return { skipped: false, deleted: 0, checkpointIds: [], error: error.message };
+  } finally {
+    dispatchV2CheckpointRetentionRunning = false;
+  }
+}
+
 export async function startServer() {
   await recoverInterruptedSyncState();
   await recoverInterruptedPhotoArchive();
@@ -17854,6 +18303,10 @@ export async function startServer() {
     setInterval(() => void returnReconciliationTick(), 15 * 60 * 1000);
     setInterval(() => void returnCustomerDirectorySyncTick(), 5 * 60 * 1000);
     setInterval(() => void scmReconciliationScheduledTick(), 60000);
+    setTimeout(() => void dispatchV2FollowupTick(), 2000);
+    setInterval(() => void dispatchV2FollowupTick(), 30000);
+    setTimeout(() => void dispatchV2CheckpointRetentionTick(), 60000);
+    setInterval(() => void dispatchV2CheckpointRetentionTick(), 24 * 60 * 60 * 1000);
   });
 }
 

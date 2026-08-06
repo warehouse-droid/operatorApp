@@ -14,7 +14,8 @@ const sharedGlobals = {
   clearInterval: "readonly",
   clearTimeout: "readonly",
   URL: "readonly",
-  URLSearchParams: "readonly"
+  URLSearchParams: "readonly",
+  performance: "readonly"
 };
 
 export default [
@@ -33,6 +34,35 @@ export default [
       curly: ["error", "all"],
       eqeqeq: ["error", "always"],
       "max-depth": ["error", 4],
+      "no-constant-condition": "error",
+      "no-duplicate-imports": "error",
+      "no-implicit-coercion": "error",
+      "no-shadow": "error",
+      "no-undef": "error",
+      "no-unreachable": "error",
+      "no-unused-vars": ["error", {
+        "argsIgnorePattern": "^_",
+        "caughtErrorsIgnorePattern": "^_",
+        "varsIgnorePattern": "^_"
+      }],
+      "no-useless-catch": "error",
+      "no-var": "error",
+      "prefer-const": "error"
+    }
+  },
+  {
+    files: ["src/dispatch-planner-*.js", "test/dispatch/**/*.js"],
+    languageOptions: {
+      ecmaVersion: "latest",
+      sourceType: "module",
+      globals: sharedGlobals
+    },
+    linterOptions: {
+      reportUnusedDisableDirectives: "error"
+    },
+    rules: {
+      curly: ["error", "all"],
+      eqeqeq: ["error", "always"],
       "no-constant-condition": "error",
       "no-duplicate-imports": "error",
       "no-implicit-coercion": "error",

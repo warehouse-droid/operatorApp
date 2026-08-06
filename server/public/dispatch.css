@@ -6589,7 +6589,10 @@ button[data-action="enter-edit-mode"]:disabled:hover {
 .modal-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 50;
+  /* The shared application sidebar uses z-index 4200. Dispatch dialogs must
+     remain the top interactive layer, including on horizontally scrolled
+     mobile planning boards. */
+  z-index: 5000;
   background: rgba(16, 24, 32, 0.45);
   display: none;
   align-items: center;

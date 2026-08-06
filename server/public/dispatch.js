@@ -481,6 +481,7 @@ let orderListScrollTop = 0;
 let loadPreviewWidth = Number(dispatchStorageGet("mbbs.dispatch.previewWidth", "520"));
 let isResizingPreview = false;
 let renderUiSequence = 0;
+let dispatchPersistentFocusSelector = "";
 let lastServerSavedAt = "";
 let saveTimer = null;
 let saveInFlight = false;
@@ -509,7 +510,9 @@ let historyReady = false;
 let isApplyingHistory = false;
 let pendingOperatorAlertRefs = new Set();
 let nextSaveNeedsOrderPoolRefresh = false;
+let pendingTargetedOrderRefreshRefs = new Set();
 let nextPlanSaveMode = "";
+let pendingPlanMutationAction = "dispatch_plan_autosaved";
 let plannedAssignmentRefs = new Set();
 const HISTORY_LIMIT = 20;
 const HISTORY_MEMORY_LIMIT_BYTES = 32 * 1024 * 1024;
@@ -517,6 +520,8 @@ const DISPATCH_PLAN_KEY = DISPATCH_PLAN_CACHE_KEY;
 const DISPATCH_PLAN_DATE_KEY = "mbbs.dispatch.planDate";
 let currentPlanDate = dispatchStorageGet(DISPATCH_PLAN_DATE_KEY, "") || todayLocalDate();
 let currentPlan = null;
+let dispatchPlannerSnapshotState = "loading";
+let dispatchPlannerSnapshotError = "";
 let planHistory = [];
 let planEditLease = null;
 let planEditLeaseToken = "";
@@ -535,16 +540,24 @@ function isDispatchPlanEditor() {
   return Boolean(planEditMode && planEditLeaseToken && planEditLease?.active && planEditLease?.sessionId === dispatchSessionId);
 }
 
+function canMutateDispatchPlan() {
+  return dispatchPlannerSnapshotState === "ready" && isDispatchPlanEditor();
+}
+
 function ensureDispatchPlanEditor() {
-  if (isDispatchPlanEditor()) return true;
-  routeNotice = dispatchEditModeMessage();
+  if (canMutateDispatchPlan()) return true;
+  routeNotice = dispatchPlannerSnapshotState === "ready"
+    ? dispatchEditModeMessage()
+    : dispatchPlannerSnapshotState === "loading"
+      ? "Wait for the current Dispatch plan to finish loading before making changes."
+      : "The current Dispatch snapshot could not be verified. Reload it before making changes.";
   render({ save: false });
   return false;
 }
 
 const DISPATCH_VIEW_MUTATION_ACTIONS = new Set([
   "undo-plan", "redo-plan", "confirm-plan", "reopen-plan",
-  "open-group-modal", "confirm-group", "ungroup-order", "open-split-modal", "confirm-split", "unsplit-order", "request-unpack-for-split",
+  "confirm-group", "ungroup-order", "confirm-split", "unsplit-order", "request-unpack-for-split",
   "open-consolidate-modal", "confirm-consolidate", "open-po-link-modal", "open-to-link-modal", "confirm-po-link",
   "open-co-modal", "confirm-co", "open-po-yard-modal", "confirm-po-yard", "cancel-po-link",
   "link-order-dependency", "update-dependency-mode", "unlink-dependency",
@@ -642,6 +655,9 @@ function startDispatchEditHeartbeat() {
 }
 
 async function enterDispatchEditMode() {
+  if (dispatchPlannerSnapshotState !== "ready") {
+    throw new Error("Wait until the current Dispatch snapshot is verified before entering Edit Mode.");
+  }
   const response = await fetch("/api/dispatch/plan-edit-lease/acquire", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -3326,6 +3342,33 @@ function applyDispatchOrderFeed(feed) {
   if (!selectedOrderIds.size && selectedOrderId) selectedOrderIds.add(selectedOrderId);
 }
 
+function preserveDispatchPlanningFields(existing = {}, fresh = {}) {
+  const planningKeys = [
+    "assigned",
+    "localDispatchStatus",
+    "childOrders",
+    "childOrderDetails",
+    "consolidation",
+    "originalOrderId",
+    "originalPallets",
+    "transitCo",
+    "transitOriginalPickupLocations",
+    "groupAliases",
+    "planOwned",
+    "isSplit",
+    "isGrouped"
+  ];
+  const planning = Object.fromEntries(planningKeys
+    .filter((key) => existing[key] !== undefined)
+    .map((key) => [key, existing[key]]));
+  return { ...fresh, ...planning };
+}
+
+function mergeFreshDispatchOperationalOrder(existing = {}, candidate = {}, activityEvidence = activePhysicalOrderEvidence()) {
+  const fresh = preserveDispatchPlanningFields(existing, candidate);
+  return normalizeOrder(preserveActiveOrderEvidence(existing, fresh, activityEvidence));
+}
+
 function mergeDispatchOrderSearchFeed(feed) {
   const candidates = Array.isArray(feed) ? feed.map(normalizeOrder).filter((order) => order.id) : [];
   if (!candidates.length) return;
@@ -3338,11 +3381,11 @@ function mergeDispatchOrderSearchFeed(feed) {
   const ordersById = new Map(orders.map((order) => [order.id, order]));
   for (const candidate of candidates) {
     const existing = ordersById.get(candidate.id);
-    const merged = normalizeOrder(existing ? { ...candidate, ...existing } : candidate);
+    const merged = existing
+      ? mergeFreshDispatchOperationalOrder(existing, candidate, activityEvidence)
+      : normalizeOrder(candidate);
     ordersById.set(candidate.id, merged);
-    catalogById.set(candidate.id, normalizeOrder(catalogById.has(candidate.id)
-      ? { ...candidate, ...catalogById.get(candidate.id) }
-      : candidate));
+    catalogById.set(candidate.id, normalizeOrder(candidate));
   }
   orders = [...ordersById.values()];
   orderCatalog = [...catalogById.values()];
@@ -3350,6 +3393,42 @@ function mergeDispatchOrderSearchFeed(feed) {
   orders = reapplyActiveOrderEvidence(orders, evidenceBaselines, activityEvidence);
   reconcilePickupStopRepresentatives({ audit: true });
   invalidateRoutesChangedByOrderFeed(routeSignaturesBefore);
+}
+
+function mergeTargetedDispatchMutationOrders(payload) {
+  const responsePayload = payload || {};
+  const candidates = [
+    responsePayload.order,
+    ...(Array.isArray(responsePayload.orders) ? responsePayload.orders : [])
+  ].filter(Boolean);
+  if (candidates.length) mergeDispatchOrderSearchFeed(candidates);
+  return candidates;
+}
+
+function renderDispatchOrderPoolPatch() {
+  const current = app.querySelector("[data-dispatch-order-pool]");
+  if (!current) return;
+  const active = document.activeElement;
+  const restoreSearchFocus = active?.id === "orderSearch";
+  const selectionStart = restoreSearchFocus ? active.selectionStart : null;
+  current.outerHTML = renderOrderPool();
+  if (restoreSearchFocus) {
+    const next = document.getElementById("orderSearch");
+    next?.focus({ preventScroll: true });
+    if (selectionStart !== null) next?.setSelectionRange(selectionStart, selectionStart);
+  }
+}
+
+async function applyTargetedDispatchOrderUpdate(orderId) {
+  const response = await fetch(`/api/dispatch/v2/order-feed/${encodeURIComponent(orderId)}`, {
+    headers: { "Cache-Control": "no-cache" }
+  });
+  if (!response.ok) throw new Error(await dispatchErrorMessage(response));
+  const payload = await response.json();
+  if (!payload?.order) throw new Error("The refreshed Dispatch order was not returned.");
+  mergeDispatchOrderSearchFeed([payload.order]);
+  renderDispatchOrderPoolPatch();
+  return payload.order;
 }
 
 function cancelDispatchOrderSearch() {
@@ -3894,7 +3973,10 @@ async function loadDispatchForecast({ renderAfter = false } = {}) {
       || Number(forecast?.planRevision ?? forecast?.revision ?? 0) !== revision
     ) return false;
     dispatchForecast = forecast;
-    if (renderAfter && !dispatchBackgroundRenderBlocked()) render({ save: false });
+    if (renderAfter && !dispatchBackgroundRenderBlocked()) {
+      if (renderAfter === "planner") renderDispatchPlannerPatch();
+      else render({ save: false });
+    }
     return true;
   } catch {
     // Forecast is advisory. Keep the last revision-matched response on transient failures.
@@ -4388,16 +4470,59 @@ function planPayload(savedAt = new Date()) {
     baseRevision: nextPlanSaveMode === "truck_sequence" ? null : (currentPlan?.revision ?? 0),
     saveMode: nextPlanSaveMode || "",
     savedAt: savedAt.toISOString(),
+    mutationAction: pendingPlanMutationAction,
     refreshOrderPool: Boolean(nextSaveNeedsOrderPoolRefresh),
     summary: planSummary(),
     orders: orders
       .filter((order) => !hiddenOrderIds.has(order.id))
+      .filter((order) => assignedIds.has(order.id) || isDispatchPlanOwnedOrder(order))
       .map((order) => ({
         ...order,
         localDispatchStatus: assignedIds.has(order.id) ? "planned" : "open"
       })),
     trucks: trucksWithTimingMetadata()
   };
+}
+
+function reduceDispatchPlanCommand(state, command) {
+  state ||= {};
+  command ||= {};
+  const next = {
+    ...state,
+    orders: Array.isArray(state.orders) ? [...state.orders] : [],
+    trucks: (state.trucks || []).map((truck) => ({
+      ...truck,
+      loads: (truck.loads || []).map((load) => ({ ...load, stops: [...(load.stops || [])] }))
+    }))
+  };
+  const payload = command.payload || {};
+  const ref = String(payload.orderRef || "");
+  if (command.type === "remove_order") {
+    for (const truck of next.trucks || []) {
+      for (const load of truck.loads || []) {
+        load.stops = (load.stops || []).filter((stop) => {
+          const refs = Array.isArray(stop.orderRefs) ? stop.orderRefs.map(String) : [String(stop.orderId || "")];
+          return !refs.includes(ref);
+        });
+      }
+    }
+  }
+  if (command.type === "assign_order") {
+    const load = (next.trucks || []).flatMap((truck) => truck.loads || [])
+      .find((candidate) => String(candidate.id || "") === String(payload.loadId || ""));
+    if (load) load.stops.push({ ...(payload.stop || { id: `dispatch-${ref}`, type: "drop", orderId: ref }) });
+  }
+  return next;
+}
+
+function isDispatchPlanOwnedOrder(order = {}) {
+  return ["CO", "CUSTOM", "GROUP"].includes(String(order.type || "").toUpperCase())
+    || Boolean(order.originalOrderId)
+    || Boolean(order.transitCo)
+    || Boolean(order.planOwned)
+    || Boolean(order.isSplit)
+    || Boolean(order.isGrouped)
+    || Array.isArray(order.childOrders) && order.childOrders.length > 0;
 }
 
 function trucksWithTimingMetadata() {
@@ -4504,6 +4629,14 @@ function payloadRequiresSave(payload = {}, nextHash = stablePlanHashPayload(payl
 }
 
 function requestOrderPoolRefreshOnNextSave() {
+  nextSaveNeedsOrderPoolRefresh = true;
+}
+
+function requestTargetedOrderPoolRefresh(orderRefs = []) {
+  for (const ref of orderRefs || []) {
+    const clean = String(ref || "").trim();
+    if (clean) pendingTargetedOrderRefreshRefs.add(clean);
+  }
   nextSaveNeedsOrderPoolRefresh = true;
 }
 
@@ -4853,8 +4986,98 @@ function applySavedPlan(saved) {
 
 function compactCurrentPlan(plan) {
   if (!plan?.id) return plan || null;
-  const { orders: _orders, trucks: _trucks, ...metadata } = plan;
+  const {
+    orders: _orders,
+    trucks: _trucks,
+    assignedOrders: _assignedOrders,
+    assignedOrderSnapshots: _assignedOrderSnapshots,
+    ...metadata
+  } = plan;
   return metadata;
+}
+
+function applyCompactDispatchPlanSnapshot(snapshot) {
+  snapshot ||= {};
+  const assignedOrders = Array.isArray(snapshot.assignedOrderSnapshots)
+    ? snapshot.assignedOrderSnapshots
+    : Array.isArray(snapshot.assignedOrders)
+      ? snapshot.assignedOrders
+      : [];
+  const materialized = {
+    ...snapshot,
+    orders: assignedOrders,
+    trucks: Array.isArray(snapshot.trucks) ? snapshot.trucks : []
+  };
+  const applied = applySavedPlan(materialized);
+  currentPlan = compactCurrentPlan(materialized);
+  currentPlanDate = materialized.planDate || currentPlanDate;
+  dispatchStorageSet(DISPATCH_PLAN_DATE_KEY, currentPlanDate);
+  lastServerSavedAt = materialized.savedAt || materialized.updatedAt || lastServerSavedAt;
+  return applied;
+}
+
+function applyDispatchPlanSnapshotResult(snapshot) {
+  if (snapshot?.exists === false) {
+    currentPlan = null;
+    resetPlanningBoard();
+    dispatchPlannerSnapshotState = "ready";
+    dispatchPlannerSnapshotError = "";
+    return { loaded: false, hasSnapshot: false };
+  }
+  const plan = snapshot?.plan || snapshot;
+  if (!plan?.id || !Array.isArray(plan.trucks)) {
+    if (currentPlan?.id) dispatchPlannerSnapshotState = "stale";
+    else dispatchPlannerSnapshotState = "failed";
+    dispatchPlannerSnapshotError = "The server did not return a valid Dispatch snapshot.";
+    return { loaded: false, hasSnapshot: Boolean(currentPlan?.id), invalid: true };
+  }
+  applyCompactDispatchPlanSnapshot(plan);
+  dispatchPlannerSnapshotState = "ready";
+  dispatchPlannerSnapshotError = "";
+  return { loaded: true, hasSnapshot: true };
+}
+
+function shouldUseDispatchIncrementalSave(payload = {}, { forceSave = false } = {}) {
+  return !forceSave
+    && payload.saveMode !== "truck_sequence"
+    && Boolean(payload.planId)
+    && Number.isFinite(Number(payload.baseRevision))
+    && Boolean(currentPlan?.digest)
+    && dispatchPlannerSnapshotState === "ready";
+}
+
+function dispatchIncrementalSaveRequest(targetPlanId, payload, options) {
+  options ||= {};
+  const { payloadHash = "", operatorAlertRefs = [] } = options;
+  const commandId = [
+    "dispatch-autosave",
+    dispatchSessionId,
+    Number(payload.baseRevision || 0),
+    payloadHash || stablePlanHashPayload(payload)
+  ].join(":");
+  return fetch(`/api/dispatch/v2/plans/${encodeURIComponent(targetPlanId)}/commands`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-dispatch-edit-lease": planEditLeaseToken
+    },
+    body: JSON.stringify({
+      commandId,
+      baseRevision: Number(payload.baseRevision || 0),
+      baseDigest: currentPlan?.digest || "",
+      sessionId: dispatchSessionId,
+      commandType: "replace_plan",
+      payload: {
+        planDate: payload.planDate,
+        orders: payload.orders || [],
+        trucks: payload.trucks || [],
+        summary: payload.summary || {},
+        actionName: payload.mutationAction || "dispatch_plan_autosaved",
+        operatorAlertRefs,
+        refreshOrderPool: Boolean(payload.refreshOrderPool)
+      }
+    })
+  });
 }
 
 async function savePlanToServer(payload, { retryOnStale = true, forceSave = false, payloadHash = "", saveGeneration = localPlanGeneration } = {}) {
@@ -4876,7 +5099,9 @@ async function savePlanToServer(payload, { retryOnStale = true, forceSave = fals
     payloadHash ||= stablePlanHashPayload(payload);
     const operatorAlertRefs = [...pendingOperatorAlertRefs];
     const refreshOrderPool = Boolean(payload.refreshOrderPool);
+    const targetedOrderRefs = [...pendingTargetedOrderRefreshRefs];
     const saveMode = payload.saveMode || "";
+    const incrementalSave = shouldUseDispatchIncrementalSave(payload, { forceSave });
     autosaveDebug("savePlanToServer:start", {
       baseRevision: payload.baseRevision,
       payloadHash: shortHash(payloadHash),
@@ -4884,21 +5109,23 @@ async function savePlanToServer(payload, { retryOnStale = true, forceSave = fals
       saveMode,
       refreshOrderPool
     });
-    const response = await fetch(`/api/dispatch/plans/${encodeURIComponent(targetPlanId)}`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        ...payload,
-        forceSave,
-        baseRevision: forceSave ? null : payload.baseRevision,
-        summary: planSummary(),
-        audit: {
-          sessionId: dispatchSessionId,
-          action: forceSave ? "dispatch_plan_force_saved" : saveMode === "truck_sequence" ? "dispatch_plan_truck_sequence_saved" : "dispatch_plan_autosaved",
-          details: { planDate: targetPlanDate, status: currentPlan?.status, operatorAlertRefs, refreshOrderPool, saveMode, forceSave }
-        }
-      })
-    });
+    const response = incrementalSave
+      ? await dispatchIncrementalSaveRequest(targetPlanId, payload, { payloadHash, operatorAlertRefs })
+      : await fetch(`/api/dispatch/plans/${encodeURIComponent(targetPlanId)}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ...payload,
+            forceSave,
+            baseRevision: forceSave ? null : payload.baseRevision,
+            summary: planSummary(),
+            audit: {
+              sessionId: dispatchSessionId,
+              action: forceSave ? "dispatch_plan_force_saved" : saveMode === "truck_sequence" ? "dispatch_plan_truck_sequence_saved" : "dispatch_plan_autosaved",
+              details: { planDate: targetPlanDate, status: currentPlan?.status, operatorAlertRefs, refreshOrderPool, saveMode, forceSave }
+            }
+          })
+        });
     autosaveDebug("savePlanToServer:response", {
       status: response.status,
       baseRevision: payload.baseRevision,
@@ -4911,7 +5138,7 @@ async function savePlanToServer(payload, { retryOnStale = true, forceSave = fals
         expectedRevision: conflict.expectedRevision,
         currentRevision: conflict.currentRevision,
         retryOnStale,
-        willRetry: conflict.code === "STALE_DISPATCH_PLAN" && retryOnStale && localPlanDirty
+        willRetry: !incrementalSave && conflict.code === "STALE_DISPATCH_PLAN" && retryOnStale && localPlanDirty
       });
       reportDispatchSaveError("conflict", new Error(conflict.error || conflict.message || `Plan save conflict (${response.status})`), {
         status: response.status,
@@ -4954,7 +5181,7 @@ async function savePlanToServer(payload, { retryOnStale = true, forceSave = fals
           revision: Number(conflict.currentRevision || 0)
         };
       }
-      if (conflict.code === "STALE_DISPATCH_PLAN" && retryOnStale && localPlanDirty) {
+      if (!incrementalSave && conflict.code === "STALE_DISPATCH_PLAN" && retryOnStale && localPlanDirty) {
         saveQueued = true;
         return { staleRetryQueued: true, code: conflict.code };
       }
@@ -4975,7 +5202,9 @@ async function savePlanToServer(payload, { retryOnStale = true, forceSave = fals
       render({ save: false });
       return { failed: true, error };
     }
-    const result = await response.json();
+    const responsePayload = await response.json();
+    const result = incrementalSave ? responsePayload.plan : responsePayload;
+    if (!result?.id) throw new Error("The server did not acknowledge the saved Dispatch plan.");
     const saveTargetsCurrentView = String(currentPlan?.id || "") === String(targetPlanId)
       && String(currentPlanDate || "").slice(0, 10) === String(targetPlanDate || "").slice(0, 10);
     const resultRevision = Number(result.revision || 0);
@@ -5008,7 +5237,10 @@ async function savePlanToServer(payload, { retryOnStale = true, forceSave = fals
     });
     if (result.noChange) {
       if (savedLatestLocal) {
-        if (refreshOrderPool) nextSaveNeedsOrderPoolRefresh = false;
+        if (refreshOrderPool) {
+          nextSaveNeedsOrderPoolRefresh = false;
+          targetedOrderRefs.forEach((ref) => pendingTargetedOrderRefreshRefs.delete(ref));
+        }
         if (saveMode === "truck_sequence") nextPlanSaveMode = "";
         clearLocalPlanDirty(payload.savedAt, saveGeneration);
         loadDispatchForecast({ renderAfter: true }).catch(() => null);
@@ -5027,14 +5259,28 @@ async function savePlanToServer(payload, { retryOnStale = true, forceSave = fals
             resetUndoHistory();
             isApplyingRemotePlan = false;
           })
+        : refreshOrderPool && targetedOrderRefs.length
+          ? Promise.all(targetedOrderRefs.map((ref) => applyTargetedDispatchOrderUpdate(ref).catch(() => null)))
         : refreshOrderPool
           ? loadDispatchOrders().then(() => restoreServerPlan())
           : refreshPlannedAssignments();
-      refreshAfterSave.then(() => render({ save: false })).catch(() => null);
-      if (refreshOrderPool) nextSaveNeedsOrderPoolRefresh = false;
+      refreshAfterSave.then(() => {
+        if (incrementalSave) {
+          renderDispatchOrderPoolPatch();
+          renderDispatchSaveStatePatch();
+        } else {
+          render({ save: false });
+        }
+      }).catch(() => null);
+      if (refreshOrderPool) {
+        nextSaveNeedsOrderPoolRefresh = false;
+        targetedOrderRefs.forEach((ref) => pendingTargetedOrderRefreshRefs.delete(ref));
+      }
       if (saveMode === "truck_sequence") nextPlanSaveMode = "";
+      if (payload.mutationAction === pendingPlanMutationAction) pendingPlanMutationAction = "dispatch_plan_autosaved";
       clearLocalPlanDirty(payload.savedAt, saveGeneration);
-      loadDispatchForecast({ renderAfter: true }).catch(() => null);
+      if (incrementalSave) renderDispatchSaveStatePatch();
+      loadDispatchForecast({ renderAfter: incrementalSave ? "planner" : true }).catch(() => null);
       operatorAlertRefs.forEach((ref) => pendingOperatorAlertRefs.delete(ref));
     } else {
       saveQueued = true;
@@ -5264,6 +5510,7 @@ function resetLocalPlanDirty() {
   const refreshSetup = blockedDispatchSetupUpdate;
   localPlanDirty = false;
   lastLocalPlanEditAt = "";
+  pendingPlanMutationAction = "dispatch_plan_autosaved";
   blockedRemotePlanUpdate = false;
   blockedDispatchSetupUpdate = false;
   if (refreshSetup) queueDispatchSetupRefresh(0);
@@ -5485,6 +5732,7 @@ function commitPlanMutation(actionName = "dispatch_plan_mutation", mutator = nul
   const planChanged = captureUndoPointIfNeeded(true);
   if (planChanged || options.forceSave) {
     if (planChanged) clearDispatchForecast();
+    pendingPlanMutationAction = actionName || "dispatch_plan_mutation";
     markLocalPlanDirty();
     autoSavePlan();
   }
@@ -5571,51 +5819,70 @@ async function loadPlanForDate(planDate = currentPlanDate, { createIfMissing = t
     driverNewTruckSelections.clear();
     resetActiveLinkModalState();
   }
-  const response = await fetch(`/api/dispatch/plans/current?date=${encodeURIComponent(planDate)}`);
-  if (!response.ok) throw new Error(await response.text());
-  let plan = await response.json();
+  dispatchPlannerSnapshotState = "loading";
+  dispatchPlannerSnapshotError = "";
   let created = false;
-  if (!plan?.id && createIfMissing && isDispatchPlanEditor()) {
-    plan = await createPlanForDate(planDate);
-    created = true;
-  }
-  currentPlan = plan?.id ? plan : null;
-  currentPlanDate = plan?.planDate || planDate;
-  dispatchStorageSet(DISPATCH_PLAN_DATE_KEY, currentPlanDate);
-  // Lease status controls editing only. A transient read failure must not prevent
-  // the read-only planning board from rendering.
   try {
-    await refreshDispatchPlanEditLease(currentPlanDate);
+    const params = new URLSearchParams({ date: String(planDate || currentPlanDate) });
+    if (currentPlan?.id && String(currentPlan.planDate || "") === String(planDate || "")) {
+      params.set("planId", currentPlan.id);
+    }
+    const response = await fetch(`/api/dispatch/v2/bootstrap?${params.toString()}`, {
+      headers: { "Cache-Control": "no-cache" }
+    });
+    if (!response.ok) throw new Error(await dispatchErrorMessage(response));
+    let snapshot = await response.json();
+    if (snapshot?.exists !== true && snapshot?.exists !== false) {
+      const legacyResponse = await fetch(`/api/dispatch/plans/current?date=${encodeURIComponent(planDate)}`, {
+        headers: { "Cache-Control": "no-cache" }
+      });
+      if (!legacyResponse.ok) throw new Error(await dispatchErrorMessage(legacyResponse));
+      const legacy = await legacyResponse.json();
+      snapshot = legacy?.id
+        ? {
+            exists: true,
+            plan: {
+              ...legacy,
+              assignedOrderSnapshots: Array.isArray(legacy.orders) ? legacy.orders : []
+            }
+          }
+        : { exists: false, plan: { exists: false, planDate } };
+    }
+    if (snapshot.exists === false && createIfMissing && isDispatchPlanEditor()) {
+      const plan = await createPlanForDate(planDate);
+      created = true;
+      snapshot = {
+        exists: true,
+        plan: {
+          ...plan,
+          assignedOrderSnapshots: Array.isArray(plan.orders) ? plan.orders : []
+        }
+      };
+    }
+    const candidate = snapshot.plan || snapshot;
+    currentPlanDate = candidate?.planDate || planDate;
+    if (candidate?.id) currentPlan = compactCurrentPlan(candidate);
+    dispatchStorageSet(DISPATCH_PLAN_DATE_KEY, currentPlanDate);
+    await loadDriverJobStatuses();
+    const applied = applyDispatchPlanSnapshotResult(snapshot);
+    if (applied.invalid) throw new Error(dispatchPlannerSnapshotError);
+    try {
+      await refreshDispatchPlanEditLease(currentPlanDate);
+    } catch (error) {
+      leaveDispatchEditMode({ clearLease: true });
+      routeNotice = `Edit Mode status is temporarily unavailable: ${error.message}`;
+    }
+    resetUndoHistory();
+    resetLocalPlanDirty();
+    if (applied.loaded) await loadDispatchForecast();
+    else clearDispatchForecast();
+    return { ...applied, created };
   } catch (error) {
-    leaveDispatchEditMode({ clearLease: true });
-    routeNotice = `Edit Mode status is temporarily unavailable: ${error.message}`;
+    if (currentPlan?.id && trucks.length) dispatchPlannerSnapshotState = "stale";
+    else dispatchPlannerSnapshotState = "failed";
+    dispatchPlannerSnapshotError = error.message || "Dispatch snapshot load failed.";
+    throw error;
   }
-  if (Array.isArray(currentPlan?.orders) && Array.isArray(currentPlan?.trucks)) {
-    await loadDriverJobStatuses();
-    applySavedPlan(currentPlan);
-    currentPlan = compactCurrentPlan(currentPlan);
-    lastServerSavedAt = currentPlan.savedAt || currentPlan.updatedAt || lastServerSavedAt;
-    resetUndoHistory();
-    resetLocalPlanDirty();
-    await loadDispatchForecast();
-    return { loaded: true, created, hasSnapshot: true };
-  }
-  currentPlan = compactCurrentPlan(currentPlan);
-  if (currentPlan?.id) {
-    resetPlanningBoard();
-    lastServerSavedAt = currentPlan.savedAt || currentPlan.updatedAt || lastServerSavedAt;
-    await loadDriverJobStatuses();
-    resetUndoHistory();
-    resetLocalPlanDirty();
-    await loadDispatchForecast();
-    return { loaded: true, created, hasSnapshot: false };
-  }
-  resetPlanningBoard();
-  await loadDriverJobStatuses();
-  clearDispatchForecast();
-  resetUndoHistory();
-  resetLocalPlanDirty();
-  return { loaded: false, created, hasSnapshot: false };
 }
 
 async function loadPlanById(planId) {
@@ -8423,6 +8690,9 @@ async function runBackgroundRouteEstimates() {
 }
 
 function planBadgeText() {
+  if (dispatchPlannerSnapshotState === "loading") return "LOADING PLAN";
+  if (dispatchPlannerSnapshotState === "stale") return "STALE · EDITING LOCKED";
+  if (dispatchPlannerSnapshotState === "failed") return "PLAN UNAVAILABLE";
   if (!currentPlan?.id) return "No plan";
   return String(currentPlan.status || "draft").toUpperCase();
 }
@@ -8442,7 +8712,7 @@ function planModeControlHtml() {
   const lockedByOther = Boolean(planEditLease?.active && planEditLease.sessionId !== dispatchSessionId);
   return `
     <span class="dispatch-mode-pill viewing">${lockedByOther ? `${owner} editing` : "View mode"}</span>
-    <button class="primary" data-action="enter-edit-mode" type="button" ${lockedByOther ? `disabled title="${owner} is already editing this plan"` : ""}>Enter Edit Mode</button>
+    <button class="primary" data-action="enter-edit-mode" type="button" ${lockedByOther || dispatchPlannerSnapshotState !== "ready" ? `disabled title="${lockedByOther ? `${owner} is already editing this plan` : "Wait for the current snapshot to load"}"` : ""}>Enter Edit Mode</button>
   `;
 }
 
@@ -8535,6 +8805,87 @@ function restoreRenderUiState(state = {}, sequence = renderUiSequence) {
   });
 }
 
+function ensureDispatchRenderLayers() {
+  let plannerRoot = app.querySelector("[data-dispatch-planner-root]");
+  let modalLayer = app.querySelector("[data-dispatch-modal-layer]");
+  if (!plannerRoot) {
+    plannerRoot = document.createElement("div");
+    plannerRoot.dataset.dispatchPlannerRoot = "true";
+    app.appendChild(plannerRoot);
+  }
+  if (!modalLayer) {
+    modalLayer = document.createElement("div");
+    modalLayer.dataset.dispatchModalLayer = "true";
+    app.appendChild(modalLayer);
+  }
+  return { plannerRoot, modalLayer };
+}
+
+function renderDispatchModalInPlace() {
+  const { modalLayer } = ensureDispatchRenderLayers();
+  modalLayer.innerHTML = renderModal();
+  if (dispatchPersistentFocusSelector) {
+    const input = app.querySelector(dispatchPersistentFocusSelector);
+    input?.focus?.({ preventScroll: true });
+  }
+}
+
+function renderDispatchRouteNotice() {
+  return routeNotice
+    ? `<div class="route-notice"><span>${escapeHtml(routeNotice)}</span><button data-action="close-route-notice" type="button">x</button></div>`
+    : "";
+}
+
+function renderDispatchNoticePatch() {
+  const region = app.querySelector("[data-dispatch-route-notice]");
+  if (region) region.innerHTML = renderDispatchRouteNotice();
+}
+
+function finishTargetedDispatchPopupMutation(payload) {
+  mergeTargetedDispatchMutationOrders(payload);
+  renderDispatchNoticePatch();
+  renderDispatchOrderPoolPatch();
+  renderDispatchPlannerPatch();
+  renderDispatchModalInPlace();
+}
+
+function renderDispatchKpiStrip() {
+  const stats = boardStats();
+  return `
+    <div class="kpi-strip">
+      <div class="kpi"><span>${t("dispatch.openOrders", "Open Orders")}</span><strong>${stats.open}</strong></div>
+      <div class="kpi"><span>${t("dispatch.plannedDrops", "Planned Drops")}</span><strong>${stats.planned}</strong></div>
+      <div class="kpi"><span>${t("dispatch.totalStops", "Total Stops")}</span><strong>${stats.stops}</strong></div>
+      <div class="kpi"><span>${t("dispatch.warnings", "Warnings")}</span><strong>${stats.warnings}</strong></div>
+      <div class="kpi"><span>${driverOrientedPlanningEnabled() ? t("dispatch.drivers", "Drivers") : t("dispatch.trucks", "Trucks")}</span><strong>${driverOrientedPlanningEnabled() ? drivers.length : trucks.length}</strong></div>
+    </div>
+  `;
+}
+
+function renderDispatchSaveStatePatch() {
+  const saveStatus = app.querySelector("[data-dispatch-save-status]");
+  if (saveStatus) saveStatus.textContent = `${localPlanDirty ? "Saving..." : t("dispatch.saved", "Saved")} ${lastSavedAt}`;
+  const planStatus = app.querySelector("[data-dispatch-plan-status]");
+  if (planStatus) planStatus.textContent = planBadgeText();
+}
+
+function renderDispatchPlannerPatch() {
+  const uiSequence = ++renderUiSequence;
+  const uiState = captureRenderUiState();
+  const kpi = app.querySelector(".kpi-strip");
+  if (kpi) kpi.outerHTML = renderDispatchKpiStrip();
+  const board = app.querySelector(".truck-board");
+  if (board) board.innerHTML = driverOrientedPlanningEnabled()
+    ? driverLanes().map(renderDriverLane).join("")
+    : trucks.map(renderTruck).join("");
+  const preview = app.querySelector("[data-dispatch-load-preview-layer]");
+  if (preview) preview.innerHTML = renderLoadPreview();
+  restoreRenderUiState(uiState, uiSequence);
+  renderDispatchSaveStatePatch();
+  renderGoogleMapPreview();
+  scheduleBackgroundRouteEstimates();
+}
+
 function render(options = {}) {
   const { save = false } = options;
   const uiSequence = ++renderUiSequence;
@@ -8546,8 +8897,8 @@ function render(options = {}) {
     markLocalPlanDirty();
     autoSavePlan();
   }
-  const stats = boardStats();
-  app.innerHTML = `
+  const { plannerRoot } = ensureDispatchRenderLayers();
+  plannerRoot.innerHTML = `
     <section class="dispatch-shell ${isDispatchPlanEditor() ? "dispatch-editing" : "dispatch-viewing"}">
       <header class="dispatch-topbar">
         <div class="topbar-main">
@@ -8557,7 +8908,7 @@ function render(options = {}) {
           </div>
           <div class="topbar-controls">
             <input id="planDateInput" type="date" value="${escapeHtml(currentPlanDate)}" />
-            <span class="autosave-pill plan-status-pill">${escapeHtml(planBadgeText())}</span>
+            <span class="autosave-pill plan-status-pill" data-dispatch-plan-status>${escapeHtml(planBadgeText())}</span>
           </div>
         </div>
         <div class="topbar-language">${languageToggle()}</div>
@@ -8569,33 +8920,27 @@ function render(options = {}) {
           <button class="primary" data-action="confirm-plan" ${currentPlan?.id && isDispatchPlanEditor() ? "" : "disabled"} type="button">${t("dispatch.confirmPlan", "Confirm Plan")}</button>
           <button data-action="refresh-orders" type="button">${t("dispatch.refreshOrders", "Refresh Orders")}</button>
           ${planModeControlHtml()}
-          <span class="autosave-pill">${localPlanDirty ? "Saving..." : t("dispatch.saved", "Saved")} ${lastSavedAt}</span>
+          <span class="autosave-pill" data-dispatch-save-status>${localPlanDirty ? "Saving..." : t("dispatch.saved", "Saved")} ${lastSavedAt}</span>
         </div>
       </header>
-      ${routeNotice ? `<div class="route-notice"><span>${escapeHtml(routeNotice)}</span><button data-action="close-route-notice" type="button">x</button></div>` : ""}
+      <div data-dispatch-route-notice>${renderDispatchRouteNotice()}</div>
       ${driverTruckSwitchAttention.length ? `<div class="truck-switch-attention-panel">
         ${driverTruckSwitchAttention.map((item) => `<div><span><strong>${escapeHtml(item.driver_login || "Driver")}</strong>: ${escapeHtml(item.from_truck_plate || "previous truck")} to ${escapeHtml(item.to_truck_plate || "new truck")} failed in Samsara. ${escapeHtml(item.samsara_error || "")}</span><button data-action="override-truck-switch" data-job-id="${escapeHtml(item.job_id)}" type="button">Override</button></div>`).join("")}
       </div>` : ""}
       <div class="dispatch-grid">
         ${renderOrderPool()}
         <section class="planner-panel">
-          <div class="kpi-strip">
-            <div class="kpi"><span>${t("dispatch.openOrders", "Open Orders")}</span><strong>${stats.open}</strong></div>
-            <div class="kpi"><span>${t("dispatch.plannedDrops", "Planned Drops")}</span><strong>${stats.planned}</strong></div>
-            <div class="kpi"><span>${t("dispatch.totalStops", "Total Stops")}</span><strong>${stats.stops}</strong></div>
-            <div class="kpi"><span>${t("dispatch.warnings", "Warnings")}</span><strong>${stats.warnings}</strong></div>
-            <div class="kpi"><span>${driverOrientedPlanningEnabled() ? t("dispatch.drivers", "Drivers") : t("dispatch.trucks", "Trucks")}</span><strong>${driverOrientedPlanningEnabled() ? drivers.length : trucks.length}</strong></div>
-          </div>
+          ${renderDispatchKpiStrip()}
           <div class="truck-board">
             ${driverOrientedPlanningEnabled() ? driverLanes().map(renderDriverLane).join("") : trucks.map(renderTruck).join("")}
           </div>
         </section>
       </div>
-      ${renderLoadPreview()}
-      ${renderModal()}
+      <div data-dispatch-load-preview-layer>${renderLoadPreview()}</div>
       <div id="orderTooltip"></div>
     </section>
   `;
+  renderDispatchModalInPlace();
   const orderList = app.querySelector(".order-list");
   if (orderList) orderList.scrollTop = orderListScrollTop;
   restoreRenderUiState(uiState, uiSequence);
@@ -8618,7 +8963,7 @@ function orderPoolSubtitle() {
 function renderOrderPool() {
   const searching = Boolean(searchText.trim());
   return `
-    <section class="panel">
+    <section class="panel" data-dispatch-order-pool="true">
       <div class="panel-header">
         <div>
           <h2>${t("dispatch.orderPool", "Order Pool")}</h2>
@@ -8784,15 +9129,15 @@ function renderSelectedOrderActions() {
       <span>${escapeHtml(label)}</span>
       ${reviewOnly ? `<span>Loaded/shipped history</span>` : ""}
       ${reconciliationBlocked ? `<span class="chip warn">${escapeHtml(scmReconciliationBlockText(selected.find(isScmReconciliationBlocked)))}</span>` : ""}
-      ${reconciliationBlocked ? "" : groupedCount ? `<button data-action="ungroup-order" data-order="${escapeHtml(order.id)}" ${blockedUngroup ? `disabled title="Cancel ${escapeHtml(blockedUngroup)} before ungrouping"` : ""} type="button">Ungroup</button>` : selected.length > 1 && !includesCustomOrder ? `<button data-action="open-group-modal" data-order="${escapeHtml(order.id)}" type="button">Group</button>` : ""}
+      ${reconciliationBlocked ? "" : groupedCount ? `<button data-action="ungroup-order" data-order-ref="${escapeHtml(order.id)}" ${blockedUngroup ? `disabled title="Cancel ${escapeHtml(blockedUngroup)} before ungrouping"` : ""} type="button">Ungroup</button>` : selected.length > 1 && !includesCustomOrder ? `<button data-action="open-group-modal" data-order-ref="${escapeHtml(order.id)}" type="button">Group</button>` : ""}
       ${blockedUngroup ? `<span>Cancel ${escapeHtml(blockedUngroup)} before ungrouping</span>` : ""}
       ${order.type === "CUSTOM" ? `<button data-action="edit-custom-order" data-custom-order-id="${escapeHtml(order.customOrderId || "")}" type="button">Open Custom Order</button>` : ""}
-      ${!reviewOnly && !reconciliationBlocked && order.type === "PO" && order.sourceTable !== "scm_vrma_orders" ? `<button data-action="open-po-yard-modal" data-order="${escapeHtml(order.id)}" type="button">Set Yard</button>` : ""}
-      ${!reviewOnly && order.type === "SO" ? `<button data-action="open-po-link-modal" data-order="${escapeHtml(order.id)}" type="button">Link PO</button>` : ""}
-      ${!reviewOnly && order.type === "SO" ? `<button data-action="open-to-link-modal" data-order="${escapeHtml(order.id)}" type="button">Link TO</button>` : ""}
-      ${!reviewOnly && !reconciliationBlocked && !["CO", "CUSTOM"].includes(order.type) && order.sourceTable !== "scm_vrma_orders" && !order.originalOrderId ? `<button data-action="open-split-modal" data-order="${escapeHtml(order.id)}" type="button">Split</button>` : ""}
-      ${!reviewOnly && !reconciliationBlocked && order.type !== "CUSTOM" && order.originalOrderId ? `<button data-action="unsplit-order" data-order="${escapeHtml(order.id)}" type="button">Unsplit</button>` : ""}
-      ${!reviewOnly && canConsolidatePick(order) ? `<button data-action="open-consolidate-modal" data-order="${escapeHtml(order.id)}" type="button">Consolidate Pick</button>` : ""}
+      ${!reviewOnly && !reconciliationBlocked && order.type === "PO" && order.sourceTable !== "scm_vrma_orders" ? `<button data-action="open-po-yard-modal" data-order-ref="${escapeHtml(order.id)}" type="button">Set Yard</button>` : ""}
+      ${!reviewOnly && order.type === "SO" ? `<button data-action="open-po-link-modal" data-order-ref="${escapeHtml(order.id)}" type="button">Link PO</button>` : ""}
+      ${!reviewOnly && order.type === "SO" ? `<button data-action="open-to-link-modal" data-order-ref="${escapeHtml(order.id)}" type="button">Link TO</button>` : ""}
+      ${!reviewOnly && !reconciliationBlocked && !["CO", "CUSTOM"].includes(order.type) && order.sourceTable !== "scm_vrma_orders" && !order.originalOrderId ? `<button data-action="open-split-modal" data-order-ref="${escapeHtml(order.id)}" type="button">Split</button>` : ""}
+      ${!reviewOnly && !reconciliationBlocked && order.type !== "CUSTOM" && order.originalOrderId ? `<button data-action="unsplit-order" data-order-ref="${escapeHtml(order.id)}" type="button">Unsplit</button>` : ""}
+      ${!reviewOnly && canConsolidatePick(order) ? `<button data-action="open-consolidate-modal" data-order-ref="${escapeHtml(order.id)}" type="button">Consolidate Pick</button>` : ""}
     </div>
   `;
 }
@@ -11680,11 +12025,11 @@ function persistTransitCoInBackground(promise, successMessage = "") {
     .then(() => {
       if (!successMessage) return;
       routeNotice = successMessage;
-      render({ save: false });
+      renderDispatchNoticePatch();
     })
     .catch((error) => {
       routeNotice = `CO server update failed: ${error.message}`;
-      render({ save: false });
+      renderDispatchNoticePatch();
     });
 }
 
@@ -12255,6 +12600,14 @@ app.addEventListener("drop", (event) => {
   commitPlanMutation("drop_order_or_stop");
 });
 
+app.addEventListener("focusin", (event) => {
+  const field = event.target?.closest?.("input, textarea, select, [contenteditable='true']");
+  if (!field || field.closest("[data-dispatch-modal-layer]")) return;
+  dispatchPersistentFocusSelector = field.id
+    ? `#${CSS.escape(field.id)}`
+    : selectorForElement(field) || "";
+});
+
 app.addEventListener("click", (event) => {
   if (event.target.dataset?.action === "close-modal") {
     resetActiveLinkModalState();
@@ -12267,7 +12620,8 @@ app.addEventListener("click", (event) => {
     orderDependencyOptions = null;
     orderDependencyLoading = false;
     orderDependencyError = "";
-    return render({ save: false });
+    renderDispatchModalInPlace();
+    return;
   }
   const button = event.target.closest("button");
   if (!button) {
@@ -12422,7 +12776,7 @@ app.addEventListener("click", (event) => {
   if (action === "update-dependency-mode") {
     const dependencyId = button.dataset.dependency;
     const mode = app.querySelector(`[data-dependency-mode="${CSS.escape(dependencyId)}"]`)?.value;
-    fetch(`/api/dispatch/order-dependencies/${encodeURIComponent(dependencyId)}/mode`, {
+    fetch(`/api/dispatch/order-dependencies/${encodeURIComponent(dependencyId)}/mode?response=targeted`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(dispatchLeaseRequestPayload({ mode }))
@@ -12430,7 +12784,7 @@ app.addEventListener("click", (event) => {
       if (!response.ok) throw new Error(await dispatchErrorMessage(response));
       return response.json();
     }).then(async (payload) => {
-      if (Array.isArray(payload.orders)) applyDispatchOrderFeed(payload.orders);
+      mergeTargetedDispatchMutationOrders(payload);
       routeNotice = "Dependency mode updated.";
       await loadOrderDependencyOptions(orderById(modalOrderId));
     }).catch((error) => {
@@ -12442,15 +12796,15 @@ app.addEventListener("click", (event) => {
   if (action === "unlink-dependency") {
     const dependencyId = button.dataset.dependency;
     if (!window.confirm("Unlink this Transfer Order dependency?")) return;
-    fetch(`/api/dispatch/order-dependencies/${encodeURIComponent(dependencyId)}`, {
+    fetch(`/api/dispatch/order-dependencies/${encodeURIComponent(dependencyId)}?response=targeted`, {
       method: "DELETE",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(dispatchLeaseRequestPayload())
+      body: JSON.stringify(dispatchLeaseRequestPayload({ orderRefs: [modalOrderId] }))
     }).then(async (response) => {
       if (!response.ok) throw new Error(await dispatchErrorMessage(response));
       return response.json();
     }).then(async (payload) => {
-      if (Array.isArray(payload.orders)) applyDispatchOrderFeed(payload.orders);
+      mergeTargetedDispatchMutationOrders(payload);
       removeLocalOrderDependency(dependencyId);
       orderDependencyError = "";
       routeNotice = "Order dependency unlinked.";
@@ -12476,22 +12830,27 @@ app.addEventListener("click", (event) => {
     }
     return;
   }
-  if (button.dataset.order) {
-    selectedOrderId = button.dataset.order;
-    if (!selectedOrderIds.has(button.dataset.order)) selectedOrderIds = new Set([button.dataset.order]);
+  const actionOrderId = button.dataset.order || button.dataset.orderRef || "";
+  if (actionOrderId) {
+    selectedOrderId = actionOrderId;
+    if (!selectedOrderIds.has(actionOrderId)) selectedOrderIds = new Set([actionOrderId]);
   }
   if (action === "open-group-modal") {
     modalType = "group";
-    modalOrderId = button.dataset.order;
+    modalOrderId = actionOrderId;
+    renderDispatchModalInPlace();
+    return;
   }
   if (action === "ungroup-order") {
-    ungroupOrder(button.dataset.order);
-    requestOrderPoolRefreshOnNextSave();
+    const grouped = orderById(actionOrderId);
+    const refreshRefs = [...(grouped?.childOrders || [])];
+    ungroupOrder(actionOrderId);
+    requestTargetedOrderPoolRefresh(refreshRefs);
     commitPlanMutation("ungroup_order");
     return;
   }
   if (action === "unsplit-order") {
-    const prepared = prepareUnsplitOrder(button.dataset.order);
+    const prepared = prepareUnsplitOrder(actionOrderId);
     if (!prepared) {
       render({ save: false });
       return;
@@ -12512,7 +12871,7 @@ app.addEventListener("click", (event) => {
       return response.json();
     }).then(() => {
       applyUnsplitOrder(prepared);
-      requestOrderPoolRefreshOnNextSave();
+      requestTargetedOrderPoolRefresh([prepared.parent.id]);
       commitPlanMutation("unsplit_order");
     }).catch((error) => {
       routeNotice = `Unsplit failed: ${error.message}`;
@@ -12522,30 +12881,32 @@ app.addEventListener("click", (event) => {
   }
   if (action === "open-split-modal") {
     modalType = "split";
-    modalOrderId = button.dataset.order;
-    const splitOrderTarget = orderById(button.dataset.order);
+    modalOrderId = actionOrderId;
+    const splitOrderTarget = orderById(actionOrderId);
     splitParts = Math.max(2, Math.ceil((orderFootprintPallets(splitOrderTarget) || 2) / 10));
-    ensureSplitDraft(orderById(button.dataset.order), true);
+    ensureSplitDraft(orderById(actionOrderId), true);
+    renderDispatchModalInPlace();
+    return;
   }
   if (action === "open-consolidate-modal") {
     modalType = "consolidate";
-    modalOrderId = button.dataset.order;
+    modalOrderId = actionOrderId;
   }
   if (action === "open-po-yard-modal") {
     modalType = "po-yard";
-    modalOrderId = button.dataset.order;
+    modalOrderId = actionOrderId;
   }
   if (action === "open-po-link-modal") {
     modalType = "po-link";
-    modalOrderId = button.dataset.order;
+    modalOrderId = actionOrderId;
     poAllocationError = "";
     getLinkModalDraft("po", modalOrderId);
     render({ save: false });
-    loadPoAllocationOptions(button.dataset.order).catch(() => null);
+    loadPoAllocationOptions(actionOrderId).catch(() => null);
     return;
   }
   if (action === "open-to-link-modal") {
-    const targetOrder = orderById(button.dataset.order);
+    const targetOrder = orderById(actionOrderId);
     const groupPlanId = Number(targetOrder?.groupPlanId || 0);
     const currentPlanId = Number(currentPlan?.id || 0);
     const groupPlanDate = String(
@@ -12562,7 +12923,7 @@ app.addEventListener("click", (event) => {
       return;
     }
     modalType = "to-link";
-    modalOrderId = button.dataset.order;
+    modalOrderId = actionOrderId;
     orderDependencyOptions = null;
     orderDependencyError = "";
     getLinkModalDraft("to", modalOrderId);
@@ -12681,7 +13042,7 @@ app.addEventListener("click", (event) => {
       render({ save: false });
       return;
     }
-    requestOrderPoolRefreshOnNextSave();
+    requestTargetedOrderPoolRefresh([selectedOrderId]);
     logDispatchAudit({
       action: "orders_grouped",
       entityType: "order",
@@ -12735,8 +13096,8 @@ app.addEventListener("click", (event) => {
       })
       .then((seed) => {
         splitOrder(button.dataset.order, splitParts, seed.nextSuffix);
-        requestOrderPoolRefreshOnNextSave();
         const created = orders.filter((item) => item.originalOrderId === button.dataset.order).map(summarizeOrder);
+        requestTargetedOrderPoolRefresh(created.map((item) => item?.id).filter(Boolean));
         logDispatchAudit({
           action: "order_split",
           entityType: "order",
@@ -12779,33 +13140,33 @@ app.addEventListener("click", (event) => {
   if (action === "confirm-po-yard") {
     const vendorYardId = document.getElementById("poVendorYardSelect")?.value;
     const before = summarizeOrder(orderById(button.dataset.order));
-    fetch(`/api/dispatch/orders/${encodeURIComponent(button.dataset.order)}/vendor-yard`, {
+    fetch(`/api/dispatch/orders/${encodeURIComponent(button.dataset.order)}/vendor-yard?response=targeted`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(dispatchLeaseRequestPayload({ vendorYardId, audit: { sessionId: dispatchSessionId, before } }))
     }).then((response) => {
       if (!response.ok) return response.text().then((text) => Promise.reject(new Error(text)));
-      return loadDispatchOrders();
-    }).then(() => {
+      return response.json();
+    }).then((payload) => {
       modalType = "";
       modalOrderId = "";
       routeNotice = "PO vendor yard updated.";
-      render({ save: false });
+      finishTargetedDispatchPopupMutation(payload);
     }).catch((error) => {
       routeNotice = `PO yard update failed: ${error.message}`;
-      render({ save: false });
+      renderDispatchNoticePatch();
     });
     return;
   }
   if (action === "cancel-po-link") {
-    fetch(`/api/dispatch/po-allocations/${encodeURIComponent(button.dataset.allocation)}?sessionId=${encodeURIComponent(dispatchSessionId)}&planDate=${encodeURIComponent(currentPlanDate)}&editLeaseToken=${encodeURIComponent(planEditLeaseToken)}`, {
+    fetch(`/api/dispatch/po-allocations/${encodeURIComponent(button.dataset.allocation)}?sessionId=${encodeURIComponent(dispatchSessionId)}&planDate=${encodeURIComponent(currentPlanDate)}&editLeaseToken=${encodeURIComponent(planEditLeaseToken)}&response=targeted`, {
       method: "DELETE"
     }).then((response) => {
       if (!response.ok) return response.text().then((text) => Promise.reject(new Error(text)));
       return response.json();
     }).then((payload) => {
       poAllocationOptions = payload.options;
-      applyDispatchOrderFeed(payload.orders || []);
+      mergeTargetedDispatchMutationOrders(payload);
       requestOrderPoolRefreshOnNextSave();
       routeNotice = "PO link cancelled.";
       commitPlanMutation("cancel_po_link");
@@ -13726,7 +14087,7 @@ app.addEventListener("submit", (event) => {
       submitButton.textContent = "Linking...";
     }
     setModalFormStatus(form, "Validating Transfer Order quantities...", "info");
-    fetch("/api/dispatch/order-dependencies", {
+    fetch("/api/dispatch/order-dependencies?response=targeted", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(dispatchLeaseRequestPayload({
@@ -13741,7 +14102,7 @@ app.addEventListener("submit", (event) => {
       if (!response.ok) throw new Error(await dispatchErrorMessage(response));
       return response.json();
     }).then((payload) => {
-      if (Array.isArray(payload.orders)) applyDispatchOrderFeed(payload.orders);
+      mergeTargetedDispatchMutationOrders(payload);
       clearLinkModalDraft("to", order.id);
       getLinkModalDraft("to", order.id);
       orderDependencyOptions = null;
@@ -13798,7 +14159,7 @@ app.addEventListener("submit", (event) => {
       submitButton.textContent = "Connecting...";
     }
     setModalFormStatus(form, "Checking PO available quantity...", "info");
-    fetch(`/api/dispatch/orders/${encodeURIComponent(order.id)}/po-allocations`, {
+    fetch(`/api/dispatch/orders/${encodeURIComponent(order.id)}/po-allocations?response=targeted`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(dispatchLeaseRequestPayload({
@@ -13812,7 +14173,7 @@ app.addEventListener("submit", (event) => {
       return response.json();
     }).then((payload) => {
       poAllocationOptions = payload.options;
-      if (Array.isArray(payload.orders)) applyDispatchOrderFeed(payload.orders);
+      mergeTargetedDispatchMutationOrders(payload);
       clearLinkModalDraft("po", order.id);
       const nextDraft = getLinkModalDraft("po", order.id);
       nextDraft.targetSignature = payload.options?.order?.targetSignature || "";
@@ -13854,7 +14215,7 @@ app.addEventListener("submit", (event) => {
     setEditFormStatus(form, "Saving dispatch info...", "info");
     const saveDetails = isLocalDispatchOrder(order)
       ? Promise.resolve({ orders: null })
-      : fetch(`/api/dispatch/orders/${encodeURIComponent(order.id)}/details`, {
+          : fetch(`/api/dispatch/orders/${encodeURIComponent(order.id)}/details?response=targeted`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(dispatchLeaseRequestPayload({
@@ -13882,7 +14243,7 @@ app.addEventListener("submit", (event) => {
       order.expectedDeliveryDate = data.expectedDeliveryDate || "";
       order.windowStart = windowStart;
       order.windowEnd = windowEnd;
-      if (Array.isArray(payload.orders)) applyDispatchOrderFeed(payload.orders);
+          mergeTargetedDispatchMutationOrders(payload);
       let coOrder = null;
       let cancelledCo = null;
       if (wantsTransitCo) {
@@ -13891,7 +14252,11 @@ app.addEventListener("submit", (event) => {
       } else if (supportsTransitCo && order.transitCo?.id) {
         cancelledCo = cancelTransitCoForOrder(order.id);
       }
-      if (coOrder || cancelledCo) requestOrderPoolRefreshOnNextSave();
+      if (coOrder || cancelledCo) requestTargetedOrderPoolRefresh([
+        order.id,
+        coOrder?.id,
+        cancelledCo?.coId
+      ]);
       if (coOrder) {
         persistTransitCoInBackground(
           saveTransitCoToServer(order, coOrder),
@@ -13947,28 +14312,37 @@ app.addEventListener("submit", (event) => {
 });
 
 async function initDispatch() {
+  dispatchPlannerSnapshotState = "loading";
+  orders = [];
+  orderCatalog = [];
+  render({ save: false });
+  const orderFeedPromise = loadDispatchOrders();
+  const planHistoryPromise = loadPlanHistory();
   try {
-    await loadDispatchConfig();
-    await loadDispatchSetup();
-    await loadDispatchVendorYards();
-    await loadDispatchOrders();
-    await loadPlanHistory();
-    const restoredServer = await loadPlanForDate(currentPlanDate, { createIfMissing: false });
-    if (!restoredServer.loaded) resetPlanningBoard();
+    await Promise.all([
+      loadDispatchConfig(),
+      loadDispatchSetup(),
+      loadDispatchVendorYards()
+    ]);
+    await loadPlanForDate(currentPlanDate, { createIfMissing: false });
   } catch (error) {
     console.error("Dispatch planner initialization failed", error);
-    routeNotice = `Planning data could not fully load: ${error.message}. You can still review the available board and retry Edit Mode.`;
-    if (!trucks.length && !dispatchSetupLoaded) resetPlanningBoard();
+    routeNotice = `Planning data could not fully load: ${error.message}. Editing is locked until the current snapshot is verified.`;
   }
   render({ save: false });
   connectEvents();
+  Promise.allSettled([orderFeedPromise, planHistoryPromise]).then(() => {
+    if (dispatchPlannerSnapshotState !== "ready") return;
+    renderDispatchOrderPoolPatch();
+    renderDispatchPlannerPatch();
+  });
   loadMbtBinDispatchCapability().then(async (enabled) => {
     if (!enabled) return;
     await loadMbtBinFrontLegs();
     render({ save: false });
   }).catch(() => null);
   scheduleDispatchForecastPolling();
-  setInterval(pollServerPlan, 1000);
+  setInterval(pollServerPlan, 5000);
 }
 
 window.addEventListener("mbbs-language-changed", () => {
