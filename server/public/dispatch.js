@@ -3367,6 +3367,8 @@ function applyDispatchOrderFeed(feed) {
 }
 
 function preserveDispatchPlanningFields(existing = {}, fresh = {}) {
+  const authoritativeTransitCoClear = Object.prototype.hasOwnProperty.call(fresh, "transitCo")
+    && !fresh.transitCo;
   const planningKeys = [
     "assigned",
     "localDispatchStatus",
@@ -3383,6 +3385,11 @@ function preserveDispatchPlanningFields(existing = {}, fresh = {}) {
     "isGrouped"
   ];
   const planning = Object.fromEntries(planningKeys
+    .filter((key) => !(authoritativeTransitCoClear && [
+      "transitCo",
+      "transitOriginalPickupLocations",
+      "transitOriginalSourceYard"
+    ].includes(key)))
     .filter((key) => existing[key] !== undefined)
     .map((key) => [key, existing[key]]));
   return { ...fresh, ...planning };
@@ -12157,7 +12164,7 @@ async function saveTransitCoToServer(sourceOrder, coOrder) {
 
 async function cancelTransitCoOnServer(coId) {
   if (!coId) return null;
-  const response = await fetch(`/api/dispatch/co-orders/${encodeURIComponent(coId)}?sessionId=${encodeURIComponent(dispatchSessionId)}&planDate=${encodeURIComponent(currentPlanDate)}&editLeaseToken=${encodeURIComponent(planEditLeaseToken)}`, {
+  const response = await fetch(`/api/dispatch/co-orders/${encodeURIComponent(coId)}?sessionId=${encodeURIComponent(dispatchSessionId)}&planDate=${encodeURIComponent(currentPlanDate)}&editLeaseToken=${encodeURIComponent(planEditLeaseToken)}&response=targeted`, {
     method: "DELETE"
   });
   if (!response.ok) throw new Error(await response.text());
@@ -12177,6 +12184,52 @@ function persistTransitCoInBackground(promise, successMessage = "") {
     });
 }
 
+function clearTransitCoFromOrderSnapshot(order = {}, coId = "") {
+  const targetCoId = String(coId || "").trim();
+  const activeCoId = String(order?.transitCo?.id || "").trim();
+  const shouldClear = Boolean(activeCoId) && (!targetCoId || activeCoId === targetCoId);
+  const childOrderDetails = (Array.isArray(order?.childOrderDetails) ? order.childOrderDetails : [])
+    .map((child) => clearTransitCoFromOrderSnapshot(child, targetCoId));
+  const next = {
+    ...order,
+    ...(Array.isArray(order?.childOrderDetails) ? { childOrderDetails } : {})
+  };
+  if (!shouldClear) return next;
+
+  const locationKey = (value) => String(value || "").trim().split(/\s*:\s*/u, 1)[0].toLowerCase();
+  const transitDestination = locationKey(order.transitCo?.toYard);
+  const restored = [
+    ...(Array.isArray(order.transitOriginalPickupLocations) ? order.transitOriginalPickupLocations : []),
+    ...(!order.transitOriginalPickupLocations?.length && order.transitCo?.fromYard
+      ? [order.transitCo.fromYard]
+      : []),
+    ...(Array.isArray(order.pickupLocations)
+      ? order.pickupLocations.filter((location) => locationKey(location) !== transitDestination)
+      : []),
+    ...(Array.isArray(order.poPickupManifest)
+      ? order.poPickupManifest.map((entry) => entry?.location).filter(Boolean)
+      : [])
+  ];
+  const seen = new Set();
+  next.pickupLocations = restored.filter((location) => {
+    const key = locationKey(location);
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  if (!next.pickupLocations.length && order.transitCo?.fromYard) {
+    next.pickupLocations = [order.transitCo.fromYard];
+  }
+  next.sourceYard = order.transitOriginalSourceYard
+    || next.pickupLocations[0]
+    || order.sourceYard;
+  next.notes = String(order.notes || "").replace(/^Transit via [^.]+\.?\s*/iu, "").trim();
+  delete next.transitCo;
+  delete next.transitOriginalPickupLocations;
+  delete next.transitOriginalSourceYard;
+  return next;
+}
+
 function cancelTransitCoForOrder(orderId) {
   const order = orderById(orderId);
   if (!order?.transitCo?.id) return null;
@@ -12184,43 +12237,41 @@ function cancelTransitCoForOrder(orderId) {
   const beforeOrder = summarizeOrder(order);
   const beforeCo = summarizeOrder(orderById(coId));
   const removedStops = removeStopsForOrders([coId]);
-  const restoredPickups = order.transitOriginalPickupLocations?.length
-    ? order.transitOriginalPickupLocations
-    : order.transitCo.fromYard
-      ? [order.transitCo.fromYard]
-      : order.pickupLocations || ["3445"];
-  order.pickupLocations = restoredPickups;
-  order.sourceYard = order.transitOriginalSourceYard || restoredPickups[0] || order.sourceYard;
-  order.childOrderDetails = (order.childOrderDetails || []).map((child) => {
-    const next = normalizeOrder({ ...child });
-    const childRestoredPickups = next.transitOriginalPickupLocations?.length
-      ? next.transitOriginalPickupLocations
-      : restoredPickups;
-    next.pickupLocations = childRestoredPickups;
-    next.sourceYard = next.transitOriginalSourceYard || childRestoredPickups[0] || next.sourceYard;
-    delete next.transitCo;
-    delete next.transitOriginalPickupLocations;
-    delete next.transitOriginalSourceYard;
-    return next;
-  });
-  delete order.transitCo;
-  delete order.transitOriginalPickupLocations;
-  delete order.transitOriginalSourceYard;
-  order.notes = String(order.notes || "").replace(/^Transit via [^.]+\.?\s*/i, "").trim();
-  orders = orders.filter((item) => item.id !== coId);
+  const clearList = (list) => (list || [])
+    .filter((item) => item.id !== coId)
+    .map((item) => item.id === order.id
+      ? normalizeOrder(clearTransitCoFromOrderSnapshot(item, coId))
+      : item);
+  orders = clearList(orders);
+  orderCatalog = clearList(orderCatalog);
+  if (assignedOrderEvidenceById.has(String(order.id || ""))) {
+    assignedOrderEvidenceById.set(
+      String(order.id),
+      normalizeOrder(clearTransitCoFromOrderSnapshot(assignedOrderEvidenceById.get(String(order.id)), coId))
+    );
+  }
+  assignedOrderEvidenceById.delete(String(coId));
+  const clearedOrder = orderById(order.id);
   if (activeOrderType === "CO" && !orders.some((item) => item.type === "CO")) activeOrderType = "SO";
-  selectedOrderId = order.id;
-  selectedOrderIds = new Set([order.id]);
+  selectedOrderId = clearedOrder?.id || order.id;
+  selectedOrderIds = new Set([selectedOrderId]);
   logDispatchAudit({
     action: "co_cancelled",
     entityType: "order",
     entityId: coId,
     orderId: coId,
     before: { sourceOrder: beforeOrder, coOrder: beforeCo },
-    after: { sourceOrder: summarizeOrder(order) },
+    after: { sourceOrder: summarizeOrder(clearedOrder) },
     details: { sourceOrderId: order.id, removedStops }
   });
   return { coId, removedStops };
+}
+
+async function cancelTransitCoAndApply(order) {
+  const coId = String(order?.transitCo?.id || "").trim();
+  if (!coId) return null;
+  await cancelTransitCoOnServer(coId);
+  return cancelTransitCoForOrder(order.id);
 }
 
 function optimizeSelectedRoute() {
@@ -14394,7 +14445,7 @@ app.addEventListener("submit", (event) => {
         coOrder = upsertTransitCoForOrder(order.id, transitFromYard, transitToYard);
         if (coOrder) activeOrderType = "CO";
       } else if (supportsTransitCo && order.transitCo?.id) {
-        cancelledCo = cancelTransitCoForOrder(order.id);
+        cancelledCo = await cancelTransitCoAndApply(order);
       }
       if (coOrder || cancelledCo) requestTargetedOrderPoolRefresh([
         order.id,
@@ -14405,12 +14456,6 @@ app.addEventListener("submit", (event) => {
         persistTransitCoInBackground(
           saveTransitCoToServer(order, coOrder),
           `${coOrder.id} saved to local DB.`
-        );
-      }
-      if (cancelledCo?.coId) {
-        persistTransitCoInBackground(
-          cancelTransitCoOnServer(cancelledCo.coId),
-          `${cancelledCo.coId} cancellation saved to local DB.`
         );
       }
       modalType = "";

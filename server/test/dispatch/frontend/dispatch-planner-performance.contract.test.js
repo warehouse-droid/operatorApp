@@ -14,7 +14,19 @@ const serverSource = await readFile(
 function functionBody(name) {
   const start = dispatchSource.indexOf(`function ${name}(`);
   assert.notEqual(start, -1, `Expected ${name} to be implemented.`);
-  const open = dispatchSource.indexOf("{", start);
+  const parametersOpen = dispatchSource.indexOf("(", start);
+  let parameterDepth = 0;
+  let parametersClose = -1;
+  for (let index = parametersOpen; index < dispatchSource.length; index += 1) {
+    if (dispatchSource[index] === "(") {parameterDepth += 1;}
+    if (dispatchSource[index] === ")") {parameterDepth -= 1;}
+    if (!parameterDepth) {
+      parametersClose = index;
+      break;
+    }
+  }
+  assert.notEqual(parametersClose, -1, `Could not read ${name} parameters.`);
+  const open = dispatchSource.indexOf("{", parametersClose);
   let depth = 0;
   for (let index = open; index < dispatchSource.length; index += 1) {
     if (dispatchSource[index] === "{") {depth += 1;}
@@ -242,6 +254,107 @@ test("DP-26 frontend: planner undo and redo are persisted even after resetting t
   );
 });
 
+test("DP-28 frontend: CO cancellation is server-first and clears every stale required-CO marker", () => {
+  const clearSnapshot = functionBody("clearTransitCoFromOrderSnapshot");
+  const clearTransitCo = Function(`"use strict"; return (${clearSnapshot});`)();
+  const relationshipCases = [
+    { label: "CO only", po: false, to: false },
+    { label: "Link PO + CO", po: true, to: false },
+    { label: "Link TO + CO", po: false, to: true },
+    { label: "Link PO + Link TO + CO", po: true, to: true }
+  ];
+  for (const relationship of relationshipCases) {
+    const poPickupManifest = relationship.po ? [{
+      poOrderRef: "POB03597",
+      location: "Vendor Yard",
+      items: [{ sku: "GROUP-SKU", pieces: 8, quantity: 8 }]
+    }] : undefined;
+    const orderDependencies = relationship.to ? [{
+      id: 912,
+      transferOrderRef: "TOB00762",
+      mode: "direct_to_customer",
+      status: "active"
+    }] : undefined;
+    const grouped = {
+      id: "GOA-6486-6489",
+      transitCo: { id: "CO-GOA-6486-6489", fromYard: "2967", toYard: "12441" },
+      transitOriginalPickupLocations: ["2967"],
+      transitOriginalSourceYard: "2967",
+      pickupLocations: ["12441", ...(relationship.po ? ["Vendor Yard"] : [])],
+      sourceYard: "12441",
+      notes: "Transit via 12441. Grouped orders",
+      ...(poPickupManifest ? { poPickupManifest } : {}),
+      ...(orderDependencies ? { orderDependencies } : {}),
+      childOrderDetails: [{
+        id: "SOA06486",
+        transitCo: { id: "CO-GOA-6486-6489", fromYard: "2967", toYard: "12441" },
+        transitOriginalPickupLocations: ["2967"],
+        transitOriginalSourceYard: "2967",
+        pickupLocations: ["12441"],
+        sourceYard: "12441",
+        items: [{
+          sku: "GROUP-SKU",
+          pieces: 8,
+          ...(relationship.po ? { poAllocatedPieces: 8, poAllocatedSalesQty: 8 } : {})
+        }],
+        ...(orderDependencies ? { orderDependencies } : {})
+      }]
+    };
+    const expectedPo = relationship.po ? structuredClone({
+      poPickupManifest: grouped.poPickupManifest,
+      childItems: grouped.childOrderDetails[0].items
+    }) : null;
+    const expectedTo = relationship.to ? structuredClone({
+      group: grouped.orderDependencies,
+      child: grouped.childOrderDetails[0].orderDependencies
+    }) : null;
+
+    const cleared = clearTransitCo(grouped, "CO-GOA-6486-6489");
+
+    assert.equal(cleared.transitCo, undefined, relationship.label);
+    assert.deepEqual(
+      cleared.pickupLocations,
+      ["2967", ...(relationship.po ? ["Vendor Yard"] : [])],
+      `${relationship.label} must restore the original yard without dropping a PO pickup.`
+    );
+    assert.equal(cleared.sourceYard, "2967", relationship.label);
+    assert.equal(cleared.transitOriginalPickupLocations, undefined, relationship.label);
+    assert.equal(cleared.childOrderDetails[0].transitCo, undefined, relationship.label);
+    assert.deepEqual(cleared.childOrderDetails[0].pickupLocations, ["2967"], relationship.label);
+    assert.doesNotMatch(cleared.notes, /^Transit via /iu, relationship.label);
+    if (expectedPo) {
+      assert.deepEqual(cleared.poPickupManifest, expectedPo.poPickupManifest, relationship.label);
+      assert.deepEqual(cleared.childOrderDetails[0].items, expectedPo.childItems, relationship.label);
+    }
+    if (expectedTo) {
+      assert.deepEqual(cleared.orderDependencies, expectedTo.group, relationship.label);
+      assert.deepEqual(cleared.childOrderDetails[0].orderDependencies, expectedTo.child, relationship.label);
+    }
+  }
+
+  const cancellation = functionBody("cancelTransitCoAndApply");
+  assert.match(cancellation, /await\s+cancelTransitCoOnServer\(coId\)/u);
+  assert.ok(
+    cancellation.indexOf("await cancelTransitCoOnServer(coId)")
+      < cancellation.indexOf("cancelTransitCoForOrder(order.id)"),
+    "The server must accept cancellation before the browser removes CO state."
+  );
+  assert.doesNotMatch(cancellation, /persistTransitCoInBackground/u);
+  assert.match(dispatchSource, /cancelledCo\s*=\s*await\s+cancelTransitCoAndApply\(order\)/u);
+
+  const preservePlanning = Function(`"use strict"; return (${functionBody("preserveDispatchPlanningFields")});`)();
+  const authoritativeCancellation = preservePlanning(
+    {
+      id: "SOA06486",
+      transitCo: { id: "CO-GOA-6486-6489" },
+      transitOriginalPickupLocations: ["2967"]
+    },
+    { id: "SOA06486", transitCo: null }
+  );
+  assert.equal(authoritativeCancellation.transitCo, null);
+  assert.equal(authoritativeCancellation.transitOriginalPickupLocations, undefined);
+});
+
 test("DP-15: successful popup persistence never replaces the dispatch planner root", () => {
   const coPersistence = functionBody("persistTransitCoInBackground");
   assert.doesNotMatch(coPersistence, /render\(\{\s*save:\s*false\s*\}\)/u);
@@ -265,4 +378,19 @@ test("DP-11 backend: a targeted refresh does not hydrate every historical snapsh
   assert.notEqual(feedStart, -1);
   const feed = serverSource.slice(feedStart, feedStart + 2_500);
   assert.match(feed, /listDispatchSnapshotDerivedOrders\(\{\s*type,\s*search:\s*searchTerm\s*\}\)/u);
+});
+
+test("DP-29 backend: snapshot-derived groups reconcile cancelled local COs before entering the order feed", () => {
+  const snapshotStart = serverSource.indexOf("async function listDispatchSnapshotDerivedOrders(");
+  assert.notEqual(snapshotStart, -1);
+  const snapshotLoader = serverSource.slice(snapshotStart, snapshotStart + 5_000);
+  assert.match(snapshotLoader, /FROM\s+local_co_orders[\s\S]*?status\s*=\s*['"]cancelled['"]/u);
+  assert.match(
+    snapshotLoader,
+    /clearCancelledTransitCoMetadata\(snapshotOrder,\s*cancelledLocalCoByRef\)/u
+  );
+  assert.match(
+    serverSource,
+    /import\s*\{[^}]*clearCancelledTransitCoMetadata[^}]*\}\s*from\s*["']\.\/dispatch-planner-performance\.js["']/u
+  );
 });

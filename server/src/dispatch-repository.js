@@ -6112,7 +6112,10 @@ export async function upsertLocalCoOrder({ sourceOrderRef, fromYard, toYard, ord
   const activeLineIds = [];
   for (let index = 0; index < items.length; index += 1) {
     const item = items[index] || {};
-    const lineId = Number(item.lineId || item.line_id || index + 1);
+    const sourceLineId = Number(item.lineId || item.line_id || item.lineRowId || item.line_row_id);
+    const lineId = Number.isSafeInteger(sourceLineId) && sourceLineId > 0 && !activeLineIds.includes(sourceLineId)
+      ? sourceLineId
+      : -(index + 1);
     activeLineIds.push(lineId);
     await query(
       `INSERT INTO local_co_order_lines (

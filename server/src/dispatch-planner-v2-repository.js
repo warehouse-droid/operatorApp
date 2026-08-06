@@ -5,6 +5,7 @@ import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
 import {
   applyDispatchPlanCommand,
   buildCompactDispatchSnapshot,
+  clearCancelledTransitCoMetadata,
   createDispatchCommandReceiptStore,
   digestDispatchPlan,
   dispatchPlanBoard,
@@ -75,7 +76,10 @@ function slimAssignedOrder(order = {}) {
     "salesQty", "salesQuantities", "committedQty", "packed", "weight", "totalWeightLbs",
     "unloadMinutes", "travelMinutes", "stopMinutes", "instructions", "notes",
     "originalOrderId", "sourceOrderId", "relatedSoId", "originalPoRef", "childOrders",
-    "childOrderDetails", "groupAliases", "transitCo", "planOwned", "isSplit", "isGrouped",
+    "childOrderDetails", "groupAliases", "transitCo", "transitOriginalPickupLocations",
+    "transitOriginalSourceYard", "poPickupManifest", "orderDependencies", "dependencyLabels",
+    "dependencyDirectPickup", "dependencyWaitingForTransfer", "dependencyAttention",
+    "dependencyUncovered", "dependencyUncoveredQuantity", "planOwned", "isSplit", "isGrouped",
     "sourceTable", "netsuiteId", "dispatchRef", "dependency", "dependencies", "mbt"
   ];
   const slim = Object.fromEntries(keys.filter((key) => order[key] !== undefined).map((key) => [key, order[key]]));
@@ -107,6 +111,39 @@ function publicPlan(plan = {}) {
   };
 }
 
+function planTransitCoRefs(orders = []) {
+  const refs = new Set();
+  const visit = (order = {}) => {
+    const ref = text(order.transitCo?.id);
+    if (ref) {refs.add(ref);}
+    for (const child of Array.isArray(order.childOrderDetails) ? order.childOrderDetails : []) {
+      visit(child);
+    }
+  };
+  for (const order of orders || []) {visit(order);}
+  return [...refs];
+}
+
+async function reconcileCancelledLocalCos(plan) {
+  if (!plan) {return null;}
+  const refs = planTransitCoRefs(plan.orders);
+  if (!refs.length) {return plan;}
+  const cancelled = await query(
+    `SELECT co_ref, from_location, to_location
+       FROM local_co_orders
+      WHERE status = 'cancelled'
+        AND co_ref = ANY($1::text[])`,
+    [refs]
+  );
+  if (!cancelled.rows.length) {return plan;}
+  const byRef = new Map(cancelled.rows.map((row) => [
+    text(row.co_ref).toLowerCase(),
+    { fromYard: text(row.from_location), toYard: text(row.to_location) }
+  ]));
+  const orders = (plan.orders || []).map((order) => clearCancelledTransitCoMetadata(order, byRef));
+  return orders.some((order, index) => order !== plan.orders[index]) ? { ...plan, orders } : plan;
+}
+
 async function selectPlan({ planId = "", date = "", lock = false } = {}) {
   const cleanId = text(planId);
   const cleanDate = planDate(date);
@@ -131,7 +168,7 @@ async function selectPlan({ planId = "", date = "", lock = false } = {}) {
       ${lock ? "FOR UPDATE OF p" : ""}`,
     params
   );
-  return result.rows[0] ? rowPlan(result.rows[0]) : null;
+  return result.rows[0] ? reconcileCancelledLocalCos(rowPlan(result.rows[0])) : null;
 }
 
 export async function getDispatchV2Bootstrap({ planId = "", date = "" } = {}) {

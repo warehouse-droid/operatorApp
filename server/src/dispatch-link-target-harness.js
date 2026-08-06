@@ -1,13 +1,18 @@
 import { readFile } from "node:fs/promises";
 import { beginRollbackContext, closeDb, query } from "./db.js";
 import {
+  cancelLocalCoOrder,
+  cancelSalesOrderPoAllocation,
   createSalesOrderPoAllocations,
   enrichDispatchOrdersWithPoTargetAllocations,
-  getSalesOrderPoAllocationOptions
+  getLocalCoOrder,
+  getSalesOrderPoAllocationOptions,
+  upsertLocalCoOrder
 } from "./dispatch-repository.js";
 import { resolveDispatchSalesTarget } from "./dispatch-order-target-repository.js";
 import { applyDispatchPlannedAssignment } from "./dispatch-plan-repository.js";
 import {
+  cancelOrderDependency,
   createOrderDependency,
   getOrderDependencyOptions,
   listOrderDependencies
@@ -322,6 +327,65 @@ try {
     });
     assert(poAllocations.length === 2 && poAllocations.every((allocation) => allocation.dispatchTargetRef === groupRef),
       "Grouped PO allocations must persist under the visible target.", { poAllocations });
+
+    const coRef = `CO-${groupRef}`;
+    const groupedWithLinks = {
+      ...groupOrder,
+      pickupLocations: ["12441", "Link Target Yard"],
+      sourceYard: "12441",
+      transitCo: { id: coRef, fromYard: "3445", toYard: "12441" },
+      orderDependencies: [dependency]
+    };
+    const groupedCo = await upsertLocalCoOrder({
+      sourceOrderRef: groupRef,
+      fromYard: "3445",
+      toYard: "12441",
+      order: groupedWithLinks,
+      plan: { id: plan.rows[0].id, planDate },
+      requestedBy: "dispatch-link-harness"
+    });
+    assert(groupedCo?.co_ref === coRef
+        && groupedCo?.source_order_ref === groupRef
+        && groupedCo?.details?.childOrderIds?.length === 2
+        && groupedCo?.lines?.length === 3
+        && new Set(groupedCo.lines.map((line) => String(line.line_id))).size === 3,
+      "A grouped order with active PO and TO links must also support a local CO.", { groupedCo });
+
+    const linkedGroup = (await enrichDispatchOrdersWithPoTargetAllocations([groupedWithLinks]))[0];
+    assert(linkedGroup.poPickupManifest?.length === 1
+        && linkedGroup.childOrderDetails.every((child) => child.items.some((item) => Number(item.poAllocatedSalesQty) > 0)),
+      "The PO link must remain materialized across every child while grouped TO and CO links are active.", { linkedGroup });
+    assert((await listOrderDependencies({ salesOrderRef: groupRef })).some((entry) => String(entry.id) === String(dependency.id)),
+      "The grouped TO link must remain active while PO and CO links are present.");
+
+    const cancelledCo = await cancelLocalCoOrder(coRef, { requestedBy: "dispatch-link-harness" });
+    const poAfterCoCancel = await getSalesOrderPoAllocationOptions(groupRef, { planDate });
+    const toAfterCoCancel = await listOrderDependencies({ salesOrderRef: groupRef });
+    assert(cancelledCo?.status === "cancelled"
+        && (await getLocalCoOrder(coRef))?.status === "cancelled",
+      "Grouped CO cancellation must be durable.", { cancelledCo });
+    assert(poAfterCoCancel.allocations.length === poAllocations.length,
+      "Cancelling a grouped CO must not unlink its PO allocations.", { poAfterCoCancel });
+    assert(toAfterCoCancel.some((entry) => String(entry.id) === String(dependency.id)),
+      "Cancelling a grouped CO must not unlink its TO dependency.", { toAfterCoCancel });
+
+    const cancelledPo = await cancelSalesOrderPoAllocation(poAllocations[0].id, {
+      cancelledBy: "dispatch-link-harness"
+    });
+    assert(cancelledPo?.status === "cancelled"
+        && (await listOrderDependencies({ salesOrderRef: groupRef })).some((entry) => String(entry.id) === String(dependency.id))
+        && (await getLocalCoOrder(coRef))?.status === "cancelled",
+      "Unlinking one grouped PO allocation must not alter its TO or CO state.", { cancelledPo });
+
+    const cancelledTo = await cancelOrderDependency(dependency.id, null, planDate);
+    const poAfterToCancel = await getSalesOrderPoAllocationOptions(groupRef, { planDate });
+    assert(cancelledTo.cancelled === true
+        && poAfterToCancel.allocations.length === poAllocations.length - 1
+        && (await getLocalCoOrder(coRef))?.status === "cancelled",
+      "Unlinking a grouped TO must not alter the remaining PO allocation or CO state.", {
+        cancelledTo,
+        poAfterToCancel
+      });
     const specialOrderId = base + 4;
     const specialOrderRef = "LINK-SO-SPECIAL-" + suffix;
     const specialLine = await insertSalesOrder(specialOrderId, specialOrderRef, 5, base + 104);

@@ -99,6 +99,98 @@ test("DP-17: compact bootstrap preserves assigned Custom Order identity and oper
   assert.equal(saved.response.status, 200, JSON.stringify(saved.payload));
 });
 
+test("DP-29: compact bootstrap removes a cancelled grouped CO while preserving Link PO and Link TO", { timeout: 30_000 }, async () => {
+  const groupRef = "GOA-DP29-6486-6489";
+  const coRef = `CO-${groupRef}`;
+  const seeded = await fixture.seedPlan({ date: "2038-11-17", refs: [groupRef] });
+  const group = {
+    ...dispatchOrder(groupRef, 29),
+    childOrders: ["SOA-DP29-6486", "SOA-DP29-6489"],
+    childOrderDetails: [{
+      ...dispatchOrder("SOA-DP29-6486", 30),
+      transitCo: { id: coRef, fromYard: "2967", toYard: "12441" },
+      transitOriginalPickupLocations: ["2967"],
+      pickupLocations: ["12441"],
+      items: [{ itemName: "DP29-GROUP-SKU", quantity: 8, poAllocatedSalesQty: 8 }]
+    }],
+    transitCo: { id: coRef, fromYard: "2967", toYard: "12441" },
+    transitOriginalPickupLocations: ["2967"],
+    transitOriginalSourceYard: "2967",
+    pickupLocations: ["12441"],
+    sourceYard: "12441",
+    notes: "Transit via 12441. Grouped orders",
+    poPickupManifest: [{
+      poOrderRef: "POB-DP29",
+      location: "DP29 Vendor Yard",
+      items: [{ itemName: "DP29-GROUP-SKU", quantity: 8 }]
+    }],
+    orderDependencies: [{
+      id: 29001,
+      transferOrderRef: "TOB-DP29",
+      mode: "direct_to_customer",
+      status: "active"
+    }],
+    dependencyDirectPickup: true
+  };
+  await query(
+    `INSERT INTO local_co_orders (
+       co_ref, source_order_ref, from_location, to_location, status, details
+     ) VALUES ($1, $2, '2967', '12441', 'cancelled', $3::jsonb)`,
+    [coRef, groupRef, JSON.stringify({ testOnly: true })]
+  );
+  await query(
+    `UPDATE dispatch_plan_snapshots
+        SET orders = $2::jsonb, trucks = $3::jsonb, saved_at = now()
+      WHERE plan_id = $1`,
+    [seeded.id, JSON.stringify([group]), JSON.stringify(dispatchTrucks([groupRef]))]
+  );
+
+  const bootstrap = await fixture.request(`/api/dispatch/v2/bootstrap?planId=${seeded.id}&date=${seeded.plan_date}`);
+
+  assert.equal(bootstrap.response.status, 200, JSON.stringify(bootstrap.payload));
+  const compact = bootstrap.payload.plan.assignedOrderSnapshots.find((order) => order.id === groupRef);
+  assert.ok(compact, "the grouped order must remain in the compact plan after CO cancellation");
+  assert.equal(compact.transitCo, null, "the first render must not resurrect the cancelled CO");
+  assert.deepEqual(compact.pickupLocations, ["2967", "DP29 Vendor Yard"]);
+  assert.equal(compact.sourceYard, "2967");
+  assert.deepEqual(compact.poPickupManifest, group.poPickupManifest);
+  assert.deepEqual(compact.orderDependencies, group.orderDependencies);
+  assert.equal(compact.dependencyDirectPickup, true);
+  assert.equal(compact.childOrderDetails[0].transitCo, null);
+  assert.equal(compact.childOrderDetails[0].items[0].poAllocatedSalesQty, 8);
+
+  const lease = await fixture.acquireLease({ planDate: seeded.plan_date, sessionId: "dispatch-v2-dp29" });
+  const saved = await fixture.request(`/api/dispatch/v2/plans/${seeded.id}/commands`, {
+    method: "POST",
+    headers: { "x-dispatch-edit-lease": lease },
+    body: {
+      commandId: "dp29-save-sanitized-group",
+      baseRevision: bootstrap.payload.plan.revision,
+      baseDigest: bootstrap.payload.plan.digest,
+      sessionId: "dispatch-v2-dp29",
+      commandType: "replace_plan",
+      payload: {
+        planDate: seeded.plan_date,
+        orders: bootstrap.payload.plan.assignedOrderSnapshots,
+        trucks: bootstrap.payload.plan.trucks,
+        summary: bootstrap.payload.plan.summary,
+        actionName: "cancelled_group_co_recovery",
+        affectedOrderRefs: [groupRef, coRef]
+      }
+    }
+  });
+  assert.equal(saved.response.status, 200, JSON.stringify(saved.payload));
+  const persisted = await query(
+    `SELECT order_row.value->'transitCo' AS transit_co
+       FROM dispatch_plan_snapshots snapshot
+       CROSS JOIN LATERAL jsonb_array_elements(snapshot.orders) order_row(value)
+      WHERE snapshot.plan_id = $1
+        AND order_row.value->>'id' = $2`,
+    [seeded.id, groupRef]
+  );
+  assert.equal(persisted.rows[0]?.transit_co, null, "the next save must durably remove the stale CO marker");
+});
+
 test("DP-18: CO detail persistence acknowledgement is bounded and skips global order hydration", { timeout: 30_000 }, async () => {
   const orderRef = "DP-CO-ACK-FAST";
   await query(

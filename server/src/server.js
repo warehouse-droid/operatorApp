@@ -80,7 +80,7 @@ import {
   pendingDispatchV2Followups,
   pruneExpiredDispatchV2Checkpoints
 } from "./dispatch-planner-v2-repository.js";
-import { evaluateExecutedPrefixPolicy } from "./dispatch-planner-performance.js";
+import { clearCancelledTransitCoMetadata, evaluateExecutedPrefixPolicy } from "./dispatch-planner-performance.js";
 import { DispatchPlanEditLeaseError, acquireDispatchPlanEditLease, assertDispatchPlanEditLease, getDispatchPlanEditLease, heartbeatDispatchPlanEditLease, releaseDispatchPlanEditLease } from "./dispatch-plan-lease-repository.js";
 import { getDispatchStatistics } from "./dispatch-statistics-repository.js";
 import { buildDispatchForecast } from "./dispatch-forecast-service.js";
@@ -1026,7 +1026,7 @@ function dispatchOrderLogicalRefs(order = {}) {
 async function listDispatchSnapshotDerivedOrders({ type = null, search = "" } = {}) {
   const sandbox = isNetSuiteSandboxEnvironment();
   const snapshotSearch = String(search || "").trim().slice(0, 120);
-  const [result, inactiveSplits, blanketPurchaseOrders] = await Promise.all([
+  const [result, inactiveSplits, blanketPurchaseOrders, cancelledLocalCos] = await Promise.all([
     query(
     `SELECT p.id, p.plan_date::text AS plan_date, p.updated_at, s.orders
        FROM dispatch_plans p
@@ -1045,16 +1045,29 @@ async function listDispatchSnapshotDerivedOrders({ type = null, search = "" } = 
       `SELECT tranid, dispatch_ref
          FROM purchase_orders
         WHERE is_blanket_po = true`
+    ),
+    query(
+      `SELECT co_ref, from_location, to_location
+         FROM local_co_orders
+        WHERE status = 'cancelled'`
     )
   ]);
   const inactiveSplitRefs = new Set(inactiveSplits.rows.map((row) => String(row.tranid || "")));
   const blanketPurchaseOrderRefs = new Set(blanketPurchaseOrders.rows.flatMap((row) => [row.tranid, row.dispatch_ref])
     .map((ref) => String(ref || "").trim().toLowerCase())
     .filter(Boolean));
+  const cancelledLocalCoByRef = new Map(cancelledLocalCos.rows.map((row) => [
+    String(row.co_ref || "").trim().toLowerCase(),
+    {
+      fromYard: String(row.from_location || "").trim(),
+      toYard: String(row.to_location || "").trim()
+    }
+  ]).filter(([ref]) => ref));
   const derivedOrders = new Map();
   const wantedType = type ? String(type).toUpperCase() : "";
   for (const row of result.rows) {
-    for (const order of row.orders || []) {
+    for (const snapshotOrder of row.orders || []) {
+      const order = clearCancelledTransitCoMetadata(snapshotOrder, cancelledLocalCoByRef);
       if (!isSnapshotDerivedDispatchOrder(order)) continue;
       if (wantedType && String(order?.type || "").toUpperCase() !== wantedType) continue;
       const id = String(order?.id || "").trim();

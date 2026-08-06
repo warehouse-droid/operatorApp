@@ -4,6 +4,7 @@ import { test } from "node:test";
 import {
   applyDispatchPlanCommand,
   buildCompactDispatchSnapshot,
+  clearCancelledTransitCoMetadata,
   createDispatchCommandReceiptStore,
   digestDispatchPlan
 } from "../../../src/dispatch-planner-performance.js";
@@ -92,6 +93,86 @@ test("DP-04 plan digest is canonical, includes the compact board, and excludes u
   assert.equal(digestDispatchPlan(base), digestDispatchPlan(differentObjectKeyOrder));
   assert.equal(digestDispatchPlan(base), digestDispatchPlan(poolChange));
   assert.notEqual(digestDispatchPlan(base), digestDispatchPlan(scheduledChange));
+});
+
+test("DP-28 a grouped source order remains in the compact plan after its cancelled CO metadata is cleared", () => {
+  const grouped = order("GOA-6486-6489", {
+    type: "SO",
+    childOrders: ["SOA06486", "SOA06489"],
+    childOrderDetails: [
+      order("SOA06486", {
+        items: [{ sku: "GROUP-SKU", pieces: 8, poAllocatedPieces: 8, poAllocatedSalesQty: 8 }]
+      }),
+      order("SOA06489")
+    ],
+    pickupLocations: ["2967", "Vendor Yard"],
+    sourceYard: "2967",
+    localDispatchStatus: "open",
+    poPickupManifest: [{
+      poOrderRef: "POB03597",
+      location: "Vendor Yard",
+      items: [{ sku: "GROUP-SKU", pieces: 8, quantity: 8 }]
+    }],
+    orderDependencies: [{
+      id: 912,
+      transferOrderRef: "TOB00762",
+      mode: "direct_to_customer",
+      status: "active"
+    }]
+  });
+  const source = planWithOrders([grouped], []);
+
+  const compact = buildCompactDispatchSnapshot(source);
+
+  assert.deepEqual(compact.orders.map((candidate) => candidate.id), [grouped.id]);
+  assert.deepEqual(compact.orders[0].childOrders, grouped.childOrders);
+  assert.equal(compact.orders[0].transitCo, undefined);
+  assert.deepEqual(compact.orders[0].poPickupManifest, grouped.poPickupManifest);
+  assert.deepEqual(compact.orders[0].orderDependencies, grouped.orderDependencies);
+  assert.equal(compact.orders[0].childOrderDetails[0].items[0].poAllocatedSalesQty, 8);
+});
+
+test("DP-29 a cancelled local CO cannot be resurrected by a grouped snapshot-derived order", () => {
+  const grouped = order("GOA-6486-6489", {
+    transitCo: { id: "CO-GOA-6486-6489", fromYard: "2967", toYard: "12441" },
+    transitOriginalPickupLocations: ["2967"],
+    transitOriginalSourceYard: "2967",
+    pickupLocations: ["12441"],
+    sourceYard: "12441",
+    notes: "Transit via 12441. Grouped orders",
+    poPickupManifest: [{ poOrderRef: "POB03597", location: "Vendor Yard", items: [] }],
+    orderDependencies: [{ id: 912, transferOrderRef: "TOB00762" }],
+    childOrders: ["SOA06486"],
+    childOrderDetails: [order("SOA06486", {
+      transitCo: { id: "CO-GOA-6486-6489", fromYard: "2967", toYard: "12441" },
+      transitOriginalPickupLocations: ["2967"],
+      pickupLocations: ["12441"],
+      items: [{ sku: "GROUP-SKU", poAllocatedSalesQty: 8 }]
+    })]
+  });
+
+  const cleared = clearCancelledTransitCoMetadata(grouped, [{
+    coRef: "CO-GOA-6486-6489",
+    fromYard: "2967",
+    toYard: "12441"
+  }]);
+
+  assert.equal(cleared.transitCo, null);
+  assert.deepEqual(cleared.pickupLocations, ["2967", "Vendor Yard"]);
+  assert.equal(cleared.sourceYard, "2967");
+  assert.equal(cleared.childOrderDetails[0].transitCo, null);
+  assert.deepEqual(cleared.orderDependencies, grouped.orderDependencies);
+  assert.deepEqual(cleared.poPickupManifest, grouped.poPickupManifest);
+  assert.equal(cleared.childOrderDetails[0].items[0].poAllocatedSalesQty, 8);
+  assert.doesNotMatch(cleared.notes, /^Transit via /iu);
+
+  const active = clearCancelledTransitCoMetadata(grouped, [{
+    coRef: "CO-ANOTHER-GROUP",
+    fromYard: "3445",
+    toYard: "12441"
+  }]);
+  assert.deepEqual(active.transitCo, grouped.transitCo);
+  assert.deepEqual(active.pickupLocations, grouped.pickupLocations);
 });
 
 test("DP-06 exact command retries return the stored acknowledgement without a second revision or side effect", () => {

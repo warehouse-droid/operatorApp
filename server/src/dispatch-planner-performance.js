@@ -66,6 +66,71 @@ function relatedOrderRefs(order = {}) {
   ].map(text).filter(Boolean))];
 }
 
+export function clearCancelledTransitCoMetadata(order = {}, cancelledCos = []) {
+  const cancelledByRef = cancelledCos instanceof Map
+    ? cancelledCos
+    : new Map((Array.isArray(cancelledCos) ? cancelledCos : [])
+      .map((record) => [
+        text(record?.coRef || record?.co_ref).toLowerCase(),
+        {
+          fromYard: text(record?.fromYard || record?.from_yard || record?.from_location),
+          toYard: text(record?.toYard || record?.to_yard || record?.to_location)
+        }
+      ])
+      .filter(([ref]) => ref));
+  const locationKey = (value) => text(value).split(/\s*:\s*/u, 1)[0].toLowerCase();
+  const reconcile = (candidate = {}) => {
+    const existingChildren = Array.isArray(candidate.childOrderDetails) ? candidate.childOrderDetails : [];
+    const childOrderDetails = existingChildren.map(reconcile);
+    const childChanged = childOrderDetails.some((child, index) => child !== existingChildren[index]);
+    const coRef = text(candidate.transitCo?.id).toLowerCase();
+    const cancelled = cancelledByRef.get(coRef);
+    if (!cancelled && !childChanged) {return candidate;}
+    const next = {
+      ...candidate,
+      ...(existingChildren.length || Array.isArray(candidate.childOrderDetails)
+        ? { childOrderDetails }
+        : {})
+    };
+    if (!cancelled) {return next;}
+
+    const destination = locationKey(candidate.transitCo?.toYard || cancelled.toYard);
+    const restored = [
+      ...(Array.isArray(candidate.transitOriginalPickupLocations)
+        ? candidate.transitOriginalPickupLocations
+        : []),
+      ...(!candidate.transitOriginalPickupLocations?.length && (candidate.transitCo?.fromYard || cancelled.fromYard)
+        ? [candidate.transitCo?.fromYard || cancelled.fromYard]
+        : []),
+      ...(Array.isArray(candidate.pickupLocations)
+        ? candidate.pickupLocations.filter((location) => locationKey(location) !== destination)
+        : []),
+      ...(Array.isArray(candidate.poPickupManifest)
+        ? candidate.poPickupManifest.map((entry) => entry?.location).filter(Boolean)
+        : [])
+    ];
+    const seen = new Set();
+    next.pickupLocations = restored.filter((location) => {
+      const key = locationKey(location);
+      if (!key || seen.has(key)) {return false;}
+      seen.add(key);
+      return true;
+    });
+    if (!next.pickupLocations.length && cancelled.fromYard) {
+      next.pickupLocations = [cancelled.fromYard];
+    }
+    next.sourceYard = candidate.transitOriginalSourceYard
+      || next.pickupLocations[0]
+      || candidate.sourceYard;
+    next.notes = text(candidate.notes).replace(/^Transit via [^.]+\.?\s*/iu, "").trim();
+    next.transitCo = null;
+    delete next.transitOriginalPickupLocations;
+    delete next.transitOriginalSourceYard;
+    return next;
+  };
+  return reconcile(order);
+}
+
 function planOwnedOrder(order = {}) {
   const type = text(order.type).toUpperCase();
   return PLAN_OWNED_TYPES.has(type)
@@ -73,7 +138,8 @@ function planOwnedOrder(order = {}) {
     || Boolean(order.transitCo)
     || Boolean(order.planOwned)
     || Boolean(order.isSplit)
-    || Boolean(order.isGrouped);
+    || Boolean(order.isGrouped)
+    || (Array.isArray(order.childOrders) && order.childOrders.length > 0);
 }
 
 function compactOrderRefs(plan = {}) {
