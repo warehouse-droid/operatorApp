@@ -754,6 +754,112 @@ function rebaseFutureStopTiming(stop = {}, offset = 0) {
   return { ...stop, timing };
 }
 
+function fixedLoadStart(load = {}) {
+  const configured = text(load.startMode || load.start_mode).toLowerCase();
+  if (configured === "fixed") return true;
+  if (configured === "auto") return false;
+  return Boolean(text(load.start));
+}
+
+function rebaseMutableLoadDerivedSchedule(load = {}, offset = 0) {
+  if (!offset) return load;
+  const rebased = { ...load };
+  for (const field of ["plannedStartMinute", "plannedFinishMinute"]) {
+    if (Object.prototype.hasOwnProperty.call(load, field)) {
+      rebased[field] = shiftedDerivedMinute(load[field], offset);
+    }
+  }
+  if (!fixedLoadStart(load) && Object.prototype.hasOwnProperty.call(load, "scheduledStartMinute")) {
+    rebased.scheduledStartMinute = shiftedDerivedMinute(load.scheduledStartMinute, offset);
+  }
+  if (load.timing && typeof load.timing === "object") {
+    const timing = { ...load.timing };
+    for (const field of ["start", "finish", "previousFinish", "handoffStart", "switchStart"]) {
+      if (Object.prototype.hasOwnProperty.call(load.timing, field)) {
+        timing[field] = shiftedDerivedMinute(load.timing[field], offset);
+      }
+    }
+    if (!fixedLoadStart(load) && Object.prototype.hasOwnProperty.call(load.timing, "scheduledStart")) {
+      timing.scheduledStart = shiftedDerivedMinute(load.timing.scheduledStart, offset);
+    }
+    if (load.timing.handoffTravel && typeof load.timing.handoffTravel === "object") {
+      timing.handoffTravel = { ...load.timing.handoffTravel };
+      for (const field of ["start", "finish"]) {
+        if (Object.prototype.hasOwnProperty.call(load.timing.handoffTravel, field)) {
+          timing.handoffTravel[field] = shiftedDerivedMinute(load.timing.handoffTravel[field], offset);
+        }
+      }
+    }
+    rebased.timing = timing;
+  }
+  rebased.stops = (load.stops || []).map((stop) => rebaseFutureStopTiming(stop, offset));
+  return rebased;
+}
+
+function loadInterval(load = {}) {
+  return {
+    start: dispatchMinute(load.plannedStartMinute ?? load.timing?.start),
+    finish: dispatchMinute(load.plannedFinishMinute ?? load.timing?.finish)
+  };
+}
+
+function rebaseMutableLaneSuffixes(plan = {}, restoredLoadIds = new Set(), lockedLoadIds = new Set()) {
+  if (!restoredLoadIds.size) return plan;
+  const trucks = (plan.trucks || []).map((truck) => ({
+    ...truck,
+    loads: [...(truck.loads || [])]
+  }));
+  const lanes = new Map();
+  for (const [truckIndex, truck] of trucks.entries()) {
+    for (const [loadIndex, load] of (truck.loads || []).entries()) {
+      const assignment = dispatchLoadAssignment(truck, load, { driverSequence: loadIndex });
+      if (!assignment.driverLogin) continue;
+      if (!lanes.has(assignment.driverLogin)) lanes.set(assignment.driverLogin, []);
+      lanes.get(assignment.driverLogin).push({ truck, truckIndex, loadIndex, load, assignment });
+    }
+  }
+
+  for (const entries of lanes.values()) {
+    entries.sort((left, right) =>
+      left.assignment.driverSequence - right.assignment.driverSequence
+      || left.truckIndex - right.truckIndex
+      || left.loadIndex - right.loadIndex
+    );
+    let restoredPrefix = false;
+    let previous = null;
+    for (const entry of entries) {
+      const loadId = text(entry.load.id);
+      if (restoredLoadIds.has(loadId)) restoredPrefix = true;
+      if (restoredPrefix && previous && !lockedLoadIds.has(loadId)) {
+        const previousInterval = loadInterval(previous.load);
+        const currentInterval = loadInterval(entry.load);
+        if (
+          previousInterval.finish !== null
+          && currentInterval.start !== null
+          && currentInterval.finish !== null
+          && currentInterval.finish > currentInterval.start
+        ) {
+          const changedTruck = previous.assignment.truckPlate !== entry.assignment.truckPlate;
+          const handoffMinutes = changedTruck ? Math.max(0, Number(entry.assignment.handoffTravelMinutes || 0)) : 0;
+          const configuredSwitch = Number(entry.load.truckSwitchMinutes ?? DEFAULT_SWITCH_MINUTES);
+          const switchMinutes = changedTruck
+            ? Math.max(0, Math.round(Number.isFinite(configuredSwitch) ? configuredSwitch : DEFAULT_SWITCH_MINUTES))
+            : 0;
+          const requiredStart = previousInterval.finish + handoffMinutes + switchMinutes;
+          if (currentInterval.start < requiredStart) {
+            const shifted = rebaseMutableLoadDerivedSchedule(entry.load, requiredStart - currentInterval.start);
+            entry.truck.loads[entry.loadIndex] = shifted;
+            entry.load = shifted;
+            entry.assignment = dispatchLoadAssignment(entry.truck, shifted, { driverSequence: entry.assignment.driverSequence });
+          }
+        }
+      }
+      previous = entry;
+    }
+  }
+  return { ...plan, trucks };
+}
+
 /**
  * Keep the server's already-published schedule for loads with driver activity.
  *
@@ -780,7 +886,8 @@ export function overlayLockedLoadDerivedSchedule(previousPlan = {}, nextPlan = {
   const previousLoads = new Map(flattenDispatchPlanLoads(previousPlan)
     .map((row) => [text(row.load.id), row.load])
     .filter(([loadId]) => loadId));
-  return {
+  const restoredLoadIds = new Set();
+  const overlaidPlan = {
     ...nextPlan,
     trucks: (nextPlan.trucks || []).map((truck) => ({
       ...truck,
@@ -827,10 +934,17 @@ export function overlayLockedLoadDerivedSchedule(previousPlan = {}, nextPlan = {
             ? overlayFields(stop, previousStop, LOCKED_STOP_DERIVED_SCHEDULE_FIELDS)
             : stop;
         });
+        const submittedInterval = loadInterval(load);
+        const restoredInterval = loadInterval(overlaid);
+        if (
+          submittedInterval.start !== restoredInterval.start
+          || submittedInterval.finish !== restoredInterval.finish
+        ) restoredLoadIds.add(loadId);
         return overlaid;
       })
     }))
   };
+  return rebaseMutableLaneSuffixes(overlaidPlan, restoredLoadIds, locked);
 }
 
 export function driverLoadLanes(plan = {}, configuredDrivers = []) {

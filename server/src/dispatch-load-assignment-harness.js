@@ -1208,6 +1208,145 @@ assert.deepEqual(
   "Every completed physical visit must retain its original planned timing."
 );
 
+const completedDayBaseline = normalizeDispatchPlanLoadAssignments({
+  id: 208,
+  planDate: "2026-08-05",
+  trucks: [truck("T6", "CE94489", "sety", [
+    ["DAY-1", 360, 468],
+    ["DAY-2", 468, 633],
+    ["DAY-3", 633, 750],
+    ["DAY-4", 762, 1079],
+    ["DAY-5", 1091, 1166]
+  ].map(([id, start, finish], driverSequence) => load(id, {
+    driverSequence,
+    plannedStartMinute: start,
+    plannedFinishMinute: finish,
+    timing: { start, finish, previousFinish: driverSequence ? start : null },
+    stops: [{
+      id: `${id}-STOP`,
+      type: driverSequence === 3 ? "drop" : "pick",
+      orderId: `${id}-ORDER`,
+      location: driverSequence === 3 ? "Customer" : "12441",
+      timing: { arrival: start + 5, depart: finish - 5 }
+    }]
+  })))]
+});
+const staleCompletedDayWithLoadSix = structuredClone(completedDayBaseline);
+[
+  [360, 464],
+  [464, 629],
+  [629, 746],
+  [746, 938],
+  [938, 1025]
+].forEach(([start, finish], index) => {
+  const candidate = staleCompletedDayWithLoadSix.trucks[0].loads[index];
+  candidate.plannedStartMinute = start;
+  candidate.plannedFinishMinute = finish;
+  candidate.timing = { start, finish, previousFinish: index ? start : null };
+  candidate.stops[0].timing = { arrival: start + 5, depart: finish - 5 };
+});
+staleCompletedDayWithLoadSix.trucks[0].loads.push(load("DAY-6", {
+  driverSequence: 5,
+  plannedStartMinute: 1025,
+  plannedFinishMinute: 1143,
+  timing: { start: 1025, finish: 1143, previousFinish: 1025 },
+  stops: [{
+    id: "DAY-6-STOP",
+    type: "drop",
+    orderId: "DAY-6-ORDER",
+    location: "New customer",
+    timing: { arrival: 1035, depart: 1133 }
+  }]
+}));
+const completedDayStatuses = completedDayBaseline.trucks[0].loads.map((candidate) => ({
+  load_id: candidate.id,
+  stop_id: candidate.stops[0].id,
+  stop_type: candidate.stops[0].type === "pick" ? "pickup" : "dropoff",
+  order_refs: [candidate.stops[0].orderId],
+  status: "complete"
+}));
+const completedDayWithLoadSix = overlayLockedLoadDerivedSchedule(
+  completedDayBaseline,
+  staleCompletedDayWithLoadSix,
+  new Set(completedDayBaseline.trucks[0].loads.map((candidate) => candidate.id)),
+  { activityStatuses: completedDayStatuses }
+);
+assert.deepEqual(
+  completedDayWithLoadSix.trucks[0].loads.slice(0, 5).map((candidate) => [candidate.plannedStartMinute, candidate.plannedFinishMinute]),
+  completedDayBaseline.trucks[0].loads.map((candidate) => [candidate.plannedStartMinute, candidate.plannedFinishMinute]),
+  "Restoring a completed day must retain all five published intervals."
+);
+assert.deepEqual(
+  [
+    completedDayWithLoadSix.trucks[0].loads[5].plannedStartMinute,
+    completedDayWithLoadSix.trucks[0].loads[5].plannedFinishMinute,
+    completedDayWithLoadSix.trucks[0].loads[5].timing.previousFinish,
+    completedDayWithLoadSix.trucks[0].loads[5].stops[0].timing
+  ],
+  [1166, 1284, 1166, { arrival: 1176, depart: 1274 }],
+  "A newly appended load must move atomically after the restored completed prefix."
+);
+assert.equal(
+  validateDispatchLoadAssignments(completedDayWithLoadSix).some((item) => ["DISPATCH_DRIVER_TIME_CONFLICT", "DISPATCH_TRUCK_OCCUPANCY_CONFLICT"].includes(item.code)),
+  false,
+  "A valid Load 6 append must not be rejected because the browser recalculated completed loads from stale operational data."
+);
+
+const partialScheduleBaseline = normalizeDispatchPlanLoadAssignments({
+  id: 209,
+  planDate: "2026-08-06",
+  trucks: [truck("T-PARTIAL-SCHEDULE", "CE94489", "sety", [
+    load("PARTIAL-ACTIVE", {
+      driverSequence: 0,
+      plannedStartMinute: 420,
+      plannedFinishMinute: 720,
+      timing: { start: 420, finish: 720, previousFinish: null },
+      stops: Array.from({ length: 6 }, (_, index) => ({
+        id: `PARTIAL-ACTIVE-${index + 1}`,
+        type: index === 0 ? "pick" : "drop",
+        orderId: `PARTIAL-ACTIVE-ORDER-${index + 1}`,
+        location: index === 0 ? "12441" : `Customer ${index + 1}`,
+        timing: { arrival: 430 + (index * 45), depart: 450 + (index * 45) }
+      }))
+    }),
+    load("PARTIAL-LATER", {
+      driverSequence: 1,
+      plannedStartMinute: 720,
+      plannedFinishMinute: 780,
+      timing: { start: 720, finish: 780, previousFinish: 720 },
+      stops: [{ id: "PARTIAL-LATER-1", type: "drop", orderId: "PARTIAL-LATER-ORDER", location: "Later", timing: { arrival: 730, depart: 770 } }]
+    })
+  ])]
+});
+const stalePartialAppend = structuredClone(partialScheduleBaseline);
+Object.assign(stalePartialAppend.trucks[0].loads[0], {
+  plannedStartMinute: 300,
+  plannedFinishMinute: 650,
+  timing: { start: 300, finish: 650, previousFinish: null }
+});
+Object.assign(stalePartialAppend.trucks[0].loads[1], {
+  plannedStartMinute: 650,
+  plannedFinishMinute: 710,
+  timing: { start: 650, finish: 710, previousFinish: 650 }
+});
+const partialScheduleStatuses = [1, 2, 3, 4].map((number) => ({
+  load_id: "PARTIAL-ACTIVE",
+  stop_id: `PARTIAL-ACTIVE-${number}`,
+  stop_type: number === 1 ? "pickup" : "dropoff",
+  status: number === 4 ? "in_progress" : "complete"
+}));
+const rebasedPartialAppend = overlayLockedLoadDerivedSchedule(
+  partialScheduleBaseline,
+  stalePartialAppend,
+  new Set(["PARTIAL-ACTIVE"]),
+  { activityStatuses: partialScheduleStatuses }
+);
+assert.deepEqual(
+  rebasedPartialAppend.trucks[0].loads.map((candidate) => [candidate.plannedStartMinute, candidate.plannedFinishMinute]),
+  [[420, 770], [770, 830]],
+  "Stops 1-3 complete and stop 4 active must still allow stop 5+ growth and atomically shift every later load."
+);
+
 const endingTripPlan = normalizeDispatchPlanLoadAssignments({
   id: 99,
   planDate: "2026-08-01",
@@ -1232,4 +1371,4 @@ const laterLoadAfterEnding = structuredClone(endingTripPlan);
 laterLoadAfterEnding.trucks[0].loads.push(load("LATER-LOAD", { timing: { start: 540, finish: 600 }, driverSequence: 2 }));
 assert.ok(validateDispatchPlanTimingMetadata(laterLoadAfterEnding).some((item) => item.reason === "not_final_driver_load"));
 
-console.log(JSON.stringify({ ok: true, tests: 140 }));
+console.log(JSON.stringify({ ok: true, tests: 151 }));

@@ -203,8 +203,6 @@ test("DP-17/DP-19 browser: compact Custom Order startup keeps completed travel s
     address: nestedChild.address,
     sourceYard: "3445",
     pickupLocations: ["3445"],
-    childOrders: [nestedChild.id],
-    childOrderDetails: [nestedChild],
     items: nestedChild.items,
     pallets: nestedChild.pallets,
     weight: nestedChild.weight
@@ -217,6 +215,9 @@ test("DP-17/DP-19 browser: compact Custom Order startup keeps completed travel s
     digest: "dp-compact-browser-digest",
     status: "draft",
     summary: { driverLaneOrder: ["compact-driver"] },
+    // Production snapshots created before group materialization can contain the
+    // historical child stop IDs while only retaining the current parent order.
+    // Driver evidence, not order-feed completeness, must protect those stops.
     assignedOrderSnapshots: [compactOrder, nestedGroup],
     trucks: [{
       id: "DP-TRAVEL-TRUCK",

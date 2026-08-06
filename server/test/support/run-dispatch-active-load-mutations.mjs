@@ -36,6 +36,13 @@ const mutants = [
     before: "        if (stopHasDriverActivity(load, stop)) {\n          nextStops.push(stop);\n          if (stop.type === \"drop\") seenDropGroups.add(group.id);\n          continue;\n        }",
     after: "        if (false) {\n          nextStops.push(stop);\n          if (stop.type === \"drop\") seenDropGroups.add(group.id);\n          continue;\n        }",
     command: ["--test", "test/dispatch/frontend/dispatch-planner-performance.contract.test.js"]
+  },
+  {
+    name: "leaves a newly appended load overlapping the restored completed prefix",
+    file: "src/dispatch-load-assignment.js",
+    before: "  return rebaseMutableLaneSuffixes(overlaidPlan, restoredLoadIds, locked);",
+    after: "  return overlaidPlan;",
+    command: ["src/dispatch-load-assignment-harness.js"]
   }
 ];
 

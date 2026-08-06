@@ -137,6 +137,14 @@ Given a compact historical plan whose physical stops reference grouped child ord
 
 Given stops 1–3 are complete and stop 4 is in progress, dispatch may add an order strictly after stop 5 without changing stops 1–4. The same activity must not block adding an order to any later load or creating a later load for that driver. Backend executed-prefix validation accepts both mutations while continuing to reject insertion, removal, reassignment, or reordering inside the executed/active prefix.
 
+### DP-24 — Incomplete compact snapshots retain executed child stops
+
+Given a historical grouped order whose child order document is absent from the compact startup payload, when that child pickup or drop has Driver PWA activity, orphan cleanup retains the physical stop unchanged. A delayed order feed may enrich the card later, but startup cleanup must not silently remove execution evidence or submit a structurally different protected load.
+
+### DP-25 — Restored schedules rebase only the mutable lane suffix
+
+Given completed or active loads whose authoritative intervals differ from the browser's stale recalculation, when dispatch appends an order or load after the protected prefix, the server first restores the protected intervals and then shifts each overlapping unlocked later load as one interval. Stop timing, previous-finish metadata, handoff travel, and truck-switch timing move by the same offset. Protected loads remain unchanged, and an explicit fixed future start is never rewritten merely to hide a genuine conflict.
+
 ## Setup and gauntlet plan
 
 - Reuse Node 20, `node:test`, Playwright, c8, TypeScript, ESLint, PostgreSQL, and the existing isolated Docker test environment.

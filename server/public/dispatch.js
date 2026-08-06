@@ -7338,7 +7338,13 @@ function cleanupOrphanPickupStops() {
   for (const truck of trucks) {
     for (const load of truck.loads) {
       if (load.returnOnly) continue;
-      load.stops = load.stops.filter((stop) => stop.type !== "drop" || Boolean(stopOrder(stop)));
+      // Compact startup can arrive before the full order feed and older plan
+      // snapshots may no longer contain a grouped child's order document. The
+      // recorded stop ID is still immutable Driver PWA evidence and must never
+      // be mistaken for an orphan while its order details are downloading.
+      load.stops = load.stops.filter((stop) =>
+        stop.type !== "drop" || Boolean(stopOrder(stop)) || stopHasDriverActivity(load, stop)
+      );
       const needed = new Set();
       for (const stop of load.stops) {
         if (stop.type !== "drop") continue;
@@ -7346,7 +7352,11 @@ function cleanupOrphanPickupStops() {
         if (!order) continue;
         for (const location of requiredPickupLocations(order)) needed.add(normalizedPickupLocation(location));
       }
-      load.stops = load.stops.filter((stop) => stop.type !== "pick" || needed.has(normalizedPickupLocation(stop.location)));
+      load.stops = load.stops.filter((stop) =>
+        stop.type !== "pick"
+        || needed.has(normalizedPickupLocation(stop.location))
+        || stopHasDriverActivity(load, stop)
+      );
     }
   }
 }

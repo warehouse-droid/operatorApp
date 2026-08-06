@@ -215,6 +215,20 @@ test("DP-22 frontend: compact nested group children remain resolvable as plan ev
   assert.match(functionBody("applySavedPlan"), /rememberAssignedOrderEvidence\(saved\.orders\)/u);
 });
 
+test("DP-24 frontend: incomplete compact order snapshots never delete executed child stops", () => {
+  const cleanup = functionBody("cleanupOrphanPickupStops");
+  assert.match(
+    cleanup,
+    /stop\.type\s*!==\s*["']drop["'][\s\S]{0,220}stopHasDriverActivity\(load,\s*stop\)/u,
+    "An executed drop must survive even when its historical child order is absent from the compact order snapshot."
+  );
+  assert.match(
+    cleanup,
+    /stop\.type\s*!==\s*["']pick["'][\s\S]{0,220}stopHasDriverActivity\(load,\s*stop\)/u,
+    "An executed pickup must survive even when the current order feed no longer requires that historical pickup."
+  );
+});
+
 test("DP-15: successful popup persistence never replaces the dispatch planner root", () => {
   const coPersistence = functionBody("persistTransitCoInBackground");
   assert.doesNotMatch(coPersistence, /render\(\{\s*save:\s*false\s*\}\)/u);
