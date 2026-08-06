@@ -187,6 +187,34 @@ test("DP-19 frontend: completed travel evidence survives local mutations while s
   assert.match(travelForPair, /travelLegMatchesVisitPair/u);
 });
 
+test("DP-21 frontend: completed stop baseline evidence survives unrelated local mutations", () => {
+  assert.match(dispatchSource, /let\s+dispatchStopExecutionEvidence\s*=/u);
+  const rememberEvidence = functionBody("rememberDispatchStopExecutionEvidence");
+  assert.match(rememberEvidence, /actualArrival|actualLeave|status/u);
+  const clearForecast = functionBody("clearDispatchForecast");
+  assert.match(clearForecast, /rememberDispatchStopExecutionEvidence\(dispatchForecast\)/u);
+  const stopRecord = functionBody("forecastRecordForStop");
+  assert.match(stopRecord, /stopExecutionEvidenceForStop/u);
+});
+
+test("DP-22 frontend: compact nested group children remain resolvable as plan evidence", () => {
+  const collectEvidence = functionBody("collectAssignedOrderEvidence");
+  const collect = Function(`"use strict"; return (${collectEvidence});`)();
+  const child = { id: "3022094354", type: "PO", items: [{ sku: "DP-CHILD" }] };
+  const evidence = collect([{
+    id: "POB03597",
+    type: "PO",
+    childOrders: [child.id],
+    childOrderDetails: [child]
+  }]);
+  assert.equal(evidence.get(child.id)?.items?.[0]?.sku, "DP-CHILD");
+  assert.match(dispatchSource, /let\s+assignedOrderEvidenceById\s*=\s*new Map/u);
+  assert.match(functionBody("orderById"), /assignedOrderEvidenceById\.get/u);
+  assert.match(functionBody("directOrderForStop"), /assignedOrderEvidenceById\.get/u);
+  assert.match(functionBody("collapseGroupedOrderStops"), /stopHasDriverActivity/u);
+  assert.match(functionBody("applySavedPlan"), /rememberAssignedOrderEvidence\(saved\.orders\)/u);
+});
+
 test("DP-15: successful popup persistence never replaces the dispatch planner root", () => {
   const coPersistence = functionBody("persistTransitCoInBackground");
   assert.doesNotMatch(coPersistence, /render\(\{\s*save:\s*false\s*\}\)/u);

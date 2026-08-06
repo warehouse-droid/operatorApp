@@ -565,6 +565,81 @@ const appendedAfterActive = changedActivityPlan((plan) => {
   plan.trucks[0].loads[0].stops.push({ id: "FUTURE-DROP", type: "drop", orderId: "PO-C", dropLocation: "Future" });
 });
 assert.equal(changedDriverActivityAssignments(activityPlan, appendedAfterActive, activeDrop).length, 0);
+
+const partiallyExecutedPlan = normalizeDispatchPlanLoadAssignments({
+  id: 78,
+  planDate: "2026-08-05",
+  orders: Array.from({ length: 9 }, (_, index) => ({
+    id: `PO-PARTIAL-${index + 1}`,
+    items: [{ id: 700 + index, quantity: index + 1 }]
+  })),
+  trucks: [truck("T-PARTIAL", "CE94489", "sety", [
+    load("L-PARTIAL-ACTIVE", {
+      timing: { start: 420, finish: 720 },
+      driverSequence: 0,
+      stops: Array.from({ length: 6 }, (_, index) => ({
+        id: `PARTIAL-STOP-${index + 1}`,
+        type: index === 0 ? "pick" : "drop",
+        orderId: `PO-PARTIAL-${index + 1}`,
+        location: index === 0 ? "3445" : `Customer ${index + 1}`,
+        lineRowIds: [700 + index]
+      }))
+    }),
+    load("L-PARTIAL-LATER", {
+      timing: { start: 720, finish: 780 },
+      driverSequence: 1,
+      stops: [{
+        id: "PARTIAL-LATER-STOP-1",
+        type: "drop",
+        orderId: "PO-PARTIAL-7",
+        location: "Later customer",
+        lineRowIds: [706]
+      }]
+    })
+  ])]
+});
+const partiallyExecutedStatuses = [
+  ...[1, 2, 3].map((number) => ({
+    load_id: "L-PARTIAL-ACTIVE",
+    stop_id: `PARTIAL-STOP-${number}`,
+    stop_type: number === 1 ? "pickup" : "dropoff",
+    order_refs: [`PO-PARTIAL-${number}`],
+    status: "complete"
+  })),
+  {
+    load_id: "L-PARTIAL-ACTIVE",
+    stop_id: "PARTIAL-STOP-4",
+    stop_type: "dropoff",
+    order_refs: ["PO-PARTIAL-4"],
+    status: "in_progress"
+  }
+];
+const addAfterStopFive = structuredClone(partiallyExecutedPlan);
+addAfterStopFive.trucks[0].loads[0].stops.splice(5, 0, {
+  id: "PARTIAL-INSERTED-AFTER-5",
+  type: "drop",
+  orderId: "PO-PARTIAL-8",
+  location: "Inserted after stop 5",
+  lineRowIds: [707]
+});
+assert.equal(
+  changedDriverActivityAssignments(partiallyExecutedPlan, addAfterStopFive, partiallyExecutedStatuses).length,
+  0,
+  "With stops 1-3 complete and stop 4 active, dispatch may add an order after stop 5."
+);
+const addToLaterLoad = structuredClone(partiallyExecutedPlan);
+addToLaterLoad.trucks[0].loads[1].stops.push({
+  id: "PARTIAL-LATER-STOP-2",
+  type: "drop",
+  orderId: "PO-PARTIAL-9",
+  location: "Another later customer",
+  lineRowIds: [708]
+});
+assert.equal(
+  changedDriverActivityAssignments(partiallyExecutedPlan, addToLaterLoad, partiallyExecutedStatuses).length,
+  0,
+  "Driver activity in Load 1 must not prevent additions to any later load."
+);
 assert.equal(changedDriverActivityAssignments(activityPlan, swappedExecutedPrefix, travelActivity).length, 0);
 assert.deepEqual(changedDriverActivityAssignments(activityPlan, activityPlan, [{
   ...pickupActivity[0],
@@ -1057,6 +1132,82 @@ assert.deepEqual(suffixOverlay.trucks[0].loads[0].stops[0].timing, { arrival: 43
 assert.deepEqual(suffixOverlay.trucks[0].loads[0].stops[1].timing, { arrival: 470, depart: 490 }, "Every member of the active physical visit belongs to the immutable prefix.");
 assert.deepEqual(suffixOverlay.trucks[0].loads[0].stops[2].timing, { arrival: 520, depart: 590 }, "A future visit's recalculated timing must survive the overlay.");
 
+const earlierFallbackSchedule = structuredClone(activeVisitBaseline);
+Object.assign(earlierFallbackSchedule.trucks[0].loads[0], {
+  plannedStartMinute: 300,
+  plannedFinishMinute: 410,
+  timing: { start: 300, finish: 410, scheduledStart: 300, previousFinish: 300 }
+});
+earlierFallbackSchedule.trucks[0].loads[0].stops[0].timing = { arrival: 310, depart: 330 };
+earlierFallbackSchedule.trucks[0].loads[0].stops[1].timing = { arrival: 330, depart: 350 };
+earlierFallbackSchedule.trucks[0].loads[0].stops[2].timing = { arrival: 380, depart: 410 };
+earlierFallbackSchedule.trucks[0].loads[0].stops[3].timing = { arrival: 380, depart: 410 };
+const rebasedFallbackSchedule = overlayLockedLoadDerivedSchedule(
+  activeVisitBaseline,
+  earlierFallbackSchedule,
+  new Set(["VISIT-LOAD"]),
+  { activityStatuses: activeVisitStatuses }
+);
+const rebasedFallbackLoad = rebasedFallbackSchedule.trucks[0].loads[0];
+assert.equal(rebasedFallbackLoad.plannedStartMinute, 420, "The published active-load baseline start must remain immutable.");
+assert.equal(rebasedFallbackLoad.plannedFinishMinute, 530, "The fallback duration must shift with the protected baseline start instead of creating an inverted interval.");
+assert.equal(rebasedFallbackLoad.timing.finish, 530, "Nested load timing must be rebased atomically with the top-level interval.");
+assert.deepEqual(rebasedFallbackLoad.stops[0].timing, { arrival: 430, depart: 450 }, "The executed physical prefix must retain its published baseline.");
+assert.deepEqual(rebasedFallbackLoad.stops[2].timing, { arrival: 500, depart: 530 }, "Future visit timing must move by the same baseline offset.");
+assert.equal(
+  validateDispatchLoadAssignments(rebasedFallbackSchedule).some((item) => item.reason === "invalid_interval"),
+  false,
+  "An unrelated edit must not manufacture an invalid active-load interval."
+);
+assert.equal(earlierFallbackSchedule.trucks[0].loads[0].plannedStartMinute, 300, "Rebasing must not mutate the submitted candidate.");
+
+const nullableFallbackSchedule = structuredClone(earlierFallbackSchedule);
+nullableFallbackSchedule.trucks[0].loads[0].plannedFinishMinute = null;
+const rebasedNullableFallback = overlayLockedLoadDerivedSchedule(
+  activeVisitBaseline,
+  nullableFallbackSchedule,
+  new Set(["VISIT-LOAD"]),
+  { activityStatuses: activeVisitStatuses }
+).trucks[0].loads[0];
+assert.equal(rebasedNullableFallback.plannedFinishMinute, null, "A nullable legacy top-level finish must remain nullable.");
+assert.equal(rebasedNullableFallback.timing.finish, 530, "A valid nested legacy finish must still rebase with the active-load baseline.");
+
+const completedVisitStatuses = [
+  {
+    load_id: "VISIT-LOAD",
+    stop_id: "OWN-A",
+    stop_type: "dropoff",
+    status: "complete"
+  },
+  {
+    load_id: "VISIT-LOAD",
+    stop_id: "DELIVERY-A",
+    stop_type: "dropoff",
+    status: "complete"
+  }
+];
+const completedFallbackSchedule = overlayLockedLoadDerivedSchedule(
+  activeVisitBaseline,
+  earlierFallbackSchedule,
+  new Set(["VISIT-LOAD"]),
+  { activityStatuses: completedVisitStatuses }
+).trucks[0].loads[0];
+assert.equal(
+  completedFallbackSchedule.plannedStartMinute,
+  420,
+  "A fully executed load must retain its original planned start during an unrelated edit."
+);
+assert.equal(
+  completedFallbackSchedule.plannedFinishMinute,
+  650,
+  "A fully executed load has no future suffix, so an unrelated edit must retain its original planned finish."
+);
+assert.deepEqual(
+  completedFallbackSchedule.stops.map((stop) => stop.timing),
+  activeVisitBaseline.trucks[0].loads[0].stops.map((stop) => stop.timing),
+  "Every completed physical visit must retain its original planned timing."
+);
+
 const endingTripPlan = normalizeDispatchPlanLoadAssignments({
   id: 99,
   planDate: "2026-08-01",
@@ -1081,4 +1232,4 @@ const laterLoadAfterEnding = structuredClone(endingTripPlan);
 laterLoadAfterEnding.trucks[0].loads.push(load("LATER-LOAD", { timing: { start: 540, finish: 600 }, driverSequence: 2 }));
 assert.ok(validateDispatchPlanTimingMetadata(laterLoadAfterEnding).some((item) => item.reason === "not_final_driver_load"));
 
-console.log(JSON.stringify({ ok: true, tests: 133 }));
+console.log(JSON.stringify({ ok: true, tests: 140 }));

@@ -401,6 +401,7 @@ const sampleOrders = [
 
 let orderCatalog = [];
 let orders = orderCatalog.map((order) => ({ ...order, assigned: false }));
+let assignedOrderEvidenceById = new Map();
 let drivers = [
   { name: "Alex Wong", license: "AZ", number: "A90211", login: "alex", ownYardFixedMinutes: 42, vendorFixedMinutes: 36, deliveryFixedMinutes: 36, outsideFixedMinutes: 36, minutesPerPallet: 1, loadMinutes: 42, unloadMinutes: 36 },
   { name: "Jenny Lee", license: "DZ", number: "D18870", login: "jenny", ownYardFixedMinutes: 38, vendorFixedMinutes: 32, deliveryFixedMinutes: 32, outsideFixedMinutes: 32, minutesPerPallet: 1, loadMinutes: 38, unloadMinutes: 32 }
@@ -465,6 +466,7 @@ let driverJobStatusesLoadedPlanId = "";
 let driverTruckSwitchAttention = [];
 let dispatchForecast = null;
 let dispatchTravelExecutionEvidence = { planId: "", planDate: "", travelLegs: [] };
+let dispatchStopExecutionEvidence = { planId: "", planDate: "", stops: [] };
 let dispatchForecastRequestSequence = 0;
 let dispatchForecastInFlight = false;
 let dispatchForecastPollTimer = null;
@@ -2469,8 +2471,29 @@ function canConsolidatePick(order) {
   return consolidateYards(order).length > 0;
 }
 
+function collectAssignedOrderEvidence(orderList = []) {
+  const evidence = new Map();
+  const visit = (order) => {
+    if (!order || typeof order !== "object") return;
+    const id = String(order.id || order.orderId || order.orderRef || order.tranid || order.refNumber || "").trim();
+    if (id) evidence.set(id, order);
+    for (const child of Array.isArray(order.childOrderDetails) ? order.childOrderDetails : []) visit(child);
+  };
+  for (const order of Array.isArray(orderList) ? orderList : []) visit(order);
+  return evidence;
+}
+
+function rememberAssignedOrderEvidence(orderList = []) {
+  assignedOrderEvidenceById = new Map([...collectAssignedOrderEvidence(orderList)].map(([id, order]) => [
+    id,
+    normalizeOrder({ ...order, id, childOrders: [], childOrderDetails: [], groupAliases: [] })
+  ]));
+}
+
 function orderById(id) {
-  return orders.find((order) => order.id === id) || orderCatalog.find((order) => order.id === id);
+  return orders.find((order) => order.id === id)
+    || orderCatalog.find((order) => order.id === id)
+    || assignedOrderEvidenceById.get(String(id || ""));
 }
 
 function canonicalDispatchOrderType(value, id = "") {
@@ -3966,6 +3989,37 @@ function rememberDispatchTravelExecutionEvidence(forecast) {
   };
 }
 
+function rememberDispatchStopExecutionEvidence(forecast) {
+  forecast ||= {};
+  const planId = String(forecast?.planId || "");
+  if (!planId) return;
+  dispatchStopExecutionEvidence = {
+    planId,
+    planDate: String(forecast?.planDate || currentPlanDate || "").slice(0, 10),
+    stops: (forecast?.stops || []).filter((stop) =>
+      Boolean(stop?.actualArrival || stop?.actualLeave)
+      || ["complete", "completed", "in_progress", "in-progress", "started"].includes(String(stop?.status || "").toLowerCase())
+    ).map((stop) => ({ ...stop }))
+  };
+}
+
+function stopExecutionEvidenceForStop(stop) {
+  if (
+    !currentPlan?.id
+    || String(dispatchStopExecutionEvidence.planId || "") !== String(currentPlan.id)
+    || (
+      dispatchStopExecutionEvidence.planDate
+      && String(dispatchStopExecutionEvidence.planDate) !== String(currentPlanDate || "").slice(0, 10)
+    )
+  ) return null;
+  const stopId = String(stop?.id || "");
+  if (!stopId) return null;
+  return (dispatchStopExecutionEvidence.stops || []).find((record) =>
+    String(record?.stopId || "") === stopId
+    || (record?.visitStopIds || []).map(String).includes(stopId)
+  ) || null;
+}
+
 function interStopExecutionEvidenceForLoad(load) {
   if (
     !currentPlan?.id
@@ -4005,6 +4059,7 @@ async function loadDispatchForecast({ renderAfter = false } = {}) {
     ) return false;
     dispatchForecast = forecast;
     rememberDispatchTravelExecutionEvidence(forecast);
+    rememberDispatchStopExecutionEvidence(forecast);
     if (renderAfter && !dispatchBackgroundRenderBlocked()) {
       if (renderAfter === "planner") renderDispatchPlannerPatch();
       else render({ save: false });
@@ -4020,6 +4075,7 @@ async function loadDispatchForecast({ renderAfter = false } = {}) {
 
 function clearDispatchForecast() {
   rememberDispatchTravelExecutionEvidence(dispatchForecast);
+  rememberDispatchStopExecutionEvidence(dispatchForecast);
   dispatchForecast = null;
   dispatchForecastRequestSequence += 1;
   dispatchForecastInFlight = false;
@@ -4036,7 +4092,7 @@ function forecastStopIndex() {
 }
 
 function forecastRecordForStop(stop) {
-  return forecastStopIndex().get(String(stop?.id || "")) || null;
+  return forecastStopIndex().get(String(stop?.id || "")) || stopExecutionEvidenceForStop(stop);
 }
 
 function forecastLoadRecord(load) {
@@ -4971,6 +5027,7 @@ function splitOrderPlanningBlock(splits = []) {
 
 function applySavedPlan(saved) {
   if (!Array.isArray(saved?.orders) || !Array.isArray(saved?.trucks)) return false;
+  rememberAssignedOrderEvidence(saved.orders);
   clearActiveRouteEstimates();
   const activityEvidence = activePhysicalOrderEvidence(saved.trucks, saved.id || saved.planId);
   const evidenceBaselines = new Map(saved.orders
@@ -5841,6 +5898,7 @@ async function createPlanForDate(planDate = currentPlanDate) {
 }
 
 function resetPlanningBoard() {
+  assignedOrderEvidenceById = new Map();
   orders = orderCatalog.map((order) => normalizeOrder(order));
   trucks = fleet.map((vehicle, index) => makeTruckFromFleet(vehicle, index));
   if (driverOrientedPlanningEnabled()) {
@@ -6320,6 +6378,8 @@ function directOrderForStop(stop) {
   if (directPlanOrder) return directPlanOrder;
   const catalogOrder = orderCatalog.find((order) => String(order?.id || "") === orderId);
   if (catalogOrder) return catalogOrder;
+  const evidenceOrder = assignedOrderEvidenceById.get(orderId);
+  if (evidenceOrder) return evidenceOrder;
   return orders.find((order) => dispatchGroupingRefs(order).has(orderId)) || null;
 }
 
@@ -7250,6 +7310,15 @@ function collapseGroupedOrderStops() {
         const group = groupsById.get(stopOrderId) || groupsByMemberRef.get(stopOrderId);
         if (!group) {
           nextStops.push(stop);
+          continue;
+        }
+        // A started physical stop is immutable execution evidence. Compact snapshots can
+        // contain its historical child order only inside childOrderDetails, so replacing
+        // that child ID with the current group ID would manufacture a protected-prefix
+        // conflict during an otherwise unrelated save.
+        if (stopHasDriverActivity(load, stop)) {
+          nextStops.push(stop);
+          if (stop.type === "drop") seenDropGroups.add(group.id);
           continue;
         }
         if (stop.type === "drop") {

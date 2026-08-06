@@ -208,6 +208,7 @@ const historicalRestore = Function(
   let lastSavedAt = "";
   let lastServerSavedAt = "";
   let lastSavedPlanHash = "";
+  function rememberAssignedOrderEvidence() {}
   function clearActiveRouteEstimates() {}
   function activePhysicalOrderEvidence() { return { all: new Set(), pickups: new Set(), drops: new Set() }; }
   function orderMatchesActivityRefs() { return false; }

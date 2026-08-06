@@ -712,6 +712,48 @@ function overlayExecutedPrefixLoadFields(target = {}, source = {}) {
   return overlaid;
 }
 
+function shiftedDerivedMinute(value, offset) {
+  if (value === null || value === undefined || text(value) === "") return value;
+  const minute = finiteNumber(value);
+  return minute === null ? value : minute + offset;
+}
+
+function rebaseExecutedPrefixCandidateLoad(target = {}, source = {}) {
+  const candidateStart = dispatchMinute(target.plannedStartMinute ?? target.timing?.start);
+  const candidateFinish = dispatchMinute(target.plannedFinishMinute ?? target.timing?.finish);
+  const baselineStart = dispatchMinute(source.plannedStartMinute ?? source.timing?.start);
+  if (
+    candidateStart === null
+    || candidateFinish === null
+    || baselineStart === null
+    || candidateFinish <= candidateStart
+  ) return { load: target, offset: 0 };
+  const offset = baselineStart - candidateStart;
+  if (!offset) return { load: target, offset: 0 };
+  const load = { ...target };
+  if (Object.prototype.hasOwnProperty.call(target, "plannedFinishMinute")) {
+    load.plannedFinishMinute = shiftedDerivedMinute(target.plannedFinishMinute, offset);
+  }
+  if (target.timing && typeof target.timing === "object") {
+    load.timing = { ...target.timing };
+    if (Object.prototype.hasOwnProperty.call(target.timing, "finish")) {
+      load.timing.finish = shiftedDerivedMinute(target.timing.finish, offset);
+    }
+  }
+  return { load, offset };
+}
+
+function rebaseFutureStopTiming(stop = {}, offset = 0) {
+  if (!offset || !stop.timing || typeof stop.timing !== "object") return stop;
+  const timing = { ...stop.timing };
+  for (const field of ["arrival", "depart", "start", "finish"]) {
+    if (Object.prototype.hasOwnProperty.call(timing, field)) {
+      timing[field] = shiftedDerivedMinute(timing[field], offset);
+    }
+  }
+  return { ...stop, timing };
+}
+
 /**
  * Keep the server's already-published schedule for loads with driver activity.
  *
@@ -750,9 +792,8 @@ export function overlayLockedLoadDerivedSchedule(previousPlan = {}, nextPlan = {
           .map((stop) => [text(stop.id), stop])
           .filter(([stopId]) => stopId));
         const activityScope = activityScopes.get(loadId);
-        const useExecutedPrefix = Boolean(activityScope && !activityScope.fullLoad);
         let activityBoundary = -1;
-        if (useExecutedPrefix) {
+        if (activityScope && !activityScope.fullLoad) {
           for (const stopId of activityScope.activeStopIds) {
             const visit = activityScope.visitsByStopId.get(stopId);
             if (!visit) {
@@ -762,15 +803,26 @@ export function overlayLockedLoadDerivedSchedule(previousPlan = {}, nextPlan = {
             activityBoundary = Math.max(activityBoundary, visit.lastIndex);
           }
         }
+        // Recalculate only when the submitted load still has an unexecuted suffix.
+        // Once activity reaches the final physical visit, the whole published
+        // schedule is historical evidence and an unrelated edit must not drift it.
+        const useExecutedPrefix = Boolean(
+          activityScope
+          && !activityScope.fullLoad
+          && activityBoundary < ((load.stops || []).length - 1)
+        );
+        const rebased = useExecutedPrefix
+          ? rebaseExecutedPrefixCandidateLoad(load, previousLoad)
+          : { load, offset: 0 };
         const overlaid = useExecutedPrefix
-          ? overlayExecutedPrefixLoadFields(load, previousLoad)
+          ? overlayExecutedPrefixLoadFields(rebased.load, previousLoad)
           : overlayFields(load, previousLoad, LOCKED_LOAD_DERIVED_SCHEDULE_FIELDS);
         overlaid.stops = (load.stops || []).map((stop, index) => {
           const stopId = text(stop.id);
           const previousStop = stopId
             ? previousStopsById.get(stopId)
             : (!text(previousLoad.stops?.[index]?.id) ? previousLoad.stops?.[index] : null);
-          if (useExecutedPrefix && index > activityBoundary) return stop;
+          if (useExecutedPrefix && index > activityBoundary) return rebaseFutureStopTiming(stop, rebased.offset);
           return previousStop
             ? overlayFields(stop, previousStop, LOCKED_STOP_DERIVED_SCHEDULE_FIELDS)
             : stop;

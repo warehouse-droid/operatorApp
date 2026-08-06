@@ -185,6 +185,30 @@ test("DP-17/DP-19 browser: compact Custom Order startup keeps completed travel s
     packed: { pallets: 0, layers: 0, sections: 0, pieces: 0 },
     weight: 2300
   };
+  const nestedChild = {
+    id: "3022094354",
+    type: "PO",
+    customer: "Historical grouped PO child",
+    address: "12441 Woodbine Avenue, Whitchurch-Stouffville, ON",
+    sourceYard: "3445",
+    pickupLocations: ["3445"],
+    items: [{ sku: "NESTED-CHILD", pallets: 2 }],
+    pallets: 2,
+    weight: 4000
+  };
+  const nestedGroup = {
+    id: "POB03597",
+    type: "PO",
+    customer: "Historical grouped PO",
+    address: nestedChild.address,
+    sourceYard: "3445",
+    pickupLocations: ["3445"],
+    childOrders: [nestedChild.id],
+    childOrderDetails: [nestedChild],
+    items: nestedChild.items,
+    pallets: nestedChild.pallets,
+    weight: nestedChild.weight
+  };
   const compactPlan = {
     id: "777",
     planId: "777",
@@ -193,7 +217,7 @@ test("DP-17/DP-19 browser: compact Custom Order startup keeps completed travel s
     digest: "dp-compact-browser-digest",
     status: "draft",
     summary: { driverLaneOrder: ["compact-driver"] },
-    assignedOrderSnapshots: [compactOrder],
+    assignedOrderSnapshots: [compactOrder, nestedGroup],
     trucks: [{
       id: "DP-TRAVEL-TRUCK",
       plate: "DP-TRAVEL-TRUCK",
@@ -212,6 +236,19 @@ test("DP-17/DP-19 browser: compact Custom Order startup keeps completed travel s
           { id: "dp-travel-pick", loadId: "dp-travel-load", type: "pick", orderId: compactOrder.id, location: "3445" },
           { id: "dp-travel-drop", loadId: "dp-travel-load", type: "drop", orderId: compactOrder.id, location: compactOrder.address }
         ]
+      }, {
+        id: "dp-nested-load",
+        name: "Load 2",
+        driverName: "Compact Driver",
+        driverLogin: "compact-driver",
+        driverSequence: 1,
+        truckId: "DP-TRAVEL-TRUCK",
+        truckPlate: "DP-TRAVEL-TRUCK",
+        startMode: "auto",
+        stops: [
+          { id: "dp-nested-pick", loadId: "dp-nested-load", type: "pick", orderId: nestedChild.id, location: "3445" },
+          { id: "dp-nested-drop", loadId: "dp-nested-load", type: "drop", orderId: nestedChild.id, location: nestedChild.address }
+        ]
       }]
     }]
   };
@@ -223,13 +260,23 @@ test("DP-17/DP-19 browser: compact Custom Order startup keeps completed travel s
     stops: [
       {
         stopId: "dp-travel-pick",
-        plannedArrival: "2038-11-14T07:00:00.000Z",
-        plannedLeave: "2038-11-14T07:40:00.000Z"
+        plannedArrival: "2038-11-14T18:11:00.000Z",
+        plannedLeave: "2038-11-14T18:41:00.000Z",
+        forecastArrival: "2038-11-14T18:30:00.000Z",
+        forecastLeave: "2038-11-14T18:30:00.000Z",
+        actualArrival: "2038-11-14T18:30:00.000Z",
+        actualLeave: "2038-11-14T18:30:00.000Z",
+        status: "complete"
       },
       {
         stopId: "dp-travel-drop",
-        plannedArrival: "2038-11-14T08:10:00.000Z",
-        plannedLeave: "2038-11-14T08:57:00.000Z"
+        plannedArrival: "2038-11-14T19:17:00.000Z",
+        plannedLeave: "2038-11-14T19:47:00.000Z",
+        forecastArrival: "2038-11-14T18:31:00.000Z",
+        forecastLeave: "2038-11-14T20:03:00.000Z",
+        actualArrival: "2038-11-14T18:31:00.000Z",
+        actualLeave: "2038-11-14T20:03:00.000Z",
+        status: "complete"
       }
     ],
     travelLegs: [{
@@ -256,13 +303,20 @@ test("DP-17/DP-19 browser: compact Custom Order startup keeps completed travel s
       planning: { truckSwitchMinutes: 10 }
     }],
     ["/api/dispatch/forecast", forecast],
-    ["/api/dispatch/driver-job-statuses", []],
+    ["/api/dispatch/driver-job-statuses", [{
+      load_id: "dp-nested-load",
+      stop_id: "dp-nested-pick",
+      stop_type: "pickup",
+      status: "complete",
+      order_refs: [nestedChild.id]
+    }]],
     ["/api/dispatch/driver-truck-switches/attention", []],
     ["/api/dispatch/plans", []],
     ["/api/dispatch/plan-edit-lease", { lease: null }],
     ["/api/dispatch/plan-edit-lease/heartbeat", { released: true }],
     ["/api/dispatch/plan-edit-lease/release", { released: true }]
   ]);
+  let lastSaveCommand = null;
   await page.route("**/api/dispatch/**", async (route) => {
     const requestInfo = route.request();
     const path = new URL(requestInfo.url()).pathname;
@@ -281,6 +335,7 @@ test("DP-17/DP-19 browser: compact Custom Order startup keeps completed travel s
     }
     if (path === "/api/dispatch/v2/plans/777/commands") {
       failedSaveRequests += 1;
+      lastSaveCommand = requestInfo.postDataJSON();
       return route.fulfill({
         status: 409,
         contentType: "application/json",
@@ -304,6 +359,10 @@ test("DP-17/DP-19 browser: compact Custom Order startup keeps completed travel s
 
   const root = page.locator("[data-dispatch-planner-root]");
   const rootHandle = await root.elementHandle();
+  const pickupTiming = page.locator('[data-stop="dp-travel-pick"] .stop-time');
+  const pickupTimingText = () => pickupTiming.evaluate((element) => element.innerText.replace(/\s+/g, " ").trim());
+  const pickupTimingBeforeMutation = await pickupTimingText();
+  expect(pickupTimingBeforeMutation).toContain("Actual");
   const travel = page.locator('[data-travel-leg="dp-travel-pick-to-dp-travel-drop"]');
   await expect(travel).toHaveClass(/inter-stop-travel.*status-complete/);
   const style = await travel.evaluate((element) => {
@@ -325,6 +384,11 @@ test("DP-17/DP-19 browser: compact Custom Order startup keeps completed travel s
   await page.getByRole("button", { name: "Enter Edit Mode" }).dispatchEvent("click");
   await page.locator('[data-load-start-mode="dp-travel-load"]').selectOption("fixed");
   await expect.poll(() => failedSaveRequests).toBeGreaterThan(0);
+  const nestedSavedLoad = lastSaveCommand.payload.trucks
+    .flatMap((truck) => truck.loads || [])
+    .find((load) => load.id === "dp-nested-load");
+  expect(nestedSavedLoad.stops.find((stop) => stop.id === "dp-nested-pick")?.orderId).toBe(nestedChild.id);
+  await expect.poll(pickupTimingText).toBe(pickupTimingBeforeMutation);
   await expect(travel).toHaveClass(/inter-stop-travel.*status-complete/);
   expect(await rootHandle.evaluate((element) => element === globalThis.document.querySelector("[data-dispatch-planner-root]"))).toBe(true);
 });

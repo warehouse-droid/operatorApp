@@ -119,6 +119,24 @@ Given a dispatcher editing one source order while hundreds of orders and large h
 
 Given the full order feed is delayed or unavailable, when an assigned compact plan contains completed travel legs and custom stop durations, then the travel card retains its travel/status classes, completed grey treatment, address, and timing layout. A subsequent failed save leaves the same planner root and travel card visible.
 
+### DP-20 — Active-load schedule rebasing is atomic
+
+Given a completed or in-progress load whose browser fallback schedule starts earlier or later than its published schedule, when an unrelated plan mutation is submitted, then the server rebases the candidate duration and future physical-visit timing onto the protected baseline start as one interval. It never combines the protected start with an unshifted fallback finish. A genuinely zero or negative candidate duration remains invalid.
+
+When activity has reached the final physical visit and no new suffix is appended to that load, the load has no forecastable future: its complete published schedule, including planned finish and every stop timing, remains unchanged.
+
+### DP-21 — Completed-stop baseline remains visible during unrelated edits
+
+Given the current forecast contains a completed or in-progress stop, when an unrelated local mutation invalidates the live revision forecast, then the last server-issued Plan, Forecast, Actual, and Variance evidence for that executed stop remains visible. This evidence is scoped to the same plan/date and is never reused for a pending stop or another plan.
+
+### DP-22 — Nested assigned orders remain resolvable
+
+Given a compact historical plan whose physical stops reference grouped child orders stored inside `childOrderDetails`, when the full current order feed omits those historical children, then stop lookup still resolves the plan-scoped child evidence. Normalization may hide child cards from the order pool, but it must not remove or rewrite their pickup/drop stops during an unrelated edit.
+
+### DP-23 — Future additions remain editable after driver activity
+
+Given stops 1–3 are complete and stop 4 is in progress, dispatch may add an order strictly after stop 5 without changing stops 1–4. The same activity must not block adding an order to any later load or creating a later load for that driver. Backend executed-prefix validation accepts both mutations while continuing to reject insertion, removal, reassignment, or reordering inside the executed/active prefix.
+
 ## Setup and gauntlet plan
 
 - Reuse Node 20, `node:test`, Playwright, c8, TypeScript, ESLint, PostgreSQL, and the existing isolated Docker test environment.
