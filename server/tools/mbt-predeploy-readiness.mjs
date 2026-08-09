@@ -84,7 +84,9 @@ export const REQUIRED_MBT_P3_MIGRATIONS = Object.freeze([
   "137_dispatch_planner_followup_progress.sql",
   "138_smart_scm_authoritative_on_order.sql",
   "139_sales_order_reload_cycles.sql",
-  "140_driver_yard_dependency_soft_mode.sql"
+  "140_driver_yard_dependency_soft_mode.sql",
+  "141_transfer_dependency_revision_reprint.sql",
+  "142_mbt_frontdesk_customer_charge_requests.sql"
 ]);
 
 export const REQUIRED_MBT_P3_FLAGS = Object.freeze([

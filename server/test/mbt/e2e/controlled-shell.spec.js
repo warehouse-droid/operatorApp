@@ -413,7 +413,16 @@ test("F02/F15: Front Desk and Billing render their role-scoped disabled surfaces
       title: "Front Desk",
       status: "#frontdeskMessage",
       statusText: "This MBT capability is disabled.",
-      commandSelector: "#quoteForm input, #quoteForm select, #quoteForm button"
+      commandSelector: [
+        "#quoteForm input",
+        "#quoteForm select",
+        "#quoteForm textarea",
+        "#quoteForm button",
+        "#customerChargeForm input",
+        "#customerChargeForm select",
+        "#customerChargeForm textarea",
+        "#customerChargeForm button"
+      ].join(", ")
     },
     {
       role: "mbt_billing",

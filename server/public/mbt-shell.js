@@ -68,6 +68,12 @@ const rateCardState = {
   yardOptions: []
 };
 
+const customerChargeConfigurationState = {
+  configuration: null,
+  loadedRateCardVersionId: "",
+  saveInFlight: false
+};
+
 let localItemSaveInFlight = false;
 let rateCardSaveInFlight = false;
 let readinessLoaded = false;
@@ -756,11 +762,255 @@ async function loadRateCards() {
     rateCardState.items = Array.isArray(result.items) ? result.items : [];
     rateCardState.yardOptions = Array.isArray(result.yardOptions) ? result.yardOptions : [];
     renderRateCards();
+    renderCustomerChargeRateCardOptions();
     renderRatePricingItemOptions(rateCardState.activePricingItemCode);
     phase3ConfigState.rateCardsLoaded = true;
     setConfigMessage("rateCardsMessage", "Local rate cards loaded.");
   } catch (error) {
     setConfigMessage("rateCardsMessage", error.message, "attention");
+  }
+}
+
+function renderCustomerChargeRateCardOptions() {
+  const select = readinessElement("customerChargeRateCardVersion");
+  if (!select) return;
+  const prior = select.value || customerChargeConfigurationState.loadedRateCardVersionId;
+  select.replaceChildren();
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = "Select a named rate card";
+  select.append(placeholder);
+  for (const item of rateCardState.items) {
+    const option = document.createElement("option");
+    option.value = String(item.rateCardVersionId || "");
+    option.textContent = `${item.displayName || item.rateCardCode || "Rate card"} · v${item.versionNumber || 1} · ${item.status || "draft"}`;
+    select.append(option);
+  }
+  select.value = [...select.options].some((option) => option.value === prior) ? prior : "";
+}
+
+function setCustomerChargeInput(row, selector, value) {
+  const input = row?.querySelector(selector);
+  if (input instanceof HTMLInputElement) input.value = value === null || value === undefined ? "" : String(value);
+}
+
+function customerChargeBandInput(attribute, value, { readOnly = false, label = "" } = {}) {
+  const input = document.createElement("input");
+  input.setAttribute(attribute, "");
+  input.value = value === null || value === undefined ? "" : String(value);
+  input.readOnly = readOnly;
+  input.required = attribute !== "data-band-maximum-km";
+  if (label) input.setAttribute("aria-label", label);
+  return input;
+}
+
+function appendAggregateDistanceBandRow(band = {}) {
+  const rows = readinessElement("aggregateDistanceBandRows");
+  if (!rows) return;
+  const existingRows = [...rows.querySelectorAll("[data-aggregate-distance-band]")];
+  const priorMaximum = existingRows.at(-1)?.querySelector("[data-band-maximum-km]")?.value || "30";
+  const minimumMetres = Number.isSafeInteger(band.minimumMetres)
+    ? Number(band.minimumMetres)
+    : Math.round(Number(priorMaximum || 30) * 1_000);
+  const isBase = band.minimumMetres === 0 || existingRows.length === 0;
+  const row = document.createElement("tr");
+  row.dataset.aggregateDistanceBand = "";
+  if (isBase) row.dataset.baseBand = "true";
+  const code = isBase ? "AGG_0_30" : String(band.bandCode || `AGG_${minimumMetres / 1_000}_PLUS`)
+    .toUpperCase().replaceAll(/[^A-Z0-9_]/gu, "_");
+  const values = [
+    customerChargeBandInput("data-band-code", code, { readOnly: isBase, label: "Aggregate distance band code" }),
+    customerChargeBandInput("data-band-minimum-km", (minimumMetres / 1_000).toString(), {
+      readOnly: isBase,
+      label: "Aggregate distance from kilometres"
+    }),
+    customerChargeBandInput(
+      "data-band-maximum-km",
+      isBase ? "30" : band.maximumMetres === null ? "" : Number.isSafeInteger(band.maximumMetres)
+        ? (Number(band.maximumMetres) / 1_000).toString()
+        : "",
+      { readOnly: isBase, label: "Aggregate distance through kilometres" }
+    ),
+    customerChargeBandInput(
+      "data-band-amount-cad",
+      isBase ? "150.00" : band.amountMinor === null || band.amountMinor === undefined
+        ? ""
+        : cadInputValue(band.amountMinor),
+      { readOnly: isBase, label: "Aggregate distance charge CAD" }
+    )
+  ];
+  const cells = values.map((input) => {
+    const cell = document.createElement("td");
+    cell.append(input);
+    return cell;
+  });
+  const action = document.createElement("td");
+  if (isBase) {
+    action.textContent = "Required";
+  } else {
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "mbt-button-secondary";
+    remove.textContent = "Remove";
+    remove.addEventListener("click", () => row.remove());
+    action.append(remove);
+  }
+  row.append(...cells, action);
+  rows.append(row);
+}
+
+function renderCustomerChargeDistanceBands(bands) {
+  const rows = readinessElement("aggregateDistanceBandRows");
+  if (!rows) return;
+  rows.replaceChildren();
+  const configured = Array.isArray(bands) && bands.length
+    ? bands
+    : [{ bandCode: "AGG_0_30", minimumMetres: 0, maximumMetres: 30_000, amountMinor: 15_000 }];
+  for (const band of configured) appendAggregateDistanceBandRow(band);
+}
+
+function populateCustomerChargeConfiguration(configuration) {
+  customerChargeConfigurationState.configuration = configuration;
+  customerChargeConfigurationState.loadedRateCardVersionId = String(configuration.rateCardVersionId || "");
+  const revision = readinessElement("customerChargeConfigurationRevision");
+  if (revision instanceof HTMLInputElement) revision.value = String(configuration.revision || 0);
+  for (const row of document.querySelectorAll("[data-aggregate-charge-code]")) {
+    const item = (configuration.aggregateItems || []).find(
+      (candidate) => candidate.itemCode === row.dataset.aggregateChargeCode
+    );
+    setCustomerChargeInput(row, "[data-charge-amount-cad]", item?.amountMinor === null || item?.amountMinor === undefined
+      ? "" : cadInputValue(item.amountMinor));
+    setCustomerChargeInput(row, "[data-charge-density]", item?.densityLbsPerYard ?? "");
+  }
+  for (const row of document.querySelectorAll("[data-fixed-dump-charge-code]")) {
+    const item = (configuration.fixedDumpItems || []).find(
+      (candidate) => candidate.itemCode === row.dataset.fixedDumpChargeCode
+    );
+    setCustomerChargeInput(row, "[data-charge-amount-cad]", item?.amountMinor === null || item?.amountMinor === undefined
+      ? "" : cadInputValue(item.amountMinor));
+  }
+  renderCustomerChargeDistanceBands(configuration.aggregateDistanceBands);
+  const select = readinessElement("customerChargeRateCardVersion");
+  if (select instanceof HTMLSelectElement) select.value = customerChargeConfigurationState.loadedRateCardVersionId;
+}
+
+async function loadCustomerChargeConfiguration(versionId) {
+  const normalizedVersionId = String(versionId || "");
+  if (!normalizedVersionId) {
+    setConfigMessage("customerChargesMessage", "Select a rate card to load customer charges.");
+    return;
+  }
+  setConfigMessage("customerChargesMessage", "Loading dump and aggregate customer charges…");
+  try {
+    const configuration = await api(
+      `/api/mbt/config/customer-charges/${encodeURIComponent(normalizedVersionId)}`
+    );
+    populateCustomerChargeConfiguration(configuration);
+    setConfigMessage(
+      "customerChargesMessage",
+      configuration.complete
+        ? `Complete customer-charge sheet loaded at revision ${configuration.revision}.`
+        : "This rate card has no complete customer-charge sheet yet. Enter every rate before saving.",
+      configuration.complete ? "safe" : "attention"
+    );
+  } catch (error) {
+    setConfigMessage("customerChargesMessage", error.message, "attention");
+  }
+}
+
+async function ensureCustomerChargeConfigurationLoaded() {
+  if (!phase3ConfigState.rateCardsLoaded) await loadRateCards();
+  renderCustomerChargeRateCardOptions();
+  const select = readinessElement("customerChargeRateCardVersion");
+  if (!(select instanceof HTMLSelectElement)) return;
+  if (!select.value && rateCardState.items.length) {
+    const preferred = rateCardState.items.find((item) => item.status === "active") || rateCardState.items[0];
+    select.value = String(preferred?.rateCardVersionId || "");
+  }
+  if (select.value !== customerChargeConfigurationState.loadedRateCardVersionId) {
+    await loadCustomerChargeConfiguration(select.value);
+  }
+}
+
+function positiveCustomerChargeInteger(value, label) {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) throw new Error(`${label} must be a positive whole number.`);
+  return parsed;
+}
+
+function customerChargeKilometres(value, label, { nullable = false } = {}) {
+  const text = String(value ?? "").trim();
+  if (nullable && !text) return null;
+  const match = /^(\d{1,6})(?:\.(\d{1,3}))?$/u.exec(text);
+  if (!match) {
+    throw new Error(`${label} must use kilometres with at most three decimals.`);
+  }
+  return (Number(match[1]) * 1_000) + Number((match[2] || "").padEnd(3, "0"));
+}
+
+function customerChargeConfigurationInput() {
+  const aggregateItems = [...document.querySelectorAll("[data-aggregate-charge-code]")].map((row) => ({
+    itemCode: row.dataset.aggregateChargeCode,
+    amountMinor: cadMinorFromValue(row.querySelector("[data-charge-amount-cad]")?.value, `${row.cells[0].textContent} price`),
+    densityLbsPerYard: positiveCustomerChargeInteger(
+      row.querySelector("[data-charge-density]")?.value,
+      `${row.cells[0].textContent} density`
+    )
+  }));
+  const fixedDumpItems = [...document.querySelectorAll("[data-fixed-dump-charge-code]")].map((row) => ({
+    itemCode: row.dataset.fixedDumpChargeCode,
+    amountMinor: cadMinorFromValue(row.querySelector("[data-charge-amount-cad]")?.value, `${row.cells[0].textContent} price`)
+  }));
+  const aggregateDistanceBands = [...document.querySelectorAll("[data-aggregate-distance-band]")].map((row, index) => ({
+    bandCode: String(row.querySelector("[data-band-code]")?.value || "").trim().toUpperCase(),
+    minimumMetres: customerChargeKilometres(
+      row.querySelector("[data-band-minimum-km]")?.value,
+      `Distance band ${index + 1} start`
+    ),
+    maximumMetres: customerChargeKilometres(
+      row.querySelector("[data-band-maximum-km]")?.value,
+      `Distance band ${index + 1} end`,
+      { nullable: true }
+    ),
+    amountMinor: cadMinorFromValue(
+      row.querySelector("[data-band-amount-cad]")?.value,
+      `Distance band ${index + 1} price`
+    )
+  }));
+  return { aggregateItems, fixedDumpItems, aggregateDistanceBands };
+}
+
+async function saveCustomerChargeConfiguration(event) {
+  event.preventDefault();
+  if (customerChargeConfigurationState.saveInFlight) return;
+  const select = readinessElement("customerChargeRateCardVersion");
+  const versionId = String(select?.value || "");
+  if (!versionId) {
+    setConfigMessage("customerChargesMessage", "Select a rate card before saving.", "attention");
+    return;
+  }
+  customerChargeConfigurationState.saveInFlight = true;
+  try {
+    const body = {
+      expectedRevision: Number(readinessElement("customerChargeConfigurationRevision")?.value || 0),
+      ...customerChargeConfigurationInput(),
+      reason: inputValue("customerChargeConfigurationReason")
+    };
+    setConfigMessage("customerChargesMessage", "Saving the complete local customer-charge sheet…");
+    const result = await api(`/api/mbt/config/customer-charges/${encodeURIComponent(versionId)}`, {
+      method: "PUT",
+      body,
+      idempotencyKey: commandIdentity("mbt-customer-charge-configuration")
+    });
+    populateCustomerChargeConfiguration(result.configuration);
+    setConfigMessage(
+      "customerChargesMessage",
+      `Customer-charge sheet saved at revision ${result.configuration.revision}. No NetSuite work was created.`
+    );
+  } catch (error) {
+    setConfigMessage("customerChargesMessage", error.message, "attention");
+  } finally {
+    customerChargeConfigurationState.saveInFlight = false;
   }
 }
 
@@ -2499,6 +2749,17 @@ function bindPhase3ConfigurationControls() {
   readinessElement("cloneRateCardButton")?.addEventListener("click", () => runRateCardLifecycle("clone"));
   readinessElement("previewRateCardCsvButton")?.addEventListener("click", previewRateCardCsv);
   readinessElement("applyRateCardCsvButton")?.addEventListener("click", applyRateCardCsv);
+  readinessElement("customerChargeRateCardVersion")?.addEventListener("change", (event) => {
+    void loadCustomerChargeConfiguration(event.currentTarget.value);
+  });
+  readinessElement("addAggregateDistanceBandButton")?.addEventListener(
+    "click",
+    () => appendAggregateDistanceBandRow()
+  );
+  readinessElement("customerChargeConfigurationForm")?.addEventListener(
+    "submit",
+    saveCustomerChargeConfiguration
+  );
   document.querySelectorAll("[data-mbt-template-download]").forEach((link) => {
     link.addEventListener("click", downloadProtectedTemplate);
   });
@@ -2539,6 +2800,9 @@ function activateConfigurationTab(tab, { focus = false } = {}) {
       if (!phase3ConfigState.materialsLoaded) await loadMaterialsAndDumps();
       await loadRateCards();
     })();
+  }
+  if (tab.id === "customerChargesTab") {
+    void ensureCustomerChargeConfigurationLoaded();
   }
 }
 

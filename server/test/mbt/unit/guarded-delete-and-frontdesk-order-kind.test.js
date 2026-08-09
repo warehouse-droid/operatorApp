@@ -74,25 +74,29 @@ test("delete is server guarded and never relies on a browser-only confirmation",
   assert.match(assetService, /MBT_ENTITY_IN_USE/u);
 });
 
-test("Front Desk reveals only fields related to Delivery or BIN", () => {
+test("Front Desk separates Delivery from fixed-price BIN and Aggregate Order workflows", () => {
   assert.match(frontdeskHtml, /id=["']orderKind["']/u);
   assert.match(frontdeskHtml, /value=["']delivery["'][^>]*>Delivery/u);
   assert.match(frontdeskHtml, /value=["']bin["'][^>]*>BIN/u);
+  assert.match(frontdeskHtml, /value=["']aggregate["'][^>]*>Aggregate Order/u);
   assert.match(frontdeskHtml, /id=["']deliveryOrderFields["']/u);
-  assert.match(frontdeskHtml, /id=["']binOrderFields["']/u);
+  assert.match(frontdeskHtml, /id=["']customerChargeDialog["']/u);
+  assert.doesNotMatch(frontdeskHtml, /id=["']binOrderFields["']/u);
   assert.match(frontdeskClient, /function syncOrderKindFields/u);
   assert.match(frontdeskClient, /configuration\.deliveryItems/u);
   assert.match(frontdeskClient, /configuration\.binItems/u);
+  assert.match(frontdeskClient, /openCustomerChargeDialog\(null, "initial_bin"\)/u);
+  assert.match(frontdeskClient, /openCustomerChargeDialog\(null, "aggregate_order"\)/u);
   assert.match(frontdeskService, /item_type = 'delivery_fee'/u);
   assert.match(frontdeskService, /item_type = 'bin'/u);
   assert.match(router, /frontdesk\/delivery-orders/u);
 });
 
 test("Front Desk makes the 150-yard price choice explicit and durable", () => {
-  assert.match(frontdeskHtml, /id=["']orderFrom150["']/u);
+  assert.match(frontdeskHtml, /id=["']chargeOrderFrom150["']/u);
   assert.match(frontdeskHtml, /Order from 150/u);
-  assert.match(frontdeskHtml, /3445\s*\/\s*2967/u);
-  assert.match(frontdeskClient, /pricingOriginYardCode:\s*orderFrom150\.checked\s*\?\s*["']150["']\s*:\s*["']3445["']/u);
+  assert.match(frontdeskHtml, /Required whenever aggregate travels with a bin/u);
+  assert.match(frontdeskClient, /orderFrom150:\s*chargeOrderFrom150\.checked/u);
   assert.match(router, /pricingOriginYardCode:\s*body\.pricingOriginYardCode/u);
   assert.match(frontdeskService, /pricingOriginYardCode/u);
   assert.match(frontdeskService, /\["3445",\s*"150"\]/u);

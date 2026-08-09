@@ -9,6 +9,7 @@ import { createMbtRouter } from "../../../src/mbt/router.js";
 const QUOTE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const CONTRACT_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const SERVICE_LINE_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+const CHARGE_REQUEST_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 const ACTORS = Object.freeze({
   frontdesk: Object.freeze({
     id: "p3-frontdesk-http-operator",
@@ -97,6 +98,23 @@ const frontdeskService = Object.freeze({
   }
 });
 
+const customerChargeService = Object.freeze({
+  async getFrontdeskCustomerChargeConfiguration(input) {
+    calls.push({ operation: "customer-charge-configuration", input });
+    return { schemaVersion: "mbt-frontdesk-customer-charge-configuration-v1", aggregateItems: [] };
+  },
+  async previewFrontdeskChargeRequest(input) {
+    return commandResult("customer-charge-preview", input, 201);
+  },
+  async confirmFrontdeskChargeRequest(input) {
+    return commandResult("customer-charge-confirm", input, 201);
+  },
+  async listFrontdeskContractChargeRequests(input) {
+    calls.push({ operation: "customer-charge-list", input });
+    return { schemaVersion: "mbt-frontdesk-contract-charge-requests-v1", items: [] };
+  }
+});
+
 function authenticate(req, res, next) {
   const token = String(req.get("authorization") || "").replace(/^Bearer\s+/i, "");
   const actor = ACTORS[token];
@@ -141,8 +159,9 @@ before(async () => {
   app.use(authenticate);
   app.use("/api/mbt", createMbtRouter({
     frontdeskService,
+    customerChargeService,
     frontdeskPricing: {
-      resolveDistance: async () => ({ source: "server" }),
+      resolveDistance: async () => ({ source: "server", providerMetres: 31_000 }),
       resolveTaxPolicy: async () => ({ source: "server" })
     },
     authorizePhase3Capability,
@@ -213,6 +232,15 @@ test("P3-F13 HTTP: quote commands bind server actor, pricing adapters, and idemp
     binTypeId: CONTRACT_ID,
     deliveryItemCode: "DELIVERY_CROSS_CHARGE",
     pricingOriginYardCode: "150",
+    orderFrom150: true,
+    paymentMethod: "card",
+    billingAddressText: "100 Billing Avenue, Toronto, ON M1M 1M1",
+    serviceAddressText: "200 Service Road, Toronto, ON M2M 2M2",
+    contractTelephone: "416-555-0100",
+    contentCode: "soil",
+    discountMinor: 2_500,
+    discountReason: "Repeat customer",
+    aggregateLines: [{ itemCode: "AGG_HPB", quantityYards: "1.000" }],
     dumpItemCode: "SOIL",
     estimatedTonnes: "1.500",
     surcharges: [{ itemCode: "DOWNTOWN", amountMinor: 12500 }],
@@ -258,9 +286,95 @@ test("P3-F13 HTTP: quote commands bind server actor, pricing adapters, and idemp
   assert.equal(calls[0].input.idempotencyKey, "p3-frontdesk-http-create");
   assert.deepEqual(calls[0].input.serviceLines, body.serviceLines);
   assert.equal(calls[0].input.pricingOriginYardCode, "150");
+  assert.equal(calls[0].input.paymentMethod, "card");
+  assert.equal(calls[0].input.billingAddressText, body.billingAddressText);
+  assert.deepEqual(calls[0].input.aggregateLines, body.aggregateLines);
   assert.equal(Object.hasOwn(calls[0].input, "clientDisplayTotals"), false);
   assert.equal(typeof calls[0].pricing.resolveDistance, "function");
   assert.equal(typeof calls[0].pricing.resolveTaxPolicy, "function");
+});
+
+test("MBT Front Desk HTTP: customer-charge preview and confirmation are private server-owned commands", async () => {
+  const configuration = await request(
+    `/api/mbt/frontdesk/customer-charge/configuration?rateCardVersionId=${QUOTE_ID}`,
+    { actor: "frontdesk" }
+  );
+  assert.equal(configuration.response.status, 200, JSON.stringify(configuration.payload));
+  assert.match(configuration.response.headers.get("cache-control") || "", /no-store/u);
+
+  const previewBody = {
+    actor: { operatorId: "forged-browser", roles: ["admin"] },
+    kind: "exchange_bin",
+    contractId: CONTRACT_ID,
+    serviceLineId: SERVICE_LINE_ID,
+    expectedContractRevision: 3,
+    expectedServiceLineRevision: 2,
+    rateCardVersionId: QUOTE_ID,
+    paymentMethod: "card",
+    billingAddressText: "100 Billing Avenue, Toronto, ON M1M 1M1",
+    serviceAddressText: "200 Service Road, Toronto, ON M2M 2M2",
+    contractTelephone: "416-555-0100",
+    orderFrom150: true,
+    distanceMetres: 12_500,
+    bin: {
+      incomingContentCode: "garbage",
+      incomingBinSizeYards: 20,
+      outgoingContentCode: "garbage",
+      outgoingBinSizeYards: 14
+    },
+    aggregateLines: [{ itemCode: "AGG_HPB", quantityYards: "2.500" }],
+    reason: "Customer approved exchange"
+  };
+  const withoutKey = await request("/api/mbt/frontdesk/charge-requests/preview", {
+    actor: "frontdesk", method: "POST", body: previewBody
+  });
+  assert.equal(withoutKey.response.status, 400);
+  assert.equal(withoutKey.payload.code, "MBT_IDEMPOTENCY_KEY_REQUIRED");
+
+  const preview = await request("/api/mbt/frontdesk/charge-requests/preview", {
+    actor: "frontdesk",
+    method: "POST",
+    body: previewBody,
+    idempotencyKey: "customer-charge-preview-http"
+  });
+  assert.equal(preview.response.status, 201, JSON.stringify(preview.payload));
+  assert.equal(preview.response.headers.get("x-mbt-idempotent-replay"), "false");
+
+  const confirmation = await request(
+    `/api/mbt/frontdesk/charge-requests/${CHARGE_REQUEST_ID}/confirm`,
+    {
+      actor: "frontdesk",
+      method: "POST",
+      body: { expectedRevision: 1, reason: "Payment confirmed" },
+      idempotencyKey: "customer-charge-confirm-http"
+    }
+  );
+  assert.equal(confirmation.response.status, 201, JSON.stringify(confirmation.payload));
+
+  const listed = await request(`/api/mbt/frontdesk/contracts/${CONTRACT_ID}/charge-requests`, {
+    actor: "frontdesk"
+  });
+  assert.equal(listed.response.status, 200, JSON.stringify(listed.payload));
+
+  assert.deepEqual(calls.map(({ operation }) => operation), [
+    "customer-charge-configuration",
+    "customer-charge-preview",
+    "customer-charge-confirm",
+    "customer-charge-list"
+  ]);
+  for (const call of calls) {
+    assert.deepEqual(call.input.actor, {
+      operatorId: ACTORS.frontdesk.id,
+      roles: ["mbt_frontdesk"]
+    });
+  }
+  assert.equal(calls[0].input.rateCardVersionId, QUOTE_ID);
+  assert.equal(calls[1].input.paymentMethod, "card");
+  assert.equal(calls[1].input.distanceMetres, 31_000);
+  assert.deepEqual(calls[1].input.aggregateLines, previewBody.aggregateLines);
+  assert.equal(Object.hasOwn(calls[1].input, "actor") && calls[1].input.actor.operatorId === "forged-browser", false);
+  assert.equal(calls[2].input.chargeRequestId, CHARGE_REQUEST_ID);
+  assert.equal(calls[3].input.contractId, CONTRACT_ID);
 });
 
 test("MBT Front Desk HTTP: customer contracts and independent service-line actions are explicit", async () => {

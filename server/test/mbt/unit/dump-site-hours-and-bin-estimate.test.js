@@ -178,7 +178,7 @@ test("Front Desk pricing origin defaults to standard and accepts only the two qu
   assert.throws(() => normalizePricingOriginYardCode("2967"), /pricing origin/i);
 });
 
-test("schema and browser contracts expose dump schedules and site-first one-bin rows", async () => {
+test("schema retains legacy dump evidence while the customer-charge browser uses fixed prices", async () => {
   const [migration, configPage, frontdeskPage, frontdeskClient] = await Promise.all([
     readFile(migrationUrl, "utf8"),
     readFile(configPageUrl, "utf8"),
@@ -192,12 +192,12 @@ test("schema and browser contracts expose dump schedules and site-first one-bin 
   assert.match(migration, /estimated_weight_kg/i);
   assert.match(configPage, /data-dump-acceptance-item/i);
   assert.match(configPage, /data-dump-opening-day/i);
-  assert.match(frontdeskPage, /id="contractServiceSite"/i);
-  assert.match(frontdeskPage, /id="binDeliveryItemCode"/i);
-  assert.match(frontdeskPage, /data-line-dump-item/i);
-  assert.match(frontdeskPage, /data-line-estimated-tonnes/i);
-  assert.match(frontdeskPage, /id="addOrderSurcharge"/i);
-  assert.match(frontdeskPage, /base rental[\s\S]*estimated dump tonnes[\s\S]*one-way delivery fee[\s\S]*manual surcharge/i);
+  assert.match(frontdeskPage, /id="serviceAddressText"/i);
+  assert.match(frontdeskPage, /id="chargeDeliveryItemCode"/i);
+  assert.match(frontdeskPage, /id="binContentCode"/i);
+  assert.match(frontdeskPage, /id="binDiscountCad"/i);
+  assert.doesNotMatch(frontdeskPage, /data-line-dump-item|data-line-estimated-tonnes|Estimated tonnes/i);
+  assert.doesNotMatch(frontdeskClient, /estimatedTonnes/i);
   assert.doesNotMatch(frontdeskPage, /data-line-quantity/i);
-  assert.match(frontdeskClient, /dumpItems/i);
+  assert.match(frontdeskClient, /customer-charge\/configuration/i);
 });

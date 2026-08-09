@@ -5,6 +5,10 @@ import crypto from "node:crypto";
 import { query } from "../db.js";
 import { createDispatchCustomOrder } from "../dispatch-custom-order-repository.js";
 import { executeMbtCommand } from "./command-repository.js";
+import {
+  persistPreparedFrontdeskInitialCharge,
+  prepareFrontdeskInitialCharge
+} from "./customer-charge-request-service.js";
 import { MbtError } from "./errors.js";
 import { calculateDistanceBandChargeMinor } from "./distance-band-pricing.js";
 
@@ -764,6 +768,9 @@ function requestedServiceLineGroups(input) {
     : [{
       binItemCode: input.binItemCode,
       binTypeId: input.binTypeId,
+      contentCode: input.contentCode,
+      discountMinor: input.discountMinor,
+      discountReason: input.discountReason,
       dumpItemCode: input.dumpItemCode,
       estimatedTonnes: input.estimatedTonnes,
       proposedDeliveryAt: input.proposedDeliveryAt,
@@ -866,6 +873,43 @@ function requiredArrayEntry(values, index, label) {
   return value;
 }
 
+/** @param {Record<string, unknown>} group @param {Record<string, unknown>} input @param {string} label */
+function normalizedFixedServiceLinePricing(group, input, label) {
+  const contentCode = requiredText(group.contentCode ?? input.contentCode, `${label} content`).toLowerCase();
+  if (!["garbage", "soil", "asphalt", "concrete"].includes(contentCode)) {
+    throw failure(400, "MBT_FRONTDESK_INPUT_INVALID", `${label} content is not supported.`);
+  }
+  return {
+    contentCode,
+    dumpItemCode: null,
+    estimatedWeightKg: null,
+    discountMinor: safeNonnegativeInteger(Number(group.discountMinor ?? input.discountMinor ?? 0), `${label} discount`),
+    discountReason: String(group.discountReason ?? input.discountReason ?? "").trim()
+  };
+}
+
+/** @param {Record<string, unknown>} group @param {Record<string, unknown>} input @param {string} label */
+function normalizedLegacyServiceLinePricing(group, input, label) {
+  return {
+    contentCode: null,
+    dumpItemCode: localItemCode(group.dumpItemCode ?? input.dumpItemCode, `${label} dump item`),
+    estimatedWeightKg: normalizeEstimatedDumpWeightKg(
+      group.estimatedTonnes ?? input.estimatedTonnes,
+      `${label} estimated tonnes`
+    ),
+    discountMinor: 0,
+    discountReason: ""
+  };
+}
+
+/** @param {Record<string, unknown>} group @param {Record<string, unknown>} input @param {string} label */
+function normalizedServiceLinePricing(group, input, label) {
+  if (input.paymentMethod !== undefined && input.paymentMethod !== null) {
+    return normalizedFixedServiceLinePricing(group, input, label);
+  }
+  return normalizedLegacyServiceLinePricing(group, input, label);
+}
+
 /** @param {unknown} value @param {number} groupIndex @param {Record<string, unknown>} input */
 function normalizedServiceLineGroup(value, groupIndex, input) {
   const label = `Service line ${groupIndex + 1}`;
@@ -875,18 +919,14 @@ function normalizedServiceLineGroup(value, groupIndex, input) {
   }
   const binItemCode = localItemCode(group.binItemCode ?? input.binItemCode, `${label} bin item`);
   const binTypeId = requiredUuid(group.binTypeId ?? input.binTypeId, `${label} bin type ID`);
-  const dumpItemCode = localItemCode(group.dumpItemCode ?? input.dumpItemCode, `${label} dump item`);
-  const estimatedWeightKg = normalizeEstimatedDumpWeightKg(
-    group.estimatedTonnes ?? input.estimatedTonnes,
-    `${label} estimated tonnes`
-  );
+  const pricing = normalizedServiceLinePricing(group, input, label);
   const deliveryAt = applicableDate(group.proposedDeliveryAt ?? input.proposedDeliveryAt, `${label} proposed delivery time`);
   const returnAt = applicableDate(group.proposedReturnAt ?? input.proposedReturnAt, `${label} proposed return time`);
   if (returnAt <= deliveryAt) {
     throw failure(400, "MBT_FRONTDESK_INPUT_INVALID", `${label} return time must follow delivery time.`);
   }
   return {
-    binItemCode, binTypeId, dumpItemCode, estimatedWeightKg,
+    binItemCode, binTypeId, ...pricing,
     deliveryAt, returnAt, ...requestedServiceLineSite(group, input, label)
   };
 }
@@ -900,10 +940,13 @@ function normalizedServiceLineGroup(value, groupIndex, input) {
  */
 export function normalizeFrontdeskServiceLines(input) {
   const candidateGroups = requestedServiceLineGroups(input);
+  if (input.paymentMethod !== undefined && candidateGroups.length !== 1) {
+    throw failure(400, "MBT_FRONTDESK_INPUT_INVALID", "A fixed-price customer request must contain exactly one physical bin.");
+  }
   if (candidateGroups.length > 25) {
     throw failure(400, "MBT_FRONTDESK_INPUT_INVALID", "A contract can contain at most 25 physical bins.");
   }
-  /** @type {Array<{lineNumber: number, binItemCode: string, binTypeId: string, dumpItemCode: string, estimatedWeightKg: number, estimatedTonnes: string, siteProfileId: string | null, site: Record<string, string> | null, proposedDeliveryAt: string, proposedReturnAt: string}>} */
+  /** @type {Array<{lineNumber: number, binItemCode: string, binTypeId: string, contentCode: string | null, discountMinor: number, discountReason: string, dumpItemCode: string | null, estimatedWeightKg: number | null, estimatedTonnes: string | null, siteProfileId: string | null, site: Record<string, string> | null, proposedDeliveryAt: string, proposedReturnAt: string}>} */
   const lines = [];
   for (const [groupIndex, value] of candidateGroups.entries()) {
     const group = normalizedServiceLineGroup(value, groupIndex, input);
@@ -913,7 +956,10 @@ export function normalizeFrontdeskServiceLines(input) {
       binTypeId: group.binTypeId,
       dumpItemCode: group.dumpItemCode,
       estimatedWeightKg: group.estimatedWeightKg,
-      estimatedTonnes: (group.estimatedWeightKg / 1000).toFixed(3),
+      contentCode: group.contentCode,
+      discountMinor: group.discountMinor,
+      discountReason: group.discountReason,
+      estimatedTonnes: group.estimatedWeightKg === null ? null : (group.estimatedWeightKg / 1000).toFixed(3),
       siteProfileId: group.siteProfileId,
       site: group.site,
       proposedDeliveryAt: iso(group.deliveryAt),
@@ -1178,8 +1224,7 @@ function physicalDeliveryPriceLine(delivery, input, amountMinor) {
  * @param {{binItemCode: string, deliveryItemCode: string, dumpItemCode: string, estimatedWeightKg: number, serviceCode: string, binTypeId: string, providerMetres: number, originYardCode: string, deliveryAt: string, expectedCurrency: string}} input
  */
 async function quotePhysicalBinRate(input) {
-  const [rentalResult, deliveryResult, dumpResult] = await Promise.all([
-    query(
+  const rentalResult = await query(
       `SELECT item.item_code, item.display_name, card.rate_card_id::text,
               version.rate_card_version_id::text, component.rate_component_id::text,
               component.amount_minor, component.currency, component.taxable
@@ -1206,8 +1251,8 @@ async function quotePhysicalBinRate(input) {
                  (component.bin_type_id IS NOT NULL) DESC, component.rate_component_id
         LIMIT 2`,
       [input.binItemCode, input.binTypeId, input.deliveryAt]
-    ),
-    query(
+    );
+  const deliveryResult = await query(
       `SELECT item.item_code, item.display_name, card.rate_card_id::text,
               version.rate_card_version_id::text, band.rate_distance_band_id::text,
               band.amount_minor, band.pricing_basis, band.boundary_rule,
@@ -1246,8 +1291,8 @@ async function quotePhysicalBinRate(input) {
                  band.sequence_number, band.rate_distance_band_id
         LIMIT 2`,
       [input.deliveryItemCode, input.serviceCode, input.binTypeId, input.providerMetres, input.deliveryAt, input.originYardCode]
-    ),
-    query(
+    );
+  const dumpResult = await query(
       `SELECT item.item_code, item.display_name, material.material_id::text,
               card.rate_card_id::text, version.rate_card_version_id::text,
               tariff.dump_tariff_id::text, tariff.amount_minor,
@@ -1276,8 +1321,7 @@ async function quotePhysicalBinRate(input) {
                  tariff.dump_tariff_id
         LIMIT 2`,
       [input.dumpItemCode, input.deliveryAt]
-    )
-  ]);
+    );
   if (rentalResult.rowCount !== 1) {
     throw failure(422, "MBT_FRONTDESK_RENTAL_RATE_MISSING", "The selected BIN item needs one active base-rental rate for the delivery date.");
   }
@@ -1355,6 +1399,291 @@ async function quotePhysicalBinDeposit(input) {
   return { depositRuleId: String(deposit.deposit_rule_id), depositRequiredMinor };
 }
 
+/** @param {Record<string, any>} calculation @param {string} chargeRequestId */
+function fixedQuoteAttachedAggregate(calculation, chargeRequestId) {
+  const lines = /** @type {Array<Record<string, any>>} */ (calculation.lines);
+  const materials = lines.filter((line) => line.lineType === "aggregate_material");
+  if (!materials.length) {
+    return null;
+  }
+  const loading = lines.find((line) => line.lineType === "aggregate_loading_fee");
+  return {
+    schemaVersion: "mbt-attached-aggregate-v1",
+    chargeRequestId,
+    materials: materials.map((line) => ({
+      itemCode: line.itemCode,
+      displayName: line.label,
+      quantityMilliYards: line.quantityMilliUnits,
+      unitOfMeasure: "YARD",
+      derivedWeightLbs: line.derivedWeightLbs
+    })),
+    totalWeightLbs: materials.reduce((sum, line) => sum + Number(line.derivedWeightLbs), 0),
+    loadingFeeMinor: loading ? Number(loading.configuredAmountMinor) : 0
+  };
+}
+
+/**
+ * Build the new fixed-price initial-bin quote while preserving the existing
+ * operational quote/contract lifecycle and route snapshots.
+ *
+ * @param {Record<string, any>} input
+ */
+async function createFixedPriceInitialQuoteMutation(input) {
+  const line = input.serviceLine;
+  const selectedBin = input.selectedBin;
+  const distance = input.distance;
+  const prepared = await prepareFrontdeskInitialCharge({
+    actor: input.actor,
+    customerNetsuiteId: input.customerNetsuiteId,
+    rateCardVersionId: input.rateCardVersionId,
+    paymentMethod: input.paymentMethod,
+    billingAddressText: input.billingAddressText,
+    serviceAddressText: input.serviceAddressText,
+    contractTelephone: input.contractTelephone,
+    orderFrom150: input.orderFrom150,
+    distanceMetres: distance.providerMetres,
+    bin: {
+      incomingContentCode: line.contentCode,
+      incomingBinSizeYards: Number(selectedBin.nominal_yards),
+      incomingBinTypeId: line.binTypeId,
+      binItemCode: line.binItemCode,
+      deliveryItemCode: input.deliveryItemCode,
+      discountMinor: line.discountMinor,
+      discountReason: line.discountReason || null,
+      proposedDeliveryAt: line.proposedDeliveryAt,
+      proposedReturnAt: line.proposedReturnAt
+    },
+    aggregateLines: input.aggregateLines,
+    reason: input.reason
+  });
+  const calculation = prepared.calculation;
+  const binRate = prepared.binRate;
+  if (!binRate) {
+    throw failure(422, "MBT_FRONTDESK_CONFIGURATION_INVALID", "The initial fixed-price quote has no bin rate evidence.");
+  }
+  const quoteId = crypto.randomUUID();
+  const quoteNumber = publicNumber("MBT-Q", quoteId);
+  const attachedAggregate = fixedQuoteAttachedAggregate(calculation, prepared.chargeRequestId);
+  const displayLines = calculation.lines.map((priceLine) => ({
+    ...priceLine,
+    code: priceLine.lineCode,
+    amountMinor: priceLine.customerAmountMinor
+  }));
+  const linePricing = {
+    schemaVersion: "mbt-frontdesk-service-line-pricing-v2",
+    pricingModel: "fixed_bin_customer_charge",
+    chargeRequestId: prepared.chargeRequestId,
+    lineNumber: 1,
+    binItemCode: line.binItemCode,
+    binTypeId: line.binTypeId,
+    contentCode: line.contentCode,
+    deliveryItemCode: input.deliveryItemCode,
+    pricingOriginYardCode: input.orderFrom150 ? "150" : "3445",
+    dumpItemCode: null,
+    materialId: null,
+    estimatedWeightKg: null,
+    estimatedTonnes: null,
+    siteProfileId: line.siteProfileId,
+    siteSnapshot: line.siteSnapshot,
+    binTypeCode: String(selectedBin.type_code),
+    binTypeDisplayName: String(selectedBin.display_name),
+    proposedDeliveryAt: line.proposedDeliveryAt,
+    proposedReturnAt: line.proposedReturnAt,
+    distanceSnapshotId: distance.distanceSnapshotId,
+    distance,
+    rateCardVersionId: input.rateCardVersionId,
+    rateDistanceBandId: binRate.itemEvidence.deliveryRateDistanceBandId,
+    subtotalMinor: calculation.preTaxRevenueMinor,
+    taxableSubtotalMinor: calculation.preTaxRevenueMinor,
+    taxMinor: calculation.addedHstMinor,
+    totalMinor: calculation.newRequestChargeableMinor,
+    tax: {
+      code: "ON_HST_13",
+      label: calculation.taxMode === "included" ? "Included Ontario HST" : "Ontario HST",
+      basisPoints: calculation.taxRateBasisPoints,
+      mode: calculation.taxMode,
+      includedHstMinor: calculation.includedHstMinor,
+      amountMinor: calculation.addedHstMinor
+    },
+    lines: displayLines,
+    depositRequiredMinor: calculation.requiredDepositMinor,
+    depositRuleId: line.contentCode === "garbage"
+      ? binRate.itemEvidence.depositRuleId
+      : null,
+    ...(attachedAggregate ? { attachedAggregate } : {})
+  };
+  const pricingSnapshot = {
+    pricingModel: "fixed_bin_customer_charge",
+    chargeRequestId: prepared.chargeRequestId,
+    paymentMethod: calculation.paymentMethod,
+    paymentCategory: calculation.paymentCategory,
+    taxMode: calculation.taxMode,
+    taxRateBasisPoints: calculation.taxRateBasisPoints,
+    currency: calculation.currency,
+    distanceMetres: distance.providerMetres,
+    currentContractTotalMinor: 0,
+    preTaxRevenueMinor: calculation.preTaxRevenueMinor,
+    includedHstMinor: calculation.includedHstMinor,
+    addedHstMinor: calculation.addedHstMinor,
+    subtotalMinor: calculation.preTaxRevenueMinor,
+    taxableSubtotalMinor: calculation.preTaxRevenueMinor,
+    taxMinor: calculation.addedHstMinor,
+    totalMinor: calculation.newRequestChargeableMinor,
+    customerTotalMinor: calculation.newRequestChargeableMinor,
+    requiredDepositMinor: calculation.requiredDepositMinor,
+    dueNowMinor: calculation.dueNowMinor,
+    netsuiteExportPolicy: calculation.netsuiteExportPolicy,
+    netsuiteReadySnapshot: calculation.netsuiteReadySnapshot,
+    lines: displayLines,
+    serviceLines: [linePricing],
+    tax: linePricing.tax,
+    serviceCode: input.serviceCode,
+    deliveryItemCode: input.deliveryItemCode,
+    pricingOriginYardCode: input.orderFrom150 ? "150" : "3445",
+    surcharges: [],
+    serviceTemplateVersionId: input.serviceTemplateVersionId,
+    serviceTemplateCode: String(input.configuration.template_code),
+    serviceTemplateDisplayName: String(input.configuration.template_display_name),
+    rateCardVersionId: input.rateCardVersionId,
+    configuredSubsidiaryId: input.configuredSubsidiaryId,
+    rateCardCode: String(input.configuration.rate_card_code),
+    rateCardDisplayName: String(input.configuration.rate_display_name),
+    binTypeId: line.binTypeId,
+    binTypeCode: String(selectedBin.type_code),
+    binTypeDisplayName: String(selectedBin.display_name),
+    rentalCalendarDays: Number(input.configuration.default_rental_calendar_days),
+    billingOwnership: String(input.configuration.billing_ownership)
+  };
+  const transportLine = calculation.lines.find((priceLine) => priceLine.lineType === "bin_transport");
+  await query(
+    `INSERT INTO mbt_distance_snapshots (
+       distance_snapshot_id, subject_type, subject_id,
+       rate_card_version_id, rate_distance_band_id,
+       provider, provider_metres, route_hash,
+       origin_snapshot, destination_snapshot, route_snapshot,
+       calculated_amount_minor, currency
+     ) VALUES (
+       $1::uuid, 'quote', $2::uuid, $3::uuid, $4::uuid,
+       $5, $6, $7, $8::jsonb, $9::jsonb, $10::jsonb, $11, $12
+     )`,
+    [
+      distance.distanceSnapshotId, quoteId, input.rateCardVersionId,
+      binRate.itemEvidence.deliveryRateDistanceBandId,
+      distance.provider, distance.providerMetres, distance.routeHash,
+      JSON.stringify(distance.originSnapshot), JSON.stringify(distance.destinationSnapshot),
+      JSON.stringify({ ...distance.routeSnapshot, physicalBinLineNumber: 1 }),
+      Number(transportLine?.configuredAmountMinor || 0), calculation.currency
+    ]
+  );
+  const inserted = await query(
+    `INSERT INTO mbt_quotes (
+       quote_id, quote_number, customer_netsuite_id,
+       customer_site_profile_id, service_template_version_id,
+       rate_card_version_id, bin_type_id, distance_snapshot_id,
+       deposit_rule_id, status, proposed_delivery_at,
+       proposed_return_at, customer_snapshot, site_snapshot,
+       pricing_snapshot, deposit_required_minor, currency,
+       created_by, updated_by
+     ) VALUES (
+       $1::uuid, $2, $3::bigint, $4::uuid, $5::uuid,
+       $6::uuid, $7::uuid, $8::uuid, $9::uuid, 'draft',
+       $10::timestamptz, $11::timestamptz, $12::jsonb,
+       $13::jsonb, $14::jsonb, $15, $16, $17, $17
+     ) RETURNING *`,
+    [
+      quoteId, quoteNumber, input.customerNetsuiteId, line.siteProfileId,
+      input.serviceTemplateVersionId, input.rateCardVersionId, line.binTypeId,
+      distance.distanceSnapshotId, linePricing.depositRuleId,
+      line.proposedDeliveryAt, line.proposedReturnAt,
+      JSON.stringify(input.canonicalCustomer), JSON.stringify(line.siteSnapshot),
+      JSON.stringify(pricingSnapshot), calculation.requiredDepositMinor,
+      calculation.currency, String(input.actor.operatorId)
+    ]
+  );
+  const chargeRequest = await persistPreparedFrontdeskInitialCharge(prepared, quoteId);
+  const quote = publicQuote({ ...inserted.rows[0], bin_type_code: selectedBin.type_code });
+  return {
+    status: 201,
+    body: { schemaVersion: "mbt-frontdesk-quote-v2", quote, chargeRequest },
+    audit: {
+      action: "mbt.frontdesk.quote.created",
+      entityType: "mbt_quote",
+      entityId: quoteId,
+      beforeState: { quoteId, exists: false },
+      afterState: { quote, chargeRequest },
+      reason: input.reason,
+      revisionBefore: 1,
+      revisionAfter: 1,
+      source: "frontdesk_local"
+    }
+  };
+}
+
+/** @param {unknown} value */
+function frontdeskCustomerNetsuiteId(value) {
+  const customerNetsuiteId = requiredText(value, "Customer NetSuite ID");
+  if (!/^\d+$/u.test(customerNetsuiteId)) {
+    throw failure(400, "MBT_FRONTDESK_INPUT_INVALID", "Customer NetSuite ID is invalid.");
+  }
+  return customerNetsuiteId;
+}
+
+/** @param {unknown} value */
+function frontdeskServiceCode(value) {
+  const serviceCode = requiredText(value, "Service code");
+  if (!/^[a-z][a-z0-9_]*$/u.test(serviceCode)) {
+    throw failure(400, "MBT_FRONTDESK_INPUT_INVALID", "Service code is invalid.");
+  }
+  return serviceCode;
+}
+
+/** @param {Record<string, unknown>} input @param {boolean} fixedChargeMode */
+function fixedChargeSnapshots(input, fixedChargeMode) {
+  if (!fixedChargeMode) {
+    return { billingAddressText: "", serviceAddressText: "", contractTelephone: "", aggregateLines: [] };
+  }
+  return {
+    billingAddressText: siteText(input.billingAddressText, "Billing address", 1_000, true),
+    serviceAddressText: siteText(input.serviceAddressText, "Service address", 1_000, true),
+    contractTelephone: siteText(input.contractTelephone, "Contract telephone", 100, true),
+    aggregateLines: Array.isArray(input.aggregateLines) ? input.aggregateLines : []
+  };
+}
+
+/** @param {Record<string, unknown>} input */
+function normalizedQuotePricingMode(input) {
+  const fixedChargeMode = input.paymentMethod !== undefined && input.paymentMethod !== null;
+  const orderFrom150 = fixedChargeMode
+    ? input.orderFrom150 === true
+    : String(input.pricingOriginYardCode || "") === "150";
+  const pricingOriginYardCode = normalizePricingOriginYardCode(
+    fixedChargeMode ? (orderFrom150 ? "150" : "3445") : input.pricingOriginYardCode
+  );
+  const requestedSurcharges = normalizeFrontdeskSurcharges(input.surcharges);
+  if (fixedChargeMode && requestedSurcharges.length) {
+    throw failure(400, "MBT_FRONTDESK_INPUT_INVALID", "Fixed-price bin requests use the per-bin discount field instead of manual surcharges.");
+  }
+  return {
+    fixedChargeMode,
+    orderFrom150,
+    pricingOriginYardCode,
+    requestedSurcharges,
+    ...fixedChargeSnapshots(input, fixedChargeMode)
+  };
+}
+
+/** @param {{resolveDistance?: Function, resolveTaxPolicy?: Function}} options @param {boolean} fixedChargeMode */
+function quotePricingResolvers(options, fixedChargeMode) {
+  if (typeof options.resolveDistance !== "function"
+      || (!fixedChargeMode && typeof options.resolveTaxPolicy !== "function")) {
+    throw failure(503, "MBT_FRONTDESK_PRICING_UNAVAILABLE", "Server-owned distance and tax resolvers are required.");
+  }
+  return {
+    resolveDistance: /** @type {Function} */ (options.resolveDistance),
+    resolveTaxPolicy: /** @type {Function} */ (options.resolveTaxPolicy)
+  };
+}
+
 /**
  * @param {Record<string, unknown>} input
  * @param {{resolveDistance?: Function, resolveTaxPolicy?: Function}} [options]
@@ -1362,33 +1691,22 @@ async function quotePhysicalBinDeposit(input) {
 export async function createFrontdeskQuote(input, options = {}) {
   const actor = /** @type {any} */ (input.actor);
   assertFrontdeskActor(actor);
-  const customerNetsuiteId = requiredText(input.customerNetsuiteId, "Customer NetSuite ID");
-  if (!/^\d+$/.test(customerNetsuiteId)) {
-    throw failure(400, "MBT_FRONTDESK_INPUT_INVALID", "Customer NetSuite ID is invalid.");
-  }
+  const customerNetsuiteId = frontdeskCustomerNetsuiteId(input.customerNetsuiteId);
   const serviceTemplateVersionId = requiredUuid(input.serviceTemplateVersionId, "Service template version ID");
   const rateCardVersionId = requiredUuid(input.rateCardVersionId, "Rate card version ID");
   const requestedServiceLines = normalizeFrontdeskServiceLines(input);
   const deliveryItemCode = localItemCode(input.deliveryItemCode, "Delivery fee item");
-  const pricingOriginYardCode = normalizePricingOriginYardCode(input.pricingOriginYardCode);
-  const requestedSurcharges = normalizeFrontdeskSurcharges(input.surcharges);
-  const primaryServiceLine = requestedServiceLines[0];
-  if (!primaryServiceLine) {
-    throw failure(400, "MBT_FRONTDESK_INPUT_INVALID", "At least one physical-bin service line is required.");
-  }
+  const {
+    fixedChargeMode, orderFrom150, pricingOriginYardCode, requestedSurcharges,
+    billingAddressText, serviceAddressText, contractTelephone, aggregateLines
+  } = normalizedQuotePricingMode(input);
+  const primaryServiceLine = requiredArrayEntry(requestedServiceLines, 0, "Physical-bin service line");
   const binTypeId = primaryServiceLine.binTypeId;
-  const serviceCode = requiredText(input.serviceCode, "Service code");
-  if (!/^[a-z][a-z0-9_]*$/.test(serviceCode)) {
-    throw failure(400, "MBT_FRONTDESK_INPUT_INVALID", "Service code is invalid.");
-  }
+  const serviceCode = frontdeskServiceCode(input.serviceCode);
   const proposedDeliveryAt = new Date(primaryServiceLine.proposedDeliveryAt);
   const proposedReturnAt = new Date(primaryServiceLine.proposedReturnAt);
   const reason = requiredText(input.reason, "Audit reason");
-  if (typeof options.resolveDistance !== "function" || typeof options.resolveTaxPolicy !== "function") {
-    throw failure(503, "MBT_FRONTDESK_PRICING_UNAVAILABLE", "Server-owned distance and tax resolvers are required.");
-  }
-  const resolveDistance = options.resolveDistance;
-  const resolveTaxPolicy = options.resolveTaxPolicy;
+  const { resolveDistance, resolveTaxPolicy } = quotePricingResolvers(options, fixedChargeMode);
   const payload = {
     customerNetsuiteId,
     serviceTemplateVersionId,
@@ -1399,6 +1717,13 @@ export async function createFrontdeskQuote(input, options = {}) {
     proposedReturnAt: iso(proposedReturnAt),
     deliveryItemCode,
     pricingOriginYardCode,
+    fixedChargeMode,
+    paymentMethod: fixedChargeMode ? input.paymentMethod : null,
+    billingAddressText,
+    serviceAddressText,
+    contractTelephone,
+    orderFrom150,
+    aggregateLines,
     surcharges: requestedSurcharges,
     serviceLines: requestedServiceLines,
     reason
@@ -1494,7 +1819,7 @@ export async function createFrontdeskQuote(input, options = {}) {
       }
 
       const selectedBinTypes = await query(
-        `SELECT bin_type_id::text, type_code, display_name, active
+        `SELECT bin_type_id::text, type_code, display_name, nominal_yards::int, active
            FROM mbt_bin_types
           WHERE bin_type_id = ANY($1::uuid[])`,
         [[...new Set(requestedServiceLines.map((/** @type {{binTypeId: string}} */ line) => line.binTypeId))]]
@@ -1530,7 +1855,9 @@ export async function createFrontdeskQuote(input, options = {}) {
       }));
 
       const canonicalCustomer = customerSnapshot(configuration);
-      const distanceEvidence = await Promise.all(serviceLinesWithSites.map(async (line) => {
+      /** @type {Array<Record<string, any>>} */
+      const distanceEvidence = [];
+      for (const line of serviceLinesWithSites) {
         const raw = jsonObject(await resolveDistance({
           customer: canonicalCustomer,
           site: line.siteSnapshot,
@@ -1544,7 +1871,7 @@ export async function createFrontdeskQuote(input, options = {}) {
         if (!/^[0-9a-f]{64}$/u.test(routeHash)) {
           throw failure(422, "MBT_FRONTDESK_DISTANCE_INVALID", "Distance route hash is invalid.");
         }
-        return {
+        distanceEvidence.push({
           distanceSnapshotId: crypto.randomUUID(),
           provider: requiredText(raw.provider, `Service line ${line.lineNumber} distance provider`),
           providerMetres: safeNonnegativeInteger(raw.providerMetres, `Service line ${line.lineNumber} provider metres`),
@@ -1552,27 +1879,62 @@ export async function createFrontdeskQuote(input, options = {}) {
           originSnapshot: jsonObject(raw.originSnapshot, `Service line ${line.lineNumber} distance origin snapshot`),
           destinationSnapshot: jsonObject(raw.destinationSnapshot, `Service line ${line.lineNumber} distance destination snapshot`),
           routeSnapshot: jsonObject(raw.routeSnapshot || {}, `Service line ${line.lineNumber} distance route snapshot`)
-        };
-      }));
+        });
+      }
 
-      const physicalRates = await Promise.all(serviceLinesWithSites.map((line, index) => quotePhysicalBinRate({
-        binItemCode: line.binItemCode,
-        deliveryItemCode,
-        dumpItemCode: line.dumpItemCode,
-        estimatedWeightKg: line.estimatedWeightKg,
-        serviceCode,
-        binTypeId: line.binTypeId,
-        providerMetres: requiredArrayEntry(distanceEvidence, index, "Physical-bin distance evidence").providerMetres,
-        originYardCode: pricingOriginYardCode,
-        deliveryAt: line.proposedDeliveryAt,
-        expectedCurrency: String(configuration.rate_currency)
-      })));
+      if (fixedChargeMode) {
+        const line = requiredArrayEntry(serviceLinesWithSites, 0, "Fixed-price physical-bin line");
+        const selectedBin = binTypeById.get(line.binTypeId);
+        if (!selectedBin) {
+          throw failure(422, "MBT_FRONTDESK_CONFIGURATION_INVALID", "The fixed-price bin configuration is missing.");
+        }
+        return createFixedPriceInitialQuoteMutation({
+          actor,
+          customerNetsuiteId,
+          rateCardVersionId,
+          serviceTemplateVersionId,
+          serviceCode,
+          deliveryItemCode,
+          orderFrom150,
+          paymentMethod: input.paymentMethod,
+          billingAddressText,
+          serviceAddressText,
+          contractTelephone,
+          aggregateLines,
+          reason,
+          configuration,
+          configuredSubsidiaryId,
+          canonicalCustomer,
+          serviceLine: line,
+          selectedBin,
+          distance: requiredArrayEntry(distanceEvidence, 0, "Fixed-price distance evidence")
+        });
+      }
+
+      /** @type {Array<Record<string, any>>} */
+      const physicalRates = [];
+      for (const [index, line] of serviceLinesWithSites.entries()) {
+        physicalRates.push(await quotePhysicalBinRate({
+          binItemCode: line.binItemCode,
+          deliveryItemCode,
+          dumpItemCode: line.dumpItemCode,
+          estimatedWeightKg: line.estimatedWeightKg,
+          serviceCode,
+          binTypeId: line.binTypeId,
+          providerMetres: requiredArrayEntry(distanceEvidence, index, "Physical-bin distance evidence").providerMetres,
+          originYardCode: pricingOriginYardCode,
+          deliveryAt: line.proposedDeliveryAt,
+          expectedCurrency: String(configuration.rate_currency)
+        }));
+      }
       const primaryRate = physicalRates[0];
       if (!primaryRate) {
         throw failure(422, "MBT_FRONTDESK_CONFIGURATION_INVALID", "The quote has no physical-bin rate evidence.");
       }
       const currency = primaryRate.currency;
-      const taxPolicies = await Promise.all(serviceLinesWithSites.map(async (line) => {
+      /** @type {Array<Record<string, any>>} */
+      const taxPolicies = [];
+      for (const line of serviceLinesWithSites) {
         const taxPolicy = jsonObject(await resolveTaxPolicy({
           customer: canonicalCustomer,
           site: line.siteSnapshot,
@@ -1580,12 +1942,12 @@ export async function createFrontdeskQuote(input, options = {}) {
           proposedDeliveryAt: line.proposedDeliveryAt,
           currency
         }), "Tax policy");
-        return {
+        taxPolicies.push({
           code: requiredText(taxPolicy.code, "Tax code"),
           basisPoints: safeNonnegativeInteger(taxPolicy.basisPoints, "Tax basis points"),
           label: String(taxPolicy.label || taxPolicy.code)
-        };
-      }));
+        });
+      }
       /** @type {Array<Record<string, any>>} */
       const serviceLinePricing = serviceLinesWithSites.map((line, index) => {
         const selectedBin = binTypeById.get(line.binTypeId);
@@ -1593,7 +1955,7 @@ export async function createFrontdeskQuote(input, options = {}) {
         const taxPolicy = requiredArrayEntry(taxPolicies, index, "Physical-bin tax evidence");
         const distance = requiredArrayEntry(distanceEvidence, index, "Physical-bin distance evidence");
         const lineItems = [
-          ...rate.lines.map((lineItem) => ({ ...lineItem })),
+          ...rate.lines.map((/** @type {Record<string, any>} */ lineItem) => ({ ...lineItem })),
           ...(index === 0 ? surchargeLines.map((lineItem) => ({ ...lineItem })) : [])
         ];
         const subtotalMinor = lineItems.reduce((total, lineItem) => total + lineItem.amountMinor, 0);
@@ -1647,13 +2009,16 @@ export async function createFrontdeskQuote(input, options = {}) {
         throw failure(422, "MBT_FRONTDESK_CONFIGURATION_INVALID", "The configured quote total exceeds safe integer limits.");
       }
 
-      const lineDeposits = await Promise.all(serviceLinePricing.map((line) => quotePhysicalBinDeposit({
-        rateCardVersionId,
-        serviceCode,
-        binTypeId: line.binTypeId,
-        currency,
-        totalMinor: line.totalMinor
-      })));
+      const lineDeposits = [];
+      for (const line of serviceLinePricing) {
+        lineDeposits.push(await quotePhysicalBinDeposit({
+          rateCardVersionId,
+          serviceCode,
+          binTypeId: line.binTypeId,
+          currency,
+          totalMinor: line.totalMinor
+        }));
+      }
       const depositRequiredMinor = lineDeposits.reduce((total, line) => total + line.depositRequiredMinor, 0);
       const depositRuleId = lineDeposits[0]?.depositRuleId || null;
       for (const [index, line] of serviceLinePricing.entries()) {
@@ -2202,6 +2567,10 @@ function physicalLineRouteEvidence(quoteDistance, distance) {
  * @param {Record<string, any>} linePricing
  */
 function lineDistanceEvidence(quoteDistance, linePricing) {
+  const rateCardVersionId = requiredUuid(
+    linePricing.rateCardVersionId ?? quoteDistance.rate_card_version_id,
+    "Physical-bin rate card version ID"
+  );
   const rateDistanceBandId = requiredUuid(
     linePricing.rateDistanceBandId ?? quoteDistance.rate_distance_band_id,
     "Physical-bin distance rate band ID"
@@ -2215,6 +2584,7 @@ function lineDistanceEvidence(quoteDistance, linePricing) {
   const route = physicalLineRouteEvidence(quoteDistance, distance);
   return {
     ...quoteDistance,
+    rate_card_version_id: rateCardVersionId,
     distance_snapshot_id: linePricing.distanceSnapshotId || quoteDistance.distance_snapshot_id,
     rate_distance_band_id: rateDistanceBandId,
     provider: route.provider,
@@ -2243,18 +2613,27 @@ function storedQuoteServiceLine(value, index, quoteRow) {
     if (proposedReturnAt <= proposedDeliveryAt) {
       throw failure(422, "MBT_FRONTDESK_QUOTE_INCOMPLETE", "A quoted service line has an invalid return schedule.");
     }
-    const hasItemEstimate = [line.binItemCode, line.dumpItemCode, line.materialId, line.estimatedWeightKg]
+    const fixedPriceLine = line.pricingModel === "fixed_bin_customer_charge";
+    const hasItemEstimate = !fixedPriceLine && [line.binItemCode, line.dumpItemCode, line.materialId, line.estimatedWeightKg]
       .some((entry) => entry !== null && entry !== undefined && entry !== "");
-    const binItemCode = hasItemEstimate
+    const binItemCode = fixedPriceLine
+      ? localItemCode(line.binItemCode, `Quote service line ${index + 1} bin item`)
+      : hasItemEstimate
       ? localItemCode(line.binItemCode, `Quote service line ${index + 1} bin item`)
       : null;
-    const dumpItemCode = hasItemEstimate
+    const dumpItemCode = fixedPriceLine
+      ? null
+      : hasItemEstimate
       ? localItemCode(line.dumpItemCode, `Quote service line ${index + 1} dump item`)
       : null;
-    const materialId = hasItemEstimate
+    const materialId = fixedPriceLine
+      ? null
+      : hasItemEstimate
       ? requiredUuid(line.materialId, `Quote service line ${index + 1} material ID`)
       : null;
-    const estimatedWeightKg = hasItemEstimate
+    const estimatedWeightKg = fixedPriceLine
+      ? null
+      : hasItemEstimate
       ? safeNonnegativeInteger(line.estimatedWeightKg, `Quote service line ${index + 1} estimated weight`)
       : null;
     if (hasItemEstimate && (!estimatedWeightKg || estimatedWeightKg > 100_000)) {
@@ -2323,6 +2702,11 @@ function firstQuotedServiceLine(serviceLines) {
   return serviceLine;
 }
 
+/** @param {boolean} multiLine @param {string} contractNumber @param {number} lineNumber */
+function physicalBinReferencePrefix(multiLine, contractNumber, lineNumber) {
+  return multiLine ? `${contractNumber}-L${lineNumber}` : contractNumber;
+}
+
 /**
  * Materialize one physical-bin line without changing its contract siblings.
  * Every line owns a delivery and dependent collection chain, making the ready
@@ -2331,7 +2715,8 @@ function firstQuotedServiceLine(serviceLines) {
  * @param {object} input
  * @param {string} input.contractId
  * @param {string} input.contractNumber
- * @param {string} input.quoteId
+ * @param {string | null} input.quoteId
+ * @param {string | null} [input.sourceChargeRequestId]
  * @param {Record<string, any>} input.quoteRow
  * @param {Record<string, any>} input.line
  * @param {number} input.visitNumberStart
@@ -2346,9 +2731,11 @@ async function materializeContractServiceLine(input) {
   const serviceLineId = crypto.randomUUID();
   const deliveryVisitId = crypto.randomUUID();
   const returnVisitId = crypto.randomUUID();
-  const referencePrefix = input.multiLine
-    ? `${input.contractNumber}-L${input.line.lineNumber}`
-    : input.contractNumber;
+  const referencePrefix = physicalBinReferencePrefix(
+    input.multiLine,
+    input.contractNumber,
+    input.line.lineNumber
+  );
   const deliveryVisitReference = `${referencePrefix}-V1`;
   const returnVisitReference = `${referencePrefix}-V2`;
   const deliveryAt = input.line.proposedDeliveryAt;
@@ -2368,20 +2755,21 @@ async function materializeContractServiceLine(input) {
   const binTypeCode = String(binType.rows[0].type_code);
   const insertedLine = await query(
     `INSERT INTO mbt_contract_service_lines (
-       service_line_id, contract_id, source_quote_id, line_number, bin_type_id,
+       service_line_id, contract_id, source_quote_id, source_charge_request_id,
+       line_number, bin_type_id,
        bin_item_code, dump_item_code, material_id, estimated_weight_kg,
        customer_site_profile_id, site_snapshot, status,
        planned_delivery_at, planned_return_at, pricing_snapshot,
        customer_confirmation_status, waiver_snapshot, created_by, updated_by
      ) VALUES (
-       $1::uuid, $2::uuid, $3::uuid, $4, $5::uuid,
-       $6, $7, $8::uuid, $9, $10::uuid, $11::jsonb,
-       'scheduled', $12::timestamptz, $13::timestamptz, $14::jsonb,
-       'not_required', '{}'::jsonb, $15, $15
+       $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6::uuid,
+       $7, $8, $9::uuid, $10, $11::uuid, $12::jsonb,
+       'scheduled', $13::timestamptz, $14::timestamptz, $15::jsonb,
+       'not_required', '{}'::jsonb, $16, $16
      ) RETURNING *`,
     [
-      serviceLineId, input.contractId, input.quoteId, input.line.lineNumber,
-      input.line.binTypeId, binItemCode, dumpItemCode, materialId, estimatedWeightKg,
+      serviceLineId, input.contractId, input.quoteId, input.sourceChargeRequestId || null,
+      input.line.lineNumber, input.line.binTypeId, binItemCode, dumpItemCode, materialId, estimatedWeightKg,
       input.line.siteProfileId, JSON.stringify(input.line.siteSnapshot),
       iso(deliveryAt), iso(returnAt), JSON.stringify(linePricing), input.actorId
     ]
@@ -2403,6 +2791,8 @@ async function materializeContractServiceLine(input) {
     materialId,
     estimatedWeightKg,
     estimatedTonnes: estimatedWeightKg ? (estimatedWeightKg / 1000).toFixed(3) : null,
+    ...(linePricing.chargeRequestId ? { chargeRequestId: String(linePricing.chargeRequestId) } : {}),
+    ...(linePricing.attachedAggregate ? { attachedAggregate: linePricing.attachedAggregate } : {}),
     predecessorVisitId: null,
     dependencyKind: "none",
     dependentReturnVisitId: returnVisitId,
@@ -2506,6 +2896,190 @@ async function materializeContractServiceLine(input) {
   };
 }
 
+/**
+ * Materialize the operational side of one already-priced add-bin request.
+ * This is intentionally an internal transaction participant: the immutable
+ * customer-charge command owns confirmation, audit, and idempotency.
+ *
+ * @param {object} input
+ * @param {string} input.chargeRequestId
+ * @param {string} input.contractId
+ * @param {number} input.expectedContractRevision
+ * @param {Record<string, any>} input.calculation
+ * @param {Record<string, any>} input.binRate
+ * @param {Record<string, any> | null} input.attachedAggregate
+ * @param {string} input.actorId
+ */
+/** @param {Record<string, any>} result @param {number} expectedRevision */
+function pricedAddBinContract(result, expectedRevision) {
+  if (!result.rowCount) {
+    throw failure(404, "MBT_FRONTDESK_CONTRACT_NOT_FOUND", "The Front Desk contract was not found.");
+  }
+  const row = result.rows[0];
+  if (Number(row.revision) !== expectedRevision
+      || !["confirmed", "active", "return_due"].includes(String(row.status))) {
+    throw failure(409, "MBT_FRONTDESK_PRICE_STALE", "The contract changed after this request was priced.");
+  }
+  if (!row.quote_id) {
+    throw failure(422, "MBT_FRONTDESK_CONTRACT_INCOMPLETE", "The contract has no accepted route evidence for a new bin.");
+  }
+  return row;
+}
+
+/** @param {Record<string, any>} result */
+function pricedAddBinSite(result) {
+  if (!result.rowCount || !result.rows[0].customer_site_profile_id) {
+    throw failure(422, "MBT_FRONTDESK_CONTRACT_INCOMPLETE", "The contract has no service site for the new bin.");
+  }
+  return result.rows[0];
+}
+
+/** @param {Array<Record<string, any>>} visits */
+function pricedAddBinDeliveryVisit(visits) {
+  const deliveryVisit = visits.find((visit) => visit.serviceAction === "delivery");
+  if (!deliveryVisit) {
+    throw failure(422, "MBT_FRONTDESK_CONTRACT_INCOMPLETE", "The new bin has no delivery visit.");
+  }
+  return deliveryVisit;
+}
+
+/** @param {Record<string, any>} input */
+function pricedAddBinLinePricing(input) {
+  return {
+    schemaVersion: "mbt-frontdesk-priced-add-bin-v1",
+    chargeRequestId: input.chargeRequestId,
+    lineNumber: input.lineNumber,
+    binItemCode: input.binItemCode,
+    binTypeId: input.binTypeId,
+    contentCode: String(input.calculator.incomingContentCode || ""),
+    proposedDeliveryAt: iso(input.deliveryAt),
+    proposedReturnAt: iso(input.returnAt),
+    serviceCode: "delivery",
+    rateCardVersionId: String(input.contractRow.rate_card_version_id),
+    rateDistanceBandId: requiredUuid(input.itemEvidence.deliveryRateDistanceBandId, "Delivery distance rate ID"),
+    distance: {
+      provider: input.routeInputs.distance.provider,
+      providerMetres: Number(input.calculation.distanceMetres ?? input.routeInputs.distance.provider_metres),
+      routeHash: input.routeInputs.distance.route_hash,
+      originSnapshot: input.routeInputs.distance.origin_snapshot,
+      destinationSnapshot: input.routeInputs.distance.destination_snapshot,
+      routeSnapshot: input.routeInputs.distance.route_snapshot
+    },
+    currency: String(input.calculation.currency || "CAD"),
+    subtotalMinor: Number(input.calculation.preTaxRevenueMinor),
+    taxMinor: Number(input.calculation.addedHstMinor || 0),
+    totalMinor: Number(input.calculation.newRequestChargeableMinor),
+    lines: Array.isArray(input.calculation.lines) ? input.calculation.lines : [],
+    ...(input.attachedAggregate ? { attachedAggregate: input.attachedAggregate } : {})
+  };
+}
+
+/** @param {Record<string, any>} input */
+export async function materializeFrontdeskPricedAddBin(input) {
+  const chargeRequestId = requiredUuid(input.chargeRequestId, "Charge request ID");
+  const contractId = requiredUuid(input.contractId, "Contract ID");
+  const expectedContractRevision = positiveRevision(input.expectedContractRevision, "Expected contract revision");
+  const actorId = requiredText(input.actorId, "Actor operator ID");
+  const calculation = jsonObject(input.calculation, "Customer charge calculation");
+  const binRate = jsonObject(input.binRate, "Customer charge bin evidence");
+  const calculator = jsonObject(binRate.calculator, "Customer charge bin calculator evidence");
+  const schedule = jsonObject(binRate.schedule, "Customer charge schedule");
+  const itemEvidence = jsonObject(binRate.itemEvidence, "Customer charge item evidence");
+  const deliveryAt = timestamp(schedule.proposedDeliveryAt, "Proposed delivery time");
+  const returnAt = timestamp(schedule.proposedReturnAt, "Proposed return time");
+  if (returnAt <= deliveryAt) {
+    throw failure(400, "MBT_FRONTDESK_INPUT_INVALID", "The return time must follow delivery.");
+  }
+  const contractResult = await query(
+    "SELECT * FROM mbt_contracts WHERE contract_id = $1::uuid FOR UPDATE",
+    [contractId]
+  );
+  const contractRow = pricedAddBinContract(contractResult, expectedContractRevision);
+  const siteResult = await query(
+    `SELECT line.customer_site_profile_id::text, line.site_snapshot,
+            visit.billing_ownership
+       FROM mbt_contract_service_lines line
+       JOIN mbt_service_visits visit
+         ON visit.service_line_id = line.service_line_id
+        AND visit.service_action = 'delivery'
+      WHERE line.contract_id = $1::uuid
+      ORDER BY line.line_number, line.service_line_id
+      LIMIT 1`,
+    [contractId]
+  );
+  const siteRow = pricedAddBinSite(siteResult);
+  const sequenceResult = await query(
+    `SELECT COALESCE(max(line_number), 0)::int + 1 AS next_line_number,
+            COALESCE((SELECT max(visit_number) FROM mbt_service_visits WHERE contract_id = $1::uuid), 0)::int + 1 AS next_visit_number
+       FROM mbt_contract_service_lines
+      WHERE contract_id = $1::uuid`,
+    [contractId]
+  );
+  const quoteRow = await selectedQuote(String(contractRow.quote_id));
+  const routeInputs = await conversionRouteInputs(quoteRow);
+  const lineNumber = Number(sequenceResult.rows[0].next_line_number);
+  const visitNumberStart = Number(sequenceResult.rows[0].next_visit_number);
+  const binTypeId = requiredUuid(itemEvidence.incomingBinTypeId, "Incoming bin type ID");
+  const binItemCode = localItemCode(itemEvidence.binItemCode, "Incoming bin item");
+  const linePricing = pricedAddBinLinePricing({
+    chargeRequestId, lineNumber, binItemCode, binTypeId, calculator,
+    deliveryAt, returnAt, contractRow, itemEvidence, routeInputs,
+    calculation, attachedAggregate: input.attachedAggregate
+  });
+  const materialized = await materializeContractServiceLine({
+    contractId,
+    contractNumber: String(contractRow.contract_number),
+    quoteId: null,
+    sourceChargeRequestId: chargeRequestId,
+    quoteRow,
+    line: {
+      lineNumber,
+      binItemCode,
+      binTypeId,
+      dumpItemCode: null,
+      materialId: null,
+      estimatedWeightKg: null,
+      siteProfileId: String(siteRow.customer_site_profile_id),
+      siteSnapshot: jsonObject(siteRow.site_snapshot, "Contract service site"),
+      proposedDeliveryAt: deliveryAt,
+      proposedReturnAt: returnAt,
+      pricing: linePricing
+    },
+    visitNumberStart,
+    multiLine: true,
+    routeInputs,
+    customer: jsonObject(contractRow.customer_snapshot, "Contract customer snapshot"),
+    site: jsonObject(siteRow.site_snapshot, "Contract service site"),
+    billingOwnership: requiredText(siteRow.billing_ownership, "Billing ownership"),
+    actorId
+  });
+  const deliveryVisit = pricedAddBinDeliveryVisit(materialized.visits);
+  const billingCaseId = crypto.randomUUID();
+  const billing = await query(
+    `INSERT INTO mbt_billing_cases (
+       billing_case_id, case_type, contract_id, service_visit_id,
+       customer_netsuite_id, status, currency, created_by, updated_by
+     ) VALUES ($1::uuid, 'mbt_contract', $2::uuid, $3::uuid, $4::bigint,
+       'open', $5, $6, $6) RETURNING *`,
+    [billingCaseId, contractId, deliveryVisit.visitId, contractRow.customer_netsuite_id,
+      calculation.currency || "CAD", actorId]
+  );
+  const updatedContract = await updateContractLineScheduleRollup(contractId, actorId);
+  return {
+    schemaVersion: "mbt-frontdesk-priced-add-bin-operation-v1",
+    contract: publicContract(updatedContract.rows[0]),
+    serviceLine: materialized.serviceLine,
+    visits: materialized.visits,
+    billingCase: {
+      billingCaseId: String(billing.rows[0].billing_case_id),
+      serviceVisitId: String(deliveryVisit.visitId),
+      serviceLineId: String(materialized.serviceLine.serviceLineId),
+      status: String(billing.rows[0].status),
+      revision: Number(billing.rows[0].revision)
+    }
+  };
+}
+
 /** @param {number} physicalBinCount */
 function conversionSchemaVersion(physicalBinCount) {
   return physicalBinCount > 1
@@ -2516,6 +3090,59 @@ function conversionSchemaVersion(physicalBinCount) {
 /** @param {Record<string, unknown>} pricing */
 function quoteUsesLineOwnedSites(pricing) {
   return Array.isArray(pricing.serviceLines) && pricing.serviceLines.length > 0;
+}
+
+/** @param {Record<string, any>} pricing @param {string} quoteId @param {string} contractId @param {string} actorId */
+async function confirmConvertedInitialCharge(pricing, quoteId, contractId, actorId) {
+  if (pricing.pricingModel !== "fixed_bin_customer_charge" || !pricing.chargeRequestId) {
+    return null;
+  }
+  const result = await query(
+    `UPDATE mbt_frontdesk_charge_requests
+        SET contract_id = $3::uuid, status = 'confirmed', confirmed_at = now(),
+            confirmed_by = $4, revision = revision + 1,
+            updated_by = $4, updated_at = now()
+      WHERE charge_request_id = $1::uuid
+        AND source_quote_id = $2::uuid
+        AND request_kind = 'initial_bin'
+        AND status = 'draft'
+      RETURNING charge_request_id::text, request_number, status,
+                contract_id::text, request_total_minor, due_now_minor,
+                required_deposit_minor, currency, revision::int`,
+    [pricing.chargeRequestId, quoteId, contractId, actorId]
+  );
+  if (result.rowCount !== 1) {
+    throw failure(409, "MBT_FRONTDESK_PRICE_STALE", "The initial customer charge is missing or no longer draft.");
+  }
+  const row = result.rows[0];
+  return {
+    chargeRequestId: String(row.charge_request_id),
+    requestNumber: String(row.request_number),
+    status: String(row.status),
+    contractId: String(row.contract_id),
+    newRequestChargeableMinor: Number(row.request_total_minor),
+    dueNowMinor: Number(row.due_now_minor),
+    requiredDepositMinor: Number(row.required_deposit_minor),
+    currency: String(row.currency),
+    revision: Number(row.revision)
+  };
+}
+
+/** @param {Function | undefined} hook @param {Record<string, unknown>} payload */
+async function runFrontdeskConversionHook(hook, payload) {
+  if (typeof hook === "function") {
+    await hook(payload);
+  }
+}
+
+/** @param {Record<string, any> | null} chargeRequest */
+function convertedChargeRequestBody(chargeRequest) {
+  return chargeRequest ? { chargeRequest } : {};
+}
+
+/** @param {Record<string, any> | null} chargeRequest */
+function convertedChargeRequestAudit(chargeRequest) {
+  return chargeRequest ? { chargeRequestId: chargeRequest.chargeRequestId } : {};
 }
 
 /**
@@ -2535,10 +3162,7 @@ function quoteUsesLineOwnedSites(pricing) {
  */
 async function convertMultiLineFrontdeskQuote(input) {
   const lines = storedQuoteServiceLines(input.quoteRow, input.pricing);
-  const firstLine = lines[0];
-  if (!firstLine) {
-    throw failure(422, "MBT_FRONTDESK_QUOTE_INCOMPLETE", "The accepted quote has no physical-bin service lines.");
-  }
+  const firstLine = firstQuotedServiceLine(lines);
   const contractId = crypto.randomUUID();
   const contractNumber = publicNumber("MBT-C", contractId);
   const routeInputs = await conversionRouteInputs(input.quoteRow);
@@ -2577,13 +3201,13 @@ async function convertMultiLineFrontdeskQuote(input) {
       input.quoteRow.deposit_required_minor, input.quoteRow.currency, input.actorId
     ]
   );
-  if (typeof input.hooks.afterContractInsert === "function") {
-    await input.hooks.afterContractInsert({ contractId, quoteId: input.quoteId });
-  }
+  await runFrontdeskConversionHook(input.hooks.afterContractInsert, { contractId, quoteId: input.quoteId });
   const materialized = [];
   for (const line of lines) {
+    const linePricing = /** @type {Record<string, any>} */ (line.pricing);
     materialized.push(await materializeContractServiceLine({
       contractId, contractNumber, quoteId: input.quoteId, quoteRow: input.quoteRow,
+      sourceChargeRequestId: linePricing.chargeRequestId || null,
       line, visitNumberStart: ((line.lineNumber - 1) * 2) + 1, multiLine: true,
       routeInputs, customer: input.customer, site: input.site,
       billingOwnership: input.billingOwnership, actorId: input.actorId
@@ -2591,13 +3215,17 @@ async function convertMultiLineFrontdeskQuote(input) {
   }
   const visits = materialized.flatMap((/** @type {any} */ entry) => entry.visits);
   const serviceLines = materialized.map((entry) => entry.serviceLine);
+  const chargeRequest = await confirmConvertedInitialCharge(
+    input.pricing, input.quoteId, contractId, input.actorId
+  );
   const firstVisit = visits[0];
   if (!firstVisit) {
     throw failure(422, "MBT_FRONTDESK_CONTRACT_INCOMPLETE", "The local contract did not materialize a first service visit.");
   }
-  if (typeof input.hooks.afterVisitsInsert === "function") {
-    await input.hooks.afterVisitsInsert({ contractId, visits: visits.map(({ visitId }) => visitId) });
-  }
+  await runFrontdeskConversionHook(input.hooks.afterVisitsInsert, {
+    contractId,
+    visits: visits.map(({ visitId }) => visitId)
+  });
   const billingCases = [];
   for (const entry of materialized) {
     const deliveryVisit = entry.visits.find(({ serviceAction }) => serviceAction === "delivery");
@@ -2635,7 +3263,8 @@ async function convertMultiLineFrontdeskQuote(input) {
     schemaVersion: conversionSchemaVersion(lines.length),
     contract, serviceLines, visits,
     billingCase: primaryBillingCase,
-    billingCases
+    billingCases,
+    ...convertedChargeRequestBody(chargeRequest)
   };
   return {
     status: 201,
@@ -2648,6 +3277,7 @@ async function convertMultiLineFrontdeskQuote(input) {
       afterState: {
         quoteId: input.quoteId, status: "converted", revision: input.before.revision + 1,
         contractId, serviceLineIds: serviceLines.map(({ serviceLineId }) => serviceLineId),
+        ...convertedChargeRequestAudit(chargeRequest),
         visitIds: visits.map(({ visitId }) => visitId),
         billingCaseId: primaryBillingCase?.billingCaseId || null,
         billingCaseIds: billingCases.map(({ billingCaseId }) => billingCaseId)
@@ -3519,6 +4149,59 @@ function exchangeRouteFromDelivery(visit) {
   ];
 }
 
+/** @param {string} chargeMode @param {string | null} waiverReason @param {unknown} operatorId */
+function exchangeWaiverEvidence(chargeMode, waiverReason, operatorId) {
+  if (chargeMode !== "free_internal") {
+    return {};
+  }
+  return {
+    mode: "free_internal",
+    reason: waiverReason,
+    approvedBy: String(operatorId),
+    approvedAt: new Date().toISOString()
+  };
+}
+
+/** @param {string | null} sourceChargeRequestId @param {string | null} incomingContentCode @param {Record<string, unknown> | null} attachedAggregate */
+function exchangeChargeSnapshot(sourceChargeRequestId, incomingContentCode, attachedAggregate) {
+  return {
+    ...(sourceChargeRequestId ? { chargeRequestId: sourceChargeRequestId } : {}),
+    ...(incomingContentCode ? { contentCode: incomingContentCode } : {}),
+    ...(attachedAggregate ? { attachedAggregate } : {})
+  };
+}
+
+/** @param {boolean} sizeChanged @param {Record<string, any>} lineRow */
+function exchangeCustomerConfirmation(sizeChanged, lineRow) {
+  if (!sizeChanged) {
+    return {
+      status: String(lineRow.customer_confirmation_status),
+      reason: lineRow.customer_confirmation_reason
+    };
+  }
+  return {
+    status: "required",
+    reason: "Customer confirmation is required for the planned bin size change."
+  };
+}
+
+/** @param {Record<string, any>} input */
+async function recordFreeExchangeWaiver(input) {
+  if (input.chargeMode !== "free_internal") {
+    return;
+  }
+  await insertServiceLineEvent({
+    serviceLineId: input.serviceLineId,
+    contractId: input.contractId,
+    visitId: input.exchangeVisitId,
+    eventType: "charge_waiver",
+    before: {},
+    after: input.waiver,
+    reason: input.waiverReason || input.reason,
+    actorId: String(input.actorId)
+  });
+}
+
 /**
  * Insert an exchange between a physical delivery and its future collection.
  * A size change is intentionally customer-confirmation-required until Front
@@ -3540,6 +4223,18 @@ export async function exchangeFrontdeskServiceLine(input) {
     throw failure(400, "MBT_FRONTDESK_INPUT_INVALID", "Exchange window end must follow its start.");
   }
   const incomingBinTypeId = requiredUuid(input.incomingBinTypeId, "Incoming bin type ID");
+  const sourceChargeRequestId = input.sourceChargeRequestId
+    ? requiredUuid(input.sourceChargeRequestId, "Charge request ID")
+    : null;
+  const incomingContentCode = input.incomingContentCode
+    ? requiredText(input.incomingContentCode, "Incoming bin content").toLowerCase()
+    : null;
+  if (incomingContentCode && !["garbage", "soil", "asphalt", "concrete"].includes(incomingContentCode)) {
+    throw failure(400, "MBT_FRONTDESK_INPUT_INVALID", "Incoming bin content is not supported.");
+  }
+  const attachedAggregate = input.attachedAggregate
+    ? jsonObject(input.attachedAggregate, "Attached aggregate evidence")
+    : null;
   const chargeMode = requiredText(input.chargeMode ?? "charged", "Exchange charge mode");
   if (!["charged", "free_internal"].includes(chargeMode)) {
     throw failure(400, "MBT_FRONTDESK_INPUT_INVALID", "Exchange charge mode must be charged or free_internal.");
@@ -3551,7 +4246,8 @@ export async function exchangeFrontdeskServiceLine(input) {
   const payload = {
     contractId, serviceLineId, expectedRevision,
     exchangeWindow: { startAt: iso(startAt), endAt: iso(endAt) }, incomingBinTypeId,
-    chargeMode, waiverReason, reason
+    chargeMode, waiverReason, sourceChargeRequestId, incomingContentCode,
+    attachedAggregate, reason
   };
   return executeMbtCommand({
     actor, commandName: "mbt.frontdesk.service_line.exchange",
@@ -3606,9 +4302,13 @@ export async function exchangeFrontdeskServiceLine(input) {
       const amendmentId = crypto.randomUUID();
       const amendmentNumber = await nextContractAmendmentNumber(contractId);
       const sizeChanged = String(locked.lineRow.bin_type_id) !== incomingBinTypeId;
-      const waiver = chargeMode === "free_internal"
-        ? { mode: "free_internal", reason: waiverReason, approvedBy: String(actor.operatorId), approvedAt: new Date().toISOString() }
-        : {};
+      const waiver = exchangeWaiverEvidence(chargeMode, waiverReason, actor.operatorId);
+      const chargeSnapshot = exchangeChargeSnapshot(
+        sourceChargeRequestId,
+        incomingContentCode,
+        attachedAggregate
+      );
+      const customerConfirmation = exchangeCustomerConfirmation(sizeChanged, locked.lineRow);
       const amendmentResult = await query(
         `INSERT INTO mbt_contract_amendments (
            amendment_id, contract_id, amendment_number, amendment_type, status,
@@ -3637,7 +4337,8 @@ export async function exchangeFrontdeskServiceLine(input) {
         predecessorVisitId: String(deliveryVisit.service_visit_id), dependencyKind: "predecessor_completed",
         binItemCode: String(incomingType.rows[0].local_item_code),
         binTypeId: incomingBinTypeId, mandatoryStops: route,
-        customerConfirmationRequired: sizeChanged, chargeMode, waiver
+        customerConfirmationRequired: sizeChanged, chargeMode, waiver,
+        ...chargeSnapshot
       };
       const exchangeVisit = await insertServiceVisit({
         visitId: exchangeVisitId, contractId, visitNumber: exchangeVisitNumber,
@@ -3684,14 +4385,17 @@ export async function exchangeFrontdeskServiceLine(input) {
                 customer_confirmation_status = $3,
                 customer_confirmation_reason = $4,
                 customer_confirmation_requested_at = CASE WHEN $3 = 'required' THEN now() ELSE customer_confirmation_requested_at END,
-                waiver_snapshot = $5::jsonb, revision = revision + 1,
+                waiver_snapshot = $5::jsonb,
+                pricing_snapshot = pricing_snapshot || $8::jsonb,
+                revision = revision + 1,
                 updated_by = $6, updated_at = now()
           WHERE service_line_id = $1::uuid RETURNING *`,
         [
-          serviceLineId, incomingBinTypeId, sizeChanged ? "required" : String(locked.lineRow.customer_confirmation_status),
-          sizeChanged ? "Customer confirmation is required for the planned bin size change." : locked.lineRow.customer_confirmation_reason,
+          serviceLineId, incomingBinTypeId, customerConfirmation.status,
+          customerConfirmation.reason,
           JSON.stringify(waiver), String(actor.operatorId),
-          String(incomingType.rows[0].local_item_code)
+          String(incomingType.rows[0].local_item_code),
+          JSON.stringify(chargeSnapshot)
         ]
       );
       const updatedContract = await updateContractLineScheduleRollup(contractId, String(actor.operatorId));
@@ -3705,12 +4409,10 @@ export async function exchangeFrontdeskServiceLine(input) {
         serviceLineId, contractId, visitId: exchangeVisitId, eventType: "exchange",
         before, after: result, reason, actorId: String(actor.operatorId)
       });
-      if (chargeMode === "free_internal") {
-        await insertServiceLineEvent({
-          serviceLineId, contractId, visitId: exchangeVisitId, eventType: "charge_waiver",
-          before: {}, after: waiver, reason: waiverReason || reason, actorId: String(actor.operatorId)
-        });
-      }
+      await recordFreeExchangeWaiver({
+        chargeMode, serviceLineId, contractId, exchangeVisitId,
+        waiver, waiverReason, reason, actorId: actor.operatorId
+      });
       return {
         status: 201,
         body: { schemaVersion: "mbt-frontdesk-service-line-exchange-v1", ...result },

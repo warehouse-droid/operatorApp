@@ -7,6 +7,14 @@
  */
 export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
   Object.freeze({
+    runner: "run-customer-charge-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "src/mbt/customer-charge-calculator.js",
+      "src/mbt/customer-charge-request-service.js"
+    ])
+  }),
+  Object.freeze({
     runner: "run-dispatch-active-load-mutations.mjs",
     adminUrlEnvironment: null,
     sourcePaths: Object.freeze([
@@ -18,6 +26,16 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
     runner: "run-dispatch-performance-mutations.mjs",
     adminUrlEnvironment: null,
     sourcePaths: Object.freeze(["src/dispatch-planner-performance.js"])
+  }),
+  Object.freeze({
+    runner: "run-dispatch-save-recovery-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "public/dispatch.js",
+      "src/dispatch-plan-repository.js",
+      "src/dispatch-planner-v2-repository.js",
+      "src/server.js"
+    ])
   }),
   Object.freeze({
     runner: "run-frontdesk-mutations.mjs",

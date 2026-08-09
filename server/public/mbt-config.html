@@ -59,6 +59,14 @@
           tabindex="-1"
         >Rate Cards</button>
         <button
+          id="customerChargesTab"
+          type="button"
+          role="tab"
+          aria-selected="false"
+          aria-controls="customerChargesPanel"
+          tabindex="-1"
+        >Customer Charges</button>
+        <button
           id="netSuiteReadinessTab"
           type="button"
           role="tab"
@@ -374,6 +382,97 @@
             </table>
           </div>
         </section>
+      </section>
+      <section
+        id="customerChargesPanel"
+        class="mbt-readiness"
+        role="tabpanel"
+        aria-labelledby="customerChargesTab"
+        tabindex="0"
+        hidden
+      >
+        <div class="mbt-readiness-heading">
+          <div>
+            <p class="mbt-eyebrow">Local customer pricing</p>
+            <h2>Dump &amp; Aggregate Customer Charges</h2>
+            <p>Configure one complete charge sheet for a rate-card version. This saves local pricing only and creates no NetSuite work.</p>
+          </div>
+          <span class="mbt-local-badge">No external write</span>
+        </div>
+        <p id="customerChargesMessage" class="mbt-message" role="status" aria-live="polite">Select a rate card to load customer charges.</p>
+        <form id="customerChargeConfigurationForm" class="mbt-editor">
+          <div class="mbt-form-grid">
+            <label>Rate-card version
+              <select id="customerChargeRateCardVersion" required>
+                <option value="">Select a named rate card</option>
+              </select>
+            </label>
+            <label>Configuration revision
+              <input id="customerChargeConfigurationRevision" value="0" readonly />
+            </label>
+          </div>
+
+          <section class="mbt-rate-section" aria-labelledby="aggregateChargeRatesTitle">
+            <h3 id="aggregateChargeRatesTitle">Aggregate material charge per yard</h3>
+            <p>Enter all four material rates and operational density. A combined bin delivery or exchange adds one fixed CAD 50 loading fee.</p>
+            <div class="mbt-table-wrap" tabindex="0">
+              <table aria-label="Aggregate material customer charges">
+                <thead><tr><th>Material</th><th>CAD / yard</th><th>Density lb / yard</th></tr></thead>
+                <tbody id="aggregateChargeRateRows">
+                  <tr data-aggregate-charge-code="AGG_CLEAR_LIMESTONE_34"><td>3/4 Clear Limestone</td><td><input data-charge-amount-cad required inputmode="decimal" aria-label="3/4 Clear Limestone CAD per yard" /></td><td><input data-charge-density required type="number" min="1" step="1" aria-label="3/4 Clear Limestone density pounds per yard" /></td></tr>
+                  <tr data-aggregate-charge-code="AGG_CRUSHER_RUN"><td>Crusher Run</td><td><input data-charge-amount-cad required inputmode="decimal" aria-label="Crusher Run CAD per yard" /></td><td><input data-charge-density required type="number" min="1" step="1" aria-label="Crusher Run density pounds per yard" /></td></tr>
+                  <tr data-aggregate-charge-code="AGG_HPB"><td>HPB</td><td><input data-charge-amount-cad required inputmode="decimal" aria-label="HPB CAD per yard" /></td><td><input data-charge-density required type="number" min="1" step="1" aria-label="HPB density pounds per yard" /></td></tr>
+                  <tr data-aggregate-charge-code="AGG_SCREENING"><td>Screening</td><td><input data-charge-amount-cad required inputmode="decimal" aria-label="Screening CAD per yard" /></td><td><input data-charge-density required type="number" min="1" step="1" aria-label="Screening density pounds per yard" /></td></tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="mbt-rate-section" aria-labelledby="fixedDumpChargeRatesTitle">
+            <h3 id="fixedDumpChargeRatesTitle">Fixed dump price per bin</h3>
+            <p>Soil, asphalt, and concrete use one fixed charge for each 14YD bin. Garbage has no dumping-fee line.</p>
+            <div class="mbt-table-wrap" tabindex="0">
+              <table aria-label="Fixed dump customer charges">
+                <thead><tr><th>Content</th><th>CAD / bin</th></tr></thead>
+                <tbody id="fixedDumpChargeRateRows">
+                  <tr data-fixed-dump-charge-code="DUMP_SOIL"><td>Soil fixed dump charge</td><td><input data-charge-amount-cad required inputmode="decimal" aria-label="Soil fixed dump charge CAD per bin" /></td></tr>
+                  <tr data-fixed-dump-charge-code="DUMP_ASPHALT"><td>Asphalt fixed dump charge</td><td><input data-charge-amount-cad required inputmode="decimal" aria-label="Asphalt fixed dump charge CAD per bin" /></td></tr>
+                  <tr data-fixed-dump-charge-code="DUMP_CONCRETE"><td>Concrete fixed dump charge</td><td><input data-charge-amount-cad required inputmode="decimal" aria-label="Concrete fixed dump charge CAD per bin" /></td></tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="mbt-rate-section" aria-labelledby="aggregateDistanceRatesTitle">
+            <div class="mbt-section-heading">
+              <div>
+                <h3 id="aggregateDistanceRatesTitle">Standalone aggregate delivery</h3>
+                <p>The enforced standard is CAD 150 through 30 km. Each later contiguous band must increase.</p>
+              </div>
+              <button id="addAggregateDistanceBandButton" type="button" class="mbt-button-secondary">Add distance band</button>
+            </div>
+            <div class="mbt-table-wrap" tabindex="0">
+              <table aria-label="Standalone aggregate distance charges">
+                <thead><tr><th>Code</th><th>From km</th><th>Through km</th><th>CAD</th><th>Action</th></tr></thead>
+                <tbody id="aggregateDistanceBandRows">
+                  <tr data-aggregate-distance-band data-base-band="true">
+                    <td><input data-band-code value="AGG_0_30" readonly aria-label="Base distance band code" /></td>
+                    <td><input data-band-minimum-km value="0" readonly aria-label="Base distance from kilometres" /></td>
+                    <td><input data-band-maximum-km value="30" readonly aria-label="Base distance through kilometres" /></td>
+                    <td><input data-band-amount-cad value="150.00" readonly aria-label="Base distance charge CAD" /></td>
+                    <td>Required</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <p>Cash treats configured prices as tax-included. Non-cash treats the same entries as pre-tax and adds 13% HST once.</p>
+          <label>Audit reason<textarea id="customerChargeConfigurationReason" required maxlength="2000" rows="3">Configure dump and aggregate customer charges</textarea></label>
+          <div class="mbt-form-actions">
+            <button type="submit">Save complete customer-charge sheet</button>
+          </div>
+        </form>
       </section>
       <section
         id="netSuiteReadinessPanel"

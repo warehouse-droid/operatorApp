@@ -75,7 +75,7 @@ test("full baseline resolution rejects an omitted eligible harness unless it has
   }, packageScripts, "full"));
 });
 
-test("the real full baseline freezes 129 exhaustive harnesses plus documented exclusions", async () => {
+test("the real full baseline freezes 133 exhaustive harnesses plus documented exclusions", async () => {
   const [manifestSource, packageSource] = await Promise.all([
     readFile(path.join(serverRoot, "test/baseline-harnesses.json"), "utf8"),
     readFile(path.join(serverRoot, "package.json"), "utf8")
@@ -84,8 +84,8 @@ test("the real full baseline freezes 129 exhaustive harnesses plus documented ex
   const packageJson = JSON.parse(packageSource);
   const resolved = resolveHarnessProfile(manifest, packageJson.scripts || {}, "full");
 
-  assert.equal(resolved.length, 129);
-  assert.equal(new Set(resolved.map(({ name }) => name)).size, 129);
+  assert.equal(resolved.length, 133);
+  assert.equal(new Set(resolved.map(({ name }) => name)).size, 133);
   assert.deepEqual(Object.keys(manifest.excluded).sort(), [
     "test:netsuite-restlet-live",
     "test:smart-scm"

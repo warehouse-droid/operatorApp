@@ -12,8 +12,10 @@ const repoRoot = path.resolve(process.env.MBBS_REPO_ROOT || path.resolve(serverR
 const CHECKOUT_SHA = "11d5960a326750d5838078e36cf38b85af677262";
 const UPLOAD_ARTIFACT_SHA = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
 const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
+  "run-customer-charge-mutations.mjs",
   "run-dispatch-active-load-mutations.mjs",
   "run-dispatch-performance-mutations.mjs",
+  "run-dispatch-save-recovery-mutations.mjs",
   "run-frontdesk-mutations.mjs",
   "run-p310-adversarial-mutations.mjs",
   "run-p310-reconciliation-mutations.mjs",

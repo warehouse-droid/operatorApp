@@ -20,11 +20,14 @@ const CONTRACT_ID = "00000000-0000-4000-8000-000000000142";
 const DELIVERY_VISIT_ID = "00000000-0000-4000-8000-000000000143";
 const RETURN_VISIT_ID = "00000000-0000-4000-8000-000000000144";
 const BILLING_CASE_ID = "00000000-0000-4000-8000-000000000145";
+const SERVICE_LINE_ID = "00000000-0000-4000-8000-000000000146";
+const CHARGE_REQUEST_ID = "00000000-0000-4000-8000-000000000147";
 
 const CUSTOMER = Object.freeze({
   customerNetsuiteId: CUSTOMER_ID,
   entityNumber: "SYN137",
   displayName: "Synthetic Pilot Customer",
+  phone: "416-555-0137",
   currency: "CAD",
   serviceReady: true,
   sites: [{
@@ -41,15 +44,33 @@ const CUSTOMER = Object.freeze({
 });
 
 const PRICING = Object.freeze({
+  pricingModel: "fixed_bin_customer_charge",
+  chargeRequestId: CHARGE_REQUEST_ID,
+  paymentMethod: "cash",
+  paymentCategory: "cash",
+  taxMode: "included",
+  taxRateBasisPoints: 1_300,
   currency: "CAD",
   distanceMetres: 12_500,
-  subtotalMinor: 47_500,
-  taxMinor: 6_175,
-  totalMinor: 53_675,
+  currentContractTotalMinor: 0,
+  preTaxRevenueMinor: 55_088,
+  includedHstMinor: 7_162,
+  addedHstMinor: 0,
+  subtotalMinor: 55_088,
+  taxMinor: 0,
+  totalMinor: 62_250,
+  customerTotalMinor: 62_250,
+  requiredDepositMinor: 10_000,
+  dueNowMinor: 24_750,
+  netsuiteExportPolicy: "excluded_cash",
+  netsuiteReadySnapshot: null,
+  rateCardVersionId: RATE_VERSION_ID,
+  deliveryItemCode: "DELIVERY_CROSS_CHARGE",
   lines: [
-    { code: "bin_base_rental", label: "14-day rental", amountMinor: 35_000 },
-    { code: "estimated_dump_weight", label: "Garbage · 1.000 t estimated", amountMinor: 0 },
-    { code: "one_way_delivery", label: "One-way delivery", amountMinor: 12_500 }
+    { lineCode: "initial_bin_bin_rental", label: "14YD bin", customerAmountMinor: 35_000 },
+    { lineCode: "initial_bin_bin_transport", label: "One-way bin transport", customerAmountMinor: 12_500 },
+    { lineCode: "aggregate_agg_hpb", label: "HPB", customerAmountMinor: 9_750 },
+    { lineCode: "aggregate_loading_fee", label: "Aggregate loading fee", customerAmountMinor: 5_000 }
   ]
 });
 
@@ -120,6 +141,23 @@ function quote(status, revision, additions = {}) {
 }
 
 function conversion() {
+  const serviceLine = {
+    serviceLineId: SERVICE_LINE_ID,
+    lineNumber: 1,
+    binTypeId: BIN_TYPE_ID,
+    binTypeCode: "14YD",
+    binItemCode: "14YD",
+    status: "scheduled",
+    revision: 1,
+    plannedDeliveryAt: "2037-08-03T12:00:00.000Z",
+    plannedReturnAt: "2037-08-17T12:00:00.000Z",
+    site: CUSTOMER.sites[0],
+    pricing: {
+      contentCode: "garbage",
+      deliveryItemCode: "DELIVERY_CROSS_CHARGE",
+      chargeRequestId: CHARGE_REQUEST_ID
+    }
+  };
   return {
     schemaVersion: "mbt-frontdesk-conversion-v1",
     contract: {
@@ -131,6 +169,7 @@ function conversion() {
       customer: CUSTOMER,
       pricing: PRICING
     },
+    serviceLines: [serviceLine],
     visits: [
       {
         visitId: DELIVERY_VISIT_ID,
@@ -186,8 +225,8 @@ async function installFrontdeskApi(page) {
     })],
     ["GET /api/mbt/frontdesk/configuration", async (route) => fulfillJson(route, 200, {
       schemaVersion: "mbt-frontdesk-configuration-v1",
-      binItems: [{ itemCode: "14YD", binTypeId: BIN_TYPE_ID, typeCode: "14YD", displayName: "14 yard" }],
-      binTypes: [{ itemCode: "14YD", binTypeId: BIN_TYPE_ID, typeCode: "14YD", displayName: "14 yard" }],
+      binItems: [{ itemCode: "14YD", binTypeId: BIN_TYPE_ID, typeCode: "14YD", displayName: "14 yard", nominalYards: 14 }],
+      binTypes: [{ itemCode: "14YD", binTypeId: BIN_TYPE_ID, typeCode: "14YD", displayName: "14 yard", nominalYards: 14 }],
       deliveryItems: [{ itemCode: "DELIVERY_CROSS_CHARGE", displayName: "Delivery Charge - MBT" }],
       dumpItems: [{ itemCode: "DUMP", displayName: "Garbage" }],
       surchargeItems: [{ itemCode: "DOWNTOWN", displayName: "Downtown surcharge" }],
@@ -197,6 +236,34 @@ async function installFrontdeskApi(page) {
         templateVersionId: TEMPLATE_VERSION_ID,
         rateCardVersionId: RATE_VERSION_ID,
         defaultRentalCalendarDays: 14
+      }]
+    })],
+    ["GET /api/mbt/frontdesk/customer-charge/configuration", async (route) => fulfillJson(route, 200, {
+      schemaVersion: "mbt-frontdesk-customer-charge-configuration-v1",
+      rateCardVersionId: RATE_VERSION_ID,
+      paymentMethods: ["cash", "card", "debit", "e_transfer", "cheque", "account"],
+      binContents: [
+        { contentCode: "garbage", displayName: "Garbage", allowedBinSizesYards: [14, 20, 40], dumpPricing: "none" },
+        { contentCode: "soil", displayName: "Soil", allowedBinSizesYards: [14], dumpPricing: "fixed_per_bin" },
+        { contentCode: "asphalt", displayName: "Asphalt", allowedBinSizesYards: [14], dumpPricing: "fixed_per_bin" },
+        { contentCode: "concrete", displayName: "Concrete", allowedBinSizesYards: [14], dumpPricing: "fixed_per_bin" }
+      ],
+      aggregateItems: [{
+        itemCode: "AGG_HPB",
+        displayName: "HPB",
+        unitOfMeasure: "YARD",
+        unitAmountMinor: 6_500,
+        densityLbsPerYard: 2_600
+      }],
+      fixedDumpItems: [],
+      aggregateLoadingFeeMinor: 5_000,
+      aggregateDistanceBands: [{
+        aggregateDistanceBandId: "00000000-0000-4000-8000-000000000148",
+        bandCode: "AGG_0_30",
+        minimumMetres: 0,
+        maximumMetres: 30_000,
+        amountMinor: 15_000,
+        currency: "CAD"
       }]
     })],
     ["GET /api/mbt/frontdesk/customers", async (route) => fulfillJson(route, 200, {
@@ -252,10 +319,16 @@ async function installFrontdeskApi(page) {
       {
         schemaVersion: "mbt-frontdesk-contract-v1",
         contract: state.converted?.contract,
-        visits: state.converted?.visits || []
+        serviceLines: state.converted?.serviceLines || [],
+        visits: state.converted?.visits || [],
+        amendments: state.converted?.amendments || []
       }
     )],
-    [`POST /api/mbt/frontdesk/contracts/${CONTRACT_ID}/extensions`, async (route) => {
+    [`GET /api/mbt/frontdesk/contracts/${CONTRACT_ID}/charge-requests`, async (route) => fulfillJson(route, 200, {
+      schemaVersion: "mbt-frontdesk-contract-charge-requests-v1",
+      items: []
+    })],
+    [`POST /api/mbt/frontdesk/contracts/${CONTRACT_ID}/service-lines/${SERVICE_LINE_ID}/extensions`, async (route) => {
       const captured = capturedCall(route.request());
       calls.push(captured);
       const prior = conversion();
@@ -265,20 +338,28 @@ async function installFrontdeskApi(page) {
         scheduledStartAt: captured.body.returnWindow.startAt,
         scheduledEndAt: captured.body.returnWindow.endAt
       };
+      const amendment = {
+        amendmentId: "00000000-0000-4000-8000-000000000149",
+        amendmentNumber: 1,
+        amendmentType: "extension",
+        status: "approved"
+      };
       state.converted = {
         ...prior,
         contract: { ...prior.contract, revision: 2 },
-        visits: [prior.visits[0], amendedReturn]
+        serviceLines: [{
+          ...prior.serviceLines[0],
+          revision: 2,
+          plannedReturnAt: captured.body.returnWindow.startAt
+        }],
+        visits: [prior.visits[0], amendedReturn],
+        amendments: [amendment]
       };
       await fulfillJson(route, 200, {
-        schemaVersion: "mbt-frontdesk-extension-v1",
+        schemaVersion: "mbt-frontdesk-service-line-extension-v1",
         contract: state.converted.contract,
-        amendment: {
-          amendmentId: "00000000-0000-4000-8000-000000000146",
-          amendmentNumber: 1,
-          amendmentType: "extension",
-          status: "approved"
-        },
+        serviceLine: state.converted.serviceLines[0],
+        amendment,
         returnVisit: amendedReturn
       });
     }]
@@ -309,18 +390,25 @@ async function completeSyntheticConversion(page) {
   await page.getByRole("button", { name: "Add new order" }).click();
   await expect(page.getByRole("dialog", { name: "Choose the work type" })).toBeVisible();
   await page.getByRole("combobox", { name: "Order type" }).selectOption("bin");
-  await page.getByRole("combobox", { name: "BIN item" }).selectOption("14YD");
-  await page.getByRole("combobox", { name: "Dump item" }).selectOption("DUMP");
-  await page.getByRole("spinbutton", { name: "Estimated tonnes" }).fill("1.000");
-  await page.getByRole("combobox", { name: "BIN service site" }).selectOption(SITE_ID);
-  await page.getByRole("combobox", { name: "BIN workflow" }).selectOption("delivery");
-  await page.getByRole("combobox", { name: "One-way delivery fee" }).selectOption("DELIVERY_CROSS_CHARGE");
-  await page.getByLabel("Delivery date and time").fill("2037-08-03T12:00");
-  await page.getByLabel("Return date and time").fill("2037-08-17T12:00");
-  await page.getByRole("button", { name: "Create draft BIN quote" }).click();
+  await page.getByRole("button", { name: "Continue to BIN pricing" }).click();
+  const pricingDialog = page.getByRole("dialog", { name: "New BIN contract price" });
+  await expect(pricingDialog).toBeVisible();
+  await pricingDialog.getByRole("combobox", { name: "Payment method" }).selectOption("cash");
+  await pricingDialog.getByRole("combobox", { name: "Contents" }).selectOption("garbage");
+  await pricingDialog.getByRole("combobox", { name: "BIN item" }).selectOption("14YD");
+  await pricingDialog.getByRole("combobox", { name: "BIN workflow" }).selectOption("delivery");
+  await pricingDialog.getByRole("combobox", { name: "One-way delivery fee" }).selectOption("DELIVERY_CROSS_CHARGE");
+  await pricingDialog.getByLabel("Delivery date and time").fill("2037-08-03T12:00");
+  await pricingDialog.getByLabel("Return date and time").fill("2037-08-17T12:00");
+  await pricingDialog.getByRole("checkbox", { name: /Order from 150/ }).check();
+  await pricingDialog.getByRole("button", { name: "Add aggregate material" }).click();
+  await pricingDialog.getByRole("combobox", { name: "Aggregate material" }).selectOption("AGG_HPB");
+  await pricingDialog.getByRole("spinbutton", { name: "Quantity (yards)" }).fill("1.500");
+  await pricingDialog.getByRole("button", { name: "Calculate charge" }).click();
   await expect(page.getByRole("heading", { name: "Quote MBT-Q-SYN-0137" })).toBeVisible();
-  await expect(page.getByText("$536.75", { exact: true })).toBeVisible();
-  await expect(page.getByText("12.5 km", { exact: true })).toBeVisible();
+  await expect(page.getByText("$622.50", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("Included HST", { exact: true })).toBeVisible();
+  await expect(page.getByText("Aggregate loading fee", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Issue quote" }).click();
   await page.getByRole("button", { name: "Accept quote" }).click();
   await page.getByRole("button", { name: "Convert to contract" }).click();
@@ -348,10 +436,10 @@ test("P3-F13 browser: accessible quote-to-contract flow keeps search focus and e
   await expect(page.getByRole("heading", { name: "Front Desk", exact: true })).toBeVisible();
   await completeSyntheticConversion(page);
 
-  await expect(page.getByText("Initial delivery")).toBeVisible();
-  await expect(page.getByText("Ready · Front leg")).toBeVisible();
-  await expect(page.getByText("Return bin")).toBeVisible();
-  await expect(page.getByText("Tentative · waits for Initial delivery")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Initial delivery" })).toBeVisible();
+  await expect(page.getByText("ready", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Return bin" })).toBeVisible();
+  await expect(page.getByText("tentative", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: /Post to NetSuite/i })).toHaveCount(0);
   await expect(page.getByRole("button", { name: /Create Sales Order/i })).toHaveCount(0);
   await expect(page.getByRole("button", { name: /Record customer deposit/i })).toHaveCount(0);
@@ -365,11 +453,16 @@ test("P3-F13 browser: accessible quote-to-contract flow keeps search focus and e
   expect(calls.map(({ body }) => body.expectedRevision ?? null)).toEqual([null, 1, 2, 3]);
   expect(calls[0].body.serviceLines).toEqual([expect.objectContaining({
     binItemCode: "14YD",
-    dumpItemCode: "DUMP",
-    estimatedTonnes: "1.000"
+    contentCode: "garbage",
+    discountMinor: 0
   })]);
+  expect(calls[0].body.paymentMethod).toBe("cash");
+  expect(calls[0].body.orderFrom150).toBe(true);
+  expect(calls[0].body.aggregateLines).toEqual([{ itemCode: "AGG_HPB", quantityYards: "1.500" }]);
+  expect(calls[0].body).not.toHaveProperty("estimatedTonnes");
   expect(calls[0].body.deliveryItemCode).toBe("DELIVERY_CROSS_CHARGE");
-  expect(calls[0].body.surcharges).toEqual([]);
+  expect(calls[0].body.billingAddressText).toContain("100 Test Route");
+  expect(calls[0].body.contractTelephone).toBe("416-555-0137");
   expect(calls.every(({ idempotencyKey }) => typeof idempotencyKey === "string" && idempotencyKey.length > 0)).toBe(true);
   expect(calls.some(({ path }) => /netsuite|sales.?order|deposit|post/i.test(path))).toBe(false);
 
@@ -389,17 +482,21 @@ test("P3-F14 browser: mobile extension edits only the future return and preserve
   await page.getByRole("button", { name: "Extend return" }).click();
   const dialog = page.getByRole("dialog", { name: "Extend return visit" });
   await expect(dialog).toBeVisible();
-  await dialog.getByLabel("New return date and time").fill("2037-08-24T12:00");
-  await dialog.getByLabel("Return window end").fill("2037-08-24T16:00");
-  await dialog.getByLabel("Audit reason").fill("Synthetic customer requested one more week");
+  await dialog.getByLabel("Window start").fill("2037-08-24T12:00");
+  await dialog.getByLabel("Window end").fill("2037-08-24T16:00");
+  await dialog.getByLabel("Approval reason").fill("Synthetic customer requested one more week");
   await dialog.getByRole("button", { name: "Approve extension" }).click();
 
-  await expect(page.getByText("Initial delivery")).toBeVisible();
-  await expect(page.getByText("03 Aug 2037", { exact: false })).toBeVisible();
-  await expect(page.getByText("Return bin")).toBeVisible();
-  await expect(page.getByText("24 Aug 2037", { exact: false })).toBeVisible();
+  const deliveryVisit = page.locator(".mbt-visit-card").filter({
+    has: page.getByRole("heading", { name: "Initial delivery" })
+  });
+  const returnVisit = page.locator(".mbt-visit-card").filter({
+    has: page.getByRole("heading", { name: "Return bin" })
+  });
+  await expect(deliveryVisit).toContainText("03 Aug 2037");
+  await expect(returnVisit).toContainText("24 Aug 2037");
   await expect(page.getByText("Approved extension 1")).toBeVisible();
-  expect(calls.at(-1).path).toBe(`/api/mbt/frontdesk/contracts/${CONTRACT_ID}/extensions`);
+  expect(calls.at(-1).path).toBe(`/api/mbt/frontdesk/contracts/${CONTRACT_ID}/service-lines/${SERVICE_LINE_ID}/extensions`);
   expect(calls.at(-1).body.expectedRevision).toBe(1);
   expect(calls.at(-1).body.reason).toBe("Synthetic customer requested one more week");
   expect(await page.evaluate(() => (

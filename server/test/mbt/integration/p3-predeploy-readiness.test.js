@@ -116,7 +116,9 @@ test("P3.12: deployment readiness requires every Phase 3 migration and exactly n
     "137_dispatch_planner_followup_progress.sql",
     "138_smart_scm_authoritative_on_order.sql",
     "139_sales_order_reload_cycles.sql",
-    "140_driver_yard_dependency_soft_mode.sql"
+    "140_driver_yard_dependency_soft_mode.sql",
+    "141_transfer_dependency_revision_reprint.sql",
+    "142_mbt_frontdesk_customer_charge_requests.sql"
   ]);
   assert.deepEqual(REQUIRED_MBT_P3_FLAGS, EXPECTED_FLAGS);
   const rows = EXPECTED_FLAGS.map((flag_key) => ({ flag_key, enabled: false }));

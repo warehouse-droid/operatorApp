@@ -109,6 +109,28 @@ function rateDetail(currentVersion = version()) {
   };
 }
 
+function customerChargeConfiguration(revision = 0) {
+  return {
+    schemaVersion: "mbt-frontdesk-customer-charge-admin-configuration-v1",
+    rateCardVersionId: VERSION_ID,
+    revision,
+    complete: revision > 0,
+    aggregateLoadingFeeMinor: 5_000,
+    aggregateItems: [
+      { itemCode: "AGG_CLEAR_LIMESTONE_34", amountMinor: null, densityLbsPerYard: null },
+      { itemCode: "AGG_CRUSHER_RUN", amountMinor: null, densityLbsPerYard: null },
+      { itemCode: "AGG_HPB", amountMinor: null, densityLbsPerYard: null },
+      { itemCode: "AGG_SCREENING", amountMinor: null, densityLbsPerYard: null }
+    ],
+    fixedDumpItems: [
+      { itemCode: "DUMP_SOIL", amountMinor: null },
+      { itemCode: "DUMP_ASPHALT", amountMinor: null },
+      { itemCode: "DUMP_CONCRETE", amountMinor: null }
+    ],
+    aggregateDistanceBands: []
+  };
+}
+
 async function handleConfigReads(route, request, path, state) {
   if (path === "/api/auth/me") {
     await json(route, { operator: { roles: ["admin"] } });
@@ -203,11 +225,35 @@ async function handleRateCardRequests(route, request, path, calls, state) {
   return false;
 }
 
+async function handleCustomerChargeRequests(route, request, path, calls, state) {
+  if (path !== `/api/mbt/config/customer-charges/${VERSION_ID}`) {
+    return false;
+  }
+  if (request.method() === "GET") {
+    await json(route, state.customerChargeConfiguration);
+    return true;
+  }
+  if (request.method() === "PUT") {
+    const body = request.postDataJSON();
+    calls.push({ path, body });
+    state.customerChargeConfiguration = {
+      ...customerChargeConfiguration(Number(body.expectedRevision) + 1),
+      aggregateItems: body.aggregateItems,
+      fixedDumpItems: body.fixedDumpItems,
+      aggregateDistanceBands: body.aggregateDistanceBands
+    };
+    await json(route, { configuration: state.customerChargeConfiguration }, 201);
+    return true;
+  }
+  return false;
+}
+
 async function installConfigApi(page) {
   const calls = [];
   const state = {
     sites: [],
-    currentVersion: version()
+    currentVersion: version(),
+    customerChargeConfiguration: customerChargeConfiguration()
   };
   await page.route("**/api/**", async (route) => {
     const request = route.request();
@@ -219,6 +265,9 @@ async function installConfigApi(page) {
       return;
     }
     if (await handleRateCardRequests(route, request, path, calls, state)) {
+      return;
+    }
+    if (await handleCustomerChargeRequests(route, request, path, calls, state)) {
       return;
     }
     await json(route, { error: `Unexpected browser route: ${request.method()} ${path}` }, 404);
@@ -237,6 +286,58 @@ async function openConfig(page) {
   await page.goto("/mbt/config");
   await expect(page.locator(".mbt-status")).toHaveAttribute("aria-busy", "false");
 }
+
+test("customer-charge editor saves four per-yard rates, fixed per-bin dumps, and increasing delivery bands", async ({ page }) => {
+  const calls = await installConfigApi(page);
+  await openConfig(page);
+
+  await page.getByRole("tab", { name: "Customer Charges" }).click();
+  await expect(page.locator("#customerChargesPanel")).toBeVisible();
+  await expect(page.locator("#customerChargeRateCardVersion")).toHaveValue(VERSION_ID);
+  await expect(page.locator("#customerChargesMessage")).toContainText("no complete customer-charge sheet");
+
+  const aggregateRows = page.locator("#aggregateChargeRateRows tr");
+  const aggregateValues = [
+    ["52.50", "2700"],
+    ["48.00", "2850"],
+    ["65.00", "2600"],
+    ["42.00", "2750"]
+  ];
+  for (const [index, [amount, density]] of aggregateValues.entries()) {
+    await aggregateRows.nth(index).locator("[data-charge-amount-cad]").fill(amount);
+    await aggregateRows.nth(index).locator("[data-charge-density]").fill(density);
+  }
+  const dumpRows = page.locator("#fixedDumpChargeRateRows tr");
+  for (const [index, amount] of ["850.00", "725.00", "925.00"].entries()) {
+    await dumpRows.nth(index).locator("[data-charge-amount-cad]").fill(amount);
+  }
+  await page.locator("#addAggregateDistanceBandButton").click();
+  const distanceRows = page.locator("#aggregateDistanceBandRows tr");
+  await expect(distanceRows).toHaveCount(2);
+  await distanceRows.nth(1).locator("[data-band-code]").fill("AGG_30_PLUS");
+  await distanceRows.nth(1).locator("[data-band-amount-cad]").fill("200.00");
+  await page.locator("#customerChargeConfigurationReason").fill("Browser-approved real-rate setup");
+  await page.locator("#customerChargeConfigurationForm button[type='submit']").click();
+  await expect(page.locator("#customerChargesMessage")).toContainText("saved at revision 1");
+
+  const save = calls.find((call) => call.path === `/api/mbt/config/customer-charges/${VERSION_ID}`);
+  expect(save.body.expectedRevision).toBe(0);
+  expect(save.body.aggregateItems).toEqual([
+    { itemCode: "AGG_CLEAR_LIMESTONE_34", amountMinor: 5_250, densityLbsPerYard: 2_700 },
+    { itemCode: "AGG_CRUSHER_RUN", amountMinor: 4_800, densityLbsPerYard: 2_850 },
+    { itemCode: "AGG_HPB", amountMinor: 6_500, densityLbsPerYard: 2_600 },
+    { itemCode: "AGG_SCREENING", amountMinor: 4_200, densityLbsPerYard: 2_750 }
+  ]);
+  expect(save.body.fixedDumpItems).toEqual([
+    { itemCode: "DUMP_SOIL", amountMinor: 85_000 },
+    { itemCode: "DUMP_ASPHALT", amountMinor: 72_500 },
+    { itemCode: "DUMP_CONCRETE", amountMinor: 92_500 }
+  ]);
+  expect(save.body.aggregateDistanceBands).toEqual([
+    { bandCode: "AGG_0_30", minimumMetres: 0, maximumMetres: 30_000, amountMinor: 15_000 },
+    { bandCode: "AGG_30_PLUS", minimumMetres: 30_000, maximumMetres: null, amountMinor: 20_000 }
+  ]);
+});
 
 test("P4 browser: dump sites and item-owned pricing use only the charging fields allowed by each item", async ({ page }) => {
   const calls = await installConfigApi(page);
@@ -345,19 +446,29 @@ test("P4 browser: dump sites and item-owned pricing use only the charging fields
     { isoWeekday: 1, opensAt: "07:00", closesAt: "17:00" },
     { isoWeekday: 6, opensAt: "08:00", closesAt: "12:00" }
   ]));
-  expect(creates[0].body.graph.rateCard.itemCode).toBe("DELIVERY_CROSS_CHARGE");
-  expect(creates[0].body.graph.components).toEqual([]);
-  expect(creates[0].body.graph.dumpTariffs).toEqual([]);
+  // Multi-item rate cards leave the header unowned; child rows retain item ownership.
+  expect(creates[0].body.graph.rateCard.itemCode).toBeNull();
+  expect(creates[0].body.graph.components).toEqual(expect.arrayContaining([
+    expect.objectContaining({ itemCode: "14YD", componentKind: "rental", amountMinor: 10000 }),
+    expect.objectContaining({ itemCode: "14YD", componentKind: "extension", amountMinor: 1000 })
+  ]));
+  expect(creates[0].body.graph.components).toHaveLength(2);
+  expect(creates[0].body.graph.dumpTariffs).toEqual([
+    expect.objectContaining({ itemCode: "CLEAN_FILL", amountMinor: 17500, minimumAmountMinor: 2000 })
+  ]);
   expect(creates[0].body.graph.distanceBands).toEqual(expect.arrayContaining([
     expect.objectContaining({ itemCode: "DELIVERY_CROSS_CHARGE", minimumMetres: 0, maximumMetres: 10000 }),
     expect.objectContaining({ itemCode: "DELIVERY_CROSS_CHARGE", minimumMetres: 10000, maximumMetres: null })
   ]));
+  expect(creates[0].body.graph.distanceBands).toHaveLength(2);
   const updates = calls.filter((call) => call.path === `/api/mbt/config/rate-cards/${VERSION_ID}`);
-  expect(updates.at(-1).body.graph.rateCard.itemCode).toBe("14YD");
+  expect(updates.at(-1).body.graph.rateCard.itemCode).toBeNull();
   expect(updates.at(-1).body.graph.components).toEqual(expect.arrayContaining([
     expect.objectContaining({ itemCode: "14YD", componentKind: "rental", amountMinor: 12000 })
   ]));
   expect(calls.some((call) => call.path.endsWith("/clone"))).toBe(true);
-  const overflow = await page.evaluate(() => globalThis.document.documentElement.scrollWidth - globalThis.document.documentElement.clientWidth);
+  const overflow = await page.evaluate(() => (
+    globalThis.document.documentElement.scrollWidth - globalThis.document.documentElement.clientWidth
+  ));
   expect(overflow).toBeLessThanOrEqual(1);
 });

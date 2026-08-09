@@ -111,7 +111,7 @@ test("MBT Front Desk BIN order: one inline contract site is retained by every ph
   assert.deepEqual(lines.map((line) => line.siteProfileId), [null, null]);
 });
 
-test("MBT Front Desk multi-bin: the additive persistence seam and accessible contract master/detail shell are declared", async () => {
+test("MBT Front Desk persistence seams and the fixed-price accessible contract shell are declared", async () => {
   const [migration, siteMigration, page, script, service] = await Promise.all([
     readFile(migrationUrl, "utf8"),
     readFile(siteMigrationUrl, "utf8"),
@@ -147,13 +147,15 @@ test("MBT Front Desk multi-bin: the additive persistence seam and accessible con
   assert.match(page, /id="contractMaster"/i);
   assert.match(page, /id="contractDetail"/i);
   assert.match(page, /id="serviceLineActionDialog"/i);
-  assert.match(page, /id="contractServiceSite"/i);
-  assert.match(page, /data-contract-address-one/i);
-  assert.match(page, /data-contract-postal-code/i);
-  assert.match(script, /contractServiceSite/i);
+  assert.match(page, /id="billingAddressText"/i);
+  assert.match(page, /id="serviceAddressText"/i);
+  assert.match(page, /Billing address — one full text field/i);
+  assert.match(page, /Service address — one full text field/i);
+  assert.doesNotMatch(page, /data-contract-address-one|data-contract-postal-code/i);
+  assert.match(script, /serviceAddressText/i);
   assert.doesNotMatch(service, /subsidiary_netsuite_id\s*=\s*33/i);
   assert.match(script, /Exchange bin/i);
   assert.match(script, /Collect bin/i);
-  assert.match(script, /button\("Extend return", \(\) => openExtension\(\)\)/);
+  assert.match(script, /button\("Extend return", \(\) => openExtension\(line\.serviceLineId\)/);
   assert.doesNotMatch(script, /button\("Extend return", openExtension\)/);
 });

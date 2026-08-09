@@ -52,6 +52,16 @@ const RATE_DETAIL = Object.freeze({
     depositRules: Object.freeze([])
   })
 });
+const CUSTOMER_CHARGE_CONFIGURATION = Object.freeze({
+  schemaVersion: "mbt-frontdesk-customer-charge-admin-configuration-v1",
+  rateCardVersionId: VERSION_ID,
+  revision: 1,
+  complete: true,
+  aggregateItems: Object.freeze([]),
+  fixedDumpItems: Object.freeze([]),
+  aggregateDistanceBands: Object.freeze([]),
+  aggregateLoadingFeeMinor: 5_000
+});
 
 let baseUrl;
 let server;
@@ -115,6 +125,24 @@ const rateCardService = Object.freeze({
   }
 });
 
+const customerChargeService = Object.freeze({
+  async getFrontdeskCustomerChargeAdminConfiguration(input) {
+    calls.push({ method: "customer-charge-detail", input });
+    return CUSTOMER_CHARGE_CONFIGURATION;
+  },
+  async replaceFrontdeskCustomerChargeConfiguration(input) {
+    calls.push({ method: "customer-charge-replace", input });
+    return {
+      status: 201,
+      replayed: false,
+      body: {
+        schemaVersion: "mbt-frontdesk-customer-charge-admin-configuration-command-v1",
+        configuration: CUSTOMER_CHARGE_CONFIGURATION
+      }
+    };
+  }
+});
+
 function authenticate(req, res, next) {
   const token = String(req.get("authorization") || "").replace(/^Bearer\s+/i, "");
   const actor = ACTORS[token];
@@ -163,6 +191,7 @@ before(async () => {
   app.use(authenticate);
   app.use("/api/mbt", createMbtRouter({
     rateCardService,
+    customerChargeService,
     authorizePhase3Capability,
     netSuiteTransport: async () => {
       netSuiteTransportCalls += 1;
@@ -217,6 +246,57 @@ test("P3-F12 HTTP: private rate-card reads are Admin-only, no-store, and local-o
     method: "list",
     input: { query: "P3_HTTP", status: "draft", limit: 20, cursor: null }
   }]);
+  assert.equal(netSuiteTransportCalls, 0);
+});
+
+test("customer-charge pricing configuration is Admin-only, optimistic, audited, and local-only", async () => {
+  const forbidden = await request(`/api/mbt/config/customer-charges/${VERSION_ID}`, {
+    actor: "dispatcher"
+  });
+  assert.equal(forbidden.response.status, 403);
+
+  const detail = await request(`/api/mbt/config/customer-charges/${VERSION_ID}`, { actor: "admin" });
+  assert.equal(detail.response.status, 200, JSON.stringify(detail.payload));
+  assert.match(detail.response.headers.get("cache-control") || "", /no-store/u);
+  assert.deepEqual(detail.payload, CUSTOMER_CHARGE_CONFIGURATION);
+
+  const body = {
+    actor: { operatorId: "browser-forgery", roles: ["admin"] },
+    expectedRevision: 0,
+    aggregateItems: [{ itemCode: "AGG_HPB", amountMinor: 6_500, densityLbsPerYard: 2_600 }],
+    fixedDumpItems: [{ itemCode: "DUMP_SOIL", amountMinor: 85_000 }],
+    aggregateDistanceBands: [
+      { bandCode: "AGG_0_30", minimumMetres: 0, maximumMetres: 30_000, amountMinor: 15_000 }
+    ],
+    reason: "Configure customer charge rates"
+  };
+  const withoutKey = await request(`/api/mbt/config/customer-charges/${VERSION_ID}`, {
+    actor: "admin", method: "PUT", body
+  });
+  assert.equal(withoutKey.response.status, 400);
+  assert.equal(withoutKey.payload.code, "MBT_IDEMPOTENCY_KEY_REQUIRED");
+
+  const saved = await request(`/api/mbt/config/customer-charges/${VERSION_ID}`, {
+    actor: "admin",
+    method: "PUT",
+    body,
+    idempotencyKey: "customer-charge-configuration-http"
+  });
+  assert.equal(saved.response.status, 201, JSON.stringify(saved.payload));
+  assert.equal(saved.response.headers.get("x-mbt-idempotent-replay"), "false");
+  assert.deepEqual(calls.map(({ method }) => method), [
+    "customer-charge-detail",
+    "customer-charge-replace"
+  ]);
+  assert.deepEqual(calls[0].input.actor, {
+    operatorId: ACTORS.admin.id,
+    roles: ["admin"]
+  });
+  assert.equal(calls[1].input.actor.operatorId, ACTORS.admin.id);
+  assert.equal(calls[1].input.rateCardVersionId, VERSION_ID);
+  assert.equal(calls[1].input.expectedRevision, 0);
+  assert.deepEqual(calls[1].input.aggregateItems, body.aggregateItems);
+  assert.equal(calls[1].input.idempotencyKey, "customer-charge-configuration-http");
   assert.equal(netSuiteTransportCalls, 0);
 });
 

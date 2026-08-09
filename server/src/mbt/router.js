@@ -44,6 +44,7 @@ import { getMbtStatus, listMbtFeatureFlags } from "./status-repository.js";
 /** @typedef {typeof import("./rate-card-configuration-service.js")} RateCardService */
 /** @typedef {typeof import("./rate-card-csv-import-service.js").rateCardCsvImportService} RateCardImportService */
 /** @typedef {typeof import("./frontdesk-service.js")} FrontdeskService */
+/** @typedef {typeof import("./customer-charge-request-service.js")} CustomerChargeService */
 /** @typedef {typeof import("./bin-dispatch-service.js")} BinDispatchService */
 /** @typedef {typeof import("./shadow-billing-service.js")} ShadowBillingService */
 /** @typedef {typeof import("./pilot-reconciliation-service.js")} PilotReconciliationService */
@@ -548,6 +549,7 @@ function mbtErrorHandler(error, req, res, _next) {
  * @param {RateCardService} [dependencies.rateCardService]
  * @param {RateCardImportService} [dependencies.rateCardImportService]
  * @param {FrontdeskService} [dependencies.frontdeskService]
+ * @param {CustomerChargeService} [dependencies.customerChargeService]
  * @param {BinDispatchService} [dependencies.binDispatchService]
  * @param {ShadowBillingService} [dependencies.billingService]
  * @param {PilotReconciliationService} [dependencies.reconciliationService]
@@ -586,6 +588,9 @@ export function createMbtRouter(dependencies = {}) {
   const injectedFrontdeskService = dependencies.frontdeskService;
   const resolveFrontdeskService = async () => injectedFrontdeskService
     || import("./frontdesk-service.js");
+  const injectedCustomerChargeService = dependencies.customerChargeService;
+  const resolveCustomerChargeService = async () => injectedCustomerChargeService
+    || import("./customer-charge-request-service.js");
   const injectedBinDispatchService = dependencies.binDispatchService;
   const resolveBinDispatchService = async () => injectedBinDispatchService
     || import("./bin-dispatch-service.js");
@@ -923,6 +928,58 @@ export function createMbtRouter(dependencies = {}) {
     requireMbtAdmin,
     localMasterDirectHandler("dump_sites", "delete")
   );
+
+  router.get("/config/customer-charges/:versionId", requireMbtAdmin, async (req, res, next) => {
+    try {
+      const service = await resolveCustomerChargeService();
+      const result = await service.getFrontdeskCustomerChargeAdminConfiguration({
+        actor: commandActor(req),
+        rateCardVersionId: requiredRequestText(
+          req.params.versionId,
+          "MBT_RATE_CARD_VERSION_REQUIRED",
+          "A rate-card version ID is required."
+        )
+      });
+      noStore(res);
+      res.json(result);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  router.put("/config/customer-charges/:versionId", requireMbtAdmin, async (req, res, next) => {
+    try {
+      const body = requestObject(req.body);
+      const idempotencyKey = requiredRequestText(
+        req.get("idempotency-key"),
+        "MBT_IDEMPOTENCY_KEY_REQUIRED",
+        "An Idempotency-Key header is required."
+      );
+      await authorizePhase3Capability({ capability: "masterData" });
+      const service = await resolveCustomerChargeService();
+      const result = await service.replaceFrontdeskCustomerChargeConfiguration({
+        actor: commandActor(req),
+        rateCardVersionId: requiredRequestText(
+          req.params.versionId,
+          "MBT_RATE_CARD_VERSION_REQUIRED",
+          "A rate-card version ID is required."
+        ),
+        expectedRevision: Number(body.expectedRevision),
+        aggregateItems: body.aggregateItems,
+        fixedDumpItems: body.fixedDumpItems,
+        aggregateDistanceBands: body.aggregateDistanceBands,
+        reason: body.reason,
+        idempotencyKey,
+        correlationId: correlationId(req),
+        requestId: requestId(req)
+      });
+      noStore(res);
+      res.setHeader("x-mbt-idempotent-replay", String(result.replayed));
+      res.status(result.status).json(result.body);
+    } catch (error) {
+      next(error);
+    }
+  });
 
   router.get("/config/rate-cards", requireMbtAdmin, async (req, res, next) => {
     try {
@@ -1947,6 +2004,123 @@ export function createMbtRouter(dependencies = {}) {
   );
 
   router.get(
+    "/frontdesk/customer-charge/configuration",
+    requireMbtSurface("mbt_frontdesk", "MBT Front Desk"),
+    async (req, res, next) => {
+      try {
+        await authorizePhase3Capability({ capability: "frontdeskOperations" });
+        const service = await resolveCustomerChargeService();
+        const result = await service.getFrontdeskCustomerChargeConfiguration({
+          actor: commandActor(req),
+          rateCardVersionId: requiredRequestText(
+            req.query.rateCardVersionId,
+            "MBT_FRONTDESK_RATE_CARD_REQUIRED",
+            "A Front Desk rate card version is required."
+          )
+        });
+        noStore(res);
+        res.json(result);
+      } catch (error) {
+        next(error);
+      }
+    }
+  );
+
+  router.post(
+    "/frontdesk/charge-requests/preview",
+    requireMbtSurface("mbt_frontdesk", "MBT Front Desk"),
+    async (req, res, next) => {
+      try {
+        await authorizePhase3Capability({ capability: "frontdeskOperations" });
+        const body = requestObject(req.body);
+        const rawDistance = await frontdeskPricing.resolveDistance({
+          serviceAddressText: body.serviceAddressText,
+          originYardCode: body.orderFrom150 === true ? "150" : "3445",
+          orderFrom150: body.orderFrom150 === true
+        });
+        const distanceMetres = Number(
+          rawDistance && typeof rawDistance === "object"
+            ? /** @type {Record<string, unknown>} */ (rawDistance).providerMetres
+            : Number.NaN
+        );
+        if (!Number.isSafeInteger(distanceMetres) || distanceMetres < 0) {
+          throw new MbtError({
+            status: 422,
+            code: "MBT_FRONTDESK_DISTANCE_INVALID",
+            message: "The server distance resolver did not return a valid distance."
+          });
+        }
+        const service = await resolveCustomerChargeService();
+        const result = await service.previewFrontdeskChargeRequest({
+          actor: commandActor(req),
+          kind: body.kind,
+          customerNetsuiteId: body.customerNetsuiteId,
+          contractId: body.contractId,
+          serviceLineId: body.serviceLineId,
+          expectedContractRevision: body.expectedContractRevision,
+          expectedServiceLineRevision: body.expectedServiceLineRevision,
+          rateCardVersionId: body.rateCardVersionId,
+          paymentMethod: body.paymentMethod,
+          billingAddressText: body.billingAddressText,
+          serviceAddressText: body.serviceAddressText,
+          contractTelephone: body.contractTelephone,
+          orderFrom150: body.orderFrom150 === true,
+          distanceMetres,
+          bin: body.bin,
+          aggregateLines: body.aggregateLines,
+          reason: body.reason,
+          idempotencyKey: requiredRequestText(
+            req.get("idempotency-key"),
+            "MBT_IDEMPOTENCY_KEY_REQUIRED",
+            "An Idempotency-Key header is required."
+          ),
+          correlationId: correlationId(req),
+          requestId: requestId(req)
+        });
+        noStore(res);
+        res.setHeader("x-mbt-idempotent-replay", String(result.replayed));
+        res.status(result.status).json(result.body);
+      } catch (error) {
+        next(error);
+      }
+    }
+  );
+
+  router.post(
+    "/frontdesk/charge-requests/:chargeRequestId/confirm",
+    requireMbtSurface("mbt_frontdesk", "MBT Front Desk"),
+    async (req, res, next) => {
+      try {
+        await authorizePhase3Capability({ capability: "frontdeskOperations" });
+        const body = requestObject(req.body);
+        const service = await resolveCustomerChargeService();
+        const result = await service.confirmFrontdeskChargeRequest({
+          actor: commandActor(req),
+          chargeRequestId: requiredRequestText(
+            req.params.chargeRequestId,
+            "MBT_FRONTDESK_CHARGE_REQUEST_REQUIRED",
+            "A Front Desk charge request ID is required."
+          ),
+          expectedRevision: body.expectedRevision,
+          reason: body.reason,
+          idempotencyKey: requiredRequestText(
+            req.get("idempotency-key"),
+            "MBT_IDEMPOTENCY_KEY_REQUIRED",
+            "An Idempotency-Key header is required."
+          ),
+          correlationId: correlationId(req),
+          requestId: requestId(req)
+        });
+        noStore(res);
+        res.setHeader("x-mbt-idempotent-replay", String(result.replayed));
+        res.status(result.status).json(result.body);
+      } catch (error) {
+        next(error);
+      }
+    }
+  );
+
+  router.get(
     "/frontdesk/customers",
     requireMbtSurface("mbt_frontdesk", "MBT Front Desk"),
     async (req, res, next) => {
@@ -2009,6 +2183,15 @@ export function createMbtRouter(dependencies = {}) {
           binTypeId: body.binTypeId,
           deliveryItemCode: body.deliveryItemCode,
           pricingOriginYardCode: body.pricingOriginYardCode,
+          orderFrom150: body.orderFrom150 === true,
+          paymentMethod: body.paymentMethod,
+          billingAddressText: body.billingAddressText,
+          serviceAddressText: body.serviceAddressText,
+          contractTelephone: body.contractTelephone,
+          contentCode: body.contentCode,
+          discountMinor: body.discountMinor,
+          discountReason: body.discountReason,
+          aggregateLines: body.aggregateLines,
           dumpItemCode: body.dumpItemCode,
           estimatedTonnes: body.estimatedTonnes,
           surcharges: body.surcharges,
@@ -2123,6 +2306,29 @@ export function createMbtRouter(dependencies = {}) {
     "/frontdesk/quotes/:quoteId/convert",
     requireMbtSurface("mbt_frontdesk", "MBT Front Desk"),
     frontdeskQuoteAction("convert")
+  );
+
+  router.get(
+    "/frontdesk/contracts/:contractId/charge-requests",
+    requireMbtSurface("mbt_frontdesk", "MBT Front Desk"),
+    async (req, res, next) => {
+      try {
+        await authorizePhase3Capability({ capability: "frontdeskOperations" });
+        const service = await resolveCustomerChargeService();
+        const result = await service.listFrontdeskContractChargeRequests({
+          actor: commandActor(req),
+          contractId: requiredRequestText(
+            req.params.contractId,
+            "MBT_FRONTDESK_CONTRACT_REQUIRED",
+            "A Front Desk contract ID is required."
+          )
+        });
+        noStore(res);
+        res.json(result);
+      } catch (error) {
+        next(error);
+      }
+    }
   );
 
   router.get(
