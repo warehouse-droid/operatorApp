@@ -15,6 +15,15 @@ export const MBT_ADMIN_GATE_DEFINITIONS = Object.freeze([
     lockReason: null
   }),
   Object.freeze({
+    flagKey: "driver_yard_dependency_soft_mode",
+    label: "Driver soft yard dependency (testing)",
+    description: "Allow Driver PWA start/completion to show a warning instead of blocking on ordinary yard-replenishment Transfer Orders. Dispatch planning and direct-linked/same-truck Transfer Orders always remain hard.",
+    environmentProperty: null,
+    independent: true,
+    locked: false,
+    lockReason: null
+  }),
+  Object.freeze({
     flagKey: "mbt_enabled",
     label: "MBT local modules",
     description: "Global database gate for every MBT local workflow.",

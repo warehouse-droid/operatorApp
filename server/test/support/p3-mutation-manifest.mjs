@@ -7,6 +7,19 @@
  */
 export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
   Object.freeze({
+    runner: "run-dispatch-active-load-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "src/dispatch-load-assignment.js",
+      "public/dispatch.js"
+    ])
+  }),
+  Object.freeze({
+    runner: "run-dispatch-performance-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze(["src/dispatch-planner-performance.js"])
+  }),
+  Object.freeze({
     runner: "run-frontdesk-mutations.mjs",
     adminUrlEnvironment: null,
     sourcePaths: Object.freeze(["src/mbt/frontdesk-service.js"])

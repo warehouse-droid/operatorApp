@@ -15,10 +15,16 @@ so_source_state="$(
     src/sales-order-reconciliation-harness.js \
     src/sales-order-reconciliation-integration-harness.js \
     src/sales-order-reconciliation-mutation-harness.js \
+    src/grouped-po-reconciliation-integration-harness.js \
+    src/grouped-sales-order-reconciliation-integration-harness.js \
+    src/dispatch-group-reconciliation-ui-harness.js \
+    src/dispatch-plan-repository.js \
+    src/scm-reconciliation.js \
+    src/scm-reconciliation-harness.js \
     src/scm-reconciliation-repository.js \
     src/scm-reconciliation-service.js \
     src/scm-reconciliation-so-type-harness.js \
-    test/mbt/integration/migration-upgrade.test.js \
+    public/dispatch.js \
     tools/eslint.so-reconciliation.config.js \
     tools/so-reconciliation-db-only-gauntlet.sh \
     | sha256sum \
@@ -29,7 +35,7 @@ if [[ ! "$so_source_state" =~ ^[0-9a-f]{64}$ ]]; then
   echo "Could not calculate the SO reconciliation source state." >&2
   exit 70
 fi
-echo "SO reconciliation source state: $so_source_state"
+echo "Grouped reconciliation source state: $so_source_state"
 
 if [[ "$so_project" == "mbbs-operator-app" || "$so_compose_file" == "$so_repo_root/docker-compose.yml" ]]; then
   echo "Refusing to use the production Compose project." >&2
@@ -53,20 +59,32 @@ trap cleanup_so_gauntlet EXIT
     --reporter text \
     npm run test:so-reconciliation
 "${so_compose[@]}" --profile tools run --rm test npm run test:so-reconciliation-integration
+"${so_compose[@]}" --profile tools run --rm test npm run test:grouped-po-reconciliation-integration
+"${so_compose[@]}" --profile tools run --rm test npm run test:grouped-so-reconciliation-integration
+"${so_compose[@]}" --profile tools run --rm test npm run test:dispatch-group-reconciliation-ui
+"${so_compose[@]}" --profile tools run --rm test npm run test:scm-reconciliation
 "${so_compose[@]}" --profile tools run --rm test npm run test:so-reconciliation-policy
 "${so_compose[@]}" --profile tools run --rm test npm run test:scm-reconciliation-so-type
 "${so_compose[@]}" --profile tools run --rm test npm run test:scm-reconciliation-repository
 "${so_compose[@]}" --profile tools run --rm test npm run test:scm-reconciliation-scope-controls
 "${so_compose[@]}" --profile tools run --rm test npm run test:scm-reconciliation-server
+"${so_compose[@]}" --profile tools run --rm test npm run test:order-dependencies
+"${so_compose[@]}" --profile tools run --rm test npm run test:dispatch-links
+"${so_compose[@]}" --profile tools run --rm test npm run test:consolidation
+"${so_compose[@]}" --profile tools run --rm test npm run test:dispatch-save-coordination
+"${so_compose[@]}" --profile tools run --rm test npm run test:dispatch-load-assignments
 "${so_compose[@]}" --profile tools run --rm test npm run mutate:so-reconciliation
-"${so_compose[@]}" --profile tools run --rm test \
-  node --test test/mbt/integration/migration-upgrade.test.js
 "${so_compose[@]}" --profile tools run --rm test \
   node --check src/sales-order-reconciliation.js
 "${so_compose[@]}" --profile tools run --rm test \
   node --check src/sales-order-reconciliation-repository.js
 "${so_compose[@]}" --profile tools run --rm test \
   node --check src/scm-reconciliation-service.js
+"${so_compose[@]}" --profile tools run --rm test \
+  node --check src/scm-reconciliation-repository.js
+"${so_compose[@]}" --profile tools run --rm test \
+  node --check src/dispatch-plan-repository.js
+"${so_compose[@]}" --profile tools run --rm test npm run syntax:legacy
 "${so_compose[@]}" --profile tools run --rm test npm run typecheck:mbt
 
 set +e
@@ -99,7 +117,14 @@ fi
     src/sales-order-reconciliation-harness.js \
     src/sales-order-reconciliation-integration-harness.js \
     src/sales-order-reconciliation-mutation-harness.js \
+    src/grouped-po-reconciliation-integration-harness.js \
+    src/grouped-sales-order-reconciliation-integration-harness.js \
+    src/dispatch-group-reconciliation-ui-harness.js \
+    src/dispatch-plan-repository.js \
+    src/scm-reconciliation.js \
+    src/scm-reconciliation-harness.js \
+    src/scm-reconciliation-repository.js \
     src/scm-reconciliation-service.js \
     src/scm-reconciliation-so-type-harness.js
 
-echo "SO reconciliation DB-only gauntlet passed."
+echo "Grouped PO/SO reconciliation gauntlet passed."

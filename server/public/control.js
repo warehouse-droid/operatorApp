@@ -538,6 +538,65 @@ function closePhotoLightbox() {
   modal.remove();
 }
 
+function closeSalesOrderReloadDialog() {
+  document.querySelector(".sales-order-reload-modal")?.remove();
+}
+
+function openSalesOrderReloadDialog(order, { cancel = false, cycle = null } = {}) {
+  if (!order?.order_id) return;
+  closeSalesOrderReloadDialog();
+  const requestId = cancel ? "" : crypto.randomUUID();
+  const modal = document.createElement("div");
+  modal.className = "photo-lightbox sales-order-reload-modal";
+  modal.innerHTML = `
+    <form class="photo-lightbox-panel sales-order-reload-panel" role="dialog" aria-modal="true" aria-label="${cancel ? "Cancel Re-load" : "Authorize Re-load"}">
+      <button class="photo-lightbox-close" data-action="close-sales-order-reload" type="button">×</button>
+      <h2>${cancel ? "Cancel Re-load" : "Authorize Re-load"}</h2>
+      <p><strong>${escapeHtml(order.tranid || order.order_id)}</strong> · ${escapeHtml(order.yard_location || "")}</p>
+      <p class="muted">${cancel
+        ? "Cancellation is allowed only before any Operator packing activity. Existing load records remain unchanged."
+        : "Exactly the currently loaded local quantities will be offered again. This is local-only: it does not create a NetSuite fulfillment or change Dispatch."}</p>
+      <label>
+        <span>Re-load reason</span>
+        <textarea name="reason" maxlength="500" rows="4" required placeholder="Describe why this order must be packed and loaded again"></textarea>
+      </label>
+      <div class="loaded-filter-actions">
+        <button data-action="close-sales-order-reload" type="button">${t("common.cancel", "Cancel")}</button>
+        <button class="primary" type="submit">${cancel ? "Cancel Re-load" : "Authorize Re-load"}</button>
+      </div>
+    </form>
+  `;
+  modal.addEventListener("click", (event) => {
+    if (event.target === modal || event.target.closest("[data-action='close-sales-order-reload']")) {
+      closeSalesOrderReloadDialog();
+    }
+  });
+  modal.querySelector("form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const reason = String(new FormData(form).get("reason") || "").trim();
+    if (!reason) return;
+    const submit = form.querySelector("button[type='submit']");
+    if (submit) submit.disabled = true;
+    try {
+      const base = `/api/control/sales-orders/${encodeURIComponent(order.order_id)}/reload-cycles`;
+      await request(cancel ? `${base}/${encodeURIComponent(cycle?.id)}/cancel` : base, {
+        method: "POST",
+        body: JSON.stringify(cancel ? { reason } : { reason, requestId })
+      });
+      closeSalesOrderReloadDialog();
+      await loadLoadedOrders({ keepSelection: true });
+      if (isLoadedSearchActive()) await loadLoadedSearchResults();
+      render();
+    } catch (error) {
+      if (submit) submit.disabled = false;
+      alert(error.message);
+    }
+  });
+  document.body.appendChild(modal);
+  modal.querySelector("textarea")?.focus();
+}
+
 function envFileLabel(file) {
   if (file === ".env") return "Production (.env)";
   if (file === ".env.old") return "Sandbox (.env.old)";
@@ -2417,14 +2476,47 @@ function renderLoadedExportSection() {
   `;
 }
 
+function renderSalesOrderLoadAttempts(loadAttempts = []) {
+  if (!loadAttempts.length) return "";
+  return `
+    <div class="loaded-photo-section load-attempt-timeline">
+      <h3>Physical load attempts</h3>
+      <div class="loaded-lines">
+        ${loadAttempts.map((attempt) => `
+          <article class="loaded-line-card load-attempt-card">
+            <div>
+              <strong>${attempt.attemptKind === "reload" ? `Re-load #${attempt.cycleNumber || ""}` : "Original load"}</strong>
+              <span>${formatDate(attempt.processedAt)} · ${escapeHtml(attempt.operatorName || attempt.operatorId || "Operator")}</span>
+              ${attempt.reason ? `<em>${escapeHtml(attempt.reason)}</em>` : ""}
+              <small>${attempt.quantityBasis === "exact_attempt" ? "Exact quantity for this attempt" : "Legacy recorded loaded state"}</small>
+            </div>
+            <div class="loaded-line-qty">
+              <strong>${(attempt.attemptLines || []).length} ${t("control.lines", "line(s)")}</strong>
+              <small>${(attempt.photos || []).length} ${t("common.photos", "photos")}</small>
+            </div>
+          </article>
+          ${(attempt.attemptLines || []).map((line) => `
+            <div class="loaded-line-card load-attempt-line">
+              <div><strong>${escapeHtml(line.sku || line.itemName || "")}</strong><span>${escapeHtml(line.itemName || "")}</span></div>
+              <div class="loaded-line-qty"><strong>${movementQuantity(line.loadedQty ?? line.quantity ?? 0)} ${escapeHtml(line.loadedUom || line.unit || "")}</strong></div>
+            </div>
+          `).join("")}
+        `).join("")}
+      </div>
+    </div>
+  `;
+}
+
 function renderLoadedOrderDetail() {
   if (!loadedOrderDetail) {
     return `<div class="empty-detail"><strong>${t("common.selectOrder", "Select an order")}</strong><span>${t("yard.selectMovementHelp", "Yard processing, driver delivery details, timestamps, and photo proof will show here.")}</span></div>`;
   }
-  const { order, lines = [], photos = [] } = loadedOrderDetail;
+  const { order, lines = [], photos = [], loadAttempts = [], activeReloadCycle = null } = loadedOrderDetail;
   const driverRecords = loadedOrderDetail.driverRecords || loadedOrderDetail.driverEvents || [];
   const driverPhotos = loadedOrderDetail.driverPhotos || [];
   const route = [order.source_location, order.destination_location].filter(Boolean).join(" → ");
+  const salesOrderReloadEligible = order.direction === "outbound" && order.order_type === "sales_order" && !order.driver_only;
+  const reloadCanCancel = activeReloadCycle?.status === "authorized" && !activeReloadCycle?.activityStartedAt;
   return `
     <div class="loaded-detail-head">
       <div>
@@ -2434,7 +2526,12 @@ function renderLoadedOrderDetail() {
         ${order.party ? `<p class="muted">${escapeHtml(order.party)}</p>` : ""}
         ${order.delivery_at ? `<p class="muted"><strong>${t("yard.deliveryTime", "Delivered")}:</strong> ${formatDate(order.delivery_at)}</p>` : ""}
       </div>
-      <strong>${lines.length} ${t("control.lines", "line(s)")} · ${t("yard.yardActivities", "Yard")} ${order.yard_activity_count || order.process_count || 0} · ${t("yard.driverActivities", "Driver")} ${order.driver_activity_count || driverRecords.length}</strong>
+      <div class="loaded-detail-actions">
+        <strong>${lines.length} ${t("control.lines", "line(s)")} · ${t("yard.yardActivities", "Yard")} ${order.yard_activity_count || order.process_count || 0} · ${t("yard.driverActivities", "Driver")} ${order.driver_activity_count || driverRecords.length}</strong>
+        ${salesOrderReloadEligible && !activeReloadCycle ? `<button class="primary" data-action="authorize-sales-order-reload" type="button">Authorize Re-load</button>` : ""}
+        ${reloadCanCancel ? `<button data-action="cancel-sales-order-reload" data-cycle-id="${escapeHtml(activeReloadCycle.id)}" type="button">Cancel Re-load</button>` : ""}
+        ${activeReloadCycle ? `<small><strong>Re-load #${escapeHtml(activeReloadCycle.cycleNumber)}</strong> · ${escapeHtml(activeReloadCycle.status)} · ${escapeHtml(activeReloadCycle.reason)}</small>` : ""}
+      </div>
     </div>
     <div class="loaded-lines">
       ${lines.map((line) => `
@@ -2451,6 +2548,7 @@ function renderLoadedOrderDetail() {
         </div>
       `).join("") || `<div class="notice"><strong>${t("yard.noProcessedLines", "No processed lines")}</strong><span>${order.driver_only ? t("yard.noYardLinesYet", "No yard processing record yet. Driver delivery data is shown below.") : t("yard.noProcessedLinesHelp", "This order has an activity record but no retained processed line quantity.")}</span></div>`}
     </div>
+    ${renderSalesOrderLoadAttempts(loadAttempts)}
     ${driverRecords.length ? `
       <div class="loaded-photo-section">
         <h3>${t("yard.driverActivity", "Driver activity")}</h3>
@@ -4606,6 +4704,19 @@ app.addEventListener("click", async (event) => {
       selectedLoadedOrderKey = button.dataset.key || "";
       await loadLoadedOrderDetailForSelection();
       refreshLoadedPanels();
+      return;
+    }
+    if (button.dataset.action === "authorize-sales-order-reload") {
+      if (!loadedOrderDetail?.order) return;
+      openSalesOrderReloadDialog(loadedOrderDetail.order);
+      return;
+    }
+    if (button.dataset.action === "cancel-sales-order-reload") {
+      if (!loadedOrderDetail?.order || !loadedOrderDetail.activeReloadCycle) return;
+      openSalesOrderReloadDialog(loadedOrderDetail.order, {
+        cancel: true,
+        cycle: loadedOrderDetail.activeReloadCycle
+      });
       return;
     }
     if (button.dataset.action === "export-loaded-csv") {

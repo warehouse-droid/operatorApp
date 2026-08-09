@@ -5,9 +5,10 @@ import {
   upsertSalesOrderLines,
   upsertSalesOrders
 } from "./order-sync-repository.js";
-import { cleanupBilledSalesOrderFamilyFromDispatchPlans } from "./dispatch-plan-repository.js";
+import { reconcileSalesOrderFamilyInDispatchPlans } from "./dispatch-plan-repository.js";
 import {
   isNetSuiteSalesOrderBilled,
+  isNetSuiteSalesOrderFulfilled,
   isSalesOrderInventoryLine,
   mapNetSuiteSalesOrderLine
 } from "./sales-order-reconciliation.js";
@@ -259,10 +260,12 @@ export async function activeSalesOrderFamilyDraft(family = {}) {
   } : { blocked: false };
 }
 
-function salesOrderProgress(lines = []) {
+function salesOrderProgress(lines = [], { forceComplete = false } = {}) {
   const progress = (lines || []).map((line) => ({
     ordered: quantity(line.quantity),
-    fulfilled: quantity(line.cumulativeProgressQuantity)
+    fulfilled: forceComplete
+      ? quantity(line.quantity)
+      : quantity(line.cumulativeProgressQuantity)
   }));
   const ordered = progress.reduce((sum, line) => sum + line.ordered, 0);
   const fulfilled = progress.reduce((sum, line) => sum + Math.min(line.fulfilled, line.ordered), 0);
@@ -329,7 +332,10 @@ export async function reconcileSalesOrderFromNetSuite({
   const inventoryLines = sourceLines.filter(isSalesOrderInventoryLine);
   const excludedLines = sourceLines.filter((line) => !isSalesOrderInventoryLine(line));
   const billed = isNetSuiteSalesOrderBilled(order);
-  const progress = salesOrderProgress(inventoryLines);
+  const fulfilledByHeader = isNetSuiteSalesOrderFulfilled(order);
+  const progress = salesOrderProgress(inventoryLines, {
+    forceComplete: fulfilledByHeader
+  });
   const proposal = {
     orderKind: "SO",
     sourceOrderId: orderId,
@@ -337,6 +343,7 @@ export async function reconcileSalesOrderFromNetSuite({
     familyOrderRefs: family.familyRefs,
     dryRun: Boolean(dryRun),
     billed,
+    fulfilledByHeader,
     reconciliationStatus: draft.blocked ? "review" : "current",
     applicationStatus: billed ? "Billed" : progress.complete ? "Completed" : "Queued",
     reason: draft.blocked
@@ -355,6 +362,19 @@ export async function reconcileSalesOrderFromNetSuite({
   };
   if (draft.blocked || dryRun) {
     await recordSalesOrderReconciliationAudit({ order, runId, source, dryRun: true, result: proposal });
+    if (!dryRun && draft.blocked) {
+      return {
+        ...proposal,
+        planCleanup: await reconcileSalesOrderFamilyInDispatchPlans({
+          canonicalRef: family.sourceOrderRef || orderRef,
+          familyRefs: family.familyRefs,
+          billed: false,
+          reconciliationStatus: "review",
+          reconciliationReason: proposal.reason,
+          actor: source
+        })
+      };
+    }
     return proposal;
   }
 
@@ -380,7 +400,17 @@ export async function reconcileSalesOrderFromNetSuite({
         reason: `Sales Order family reconciliation is blocked by an active operator packing draft on ${liveDraft.orderRef || orderRef}.`
       };
       await recordSalesOrderReconciliationAudit({ order, runId, source, dryRun: false, result: blocked });
-      return blocked;
+      return {
+        ...blocked,
+        planCleanup: await reconcileSalesOrderFamilyInDispatchPlans({
+          canonicalRef: family.sourceOrderRef || orderRef,
+          familyRefs: family.familyRefs,
+          billed: false,
+          reconciliationStatus: "review",
+          reconciliationReason: blocked.reason,
+          actor: source
+        })
+      };
     }
 
     const mappedLines = inventoryLines.map(mapNetSuiteSalesOrderLine);
@@ -396,11 +426,14 @@ export async function reconcileSalesOrderFromNetSuite({
     );
 
     let planCleanup = { changedPlans: [], deferred: false, familyRefs: family.familyRefs };
-    if (billed) {
+    if (fulfilledByHeader) {
       await query(
         `UPDATE sales_orders
-            SET status = 'G',
-                status_text = 'Sales Order : Billed',
+            SET status = CASE WHEN $3::boolean THEN 'G' ELSE status END,
+                status_text = CASE
+                  WHEN $3::boolean THEN 'Sales Order : Billed'
+                  ELSE status_text
+                END,
                 netsuite_active = false,
                 fulfillment_status = 'fulfilled',
                 operator_status = 'fulfilled',
@@ -416,7 +449,7 @@ export async function reconcileSalesOrderFromNetSuite({
                 synced_at = now()
           WHERE netsuite_id = ANY($1::bigint[])
              OR upper(tranid) = ANY($2::text[])`,
-        [family.familyIds, family.familyRefs]
+        [family.familyIds, family.familyRefs, billed]
       );
       await query(
         `UPDATE sales_order_lines
@@ -431,19 +464,26 @@ export async function reconcileSalesOrderFromNetSuite({
              OR saved.order_key = ANY($2::text[])`,
         [family.familyRefs, family.familyIds.map(String)]
       );
-      planCleanup = await cleanupBilledSalesOrderFamilyFromDispatchPlans({
-        canonicalRef: family.sourceOrderRef || orderRef,
-        familyRefs: family.familyRefs,
-        actor: source
-      });
     }
+    planCleanup = await reconcileSalesOrderFamilyInDispatchPlans({
+      canonicalRef: family.sourceOrderRef || orderRef,
+      familyRefs: family.familyRefs,
+      // Fulfilled/Pending Billing is terminal evidence, but it is not a reason
+      // to delete that child from an existing group. Keep it in the snapshot
+      // so the group can roll up to Partially Done/Completed; only an actual
+      // Billed header uses the destructive dispatch-plan scrub.
+      billed,
+      reconciliationStatus: "current",
+      reconciliationReason: "",
+      actor: source
+    });
     const result = {
       ...proposal,
       dryRun: false,
       planCleanup,
       reconciliationStatus: planCleanup.deferred ? "current" : "current",
       reason: planCleanup.deferred
-        ? "Billed order is hidden from planning; dispatch-plan cleanup is deferred until the in-progress driver job finishes."
+        ? "Completed order is hidden from planning; dispatch-plan cleanup is deferred until the in-progress driver job finishes."
         : ""
     };
     await recordSalesOrderReconciliationAudit({ order, runId, source, dryRun: false, result });

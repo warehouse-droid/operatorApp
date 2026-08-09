@@ -1258,19 +1258,19 @@ assert.match(
   driverSource,
   /lastError \? t\("driver\.retrySync", "Retry sync"\) : t\("driver\.syncNow", "Sync now"\)/
 );
-assert.match(driverHtml, /driver-offline-db\.js\?v=20260805-online-mode-v3/);
-assert.match(driverHtml, /driver-photo-hash\.js\?v=20260805-online-mode-v3/);
-assert.match(driverHtml, /driver-offline-photos\.js\?v=20260805-online-mode-v3/);
-assert.match(driverHtml, /driver-offline-sync\.js\?v=20260805-online-mode-v3/);
+assert.match(driverHtml, /driver-offline-db\.js\?v=20260808-yard-dependency-v1/);
+assert.match(driverHtml, /driver-photo-hash\.js\?v=20260808-yard-dependency-v1/);
+assert.match(driverHtml, /driver-offline-photos\.js\?v=20260808-yard-dependency-v1/);
+assert.match(driverHtml, /driver-offline-sync\.js\?v=20260808-yard-dependency-v1/);
 assert.match(driverHtml, /driver-bin-ui\.js\?v=20260803-bin-pwa-v1/);
-assert.match(driverHtml, /driver\.js\?v=20260805-online-mode-v3/);
-assert.match(driverWorker, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v19`/);
-assert.match(driverWorker, /driver-offline-db\.js\?v=20260805-online-mode-v3/);
-assert.match(driverWorker, /driver-photo-hash\.js\?v=20260805-online-mode-v3/);
-assert.match(driverWorker, /driver-offline-photos\.js\?v=20260805-online-mode-v3/);
-assert.match(driverWorker, /driver-offline-sync\.js\?v=20260805-online-mode-v3/);
+assert.match(driverHtml, /driver\.js\?v=20260808-yard-dependency-v1/);
+assert.match(driverWorker, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v20`/);
+assert.match(driverWorker, /driver-offline-db\.js\?v=20260808-yard-dependency-v1/);
+assert.match(driverWorker, /driver-photo-hash\.js\?v=20260808-yard-dependency-v1/);
+assert.match(driverWorker, /driver-offline-photos\.js\?v=20260808-yard-dependency-v1/);
+assert.match(driverWorker, /driver-offline-sync\.js\?v=20260808-yard-dependency-v1/);
 assert.match(driverWorker, /driver-bin-ui\.js\?v=20260803-bin-pwa-v1/);
-assert.match(driverWorker, /driver\.js\?v=20260805-online-mode-v3/);
+assert.match(driverWorker, /driver\.js\?v=20260808-yard-dependency-v1/);
 assert.match(
   offlineSyncSource,
   /if \(!response\.ok\)[\s\S]*error\.status = response\.status;[\s\S]*error\.code = String\(payload\.code \|\| ""\)/,

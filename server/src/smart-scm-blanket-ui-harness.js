@@ -11,6 +11,7 @@ const exclusions = readPublic("scm-smart-exclusions.js");
 const exclusionsCss = readPublic("scm-smart-exclusions.css");
 const proposalEditor = fs.readFileSync(new URL("smart-scm-proposal-editor.js", import.meta.url), "utf8");
 const blanketRepository = fs.readFileSync(new URL("smart-scm-blanket-repository.js", import.meta.url), "utf8");
+const server = fs.readFileSync(new URL("server.js", import.meta.url), "utf8");
 const vendor = readPublic("scm-smart-vendor.js");
 const vendorCss = readPublic("scm-smart-vendor.css");
 const sidebar = readPublic("app-sidebar.js");
@@ -44,6 +45,17 @@ assert.match(blanket, /smart-urgency-\$\{smartEscape\(urgencyLevel\)\}/,
 assert.match(blanket, /data-smart-blanket-destination/);
 assert.match(blanket, /data-smart-blanket-pallets[^>]*step="1"/);
 assert.match(blanket, /data-smart-action="save-blanket-proposal-line"/);
+assert.match(blanket, /data-smart-action="split-blanket-proposal-line"/,
+  "Editable Blanket lines must expose Split to load.");
+assert.match(blanket, /data-smart-action="remove-blanket-proposal-line"/,
+  "Editable Blanket lines must expose Remove.");
+assert.match(blanket, /physicalPalletLines/,
+  "Blanket loads must render the automatic official PALLET calculation.");
+assert.match(blanket, /data-smart-action="save-blanket-pallet-line"/);
+assert.match(blanket, /data-smart-action="reset-blanket-pallet-line"/);
+assert.match(blanket, /\/api\/scm\/smart\/blanket-proposals\/\$\{proposalId\}\/lines\/\$\{lineId\}\/split/);
+assert.match(server, /app\.post\("\/api\/scm\/smart\/blanket-proposals\/:id\/lines\/:lineId\/split"/);
+assert.match(server, /app\.delete\("\/api\/scm\/smart\/blanket-proposals\/:id\/lines\/:lineId"/);
 assert.match(blanket, /overCapacity \? smartPill\("attention", "Over capacity · manual"\)/,
   "A manually overloaded Blanket release must remain visibly flagged.");
 const blanketLineRenderer = blanket.slice(
@@ -85,6 +97,8 @@ assert.match(blanketRepository, /DELETE FROM scm_smart_blanket_allocations[\s\S]
 assert.match(blanketRepository, /INSERT INTO scm_smart_blanket_allocations/);
 assert.match(blanketRepository, /UPDATE scm_smart_proposal_lines/,
   "Blanket line edits must update both proposal data and exact source allocations transactionally.");
+assert.match(blanketRepository, /export async function splitSmartScmBlanketProposalLine/);
+assert.match(blanketRepository, /export async function removeSmartScmBlanketProposalLine/);
 
 assert.match(vendor, /data-vendor-kind="\$\{isBlanket \? "blanket_po" : "regular_po"\}"/);
 assert.match(vendor, /Show source balance/);
@@ -110,15 +124,15 @@ assert.match(sidebar, /!item\.scmWriteOnly \|\| canManageScmPurchaseOrders\(\)/)
 
 for (const version of [
   "scm-smart.css?v=20260801-blanket-ui-v2",
-  "scm-smart-vendor.css?v=20260801-vendor-email-location-v3",
-  "scm-smart-blanket.css?v=20260801-blanket-sidebar-tabs-v4",
+  "scm-smart-vendor.css?v=20260807-blanket-source-po-v1",
+  "scm-smart-blanket.css?v=20260807-blanket-editor-v1",
   "scm-smart-exclusions.css?v=20260801-planning-pauses-v3",
   "app-sidebar.js?v=20260801-netsuite-po-role-v1",
   "scm-smart.js?v=20260801-focus-preservation-v1",
-  "scm-smart-blanket.js?v=20260801-manual-over-capacity-v1",
+  "scm-smart-blanket.js?v=20260807-blanket-editor-v1",
   "scm-smart-proposals.js?v=20260801-manual-over-capacity-v1",
   "scm-smart-exclusions.js?v=20260801-po-only-pauses-v1",
-  "scm-smart-vendor.js?v=20260801-manual-over-capacity-v1"
+  "scm-smart-vendor.js?v=20260807-blanket-source-po-v1"
 ]) assert.equal(html.includes(version), true, `Smart SCM must load cache-busted asset ${version}.`);
 
 console.log(JSON.stringify({

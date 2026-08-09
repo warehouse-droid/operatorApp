@@ -14,6 +14,7 @@ import {
   getScmReconciliationSettings,
   initializeScmReconciliationRunTargets,
   listLocalScmReconciliationSources,
+  listScmReconciliationLinkedEvidenceSensitiveSourceKeys,
   listScmReconciliationRuns,
   loadLocalScmReconciliationOrder,
   markScmReconciliationRunRunning,
@@ -57,6 +58,15 @@ assert.equal(scmScheduleEffectiveReconciliationStatus({
 }), "Queued", "A newer persisted un-Hold must win over an older Hold reconciliation snapshot.");
 
 assert.equal(scmScheduleEffectiveReconciliationStatus({
+  scheduleStatus: "Queued",
+  scheduleId: 106,
+  scheduleUpdatedAt: newerScheduleAt,
+  reconciliationStatus: "current",
+  reconciliationReconciledAt: olderReconciliationAt,
+  reconciliationApplicationStatus: "Completed"
+}), "Completed", "A completed reconciliation outcome must remain terminal even when the persisted schedule is newer.");
+
+assert.equal(scmScheduleEffectiveReconciliationStatus({
   scheduleStatus: "Hold",
   scheduleId: 103,
   scheduleUpdatedAt: newerScheduleAt,
@@ -90,11 +100,17 @@ const operatorId = `reconcile-harness-${seed}`;
 const poId = 9800000000 + seed;
 const poRef = `PO-RECON-${seed}`;
 const poLineKey = 7100000000 + seed;
+const terminalPoId = 9810000000 + seed;
+const terminalPoRef = `PO-TERMINAL-${seed}`;
+const terminalPoLineKey = 7110000000 + seed;
 const irId = 7200000000 + seed;
 const irLineKey = String(7300000000 + seed);
 const toId = 9400000000 + seed;
 const toRef = `TO-RECON-${seed}`;
 const toLineKey = 7500000000 + seed;
+const terminalToId = 9410000000 + seed;
+const terminalToRef = `TO-TERMINAL-${seed}`;
+const terminalToLineKey = 7510000000 + seed;
 const ifId = 7600000000 + seed;
 const inheritedSplitToId = 8900000000 + seed;
 const inheritedSplitToRef = `TO-INHERITED-SPLIT-${seed}`;
@@ -632,6 +648,47 @@ try {
       "The first reconciliation pass must preserve a new PO's Hold status.");
     assert.equal(initialPoReconciliation.targets[poRef]?.applicationStatus, "Hold",
       "The source PO target must also preserve Hold before any receiving progress.");
+    await query(
+      `INSERT INTO purchase_orders (
+         netsuite_id, tranid, trandate, status, status_text,
+         vendor_id, vendor, destination_location_id, destination_location,
+         receipt_status, initial_scm_status, netsuite_active, synced_at
+       ) VALUES (
+         $1, $2, DATE '2026-07-29', 'F', 'Purchase Order : Pending Billing',
+         5001, 'Harness Vendor', 1, 'Destination Yard',
+         'not_received', 'Hold', true, now()
+       )`,
+      [terminalPoId, terminalPoRef]
+    );
+    await query(
+      `INSERT INTO purchase_order_lines (
+         purchase_order_id, line_id, item_id, item_name, sku, quantity,
+         netsuite_received_qty, unit, location_id, location, netsuite_active,
+         raw
+       ) VALUES (
+         $1, $2, 810002, 'Terminal PO Item', 'TERMINAL-PO', 10,
+         0, 'EA', 1, 'Destination Yard', true, $3::jsonb
+       )`,
+      [terminalPoId, terminalPoLineKey, JSON.stringify({
+        sourceLineAliases: [String(terminalPoLineKey)],
+        orderLine: String(terminalPoLineKey),
+        orderLineAliases: [String(terminalPoLineKey)],
+        identityStatus: "exact"
+      })]
+    );
+    const terminalPoResult = await reconcileScmOrderFamily({
+      kind: "PO",
+      sourceOrderId: terminalPoId,
+      source: "manual"
+    });
+    assert.equal(terminalPoResult.applicationStatus, "Completed");
+    assert.equal(terminalPoResult.targets[terminalPoRef].received, 10,
+      "A terminal PO header must apply full receipt quantity to its target, not only its family rollup.");
+    const terminalPoLocal = await query(
+      "SELECT receipt_status FROM purchase_orders WHERE netsuite_id = $1",
+      [terminalPoId]
+    );
+    assert.equal(terminalPoLocal.rows[0].receipt_status, "received");
     const firstReceipt = linkedTransaction({
       sourceOrderId: poId,
       sourceOrderRef: poRef,
@@ -740,6 +797,12 @@ try {
           10, 'EA', 1, 'Destination Yard', 0, 0, true, $3::jsonb)`,
       [toId, toLineKey, toRaw]
     );
+    const queuedToBeforeReconciliation = await loadLocalScmReconciliationOrder("TO", toId);
+    assert.equal(
+      queuedToBeforeReconciliation.localStatus,
+      "Queued",
+      "Internal not_received/not_fulfilled progress must not be loaded as a transport schedule status."
+    );
     const fulfillment = linkedTransaction({
       sourceOrderId: toId,
       sourceOrderRef: toRef,
@@ -775,6 +838,60 @@ try {
     assert.equal(toResult.quantities.ordered, 10);
     assert.equal(toResult.quantities.fulfilled, 10);
     assert.equal(toResult.quantities.received, 0);
+    const reloadedTo = await loadLocalScmReconciliationOrder("TO", toId);
+    assert.equal(
+      reloadedTo.localStatus,
+      "In Transit",
+      "A valid reconciliation schedule status must replace the default Queued status."
+    );
+    await query(
+      `INSERT INTO transfer_orders (
+         netsuite_id, tranid, trandate, status, status_text,
+         from_location_id, from_location, to_location_id, to_location,
+         fulfillment_status, receiving_status, netsuite_active, synced_at
+       ) VALUES (
+         $1, $2, DATE '2026-07-29', 'G', 'Transfer Order : Received',
+         15, 'Source Yard', 1, 'Destination Yard',
+         'not_fulfilled', 'not_received', true, now()
+       )`,
+      [terminalToId, terminalToRef]
+    );
+    const terminalToRaw = JSON.stringify({
+      sourceLineAliases: [String(terminalToLineKey)],
+      orderLine: String(terminalToLineKey),
+      orderLineAliases: [String(terminalToLineKey)],
+      logicalLineIdentity: `transfer-anchor:${terminalToLineKey}`,
+      identityStatus: "exact"
+    });
+    await query(
+      `INSERT INTO transfer_order_lines (
+         line_stage, transfer_order_id, line_id, item_id, item_name, sku,
+         quantity, unit, location_id, location, loaded_qty,
+         netsuite_received_qty, netsuite_active, raw
+       ) VALUES
+         ('outbound', $1, $2, 820002, 'Terminal TO Item', 'TERMINAL-TO',
+          10, 'EA', 15, 'Source Yard', 0, 0, true, $3::jsonb),
+         ('receiving', $1, $2, 820002, 'Terminal TO Item', 'TERMINAL-TO',
+          10, 'EA', 1, 'Destination Yard', 0, 0, true, $3::jsonb)`,
+      [terminalToId, terminalToLineKey, terminalToRaw]
+    );
+    const terminalToResult = await reconcileScmOrderFamily({
+      kind: "TO",
+      sourceOrderId: terminalToId,
+      source: "manual"
+    });
+    assert.equal(terminalToResult.applicationStatus, "Completed");
+    assert.equal(terminalToResult.targets[terminalToRef].fulfilled, 10);
+    assert.equal(terminalToResult.targets[terminalToRef].received, 10,
+      "A received TO header must apply full destination receipt quantity to its target.");
+    const terminalToLocal = await query(
+      `SELECT fulfillment_status, receiving_status
+         FROM transfer_orders
+        WHERE netsuite_id = $1`,
+      [terminalToId]
+    );
+    assert.equal(terminalToLocal.rows[0].fulfillment_status, "fulfilled");
+    assert.equal(terminalToLocal.rows[0].receiving_status, "received");
 
     await query(
       `INSERT INTO transfer_orders (
@@ -853,6 +970,15 @@ try {
         incompleteSplitChildRef
       ]
     );
+    const linkedSensitiveToKeys = await listScmReconciliationLinkedEvidenceSensitiveSourceKeys([
+      { kind: "TO", id: toId },
+      { kind: "TO", id: inheritedSplitToId },
+      { kind: "TO", id: incompleteSplitToId }
+    ]);
+    assert.deepEqual(linkedSensitiveToKeys, [
+      `TO:${incompleteSplitToId}`,
+      `TO:${inheritedSplitToId}`
+    ].sort(), "Only TO sources with active splits/allocations must retain deep IF/IR lookup.");
 
     const inheritedSplitResult = await reconcileScmOrderFamily({
       kind: "TO",

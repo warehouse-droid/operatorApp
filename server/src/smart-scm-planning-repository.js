@@ -38,6 +38,53 @@ function round(value, places = 6) {
   return Math.round((number(value) + Number.EPSILON) * factor) / factor;
 }
 
+export function smartScmEffectiveInboundSales({
+  authoritativeOnOrderSales = 0,
+  blanketExcludedSales = 0,
+  excludedTransferOrderSales = 0,
+  reservedBlanketSales = 0,
+  pendingTransferReservationSales = 0
+} = {}) {
+  const authoritative = positive(authoritativeOnOrderSales);
+  const blanketExcluded = positive(blanketExcludedSales);
+  const transferExcluded = positive(excludedTransferOrderSales);
+  const blanketReserved = positive(reservedBlanketSales);
+  const transferReserved = positive(pendingTransferReservationSales);
+  return {
+    authoritativeOnOrderSales: authoritative,
+    blanketExcludedSales: blanketExcluded,
+    excludedTransferOrderSales: transferExcluded,
+    reservedBlanketSales: blanketReserved,
+    pendingTransferReservationSales: transferReserved,
+    effectiveOnOrderSales: round(
+      Math.max(0, authoritative - blanketExcluded - transferExcluded)
+        + blanketReserved
+        + transferReserved
+    )
+  };
+}
+
+export function smartScmInventoryPositionSales({
+  quantityAvailableSales = 0,
+  quantityBackorderedSales = 0,
+  reservedOutboundSales = 0,
+  ...inboundValues
+} = {}) {
+  const inbound = smartScmEffectiveInboundSales(inboundValues);
+  const available = positive(quantityAvailableSales);
+  const backordered = positive(quantityBackorderedSales);
+  const outboundReserved = positive(reservedOutboundSales);
+  return {
+    quantityAvailableSales: available,
+    ...inbound,
+    quantityBackorderedSales: backordered,
+    reservedOutboundSales: outboundReserved,
+    inventoryPositionSales: round(
+      available + inbound.effectiveOnOrderSales - backordered - outboundReserved
+    )
+  };
+}
+
 export function smartScmUrgencyLevel(value, urgent = false) {
   const level = String(value || "").trim().toLowerCase();
   if (URGENCY_RANK.has(level)) return level === "normal" && urgent ? "urgent" : level;
@@ -425,62 +472,75 @@ export async function loadSmartScmPlanningPolicies({ includeTemporarilyExcluded 
   });
 }
 
-async function inventoryState() {
-  const balances = await query(`SELECT item_id, location_id, quantity_on_hand, quantity_available, synced_at FROM inventory_balances`);
-  const inbound = await query(
-    `WITH open_po AS (
-         SELECT l.item_id,
-                COALESCE(l.location_id, o.destination_location_id) AS location_id,
-                SUM(GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_qty, 0), 0)) AS quantity
-           FROM purchase_order_lines l
-           JOIN purchase_orders o ON o.netsuite_id = l.purchase_order_id
-          WHERE l.netsuite_active = true
-            AND o.netsuite_active = true
-            AND NOT COALESCE(o.is_blanket_po, false)
-            AND l.item_id IS NOT NULL
-            AND COALESCE(l.location_id, o.destination_location_id) IS NOT NULL
-          GROUP BY l.item_id, COALESCE(l.location_id, o.destination_location_id)
-       ), open_to AS (
-         SELECT l.item_id,
-                o.to_location_id AS location_id,
-                SUM(GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_qty, 0), 0)) AS quantity
-           FROM transfer_order_lines l
-           JOIN transfer_orders o ON o.netsuite_id = l.transfer_order_id
-          WHERE l.line_stage = 'receiving'
-            AND l.netsuite_active = true
-            AND o.netsuite_active = true
-            AND l.item_id IS NOT NULL
-            AND o.to_location_id IS NOT NULL
-          GROUP BY l.item_id, o.to_location_id
-       ), blanket_reservation AS (
-         SELECT allocation.item_id,
-                allocation.destination_location_id AS location_id,
-                SUM(CASE
-                  WHEN allocation.status = 'reserved' THEN allocation.reserved_sales_qty
-                  WHEN allocation.status = 'held' THEN allocation.held_sales_qty
-                  ELSE 0
-                END) AS quantity
-           FROM scm_smart_blanket_allocations allocation
-          WHERE allocation.status IN ('reserved', 'held')
-          GROUP BY allocation.item_id, allocation.destination_location_id
-       )
-       SELECT item_id, location_id, SUM(quantity) AS quantity
-         FROM (
-           SELECT * FROM open_po
-           UNION ALL SELECT * FROM open_to
-           UNION ALL SELECT * FROM blanket_reservation
-         ) inbound
-        GROUP BY item_id, location_id`
+async function inventoryState({ excludeTransferOrderIds = [] } = {}) {
+  const excludedTransferOrderIds = [...new Set((excludeTransferOrderIds || [])
+    .map(Number)
+    .filter((id) => Number.isInteger(id) && id > 0))];
+  const balances = await query(
+    `SELECT item_id, location_id, quantity_on_hand, quantity_available,
+            quantity_on_order, quantity_backordered, synced_at
+       FROM inventory_balances`
   );
-  const backorders = await query(
-    `SELECT l.item_id, COALESCE(l.location_id, o.outbound_location_id, o.order_location_id) AS location_id,
-            SUM(GREATEST(COALESCE(l.netsuite_backordered_qty, 0), 0)) AS quantity
-       FROM sales_order_lines l
-       JOIN sales_orders o ON o.netsuite_id = l.sales_order_id
-      WHERE l.netsuite_active = true
-        AND o.netsuite_active = true
-        AND l.item_id IS NOT NULL
-      GROUP BY l.item_id, COALESCE(l.location_id, o.outbound_location_id, o.order_location_id)`
+  const adjustments = await query(
+    `WITH blanket_po AS (
+       SELECT line.item_id,
+              COALESCE(line.location_id, po.destination_location_id) AS location_id,
+              SUM(GREATEST(COALESCE(line.quantity, 0) - COALESCE(line.netsuite_received_qty, 0), 0)) AS quantity
+         FROM purchase_order_lines line
+         JOIN purchase_orders po ON po.netsuite_id = line.purchase_order_id
+        WHERE line.netsuite_active = true
+          AND po.netsuite_active = true
+          AND po.is_blanket_po = true
+          AND NOT COALESCE(line.netsuite_closed, false)
+          AND (po.status_text ILIKE '%Pending Receipt%' OR po.status_text ILIKE '%Partially Received%')
+          AND NOT EXISTS (
+            SELECT 1
+              FROM dispatch_scm_po_splits child_split
+             WHERE child_split.split_po_id = po.netsuite_id
+          )
+          AND line.item_id IS NOT NULL
+          AND COALESCE(line.location_id, po.destination_location_id) IS NOT NULL
+        GROUP BY line.item_id, COALESCE(line.location_id, po.destination_location_id)
+     ), excluded_transfer AS (
+       SELECT line.item_id,
+              transfer.to_location_id AS location_id,
+              SUM(GREATEST(COALESCE(line.quantity, 0) - COALESCE(line.netsuite_received_qty, 0), 0)) AS quantity
+         FROM transfer_order_lines line
+         JOIN transfer_orders transfer ON transfer.netsuite_id = line.transfer_order_id
+        WHERE line.line_stage = 'receiving'
+          AND line.netsuite_active = true
+          AND transfer.netsuite_active = true
+          AND line.transfer_order_id = ANY($1::bigint[])
+          AND line.item_id IS NOT NULL
+          AND transfer.to_location_id IS NOT NULL
+        GROUP BY line.item_id, transfer.to_location_id
+     ), blanket_reservation AS (
+       SELECT allocation.item_id,
+              allocation.destination_location_id AS location_id,
+              SUM(CASE
+                WHEN allocation.status = 'reserved' THEN allocation.reserved_sales_qty
+                WHEN allocation.status = 'held' THEN allocation.held_sales_qty
+                ELSE 0
+              END) AS quantity
+         FROM scm_smart_blanket_allocations allocation
+        WHERE allocation.status IN ('reserved', 'held')
+        GROUP BY allocation.item_id, allocation.destination_location_id
+     )
+     SELECT item_id, location_id,
+            SUM(blanket_quantity) AS blanket_quantity,
+            SUM(excluded_transfer_quantity) AS excluded_transfer_quantity,
+            SUM(reserved_blanket_quantity) AS reserved_blanket_quantity
+       FROM (
+         SELECT item_id, location_id, quantity AS blanket_quantity,
+                0::numeric AS excluded_transfer_quantity, 0::numeric AS reserved_blanket_quantity
+           FROM blanket_po
+         UNION ALL
+         SELECT item_id, location_id, 0::numeric, quantity, 0::numeric FROM excluded_transfer
+         UNION ALL
+         SELECT item_id, location_id, 0::numeric, 0::numeric, quantity FROM blanket_reservation
+       ) adjustment
+      GROUP BY item_id, location_id`,
+    [excludedTransferOrderIds]
   );
   const reservations = await query(
     `SELECT item_id, source_location_id, destination_location_id,
@@ -491,8 +551,18 @@ async function inventoryState() {
       GROUP BY item_id, source_location_id, destination_location_id`
   );
   const balanceMap = new Map(balances.rows.map((row) => [`${row.item_id}:${row.location_id}`, row]));
-  const inboundMap = new Map(inbound.rows.map((row) => [`${row.item_id}:${row.location_id}`, positive(row.quantity)]));
-  const backorderMap = new Map(backorders.rows.map((row) => [`${row.item_id}:${row.location_id}`, positive(row.quantity)]));
+  const blanketExcludedMap = new Map(adjustments.rows.map((row) => [
+    `${row.item_id}:${row.location_id}`,
+    positive(row.blanket_quantity)
+  ]));
+  const excludedTransferOrderMap = new Map(adjustments.rows.map((row) => [
+    `${row.item_id}:${row.location_id}`,
+    positive(row.excluded_transfer_quantity)
+  ]));
+  const reservedBlanketMap = new Map(adjustments.rows.map((row) => [
+    `${row.item_id}:${row.location_id}`,
+    positive(row.reserved_blanket_quantity)
+  ]));
   const outboundReservationMap = new Map();
   const inboundReservationMap = new Map();
   for (const row of reservations.rows) {
@@ -501,7 +571,14 @@ async function inventoryState() {
     outboundReservationMap.set(outboundKey, positive(outboundReservationMap.get(outboundKey)) + positive(row.quantity));
     inboundReservationMap.set(inboundKey, positive(inboundReservationMap.get(inboundKey)) + positive(row.quantity));
   }
-  return { balanceMap, inboundMap, backorderMap, outboundReservationMap, inboundReservationMap };
+  return {
+    balanceMap,
+    blanketExcludedMap,
+    excludedTransferOrderMap,
+    reservedBlanketMap,
+    outboundReservationMap,
+    inboundReservationMap
+  };
 }
 
 async function latestVendorSupplyMap() {
@@ -549,17 +626,27 @@ export async function smartScmMinimumOrderMap(policies = []) {
   return new Map([...values].map(([key, orders]) => [key, robustMinimumOrder(orders)]));
 }
 
-function calculatePolicyState(policy, forecast, inventory, minimumOrder, settings = {}) {
+export function calculatePolicyState(policy, forecast, inventory, minimumOrder, settings = {}) {
   const key = `${policy.item_id}:${policy.location_id}`;
   const toPlt = positive(policy.to_plt);
   const balance = inventory.balanceMap.get(key) || {};
   const onHandSales = positive(balance.quantity_on_hand);
   const rawAvailableSales = number(balance.quantity_available);
   const availableSales = positive(rawAvailableSales);
-  const onOrderSales = positive(inventory.inboundMap.get(key)) + positive(inventory.inboundReservationMap.get(key));
-  const backorderedSales = positive(inventory.backorderMap.get(key));
   const reservedOutboundSales = positive(inventory.outboundReservationMap.get(key));
-  const positionPallets = toPlt > EPSILON ? (availableSales + onOrderSales - backorderedSales - reservedOutboundSales) / toPlt : 0;
+  const position = smartScmInventoryPositionSales({
+    quantityAvailableSales: availableSales,
+    authoritativeOnOrderSales: balance.quantity_on_order,
+    blanketExcludedSales: inventory.blanketExcludedMap.get(key),
+    excludedTransferOrderSales: inventory.excludedTransferOrderMap.get(key),
+    reservedBlanketSales: inventory.reservedBlanketMap.get(key),
+    pendingTransferReservationSales: inventory.inboundReservationMap.get(key),
+    quantityBackorderedSales: balance.quantity_backordered,
+    reservedOutboundSales
+  });
+  const onOrderSales = position.effectiveOnOrderSales;
+  const backorderedSales = position.quantityBackorderedSales;
+  const positionPallets = toPlt > EPSILON ? position.inventoryPositionSales / toPlt : 0;
   const availablePallets = toPlt > EPSILON ? Math.max(0, availableSales - reservedOutboundSales) / toPlt : 0;
   const levels = calculateSmartScmPolicyLevels(policy, forecast, settings);
   const leadWeeks = levels.leadWeeks;
@@ -593,7 +680,11 @@ function calculatePolicyState(policy, forecast, inventory, minimumOrder, setting
   const availableCoverageGapPallets = coverageApplied ? Math.max(0, coverageFloor - availablePallets) : 0;
   const coverageCoveredByInbound = coverageApplied && availableCoverageGapPallets > EPSILON && positionPallets >= coverageFloor - EPSILON;
   const weeksOfCover = weeklyDemand > EPSILON ? Math.max(0, positionPallets) / weeklyDemand : Number.POSITIVE_INFINITY;
-  const urgent = required > 0 && (positionPallets <= safety + EPSILON || weeksOfCover <= leadWeeks + EPSILON);
+  const urgent = required > 0 && (
+    availablePallets <= EPSILON
+    || positionPallets <= safety + EPSILON
+    || weeksOfCover <= leadWeeks + EPSILON
+  );
   return {
     key,
     policy,
@@ -604,6 +695,11 @@ function calculatePolicyState(policy, forecast, inventory, minimumOrder, setting
     rawAvailableSales,
     availableSales,
     availablePallets,
+    authoritativeOnOrderSales: position.authoritativeOnOrderSales,
+    blanketExcludedSales: position.blanketExcludedSales,
+    excludedTransferOrderSales: position.excludedTransferOrderSales,
+    reservedBlanketSales: position.reservedBlanketSales,
+    pendingTransferReservationSales: position.pendingTransferReservationSales,
     onOrderSales,
     backorderedSales,
     reservedOutboundSales,
@@ -682,10 +778,18 @@ export function smartScmProposalLineForState(state, pallets, extraReason = {}) {
       quantityOnHand: state.onHandSales,
       quantityAvailable: state.availableSales,
       quantityOnOrder: state.onOrderSales,
+      quantityOnOrderAuthoritative: state.authoritativeOnOrderSales,
+      quantityBlanketExcluded: state.blanketExcludedSales,
+      quantityTransferOrderExcluded: state.excludedTransferOrderSales,
+      quantityBlanketReservedInbound: state.reservedBlanketSales,
+      quantityPendingTransferReservation: state.pendingTransferReservationSales,
       quantityBackordered: state.backorderedSales,
       quantityReservedOutbound: state.reservedOutboundSales,
       positionPallets: state.positionPallets,
       availablePallets: state.availablePallets,
+      expectedAvailablePallets: round(Math.max(0, state.positionPallets)),
+      destinationAvailablePallets: state.availablePallets,
+      destinationExpectedAvailablePallets: round(Math.max(0, state.positionPallets)),
       baseReorderPointPallets: state.baseRop,
       basePreferredPallets: state.basePreferred,
       zeroDemandCoverageApplied: state.coverageApplied,
@@ -846,11 +950,43 @@ function palletUnits(draft) {
   if (total <= EPSILON || line.manualPlanningRequired || smartScmPalletLoadWeightLbs(line) <= EPSILON) {
     return [{ draft, line: { ...line } }];
   }
+  const savedDestinationAllocations = Array.isArray(line.reason?.destinationAllocations)
+    ? line.reason.destinationAllocations
+      .map((allocation) => ({
+        ...allocation,
+        yard: String(allocation?.yard || "").trim(),
+        proposedPallets: round(positive(allocation?.proposedPallets))
+      }))
+      .filter((allocation) => allocation.yard && allocation.proposedPallets > EPSILON)
+    : [];
+  const savedAllocationTotal = savedDestinationAllocations
+    .reduce((sum, allocation) => sum + allocation.proposedPallets, 0);
+  if (savedDestinationAllocations.length && Math.abs(savedAllocationTotal - total) > EPSILON) {
+    throw new Error("Destination allocation total must match the physical proposal-line quantity before packing.");
+  }
+  const allocationRemaining = savedDestinationAllocations
+    .map((allocation) => ({ ...allocation }));
+  let allocationIndex = 0;
+  const takeDestinationAllocations = (pallets) => {
+    if (!allocationRemaining.length) return null;
+    const taken = [];
+    let needed = pallets;
+    while (needed > EPSILON && allocationIndex < allocationRemaining.length) {
+      const allocation = allocationRemaining[allocationIndex];
+      const quantity = Math.min(needed, allocation.proposedPallets);
+      if (quantity > EPSILON) taken.push({ ...allocation, proposedPallets: round(quantity) });
+      allocation.proposedPallets = round(allocation.proposedPallets - quantity);
+      needed = round(needed - quantity);
+      if (allocation.proposedPallets <= EPSILON) allocationIndex += 1;
+    }
+    return taken;
+  };
   const units = [];
   let remaining = total;
   while (remaining > EPSILON) {
     const pallets = Math.min(1, remaining);
     const ratio = pallets / total;
+    const destinationAllocations = takeDestinationAllocations(pallets);
     units.push({
       draft,
       line: {
@@ -860,12 +996,72 @@ function palletUnits(draft) {
         confirmedPallets: 0,
         residualPallets: round(pallets),
         salesQuantity: round(positive(line.salesQuantity) * ratio),
-        lineWeight: round(positive(line.lineWeight) * ratio)
+        lineWeight: round(positive(line.lineWeight) * ratio),
+        ...(destinationAllocations ? {
+          reason: {
+            ...(line.reason || {}),
+            destinationAllocations,
+            actualDestinationYard: destinationAllocations.length === 1
+              ? destinationAllocations[0].yard
+              : null
+          }
+        } : {})
       }
     });
     remaining = round(remaining - pallets);
   }
   return units;
+}
+
+function lineDemandDestination(line = {}) {
+  return String(
+    line.reason?.actualDestinationYard
+      || line.destinationName
+      || line.destinationLocationId
+      || ""
+  ).trim();
+}
+
+function lineDestinationAllocations(line = {}) {
+  const physicalYard = String(line.destinationName || "").trim();
+  const saved = Array.isArray(line.reason?.destinationAllocations)
+    ? line.reason.destinationAllocations
+    : [];
+  const normalized = saved
+    .map((allocation) => ({
+      yard: String(allocation?.yard || "").trim(),
+      proposedPallets: round(positive(allocation?.proposedPallets)),
+      fulfillment: ["vendor_direct", "transfer_later"].includes(allocation?.fulfillment)
+        ? allocation.fulfillment
+        : String(allocation?.yard || "").trim() === physicalYard
+          ? "vendor_direct"
+          : "transfer_later"
+    }))
+    .filter((allocation) => allocation.yard && allocation.proposedPallets > EPSILON);
+  if (normalized.length) return normalized;
+  const yard = lineDemandDestination(line);
+  const proposedPallets = round(positive(line.proposedPallets));
+  return yard && proposedPallets > EPSILON ? [{
+    yard,
+    proposedPallets,
+    fulfillment: yard === physicalYard ? "vendor_direct" : "transfer_later"
+  }] : [];
+}
+
+function mergedLineDestinationAllocations(existing, next) {
+  const totals = new Map();
+  for (const allocation of [
+    ...lineDestinationAllocations(existing),
+    ...lineDestinationAllocations(next)
+  ]) {
+    const key = `${allocation.fulfillment}:${allocation.yard}`;
+    const current = totals.get(key) || { ...allocation, proposedPallets: 0 };
+    current.proposedPallets = round(current.proposedPallets + allocation.proposedPallets);
+    totals.set(key, current);
+  }
+  return [...totals.values()]
+    .sort((left, right) => left.yard.localeCompare(right.yard, undefined, { numeric: true })
+      || left.fulfillment.localeCompare(right.fulfillment));
 }
 
 function combineLoadLine(lines, next) {
@@ -875,6 +1071,12 @@ function combineLoadLine(lines, next) {
     lines.push({ ...next });
     return;
   }
+  const tracksMultipleDestinations = Array.isArray(existing.reason?.destinationAllocations)
+    || Array.isArray(next.reason?.destinationAllocations)
+    || lineDemandDestination(existing) !== lineDemandDestination(next);
+  const destinationAllocations = tracksMultipleDestinations
+    ? mergedLineDestinationAllocations(existing, next)
+    : null;
   existing.requiredPallets = round(positive(existing.requiredPallets) + positive(next.requiredPallets));
   existing.proposedPallets = round(positive(existing.proposedPallets) + positive(next.proposedPallets));
   existing.confirmedPallets = round(positive(existing.confirmedPallets) + positive(next.confirmedPallets));
@@ -892,6 +1094,10 @@ function combineLoadLine(lines, next) {
     urgencyLevel: existing.urgencyLevel,
     urgencyScore: existing.urgencyScore,
     provisional: existing.provisional,
+    ...(destinationAllocations ? {
+      destinationAllocations,
+      actualDestinationYard: destinationAllocations.length === 1 ? destinationAllocations[0].yard : null
+    } : {}),
     ...((existing.reason?.gormleyOriginalDestinations || next.reason?.gormleyOriginalDestinations)
       ? { gormleyOriginalDestinations: [...new Set([
         ...(existing.reason?.gormleyOriginalDestinations || []),
@@ -902,6 +1108,9 @@ function combineLoadLine(lines, next) {
 
 function compatibleLoadSignature(draft) {
   const destination = draft.proposalType === "PO" ? "multi-drop" : `${draft.destinationLocationId}|${draft.destinationName}`;
+  const phase = draft.proposalType === "PO" && ["direct_vendor", "vendor_hub"].includes(draft.phase)
+    ? "vendor_purchase"
+    : draft.phase;
   const vendorYardId = Number(draft.sourceVendorYardId);
   const sourceIdentity = draft.sourceKind === "vendor" && Number.isInteger(vendorYardId) && vendorYardId > 0
     ? `vendor-yard:${vendorYardId}`
@@ -909,7 +1118,7 @@ function compatibleLoadSignature(draft) {
       ? `legacy-vendor:${text(draft.vendor).toLowerCase().replace(/[^a-z0-9]+/g, "")}:${text(draft.plant || draft.sourceName).toLowerCase().replace(/[^a-z0-9]+/g, "")}`
       : `yard:${draft.sourceLocationId || text(draft.sourceName).toLowerCase().replace(/[^a-z0-9]+/g, "")}`;
   return [
-    draft.proposalType, draft.phase, draft.sourceKind, sourceIdentity, destination
+    draft.proposalType, phase, draft.sourceKind, sourceIdentity, destination
   ].join("|");
 }
 
@@ -1128,6 +1337,11 @@ function criticalAffinityProposalLoads(baselineLoads = [], truckCapacity = 0, ma
   if (candidate.some((load) => load.totalWeight > truckCapacity + EPSILON || loadDestinationIds(load).size > maxStops)) {
     return baselineLoads;
   }
+  const fullSingleDestinationCount = (loads) => loads.filter((load) =>
+    loadDestinationIds(load).size === 1 && operationallyFullLoad(load, truckCapacity)).length;
+  if (fullSingleDestinationCount(candidate) < fullSingleDestinationCount(baselineLoads)) {
+    return baselineLoads;
+  }
   const baselineWeight = baselineLoads.reduce((sum, load) => sum + positive(load.totalWeight), 0);
   const candidateWeight = candidate.reduce((sum, load) => sum + positive(load.totalWeight), 0);
   if (Math.abs(baselineWeight - candidateWeight) > EPSILON || !samePackedLineTotals(baselineLoads, candidate)) {
@@ -1182,7 +1396,10 @@ export function consolidateCompatibleDrafts(drafts = [], settings = {}, namespac
   }
   const consolidated = [];
   for (const [signature, group] of groups) {
-    const base = group[0];
+    const base = group.find((draft) => draft.phase === "direct_vendor") || group[0];
+    const phase = group.some((draft) => draft.phase === "direct_vendor")
+      ? "direct_vendor"
+      : base.phase;
     const routeRule = routeRules.get?.(smartScmRouteRuleKey(base.sourceName));
     const loads = smartScmPackWholePalletLines(group.flatMap((draft) => draft.lines), truckCapacity, {
       proposalType: base.proposalType,
@@ -1202,7 +1419,8 @@ export function consolidateCompatibleDrafts(drafts = [], settings = {}, namespac
       else if (base.proposalType !== "PO" && utilization < positive(settings.hold_load_ratio, 0.5)) status = "held";
       consolidated.push({
         ...base,
-        proposalKey: `load:${namespace}:${base.phase}:${planningKeyHash(signature)}:${index + 1}`,
+        phase,
+        proposalKey: `load:${namespace}:${phase}:${planningKeyHash(signature)}:${index + 1}`,
         status,
         urgent: priority.urgent,
         urgencyLevel: priority.urgencyLevel,
@@ -1215,7 +1433,7 @@ export function consolidateCompatibleDrafts(drafts = [], settings = {}, namespac
         totalPallets,
         totalWeight: load.totalWeight,
         utilization,
-        memo: `${base.phase.replaceAll("_", " ")} · load ${index + 1} · ${load.lines.length} item${load.lines.length === 1 ? "" : "s"}`,
+        memo: `${phase.replaceAll("_", " ")} · load ${index + 1} · ${load.lines.length} item${load.lines.length === 1 ? "" : "s"}`,
         lines: load.lines
       });
     });
@@ -1323,19 +1541,17 @@ export function smartScmBuildPlanningDrafts({ states, supplyMap, settings }) {
         keySuffix: index + 1
       }, settings)));
     }
-    let transferNeed = Math.max(0, state.requiredPallets - (supplyStatus === "partial" ? directPallets : 0));
-    let provisional = false;
-    if (state.urgent && ["unknown", "available", "production_eta"].includes(supplyStatus)) {
-      transferNeed = state.requiredPallets;
-      provisional = true;
-    }
+    let transferNeed = Math.max(0, state.requiredPallets - directPallets);
+    const provisional = false;
     if (["out_of_stock", "credit_hold"].includes(supplyStatus)) transferNeed = state.requiredPallets;
     if (purchasePlanningExcluded) transferNeed = state.requiredPallets;
     if (transferNeed > EPSILON) {
       const internal = internalTransferDrafts({ state, requestedPallets: transferNeed, stateByKey, settings, provisional, keyPrefix: "initial" });
       drafts.push(...internal.drafts);
-      if (internal.remaining > EPSILON && !purchasePlanningExcluded) {
-        const hub = YARDS.find((yard) => yard.code === "12441");
+      const hub = YARDS.find((yard) => yard.code === "12441");
+      if (internal.remaining > EPSILON
+        && !purchasePlanningExcluded
+        && Number(state.policy.location_id) !== hub.locationId) {
         const vendorHubLine = smartScmProposalLineForState(state, internal.remaining, {
           vendorSupplyStatus: supplyStatus,
           residualAfterInternalTransferPallets: internal.remaining,
@@ -1697,12 +1913,13 @@ async function proposalRows({ proposalId = null, runId = null, status = "", stat
 
 export async function loadSmartScmPlanningDemandStates({
   forecastRunId = null,
-  includeTemporarilyExcluded = true
+  includeTemporarilyExcluded = true,
+  excludeTransferOrderIds = []
 } = {}) {
   const selectedForecastRunId = forecastRunId || await latestSmartScmForecastRunId();
   const settings = await settingsRow();
   const policies = await loadSmartScmPlanningPolicies({ includeTemporarilyExcluded });
-  const inventory = await inventoryState();
+  const inventory = await inventoryState({ excludeTransferOrderIds });
   const supplyMap = await latestVendorSupplyMap();
   const forecasts = await smartScmForecastMap(selectedForecastRunId);
   const routeRules = await smartScmRouteRuleMap();

@@ -3,6 +3,7 @@ import { config, requireConfig } from "./config.js";
 import { query } from "./db.js";
 import { assertSandboxNetSuiteEnvironment } from "./mbt/netsuite-readonly-adapter.js";
 import { normalizeSalesOrderReconciliationType } from "./sales-order-reconciliation.js";
+import { buildTransferDependencyUpdateRequest } from "./transfer-dependency-netsuite.js";
 
 let suiteqlQueue = Promise.resolve();
 let restMutationQueue = Promise.resolve();
@@ -713,6 +714,21 @@ export async function createTransferOrderInNetSuite(payload, { intercompany = fa
   return result;
 }
 
+export async function updateTransferOrderInNetSuite(orderId, payload, { intercompany = false } = {}) {
+  const request = buildTransferDependencyUpdateRequest({
+    transferOrderId: orderId,
+    intercompany,
+    payload
+  });
+  const run = () => netsuiteRest(request.path, {
+    method: request.method,
+    body: request.payload
+  });
+  const result = restMutationQueue.then(run, run);
+  restMutationQueue = result.catch(() => {});
+  return result;
+}
+
 export async function createPurchaseOrderInNetSuite(payload) {
   const run = () => netsuiteRest("/record/v1/purchaseOrder", {
     method: "POST",
@@ -987,6 +1003,48 @@ export async function fetchPurchaseOrderPdfFromNetSuite(orderId, { filenamePrefi
   };
 }
 
+export function buildPurchaseOrderHistoryRestPayload({ header = {}, lines = [] } = {}) {
+  const payload = {};
+  if (Object.prototype.hasOwnProperty.call(header, "transactionDate")) payload.tranDate = header.transactionDate;
+  if (Object.prototype.hasOwnProperty.call(header, "expectedDeliveryDate")) payload.custbody4 = header.expectedDeliveryDate || null;
+  if (Object.prototype.hasOwnProperty.call(header, "memo")) payload.memo = String(header.memo ?? "");
+  if (Object.prototype.hasOwnProperty.call(header, "vendorReference")) payload.otherRefNum = String(header.vendorReference ?? "");
+  if (lines.length) {
+    payload.item = {
+      items: lines.map((entry) => {
+        const restLineId = Number(entry.restLineId);
+        if (!Number.isInteger(restLineId) || restLineId <= 0) {
+          const error = new Error(`Purchase-order line ${entry.lineId || ""} has no REST sublist key.`.trim());
+          error.code = "NETSUITE_PO_REST_LINE_KEY_MISSING";
+          error.status = 409;
+          throw error;
+        }
+        const line = { line: restLineId };
+        if (Object.prototype.hasOwnProperty.call(entry, "quantity")) line.quantity = Number(entry.quantity);
+        if (entry.updatePalletColumn === true
+          && Object.prototype.hasOwnProperty.call(entry, "palletQuantity")) {
+          line.custcol_plt = Number(entry.palletQuantity);
+        }
+        if (Object.prototype.hasOwnProperty.call(entry, "rate")) line.rate = Number(entry.rate);
+        if (Object.prototype.hasOwnProperty.call(entry, "locationId")) {
+          line.location = { id: String(Number(entry.locationId)) };
+        }
+        return line;
+      })
+    };
+  }
+  return payload;
+}
+
+function comparableNetSuiteDate(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const instant = new Date(raw);
+  if (!Number.isNaN(instant.getTime())) return instant.toISOString().slice(0, 10);
+  const match = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  return match ? `${match[3]}-${match[1].padStart(2, "0")}-${match[2].padStart(2, "0")}` : raw.slice(0, 10);
+}
+
 export async function updatePurchaseOrderHistoryInNetSuite(orderId, {
   expectedLastModifiedAt,
   header = {},
@@ -994,20 +1052,46 @@ export async function updatePurchaseOrderHistoryInNetSuite(orderId, {
 } = {}) {
   const id = Number(orderId);
   if (!Number.isInteger(id) || id <= 0) throw new Error("A valid numeric NetSuite purchase order ID is required.");
-  const run = () => configuredRestletJson({
-    action: "updatePurchaseOrder",
-    entityId: id,
-    expectedLastModifiedAt: String(expectedLastModifiedAt || "").trim(),
-    header,
-    lines
-  });
+  const run = async () => {
+    const current = await netsuiteRest(`/record/v1/purchaseOrder/${id}?expandSubResources=true`, { method: "GET" });
+    const record = current.data && typeof current.data === "object" ? current.data : {};
+    const expected = String(expectedLastModifiedAt || "").trim();
+    if (expected && comparableNetSuiteDate(expected) !== comparableNetSuiteDate(record.lastModifiedDate)) {
+      const error = new Error("This purchase order changed in NetSuite. Refresh and review the latest values before saving.");
+      error.code = "MBBS_PO_VERSION_CONFLICT";
+      error.status = 409;
+      throw error;
+    }
+    const remoteLines = new Map((record.item?.items || []).map((line) => [Number(line.line), line]));
+    for (const requested of lines) {
+      const remote = remoteLines.get(Number(requested.restLineId));
+      if (!remote) {
+        const error = new Error(`Purchase-order line ${requested.lineId || requested.restLineId} no longer exists.`);
+        error.status = 409;
+        throw error;
+      }
+      if (requested.itemId && Number(remote.item?.id) !== Number(requested.itemId)) {
+        const error = new Error(`Item identity on purchase-order line ${requested.lineId || requested.restLineId} changed in NetSuite.`);
+        error.status = 409;
+        throw error;
+      }
+    }
+    const payload = buildPurchaseOrderHistoryRestPayload({ header, lines });
+    const updated = await netsuiteRest(`/record/v1/purchaseOrder/${id}`, {
+      method: "PATCH",
+      body: payload
+    });
+    return {
+      operation: "purchaseOrderUpdate",
+      entityId: id,
+      transport: "restRecord",
+      status: updated.status,
+      lastModifiedBefore: record.lastModifiedDate || null
+    };
+  };
   const result = restMutationQueue.then(run, run);
   restMutationQueue = result.catch(() => {});
-  const response = await result;
-  if (response.action !== "updatePurchaseOrder" || Number(response.entityId) !== id) {
-    throw new Error("NetSuite purchase-order update RESTlet returned the wrong transaction identity.");
-  }
-  return response;
+  return result;
 }
 
 export async function resolvePalletItemFromNetSuite() {
@@ -2480,6 +2564,7 @@ function purchaseOrderHistorySnapshotFromRows(rows) {
     foreignTotal: first.foreigntotal === null || first.foreigntotal === undefined ? null : Number(first.foreigntotal),
     lines: rows.filter((row) => row.line_id !== null && row.line_id !== undefined).map((row) => ({
       lineId: Number(row.line_id),
+      restLineId: Number(row.rest_line_id) || null,
       itemId: Number(row.item_id) || null,
       itemName: row.item_name || "",
       itemType: row.item_type || "",
@@ -2526,6 +2611,7 @@ export async function fetchPurchaseOrderHistorySnapshotsFromNetSuite(orderIds = 
       t.custbody4 AS expected_delivery_date,
       t.foreigntotal,
       tl.uniquekey AS line_id,
+      tl.id AS rest_line_id,
       tl.item AS item_id,
       BUILTIN.DF(tl.item) AS item_name,
       i.itemtype AS item_type,
@@ -2756,7 +2842,9 @@ export async function fetchInventoryBalancesFromNetSuite(locationIds = [1, 28, 1
       ib.location AS location_id,
       BUILTIN.DF(ib.location) AS location,
       ib.quantityonhand AS quantity_on_hand,
-      ib.quantityavailable AS quantity_available
+      ib.quantityavailable AS quantity_available,
+      ib.quantityonorder AS quantity_on_order,
+      ib.quantitybackordered AS quantity_backordered
     FROM AggregateItemLocation ib
     INNER JOIN item i ON i.id = ib.item
     WHERE ib.location IN (${ids.join(",")})
@@ -2796,7 +2884,9 @@ export async function fetchInventoryBalanceForItemFromNetSuite(itemId, locationI
       ib.location AS location_id,
       BUILTIN.DF(ib.location) AS location,
       ib.quantityonhand AS quantity_on_hand,
-      ib.quantityavailable AS quantity_available
+      ib.quantityavailable AS quantity_available,
+      ib.quantityonorder AS quantity_on_order,
+      ib.quantitybackordered AS quantity_backordered
     FROM AggregateItemLocation ib
     INNER JOIN item i ON i.id = ib.item
     WHERE ib.item = ${item}
@@ -3112,7 +3202,9 @@ export async function fetchInventoryBalancesForItemsFromNetSuite(itemIds = [], l
       ib.location AS location_id,
       BUILTIN.DF(ib.location) AS location,
       ib.quantityonhand AS quantity_on_hand,
-      ib.quantityavailable AS quantity_available
+      ib.quantityavailable AS quantity_available,
+      ib.quantityonorder AS quantity_on_order,
+      ib.quantitybackordered AS quantity_backordered
     FROM AggregateItemLocation ib
     INNER JOIN item i ON i.id = ib.item
     WHERE ib.item IN (${items.join(",")})

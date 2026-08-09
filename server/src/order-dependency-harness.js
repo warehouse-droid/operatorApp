@@ -1,12 +1,13 @@
 import { beginRollbackContext, closeDb, query } from "./db.js";
 import { config } from "./config.js";
 import {
+  claimTransferDependencyPrintGeneration,
   safeEstablishedDependencyUngroupingTargets,
   safeNormalDependencyGroupingRefs,
   safeNormalDependencyGroupingTargets
 } from "./server.js";
 import { matchNetSuiteLocation } from "./netsuite.js";
-import { buildTransferDependencyRestPayload } from "./transfer-dependency-netsuite.js";
+import { buildTransferDependencyRestPayload, transferDependencyPickingTicketJobKey } from "./transfer-dependency-netsuite.js";
 import {
   assertNoActiveOrderDependenciesByRefs,
   calculateTransferProposalPallets,
@@ -30,6 +31,7 @@ import {
   reconcileCompletedYardTransfersForSalesOrderStart,
   removeTransferDependencyProposalLine,
   reopenTransferDependencyCandidate,
+  reviseTransferDependencyProposal,
   sortTransferDependencyCandidatesByCompletedAt,
   reviewTransferDependencyCandidate,
   sortTransferDependencyCandidatesByCreatedAt,
@@ -896,6 +898,245 @@ try {
       && singleProposalResult.batch.status === "partially_created"
       && singleProposalResult.batch.proposals.some((proposal) => proposal.creationStatus === "draft"),
     "Creating one proposed TO must leave sibling proposals editable for separate creation.", { singleProposalResult });
+    const createdProposalBeforeRevision = singleProposalResult.batch.proposals
+      .find((proposal) => proposal.creationStatus === "created");
+    const historicalPrint = await query(
+      `INSERT INTO scm_print_jobs (
+         job_key, location_id, document_type, document_name, document_path,
+         document_sha256, status, queued_at, started_at, printed_at
+       ) VALUES ($1, $2, 'transfer_dependency_picking_ticket', $3, $4, $5, 'printed', now(), now(), now())
+       RETURNING id`,
+      [`dependency-revision-history:${suffix}`, createdProposalBeforeRevision.fromLocationId,
+        `revision-before-${suffix}.pdf`, `/tmp/revision-before-${suffix}.pdf`, String(suffix + 1).padStart(64, "0").slice(0, 64)]
+    );
+    await query(
+      `UPDATE scm_transfer_dependency_proposals
+          SET print_job_id = $2, approval_status = 'approved', quantity_verification_status = 'verified'
+        WHERE id = $1`,
+      [createdProposalBeforeRevision.id, historicalPrint.rows[0].id]
+    );
+    const revisionSource = await getTransferDependencyBatch(batch.id);
+    const revisionProposal = revisionSource.proposals.find((proposal) => proposal.id === createdProposalBeforeRevision.id);
+    const revisedLineId = revisionProposal.lines.find((proposalLine) => proposalLine.lineSource !== "manual")?.id;
+    const revisedInputLines = revisionProposal.lines.map((proposalLine) => ({
+      proposalLineId: proposalLine.id,
+      quantities: proposalLine.id === revisedLineId
+        ? { ...proposalLine.quantities, pallets: Math.max(1, Number(proposalLine.quantities.pallets || 0) - 1) }
+        : { ...proposalLine.quantities }
+    }));
+    let revisionPatched = false;
+    let revisionPatchCalls = 0;
+    const revisionRequest = {
+      requestId: `dependency-revision:${suffix}`,
+      expectedRevision: revisionProposal.revision,
+      lines: revisedInputLines
+    };
+    const revisedResult = await reviseTransferDependencyProposal(
+      batch.id,
+      revisionProposal.id,
+      revisionRequest,
+      {
+        operatorId: "dependency-harness",
+        inspectTransferOrder: async ({ proposal }) => ({
+          matches: revisionPatched,
+          pendingFulfillment: true,
+          mismatches: revisionPatched ? [] : ["fixture quantity differs"],
+          proposal
+        }),
+        updateTransferOrder: async ({ proposal, transferOrderId }) => {
+          revisionPatchCalls += 1;
+          check(Number(transferOrderId) === Number(createdTransferIds[0]),
+            "A created revision must PATCH the existing TO ID instead of creating another order.",
+            { transferOrderId, createdTransferIds });
+          revisionPatched = true;
+          return { id: transferOrderId, status: 204, proposal };
+        },
+        hydrateTransferOrder: fakeHydrateTransferOrder
+      }
+    );
+    const revisedProposal = revisedResult.batch.proposals.find((proposal) => proposal.id === revisionProposal.id);
+    const revisedProposalLine = revisedProposal.lines.find((proposalLine) => proposalLine.id === revisedLineId);
+    const revisedDependencyLine = await query(
+      `SELECT dl.allocated_quantity, dl.pallet_qty, dl.layer_qty, dl.section_qty, dl.piece_qty
+         FROM order_dependency_lines dl
+         JOIN order_dependencies d ON d.id = dl.dependency_id
+        WHERE d.proposal_id = $1 AND dl.sales_line_id = $2`,
+      [revisionProposal.id, revisedProposalLine.salesLineId]
+    );
+    const preservedHistoricalPrint = await query(
+      "SELECT status FROM scm_print_jobs WHERE id = $1",
+      [historicalPrint.rows[0].id]
+    );
+    const revisedTransferCoverage = await query(
+      `SELECT dl.line_role, dl.item_id, dl.allocated_quantity,
+              outbound.quantity AS outbound_quantity,
+              receiving.quantity AS receiving_quantity
+         FROM order_dependency_lines dl
+         JOIN order_dependencies d ON d.id = dl.dependency_id
+         LEFT JOIN transfer_order_lines outbound
+           ON outbound.id = dl.transfer_outbound_line_id AND outbound.line_stage = 'outbound'
+         LEFT JOIN transfer_order_lines receiving
+           ON receiving.id = dl.transfer_receiving_line_id AND receiving.line_stage = 'receiving'
+        WHERE d.proposal_id = $1
+        ORDER BY dl.id`,
+      [revisionProposal.id]
+    );
+    check(revisionPatchCalls === 1
+      && Number(revisedProposal.transferOrderId) === Number(createdTransferIds[0])
+      && Number(revisedProposal.revision) === Number(revisionProposal.revision) + 1
+      && Number(revisedDependencyLine.rows[0]?.allocated_quantity) === Number(revisedProposalLine.proposedQuantity)
+      && revisedTransferCoverage.rows.every((line) =>
+        Number(line.outbound_quantity) >= Number(line.allocated_quantity)
+        && Number(line.receiving_quantity) >= Number(line.allocated_quantity))
+      && revisedProposal.printJob === null
+      && preservedHistoricalPrint.rows[0]?.status === "printed",
+    "A created quantity revision must PATCH once, update proposal/dependency quantities, invalidate the current print pointer, and preserve print history.",
+    { revisionPatchCalls, revisionProposal, revisedProposal, revisedDependencyLine: revisedDependencyLine.rows[0], revisedTransferCoverage: revisedTransferCoverage.rows });
+    const firstPrintRequestId = `dependency-reprint:${suffix}:1`;
+    const firstPrintClaim = await claimTransferDependencyPrintGeneration(revisionProposal.id, firstPrintRequestId);
+    const repeatedPrintClaim = await claimTransferDependencyPrintGeneration(revisionProposal.id, firstPrintRequestId);
+    const firstReprintJob = await query(
+      `INSERT INTO scm_print_jobs (
+         job_key, location_id, document_type, document_name, document_path,
+         document_sha256, status, queued_at, started_at, printed_at
+       ) VALUES ($1, $2, 'transfer_dependency_picking_ticket', $3, $4, $5, 'printed', now(), now(), now())
+       RETURNING id`,
+      [transferDependencyPickingTicketJobKey({
+        proposalId: revisionProposal.id,
+        transferOrderRef: revisionProposal.transferOrderRef,
+        generation: firstPrintClaim.generation
+      }), revisionProposal.fromLocationId, `revision-reprint-${suffix}.pdf`,
+      `/tmp/revision-reprint-${suffix}.pdf`, String(suffix + 2).padStart(64, "0").slice(0, 64)]
+    );
+    await query(
+      `UPDATE scm_transfer_dependency_proposals
+          SET print_job_id = $2, print_request_status = 'idle',
+              print_request_started_at = NULL, print_request_error = NULL
+        WHERE id = $1`,
+      [revisionProposal.id, firstReprintJob.rows[0].id]
+    );
+    const completedRequestReplay = await claimTransferDependencyPrintGeneration(revisionProposal.id, firstPrintRequestId);
+    const nextPrintClaim = await claimTransferDependencyPrintGeneration(
+      revisionProposal.id,
+      `dependency-reprint:${suffix}:2`
+    );
+    const retainedPrintHistory = await query(
+      `SELECT id, job_key, status FROM scm_print_jobs
+        WHERE id = ANY($1::bigint[])
+        ORDER BY id`,
+      [[historicalPrint.rows[0].id, firstReprintJob.rows[0].id]]
+    );
+    check(firstPrintClaim.generation === 1
+      && repeatedPrintClaim.generation === 1
+      && repeatedPrintClaim.recovered === true
+      && completedRequestReplay.generation === 1
+      && completedRequestReplay.recovered === true
+      && nextPrintClaim.generation === 2
+      && retainedPrintHistory.rowCount === 2
+      && retainedPrintHistory.rows.every((row) => row.status === "printed"),
+    "Reprint claims must be request-idempotent, advance only for a deliberate new request, and retain prior immutable jobs.",
+    { firstPrintClaim, repeatedPrintClaim, completedRequestReplay, nextPrintClaim, retainedPrintHistory: retainedPrintHistory.rows });
+    await query(
+      `UPDATE scm_transfer_dependency_proposals
+          SET print_request_status = 'idle', print_request_id = NULL,
+              print_request_started_at = NULL, print_request_error = NULL
+        WHERE id = $1`,
+      [revisionProposal.id]
+    );
+    const replayedRevision = await reviseTransferDependencyProposal(
+      batch.id,
+      revisionProposal.id,
+      revisionRequest,
+      {
+        operatorId: "dependency-harness",
+        inspectTransferOrder: async () => ({ matches: true, pendingFulfillment: true, mismatches: [] }),
+        updateTransferOrder: async () => {
+          revisionPatchCalls += 1;
+          throw new Error("An applied request must not PATCH NetSuite twice.");
+        },
+        hydrateTransferOrder: fakeHydrateTransferOrder
+      }
+    );
+    check(replayedRevision.reused === true
+      && revisionPatchCalls === 1
+      && Number(replayedRevision.batch.proposals.find((proposal) => proposal.id === revisionProposal.id)?.revision)
+        === Number(revisedProposal.revision),
+    "Replaying the same created-quantity request must return the applied revision without a second NetSuite mutation.",
+    { replayedRevision, revisionPatchCalls });
+    let staleRevisionBlocked = false;
+    try {
+      await reviseTransferDependencyProposal(batch.id, revisionProposal.id, {
+        ...revisionRequest,
+        requestId: `${revisionRequest.requestId}:stale`
+      }, {
+        operatorId: "dependency-harness",
+        inspectTransferOrder: async () => ({ matches: false, pendingFulfillment: true, mismatches: [] }),
+        updateTransferOrder: async () => ({}),
+        hydrateTransferOrder: fakeHydrateTransferOrder
+      });
+    } catch (error) {
+      staleRevisionBlocked = error.status === 409 && /revision|refresh/i.test(error.message);
+    }
+    check(staleRevisionBlocked, "A stale created-quantity revision must fail visibly before NetSuite is changed.");
+    let excessDirectRevisionBlocked = false;
+    try {
+      await reviseTransferDependencyProposal(batch.id, revisionProposal.id, {
+        requestId: `${revisionRequest.requestId}:excess-direct`,
+        expectedRevision: revisedProposal.revision,
+        lines: revisedProposal.lines.map((proposalLine) => ({
+          proposalLineId: proposalLine.id,
+          quantities: proposalLine.id === revisedLineId
+            ? { ...proposalLine.quantities, pallets: 11 }
+            : { ...proposalLine.quantities }
+        }))
+      }, {
+        operatorId: "dependency-harness",
+        inspectTransferOrder: async () => ({ matches: false, pendingFulfillment: true, mismatches: [] }),
+        updateTransferOrder: async () => {
+          throw new Error("A direct-pickup revision above the SO backorder must be blocked before NetSuite is changed.");
+        },
+        hydrateTransferOrder: fakeHydrateTransferOrder
+      });
+    } catch (error) {
+      excessDirectRevisionBlocked = error.status === 409 && /shortage|backorder|exceed/i.test(error.message);
+    }
+    check(excessDirectRevisionBlocked,
+      "A created direct-pickup revision must not exceed the Sales Order quantity still available to that dependency.");
+    const revisionDependency = await query(
+      "SELECT id FROM order_dependencies WHERE proposal_id = $1",
+      [revisionProposal.id]
+    );
+    await query(
+      `UPDATE order_dependency_lines SET loaded_quantity = 1
+        WHERE dependency_id = $1 AND sales_line_id IS NOT NULL`,
+      [revisionDependency.rows[0].id]
+    );
+    let progressedRevisionBlocked = false;
+    try {
+      await reviseTransferDependencyProposal(batch.id, revisionProposal.id, {
+        requestId: `${revisionRequest.requestId}:progressed`,
+        expectedRevision: revisedProposal.revision,
+        lines: revisedProposal.lines.map((proposalLine) => ({
+          proposalLineId: proposalLine.id,
+          quantities: { ...proposalLine.quantities }
+        }))
+      }, {
+        operatorId: "dependency-harness",
+        inspectTransferOrder: async () => ({ matches: false, pendingFulfillment: true, mismatches: [] }),
+        updateTransferOrder: async () => {
+          throw new Error("A progressed dependency must be blocked before NetSuite is changed.");
+        },
+        hydrateTransferOrder: fakeHydrateTransferOrder
+      });
+    } catch (error) {
+      progressedRevisionBlocked = error.status === 409 && /started|loaded|progress/i.test(error.message);
+    }
+    check(progressedRevisionBlocked, "A loaded dependency must reject later SCM quantity revisions.");
+    await query("UPDATE order_dependency_lines SET loaded_quantity = 0 WHERE dependency_id = $1", [revisionDependency.rows[0].id]);
+    await query(
+      "UPDATE scm_transfer_dependency_batches SET allow_incomplete_coverage = true WHERE id = $1",
+      [batch.id]
+    );
     const createdManualTransfer = await query(
       `SELECT dl.sales_line_id, dl.item_id, dl.allocated_quantity, dl.line_role
          FROM order_dependency_lines dl
@@ -1075,6 +1316,49 @@ try {
       "Grouped SO should inherit its canonical child's dependency manifest.", { groupedEnriched });
 
     await query("UPDATE order_dependencies SET dependency_mode = 'yard_replenishment' WHERE id = $1", [dependency.id]);
+    const splitSalesOrderRef = `${salesOrderRef}-S1`;
+    const splitEnriched = await enrichDispatchOrdersWithDependencies([{
+      id: splitSalesOrderRef,
+      type: "SO",
+      originalOrderId: salesOrderRef,
+      sourceYard: "12441",
+      pickupLocations: ["12441"],
+      items: []
+    }]);
+    check(
+      splitEnriched[0].orderDependencies?.some((entry) => String(entry.id) === String(dependency.id))
+      && splitEnriched[0].dependencyWaitingForTransfer === true,
+      "Every split child must inherit its parent SO yard-replenishment dependency and execution gate.",
+      { splitEnriched }
+    );
+    const splitSalesOrderId = -Math.abs(salesOrderId);
+    await query(
+      `INSERT INTO sales_orders (
+         netsuite_id, tranid, trandate, customer, status, status_text,
+         outbound_location_id, outbound_location, sales_order_type,
+         fulfillment_status, operator_status, local_yard_order_status,
+         dispatch_address, netsuite_active
+       )
+       SELECT $1, $2, trandate, customer, status, status_text,
+              outbound_location_id, outbound_location, sales_order_type,
+              fulfillment_status, operator_status, local_yard_order_status,
+              dispatch_address, true
+         FROM sales_orders
+        WHERE netsuite_id = $3`,
+      [splitSalesOrderId, splitSalesOrderRef, salesOrderId]
+    );
+    await query(
+      `INSERT INTO dispatch_scm_so_splits (
+         source_so_id, source_so_ref, split_so_id, split_so_ref,
+         status, created_by, details
+       ) VALUES ($1, $2, $3, $4, 'active', 'dependency-harness', $5::jsonb)`,
+      [salesOrderId, salesOrderRef, splitSalesOrderId, splitSalesOrderRef,
+        JSON.stringify({ regression: "yard-dependency-split-execution-gate" })]
+    );
+    const splitExecutionBlock = await getSalesOrderDependencyExecutionBlock([splitSalesOrderRef]);
+    check(splitExecutionBlock?.transferOrderRef === dependency.transferOrderRef,
+      "A materialized split child must retain the parent SO execution block until its replenishment TO is received.",
+      { splitExecutionBlock });
     const replenishmentDeliveryOrders = await listDeliveryOrders({
       locationId: 15,
       status: "active",
@@ -1090,6 +1374,34 @@ try {
       { id: salesOrderRef, pickupLocations: ["12441"] },
       { id: dependency.transferOrderRef, pickupLocations: [dependency.sourceLocation] }
     ];
+    const prePlanTransferCoverage = await query(
+      `SELECT d.status, d.attention_reason, dl.line_role, dl.item_id, dl.allocated_quantity,
+              outbound.quantity AS outbound_quantity,
+              outbound.netsuite_active AS outbound_active,
+              receiving.quantity AS receiving_quantity,
+              receiving.netsuite_active AS receiving_active
+         FROM order_dependencies d
+         JOIN order_dependency_lines dl ON dl.dependency_id = d.id
+         LEFT JOIN transfer_order_lines outbound
+           ON outbound.id = dl.transfer_outbound_line_id AND outbound.line_stage = 'outbound'
+         LEFT JOIN transfer_order_lines receiving
+           ON receiving.id = dl.transfer_receiving_line_id AND receiving.line_stage = 'receiving'
+        WHERE d.id = $1
+        ORDER BY dl.id`,
+      [dependency.id]
+    );
+    check(prePlanTransferCoverage.rows
+      .filter((line) => line.line_role !== "pallet")
+      .every((line) => line.outbound_active !== false
+        && line.receiving_active !== false
+        && Number(line.outbound_quantity) >= Number(line.allocated_quantity)
+        && Number(line.receiving_quantity) >= Number(line.allocated_quantity)),
+    "A revised TO must retain exact active outbound/receiving coverage through later review and print state changes.",
+    { prePlanTransferCoverage: prePlanTransferCoverage.rows });
+    const revisedTransferSync = await syncOrderDependenciesForTransferOrder(dependency.transferOrderId);
+    check(revisedTransferSync.every((entry) => entry.attention !== true),
+      "A revised TO with exact local line coverage must reconcile without quantity attention.",
+      { revisedTransferSync, prePlanTransferCoverage: prePlanTransferCoverage.rows });
     const salesOnlyConflicts = await validateDispatchPlanDependencies({
       id: 0,
       planDate: "2097-07-13",
@@ -1173,6 +1485,69 @@ try {
     });
     check(orderedConflicts.length === 0,
       "Replenishment TO before SO pickup in the same load should be valid.", { orderedConflicts });
+
+    const secondSplitSalesOrderRef = `${salesOrderRef}-S2`;
+    const splitDependencyPlanOrders = [
+      {
+        id: splitSalesOrderRef,
+        type: "SO",
+        originalOrderId: salesOrderRef,
+        pickupLocations: ["12441"]
+      },
+      {
+        id: secondSplitSalesOrderRef,
+        type: "SO",
+        originalOrderId: salesOrderRef,
+        pickupLocations: ["12441"]
+      },
+      { id: dependency.transferOrderRef, pickupLocations: [dependency.sourceLocation] }
+    ];
+    const oneSplitBeforeTransferConflicts = await validateDispatchPlanDependencies({
+      id: 0,
+      planDate: "2097-07-13",
+      orders: splitDependencyPlanOrders,
+      trucks: [{
+        plate: "DEP-SPLIT-TRUCK",
+        loads: [{
+          id: "DEP-SPLIT-L1",
+          name: "Split Load 1",
+          stops: [
+            { id: "split-1-pick", type: "pick", orderId: splitSalesOrderRef, location: "12441" },
+            { id: "split-1-drop", type: "drop", orderId: splitSalesOrderRef, location: "Customer A" },
+            { id: "split-to-pick", type: "pick", orderId: dependency.transferOrderRef, location: dependency.sourceLocation },
+            { id: "split-to-drop", type: "drop", orderId: dependency.transferOrderRef, location: "12441" },
+            { id: "split-2-pick", type: "pick", orderId: secondSplitSalesOrderRef, location: "12441" },
+            { id: "split-2-drop", type: "drop", orderId: secondSplitSalesOrderRef, location: "Customer B" }
+          ]
+        }]
+      }]
+    });
+    check(oneSplitBeforeTransferConflicts.some((message) => message.includes(dependency.transferOrderRef)),
+      "The replenishment TO must complete before every split child; one early split must block the plan.",
+      { oneSplitBeforeTransferConflicts });
+    const transferBeforeAllSplitsConflicts = await validateDispatchPlanDependencies({
+      id: 0,
+      planDate: "2097-07-13",
+      orders: splitDependencyPlanOrders,
+      trucks: [{
+        plate: "DEP-SPLIT-TRUCK",
+        loads: [{
+          id: "DEP-SPLIT-L1",
+          name: "Split Load 1",
+          stops: [
+            { id: "ordered-split-to-pick", type: "pick", orderId: dependency.transferOrderRef, location: dependency.sourceLocation },
+            { id: "ordered-split-to-drop", type: "drop", orderId: dependency.transferOrderRef, location: "12441" },
+            { id: "ordered-split-1-pick", type: "pick", orderId: splitSalesOrderRef, location: "12441" },
+            { id: "ordered-split-1-drop", type: "drop", orderId: splitSalesOrderRef, location: "Customer A" },
+            { id: "ordered-split-2-pick", type: "pick", orderId: secondSplitSalesOrderRef, location: "12441" },
+            { id: "ordered-split-2-drop", type: "drop", orderId: secondSplitSalesOrderRef, location: "Customer B" }
+          ]
+        }]
+      }]
+    });
+    check(transferBeforeAllSplitsConflicts.length === 0,
+      "A split yard-replenishment SO should be valid when its TO completes before every split child.",
+      { transferBeforeAllSplitsConflicts });
 
     const groupedDependencyRef = `${groupRef}-NONFIRST`;
     const groupedDependencyPlanOrders = [
@@ -1329,6 +1704,16 @@ try {
       "Comparable V2 timing should allow a cross-driver transfer that finishes before the Sales pickup on the same truck.",
       { orderedTimeSharedTruckConflicts });
 
+    const groupedPlanFixture = {
+      planDate: "2097-07-13",
+      orders: [{
+        id: groupRef,
+        type: "SO",
+        childOrders: [salesOrderRef],
+        childOrderDetails: [{ id: salesOrderRef, type: "SO" }]
+      }],
+      trucks: []
+    };
     await query(
       `UPDATE order_dependencies
           SET status = 'attention', attention_reason = 'Grouping attention fixture'
@@ -1349,6 +1734,70 @@ try {
       "An unstarted normal yard-replenishment dependency in attention should allow its Sales Order to enter a group.");
 
     await query(
+      `UPDATE order_dependencies
+          SET status = 'delivered', attention_reason = null
+        WHERE id = $1`,
+      [dependency.id]
+    );
+    let completedGroupingBlocked = false;
+    try {
+      await assertNoActiveOrderDependenciesByRefs(
+        [salesOrderRef],
+        "group these orders",
+        { allowNormalGroupingRefs: [salesOrderRef] }
+      );
+    } catch (error) {
+      completedGroupingBlocked = error.code === "ORDER_DEPENDENCY_STRUCTURE_LOCK";
+    }
+    check(!completedGroupingBlocked,
+      "A completed normal yard-replenishment dependency must not block its Sales Order from entering a group.");
+    const completedGroupSync = await syncOrderDependenciesFromDispatchPlan(groupedPlanFixture);
+    check(!completedGroupSync.remapped.some((entry) => String(entry.dependencyId) === String(dependency.id)),
+      "Grouping must leave a completed dependency attached to its historical normal Sales Order target.",
+      { completedGroupSync });
+    const completedHeader = await query(
+      `SELECT dispatch_target_ref, dispatch_target_kind
+         FROM order_dependencies
+        WHERE id = $1`,
+      [dependency.id]
+    );
+    check(
+      completedHeader.rows[0].dispatch_target_ref === salesOrderRef
+      && completedHeader.rows[0].dispatch_target_kind === "normal",
+      "Completed dependency ownership changed while grouping its Sales Order.",
+      { completedHeader: completedHeader.rows[0] }
+    );
+    await query(
+      `UPDATE order_dependencies
+          SET dispatch_target_ref = $2, dispatch_target_kind = 'group'
+        WHERE id = $1`,
+      [dependency.id, groupRef]
+    );
+    let unrelatedUnplanBlocked = false;
+    try {
+      await assertNoActiveOrderDependenciesByRefs(
+        ["SOB116330", salesOrderRef, groupRef],
+        "group, ungroup, split, or unsplit these orders"
+      );
+    } catch (error) {
+      unrelatedUnplanBlocked = error.code === "ORDER_DEPENDENCY_STRUCTURE_LOCK";
+    }
+    check(!unrelatedUnplanBlocked,
+      "Unplanning SOB116330 must not be blocked by the completed yard dependency GOA-5876-5889 -> TOB00731 pattern.");
+    await query(
+      `UPDATE order_dependencies
+          SET dispatch_target_ref = sales_order_ref, dispatch_target_kind = 'normal'
+        WHERE id = $1`,
+      [dependency.id]
+    );
+    await query(
+      `UPDATE order_dependencies
+          SET status = 'attention', attention_reason = 'Grouping attention fixture'
+        WHERE id = $1`,
+      [dependency.id]
+    );
+
+    await query(
       `UPDATE order_dependency_lines
           SET loaded_quantity = 1
         WHERE id = (
@@ -1366,8 +1815,8 @@ try {
     } catch (error) {
       progressedGroupingBlocked = error.code === "ORDER_DEPENDENCY_STRUCTURE_LOCK";
     }
-    check(progressedGroupingBlocked,
-      "Dependency grouping must remain blocked after execution progress starts.");
+    check(!progressedGroupingBlocked,
+      "A yard-replenishment dependency must not block grouping after execution progress starts.");
     await query("UPDATE order_dependency_lines SET loaded_quantity = 0 WHERE dependency_id = $1", [dependency.id]);
     await query(
       `UPDATE order_dependencies
@@ -1376,16 +1825,6 @@ try {
       [dependency.id]
     );
 
-    const groupedPlanFixture = {
-      planDate: "2097-07-13",
-      orders: [{
-        id: groupRef,
-        type: "SO",
-        childOrders: [salesOrderRef],
-        childOrderDetails: [{ id: salesOrderRef, type: "SO" }]
-      }],
-      trucks: []
-    };
     const firstGroupSync = await syncOrderDependenciesFromDispatchPlan(groupedPlanFixture);
     check(firstGroupSync.remapped.some((entry) =>
       String(entry.dependencyId) === String(dependency.id)
@@ -1556,8 +1995,8 @@ try {
     } catch (error) {
       mismatchedHistoricalGroupBlocked = error.code === "ORDER_DEPENDENCY_STRUCTURE_LOCK";
     }
-    check(mismatchedHistoricalGroupBlocked,
-      "The historical-plan exception must not allow a dependency to move to a different group.");
+    check(!mismatchedHistoricalGroupBlocked,
+      "A yard-replenishment dependency's historical dispatch target must not block regrouping into a different container.");
     await query(
       `UPDATE order_dependency_lines
           SET loaded_quantity = 1
@@ -1579,8 +2018,8 @@ try {
     } catch (error) {
       progressedHistoricalCatchupBlocked = error.code === "ORDER_DEPENDENCY_STRUCTURE_LOCK";
     }
-    check(progressedHistoricalCatchupBlocked,
-      "The historical-plan exception must remain locked after dependency execution starts.");
+    check(!progressedHistoricalCatchupBlocked,
+      "A progressed yard-replenishment dependency must not block an otherwise valid historical group structure.");
     await query("UPDATE order_dependency_lines SET loaded_quantity = 0 WHERE dependency_id = $1", [dependency.id]);
 
     const ungroupedPlanFixture = {
@@ -1711,8 +2150,8 @@ try {
     } catch (error) {
       progressedUngroupBlocked = error.code === "ORDER_DEPENDENCY_STRUCTURE_LOCK";
     }
-    check(progressedUngroupBlocked,
-      "A progressed replenishment dependency must remain structurally locked during ungrouping.");
+    check(!progressedUngroupBlocked,
+      "A progressed yard-replenishment dependency must not block ungrouping; its canonical SO/TO linkage remains intact.");
     const progressedUngroupSync = await syncOrderDependenciesFromDispatchPlan(ungroupedPlanFixture, {
       allowEstablishedUngroupTargets: establishedUngroupTargets
     });
@@ -1725,7 +2164,7 @@ try {
     check(
       stillGroupedHeader.rows[0].dispatch_target_ref === groupRef
       && stillGroupedHeader.rows[0].dispatch_target_kind === "group",
-      "A blocked direct/progressed ungroup attempt changed dependency ownership.",
+      "A progressed ungroup that preserves historical dependency ownership changed its canonical target.",
       { stillGroupedHeader: stillGroupedHeader.rows[0] }
     );
     await query("UPDATE order_dependency_lines SET loaded_quantity = 0 WHERE dependency_id = $1", [dependency.id]);

@@ -4,6 +4,7 @@ import test, { after, before } from "node:test";
 
 import { createOperator } from "../../../src/auth-repository.js";
 import { closeDb, query } from "../../../src/db.js";
+import { getDriverYardDependencyMode } from "../../../src/driver-yard-dependency-mode.js";
 import { app } from "../../../src/server.js";
 
 const RUN_ID = crypto.randomUUID().replaceAll("-", "");
@@ -14,6 +15,7 @@ const USERS = Object.freeze({
 });
 const EXPECTED_FLAGS = Object.freeze([
   "driver_offline_mode",
+  "driver_yard_dependency_soft_mode",
   "mbt_enabled",
   "mbt_master_data",
   "mbt_asset_management",
@@ -244,6 +246,74 @@ test("Admin independently controls the Driver PWA offline mode advertised to dev
   assert.equal(advertisedDisabled.response.status, 200, JSON.stringify(advertisedDisabled.payload));
   assert.equal(advertisedDisabled.payload.offlineEnabled, false);
   assert.equal(advertisedDisabled.payload.offlineModeRevision, disabled.payload.flag.revision);
+});
+
+test("Admin persists and audits the Driver yard-dependency Soft mode independently", async () => {
+  const initial = await request("/api/mbt/config/gates", { token: tokens.get("admin") });
+  assert.equal(initial.response.status, 200, JSON.stringify(initial.payload));
+  const original = gate(initial.payload, "driver_yard_dependency_soft_mode");
+  assert.equal(original.configured, false);
+  assert.deepEqual(await getDriverYardDependencyMode(), {
+    mode: "hard",
+    soft: false,
+    revision: original.revision,
+    updatedAt: original.updatedAt
+  });
+
+  const onKey = `driver-yard-soft-on-${RUN_ID}`;
+  const enabled = await request("/api/mbt/config/gates/driver_yard_dependency_soft_mode", {
+    token: tokens.get("admin"),
+    method: "PUT",
+    headers: { "idempotency-key": onKey },
+    body: {
+      enabled: true,
+      expectedRevision: original.revision,
+      reason: "Exercise Driver ordinary yard dependency Soft testing mode"
+    }
+  });
+  assert.equal(enabled.response.status, 200, JSON.stringify(enabled.payload));
+  assert.equal(enabled.payload.flag.enabled, true);
+  const enabledMode = await getDriverYardDependencyMode();
+  assert.deepEqual({
+    mode: enabledMode.mode,
+    soft: enabledMode.soft,
+    revision: enabledMode.revision
+  }, {
+    mode: "soft",
+    soft: true,
+    revision: enabled.payload.flag.revision
+  });
+  assert.match(enabledMode.updatedAt, /^\d{4}-\d{2}-\d{2}T/u);
+
+  const offKey = `driver-yard-soft-off-${RUN_ID}`;
+  const disabled = await request("/api/mbt/config/gates/driver_yard_dependency_soft_mode", {
+    token: tokens.get("admin"),
+    method: "PUT",
+    headers: { "idempotency-key": offKey },
+    body: {
+      enabled: false,
+      expectedRevision: enabled.payload.flag.revision,
+      reason: "Restore Driver yard dependency Hard mode after the isolated test"
+    }
+  });
+  assert.equal(disabled.response.status, 200, JSON.stringify(disabled.payload));
+  assert.equal((await getDriverYardDependencyMode()).mode, "hard");
+
+  const evidence = await query(
+    `SELECT
+       (SELECT count(*)::int
+          FROM mbt_audit_events
+         WHERE action = 'mbt.feature_flag.state_updated'
+           AND entity_id = 'driver_yard_dependency_soft_mode'
+           AND idempotency_key = ANY($1::text[])) AS audits,
+       (SELECT count(*)::int
+          FROM mbt_command_receipts
+         WHERE command_name = 'mbt.feature_flag.state_updated'
+           AND entity_id = 'driver_yard_dependency_soft_mode'
+           AND idempotency_key = ANY($1::text[])) AS receipts`,
+    [[onKey, offKey]]
+  );
+  assert.deepEqual(evidence.rows[0], { audits: 2, receipts: 2 });
 });
 
 test("P3-F29 live customer sync and NetSuite posting cannot be enabled through Admin", async () => {

@@ -231,6 +231,116 @@ const groupedOrderDependenciesSource = sourceRange(
 const groupedOrderDependencies = Function(
   `"use strict"; ${groupedOrderDependenciesSource}; return groupedOrderDependencies;`
 )();
+const groupedOrderDependencyStructureBlockMessageSource = sourceRange(
+  plannerUi,
+  "function groupedOrderDependencyStructureBlockMessage",
+  "function dispatchGroupingRefs"
+);
+const groupedOrderDependencyStructureBlockMessage = Function(
+  "groupedOrderDependencies",
+  `"use strict"; ${groupedOrderDependencyStructureBlockMessageSource}; return groupedOrderDependencyStructureBlockMessage;`
+)(groupedOrderDependencies);
+const som05433GroupingItems = [{
+  id: "SOM05433",
+  orderDependencies: [
+    {
+      id: 145,
+      mode: "yard_replenishment",
+      status: "delivered",
+      canonicalSalesOrderRef: "SOM05433",
+      dispatchTargetKind: "normal",
+      transferOrderRef: "TOB00774",
+      lines: [{ loadedQuantity: 0, deliveredQuantity: 0, locallyReceivedQuantity: 0 }]
+    },
+    {
+      id: 146,
+      mode: "yard_replenishment",
+      status: "active",
+      canonicalSalesOrderRef: "SOM05433",
+      dispatchTargetKind: "normal",
+      transferOrderRef: "TOB00775",
+      lines: [{ loadedQuantity: 0, deliveredQuantity: 0, locallyReceivedQuantity: 0 }]
+    }
+  ]
+}];
+assert.equal(
+  groupedOrderDependencyStructureBlockMessage(som05433GroupingItems),
+  "",
+  "SOM05433 could not be grouped because its completed TOB00774 dependency was treated as movable work."
+);
+assert.equal(
+  groupedOrderDependencyStructureBlockMessage([{
+    id: "SO-RECEIVED-LOCAL",
+    orderDependencies: [{
+      mode: "yard_replenishment",
+      status: "received_local",
+      canonicalSalesOrderRef: "SO-RECEIVED-LOCAL",
+      dispatchTargetKind: "normal",
+      transferOrderRef: "TO-RECEIVED-LOCAL",
+      lines: [{ loadedQuantity: 10, deliveredQuantity: 10, locallyReceivedQuantity: 10 }]
+    }]
+  }]),
+  "",
+  "A locally received dependency still blocked grouping after its work was complete."
+);
+assert.equal(
+  groupedOrderDependencyStructureBlockMessage([{
+    id: "SO-PROGRESSED",
+    orderDependencies: [{
+      mode: "yard_replenishment",
+      status: "loaded",
+      canonicalSalesOrderRef: "SO-PROGRESSED",
+      dispatchTargetKind: "normal",
+      transferOrderRef: "TO-PROGRESSED",
+      lines: [{ loadedQuantity: 1 }]
+    }]
+  }]),
+  "",
+  "An in-progress yard-replenishment dependency incorrectly blocked grouping."
+);
+assert.match(
+  groupedOrderDependencyStructureBlockMessage([{
+    id: "SO-DIRECT",
+    orderDependencies: [{
+      mode: "direct_to_customer",
+      status: "active",
+      canonicalSalesOrderRef: "SO-DIRECT",
+      dispatchTargetKind: "normal",
+      transferOrderRef: "TO-DIRECT"
+    }]
+  }]),
+  /TO-DIRECT is a direct-pickup dependency/,
+  "Grouping allowed an active direct-pickup dependency to move."
+);
+assert.match(
+  groupedOrderDependencyStructureBlockMessage([{
+    id: "SO-DIRECT-COMPLETED",
+    orderDependencies: [{
+      mode: "direct_to_customer",
+      status: "delivered",
+      canonicalSalesOrderRef: "SO-DIRECT-COMPLETED",
+      dispatchTargetKind: "normal",
+      transferOrderRef: "TO-DIRECT-COMPLETED",
+      lines: [{ loadedQuantity: 1, deliveredQuantity: 1 }]
+    }]
+  }]),
+  /TO-DIRECT-COMPLETED is a direct-pickup dependency/,
+  "The completed yard-replenishment exception leaked into direct-pickup grouping."
+);
+assert.equal(
+  groupedOrderDependencyStructureBlockMessage([{
+    id: "SO-ALREADY-GROUPED",
+    orderDependencies: [{
+      mode: "yard_replenishment",
+      status: "active",
+      canonicalSalesOrderRef: "SO-ALREADY-GROUPED",
+      dispatchTargetKind: "group",
+      transferOrderRef: "TO-ALREADY-GROUPED"
+    }]
+  }]),
+  "",
+  "A yard-replenishment dependency's prior dispatch target incorrectly blocked regrouping."
+);
 const makeReplenishmentPlacementHelpers = Function(
   "dispatchGroupingRefs",
   "stopOrder",
@@ -840,7 +950,7 @@ const searchFeedSource = sourceRange(plannerUi, "function mergeDispatchOrderSear
 assert(searchFeedSource.indexOf("reconcileTransitCoSourceOrders();") < searchFeedSource.indexOf("reapplyActiveOrderEvidence"),
   "The search order feed does not restore active evidence after transit reconciliation.");
 const planForDateLoader = sourceRange(plannerUi, "async function loadPlanForDate", "async function loadPlanById");
-assert(planForDateLoader.indexOf("await loadDriverJobStatuses();") < planForDateLoader.indexOf("applySavedPlan(currentPlan);"),
+assert(planForDateLoader.indexOf("await loadDriverJobStatuses();") < planForDateLoader.indexOf("applyDispatchPlanSnapshotResult(snapshot)"),
   "Plan startup merges the live feed before loading driver evidence.");
 const planByIdLoader = sourceRange(plannerUi, "async function loadPlanById", "async function restoreServerPlan");
 assert(planByIdLoader.indexOf("await loadDriverJobStatuses();") < planByIdLoader.indexOf("applySavedPlan(plan)"),
@@ -856,7 +966,7 @@ assert.equal((initDispatchSource.match(/loadDriverJobStatuses\(/g) || []).length
 assert(repository.includes("displayOrder: numberValue(row.display_order, 0)"), "Setup API does not expose persisted display order.");
 assert(repository.includes("cleanDriver(driver, index)"), "Driver request order is not explicitly persisted as display_order.");
 assert(setupHtml.includes("20260803-mbt-bin-trucks-v1"), "Dispatch Setup browser asset version was not bumped.");
-assert(plannerHtml.includes('/dispatch.js?v=20260805-mbbs-special-po-link-location-hierarchy-v2'), "Dispatch planner browser asset version was not bumped.");
+assert(plannerHtml.includes('/dispatch.js?v=20260807-yard-dependency-structure-v1'), "Dispatch planner browser asset version was not bumped.");
 
 const activityPositionSource = sourceRange(
   plannerUi,
@@ -915,5 +1025,5 @@ console.log(JSON.stringify({
   dependentSalesAutoPlacement: true,
   driverLoadRenumberAfterDrag: true,
   canonicalReplenishmentLoadPrecedence: true,
-  tests: 90
+  tests: 96
 }));

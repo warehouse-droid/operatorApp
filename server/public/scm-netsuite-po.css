@@ -1,4 +1,4 @@
-.po-filters { display:grid; grid-template-columns:minmax(230px,1.5fr) repeat(2,minmax(135px,.7fr)) repeat(3,minmax(145px,1fr)) auto auto; gap:8px; align-items:end; padding:10px 12px; border-bottom:1px solid var(--smart-border); background:#f8fafb; }
+.po-filters { display:grid; grid-template-columns:minmax(230px,1.5fr) repeat(2,minmax(135px,.7fr)) repeat(4,minmax(145px,1fr)) auto auto; gap:8px; align-items:end; padding:10px 12px; border-bottom:1px solid var(--smart-border); background:#f8fafb; }
 .po-filters label { display:grid; gap:3px; color:var(--smart-muted); font-size:9px; font-weight:800; text-transform:uppercase; }
 .po-filters input,.po-filters select { min-height:34px; }
 .po-sync-warning { border-color:#e8c66a; color:#72520b; background:#fff8df; }
@@ -11,14 +11,16 @@
 .po-kicker { color:var(--smart-blue)!important; font-weight:900; letter-spacing:.04em; }
 .po-card-actions { display:flex; justify-content:flex-end; gap:5px; flex-wrap:wrap; }
 .po-card-actions .smart-button { min-height:31px; padding:5px 8px; white-space:nowrap; }
+.po-missing-actions { align-self:center; color:var(--smart-red); font-weight:800; }
 .po-meta-grid { display:grid; grid-template-columns:150px 150px minmax(190px,.7fr) minmax(280px,1.5fr); gap:10px; padding:10px 12px; }
 .po-meta-grid label { display:grid; gap:3px; color:var(--smart-muted); font-size:9px; font-weight:800; text-transform:uppercase; }
 .po-meta-grid input,.po-meta-grid textarea { color:var(--smart-ink); font-size:11px; font-weight:600; text-transform:none; }
 .po-meta-grid textarea { min-height:34px; max-height:90px; resize:vertical; }
-.po-lines { min-width:980px; }
+.po-lines { min-width:1130px; }
 .po-lines td:first-child { min-width:260px; }
 .po-lines td small { display:block; margin-top:2px; color:var(--smart-muted); font-size:9px; }
 .po-lines input { width:110px; min-height:30px; text-align:right; }
+.po-lines input[readonly] { border-color:#d7e0e6; background:#f1f5f7; color:var(--smart-muted); cursor:default; }
 .po-lines select { min-width:155px; min-height:30px; }
 .po-lines .po-lock { color:var(--smart-red); font-weight:900; }
 .po-history-card footer { display:flex; justify-content:space-between; gap:12px; padding:8px 12px; border-top:1px solid var(--smart-border); color:var(--smart-muted); background:#f8fafb; font-size:9px; }

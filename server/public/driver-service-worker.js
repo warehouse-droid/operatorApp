@@ -1,27 +1,27 @@
 /* global DriverOfflineSync */
 "use strict";
 
-importScripts("/driver-offline-db.js?v=20260805-online-mode-v3");
-importScripts("/driver-photo-hash.js?v=20260805-online-mode-v3");
-importScripts("/driver-offline-sync.js?v=20260805-online-mode-v3");
+importScripts("/driver-offline-db.js?v=20260808-yard-dependency-v1");
+importScripts("/driver-photo-hash.js?v=20260808-yard-dependency-v1");
+importScripts("/driver-offline-sync.js?v=20260808-yard-dependency-v1");
 
-const DRIVER_PWA_CLIENT_VERSION = "2026.08.05.3";
+const DRIVER_PWA_CLIENT_VERSION = "2026.08.08.1";
 const DRIVER_CACHE_PREFIX = "mbbs-driver-shell-";
-const DRIVER_CACHE_NAME = `${DRIVER_CACHE_PREFIX}v19`;
-const DRIVER_REFRESH_CACHE_NAME = `${DRIVER_CACHE_PREFIX}refresh-v19`;
+const DRIVER_CACHE_NAME = `${DRIVER_CACHE_PREFIX}v20`;
+const DRIVER_REFRESH_CACHE_NAME = `${DRIVER_CACHE_PREFIX}refresh-v20`;
 const DRIVER_OFFLINE_MODE_REQUEST = "/__mbbs_driver_offline_mode__";
 const DRIVER_SHELL = [
   "/driver",
   "/driver.html",
-  "/driver.css?v=20260803-bin-pwa-v1",
+  "/driver.css?v=20260808-yard-dependency-v1",
   "/i18n.css?v=20260701-i18n-v2",
   "/i18n.js?v=20260803-bin-pwa-v1",
-  "/driver-offline-db.js?v=20260805-online-mode-v3",
-  "/driver-photo-hash.js?v=20260805-online-mode-v3",
-  "/driver-offline-photos.js?v=20260805-online-mode-v3",
-  "/driver-offline-sync.js?v=20260805-online-mode-v3",
+  "/driver-offline-db.js?v=20260808-yard-dependency-v1",
+  "/driver-photo-hash.js?v=20260808-yard-dependency-v1",
+  "/driver-offline-photos.js?v=20260808-yard-dependency-v1",
+  "/driver-offline-sync.js?v=20260808-yard-dependency-v1",
   "/driver-bin-ui.js?v=20260803-bin-pwa-v1",
-  "/driver.js?v=20260805-online-mode-v3",
+  "/driver.js?v=20260808-yard-dependency-v1",
   "/driver-manifest.webmanifest",
   "/icons/mbbs-yard-192.png",
   "/icons/mbbs-yard-512.png",

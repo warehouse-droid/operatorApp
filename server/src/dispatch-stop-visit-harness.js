@@ -593,7 +593,11 @@ assert.match(forecastRefreshSource, /if \(!forecast \|\| !currentPlan\?\.id \|\|
 assert.match(forecastRefreshSource, /if \(!planId \|\| localPlanDirty \|\| dispatchForecastInFlight\) return false/);
 assert.match(forecastRefreshSource, /sequence !== dispatchForecastRequestSequence[\s\S]*?\|\| localPlanDirty/);
 const mutationSource = sourceSlice("function commitPlanMutation", "async function loadPlanHistory");
-assert.match(mutationSource, /if \(planChanged\) clearDispatchForecast\(\)/);
+assert.match(
+  mutationSource,
+  /if \(planChanged \|\| options\.forceSave\) \{[\s\S]*?clearDispatchForecast\(\)/,
+  "A changed plan and an explicit undo/redo force-save must both invalidate the stale forecast."
+);
 const saveSource = sourceSlice("async function savePlanToServer", "function queueServerSave");
 assert.ok(
   saveSource.indexOf("clearLocalPlanDirty(payload.savedAt, saveGeneration);")

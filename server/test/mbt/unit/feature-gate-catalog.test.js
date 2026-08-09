@@ -36,9 +36,10 @@ function gate(gates, flagKey) {
   return selected;
 }
 
-test("P3-F29 Admin catalog exposes Driver offline control, seven writable local gates, and two locked integration gates", () => {
+test("P3-F29 Admin catalog exposes two independent Driver controls, seven writable MBT gates, and two locked integration gates", () => {
   assert.deepEqual(MBT_ADMIN_GATE_KEYS, [
     "driver_offline_mode",
+    "driver_yard_dependency_soft_mode",
     "mbt_enabled",
     "mbt_master_data",
     "mbt_asset_management",
@@ -49,7 +50,7 @@ test("P3-F29 Admin catalog exposes Driver offline control, seven writable local 
     "mbt_customer_sync",
     "mbt_netsuite_writes"
   ]);
-  assert.deepEqual(MBT_ADMIN_WRITABLE_GATE_KEYS, MBT_ADMIN_GATE_KEYS.slice(0, 8));
+  assert.deepEqual(MBT_ADMIN_WRITABLE_GATE_KEYS, MBT_ADMIN_GATE_KEYS.slice(0, 9));
 });
 
 test("P3-F29 effective state requires both deployment and database root/specific gates", () => {
@@ -75,11 +76,13 @@ test("P3-F29 effective state requires both deployment and database root/specific
   });
   assert.equal(gate(environmentRootClosed, "driver_offline_mode").effective, true);
   assert.equal(gate(environmentRootClosed, "driver_offline_mode").environmentAllowed, true);
+  assert.equal(gate(environmentRootClosed, "driver_yard_dependency_soft_mode").effective, true);
+  assert.equal(gate(environmentRootClosed, "driver_yard_dependency_soft_mode").environmentAllowed, true);
   assert.ok(environmentRootClosed
-    .filter((candidate) => candidate.flagKey !== "driver_offline_mode")
+    .filter((candidate) => !candidate.flagKey.startsWith("driver_"))
     .every((candidate) => candidate.effective === false));
   assert.ok(environmentRootClosed
-    .filter((candidate) => candidate.flagKey !== "driver_offline_mode")
+    .filter((candidate) => !candidate.flagKey.startsWith("driver_"))
     .every((candidate) => candidate.environmentAllowed === false));
 
   const capabilityClosed = materializeMbtAdminGates({

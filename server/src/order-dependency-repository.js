@@ -16,6 +16,11 @@ import {
   transferDependencyReservationOverrideSet,
   transferDependencyReservationOverridesFromSnapshot
 } from "./transfer-dependency-reservation.js";
+import {
+  dependencyBlocksDispatchStructureChange,
+  dispatchDependencyOrderRefs as dispatchOrderRefs,
+  everySalesAssignmentFollowsTransfer
+} from "./yard-dependency-structure.js";
 
 export const DEPENDENCY_YARDS = Object.freeze([
   { code: "3445", locationId: 1, address: "3445 Kennedy Road, Toronto, ON", priority: 1, westPenaltyMinutes: 0 },
@@ -54,6 +59,29 @@ function normalizedToken(value) {
 
 function normalizeMode(value) {
   return value === "direct_to_customer" ? "direct_to_customer" : "yard_replenishment";
+}
+
+export function transferDependencyRevisionProgressBlock(state = {}) {
+  const dependencyStatus = text(state.dependencyStatus).toLowerCase();
+  if (dependencyStatus && !["active", "attention"].includes(dependencyStatus)) {
+    return `Transfer execution has started (${dependencyStatus}); its quantities can no longer be changed.`;
+  }
+  const progressFields = [
+    "loadedQuantity",
+    "deliveredQuantity",
+    "locallyReceivedQuantity",
+    "transferPackedQuantity",
+    "transferLoadedQuantity",
+    "transferFulfilledQuantity",
+    "transferReceivedQuantity"
+  ];
+  if (progressFields.some((field) => number(state[field]) > EPSILON)) {
+    return "Transfer packing, loading, fulfillment, delivery, or receiving has started; its quantities can no longer be changed.";
+  }
+  if (state.lastItemFulfillmentId || state.lastItemReceiptId || state.fulfilledAt || state.receivedAt) {
+    return "NetSuite fulfillment or receiving has started; its quantities can no longer be changed.";
+  }
+  return null;
 }
 
 function terminalTransferOrderStatus(row = {}) {
@@ -388,22 +416,9 @@ export async function listOrderDependencies(filters = {}) {
   return loadDependencies(filters);
 }
 
-export async function assertNoActiveOrderDependenciesByRefs(orderRefs = [], action = "change these orders", options = {}) {
+export async function assertNoActiveOrderDependenciesByRefs(orderRefs = [], action = "change these orders", _options = {}) {
   const refs = [...new Set((orderRefs || []).map(text).filter(Boolean))];
   if (!refs.length) return;
-  const allowNormalGroupingRefs = new Set(
-    (options.allowNormalGroupingRefs || []).map(text).filter(Boolean)
-  );
-  const allowEstablishedGroupTargets = new Map(
-    (options.allowEstablishedGroupTargets || [])
-      .map((target) => [text(target?.sourceOrderRef), text(target?.groupRef)])
-      .filter(([sourceOrderRef, groupRef]) => sourceOrderRef && groupRef)
-  );
-  const allowEstablishedUngroupTargets = new Map(
-    (options.allowEstablishedUngroupTargets || [])
-      .map((target) => [text(target?.sourceOrderRef), text(target?.groupRef)])
-      .filter(([sourceOrderRef, groupRef]) => sourceOrderRef && groupRef)
-  );
   const result = await query(
     `SELECT DISTINCT dependency.dispatch_target_ref, dependency.sales_order_ref,
             dependency.transfer_order_ref, dependency.dependency_mode, dependency.status,
@@ -432,25 +447,13 @@ export async function assertNoActiveOrderDependenciesByRefs(orderRefs = [], acti
       ORDER BY dependency.dispatch_target_ref, dependency.transfer_order_ref`,
     [refs, EPSILON]
   );
-  const blocked = result.rows.filter((row) => {
-    const targetRef = text(row.dispatch_target_ref || row.sales_order_ref);
-    const safeNormalGrouping = allowNormalGroupingRefs.has(targetRef)
-      && row.dispatch_target_kind === "normal"
-      && row.dependency_mode === "yard_replenishment"
-      && ["active", "attention"].includes(row.status)
-      && !row.has_execution_progress;
-    const safeEstablishedGrouping = allowEstablishedGroupTargets.get(text(row.sales_order_ref)) === targetRef
-      && row.dispatch_target_kind === "group"
-      && row.dependency_mode === "yard_replenishment"
-      && ["active", "attention"].includes(row.status)
-      && !row.has_execution_progress;
-    const safeEstablishedUngroup = allowEstablishedUngroupTargets.get(text(row.sales_order_ref)) === targetRef
-      && row.dispatch_target_kind === "group"
-      && row.dependency_mode === "yard_replenishment"
-      && ["active", "attention"].includes(row.status)
-      && !row.has_execution_progress;
-    return !safeNormalGrouping && !safeEstablishedGrouping && !safeEstablishedUngroup;
-  });
+  // A yard-replenishment dependency owns canonical SO/TO line allocations, not
+  // the temporary Dispatch container. Group/split edits therefore leave its
+  // inventory contract intact; ordering and execution gates are enforced by
+  // validateDispatchPlanDependencies and getSalesOrderDependencyExecutionBlock.
+  // Direct-to-customer dependencies remain locked because their pickup and
+  // customer drop must stay coupled on one physical load.
+  const blocked = result.rows.filter(dependencyBlocksDispatchStructureChange);
   if (!blocked.length) return;
   const relations = blocked.map((row) => `${row.dispatch_target_ref || row.sales_order_ref} -> ${row.transfer_order_ref}`).join(", ");
   const error = new Error(`Cannot ${action} while an active order dependency exists: ${relations}. Unlink the dependency first.`);
@@ -463,12 +466,27 @@ export async function getSalesOrderDependencyExecutionBlock(orderRefs = []) {
   const refs = [...new Set((orderRefs || []).map(text).filter(Boolean))];
   if (!refs.length) return null;
   const result = await query(
-    `SELECT COALESCE(d.dispatch_target_ref, d.sales_order_ref) AS dispatch_target_ref,
+    `WITH requested_refs AS (
+       SELECT unnest($1::text[]) AS order_ref
+     ), effective_refs AS (
+       SELECT order_ref FROM requested_refs
+       UNION
+       SELECT split.source_so_ref
+         FROM dispatch_scm_so_splits split
+         JOIN requested_refs requested ON requested.order_ref = split.split_so_ref
+        WHERE split.status = 'active'
+     )
+     SELECT COALESCE(d.dispatch_target_ref, d.sales_order_ref) AS dispatch_target_ref,
             d.sales_order_ref, d.transfer_order_ref, d.status,
             t.receiving_status, t.received_at, t.netsuite_active
        FROM order_dependencies d
        JOIN transfer_orders t ON t.netsuite_id = d.transfer_order_id
-      WHERE (d.dispatch_target_ref = ANY($1::text[]) OR d.sales_order_ref = ANY($1::text[]))
+      WHERE EXISTS (
+              SELECT 1
+                FROM effective_refs candidate
+               WHERE candidate.order_ref = d.dispatch_target_ref
+                  OR candidate.order_ref = d.sales_order_ref
+            )
         AND d.dependency_mode = 'yard_replenishment'
         AND d.status <> 'cancelled'
         AND NOT (
@@ -1173,6 +1191,11 @@ async function salesOrderShortageRows(salesOrderId = null) {
             o.outbound_location_id,
             o.outbound_location,
             o.is_test_fixture,
+            GREATEST(
+              COALESCE(o.status_updated_at, '-infinity'::timestamptz),
+              COALESCE(o.synced_at, '-infinity'::timestamptz),
+              COALESCE(l.synced_at, '-infinity'::timestamptz)
+            ) AS latest_activity_at,
             l.*,
             COALESCE(b.quantity_available, 0) AS outbound_available,
             COALESCE(a.allocated_quantity, 0) AS dependency_allocated,
@@ -1323,7 +1346,16 @@ async function applyTransferDependencyReviews(orders = [], reviewStatus = "open"
       completedAt: activeReview ? review.reviewed_at : transferCompleted ? batch.last_printed_at || batch.updated_at : null,
       workflowStage,
       dependencyBatchId: transferCreated ? batch.batch_id : null,
-      transferCreatedAt: transferCreated ? batch.transfer_created_at || null : null
+      transferCreatedAt: transferCreated ? batch.transfer_created_at || null : null,
+      latestActivityAt: latestTransferDependencyActivityAt(
+        order.latestActivityAt,
+        batch?.updated_at,
+        batch?.transfer_created_at,
+        batch?.last_printed_at,
+        review?.updated_at,
+        review?.reviewed_at,
+        review?.reopened_at
+      )
     });
   }
   const normalizedStatus = ["reviewed", "created", "completed", "all"].includes(reviewStatus) ? reviewStatus : "open";
@@ -1337,8 +1369,31 @@ async function applyTransferDependencyReviews(orders = [], reviewStatus = "open"
       enriched.filter((order) => order.workflowStage === "created")
     );
   }
-  if (normalizedStatus === "all") return enriched;
-  return enriched.filter((order) => order.workflowStage === "open" && number(order.uncoveredQuantity) > EPSILON);
+  if (normalizedStatus === "all") return sortTransferDependencyCandidatesByLatestActivity(enriched);
+  return sortTransferDependencyCandidatesByLatestActivity(
+    enriched.filter((order) => order.workflowStage === "open" && number(order.uncoveredQuantity) > EPSILON)
+  );
+}
+
+function latestTransferDependencyActivityAt(...values) {
+  let latest = 0;
+  for (const value of values) {
+    const parsed = Date.parse(value || "");
+    if (Number.isFinite(parsed) && parsed > latest) latest = parsed;
+  }
+  return latest ? new Date(latest).toISOString() : null;
+}
+
+export function sortTransferDependencyCandidatesByLatestActivity(orders = []) {
+  const timestamp = (value) => {
+    const parsed = Date.parse(value || "");
+    return Number.isFinite(parsed) ? parsed : 0;
+  };
+  return [...orders].sort((left, right) => (
+    timestamp(right.latestActivityAt) - timestamp(left.latestActivityAt)
+    || Number(right.salesOrderId || 0) - Number(left.salesOrderId || 0)
+    || String(left.salesOrderRef || "").localeCompare(String(right.salesOrderRef || ""))
+  ));
 }
 
 export function sortTransferDependencyCandidatesByCreatedAt(orders = []) {
@@ -1382,11 +1437,13 @@ export async function listTransferDependencyCandidates({ search = "", salesOrder
         outboundLocation: row.outbound_location,
         customerAddress: row.dispatch_address,
         testFixture: row.is_test_fixture === true,
+        latestActivityAt: row.latest_activity_at || null,
         uncoveredQuantity: 0,
         lines: []
       });
     }
     const order = orders.get(key);
+    order.latestActivityAt = latestTransferDependencyActivityAt(order.latestActivityAt, row.latest_activity_at);
     order.uncoveredQuantity += row.unresolved_quantity;
     order.lines.push({
       salesLineId: row.id,
@@ -1919,9 +1976,60 @@ export async function getTransferDependencyBatch(batchId) {
             j.queued_at AS print_queued_at,
             j.started_at AS print_started_at,
             j.printed_at AS print_printed_at,
-            j.last_error AS print_error
+            j.last_error AS print_error,
+            dependency.status AS dependency_status,
+            COALESCE(dependency.loaded_quantity, 0) AS dependency_loaded_quantity,
+            COALESCE(dependency.delivered_quantity, 0) AS dependency_delivered_quantity,
+            COALESCE(dependency.locally_received_quantity, 0) AS dependency_locally_received_quantity,
+            COALESCE(transfer_progress.packed_quantity, 0) AS transfer_packed_quantity,
+            COALESCE(transfer_progress.loaded_quantity, 0) AS transfer_loaded_quantity,
+            COALESCE(transfer_progress.fulfilled_quantity, 0) AS transfer_fulfilled_quantity,
+            COALESCE(transfer_progress.received_quantity, 0) AS transfer_received_quantity,
+            transfer_header.last_item_fulfillment_id,
+            transfer_header.last_item_receipt_id,
+            transfer_header.fulfilled_at,
+            transfer_header.received_at
        FROM scm_transfer_dependency_proposals p
        LEFT JOIN scm_print_jobs j ON j.id = p.print_job_id
+       LEFT JOIN LATERAL (
+         SELECT d.status,
+                SUM(dl.loaded_quantity) AS loaded_quantity,
+                SUM(dl.delivered_quantity) AS delivered_quantity,
+                SUM(dl.locally_received_quantity) AS locally_received_quantity
+           FROM order_dependencies d
+           LEFT JOIN order_dependency_lines dl ON dl.dependency_id = d.id
+          WHERE d.proposal_id = p.id AND d.status <> 'cancelled'
+          GROUP BY d.id, d.status
+          ORDER BY d.id DESC
+          LIMIT 1
+       ) dependency ON true
+       LEFT JOIN transfer_orders transfer_header
+         ON transfer_header.netsuite_id = p.netsuite_transfer_order_id
+       LEFT JOIN LATERAL (
+         SELECT SUM(
+                  COALESCE(line.packed_pallet_qty, 0)
+                  + COALESCE(line.packed_layer_qty, 0)
+                  + COALESCE(line.packed_section_qty, 0)
+                  + COALESCE(line.packed_piece_qty, 0)
+                ) AS packed_quantity,
+                SUM(COALESCE(line.loaded_qty, 0)) AS loaded_quantity,
+                SUM(
+                  COALESCE(line.fulfilled_pallet_qty, 0)
+                  + COALESCE(line.fulfilled_layer_qty, 0)
+                  + COALESCE(line.fulfilled_section_qty, 0)
+                  + COALESCE(line.fulfilled_piece_qty, 0)
+                ) AS fulfilled_quantity,
+                SUM(
+                  COALESCE(line.received_pallet_qty, 0)
+                  + COALESCE(line.received_layer_qty, 0)
+                  + COALESCE(line.received_section_qty, 0)
+                  + COALESCE(line.received_piece_qty, 0)
+                  + COALESCE(line.netsuite_received_qty, 0)
+                ) AS received_quantity
+           FROM transfer_order_lines line
+          WHERE line.transfer_order_id = p.netsuite_transfer_order_id
+            AND COALESCE(line.netsuite_active, true)
+       ) transfer_progress ON true
       WHERE p.batch_id = $1
         AND p.creation_status <> 'cancelled'
       ORDER BY p.id`,
@@ -2031,6 +2139,24 @@ export async function getTransferDependencyBatch(batchId) {
       transferOrderId: proposal.netsuite_transfer_order_id,
       transferOrderRef: proposal.netsuite_transfer_order_ref,
       creationError: proposal.creation_error,
+      revision: Number(proposal.revision || 1),
+      revisionStatus: proposal.revision_status || "idle",
+      revisionRequestId: proposal.revision_request_id,
+      revisionError: proposal.revision_error,
+      revisionBlockedReason: transferDependencyRevisionProgressBlock({
+        dependencyStatus: proposal.dependency_status,
+        loadedQuantity: proposal.dependency_loaded_quantity,
+        deliveredQuantity: proposal.dependency_delivered_quantity,
+        locallyReceivedQuantity: proposal.dependency_locally_received_quantity,
+        transferPackedQuantity: proposal.transfer_packed_quantity,
+        transferLoadedQuantity: proposal.transfer_loaded_quantity,
+        transferFulfilledQuantity: proposal.transfer_fulfilled_quantity,
+        transferReceivedQuantity: proposal.transfer_received_quantity,
+        lastItemFulfillmentId: proposal.last_item_fulfillment_id,
+        lastItemReceiptId: proposal.last_item_receipt_id,
+        fulfilledAt: proposal.fulfilled_at,
+        receivedAt: proposal.received_at
+      }),
       quantityVerificationStatus: proposal.quantity_verification_status || "pending",
       quantityVerificationError: proposal.quantity_verification_error,
       quantityVerifiedAt: proposal.quantity_verified_at,
@@ -2039,6 +2165,9 @@ export async function getTransferDependencyBatch(batchId) {
       approvalError: proposal.approval_error,
       approvedAt: proposal.approved_at,
       approvedBy: proposal.approved_by,
+      printGeneration: Number(proposal.print_generation || 0),
+      printRequestStatus: proposal.print_request_status || "idle",
+      printRequestError: proposal.print_request_error,
       printJob: proposal.print_job_id ? {
         id: Number(proposal.print_job_id),
         status: proposal.print_status,
@@ -2318,6 +2447,537 @@ export async function updateTransferDependencyBatch(batchId, input = {}, operato
     );
     return getTransferDependencyBatch(batchId);
   });
+}
+
+function transferDependencyRevisionTarget(proposal, input = {}) {
+  const requestedLines = Array.isArray(input.lines) ? input.lines : [];
+  const requestedById = new Map();
+  for (const line of requestedLines) {
+    const id = Number(line.proposalLineId);
+    if (!Number.isInteger(id) || id <= 0 || requestedById.has(id)) {
+      throw Object.assign(new Error("Every revised Transfer Order line must have one unique proposal-line ID."), { status: 400 });
+    }
+    requestedById.set(id, line);
+  }
+  const currentIds = new Set((proposal.lines || []).map((line) => Number(line.id)));
+  if (requestedById.size !== currentIds.size || [...requestedById.keys()].some((id) => !currentIds.has(id))) {
+    throw Object.assign(new Error("Submit every current Transfer Order line exactly once. Refresh before retrying."), { status: 409 });
+  }
+  const lines = (proposal.lines || []).map((line) => {
+    const requested = requestedById.get(Number(line.id));
+    const converted = allocationSalesQuantity({
+      quantity: requested.proposedQuantity,
+      quantities: requested.quantities
+    }, line);
+    if (converted.quantity <= EPSILON) {
+      throw Object.assign(new Error("Every revised Transfer Order line must have a quantity above zero."), { status: 400 });
+    }
+    return {
+      ...line,
+      proposedQuantity: converted.quantity,
+      palletQty: converted.display.palletQty,
+      layerQty: converted.display.layerQty,
+      sectionQty: converted.display.sectionQty,
+      pieceQty: converted.display.pieceQty,
+      quantities: {
+        pallets: converted.display.palletQty,
+        layers: converted.display.layerQty,
+        sections: converted.display.sectionQty,
+        pieces: converted.display.pieceQty,
+        salesQty: Object.values(line.conversions || {}).some((value) => number(value) > EPSILON)
+          ? 0
+          : converted.quantity
+      }
+    };
+  });
+  const pallet = calculateTransferProposalPallets(lines);
+  const overrideProvided = input.palletTransferQuantity !== undefined
+    && input.palletTransferQuantity !== null
+    && input.palletTransferQuantity !== "";
+  if (!pallet.complete && !overrideProvided && !proposal.palletQuantityOverridden) {
+    throw Object.assign(new Error("Enter the required PALLET quantity because at least one item has no PLT conversion."), { status: 400 });
+  }
+  const palletTransferQuantity = overrideProvided
+    ? number(input.palletTransferQuantity)
+    : proposal.palletQuantityOverridden
+      ? number(proposal.palletTransferQuantity)
+      : pallet.recommendedQuantity;
+  if (palletTransferQuantity + EPSILON < pallet.explicitQuantity) {
+    throw Object.assign(new Error(`PALLET quantity cannot be below ${pallet.explicitQuantity}.`), { status: 400 });
+  }
+  return {
+    lines: lines.map((line) => ({
+      id: Number(line.id),
+      proposedQuantity: number(line.proposedQuantity),
+      palletQty: number(line.palletQty),
+      layerQty: number(line.layerQty),
+      sectionQty: number(line.sectionQty),
+      pieceQty: number(line.pieceQty)
+    })),
+    calculatedPalletQuantity: pallet.calculatedQuantity,
+    palletTransferQuantity,
+    palletCalculationComplete: pallet.complete,
+    palletQuantityOverridden: overrideProvided || proposal.palletQuantityOverridden === true
+  };
+}
+
+function transferDependencyProposalWithRevisionTarget(proposal, target = {}) {
+  const targetById = new Map((target.lines || []).map((line) => [Number(line.id), line]));
+  return {
+    ...proposal,
+    calculatedPalletQuantity: number(target.calculatedPalletQuantity),
+    palletTransferQuantity: number(target.palletTransferQuantity),
+    palletCalculationComplete: target.palletCalculationComplete !== false,
+    palletQuantityOverridden: target.palletQuantityOverridden === true,
+    lines: (proposal.lines || []).map((line) => {
+      const revised = targetById.get(Number(line.id));
+      if (!revised) throw Object.assign(new Error("A saved quantity revision no longer matches the proposal lines."), { status: 409 });
+      return {
+        ...line,
+        proposedQuantity: number(revised.proposedQuantity),
+        palletQty: number(revised.palletQty),
+        layerQty: number(revised.layerQty),
+        sectionQty: number(revised.sectionQty),
+        pieceQty: number(revised.pieceQty),
+        quantities: {
+          pallets: number(revised.palletQty),
+          layers: number(revised.layerQty),
+          sections: number(revised.sectionQty),
+          pieces: number(revised.pieceQty),
+          salesQty: Object.values(line.conversions || {}).some((value) => number(value) > EPSILON)
+            ? 0
+            : number(revised.proposedQuantity)
+        }
+      };
+    })
+  };
+}
+
+async function assertTransferDependencyRevisionCoverage(proposal, target) {
+  if (proposal.mode !== "direct_to_customer") return;
+  const salesLineIds = (proposal.lines || [])
+    .filter((line) => line.lineSource !== "manual" && Number.isInteger(Number(line.salesLineId)))
+    .map((line) => Number(line.salesLineId));
+  if (!salesLineIds.length) return;
+  await query(
+    "SELECT id FROM sales_order_lines WHERE id = ANY($1::bigint[]) ORDER BY id FOR UPDATE",
+    [salesLineIds]
+  );
+  const coverage = await query(
+    `SELECT sl.id AS sales_line_id,
+            COALESCE(sl.netsuite_backordered_qty, 0) AS backordered_quantity,
+            COALESCE(SUM(CASE
+              WHEN d.status <> 'cancelled' AND d.proposal_id IS DISTINCT FROM $2
+              THEN dl.allocated_quantity
+              ELSE 0
+            END), 0) AS other_allocated_quantity
+       FROM sales_order_lines sl
+       LEFT JOIN order_dependency_lines dl ON dl.sales_line_id = sl.id
+       LEFT JOIN order_dependencies d ON d.id = dl.dependency_id
+      WHERE sl.id = ANY($1::bigint[])
+      GROUP BY sl.id, sl.netsuite_backordered_qty`,
+    [salesLineIds, Number(proposal.id)]
+  );
+  const coverageByLine = new Map(coverage.rows.map((row) => [String(row.sales_line_id), row]));
+  const targetById = new Map((target.lines || []).map((line) => [Number(line.id), line]));
+  for (const currentLine of proposal.lines || []) {
+    if (currentLine.lineSource === "manual" || !currentLine.salesLineId) continue;
+    const row = coverageByLine.get(String(currentLine.salesLineId));
+    const maximum = Math.max(0, number(row?.backordered_quantity) - number(row?.other_allocated_quantity));
+    const revised = targetById.get(Number(currentLine.id));
+    const layerAllowance = number(revised?.layerQty) > EPSILON && number(currentLine.toLyr) > EPSILON
+      ? number(currentLine.toLyr) / 2
+      : 0;
+    if (number(revised?.proposedQuantity) > maximum + layerAllowance + EPSILON) {
+      throw Object.assign(new Error(
+        `${currentLine.itemName || currentLine.itemId} revised quantity ${number(revised?.proposedQuantity)} exceeds the Sales Order backorder available to this dependency (${maximum}).`
+      ), { status: 409 });
+    }
+  }
+}
+
+async function transferDependencyRevisionProgressState(proposalId) {
+  const result = await query(
+    `SELECT d.status AS dependency_status,
+            COALESCE(SUM(dl.loaded_quantity), 0) AS loaded_quantity,
+            COALESCE(SUM(dl.delivered_quantity), 0) AS delivered_quantity,
+            COALESCE(SUM(dl.locally_received_quantity), 0) AS locally_received_quantity,
+            transfer_header.last_item_fulfillment_id,
+            transfer_header.last_item_receipt_id,
+            transfer_header.fulfilled_at,
+            transfer_header.received_at,
+            COALESCE(progress.packed_quantity, 0) AS transfer_packed_quantity,
+            COALESCE(progress.loaded_quantity, 0) AS transfer_loaded_quantity,
+            COALESCE(progress.fulfilled_quantity, 0) AS transfer_fulfilled_quantity,
+            COALESCE(progress.received_quantity, 0) AS transfer_received_quantity
+       FROM scm_transfer_dependency_proposals p
+       LEFT JOIN order_dependencies d ON d.proposal_id = p.id AND d.status <> 'cancelled'
+       LEFT JOIN order_dependency_lines dl ON dl.dependency_id = d.id
+       LEFT JOIN transfer_orders transfer_header ON transfer_header.netsuite_id = p.netsuite_transfer_order_id
+       LEFT JOIN LATERAL (
+         SELECT SUM(COALESCE(line.packed_pallet_qty, 0) + COALESCE(line.packed_layer_qty, 0)
+                    + COALESCE(line.packed_section_qty, 0) + COALESCE(line.packed_piece_qty, 0)) AS packed_quantity,
+                SUM(COALESCE(line.loaded_qty, 0)) AS loaded_quantity,
+                SUM(COALESCE(line.fulfilled_pallet_qty, 0) + COALESCE(line.fulfilled_layer_qty, 0)
+                    + COALESCE(line.fulfilled_section_qty, 0) + COALESCE(line.fulfilled_piece_qty, 0)) AS fulfilled_quantity,
+                SUM(COALESCE(line.received_pallet_qty, 0) + COALESCE(line.received_layer_qty, 0)
+                    + COALESCE(line.received_section_qty, 0) + COALESCE(line.received_piece_qty, 0)
+                    + COALESCE(line.netsuite_received_qty, 0)) AS received_quantity
+           FROM transfer_order_lines line
+          WHERE line.transfer_order_id = p.netsuite_transfer_order_id
+            AND COALESCE(line.netsuite_active, true)
+       ) progress ON true
+      WHERE p.id = $1
+      GROUP BY p.id, d.id, d.status, transfer_header.netsuite_id,
+               transfer_header.last_item_fulfillment_id, transfer_header.last_item_receipt_id,
+               transfer_header.fulfilled_at, transfer_header.received_at,
+               progress.packed_quantity, progress.loaded_quantity,
+               progress.fulfilled_quantity, progress.received_quantity
+      ORDER BY d.id DESC NULLS LAST
+      LIMIT 1`,
+    [Number(proposalId)]
+  );
+  const row = result.rows[0] || {};
+  return {
+    dependencyStatus: row.dependency_status,
+    loadedQuantity: row.loaded_quantity,
+    deliveredQuantity: row.delivered_quantity,
+    locallyReceivedQuantity: row.locally_received_quantity,
+    transferPackedQuantity: row.transfer_packed_quantity,
+    transferLoadedQuantity: row.transfer_loaded_quantity,
+    transferFulfilledQuantity: row.transfer_fulfilled_quantity,
+    transferReceivedQuantity: row.transfer_received_quantity,
+    lastItemFulfillmentId: row.last_item_fulfillment_id,
+    lastItemReceiptId: row.last_item_receipt_id,
+    fulfilledAt: row.fulfilled_at,
+    receivedAt: row.received_at
+  };
+}
+
+async function applyTransferDependencyRevisionLocally({
+  batch,
+  proposal,
+  target,
+  revisionId,
+  targetRevision,
+  operatorId
+}) {
+  return withTransaction(async () => {
+    const locked = await query(
+      `SELECT p.id, p.revision, p.revision_status, p.netsuite_transfer_order_id
+         FROM scm_transfer_dependency_proposals p
+        WHERE p.id = $1 AND p.batch_id = $2
+        FOR UPDATE`,
+      [Number(proposal.id), Number(batch.id)]
+    );
+    if (!locked.rowCount) throw Object.assign(new Error("Transfer proposal not found."), { status: 404 });
+    const revision = await query(
+      "SELECT * FROM scm_transfer_dependency_revisions WHERE id = $1 FOR UPDATE",
+      [Number(revisionId)]
+    );
+    if (revision.rows[0]?.status === "applied") {
+      return { batch: await getTransferDependencyBatch(batch.id), reused: true };
+    }
+    if (Number(locked.rows[0].revision) !== Number(targetRevision) - 1) {
+      throw Object.assign(new Error("This Transfer Order revision changed. Refresh before retrying."), { status: 409 });
+    }
+    const progressBlock = transferDependencyRevisionProgressBlock(
+      await transferDependencyRevisionProgressState(proposal.id)
+    );
+    if (progressBlock) throw Object.assign(new Error(progressBlock), { status: 409 });
+
+    const targetById = new Map((target.lines || []).map((line) => [Number(line.id), line]));
+    for (const currentLine of proposal.lines || []) {
+      const line = targetById.get(Number(currentLine.id));
+      const updated = await query(
+        `UPDATE scm_transfer_dependency_proposal_lines
+            SET proposed_quantity = $3, pallet_qty = $4, layer_qty = $5,
+                section_qty = $6, piece_qty = $7, updated_at = now()
+          WHERE id = $1 AND proposal_id = $2`,
+        [Number(currentLine.id), Number(proposal.id), number(line.proposedQuantity),
+          number(line.palletQty), number(line.layerQty), number(line.sectionQty), number(line.pieceQty)]
+      );
+      if (updated.rowCount !== 1) throw new Error("A Transfer Order line changed while applying the revision.");
+    }
+
+    const dependency = await query(
+      `SELECT id FROM order_dependencies
+        WHERE proposal_id = $1 AND status <> 'cancelled'
+        ORDER BY id DESC LIMIT 1 FOR UPDATE`,
+      [Number(proposal.id)]
+    );
+    if (!dependency.rowCount) throw new Error("The linked order dependency is missing.");
+    const transferLines = await transferLinesForOrder(locked.rows[0].netsuite_transfer_order_id);
+    for (const currentLine of proposal.lines || []) {
+      const line = targetById.get(Number(currentLine.id));
+      const role = currentLine.lineSource === "manual" || !currentLine.salesLineId
+        ? "manual_transfer"
+        : "sales_allocation";
+      const outbound = transferLines.find((candidate) => candidate.line_stage === "outbound"
+        && String(candidate.item_id) === String(currentLine.itemId));
+      const receiving = transferLines.find((candidate) => candidate.line_stage === "receiving"
+        && String(candidate.item_id) === String(currentLine.itemId));
+      const params = [dependency.rows[0].id, currentLine.salesLineId || null, currentLine.itemId, role,
+        number(line.proposedQuantity), number(line.palletQty), number(line.layerQty),
+        number(line.sectionQty), number(line.pieceQty), outbound?.id || null, receiving?.id || null];
+      const updated = await query(
+        `UPDATE order_dependency_lines
+            SET allocated_quantity = $5, pallet_qty = $6, layer_qty = $7,
+                section_qty = $8, piece_qty = $9,
+                transfer_outbound_line_id = $10, transfer_receiving_line_id = $11,
+                updated_at = now()
+          WHERE dependency_id = $1
+            AND item_id = $3
+            AND line_role = $4
+            AND (($2::bigint IS NULL AND sales_line_id IS NULL) OR sales_line_id = $2)`,
+        params
+      );
+      if (updated.rowCount !== 1) throw new Error(`The linked dependency line for ${currentLine.itemName || currentLine.itemId} could not be revised exactly once.`);
+    }
+    const explicitPalletQuantity = (proposal.lines || []).reduce((total, currentLine) => (
+      isPalletItem(currentLine) ? total + number(targetById.get(Number(currentLine.id))?.proposedQuantity) : total
+    ), 0);
+    const ancillaryPalletQuantity = Math.max(0, number(target.palletTransferQuantity) - explicitPalletQuantity);
+    const existingPallet = await query(
+      `SELECT id FROM order_dependency_lines
+        WHERE dependency_id = $1 AND line_role = 'pallet'
+        ORDER BY id LIMIT 1 FOR UPDATE`,
+      [dependency.rows[0].id]
+    );
+    if (ancillaryPalletQuantity > EPSILON) {
+      const palletOutbound = transferLines.find((candidate) => candidate.line_stage === "outbound"
+        && String(candidate.item_id) === String(proposal.palletItemId));
+      const palletReceiving = transferLines.find((candidate) => candidate.line_stage === "receiving"
+        && String(candidate.item_id) === String(proposal.palletItemId));
+      if (existingPallet.rowCount) {
+        await query(
+          `UPDATE order_dependency_lines
+              SET allocated_quantity = $2, piece_qty = $2,
+                  transfer_outbound_line_id = $3, transfer_receiving_line_id = $4,
+                  updated_at = now()
+            WHERE id = $1`,
+          [existingPallet.rows[0].id, ancillaryPalletQuantity, palletOutbound?.id || null, palletReceiving?.id || null]
+        );
+      } else {
+        await query(
+          `INSERT INTO order_dependency_lines (
+             dependency_id, sales_line_id, transfer_outbound_line_id, transfer_receiving_line_id,
+             item_id, item_name, unit, allocated_quantity, pallet_qty, layer_qty,
+             section_qty, piece_qty, line_role
+           ) VALUES ($1, null, $2, $3, $4, $5, 'EACH', $6, 0, 0, 0, $6, 'pallet')`,
+          [dependency.rows[0].id, palletOutbound?.id || null, palletReceiving?.id || null,
+            proposal.palletItemId, proposal.palletItemName || "PALLET", ancillaryPalletQuantity]
+        );
+      }
+    } else if (existingPallet.rowCount) {
+      await query("DELETE FROM order_dependency_lines WHERE id = $1", [existingPallet.rows[0].id]);
+    }
+
+    await query(
+      `UPDATE scm_transfer_dependency_proposals
+          SET revision = $2, revision_status = 'idle', revision_request_id = NULL,
+              revision_started_at = NULL, revision_error = NULL,
+              calculated_pallet_qty = $3, pallet_transfer_qty = $4,
+              pallet_calculation_complete = $5, pallet_qty_overridden = $6,
+              quantity_verification_status = 'pending', quantity_verification_error = NULL,
+              quantity_verified_at = NULL, quantity_verified_by = NULL,
+              print_job_id = NULL, print_request_status = 'idle',
+              print_request_id = NULL, print_request_started_at = NULL,
+              print_request_error = NULL, updated_at = now()
+        WHERE id = $1`,
+      [Number(proposal.id), Number(targetRevision), number(target.calculatedPalletQuantity),
+        number(target.palletTransferQuantity), target.palletCalculationComplete !== false,
+        target.palletQuantityOverridden === true]
+    );
+    await query(
+      `UPDATE scm_transfer_dependency_revisions
+          SET status = 'applied', error = NULL, applied_at = now(), updated_at = now()
+        WHERE id = $1`,
+      [Number(revisionId)]
+    );
+    const shortageRows = await salesOrderShortageRows(batch.salesOrderId);
+    const uncovered = shortageRows.reduce((total, row) => total + number(row.unresolved_quantity), 0);
+    await query(
+      `UPDATE scm_transfer_dependency_batches
+          SET uncovered_shortage_qty = $2, updated_by = $3, updated_at = now()
+        WHERE id = $1`,
+      [Number(batch.id), uncovered, operatorId]
+    );
+    await writeDispatchAudit({
+      action: "scm.transfer_dependency.quantity_revised",
+      source: "scm",
+      entityType: "transfer_dependency_proposal",
+      entityId: String(proposal.id),
+      orderId: proposal.transferOrderRef,
+      operatorId,
+      details: {
+        batchId: batch.id,
+        salesOrderRef: batch.salesOrderRef,
+        transferOrderId: proposal.transferOrderId,
+        revision: targetRevision,
+        printInvalidated: Boolean(proposal.printJob)
+      }
+    });
+    return { batch: await getTransferDependencyBatch(batch.id), reused: false };
+  });
+}
+
+export async function reviseTransferDependencyProposal(batchId, proposalId, input = {}, {
+  operatorId = null,
+  inspectTransferOrder,
+  updateTransferOrder,
+  hydrateTransferOrder
+} = {}) {
+  if (typeof inspectTransferOrder !== "function" || typeof updateTransferOrder !== "function"
+      || typeof hydrateTransferOrder !== "function") {
+    throw new Error("NetSuite Transfer Order revision transport is unavailable.");
+  }
+  const resolvedBatchId = Number(batchId);
+  const resolvedProposalId = Number(proposalId);
+  const requestId = text(input.requestId);
+  if (!Number.isInteger(resolvedBatchId) || resolvedBatchId <= 0
+      || !Number.isInteger(resolvedProposalId) || resolvedProposalId <= 0) {
+    throw Object.assign(new Error("A valid dependency batch and proposal are required."), { status: 400 });
+  }
+  if (!requestId || requestId.length > 200) {
+    throw Object.assign(new Error("A stable quantity-revision request ID is required."), { status: 400 });
+  }
+  let batch = await getTransferDependencyBatch(resolvedBatchId);
+  if (!batch) throw Object.assign(new Error("Dependency batch not found."), { status: 404 });
+  let proposal = batch.proposals.find((row) => Number(row.id) === resolvedProposalId);
+  if (!proposal) throw Object.assign(new Error("Transfer proposal not found."), { status: 404 });
+  if (!["created", "attention"].includes(proposal.creationStatus) || !proposal.transferOrderId) {
+    throw Object.assign(new Error("Create the NetSuite Transfer Order before revising its quantities."), { status: 409 });
+  }
+
+  const sameRequest = await query(
+    `SELECT * FROM scm_transfer_dependency_revisions
+      WHERE proposal_id = $1 AND request_id = $2`,
+    [resolvedProposalId, requestId]
+  );
+  if (sameRequest.rows[0]?.status === "applied") {
+    return { batch, reused: true, recovered: false };
+  }
+  let expectedRevision;
+  let target;
+  if (sameRequest.rowCount && ["updating", "attention"].includes(sameRequest.rows[0].status)) {
+    expectedRevision = Number(sameRequest.rows[0].expected_revision);
+    target = sameRequest.rows[0].request_payload;
+  } else {
+    expectedRevision = Number(input.expectedRevision);
+    if (!Number.isInteger(expectedRevision) || expectedRevision <= 0) {
+      throw Object.assign(new Error("The current Transfer Order revision is required."), { status: 400 });
+    }
+    target = transferDependencyRevisionTarget(proposal, input);
+  }
+  const targetPayload = JSON.stringify(target);
+  let revisionClaim;
+  await withTransaction(async () => {
+    const locked = await query(
+      `SELECT id, revision, revision_status, revision_request_id
+         FROM scm_transfer_dependency_proposals
+        WHERE id = $1 AND batch_id = $2
+        FOR UPDATE`,
+      [resolvedProposalId, resolvedBatchId]
+    );
+    if (!locked.rowCount) throw Object.assign(new Error("Transfer proposal not found."), { status: 404 });
+    const existingSameRequest = await query(
+      `SELECT * FROM scm_transfer_dependency_revisions
+        WHERE proposal_id = $1 AND request_id = $2 FOR UPDATE`,
+      [resolvedProposalId, requestId]
+    );
+    if (existingSameRequest.rowCount) {
+      revisionClaim = existingSameRequest.rows[0];
+      return;
+    }
+    const active = await query(
+      `SELECT *, request_payload = $2::jsonb AS payload_matches
+         FROM scm_transfer_dependency_revisions
+        WHERE proposal_id = $1 AND status IN ('updating', 'attention')
+        ORDER BY id DESC LIMIT 1 FOR UPDATE`,
+      [resolvedProposalId, targetPayload]
+    );
+    if (active.rowCount) {
+      if (Number(active.rows[0].expected_revision) !== expectedRevision
+          || active.rows[0].payload_matches !== true) {
+        throw Object.assign(new Error("Another quantity revision needs recovery. Refresh before changing this Transfer Order."), { status: 409 });
+      }
+      revisionClaim = active.rows[0];
+      return;
+    }
+    if (Number(locked.rows[0].revision) !== expectedRevision) {
+      throw Object.assign(new Error("This Transfer Order revision changed. Refresh and review the latest quantities."), { status: 409 });
+    }
+    const progressBlock = transferDependencyRevisionProgressBlock(
+      await transferDependencyRevisionProgressState(resolvedProposalId)
+    );
+    if (progressBlock) throw Object.assign(new Error(progressBlock), { status: 409 });
+    await assertTransferDependencyRevisionCoverage(proposal, target);
+    const inserted = await query(
+      `INSERT INTO scm_transfer_dependency_revisions (
+         proposal_id, request_id, expected_revision, target_revision,
+         status, request_payload, requested_by
+       ) VALUES ($1, $2, $3, $4, 'updating', $5::jsonb, $6)
+       RETURNING *`,
+      [resolvedProposalId, requestId, expectedRevision, expectedRevision + 1, targetPayload, operatorId]
+    );
+    revisionClaim = inserted.rows[0];
+    await query(
+      `UPDATE scm_transfer_dependency_proposals
+          SET revision_status = 'updating', revision_request_id = $2,
+              revision_started_at = now(), revision_error = NULL, updated_at = now()
+        WHERE id = $1`,
+      [resolvedProposalId, revisionClaim.request_id]
+    );
+  });
+  if (revisionClaim.status === "applied") return { batch: await getTransferDependencyBatch(resolvedBatchId), reused: true };
+  target = revisionClaim.request_payload;
+  proposal = transferDependencyProposalWithRevisionTarget(proposal, target);
+  let mutationAttempted = false;
+  try {
+    let inspection = await inspectTransferOrder({ proposal, batch, transferOrderId: proposal.transferOrderId });
+    if (inspection?.revisionStatusBlock) {
+      throw Object.assign(new Error(inspection.revisionStatusBlock), { status: 409 });
+    }
+    if (!inspection?.matches) {
+      mutationAttempted = true;
+      await updateTransferOrder({ proposal, batch, transferOrderId: proposal.transferOrderId });
+      await hydrateTransferOrder(proposal.transferOrderId, proposal);
+      inspection = await inspectTransferOrder({ proposal, batch, transferOrderId: proposal.transferOrderId });
+    }
+    if (inspection?.revisionStatusBlock) {
+      throw Object.assign(new Error(inspection.revisionStatusBlock), { status: 409 });
+    }
+    if (!inspection?.matches) {
+      const mismatchText = (inspection?.mismatches || []).slice(0, 8).join("; ") || "NetSuite quantities did not match";
+      throw new Error(`TO quantity revision verification failed: ${mismatchText}`);
+    }
+    const result = await applyTransferDependencyRevisionLocally({
+      batch,
+      proposal,
+      target,
+      revisionId: revisionClaim.id,
+      targetRevision: revisionClaim.target_revision,
+      operatorId
+    });
+    return { ...result, recovered: !mutationAttempted };
+  } catch (error) {
+    await withTransaction(async () => {
+      await query(
+        `UPDATE scm_transfer_dependency_revisions
+            SET status = 'attention', error = $2, updated_at = now()
+          WHERE id = $1 AND status <> 'applied'`,
+        [Number(revisionClaim.id), error.message]
+      );
+      await query(
+        `UPDATE scm_transfer_dependency_proposals
+            SET revision_status = 'attention', revision_error = $2, updated_at = now()
+          WHERE id = $1 AND revision < $3`,
+        [resolvedProposalId, error.message, Number(revisionClaim.target_revision)]
+      );
+    });
+    throw error;
+  }
 }
 
 export async function mergeTransferDependencyProposals(batchId, input = {}, operatorId = null) {
@@ -3386,13 +4046,7 @@ export async function enrichDispatchOrdersWithDependencies(orders = []) {
   }
   return orders.map((order) => {
     const ref = text(order.id || order.tranid);
-    const salesRefs = [...new Set([
-      ref,
-      ...(Array.isArray(order.childOrders) ? order.childOrders : []),
-      ...(Array.isArray(order.childOrderDetails)
-        ? order.childOrderDetails.flatMap((child) => [child?.id, child?.originalOrderId])
-        : [])
-    ].map(text).filter(Boolean))];
+    const salesRefs = dispatchOrderRefs({ ...order, id: ref });
     const salesDependencies = [...new Map(
       salesRefs.flatMap((salesRef) => bySales.get(salesRef) || [])
         .map((dependency) => [String(dependency.id), dependency])
@@ -3449,17 +4103,6 @@ export async function enrichDispatchOrdersWithDependencies(orders = []) {
   });
 }
 
-function dispatchOrderRefs(order = {}) {
-  return [...new Set([
-    order.id,
-    order.tranid,
-    ...(Array.isArray(order.childOrders) ? order.childOrders : []),
-    ...(Array.isArray(order.childOrderDetails)
-      ? order.childOrderDetails.flatMap((child) => [child?.id, child?.originalOrderId])
-      : [])
-  ].map(text).filter(Boolean))];
-}
-
 export function normalDispatchGroupTargets(plan = {}) {
   const targets = new Map();
   const ambiguousRefs = new Set();
@@ -3510,8 +4153,8 @@ function physicalTruckLoadSequence(plan = {}) {
   return sequences;
 }
 
-function loadSequenceIndex(plan = {}) {
-  const index = new Map();
+function loadSequenceAssignments(plan = {}) {
+  const assignmentsByRef = new Map();
   const truckLoadSequence = physicalTruckLoadSequence(plan);
   const orderByRef = new Map();
   for (const order of plan.orders || []) {
@@ -3546,6 +4189,7 @@ function loadSequenceIndex(plan = {}) {
           .map((entry) => entry.arrival)
           .filter(Number.isFinite);
         const assignment = {
+          orderRef: text(stop.orderId),
           sequence,
           firstPickupSequence: pickupSequences.length ? Math.min(...pickupSequences) : sequence,
           firstPickupArrival: pickupArrivals.length ? Math.min(...pickupArrivals) : null,
@@ -3563,11 +4207,26 @@ function loadSequenceIndex(plan = {}) {
           arrival: dependencyTimingNumber(stop.timing?.arrival ?? stop.arrival ?? stop.arrive),
           departure: dependencyTimingNumber(stop.timing?.depart ?? stop.end ?? stop.departure ?? stop.leave)
         };
-        for (const ref of dispatchOrderRefs(order)) index.set(ref, assignment);
+        for (const ref of dispatchOrderRefs(order)) {
+          if (!assignmentsByRef.has(ref)) assignmentsByRef.set(ref, []);
+          assignmentsByRef.get(ref).push(assignment);
+        }
       }
     }
   }
-  return index;
+  return assignmentsByRef;
+}
+
+function loadSequenceIndexFromAssignments(assignmentsByRef = new Map()) {
+  return new Map(
+    [...assignmentsByRef.entries()]
+      .filter(([, assignments]) => assignments.length)
+      .map(([ref, assignments]) => [ref, assignments[assignments.length - 1]])
+  );
+}
+
+function loadSequenceIndex(plan = {}) {
+  return loadSequenceIndexFromAssignments(loadSequenceAssignments(plan));
 }
 
 function dependencyTimingNumber(value) {
@@ -3675,7 +4334,8 @@ async function priorPlannedTransferRefs(transferRefs = [], plan = {}) {
 export async function validateDispatchPlanDependencies(plan = {}) {
   const dependencies = await loadDependencies();
   if (!dependencies.length) return [];
-  const current = loadSequenceIndex(plan);
+  const assignmentsByRef = loadSequenceAssignments(plan);
+  const current = loadSequenceIndexFromAssignments(assignmentsByRef);
   const transferIds = [...new Set(dependencies.map((dependency) => Number(dependency.transferOrderId)).filter(Number.isInteger))];
   const transferRows = transferIds.length ? await query(
     `SELECT netsuite_id, fulfillment_status, receiving_status, received_at,
@@ -3694,12 +4354,13 @@ export async function validateDispatchPlanDependencies(plan = {}) {
     const dispatchTargetRef = text(dependency.dispatchTargetRef || dependency.salesOrderRef);
     const canonicalRef = text(dependency.canonicalSalesOrderRef);
     const plannedSalesRef = current.has(dispatchTargetRef) ? dispatchTargetRef : canonicalRef;
+    const salesAssignments = assignmentsByRef.get(plannedSalesRef) || [];
     const salesAssignment = current.get(plannedSalesRef);
     if (dependency.status === "attention") {
-      if (salesAssignment) conflicts.push(`${plannedSalesRef}: ${dependency.attentionReason || `${dependency.transferOrderRef} requires attention`}.`);
+      if (salesAssignments.length) conflicts.push(`${plannedSalesRef}: ${dependency.attentionReason || `${dependency.transferOrderRef} requires attention`}.`);
       continue;
     }
-    if (!salesAssignment) continue;
+    if (!salesAssignments.length) continue;
     if (dependency.mode === "direct_to_customer") {
       const assignedLoad = (plan.trucks || []).flatMap((truck) => truck.loads || [])
         .find((load) => String(load.id || "") === String(salesAssignment.loadId || ""));
@@ -3742,8 +4403,12 @@ export async function validateDispatchPlanDependencies(plan = {}) {
     const complete = ["received", "completed", "shipped"].includes(String(transferRow.receiving_status || "").toLowerCase())
       || ["delivered", "received_local"].includes(dependency.status);
     if (complete) continue;
-    if (replenishmentTransferPrecedesSales(transferAssignment, salesAssignment)) continue;
     if (priorTransferRefs.has(dependency.transferOrderRef)) continue;
+    if (everySalesAssignmentFollowsTransfer(
+      transferAssignment,
+      salesAssignments,
+      replenishmentTransferPrecedesSales
+    )) continue;
     conflicts.push(`${plannedSalesRef} requires ${dependency.transferOrderRef} to complete earlier or finish before its pickup.`);
   }
   return conflicts;

@@ -1,5 +1,6 @@
 import { writeAudit } from "./auth-repository.js";
 import { query, withTransaction } from "./db.js";
+import { describePurchaseOrderLinePallets } from "./scm-netsuite-po-unit-conversion.js";
 
 function positiveInt(value, fallback = null) {
   const number = Number(value);
@@ -37,6 +38,7 @@ function historyRow(row, lines = []) {
     lastSyncedAt: row.last_synced_at || row.canonical_synced_at,
     lastSyncError: row.last_sync_error,
     remoteLastModifiedAt: row.remote_last_modified_at || row.canonical_remote_last_modified_at,
+    lifecycle: row.history_lifecycle || "active",
     current: {
       tranid: row.current_tranid || row.netsuite_purchase_order_ref,
       transactionDate: row.trandate,
@@ -51,6 +53,8 @@ function historyRow(row, lines = []) {
       expectedDeliveryDate: row.expected_delivery_date,
       memo: row.memo || "",
       active: row.netsuite_active !== false,
+      receiptStatus: row.receipt_status || "",
+      netSuiteMissingAt: row.netsuite_missing_at || null,
       lines
     }
   };
@@ -59,6 +63,14 @@ function historyRow(row, lines = []) {
 function lineRow(row) {
   const received = Number(row.netsuite_received_qty || 0);
   const closed = row.netsuite_closed === true;
+  const conversion = describePurchaseOrderLinePallets({
+    itemId: row.item_id,
+    itemName: row.item_name,
+    quantity: row.quantity,
+    unit: row.unit,
+    palletQuantity: row.pallet_qty,
+    toPlt: row.to_plt
+  });
   return {
     lineId: Number(row.line_id),
     itemId: Number(row.item_id),
@@ -72,9 +84,31 @@ function lineRow(row) {
     destinationLocationId: row.location_id === null ? null : Number(row.location_id),
     destination: row.location || "",
     closed,
-    editable: !closed && received <= 0 && row.netsuite_active !== false
+    editable: !closed && received <= 0 && row.netsuite_active !== false,
+    ...conversion
   };
 }
+
+const MISSING_HISTORY_SQL = `(COALESCE(h.last_sync_error = 'The purchase order no longer exists in NetSuite.', false)
+  OR COALESCE(state.netsuite_terminal_state IN ('missing', 'deleted'), false)
+  OR (po.netsuite_active = false AND po.netsuite_missing_at IS NOT NULL))`;
+const COMPLETED_HISTORY_SQL = `(NOT ${MISSING_HISTORY_SQL} AND (
+  COALESCE(state.application_status = 'Completed', false)
+  OR LOWER(COALESCE(po.receipt_status, '')) = 'received'
+  OR COALESCE(po.status_text, po.status, '') ILIKE '%fully received%'
+  OR COALESCE(po.status_text, po.status, '') ILIKE '%fully billed%'
+))`;
+const OPEN_QUANTITY_HISTORY_SQL = `EXISTS (
+  SELECT 1
+    FROM purchase_order_lines open_line
+   WHERE open_line.purchase_order_id = h.netsuite_purchase_order_id
+     AND open_line.netsuite_active IS DISTINCT FROM false
+     AND NOT COALESCE(open_line.netsuite_closed, false)
+     AND COALESCE(open_line.quantity, 0) - COALESCE(open_line.netsuite_received_qty, 0) > 0.000001
+)`;
+const PENDING_RECEIVE_HISTORY_SQL = `(NOT ${MISSING_HISTORY_SQL}
+  AND NOT ${COMPLETED_HISTORY_SQL}
+  AND ${OPEN_QUANTITY_HISTORY_SQL})`;
 
 const SELECT_HEADER = `
   SELECT h.*,
@@ -82,10 +116,20 @@ const SELECT_HEADER = `
          po.vendor_id, po.vendor, po.status, po.status_text, po.foreign_total,
          po.dispatch_vendor_yard, po.source_location, po.vendor_reference,
          po.expected_delivery_date, po.memo, po.netsuite_active,
+         po.receipt_status, po.netsuite_missing_at,
          po.synced_at AS canonical_synced_at,
-         po.remote_last_modified_at AS canonical_remote_last_modified_at
+         po.remote_last_modified_at AS canonical_remote_last_modified_at,
+         CASE
+           WHEN ${MISSING_HISTORY_SQL} THEN 'missing'
+           WHEN ${COMPLETED_HISTORY_SQL} THEN 'completed'
+           WHEN ${PENDING_RECEIVE_HISTORY_SQL} THEN 'pending_receive'
+           ELSE 'active'
+         END AS history_lifecycle
     FROM scm_netsuite_po_history h
-    LEFT JOIN purchase_orders po ON po.netsuite_id = h.netsuite_purchase_order_id`;
+    LEFT JOIN purchase_orders po ON po.netsuite_id = h.netsuite_purchase_order_id
+    LEFT JOIN scm_reconciliation_order_state state
+      ON state.order_kind = 'PO'
+     AND state.source_order_netsuite_id = h.netsuite_purchase_order_id`;
 
 async function loadLines(orderIds) {
   if (!orderIds.length) return new Map();
@@ -126,8 +170,21 @@ export async function listScmNetSuitePoHistory(filters = {}) {
   } else if (text(filters.destinationYard)) {
     clauses.push(`EXISTS (SELECT 1 FROM purchase_order_lines pol WHERE pol.purchase_order_id = h.netsuite_purchase_order_id AND pol.netsuite_active IS DISTINCT FROM false AND pol.location ILIKE ${bind(`%${text(filters.destinationYard)}%`)})`);
   }
+  const lifecycle = text(filters.lifecycle).toLowerCase();
+  if (lifecycle === "missing") clauses.push(MISSING_HISTORY_SQL);
+  if (lifecycle === "completed") clauses.push(COMPLETED_HISTORY_SQL);
+  if (lifecycle === "pending_receive") clauses.push(PENDING_RECEIVE_HISTORY_SQL);
   const where = clauses.join(" AND ");
-  const count = await query(`SELECT COUNT(*)::integer AS count FROM scm_netsuite_po_history h LEFT JOIN purchase_orders po ON po.netsuite_id = h.netsuite_purchase_order_id WHERE ${where}`, values);
+  const count = await query(
+    `SELECT COUNT(*)::integer AS count
+       FROM scm_netsuite_po_history h
+       LEFT JOIN purchase_orders po ON po.netsuite_id = h.netsuite_purchase_order_id
+       LEFT JOIN scm_reconciliation_order_state state
+         ON state.order_kind = 'PO'
+        AND state.source_order_netsuite_id = h.netsuite_purchase_order_id
+      WHERE ${where}`,
+    values
+  );
   const offsetBind = bind((page - 1) * pageSize);
   const limitBind = bind(pageSize);
   const result = await query(`${SELECT_HEADER} WHERE ${where} ORDER BY h.archived_at DESC NULLS LAST, h.app_created_at DESC, h.id DESC OFFSET ${offsetBind} LIMIT ${limitBind}`, values);

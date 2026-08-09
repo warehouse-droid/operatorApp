@@ -170,6 +170,7 @@ let fulfillmentStartedAt = 0;
 let fulfillmentProgressTimer = null;
 let fulfillmentValidation = null;
 let fulfillmentReturnModule = "delivery";
+let fulfillmentLoadRequestId = "";
 let customerPickupScan = ["string", "number"].includes(typeof initialOperatorState.customerPickupScan)
   ? String(initialOperatorState.customerPickupScan)
   : "";
@@ -3943,6 +3944,31 @@ function renderOrderSaveStar(order) {
   `;
 }
 
+function renderReloadMarker(order) {
+  return order?.reload_authorized
+    ? `<span class="status-pill warning reload-marker">RE-LOAD</span>`
+    : "";
+}
+
+function isPackedReloadReady(order) {
+  if (!order?.reload_authorized) return false;
+  const cycle = order.reload_cycle || order.reloadCycle;
+  if (cycle) return String(cycle.status || "") === "packed";
+  const cycles = Array.isArray(order.reload_cycles) ? order.reload_cycles : [];
+  return cycles.length > 0 && cycles.every((item) => String(item?.status || "") === "packed");
+}
+
+function deliveryLoadAction(order, mode = "active") {
+  const reloadReady = isPackedReloadReady(order);
+  return {
+    reloadReady,
+    show: reloadReady || mode === "packed",
+    label: reloadReady ? "Take Photos & Re-load" : t("common.load", "Load"),
+    allowPackedQuantityEdit: !reloadReady,
+    showEditPacking: reloadReady
+  };
+}
+
 function renderOrderPanel() {
   const panelOrders = filteredDeliveryOrders();
   const count = pageCount(panelOrders, DELIVERY_ORDER_PAGE_SIZE);
@@ -3989,7 +4015,7 @@ function renderOrderPanel() {
         return `
         <div class="order-card-wrap">
           <button class="order-card ${String(order.netsuite_id) === String(selectedId) ? "active" : ""} ${orderWarningCount(order) ? "warning" : ""} ${orderUnderpackCount(order) && order.operator_status === "packed" ? "underpack" : ""} ${request ? "request" : ""}" data-order="${order.netsuite_id}" type="button">
-            <strong>${order.tranid}${order.testFixture ? ` <span class="status-pill test-fixture">TEST</span>` : ""}</strong>
+            <strong>${order.tranid}${order.testFixture ? ` <span class="status-pill test-fixture">TEST</span>` : ""} ${renderReloadMarker(order)}</strong>
             <span class="muted order-schedule-line">${shouldShowDeliverySchedule() ? deliveryScheduleText(order) : formatDate(order.trandate)} | ${order.outbound_location || ""}</span>
             ${order.dispatch_planned || order.load_view ? `<span class="planned-line">${plannedOrderText(order)}</span>` : ""}
             ${isOrderSaved(order) ? `<span class="saved-line">${t("operator.savedOrder", "Saved order")}</span>` : ""}
@@ -4094,12 +4120,13 @@ function renderDetailPanel(order) {
   const directPickupInfo = !isCustomerPickupMode() && order.direct_pickup_only === true && !lines.length;
   const vrmaReferenceOnly = isVrmaReferenceOrder(order);
   const vrmaLocalOnly = isVrmaOrder(order) && !vrmaReferenceOnly;
+  const loadAction = deliveryLoadAction(order, viewMode);
 
   return `
     <div class="detail-header">
       <div>
         <div class="order-title-row">
-          <h2>${order.tranid}${order.testFixture ? ` <span class="status-pill test-fixture">TEST</span>` : ""}</h2>
+          <h2>${order.tranid}${order.testFixture ? ` <span class="status-pill test-fixture">TEST</span>` : ""} ${renderReloadMarker(order)}</h2>
           ${viewMode === "packed" && !isCustomerPickupMode() && !vrmaReferenceOnly ? `<button class="secondary-button danger-button compact-action" data-action="unpack-order" type="button">${t("operator.unpackWholeOrder", "Unpack whole order")}</button>` : ""}
         </div>
         <p class="muted">${order.customer || ""}</p>
@@ -4114,8 +4141,8 @@ function renderDetailPanel(order) {
           ? `<span class="muted">${t("operator.referenceOnlyNoInventory", "Reference only · No inventory deduction")}</span>`
           : directPickupInfo ? "" : isCustomerPickupMode()
             ? `<button class="primary-button" data-action="start-fulfill" type="button" ${hasCustomerPickupDraft(order) ? "" : "disabled"}>${t("common.load", "Load")}</button>`
-            : viewMode === "packed"
-              ? `<button class="primary-button" data-action="start-fulfill" type="button">${t("common.load", "Load")}</button>`
+            : loadAction.show
+              ? `<button class="primary-button" data-action="start-fulfill" type="button">${loadAction.label}</button>`
               : `<button class="secondary-button" data-action="set-preparing" type="button">${t("operator.preparing", "Preparing")}</button>
                  <button class="primary-button" data-action="set-packed" type="button" ${canMarkPacked(order) ? "" : "disabled"}>${t("operator.packed", "Packed")}</button>`}
       </div>
@@ -4125,6 +4152,13 @@ function renderDetailPanel(order) {
       <div><span>${t("common.location", "Location")}</span><strong>${currentLocation()?.text}</strong></div>
       <div><span>${t("operator.status", "Status")}</span><strong>${directPickupInfo ? t("operator.directPickup", "Direct pickup") : orderStatusText(order)}</strong></div>
     </div>
+    ${order.reload_authorized ? `
+      <div class="sync-alert reload-notice">
+        <strong>Local-only re-load</strong>
+        <span>${escapeHtml(order.reload_reason || order.reload_cycle?.reason || "Authorized by Control")}</span>
+        <em>Pack and photograph this physical load again. Canonical Sales Order fulfillment and Dispatch stay unchanged.</em>
+      </div>
+    ` : ""}
     ${vrmaReferenceOnly ? `
       <div class="sync-alert">
         <strong>${t("operator.localVrmaReference", "Local VRMA pickup reference")}</strong>
@@ -4185,14 +4219,15 @@ function renderFulfillmentScreen() {
   const packedLines = visibleLines(order).filter((line) => hasPackedQty(line));
   const fulfillmentPhotoSlots = Math.max(2, fulfillmentPhotoDataUrls.length);
   const fulfillmentPhotoCount = fulfillmentPhotoDataUrls.filter(Boolean).length;
+  const isReloadLoad = Boolean(order.reload_authorized);
   if (fulfillmentResult) {
     const isPickupLoad = currentModule === "customer-pickup-load";
     return shell(t("operator.loadComplete", "Load Complete"), `${t("common.order", "Order")} ${order.tranid}`, `
       <section class="fulfillment-screen">
         <div class="fulfillment-card success">
           <span>${isPickupLoad ? t("operator.pickupStatus", "Pickup Status") : t("operator.localYardStatus", "Local Yard Status")}</span>
-          <strong>${isPickupLoad ? (fulfillmentResult.pickupStatus === "partial_loaded" ? t("operator.partialLoaded", "Partial Loaded") : t("common.loaded", "Loaded")) : (fulfillmentResult.localYardOrderStatus || t("common.loaded", "Loaded"))}</strong>
-          <p>${isPickupLoad ? tf("operator.photoSavedRemaining", "Photo proof saved. Remaining line count: {count}.", { count: fulfillmentResult.remainingLines || 0 }) : t("operator.photoSavedHidden", "Photo proof saved. This order is hidden from the operator list.")}</p>
+          <strong>${isPickupLoad ? (fulfillmentResult.pickupStatus === "partial_loaded" ? t("operator.partialLoaded", "Partial Loaded") : t("common.loaded", "Loaded")) : isReloadLoad ? (fulfillmentResult.completed ? "Re-load Complete" : "Re-load Partially Loaded") : (fulfillmentResult.localYardOrderStatus || t("common.loaded", "Loaded"))}</strong>
+          <p>${isPickupLoad ? tf("operator.photoSavedRemaining", "Photo proof saved. Remaining line count: {count}.", { count: fulfillmentResult.remainingLines || 0 }) : isReloadLoad ? "This re-load attempt was saved locally. NetSuite fulfillment and Dispatch were not changed." : t("operator.photoSavedHidden", "Photo proof saved. This order is hidden from the operator list.")}</p>
         </div>
         <div class="selected-actions">
           <button class="primary-button" data-action="finish-fulfill" type="button">${isPickupLoad ? t("operator.backToScan", "Back to Scan") : t("operator.backToDelivery", "Back to Delivery")}</button>
@@ -4201,7 +4236,8 @@ function renderFulfillmentScreen() {
     `, `<button class="secondary-button" data-action="finish-fulfill" type="button">${t("operator.deliveryPrep", "Delivery")}</button>`);
   }
   return shell(t("operator.loadOrder", "Load Order"), `${order.tranid} | ${t("common.location", "Location")} ${currentLocation()?.text || ""}`, `
-    <section class="fulfillment-screen">
+    <section class="fulfillment-screen ${isReloadLoad ? "reload-fulfillment-screen" : ""}">
+      ${isReloadLoad ? `<div class="sync-alert reload-notice"><strong>Local-only re-load</strong><span>${escapeHtml(order.reload_reason || order.reload_cycle?.reason || "")}</span></div>` : ""}
       <div class="fulfillment-card">
         <span>${t("operator.photoProof", "Photo proof")}</span>
         <strong>${t("operator.loadedOnTruck", "Loaded on truck")}</strong>
@@ -4299,11 +4335,16 @@ function renderVrmaReferenceLinePanel(line) {
 function renderSelectedLinePanel(line) {
   const units = deliveryLineUnits(line);
   const notice = exceptionText(line);
-  const showConfirmPage = currentModule === "delivery" && viewMode !== "packed";
-  const packedActions = notice
-    ? `<button class="secondary-button danger-button" data-action="unpack-line" data-line="${line.id}" type="button">${t("operator.unpackPackedQty", "Unpack packed qty")}</button>`
-    : `<button class="primary-button" data-action="update-packed-line" data-line="${line.id}" type="button">${t("operator.updatePackedQty", "Update packed qty")}</button>
-       <button class="secondary-button danger-button" data-action="unpack-line" data-line="${line.id}" type="button">${t("operator.unpackPackedQty", "Unpack packed qty")}</button>`;
+  const loadAction = deliveryLoadAction(selectedOrder, viewMode);
+  const packedReview = viewMode === "packed" || loadAction.reloadReady;
+  const showConfirmPage = currentModule === "delivery" && !packedReview;
+  const packedActions = loadAction.allowPackedQuantityEdit
+    ? notice
+      ? `<button class="secondary-button danger-button" data-action="unpack-line" data-line="${line.id}" type="button">${t("operator.unpackPackedQty", "Unpack packed qty")}</button>`
+      : `<button class="primary-button" data-action="update-packed-line" data-line="${line.id}" type="button">${t("operator.updatePackedQty", "Update packed qty")}</button>
+         <button class="secondary-button danger-button" data-action="unpack-line" data-line="${line.id}" type="button">${t("operator.unpackPackedQty", "Unpack packed qty")}</button>`
+    : `<button class="primary-button" data-action="start-fulfill" type="button">${loadAction.label}</button>
+       <button class="secondary-button" data-action="edit-reload-packing" type="button">Edit packing</button>`;
   return `
     <aside class="selected-panel" data-selected-line="${line.id}">
       ${showConfirmPage ? `
@@ -4320,8 +4361,8 @@ function renderSelectedLinePanel(line) {
         ${units.map((unit) => `<div class="measure"><span>${isCustomerPickupMode() ? t("operator.remaining", "Remaining") : t("operator.required", "Required")} ${unit.label}</span><b>${displayQty(isCustomerPickupMode() ? Math.max(0, requiredValue(line, unit.key) - pickupLoadedValue(line, unit.key)) : requiredValue(line, unit.key))}</b></div>`).join("")}
       </div>
       ${notice ? `<div class="line-alert"><strong>${t("operator.repackNeeded", "Repack needed")}</strong><span>${notice}</span></div>` : ""}
-      ${notice ? "" : units.map((unit) => renderStepper(unit.key, `${viewMode === "packed" ? t("operator.packed", "Packed") : t("operator.pack", "Pack")} ${unit.label}`, panelValue(line, unit.key))).join("")}
-      ${viewMode === "packed"
+      ${notice || !loadAction.allowPackedQuantityEdit ? "" : units.map((unit) => renderStepper(unit.key, `${packedReview ? t("operator.packed", "Packed") : t("operator.pack", "Pack")} ${unit.label}`, panelValue(line, unit.key))).join("")}
+      ${packedReview
         ? `<div class="selected-actions">${packedActions}</div>`
         : `<div class="selected-actions"><button class="primary-button" data-action="confirm-line" data-line="${line.id}" type="button">${t("operator.confirmLine", "Confirm line")}</button></div>`}
     </aside>
@@ -5740,9 +5781,49 @@ async function releaseCurrentDraft(orderId) {
   }
 }
 
+function createOperatorUuid() {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  const hex = Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16));
+  hex[12] = "4";
+  hex[16] = ["8", "9", "a", "b"][Math.floor(Math.random() * 4)];
+  const value = hex.join("");
+  return `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20)}`;
+}
+
+async function editReloadPacking() {
+  if (!selectedOrder || !isPackedReloadReady(selectedOrder)) return;
+  const orderId = selectedOrder.netsuite_id;
+  markLocalDeliveryMutation(orderId);
+  try {
+    const result = await api(`/api/delivery/orders/${encodeURIComponent(orderId)}/status`, {
+      method: "POST",
+      body: JSON.stringify({ status: "preparing" })
+    });
+    viewMode = "active";
+    deliveryOrderBuckets = { active: null, packed: null };
+    selectedId = orderId;
+    selectedOrder = result.order || selectedOrder;
+    showToast("Re-load moved back to Preparing");
+    await loadOrders({ keepSelection: true });
+  } finally {
+    finishLocalDeliveryMutation(orderId);
+  }
+}
+
 async function startFulfillment() {
   if (!selectedOrder) return;
-  fulfillmentOrder = selectedOrder;
+  let order = selectedOrder;
+  if (order.reload_authorized) {
+    const refreshed = await api(`/api/delivery/orders/${encodeURIComponent(order.netsuite_id)}`);
+    acceptRefreshedDeliveryOrder(refreshed, { renderPanels: false });
+    if (!isPackedReloadReady(refreshed)) {
+      showToast("Pack this re-load before taking photos.");
+      if (currentModule === "delivery") renderDeliveryPanels();
+      return;
+    }
+    order = refreshed;
+  }
+  fulfillmentOrder = order;
   fulfillmentReturnModule = currentModule;
   fulfillmentPhotoDataUrls = [];
   fulfillmentActivePhotoSlot = 0;
@@ -5752,9 +5833,11 @@ async function startFulfillment() {
   fulfillmentJobStage = "";
   fulfillmentStartedAt = 0;
   fulfillmentValidation = null;
+  fulfillmentLoadRequestId = createOperatorUuid();
   selectRearCamera();
   currentModule = isCustomerPickupMode() ? "customer-pickup-load" : "delivery-fulfill";
   render();
+  if (order.reload_authorized) await startFulfillmentCamera();
 }
 
 function stopFulfillmentCamera() {
@@ -5897,7 +5980,11 @@ async function confirmFulfillment() {
     fulfillmentStatusText = "Saving local loaded status...";
     fulfillmentResult = await api(path, {
       method: "POST",
-      body: JSON.stringify({ photoDataUrls: uploadedPhotoRefs, locationId })
+      body: JSON.stringify({
+        photoDataUrls: uploadedPhotoRefs,
+        requestId: fulfillmentLoadRequestId,
+        locationId
+      })
     });
     showToast("Order loaded");
   } catch (error) {
@@ -5942,6 +6029,7 @@ async function finishFulfillment() {
   fulfillmentJobStage = "";
   fulfillmentValidation = null;
   fulfillmentStartedAt = 0;
+  fulfillmentLoadRequestId = "";
   fulfillmentReturnModule = "delivery";
   viewMode = "active";
   if (wasPickup) {
@@ -8119,6 +8207,7 @@ app.addEventListener("click", async (event) => {
     if (button.dataset.action === "step-qty") return stepQty(button.dataset.unit, button.dataset.delta);
     if (button.dataset.action === "set-preparing") return setOrderStatus("preparing");
     if (button.dataset.action === "set-packed") return setOrderStatus("packed");
+    if (button.dataset.action === "edit-reload-packing") return editReloadPacking();
     if (button.dataset.action === "start-fulfill") return startFulfillment();
     if (button.dataset.action === "cancel-fulfill") {
       stopFulfillmentCamera();
@@ -8130,6 +8219,7 @@ app.addEventListener("click", async (event) => {
       fulfillmentStatusText = "";
       fulfillmentJobStage = "";
       fulfillmentStartedAt = 0;
+      fulfillmentLoadRequestId = "";
       return render();
     }
     if (button.dataset.action === "confirm-fulfill") return confirmFulfillment();

@@ -12,6 +12,10 @@ import {
 
 let fixture;
 
+function jsonClone(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
 before(async () => {
   fixture = await createDispatchV2Fixture();
 });
@@ -255,11 +259,23 @@ test("DP-27: consecutive Custom Order saves accept the digest acknowledged befor
   assert.equal(result.payload.plan.summary.saveSequence, 2);
 });
 
-test("DP-07: compact-board replacement cannot bypass cross-date order ownership", async () => {
+test("DP-07: a rejected compact-board replacement is retained without changing the confirmed plan", async () => {
   await fixture.seedPlan({ date: "2025-02-21", refs: ["DP-REPLACE-FOREIGN"] });
   const target = await fixture.seedPlan({ date: "2025-02-22", refs: ["DP-REPLACE-TARGET"] });
+  await query(
+    "UPDATE dispatch_plans SET status = 'confirmed', confirmed_at = now(), revision = revision + 1 WHERE id = $1",
+    [target.id]
+  );
   const lease = await fixture.acquireLease({ planDate: target.plan_date, sessionId: "dispatch-v2-replace-conflict" });
   const current = await bootstrap(target.id, target.plan_date);
+  const activeBefore = (await query(
+    `SELECT p.status, p.revision::int AS revision, p.confirmed_at,
+            s.orders, s.trucks, s.summary, s.saved_at, s.plan_digest
+       FROM dispatch_plans p
+       JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+      WHERE p.id = $1`,
+    [target.id]
+  )).rows[0];
   const orders = [
     ...current.plan.assignedOrderSnapshots,
     { id: "DP-REPLACE-FOREIGN", type: "SO", items: [] }
@@ -290,10 +306,35 @@ test("DP-07: compact-board replacement cannot bypass cross-date order ownership"
     }
   });
 
-  assert.equal(result.response.status, 409, JSON.stringify(result.payload));
-  assert.equal(result.payload.code, "DISPATCH_ORDER_ALREADY_PLANNED");
+  assert.equal(result.response.status, 202, JSON.stringify(result.payload));
+  assert.equal(result.payload.code, "DISPATCH_PLAN_RECOVERY_SAVED");
+  assert.equal(result.payload.saved, true);
+  assert.equal(result.payload.applied, false);
+  assert.ok(result.payload.recoveryDraft?.id);
+  assert.ok(
+    (result.payload.validationIssues || []).some((issue) => issue.code === "DISPATCH_ORDER_ALREADY_PLANNED")
+  );
   assert.equal(
     (await query("SELECT count(*)::int AS count FROM dispatch_plan_commands WHERE command_id = 'dp-replace-cross-date-block'")).rows[0].count,
     0
+  );
+  assert.deepEqual(
+    jsonClone((await query(
+      `SELECT p.status, p.revision::int AS revision, p.confirmed_at,
+              s.orders, s.trucks, s.summary, s.saved_at, s.plan_digest
+         FROM dispatch_plans p
+         JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+        WHERE p.id = $1`,
+      [target.id]
+    )).rows[0]),
+    jsonClone(activeBefore),
+    "A rejected incremental save must not mutate the confirmed plan."
+  );
+  assert.equal(
+    (await query(
+      "SELECT archive_reason FROM dispatch_plan_snapshot_history WHERE id = $1",
+      [result.payload.recoveryDraft.id]
+    )).rows[0]?.archive_reason,
+    "save_recovery"
   );
 });

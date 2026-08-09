@@ -77,7 +77,14 @@ export const REQUIRED_MBT_P3_MIGRATIONS = Object.freeze([
   "130_mbt_multi_item_quoted_distance_pricing.sql",
   "131_sales_order_reconciliation.sql",
   "132_so_reconciliation_type_filter.sql",
-  "133_driver_pwa_offline_mode.sql"
+  "133_driver_pwa_offline_mode.sql",
+  "134_so_reconciliation_db_only.sql",
+  "135_dispatch_planner_incremental_commands.sql",
+  "136_dispatch_planner_command_actor_identity.sql",
+  "137_dispatch_planner_followup_progress.sql",
+  "138_smart_scm_authoritative_on_order.sql",
+  "139_sales_order_reload_cycles.sql",
+  "140_driver_yard_dependency_soft_mode.sql"
 ]);
 
 export const REQUIRED_MBT_P3_FLAGS = Object.freeze([

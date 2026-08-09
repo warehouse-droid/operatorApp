@@ -1,3 +1,5 @@
+import { rollupReconciliationGroup } from "./scm-reconciliation.js";
+
 const EXACT_BILLED_STATUS_CODE = "G";
 const INVENTORY_ITEM_TYPES = new Set([
   "assembly",
@@ -72,6 +74,22 @@ export function isNetSuiteSalesOrderBilled(order = {}) {
   return label === "billed" || label === "sales order:billed";
 }
 
+export function isNetSuiteSalesOrderFulfilled(order = {}) {
+  if (isNetSuiteSalesOrderBilled(order)) return true;
+  if (text(order.status ?? order.statusCode).toUpperCase() === "F") return true;
+  const label = normalizedStatusLabel(
+    order.statusText
+      ?? order.status_text
+      ?? order.netsuiteStatusText
+  );
+  return [
+    "fulfilled",
+    "sales order:fulfilled",
+    "pending billing",
+    "sales order:pending billing"
+  ].includes(label);
+}
+
 export function isSalesOrderInventoryLine(line = {}) {
   const itemType = text(line.itemType ?? line.item_type).toLowerCase().replaceAll(" ", "");
   const itemTypeText = text(line.itemTypeText ?? line.item_type_text).toLowerCase();
@@ -142,7 +160,7 @@ function normalizedRef(value) {
   return text(value).toUpperCase();
 }
 
-function valueRefs(value = {}) {
+function directValueRefs(value = {}) {
   if (typeof value === "string" || typeof value === "number") {
     return [normalizedRef(value)].filter(Boolean);
   }
@@ -158,7 +176,17 @@ function valueRefs(value = {}) {
     value.sourceOrderId,
     value.source_order_id,
     ...(Array.isArray(value.orderRefs) ? value.orderRefs : []),
-    ...(Array.isArray(value.order_refs) ? value.order_refs : []),
+    ...(Array.isArray(value.order_refs) ? value.order_refs : [])
+  ].map(normalizedRef).filter(Boolean);
+}
+
+function valueRefs(value = {}) {
+  if (typeof value === "string" || typeof value === "number") {
+    return directValueRefs(value);
+  }
+  return [
+    ...directValueRefs(value),
+    ...(Array.isArray(value.groupedOrderRefs) ? value.groupedOrderRefs : []),
     ...(Array.isArray(value.childOrders) ? value.childOrders : [])
   ].map(normalizedRef).filter(Boolean);
 }
@@ -167,28 +195,283 @@ function referencesFamily(value, family) {
   return valueRefs(value).some((ref) => family.has(ref));
 }
 
-function stripFamilyFromLoadOrder(value, family) {
-  if (typeof value === "string" || typeof value === "number") {
-    return family.has(normalizedRef(value)) ? null : value;
-  }
-  if (!value || typeof value !== "object") return value;
-  if (referencesFamily(value, family)) return null;
-  return value;
+function directlyReferencesFamily(value, family) {
+  return directValueRefs(value).some((ref) => family.has(ref));
 }
 
-function scrubLoad(load = {}, family) {
+function uniqueValues(values = []) {
+  return [...new Set(values.map((value) => text(value)).filter(Boolean))];
+}
+
+function salesOrderMemberReconciliationState(order = {}) {
+  const reconciliationStatus = text(order.reconciliationStatus).toLowerCase();
+  const explicitStatus = text(
+    order.reconciliationApplicationStatus
+      || order.applicationStatus
+      || order.scm?.reconciliationApplicationStatus
+  );
+  if (
+    order.reconciliationBlocked === true
+    || ["review", "missing", "error"].includes(reconciliationStatus)
+    || explicitStatus === "Reconcile Review"
+  ) {
+    return { status: "Reconcile Review", reconciliationStatus: "review" };
+  }
+  if (explicitStatus === "Cancelled") {
+    return { status: "Cancelled", reconciliationStatus: "ok" };
+  }
+  const fulfillmentStatus = text(
+    order.fulfillmentStatus
+      || order.fulfillment_status
+      || order.raw?.fulfillment_status
+  ).toLowerCase();
+  const statusLabel = normalizedStatusLabel(
+    order.netsuiteStatusText
+      || order.statusText
+      || order.status_text
+      || order.raw?.status_text
+  );
+  if (
+    ["partial_fulfilled", "partially_fulfilled", "partial", "partially fulfilled"].includes(fulfillmentStatus)
+    || statusLabel.includes("partially fulfilled")
+  ) {
+    return { status: "Partially Done", reconciliationStatus: "ok" };
+  }
+  if (
+    isNetSuiteSalesOrderBilled(order)
+    || explicitStatus === "Billed"
+    || ["fulfilled", "shipped", "billed"].includes(fulfillmentStatus)
+    || statusLabel === "fulfilled"
+    || statusLabel === "sales order:fulfilled"
+    || statusLabel.includes("pending billing")
+  ) {
+    return { status: "Completed", reconciliationStatus: "ok" };
+  }
+  if (/\b(cancelled|canceled|voided|void)\b/.test(statusLabel)) {
+    return { status: "Cancelled", reconciliationStatus: "ok" };
+  }
+  return { status: explicitStatus || "Queued", reconciliationStatus: "ok" };
+}
+
+function groupedSalesOrderTotals(children = [], field) {
+  return children.reduce((sum, child) => {
+    const value = Number(child?.[field] || 0);
+    return sum + (Number.isFinite(value) ? value : 0);
+  }, 0);
+}
+
+export function rollupGroupedSalesOrderReconciliation(order = {}, childOrderDetails = []) {
+  const children = Array.isArray(childOrderDetails) ? childOrderDetails : [];
+  const rollup = rollupReconciliationGroup(children.map(salesOrderMemberReconciliationState));
+  const fulfillmentStatus = rollup.applicationStatus === "Completed"
+    ? "fulfilled"
+    : rollup.applicationStatus === "Partially Done"
+      ? "partial_fulfilled"
+      : "not_fulfilled";
+  const reviewReasons = uniqueValues(children
+    .filter((child) => salesOrderMemberReconciliationState(child).reconciliationStatus === "review")
+    .map((child) => child.reconciliationReason || child.scm?.reconciliationReason));
+  return {
+    ...order,
+    customer: `${children.length} orders grouped`,
+    childOrders: children.map((child) => text(child?.id)).filter(Boolean),
+    childOrderDetails: children,
+    pallets: groupedSalesOrderTotals(children, "pallets"),
+    layers: groupedSalesOrderTotals(children, "layers"),
+    sections: groupedSalesOrderTotals(children, "sections"),
+    pieces: groupedSalesOrderTotals(children, "pieces"),
+    salesQty: groupedSalesOrderTotals(children, "salesQty"),
+    weight: groupedSalesOrderTotals(children, "weight"),
+    unloadMinutes: groupedSalesOrderTotals(children, "unloadMinutes"),
+    travelMinutes: children.reduce((max, child) => Math.max(max, Number(child?.travelMinutes || 0)), 0),
+    pickupLocations: uniqueValues(children.flatMap((child) => child?.pickupLocations || [])),
+    items: children.flatMap((child) => Array.isArray(child?.items) ? child.items : []),
+    fulfillmentStatus,
+    reconciliationApplicationStatus: rollup.applicationStatus,
+    reconciliationStatus: rollup.reconciliationStatus,
+    reconciliationBlocked: rollup.reconciliationStatus === "review",
+    reconciliationReason: reviewReasons.join(" "),
+    netsuiteActive: children.some((child) => child?.netsuiteActive !== false),
+    raw: {
+      ...(order.raw && typeof order.raw === "object" ? order.raw : {}),
+      fulfillment_status: fulfillmentStatus,
+      grouped_sales_order: true
+    }
+  };
+}
+
+function snapshotMapValue(snapshots, ref) {
+  const key = normalizedRef(ref);
+  if (!key) return null;
+  if (snapshots instanceof Map) return snapshots.get(key) || snapshots.get(ref) || null;
+  return snapshots?.[key] || snapshots?.[ref] || null;
+}
+
+function mergeSalesOrderReconciliationSnapshot(order = {}, snapshot = null) {
+  if (!snapshot) return order;
+  return {
+    ...order,
+    ...snapshot,
+    id: text(order.id || snapshot.id),
+    raw: {
+      ...(order.raw && typeof order.raw === "object" ? order.raw : {}),
+      ...(snapshot.raw && typeof snapshot.raw === "object" ? snapshot.raw : {})
+    }
+  };
+}
+
+function groupedSalesOrderLeafRefs(order = {}) {
+  const refs = [];
+  const detailById = new Map((order.childOrderDetails || [])
+    .map((child) => [text(child?.id), child])
+    .filter(([id]) => id));
+  for (const childRef of order.childOrders || []) {
+    const ref = text(childRef);
+    const detail = detailById.get(ref);
+    if (detail?.childOrders?.length) refs.push(...groupedSalesOrderLeafRefs(detail));
+    else if (ref) refs.push(ref);
+  }
+  return uniqueValues(refs);
+}
+
+function refreshGroupedSalesOrder(order = {}, snapshots) {
+  const detailById = new Map((order.childOrderDetails || [])
+    .map((child) => [text(child?.id), child])
+    .filter(([id]) => id));
+  const children = (order.childOrders || []).map((childRef) => {
+    const ref = text(childRef);
+    const detail = detailById.get(ref) || { id: ref, type: "SO" };
+    if (detail.childOrders?.length) return refreshGroupedSalesOrder(detail, snapshots);
+    return mergeSalesOrderReconciliationSnapshot(detail, snapshotMapValue(snapshots, ref));
+  }).filter((child) => child?.id);
+  return rollupGroupedSalesOrderReconciliation(order, children);
+}
+
+export function refreshGroupedSalesOrderReconciliationInPlan(plan = {}, {
+  childSnapshots = new Map(),
+  targetRefs = []
+} = {}) {
+  const targets = new Set(targetRefs.map(normalizedRef).filter(Boolean));
+  const updatedGroupRefs = [];
+  const orders = (Array.isArray(plan.orders) ? plan.orders : []).map((order) => {
+    if (text(order?.type).toUpperCase() !== "SO" || !order?.childOrders?.length) return order;
+    const leafRefs = groupedSalesOrderLeafRefs(order).map(normalizedRef);
+    if (targets.size && !leafRefs.some((ref) => targets.has(ref))) return order;
+    const refreshed = refreshGroupedSalesOrder(order, childSnapshots);
+    if (JSON.stringify(refreshed) !== JSON.stringify(order)) updatedGroupRefs.push(text(order.id));
+    return refreshed;
+  });
+  const changed = updatedGroupRefs.length > 0;
+  return {
+    plan: changed ? { ...plan, orders } : plan,
+    changed,
+    updatedGroupRefs
+  };
+}
+
+function dissolvedGroupedSalesOrder(order, child) {
+  return {
+    ...child,
+    id: text(child.id),
+    type: text(child.type || order.type || "SO").toUpperCase(),
+    childOrders: Array.isArray(child.childOrders) ? child.childOrders : [],
+    childOrderDetails: Array.isArray(child.childOrderDetails) ? child.childOrderDetails : [],
+    groupAliases: uniqueValues([
+      ...(child.groupAliases || []),
+      order.id,
+      ...(order.groupAliases || [])
+    ]),
+    localDispatchStatus: "planned",
+    assigned: order.assigned ?? child.assigned,
+    dispatchPlanned: order.dispatchPlanned ?? child.dispatchPlanned ?? true,
+    groupPlanId: order.groupPlanId || child.groupPlanId,
+    groupPlanDate: order.groupPlanDate || child.groupPlanDate,
+    transitCo: child.transitCo || order.transitCo
+  };
+}
+
+function pruneFamilyFromOrder(order, family) {
+  if (typeof order === "string" || typeof order === "number") {
+    return family.has(normalizedRef(order)) ? null : order;
+  }
+  if (!order || typeof order !== "object") return order;
+  if (!Array.isArray(order.childOrders) || !order.childOrders.length) {
+    return directlyReferencesFamily(order, family) ? null : order;
+  }
+  if (directlyReferencesFamily(order, family)) return null;
+  const detailById = new Map((order.childOrderDetails || [])
+    .map((child) => [text(child?.id), child])
+    .filter(([id]) => id));
+  const containsFamily = order.childOrders.some((childRef) => {
+    const ref = text(childRef);
+    const detail = detailById.get(ref);
+    return family.has(normalizedRef(ref))
+      || directlyReferencesFamily(detail || {}, family)
+      || (detail?.childOrders?.length && referencesFamily(detail, family));
+  });
+  if (!containsFamily) return order;
+  const children = [];
+  for (const childRef of order.childOrders) {
+    const ref = text(childRef);
+    const detail = detailById.get(ref) || { id: ref, type: order.type || "SO" };
+    if (family.has(normalizedRef(ref)) || directlyReferencesFamily(detail, family)) continue;
+    const pruned = pruneFamilyFromOrder(detail, family);
+    if (pruned && typeof pruned === "object" && pruned.id) children.push(pruned);
+  }
+  if (!children.length) return null;
+  if (children.length === 1) return dissolvedGroupedSalesOrder(order, children[0]);
+  return rollupGroupedSalesOrderReconciliation(order, children);
+}
+
+function stripFamilyFromLoadOrder(value, family, orderReplacements) {
+  if (typeof value === "string" || typeof value === "number") {
+    const ref = normalizedRef(value);
+    if (family.has(ref)) return null;
+    if (orderReplacements.has(ref)) return orderReplacements.get(ref)?.id || null;
+    return value;
+  }
+  if (!value || typeof value !== "object") return value;
+  const id = normalizedRef(value.id || value.orderId || value.order_id);
+  if (id && orderReplacements.has(id)) return orderReplacements.get(id);
+  return pruneFamilyFromOrder(value, family);
+}
+
+function rewrittenStop(stop, family, orderReplacements) {
+  const rewriteRef = (value) => {
+    const ref = normalizedRef(value);
+    if (!ref || family.has(ref)) return "";
+    if (orderReplacements.has(ref)) return text(orderReplacements.get(ref)?.id);
+    return text(value);
+  };
+  const hadRefs = Array.isArray(stop.orderRefs) || Array.isArray(stop.order_refs);
+  const originalRefs = Array.isArray(stop.orderRefs)
+    ? stop.orderRefs
+    : Array.isArray(stop.order_refs)
+      ? stop.order_refs
+      : [];
+  const refs = uniqueValues(originalRefs.map(rewriteRef));
+  const originalOrderId = stop.orderId ?? stop.order_id;
+  let orderId = rewriteRef(originalOrderId);
+  if (!orderId && refs.length) orderId = refs[0];
+  if (!orderId && !refs.length && (originalOrderId || referencesFamily(stop, family))) return null;
+  const groupedOrderRefs = Array.isArray(stop.groupedOrderRefs)
+    ? uniqueValues(stop.groupedOrderRefs.map(rewriteRef))
+    : stop.groupedOrderRefs;
+  return {
+    ...stop,
+    ...(originalOrderId !== undefined ? { orderId } : {}),
+    ...(hadRefs ? { orderRefs: refs } : {}),
+    ...(Array.isArray(groupedOrderRefs) ? { groupedOrderRefs } : {})
+  };
+}
+
+function scrubLoad(load = {}, family, orderReplacements) {
   const nextOrders = Array.isArray(load.orders)
-    ? load.orders.map((order) => stripFamilyFromLoadOrder(order, family)).filter(Boolean)
+    ? load.orders.map((order) => stripFamilyFromLoadOrder(order, family, orderReplacements)).filter(Boolean)
     : load.orders;
   const nextStops = Array.isArray(load.stops)
     ? load.stops
-      .map((stop) => {
-        if (!referencesFamily(stop, family)) return stop;
-        const refs = (Array.isArray(stop.orderRefs) ? stop.orderRefs : [])
-          .filter((ref) => !family.has(normalizedRef(ref)));
-        if (refs.length) return { ...stop, orderRefs: refs, orderId: refs[0] };
-        return null;
-      })
+      .map((stop) => rewrittenStop(stop, family, orderReplacements))
       .filter(Boolean)
     : load.stops;
   return {
@@ -210,11 +493,19 @@ export function scrubBilledSalesOrderFamilyFromPlan(plan = {}, {
   }
   if (!family.size) return { plan, changed: false, deferred: false, removedOrderRefs: [] };
 
-  const orders = (Array.isArray(plan.orders) ? plan.orders : [])
-    .filter((order) => !referencesFamily(order, family));
+  const orderReplacements = new Map();
+  const orders = [];
+  for (const order of Array.isArray(plan.orders) ? plan.orders : []) {
+    const pruned = pruneFamilyFromOrder(order, family);
+    const originalId = normalizedRef(order?.id || order?.orderId || order?.order_id);
+    if (originalId && order?.childOrders?.length && pruned !== order) {
+      orderReplacements.set(originalId, pruned && typeof pruned === "object" ? pruned : null);
+    }
+    if (pruned) orders.push(pruned);
+  }
   const trucks = (Array.isArray(plan.trucks) ? plan.trucks : []).map((truck) => ({
     ...truck,
-    loads: (Array.isArray(truck.loads) ? truck.loads : []).map((load) => scrubLoad(load, family))
+    loads: (Array.isArray(truck.loads) ? truck.loads : []).map((load) => scrubLoad(load, family, orderReplacements))
   }));
   const changed = JSON.stringify(orders) !== JSON.stringify(plan.orders || [])
     || JSON.stringify(trucks) !== JSON.stringify(plan.trucks || []);

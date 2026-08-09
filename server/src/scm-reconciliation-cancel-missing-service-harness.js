@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
 import {
+  verifyMissingScmOrderInNetSuite,
   verifyMissingScmPurchaseOrderInNetSuite
 } from "./scm-reconciliation-service.js";
+
+const serviceSource = await fs.readFile(new URL("./scm-reconciliation-service.js", import.meta.url), "utf8");
+assert.match(serviceSource, /verification = await verifyMissingScmOrderInNetSuite\(source\)/,
+  "Confirmed missing run targets must perform a fresh authoritative verification.");
+assert.match(serviceSource, /autoCancelConfirmedMissingScmOrder\(\{[\s\S]*?verification[\s\S]*?\}\)/,
+  "Automatic local cancellation must receive the fresh NetSuite verification result.");
 
 const source = {
   id: 987654,
@@ -35,6 +43,26 @@ assert.deepEqual(calls[0].options.orderIds, [source.id]);
 assert.equal(calls[0].options.targetOnly, true);
 assert.equal(calls[1].recordType, "PurchOrd");
 assert.equal(calls[2].orderRef, source.tranid);
+
+for (const [kind, recordType] of [["SO", "SalesOrd"], ["TO", "TrnfrOrd"]]) {
+  const verification = await verifyMissingScmOrderInNetSuite({
+    id: source.id,
+    kind,
+    tranid: `${kind}-${source.id}`
+  }, {
+    async fetchOrders() { return []; },
+    async fetchHeader(_orderId, actualRecordType) {
+      assert.equal(actualRecordType, recordType);
+      return null;
+    },
+    async fetchReference(_orderRef, actualRecordType) {
+      assert.equal(actualRecordType, recordType);
+      return null;
+    }
+  });
+  assert.equal(verification.orderKind, kind);
+  assert.equal(verification.referenceQueryFound, false);
+}
 
 await assert.rejects(
   verifyMissingScmPurchaseOrderInNetSuite(source, {

@@ -4,7 +4,7 @@ const poState = {
   operator: null,
   records: [],
   options: { vendors: [], vendorYards: [], destinations: [] },
-  filters: { search: "", createdFrom: "", createdTo: "", vendorId: "", vendorYard: "", destinationLocationId: "" },
+  filters: { search: "", createdFrom: "", createdTo: "", vendorId: "", vendorYard: "", destinationLocationId: "", lifecycle: "pending_receive" },
   page: 1,
   pageSize: 25,
   total: 0,
@@ -54,6 +54,11 @@ function sameNumber(left, right) {
   return Number.isFinite(a) && Number.isFinite(b) && Math.abs(a - b) < 0.000001;
 }
 
+function inputNumber(value, places = 6) {
+  const number = Number(value);
+  return Number.isFinite(number) ? String(Number(number.toFixed(places))) : "";
+}
+
 function activeEditor() {
   const active = document.activeElement;
   return Boolean(active && poApp.contains(active) && /^(INPUT|TEXTAREA|SELECT)$/.test(active.tagName));
@@ -73,8 +78,9 @@ function canWrite() {
 
 function recordCanWrite(record) {
   const status = `${record.current.status || ""} ${record.current.statusText || ""}`;
-  return canWrite() && record.current.active !== false
-    && !/closed|cancelled|canceled|fully received/i.test(status)
+  return canWrite() && record.lifecycle !== "missing" && record.lifecycle !== "completed"
+    && record.current.active !== false
+    && !/closed|cancelled|canceled|fully received|fully billed/i.test(status)
     && !(record.current.lines || []).some((line) => line.closed || Number(line.receivedQuantity || 0) > 0);
 }
 
@@ -103,23 +109,38 @@ function optionList(rows, selected, emptyLabel) {
 }
 
 function statusPill(record) {
-  const label = record.current.statusText || record.current.status || "Unknown";
-  const css = /closed|cancel/i.test(label) ? "cancelled" : /pending|open|receive/i.test(label) ? "confirmed" : "reviewed";
+  const netSuiteLabel = record.current.statusText || record.current.status || "Unknown";
+  const label = record.lifecycle === "missing"
+    ? "No longer exists in NetSuite"
+    : record.lifecycle === "completed"
+      ? `Completed · ${netSuiteLabel}`
+      : netSuiteLabel;
+  const css = record.lifecycle === "missing" || /closed|cancel/i.test(label)
+    ? "cancelled"
+    : /pending|open|receive/i.test(label) ? "confirmed" : "reviewed";
   return `<span class="smart-pill ${css}">${esc(label)}</span>`;
 }
 
 function lineRow(record, line) {
   const editable = recordCanWrite(record) && line.editable;
+  const palletEditable = editable && line.palletEditable;
   const draft = (poState.drafts.get(record.id)?.lines || []).find((row) => Number(row.lineId) === Number(line.lineId)) || {};
-  const quantity = Object.prototype.hasOwnProperty.call(draft, "quantity") ? draft.quantity : line.quantity;
+  const palletQuantity = Object.prototype.hasOwnProperty.call(draft, "palletQuantity") ? draft.palletQuantity : line.palletQuantity;
+  const nativeQuantity = Object.prototype.hasOwnProperty.call(draft, "palletQuantity") && Number(line.unitsPerPallet) > 0
+    ? Number(draft.palletQuantity) * Number(line.unitsPerPallet)
+    : line.nativeQuantity ?? line.quantity;
   const rate = Object.prototype.hasOwnProperty.call(draft, "rate") ? draft.rate : line.rate ?? 0;
   const destinationLocationId = Object.prototype.hasOwnProperty.call(draft, "destinationLocationId") ? draft.destinationLocationId : line.destinationLocationId;
   const destinations = poState.options.destinations.some((row) => Number(row.id) === Number(line.destinationLocationId))
     ? poState.options.destinations
     : [{ id: line.destinationLocationId, name: line.destination || `Location ${line.destinationLocationId}` }, ...poState.options.destinations];
-  return `<tr data-po-line="${line.lineId}">
+  const conversionHelp = line.palletEditable
+    ? `${inputNumber(line.unitsPerPallet)} ${line.nativeUnit || line.unit || "unit"} / PLT${line.conversionSource === "line_ratio" ? " · derived from current PO" : ""}`
+    : `No reliable PLT conversion; ${line.nativeUnit || line.unit || "native quantity"} is read-only`;
+  return `<tr data-po-line="${line.lineId}" data-units-per-pallet="${esc(line.unitsPerPallet || "")}">
     <td><strong>${esc(line.itemName || line.itemId)}</strong><small>ID ${esc(line.itemId)} · ${esc(line.description || "No description")}</small></td>
-    <td><input data-line-field="quantity" type="number" min="0.000001" step="0.0001" value="${esc(quantity)}" ${editable ? "" : "disabled"}><small>${esc(line.unit || "unit")}</small></td>
+    <td><input data-line-field="palletQuantity" type="number" min="0.000001" step="0.01" value="${esc(palletQuantity ?? "")}" ${palletEditable ? "" : "disabled"}><small>PLT · ${esc(conversionHelp)}</small></td>
+    <td><input data-line-native-quantity type="number" value="${esc(inputNumber(nativeQuantity))}" readonly tabindex="-1"><small>${esc(line.nativeUnit || line.unit || "unit")} · calculated, read only</small></td>
     <td><input data-line-field="rate" type="number" min="0" step="0.0001" value="${esc(rate)}" ${editable ? "" : "disabled"}></td>
     <td>${money(line.amount)}</td>
     <td><select data-line-field="destinationLocationId" ${editable ? "" : "disabled"}>${optionList(destinations, destinationLocationId, line.destination || "Destination")}</select><small>${esc(line.destination || "—")}</small></td>
@@ -135,6 +156,7 @@ function snapshotSummary(record) {
 
 function card(record) {
   const writable = recordCanWrite(record);
+  const netSuiteExists = record.lifecycle !== "missing";
   const current = record.current;
   const headerDraft = poState.drafts.get(record.id)?.header || {};
   const headValue = (field, original) => Object.prototype.hasOwnProperty.call(headerDraft, field) ? headerDraft[field] : original;
@@ -144,7 +166,7 @@ function card(record) {
       <div class="po-history-route"><strong>${esc(current.vendor || record.creationSnapshot?.vendor || "Unknown vendor")}</strong><span>${esc(current.vendorYard || "Vendor yard not set")} → ${esc([...new Set((current.lines || []).map((line) => line.destination).filter(Boolean))].join(", ") || "Destination not set")}</span></div>
       <div><strong>${money(current.total)}</strong><span>Current total</span></div>
       <div>${statusPill(record)}<span>NetSuite status</span></div>
-      <div class="po-card-actions"><button class="smart-button" data-action="pdf">Preview PDF</button><button class="smart-button" data-action="refresh">Sync now</button>${writable ? `<button class="smart-button primary" data-action="save">Save to NetSuite</button>` : ""}${canWrite() ? `<button class="smart-button danger" data-action="unarchive">Return to Vendor Replies</button>` : ""}</div>
+      <div class="po-card-actions">${netSuiteExists ? `<button class="smart-button" data-action="pdf">Preview PDF</button><button class="smart-button" data-action="refresh">Sync now</button>${writable ? `<button class="smart-button primary" data-action="save">Save to NetSuite</button>` : ""}` : `<span class="smart-help po-missing-actions">NetSuite actions unavailable</span>`}${canWrite() ? `<button class="smart-button danger" data-action="unarchive">Return to Vendor Replies</button>` : ""}</div>
     </header>
     ${record.lastSyncError ? `<div class="smart-notice error">${esc(record.lastSyncError)}</div>` : ""}
     <div class="po-meta-grid">
@@ -153,7 +175,7 @@ function card(record) {
       <label>Vendor reference<input data-head-field="vendorReference" value="${esc(headValue("vendorReference", current.vendorReference || ""))}" maxlength="300" ${writable ? "" : "disabled"}></label>
       <label class="po-memo">Memo<textarea data-head-field="memo" maxlength="4000" ${writable ? "" : "disabled"}>${esc(headValue("memo", current.memo || ""))}</textarea></label>
     </div>
-    <div class="smart-table-wrap"><table class="smart-table po-lines"><thead><tr><th>Item</th><th>Quantity</th><th>Rate</th><th>Amount</th><th>Destination</th><th>Received</th></tr></thead><tbody>${(current.lines || []).map((line) => lineRow(record, line)).join("") || `<tr><td colspan="6">No current NetSuite lines were mirrored.</td></tr>`}</tbody></table></div>
+    <div class="smart-table-wrap"><table class="smart-table po-lines"><thead><tr><th>Item</th><th>PLT (editable)</th><th>Native quantity (read only)</th><th>Rate</th><th>Amount</th><th>Destination</th><th>Received</th></tr></thead><tbody>${(current.lines || []).map((line) => lineRow(record, line)).join("") || `<tr><td colspan="7">No current NetSuite lines were mirrored.</td></tr>`}</tbody></table></div>
     <footer><span>Created ${date(record.appCreatedAt, true)} · Archived ${date(record.archivedAt, true)}</span><span>NetSuite synced ${date(record.lastSyncedAt, true)} · Version ${date(record.remoteLastModifiedAt, true)}</span></footer>
     ${snapshotSummary(record)}
   </article>`;
@@ -171,6 +193,7 @@ function render() {
         <select id="poVendor">${optionList(poState.options.vendors, poState.filters.vendorId, "All vendors")}</select>
         <select id="poVendorYard">${optionList(poState.options.vendorYards, poState.filters.vendorYard, "All vendor yards")}</select>
         <select id="poDestination">${optionList(poState.options.destinations, poState.filters.destinationLocationId, "All destination yards")}</select>
+        <select id="poLifecycle" aria-label="PO lifecycle"><option value="" ${poState.filters.lifecycle ? "" : "selected"}>All PO lifecycle</option><option value="pending_receive" ${poState.filters.lifecycle === "pending_receive" ? "selected" : ""}>Pending Receive</option><option value="completed" ${poState.filters.lifecycle === "completed" ? "selected" : ""}>Completed</option><option value="missing" ${poState.filters.lifecycle === "missing" ? "selected" : ""}>No longer exists in NetSuite</option></select>
         <button class="smart-button primary" data-action="filter">Apply</button><button class="smart-button" data-action="clear">Clear</button>
       </div>
       <div class="po-history-list">${poState.records.map(card).join("") || `<div class="smart-empty">No archived application-created PO matches these filters.</div>`}</div>
@@ -186,7 +209,8 @@ function readFilters() {
     createdTo: document.getElementById("poCreatedTo")?.value || "",
     vendorId: document.getElementById("poVendor")?.value || "",
     vendorYard: document.getElementById("poVendorYard")?.value || "",
-    destinationLocationId: document.getElementById("poDestination")?.value || ""
+    destinationLocationId: document.getElementById("poDestination")?.value || "",
+    lifecycle: document.getElementById("poLifecycle")?.value || ""
   };
   poState.filtersDirty = false;
 }
@@ -244,10 +268,12 @@ function changesForCard(cardElement, record) {
     const original = currentByLine.get(Number(row.dataset.poLine));
     if (!original) continue;
     const requested = { lineId: Number(row.dataset.poLine), itemId: original.itemId };
-    const quantity = row.querySelector('[data-line-field="quantity"]');
+    const palletQuantity = row.querySelector('[data-line-field="palletQuantity"]');
     const rate = row.querySelector('[data-line-field="rate"]');
     const destination = row.querySelector('[data-line-field="destinationLocationId"]');
-    if (quantity && !sameNumber(quantity.value, original.quantity)) requested.quantity = Number(quantity.value);
+    if (palletQuantity && !palletQuantity.disabled && !sameNumber(palletQuantity.value, original.palletQuantity)) {
+      requested.palletQuantity = Number(palletQuantity.value);
+    }
     if (rate && !sameNumber(rate.value, original.rate ?? 0)) requested.rate = Number(rate.value);
     if (destination && String(destination.value) !== String(original.destinationLocationId ?? "")) {
       requested.destinationLocationId = Number(destination.value);
@@ -255,6 +281,18 @@ function changesForCard(cardElement, record) {
     if (Object.keys(requested).length > 2) lines.push(requested);
   }
   return { header, lines };
+}
+
+function syncNativeQuantityPreview(input) {
+  if (!input?.matches('[data-line-field="palletQuantity"]')) return;
+  const row = input.closest("[data-po-line]");
+  const native = row?.querySelector("[data-line-native-quantity]");
+  const unitsPerPallet = Number(row?.dataset.unitsPerPallet);
+  const pallets = Number(input.value);
+  if (!native) return;
+  native.value = Number.isFinite(pallets) && pallets > 0 && Number.isFinite(unitsPerPallet) && unitsPerPallet > 0
+    ? inputNumber(pallets * unitsPerPallet)
+    : "";
 }
 
 async function reconcileFromNetSuite() {
@@ -282,7 +320,7 @@ async function act(button) {
   if (["filter", "clear", "previous", "next"].includes(action) && poState.dirtyIds.size && !confirm("Discard unsaved PO edits and continue?")) return;
   if (["filter", "clear", "previous", "next"].includes(action)) { poState.dirtyIds.clear(); poState.drafts.clear(); }
   if (action === "filter") { readFilters(); poState.page = 1; await load(); return; }
-  if (action === "clear") { poState.filters = { search: "", createdFrom: "", createdTo: "", vendorId: "", vendorYard: "", destinationLocationId: "" }; poState.filtersDirty = false; poState.page = 1; await load(); return; }
+  if (action === "clear") { poState.filters = { search: "", createdFrom: "", createdTo: "", vendorId: "", vendorYard: "", destinationLocationId: "", lifecycle: "pending_receive" }; poState.filtersDirty = false; poState.page = 1; await load(); return; }
   if (action === "previous" || action === "next") { poState.page += action === "next" ? 1 : -1; await load(); return; }
   const cardElement = button.closest("[data-history-id]");
   if (!cardElement) return;
@@ -346,6 +384,7 @@ poApp.addEventListener("keydown", (event) => {
 });
 
 poApp.addEventListener("input", (event) => {
+  syncNativeQuantityPreview(event.target);
   if (event.target.closest(".po-filters")) poState.filtersDirty = true;
   const cardElement = event.target.closest("[data-history-id]");
   if (cardElement && (event.target.matches("[data-head-field]") || event.target.matches("[data-line-field]"))) {

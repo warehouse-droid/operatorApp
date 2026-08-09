@@ -77,7 +77,7 @@ function smartBlanketProposalLine(proposal = {}, line = {}, sourceRemaining = un
     <td><strong>${smartEscape(line.itemName || line.itemId)}</strong><span class="smart-sr-only">${smartEscape(urgencyLabel)} urgency.</span></td>
     <td>${editable ? `<select class="smart-line-destination-select" data-smart-blanket-destination data-smart-focus-key="blanket-proposal:${smartEscape(proposal.id)}:line:${smartEscape(line.id)}:destination" aria-label="Blanket line destination yard">${smartBlanketYardOptions(line.destinationLocationId || proposal.destinationLocationId)}</select>` : `<strong>${smartEscape(line.destinationName || proposal.destinationName || "—")}</strong>`}</td>
     <td class="numeric">${smartBlanketNumber(line.requiredPallets)} PLT</td>
-    <td>${editable ? `<div class="smart-line-quantity smart-blanket-line-quantity"><input data-smart-blanket-pallets data-smart-focus-key="blanket-proposal:${smartEscape(proposal.id)}:line:${smartEscape(line.id)}:pallets" type="number" min="1" step="1" value="${smartEscape(Math.max(1, Math.round(Number(line.proposedPallets) || 1)))}" /><span>PLT</span><button class="smart-button" data-smart-action="save-blanket-proposal-line" data-proposal-id="${smartEscape(proposal.id)}" data-line-id="${smartEscape(line.id)}" type="button">Save</button></div>` : `<strong>${smartBlanketNumber(line.proposedPallets, 0)} PLT</strong>`}</td>
+    <td>${editable ? `<div class="smart-line-quantity smart-blanket-line-quantity"><input data-smart-blanket-pallets data-smart-focus-key="blanket-proposal:${smartEscape(proposal.id)}:line:${smartEscape(line.id)}:pallets" type="number" min="1" step="1" value="${smartEscape(Math.max(1, Math.round(Number(line.proposedPallets) || 1)))}" /><span>PLT</span><button class="smart-button" data-smart-action="save-blanket-proposal-line" data-proposal-id="${smartEscape(proposal.id)}" data-line-id="${smartEscape(line.id)}" type="button">Save</button><button class="smart-button" data-smart-action="split-blanket-proposal-line" data-proposal-id="${smartEscape(proposal.id)}" data-line-id="${smartEscape(line.id)}" data-current-pallets="${smartEscape(line.proposedPallets)}" type="button">Split to load</button><button class="smart-button danger" data-smart-action="remove-blanket-proposal-line" data-proposal-id="${smartEscape(proposal.id)}" data-line-id="${smartEscape(line.id)}" type="button">Remove</button></div>` : `<strong>${smartBlanketNumber(line.proposedPallets, 0)} PLT</strong>`}</td>
     <td class="numeric">${smartBlanketNumber(line.salesQuantity, 3)} ${smartEscape(line.unit || "")}</td>
     <td class="numeric">${smartBlanketNumber(line.lineWeightLbs, 0)} lb</td>
     <td><div class="smart-availability-summary smart-availability-inline smart-blanket-availability">
@@ -85,6 +85,22 @@ function smartBlanketProposalLine(proposal = {}, line = {}, sourceRemaining = un
       <span><small>${smartEscape(line.destinationName || proposal.destinationName || "Destination")} available</small><strong>${destinationAvailable === null || destinationAvailable === undefined ? "—" : `${smartBlanketNumber(destinationAvailable)} PLT`}</strong></span>
       <span><small>Expected</small><strong>${destinationExpected === null || destinationExpected === undefined ? "—" : `${smartBlanketNumber(destinationExpected)} PLT`}</strong></span>
     </div></td>
+  </tr>`;
+}
+
+function smartBlanketPhysicalPalletLine(proposal = {}, line = {}, editable = false) {
+  const quantity = Number(line.quantity ?? line.salesQuantity ?? 0);
+  const automaticQuantity = Number(line.automaticQuantity ?? quantity);
+  const unit = line.unit || "EACH";
+  const itemWeight = Number(line.itemWeightLbs || 0);
+  return `<tr class="smart-physical-pallet-line" data-smart-physical-pallet-line="${smartEscape(line.id)}">
+    <td><strong>${smartEscape(line.itemName || "PALLET")}</strong><div class="smart-help">Official ancillary PALLET item</div></td>
+    <td><strong>${smartEscape(line.destinationName || "—")}</strong></td>
+    <td class="numeric">${smartBlanketNumber(automaticQuantity, 2)} ${smartEscape(unit)}<div class="smart-help">Automatic from material PLT</div></td>
+    <td>${editable ? `<div class="smart-line-quantity smart-blanket-line-quantity"><input data-smart-pallet-quantity data-smart-focus-key="blanket-proposal:${smartEscape(proposal.id)}:pallet-destination:${smartEscape(line.destinationLocationId)}:quantity" type="number" min="0" step="0.01" value="${smartEscape(quantity)}" aria-label="Official PALLET quantity for ${smartEscape(line.destinationName || "destination")}" /><span>${smartEscape(unit)}</span><button class="smart-button" data-smart-action="save-blanket-pallet-line" data-proposal-id="${smartEscape(proposal.id)}" data-destination-location-id="${smartEscape(line.destinationLocationId)}" type="button">Save</button>${line.overridden ? `<button class="smart-button" data-smart-action="reset-blanket-pallet-line" data-proposal-id="${smartEscape(proposal.id)}" data-destination-location-id="${smartEscape(line.destinationLocationId)}" type="button">Reset auto</button>` : ""}</div>` : `<strong>${smartBlanketNumber(quantity, 2)} ${smartEscape(unit)}</strong><div class="smart-help">${line.overridden ? "Manual override" : "Automatic"}</div>`}</td>
+    <td class="numeric">${smartBlanketNumber(quantity, 2)} ${smartEscape(unit)}</td>
+    <td class="numeric">${itemWeight > 0 ? `${smartBlanketNumber(line.lineWeightLbs, 0)} lb` : "—"}</td>
+    <td><span class="smart-help">Packaging weight included in this load; it does not add material PLT.</span></td>
   </tr>`;
 }
 
@@ -114,7 +130,7 @@ function smartBlanketProposalCard(proposal = {}, sourceOrdersByRef = new Map(), 
       <div class="smart-proposal-metric"><strong>${smartEscape(sourceRef)}</strong><span>Source PO</span></div>
       <div class="smart-actions">${reservable ? `<button class="smart-button primary" data-smart-action="confirm-blanket-proposal" data-proposal-id="${smartEscape(proposal.id)}" type="button">Confirm release</button>` : ""}</div>
     </div>
-    <div class="smart-proposal-lines smart-table-wrap smart-proposal-lines-compact smart-blanket-proposal-lines"><table class="smart-table"><thead><tr><th>Item</th><th>Destination</th><th class="numeric">Required</th><th>Proposed</th><th class="numeric">Sales qty</th><th class="numeric">Weight</th><th>Availability</th></tr></thead><tbody>${(proposal.lines || []).map((line) => smartBlanketProposalLine(proposal, line, smartBlanketProposalLineSourceRemaining(proposal, line, sourceOrder, allProposals), editable)).join("")}</tbody></table></div>
+    <div class="smart-proposal-lines smart-table-wrap smart-proposal-lines-compact smart-blanket-proposal-lines"><table class="smart-table"><thead><tr><th>Item</th><th>Destination</th><th class="numeric">Required</th><th>Proposed</th><th class="numeric">Sales qty</th><th class="numeric">Weight</th><th>Availability</th></tr></thead><tbody>${(proposal.lines || []).map((line) => smartBlanketProposalLine(proposal, line, smartBlanketProposalLineSourceRemaining(proposal, line, sourceOrder, allProposals), editable)).join("")}${(proposal.physicalPalletLines || []).map((line) => smartBlanketPhysicalPalletLine(proposal, line, editable)).join("")}</tbody></table></div>
   </article>`;
 }
 
@@ -223,7 +239,7 @@ smartScmApp.addEventListener("click", async (event) => {
   const button = event.target.closest("[data-smart-action]");
   if (!button || smartState.busy) return;
   const action = button.dataset.smartAction;
-  if (!["set-blanket-sidebar-tab", "refresh-blanket-workspace", "build-blanket-plan", "flag-blanket-po", "unflag-blanket-po", "save-blanket-proposal-line", "confirm-blanket-proposal"].includes(action)) return;
+  if (!["set-blanket-sidebar-tab", "refresh-blanket-workspace", "build-blanket-plan", "flag-blanket-po", "unflag-blanket-po", "save-blanket-proposal-line", "split-blanket-proposal-line", "remove-blanket-proposal-line", "save-blanket-pallet-line", "reset-blanket-pallet-line", "confirm-blanket-proposal"].includes(action)) return;
   try {
     if (action === "set-blanket-sidebar-tab") {
       const selectedTab = button.dataset.smartBlanketSidebarTab;
@@ -267,6 +283,46 @@ smartScmApp.addEventListener("click", async (event) => {
       }), "Blanket release line saved with exact source allocation");
       await smartLoadBlanketWorkspace({ quiet: true });
       if (typeof smartRefreshPlanningExclusions === "function") await smartRefreshPlanningExclusions();
+      return;
+    }
+    if (action === "split-blanket-proposal-line") {
+      const proposalId = Number(button.dataset.proposalId);
+      const lineId = Number(button.dataset.lineId);
+      const currentPallets = Number(button.dataset.currentPallets);
+      if (!confirm(`Move this entire ${smartBlanketNumber(currentPallets, 0)}-PLT item line into its own held Blanket load?`)) return;
+      await smartWork("Moving Blanket proposal line", () => smartApi(`/api/scm/smart/blanket-proposals/${proposalId}/lines/${lineId}/split`, {
+        method: "POST",
+        body: {}
+      }), "Blanket item line moved into a separate held load");
+      await smartLoadBlanketWorkspace({ quiet: true });
+      if (typeof smartRefreshPlanningExclusions === "function") await smartRefreshPlanningExclusions();
+      return;
+    }
+    if (action === "remove-blanket-proposal-line") {
+      const proposalId = Number(button.dataset.proposalId);
+      const lineId = Number(button.dataset.lineId);
+      if (!confirm("Remove this item line and release its planned Blanket source quantity?")) return;
+      await smartWork("Removing Blanket proposal line", () => smartApi(`/api/scm/smart/blanket-proposals/${proposalId}/lines/${lineId}`, {
+        method: "DELETE"
+      }), "Blanket item line removed and source quantity released");
+      await smartLoadBlanketWorkspace({ quiet: true });
+      if (typeof smartRefreshPlanningExclusions === "function") await smartRefreshPlanningExclusions();
+      return;
+    }
+    if (action === "save-blanket-pallet-line" || action === "reset-blanket-pallet-line") {
+      const row = button.closest("[data-smart-physical-pallet-line]");
+      const proposalId = Number(button.dataset.proposalId);
+      const destinationLocationId = Number(button.dataset.destinationLocationId);
+      const reset = action === "reset-blanket-pallet-line";
+      const rawQuantity = row?.querySelector("[data-smart-pallet-quantity]")?.value?.trim() ?? "";
+      if (!reset && rawQuantity === "") throw new Error("Enter a PALLET quantity, or use Reset auto.");
+      const quantity = Number(rawQuantity);
+      if (!reset && (!Number.isFinite(quantity) || quantity < 0)) throw new Error("PALLET quantity must be zero or greater.");
+      await smartWork(reset ? "Resetting Blanket PALLET quantity" : "Saving Blanket PALLET quantity", () => smartApi(`/api/scm/smart/proposals/${proposalId}/pallets/${destinationLocationId}`, {
+        method: "PATCH",
+        body: reset ? { reset: true } : { quantity }
+      }), reset ? "Blanket PALLET quantity returned to Automatic" : "Blanket PALLET quantity override saved");
+      await smartLoadBlanketWorkspace({ quiet: true });
       return;
     }
     if (action === "confirm-blanket-proposal") {

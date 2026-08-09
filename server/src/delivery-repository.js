@@ -6,6 +6,16 @@ import { writeAudit } from "./auth-repository.js";
 import { getDispatchDeliveryGroup, listDispatchDeliveryGroups } from "./dispatch-delivery-group-repository.js";
 import { remapDispatchLinksToMaterializedSplit } from "./dispatch-order-target-repository.js";
 import { isNetSuiteSalesOrderBilled } from "./sales-order-reconciliation.js";
+import {
+  ACTIVE_RELOAD_STATUSES,
+  getActiveReloadCycleForOrder,
+  getReloadLoadAttemptByRequestId,
+  listActiveReloadOrders,
+  recordReloadLoadAttempt,
+  releaseReloadDraft,
+  updateReloadCycleStatus,
+  updateReloadPackedQuantity
+} from "./sales-order-reload-repository.js";
 
 function normalizeNumber(value) {
   if (value === null || value === undefined || value === "") return null;
@@ -38,6 +48,94 @@ function requirePhotoReferences(values = [], minimum = 2) {
 
 function roundQuantity(value) {
   return Number(Number(value || 0).toFixed(6));
+}
+
+function reloadOperatorStatus(cycle = {}) {
+  if (cycle.status === "preparing") return "preparing";
+  if (cycle.status === "packed") return "packed";
+  return "open";
+}
+
+function reloadYardStatus(cycle = {}) {
+  if (cycle.status === "preparing") return "Re-load Preparing";
+  if (cycle.status === "packed") return "Re-load Ready";
+  if (cycle.status === "in_progress") return "Partially Re-loaded";
+  return "Re-load Authorized";
+}
+
+function decorateSalesOrderReload(order, cycle) {
+  if (!order || !cycle) return order;
+  const canonicalLines = new Map((order.lines || []).map((line) => [String(line.id), line]));
+  const lines = (cycle.lines || []).map((reloadLine) => {
+    const canonical = canonicalLines.get(String(reloadLine.salesOrderLineId)) || {};
+    const packedTotal = positiveQuantity(reloadLine.packedPalletQty)
+      + positiveQuantity(reloadLine.packedLayerQty)
+      + positiveQuantity(reloadLine.packedSectionQty)
+      + positiveQuantity(reloadLine.packedPieceQty)
+      + positiveQuantity(reloadLine.packedSalesQty);
+    return {
+      ...canonical,
+      id: reloadLine.salesOrderLineId,
+      line_id: reloadLine.netsuiteLineId,
+      item_id: reloadLine.itemId,
+      item_name: reloadLine.itemName,
+      sku: reloadLine.sku,
+      item_description: reloadLine.itemDescription,
+      item_type: canonical.item_type || "InvtPart",
+      quantity: reloadLine.targetSalesQty,
+      unit: reloadLine.salesUom,
+      pallet_qty: reloadLine.targetPalletQty,
+      layer_qty: reloadLine.targetLayerQty,
+      section_qty: reloadLine.targetSectionQty,
+      piece_qty: reloadLine.targetPieceQty,
+      to_plt: reloadLine.toPlt,
+      to_lyr: reloadLine.toLyr,
+      to_sec: reloadLine.toSec,
+      to_pcs: reloadLine.toPcs,
+      packed_pallet_qty: reloadLine.packedPalletQty,
+      packed_layer_qty: reloadLine.packedLayerQty,
+      packed_section_qty: reloadLine.packedSectionQty,
+      packed_piece_qty: reloadLine.packedPieceQty,
+      packed_sales_qty: reloadLine.packedSalesQty,
+      loaded_qty: reloadLine.reloadedSalesQty,
+      loaded_uom: reloadLine.salesUom,
+      confirmed: packedTotal > 0,
+      netsuite_active: true,
+      canonical_loaded_qty: positiveQuantity(canonical.loaded_qty),
+      canonical_loaded_uom: canonical.loaded_uom || canonical.unit || "",
+      canonical_quantity: positiveQuantity(canonical.quantity),
+      reload_line: true,
+      reload_cycle_id: cycle.id,
+      reload_cycle_number: cycle.cycleNumber,
+      reload_target_sales_qty: reloadLine.targetSalesQty,
+      reload_remaining_sales_qty: reloadLine.remainingSalesQty
+    };
+  });
+  const hasOpen = lines.some((line) => positiveQuantity(line.reload_remaining_sales_qty) > 0.000001);
+  const hasPacked = lines.some(lineHasPackedQuantity);
+  const hasLoaded = lines.some((line) => positiveQuantity(line.loaded_qty) > 0);
+  return {
+    ...order,
+    operator_status: reloadOperatorStatus(cycle),
+    local_yard_order_status: reloadYardStatus(cycle),
+    preparing_operator_id: cycle.preparingOperatorId,
+    preparing_started_at: cycle.preparingStartedAt,
+    reload_authorized: true,
+    reload_cycle: cycle,
+    reloadCycle: cycle,
+    reload_reason: cycle.reason,
+    reload_cycle_number: cycle.cycleNumber,
+    has_open_qty: hasOpen,
+    has_packed_qty: hasPacked,
+    has_loaded_qty: hasLoaded,
+    lines
+  };
+}
+
+async function decorateActiveSalesOrderReload(order) {
+  if (!order || order.order_type !== "sales_order" || !Number.isInteger(Number(order.netsuite_id)) || Number(order.netsuite_id) <= 0) return order;
+  const cycle = await getActiveReloadCycleForOrder(Number(order.netsuite_id));
+  return decorateSalesOrderReload(order, cycle);
 }
 
 const LOAD_SALES_QTY_TOLERANCE = 0.1;
@@ -716,7 +814,9 @@ function groupLineSource(line, order) {
     orderRef: order.tranid,
     orderType: order.order_type,
     lineId: line.id,
-    lineKey: groupLineKey(line)
+    lineKey: groupLineKey(line),
+    reloadLine: Boolean(line.reload_line),
+    reloadCycleId: line.reload_cycle_id || null
   };
 }
 
@@ -768,6 +868,7 @@ function aggregateGroupLines(groupId, childOrders = []) {
       ]);
       existing.source_lines.push(groupLineSource(line, order));
       if (!existing.source_order_refs.includes(order.tranid)) existing.source_order_refs.push(order.tranid);
+      existing.reload_line = Boolean(existing.reload_line || line.reload_line);
       existing.confirmed = Boolean(existing.confirmed || line.confirmed);
       if (line.sync_exception && !existing.sync_exception) existing.sync_exception = line.sync_exception;
       if (line.sync_exception_at && !existing.sync_exception_at) existing.sync_exception_at = line.sync_exception_at;
@@ -865,10 +966,14 @@ async function loadDispatchGroupChildOrders(groups = []) {
     if (!linesByOrder.has(key)) linesByOrder.set(key, []);
     linesByOrder.get(key).push(line);
   }
-  const ordersByRef = new Map(orderResult.rows.map((order) => [String(order.tranid), {
-    ...order,
-    lines: (linesByOrder.get(String(order.netsuite_id)) || []).filter(hasDeliveryDisplayQuantity)
-  }]));
+  const ordersByRef = new Map();
+  for (const order of orderResult.rows) {
+    const base = {
+      ...order,
+      lines: (linesByOrder.get(String(order.netsuite_id)) || []).filter(hasDeliveryDisplayQuantity)
+    };
+    ordersByRef.set(String(order.tranid), isTransfer ? base : await decorateActiveSalesOrderReload(base));
+  }
   return new Map(groups.map((group) => [
     group.id,
     (group.childRefs || []).map((ref) => ordersByRef.get(String(ref))).filter(Boolean)
@@ -886,6 +991,7 @@ function buildDispatchGroupDeliveryOrder(group, childOrders = []) {
   const allLoaded = childOrders.every((order) => String(order.local_yard_order_status || "").toLowerCase() === "loaded");
   const operatorStatus = hasPreparing ? "preparing" : hasPacked ? "packed" : hasLoaded && hasOpen ? "partial_loaded" : "open";
   const base = childOrders[0];
+  const reloadChildren = childOrders.filter((order) => order.reload_authorized);
   return {
     ...base,
     netsuite_id: group.id,
@@ -895,6 +1001,9 @@ function buildDispatchGroupDeliveryOrder(group, childOrders = []) {
     child_orders: childOrders,
     child_order_refs: childOrders.map((order) => order.tranid),
     child_order_ids: childOrders.map((order) => order.netsuite_id),
+    reload_authorized: reloadChildren.length > 0,
+    reload_child_order_refs: reloadChildren.map((order) => order.tranid),
+    reload_cycles: reloadChildren.map((order) => order.reload_cycle),
     customer: [...new Set(childOrders.map((order) => order.customer).filter(Boolean))].join(" + "),
     operator_status: operatorStatus,
     local_yard_order_status: allLoaded ? "Loaded" : (hasOpen && (hasPacked || hasLoaded) ? "Partial Loaded" : "Open"),
@@ -920,6 +1029,7 @@ function buildDispatchGroupDeliveryListOrder(group, orders = []) {
   const allLoaded = orders.every((order) => String(order.local_yard_order_status || "").toLowerCase() === "loaded");
   const hasPreparing = orders.some((order) => order.operator_status === "preparing");
   const base = orders[0];
+  const reloadChildren = orders.filter((order) => order.reload_authorized);
   return {
     ...base,
     netsuite_id: group.id,
@@ -928,6 +1038,9 @@ function buildDispatchGroupDeliveryListOrder(group, orders = []) {
     is_dispatch_group: true,
     child_order_refs: group.childRefs,
     child_order_ids: childIds,
+    reload_authorized: reloadChildren.length > 0,
+    reload_child_order_refs: reloadChildren.map((order) => order.tranid),
+    reload_cycles: reloadChildren.map((order) => order.reload_cycle),
     customer: [...new Set(orders.map((order) => order.customer).filter(Boolean))].join(" + "),
     operator_status: hasPreparing ? "preparing" : hasPacked ? "packed" : hasLoaded && hasOpen ? "partial_loaded" : "open",
     local_yard_order_status: allLoaded ? "Loaded" : (hasOpen && (hasPacked || hasLoaded) ? "Partial Loaded" : "Open"),
@@ -1038,11 +1151,11 @@ export async function getDeliveryOrdersBatch(ids = []) {
       linesByOrder.get(key).push(line);
     }
     for (const order of orderResult.rows) {
-      ordersByKey.set(String(order.netsuite_id), {
+      ordersByKey.set(String(order.netsuite_id), await decorateActiveSalesOrderReload({
         ...order,
         testFixture: sandboxFixtures && order.is_test_fixture === true,
         lines: (linesByOrder.get(String(order.netsuite_id)) || []).filter(hasDeliveryDisplayQuantity)
-      });
+      }));
     }
   }
 
@@ -1774,25 +1887,43 @@ export async function listDeliveryOrders({ locationId = null, status = "active",
     ...order,
     testFixture: sandboxFixtures && (/^TSTDEP-SO-/i.test(String(order.tranid || "")) || order.is_test_fixture === true)
   });
-  if (!groupRows.length) return [...localCoRows, ...result.rows].map(markFixture);
   const groupedChildRefs = new Set(groupRows.flatMap((order) => order.child_order_refs || []));
+  const resultIds = new Set(result.rows.map((row) => String(row.netsuite_id)));
+  const reloadRows = orderType === "sales_order" ? await listActiveReloadOrders({ locationId }) : [];
+  const standaloneReloadRows = [];
+  for (const row of reloadRows) {
+    if (groupedChildRefs.has(String(row.tranid || "")) || resultIds.has(String(row.netsuite_id))) continue;
+    const cycleStatus = String(row.reload_cycle?.status || "");
+    if (status === "packed" ? cycleStatus !== "packed" : cycleStatus === "packed") continue;
+    if (planDate && dateOnly(row.dispatch_plan_date) !== dateOnly(planDate)) continue;
+    if (truckPlate && String(row.dispatch_truck_plate || "") !== String(truckPlate)) continue;
+    const detail = await getDeliveryOrder(row.netsuite_id);
+    if (detail) standaloneReloadRows.push(detail);
+  }
   return [
     ...localCoRows,
     ...groupRows,
-    ...result.rows.filter((row) => !groupedChildRefs.has(String(row.tranid || "")))
+    ...result.rows.filter((row) => !groupedChildRefs.has(String(row.tranid || ""))),
+    ...standaloneReloadRows
   ].map(markFixture);
 }
 
 export async function listDeliveryLoadTrucks({ locationId = null, planDate = null } = {}) {
   const date = dateOnly(planDate);
   if (!date) return [];
-  const params = [date];
+  const params = [date, ACTIVE_RELOAD_STATUSES];
   const sandboxSql = isNetSuiteSandboxEnvironment() ? "true" : "false";
   const locationClause = locationId ? `AND outbound_location_id = $${params.push(Number(locationId))}` : "";
   const result = await query(
     `WITH planned_delivery_orders AS (
        SELECT dispatch_truck_plate, dispatch_load_name, outbound_location_id, operator_status,
-              local_yard_order_status, 'sales_order'::text AS order_type
+              local_yard_order_status, 'sales_order'::text AS order_type,
+              EXISTS (
+                SELECT 1
+                  FROM operator_reload_cycles reload_cycle
+                 WHERE reload_cycle.sales_order_id = sales_orders.netsuite_id
+                   AND reload_cycle.status = ANY($2::text[])
+              ) AS reload_authorized
          FROM sales_orders
          WHERE dispatch_plan_date = $1
            AND COALESCE(dispatch_truck_plate, '') <> ''
@@ -1802,7 +1933,7 @@ export async function listDeliveryLoadTrucks({ locationId = null, planDate = nul
        UNION ALL
        SELECT dispatch_truck_plate, dispatch_load_name, from_location_id AS outbound_location_id,
               outbound_operator_status AS operator_status, local_yard_order_status,
-              'transfer_order'::text AS order_type
+              'transfer_order'::text AS order_type, false AS reload_authorized
          FROM transfer_orders
         WHERE dispatch_plan_date = $1
           AND COALESCE(dispatch_truck_plate, '') <> ''
@@ -1814,7 +1945,7 @@ export async function listDeliveryLoadTrucks({ locationId = null, planDate = nul
             COUNT(*) AS order_count,
             MIN(dispatch_load_name) AS first_load_name
        FROM planned_delivery_orders
-      WHERE COALESCE(local_yard_order_status, 'Open') <> 'Loaded'
+      WHERE (COALESCE(local_yard_order_status, 'Open') <> 'Loaded' OR reload_authorized)
         ${locationClause}
       GROUP BY dispatch_truck_plate
       ORDER BY dispatch_truck_plate`,
@@ -2208,13 +2339,13 @@ export async function getDeliveryOrder(id) {
     [id]
   );
 
-  return {
+  return decorateActiveSalesOrderReload({
     ...order.rows[0],
     testFixture: sandboxFixtures && order.rows[0].is_test_fixture === true,
     lines: lines.rows
       .map(applyDeliveryAllocationFields)
       .filter(hasDeliveryDisplayQuantity)
-  };
+  });
 }
 
 export async function getDeliveryPrepNotifications({ locationId = null } = {}) {
@@ -2919,6 +3050,23 @@ export async function applyConfirmedDispatchPlanToDelivery(plan, { forceOrderRef
 
   for (const row of plannedRows) {
     const targetTable = row.orderType === "TO" ? "transfer_orders" : "sales_orders";
+    const activeReloadOverride = row.orderType === "SO"
+      ? `OR EXISTS (
+             SELECT 1
+               FROM operator_reload_cycles reload_cycle
+              WHERE reload_cycle.sales_order_id = sales_orders.netsuite_id
+                AND reload_cycle.status = ANY($7::text[])
+           )`
+      : "";
+    const assignmentParams = [
+      row.tranid,
+      row.planDate,
+      row.truckPlate,
+      row.loadName,
+      row.parkingSpot,
+      row.forcePlannedAt
+    ];
+    if (row.orderType === "SO") assignmentParams.push(ACTIVE_RELOAD_STATUSES);
     await query(
       `UPDATE ${targetTable}
           SET dispatch_planned = true,
@@ -2938,8 +3086,11 @@ export async function applyConfirmedDispatchPlanToDelivery(plan, { forceOrderRef
                 ELSE dispatch_planned_at
               END
         WHERE tranid = $1
-          AND COALESCE(local_yard_order_status, 'Open') <> 'Loaded'`,
-      [row.tranid, row.planDate, row.truckPlate, row.loadName, row.parkingSpot, row.forcePlannedAt]
+          AND (
+            COALESCE(local_yard_order_status, 'Open') <> 'Loaded'
+            ${activeReloadOverride}
+          )`,
+      assignmentParams
     );
   }
 
@@ -3554,9 +3705,24 @@ async function recordVrmaDeliveryLoad(order, operatorId, { photoDataUrls }) {
   };
 }
 
-export async function recordDeliveryLoad(orderId, operatorId, { photoDataUrls }) {
+export async function recordDeliveryLoad(orderId, operatorId, { photoDataUrls, requestId } = {}) {
   const photos = requirePhotoReferences(photoDataUrls);
-  if (isDispatchGroupOrderId(orderId)) return recordGroupedDeliveryLoad(orderId, operatorId, { photoDataUrls: photos });
+  if (isDispatchGroupOrderId(orderId)) {
+    return recordGroupedDeliveryLoad(orderId, operatorId, { photoDataUrls: photos, requestId });
+  }
+  if (/^\d+$/.test(String(orderId || ""))) {
+    const reloadCycle = await getActiveReloadCycleForOrder(Number(orderId));
+    if (reloadCycle) {
+      return recordReloadLoadAttempt(Number(orderId), operatorId, {
+        photoDataUrls: photos,
+        requestId
+      });
+    }
+    if (requestId) {
+      const existingReload = await getReloadLoadAttemptByRequestId(requestId);
+      if (existingReload && Number(existingReload.salesOrderId) === Number(orderId)) return existingReload;
+    }
+  }
   const order = await getDeliveryOrder(orderId);
   if (!order) throw new Error("Delivery order not found.");
   if (order.order_type === "co_order") return recordLocalCoDeliveryLoad(order, operatorId, { photoDataUrls: photos });
@@ -4407,6 +4573,12 @@ async function findActiveDraftOrder(operatorId, orderId) {
           WHERE o.delivery_order_id::text <> $2::text
             AND o.status = 'preparing'
             AND o.preparing_operator_id::text = $1
+         UNION ALL
+         SELECT cycle.sales_order_id AS netsuite_id
+           FROM operator_reload_cycles cycle
+          WHERE cycle.sales_order_id <> $2
+            AND cycle.status = 'preparing'
+            AND cycle.preparing_operator_id::text = $1
        ) active_draft
       LIMIT 1`,
     [operatorId, orderId]
@@ -4414,11 +4586,29 @@ async function findActiveDraftOrder(operatorId, orderId) {
   return result.rows[0]?.netsuite_id || null;
 }
 
-async function recordGroupedDeliveryLoad(groupId, operatorId, { photoDataUrls }) {
+function groupedReloadRequestId(requestId, reloadIndex) {
+  if (reloadIndex === 0) return requestId;
+  const hex = crypto.createHash("sha256").update(`${requestId}:${reloadIndex}`).digest("hex").slice(0, 32);
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20)}`;
+}
+
+async function recordGroupedDeliveryLoad(groupId, operatorId, { photoDataUrls, requestId }) {
   const photos = requirePhotoReferences(photoDataUrls);
   const groupOrder = await getDispatchGroupDeliveryOrder(groupId);
   if (!groupOrder) throw new Error("Grouped delivery order not found.");
+  if (requestId) {
+    const existing = await getReloadLoadAttemptByRequestId(requestId);
+    if (existing) {
+      if (!groupChildOrderIds(groupOrder).some((id) => Number(id) === Number(existing.salesOrderId))) {
+        throw Object.assign(new Error("Load request ID was already used for another order."), { status: 409 });
+      }
+      return { ...existing, groupLoad: true, netSuiteUpdated: false };
+    }
+  }
   const childOrders = (await Promise.all(groupChildOrderIds(groupOrder).map((id) => getDeliveryOrder(id)))).filter(Boolean);
+  if (childOrders.some((child) => child.reload_authorized) && !requestId) {
+    throw Object.assign(new Error("A valid re-load request ID is required."), { status: 400 });
+  }
   const loadResults = [];
   const validations = [];
   for (const child of childOrders) {
@@ -4434,12 +4624,19 @@ async function recordGroupedDeliveryLoad(groupId, operatorId, { photoDataUrls })
     throw error;
   }
   const groupLoadRef = crypto.randomUUID();
+  let reloadIndex = 0;
   for (const child of childOrders) {
     if (!(child.lines || []).some(lineHasPackedQuantity)) continue;
-    if (!["packed", "loaded"].includes(child.operator_status)) {
+    if (!child.reload_authorized && !["packed", "loaded"].includes(child.operator_status)) {
       await setCanonicalDeliveryStatus(child, "packed", { clearPreparing: true });
     }
-    const result = await recordDeliveryLoad(child.netsuite_id, operatorId, { photoDataUrls: photos });
+    const childRequestId = child.reload_authorized
+      ? groupedReloadRequestId(requestId, reloadIndex++)
+      : undefined;
+    const result = await recordDeliveryLoad(child.netsuite_id, operatorId, {
+      photoDataUrls: photos,
+      requestId: childRequestId
+    });
     if (result?.id) {
       await query(
         `UPDATE operator_load_records
@@ -4468,11 +4665,17 @@ async function recordGroupedDeliveryLoad(groupId, operatorId, { photoDataUrls })
     }
   });
   const refreshed = await getDispatchGroupDeliveryOrder(groupId);
+  const reloadResults = loadResults.filter((result) => result.localOnly && result.reloadCycleId);
+  const entirelyLocal = loadResults.every((result) => result.localOnly === true);
   return {
     id: loadResults[0]?.id || null,
     groupLoad: true,
     groupLoadRef,
     sourceLoadRecords: loadResults,
+    localOnly: entirelyLocal,
+    netSuiteUpdated: false,
+    reloadCycleId: reloadResults.length === 1 ? reloadResults[0].reloadCycleId : null,
+    completed: reloadResults.length > 0 && reloadResults.every((result) => result.completed),
     localYardOrderStatus: refreshed?.local_yard_order_status || "Partial Loaded",
     dispatchPlanDate: groupOrder.dispatch_plan_date,
     dispatchTruckPlate: groupOrder.dispatch_truck_plate,
@@ -4523,6 +4726,12 @@ async function findActiveDraftOrderExcluding(operatorId, excludedOrderIds = []) 
                 )
               )
             )
+         UNION ALL
+         SELECT cycle.sales_order_id AS netsuite_id
+           FROM operator_reload_cycles cycle
+          WHERE NOT (cycle.sales_order_id::text = ANY($2::text[]))
+            AND cycle.status = 'preparing'
+            AND cycle.preparing_operator_id::text = $1
        ) active_draft
       LIMIT 1`,
     [operatorId, excluded]
@@ -4556,6 +4765,18 @@ async function claimPreparingGroupOrder(groupOrder, operatorId) {
   const existing = await findActiveDraftOrderExcluding(operatorId, childIds);
   if (existing) throw new Error("Pack your current preparing order before moving on.");
 
+  const childOrders = Array.isArray(groupOrder.child_orders) && groupOrder.child_orders.length
+    ? groupOrder.child_orders
+    : (await Promise.all(childIds.map((childId) => getDeliveryOrder(childId)))).filter(Boolean);
+  const reloadChildren = childOrders.filter((order) => order.reload_authorized);
+  for (const child of reloadChildren) {
+    await updateReloadCycleStatus({ orderId: child.netsuite_id, status: "preparing", operatorId });
+  }
+  const canonicalChildIds = childOrders
+    .filter((order) => !order.reload_authorized)
+    .map((order) => Number(order.netsuite_id))
+    .filter((id) => Number.isInteger(id));
+  if (!canonicalChildIds.length) return groupOrder;
   const target = canonicalOrderTarget(groupOrder);
   await query(
     `UPDATE ${target.table}
@@ -4564,7 +4785,7 @@ async function claimPreparingGroupOrder(groupOrder, operatorId) {
             preparing_started_at = CASE WHEN ${target.statusColumn} <> 'packed' THEN COALESCE(preparing_started_at, now()) ELSE preparing_started_at END,
             status_updated_at = now()
       WHERE netsuite_id = ANY($1::bigint[])`,
-    [childIds.map((id) => Number(id)).filter((id) => Number.isInteger(id)), operatorId]
+    [canonicalChildIds, operatorId]
   );
   return groupOrder;
 }
@@ -4722,7 +4943,18 @@ async function applyGroupedLinePackedQuantityToOrder(groupOrder, lineId, values,
     throw new Error("Grouped packed sales quantity exceeds the source lines' remaining sales quantity.");
   }
 
-  await updateSourceLinePackedQuantities(working);
+  const canonicalWorking = working.filter(({ order }) => !order.reload_authorized);
+  const reloadWorking = working.filter(({ order }) => order.reload_authorized);
+  await updateSourceLinePackedQuantities(canonicalWorking);
+  for (const source of reloadWorking) {
+    await updateReloadPackedQuantity({
+      orderId: source.order.netsuite_id,
+      lineId: source.line.id,
+      values: source.next,
+      operatorId,
+      absolute: true
+    });
+  }
   if (audit) {
     await writeAudit({
       actorOperatorId: operatorId,
@@ -4907,10 +5139,34 @@ export async function getCurrentOperatorDeliveryDraft(operatorId, { locationId =
                 )::int AS draft_line_count
            FROM scm_vrma_orders v
            LEFT JOIN scm_vrma_order_lines l ON l.vrma_order_id = v.id
-          WHERE v.preparing_operator_id::text = $1
+         WHERE v.preparing_operator_id::text = $1
             AND v.operator_status = 'preparing'
             ${vrmaLocationClause}
           GROUP BY v.id
+         UNION ALL
+         SELECT 'sales_order'::text AS order_type,
+                cycle.sales_order_id::text AS netsuite_id,
+                cycle.order_ref AS tranid,
+                'preparing'::text AS operator_status,
+                'Re-load Preparing'::text AS local_yard_order_status,
+                cycle.outbound_location_id AS location_id,
+                o.outbound_location AS location,
+                cycle.preparing_operator_id,
+                cycle.preparing_started_at,
+                COUNT(line.id) FILTER (
+                  WHERE COALESCE(line.packed_pallet_qty, 0) > 0
+                     OR COALESCE(line.packed_layer_qty, 0) > 0
+                     OR COALESCE(line.packed_section_qty, 0) > 0
+                     OR COALESCE(line.packed_piece_qty, 0) > 0
+                     OR COALESCE(line.packed_sales_qty, 0) > 0
+                )::int AS draft_line_count
+           FROM operator_reload_cycles cycle
+           JOIN sales_orders o ON o.netsuite_id = cycle.sales_order_id
+           LEFT JOIN operator_reload_cycle_lines line ON line.cycle_id = cycle.id
+          WHERE cycle.preparing_operator_id::text = $1
+            AND cycle.status = 'preparing'
+            ${salesLocationClause}
+          GROUP BY cycle.id, o.outbound_location
        ) draft
       ORDER BY preparing_started_at DESC NULLS LAST, tranid
       LIMIT 1`,
@@ -4946,8 +5202,14 @@ export async function releaseCurrentDeliveryDraft(orderId, operatorId) {
   if (isDispatchGroupOrderId(orderId)) {
     const groupOrder = await getDispatchGroupDeliveryOrder(orderId);
     if (!groupOrder) throw new Error("Grouped delivery order not found.");
-    const childIds = groupChildOrderIds(groupOrder).map((id) => Number(id)).filter((id) => Number.isInteger(id));
-    if (!childIds.length) return groupOrder;
+    const childOrders = groupOrder.child_orders || [];
+    const reloadChildren = childOrders.filter((order) => order.reload_authorized);
+    for (const child of reloadChildren) await releaseReloadDraft(child.netsuite_id, operatorId);
+    const childIds = childOrders
+      .filter((order) => !order.reload_authorized)
+      .map((order) => Number(order.netsuite_id))
+      .filter((id) => Number.isInteger(id));
+    if (!childIds.length) return getDispatchGroupDeliveryOrder(orderId);
     const orderTarget = canonicalOrderTarget(groupOrder);
     const lineTarget = canonicalLineTarget(groupOrder);
     await query(
@@ -4990,6 +5252,7 @@ export async function releaseCurrentDeliveryDraft(orderId, operatorId) {
   }
   const order = await getDeliveryOrder(orderId);
   if (!order) throw new Error("Delivery order not found.");
+  if (order.reload_authorized) return releaseReloadDraft(orderId, operatorId);
   if (!order.preparing_operator_id || String(order.preparing_operator_id) !== String(operatorId)) {
     const error = new Error("This order is not locked by your account.");
     error.status = 409;
@@ -5086,6 +5349,13 @@ export async function confirmDeliveryLine(orderId, lineId, values, operatorId) {
     return;
   }
   const current = await getDeliveryOrder(orderId);
+  if (current?.reload_authorized) {
+    if (await findActiveDraftOrder(operatorId, orderId)) {
+      throw new Error("Pack your current preparing order before moving on.");
+    }
+    await updateReloadPackedQuantity({ orderId, lineId, values, operatorId, absolute: false });
+    return;
+  }
   if (isVrmaDeliveryOrder(current)) {
     await claimVrmaPreparingOrder(current, operatorId);
     await updateVrmaLinePackedQuantity(orderId, lineId, values, operatorId);
@@ -5283,6 +5553,13 @@ export async function setDeliveryLinePackedQuantity(orderId, lineId, values, ope
     return;
   }
   const current = await getDeliveryOrder(orderId);
+  if (current?.reload_authorized) {
+    if (await findActiveDraftOrder(operatorId, orderId)) {
+      throw new Error("Pack your current preparing order before moving on.");
+    }
+    await updateReloadPackedQuantity({ orderId, lineId, values, operatorId, absolute: true });
+    return;
+  }
   if (isVrmaDeliveryOrder(current)) {
     await updateVrmaLinePackedQuantity(orderId, lineId, values, operatorId, { absolute: true });
     return;
@@ -5351,6 +5628,19 @@ export async function unpackDeliveryLine(orderId, lineId, values, operatorId) {
     await assertGroupEditable(groupOrder, operatorId);
     const { lines } = await resolveGroupSourceLines(groupOrder, lineId);
     for (const { order, line } of lines) {
+      if (order.reload_authorized) {
+        if (order.reload_cycle?.status === "packed") {
+          await updateReloadCycleStatus({ orderId: order.netsuite_id, status: "preparing", operatorId });
+        }
+        await updateReloadPackedQuantity({
+          orderId: order.netsuite_id,
+          lineId: line.id,
+          values: { pallets: 0, layers: 0, pieces: 0, sections: 0, salesQty: 0 },
+          operatorId,
+          absolute: true
+        });
+        continue;
+      }
       const lineTarget = canonicalLineTarget(order);
       await query(
         `UPDATE ${lineTarget.table}
@@ -5375,6 +5665,20 @@ export async function unpackDeliveryLine(orderId, lineId, values, operatorId) {
       action: "delivery.group.line.unpack",
       lineId,
       details: { groupId: orderId, childOrders: groupChildOrderIds(groupOrder) }
+    });
+    return;
+  }
+  const currentOrder = await getDeliveryOrder(orderId);
+  if (currentOrder?.reload_authorized) {
+    if (currentOrder.reload_cycle?.status === "packed") {
+      await updateReloadCycleStatus({ orderId, status: "preparing", operatorId });
+    }
+    await updateReloadPackedQuantity({
+      orderId,
+      lineId,
+      values: { pallets: 0, layers: 0, pieces: 0, sections: 0, salesQty: 0 },
+      operatorId,
+      absolute: true
     });
     return;
   }
@@ -5493,6 +5797,11 @@ export async function unpackDeliveryOrder(orderId, operatorId) {
     });
     return;
   }
+  const currentOrder = await getDeliveryOrder(orderId);
+  if (currentOrder?.reload_authorized) {
+    await releaseReloadDraft(orderId, operatorId);
+    return;
+  }
   const order = await assertOrderEditable(orderId, operatorId);
   if (isVrmaDeliveryOrder(order)) {
     await query(
@@ -5589,6 +5898,12 @@ export async function updateDeliveryStatus(id, status, operatorId) {
     return withTransaction(async () => {
       const groupOrder = await getDispatchGroupDeliveryOrder(id);
       if (!groupOrder) throw new Error("Grouped delivery order not found.");
+      const childOrders = groupOrder.child_orders || [];
+      const reloadChildren = childOrders.filter((order) => order.reload_authorized);
+      const canonicalChildIds = childOrders
+        .filter((order) => !order.reload_authorized)
+        .map((order) => Number(order.netsuite_id))
+        .filter((childId) => Number.isInteger(childId));
       if (status === "preparing") {
         await claimPreparingGroupOrder(groupOrder, operatorId);
       } else if (status === "packed") {
@@ -5598,10 +5913,12 @@ export async function updateDeliveryStatus(id, status, operatorId) {
           throw error;
         }
         await assertGroupEditable(groupOrder, operatorId);
-        const childIds = groupChildOrderIds(groupOrder).map((childId) => Number(childId)).filter((childId) => Number.isInteger(childId));
+        for (const child of reloadChildren.filter(orderHasPackedQuantity)) {
+          await updateReloadCycleStatus({ orderId: child.netsuite_id, status: "packed", operatorId });
+        }
         const orderTarget = canonicalOrderTarget(groupOrder);
         const lineTarget = canonicalLineTarget(groupOrder);
-        await query(
+        if (canonicalChildIds.length) await query(
           `UPDATE ${orderTarget.table} o
               SET ${orderTarget.statusColumn} = CASE
                     WHEN EXISTS (
@@ -5618,20 +5935,20 @@ export async function updateDeliveryStatus(id, status, operatorId) {
                   preparing_started_at = null,
                   status_updated_at = now()
             WHERE o.netsuite_id = ANY($1::bigint[])`,
-          [childIds]
+          [canonicalChildIds]
         );
       } else {
         await assertGroupEditable(groupOrder, operatorId);
-        const childIds = groupChildOrderIds(groupOrder).map((childId) => Number(childId)).filter((childId) => Number.isInteger(childId));
+        for (const child of reloadChildren) await releaseReloadDraft(child.netsuite_id, operatorId);
         const orderTarget = canonicalOrderTarget(groupOrder);
-        await query(
+        if (canonicalChildIds.length) await query(
           `UPDATE ${orderTarget.table}
               SET ${orderTarget.statusColumn} = CASE WHEN ${orderTarget.statusColumn} = 'loaded' THEN ${orderTarget.statusColumn} ELSE 'open' END,
                   preparing_operator_id = null,
                   preparing_started_at = null,
                   status_updated_at = now()
             WHERE netsuite_id = ANY($1::bigint[])`,
-          [childIds]
+          [canonicalChildIds]
         );
       }
       await writeAudit({
@@ -5642,6 +5959,18 @@ export async function updateDeliveryStatus(id, status, operatorId) {
     });
   }
   const currentOrder = await getDeliveryOrder(id);
+  if (currentOrder?.reload_authorized) {
+    if (status === "open") return releaseReloadDraft(id, operatorId);
+    if (status === "preparing" && await findActiveDraftOrder(operatorId, id)) {
+      throw new Error("Pack your current preparing order before moving on.");
+    }
+    if (status === "packed" && !orderHasPackedQuantity(currentOrder)) {
+      const error = new Error("Cannot mark this re-load as packed because no order line has confirmed packed quantity.");
+      error.status = 409;
+      throw error;
+    }
+    return updateReloadCycleStatus({ orderId: id, status, operatorId });
+  }
   if (isVrmaDeliveryOrder(currentOrder)) {
     if (status === "preparing") {
       await claimVrmaPreparingOrder(currentOrder, operatorId);

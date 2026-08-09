@@ -90,9 +90,90 @@ const bh80AvailabilityHtml = proposalContext.smartProposalAvailability(
   { proposalType: "PO", destinationName: "12441" },
   bh80Line
 );
+assert.match(
+  bh80AvailabilityHtml,
+  /class="smart-availability-hub-tag"[^>]*>HUB<\/span>/,
+  "A PO physically received at the hub for another yard must show HUB in Availability."
+);
 assert.match(bh80AvailabilityHtml, /<small>150 available<\/small><strong>0 PLT<\/strong>/);
 assert.match(bh80AvailabilityHtml, /Expected inventory · AA \+ OO − BO/);
 assert.match(bh80AvailabilityHtml, /<strong>10 PLT<\/strong>/);
+
+const directPoAvailabilityHtml = proposalContext.smartProposalAvailability(
+  { proposalType: "PO", phase: "direct_vendor", destinationName: "12441" },
+  {
+    ...bh80Line,
+    reason: { ...bh80Reason, actualDestinationYard: "12441" }
+  }
+);
+assert.doesNotMatch(
+  directPoAvailabilityHtml,
+  /smart-availability-hub-tag/,
+  "A vendor-direct PO line for the physical destination must not be labeled HUB."
+);
+
+const capacityConstrainedHtml = proposalContext.smartProposalInventory(
+  { proposalType: "PO", phase: "direct_vendor", destinationName: "12441" },
+  {
+    ...bh80Line,
+    requiredPallets: 25,
+    proposedPallets: 25,
+    reason: {
+      ...bh80Reason,
+      actualDestinationYard: "12441",
+      positionPallets: 0,
+      reorderPointPallets: 32,
+      preferredPallets: 25,
+      capacityPallets: 25,
+      minimumOrderPallets: 6,
+      quantityAvailable: 0,
+      quantityOnOrder: 0
+    }
+  }
+);
+assert.match(
+  capacityConstrainedHtml,
+  /Policy scope: this SKU at <strong>12441<\/strong>/,
+  "The proposal explanation must identify ROP and preferred target as SKU-yard policy values."
+);
+assert.match(
+  capacityConstrainedHtml,
+  /Capacity constraint: <strong>25 PLT<\/strong> capacity is below <strong>32 PLT<\/strong> ROP/,
+  "A preferred target below ROP must explicitly explain the binding SKU-yard capacity."
+);
+
+const groupedHubLine = {
+  ...bh80Line,
+  requiredPallets: 3,
+  proposedPallets: 3,
+  reason: {
+    ...bh80Reason,
+    actualDestinationYard: null,
+    destinationAllocations: [
+      { yard: "12441", proposedPallets: 2, fulfillment: "vendor_direct" },
+      { yard: "3445", proposedPallets: 1, fulfillment: "transfer_later" }
+    ]
+  }
+};
+const groupedAllocationHtml = proposalContext.smartProposalAllocationSummary(groupedHubLine);
+assert.match(groupedAllocationHtml, /12441[^<]*<\/strong> · Vendor direct · 2 PLT/);
+assert.match(groupedAllocationHtml, /3445[^<]*<\/strong> · Transfer later · 1 PLT/);
+const groupedInventoryHtml = proposalContext.smartProposalInventory(
+  { proposalType: "PO", destinationName: "12441" },
+  groupedHubLine
+);
+assert.match(groupedInventoryHtml, /Grouped yard allocation/);
+assert.match(groupedInventoryHtml, /One physical receipt at 12441/);
+assert.doesNotMatch(groupedInventoryHtml, /saved snapshot rule calculates/i,
+  "A grouped multi-yard line must not display one yard's policy snapshot as if it covered the whole line.");
+assert.match(
+  proposalContext.smartProposalAvailability(
+    { proposalType: "PO", phase: "direct_vendor", destinationName: "12441" },
+    groupedHubLine
+  ),
+  /class="smart-availability-hub-tag"[^>]*>HUB<\/span>/,
+  "A grouped physical receipt with any transfer-later allocation must show HUB in Availability."
+);
 const reservedPoAvailabilityHtml = proposalContext.smartProposalAvailability(
   { proposalType: "PO", destinationName: "2967" },
   {
@@ -267,6 +348,11 @@ assert.match(proposalContext.smartProposalDecisionEvidence(transferLine), /Sourc
 const transferAvailabilityHtml = proposalContext.smartProposalAvailability(transferProposal, transferLine);
 assert.match(transferAvailabilityHtml, /<small>12441 source available<\/small><strong>2\.5 PLT<\/strong>/);
 assert.match(transferAvailabilityHtml, /<small>150 destination available<\/small><strong>1\.17 PLT<\/strong>/);
+assert.doesNotMatch(
+  transferAvailabilityHtml,
+  /smart-availability-hub-tag/,
+  "An ordinary internal transfer from 12441 must not be mislabeled as a vendor-hub receipt."
+);
 assert.doesNotMatch(
   transferAvailabilityHtml,
   /safety|reorder|protected/i,

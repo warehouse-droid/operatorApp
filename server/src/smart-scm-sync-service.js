@@ -81,7 +81,9 @@ async function insertInventorySnapshotRows(runId, rows = []) {
         Number(row.location_id),
         String(row.location || ""),
         inventoryQuantity(row.quantity_on_hand),
-        inventoryQuantity(row.quantity_available)
+        inventoryQuantity(row.quantity_available),
+        inventoryQuantity(row.quantity_on_order),
+        inventoryQuantity(row.quantity_backordered)
       ];
       return `(${fields.map((field) => {
         params.push(field);
@@ -90,7 +92,8 @@ async function insertInventorySnapshotRows(runId, rows = []) {
     });
     await query(
       `INSERT INTO scm_smart_inventory_snapshots (
-         run_id, item_id, location_id, yard_code, quantity_on_hand, quantity_available
+         run_id, item_id, location_id, yard_code, quantity_on_hand, quantity_available,
+         quantity_on_order, quantity_backordered
        ) VALUES ${values.join(", ")}`,
       params
     );
@@ -132,7 +135,9 @@ function canonicalInventoryRows(rows, yards, requestedItemIds = []) {
         location_id: yard.localLocationId,
         location: yard.localLocationCode,
         quantity_on_hand: 0,
-        quantity_available: 0
+        quantity_available: 0,
+        quantity_on_order: 0,
+        quantity_backordered: 0
       });
       present.add(key);
     }

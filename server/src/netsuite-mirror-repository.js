@@ -332,7 +332,8 @@ export async function getNetSuiteMirrorInventorySnapshot(itemIds = []) {
             item.item_type, item.item_type_text, item.stock_unit, item.item_weight,
             item.to_plt, item.to_lyr, item.to_sec, item.to_pcs, item.raw,
             balance.location_id, balance.location, balance.quantity_on_hand,
-            balance.quantity_available
+            balance.quantity_available, balance.quantity_on_order,
+            balance.quantity_backordered
        FROM inventory_items item
        JOIN inventory_balances balance ON balance.item_id = item.item_id
       WHERE item.item_id = ANY($1::bigint[])

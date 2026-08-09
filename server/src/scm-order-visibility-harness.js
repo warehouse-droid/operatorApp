@@ -307,5 +307,15 @@ assert.match(
   /AND NOT EXISTS \([\s\S]*?FROM scm_reconciliation_order_state current_state/,
   "A current PO reconciliation status must override the intake-time Hold status."
 );
+assert.match(
+  restrictedRefSource,
+  /manual_schedule\.updated_at > state\.reconciled_at/,
+  "A newer manual SCM schedule status must override stale reconciliation restrictions."
+);
+assert.match(
+  restrictedRefSource,
+  /applicationStatus'[\s\S]*?IN \('complete', 'completed'\)[\s\S]*?OR NOT EXISTS/,
+  "Completed reconciliation targets must remain terminal despite a newer manual SCM status."
+);
 
 console.log("SCM restricted-order role and final-response visibility harness passed.");

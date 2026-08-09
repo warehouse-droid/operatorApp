@@ -1,7 +1,7 @@
 (function driverOfflineSync(global) {
   "use strict";
 
-  const DRIVER_PWA_CLIENT_VERSION = "2026.08.05.3";
+  const DRIVER_PWA_CLIENT_VERSION = "2026.08.08.1";
   const DRIVER_PWA_VERSION_HEADER = "X-MBBS-Driver-Version";
   const LEASE_TTL_MS = 120000;
   const LEASE_HEARTBEAT_MS = 30000;

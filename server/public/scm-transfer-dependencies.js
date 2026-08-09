@@ -19,6 +19,7 @@ const dependencyState = {
   reviewStatus: "open",
   mobilePanel: "candidates",
   busy: "",
+  busyScopes: new Map(),
   notice: "",
   error: ""
 };
@@ -27,6 +28,19 @@ let dependencyEventSource = null;
 let dependencyRemoteRefreshTimer = null;
 const dependencyManualItemEditors = new Map();
 const dependencyManualItemSearchTimers = new Map();
+const dependencyActions = new Map();
+const dependencyPrintRequestIds = new Map();
+const dependencyRevisionRequestIds = new Map();
+let dependencyCandidateRequestVersion = 0;
+let dependencyInventoryRequestVersion = 0;
+
+function dependencyActionBusy(scope = "global") {
+  return dependencyState.busyScopes.has("global") || dependencyState.busyScopes.has(scope);
+}
+
+function dependencyBusyLabel() {
+  return dependencyState.busy || dependencyState.busyScopes.values().next().value || "";
+}
 
 function depEscape(value) {
   return String(value ?? "")
@@ -45,6 +59,12 @@ function depNumber(value) {
 function depQty(value) {
   const amount = depNumber(value);
   return new Intl.NumberFormat("en-CA", { maximumFractionDigits: 3 }).format(amount);
+}
+
+function dependencyRequestId(prefix) {
+  const suffix = globalThis.crypto?.randomUUID?.()
+    || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return `${prefix}:${suffix}`;
 }
 
 function depReservationOverrideKey(itemId, locationId) {
@@ -291,31 +311,46 @@ function depSelectedOrder() {
   return dependencyState.candidates.find((order) => String(order.salesOrderId) === String(dependencyState.selectedSalesOrderId)) || null;
 }
 
+function dependencyBatchViewIsCurrent(batchId, salesOrderId) {
+  return Number(dependencyState.batch?.id) === Number(batchId)
+    && String(dependencyState.selectedSalesOrderId) === String(salesOrderId);
+}
+
 async function loadSelectedDependencyInventory({ forceRefresh = false, refreshUndercovered = true } = {}) {
-  if (!dependencyState.selectedSalesOrderId) {
+  const requestVersion = ++dependencyInventoryRequestVersion;
+  const selectedSalesOrderId = dependencyState.selectedSalesOrderId;
+  if (!selectedSalesOrderId) {
     dependencyState.inventory = null;
     return null;
   }
   const selectedOrder = depSelectedOrder();
-  if (selectedOrder?.dependencyBatchId) {
-    clearDependencyProposalSelection();
-    dependencyState.batch = await depApi(`/api/scm/transfer-dependencies/batches/${selectedOrder.dependencyBatchId}`);
-    syncDependencyReservationOverridesFromBatch(dependencyState.batch);
-  }
   const shouldRefresh = forceRefresh || (
     refreshUndercovered
     && dependencyState.reviewStatus === "open"
     && !selectedOrder?.completed
     && depNumber(selectedOrder?.uncoveredQuantity) > 0
   );
-  const path = `/api/scm/transfer-dependencies/candidates/${dependencyState.selectedSalesOrderId}/${shouldRefresh ? "refresh-inventory" : "inventory"}`;
-  const payload = await depApi(path, shouldRefresh
+  const batchPromise = selectedOrder?.dependencyBatchId
+    ? depApi(`/api/scm/transfer-dependencies/batches/${selectedOrder.dependencyBatchId}`)
+    : Promise.resolve(null);
+  const path = `/api/scm/transfer-dependencies/candidates/${selectedSalesOrderId}/${shouldRefresh ? "refresh-inventory" : "inventory"}`;
+  const inventoryPromise = depApi(path, shouldRefresh
     ? { method: "POST", body: JSON.stringify({ force: forceRefresh, includeCandidate: true }) }
     : {});
+  const [loadedBatch, payload] = await Promise.all([batchPromise, inventoryPromise]);
+  if (requestVersion !== dependencyInventoryRequestVersion
+      || String(dependencyState.selectedSalesOrderId) !== String(selectedSalesOrderId)) {
+    return null;
+  }
+  if (loadedBatch) {
+    clearDependencyProposalSelection();
+    dependencyState.batch = loadedBatch;
+    syncDependencyReservationOverridesFromBatch(loadedBatch);
+  }
   dependencyState.inventory = payload?.inventory || payload;
   if (shouldRefresh && payload && Object.hasOwn(payload, "candidate")) {
     const currentIndex = dependencyState.candidates.findIndex((order) =>
-      String(order.salesOrderId) === String(dependencyState.selectedSalesOrderId));
+      String(order.salesOrderId) === String(selectedSalesOrderId));
     if (payload.candidate && currentIndex >= 0) {
       dependencyState.candidates.splice(currentIndex, 1, payload.candidate);
     } else if (!payload.candidate && currentIndex >= 0) {
@@ -327,18 +362,19 @@ async function loadSelectedDependencyInventory({ forceRefresh = false, refreshUn
       clearDependencyProposalSelection();
       dependencyState.notice = `${removed.salesOrderRef} is now fully committed in NetSuite and was removed from Open shortages.`;
       if (dependencyState.selectedSalesOrderId) {
-        dependencyState.inventory = await depApi(
-          `/api/scm/transfer-dependencies/candidates/${dependencyState.selectedSalesOrderId}/inventory`
-        );
+        return loadSelectedDependencyInventory({ refreshUndercovered: false });
       }
     }
   }
   return dependencyState.inventory;
 }
 
-function depCandidateQuery() {
-  const params = new URLSearchParams({ reviewStatus: dependencyState.reviewStatus });
-  if (dependencyState.search) params.set("search", dependencyState.search);
+function depCandidateQuery({
+  reviewStatus = dependencyState.reviewStatus,
+  search = dependencyState.search
+} = {}) {
+  const params = new URLSearchParams({ reviewStatus: search ? "all" : reviewStatus });
+  if (search) params.set("search", search);
   return `?${params.toString()}`;
 }
 
@@ -410,7 +446,7 @@ function updateDependencyProposalMergeState() {
   const button = scmDependencyApp.querySelector('[data-action="merge-proposals"]');
   if (button) {
     button.textContent = `Merge selected (${cards.length})`;
-    button.disabled = Boolean(dependencyState.busy) || !compatibility.eligible;
+    button.disabled = dependencyState.busyScopes.size > 0 || !compatibility.eligible;
   }
   const hint = scmDependencyApp.querySelector("[data-merge-proposal-hint]");
   if (hint) hint.textContent = compatibility.reason;
@@ -420,7 +456,9 @@ function updateDependencyProposalMergeState() {
 
 function renderDependencyCandidates() {
   if (!dependencyState.candidates.length) {
-    const emptyText = dependencyState.reviewStatus === "completed"
+    const emptyText = dependencyState.search
+      ? "No matching Sales Orders in Open, Created, or Completed."
+      : dependencyState.reviewStatus === "completed"
       ? "No completed Auto Transfer reviews."
       : dependencyState.reviewStatus === "created"
         ? "No created Transfer Orders waiting for approval or printing."
@@ -431,7 +469,7 @@ function renderDependencyCandidates() {
     <button class="scm-dependency-order ${String(order.salesOrderId) === String(dependencyState.selectedSalesOrderId) ? "selected" : ""}"
       data-action="select-order" data-order-id="${order.salesOrderId}" type="button">
       <span><strong class="scm-dependency-order-ref">${depEscape(order.salesOrderRef)}${order.testFixture ? `<b class="scm-dependency-test-badge">TEST</b>` : ""}</strong><small>${depEscape(order.customer || "")}</small></span>
-      <span class="scm-dependency-order-side"><b>${depQty(order.uncoveredQuantity)}</b><small>uncovered</small></span>
+      <span class="scm-dependency-order-side">${dependencyState.search ? `<em class="dependency-status status-${depEscape(order.workflowStage || "open")}">${depEscape(order.workflowStage || "open")}</em>` : ""}<b>${depQty(order.uncoveredQuantity)}</b><small>uncovered</small></span>
       <small>${depEscape(order.outboundLocation || "--")} | ${depEscape(depDate(order.expectedDeliveryDate))}${order.completionType === "reviewed_no_transfer" ? " | Reviewed - No Transfer" : order.completionType === "transfer_manually_reviewed" ? " | Created TO reviewed" : order.workflowStage === "created" ? " | Waiting approval / print" : order.completionType === "transfer_approved_printed" ? " | Approved & printed" : ""}</small>
     </button>
   `).join("");
@@ -505,7 +543,7 @@ function renderInventoryMatrix() {
         : order.reviewed
           ? `Reviewed${order.reviewedAt ? ` on ${depEscape(depDate(order.reviewedAt))}` : ""}. This order cannot generate a transfer proposal.`
           : "No transfer needed? Mark only this SCM shortage review; dispatch and operator status stay unchanged."}</span>
-      ${order.workflowStage === "completed" && !order.reviewed ? "" : `<button data-action="${order.reviewed ? "reopen-review" : "review-no-transfer"}" type="button" ${dependencyState.busy ? "disabled" : ""}>
+      ${order.workflowStage === "completed" && !order.reviewed ? "" : `<button data-action="${order.reviewed ? "reopen-review" : "review-no-transfer"}" type="button" ${dependencyState.busyScopes.size > 0 ? "disabled" : ""}>
         ${order.reviewed ? "Undo Review" : order.workflowStage === "created" ? "Mark Reviewed" : "Mark Reviewed - No Transfer"}
       </button>`}
     </div>
@@ -563,7 +601,7 @@ function renderInventoryMatrix() {
                 data-location="${yard.code}"
                 data-available="${depNumber(balance?.quantityAvailable)}"
                 data-reserved="${reserved}"
-                type="button" ${dependencyState.busy ? "disabled" : ""}>${overrideApplied ? "Undo full-available override" : "Use full NetSuite available"}</button>` : ""}
+                type="button" ${dependencyState.busyScopes.size > 0 ? "disabled" : ""}>${overrideApplied ? "Undo full-available override" : "Use full NetSuite available"}</button>` : ""}
             </div>`;
           }).join("")}
         </div>`;
@@ -575,14 +613,21 @@ function renderInventoryMatrix() {
 function renderProposal(proposal) {
   const mergeSelectable = proposal.creationStatus === "draft";
   const mergeSelected = dependencyState.selectedProposalIds.has(Number(proposal.id));
-  const editable = !["created", "creating", "attention"].includes(proposal.creationStatus);
+  const draftEditable = !["created", "creating", "attention"].includes(proposal.creationStatus);
   const recoverable = proposal.creationStatus === "creating";
   const created = ["created", "attention"].includes(proposal.creationStatus) && proposal.transferOrderId;
+  const actionScope = `proposal:${proposal.id}`;
+  const controlsBusy = dependencyActionBusy(actionScope);
+  const revisionPending = ["updating", "attention"].includes(proposal.revisionStatus);
+  const createdQuantityEditable = created && !proposal.revisionBlockedReason && !revisionPending;
+  const quantityEditable = (draftEditable || createdQuantityEditable) && !controlsBusy;
   const printStatus = proposal.printJob?.status || "not queued";
   const printInProgress = ["queued", "leased", "printing"].includes(printStatus);
   const printed = printStatus === "printed";
   const approvalInProgress = proposal.approvalStatus === "approving";
-  const approveLabel = ["failed", "uncertain"].includes(printStatus)
+  const approveLabel = printed
+    ? "Reprint Source-yard Ticket"
+    : ["failed", "uncertain"].includes(printStatus)
     ? "Retry Source-yard Print"
     : proposal.approvalStatus === "approved"
       ? "Get Ticket & Print"
@@ -592,7 +637,7 @@ function renderProposal(proposal) {
       <header>
         <div class="scm-dependency-proposal-heading">
           ${mergeSelectable ? `<label class="scm-dependency-proposal-select">
-            <input data-field="merge-proposal" type="checkbox" ${mergeSelected ? "checked" : ""} ${dependencyState.busy ? "disabled" : ""} aria-label="Select Proposed TO ${proposal.id} for merge" />
+            <input data-field="merge-proposal" type="checkbox" ${mergeSelected ? "checked" : ""} ${controlsBusy ? "disabled" : ""} aria-label="Select Proposed TO ${proposal.id} for merge" />
             <span>Select</span>
           </label>` : ""}
           <strong>${depEscape(proposal.transferOrderRef || `Proposed TO ${proposal.id}`)}</strong>
@@ -600,15 +645,15 @@ function renderProposal(proposal) {
         <span class="dependency-status status-${depEscape(proposal.creationStatus)}">${depEscape(proposal.creationStatus)}</span>
       </header>
       <div class="scm-dependency-proposal-route">
-        <label><span>Mode</span><select data-proposal-field="mode" ${editable ? "" : "disabled"}>
+        <label><span>Mode</span><select data-proposal-field="mode" ${draftEditable && !controlsBusy ? "" : "disabled"}>
           <option value="yard_replenishment" ${proposal.mode === "yard_replenishment" ? "selected" : ""}>Replenish yard</option>
           <option value="direct_to_customer" ${proposal.mode === "direct_to_customer" ? "selected" : ""}>Direct pickup</option>
         </select></label>
-        <label><span>From</span><select data-proposal-field="fromLocationId" ${editable ? "" : "disabled"}>${depYardOptions(proposal.fromLocationId)}</select></label>
-        <label><span>Accounting To</span><select data-proposal-field="toLocationId" ${editable ? "" : "disabled"}>${depYardOptions(proposal.toLocationId)}</select></label>
+        <label><span>From</span><select data-proposal-field="fromLocationId" ${draftEditable && !controlsBusy ? "" : "disabled"}>${depYardOptions(proposal.fromLocationId)}</select></label>
+        <label><span>Accounting To</span><select data-proposal-field="toLocationId" ${draftEditable && !controlsBusy ? "" : "disabled"}>${depYardOptions(proposal.toLocationId)}</select></label>
         <div><span>Route score</span><strong>${proposal.routeScore === null ? "Fallback" : `${depQty(proposal.routeScore)} min`}</strong></div>
       </div>
-      <label class="scm-dependency-memo"><span>Memo</span><input data-proposal-field="memo" value="${depEscape(proposal.memo || "")}" ${editable ? "" : "disabled"} /></label>
+      <label class="scm-dependency-memo"><span>Memo</span><input data-proposal-field="memo" value="${depEscape(proposal.memo || "")}" ${draftEditable && !controlsBusy ? "" : "disabled"} /></label>
       <div class="scm-dependency-proposal-lines">
         ${proposal.lines.map((line, lineIndex) => {
           const conversions = depProposalConversions(line);
@@ -630,7 +675,7 @@ function renderProposal(proposal) {
               <span><strong>${depEscape(line.sku || line.itemName)}${line.lineSource === "manual" ? `<b class="scm-dependency-manual-badge">Manual</b>` : ""}</strong><small>${line.lineSource === "manual" ? depEscape(line.itemName || "Manually added item") : "Sales quantity"}</small></span>
               <div class="scm-dependency-line-controls">
                 <em class="link-sales-equivalent" data-proposal-sales-equivalent>${depQty(salesQuantity)} ${depEscape(line.unit || "UOM")}</em>
-                ${editable && !dependencyState.busy ? `<button class="scm-dependency-remove-line" data-action="remove-proposal-line"
+                ${draftEditable && !controlsBusy ? `<button class="scm-dependency-remove-line" data-action="remove-proposal-line"
                   data-proposal-id="${proposal.id}" data-proposal-line-id="${line.id}" data-item-name="${depEscape(line.itemName)}"
                   type="button">Remove line</button>` : ""}
               </div>
@@ -638,24 +683,26 @@ function renderProposal(proposal) {
             <div class="link-quantity-units">${units.map(([field, label]) => `<label>
               <span>${depEscape(label)}</span>
               <input id="proposal-${proposal.id}-${lineIndex}-${field}" data-proposal-unit="${field}" type="number"
-                min="0" step="${field === "salesQty" ? "0.001" : "1"}" value="${depNumber(values[field])}" ${editable ? "" : "disabled"} />
+                min="0" step="${field === "salesQty" ? "0.001" : "1"}" value="${depNumber(values[field])}" ${quantityEditable ? "" : "disabled"} />
             </label>`).join("")}</div>
           </section>`;
         }).join("")}
       </div>
-      ${editable ? renderDependencyManualItemEditor(proposal) : ""}
+      ${draftEditable && !controlsBusy ? renderDependencyManualItemEditor(proposal) : ""}
       <div class="scm-dependency-pallet-summary">
         <div><span>Calculated PALLET</span><strong data-calculated-pallet>${depQty(proposal.calculatedPalletQuantity)}</strong></div>
         <label><span>Final PALLET quantity</span>
           <input data-proposal-field="palletTransferQuantity" type="number" min="0" step="1"
             value="${!proposal.palletCalculationComplete && !proposal.palletQuantityOverridden ? "" : depNumber(proposal.palletTransferQuantity)}"
-            placeholder="${depNumber(proposal.palletTransferQuantity)}" ${editable ? "" : "disabled"} />
+            placeholder="${depNumber(proposal.palletTransferQuantity)}" ${quantityEditable ? "" : "disabled"} />
         </label>
         <small data-pallet-calculation-note class="${proposal.palletCalculationComplete ? "" : "warning-text"}">${proposal.palletCalculationComplete
           ? "One PALLET per full PLT, plus one for each SKU with loose remainder."
           : "Manual quantity required: at least one item has no PLT conversion."}</small>
       </div>
       ${proposal.creationError ? `<div class="scm-dependency-error">${depEscape(proposal.creationError)}</div>` : ""}
+      ${proposal.revisionBlockedReason ? `<div class="scm-dependency-error">Quantity update unavailable: ${depEscape(proposal.revisionBlockedReason)}</div>` : ""}
+      ${proposal.revisionError ? `<div class="scm-dependency-error">Quantity revision needs recovery: ${depEscape(proposal.revisionError)}</div>` : ""}
       ${created ? `<div class="scm-dependency-workflow">
         <div><span>Quantity check</span><strong>${depEscape(proposal.quantityVerificationStatus || "pending")}</strong></div>
         <div><span>NetSuite approval</span><strong>${depEscape(proposal.approvalStatus || "pending")}</strong></div>
@@ -665,11 +712,12 @@ function renderProposal(proposal) {
       ${proposal.approvalError ? `<div class="scm-dependency-error">${depEscape(proposal.approvalError)}</div>` : ""}
       ${proposal.printJob?.error ? `<div class="scm-dependency-error">${depEscape(proposal.printJob.error)}</div>` : ""}
       <footer class="scm-dependency-proposal-actions">
-        <button data-action="save-proposal" data-proposal-id="${proposal.id}" type="button" ${editable && !dependencyState.busy ? "" : "disabled"}>Save Draft</button>
-        ${(editable || recoverable) ? `<button class="primary-action" data-action="confirm-proposal" data-proposal-id="${proposal.id}" type="button" ${!dependencyState.busy ? "" : "disabled"}>
+        ${draftEditable ? `<button data-action="save-proposal" data-proposal-id="${proposal.id}" type="button" ${!controlsBusy ? "" : "disabled"}>Save Draft</button>` : ""}
+        ${created ? `<button data-action="save-created-proposal" data-proposal-id="${proposal.id}" data-revision="${proposal.revision || 1}" type="button" ${(!proposal.revisionBlockedReason && !controlsBusy) ? "" : "disabled"}>${revisionPending ? "Recover Quantity Update" : "Update NetSuite Quantity"}</button>` : ""}
+        ${(draftEditable || recoverable) ? `<button class="primary-action" data-action="confirm-proposal" data-proposal-id="${proposal.id}" type="button" ${!controlsBusy ? "" : "disabled"}>
           ${recoverable ? "Recover Transfer Order" : proposal.creationStatus === "failed" ? "Retry Transfer Order" : "Create Transfer Order"}
         </button>` : ""}
-        ${created && !printed ? `<button class="primary-action" data-action="approve-print" data-proposal-id="${proposal.id}" type="button" ${!dependencyState.busy && !printInProgress && !approvalInProgress ? "" : "disabled"}>${printInProgress ? `Print ${depEscape(printStatus)}` : depEscape(approveLabel)}</button>` : ""}
+        ${created ? `<button class="primary-action" data-action="approve-print" data-proposal-id="${proposal.id}" type="button" ${!controlsBusy && !revisionPending && !printInProgress && !approvalInProgress ? "" : "disabled"}>${printInProgress ? `Print ${depEscape(printStatus)}` : depEscape(approveLabel)}</button>` : ""}
       </footer>
     </article>
   `;
@@ -691,7 +739,7 @@ function renderDependencyProposals() {
       <div><span>Batch</span><strong>#${batch.id} | ${depEscape(batch.status)}</strong></div>
       <div><span>Uncovered</span><strong class="${batch.uncoveredShortageQuantity > 0 ? "warning-text" : ""}">${depQty(batch.uncoveredShortageQuantity)}</strong></div>
       <div class="scm-dependency-merge-actions">
-        <button data-action="merge-proposals" type="button" ${!dependencyState.busy && mergeCompatibility.eligible ? "" : "disabled"}>Merge selected (${selectedProposals.length})</button>
+        <button data-action="merge-proposals" type="button" ${dependencyState.busyScopes.size === 0 && mergeCompatibility.eligible ? "" : "disabled"}>Merge selected (${selectedProposals.length})</button>
         <small data-merge-proposal-hint>${depEscape(mergeCompatibility.reason)}</small>
       </div>
     </div>
@@ -736,18 +784,18 @@ function renderDependencyPage() {
       <button class="${dependencyState.mobilePanel === "proposals" ? "active" : ""}" data-action="set-mobile-panel" data-mobile-panel="proposals" type="button"><span>3</span>Proposals</button>
     </nav>
     <section class="scm-dependency-toolbar">
-      <button data-action="refresh-inventory" type="button" ${dependencyState.reviewStatus === "open" && dependencyState.selectedSalesOrderId && !selectedOrder?.completed && !dependencyState.busy ? "" : "disabled"}>Refresh Inventory</button>
+      <button data-action="refresh-inventory" type="button" ${dependencyState.reviewStatus === "open" && dependencyState.selectedSalesOrderId && !selectedOrder?.completed && dependencyState.busyScopes.size === 0 ? "" : "disabled"}>Refresh Inventory</button>
       <select data-field="suggest-mode">
         <option value="yard_replenishment">Replenish outbound yard</option>
         <option value="direct_to_customer">Direct pickup to customer</option>
       </select>
-      <button class="primary-action" data-action="generate" type="button" ${dependencyState.reviewStatus === "open" && dependencyState.selectedSalesOrderId && !selectedOrder?.completed && !dependencyState.busy ? "" : "disabled"}>Generate Suggestion</button>
-      <span class="scm-dependency-busy">${depEscape(dependencyState.busy)}</span>
+      <button class="primary-action" data-action="generate" type="button" ${dependencyState.reviewStatus === "open" && dependencyState.selectedSalesOrderId && !selectedOrder?.completed && dependencyState.busyScopes.size === 0 ? "" : "disabled"}>Generate Suggestion</button>
+      <span class="scm-dependency-busy">${depEscape(dependencyBusyLabel())}</span>
     </section>
     <section class="scm-dependency-grid" data-mobile-panel="${depEscape(dependencyState.mobilePanel)}">
       <aside class="scm-dependency-panel scm-dependency-candidates">
         <div class="panel-title scm-dependency-candidate-title">
-          <div><p>${dependencyState.reviewStatus === "completed" ? "Completed reviews" : dependencyState.reviewStatus === "created" ? "Created · action required" : "Open shortages"}</p><h2>Sales Orders</h2></div>
+          <div><p>${dependencyState.search ? "Search · all statuses" : dependencyState.reviewStatus === "completed" ? "Completed reviews" : dependencyState.reviewStatus === "created" ? "Created · action required" : "Open shortages"}</p><h2>Sales Orders</h2></div>
           <div class="scm-dependency-review-tabs" role="group" aria-label="Review status">
             <button class="${dependencyState.reviewStatus === "open" ? "active" : ""}" data-action="set-review-filter" data-review-status="open" type="button">Open</button>
             <button class="${dependencyState.reviewStatus === "created" ? "active" : ""}" data-action="set-review-filter" data-review-status="created" type="button">Created</button>
@@ -781,8 +829,20 @@ function renderDependencyPage() {
 }
 
 async function loadDependencyCandidates({ preserveSelection = true, refreshInventory = true } = {}) {
+  const requestVersion = ++dependencyCandidateRequestVersion;
+  const requestedReviewStatus = dependencyState.reviewStatus;
+  const requestedSearch = dependencyState.search;
   const previousSelected = depSelectedOrder();
-  dependencyState.candidates = await depApi(`/api/scm/transfer-dependencies/candidates${depCandidateQuery()}`);
+  const candidates = await depApi(`/api/scm/transfer-dependencies/candidates${depCandidateQuery({
+    reviewStatus: requestedReviewStatus,
+    search: requestedSearch
+  })}`);
+  if (requestVersion !== dependencyCandidateRequestVersion
+      || dependencyState.reviewStatus !== requestedReviewStatus
+      || dependencyState.search !== requestedSearch) {
+    return { stale: true };
+  }
+  dependencyState.candidates = candidates;
   if (!preserveSelection || !dependencyState.candidates.some((order) => String(order.salesOrderId) === String(dependencyState.selectedSalesOrderId))) {
     dependencyState.selectedSalesOrderId = dependencyState.candidates[0]?.salesOrderId || null;
     clearDependencyProposalSelection();
@@ -811,7 +871,7 @@ async function loadDependencyCandidates({ preserveSelection = true, refreshInven
 function scheduleDependencyRemoteRefresh(delayMs = 450) {
   window.clearTimeout(dependencyRemoteRefreshTimer);
   dependencyRemoteRefreshTimer = window.setTimeout(async () => {
-    if (dependencyState.busy) {
+    if (dependencyState.busyScopes.size > 0) {
       scheduleDependencyRemoteRefresh(1000);
       return;
     }
@@ -892,20 +952,28 @@ function collectDependencyBatchPayload(cards = [...scmDependencyApp.querySelecto
   };
 }
 
-async function runDependencyAction(label, action) {
-  if (dependencyState.busy) return;
-  dependencyState.busy = label;
+async function runDependencyAction(label, action, options = {}) {
+  const scope = String(options.scope || "global");
+  const active = dependencyActions.get(scope);
+  if (active) return active;
+  dependencyState.busyScopes.set(scope, label);
+  if (scope === "global") dependencyState.busy = label;
   dependencyState.error = "";
   dependencyState.notice = "";
   renderDependencyPage();
-  try {
-    await action();
-  } catch (error) {
-    dependencyState.error = error.message;
-  } finally {
-    dependencyState.busy = "";
-    renderDependencyPage();
-  }
+  const task = Promise.resolve()
+    .then(action)
+    .catch((error) => {
+      dependencyState.error = error.message;
+    })
+    .finally(() => {
+      dependencyActions.delete(scope);
+      dependencyState.busyScopes.delete(scope);
+      if (scope === "global") dependencyState.busy = "";
+      renderDependencyPage();
+    });
+  dependencyActions.set(scope, task);
+  return task;
 }
 
 let dependencySearchTimer = null;
@@ -963,7 +1031,11 @@ scmDependencyApp.addEventListener("input", (event) => {
   if (event.target.dataset.field !== "candidate-search") return;
   dependencyState.search = event.target.value;
   clearTimeout(dependencySearchTimer);
-  dependencySearchTimer = setTimeout(() => runDependencyAction("Searching...", () => loadDependencyCandidates({ preserveSelection: false })), 250);
+  dependencySearchTimer = setTimeout(() => runDependencyAction(
+    "Searching...",
+    () => loadDependencyCandidates({ preserveSelection: false, refreshInventory: false }),
+    { scope: dependencyRequestId("search") }
+  ), 250);
 });
 
 scmDependencyApp.addEventListener("change", (event) => {
@@ -1006,13 +1078,22 @@ scmDependencyApp.addEventListener("click", async (event) => {
     return;
   }
   if (action === "select-order") {
+    const selectedCandidate = dependencyState.candidates.find((order) =>
+      String(order.salesOrderId) === String(target.dataset.orderId));
     dependencyState.selectedSalesOrderId = target.dataset.orderId;
+    if (["open", "created", "completed"].includes(selectedCandidate?.workflowStage)) {
+      dependencyState.reviewStatus = selectedCandidate.workflowStage;
+    }
     if (window.matchMedia?.("(max-width: 760px)").matches) dependencyState.mobilePanel = "inventory";
     clearDependencyProposalSelection();
     dependencyState.batch = null;
     dependencyState.inventory = null;
     dependencyState.reservationOverrideKeys.clear();
-    await runDependencyAction("Refreshing NetSuite inventory...", () => loadSelectedDependencyInventory());
+    await runDependencyAction(
+      "Refreshing NetSuite inventory...",
+      () => loadSelectedDependencyInventory(),
+      { scope: dependencyRequestId("selection") }
+    );
     return;
   }
   if (action === "set-review-filter") {
@@ -1020,7 +1101,11 @@ scmDependencyApp.addEventListener("click", async (event) => {
     if (status === dependencyState.reviewStatus) return;
     dependencyState.reviewStatus = status;
     dependencyState.mobilePanel = "candidates";
-    await runDependencyAction("Loading shortages...", () => loadDependencyCandidates({ preserveSelection: false }));
+    await runDependencyAction(
+      "Loading shortages...",
+      () => loadDependencyCandidates({ preserveSelection: false, refreshInventory: false }),
+      { scope: dependencyRequestId("tab") }
+    );
     return;
   }
   if (action === "toggle-reservation-override") {
@@ -1059,6 +1144,8 @@ scmDependencyApp.addEventListener("click", async (event) => {
   }
   if (action === "add-manual-item") {
     if (!dependencyState.batch) return;
+    const batchId = Number(dependencyState.batch.id);
+    const salesOrderId = dependencyState.selectedSalesOrderId;
     const proposalId = Number(target.dataset.proposalId);
     const editor = dependencyManualItemEditor(proposalId);
     if (!editor.selectedItem) return;
@@ -1073,16 +1160,17 @@ scmDependencyApp.addEventListener("click", async (event) => {
     const quantities = { pallets: 0, layers: 0, sections: 0, pieces: 0, salesQty: 0, [unit]: quantity };
     const itemName = editor.selectedItem.sku || editor.selectedItem.itemName || `Item ${editor.selectedItem.itemId}`;
     await runDependencyAction("Adding item to proposal...", async () => {
-      dependencyState.batch = await depApi(
-        `/api/scm/transfer-dependencies/batches/${dependencyState.batch.id}/proposals/${proposalId}/lines`,
+      const updatedBatch = await depApi(
+        `/api/scm/transfer-dependencies/batches/${batchId}/proposals/${proposalId}/lines`,
         {
           method: "POST",
           body: JSON.stringify({ itemId: editor.selectedItem.itemId, quantities })
         }
       );
+      if (dependencyBatchViewIsCurrent(batchId, salesOrderId)) dependencyState.batch = updatedBatch;
       dependencyManualItemEditors.delete(String(proposalId));
       dependencyState.notice = `${itemName} added manually. Review and save the Transfer Order before creation.`;
-    });
+    }, { scope: `proposal:${proposalId}` });
     return;
   }
   if (action === "review-no-transfer") {
@@ -1176,6 +1264,8 @@ scmDependencyApp.addEventListener("click", async (event) => {
   }
   if (action === "remove-proposal-line") {
     if (!dependencyState.batch) return;
+    const batchId = Number(dependencyState.batch.id);
+    const salesOrderId = dependencyState.selectedSalesOrderId;
     const proposalId = Number(target.dataset.proposalId);
     const proposalLineId = Number(target.dataset.proposalLineId);
     const itemName = target.dataset.itemName || "this order line";
@@ -1185,14 +1275,15 @@ scmDependencyApp.addEventListener("click", async (event) => {
       : "The quantity will return to Undercovered.";
     if (!window.confirm(`Remove ${itemName} from this Transfer Order proposal? ${consequence}`)) return;
     await runDependencyAction("Removing order line...", async () => {
-      dependencyState.batch = await depApi(
-        `/api/scm/transfer-dependencies/batches/${dependencyState.batch.id}/proposals/${proposalId}/lines/${proposalLineId}`,
+      const updatedBatch = await depApi(
+        `/api/scm/transfer-dependencies/batches/${batchId}/proposals/${proposalId}/lines/${proposalLineId}`,
         { method: "DELETE" }
       );
+      if (dependencyBatchViewIsCurrent(batchId, salesOrderId)) dependencyState.batch = updatedBatch;
       dependencyState.notice = manual
         ? `${itemName} removed. The PALLET estimate was recalculated.`
         : `${itemName} removed. The uncovered quantity and PALLET estimate were recalculated.`;
-    });
+    }, { scope: `proposal:${proposalId}` });
     return;
   }
   if (action === "save-proposal") {
@@ -1200,32 +1291,88 @@ scmDependencyApp.addEventListener("click", async (event) => {
     if (!card || !dependencyState.batch) return;
     const payload = collectDependencyBatchPayload([card]);
     const proposalId = Number(card.dataset.proposalId);
+    const batchId = Number(dependencyState.batch.id);
+    const salesOrderId = dependencyState.selectedSalesOrderId;
     await runDependencyAction("Saving draft...", async () => {
-      dependencyState.batch = await depApi(`/api/scm/transfer-dependencies/batches/${dependencyState.batch.id}`, {
+      const updatedBatch = await depApi(`/api/scm/transfer-dependencies/batches/${batchId}`, {
         method: "PUT",
         body: JSON.stringify(payload)
       });
+      if (dependencyBatchViewIsCurrent(batchId, salesOrderId)) dependencyState.batch = updatedBatch;
       dependencyState.notice = `Proposed TO ${proposalId} draft saved.`;
-    });
+    }, { scope: `proposal:${proposalId}` });
+    return;
+  }
+  if (action === "save-created-proposal") {
+    const card = target.closest(".scm-dependency-proposal");
+    if (!card || !dependencyState.batch) return;
+    const batchId = Number(dependencyState.batch.id);
+    const salesOrderId = dependencyState.selectedSalesOrderId;
+    const proposalId = Number(card.dataset.proposalId);
+    const proposal = dependencyState.batch.proposals.find((row) => Number(row.id) === proposalId);
+    if (!proposal) return;
+    const recovering = ["updating", "attention"].includes(proposal.revisionStatus)
+      && proposal.revisionRequestId;
+    const requestId = recovering
+      ? proposal.revisionRequestId
+      : dependencyRevisionRequestIds.get(String(proposalId))
+        || dependencyRequestId(`transfer-dependency-revision:${proposalId}`);
+    dependencyRevisionRequestIds.set(String(proposalId), requestId);
+    const payload = {
+      ...collectDependencyProposalPayload(card),
+      requestId,
+      expectedRevision: Number(proposal.revision || card.dataset.revision || 1)
+    };
+    const confirmation = recovering
+      ? `Recover the interrupted quantity update for ${proposal.transferOrderRef}? NetSuite will be checked before any retry.`
+      : `Update quantities on existing NetSuite order ${proposal.transferOrderRef}? This will not create a new TO, and you must print a new ticket afterward.`;
+    if (!window.confirm(confirmation)) return;
+    await runDependencyAction(recovering ? "Recovering quantity update..." : "Updating NetSuite quantities...", async () => {
+      const result = await depApi(
+        `/api/scm/transfer-dependencies/batches/${batchId}/proposals/${proposalId}/quantities`,
+        { method: "PATCH", body: JSON.stringify(payload) }
+      );
+      dependencyRevisionRequestIds.delete(String(proposalId));
+      if (dependencyBatchViewIsCurrent(batchId, salesOrderId)) dependencyState.batch = result.batch;
+      dependencyState.notice = result.recovered
+        ? `${proposal.transferOrderRef} quantity update was recovered and verified. Print a new source-yard ticket.`
+        : `${proposal.transferOrderRef} quantities were updated and verified. Print a new source-yard ticket.`;
+      await loadDependencyCandidates({ preserveSelection: true, refreshInventory: false });
+    }, { scope: `proposal:${proposalId}` });
     return;
   }
   if (action === "approve-print") {
     if (!dependencyState.batch) return;
+    const batchId = Number(dependencyState.batch.id);
+    const salesOrderId = dependencyState.selectedSalesOrderId;
     const proposalId = Number(target.dataset.proposalId);
     const proposal = dependencyState.batch.proposals.find((row) => Number(row.id) === proposalId);
     if (!proposal) return;
+    const reprint = proposal.printJob?.status === "printed";
+    const printRequestId = dependencyPrintRequestIds.get(String(proposalId))
+      || dependencyRequestId(`transfer-dependency-print:${proposalId}`);
+    dependencyPrintRequestIds.set(String(proposalId), printRequestId);
     const prompt = proposal.printJob && ["failed", "uncertain"].includes(proposal.printJob.status)
       ? `Requeue ${proposal.transferOrderRef} picking ticket to the ${proposal.fromLocation} printer?`
+      : reprint
+        ? `Verify current quantities and print a new ${proposal.transferOrderRef} picking ticket at ${proposal.fromLocation}? The earlier print remains in history.`
       : `Verify ${proposal.transferOrderRef} against the saved quantities, approve it in NetSuite, and print its picking ticket at ${proposal.fromLocation}?`;
     if (!window.confirm(prompt)) return;
     await runDependencyAction("Verifying, approving, and preparing source-yard print...", async () => {
-      const result = await depApi(`/api/scm/transfer-dependencies/batches/${dependencyState.batch.id}/proposals/${proposalId}/approve-print`, { method: "POST", body: "{}" });
-      dependencyState.batch = result.batch;
+      const result = await depApi(`/api/scm/transfer-dependencies/batches/${batchId}/proposals/${proposalId}/approve-print`, {
+        method: "POST",
+        body: JSON.stringify({
+          reprint,
+          requestId: printRequestId
+        })
+      });
+      dependencyPrintRequestIds.delete(String(proposalId));
+      if (dependencyBatchViewIsCurrent(batchId, salesOrderId)) dependencyState.batch = result.batch;
       dependencyState.notice = result.printJob?.status === "printed"
-        ? `${proposal.transferOrderRef} was approved and printed.`
+        ? `${proposal.transferOrderRef} was ${reprint ? "reprinted" : "approved and printed"}.`
         : `${proposal.transferOrderRef} was approved; its picking ticket is ${result.printJob?.status || "queued"} at ${proposal.fromLocation}.`;
       await loadDependencyCandidates({ preserveSelection: true, refreshInventory: false });
-    });
+    }, { scope: `proposal:${proposalId}` });
     return;
   }
   if (action === "confirm-proposal") {
@@ -1238,15 +1385,18 @@ scmDependencyApp.addEventListener("click", async (event) => {
       ? "Recover the Transfer Order already created by the interrupted request? This will not create a duplicate if the existing order is found."
       : "Create this Transfer Order in NetSuite? A successful order cannot be rolled back from this screen.";
     if (!window.confirm(confirmation)) return;
+    const batchId = Number(dependencyState.batch.id);
+    const salesOrderId = dependencyState.selectedSalesOrderId;
     await runDependencyAction(recovering ? "Recovering NetSuite Transfer Order..." : "Creating NetSuite Transfer Order...", async () => {
       if (payload) {
-        dependencyState.batch = await depApi(`/api/scm/transfer-dependencies/batches/${dependencyState.batch.id}`, {
+        const savedBatch = await depApi(`/api/scm/transfer-dependencies/batches/${batchId}`, {
           method: "PUT",
           body: JSON.stringify(payload)
         });
+        if (dependencyBatchViewIsCurrent(batchId, salesOrderId)) dependencyState.batch = savedBatch;
       }
-      const result = await depApi(`/api/scm/transfer-dependencies/batches/${dependencyState.batch.id}/proposals/${proposalId}/confirm`, { method: "POST", body: "{}" });
-      dependencyState.batch = result.batch;
+      const result = await depApi(`/api/scm/transfer-dependencies/batches/${batchId}/proposals/${proposalId}/confirm`, { method: "POST", body: "{}" });
+      if (dependencyBatchViewIsCurrent(batchId, salesOrderId)) dependencyState.batch = result.batch;
       const createdCount = result.results.filter((entry) => entry.status === "created").length;
       const attentionCount = result.results.filter((entry) => entry.status === "attention").length;
       const failedCount = result.results.filter((entry) => entry.status === "failed").length;
@@ -1265,7 +1415,7 @@ scmDependencyApp.addEventListener("click", async (event) => {
         dependencyState.mobilePanel = "proposals";
       }
       await loadDependencyCandidates({ preserveSelection: true, refreshInventory: false });
-    });
+    }, { scope: `proposal:${proposalId}` });
     return;
   }
 });

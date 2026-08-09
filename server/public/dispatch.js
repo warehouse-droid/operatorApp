@@ -2212,13 +2212,20 @@ function isReviewOnlyOrder(order = {}) {
 }
 
 function reviewOnlyText(order = {}) {
+  const groupedReconciliationStatus = order.childOrders?.length
+    ? String(order.reconciliationApplicationStatus || "").trim()
+    : "";
+  if (groupedReconciliationStatus) return groupedReconciliationStatus;
   const localStatus = String(order.localYardOrderStatus || order.operatorStatus || "").trim();
   const statusText = String(order.netsuiteStatusText || order.raw?.status_text || "").replace(/^(Sales Order|Transfer Order|Purchase Order)\s*:\s*/i, "").trim();
   return localStatus || statusText || "Review only";
 }
 
 function isScmReconciliationBlocked(order = {}) {
-  return ["PO", "TO"].includes(String(order.type || "").toUpperCase())
+  const type = String(order.type || "").toUpperCase();
+  const supportedOrder = ["PO", "TO"].includes(type)
+    || (type === "SO" && Array.isArray(order.childOrders) && order.childOrders.length > 0);
+  return supportedOrder
     && (
       order.reconciliationBlocked === true
       || String(order.reconciliationStatus || "").toLowerCase() === "review"
@@ -2230,7 +2237,7 @@ function scmReconciliationBlockText(order = {}) {
   return String(
     order.reconciliationReason
       || order.scm?.reconciliationReason
-      || "Resolve this PO/TO in NetSuite Reconcile Review before changing its plan."
+      || "Resolve this grouped order in NetSuite Reconcile Review before changing its plan."
   ).trim();
 }
 
@@ -5329,6 +5336,21 @@ async function savePlanToServer(payload, { retryOnStale = true, forceSave = fals
       return { failed: true, error };
     }
     const responsePayload = await response.json();
+    if (responsePayload?.applied === false && responsePayload?.recoveryDraft) {
+      localPlanDirty = true;
+      const firstIssue = responsePayload.validationIssues?.[0];
+      const issueMessage = String(firstIssue?.message || "The submitted plan needs correction.");
+      routeNotice = `Draft backed up separately, but not applied to the active plan: ${issueMessage}`;
+      render({ save: false });
+      return {
+        blocked: true,
+        recoverySaved: true,
+        code: responsePayload.code || "DISPATCH_PLAN_RECOVERY_SAVED",
+        recoveryDraft: responsePayload.recoveryDraft,
+        validationIssues: responsePayload.validationIssues || [],
+        error: routeNotice
+      };
+    }
     const result = incrementalSave ? responsePayload.plan : responsePayload;
     if (!result?.id) throw new Error("The server did not acknowledge the saved Dispatch plan.");
     const saveTargetsCurrentView = String(currentPlan?.id || "") === String(targetPlanId)
@@ -5717,20 +5739,27 @@ async function saveCurrentPlanNow({ forceSave = false } = {}) {
   const result = joinsCurrentGeneration
     ? await saveFlushPromise
     : await flushPlanSaveQueue();
+  if (result?.recoverySaved) return result;
   if (result?.failed || result?.blocked) {
     throw result.error instanceof Error ? result.error : new Error(result.error || routeNotice || "Dispatch plan save failed.");
   }
   if (localPlanDirty) {
     throw new Error(routeNotice || "Latest dispatch plan changes were not saved.");
   }
+  return result;
 }
 
 async function forceSaveCurrentPlan() {
   if (!ensureDispatchPlanEditor()) throw new Error(dispatchEditModeMessage());
   if (!currentPlan?.id) throw new Error("Dispatch plan is not loaded.");
-  await saveCurrentPlanNow({ forceSave: true });
+  const result = await saveCurrentPlanNow({ forceSave: true });
+  if (result?.recoverySaved) {
+    render({ save: false });
+    return result;
+  }
   if (!routeNotice.startsWith("Plan saved, but")) routeNotice = "Plan saved.";
   render({ save: false });
+  return result;
 }
 
 async function dispatchErrorMessage(response) {
@@ -5747,7 +5776,12 @@ async function confirmCurrentPlanAtomic() {
   if (!ensureDispatchPlanEditor()) throw new Error(dispatchEditModeMessage());
   if (!currentPlan?.id) throw new Error("Dispatch plan is not loaded.");
   clearTimeout(saveTimer);
-  await saveCurrentPlanNow();
+  const saveResult = await saveCurrentPlanNow();
+  if (saveResult?.recoverySaved) {
+    const error = new Error(routeNotice || "The latest draft was backed up but not applied. Fix it before confirming.");
+    error.code = "DISPATCH_PLAN_RECOVERY_PENDING";
+    throw error;
+  }
   saveQueued = false;
   const savedAt = new Date();
   const payload = planPayload(savedAt);
@@ -11711,21 +11745,8 @@ function groupedOrderDependencyStructureBlockMessage(groupItems = []) {
       || "this Sales Order"
     );
     const mode = String(dependency.mode || "");
-    const status = String(dependency.status || "active").toLowerCase();
-    const targetKind = String(dependency.dispatchTargetKind || "normal").toLowerCase();
-    const hasExecutionProgress = (dependency.lines || []).some((line) =>
-      Number(line.loadedQuantity ?? line.loaded_quantity ?? 0) > 0
-      || Number(line.deliveredQuantity ?? line.delivered_quantity ?? 0) > 0
-      || Number(line.locallyReceivedQuantity ?? line.locally_received_quantity ?? 0) > 0
-    );
     if (mode !== "yard_replenishment") {
       return `Cannot group ${salesRef}: ${transferRef} is a direct-pickup dependency. Change or unlink it first.`;
-    }
-    if (hasExecutionProgress) {
-      return `Cannot group ${salesRef}: processing has already started for ${transferRef}.`;
-    }
-    if (!["active", "attention"].includes(status) || targetKind !== "normal") {
-      return `Cannot group ${salesRef}: its dependency on ${transferRef} cannot be moved into a new group.`;
     }
   }
   return "";

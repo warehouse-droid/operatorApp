@@ -10,6 +10,7 @@ const migration = read("migrations/098_smart_scm_vendor_workflows.sql");
 const emailRecipientMigration = read("migrations/100_smart_scm_vendor_email_recipient.sql");
 const repository = read("src/smart-scm-vendor-workflow-repository.js");
 const vendorCodeService = read("src/smart-scm-vendor-code-service.js");
+const server = read("src/server.js");
 const ui = read("public/scm-smart-vendor.js");
 const css = read("public/scm-smart-vendor.css");
 
@@ -73,6 +74,30 @@ assert.match(repository, /WHEN \$6 = 'released' THEN 'split_created'/,
 assert.match(repository, /archived_at = CASE WHEN \$7 THEN COALESCE\(archived_at, now\(\)\) ELSE NULL END/,
   "Only terminal Blanket releases must leave Vendor Replies automatically.");
 
+const regularPurchaseRouteStart = server.indexOf('app.post("/api/scm/smart/vendor-workflows/:id/create-purchase-order"');
+const blanketSplitRouteStart = server.indexOf('app.post("/api/scm/smart/vendor-workflows/:id/create-blanket-split"');
+const archiveRouteStart = server.indexOf('app.patch("/api/scm/smart/vendor-workflows/:id/archive"');
+assert(regularPurchaseRouteStart >= 0 && blanketSplitRouteStart > regularPurchaseRouteStart,
+  "The regular NetSuite PO and local Blanket split routes must both exist.");
+assert(archiveRouteStart > blanketSplitRouteStart,
+  "The local Blanket split route must have a bounded server route block.");
+const regularPurchaseRoute = server.slice(regularPurchaseRouteStart, blanketSplitRouteStart);
+const blanketSplitRoute = server.slice(blanketSplitRouteStart, archiveRouteStart);
+assert.match(regularPurchaseRoute, /target\.workflowKind !== "regular_po"/,
+  "The server must reject a Blanket workflow before any NetSuite PO execution.");
+assert(regularPurchaseRoute.indexOf('target.workflowKind !== "regular_po"')
+  < regularPurchaseRoute.indexOf("executeSmartScmPurchaseProposal"),
+  "The origin guard must run before the NetSuite purchase service is called.");
+assert.match(regularPurchaseRoute, /executeSmartScmPurchaseProposal/,
+  "A regular PO proposal must retain its explicit NetSuite creation path.");
+assert.match(blanketSplitRoute, /target\.workflowKind !== "blanket_po"/,
+  "Only Blanket workflows may use the local split endpoint.");
+assert.match(blanketSplitRoute, /finalizeSmartScmBlanketVendorWorkflow/,
+  "Blanket vendor confirmation must finalize against the local source-PO ledger.");
+assert.doesNotMatch(blanketSplitRoute,
+  /executeSmartScmPurchaseProposal|registerScmNetSuitePoHistoryCreation|createPurchaseOrderInNetSuite/,
+  "A Blanket split must never call NetSuite PO creation or register NetSuite PO history.");
+
 const listeners = new Map();
 const context = vm.createContext({
   console,
@@ -128,6 +153,10 @@ assert.match(regularHtml, /smart-vendor-card-facts/);
 assert.doesNotMatch(regularHtml, /smart-proposal-head/,
   "Vendor cards must not inherit the generic proposal header grid.");
 assert.match(regularHtml, /data-smart-action="create-vendor-po"/);
+assert.doesNotMatch(regularHtml, /data-smart-action="create-blanket-split"/,
+  "A regular proposal must not expose the local Blanket split action.");
+assert.match(regularHtml, /data-smart-action="toggle-vendor-email"/,
+  "A regular proposal must support drafting the vendor email.");
 assert.doesNotMatch(regularHtml, /data-vendor-email-editor/,
   "The email draft must be a popup, not an inline section that expands the load card.");
 assert.ok(regularHtml.indexOf('data-smart-action="save-vendor-load"') < regularHtml.indexOf('data-smart-action="toggle-vendor-email"'),
@@ -190,9 +219,33 @@ const blanketHtml = context.smartVendorLoadCard({
   sourcePurchaseOrderRef: "PO-BLANKET-1"
 });
 assert.match(blanketHtml, /data-smart-action="create-blanket-split"/);
+assert.doesNotMatch(blanketHtml, /data-smart-action="create-vendor-po"/,
+  "A Blanket release must not expose NetSuite PO creation.");
+assert.match(blanketHtml, /data-smart-action="toggle-vendor-email"/,
+  "A Blanket release must support drafting the vendor email while awaiting confirmation.");
 assert.match(blanketHtml, /data-vendor-load-field="splitPoRef"/);
 assert.match(blanketHtml, /same source PO and its remaining quantity/);
 assert.match(blanketHtml, /data-destination-location-id="1"/);
+
+const blanketEmailProposal = {
+  ...base,
+  workflowId: 903,
+  workflowKind: "blanket_po",
+  sourcePurchaseOrderRef: "PO-BLANKET-1"
+};
+context.smartState.vendorReplyLoads = [blanketEmailProposal];
+context.__openSmartVendorEmail(903);
+const blanketEmailHtml = context.smartVendorEmailModal();
+assert.match(blanketEmailHtml, /Source PO[^<]*PO-BLANKET-1/,
+  "A Blanket email draft must visibly identify its source PO.");
+const blanketEmailContent = context.smartVendorEmailContent({
+  ...liveEditor,
+  dataset: { vendorEmailSourcePo: "PO-BLANKET-1" }
+});
+assert.match(blanketEmailContent.html, /Source PO[^<]*<\/strong>[^<]*PO-BLANKET-1/,
+  "Copied rich Blanket email content must include its source PO.");
+assert.match(blanketEmailContent.plain, /Source PO:\s*PO-BLANKET-1/,
+  "Gmail and plain-text Blanket email content must include its source PO.");
 
 const blanketAlternativeHtml = context.smartVendorAlternativeMarkup(501, [{
   sourceLineId: 70001,

@@ -9,6 +9,8 @@ const prefix = `VISIBILITY-${seed}`;
 const password = "Rollback123";
 const baseId = -(800000000000000 + Number(seed.slice(-9)) * 20);
 const staleHoldId = Math.abs(baseId) + 1000;
+const staleReconciliationHoldId = Math.abs(baseId) + 2000;
+const staleReconciliationCompletedId = Math.abs(baseId) + 3000;
 const vendorId = 700000000 + Number(seed.slice(-7));
 const itemId = 600000000 + Number(seed.slice(-7));
 
@@ -24,6 +26,24 @@ const purchaseFixtures = [
     status: "Hold",
     initialStatus: "Hold",
     scheduleStatus: "Hold"
+  },
+  {
+    id: staleReconciliationHoldId,
+    ref: `${prefix}-PO-MANUAL-QUEUED-STALE-HOLD`,
+    status: "Queued",
+    initialStatus: "Hold",
+    scheduleStatus: "Queued",
+    reconciliationStatus: "Hold",
+    reconciliationFamilyStatus: "Queued"
+  },
+  {
+    id: staleReconciliationCompletedId,
+    ref: `${prefix}-PO-MANUAL-QUEUED-COMPLETED`,
+    status: "Queued",
+    initialStatus: "Hold",
+    scheduleStatus: "Queued",
+    reconciliationStatus: "Completed",
+    reconciliationFamilyStatus: "Completed"
   },
   {
     id: baseId - 6,
@@ -55,7 +75,9 @@ const transferFixtures = [
 const allFixtures = [...purchaseFixtures, ...transferFixtures];
 const restrictedRefs = new Set(
   allFixtures
-    .filter((fixture) => fixture.blanket || (
+    .filter((fixture) => fixture.blanket
+      || ["Complete", "Completed"].includes(fixture.reconciliationStatus)
+      || (
       !fixture.scheduleStatus
       && ["Hold", "Completed", "Cancelled"].includes(fixture.initialStatus || fixture.status)
     ) || ["Hold", "Completed", "Cancelled"].includes(fixture.scheduleStatus))
@@ -286,31 +308,56 @@ try {
     await insertTransferFixture(fixture, index);
   }
   const staleHoldRef = `${prefix}-PO-STALE-RECON-HOLD`;
-  await query(
-    `INSERT INTO scm_reconciliation_order_state (
-       order_kind, source_order_netsuite_id, source_order_ref,
-       application_status, reconciliation_status, reconciliation_source,
-       ordered_qty, remaining_qty, quantity_summary, reconciled_at
-     ) VALUES (
-       'PO', $1, $2,
-       'Queued', 'ok', 'manual',
-       10, 10, $3::jsonb, now() - interval '10 minutes'
-     )`,
-    [
-      staleHoldId,
-      staleHoldRef,
-      JSON.stringify({
-        family: { ordered: 10, remaining: 10, applicationStatus: "Queued" },
-        targets: {
-          [staleHoldRef]: {
-            ordered: 10,
-            remaining: 10,
-            applicationStatus: "Queued"
+  const staleReconciliationHoldRef = `${prefix}-PO-MANUAL-QUEUED-STALE-HOLD`;
+  const staleReconciliationCompletedRef = `${prefix}-PO-MANUAL-QUEUED-COMPLETED`;
+  const reconciliationFixtures = [
+    {
+      id: staleHoldId,
+      ref: staleHoldRef,
+      familyStatus: "Queued",
+      targetStatus: "Queued"
+    },
+    {
+      id: staleReconciliationHoldId,
+      ref: staleReconciliationHoldRef,
+      familyStatus: "Queued",
+      targetStatus: "Hold"
+    },
+    {
+      id: staleReconciliationCompletedId,
+      ref: staleReconciliationCompletedRef,
+      familyStatus: "Completed",
+      targetStatus: "Completed"
+    }
+  ];
+  for (const fixture of reconciliationFixtures) {
+    await query(
+      `INSERT INTO scm_reconciliation_order_state (
+         order_kind, source_order_netsuite_id, source_order_ref,
+         application_status, reconciliation_status, reconciliation_source,
+         ordered_qty, remaining_qty, quantity_summary, reconciled_at
+       ) VALUES (
+         'PO', $1, $2,
+         $3, 'ok', 'manual',
+         10, 10, $4::jsonb, now() - interval '10 minutes'
+       )`,
+      [
+        fixture.id,
+        fixture.ref,
+        fixture.familyStatus,
+        JSON.stringify({
+          family: { ordered: 10, remaining: 10, applicationStatus: fixture.familyStatus },
+          targets: {
+            [fixture.ref]: {
+              ordered: 10,
+              remaining: 10,
+              applicationStatus: fixture.targetStatus
+            }
           }
-        }
-      })
-    ]
-  );
+        })
+      ]
+    );
+  }
 
   const accountSpecs = [
     { key: "dispatcher", role: "dispatcher", yardLocationIds: [] },
@@ -455,6 +502,33 @@ try {
   assert.equal(staleHoldRow.scm?.status, "Hold",
     "A newer saved Hold must override an older Queued reconciliation snapshot on PO Split.");
 
+  const staleReconciliationHoldResponse = await requestJson(
+    baseUrl,
+    `/api/dispatch/scm/purchase-orders?search=${encodeURIComponent(staleReconciliationHoldRef)}`,
+    { token: tokens.scm }
+  );
+  assert.equal(staleReconciliationHoldResponse.response.status, 200,
+    "SCM PO Split stale-Hold source request should succeed.");
+  const staleReconciliationHoldRow = fixtureRows(staleReconciliationHoldResponse.payload)
+    .find((row) => String(row.id) === staleReconciliationHoldRef);
+  assert(staleReconciliationHoldRow,
+    "A PO with a newer manual Queued status must remain visible despite an older reconciliation Hold.");
+  assert.equal(staleReconciliationHoldRow.scm?.status, "Queued",
+    "A newer manual Queued status must override an older reconciliation Hold.");
+
+  const completedResponse = await requestJson(
+    baseUrl,
+    `/api/dispatch/scm/purchase-orders?search=${encodeURIComponent(staleReconciliationCompletedRef)}`,
+    { token: tokens.scm }
+  );
+  assert.equal(completedResponse.response.status, 200,
+    "SCM PO Split completed source request should succeed.");
+  const completedRow = fixtureRows(completedResponse.payload)
+    .find((row) => String(row.id) === staleReconciliationCompletedRef);
+  assert(completedRow, "SCM must retain access to the completed reconciliation fixture.");
+  assert.equal(completedRow.scm?.status, "Completed",
+    "Completed reconciliation must remain terminal despite a newer manual Queued status.");
+
   console.log("SCM restricted-order DB/API integration harness passed.");
 } finally {
   if (server) {
@@ -465,8 +539,8 @@ try {
   const transferIds = transferFixtures.map((fixture) => fixture.id);
   const refs = allFixtures.map((fixture) => fixture.ref);
   await query(
-    "DELETE FROM scm_reconciliation_order_state WHERE order_kind = 'PO' AND source_order_netsuite_id = $1",
-    [staleHoldId]
+    "DELETE FROM scm_reconciliation_order_state WHERE order_kind = 'PO' AND source_order_netsuite_id = ANY($1::bigint[])",
+    [[staleHoldId, staleReconciliationHoldId, staleReconciliationCompletedId]]
   ).catch(() => null);
   await query("DELETE FROM scm_transport_schedule WHERE order_ref = ANY($1::text[])", [refs]).catch(() => null);
   await query("DELETE FROM transfer_order_lines WHERE transfer_order_id = ANY($1::bigint[])", [transferIds]).catch(() => null);

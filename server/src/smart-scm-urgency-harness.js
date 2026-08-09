@@ -1,9 +1,53 @@
 import assert from "node:assert/strict";
 import {
+  calculatePolicyState,
   classifySmartScmUrgency,
   smartScmPackWholePalletLines,
   smartScmUrgencySummary
 } from "./smart-scm-planning-repository.js";
+
+const zeroAvailableShortage = calculatePolicyState({
+  item_id: 999001,
+  item_name: "ZERO-AVAILABLE-URGENCY",
+  location_id: 1,
+  yard_code: "3445",
+  stock_unit: "EA",
+  to_plt: 10,
+  pallet_weight_lbs: 1000,
+  capacity_pallets: 25,
+  minimum_safety_pallets: 1,
+  effective_lead_time_days: 7,
+  service_quantile: 0.9
+}, {
+  authoritative_model: "formula",
+  formula_weekly_demand: 5,
+  baseline_weekly: 5,
+  formula_weekly_sd: 0
+}, {
+  balanceMap: new Map([["999001:1", {
+    quantity_on_hand: 0,
+    quantity_available: 0,
+    quantity_on_order: 58,
+    quantity_backordered: 0
+  }]]),
+  blanketExcludedMap: new Map(),
+  excludedTransferOrderMap: new Map(),
+  reservedBlanketMap: new Map(),
+  outboundReservationMap: new Map(),
+  inboundReservationMap: new Map()
+}, 1, {
+  pickup_safety_factor: 1.3,
+  delivery_safety_factor: 1.645
+});
+assert.equal(zeroAvailableShortage.availablePallets, 0);
+assert.equal(zeroAvailableShortage.positionPallets, 5.8);
+assert.equal(zeroAvailableShortage.rop, 6);
+assert.equal(zeroAvailableShortage.requiredPallets, 6);
+assert.equal(
+  zeroAvailableShortage.urgent,
+  true,
+  "Zero available stock with a positive calculated need must always be urgent, even when inbound raises projected position."
+);
 
 function state(locationId, weeklyDemand, { urgent = true, availableSales = 0 } = {}) {
   return {

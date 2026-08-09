@@ -35,6 +35,7 @@ let server = null;
 let testPrintJobId = null;
 let testPrintPath = "";
 let originalPublicSalesSettings = null;
+let specialOrderId = null;
 
 async function requestJson(baseUrl, path, { method = "GET", token = "", body = null, headers = {} } = {}) {
   const response = await fetch(`${baseUrl}${path}`, {
@@ -152,6 +153,44 @@ try {
   assert.deepEqual(login.payload.operator.yardLocationIds, [1]);
   const token = login.payload.token;
 
+  specialOrderId = 9750000000 + Number(String(runId).slice(-7));
+  const specialOrderRef = `SOBSP${String(runId).slice(-9)}`;
+  await query(
+    `INSERT INTO sales_orders (
+       netsuite_id, tranid, trandate, customer, status, status_text,
+       outbound_location_id, outbound_location, sales_order_type, netsuite_active
+     ) VALUES ($1, $2, CURRENT_DATE, 'MBBS-Special Print Harness', 'B',
+       'Sales Order : Pending Fulfillment', 15, '12441', 'Delivery', true)`,
+    [specialOrderId, specialOrderRef]
+  );
+  await query(
+    `INSERT INTO sales_order_lines (
+       sales_order_id, line_id, item_id, item_name, sku, item_description,
+       item_type, item_type_text, quantity, unit, location_id, location, netsuite_active
+     ) VALUES
+       ($1, $2, 2055, 'MBBS-Special Order', 'MBBS-Special Order', 'Custom coping',
+        'NonInvtPart', 'Non-inventory Item', 22, 'PC', 15, '12441', true),
+       ($1, $3, 1987, 'Delivery Charge', 'Delivery Charge', '',
+        'OthCharge', 'Other Charge', 1, '', 15, '12441', true)`,
+    [specialOrderId, specialOrderId + 1, specialOrderId + 2]
+  );
+  const specialCandidates = await listSalesOrderPrintCandidates({
+    search: specialOrderRef,
+    orderingLocationIds: [1],
+    limit: 20
+  });
+  assert.equal(specialCandidates.length, 1, "A Delivery Sales Order containing MBBS-Special must appear in Sales Printing.");
+  assert.deepEqual(specialCandidates[0].lineYards.map((yard) => yard.locationId), [15],
+    "MBBS-Special must route its picking ticket to the product line yard.");
+  assert.deepEqual(specialCandidates[0].itemLines.map((line) => line.itemName), ["MBBS-Special Order"],
+    "Charges must remain excluded from printable product details and yard routing.");
+  const specialCandidate = await getSalesOrderPrintCandidate({
+    orderId: specialOrderId,
+    allowedOrderingLocationIds: [1]
+  });
+  assert.equal(specialCandidate.orderRef, specialOrderRef,
+    "MBBS-Special must remain eligible when Sales Printing reloads it for preview or history.");
+
   const publicInOutbound = await requestJson(
     baseUrl,
     "/api/sales/in-outbound-records?from=2000-01-01&to=2099-12-31&yard=all"
@@ -247,7 +286,7 @@ try {
            WHERE line.sales_order_id = so.netsuite_id
              AND line.netsuite_active = true
              AND (
-               UPPER(TRIM(COALESCE(line.item_type, ''))) IN ('INVTPART', 'KIT', 'ASSEMBLY')
+               UPPER(TRIM(COALESCE(line.item_type, ''))) IN ('INVTPART', 'NONINVTPART', 'KIT', 'ASSEMBLY')
                OR UPPER(TRIM(COALESCE(line.item_type_text, ''))) IN (
                  'INVENTORY ITEM', 'INVTPART', 'KIT/PACKAGE', 'KIT',
                  'ASSEMBLY ITEM', 'ASSEMBLY/BILL OF MATERIALS'
@@ -452,6 +491,10 @@ try {
   if (server) await new Promise((resolve) => server.close(resolve));
   if (testPrintJobId) await query("DELETE FROM scm_print_jobs WHERE id = $1", [testPrintJobId]).catch(() => null);
   if (testPrintPath) await fs.unlink(testPrintPath).catch(() => null);
+  if (specialOrderId) {
+    await query("DELETE FROM sales_order_lines WHERE sales_order_id = $1", [specialOrderId]).catch(() => null);
+    await query("DELETE FROM sales_orders WHERE netsuite_id = $1", [specialOrderId]).catch(() => null);
+  }
   if (originalPublicSalesSettings) {
     await query(
       `UPDATE sales_portal_settings

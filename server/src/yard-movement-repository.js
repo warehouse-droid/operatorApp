@@ -1,5 +1,6 @@
 import { query } from "./db.js";
 import { salesStoreLocationIdSql } from "./sales-store.js";
+import { getActiveReloadCycleForOrder, listSalesOrderLoadAttempts } from "./sales-order-reload-repository.js";
 
 const VALID_DIRECTIONS = new Set(["inbound", "outbound"]);
 const VALID_ORDER_TYPES = new Set(["sales_order", "transfer_order", "purchase_order", "co_order", "vrma_order", "custom_order"]);
@@ -19,6 +20,19 @@ function normalizeDate(value, fallback = new Date()) {
     String(fallback.getMonth() + 1).padStart(2, "0"),
     String(fallback.getDate()).padStart(2, "0")
   ].join("-");
+}
+
+function dateKey(value) {
+  if (!value) return "";
+  const parsed = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(parsed.getTime()) ? String(value).slice(0, 10) : parsed.toISOString().slice(0, 10);
+}
+
+function attemptsWithinDates(attempts, fromDate, toDate) {
+  return (attempts || []).filter((attempt) => {
+    const key = dateKey(attempt.processedAt);
+    return key && key >= fromDate && key <= toDate;
+  });
 }
 
 function photoCountSql(arrayExpression, fallbackExpression = "''") {
@@ -802,13 +816,52 @@ export async function getYardMovementDetail({
                  photo.photo_index`,
     detailParams
   );
+  const isSalesOrderLoad = normalizedDirection === "outbound"
+    && normalizedType === "sales_order"
+    && /^\d+$/.test(String(orderId || ""));
+  const loadAttempts = isSalesOrderLoad
+    ? attemptsWithinDates(await listSalesOrderLoadAttempts(Number(orderId)), fromDate, toDate)
+    : [];
+  const activeReloadCycle = isSalesOrderLoad
+    ? await getActiveReloadCycleForOrder(Number(orderId))
+    : null;
   return {
     order: orderResult.rows[0],
     lines: lineResult.rows,
     photos: photoResult.rows,
     driverRecords: driverResult.rows,
     driverEvents: driverResult.rows,
-    driverPhotos: driverPhotoResult.rows
+    driverPhotos: driverPhotoResult.rows,
+    loadAttempts,
+    activeReloadCycle
+  };
+}
+
+function attemptCsvLine(attemptLine = {}, detailLines = []) {
+  const canonical = detailLines.find((line) => (
+    String(line.id) === String(attemptLine.salesOrderLineId || "")
+    || String(line.line_id) === String(attemptLine.lineId || "")
+    || (attemptLine.itemId && String(line.item_id) === String(attemptLine.itemId))
+  )) || {};
+  return {
+    id: attemptLine.salesOrderLineId || canonical.id || null,
+    line_id: attemptLine.lineId || canonical.line_id || null,
+    item_id: attemptLine.itemId || canonical.item_id || null,
+    item_name: attemptLine.itemName || canonical.item_name || "",
+    sku: attemptLine.sku || canonical.sku || "",
+    item_description: attemptLine.description || canonical.item_description || "",
+    processed_qty: attemptLine.loadedQty ?? attemptLine.quantity ?? attemptLine.packedSalesQty ?? 0,
+    processed_uom: attemptLine.loadedUom || attemptLine.unit || canonical.processed_uom || canonical.unit || "",
+    unit: attemptLine.unit || canonical.unit || "",
+    location: canonical.location || "",
+    to_plt: canonical.to_plt ?? null,
+    to_lyr: canonical.to_lyr ?? null,
+    to_sec: canonical.to_sec ?? null,
+    to_pcs: canonical.to_pcs ?? null,
+    processed_pallet_qty: attemptLine.packedPallets ?? 0,
+    processed_layer_qty: attemptLine.packedLayers ?? 0,
+    processed_section_qty: attemptLine.packedSections ?? 0,
+    processed_piece_qty: attemptLine.packedPieces ?? 0
   };
 }
 
@@ -842,6 +895,32 @@ export async function listYardMovementCsvRows(filters = {}) {
       yard_photo_count: order.yard_photo_count,
       driver_photo_count: order.driver_photo_count
     };
+    const loadAttempts = detail?.loadAttempts || [];
+    if (order.direction === "outbound" && order.order_type === "sales_order" && loadAttempts.length) {
+      for (const attempt of loadAttempts) {
+        const attemptCommon = {
+          ...common,
+          processed_at: attempt.processedAt,
+          yard_photo_count: attempt.photos.length,
+          attempt_id: attempt.id,
+          attempt_kind: attempt.attemptKind,
+          attempt_cycle_number: attempt.cycleNumber,
+          attempt_reason: attempt.reason,
+          attempt_operator: attempt.operatorName || attempt.operatorId || "",
+          attempt_authorized_by: attempt.authorizedByName || attempt.authorizedBy || "",
+          attempt_quantity_basis: attempt.quantityBasis,
+          attempt_processed_at: attempt.processedAt
+        };
+        if (!attempt.attemptLines.length) {
+          rows.push(attemptCommon);
+          continue;
+        }
+        for (const line of attempt.attemptLines) {
+          rows.push({ ...attemptCommon, ...attemptCsvLine(line, detail?.lines || []) });
+        }
+      }
+      continue;
+    }
     const lines = detail?.lines || [];
     if (!lines.length) {
       rows.push(common);

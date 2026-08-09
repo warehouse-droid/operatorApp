@@ -395,8 +395,8 @@ assert(apiCalls.some((call) => String(call.url).startsWith("/api/scm/smart/vendo
   "Removing a vendor load must refresh the cross-plan queue.");
 
 const html = readPublic("scm-smart.html");
-assert.match(html, /scm-smart-vendor\.css\?v=20260801-vendor-email-location-v3/);
-assert.match(html, /scm-smart-vendor\.js\?v=20260801-manual-over-capacity-v1/);
+assert.match(html, /scm-smart-vendor\.css\?v=20260807-blanket-source-po-v1/);
+assert.match(html, /scm-smart-vendor\.js\?v=20260807-blanket-source-po-v1/);
 
 console.log(JSON.stringify({
   ok: true,

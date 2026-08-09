@@ -540,6 +540,7 @@ export async function pruneExpiredDispatchV2Checkpoints({ retentionDays = 7, bat
        SELECT id
          FROM dispatch_plan_snapshot_history
         WHERE archived_at < now() - ($1::text || ' days')::interval
+          AND archive_reason <> 'save_recovery'
         ORDER BY archived_at, id
         LIMIT $2
      )

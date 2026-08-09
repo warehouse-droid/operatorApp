@@ -387,9 +387,13 @@ async function itemMetadataForLines(lines = [], { vendorId = null } = {}) {
 
 function defaultEmailDraft(source, workflow) {
   const vendor = text(source?.vendor || source?.sourceName) || "Vendor";
+  const sourcePoRef = workflow.workflowKind === "blanket_po"
+    ? text(workflow.sourcePurchaseOrderRef)
+    : "";
+  const sourcePoLabel = sourcePoRef ? ` - Source PO ${sourcePoRef}` : "";
   return {
     to: workflow.emailTo || "",
-    subject: workflow.emailSubject || `Purchase order request - ${vendor} - Load #${workflow.sourceProposalId}`,
+    subject: workflow.emailSubject || `Purchase order request - ${vendor}${sourcePoLabel} - Load #${workflow.sourceProposalId}`,
     intro: workflow.emailIntro || "Hello,\n\nPlease review the requested items below and confirm availability and ready date.",
     closing: workflow.emailClosing || "Thank you,"
   };

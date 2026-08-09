@@ -4,6 +4,7 @@ import {
   getSmartScmProposal,
   listSmartScmProposals,
   recordSmartScmVendorResponses,
+  smartScmInventoryPositionSales,
   smartScmNormalizePalletQuantityOverrides,
   smartScmPalletQuantityOverridePatch,
   setSmartScmPalletQuantityOverride,
@@ -974,32 +975,37 @@ async function smartScmAlternativeEvidence(rows = [], destinationLocationId) {
       ORDER BY item_id, run_id DESC`,
     [itemIds, destinationLocationId]
   );
-  const inbound = await query(
-    `WITH open_po AS (
-         SELECT l.item_id, SUM(GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_qty, 0), 0)) AS quantity
-           FROM purchase_order_lines l JOIN purchase_orders o ON o.netsuite_id = l.purchase_order_id
-          WHERE l.netsuite_active = true AND o.netsuite_active = true
-            AND l.item_id = ANY($1::bigint[]) AND COALESCE(l.location_id, o.destination_location_id) = $2
-          GROUP BY l.item_id
-       ), open_to AS (
-         SELECT l.item_id, SUM(GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_qty, 0), 0)) AS quantity
-           FROM transfer_order_lines l JOIN transfer_orders o ON o.netsuite_id = l.transfer_order_id
-          WHERE l.line_stage = 'receiving' AND l.netsuite_active = true AND o.netsuite_active = true
-            AND l.item_id = ANY($1::bigint[]) AND o.to_location_id = $2
-          GROUP BY l.item_id
-       )
-       SELECT item_id, SUM(quantity) AS quantity FROM (
-         SELECT * FROM open_po UNION ALL SELECT * FROM open_to
-       ) source GROUP BY item_id`,
-    [itemIds, destinationLocationId]
-  );
-  const backorders = await query(
-    `SELECT l.item_id, SUM(GREATEST(COALESCE(l.netsuite_backordered_qty, 0), 0)) AS quantity
-       FROM sales_order_lines l JOIN sales_orders o ON o.netsuite_id = l.sales_order_id
-      WHERE l.netsuite_active = true AND o.netsuite_active = true
-        AND l.item_id = ANY($1::bigint[])
-        AND COALESCE(l.location_id, o.outbound_location_id, o.order_location_id) = $2
-      GROUP BY l.item_id`,
+  const adjustments = await query(
+    `SELECT requested.item_id,
+            COALESCE((
+              SELECT SUM(GREATEST(COALESCE(line.quantity, 0) - COALESCE(line.netsuite_received_qty, 0), 0))
+                FROM purchase_order_lines line
+                JOIN purchase_orders po ON po.netsuite_id = line.purchase_order_id
+               WHERE line.item_id = requested.item_id
+                 AND COALESCE(line.location_id, po.destination_location_id) = $2
+                 AND line.netsuite_active = true
+                 AND po.netsuite_active = true
+                 AND po.is_blanket_po = true
+                 AND NOT COALESCE(line.netsuite_closed, false)
+                 AND (po.status_text ILIKE '%Pending Receipt%' OR po.status_text ILIKE '%Partially Received%')
+                 AND NOT EXISTS (
+                   SELECT 1
+                     FROM dispatch_scm_po_splits child_split
+                    WHERE child_split.split_po_id = po.netsuite_id
+                 )
+            ), 0) AS blanket_excluded,
+            COALESCE((
+              SELECT SUM(CASE
+                WHEN allocation.status = 'reserved' THEN allocation.reserved_sales_qty
+                WHEN allocation.status = 'held' THEN allocation.held_sales_qty
+                ELSE 0
+              END)
+                FROM scm_smart_blanket_allocations allocation
+               WHERE allocation.item_id = requested.item_id
+                 AND allocation.destination_location_id = $2
+                 AND allocation.status IN ('reserved', 'held')
+            ), 0) AS blanket_reserved
+       FROM unnest($1::bigint[]) AS requested(item_id)`,
     [itemIds, destinationLocationId]
   );
   const reservations = await query(
@@ -1014,18 +1020,28 @@ async function smartScmAlternativeEvidence(rows = [], destinationLocationId) {
   const settings = await settingsRow();
   const minimumOrders = await smartScmMinimumOrderMap(rows);
   const forecastByItem = new Map(forecasts.rows.map((row) => [Number(row.item_id), row]));
-  const inboundByItem = new Map(inbound.rows.map((row) => [Number(row.item_id), positive(row.quantity)]));
-  const backorderByItem = new Map(backorders.rows.map((row) => [Number(row.item_id), positive(row.quantity)]));
+  const adjustmentByItem = new Map(adjustments.rows.map((row) => [Number(row.item_id), row]));
   const reservationByItem = new Map(reservations.rows.map((row) => [Number(row.item_id), row]));
   return new Map(rows.map((row) => {
     const itemId = Number(row.item_id);
     const toPlt = positive(row.to_plt);
     const quantityAvailable = positive(row.quantity_available);
-    const quantityOnOrder = positive(inboundByItem.get(itemId)) + positive(reservationByItem.get(itemId)?.inbound_quantity);
-    const quantityBackordered = positive(backorderByItem.get(itemId));
-    const quantityReservedOutbound = positive(reservationByItem.get(itemId)?.outbound_quantity);
+    const adjustment = adjustmentByItem.get(itemId) || {};
+    const reservation = reservationByItem.get(itemId) || {};
+    const position = smartScmInventoryPositionSales({
+      quantityAvailableSales: quantityAvailable,
+      authoritativeOnOrderSales: row.quantity_on_order,
+      blanketExcludedSales: adjustment.blanket_excluded,
+      reservedBlanketSales: adjustment.blanket_reserved,
+      pendingTransferReservationSales: reservation.inbound_quantity,
+      quantityBackorderedSales: row.quantity_backordered,
+      reservedOutboundSales: reservation.outbound_quantity
+    });
+    const quantityOnOrder = position.effectiveOnOrderSales;
+    const quantityBackordered = position.quantityBackorderedSales;
+    const quantityReservedOutbound = position.reservedOutboundSales;
     const positionPallets = toPlt > EPSILON
-      ? (quantityAvailable + quantityOnOrder - quantityBackordered - quantityReservedOutbound) / toPlt
+      ? position.inventoryPositionSales / toPlt
       : 0;
     const forecast = forecastByItem.get(itemId) || null;
     const levels = calculateSmartScmPolicyLevels(row, forecast, settings);
@@ -1045,6 +1061,10 @@ async function smartScmAlternativeEvidence(rows = [], destinationLocationId) {
       quantityOnHand: positive(row.quantity_on_hand),
       quantityAvailable,
       quantityOnOrder,
+      quantityOnOrderAuthoritative: position.authoritativeOnOrderSales,
+      quantityBlanketExcluded: position.blanketExcludedSales,
+      quantityBlanketReservedInbound: position.reservedBlanketSales,
+      quantityPendingTransferReservation: position.pendingTransferReservationSales,
       quantityBackordered,
       quantityReservedOutbound,
       positionPallets: round(positionPallets),
@@ -1113,7 +1133,8 @@ export async function searchSmartScmVendorAlternatives(proposalId, { search = ""
             p.lead_time_days, p.purchase_lead_time_days,
             y.location_id, y.yard_code, y.capacity_pallets, y.service_quantile,
             y.minimum_safety_pallets, y.lower_stock_policy_enabled,
-            b.quantity_on_hand, b.quantity_available, b.synced_at AS inventory_synced_at,
+            b.quantity_on_hand, b.quantity_available, b.quantity_on_order,
+            b.quantity_backordered, b.synced_at AS inventory_synced_at,
             CASE
               WHEN NULLIF($3, '') IS NOT NULL AND LOWER(COALESCE(i.series, '')) = LOWER($3) THEN 4
               WHEN NULLIF($4, '') IS NOT NULL AND LOWER(COALESCE(i.brand, '')) = LOWER($4) THEN 2

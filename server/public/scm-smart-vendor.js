@@ -13,6 +13,19 @@ function smartVendorIsBlanket(proposal = {}) {
   return proposal.workflowKind === "blanket_po" || proposal.proposalOrigin === "blanket";
 }
 
+function smartVendorSourcePoRef(proposal = {}) {
+  return smartVendorIsBlanket(proposal)
+    ? String(proposal.sourcePurchaseOrderRef || "").trim()
+    : "";
+}
+
+function smartVendorDefaultEmailSubject(proposal = {}) {
+  const vendor = proposal.vendor || proposal.sourceName || "Vendor";
+  const sourcePoRef = smartVendorSourcePoRef(proposal);
+  const sourcePoLabel = sourcePoRef ? ` - Source PO ${sourcePoRef}` : "";
+  return `Purchase order request - ${vendor}${sourcePoLabel} - Load #${proposal.sourceProposalId || proposal.id}`;
+}
+
 function smartVendorPendingPallets(line = {}, proposal = null) {
   const proposed = Number(line.proposedPallets || 0);
   const held = Number(line.residualPallets || 0);
@@ -52,10 +65,9 @@ function smartVendorEmailDraft(proposal = {}) {
   const local = smartVendorEmailModalDraft?.workflowId === smartVendorWorkflowId(proposal)
     ? smartVendorEmailModalDraft
     : null;
-  const vendor = proposal.vendor || proposal.sourceName || "Vendor";
   return {
     to: local?.to ?? draft.to ?? "",
-    subject: local?.subject ?? draft.subject ?? `Purchase order request - ${vendor} - Load #${proposal.sourceProposalId || proposal.id}`,
+    subject: local?.subject ?? draft.subject ?? smartVendorDefaultEmailSubject(proposal),
     intro: local?.intro ?? draft.intro ?? "Hello,\n\nPlease review the requested items below and confirm availability and ready date.",
     closing: local?.closing ?? draft.closing ?? "Thank you,"
   };
@@ -64,11 +76,10 @@ function smartVendorEmailDraft(proposal = {}) {
 function smartVendorStartEmailDraft(proposal = {}) {
   const workflowId = smartVendorWorkflowId(proposal);
   const saved = proposal.vendorEmailDraft || {};
-  const vendor = proposal.vendor || proposal.sourceName || "Vendor";
   smartVendorEmailModalDraft = {
     workflowId,
     to: saved.to || "",
-    subject: saved.subject || `Purchase order request - ${vendor} - Load #${proposal.sourceProposalId || proposal.id}`,
+    subject: saved.subject || smartVendorDefaultEmailSubject(proposal),
     intro: saved.intro || "Hello,\n\nPlease review the requested items below and confirm availability and ready date.",
     closing: saved.closing || "Thank you,",
     vendorCodes: Object.fromEntries(smartVendorEmailRows(proposal)
@@ -103,10 +114,11 @@ function smartVendorEmailModal() {
       : ""
   ].filter(Boolean).join(" ");
   const vendor = proposal.vendor || proposal.sourceName || "Vendor";
+  const sourcePoRef = smartVendorSourcePoRef(proposal);
   return `<div class="smart-vendor-email-modal" role="presentation">
     <button class="smart-vendor-email-backdrop" data-smart-action="close-vendor-email" data-workflow-id="${workflowId}" type="button" aria-label="Close vendor email draft"></button>
-    <section class="smart-vendor-email-dialog" data-vendor-email-editor="${workflowId}" role="dialog" aria-modal="true" aria-labelledby="smartVendorEmailTitle">
-      <header><div><strong id="smartVendorEmailTitle">New message</strong><span>${smartEscape(vendor)} · Load #${smartEscape(proposal.sourceProposalId || proposal.id)}</span></div><button class="smart-button" data-smart-action="close-vendor-email" data-workflow-id="${workflowId}" type="button" aria-label="Close vendor email draft">Close</button></header>
+    <section class="smart-vendor-email-dialog" data-vendor-email-editor="${workflowId}" data-vendor-email-source-po="${smartEscape(sourcePoRef)}" role="dialog" aria-modal="true" aria-labelledby="smartVendorEmailTitle">
+      <header><div><strong id="smartVendorEmailTitle">New message</strong><span>${smartEscape(vendor)} · Load #${smartEscape(proposal.sourceProposalId || proposal.id)}${sourcePoRef ? ` · Source PO ${smartEscape(sourcePoRef)}` : ""}</span></div><button class="smart-button" data-smart-action="close-vendor-email" data-workflow-id="${workflowId}" type="button" aria-label="Close vendor email draft">Close</button></header>
       <div class="smart-vendor-email-compose">
         <div class="smart-vendor-email-envelope">
           <label class="smart-vendor-email-envelope-row"><span>To</span><input data-vendor-email-field="to" data-smart-focus-key="vendor-workflow:${workflowId}:email:to" type="text" value="${smartEscape(draft.to)}" placeholder="vendor@example.com" autocomplete="email" /></label>
@@ -114,6 +126,7 @@ function smartVendorEmailModal() {
         </div>
         <div class="smart-vendor-email-paper">
           <textarea class="smart-vendor-email-body-field" data-vendor-email-field="intro" data-smart-focus-key="vendor-workflow:${workflowId}:email:intro" aria-label="Email introduction">${smartEscape(draft.intro)}</textarea>
+          ${sourcePoRef ? `<div class="smart-vendor-email-source-po"><strong>Source PO:</strong> ${smartEscape(sourcePoRef)}</div>` : ""}
           ${warning ? `<div class="smart-vendor-email-warning">${smartEscape(warning)}</div>` : ""}
           <div class="smart-table-wrap"><table class="smart-table smart-vendor-email-table"><thead><tr><th>Item name</th><th>Vendor code</th><th>Description</th><th class="numeric">PLT qty</th></tr></thead><tbody>${rows.map((row) => `<tr data-vendor-email-item="${smartEscape(row.itemId || "")}"><td><strong>${smartEscape(row.itemName || row.itemId || "—")}</strong></td><td><input data-vendor-email-code="${smartEscape(row.itemId || "")}" data-smart-focus-key="vendor-workflow:${workflowId}:email:item:${smartEscape(row.itemId || "unknown")}:code" value="${smartEscape(smartVendorEmailCode(row))}" placeholder="Missing — enter if known" aria-label="Vendor code for ${smartEscape(row.itemName || row.itemId || "item")}" /></td><td>${smartEscape(row.description || "—")}</td><td class="numeric"><strong>${smartNumber(row.requestedPallets, 2)} PLT</strong></td></tr>`).join("") || `<tr><td colspan="4"><span class="smart-help">No material item is available for this draft.</span></td></tr>`}</tbody></table></div>
           <textarea class="smart-vendor-email-body-field closing" data-vendor-email-field="closing" data-smart-focus-key="vendor-workflow:${workflowId}:email:closing" aria-label="Email closing">${smartEscape(draft.closing)}</textarea>
@@ -138,6 +151,7 @@ function smartVendorEmailPayload(editor) {
 
 function smartVendorEmailContent(editor) {
   const payload = smartVendorEmailPayload(editor);
+  const sourcePoRef = String(editor?.dataset?.vendorEmailSourcePo || "").trim();
   const rows = [...editor.querySelectorAll("[data-vendor-email-item]")].map((row) => ({
     itemName: row.cells?.[0]?.innerText?.trim() || row.querySelector("td:nth-child(1)")?.textContent?.trim() || "",
     vendorCode: row.querySelector("[data-vendor-email-code]")?.value?.trim() || "",
@@ -145,9 +159,11 @@ function smartVendorEmailContent(editor) {
     pallets: row.cells?.[3]?.innerText?.trim() || row.querySelector("td:nth-child(4)")?.textContent?.trim() || ""
   }));
   const htmlRows = rows.map((row) => `<tr><td style="border:1px solid #b9c5cc;padding:7px 9px"><strong>${smartEscape(row.itemName)}</strong></td><td style="border:1px solid #b9c5cc;padding:7px 9px">${smartEscape(row.vendorCode || "—")}</td><td style="border:1px solid #b9c5cc;padding:7px 9px">${smartEscape(row.description || "—")}</td><td style="border:1px solid #b9c5cc;padding:7px 9px;text-align:right;white-space:nowrap"><strong>${smartEscape(row.pallets)}</strong></td></tr>`).join("");
-  const html = `<div style="font-family:Arial,sans-serif;color:#17313d;font-size:14px;line-height:1.45"><p>${smartVendorTextLines(payload.intro)}</p><table style="border-collapse:collapse;width:100%;max-width:900px"><thead><tr style="background:#eaf1f5"><th style="border:1px solid #b9c5cc;padding:7px 9px;text-align:left">Item name</th><th style="border:1px solid #b9c5cc;padding:7px 9px;text-align:left">Vendor code</th><th style="border:1px solid #b9c5cc;padding:7px 9px;text-align:left">Description</th><th style="border:1px solid #b9c5cc;padding:7px 9px;text-align:right">PLT qty</th></tr></thead><tbody>${htmlRows}</tbody></table><p>${smartVendorTextLines(payload.closing)}</p></div>`;
+  const sourcePoHtml = sourcePoRef ? `<p><strong>Source PO:</strong> ${smartEscape(sourcePoRef)}</p>` : "";
+  const html = `<div style="font-family:Arial,sans-serif;color:#17313d;font-size:14px;line-height:1.45"><p>${smartVendorTextLines(payload.intro)}</p>${sourcePoHtml}<table style="border-collapse:collapse;width:100%;max-width:900px"><thead><tr style="background:#eaf1f5"><th style="border:1px solid #b9c5cc;padding:7px 9px;text-align:left">Item name</th><th style="border:1px solid #b9c5cc;padding:7px 9px;text-align:left">Vendor code</th><th style="border:1px solid #b9c5cc;padding:7px 9px;text-align:left">Description</th><th style="border:1px solid #b9c5cc;padding:7px 9px;text-align:right">PLT qty</th></tr></thead><tbody>${htmlRows}</tbody></table><p>${smartVendorTextLines(payload.closing)}</p></div>`;
   const plainRows = rows.map((row) => `${row.itemName}\t${row.vendorCode || "—"}\t${row.description || "—"}\t${row.pallets}`).join("\n");
-  const plain = `${payload.intro}\n\nItem name\tVendor code\tDescription\tPLT qty\n${plainRows}\n\n${payload.closing}`;
+  const sourcePoPlain = sourcePoRef ? `Source PO: ${sourcePoRef}\n\n` : "";
+  const plain = `${payload.intro}\n\n${sourcePoPlain}Item name\tVendor code\tDescription\tPLT qty\n${plainRows}\n\n${payload.closing}`;
   return { ...payload, html, plain };
 }
 

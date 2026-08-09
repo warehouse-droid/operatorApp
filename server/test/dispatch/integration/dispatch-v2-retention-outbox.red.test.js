@@ -24,19 +24,21 @@ after(async () => {
   await fixture?.close();
 });
 
-test("DP-14: retention prunes only expired checkpoint documents and preserves active command state", async () => {
+test("DP-14: retention prunes only expired checkpoint documents and preserves recovery drafts and active command state", async () => {
   const seeded = await fixture.seedPlan({ date: "2025-03-01", refs: ["DP-RETENTION-A"] });
   const commandId = `dp-retention-${crypto.randomUUID()}`;
   const inserted = await query(
     `INSERT INTO dispatch_plan_snapshot_history (
        plan_id, plan_date, revision, orders, trucks, summary, archived_at, archive_reason, session_id
      ) VALUES
+       ($1, $2::date, 0, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb, now() - interval '10 days', 'save_recovery', 'dp14-recovery'),
        ($1, $2::date, 1, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb, now() - interval '9 days', 'test-expired-oldest', 'dp14'),
        ($1, $2::date, 2, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb, now() - interval '8 days', 'test-expired-next', 'dp14'),
        ($1, $2::date, 3, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb, now() - interval '6 days', 'test-current', 'dp14')
      RETURNING id::text, archive_reason`,
     [seeded.id, seeded.plan_date]
   );
+  const recoveryId = inserted.rows.find((row) => row.archive_reason === "save_recovery").id;
   const oldestExpiredId = inserted.rows.find((row) => row.archive_reason === "test-expired-oldest").id;
   const nextExpiredId = inserted.rows.find((row) => row.archive_reason === "test-expired-next").id;
   const currentId = inserted.rows.find((row) => row.archive_reason === "test-current").id;
@@ -64,6 +66,7 @@ test("DP-14: retention prunes only expired checkpoint documents and preserves ac
   assert.equal((await query("SELECT count(*)::int AS count FROM dispatch_plan_commands WHERE command_id = $1", [commandId])).rows[0].count, 1);
   assert.equal((await query("SELECT count(*)::int AS count FROM dispatch_plan_followup_outbox WHERE command_id = $1", [commandId])).rows[0].count, 1);
   assert.equal((await query("SELECT count(*)::int AS count FROM dispatch_plan_snapshot_history WHERE id = ANY($1::bigint[])", [[oldestExpiredId, nextExpiredId]])).rows[0].count, 0);
+  assert.equal((await query("SELECT count(*)::int AS count FROM dispatch_plan_snapshot_history WHERE id = $1", [recoveryId])).rows[0].count, 1);
   assert.equal((await query("SELECT count(*)::int AS count FROM dispatch_plan_snapshot_history WHERE id = $1", [currentId])).rows[0].count, 1);
 });
 

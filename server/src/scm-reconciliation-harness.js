@@ -141,4 +141,25 @@ assert.deepEqual(rollupReconciliationGroup([
   { status: "Cancelled", reconciliationStatus: "ok" }
 ]), { applicationStatus: "Completed", reconciliationStatus: "ok" });
 
+for (let memberCount = 2; memberCount <= 20; memberCount += 1) {
+  for (let completedCount = 0; completedCount <= memberCount; completedCount += 1) {
+    const members = Array.from({ length: memberCount }, (_, index) => ({
+      status: index < completedCount ? "Completed" : "Queued",
+      reconciliationStatus: "ok"
+    }));
+    const expected = completedCount === memberCount
+      ? "Completed"
+      : completedCount > 0
+        ? "Partially Done"
+        : "Queued";
+    assert.equal(rollupReconciliationGroup(members).applicationStatus, expected,
+      "Grouped PO rollup must account for every active child at every supported group size.");
+  }
+}
+
+assert.deepEqual(rollupReconciliationGroup([
+  { status: "Completed", reconciliationStatus: "ok" },
+  { status: "Completed", reconciliationStatus: "review" }
+]), { applicationStatus: "Reconcile Review", reconciliationStatus: "review" });
+
 console.log("SCM PO/TO reconciliation harness passed.");

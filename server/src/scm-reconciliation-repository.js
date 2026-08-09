@@ -4,7 +4,9 @@ import {
   allocateReconciliationProgress,
   classifyNetSuiteLifecycle,
   derivePoToReconciliationState,
+  netSuiteHeaderCompletesReceipt,
   reconciliationQuantity,
+  rollupReconciliationGroup,
   roundReconciliationQuantity
 } from "./scm-reconciliation.js";
 import {
@@ -87,6 +89,10 @@ export function scmScheduleEffectiveReconciliationStatus({
 } = {}) {
   const currentScheduleStatus = text(scheduleStatus) || "Queued";
   const currentReconciliationStatus = text(reconciliationStatus).toLowerCase();
+  const currentReconciliationApplicationStatus = text(reconciliationApplicationStatus);
+  if (["complete", "completed"].includes(currentReconciliationApplicationStatus.toLowerCase())) {
+    return "Completed";
+  }
   if (blockingReview || currentReconciliationStatus === "review") return "Reconcile Review";
   if (currentReconciliationStatus === "pending") return currentScheduleStatus;
 
@@ -96,7 +102,7 @@ export function scmScheduleEffectiveReconciliationStatus({
     && scheduleUpdatedTimestamp !== null
     && (reconciliationTimestamp === null || scheduleUpdatedTimestamp > reconciliationTimestamp);
   if (scheduleIsNewer) return currentScheduleStatus;
-  return text(reconciliationApplicationStatus) || currentScheduleStatus;
+  return currentReconciliationApplicationStatus || currentScheduleStatus;
 }
 
 export function scmReconciliationProposedOutcome(proposal = {}) {
@@ -1740,7 +1746,100 @@ export async function storeLinkedScmReconciliationTransactions({
 export async function loadLocalScmReconciliationOrder(kind, sourceOrderId) {
   const orderKind = text(kind).toUpperCase();
   const id = positiveId(sourceOrderId);
-  if (!["PO", "TO"].includes(orderKind) || !id) return null;
+  if (!["SO", "PO", "TO"].includes(orderKind) || !id) return null;
+  if (orderKind === "SO") {
+    const header = await query(
+      `SELECT sales_order.*,
+              schedule.id AS schedule_id,
+              schedule.status AS schedule_status,
+              schedule.eta_date AS schedule_eta_date,
+              schedule.updated_at AS schedule_updated_at
+         FROM sales_orders sales_order
+         LEFT JOIN LATERAL (
+           SELECT candidate.id, candidate.status, candidate.eta_date,
+                  candidate.updated_at
+             FROM scm_transport_schedule candidate
+            WHERE candidate.order_kind = 'SO'
+              AND (
+                candidate.source_id = sales_order.netsuite_id
+                OR lower(candidate.order_ref) = lower(sales_order.tranid)
+              )
+            ORDER BY CASE WHEN candidate.source_id = sales_order.netsuite_id THEN 0 ELSE 1 END,
+                     candidate.updated_at DESC, candidate.id DESC
+            LIMIT 1
+         ) schedule ON true
+        WHERE sales_order.netsuite_id = $1`,
+      [id]
+    );
+    if (!header.rows[0]) return null;
+    const lines = await query(
+      `SELECT *
+         FROM sales_order_lines
+        WHERE sales_order_id = $1
+        ORDER BY line_id NULLS LAST, id`,
+      [id]
+    );
+    const row = header.rows[0];
+    const mappedLines = lines.rows.map((line) => ({
+      localLineId: Number(line.id),
+      netsuiteActive: line.netsuite_active !== false,
+      sourceLineKey: text(line.line_id || line.id),
+      sourceLineAliases: [text(line.line_id || line.id)],
+      orderLine: text(line.line_id || line.id),
+      orderLineAliases: [text(line.line_id || line.id)],
+      identityStatus: "exact",
+      identityIssue: "",
+      logicalLineIdentity: "",
+      stage: "outbound",
+      itemId: positiveId(line.item_id),
+      itemName: line.item_name || "",
+      sku: line.sku || "",
+      quantity: roundReconciliationQuantity(line.quantity),
+      cumulativeProgressQuantity: roundReconciliationQuantity(
+        line.fulfilled_sales_qty ?? line.loaded_qty
+      ),
+      unit: line.unit || "",
+      locationId: line.location_id || row.outbound_location_id || row.order_location_id || null,
+      location: line.location || row.outbound_location || row.order_location || "",
+      itemWeight: line.item_weight,
+      palletQty: reconciliationQuantity(line.pallet_qty),
+      layerQty: reconciliationQuantity(line.layer_qty),
+      sectionQty: reconciliationQuantity(line.section_qty),
+      pieceQty: reconciliationQuantity(line.piece_qty),
+      toPlt: reconciliationQuantity(line.to_plt),
+      toLyr: reconciliationQuantity(line.to_lyr),
+      toSec: reconciliationQuantity(line.to_sec),
+      toPcs: reconciliationQuantity(line.to_pcs),
+      raw: {}
+    }));
+    return {
+      id,
+      kind: "SO",
+      tranid: row.tranid || "",
+      scheduleRef: row.tranid || "",
+      trandate: row.trandate,
+      status: row.status || "",
+      statusText: row.status_text || "",
+      entityId: row.customer_id || null,
+      entity: row.customer || "",
+      memo: row.memo || "",
+      foreignTotal: row.foreign_total,
+      sourceLocationId: row.order_location_id || null,
+      sourceLocation: row.order_location || "",
+      destinationLocationId: row.outbound_location_id || null,
+      destinationLocation: row.outbound_location || "",
+      expectedDeliveryDate: row.expected_delivery_date,
+      localStatus: row.schedule_status || row.local_yard_order_status || row.operator_status || "Queued",
+      localStatusScheduleId: positiveId(row.schedule_id),
+      localStatusUpdatedAt: row.schedule_updated_at || null,
+      dispatchPlanned: row.dispatch_planned === true || Boolean(row.schedule_id),
+      dispatchPlanDate: row.schedule_eta_date || row.dispatch_plan_date || null,
+      dispatchPlannedAt: row.schedule_updated_at || row.dispatch_planned_at || null,
+      lastModifiedAt: row.status_updated_at || row.synced_at || null,
+      lines: mappedLines.filter((line) => line.netsuiteActive),
+      historicalLines: mappedLines.filter((line) => !line.netsuiteActive)
+    };
+  }
   if (orderKind === "PO") {
     const header = await query(
       `SELECT po.netsuite_id, po.tranid, po.dispatch_ref, po.trandate,
@@ -1904,13 +2003,39 @@ export async function loadLocalScmReconciliationOrder(kind, sourceOrderId) {
   }
 
   const header = await query(
-    `SELECT netsuite_id, tranid, trandate, status, status_text,
-            from_location_id, from_location, to_location_id, to_location,
-            memo, expected_delivery_date, fulfillment_status, receiving_status,
-            netsuite_active, dispatch_planned, dispatch_plan_date,
-            dispatch_planned_at, status_updated_at, synced_at
-       FROM transfer_orders
-      WHERE netsuite_id = $1`,
+    `SELECT transfer.netsuite_id, transfer.tranid, transfer.trandate,
+            transfer.status, transfer.status_text,
+            transfer.from_location_id, transfer.from_location,
+            transfer.to_location_id, transfer.to_location,
+            transfer.memo, transfer.expected_delivery_date,
+            transfer.fulfillment_status, transfer.receiving_status,
+            transfer.netsuite_active, transfer.dispatch_planned,
+            transfer.dispatch_plan_date, transfer.dispatch_planned_at,
+            transfer.status_updated_at, transfer.synced_at,
+            schedule.id AS schedule_id,
+            schedule.status AS schedule_status,
+            schedule.eta_date AS schedule_eta_date,
+            schedule.updated_at AS schedule_updated_at
+       FROM transfer_orders transfer
+       LEFT JOIN LATERAL (
+         SELECT candidate.id, candidate.status, candidate.eta_date,
+                candidate.updated_at
+           FROM scm_transport_schedule candidate
+          WHERE candidate.order_kind = 'TO'
+            AND (
+              candidate.source_id = transfer.netsuite_id
+              OR (
+                candidate.source_id IS NULL
+                AND lower(candidate.order_ref) = lower(transfer.tranid)
+              )
+            )
+          ORDER BY
+            CASE WHEN candidate.source_id = transfer.netsuite_id THEN 0 ELSE 1 END,
+            candidate.updated_at DESC,
+            candidate.id DESC
+          LIMIT 1
+       ) schedule ON true
+      WHERE transfer.netsuite_id = $1`,
     [id]
   );
   if (!header.rows[0]) return null;
@@ -1976,10 +2101,12 @@ export async function loadLocalScmReconciliationOrder(kind, sourceOrderId) {
     destinationLocationId: row.to_location_id || null,
     destinationLocation: row.to_location || "",
     expectedDeliveryDate: row.expected_delivery_date,
-    localStatus: row.receiving_status || row.fulfillment_status || "Queued",
-    dispatchPlanned: row.dispatch_planned === true,
-    dispatchPlanDate: row.dispatch_plan_date || null,
-    dispatchPlannedAt: row.dispatch_planned_at || null,
+    localStatus: row.schedule_status || "Queued",
+    localStatusScheduleId: positiveId(row.schedule_id),
+    localStatusUpdatedAt: row.schedule_updated_at || null,
+    dispatchPlanned: row.dispatch_planned === true || Boolean(row.schedule_id),
+    dispatchPlanDate: row.schedule_eta_date || row.dispatch_plan_date || null,
+    dispatchPlannedAt: row.schedule_updated_at || row.dispatch_planned_at || null,
     lastModifiedAt: row.status_updated_at || row.synced_at || null,
     lines: mappedLines.filter((line) => line.netsuiteActive),
     historicalLines: mappedLines.filter((line) => !line.netsuiteActive)
@@ -2873,6 +3000,95 @@ async function upsertBlockingReview({
   return resolved.rows[0];
 }
 
+function groupedReconciliationApplicationStatus(rollup = {}, currentStatus = "") {
+  const derived = text(rollup.applicationStatus) || "Queued";
+  if (derived !== "Queued") return derived;
+  const current = text(currentStatus);
+  if (!current || ["Completed", "Cancelled", "Reconcile Review"].includes(current)) return "Queued";
+  return current;
+}
+
+async function applyAffectedScheduleGroupRollups(orderKind, memberRefs = []) {
+  if (text(orderKind).toUpperCase() !== "PO") return [];
+  const normalizedRefs = [...new Set(memberRefs.map((ref) => text(ref).toLowerCase()).filter(Boolean))];
+  if (!normalizedRefs.length) return [];
+  const groups = await query(
+    `SELECT group_header.id, group_header.group_ref
+       FROM scm_schedule_groups group_header
+      WHERE group_header.status = 'active'
+        AND group_header.id IN (
+          SELECT affected_member.group_id
+            FROM scm_schedule_group_members affected_member
+           WHERE affected_member.order_kind = 'PO'
+             AND lower(affected_member.order_ref) = ANY($1::text[])
+        )
+      ORDER BY group_header.id
+      FOR UPDATE OF group_header`,
+    [normalizedRefs]
+  );
+  const results = [];
+  for (const group of groups.rows) {
+    const parent = await query(
+      `SELECT status
+         FROM scm_transport_schedule
+        WHERE order_kind = 'PO'
+          AND lower(order_ref) = lower($1)
+        FOR UPDATE`,
+      [group.group_ref]
+    );
+    if (!parent.rows.length) continue;
+    const members = await query(
+      `SELECT member.order_ref,
+              COALESCE(schedule.status, 'Queued') AS status,
+              COALESCE(schedule.reconciliation_blocked, false) AS reconciliation_blocked,
+              COALESCE(state.reconciliation_status, 'pending') AS reconciliation_status
+         FROM scm_schedule_group_members member
+         LEFT JOIN scm_transport_schedule schedule
+           ON schedule.order_kind = member.order_kind
+          AND lower(schedule.order_ref) = lower(member.order_ref)
+         LEFT JOIN scm_reconciliation_order_state state
+           ON state.id = schedule.reconciliation_order_state_id
+        WHERE member.group_id = $1
+          AND member.order_kind = 'PO'
+        ORDER BY member.id`,
+      [group.id]
+    );
+    const rollup = rollupReconciliationGroup(members.rows.map((member) => ({
+      status: member.status || "Queued",
+      reconciliationStatus: member.reconciliation_blocked === true
+        || ["review", "missing", "error"].includes(text(member.reconciliation_status).toLowerCase())
+        ? "review"
+        : "ok"
+    })));
+    const reconciliationBlocked = rollup.reconciliationStatus === "review";
+    const applicationStatus = groupedReconciliationApplicationStatus(
+      rollup,
+      parent.rows[0].status
+    );
+    await query(
+      `UPDATE scm_transport_schedule
+          SET status = $2,
+              reconciliation_blocked = $3,
+              last_reconciled_at = now(),
+              updated_by = 'reconciliation',
+              updated_at = now()
+        WHERE order_kind = 'PO'
+          AND lower(order_ref) = lower($1)
+          AND (
+            status IS DISTINCT FROM $2
+            OR reconciliation_blocked IS DISTINCT FROM $3
+          )`,
+      [group.group_ref, applicationStatus, reconciliationBlocked]
+    );
+    results.push({
+      groupRef: group.group_ref,
+      applicationStatus,
+      reconciliationStatus: rollup.reconciliationStatus
+    });
+  }
+  return results;
+}
+
 async function applyTargetScheduleStates(order, orderStateId, targetStates, blocked) {
   for (const state of Object.values(targetStates)) {
     if (!state.orderRef) continue;
@@ -2895,6 +3111,9 @@ async function applyTargetScheduleStates(order, orderStateId, targetStates, bloc
       [order.kind, state.orderRef, state.applicationStatus, orderStateId, blocked]
     );
   }
+  await applyAffectedScheduleGroupRollups(order.kind, Object.values(targetStates)
+    .map((state) => state.orderRef)
+    .filter(Boolean));
   const family = Object.values(targetStates).reduce((sum, state) => ({
     ordered: sum.ordered + reconciliationQuantity(state.ordered),
     fulfilled: sum.fulfilled + reconciliationQuantity(state.fulfilled),
@@ -3127,6 +3346,10 @@ export async function reconcileScmOrderFamily({
       line.cumulativeProgressObserved !== false
     )
   );
+  const headerReceiptComplete = netSuiteHeaderCompletesReceipt(
+    order.kind,
+    order.statusText
+  );
   const observedFulfillment = current.observedTypes.has("IF");
   const observedReceipt = current.observedTypes.has("IR");
   const eventFulfilledTotal = roundReconciliationQuantity(
@@ -3143,7 +3366,9 @@ export async function reconcileScmOrderFamily({
     sourceLines.reduce((sum, line) => sum + reconciliationQuantity(line.quantity), 0)
   );
   const fulfilledTotal = order.kind === "TO"
-    ? authoritativeProgress
+    ? headerReceiptComplete
+      ? orderedTotal
+      : authoritativeProgress
       ? roundReconciliationQuantity(
         sourceLines.reduce((sum, line) => sum + reconciliationQuantity(line.cumulativeProgressQuantity), 0)
       )
@@ -3153,8 +3378,10 @@ export async function reconcileScmOrderFamily({
           sourceLines.reduce((sum, line) => sum + reconciliationQuantity(line.cumulativeProgressQuantity), 0)
         )
     : 0;
-  const receivedTotal = authoritativeProgress
-    ? roundReconciliationQuantity(
+  const receivedTotal = headerReceiptComplete
+    ? orderedTotal
+    : authoritativeProgress
+      ? roundReconciliationQuantity(
       receivingLines.reduce((sum, line) => sum + reconciliationQuantity(line.cumulativeProgressQuantity), 0)
     )
     : observedReceipt
@@ -3361,7 +3588,9 @@ export async function reconcileScmOrderFamily({
       received: 0
     };
     const fulfilled = order.kind === "TO"
-      ? authoritativeProgress
+      ? headerReceiptComplete
+        ? reconciliationQuantity(line.quantity)
+        : authoritativeProgress
         ? reconciliationQuantity(line.cumulativeProgressQuantity)
         : observedFulfillment
           ? sourceProgress.fulfilled
@@ -3371,7 +3600,9 @@ export async function reconcileScmOrderFamily({
     let receiptIdentityStatus = text(line.identityStatus || "exact") === "exact"
       ? "exact"
       : "ambiguous";
-    if (order.kind === "PO") {
+    if (headerReceiptComplete) {
+      received = reconciliationQuantity(line.quantity);
+    } else if (order.kind === "PO") {
       received = authoritativeProgress
         ? reconciliationQuantity(line.cumulativeProgressQuantity)
         : observedReceipt
@@ -3871,6 +4102,9 @@ export async function listLocalScmReconciliationSources({
   const result = await query(
     `SELECT 'SO'::text AS order_kind, sales_order.netsuite_id, sales_order.tranid
        FROM sales_orders sales_order
+       LEFT JOIN scm_reconciliation_order_state sales_state
+         ON sales_state.order_kind = 'SO'
+        AND sales_state.source_order_netsuite_id = sales_order.netsuite_id
       WHERE sales_order.netsuite_id > 0
         AND COALESCE(sales_order.is_test_fixture, false) = false
         AND ($1 = '' OR $1 = 'SO')
@@ -3883,6 +4117,12 @@ export async function listLocalScmReconciliationSources({
             'g'
           ) = $3
         )
+        AND ($2::boolean OR NOT (
+          sales_order.netsuite_active = false
+          AND sales_state.netsuite_terminal_state = 'deleted'
+          AND sales_state.reconciliation_status = 'current'
+          AND sales_state.application_status = 'Cancelled'
+        ))
      UNION ALL
      SELECT 'PO'::text AS order_kind, po.netsuite_id, po.tranid
        FROM purchase_orders po
@@ -3898,10 +4138,19 @@ export async function listLocalScmReconciliationSources({
           AND state.application_status = 'Cancelled'
         ))
      UNION ALL
-     SELECT 'TO'::text AS order_kind, netsuite_id, tranid
-       FROM transfer_orders
-      WHERE netsuite_id > 0
+     SELECT 'TO'::text AS order_kind, transfer.netsuite_id, transfer.tranid
+       FROM transfer_orders transfer
+       LEFT JOIN scm_reconciliation_order_state transfer_state
+         ON transfer_state.order_kind = 'TO'
+        AND transfer_state.source_order_netsuite_id = transfer.netsuite_id
+      WHERE transfer.netsuite_id > 0
         AND ($1 = '' OR $1 = 'TO')
+        AND ($2::boolean OR NOT (
+          transfer.netsuite_active = false
+          AND transfer_state.netsuite_terminal_state = 'deleted'
+          AND transfer_state.reconciliation_status = 'current'
+          AND transfer_state.application_status = 'Cancelled'
+        ))
      ORDER BY order_kind, netsuite_id`,
     [
       ["SO", "PO", "TO"].includes(cleanKind) ? cleanKind : "",
@@ -3914,6 +4163,48 @@ export async function listLocalScmReconciliationSources({
     id: Number(row.netsuite_id),
     tranid: row.tranid || ""
   }));
+}
+
+export async function listScmReconciliationLinkedEvidenceSensitiveSourceKeys(orders = []) {
+  const poIds = [...new Set((orders || [])
+    .filter((order) => text(order?.kind).toUpperCase() === "PO")
+    .map((order) => positiveId(order?.id))
+    .filter(Boolean))];
+  const toIds = [...new Set((orders || [])
+    .filter((order) => text(order?.kind).toUpperCase() === "TO")
+    .map((order) => positiveId(order?.id))
+    .filter(Boolean))];
+  if (!poIds.length && !toIds.length) return [];
+  const result = await query(
+    `SELECT sensitive.order_kind, sensitive.source_order_id
+       FROM (
+         SELECT 'PO'::text AS order_kind, split.source_po_id AS source_order_id
+           FROM dispatch_scm_po_splits split
+          WHERE split.status = 'active'
+            AND split.source_po_id = ANY($1::bigint[])
+         UNION
+         SELECT 'TO'::text AS order_kind, split.source_to_id AS source_order_id
+           FROM dispatch_scm_to_splits split
+          WHERE split.status = 'active'
+            AND split.source_to_id = ANY($2::bigint[])
+         UNION
+         SELECT state.order_kind, state.source_order_netsuite_id
+           FROM scm_reconciliation_order_state state
+           JOIN scm_reconciliation_order_line_state line_state
+             ON line_state.order_state_id = state.id
+           JOIN scm_reconciliation_allocations allocation
+             ON allocation.order_line_state_id = line_state.id
+            AND allocation.active = true
+            AND allocation.allocation_method = 'pinned'
+          WHERE (state.order_kind = 'PO' AND state.source_order_netsuite_id = ANY($1::bigint[]))
+             OR (state.order_kind = 'TO' AND state.source_order_netsuite_id = ANY($2::bigint[]))
+       ) sensitive
+      ORDER BY sensitive.order_kind, sensitive.source_order_id`,
+    [poIds, toIds]
+  );
+  return result.rows.map((row) =>
+    `${row.order_kind}:${Number(row.source_order_id)}`
+  );
 }
 
 export async function listScmReconciliationBroadExcludedSources({ kind = "" } = {}) {
@@ -4544,11 +4835,11 @@ export async function recordScmReconciliationMissingLookup(source, {
 } = {}) {
   const kind = text(source.kind).toUpperCase();
   const id = positiveId(source.id);
-  if (!["PO", "TO"].includes(kind) || !id) {
-    throw Object.assign(new Error("A valid PO/TO source is required."), { status: 400 });
+  if (!["SO", "PO", "TO"].includes(kind) || !id) {
+    throw Object.assign(new Error("A valid SO/PO/TO source is required."), { status: 400 });
   }
   const local = await loadLocalScmReconciliationOrder(kind, id);
-  if (!local) throw Object.assign(new Error("The local PO/TO source was not found."), { status: 404 });
+  if (!local) throw Object.assign(new Error("The local SO/PO/TO source was not found."), { status: 404 });
   const cleanSource = ["nightly", "manual", "backfill", "webhook", "system"].includes(sourceName)
     ? sourceName
     : "manual";
@@ -4653,6 +4944,10 @@ export async function recordScmReconciliationMissingLookup(source, {
                 SELECT lower(split_to_ref)
                   FROM dispatch_scm_to_splits
                  WHERE $2 = 'TO' AND source_to_id = $4
+                UNION ALL
+                SELECT lower(split_so_ref)
+                  FROM dispatch_scm_so_splits
+                 WHERE $2 = 'SO' AND source_so_id = $4
               )
             )`,
         [state.id, kind, local.scheduleRef || local.tranid, id]
@@ -4662,6 +4957,285 @@ export async function recordScmReconciliationMissingLookup(source, {
       missing_success_count: Number(state.missing_success_count),
       reconciliation_status: state.reconciliation_status,
       reconciliation_reason: state.reconciliation_reason || ""
+    };
+  });
+}
+
+export async function autoCancelConfirmedMissingScmOrder({
+  kind: sourceKind,
+  id: sourceId,
+  tranid = "",
+  successfulLookups = 0,
+  sourceName = "system",
+  runId = null,
+  verification = {}
+} = {}) {
+  const kind = text(sourceKind).toUpperCase();
+  const id = positiveId(sourceId);
+  const verifiedAt = dateValue(verification.verifiedAt);
+  if (!["SO", "PO", "TO"].includes(kind) || !id) {
+    throw Object.assign(new Error("A valid confirmed-missing SO/PO/TO source is required."), { status: 400 });
+  }
+  if (Number(successfulLookups) < 2) {
+    throw Object.assign(new Error("Two successful authoritative missing lookups are required before local cancellation."), {
+      status: 409,
+      code: "SCM_RECONCILIATION_MISSING_NOT_CONFIRMED"
+    });
+  }
+  const verificationAgeMs = verifiedAt ? Date.now() - new Date(verifiedAt).getTime() : Infinity;
+  const verificationMatchesSource = text(verification.orderKind).toUpperCase() === kind
+    && positiveId(verification.sourceOrderId) === id
+    && verification.lineQueryFound === false
+    && verification.headerQueryFound === false
+    && verification.referenceQueryFound === false
+    && verificationAgeMs >= -30_000
+    && verificationAgeMs <= 5 * 60_000;
+  if (!verificationMatchesSource) {
+    throw Object.assign(
+      new Error("Fresh NetSuite ID, header, and transaction-number verification is required."),
+      { status: 409, code: "SCM_RECONCILIATION_NETSUITE_VERIFICATION_REQUIRED" }
+    );
+  }
+  const configuration = {
+    SO: { table: "sales_orders", lineTable: "sales_order_lines", lineForeignKey: "sales_order_id" },
+    PO: { table: "purchase_orders", lineTable: "purchase_order_lines", lineForeignKey: "purchase_order_id" },
+    TO: { table: "transfer_orders", lineTable: "transfer_order_lines", lineForeignKey: "transfer_order_id" }
+  }[kind];
+  const cleanSource = ["nightly", "manual", "backfill", "webhook", "system"].includes(sourceName)
+    ? sourceName
+    : "system";
+  return withTransaction(async () => {
+    const localResult = await query(
+      `SELECT netsuite_id, tranid, netsuite_active, netsuite_missing_at
+         FROM ${configuration.table}
+        WHERE netsuite_id = $1
+        FOR UPDATE`,
+      [id]
+    );
+    const local = localResult.rows[0];
+    if (!local) throw Object.assign(new Error("The local source order was not found."), { status: 404 });
+    const stateResult = await query(
+      `SELECT *
+         FROM scm_reconciliation_order_state
+        WHERE order_kind = $1 AND source_order_netsuite_id = $2
+        FOR UPDATE`,
+      [kind, id]
+    );
+    const state = stateResult.rows[0];
+    if (!state || Number(state.missing_success_count || 0) < 2) {
+      throw Object.assign(new Error("The local reconciliation state has not confirmed two successful missing lookups."), {
+        status: 409,
+        code: "SCM_RECONCILIATION_MISSING_NOT_CONFIRMED"
+      });
+    }
+    const orderRef = text(local.tranid || state.source_order_ref || tranid).toUpperCase();
+    if (text(verification.sourceOrderRef).toUpperCase() !== orderRef) {
+      throw Object.assign(
+        new Error("The verified NetSuite transaction number does not match the local source order."),
+        { status: 409, code: "SCM_RECONCILIATION_NETSUITE_VERIFICATION_REQUIRED" }
+      );
+    }
+    if (state.netsuite_terminal_state === "deleted"
+      && state.application_status === "Cancelled"
+      && state.reconciliation_status === "current") {
+      return {
+        ok: true,
+        alreadyCancelled: true,
+        orderKind: kind,
+        sourceOrderId: id,
+        sourceOrderRef: orderRef,
+        applicationStatus: "Cancelled",
+        netsuiteTerminalState: "deleted"
+      };
+    }
+    const lineFilter = kind === "TO" ? " AND line_stage = 'outbound'" : "";
+    const orderedResult = await query(
+      `SELECT COALESCE(SUM(GREATEST(COALESCE(quantity, 0), 0)), 0) AS ordered_qty
+         FROM ${configuration.lineTable}
+        WHERE ${configuration.lineForeignKey} = $1${lineFilter}`,
+      [id]
+    );
+    const ordered = roundReconciliationQuantity(orderedResult.rows[0]?.ordered_qty);
+    const note = "Automatically marked Cancelled after two successful authoritative NetSuite lookups found no source order.";
+    const quantitySummary = {
+      family: {
+        ordered,
+        fulfilled: 0,
+        received: 0,
+        abandoned: 0,
+        remaining: 0,
+        destinationRemaining: 0
+      },
+      targets: {
+        [orderRef]: {
+          orderRef,
+          orderId: id,
+          targetKind: "source_residual",
+          ordered,
+          fulfilled: 0,
+          received: 0,
+          abandoned: 0,
+          remaining: 0,
+          destinationRemaining: 0,
+          exactAllocation: true,
+          hidden: ordered <= EPSILON,
+          hasActivePlan: false,
+          allocationMethods: [],
+          applicationStatus: "Cancelled",
+          reconciliationStatus: "current",
+          reason: ""
+        }
+      }
+    };
+    const proposedState = {
+      applicationStatus: "Cancelled",
+      reconciliationStatus: "current",
+      reason: "",
+      quantities: quantitySummary.family,
+      exactAllocation: true,
+      targets: quantitySummary.targets,
+      resolution: "authoritative_source_deleted"
+    };
+    const audit = await insertReconciliationAuditEvent({
+      eventKey: `reconcile:${runId || "targeted"}:${kind}:${id}:source-deleted:${crypto.randomUUID()}`,
+      runId: positiveId(runId),
+      source: cleanSource,
+      eventType: "order.applied",
+      recordType: kind,
+      action: "cancel_missing",
+      parentOrderKind: kind,
+      parentOrderId: id,
+      parentOrderRef: orderRef,
+      occurredAt: verifiedAt,
+      payload: {
+        resolution: "authoritative_source_deleted",
+        successfulLookups: Number(successfulLookups),
+        verification,
+        previousState: {
+          netsuiteTerminalState: state.netsuite_terminal_state,
+          applicationStatus: state.application_status,
+          reconciliationStatus: state.reconciliation_status,
+          localNetSuiteActive: local.netsuite_active
+        },
+        localOutcome: proposedState
+      },
+      actor: "reconciliation"
+    });
+    const reviews = await query(
+      `SELECT id
+         FROM scm_reconciliation_review_cases
+        WHERE order_state_id = $1 AND review_code = 'source_missing' AND status = 'open'
+        ORDER BY id
+        FOR UPDATE`,
+      [state.id]
+    );
+    for (const review of reviews.rows) {
+      await query(
+        `INSERT INTO scm_reconciliation_review_resolutions (
+           review_case_id, action, actor, actor_role, note, details, audit_event_id
+         ) VALUES ($1,'auto_resolve','reconciliation','system',$2,$3::jsonb,$4)`,
+        [review.id, note, JSON.stringify({ orderKind: kind, sourceOrderId: id, successfulLookups: Number(successfulLookups) }), audit.event.id]
+      );
+      await query(
+        `UPDATE scm_reconciliation_review_cases
+            SET status = 'resolved', resolved_at = now(), resolved_by = 'reconciliation',
+                resolution_action = 'auto_resolve', resolution_note = $2, updated_at = now()
+          WHERE id = $1`,
+        [review.id, note]
+      );
+    }
+    if (kind === "SO") {
+      await query(
+        `UPDATE sales_orders
+            SET netsuite_active = false,
+                netsuite_missing_at = COALESCE(netsuite_missing_at, $2::timestamptz),
+                operator_status = 'cancelled',
+                local_yard_order_status = 'Cancelled',
+                synced_at = now()
+          WHERE netsuite_id = $1`,
+        [id, verifiedAt]
+      );
+    } else {
+      await query(
+        `UPDATE ${configuration.table}
+            SET netsuite_active = false,
+                netsuite_missing_at = COALESCE(netsuite_missing_at, $2::timestamptz),
+                synced_at = now()
+          WHERE netsuite_id = $1`,
+        [id, verifiedAt]
+      );
+    }
+    await query(
+      `UPDATE scm_reconciliation_order_state
+          SET netsuite_terminal_state = 'deleted',
+              application_status = 'Cancelled',
+              reconciliation_status = 'current',
+              reconciliation_reason = null,
+              reconciliation_source = $2,
+              ordered_qty = $3,
+              fulfilled_qty = 0,
+              received_qty = 0,
+              abandoned_qty = 0,
+              remaining_qty = 0,
+              destination_remaining_qty = 0,
+              exact_allocation = true,
+              last_direct_lookup_at = $4::timestamptz,
+              last_run_id = COALESCE($5, last_run_id),
+              quantity_summary = $6::jsonb,
+              proposed_state = $7::jsonb,
+              reconciled_at = now(),
+              completed_at = null,
+              cancelled_at = COALESCE(cancelled_at, now()),
+              status_changed_at = CASE WHEN application_status IS DISTINCT FROM 'Cancelled' THEN now() ELSE status_changed_at END,
+              updated_at = now()
+        WHERE id = $1`,
+      [state.id, cleanSource, ordered, verifiedAt, positiveId(runId), JSON.stringify(quantitySummary), JSON.stringify(proposedState)]
+    );
+    let splitRefs = [];
+    if (kind === "PO") {
+      const result = await query("SELECT split_po_ref AS ref FROM dispatch_scm_po_splits WHERE source_po_id = $1", [id]);
+      splitRefs = result.rows.map((row) => row.ref);
+    } else if (kind === "TO") {
+      const result = await query("SELECT split_to_ref AS ref FROM dispatch_scm_to_splits WHERE source_to_id = $1", [id]);
+      splitRefs = result.rows.map((row) => row.ref);
+    }
+    const referenceValues = [...new Set([orderRef, ...splitRefs].map((value) => text(value).toLowerCase()).filter(Boolean))];
+    if (kind !== "SO") {
+      await query(
+        `UPDATE scm_transport_schedule
+            SET status = 'Cancelled', reconciliation_order_state_id = $1,
+                reconciliation_blocked = false, last_reconciled_at = now(),
+                updated_by = 'reconciliation', updated_at = now()
+          WHERE order_kind = $2
+            AND (source_id = $3 OR lower(order_ref) = ANY($4::text[]))`,
+        [state.id, kind, id, referenceValues]
+      );
+      await query(
+        `INSERT INTO scm_transport_schedule (
+           order_kind, source_table, source_id, order_ref, status,
+           reconciliation_order_state_id, reconciliation_blocked,
+           last_reconciled_at, created_by, updated_by, created_at, updated_at
+         ) VALUES ($1,$2,$3,$4,'Cancelled',$5,false,now(),'reconciliation','reconciliation',now(),now())
+         ON CONFLICT (order_kind, order_ref) DO UPDATE SET
+           source_table = COALESCE(scm_transport_schedule.source_table, EXCLUDED.source_table),
+           source_id = COALESCE(scm_transport_schedule.source_id, EXCLUDED.source_id),
+           status = 'Cancelled', reconciliation_order_state_id = EXCLUDED.reconciliation_order_state_id,
+           reconciliation_blocked = false, last_reconciled_at = now(),
+           updated_by = 'reconciliation', updated_at = now()`,
+        [kind, configuration.table, id, orderRef, state.id]
+      );
+    }
+    return {
+      ok: true,
+      alreadyCancelled: false,
+      orderKind: kind,
+      sourceOrderId: id,
+      sourceOrderRef: orderRef,
+      applicationStatus: "Cancelled",
+      netsuiteTerminalState: "deleted",
+      successfulLookups: Number(successfulLookups),
+      verification,
+      auditEventId: Number(audit.event.id)
     };
   });
 }
@@ -5232,8 +5806,11 @@ export async function enrichScmScheduleWithReconciliation(rows = [], {
     : { rows: [] };
   const groupMatches = new Map();
   for (const member of groupMembersResult.rows) {
-    const match = byTarget.get(`PO:${text(member.order_ref).toLowerCase()}`);
-    if (!match) continue;
+    const match = byTarget.get(`PO:${text(member.order_ref).toLowerCase()}`) || {
+      state: null,
+      target: null,
+      orderRef: member.order_ref
+    };
     if (!groupMatches.has(member.group_ref)) groupMatches.set(member.group_ref, []);
     groupMatches.get(member.group_ref).push(match);
   }
@@ -5383,9 +5960,23 @@ export async function enrichScmScheduleWithReconciliation(rows = [], {
     if (!match && kind === "PO") {
       const members = groupMatches.get(text(row.orderRef).toLowerCase()) || [];
       if (members.length) {
-        const memberStates = members.map((member) => member.state);
+        const memberStates = members.map((member) => member.state || {});
         const memberTargets = members.map((member) =>
-          member.target || member.state.quantity_summary?.family || {});
+          member.target || member.state?.quantity_summary?.family || {});
+        const groupRollup = rollupReconciliationGroup(members.map((member) => {
+          const state = member.state || {};
+          const target = member.target || state.quantity_summary?.family || {};
+          const reconciliationStatus = state.reconciliation_status === "review"
+            || state.reconciliation_status === "missing"
+            || (state.review_cases || []).some((item) => item.severity === "blocking")
+            ? "review"
+            : "ok";
+          return {
+            status: target.applicationStatus || state.application_status || "Queued",
+            reconciliationStatus
+          };
+        }));
+        const groupApplicationStatus = groupedReconciliationApplicationStatus(groupRollup, row.status);
         const reviewReasons = [...new Set(memberStates
           .filter((state) =>
             state.reconciliation_status === "review"
@@ -5398,10 +5989,11 @@ export async function enrichScmScheduleWithReconciliation(rows = [], {
             sum + reconciliationQuantity(target[field] ?? memberStates[index][fallbackField]), 0)
         );
         match = {
+          groupedRollup: true,
           state: {
             ...memberStates[0],
-            application_status: reviewReasons.length ? "Reconcile Review" : row.status,
-            reconciliation_status: reviewReasons.length ? "review" : "current",
+            application_status: groupApplicationStatus,
+            reconciliation_status: groupRollup.reconciliationStatus === "review" ? "review" : "current",
             reconciliation_reason: reviewReasons.join(" "),
             exact_allocation: memberStates.every((state) => state.exact_allocation === true),
             review_cases: memberStates.flatMap((state) => state.review_cases || []),
@@ -5413,7 +6005,7 @@ export async function enrichScmScheduleWithReconciliation(rows = [], {
           },
           target: {
             orderRef: row.orderRef,
-            applicationStatus: reviewReasons.length ? "Reconcile Review" : row.status,
+            applicationStatus: groupApplicationStatus,
             ordered: aggregate("ordered", "ordered_qty"),
             fulfilled: aggregate("fulfilled", "fulfilled_qty"),
             received: aggregate("received", "received_qty"),
@@ -5454,15 +6046,17 @@ export async function enrichScmScheduleWithReconciliation(rows = [], {
     const currentTargetStatus = target.applicationStatus === "Reconcile Review"
       ? state.application_status
       : target.applicationStatus;
-    const effectiveStatus = scmScheduleEffectiveReconciliationStatus({
-      scheduleStatus: row.status,
-      scheduleId: row.scheduleId,
-      scheduleUpdatedAt: row.updatedAt,
-      reconciliationStatus: state.reconciliation_status,
-      reconciliationReconciledAt: state.reconciled_at,
-      reconciliationApplicationStatus: currentTargetStatus || state.application_status,
-      blockingReview: isReview
-    });
+    const effectiveStatus = match.groupedRollup
+      ? currentTargetStatus || state.application_status
+      : scmScheduleEffectiveReconciliationStatus({
+          scheduleStatus: row.status,
+          scheduleId: row.scheduleId,
+          scheduleUpdatedAt: row.updatedAt,
+          reconciliationStatus: state.reconciliation_status,
+          reconciliationReconciledAt: state.reconciled_at,
+          reconciliationApplicationStatus: currentTargetStatus || state.application_status,
+          blockingReview: isReview
+        });
     const displayedReason = isReview
       ? state.reconciliation_reason || target.reason || ""
       : "";

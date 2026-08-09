@@ -24,6 +24,7 @@ import {
 import {
   approveInitialScmReconciliationRun,
   assertScmReconciliationRunReadyToApply,
+  autoCancelConfirmedMissingScmOrder,
   cancelMissingScmPurchaseOrderLocally,
   clearScmReconciliationMissingLookup,
   createScmReconciliationRun,
@@ -33,6 +34,7 @@ import {
   initializeScmReconciliationRunTargets,
   listScmReconciliationRunTargetDecisions,
   listLocalScmReconciliationSources,
+  listScmReconciliationLinkedEvidenceSensitiveSourceKeys,
   listScmReconciliationBroadExcludedSources,
   loadLocalScmReconciliationOrder,
   markScmReconciliationNightlyRun,
@@ -47,6 +49,7 @@ import {
   updateScmReconciliationRunTarget
 } from "./scm-reconciliation-repository.js";
 import { reconcileSalesOrderFromNetSuite } from "./sales-order-reconciliation-repository.js";
+import { shouldFetchPoToLinkedTransactions } from "./scm-reconciliation.js";
 
 const VALID_KINDS = new Set(["SO", "PO", "TO"]);
 const VALID_SCOPES = new Set(["all", "SO", "PO", "TO", "order_family"]);
@@ -795,38 +798,40 @@ async function directFetchSource(source) {
   };
 }
 
-export async function verifyMissingScmPurchaseOrderInNetSuite(source = {}, options = {}) {
+export async function verifyMissingScmOrderInNetSuite(source = {}, options = {}) {
+  const kind = normalizeKind(source.kind || options.kind || "PO");
   const orderId = positiveId(source.id ?? source.orderId ?? source.sourceOrderId);
   const orderRef = text(
     source.tranid ?? source.orderRef ?? source.sourceOrderRef
   ).toUpperCase();
-  if (!orderId || !orderRef) {
+  if (!kind || !orderId || !orderRef) {
     throw Object.assign(
-      new Error("A valid local Purchase Order ID and transaction number are required."),
+      new Error("A valid local SO/PO/TO ID and transaction number are required."),
       { status: 400 }
     );
   }
   const fetchOrders = options.fetchOrders
-    || fetchPoToReconciliationOrdersFromNetSuite;
+    || (kind === "SO" ? fetchScmReconciliationOrdersFromNetSuite : fetchPoToReconciliationOrdersFromNetSuite);
   const fetchHeader = options.fetchHeader
     || fetchTransactionStatusFromNetSuite;
   const fetchReference = options.fetchReference
     || fetchTransactionReferenceByTranidFromNetSuite;
   const orders = await fetchOrders({
     orderIds: [orderId],
-    kind: "PO",
+    kind,
     modifiedSince: "1900-01-01",
     includeOpen: false,
     targetOnly: true
   });
   const exactOrder = (orders || [])
     .map(normalizeFetchedOrder)
-    .find((order) => order && order.kind === "PO" && order.id === orderId);
-  const header = await fetchHeader(orderId, "PurchOrd");
-  const reference = await fetchReference(orderRef, "PurchOrd");
+    .find((order) => order && order.kind === kind && order.id === orderId);
+  const recordType = kind === "SO" ? "SalesOrd" : kind === "PO" ? "PurchOrd" : "TrnfrOrd";
+  const header = await fetchHeader(orderId, recordType);
+  const reference = await fetchReference(orderRef, recordType);
   const verification = {
     verifiedAt: new Date().toISOString(),
-    orderKind: "PO",
+    orderKind: kind,
     sourceOrderId: orderId,
     sourceOrderRef: orderRef,
     lineQueryFound: Boolean(exactOrder),
@@ -870,6 +875,10 @@ export async function verifyMissingScmPurchaseOrderInNetSuite(source = {}, optio
     );
   }
   return verification;
+}
+
+export async function verifyMissingScmPurchaseOrderInNetSuite(source = {}, options = {}) {
+  return verifyMissingScmOrderInNetSuite({ ...source, kind: "PO" }, options);
 }
 
 export async function cancelMissingScmPurchaseOrder(
@@ -1177,6 +1186,7 @@ function initialSummary(run, effectiveDryRun) {
     failedOrders: 0,
     linkedTransactionsStored: 0,
     linkedTransactionsDeleted: 0,
+    linkedLookupSkippedOrders: 0,
     locallyExcludedOrders: 0,
     decisionSkippedOrders: 0,
     decisionAcceptedOrders: 0,
@@ -1649,26 +1659,6 @@ async function executeRunCore(runOrId, {
         summary.decisionKeptReviewOrders += 1;
       }
       await updateOwnedRunTarget(source, { status: "running" });
-      if (source.kind === "SO") {
-        const reason = "The Sales Order was not returned by the authoritative NetSuite header/line lookup; local SO data was not changed.";
-        await updateOwnedRunTarget(source, {
-          status: "review",
-          proposedChange: {
-            orderKind: "SO",
-            sourceOrderId: source.id,
-            sourceOrderRef: source.tranid,
-            reconciliationStatus: "review",
-            reason
-          },
-          result: { dryRun: effectiveDryRun, reason, missingLookupCount: 1 }
-        });
-        summary.reviewOrders += 1;
-        summary.missingFirstLookup += 1;
-        missingProcessed += 1;
-        checkpoint.processed = missingProcessed;
-        await updateRunCheckpoint(run.id, checkpoint, apiRequestCount, summary);
-        continue;
-      }
       try {
         const sourceName = reconciliationSourceName(run.triggerSource);
         const missing = await withTransaction(async () => {
@@ -1687,20 +1677,42 @@ async function executeRunCore(runOrId, {
             });
           }
           const confirmedMissing = Number(outcome.missing_success_count || 0) >= 2;
+          let verification = null;
+          if (confirmedMissing && !effectiveDryRun) {
+            apiRequestCount += 3;
+            verification = await verifyMissingScmOrderInNetSuite(source);
+          }
+          const cancellation = confirmedMissing && !effectiveDryRun
+            ? await autoCancelConfirmedMissingScmOrder({
+                kind: source.kind,
+                id: source.id,
+                tranid: source.tranid,
+                successfulLookups: Number(outcome.missing_success_count || 0),
+                sourceName,
+                runId: run.id,
+                verification
+              })
+            : null;
           await updateOwnedRunTarget(source, {
-            status: confirmedMissing ? "review" : "skipped",
+            status: cancellation ? "succeeded" : confirmedMissing ? "review" : "skipped",
             proposedChange: {
-              reconciliationStatus: confirmedMissing ? "missing" : "pending",
-              reason: confirmedMissing
-                ? "The order was absent from two successful direct NetSuite lookups."
+              applicationStatus: cancellation ? "Cancelled" : undefined,
+              reconciliationStatus: cancellation ? "current" : confirmedMissing ? "missing" : "pending",
+              reason: cancellation
+                ? ""
+                : confirmedMissing
+                  ? "The order was absent from two successful direct NetSuite lookups."
                 : "One successful direct NetSuite lookup did not find the order."
             },
             result: {
               missingLookupCount: Number(outcome.missing_success_count || 0),
-              dryRun: effectiveDryRun
+              dryRun: effectiveDryRun,
+              autoCancelled: Boolean(cancellation),
+              verification,
+              cancellation
             }
           });
-          return outcome;
+          return { ...outcome, verification, cancellation };
         });
         const confirmed = Number(missing.missing_success_count || 0) >= 2;
         if (confirmed) {
@@ -1742,11 +1754,28 @@ async function executeRunCore(runOrId, {
     );
     const salesOrders = fetchedOrders.filter((order) => order.kind === "SO");
     const linkedSourceOrders = fetchedOrders.filter((order) => order.kind !== "SO");
-    const fetchedIds = linkedSourceOrders.map((order) => order.id);
-    const fetchedOrdersById = new Map(
-      linkedSourceOrders.map((order) => [order.id, order])
-    );
     const authoritativeLinkedSnapshot = run.triggerSource !== "webhook";
+    const linkedEvidenceSensitiveKeys = authoritativeLinkedSnapshot
+      ? new Set(await listScmReconciliationLinkedEvidenceSensitiveSourceKeys(
+        linkedSourceOrders
+      ))
+      : new Set();
+    const linkedLookupOrders = authoritativeLinkedSnapshot
+      ? linkedSourceOrders.filter((order) => shouldFetchPoToLinkedTransactions(
+        order,
+        { linkedEvidenceSensitive: linkedEvidenceSensitiveKeys.has(sourceKey(order)) }
+      ))
+      : [];
+    const noLinkedLookupOrders = authoritativeLinkedSnapshot
+      ? linkedSourceOrders.filter((order) => !linkedLookupOrders.includes(order))
+      : linkedSourceOrders;
+    summary.linkedLookupSkippedOrders += authoritativeLinkedSnapshot
+      ? noLinkedLookupOrders.length
+      : 0;
+    const fetchedIds = linkedLookupOrders.map((order) => order.id);
+    const fetchedOrdersById = new Map(
+      linkedLookupOrders.map((order) => [order.id, order])
+    );
     let processed = completedTargets.length + failedTargets.length + missingSources.length;
     let linkedProcessed = 0;
     if (salesOrders.length) {
@@ -1754,7 +1783,15 @@ async function executeRunCore(runOrId, {
       await updateRunCheckpoint(run.id, checkpoint, apiRequestCount);
       const noLinkedTransactions = new Map();
       for (const order of salesOrders) {
-        await reconcileFetchedOrder(order, noLinkedTransactions, null);
+        await reconcileFetchedOrder(order, noLinkedTransactions, null, false);
+      }
+    }
+    if (noLinkedLookupOrders.length) {
+      checkpoint.phase = "reconcile";
+      await updateRunCheckpoint(run.id, checkpoint, apiRequestCount);
+      const noLinkedTransactions = new Map();
+      for (const order of noLinkedLookupOrders) {
+        await reconcileFetchedOrder(order, noLinkedTransactions, null, false);
       }
     }
     if (fetchedIds.length && authoritativeLinkedSnapshot) {
@@ -1830,7 +1867,8 @@ async function executeRunCore(runOrId, {
             await reconcileFetchedOrder(
               order,
               linkedBySource,
-              batchStartedAt
+              batchStartedAt,
+              true
             );
           }
           linkedProcessed = processedOrderIds.length;
@@ -1840,13 +1878,6 @@ async function executeRunCore(runOrId, {
           await updateRunCheckpoint(run.id, checkpoint, apiRequestCount);
         }
       });
-    } else if (linkedSourceOrders.length) {
-      checkpoint.phase = "reconcile";
-      await updateRunCheckpoint(run.id, checkpoint, apiRequestCount);
-      const linkedBySource = new Map();
-      for (const order of linkedSourceOrders) {
-        await reconcileFetchedOrder(order, linkedBySource, null);
-      }
     }
 
     checkpoint.phase = "reconcile";
@@ -1870,7 +1901,8 @@ async function executeRunCore(runOrId, {
     async function reconcileFetchedOrder(
       order,
       linkedBySource,
-      linkedSnapshotStartedAt
+      linkedSnapshotStartedAt,
+      authoritativeLinkedEvidence = false
     ) {
       const source = { kind: order.kind, id: order.id, tranid: order.tranid };
       const reviewDecision = reviewDecisions.get(sourceKey(source));
@@ -1935,7 +1967,7 @@ async function executeRunCore(runOrId, {
             workerLeaseToken
           );
           let linkedSnapshot = { stored: 0, deleted: 0 };
-          if (authoritativeLinkedSnapshot) {
+          if (authoritativeLinkedEvidence) {
             linkedSnapshot = await storeLinkedScmReconciliationTransactions({
               order,
               transactions: linkedBySource.get(order.id) || [],

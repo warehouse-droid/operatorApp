@@ -29,6 +29,49 @@ function isPalletLine(line = {}, palletItemId = null) {
     || String(line.itemName || line.sku || "").trim().toUpperCase() === "PALLET";
 }
 
+export function smartScmPurchaseOrderMemo({ proposal = {}, materialLines = [], locations = [] } = {}) {
+  const locationById = new Map(locations.map((location) => [
+    Number(location.localLocationId ?? location.locationId),
+    location
+  ]));
+  const yards = [...new Set((materialLines.length ? materialLines : proposal.lines || [])
+    .filter((line) => !isPalletLine(line, proposal.palletItemId ?? proposal.palletItem?.itemId))
+    .map((line) => {
+      const location = locationById.get(Number(line.destinationLocationId));
+      return String(
+        line.destinationName
+        || location?.yardCode
+        || location?.locationName
+        || location?.name
+        || (Number(line.destinationLocationId) === Number(proposal.destinationLocationId) ? proposal.destinationName : "")
+        || line.destinationLocationId
+        || ""
+      ).trim();
+    })
+    .filter(Boolean))];
+  if (!yards.length && proposal.destinationName) yards.push(String(proposal.destinationName).trim());
+  const rawDate = String(
+    proposal.readyDate
+    || proposal.vendorReadyDate
+    || proposal.expectedDeliveryDate
+    || proposal.transactionDate
+    || "Not set"
+  ).trim();
+  const memoDate = /^\d{4}-\d{2}-\d{2}/.test(rawDate) ? rawDate.slice(0, 10) : rawDate;
+  const marker = smartScmPurchaseOrderMemoMarker(proposal.id);
+  const loadNumber = [proposal.sourceProposalId, proposal.parentProposalId, proposal.id]
+    .map(Number)
+    .find((value) => Number.isInteger(value) && value > 0);
+  return [
+    `Date: ${memoDate}`,
+    `Yard: ${yards.join(", ") || "Not set"}`,
+    `Load #${loadNumber || "Not set"}`,
+    proposal.memo || "Smart SCM replenishment",
+    marker,
+    proposal.vendorReference ? `Vendor ref: ${proposal.vendorReference}` : ""
+  ].filter(Boolean).join(" | ");
+}
+
 export function buildSmartScmPurchaseOrderRestPayload({ proposal, locations = [], palletItem = null }) {
   const locationById = new Map(locations.map((location) => [Number(location.localLocationId ?? location.locationId), location]));
   const defaultLocation = locationById.get(Number(proposal.destinationLocationId)) || locations[0];
@@ -114,7 +157,7 @@ export function buildSmartScmPurchaseOrderRestPayload({ proposal, locations = []
   const payload = {
     entity: { id: String(proposal.vendorId) },
     location: { id: String(defaultLocation.netsuiteLocationId) },
-    memo: `${proposal.memo || "Smart SCM replenishment"} | ${smartScmPurchaseOrderMemoMarker(proposal.id)}${proposal.vendorReference ? ` | Vendor ref: ${proposal.vendorReference}` : ""}`,
+    memo: smartScmPurchaseOrderMemo({ proposal, materialLines, locations }),
     item: { items: lines }
   };
   if (defaultLocation.subsidiaryId) payload.subsidiary = { id: String(defaultLocation.subsidiaryId) };

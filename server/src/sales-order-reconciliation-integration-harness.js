@@ -264,6 +264,19 @@ try {
     assert.equal(queued.quantities.ordered, 1088);
     assert.equal(queued.quantities.fulfilled, 0);
     assert.equal(queued.quantities.remaining, 1088);
+    const fulfilledHeaderProposal = await reconcileSalesOrderFromNetSuite({
+      order: {
+        ...queuedAuthoritative,
+        status: "F",
+        statusText: "Sales Order : Pending Billing"
+      },
+      source: "manual",
+      dryRun: true
+    });
+    assert.equal(fulfilledHeaderProposal.applicationStatus, "Completed");
+    assert.equal(fulfilledHeaderProposal.quantities.fulfilled, 1088,
+      "An exact fully fulfilled SO header must override stale zero line progress.");
+    assert.equal(fulfilledHeaderProposal.quantities.remaining, 0);
     const queuedLines = await query(
       `SELECT line_id, quantity, unit, pallet_qty, pack_quantity_source, netsuite_active
          FROM sales_order_lines

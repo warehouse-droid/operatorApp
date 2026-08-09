@@ -7,7 +7,7 @@ const STAFF_TOKEN_KEY = "mbbs.staff.token";
 const STAFF_ROLE_KEY = "mbbs.staff.role";
 const STAFF_ROLES_KEY = "mbbs.staff.roles";
 const CAMERA_FACING_KEY = "mbbs.camera.facingMode";
-const DRIVER_PWA_CLIENT_VERSION = "2026.08.05.3";
+const DRIVER_PWA_CLIENT_VERSION = "2026.08.08.1";
 const DRIVER_PWA_VERSION_HEADER = "X-MBBS-Driver-Version";
 const DRIVER_PWA_UPDATE_MARKER_KEY = "mbbs.driver.requiredPwaVersion";
 const DRIVER_PWA_VERIFIED_VERSION_KEY = "mbbs.driver.verifiedPwaVersion";
@@ -2577,6 +2577,28 @@ function renderPhotoSlots(job) {
   `;
 }
 
+function renderDriverDependencyWarnings(job) {
+  const warnings = Array.isArray(job?.dependencyWarnings)
+    ? job.dependencyWarnings.filter((warning) => warning?.softened === true)
+    : [];
+  if (!warnings.length) return "";
+  return `
+    <section class="driver-dependency-warning" role="alert" aria-live="assertive">
+      <strong>${t("driver.softDependencyTitle", "Testing mode · dependency warning")}</strong>
+      ${warnings.map((warning) => `
+        <span>${escapeHtml(warning.message || t(
+          "driver.softDependencyFallback",
+          "The required yard-replenishment Transfer Order is not complete. Driver execution is temporarily allowed by Admin."
+        ))}</span>
+      `).join("")}
+      <small>${t(
+        "driver.softDependencyDispatchHard",
+        "Dispatch planning and direct-linked same-truck Transfer Orders remain hard-blocked."
+      )}</small>
+    </section>
+  `;
+}
+
 function renderJob() {
   if (activeRest) scheduleRestRender();
   else clearRestTimer();
@@ -2624,6 +2646,7 @@ function renderJob() {
           ${navigationUrl ? `<a class="map-button" href="${navigationUrl}" target="_blank" rel="noopener">${t("driver.maps", "Maps")}</a>` : ""}
         </div>
       </div>
+      ${renderDriverDependencyWarnings(job)}
       ${isTruckSwitch ? `<section class="truck-switch-summary">
         <div><span>${t("driver.currentTruck", "Current truck")}</span><strong>${escapeHtml(job.fromTruckPlate || "-")}</strong></div>
         <div><span>${t("driver.nextTruck", "Next truck")}</span><strong>${escapeHtml(job.nextTruckPlate || job.truckPlate || "-")}</strong></div>
@@ -4771,7 +4794,11 @@ app.addEventListener("click", async (event) => {
         locationCheck = null;
         locationOverrideAccepted = false;
         renderJob();
-        showToast(t("driver.jobStarted", "Job started"));
+        showToast(
+          currentJob?.dependencyWarnings?.[0]?.message
+          || startedJob?.dependencyWarnings?.[0]?.message
+          || t("driver.jobStarted", "Job started")
+        );
         if (navigator.onLine) checkCurrentJobLocation().catch((error) => showToast(error.message));
         return;
       } catch (error) {
@@ -4840,7 +4867,7 @@ app.addEventListener("click", async (event) => {
       locationCheck = null;
       locationOverrideAccepted = false;
       renderJob();
-      showToast(t("driver.jobStarted", "Job started"));
+      showToast(result.dependencyWarnings?.[0]?.message || t("driver.jobStarted", "Job started"));
       checkCurrentJobLocation().catch((error) => showToast(error.message));
     } catch (error) {
       if (error.data?.rest) {
@@ -5100,7 +5127,7 @@ app.addEventListener("click", async (event) => {
       }
       renderJob();
       if (shouldCheckNext) checkCurrentJobLocation().catch((error) => showToast(error.message));
-      showToast(t("driver.stopCompleted", "Stop completed"));
+      showToast(result.dependencyWarnings?.[0]?.message || t("driver.stopCompleted", "Stop completed"));
     } catch (error) {
       if (error.data?.locationCheck) locationCheck = error.data.locationCheck;
       showToast(error.message);

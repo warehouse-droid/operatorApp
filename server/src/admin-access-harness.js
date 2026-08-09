@@ -142,7 +142,7 @@ includesAll(sidebar, [
   '{ label: "Operator Load Records", href: "/control/operator-load-records"',
   '{ label: "Accounts", href: "/admin/accounts", controlSection: "operators"',
   '{ label: "Sync", href: "/admin/sync", controlSection: "sync"',
-  '{ label: "PO / TO Reconcile", href: "/admin/reconciliation", controlSection: "reconciliation"',
+  '{ label: "SO / PO / TO Reconcile", href: "/admin/reconciliation", controlSection: "reconciliation"',
   '{ label: "Photo Storage", href: "/admin/photo-storage", controlSection: "storage"',
   '{ label: "Audit", href: "/admin/audit", controlSection: "audit"'
 ], "navigation");

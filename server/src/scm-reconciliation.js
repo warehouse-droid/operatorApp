@@ -20,15 +20,55 @@ function normalizedStatusText(value) {
 
 export function classifyNetSuiteLifecycle(statusText = "") {
   const text = normalizedStatusText(statusText);
+  const partiallyReceived = /\bpartially received\b/.test(text);
+  const partiallyFulfilled = /\bpartially fulfilled\b/.test(text);
+  const exactLeaf = (pattern) => new RegExp(`(?:^|:\\s*)${pattern}$`).test(text);
   return {
     text,
     cancelled: /\b(cancelled|canceled|voided|void)\b/.test(text),
     closed: /\bclosed\b/.test(text) || /\bfully billed\b/.test(text),
-    partiallyReceived: /\bpartially received\b/.test(text),
-    partiallyFulfilled: /\bpartially fulfilled\b/.test(text),
+    partiallyReceived,
+    partiallyFulfilled,
     pendingReceipt: /\bpending receipt\b/.test(text),
-    pendingFulfillment: /\bpending fulfillment\b/.test(text)
+    pendingFulfillment: /\bpending fulfillment\b/.test(text),
+    received: !partiallyReceived && exactLeaf("received"),
+    pendingBilling: !partiallyReceived
+      && !partiallyFulfilled
+      && exactLeaf("pending bill(?:ing)?"),
+    billed: !partiallyReceived
+      && !partiallyFulfilled
+      && exactLeaf("(?:fully )?billed"),
+    fulfilled: !partiallyFulfilled && exactLeaf("fulfilled")
   };
+}
+
+export function netSuiteHeaderCompletesReceipt(kind, statusTextOrLifecycle = "") {
+  const lifecycle = typeof statusTextOrLifecycle === "string"
+    ? classifyNetSuiteLifecycle(statusTextOrLifecycle)
+    : statusTextOrLifecycle || {};
+  return kind === "PO"
+    ? lifecycle.received || lifecycle.pendingBilling || lifecycle.billed
+    : kind === "TO"
+      ? lifecycle.received
+      : false;
+}
+
+export function shouldFetchPoToLinkedTransactions(order = {}, {
+  linkedEvidenceSensitive = false
+} = {}) {
+  const kind = String(order.kind || "").trim().toUpperCase();
+  if (!["PO", "TO"].includes(kind)) return true;
+  if (linkedEvidenceSensitive || order.headerOnlyFallback === true) return true;
+  const lines = Array.isArray(order.lines) ? order.lines : [];
+  if (!lines.length) return true;
+  if (lines.some((line) => String(line.identityStatus || "exact").trim().toLowerCase() !== "exact")) {
+    return true;
+  }
+  if (kind === "TO") {
+    const stages = new Set(lines.map((line) => String(line.stage || "").trim().toLowerCase()));
+    if (!stages.has("outbound") || !stages.has("receiving")) return true;
+  }
+  return !netSuiteHeaderCompletesReceipt(kind, order.statusText);
 }
 
 function quantitiesConflict({ kind, ordered, fulfilled, received, fullyReceived }) {
@@ -39,10 +79,16 @@ function quantitiesConflict({ kind, ordered, fulfilled, received, fullyReceived 
 
 function preservedQueueStatus(status = "Queued") {
   const value = String(status || "").trim();
-  if (["Completed", "Cancelled", "Partially Done", "In Transit", "Reconcile Review"].includes(value)) {
-    return "Queued";
-  }
-  return value || "Queued";
+  const manuallyPreserved = new Set([
+    "Queued",
+    "Planned",
+    "Urgent",
+    "Hold",
+    "Priority",
+    "Surplus Only",
+    "Book Appt"
+  ]);
+  return manuallyPreserved.has(value) ? value : "Queued";
 }
 
 export function derivePoToReconciliationState({
@@ -63,12 +109,18 @@ export function derivePoToReconciliationState({
   }
 
   const ordered = roundReconciliationQuantity(orderedQty);
-  const fulfilled = orderKind === "TO" ? roundReconciliationQuantity(fulfilledQty) : 0;
-  const received = roundReconciliationQuantity(receivedQty);
+  let fulfilled = orderKind === "TO" ? roundReconciliationQuantity(fulfilledQty) : 0;
+  let received = roundReconciliationQuantity(receivedQty);
   const previousReceived = roundReconciliationQuantity(previousReceivedQty);
   const lifecycle = classifyNetSuiteLifecycle(statusText);
+  const headerReceiptComplete = netSuiteHeaderCompletesReceipt(orderKind, lifecycle);
+  if (headerReceiptComplete) {
+    received = ordered;
+    if (orderKind === "TO") fulfilled = ordered;
+  }
   const hasProgress = fulfilled > EPSILON || received > EPSILON || hasOperationalActivity;
-  const fullyReceived = ordered > EPSILON && received + EPSILON >= ordered;
+  const fullyReceived = headerReceiptComplete
+    || (ordered > EPSILON && received + EPSILON >= ordered);
   const fullyFulfilled = orderKind === "TO" && ordered > EPSILON && fulfilled + EPSILON >= ordered;
   const queueRemaining = lifecycle.closed || lifecycle.cancelled || fullyReceived
     ? 0

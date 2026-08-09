@@ -86,13 +86,14 @@ const OUTBOUND_YARD_CODE_SQL = `CASE COALESCE(l.location_id, so.outbound_locatio
   ELSE COALESCE(NULLIF(l.location, ''), NULLIF(so.outbound_location, ''), '')
 END`;
 
-// Only stock-bearing lines determine which yard owns the picking ticket. NetSuite
-// accounting/display lines (discounts, subtotals, services, charges, and
-// non-inventory items) can carry a different location and must not redirect it.
+// Only operational product lines determine which yard owns the picking ticket.
+// Non-inventory products such as MBBS-Special are printable, while NetSuite
+// accounting/display lines (discounts, subtotals, services, and charges) can
+// carry a different location and must not redirect it.
 // The blank-type fallback preserves older webhook rows whose item type was not
 // supplied, provided they still reference a real NetSuite item.
-const INVENTORY_LINE_SQL = `(
-  UPPER(TRIM(COALESCE(l.item_type, ''))) IN ('INVTPART', 'KIT', 'ASSEMBLY')
+const PRINTABLE_LINE_SQL = `(
+  UPPER(TRIM(COALESCE(l.item_type, ''))) IN ('INVTPART', 'NONINVTPART', 'KIT', 'ASSEMBLY')
   OR UPPER(TRIM(COALESCE(l.item_type_text, ''))) IN (
     'INVENTORY ITEM',
     'INVTPART',
@@ -136,7 +137,7 @@ export async function listSalesOrderPrintCandidates({ search = "", orderingLocat
          JOIN sales_order_lines l
            ON l.sales_order_id = so.netsuite_id
           AND l.netsuite_active = true
-          AND ${INVENTORY_LINE_SQL}
+          AND ${PRINTABLE_LINE_SQL}
         WHERE so.netsuite_active = true
           AND lower(trim(COALESCE(so.sales_order_type, ''))) = 'delivery'
      )
@@ -245,7 +246,7 @@ export async function getSalesOrderPrintCandidate({ orderId, allowedOrderingLoca
          JOIN sales_order_lines l
            ON l.sales_order_id = so.netsuite_id
           AND l.netsuite_active = true
-          AND ${INVENTORY_LINE_SQL}
+          AND ${PRINTABLE_LINE_SQL}
         WHERE so.netsuite_id = $1
           AND so.netsuite_active = true
           AND lower(trim(COALESCE(so.sales_order_type, ''))) = 'delivery'

@@ -238,7 +238,7 @@ assert.match(
 );
 assert.match(
   driverUiSource,
-  /showToast\(t\("driver\.jobStarted", "Job started"\)\);\s*checkCurrentJobLocation\(\)\.catch/,
+  /showToast\(result\.dependencyWarnings\?\.\[0\]\?\.message \|\| t\("driver\.jobStarted", "Job started"\)\);\s*checkCurrentJobLocation\(\)\.catch/,
   "Driver PWA must run GPS verification after every job start, even when write workflows are off."
 );
 assert.match(

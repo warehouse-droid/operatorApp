@@ -32,6 +32,7 @@ import {
   normalizeR2Key
 } from "./photo-upload.js";
 import { readArchivedPhoto } from "./photo-archive-repository.js";
+import { withNetSuiteOperationalWork } from "./netsuite-operational-work.js";
 
 export const RETURN_YARDS = Object.freeze([
   { locationId: 1, yardCode: "3445", name: "3445" },
@@ -2068,13 +2069,22 @@ export async function syncReturnRecord({ recordId, actorOperatorId = null, force
           "PALLET item ID"
         );
       }
-      const response = detail.recordType === "stock"
-        ? await upsertReturnAuthorizationInNetSuite(detail)
-        : await upsertPalletCreditMemoInNetSuite(detail);
       const transactionType = detail.recordType === "stock" ? "return_authorization" : "credit_memo";
-      const recovered = response.recovered
-        ? response
-        : await findReturnTransactionByExternalId(detail.externalId, transactionType).catch(() => null);
+      const { response, recovered } = await withNetSuiteOperationalWork(
+        "returns.pending",
+        async () => {
+          const response = detail.recordType === "stock"
+            ? await upsertReturnAuthorizationInNetSuite(detail)
+            : await upsertPalletCreditMemoInNetSuite(detail);
+          const recovered = response.recovered
+            ? response
+            : await findReturnTransactionByExternalId(
+              detail.externalId,
+              transactionType
+            ).catch(() => null);
+          return { response, recovered };
+        }
+      );
       const transactionId = Number(response.id || recovered?.id || detail.netSuiteTransactionId);
       if (!Number.isSafeInteger(transactionId) || transactionId <= 0) {
         throw new Error(`NetSuite ${transactionType === "credit_memo" ? "Credit Memo" : "Return Authorization"} was created but its internal ID could not be confirmed.`);
@@ -2347,10 +2357,13 @@ export async function linkReturnNetSuiteTransaction({
     if (reused.rowCount) {
       throw httpError(409, `NetSuite transaction ${id} is already linked to ${reused.rows[0].record_reference}.`);
     }
-    const snapshot = await fetchLinkedReturnTransaction({
-      netsuiteTransactionId: id,
-      netsuiteStage: type
-    });
+    const snapshot = await withNetSuiteOperationalWork(
+      "returns.manual-link",
+      () => fetchLinkedReturnTransaction({
+        netsuiteTransactionId: id,
+        netsuiteStage: type
+      })
+    );
     if (!snapshot) throw httpError(404, "NetSuite transaction was not found.");
     const statusText = cleanText(
       snapshot.status?.refName || snapshot.status?.id || snapshot.status || "",
@@ -2535,19 +2548,25 @@ export async function reconcileReturnRecords({ limit = 50, actorOperatorId = nul
       const detail = await getReturnRecordDetail(row.id);
       if (!detail || detail.status === "voided") return { skipped: true };
       try {
-        const snapshot = await fetchLinkedReturnTransaction({
-          netsuiteTransactionId: detail.netSuiteTransactionId,
-          netsuiteStage: detail.netSuiteStage
-        });
+        const { snapshot, creditMemos } = await withNetSuiteOperationalWork(
+          "returns.reconcile",
+          async () => {
+            const snapshot = await fetchLinkedReturnTransaction({
+              netsuiteTransactionId: detail.netSuiteTransactionId,
+              netsuiteStage: detail.netSuiteStage
+            });
+            const creditMemos = snapshot && detail.netSuiteStage === "return_authorization"
+              ? await findCreditMemosFromReturnAuthorization(detail.netSuiteTransactionId)
+              : [];
+            return { snapshot, creditMemos };
+          }
+        );
         if (!snapshot) throw new Error("Linked NetSuite return transaction was not found.");
         const transactionStatus = cleanText(
           snapshot.status?.refName || snapshot.status?.id || snapshot.status || "",
           "NetSuite status",
           180
         );
-        const creditMemos = detail.netSuiteStage === "return_authorization"
-          ? await findCreditMemosFromReturnAuthorization(detail.netSuiteTransactionId)
-          : [];
         const creditValues = (detail.netSuiteStage === "return_authorization"
           ? creditMemos
             .map((credit) => Number(credit.foreigntotal))

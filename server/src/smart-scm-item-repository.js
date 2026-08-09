@@ -291,6 +291,8 @@ function publicItem(row) {
       yardCode: balance.yardCode,
       quantityOnHand: number(balance.quantityOnHand),
       quantityAvailable: number(balance.quantityAvailable),
+      quantityOnOrder: number(balance.quantityOnOrder),
+      quantityBackordered: number(balance.quantityBackordered),
       syncedAt: balance.syncedAt || null
     })) : [],
     yardPolicies: Array.isArray(row.yard_policies) ? row.yard_policies.map((policy) => ({
@@ -427,6 +429,8 @@ export async function listSmartScmItems({
                 'yardCode', yard.yard_code,
                 'quantityOnHand', COALESCE(b.quantity_on_hand, 0),
                 'quantityAvailable', COALESCE(b.quantity_available, 0),
+                'quantityOnOrder', COALESCE(b.quantity_on_order, 0),
+                'quantityBackordered', COALESCE(b.quantity_backordered, 0),
                 'syncedAt', b.synced_at
               ) ORDER BY yard.sort_order)
                 FROM (VALUES (1::bigint, '3445'::text, 1), (28, '2967', 2), (15, '12441', 3), (26, '150', 4)) yard(location_id, yard_code, sort_order)

@@ -216,7 +216,7 @@
 }
 
 .smart-blanket-line-quantity {
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   min-width: 160px;
 }
 

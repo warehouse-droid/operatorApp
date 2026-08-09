@@ -411,12 +411,36 @@ assert.match(dirtySource, /if \(savedGeneration !== localPlanGeneration\) return
 assert.match(dirtySource, /new Date\(savedAt\) < new Date\(lastLocalPlanEditAt\)/, "A response older than the latest edit must not clear the dirty flag.");
 
 const saveSource = sourceSlice("async function savePlanToServer", "function queueServerSave", "plan save response coordination");
+const recoveryAckStart = saveSource.indexOf("if (responsePayload?.applied === false && responsePayload?.recoveryDraft)");
+const recoveryAckEnd = saveSource.indexOf("const result = incrementalSave", recoveryAckStart);
+assert.ok(recoveryAckStart >= 0 && recoveryAckEnd > recoveryAckStart, "The recovery acknowledgement branch must be present.");
+const recoveryAckSource = saveSource.slice(recoveryAckStart, recoveryAckEnd);
+assert.match(
+  recoveryAckSource,
+  /responsePayload\?\.applied\s*===\s*false[\s\S]*?responsePayload\?\.recoveryDraft/,
+  "A recovery acknowledgement must be handled before the browser treats the active plan as saved."
+);
+assert.match(
+  recoveryAckSource,
+  /localPlanDirty\s*=\s*true[\s\S]*?recoverySaved:\s*true/,
+  "A separately retained recovery draft must stay locally editable and retryable."
+);
+assert.match(
+  recoveryAckSource,
+  /Draft backed up[\s\S]*?not applied/,
+  "The browser must distinguish durable backup from application to the active plan."
+);
 assert.match(saveSource, /const savedLatestLocal\s*=\s*saveGeneration\s*===\s*localPlanGeneration;/, "Save completion must be compared with the latest local generation.");
 assert.match(saveSource, /if \(savedLatestLocal\)[\s\S]*?clearLocalPlanDirty\([^;]*saveGeneration\);[\s\S]*?else\s*{\s*saveQueued\s*=\s*true;/, "A superseded save must queue a new save instead of clearing local state.");
 assert.match(saveSource, /minimumPlanRevisionToApply\.planId[\s\S]*?===\s*String\(targetPlanId\)/, "The minimum accepted revision must be scoped to the plan being saved.");
 assert.match(saveSource, /resultRevision\s*<\s*guardedRevision/, "A response older than the guarded revision must be ignored.");
 
 const confirmSource = sourceSlice("async function confirmCurrentPlanAtomic", "function commitPlanMutation", "confirm revision hand-off");
+assert.match(
+  confirmSource,
+  /recoverySaved[\s\S]*?DISPATCH_PLAN_RECOVERY_PENDING/,
+  "Confirm must stop when the submitted board was backed up but not applied."
+);
 assert.match(confirmSource, /minimumPlanRevisionToApply\s*=\s*{\s*planId:\s*String\(plan\.id\s*\|\|\s*""\),\s*revision:\s*Number\(plan\.revision\s*\|\|\s*0\)\s*}/, "Confirmation must establish a per-plan minimum revision before older autosaves can return.");
 
 const restoreSource = sourceSlice("async function restoreServerPlan", "async function pollServerPlan", "remote-newer restore guard");

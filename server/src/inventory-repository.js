@@ -113,19 +113,24 @@ export async function upsertInventoryBalances(rows) {
 
     await query(
       `INSERT INTO inventory_balances (
-         item_id, location_id, location, quantity_on_hand, quantity_available, synced_at
-       ) VALUES ($1, $2, $3, $4, $5, now())
+         item_id, location_id, location, quantity_on_hand, quantity_available,
+         quantity_on_order, quantity_backordered, synced_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, now())
        ON CONFLICT (item_id, location_id) DO UPDATE SET
          location = EXCLUDED.location,
          quantity_on_hand = EXCLUDED.quantity_on_hand,
          quantity_available = EXCLUDED.quantity_available,
+         quantity_on_order = EXCLUDED.quantity_on_order,
+         quantity_backordered = EXCLUDED.quantity_backordered,
          synced_at = now()`,
       [
         itemId,
         locationId,
         row.location || null,
         normalizeNumber(row.quantity_on_hand),
-        normalizeNumber(row.quantity_available)
+        normalizeNumber(row.quantity_available),
+        normalizeNumber(row.quantity_on_order),
+        normalizeNumber(row.quantity_backordered)
       ]
     );
     balanceCount += 1;
@@ -202,7 +207,8 @@ export async function upsertInventoryBalancesBulk(rows = []) {
     const values = group.map((row) => {
       const fields = [
         Number(row.item_id), Number(row.location_id), row.location || null,
-        normalizeNumber(row.quantity_on_hand), normalizeNumber(row.quantity_available)
+        normalizeNumber(row.quantity_on_hand), normalizeNumber(row.quantity_available),
+        normalizeNumber(row.quantity_on_order), normalizeNumber(row.quantity_backordered)
       ];
       return `(${fields.map((field) => {
         params.push(field);
@@ -211,12 +217,15 @@ export async function upsertInventoryBalancesBulk(rows = []) {
     });
     await query(
       `INSERT INTO inventory_balances (
-         item_id, location_id, location, quantity_on_hand, quantity_available, synced_at
+         item_id, location_id, location, quantity_on_hand, quantity_available,
+         quantity_on_order, quantity_backordered, synced_at
        ) VALUES ${values.join(", ")}
        ON CONFLICT (item_id, location_id) DO UPDATE SET
          location = EXCLUDED.location,
          quantity_on_hand = EXCLUDED.quantity_on_hand,
          quantity_available = EXCLUDED.quantity_available,
+         quantity_on_order = EXCLUDED.quantity_on_order,
+         quantity_backordered = EXCLUDED.quantity_backordered,
          synced_at = now()`,
       params
     );

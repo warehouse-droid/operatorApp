@@ -6,8 +6,10 @@ import {
   confirmSmartScmBlanketProposal,
   finalizeSmartScmBlanketVendorWorkflow,
   listSmartScmBlanketWorkspace,
+  removeSmartScmBlanketProposalLine,
   saveSmartScmBlanketVendorReplyDraft,
   searchSmartScmBlanketAlternatives,
+  splitSmartScmBlanketProposalLine,
   updateSmartScmBlanketProposalLine
 } from "./smart-scm-blanket-repository.js";
 import {
@@ -17,6 +19,7 @@ import {
 } from "./smart-scm-planning-repository.js";
 import { updateSmartScmProposalLine } from "./smart-scm-proposal-editor.js";
 import { listSmartScmPlanningPauses } from "./smart-scm-repository.js";
+import { getSmartScmVendorWorkflowForProposal } from "./smart-scm-vendor-workflow-repository.js";
 
 const migrationUrl = new URL("../migrations/097_smart_scm_blanket_orders.sql", import.meta.url);
 const migrationSource = await fs.readFile(migrationUrl, "utf8");
@@ -332,6 +335,72 @@ try {
     assert.equal(Number(restoredAllocation.rows[0].destination_location_id), 1);
     assert.equal(Number(restoredAllocation.rows[0].pallets), 2);
 
+    const editorProposal = await query(
+      `INSERT INTO scm_smart_proposals (
+         run_id, proposal_key, proposal_type, phase, source_kind, source_name,
+         destination_location_id, destination_name, vendor, status, urgent,
+         urgency_level, urgency_score, total_pallets, total_weight_lbs,
+         utilization, memo, route_stops, proposal_origin,
+         blanket_source_po_id, blanket_source_po_ref
+       ) VALUES (
+         $1,$2,'PO','direct_vendor','vendor',$3,1,'3445',$4,'held',true,
+         'urgent',100,4,4000,0.0513,$5,
+         '[{"locationId":1,"name":"3445","sequence":1},{"locationId":15,"name":"12441","sequence":2}]'::jsonb,
+         'blanket',$6,$7
+       ) RETURNING id`,
+      [run.rows[0].id, `blanket-editor:${sourcePoId}:load:1`, `Blanket Vendor Yard ${seed}`,
+        `Blanket Harness Vendor ${seed}`, actor, sourcePoId, sourcePoRef]
+    );
+    const editorProposalId = Number(editorProposal.rows[0].id);
+    const editorFirstLineId = await insertProposalLine(editorProposalId, 1, "3445");
+    const editorSecondLineId = await insertProposalLine(editorProposalId, 15, "12441");
+    await query(
+      `UPDATE scm_smart_proposals
+          SET pallet_quantity_overrides = '{"1":9,"15":8}'::jsonb
+        WHERE id = $1`,
+      [editorProposalId]
+    );
+    const splitRun = await splitSmartScmBlanketProposalLine(editorProposalId, editorFirstLineId, {}, actor);
+    const splitChild = splitRun.proposals.find((candidate) => candidate.proposalOrigin === "blanket"
+      && candidate.lines.some((line) => Number(line.reason?.splitFromProposalId) === editorProposalId
+        && Number(line.reason?.splitFromLineId) === editorFirstLineId));
+    assert.ok(splitChild, "Split to load must create a separate held Blanket proposal.");
+    const movedAllocation = await query(
+      `SELECT proposal_id, proposal_line_id, source_line_id, planned_pallets, planned_sales_qty, status
+         FROM scm_smart_blanket_allocations
+        WHERE proposal_id = $1`,
+      [splitChild.id]
+    );
+    assert.equal(movedAllocation.rowCount, 1);
+    assert.equal(Number(movedAllocation.rows[0].source_line_id), sourceLineId);
+    assert.equal(Number(movedAllocation.rows[0].planned_pallets), 2);
+    assert.equal(Number(movedAllocation.rows[0].planned_sales_qty), 20);
+    assert.equal(movedAllocation.rows[0].status, "planned");
+    assert.notEqual(Number(movedAllocation.rows[0].proposal_line_id), editorFirstLineId,
+      "Split to load must relink the exact allocation to the new proposal line.");
+    assert.equal(splitChild.physicalPalletLines[0]?.quantity, 2,
+      "The split load must recalculate its PALLET quantity from the moved material line.");
+    assert.equal(splitChild.physicalPalletLines[0]?.overridden, false,
+      "A load-level PALLET override must not be copied to a split item line.");
+    const remainingEditorProposal = splitRun.proposals.find((candidate) => candidate.id === editorProposalId);
+    assert.equal(remainingEditorProposal.physicalPalletLines[0]?.quantity, 8,
+      "An unrelated destination PALLET override must remain on the source load.");
+
+    const removedChild = await removeSmartScmBlanketProposalLine(
+      splitChild.id,
+      splitChild.lines[0].id,
+      actor
+    );
+    assert.equal(removedChild.deleted, true, "Removing the only line must remove its empty load.");
+    const removedSource = await removeSmartScmBlanketProposalLine(editorProposalId, editorSecondLineId, actor);
+    assert.equal(removedSource.deleted, true);
+    const editorLedgerAfterRemoval = await query(
+      "SELECT COUNT(*)::int AS count FROM scm_smart_blanket_allocations WHERE proposal_id = ANY($1::bigint[])",
+      [[editorProposalId, splitChild.id]]
+    );
+    assert.equal(editorLedgerAfterRemoval.rows[0].count, 0,
+      "Removing planned Blanket lines must release, not strand, their source allocations.");
+
     const candidateWorkspace = await listSmartScmBlanketWorkspace({ search: candidatePoRef, limit: 20 });
     assert(candidateWorkspace.candidates.some((order) => order.orderRef === candidatePoRef),
       "Open source POs must remain flaggable even when they have no plannable pallet line.");
@@ -344,6 +413,17 @@ try {
     assert.equal(firstConfirmation.release.status, "reserved");
     assert.equal(firstConfirmation.release.allocations.length, 2);
     assert.equal(firstConfirmation.release.allocations.reduce((sum, row) => sum + row.reservedPallets, 0), 4);
+    const blanketVendorWorkflow = await getSmartScmVendorWorkflowForProposal(proposalId);
+    assert.equal(blanketVendorWorkflow.workflowKind, "blanket_po");
+    assert.equal(blanketVendorWorkflow.canCreatePurchaseOrder, false,
+      "A persisted Blanket workflow must never become eligible for NetSuite PO creation.");
+    assert.equal(blanketVendorWorkflow.canCreateBlanketSplit, true);
+    assert.equal(blanketVendorWorkflow.sourcePurchaseOrderId, sourcePoId);
+    assert.equal(blanketVendorWorkflow.sourcePurchaseOrderRef, sourcePoRef);
+    assert.match(blanketVendorWorkflow.vendorEmailDraft.subject, /Purchase order request/i,
+      "A Blanket workflow must remain email-draftable while it waits for the vendor reply.");
+    assert.match(blanketVendorWorkflow.vendorEmailDraft.subject, new RegExp(sourcePoRef),
+      "A new Blanket email subject must identify its source PO.");
 
     await confirmSmartScmBlanketProposal(proposalId, actor, { idempotencyKey: `${actor}:reserve` });
     const reservationCount = await query(
@@ -481,6 +561,21 @@ try {
         { proposalLineId: secondLineId, confirmedPallets: 1, heldPallets: 1, cancelledPallets: 0 }
       ]
     };
+    await assert.rejects(
+      () => finalizeSmartScmBlanketVendorWorkflow(proposalId, {
+        ...finalizePayload,
+        splitPoRef: sourcePoRef,
+        vendorReference: sourcePoRef
+      }, actor),
+      /must be different from the blanket PO/i,
+      "Vendor confirmation must create a new local PO reference, never reuse the source Blanket PO reference."
+    );
+    const rejectedSplitCount = await query(
+      "SELECT COUNT(*)::int AS count FROM dispatch_scm_po_splits WHERE source_po_id = $1",
+      [sourcePoId]
+    );
+    assert.equal(rejectedSplitCount.rows[0].count, 0,
+      "A rejected same-reference split must roll back without creating a partial local PO.");
     const finalized = await finalizeSmartScmBlanketVendorWorkflow(proposalId, finalizePayload, actor);
     assert.equal(finalized.release.status, "partially_released");
     assert.equal(finalized.release.splitPoRef, splitPoRef);
@@ -490,6 +585,27 @@ try {
     assert(finalized.proposal.lines.every((line) => line.reason?.vendorReplyDraft?.decision === "hold"));
     assert(finalized.proposal.lines.every((line) => Number(line.reason?.vendorReplyDraft?.decisionPallets) === 1),
       "Partial finalization must replace stale drafts with the exact held balance.");
+
+    const localSplitIdentity = await query(
+      `SELECT source_po_id, source_po_ref, split_po_id, split_po_ref
+         FROM dispatch_scm_po_splits
+        WHERE source_po_id = $1 AND split_po_ref = $2`,
+      [sourcePoId, splitPoRef]
+    );
+    assert.equal(localSplitIdentity.rowCount, 1);
+    assert.equal(Number(localSplitIdentity.rows[0].source_po_id), sourcePoId);
+    assert.equal(localSplitIdentity.rows[0].source_po_ref, sourcePoRef);
+    assert.equal(localSplitIdentity.rows[0].split_po_ref, splitPoRef);
+    assert.notEqual(localSplitIdentity.rows[0].split_po_ref, localSplitIdentity.rows[0].source_po_ref,
+      "The released load must retain source lineage while receiving its own distinct PO reference.");
+    const netSuiteHistoryCount = await query(
+      `SELECT COUNT(*)::int AS count
+         FROM scm_netsuite_po_history
+        WHERE proposal_id = $1 OR netsuite_purchase_order_id = $2`,
+      [proposalId, Number(localSplitIdentity.rows[0].split_po_id)]
+    );
+    assert.equal(netSuiteHistoryCount.rows[0].count, 0,
+      "A local Blanket split must not be registered as an application-created NetSuite PO.");
 
     const ledgerAfterFinalize = await query(
       `SELECT SUM(released_pallets)::numeric AS released,

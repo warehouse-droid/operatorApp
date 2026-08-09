@@ -2211,6 +2211,35 @@ label span {
   overflow: hidden;
 }
 
+.reload-fulfillment-screen {
+  grid-template-rows: max-content max-content max-content;
+  grid-auto-rows: max-content;
+  align-content: start;
+  overflow-y: auto;
+}
+
+.reload-fulfillment-screen > .reload-notice {
+  grid-column: 1 / -1;
+}
+
+.reload-fulfillment-screen > .fulfillment-card {
+  min-height: max-content;
+  overflow: visible;
+}
+
+@media (max-width: 700px) {
+  .reload-fulfillment-screen {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: max-content;
+    grid-auto-rows: max-content;
+  }
+
+  .reload-fulfillment-screen > .reload-notice,
+  .reload-fulfillment-screen > .selected-actions {
+    grid-column: 1;
+  }
+}
+
 .fulfillment-card {
   min-height: 0;
   border: 2px solid var(--line);

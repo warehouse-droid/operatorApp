@@ -57,7 +57,7 @@ const dictionarySource = sourceSection(i18nSource, "const dictionary = {", "cons
 const dictionaryKeyList = [...dictionarySource.matchAll(/^\s+"([^"]+)":/gm)].map((match) => match[1]);
 const dictionaryKeys = new Set(dictionaryKeyList);
 const usedKeys = new Set(
-  frontendSources.flatMap((source) => [...source.matchAll(/\b(?:t|tf)\("([^"]+)"/g)].map((match) => match[1]))
+  frontendSources.flatMap((source) => [...source.matchAll(/\b(?:t|tf)\(\s*"([^"]+)"/g)].map((match) => match[1]))
 );
 const missingKeys = [...usedKeys].filter((key) => !dictionaryKeys.has(key));
 assert.deepEqual(missingKeys, [], `missing Chinese dictionary keys: ${missingKeys.join(", ")}`);
@@ -72,7 +72,7 @@ assert.deepEqual(duplicateDriverKeys, [], `duplicate Driver dictionary keys: ${d
 // back to its English label, and formatted translations must retain every
 // named variable used by the caller.
 const driverTranslationCalls = [...driverSource.matchAll(
-  /\b(t|tf)\("([^"]+)",\s*"((?:[^"\\]|\\.)*)"/g
+  /\b(t|tf)\(\s*"([^"]+)",\s*"((?:[^"\\]|\\.)*)"/g
 )].map((match) => ({
   helper: match[1],
   key: match[2],

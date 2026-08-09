@@ -396,6 +396,14 @@
   font-weight: 800;
 }
 
+.smart-vendor-email-source-po {
+  padding: 8px 10px;
+  border-left: 3px solid #4a96c4;
+  color: #17313d;
+  background: #f3f8fb;
+  font-size: 13px;
+}
+
 .smart-vendor-email-table {
   min-width: 780px;
   background: white;

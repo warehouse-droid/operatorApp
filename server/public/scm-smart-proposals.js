@@ -99,6 +99,54 @@ function smartOptionalNumber(value, places = 1) {
   return value === null || value === undefined ? "—" : smartNumber(value, places);
 }
 
+function smartProposalDestinationAllocations(line = {}) {
+  const saved = Array.isArray(line.reason?.destinationAllocations)
+    ? line.reason.destinationAllocations
+    : [];
+  const physicalYard = smartProposalYardCode(line.destinationName) || String(line.destinationName || "").trim();
+  return saved
+    .map((allocation) => {
+      const yard = String(allocation?.yard || "").trim();
+      const proposedPallets = Number(allocation?.proposedPallets);
+      const fulfillment = ["vendor_direct", "transfer_later"].includes(allocation?.fulfillment)
+        ? allocation.fulfillment
+        : yard === physicalYard ? "vendor_direct" : "transfer_later";
+      return { yard, proposedPallets, fulfillment };
+    })
+    .filter((allocation) => allocation.yard
+      && Number.isFinite(allocation.proposedPallets)
+      && allocation.proposedPallets > 0);
+}
+
+function smartProposalAllocationSummary(line = {}) {
+  const allocations = smartProposalDestinationAllocations(line);
+  if (!allocations.length) return "";
+  return `<div class="smart-destination-allocations">${allocations.map((allocation) => {
+    const label = allocation.fulfillment === "transfer_later" ? "Transfer later" : "Vendor direct";
+    return `<span><strong>${smartEscape(allocation.yard)}</strong> · ${label} · ${smartNumber(allocation.proposedPallets, 2)} PLT</span>`;
+  }).join("")}</div>`;
+}
+
+function smartProposalIsHubLine(proposal = {}, line = {}) {
+  const phase = String(proposal.phase || "").trim().toLowerCase();
+  if (["vendor_hub", "hub_store"].includes(phase)) return true;
+  if (proposal.proposalType !== "PO") return false;
+  const reason = line.reason || {};
+  if (reason.gormleyHubRedirected === true || reason.routeRulePartialRedirected === true) return true;
+  if (smartProposalDestinationAllocations(line).some((allocation) => allocation.fulfillment === "transfer_later")) {
+    return true;
+  }
+  const physicalYard = smartProposalYardCode(line.destinationName || proposal.destinationName);
+  const demandYard = smartProposalYardCode(reason.actualDestinationYard);
+  return Boolean(physicalYard && demandYard && physicalYard !== demandYard);
+}
+
+function smartProposalHubAvailabilityTag(proposal, line) {
+  return smartProposalIsHubLine(proposal, line)
+    ? '<span class="smart-availability-hub-tag" title="This line uses the vendor hub for receipt or onward transfer.">HUB</span>'
+    : "";
+}
+
 function smartProposalStops(proposal) {
   const stops = Array.isArray(proposal.routeStops) && proposal.routeStops.length
     ? proposal.routeStops
@@ -161,6 +209,15 @@ function smartProposalYardOptions(selectedLocationId) {
 
 function smartProposalDestinationCalculation(proposal, line, movementLabel = "proposal") {
   const reason = line.reason || {};
+  const destinationAllocations = smartProposalDestinationAllocations(line);
+  if (destinationAllocations.length > 1) {
+    const physicalDestination = line.destinationName || proposal.destinationName || "12441";
+    return `<div class="smart-calculation-block smart-destination-calculation">
+      <span class="smart-calculation-title"><strong>Grouped yard allocation</strong></span>
+      <small>One physical receipt at ${smartEscape(physicalDestination)}; yard demand remains separated for validation and later transfers.</small>
+      ${smartProposalAllocationSummary(line)}
+    </div>`;
+  }
   const toPlt = Number(line.toPlt || 0);
   const pallets = (value) => {
     if (toPlt <= 0 || value === null || value === undefined || value === "") return null;
@@ -189,6 +246,7 @@ function smartProposalDestinationCalculation(proposal, line, movementLabel = "pr
   const afterProposal = position === null ? null : position + proposed;
   const planningYard = reason.actualDestinationYard || line.destinationName || proposal.destinationName;
   const hasPolicyDecision = position !== null && reorderPoint !== null && preferred !== null;
+  const preferredBelowReorderPoint = hasPolicyDecision && preferred + 0.000001 < reorderPoint;
   const targetGap = hasPolicyDecision ? Math.max(0, preferred - position) : 0;
   const minimumOrder = smartReasonNumber(reason, "minimumOrderPallets") ?? 0;
   const capacity = smartReasonNumber(reason, "capacityPallets");
@@ -223,7 +281,10 @@ function smartProposalDestinationCalculation(proposal, line, movementLabel = "pr
     <span>Available in snapshot: <strong>${smartOptionalNumber(current, 2)} PLT</strong></span>
     <span>Projected position before recommendation: <strong>${smartOptionalNumber(position, 2)} PLT</strong></span>
     ${hasPositionBreakdown ? `<small>${smartNumber(available, 2)} available + ${smartNumber(onOrder, 2)} on order − ${smartNumber(backordered, 2)} backorder − ${smartNumber(reservedOutbound, 2)} reserved = ${smartNumber(position, 2)} PLT</small>` : ""}
-    ${hasPolicyDecision ? `<span>Reorder trigger: <strong>${smartNumber(reorderPoint, 2)} PLT</strong></span><span>Preferred target: <strong>${smartNumber(preferred, 2)} PLT</strong></span>` : ""}
+    ${hasPolicyDecision ? `<small>Policy scope: this SKU at <strong>${smartEscape(planningYard)}</strong>; not this proposal line or load.</small><span>Reorder trigger: <strong>${smartNumber(reorderPoint, 2)} PLT</strong></span><span>Preferred target: <strong>${smartNumber(preferred, 2)} PLT</strong></span>` : ""}
+    ${preferredBelowReorderPoint ? capacity !== null
+      ? `<span class="smart-policy-constraint">Capacity constraint: <strong>${smartNumber(capacity, 2)} PLT</strong> capacity is below <strong>${smartNumber(reorderPoint, 2)} PLT</strong> ROP, so this SKU-yard's preferred target is capped at ${smartNumber(preferred, 2)} PLT.</span>`
+      : `<span class="smart-policy-constraint">Policy warning: preferred target is below ROP and the saved capacity is unavailable.</span>` : ""}
     <span class="smart-replenishment-equation">${decision}</span>
     ${orderRule ? `<small>${orderRule}</small>` : ""}
     ${storedRequirementDiffers ? `<small>Stored line requirement ${smartNumber(storedRequired, 2)} PLT differs after editing/grouping; calculated snapshot need is ${smartNumber(calculatedRequired, 2)} PLT.</small>` : ""}
@@ -325,6 +386,16 @@ function smartProposalExpectedInventoryPallets(line) {
 
 function smartProposalAvailability(proposal, line) {
   const reason = line.reason || {};
+  const destinationAllocations = smartProposalDestinationAllocations(line);
+  const hubTag = smartProposalHubAvailabilityTag(proposal, line);
+  if (destinationAllocations.length > 1) {
+    const physicalDestination = line.destinationName || proposal.destinationName || "Destination";
+    return `<div class="smart-availability-summary${smartState.planCompact ? " smart-availability-inline" : ""}">
+      ${hubTag}
+      <span><small>Physical receipt</small><strong>${smartEscape(physicalDestination)}</strong></span>
+      <span><small>Planned allocation</small><strong>${smartNumber(line.proposedPallets, 2)} PLT · ${destinationAllocations.length} yards</strong></span>
+    </div>`;
+  }
   const destinationName = reason.actualDestinationYard || line.destinationName || proposal.destinationName || "Destination";
   const destinationAvailable = smartProposalDestinationAvailablePallets(line);
   if (proposal.proposalType === "TO") {
@@ -332,11 +403,13 @@ function smartProposalAvailability(proposal, line) {
     const sourceAvailable = smartReasonNumber(reason, "sourceAvailablePallets");
     if (smartState.planCompact) {
       return `<div class="smart-availability-summary smart-availability-inline">
+        ${hubTag}
         <span><small>${smartEscape(sourceName)} source</small><strong>${smartOptionalNumber(sourceAvailable, 2)} PLT</strong></span>
         <span><small>${smartEscape(destinationName)} destination</small><strong>${smartOptionalNumber(destinationAvailable, 2)} PLT</strong></span>
       </div>`;
     }
     return `<div class="smart-availability-summary">
+      ${hubTag}
       <span><small>${smartEscape(sourceName)} source available</small><strong>${smartOptionalNumber(sourceAvailable, 2)} PLT</strong></span>
       <span><small>${smartEscape(destinationName)} destination available</small><strong>${smartOptionalNumber(destinationAvailable, 2)} PLT</strong></span>
     </div>`;
@@ -344,11 +417,13 @@ function smartProposalAvailability(proposal, line) {
   const expected = smartProposalExpectedInventoryPallets(line);
   if (smartState.planCompact) {
     return `<div class="smart-availability-summary smart-availability-inline">
+      ${hubTag}
       <span><small>${smartEscape(destinationName)} available</small><strong>${smartOptionalNumber(destinationAvailable, 2)} PLT</strong></span>
       <span><small>Expected</small><strong>${smartOptionalNumber(expected, 2)} PLT</strong></span>
     </div>`;
   }
   return `<div class="smart-availability-summary">
+    ${hubTag}
     <span><small>${smartEscape(destinationName)} available</small><strong>${smartOptionalNumber(destinationAvailable, 2)} PLT</strong></span>
     <span><small>Expected inventory · AA + OO − BO</small><strong>${smartOptionalNumber(expected, 2)} PLT</strong></span>
   </div>`;
@@ -356,6 +431,10 @@ function smartProposalAvailability(proposal, line) {
 
 function smartProposalDecisionEvidence(line) {
   const reason = line.reason || {};
+  const destinationAllocations = smartProposalDestinationAllocations(line);
+  if (destinationAllocations.length > 1) {
+    return `<div class="smart-reason"><span>Grouped physical receipt; each yard allocation is validated against its own ROP and preferred stock level.</span></div>`;
+  }
   const destinationPolicyInvalid = Boolean(reason.destinationManuallyAdjusted);
   const evidence = [
     ["Weekly demand", destinationPolicyInvalid ? null : reason.weeklyDemandPallets, " PLT/week", 2],
@@ -484,9 +563,10 @@ function smartProposalLineRow(proposal, line, editable) {
   const evidenceHidden = !smartState.planCompact && smartState.planShowDecisionEvidence ? "" : " hidden";
   const urgencyLevel = smartLineUrgencyLevel(line);
   const urgencyLabel = smartUrgencyLabel(urgencyLevel);
+  const allocationSummary = smartProposalAllocationSummary(line);
   const itemContent = smartState.planCompact
-    ? `<strong>${smartEscape(line.itemName)}</strong><span class="smart-sr-only">${smartEscape(urgencyLabel)} urgency.</span>`
-    : `<strong>${smartEscape(line.itemName)}</strong><div class="smart-help">ID ${line.itemId} · ${smartEscape(line.itemDescription || line.unit || "")}</div><div class="smart-line-flags">${urgencyLevel !== "normal" ? smartPill("attention", urgencyLabel) : ""}${line.provisional ? smartPill("held", "Provisional") : ""}${line.reason?.gormleyHubRedirected ? smartPill("held", `Gormley hub for ${smartEscape((line.reason.gormleyOriginalDestinations || [line.reason.actualDestinationYard]).filter(Boolean).join(", "))}`) : ""}${Number(line.reason?.groupingDeferredPallets) > 0 ? smartPill("held", `${smartNumber(line.reason.groupingDeferredPallets, 0)} PLT deferred`) : ""}${line.manualPlanningRequired ? smartPill("attention", "Missing conversion / weight") : ""}</div>`;
+    ? `<strong>${smartEscape(line.itemName)}</strong><span class="smart-sr-only">${smartEscape(urgencyLabel)} urgency.</span>${allocationSummary}`
+    : `<strong>${smartEscape(line.itemName)}</strong><div class="smart-help">ID ${line.itemId} · ${smartEscape(line.itemDescription || line.unit || "")}</div><div class="smart-line-flags">${urgencyLevel !== "normal" ? smartPill("attention", urgencyLabel) : ""}${line.provisional ? smartPill("held", "Provisional") : ""}${line.reason?.gormleyHubRedirected ? smartPill("held", `Gormley hub for ${smartEscape((line.reason.gormleyOriginalDestinations || [line.reason.actualDestinationYard]).filter(Boolean).join(", "))}`) : ""}${Number(line.reason?.groupingDeferredPallets) > 0 ? smartPill("held", `${smartNumber(line.reason.groupingDeferredPallets, 0)} PLT deferred`) : ""}${line.manualPlanningRequired ? smartPill("attention", "Missing conversion / weight") : ""}</div>${allocationSummary}`;
   return `<tr class="smart-urgency-${urgencyLevel}" data-smart-urgency="${urgencyLevel}" data-smart-proposal-line="${line.id}" aria-label="${smartEscape(line.itemName)}. ${smartEscape(urgencyLabel)} urgency.">
     <td>${itemContent}</td>
     <td>${editable && proposal.proposalType === "PO" ? `<select class="smart-line-destination-select" data-smart-proposal-destination data-smart-focus-key="proposal:${smartEscape(proposal.id)}:line:${smartEscape(line.id)}:destination" aria-label="Line destination yard">${smartProposalYardOptions(line.destinationLocationId || proposal.destinationLocationId)}</select>` : `<strong>${smartEscape(line.destinationName || proposal.destinationName)}</strong>`}</td>

@@ -14,6 +14,7 @@ import {
   persistScmNetSuitePoSnapshot,
   recordScmNetSuitePoCreation
 } from "./scm-netsuite-po-history-repository.js";
+import { convertPurchaseOrderPalletQuantity } from "./scm-netsuite-po-unit-conversion.js";
 
 function text(value, max = 4000) {
   return String(value ?? "").trim().slice(0, max);
@@ -64,6 +65,9 @@ function snapshotReflectsChanges(snapshot, { header = {}, lines = [] } = {}) {
     const remote = remoteByLine.get(Number(requested.lineId));
     if (!remote) return false;
     if (Object.prototype.hasOwnProperty.call(requested, "quantity") && Math.abs(Number(remote.quantity) - Number(requested.quantity)) > 0.000001) return false;
+    if (requested.updatePalletColumn === true
+      && Object.prototype.hasOwnProperty.call(requested, "palletQuantity")
+      && Math.abs(Number(remote.palletQuantity) - Number(requested.palletQuantity)) > 0.000001) return false;
     if (Object.prototype.hasOwnProperty.call(requested, "rate") && Math.abs(Number(remote.rate || 0) - Number(requested.rate)) > 0.000001) return false;
     if (Object.prototype.hasOwnProperty.call(requested, "locationId") && Number(remote.locationId) !== Number(requested.locationId)) return false;
   }
@@ -224,7 +228,7 @@ export async function updateScmNetSuitePoHistory(historyId, body = {}, operatorI
   const history = await getScmNetSuitePoHistory(historyId, { includeUnarchived: false });
   const remote = await fetchPurchaseOrderHistorySnapshotFromNetSuite(history.purchaseOrderId);
   if (!remote) throw Object.assign(new Error("The purchase order no longer exists in NetSuite."), { status: 404 });
-  const terminal = /closed|cancelled|canceled|fully received/i.test(`${remote.status || ""} ${remote.statusText || ""}`);
+  const terminal = /closed|cancelled|canceled|fully received|fully billed/i.test(`${remote.status || ""} ${remote.statusText || ""}`);
   const hasReceiptOrClosedLine = (remote.lines || []).some((line) => line.closed || Number(line.receivedQuantity || 0) > 0);
   if (terminal || hasReceiptOrClosedLine || history.current.active === false) {
     throw Object.assign(new Error("This purchase order is received, closed, cancelled, or inactive and is read-only."), { status: 409 });
@@ -254,8 +258,20 @@ export async function updateScmNetSuitePoHistory(historyId, body = {}, operatorI
     if (current.closed || Number(current.receivedQuantity || 0) > 0) {
       throw Object.assign(new Error(`${current.itemName || `Line ${lineId}`} is received or closed and cannot be edited.`), { status: 409 });
     }
-    const clean = { lineId, itemId: current.itemId };
-    if (Object.prototype.hasOwnProperty.call(requested, "quantity")) clean.quantity = number(requested.quantity, `Quantity for ${current.itemName}`, { positive: true });
+    const clean = { lineId, restLineId: current.restLineId, itemId: current.itemId };
+    const hasPalletQuantity = Object.prototype.hasOwnProperty.call(requested, "palletQuantity");
+    const hasNativeQuantity = Object.prototype.hasOwnProperty.call(requested, "quantity");
+    if (hasPalletQuantity && hasNativeQuantity) {
+      throw Object.assign(new Error("PLT quantity and native quantity cannot both be provided."), { status: 400 });
+    }
+    if (hasPalletQuantity) {
+      const converted = convertPurchaseOrderPalletQuantity(current, requested.palletQuantity);
+      clean.palletQuantity = converted.palletQuantity;
+      clean.quantity = converted.nativeQuantity;
+      clean.updatePalletColumn = converted.updatePalletColumn;
+    } else if (hasNativeQuantity) {
+      clean.quantity = number(requested.quantity, `Quantity for ${current.itemName}`, { positive: true });
+    }
     if (Object.prototype.hasOwnProperty.call(requested, "rate")) clean.rate = number(requested.rate, `Rate for ${current.itemName}`);
     if (Object.prototype.hasOwnProperty.call(requested, "destinationLocationId")) {
       const location = Number(requested.destinationLocationId);
@@ -263,7 +279,7 @@ export async function updateScmNetSuitePoHistory(historyId, body = {}, operatorI
       clean.locationId = location;
     }
     return clean;
-  }).filter((line) => Object.keys(line).length > 2);
+  }).filter((line) => Object.keys(line).length > 3);
 
   if (!Object.keys(header).length && !lines.length) throw Object.assign(new Error("No editable purchase-order changes were provided."), { status: 400 });
   const requestedChanges = { header, lines };

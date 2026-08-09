@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
+import { buildPurchaseOrderHistoryRestPayload } from "./netsuite.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const read = (file) => fs.readFileSync(path.join(root, file), "utf8");
@@ -15,6 +16,7 @@ const worker = read("netsuite-order-webhook-scheduled.js");
 const directWebhook = read("netsuite-order-webhook-user-event-direct.js");
 const restlet = read("netsuite-smart-scm-picking-ticket-restlet.js");
 const ui = read("public/scm-netsuite-po.js");
+const server = read("src/server.js");
 
 assert.match(migration, /CREATE TABLE IF NOT EXISTS scm_netsuite_po_history/);
 assert.match(migration, /creation_snapshot jsonb NOT NULL/);
@@ -32,6 +34,58 @@ for (const name of ["registerScmNetSuitePoHistoryCreation", "refreshScmNetSuiteP
 assert.match(service, /received, closed, cancelled, or inactive and is read-only/);
 assert.match(service, /expectedLastModifiedAt/);
 assert.match(service, /source: "application"/);
+assert.match(service, /Object\.keys\(line\)\.length > 3/,
+  "REST line identity fields alone must not turn an unchanged PO line into an update.");
+const restUpdatePayload = buildPurchaseOrderHistoryRestPayload({
+  header: {
+    transactionDate: "2026-08-07",
+    expectedDeliveryDate: "2026-08-12",
+    memo: "History edit",
+    vendorReference: "VENDOR-REF"
+  },
+  lines: [{
+    lineId: 4748749,
+    restLineId: 1,
+    itemId: 2055,
+    quantity: 217.95,
+    rate: 5.93,
+    locationId: 1
+  }]
+});
+assert.deepEqual(restUpdatePayload, {
+  tranDate: "2026-08-07",
+  custbody4: "2026-08-12",
+  memo: "History edit",
+  otherRefNum: "VENDOR-REF",
+  item: {
+    items: [{ line: 1, quantity: 217.95, rate: 5.93, location: { id: "1" } }]
+  }
+});
+const palletEditPayload = buildPurchaseOrderHistoryRestPayload({
+  lines: [{
+    lineId: 4748749,
+    restLineId: 1,
+    itemId: 2055,
+    palletQuantity: 6,
+    quantity: 261.54,
+    updatePalletColumn: true
+  }]
+});
+assert.deepEqual(palletEditPayload.item.items, [{
+  line: 1,
+  quantity: 261.54,
+  custcol_plt: 6
+}]);
+const updateTransportSource = netsuite.slice(
+  netsuite.indexOf("export async function updatePurchaseOrderHistoryInNetSuite"),
+  netsuite.indexOf("export async function resolvePalletItemFromNetSuite")
+);
+assert.match(updateTransportSource, /\/record\/v1\/purchaseOrder\/\$\{id\}/,
+  "PO history edits must use the supported REST Record API.");
+assert.doesNotMatch(updateTransportSource, /configuredRestletJson|action:\s*"updatePurchaseOrder"/,
+  "PO history edits must not depend on optional picking-ticket RESTlet actions.");
+assert.match(netsuite, /tl\.id AS rest_line_id/,
+  "SuiteQL history snapshots must retain the REST sublist line key.");
 
 assert.match(vendorCodes, /export async function resolveSmartScmVendorItemCodes/);
 assert.match(netsuite, /FROM itemvendor iv/);
@@ -137,6 +191,81 @@ assert.match(ui, /new EventSource\("\/api\/events\?client=scm-netsuite-po-histor
 assert.match(ui, /Preview PDF/);
 assert.match(ui, /Return to Vendor Replies/);
 assert.match(ui, /expectedLastModifiedAt/);
+assert.match(ui, /data-line-field="palletQuantity"/,
+  "PO history must expose PLT as the editable quantity.");
+assert.match(ui, /data-line-native-quantity/,
+  "PO history must retain native SQFT or stock quantity as a read-only field.");
+assert.match(ui, /syncNativeQuantityPreview/,
+  "Editing PLT must immediately update the read-only native quantity preview.");
+assert.match(ui, /record\.lifecycle !== "missing"/,
+  "NetSuite action buttons must not render after the PO is confirmed missing.");
+assert.match(service, /convertPurchaseOrderPalletQuantity/,
+  "The server must own the PLT-to-native conversion used for NetSuite writes.");
+assert.match(service, /PLT quantity and native quantity cannot both be provided/,
+  "Ambiguous PLT/native write requests must be rejected instead of guessing which quantity wins.");
+assert.match(ui, /id="poLifecycle"/,
+  "PO history must expose a lifecycle filter.");
+assert.match(ui, /option value="completed"/,
+  "PO history must let users isolate completed purchase orders.");
+assert.match(ui, /option value="pending_receive"/,
+  "PO history must let users isolate purchase orders awaiting receipt.");
+assert.match(ui, /lifecycle:\s*"pending_receive"/,
+  "PO history must default to app-created purchase orders with open quantity.");
+assert.match(ui, /option value="missing"/,
+  "PO history must let users isolate purchase orders that no longer exist in NetSuite.");
+assert.match(ui, /lifecycle: document\.getElementById\("poLifecycle"\)/,
+  "The selected lifecycle must be included in PO history requests.");
+assert.match(server, /lifecycle: req\.query\.lifecycle/,
+  "The PO history endpoint must pass lifecycle filtering to the repository.");
+assert.match(repository, /filters\.lifecycle/,
+  "PO history lifecycle filtering must be enforced server-side before pagination.");
+
+function renderPoHistoryCard(lifecycle) {
+  const mount = {
+    addEventListener() {},
+    contains() { return false; },
+    innerHTML: ""
+  };
+  const context = vm.createContext({
+    console,
+    confirm: () => true,
+    document: {
+      activeElement: null,
+      visibilityState: "visible",
+      addEventListener() {},
+      getElementById: () => mount
+    },
+    requireDispatchLogin() {},
+    setInterval() { return 1; },
+    window: { addEventListener() {} }
+  });
+  vm.runInContext(ui, context);
+  const record = {
+    id: 10,
+    lifecycle,
+    purchaseOrderRef: "PO-RENDER-TEST",
+    creationSnapshot: {},
+    current: {
+      active: lifecycle !== "missing",
+      lines: [],
+      status: lifecycle === "missing" ? "" : "B",
+      statusText: lifecycle === "missing" ? "" : "Purchase Order : Pending Receipt",
+      tranid: "PO-RENDER-TEST"
+    }
+  };
+  context.__record = record;
+  return vm.runInContext("poState.operator = { role: 'scm' }; card(__record)", context);
+}
+
+const missingCard = renderPoHistoryCard("missing");
+assert.doesNotMatch(missingCard, /data-action="(?:pdf|refresh|save)"/,
+  "A deleted PO card must render no button that calls NetSuite.");
+assert.match(missingCard, /NetSuite actions unavailable/);
+const activeCard = renderPoHistoryCard("active");
+for (const action of ["pdf", "refresh", "save"]) {
+  assert.match(activeCard, new RegExp(`data-action="${action}"`),
+    `An editable active PO must retain its ${action} action.`);
+}
 
 const loadSource = ui.slice(
   ui.indexOf("async function load("),

@@ -332,7 +332,8 @@ test("F06/F16: schema-101 upgrade preserves representative legacy records and is
     for (const filename of MBT_FOUNDATION_MIGRATIONS) {
       assert.match(firstRunner.stdout, new RegExp(`Applied ${filename.replaceAll(".", "\\.")}`));
     }
-    assert.match(firstRunner.stdout, /Applied 134_so_reconciliation_db_only\.sql/);
+    assert.match(firstRunner.stdout, /Applied 139_sales_order_reload_cycles\.sql/);
+    assert.match(firstRunner.stdout, /Applied 140_driver_yard_dependency_soft_mode\.sql/);
 
     const after = await captureLegacyState(client, ids);
     assert.deepEqual(after, before, "Migrations 102-109 must not rewrite representative schema-101 records.");
@@ -379,10 +380,10 @@ test("F06/F16: schema-101 upgrade preserves representative legacy records and is
          FROM schema_migrations
         ORDER BY filename`
     );
-    assert.equal(receiptsBeforeNoOp.rowCount, 134);
+    assert.equal(receiptsBeforeNoOp.rowCount, 140);
     assert.equal(
       receiptsBeforeNoOp.rows.at(-1)?.filename,
-      "134_so_reconciliation_db_only.sql"
+      "140_driver_yard_dependency_soft_mode.sql"
     );
     assert.deepEqual(
       receiptsBeforeNoOp.rows

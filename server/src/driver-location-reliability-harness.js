@@ -74,8 +74,8 @@ assert.match(
 );
 assert.match(
   nextJobRoute,
-  /res\.json\(\{ state, job, rest, restSummary, pendingCompletion, routeBootstrap \}\)/,
-  "The next-job response must return the day state, cross-device completion guard, and fast offline bootstrap metadata."
+  /res\.json\(\{[\s\S]*?state,[\s\S]*?job: presentedJob,[\s\S]*?rest,[\s\S]*?restSummary,[\s\S]*?pendingCompletion,[\s\S]*?routeBootstrap,[\s\S]*?offlineEnabled: driverMode\.enabled,[\s\S]*?offlineModeRevision: driverMode\.revision[\s\S]*?\}\)/,
+  "The next-job response must return the dependency-reviewed job, day state, cross-device completion guard, offline bootstrap, and mode metadata."
 );
 
 assert.match(

@@ -11,8 +11,8 @@ import { binDispatchOrders } from "./mbt/dispatch-bin-safety.js";
 import { authorizeMbtPhase3Capability } from "./mbt/phase3-authorization.js";
 import { afterTransactionCommit, beginRollbackContext, pool, query, withTransaction } from "./db.js";
 import { fetchSalesOrderReferenceFromNetSuite, fetchTransactionReferenceByTranidFromNetSuite } from "./netsuite.js";
-import { buildAuthorizationUrl, exchangeCodeForToken, fetchDeliveryOrdersFromNetSuite, fetchDeliveryOrderFromNetSuite, fetchCustomerPickupOrderFromNetSuite, fetchDeliveryOrderDetailsFromNetSuite, fetchDeliveryOrderDetailsBatchFromNetSuite, fetchTransferDeliveryOrdersFromNetSuite, fetchTransferDeliveryOrderFromNetSuite, fetchTransferOrderDetailsFromNetSuite, fetchTransferOrderVerificationLinesFromNetSuite, fetchTransferOrderByIdFromNetSuite, findTransferOrdersByDependencyMarkerFromNetSuite, findTransferOrdersBySmartScmMarkerFromNetSuite, fetchPurchaseOrdersFromNetSuite, fetchPurchaseOrderFromNetSuite, fetchPurchaseOrderReferenceFromNetSuite, fetchPurchaseOrderDetailsFromNetSuite, fetchTransferReceivingOrdersFromNetSuite, fetchTransferReceivingOrderFromNetSuite, fetchInventoryBalanceForItemFromNetSuite, fetchInventoryBalancesFromNetSuite, fetchInventoryBalancesForItemsFromNetSuite, fetchItemFulfillmentFromNetSuite, fetchItemReceiptFromNetSuite, fetchTransactionProgressFromNetSuite, fetchTransactionStatusFromNetSuite, createPurchaseOrderInNetSuite, createTransferOrderInNetSuite, updateTransferOrderStatusInNetSuite, fetchPickingTicketFromNetSuite, resolveNetSuiteTransferLocations, resolveNetSuiteYardLocations, resolvePalletItemFromNetSuite, transformSalesOrderToItemFulfillment, transformTransferOrderToItemFulfillment, transformPurchaseOrderToItemReceipt, transformTransferOrderToItemReceipt } from "./netsuite.js";
-import { buildTransferDependencyRestPayload, selectSmartScmMarkerTransferOrder, smartScmTransferOrderMemoMarker, transferDependencyMemoMarker } from "./transfer-dependency-netsuite.js";
+import { buildAuthorizationUrl, exchangeCodeForToken, fetchDeliveryOrdersFromNetSuite, fetchDeliveryOrderFromNetSuite, fetchCustomerPickupOrderFromNetSuite, fetchDeliveryOrderDetailsFromNetSuite, fetchDeliveryOrderDetailsBatchFromNetSuite, fetchTransferDeliveryOrdersFromNetSuite, fetchTransferDeliveryOrderFromNetSuite, fetchTransferOrderDetailsFromNetSuite, fetchTransferOrderVerificationLinesFromNetSuite, fetchTransferOrderByIdFromNetSuite, findTransferOrdersByDependencyMarkerFromNetSuite, findTransferOrdersBySmartScmMarkerFromNetSuite, fetchPurchaseOrdersFromNetSuite, fetchPurchaseOrderFromNetSuite, fetchPurchaseOrderReferenceFromNetSuite, fetchPurchaseOrderDetailsFromNetSuite, fetchTransferReceivingOrdersFromNetSuite, fetchTransferReceivingOrderFromNetSuite, fetchInventoryBalanceForItemFromNetSuite, fetchInventoryBalancesFromNetSuite, fetchInventoryBalancesForItemsFromNetSuite, fetchItemFulfillmentFromNetSuite, fetchItemReceiptFromNetSuite, fetchTransactionProgressFromNetSuite, fetchTransactionStatusFromNetSuite, createPurchaseOrderInNetSuite, createTransferOrderInNetSuite, updateTransferOrderInNetSuite, updateTransferOrderStatusInNetSuite, fetchPickingTicketFromNetSuite, resolveNetSuiteTransferLocations, resolveNetSuiteYardLocations, resolvePalletItemFromNetSuite, transformSalesOrderToItemFulfillment, transformTransferOrderToItemFulfillment, transformPurchaseOrderToItemReceipt, transformTransferOrderToItemReceipt } from "./netsuite.js";
+import { buildTransferDependencyRestPayload, selectSmartScmMarkerTransferOrder, smartScmTransferOrderMemoMarker, transferDependencyMemoMarker, transferDependencyPickingTicketJobKey, transferOrderQuantityRevisionStatusBlock } from "./transfer-dependency-netsuite.js";
 import {
   assertScmReconciliationOrderEditable,
   cancelScmReconciliationRun,
@@ -45,11 +45,21 @@ import {
   listBilledSalesOrderFamilyRefs
 } from "./sales-order-reconciliation-repository.js";
 import { isNetSuiteSalesOrderBilled } from "./sales-order-reconciliation.js";
+import { isNetSuiteOperationalWorkActive } from "./netsuite-operational-work.js";
 import { getScmSchedulePreference, normalizeScmSchedulePreferenceSurface, updateScmSchedulePreference } from "./scm-schedule-preference-repository.js";
 import { getScmScheduleFormatting, updateScmScheduleFormatting } from "./scm-schedule-formatting-repository.js";
 import { canViewRestrictedScmOrders, filterRestrictedScmOrders } from "./scm-order-visibility.js";
 import { changedPlacedDispatchScmAssignmentRefs } from "./dispatch-scm-placement.js";
 import { syncTargetedNetSuiteOrder } from "./targeted-order-sync.js";
+import { authorizeSalesOrderReload, cancelSalesOrderReload } from "./sales-order-reload.js";
+import {
+  cancelReloadCycle,
+  createReloadCycle,
+  findLocalSalesOrderIdentity,
+  findReloadCycleByRequestId,
+  lockReloadAuthorizationSnapshot,
+  lockReloadCycle
+} from "./sales-order-reload-repository.js";
 import { listDeliveryOrders, listVrmaDeliveryPrepOrders, getDeliveryOrder, getFulfillableDeliveryOrder, buildItemFulfillmentPayload, markDeliveryPrepared, updateDeliveryStatus, confirmDeliveryLine, confirmDeliveryLines, setDeliveryLinePackedQuantity, unpackDeliveryLine, unpackDeliveryOrder, recordDeliveryFulfillment, recordDeliveryFulfillmentFailure, recordDeliveryLoad, listDeliveryFulfillments, getDeliveryBootstrap, getDeliveryPrepNotifications, resetDeliveryFulfillmentState, applyConfirmedDispatchPlanToDelivery, deactivateUnplannedDispatchSplitOrders, getNextDispatchSplitSuffix, getCurrentOperatorDeliveryDraft, releaseCurrentDeliveryDraft, listSavedDeliveryOrdersForOperator, listSavedDeliveryOrderKeysForOperator, saveDeliveryOrderForOperator, removeSavedDeliveryOrderForOperator, listDeliveryLoadTrucks, listDeliveryLoadOrders } from "./delivery-repository.js";
 import { getYardMovementDetail, listYardMovementCsvRows, listYardMovements } from "./yard-movement-repository.js";
 import { yardMixedUnits } from "./yard-quantity.js";
@@ -67,7 +77,7 @@ import { cancelDispatchCustomOrder, canonicalizeDispatchCustomOrdersInPlan, comp
 import { DISPATCH_VENDOR_WEEK_DAYS, listDispatchVendorYards, listDispatchLocalVendors, saveDispatchVendorYardSchedule, updateDispatchVendorYard, upsertDispatchVendorYard, listDispatchParserRules, updateDispatchParserRule, listOllamaAudit, listDispatchVendorMappings, discoverDispatchVendorMappingsFromPurchaseOrders, updateDispatchVendorMapping, createDispatchLocalVendor, updateDispatchLocalVendor } from "./dispatch-enrichment.js";
 import { listDispatchAudit, writeDispatchAudit } from "./dispatch-audit-repository.js";
 import { runWithAuditContext } from "./audit-context.js";
-import { DispatchPlanDateMismatchError, StaleDispatchPlanSaveError, applyDispatchPlannedAssignment, cleanupBilledSalesOrderFamiliesFromDispatchPlan, confirmDispatchPlan, createDispatchPlan, dispatchPlannedAssignmentMap, dispatchPlannedOrderConflictRefs, dispatchPlannedOrderRefs, getCurrentDispatchPlan, getDispatchPlan, getDispatchPlanRevision, getDispatchPlanSnapshot, listDispatchPlanSnapshots, listDispatchPlans, reopenDispatchPlan, restoreDispatchPlanSnapshot, saveDispatchPlanSnapshot } from "./dispatch-plan-repository.js";
+import { DispatchPlanDateMismatchError, StaleDispatchPlanSaveError, applyDispatchPlannedAssignment, cleanupBilledSalesOrderFamiliesFromDispatchPlan, confirmDispatchPlan, createDispatchPlan, dispatchPlannedAssignmentMap, dispatchPlannedOrderConflictRefs, dispatchPlannedOrderRefs, getCurrentDispatchPlan, getDispatchPlan, getDispatchPlanRevision, getDispatchPlanSnapshot, listDispatchPlanSnapshots, listDispatchPlans, reopenDispatchPlan, restoreDispatchPlanSnapshot, saveDispatchPlanRecoveryDraft, saveDispatchPlanSnapshot } from "./dispatch-plan-repository.js";
 import {
   advanceDispatchV2Followup,
   applyDispatchV2Command,
@@ -136,6 +146,11 @@ import {
 } from "./driver-client-version.js";
 import { getDriverOfflineMode } from "./driver-mode-repository.js";
 import {
+  evaluateDriverYardDependencyCompletion,
+  evaluateDriverYardDependencyStart,
+  getDriverYardDependencyMode
+} from "./driver-yard-dependency-mode.js";
+import {
   assertMbtDriverBinProjectionScope,
   authorizeMbtDriverBinProjection
 } from "./mbt/driver-bin-authorization.js";
@@ -153,7 +168,7 @@ import { createPhotoReadToken, createPhotoUploadToken, isJpegEvidenceBytes, isR2
 import { getPhotoArchiveSettings, isPhotoArchiveRunning, photoArchiveAutoTick, readArchivedPhoto, recoverInterruptedPhotoArchive, runPhotoArchive, updatePhotoArchiveSettings } from "./photo-archive-repository.js";
 import { authenticateDispatchDriver, ensureDispatchFleetSetup, getDispatchDriverByLogin, listDispatchDrivers, listDispatchTrucks, replaceDispatchFleetSetup, setDispatchDriverActive, setDispatchTruckActive, updateDispatchTruckCapabilities } from "./dispatch-setup-repository.js";
 import { assertNoActiveConsolidationClaimsByRefs, confirmConsolidationItem, getActiveConsolidationBatch, getSavedConsolidationQueue, packConsolidationOrder, releaseConsolidationBatch, startSavedConsolidationBatch, updateConsolidationLine } from "./delivery-consolidation-repository.js";
-import { DEPENDENCY_YARDS, assertNoActiveOrderDependenciesByRefs, cancelOrderDependency, completeDirectDependenciesForSalesOrderDrop, completeYardDependenciesForTransferDrop, confirmTransferDependencyBatch, createOrderDependency, enrichDispatchOrdersWithDependencies, generateTransferDependencySuggestion, getDependencyInventoryMatrix, getDirectPickupDependencyExecutionBlock, getOrderDependencyOptions, getSalesOrderDependencyExecutionBlock, getTransferDependencyBatch, listOrderDependencies, listTransferDependencyCandidates, markDirectDependencyPickupCompleted, mergeTransferDependencyProposals, normalDispatchGroupTargets, prepareTransferDependencyPalletItem, reconcileCompletedYardTransfersForSalesOrderStart, reconcileOrderDependency, removeTransferDependencyProposalLine, reopenTransferDependencyCandidate, retryTransferDependencyBatch, reviewTransferDependencyCandidate, syncDirectDependencyOperatorProgress, syncOrderDependenciesForTransferOrder, syncOrderDependenciesFromDispatchPlan, updateOrderDependencyMode, updateTransferDependencyBatch, validateDispatchPlanDependencies } from "./order-dependency-repository.js";
+import { DEPENDENCY_YARDS, assertNoActiveOrderDependenciesByRefs, cancelOrderDependency, completeDirectDependenciesForSalesOrderDrop, completeYardDependenciesForTransferDrop, confirmTransferDependencyBatch, createOrderDependency, enrichDispatchOrdersWithDependencies, generateTransferDependencySuggestion, getDependencyInventoryMatrix, getDirectPickupDependencyExecutionBlock, getOrderDependencyOptions, getSalesOrderDependencyExecutionBlock, getTransferDependencyBatch, listOrderDependencies, listTransferDependencyCandidates, markDirectDependencyPickupCompleted, mergeTransferDependencyProposals, normalDispatchGroupTargets, prepareTransferDependencyPalletItem, reconcileCompletedYardTransfersForSalesOrderStart, reconcileOrderDependency, removeTransferDependencyProposalLine, reopenTransferDependencyCandidate, retryTransferDependencyBatch, reviewTransferDependencyCandidate, reviseTransferDependencyProposal, syncDirectDependencyOperatorProgress, syncOrderDependenciesForTransferOrder, syncOrderDependenciesFromDispatchPlan, updateOrderDependencyMode, updateTransferDependencyBatch, validateDispatchPlanDependencies } from "./order-dependency-repository.js";
 import { activateSmartScmInputFile, importSmartScmSalesCsv, listSmartScmInputFiles, parseSmartScmVendorResponseFile, smartScmInputDownload, storeSmartScmInputFile } from "./smart-scm-import-repository.js";
 import { getSmartScmBootstrap, getSmartScmSettings, getSmartScmPlanningRun, listSmartScmForecasts, listSmartScmForecastRuns, listSmartScmPlanningPauses, listSmartScmPlanningRuns, listSmartScmProposals, promoteSmartScmForecastSegment, runSmartScmForecast, runSmartScmPlan, smartScmAutoTick, updateSmartScmSettings } from "./smart-scm-repository.js";
 import { buildSmartScmItemMasterCsvTemplate, getSmartScmSyncStatus, importSmartScmItemMasterCsv, listSmartScmItems, updateSmartScmItem } from "./smart-scm-item-repository.js";
@@ -168,8 +183,10 @@ import {
   finalizeSmartScmBlanketVendorWorkflow,
   listSmartScmBlanketWorkspace,
   removeSmartScmBlanketAlternativeLine,
+  removeSmartScmBlanketProposalLine,
   saveSmartScmBlanketVendorReplyDraft,
   searchSmartScmBlanketAlternatives,
+  splitSmartScmBlanketProposalLine,
   updateSmartScmBlanketProposalLine
 } from "./smart-scm-blanket-repository.js";
 import { completeSmartScmTransferExecution, failSmartScmTransferExecution, getSmartScmProposal, markSmartScmTransferAttention, prepareSmartScmTransferExecution, recordSmartScmVendorResponses, setSmartScmPalletQuantityOverride, updateSmartScmProposal } from "./smart-scm-planning-repository.js";
@@ -253,6 +270,7 @@ const driverGeocodeCache = new Map();
 const transferDependencyAllocationRefreshAt = new Map();
 const DRIVER_GEOCODE_TIMEOUT_MS = 5_000;
 let transferDependencyAllocationRefreshQueue = Promise.resolve();
+let transferDependencyAllocationRefreshScheduled = false;
 let eventSeq = 0;
 
 const defaultDispatchSetup = {
@@ -314,6 +332,7 @@ async function sendLoadedOrdersCsv(req, res, {
     [
       "direction", "type", "order", "yard processed at", "last activity", "delivered at",
       "yard", "party", "driver record only", "driver", "truck", "yard photos", "driver photos",
+      "attempt ID", "attempt kind", "re-load cycle", "re-load reason", "attempt operator", "authorized by", "quantity basis", "attempt processed at",
       "item ID", "SKU", "item name", "description", "processed quantity", "UOM", "PLT", "LYR", "SEC", "PCS"
     ].map(csvCell).join(","),
     ...rows.map((row) => {
@@ -333,6 +352,14 @@ async function sendLoadedOrdersCsv(req, res, {
         row.truck_plate,
         row.yard_photo_count,
         row.driver_photo_count,
+        row.attempt_id,
+        row.attempt_kind,
+        row.attempt_cycle_number,
+        row.attempt_reason,
+        row.attempt_operator,
+        row.attempt_authorized_by,
+        row.attempt_quantity_basis,
+        row.attempt_processed_at,
         row.item_id,
         row.sku,
         row.item_name,
@@ -699,6 +726,86 @@ function sendDispatchLoadAssignmentConflictResponse(res, conflicts = []) {
   });
 }
 
+const DISPATCH_RECOVERY_EXCLUDED_ERROR_CODES = new Set([
+  "DISPATCH_COMMAND_ID_REUSED",
+  "DISPATCH_PLAN_DATE_MISMATCH",
+  "STALE_DISPATCH_PLAN"
+]);
+
+function isDispatchPlanRecoveryValidationError(error) {
+  const code = String(error?.code || "");
+  return Number(error?.status) === 409
+    && !DISPATCH_RECOVERY_EXCLUDED_ERROR_CODES.has(code)
+    && !code.startsWith("DISPATCH_PLAN_EDIT_LEASE");
+}
+
+function dispatchPlanRecoveryJson(value, fallback) {
+  try {
+    return JSON.parse(JSON.stringify(value, (_key, candidate) =>
+      typeof candidate === "bigint" ? candidate.toString() : candidate
+    ));
+  } catch {
+    return fallback;
+  }
+}
+
+function dispatchPlanRecoveryValidationIssues(error) {
+  const conflicts = Array.isArray(error?.conflicts)
+    ? error.conflicts
+    : Array.isArray(error?.duplicates)
+      ? error.duplicates
+      : [];
+  return [{
+    code: String(error?.code || "DISPATCH_PLAN_VALIDATION_FAILED"),
+    message: String(error?.message || "The submitted Dispatch plan could not be applied."),
+    conflicts: dispatchPlanRecoveryJson(conflicts, [])
+  }];
+}
+
+async function sendDispatchPlanRecoverySaved(res, {
+  req,
+  previousPlan,
+  candidate,
+  error,
+  sessionId = ""
+} = {}) {
+  const validationIssues = dispatchPlanRecoveryValidationIssues(error);
+  const recoveryDraft = await saveDispatchPlanRecoveryDraft(previousPlan.id, {
+    orders: candidate?.orders || [],
+    trucks: candidate?.trucks || [],
+    summary: candidate?.summary || {},
+    baseRevision: candidate?.baseRevision ?? req?.body?.baseRevision ?? null,
+    planDate: candidate?.planDate || previousPlan.planDate,
+    sessionId,
+    validationIssues
+  });
+  void writeDispatchAudit({
+    action: "dispatch_plan_recovery_saved",
+    entityType: "plan",
+    entityId: String(previousPlan.id),
+    planId: previousPlan.id,
+    planDate: previousPlan.planDate,
+    operatorId: req?.operator?.id,
+    operatorName: req?.operator?.display_name || req?.operator?.username,
+    sessionId,
+    details: {
+      recoverySnapshotId: recoveryDraft.id,
+      activeRevision: recoveryDraft.activeRevision,
+      activeStatus: recoveryDraft.activeStatus,
+      validationIssues,
+      applied: false,
+      deduplicated: recoveryDraft.deduplicated
+    }
+  }).catch(() => null);
+  return res.status(202).json({
+    code: "DISPATCH_PLAN_RECOVERY_SAVED",
+    saved: true,
+    applied: false,
+    validationIssues,
+    recoveryDraft
+  });
+}
+
 function dispatchTruckSequenceKey(truck = {}) {
   return String(truck.id || truck.plate || "").trim();
 }
@@ -977,6 +1084,33 @@ async function listRestrictedScmDispatchOrderRefs() {
         WHERE LOWER(BTRIM(COALESCE(state.application_status, 'Queued'))) IN (
           'hold', 'complete', 'completed', 'cancelled', 'canceled'
         )
+          AND (
+            LOWER(BTRIM(COALESCE(state.application_status, ''))) IN ('complete', 'completed')
+            OR NOT EXISTS (
+              SELECT 1
+                FROM scm_transport_schedule manual_schedule
+               WHERE manual_schedule.order_kind = state.order_kind
+                 AND LOWER(BTRIM(COALESCE(manual_schedule.updated_by, ''))) <> 'reconciliation'
+                 AND (state.reconciled_at IS NULL OR manual_schedule.updated_at > state.reconciled_at)
+                 AND (
+                   manual_schedule.source_id = state.source_order_netsuite_id
+                   OR LOWER(BTRIM(manual_schedule.order_ref)) = LOWER(BTRIM(state.source_order_ref))
+                   OR LOWER(BTRIM(COALESCE(manual_schedule.display_ref, ''))) = LOWER(BTRIM(state.source_order_ref))
+                   OR (
+                     state.order_kind = 'PO'
+                     AND EXISTS (
+                       SELECT 1
+                         FROM purchase_orders override_po
+                        WHERE override_po.netsuite_id = state.source_order_netsuite_id
+                          AND LOWER(BTRIM(manual_schedule.order_ref)) IN (
+                            LOWER(BTRIM(override_po.tranid)),
+                            LOWER(BTRIM(COALESCE(NULLIF(override_po.dispatch_ref, ''), override_po.tranid)))
+                          )
+                     )
+                   )
+                 )
+            )
+          )
        UNION ALL
        SELECT target.target_ref AS order_ref,
               NULL::text AS display_ref,
@@ -992,6 +1126,37 @@ async function listRestrictedScmDispatchOrderRefs() {
         WHERE LOWER(BTRIM(COALESCE(target.target_state->>'applicationStatus', 'Queued'))) IN (
           'hold', 'complete', 'completed', 'cancelled', 'canceled'
         )
+          AND (
+            LOWER(BTRIM(COALESCE(target.target_state->>'applicationStatus', ''))) IN ('complete', 'completed')
+            OR NOT EXISTS (
+              SELECT 1
+                FROM scm_transport_schedule manual_schedule
+               WHERE manual_schedule.order_kind = state.order_kind
+                 AND LOWER(BTRIM(COALESCE(manual_schedule.updated_by, ''))) <> 'reconciliation'
+                 AND (state.reconciled_at IS NULL OR manual_schedule.updated_at > state.reconciled_at)
+                 AND (
+                   LOWER(BTRIM(manual_schedule.order_ref)) = LOWER(BTRIM(target.target_ref))
+                   OR LOWER(BTRIM(COALESCE(manual_schedule.display_ref, ''))) = LOWER(BTRIM(target.target_ref))
+                   OR LOWER(BTRIM(COALESCE(manual_schedule.group_ref, ''))) = LOWER(BTRIM(target.target_ref))
+                   OR (
+                     state.order_kind = 'PO'
+                     AND EXISTS (
+                       SELECT 1
+                         FROM purchase_orders override_po
+                        WHERE override_po.netsuite_id = state.source_order_netsuite_id
+                          AND LOWER(BTRIM(target.target_ref)) IN (
+                            LOWER(BTRIM(override_po.tranid)),
+                            LOWER(BTRIM(COALESCE(NULLIF(override_po.dispatch_ref, ''), override_po.tranid)))
+                          )
+                          AND LOWER(BTRIM(manual_schedule.order_ref)) IN (
+                            LOWER(BTRIM(override_po.tranid)),
+                            LOWER(BTRIM(COALESCE(NULLIF(override_po.dispatch_ref, ''), override_po.tranid)))
+                          )
+                     )
+                   )
+                 )
+            )
+          )
      )
      SELECT DISTINCT LOWER(BTRIM(ref.value)) AS order_ref
        FROM restricted_rows restricted_row
@@ -1175,7 +1340,9 @@ async function listDispatchOrdersForResponse({ type = null, search = "" } = {}) 
         orderRef: order.id,
         sourceRef: order.originalPoRef || order.originalOrderId || order.id,
         sourceId: order.netsuiteId || order.sourceId || order.raw?.netsuite_id || null,
-        status: order.scm?.status || "Queued"
+        status: order.scm?.status || "Queued",
+        scheduleId: order.scm?.scheduleId || null,
+        updatedAt: order.scm?.updatedAt || null
       })),
     { includeDetails: false, view: "dispatch" }
   );
@@ -1301,6 +1468,36 @@ async function transferDependencyRestPayload({ proposal, batch }) {
   };
 }
 
+async function inspectTransferDependencyOrderQuantities({ proposal }) {
+  const transferOrderId = Number(proposal.transferOrderId);
+  const locations = await resolveNetSuiteTransferLocations({
+    sourceLocationId: proposal.fromLocationId,
+    sourceLocation: proposal.fromLocation,
+    destinationLocationId: proposal.toLocationId,
+    destinationLocation: proposal.toLocation
+  });
+  const [order, remoteLines] = await Promise.all([
+    fetchTransferOrderByIdFromNetSuite(transferOrderId),
+    fetchTransferOrderVerificationLinesFromNetSuite(transferOrderId, locations.source.netsuiteLocationId)
+  ]);
+  const mismatches = transferDependencyVerificationMismatches(proposal, remoteLines);
+  if (!order) mismatches.unshift(`${proposal.transferOrderRef || transferOrderId} was not found in NetSuite`);
+  if (order && String(order.source_location_id) !== String(locations.source.netsuiteLocationId)) {
+    mismatches.unshift(`source yard: local ${proposal.fromLocation}, NetSuite ${order.source_location || order.source_location_id || "missing"}`);
+  }
+  if (order && String(order.destination_location_id) !== String(locations.destination.netsuiteLocationId)) {
+    mismatches.unshift(`destination yard: local ${proposal.toLocation}, NetSuite ${order.destination_location || order.destination_location_id || "missing"}`);
+  }
+  return {
+    matches: Boolean(order) && mismatches.length === 0,
+    mismatches,
+    order,
+    revisionStatusBlock: order ? transferOrderQuantityRevisionStatusBlock(order) : "The NetSuite Transfer Order was not found.",
+    remoteLines,
+    locations
+  };
+}
+
 const TRANSFER_DEPENDENCY_ALLOCATION_TTL_MS = 60 * 1000;
 
 async function transferDependencyAllocationOrderIds(salesOrderId = null) {
@@ -1353,6 +1550,26 @@ async function refreshTransferDependencySalesOrderAllocations({
   const result = transferDependencyAllocationRefreshQueue.then(run, run);
   transferDependencyAllocationRefreshQueue = result.catch(() => {});
   return result;
+}
+
+function scheduleTransferDependencyAllocationRefresh() {
+  if (transferDependencyAllocationRefreshScheduled) return;
+  transferDependencyAllocationRefreshScheduled = true;
+  setTimeout(async () => {
+    try {
+      const result = await refreshTransferDependencySalesOrderAllocations();
+      if (Number(result?.refreshed || 0) > 0) {
+        emitAppEvent("scm.transfer_dependency.updated", {
+          source: "background-sales-order-allocation-refresh",
+          refreshed: Number(result.refreshed)
+        });
+      }
+    } catch (error) {
+      console.error("Background Auto Transfer allocation refresh failed:", error);
+    } finally {
+      transferDependencyAllocationRefreshScheduled = false;
+    }
+  }, 0);
 }
 
 async function refreshTransferDependencyBatchSalesOrderAllocations(batchId, { force = true } = {}) {
@@ -1616,7 +1833,49 @@ function transferDependencyVerificationMismatches(proposal, remoteLines = []) {
   return mismatches;
 }
 
-async function approveAndPrintTransferDependencyProposal(batchId, proposalId, operator) {
+export async function claimTransferDependencyPrintGeneration(proposalId, requestId) {
+  return withTransaction(async () => {
+    const locked = await query(
+      `SELECT id, print_generation, print_request_status, print_request_id,
+              print_request_started_at
+         FROM scm_transfer_dependency_proposals
+        WHERE id = $1
+        FOR UPDATE`,
+      [Number(proposalId)]
+    );
+    if (!locked.rowCount) throw Object.assign(new Error("Transfer proposal not found."), { status: 404 });
+    const current = locked.rows[0];
+    if (current.print_request_id === requestId && Number(current.print_generation) > 0) {
+      return {
+        generation: Number(current.print_generation),
+        requestId,
+        recovered: true
+      };
+    }
+    if (["queueing", "attention"].includes(current.print_request_status)) {
+      return {
+        generation: Number(current.print_generation),
+        requestId: current.print_request_id || requestId,
+        recovered: true
+      };
+    }
+    const generation = Number(current.print_generation || 0) + 1;
+    await query(
+      `UPDATE scm_transfer_dependency_proposals
+          SET print_generation = $2, print_request_status = 'queueing',
+              print_request_id = $3, print_request_started_at = now(),
+              print_request_error = NULL, updated_at = now()
+        WHERE id = $1`,
+      [Number(proposalId), generation, requestId]
+    );
+    return { generation, requestId, recovered: false };
+  });
+}
+
+async function approveAndPrintTransferDependencyProposal(batchId, proposalId, operator, {
+  reprint = false,
+  requestId = null
+} = {}) {
   const batch = await getTransferDependencyBatch(batchId);
   if (!batch) throw Object.assign(new Error("Dependency batch not found."), { status: 404 });
   const proposal = batch.proposals.find((row) => String(row.id) === String(proposalId));
@@ -1628,12 +1887,18 @@ async function approveAndPrintTransferDependencyProposal(batchId, proposalId, op
   if (!['created', 'attention'].includes(proposal.creationStatus)) {
     throw Object.assign(new Error("This Transfer Order is not ready for approval."), { status: 409 });
   }
+  if (proposal.revisionStatus !== "idle") {
+    throw Object.assign(new Error("Recover or finish the pending quantity revision before printing this Transfer Order."), { status: 409 });
+  }
   if (proposal.printJob) {
     let printJob = proposal.printJob;
     if (["failed", "uncertain"].includes(printJob.status)) {
       printJob = await retrySmartScmPrintJob(printJob.id, operator?.id);
+      return { batch: await getTransferDependencyBatch(batchId), proposalId: proposal.id, transferOrderId, transferOrderRef: proposal.transferOrderRef, printJob, reused: true };
     }
-    return { batch: await getTransferDependencyBatch(batchId), proposalId: proposal.id, transferOrderId, transferOrderRef: proposal.transferOrderRef, printJob, reused: true };
+    if (["queued", "leased", "printing"].includes(printJob.status) || !reprint) {
+      return { batch: await getTransferDependencyBatch(batchId), proposalId: proposal.id, transferOrderId, transferOrderRef: proposal.transferOrderRef, printJob, reused: true };
+    }
   }
 
   const locations = await resolveNetSuiteTransferLocations({
@@ -1750,6 +2015,8 @@ async function approveAndPrintTransferDependencyProposal(batchId, proposalId, op
       );
     }
 
+    const resolvedPrintRequestId = String(requestId || crypto.randomUUID());
+    const printClaim = await claimTransferDependencyPrintGeneration(proposal.id, resolvedPrintRequestId);
     const document = await fetchPickingTicketFromNetSuite(transferOrderId, { filenamePrefix: proposal.transferOrderRef });
     const printJob = await queueSmartScmPrintJob({
       proposalId: null,
@@ -1757,7 +2024,11 @@ async function approveAndPrintTransferDependencyProposal(batchId, proposalId, op
       documentType: "transfer_dependency_picking_ticket",
       documentName: document.filename,
       documentBuffer: document.buffer,
-      jobKey: `transfer-dependency:${proposal.id}:picking-ticket:${proposal.transferOrderRef}`,
+      jobKey: transferDependencyPickingTicketJobKey({
+        proposalId: proposal.id,
+        transferOrderRef: proposal.transferOrderRef,
+        generation: printClaim.generation
+      }),
       sourceOrderId: transferOrderId,
       sourceOrderRef: proposal.transferOrderRef,
       lineLocationId: proposal.fromLocationId
@@ -1765,7 +2036,9 @@ async function approveAndPrintTransferDependencyProposal(batchId, proposalId, op
     await query(
       `UPDATE scm_transfer_dependency_proposals
           SET approval_status = 'approved', approval_error = NULL,
-              print_job_id = $2, updated_at = now()
+              print_job_id = $2, print_request_status = 'idle',
+              print_request_started_at = NULL,
+              print_request_error = NULL, updated_at = now()
         WHERE id = $1`,
       [Number(proposal.id), printJob.id]
     );
@@ -1776,13 +2049,30 @@ async function approveAndPrintTransferDependencyProposal(batchId, proposalId, op
       entityId: String(proposal.id),
       orderId: proposal.transferOrderRef,
       operatorId: operator?.id,
-      details: { batchId: batch.id, salesOrderRef: batch.salesOrderRef, transferOrderId, sourceYard: proposal.fromLocation, printJobId: printJob.id }
+      details: {
+        batchId: batch.id,
+        salesOrderRef: batch.salesOrderRef,
+        transferOrderId,
+        sourceYard: proposal.fromLocation,
+        printJobId: printJob.id,
+        printGeneration: printClaim.generation,
+        reprint: Boolean(proposal.printJob)
+      }
     });
     return { batch: await getTransferDependencyBatch(batchId), proposalId: proposal.id, transferOrderId, transferOrderRef: proposal.transferOrderRef, printJob };
   } catch (error) {
     await query(
       `UPDATE scm_transfer_dependency_proposals
-          SET approval_status = $2, approval_error = $3, updated_at = now()
+          SET approval_status = $2, approval_error = $3,
+              print_request_status = CASE
+                WHEN print_request_status = 'queueing' THEN 'attention'
+                ELSE print_request_status
+              END,
+              print_request_error = CASE
+                WHEN print_request_status = 'queueing' THEN $3
+                ELSE print_request_error
+              END,
+              updated_at = now()
         WHERE id = $1`,
       [Number(proposal.id), approved ? "approved" : "failed", error.message]
     );
@@ -3072,6 +3362,7 @@ async function completeDriverJobOperationalEffects({
   driverRemark = undefined
 } = {}) {
   if (!job?.jobId) throw new Error("Driver job is no longer available.");
+  const yardDependencyMode = await getDriverYardDependencyMode();
   const completion = await withTransaction(async () => {
     const record = await recordDriverJobPhotos(driverLogin, job.jobId, {
       photoDataUrls,
@@ -3081,6 +3372,7 @@ async function completeDriverJobOperationalEffects({
       driverRemark
     });
     let dependencyUpdate = null;
+    let dependencyWarnings = [];
     let completedCustomOrders = [];
     if (job.stopType === "pickup") {
       const transferRefs = (job.dependencyPickupManifests || [])
@@ -3103,15 +3395,20 @@ async function completeDriverJobOperationalEffects({
         destinationLocationId: job.destinationLocationId,
         expectedSourceOfflineEventId: offlineTrace?.eventId || ""
       });
-      if (yardReplenishment.skipped.length) {
-        const conflicts = yardReplenishment.skipped.map((item) => ({
-          transferOrderRef: item.transferOrderRef || "",
-          reason: item.reason || "yard_dependency_delivery_not_applied"
-        }));
+      const conflicts = yardReplenishment.skipped.map((item) => ({
+        transferOrderRef: item.transferOrderRef || "",
+        reason: item.reason || "yard_dependency_delivery_not_applied"
+      }));
+      const yardDependencyDecision = evaluateDriverYardDependencyCompletion({
+        conflicts,
+        softMode: yardDependencyMode.soft
+      });
+      dependencyWarnings = yardDependencyDecision.warnings;
+      if (yardDependencyDecision.blocking.length) {
         throw Object.assign(
           new Error(
             `The Transfer Order drop evidence needs dependency review: ${
-              conflicts.map((item) =>
+              yardDependencyDecision.blocking.map((item) =>
                 `${item.transferOrderRef || "Transfer Order"} (${item.reason})`
               ).join(", ")
             }`
@@ -3119,7 +3416,7 @@ async function completeDriverJobOperationalEffects({
           {
             status: 409,
             code: "YARD_DEPENDENCY_DELIVERY_REVIEW_REQUIRED",
-            conflicts
+            conflicts: yardDependencyDecision.blocking
           }
         );
       }
@@ -3142,6 +3439,8 @@ async function completeDriverJobOperationalEffects({
           ...directToCustomer.alreadyCompleted
         ],
         skipped: yardReplenishment.skipped,
+        warnings: dependencyWarnings,
+        yardDependencyMode: yardDependencyDecision.mode,
         yardReplenishment,
         directToCustomer
       };
@@ -3150,8 +3449,22 @@ async function completeDriverJobOperationalEffects({
         `driver:${driverLogin}`
       );
     }
-    return { record, dependencyUpdate, completedCustomOrders };
+    return { record, dependencyUpdate, dependencyWarnings, completedCustomOrders };
   });
+  if (completion.dependencyWarnings.length) {
+    await writeDispatchAudit({
+      action: "driver.yard_dependency.soft_bypass",
+      entityType: "driver_job",
+      entityId: job.jobId,
+      actorType: "driver",
+      actorId: driverLogin,
+      details: {
+        phase: "completion",
+        settingRevision: yardDependencyMode.revision,
+        warnings: completion.dependencyWarnings
+      }
+    }).catch(() => null);
+  }
   let billedSalesOrderPlanCleanup = null;
   let billedSalesOrderPlanCleanupWarning = "";
   if (job.planId) {
@@ -3255,6 +3568,8 @@ async function applyDriverOfflineEvent({
   }
   if (event.eventType === "job_started") {
     if (!job) throw new Error("The job to start is unavailable.");
+    let dependencyWarnings = [];
+    let yardDependencyModeRevision = null;
     if (job.stopType === "pickup" || job.stopType === "dropoff") {
       await reconcileCompletedYardTransfersForSalesOrderStart({
         salesOrderRefs: job.orderRefs || [],
@@ -3263,10 +3578,19 @@ async function applyDriverOfflineEvent({
         driverLogin,
         event
       });
-      const dependencyBlock = await getSalesOrderDependencyExecutionBlock(job.orderRefs || []);
-      if (dependencyBlock) throw Object.assign(new Error(dependencyBlock.message), {
+      const [dependencyBlock, yardDependencyMode] = await Promise.all([
+        getSalesOrderDependencyExecutionBlock(job.orderRefs || []),
+        getDriverYardDependencyMode()
+      ]);
+      const yardDependencyDecision = evaluateDriverYardDependencyStart({
+        block: dependencyBlock,
+        softMode: yardDependencyMode.soft
+      });
+      if (yardDependencyDecision.blocking) throw Object.assign(new Error(yardDependencyDecision.blocking.message), {
         code: "OFFLINE_DEPENDENCY_BLOCKED"
       });
+      dependencyWarnings = yardDependencyDecision.warnings;
+      yardDependencyModeRevision = yardDependencyMode.revision;
       if (job.stopType === "pickup") {
         const directTransferRefs = (job.dependencyPickupManifests || [])
           .map((entry) => entry.transferOrderRef)
@@ -3282,6 +3606,21 @@ async function applyDriverOfflineEvent({
       occurredAt: event.occurredAt,
       offlineTrace
     });
+    if (dependencyWarnings.length) {
+      await writeDispatchAudit({
+        action: "driver.yard_dependency.soft_bypass",
+        entityType: "driver_job",
+        entityId: job.jobId,
+        actorType: "driver",
+        actorId: driverLogin,
+        details: {
+          phase: "start",
+          offline: true,
+          settingRevision: yardDependencyModeRevision,
+          warnings: dependencyWarnings
+        }
+      }).catch(() => null);
+    }
     emitAppEvent("driver.job.started", {
       driverLogin,
       eventId: event.eventId,
@@ -3293,6 +3632,7 @@ async function applyDriverOfflineEvent({
     });
     return {
       recordId: record?.id || null,
+      dependencyWarnings,
       samsaraDutyPendingOnline: manifest?.samsaraWorkflowEnabled === true,
       samsaraDutyReconciled: manifest?.samsaraWorkflowEnabled !== true
     };
@@ -3340,6 +3680,7 @@ async function applyDriverOfflineEvent({
     return {
       recordId: completion.record?.id || null,
       dependencyUpdated: Boolean(completion.dependencyUpdate),
+      dependencyWarnings: completion.dependencyWarnings || [],
       completedCustomOrderCount: completion.completedCustomOrders.length
     };
   }
@@ -4479,6 +4820,19 @@ function requireControlAccess(req, res, next) {
   next();
 }
 
+function assertSalesOrderReloadControlYard(operator, locationId) {
+  if (operatorHasAnyRole(operator, ["admin"])) return;
+  const allowed = (operator?.yardLocationIds || [])
+    .map(Number)
+    .filter((value) => Number.isInteger(value) && value > 0);
+  if (!Number.isInteger(Number(locationId)) || !allowed.includes(Number(locationId))) {
+    throw Object.assign(new Error("This Sales Order is outside your assigned outbound yards."), {
+      status: 403,
+      code: "RELOAD_YARD_FORBIDDEN"
+    });
+  }
+}
+
 function requireOperatorAccess(req, res, next) {
   if (!operatorHasAnyRole(req.operator, ["admin", "operator", "yard_manager"])) {
     return sendRoleForbidden(res, req.operator, "Operator account required");
@@ -5349,9 +5703,44 @@ function anyNetSuiteSyncRunning() {
     || targetedSyncRunning
     || netSuiteJobMapHasRunningWork(fulfillmentJobs)
     || netSuiteJobMapHasRunningWork(receivingJobs)
-    || returnPendingSyncRunning
-    || returnReconciliationRunning;
+    || isNetSuiteOperationalWorkActive();
 }
+
+async function refreshSalesOrderForReload({ orderRef, actor } = {}) {
+  if (anyNetSuiteSyncRunning()) {
+    throw Object.assign(new Error("Another NetSuite sync is currently running. Wait for it to finish, then retry the re-load authorization."), {
+      status: 409,
+      code: "RELOAD_SYNC_RUNNING"
+    });
+  }
+  targetedSyncRunning = true;
+  try {
+    return await syncTargetedNetSuiteOrder({
+      orderRef,
+      actorOperatorId: actor?.id || null
+    }, targetedOrderSyncDependencies);
+  } finally {
+    targetedSyncRunning = false;
+  }
+}
+
+const salesOrderReloadAuthorizationDependencies = {
+  findCycleByRequestId: findReloadCycleByRequestId,
+  findLocalOrderIdentity: findLocalSalesOrderIdentity,
+  assertActorYardAccess: assertSalesOrderReloadControlYard,
+  refreshOrder: refreshSalesOrderForReload,
+  withTransaction,
+  lockAuthorizationSnapshot: lockReloadAuthorizationSnapshot,
+  createCycle: createReloadCycle,
+  writeAudit
+};
+
+const salesOrderReloadCancellationDependencies = {
+  withTransaction,
+  lockCycle: lockReloadCycle,
+  cancelCycle: cancelReloadCycle,
+  writeAudit
+};
 
 class DispatchSyncStoppedError extends Error {
   constructor(message) {
@@ -7332,6 +7721,43 @@ app.patch("/api/scm/smart/blanket-proposals/:id/lines/:lineId", requireSmartScmW
   }
 });
 
+app.post("/api/scm/smart/blanket-proposals/:id/lines/:lineId/split", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const run = await splitSmartScmBlanketProposalLine(
+      req.params.id,
+      req.params.lineId,
+      req.body || {},
+      operatorId(req)
+    );
+    emitAppEvent("scm.smart.updated", {
+      source: "blanket-proposal-line-split",
+      proposalId: Number(req.params.id),
+      planningRunId: run.id
+    });
+    res.status(201).json(run);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete("/api/scm/smart/blanket-proposals/:id/lines/:lineId", requireSmartScmWriteAccess, async (req, res, next) => {
+  try {
+    const result = await removeSmartScmBlanketProposalLine(
+      req.params.id,
+      req.params.lineId,
+      operatorId(req)
+    );
+    emitAppEvent("scm.smart.updated", {
+      source: "blanket-proposal-line-remove",
+      proposalId: Number(req.params.id),
+      planningRunId: result.runId
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.delete("/api/scm/smart/blanket-releases/:id", requireSmartScmWriteAccess, async (req, res, next) => {
   try {
     const result = await cancelSmartScmBlanketReservation(req.params.id, req.body || {}, operatorId(req));
@@ -7679,6 +8105,7 @@ app.get("/api/scm/netsuite-po-history", async (req, res, next) => {
       vendorId: req.query.vendorId,
       vendorYard: req.query.vendorYard,
       destinationLocationId: req.query.destinationLocationId,
+      lifecycle: req.query.lifecycle,
       page: req.query.page,
       pageSize: req.query.pageSize
     }));
@@ -9611,12 +10038,15 @@ async function prepareDispatchV2ReplaceCommand(previousPlan = {}, command = {}) 
 }
 
 app.post("/api/dispatch/v2/plans/:id/commands", requireOperator, requireDispatcher, async (req, res, next) => {
+  let previousPlan = null;
+  let submittedCommand = null;
+  let command = null;
   try {
     dispatchPrivateNoStore(res);
-    const previousPlan = await getDispatchPlan(req.params.id);
+    previousPlan = await getDispatchPlan(req.params.id);
     if (!previousPlan) return res.status(404).json({ error: "Dispatch plan not found", code: "DISPATCH_PLAN_NOT_FOUND" });
     await requireDispatchV2PlanEditLease(req, previousPlan.planDate);
-    const submittedCommand = {
+    submittedCommand = {
       ...(req.body || {}),
       sourceRequestHash: crypto.createHash("sha256").update(JSON.stringify(stableJsonValue({
         commandId: String(req.body?.commandId || ""),
@@ -9631,7 +10061,7 @@ app.post("/api/dispatch/v2/plans/:id/commands", requireOperator, requireDispatch
       res.setHeader("X-Dispatch-Idempotent-Replay", "true");
       return res.json(stored.payload);
     }
-    const command = String(submittedCommand.commandType || submittedCommand.type || "") === "replace_plan"
+    command = String(submittedCommand.commandType || submittedCommand.type || "") === "replace_plan"
       ? await prepareDispatchV2ReplaceCommand(previousPlan, submittedCommand)
       : submittedCommand;
     const result = await applyDispatchV2Command({
@@ -9670,6 +10100,31 @@ app.post("/api/dispatch/v2/plans/:id/commands", requireOperator, requireDispatch
     res.json(result.payload);
   } catch (error) {
     if (error instanceof DispatchPlanEditLeaseError) return sendDispatchPlanEditLeaseError(res, error);
+    const recoveryCommand = command || submittedCommand;
+    if (
+      previousPlan
+      && String(recoveryCommand?.commandType || recoveryCommand?.type || "") === "replace_plan"
+      && isDispatchPlanRecoveryValidationError(error)
+    ) {
+      const payload = recoveryCommand?.payload || {};
+      try {
+        return await sendDispatchPlanRecoverySaved(res, {
+          req,
+          previousPlan,
+          candidate: {
+            planDate: payload.planDate || previousPlan.planDate,
+            baseRevision: recoveryCommand?.baseRevision,
+            orders: payload.orders || [],
+            trucks: payload.trucks || [],
+            summary: payload.summary || {}
+          },
+          error,
+          sessionId: String(recoveryCommand?.sessionId || "")
+        });
+      } catch (recoveryError) {
+        return next(recoveryError);
+      }
+    }
     next(error);
   }
 });
@@ -9994,6 +10449,7 @@ function reportDispatchSaveTiming(req, res, next) {
 
 app.put("/api/dispatch/plans/:id", reportDispatchSaveTiming, requireOperator, requireDispatcher, async (req, res, next) => {
   let previousPlan = null;
+  let recoveryCandidate = null;
   try {
     previousPlan = await getDispatchPlan(req.params.id);
     if (!previousPlan) return res.status(404).json({ error: "Dispatch plan not found" });
@@ -10017,6 +10473,13 @@ app.put("/api/dispatch/plans/:id", reportDispatchSaveTiming, requireOperator, re
     let cleanTrucks = saveMode === "truck_sequence" && previousPlan
       ? mergeDispatchTruckSequence(previousPlan.trucks || [], requestedTrucks)
       : requestedTrucks;
+    recoveryCandidate = {
+      planDate: previousPlan.planDate,
+      baseRevision: req.body?.baseRevision,
+      orders: cleanOrders,
+      trucks: cleanTrucks,
+      summary: req.body?.summary || {}
+    };
     if (config.dispatch?.driverOrientedPlanning) {
       cleanTrucks = normalizeDispatchPlanLoadAssignments({ ...previousPlan, trucks: cleanTrucks }).trucks;
     }
@@ -10028,6 +10491,7 @@ app.put("/api/dispatch/plans/:id", reportDispatchSaveTiming, requireOperator, re
     }, { previousPlan });
     cleanOrders = sanitizeDispatchPlanOrders(canonicalCandidate.orders || []);
     cleanTrucks = canonicalCandidate.trucks || [];
+    recoveryCandidate = { ...recoveryCandidate, orders: cleanOrders, trucks: cleanTrucks };
     const scheduleCandidate = await overlayDispatchLockedLoadSchedule(previousPlan, {
       ...previousPlan,
       planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date,
@@ -10035,6 +10499,7 @@ app.put("/api/dispatch/plans/:id", reportDispatchSaveTiming, requireOperator, re
       trucks: cleanTrucks
     });
     cleanTrucks = scheduleCandidate.trucks || [];
+    recoveryCandidate = { ...recoveryCandidate, trucks: cleanTrucks };
     const changedScmRefs = changedDispatchScmRefs(previousPlan, {
       ...previousPlan,
       orders: cleanOrders,
@@ -10050,7 +10515,13 @@ app.put("/api/dispatch/plans/:id", reportDispatchSaveTiming, requireOperator, re
       "save this plan"
     );
     const duplicateDrivers = config.dispatch?.driverOrientedPlanning ? [] : dispatchDuplicateDriverAssignments(cleanTrucks);
-    if (duplicateDrivers.length) return sendDispatchDuplicateDriverResponse(res, duplicateDrivers);
+    if (duplicateDrivers.length) {
+      throw dispatchV2CandidateConflict(
+        "DISPATCH_DRIVER_DUPLICATE",
+        "One driver can only be assigned to one truck.",
+        duplicateDrivers
+      );
+    }
     const dependencyStructureChanges = await assertNoConsolidationStructureConflict(
       previousPlan,
       { orders: cleanOrders }
@@ -10076,30 +10547,58 @@ app.put("/api/dispatch/plans/:id", reportDispatchSaveTiming, requireOperator, re
       trucks: cleanTrucks
     };
     const assignmentConflicts = await dispatchLoadAssignmentConflicts(previousPlan, nextPlanForValidation);
-    if (assignmentConflicts.length) return sendDispatchLoadAssignmentConflictResponse(res, assignmentConflicts);
+    if (assignmentConflicts.length) {
+      const first = assignmentConflicts[0] || {};
+      throw dispatchV2CandidateConflict(
+        first.code || "DISPATCH_DRIVER_TIME_CONFLICT",
+        first.message || "Driver or truck assignment is invalid.",
+        assignmentConflicts
+      );
+    }
     const dateConflicts = await findNewDispatchPlanDateConflicts(previousPlan || {}, {
       ...nextPlanForValidation,
       id: req.params.id
     });
-    if (dateConflicts.length) return sendDispatchPlanDateConflictResponse(res, dateConflicts);
+    if (dateConflicts.length) {
+      const preview = dateConflicts.slice(0, 5).map((item) => `${item.orderRef} on ${item.planDate}`).join(", ");
+      throw dispatchV2CandidateConflict(
+        "DISPATCH_ORDER_ALREADY_PLANNED",
+        `Some orders are already planned on another date${preview ? `: ${preview}` : "."}`,
+        dateConflicts
+      );
+    }
     const coSequenceConflicts = await findChangedDispatchCoSequenceConflicts(previousPlan, {
       id: req.params.id,
       planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date,
       orders: cleanOrders,
       trucks: cleanTrucks
     });
-    if (coSequenceConflicts.length) return sendDispatchCoSequenceConflictResponse(res, coSequenceConflicts);
+    if (coSequenceConflicts.length) {
+      throw dispatchV2CandidateConflict(
+        "DISPATCH_CO_SEQUENCE_INVALID",
+        coSequenceConflicts.slice(0, 3).map((item) => item.reason).join(" ") || "CO must be planned before the original order pickup.",
+        coSequenceConflicts
+      );
+    }
     const dependencyConflicts = await validateDispatchPlanDependencies({
       id: req.params.id,
       planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date,
       orders: cleanOrders,
       trucks: cleanTrucks
     });
-    if (dependencyConflicts.length) return sendDispatchDependencyConflictResponse(res, dependencyConflicts);
+    if (dependencyConflicts.length) {
+      throw dispatchV2CandidateConflict(
+        "DISPATCH_ORDER_DEPENDENCY_CONFLICT",
+        String(dependencyConflicts[0] || "Order dependency timing is invalid."),
+        dependencyConflicts
+      );
+    }
+    const storedSummary = await dispatchPlanSummaryWithSetup(req.body?.summary || {});
+    recoveryCandidate = { ...recoveryCandidate, summary: storedSummary };
     const plan = await saveDispatchPlanSnapshot(req.params.id, {
       orders: cleanOrders,
       trucks: cleanTrucks,
-      summary: await dispatchPlanSummaryWithSetup(req.body?.summary || {}),
+      summary: storedSummary,
       baseRevision: forceSave || saveMode === "truck_sequence" ? null : req.body?.baseRevision,
       planDate: req.body?.planDate || req.body?.date || "",
       sessionId: req.body?.audit?.sessionId || ""
@@ -10176,6 +10675,19 @@ app.put("/api/dispatch/plans/:id", reportDispatchSaveTiming, requireOperator, re
     res.json({ ...plan, operatorFlags, scmSchedule, followupWarnings });
   } catch (error) {
     if (error instanceof DispatchPlanEditLeaseError) return sendDispatchPlanEditLeaseError(res, error);
+    if (previousPlan && recoveryCandidate && isDispatchPlanRecoveryValidationError(error)) {
+      try {
+        return await sendDispatchPlanRecoverySaved(res, {
+          req,
+          previousPlan,
+          candidate: recoveryCandidate,
+          error,
+          sessionId: String(req.body?.audit?.sessionId || "")
+        });
+      } catch (recoveryError) {
+        return next(recoveryError);
+      }
+    }
     if (error instanceof DispatchPlanDateMismatchError) {
       await writeDispatchAudit({
         action: "dispatch.plan.date_mismatch_blocked",
@@ -10264,12 +10776,6 @@ app.post("/api/dispatch/plans/:id/confirm", requireOperator, requireDispatcher, 
         trucks: requestedTrucks
       });
       requestedTrucks = scheduleCandidate.trucks || [];
-      const changedScmRefs = changedDispatchScmRefs(previousPlan, {
-        ...previousPlan,
-        orders: requestedOrders,
-        trucks: requestedTrucks
-      });
-      await assertScmReconciliationOrderEditable({ orderRefs: changedScmRefs });
       await assertNoRestrictedScmDispatchOrders(
         changedPlacedDispatchScmAssignmentRefs(previousPlan, {
           ...previousPlan,
@@ -10330,7 +10836,6 @@ app.post("/api/dispatch/plans/:id/confirm", requireOperator, requireDispatcher, 
       }
     }
     const placedScmRefs = dispatchPlacedScmRefs(planForConfirm);
-    await assertScmReconciliationOrderEditable({ orderRefs: placedScmRefs });
     await assertNoRestrictedScmDispatchOrders(placedScmRefs, "confirm this plan");
     const duplicateDrivers = config.dispatch?.driverOrientedPlanning ? [] : dispatchDuplicateDriverAssignments(planForConfirm?.trucks || []);
     if (duplicateDrivers.length) return sendDispatchDuplicateDriverResponse(res, duplicateDrivers);
@@ -11058,14 +11563,14 @@ app.get("/api/dispatch/loaded-orders/export.csv", async (req, res, next) => {
 
 app.get("/api/scm/transfer-dependencies/candidates", async (req, res, next) => {
   try {
-    if ((req.query.reviewStatus || "open") === "open") {
-      await refreshTransferDependencySalesOrderAllocations();
-    }
-    res.json(await listTransferDependencyCandidates({
+    const reviewStatus = req.query.reviewStatus || "open";
+    const candidates = await listTransferDependencyCandidates({
       search: req.query.search || "",
       salesOrderId: req.query.salesOrderId || null,
-      reviewStatus: req.query.reviewStatus || "open"
-    }));
+      reviewStatus
+    });
+    res.json(candidates);
+    if (["open", "all"].includes(reviewStatus)) scheduleTransferDependencyAllocationRefresh();
   } catch (error) {
     next(error);
   }
@@ -11324,12 +11829,63 @@ app.post("/api/scm/transfer-dependencies/batches/:id/proposals/:proposalId/confi
   }
 });
 
+app.patch("/api/scm/transfer-dependencies/batches/:id/proposals/:proposalId/quantities", async (req, res, next) => {
+  try {
+    if (!operatorHasAnyRole(req.operator, ["admin", "scm", "scm_staff"])) {
+      return res.status(403).json({ error: "SCM write access required." });
+    }
+    const result = await reviseTransferDependencyProposal(
+      req.params.id,
+      req.params.proposalId,
+      req.body || {},
+      {
+        operatorId: req.operator?.id,
+        inspectTransferOrder: inspectTransferDependencyOrderQuantities,
+        updateTransferOrder: async ({ proposal, batch, transferOrderId }) => {
+          const request = await transferDependencyRestPayload({ proposal, batch });
+          return updateTransferOrderInNetSuite(
+            transferOrderId,
+            { item: request.payload.item },
+            { intercompany: request.intercompany }
+          );
+        },
+        hydrateTransferOrder: hydrateCreatedDependencyTransferOrder
+      }
+    );
+    emitAppEvent("scm.transfer_dependency.updated", {
+      source: result.recovered ? "transfer-dependency-quantity-recovered" : "transfer-dependency-quantity-revised",
+      batchId: Number(req.params.id),
+      proposalId: Number(req.params.proposalId)
+    });
+    emitAppEvent("dispatch.orders.updated", {
+      source: "scm-transfer-dependency-quantity-revised",
+      refreshOrderPool: true
+    });
+    return res.json(result);
+  } catch (error) {
+    emitAppEvent("scm.transfer_dependency.updated", {
+      source: "transfer-dependency-quantity-attention",
+      batchId: Number(req.params.id),
+      proposalId: Number(req.params.proposalId)
+    });
+    return next(error);
+  }
+});
+
 app.post("/api/scm/transfer-dependencies/batches/:id/proposals/:proposalId/approve-print", async (req, res, next) => {
   try {
     if (!operatorHasAnyRole(req.operator, ["admin", "scm", "scm_staff"])) {
       return res.status(403).json({ error: "SCM write access required." });
     }
-    const result = await approveAndPrintTransferDependencyProposal(req.params.id, req.params.proposalId, req.operator);
+    const result = await approveAndPrintTransferDependencyProposal(
+      req.params.id,
+      req.params.proposalId,
+      req.operator,
+      {
+        reprint: req.body?.reprint === true,
+        requestId: req.body?.requestId
+      }
+    );
     emitAppEvent("scm.transfer_dependency.updated", {
       source: "transfer-dependency-approve-print",
       batchId: Number(req.params.id),
@@ -14994,6 +15550,22 @@ app.get("/api/driver/next-job", requireDriver, async (req, res, next) => {
     ]);
     const job = jobContext.job;
     const routeBootstrap = await nextJobOfflineRouteBootstrap(req, state, jobContext);
+    let presentedJob = job;
+    if (job && (job.stopType === "pickup" || job.stopType === "dropoff")) {
+      const [dependencyBlock, yardDependencyMode] = await Promise.all([
+        getSalesOrderDependencyExecutionBlock(job.orderRefs || []),
+        getDriverYardDependencyMode()
+      ]);
+      const yardDependencyDecision = evaluateDriverYardDependencyStart({
+        block: dependencyBlock,
+        softMode: yardDependencyMode.soft
+      });
+      presentedJob = {
+        ...job,
+        dependencyWarnings: yardDependencyDecision.warnings,
+        yardDependencyMode: yardDependencyDecision.mode
+      };
+    }
     const deviceId = driverDeviceId(req);
     const pendingCompletion = job?.jobId
       && routeBootstrap?.currentJobFingerprint
@@ -15018,7 +15590,7 @@ app.get("/api/driver/next-job", requireDriver, async (req, res, next) => {
       return res.status(428).json({
         error: `MBBS pre-trip inspection must be received by Samsara before assigned jobs.${suffix}`,
         state,
-        job,
+        job: presentedJob,
         pendingCompletion,
         routeBootstrap,
         offlineEnabled: driverMode.enabled,
@@ -15030,7 +15602,7 @@ app.get("/api/driver/next-job", requireDriver, async (req, res, next) => {
     });
     res.json({
       state,
-      job,
+      job: presentedJob,
       rest,
       restSummary,
       pendingCompletion,
@@ -15342,8 +15914,18 @@ app.post("/api/driver/jobs/:jobId/start", requireDriver, async (req, res, next) 
           clientSequence: req.body?.clientSequence ?? null
         }
       });
-      const dependencyBlock = await getSalesOrderDependencyExecutionBlock(job.orderRefs || []);
-      if (dependencyBlock) return res.status(409).json({ error: dependencyBlock.message, dependencyBlock });
+      const [dependencyBlock, yardDependencyMode] = await Promise.all([
+        getSalesOrderDependencyExecutionBlock(job.orderRefs || []),
+        getDriverYardDependencyMode()
+      ]);
+      const yardDependencyDecision = evaluateDriverYardDependencyStart({
+        block: dependencyBlock,
+        softMode: yardDependencyMode.soft
+      });
+      if (yardDependencyDecision.blocking) return res.status(409).json({
+        error: yardDependencyDecision.blocking.message,
+        dependencyBlock: yardDependencyDecision.blocking
+      });
       if (job.stopType === "pickup") {
         const directTransferRefs = (job.dependencyPickupManifests || []).map((entry) => entry.transferOrderRef).filter(Boolean);
         const directPickupBlock = await getDirectPickupDependencyExecutionBlock(directTransferRefs);
@@ -15354,6 +15936,8 @@ app.post("/api/driver/jobs/:jobId/start", requireDriver, async (req, res, next) 
     const response = await runDriverForegroundAction(receipt, async () => {
       const liveContext = await getDriverNextJobContext(req.driverLogin);
       const liveJob = liveContext.job;
+      let dependencyWarnings = [];
+      let yardDependencyModeRevision = null;
       if (!liveJob || liveJob.jobId !== job.jobId || liveJob.stopType === "truck_switch") {
         throw Object.assign(new Error("This is no longer the next assigned job."), {
           status: 409,
@@ -15372,11 +15956,18 @@ app.post("/api/driver/jobs/:jobId/start", requireDriver, async (req, res, next) 
             clientSequence: req.body?.clientSequence ?? null
           }
         });
-        const liveDependencyBlock = await getSalesOrderDependencyExecutionBlock(
-          liveJob.orderRefs || []
-        );
-        if (liveDependencyBlock) {
-          throw Object.assign(new Error(liveDependencyBlock.message), {
+        const [liveDependencyBlock, yardDependencyMode] = await Promise.all([
+          getSalesOrderDependencyExecutionBlock(liveJob.orderRefs || []),
+          getDriverYardDependencyMode()
+        ]);
+        const liveYardDependencyDecision = evaluateDriverYardDependencyStart({
+          block: liveDependencyBlock,
+          softMode: yardDependencyMode.soft
+        });
+        dependencyWarnings = liveYardDependencyDecision.warnings;
+        yardDependencyModeRevision = yardDependencyMode.revision;
+        if (liveYardDependencyDecision.blocking) {
+          throw Object.assign(new Error(liveYardDependencyDecision.blocking.message), {
             status: 409,
             code: "DRIVER_DEPENDENCY_BLOCKED"
           });
@@ -15404,6 +15995,21 @@ app.post("/api/driver/jobs/:jobId/start", requireDriver, async (req, res, next) 
         job: liveJob,
         occurredAt: req.body?.deviceOccurredAt || null
       });
+      if (dependencyWarnings.length) {
+        await writeDispatchAudit({
+          action: "driver.yard_dependency.soft_bypass",
+          entityType: "driver_job",
+          entityId: liveJob.jobId,
+          actorType: "driver",
+          actorId: req.driverLogin,
+          details: {
+            phase: "start",
+            offline: false,
+            settingRevision: yardDependencyModeRevision,
+            warnings: dependencyWarnings
+          }
+        }).catch(() => null);
+      }
       emitAppEvent("driver.job.started", {
         driverLogin: req.driverLogin,
         jobId: req.params.jobId,
@@ -15411,9 +16017,11 @@ app.post("/api/driver/jobs/:jobId/start", requireDriver, async (req, res, next) 
         orderRefs: liveJob.orderRefs || [],
         samsaraHandoff
       });
+      const nextJob = await getNextDriverJob(req.driverLogin);
       return {
         record,
-        job: await getNextDriverJob(req.driverLogin),
+        job: nextJob ? { ...nextJob, dependencyWarnings } : nextJob,
+        dependencyWarnings,
         samsaraHandoff,
         ...(receipt ? { foregroundEventId: receipt.eventId } : {})
       };
@@ -15657,21 +16265,102 @@ app.post("/api/driver/jobs/:jobId/photos", requireDriver, async (req, res, next)
       photoDataUrls,
       driverRemark: req.body?.driverRemark
     });
-    const { record, dependencyUpdate, completedCustomOrders } = completion;
+    const {
+      record,
+      dependencyUpdate,
+      dependencyWarnings: completionDependencyWarnings,
+      completedCustomOrders
+    } = completion;
     let nextJob = await getNextDriverJob(req.driverLogin);
     let rest = null;
+    let nextDependencyWarnings = [];
+    let nextStartBlock = null;
     if (nextJob && req.body?.autoStartRest === true) {
       rest = await startDriverRest(req.driverLogin, { nextJob });
       emitAppEvent("driver.rest.started", { driverLogin: req.driverLogin, restId: rest.restId, nextJobId: rest.nextJobId || null });
     } else if (nextJob && nextJob.stopType !== "truck_switch" && req.body?.autoStartNext !== false) {
-      await ensureDriverSamsaraDutyForJob(req.driverLogin, {
-        samsaraAccounts: samsaraAccountsForDriver(req.driver),
-        job: nextJob
-      });
-      await startDriverJob(req.driverLogin, nextJob.jobId, { job: nextJob });
-      nextJob = await getNextDriverJob(req.driverLogin);
+      let autoStartAllowed = true;
+      if (nextJob.stopType === "pickup" || nextJob.stopType === "dropoff") {
+        const nextJobContext = await getDriverNextJobContext(req.driverLogin);
+        if (!nextJobContext.job || String(nextJobContext.job.jobId) !== String(nextJob.jobId)) {
+          autoStartAllowed = false;
+          nextStartBlock = {
+            code: "DRIVER_FOREGROUND_TARGET_CHANGED",
+            message: "The next assigned job changed before automatic start. Refresh and start it manually."
+          };
+        } else {
+          nextJob = nextJobContext.job;
+          await reconcileCompletedYardTransfersForSalesOrderStart({
+            salesOrderRefs: nextJob.orderRefs || [],
+            currentJob: nextJob,
+            routeJobs: nextJobContext.jobs || [],
+            driverLogin: req.driverLogin,
+            event: {
+              occurredAt: new Date().toISOString(),
+              deviceId: driverDeviceId(req),
+              clientSequence: req.body?.clientSequence ?? null
+            }
+          });
+          const [dependencyBlock, yardDependencyMode] = await Promise.all([
+            getSalesOrderDependencyExecutionBlock(nextJob.orderRefs || []),
+            getDriverYardDependencyMode()
+          ]);
+          const yardDependencyDecision = evaluateDriverYardDependencyStart({
+            block: dependencyBlock,
+            softMode: yardDependencyMode.soft
+          });
+          nextDependencyWarnings = yardDependencyDecision.warnings;
+          if (yardDependencyDecision.blocking) {
+            autoStartAllowed = false;
+            nextStartBlock = yardDependencyDecision.blocking;
+          }
+          if (nextJob.stopType === "pickup") {
+            const directTransferRefs = (nextJob.dependencyPickupManifests || [])
+              .map((entry) => entry.transferOrderRef)
+              .filter(Boolean);
+            const directPickupBlock = await getDirectPickupDependencyExecutionBlock(
+              directTransferRefs
+            );
+            if (directPickupBlock) {
+              autoStartAllowed = false;
+              nextStartBlock = directPickupBlock;
+            }
+          }
+          if (nextDependencyWarnings.length && autoStartAllowed) {
+            await writeDispatchAudit({
+              action: "driver.yard_dependency.soft_bypass",
+              entityType: "driver_job",
+              entityId: nextJob.jobId,
+              actorType: "driver",
+              actorId: req.driverLogin,
+              details: {
+                phase: "automatic_next_start",
+                settingRevision: yardDependencyMode.revision,
+                warnings: nextDependencyWarnings
+              }
+            }).catch(() => null);
+          }
+        }
+      }
+      if (autoStartAllowed) {
+        await ensureDriverSamsaraDutyForJob(req.driverLogin, {
+          samsaraAccounts: samsaraAccountsForDriver(req.driver),
+          job: nextJob
+        });
+        await startDriverJob(req.driverLogin, nextJob.jobId, { job: nextJob });
+        const startedNextJob = await getNextDriverJob(req.driverLogin);
+        nextJob = startedNextJob
+          ? { ...startedNextJob, dependencyWarnings: nextDependencyWarnings }
+          : startedNextJob;
+      } else if (nextJob) {
+        nextJob = { ...nextJob, dependencyBlock: nextStartBlock };
+      }
     }
-    emitAppEvent("driver.job.completed", { driverLogin: req.driverLogin, jobId: req.params.jobId, stopType: job.stopType, nextJobId: nextJob?.jobId || null, dependencyUpdate });
+    const dependencyWarnings = [
+      ...(completionDependencyWarnings || []),
+      ...nextDependencyWarnings
+    ];
+    emitAppEvent("driver.job.completed", { driverLogin: req.driverLogin, jobId: req.params.jobId, stopType: job.stopType, nextJobId: nextJob?.jobId || null, dependencyUpdate, dependencyWarnings, nextStartBlock });
     if (dependencyUpdate && (Array.isArray(dependencyUpdate) ? dependencyUpdate.length : dependencyUpdate.completed?.length)) {
       emitAppEvent("dispatch.orders.updated", { source: "driver-order-dependency", refreshOrderPool: true });
     }
@@ -15686,7 +16375,7 @@ app.post("/api/driver/jobs/:jobId/photos", requireDriver, async (req, res, next)
     const restSummary = await getDriverRestSummary(req.driverLogin, {
       planDate: rest?.planDate || nextJob?.planDate || job?.planDate || ""
     });
-    res.json({ record, nextJob, rest, restSummary, locationCheck, dependencyUpdate, completedCustomOrders });
+    res.json({ record, nextJob, rest, restSummary, locationCheck, dependencyUpdate, dependencyWarnings, nextStartBlock, completedCustomOrders });
   } catch (error) {
     next(error);
   }
@@ -16303,6 +16992,57 @@ app.post("/api/control/order-locks/release", requireOperator, requireControlAcce
       if (row) released.push({ ...row, order_type: lock.order_type });
     }
     res.json({ released, locks: await listOperatorOrderLocks() });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/control/sales-orders/:orderId/reload-cycles", requireOperator, requireControlAccess, async (req, res, next) => {
+  try {
+    const cycle = await authorizeSalesOrderReload({
+      orderId: req.params.orderId,
+      requestId: req.body?.requestId,
+      reason: req.body?.reason,
+      actor: req.operator
+    }, salesOrderReloadAuthorizationDependencies);
+    emitAppEvent("delivery.order.updated", {
+      orderId: req.params.orderId,
+      reloadCycleId: cycle.id,
+      source: "control-reload-authorized"
+    });
+    emitAppEvent("yard.movement.updated", {
+      orderId: req.params.orderId,
+      reloadCycleId: cycle.id,
+      source: "control-reload-authorized"
+    });
+    res.json({ cycle });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/control/sales-orders/:orderId/reload-cycles/:cycleId/cancel", requireOperator, requireControlAccess, async (req, res, next) => {
+  try {
+    const identity = await findLocalSalesOrderIdentity(req.params.orderId);
+    if (!identity) return res.status(404).json({ error: "Sales Order was not found locally." });
+    assertSalesOrderReloadControlYard(req.operator, identity.outboundLocationId);
+    const cycle = await cancelSalesOrderReload({
+      orderId: req.params.orderId,
+      cycleId: req.params.cycleId,
+      reason: req.body?.reason,
+      actor: req.operator
+    }, salesOrderReloadCancellationDependencies);
+    emitAppEvent("delivery.order.updated", {
+      orderId: req.params.orderId,
+      reloadCycleId: cycle.id,
+      source: "control-reload-cancelled"
+    });
+    emitAppEvent("yard.movement.updated", {
+      orderId: req.params.orderId,
+      reloadCycleId: cycle.id,
+      source: "control-reload-cancelled"
+    });
+    res.json({ cycle });
   } catch (error) {
     next(error);
   }
@@ -17786,7 +18526,8 @@ app.post("/api/delivery/orders/:id/load", async (req, res, next) => {
   try {
     const photoDataUrls = requiredPhotoDataUrls(req.body?.photoDataUrls);
     const result = await recordDeliveryLoad(req.params.id, operatorId(req), {
-      photoDataUrls
+      photoDataUrls,
+      requestId: req.body?.requestId
     });
     result.dependencyProgress = result.localOnly
       ? null
@@ -18098,8 +18839,8 @@ app.use((error, req, res, next) => {
 
 export { app, salesPrintRequestIp };
 
-let returnReconciliationRunning = false;
-let returnPendingSyncRunning = false;
+let returnReconciliationTickRunning = false;
+let returnPendingSyncTickRunning = false;
 let scmReconciliationScheduledTickRunning = false;
 
 async function recoverStaleScmReconciliationRuns() {
@@ -18193,26 +18934,26 @@ async function scmReconciliationScheduledTick() {
 }
 
 async function returnPendingSyncTick() {
-  if (returnPendingSyncRunning) return;
-  returnPendingSyncRunning = true;
+  if (returnPendingSyncTickRunning) return;
+  returnPendingSyncTickRunning = true;
   try {
     await processPendingReturnSyncs({ limit: 25 });
   } catch (error) {
     console.error("Scheduled pending return synchronization failed:", error.message);
   } finally {
-    returnPendingSyncRunning = false;
+    returnPendingSyncTickRunning = false;
   }
 }
 
 async function returnReconciliationTick() {
-  if (returnReconciliationRunning) return;
-  returnReconciliationRunning = true;
+  if (returnReconciliationTickRunning) return;
+  returnReconciliationTickRunning = true;
   try {
     await reconcileReturnRecords({ limit: 100 });
   } catch (error) {
     console.error("Scheduled return reconciliation failed:", error.message);
   } finally {
-    returnReconciliationRunning = false;
+    returnReconciliationTickRunning = false;
   }
 }
 

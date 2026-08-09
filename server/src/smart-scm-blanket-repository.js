@@ -875,7 +875,7 @@ export async function updateSmartScmBlanketProposalLine(proposalId, lineId, valu
         "coverageCausedNeed", "coverageReviewRequired", "availableCoverageOrders",
         "availableCoverageGapPallets", "coverageCoveredByInbound",
         "gormleyHubRedirected", "gormleyOriginalDestinations", "routeRulePartialRedirected",
-        "routeRuleOriginalDestinations", "routeRuleSource", "actualDestinationYard"
+        "routeRuleOriginalDestinations", "routeRuleSource", "actualDestinationYard", "destinationAllocations"
       ]) delete reason[key];
     }
 
@@ -981,6 +981,230 @@ export async function updateSmartScmBlanketProposalLine(proposalId, lineId, valu
     action: "smart_scm.blanket.proposal_line.update",
     details: { proposalId: id, lineId: targetLineId, pallets, ...outcome }
   });
+  return getSmartScmProposal(id);
+}
+
+async function lockedEditableBlanketProposalLine(proposalId, lineId) {
+  const proposal = await lockedBlanketProposal(proposalId);
+  if (proposal.status !== "held" || proposal.run_status !== "ready") {
+    throw httpError("Only a held proposal in the current ready Blanket plan can be edited.", 409);
+  }
+  const existingRelease = await query(
+    "SELECT id FROM scm_smart_blanket_releases WHERE proposal_id = $1 FOR UPDATE",
+    [Number(proposal.id)]
+  );
+  if (existingRelease.rowCount) {
+    throw httpError("This Blanket load is already reserved. Edit it from Vendor Replies.", 409);
+  }
+  const source = await query(
+    `SELECT netsuite_id, tranid, netsuite_active, is_blanket_po
+       FROM purchase_orders
+      WHERE netsuite_id = $1
+      FOR UPDATE`,
+    [proposal.blanket_source_po_id]
+  );
+  if (!source.rows[0]?.netsuite_active || source.rows[0]?.is_blanket_po !== true) {
+    throw httpError("The source PO is no longer an active Blanket order. Calculate releases again.", 409, "SCM_BLANKET_SOURCE_CHANGED");
+  }
+  const lineResult = await query(
+    "SELECT * FROM scm_smart_proposal_lines WHERE id = $1 AND proposal_id = $2 FOR UPDATE",
+    [Number(lineId), Number(proposal.id)]
+  );
+  if (!lineResult.rowCount) throw httpError("Blanket proposal line was not found.", 404);
+  const allocations = await query(
+    `SELECT *
+       FROM scm_smart_blanket_allocations
+      WHERE proposal_id = $1 AND proposal_line_id = $2
+      ORDER BY source_line_id, id
+      FOR UPDATE`,
+    [Number(proposal.id), Number(lineId)]
+  );
+  const line = lineResult.rows[0];
+  if (!allocations.rowCount || allocations.rows.some((row) => row.status !== "planned" || row.release_id !== null)) {
+    throw httpError("This Blanket line no longer has editable planned source allocations.", 409, "SCM_BLANKET_ALLOCATION_CHANGED");
+  }
+  if (allocations.rows.some((row) => Number(row.source_po_id) !== Number(proposal.blanket_source_po_id)
+    || Number(row.item_id) !== Number(line.item_id))) {
+    throw httpError("Blanket source lineage does not match this proposal line. Calculate releases again.", 409, "SCM_BLANKET_ALLOCATION_CHANGED");
+  }
+  return { proposal, line, allocations: allocations.rows };
+}
+
+export async function splitSmartScmBlanketProposalLine(proposalId, lineId, _values = {}, operatorId = null) {
+  const id = integer(proposalId);
+  const targetLineId = integer(lineId);
+  if (!id || !targetLineId) throw httpError("Select a valid Blanket proposal line to split.");
+  const outcome = await withTransaction(async () => {
+    await query("SELECT pg_advisory_xact_lock(hashtext('smart-scm-blanket-plan-build'))");
+    const { proposal, line, allocations } = await lockedEditableBlanketProposalLine(id, targetLineId);
+    const movedPallets = positive(line.proposed_pallets);
+    if (!Number.isInteger(movedPallets) || movedPallets <= 0) {
+      throw httpError("Save this Blanket line as a positive whole-pallet quantity before splitting it.", 409);
+    }
+    const allOverrides = proposal.pallet_quantity_overrides && typeof proposal.pallet_quantity_overrides === "object"
+      ? { ...proposal.pallet_quantity_overrides }
+      : {};
+    const destinationKey = String(Number(line.destination_location_id));
+    // A manual PALLET override belongs to the original load, not to one item
+    // line. Once that line moves, its correct share is unknowable, so both
+    // affected loads return to the deterministic automatic calculation.
+    const childOverrides = {};
+    const sourceOverrides = { ...allOverrides };
+    delete sourceOverrides[destinationKey];
+    const insertedProposal = await query(
+      `INSERT INTO scm_smart_proposals (
+         run_id, proposal_key, proposal_type, phase, source_kind,
+         source_location_id, source_vendor_yard_id, source_name,
+         destination_location_id, destination_name, vendor, plant, status,
+         urgent, urgency_level, urgency_score, provisional,
+         total_pallets, total_weight_lbs, utilization, memo, route_stops,
+         pallet_quantity_overrides, manually_grouped, proposal_origin,
+         blanket_source_po_id, blanket_source_po_ref
+       ) VALUES (
+         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'held',$13,$14,$15,$16,
+         $17,$18,0,$19,$20::jsonb,$21::jsonb,false,'blanket',$22,$23
+       ) RETURNING id`,
+      [proposal.run_id, `blanket-split:${crypto.randomUUID()}`, proposal.proposal_type, proposal.phase,
+        proposal.source_kind, proposal.source_location_id, proposal.source_vendor_yard_id, proposal.source_name,
+        Number(line.destination_location_id), line.destination_name, proposal.vendor, proposal.plant,
+        Boolean(line.urgent), line.urgency_level || "normal", positive(line.urgency_score), Boolean(line.provisional),
+        movedPallets, positive(line.line_weight_lbs), `split from Blanket load #${id} · ${line.item_name}`,
+        JSON.stringify([{ locationId: Number(line.destination_location_id), name: line.destination_name, sequence: 1 }]),
+        JSON.stringify(childOverrides), proposal.blanket_source_po_id, proposal.blanket_source_po_ref]
+    );
+    const createdProposalId = Number(insertedProposal.rows[0].id);
+    const insertedLine = await query(
+      `INSERT INTO scm_smart_proposal_lines (
+         proposal_id, item_id, item_name, item_description, unit,
+         required_pallets, proposed_pallets, confirmed_pallets, residual_pallets,
+         sales_quantity, pallet_weight_lbs, line_weight_lbs,
+         to_plt, to_lyr, to_sec, to_pcs, manual_planning_required, reason,
+         is_alternative, alternative_for_line_id, added_source, added_by,
+         destination_location_id, destination_name, urgent, provisional,
+         vendor_decision, last_purchase_price, last_purchase_price_synced_at,
+         purchase_unit, urgency_level, urgency_score
+       ) SELECT
+         $1, item_id, item_name, item_description, unit,
+         required_pallets, proposed_pallets, 0, proposed_pallets,
+         sales_quantity, pallet_weight_lbs, line_weight_lbs,
+         to_plt, to_lyr, to_sec, to_pcs, manual_planning_required,
+         COALESCE(reason, '{}'::jsonb) || jsonb_build_object(
+           'manuallySplit', true,
+           'splitWholeLine', true,
+           'splitFromProposalId', $2::bigint,
+           'splitFromLineId', $3::bigint
+         ),
+         is_alternative, alternative_for_line_id, added_source, COALESCE($4, added_by),
+         destination_location_id, destination_name, urgent, provisional,
+         vendor_decision, last_purchase_price, last_purchase_price_synced_at,
+         purchase_unit, urgency_level, urgency_score
+        FROM scm_smart_proposal_lines
+       WHERE id = $3 AND proposal_id = $2
+       RETURNING id`,
+      [createdProposalId, id, targetLineId, operatorText(operatorId)]
+    );
+    if (!insertedLine.rowCount) throw httpError("Blanket proposal line was not found.", 404);
+    const createdLineId = Number(insertedLine.rows[0].id);
+    const movedAllocations = await query(
+      `UPDATE scm_smart_blanket_allocations
+          SET proposal_id = $3, proposal_line_id = $4, updated_at = now()
+        WHERE proposal_id = $1 AND proposal_line_id = $2
+          AND status = 'planned' AND release_id IS NULL
+       RETURNING id`,
+      [id, targetLineId, createdProposalId, createdLineId]
+    );
+    if (movedAllocations.rowCount !== allocations.length) {
+      throw httpError("Blanket source allocations changed while the line was being split. Try again.", 409, "SCM_BLANKET_ALLOCATION_CHANGED");
+    }
+    const deletedLine = await query(
+      "DELETE FROM scm_smart_proposal_lines WHERE id = $1 AND proposal_id = $2 RETURNING id",
+      [targetLineId, id]
+    );
+    if (!deletedLine.rowCount) throw new Error("The original Blanket line could not be removed after its allocation was moved.");
+    const remaining = await query(
+      "SELECT COUNT(*)::int AS count FROM scm_smart_proposal_lines WHERE proposal_id = $1",
+      [id]
+    );
+    const sourceProposalRemoved = Number(remaining.rows[0]?.count || 0) === 0;
+    if (sourceProposalRemoved) {
+      await query("DELETE FROM scm_smart_proposals WHERE id = $1", [id]);
+    } else {
+      await query(
+        "UPDATE scm_smart_proposals SET pallet_quantity_overrides = $2::jsonb, updated_at = now() WHERE id = $1",
+        [id, JSON.stringify(sourceOverrides)]
+      );
+      await refreshSmartScmProposalDerived(id);
+    }
+    await refreshSmartScmProposalDerived(createdProposalId);
+    const revision = await recordSmartScmProposalRevision(proposal.run_id, "Blanket proposal item line moved into a separate load", {
+      proposalId: id,
+      lineId: targetLineId,
+      createdProposalId,
+      createdLineId,
+      movedPallets,
+      movedAllocationIds: movedAllocations.rows.map((row) => Number(row.id)),
+      sourceProposalRemoved,
+      movedDestinationPalletOverrideReset: Object.prototype.hasOwnProperty.call(allOverrides, destinationKey),
+      exactSourceAllocation: true
+    }, operatorId);
+    return { runId: Number(proposal.run_id), createdProposalId, createdLineId, revision, sourceProposalRemoved };
+  });
+  await writeAudit({
+    actorOperatorId: operatorId,
+    source: "smart_scm",
+    action: "smart_scm.blanket.proposal_line.split",
+    details: { proposalId: id, lineId: targetLineId, ...outcome }
+  });
+  return getSmartScmPlanningRun(outcome.runId);
+}
+
+export async function removeSmartScmBlanketProposalLine(proposalId, lineId, operatorId = null) {
+  const id = integer(proposalId);
+  const targetLineId = integer(lineId);
+  if (!id || !targetLineId) throw httpError("Select a valid Blanket proposal line to remove.");
+  const outcome = await withTransaction(async () => {
+    await query("SELECT pg_advisory_xact_lock(hashtext('smart-scm-blanket-plan-build'))");
+    const { proposal, line, allocations } = await lockedEditableBlanketProposalLine(id, targetLineId);
+    const deletedAllocations = await query(
+      `DELETE FROM scm_smart_blanket_allocations
+        WHERE proposal_id = $1 AND proposal_line_id = $2
+          AND status = 'planned' AND release_id IS NULL
+       RETURNING id, source_line_id, planned_pallets, planned_sales_qty`,
+      [id, targetLineId]
+    );
+    if (deletedAllocations.rowCount !== allocations.length) {
+      throw httpError("Blanket source allocations changed while the line was being removed. Try again.", 409, "SCM_BLANKET_ALLOCATION_CHANGED");
+    }
+    const removed = await query(
+      "DELETE FROM scm_smart_proposal_lines WHERE id = $1 AND proposal_id = $2 RETURNING id",
+      [targetLineId, id]
+    );
+    if (!removed.rowCount) throw httpError("Blanket proposal line was not found.", 404);
+    const remaining = await query(
+      "SELECT COUNT(*)::int AS count FROM scm_smart_proposal_lines WHERE proposal_id = $1",
+      [id]
+    );
+    const deletedProposal = Number(remaining.rows[0]?.count || 0) === 0;
+    if (deletedProposal) await query("DELETE FROM scm_smart_proposals WHERE id = $1", [id]);
+    else await refreshSmartScmProposalDerived(id);
+    const revision = await recordSmartScmProposalRevision(proposal.run_id, "Blanket proposal line removed", {
+      proposalId: id,
+      lineId: targetLineId,
+      itemId: Number(line.item_id),
+      releasedPlannedPallets: deletedAllocations.rows.reduce((sum, row) => sum + positive(row.planned_pallets), 0),
+      releasedPlannedSalesQty: deletedAllocations.rows.reduce((sum, row) => sum + positive(row.planned_sales_qty), 0),
+      deletedProposal,
+      exactSourceAllocation: true
+    }, operatorId);
+    return { runId: Number(proposal.run_id), revision, deletedProposal };
+  });
+  await writeAudit({
+    actorOperatorId: operatorId,
+    source: "smart_scm",
+    action: "smart_scm.blanket.proposal_line.remove",
+    details: { proposalId: id, lineId: targetLineId, ...outcome }
+  });
+  if (outcome.deletedProposal) return { deleted: true, runId: outcome.runId };
   return getSmartScmProposal(id);
 }
 

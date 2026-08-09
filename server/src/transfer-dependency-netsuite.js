@@ -114,3 +114,48 @@ export function buildTransferDependencyRestPayload({ proposal, batch, locations 
   }
   return payload;
 }
+
+export function buildTransferDependencyUpdateRequest({
+  transferOrderId,
+  intercompany = false,
+  payload
+} = {}) {
+  const id = Number(transferOrderId);
+  if (!Number.isInteger(id) || id <= 0) {
+    throw new Error("A valid numeric NetSuite transfer order ID is required.");
+  }
+  if (!payload?.item || !Array.isArray(payload.item.items) || !payload.item.items.length) {
+    throw new Error("A Transfer Order quantity update requires at least one item line.");
+  }
+  const recordType = intercompany ? "intercompanyTransferOrder" : "transferOrder";
+  return {
+    path: `/record/v1/${recordType}/${id}?replace=item`,
+    method: "PATCH",
+    payload
+  };
+}
+
+export function transferOrderQuantityRevisionStatusBlock(order = {}) {
+  const status = String(order.status || "").trim().toUpperCase();
+  const statusText = String(order.status_text ?? order.statusText ?? "").trim();
+  if (/partially fulfilled|pending receipt|partially received|received|closed|cancel(?:led)?/i.test(statusText)) {
+    return `NetSuite Transfer Order execution has started (${statusText || status}); its quantities can no longer be changed.`;
+  }
+  if (["A", "B"].includes(status) || /pending approval|pending fulfillment/i.test(statusText)) return null;
+  return `NetSuite Transfer Order status ${statusText || status || "unknown"} is not safe for a quantity change.`;
+}
+
+export function transferDependencyPickingTicketJobKey({
+  proposalId,
+  transferOrderRef,
+  generation
+} = {}) {
+  const proposal = Number(proposalId);
+  const printGeneration = Number(generation);
+  const orderRef = String(transferOrderRef || "").trim();
+  if (!Number.isInteger(proposal) || proposal <= 0 || !orderRef
+      || !Number.isInteger(printGeneration) || printGeneration <= 0) {
+    throw new Error("Proposal, Transfer Order reference, and positive print generation are required.");
+  }
+  return `transfer-dependency:${proposal}:picking-ticket:${orderRef}:${printGeneration}`;
+}

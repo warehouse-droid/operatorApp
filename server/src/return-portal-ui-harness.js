@@ -73,8 +73,8 @@ assert.doesNotMatch(control, /photo-upload\/preview\?ref=[^\n]+token=/, "Control
 assert.match(controlCss, /\.return-management-layout/);
 assert.match(controlCss, /\.return-photo-grid/);
 assert.match(controlCss, /\.return-automation-grid/);
-assert.match(controlHtml, /control\.js\?v=20260730-reconciliation-resume-v1/);
-assert.match(adminHtml, /control\.js\?v=20260730-reconciliation-resume-v1/);
+assert.match(controlHtml, /control\.js\?v=20260805-so-type-filter-v2/);
+assert.match(adminHtml, /control\.js\?v=20260805-so-type-filter-v2/);
 
 assert.match(sales, /SALES_RETURNS_PAGE = window\.location\.pathname === "\/sales\/returns"/);
 assert.match(sales, /allowPublicSales:\s*!SALES_RETURNS_PAGE/);

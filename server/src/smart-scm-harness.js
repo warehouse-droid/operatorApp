@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import { closeDb, query, withTransaction } from "./db.js";
 import { listSmartScmInputFiles } from "./smart-scm-import-repository.js";
 import { runSmartScmForecast, listSmartScmForecasts, smartScmCoverageFloor } from "./smart-scm-forecast-repository.js";
-import { consolidateCompatibleDrafts, getSmartScmPlanningRun, prepareSmartScmTransferExecution, runSmartScmPlan, smartScmConfirmationSourceTransferLimit, smartScmLineOverridesSourceStockFloor, smartScmPackWholePalletLines, smartScmPhysicalPalletLines, smartScmProposalLineLoadWeightLbs, smartScmSourceTransferLimit, updateSmartScmProposal } from "./smart-scm-planning-repository.js";
+import { consolidateCompatibleDrafts, getSmartScmPlanningRun, loadSmartScmPlanningDemandStates, prepareSmartScmTransferExecution, runSmartScmPlan, smartScmConfirmationSourceTransferLimit, smartScmLineOverridesSourceStockFloor, smartScmPackWholePalletLines, smartScmPhysicalPalletLines, smartScmProposalLineLoadWeightLbs, smartScmSourceTransferLimit, updateSmartScmProposal } from "./smart-scm-planning-repository.js";
 import { addSmartScmVendorAlternativeLine, listSmartScmNetSuitePoReviewLoads, listSmartScmVendorReplyLoads, removeSmartScmNetSuitePoReviewLoad, removeSmartScmVendorAlternativeLine, searchSmartScmVendorAlternatives, stageSmartScmVendorReplyLoad } from "./smart-scm-vendor-repository.js";
 import { executeSmartScmPurchaseProposal } from "./smart-scm-purchase-service.js";
 import { createSimplePdf, leaseYardPrintJob, queueSmartScmPrintJob, queueYardPrinterTest, rotateYardPrinterToken, updateLeasedPrintJob, updateYardPrinter, yardPrintJobDocument } from "./smart-scm-print-repository.js";
@@ -124,6 +124,21 @@ assert.equal(destinationFirstLoads.filter((load) => load.routeStops.length === 1
 assert.equal(destinationFirstLoads.filter((load) => load.routeStops.length > 1).length, 1, "Only the residual Ayr quantities should form a two-stop route.");
 assert(destinationFirstLoads.every((load) => load.totalWeight <= 100.000001), "Destination-first loads must stay within capacity.");
 assert.equal(destinationFirstLoads.flatMap((load) => load.lines).reduce((sum, line) => sum + line.proposedPallets, 0), 26, "Destination-first packing must preserve every pallet.");
+const criticalSameYardPriorityLoads = smartScmPackWholePalletLines([
+  { itemId: 186, destinationLocationId: 1, destinationName: "3445", proposedPallets: 2, requiredPallets: 2, palletWeight: 10, lineWeight: 20, toPlt: 1, urgencyLevel: "ultimate_urgent", urgencyScore: 100, urgent: true, reason: {} },
+  { itemId: 187, destinationLocationId: 28, destinationName: "2967", proposedPallets: 10, requiredPallets: 10, palletWeight: 10, lineWeight: 100, toPlt: 1, urgencyLevel: "normal", urgencyScore: 0, urgent: false, reason: {} }
+], 100, {
+  proposalType: "PO",
+  sourceName: "Ayr",
+  maxStops: 2,
+  routeRule: { enabled: true, maxDrops: 2, stopOrder: [1, 28, 15, 26], partialRedirectEnabled: false }
+});
+assert.equal(criticalSameYardPriorityLoads.length, 2,
+  "Urgency affinity must not increase the minimum truck count.");
+assert(criticalSameYardPriorityLoads.some((load) => load.totalWeight === 100
+  && load.routeStops.length === 1
+  && load.routeStops[0].name === "2967"),
+"A full same-yard load must remain grouped before urgency affinity mixes residual yards.");
 const urgencyFragmentationLoads = smartScmPackWholePalletLines([
   { itemId: 184, destinationLocationId: 1, destinationName: "3445", proposedPallets: 4, requiredPallets: 4, palletWeight: 4, lineWeight: 16, toPlt: 1, urgent: true, reason: {} },
   { itemId: 185, destinationLocationId: 1, destinationName: "3445", proposedPallets: 2, requiredPallets: 2, palletWeight: 6, lineWeight: 12, toPlt: 1, urgent: false, reason: {} }
@@ -552,8 +567,10 @@ assert(visiblePhysicalPallets.every((line) => line.officialLineItem && line.subm
       assert.equal(proposal.status, "held", `${line.itemName} must remain held while its order-size evidence is mostly borrowed.`);
     }
     const allianceLine = plan.proposals.flatMap((proposal) => proposal.lines.map((line) => ({ proposal, line })))
-      .find(({ proposal, line }) => proposal.destinationLocationId === 15 && line.itemId === 601 && Number(line.reason.safetyFactor) === 1.645);
+      .find(({ line }) => line.destinationLocationId === 15 && line.itemId === 601 && Number(line.reason.safetyFactor) === 1.645);
     assert(allianceLine, "Expected an Alliance G2 Supersand Grey replenishment line for 12441.");
+    assert(allianceLine.proposal.routeStops.some((stop) => Number(stop.locationId) === 15),
+      "A grouped multi-destination PO containing the 12441 line must retain 12441 in its physical route.");
     assert(Math.abs(Number(allianceLine.line.reason.safetyStockPallets) - alliance.safetyStockPallets) < 0.00001,
       "The proposal line must use the safety stock calculated from the new eligible-week stockout average.");
     assert.equal(Number(allianceLine.line.reason.reorderPointPallets), alliance.reorderPointPallets);
@@ -599,10 +616,19 @@ assert(visiblePhysicalPallets.every((line) => line.officialLineItem && line.subm
     const movedLine = destinationAdjusted.lines.find((line) => line.id === Number(move.line_id));
     assert.equal(movedLine.destinationLocationId, Number(move.destination_location_id), "A PO proposal line destination must be editable.");
     assert.equal(movedLine.reason.destinationManuallyAdjusted, true, "A manual destination change must be recorded on the line.");
-    assert.equal(movedLine.reason.positionPallets, undefined, "A destination change must invalidate the old yard's inventory position snapshot.");
-    assert.equal(movedLine.reason.reorderPointPallets, undefined, "A destination change must invalidate the old yard's reorder point.");
-    assert.equal(movedLine.reason.preferredPallets, undefined, "A destination change must invalidate the old yard's preferred target.");
-    assert(Number.isFinite(Number(movedLine.reason.quantityAvailable)), "A destination change must capture the new yard's inventory components.");
+    assert.equal(movedLine.reason.previousDestinationLocationId, Number(move.before_destination_location_id),
+      "A destination change must retain the replaced yard identity as audit evidence.");
+    const movedPlanning = await loadSmartScmPlanningDemandStates({ forecastRunId: plan.forecastRunId });
+    const movedState = movedPlanning.states.find((state) => state.key === `${movedLine.itemId}:${movedLine.destinationLocationId}`);
+    assert(movedState, "A destination change must resolve the new yard's current planning state.");
+    assert.equal(Number(movedLine.reason.positionPallets), Number(movedState.positionPallets),
+      "A destination change must replace the old yard's position with the new yard's position.");
+    assert.equal(Number(movedLine.reason.reorderPointPallets), Number(movedState.rop),
+      "A destination change must replace the old yard's ROP with the new yard's ROP.");
+    assert.equal(Number(movedLine.reason.preferredPallets), Number(movedState.preferred),
+      "A destination change must replace the old yard's PSL with the new yard's PSL.");
+    assert.equal(Number(movedLine.reason.quantityAvailable), Number(movedState.availableSales),
+      "A destination change must capture the new yard's authoritative available quantity.");
     assert(destinationAdjusted.routeStops.length <= 2, "A destination edit must preserve the proposal route limit.");
     await query(
       `UPDATE scm_smart_item_yard_policies

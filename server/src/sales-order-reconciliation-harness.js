@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import {
   filterDbBackedSalesOrderReconciliationCandidates,
   isNetSuiteSalesOrderBilled,
+  isNetSuiteSalesOrderFulfilled,
   isSalesOrderInventoryLine,
   mapNetSuiteSalesOrderLine,
+  rollupGroupedSalesOrderReconciliation,
   scrubBilledSalesOrderFamilyFromPlan
 } from "./sales-order-reconciliation.js";
 
@@ -60,6 +62,26 @@ assert.equal(isNetSuiteSalesOrderBilled({ status_text: " Sales Order:  Billed " 
 assert.equal(isNetSuiteSalesOrderBilled({ statusText: "Sales   Order :  Billed" }), true);
 assert.equal(isNetSuiteSalesOrderBilled({ netsuiteStatusText: "Billed" }), true);
 assert.equal(isNetSuiteSalesOrderBilled(), false);
+
+for (const statusText of [
+  "Fulfilled",
+  "Sales Order : Fulfilled",
+  "Pending Billing",
+  "Sales Order : Pending Billing",
+  "Billed",
+  "Sales Order : Billed"
+]) {
+  assert.equal(isNetSuiteSalesOrderFulfilled({ statusText }), true, statusText);
+}
+for (const statusText of [
+  "Pending Fulfillment",
+  "Partially Fulfilled",
+  "Pending Billing / Partially Fulfilled",
+  "Closed",
+  "Cancelled"
+]) {
+  assert.equal(isNetSuiteSalesOrderFulfilled({ statusText }), false, statusText);
+}
 
 assert.equal(isSalesOrderInventoryLine({ itemType: "InvtPart", itemName: "BLOCK" }), true);
 assert.equal(isSalesOrderInventoryLine({ itemType: "Assembly", itemName: "MBBS-Special" }), true);
@@ -195,6 +217,110 @@ const deferred = scrubBilledSalesOrderFamilyFromPlan(plan, {
 assert.equal(deferred.deferred, true);
 assert.equal(deferred.changed, false);
 assert.deepEqual(deferred.plan, plan, "An in-progress driver route must be retained verbatim.");
+
+const groupedPlan = {
+  orders: [{
+    id: "GOA-100-200",
+    type: "SO",
+    childOrders: ["SOA00100", "SOA00200"],
+    childOrderDetails: [
+      { id: "SOA00100", type: "SO", fulfillmentStatus: "fulfilled", pallets: 2, salesQty: 10 },
+      { id: "SOA00200", type: "SO", fulfillmentStatus: "not_fulfilled", pallets: 3, salesQty: 20 }
+    ],
+    pallets: 5,
+    salesQty: 30
+  }],
+  trucks: [{
+    loads: [{
+      id: "group-load",
+      orders: ["GOA-100-200"],
+      stops: [{ id: "group-stop", type: "drop", orderId: "GOA-100-200", orderRefs: ["GOA-100-200"] }]
+    }]
+  }]
+};
+const dissolvedGroup = scrubBilledSalesOrderFamilyFromPlan(groupedPlan, {
+  familyRefs: ["SOA00100"]
+});
+assert.deepEqual(dissolvedGroup.plan.orders.map((order) => order.id), ["SOA00200"]);
+assert.equal(dissolvedGroup.plan.orders[0].localDispatchStatus, "planned");
+assert.deepEqual(
+  dissolvedGroup.plan.trucks[0].loads[0].stops.map((stop) => stop.orderId),
+  ["SOA00200"],
+  "Removing one billed child must rewrite the group stop to the remaining real SO."
+);
+assert.deepEqual(dissolvedGroup.plan.trucks[0].loads[0].orders, ["SOA00200"]);
+
+const threeChildGroup = {
+  orders: [{
+    id: "GOA-100-200-300",
+    type: "SO",
+    childOrders: ["SOA00100", "SOA00200", "SOA00300"],
+    childOrderDetails: [
+      { id: "SOA00100", type: "SO", pallets: 2, salesQty: 10 },
+      { id: "SOA00200", type: "SO", pallets: 3, salesQty: 20 },
+      { id: "SOA00300", type: "SO", pallets: 4, salesQty: 30 }
+    ],
+    pallets: 9,
+    salesQty: 60
+  }],
+  trucks: [{ loads: [{ id: "three-load", stops: [{ id: "three-stop", type: "drop", orderId: "GOA-100-200-300" }] }] }]
+};
+const shrunkGroup = scrubBilledSalesOrderFamilyFromPlan(threeChildGroup, {
+  familyRefs: ["SOA00100"]
+});
+assert.equal(shrunkGroup.plan.orders[0].id, "GOA-100-200-300",
+  "A group with two children remaining must retain its stable dispatch identity.");
+assert.deepEqual(shrunkGroup.plan.orders[0].childOrders, ["SOA00200", "SOA00300"]);
+assert.equal(shrunkGroup.plan.orders[0].pallets, 7);
+assert.equal(shrunkGroup.plan.orders[0].salesQty, 50);
+assert.equal(shrunkGroup.plan.trucks[0].loads[0].stops[0].orderId, "GOA-100-200-300");
+
+const removedWholeGroup = scrubBilledSalesOrderFamilyFromPlan(groupedPlan, {
+  familyRefs: ["SOA00100", "SOA00200"]
+});
+assert.deepEqual(removedWholeGroup.plan.orders, []);
+assert.deepEqual(removedWholeGroup.plan.trucks[0].loads[0].orders, []);
+assert.deepEqual(removedWholeGroup.plan.trucks[0].loads[0].stops, []);
+
+for (let childCount = 2; childCount <= 12; childCount += 1) {
+  for (let completedCount = 0; completedCount <= childCount; completedCount += 1) {
+    const children = Array.from({ length: childCount }, (_, index) => ({
+      id: `SO-PROPERTY-${childCount}-${index}`,
+      type: "SO",
+      fulfillmentStatus: index < completedCount ? "fulfilled" : "not_fulfilled",
+      pallets: index + 1,
+      salesQty: (index + 1) * 10
+    }));
+    const rolled = rollupGroupedSalesOrderReconciliation({
+      id: `GO-PROPERTY-${childCount}-${completedCount}`,
+      type: "SO"
+    }, children);
+    const expected = completedCount === childCount
+      ? "Completed"
+      : completedCount > 0
+        ? "Partially Done"
+        : "Queued";
+    assert.equal(rolled.reconciliationApplicationStatus, expected,
+      "Grouped SO rollup must be determined by every active child, independent of group size.");
+    assert.equal(rolled.pallets, childCount * (childCount + 1) / 2);
+    assert.equal(rolled.salesQty, childCount * (childCount + 1) * 5);
+  }
+}
+
+const reviewPrecedence = rollupGroupedSalesOrderReconciliation({
+  id: "GO-REVIEW-PRECEDENCE",
+  type: "SO"
+}, [
+  { id: "SO-COMPLETE", fulfillmentStatus: "fulfilled" },
+  {
+    id: "SO-REVIEW",
+    fulfillmentStatus: "fulfilled",
+    reconciliationStatus: "review",
+    reconciliationReason: "Review wins."
+  }
+]);
+assert.equal(reviewPrecedence.reconciliationApplicationStatus, "Reconcile Review");
+assert.equal(reviewPrecedence.reconciliationReason, "Review wins.");
 
 const emptyFamily = scrubBilledSalesOrderFamilyFromPlan({ orders: [], trucks: [] });
 assert.equal(emptyFamily.changed, false);

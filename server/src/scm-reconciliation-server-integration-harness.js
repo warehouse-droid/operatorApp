@@ -348,7 +348,28 @@ includesAll(server, [
   "listScmPurchaseOrdersForResponse",
   "canSeeReconciliationDetails && reconciliationPreference.showDetails",
   "filterRestrictedScmOrders(reconciled"
-], "review enforcement and reconciled schedule metadata");
+], "dispatch confirmation safety and reconciled schedule metadata");
+
+const confirmRouteStart = server.indexOf('app.post("/api/dispatch/plans/:id/confirm"');
+const confirmRouteEnd = server.indexOf('app.post("/api/dispatch/plans/:id/reopen"', confirmRouteStart);
+assert.ok(confirmRouteStart >= 0 && confirmRouteEnd > confirmRouteStart, "Dispatch confirm route source was not found.");
+const confirmRoute = server.slice(confirmRouteStart, confirmRouteEnd);
+assert.equal(
+  (confirmRoute.match(/assertScmReconciliationOrderEditable\(/g) || []).length,
+  0,
+  "NetSuite reconciliation review must not block dispatch-plan confirmation."
+);
+assert.ok(
+  confirmRoute.includes('assertNoRestrictedScmDispatchOrders(placedScmRefs, "confirm this plan")'),
+  "Dispatch confirmation must still reject Blanket, Hold, Complete, or Cancelled SCM orders."
+);
+const saveRouteStart = server.indexOf('app.put("/api/dispatch/plans/:id"');
+assert.ok(saveRouteStart >= 0 && saveRouteStart < confirmRouteStart, "Dispatch save route source was not found.");
+const saveRoute = server.slice(saveRouteStart, confirmRouteStart);
+assert.ok(
+  saveRoute.includes("assertScmReconciliationOrderEditable({ orderRefs: changedScmRefs })"),
+  "Ordinary saves must retain reconciliation protection for actual SCM planning changes."
+);
 
 includesAll(service, [
   "export async function applyScmReconciliationRun",

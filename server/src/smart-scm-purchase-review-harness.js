@@ -90,8 +90,11 @@ try {
 
   const proposal = {
     id: 501,
+    parentProposalId: 401,
     vendorId: 77,
     destinationLocationId: 15,
+    destinationName: "12441",
+    readyDate: "2026-08-15",
     memo: "Harness staged PO",
     vendorReference: "V-501",
     palletItem: {
@@ -102,9 +105,9 @@ try {
       lastPurchasePrice: 4.25
     },
     lines: [
-      { itemId: 601, itemName: "A", unit: "Each", purchaseUnit: "Each", lastPurchasePrice: 11.5, destinationLocationId: 15, salesQuantity: 40, confirmedPallets: 1, palletQty: 1, layerQty: 0, sectionQty: 0, pieceQty: 0 },
-      { itemId: 602, itemName: "B", unit: "Each", purchaseUnit: "Each", lastPurchasePrice: 3.75, destinationLocationId: 15, salesQuantity: 80, confirmedPallets: 2, palletQty: 2, layerQty: 0, sectionQty: 0, pieceQty: 0 },
-      { itemId: 603, itemName: "C", unit: "Each", purchaseUnit: "Each", lastPurchasePrice: 9, destinationLocationId: 26, salesQuantity: 12, confirmedPallets: 0.5, palletQty: 0.5, layerQty: 0, sectionQty: 0, pieceQty: 0 },
+      { itemId: 601, itemName: "A", unit: "Each", purchaseUnit: "Each", lastPurchasePrice: 11.5, destinationLocationId: 15, destinationName: "12441", salesQuantity: 40, confirmedPallets: 1, palletQty: 1, layerQty: 0, sectionQty: 0, pieceQty: 0 },
+      { itemId: 602, itemName: "B", unit: "Each", purchaseUnit: "Each", lastPurchasePrice: 3.75, destinationLocationId: 15, destinationName: "12441", salesQuantity: 80, confirmedPallets: 2, palletQty: 2, layerQty: 0, sectionQty: 0, pieceQty: 0 },
+      { itemId: 603, itemName: "C", unit: "Each", purchaseUnit: "Each", lastPurchasePrice: 9, destinationLocationId: 26, destinationName: "150", salesQuantity: 12, confirmedPallets: 0.5, palletQty: 0.5, layerQty: 0, sectionQty: 0, pieceQty: 0 },
       { itemId: 999, itemName: "PALLET", unit: "Each", purchaseUnit: "Each", lastPurchasePrice: 4.25, destinationLocationId: 15, salesQuantity: 3.5, confirmedPallets: 3.5, ancillaryPallet: true }
     ]
   };
@@ -115,6 +118,9 @@ try {
   const payload = buildSmartScmPurchaseOrderRestPayload({ proposal, locations });
   assert.equal(smartScmPurchaseOrderMemoMarker(501), "MBBS-SCM-PO:501");
   assert.match(payload.memo, /MBBS-SCM-PO:501/);
+  assert.match(payload.memo, /Date: 2026-08-15/);
+  assert.match(payload.memo, /Yard: 12441, 150/);
+  assert.match(payload.memo, /Load #401/);
   assert.equal(payload.item.items.length, 5);
   assert.deepEqual(payload.item.items.slice(0, 3).map((line) => line.rate), [11.5, 3.75, 9]);
   const palletLines = payload.item.items.filter((line) => line.item.id === "999");

@@ -53,6 +53,7 @@ function assertFullHarnessOwnership(profileName, names, excluded, packageScripts
   }
   const declared = new Set(names);
   const omitted = Object.entries(packageScripts)
+    .filter(([name]) => name.startsWith("test:"))
     .filter(([, command]) => typeof command === "string" && HARNESS_COMMAND.test(command.trim()))
     .map(([name]) => name)
     .filter((name) => !declared.has(name) && !Object.hasOwn(excluded, name))
