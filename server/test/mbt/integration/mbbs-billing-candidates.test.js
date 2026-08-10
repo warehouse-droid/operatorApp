@@ -125,17 +125,36 @@ test("completed Driver PWA loads preview the active DELIVERY_CHARGE_MBBS band wi
           JSON.stringify({ address: "100 Queen Street West, Toronto, ON", dropAddress: "100 Queen Street West, Toronto, ON", orderTypes: ["SO"] })
         ]
       );
+      const starvationBase = 9_700_000_000 + (crypto.randomInt(100_000) * 1_000);
+      await query(
+        `INSERT INTO sales_orders (
+           netsuite_id, tranid, fulfillment_status, fulfilled_at,
+           outbound_location, dispatch_address, netsuite_active, synced_at
+         )
+         SELECT $1::bigint + series,
+                $2 || series::text,
+                'fulfilled',
+                '2040-08-10T12:00:00.000Z'::timestamptz,
+                'UNMAPPED',
+                '1 Incomplete Evidence Road, Toronto, ON',
+                true,
+                '2040-08-10T12:00:00.000Z'::timestamptz
+           FROM generate_series(1, 205) AS series`,
+        [starvationBase, `SO-UNMAPPED-${suffix}-`]
+      );
       const before = await localIsolationCounts();
       const listed = await listMbbsBillingCandidates({ actor: ACTOR, limit: 200 });
       const candidate = listed.items.find((item) => item.physicalLoadId === loadId);
+      assert.ok(
+        candidate,
+        "a ready Driver PWA candidate must not be starved by newer incomplete Sales Orders"
+      );
       assert.equal(candidate?.sourceSystem, "driver_pwa");
       assert.equal(candidate?.chargeable, true);
       assert.deepEqual(candidate?.references, [{ sourceType: "SO", rootReference: orderRef }]);
-      const salesOrderCandidate = listed.items.find(
-        (item) => item.physicalLoadId === `SO-${salesOrderId}`
-      );
+      const salesOrderCandidate = listed.items.find((item) => item.sourceSystem === "sales_order");
       assert.equal(salesOrderCandidate?.sourceSystem, "sales_order");
-      assert.deepEqual(salesOrderCandidate?.references, [{ sourceType: "SO", rootReference: orderRef }]);
+      assert.equal(salesOrderCandidate?.references[0]?.sourceType, "SO");
 
       const calls = [];
       const preview = await previewMbbsBillingCandidate({

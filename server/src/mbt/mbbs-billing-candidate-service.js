@@ -486,7 +486,8 @@ async function internalCandidates(limit) {
     ...salesOrders.map(
       (/** @type {Record<string, any>} */ row) => salesOrderCandidate(row, yards, graph.originYardCodes)
     )
-  ].sort((left, right) => right.completedAt.localeCompare(left.completedAt)
+  ].sort((left, right) => Number(right.chargeable) - Number(left.chargeable)
+    || right.completedAt.localeCompare(left.completedAt)
     || left.candidateId.localeCompare(right.candidateId));
   return { graph, items: items.slice(0, limit) };
 }
