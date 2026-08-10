@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import { query, withTransaction } from "./db.js";
 import { syncDispatchDeliveryGroupsFromPlan } from "./dispatch-delivery-group-repository.js";
 import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
+import { assertNoDriverPwaCompletedDispatchRefs } from "./dispatch-history-mode.js";
 import {
   applyDispatchPlanCommand,
   buildCompactDispatchSnapshot,
@@ -82,7 +83,8 @@ function slimAssignedOrder(order = {}) {
     "dependencyDirectPickup", "dependencyWaitingForTransfer", "dependencyAttention",
     "dependencyUncovered", "dependencyUncoveredQuantity", "planOwned", "isSplit", "isGrouped",
     "groupPlanId", "groupPlanDate",
-    "sourceTable", "netsuiteId", "dispatchRef", "dependency", "dependencies", "mbt"
+    "sourceTable", "netsuiteId", "dispatchRef", "dependency", "dependencies", "mbt",
+    "historicalReconciliationComplete", "historicalPlanDate"
   ];
   const slim = Object.fromEntries(keys.filter((key) => order[key] !== undefined).map((key) => [key, order[key]]));
   const identity = text(slim.id);
@@ -322,7 +324,9 @@ async function assertAssignmentDateAvailable(plan, command) {
       .map(text)
       .filter((ref) => ref && !previousRefs.has(ref.toLowerCase()));
   }
-  for (const ref of [...new Set(refs)]) {
+  const uniqueRefs = [...new Set(refs)];
+  await assertNoDriverPwaCompletedDispatchRefs(uniqueRefs, "add these orders to Dispatch");
+  for (const ref of uniqueRefs) {
     const conflict = await otherDateAssignment(plan, ref);
     if (!conflict) {continue;}
     throw commandError(`${ref} is already planned on ${planDate(conflict.plan_date)}.`, "DISPATCH_ORDER_ALREADY_PLANNED", 409, {

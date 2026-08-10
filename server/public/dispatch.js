@@ -675,7 +675,10 @@ async function enterDispatchEditMode() {
   if (!planEditMode) throw new Error("The server did not grant an edit lease.");
   startDispatchEditHeartbeat();
   if (!currentPlan?.id) await createPlanForDate(currentPlanDate);
-  routeNotice = "Edit Mode enabled. Changes save automatically.";
+  if (isDispatchHistoryEditMode()) await loadDispatchOrders();
+  routeNotice = isDispatchHistoryEditMode()
+    ? "History Edit Mode enabled. Reconciliation-complete orders are available; Driver PWA-completed orders remain locked."
+    : "Edit Mode enabled. Changes save automatically.";
   render({ save: false });
 }
 
@@ -684,6 +687,7 @@ async function releaseDispatchEditMode() {
     leaveDispatchEditMode();
     return;
   }
+  const leavingHistoryEditMode = isDispatchHistoryEditMode();
   const response = await fetch("/api/dispatch/plan-edit-lease/release", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -691,7 +695,8 @@ async function releaseDispatchEditMode() {
   });
   if (!response.ok) throw new Error(await dispatchErrorMessage(response));
   leaveDispatchEditMode({ clearLease: true });
-  routeNotice = "View Mode enabled.";
+  if (leavingHistoryEditMode) await loadDispatchOrders();
+  routeNotice = leavingHistoryEditMode ? "History View Mode enabled." : "View Mode enabled.";
   render({ save: false });
 }
 
@@ -743,6 +748,42 @@ function todayLocalDate() {
   const now = new Date();
   const offset = now.getTimezoneOffset();
   return new Date(now.getTime() - (offset * 60000)).toISOString().slice(0, 10);
+}
+
+function dispatchCompanyLocalDate(now = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Toronto",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(now);
+  const byType = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${byType.year}-${byType.month}-${byType.day}`;
+}
+
+function isHistoricalDispatchPlanDate(planDate = currentPlanDate) {
+  const candidate = String(planDate || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/u.test(candidate)) return false;
+  const parsed = new Date(`${candidate}T00:00:00.000Z`);
+  return !Number.isNaN(parsed.getTime())
+    && parsed.toISOString().slice(0, 10) === candidate
+    && candidate < dispatchCompanyLocalDate();
+}
+
+function isDispatchHistoryEditMode() {
+  return isDispatchPlanEditor() && isHistoricalDispatchPlanDate(currentPlanDate);
+}
+
+function dispatchOrderFeedRequest({ sync = false, search = "" } = {}) {
+  const params = new URLSearchParams();
+  const searchTerm = String(search || "").trim();
+  if (searchTerm) params.set("search", searchTerm);
+  if (isDispatchHistoryEditMode()) params.set("historyPlanDate", currentPlanDate);
+  const query = params.toString();
+  return {
+    url: `${sync ? "/api/dispatch/sync" : "/api/dispatch/orders"}${query ? `?${query}` : ""}`,
+    headers: isDispatchHistoryEditMode() ? { "x-dispatch-edit-lease": planEditLeaseToken } : {}
+  };
 }
 
 function timeText(totalMinutes) {
@@ -3484,8 +3525,8 @@ function cancelDispatchOrderSearch() {
 
 async function loadDispatchOrderSearch(term, sequence) {
   try {
-    const params = new URLSearchParams({ search: term });
-    const response = await fetch("/api/dispatch/orders?" + params.toString());
+    const request = dispatchOrderFeedRequest({ search: term });
+    const response = await fetch(request.url, { headers: request.headers });
     if (!response.ok) throw new Error(await response.text());
     const feed = await response.json();
     if (sequence !== orderSearchSequence || term !== searchText.trim()) return;
@@ -3567,7 +3608,11 @@ async function refreshPlannedAssignments() {
 
 async function loadDispatchOrders({ sync = false } = {}) {
   try {
-    const response = await fetch(sync ? "/api/dispatch/sync" : "/api/dispatch/orders", { method: sync ? "POST" : "GET" });
+    const request = dispatchOrderFeedRequest({ sync });
+    const response = await fetch(request.url, {
+      method: sync ? "POST" : "GET",
+      headers: request.headers
+    });
     if (!response.ok) throw new Error(await response.text());
     const payload = await response.json();
     applyDispatchOrderFeed(sync ? payload.orders : payload);
@@ -6151,6 +6196,7 @@ async function loadPlanById(planId) {
   await loadDriverJobStatuses();
   currentPlan = compactCurrentPlan(plan);
   if (Array.isArray(plan.orders) && Array.isArray(plan.trucks)) applySavedPlan(plan);
+  await loadDispatchOrders();
   lastServerSavedAt = plan.savedAt || plan.updatedAt || lastServerSavedAt;
   await loadPlanHistory();
   resetUndoHistory();
@@ -8969,16 +9015,29 @@ function planModeControlHtml() {
   }
   if (isDispatchPlanEditor()) {
     return `
-      <span class="dispatch-mode-pill editing">Edit mode</span>
+      <span class="dispatch-mode-pill editing">${isDispatchHistoryEditMode() ? "History edit mode" : "Edit mode"}</span>
       <button data-action="save-plan-now" type="button">Save Now</button>
       <button data-action="exit-edit-mode" type="button">Exit Edit</button>
     `;
   }
   const owner = planEditLease?.active ? escapeHtml(planEditLease.operatorName || "Another dispatcher") : "";
   const lockedByOther = Boolean(planEditLease?.active && planEditLease.sessionId !== dispatchSessionId);
+  const historicalPlan = isHistoricalDispatchPlanDate(currentPlanDate);
   return `
-    <span class="dispatch-mode-pill viewing">${lockedByOther ? `${owner} editing` : "View mode"}</span>
-    <button class="primary" data-action="enter-edit-mode" type="button" ${lockedByOther || dispatchPlannerSnapshotState !== "ready" ? `disabled title="${lockedByOther ? `${owner} is already editing this plan` : "Wait for the current snapshot to load"}"` : ""}>Enter Edit Mode</button>
+    <span class="dispatch-mode-pill viewing">${lockedByOther ? `${owner} editing` : historicalPlan ? "History view" : "View mode"}</span>
+    <button class="primary" data-action="enter-edit-mode" type="button" ${lockedByOther || dispatchPlannerSnapshotState !== "ready" ? `disabled title="${lockedByOther ? `${owner} is already editing this plan` : "Wait for the current snapshot to load"}"` : ""}>${historicalPlan ? "Enter History Edit" : "Enter Edit Mode"}</button>
+  `;
+}
+
+function historicalDispatchModeNoticeHtml() {
+  if (!isHistoricalDispatchPlanDate(currentPlanDate)) return "";
+  return `
+    <div class="dispatch-history-mode-notice ${isDispatchHistoryEditMode() ? "active" : ""}">
+      <strong>${isDispatchHistoryEditMode() ? "History Edit Mode" : "Historical plan"}</strong>
+      <span>${isDispatchHistoryEditMode()
+        ? "Reconciliation-complete PO/TO orders can be added to this past date. Orders completed in Driver PWA cannot be replanned."
+        : "Enter History Edit to add reconciliation-complete PO/TO orders. Driver PWA-completed orders remain locked."}</span>
+    </div>
   `;
 }
 
@@ -9165,7 +9224,7 @@ function render(options = {}) {
   }
   const { plannerRoot } = ensureDispatchRenderLayers();
   plannerRoot.innerHTML = `
-    <section class="dispatch-shell ${isDispatchPlanEditor() ? "dispatch-editing" : "dispatch-viewing"}">
+    <section class="dispatch-shell ${isDispatchPlanEditor() ? "dispatch-editing" : "dispatch-viewing"} ${isHistoricalDispatchPlanDate(currentPlanDate) ? "dispatch-history-plan" : ""}">
       <header class="dispatch-topbar">
         <div class="topbar-main">
           <div>
@@ -9194,6 +9253,7 @@ function render(options = {}) {
         ${driverTruckSwitchAttention.map((item) => `<div><span><strong>${escapeHtml(item.driver_login || "Driver")}</strong>: ${escapeHtml(item.from_truck_plate || "previous truck")} to ${escapeHtml(item.to_truck_plate || "new truck")} failed in Samsara. ${escapeHtml(item.samsara_error || "")}</span><button data-action="override-truck-switch" data-job-id="${escapeHtml(item.job_id)}" type="button">Override</button></div>`).join("")}
       </div>` : ""}
       <div class="dispatch-grid">
+        ${historicalDispatchModeNoticeHtml()}
         ${renderOrderPool()}
         <section class="planner-panel">
           ${renderDispatchKpiStrip()}
@@ -9219,6 +9279,9 @@ function orderPoolSubtitle() {
     if (mbtBinDispatchLoading) return "Loading current BIN contract legs...";
     if (mbtBinDispatchError) return `BIN contract legs unavailable: ${mbtBinDispatchError}`;
     return "Current ready contract legs; later legs stay locked in the contract timeline.";
+  }
+  if (isDispatchHistoryEditMode() && !searchText.trim()) {
+    return "Historical order list includes reconciliation-complete PO/TO orders; Driver PWA-completed orders stay locked.";
   }
   if (!searchText.trim()) return activeOrderType === "TO" ? "Transfer and Custom Order list" : orderTypeLabel(activeOrderType) + " list";
   if (orderSearchLoading) return "Searching all valid SO, PO, TO, Custom, and CO orders...";
@@ -9442,6 +9505,7 @@ function renderOrderCard(order) {
       <div class="chip-row">
         <span class="chip">${order.type === "CUSTOM" ? "Custom" : order.type}</span>
         ${order.sourceTable === "scm_vrma_orders" ? `<span class="chip">Local VRMA</span>` : ""}
+        ${order.historicalReconciliationComplete ? `<span class="chip history-chip">Reconciliation history</span>` : ""}
         ${executionStatus === "complete" ? `<span class="chip complete-chip">Completed</span>` : executionStatus === "in_progress" ? `<span class="chip progress-chip">In progress</span>` : ""}
         ${reviewOnly ? `<span class="chip complete-chip">${escapeHtml(reviewOnlyText(order))}</span>` : ""}
         ${reconciliationBlocked ? `<span class="chip warn" title="${escapeHtml(scmReconciliationBlockText(order))}">Reconcile Review</span>` : ""}
@@ -13906,7 +13970,7 @@ app.addEventListener("change", (event) => {
         }
         if (isDispatchPlanEditor()) await releaseDispatchEditMode();
         const result = await loadPlanForDate(nextDate, { createIfMissing: false });
-        await loadMbtBinFrontLegs();
+        await Promise.all([loadDispatchOrders(), loadMbtBinFrontLegs()]);
         return result;
       })
       .then((result) => {

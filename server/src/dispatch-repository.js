@@ -903,7 +903,8 @@ export async function listDispatchOrders({
                scm.eta_date, scm.eta_time, scm.driver, scm.notes,
                schedule_pickup_yard.address, schedule_pickup_yard.window_start, schedule_pickup_yard.window_end,
                schedule_pickup_yard.instructions, schedule_pickup_yard.day_label
-      HAVING o.dispatch_plan_date IS NOT NULL
+      HAVING $1::boolean
+          OR o.dispatch_plan_date IS NOT NULL
           OR COALESCE(SUM(GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0) - COALESCE(pa.allocated_sales_qty, 0) - COALESCE(spa.split_sales_qty, 0), 0)), 0) > 0.000001
     ),
     local_co AS (

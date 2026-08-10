@@ -49,6 +49,93 @@ async function command(boot, planId, lease, commandId, commandType, payload) {
   });
 }
 
+async function seedReconciliationCompletedPurchaseOrder({
+  netsuiteId,
+  lineId,
+  ref,
+  driverCompletedPlanId = null,
+  isBlanket = false
+}) {
+  await query(
+    `INSERT INTO purchase_orders (
+       netsuite_id, tranid, trandate, vendor_id, vendor, status, status_text,
+       source_location, destination_location_id, destination_location,
+       dispatch_vendor_yard, dispatch_address, receipt_status,
+       initial_scm_status, is_blanket_po, netsuite_active, synced_at
+     ) VALUES (
+       $1, $2, DATE '2023-03-01', 991001, 'History Mode Vendor', 'B', 'Purchase Order : Received',
+       'History Vendor Yard', 1, '3445',
+       'History Vendor Yard', '3445 Kennedy Road, Toronto, ON', 'received',
+       'Queued', $3::boolean, true, now()
+     )`,
+    [netsuiteId, ref, isBlanket]
+  );
+  await query(
+    `INSERT INTO purchase_order_lines (
+       id, purchase_order_id, line_id, item_id, item_name, sku, quantity, unit,
+       item_weight, pallet_qty, layer_qty, section_qty, piece_qty,
+       to_plt, to_lyr, to_sec, to_pcs, location_id, location,
+       netsuite_received_qty, netsuite_received_baseline_qty,
+       netsuite_active, synced_at, raw
+     ) VALUES (
+       $1, $2, $1, $1, 'History Mode Item', $3, 10, 'EA',
+       5, 1, 0, 0, 0,
+       10, 0, 0, 1, 1, '3445',
+       10, 10,
+       true, now(), '{}'::jsonb
+     )`,
+    [lineId, netsuiteId, `${ref}-ITEM`]
+  );
+  const state = await query(
+    `INSERT INTO scm_reconciliation_order_state (
+       order_kind, source_order_netsuite_id, source_order_ref,
+       application_status, reconciliation_status, reconciliation_source,
+       ordered_qty, received_qty, remaining_qty, quantity_summary,
+       reconciled_at, completed_at
+     ) VALUES (
+       'PO', $1, $2,
+       'Completed', 'ok', 'nightly',
+       10, 10, 0, $3::jsonb,
+       now() - interval '1 day', now() - interval '1 day'
+     )
+     RETURNING id`,
+    [
+      netsuiteId,
+      ref,
+      JSON.stringify({
+        family: { ordered: 10, received: 10, remaining: 0, applicationStatus: "Completed" },
+        targets: { [ref]: { ordered: 10, received: 10, remaining: 0, applicationStatus: "Completed" } }
+      })
+    ]
+  );
+  await query(
+    `INSERT INTO scm_transport_schedule (
+       order_kind, source_table, source_id, order_ref, display_ref,
+       method, pickup_point, dropoff_point, brand, content, weight_lbs, status,
+       reconciliation_order_state_id, created_by, updated_by
+     ) VALUES (
+       'PO', 'purchase_orders', $1, $2, $2,
+       'MBT', 'History Vendor Yard', '3445', 'History Mode Vendor', $2, 50, 'Completed',
+       $3, 'dispatch-history-test', 'reconciliation'
+     )`,
+    [netsuiteId, ref, state.rows[0].id]
+  );
+  if (driverCompletedPlanId) {
+    await query(
+      `INSERT INTO driver_job_records (
+         job_id, plan_id, plan_date, driver_login, truck_id, truck_plate,
+         load_id, load_name, stop_id, stop_type, order_refs,
+         status, started_at, completed_at
+       ) VALUES (
+         $1, $2, DATE '2023-03-02', 'history-driver', 'HISTORY-TRUCK', 'HISTORY-TRUCK',
+         'history-source-load', 'History source load', $3, 'drop', $4::jsonb,
+         'complete', now() - interval '2 days', now() - interval '2 days'
+       )`,
+      [`dispatch-history-complete-${ref}`, driverCompletedPlanId, `dispatch-history-stop-${ref}`, JSON.stringify([ref])]
+    );
+  }
+}
+
 test("DP-05: remove → group → ungroup → replan is an exact, continuous command sequence", async () => {
   const seeded = await fixture.seedPlan({ date: "2025-01-15", refs: ["DP-A", "DP-B", "DP-C", "DP-D"] });
   const lease = await fixture.acquireLease({ planDate: seeded.plan_date, sessionId: "dispatch-v2-command-flow" });
@@ -300,6 +387,160 @@ test("DP-07: a previous-date order may be removed and re-added to its own plan, 
   });
   assert.equal(result.response.status, 409, JSON.stringify(result.payload));
   assert.equal(result.payload.code, "DISPATCH_ORDER_ALREADY_PLANNED");
+});
+
+test("history edit mode plans reconciliation-complete orders but never Driver PWA-completed orders", async () => {
+  const planDate = "2023-03-01";
+  const allowedRef = "DP-HISTORY-RECON-COMPLETE";
+  const driverCompletedRef = "DP-HISTORY-DRIVER-COMPLETE";
+  const blanketRef = "DP-HISTORY-BLANKET-COMPLETE";
+  const source = await fixture.seedPlan({ date: "2023-03-02", refs: ["DP-HISTORY-SOURCE-CONTROL"] });
+  await seedReconciliationCompletedPurchaseOrder({
+    netsuiteId: 991001001,
+    lineId: 991001101,
+    ref: allowedRef
+  });
+  await seedReconciliationCompletedPurchaseOrder({
+    netsuiteId: 991001002,
+    lineId: 991001102,
+    ref: driverCompletedRef,
+    driverCompletedPlanId: source.id
+  });
+  await seedReconciliationCompletedPurchaseOrder({
+    netsuiteId: 991001003,
+    lineId: 991001103,
+    ref: blanketRef,
+    isBlanket: true
+  });
+
+  const target = await fixture.seedPlan({ date: planDate, refs: [] });
+  const lease = await fixture.acquireLease({
+    planDate,
+    sessionId: "dispatch-v2-history-edit"
+  });
+
+  const ordinaryFeed = await fixture.request(`/api/dispatch/orders?search=${encodeURIComponent("DP-HISTORY-")}`);
+  assert.equal(ordinaryFeed.response.status, 200, JSON.stringify(ordinaryFeed.payload));
+  assert.equal(ordinaryFeed.payload.some((order) => order.id === allowedRef), false,
+    "Current Dispatch order visibility must remain unchanged outside History Edit Mode.");
+  assert.equal(ordinaryFeed.payload.some((order) => order.id === driverCompletedRef), false);
+
+  const noLeaseFeed = await fixture.request(
+    `/api/dispatch/orders?search=${encodeURIComponent("DP-HISTORY-")}&historyPlanDate=${planDate}&sessionId=dispatch-v2-history-edit`
+  );
+  assert.equal(noLeaseFeed.response.status, 409, JSON.stringify(noLeaseFeed.payload));
+  assert.match(String(noLeaseFeed.payload.code || ""), /DISPATCH_PLAN_EDIT_LEASE/u);
+
+  const futureHistoryFeed = await fixture.request("/api/dispatch/orders?historyPlanDate=2999-01-01", {
+    headers: { "x-dispatch-edit-lease": lease }
+  });
+  assert.equal(futureHistoryFeed.response.status, 400, JSON.stringify(futureHistoryFeed.payload));
+  assert.equal(futureHistoryFeed.payload.code, "DISPATCH_HISTORY_DATE_INVALID");
+
+  const historyFeed = await fixture.request(
+    `/api/dispatch/orders?search=${encodeURIComponent("DP-HISTORY-")}&historyPlanDate=${planDate}`,
+    { headers: { "x-dispatch-edit-lease": lease } }
+  );
+  assert.equal(historyFeed.response.status, 200, JSON.stringify(historyFeed.payload));
+  const allowedOrder = historyFeed.payload.find((order) => order.id === allowedRef);
+  assert.ok(allowedOrder, "A reconciliation-complete PO must be available to a leased past-date plan.");
+  assert.equal(allowedOrder.historicalReconciliationComplete, true);
+  assert.equal(allowedOrder.historicalPlanDate, planDate);
+  assert.equal(
+    historyFeed.payload.some((order) => order.id === driverCompletedRef),
+    false,
+    "Driver PWA-completed work must remain absent even in History Edit Mode."
+  );
+  assert.equal(
+    historyFeed.payload.some((order) => order.id === blanketRef),
+    false,
+    "History Edit Mode must not weaken the existing blanket-order restriction."
+  );
+
+  let current = await bootstrap(target.id, planDate);
+  const allowedTrucks = jsonClone(current.plan.trucks);
+  allowedTrucks[0].loads[0].stops.push({
+    id: "dp-history-reconciliation-drop",
+    type: "drop",
+    orderId: allowedRef,
+    location: "3445 Kennedy Road, Toronto, ON"
+  });
+  let result = await command(current, target.id, lease, "dp-history-reconciliation-add", "replace_plan", {
+    planDate,
+    orders: [allowedOrder],
+    trucks: allowedTrucks,
+    summary: current.plan.summary,
+    affectedOrderRefs: [allowedRef],
+    actionName: "drop_order_new_load"
+  });
+  assert.equal(result.response.status, 200, JSON.stringify(result.payload));
+  assert.equal(result.payload.plan.board.orderRefs.includes(allowedRef), true);
+  current = result.payload;
+
+  const blanketOrder = {
+    ...jsonClone(allowedOrder),
+    id: blanketRef,
+    orderId: blanketRef,
+    refNumber: blanketRef,
+    originalPoRef: blanketRef,
+    netsuiteId: 991001003
+  };
+  const blanketTrucks = jsonClone(current.plan.trucks);
+  blanketTrucks[0].loads[0].stops.push({
+    id: "dp-history-blanket-drop",
+    type: "drop",
+    orderId: blanketRef,
+    location: "3445 Kennedy Road, Toronto, ON"
+  });
+  result = await command(current, target.id, lease, "dp-history-blanket-add", "replace_plan", {
+    planDate,
+    orders: [...current.plan.assignedOrderSnapshots, blanketOrder],
+    trucks: blanketTrucks,
+    summary: current.plan.summary,
+    affectedOrderRefs: [blanketRef],
+    actionName: "drop_order_new_load"
+  });
+  assert.equal(result.response.status, 202, JSON.stringify(result.payload));
+  assert.equal(result.payload.applied, false);
+  assert.ok(
+    result.payload.validationIssues?.some((issue) => issue.code === "DISPATCH_RESTRICTED_SCM_ORDER"),
+    "A forged history save must not bypass the existing blanket-order restriction."
+  );
+
+  const blockedOrder = {
+    ...jsonClone(allowedOrder),
+    id: driverCompletedRef,
+    orderId: driverCompletedRef,
+    refNumber: driverCompletedRef,
+    originalPoRef: driverCompletedRef,
+    netsuiteId: 991001002
+  };
+  const blockedTrucks = jsonClone(current.plan.trucks);
+  blockedTrucks[0].loads[0].stops.push({
+    id: "dp-history-driver-completed-drop",
+    type: "drop",
+    orderId: driverCompletedRef,
+    location: "3445 Kennedy Road, Toronto, ON"
+  });
+  result = await command(current, target.id, lease, "dp-history-driver-completed-add", "replace_plan", {
+    planDate,
+    orders: [...current.plan.assignedOrderSnapshots, blockedOrder],
+    trucks: blockedTrucks,
+    summary: current.plan.summary,
+    affectedOrderRefs: [driverCompletedRef],
+    actionName: "drop_order_new_load"
+  });
+  assert.equal(result.response.status, 202, JSON.stringify(result.payload));
+  assert.equal(result.payload.applied, false);
+  assert.ok(
+    result.payload.validationIssues?.some((issue) => issue.code === "DISPATCH_ORDER_DRIVER_COMPLETED"),
+    "The server must reject a forged compact-board save for Driver PWA-completed work."
+  );
+
+  const hardRefresh = await bootstrap(target.id, planDate);
+  assert.equal(hardRefresh.plan.board.orderRefs.includes(allowedRef), true);
+  assert.equal(hardRefresh.plan.board.orderRefs.includes(blanketRef), false);
+  assert.equal(hardRefresh.plan.board.orderRefs.includes(driverCompletedRef), false);
 });
 
 test("DP-11 and DP-12: targeted CO and atomic split commands return only affected records and exact retries", async () => {

@@ -4612,6 +4612,36 @@ button[data-action="enter-edit-mode"]:disabled:hover {
   overflow: hidden;
 }
 
+.dispatch-history-plan .dispatch-grid {
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.dispatch-history-mode-notice {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 38px;
+  padding: 8px 12px;
+  border: 1px solid #b9c9d5;
+  border-left: 5px solid #607d94;
+  border-radius: 8px;
+  background: #f1f6f9;
+  color: #294554;
+  font-size: 12px;
+}
+
+.dispatch-history-mode-notice.active {
+  border-color: #c29a3d;
+  border-left-color: #9b6b00;
+  background: #fff8df;
+  color: #674a06;
+}
+
+.dispatch-history-mode-notice strong {
+  white-space: nowrap;
+}
+
 .route-notice {
   position: fixed;
   top: 74px;
@@ -4906,6 +4936,11 @@ button[data-action="enter-edit-mode"]:disabled:hover {
 .chip.complete-chip {
   background: #4f5d66;
   color: #ffffff;
+}
+
+.chip.history-chip {
+  background: #fff0b8;
+  color: #735200;
 }
 
 .chip.danger {

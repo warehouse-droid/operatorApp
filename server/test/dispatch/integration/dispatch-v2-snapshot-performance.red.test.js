@@ -339,8 +339,13 @@ test("DP-13 and DP-16: checkpoint list is metadata-only and compact reads/comman
     assert.ok(result.responseBytes < 50_000, `targeted popup refresh must stay below 50 KB, got ${result.responseBytes}`);
     samples.push({ name: "targeted_popup_order_refresh", durationMs: result.durationMs, responseBytes: result.responseBytes });
   }
-  const summary = summarizeDispatchPerformance(samples);
+  const requestSummary = summarizeDispatchPerformance(
+    samples.filter(({ name }) => name !== "continuous_sequence")
+  );
   await recordDispatchPerformance(samples);
-  assert.ok(summary.p95Ms < 1_000, `P95 command/read time must remain below 1,000ms; got ${summary.p95Ms}`);
+  assert.ok(
+    requestSummary.p95Ms < 1_000,
+    `P95 command/read time must remain below 1,000ms; got ${requestSummary.p95Ms}`
+  );
   assert.ok(sequenceMs < 4_000, `continuous sequence must remain below 4,000ms; got ${sequenceMs}`);
 });

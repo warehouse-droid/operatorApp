@@ -147,6 +147,37 @@ test("DP-16 startup: the compact plan is on the critical path but the full order
   assert.match(init, /renderDispatchOrderPoolPatch\(|renderDispatchPlannerPatch\(/u);
 });
 
+test("history edit mode scopes reconciliation-complete feeds to a leased past date", () => {
+  const requestSource = functionBody("dispatchOrderFeedRequest");
+  const harness = Function(`
+    "use strict";
+    let historyEditMode = false;
+    let currentPlanDate = "2026-08-09";
+    let planEditLeaseToken = "history-lease";
+    function isDispatchHistoryEditMode() { return historyEditMode; }
+    ${requestSource}
+    return {
+      request: dispatchOrderFeedRequest,
+      enable() { historyEditMode = true; }
+    };
+  `)();
+  assert.deepEqual(harness.request(), { url: "/api/dispatch/orders", headers: {} },
+    "Current/view-mode requests must retain the ordinary Dispatch feed contract.");
+  assert.deepEqual(harness.request({ sync: true }), { url: "/api/dispatch/sync", headers: {} });
+  harness.enable();
+  const historical = harness.request({ search: "PO-HISTORY" });
+  assert.match(historical.url, /^\/api\/dispatch\/orders\?/u);
+  const historicalUrl = new URL(historical.url, "http://dispatch.test");
+  assert.equal(historicalUrl.searchParams.get("search"), "PO-HISTORY");
+  assert.equal(historicalUrl.searchParams.get("historyPlanDate"), "2026-08-09");
+  assert.equal(historical.headers["x-dispatch-edit-lease"], "history-lease");
+
+  assert.match(functionBody("enterDispatchEditMode"), /isDispatchHistoryEditMode\(\)[\s\S]*await\s+loadDispatchOrders\(/u);
+  assert.match(functionBody("releaseDispatchEditMode"), /leavingHistoryEditMode[\s\S]*await\s+loadDispatchOrders\(/u);
+  assert.match(dispatchSource, /History Edit Mode[\s\S]*Driver PWA-completed orders/u);
+  assert.match(dispatchSource, /historicalReconciliationComplete/u);
+});
+
 test("DP-03/DP-11: SO, PO, TO, and CO popup mutations request targeted order responses", () => {
   assert.match(dispatchSource, /orders\/\$\{encodeURIComponent\(button\.dataset\.order\)\}\/vendor-yard\?response=targeted/u);
   assert.match(dispatchSource, /orders\/\$\{encodeURIComponent\(order\.id\)\}\/po-allocations\?response=targeted/u);

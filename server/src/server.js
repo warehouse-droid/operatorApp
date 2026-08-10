@@ -49,8 +49,15 @@ import { isNetSuiteSalesOrderBilled } from "./sales-order-reconciliation.js";
 import { isNetSuiteOperationalWorkActive } from "./netsuite-operational-work.js";
 import { getScmSchedulePreference, normalizeScmSchedulePreferenceSurface, updateScmSchedulePreference } from "./scm-schedule-preference-repository.js";
 import { getScmScheduleFormatting, updateScmScheduleFormatting } from "./scm-schedule-formatting-repository.js";
-import { canViewRestrictedScmOrders, filterRestrictedScmOrders } from "./scm-order-visibility.js";
+import { canViewRestrictedScmOrders, filterRestrictedScmOrders, isRestrictedScmOrder } from "./scm-order-visibility.js";
 import { changedPlacedDispatchScmAssignmentRefs } from "./dispatch-scm-placement.js";
+import {
+  assertNoDriverPwaCompletedDispatchRefs,
+  historicalDispatchPlanDate,
+  historicalReconciliationDispatchAllowance,
+  listCompletedReconciliationDispatchRefs,
+  listDriverPwaCompletedDispatchRefs
+} from "./dispatch-history-mode.js";
 import { syncTargetedNetSuiteOrder } from "./targeted-order-sync.js";
 import { authorizeSalesOrderReload, cancelSalesOrderReload } from "./sales-order-reload.js";
 import {
@@ -492,14 +499,17 @@ function dispatchPlacedScmRefs(plan = {}) {
   return [...refs];
 }
 
-async function assertNoRestrictedScmDispatchOrders(orderRefs = [], action = "plan") {
+async function assertNoRestrictedScmDispatchOrders(orderRefs = [], action = "plan", { planDate = "" } = {}) {
   const requestedRefs = [...new Set((orderRefs || [])
     .map((ref) => String(ref || "").trim())
     .filter(Boolean))];
   if (!requestedRefs.length) return;
-  const restrictedRefs = await listRestrictedScmDispatchOrderRefs();
+  const [restrictedRefs, historicalAllowance] = await Promise.all([
+    listRestrictedScmDispatchOrderRefs(),
+    historicalReconciliationDispatchAllowance({ planDate, orderRefs: requestedRefs })
+  ]);
   const conflicts = requestedRefs
-    .filter((ref) => restrictedRefs.has(ref.toLowerCase()))
+    .filter((ref) => restrictedRefs.has(ref.toLowerCase()) && !historicalAllowance.has(ref.toLowerCase()))
     .map((orderRef) => ({
       orderRef,
       reason: `${orderRef} is Blanket, Hold, Complete, or Cancelled and cannot be added to Dispatch.`
@@ -513,6 +523,14 @@ async function assertNoRestrictedScmDispatchOrders(orderRefs = [], action = "pla
       conflicts
     }
   );
+}
+
+async function assertNoNewDriverPwaCompletedDispatchOrders(previousPlan = {}, nextPlan = {}, action = "plan these orders") {
+  const previousRefs = new Set([...dispatchPlannedOrderRefs(previousPlan)].map((ref) => String(ref || "").trim().toLowerCase()));
+  const newlyPlannedRefs = [...dispatchPlannedOrderRefs(nextPlan)]
+    .map((ref) => String(ref || "").trim())
+    .filter((ref) => ref && !previousRefs.has(ref.toLowerCase()));
+  return assertNoDriverPwaCompletedDispatchRefs(newlyPlannedRefs, action);
 }
 
 function dispatchOperatorImpactSignature(plan = {}) {
@@ -1301,11 +1319,67 @@ function dispatchOrderMatchesSearch(order = {}, search = "") {
   ].join(" ").toLowerCase().includes(term);
 }
 
-async function listDispatchOrdersForResponse({ type = null, search = "" } = {}) {
+function filterDispatchPlanningVisibleOrders(orders = []) {
+  return (orders || []).filter((order) => (
+    order?.historicalReconciliationComplete === true || !isRestrictedScmOrder(order)
+  ));
+}
+
+function requestedDispatchHistoryPlanDate(value) {
+  const requested = String(value || "").trim();
+  if (!requested) return "";
+  const historicalDate = historicalDispatchPlanDate(requested);
+  if (historicalDate) return historicalDate;
+  throw Object.assign(new Error("History edit mode requires a valid past Dispatch plan date."), {
+    status: 400,
+    code: "DISPATCH_HISTORY_DATE_INVALID"
+  });
+}
+
+function dispatchOrderCompletedByReconciliation(order = {}, completedRefs = new Set()) {
+  const blanket = [
+    order.isBlanket,
+    order.is_blanket,
+    order.isBlanketPo,
+    order.is_blanket_po,
+    order.raw?.isBlanket,
+    order.raw?.is_blanket_po
+  ].some((value) => value === true || ["true", "1", "yes"].includes(String(value || "").trim().toLowerCase()));
+  if (blanket) return false;
+  const method = String(order.scm?.method || order.scmMethod || order.raw?.scm_method || "MBT").trim().toUpperCase();
+  if (method !== "MBT") return false;
+  const childRefs = [...new Set((order.childOrders || [])
+    .map((ref) => String(ref || "").trim().toLowerCase())
+    .filter(Boolean))];
+  if (childRefs.length) {
+    const groupRef = String(order.id || "").trim().toLowerCase();
+    return completedRefs.has(groupRef) && childRefs.every((ref) => completedRefs.has(ref));
+  }
+  return dispatchOrderLogicalRefs(order).some((ref) => completedRefs.has(ref));
+}
+
+function historicalReconciliationOrder(order = {}, {
+  historyPlanDate = "",
+  completedRefs = new Set(),
+  driverCompletedRefs = new Set()
+} = {}) {
+  if (!historyPlanDate || !["PO", "TO"].includes(String(order?.type || "").trim().toUpperCase())) return null;
+  const logicalRefs = dispatchOrderLogicalRefs(order);
+  if (!dispatchOrderCompletedByReconciliation(order, completedRefs)) return null;
+  if (logicalRefs.some((ref) => driverCompletedRefs.has(ref))) return null;
+  return {
+    ...order,
+    historicalReconciliationComplete: true,
+    historicalPlanDate: historyPlanDate
+  };
+}
+
+async function listDispatchOrdersForResponse({ type = null, search = "", historyPlanDate = "" } = {}) {
   const searchTerm = String(search || "").trim().slice(0, 120);
   const requestedType = String(type || "").trim().toUpperCase();
   const includeCustom = !requestedType || requestedType === "TO" || requestedType === "CUSTOM";
-  const [orders, customOrders, snapshotOrders, restrictedScmRefs, billedSalesOrders] = await Promise.all([
+  const historicalDate = historicalDispatchPlanDate(historyPlanDate);
+  const [orders, customOrders, snapshotOrders, restrictedScmRefs, billedSalesOrders, hiddenScmOrders, completedReconciliationRefs] = await Promise.all([
     listDispatchOrders({ type, search: searchTerm }),
     includeCustom
       ? listDispatchCustomOrders({
@@ -1316,8 +1390,31 @@ async function listDispatchOrdersForResponse({ type = null, search = "" } = {}) 
       : Promise.resolve([]),
     listDispatchSnapshotDerivedOrders({ type, search: searchTerm }),
     listRestrictedScmDispatchOrderRefs(),
-    listBilledSalesOrderFamilyRefs()
+    listBilledSalesOrderFamilyRefs(),
+    historicalDate
+      ? listDispatchOrders({ type, search: searchTerm, includeHiddenScm: true })
+      : Promise.resolve([]),
+    historicalDate
+      ? listCompletedReconciliationDispatchRefs()
+      : Promise.resolve(new Set())
   ]);
+  const historicalCandidates = historicalDate
+    ? [...hiddenScmOrders, ...snapshotOrders].filter((order) => (
+        ["PO", "TO"].includes(String(order?.type || "").trim().toUpperCase())
+        && dispatchOrderCompletedByReconciliation(order, completedReconciliationRefs)
+      ))
+    : [];
+  const driverCompletedRefs = historicalCandidates.length
+    ? await listDriverPwaCompletedDispatchRefs({
+        candidateRefs: historicalCandidates.flatMap((order) => dispatchOrderLogicalRefs(order))
+      })
+    : new Set();
+  const decorateHistoricalOrder = (order) => historicalReconciliationOrder(order, {
+    historyPlanDate: historicalDate,
+    completedRefs: completedReconciliationRefs,
+    driverCompletedRefs
+  });
+  const historicalOrders = historicalCandidates.map(decorateHistoricalOrder).filter(Boolean);
   const billedSalesOrderRefs = new Set(billedSalesOrders.flatMap((order) => [order.ref, order.id])
     .map((ref) => String(ref || "").trim().toLowerCase())
     .filter(Boolean));
@@ -1326,19 +1423,22 @@ async function listDispatchOrdersForResponse({ type = null, search = "" } = {}) 
     if (type !== "SO" && !Array.isArray(order?.childOrders)) return false;
     return dispatchOrderLogicalRefs(order).some((ref) => billedSalesOrderRefs.has(ref));
   };
-  const currentOrders = filterRestrictedScmOrders([
+  const currentOrders = filterDispatchPlanningVisibleOrders([
     ...orders,
-    ...customOrders.map(dispatchOrderFromCustomOrder)
-  ], { includeRestricted: false }).filter((order) => !isBilledSalesOrderFamily(order)).filter((order) => {
+    ...customOrders.map(dispatchOrderFromCustomOrder),
+    ...historicalOrders
+  ]).filter((order) => !isBilledSalesOrderFamily(order)).filter((order) => {
+    if (order.historicalReconciliationComplete === true) return true;
     if (!["PO", "TO", "VRMA"].includes(String(order?.type || "").trim().toUpperCase())) return true;
     return !dispatchOrderLogicalRefs(order).some((ref) => restrictedScmRefs.has(ref));
   });
   const derivedCandidates = searchTerm
     ? snapshotOrders.filter((order) => dispatchOrderMatchesSearch(order, searchTerm))
     : snapshotOrders;
-  const derivedOrders = filterRestrictedScmOrders(derivedCandidates, {
-    includeRestricted: false
-  }).filter((order) => !isBilledSalesOrderFamily(order)).filter((order) => {
+  const derivedOrders = filterDispatchPlanningVisibleOrders(derivedCandidates.map((order) => (
+    decorateHistoricalOrder(order) || order
+  ))).filter((order) => !isBilledSalesOrderFamily(order)).filter((order) => {
+    if (order.historicalReconciliationComplete === true) return true;
     if (!["PO", "TO", "VRMA"].includes(String(order?.type || "").trim().toUpperCase())) return true;
     return !dispatchOrderLogicalRefs(order).some((ref) => restrictedScmRefs.has(ref));
   });
@@ -1382,9 +1482,9 @@ async function listDispatchOrdersForResponse({ type = null, search = "" } = {}) 
       }
     };
   });
-  const visibleOrders = filterRestrictedScmOrders(withReconciliation, {
-    includeRestricted: false
-  }).filter((order) => !isBilledSalesOrderFamily(order)).filter((order) => {
+  const visibleOrders = filterDispatchPlanningVisibleOrders(withReconciliation)
+    .filter((order) => !isBilledSalesOrderFamily(order)).filter((order) => {
+    if (order.historicalReconciliationComplete === true) return true;
     if (!["PO", "TO", "VRMA"].includes(String(order?.type || "").trim().toUpperCase())) return true;
     return !dispatchOrderLogicalRefs(order).some((ref) => restrictedScmRefs.has(ref));
   });
@@ -9976,7 +10076,8 @@ async function prepareDispatchV2ReplaceCommand(previousPlan = {}, command = {}) 
   await assertScmReconciliationOrderEditable({ orderRefs: changedScmRefs });
   await assertNoRestrictedScmDispatchOrders(
     changedPlacedDispatchScmAssignmentRefs(previousPlan, candidate),
-    "save this plan"
+    "save this plan",
+    { planDate: existingPlanDate }
   );
   const duplicateDrivers = config.dispatch?.driverOrientedPlanning ? [] : dispatchDuplicateDriverAssignments(cleanTrucks);
   if (duplicateDrivers.length) {
@@ -10076,7 +10177,15 @@ app.post("/api/dispatch/v2/plans/:id/commands", requireOperator, requireDispatch
       res.setHeader("X-Dispatch-Idempotent-Replay", "true");
       return res.json(stored.payload);
     }
-    command = String(submittedCommand.commandType || submittedCommand.type || "") === "replace_plan"
+    const submittedCommandType = String(submittedCommand.commandType || submittedCommand.type || "");
+    if (submittedCommandType === "assign_order") {
+      await assertNoRestrictedScmDispatchOrders(
+        [submittedCommand.payload?.orderRef],
+        "add this order to Dispatch",
+        { planDate: previousPlan.planDate }
+      );
+    }
+    command = submittedCommandType === "replace_plan"
       ? await prepareDispatchV2ReplaceCommand(previousPlan, submittedCommand)
       : submittedCommand;
     const result = await applyDispatchV2Command({
@@ -10344,9 +10453,15 @@ app.post("/api/dispatch/plan-snapshots/:snapshotId/restore", requireOperator, re
     });
     const changedScmRefs = changedDispatchScmRefs(currentPlanBeforeRestore, restoreCandidate);
     await assertScmReconciliationOrderEditable({ orderRefs: changedScmRefs });
+    await assertNoNewDriverPwaCompletedDispatchOrders(
+      currentPlanBeforeRestore,
+      restoreCandidate,
+      "restore this snapshot"
+    );
     await assertNoRestrictedScmDispatchOrders(
       changedPlacedDispatchScmAssignmentRefs(currentPlanBeforeRestore, restoreCandidate),
-      "restore this snapshot"
+      "restore this snapshot",
+      { planDate: restoreCandidate.planDate }
     );
     const dependencyStructureChanges = await assertNoConsolidationStructureConflict(
       currentPlanBeforeRestore,
@@ -10521,13 +10636,20 @@ app.put("/api/dispatch/plans/:id", reportDispatchSaveTiming, requireOperator, re
       trucks: cleanTrucks
     });
     await assertScmReconciliationOrderEditable({ orderRefs: changedScmRefs });
+    await assertNoNewDriverPwaCompletedDispatchOrders(previousPlan, {
+      ...previousPlan,
+      planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date,
+      orders: cleanOrders,
+      trucks: cleanTrucks
+    }, "save this plan");
     await assertNoRestrictedScmDispatchOrders(
       changedPlacedDispatchScmAssignmentRefs(previousPlan, {
         ...previousPlan,
         orders: cleanOrders,
         trucks: cleanTrucks
       }),
-      "save this plan"
+      "save this plan",
+      { planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date }
     );
     const duplicateDrivers = config.dispatch?.driverOrientedPlanning ? [] : dispatchDuplicateDriverAssignments(cleanTrucks);
     if (duplicateDrivers.length) {
@@ -10791,13 +10913,20 @@ app.post("/api/dispatch/plans/:id/confirm", requireOperator, requireDispatcher, 
         trucks: requestedTrucks
       });
       requestedTrucks = scheduleCandidate.trucks || [];
+      await assertNoNewDriverPwaCompletedDispatchOrders(previousPlan, {
+        ...previousPlan,
+        planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date,
+        orders: requestedOrders,
+        trucks: requestedTrucks
+      }, "confirm this plan");
       await assertNoRestrictedScmDispatchOrders(
         changedPlacedDispatchScmAssignmentRefs(previousPlan, {
           ...previousPlan,
           orders: requestedOrders,
           trucks: requestedTrucks
         }),
-        "confirm this plan"
+        "confirm this plan",
+        { planDate: previousPlan?.planDate || req.body?.planDate || req.body?.date }
       );
       const duplicateDrivers = config.dispatch?.driverOrientedPlanning ? [] : dispatchDuplicateDriverAssignments(requestedTrucks);
       if (duplicateDrivers.length) return sendDispatchDuplicateDriverResponse(res, duplicateDrivers);
@@ -10851,7 +10980,10 @@ app.post("/api/dispatch/plans/:id/confirm", requireOperator, requireDispatcher, 
       }
     }
     const placedScmRefs = dispatchPlacedScmRefs(planForConfirm);
-    await assertNoRestrictedScmDispatchOrders(placedScmRefs, "confirm this plan");
+    await assertNoNewDriverPwaCompletedDispatchOrders(previousPlan, planForConfirm, "confirm this plan");
+    await assertNoRestrictedScmDispatchOrders(placedScmRefs, "confirm this plan", {
+      planDate: planForConfirm.planDate
+    });
     const duplicateDrivers = config.dispatch?.driverOrientedPlanning ? [] : dispatchDuplicateDriverAssignments(planForConfirm?.trucks || []);
     if (duplicateDrivers.length) return sendDispatchDuplicateDriverResponse(res, duplicateDrivers);
     const finalAssignmentConflicts = await dispatchLoadAssignmentConflicts(previousPlan, planForConfirm, { requireAssignments: true });
@@ -11227,9 +11359,14 @@ app.get("/api/dispatch/orders", async (req, res, next) => {
   try {
     const type = req.query.type ? String(req.query.type).toUpperCase() : null;
     const search = req.query.search ? String(req.query.search) : "";
-    res.json(await listDispatchOrdersForResponse({ type, search }));
+    const historyPlanDate = requestedDispatchHistoryPlanDate(req.query.historyPlanDate);
+    if (historyPlanDate) await requireDispatchV2PlanEditLease(req, historyPlanDate);
+    res.json(await listDispatchOrdersForResponse({ type, search, historyPlanDate }));
   } catch (error) {
     if (error instanceof DispatchPlanEditLeaseError) return sendDispatchPlanEditLeaseError(res, error);
+    if (error?.code === "DISPATCH_HISTORY_DATE_INVALID") {
+      return res.status(400).json({ error: error.message, code: error.code });
+    }
     next(error);
   }
 });
@@ -12963,13 +13100,19 @@ app.get("/api/dispatch/orders/:id/split-seed", async (req, res, next) => {
 app.post("/api/dispatch/sync", async (req, res, next) => {
   try {
     const type = req.query.type ? String(req.query.type).toUpperCase() : null;
+    const historyPlanDate = requestedDispatchHistoryPlanDate(req.query.historyPlanDate);
+    if (historyPlanDate) await requireDispatchV2PlanEditLease(req, historyPlanDate);
     res.json({
       localOnly: true,
       skipped: true,
       reason: "NetSuite order sync is admin-only. Dispatcher refresh reads local DB.",
-      orders: await listDispatchOrdersForResponse({ type })
+      orders: await listDispatchOrdersForResponse({ type, historyPlanDate })
     });
   } catch (error) {
+    if (error instanceof DispatchPlanEditLeaseError) return sendDispatchPlanEditLeaseError(res, error);
+    if (error?.code === "DISPATCH_HISTORY_DATE_INVALID") {
+      return res.status(400).json({ error: error.message, code: error.code });
+    }
     next(error);
   }
 });
@@ -13432,13 +13575,20 @@ app.put("/api/dispatch/plan", async (req, res, next) => {
       trucks: cleanTrucks
     });
     await assertScmReconciliationOrderEditable({ orderRefs: changedScmRefs });
+    await assertNoNewDriverPwaCompletedDispatchOrders(previousPlan, {
+      ...previousPlan,
+      planDate: plan.planDate || planDate,
+      orders: cleanOrders,
+      trucks: cleanTrucks
+    }, "save this plan");
     await assertNoRestrictedScmDispatchOrders(
       changedPlacedDispatchScmAssignmentRefs(previousPlan, {
         ...previousPlan,
         orders: cleanOrders,
         trucks: cleanTrucks
       }),
-      "save this plan"
+      "save this plan",
+      { planDate: plan.planDate || planDate }
     );
     const duplicateDrivers = config.dispatch?.driverOrientedPlanning ? [] : dispatchDuplicateDriverAssignments(cleanTrucks);
     if (duplicateDrivers.length) return sendDispatchDuplicateDriverResponse(res, duplicateDrivers);
