@@ -359,9 +359,21 @@ async function itemOwnedCustomerRates(rateCardVersionId) {
        FROM mbt_local_item_settings item
        JOIN mbt_dump_tariffs tariff
          ON tariff.item_code = item.item_code
-        AND tariff.rate_card_version_id = $1::uuid
         AND tariff.active
         AND tariff.dump_site_id IS NULL
+       JOIN mbt_rate_card_versions version
+        ON version.rate_card_version_id = tariff.rate_card_version_id
+        AND version.status = 'active'
+        AND (
+          version.rate_card_version_id = $1::uuid
+          OR (
+            (version.effective_from IS NULL OR version.effective_from <= now())
+            AND (version.effective_to IS NULL OR version.effective_to > now())
+          )
+        )
+       JOIN mbt_rate_cards card
+         ON card.rate_card_id = version.rate_card_id
+        AND card.active
       WHERE item.active
         AND (
           (item.item_type = 'aggregate' AND item.charge_basis = 'per_yard'
@@ -370,7 +382,8 @@ async function itemOwnedCustomerRates(rateCardVersionId) {
           (item.item_type = 'dump' AND item.charge_basis = 'per_bin'
             AND tariff.pricing_basis = 'per_quantity' AND upper(tariff.unit_of_measure) = 'BIN')
         )
-      ORDER BY item.item_code, tariff.tariff_code`,
+      ORDER BY item.item_code, version.effective_from DESC NULLS LAST,
+               version.version_number DESC, tariff.tariff_code`,
     [rateCardVersionId]
   );
   return result.rows;
@@ -789,26 +802,38 @@ async function aggregateRateLines(input, rateCardVersionId) {
   }
   let selected = await query(
     `SELECT item.item_code, item.display_name, item.density_lbs_per_yard,
-            tariff.amount_minor, tariff.currency
+            tariff.amount_minor, tariff.currency,
+            tariff.dump_tariff_id::text,
+            version.rate_card_version_id::text
        FROM mbt_local_item_settings item
        JOIN mbt_dump_tariffs tariff
          ON tariff.item_code = item.item_code
-        AND tariff.rate_card_version_id = $2::uuid
         AND tariff.active
         AND tariff.dump_site_id IS NULL
+       JOIN mbt_rate_card_versions version
+         ON version.rate_card_version_id = tariff.rate_card_version_id
+        AND version.status = 'active'
+        AND (version.effective_from IS NULL OR version.effective_from <= now())
+        AND (version.effective_to IS NULL OR version.effective_to > now())
+       JOIN mbt_rate_cards card
+         ON card.rate_card_id = version.rate_card_id
+        AND card.active
       WHERE item.item_code = ANY($1::text[])
         AND item.item_type = 'aggregate'
         AND item.charge_basis = 'per_yard'
         AND item.active
         AND item.density_lbs_per_yard > 0
         AND tariff.pricing_basis = 'per_quantity'
-        AND upper(tariff.unit_of_measure) = 'YARD'`,
-    [requested.map((line) => line.itemCode), rateCardVersionId]
+        AND upper(tariff.unit_of_measure) = 'YARD'
+      ORDER BY item.item_code, version.effective_from DESC NULLS LAST,
+               version.version_number DESC, tariff.tariff_code`,
+    [requested.map((line) => line.itemCode)]
   );
   if (selected.rowCount !== requested.length) {
     selected = await query(
       `SELECT catalog.item_code, catalog.display_name, catalog.density_lbs_per_yard,
-            rate.amount_minor, rate.currency
+            rate.amount_minor, rate.currency, rate.charge_rate_id::text,
+            rate.rate_card_version_id::text
        FROM mbt_frontdesk_charge_catalog catalog
        JOIN mbt_frontdesk_charge_rates rate
          ON rate.item_code = catalog.item_code
@@ -836,7 +861,10 @@ async function aggregateRateLines(input, rateCardVersionId) {
       displayName: String(rate.display_name),
       quantityMilliYards: line.quantityMilliYards,
       unitAmountMinor: nonnegativeInteger(Number(rate.amount_minor), "Aggregate unit amount"),
-      densityLbsPerYard: nonnegativeInteger(Number(rate.density_lbs_per_yard), "Aggregate density")
+      densityLbsPerYard: nonnegativeInteger(Number(rate.density_lbs_per_yard), "Aggregate density"),
+      rateCardVersionId: String(rate.rate_card_version_id),
+      dumpTariffId: rate.dump_tariff_id ? String(rate.dump_tariff_id) : null,
+      chargeRateId: rate.charge_rate_id ? String(rate.charge_rate_id) : null
     };
   });
 }
@@ -991,19 +1019,32 @@ function normalizedBinRequest(input) {
   };
 }
 
-/** @param {string} incomingContentCode @param {string} rateCardVersionId */
-async function selectFixedDumpRate(incomingContentCode, rateCardVersionId) {
+/**
+ * @param {string} incomingContentCode
+ * @param {string} rateCardVersionId
+ * @param {string} deliveryAt
+ */
+async function selectFixedDumpRate(incomingContentCode, rateCardVersionId, deliveryAt) {
   if (incomingContentCode === "garbage") {
     return { rowCount: 0, rows: [] };
   }
   const dynamic = await query(
-    `SELECT item.item_code, tariff.amount_minor
+    `SELECT item.item_code, tariff.amount_minor, tariff.currency,
+            tariff.dump_tariff_id::text,
+            version.rate_card_version_id::text
        FROM mbt_local_item_settings item
        JOIN mbt_dump_tariffs tariff
          ON tariff.item_code = item.item_code
-        AND tariff.rate_card_version_id = $2::uuid
         AND tariff.active
         AND tariff.dump_site_id IS NULL
+       JOIN mbt_rate_card_versions version
+         ON version.rate_card_version_id = tariff.rate_card_version_id
+        AND version.status = 'active'
+        AND (version.effective_from IS NULL OR version.effective_from <= $2::timestamptz)
+        AND (version.effective_to IS NULL OR version.effective_to > $2::timestamptz)
+       JOIN mbt_rate_cards card
+         ON card.rate_card_id = version.rate_card_id
+        AND card.active
       WHERE item.item_type = 'dump'
         AND item.charge_basis = 'per_bin'
         AND item.active
@@ -1014,15 +1055,18 @@ async function selectFixedDumpRate(incomingContentCode, rateCardVersionId) {
           OR lower(item.item_code) = 'dump_' || $1
           OR lower(item.item_code) ~ ('(^|_)' || $1 || '(_|$)')
         )
-      ORDER BY item.item_code, tariff.tariff_code
+      ORDER BY version.effective_from DESC NULLS LAST,
+               version.version_number DESC, item.item_code, tariff.tariff_code
       LIMIT 2`,
-    [incomingContentCode, rateCardVersionId]
+    [incomingContentCode, deliveryAt]
   );
   if (dynamic.rowCount) {
     return dynamic;
   }
   return query(
-    `SELECT catalog.item_code, rate.amount_minor
+    `SELECT catalog.item_code, rate.amount_minor, rate.currency,
+            rate.charge_rate_id::text,
+            rate.rate_card_version_id::text
        FROM mbt_frontdesk_charge_catalog catalog
        JOIN mbt_frontdesk_charge_rates rate
          ON rate.item_code = catalog.item_code
@@ -1090,11 +1134,21 @@ function depositRateEvidence(incomingContentCode, depositRow) {
 /** @param {string} incomingContentCode @param {Record<string, any>} fixedDump */
 function fixedDumpRateEvidence(incomingContentCode, fixedDump) {
   if (incomingContentCode === "garbage") {
-    return { fixedDumpMinor: 0, fixedDumpItemCode: null };
+    return {
+      fixedDumpMinor: 0,
+      fixedDumpItemCode: null,
+      fixedDumpRateCardVersionId: null,
+      fixedDumpTariffId: null,
+      fixedDumpChargeRateId: null
+    };
   }
+  const row = fixedDump.rows[0];
   return {
-    fixedDumpMinor: nonnegativeInteger(Number(fixedDump.rows[0].amount_minor), "Fixed dump amount"),
-    fixedDumpItemCode: String(fixedDump.rows[0].item_code)
+    fixedDumpMinor: nonnegativeInteger(Number(row.amount_minor), "Fixed dump amount"),
+    fixedDumpItemCode: String(row.item_code),
+    fixedDumpRateCardVersionId: String(row.rate_card_version_id),
+    fixedDumpTariffId: row.dump_tariff_id ? String(row.dump_tariff_id) : null,
+    fixedDumpChargeRateId: row.charge_rate_id ? String(row.charge_rate_id) : null
   };
 }
 
@@ -1116,50 +1170,129 @@ async function binRateEvidence(input, rateCardVersionId, distanceMetres) {
         WHERE type.bin_type_id = $1::uuid AND type.active`,
       [incomingBinTypeId, binItemCode]
     );
-  const rental = await query(
-      `SELECT amount_minor, taxable, rate_component_id::text
+  let rental = await query(
+      `SELECT component.amount_minor, component.taxable, component.currency,
+              component.rate_component_id::text,
+              version.rate_card_version_id::text
+         FROM mbt_local_item_settings item
+         JOIN mbt_rate_components component
+           ON component.item_code = item.item_code
+         JOIN mbt_rate_card_versions version
+           ON version.rate_card_version_id = component.rate_card_version_id
+          AND version.status = 'active'
+          AND (version.effective_from IS NULL OR version.effective_from <= $3::timestamptz)
+          AND (version.effective_to IS NULL OR version.effective_to > $3::timestamptz)
+         JOIN mbt_rate_cards card
+           ON card.rate_card_id = version.rate_card_id
+          AND card.active
+        WHERE item.item_code = $1
+          AND item.item_type = 'bin'
+          AND item.bin_type_id = $2::uuid
+          AND item.active
+          AND component.component_kind = 'rental'
+          AND component.rate_basis = 'flat'
+          AND component.active
+          AND (component.bin_type_id IS NULL OR component.bin_type_id = $2::uuid)
+          AND (component.service_code IS NULL OR component.service_code = 'delivery')
+        ORDER BY version.effective_from DESC NULLS LAST,
+                 version.version_number DESC,
+                 (component.bin_type_id IS NOT NULL) DESC,
+                 component.rate_component_id
+        LIMIT 2`,
+      [binItemCode, incomingBinTypeId, deliveryAt]
+    );
+  if (!rental.rowCount) {
+    rental = await query(
+      `SELECT amount_minor, taxable, currency, rate_component_id::text,
+              rate_card_version_id::text
          FROM mbt_rate_components
         WHERE rate_card_version_id = $1::uuid
           AND component_kind = 'rental'
           AND rate_basis = 'flat'
           AND active
-          AND (item_code IS NULL OR item_code = $2)
-          AND (bin_type_id IS NULL OR bin_type_id = $3::uuid)
+          AND item_code IS NULL
+          AND (bin_type_id IS NULL OR bin_type_id = $2::uuid)
           AND (service_code IS NULL OR service_code = 'delivery')
-        ORDER BY (item_code IS NOT NULL) DESC, (bin_type_id IS NOT NULL) DESC,
-                 rate_component_id
+        ORDER BY (bin_type_id IS NOT NULL) DESC, rate_component_id
         LIMIT 2`,
-      [rateCardVersionId, binItemCode, incomingBinTypeId]
+      [rateCardVersionId, incomingBinTypeId]
     );
-  const delivery = await query(
-      `SELECT amount_minor, pricing_basis, rate_distance_band_id::text,
-              minimum_metres::int, maximum_metres::int
+  }
+  let delivery = await query(
+      `SELECT band.amount_minor, band.pricing_basis, band.currency,
+              band.rate_distance_band_id::text,
+              band.minimum_metres::int, band.maximum_metres::int,
+              version.rate_card_version_id::text
+         FROM mbt_local_item_settings item
+         JOIN mbt_rate_distance_bands band
+           ON band.item_code = item.item_code
+         JOIN mbt_rate_card_versions version
+           ON version.rate_card_version_id = band.rate_card_version_id
+          AND version.status = 'active'
+          AND (version.effective_from IS NULL OR version.effective_from <= $5::timestamptz)
+          AND (version.effective_to IS NULL OR version.effective_to > $5::timestamptz)
+         JOIN mbt_rate_cards card
+           ON card.rate_card_id = version.rate_card_id
+          AND card.active
+        WHERE item.item_code = $1
+          AND item.item_type = 'delivery_fee'
+          AND item.active
+          AND band.service_code = 'delivery'
+          AND (band.bin_type_id IS NULL OR band.bin_type_id = $2::uuid)
+          AND (cardinality(band.origin_yard_codes) = 0 OR $4 = ANY(band.origin_yard_codes))
+          AND (
+            (
+              band.boundary_rule = 'upper_inclusive'
+              AND (CASE WHEN band.minimum_metres = 0 THEN $3 >= band.minimum_metres ELSE $3 > band.minimum_metres END)
+              AND (band.maximum_metres IS NULL OR $3 <= band.maximum_metres)
+            )
+            OR (
+              band.boundary_rule = 'lower_inclusive'
+              AND band.minimum_metres <= $3
+              AND (band.maximum_metres IS NULL OR band.maximum_metres > $3)
+            )
+          )
+        ORDER BY version.effective_from DESC NULLS LAST,
+                 version.version_number DESC,
+                 (band.bin_type_id IS NOT NULL) DESC,
+                 band.minimum_metres DESC, band.sequence_number,
+                 band.rate_distance_band_id
+        LIMIT 2`,
+      [deliveryItemCode, incomingBinTypeId, distanceMetres, originYardCode, deliveryAt]
+    );
+  if (!delivery.rowCount) {
+    delivery = await query(
+      `SELECT amount_minor, pricing_basis, currency,
+              rate_distance_band_id::text,
+              minimum_metres::int, maximum_metres::int,
+              rate_card_version_id::text
          FROM mbt_rate_distance_bands
         WHERE rate_card_version_id = $1::uuid
           AND service_code = 'delivery'
-          AND (item_code IS NULL OR item_code = $2)
-          AND (bin_type_id IS NULL OR bin_type_id = $3::uuid)
-          AND (cardinality(origin_yard_codes) = 0 OR $5 = ANY(origin_yard_codes))
+          AND item_code IS NULL
+          AND (bin_type_id IS NULL OR bin_type_id = $2::uuid)
+          AND (cardinality(origin_yard_codes) = 0 OR $4 = ANY(origin_yard_codes))
           AND (
             (
               boundary_rule = 'upper_inclusive'
-              AND (CASE WHEN minimum_metres = 0 THEN $4 >= minimum_metres ELSE $4 > minimum_metres END)
-              AND (maximum_metres IS NULL OR $4 <= maximum_metres)
+              AND (CASE WHEN minimum_metres = 0 THEN $3 >= minimum_metres ELSE $3 > minimum_metres END)
+              AND (maximum_metres IS NULL OR $3 <= maximum_metres)
             )
             OR (
               boundary_rule = 'lower_inclusive'
-              AND minimum_metres <= $4
-              AND (maximum_metres IS NULL OR maximum_metres > $4)
+              AND minimum_metres <= $3
+              AND (maximum_metres IS NULL OR maximum_metres > $3)
             )
           )
-        ORDER BY (item_code IS NOT NULL) DESC, (bin_type_id IS NOT NULL) DESC,
-                 minimum_metres DESC, sequence_number, rate_distance_band_id
+        ORDER BY (bin_type_id IS NOT NULL) DESC, minimum_metres DESC,
+                 sequence_number, rate_distance_band_id
         LIMIT 2`,
-      [rateCardVersionId, deliveryItemCode, incomingBinTypeId, distanceMetres, originYardCode]
+      [rateCardVersionId, incomingBinTypeId, distanceMetres, originYardCode]
     );
+  }
   const deposit = await query(
       `SELECT rule_type, fixed_amount_minor, percentage_basis_points,
-              currency, deposit_rule_id::text
+              currency, deposit_rule_id::text, rate_card_version_id::text
          FROM mbt_deposit_rules
         WHERE rate_card_version_id = $1::uuid AND active
           AND (bin_type_id IS NULL OR bin_type_id = $2::uuid)
@@ -1169,8 +1302,15 @@ async function binRateEvidence(input, rateCardVersionId, distanceMetres) {
         LIMIT 1`,
       [rateCardVersionId, incomingBinTypeId]
     );
-  const fixedDump = await selectFixedDumpRate(incomingContentCode, rateCardVersionId);
+  const fixedDump = await selectFixedDumpRate(incomingContentCode, rateCardVersionId, deliveryAt);
   assertBinRateSelections({ binIdentity, rental, delivery, fixedDump }, incomingBinSizeYards, incomingContentCode);
+  const currencies = [rental.rows[0].currency, delivery.rows[0].currency];
+  if (incomingContentCode !== "garbage") {
+    currencies.push(fixedDump.rows[0].currency);
+  }
+  if (currencies.some((currency) => String(currency) !== "CAD")) {
+    throw failure(422, "MBT_FRONTDESK_CURRENCY_MISMATCH", "Rental, delivery, and fixed dump rates must use CAD.");
+  }
   const deliveryAmountMinor = calculateDistanceBandChargeMinor({
     amountMinor: nonnegativeInteger(Number(delivery.rows[0].amount_minor), "Delivery unit amount"),
     pricingBasis: String(delivery.rows[0].pricing_basis)
@@ -1198,9 +1338,15 @@ async function binRateEvidence(input, rateCardVersionId, distanceMetres) {
       binItemCode,
       deliveryItemCode,
       rentalRateComponentId: String(rental.rows[0].rate_component_id),
+      rentalRateCardVersionId: String(rental.rows[0].rate_card_version_id),
       deliveryRateDistanceBandId: String(delivery.rows[0].rate_distance_band_id),
+      deliveryRateCardVersionId: String(delivery.rows[0].rate_card_version_id),
       fixedDumpItemCode: dumpEvidence.fixedDumpItemCode,
+      fixedDumpRateCardVersionId: dumpEvidence.fixedDumpRateCardVersionId,
+      fixedDumpTariffId: dumpEvidence.fixedDumpTariffId,
+      fixedDumpChargeRateId: dumpEvidence.fixedDumpChargeRateId,
       depositRuleId: depositEvidence.depositRuleId,
+      depositRateCardVersionId: depositRow ? String(depositRow.rate_card_version_id) : null,
       percentageDepositBasisPoints: depositEvidence.percentageDepositBasisPoints
     }
   };

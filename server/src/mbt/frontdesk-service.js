@@ -1498,7 +1498,7 @@ async function createFixedPriceInitialQuoteMutation(input) {
     proposedReturnAt: line.proposedReturnAt,
     distanceSnapshotId: distance.distanceSnapshotId,
     distance,
-    rateCardVersionId: input.rateCardVersionId,
+    rateCardVersionId: binRate.itemEvidence.deliveryRateCardVersionId || input.rateCardVersionId,
     rateDistanceBandId: binRate.itemEvidence.deliveryRateDistanceBandId,
     subtotalMinor: calculation.preTaxRevenueMinor,
     taxableSubtotalMinor: calculation.preTaxRevenueMinor,
@@ -1574,7 +1574,8 @@ async function createFixedPriceInitialQuoteMutation(input) {
        $5, $6, $7, $8::jsonb, $9::jsonb, $10::jsonb, $11, $12
      )`,
     [
-      distance.distanceSnapshotId, quoteId, input.rateCardVersionId,
+      distance.distanceSnapshotId, quoteId,
+      binRate.itemEvidence.deliveryRateCardVersionId || input.rateCardVersionId,
       binRate.itemEvidence.deliveryRateDistanceBandId,
       distance.provider, distance.providerMetres, distance.routeHash,
       JSON.stringify(distance.originSnapshot), JSON.stringify(distance.destinationSnapshot),
@@ -2962,7 +2963,9 @@ function pricedAddBinLinePricing(input) {
     proposedDeliveryAt: iso(input.deliveryAt),
     proposedReturnAt: iso(input.returnAt),
     serviceCode: "delivery",
-    rateCardVersionId: String(input.contractRow.rate_card_version_id),
+    rateCardVersionId: String(
+      input.itemEvidence.deliveryRateCardVersionId || input.contractRow.rate_card_version_id
+    ),
     rateDistanceBandId: requiredUuid(input.itemEvidence.deliveryRateDistanceBandId, "Delivery distance rate ID"),
     distance: {
       provider: input.routeInputs.distance.provider,

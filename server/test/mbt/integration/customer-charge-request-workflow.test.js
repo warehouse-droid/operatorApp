@@ -117,6 +117,69 @@ async function configureCustomerChargeRates(fixture) {
   }
 }
 
+/**
+ * @param {{itemCode: string, itemType: "aggregate" | "dump", amountMinor: number, densityLbsPerYard?: number}} input
+ */
+async function configureActiveUnitTariff(input) {
+  const rateCardId = crypto.randomUUID();
+  const rateCardVersionId = crypto.randomUUID();
+  const dumpTariffId = crypto.randomUUID();
+  const suffix = crypto.randomUUID().replaceAll("-", "").slice(0, 12);
+  const aggregate = input.itemType === "aggregate";
+  await query(
+    `INSERT INTO mbt_local_item_settings (
+       item_code, display_name, description, item_type, rental_period_days,
+       category, bin_type_id, pricing_mode, netsuite_mapping_local_key,
+       system_owned, applicable_service_types, applicable_legacy_source_types,
+       charge_basis, density_lbs_per_yard, active, revision, created_by, updated_by
+     ) VALUES (
+       $1, $2, 'Separate active item-rate regression', $3, NULL,
+       $4, NULL, 'rate_card', NULL, false, ARRAY[]::text[], ARRAY[]::text[],
+       $5, $6, true, 1, $7, $7
+     )`,
+    [
+      input.itemCode, `Separate ${input.itemCode}`, input.itemType,
+      aggregate ? "other" : "dump", aggregate ? "per_yard" : "per_bin",
+      aggregate ? input.densityLbsPerYard : null, ACTOR.operatorId
+    ]
+  );
+  await query(
+    `INSERT INTO mbt_rate_cards (
+       rate_card_id, rate_card_code, display_name, currency, created_by, updated_by
+     ) VALUES ($1, $2, $3, 'CAD', $4, $4)`,
+    [rateCardId, `TEST_${suffix.toUpperCase()}`, `Separate ${input.itemCode} rate`, ACTOR.operatorId]
+  );
+  await query(
+    `INSERT INTO mbt_rate_card_versions (
+       rate_card_version_id, rate_card_id, version_number, status,
+       effective_from, created_by, updated_by
+     ) VALUES ($1, $2, 1, 'draft', '2020-01-01T00:00:00.000Z', $3, $3)`,
+    [rateCardVersionId, rateCardId, ACTOR.operatorId]
+  );
+  await query(
+    `INSERT INTO mbt_dump_tariffs (
+       dump_tariff_id, rate_card_version_id, item_code, dump_site_id,
+       material_id, tariff_code, pricing_basis, unit_of_measure,
+       amount_minor, minimum_amount_minor, currency, active, description
+     ) VALUES (
+       $1, $2, $3, NULL, NULL, $4, 'per_quantity', $5,
+       $6, 0, 'CAD', true, 'Separate active item-rate regression'
+     )`,
+    [
+      dumpTariffId, rateCardVersionId, input.itemCode, `customer_${suffix}`,
+      aggregate ? "YARD" : "BIN", input.amountMinor
+    ]
+  );
+  await query(
+    `UPDATE mbt_rate_card_versions
+        SET status = 'active', activated_at = now(), revision = revision + 1,
+            updated_by = $2
+      WHERE rate_card_version_id = $1`,
+    [rateCardVersionId, ACTOR.operatorId]
+  );
+  return { rateCardId, rateCardVersionId, dumpTariffId };
+}
+
 /** @param {string} label */
 async function convertedContract(label) {
   const fixture = await createFrontdeskPrerequisites({ label });
@@ -513,6 +576,101 @@ test("active contract add-bin preview reports current, request, resulting, depos
     [request.chargeRequestId]
   );
   assert.equal(separateDispatch.rows[0].count, 0);
+});
+
+test("incoming bin resolves rental and delivery from their independently active item rate cards", async () => {
+  const preview = requiredOperation("previewFrontdeskChargeRequest");
+  const fixture = await createFrontdeskPrerequisites({ label: "separate-item-rate-cards" });
+  await configureCustomerChargeRates(fixture);
+
+  // The contract keeps its workflow/rate version as an immutable request
+  // anchor. Current charges for a newly requested physical bin are owned by
+  // the selected BIN and Delivery fee item rows, which may be active in other
+  // rate-card versions.
+  await query(
+    `UPDATE mbt_rate_components
+        SET active = false
+      WHERE rate_card_version_id = $1::uuid
+        AND component_kind = 'rental'`,
+    [fixture.rateCardVersionId]
+  );
+
+  const result = await preview(command("separate-item-rate-cards", {
+    ...initialBinFields(fixture),
+    bin: {
+      ...initialBinFields(fixture).bin,
+      proposedDeliveryAt: "2037-08-20T12:00:00.000Z",
+      proposedReturnAt: "2037-09-03T12:00:00.000Z"
+    }
+  }));
+
+  const retained = await query(
+    `SELECT pricing_snapshot
+       FROM mbt_frontdesk_charge_requests
+      WHERE charge_request_id = $1::uuid`,
+    [result.body.request.chargeRequestId]
+  );
+  const evidence = retained.rows[0].pricing_snapshot.bin.itemEvidence;
+  assert.notEqual(evidence.rentalRateCardVersionId, fixture.rateCardVersionId);
+  assert.notEqual(evidence.deliveryRateCardVersionId, fixture.rateCardVersionId);
+  assert.equal(evidence.binItemCode, fixture.binItemCode);
+  assert.equal(evidence.deliveryItemCode, fixture.deliveryItemCode);
+  assert.equal(result.body.request.lines.find((line) => line.lineType === "bin_rental").configuredAmountMinor, 35_000);
+  assert.equal(result.body.request.lines.find((line) => line.lineType === "bin_transport").configuredAmountMinor, 12_500);
+});
+
+test("workflow configuration and pricing discover aggregate and fixed dump rates in separate active cards", async (context) => {
+  const preview = requiredOperation("previewFrontdeskChargeRequest");
+  const configuration = requiredOperation("getFrontdeskCustomerChargeConfiguration");
+  const fixture = await createFrontdeskPrerequisites({ label: "separate-unit-tariffs" });
+  await configureCustomerChargeRates(fixture);
+  const suffix = crypto.randomUUID().replaceAll("-", "").slice(0, 12).toUpperCase();
+  const aggregateItemCode = `AGG_${suffix}`;
+  const fixedDumpItemCode = `CONCRETE_${suffix}`;
+  const aggregateRate = await configureActiveUnitTariff({
+    itemCode: aggregateItemCode,
+    itemType: "aggregate",
+    amountMinor: 6_125,
+    densityLbsPerYard: 2_700
+  });
+  const dumpRate = await configureActiveUnitTariff({
+    itemCode: fixedDumpItemCode,
+    itemType: "dump",
+    amountMinor: 88_000
+  });
+  context.after(async () => {
+    await query(
+      "UPDATE mbt_rate_cards SET active = false, updated_at = now() WHERE rate_card_id = ANY($1::uuid[])",
+      [[aggregateRate.rateCardId, dumpRate.rateCardId]]
+    );
+  });
+
+  const available = await configuration({ actor: ACTOR, rateCardVersionId: fixture.rateCardVersionId });
+  assert.equal(available.aggregateItems.some((item) => item.itemCode === aggregateItemCode), true);
+  assert.equal(available.fixedDumpItems.some((item) => item.itemCode === fixedDumpItemCode), true);
+
+  const result = await preview(command("separate-unit-tariffs", initialBinFields(fixture, {
+    orderFrom150: true,
+    bin: { incomingContentCode: "concrete" },
+    aggregateLines: [{ itemCode: aggregateItemCode, quantityYards: "2.000" }]
+  })));
+  const fixedDumpLine = result.body.request.lines.find((line) => line.lineType === "fixed_dump");
+  const aggregateLine = result.body.request.lines.find((line) => line.lineType === "aggregate_material");
+  assert.equal(fixedDumpLine.configuredAmountMinor, 88_000);
+  assert.equal(aggregateLine.unitAmountMinor, 6_125);
+
+  const retained = await query(
+    `SELECT pricing_snapshot
+       FROM mbt_frontdesk_charge_requests
+      WHERE charge_request_id = $1::uuid`,
+    [result.body.request.chargeRequestId]
+  );
+  const snapshot = retained.rows[0].pricing_snapshot;
+  assert.equal(snapshot.bin.itemEvidence.fixedDumpItemCode, fixedDumpItemCode);
+  assert.equal(snapshot.bin.itemEvidence.fixedDumpRateCardVersionId, dumpRate.rateCardVersionId);
+  assert.equal(snapshot.bin.itemEvidence.fixedDumpTariffId, dumpRate.dumpTariffId);
+  assert.equal(snapshot.aggregateLines[0].rateCardVersionId, aggregateRate.rateCardVersionId);
+  assert.equal(snapshot.aggregateLines[0].dumpTariffId, aggregateRate.dumpTariffId);
 });
 
 test("cash initial then card add rolls both confirmed amounts into the next customer total", async () => {
@@ -931,7 +1089,7 @@ test("aggregate request validation rejects malformed, duplicate, and unpriced ma
   );
 });
 
-test("bin pricing rejects invalid schedules and each missing active rate selection", async () => {
+test("bin pricing rejects invalid schedules and each missing active rate selection", async (context) => {
   const preview = requiredOperation("previewFrontdeskChargeRequest");
   const inputGuard = await createFrontdeskPrerequisites({ label: "bin-input-guards" });
   await configureCustomerChargeRates(inputGuard);
@@ -967,6 +1125,26 @@ test("bin pricing rejects invalid schedules and each missing active rate selecti
 
   const rentalMissing = await createFrontdeskPrerequisites({ label: "bin-rental-missing" });
   await configureCustomerChargeRates(rentalMissing);
+  const disabledRentals = await query(
+    `UPDATE mbt_rate_components component
+        SET active = false
+       FROM mbt_rate_card_versions version
+      WHERE component.rate_card_version_id = version.rate_card_version_id
+        AND component.item_code = '20YD'
+        AND component.component_kind = 'rental'
+        AND version.status = 'active'
+        AND version.first_used_at IS NULL
+      RETURNING component.rate_component_id::text`
+  );
+  context.after(async () => {
+    const ids = disabledRentals.rows.map((row) => row.rate_component_id);
+    if (ids.length) {
+      await query(
+        "UPDATE mbt_rate_components SET active = true WHERE rate_component_id = ANY($1::uuid[])",
+        [ids]
+      );
+    }
+  });
   await rejectsCode(
     () => preview(command("bin-rental-missing", initialBinFields(rentalMissing, {
       bin: {
@@ -981,12 +1159,35 @@ test("bin pricing rejects invalid schedules and each missing active rate selecti
 
   const deliveryMissing = await createFrontdeskPrerequisites({ label: "bin-delivery-missing" });
   await configureCustomerChargeRates(deliveryMissing);
+  const missingDeliveryItemCode = `NO_RATE_${crypto.randomUUID().replaceAll("-", "").slice(0, 12).toUpperCase()}`;
+  await query(
+    `INSERT INTO mbt_local_item_settings (
+       item_code, display_name, description, item_type, rental_period_days,
+       category, bin_type_id, pricing_mode, netsuite_mapping_local_key,
+       system_owned, applicable_service_types, applicable_legacy_source_types,
+       charge_basis, density_lbs_per_yard, active, revision, created_by, updated_by
+     ) VALUES (
+       $1, 'Unpriced delivery test item', 'No active distance rows by design.',
+       'delivery_fee', NULL, 'cross_charge', NULL, 'rate_card', NULL,
+       false, ARRAY['delivery']::text[], ARRAY[]::text[],
+       'distance', NULL, true, 1, $2, $2
+     )`,
+    [missingDeliveryItemCode, ACTOR.operatorId]
+  );
+  context.after(async () => {
+    await query(
+      "UPDATE mbt_local_item_settings SET active = false, revision = revision + 1, updated_at = now() WHERE item_code = $1",
+      [missingDeliveryItemCode]
+    );
+  });
   await query(
     "DELETE FROM mbt_rate_distance_bands WHERE rate_distance_band_id = $1::uuid",
     [deliveryMissing.rateDistanceBandId]
   );
   await rejectsCode(
-    () => initialGarbagePreview(deliveryMissing, "bin-delivery-missing"),
+    () => preview(command("bin-delivery-missing", initialBinFields(deliveryMissing, {
+      bin: { deliveryItemCode: missingDeliveryItemCode }
+    }))),
     "MBT_FRONTDESK_RATE_BAND_MISSING",
     422
   );
