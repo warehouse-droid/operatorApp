@@ -224,7 +224,13 @@ test("DP-22 frontend: compact nested group children remain resolvable as plan ev
   assert.match(functionBody("orderById"), /assignedOrderEvidenceById\.get/u);
   assert.match(functionBody("directOrderForStop"), /assignedOrderEvidenceById\.get/u);
   assert.match(functionBody("collapseGroupedOrderStops"), /stopHasDriverActivity/u);
-  assert.match(functionBody("applySavedPlan"), /rememberAssignedOrderEvidence\(saved\.orders\)/u);
+  const applySaved = functionBody("applySavedPlan");
+  assert.match(applySaved, /rememberAssignedOrderEvidence\(savedOrders\)/u);
+  assert.match(
+    applySaved,
+    /savedAssignedIds\.has\(order\.id\)\s*\|\|\s*!savedGroupStructureConflictsWithPlan/u,
+    "Assigned group evidence must survive even when an old snapshot has inconsistent ownership metadata."
+  );
 });
 
 test("DP-24 frontend: incomplete compact order snapshots never delete executed child stops", () => {

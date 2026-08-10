@@ -87,6 +87,198 @@ test("DP-05: remove → group → ungroup → replan is an exact, continuous com
   assert.deepEqual(finalBoard.plan.board.orderRefs.filter((ref) => ref === "DP-C"), ["DP-C"]);
 });
 
+test("DP-05: browser ungroup deactivates its durable delivery group before a hard refresh", async () => {
+  const childRefs = ["SOB116758", "SOB117328"];
+  const groupRef = "GOB-116758-117328";
+  const seeded = await fixture.seedPlan({ date: "2025-01-16", refs: childRefs });
+  const lease = await fixture.acquireLease({
+    planDate: seeded.plan_date,
+    sessionId: "dispatch-v2-delivery-group"
+  });
+  let current = await bootstrap(seeded.id, seeded.plan_date);
+  const groupedOrder = {
+    ...jsonClone(current.plan.assignedOrderSnapshots[0]),
+    id: groupRef,
+    orderId: groupRef,
+    refNumber: groupRef,
+    type: "SO",
+    customer: "2 orders grouped",
+    childOrders: childRefs,
+    childOrderDetails: jsonClone(current.plan.assignedOrderSnapshots),
+    planOwned: true
+  };
+  const groupedTrucks = jsonClone(current.plan.trucks);
+  groupedTrucks[0].loads[0].stops = [{
+    id: "dp-v2-group-drop",
+    type: "drop",
+    orderId: groupRef,
+    location: "Grouped delivery"
+  }];
+
+  let result = await command(current, seeded.id, lease, "dp05-browser-group", "replace_plan", {
+    planDate: seeded.plan_date,
+    orders: [groupedOrder],
+    trucks: groupedTrucks,
+    summary: current.plan.summary,
+    actionName: "group_order"
+  });
+  assert.equal(result.response.status, 200, JSON.stringify(result.payload));
+  const projectedGroup = await query(
+    `SELECT active,
+            ARRAY(
+              SELECT member_order_ref
+                FROM dispatch_delivery_group_members
+               WHERE group_ref = $1
+               ORDER BY position
+            ) AS member_refs
+       FROM dispatch_delivery_groups
+      WHERE group_ref = $1`,
+    [groupRef]
+  );
+  assert.equal(projectedGroup.rows[0]?.active, true);
+  assert.deepEqual(projectedGroup.rows[0]?.member_refs, childRefs);
+
+  current = result.payload;
+  const ungroupedTrucks = jsonClone(current.plan.trucks);
+  ungroupedTrucks[0].loads[0].stops = [];
+  result = await command(current, seeded.id, lease, "dp05-browser-ungroup", "replace_plan", {
+    planDate: seeded.plan_date,
+    orders: [],
+    trucks: ungroupedTrucks,
+    summary: current.plan.summary,
+    actionName: "ungroup_order",
+    refreshOrderPool: true
+  });
+  assert.equal(result.response.status, 200, JSON.stringify(result.payload));
+  assert.equal(
+    (await query("SELECT active FROM dispatch_delivery_groups WHERE group_ref = $1", [groupRef])).rows[0]?.active,
+    false,
+    "Ungroup must deactivate the Operator-facing projection in the same transaction as the plan snapshot."
+  );
+
+  const refreshed = await bootstrap(seeded.id, seeded.plan_date);
+  assert.equal(
+    refreshed.plan.assignedOrderSnapshots.some((order) => order.id === groupRef),
+    false,
+    "A hard refresh must not restore the removed group from the saved plan."
+  );
+  assert.equal(refreshed.plan.board.orderRefs.includes(groupRef), false);
+});
+
+test("DP-05: a late cross-date order feed cannot resurrect GOB-116758-117328 after ungroup and an unrelated save", async () => {
+  const childRefs = ["SOB116758", "SOB117328"];
+  const groupRef = "GOB-116758-117328";
+  const owner = await fixture.seedPlan({ date: "2039-08-09", refs: childRefs });
+  const ownerLease = await fixture.acquireLease({
+    planDate: owner.plan_date,
+    sessionId: "dispatch-v2-cross-date-ungroup"
+  });
+  let current = await bootstrap(owner.id, owner.plan_date);
+  const groupedOrder = {
+    ...jsonClone(current.plan.assignedOrderSnapshots[0]),
+    id: groupRef,
+    orderId: groupRef,
+    refNumber: groupRef,
+    type: "SO",
+    customer: "2 orders grouped",
+    childOrders: childRefs,
+    childOrderDetails: jsonClone(current.plan.assignedOrderSnapshots),
+    groupPlanId: owner.id,
+    groupPlanDate: owner.plan_date,
+    planOwned: true
+  };
+  const groupedTrucks = jsonClone(current.plan.trucks);
+  groupedTrucks[0].loads[0].stops = [{
+    id: "dp-v2-cross-date-group-drop",
+    type: "drop",
+    orderId: groupRef,
+    location: "Grouped delivery"
+  }];
+
+  let result = await command(current, owner.id, ownerLease, "dp05-cross-date-group", "replace_plan", {
+    planDate: owner.plan_date,
+    orders: [groupedOrder],
+    trucks: groupedTrucks,
+    summary: current.plan.summary,
+    actionName: "group_order"
+  });
+  assert.equal(result.response.status, 200, JSON.stringify(result.payload));
+  current = result.payload;
+
+  const ungroupedTrucks = jsonClone(current.plan.trucks);
+  ungroupedTrucks[0].loads[0].stops = [];
+  result = await command(current, owner.id, ownerLease, "dp05-cross-date-ungroup", "replace_plan", {
+    planDate: owner.plan_date,
+    orders: [],
+    trucks: ungroupedTrucks,
+    summary: current.plan.summary,
+    actionName: "ungroup_order",
+    refreshOrderPool: true
+  });
+  assert.equal(result.response.status, 200, JSON.stringify(result.payload));
+  current = result.payload;
+
+  const copiedPlan = await fixture.seedPlan({ date: "2039-08-10", refs: ["DP-CROSS-DATE-COPY-SEED"] });
+  const copiedGroup = {
+    ...groupedOrder,
+    dispatchSnapshotSourcePlanId: copiedPlan.id,
+    dispatchSnapshotSourcePlanDate: copiedPlan.plan_date
+  };
+  await query(
+    `UPDATE dispatch_plan_snapshots
+        SET orders = orders || $2::jsonb,
+            saved_at = now()
+      WHERE plan_id = $1`,
+    [copiedPlan.id, JSON.stringify([copiedGroup])]
+  );
+  assert.equal(
+    (await query(
+      `SELECT count(*)::int AS count
+         FROM dispatch_plan_snapshots s
+         CROSS JOIN LATERAL jsonb_array_elements(s.orders) item(value)
+        WHERE s.plan_id = $1
+          AND item.value->>'id' = $2`,
+      [copiedPlan.id, groupRef]
+    )).rows[0].count,
+    1,
+    "The regression fixture must contain the stale group in the following date's snapshot."
+  );
+
+  const lateFeed = await fixture.request(`/api/dispatch/orders?search=${encodeURIComponent(groupRef)}`);
+  assert.equal(lateFeed.response.status, 200, JSON.stringify(lateFeed.payload));
+  assert.equal(
+    lateFeed.payload.some((order) => order.id === groupRef),
+    false,
+    "The global order feed must not source a group from a snapshot that does not own it."
+  );
+
+  result = await command(current, owner.id, ownerLease, "dp05-cross-date-unrelated-save", "replace_plan", {
+    planDate: owner.plan_date,
+    orders: current.plan.assignedOrderSnapshots,
+    trucks: current.plan.trucks,
+    summary: { ...current.plan.summary, unrelatedSaveAfterUngroup: true },
+    affectedOrderRefs: ["DP-UNRELATED-ORDER"],
+    actionName: "drop_order_new_load"
+  });
+  assert.equal(result.response.status, 200, JSON.stringify(result.payload));
+
+  const hardRefresh = await bootstrap(owner.id, owner.plan_date);
+  assert.equal(hardRefresh.plan.assignedOrderSnapshots.some((order) => order.id === groupRef), false);
+  assert.equal(hardRefresh.plan.board.orderRefs.includes(groupRef), false);
+  assert.equal(
+    (await query(
+      `SELECT count(*)::int AS count
+         FROM dispatch_plan_snapshots s
+         CROSS JOIN LATERAL jsonb_array_elements(s.orders) item(value)
+        WHERE s.plan_id = $1
+          AND item.value->>'id' = $2`,
+      [owner.id, groupRef]
+    )).rows[0].count,
+    0,
+    "The unrelated save must not persist the stale cross-date group back into the owning plan."
+  );
+});
+
 test("DP-07: a previous-date order may be removed and re-added to its own plan, but not another active date", async () => {
   const prior = await fixture.seedPlan({ date: "2024-01-15", refs: ["DP-HISTORY-A"] });
   const lease = await fixture.acquireLease({ planDate: prior.plan_date, sessionId: "dispatch-v2-previous-date" });

@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 
 import { query, withTransaction } from "./db.js";
+import { syncDispatchDeliveryGroupsFromPlan } from "./dispatch-delivery-group-repository.js";
 import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
 import {
   applyDispatchPlanCommand,
@@ -80,6 +81,7 @@ function slimAssignedOrder(order = {}) {
     "transitOriginalSourceYard", "poPickupManifest", "orderDependencies", "dependencyLabels",
     "dependencyDirectPickup", "dependencyWaitingForTransfer", "dependencyAttention",
     "dependencyUncovered", "dependencyUncoveredQuantity", "planOwned", "isSplit", "isGrouped",
+    "groupPlanId", "groupPlanDate",
     "sourceTable", "netsuiteId", "dispatchRef", "dependency", "dependencies", "mbt"
   ];
   const slim = Object.fromEntries(keys.filter((key) => order[key] !== undefined).map((key) => [key, order[key]]));
@@ -451,6 +453,9 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
       ]
     );
     await syncOrderAssignments(result.plan);
+    // Operator reads this projection instead of the plan JSON. Keep it in the
+    // command transaction so a refresh cannot resurrect a just-ungrouped order.
+    await syncDispatchDeliveryGroupsFromPlan(result.plan);
     const payload = {
       plan: publicPlan(result.plan),
       patch: result.patch,

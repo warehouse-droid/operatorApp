@@ -15,9 +15,18 @@ const catalogStructureSource = sourceSlice(
   "function splitSiblingsForOrder",
   "saved-plan catalog structure guard"
 );
-const catalogStructureConflictsWithSavedPlan = Function(
-  `"use strict"; ${catalogStructureSource}; return catalogStructureConflictsWithSavedPlan;`
+const catalogStructureHelpers = Function(
+  `"use strict"; ${catalogStructureSource}; return {
+    catalogStructureConflictsWithSavedPlan,
+    filterDispatchOrderFeedForAppliedPlan,
+    savedGroupStructureConflictsWithPlan
+  };`
 )();
+const {
+  catalogStructureConflictsWithSavedPlan,
+  filterDispatchOrderFeedForAppliedPlan,
+  savedGroupStructureConflictsWithPlan
+} = catalogStructureHelpers;
 const historicalPlan = {
   id: 36,
   planDate: "2026-07-10",
@@ -84,6 +93,90 @@ assert.equal(
   false,
   "A local group without foreign snapshot provenance must remain eligible for an intentional grouping."
 );
+const resurrectedGroup = {
+  id: "GOB-116758-117328",
+  type: "SO",
+  childOrders: ["SOB116758", "SOB117328"],
+  groupPlanId: "215",
+  groupPlanDate: "2026-08-09",
+  dispatchSnapshotSourcePlanId: "216",
+  dispatchSnapshotSourcePlanDate: "2026-08-10"
+};
+const ungroupedOwnerPlan = { id: "215", planDate: "2026-08-09", orders: [] };
+assert.equal(
+  catalogStructureConflictsWithSavedPlan(resurrectedGroup, ungroupedOwnerPlan),
+  true,
+  "An absent group owned by the loaded plan must not be resurrected from another dated snapshot."
+);
+assert.equal(
+  catalogStructureConflictsWithSavedPlan({
+    ...resurrectedGroup,
+    dispatchSnapshotSourcePlanId: "215",
+    dispatchSnapshotSourcePlanDate: "2026-08-09"
+  }, ungroupedOwnerPlan),
+  true,
+  "The owning plan's global feed must not restore a group that its saved snapshot no longer contains."
+);
+assert.equal(
+  catalogStructureConflictsWithSavedPlan({
+    ...resurrectedGroup,
+    dispatchSnapshotSourcePlanId: "215",
+    dispatchSnapshotSourcePlanDate: "2026-08-09"
+  }, { ...ungroupedOwnerPlan, orders: [{ id: resurrectedGroup.id }] }),
+  false,
+  "A group still present in its owning saved snapshot must remain restorable."
+);
+assert.equal(
+  catalogStructureConflictsWithSavedPlan(resurrectedGroup, {
+    id: "216",
+    planDate: "2026-08-10",
+    orders: []
+  }),
+  true,
+  "A snapshot copy whose source and owning plan disagree must be rejected."
+);
+
+const filteredLateFeed = filterDispatchOrderFeedForAppliedPlan(
+  [resurrectedGroup, { id: "SO-ORDINARY", type: "SO" }],
+  { id: "215", planDate: "2026-08-09" },
+  { planId: "215", planDate: "2026-08-09", orderIds: new Set() }
+);
+assert.deepEqual(
+  filteredLateFeed.map((order) => order.id),
+  ["SO-ORDINARY"],
+  "An order feed that finishes after plan bootstrap must still honor the successful ungroup."
+);
+assert.equal(
+  filterDispatchOrderFeedForAppliedPlan(
+    [resurrectedGroup],
+    { id: "216", planDate: "2026-08-10" },
+    { planId: "215", planDate: "2026-08-09", orderIds: new Set() }
+  ).length,
+  1,
+  "Applied structure from a previous plan must not filter a newly selected plan."
+);
+assert.equal(
+  savedGroupStructureConflictsWithPlan(resurrectedGroup, ungroupedOwnerPlan),
+  true,
+  "A persisted group carrying foreign snapshot provenance must be ignored on restore."
+);
+assert.equal(
+  savedGroupStructureConflictsWithPlan({
+    ...resurrectedGroup,
+    dispatchSnapshotSourcePlanId: "215",
+    dispatchSnapshotSourcePlanDate: "2026-08-09"
+  }, { ...ungroupedOwnerPlan, orders: [resurrectedGroup] }),
+  false,
+  "A consistently owned group must remain in its plan."
+);
+assert.equal(
+  savedGroupStructureConflictsWithPlan(resurrectedGroup, {
+    id: "216",
+    planDate: "2026-08-10"
+  }),
+  true,
+  "A grouped record owned by August 9 must not materialize inside the August 10 saved plan."
+);
 for (let index = 0; index < 25; index += 1) {
   const savedRef = `SO-SAVED-${index}`;
   const generatedPlan = { id: `PLAN-${index}`, orders: [{ id: savedRef }] };
@@ -138,6 +231,49 @@ const mutationFixtures = [
     catalogOrder: { id: "GO-LOCAL-DRAFT", childOrders: ["SOA04857"] },
     savedPlan: historicalPlan,
     expected: false
+  },
+  {
+    catalogOrder: resurrectedGroup,
+    savedPlan: ungroupedOwnerPlan,
+    expected: true
+  },
+  {
+    catalogOrder: {
+      ...resurrectedGroup,
+      dispatchSnapshotSourcePlanId: "215",
+      dispatchSnapshotSourcePlanDate: "2026-08-09"
+    },
+    savedPlan: ungroupedOwnerPlan,
+    expected: true
+  },
+  {
+    catalogOrder: {
+      ...resurrectedGroup,
+      dispatchSnapshotSourcePlanId: "215",
+      dispatchSnapshotSourcePlanDate: "2026-08-09"
+    },
+    savedPlan: { ...ungroupedOwnerPlan, orders: [{ id: resurrectedGroup.id }] },
+    expected: false
+  },
+  {
+    catalogOrder: {
+      id: resurrectedGroup.id,
+      childOrders: resurrectedGroup.childOrders,
+      groupPlanId: "215",
+      dispatchSnapshotSourcePlanId: "215"
+    },
+    savedPlan: { id: "215", orders: [] },
+    expected: true
+  },
+  {
+    catalogOrder: {
+      id: resurrectedGroup.id,
+      childOrders: resurrectedGroup.childOrders,
+      groupPlanId: "215",
+      dispatchSnapshotSourcePlanId: "216"
+    },
+    savedPlan: { id: "214", orders: [] },
+    expected: true
   }
 ];
 const catalogStructureMutants = [
@@ -156,8 +292,25 @@ const catalogStructureMutants = [
     ]
   ],
   [
-    "reject the loaded plan's own structure",
-    ["sourcePlanId === savedPlanId", "sourcePlanId !== savedPlanId"]
+      "accept a stale same-owner group",
+    [
+      "(savedPlanId && groupPlanId && savedPlanId === groupPlanId)",
+      "false"
+    ]
+  ],
+  [
+    "accept corrupted group provenance",
+    [
+      "(sourcePlanId && groupPlanId && sourcePlanId !== groupPlanId)",
+      "false"
+    ]
+  ],
+  [
+    "ignore saved group identity",
+    [
+      "if (savedOrderIds.has(catalogOrderId)) return false;",
+      "if (false) return false;"
+    ]
   ],
   [
     "treat local drafts as foreign",
@@ -184,8 +337,18 @@ const savedPlanRestoreSource = sourceSlice(
 );
 assert.match(
   savedPlanRestoreSource,
-  /catalogStructureConflictsWithSavedPlan\(order, saved\)/,
+  /catalogStructureConflictsWithSavedPlan\(order, restorableSavedPlan\)/,
   "Saved-plan restoration must apply the catalog structure guard before merging missing orders."
+);
+assert.match(
+  sourceSlice("function applyDispatchOrderFeed", "function preserveDispatchPlanningFields", "order-feed application"),
+  /filterDispatchOrderFeedForAppliedPlan\(normalizedFeed, currentPlan, appliedPlanStructure\)/,
+  "A late global order feed must be filtered through the last applied plan snapshot."
+);
+assert.match(
+  sourceSlice("function mergeDispatchOrderSearchFeed", "function mergeTargetedDispatchMutationOrders", "order-search feed application"),
+  /filterDispatchOrderFeedForAppliedPlan\(normalizedFeed, currentPlan, appliedPlanStructure\)/,
+  "A searched grouped order must obey the same saved-plan ownership guard as the initial feed."
 );
 const historicalRestore = Function(
   `"use strict";
@@ -208,6 +371,7 @@ const historicalRestore = Function(
   let lastSavedAt = "";
   let lastServerSavedAt = "";
   let lastSavedPlanHash = "";
+  let appliedPlanStructure = { planId: "", planDate: "", orderIds: new Set() };
   function rememberAssignedOrderEvidence() {}
   function clearActiveRouteEstimates() {}
   function activePhysicalOrderEvidence() { return { all: new Set(), pickups: new Set(), drops: new Set() }; }
@@ -511,6 +675,37 @@ for (const eventName of ["conflict", "server-response", "saved-with-followup-war
 }
 
 const serverSource = await readFile(new URL("./server.js", import.meta.url), "utf8");
+const snapshotOwnershipStart = serverSource.indexOf("function snapshotDerivedGroupBelongsToPlan");
+const snapshotOwnershipEnd = serverSource.indexOf("async function listDispatchSnapshotDerivedOrders", snapshotOwnershipStart);
+assert.ok(snapshotOwnershipStart >= 0 && snapshotOwnershipEnd > snapshotOwnershipStart,
+  "Expected the snapshot-derived group ownership guard.");
+const snapshotDerivedGroupBelongsToPlan = Function(
+  `"use strict"; ${serverSource.slice(snapshotOwnershipStart, snapshotOwnershipEnd)}; return snapshotDerivedGroupBelongsToPlan;`
+)();
+assert.equal(
+  snapshotDerivedGroupBelongsToPlan(resurrectedGroup, { id: "216", plan_date: "2026-08-10" }),
+  false,
+  "The server feed must not source the August 9 group from its copied August 10 snapshot."
+);
+assert.equal(
+  snapshotDerivedGroupBelongsToPlan(resurrectedGroup, { id: "215", plan_date: "2026-08-09" }),
+  true,
+  "The server may source a group from the snapshot that actually owns it."
+);
+assert.equal(
+  snapshotDerivedGroupBelongsToPlan({ id: "LEGACY-GROUP", childOrders: ["SO-A", "SO-B"] }, {
+    id: "214",
+    plan_date: "2026-08-08"
+  }),
+  true,
+  "Legacy groups without ownership metadata must retain the existing fallback behavior."
+);
+const snapshotFeedSource = serverSource.slice(snapshotOwnershipEnd, serverSource.indexOf(
+  "function mergeDispatchOrderFeedWithSnapshotDerivedOrders",
+  snapshotOwnershipEnd
+));
+assert.match(snapshotFeedSource, /snapshotDerivedGroupBelongsToPlan\(order, row\)/,
+  "Every snapshot-derived order feed candidate must pass the ownership guard.");
 const dateValidationStart = serverSource.indexOf("async function findNewDispatchPlanDateConflicts");
 const dateValidationEnd = serverSource.indexOf("function dispatchDateCompare", dateValidationStart);
 const dateValidationSource = serverSource.slice(dateValidationStart, dateValidationEnd);
@@ -550,5 +745,9 @@ const customValidationEnd = repositorySource.indexOf("function collectPlanOrderR
 const customValidationSource = repositorySource.slice(customValidationStart, customValidationEnd);
 assert.match(customValidationSource, /previousRefs[\s\S]*?filter\(\(ref\) => !previousRefs\.has\(ref\)\)[\s\S]*?if \(!customRefs\.length\) return;/,
   "Unchanged custom-order placement must not rescan every historical plan during an ordinary save.");
+
+const v2RepositorySource = await readFile(new URL("./dispatch-planner-v2-repository.js", import.meta.url), "utf8");
+assert.match(v2RepositorySource, /"groupPlanId",\s*"groupPlanDate"/,
+  "Compact v2 bootstrap must preserve the owning plan metadata for grouped orders.");
 
 console.log("Dispatch save coordination and browser diagnostics checks passed.");

@@ -402,6 +402,7 @@ const sampleOrders = [
 let orderCatalog = [];
 let orders = orderCatalog.map((order) => ({ ...order, assigned: false }));
 let assignedOrderEvidenceById = new Map();
+let appliedPlanStructure = { planId: "", planDate: "", orderIds: new Set() };
 let drivers = [
   { name: "Alex Wong", license: "AZ", number: "A90211", login: "alex", ownYardFixedMinutes: 42, vendorFixedMinutes: 36, deliveryFixedMinutes: 36, outsideFixedMinutes: 36, minutesPerPallet: 1, loadMinutes: 42, unloadMinutes: 36 },
   { name: "Jenny Lee", license: "DZ", number: "D18870", login: "jenny", ownYardFixedMinutes: 38, vendorFixedMinutes: 32, deliveryFixedMinutes: 32, outsideFixedMinutes: 32, minutesPerPallet: 1, loadMinutes: 38, unloadMinutes: 32 }
@@ -3346,7 +3347,8 @@ function invalidateRoutesChangedByOrderFeed(beforeSignatures = new Map()) {
 function applyDispatchOrderFeed(feed) {
   const routeSignaturesBefore = captureOperationalLoadSignatures();
   const activityEvidence = activePhysicalOrderEvidence();
-  const nextOrders = Array.isArray(feed) ? feed.map(normalizeOrder).filter((order) => order.id) : [];
+  const normalizedFeed = Array.isArray(feed) ? feed.map(normalizeOrder).filter((order) => order.id) : [];
+  const nextOrders = filterDispatchOrderFeedForAppliedPlan(normalizedFeed, currentPlan, appliedPlanStructure);
   orderCatalog = nextOrders;
   const byId = new Map(orders.map((order) => [order.id, order]));
   const evidenceBaselines = new Map([...byId.entries()]
@@ -3387,6 +3389,8 @@ function preserveDispatchPlanningFields(existing = {}, fresh = {}) {
     "transitCo",
     "transitOriginalPickupLocations",
     "groupAliases",
+    "groupPlanId",
+    "groupPlanDate",
     "planOwned",
     "isSplit",
     "isGrouped"
@@ -3408,7 +3412,8 @@ function mergeFreshDispatchOperationalOrder(existing = {}, candidate = {}, activ
 }
 
 function mergeDispatchOrderSearchFeed(feed) {
-  const candidates = Array.isArray(feed) ? feed.map(normalizeOrder).filter((order) => order.id) : [];
+  const normalizedFeed = Array.isArray(feed) ? feed.map(normalizeOrder).filter((order) => order.id) : [];
+  const candidates = filterDispatchOrderFeedForAppliedPlan(normalizedFeed, currentPlan, appliedPlanStructure);
   if (!candidates.length) return;
   const routeSignaturesBefore = captureOperationalLoadSignatures();
   const activityEvidence = activePhysicalOrderEvidence();
@@ -4648,6 +4653,22 @@ function reduceDispatchPlanCommand(state, command) {
 }
 
 function isDispatchPlanOwnedOrder(order = {}) {
+  if (Array.isArray(order.childOrders) && order.childOrders.length > 0) {
+    const currentPlanId = String(currentPlan?.id || "").trim();
+    const currentDate = String(currentPlan?.planDate || currentPlanDate || "").slice(0, 10);
+    const groupPlanId = String(order.groupPlanId || "").trim();
+    const groupPlanDate = String(order.groupPlanDate || "").slice(0, 10);
+    const sourcePlanId = String(order.dispatchSnapshotSourcePlanId || "").trim();
+    const sourcePlanDate = String(order.dispatchSnapshotSourcePlanDate || "").slice(0, 10);
+    if (currentPlanId && (
+      (groupPlanId && groupPlanId !== currentPlanId)
+      || (sourcePlanId && sourcePlanId !== currentPlanId)
+    )) return false;
+    if (currentDate && (
+      (groupPlanDate && groupPlanDate !== currentDate)
+      || (sourcePlanDate && sourcePlanDate !== currentDate)
+    )) return false;
+  }
   return ["CO", "CUSTOM", "GROUP"].includes(String(order.type || "").toUpperCase())
     || Boolean(order.originalOrderId)
     || Boolean(order.transitCo)
@@ -5005,21 +5026,69 @@ function splitParentOrderIds(orderList = orders) {
 
 function catalogStructureConflictsWithSavedPlan(catalogOrder = {}, savedPlan = {}) {
   const sourcePlanId = String(catalogOrder.dispatchSnapshotSourcePlanId || "").trim();
+  const sourcePlanDate = String(catalogOrder.dispatchSnapshotSourcePlanDate || "").slice(0, 10);
   const savedPlanId = String(savedPlan.id || savedPlan.planId || "").trim();
-  if (!sourcePlanId || !savedPlanId || sourcePlanId === savedPlanId) return false;
+  const savedPlanDate = String(savedPlan.planDate || "").slice(0, 10);
   const savedOrderIds = new Set((savedPlan.orders || [])
     .map((order) => String(order?.id || "").trim())
     .filter(Boolean));
   const catalogOrderId = String(catalogOrder.id || "").trim();
-  if (!catalogOrderId || savedOrderIds.has(catalogOrderId)) return false;
+  if (!catalogOrderId) return false;
   const groupedRefs = [
     ...(catalogOrder.childOrders || []),
     ...(catalogOrder.groupAliases || []),
     ...(catalogOrder.childOrderDetails || []).flatMap((child) => [child?.id, child?.originalOrderId])
   ].map((ref) => String(ref || "").trim()).filter(Boolean);
+  const groupPlanId = String(catalogOrder.groupPlanId || "").trim();
+  const groupPlanDate = String(catalogOrder.groupPlanDate || "").slice(0, 10);
+  if (groupedRefs.length && (
+    (sourcePlanId && groupPlanId && sourcePlanId !== groupPlanId)
+    || (sourcePlanDate && groupPlanDate && sourcePlanDate !== groupPlanDate)
+  )) return true;
+  if (savedOrderIds.has(catalogOrderId)) return false;
+  if (groupedRefs.length && (
+    (savedPlanId && groupPlanId && savedPlanId === groupPlanId)
+    || (savedPlanDate && groupPlanDate && savedPlanDate === groupPlanDate)
+  )) return true;
+  if (!sourcePlanId || !savedPlanId || sourcePlanId === savedPlanId) return false;
   if (groupedRefs.some((ref) => savedOrderIds.has(ref))) return true;
   const parentRef = String(catalogOrder.originalOrderId || "").trim();
   return Boolean(parentRef && savedOrderIds.has(parentRef));
+}
+
+function filterDispatchOrderFeedForAppliedPlan(feed = [], plan = {}, applied = {}) {
+  const planId = String(plan?.id || plan?.planId || "").trim();
+  const appliedPlanId = String(applied?.planId || "").trim();
+  if (!planId || planId !== appliedPlanId) return feed;
+  const orderIds = applied?.orderIds instanceof Set
+    ? [...applied.orderIds]
+    : Array.isArray(applied?.orderIds) ? applied.orderIds : [];
+  const savedPlan = {
+    id: planId,
+    planDate: applied?.planDate || plan?.planDate || "",
+    orders: orderIds.map((id) => ({ id }))
+  };
+  return (feed || []).filter((order) => !catalogStructureConflictsWithSavedPlan(order, savedPlan));
+}
+
+function savedGroupStructureConflictsWithPlan(order = {}, savedPlan = {}) {
+  if (!Array.isArray(order.childOrders) || !order.childOrders.length) return false;
+  const savedPlanId = String(savedPlan.id || savedPlan.planId || "").trim();
+  const savedPlanDate = String(savedPlan.planDate || "").slice(0, 10);
+  const groupPlanId = String(order.groupPlanId || "").trim();
+  const groupPlanDate = String(order.groupPlanDate || "").slice(0, 10);
+  const sourcePlanId = String(order.dispatchSnapshotSourcePlanId || "").trim();
+  const sourcePlanDate = String(order.dispatchSnapshotSourcePlanDate || "").slice(0, 10);
+  return Boolean(
+    (savedPlanId && (
+      (groupPlanId && groupPlanId !== savedPlanId)
+      || (sourcePlanId && sourcePlanId !== savedPlanId)
+    ))
+    || (savedPlanDate && (
+      (groupPlanDate && groupPlanDate !== savedPlanDate)
+      || (sourcePlanDate && sourcePlanDate !== savedPlanDate)
+    ))
+  );
 }
 
 function splitSiblingsForOrder(order = {}) {
@@ -5041,14 +5110,23 @@ function splitOrderPlanningBlock(splits = []) {
 
 function applySavedPlan(saved) {
   if (!Array.isArray(saved?.orders) || !Array.isArray(saved?.trucks)) return false;
-  rememberAssignedOrderEvidence(saved.orders);
+  const savedAssignedIds = assignedOrderIdsForTrucks(saved.trucks);
+  const savedOrders = saved.orders.filter((order) =>
+    savedAssignedIds.has(order.id) || !savedGroupStructureConflictsWithPlan(order, saved)
+  );
+  const restorableSavedPlan = { ...saved, orders: savedOrders };
+  appliedPlanStructure = {
+    planId: String(saved.id || saved.planId || "").trim(),
+    planDate: String(saved.planDate || "").slice(0, 10),
+    orderIds: new Set(savedOrders.map((order) => String(order?.id || "").trim()).filter(Boolean))
+  };
+  rememberAssignedOrderEvidence(savedOrders);
   clearActiveRouteEstimates();
   const activityEvidence = activePhysicalOrderEvidence(saved.trucks, saved.id || saved.planId);
-  const evidenceBaselines = new Map(saved.orders
+  const evidenceBaselines = new Map(savedOrders
     .filter((order) => orderMatchesActivityRefs(order, activityEvidence.all))
     .map((order) => [String(order.id || "").trim().toLowerCase(), order]));
   const defaultById = new Map(orderCatalog.map((order) => [order.id, normalizeOrder(order)]));
-  const savedAssignedIds = assignedOrderIdsForTrucks(saved.trucks);
   const allowSavedOnlyOrder = (order) => {
     if (order?.type === "CUSTOM" || order?.sourceTable === "dispatch_custom_orders") {
       return savedAssignedIds.has(order.id);
@@ -5058,7 +5136,7 @@ function applySavedPlan(saved) {
     const localStatus = order.localDispatchStatus || (savedAssignedIds.has(order.id) ? "planned" : "open");
     return localStatus !== "planned" || savedAssignedIds.has(order.id);
   };
-  const savedById = new Map(saved.orders.filter((order) => defaultById.has(order.id) || allowSavedOnlyOrder(order)).map((order) => {
+  const savedById = new Map(savedOrders.filter((order) => defaultById.has(order.id) || allowSavedOnlyOrder(order)).map((order) => {
     const base = defaultById.get(order.id) || {};
     const keepPlanningFields = {
       assigned: order.assigned,
@@ -5066,6 +5144,8 @@ function applySavedPlan(saved) {
       netsuiteFeedMissing: !base.id && isNetSuiteDispatchOrder(order),
       childOrders: order.childOrders,
       childOrderDetails: order.childOrderDetails,
+      groupPlanId: order.groupPlanId,
+      groupPlanDate: order.groupPlanDate,
       consolidation: order.consolidation,
       originalOrderId: order.type === "CUSTOM"
         ? ""
@@ -5093,7 +5173,7 @@ function applySavedPlan(saved) {
   ]);
   for (const order of orderCatalog) {
     if (hiddenOrderIds.has(order.id)) continue;
-    if (catalogStructureConflictsWithSavedPlan(order, saved)) continue;
+    if (catalogStructureConflictsWithSavedPlan(order, restorableSavedPlan)) continue;
     if (!savedById.has(order.id)) savedById.set(order.id, normalizeOrder(order));
   }
   orders = [...savedById.values()].filter((order) => !hiddenOrderIds.has(order.id));
@@ -5113,7 +5193,7 @@ function applySavedPlan(saved) {
   selectedOrderIds = new Set(selectedOrderId ? [selectedOrderId] : []);
   lastSavedAt = saved.savedAt ? new Date(saved.savedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "";
   lastServerSavedAt = saved.savedAt || lastServerSavedAt;
-  lastSavedPlanHash = savedPlanHash(saved);
+  lastSavedPlanHash = savedPlanHash(restorableSavedPlan);
   return true;
 }
 
@@ -5943,6 +6023,7 @@ async function createPlanForDate(planDate = currentPlanDate) {
 
 function resetPlanningBoard() {
   assignedOrderEvidenceById = new Map();
+  appliedPlanStructure = { planId: "", planDate: "", orderIds: new Set() };
   orders = orderCatalog.map((order) => normalizeOrder(order));
   trucks = fleet.map((vehicle, index) => makeTruckFromFleet(vehicle, index));
   if (driverOrientedPlanningEnabled()) {

@@ -1189,6 +1189,17 @@ function dispatchOrderLogicalRefs(order = {}) {
     .filter(Boolean);
 }
 
+function snapshotDerivedGroupBelongsToPlan(order = {}, plan = {}) {
+  if (!Array.isArray(order?.childOrders) || !order.childOrders.length) return true;
+  const ownerPlanId = String(order.groupPlanId || "").trim();
+  const ownerPlanDate = String(order.groupPlanDate || "").slice(0, 10);
+  const snapshotPlanId = String(plan.id || plan.planId || "").trim();
+  const snapshotPlanDate = String(plan.planDate || plan.plan_date || "").slice(0, 10);
+  if (ownerPlanId && snapshotPlanId && ownerPlanId !== snapshotPlanId) return false;
+  if (ownerPlanDate && snapshotPlanDate && ownerPlanDate !== snapshotPlanDate) return false;
+  return true;
+}
+
 async function listDispatchSnapshotDerivedOrders({ type = null, search = "" } = {}) {
   const sandbox = isNetSuiteSandboxEnvironment();
   const snapshotSearch = String(search || "").trim().slice(0, 120);
@@ -1235,6 +1246,7 @@ async function listDispatchSnapshotDerivedOrders({ type = null, search = "" } = 
     for (const snapshotOrder of row.orders || []) {
       const order = clearCancelledTransitCoMetadata(snapshotOrder, cancelledLocalCoByRef);
       if (!isSnapshotDerivedDispatchOrder(order)) continue;
+      if (!snapshotDerivedGroupBelongsToPlan(order, row)) continue;
       if (wantedType && String(order?.type || "").toUpperCase() !== wantedType) continue;
       const id = String(order?.id || "").trim();
       if (String(order?.type || "").toUpperCase() === "PO" && blanketPurchaseOrderRefs.has(id.toLowerCase())) continue;
