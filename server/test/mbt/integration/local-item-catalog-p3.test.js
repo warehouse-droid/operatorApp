@@ -162,6 +162,8 @@ test("P3-F09: manual and CSV custom items use one validator, normalize uppercase
       {
         ...manualRow,
         itemCode: "BIN_WASH",
+        chargeBasis: "per_event",
+        densityLbsPerYard: null,
         category: "surcharge",
         pricingMode: "custom_price"
       }
@@ -171,6 +173,8 @@ test("P3-F09: manual and CSV custom items use one validator, normalize uppercase
       {
         ...csvRow,
         itemCode: "ENV_FEE",
+        chargeBasis: "distance",
+        densityLbsPerYard: null,
         category: "service",
         pricingMode: "rate_card"
       }

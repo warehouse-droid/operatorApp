@@ -329,13 +329,33 @@ async function applyCustomerImport() {
 }
 
 function syncCustomItemTypeFields() {
-  const isBin = inputValue("customLocalItemType") === "bin";
+  const itemType = inputValue("customLocalItemType");
+  const isBin = itemType === "bin";
+  const isAggregate = itemType === "aggregate";
   for (const field of document.querySelectorAll("[data-bin-item-field]")) {
     field.hidden = !isBin;
     for (const control of field.querySelectorAll("input, select")) {
       control.disabled = !isBin;
       control.required = isBin;
     }
+  }
+  for (const field of document.querySelectorAll("[data-aggregate-item-field]")) {
+    field.hidden = !isAggregate;
+    for (const control of field.querySelectorAll("input, select")) {
+      control.disabled = !isAggregate;
+      control.required = isAggregate;
+    }
+  }
+  const basis = readinessElement("customLocalItemChargeBasis");
+  if (basis instanceof HTMLSelectElement) {
+    const options = {
+      bin: [["rental_period", "Rental period"]],
+      surcharge: [["per_event", "Per event"]],
+      dump: [["per_tonne", "Price per tonne"], ["per_bin", "Fixed price per bin"]],
+      aggregate: [["per_yard", "Price per cubic yard"]],
+      delivery_fee: [["distance", "Distance bands"]]
+    }[itemType] || [];
+    basis.replaceChildren(...options.map(([value, label]) => new Option(label, value)));
   }
 }
 
@@ -353,6 +373,8 @@ async function saveCustomLocalItem(event) {
     ? ["delivery", "final_pickup", "loaded_pickup", "dump_return", "exchange"]
     : itemType === "dump"
       ? ["dump_return"]
+      : itemType === "aggregate"
+        ? ["delivery", "exchange"]
       : itemType === "delivery_fee"
         ? ["delivery", "final_pickup", "loaded_pickup", "dump_return", "exchange"]
         : [];
@@ -365,6 +387,10 @@ async function saveCustomLocalItem(event) {
         displayName: inputValue("customLocalItemName"),
         description: inputValue("customLocalItemDescription"),
         itemType,
+        chargeBasis: inputValue("customLocalItemChargeBasis"),
+        densityLbsPerYard: itemType === "aggregate"
+          ? Number(inputValue("customLocalItemDensityLbsPerYard"))
+          : null,
         rentalPeriodDays: itemType === "bin" ? Number(inputValue("customLocalItemRentalDays")) : null,
         applicableServiceTypes,
         applicableLegacySourceTypes: [],
@@ -386,6 +412,7 @@ async function saveCustomLocalItem(event) {
     if (activeField) activeField.checked = true;
     fieldValue("customLocalItemRentalDays", "14");
     fieldValue("customLocalItemBinCapacityYards", "");
+    fieldValue("customLocalItemDensityLbsPerYard", "");
     syncCustomItemTypeFields();
     setLocalItemMessage("Custom local item created. No NetSuite item was required.");
   } catch (error) {
@@ -762,7 +789,6 @@ async function loadRateCards() {
     rateCardState.items = Array.isArray(result.items) ? result.items : [];
     rateCardState.yardOptions = Array.isArray(result.yardOptions) ? result.yardOptions : [];
     renderRateCards();
-    renderCustomerChargeRateCardOptions();
     renderRatePricingItemOptions(rateCardState.activePricingItemCode);
     phase3ConfigState.rateCardsLoaded = true;
     setConfigMessage("rateCardsMessage", "Local rate cards loaded.");
@@ -1224,6 +1250,7 @@ function rateRowInput(type, field, label, { value = "", inputType = "text", min,
 function itemPricingDefaults(item) {
   if (item.itemType === "bin") return { rentalCad: "", extensionCad: "" };
   if (item.itemType === "dump") return { amountCad: "", minimumCad: "0.00" };
+  if (item.itemType === "aggregate") return { amountCad: "", minimumCad: "0.00" };
   if (item.itemType === "delivery_fee") return { bands: [] };
   return {};
 }
@@ -1248,7 +1275,11 @@ function appendItemDistanceBandRow(container, values = {}) {
   purposeLabel.textContent = "Pricing purpose";
   const purpose = document.createElement("select");
   purpose.dataset.rateField = "serviceCode";
-  for (const [value, label] of [["delivery", "BIN delivery"], ["mbbs_cross_charge", "MBBS cross charge"]]) {
+  for (const [value, label] of [
+    ["delivery", "BIN delivery"],
+    ["aggregate_delivery", "Aggregate delivery"],
+    ["mbbs_cross_charge", "MBBS cross charge"]
+  ]) {
     const option = document.createElement("option"); option.value = value; option.textContent = label; purpose.append(option);
   }
   purpose.value = values.serviceCode || "delivery";
@@ -1269,9 +1300,9 @@ function appendItemDistanceBandRow(container, values = {}) {
   bin.value = values.binTypeCode || binItems[0]?.binTypeCode || "";
   binLabel.append(bin);
   const syncPurpose = () => {
-    const crossCharge = purpose.value === "mbbs_cross_charge";
-    binLabel.hidden = crossCharge;
-    bin.disabled = crossCharge;
+    const binDelivery = purpose.value === "delivery";
+    binLabel.hidden = !binDelivery;
+    bin.disabled = !binDelivery;
   };
   purpose.addEventListener("change", syncPurpose);
   syncPurpose();
@@ -1354,7 +1385,7 @@ function captureActiveRatePricingItem() {
       rentalCad: valueFromRow(editor, "rentalCad"),
       extensionCad: valueFromRow(editor, "extensionCad")
     });
-  } else if (item.itemType === "dump") {
+  } else if (["dump", "aggregate"].includes(item.itemType)) {
     rateCardState.itemPricing.set(item.itemCode, {
       amountCad: valueFromRow(editor, "amountCad"),
       minimumCad: valueFromRow(editor, "minimumCad")
@@ -1435,12 +1466,29 @@ function renderRateItemEditor(itemCode) {
     }
     case "dump": {
       const help = document.createElement("p"); help.className = "mbt-field-help";
-      help.textContent = "Customer charge per tonne. The actual dump-site receipt remains separate cost evidence.";
+      const fixedPerBin = item.chargeBasis === "per_bin";
+      help.textContent = fixedPerBin
+        ? "Fixed customer charge for each bin. Garbage orders add no dumping-fee line."
+        : "Customer charge per tonne. The actual dump-site receipt remains separate cost evidence.";
       const fields = document.createElement("div"); fields.className = "mbt-form-grid";
-      fields.append(
-        rateRowInput("dump", "amountCad", "CAD / tonne", { value: values.amountCad || "", inputType: "number", min: 0, step: "0.01", required: false }),
-        rateRowInput("dump", "minimumCad", "Minimum CAD", { value: values.minimumCad || "0.00", inputType: "number", min: 0, step: "0.01", required: false })
-      );
+      fields.append(rateRowInput(
+        "dump", "amountCad", fixedPerBin ? "CAD / bin" : "CAD / tonne",
+        { value: values.amountCad || "", inputType: "number", min: 0, step: "0.01", required: false }
+      ));
+      if (!fixedPerBin) {
+        fields.append(rateRowInput("dump", "minimumCad", "Minimum CAD", { value: values.minimumCad || "0.00", inputType: "number", min: 0, step: "0.01", required: false }));
+      }
+      editor.append(help, fields);
+      break;
+    }
+    case "aggregate": {
+      const help = document.createElement("p"); help.className = "mbt-field-help";
+      help.textContent = `Customer charge per cubic yard. Dispatch weight uses ${Number(item.densityLbsPerYard)} lb per yard.`;
+      const fields = document.createElement("div"); fields.className = "mbt-form-grid";
+      fields.append(rateRowInput(
+        "aggregate", "amountCad", "CAD / yard",
+        { value: values.amountCad || "", inputType: "number", min: 0, step: "0.01", required: false }
+      ));
       editor.append(help, fields);
       break;
     }
@@ -1569,7 +1617,7 @@ function populateSimplifiedRateEditor(detail) {
   for (const tariff of graph.dumpTariffs || []) {
     const itemCode = tariff.itemCode || tariff.materialCode || "DUMP";
     const item = pricingItem(itemCode);
-    if (!item || item.itemType !== "dump") continue;
+    if (!item || !["dump", "aggregate"].includes(item.itemType)) continue;
     rateCardState.itemPricing.set(itemCode, {
       amountCad: cadInputValue(tariff.amountMinor),
       minimumCad: cadInputValue(tariff.minimumAmountMinor)
@@ -1666,7 +1714,7 @@ function simplifiedRateCardGraph() {
         distanceBands.push({
           itemCode: item.itemCode,
           serviceCode: band.serviceCode || "delivery",
-          binTypeCode: band.serviceCode === "mbbs_cross_charge" ? null : (band.binTypeCode || "14YD"),
+          binTypeCode: band.serviceCode === "delivery" ? (band.binTypeCode || "14YD") : null,
           sequenceNumber,
           minimumMetres: kmToMetres(band.minimumKm, `${item.itemCode} band start`),
           maximumMetres: kmToMetres(band.maximumKm, `${item.itemCode} band end`, { nullable: true }),
@@ -1679,12 +1727,27 @@ function simplifiedRateCardGraph() {
       }
     }
     if (item.itemType === "dump" && values.amountCad) {
+      const fixedPerBin = item.chargeBasis === "per_bin";
       dumpTariffs.push({
         itemCode: item.itemCode, dumpSiteCode: null, materialCode: null,
-        tariffCode: `customer_${slug}`, pricingBasis: "per_weight", unitOfMeasure: "TONNE",
+        tariffCode: `customer_${slug}`,
+        pricingBasis: fixedPerBin ? "per_quantity" : "per_weight",
+        unitOfMeasure: fixedPerBin ? "BIN" : "TONNE",
         amountMinor: cadMinorFromValue(values.amountCad, `${item.itemCode} dump tariff`),
-        minimumAmountMinor: cadMinorFromValue(values.minimumCad || "0", `${item.itemCode} dump minimum`),
-        currency: "CAD", active: true, description: `${item.displayName} customer tariff per tonne`
+        minimumAmountMinor: fixedPerBin
+          ? 0
+          : cadMinorFromValue(values.minimumCad || "0", `${item.itemCode} dump minimum`),
+        currency: "CAD", active: true,
+        description: `${item.displayName} customer tariff ${fixedPerBin ? "per bin" : "per tonne"}`
+      });
+    }
+    if (item.itemType === "aggregate" && values.amountCad) {
+      dumpTariffs.push({
+        itemCode: item.itemCode, dumpSiteCode: null, materialCode: null,
+        tariffCode: `customer_${slug}`, pricingBasis: "per_quantity", unitOfMeasure: "YARD",
+        amountMinor: cadMinorFromValue(values.amountCad, `${item.itemCode} aggregate tariff`),
+        minimumAmountMinor: 0,
+        currency: "CAD", active: true, description: `${item.displayName} customer tariff per yard`
       });
     }
   }
@@ -1884,7 +1947,8 @@ function localItemPriceLabel(item) {
   return ({
     bin: `Fixed ${Number(item.rentalPeriodDays || 14)}-day rental + extension`,
     surcharge: "Manually added charge",
-    dump: "Price per tonne",
+    dump: item.chargeBasis === "per_bin" ? "Fixed price per bin" : "Price per tonne",
+    aggregate: "Price per cubic yard",
     delivery_fee: "Item-specific distance bands"
   })[String(item.itemType || "")] || "Server configured";
 }
@@ -1894,6 +1958,7 @@ function localItemIdentity(item) {
     bin: "Bin",
     surcharge: "Surcharge",
     dump: "Dump",
+    aggregate: "Aggregate",
     delivery_fee: "Delivery fee"
   })[String(item.itemType || "")] || "Local item";
   return item.itemType === "bin"
@@ -2062,6 +2127,11 @@ function openLocalItemEditor(itemCode) {
   fieldValue("localItemRevision", item.revision);
   fieldValue("localItemDisplayName", item.displayName);
   fieldValue("localItemDescription", item.description);
+  fieldValue("localItemChargeBasis", item.chargeBasis);
+  const chargeBasisField = readinessElement("localItemChargeBasisField");
+  const chargeBasis = readinessElement("localItemChargeBasis");
+  if (chargeBasisField) chargeBasisField.hidden = item.itemType !== "dump";
+  if (chargeBasis instanceof HTMLSelectElement) chargeBasis.disabled = item.itemType !== "dump";
   fieldValue("localItemReason", "");
   const active = readinessElement("localItemActive");
   if (active) {
@@ -2073,7 +2143,7 @@ function openLocalItemEditor(itemCode) {
   }
   const help = readinessElement("localItemIdentityHelp");
   if (help) {
-    help.textContent = `${localItemIdentity(item)} · ${localItemPriceLabel(item)}. Identity and pricing ownership cannot be changed here.`;
+    help.textContent = `${localItemIdentity(item)} · ${localItemPriceLabel(item)}. Existing activated rate versions keep their stored unit and amount.`;
   }
   const editor = readinessElement("localItemEditor");
   if (editor) {
@@ -2122,6 +2192,7 @@ async function saveLocalItem(event) {
     displayName: inputValue("localItemDisplayName"),
     description: inputValue("localItemDescription"),
     active: activeField?.checked === true,
+    ...(item.itemType === "dump" ? { chargeBasis: inputValue("localItemChargeBasis") } : {}),
     expectedRevision: Number(item.revision),
     reason: inputValue("localItemReason")
   };
@@ -2749,17 +2820,6 @@ function bindPhase3ConfigurationControls() {
   readinessElement("cloneRateCardButton")?.addEventListener("click", () => runRateCardLifecycle("clone"));
   readinessElement("previewRateCardCsvButton")?.addEventListener("click", previewRateCardCsv);
   readinessElement("applyRateCardCsvButton")?.addEventListener("click", applyRateCardCsv);
-  readinessElement("customerChargeRateCardVersion")?.addEventListener("change", (event) => {
-    void loadCustomerChargeConfiguration(event.currentTarget.value);
-  });
-  readinessElement("addAggregateDistanceBandButton")?.addEventListener(
-    "click",
-    () => appendAggregateDistanceBandRow()
-  );
-  readinessElement("customerChargeConfigurationForm")?.addEventListener(
-    "submit",
-    saveCustomerChargeConfiguration
-  );
   document.querySelectorAll("[data-mbt-template-download]").forEach((link) => {
     link.addEventListener("click", downloadProtectedTemplate);
   });
@@ -2800,9 +2860,6 @@ function activateConfigurationTab(tab, { focus = false } = {}) {
       if (!phase3ConfigState.materialsLoaded) await loadMaterialsAndDumps();
       await loadRateCards();
     })();
-  }
-  if (tab.id === "customerChargesTab") {
-    void ensureCustomerChargeConfigurationLoaded();
   }
 }
 

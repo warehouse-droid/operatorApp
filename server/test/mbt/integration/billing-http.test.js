@@ -11,6 +11,7 @@ const VERSION_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const BATCH_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 const ROW_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 const SNAPSHOT_ID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+const CANDIDATE_ID = "eyJ2IjoxLCJraW5kIjoiZHJpdmVyIiwicGxhbklkIjpudWxsLCJsb2FkSWQiOiJMT0FELTEifQ";
 const ACTORS = Object.freeze({
   billing: Object.freeze({
     id: "p3-billing-http-operator",
@@ -64,6 +65,24 @@ const billingService = Object.freeze({
   },
   async generateMbbsShadowBillingFromSnapshots(input) {
     return commandResult("generate_mbbs", input, 201);
+  }
+});
+
+const candidateService = Object.freeze({
+  async listMbbsBillingCandidates(input) {
+    calls.push({ operation: "list_mbbs_candidates", input });
+    return { schemaVersion: "mbbs-billing-candidates-v1", postingMode: "local_only_preview", items: [] };
+  },
+  async previewMbbsBillingCandidate(input, dependencies) {
+    calls.push({ operation: "preview_mbbs_candidate", input, dependencies });
+    const route = await dependencies.resolveDistance({ originYardCode: "2967", destinationAddressText: "Toronto" });
+    return {
+      schemaVersion: "mbbs-billing-candidate-preview-v1",
+      postingMode: "local_only_preview",
+      externalWork: null,
+      distanceMetres: route.providerMetres,
+      charge: { itemCode: "DELIVERY_CHARGE_MBBS", amountMinor: 25000, currency: "CAD" }
+    };
   }
 });
 
@@ -140,8 +159,17 @@ before(async () => {
   app.use(authenticate);
   app.use("/api/mbt", createMbtRouter({
     billingService,
+    billingCandidateService: candidateService,
     reconciliationService,
     authorizePhase3Capability,
+    frontdeskPricing: {
+      async resolveDistance() {
+        return { providerMetres: 31_000 };
+      },
+      async resolveTaxPolicy() {
+        throw new Error("The MBBS preview must not resolve customer tax.");
+      }
+    },
     netSuiteTransport: async () => {
       throw new Error("P3.10 HTTP must remain local-only.");
     }
@@ -192,15 +220,21 @@ test("P3-F27 HTTP: a closed operational gate preserves read-only recovery and de
 
   const cases = await request("/api/mbt/billing/cases?status=ready&billingMonth=2037-08&limit=7", { actor: "billing" });
   const detail = await request(`/api/mbt/billing/cases/${CASE_ID}`, { actor: "billing" });
+  const candidates = await request("/api/mbt/billing/mbbs/candidates?limit=5", { actor: "billing" });
   const batches = await request("/api/mbt/reconciliation/batches?limit=5", { actor: "billing" });
   const batch = await request(`/api/mbt/reconciliation/batches/${BATCH_ID}`, { actor: "billing" });
-  for (const result of [cases, detail, batches, batch]) {
+  for (const result of [cases, detail, candidates, batches, batch]) {
     assert.equal(result.response.status, 200);
   }
   assert.deepEqual(calls.map(({ operation }) => operation), [
-    "list_cases", "get_case", "list_batches", "get_batch"
+    "list_cases", "get_case", "list_mbbs_candidates", "list_batches", "get_batch"
   ]);
   assert.equal(calls[0].input.billingMonth, "2037-08");
+
+  const deniedPreview = await request(`/api/mbt/billing/mbbs/candidates/${CANDIDATE_ID}/preview`, {
+    actor: "billing", method: "POST", body: {}
+  });
+  assert.equal(deniedPreview.response.status, 409);
 
   calls.length = 0;
   const denied = await request(`/api/mbt/billing/cases/${CASE_ID}/calculate`, {
@@ -212,6 +246,32 @@ test("P3-F27 HTTP: a closed operational gate preserves read-only recovery and de
   assert.equal(denied.response.status, 409);
   assert.equal(denied.payload.code, "MBT_CAPABILITY_DISABLED");
   assert.equal(calls.length, 0);
+});
+
+test("MBBS candidate HTTP lists retained completions and previews the exact active item locally", async () => {
+  const listed = await request("/api/mbt/billing/mbbs/candidates?limit=17", { actor: "billing" });
+  assert.equal(listed.response.status, 200, JSON.stringify(listed.payload));
+  assert.equal(calls[0].operation, "list_mbbs_candidates");
+  assert.equal(calls[0].input.limit, 17);
+  assert.deepEqual(calls[0].input.actor, {
+    operatorId: ACTORS.billing.id,
+    roles: ["mbt_billing"]
+  });
+
+  calls.length = 0;
+  const preview = await request(`/api/mbt/billing/mbbs/candidates/${CANDIDATE_ID}/preview`, {
+    actor: "billing",
+    method: "POST",
+    body: { candidateId: "forged" }
+  });
+  assert.equal(preview.response.status, 200, JSON.stringify(preview.payload));
+  assert.equal(preview.payload.charge.itemCode, "DELIVERY_CHARGE_MBBS");
+  assert.equal(preview.payload.postingMode, "local_only_preview");
+  assert.equal(preview.payload.externalWork, null);
+  assert.equal(calls[0].operation, "preview_mbbs_candidate");
+  assert.equal(calls[0].input.candidateId, CANDIDATE_ID);
+  assert.equal(calls[0].input.actor.operatorId, ACTORS.billing.id);
+  assert.equal(typeof calls[0].dependencies.resolveDistance, "function");
 });
 
 test("P3-F25/P3-F27 HTTP: enabled commands replace forged actor and bind exact request identity", async () => {

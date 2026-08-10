@@ -96,16 +96,20 @@ after(async () => {
   await closeDb();
 });
 
-test("F02/F15: Front Desk sees only its controlled Phase 1 surface", async () => {
+test("F02/F15: Front Desk sees its exact controlled server gate state", async () => {
   const own = await request("/api/mbt/frontdesk/status", { role: "mbt_frontdesk" });
   assert.equal(own.response.status, 200, JSON.stringify(own.payload));
   assert.deepEqual(own.payload, {
-    schemaVersion: "mbt-v1",
-    phase: 1,
+    schemaVersion: "mbt-frontdesk-status-v1",
+    phase: 3,
     surface: "frontdesk",
     enabled: false,
     code: "MBT_CAPABILITY_DISABLED",
-    message: "Front Desk operations are not enabled in Phase 1."
+    message: "Front Desk is disabled by the server environment setting.",
+    commandState: {
+      enabled: false,
+      reason: "environment_capability_disabled"
+    }
   });
 
   const billing = await request("/api/mbt/billing/status", { role: "mbt_frontdesk" });

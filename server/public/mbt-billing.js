@@ -2,6 +2,7 @@ const token = localStorage.getItem("mbbs.staff.token") || "";
 
 const state = {
   commandsEnabled: false,
+  mbbsCandidates: [],
   billingItems: [],
   billingCursor: null,
   reconciliationItems: [],
@@ -125,6 +126,112 @@ async function loadCommandState() {
     ? "Local calculation, reconciliation, and approval commands are enabled."
     : "Commands are closed; retained evidence is available read-only.";
   message("billingCommandMessage", `${suffix} No external posting path exists.`);
+}
+
+function mbbsReferenceText(candidate) {
+  return (candidate.references || [])
+    .map((reference) => `${reference.sourceType} ${reference.rootReference}`)
+    .join(", ") || "No retained order reference";
+}
+
+function mbbsCompletionTime(value) {
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime())
+    ? String(value || "—")
+    : new Intl.DateTimeFormat("en-CA", {
+      dateStyle: "medium",
+      timeStyle: "short",
+      timeZone: "America/Toronto"
+    }).format(parsed);
+}
+
+function mbbsSourceLabel(sourceSystem) {
+  return ({
+    driver_pwa: "Driver PWA",
+    reconciliation: "Reconciliation",
+    sales_order: "Sales Order"
+  })[sourceSystem] || "Completed order";
+}
+
+function renderMbbsCandidates() {
+  const rows = element("mbbsCandidateRows");
+  if (!rows) return;
+  const focusKey = retainedFocusKey();
+  rows.replaceChildren();
+  if (!state.mbbsCandidates.length) {
+    const row = document.createElement("tr");
+    const cell = textCell("No completed Driver PWA, reconciliation, or Sales Order candidates are available.");
+    cell.colSpan = 6;
+    row.append(cell);
+    rows.append(row);
+  }
+  for (const candidate of state.mbbsCandidates) {
+    const row = document.createElement("tr");
+    const action = candidate.chargeable
+      ? actionButton(
+        "Calculate charge",
+        `mbbs-candidate:${candidate.candidateId}`,
+        () => previewMbbsCandidate(candidate.candidateId),
+        { command: true }
+      )
+      : document.createTextNode("Evidence needed");
+    const actionColumn = document.createElement("td");
+    actionColumn.append(action);
+    row.append(
+      textCell(mbbsSourceLabel(candidate.sourceSystem)),
+      textCell(mbbsReferenceText(candidate)),
+      textCell(mbbsCompletionTime(candidate.completedAt)),
+      textCell(`${candidate.originLabel || "?"} → ${candidate.destinationLabel || "?"}`),
+      textCell(candidate.chargeable ? "Ready to calculate" : candidate.reason),
+      actionColumn
+    );
+    rows.append(row);
+  }
+  syncCommandButtons();
+  restoreFocus(focusKey, rows);
+}
+
+async function loadMbbsCandidates() {
+  message("mbbsCandidateMessage", "Loading completed Driver PWA, reconciliation, and Sales Order evidence…");
+  try {
+    const result = await api("/api/mbt/billing/mbbs/candidates?limit=100");
+    state.mbbsCandidates = Array.isArray(result.items) ? result.items : [];
+    renderMbbsCandidates();
+    const ready = state.mbbsCandidates.filter((candidate) => candidate.chargeable).length;
+    message(
+      "mbbsCandidateMessage",
+      `${state.mbbsCandidates.length} completed candidate(s) loaded; ${ready} ready for a local charge preview.`
+    );
+  } catch (error) {
+    message("mbbsCandidateMessage", error.message, "attention");
+  }
+}
+
+async function previewMbbsCandidate(candidateId) {
+  const output = element("mbbsCandidatePreview");
+  message("mbbsCandidateMessage", "Resolving the retained route and active MBBS rate…");
+  if (output) output.textContent = "";
+  try {
+    const result = await api(`/api/mbt/billing/mbbs/candidates/${encodeURIComponent(candidateId)}/preview`, {
+      method: "POST",
+      body: {}
+    });
+    if (result.postingMode !== "local_only_preview" || result.externalWork !== null) {
+      throw new Error("The server did not preserve the local-only MBBS preview boundary.");
+    }
+    if (output) {
+      output.textContent = [
+        `${result.charge.itemCode} · ${money(result.charge.amountMinor, result.charge.currency)}`,
+        `Distance: ${Number(result.distanceMetres).toLocaleString("en-CA")} m`,
+        `Band: ${Number(result.selectedBand.minimumMetres).toLocaleString("en-CA")}–${result.selectedBand.maximumMetres === null ? "open" : Number(result.selectedBand.maximumMetres).toLocaleString("en-CA")} m`,
+        "Local preview only · tax $0.00 · no NetSuite work created"
+      ].join("\n");
+    }
+    message("mbbsCandidateMessage", "Charge calculated locally from the active DELIVERY_CHARGE_MBBS rate.");
+  } catch (error) {
+    if (output) output.textContent = error.message;
+    message("mbbsCandidateMessage", error.message, "attention");
+  }
 }
 
 function billingQuery() {
@@ -499,6 +606,7 @@ async function resolveVariance(event) {
 }
 
 function bind() {
+  element("refreshMbbsCandidates")?.addEventListener("click", () => loadMbbsCandidates());
   element("refreshBillingCases")?.addEventListener("click", () => loadBillingCases());
   element("billingStatusFilter")?.addEventListener("change", () => loadBillingCases());
   element("billingTypeFilter")?.addEventListener("change", () => loadBillingCases());
@@ -522,7 +630,7 @@ async function load() {
   bind();
   try {
     await loadCommandState();
-    await Promise.all([loadBillingCases(), loadReconciliationBatches()]);
+    await Promise.all([loadMbbsCandidates(), loadBillingCases(), loadReconciliationBatches()]);
   } catch (error) {
     message("billingCommandMessage", error.message, "attention");
   }

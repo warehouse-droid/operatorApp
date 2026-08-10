@@ -75,7 +75,8 @@ const state = {
   extensionControls: {},
   serviceAction: null,
   serviceActionLineId: null,
-  serviceActionControls: {}
+  serviceActionControls: {},
+  disabledMessage: "Front Desk operations are disabled."
 };
 
 function commandIdentity(prefix) {
@@ -154,9 +155,22 @@ function fullAddress(site) {
     site?.region, site?.postalCode].filter(Boolean).join(", ");
 }
 
+function selectableServices(kind = state.chargeKind) {
+  const purpose = kind === "initial_bin"
+    ? "delivery"
+    : kind === "aggregate_order"
+      ? "aggregate_delivery"
+      : null;
+  return purpose
+    ? (state.configuration.services || []).filter((item) => item.serviceCode === purpose)
+    : state.configuration.services || [];
+}
+
 function selectedService() {
-  return state.configuration.services.find((item) => item.serviceCode === chargeServiceCode.value)
-    || state.configuration.services[0]
+  const services = selectableServices();
+  return services.find((item) => item.rateCardVersionId === chargeServiceCode.value)
+    || services.find((item) => item.serviceCode === chargeServiceCode.value)
+    || services[0]
     || null;
 }
 
@@ -175,16 +189,26 @@ function populateDeliverySelect(select) {
   if ([...select.options].some((option) => option.value === current)) select.value = current;
 }
 
+function populateChargeServiceOptions(kind = null) {
+  const services = selectableServices(kind);
+  chargeServiceCode.replaceChildren(new Option("Select an active rate card", ""));
+  for (const service of services) {
+    const label = [
+      service.rateCardDisplayName || service.displayName || service.serviceCode,
+      service.rateCardVersionNumber ? `v${service.rateCardVersionNumber}` : "",
+      service.serviceCode
+    ].filter(Boolean).join(" · ");
+    chargeServiceCode.append(new Option(label, service.rateCardVersionId));
+  }
+  if (services.length) {
+    chargeServiceCode.value = services[0].rateCardVersionId;
+  }
+}
+
 function populateConfiguration() {
   populateDeliverySelect(deliveryItemCode);
   populateDeliverySelect(chargeDeliveryItemCode);
-  chargeServiceCode.replaceChildren(new Option("Select a service", ""));
-  for (const service of state.configuration.services || []) {
-    chargeServiceCode.append(new Option(service.displayName || service.serviceCode, service.serviceCode));
-  }
-  if (state.configuration.services?.length === 1) {
-    chargeServiceCode.value = state.configuration.services[0].serviceCode;
-  }
+  populateChargeServiceOptions();
   syncOrderKindFields();
 }
 
@@ -517,6 +541,29 @@ async function loadChargeConfiguration(rateCardVersionId) {
   return state.chargeConfigurationByRate.get(rateCardVersionId);
 }
 
+async function syncChargeWorkflowConfiguration() {
+  try {
+    const service = selectedService();
+    if (!service) {
+      throw new Error("Select an active MBT rate card before pricing this request.");
+    }
+    const configuration = await loadChargeConfiguration(service.rateCardVersionId);
+    state.chargeRateCardVersionId = service.rateCardVersionId;
+    populateContentAndBins(
+      configuration,
+      binContentCode.value || "garbage",
+      chargeBinType.value
+    );
+    aggregateLineEditor.replaceChildren();
+    if (state.chargeKind === "aggregate_order") {
+      addAggregateRow();
+    }
+    setMessage(`Using ${service.rateCardDisplayName || service.displayName || service.serviceCode}.`);
+  } catch (error) {
+    setMessage(error.message, "attention");
+  }
+}
+
 function populateContentAndBins(configuration, requestedContent = "garbage", requestedBinItem = "") {
   binContentCode.replaceChildren();
   for (const content of configuration.binContents || []) {
@@ -608,17 +655,30 @@ async function openCustomerChargeDialog(line, kind) {
     setMessage("Select a customer and contract before pricing this request.", "attention");
     return;
   }
-  const service = state.configuration.services?.[0] || null;
-  const rateCardVersionId = ["initial_bin", "aggregate_order"].includes(kind)
+  const workflowIsSelectable = ["initial_bin", "aggregate_order"].includes(kind);
+  const service = workflowIsSelectable
+    ? selectableServices(kind)[0] || null
+    : (state.configuration.services || []).find(
+      (item) => item.rateCardVersionId === contractRateCardVersionId()
+    ) || null;
+  if (workflowIsSelectable && !service) {
+    setMessage("Activate an MBT rate card with a Front Desk workflow before pricing this request.", "attention");
+    return;
+  }
+  const rateCardVersionId = workflowIsSelectable
     ? service?.rateCardVersionId
     : contractRateCardVersionId();
   try {
-    const configuration = await loadChargeConfiguration(rateCardVersionId);
     state.chargeKind = kind;
     state.chargeLine = line;
     state.chargeRateCardVersionId = rateCardVersionId;
     state.chargeRequest = null;
     customerChargeForm.reset();
+    if (workflowIsSelectable) {
+      populateChargeServiceOptions(kind);
+      chargeServiceCode.value = service?.rateCardVersionId || "";
+    }
+    const configuration = await loadChargeConfiguration(rateCardVersionId);
     aggregateLineEditor.replaceChildren();
     customerChargeSummary.replaceChildren();
     customerChargeSummary.hidden = true;
@@ -628,7 +688,7 @@ async function openCustomerChargeDialog(line, kind) {
     const site = line?.site || state.serviceLines[0]?.site || state.selectedCustomer.sites?.[0] || {};
     serviceAddressText.value = fullAddress(site);
     billingAddressText.value = fullAddress(state.selectedCustomer.sites?.[0]) || serviceAddressText.value;
-    chargeServiceCode.value = service?.serviceCode || "";
+    chargeServiceCode.value = service?.rateCardVersionId || "";
     populateDeliverySelect(chargeDeliveryItemCode);
     chargeDeliveryItemCode.value = line?.pricing?.deliveryItemCode
       || state.contract?.pricing?.deliveryItemCode
@@ -1051,7 +1111,7 @@ async function saveServiceLineAction(event) {
 
 function openNewContractOrderDialog() {
   if (!state.enabled) {
-    setMessage("Front Desk operations are closed by the server safety gate.", "attention");
+    setMessage(state.disabledMessage, "attention");
     return;
   }
   if (!state.selectedCustomer) {
@@ -1073,20 +1133,21 @@ function disableCommandSurfaces() {
 
 async function initialize() {
   try {
-    const [status, configuration] = await Promise.all([
-      api("/api/mbt/frontdesk/status"),
-      api("/api/mbt/frontdesk/configuration")
-    ]);
+    const status = await api("/api/mbt/frontdesk/status");
     state.enabled = status.enabled === true;
+    if (!state.enabled) {
+      const gateReason = status.commandState?.reason;
+      state.disabledMessage = status.message
+        || `Front Desk is disabled by the server safety gate${gateReason ? ` (${gateReason})` : ""}.`;
+      disableCommandSurfaces();
+      openNewContractOrder.disabled = true;
+      setMessage(state.disabledMessage, "attention");
+      return;
+    }
+    const configuration = await api("/api/mbt/frontdesk/configuration");
     state.configuration = configuration;
     populateConfiguration();
     renderContractMaster();
-    if (!state.enabled) {
-      disableCommandSurfaces();
-      openNewContractOrder.disabled = true;
-      setMessage("Front Desk operations are closed by the server safety gate.", "attention");
-      return;
-    }
     setMessage("Front Desk is ready. Cash stays local; non-cash HST is calculated once. NetSuite posting is not enabled.");
   } catch (error) {
     disableCommandSurfaces();
@@ -1110,6 +1171,7 @@ orderKind.addEventListener("change", syncOrderKindFields);
 openNewContractOrder.addEventListener("click", openNewContractOrderDialog);
 byId("closeNewContractOrder").addEventListener("click", () => newContractDialog.close());
 customerChargeForm.addEventListener("submit", previewCustomerChargeRequest);
+chargeServiceCode.addEventListener("change", syncChargeWorkflowConfiguration);
 confirmCustomerCharge.addEventListener("click", confirmCustomerChargeRequest);
 byId("closeCustomerCharge").addEventListener("click", () => customerChargeDialog.close());
 addAggregateLine.addEventListener("click", () => addAggregateRow());

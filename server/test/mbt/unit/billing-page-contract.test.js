@@ -13,6 +13,9 @@ test("P3-F23–P3-F28 billing page exposes local-only case, evidence, allocation
   assert.match(html, /No outbox or NetSuite transport/i);
   assert.match(html, /Billing case queue/i);
   assert.match(html, /Calculation evidence and versions/i);
+  assert.match(html, /Completed MBBS order candidates/i);
+  assert.match(html, /Driver PWA and reconciliation/i);
+  assert.match(html, /DELIVERY_CHARGE_MBBS/u);
   assert.match(html, /MBBS cross-charge generation/i);
   assert.match(html, /completed-load snapshot IDs/i);
   assert.match(html, /caller-authored loads are rejected/i);
@@ -27,6 +30,9 @@ test("P3-F27 browser contract keeps reads available while disabling every comman
   assert.match(script, /querySelectorAll\(["']\.mbt-command["']\)/u);
   assert.match(script, /button\.disabled\s*=\s*!state\.commandsEnabled/u);
   assert.match(script, /\/api\/mbt\/billing\/cases/u);
+  assert.match(script, /\/api\/mbt\/billing\/mbbs\/candidates/u);
+  assert.match(script, /\/candidates\/\$\{encodeURIComponent\(candidateId\)\}\/preview/u);
+  assert.match(script, /local_only_preview/u);
   assert.match(script, /\/api\/mbt\/reconciliation\/batches/u);
 });
 

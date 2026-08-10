@@ -528,7 +528,10 @@ export async function getFrontdeskConfiguration(input) {
               t.display_name,
               tv.template_version_id::text,
               tv.default_rental_calendar_days::int,
-              rv.rate_card_version_id::text
+              rv.rate_card_version_id::text,
+              rv.version_number::int AS rate_card_version_number,
+              r.rate_card_code,
+              r.display_name AS rate_card_display_name
          FROM mbt_rate_distance_bands d
          JOIN mbt_rate_card_versions rv
            ON rv.rate_card_version_id = d.rate_card_version_id
@@ -542,6 +545,7 @@ export async function getFrontdeskConfiguration(input) {
          JOIN mbt_service_template_versions tv
            ON tv.template_id = t.template_id
           AND tv.status = 'active'
+        WHERE d.service_code IN ('delivery', 'aggregate_delivery')
         ORDER BY d.service_code, tv.template_version_id,
                  rv.rate_card_version_id, d.sequence_number`
     )
@@ -584,6 +588,9 @@ export async function getFrontdeskConfiguration(input) {
       displayName: String(row.display_name),
       templateVersionId: String(row.template_version_id),
       rateCardVersionId: String(row.rate_card_version_id),
+      rateCardVersionNumber: Number(row.rate_card_version_number),
+      rateCardCode: String(row.rate_card_code),
+      rateCardDisplayName: String(row.rate_card_display_name),
       defaultRentalCalendarDays: Number(row.default_rental_calendar_days)
     }))
   };

@@ -396,7 +396,7 @@ async function completeSyntheticConversion(page) {
   await pricingDialog.getByRole("combobox", { name: "Payment method" }).selectOption("cash");
   await pricingDialog.getByRole("combobox", { name: "Contents" }).selectOption("garbage");
   await pricingDialog.getByRole("combobox", { name: "BIN item" }).selectOption("14YD");
-  await pricingDialog.getByRole("combobox", { name: "BIN workflow" }).selectOption("delivery");
+  await expect(pricingDialog.getByRole("combobox", { name: "Rate card / workflow" })).toHaveValue(RATE_VERSION_ID);
   await pricingDialog.getByRole("combobox", { name: "One-way delivery fee" }).selectOption("DELIVERY_CROSS_CHARGE");
   await pricingDialog.getByLabel("Delivery date and time").fill("2037-08-03T12:00");
   await pricingDialog.getByLabel("Return date and time").fill("2037-08-17T12:00");

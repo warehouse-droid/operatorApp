@@ -3,6 +3,7 @@ import express from "express";
 import test, { after, before, beforeEach } from "node:test";
 
 import { closeDb } from "../../../src/db.js";
+import { config } from "../../../src/config.js";
 import { MbtError } from "../../../src/mbt/errors.js";
 import { createMbtRouter } from "../../../src/mbt/router.js";
 
@@ -132,7 +133,8 @@ async function authorizePhase3Capability({ capability }) {
     throw new MbtError({
       status: 409,
       code: "MBT_CAPABILITY_DISABLED",
-      message: "This MBT capability is disabled."
+      message: "This MBT capability is disabled.",
+      details: { capability: "frontdesk_operations", reason: "database_capability_disabled" }
     });
   }
 }
@@ -219,6 +221,38 @@ test("P3-F13 HTTP: private reads are role-bound, no-store, and capability-gated"
   assert.equal(disabled.response.status, 409);
   assert.equal(disabled.payload.code, "MBT_CAPABILITY_DISABLED");
   assert.equal(calls.length, 0);
+});
+
+test("Front Desk status reports the effective gate and its exact blocking reason", async () => {
+  const beforeFlags = {
+    root: config.mbt.enabled,
+    frontdesk: config.mbtPhase3.frontdeskOperationsEnabled
+  };
+  config.mbt.enabled = true;
+  config.mbtPhase3.frontdeskOperationsEnabled = true;
+  try {
+    const enabled = await request("/api/mbt/frontdesk/status", { actor: "frontdesk" });
+    assert.equal(enabled.response.status, 200);
+    assert.equal(enabled.payload.enabled, true);
+    assert.deepEqual(enabled.payload.commandState, { enabled: true, reason: null });
+
+    capabilityAllowed = false;
+    const databaseClosed = await request("/api/mbt/frontdesk/status", { actor: "frontdesk" });
+    assert.equal(databaseClosed.response.status, 200);
+    assert.equal(databaseClosed.payload.enabled, false);
+    assert.equal(databaseClosed.payload.commandState.reason, "database_capability_disabled");
+    assert.match(databaseClosed.payload.message, /database safety flag/i);
+
+    capabilityAllowed = true;
+    config.mbtPhase3.frontdeskOperationsEnabled = false;
+    const environmentClosed = await request("/api/mbt/frontdesk/status", { actor: "frontdesk" });
+    assert.equal(environmentClosed.payload.enabled, false);
+    assert.equal(environmentClosed.payload.commandState.reason, "environment_capability_disabled");
+    assert.match(environmentClosed.payload.message, /server environment/i);
+  } finally {
+    config.mbt.enabled = beforeFlags.root;
+    config.mbtPhase3.frontdeskOperationsEnabled = beforeFlags.frontdesk;
+  }
 });
 
 test("P3-F13 HTTP: quote commands bind server actor, pricing adapters, and idempotency", async () => {

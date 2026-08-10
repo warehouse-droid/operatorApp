@@ -27,6 +27,7 @@ const LOCAL_ITEMS = Object.freeze([
     displayName: "Delivery Charge - MBT",
     description: "Item-owned delivery and cross-charge distance bands.",
     itemType: "delivery_fee",
+    chargeBasis: "distance",
     rentalPeriodDays: null,
     priceMode: "rate_card",
     binTypeCode: null,
@@ -39,9 +40,11 @@ const LOCAL_ITEMS = Object.freeze([
     displayName: "14 yard bin",
     description: "Fixed rental period and daily extension.",
     itemType: "bin",
+    chargeBasis: "rental_period",
     rentalPeriodDays: 14,
     priceMode: "rental_item",
     binTypeCode: "14YD",
+    binCapacityYards: 14,
     localReady: true,
     active: true,
     revision: 1
@@ -51,6 +54,7 @@ const LOCAL_ITEMS = Object.freeze([
     displayName: "Mixed waste",
     description: "Customer dump charge per tonne.",
     itemType: "dump",
+    chargeBasis: "per_tonne",
     rentalPeriodDays: null,
     priceMode: "rate_card",
     binTypeCode: null,
@@ -63,6 +67,7 @@ const LOCAL_ITEMS = Object.freeze([
     displayName: "Downtown surcharge",
     description: "Manually added surcharge.",
     itemType: "surcharge",
+    chargeBasis: "per_event",
     rentalPeriodDays: null,
     priceMode: "manual",
     binTypeCode: null,
@@ -81,7 +86,8 @@ const DUMP_SITE = Object.freeze({
   postalCode: "M1M 1M1",
   revision: 4,
   active: true,
-  dumpItems: [{ itemCode: "DUMP_MIXED", accepted: true, scaleTicketRequired: true }]
+  dumpItems: [{ itemCode: "DUMP_MIXED", accepted: true, scaleTicketRequired: true }],
+  openingHours: [{ isoWeekday: 1, opensAt: "07:00", closesAt: "17:00" }]
 });
 
 function graph() {
@@ -223,9 +229,9 @@ test("P4-R3 browser: a named draft edits each item through only its charging mec
   const pricingItem = panel.getByLabel("Pricing item");
   await expect(pricingItem.locator("option")).toHaveText([
     "Select a local item",
-    "Delivery Charge - MBT · Delivery fee",
-    "14 yard bin · Bin · 14YD",
-    "Mixed waste · Dump",
+    "Delivery Charge - MBT · Delivery fee · configured",
+    "14 yard bin · Bin · 14 cubic yards · configured",
+    "Mixed waste · Dump · configured",
     "Downtown surcharge · Surcharge"
   ]);
   await expect(pricingItem).toHaveValue("DELIVERY_CROSS_CHARGE");
@@ -249,6 +255,7 @@ test("P4-R3 browser: a named draft edits each item through only its charging mec
   await pricingItem.selectOption("DOWNTOWN_SURCHARGE");
   await expect(panel.locator("#rateItemEditor")).toContainText("added manually");
 
+  await panel.getByLabel("Update note").fill("Update the item-owned browser pricing fixture");
   await panel.getByRole("button", { name: "Save draft changes" }).click();
   await expect(panel.locator("#rateCardsMessage")).toContainText("Draft changes saved");
   expect(calls[0]).toMatchObject({ method: "PUT", path: `/api/mbt/config/rate-cards/${VERSION_ID}` });
@@ -282,32 +289,38 @@ test("P4-R3 browser: dump sites select item-owned dump charges for create and op
   await expect(panel).toBeVisible();
 
   await panel.locator("#dumpSiteRows").getByRole("button", { name: "Edit" }).click();
-  const acceptedItem = panel.getByLabel("Accepted dump item");
-  await expect(acceptedItem).toHaveValue("DUMP_MIXED");
-  await expect(acceptedItem.locator("option:checked")).toHaveText("Mixed waste · DUMP_MIXED");
-  await panel.getByLabel("Scale ticket required").uncheck();
+  const acceptedItem = panel.locator('[data-dump-acceptance-item][value="DUMP_MIXED"]');
+  await expect(acceptedItem).toBeChecked();
+  await panel.locator('[data-dump-ticket-item="DUMP_MIXED"]').uncheck();
+  await panel.getByLabel("Update note").fill("Use the item-owned dump acceptance fixture");
   await panel.getByRole("button", { name: "Update dump site" }).click();
   await expect(panel.locator("#masterDataMessage")).toContainText("Dump site updated");
   expect(calls.find(({ path }) => path === "/api/mbt/config/dump-sites")).toMatchObject({
     method: "POST",
-    body: {
+    body: expect.objectContaining({
       dumpSiteCode: "NORTH_DUMP",
-      itemCode: "DUMP_MIXED",
-      scaleTicketRequired: false,
+      itemAcceptances: [expect.objectContaining({
+        itemCode: "DUMP_MIXED",
+        scaleTicketRequired: false
+      })],
       expectedRevision: 4
-    }
+    })
   });
 
   await panel.getByRole("button", { name: "New dump site" }).click();
   await panel.getByLabel("Code", { exact: true }).fill("WEST_DUMP");
   await panel.getByLabel("Name", { exact: true }).fill("West dump site");
-  await panel.getByLabel("Accepted dump item").selectOption("DUMP_MIXED");
+  await panel.locator('[data-dump-acceptance-item][value="DUMP_MIXED"]').check();
   await panel.getByRole("button", { name: "Create dump site" }).click();
   await expect(panel.locator("#masterDataMessage")).toContainText("Dump site created");
   const dumpCreates = calls.filter(({ path }) => path === "/api/mbt/config/dump-sites");
   expect(dumpCreates[1]).toMatchObject({
     method: "POST",
-    body: { dumpSiteCode: "WEST_DUMP", displayName: "West dump site", itemCode: "DUMP_MIXED" }
+    body: {
+      dumpSiteCode: "WEST_DUMP",
+      displayName: "West dump site",
+      itemAcceptances: [expect.objectContaining({ itemCode: "DUMP_MIXED" })]
+    }
   });
   expect(dumpCreates[1].body).not.toHaveProperty("expectedRevision");
 });

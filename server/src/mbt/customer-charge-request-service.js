@@ -344,6 +344,65 @@ async function configuredChargeCatalog(rateCardVersionId) {
 }
 
 /**
+ * Current customer prices come from the same item-owned rows edited on the
+ * Rate Cards tab. The migration-142 catalog remains a historical fallback for
+ * already configured cards, but is no longer a second configuration source.
+ * @param {string} rateCardVersionId
+ */
+async function itemOwnedCustomerRates(rateCardVersionId) {
+  const result = await query(
+    `SELECT item.item_code, item.display_name, item.description, item.item_type,
+            item.charge_basis, item.density_lbs_per_yard,
+            item.netsuite_mapping_local_key,
+            tariff.amount_minor, tariff.currency, tariff.unit_of_measure,
+            tariff.pricing_basis
+       FROM mbt_local_item_settings item
+       JOIN mbt_dump_tariffs tariff
+         ON tariff.item_code = item.item_code
+        AND tariff.rate_card_version_id = $1::uuid
+        AND tariff.active
+        AND tariff.dump_site_id IS NULL
+      WHERE item.active
+        AND (
+          (item.item_type = 'aggregate' AND item.charge_basis = 'per_yard'
+            AND tariff.pricing_basis = 'per_quantity' AND upper(tariff.unit_of_measure) = 'YARD')
+          OR
+          (item.item_type = 'dump' AND item.charge_basis = 'per_bin'
+            AND tariff.pricing_basis = 'per_quantity' AND upper(tariff.unit_of_measure) = 'BIN')
+        )
+      ORDER BY item.item_code, tariff.tariff_code`,
+    [rateCardVersionId]
+  );
+  return result.rows;
+}
+
+/** @param {string} itemCodeValue */
+function dumpContentCode(itemCodeValue) {
+  const normalized = String(itemCodeValue).toLowerCase().replace(/^dump_/u, "");
+  for (const content of ["soil", "asphalt", "concrete"]) {
+    if (new RegExp(`(?:^|_)${content}(?:_|$)`, "u").test(normalized)) {
+      return content;
+    }
+  }
+  return normalized;
+}
+
+/** @param {string} rateCardVersionId */
+async function itemOwnedAggregateDistanceBands(rateCardVersionId) {
+  const result = await query(
+    `SELECT rate_distance_band_id::text, item_code, sequence_number::int,
+            minimum_metres::int, maximum_metres::int, amount_minor,
+            pricing_basis, currency, description
+       FROM mbt_rate_distance_bands
+      WHERE rate_card_version_id = $1::uuid
+        AND service_code = 'aggregate_delivery'
+      ORDER BY item_code, sequence_number, rate_distance_band_id`,
+    [rateCardVersionId]
+  );
+  return result.rows;
+}
+
+/**
  * Return only complete active configuration. Inactive seeded definitions stay
  * visible in the MBT database but cannot leak into Front Desk pricing.
  *
@@ -353,8 +412,12 @@ export async function getFrontdeskCustomerChargeConfiguration(input) {
   assertFrontdeskActor(/** @type {any} */ (input.actor));
   const rateCardVersionId = requiredUuid(input.rateCardVersionId, "Rate card version ID");
   await assertActiveRateVersion(rateCardVersionId);
-  const { configuration, catalog, bands } = await configuredChargeCatalog(rateCardVersionId);
-  const aggregateItems = catalog
+  const [{ configuration, catalog, bands }, itemRates, itemBands] = await Promise.all([
+    configuredChargeCatalog(rateCardVersionId),
+    itemOwnedCustomerRates(rateCardVersionId),
+    itemOwnedAggregateDistanceBands(rateCardVersionId)
+  ]);
+  const legacyAggregateItems = catalog
     .filter((/** @type {any} */ row) => row.item_kind === "aggregate_material"
       && row.charge_rate_id && Number(row.density_lbs_per_yard) > 0)
     .map((/** @type {any} */ row) => ({
@@ -368,7 +431,7 @@ export async function getFrontdeskCustomerChargeConfiguration(input) {
         ? String(row.netsuite_mapping_local_key)
         : null
     }));
-  const fixedDumpItems = catalog
+  const legacyFixedDumpItems = catalog
     .filter((/** @type {any} */ row) => row.item_kind === "fixed_dump" && row.charge_rate_id)
     .map((/** @type {any} */ row) => ({
       itemCode: String(row.item_code),
@@ -377,12 +440,35 @@ export async function getFrontdeskCustomerChargeConfiguration(input) {
       unitOfMeasure: "BIN",
       amountMinor: Number(row.amount_minor)
     }));
+  const dynamicAggregateItems = itemRates
+    .filter((/** @type {any} */ row) => row.item_type === "aggregate")
+    .map((/** @type {any} */ row) => ({
+      itemCode: String(row.item_code),
+      displayName: String(row.display_name),
+      description: String(row.description || ""),
+      unitOfMeasure: "YARD",
+      unitAmountMinor: Number(row.amount_minor),
+      densityLbsPerYard: Number(row.density_lbs_per_yard),
+      netsuiteMappingLocalKey: row.netsuite_mapping_local_key ? String(row.netsuite_mapping_local_key) : null
+    }));
+  const dynamicFixedDumpItems = itemRates
+    .filter((/** @type {any} */ row) => row.item_type === "dump")
+    .map((/** @type {any} */ row) => ({
+      itemCode: String(row.item_code),
+      displayName: String(row.display_name),
+      contentCode: dumpContentCode(row.item_code),
+      unitOfMeasure: "BIN",
+      amountMinor: Number(row.amount_minor)
+    }));
+  const aggregateItems = dynamicAggregateItems.length ? dynamicAggregateItems : legacyAggregateItems;
+  const fixedDumpItems = dynamicFixedDumpItems.length ? dynamicFixedDumpItems : legacyFixedDumpItems;
   const loading = catalog.find((/** @type {any} */ row) => row.item_kind === "loading_fee");
+  const aggregateDistanceRows = itemBands.length ? itemBands : bands;
   return {
     schemaVersion: "mbt-frontdesk-customer-charge-configuration-v1",
     rateCardVersionId,
     configurationRevision: Number(configuration?.revision || 0),
-    complete: configuration?.complete === true,
+    complete: configuration?.complete === true || itemRates.length > 0 || itemBands.length > 0,
     paymentMethods: ["cash", "card", "debit", "e_transfer", "cheque", "account"],
     binContents: [
       { contentCode: "garbage", displayName: "Garbage", allowedBinSizesYards: [14, 20, 40], dumpPricing: "none" },
@@ -395,9 +481,9 @@ export async function getFrontdeskCustomerChargeConfiguration(input) {
     aggregateLoadingFeeMinor: loading
       ? Number(loading.amount_minor ?? loading.default_amount_minor ?? 0)
       : null,
-    aggregateDistanceBands: bands.map((/** @type {any} */ row) => ({
-      aggregateDistanceBandId: String(row.aggregate_distance_band_id),
-      bandCode: String(row.band_code),
+    aggregateDistanceBands: aggregateDistanceRows.map((/** @type {any} */ row) => ({
+      aggregateDistanceBandId: String(row.aggregate_distance_band_id || row.rate_distance_band_id),
+      bandCode: String(row.band_code || `${row.item_code || "AGG_DELIVERY"}_${row.sequence_number}`),
       minimumMetres: Number(row.minimum_metres),
       maximumMetres: row.maximum_metres === null ? null : Number(row.maximum_metres),
       amountMinor: Number(row.amount_minor),
@@ -701,8 +787,27 @@ async function aggregateRateLines(input, rateCardVersionId) {
   if (new Set(requested.map((line) => line.itemCode)).size !== requested.length) {
     throw failure(400, "MBT_FRONTDESK_AGGREGATE_DUPLICATE", "Aggregate material lines must be distinct.");
   }
-  const selected = await query(
-    `SELECT catalog.item_code, catalog.display_name, catalog.density_lbs_per_yard,
+  let selected = await query(
+    `SELECT item.item_code, item.display_name, item.density_lbs_per_yard,
+            tariff.amount_minor, tariff.currency
+       FROM mbt_local_item_settings item
+       JOIN mbt_dump_tariffs tariff
+         ON tariff.item_code = item.item_code
+        AND tariff.rate_card_version_id = $2::uuid
+        AND tariff.active
+        AND tariff.dump_site_id IS NULL
+      WHERE item.item_code = ANY($1::text[])
+        AND item.item_type = 'aggregate'
+        AND item.charge_basis = 'per_yard'
+        AND item.active
+        AND item.density_lbs_per_yard > 0
+        AND tariff.pricing_basis = 'per_quantity'
+        AND upper(tariff.unit_of_measure) = 'YARD'`,
+    [requested.map((line) => line.itemCode), rateCardVersionId]
+  );
+  if (selected.rowCount !== requested.length) {
+    selected = await query(
+      `SELECT catalog.item_code, catalog.display_name, catalog.density_lbs_per_yard,
             rate.amount_minor, rate.currency
        FROM mbt_frontdesk_charge_catalog catalog
        JOIN mbt_frontdesk_charge_rates rate
@@ -714,8 +819,9 @@ async function aggregateRateLines(input, rateCardVersionId) {
         AND catalog.active
         AND catalog.unit_of_measure = 'YARD'
         AND catalog.density_lbs_per_yard > 0`,
-    [requested.map((line) => line.itemCode), rateCardVersionId]
-  );
+      [requested.map((line) => line.itemCode), rateCardVersionId]
+    );
+  }
   if (selected.rowCount !== requested.length) {
     throw failure(422, "MBT_FRONTDESK_AGGREGATE_RATE_MISSING", "Every aggregate material needs an active MBT per-yard rate and density.");
   }
@@ -737,18 +843,31 @@ async function aggregateRateLines(input, rateCardVersionId) {
 
 /** @param {string} rateCardVersionId */
 async function aggregateDistanceBands(rateCardVersionId) {
-  const result = await query(
-    `SELECT band_code, minimum_metres::int, maximum_metres::int, amount_minor
+  let result = await query(
+    `SELECT rate_distance_band_id::text AS band_code,
+            minimum_metres::int, maximum_metres::int, amount_minor,
+            pricing_basis
+       FROM mbt_rate_distance_bands
+      WHERE rate_card_version_id = $1::uuid
+        AND service_code = 'aggregate_delivery'
+      ORDER BY item_code, sequence_number, rate_distance_band_id`,
+    [rateCardVersionId]
+  );
+  if (!result.rowCount) {
+    result = await query(
+      `SELECT band_code, minimum_metres::int, maximum_metres::int, amount_minor
        FROM mbt_frontdesk_aggregate_distance_bands
       WHERE rate_card_version_id = $1::uuid AND active
       ORDER BY sequence_number, aggregate_distance_band_id`,
-    [rateCardVersionId]
-  );
+      [rateCardVersionId]
+    );
+  }
   return result.rows.map((/** @type {any} */ row) => ({
     bandCode: String(row.band_code),
     minimumMetres: Number(row.minimum_metres),
     maximumMetres: row.maximum_metres === null ? null : Number(row.maximum_metres),
-    amountMinor: Number(row.amount_minor)
+    amountMinor: Number(row.amount_minor),
+    ...(row.pricing_basis ? { pricingBasis: String(row.pricing_basis) } : {})
   }));
 }
 
@@ -876,6 +995,31 @@ function normalizedBinRequest(input) {
 async function selectFixedDumpRate(incomingContentCode, rateCardVersionId) {
   if (incomingContentCode === "garbage") {
     return { rowCount: 0, rows: [] };
+  }
+  const dynamic = await query(
+    `SELECT item.item_code, tariff.amount_minor
+       FROM mbt_local_item_settings item
+       JOIN mbt_dump_tariffs tariff
+         ON tariff.item_code = item.item_code
+        AND tariff.rate_card_version_id = $2::uuid
+        AND tariff.active
+        AND tariff.dump_site_id IS NULL
+      WHERE item.item_type = 'dump'
+        AND item.charge_basis = 'per_bin'
+        AND item.active
+        AND tariff.pricing_basis = 'per_quantity'
+        AND upper(tariff.unit_of_measure) = 'BIN'
+        AND (
+          lower(item.item_code) = $1
+          OR lower(item.item_code) = 'dump_' || $1
+          OR lower(item.item_code) ~ ('(^|_)' || $1 || '(_|$)')
+        )
+      ORDER BY item.item_code, tariff.tariff_code
+      LIMIT 2`,
+    [incomingContentCode, rateCardVersionId]
+  );
+  if (dynamic.rowCount) {
+    return dynamic;
   }
   return query(
     `SELECT catalog.item_code, rate.amount_minor

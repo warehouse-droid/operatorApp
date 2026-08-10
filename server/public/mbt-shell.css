@@ -1047,6 +1047,10 @@ body[data-mbt-surface="gates"] .mbt-shell {
   margin-top: 22px;
 }
 
+.mbt-config-columns > * {
+  min-width: 0;
+}
+
 .mbt-rate-card {
   align-items: start;
 }
@@ -1284,7 +1288,11 @@ body[data-mbt-surface="gates"] .mbt-shell {
   }
 
   .mbt-config-columns {
-    grid-template-columns: 1fr;
+    display: block;
+  }
+
+  .mbt-config-columns > * + * {
+    margin-top: 18px;
   }
 
   .mbt-runtime-binding .mbt-runtime-wide {

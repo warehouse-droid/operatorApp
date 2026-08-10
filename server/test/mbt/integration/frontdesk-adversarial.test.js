@@ -174,6 +174,15 @@ test("P3-F13 adversarial: pilot scoping, limiting, and active configuration rema
       && service.rateCardVersionId === first.rateCardVersionId
       && service.serviceCode === "delivery"
   )));
+  assert.ok(configuration.services.some((service) => (
+    service.templateVersionId === second.templateVersionId
+      && service.rateCardVersionId === second.rateCardVersionId
+      && service.serviceCode === "delivery"
+  )));
+  assert.equal(configuration.services.some(({ serviceCode }) => serviceCode === "mbbs_cross_charge"), false);
+  assert.ok(configuration.services.every((service) => (
+    service.rateCardDisplayName && service.rateCardCode && service.rateCardVersionNumber > 0
+  )));
 });
 
 test("P3-F13 adversarial: incomplete and inactive canonical configuration cannot quote", async () => {

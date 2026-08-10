@@ -6,6 +6,7 @@ import { isIP } from "node:net";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { config, isNetSuiteSandboxEnvironment, listEnvFiles, selectEnvFile } from "./config.js";
 import { createMbtRouter } from "./mbt/router.js";
+import { createFrontdeskPricingAdapter } from "./mbt/frontdesk-pricing-adapter.js";
 import { confirmMbtBinDispatchPlan } from "./mbt/bin-dispatch-service.js";
 import { binDispatchOrders } from "./mbt/dispatch-bin-safety.js";
 import { authorizeMbtPhase3Capability } from "./mbt/phase3-authorization.js";
@@ -8754,7 +8755,9 @@ app.get("/api/sales/public-access", async (_req, res, next) => {
 app.use("/api/scm", requireOperator, requireScmAccess);
 app.use("/api/dispatch", requireOperatorOrPublicSalesRead, requireDispatchAccess);
 app.use("/api/sales", requireSalesOperator, requireSalesAccess);
-app.use("/api/mbt", requireOperator, createMbtRouter());
+app.use("/api/mbt", requireOperator, createMbtRouter({
+  frontdeskPricing: createFrontdeskPricingAdapter({ apiKey: config.googleMapsApiKey })
+}));
 
 app.get("/api/dispatch/offline-review/count", requireDispatcher, async (_req, res, next) => {
   try {

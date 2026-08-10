@@ -31,6 +31,24 @@
         <span>No outbox or NetSuite transport</span>
       </section>
 
+      <section class="mbt-panel" aria-labelledby="mbbsCandidateTitle">
+        <div class="mbt-panel-heading">
+          <div>
+            <h2 id="mbbsCandidateTitle">Completed MBBS order candidates</h2>
+            <p>Driver PWA and reconciliation completions are read locally. Calculate the chargeable amount from the active <code>DELIVERY_CHARGE_MBBS</code> rate without changing operational records or creating NetSuite work.</p>
+          </div>
+          <button id="refreshMbbsCandidates" type="button">Refresh completed orders</button>
+        </div>
+        <p id="mbbsCandidateMessage" class="mbt-inline-message" role="status" aria-live="polite"></p>
+        <div class="mbt-table-wrap" tabindex="0" aria-label="Scrollable completed MBBS order candidates">
+          <table>
+            <thead><tr><th scope="col">Completion source</th><th scope="col">Order reference</th><th scope="col">Completed</th><th scope="col">Route</th><th scope="col">Readiness</th><th scope="col">Action</th></tr></thead>
+            <tbody id="mbbsCandidateRows"></tbody>
+          </table>
+        </div>
+        <pre id="mbbsCandidatePreview" class="mbt-json-result" aria-live="polite"></pre>
+      </section>
+
       <section class="mbt-panel" aria-labelledby="billingQueueTitle">
         <div class="mbt-panel-heading">
           <div>

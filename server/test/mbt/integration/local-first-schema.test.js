@@ -34,7 +34,9 @@ test("LC01/LC03-R1: local item schema owns item type and rental period without d
     "applicable_service_types",
     "applicable_legacy_source_types",
     "item_type",
-    "rental_period_days"
+    "rental_period_days",
+    "charge_basis",
+    "density_lbs_per_yard"
   ]);
   const forbidden = new Set([
     "default_unit_amount_minor",

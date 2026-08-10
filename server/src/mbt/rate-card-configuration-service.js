@@ -545,7 +545,7 @@ async function resolveGraphReferences(graph) {
     ...graph.dumpTariffs.map((/** @type {Record<string, any>} */ row) => row.itemCode)
   ].filter(Boolean))];
   const items = await query(
-    `SELECT item_code, item_type, bin_type_id::text
+    `SELECT item_code, item_type, charge_basis, bin_type_id::text
        FROM mbt_local_item_settings
       WHERE active AND item_code = ANY($1::text[])`,
     [itemCodes]
@@ -556,12 +556,6 @@ async function resolveGraphReferences(graph) {
   const yards = await query(
     "SELECT yard_code FROM mbt_yards WHERE active AND yard_code = ANY($1::text[])",
     [yardCodes]
-  );
-  const materials = await query(
-    "SELECT material_code, material_id::text FROM mbt_materials WHERE active AND material_code = ANY($1::text[])",
-    [[...new Set(graph.dumpTariffs.map(
-      (/** @type {Record<string, any>} */ row) => row.materialCode || row.itemCode
-    ).filter(Boolean))]]
   );
   const template = await query(
     "SELECT template_id::text FROM mbt_service_templates WHERE active AND template_code = $1",
@@ -575,13 +569,21 @@ async function resolveGraphReferences(graph) {
     row.dump_site_code,
     row.dump_site_id
   ]));
+  const localItems = new Map(items.rows.map((/** @type {Record<string, any>} */ row) => [
+    row.item_code,
+    { itemType: row.item_type, chargeBasis: row.charge_basis, binTypeId: row.bin_type_id }
+  ]));
+  const materialCodes = [...new Set(graph.dumpTariffs.map(
+    (/** @type {Record<string, any>} */ row) => row.materialCode
+      || (localItems.get(row.itemCode)?.itemType === "dump" ? row.itemCode : null)
+  ).filter(Boolean))];
+  const materials = await query(
+    "SELECT material_code, material_id::text FROM mbt_materials WHERE active AND material_code = ANY($1::text[])",
+    [materialCodes]
+  );
   const materialTypes = new Map(materials.rows.map((/** @type {Record<string, any>} */ row) => [
     row.material_code,
     row.material_id
-  ]));
-  const localItems = new Map(items.rows.map((/** @type {Record<string, any>} */ row) => [
-    row.item_code,
-    { itemType: row.item_type, binTypeId: row.bin_type_id }
   ]));
   const activeYardCodes = new Set(yards.rows.map(
     (/** @type {Record<string, any>} */ row) => String(row.yard_code)
@@ -590,18 +592,35 @@ async function resolveGraphReferences(graph) {
     || graph.dumpTariffs.some(
       (/** @type {Record<string, any>} */ row) => row.dumpSiteCode && !dumpSites.has(row.dumpSiteCode)
     )
-    || graph.dumpTariffs.some(
-      (/** @type {Record<string, any>} */ row) => (row.materialCode || row.itemCode)
-        && !materialTypes.has(row.materialCode || row.itemCode)
-    )
+    || graph.dumpTariffs.some((/** @type {Record<string, any>} */ row) => {
+      const materialCode = row.materialCode
+        || (localItems.get(row.itemCode)?.itemType === "dump" ? row.itemCode : null);
+      return materialCode && !materialTypes.has(materialCode);
+    })
     || itemCodes.some((code) => !localItems.has(code))
     || yardCodes.some((code) => !activeYardCodes.has(code))
     || graph.distanceBands.some((/** @type {Record<string, any>} */ row) => (
       row.itemCode && localItems.get(row.itemCode)?.itemType !== "delivery_fee"
     ))
-    || graph.dumpTariffs.some((/** @type {Record<string, any>} */ row) => (
-      row.itemCode && localItems.get(row.itemCode)?.itemType !== "dump"
-    ))
+    || graph.dumpTariffs.some((/** @type {Record<string, any>} */ row) => {
+      if (!row.itemCode) {
+        return false;
+      }
+      const item = localItems.get(row.itemCode);
+      if (!item || !["dump", "aggregate"].includes(item.itemType)) {
+        return true;
+      }
+      const unit = String(row.unitOfMeasure || "").toUpperCase();
+      if (item.itemType === "aggregate") {
+        return item.chargeBasis !== "per_yard"
+          || row.pricingBasis !== "per_quantity" || unit !== "YARD";
+      }
+      if (item.chargeBasis === "per_bin") {
+        return row.pricingBasis !== "per_quantity" || unit !== "BIN";
+      }
+      return item.chargeBasis !== "per_tonne"
+        || !["per_weight", "per_quantity"].includes(row.pricingBasis) || unit !== "TONNE";
+    })
     || graph.components.some((/** @type {Record<string, any>} */ row) => (
       row.itemCode && ["rental", "extension"].includes(row.componentKind)
         && localItems.get(row.itemCode)?.itemType !== "bin"
@@ -760,7 +779,11 @@ async function insertDumpTariffs(versionId, rows, references) {
       [
         crypto.randomUUID(), versionId, row.itemCode || null,
         row.dumpSiteCode ? references.dumpSites.get(row.dumpSiteCode) : null,
-        (row.materialCode || row.itemCode) ? references.materials.get(row.materialCode || row.itemCode) : null,
+        (() => {
+          const item = references.items.get(row.itemCode);
+          const materialCode = row.materialCode || (item?.itemType === "dump" ? row.itemCode : null);
+          return materialCode ? references.materials.get(materialCode) : null;
+        })(),
         row.tariffCode, row.pricingBasis, row.unitOfMeasure, row.amountMinor,
         row.minimumAmountMinor, row.currency, row.active, row.description
       ]
@@ -988,7 +1011,7 @@ async function storedBandValidation(rateCardVersionId) {
     if (item.item_type === "bin") {
       const kinds = componentKinds.get(item.item_code) || new Set();
       valid &&= kinds.has("rental") && kinds.has("extension");
-    } else if (item.item_type === "dump") {
+    } else if (["dump", "aggregate"].includes(item.item_type)) {
       valid &&= tariffItems.has(item.item_code);
     } else if (item.item_type === "delivery_fee") {
       valid &&= [...groups.keys()].some((key) => key.startsWith(`${item.item_code}\u0000`));

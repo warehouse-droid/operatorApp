@@ -16,6 +16,7 @@ const VISIT_ID = "00000000-0000-4000-8000-000000000254";
 const DISTANCE_ID = "00000000-0000-4000-8000-000000000255";
 const BATCH_ID = "00000000-0000-4000-8000-000000000256";
 const ROW_ID = "00000000-0000-4000-8000-000000000257";
+const CANDIDATE_ID = "eyJ2IjoxLCJraW5kIjoiZHJpdmVyIiwicGxhbklkIjpudWxsLCJsb2FkSWQiOiJMT0FELTEifQ";
 
 async function removeFixture() {
   await query(
@@ -204,6 +205,48 @@ async function installBillingApi(page, { commandsEnabled }) {
         : "Billing commands are closed. Retained evidence remains available read-only."
     })],
     ["GET /api/mbt/billing/cases", async (route) => fulfillJson(route, 200, queue(browserState))],
+    ["GET /api/mbt/billing/mbbs/candidates", async (route) => fulfillJson(route, 200, {
+      schemaVersion: "mbbs-billing-candidates-v1",
+      postingMode: "local_only_preview",
+      rateCardVersionId: "00000000-0000-4000-8000-000000000260",
+      currency: "CAD",
+      items: [{
+        candidateId: CANDIDATE_ID,
+        sourceSystem: "driver_pwa",
+        sourceRecordId: "unplanned:LOAD-1",
+        physicalLoadId: "LOAD-1",
+        planDate: "2038-08-03",
+        completedAt: "2038-08-03T12:00:00.000Z",
+        references: [{ sourceType: "SO", rootReference: "SOA01234" }],
+        originYardCode: "2967",
+        originLabel: "2967 Kennedy Road",
+        destinationLabel: "100 Queen Street West",
+        routeStopCount: 2,
+        chargeable: true,
+        reason: null
+      }]
+    })],
+    [`POST /api/mbt/billing/mbbs/candidates/${CANDIDATE_ID}/preview`, async (route) => {
+      calls.push(capturedCall(route.request()));
+      await fulfillJson(route, 200, {
+        schemaVersion: "mbbs-billing-candidate-preview-v1",
+        postingMode: "local_only_preview",
+        externalWork: null,
+        distanceMetres: 31_000,
+        selectedBand: {
+          minimumMetres: 30_000,
+          maximumMetres: 50_000,
+          pricingBasis: "flat"
+        },
+        charge: {
+          itemCode: "DELIVERY_CHARGE_MBBS",
+          amountMinor: 25_000,
+          currency: "CAD",
+          estimatedTaxMinor: 0,
+          totalMinor: 25_000
+        }
+      });
+    }],
     [`GET /api/mbt/billing/cases/${CASE_ID}`, async (route) => fulfillJson(route, 200, detail(browserState))],
     [`POST /api/mbt/billing/cases/${CASE_ID}/calculate`, async (route) => {
       calls.push(capturedCall(route.request()));
@@ -297,6 +340,9 @@ test("P3-F23–P3-F28 browser: bound visit calculation, local approval, and vari
   await expect(page.getByRole("heading", { name: "Reconcile, calculate, approve locally" })).toBeVisible();
   await expect(page.getByText("No outbox or NetSuite transport")).toBeVisible();
   await expect(page.getByRole("cell", { name: "MBT contract" })).toBeVisible();
+  await expect(page.getByRole("cell", { name: "SO SOA01234" })).toBeVisible();
+  await page.getByRole("button", { name: "Calculate charge" }).click();
+  await expect(page.locator("#mbbsCandidatePreview")).toContainText("DELIVERY_CHARGE_MBBS · $250.00");
 
   await page.getByRole("button", { name: "Review", exact: true }).click();
   await expect(page.getByLabel("Service visit UUID")).toHaveValue(VISIT_ID);
@@ -323,15 +369,16 @@ test("P3-F23–P3-F28 browser: bound visit calculation, local approval, and vari
   await expect(page.getByRole("cell", { name: "accepted_application" }).first()).toBeVisible();
 
   expect(calls.map(({ path }) => path)).toEqual([
+    `/api/mbt/billing/mbbs/candidates/${CANDIDATE_ID}/preview`,
     `/api/mbt/billing/cases/${CASE_ID}/calculate`,
     `/api/mbt/billing/cases/${CASE_ID}/approve-local`,
     `/api/mbt/reconciliation/batches/${BATCH_ID}/resolve`
   ]);
-  expect(calls[0].body.serviceVisitId).toBe(VISIT_ID);
-  expect(calls[0].body.distanceSnapshotId).toBe(DISTANCE_ID);
-  expect(calls[1].body.billingVersionId).toBe(VERSION_ID);
-  expect(calls[2].body.reconciliationRowId).toBe(ROW_ID);
-  expect(calls.every(({ idempotencyKey }) => typeof idempotencyKey === "string" && idempotencyKey.length > 0)).toBe(true);
+  expect(calls[1].body.serviceVisitId).toBe(VISIT_ID);
+  expect(calls[1].body.distanceSnapshotId).toBe(DISTANCE_ID);
+  expect(calls[2].body.billingVersionId).toBe(VERSION_ID);
+  expect(calls[3].body.reconciliationRowId).toBe(ROW_ID);
+  expect(calls.slice(1).every(({ idempotencyKey }) => typeof idempotencyKey === "string" && idempotencyKey.length > 0)).toBe(true);
   expect(calls.some(({ path }) => /netsuite|sales.?order|deposit|outbox|\/post/iu.test(path))).toBe(false);
 
   const accessibility = await new AxeBuilder({ page })
@@ -354,7 +401,7 @@ test("P3-F27 browser: closing billing commands keeps queue/detail review visible
   await page.getByRole("button", { name: "Review evidence" }).click();
   await expect(page.getByRole("cell", { name: "rawMetres" })).toBeVisible();
   const commands = page.locator(".mbt-command");
-  await expect(commands).toHaveCount(6);
+  await expect(commands).toHaveCount(7);
   for (let index = 0; index < await commands.count(); index += 1) {
     await expect(commands.nth(index)).toBeDisabled();
   }

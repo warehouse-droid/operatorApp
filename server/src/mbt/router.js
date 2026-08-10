@@ -47,6 +47,7 @@ import { getMbtStatus, listMbtFeatureFlags } from "./status-repository.js";
 /** @typedef {typeof import("./customer-charge-request-service.js")} CustomerChargeService */
 /** @typedef {typeof import("./bin-dispatch-service.js")} BinDispatchService */
 /** @typedef {typeof import("./shadow-billing-service.js")} ShadowBillingService */
+/** @typedef {typeof import("./mbbs-billing-candidate-service.js")} MbbsBillingCandidateService */
 /** @typedef {typeof import("./pilot-reconciliation-service.js")} PilotReconciliationService */
 /** @typedef {{resolveDistance: Function, resolveTaxPolicy: Function}} FrontdeskPricing */
 
@@ -439,6 +440,7 @@ function localItemUpdateBody(value) {
     "displayName",
     "description",
     "active",
+    "chargeBasis",
     "expectedRevision",
     "reason"
   ]);
@@ -552,6 +554,7 @@ function mbtErrorHandler(error, req, res, _next) {
  * @param {CustomerChargeService} [dependencies.customerChargeService]
  * @param {BinDispatchService} [dependencies.binDispatchService]
  * @param {ShadowBillingService} [dependencies.billingService]
+ * @param {MbbsBillingCandidateService} [dependencies.billingCandidateService]
  * @param {PilotReconciliationService} [dependencies.reconciliationService]
  * @param {FrontdeskPricing} [dependencies.frontdeskPricing]
  * @param {typeof authorizeMbtPhase3Capability} [dependencies.authorizePhase3Capability]
@@ -597,6 +600,9 @@ export function createMbtRouter(dependencies = {}) {
   const injectedBillingService = dependencies.billingService;
   const resolveBillingService = async () => injectedBillingService
     || import("./shadow-billing-service.js");
+  const injectedBillingCandidateService = dependencies.billingCandidateService;
+  const resolveBillingCandidateService = async () => injectedBillingCandidateService
+    || import("./mbbs-billing-candidate-service.js");
   const injectedReconciliationService = dependencies.reconciliationService;
   const resolveReconciliationService = async () => injectedReconciliationService
     || import("./pilot-reconciliation-service.js");
@@ -770,7 +776,8 @@ export function createMbtRouter(dependencies = {}) {
         setting: {
           displayName: body.displayName,
           description: body.description,
-          active: body.active
+          active: body.active,
+          ...(body.chargeBasis === undefined ? {} : { chargeBasis: body.chargeBasis })
         },
         expectedRevision: /** @type {number} */ (body.expectedRevision),
         reason: requiredRequestText(
@@ -1947,16 +1954,30 @@ export function createMbtRouter(dependencies = {}) {
     }
   );
 
-  /** @param {import("express").Response} res */
-  function disabledFrontdeskStatus(res) {
+  /** @param {string} reason */
+  function frontdeskGateMessage(reason) {
+    return ({
+      environment_root_disabled: "Front Desk is disabled by the server environment root setting.",
+      environment_capability_disabled: "Front Desk is disabled by the server environment setting.",
+      database_root_missing: "The MBT database root safety flag is missing.",
+      database_root_disabled: "The MBT database root safety flag is disabled.",
+      database_capability_missing: "The Front Desk database safety flag is missing.",
+      database_capability_disabled: "The Front Desk database safety flag is disabled.",
+      pilot_scope_denied: "This operator is outside the enabled Front Desk pilot scope."
+    })[reason] || "Front Desk is disabled by an effective server safety gate.";
+  }
+
+  /** @param {import("express").Response} res @param {string} reason */
+  function disabledFrontdeskStatus(res, reason) {
     noStore(res);
     return res.json({
-      schemaVersion: "mbt-v1",
-      phase: 1,
+      schemaVersion: "mbt-frontdesk-status-v1",
+      phase: 3,
       surface: "frontdesk",
       enabled: false,
       code: "MBT_CAPABILITY_DISABLED",
-      message: "Front Desk operations are not enabled in Phase 1."
+      message: frontdeskGateMessage(reason),
+      commandState: { enabled: false, reason }
     });
   }
 
@@ -1964,9 +1985,11 @@ export function createMbtRouter(dependencies = {}) {
     "/frontdesk/status",
     requireMbtSurface("mbt_frontdesk", "MBT Front Desk"),
     async (_req, res, next) => {
-      if (config.mbt.enabled !== true
-          || config.mbtPhase3.frontdeskOperationsEnabled !== true) {
-        return disabledFrontdeskStatus(res);
+      if (config.mbt.enabled !== true) {
+        return disabledFrontdeskStatus(res, "environment_root_disabled");
+      }
+      if (config.mbtPhase3.frontdeskOperationsEnabled !== true) {
+        return disabledFrontdeskStatus(res, "environment_capability_disabled");
       }
       try {
         await authorizePhase3Capability({ capability: "frontdeskOperations" });
@@ -1976,11 +1999,12 @@ export function createMbtRouter(dependencies = {}) {
           phase: 3,
           surface: "frontdesk",
           enabled: true,
-          postingEnabled: false
+          postingEnabled: false,
+          commandState: { enabled: true, reason: null }
         });
       } catch (error) {
         if (error instanceof MbtError && error.code === "MBT_CAPABILITY_DISABLED") {
-          return disabledFrontdeskStatus(res);
+          return disabledFrontdeskStatus(res, String(error.details?.reason || "effective_gate_disabled"));
         }
         return next(error);
       }
@@ -2711,6 +2735,47 @@ export function createMbtRouter(dependencies = {}) {
         const caseId = requiredRequestUuid(req.params.caseId, "Billing-case ID");
         const service = await resolveBillingService();
         const result = await service.getLocalBillingCase(caseId, commandActor(req));
+        noStore(res);
+        res.json(result);
+      } catch (error) {
+        next(error);
+      }
+    }
+  );
+
+  router.get(
+    "/billing/mbbs/candidates",
+    requireMbtSurface("mbt_billing", "MBT Billing"),
+    async (req, res, next) => {
+      try {
+        const service = await resolveBillingCandidateService();
+        const result = await service.listMbbsBillingCandidates({
+          actor: commandActor(req),
+          limit: req.query.limit === undefined ? undefined : Number(req.query.limit)
+        });
+        noStore(res);
+        res.json(result);
+      } catch (error) {
+        next(error);
+      }
+    }
+  );
+
+  router.post(
+    "/billing/mbbs/candidates/:candidateId/preview",
+    requireMbtSurface("mbt_billing", "MBT Billing"),
+    async (req, res, next) => {
+      try {
+        await billingCommandCapability(req);
+        const service = await resolveBillingCandidateService();
+        const result = await service.previewMbbsBillingCandidate({
+          actor: commandActor(req),
+          candidateId: requiredRequestText(
+            req.params.candidateId,
+            "MBT_BILLING_CANDIDATE_ID_INVALID",
+            "An MBBS billing candidate ID is required."
+          )
+        }, { resolveDistance: frontdeskPricing.resolveDistance });
         noStore(res);
         res.json(result);
       } catch (error) {

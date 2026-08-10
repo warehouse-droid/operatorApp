@@ -31,6 +31,13 @@ test("Front Desk customer-charge form exposes the supported request inputs and n
   assert.doesNotMatch(script, /data-line-estimated-tonnes|estimatedTonnes/iu);
 });
 
+test("Front Desk reads status before configuration and displays the server gate reason", async () => {
+  const script = await readFile(scriptUrl, "utf8");
+  assert.match(script, /const status = await api\(["']\/api\/mbt\/frontdesk\/status["']\)/u);
+  assert.match(script, /if\s*\(!state\.enabled\)[\s\S]{0,500}status\.message/u);
+  assert.match(script, /status\.commandState\?\.reason/u);
+});
+
 test("Front Desk explains payment-specific HST and previews all three customer totals", async () => {
   const [page, script] = await Promise.all([
     readFile(pageUrl, "utf8"),
@@ -51,4 +58,16 @@ test("priced add-bin and exchange actions replace direct charged exchange submis
   assert.match(script, /openCustomerChargeDialog\([^)]*"add_bin"/u);
   assert.match(script, /openCustomerChargeDialog\([^)]*"exchange_bin"/u);
   assert.doesNotMatch(script, /chargeMode\.append\(new Option\("Charge the change", "charged"\)\)/u);
+});
+
+test("each active Front Desk rate-card version is independently selectable", async () => {
+  const [page, script] = await Promise.all([
+    readFile(pageUrl, "utf8"),
+    readFile(scriptUrl, "utf8")
+  ]);
+  assert.match(page, /Rate card \/ workflow/u);
+  assert.match(script, /new Option\([\s\S]{0,250}service\.rateCardVersionId/u);
+  assert.match(script, /item\.rateCardVersionId === chargeServiceCode\.value/u);
+  assert.match(script, /chargeServiceCode\.addEventListener\("change", syncChargeWorkflowConfiguration\)/u);
+  assert.match(script, /loadChargeConfiguration\(service\.rateCardVersionId\)/u);
 });

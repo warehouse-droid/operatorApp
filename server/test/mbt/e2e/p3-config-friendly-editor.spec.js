@@ -8,6 +8,7 @@ const LOCAL_ITEMS = Object.freeze([
     itemCode: "DELIVERY_CROSS_CHARGE",
     displayName: "Delivery Charge - MBT",
     itemType: "delivery_fee",
+    chargeBasis: "distance",
     rentalPeriodDays: null,
     priceMode: "rate_card",
     binTypeCode: null,
@@ -19,6 +20,7 @@ const LOCAL_ITEMS = Object.freeze([
     itemCode: "14YD",
     displayName: "14 yard bin",
     itemType: "bin",
+    chargeBasis: "rental_period",
     rentalPeriodDays: 14,
     priceMode: "rental_item",
     binTypeCode: "14YD",
@@ -31,6 +33,7 @@ const LOCAL_ITEMS = Object.freeze([
     itemCode: "CLEAN_FILL",
     displayName: "Clean fill",
     itemType: "dump",
+    chargeBasis: "per_tonne",
     rentalPeriodDays: null,
     priceMode: "rate_card",
     binTypeCode: null,
@@ -42,6 +45,20 @@ const LOCAL_ITEMS = Object.freeze([
     itemCode: "CONCRETE",
     displayName: "Concrete",
     itemType: "dump",
+    chargeBasis: "per_bin",
+    rentalPeriodDays: null,
+    priceMode: "rate_card",
+    binTypeCode: null,
+    localReady: true,
+    active: true,
+    revision: 1
+  },
+  {
+    itemCode: "AGG_HPB",
+    displayName: "HPB",
+    itemType: "aggregate",
+    chargeBasis: "per_yard",
+    densityLbsPerYard: 2600,
     rentalPeriodDays: null,
     priceMode: "rate_card",
     binTypeCode: null,
@@ -53,6 +70,7 @@ const LOCAL_ITEMS = Object.freeze([
     itemCode: "OVERTIME_SURCHARGE",
     displayName: "Overtime surcharge",
     itemType: "surcharge",
+    chargeBasis: "per_event",
     rentalPeriodDays: null,
     priceMode: "manual",
     binTypeCode: null,
@@ -142,8 +160,8 @@ async function handleConfigReads(route, request, path, state) {
     });
     return true;
   }
-  if (path === "/api/mbt/config/local/items") {
-    await json(route, { items: LOCAL_ITEMS });
+  if (path === "/api/mbt/config/local/items" && request.method() === "GET") {
+    await json(route, { items: state.localItems });
     return true;
   }
   if (path === "/api/mbt/config/dump-sites" && request.method() === "GET") {
@@ -154,6 +172,34 @@ async function handleConfigReads(route, request, path, state) {
 }
 
 async function handleMasterDataWrites(route, request, path, calls, state) {
+  if (path === "/api/mbt/config/local/items" && request.method() === "POST") {
+    const body = request.postDataJSON();
+    calls.push({ method: request.method(), path, body });
+    const entity = {
+      ...body,
+      localReady: true,
+      active: body.active !== false,
+      revision: 1
+    };
+    state.localItems.push(entity);
+    await json(route, { entities: [entity] }, 201);
+    return true;
+  }
+  if (path.startsWith("/api/mbt/config/local/items/") && request.method() === "PUT") {
+    const itemCode = decodeURIComponent(path.slice("/api/mbt/config/local/items/".length));
+    const body = request.postDataJSON();
+    calls.push({ method: request.method(), path, body });
+    const index = state.localItems.findIndex((item) => item.itemCode === itemCode);
+    const entity = {
+      ...state.localItems[index],
+      ...body,
+      itemCode,
+      revision: Number(state.localItems[index]?.revision || 0) + 1
+    };
+    state.localItems[index] = entity;
+    await json(route, { item: entity });
+    return true;
+  }
   if (path === "/api/mbt/config/dump-sites" && request.method() === "POST") {
     const body = request.postDataJSON();
     calls.push({ path, body });
@@ -252,6 +298,7 @@ async function installConfigApi(page) {
   const calls = [];
   const state = {
     sites: [],
+    localItems: LOCAL_ITEMS.map((item) => ({ ...item })),
     currentVersion: version(),
     customerChargeConfiguration: customerChargeConfiguration()
   };
@@ -287,56 +334,46 @@ async function openConfig(page) {
   await expect(page.locator(".mbt-status")).toHaveAttribute("aria-busy", "false");
 }
 
-test("customer-charge editor saves four per-yard rates, fixed per-bin dumps, and increasing delivery bands", async ({ page }) => {
+test("item-owned setup creates per-yard aggregate and changes a dump item to fixed per bin", async ({ page }) => {
   const calls = await installConfigApi(page);
   await openConfig(page);
 
-  await page.getByRole("tab", { name: "Customer Charges" }).click();
-  await expect(page.locator("#customerChargesPanel")).toBeVisible();
-  await expect(page.locator("#customerChargeRateCardVersion")).toHaveValue(VERSION_ID);
-  await expect(page.locator("#customerChargesMessage")).toContainText("no complete customer-charge sheet");
+  await expect(page.getByRole("tab", { name: "Customer Charges" })).toHaveCount(0);
+  await expect(page.locator("#customerChargesPanel")).toHaveCount(0);
 
-  const aggregateRows = page.locator("#aggregateChargeRateRows tr");
-  const aggregateValues = [
-    ["52.50", "2700"],
-    ["48.00", "2850"],
-    ["65.00", "2600"],
-    ["42.00", "2750"]
-  ];
-  for (const [index, [amount, density]] of aggregateValues.entries()) {
-    await aggregateRows.nth(index).locator("[data-charge-amount-cad]").fill(amount);
-    await aggregateRows.nth(index).locator("[data-charge-density]").fill(density);
-  }
-  const dumpRows = page.locator("#fixedDumpChargeRateRows tr");
-  for (const [index, amount] of ["850.00", "725.00", "925.00"].entries()) {
-    await dumpRows.nth(index).locator("[data-charge-amount-cad]").fill(amount);
-  }
-  await page.locator("#addAggregateDistanceBandButton").click();
-  const distanceRows = page.locator("#aggregateDistanceBandRows tr");
-  await expect(distanceRows).toHaveCount(2);
-  await distanceRows.nth(1).locator("[data-band-code]").fill("AGG_30_PLUS");
-  await distanceRows.nth(1).locator("[data-band-amount-cad]").fill("200.00");
-  await page.locator("#customerChargeConfigurationReason").fill("Browser-approved real-rate setup");
-  await page.locator("#customerChargeConfigurationForm button[type='submit']").click();
-  await expect(page.locator("#customerChargesMessage")).toContainText("saved at revision 1");
+  const createItem = page.locator("#customLocalItemForm");
+  await createItem.getByLabel("Item type").selectOption("aggregate");
+  await expect(createItem.getByLabel("Charging method")).toHaveValue("per_yard");
+  await expect(createItem.getByLabel("Charging method").locator("option:checked")).toHaveText("Price per cubic yard");
+  await createItem.getByLabel("Item code").fill("AGG_GRANITE_TEST");
+  await createItem.getByLabel("Display name").fill("Granite test aggregate");
+  await createItem.getByLabel("Density (lb / yard)").fill("2750");
+  await createItem.getByRole("button", { name: "Create custom item" }).click();
+  await expect(page.locator("#localItemRows")).toContainText("Granite test aggregate");
+  await expect(page.locator("#localItemRows")).toContainText("Price per cubic yard");
 
-  const save = calls.find((call) => call.path === `/api/mbt/config/customer-charges/${VERSION_ID}`);
-  expect(save.body.expectedRevision).toBe(0);
-  expect(save.body.aggregateItems).toEqual([
-    { itemCode: "AGG_CLEAR_LIMESTONE_34", amountMinor: 5_250, densityLbsPerYard: 2_700 },
-    { itemCode: "AGG_CRUSHER_RUN", amountMinor: 4_800, densityLbsPerYard: 2_850 },
-    { itemCode: "AGG_HPB", amountMinor: 6_500, densityLbsPerYard: 2_600 },
-    { itemCode: "AGG_SCREENING", amountMinor: 4_200, densityLbsPerYard: 2_750 }
-  ]);
-  expect(save.body.fixedDumpItems).toEqual([
-    { itemCode: "DUMP_SOIL", amountMinor: 85_000 },
-    { itemCode: "DUMP_ASPHALT", amountMinor: 72_500 },
-    { itemCode: "DUMP_CONCRETE", amountMinor: 92_500 }
-  ]);
-  expect(save.body.aggregateDistanceBands).toEqual([
-    { bandCode: "AGG_0_30", minimumMetres: 0, maximumMetres: 30_000, amountMinor: 15_000 },
-    { bandCode: "AGG_30_PLUS", minimumMetres: 30_000, maximumMetres: null, amountMinor: 20_000 }
-  ]);
+  await page.getByRole("button", { name: "Edit CLEAN_FILL" }).click();
+  const editor = page.locator("#localItemEditor");
+  await expect(editor.getByLabel("Charging method")).toHaveValue("per_tonne");
+  await editor.getByLabel("Charging method").selectOption("per_bin");
+  await editor.getByLabel("Audit reason").fill("Use the fixed customer price for each clean-fill bin");
+  await editor.getByRole("button", { name: "Save local item" }).click();
+  await expect(page.locator("#localItemRows")).toContainText("Fixed price per bin");
+
+  const create = calls.find((call) => call.path === "/api/mbt/config/local/items" && call.method === "POST");
+  expect(create.body).toEqual(expect.objectContaining({
+    itemCode: "AGG_GRANITE_TEST",
+    itemType: "aggregate",
+    chargeBasis: "per_yard",
+    densityLbsPerYard: 2750,
+    applicableServiceTypes: ["delivery", "exchange"]
+  }));
+  const update = calls.find((call) => call.path === "/api/mbt/config/local/items/CLEAN_FILL");
+  expect(update.body).toEqual(expect.objectContaining({
+    chargeBasis: "per_bin",
+    expectedRevision: 1,
+    reason: "Use the fixed customer price for each clean-fill bin"
+  }));
 });
 
 test("P4 browser: dump sites and item-owned pricing use only the charging fields allowed by each item", async ({ page }) => {
@@ -378,6 +415,7 @@ test("P4 browser: dump sites and item-owned pricing use only the charging fields
     "14 yard bin · Bin · 14 cubic yards",
     "Clean fill · Dump",
     "Concrete · Dump",
+    "HPB · Aggregate",
     "Overtime surcharge · Surcharge"
   ]);
 
@@ -390,6 +428,16 @@ test("P4 browser: dump sites and item-owned pricing use only the charging fields
   await expect(page.locator("#rateItemEditor")).toContainText("Customer charge per tonne");
   await page.locator('#rateItemEditor [data-rate-field="amountCad"]').fill("175.00");
   await page.locator('#rateItemEditor [data-rate-field="minimumCad"]').fill("20.00");
+
+  await pricingItem.selectOption("CONCRETE");
+  await expect(page.locator("#rateItemEditor")).toContainText("Fixed customer charge for each bin");
+  await expect(page.locator('#rateItemEditor [data-rate-field="minimumCad"]')).toHaveCount(0);
+  await page.locator('#rateItemEditor [data-rate-field="amountCad"]').fill("725.00");
+
+  await pricingItem.selectOption("AGG_HPB");
+  await expect(page.locator("#rateItemEditor")).toContainText("Customer charge per cubic yard");
+  await expect(page.locator("#rateItemEditor")).toContainText("2600 lb per yard");
+  await page.locator('#rateItemEditor [data-rate-field="amountCad"]').fill("65.00");
 
   await pricingItem.selectOption("OVERTIME_SURCHARGE");
   await expect(page.locator("#rateItemEditor")).toContainText("added manually");
@@ -453,9 +501,21 @@ test("P4 browser: dump sites and item-owned pricing use only the charging fields
     expect.objectContaining({ itemCode: "14YD", componentKind: "extension", amountMinor: 1000 })
   ]));
   expect(creates[0].body.graph.components).toHaveLength(2);
-  expect(creates[0].body.graph.dumpTariffs).toEqual([
-    expect.objectContaining({ itemCode: "CLEAN_FILL", amountMinor: 17500, minimumAmountMinor: 2000 })
-  ]);
+  expect(creates[0].body.graph.dumpTariffs).toEqual(expect.arrayContaining([
+    expect.objectContaining({
+      itemCode: "CLEAN_FILL", pricingBasis: "per_weight", unitOfMeasure: "TONNE",
+      amountMinor: 17500, minimumAmountMinor: 2000
+    }),
+    expect.objectContaining({
+      itemCode: "CONCRETE", pricingBasis: "per_quantity", unitOfMeasure: "BIN",
+      amountMinor: 72500, minimumAmountMinor: 0
+    }),
+    expect.objectContaining({
+      itemCode: "AGG_HPB", pricingBasis: "per_quantity", unitOfMeasure: "YARD",
+      amountMinor: 6500, minimumAmountMinor: 0
+    })
+  ]));
+  expect(creates[0].body.graph.dumpTariffs).toHaveLength(3);
   expect(creates[0].body.graph.distanceBands).toEqual(expect.arrayContaining([
     expect.objectContaining({ itemCode: "DELIVERY_CROSS_CHARGE", minimumMetres: 0, maximumMetres: 10000 }),
     expect.objectContaining({ itemCode: "DELIVERY_CROSS_CHARGE", minimumMetres: 10000, maximumMetres: null })

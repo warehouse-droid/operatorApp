@@ -18,6 +18,8 @@ const SELECT_FIELDS = `
   s.display_name,
   s.description,
   s.item_type,
+  s.charge_basis,
+  s.density_lbs_per_yard,
   s.rental_period_days,
   s.category,
   s.pricing_mode,
@@ -103,6 +105,8 @@ function publicItem(row) {
     description: String(row.description || ""),
     systemOwned: row.system_owned === true,
     itemType: String(row.item_type),
+    chargeBasis: String(row.charge_basis),
+    densityLbsPerYard: row.density_lbs_per_yard === null ? null : Number(row.density_lbs_per_yard),
     rentalPeriodDays: row.rental_period_days === null ? null : Number(row.rental_period_days),
     category: String(row.category),
     priceMode: String(row.pricing_mode),
@@ -212,6 +216,10 @@ export async function updateMbtLocalItemSetting({
         });
       }
       const before = publicItem(selected[0]);
+      const normalizedSetting = normalizeMbtLocalItemUpdate(rawSetting, {
+        ...policy,
+        itemType: before.itemType
+      });
       assertExpectedRevision(Number(before.revision), expectedRevision);
       const revision = nextRevision(Number(before.revision));
       await query(
@@ -219,15 +227,17 @@ export async function updateMbtLocalItemSetting({
             SET display_name = $2,
                 description = $3,
                 active = $4,
-                revision = $5,
-                updated_by = $6,
+                charge_basis = $5,
+                revision = $6,
+                updated_by = $7,
                 updated_at = now()
           WHERE item_code = $1`,
         [
           code,
-          setting.displayName,
-          setting.description,
-          setting.active,
+          normalizedSetting.displayName,
+          normalizedSetting.description,
+          normalizedSetting.active,
+          normalizedSetting.chargeBasis ?? before.chargeBasis,
           revision,
           actor.operatorId
         ]

@@ -62,14 +62,23 @@ for (const policy of POLICIES) {
 
 export const MBT_LOCAL_ITEM_POLICIES = Object.freeze(POLICIES);
 
-const EDITABLE_FIELDS = Object.freeze(["displayName", "description", "active"]);
+const REQUIRED_EDITABLE_FIELDS = Object.freeze(["displayName", "description", "active"]);
+const EDITABLE_FIELDS = Object.freeze([...REQUIRED_EDITABLE_FIELDS, "chargeBasis"]);
+/** @type {Readonly<Record<string, ReadonlySet<string>>>} */
+const CHARGE_BASES_BY_TYPE = Object.freeze({
+  bin: new Set(["rental_period"]),
+  surcharge: new Set(["per_event"]),
+  dump: new Set(["per_tonne", "per_bin"]),
+  aggregate: new Set(["per_yard"]),
+  delivery_fee: new Set(["distance"])
+});
 
 /** @returns {never} */
 function invalidLocalItemInput() {
   throw new MbtError({
     status: 400,
     code: "MBT_LOCAL_ITEM_INPUT_INVALID",
-    message: "Local item settings may update only the display name, description, and active status."
+    message: "Local item settings may update only presentation, active status, and the supported charging basis."
   });
 }
 
@@ -96,25 +105,36 @@ function recognizedItemPolicy(policy) {
 /**
  * @param {unknown} raw
  * @param {unknown} policy
- * @returns {{displayName: string, description: string, active: boolean}}
+ * @returns {{displayName: string, description: string, active: boolean, chargeBasis?: string}}
  */
+// eslint-disable-next-line complexity
 export function normalizeMbtLocalItemUpdate(raw, policy) {
   const recognizedPolicy = recognizedItemPolicy(policy);
   if (!recognizedPolicy || !raw || typeof raw !== "object" || Array.isArray(raw)) {
     return invalidLocalItemInput();
   }
   const input = /** @type {Record<string, unknown>} */ (raw);
-  const keys = Object.keys(input).sort();
-  if (keys.length !== EDITABLE_FIELDS.length
-      || !EDITABLE_FIELDS.every((field) => Object.hasOwn(input, field))) {
+  const keys = Object.keys(input);
+  if (keys.some((field) => !EDITABLE_FIELDS.includes(field))
+      || !REQUIRED_EDITABLE_FIELDS.every((field) => Object.hasOwn(input, field))) {
     return invalidLocalItemInput();
   }
   if (input.active !== true && input.active !== false) {
     return invalidLocalItemInput();
   }
+  const chargeBasis = input.chargeBasis === undefined
+    ? undefined
+    : String(input.chargeBasis).trim().toLowerCase();
+  const itemType = String(/** @type {any} */ (policy).itemType || "");
+  if (chargeBasis !== undefined
+      && (!Object.values(CHARGE_BASES_BY_TYPE).some((values) => values.has(chargeBasis))
+        || (itemType && !CHARGE_BASES_BY_TYPE[itemType]?.has(chargeBasis)))) {
+    return invalidLocalItemInput();
+  }
   return {
     displayName: boundedText(input.displayName, 160, false),
     description: boundedText(input.description, 2000, true),
-    active: input.active
+    active: input.active,
+    ...(chargeBasis === undefined ? {} : { chargeBasis })
   };
 }

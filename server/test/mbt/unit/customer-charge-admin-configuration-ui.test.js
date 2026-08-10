@@ -9,40 +9,22 @@ const [page, script] = await Promise.all([
   readFile(new URL("../../../public/mbt-shell.js", import.meta.url), "utf8")
 ]);
 
-test("admin configuration exposes all four aggregate and three fixed-dump real-rate inputs", () => {
-  for (const id of [
-    "customerChargesTab",
-    "customerChargesPanel",
-    "customerChargeRateCardVersion",
-    "aggregateChargeRateRows",
-    "fixedDumpChargeRateRows",
-    "aggregateDistanceBandRows",
-    "addAggregateDistanceBandButton",
-    "customerChargeConfigurationForm",
-    "customerChargeConfigurationReason"
-  ]) {
-    assert.match(page, new RegExp(`id=["']${id}["']`, "u"), `${id} must be rendered.`);
-  }
-  for (const label of [
-    "3/4 Clear Limestone",
-    "Crusher Run",
-    "HPB",
-    "Screening",
-    "Soil fixed dump charge",
-    "Asphalt fixed dump charge",
-    "Concrete fixed dump charge"
-  ]) {
-    assert.match(page, new RegExp(label.replace("/", "\\/"), "u"));
-  }
-  assert.match(page, /CAD 150[^<]*through 30 km/iu);
-  assert.match(page, /CAD 50[^<]*loading fee/iu);
+test("item settings and rate cards replace the duplicate hard-coded customer-charge sheet", () => {
+  assert.doesNotMatch(page, /id=["']customerChargesTab["']/u);
+  assert.doesNotMatch(page, /id=["']customerChargesPanel["']/u);
+  assert.doesNotMatch(page, /data-aggregate-charge-code/u);
+  assert.doesNotMatch(page, /data-fixed-dump-charge-code/u);
+  assert.match(page, /<option value=["']aggregate["']>Aggregate<\/option>/u);
+  assert.match(page, /id=["']customLocalItemChargeBasis["']/u);
+  assert.match(page, /id=["']customLocalItemDensityLbsPerYard["']/u);
+  assert.match(page, /id=["']localItemChargeBasis["']/u);
 });
 
-test("admin configuration reads and saves one audited optimistic customer-charge sheet", () => {
-  assert.match(script, /\/api\/mbt\/config\/customer-charges\/\$\{[^}]+\}/u);
-  assert.match(script, /expectedRevision/u);
-  assert.match(script, /aggregateItems/u);
-  assert.match(script, /fixedDumpItems/u);
-  assert.match(script, /aggregateDistanceBands/u);
-  assert.match(script, /idempotencyKey/u);
+test("the normal rate-card editor owns per-yard aggregate and per-bin dump prices", () => {
+  assert.match(script, /case ["']aggregate["']/u);
+  assert.match(script, /unitOfMeasure:\s*["']YARD["']/u);
+  assert.match(script, /unitOfMeasure:\s*fixedPerBin\s*\?\s*["']BIN["']\s*:\s*["']TONNE["']/u);
+  assert.match(script, /itemType === ["']aggregate["'][\s\S]{0,100}\[["']delivery["'], ["']exchange["']\]/u);
+  assert.match(script, /chargeBasis/u);
+  assert.doesNotMatch(script, /readinessElement\(["']customerChargeConfigurationForm["']\)/u);
 });

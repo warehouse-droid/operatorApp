@@ -15,7 +15,15 @@ const LOCAL_ITEM_CATEGORIES = new Set([
   "bin_charge", "dump", "service", "surcharge", "discount", "cross_charge", "other"
 ]);
 const PRICING_MODES = new Set(["calculated", "rate_card", "rental_item", "custom_price"]);
-const LOCAL_ITEM_TYPES = new Set(["bin", "surcharge", "dump", "delivery_fee"]);
+const LOCAL_ITEM_TYPES = new Set(["bin", "surcharge", "dump", "aggregate", "delivery_fee"]);
+/** @type {Readonly<Record<string, ReadonlySet<string>>>} */
+const CHARGE_BASES = Object.freeze({
+  bin: new Set(["rental_period"]),
+  surcharge: new Set(["per_event"]),
+  dump: new Set(["per_tonne", "per_bin"]),
+  aggregate: new Set(["per_yard"]),
+  delivery_fee: new Set(["distance"])
+});
 const SERVICE_TYPES = new Set(["delivery", "final_pickup", "loaded_pickup", "dump_return", "exchange"]);
 const LEGACY_SOURCE_TYPES = new Set(["SO", "TO", "PO", "VRMA"]);
 const PROTECTED_ITEM_CODES = new Set(["DELIVERY_CROSS_CHARGE", "14YD", "20YD", "40YD", "DUMP"]);
@@ -102,7 +110,7 @@ function normalizedArray(value, allowed, map, invalid) {
 function normalizeLocalItem(raw) {
   const input = inputRecord(raw, invalidLocalItem);
   assertAllowedFields(input, [
-    "itemCode", "displayName", "description", "itemType", "rentalPeriodDays",
+    "itemCode", "displayName", "description", "itemType", "chargeBasis", "densityLbsPerYard", "rentalPeriodDays",
     "category", "pricingMode",
     "applicableServiceTypes", "applicableLegacySourceTypes", "binTypeCode", "binCapacityYards",
     "netSuiteMappingLocalKey", "active", "expectedRevision"
@@ -121,6 +129,7 @@ function normalizeLocalItem(raw) {
     bin: { category: "bin_charge", pricingMode: "rental_item" },
     surcharge: { category: "surcharge", pricingMode: "custom_price" },
     dump: { category: "dump", pricingMode: "rate_card" },
+    aggregate: { category: "other", pricingMode: "rate_card" },
     delivery_fee: { category: "service", pricingMode: "rate_card" }
   }[itemType];
   const category = input.itemType === undefined ? legacyCategory : policy?.category;
@@ -128,6 +137,25 @@ function normalizeLocalItem(raw) {
   if (!LOCAL_ITEM_TYPES.has(itemType)
       || !LOCAL_ITEM_CATEGORIES.has(String(category))
       || !PRICING_MODES.has(String(pricingMode))) {
+    return invalidLocalItem();
+  }
+  const defaultChargeBasis = {
+    bin: "rental_period",
+    surcharge: "per_event",
+    dump: "per_tonne",
+    aggregate: "per_yard",
+    delivery_fee: "distance"
+  }[itemType];
+  const chargeBasis = String(input.chargeBasis ?? defaultChargeBasis).trim().toLowerCase();
+  if (!CHARGE_BASES[itemType]?.has(chargeBasis)) {
+    return invalidLocalItem();
+  }
+  const densityLbsPerYard = input.densityLbsPerYard === undefined || input.densityLbsPerYard === null
+    ? null
+    : Number(input.densityLbsPerYard);
+  if ((itemType === "aggregate"
+      && (!Number.isSafeInteger(densityLbsPerYard) || Number(densityLbsPerYard) < 1))
+      || (itemType !== "aggregate" && densityLbsPerYard !== null)) {
     return invalidLocalItem();
   }
   const binTypeCode = input.binTypeCode === undefined || input.binTypeCode === null
@@ -173,6 +201,8 @@ function normalizeLocalItem(raw) {
     displayName: boundedText(input.displayName, 160, false, invalidLocalItem),
     description: boundedText(input.description, 2000, true, invalidLocalItem),
     itemType,
+    chargeBasis,
+    densityLbsPerYard,
     rentalPeriodDays,
     category: String(category),
     pricingMode: String(pricingMode),
@@ -741,14 +771,14 @@ async function createLocalItem(row, actor, binTypeId) {
   const code = String(row.itemCode);
   await query(
     `INSERT INTO mbt_local_item_settings (
-       item_code, display_name, description, item_type, rental_period_days,
+       item_code, display_name, description, item_type, charge_basis, density_lbs_per_yard, rental_period_days,
        category, bin_type_id, pricing_mode,
        netsuite_mapping_local_key, system_owned, applicable_service_types,
        applicable_legacy_source_types, active, revision, created_by, updated_by
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false, $10::text[], $11::text[], $12, 1, $13, $13)`,
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, false, $12::text[], $13::text[], $14, 1, $15, $15)`,
     [
-      code, row.displayName, row.description, row.itemType, row.rentalPeriodDays,
-      row.category, binTypeId, row.pricingMode, row.netSuiteMappingLocalKey ?? null,
+      code, row.displayName, row.description, row.itemType, row.chargeBasis, row.densityLbsPerYard,
+      row.rentalPeriodDays, row.category, binTypeId, row.pricingMode, row.netSuiteMappingLocalKey ?? null,
       row.applicableServiceTypes, row.applicableLegacySourceTypes, row.active,
       actor.operatorId
     ]
@@ -804,11 +834,11 @@ async function mirrorLegacyMaterialToDumpItem(row, actor) {
   if (!selected.rowCount) {
     await query(
       `INSERT INTO mbt_local_item_settings (
-         item_code, display_name, description, item_type, rental_period_days,
+         item_code, display_name, description, item_type, charge_basis, density_lbs_per_yard, rental_period_days,
          category, bin_type_id, pricing_mode, netsuite_mapping_local_key,
          system_owned, applicable_service_types, applicable_legacy_source_types,
          active, revision, created_by, updated_by
-       ) VALUES ($1, $2, $3, 'dump', NULL, 'dump', NULL, 'rate_card', NULL,
+       ) VALUES ($1, $2, $3, 'dump', 'per_tonne', NULL, NULL, 'dump', NULL, 'rate_card', NULL,
                  false, ARRAY['dump_return']::text[], ARRAY[]::text[],
                  $4, 1, $5, $5)`,
       [code, row.displayName, row.description, row.active, actor.operatorId]
@@ -865,21 +895,23 @@ async function updateLocalItem(before, row, actor, binTypeId) {
         SET display_name = $2,
             description = $3,
             item_type = $4,
-            rental_period_days = $5,
-            category = $6,
-            bin_type_id = $7,
-            pricing_mode = $8,
-            netsuite_mapping_local_key = $9,
-            applicable_service_types = $10::text[],
-            applicable_legacy_source_types = $11::text[],
-            active = $12,
-            revision = $13,
-            updated_by = $14,
+            charge_basis = $5,
+            density_lbs_per_yard = $6,
+            rental_period_days = $7,
+            category = $8,
+            bin_type_id = $9,
+            pricing_mode = $10,
+            netsuite_mapping_local_key = $11,
+            applicable_service_types = $12::text[],
+            applicable_legacy_source_types = $13::text[],
+            active = $14,
+            revision = $15,
+            updated_by = $16,
             updated_at = now()
       WHERE item_code = $1`,
     [
-      code, row.displayName, row.description, row.itemType, row.rentalPeriodDays,
-      row.category, binTypeId, row.pricingMode,
+      code, row.displayName, row.description, row.itemType, row.chargeBasis,
+      row.densityLbsPerYard, row.rentalPeriodDays, row.category, binTypeId, row.pricingMode,
       row.netSuiteMappingLocalKey ?? before.netsuite_mapping_local_key,
       row.applicableServiceTypes, row.applicableLegacySourceTypes, row.active,
       nextRevision, actor.operatorId

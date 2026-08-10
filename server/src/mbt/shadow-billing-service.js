@@ -1423,7 +1423,7 @@ export async function generateMbbsShadowBilling(rawInput, dependencies = {}) {
       );
       const rate = await query(
         `SELECT version.rate_card_version_id, card.currency,
-                band.currency AS band_currency
+                band.currency AS band_currency, band.item_code
            FROM mbt_rate_card_versions version
            JOIN mbt_rate_cards card USING (rate_card_id)
            JOIN mbt_rate_distance_bands band
@@ -1447,9 +1447,10 @@ export async function generateMbbsShadowBilling(rawInput, dependencies = {}) {
       const item = await query(
         `SELECT item_code, revision, netsuite_mapping_local_key
            FROM mbt_local_item_settings
-          WHERE item_code = 'DELIVERY_CROSS_CHARGE'
+          WHERE item_code = $1
+            AND item_type = 'delivery_fee'
             AND active`,
-        []
+        [String(rate.rows[0].item_code || "DELIVERY_CROSS_CHARGE")]
       );
       if (!item.rowCount) {
         throw failure(409, "MBT_BILLING_LOCAL_ITEM_INVALID", "The cross-charge local item is not active.");
