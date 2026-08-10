@@ -1,11 +1,17 @@
 // @ts-check
 
+import crypto from "node:crypto";
+
 import { query } from "../db.js";
+import { executeMbtCommand } from "./command-repository.js";
 import { calculateDistanceBandChargeMinor } from "./distance-band-pricing.js";
 import { MbtError } from "./errors.js";
 import { selectRateBand } from "./rate-bands.js";
 
-const MAX_CANDIDATES = 200;
+const MAX_CANDIDATES = 1000;
+const MAX_BATCH_CANDIDATES = 100;
+const BATCH_DISTANCE_CONCURRENCY = 5;
+const TORONTO_TIME_ZONE = "America/Toronto";
 
 /**
  * @typedef {{
@@ -61,6 +67,58 @@ function candidateLimit(value) {
     throw failure(400, "MBT_BILLING_CANDIDATE_LIMIT_INVALID", `Candidate limit must be between 1 and ${MAX_CANDIDATES}.`);
   }
   return parsed;
+}
+
+/** @param {unknown} value @param {{required?: boolean}} [options] */
+function completedMonth(value, { required = false } = {}) {
+  const normalized = text(value);
+  if (!normalized && !required) {
+    return null;
+  }
+  if (!/^[0-9]{4}-(?:0[1-9]|1[0-2])$/u.test(normalized)) {
+    throw failure(
+      400,
+      "MBT_BILLING_COMPLETED_MONTH_INVALID",
+      "Completed month must use YYYY-MM in the America/Toronto time zone."
+    );
+  }
+  return normalized;
+}
+
+/** @param {unknown} value */
+function rateCardVersionId(value) {
+  const normalized = text(value).toLowerCase();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(normalized)) {
+    throw failure(400, "MBT_MBBS_RATE_SELECTION_INVALID", "Choose a valid active MBBS rate-card version.");
+  }
+  return normalized;
+}
+
+/** @param {unknown} value */
+function batchCandidateIds(value) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_BATCH_CANDIDATES) {
+    throw failure(
+      400,
+      "MBT_BILLING_CANDIDATE_BATCH_INVALID",
+      `Choose between 1 and ${MAX_BATCH_CANDIDATES} completed MBBS orders.`
+    );
+  }
+  const ids = value.map((raw) => {
+    const identity = decodedCandidateId(raw);
+    const canonical = candidateId(identity);
+    if (canonical !== text(raw)) {
+      throw failure(400, "MBT_BILLING_CANDIDATE_ID_INVALID", "The MBBS billing candidate ID is invalid.");
+    }
+    return canonical;
+  });
+  if (new Set(ids).size !== ids.length) {
+    throw failure(
+      400,
+      "MBT_BILLING_CANDIDATE_BATCH_DUPLICATE",
+      "Each completed MBBS order may appear only once in a calculation batch."
+    );
+  }
+  return ids;
 }
 
 /** @param {unknown} value */
@@ -349,10 +407,13 @@ function salesOrderCandidate(row, yards, allowedOrigins) {
   };
 }
 
-async function activeMbbsRateGraph() {
+async function activeMbbsRateGraphs() {
   const selected = await query(
-    `SELECT version.rate_card_version_id::text, version.version_number::int,
-            card.currency, band.rate_distance_band_id::text,
+    `SELECT card.rate_card_id::text, card.rate_card_code, card.display_name,
+            version.rate_card_version_id::text, version.version_number::int,
+            version.effective_from, version.effective_to,
+            card.currency, band.currency AS band_currency,
+            band.rate_distance_band_id::text,
             band.item_code, band.service_code, band.sequence_number::int,
             band.minimum_metres::int, band.maximum_metres::int,
             band.amount_minor::int, band.pricing_basis, band.boundary_rule,
@@ -360,45 +421,97 @@ async function activeMbbsRateGraph() {
        FROM mbt_rate_cards card
        JOIN mbt_rate_card_versions version USING (rate_card_id)
        JOIN mbt_rate_distance_bands band USING (rate_card_version_id)
-      WHERE card.rate_card_code = 'DELIVERY_CHARGE_MBBS'
+      WHERE card.active
         AND version.status = 'active'
+        AND version.effective_from <= now()
+        AND (version.effective_to IS NULL OR version.effective_to > now())
         AND band.item_code = 'DELIVERY_CHARGE_MBBS'
         AND band.service_code = 'mbbs_cross_charge'
-      ORDER BY version.version_number DESC, band.sequence_number, band.minimum_metres`
+      ORDER BY lower(card.display_name), card.rate_card_code,
+               version.version_number DESC, band.sequence_number, band.minimum_metres`
   );
-  if (!selected.rowCount) {
-    throw failure(409, "MBT_MBBS_RATE_UNAVAILABLE", "Activate the DELIVERY_CHARGE_MBBS rate card before calculating completed orders.");
+  /** @type {Map<string, Array<Record<string, any>>>} */
+  const grouped = new Map();
+  for (const rawRow of selected.rows) {
+    const row = object(rawRow);
+    const versionId = text(row.rate_card_version_id);
+    const rows = grouped.get(versionId);
+    if (rows) {
+      rows.push(row);
+    } else {
+      grouped.set(versionId, [row]);
+    }
   }
-  const rateCardVersionId = text(selected.rows[0].rate_card_version_id);
-  const rows = selected.rows.filter(
-    (/** @type {Record<string, any>} */ row) => text(row.rate_card_version_id) === rateCardVersionId
-  );
-  const bands = /** @type {MbbsRateBand[]} */ (rows.map((/** @type {Record<string, any>} */ row) => ({
-    rateDistanceBandId: text(row.rate_distance_band_id),
-    itemCode: text(row.item_code),
-    serviceCode: text(row.service_code),
-    sequenceNumber: Number(row.sequence_number),
-    minimumMetres: Number(row.minimum_metres),
-    maximumMetres: row.maximum_metres === null ? null : Number(row.maximum_metres),
-    amountMinor: Number(row.amount_minor),
-    pricingBasis: text(row.pricing_basis),
-    boundaryRule: text(row.boundary_rule),
-    originYardCodes: array(row.origin_yard_codes).map(text).filter(Boolean)
-  })));
-  // selectRateBand performs the complete contiguous/open-band validation.
-  selectRateBand(bands, 0);
-  const originYardCodes = new Set(bands.flatMap((band) => band.originYardCodes));
-  return {
-    rateCardVersionId,
-    versionNumber: Number(rows[0].version_number),
-    currency: text(rows[0].currency),
-    bands,
-    originYardCodes
-  };
+  return [...grouped.values()].map((rows) => {
+    const first = /** @type {Record<string, any>} */ (rows[0]);
+    const currency = text(first.currency);
+    if (rows.some((row) => text(row.band_currency) !== currency)) {
+      throw failure(409, "MBT_MBBS_RATE_INVALID", "An active MBBS rate card has inconsistent currency evidence.");
+    }
+    const bands = /** @type {MbbsRateBand[]} */ (rows.map((row) => ({
+      rateDistanceBandId: text(row.rate_distance_band_id),
+      itemCode: text(row.item_code),
+      serviceCode: text(row.service_code),
+      sequenceNumber: Number(row.sequence_number),
+      minimumMetres: Number(row.minimum_metres),
+      maximumMetres: row.maximum_metres === null ? null : Number(row.maximum_metres),
+      amountMinor: Number(row.amount_minor),
+      pricingBasis: text(row.pricing_basis),
+      boundaryRule: text(row.boundary_rule),
+      originYardCodes: array(row.origin_yard_codes).map(text).filter(Boolean)
+    })));
+    // selectRateBand performs complete contiguous/open-band validation.
+    selectRateBand(bands, 0);
+    return {
+      rateCardId: text(first.rate_card_id),
+      rateCardCode: text(first.rate_card_code),
+      displayName: text(first.display_name),
+      rateCardVersionId: text(first.rate_card_version_id),
+      versionNumber: Number(first.version_number),
+      effectiveFrom: new Date(first.effective_from).toISOString(),
+      effectiveTo: first.effective_to === null ? null : new Date(first.effective_to).toISOString(),
+      currency,
+      bands,
+      originYardCodes: new Set(bands.flatMap((band) => band.originYardCodes))
+    };
+  });
 }
 
-/** @param {number} limit */
-async function driverRows(limit) {
+/** @param {Array<Record<string, any>>} graphs */
+function rateOptions(graphs) {
+  return graphs.map((graph) => ({
+    rateCardId: graph.rateCardId,
+    rateCardCode: graph.rateCardCode,
+    displayName: graph.displayName,
+    rateCardVersionId: graph.rateCardVersionId,
+    versionNumber: graph.versionNumber,
+    effectiveFrom: graph.effectiveFrom,
+    effectiveTo: graph.effectiveTo,
+    currency: graph.currency
+  }));
+}
+
+/** @param {Array<Record<string, any>>} graphs @param {unknown} rawVersionId @param {{explicit?: boolean}} [options] */
+function selectedRateGraph(graphs, rawVersionId, { explicit = false } = {}) {
+  if (graphs.length === 0) {
+    throw failure(409, "MBT_MBBS_RATE_UNAVAILABLE", "Activate an MBBS rate card containing DELIVERY_CHARGE_MBBS before calculating completed orders.");
+  }
+  if (!text(rawVersionId)) {
+    if (!explicit && graphs.length === 1) {
+      return /** @type {Record<string, any>} */ (graphs[0]);
+    }
+    throw failure(409, "MBT_MBBS_RATE_SELECTION_REQUIRED", "Choose which active MBBS rate card to apply.");
+  }
+  const versionId = rateCardVersionId(rawVersionId);
+  const graph = graphs.find((candidate) => candidate.rateCardVersionId === versionId);
+  if (!graph) {
+    throw failure(409, "MBT_MBBS_RATE_SELECTION_UNAVAILABLE", "The selected MBBS rate card is not active or eligible for DELIVERY_CHARGE_MBBS.");
+  }
+  return /** @type {Record<string, any>} */ (graph);
+}
+
+/** @param {number} limit @param {string | null} completedMonthValue */
+async function driverRows(limit, completedMonthValue) {
   const result = await query(
     `SELECT plan_id::text, plan_date::text, load_id,
             max(completed_at) AS completed_at,
@@ -413,15 +526,19 @@ async function driverRows(limit) {
       GROUP BY plan_id, plan_date, load_id
      HAVING bool_and(status = 'complete')
         AND bool_or(jsonb_array_length(COALESCE(order_refs, '[]'::jsonb)) > 0)
+        AND ($2::text IS NULL OR (
+          (max(completed_at) AT TIME ZONE '${TORONTO_TIME_ZONE}') >= (($2 || '-01')::date)::timestamp
+          AND (max(completed_at) AT TIME ZONE '${TORONTO_TIME_ZONE}') < ((($2 || '-01')::date + interval '1 month')::timestamp)
+        ))
       ORDER BY max(completed_at) DESC NULLS LAST, plan_id DESC NULLS LAST, load_id
       LIMIT $1`,
-    [limit]
+    [limit, completedMonthValue]
   );
   return result.rows;
 }
 
-/** @param {number} limit */
-async function reconciliationRows(limit) {
+/** @param {number} limit @param {string | null} completedMonthValue */
+async function reconciliationRows(limit, completedMonthValue) {
   const result = await query(
     `SELECT state.id::text, state.order_kind, state.source_order_ref,
             state.source_location_id::text, state.source_location,
@@ -444,15 +561,21 @@ async function reconciliationRows(limit) {
          ON state.order_kind = 'TO'
         AND transfer.netsuite_id = state.source_order_netsuite_id
       WHERE state.application_status = 'Completed'
+        AND ($2::text IS NULL OR (
+          (COALESCE(state.completed_at, state.reconciled_at, state.updated_at)
+            AT TIME ZONE '${TORONTO_TIME_ZONE}') >= (($2 || '-01')::date)::timestamp
+          AND (COALESCE(state.completed_at, state.reconciled_at, state.updated_at)
+            AT TIME ZONE '${TORONTO_TIME_ZONE}') < ((($2 || '-01')::date + interval '1 month')::timestamp)
+        ))
       ORDER BY COALESCE(state.completed_at, state.reconciled_at, state.updated_at) DESC, state.id DESC
       LIMIT $1`,
-    [limit]
+    [limit, completedMonthValue]
   );
   return result.rows;
 }
 
-/** @param {number} limit */
-async function completedSalesOrderRows(limit) {
+/** @param {number} limit @param {string | null} completedMonthValue */
+async function completedSalesOrderRows(limit, completedMonthValue) {
   const result = await query(
     `SELECT netsuite_id::text, tranid, outbound_location_id::text,
             outbound_location, dispatch_address,
@@ -460,42 +583,128 @@ async function completedSalesOrderRows(limit) {
             COALESCE(dispatch_plan_date::text,
                      COALESCE(fulfilled_at, status_updated_at, synced_at)::date::text) AS plan_date
        FROM sales_orders
-      WHERE fulfillment_status = 'fulfilled' OR fulfilled_at IS NOT NULL
+      WHERE (fulfillment_status = 'fulfilled' OR fulfilled_at IS NOT NULL)
+        AND ($2::text IS NULL OR (
+          (COALESCE(fulfilled_at, status_updated_at, synced_at)
+            AT TIME ZONE '${TORONTO_TIME_ZONE}') >= (($2 || '-01')::date)::timestamp
+          AND (COALESCE(fulfilled_at, status_updated_at, synced_at)
+            AT TIME ZONE '${TORONTO_TIME_ZONE}') < ((($2 || '-01')::date + interval '1 month')::timestamp)
+        ))
       ORDER BY COALESCE(fulfilled_at, status_updated_at, synced_at) DESC NULLS LAST,
                netsuite_id DESC
       LIMIT $1`,
-    [limit]
+    [limit, completedMonthValue]
   );
   return result.rows.filter((/** @type {Record<string, any>} */ row) => row.completed_at);
 }
 
-/** @param {number} limit */
-async function internalCandidates(limit) {
-  const [graph, yards, driver, reconciliation, salesOrders] = await Promise.all([
-    activeMbbsRateGraph(),
+/** @param {string[]} candidateIds */
+async function storedAddressOverrides(candidateIds) {
+  if (candidateIds.length === 0) {
+    return new Map();
+  }
+  const result = await query(
+    `SELECT candidate_id, source_system, source_record_id,
+            destination_address_text, revision::int, updated_by, updated_at
+       FROM mbt_mbbs_billing_address_overrides
+      WHERE candidate_id = ANY($1::text[])`,
+    [candidateIds]
+  );
+  return new Map(result.rows.map((/** @type {Record<string, any>} */ rawRow) => {
+    const row = object(rawRow);
+    return [text(row.candidate_id), {
+      sourceSystem: text(row.source_system),
+      sourceRecordId: text(row.source_record_id),
+      destinationAddressText: text(row.destination_address_text),
+      revision: Number(row.revision),
+      updatedBy: text(row.updated_by),
+      updatedAt: new Date(row.updated_at).toISOString()
+    }];
+  }));
+}
+
+/** @param {Record<string, any>} candidate @param {Record<string, any> | undefined} override @param {Set<string>} allowedOrigins */
+function applyAddressOverride(candidate, override, allowedOrigins) {
+  if (!override) {
+    return { ...candidate, addressOverride: null };
+  }
+  if (override.sourceSystem !== candidate.sourceSystem || override.sourceRecordId !== candidate.sourceRecordId) {
+    throw failure(409, "MBT_BILLING_ADDRESS_OVERRIDE_INVALID", "A retained billing address override no longer matches its completed order identity.");
+  }
+  const publicOverride = {
+    destinationAddressText: override.destinationAddressText,
+    revision: override.revision,
+    updatedBy: override.updatedBy,
+    updatedAt: override.updatedAt
+  };
+  const originAllowed = Boolean(
+    candidate.originYardCode
+    && candidate.originLabel
+    && (allowedOrigins.size === 0 || allowedOrigins.has(candidate.originYardCode))
+  );
+  if (!originAllowed || array(candidate.references).length === 0) {
+    return { ...candidate, addressOverride: publicOverride };
+  }
+  return {
+    ...candidate,
+    destinationLabel: override.destinationAddressText,
+    routeStopCount: 2,
+    chargeable: true,
+    reason: null,
+    addressOverride: publicOverride,
+    _routeStops: [
+      { addressText: candidate.originLabel, stopType: "pickup" },
+      { addressText: override.destinationAddressText, stopType: "dropoff" }
+    ]
+  };
+}
+
+/**
+ * @param {number} limit
+ * @param {string | null} completedMonthValue
+ * @param {{graphs?: Array<Record<string, any>>, includeOverrides?: boolean, truncate?: boolean}} [options]
+ */
+async function internalCandidates(
+  limit,
+  completedMonthValue,
+  { graphs, includeOverrides = true, truncate = true } = {}
+) {
+  const rateGraphs = graphs || await activeMbbsRateGraphs();
+  const hasUnrestrictedGraph = rateGraphs.some((graph) => graph.originYardCodes.size === 0);
+  const allowedOrigins = hasUnrestrictedGraph
+    ? new Set()
+    : new Set(rateGraphs.flatMap((graph) => [...graph.originYardCodes]));
+  const [yards, driver, reconciliation, salesOrders] = await Promise.all([
     activeYards(),
-    driverRows(limit),
-    reconciliationRows(limit),
-    completedSalesOrderRows(limit)
+    driverRows(limit, completedMonthValue),
+    reconciliationRows(limit, completedMonthValue),
+    completedSalesOrderRows(limit, completedMonthValue)
   ]);
-  const items = [
-    ...driver.map((/** @type {Record<string, any>} */ row) => driverCandidate(row, yards, graph.originYardCodes)),
+  let items = [
+    ...driver.map((/** @type {Record<string, any>} */ row) => driverCandidate(row, yards, allowedOrigins)),
     ...reconciliation.map(
-      (/** @type {Record<string, any>} */ row) => reconciliationCandidate(row, yards, graph.originYardCodes)
+      (/** @type {Record<string, any>} */ row) => reconciliationCandidate(row, yards, allowedOrigins)
     ),
     ...salesOrders.map(
-      (/** @type {Record<string, any>} */ row) => salesOrderCandidate(row, yards, graph.originYardCodes)
+      (/** @type {Record<string, any>} */ row) => salesOrderCandidate(row, yards, allowedOrigins)
     )
-  ].sort((left, right) => Number(right.chargeable) - Number(left.chargeable)
+  ];
+  if (includeOverrides) {
+    const overrides = await storedAddressOverrides(items.map((item) => item.candidateId));
+    items = items.map((item) => applyAddressOverride(item, overrides.get(item.candidateId), allowedOrigins));
+  } else {
+    items = items.map((item) => ({ ...item, addressOverride: null }));
+  }
+  items.sort((left, right) => Number(right.chargeable) - Number(left.chargeable)
     || right.completedAt.localeCompare(left.completedAt)
     || left.candidateId.localeCompare(right.candidateId));
-  return { graph, items: items.slice(0, limit) };
+  return { graphs: rateGraphs, items: truncate ? items.slice(0, limit) : items };
 }
 
 /** @param {Record<string, any>} candidate */
 function publicCandidate(candidate) {
   const { _routeStops, _identity, ...result } = candidate;
-  return result;
+  return { ...result, addressOverride: result.addressOverride || null };
 }
 
 /**
@@ -508,43 +717,41 @@ export async function listMbbsBillingCandidates(rawInput) {
   const input = object(rawInput);
   billingActor(input.actor);
   const limit = candidateLimit(input.limit);
-  const { graph, items } = await internalCandidates(limit);
+  const month = completedMonth(input.completedMonth);
+  const { graphs, items } = await internalCandidates(limit, month);
+  const soleGraph = graphs.length === 1 ? graphs[0] : null;
   return {
-    schemaVersion: "mbbs-billing-candidates-v1",
+    schemaVersion: "mbbs-billing-candidates-v2",
     postingMode: "local_only_preview",
-    rateCardVersionId: graph.rateCardVersionId,
-    currency: graph.currency,
+    completedMonth: month,
+    rateCardVersionId: soleGraph?.rateCardVersionId || null,
+    currency: soleGraph?.currency || null,
+    rateOptions: rateOptions(graphs),
     items: items.map(publicCandidate)
   };
 }
 
-/**
- * Resolve one opaque server-owned candidate and calculate it from the active
- * MBBS graph. No candidate, snapshot, billing, Driver, reconciliation, outbox,
- * or NetSuite row is inserted or updated.
- *
- * @param {unknown} rawInput
- * @param {{resolveDistance: Function}} dependencies
- */
-// eslint-disable-next-line complexity
-export async function previewMbbsBillingCandidate(rawInput, dependencies) {
-  const input = object(rawInput);
-  billingActor(input.actor);
-  const identity = decodedCandidateId(input.candidateId);
-  if (!dependencies || typeof dependencies.resolveDistance !== "function") {
+/** @param {unknown} dependencies */
+function distanceResolver(dependencies) {
+  const selected = object(dependencies).resolveDistance;
+  if (typeof selected !== "function") {
     throw failure(503, "MBT_MBBS_DISTANCE_UNAVAILABLE", "Server distance pricing is not configured.");
   }
-  const { graph, items } = await internalCandidates(MAX_CANDIDATES);
-  const encoded = candidateId(identity);
-  const candidate = items.find((item) => item.candidateId === encoded);
-  if (!candidate) {
-    throw failure(404, "MBT_BILLING_CANDIDATE_NOT_FOUND", "The completed MBBS billing candidate is unavailable.");
-  }
+  return selected;
+}
+
+/** @param {Record<string, any>} candidate @param {Record<string, any>} graph @param {Function} resolveDistance */
+// eslint-disable-next-line complexity
+async function calculateCandidate(candidate, graph, resolveDistance) {
   if (!candidate.chargeable) {
     throw failure(422, "MBT_BILLING_CANDIDATE_INCOMPLETE", candidate.reason || "The completed MBBS candidate is incomplete.");
   }
   if (graph.originYardCodes.size && !graph.originYardCodes.has(candidate.originYardCode)) {
-    throw failure(422, "MBT_BILLING_CANDIDATE_ORIGIN_INVALID", "The completed route origin is outside the active MBBS rate scope.");
+    throw failure(
+      422,
+      "MBT_MBBS_RATE_ORIGIN_UNAVAILABLE",
+      "The selected MBBS rate card does not apply to this order's origin yard."
+    );
   }
   const stops = array(candidate._routeStops).map(object);
   let distanceMetres = 0;
@@ -555,7 +762,7 @@ export async function previewMbbsBillingCandidate(rawInput, dependencies) {
     if (!origin || !destination) {
       throw failure(422, "MBT_BILLING_CANDIDATE_INCOMPLETE", "The completed route has a missing stop.");
     }
-    const raw = object(await dependencies.resolveDistance(index === 1
+    const raw = object(await resolveDistance(index === 1
       ? { originYardCode: candidate.originYardCode, destinationAddressText: destination.addressText }
       : { originAddressText: origin.addressText, destinationAddressText: destination.addressText }));
     const segmentMetres = Number(raw.providerMetres);
@@ -582,9 +789,6 @@ export async function previewMbbsBillingCandidate(rawInput, dependencies) {
   }
   const amountMinor = calculateDistanceBandChargeMinor(selected, distanceMetres);
   return {
-    schemaVersion: "mbbs-billing-candidate-preview-v1",
-    postingMode: "local_only_preview",
-    externalWork: null,
     candidate: publicCandidate(candidate),
     rateCardVersionId: graph.rateCardVersionId,
     rateCardVersionNumber: graph.versionNumber,
@@ -606,4 +810,269 @@ export async function previewMbbsBillingCandidate(rawInput, dependencies) {
       totalMinor: amountMinor
     }
   };
+}
+
+/**
+ * Resolve one opaque server-owned candidate and calculate it from the selected
+ * active MBBS graph. This preview performs no writes.
+ *
+ * @param {unknown} rawInput
+ * @param {{resolveDistance: Function}} dependencies
+ */
+export async function previewMbbsBillingCandidate(rawInput, dependencies) {
+  const input = object(rawInput);
+  billingActor(input.actor);
+  const identity = decodedCandidateId(input.candidateId);
+  const month = completedMonth(input.completedMonth);
+  const resolveDistance = distanceResolver(dependencies);
+  const graphs = await activeMbbsRateGraphs();
+  const graph = selectedRateGraph(graphs, input.rateCardVersionId);
+  const { items } = await internalCandidates(MAX_CANDIDATES, month, { graphs });
+  const encoded = candidateId(identity);
+  const candidate = items.find((item) => item.candidateId === encoded);
+  if (!candidate) {
+    throw failure(404, "MBT_BILLING_CANDIDATE_NOT_FOUND", "The completed MBBS billing candidate is unavailable.");
+  }
+  return {
+    schemaVersion: "mbbs-billing-candidate-preview-v1",
+    postingMode: "local_only_preview",
+    externalWork: null,
+    ...await calculateCandidate(/** @type {Record<string, any>} */ (candidate), graph, resolveDistance)
+  };
+}
+
+/** @param {unknown} error */
+function batchFailure(error) {
+  if (error instanceof MbtError) {
+    return { code: error.code, message: error.message };
+  }
+  return {
+    code: "MBT_MBBS_DISTANCE_LOOKUP_FAILED",
+    message: "The retained route could not be resolved for this completed order."
+  };
+}
+
+/** @param {unknown[]} values @param {number} concurrency @param {(value: any, index: number) => Promise<any>} operation */
+async function mapConcurrently(values, concurrency, operation) {
+  const results = new Array(values.length);
+  let nextIndex = 0;
+  async function worker() {
+    while (nextIndex < values.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await operation(values[index], index);
+    }
+  }
+  await Promise.all(Array.from(
+    { length: Math.min(concurrency, values.length) },
+    () => worker()
+  ));
+  return results;
+}
+
+/**
+ * Calculate one selected completion-month batch using one explicitly selected
+ * active rate version. A failure is retained on its own row and does not hide
+ * successful calculations. This preview performs no writes.
+ *
+ * @param {unknown} rawInput
+ * @param {{resolveDistance: Function}} dependencies
+ */
+export async function previewMbbsBillingCandidatesBatch(rawInput, dependencies) {
+  const input = object(rawInput);
+  billingActor(input.actor);
+  const ids = batchCandidateIds(input.candidateIds);
+  const month = completedMonth(input.completedMonth, { required: true });
+  const resolveDistance = distanceResolver(dependencies);
+  const graphs = await activeMbbsRateGraphs();
+  const graph = selectedRateGraph(graphs, input.rateCardVersionId, { explicit: true });
+  const { items } = await internalCandidates(MAX_CANDIDATES, month, { graphs });
+  const byId = new Map(items.map((candidate) => [candidate.candidateId, candidate]));
+  const results = await mapConcurrently(ids, BATCH_DISTANCE_CONCURRENCY, async (id) => {
+    try {
+      const candidate = byId.get(id);
+      if (!candidate) {
+        throw failure(404, "MBT_BILLING_CANDIDATE_NOT_FOUND", "The completed MBBS billing candidate is unavailable in the selected month.");
+      }
+      return {
+        candidateId: id,
+        status: "calculated",
+        ...await calculateCandidate(/** @type {Record<string, any>} */ (candidate), graph, resolveDistance)
+      };
+    } catch (error) {
+      return { candidateId: id, status: "failed", error: batchFailure(error) };
+    }
+  });
+  const successCount = results.filter((result) => result.status === "calculated").length;
+  return {
+    schemaVersion: "mbbs-billing-candidate-batch-preview-v1",
+    postingMode: "local_only_preview",
+    externalWork: null,
+    completedMonth: month,
+    rateCardVersionId: graph.rateCardVersionId,
+    requestedCount: ids.length,
+    successCount,
+    failureCount: ids.length - successCount,
+    results
+  };
+}
+
+/** @param {unknown} value @param {string} code @param {string} message @param {number} maximum @param {number} [minimum] */
+function requiredBoundedText(value, code, message, maximum, minimum = 1) {
+  const normalized = text(value);
+  if (normalized.length < minimum || normalized.length > maximum) {
+    throw failure(400, code, message);
+  }
+  return normalized;
+}
+
+/** @param {unknown} value */
+function expectedAddressRevision(value) {
+  const revision = Number(value);
+  if (!Number.isSafeInteger(revision) || revision < 0) {
+    throw failure(400, "MBT_BILLING_ADDRESS_OVERRIDE_REVISION_INVALID", "The billing address revision must be a non-negative integer.");
+  }
+  return revision;
+}
+
+/** @param {Record<string, any>} candidate @param {Record<string, any> | null} existing */
+function assertAddressOverrideAllowed(candidate, existing) {
+  if (existing) {
+    return;
+  }
+  if (array(candidate.references).length === 0 || !candidate.originYardCode || !candidate.originLabel) {
+    throw failure(422, "MBT_BILLING_ADDRESS_OVERRIDE_INSUFFICIENT", "A destination address alone cannot complete this order's retained billing route.");
+  }
+  if (candidate.routeStopCount >= 2 && candidate.destinationLabel) {
+    throw failure(409, "MBT_BILLING_ADDRESS_OVERRIDE_NOT_ALLOWED", "This completed order already has a retained destination address.");
+  }
+}
+
+/**
+ * Retain one billing-only destination override under the standard atomic
+ * command receipt and append-only audit boundary. Operational source rows are
+ * intentionally never changed.
+ *
+ * @param {unknown} rawInput
+ */
+export async function setMbbsBillingCandidateAddressOverride(rawInput) {
+  const input = object(rawInput);
+  const actor = billingActor(input.actor);
+  const identity = decodedCandidateId(input.candidateId);
+  const encoded = candidateId(identity);
+  if (encoded !== text(input.candidateId)) {
+    throw failure(400, "MBT_BILLING_CANDIDATE_ID_INVALID", "The MBBS billing candidate ID is invalid.");
+  }
+  const month = completedMonth(input.completedMonth, { required: true });
+  const destinationAddressText = requiredBoundedText(
+    input.destinationAddressText,
+    "MBT_BILLING_ADDRESS_OVERRIDE_INVALID",
+    "Enter one complete billing destination address of at most 1,000 characters.",
+    1000,
+    5
+  );
+  const reason = requiredBoundedText(
+    input.reason,
+    "MBT_BILLING_ADDRESS_OVERRIDE_REASON_INVALID",
+    "Enter an audit reason of at most 2,000 characters.",
+    2000,
+    3
+  );
+  const expectedRevision = expectedAddressRevision(input.expectedRevision);
+  const payload = {
+    candidateId: encoded,
+    completedMonth: month,
+    destinationAddressText,
+    expectedRevision,
+    reason
+  };
+  return executeMbtCommand({
+    actor,
+    commandName: "mbt.billing.mbbs_candidate_address.override",
+    idempotencyKey: input.idempotencyKey,
+    payload,
+    correlationId: input.correlationId,
+    requestId: input.requestId,
+    mutation: async () => {
+      await query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`mbt-billing-address:${encoded}`]);
+      const graphs = await activeMbbsRateGraphs();
+      const { items } = await internalCandidates(MAX_CANDIDATES, month, {
+        graphs,
+        includeOverrides: false,
+        truncate: false
+      });
+      const candidate = items.find((item) => item.candidateId === encoded);
+      if (!candidate) {
+        throw failure(404, "MBT_BILLING_CANDIDATE_NOT_FOUND", "The completed MBBS billing candidate is unavailable in the selected month.");
+      }
+      const current = await query(
+        `SELECT address_override_id::text, source_system, source_record_id,
+                destination_address_text, revision::text, updated_by, updated_at
+           FROM mbt_mbbs_billing_address_overrides
+          WHERE candidate_id = $1
+          FOR UPDATE`,
+        [encoded]
+      );
+      const existing = current.rowCount ? object(current.rows[0]) : null;
+      if (existing && (
+        text(existing.source_system) !== candidate.sourceSystem
+        || text(existing.source_record_id) !== candidate.sourceRecordId
+      )) {
+        throw failure(409, "MBT_BILLING_ADDRESS_OVERRIDE_INVALID", "The retained override no longer matches its completed order identity.");
+      }
+      assertAddressOverrideAllowed(candidate, existing);
+      const currentRevision = existing ? Number(existing.revision) : 0;
+      if (currentRevision !== expectedRevision) {
+        throw failure(409, "MBT_BILLING_ADDRESS_OVERRIDE_REVISION_CONFLICT", "The billing address changed after it was loaded. Refresh the candidate and try again.");
+      }
+      const beforeRevision = Math.max(1, currentRevision);
+      const saved = await query(
+        `INSERT INTO mbt_mbbs_billing_address_overrides (
+           address_override_id, candidate_id, source_system, source_record_id,
+           destination_address_text, revision, created_by, updated_by
+         ) VALUES ($1, $2, $3, $4, $5, 1, $6, $6)
+         ON CONFLICT (candidate_id) DO UPDATE
+           SET destination_address_text = EXCLUDED.destination_address_text,
+               revision = mbt_mbbs_billing_address_overrides.revision + 1,
+               updated_by = EXCLUDED.updated_by,
+               updated_at = now()
+         RETURNING address_override_id::text, destination_address_text,
+                   revision::text, updated_by, updated_at`,
+        [
+          crypto.randomUUID(), encoded, candidate.sourceSystem, candidate.sourceRecordId,
+          destinationAddressText, actor.operatorId
+        ]
+      );
+      const row = object(saved.rows[0]);
+      const revision = Number(row.revision);
+      const body = {
+        schemaVersion: "mbbs-billing-address-override-v1",
+        postingMode: "local_only",
+        candidateId: encoded,
+        destinationAddressText: text(row.destination_address_text),
+        revision,
+        updatedBy: text(row.updated_by),
+        updatedAt: new Date(row.updated_at).toISOString()
+      };
+      return {
+        status: 200,
+        body,
+        audit: {
+          action: "mbt.billing.mbbs_candidate_address.overridden",
+          entityType: "mbt_mbbs_billing_address_override",
+          entityId: encoded,
+          beforeState: existing ? {
+            exists: true,
+            destinationAddressText: text(existing.destination_address_text),
+            revision: beforeRevision
+          } : { exists: false, candidateId: encoded },
+          afterState: body,
+          reason,
+          revisionBefore: beforeRevision,
+          revisionAfter: revision,
+          source: "mbt_billing"
+        }
+      };
+    }
+  });
 }

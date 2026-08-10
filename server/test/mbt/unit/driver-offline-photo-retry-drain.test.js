@@ -6,6 +6,8 @@ import test from "node:test";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
 
+/* global Response */
+
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const readPublic = (name) => fs.readFileSync(path.resolve(HERE, `../../../public/${name}`), "utf8");
 const HASH_SOURCE = readPublic("driver-photo-hash.js");
@@ -69,11 +71,15 @@ test("one retrying photo cannot starve the later retained photos", async () => {
     getManifest: async () => manifest,
     applySyncResponse: async (_key, payload) => {
       for (const result of payload.photos || []) {
-        if (!result.durableReceipt) continue;
+        if (!result.durableReceipt) {
+          continue;
+        }
         const photo = photos.find((candidate) => candidate.photoId === result.photoId);
         photo.status = "durably_received";
         photo.blob = null;
-        if (photo.photoId === "photo-b") resolveSecondDurable();
+        if (photo.photoId === "photo-b") {
+          resolveSecondDurable();
+        }
       }
     },
     markPhotoAttempt: async (photoId, phase) => {

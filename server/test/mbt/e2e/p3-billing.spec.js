@@ -17,6 +17,8 @@ const DISTANCE_ID = "00000000-0000-4000-8000-000000000255";
 const BATCH_ID = "00000000-0000-4000-8000-000000000256";
 const ROW_ID = "00000000-0000-4000-8000-000000000257";
 const CANDIDATE_ID = "eyJ2IjoxLCJraW5kIjoiZHJpdmVyIiwicGxhbklkIjpudWxsLCJsb2FkSWQiOiJMT0FELTEifQ";
+const CANDIDATE_ID_2 = "eyJ2IjoxLCJraW5kIjoic2FsZXNfb3JkZXIiLCJuZXRzdWl0ZUlkIjoiMiJ9";
+const RATE_VERSION_ID = "00000000-0000-4000-8000-000000000260";
 
 async function removeFixture() {
   await query(
@@ -206,10 +208,16 @@ async function installBillingApi(page, { commandsEnabled }) {
     })],
     ["GET /api/mbt/billing/cases", async (route) => fulfillJson(route, 200, queue(browserState))],
     ["GET /api/mbt/billing/mbbs/candidates", async (route) => fulfillJson(route, 200, {
-      schemaVersion: "mbbs-billing-candidates-v1",
+      schemaVersion: "mbbs-billing-candidates-v2",
       postingMode: "local_only_preview",
-      rateCardVersionId: "00000000-0000-4000-8000-000000000260",
-      currency: "CAD",
+      completedMonth: null,
+      rateOptions: [{
+        rateCardVersionId: RATE_VERSION_ID,
+        rateCardCode: "DELIVERY_CHARGE_MBBS",
+        displayName: "Standard MBBS delivery",
+        versionNumber: 1,
+        currency: "CAD"
+      }],
       items: [{
         candidateId: CANDIDATE_ID,
         sourceSystem: "driver_pwa",
@@ -221,6 +229,20 @@ async function installBillingApi(page, { commandsEnabled }) {
         originYardCode: "2967",
         originLabel: "2967 Kennedy Road",
         destinationLabel: "100 Queen Street West",
+        routeStopCount: 2,
+        chargeable: true,
+        reason: null
+      }, {
+        candidateId: CANDIDATE_ID_2,
+        sourceSystem: "sales_order",
+        sourceRecordId: "2",
+        physicalLoadId: "SO-2",
+        planDate: "2038-08-04",
+        completedAt: "2038-08-04T12:00:00.000Z",
+        references: [{ sourceType: "SO", rootReference: "SOA05678" }],
+        originYardCode: "2967",
+        originLabel: "2967 Kennedy Road",
+        destinationLabel: "200 King Street West",
         routeStopCount: 2,
         chargeable: true,
         reason: null
@@ -245,6 +267,41 @@ async function installBillingApi(page, { commandsEnabled }) {
           estimatedTaxMinor: 0,
           totalMinor: 25_000
         }
+      });
+    }],
+    ["POST /api/mbt/billing/mbbs/candidates/batch-preview", async (route) => {
+      calls.push(capturedCall(route.request()));
+      await fulfillJson(route, 200, {
+        schemaVersion: "mbbs-billing-candidate-batch-preview-v1",
+        postingMode: "local_only_preview",
+        externalWork: null,
+        completedMonth: "2038-08",
+        rateCardVersionId: RATE_VERSION_ID,
+        requestedCount: 2,
+        successCount: 2,
+        failureCount: 0,
+        results: [CANDIDATE_ID, CANDIDATE_ID_2].map((candidateId, index) => ({
+          candidateId,
+          status: "calculated",
+          candidate: {
+            references: [{ sourceType: "SO", rootReference: index === 0 ? "SOA01234" : "SOA05678" }]
+          },
+          rateCardVersionId: RATE_VERSION_ID,
+          rateCardVersionNumber: 1,
+          distanceMetres: index === 0 ? 31_000 : 42_000,
+          selectedBand: {
+            minimumMetres: 30_000,
+            maximumMetres: 50_000,
+            pricingBasis: "flat"
+          },
+          charge: {
+            itemCode: "DELIVERY_CHARGE_MBBS",
+            amountMinor: 25_000,
+            currency: "CAD",
+            estimatedTaxMinor: 0,
+            totalMinor: 25_000
+          }
+        }))
       });
     }],
     [`GET /api/mbt/billing/cases/${CASE_ID}`, async (route) => fulfillJson(route, 200, detail(browserState))],
@@ -334,51 +391,65 @@ test.afterAll(async () => {
   await removeFixture().catch(() => null);
 });
 
-test("P3-F23–P3-F28 browser: bound visit calculation, local approval, and variance review create no posting work", async ({ page, request }) => {
+test("billing browser batches selected monthly candidates and switches to billing-case master/detail without posting", async ({ page, request }) => {
   const { calls } = await installBillingApi(page, { commandsEnabled: true });
   await openBilling(page, request);
-  await expect(page.getByRole("heading", { name: "Reconcile, calculate, approve locally" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "MBT Billing" })).toBeVisible();
   await expect(page.getByText("No outbox or NetSuite transport")).toBeVisible();
+  await expect(page.getByRole("cell", { name: "SO SOA01234", exact: true })).toBeVisible();
+  await page.getByLabel("Completed month (Toronto)").fill("2038-08");
+  await page.getByRole("button", { name: "Refresh completed orders" }).click();
+  await page.getByLabel("Choose MBBS rate card").selectOption(RATE_VERSION_ID);
+  await page.getByLabel("Select all ready MBBS candidates").check();
+  await page.getByRole("button", { name: "Calculate selected orders" }).click();
+  await expect(page.locator("#mbbsBatchResultRows")).toContainText("SO SOA01234");
+  await expect(page.locator("#mbbsBatchResultRows")).toContainText("$250.00");
+
+  await page.getByRole("tab", { name: "Billing cases" }).click();
   await expect(page.getByRole("cell", { name: "MBT contract" })).toBeVisible();
-  await expect(page.getByRole("cell", { name: "SO SOA01234" })).toBeVisible();
-  await page.getByRole("button", { name: "Calculate charge" }).click();
-  await expect(page.locator("#mbbsCandidatePreview")).toContainText("DELIVERY_CHARGE_MBBS · $250.00");
-
   await page.getByRole("button", { name: "Review", exact: true }).click();
-  await expect(page.getByLabel("Service visit UUID")).toHaveValue(VISIT_ID);
-  await expect(page.getByLabel("Distance snapshot UUID")).toHaveValue(DISTANCE_ID);
-  const calculateForm = page.locator("#calculateBillingForm");
-  await calculateForm.getByLabel("Audit reason").fill("Synthetic browser calculation");
-  await calculateForm.getByRole("button", { name: "Calculate complete local draft" }).click();
-  await expect(page.getByRole("cell", { name: "Version 1 · draft" })).toBeVisible();
-  await expect(page.getByLabel("Scrollable billing version lines")
-    .getByRole("cell", { name: "$141.25", exact: true }).first()).toBeVisible();
-
-  const approvalForm = page.locator("#approveBillingForm");
-  await expect(approvalForm.getByLabel("Billing version UUID")).toHaveValue(VERSION_ID);
-  await approvalForm.getByLabel("Audit reason").fill("Synthetic local approval");
-  await approvalForm.getByRole("button", { name: "Approve locally" }).click();
-  await expect(page.getByRole("cell", { name: "Version 1 · approved" })).toBeVisible();
-
-  await page.getByRole("button", { name: "Review evidence" }).click();
-  await expect(page.getByRole("cell", { name: "rawMetres" })).toBeVisible();
-  await page.getByRole("button", { name: "Resolve" }).click();
-  const resolveForm = page.locator("#resolveVarianceForm");
-  await resolveForm.getByLabel("Audit note").fill("Server distance evidence accepted for the pilot");
-  await resolveForm.getByRole("button", { name: "Record immutable decision" }).click();
-  await expect(page.getByRole("cell", { name: "accepted_application" }).first()).toBeVisible();
+  await expect(page.locator("#billingCaseDetail")).toContainText("MBT contract · open · revision 1");
+  await expect(page.locator("#billingCaseDetail")).toContainText("No calculated version exists yet");
+  await page.getByLabel("Waiver amount (CAD)").fill("10.00");
+  await page.getByLabel("Waiver audit note").fill("Customer service recovery");
+  await page.getByLabel("Calculation audit reason").fill("Calculate selected completed visit");
+  await page.getByRole("button", { name: "Calculate selected case" }).click();
+  await expect(page.locator("#billingCaseDetail")).toContainText("Version 1 · draft");
+  await page.getByLabel("Approval audit reason").fill("Billing evidence reviewed");
+  await page.getByRole("button", { name: "Approve selected draft locally" }).click();
+  await expect(page.locator("#billingCaseDetail")).toContainText("MBT contract · approved · revision 3");
+  await expect(page.getByText("Calculation evidence and versions")).toHaveCount(0);
+  await expect(page.getByText("Pilot reconciliation")).toHaveCount(0);
 
   expect(calls.map(({ path }) => path)).toEqual([
-    `/api/mbt/billing/mbbs/candidates/${CANDIDATE_ID}/preview`,
+    "/api/mbt/billing/mbbs/candidates/batch-preview",
     `/api/mbt/billing/cases/${CASE_ID}/calculate`,
-    `/api/mbt/billing/cases/${CASE_ID}/approve-local`,
-    `/api/mbt/reconciliation/batches/${BATCH_ID}/resolve`
+    `/api/mbt/billing/cases/${CASE_ID}/approve-local`
   ]);
-  expect(calls[1].body.serviceVisitId).toBe(VISIT_ID);
-  expect(calls[1].body.distanceSnapshotId).toBe(DISTANCE_ID);
-  expect(calls[2].body.billingVersionId).toBe(VERSION_ID);
-  expect(calls[3].body.reconciliationRowId).toBe(ROW_ID);
-  expect(calls.slice(1).every(({ idempotencyKey }) => typeof idempotencyKey === "string" && idempotencyKey.length > 0)).toBe(true);
+  expect(calls[0].body).toEqual({
+    candidateIds: [CANDIDATE_ID, CANDIDATE_ID_2],
+    completedMonth: "2038-08",
+    rateCardVersionId: RATE_VERSION_ID
+  });
+  expect(calls[1].body).toEqual({
+    serviceVisitId: VISIT_ID,
+    distanceSnapshotId: DISTANCE_ID,
+    expectedRevision: 1,
+    componentQuantities: {},
+    customPrices: [],
+    waiver: {
+      amountMinor: 1000,
+      reason: "Customer service recovery",
+      description: "Audited billing waiver",
+      taxable: false
+    },
+    reason: "Calculate selected completed visit"
+  });
+  expect(calls[2].body).toEqual({
+    billingVersionId: VERSION_ID,
+    expectedRevision: 2,
+    reason: "Billing evidence reviewed"
+  });
   expect(calls.some(({ path }) => /netsuite|sales.?order|deposit|outbox|\/post/iu.test(path))).toBe(false);
 
   const accessibility = await new AxeBuilder({ page })
@@ -395,13 +466,13 @@ test("P3-F27 browser: closing billing commands keeps queue/detail review visible
   const { calls } = await installBillingApi(page, { commandsEnabled: false });
   await openBilling(page, request);
   await expect(page.getByText(/Commands are closed; retained evidence is available read-only/u)).toBeVisible();
+  await page.getByRole("tab", { name: "Billing cases" }).click();
   await expect(page.getByRole("cell", { name: "MBT contract" })).toBeVisible();
   await page.getByRole("button", { name: "Review", exact: true }).click();
-  await expect(page.getByLabel("Service visit UUID")).toHaveValue(VISIT_ID);
-  await page.getByRole("button", { name: "Review evidence" }).click();
-  await expect(page.getByRole("cell", { name: "rawMetres" })).toBeVisible();
+  await expect(page.locator("#billingCaseDetail")).toContainText("MBT contract · open · revision 1");
+  await page.getByRole("tab", { name: "Order candidates" }).click();
   const commands = page.locator(".mbt-command");
-  await expect(commands).toHaveCount(7);
+  await expect(commands).toHaveCount(4);
   for (let index = 0; index < await commands.count(); index += 1) {
     await expect(commands.nth(index)).toBeDisabled();
   }

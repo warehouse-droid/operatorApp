@@ -1,13 +1,17 @@
 const token = localStorage.getItem("mbbs.staff.token") || "";
+const MAX_BATCH_SELECTION = 100;
 
 const state = {
   commandsEnabled: false,
+  activeWorkspace: "candidates",
   mbbsCandidates: [],
+  mbbsRateOptions: [],
+  selectedMbbsCandidateId: null,
+  selectedMbbsCandidateIds: new Set(),
+  mbbsBatchResults: [],
   billingItems: [],
   billingCursor: null,
-  reconciliationItems: [],
-  reconciliationCursor: null,
-  selectedBatchId: null
+  selectedBillingCase: null
 };
 
 function element(id) {
@@ -58,21 +62,23 @@ async function api(path, { method = "GET", body, idempotencyKey = "" } = {}) {
   return payload;
 }
 
-function parseJson(id, label) {
-  const source = inputValue(id);
-  try {
-    return JSON.parse(source);
-  } catch {
-    throw new Error(`${label} must be valid JSON.`);
-  }
-}
-
 function money(value, currency = "CAD") {
   if (value === null || value === undefined) return "—";
-  return new Intl.NumberFormat("en-CA", {
-    style: "currency",
-    currency
-  }).format(Number(value) / 100);
+  return new Intl.NumberFormat("en-CA", { style: "currency", currency }).format(Number(value) / 100);
+}
+
+function cadMinorInput(id, label) {
+  const value = inputValue(id);
+  if (!value) return null;
+  if (!/^(?:0|[1-9]\d*)(?:\.\d{1,2})?$/.test(value)) {
+    throw new Error(`${label} must be a positive CAD value with at most two decimal places.`);
+  }
+  const [whole, fraction = ""] = value.split(".");
+  const amountMinor = (Number(whole) * 100) + Number(fraction.padEnd(2, "0"));
+  if (!Number.isSafeInteger(amountMinor) || amountMinor <= 0) {
+    throw new Error(`${label} is outside the supported CAD range.`);
+  }
+  return amountMinor;
 }
 
 function textCell(value) {
@@ -81,21 +87,13 @@ function textCell(value) {
   return cell;
 }
 
-function actionButton(label, focusKey, operation, { command = false } = {}) {
+function actionButton(label, focusKey, operation) {
   const button = document.createElement("button");
   button.type = "button";
   button.textContent = label;
   button.dataset.focusKey = focusKey;
-  if (command) button.classList.add("mbt-command");
-  button.disabled = command && !state.commandsEnabled;
   button.addEventListener("click", operation);
   return button;
-}
-
-function actionCell(button) {
-  const cell = document.createElement("td");
-  cell.append(button);
-  return cell;
 }
 
 function retainedFocusKey() {
@@ -116,6 +114,15 @@ function syncCommandButtons() {
       ? ""
       : "Billing commands are closed by the server safety gates.";
   }
+  const batch = element("calculateSelectedMbbsCandidates");
+  if (batch && state.commandsEnabled) {
+    batch.disabled = state.selectedMbbsCandidateIds.size === 0
+      || !inputValue("mbbsCompletedMonth")
+      || !inputValue("mbbsRateCardVersion");
+    batch.title = batch.disabled
+      ? "Choose a completion month, rate card, and at least one ready order."
+      : "";
+  }
 }
 
 async function loadCommandState() {
@@ -123,9 +130,31 @@ async function loadCommandState() {
   state.commandsEnabled = result.commandState?.enabled === true;
   syncCommandButtons();
   const suffix = state.commandsEnabled
-    ? "Local calculation, reconciliation, and approval commands are enabled."
+    ? "Local batch calculations and billing-only address corrections are enabled."
     : "Commands are closed; retained evidence is available read-only.";
   message("billingCommandMessage", `${suffix} No external posting path exists.`);
+}
+
+function selectBillingWorkspace(workspace, { focus = false } = {}) {
+  const candidatesSelected = workspace === "candidates";
+  state.activeWorkspace = candidatesSelected ? "candidates" : "cases";
+  const candidateTab = element("billingWorkspaceCandidateTab");
+  const caseTab = element("billingWorkspaceCaseTab");
+  const candidatePanel = element("mbbsCandidateWorkspace");
+  const casePanel = element("billingCaseWorkspace");
+  candidateTab?.setAttribute("aria-selected", String(candidatesSelected));
+  caseTab?.setAttribute("aria-selected", String(!candidatesSelected));
+  if (candidateTab) candidateTab.tabIndex = candidatesSelected ? 0 : -1;
+  if (caseTab) caseTab.tabIndex = candidatesSelected ? -1 : 0;
+  if (candidatePanel) candidatePanel.hidden = !candidatesSelected;
+  if (casePanel) casePanel.hidden = candidatesSelected;
+  if (focus) (candidatesSelected ? candidateTab : caseTab)?.focus();
+}
+
+function tabKeydown(event) {
+  if (!["ArrowLeft", "ArrowRight"].includes(event.key)) return;
+  event.preventDefault();
+  selectBillingWorkspace(state.activeWorkspace === "candidates" ? "cases" : "candidates", { focus: true });
 }
 
 function mbbsReferenceText(candidate) {
@@ -145,12 +174,104 @@ function mbbsCompletionTime(value) {
     }).format(parsed);
 }
 
+function mbbsCompletionMonth(value) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    year: "numeric",
+    month: "2-digit",
+    timeZone: "America/Toronto"
+  }).formatToParts(new Date(value));
+  const year = parts.find((part) => part.type === "year")?.value;
+  const month = parts.find((part) => part.type === "month")?.value;
+  return year && month ? `${year}-${month}` : "";
+}
+
 function mbbsSourceLabel(sourceSystem) {
   return ({
     driver_pwa: "Driver PWA",
     reconciliation: "Reconciliation",
     sales_order: "Sales Order"
   })[sourceSystem] || "Completed order";
+}
+
+function selectedMbbsCandidate() {
+  return state.mbbsCandidates.find((candidate) => candidate.candidateId === state.selectedMbbsCandidateId) || null;
+}
+
+function appendFact(list, label, value) {
+  const term = document.createElement("dt");
+  term.textContent = label;
+  const detail = document.createElement("dd");
+  detail.textContent = String(value || "—");
+  list.append(term, detail);
+}
+
+function renderMbbsCandidateDetail() {
+  const candidate = selectedMbbsCandidate();
+  const summary = element("selectedMbbsCandidate");
+  const facts = element("mbbsCandidateFacts");
+  const form = element("mbbsAddressOverrideForm");
+  if (!candidate) {
+    if (summary) summary.textContent = "Select an order to review its retained route.";
+    facts?.replaceChildren();
+    if (form) form.hidden = true;
+    return;
+  }
+  if (summary) summary.textContent = `${mbbsReferenceText(candidate)} · ${mbbsSourceLabel(candidate.sourceSystem)}`;
+  facts?.replaceChildren();
+  if (facts) {
+    appendFact(facts, "Completed", mbbsCompletionTime(candidate.completedAt));
+    appendFact(facts, "Origin", candidate.originLabel);
+    appendFact(facts, "Destination", candidate.destinationLabel || "Missing");
+    appendFact(facts, "Readiness", candidate.chargeable ? "Ready to calculate" : candidate.reason);
+    appendFact(
+      facts,
+      "Billing override",
+      candidate.addressOverride
+        ? `Revision ${candidate.addressOverride.revision} · ${candidate.addressOverride.destinationAddressText}`
+        : "None"
+    );
+  }
+  const canEditAddress = Boolean(
+    candidate.addressOverride
+    || ((candidate.references || []).length > 0
+      && candidate.originYardCode
+      && (!candidate.destinationLabel || candidate.routeStopCount < 2))
+  );
+  if (form) {
+    form.hidden = !canEditAddress;
+    form.dataset.candidateId = candidate.candidateId;
+  }
+  setInputValue("mbbsAddressOverrideText", candidate.addressOverride?.destinationAddressText || "");
+  setInputValue("mbbsAddressOverrideReason", "");
+  syncCommandButtons();
+}
+
+function selectMbbsCandidate(candidateId) {
+  state.selectedMbbsCandidateId = candidateId;
+  renderMbbsCandidateDetail();
+  renderMbbsCandidates();
+}
+
+function updateSelectAllState() {
+  const selectAll = element("selectAllMbbsCandidates");
+  if (!selectAll) return;
+  const ready = state.mbbsCandidates.filter((candidate) => candidate.chargeable).slice(0, MAX_BATCH_SELECTION);
+  const selectedReady = ready.filter((candidate) => state.selectedMbbsCandidateIds.has(candidate.candidateId));
+  selectAll.checked = ready.length > 0 && selectedReady.length === ready.length;
+  selectAll.indeterminate = selectedReady.length > 0 && selectedReady.length < ready.length;
+  selectAll.disabled = ready.length === 0;
+}
+
+function toggleCandidate(candidateId, checked) {
+  if (checked && state.selectedMbbsCandidateIds.size >= MAX_BATCH_SELECTION) {
+    message("mbbsCandidateMessage", `A calculation batch can contain at most ${MAX_BATCH_SELECTION} orders.`, "attention");
+    renderMbbsCandidates();
+    return;
+  }
+  if (checked) state.selectedMbbsCandidateIds.add(candidateId);
+  else state.selectedMbbsCandidateIds.delete(candidateId);
+  updateSelectAllState();
+  syncCommandButtons();
 }
 
 function renderMbbsCandidates() {
@@ -160,76 +281,191 @@ function renderMbbsCandidates() {
   rows.replaceChildren();
   if (!state.mbbsCandidates.length) {
     const row = document.createElement("tr");
-    const cell = textCell("No completed Driver PWA, reconciliation, or Sales Order candidates are available.");
-    cell.colSpan = 6;
+    const cell = textCell("No completed Driver PWA, reconciliation, or Sales Order candidates match this month.");
+    cell.colSpan = 5;
     row.append(cell);
     rows.append(row);
   }
   for (const candidate of state.mbbsCandidates) {
     const row = document.createElement("tr");
-    const action = candidate.chargeable
-      ? actionButton(
-        "Calculate charge",
-        `mbbs-candidate:${candidate.candidateId}`,
-        () => previewMbbsCandidate(candidate.candidateId),
-        { command: true }
-      )
-      : document.createTextNode("Evidence needed");
-    const actionColumn = document.createElement("td");
-    actionColumn.append(action);
+    if (candidate.candidateId === state.selectedMbbsCandidateId) row.dataset.selected = "true";
+    const selectionCell = document.createElement("td");
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.setAttribute("data-mbbs-candidate-id", candidate.candidateId);
+    checkbox.setAttribute("aria-label", `Select ${mbbsReferenceText(candidate)}`);
+    checkbox.checked = state.selectedMbbsCandidateIds.has(candidate.candidateId);
+    checkbox.disabled = !candidate.chargeable;
+    checkbox.addEventListener("change", () => toggleCandidate(candidate.candidateId, checkbox.checked));
+    selectionCell.append(checkbox);
+    const detailCell = document.createElement("td");
+    detailCell.append(actionButton(
+      "View",
+      `mbbs-detail:${candidate.candidateId}`,
+      () => selectMbbsCandidate(candidate.candidateId)
+    ));
     row.append(
-      textCell(mbbsSourceLabel(candidate.sourceSystem)),
+      selectionCell,
       textCell(mbbsReferenceText(candidate)),
       textCell(mbbsCompletionTime(candidate.completedAt)),
-      textCell(`${candidate.originLabel || "?"} → ${candidate.destinationLabel || "?"}`),
-      textCell(candidate.chargeable ? "Ready to calculate" : candidate.reason),
-      actionColumn
+      textCell(candidate.chargeable ? "Ready" : candidate.reason),
+      detailCell
     );
     rows.append(row);
   }
+  updateSelectAllState();
   syncCommandButtons();
   restoreFocus(focusKey, rows);
+}
+
+function renderMbbsRateOptions() {
+  const select = element("mbbsRateCardVersion");
+  if (!select) return;
+  const retained = select.value;
+  select.replaceChildren(new Option("Select an active rate card", ""));
+  for (const option of state.mbbsRateOptions) {
+    select.add(new Option(
+      `${option.displayName} · ${option.rateCardCode} · version ${option.versionNumber}`,
+      option.rateCardVersionId
+    ));
+  }
+  if (state.mbbsRateOptions.some((option) => option.rateCardVersionId === retained)) {
+    select.value = retained;
+  }
+  syncCommandButtons();
+}
+
+function mbbsCandidateQuery() {
+  const params = new URLSearchParams({ limit: "1000" });
+  const month = inputValue("mbbsCompletedMonth");
+  if (month) params.set("completedMonth", month);
+  return params;
 }
 
 async function loadMbbsCandidates() {
   message("mbbsCandidateMessage", "Loading completed Driver PWA, reconciliation, and Sales Order evidence…");
   try {
-    const result = await api("/api/mbt/billing/mbbs/candidates?limit=100");
+    const result = await api(`/api/mbt/billing/mbbs/candidates?${mbbsCandidateQuery()}`);
     state.mbbsCandidates = Array.isArray(result.items) ? result.items : [];
+    state.mbbsRateOptions = Array.isArray(result.rateOptions) ? result.rateOptions : [];
+    const readyIds = new Set(state.mbbsCandidates.filter((candidate) => candidate.chargeable)
+      .map((candidate) => candidate.candidateId));
+    state.selectedMbbsCandidateIds = new Set([...state.selectedMbbsCandidateIds]
+      .filter((candidateId) => readyIds.has(candidateId)));
+    if (!state.mbbsCandidates.some((candidate) => candidate.candidateId === state.selectedMbbsCandidateId)) {
+      state.selectedMbbsCandidateId = state.mbbsCandidates[0]?.candidateId || null;
+    }
+    renderMbbsRateOptions();
     renderMbbsCandidates();
+    renderMbbsCandidateDetail();
     const ready = state.mbbsCandidates.filter((candidate) => candidate.chargeable).length;
     message(
       "mbbsCandidateMessage",
-      `${state.mbbsCandidates.length} completed candidate(s) loaded; ${ready} ready for a local charge preview.`
+      `${state.mbbsCandidates.length} completed candidate(s) loaded; ${ready} ready. ${state.mbbsRateOptions.length} active MBBS rate card(s) available.`
     );
   } catch (error) {
     message("mbbsCandidateMessage", error.message, "attention");
   }
 }
 
-async function previewMbbsCandidate(candidateId) {
-  const output = element("mbbsCandidatePreview");
-  message("mbbsCandidateMessage", "Resolving the retained route and active MBBS rate…");
-  if (output) output.textContent = "";
+function toggleAllCandidates(checked) {
+  state.selectedMbbsCandidateIds.clear();
+  if (checked) {
+    const ready = state.mbbsCandidates.filter((candidate) => candidate.chargeable);
+    for (const candidate of ready.slice(0, MAX_BATCH_SELECTION)) {
+      state.selectedMbbsCandidateIds.add(candidate.candidateId);
+    }
+    if (ready.length > MAX_BATCH_SELECTION) {
+      message("mbbsCandidateMessage", `Selected the first ${MAX_BATCH_SELECTION} ready orders; calculate another batch for the remainder.`);
+    }
+  }
+  renderMbbsCandidates();
+}
+
+function selectedRateLabel(rateCardVersionId) {
+  const option = state.mbbsRateOptions.find((item) => item.rateCardVersionId === rateCardVersionId);
+  return option ? `${option.rateCardCode} v${option.versionNumber}` : rateCardVersionId;
+}
+
+function renderBatchResults() {
+  const rows = element("mbbsBatchResultRows");
+  if (!rows) return;
+  rows.replaceChildren();
+  if (!state.mbbsBatchResults.length) {
+    const row = document.createElement("tr");
+    const cell = textCell("No batch has been calculated yet.");
+    cell.colSpan = 5;
+    row.append(cell);
+    rows.append(row);
+    return;
+  }
+  for (const result of state.mbbsBatchResults) {
+    const candidate = result.candidate
+      || state.mbbsCandidates.find((item) => item.candidateId === result.candidateId)
+      || {};
+    const row = document.createElement("tr");
+    row.append(
+      textCell(mbbsReferenceText(candidate)),
+      textCell(result.status === "calculated" ? "Calculated" : result.error?.message || "Failed"),
+      textCell(result.status === "calculated" ? `${Number(result.distanceMetres).toLocaleString("en-CA")} m` : "—"),
+      textCell(result.status === "calculated" ? selectedRateLabel(result.rateCardVersionId) : "—"),
+      textCell(result.status === "calculated" ? money(result.charge.amountMinor, result.charge.currency) : "—")
+    );
+    rows.append(row);
+  }
+}
+
+async function calculateSelectedMbbsCandidates() {
+  const candidateIds = [...state.selectedMbbsCandidateIds];
+  const completedMonth = inputValue("mbbsCompletedMonth");
+  const rateCardVersionId = inputValue("mbbsRateCardVersion");
+  if (!completedMonth || !rateCardVersionId || candidateIds.length === 0) {
+    message("mbbsCandidateMessage", "Choose a completion month, rate card, and at least one ready order.", "attention");
+    return;
+  }
+  message("mbbsCandidateMessage", `Calculating ${candidateIds.length} selected completed order(s)…`);
   try {
-    const result = await api(`/api/mbt/billing/mbbs/candidates/${encodeURIComponent(candidateId)}/preview`, {
+    const result = await api("/api/mbt/billing/mbbs/candidates/batch-preview", {
       method: "POST",
-      body: {}
+      body: { candidateIds, completedMonth, rateCardVersionId }
     });
     if (result.postingMode !== "local_only_preview" || result.externalWork !== null) {
       throw new Error("The server did not preserve the local-only MBBS preview boundary.");
     }
-    if (output) {
-      output.textContent = [
-        `${result.charge.itemCode} · ${money(result.charge.amountMinor, result.charge.currency)}`,
-        `Distance: ${Number(result.distanceMetres).toLocaleString("en-CA")} m`,
-        `Band: ${Number(result.selectedBand.minimumMetres).toLocaleString("en-CA")}–${result.selectedBand.maximumMetres === null ? "open" : Number(result.selectedBand.maximumMetres).toLocaleString("en-CA")} m`,
-        "Local preview only · tax $0.00 · no NetSuite work created"
-      ].join("\n");
-    }
-    message("mbbsCandidateMessage", "Charge calculated locally from the active DELIVERY_CHARGE_MBBS rate.");
+    state.mbbsBatchResults = Array.isArray(result.results) ? result.results : [];
+    renderBatchResults();
+    message(
+      "mbbsCandidateMessage",
+      `${result.successCount} order(s) calculated; ${result.failureCount} failed. No billing, Dispatch, Driver PWA, outbox, or NetSuite rows were created.`,
+      result.failureCount ? "attention" : "safe"
+    );
   } catch (error) {
-    if (output) output.textContent = error.message;
+    message("mbbsCandidateMessage", error.message, "attention");
+  }
+}
+
+async function saveMbbsAddressOverride(event) {
+  event.preventDefault();
+  const form = element("mbbsAddressOverrideForm");
+  const candidateId = String(form?.dataset.candidateId || "");
+  const candidate = state.mbbsCandidates.find((item) => item.candidateId === candidateId);
+  const completedMonth = inputValue("mbbsCompletedMonth") || mbbsCompletionMonth(candidate?.completedAt);
+  message("mbbsCandidateMessage", "Saving the audited billing-only destination…");
+  try {
+    await api(`/api/mbt/billing/mbbs/candidates/${encodeURIComponent(candidateId)}/address-override`, {
+      method: "PUT",
+      idempotencyKey: commandIdentity("mbt-billing-address-override"),
+      body: {
+        completedMonth,
+        destinationAddressText: inputValue("mbbsAddressOverrideText"),
+        expectedRevision: candidate?.addressOverride?.revision || 0,
+        reason: inputValue("mbbsAddressOverrideReason")
+      }
+    });
+    state.selectedMbbsCandidateId = candidateId;
+    await loadMbbsCandidates();
+    message("mbbsCandidateMessage", "Billing-only address saved. Operational order and Driver PWA evidence was not changed.");
+  } catch (error) {
     message("mbbsCandidateMessage", error.message, "attention");
   }
 }
@@ -254,24 +490,26 @@ function renderBillingCases() {
   if (!state.billingItems.length) {
     const row = document.createElement("tr");
     const cell = textCell("No local billing cases match these filters.");
-    cell.colSpan = 6;
+    cell.colSpan = 5;
     row.append(cell);
     rows.append(row);
   }
   for (const item of state.billingItems) {
     const row = document.createElement("tr");
+    if (item.billingCaseId === state.selectedBillingCase?.billingCaseId) row.dataset.selected = "true";
     const source = item.caseType === "mbt_contract" ? "MBT contract" : "MBBS cross-charge";
+    const actionCell = document.createElement("td");
+    actionCell.append(actionButton(
+      "Review",
+      `billing:${item.billingCaseId}`,
+      () => loadBillingCase(item.billingCaseId)
+    ));
     row.append(
       textCell(source),
       textCell(item.customerNetsuiteId),
       textCell(item.status),
-      textCell(item.currentVersionNumber || "—"),
       textCell(money(item.totalMinor, item.currency)),
-      actionCell(actionButton(
-        "Review",
-        `billing:${item.billingCaseId}`,
-        () => loadBillingCase(item.billingCaseId)
-      ))
+      actionCell
     );
     rows.append(row);
   }
@@ -291,10 +529,7 @@ async function loadBillingCases({ reset = true } = {}) {
     state.billingItems.push(...(Array.isArray(result.items) ? result.items : []));
     state.billingCursor = result.nextCursor || null;
     renderBillingCases();
-    message(
-      "billingQueueMessage",
-      `${state.billingItems.length} case(s) loaded. All displayed cases are ${result.postingMode || "local_only"}.`
-    );
+    message("billingQueueMessage", `${state.billingItems.length} local case(s) loaded.`);
   } catch (error) {
     message("billingQueueMessage", error.message, "attention");
   }
@@ -306,24 +541,48 @@ function evidenceText(line) {
   return typeof source === "string" ? source : JSON.stringify(source);
 }
 
-function renderBillingCase(result) {
-  setInputValue("calculationCaseId", result.billingCaseId);
-  setInputValue("calculationVisitId", result.serviceVisitId || "");
-  setInputValue("calculationDistanceId", result.visitDistanceSnapshotId || "");
-  setInputValue("calculationRevision", result.revision);
-  setInputValue("approvalCaseId", result.billingCaseId);
-  setInputValue("approvalRevision", result.revision);
-  const draft = (result.versions || []).find((version) => version.status === "draft");
-  setInputValue("approvalVersionId", draft?.billingVersionId || "");
-  const summary = element("selectedBillingCase");
-  if (summary) {
-    const binding = result.caseType === "mbt_contract"
-      ? result.serviceVisitId && result.visitDistanceSnapshotId
-        ? `visit ${result.serviceVisitId} · distance ${result.visitDistanceSnapshotId}`
-        : "visit/distance binding incomplete"
-      : `cross-charge ${result.crossChargeCaseId || "retained"}`;
-    summary.textContent = `${result.caseType} · ${result.status} · revision ${result.revision} · ${result.postingMode} · ${binding}`;
+function renderBillingCaseActions(result) {
+  const actions = element("billingCaseActions");
+  const calculationForm = element("billingCaseCalculationForm");
+  const approvalForm = element("billingCaseApprovalForm");
+  const help = element("billingCaseActionHelp");
+  const versions = Array.isArray(result.versions) ? result.versions : [];
+  const currentVersion = versions.find((version) => (
+    Number(version.versionNumber) === Number(result.currentVersionNumber)
+  )) || versions[0] || null;
+  const canCalculate = result.caseType === "mbt_contract"
+    && Number(result.currentVersionNumber) === 0
+    && Boolean(result.serviceVisitId)
+    && Boolean(result.visitDistanceSnapshotId)
+    && ["open", "ready", "in_review"].includes(result.status);
+  const canApprove = result.caseType === "mbt_contract"
+    && currentVersion?.status === "draft"
+    && ["ready", "in_review"].includes(result.status);
+  if (actions) actions.hidden = false;
+  if (calculationForm) calculationForm.hidden = !canCalculate;
+  if (approvalForm) approvalForm.hidden = !canApprove;
+  if (help) {
+    help.textContent = canCalculate
+      ? "Calculate one complete local draft from this case's retained evidence."
+      : canApprove
+        ? `Draft version ${currentVersion.versionNumber} is ready for local approval.`
+        : result.caseType === "mbbs_cross_charge"
+          ? "MBBS cross-charge cases are generated from immutable completed-load snapshots."
+          : "No local action is available for this case state.";
   }
+  setInputValue("billingCaseDumpReceiptId", "");
+  setInputValue("billingCaseWaiverCad", "");
+  setInputValue("billingCaseWaiverReason", "");
+  setInputValue("billingCaseCalculationReason", "");
+  setInputValue("billingCaseApprovalReason", "");
+  syncCommandButtons();
+}
+
+function renderBillingCase(result) {
+  state.selectedBillingCase = result;
+  const source = result.caseType === "mbt_contract" ? "MBT contract" : "MBBS cross-charge";
+  const summary = element("selectedBillingCase");
+  if (summary) summary.textContent = `${source} · ${result.status} · revision ${result.revision} · ${result.postingMode}`;
   const rows = element("billingEvidenceRows");
   if (!rows) return;
   rows.replaceChildren();
@@ -359,278 +618,120 @@ function renderBillingCase(result) {
     row.append(cell);
     rows.append(row);
   }
-}
-
-function cadMinorInput(id, label) {
-  const value = inputValue(id);
-  if (!value) return null;
-  const amount = Number(value);
-  if (!Number.isFinite(amount) || amount <= 0 || Math.round(amount * 100) !== amount * 100) {
-    throw new Error(`${label} must be a positive CAD value with at most two decimal places.`);
-  }
-  return Math.round(amount * 100);
+  renderBillingCaseActions(result);
+  renderBillingCases();
 }
 
 async function loadBillingCase(caseId) {
-  message("billingCommandMessage", "Loading immutable calculation evidence…");
+  message("billingQueueMessage", "Loading the selected local billing case…");
   try {
     const result = await api(`/api/mbt/billing/cases/${encodeURIComponent(caseId)}`);
     renderBillingCase(result);
-    message("billingCommandMessage", "Calculation evidence loaded. Original versions remain queryable.");
+    message("billingQueueMessage", "Selected case detail loaded.");
   } catch (error) {
-    message("billingCommandMessage", error.message, "attention");
+    message("billingQueueMessage", error.message, "attention");
   }
 }
 
-async function calculateBilling(event) {
+async function calculateSelectedBillingCase(event) {
   event.preventDefault();
-  message("billingCommandMessage", "Calculating every draft line atomically…");
-  const caseId = inputValue("calculationCaseId");
-  const receiptId = inputValue("calculationReceiptId");
+  const selected = state.selectedBillingCase;
+  message("billingQueueMessage", "Calculating the selected case from retained evidence…");
   try {
-    const waiverAmountMinor = cadMinorInput("calculationWaiverCad", "Waiver amount");
-    const waiverReason = inputValue("calculationWaiverReason");
+    if (!selected?.billingCaseId || !selected.serviceVisitId || !selected.visitDistanceSnapshotId) {
+      throw new Error("The selected case does not contain complete visit and distance evidence.");
+    }
+    const waiverAmountMinor = cadMinorInput("billingCaseWaiverCad", "Waiver amount");
+    const waiverReason = inputValue("billingCaseWaiverReason");
     if (waiverAmountMinor !== null && !waiverReason) {
       throw new Error("Provide an audit note for the waiver.");
     }
-    const result = await api(`/api/mbt/billing/cases/${encodeURIComponent(caseId)}/calculate`, {
+    const dumpReceiptId = inputValue("billingCaseDumpReceiptId");
+    await api(`/api/mbt/billing/cases/${encodeURIComponent(selected.billingCaseId)}/calculate`, {
       method: "POST",
       idempotencyKey: commandIdentity("mbt-billing-calculate"),
       body: {
-        serviceVisitId: inputValue("calculationVisitId"),
-        distanceSnapshotId: inputValue("calculationDistanceId"),
-        ...(receiptId ? { dumpReceiptId: receiptId } : {}),
-        expectedRevision: Number(inputValue("calculationRevision")),
+        serviceVisitId: selected.serviceVisitId,
+        distanceSnapshotId: selected.visitDistanceSnapshotId,
+        ...(dumpReceiptId ? { dumpReceiptId } : {}),
+        expectedRevision: Number(selected.revision),
         componentQuantities: {},
         customPrices: [],
         ...(waiverAmountMinor === null ? {} : {
-          waiver: { amountMinor: waiverAmountMinor, reason: waiverReason, description: "Audited billing waiver", taxable: false }
+          waiver: {
+            amountMinor: waiverAmountMinor,
+            reason: waiverReason,
+            description: "Audited billing waiver",
+            taxable: false
+          }
         }),
-        reason: inputValue("calculationReason")
+        reason: inputValue("billingCaseCalculationReason")
       }
     });
-    message("billingCommandMessage", `Draft version ${result.versionNumber} is complete and local-only.`);
-    await Promise.all([loadBillingCase(caseId), loadBillingCases()]);
+    await loadBillingCases();
+    await loadBillingCase(selected.billingCaseId);
+    message("billingQueueMessage", "The complete draft was calculated locally. No external work was created.");
   } catch (error) {
-    message("billingCommandMessage", error.message, "attention");
+    message("billingQueueMessage", error.message, "attention");
   }
 }
 
-async function approveBilling(event) {
+async function approveSelectedBillingCase(event) {
   event.preventDefault();
-  const caseId = inputValue("approvalCaseId");
-  message("billingCommandMessage", "Validating the complete draft and every open variance…");
+  const selected = state.selectedBillingCase;
+  message("billingQueueMessage", "Validating the selected local draft…");
   try {
-    const result = await api(`/api/mbt/billing/cases/${encodeURIComponent(caseId)}/approve-local`, {
+    const currentVersion = (selected?.versions || []).find((version) => (
+      Number(version.versionNumber) === Number(selected.currentVersionNumber)
+    ));
+    if (!selected?.billingCaseId || currentVersion?.status !== "draft") {
+      throw new Error("The selected case does not have a current draft to approve.");
+    }
+    await api(`/api/mbt/billing/cases/${encodeURIComponent(selected.billingCaseId)}/approve-local`, {
       method: "POST",
       idempotencyKey: commandIdentity("mbt-billing-approve"),
       body: {
-        billingVersionId: inputValue("approvalVersionId"),
-        expectedRevision: Number(inputValue("approvalRevision")),
-        reason: inputValue("approvalReason")
+        billingVersionId: currentVersion.billingVersionId,
+        expectedRevision: Number(selected.revision),
+        reason: inputValue("billingCaseApprovalReason")
       }
     });
-    message("billingCommandMessage", `Version ${result.versionNumber} approved locally. External work created: 0.`);
-    await Promise.all([loadBillingCase(caseId), loadBillingCases()]);
-  } catch (error) {
-    message("billingCommandMessage", error.message, "attention");
-  }
-}
-
-async function generateMbbs(event) {
-  event.preventDefault();
-  const output = element("mbbsGenerationResult");
-  try {
-    const evidence = parseJson("mbbsGenerationJson", "MBBS snapshot generation evidence");
-    const result = await api("/api/mbt/billing/mbbs/generate", {
-      method: "POST",
-      idempotencyKey: commandIdentity("mbt-billing-mbbs"),
-      body: { ...evidence, reason: inputValue("mbbsGenerationReason") }
-    });
-    if (output) output.textContent = JSON.stringify(result, null, 2);
     await loadBillingCases();
+    await loadBillingCase(selected.billingCaseId);
+    message("billingQueueMessage", "The selected draft was approved locally. No external work was created.");
   } catch (error) {
-    if (output) output.textContent = error.message;
-  }
-}
-
-function reconciliationQuery() {
-  const params = new URLSearchParams({ limit: "25" });
-  if (state.reconciliationCursor) params.set("cursor", state.reconciliationCursor);
-  return params;
-}
-
-function renderReconciliationBatches() {
-  const rows = element("reconciliationBatchRows");
-  if (!rows) return;
-  const focusKey = retainedFocusKey();
-  rows.replaceChildren();
-  if (!state.reconciliationItems.length) {
-    const row = document.createElement("tr");
-    const cell = textCell("No retained reconciliation batches are available.");
-    cell.colSpan = 5;
-    row.append(cell);
-    rows.append(row);
-  }
-  for (const item of state.reconciliationItems) {
-    const row = document.createElement("tr");
-    row.append(
-      textCell(item.batchReference),
-      textCell(item.manualSource),
-      textCell(item.rowCount),
-      textCell(item.openVarianceCount),
-      actionCell(actionButton(
-        "Review evidence",
-        `reconciliation:${item.batchId}`,
-        () => loadReconciliationBatch(item.batchId)
-      ))
-    );
-    rows.append(row);
-  }
-  const more = element("moreReconciliation");
-  if (more) more.hidden = !state.reconciliationCursor;
-  restoreFocus(focusKey, rows);
-}
-
-async function loadReconciliationBatches({ reset = true } = {}) {
-  if (reset) {
-    state.reconciliationItems = [];
-    state.reconciliationCursor = null;
-  }
-  message("reconciliationMessage", "Loading immutable comparison batches…");
-  try {
-    const result = await api(`/api/mbt/reconciliation/batches?${reconciliationQuery()}`);
-    state.reconciliationItems.push(...(Array.isArray(result.items) ? result.items : []));
-    state.reconciliationCursor = result.nextCursor || null;
-    renderReconciliationBatches();
-    message("reconciliationMessage", `${state.reconciliationItems.length} batch(es) loaded.`);
-  } catch (error) {
-    message("reconciliationMessage", error.message, "attention");
-  }
-}
-
-function selectVariance(batchId, rowId) {
-  setInputValue("resolutionBatchId", batchId);
-  setInputValue("resolutionRowId", rowId);
-  element("resolutionNote")?.focus();
-}
-
-function renderReconciliationEvidence(batch) {
-  const rows = element("reconciliationEvidenceRows");
-  if (!rows) return;
-  rows.replaceChildren();
-  for (const item of batch.rows || []) {
-    const row = document.createElement("tr");
-    const differences = Array.isArray(item.differences)
-      ? item.differences.map((difference) => difference.field).join(", ")
-      : "";
-    const action = item.comparisonResult === "open_variance" && !item.resolution
-      ? actionButton(
-        "Resolve",
-        `variance:${item.reconciliationRowId}`,
-        () => selectVariance(batch.batchId, item.reconciliationRowId),
-        { command: true }
-      )
-      : document.createTextNode(item.effectiveResult || "Retained");
-    const actionColumn = document.createElement("td");
-    actionColumn.append(action);
-    row.append(
-      textCell(item.comparisonKind),
-      textCell(item.manualReference),
-      textCell(item.effectiveResult),
-      textCell(differences || "Exact match"),
-      actionColumn
-    );
-    rows.append(row);
-  }
-  syncCommandButtons();
-}
-
-async function loadReconciliationBatch(batchId) {
-  message("reconciliationMessage", "Loading retained application and manual snapshots…");
-  try {
-    const result = await api(`/api/mbt/reconciliation/batches/${encodeURIComponent(batchId)}`);
-    state.selectedBatchId = batchId;
-    renderReconciliationEvidence(result);
-    message("reconciliationMessage", `${result.rows.length} comparison row(s) loaded from ${result.batchReference}.`);
-  } catch (error) {
-    message("reconciliationMessage", error.message, "attention");
-  }
-}
-
-async function createReconciliation(event) {
-  event.preventDefault();
-  try {
-    const comparisons = parseJson("reconciliationComparisons", "Reconciliation comparisons");
-    if (!Array.isArray(comparisons)) throw new Error("Reconciliation comparisons must be a JSON array.");
-    const result = await api("/api/mbt/reconciliation/batches", {
-      method: "POST",
-      idempotencyKey: commandIdentity("mbt-reconciliation-create"),
-      body: {
-        batchReference: inputValue("reconciliationBatchReference"),
-        manualSource: inputValue("reconciliationManualSource"),
-        comparisons,
-        reason: inputValue("reconciliationCreateReason")
-      }
-    });
-    message("reconciliationMessage", `Batch ${result.batchReference} retained with ${result.rows.length} comparison(s).`);
-    await Promise.all([loadReconciliationBatches(), loadReconciliationBatch(result.batchId)]);
-  } catch (error) {
-    message("reconciliationMessage", error.message, "attention");
-  }
-}
-
-async function resolveVariance(event) {
-  event.preventDefault();
-  const batchId = inputValue("resolutionBatchId");
-  const correctionSource = inputValue("resolutionCorrection");
-  try {
-    const correctionReference = correctionSource
-      ? parseJson("resolutionCorrection", "Correction reference")
-      : null;
-    const result = await api(`/api/mbt/reconciliation/batches/${encodeURIComponent(batchId)}/resolve`, {
-      method: "POST",
-      idempotencyKey: commandIdentity("mbt-reconciliation-resolve"),
-      body: {
-        reconciliationRowId: inputValue("resolutionRowId"),
-        decision: inputValue("resolutionDecision"),
-        note: inputValue("resolutionNote"),
-        correctionReference
-      }
-    });
-    message("reconciliationMessage", `Immutable decision recorded: ${result.decision}.`);
-    await Promise.all([loadReconciliationBatches(), loadReconciliationBatch(batchId)]);
-  } catch (error) {
-    message("reconciliationMessage", error.message, "attention");
+    message("billingQueueMessage", error.message, "attention");
   }
 }
 
 function bind() {
-  element("refreshMbbsCandidates")?.addEventListener("click", () => loadMbbsCandidates());
+  element("billingWorkspaceCandidateTab")?.addEventListener("click", () => selectBillingWorkspace("candidates"));
+  element("billingWorkspaceCaseTab")?.addEventListener("click", () => selectBillingWorkspace("cases"));
+  element("billingWorkspaceCandidateTab")?.addEventListener("keydown", tabKeydown);
+  element("billingWorkspaceCaseTab")?.addEventListener("keydown", tabKeydown);
+  element("refreshMbbsCandidates")?.addEventListener("click", loadMbbsCandidates);
+  element("mbbsCompletedMonth")?.addEventListener("change", loadMbbsCandidates);
+  element("mbbsRateCardVersion")?.addEventListener("change", syncCommandButtons);
+  element("selectAllMbbsCandidates")?.addEventListener("change", (event) => toggleAllCandidates(event.target.checked));
+  element("calculateSelectedMbbsCandidates")?.addEventListener("click", calculateSelectedMbbsCandidates);
+  element("mbbsAddressOverrideForm")?.addEventListener("submit", saveMbbsAddressOverride);
   element("refreshBillingCases")?.addEventListener("click", () => loadBillingCases());
   element("billingStatusFilter")?.addEventListener("change", () => loadBillingCases());
   element("billingTypeFilter")?.addEventListener("change", () => loadBillingCases());
   element("billingMonthFilter")?.addEventListener("change", () => loadBillingCases());
   element("moreBillingCases")?.addEventListener("click", () => loadBillingCases({ reset: false }));
-  element("calculateBillingForm")?.addEventListener("submit", calculateBilling);
-  element("approveBillingForm")?.addEventListener("submit", approveBilling);
-  element("mbbsGenerationForm")?.addEventListener("submit", generateMbbs);
-  element("refreshReconciliation")?.addEventListener("click", () => loadReconciliationBatches());
-  element("moreReconciliation")?.addEventListener("click", () => loadReconciliationBatches({ reset: false }));
-  element("createReconciliationForm")?.addEventListener("submit", createReconciliation);
-  element("resolveVarianceForm")?.addEventListener("submit", resolveVariance);
-  const mbbs = element("mbbsGenerationJson");
-  if (mbbs) mbbs.placeholder = "{\n  \"currency\": \"CAD\",\n  \"rateCardVersionId\": \"…\",\n  \"rateDistanceBandId\": \"…\",\n  \"customerNetsuiteId\": \"…\",\n  \"completedLoadSnapshotIds\": [\"…\"]\n}";
-  const comparisons = element("reconciliationComparisons");
-  if (comparisons) comparisons.placeholder = "[{\n  \"comparisonKind\": \"distance\",\n  \"applicationEvidenceId\": \"…\",\n  \"manualReference\": \"…\",\n  \"manualSnapshot\": {}\n}]";
+  element("billingCaseCalculationForm")?.addEventListener("submit", calculateSelectedBillingCase);
+  element("billingCaseApprovalForm")?.addEventListener("submit", approveSelectedBillingCase);
 }
 
 async function load() {
   if (!token) return;
   bind();
+  selectBillingWorkspace("candidates");
+  renderBatchResults();
   try {
     await loadCommandState();
-    await Promise.all([loadMbbsCandidates(), loadBillingCases(), loadReconciliationBatches()]);
+    await Promise.all([loadMbbsCandidates(), loadBillingCases()]);
   } catch (error) {
     message("billingCommandMessage", error.message, "attention");
   }

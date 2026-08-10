@@ -13,12 +13,12 @@
           <span class="mbt-app-mark" aria-hidden="true">MB</span>
           <div>
             <p>MBT Bin Operations · Local billing evidence</p>
-            <h1 id="mbtTitle">Reconcile, calculate, approve locally</h1>
+            <h1 id="mbtTitle">MBT Billing</h1>
           </div>
         </div>
         <span class="mbt-app-mode">Local-only billing</span>
       </header>
-      <p class="mbt-lead">Review immutable pilot evidence and local-only billing versions. This surface cannot post, enqueue, or mutate NetSuite.</p>
+      <p class="mbt-lead">Calculate completed MBBS orders in batches and review local billing cases. This surface cannot post, enqueue, or mutate NetSuite.</p>
       <section class="mbt-status" aria-live="polite" aria-busy="true">
         <h2>Loading controlled status</h2>
         <p>Checking your live authority and the server safety gates.</p>
@@ -31,29 +31,74 @@
         <span>No outbox or NetSuite transport</span>
       </section>
 
-      <section class="mbt-panel" aria-labelledby="mbbsCandidateTitle">
+      <div class="mbt-tabs" role="tablist" aria-label="Billing workspaces">
+        <button id="billingWorkspaceCandidateTab" type="button" role="tab" aria-selected="true" aria-controls="mbbsCandidateWorkspace" tabindex="0">Order candidates</button>
+        <button id="billingWorkspaceCaseTab" type="button" role="tab" aria-selected="false" aria-controls="billingCaseWorkspace" tabindex="-1">Billing cases</button>
+      </div>
+
+      <section id="mbbsCandidateWorkspace" class="mbt-panel mbt-billing-workspace" role="tabpanel" aria-labelledby="billingWorkspaceCandidateTab" tabindex="0">
         <div class="mbt-panel-heading">
           <div>
             <h2 id="mbbsCandidateTitle">Completed MBBS order candidates</h2>
-            <p>Driver PWA and reconciliation completions are read locally. Calculate the chargeable amount from the active <code>DELIVERY_CHARGE_MBBS</code> rate without changing operational records or creating NetSuite work.</p>
+            <p>Driver PWA and reconciliation completions are read locally. Choose the completion month and the active rate card containing <code>DELIVERY_CHARGE_MBBS</code> to calculate selected orders in one batch.</p>
           </div>
           <button id="refreshMbbsCandidates" type="button">Refresh completed orders</button>
         </div>
-        <p id="mbbsCandidateMessage" class="mbt-inline-message" role="status" aria-live="polite"></p>
-        <div class="mbt-table-wrap" tabindex="0" aria-label="Scrollable completed MBBS order candidates">
-          <table>
-            <thead><tr><th scope="col">Completion source</th><th scope="col">Order reference</th><th scope="col">Completed</th><th scope="col">Route</th><th scope="col">Readiness</th><th scope="col">Action</th></tr></thead>
-            <tbody id="mbbsCandidateRows"></tbody>
-          </table>
+        <div class="mbt-form-row" role="search" aria-label="Completed MBBS order filters">
+          <label>Completed month (Toronto)
+            <input id="mbbsCompletedMonth" type="month" aria-describedby="mbbsCompletedMonthHelp" />
+            <span id="mbbsCompletedMonthHelp" class="mbt-field-help">Month boundaries use America/Toronto.</span>
+          </label>
+          <label>Choose MBBS rate card
+            <select id="mbbsRateCardVersion">
+              <option value="">Select an active rate card</option>
+            </select>
+          </label>
+          <button id="calculateSelectedMbbsCandidates" class="mbt-command" type="button" disabled>Calculate selected orders</button>
         </div>
-        <pre id="mbbsCandidatePreview" class="mbt-json-result" aria-live="polite"></pre>
+        <p id="mbbsCandidateMessage" class="mbt-inline-message" role="status" aria-live="polite"></p>
+        <div class="mbt-billing-master-detail">
+          <section id="mbbsCandidateMaster" class="mbt-billing-master" aria-label="Completed order master list">
+            <div class="mbt-table-wrap" tabindex="0" aria-label="Scrollable completed MBBS order candidates">
+              <table>
+                <thead><tr><th scope="col"><input id="selectAllMbbsCandidates" type="checkbox" aria-label="Select all ready MBBS candidates" /></th><th scope="col">Order</th><th scope="col">Completed</th><th scope="col">Readiness</th><th scope="col">Detail</th></tr></thead>
+                <tbody id="mbbsCandidateRows"></tbody>
+              </table>
+            </div>
+          </section>
+          <section id="mbbsCandidateDetail" class="mbt-billing-detail" aria-label="Selected completed order detail">
+            <h3>Order detail</h3>
+            <p id="selectedMbbsCandidate">Select an order to review its retained route.</p>
+            <dl id="mbbsCandidateFacts" class="mbt-detail-list"></dl>
+            <form id="mbbsAddressOverrideForm" class="mbt-form-stack" hidden>
+              <h4>Complete missing billing address</h4>
+              <p>This local override is used only for billing. Sales Order, reconciliation, Dispatch, and Driver PWA evidence remains unchanged.</p>
+              <label>Billing destination address
+                <textarea id="mbbsAddressOverrideText" rows="3" minlength="5" maxlength="1000" required></textarea>
+              </label>
+              <label>Audit reason
+                <textarea id="mbbsAddressOverrideReason" rows="2" minlength="3" maxlength="2000" required></textarea>
+              </label>
+              <button class="mbt-command" type="submit">Save billing-only address</button>
+            </form>
+          </section>
+        </div>
+        <section class="mbt-batch-results" aria-labelledby="mbbsBatchResultsTitle">
+          <h3 id="mbbsBatchResultsTitle">Batch calculation results</h3>
+          <div class="mbt-table-wrap" tabindex="0" aria-label="Scrollable MBBS batch calculation results">
+            <table>
+              <thead><tr><th scope="col">Order</th><th scope="col">Result</th><th scope="col">Distance</th><th scope="col">Rate</th><th scope="col">Charge</th></tr></thead>
+              <tbody id="mbbsBatchResultRows"></tbody>
+            </table>
+          </div>
+        </section>
       </section>
 
-      <section class="mbt-panel" aria-labelledby="billingQueueTitle">
+      <section id="billingCaseWorkspace" class="mbt-panel mbt-billing-workspace" role="tabpanel" aria-labelledby="billingWorkspaceCaseTab" tabindex="0" hidden>
         <div class="mbt-panel-heading">
           <div>
             <h2 id="billingQueueTitle">Billing case queue</h2>
-            <p>MBT contract and MBBS cross-charge cases share this read-only recovery queue.</p>
+            <p>MBT contract and MBBS cross-charge cases share this local queue. Select a case to review its evidence and available local actions.</p>
           </div>
           <button id="refreshBillingCases" type="button">Refresh cases</button>
         </div>
@@ -82,121 +127,61 @@
           </label>
         </div>
         <p id="billingQueueMessage" class="mbt-inline-message" role="status" aria-live="polite"></p>
-        <div class="mbt-table-wrap" tabindex="0" aria-label="Scrollable billing case queue">
-          <table>
-            <thead><tr><th scope="col">Source</th><th scope="col">Customer</th><th scope="col">Status</th><th scope="col">Version</th><th scope="col">Total</th><th scope="col">Action</th></tr></thead>
-            <tbody id="billingCaseRows"></tbody>
-          </table>
-        </div>
-        <button id="moreBillingCases" type="button" hidden>Load more cases</button>
-      </section>
-
-      <section class="mbt-panel" aria-labelledby="billingEvidenceTitle">
-        <div class="mbt-panel-heading">
-          <div>
-            <h2 id="billingEvidenceTitle">Calculation evidence and versions</h2>
-            <p id="selectedBillingCase">Select a case to inspect its immutable versions and calculated lines.</p>
-          </div>
-        </div>
-        <div class="mbt-table-wrap" tabindex="0" aria-label="Scrollable billing version lines">
-          <table>
-            <thead><tr><th scope="col">Version / line</th><th scope="col">Quantity</th><th scope="col">Net</th><th scope="col">Tax</th><th scope="col">Total</th><th scope="col">Evidence</th></tr></thead>
-            <tbody id="billingEvidenceRows"></tbody>
-          </table>
-        </div>
-
-        <div class="mbt-grid-two mbt-command-grid">
-          <form id="calculateBillingForm" class="mbt-form-stack">
-            <h3>Calculate an MBT draft</h3>
-            <label>Billing case UUID<input id="calculationCaseId" required autocomplete="off" /></label>
-            <label>Service visit UUID<input id="calculationVisitId" required autocomplete="off" /></label>
-            <label>Distance snapshot UUID<input id="calculationDistanceId" required autocomplete="off" /></label>
-            <label>Dump receipt UUID (optional)<input id="calculationReceiptId" autocomplete="off" /></label>
-            <fieldset class="mbt-inline-fieldset">
-              <legend>Optional audited waiver (negative adjustment)</legend>
-              <label>Amount (CAD)<input id="calculationWaiverCad" type="number" min="0.01" step="0.01" inputmode="decimal" /></label>
-              <label>Waiver note<input id="calculationWaiverReason" maxlength="2000" autocomplete="off" /></label>
-            </fieldset>
-            <label>Expected case revision<input id="calculationRevision" type="number" min="1" step="1" required /></label>
-            <label>Audit reason<textarea id="calculationReason" rows="2" required></textarea></label>
-            <button class="mbt-command" type="submit">Calculate complete local draft</button>
-          </form>
-
-          <form id="approveBillingForm" class="mbt-form-stack">
-            <h3>Approve the selected draft locally</h3>
-            <label>Billing case UUID<input id="approvalCaseId" required autocomplete="off" /></label>
-            <label>Billing version UUID<input id="approvalVersionId" required autocomplete="off" /></label>
-            <label>Expected case revision<input id="approvalRevision" type="number" min="1" step="1" required /></label>
-            <label>Audit reason<textarea id="approvalReason" rows="2" required></textarea></label>
-            <button class="mbt-command" type="submit">Approve locally</button>
-            <p>Approval freezes this complete version. It never posts externally.</p>
-          </form>
-        </div>
-        <p id="billingCommandMessage" class="mbt-inline-message" role="status" aria-live="polite"></p>
-      </section>
-
-      <section class="mbt-panel" aria-labelledby="mbbsGenerationTitle">
-        <h2 id="mbbsGenerationTitle">MBBS cross-charge generation</h2>
-        <p>Submit server-owned completed-load snapshot IDs with the customer, active rate version, distance band, and CAD currency. Caller-authored loads are rejected; SO, TO, PO, and VRMA evidence comes only from immutable snapshots.</p>
-        <form id="mbbsGenerationForm" class="mbt-form-stack">
-          <label>Snapshot generation evidence (JSON)<textarea id="mbbsGenerationJson" rows="12" spellcheck="false" required></textarea></label>
-          <label>Audit reason<textarea id="mbbsGenerationReason" rows="2" required></textarea></label>
-          <button class="mbt-command" type="submit">Generate local shadow cases</button>
-        </form>
-        <pre id="mbbsGenerationResult" class="mbt-json-result" aria-live="polite"></pre>
-      </section>
-
-      <section class="mbt-panel" aria-labelledby="reconciliationTitle">
-        <div class="mbt-panel-heading">
-          <div>
-            <h2 id="reconciliationTitle">Pilot reconciliation</h2>
-            <p>Manual evidence stays separate. A resolution records a decision; it never rewrites the original ledger.</p>
-          </div>
-          <button id="refreshReconciliation" type="button">Refresh batches</button>
-        </div>
-        <p id="reconciliationMessage" class="mbt-inline-message" role="status" aria-live="polite"></p>
-        <div class="mbt-table-wrap" tabindex="0" aria-label="Scrollable reconciliation batches">
-          <table>
-            <thead><tr><th scope="col">Batch</th><th scope="col">Manual source</th><th scope="col">Rows</th><th scope="col">Open blockers</th><th scope="col">Action</th></tr></thead>
-            <tbody id="reconciliationBatchRows"></tbody>
-          </table>
-        </div>
-        <button id="moreReconciliation" type="button" hidden>Load more batches</button>
-
-        <div class="mbt-table-wrap" tabindex="0" aria-label="Scrollable selected reconciliation evidence">
-          <table>
-            <thead><tr><th scope="col">Kind</th><th scope="col">Manual reference</th><th scope="col">Result</th><th scope="col">Differences</th><th scope="col">Action</th></tr></thead>
-            <tbody id="reconciliationEvidenceRows"></tbody>
-          </table>
-        </div>
-
-        <div class="mbt-grid-two mbt-command-grid">
-          <form id="createReconciliationForm" class="mbt-form-stack">
-            <h3>Create immutable comparison batch</h3>
-            <label>Batch reference<input id="reconciliationBatchReference" required /></label>
-            <label>Manual source<input id="reconciliationManualSource" required /></label>
-            <label>Comparisons (JSON array)<textarea id="reconciliationComparisons" rows="9" spellcheck="false" required></textarea></label>
-            <label>Audit reason<textarea id="reconciliationCreateReason" rows="2" required></textarea></label>
-            <button class="mbt-command" type="submit">Compare and retain evidence</button>
-          </form>
-
-          <form id="resolveVarianceForm" class="mbt-form-stack">
-            <h3>Resolve selected variance</h3>
-            <label>Batch UUID<input id="resolutionBatchId" required readonly /></label>
-            <label>Row UUID<input id="resolutionRowId" required readonly /></label>
-            <label>Decision<select id="resolutionDecision" required>
-              <option value="accepted_application">Accept application evidence</option>
-              <option value="accepted_manual">Accept manual evidence</option>
-              <option value="evidence_only">Evidence only</option>
-              <option value="corrected_application">Corrected application</option>
-              <option value="corrected_manual">Corrected manual</option>
-            </select></label>
-            <label>Audit note<textarea id="resolutionNote" rows="3" required></textarea></label>
-            <label>Correction reference (JSON; corrected decisions only)<textarea id="resolutionCorrection" rows="3" spellcheck="false"></textarea></label>
-            <button class="mbt-command" type="submit">Record immutable decision</button>
-          </form>
+        <div class="mbt-billing-master-detail">
+          <section id="billingCaseMaster" class="mbt-billing-master" aria-label="Billing case master list">
+            <div class="mbt-table-wrap" tabindex="0" aria-label="Scrollable billing case queue">
+              <table>
+                <thead><tr><th scope="col">Source</th><th scope="col">Customer</th><th scope="col">Status</th><th scope="col">Total</th><th scope="col">Detail</th></tr></thead>
+                <tbody id="billingCaseRows"></tbody>
+              </table>
+            </div>
+            <button id="moreBillingCases" type="button" hidden>Load more cases</button>
+          </section>
+          <section id="billingCaseDetail" class="mbt-billing-detail" aria-label="Selected billing case detail">
+            <h3>Billing case detail</h3>
+            <p id="selectedBillingCase">Select a case to review its local versions.</p>
+            <div class="mbt-table-wrap" tabindex="0" aria-label="Scrollable selected billing case versions">
+              <table>
+                <thead><tr><th scope="col">Version / line</th><th scope="col">Quantity</th><th scope="col">Net</th><th scope="col">Tax</th><th scope="col">Total</th><th scope="col">Evidence</th></tr></thead>
+                <tbody id="billingEvidenceRows"><tr><td colspan="6">No billing case selected.</td></tr></tbody>
+              </table>
+            </div>
+            <section id="billingCaseActions" class="mbt-form-stack" aria-labelledby="billingCaseActionsTitle" hidden>
+              <h4 id="billingCaseActionsTitle">Selected case actions</h4>
+              <p id="billingCaseActionHelp">Select a case to see its available local actions.</p>
+              <form id="billingCaseCalculationForm" class="mbt-form-stack" hidden>
+                <h4>Calculate selected case</h4>
+                <p>The selected case supplies its retained visit, distance, revision, and case identity automatically.</p>
+                <label>Dump receipt UUID (only when required)
+                  <input id="billingCaseDumpReceiptId" autocomplete="off" />
+                </label>
+                <fieldset class="mbt-inline-fieldset">
+                  <legend>Optional audited waiver</legend>
+                  <label>Waiver amount (CAD)
+                    <input id="billingCaseWaiverCad" type="number" min="0.01" step="0.01" inputmode="decimal" />
+                  </label>
+                  <label>Waiver audit note
+                    <input id="billingCaseWaiverReason" maxlength="2000" autocomplete="off" />
+                  </label>
+                </fieldset>
+                <label>Calculation audit reason
+                  <textarea id="billingCaseCalculationReason" rows="2" minlength="3" maxlength="2000" required></textarea>
+                </label>
+                <button class="mbt-command" type="submit" disabled>Calculate selected case</button>
+              </form>
+              <form id="billingCaseApprovalForm" class="mbt-form-stack" hidden>
+                <h4>Approve selected draft</h4>
+                <label>Approval audit reason
+                  <textarea id="billingCaseApprovalReason" rows="2" minlength="3" maxlength="2000" required></textarea>
+                </label>
+                <button class="mbt-command" type="submit" disabled>Approve selected draft locally</button>
+                <p>Approval freezes this complete version locally and creates no external work.</p>
+              </form>
+            </section>
+          </section>
         </div>
       </section>
+      <p id="billingCommandMessage" class="mbt-inline-message" role="status" aria-live="polite"></p>
     </main>
     <script src="/app-sidebar.js"></script>
     <script src="/mbt-shell.js" type="module"></script>

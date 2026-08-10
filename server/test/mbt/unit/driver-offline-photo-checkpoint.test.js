@@ -6,6 +6,8 @@ import test from "node:test";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
 
+/* global Response */
+
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SYNC_SOURCE = fs.readFileSync(
   path.resolve(HERE, "../../../public/driver-offline-sync.js"),
@@ -82,7 +84,9 @@ test("each successful photo is durably checkpointed before the next large photo 
     getManifest: async () => manifest,
     applySyncResponse: async (_partitionKey, response) => {
       for (const photo of response.photos || []) {
-        if (photo.durableReceipt) durable.push(photo.photoId);
+        if (photo.durableReceipt) {
+          durable.push(photo.photoId);
+        }
       }
     },
     markPhotoAttempt: async (photoId, phase) => order.push(`attempt:${photoId}:${phase}`),
@@ -127,7 +131,9 @@ test("each successful photo is durably checkpointed before the next large photo 
       if (String(url).startsWith("https://upload.test/")) {
         const photoId = String(url).split("/").pop();
         order.push(`upload:${photoId}`);
-        if (photoId === "photo-two") return jsonResponse({ error: "synthetic worker rejection" }, 400);
+        if (photoId === "photo-two") {
+          return jsonResponse({ error: "synthetic worker rejection" }, 400);
+        }
         return jsonResponse({
           objectReference: `r2://driver/driver-stop-photo/2026/08/05/${photoId}/evidence.jpg`,
           byteSize: photos[0].byteSize

@@ -8,18 +8,18 @@ const [html, script, css] = await Promise.all([
   readFile(new URL("../../../public/mbt-shell.css", import.meta.url), "utf8")
 ]);
 
-test("P3-F23–P3-F28 billing page exposes local-only case, evidence, allocation, and variance controls", () => {
+test("billing page exposes only the local candidate and billing-case workspaces", () => {
   assert.match(html, /Local only/i);
   assert.match(html, /No outbox or NetSuite transport/i);
   assert.match(html, /Billing case queue/i);
-  assert.match(html, /Calculation evidence and versions/i);
   assert.match(html, /Completed MBBS order candidates/i);
   assert.match(html, /Driver PWA and reconciliation/i);
   assert.match(html, /DELIVERY_CHARGE_MBBS/u);
-  assert.match(html, /MBBS cross-charge generation/i);
-  assert.match(html, /completed-load snapshot IDs/i);
-  assert.match(html, /caller-authored loads are rejected/i);
-  assert.match(html, /Pilot reconciliation/i);
+  assert.doesNotMatch(html, /Calculation evidence and versions/i);
+  assert.doesNotMatch(html, /Pilot reconciliation/i);
+  assert.doesNotMatch(html, /id=["']calculateBillingForm["']/u);
+  assert.doesNotMatch(html, /id=["']approveBillingForm["']/u);
+  assert.doesNotMatch(html, /id=["']reconciliationTitle["']/u);
   assert.match(html, /mbt-billing\.js/iu);
   assert.match(css, /data-mbt-surface=["']billing["']/u);
 });
@@ -31,24 +31,82 @@ test("P3-F27 browser contract keeps reads available while disabling every comman
   assert.match(script, /button\.disabled\s*=\s*!state\.commandsEnabled/u);
   assert.match(script, /\/api\/mbt\/billing\/cases/u);
   assert.match(script, /\/api\/mbt\/billing\/mbbs\/candidates/u);
-  assert.match(script, /\/candidates\/\$\{encodeURIComponent\(candidateId\)\}\/preview/u);
+  assert.match(script, /\/candidates\/batch-preview/u);
   assert.match(script, /local_only_preview/u);
-  assert.match(script, /\/api\/mbt\/reconciliation\/batches/u);
+  assert.doesNotMatch(script, /\/api\/mbt\/reconciliation\/batches/u);
 });
 
-test("P3-F25/P3-F26/P3-F28 browser contract delegates money and reconciliation truth to server endpoints", () => {
-  assert.match(script, /\/calculate/u);
-  assert.match(script, /\/approve-local/u);
-  assert.match(script, /\/billing\/mbbs\/generate/u);
-  assert.match(script, /MBBS snapshot generation evidence/u);
-  assert.match(script, /\/resolve/u);
+test("browser contract delegates candidate money to server endpoints and has no posting path", () => {
+  assert.match(script, /\/batch-preview/u);
   assert.doesNotMatch(script, /subtotalMinor\s*=|totalMinor\s*=|allocatedAmountMinor\s*=/u);
   assert.doesNotMatch(script, /netsuite.*(?:post|write)|(?:post|write).*netsuite/iu);
   assert.doesNotMatch(script, /innerHTML|insertAdjacentHTML/u);
 });
 
-test("P3-F25 browser contract prefills the server-bound visit and immutable visit-distance identity", () => {
-  assert.match(script, /calculationVisitId["'],\s*result\.serviceVisitId/u);
-  assert.match(script, /calculationDistanceId["'],\s*result\.visitDistanceSnapshotId/u);
-  assert.match(script, /visit\/distance binding incomplete/u);
+test("candidate and billing-case workspaces use top-level tabs and master/detail panels", () => {
+  for (const id of [
+    "billingWorkspaceCandidateTab",
+    "billingWorkspaceCaseTab",
+    "mbbsCandidateWorkspace",
+    "billingCaseWorkspace",
+    "mbbsCandidateMaster",
+    "mbbsCandidateDetail",
+    "billingCaseMaster",
+    "billingCaseDetail"
+  ]) {
+    assert.match(html, new RegExp(`id=["']${id}["']`, "u"), `${id} must be rendered.`);
+  }
+  assert.match(html, /role=["']tablist["']/u);
+  assert.match(html, /role=["']tabpanel["']/u);
+  assert.match(css, /mbt-billing-master-detail/u);
+  assert.match(script, /selectBillingWorkspace/u);
+});
+
+test("billing-case actions stay inside the selected detail and do not require copied UUIDs", () => {
+  for (const id of [
+    "billingCaseCalculationForm",
+    "billingCaseWaiverCad",
+    "billingCaseWaiverReason",
+    "billingCaseApprovalForm"
+  ]) {
+    assert.match(html, new RegExp(`id=["']${id}["']`, "u"), `${id} must be rendered in the detail.`);
+  }
+  assert.match(html, /Optional audited waiver/u);
+  assert.match(script, /state\.selectedBillingCase/u);
+  assert.match(script, /selected\.serviceVisitId/u);
+  assert.match(script, /selected\.visitDistanceSnapshotId/u);
+  assert.doesNotMatch(html, /Billing case UUID|Service visit UUID|Distance snapshot UUID/u);
+});
+
+test("missing candidate addresses are edited only through the audited billing override endpoint", () => {
+  for (const id of ["mbbsAddressOverrideForm", "mbbsAddressOverrideText", "mbbsAddressOverrideReason"]) {
+    assert.match(html, new RegExp(`id=["']${id}["']`, "u"), `${id} must be rendered.`);
+  }
+  assert.match(script, /\/address-override/u);
+  assert.match(script, /commandIdentity\(["']mbt-billing-address-override["']\)/u);
+  assert.doesNotMatch(script, /sales[_-]orders.*(?:put|patch|post)|driver.*(?:put|patch|post)/iu);
+});
+
+test("MBBS candidate workflow selects completion month, active rate version, and a bounded batch", () => {
+  for (const id of [
+    "mbbsCompletedMonth",
+    "mbbsRateCardVersion",
+    "selectAllMbbsCandidates",
+    "calculateSelectedMbbsCandidates",
+    "mbbsBatchResultRows"
+  ]) {
+    assert.match(html, new RegExp(`id=["']${id}["']`, "u"), `${id} must be rendered.`);
+  }
+  assert.match(html, /Completed month \(Toronto\)/u);
+  assert.match(html, /Choose MBBS rate card/u);
+  assert.match(html, /Calculate selected orders/u);
+  assert.match(script, /completedMonth/u);
+  assert.match(script, /rateOptions/u);
+  assert.match(script, /rateCardVersionId/u);
+  assert.match(script, /data-mbbs-candidate-id/u);
+  assert.match(script, /\/api\/mbt\/billing\/mbbs\/candidates\/batch-preview/u);
+  assert.match(script, /URLSearchParams\(\{ limit: "1000" \}\)/u);
+  assert.match(script, /candidateIds/u);
+  assert.match(script, /successCount/u);
+  assert.match(script, /failureCount/u);
 });

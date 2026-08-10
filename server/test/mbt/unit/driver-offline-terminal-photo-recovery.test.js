@@ -6,6 +6,8 @@ import test from "node:test";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
 
+/* global Response */
+
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const readPublic = (name) => fs.readFileSync(
   path.resolve(HERE, `../../../public/${name}`),

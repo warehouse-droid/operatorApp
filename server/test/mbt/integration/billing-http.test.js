@@ -83,6 +83,38 @@ const candidateService = Object.freeze({
       distanceMetres: route.providerMetres,
       charge: { itemCode: "DELIVERY_CHARGE_MBBS", amountMinor: 25000, currency: "CAD" }
     };
+  },
+  async previewMbbsBillingCandidatesBatch(input, dependencies) {
+    calls.push({ operation: "preview_mbbs_candidates_batch", input, dependencies });
+    const route = await dependencies.resolveDistance({ originYardCode: "2967", destinationAddressText: "Toronto" });
+    return {
+      schemaVersion: "mbbs-billing-candidate-batch-preview-v1",
+      postingMode: "local_only_preview",
+      externalWork: null,
+      requestedCount: input.candidateIds.length,
+      successCount: input.candidateIds.length,
+      failureCount: 0,
+      results: input.candidateIds.map((candidateId) => ({
+        candidateId,
+        status: "calculated",
+        distanceMetres: route.providerMetres,
+        charge: { itemCode: "DELIVERY_CHARGE_MBBS", amountMinor: 25000, currency: "CAD" }
+      }))
+    };
+  },
+  async setMbbsBillingCandidateAddressOverride(input) {
+    calls.push({ operation: "set_mbbs_candidate_address_override", input });
+    return {
+      status: 200,
+      replayed: false,
+      body: {
+        schemaVersion: "mbbs-billing-address-override-v1",
+        candidateId: input.candidateId,
+        destinationAddressText: input.destinationAddressText,
+        revision: 1,
+        postingMode: "local_only"
+      }
+    };
   }
 });
 
@@ -249,10 +281,11 @@ test("P3-F27 HTTP: a closed operational gate preserves read-only recovery and de
 });
 
 test("MBBS candidate HTTP lists retained completions and previews the exact active item locally", async () => {
-  const listed = await request("/api/mbt/billing/mbbs/candidates?limit=17", { actor: "billing" });
+  const listed = await request("/api/mbt/billing/mbbs/candidates?limit=17&completedMonth=2038-08", { actor: "billing" });
   assert.equal(listed.response.status, 200, JSON.stringify(listed.payload));
   assert.equal(calls[0].operation, "list_mbbs_candidates");
   assert.equal(calls[0].input.limit, 17);
+  assert.equal(calls[0].input.completedMonth, "2038-08");
   assert.deepEqual(calls[0].input.actor, {
     operatorId: ACTORS.billing.id,
     roles: ["mbt_billing"]
@@ -262,7 +295,12 @@ test("MBBS candidate HTTP lists retained completions and previews the exact acti
   const preview = await request(`/api/mbt/billing/mbbs/candidates/${CANDIDATE_ID}/preview`, {
     actor: "billing",
     method: "POST",
-    body: { candidateId: "forged" }
+    body: {
+      actor: { operatorId: "forged", roles: ["admin"] },
+      candidateId: "forged",
+      completedMonth: "2038-08",
+      rateCardVersionId: VERSION_ID
+    }
   });
   assert.equal(preview.response.status, 200, JSON.stringify(preview.payload));
   assert.equal(preview.payload.charge.itemCode, "DELIVERY_CHARGE_MBBS");
@@ -270,8 +308,56 @@ test("MBBS candidate HTTP lists retained completions and previews the exact acti
   assert.equal(preview.payload.externalWork, null);
   assert.equal(calls[0].operation, "preview_mbbs_candidate");
   assert.equal(calls[0].input.candidateId, CANDIDATE_ID);
+  assert.equal(calls[0].input.completedMonth, "2038-08");
+  assert.equal(calls[0].input.rateCardVersionId, VERSION_ID);
   assert.equal(calls[0].input.actor.operatorId, ACTORS.billing.id);
   assert.equal(typeof calls[0].dependencies.resolveDistance, "function");
+
+  calls.length = 0;
+  const batch = await request("/api/mbt/billing/mbbs/candidates/batch-preview", {
+    actor: "billing",
+    method: "POST",
+    body: {
+      actor: { operatorId: "forged", roles: ["admin"] },
+      candidateIds: [CANDIDATE_ID],
+      completedMonth: "2038-08",
+      rateCardVersionId: VERSION_ID
+    }
+  });
+  assert.equal(batch.response.status, 200, JSON.stringify(batch.payload));
+  assert.equal(batch.payload.postingMode, "local_only_preview");
+  assert.equal(batch.payload.externalWork, null);
+  assert.equal(calls[0].operation, "preview_mbbs_candidates_batch");
+  assert.deepEqual(calls[0].input.candidateIds, [CANDIDATE_ID]);
+  assert.equal(calls[0].input.completedMonth, "2038-08");
+  assert.equal(calls[0].input.rateCardVersionId, VERSION_ID);
+  assert.equal(calls[0].input.actor.operatorId, ACTORS.billing.id);
+  assert.equal(typeof calls[0].dependencies.resolveDistance, "function");
+
+  calls.length = 0;
+  const address = await request(`/api/mbt/billing/mbbs/candidates/${CANDIDATE_ID}/address-override`, {
+    actor: "billing",
+    method: "PUT",
+    idempotencyKey: "p3-billing-address-override",
+    body: {
+      actor: { operatorId: "forged", roles: ["admin"] },
+      candidateId: "forged",
+      completedMonth: "2038-08",
+      destinationAddressText: "200 King Street West, Toronto, ON",
+      expectedRevision: 0,
+      reason: "Verified with the customer"
+    }
+  });
+  assert.equal(address.response.status, 200, JSON.stringify(address.payload));
+  assert.equal(address.response.headers.get("x-mbt-idempotent-replay"), "false");
+  assert.equal(calls[0].operation, "set_mbbs_candidate_address_override");
+  assert.equal(calls[0].input.candidateId, CANDIDATE_ID);
+  assert.equal(calls[0].input.completedMonth, "2038-08");
+  assert.equal(calls[0].input.destinationAddressText, "200 King Street West, Toronto, ON");
+  assert.equal(calls[0].input.expectedRevision, 0);
+  assert.equal(calls[0].input.reason, "Verified with the customer");
+  assert.equal(calls[0].input.idempotencyKey, "p3-billing-address-override");
+  assert.equal(calls[0].input.actor.operatorId, ACTORS.billing.id);
 });
 
 test("P3-F25/P3-F27 HTTP: enabled commands replace forged actor and bind exact request identity", async () => {

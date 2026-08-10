@@ -30,7 +30,7 @@ test("F15: all MBT routes render one accessible controlled shell with an explici
     ["/mbt/config", "config", ["mbt-shell.js"], "Configuration"],
     ["/mbt/assets", "assets", ["mbt-assets.js"], "Bin asset registry"],
     ["/mbt/frontdesk", "frontdesk", ["mbt-frontdesk.js"], "Front Desk"],
-    ["/mbt/billing", "billing", ["mbt-shell.js", "mbt-billing.js"], "Reconcile, calculate, approve locally"]
+    ["/mbt/billing", "billing", ["mbt-shell.js", "mbt-billing.js"], "MBT Billing"]
   ]) {
     const response = await fetch(`${baseUrl}${path}`);
     const html = await response.text();

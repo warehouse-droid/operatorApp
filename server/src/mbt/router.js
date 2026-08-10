@@ -2751,10 +2751,69 @@ export function createMbtRouter(dependencies = {}) {
         const service = await resolveBillingCandidateService();
         const result = await service.listMbbsBillingCandidates({
           actor: commandActor(req),
-          limit: req.query.limit === undefined ? undefined : Number(req.query.limit)
+          limit: req.query.limit === undefined ? undefined : Number(req.query.limit),
+          completedMonth: req.query.completedMonth
         });
         noStore(res);
         res.json(result);
+      } catch (error) {
+        next(error);
+      }
+    }
+  );
+
+  router.post(
+    "/billing/mbbs/candidates/batch-preview",
+    requireMbtSurface("mbt_billing", "MBT Billing"),
+    async (req, res, next) => {
+      try {
+        await billingCommandCapability(req);
+        const body = requestObject(req.body);
+        const service = await resolveBillingCandidateService();
+        const result = await service.previewMbbsBillingCandidatesBatch({
+          actor: commandActor(req),
+          candidateIds: body.candidateIds,
+          completedMonth: body.completedMonth,
+          rateCardVersionId: body.rateCardVersionId
+        }, { resolveDistance: frontdeskPricing.resolveDistance });
+        noStore(res);
+        res.json(result);
+      } catch (error) {
+        next(error);
+      }
+    }
+  );
+
+  router.put(
+    "/billing/mbbs/candidates/:candidateId/address-override",
+    requireMbtSurface("mbt_billing", "MBT Billing"),
+    async (req, res, next) => {
+      try {
+        await billingCommandCapability(req);
+        const body = requestObject(req.body);
+        const service = await resolveBillingCandidateService();
+        const result = await service.setMbbsBillingCandidateAddressOverride({
+          actor: commandActor(req),
+          candidateId: requiredRequestText(
+            req.params.candidateId,
+            "MBT_BILLING_CANDIDATE_ID_INVALID",
+            "An MBBS billing candidate ID is required."
+          ),
+          completedMonth: body.completedMonth,
+          destinationAddressText: body.destinationAddressText,
+          expectedRevision: body.expectedRevision,
+          reason: body.reason,
+          idempotencyKey: requiredRequestText(
+            req.get("idempotency-key"),
+            "MBT_IDEMPOTENCY_KEY_REQUIRED",
+            "An Idempotency-Key header is required."
+          ),
+          correlationId: correlationId(req),
+          requestId: requestId(req)
+        });
+        noStore(res);
+        res.setHeader("x-mbt-idempotent-replay", String(result.replayed));
+        res.status(result.status).json(result.body);
       } catch (error) {
         next(error);
       }
@@ -2767,6 +2826,7 @@ export function createMbtRouter(dependencies = {}) {
     async (req, res, next) => {
       try {
         await billingCommandCapability(req);
+        const body = requestObject(req.body);
         const service = await resolveBillingCandidateService();
         const result = await service.previewMbbsBillingCandidate({
           actor: commandActor(req),
@@ -2774,7 +2834,9 @@ export function createMbtRouter(dependencies = {}) {
             req.params.candidateId,
             "MBT_BILLING_CANDIDATE_ID_INVALID",
             "An MBBS billing candidate ID is required."
-          )
+          ),
+          completedMonth: body.completedMonth,
+          rateCardVersionId: body.rateCardVersionId
         }, { resolveDistance: frontdeskPricing.resolveDistance });
         noStore(res);
         res.json(result);

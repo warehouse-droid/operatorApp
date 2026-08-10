@@ -1,6 +1,8 @@
 import { expect, test } from "./mbt-e2e-test.js";
 import { readFile } from "node:fs/promises";
 
+/* global HTMLMediaElement, HTMLVideoElement, MediaStream, document, getComputedStyle, localStorage, navigator, window */
+
 test.use({ serviceWorkers: "block" });
 
 const reloadOrder = {
@@ -93,14 +95,24 @@ async function installReloadApi(page) {
     if (url.pathname === "/api/delivery/notifications") {
       return json({ total: 0, salesOrder: { dueToday: 0 }, transferOrder: { dueToday: 0 }, items: [] });
     }
-    if (url.pathname === "/api/delivery/current-draft") return json(null);
-    if (url.pathname === "/api/delivery/saved-order-keys") return json([]);
-    if (url.pathname === "/api/operator/requests") return json([]);
+    if (url.pathname === "/api/delivery/current-draft") {
+      return json(null);
+    }
+    if (url.pathname === "/api/delivery/saved-order-keys") {
+      return json([]);
+    }
+    if (url.pathname === "/api/operator/requests") {
+      return json([]);
+    }
     if (url.pathname === "/api/delivery/load-trucks") {
       return json([{ truck_plate: "BD98773", load_count: 1, order_count: 1, first_load_name: "Load 1" }]);
     }
-    if (url.pathname === "/api/delivery/load-orders") return json([reloadOrder]);
-    if (url.pathname === "/api/delivery/orders/928827") return json(reloadOrder);
+    if (url.pathname === "/api/delivery/load-orders") {
+      return json([reloadOrder]);
+    }
+    if (url.pathname === "/api/delivery/orders/928827") {
+      return json(reloadOrder);
+    }
     return route.fulfill({ status: 404, contentType: "application/json", body: JSON.stringify({ error: `Unhandled ${url.pathname}` }) });
   });
 }
@@ -170,7 +182,9 @@ async function installVirtualRearCamera(page) {
 }
 
 test("packed reload load screen opens the camera and captures two photos", async ({ page }) => {
-  if (process.env.MBT_TEST_USE_LIVE_ASSETS !== "1") await installReloadAssets(page);
+  if (process.env.MBT_TEST_USE_LIVE_ASSETS !== "1") {
+    await installReloadAssets(page);
+  }
   await installReloadApi(page);
   await installVirtualRearCamera(page);
 
@@ -181,20 +195,35 @@ test("packed reload load screen opens the camera and captures two photos", async
   await expect(page.getByText("Local-only re-load")).toBeVisible();
   await expect(page.getByRole("button", { name: "Capture photo 1" })).toBeVisible();
   await expect.poll(() => page.evaluate(() => window.__reloadCameraOpenCount)).toBe(1);
-  const clippedCameraControls = await page.locator("#fulfillmentCamera, [data-action='capture-photo']").evaluateAll((elements) => (
-    elements.flatMap((element) => {
+  const clippedCameraControls = await page.locator("#fulfillmentCamera, [data-action='capture-photo']").evaluateAll((elements) => {
+    const clipsBounds = (scrollable, overflow, start, end, ancestorStart, ancestorEnd) => (
+      !scrollable
+      && ["hidden", "clip"].includes(overflow)
+      && (start < ancestorStart || end > ancestorEnd)
+    );
+    return elements.flatMap((element) => {
       const rect = element.getBoundingClientRect();
       let verticallyScrollable = false;
       let horizontallyScrollable = false;
       for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
         const style = getComputedStyle(ancestor);
         const ancestorRect = ancestor.getBoundingClientRect();
-        const clippedVertically = !verticallyScrollable
-          && ["hidden", "clip"].includes(style.overflowY)
-          && (rect.top < ancestorRect.top || rect.bottom > ancestorRect.bottom);
-        const clippedHorizontally = !horizontallyScrollable
-          && ["hidden", "clip"].includes(style.overflowX)
-          && (rect.left < ancestorRect.left || rect.right > ancestorRect.right);
+        const clippedVertically = clipsBounds(
+          verticallyScrollable,
+          style.overflowY,
+          rect.top,
+          rect.bottom,
+          ancestorRect.top,
+          ancestorRect.bottom
+        );
+        const clippedHorizontally = clipsBounds(
+          horizontallyScrollable,
+          style.overflowX,
+          rect.left,
+          rect.right,
+          ancestorRect.left,
+          ancestorRect.right
+        );
         if (clippedVertically || clippedHorizontally) {
           return [{
             element: element.id || element.getAttribute("data-action"),
@@ -208,12 +237,16 @@ test("packed reload load screen opens the camera and captures two photos", async
             }
           }];
         }
-        if (["auto", "scroll"].includes(style.overflowY)) verticallyScrollable = true;
-        if (["auto", "scroll"].includes(style.overflowX)) horizontallyScrollable = true;
+        if (["auto", "scroll"].includes(style.overflowY)) {
+          verticallyScrollable = true;
+        }
+        if (["auto", "scroll"].includes(style.overflowX)) {
+          horizontallyScrollable = true;
+        }
       }
       return [];
-    })
-  ));
+    });
+  });
   expect(clippedCameraControls).toEqual([]);
 
   const firstCapture = page.getByRole("button", { name: "Capture photo 1" });

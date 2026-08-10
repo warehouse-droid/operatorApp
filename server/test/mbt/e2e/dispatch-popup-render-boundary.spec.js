@@ -331,7 +331,7 @@ test("DP-17/DP-19 browser: compact Custom Order startup keeps completed travel s
       const body = requestInfo.postDataJSON();
       return json(route, {
         lease: { active: true, sessionId: body.sessionId, operatorName: "Compact browser" },
-        editLeaseToken: "compact-browser-lease"
+        editLeaseToken: "test-compact-browser-lease"
       });
     }
     if (path === "/api/dispatch/v2/plans/777/commands") {

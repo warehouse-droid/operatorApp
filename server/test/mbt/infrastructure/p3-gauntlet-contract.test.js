@@ -50,7 +50,12 @@ const P3_BASE_MUTANT_NAMES = Object.freeze([
   "P3 rate-card CSV accepts an extra sixth file",
   "P3 rate-card CSV ignores the aggregate byte ceiling",
   "P3 rate-card CSV apply ignores preview ownership",
-  "P3 rate-card CSV apply skips the transactional rollback hook"
+  "P3 rate-card CSV apply skips the transactional rollback hook",
+  "P3 MBBS candidate list regresses to a 200-order ceiling",
+  "P3 MBBS batch accepts a 101st order",
+  "P3 MBBS batch starts unbounded distance work",
+  "P3 MBBS selected rate ignores origin-yard scope",
+  "P3 MBBS address override ignores optimistic revision"
 ]);
 const P3_ADVERSARIAL_TESTS = Object.freeze([
   "p311-completed-load-snapshot-integrity.test.js",
@@ -248,10 +253,11 @@ test("P3.1: predeploy exposes dedicated P3 migration inspection and production c
 });
 
 test("P3.1: mutation selection contains a distinct nonempty P3 set instead of P1/P2 evidence", async () => {
-  const mutations = await readFile(
-    path.join(serverRoot, "test/support/run-mutations.mjs"),
-    "utf8"
-  );
+  const [mutations, packageSource] = await Promise.all([
+    readFile(path.join(serverRoot, "test/support/run-mutations.mjs"), "utf8"),
+    readFile(path.join(serverRoot, "package.json"), "utf8")
+  ]);
+  const packageJson = JSON.parse(packageSource);
   const p3Mutants = frozenArrayBody(mutations, "P3_MUTANTS");
   const p3MutantNames = [...p3Mutants.matchAll(/\n\s*name:\s*"([^"]+)"/g)]
     .map((match) => match[1]);
@@ -278,6 +284,13 @@ test("P3.1: mutation selection contains a distinct nonempty P3 set instead of P1
     "The mutation phase allowlist must include P3 instead of rejecting it."
   );
   assert.match(mutations, /Phase 3 mutation score:/);
+  assert.equal(
+    packageJson.scripts?.["mutate:mbt:mbbs-billing"],
+    "MBT_MUTATION_PHASE=P3 MBT_MUTATION_SCOPE=MBBS_BILLING node test/support/run-mutations.mjs"
+  );
+  assert.match(mutations, /mutationScope\s*===\s*"MBBS_BILLING"/u);
+  assert.match(mutations, /scope\s*===\s*"mbbs_billing"/u);
+  assert.match(mutations, /scopedP3Mutants\.length\s*!==\s*5/u);
 });
 
 test("P3.11: every unmutated Node test category is owned by main, coverage, and shuffle", async () => {

@@ -56,6 +56,11 @@ const P3_RATE_CSV_SERVICE_TARGET_TESTS = Object.freeze([
   "test/mbt/concurrency/rate-card-csv-import-races.test.js"
 ]);
 
+const P3_MBBS_BILLING_CANDIDATE_TARGET_TESTS = Object.freeze([
+  "test/mbt/integration/mbbs-billing-candidates.test.js",
+  "test/mbt/concurrency/mbbs-billing-address-override-races.test.js"
+]);
+
 const READ_STRATEGY_TARGET_TESTS = Object.freeze([
   "test/mbt/unit/netsuite-read-strategies-p2.test.js"
 ]);
@@ -595,6 +600,46 @@ const P3_MUTANTS = Object.freeze([
     targetTests: P3_RATE_CSV_SERVICE_TARGET_TESTS,
     from: "      await input.hooks?.afterDraftApply?.();",
     to: "      if (false) await input.hooks?.afterDraftApply?.();"
+  },
+  {
+    name: "P3 MBBS candidate list regresses to a 200-order ceiling",
+    scope: "mbbs_billing",
+    file: "mbbs-billing-candidate-service.js",
+    targetTests: P3_MBBS_BILLING_CANDIDATE_TARGET_TESTS,
+    from: "const MAX_CANDIDATES = 1000;",
+    to: "const MAX_CANDIDATES = 200;"
+  },
+  {
+    name: "P3 MBBS batch accepts a 101st order",
+    scope: "mbbs_billing",
+    file: "mbbs-billing-candidate-service.js",
+    targetTests: P3_MBBS_BILLING_CANDIDATE_TARGET_TESTS,
+    from: "const MAX_BATCH_CANDIDATES = 100;",
+    to: "const MAX_BATCH_CANDIDATES = 101;"
+  },
+  {
+    name: "P3 MBBS batch starts unbounded distance work",
+    scope: "mbbs_billing",
+    file: "mbbs-billing-candidate-service.js",
+    targetTests: P3_MBBS_BILLING_CANDIDATE_TARGET_TESTS,
+    from: "const BATCH_DISTANCE_CONCURRENCY = 5;",
+    to: "const BATCH_DISTANCE_CONCURRENCY = 100;"
+  },
+  {
+    name: "P3 MBBS selected rate ignores origin-yard scope",
+    scope: "mbbs_billing",
+    file: "mbbs-billing-candidate-service.js",
+    targetTests: P3_MBBS_BILLING_CANDIDATE_TARGET_TESTS,
+    from: "  if (graph.originYardCodes.size && !graph.originYardCodes.has(candidate.originYardCode)) {",
+    to: "  if (false && graph.originYardCodes.size && !graph.originYardCodes.has(candidate.originYardCode)) {"
+  },
+  {
+    name: "P3 MBBS address override ignores optimistic revision",
+    scope: "mbbs_billing",
+    file: "mbbs-billing-candidate-service.js",
+    targetTests: P3_MBBS_BILLING_CANDIDATE_TARGET_TESTS,
+    from: "      if (currentRevision !== expectedRevision) {",
+    to: "      if (currentRevision === expectedRevision) {"
   }
 ]);
 
@@ -646,14 +691,29 @@ if (LOCAL_ITEM_MUTANTS.length !== 7) {
 if (BILLING_APPROVAL_MUTANTS.length !== 4) {
   throw new Error(`The frozen billing-approval mutation set must contain exactly 4 mutants, found ${BILLING_APPROVAL_MUTANTS.length}.`);
 }
-if (P3_MUTANTS.length !== 22) {
-  throw new Error(`The frozen Phase 3 mutation set must contain exactly 22 mutants, found ${P3_MUTANTS.length}.`);
+if (P3_MUTANTS.length !== 27) {
+  throw new Error(`The frozen Phase 3 mutation set must contain exactly 27 mutants, found ${P3_MUTANTS.length}.`);
 }
 const mutationPhase = String(process.env.MBT_MUTATION_PHASE || "P1").toUpperCase();
 if (mutationPhase !== "P1" && mutationPhase !== "P2" && mutationPhase !== "P3") {
   throw new Error(`Unsupported MBT mutation phase: ${mutationPhase}.`);
 }
-const MUTANTS = mutationPhase === "P3"
+const mutationScope = String(process.env.MBT_MUTATION_SCOPE || "").trim().toUpperCase();
+if (mutationScope && mutationScope !== "MBBS_BILLING") {
+  throw new Error(`Unsupported MBT mutation scope: ${mutationScope}.`);
+}
+if (mutationScope && mutationPhase !== "P3") {
+  throw new Error("The MBBS Billing mutation scope requires Phase 3.");
+}
+const scopedP3Mutants = P3_MUTANTS.filter((mutant) => (
+  "scope" in mutant && mutant.scope === "mbbs_billing"
+));
+if (scopedP3Mutants.length !== 5) {
+  throw new Error(`The MBBS Billing mutation scope must contain exactly 5 mutants, found ${scopedP3Mutants.length}.`);
+}
+const MUTANTS = mutationScope === "MBBS_BILLING"
+  ? Object.freeze([...scopedP3Mutants])
+  : mutationPhase === "P3"
   ? Object.freeze([
     ...P1_MUTANTS,
     ...P2_MUTANTS,

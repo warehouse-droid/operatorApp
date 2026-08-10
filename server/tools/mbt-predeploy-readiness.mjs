@@ -87,7 +87,8 @@ export const REQUIRED_MBT_P3_MIGRATIONS = Object.freeze([
   "140_driver_yard_dependency_soft_mode.sql",
   "141_transfer_dependency_revision_reprint.sql",
   "142_mbt_frontdesk_customer_charge_requests.sql",
-  "143_mbt_item_charge_bases_and_aggregate.sql"
+  "143_mbt_item_charge_bases_and_aggregate.sql",
+  "144_mbt_mbbs_billing_address_overrides.sql"
 ]);
 
 export const REQUIRED_MBT_P3_FLAGS = Object.freeze([

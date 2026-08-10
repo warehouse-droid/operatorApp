@@ -747,6 +747,7 @@ export async function calculateMbtBillingCase(rawInput, dependencies = {}) {
     dumpReceiptId: input.dumpReceiptId ?? null,
     componentQuantities: input.componentQuantities ?? {},
     customPrices: input.customPrices ?? [],
+    waiver: input.waiver ?? null,
     amendsBillingVersionId: input.amendsBillingVersionId ?? null,
     amendmentKind: input.amendmentKind ?? null,
     reason

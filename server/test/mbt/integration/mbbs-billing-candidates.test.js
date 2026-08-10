@@ -7,14 +7,21 @@ import test, { after } from "node:test";
 import { beginRollbackContext, closeDb, query } from "../../../src/db.js";
 import {
   listMbbsBillingCandidates,
-  previewMbbsBillingCandidate
+  previewMbbsBillingCandidate,
+  previewMbbsBillingCandidatesBatch,
+  setMbbsBillingCandidateAddressOverride
 } from "../../../src/mbt/mbbs-billing-candidate-service.js";
 
 const ACTOR = Object.freeze({ operatorId: "mbbs-candidate-test", roles: Object.freeze(["admin"]) });
 
 after(closeDb);
 
-async function installRealMbbsRates() {
+async function installRealMbbsRates({
+  rateCardCode = "DELIVERY_CHARGE_MBBS",
+  displayName,
+  amountsMinor = [20_000, 25_000, 30_000, 35_000, 700],
+  originYardCodes = ["2967", "3445"]
+} = {}) {
   const suffix = crypto.randomUUID().replaceAll("-", "");
   const rateCardId = crypto.randomUUID();
   const rateCardVersionId = crypto.randomUUID();
@@ -35,8 +42,8 @@ async function installRealMbbsRates() {
   await query(
     `INSERT INTO mbt_rate_cards (
        rate_card_id, rate_card_code, display_name, currency, created_by, updated_by
-     ) VALUES ($1, 'DELIVERY_CHARGE_MBBS', $2, 'CAD', 'mbbs-candidate-test', 'mbbs-candidate-test')`,
-    [rateCardId, `MBBS candidate real rates ${suffix}`]
+     ) VALUES ($1, $2, $3, 'CAD', 'mbbs-candidate-test', 'mbbs-candidate-test')`,
+    [rateCardId, rateCardCode, displayName || `MBBS candidate real rates ${suffix}`]
   );
   await query(
     `INSERT INTO mbt_rate_card_versions (
@@ -52,7 +59,7 @@ async function installRealMbbsRates() {
     [3, 65_000, 75_000, 35_000, "flat"],
     [4, 75_000, null, 700, "per_km"]
   ];
-  for (const [sequence, minimum, maximum, amount, basis] of bands) {
+  for (const [sequence, minimum, maximum, _amount, basis] of bands) {
     await query(
       `INSERT INTO mbt_rate_distance_bands (
          rate_distance_band_id, rate_card_version_id, item_code,
@@ -62,9 +69,18 @@ async function installRealMbbsRates() {
        ) VALUES (
          $1, $2, 'DELIVERY_CHARGE_MBBS', 'mbbs_cross_charge', NULL,
          $3, $4, $5, $6, 'CAD', 'Real MBBS regression band',
-         $7, 'upper_inclusive', ARRAY['2967','3445']::text[]
+         $7, 'upper_inclusive', $8::text[]
        )`,
-      [crypto.randomUUID(), rateCardVersionId, sequence, minimum, maximum, amount, basis]
+      [
+        crypto.randomUUID(),
+        rateCardVersionId,
+        sequence,
+        minimum,
+        maximum,
+        amountsMinor[sequence],
+        basis,
+        originYardCodes
+      ]
     );
   }
   await query(
@@ -75,6 +91,16 @@ async function installRealMbbsRates() {
     [rateCardVersionId]
   );
   return rateCardVersionId;
+}
+
+async function installFulfilledSalesOrder({ netsuiteId, tranid, completedAt, dispatchAddress }) {
+  await query(
+    `INSERT INTO sales_orders (
+       netsuite_id, tranid, fulfillment_status, fulfilled_at, outbound_location,
+       dispatch_address, netsuite_active, synced_at
+     ) VALUES ($1, $2, 'fulfilled', $3::timestamptz, '2967', $4, true, $3::timestamptz)`,
+    [netsuiteId, tranid, completedAt, dispatchAddress]
+  );
 }
 
 async function localIsolationCounts() {
@@ -159,7 +185,8 @@ test("completed Driver PWA loads preview the active DELIVERY_CHARGE_MBBS band wi
       const calls = [];
       const preview = await previewMbbsBillingCandidate({
         actor: ACTOR,
-        candidateId: candidate.candidateId
+        candidateId: candidate.candidateId,
+        rateCardVersionId
       }, {
         async resolveDistance(input) {
           calls.push(input);
@@ -192,7 +219,7 @@ test("completed reconciliation orders use the actual-metre per-km band and remai
   const rollback = await beginRollbackContext();
   try {
     await rollback.run(async () => {
-      await installRealMbbsRates();
+      const rateCardVersionId = await installRealMbbsRates();
       const suffix = crypto.randomUUID().replaceAll("-", "").toUpperCase();
       const transferId = 9_600_000_000 + crypto.randomInt(100_000);
       const orderRef = `TO${suffix.slice(0, 8)}`;
@@ -224,7 +251,8 @@ test("completed reconciliation orders use the actual-metre per-km band and remai
 
       const preview = await previewMbbsBillingCandidate({
         actor: ACTOR,
-        candidateId: candidate.candidateId
+        candidateId: candidate.candidateId,
+        rateCardVersionId
       }, {
         async resolveDistance() {
           return {
@@ -240,6 +268,384 @@ test("completed reconciliation orders use the actual-metre per-km band and remai
       assert.equal(preview.selectedBand.pricingBasis, "per_km");
       assert.equal(preview.charge.amountMinor, 52_501);
       assert.deepEqual(await localIsolationCounts(), before);
+    });
+  } finally {
+    await rollback.rollback();
+  }
+});
+
+test("completed-month filtering uses Toronto boundaries and exposes every eligible active MBBS rate card", async () => {
+  const rollback = await beginRollbackContext();
+  try {
+    await rollback.run(async () => {
+      const suffix = crypto.randomUUID().replaceAll("-", "").toUpperCase();
+      const standardVersionId = await installRealMbbsRates({ displayName: "Standard MBBS delivery" });
+      const premiumCode = `MBBS_PREMIUM_${suffix}`;
+      const premiumVersionId = await installRealMbbsRates({
+        rateCardCode: premiumCode,
+        displayName: "Premium MBBS delivery",
+        amountsMinor: [41_000, 42_000, 43_000, 44_000, 900],
+        originYardCodes: ["3445"]
+      });
+      const inactiveCode = `MBBS_INACTIVE_${suffix}`;
+      const inactiveVersionId = await installRealMbbsRates({
+        rateCardCode: inactiveCode,
+        displayName: "Inactive MBBS delivery"
+      });
+      await query("UPDATE mbt_rate_cards SET active = false WHERE rate_card_code = $1", [inactiveCode]);
+
+      const base = 9_810_000_000 + (crypto.randomInt(100_000) * 10);
+      const orders = [
+        [base + 1, `SO-BEFORE-${suffix}`, "2038-03-01T04:59:59.999Z", "Before Toronto March"],
+        [base + 2, `SO-START-${suffix}`, "2038-03-01T05:00:00.000Z", "Start Toronto March"],
+        [base + 3, `SO-END-${suffix}`, "2038-04-01T03:59:59.999Z", "End Toronto March"],
+        [base + 4, `SO-AFTER-${suffix}`, "2038-04-01T04:00:00.000Z", "After Toronto March"]
+      ];
+      for (const [netsuiteId, tranid, completedAt, dispatchAddress] of orders) {
+        await installFulfilledSalesOrder({ netsuiteId, tranid, completedAt, dispatchAddress });
+      }
+
+      const listed = await listMbbsBillingCandidates({
+        actor: ACTOR,
+        completedMonth: "2038-03",
+        limit: 201
+      });
+      const references = listed.items
+        .flatMap((item) => item.references)
+        .map((reference) => reference.rootReference)
+        .filter((reference) => reference.endsWith(suffix));
+      assert.deepEqual(references.sort(), [`SO-END-${suffix}`, `SO-START-${suffix}`].sort());
+      assert.equal(listed.completedMonth, "2038-03");
+      assert.deepEqual(
+        listed.rateOptions
+          .filter((option) => [standardVersionId, premiumVersionId, inactiveVersionId]
+            .includes(option.rateCardVersionId))
+          .map((option) => ({
+            rateCardVersionId: option.rateCardVersionId,
+            rateCardCode: option.rateCardCode,
+            displayName: option.displayName,
+            versionNumber: option.versionNumber,
+            currency: option.currency
+          })),
+        [
+          {
+            rateCardVersionId: premiumVersionId,
+            rateCardCode: premiumCode,
+            displayName: "Premium MBBS delivery",
+            versionNumber: 1,
+            currency: "CAD"
+          },
+          {
+            rateCardVersionId: standardVersionId,
+            rateCardCode: "DELIVERY_CHARGE_MBBS",
+            displayName: "Standard MBBS delivery",
+            versionNumber: 1,
+            currency: "CAD"
+          }
+        ]
+      );
+
+      const selectedCandidate = listed.items.find(
+        (item) => item.references[0]?.rootReference === `SO-START-${suffix}`
+      );
+      assert.equal(selectedCandidate.chargeable, true, "another active graph keeps the candidate selectable");
+      let inapplicableResolverCalls = 0;
+      await assert.rejects(
+        previewMbbsBillingCandidate({
+          actor: ACTOR,
+          candidateId: selectedCandidate.candidateId,
+          completedMonth: "2038-03",
+          rateCardVersionId: premiumVersionId
+        }, {
+          async resolveDistance() {
+            inapplicableResolverCalls += 1;
+            return { providerMetres: 30_001 };
+          }
+        }),
+        (error) => error?.code === "MBT_MBBS_RATE_ORIGIN_UNAVAILABLE"
+      );
+      assert.equal(inapplicableResolverCalls, 0, "an inapplicable rate fails before paid distance work");
+
+      const rejectedBatch = await previewMbbsBillingCandidatesBatch({
+        actor: ACTOR,
+        candidateIds: [selectedCandidate.candidateId],
+        completedMonth: "2038-03",
+        rateCardVersionId: premiumVersionId
+      }, {
+        async resolveDistance() {
+          inapplicableResolverCalls += 1;
+          return { providerMetres: 30_001 };
+        }
+      });
+      assert.equal(rejectedBatch.failureCount, 1);
+      assert.equal(rejectedBatch.results[0].error.code, "MBT_MBBS_RATE_ORIGIN_UNAVAILABLE");
+      assert.equal(inapplicableResolverCalls, 0);
+
+      const preview = await previewMbbsBillingCandidate({
+        actor: ACTOR,
+        candidateId: selectedCandidate.candidateId,
+        completedMonth: "2038-03",
+        rateCardVersionId: standardVersionId
+      }, {
+        async resolveDistance() {
+          return { providerMetres: 30_001 };
+        }
+      });
+      assert.equal(preview.rateCardVersionId, standardVersionId);
+      assert.equal(preview.charge.amountMinor, 25_000);
+
+      await assert.rejects(
+        listMbbsBillingCandidates({ actor: ACTOR, completedMonth: "2038-3", limit: 25 }),
+        (error) => error?.code === "MBT_BILLING_COMPLETED_MONTH_INVALID"
+      );
+      await assert.rejects(
+        previewMbbsBillingCandidate({
+          actor: ACTOR,
+          candidateId: selectedCandidate.candidateId,
+          completedMonth: "2038-03"
+        }, { async resolveDistance() { return { providerMetres: 30_001 }; } }),
+        (error) => error?.code === "MBT_MBBS_RATE_SELECTION_REQUIRED"
+      );
+    });
+  } finally {
+    await rollback.rollback();
+  }
+});
+
+test("a missing destination can be fixed by an audited billing-only override without changing operational evidence", async () => {
+  const rollback = await beginRollbackContext();
+  try {
+    await rollback.run(async () => {
+      const rateCardVersionId = await installRealMbbsRates({ displayName: "Address override MBBS delivery" });
+      const suffix = crypto.randomUUID().replaceAll("-", "").toUpperCase();
+      const netsuiteId = 9_815_000_000 + crypto.randomInt(100_000);
+      const tranid = `SO-MISSING-${suffix}`;
+      await installFulfilledSalesOrder({
+        netsuiteId,
+        tranid,
+        completedAt: "2038-06-15T15:00:00.000Z",
+        dispatchAddress: null
+      });
+      const initial = await listMbbsBillingCandidates({
+        actor: ACTOR,
+        completedMonth: "2038-06",
+        limit: 200
+      });
+      const candidate = initial.items.find((item) => item.references[0]?.rootReference === tranid);
+      assert.equal(candidate?.chargeable, false);
+      assert.match(candidate?.reason || "", /dispatch address/iu);
+      assert.equal(candidate?.addressOverride, null);
+
+      const command = {
+        actor: ACTOR,
+        candidateId: candidate.candidateId,
+        completedMonth: "2038-06",
+        destinationAddressText: "200 King Street West, Toronto, ON M5H 3T4",
+        expectedRevision: 0,
+        reason: "Customer confirmed the billing route destination",
+        idempotencyKey: `address-${suffix}`,
+        correlationId: `correlation-${suffix}`,
+        requestId: `request-${suffix}`
+      };
+      const saved = await setMbbsBillingCandidateAddressOverride(command);
+      assert.equal(saved.status, 200);
+      assert.equal(saved.replayed, false);
+      assert.equal(saved.body.candidateId, candidate.candidateId);
+      assert.equal(saved.body.destinationAddressText, command.destinationAddressText);
+      assert.equal(saved.body.revision, 1);
+      assert.equal(saved.body.postingMode, "local_only");
+
+      const listed = await listMbbsBillingCandidates({
+        actor: ACTOR,
+        completedMonth: "2038-06",
+        limit: 200
+      });
+      const corrected = listed.items.find((item) => item.candidateId === candidate.candidateId);
+      assert.equal(corrected?.chargeable, true);
+      assert.equal(corrected?.destinationLabel, command.destinationAddressText);
+      assert.deepEqual(corrected?.addressOverride, {
+        destinationAddressText: command.destinationAddressText,
+        revision: 1,
+        updatedBy: ACTOR.operatorId,
+        updatedAt: corrected.addressOverride.updatedAt
+      });
+      assert.match(corrected?.addressOverride.updatedAt || "", /^20[0-9]{2}-/u);
+
+      let resolvedInput;
+      const preview = await previewMbbsBillingCandidate({
+        actor: ACTOR,
+        candidateId: candidate.candidateId,
+        completedMonth: "2038-06",
+        rateCardVersionId
+      }, {
+        async resolveDistance(input) {
+          resolvedInput = input;
+          return { providerMetres: 30_001 };
+        }
+      });
+      assert.equal(resolvedInput.destinationAddressText, command.destinationAddressText);
+      assert.equal(preview.charge.amountMinor, 25_000);
+
+      const evidence = await query(
+        `SELECT
+           (SELECT dispatch_address FROM sales_orders WHERE netsuite_id = $1) AS source_address,
+           (SELECT count(*)::int FROM mbt_mbbs_billing_address_overrides WHERE candidate_id = $2) AS override_count,
+           (SELECT count(*)::int FROM mbt_audit_events
+             WHERE action = 'mbt.billing.mbbs_candidate_address.overridden' AND entity_id = $2) AS audit_count,
+           (SELECT count(*)::int FROM mbt_command_receipts
+             WHERE command_name = 'mbt.billing.mbbs_candidate_address.override'
+               AND actor_operator_id = $3 AND idempotency_key = $4) AS receipt_count`,
+        [netsuiteId, candidate.candidateId, ACTOR.operatorId, command.idempotencyKey]
+      );
+      assert.deepEqual(evidence.rows[0], {
+        source_address: null,
+        override_count: 1,
+        audit_count: 1,
+        receipt_count: 1
+      });
+
+      const replay = await setMbbsBillingCandidateAddressOverride(command);
+      assert.equal(replay.replayed, true);
+      assert.deepEqual(replay.body, saved.body);
+      await assert.rejects(
+        setMbbsBillingCandidateAddressOverride({
+          ...command,
+          destinationAddressText: "300 Front Street West, Toronto, ON",
+          idempotencyKey: `stale-address-${suffix}`
+        }),
+        (error) => error?.code === "MBT_BILLING_ADDRESS_OVERRIDE_REVISION_CONFLICT"
+      );
+      const replayEvidence = await query(
+        `SELECT
+           (SELECT count(*)::int FROM mbt_mbbs_billing_address_overrides WHERE candidate_id = $1) AS override_count,
+           (SELECT count(*)::int FROM mbt_audit_events
+             WHERE action = 'mbt.billing.mbbs_candidate_address.overridden' AND entity_id = $1) AS audit_count`,
+        [candidate.candidateId]
+      );
+      assert.deepEqual(replayEvidence.rows[0], { override_count: 1, audit_count: 1 });
+    });
+  } finally {
+    await rollback.rollback();
+  }
+});
+
+test("a selected rate calculates 100 completed orders as one bounded read-only batch with per-row failures", async () => {
+  const rollback = await beginRollbackContext();
+  try {
+    await rollback.run(async () => {
+      await installRealMbbsRates({ displayName: "Standard MBBS delivery" });
+      const suffix = crypto.randomUUID().replaceAll("-", "").toUpperCase();
+      const batchVersionId = await installRealMbbsRates({
+        rateCardCode: `MBBS_BATCH_${suffix}`,
+        displayName: "Batch-selected MBBS delivery",
+        amountsMinor: [41_000, 42_000, 43_000, 44_000, 900]
+      });
+      const base = 9_820_000_000 + (crypto.randomInt(100_000) * 1_000);
+      await query(
+        `INSERT INTO sales_orders (
+           netsuite_id, tranid, fulfillment_status, fulfilled_at, outbound_location,
+           dispatch_address, netsuite_active, synced_at
+         )
+         SELECT $1::bigint + series,
+                $2 || lpad(series::text, 3, '0'),
+                'fulfilled',
+                '2039-07-15T14:00:00.000Z'::timestamptz + (series * interval '1 minute'),
+                '2967',
+                'MBBS Batch ' || series::text || ', Toronto, ON',
+                true,
+                '2039-07-15T14:00:00.000Z'::timestamptz + (series * interval '1 minute')
+           FROM generate_series(1, 100) AS series`,
+        [base, `SO-BATCH-${suffix}-`]
+      );
+      const listed = await listMbbsBillingCandidates({
+        actor: ACTOR,
+        completedMonth: "2039-07",
+        limit: 200
+      });
+      const selected = listed.items.filter(
+        (item) => item.references[0]?.rootReference.startsWith(`SO-BATCH-${suffix}-`)
+      );
+      assert.equal(selected.length, 100);
+      const candidateIds = selected.map((candidate) => candidate.candidateId).reverse();
+      const before = await localIsolationCounts();
+      let inFlight = 0;
+      let maximumInFlight = 0;
+      let distanceCalls = 0;
+      const distances = [30_000, 30_001, 50_001, 65_001, 75_001];
+
+      const batch = await previewMbbsBillingCandidatesBatch({
+        actor: ACTOR,
+        candidateIds,
+        completedMonth: "2039-07",
+        rateCardVersionId: batchVersionId
+      }, {
+        async resolveDistance(input) {
+          distanceCalls += 1;
+          inFlight += 1;
+          maximumInFlight = Math.max(maximumInFlight, inFlight);
+          try {
+            await Promise.resolve();
+            const index = Number(/MBBS Batch ([0-9]+)/u.exec(input.destinationAddressText)?.[1]);
+            if (index === 17) {
+              throw new Error("Synthetic route lookup failure");
+            }
+            return { provider: "synthetic_read_only", providerMetres: distances[index % distances.length] };
+          } finally {
+            inFlight -= 1;
+          }
+        }
+      });
+
+      assert.equal(batch.schemaVersion, "mbbs-billing-candidate-batch-preview-v1");
+      assert.equal(batch.postingMode, "local_only_preview");
+      assert.equal(batch.externalWork, null);
+      assert.equal(batch.completedMonth, "2039-07");
+      assert.equal(batch.rateCardVersionId, batchVersionId);
+      assert.equal(batch.requestedCount, 100);
+      assert.equal(batch.successCount, 99);
+      assert.equal(batch.failureCount, 1);
+      assert.deepEqual(batch.results.map((result) => result.candidateId), candidateIds);
+      assert.equal(batch.results.filter((result) => result.status === "calculated").length, 99);
+      assert.equal(batch.results.filter((result) => result.status === "failed").length, 1);
+      assert.equal(batch.results.find((result) => result.status === "failed")?.error.code, "MBT_MBBS_DISTANCE_LOOKUP_FAILED");
+      assert.deepEqual(
+        [...new Set(batch.results
+          .filter((result) => result.status === "calculated")
+          .map((result) => result.charge.amountMinor))].sort((left, right) => left - right),
+        [41_000, 42_000, 43_000, 44_000, 67_501]
+      );
+      assert.equal(distanceCalls, 100);
+      assert.ok(maximumInFlight > 1, "the batch should make safe parallel progress");
+      assert.ok(maximumInFlight <= 5, "distance resolution concurrency must stay bounded");
+      assert.deepEqual(await localIsolationCounts(), before);
+
+      await assert.rejects(
+        previewMbbsBillingCandidatesBatch({
+          actor: ACTOR,
+          candidateIds: [candidateIds[0], candidateIds[0]],
+          completedMonth: "2039-07",
+          rateCardVersionId: batchVersionId
+        }, { async resolveDistance() { return { providerMetres: 1 }; } }),
+        (error) => error?.code === "MBT_BILLING_CANDIDATE_BATCH_DUPLICATE"
+      );
+      await assert.rejects(
+        previewMbbsBillingCandidatesBatch({
+          actor: ACTOR,
+          candidateIds: [],
+          completedMonth: "2039-07",
+          rateCardVersionId: batchVersionId
+        }, { async resolveDistance() { return { providerMetres: 1 }; } }),
+        (error) => error?.code === "MBT_BILLING_CANDIDATE_BATCH_INVALID"
+      );
+      await assert.rejects(
+        previewMbbsBillingCandidatesBatch({
+          actor: ACTOR,
+          candidateIds: Array.from({ length: 101 }, () => candidateIds[0]),
+          completedMonth: "2039-07",
+          rateCardVersionId: batchVersionId
+        }, { async resolveDistance() { return { providerMetres: 1 }; } }),
+        (error) => error?.code === "MBT_BILLING_CANDIDATE_BATCH_INVALID"
+      );
     });
   } finally {
     await rollback.rollback();
