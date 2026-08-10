@@ -4406,17 +4406,21 @@ export async function updateScmPurchaseOrderSplitRef({
     const split = splitResult.rows[0];
     if (!split) throw new Error(`SCM split ${oldRef} was not found.`);
     const existing = await client.query(
-      `SELECT tranid FROM purchase_orders
-        WHERE lower(tranid) = lower($1)
-          AND netsuite_id <> $3
-       UNION
-       SELECT dispatch_ref AS tranid FROM purchase_orders
-        WHERE lower(dispatch_ref) = lower($1)
-          AND netsuite_id <> $3
+      `SELECT COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid) AS tranid
+         FROM purchase_orders po
+        WHERE lower(COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid)) = lower($1)
+          AND po.netsuite_id <> $3
+          AND NOT EXISTS (
+            SELECT 1
+              FROM dispatch_scm_po_splits retired_split
+             WHERE retired_split.split_po_id = po.netsuite_id
+               AND retired_split.status = 'cancelled'
+          )
        UNION
        SELECT split_po_ref AS tranid FROM dispatch_scm_po_splits
         WHERE lower(split_po_ref) = lower($1)
-          AND id <> $2`,
+          AND id <> $2
+          AND status = 'active'`,
       [nextRef, split.id, split.split_po_id]
     );
     if (existing.rowCount) throw new Error(`PO ref ${nextRef} already exists.`);
@@ -4491,9 +4495,16 @@ export async function updatePurchaseOrderDispatchRef({
     const newVisibleRef = normalizedRef || po.tranid;
     if (normalizedRef) {
       const existing = await client.query(
-        `SELECT tranid FROM purchase_orders
-          WHERE (lower(tranid) = lower($1) OR lower(dispatch_ref) = lower($1))
-            AND netsuite_id <> $2
+        `SELECT COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid) AS tranid
+           FROM purchase_orders po
+          WHERE lower(COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid)) = lower($1)
+            AND po.netsuite_id <> $2
+            AND NOT EXISTS (
+              SELECT 1
+                FROM dispatch_scm_po_splits retired_split
+               WHERE retired_split.split_po_id = po.netsuite_id
+                 AND retired_split.status = 'cancelled'
+            )
          UNION
          SELECT split_po_ref AS tranid FROM dispatch_scm_po_splits
           WHERE lower(split_po_ref) = lower($1)
@@ -4969,11 +4980,20 @@ export async function createScmPurchaseOrderSplit({
       }
     } else {
       const existing = await query(
-        `SELECT tranid FROM purchase_orders WHERE lower(tranid) = lower($1)
+        `SELECT COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid) AS tranid
+           FROM purchase_orders po
+          WHERE lower(COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid)) = lower($1)
+            AND NOT EXISTS (
+              SELECT 1
+                FROM dispatch_scm_po_splits retired_split
+               WHERE retired_split.split_po_id = po.netsuite_id
+                 AND retired_split.status = 'cancelled'
+            )
          UNION
-         SELECT dispatch_ref AS tranid FROM purchase_orders WHERE lower(dispatch_ref) = lower($1)
-         UNION
-         SELECT split_po_ref AS tranid FROM dispatch_scm_po_splits WHERE lower(split_po_ref) = lower($1)`,
+         SELECT split_po_ref AS tranid
+           FROM dispatch_scm_po_splits
+          WHERE lower(split_po_ref) = lower($1)
+            AND status = 'active'`,
         [splitRef]
       );
       if (existing.rowCount) throw new Error(`PO ref ${splitRef} already exists.`);
@@ -5089,7 +5109,12 @@ export async function createScmPurchaseOrderSplit({
     let splitOrderId = extendingSplit?.split_po_id || null;
     let split = extendingSplit;
     if (!split) {
-      splitOrderId = syntheticPurchaseOrderId(`scm-po:${source.netsuite_id}:${splitRef}`);
+      const splitIdentity = await query(
+        `SELECT nextval(pg_get_serial_sequence('dispatch_scm_po_splits', 'id'))::bigint AS id`
+      );
+      const splitHeaderId = splitIdentity.rows[0]?.id;
+      if (!splitHeaderId) throw new Error("Unable to reserve the SCM split identity.");
+      splitOrderId = syntheticPurchaseOrderId(`scm-po:${source.netsuite_id}:${splitRef}:${splitHeaderId}`);
       await query(
         `INSERT INTO purchase_orders (
            netsuite_id, tranid, trandate, vendor_id, vendor, status, status_text, foreign_total,
@@ -5130,10 +5155,11 @@ export async function createScmPurchaseOrderSplit({
 
       const splitHeader = await query(
         `INSERT INTO dispatch_scm_po_splits (
-           source_po_id, source_po_ref, split_po_id, split_po_ref, created_by, details
-         ) VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+           id, source_po_id, source_po_ref, split_po_id, split_po_ref, created_by, details
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
          RETURNING *`,
         [
+          splitHeaderId,
           source.netsuite_id,
           source.tranid,
           splitOrderId,
@@ -5229,11 +5255,11 @@ export async function createScmPurchaseOrderSplit({
         createdLines.push({ ...extended.rows[0], source_line_id: sourceLine.id });
         continue;
       }
-      const splitLineId = syntheticPurchaseOrderId(`scm-po-line:${splitRef}:${childLineIdentity}`);
+      const splitLineId = syntheticPurchaseOrderId(`scm-po-line:${split.id}:${splitRef}:${childLineIdentity}`);
       const originalLineKey = Number(sourceLine.line_id);
       const childLineKey = !usedChildLineKeys.has(String(originalLineKey))
         ? sourceLine.line_id
-        : syntheticPurchaseOrderId(`scm-po-line-key:${splitRef}:${childLineIdentity}`);
+        : syntheticPurchaseOrderId(`scm-po-line-key:${split.id}:${splitRef}:${childLineIdentity}`);
       usedChildLineKeys.add(String(childLineKey));
       const inserted = await query(
         `INSERT INTO purchase_order_lines (
