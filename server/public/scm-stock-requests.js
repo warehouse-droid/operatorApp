@@ -36,10 +36,7 @@ function scmStockNumber(value) {
 
 function scmStockDate(value) {
   if (!value) return "—";
-  const date = new Date(value);
-  return Number.isFinite(date.getTime())
-    ? new Intl.DateTimeFormat("en-CA", { dateStyle: "medium", timeStyle: "short" }).format(date)
-    : "—";
+  return window.MBBS_I18N?.displayDateTime?.(value) || String(value);
 }
 
 function scmStockPill(status) {

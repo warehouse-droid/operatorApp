@@ -58,7 +58,8 @@ const P3_RATE_CSV_SERVICE_TARGET_TESTS = Object.freeze([
 
 const P3_MBBS_BILLING_CANDIDATE_TARGET_TESTS = Object.freeze([
   "test/mbt/integration/mbbs-billing-candidates.test.js",
-  "test/mbt/concurrency/mbbs-billing-address-override-races.test.js"
+  "test/mbt/concurrency/mbbs-billing-address-override-races.test.js",
+  "test/mbt/integration/mbbs-order-billing-v3.red.test.js"
 ]);
 
 const READ_STRATEGY_TARGET_TESTS = Object.freeze([
@@ -626,12 +627,36 @@ const P3_MUTANTS = Object.freeze([
     to: "const BATCH_DISTANCE_CONCURRENCY = 100;"
   },
   {
-    name: "P3 MBBS selected rate ignores origin-yard scope",
+    name: "P3 MBBS two-address routes regress to origin-yard-only eligibility",
     scope: "mbbs_billing",
     file: "mbbs-billing-candidate-service.js",
     targetTests: P3_MBBS_BILLING_CANDIDATE_TARGET_TESTS,
-    from: "  if (graph.originYardCodes.size && !graph.originYardCodes.has(candidate.originYardCode)) {",
-    to: "  if (false && graph.originYardCodes.size && !graph.originYardCodes.has(candidate.originYardCode)) {"
+    from: "  if (!candidate.chargeable) {",
+    to: "  if (!candidate.chargeable || (graph.originYardCodes.size && !graph.originYardCodes.has(candidate.originYardCode))) {"
+  },
+  {
+    name: "P3 MBBS durable conversion skips immutable candidate snapshots",
+    scope: "mbbs_billing",
+    file: "mbbs-billing-candidate-service.js",
+    targetTests: P3_MBBS_BILLING_CANDIDATE_TARGET_TESTS,
+    from: "        const snapshotId = await freezeCandidateCalculation(calculation, actor);",
+    to: "        const snapshotId = crypto.randomUUID();"
+  },
+  {
+    name: "P3 MBBS durable conversion skips atomic failure hook",
+    scope: "mbbs_billing",
+    file: "shadow-billing-service.js",
+    targetTests: P3_MBBS_BILLING_CANDIDATE_TARGET_TESTS,
+    from: "      await dependencies.hooks.afterCaseInsert({ calculatedCase, durable });",
+    to: "      if (false) await dependencies.hooks.afterCaseInsert({ calculatedCase, durable });"
+  },
+  {
+    name: "P3 MBBS durable conversion excludes explicitly searched Pick-Up",
+    scope: "mbbs_billing",
+    file: "mbbs-billing-candidate-service.js",
+    targetTests: P3_MBBS_BILLING_CANDIDATE_TARGET_TESTS,
+    from: "        completedDateValue: day,\n        includeAllSalesMethods: true,\n        truncate: false",
+    to: "        completedDateValue: day,\n        includeAllSalesMethods: false,\n        truncate: false"
   },
   {
     name: "P3 MBBS address override ignores optimistic revision",
@@ -691,8 +716,8 @@ if (LOCAL_ITEM_MUTANTS.length !== 7) {
 if (BILLING_APPROVAL_MUTANTS.length !== 4) {
   throw new Error(`The frozen billing-approval mutation set must contain exactly 4 mutants, found ${BILLING_APPROVAL_MUTANTS.length}.`);
 }
-if (P3_MUTANTS.length !== 27) {
-  throw new Error(`The frozen Phase 3 mutation set must contain exactly 27 mutants, found ${P3_MUTANTS.length}.`);
+if (P3_MUTANTS.length !== 30) {
+  throw new Error(`The frozen Phase 3 mutation set must contain exactly 30 mutants, found ${P3_MUTANTS.length}.`);
 }
 const mutationPhase = String(process.env.MBT_MUTATION_PHASE || "P1").toUpperCase();
 if (mutationPhase !== "P1" && mutationPhase !== "P2" && mutationPhase !== "P3") {
@@ -708,8 +733,8 @@ if (mutationScope && mutationPhase !== "P3") {
 const scopedP3Mutants = P3_MUTANTS.filter((mutant) => (
   "scope" in mutant && mutant.scope === "mbbs_billing"
 ));
-if (scopedP3Mutants.length !== 5) {
-  throw new Error(`The MBBS Billing mutation scope must contain exactly 5 mutants, found ${scopedP3Mutants.length}.`);
+if (scopedP3Mutants.length !== 8) {
+  throw new Error(`The MBBS Billing mutation scope must contain exactly 8 mutants, found ${scopedP3Mutants.length}.`);
 }
 const MUTANTS = mutationScope === "MBBS_BILLING"
   ? Object.freeze([...scopedP3Mutants])

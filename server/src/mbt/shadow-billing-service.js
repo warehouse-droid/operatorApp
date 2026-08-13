@@ -5,12 +5,14 @@ import crypto from "node:crypto";
 import { query } from "../db.js";
 import { canonicalSha256, canonicalize } from "./canonical-json.js";
 import { executeMbtCommand } from "./command-repository.js";
+import { calculateDistanceBandChargeMinor } from "./distance-band-pricing.js";
 import { MbtError } from "./errors.js";
 import {
   calculateTorontoRentalExtensionDays,
   calculateMbbsCrossCharges,
   calculateMbtLocalBilling
 } from "./local-billing-calculator.js";
+import { selectRateBand } from "./rate-bands.js";
 import { assertExpectedRevision, nextRevision } from "./revisions.js";
 
 const QUANTITY_SCALE = 1_000_000;
@@ -1388,6 +1390,230 @@ async function insertOrVerifyCrossCharge(calculatedCase, source) {
     billingVersionId,
     billingLineId,
     versionStatus: "draft",
+    postingMode: "local_only"
+  };
+}
+
+/** @param {Array<Record<string, any>>} calculations @param {string} customerNetsuiteId */
+async function validatedCandidateRateGraphs(calculations, customerNetsuiteId) {
+  const versionIds = [...new Set(calculations.map((entry) => uuid(
+    entry.rateCardVersionId,
+    "Rate-card version ID"
+  )))];
+  const selected = await query(
+    `SELECT version.rate_card_version_id::text, card.currency,
+            card.customer_netsuite_id::text AS rate_customer_netsuite_id,
+            band.currency AS band_currency, band.rate_distance_band_id::text,
+            band.item_code, band.service_code, band.sequence_number::int,
+            band.minimum_metres::int, band.maximum_metres::int,
+            band.amount_minor::int, band.pricing_basis, band.boundary_rule
+       FROM mbt_rate_card_versions version
+       JOIN mbt_rate_cards card USING (rate_card_id)
+       JOIN mbt_rate_distance_bands band USING (rate_card_version_id)
+      WHERE version.rate_card_version_id = ANY($1::uuid[])
+        AND version.status = 'active'
+        AND card.active
+        AND version.effective_from <= now()
+        AND (version.effective_to IS NULL OR version.effective_to > now())
+        AND band.item_code = 'DELIVERY_CHARGE_MBBS'
+        AND band.service_code = 'mbbs_cross_charge'
+      ORDER BY version.rate_card_version_id, band.sequence_number, band.minimum_metres`,
+    [versionIds]
+  );
+  /** @type {Map<string, Array<Record<string, any>>>} */
+  const graphs = new Map();
+  for (const row of selected.rows) {
+    const versionId = String(row.rate_card_version_id);
+    const graph = graphs.get(versionId) || [];
+    graph.push({
+      rateDistanceBandId: String(row.rate_distance_band_id),
+      itemCode: String(row.item_code),
+      serviceCode: String(row.service_code),
+      sequenceNumber: Number(row.sequence_number),
+      minimumMetres: Number(row.minimum_metres),
+      maximumMetres: row.maximum_metres === null ? null : Number(row.maximum_metres),
+      amountMinor: Number(row.amount_minor),
+      pricingBasis: String(row.pricing_basis),
+      boundaryRule: String(row.boundary_rule),
+      currency: cad(row.currency),
+      bandCurrency: cad(row.band_currency),
+      rateCustomerNetsuiteId: row.rate_customer_netsuite_id === null
+        ? null
+        : String(row.rate_customer_netsuite_id)
+    });
+    graphs.set(versionId, graph);
+  }
+  if (graphs.size !== versionIds.length) {
+    throw failure(409, "MBT_MBBS_RATE_SELECTION_UNAVAILABLE", "Every selected MBBS rate card must remain active during billing conversion.");
+  }
+  for (const [versionId, graph] of graphs) {
+    if (graph.some((band) => band.currency !== band.bandCurrency)) {
+      throw failure(409, "MBT_MBBS_RATE_INVALID", `MBBS rate version ${versionId} has inconsistent currency evidence.`);
+    }
+    const mappedCustomerId = graph[0]?.rateCustomerNetsuiteId;
+    if (mappedCustomerId && mappedCustomerId !== customerNetsuiteId) {
+      throw failure(409, "MBT_CROSS_CHARGE_CUSTOMER_RATE_MISMATCH", `MBBS rate version ${versionId} is mapped to a different canonical customer.`);
+    }
+    selectRateBand(graph, 0);
+  }
+  return graphs;
+}
+
+/** @param {unknown} value */
+function candidateBillingCustomerId(value) {
+  const selected = requiredText(value, "Customer NetSuite ID");
+  if (!/^\d+$/u.test(selected) || BigInt(selected) < 1n) {
+    throw failure(400, "MBT_CROSS_CHARGE_CUSTOMER_INVALID", "Choose a valid canonical billing customer.");
+  }
+  return selected;
+}
+
+/** @param {unknown} value */
+function candidateCalculations(value) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 100) {
+    throw failure(400, "MBT_BILLING_CANDIDATE_BATCH_INVALID", "Provide between 1 and 100 server-calculated MBBS orders.");
+  }
+  return value.map((entry) => object(entry, "Calculated MBBS candidate"));
+}
+
+/** @param {string} customerNetsuiteId */
+async function assertActiveCandidateCustomer(customerNetsuiteId) {
+  const customer = await query(
+    `SELECT netsuite_id::text
+       FROM netsuite_customers
+      WHERE netsuite_id = $1::bigint
+        AND active
+        AND currency = 'CAD'`,
+    [customerNetsuiteId]
+  );
+  if (!customer.rowCount) {
+    throw failure(409, "MBT_CROSS_CHARGE_CUSTOMER_INVALID", "The selected billing customer is not an active CAD customer in the canonical customer master.");
+  }
+}
+
+async function selectedCandidateLocalItem() {
+  const selected = await query(
+    `SELECT item_code, revision::int, netsuite_mapping_local_key
+       FROM mbt_local_item_settings
+      WHERE item_code = 'DELIVERY_CHARGE_MBBS'
+        AND item_type = 'delivery_fee'
+        AND active`
+  );
+  if (!selected.rowCount) {
+    throw failure(409, "MBT_BILLING_LOCAL_ITEM_INVALID", "DELIVERY_CHARGE_MBBS must remain an active delivery item.");
+  }
+  return selected.rows[0];
+}
+
+/** @param {Record<string, any>} entry @param {Map<string, Array<Record<string, any>>>} graphs */
+function candidateBillingLoad(entry, graphs) {
+  const candidate = object(entry.candidate, "Calculated candidate identity");
+  const graph = graphs.get(String(entry.rateCardVersionId));
+  const distanceMetres = nonnegativeInteger(entry.distanceMetres, "Cross-charge distance");
+  const selected = graph
+    ? /** @type {(Record<string, any> & {amountMinor: unknown}) | undefined} */ (
+      selectRateBand(graph, distanceMetres)
+    )
+    : null;
+  const selectedBand = object(entry.selectedBand, "Selected rate band");
+  const charge = object(entry.charge, "Calculated charge");
+  const chargeCurrency = cad(charge.currency);
+  const matches = selected && [
+    [selected.rateDistanceBandId, String(selectedBand.rateDistanceBandId)],
+    [selected.itemCode, String(charge.itemCode)],
+    [calculateDistanceBandChargeMinor(selected, distanceMetres), Number(charge.amountMinor)],
+    [chargeCurrency, selected.currency]
+  ].every(([actual, expected]) => actual === expected);
+  if (!matches || !selected) {
+    throw failure(409, "MBT_MBBS_CALCULATION_STALE", "A selected MBBS calculation no longer matches the active rate graph.");
+  }
+  return {
+    physicalLoadId: requiredText(candidate.physicalLoadId, "Physical-load ID"),
+    completedAt: requiredText(candidate.completedAt, "Completed-load time"),
+    planDate: requiredText(candidate.planDate || String(candidate.completedAt).slice(0, 10), "Plan date"),
+    truckId: null,
+    driverId: null,
+    calculatedMetres: distanceMetres,
+    sharedTotalMinor: nonnegativeInteger(charge.amountMinor, "Shared cross-charge total"),
+    references: candidate.references,
+    _rate: {
+      rateCardVersionId: String(entry.rateCardVersionId),
+      rateDistanceBandId: selected.rateDistanceBandId,
+      currency: selected.currency
+    }
+  };
+}
+
+/**
+ * Persist a server-calculated candidate batch without opening another command
+ * receipt. The caller must already be inside executeMbtCommand's transaction;
+ * this boundary independently revalidates every active rate band and cent.
+ *
+ * @param {unknown} rawInput
+ * @param {{hooks?: Record<string, Function>}} [dependencies]
+ */
+export async function persistCalculatedMbbsCandidateBatch(rawInput, dependencies = {}) {
+  const input = object(rawInput, "MBBS candidate billing batch");
+  const actor = billingActor(input.actor);
+  const customerNetsuiteId = candidateBillingCustomerId(input.customerNetsuiteId);
+  const reason = requiredText(input.reason, "Generation reason");
+  const correlationId = requiredText(input.correlationId, "Correlation ID");
+  const calculations = candidateCalculations(input.calculations);
+  await assertActiveCandidateCustomer(customerNetsuiteId);
+  const graphs = await validatedCandidateRateGraphs(calculations, customerNetsuiteId);
+  const item = await selectedCandidateLocalItem();
+  const loads = calculations.map((entry) => candidateBillingLoad(entry, graphs));
+  const calculation = calculateMbbsCrossCharges({
+    currency: "CAD",
+    loads: loads.map(({ _rate, ...load }) => load)
+  });
+  const rateByLoad = new Map(loads.map((load) => [load.physicalLoadId, load._rate]));
+  const sourceBase = {
+    customerNetsuiteId,
+    calculation,
+    completedLoadSnapshotIdsByPhysicalLoad: object(
+      input.completedLoadSnapshotIdsByPhysicalLoad,
+      "Completed-load snapshot map"
+    ),
+    actorId: requiredText(actor.operatorId, "Actor ID"),
+    reason,
+    correlationId,
+    localItemCode: String(item.item_code),
+    localItemRevision: Number(item.revision),
+    localItemMappingKey: item.netsuite_mapping_local_key
+  };
+  const cases = [];
+  for (const calculatedCase of calculation.cases) {
+    const rate = rateByLoad.get(calculatedCase.physicalLoadId);
+    if (!rate) {
+      throw failure(500, "MBT_BILLING_DRAFT_INCOMPLETE", "A calculated MBBS load lost its validated rate identity.");
+    }
+    const durable = await insertOrVerifyCrossCharge(calculatedCase, {
+      ...sourceBase,
+      ...rate
+    });
+    cases.push({
+      deduplicationKey: calculatedCase.deduplicationKey,
+      sourceType: calculatedCase.sourceType,
+      rootReference: calculatedCase.rootReference,
+      physicalLoadId: calculatedCase.physicalLoadId,
+      allocatedAmountMinor: calculatedCase.allocatedAmountMinor,
+      rateCardVersionId: rate.rateCardVersionId,
+      rateDistanceBandId: rate.rateDistanceBandId,
+      ...durable
+    });
+    if (typeof dependencies.hooks?.afterCaseInsert === "function") {
+      await dependencies.hooks.afterCaseInsert({ calculatedCase, durable });
+    }
+  }
+  return {
+    generationId: stableId("mbt.cross_charge.candidate_generation", cases.map((entry) => entry.deduplicationKey)),
+    currency: "CAD",
+    cases,
+    allocationGroups: calculation.allocationGroups.map((group) => ({
+      ...group,
+      allocationGroupId: stableId("mbt.cross_charge.allocation_group", group.allocationKey)
+    })),
     postingMode: "local_only"
   };
 }

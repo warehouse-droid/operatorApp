@@ -97,8 +97,8 @@ async function installFulfilledSalesOrder({ netsuiteId, tranid, completedAt, dis
   await query(
     `INSERT INTO sales_orders (
        netsuite_id, tranid, fulfillment_status, fulfilled_at, outbound_location,
-       dispatch_address, netsuite_active, synced_at
-     ) VALUES ($1, $2, 'fulfilled', $3::timestamptz, '2967', $4, true, $3::timestamptz)`,
+       sales_order_type, dispatch_address, netsuite_active, synced_at
+     ) VALUES ($1, $2, 'fulfilled', $3::timestamptz, '2967', 'Delivery', $4, true, $3::timestamptz)`,
     [netsuiteId, tranid, completedAt, dispatchAddress]
   );
 }
@@ -126,8 +126,8 @@ test("completed Driver PWA loads preview the active DELIVERY_CHARGE_MBBS band wi
       await query(
         `INSERT INTO sales_orders (
            netsuite_id, tranid, fulfillment_status, fulfilled_at, outbound_location,
-           dispatch_address, netsuite_active, synced_at
-         ) VALUES ($1, $2, 'fulfilled', now(), '2967', $3, true, now())`,
+           sales_order_type, dispatch_address, netsuite_active, synced_at
+         ) VALUES ($1, $2, 'fulfilled', now(), '2967', 'Delivery', $3, true, now())`,
         [salesOrderId, orderRef, "100 Queen Street West, Toronto, ON"]
       );
       await query(
@@ -155,13 +155,14 @@ test("completed Driver PWA loads preview the active DELIVERY_CHARGE_MBBS band wi
       await query(
         `INSERT INTO sales_orders (
            netsuite_id, tranid, fulfillment_status, fulfilled_at,
-           outbound_location, dispatch_address, netsuite_active, synced_at
+           outbound_location, sales_order_type, dispatch_address, netsuite_active, synced_at
          )
          SELECT $1::bigint + series,
                 $2 || series::text,
                 'fulfilled',
                 '2040-08-10T12:00:00.000Z'::timestamptz,
                 'UNMAPPED',
+                'Delivery',
                 '1 Incomplete Evidence Road, Toronto, ON',
                 true,
                 '2040-08-10T12:00:00.000Z'::timestamptz
@@ -349,37 +350,35 @@ test("completed-month filtering uses Toronto boundaries and exposes every eligib
         (item) => item.references[0]?.rootReference === `SO-START-${suffix}`
       );
       assert.equal(selectedCandidate.chargeable, true, "another active graph keeps the candidate selectable");
-      let inapplicableResolverCalls = 0;
-      await assert.rejects(
-        previewMbbsBillingCandidate({
-          actor: ACTOR,
-          candidateId: selectedCandidate.candidateId,
-          completedMonth: "2038-03",
-          rateCardVersionId: premiumVersionId
-        }, {
-          async resolveDistance() {
-            inapplicableResolverCalls += 1;
-            return { providerMetres: 30_001 };
-          }
-        }),
-        (error) => error?.code === "MBT_MBBS_RATE_ORIGIN_UNAVAILABLE"
-      );
-      assert.equal(inapplicableResolverCalls, 0, "an inapplicable rate fails before paid distance work");
+      let premiumResolverCalls = 0;
+      const premiumPreview = await previewMbbsBillingCandidate({
+        actor: ACTOR,
+        candidateId: selectedCandidate.candidateId,
+        completedMonth: "2038-03",
+        rateCardVersionId: premiumVersionId
+      }, {
+        async resolveDistance() {
+          premiumResolverCalls += 1;
+          return { providerMetres: 30_001 };
+        }
+      });
+      assert.equal(premiumPreview.charge.amountMinor, 42_000);
+      assert.equal(premiumResolverCalls, 1, "a retained two-address route uses the explicitly selected rate");
 
-      const rejectedBatch = await previewMbbsBillingCandidatesBatch({
+      const premiumBatch = await previewMbbsBillingCandidatesBatch({
         actor: ACTOR,
         candidateIds: [selectedCandidate.candidateId],
         completedMonth: "2038-03",
         rateCardVersionId: premiumVersionId
       }, {
         async resolveDistance() {
-          inapplicableResolverCalls += 1;
+          premiumResolverCalls += 1;
           return { providerMetres: 30_001 };
         }
       });
-      assert.equal(rejectedBatch.failureCount, 1);
-      assert.equal(rejectedBatch.results[0].error.code, "MBT_MBBS_RATE_ORIGIN_UNAVAILABLE");
-      assert.equal(inapplicableResolverCalls, 0);
+      assert.equal(premiumBatch.failureCount, 0);
+      assert.equal(premiumBatch.results[0].charge.amountMinor, 42_000);
+      assert.equal(premiumResolverCalls, 2);
 
       const preview = await previewMbbsBillingCandidate({
         actor: ACTOR,
@@ -544,13 +543,14 @@ test("a selected rate calculates 100 completed orders as one bounded read-only b
       await query(
         `INSERT INTO sales_orders (
            netsuite_id, tranid, fulfillment_status, fulfilled_at, outbound_location,
-           dispatch_address, netsuite_active, synced_at
+           sales_order_type, dispatch_address, netsuite_active, synced_at
          )
          SELECT $1::bigint + series,
                 $2 || lpad(series::text, 3, '0'),
                 'fulfilled',
                 '2039-07-15T14:00:00.000Z'::timestamptz + (series * interval '1 minute'),
                 '2967',
+                'Delivery',
                 'MBBS Batch ' || series::text || ', Toronto, ON',
                 true,
                 '2039-07-15T14:00:00.000Z'::timestamptz + (series * interval '1 minute')

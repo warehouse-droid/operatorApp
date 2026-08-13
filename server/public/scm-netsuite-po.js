@@ -41,7 +41,11 @@ function money(value) {
 function date(value, withTime = false) {
   if (!value) return "—";
   const parsed = new Date(value);
-  return Number.isFinite(parsed.getTime()) ? new Intl.DateTimeFormat("en-CA", withTime ? { dateStyle: "medium", timeStyle: "short" } : { dateStyle: "medium" }).format(parsed) : esc(value);
+  if (!Number.isFinite(parsed.getTime())) return esc(value);
+  if (withTime && window.MBBS_I18N?.displayDateTime) return window.MBBS_I18N.displayDateTime(value);
+  return new Intl.DateTimeFormat("en-CA", withTime
+    ? { dateStyle: "medium", timeStyle: "short", timeZone: "America/Toronto" }
+    : { dateStyle: "medium", timeZone: "America/Toronto" }).format(parsed);
 }
 
 function dateInput(value) {

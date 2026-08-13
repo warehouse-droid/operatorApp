@@ -74,8 +74,8 @@ async function installRateAndMissingAddressOrder() {
   await query(
     `INSERT INTO sales_orders (
        netsuite_id, tranid, fulfillment_status, fulfilled_at, outbound_location,
-       dispatch_address, netsuite_active, synced_at
-     ) VALUES ($1, $2, 'fulfilled', '2040-02-15T15:00:00.000Z', '2967', NULL, true,
+       sales_order_type, dispatch_address, netsuite_active, synced_at
+     ) VALUES ($1, $2, 'fulfilled', '2040-02-15T15:00:00.000Z', '2967', 'Delivery', NULL, true,
        '2040-02-15T15:00:00.000Z')`,
     [netsuiteId, tranid]
   );

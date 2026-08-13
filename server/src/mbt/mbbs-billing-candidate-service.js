@@ -3,9 +3,11 @@
 import crypto from "node:crypto";
 
 import { query } from "../db.js";
+import { canonicalSha256, canonicalize } from "./canonical-json.js";
 import { executeMbtCommand } from "./command-repository.js";
 import { calculateDistanceBandChargeMinor } from "./distance-band-pricing.js";
 import { MbtError } from "./errors.js";
+import { persistCalculatedMbbsCandidateBatch } from "./shadow-billing-service.js";
 import { selectRateBand } from "./rate-bands.js";
 
 const MAX_CANDIDATES = 1000;
@@ -86,6 +88,88 @@ function completedMonth(value, { required = false } = {}) {
 }
 
 /** @param {unknown} value */
+function completedDay(value) {
+  const normalized = text(value);
+  if (!normalized) {
+    return null;
+  }
+  if (!/^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])$/u.test(normalized)) {
+    throw failure(
+      400,
+      "MBT_BILLING_COMPLETED_DATE_INVALID",
+      "Completed date must use YYYY-MM-DD in the America/Toronto time zone."
+    );
+  }
+  const parsed = new Date(`${normalized}T00:00:00.000Z`);
+  if (!Number.isFinite(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== normalized) {
+    throw failure(
+      400,
+      "MBT_BILLING_COMPLETED_DATE_INVALID",
+      "Completed date must be a real calendar date in the America/Toronto time zone."
+    );
+  }
+  return normalized;
+}
+
+/** @param {string | null} month @param {string | null} day */
+function assertCompatibleCompletionFilters(month, day) {
+  if (month && day && !day.startsWith(`${month}-`)) {
+    throw failure(
+      400,
+      "MBT_BILLING_COMPLETED_FILTER_CONFLICT",
+      "Completed date must fall inside the selected completion month."
+    );
+  }
+}
+
+/** @param {unknown} value */
+function candidateSearch(value) {
+  const normalized = text(value);
+  if (!normalized) {
+    return null;
+  }
+  if (normalized.length < 2 || normalized.length > 120) {
+    throw failure(
+      400,
+      "MBT_BILLING_CANDIDATE_SEARCH_INVALID",
+      "Order search must contain between 2 and 120 characters."
+    );
+  }
+  return normalized;
+}
+
+/** @param {unknown} value */
+function customerSearch(value) {
+  const normalized = text(value);
+  if (normalized.length < 2 || normalized.length > 120) {
+    throw failure(
+      400,
+      "MBT_BILLING_CUSTOMER_SEARCH_INVALID",
+      "Customer search must contain between 2 and 120 characters."
+    );
+  }
+  return normalized;
+}
+
+/** @param {unknown} value */
+function customerLimit(value) {
+  const parsed = value === undefined ? 25 : Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > 50) {
+    throw failure(400, "MBT_BILLING_CUSTOMER_LIMIT_INVALID", "Customer search limit must be between 1 and 50.");
+  }
+  return parsed;
+}
+
+/** @param {unknown} value */
+function customerNetsuiteId(value) {
+  const normalized = text(value);
+  if (!/^\d+$/u.test(normalized) || BigInt(normalized) < 1n) {
+    throw failure(400, "MBT_CROSS_CHARGE_CUSTOMER_INVALID", "Choose a valid canonical billing customer.");
+  }
+  return normalized;
+}
+
+/** @param {unknown} value */
 function rateCardVersionId(value) {
   const normalized = text(value).toLowerCase();
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(normalized)) {
@@ -124,6 +208,15 @@ function batchCandidateIds(value) {
 /** @param {unknown} value */
 function normalizedLocation(value) {
   return text(value).toLowerCase().replaceAll(/[^a-z0-9]+/gu, " ").trim();
+}
+
+/** @param {unknown} value */
+function retainedRouteLabel(value) {
+  const retained = text(value);
+  return ["unmapped", "unknown", "n/a", "na", "none", "null", "tbd"]
+    .includes(retained.toLowerCase())
+    ? ""
+    : retained;
 }
 
 /** @param {unknown[]} values */
@@ -174,6 +267,20 @@ function candidateId(identity) {
   return Buffer.from(JSON.stringify({ v: 1, ...identity }), "utf8").toString("base64url");
 }
 
+/** @param {string} hash */
+function deterministicUuid(hash) {
+  const value = hash.slice(0, 32).split("");
+  value[12] = "5";
+  value[16] = ((Number.parseInt(value[16] || "0", 16) & 0x3) | 0x8).toString(16);
+  const hex = value.join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+/** @param {string} scope @param {unknown} identity */
+function stableId(scope, identity) {
+  return deterministicUuid(canonicalSha256({ scope, identity }));
+}
+
 /** @param {unknown} value */
 function decodedCandidateId(value) {
   const encoded = text(value);
@@ -182,7 +289,7 @@ function decodedCandidateId(value) {
   }
   try {
     const decoded = object(JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")));
-    if (decoded.v !== 1 || !["driver", "reconciliation", "sales_order"].includes(text(decoded.kind))) {
+    if (decoded.v !== 1 || !["driver", "reconciliation", "sales_order", "custom_order"].includes(text(decoded.kind))) {
       throw new Error("unsupported candidate identity");
     }
     return decoded;
@@ -194,7 +301,7 @@ function decodedCandidateId(value) {
 /** @param {unknown} value */
 function sourceType(value) {
   const normalized = text(value).toUpperCase();
-  return ["SO", "TO", "PO", "VRMA"].includes(normalized) ? normalized : null;
+  return ["SO", "TO", "PO", "VRMA", "CUSTOM"].includes(normalized) ? normalized : null;
 }
 
 /** @param {string} reference */
@@ -269,9 +376,9 @@ function routeStops(records) {
   return stops;
 }
 
-/** @param {Record<string, any>} row @param {Array<Record<string, any>>} yards @param {Set<string>} allowedOrigins */
+/** @param {Record<string, any>} row @param {Array<Record<string, any>>} yards */
 // eslint-disable-next-line complexity
-function driverCandidate(row, yards, allowedOrigins) {
+function driverCandidate(row, yards) {
   const records = array(row.records).map(object);
   const references = driverReferences(records);
   const stops = routeStops(records);
@@ -281,16 +388,11 @@ function driverCandidate(row, yards, allowedOrigins) {
     firstDetails.location,
     stops[0]?.addressText
   ]);
-  const originAllowed = Boolean(originYard && (allowedOrigins.size === 0 || allowedOrigins.has(originYard.yardCode)));
   const reason = references.length === 0
     ? "No SO, TO, PO, or VRMA reference is retained on this load."
     : stops.length < 2
       ? "At least two retained pickup/drop addresses are required."
-      : !originYard
-        ? "The retained pickup does not match an active MBT yard."
-        : !originAllowed
-          ? "The retained pickup yard is outside the active MBBS rate scope."
-          : null;
+      : null;
   const identity = {
     kind: "driver",
     planId: row.plan_id === null ? null : String(row.plan_id),
@@ -315,9 +417,9 @@ function driverCandidate(row, yards, allowedOrigins) {
   };
 }
 
-/** @param {Record<string, any>} row @param {Array<Record<string, any>>} yards @param {Set<string>} allowedOrigins */
+/** @param {Record<string, any>} row @param {Array<Record<string, any>>} yards */
 // eslint-disable-next-line complexity
-function reconciliationCandidate(row, yards, allowedOrigins) {
+function reconciliationCandidate(row, yards) {
   const snapshot = object(row.order_snapshot);
   const type = sourceType(row.order_kind) || "PO";
   const reference = text(row.source_order_ref);
@@ -329,25 +431,14 @@ function reconciliationCandidate(row, yards, allowedOrigins) {
     || text(snapshot.destinationLocation);
   const sourceYard = findYard(yards, [row.source_location_id, sourceLabel]);
   const destinationYard = findYard(yards, [row.destination_location_id, destinationLabel]);
-  let originYard = sourceYard;
-  let originAddress = sourceYard?.addressText || sourceLabel;
-  let destinationAddress = destinationYard?.addressText || destinationLabel;
-  if ((!originYard || (allowedOrigins.size && !allowedOrigins.has(originYard.yardCode)))
-      && destinationYard && (!allowedOrigins.size || allowedOrigins.has(destinationYard.yardCode))) {
-    originYard = destinationYard;
-    originAddress = destinationYard.addressText;
-    destinationAddress = sourceYard?.addressText || sourceLabel;
-  }
-  const originAllowed = Boolean(originYard && (allowedOrigins.size === 0 || allowedOrigins.has(originYard.yardCode)));
+  const originYard = sourceYard;
+  const originAddress = sourceYard?.addressText || sourceLabel;
+  const destinationAddress = destinationYard?.addressText || destinationLabel;
   const reason = !reference
     ? "The reconciliation row has no order reference."
     : !originAddress || !destinationAddress
       ? "The completed reconciliation row has no complete route addresses."
-      : !originYard
-        ? "Neither reconciliation endpoint matches an active MBT yard."
-        : !originAllowed
-          ? "The reconciliation route is outside the active MBBS rate scope."
-          : null;
+      : null;
   const identity = { kind: "reconciliation", orderKind: type, recordId: String(row.id) };
   return {
     candidateId: candidateId(identity),
@@ -370,21 +461,21 @@ function reconciliationCandidate(row, yards, allowedOrigins) {
   };
 }
 
-/** @param {Record<string, any>} row @param {Array<Record<string, any>>} yards @param {Set<string>} allowedOrigins */
+/** @param {Record<string, any>} row @param {Array<Record<string, any>>} yards */
 // eslint-disable-next-line complexity
-function salesOrderCandidate(row, yards, allowedOrigins) {
+function salesOrderCandidate(row, yards) {
   const originYard = findYard(yards, [row.outbound_location_id, row.outbound_location]);
-  const originAllowed = Boolean(originYard && (allowedOrigins.size === 0 || allowedOrigins.has(originYard.yardCode)));
-  const destination = text(row.dispatch_address);
+  const origin = originYard?.addressText
+    || retainedRouteLabel(row.dispatch_pickup_address)
+    || retainedRouteLabel(row.outbound_location);
+  const destination = retainedRouteLabel(row.dispatch_address);
   const reason = !text(row.tranid)
     ? "The completed Sales Order has no reference."
     : !destination
       ? "The completed Sales Order has no dispatch address."
-      : !originYard
-        ? "The Sales Order origin does not match an active MBT yard."
-        : !originAllowed
-          ? "The Sales Order origin is outside the active MBBS rate scope."
-          : null;
+      : !origin
+        ? "The completed Sales Order has no retained origin address."
+        : null;
   const identity = { kind: "sales_order", netsuiteId: String(row.netsuite_id) };
   return {
     candidateId: candidateId(identity),
@@ -395,21 +486,77 @@ function salesOrderCandidate(row, yards, allowedOrigins) {
     completedAt: new Date(row.completed_at).toISOString(),
     references: text(row.tranid) ? [{ sourceType: "SO", rootReference: rootReference("SO", text(row.tranid)) }] : [],
     originYardCode: originYard?.yardCode || null,
-    originLabel: originYard?.addressText || text(row.outbound_location),
+    originLabel: origin,
     destinationLabel: destination,
-    routeStopCount: destination && originYard ? 2 : 0,
+    routeStopCount: destination && origin ? 2 : 0,
     chargeable: reason === null,
     reason,
-    _routeStops: destination && originYard
-      ? [{ addressText: originYard.addressText, stopType: "pickup" }, { addressText: destination, stopType: "dropoff" }]
+    deliveryMethod: text(row.sales_order_type),
+    _routeStops: destination && origin
+      ? [{ addressText: origin, stopType: "pickup" }, { addressText: destination, stopType: "dropoff" }]
       : [],
     _identity: identity
   };
 }
 
+/** @param {Record<string, any>} row */
+function customOrderCandidate(row) {
+  const origin = text(row.pickup_location);
+  const destination = text(row.dropoff_location);
+  const reference = text(row.ref_number);
+  const reason = !reference
+    ? "The completed custom order has no reference."
+    : !origin || !destination
+      ? "The completed custom order has no complete route addresses."
+      : null;
+  const identity = { kind: "custom_order", recordId: String(row.id) };
+  return {
+    candidateId: candidateId(identity),
+    sourceSystem: "custom_order",
+    sourceRecordId: String(row.id),
+    physicalLoadId: `CUSTOM-${row.id}`,
+    planDate: torontoCalendarDate(row.completed_at),
+    completedAt: new Date(row.completed_at).toISOString(),
+    references: reference ? [{ sourceType: "CUSTOM", rootReference: reference }] : [],
+    originYardCode: null,
+    originLabel: origin,
+    destinationLabel: destination,
+    routeStopCount: origin && destination ? 2 : 0,
+    chargeable: reason === null,
+    reason,
+    deliveryMethod: "Delivery",
+    _routeStops: origin && destination
+      ? [{ addressText: origin, stopType: "pickup" }, { addressText: destination, stopType: "dropoff" }]
+      : [],
+    _identity: identity
+  };
+}
+
+/** @param {unknown} value */
+function torontoCalendarDate(value) {
+  const date = new Date(String(value));
+  if (!Number.isFinite(date.getTime())) {
+    throw failure(409, "MBT_BILLING_CANDIDATE_INCOMPLETE", "A completed order has an invalid completion time.");
+  }
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    timeZone: TORONTO_TIME_ZONE
+  }).formatToParts(date);
+  const year = parts.find((part) => part.type === "year")?.value;
+  const month = parts.find((part) => part.type === "month")?.value;
+  const day = parts.find((part) => part.type === "day")?.value;
+  if (!year || !month || !day) {
+    throw failure(409, "MBT_BILLING_CANDIDATE_INCOMPLETE", "A completed order has no Toronto completion date.");
+  }
+  return `${year}-${month}-${day}`;
+}
+
 async function activeMbbsRateGraphs() {
   const selected = await query(
     `SELECT card.rate_card_id::text, card.rate_card_code, card.display_name,
+            card.customer_netsuite_id::text,
             version.rate_card_version_id::text, version.version_number::int,
             version.effective_from, version.effective_to,
             card.currency, band.currency AS band_currency,
@@ -466,6 +613,9 @@ async function activeMbbsRateGraphs() {
       rateCardId: text(first.rate_card_id),
       rateCardCode: text(first.rate_card_code),
       displayName: text(first.display_name),
+      customerNetsuiteId: first.customer_netsuite_id === null
+        ? null
+        : text(first.customer_netsuite_id),
       rateCardVersionId: text(first.rate_card_version_id),
       versionNumber: Number(first.version_number),
       effectiveFrom: new Date(first.effective_from).toISOString(),
@@ -483,6 +633,7 @@ function rateOptions(graphs) {
     rateCardId: graph.rateCardId,
     rateCardCode: graph.rateCardCode,
     displayName: graph.displayName,
+    customerNetsuiteId: graph.customerNetsuiteId,
     rateCardVersionId: graph.rateCardVersionId,
     versionNumber: graph.versionNumber,
     effectiveFrom: graph.effectiveFrom,
@@ -510,8 +661,8 @@ function selectedRateGraph(graphs, rawVersionId, { explicit = false } = {}) {
   return /** @type {Record<string, any>} */ (graph);
 }
 
-/** @param {number} limit @param {string | null} completedMonthValue */
-async function driverRows(limit, completedMonthValue) {
+/** @param {number} limit @param {string | null} completedMonthValue @param {string | null} completedDateValue @param {string | null} searchValue */
+async function driverRows(limit, completedMonthValue, completedDateValue, searchValue) {
   const result = await query(
     `SELECT plan_id::text, plan_date::text, load_id,
             max(completed_at) AS completed_at,
@@ -530,15 +681,21 @@ async function driverRows(limit, completedMonthValue) {
           (max(completed_at) AT TIME ZONE '${TORONTO_TIME_ZONE}') >= (($2 || '-01')::date)::timestamp
           AND (max(completed_at) AT TIME ZONE '${TORONTO_TIME_ZONE}') < ((($2 || '-01')::date + interval '1 month')::timestamp)
         ))
+        AND ($3::text IS NULL OR (max(completed_at) AT TIME ZONE '${TORONTO_TIME_ZONE}')::date = $3::date)
+        AND ($4::text IS NULL OR concat_ws(
+          ' ', load_id, plan_id::text,
+          jsonb_agg(COALESCE(order_refs, '[]'::jsonb))::text,
+          jsonb_agg(COALESCE(job_details, '{}'::jsonb))::text
+        ) ILIKE '%' || $4 || '%')
       ORDER BY max(completed_at) DESC NULLS LAST, plan_id DESC NULLS LAST, load_id
       LIMIT $1`,
-    [limit, completedMonthValue]
+    [limit, completedMonthValue, completedDateValue, searchValue]
   );
   return result.rows;
 }
 
-/** @param {number} limit @param {string | null} completedMonthValue */
-async function reconciliationRows(limit, completedMonthValue) {
+/** @param {number} limit @param {string | null} completedMonthValue @param {string | null} completedDateValue @param {string | null} searchValue */
+async function reconciliationRows(limit, completedMonthValue, completedDateValue, searchValue) {
   const result = await query(
     `SELECT state.id::text, state.order_kind, state.source_order_ref,
             state.source_location_id::text, state.source_location,
@@ -549,7 +706,13 @@ async function reconciliationRows(limit, completedMonthValue) {
                      state.completed_at::date::text,
                      state.reconciled_at::date::text,
                      state.updated_at::date::text) AS plan_date,
-            CASE WHEN state.order_kind = 'PO' THEN purchase.dispatch_address
+            CASE WHEN state.order_kind = 'PO' THEN COALESCE(
+                   NULLIF(purchase.dispatch_pickup_address, ''),
+                   NULLIF(vendor_yard.address, ''),
+                   NULLIF(purchase.dispatch_address, ''),
+                   NULLIF(purchase.source_location, ''),
+                   state.source_location
+                 )
                  ELSE transfer.from_location END AS header_source_address,
             CASE WHEN state.order_kind = 'PO' THEN purchase.destination_location
                  ELSE transfer.to_location END AS header_destination_address
@@ -560,6 +723,19 @@ async function reconciliationRows(limit, completedMonthValue) {
        LEFT JOIN transfer_orders transfer
          ON state.order_kind = 'TO'
         AND transfer.netsuite_id = state.source_order_netsuite_id
+       LEFT JOIN LATERAL (
+         SELECT yard.address
+           FROM dispatch_vendor_yards yard
+          WHERE state.order_kind = 'PO'
+            AND yard.active
+            AND lower(btrim(yard.yard)) = lower(btrim(COALESCE(
+              NULLIF(purchase.dispatch_vendor_yard, ''),
+              NULLIF(state.source_location, ''),
+              purchase.source_location
+            )))
+          ORDER BY yard.id
+          LIMIT 1
+       ) vendor_yard ON true
       WHERE state.application_status = 'Completed'
         AND ($2::text IS NULL OR (
           (COALESCE(state.completed_at, state.reconciled_at, state.updated_at)
@@ -567,35 +743,83 @@ async function reconciliationRows(limit, completedMonthValue) {
           AND (COALESCE(state.completed_at, state.reconciled_at, state.updated_at)
             AT TIME ZONE '${TORONTO_TIME_ZONE}') < ((($2 || '-01')::date + interval '1 month')::timestamp)
         ))
+        AND ($3::text IS NULL OR (
+          COALESCE(state.completed_at, state.reconciled_at, state.updated_at)
+            AT TIME ZONE '${TORONTO_TIME_ZONE}'
+        )::date = $3::date)
+        AND ($4::text IS NULL OR concat_ws(
+          ' ', state.source_order_ref, state.order_kind, state.source_location,
+          state.destination_location, purchase.vendor, purchase.dispatch_vendor_yard,
+          purchase.dispatch_address, transfer.from_location, transfer.to_location
+        ) ILIKE '%' || $4 || '%')
       ORDER BY COALESCE(state.completed_at, state.reconciled_at, state.updated_at) DESC, state.id DESC
       LIMIT $1`,
-    [limit, completedMonthValue]
+    [limit, completedMonthValue, completedDateValue, searchValue]
   );
   return result.rows;
 }
 
-/** @param {number} limit @param {string | null} completedMonthValue */
-async function completedSalesOrderRows(limit, completedMonthValue) {
+/** @param {number} limit @param {string | null} completedMonthValue @param {string | null} completedDateValue @param {string | null} searchValue @param {boolean} includeAllMethods */
+async function completedSalesOrderRows(
+  limit,
+  completedMonthValue,
+  completedDateValue,
+  searchValue,
+  includeAllMethods
+) {
   const result = await query(
     `SELECT netsuite_id::text, tranid, outbound_location_id::text,
-            outbound_location, dispatch_address,
+            outbound_location, dispatch_pickup_address, dispatch_address,
+            sales_order_type, customer,
             COALESCE(fulfilled_at, status_updated_at, synced_at) AS completed_at,
             COALESCE(dispatch_plan_date::text,
                      COALESCE(fulfilled_at, status_updated_at, synced_at)::date::text) AS plan_date
        FROM sales_orders
       WHERE (fulfillment_status = 'fulfilled' OR fulfilled_at IS NOT NULL)
+        AND ($5::boolean OR lower(btrim(COALESCE(sales_order_type, ''))) = 'delivery')
         AND ($2::text IS NULL OR (
           (COALESCE(fulfilled_at, status_updated_at, synced_at)
             AT TIME ZONE '${TORONTO_TIME_ZONE}') >= (($2 || '-01')::date)::timestamp
           AND (COALESCE(fulfilled_at, status_updated_at, synced_at)
             AT TIME ZONE '${TORONTO_TIME_ZONE}') < ((($2 || '-01')::date + interval '1 month')::timestamp)
         ))
+        AND ($3::text IS NULL OR (
+          COALESCE(fulfilled_at, status_updated_at, synced_at)
+            AT TIME ZONE '${TORONTO_TIME_ZONE}'
+        )::date = $3::date)
+        AND ($4::text IS NULL OR concat_ws(
+          ' ', tranid, customer, outbound_location, dispatch_pickup_address,
+          dispatch_address, sales_order_type
+        ) ILIKE '%' || $4 || '%')
       ORDER BY COALESCE(fulfilled_at, status_updated_at, synced_at) DESC NULLS LAST,
                netsuite_id DESC
       LIMIT $1`,
-    [limit, completedMonthValue]
+    [limit, completedMonthValue, completedDateValue, searchValue, includeAllMethods]
   );
   return result.rows.filter((/** @type {Record<string, any>} */ row) => row.completed_at);
+}
+
+/** @param {number} limit @param {string | null} completedMonthValue @param {string | null} completedDateValue @param {string | null} searchValue */
+async function completedCustomOrderRows(limit, completedMonthValue, completedDateValue, searchValue) {
+  const result = await query(
+    `SELECT id::text, ref_number, pickup_location, dropoff_location,
+            order_details, completed_at
+       FROM dispatch_custom_orders
+      WHERE status = 'completed'
+        AND completed_at IS NOT NULL
+        AND ($2::text IS NULL OR (
+          (completed_at AT TIME ZONE '${TORONTO_TIME_ZONE}') >= (($2 || '-01')::date)::timestamp
+          AND (completed_at AT TIME ZONE '${TORONTO_TIME_ZONE}') < ((($2 || '-01')::date + interval '1 month')::timestamp)
+        ))
+        AND ($3::text IS NULL OR (completed_at AT TIME ZONE '${TORONTO_TIME_ZONE}')::date = $3::date)
+        AND ($4::text IS NULL OR concat_ws(
+          ' ', ref_number, pickup_location, dropoff_location, order_details
+        ) ILIKE '%' || $4 || '%')
+      ORDER BY completed_at DESC, id DESC
+      LIMIT $1`,
+    [limit, completedMonthValue, completedDateValue, searchValue]
+  );
+  return result.rows;
 }
 
 /** @param {string[]} candidateIds */
@@ -623,8 +847,8 @@ async function storedAddressOverrides(candidateIds) {
   }));
 }
 
-/** @param {Record<string, any>} candidate @param {Record<string, any> | undefined} override @param {Set<string>} allowedOrigins */
-function applyAddressOverride(candidate, override, allowedOrigins) {
+/** @param {Record<string, any>} candidate @param {Record<string, any> | undefined} override */
+function applyAddressOverride(candidate, override) {
   if (!override) {
     return { ...candidate, addressOverride: null };
   }
@@ -637,12 +861,7 @@ function applyAddressOverride(candidate, override, allowedOrigins) {
     updatedBy: override.updatedBy,
     updatedAt: override.updatedAt
   };
-  const originAllowed = Boolean(
-    candidate.originYardCode
-    && candidate.originLabel
-    && (allowedOrigins.size === 0 || allowedOrigins.has(candidate.originYardCode))
-  );
-  if (!originAllowed || array(candidate.references).length === 0) {
+  if (!candidate.originLabel || array(candidate.references).length === 0) {
     return { ...candidate, addressOverride: publicOverride };
   }
   return {
@@ -662,36 +881,57 @@ function applyAddressOverride(candidate, override, allowedOrigins) {
 /**
  * @param {number} limit
  * @param {string | null} completedMonthValue
- * @param {{graphs?: Array<Record<string, any>>, includeOverrides?: boolean, truncate?: boolean}} [options]
+ * @param {{graphs?: Array<Record<string, any>>, includeOverrides?: boolean, truncate?: boolean, completedDateValue?: string | null, searchValue?: string | null, includeAllSalesMethods?: boolean}} [options]
  */
 async function internalCandidates(
   limit,
   completedMonthValue,
-  { graphs, includeOverrides = true, truncate = true } = {}
+  {
+    graphs,
+    includeOverrides = true,
+    truncate = true,
+    completedDateValue = null,
+    searchValue = null,
+    includeAllSalesMethods = false
+  } = {}
 ) {
   const rateGraphs = graphs || await activeMbbsRateGraphs();
-  const hasUnrestrictedGraph = rateGraphs.some((graph) => graph.originYardCodes.size === 0);
-  const allowedOrigins = hasUnrestrictedGraph
-    ? new Set()
-    : new Set(rateGraphs.flatMap((graph) => [...graph.originYardCodes]));
-  const [yards, driver, reconciliation, salesOrders] = await Promise.all([
-    activeYards(),
-    driverRows(limit, completedMonthValue),
-    reconciliationRows(limit, completedMonthValue),
-    completedSalesOrderRows(limit, completedMonthValue)
-  ]);
+  // These reads may execute inside an atomic conversion command, where one
+  // PostgreSQL client must never receive overlapping queries.
+  const yards = await activeYards();
+  const driver = await driverRows(limit, completedMonthValue, completedDateValue, searchValue);
+  const reconciliation = await reconciliationRows(
+    limit,
+    completedMonthValue,
+    completedDateValue,
+    searchValue
+  );
+  const salesOrders = await completedSalesOrderRows(
+    limit,
+    completedMonthValue,
+    completedDateValue,
+    searchValue,
+    includeAllSalesMethods || Boolean(searchValue)
+  );
+  const customOrders = await completedCustomOrderRows(
+    limit,
+    completedMonthValue,
+    completedDateValue,
+    searchValue
+  );
   let items = [
-    ...driver.map((/** @type {Record<string, any>} */ row) => driverCandidate(row, yards, allowedOrigins)),
+    ...driver.map((/** @type {Record<string, any>} */ row) => driverCandidate(row, yards)),
     ...reconciliation.map(
-      (/** @type {Record<string, any>} */ row) => reconciliationCandidate(row, yards, allowedOrigins)
+      (/** @type {Record<string, any>} */ row) => reconciliationCandidate(row, yards)
     ),
     ...salesOrders.map(
-      (/** @type {Record<string, any>} */ row) => salesOrderCandidate(row, yards, allowedOrigins)
-    )
+      (/** @type {Record<string, any>} */ row) => salesOrderCandidate(row, yards)
+    ),
+    ...customOrders.map((/** @type {Record<string, any>} */ row) => customOrderCandidate(row))
   ];
   if (includeOverrides) {
     const overrides = await storedAddressOverrides(items.map((item) => item.candidateId));
-    items = items.map((item) => applyAddressOverride(item, overrides.get(item.candidateId), allowedOrigins));
+    items = items.map((item) => applyAddressOverride(item, overrides.get(item.candidateId)));
   } else {
     items = items.map((item) => ({ ...item, addressOverride: null }));
   }
@@ -718,16 +958,70 @@ export async function listMbbsBillingCandidates(rawInput) {
   billingActor(input.actor);
   const limit = candidateLimit(input.limit);
   const month = completedMonth(input.completedMonth);
-  const { graphs, items } = await internalCandidates(limit, month);
+  const day = completedDay(input.completedDate);
+  const searchValue = candidateSearch(input.search);
+  assertCompatibleCompletionFilters(month, day);
+  const { graphs, items } = await internalCandidates(limit, month, {
+    completedDateValue: day,
+    searchValue
+  });
   const soleGraph = graphs.length === 1 ? graphs[0] : null;
   return {
     schemaVersion: "mbbs-billing-candidates-v2",
     postingMode: "local_only_preview",
     completedMonth: month,
+    completedDate: day,
+    search: searchValue,
+    searchMode: searchValue ? "database" : "default_delivery",
     rateCardVersionId: soleGraph?.rateCardVersionId || null,
     currency: soleGraph?.currency || null,
     rateOptions: rateOptions(graphs),
     items: items.map(publicCandidate)
+  };
+}
+
+/**
+ * Search the canonical local customer master used by durable billing. The
+ * search is intentionally explicit; a rate card may suggest a customer, but
+ * conversion never guesses an unrelated customer from order text.
+ *
+ * @param {unknown} rawInput
+ */
+export async function searchMbbsBillingCustomers(rawInput) {
+  const input = object(rawInput);
+  billingActor(input.actor);
+  const searchValue = customerSearch(input.search);
+  const limit = customerLimit(input.limit);
+  const result = await query(
+    `SELECT netsuite_id::text, entity_number, legal_name, display_name,
+            currency, terms, tax_status
+       FROM netsuite_customers
+      WHERE active
+        AND currency = 'CAD'
+        AND concat_ws(' ', netsuite_id::text, entity_number, legal_name, display_name)
+            ILIKE '%' || $1 || '%'
+      ORDER BY CASE
+                 WHEN lower(entity_number) = lower($1) THEN 0
+                 WHEN netsuite_id::text = $1 THEN 1
+                 WHEN lower(display_name) = lower($1) THEN 2
+                 ELSE 3
+               END,
+               lower(display_name), netsuite_id
+      LIMIT $2`,
+    [searchValue, limit]
+  );
+  return {
+    schemaVersion: "mbbs-billing-customer-search-v1",
+    search: searchValue,
+    items: result.rows.map((/** @type {Record<string, any>} */ row) => ({
+      netsuiteId: text(row.netsuite_id),
+      entityNumber: text(row.entity_number),
+      legalName: text(row.legal_name),
+      displayName: text(row.display_name),
+      currency: text(row.currency),
+      terms: row.terms === null ? null : text(row.terms),
+      taxStatus: row.tax_status === null ? null : text(row.tax_status)
+    }))
   };
 }
 
@@ -741,17 +1035,9 @@ function distanceResolver(dependencies) {
 }
 
 /** @param {Record<string, any>} candidate @param {Record<string, any>} graph @param {Function} resolveDistance */
-// eslint-disable-next-line complexity
 async function calculateCandidate(candidate, graph, resolveDistance) {
   if (!candidate.chargeable) {
     throw failure(422, "MBT_BILLING_CANDIDATE_INCOMPLETE", candidate.reason || "The completed MBBS candidate is incomplete.");
-  }
-  if (graph.originYardCodes.size && !graph.originYardCodes.has(candidate.originYardCode)) {
-    throw failure(
-      422,
-      "MBT_MBBS_RATE_ORIGIN_UNAVAILABLE",
-      "The selected MBBS rate card does not apply to this order's origin yard."
-    );
   }
   const stops = array(candidate._routeStops).map(object);
   let distanceMetres = 0;
@@ -762,7 +1048,7 @@ async function calculateCandidate(candidate, graph, resolveDistance) {
     if (!origin || !destination) {
       throw failure(422, "MBT_BILLING_CANDIDATE_INCOMPLETE", "The completed route has a missing stop.");
     }
-    const raw = object(await resolveDistance(index === 1
+    const raw = object(await resolveDistance(index === 1 && candidate.originYardCode
       ? { originYardCode: candidate.originYardCode, destinationAddressText: destination.addressText }
       : { originAddressText: origin.addressText, destinationAddressText: destination.addressText }));
     const segmentMetres = Number(raw.providerMetres);
@@ -824,10 +1110,16 @@ export async function previewMbbsBillingCandidate(rawInput, dependencies) {
   billingActor(input.actor);
   const identity = decodedCandidateId(input.candidateId);
   const month = completedMonth(input.completedMonth);
+  const day = completedDay(input.completedDate);
+  assertCompatibleCompletionFilters(month, day);
   const resolveDistance = distanceResolver(dependencies);
   const graphs = await activeMbbsRateGraphs();
   const graph = selectedRateGraph(graphs, input.rateCardVersionId);
-  const { items } = await internalCandidates(MAX_CANDIDATES, month, { graphs });
+  const { items } = await internalCandidates(MAX_CANDIDATES, month, {
+    graphs,
+    completedDateValue: day,
+    includeAllSalesMethods: true
+  });
   const encoded = candidateId(identity);
   const candidate = items.find((item) => item.candidateId === encoded);
   if (!candidate) {
@@ -883,10 +1175,16 @@ export async function previewMbbsBillingCandidatesBatch(rawInput, dependencies) 
   billingActor(input.actor);
   const ids = batchCandidateIds(input.candidateIds);
   const month = completedMonth(input.completedMonth, { required: true });
+  const day = completedDay(input.completedDate);
+  assertCompatibleCompletionFilters(month, day);
   const resolveDistance = distanceResolver(dependencies);
   const graphs = await activeMbbsRateGraphs();
   const graph = selectedRateGraph(graphs, input.rateCardVersionId, { explicit: true });
-  const { items } = await internalCandidates(MAX_CANDIDATES, month, { graphs });
+  const { items } = await internalCandidates(MAX_CANDIDATES, month, {
+    graphs,
+    completedDateValue: day,
+    includeAllSalesMethods: true
+  });
   const byId = new Map(items.map((candidate) => [candidate.candidateId, candidate]));
   const results = await mapConcurrently(ids, BATCH_DISTANCE_CONCURRENCY, async (id) => {
     try {
@@ -909,6 +1207,7 @@ export async function previewMbbsBillingCandidatesBatch(rawInput, dependencies) 
     postingMode: "local_only_preview",
     externalWork: null,
     completedMonth: month,
+    completedDate: day,
     rateCardVersionId: graph.rateCardVersionId,
     requestedCount: ids.length,
     successCount,
@@ -935,12 +1234,309 @@ function expectedAddressRevision(value) {
   return revision;
 }
 
+/** @param {unknown} value @param {string} label */
+function nonnegativeSafeInteger(value, label) {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw failure(422, "MBT_BILLING_CANDIDATE_EVIDENCE_INVALID", `${label} must be a non-negative safe integer.`);
+  }
+  return parsed;
+}
+
+/** @param {Record<string, any>} candidate */
+function candidateSnapshotIdentity(candidate) {
+  const addressRevision = Number(object(candidate.addressOverride).revision || 0);
+  if (!Number.isSafeInteger(addressRevision) || addressRevision < 0) {
+    throw failure(409, "MBT_BILLING_CANDIDATE_EVIDENCE_INVALID", "The billing address evidence has an invalid revision.");
+  }
+  const identity = {
+    candidateId: text(candidate.candidateId),
+    sourceSystem: text(candidate.sourceSystem),
+    sourceRecordId: text(candidate.sourceRecordId),
+    sourcePlanRevision: addressRevision + 1,
+    physicalLoadId: text(candidate.physicalLoadId)
+  };
+  if (Object.values(identity).includes("")) {
+    throw failure(409, "MBT_BILLING_CANDIDATE_EVIDENCE_INVALID", "The completed order has an incomplete source identity.");
+  }
+  return identity;
+}
+
+/** @param {Record<string, any>} candidate */
+function candidateSnapshotReferences(candidate) {
+  const references = array(candidate.references).map((rawReference) => {
+    const reference = object(rawReference);
+    const type = sourceType(reference.sourceType);
+    const root = text(reference.rootReference);
+    if (!type || !root) {
+      throw failure(409, "MBT_BILLING_CANDIDATE_EVIDENCE_INVALID", "The completed order has an invalid billing reference.");
+    }
+    return { sourceType: type, rootReference: root };
+  });
+  if (references.length === 0) {
+    throw failure(409, "MBT_BILLING_CANDIDATE_EVIDENCE_INVALID", "The completed order has no billing references.");
+  }
+  return references;
+}
+
+/** @param {Record<string, any>} calculation */
+function candidateSnapshotEvidence(calculation) {
+  const candidate = object(calculation.candidate);
+  const completedAtDate = new Date(text(candidate.completedAt));
+  if (!Number.isFinite(completedAtDate.getTime())) {
+    throw failure(409, "MBT_BILLING_CANDIDATE_EVIDENCE_INVALID", "The completed order has an invalid completion time.");
+  }
+  const completedAt = completedAtDate.toISOString();
+  const planDate = completedDay(candidate.planDate) || torontoCalendarDate(completedAt);
+  const references = candidateSnapshotReferences(candidate);
+  const identity = candidateSnapshotIdentity(candidate);
+  const completedLoadSnapshotId = stableId("mbt.billing.candidate.completed_load", identity);
+  const calculatedMetres = nonnegativeSafeInteger(calculation.distanceMetres, "Calculated route distance");
+  const charge = object(calculation.charge);
+  const sharedTotalMinor = nonnegativeSafeInteger(charge.amountMinor, "Calculated MBBS charge");
+  if (text(charge.currency).toUpperCase() !== "CAD") {
+    throw failure(409, "MBT_BILLING_CURRENCY_MISMATCH", "Durable MBBS candidate billing requires CAD evidence.");
+  }
+  const sourceSnapshot = canonicalize({
+    schemaVersion: "mbbs-billing-candidate-snapshot-v1",
+    completed: true,
+    completedLoadSnapshotId,
+    physicalLoadId: identity.physicalLoadId,
+    completedAt,
+    planDate,
+    candidate: publicCandidate(candidate),
+    calculatedMetres,
+    routeEvidence: array(calculation.routeEvidence),
+    rateCardVersionId: text(calculation.rateCardVersionId),
+    selectedBand: object(calculation.selectedBand),
+    charge: {
+      itemCode: text(charge.itemCode),
+      amountMinor: sharedTotalMinor,
+      currency: "CAD"
+    }
+  });
+  return {
+    identity,
+    completedLoadSnapshotId,
+    completedAt,
+    planDate,
+    references,
+    calculatedMetres,
+    sharedTotalMinor,
+    sourceSnapshot,
+    snapshotHash: canonicalSha256(sourceSnapshot)
+  };
+}
+
+/** @param {Record<string, any> | null} row @param {ReturnType<typeof candidateSnapshotEvidence>} evidence */
+function retainedCandidateSnapshotMatches(row, evidence) {
+  if (!row) {
+    return false;
+  }
+  const equalValues = [
+    [text(row.completed_load_snapshot_id), evidence.completedLoadSnapshotId],
+    [Number(row.calculated_metres), evidence.calculatedMetres],
+    [Number(row.shared_total_minor), evidence.sharedTotalMinor],
+    [text(row.currency), "CAD"],
+    [text(row.source_snapshot_hash), evidence.snapshotHash],
+    [canonicalSha256(row.source_references), canonicalSha256(evidence.references)],
+    [canonicalSha256(row.source_snapshot), evidence.snapshotHash]
+  ];
+  return equalValues.every(([actual, expected]) => actual === expected);
+}
+
+/** @param {Record<string, any>} calculation @param {{operatorId: string}} actor */
+async function freezeCandidateCalculation(calculation, actor) {
+  const evidence = candidateSnapshotEvidence(calculation);
+  await query(
+    `INSERT INTO mbt_mbbs_completed_load_snapshots (
+       completed_load_snapshot_id, source_system, source_plan_id,
+       source_plan_revision, plan_date, physical_load_id, completed_at,
+       truck_id, driver_id, calculated_metres, shared_total_minor, currency,
+       source_references, source_snapshot, source_snapshot_hash, created_by
+     ) VALUES (
+       $1, 'billing_candidate', $2, $3, $4::date, $5, $6::timestamptz,
+       NULL, NULL, $7, $8, 'CAD', $9::jsonb, $10::jsonb, $11, $12
+     ) ON CONFLICT DO NOTHING`,
+    [
+      evidence.completedLoadSnapshotId,
+      evidence.identity.candidateId,
+      evidence.identity.sourcePlanRevision,
+      evidence.planDate,
+      evidence.identity.physicalLoadId,
+      evidence.completedAt,
+      evidence.calculatedMetres,
+      evidence.sharedTotalMinor,
+      JSON.stringify(evidence.references),
+      JSON.stringify(evidence.sourceSnapshot),
+      evidence.snapshotHash,
+      actor.operatorId
+    ]
+  );
+  const retained = await query(
+    `SELECT completed_load_snapshot_id::text, calculated_metres::text,
+            shared_total_minor::text, currency, source_references,
+            source_snapshot, source_snapshot_hash
+       FROM mbt_mbbs_completed_load_snapshots
+      WHERE source_system = 'billing_candidate'
+        AND source_plan_id = $1
+        AND source_plan_revision = $2
+        AND physical_load_id = $3
+      FOR SHARE`,
+    [
+      evidence.identity.candidateId,
+      evidence.identity.sourcePlanRevision,
+      evidence.identity.physicalLoadId
+    ]
+  );
+  const row = retained.rowCount ? object(retained.rows[0]) : null;
+  if (!retainedCandidateSnapshotMatches(row, evidence)) {
+    throw failure(
+      409,
+      "MBT_CROSS_CHARGE_SOURCE_CONFLICT",
+      "This completed order identity is already bound to different immutable billing evidence."
+    );
+  }
+  return evidence.completedLoadSnapshotId;
+}
+
+/**
+ * Recalculate and atomically convert a selected completed-order batch into
+ * durable local-only MBBS billing cases. Caller-authored preview money is
+ * intentionally not accepted.
+ *
+ * @param {unknown} rawInput
+ * @param {{resolveDistance: Function, hooks?: Record<string, Function>}} dependencies
+ */
+export async function createMbbsBillingCasesFromCandidates(rawInput, dependencies) {
+  const input = object(rawInput);
+  const actor = billingActor(input.actor);
+  const ids = batchCandidateIds(input.candidateIds);
+  const month = completedMonth(input.completedMonth, { required: true });
+  const day = completedDay(input.completedDate);
+  assertCompatibleCompletionFilters(month, day);
+  const selectedVersionId = rateCardVersionId(input.rateCardVersionId);
+  const selectedCustomerId = customerNetsuiteId(input.customerNetsuiteId);
+  const reason = requiredBoundedText(
+    input.reason,
+    "MBT_BILLING_CONVERSION_REASON_INVALID",
+    "Enter a billing conversion audit reason of at most 2,000 characters.",
+    2000,
+    3
+  );
+  const resolveDistance = distanceResolver(dependencies);
+  const hooks = object(dependencies).hooks;
+  const payload = {
+    candidateIds: ids,
+    completedMonth: month,
+    completedDate: day,
+    rateCardVersionId: selectedVersionId,
+    customerNetsuiteId: selectedCustomerId,
+    reason
+  };
+  return executeMbtCommand({
+    actor,
+    commandName: "mbt.billing.mbbs_candidates.batch_create",
+    idempotencyKey: input.idempotencyKey,
+    payload,
+    correlationId: input.correlationId,
+    requestId: input.requestId,
+    mutation: async () => {
+      await query(
+        "SELECT pg_advisory_xact_lock(hashtextextended('mbt.billing.mbbs_candidates.batch_create', 0))"
+      );
+      const graphs = await activeMbbsRateGraphs();
+      const graph = selectedRateGraph(graphs, selectedVersionId, { explicit: true });
+      const { items } = await internalCandidates(MAX_CANDIDATES, month, {
+        graphs,
+        completedDateValue: day,
+        includeAllSalesMethods: true,
+        truncate: false
+      });
+      const byId = new Map(items.map((candidate) => [candidate.candidateId, candidate]));
+      const calculations = [];
+      for (const id of ids) {
+        const candidate = byId.get(id);
+        if (!candidate) {
+          throw failure(
+            404,
+            "MBT_BILLING_CANDIDATE_NOT_FOUND",
+            "The completed MBBS billing candidate is unavailable in the selected completion period."
+          );
+        }
+        // The command owns one transaction client. Sequential resolution keeps
+        // any database-backed distance adapter from issuing overlapping queries.
+        calculations.push(await calculateCandidate(candidate, graph, resolveDistance));
+      }
+      /** @type {Record<string, string>} */
+      const completedLoadSnapshotIdsByPhysicalLoad = {};
+      const completedLoadSnapshotIds = [];
+      for (const calculation of calculations) {
+        const snapshotId = await freezeCandidateCalculation(calculation, actor);
+        const physicalLoadId = text(object(calculation.candidate).physicalLoadId);
+        completedLoadSnapshotIdsByPhysicalLoad[physicalLoadId] = snapshotId;
+        completedLoadSnapshotIds.push(snapshotId);
+        if (typeof hooks?.afterSnapshotInsert === "function") {
+          await hooks.afterSnapshotInsert({ calculation, snapshotId });
+        }
+      }
+      const durable = await persistCalculatedMbbsCandidateBatch({
+        actor,
+        customerNetsuiteId: selectedCustomerId,
+        calculations,
+        reason,
+        correlationId: input.correlationId,
+        completedLoadSnapshotIdsByPhysicalLoad
+      }, { hooks });
+      const body = {
+        schemaVersion: "mbbs-billing-candidate-batch-create-v1",
+        generationId: durable.generationId,
+        completedMonth: month,
+        completedDate: day,
+        customerNetsuiteId: selectedCustomerId,
+        rateCardVersionId: selectedVersionId,
+        requestedCandidateCount: ids.length,
+        durableCaseCount: durable.cases.length,
+        completedLoadSnapshotIds,
+        currency: durable.currency,
+        cases: durable.cases,
+        allocationGroups: durable.allocationGroups,
+        postingMode: "local_only",
+        externalWork: null
+      };
+      return {
+        status: 201,
+        body,
+        audit: {
+          action: "mbt.billing.mbbs_candidates.created",
+          entityType: "mbt_cross_charge_generation",
+          entityId: durable.generationId,
+          beforeState: {
+            candidateIds: ids,
+            conversionStatus: "not_started"
+          },
+          afterState: {
+            candidateIds: ids,
+            completedLoadSnapshotIds,
+            durableCaseCount: durable.cases.length,
+            postingMode: "local_only"
+          },
+          reason,
+          revisionBefore: 1,
+          revisionAfter: 1,
+          source: "mbt_billing_candidate_conversion"
+        }
+      };
+    }
+  });
+}
+
 /** @param {Record<string, any>} candidate @param {Record<string, any> | null} existing */
 function assertAddressOverrideAllowed(candidate, existing) {
   if (existing) {
     return;
   }
-  if (array(candidate.references).length === 0 || !candidate.originYardCode || !candidate.originLabel) {
+  if (array(candidate.references).length === 0 || !candidate.originLabel) {
     throw failure(422, "MBT_BILLING_ADDRESS_OVERRIDE_INSUFFICIENT", "A destination address alone cannot complete this order's retained billing route.");
   }
   if (candidate.routeStopCount >= 2 && candidate.destinationLabel) {
@@ -999,7 +1595,8 @@ export async function setMbbsBillingCandidateAddressOverride(rawInput) {
       const { items } = await internalCandidates(MAX_CANDIDATES, month, {
         graphs,
         includeOverrides: false,
-        truncate: false
+        truncate: false,
+        includeAllSalesMethods: true
       });
       const candidate = items.find((item) => item.candidateId === encoded);
       if (!candidate) {

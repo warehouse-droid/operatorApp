@@ -96,10 +96,7 @@ function salesPrintEscape(value) {
 
 function salesPrintDate(value) {
   if (!value) return "—";
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString([], {
-    year: "numeric", month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit"
-  });
+  return window.MBBS_I18N?.displayDateTime?.(value) || String(value);
 }
 
 function salesPrintOrderDate(value) {

@@ -2,7 +2,12 @@ import crypto from "node:crypto";
 
 import { query, withTransaction } from "./db.js";
 import { syncDispatchDeliveryGroupsFromPlan } from "./dispatch-delivery-group-repository.js";
+import {
+  assertActiveDispatchCosForPlan,
+  reconcileDispatchPlanLocalCos
+} from "./dispatch-co-lifecycle.js";
 import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
+import { dispatchPlanV2Summary } from "./dispatch-plan-repository.js";
 import {
   assertHistoricalInactiveSalesOrdersReconciled,
   assertNoDriverPwaCompletedDispatchRefs
@@ -10,7 +15,6 @@ import {
 import {
   applyDispatchPlanCommand,
   buildCompactDispatchSnapshot,
-  clearCancelledTransitCoMetadata,
   createDispatchCommandReceiptStore,
   digestDispatchPlan,
   dispatchPlanBoard,
@@ -18,6 +22,17 @@ import {
 } from "./dispatch-planner-performance.js";
 
 const SNAPSHOT_SCHEMA_VERSION = 2;
+const DISPATCH_COMPANY_TIME_ZONE = "America/Toronto";
+const SNAPSHOT_SUMMARY_REPAIR_SOURCE = "dispatchV2-schema-repair";
+const SNAPSHOT_SUMMARY_SAVE_SOURCE = "dispatchV2-save";
+const MISSING_V2_SUMMARY_MARKER_SQL = `COALESCE(
+  CASE
+    WHEN (s.summary #>> '{dispatchPlanFormat,version}') ~ '^[0-9]+$'
+      THEN (s.summary #>> '{dispatchPlanFormat,version}')::int
+    ELSE 0
+  END,
+  0
+) < 2`;
 
 function text(value) {
   return String(value ?? "").trim();
@@ -26,6 +41,22 @@ function text(value) {
 function planDate(value) {
   if (value instanceof Date && !Number.isNaN(value.getTime())) {return value.toISOString().slice(0, 10);}
   return text(value).slice(0, 10);
+}
+
+function dispatchCompanyDate(value = new Date()) {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
+    timeZone: DISPATCH_COMPANY_TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(value).map((part) => [part.type, part.value]));
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+function snapshotMarkerTimestamp(row = {}) {
+  const value = row.saved_at || row.original_saved_at || row.archived_at || row.created_at || row.updated_at;
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {return value.toISOString();}
+  return text(value) || new Date().toISOString();
 }
 
 function stableValue(value) {
@@ -56,6 +87,7 @@ function commandError(message, code, status = 409, details = {}) {
 }
 
 function rowPlan(row = {}) {
+  const summary = row.summary && typeof row.summary === "object" ? row.summary : {};
   return {
     id: text(row.id || row.plan_id),
     planId: text(row.id || row.plan_id),
@@ -66,7 +98,12 @@ function rowPlan(row = {}) {
     savedAt: row.saved_at || row.updated_at || null,
     orders: Array.isArray(row.orders) ? row.orders : [],
     trucks: Array.isArray(row.trucks) ? row.trucks : [],
-    summary: row.summary && typeof row.summary === "object" ? row.summary : {}
+    summary: Number(row.schema_version || 1) >= SNAPSHOT_SCHEMA_VERSION
+      ? dispatchPlanV2Summary(summary, {
+          source: SNAPSHOT_SUMMARY_REPAIR_SOURCE,
+          migratedAt: snapshotMarkerTimestamp(row)
+        })
+      : summary
   };
 }
 
@@ -118,37 +155,8 @@ function publicPlan(plan = {}) {
   };
 }
 
-function planTransitCoRefs(orders = []) {
-  const refs = new Set();
-  const visit = (order = {}) => {
-    const ref = text(order.transitCo?.id);
-    if (ref) {refs.add(ref);}
-    for (const child of Array.isArray(order.childOrderDetails) ? order.childOrderDetails : []) {
-      visit(child);
-    }
-  };
-  for (const order of orders || []) {visit(order);}
-  return [...refs];
-}
-
 async function reconcileCancelledLocalCos(plan) {
-  if (!plan) {return null;}
-  const refs = planTransitCoRefs(plan.orders);
-  if (!refs.length) {return plan;}
-  const cancelled = await query(
-    `SELECT co_ref, from_location, to_location
-       FROM local_co_orders
-      WHERE status = 'cancelled'
-        AND co_ref = ANY($1::text[])`,
-    [refs]
-  );
-  if (!cancelled.rows.length) {return plan;}
-  const byRef = new Map(cancelled.rows.map((row) => [
-    text(row.co_ref).toLowerCase(),
-    { fromYard: text(row.from_location), toYard: text(row.to_location) }
-  ]));
-  const orders = (plan.orders || []).map((order) => clearCancelledTransitCoMetadata(order, byRef));
-  return orders.some((order, index) => order !== plan.orders[index]) ? { ...plan, orders } : plan;
+  return reconcileDispatchPlanLocalCos(plan);
 }
 
 async function selectPlan({ planId = "", date = "", lock = false } = {}) {
@@ -167,7 +175,8 @@ async function selectPlan({ planId = "", date = "", lock = false } = {}) {
   if (!clauses.length) {throw commandError("A plan ID or plan date is required.", "DISPATCH_PLAN_SELECTOR_REQUIRED", 400);}
   const result = await query(
     `SELECT p.id, p.plan_date::text AS plan_date, p.status, p.note, p.revision,
-            p.created_at, p.updated_at, s.saved_at, s.orders, s.trucks, s.summary
+            p.created_at, p.updated_at, s.saved_at, s.orders, s.trucks, s.summary,
+            s.schema_version
        FROM dispatch_plans p
        LEFT JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
       WHERE ${clauses.join(" AND ")}
@@ -198,6 +207,90 @@ export async function getDispatchV2Bootstrap({ planId = "", date = "" } = {}) {
     };
   }
   return { exists: true, plan: publicPlan(plan) };
+}
+
+export async function repairDispatchV2SummaryMarkers({
+  planId = "",
+  date = "",
+  limit = 25
+} = {}) {
+  const selectedPlanId = text(planId);
+  if (selectedPlanId && !/^\d+$/u.test(selectedPlanId)) {
+    throw new TypeError("planId must be a positive integer.");
+  }
+  const selectedDate = planDate(date || dispatchCompanyDate());
+  if (!selectedPlanId && !/^\d{4}-\d{2}-\d{2}$/u.test(selectedDate)) {
+    throw new TypeError("date must use YYYY-MM-DD format.");
+  }
+  const safeLimit = Math.min(Math.max(Number(limit) || 25, 1), 100);
+  return withTransaction(async () => {
+    await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
+    const candidates = await query(
+      `SELECT p.id, p.plan_date::text AS plan_date, p.status, p.note, p.revision,
+              p.created_at, p.updated_at, s.saved_at, s.orders, s.trucks, s.summary,
+              s.schema_version
+         FROM dispatch_plans p
+         JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+        WHERE s.schema_version >= 2
+          AND ${MISSING_V2_SUMMARY_MARKER_SQL}
+          AND (
+            ($1::bigint IS NOT NULL AND p.id = $1::bigint)
+            OR ($1::bigint IS NULL AND p.plan_date = $2::date)
+          )
+        ORDER BY p.plan_date DESC, p.id DESC
+        LIMIT $3
+        FOR UPDATE OF p, s`,
+      [selectedPlanId || null, selectedDate || null, safeLimit]
+    );
+    const repairedPlanIds = [];
+    for (const row of candidates.rows) {
+      const summary = dispatchPlanV2Summary(row.summary || {}, {
+        source: SNAPSHOT_SUMMARY_REPAIR_SOURCE,
+        migratedAt: snapshotMarkerTimestamp(row)
+      });
+      const repairedPlan = buildCompactDispatchSnapshot({
+        id: text(row.id),
+        planId: text(row.id),
+        planDate: planDate(row.plan_date),
+        status: row.status || "draft",
+        note: row.note || "",
+        revision: Number(row.revision || 0),
+        orders: Array.isArray(row.orders) ? row.orders : [],
+        trucks: Array.isArray(row.trucks) ? row.trucks : [],
+        summary
+      });
+      const counts = snapshotCounts(repairedPlan);
+      const updated = await query(
+        `UPDATE dispatch_plan_snapshots s
+            SET summary = $2::jsonb,
+                plan_digest = $3,
+                order_count = $4,
+                truck_count = $5,
+                load_count = $6,
+                stop_count = $7
+          WHERE s.plan_id = $1
+            AND s.schema_version >= 2
+            AND ${MISSING_V2_SUMMARY_MARKER_SQL}
+          RETURNING s.plan_id::text AS plan_id`,
+        [
+          row.id,
+          JSON.stringify(summary),
+          digestDispatchPlan(repairedPlan),
+          counts.orderCount,
+          counts.truckCount,
+          counts.loadCount,
+          counts.stopCount
+        ]
+      );
+      if (updated.rows[0]?.plan_id) {repairedPlanIds.push(updated.rows[0].plan_id);}
+    }
+    return {
+      date: selectedDate,
+      scanned: candidates.rows.length,
+      repaired: repairedPlanIds.length,
+      planIds: repairedPlanIds
+    };
+  });
 }
 
 async function existingReceipt(commandId, hash) {
@@ -384,6 +477,10 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
       command: { ...command, type: commandType },
       receiptStore: createDispatchCommandReceiptStore()
     });
+    result.plan.summary = dispatchPlanV2Summary(result.plan.summary || {}, {
+      previousSummary: plan.summary || {},
+      source: SNAPSHOT_SUMMARY_SAVE_SOURCE
+    });
     const policy = evaluateExecutedPrefixPolicy({
       previousPlan: plan,
       nextPlan: result.plan,
@@ -392,6 +489,7 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
     if (!policy.allowed) {
       throw commandError(policy.conflicts[0].message, policy.conflicts[0].code, 409, { conflicts: policy.conflicts });
     }
+    await assertActiveDispatchCosForPlan(result.plan);
     if (plan.savedAt) {
       const previousCounts = snapshotCounts(plan);
       await query(
@@ -538,7 +636,8 @@ export async function listDispatchV2Checkpoints({ planId, date = "" } = {}) {
 export async function getDispatchV2Checkpoint({ planId, checkpointId } = {}) {
   const result = await query(
     `SELECT h.id, h.plan_id, h.plan_date::text AS plan_date, h.revision,
-            h.orders, h.trucks, h.summary, h.original_saved_at, h.archived_at
+            h.orders, h.trucks, h.summary, h.original_saved_at, h.archived_at,
+            h.schema_version
        FROM dispatch_plan_snapshot_history h
       WHERE h.plan_id = $1
         AND h.id = $2

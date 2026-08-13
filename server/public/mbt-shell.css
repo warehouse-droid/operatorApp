@@ -413,8 +413,19 @@ body[data-mbt-surface="billing"] textarea {
 body[data-mbt-surface="billing"] .mbt-table-wrap {
   width: 100%;
   max-width: 100%;
+  max-height: min(60vh, 640px);
   margin: 14px 0;
-  overflow-x: auto;
+  overflow: auto;
+  scrollbar-gutter: stable both-edges;
+}
+
+body[data-mbt-surface="billing"] .mbt-billing-search,
+body[data-mbt-surface="billing"] .mbt-batch-conversion {
+  margin-top: 18px;
+  padding: 16px;
+  border: 1px solid #ccd9d0;
+  border-radius: 11px;
+  background: #f8fbf9;
 }
 
 body[data-mbt-surface="billing"] table {
@@ -1027,9 +1038,18 @@ body[data-mbt-surface="gates"] .mbt-shell {
 
 .mbt-table-wrap {
   margin-top: 14px;
-  overflow-x: auto;
+  max-height: min(60vh, 640px);
+  overflow: auto;
+  scrollbar-gutter: stable both-edges;
   border: 1px solid #ccd9d0;
   border-radius: 11px;
+}
+
+.mbt-table-wrap th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: #fff;
 }
 
 .mbt-table-actions {

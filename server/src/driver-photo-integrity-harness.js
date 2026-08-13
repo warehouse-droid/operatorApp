@@ -180,7 +180,7 @@ assert.match(
 );
 assert.match(
   driverWorker,
-  /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v27`/,
+  /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v28`/,
   "The recovery shell must use a new cache generation."
 );
 for (const asset of ["driver-photo-hash.js", "driver-offline-photos.js", "driver-offline-sync.js"]) {

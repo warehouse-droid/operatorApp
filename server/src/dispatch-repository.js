@@ -10,6 +10,7 @@ import {
   useNetSuiteAddressMappingValue
 } from "./dispatch-enrichment.js";
 import { resolveDispatchSalesTarget } from "./dispatch-order-target-repository.js";
+import { cancelDispatchCoGlobally } from "./dispatch-co-lifecycle.js";
 import {
   dispatchLocationsShareYard,
   uniqueDispatchLocations
@@ -6353,17 +6354,7 @@ export async function upsertLocalCoOrder({ sourceOrderRef, fromYard, toYard, ord
 }
 
 export async function cancelLocalCoOrder(coRef, { requestedBy = "" } = {}) {
-  const result = await query(
-    `UPDATE local_co_orders
-        SET status = 'cancelled',
-            updated_at = now(),
-            details = details || $2::jsonb
-      WHERE co_ref = $1
-        AND status NOT IN ('received', 'loaded')
-      RETURNING *`,
-    [coRef, JSON.stringify({ cancelledBy: requestedBy || null, cancelledAt: new Date().toISOString() })]
-  );
-  return result.rows[0] || null;
+  return cancelDispatchCoGlobally(coRef, { requestedBy });
 }
 
 export async function getLocalCoOrder(coRefOrId) {

@@ -40,7 +40,7 @@
         <div class="mbt-panel-heading">
           <div>
             <h2 id="mbbsCandidateTitle">Completed MBBS order candidates</h2>
-            <p>Driver PWA and reconciliation completions are read locally. Choose the completion month and the active rate card containing <code>DELIVERY_CHARGE_MBBS</code> to calculate selected orders in one batch.</p>
+            <p>Driver PWA and reconciliation completions, completed Delivery Sales Orders, and completed custom local orders are read locally. Choose the completion period and the active rate card containing <code>DELIVERY_CHARGE_MBBS</code> to calculate selected orders in one batch.</p>
           </div>
           <button id="refreshMbbsCandidates" type="button">Refresh completed orders</button>
         </div>
@@ -48,6 +48,10 @@
           <label>Completed month (Toronto)
             <input id="mbbsCompletedMonth" type="month" aria-describedby="mbbsCompletedMonthHelp" />
             <span id="mbbsCompletedMonthHelp" class="mbt-field-help">Month boundaries use America/Toronto.</span>
+          </label>
+          <label>Completed date (Toronto, optional)
+            <input id="mbbsCompletedDate" type="date" aria-describedby="mbbsCompletedDateHelp" />
+            <span id="mbbsCompletedDateHelp" class="mbt-field-help">Use this to narrow the selected month to one exact Toronto day.</span>
           </label>
           <label>Choose MBBS rate card
             <select id="mbbsRateCardVersion">
@@ -57,6 +61,22 @@
           <button id="calculateSelectedMbbsCandidates" class="mbt-command" type="button" disabled>Calculate selected orders</button>
         </div>
         <p id="mbbsCandidateMessage" class="mbt-inline-message" role="status" aria-live="polite"></p>
+        <section class="mbt-billing-search" aria-labelledby="mbbsOrderSearchTitle">
+          <h3 id="mbbsOrderSearchTitle">Find another completed database order</h3>
+          <p>Delivery orders are included by default. Pick-Up orders are excluded from the default list, but you can find and add one explicitly with database search.</p>
+          <div class="mbt-form-row" role="search" aria-label="Search all completed database orders">
+            <label>Order, customer, or address
+              <input id="mbbsOrderSearch" type="search" minlength="2" maxlength="120" autocomplete="off" />
+            </label>
+            <button id="searchMbbsOrders" type="button">Search database</button>
+          </div>
+          <div class="mbt-table-wrap" tabindex="0" aria-label="Scrollable database order search results">
+            <table>
+              <thead><tr><th scope="col">Order</th><th scope="col">Method / source</th><th scope="col">Completed</th><th scope="col">Readiness</th><th scope="col">Action</th></tr></thead>
+              <tbody id="mbbsOrderSearchRows"><tr><td colspan="5">Search to find a completed database order, including Pick-Up.</td></tr></tbody>
+            </table>
+          </div>
+        </section>
         <div class="mbt-billing-master-detail">
           <section id="mbbsCandidateMaster" class="mbt-billing-master" aria-label="Completed order master list">
             <div class="mbt-table-wrap" tabindex="0" aria-label="Scrollable completed MBBS order candidates">
@@ -91,6 +111,26 @@
               <tbody id="mbbsBatchResultRows"></tbody>
             </table>
           </div>
+          <section class="mbt-batch-conversion" aria-labelledby="mbbsBatchConversionTitle">
+            <h4 id="mbbsBatchConversionTitle">Create real local billing cases</h4>
+            <p>The server recalculates every selected route and rate, freezes immutable evidence, and creates the complete batch atomically. This still creates no outbox or NetSuite work.</p>
+            <div class="mbt-form-row" role="search" aria-label="Canonical billing customer search">
+              <label>Find canonical billing customer
+                <input id="mbbsBillingCustomerSearch" type="search" minlength="2" maxlength="120" autocomplete="off" />
+              </label>
+              <button id="searchMbbsBillingCustomers" type="button">Search customers</button>
+              <label>Selected billing customer
+                <select id="mbbsBillingCustomerId">
+                  <option value="">Search and choose a customer</option>
+                </select>
+              </label>
+            </div>
+            <p id="mbbsBillingCustomerMessage" class="mbt-inline-message" role="status" aria-live="polite"></p>
+            <label>Conversion audit reason
+              <textarea id="mbbsBatchConversionReason" rows="2" minlength="3" maxlength="2000" required></textarea>
+            </label>
+            <button id="createMbbsBillingCases" class="mbt-command" type="button" disabled>Create local billing cases</button>
+          </section>
         </section>
       </section>
 

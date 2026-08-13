@@ -7,8 +7,8 @@ importScripts("/driver-offline-sync.js?v=20260812-driver-pwa-v3");
 
 const DRIVER_PWA_CLIENT_VERSION = "2026.08.12.3";
 const DRIVER_CACHE_PREFIX = "mbbs-driver-shell-";
-const DRIVER_CACHE_NAME = `${DRIVER_CACHE_PREFIX}v27`;
-const DRIVER_REFRESH_CACHE_NAME = `${DRIVER_CACHE_PREFIX}refresh-v27`;
+const DRIVER_CACHE_NAME = `${DRIVER_CACHE_PREFIX}v28`;
+const DRIVER_REFRESH_CACHE_NAME = `${DRIVER_CACHE_PREFIX}refresh-v28`;
 const DRIVER_OFFLINE_MODE_REQUEST = "/__mbbs_driver_offline_mode__";
 const DRIVER_SHELL = [
   "/driver",
@@ -32,7 +32,10 @@ let driverShellRepairPromise = null;
 
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(DRIVER_CACHE_NAME).then(async (cache) => {
-    await cache.addAll(DRIVER_SHELL);
+    await cache.addAll(DRIVER_SHELL.map((url) => new Request(
+      new URL(url, self.location.origin),
+      { cache: "reload" }
+    )));
     await cache.put(DRIVER_OFFLINE_MODE_REQUEST, new Response("false", {
       headers: { "content-type": "text/plain", "cache-control": "no-store" }
     }));

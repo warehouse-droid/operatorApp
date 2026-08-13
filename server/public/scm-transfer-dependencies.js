@@ -104,7 +104,7 @@ function syncDependencyReservationOverridesFromBatch(batch = null) {
 
 function depDate(value) {
   if (!value) return "No delivery date";
-  return window.MBBS_I18N?.formatDate?.(value) || String(value).slice(0, 10);
+  return window.MBBS_I18N?.displayDate?.(value) || String(value).slice(0, 10);
 }
 
 function depUnitText(line = {}, quantityField = "unresolvedQuantity") {

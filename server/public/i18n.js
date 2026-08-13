@@ -2005,31 +2005,47 @@
   }
 
   const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const OPERATION_TIME_ZONE = "America/Toronto";
 
-  function parseDisplayDate(value) {
+  function torontoDisplayDateParts(value, { preserveDateOnly = false } = {}) {
     if (!value) return null;
-    if (typeof value === "string") {
-      const iso = value.match(/^(\d{4})-(\d{2})-(\d{2})/);
-      if (iso) return new Date(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3]));
+    if (preserveDateOnly && typeof value === "string") {
+      const dateOnly = value.trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+      if (dateOnly) return { month: Number(dateOnly[2]), day: Number(dateOnly[3]) };
     }
-    const date = new Date(value);
-    return Number.isNaN(date.getTime()) ? null : date;
+    const date = value instanceof Date ? value : new Date(value);
+    if (Number.isNaN(date.getTime())) return null;
+    const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
+      timeZone: OPERATION_TIME_ZONE,
+      month: "2-digit",
+      day: "2-digit"
+    }).formatToParts(date).map((part) => [part.type, part.value]));
+    return { month: Number(parts.month), day: Number(parts.day) };
+  }
+
+  function localizedDisplayDate({ month, day }) {
+    return language() === ZH
+      ? `${month}月${day}日`
+      : `${String(day).padStart(2, "0")}-${MONTHS[month - 1]}`;
   }
 
   function displayDate(value) {
-    const date = parseDisplayDate(value);
-    if (!date) return "";
-    if (language() === ZH) return `${date.getMonth() + 1}月${date.getDate()}日`;
-    return `${String(date.getDate()).padStart(2, "0")}-${MONTHS[date.getMonth()]}`;
+    const parts = torontoDisplayDateParts(value, { preserveDateOnly: true });
+    return parts ? localizedDisplayDate(parts) : "";
   }
 
   function displayDateTime(value) {
     if (!value) return "";
     const date = new Date(value);
-    if (!date) return "";
     if (Number.isNaN(date.getTime())) return "";
-    const locale = language() === ZH ? "zh-CN" : [];
-    return `${displayDate(value)} ${date.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" })}`;
+    const localizedDate = localizedDisplayDate(torontoDisplayDateParts(date));
+    const locale = language() === ZH ? "zh-CN" : "en-US";
+    const localizedTime = date.toLocaleTimeString(locale, {
+      timeZone: OPERATION_TIME_ZONE,
+      hour: "2-digit",
+      minute: "2-digit"
+    });
+    return `${localizedDate} ${localizedTime}`;
   }
 
   document.documentElement.lang = language();

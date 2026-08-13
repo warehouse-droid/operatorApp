@@ -34,6 +34,17 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
     ])
   }),
   Object.freeze({
+    runner: "run-dispatch-co-lifecycle-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "public/dispatch.js",
+      "src/dispatch-co-lifecycle.js",
+      "src/dispatch-co-recovery.js",
+      "src/dispatch-plan-repository.js",
+      "src/dispatch-repository.js"
+    ])
+  }),
+  Object.freeze({
     runner: "run-dispatch-driver-completion-mutations.mjs",
     adminUrlEnvironment: null,
     sourcePaths: Object.freeze(["src/dispatch-history-mode.js"])
@@ -51,6 +62,14 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
       "src/dispatch-plan-repository.js",
       "src/dispatch-planner-v2-repository.js",
       "src/server.js"
+    ])
+  }),
+  Object.freeze({
+    runner: "run-dispatch-v2-summary-marker-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "src/dispatch-plan-repository.js",
+      "src/dispatch-planner-v2-repository.js"
     ])
   }),
   Object.freeze({

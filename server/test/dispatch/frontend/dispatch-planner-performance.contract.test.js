@@ -435,7 +435,11 @@ test("DP-28 frontend: CO cancellation is server-first and clears every stale req
     }
   }
 
-  const cancellation = functionBody("cancelTransitCoAndApply");
+  const cancellationStart = dispatchSource.indexOf('if (action === "cancel-transit-co")');
+  const cancellationEnd = dispatchSource.indexOf('if (action === "undo-plan")', cancellationStart);
+  assert.ok(cancellationStart >= 0 && cancellationEnd > cancellationStart, "Expected an explicit CO cancellation action.");
+  const cancellation = dispatchSource.slice(cancellationStart, cancellationEnd);
+  assert.match(cancellation, /window\.confirm/u);
   assert.match(cancellation, /await\s+cancelTransitCoOnServer\(coId\)/u);
   assert.ok(
     cancellation.indexOf("await cancelTransitCoOnServer(coId)")
@@ -443,7 +447,10 @@ test("DP-28 frontend: CO cancellation is server-first and clears every stale req
     "The server must accept cancellation before the browser removes CO state."
   );
   assert.doesNotMatch(cancellation, /persistTransitCoInBackground/u);
-  assert.match(dispatchSource, /cancelledCo\s*=\s*await\s+cancelTransitCoAndApply\(order\)/u);
+  const detailsStart = dispatchSource.indexOf('if (form.dataset.form === "edit-order-details")');
+  const detailsEnd = dispatchSource.indexOf('if (form.dataset.form === "driver")', detailsStart);
+  const detailsSave = dispatchSource.slice(detailsStart, detailsEnd);
+  assert.doesNotMatch(detailsSave, /cancelTransitCo(?:OnServer|ForOrder|AndApply)/u);
 
   const preservePlanning = Function(`"use strict"; return (${functionBody("preserveDispatchPlanningFields")});`)();
   const authoritativeCancellation = preservePlanning(
@@ -483,17 +490,22 @@ test("DP-11 backend: a targeted refresh does not hydrate every historical snapsh
   assert.match(feed, /listDispatchSnapshotDerivedOrders\(\{\s*type,\s*search:\s*searchTerm\s*\}\)/u);
 });
 
-test("DP-29 backend: snapshot-derived groups reconcile cancelled local COs before entering the order feed", () => {
+test("DP-29 backend: snapshot-derived groups reconcile both cancelled and active global COs before entering the order feed", () => {
   const snapshotStart = serverSource.indexOf("async function listDispatchSnapshotDerivedOrders(");
   assert.notEqual(snapshotStart, -1);
   const snapshotLoader = serverSource.slice(snapshotStart, snapshotStart + 5_000);
-  assert.match(snapshotLoader, /FROM\s+local_co_orders[\s\S]*?status\s*=\s*['"]cancelled['"]/u);
+  assert.match(snapshotLoader, /SELECT\s+co_ref,\s*source_order_ref,[\s\S]*?status[\s\S]*?FROM\s+local_co_orders/u);
+  assert.match(snapshotLoader, /String\(row\.status[\s\S]*?===\s*["']cancelled["']/u);
   assert.match(
     snapshotLoader,
     /clearCancelledTransitCoMetadata\(snapshotOrder,\s*cancelledLocalCoByRef\)/u
   );
   assert.match(
+    snapshotLoader,
+    /applyActiveTransitCoMetadata\([\s\S]*?activeLocalCoBySource/u
+  );
+  assert.match(
     serverSource,
-    /import\s*\{[^}]*clearCancelledTransitCoMetadata[^}]*\}\s*from\s*["']\.\/dispatch-planner-performance\.js["']/u
+    /import\s*\{[^}]*applyActiveTransitCoMetadata[^}]*clearCancelledTransitCoMetadata[^}]*\}\s*from\s*["']\.\/dispatch-planner-performance\.js["']/u
   );
 });

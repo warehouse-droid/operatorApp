@@ -69,6 +69,14 @@ const billingService = Object.freeze({
 });
 
 const candidateService = Object.freeze({
+  async searchMbbsBillingCustomers(input) {
+    calls.push({ operation: "search_mbbs_customers", input });
+    return {
+      schemaVersion: "mbbs-billing-customer-search-v1",
+      search: input.search,
+      items: [{ netsuiteId: "123", entityNumber: "MBBS", displayName: "MBBS", currency: "CAD" }]
+    };
+  },
   async listMbbsBillingCandidates(input) {
     calls.push({ operation: "list_mbbs_candidates", input });
     return { schemaVersion: "mbbs-billing-candidates-v1", postingMode: "local_only_preview", items: [] };
@@ -100,6 +108,21 @@ const candidateService = Object.freeze({
         distanceMetres: route.providerMetres,
         charge: { itemCode: "DELIVERY_CHARGE_MBBS", amountMinor: 25000, currency: "CAD" }
       }))
+    };
+  },
+  async createMbbsBillingCasesFromCandidates(input, dependencies) {
+    calls.push({ operation: "create_mbbs_candidate_cases", input, dependencies });
+    await dependencies.resolveDistance({ originAddressText: "Vendor", destinationAddressText: "MBBS" });
+    return {
+      status: 201,
+      replayed: false,
+      body: {
+        schemaVersion: "mbbs-billing-candidate-batch-create-v1",
+        requestedCandidateCount: input.candidateIds.length,
+        durableCaseCount: input.candidateIds.length,
+        postingMode: "local_only",
+        externalWork: null
+      }
     };
   },
   async setMbbsBillingCandidateAddressOverride(input) {
@@ -281,11 +304,13 @@ test("P3-F27 HTTP: a closed operational gate preserves read-only recovery and de
 });
 
 test("MBBS candidate HTTP lists retained completions and previews the exact active item locally", async () => {
-  const listed = await request("/api/mbt/billing/mbbs/candidates?limit=17&completedMonth=2038-08", { actor: "billing" });
+  const listed = await request("/api/mbt/billing/mbbs/candidates?limit=17&completedMonth=2038-08&completedDate=2038-08-10&search=SO-123", { actor: "billing" });
   assert.equal(listed.response.status, 200, JSON.stringify(listed.payload));
   assert.equal(calls[0].operation, "list_mbbs_candidates");
   assert.equal(calls[0].input.limit, 17);
   assert.equal(calls[0].input.completedMonth, "2038-08");
+  assert.equal(calls[0].input.completedDate, "2038-08-10");
+  assert.equal(calls[0].input.search, "SO-123");
   assert.deepEqual(calls[0].input.actor, {
     operatorId: ACTORS.billing.id,
     roles: ["mbt_billing"]
@@ -299,6 +324,7 @@ test("MBBS candidate HTTP lists retained completions and previews the exact acti
       actor: { operatorId: "forged", roles: ["admin"] },
       candidateId: "forged",
       completedMonth: "2038-08",
+      completedDate: "2038-08-10",
       rateCardVersionId: VERSION_ID
     }
   });
@@ -309,6 +335,7 @@ test("MBBS candidate HTTP lists retained completions and previews the exact acti
   assert.equal(calls[0].operation, "preview_mbbs_candidate");
   assert.equal(calls[0].input.candidateId, CANDIDATE_ID);
   assert.equal(calls[0].input.completedMonth, "2038-08");
+  assert.equal(calls[0].input.completedDate, "2038-08-10");
   assert.equal(calls[0].input.rateCardVersionId, VERSION_ID);
   assert.equal(calls[0].input.actor.operatorId, ACTORS.billing.id);
   assert.equal(typeof calls[0].dependencies.resolveDistance, "function");
@@ -321,6 +348,7 @@ test("MBBS candidate HTTP lists retained completions and previews the exact acti
       actor: { operatorId: "forged", roles: ["admin"] },
       candidateIds: [CANDIDATE_ID],
       completedMonth: "2038-08",
+      completedDate: "2038-08-10",
       rateCardVersionId: VERSION_ID
     }
   });
@@ -330,6 +358,7 @@ test("MBBS candidate HTTP lists retained completions and previews the exact acti
   assert.equal(calls[0].operation, "preview_mbbs_candidates_batch");
   assert.deepEqual(calls[0].input.candidateIds, [CANDIDATE_ID]);
   assert.equal(calls[0].input.completedMonth, "2038-08");
+  assert.equal(calls[0].input.completedDate, "2038-08-10");
   assert.equal(calls[0].input.rateCardVersionId, VERSION_ID);
   assert.equal(calls[0].input.actor.operatorId, ACTORS.billing.id);
   assert.equal(typeof calls[0].dependencies.resolveDistance, "function");
@@ -358,6 +387,41 @@ test("MBBS candidate HTTP lists retained completions and previews the exact acti
   assert.equal(calls[0].input.reason, "Verified with the customer");
   assert.equal(calls[0].input.idempotencyKey, "p3-billing-address-override");
   assert.equal(calls[0].input.actor.operatorId, ACTORS.billing.id);
+});
+
+test("MBBS candidate HTTP searches canonical customers and converts one server-owned batch atomically", async () => {
+  const customers = await request("/api/mbt/billing/mbbs/customers?search=MBBS&limit=12", { actor: "billing" });
+  assert.equal(customers.response.status, 200, JSON.stringify(customers.payload));
+  assert.equal(calls[0].operation, "search_mbbs_customers");
+  assert.equal(calls[0].input.search, "MBBS");
+  assert.equal(calls[0].input.limit, 12);
+  assert.equal(calls[0].input.actor.operatorId, ACTORS.billing.id);
+
+  calls.length = 0;
+  const converted = await request("/api/mbt/billing/mbbs/candidates/batch-create", {
+    actor: "billing",
+    method: "POST",
+    idempotencyKey: "p3-billing-http-candidate-create",
+    body: {
+      actor: { operatorId: "forged", roles: ["admin"] },
+      candidateIds: [CANDIDATE_ID],
+      completedMonth: "2038-08",
+      completedDate: "2038-08-10",
+      rateCardVersionId: VERSION_ID,
+      customerNetsuiteId: "123",
+      reason: "Convert a verified batch"
+    }
+  });
+  assert.equal(converted.response.status, 201, JSON.stringify(converted.payload));
+  assert.equal(converted.response.headers.get("x-mbt-idempotent-replay"), "false");
+  assert.equal(converted.payload.postingMode, "local_only");
+  assert.equal(converted.payload.externalWork, null);
+  assert.equal(calls[0].operation, "create_mbbs_candidate_cases");
+  assert.equal(calls[0].input.actor.operatorId, ACTORS.billing.id);
+  assert.equal(calls[0].input.idempotencyKey, "p3-billing-http-candidate-create");
+  assert.equal(calls[0].input.completedDate, "2038-08-10");
+  assert.equal(calls[0].input.customerNetsuiteId, "123");
+  assert.equal(typeof calls[0].dependencies.resolveDistance, "function");
 });
 
 test("P3-F25/P3-F27 HTTP: enabled commands replace forged actor and bind exact request identity", async () => {

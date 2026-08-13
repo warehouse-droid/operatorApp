@@ -134,14 +134,22 @@ function displayDate(value) {
   if (!value) return "Not scheduled";
   return new Intl.DateTimeFormat("en-GB", {
     day: "2-digit", month: "short", year: "numeric", hour: "2-digit",
-    minute: "2-digit", hourCycle: "h23", timeZone: "UTC"
+    minute: "2-digit", hourCycle: "h23", timeZone: "America/Toronto"
   }).format(new Date(value));
 }
 
 function localDateTimeValue(value) {
   const date = new Date(value || Date.now());
-  const shifted = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
-  return shifted.toISOString().slice(0, 16);
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Toronto",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23"
+  }).formatToParts(date).map((part) => [part.type, part.value]));
+  return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}`;
 }
 
 function configuredBinItems() {

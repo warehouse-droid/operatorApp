@@ -1,4 +1,4 @@
-const CACHE_NAME = "mbbs-yard-operator-v137-performance-v1";
+const CACHE_NAME = "mbbs-yard-operator-v138-toronto-timestamps-v1";
 const OPERATOR_CACHE_PREFIX = "mbbs-yard-operator-";
 const APP_SHELL = [
   "/operator",
@@ -6,8 +6,8 @@ const APP_SHELL = [
   "/operator.css?v=20260810-operator-performance-v1",
   "/i18n.css?v=20260701-i18n-v2",
   "/vendor/quagga2/quagga.min.js?v=1.12.1",
-  "/i18n.js?v=20260729-returns-v9",
-  "/operator.js?v=20260810-operator-performance-v1",
+  "/i18n.js?v=20260813-toronto-timestamps-v1",
+  "/operator.js?v=20260813-toronto-timestamps-v1",
   "/manifest.webmanifest",
   "/icons/mbbs-yard-192.png",
   "/icons/mbbs-yard-512.png",
@@ -15,7 +15,10 @@ const APP_SHELL = [
 ];
 
 self.addEventListener("install", (event) => {
-  event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(APP_SHELL)));
+  event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(APP_SHELL.map((url) => new Request(
+    new URL(url, self.location.origin),
+    { cache: "reload" }
+  )))));
   self.skipWaiting();
 });
 

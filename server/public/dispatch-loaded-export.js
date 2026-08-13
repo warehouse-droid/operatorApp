@@ -13,8 +13,7 @@ const LOADED_YARDS = [
 ];
 
 function loadedToday() {
-  const date = new Date();
-  return new Date(date.getTime() - (date.getTimezoneOffset() * 60000)).toISOString().slice(0, 10);
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "America/Toronto" }).format(new Date());
 }
 
 const loadedDefaultDate = loadedToday();

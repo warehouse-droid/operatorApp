@@ -89,14 +89,14 @@ function formatTime(value) {
   if (!value) return "-";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "-";
-  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  return date.toLocaleTimeString([], { timeZone: "America/Toronto", hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
 function formatActualTime(value) {
   if (!value) return "--";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "--";
-  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+  return date.toLocaleTimeString([], { timeZone: "America/Toronto", hour: "2-digit", minute: "2-digit", hour12: false });
 }
 
 function formatPlannedMinute(value) {
@@ -137,7 +137,7 @@ function formatKmh(value) {
 function formatEtaArrival(value) {
   const date = value ? new Date(value) : null;
   if (!date || Number.isNaN(date.getTime())) return "—";
-  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return date.toLocaleTimeString([], { timeZone: "America/Toronto", hour: "2-digit", minute: "2-digit" });
 }
 
 function monitorDistanceMeters(left = {}, right = {}) {

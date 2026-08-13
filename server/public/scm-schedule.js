@@ -1014,9 +1014,8 @@ function scmScheduleReconciliationQuantity(row = {}, keys = []) {
 }
 
 function scmScheduleReconciliationDate(value) {
-  const date = value ? new Date(value) : null;
-  if (!date || Number.isNaN(date.getTime())) return "--";
-  return date.toLocaleString([], { year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  if (!value) return "--";
+  return window.MBBS_I18N?.displayDateTime?.(value) || String(value);
 }
 
 function scmScheduleReconciliationLines(row = {}) {

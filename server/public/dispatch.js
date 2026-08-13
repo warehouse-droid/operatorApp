@@ -578,7 +578,7 @@ const DISPATCH_VIEW_MUTATION_ACTIONS = new Set([
   "confirm-group", "ungroup-order", "confirm-split", "unsplit-order", "request-unpack-for-split",
   "open-consolidate-modal", "confirm-consolidate", "open-po-link-modal", "open-to-link-modal", "confirm-po-link",
   "open-co-modal", "confirm-co", "open-po-yard-modal", "confirm-po-yard", "cancel-po-link",
-  "link-order-dependency", "update-dependency-mode", "unlink-dependency",
+  "link-order-dependency", "update-dependency-mode", "unlink-dependency", "cancel-transit-co",
   "delete-load", "confirm-delete-load", "clear-load", "add-load", "add-driver-load", "add-driver-return", "insert-driver-return", "move-truck-up", "move-truck-down",
   "move-driver-up", "move-driver-down", "add-return-load", "remove-stop", "optimize-route", "toggle-route-tolls"
 ]);
@@ -759,9 +759,7 @@ function minutes(value) {
 }
 
 function todayLocalDate() {
-  const now = new Date();
-  const offset = now.getTimezoneOffset();
-  return new Date(now.getTime() - (offset * 60000)).toISOString().slice(0, 10);
+  return dispatchCompanyLocalDate();
 }
 
 function dispatchCompanyLocalDate(now = new Date()) {
@@ -5331,7 +5329,7 @@ function applySavedPlan(saved) {
   selectedOrderId = orders.find((order) => order.id === selectedOrderId)?.id || orders[0]?.id || "";
   selectedLoadId = trucks.flatMap((truck) => truck.loads).find((load) => load.id === selectedLoadId)?.id || trucks[0]?.loads[0]?.id || "";
   selectedOrderIds = new Set(selectedOrderId ? [selectedOrderId] : []);
-  lastSavedAt = saved.savedAt ? new Date(saved.savedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "";
+  lastSavedAt = saved.savedAt ? new Date(saved.savedAt).toLocaleTimeString([], { timeZone: "America/Toronto", hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "";
   lastServerSavedAt = saved.savedAt || lastServerSavedAt;
   lastSavedPlanHash = savedPlanHash(restorableSavedPlan);
   return true;
@@ -5723,7 +5721,7 @@ async function flushPlanSaveQueue() {
           clearLocalPlanDirty(savedAt.toISOString(), saveGeneration);
           continue;
         }
-        lastSavedAt = savedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+        lastSavedAt = savedAt.toLocaleTimeString([], { timeZone: "America/Toronto", hour: "2-digit", minute: "2-digit", second: "2-digit" });
         activeSaveGeneration = saveGeneration;
         let result;
         try {
@@ -5949,7 +5947,7 @@ function redoDispatchChange() {
 
 function autoSavePlan() {
   if (!isDispatchPlanEditor()) return;
-  lastSavedAt = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  lastSavedAt = new Date().toLocaleTimeString([], { timeZone: "America/Toronto", hour: "2-digit", minute: "2-digit", second: "2-digit" });
   queueServerSave();
 }
 
@@ -6049,7 +6047,7 @@ async function confirmCurrentPlanAtomic() {
       await loadPlanHistory();
       lastServerSavedAt = plan.savedAt || plan.updatedAt || lastServerSavedAt;
       lastSavedPlanHash = savedPlanHash(plan);
-      lastSavedAt = savedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+      lastSavedAt = savedAt.toLocaleTimeString([], { timeZone: "America/Toronto", hour: "2-digit", minute: "2-digit", second: "2-digit" });
       saveQueued = false;
       nextSaveNeedsOrderPoolRefresh = false;
       nextPlanSaveMode = "";
@@ -11134,26 +11132,34 @@ function renderMap() {
 function renderTransitCoEditor(order) {
   const originalPickup = order.transitOriginalPickupLocations?.[0] || order.transitCo?.fromYard || order.pickupLocations?.[0] || "3445";
   const toYard = order.transitCo?.toYard || "12441";
-  const checked = order.transitCo ? "checked" : "";
   const sourceTypeLabel = order.childOrders?.length ? "grouped order" : order.type === "TO" ? "TO" : "SO";
   return `
     <section class="transit-co-editor">
-      <label class="transit-check">
-        <input name="createTransitCo" type="checkbox" ${checked} />
-        <span>Initiate CO transit depot order</span>
-      </label>
+      ${order.transitCo ? `
+        <label class="transit-check">
+          <input type="checkbox" checked disabled />
+          <span>Current CO: ${escapeHtml(order.transitCo.id)}</span>
+        </label>
+      ` : `
+        <label class="transit-check">
+          <input name="createTransitCo" type="checkbox" />
+          <span>Initiate CO transit depot order</span>
+        </label>
+      `}
       <div class="transit-co-grid">
         <label class="split-field">
           <span>Pick from</span>
-          <select name="transitFromYard">${yardOptions(originalPickup)}</select>
+          <select name="transitFromYard" ${order.transitCo ? "disabled" : ""}>${yardOptions(originalPickup)}</select>
         </label>
         <label class="split-field">
           <span>Transit depot</span>
-          <select name="transitToYard">${yardOptions(toYard)}</select>
+          <select name="transitToYard" ${order.transitCo ? "disabled" : ""}>${yardOptions(toYard)}</select>
         </label>
       </div>
-      <p>Creates a local CO and changes this ${sourceTypeLabel} pickup yard to the transit depot. The CO must be planned before this ${sourceTypeLabel} can be dropped to a load.</p>
-      ${order.transitCo ? `<strong>Current CO: ${escapeHtml(order.transitCo.id)}</strong>` : ""}
+      <p>${order.transitCo
+        ? `This CO route is retained independently of Dispatch Info edits. Cancel it separately only after removing it from every Dispatch plan.`
+        : `Creates a local CO and changes this ${sourceTypeLabel} pickup yard to the transit depot. The CO must be planned before this ${sourceTypeLabel} can be dropped to a load.`}</p>
+      ${order.transitCo ? `<button data-action="cancel-transit-co" data-order="${escapeHtml(order.id)}" type="button">Cancel CO</button>` : ""}
     </section>
   `;
 }
@@ -13109,7 +13115,7 @@ async function cancelTransitCoOnServer(coId) {
   const response = await fetch(`/api/dispatch/co-orders/${encodeURIComponent(coId)}?sessionId=${encodeURIComponent(dispatchSessionId)}&planDate=${encodeURIComponent(currentPlanDate)}&editLeaseToken=${encodeURIComponent(planEditLeaseToken)}&response=targeted`, {
     method: "DELETE"
   });
-  if (!response.ok) throw new Error(await response.text());
+  if (!response.ok) throw new Error(await dispatchErrorMessage(response));
   return response.json();
 }
 
@@ -13207,13 +13213,6 @@ function cancelTransitCoForOrder(orderId) {
     details: { sourceOrderId: order.id, removedStops }
   });
   return { coId, removedStops };
-}
-
-async function cancelTransitCoAndApply(order) {
-  const coId = String(order?.transitCo?.id || "").trim();
-  if (!coId) return null;
-  await cancelTransitCoOnServer(coId);
-  return cancelTransitCoForOrder(order.id);
 }
 
 function optimizeSelectedRoute() {
@@ -13763,7 +13762,7 @@ app.addEventListener("focusin", (event) => {
     : selectorForElement(field) || "";
 });
 
-app.addEventListener("click", (event) => {
+app.addEventListener("click", async (event) => {
   if (event.target.dataset?.action === "close-modal") {
     resetActiveLinkModalState();
     modalType = "";
@@ -13986,6 +13985,29 @@ app.addEventListener("click", (event) => {
       routeNotice = `Dependency unlink failed: ${error.message}`;
       render({ save: false });
     });
+    return;
+  }
+  if (action === "cancel-transit-co") {
+    const order = orderById(button.dataset.order || modalOrderId);
+    const coId = String(order?.transitCo?.id || "").trim();
+    if (!order || !coId) return;
+    if (!window.confirm(`Cancel ${coId}? This is allowed only when the CO is not planned on any Dispatch date.`)) return;
+    button.disabled = true;
+    try {
+      const payload = await cancelTransitCoOnServer(coId);
+      mergeTargetedDispatchMutationOrders(payload);
+      const cancelled = cancelTransitCoForOrder(order.id);
+      requestTargetedOrderPoolRefresh([order.id, coId]);
+      routeNotice = `${cancelled?.coId || coId} cancelled. ${order.id} pickup restored.`;
+      modalType = "";
+      modalOrderId = "";
+      clearActiveRouteEstimates();
+      commitPlanMutation("co_cancelled");
+    } catch (error) {
+      button.disabled = false;
+      routeNotice = `CO cancellation failed: ${error.message}`;
+      render({ save: false });
+    }
     return;
   }
   if (action === "undo-plan") {
@@ -15454,7 +15476,7 @@ app.addEventListener("submit", (event) => {
           if (!response.ok) return response.text().then((text) => Promise.reject(new Error(text)));
           return response.json();
         });
-    saveDetails.then(async (payload) => {
+    saveDetails.then((payload) => {
       const pickupAddress = String(data.pickupAddress || "").trim();
       order.address = data.address;
       order.pickupAddressOverride = pickupAddress;
@@ -15462,19 +15484,15 @@ app.addEventListener("submit", (event) => {
       order.expectedDeliveryDate = data.expectedDeliveryDate || "";
       order.windowStart = windowStart;
       order.windowEnd = windowEnd;
-          mergeTargetedDispatchMutationOrders(payload);
+      mergeTargetedDispatchMutationOrders(payload);
       let coOrder = null;
-      let cancelledCo = null;
       if (wantsTransitCo) {
         coOrder = upsertTransitCoForOrder(order.id, transitFromYard, transitToYard);
         if (coOrder) activeOrderType = "CO";
-      } else if (supportsTransitCo && order.transitCo?.id) {
-        cancelledCo = await cancelTransitCoAndApply(order);
       }
-      if (coOrder || cancelledCo) requestTargetedOrderPoolRefresh([
+      if (coOrder) requestTargetedOrderPoolRefresh([
         order.id,
-        coOrder?.id,
-        cancelledCo?.coId
+        coOrder?.id
       ]);
       if (coOrder) {
         persistTransitCoInBackground(
@@ -15486,9 +15504,7 @@ app.addEventListener("submit", (event) => {
       modalOrderId = "";
       routeNotice = coOrder
         ? `${coOrder.id} initiated. Plan this CO before dropping ${order.id}.`
-        : cancelledCo
-          ? `${cancelledCo.coId} cancelled. ${order.id} pickup restored.`
-          : "Dispatch info updated.";
+        : "Dispatch info updated.";
       clearActiveRouteEstimates();
       commitPlanMutation("dispatch_order_details_updated");
     }).catch((error) => {

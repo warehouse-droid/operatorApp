@@ -101,7 +101,8 @@ export const REQUIRED_MBT_P3_MIGRATIONS = Object.freeze([
   "154_sales_order_delivery_instructions.sql",
   "155_delivery_instruction_media_replacement.sql",
   "156_scm_vendor_item_price.sql",
-  "157_yard_movement_history_indexes.sql"
+  "157_yard_movement_history_indexes.sql",
+  "158_mbt_mbbs_candidate_billing.sql"
 ]);
 
 export const REQUIRED_MBT_P3_FLAGS = Object.freeze([

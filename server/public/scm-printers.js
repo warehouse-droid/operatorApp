@@ -22,8 +22,7 @@ function printerEscape(value) {
 
 function printerDate(value) {
   if (!value) return "Never";
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? String(value) : new Intl.DateTimeFormat("en-CA", { dateStyle: "medium", timeStyle: "short" }).format(date);
+  return window.MBBS_I18N?.displayDateTime?.(value) || String(value);
 }
 
 function printerDuration(value) {

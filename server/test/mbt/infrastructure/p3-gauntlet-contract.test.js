@@ -15,9 +15,11 @@ const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
   "run-customer-charge-mutations.mjs",
   "run-delivery-instruction-mutations.mjs",
   "run-dispatch-active-load-mutations.mjs",
+  "run-dispatch-co-lifecycle-mutations.mjs",
   "run-dispatch-driver-completion-mutations.mjs",
   "run-dispatch-performance-mutations.mjs",
   "run-dispatch-save-recovery-mutations.mjs",
+  "run-dispatch-v2-summary-marker-mutations.mjs",
   "run-driver-offline-stress-mutations.mjs",
   "run-frontdesk-mutations.mjs",
   "run-p310-adversarial-mutations.mjs",
@@ -63,7 +65,10 @@ const P3_BASE_MUTANT_NAMES = Object.freeze([
   "P3 MBBS candidate list regresses to a 200-order ceiling",
   "P3 MBBS batch accepts a 101st order",
   "P3 MBBS batch starts unbounded distance work",
-  "P3 MBBS selected rate ignores origin-yard scope",
+  "P3 MBBS two-address routes regress to origin-yard-only eligibility",
+  "P3 MBBS durable conversion skips immutable candidate snapshots",
+  "P3 MBBS durable conversion skips atomic failure hook",
+  "P3 MBBS durable conversion excludes explicitly searched Pick-Up",
   "P3 MBBS address override ignores optimistic revision"
 ]);
 const P3_ADVERSARIAL_TESTS = Object.freeze([
@@ -301,7 +306,7 @@ test("P3.1: mutation selection contains a distinct nonempty P3 set instead of P1
   );
   assert.match(mutations, /mutationScope\s*===\s*"MBBS_BILLING"/u);
   assert.match(mutations, /scope\s*===\s*"mbbs_billing"/u);
-  assert.match(mutations, /scopedP3Mutants\.length\s*!==\s*5/u);
+  assert.match(mutations, /scopedP3Mutants\.length\s*!==\s*8/u);
 });
 
 test("P3.11: every unmutated Node test category is owned by main, coverage, and shuffle", async () => {

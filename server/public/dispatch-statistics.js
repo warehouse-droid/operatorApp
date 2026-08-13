@@ -13,16 +13,12 @@ const state = {
 };
 
 function localDate() {
-  const now = new Date();
-  const offset = now.getTimezoneOffset();
-  return new Date(now.getTime() - (offset * 60000)).toISOString().slice(0, 10);
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "America/Toronto" }).format(new Date());
 }
 
 function daysAgo(days = 0) {
-  const date = new Date();
-  date.setDate(date.getDate() - Number(days || 0));
-  const offset = date.getTimezoneOffset();
-  return new Date(date.getTime() - (offset * 60000)).toISOString().slice(0, 10);
+  const [year, month, day] = localDate().split("-").map(Number);
+  return new Date(Date.UTC(year, month - 1, day - Number(days || 0), 12)).toISOString().slice(0, 10);
 }
 
 function escapeHtml(value) {

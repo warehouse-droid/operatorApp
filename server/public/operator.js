@@ -127,7 +127,7 @@ let deliveryOrderType = initialOperatorState.deliveryOrderType || localStorage.g
 let deliveryBatchFilter = initialOperatorState.deliveryBatchFilter || localStorage.getItem("mbbs.operator.deliveryBatchFilter") || "batch_a";
 let deliveryPrepMode = initialOperatorState.deliveryPrepMode || localStorage.getItem("mbbs.operator.deliveryPrepMode") || "standard";
 if (!["standard", "saved", "load"].includes(deliveryPrepMode)) deliveryPrepMode = "standard";
-let deliveryLoadViewDate = initialOperatorState.deliveryLoadViewDate || localStorage.getItem("mbbs.operator.deliveryLoadViewDate") || new Date().toISOString().slice(0, 10);
+let deliveryLoadViewDate = initialOperatorState.deliveryLoadViewDate || localStorage.getItem("mbbs.operator.deliveryLoadViewDate") || new Intl.DateTimeFormat("en-CA", { timeZone: "America/Toronto" }).format(new Date());
 let deliveryLoadViewTruck = "";
 localStorage.removeItem("mbbs.operator.deliveryLoadViewTruck");
 let deliveryLoadTrucks = [];
@@ -298,7 +298,7 @@ let receiptJobStage = "";
 let receiptStartedAt = 0;
 let receiptProgressTimer = null;
 let personalHistory = [];
-let personalHistoryDate = initialOperatorState.personalHistoryDate || new Date().toISOString().slice(0, 10);
+let personalHistoryDate = initialOperatorState.personalHistoryDate || new Intl.DateTimeFormat("en-CA", { timeZone: "America/Toronto" }).format(new Date());
 let selectedHistoryId = initialOperatorState.selectedHistoryId || "";
 let historyReportReason = "";
 let historyPage = Number(initialOperatorState.historyPage || 0);
@@ -1342,7 +1342,7 @@ function renderUrgentDeliveryAlert() {
   const permission = "Notification" in window ? Notification.permission : "unsupported";
   const first = items[0] || {};
   const alertTime = urgentDeliveryAlert?.updatedAt
-    ? new Date(urgentDeliveryAlert.updatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })
+    ? new Date(urgentDeliveryAlert.updatedAt).toLocaleTimeString([], { timeZone: "America/Toronto", hour: "2-digit", minute: "2-digit", second: "2-digit" })
     : "";
   return `
     <aside class="urgent-delivery-alert" role="status" aria-live="polite">
@@ -8206,7 +8206,7 @@ app.addEventListener("click", async (event) => {
       if (currentOrderBlocksMove()) return showToast("Pack current order before moving on.");
       const dateInput = app.querySelector('[data-input="delivery-load-date"]');
       const truckInput = app.querySelector('[data-input="delivery-load-truck"]');
-      deliveryLoadViewDate = dateInput?.value || deliveryLoadViewDate || new Date().toISOString().slice(0, 10);
+      deliveryLoadViewDate = dateInput?.value || deliveryLoadViewDate || new Intl.DateTimeFormat("en-CA", { timeZone: "America/Toronto" }).format(new Date());
       deliveryLoadViewTruck = truckInput?.value || "";
       localStorage.setItem("mbbs.operator.deliveryLoadViewDate", deliveryLoadViewDate);
       orderPage = 0;

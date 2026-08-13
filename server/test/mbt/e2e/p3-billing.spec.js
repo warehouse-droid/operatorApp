@@ -19,6 +19,7 @@ const ROW_ID = "00000000-0000-4000-8000-000000000257";
 const CANDIDATE_ID = "eyJ2IjoxLCJraW5kIjoiZHJpdmVyIiwicGxhbklkIjpudWxsLCJsb2FkSWQiOiJMT0FELTEifQ";
 const CANDIDATE_ID_2 = "eyJ2IjoxLCJraW5kIjoic2FsZXNfb3JkZXIiLCJuZXRzdWl0ZUlkIjoiMiJ9";
 const RATE_VERSION_ID = "00000000-0000-4000-8000-000000000260";
+const BILLING_CUSTOMER_ID = "8600000000251";
 
 async function removeFixture() {
   await query(
@@ -211,6 +212,7 @@ async function installBillingApi(page, { commandsEnabled }) {
       schemaVersion: "mbbs-billing-candidates-v2",
       postingMode: "local_only_preview",
       completedMonth: null,
+      completedDate: null,
       rateOptions: [{
         rateCardVersionId: RATE_VERSION_ID,
         rateCardCode: "DELIVERY_CHARGE_MBBS",
@@ -237,8 +239,8 @@ async function installBillingApi(page, { commandsEnabled }) {
         sourceSystem: "sales_order",
         sourceRecordId: "2",
         physicalLoadId: "SO-2",
-        planDate: "2038-08-04",
-        completedAt: "2038-08-04T12:00:00.000Z",
+        planDate: "2038-08-03",
+        completedAt: "2038-08-03T13:00:00.000Z",
         references: [{ sourceType: "SO", rootReference: "SOA05678" }],
         originYardCode: "2967",
         originLabel: "2967 Kennedy Road",
@@ -246,6 +248,17 @@ async function installBillingApi(page, { commandsEnabled }) {
         routeStopCount: 2,
         chargeable: true,
         reason: null
+      }]
+    })],
+    ["GET /api/mbt/billing/mbbs/customers", async (route) => fulfillJson(route, 200, {
+      schemaVersion: "mbbs-billing-customer-search-v1",
+      search: "Synthetic",
+      items: [{
+        netsuiteId: BILLING_CUSTOMER_ID,
+        entityNumber: "SYNTHETIC-MBBS",
+        legalName: "Synthetic MBBS Billing Customer",
+        displayName: "Synthetic MBBS Billing Customer",
+        currency: "CAD"
       }]
     })],
     [`POST /api/mbt/billing/mbbs/candidates/${CANDIDATE_ID}/preview`, async (route) => {
@@ -303,6 +316,18 @@ async function installBillingApi(page, { commandsEnabled }) {
           }
         }))
       });
+    }],
+    ["POST /api/mbt/billing/mbbs/candidates/batch-create", async (route) => {
+      calls.push(capturedCall(route.request()));
+      await fulfillJson(route, 201, {
+        schemaVersion: "mbbs-billing-candidate-batch-create-v1",
+        generationId: "00000000-0000-4000-8000-000000000261",
+        requestedCandidateCount: 2,
+        durableCaseCount: 2,
+        postingMode: "local_only",
+        externalWork: null,
+        cases: []
+      }, { "x-mbt-idempotent-replay": "false" });
     }],
     [`GET /api/mbt/billing/cases/${CASE_ID}`, async (route) => fulfillJson(route, 200, detail(browserState))],
     [`POST /api/mbt/billing/cases/${CASE_ID}/calculate`, async (route) => {
@@ -397,13 +422,20 @@ test("billing browser batches selected monthly candidates and switches to billin
   await expect(page.getByRole("heading", { name: "MBT Billing" })).toBeVisible();
   await expect(page.getByText("No outbox or NetSuite transport")).toBeVisible();
   await expect(page.getByRole("cell", { name: "SO SOA01234", exact: true })).toBeVisible();
-  await page.getByLabel("Completed month (Toronto)").fill("2038-08");
-  await page.getByRole("button", { name: "Refresh completed orders" }).click();
+  await page.getByLabel("Completed date (Toronto, optional)").fill("2038-08-03");
+  await page.getByLabel("Completed date (Toronto, optional)").press("Tab");
+  await expect(page.getByLabel("Completed month (Toronto)")).toHaveValue("2038-08");
   await page.getByLabel("Choose MBBS rate card").selectOption(RATE_VERSION_ID);
   await page.getByLabel("Select all ready MBBS candidates").check();
   await page.getByRole("button", { name: "Calculate selected orders" }).click();
   await expect(page.locator("#mbbsBatchResultRows")).toContainText("SO SOA01234");
   await expect(page.locator("#mbbsBatchResultRows")).toContainText("$250.00");
+  await page.getByLabel("Find canonical billing customer").fill("Synthetic");
+  await page.getByRole("button", { name: "Search customers" }).click();
+  await expect(page.getByLabel("Selected billing customer")).toHaveValue(BILLING_CUSTOMER_ID);
+  await page.getByLabel("Conversion audit reason").fill("Create verified local MBBS billing cases");
+  await page.getByRole("button", { name: "Create local billing cases" }).click();
+  await expect(page.locator("#mbbsCandidateMessage")).toContainText("2 local billing case(s) created");
 
   await page.getByRole("tab", { name: "Billing cases" }).click();
   await expect(page.getByRole("cell", { name: "MBT contract" })).toBeVisible();
@@ -423,15 +455,26 @@ test("billing browser batches selected monthly candidates and switches to billin
 
   expect(calls.map(({ path }) => path)).toEqual([
     "/api/mbt/billing/mbbs/candidates/batch-preview",
+    "/api/mbt/billing/mbbs/candidates/batch-create",
     `/api/mbt/billing/cases/${CASE_ID}/calculate`,
     `/api/mbt/billing/cases/${CASE_ID}/approve-local`
   ]);
   expect(calls[0].body).toEqual({
     candidateIds: [CANDIDATE_ID, CANDIDATE_ID_2],
     completedMonth: "2038-08",
+    completedDate: "2038-08-03",
     rateCardVersionId: RATE_VERSION_ID
   });
   expect(calls[1].body).toEqual({
+    candidateIds: [CANDIDATE_ID, CANDIDATE_ID_2],
+    completedMonth: "2038-08",
+    completedDate: "2038-08-03",
+    rateCardVersionId: RATE_VERSION_ID,
+    customerNetsuiteId: BILLING_CUSTOMER_ID,
+    reason: "Create verified local MBBS billing cases"
+  });
+  expect(calls[1].idempotencyKey).toMatch(/^mbt-billing-batch-create:/u);
+  expect(calls[2].body).toEqual({
     serviceVisitId: VISIT_ID,
     distanceSnapshotId: DISTANCE_ID,
     expectedRevision: 1,
@@ -445,7 +488,7 @@ test("billing browser batches selected monthly candidates and switches to billin
     },
     reason: "Calculate selected completed visit"
   });
-  expect(calls[2].body).toEqual({
+  expect(calls[3].body).toEqual({
     billingVersionId: VERSION_ID,
     expectedRevision: 2,
     reason: "Billing evidence reviewed"
@@ -472,7 +515,7 @@ test("P3-F27 browser: closing billing commands keeps queue/detail review visible
   await expect(page.locator("#billingCaseDetail")).toContainText("MBT contract · open · revision 1");
   await page.getByRole("tab", { name: "Order candidates" }).click();
   const commands = page.locator(".mbt-command");
-  await expect(commands).toHaveCount(4);
+  await expect(commands).toHaveCount(5);
   for (let index = 0; index < await commands.count(); index += 1) {
     await expect(commands.nth(index)).toBeDisabled();
   }

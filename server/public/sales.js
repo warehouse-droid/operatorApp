@@ -131,7 +131,7 @@ function salesReturnMoney(value) {
 function salesReturnDate(value) {
   if (!value) return "—";
   return window.MBBS_I18N?.displayDateTime?.(value)
-    || new Intl.DateTimeFormat("en-CA", { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
+    || new Intl.DateTimeFormat("en-CA", { dateStyle: "medium", timeStyle: "short", timeZone: "America/Toronto" }).format(new Date(value));
 }
 
 function salesReturnYard(record, prefix) {

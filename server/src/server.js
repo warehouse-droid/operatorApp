@@ -100,9 +100,10 @@ import {
   getDispatchV2Checkpoint,
   listDispatchV2Checkpoints,
   pendingDispatchV2Followups,
-  pruneExpiredDispatchV2Checkpoints
+  pruneExpiredDispatchV2Checkpoints,
+  repairDispatchV2SummaryMarkers
 } from "./dispatch-planner-v2-repository.js";
-import { clearCancelledTransitCoMetadata, evaluateExecutedPrefixPolicy } from "./dispatch-planner-performance.js";
+import { applyActiveTransitCoMetadata, clearCancelledTransitCoMetadata, evaluateExecutedPrefixPolicy } from "./dispatch-planner-performance.js";
 import { DispatchPlanEditLeaseError, acquireDispatchPlanEditLease, assertDispatchPlanEditLease, getDispatchPlanEditLease, heartbeatDispatchPlanEditLease, releaseDispatchPlanEditLease } from "./dispatch-plan-lease-repository.js";
 import { getDispatchStatistics } from "./dispatch-statistics-repository.js";
 import { buildDispatchForecast } from "./dispatch-forecast-service.js";
@@ -1291,7 +1292,7 @@ function snapshotDerivedGroupBelongsToPlan(order = {}, plan = {}) {
 async function listDispatchSnapshotDerivedOrders({ type = null, search = "" } = {}) {
   const sandbox = isNetSuiteSandboxEnvironment();
   const snapshotSearch = String(search || "").trim().slice(0, 120);
-  const [result, inactiveSplits, blanketPurchaseOrders, cancelledLocalCos] = await Promise.all([
+  const [result, inactiveSplits, blanketPurchaseOrders, localCos] = await Promise.all([
     query(
     `SELECT p.id, p.plan_date::text AS plan_date, p.updated_at, s.orders
        FROM dispatch_plans p
@@ -1312,27 +1313,45 @@ async function listDispatchSnapshotDerivedOrders({ type = null, search = "" } = 
         WHERE is_blanket_po = true`
     ),
     query(
-      `SELECT co_ref, from_location, to_location
+      `SELECT co_ref, source_order_ref, from_location, to_location, status, created_at, updated_at
          FROM local_co_orders
-        WHERE status = 'cancelled'`
+        ORDER BY updated_at DESC, id DESC`
     )
   ]);
   const inactiveSplitRefs = new Set(inactiveSplits.rows.map((row) => String(row.tranid || "")));
   const blanketPurchaseOrderRefs = new Set(blanketPurchaseOrders.rows.flatMap((row) => [row.tranid, row.dispatch_ref])
     .map((ref) => String(ref || "").trim().toLowerCase())
     .filter(Boolean));
-  const cancelledLocalCoByRef = new Map(cancelledLocalCos.rows.map((row) => [
+  const cancelledLocalCoByRef = new Map(localCos.rows
+    .filter((row) => String(row.status || "").toLowerCase() === "cancelled")
+    .map((row) => [
     String(row.co_ref || "").trim().toLowerCase(),
     {
       fromYard: String(row.from_location || "").trim(),
       toYard: String(row.to_location || "").trim()
     }
   ]).filter(([ref]) => ref));
+  const activeLocalCoBySource = new Map();
+  for (const row of localCos.rows) {
+    if (String(row.status || "").toLowerCase() === "cancelled") continue;
+    const sourceRef = String(row.source_order_ref || "").trim().toLowerCase();
+    if (!sourceRef || activeLocalCoBySource.has(sourceRef)) continue;
+    activeLocalCoBySource.set(sourceRef, {
+      coRef: String(row.co_ref || "").trim(),
+      sourceOrderRef: String(row.source_order_ref || "").trim(),
+      fromYard: String(row.from_location || "").trim(),
+      toYard: String(row.to_location || "").trim(),
+      createdAt: row.created_at || null
+    });
+  }
   const derivedOrders = new Map();
   const wantedType = type ? String(type).toUpperCase() : "";
   for (const row of result.rows) {
     for (const snapshotOrder of row.orders || []) {
-      const order = clearCancelledTransitCoMetadata(snapshotOrder, cancelledLocalCoByRef);
+      const order = applyActiveTransitCoMetadata(
+        clearCancelledTransitCoMetadata(snapshotOrder, cancelledLocalCoByRef),
+        activeLocalCoBySource
+      );
       if (!isSnapshotDerivedDispatchOrder(order)) continue;
       if (!snapshotDerivedGroupBelongsToPlan(order, row)) continue;
       if (wantedType && String(order?.type || "").toUpperCase() !== wantedType) continue;
@@ -20279,6 +20298,10 @@ export async function dispatchV2CheckpointRetentionTick() {
 export async function startServer() {
   await recoverInterruptedSyncState();
   await recoverInterruptedPhotoArchive();
+  const dispatchV2SummaryRepair = await repairDispatchV2SummaryMarkers();
+  if (dispatchV2SummaryRepair.repaired > 0) {
+    console.log(`Repaired ${dispatchV2SummaryRepair.repaired} Dispatch V2 summary marker(s) for ${dispatchV2SummaryRepair.date}.`);
+  }
   return app.listen(config.port, () => {
     console.log(`MBBS Yard Server listening on ${config.appBaseUrl}`);
     startNetSuiteMirrorWorkers();

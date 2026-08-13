@@ -9,6 +9,9 @@ const state = {
   selectedMbbsCandidateId: null,
   selectedMbbsCandidateIds: new Set(),
   mbbsBatchResults: [],
+  mbbsBatchPreviewContext: null,
+  mbbsOrderSearchResults: [],
+  mbbsCustomerResults: [],
   billingItems: [],
   billingCursor: null,
   selectedBillingCase: null
@@ -123,6 +126,47 @@ function syncCommandButtons() {
       ? "Choose a completion month, rate card, and at least one ready order."
       : "";
   }
+  const create = element("createMbbsBillingCases");
+  if (create && state.commandsEnabled) {
+    const reason = inputValue("mbbsBatchConversionReason");
+    const contextMatches = batchContextsMatch(state.mbbsBatchPreviewContext, currentMbbsBatchContext());
+    const allCalculated = state.mbbsBatchResults.length > 0
+      && state.mbbsBatchResults.every((result) => result.status === "calculated");
+    create.disabled = !contextMatches
+      || !allCalculated
+      || !inputValue("mbbsBillingCustomerId")
+      || reason.length < 3
+      || reason.length > 2000;
+    create.title = create.disabled
+      ? "Calculate the unchanged batch successfully, choose a customer, and enter an audit reason."
+      : "Recalculate and create this complete local billing batch atomically.";
+  }
+}
+
+function currentMbbsBatchContext() {
+  return {
+    candidateIds: [...state.selectedMbbsCandidateIds].sort(),
+    completedMonth: inputValue("mbbsCompletedMonth"),
+    completedDate: inputValue("mbbsCompletedDate"),
+    rateCardVersionId: inputValue("mbbsRateCardVersion")
+  };
+}
+
+function batchContextsMatch(left, right) {
+  return Boolean(left)
+    && left.completedMonth === right.completedMonth
+    && left.completedDate === right.completedDate
+    && left.rateCardVersionId === right.rateCardVersionId
+    && JSON.stringify(left.candidateIds) === JSON.stringify(right.candidateIds);
+}
+
+function invalidateMbbsBatchPreview({ clearResults = true } = {}) {
+  state.mbbsBatchPreviewContext = null;
+  if (clearResults) {
+    state.mbbsBatchResults = [];
+    renderBatchResults();
+  }
+  syncCommandButtons();
 }
 
 async function loadCommandState() {
@@ -189,7 +233,8 @@ function mbbsSourceLabel(sourceSystem) {
   return ({
     driver_pwa: "Driver PWA",
     reconciliation: "Reconciliation",
-    sales_order: "Sales Order"
+    sales_order: "Sales Order",
+    custom_order: "Custom local order"
   })[sourceSystem] || "Completed order";
 }
 
@@ -234,7 +279,7 @@ function renderMbbsCandidateDetail() {
   const canEditAddress = Boolean(
     candidate.addressOverride
     || ((candidate.references || []).length > 0
-      && candidate.originYardCode
+      && candidate.originLabel
       && (!candidate.destinationLabel || candidate.routeStopCount < 2))
   );
   if (form) {
@@ -270,6 +315,7 @@ function toggleCandidate(candidateId, checked) {
   }
   if (checked) state.selectedMbbsCandidateIds.add(candidateId);
   else state.selectedMbbsCandidateIds.delete(candidateId);
+  invalidateMbbsBatchPreview();
   updateSelectAllState();
   syncCommandButtons();
 }
@@ -281,7 +327,7 @@ function renderMbbsCandidates() {
   rows.replaceChildren();
   if (!state.mbbsCandidates.length) {
     const row = document.createElement("tr");
-    const cell = textCell("No completed Driver PWA, reconciliation, or Sales Order candidates match this month.");
+    const cell = textCell("No completed Delivery, custom local, Driver PWA, or reconciliation candidates match this completion period.");
     cell.colSpan = 5;
     row.append(cell);
     rows.append(row);
@@ -318,7 +364,45 @@ function renderMbbsCandidates() {
   restoreFocus(focusKey, rows);
 }
 
-function renderMbbsRateOptions() {
+function appendCustomerOption(customer, { select = false } = {}) {
+  const customerSelect = element("mbbsBillingCustomerId");
+  if (!customerSelect || !customer?.netsuiteId) return;
+  const value = String(customer.netsuiteId);
+  let option = [...customerSelect.options].find((entry) => entry.value === value);
+  if (!option) {
+    option = new Option(
+      `${customer.displayName || customer.legalName || "Customer"} · ${customer.entityNumber || value} · #${value}`,
+      value
+    );
+    customerSelect.add(option);
+  }
+  if (select) customerSelect.value = value;
+}
+
+function applyRateCardCustomer() {
+  const selectedRate = state.mbbsRateOptions.find(
+    (option) => option.rateCardVersionId === inputValue("mbbsRateCardVersion")
+  );
+  if (!selectedRate?.customerNetsuiteId) {
+    syncCommandButtons();
+    return;
+  }
+  const known = state.mbbsCustomerResults.find(
+    (customer) => String(customer.netsuiteId) === String(selectedRate.customerNetsuiteId)
+  );
+  appendCustomerOption(known || {
+    netsuiteId: selectedRate.customerNetsuiteId,
+    displayName: "Rate-card customer",
+    entityNumber: selectedRate.customerNetsuiteId
+  }, { select: true });
+  message(
+    "mbbsBillingCustomerMessage",
+    `Using canonical customer #${selectedRate.customerNetsuiteId} mapped to the selected rate card.`
+  );
+  syncCommandButtons();
+}
+
+function renderMbbsRateOptions(defaultVersionId = "") {
   const select = element("mbbsRateCardVersion");
   if (!select) return;
   const retained = select.value;
@@ -331,23 +415,96 @@ function renderMbbsRateOptions() {
   }
   if (state.mbbsRateOptions.some((option) => option.rateCardVersionId === retained)) {
     select.value = retained;
+  } else if (state.mbbsRateOptions.some((option) => option.rateCardVersionId === defaultVersionId)) {
+    select.value = defaultVersionId;
   }
+  applyRateCardCustomer();
   syncCommandButtons();
 }
 
-function mbbsCandidateQuery() {
+function mbbsCandidateQuery(search = "") {
   const params = new URLSearchParams({ limit: "1000" });
   const month = inputValue("mbbsCompletedMonth");
+  const completedDate = inputValue("mbbsCompletedDate");
   if (month) params.set("completedMonth", month);
+  if (completedDate) params.set("completedDate", completedDate);
+  if (search) params.set("search", search);
   return params;
 }
 
+function renderMbbsOrderSearchResults() {
+  const rows = element("mbbsOrderSearchRows");
+  if (!rows) return;
+  rows.replaceChildren();
+  if (!state.mbbsOrderSearchResults.length) {
+    const row = document.createElement("tr");
+    const cell = textCell("No completed database orders match this search and completion period.");
+    cell.colSpan = 5;
+    row.append(cell);
+    rows.append(row);
+    return;
+  }
+  for (const candidate of state.mbbsOrderSearchResults) {
+    const row = document.createElement("tr");
+    const actionCell = document.createElement("td");
+    const alreadyAdded = state.mbbsCandidates.some((item) => item.candidateId === candidate.candidateId);
+    const add = actionButton(
+      alreadyAdded ? "Added" : "Add order",
+      `mbbs-search-add:${candidate.candidateId}`,
+      () => addSearchedMbbsOrder(candidate.candidateId)
+    );
+    add.disabled = alreadyAdded || !candidate.chargeable;
+    actionCell.append(add);
+    row.append(
+      textCell(mbbsReferenceText(candidate)),
+      textCell(candidate.deliveryMethod || mbbsSourceLabel(candidate.sourceSystem)),
+      textCell(mbbsCompletionTime(candidate.completedAt)),
+      textCell(candidate.chargeable ? "Ready" : candidate.reason),
+      actionCell
+    );
+    rows.append(row);
+  }
+}
+
+function addSearchedMbbsOrder(candidateId) {
+  const candidate = state.mbbsOrderSearchResults.find((item) => item.candidateId === candidateId);
+  if (!candidate?.chargeable) return;
+  if (!state.mbbsCandidates.some((item) => item.candidateId === candidateId)) {
+    state.mbbsCandidates.push(candidate);
+  }
+  invalidateMbbsBatchPreview();
+  state.selectedMbbsCandidateIds.add(candidateId);
+  state.selectedMbbsCandidateId = candidateId;
+  renderMbbsCandidates();
+  renderMbbsCandidateDetail();
+  renderMbbsOrderSearchResults();
+  message("mbbsCandidateMessage", `${mbbsReferenceText(candidate)} was added explicitly to this billing batch.`);
+}
+
+async function searchMbbsOrders() {
+  const search = inputValue("mbbsOrderSearch");
+  message("mbbsCandidateMessage", "Searching completed database orders…");
+  try {
+    const result = await api(`/api/mbt/billing/mbbs/candidates?${mbbsCandidateQuery(search)}`);
+    state.mbbsOrderSearchResults = Array.isArray(result.items) ? result.items : [];
+    renderMbbsOrderSearchResults();
+    message(
+      "mbbsCandidateMessage",
+      `${state.mbbsOrderSearchResults.length} matching completed order(s) found. Pick-Up remains excluded until you choose Add order.`
+    );
+  } catch (error) {
+    message("mbbsCandidateMessage", error.message, "attention");
+  }
+}
+
 async function loadMbbsCandidates() {
-  message("mbbsCandidateMessage", "Loading completed Driver PWA, reconciliation, and Sales Order evidence…");
+  message("mbbsCandidateMessage", "Loading completed Delivery, custom local, Driver PWA, and reconciliation evidence…");
   try {
     const result = await api(`/api/mbt/billing/mbbs/candidates?${mbbsCandidateQuery()}`);
+    invalidateMbbsBatchPreview();
     state.mbbsCandidates = Array.isArray(result.items) ? result.items : [];
     state.mbbsRateOptions = Array.isArray(result.rateOptions) ? result.rateOptions : [];
+    state.mbbsOrderSearchResults = [];
     const readyIds = new Set(state.mbbsCandidates.filter((candidate) => candidate.chargeable)
       .map((candidate) => candidate.candidateId));
     state.selectedMbbsCandidateIds = new Set([...state.selectedMbbsCandidateIds]
@@ -355,9 +512,10 @@ async function loadMbbsCandidates() {
     if (!state.mbbsCandidates.some((candidate) => candidate.candidateId === state.selectedMbbsCandidateId)) {
       state.selectedMbbsCandidateId = state.mbbsCandidates[0]?.candidateId || null;
     }
-    renderMbbsRateOptions();
+    renderMbbsRateOptions(result.rateCardVersionId || "");
     renderMbbsCandidates();
     renderMbbsCandidateDetail();
+    renderMbbsOrderSearchResults();
     const ready = state.mbbsCandidates.filter((candidate) => candidate.chargeable).length;
     message(
       "mbbsCandidateMessage",
@@ -369,6 +527,7 @@ async function loadMbbsCandidates() {
 }
 
 function toggleAllCandidates(checked) {
+  invalidateMbbsBatchPreview();
   state.selectedMbbsCandidateIds.clear();
   if (checked) {
     const ready = state.mbbsCandidates.filter((candidate) => candidate.chargeable);
@@ -418,6 +577,7 @@ function renderBatchResults() {
 async function calculateSelectedMbbsCandidates() {
   const candidateIds = [...state.selectedMbbsCandidateIds];
   const completedMonth = inputValue("mbbsCompletedMonth");
+  const completedDate = inputValue("mbbsCompletedDate");
   const rateCardVersionId = inputValue("mbbsRateCardVersion");
   if (!completedMonth || !rateCardVersionId || candidateIds.length === 0) {
     message("mbbsCandidateMessage", "Choose a completion month, rate card, and at least one ready order.", "attention");
@@ -425,15 +585,18 @@ async function calculateSelectedMbbsCandidates() {
   }
   message("mbbsCandidateMessage", `Calculating ${candidateIds.length} selected completed order(s)…`);
   try {
+    const requestContext = currentMbbsBatchContext();
     const result = await api("/api/mbt/billing/mbbs/candidates/batch-preview", {
       method: "POST",
-      body: { candidateIds, completedMonth, rateCardVersionId }
+      body: { candidateIds, completedMonth, completedDate, rateCardVersionId }
     });
     if (result.postingMode !== "local_only_preview" || result.externalWork !== null) {
       throw new Error("The server did not preserve the local-only MBBS preview boundary.");
     }
     state.mbbsBatchResults = Array.isArray(result.results) ? result.results : [];
+    state.mbbsBatchPreviewContext = requestContext;
     renderBatchResults();
+    syncCommandButtons();
     message(
       "mbbsCandidateMessage",
       `${result.successCount} order(s) calculated; ${result.failureCount} failed. No billing, Dispatch, Driver PWA, outbox, or NetSuite rows were created.`,
@@ -442,6 +605,105 @@ async function calculateSelectedMbbsCandidates() {
   } catch (error) {
     message("mbbsCandidateMessage", error.message, "attention");
   }
+}
+
+function renderMbbsCustomerResults({ preferredCustomerId = "" } = {}) {
+  const select = element("mbbsBillingCustomerId");
+  if (!select) return;
+  const retained = preferredCustomerId || select.value;
+  select.replaceChildren(new Option("Search and choose a customer", ""));
+  for (const customer of state.mbbsCustomerResults) {
+    appendCustomerOption(customer);
+  }
+  if ([...select.options].some((option) => option.value === retained)) {
+    select.value = retained;
+  }
+  applyRateCardCustomer();
+  syncCommandButtons();
+}
+
+async function searchMbbsBillingCustomers() {
+  const search = inputValue("mbbsBillingCustomerSearch");
+  message("mbbsBillingCustomerMessage", "Searching the canonical customer master…");
+  try {
+    const params = new URLSearchParams({ search, limit: "25" });
+    const result = await api(`/api/mbt/billing/mbbs/customers?${params}`);
+    state.mbbsCustomerResults = Array.isArray(result.items) ? result.items : [];
+    const exact = state.mbbsCustomerResults.find((customer) => (
+      String(customer.netsuiteId) === search
+      || String(customer.entityNumber).toLowerCase() === search.toLowerCase()
+    ));
+    renderMbbsCustomerResults({
+      preferredCustomerId: exact?.netsuiteId
+        || (state.mbbsCustomerResults.length === 1 ? state.mbbsCustomerResults[0].netsuiteId : "")
+    });
+    message(
+      "mbbsBillingCustomerMessage",
+      `${state.mbbsCustomerResults.length} active canonical customer(s) found.`
+    );
+  } catch (error) {
+    message("mbbsBillingCustomerMessage", error.message, "attention");
+  }
+}
+
+async function createMbbsBillingCases() {
+  const context = currentMbbsBatchContext();
+  if (!batchContextsMatch(state.mbbsBatchPreviewContext, context)
+      || state.mbbsBatchResults.length === 0
+      || state.mbbsBatchResults.some((result) => result.status !== "calculated")) {
+    message("mbbsCandidateMessage", "Recalculate the unchanged selected batch successfully before creating billing cases.", "attention");
+    return;
+  }
+  message("mbbsCandidateMessage", `Creating one atomic local billing batch for ${context.candidateIds.length} selected order(s)…`);
+  try {
+    const result = await api("/api/mbt/billing/mbbs/candidates/batch-create", {
+      method: "POST",
+      idempotencyKey: commandIdentity("mbt-billing-batch-create"),
+      body: {
+        candidateIds: context.candidateIds,
+        completedMonth: context.completedMonth,
+        completedDate: context.completedDate,
+        rateCardVersionId: context.rateCardVersionId,
+        customerNetsuiteId: inputValue("mbbsBillingCustomerId"),
+        reason: inputValue("mbbsBatchConversionReason")
+      }
+    });
+    if (result.postingMode !== "local_only" || result.externalWork !== null) {
+      throw new Error("The server did not preserve the local-only MBBS billing boundary.");
+    }
+    state.mbbsBatchPreviewContext = null;
+    setInputValue("mbbsBatchConversionReason", "");
+    syncCommandButtons();
+    await loadBillingCases();
+    message(
+      "mbbsCandidateMessage",
+      `${result.durableCaseCount} local billing case(s) created from ${result.requestedCandidateCount} completed order(s). No outbox or NetSuite work was created.`
+    );
+  } catch (error) {
+    message("mbbsCandidateMessage", error.message, "attention");
+  }
+}
+
+async function changeMbbsCompletedDate() {
+  const completedDate = inputValue("mbbsCompletedDate");
+  if (completedDate) setInputValue("mbbsCompletedMonth", completedDate.slice(0, 7));
+  invalidateMbbsBatchPreview();
+  await loadMbbsCandidates();
+}
+
+async function changeMbbsCompletedMonth() {
+  const month = inputValue("mbbsCompletedMonth");
+  const completedDate = inputValue("mbbsCompletedDate");
+  if (completedDate && !completedDate.startsWith(`${month}-`)) {
+    setInputValue("mbbsCompletedDate", "");
+  }
+  invalidateMbbsBatchPreview();
+  await loadMbbsCandidates();
+}
+
+function changeMbbsRateCard() {
+  invalidateMbbsBatchPreview();
+  applyRateCardCustomer();
 }
 
 async function saveMbbsAddressOverride(event) {
@@ -710,10 +972,28 @@ function bind() {
   element("billingWorkspaceCandidateTab")?.addEventListener("keydown", tabKeydown);
   element("billingWorkspaceCaseTab")?.addEventListener("keydown", tabKeydown);
   element("refreshMbbsCandidates")?.addEventListener("click", loadMbbsCandidates);
-  element("mbbsCompletedMonth")?.addEventListener("change", loadMbbsCandidates);
-  element("mbbsRateCardVersion")?.addEventListener("change", syncCommandButtons);
+  element("mbbsCompletedMonth")?.addEventListener("change", changeMbbsCompletedMonth);
+  element("mbbsCompletedDate")?.addEventListener("change", changeMbbsCompletedDate);
+  element("mbbsRateCardVersion")?.addEventListener("change", changeMbbsRateCard);
+  element("searchMbbsOrders")?.addEventListener("click", searchMbbsOrders);
+  element("mbbsOrderSearch")?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      searchMbbsOrders();
+    }
+  });
   element("selectAllMbbsCandidates")?.addEventListener("change", (event) => toggleAllCandidates(event.target.checked));
   element("calculateSelectedMbbsCandidates")?.addEventListener("click", calculateSelectedMbbsCandidates);
+  element("searchMbbsBillingCustomers")?.addEventListener("click", searchMbbsBillingCustomers);
+  element("mbbsBillingCustomerSearch")?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      searchMbbsBillingCustomers();
+    }
+  });
+  element("mbbsBillingCustomerId")?.addEventListener("change", syncCommandButtons);
+  element("mbbsBatchConversionReason")?.addEventListener("input", syncCommandButtons);
+  element("createMbbsBillingCases")?.addEventListener("click", createMbbsBillingCases);
   element("mbbsAddressOverrideForm")?.addEventListener("submit", saveMbbsAddressOverride);
   element("refreshBillingCases")?.addEventListener("click", () => loadBillingCases());
   element("billingStatusFilter")?.addEventListener("change", () => loadBillingCases());

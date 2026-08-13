@@ -2,18 +2,18 @@
 
 ## Latest full campaign
 
-- Run: `full-seed-20260812-2026-08-12T173755-266Z`
+- Run: `full-seed-20260812-2026-08-13T144152-488Z`
 - Seed: `20260812`
-- Source SHA-256: `e8f1ff5c4547260a0b53f2f0ebd9d31f52269f80e1ccb2780a097c4d8bf18e7c`
-- Requested/executed/passed/failed/missing: **320/320/312/8/0**
-- Browser cases: **272/280 passed**; real Node/PostgreSQL cases: **40/40 passed**
+- Source SHA-256: `895284f96a81a8d9a5151913cb365f53d2e30df729e06691a79af836166c09b0`
+- Requested/executed/passed/failed/missing: **320/320/320/0/0**
+- Browser cases: **280/280 passed**; real Node/PostgreSQL cases: **40/40 passed**
 - Browser assignment: 144 mobile WebKit, 88 mobile Chromium, 48 desktop Chromium
 - Historical input: anonymized deterministic aggregate clone of 425 route manifests from 2026-07-30 through 2026-08-11; p99 was 21 stops, or 168 required photos at eight photos per stop
 - iOS scope: mobile WebKit emulation only; physical iPhone/CriOS validation remains required
 
 | Group | Executed | Passed | Failed |
 |---|---:|---:|---:|
-| Historical/schema | 32 | 24 | 8 |
+| Historical/schema | 32 | 32 | 0 |
 | 4K capture/click storm | 64 | 64 | 0 |
 | Network/upload cut points | 96 | 96 | 0 |
 | Quota/cross-cache | 48 | 48 | 0 |
@@ -21,13 +21,13 @@
 | Server idempotency/durability | 24 | 24 | 0 |
 | Integrity/property/telemetry | 16 | 16 | 0 |
 
-The post-fix campaign improved from 288/320 to 312/320. All 24 former route-capacity and storage-pressure failures passed. The only remaining failures are DOS-001, DOS-005, DOS-009, DOS-013, DOS-017, DOS-021, DOS-025, and DOS-029. Each is a mobile-WebKit legacy schema-v1 case that organically reproduces `UnknownError: Error preparing Blob/File data to be stored in object store`, classified as `driver_indexeddb_unknownerror`; no fault was injected.
+The complete post-fix campaign improved from 288/320, then 312/320, to **320/320**. All 24 former route-capacity/storage-pressure failures and all eight former mobile-WebKit schema-v1 failures passed. DOS-001, DOS-005, DOS-009, DOS-013, DOS-017, DOS-021, DOS-025, and DOS-029 now persist ArrayBuffer-only historical bytes, verify their deterministic SHA-256 after schema upgrade, and combine them with seven new 4K captures. No retry, waiver, expected failure, or injected IndexedDB fault was used for those eight cases.
 
-Those eight failures occur while the test asks WebKit to create the historical schema-v1 Blob record, before the fixed Driver runtime is loaded and can migrate it. They remain RED and are not waived. The current write boundary converts every Blob/File to ArrayBuffer before IndexedDB, and its binary persistence, migration, atomic admission, durable-receipt, and cache-isolation contracts all pass. Application code cannot recover bytes that the browser engine refuses to expose to an IndexedDB transaction.
+The current write boundary converts every Blob/File to ArrayBuffer before IndexedDB. The campaign observed **0 organic IndexedDB errors** while retaining 100 deliberately injected IndexedDB, network, and quota faults as passing recovery detectors. The earlier native-Blob WebKit artifacts remain immutable RED evidence of the browser-engine failure and were not relabeled.
 
 All 96 network cases converged without lost or duplicate events across registration, ticket, zero-byte upload, halfway upload, post-commit, and receipt cut points. These included disconnects, 408, 425, 429, 500, 503, and the virtual 1-second-online/10-seconds-offline waveform while 20 Hz operator click storms continued. All 24 server cases preserved exactly-once application under lost responses after commit.
 
-The full evidence retains all 320 result records, including per-case dimensions, compressed byte counts, click metrics, fault phase, retry/convergence data, and sanitized failures. It is stored at `test-artifacts/driver-offline-stress/runs/full-seed-20260812-2026-08-12T173755-266Z/`.
+The full evidence retains all 320 result records, including per-case dimensions, compressed byte counts, click metrics, fault phase, retry/convergence data, and sanitized failures. It is stored at `test-artifacts/driver-offline-stress/runs/full-seed-20260812-2026-08-13T144152-488Z/`.
 
 ## Focused no-Blob WebKit rerun
 
@@ -58,22 +58,21 @@ source digest
 
 This focused result is prevention evidence, not proof that native WebKit Blob
 persistence or recovery was repaired. The prior native-Blob artifacts remain
-immutable and RED. The latest complete 320-case campaign also remains the
-312/320 run above; the full matrix has not been rerun after the approved oracle
-revision.
+immutable and RED. The complete approved ArrayBuffer release-oracle matrix was
+subsequently rerun and is the 320/320 campaign recorded above.
 
 ## Assurance gates
 
 - Matrix validator: 320 contiguous IDs, 24 smoke cases, 280 browser cases, and 40 PostgreSQL cases
-- Focused property/invariant contracts: 11/11 passed, including the deterministic no-Blob fixture guard; the latest full campaign ran the earlier 10/10 contract set
-- Coverage: 97.28% statements/lines, 84.56% branches, and 97.14% functions; all configured thresholds passed
+- Focused property/invariant contracts: 15/15 passed, including the deterministic no-Blob fixture guard
+- Coverage: 97.61% statements/lines, 84.44% branches, and 97.56% functions; all configured thresholds passed
 - Persisted mutation gate: 8/8 mutants killed, source restored, post-mutation contracts green
 - Binary/cache contracts: 10/10 passed; scoped lint and legacy syntax checks passed
 - Real PostgreSQL verification: 40/40 passed
 - Dependency tree, scoped lint, secret scan, shell syntax, source-state, and diff-whitespace gates: passed
 - Shortened soak-controller proof: one fault-cycling cycle followed by one explicit stable-drain cycle, exit 0
 
-The actual eight-hour wall-clock soak was not spent during this implementation session. The weekly self-hosted CI job executes eight hours of cycling plus a 30-minute stable drain. The focused no-Blob gate is green, but the latest complete 320-case release gate remains RED under its original native-Blob oracle until the complete matrix is rerun under an explicitly approved release oracle. The soak process itself consumes runner time and essentially no model tokens.
+The actual eight-hour wall-clock soak was not repeated during this implementation session. The weekly self-hosted CI job executes eight hours of cycling plus a 30-minute stable drain. The approved ArrayBuffer release gate is green at 320/320; physical iPhone/CriOS validation remains separate from Playwright mobile-WebKit emulation. The soak process itself consumes runner time and essentially no model tokens.
 
 ## Artifact layout
 

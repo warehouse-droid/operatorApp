@@ -131,6 +131,75 @@ export function clearCancelledTransitCoMetadata(order = {}, cancelledCos = []) {
   return reconcile(order);
 }
 
+export function applyActiveTransitCoMetadata(order = {}, activeCos = []) {
+  const activeBySource = activeCos instanceof Map
+    ? activeCos
+    : new Map((Array.isArray(activeCos) ? activeCos : [])
+      .map((record) => [
+        text(record?.sourceOrderRef || record?.source_order_ref).toLowerCase(),
+        {
+          coRef: text(record?.coRef || record?.co_ref),
+          sourceOrderRef: text(record?.sourceOrderRef || record?.source_order_ref),
+          fromYard: text(record?.fromYard || record?.from_yard || record?.from_location),
+          toYard: text(record?.toYard || record?.to_yard || record?.to_location),
+          createdAt: record?.createdAt || record?.created_at || null
+        }
+      ])
+      .filter(([sourceRef, record]) => sourceRef && record.coRef && record.fromYard && record.toYard));
+  const locationKey = (value) => text(value).split(/\s*:\s*/u, 1)[0].toLowerCase();
+  const reconcile = (candidate = {}, inherited = null) => {
+    const ref = orderRef(candidate);
+    const active = activeBySource.get(ref.toLowerCase()) || inherited;
+    const existingChildren = Array.isArray(candidate.childOrderDetails) ? candidate.childOrderDetails : [];
+    const childOrderDetails = existingChildren.map((child) => reconcile(child, active));
+    const childChanged = childOrderDetails.some((child, index) => child !== existingChildren[index]);
+    if (!active && !childChanged) {return candidate;}
+    const next = {
+      ...candidate,
+      ...(existingChildren.length || Array.isArray(candidate.childOrderDetails)
+        ? { childOrderDetails }
+        : {})
+    };
+    if (!active) {return next;}
+
+    const destination = locationKey(active.toYard);
+    const originalPickups = [
+      ...(Array.isArray(candidate.transitOriginalPickupLocations)
+        ? candidate.transitOriginalPickupLocations
+        : []),
+      ...(Array.isArray(candidate.pickupLocations)
+        ? candidate.pickupLocations.filter((location) => locationKey(location) !== destination)
+        : []),
+      ...(!candidate.transitOriginalPickupLocations?.length && active.fromYard ? [active.fromYard] : [])
+    ];
+    const seen = new Set();
+    next.transitOriginalPickupLocations = originalPickups.filter((location) => {
+      const key = locationKey(location);
+      if (!key || seen.has(key)) {return false;}
+      seen.add(key);
+      return true;
+    });
+    if (!next.transitOriginalPickupLocations.length) {
+      next.transitOriginalPickupLocations = [active.fromYard];
+    }
+    next.transitOriginalSourceYard = candidate.transitOriginalSourceYard
+      || candidate.sourceYard
+      || next.transitOriginalPickupLocations[0]
+      || active.fromYard;
+    next.transitCo = {
+      ...(candidate.transitCo || {}),
+      id: active.coRef,
+      fromYard: active.fromYard,
+      toYard: active.toYard,
+      sourceOrderId: ref || active.sourceOrderRef
+    };
+    next.pickupLocations = [active.toYard];
+    next.sourceYard = active.toYard;
+    return next;
+  };
+  return reconcile(order);
+}
+
 function planOwnedOrder(order = {}) {
   const type = text(order.type).toUpperCase();
   return PLAN_OWNED_TYPES.has(type)

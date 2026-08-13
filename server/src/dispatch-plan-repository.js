@@ -1,4 +1,5 @@
 import { query, withTransaction } from "./db.js";
+import { assertActiveDispatchCosForPlan } from "./dispatch-co-lifecycle.js";
 import { canonicalizeDispatchCustomOrdersInPlan } from "./dispatch-custom-order-repository.js";
 import { syncDispatchDeliveryGroupsFromPlan } from "./dispatch-delivery-group-repository.js";
 import {
@@ -75,7 +76,7 @@ export function isDispatchV2Plan(plan = {}) {
   return Number(plan?.summary?.dispatchPlanFormat?.version || 0) >= DISPATCH_PLAN_V2_VERSION;
 }
 
-function dispatchPlanV2Summary(summary = {}, {
+export function dispatchPlanV2Summary(summary = {}, {
   previousSummary = {},
   source = DISPATCH_PLAN_V2_SAVE_SOURCE,
   migratedAt = new Date().toISOString(),
@@ -102,7 +103,9 @@ function dispatchPlanV2Summary(summary = {}, {
       : {
           version: DISPATCH_PLAN_V2_VERSION,
           source,
-          migratedAt: String(migratedAt || new Date().toISOString()),
+          migratedAt: migratedAt instanceof Date
+            ? migratedAt.toISOString()
+            : String(migratedAt || new Date().toISOString()),
           ownYardCodes: resolvedOwnYardCodes
         }
   };
@@ -761,6 +764,10 @@ export async function createDispatchPlan({ planDate, note = "", status = "draft"
     [cleanDate, status, note || ""]
   );
   const plan = result.rows[0];
+  const initialSummary = dispatchPlanV2Summary({}, {
+    migratedAt: plan.created_at,
+    source: DISPATCH_PLAN_V2_SAVE_SOURCE
+  });
   const initialDigest = digestDispatchPlan({
     id: String(plan.id),
     planDate: cleanDate,
@@ -769,16 +776,16 @@ export async function createDispatchPlan({ planDate, note = "", status = "draft"
     revision: Number(plan.revision || 0),
     orders: [],
     trucks: [],
-    summary: {}
+    summary: initialSummary
   });
   await query(
     `INSERT INTO dispatch_plan_snapshots (
        plan_id, orders, trucks, summary, schema_version, plan_digest,
        order_count, truck_count, load_count, stop_count
      )
-     VALUES ($1, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb, 2, $2, 0, 0, 0, 0)
+     VALUES ($1, '[]'::jsonb, '[]'::jsonb, $2::jsonb, 2, $3, 0, 0, 0, 0)
      ON CONFLICT (plan_id) DO NOTHING`,
-    [plan.id, initialDigest]
+    [plan.id, JSON.stringify(initialSummary), initialDigest]
   );
   return getDispatchPlan(plan.id);
 }
@@ -1391,6 +1398,11 @@ export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [
     }, {
       previousPlan
     });
+    await assertActiveDispatchCosForPlan({
+      ...canonicalPlan,
+      id: String(planId),
+      planDate: expectedPlanDate
+    });
     const hasBaseRevision = baseRevision !== null && baseRevision !== undefined && baseRevision !== "";
     const expectedRevision = Number(baseRevision);
     const result = hasBaseRevision && Number.isFinite(expectedRevision)
@@ -1633,6 +1645,11 @@ export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" }
         trucks: current.trucks || []
       }
     });
+    await assertActiveDispatchCosForPlan({
+      ...cleanPlan,
+      id: String(source.plan_id),
+      planDate: currentDate
+    });
     await query(
       `INSERT INTO dispatch_plan_snapshots (plan_id, orders, trucks, summary, saved_at)
        VALUES ($1, $2::jsonb, $3::jsonb, $4::jsonb, now())
@@ -1717,6 +1734,11 @@ async function confirmDispatchPlanTransaction(planId, { note = "", binBoundary =
     await assertCustomOrderPlanDateExclusivity(canonicalPlan, { previousPlan: currentPlan });
     const sanitizedPlan = await sanitizeDispatchPlan(canonicalPlan);
     await assertActiveDispatchFleetAssignments(sanitizedPlan, { previousPlan: currentPlan });
+    await assertActiveDispatchCosForPlan({
+      ...sanitizedPlan,
+      id: String(planId),
+      planDate: currentPlan.planDate
+    });
     await query(
       `UPDATE dispatch_plan_snapshots
           SET orders = $2::jsonb,

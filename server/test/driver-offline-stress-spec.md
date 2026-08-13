@@ -283,3 +283,17 @@ Setup plan: add no dependency; modify only the Driver shell/page styles and
 translations, version declarations, focused contracts, source-state inventory,
 and evidence documents; preserve unrelated worktree changes; make no git
 commit; and do not deploy.
+
+## Toronto timestamp display cache refresh — 2026-08-13
+
+The shared UI timestamp formatter must derive both the calendar date and clock
+time from `America/Toronto`. The production regression value
+`2026-08-13T02:16:00.195Z` must render as `12-Aug 10:16 PM`, while the literal
+business date `2026-08-13` must remain `13-Aug`.
+
+This display-only correction keeps the Driver client/server version and asset
+token at `2026.08.12.3` / `20260812-driver-pwa-v3`, but advances the scoped
+Driver shell cache from v27 to v28. Initial v28 shell installation must fetch
+every shell asset with `cache: "reload"`, preserve IndexedDB and the offline-mode
+sentinel, and delete only older `mbbs-driver-shell-` caches. The v27 soak evidence
+remains historical; v28 requires a new complete stress run before deployment.

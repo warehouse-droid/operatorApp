@@ -30,8 +30,9 @@ test("the installed Driver shell cannot mix old DB/route code with photo recover
     assert.ok(html.includes(versionedPath), `${asset} must be versioned in driver.html.`);
     assert.ok(worker.includes(versionedPath), `${asset} must be versioned in the shell cache.`);
   }
-  assert.match(worker, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v27`/u);
-  assert.match(worker, /DRIVER_REFRESH_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}refresh-v27`/u);
+  assert.match(worker, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v28`/u);
+  assert.match(worker, /DRIVER_REFRESH_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}refresh-v28`/u);
+  assert.match(worker, /cache\.addAll\(DRIVER_SHELL\.map\(\(url\) => new Request\([\s\S]*?cache: "reload"/u);
   assert.match(read("driver.js"), /serviceWorker\.register\("\/driver-service-worker\.js\?v=20260812-driver-pwa-v3"/u);
   assert.match(read("service-worker.js"), /url\.pathname\.startsWith\("\/driver-"\)/u);
 });

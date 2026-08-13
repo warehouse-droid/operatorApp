@@ -11,8 +11,8 @@ const PUBLIC = path.resolve(HERE, "../../../public");
 const DRIVER_SOURCE = fs.readFileSync(path.join(PUBLIC, "driver.js"), "utf8");
 const WORKER_SOURCE = fs.readFileSync(path.join(PUBLIC, "driver-service-worker.js"), "utf8");
 const ORIGIN = "https://driver-cache.test";
-const ACTIVE_CACHE = "mbbs-driver-shell-v27";
-const REFRESH_CACHE = "mbbs-driver-shell-refresh-v27";
+const ACTIVE_CACHE = "mbbs-driver-shell-v28";
+const REFRESH_CACHE = "mbbs-driver-shell-refresh-v28";
 const OFFLINE_MODE_URL = `${ORIGIN}/__mbbs_driver_offline_mode__`;
 
 function requestUrl(input) {
@@ -134,6 +134,25 @@ async function sendRepair(listeners) {
   await completion;
   return reply;
 }
+
+async function installWorker(listeners) {
+  let completion;
+  listeners.get("install")({
+    waitUntil: (promise) => { completion = promise; }
+  });
+  assert.ok(completion, "The install event must wait for the complete Driver shell.");
+  await completion;
+}
+
+test("a fresh Driver worker reloads every v28 shell asset and initializes only its scoped sentinel", async () => {
+  const cacheStorage = new MemoryCacheStorage();
+  await installWorker(createWorker(cacheStorage));
+
+  assert.equal(cacheStorage.networkRequests.length, 15);
+  assert.ok(cacheStorage.networkRequests.every((request) => request.cache === "reload"));
+  assert.equal(await readBody(cacheStorage, ACTIVE_CACHE, OFFLINE_MODE_URL), "false");
+  assert.deepEqual(await cacheStorage.keys(), [ACTIVE_CACHE]);
+});
 
 test("the Driver UI exposes a data-preserving scoped repair in normal and update-required states", () => {
   assert.match(DRIVER_SOURCE, /data-offline-action="repair-cache"/u);

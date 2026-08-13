@@ -252,4 +252,31 @@ assert.equal(i18n.message("Truck location verified within 25 m."), "车辆位置
 assert.equal(i18n.message("3 photos are required."), "需要 3 张照片。");
 assert.equal(i18n.format("operator.lineCount", "{count} line(s)", { count: 4 }), "4 行");
 
+// TIMESTAMPTZ values must derive both their calendar date and clock time from
+// the Toronto business timezone. Combining the UTC ISO date prefix with a
+// localized clock time made 2026-08-13T02:16Z appear as the future value
+// "13-Aug 10:16 PM" instead of its real Toronto completion date.
+i18n.setLanguage("en");
+assert.equal(
+  i18n.displayDateTime("2026-08-13T02:16:00.195Z"),
+  "12-Aug 10:16 PM",
+  "completion timestamps must not combine a UTC date with a Toronto time"
+);
+assert.equal(
+  i18n.displayDate("2026-08-13"),
+  "13-Aug",
+  "date-only plan values must retain their literal calendar date"
+);
+assert.equal(
+  i18n.displayDate("2026-08-13T02:16:00.195Z"),
+  "12-Aug",
+  "date-only rendering of a timestamp must use its Toronto calendar date"
+);
+i18n.setLanguage("zh-CN");
+assert.equal(
+  i18n.displayDateTime("2026-08-13T02:16:00.195Z"),
+  "8\u670812\u65e5 22:16",
+  "Chinese completion timestamps must use the same Toronto date and time"
+);
+
 console.log(`PWA i18n harness passed (${usedKeys.size} UI keys checked).`);

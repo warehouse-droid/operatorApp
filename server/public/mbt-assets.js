@@ -96,8 +96,15 @@ async function assetCsvRequest(path, { method = "GET", body, fileName = "" } = {
 }
 
 function displayTime(value) {
-  const date = new Date(String(value || ""));
-  return Number.isNaN(date.getTime()) ? "Time unavailable" : date.toLocaleString();
+  if (!value) return "Time unavailable";
+  const date = new Date(String(value));
+  return Number.isNaN(date.getTime())
+    ? "Time unavailable"
+    : new Intl.DateTimeFormat("en-CA", {
+      dateStyle: "medium",
+      timeStyle: "short",
+      timeZone: "America/Toronto"
+    }).format(date);
 }
 
 function textCell(value) {
@@ -300,8 +307,16 @@ async function loadTimeline(assetId) {
 function localTimestampValue(value) {
   const date = new Date(String(value || ""));
   if (Number.isNaN(date.getTime())) return "";
-  const local = new Date(date.getTime() - (date.getTimezoneOffset() * 60_000));
-  return local.toISOString().slice(0, 16);
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Toronto",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23"
+  }).formatToParts(date).map((part) => [part.type, part.value]));
+  return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}`;
 }
 
 function renderAssetCsvPreview(rows = []) {

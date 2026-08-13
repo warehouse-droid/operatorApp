@@ -1,7 +1,7 @@
 /* global caches, indexedDB, localStorage, navigator, Response */
 import { expect, test } from "./mbt-e2e-test.js";
 
-const ACTIVE_CACHE = "mbbs-driver-shell-v27";
+const ACTIVE_CACHE = "mbbs-driver-shell-v28";
 const OLD_DRIVER_CACHE = "mbbs-driver-shell-v26";
 const OPERATOR_CACHE = "mbbs-yard-operator-cache-repair-probe";
 const PROBE_DB = "mbbs-driver-cache-repair-probe";

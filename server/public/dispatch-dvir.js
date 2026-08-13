@@ -13,9 +13,7 @@ let dvirLoading = false;
 let dvirError = "";
 
 function localDate() {
-  const date = new Date();
-  const offset = date.getTimezoneOffset();
-  return new Date(date.getTime() - offset * 60000).toISOString().slice(0, 10);
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "America/Toronto" }).format(new Date());
 }
 
 function escapeHtml(value) {
@@ -64,7 +62,7 @@ function formatTime(value) {
   if (!value) return "-";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "-";
-  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return date.toLocaleTimeString([], { timeZone: "America/Toronto", hour: "2-digit", minute: "2-digit" });
 }
 
 function formatDate(value) {

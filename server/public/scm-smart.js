@@ -96,9 +96,10 @@ function smartDate(value, withTime = false) {
   if (!value) return "—";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return smartEscape(String(value));
+  if (withTime && window.MBBS_I18N?.displayDateTime) return window.MBBS_I18N.displayDateTime(value);
   return new Intl.DateTimeFormat("en-CA", withTime
-    ? { dateStyle: "medium", timeStyle: "short" }
-    : { dateStyle: "medium" }).format(date);
+    ? { dateStyle: "medium", timeStyle: "short", timeZone: "America/Toronto" }
+    : { dateStyle: "medium", timeZone: "America/Toronto" }).format(date);
 }
 
 function smartRoles() {

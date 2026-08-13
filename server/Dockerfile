@@ -14,6 +14,7 @@ COPY netsuite-order-webhook-scheduled.js ./
 COPY public ./public
 COPY src ./src
 COPY tools/mbt-predeploy-readiness.mjs ./tools/mbt-predeploy-readiness.mjs
+COPY tools/recover-co-goa-3464-3470-6922.js ./tools/recover-co-goa-3464-3470-6922.js
 COPY tools/scm-netsuite-po-history-gauntlet.sh ./tools/scm-netsuite-po-history-gauntlet.sh
 
 RUN mkdir -p /app/data && chown -R node:node /app

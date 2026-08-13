@@ -324,12 +324,7 @@ function updateControlPageLayoutClass() {
 updateControlPageLayoutClass();
 
 function todayKey() {
-  const date = new Date();
-  return [
-    date.getFullYear(),
-    String(date.getMonth() + 1).padStart(2, "0"),
-    String(date.getDate()).padStart(2, "0")
-  ].join("-");
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "America/Toronto" }).format(new Date());
 }
 
 const loadedDefaultDate = todayKey();

@@ -4,8 +4,10 @@ import { test } from "node:test";
 import fc from "fast-check";
 
 import {
+  applyActiveTransitCoMetadata,
   applyDispatchPlanCommand,
   buildCompactDispatchSnapshot,
+  clearCancelledTransitCoMetadata,
   createDispatchCommandReceiptStore,
   digestDispatchPlan
 } from "../../../src/dispatch-planner-performance.js";
@@ -64,4 +66,43 @@ test("DP-06 property: every exact retry is observationally equivalent to the fir
       assert.equal(first.plan.trucks[0].loads[0].stops.some((stop) => stop.orderId === target), false);
     }
   ), { seed: SEED + 1, numRuns: RUNS });
+});
+
+test("DP-30 property: active CO hydration and cancellation restore every original pickup", () => {
+  fc.assert(fc.property(
+    fc.constantFrom("3445", "2967", "12441", "150"),
+    fc.constantFrom("3445", "2967", "12441", "150"),
+    fc.uniqueArray(fc.stringMatching(/^VENDOR-[A-Z0-9]{1,6}$/), { minLength: 0, maxLength: 5 }),
+    (fromYard, candidateToYard, vendorYards) => {
+      const toYard = candidateToYard === fromYard
+        ? ({ "3445": "2967", "2967": "150", "150": "12441", "12441": "3445" })[fromYard]
+        : candidateToYard;
+      const source = {
+        id: "GOA-PROPERTY",
+        type: "SO",
+        pickupLocations: [fromYard, ...vendorYards],
+        sourceYard: fromYard,
+        arbitraryEvidence: { keep: true, vendorYards }
+      };
+      const active = [{
+        coRef: "CO-GOA-PROPERTY",
+        sourceOrderRef: source.id,
+        fromYard,
+        toYard
+      }];
+      const hydrated = applyActiveTransitCoMetadata(source, active);
+      const restored = clearCancelledTransitCoMetadata(hydrated, [{
+        coRef: active[0].coRef,
+        fromYard,
+        toYard
+      }]);
+
+      assert.deepEqual(hydrated.pickupLocations, [toYard]);
+      assert.equal(hydrated.sourceYard, toYard);
+      assert.deepEqual(restored.pickupLocations, [fromYard, ...vendorYards]);
+      assert.equal(restored.sourceYard, fromYard);
+      assert.deepEqual(restored.arbitraryEvidence, source.arbitraryEvidence);
+      assert.deepEqual(source.pickupLocations, [fromYard, ...vendorYards]);
+    }
+  ), { seed: SEED + 30, numRuns: RUNS });
 });

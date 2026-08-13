@@ -12,7 +12,7 @@ const COMPONENT_TYPE_ORDER = Object.freeze({
   surcharge: 50,
   discount: 60
 });
-const CROSS_CHARGE_TYPE_ORDER = Object.freeze({ SO: 10, TO: 20, PO: 30, VRMA: 40 });
+const CROSS_CHARGE_TYPE_ORDER = Object.freeze({ SO: 10, TO: 20, PO: 30, VRMA: 40, CUSTOM: 50 });
 
 /** @param {Date} instant @returns {[number, number, number, number, number, number]} */
 function torontoCalendarParts(instant) {
@@ -602,6 +602,18 @@ export function calculateMbbsCrossCharges(value) {
         sourceType: "TO",
         rootReference: reference.rootReference,
         deduplicationKey: `TO|${reference.rootReference}`,
+        allocatedAmountMinor: load.sharedTotalMinor,
+        allocationKey: null,
+        currency: crossChargeCurrency
+      });
+    }
+    for (const reference of references.filter(({ sourceType }) => sourceType === "CUSTOM")) {
+      cases.push({
+        ...load,
+        references: undefined,
+        sourceType: "CUSTOM",
+        rootReference: reference.rootReference,
+        deduplicationKey: `CUSTOM|${reference.rootReference}|${load.physicalLoadId}`,
         allocatedAmountMinor: load.sharedTotalMinor,
         allocationKey: null,
         currency: crossChargeCurrency

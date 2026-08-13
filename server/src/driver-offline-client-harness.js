@@ -1305,8 +1305,8 @@ for (const asset of [
   assert.ok(driverHtml.includes(`/${asset}?v=20260812-driver-pwa-v3`));
   assert.ok(driverWorker.includes(`/${asset}?v=20260812-driver-pwa-v3`));
 }
-assert.match(driverWorker, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v27`/);
-assert.match(driverWorker, /DRIVER_REFRESH_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}refresh-v27`/);
+assert.match(driverWorker, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v28`/);
+assert.match(driverWorker, /DRIVER_REFRESH_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}refresh-v28`/);
 assert.match(
   driverSource,
   /serviceWorker\.register\("\/driver-service-worker\.js\?v=20260812-driver-pwa-v3"/

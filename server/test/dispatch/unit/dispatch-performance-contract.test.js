@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  applyActiveTransitCoMetadata,
   applyDispatchPlanCommand,
   buildCompactDispatchSnapshot,
   clearCancelledTransitCoMetadata,
@@ -219,6 +220,44 @@ test("DP-29 cancelled CO cleanup preserves sparse legacy aliases and child-only 
   assert.equal(childOnly.transitCo, undefined);
   assert.equal(childOnly.childOrderDetails[0].transitCo, null);
   assert.deepEqual(childOnly.childOrderDetails[0].pickupLocations, ["3445"]);
+});
+
+test("DP-30 an active global CO rehydrates grouped source and children without mutating the snapshot", () => {
+  const grouped = order("GOA-3464-3470-6922", {
+    childOrders: ["SOA03464", "SOA03470"],
+    childOrderDetails: [
+      order("SOA03464", { pickupLocations: ["2967"], sourceYard: "2967" }),
+      order("SOA03470", { pickupLocations: ["2967"], sourceYard: "2967" })
+    ],
+    pickupLocations: ["2967"],
+    sourceYard: "2967",
+    orderDependencies: [{ id: 17, transferOrderRef: "TOB00860" }]
+  });
+  const before = structuredClone(grouped);
+  const active = [{
+    coRef: "CO-GOA-3464-3470-6922",
+    sourceOrderRef: grouped.id,
+    fromYard: "2967",
+    toYard: "150"
+  }];
+
+  const hydrated = applyActiveTransitCoMetadata(grouped, active);
+  const repeated = applyActiveTransitCoMetadata(hydrated, active);
+
+  assert.deepEqual(grouped, before);
+  assert.deepEqual(hydrated.transitCo, {
+    id: "CO-GOA-3464-3470-6922",
+    fromYard: "2967",
+    toYard: "150",
+    sourceOrderId: grouped.id
+  });
+  assert.deepEqual(hydrated.pickupLocations, ["150"]);
+  assert.equal(hydrated.sourceYard, "150");
+  assert.deepEqual(hydrated.transitOriginalPickupLocations, ["2967"]);
+  assert.equal(hydrated.transitOriginalSourceYard, "2967");
+  assert.ok(hydrated.childOrderDetails.every((child) => child.transitCo.id === active[0].coRef));
+  assert.deepEqual(hydrated.orderDependencies, grouped.orderDependencies);
+  assert.deepEqual(repeated, hydrated);
 });
 
 test("DP-06 exact command retries return the stored acknowledgement without a second revision or side effect", () => {
