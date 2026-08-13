@@ -93,6 +93,55 @@ export async function listCompletedReconciliationDispatchRefs() {
          ) target(target_ref, target_state)
         WHERE LOWER(BTRIM(COALESCE(target.target_state->>'applicationStatus', ''))) IN ('complete', 'completed')
      ),
+     latest_sales_order_apply AS (
+       SELECT DISTINCT ON (event.parent_order_netsuite_id)
+              event.parent_order_netsuite_id,
+              event.parent_order_ref,
+              event.payload
+         FROM scm_reconciliation_audit_events event
+        WHERE event.record_type = 'SO'
+          AND event.parent_order_kind = 'SO'
+          AND event.parent_order_netsuite_id IS NOT NULL
+          AND event.action = 'apply'
+          AND event.validation_status = 'accepted'
+        ORDER BY event.parent_order_netsuite_id,
+                 COALESCE(event.occurred_at, event.received_at, event.created_at) DESC,
+                 event.id DESC
+     ),
+     completed_sales_order_apply AS (
+       SELECT latest.parent_order_netsuite_id,
+              latest.parent_order_ref,
+              latest.payload,
+              sales.tranid
+         FROM latest_sales_order_apply latest
+         JOIN sales_orders sales
+           ON sales.netsuite_id = latest.parent_order_netsuite_id
+        WHERE LOWER(BTRIM(COALESCE(latest.payload->>'applicationStatus', ''))) IN ('complete', 'completed')
+          AND LOWER(BTRIM(COALESCE(latest.payload->>'reconciliationStatus', ''))) IN ('current', 'ok')
+          AND LOWER(BTRIM(COALESCE(latest.payload->>'dryRun', 'false'))) NOT IN ('true', '1', 'yes')
+          AND sales.netsuite_active = false
+          AND LOWER(BTRIM(COALESCE(sales.fulfillment_status, ''))) = 'fulfilled'
+     ),
+     completed_sales_order_refs AS (
+       SELECT completed.parent_order_ref AS value
+         FROM completed_sales_order_apply completed
+       UNION ALL
+       SELECT completed.tranid
+         FROM completed_sales_order_apply completed
+       UNION ALL
+       SELECT completed.payload->>'sourceOrderRef'
+         FROM completed_sales_order_apply completed
+       UNION ALL
+       SELECT family_ref.value
+         FROM completed_sales_order_apply completed
+         CROSS JOIN LATERAL JSONB_ARRAY_ELEMENTS_TEXT(
+           CASE
+             WHEN JSONB_TYPEOF(completed.payload->'familyOrderRefs') = 'array'
+               THEN completed.payload->'familyOrderRefs'
+             ELSE '[]'::jsonb
+           END
+         ) family_ref(value)
+     ),
      completed_refs AS (
        SELECT family.source_order_ref AS value
          FROM completed_family family
@@ -151,6 +200,9 @@ export async function listCompletedReconciliationDispatchRefs() {
          JOIN transfer_orders transfer
            ON target.order_kind = 'TO'
           AND LOWER(BTRIM(target.target_ref)) = LOWER(BTRIM(transfer.tranid))
+       UNION ALL
+       SELECT completed.value
+         FROM completed_sales_order_refs completed
      ),
      normalized_completed_refs AS (
        SELECT DISTINCT LOWER(BTRIM(value)) AS order_ref
@@ -180,27 +232,125 @@ export async function listCompletedReconciliationDispatchRefs() {
 export async function listDriverPwaCompletedDispatchRefs({ candidateRefs = [] } = {}) {
   const requested = [...new Set((candidateRefs || []).map(refKey).filter(Boolean))];
   const result = await query(
+    `WITH RECURSIVE group_relations AS (
+       SELECT DISTINCT LOWER(BTRIM(raw.parent_ref)) AS parent_ref,
+                       LOWER(BTRIM(raw.child_ref)) AS child_ref
+         FROM (
+           SELECT group_row.group_ref AS parent_ref,
+                  member.member_order_ref AS child_ref
+             FROM dispatch_delivery_groups group_row
+             JOIN dispatch_delivery_group_members member ON member.group_ref = group_row.group_ref
+            WHERE group_row.active = true
+           UNION ALL
+           SELECT group_row.group_ref AS parent_ref,
+                  member.order_ref AS child_ref
+             FROM scm_schedule_groups group_row
+             JOIN scm_schedule_group_members member ON member.group_id = group_row.id
+            WHERE LOWER(BTRIM(COALESCE(group_row.status, ''))) = 'active'
+         ) raw
+        WHERE COALESCE(BTRIM(raw.parent_ref), '') <> ''
+          AND COALESCE(BTRIM(raw.child_ref), '') <> ''
+     ),
+     split_relations AS (
+       SELECT DISTINCT LOWER(BTRIM(raw.parent_ref)) AS parent_ref,
+                       LOWER(BTRIM(raw.child_ref)) AS child_ref
+         FROM (
+           SELECT source_po_ref AS parent_ref,
+                  split_po_ref AS child_ref
+             FROM dispatch_scm_po_splits
+            WHERE LOWER(BTRIM(COALESCE(status, ''))) = 'active'
+           UNION ALL
+           SELECT source_to_ref AS parent_ref,
+                  split_to_ref AS child_ref
+             FROM dispatch_scm_to_splits
+            WHERE LOWER(BTRIM(COALESCE(status, ''))) = 'active'
+           UNION ALL
+           SELECT source_so_ref AS parent_ref,
+                  split_so_ref AS child_ref
+             FROM dispatch_scm_so_splits
+            WHERE LOWER(BTRIM(COALESCE(status, ''))) = 'active'
+         ) raw
+        WHERE COALESCE(BTRIM(raw.parent_ref), '') <> ''
+          AND COALESCE(BTRIM(raw.child_ref), '') <> ''
+     ),
+     completion_edges(from_ref, to_ref) AS (
+       SELECT parent_ref, child_ref
+         FROM group_relations
+       UNION
+       SELECT child_ref, parent_ref
+         FROM group_relations
+       UNION
+       SELECT parent_ref, child_ref
+         FROM split_relations
+     ),
+     candidate_sources(order_ref) AS (
+       SELECT UNNEST($1::text[])
+       UNION
+       SELECT edge.from_ref
+         FROM candidate_sources candidate
+         JOIN completion_edges edge ON edge.to_ref = candidate.order_ref
+     ),
+     driver_completed AS (
+       SELECT DISTINCT LOWER(BTRIM(ref.value)) AS order_ref
+         FROM driver_job_records record
+         CROSS JOIN LATERAL JSONB_ARRAY_ELEMENTS_TEXT(
+           CASE
+             WHEN JSONB_TYPEOF(record.order_refs) = 'array' THEN record.order_refs
+             ELSE '[]'::jsonb
+           END
+         ) ref(value)
+        WHERE LOWER(BTRIM(COALESCE(record.status, ''))) IN ('complete', 'completed')
+          AND COALESCE(BTRIM(ref.value), '') <> ''
+          AND (
+            $2::boolean
+            OR LOWER(BTRIM(ref.value)) IN (SELECT order_ref FROM candidate_sources)
+          )
+     ),
+     completed_closure(order_ref) AS (
+       SELECT order_ref
+         FROM driver_completed
+       UNION
+       SELECT edge.to_ref
+         FROM completed_closure completed
+         JOIN completion_edges edge ON edge.from_ref = completed.order_ref
+     )
+     SELECT order_ref
+       FROM completed_closure`,
+    [requested, requested.length === 0]
+  );
+  return new Set(result.rows.map((row) => refKey(row.order_ref)).filter(Boolean));
+}
+
+export async function historicalReconciliationDispatchAllowance({ planDate = "", orderRefs = [] } = {}) {
+  if (!historicalDispatchPlanDate(planDate)) return new Set();
+  const requested = new Set((orderRefs || []).map(refKey).filter(Boolean));
+  if (!requested.size) return new Set();
+  const completedRefs = await listCompletedReconciliationDispatchRefs();
+  return new Set([...requested].filter((ref) => completedRefs.has(ref)));
+}
+
+export async function assertHistoricalInactiveSalesOrdersReconciled({
+  planDate = "",
+  orderRefs = [],
+  action = "plan these orders"
+} = {}) {
+  if (!historicalDispatchPlanDate(planDate)) return true;
+  const requested = [...new Set((orderRefs || []).map(refKey).filter(Boolean))];
+  if (!requested.length) return true;
+  const result = await query(
     `WITH RECURSIVE raw_relations AS (
-       SELECT group_ref AS parent_ref,
-              member_order_ref AS child_ref
-         FROM dispatch_delivery_group_members
+       SELECT member.group_ref AS parent_ref,
+              member.member_order_ref AS child_ref
+         FROM dispatch_delivery_group_members member
+         JOIN dispatch_delivery_groups group_row
+           ON group_row.group_ref = member.group_ref
+          AND group_row.active = true
+          AND group_row.order_type = 'sales_order'
        UNION ALL
-       SELECT group_row.group_ref AS parent_ref,
-              member.order_ref AS child_ref
-         FROM scm_schedule_groups group_row
-         JOIN scm_schedule_group_members member ON member.group_id = group_row.id
-       UNION ALL
-       SELECT source_po_ref AS parent_ref,
-              split_po_ref AS child_ref
-         FROM dispatch_scm_po_splits
-       UNION ALL
-       SELECT source_to_ref AS parent_ref,
-              split_to_ref AS child_ref
-         FROM dispatch_scm_to_splits
-       UNION ALL
-       SELECT source_so_ref AS parent_ref,
-              split_so_ref AS child_ref
-         FROM dispatch_scm_so_splits
+       SELECT split.source_so_ref AS parent_ref,
+              split.split_so_ref AS child_ref
+         FROM dispatch_scm_so_splits split
+        WHERE split.status = 'active'
      ),
      relations AS (
        SELECT DISTINCT LOWER(BTRIM(parent_ref)) AS parent_ref,
@@ -220,49 +370,31 @@ export async function listDriverPwaCompletedDispatchRefs({ candidateRefs = [] } 
          JOIN relations relation
            ON relation.parent_ref = candidate.order_ref
            OR relation.child_ref = candidate.order_ref
-     ),
-     driver_completed AS (
-       SELECT DISTINCT LOWER(BTRIM(ref.value)) AS order_ref
-         FROM driver_job_records record
-         CROSS JOIN LATERAL JSONB_ARRAY_ELEMENTS_TEXT(
-           CASE
-             WHEN JSONB_TYPEOF(record.order_refs) = 'array' THEN record.order_refs
-             ELSE '[]'::jsonb
-           END
-         ) ref(value)
-        WHERE LOWER(BTRIM(COALESCE(record.status, ''))) IN ('complete', 'completed')
-          AND COALESCE(BTRIM(ref.value), '') <> ''
-          AND (
-            $2::boolean
-            OR LOWER(BTRIM(ref.value)) IN (SELECT order_ref FROM candidate_closure)
-          )
-     ),
-     completed_closure(order_ref) AS (
-       SELECT order_ref
-         FROM driver_completed
-       UNION
-       SELECT CASE
-                WHEN relation.parent_ref = completed.order_ref THEN relation.child_ref
-                ELSE relation.parent_ref
-              END
-         FROM completed_closure completed
-         JOIN relations relation
-           ON relation.parent_ref = completed.order_ref
-           OR relation.child_ref = completed.order_ref
      )
-     SELECT order_ref
-       FROM completed_closure`,
-    [requested, requested.length === 0]
+     SELECT DISTINCT LOWER(BTRIM(sales.tranid)) AS order_ref
+       FROM sales_orders sales
+      WHERE sales.netsuite_active = false
+        AND LOWER(BTRIM(sales.tranid)) IN (SELECT order_ref FROM candidate_closure)`,
+    [requested]
   );
-  return new Set(result.rows.map((row) => refKey(row.order_ref)).filter(Boolean));
-}
-
-export async function historicalReconciliationDispatchAllowance({ planDate = "", orderRefs = [] } = {}) {
-  if (!historicalDispatchPlanDate(planDate)) return new Set();
-  const requested = new Set((orderRefs || []).map(refKey).filter(Boolean));
-  if (!requested.size) return new Set();
+  const inactiveRefs = result.rows.map((row) => refKey(row.order_ref)).filter(Boolean);
+  if (!inactiveRefs.length) return true;
   const completedRefs = await listCompletedReconciliationDispatchRefs();
-  return new Set([...requested].filter((ref) => completedRefs.has(ref)));
+  const conflicts = inactiveRefs
+    .filter((ref) => !completedRefs.has(ref))
+    .map((orderRef) => ({
+      orderRef,
+      reason: `${orderRef} is inactive without accepted reconciliation-complete proof.`
+    }));
+  if (!conflicts.length) return true;
+  throw Object.assign(
+    new Error(`Cannot ${action}: ${conflicts.map((item) => item.orderRef).join(", ")} is not reconciliation-complete.`),
+    {
+      status: 409,
+      code: "DISPATCH_HISTORY_RECONCILIATION_REQUIRED",
+      conflicts
+    }
+  );
 }
 
 export async function assertNoDriverPwaCompletedDispatchRefs(orderRefs = [], action = "plan this order") {

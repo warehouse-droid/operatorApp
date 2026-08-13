@@ -34,6 +34,16 @@ const MBT_LINKS = Object.freeze([
   "/mbt/assets",
   "/mbt/config"
 ]);
+const FRONTDESK_DISABLED_MESSAGE = "Front Desk is disabled by the server environment root setting.";
+const MAIN_MODULE_LINKS = Object.freeze([
+  "/admin",
+  "/control",
+  "/dispatch",
+  "/scm",
+  "/sales",
+  "/mbt",
+  "/operator"
+]);
 const LEGACY_LOGIN_CASES = Object.freeze([
   { account: "operator", path: "/operator", storageKey: "mbbs.operator.token" },
   { account: "dispatcher", path: "/dispatch", storageKey: "mbbs.dispatch.token" },
@@ -63,7 +73,7 @@ async function tokenFor(request, role) {
 async function expectMbtSurfaceReady(page, path) {
   if (path === "/mbt/frontdesk") {
     await expect(page.locator("#frontdeskMessage"))
-      .toHaveText("This MBT capability is disabled.");
+      .toHaveText(FRONTDESK_DISABLED_MESSAGE);
     return;
   }
   await expect(page.locator(".mbt-status")).toHaveAttribute("aria-busy", "false");
@@ -151,6 +161,15 @@ async function expectMbtLinks(page, allowed) {
   await expect(page.locator("#appSidebar")).toBeVisible();
   for (const href of MBT_LINKS) {
     await expect(page.locator(`#appSidebar a.app-sidebar-link[href='${href}']`))
+      .toHaveCount(allowed.includes(href) ? 1 : 0);
+  }
+}
+
+async function expectMainModuleLinks(page, allowed) {
+  const moduleNav = page.locator("#appSidebar nav[aria-label='Main modules']");
+  await expect(moduleNav).toBeVisible();
+  for (const href of MAIN_MODULE_LINKS) {
+    await expect(moduleNav.locator(`a.app-sidebar-link[href='${href}']`))
       .toHaveCount(allowed.includes(href) ? 1 : 0);
   }
 }
@@ -315,6 +334,45 @@ test("F02/F15: MBT sidebar renders every permitted link exactly once", async ({ 
   await expectMbtLinks(page, MBT_LINKS);
 });
 
+test("F02/F15: an admin can switch modules directly from both MBT and Sales", async ({ page, request }) => {
+  await openAs(page, request, "admin", "/mbt/config");
+  await expectMainModuleLinks(page, MAIN_MODULE_LINKS);
+
+  await page.locator("#appSidebar nav[aria-label='Main modules'] a[href='/sales']").click();
+  await expect(page).toHaveURL(/\/sales$/);
+  await expect(page.locator("#salesApp")).toBeVisible();
+  await expectMainModuleLinks(page, MAIN_MODULE_LINKS);
+
+  await page.locator("#appSidebar nav[aria-label='Main modules'] a[href='/dispatch']").click();
+  await expect(page).toHaveURL(/\/dispatch$/);
+  await expect(page.locator("#dispatchMenuApp")).toBeVisible();
+  await expectMainModuleLinks(page, MAIN_MODULE_LINKS);
+});
+
+test("Dispatch and SCM menus remain reachable on a short screen by scrolling", async ({ page, request }) => {
+  await page.setViewportSize({ width: 1440, height: 600 });
+  await openAs(page, request, "admin", "/mbt/config");
+
+  for (const fixture of [
+    { path: "/dispatch", app: "#dispatchMenuApp", finalCard: "Setup" },
+    { path: "/scm", app: "#scmMenuApp", finalCard: "PO Route Rules" }
+  ]) {
+    await page.goto(fixture.path);
+    await expect(page.locator(fixture.app)).toBeVisible();
+    const menu = page.locator(".dispatch-menu-page");
+    await expect(menu).toHaveCSS("overflow-y", "auto");
+    const dimensions = await menu.evaluate((element) => ({
+      clientHeight: element.clientHeight,
+      scrollHeight: element.scrollHeight
+    }));
+    expect(dimensions.scrollHeight).toBeGreaterThan(dimensions.clientHeight);
+    await menu.evaluate((element) => {
+      element.scrollTop = element.scrollHeight;
+    });
+    await expect(page.getByRole("button", { name: new RegExp(`^${fixture.finalCard}`) })).toBeInViewport();
+  }
+});
+
 test("P3-F29: Admin can operate a local gate from the responsive audited control page", async ({ page, request }) => {
   let configured = false;
   let revision = 7;
@@ -412,7 +470,7 @@ test("F02/F15: Front Desk and Billing render their role-scoped disabled surfaces
       path: "/mbt/frontdesk",
       title: "Front Desk",
       status: "#frontdeskMessage",
-      statusText: "This MBT capability is disabled.",
+      statusText: FRONTDESK_DISABLED_MESSAGE,
       commandSelector: [
         "#quoteForm input",
         "#quoteForm select",
@@ -427,7 +485,7 @@ test("F02/F15: Front Desk and Billing render their role-scoped disabled surfaces
     {
       role: "mbt_billing",
       path: "/mbt/billing",
-      title: "Reconcile, calculate, approve locally",
+      title: "MBT Billing",
       status: "#billingCommandMessage",
       statusText: "Commands are closed; retained evidence is available read-only. No external posting path exists.",
       commandSelector: ".mbt-command"

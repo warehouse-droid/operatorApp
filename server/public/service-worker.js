@@ -1,13 +1,13 @@
-const CACHE_NAME = "mbbs-yard-operator-v135-reload-photo-layout-v1";
+const CACHE_NAME = "mbbs-yard-operator-v137-performance-v1";
 const OPERATOR_CACHE_PREFIX = "mbbs-yard-operator-";
 const APP_SHELL = [
   "/operator",
   "/operator.html",
-  "/operator.css?v=20260807-reload-photo-layout-v1",
+  "/operator.css?v=20260810-operator-performance-v1",
   "/i18n.css?v=20260701-i18n-v2",
   "/vendor/quagga2/quagga.min.js?v=1.12.1",
   "/i18n.js?v=20260729-returns-v9",
-  "/operator.js?v=20260807-reload-photo-layout-v1",
+  "/operator.js?v=20260810-operator-performance-v1",
   "/manifest.webmanifest",
   "/icons/mbbs-yard-192.png",
   "/icons/mbbs-yard-512.png",
@@ -67,7 +67,7 @@ self.addEventListener("fetch", (event) => {
     || url.pathname === "/driver.js"
     || url.pathname === "/driver-manifest.webmanifest"
     || url.pathname === "/driver-service-worker.js"
-    || url.pathname.startsWith("/driver-offline-");
+    || url.pathname.startsWith("/driver-");
   if (event.request.method !== "GET" || url.pathname.startsWith("/api/") || driverAsset) return;
 
   event.respondWith(

@@ -142,6 +142,38 @@ assert.equal(renumberResult["LI-TRANSFER"], "Load 3", "A load dragged earlier ke
 assert.equal(renumberResult["LI-SALES"], "Load 4", "The displaced later load did not receive the next load number.");
 assert.equal(renumberResult["LI-RETURN"], "Return Load", "Driver renumbering changed the Return Load label.");
 
+const replenishmentDependencyCompleteSource = sourceRange(
+  plannerUi,
+  "function replenishmentDependencyComplete",
+  "function replenishmentDependencyTargetRefs"
+);
+const replenishmentDependencyComplete = Function(
+  `"use strict"; ${replenishmentDependencyCompleteSource}; return replenishmentDependencyComplete;`
+)();
+assert.equal(
+  replenishmentDependencyComplete({ status: "active", reconciliationStatus: "reconciled" }),
+  true,
+  "An exactly reconciled TO dependency was still treated as unreceived by Dispatch."
+);
+assert.equal(
+  replenishmentDependencyComplete({
+    status: "active",
+    transferReceived: true,
+    transferApplicationStatus: "Completed",
+    transferReconciliationStatus: "ok"
+  }),
+  true,
+  "Authoritative Completed SCM evidence did not release the Dispatch dependency."
+);
+assert.equal(
+  replenishmentDependencyComplete({
+    status: "active",
+    transferStatusText: "Transfer Order : Partially Received"
+  }),
+  false,
+  "A partially received NetSuite TO was incorrectly treated as fully received."
+);
+
 const replenishmentLoadPrecedenceSource = sourceRange(
   plannerUi,
   "function replenishmentLoadPrecedence",
@@ -150,6 +182,7 @@ const replenishmentLoadPrecedenceSource = sourceRange(
 const replenishmentPrecedenceContext = vm.createContext({});
 vm.runInContext(`
   const transferOrder = { id: "TOB00749" };
+  const currentPlanDate = "2026-07-22";
   const orders = new Map([[transferOrder.id, transferOrder]]);
   const transferLoad = {
     id: "LI-TRANSFER",
@@ -171,6 +204,7 @@ vm.runInContext(`
     loads: [salesLoad, transferLoad]
   };
   const trucks = [truck];
+  let hasTransferAssignment = true;
   function driverOrientedPlanningEnabled() { return true; }
   function loadDriverKey(parentTruck, load) {
     return String(load?.driverLogin || parentTruck?.driverLogin || "").trim().toLowerCase();
@@ -188,10 +222,17 @@ vm.runInContext(`
   function orderById(orderId) { return orders.get(String(orderId || "")) || null; }
   function replenishmentDependencyComplete() { return false; }
   function orderAssignment(orderId) {
-    return String(orderId || "") === transferOrder.id ? { truck, load: transferLoad } : {};
+    return hasTransferAssignment && String(orderId || "") === transferOrder.id
+      ? { truck, load: transferLoad }
+      : {};
   }
   function replenishmentTransferCompletionInLoad() { return null; }
-  function comparePlanDate() { return 0; }
+  function comparePlanDate(a, b) {
+    const left = String(a || "").slice(0, 10);
+    const right = String(b || "").slice(0, 10);
+    if (!left || !right || left === right) return 0;
+    return left < right ? -1 : 1;
+  }
   ${replenishmentLoadPrecedenceSource}
   const groupedSales = {
     id: "GOB-116372-116373",
@@ -204,7 +245,15 @@ vm.runInContext(`
   const allowed = replenishmentPlacementBlockMessage(groupedSales, truck, salesLoad);
   transferLoad.driverSequence = 5;
   const blocked = replenishmentPlacementBlockMessage(groupedSales, truck, salesLoad);
-  globalThis.result = { allowed, blocked };
+  hasTransferAssignment = false;
+  transferLoad.driverSequence = 3;
+  groupedSales.orderDependencies[0].transferDispatchPlanned = true;
+  groupedSales.orderDependencies[0].transferDispatchPlanDate = "2026-07-21";
+  const historicalAllowed = replenishmentPlacementBlockMessage(groupedSales, truck, salesLoad);
+  delete groupedSales.orderDependencies[0].transferDispatchPlanned;
+  delete groupedSales.orderDependencies[0].transferDispatchPlanDate;
+  const missingPlanBlocked = replenishmentPlacementBlockMessage(groupedSales, truck, salesLoad);
+  globalThis.result = { allowed, blocked, historicalAllowed, missingPlanBlocked };
 `, replenishmentPrecedenceContext);
 const replenishmentPrecedenceResult = JSON.parse(JSON.stringify(replenishmentPrecedenceContext.result));
 assert.equal(
@@ -216,6 +265,16 @@ assert.match(
   replenishmentPrecedenceResult.blocked,
   /TOB00749 must be in an earlier load than GOB-116372-116373/,
   "The frontend allowed the grouped SO when its prerequisite TO was actually later in the driver lane."
+);
+assert.equal(
+  replenishmentPrecedenceResult.historicalAllowed,
+  "",
+  "Dispatch ignored the dependency's prior plan date when the received TO was absent from the current order pool."
+);
+assert.match(
+  replenishmentPrecedenceResult.missingPlanBlocked,
+  /requires TOB00749 to be planned before this delivery/,
+  "Dispatch stopped enforcing a genuinely unplanned replenishment prerequisite."
 );
 
 const replenishmentPlacementFunctions = sourceRange(
@@ -966,7 +1025,7 @@ assert.equal((initDispatchSource.match(/loadDriverJobStatuses\(/g) || []).length
 assert(repository.includes("displayOrder: numberValue(row.display_order, 0)"), "Setup API does not expose persisted display order.");
 assert(repository.includes("cleanDriver(driver, index)"), "Driver request order is not explicitly persisted as display_order.");
 assert(setupHtml.includes("20260803-mbt-bin-trucks-v1"), "Dispatch Setup browser asset version was not bumped.");
-assert(plannerHtml.includes('/dispatch.js?v=20260807-yard-dependency-structure-v1'), "Dispatch planner browser asset version was not bumped.");
+assert(plannerHtml.includes('/dispatch.js?v=20260813-delivery-to-dependency-v1'), "Dispatch planner browser asset version was not bumped.");
 
 const activityPositionSource = sourceRange(
   plannerUi,

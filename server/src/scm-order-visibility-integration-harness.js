@@ -13,6 +13,11 @@ const staleReconciliationHoldId = Math.abs(baseId) + 2000;
 const staleReconciliationCompletedId = Math.abs(baseId) + 3000;
 const vendorId = 700000000 + Number(seed.slice(-7));
 const itemId = 600000000 + Number(seed.slice(-7));
+const searchWindowPrefix = `PO-SPLIT-WINDOW-${seed}`;
+const searchWindowTargetRef = `AAA-${searchWindowPrefix}-TARGET`;
+const searchWindowBaseId = baseId - 1000000;
+const searchWindowLineBaseId = baseId - 2000000;
+const searchWindowFillerCount = 501;
 
 const purchaseFixtures = [
   { id: baseId - 1, ref: `${prefix}-PO-QUEUED`, status: "Queued" },
@@ -187,6 +192,68 @@ async function insertPurchaseFixture(fixture, index) {
       status: fixture.scheduleStatus || fixture.status
     });
   }
+}
+
+async function insertPoSplitSearchWindowFixtures() {
+  await query(
+    `INSERT INTO purchase_orders (
+       netsuite_id, tranid, trandate, vendor_id, vendor, status, status_text,
+       source_location_id, source_location, destination_location_id, destination_location,
+       dispatch_vendor_yard, dispatch_address, receipt_status,
+       initial_scm_status, is_blanket_po, netsuite_active, synced_at
+     )
+     SELECT
+       $1::bigint - fixture_number,
+       CASE
+         WHEN fixture_number = 0 THEN $2
+         ELSE 'ZZZ-' || $3 || '-' || lpad(fixture_number::text, 4, '0')
+       END,
+       DATE '2026-07-30', $4, $5, 'pendingReceipt', 'Purchase Order : Pending Receipt',
+       NULL, $6, 1, '3445',
+       $6, '3445 Kennedy Road, Toronto, ON', 'not_received',
+       'Queued', false, true, now()
+     FROM generate_series(0, $7::int) AS fixture_number`,
+    [
+      searchWindowBaseId,
+      searchWindowTargetRef,
+      searchWindowPrefix,
+      vendorId + 100000,
+      `${searchWindowPrefix} Vendor`,
+      `${searchWindowPrefix} Vendor Yard`,
+      searchWindowFillerCount
+    ]
+  );
+  await query(
+    `INSERT INTO purchase_order_lines (
+       id, purchase_order_id, line_id, item_id, item_name, sku, quantity, unit,
+       item_weight, pallet_qty, layer_qty, section_qty, piece_qty,
+       to_plt, to_lyr, to_sec, to_pcs, location_id, location,
+       netsuite_received_qty, netsuite_received_baseline_qty,
+       received_pallet_qty, received_layer_qty, received_section_qty, received_piece_qty,
+       netsuite_active, synced_at, raw
+     )
+     SELECT
+       $1::bigint - fixture_number,
+       $2::bigint - fixture_number,
+       9000 + fixture_number,
+       $3::bigint + fixture_number,
+       $4 || ' Item ' || fixture_number,
+       $4 || '-SKU-' || fixture_number,
+       10, 'EA',
+       5, 1, 0, 0, 0,
+       10, 0, 0, 1, 1, '3445',
+       0, 0,
+       0, 0, 0, 0,
+       true, now(), '{}'::jsonb
+     FROM generate_series(0, $5::int) AS fixture_number`,
+    [
+      searchWindowLineBaseId,
+      searchWindowBaseId,
+      itemId + 100000,
+      searchWindowPrefix,
+      searchWindowFillerCount
+    ]
+  );
 }
 
 async function insertTransferFixture(fixture, index) {
@@ -502,6 +569,20 @@ try {
   assert.equal(staleHoldRow.scm?.status, "Hold",
     "A newer saved Hold must override an older Queued reconciliation snapshot on PO Split.");
 
+  const splitSourceSearchRef = `${prefix}-PO-HOLD`;
+  const linkedSplitRef = `${prefix}-PO-SPLIT-CHILD`;
+  const linkedSplitSearchResponse = await requestJson(
+    baseUrl,
+    `/api/dispatch/scm/purchase-orders?search=${encodeURIComponent(splitSourceSearchRef)}`,
+    { token: tokens.scm }
+  );
+  assert.equal(linkedSplitSearchResponse.response.status, 200,
+    "A PO Split source-reference search should succeed.");
+  assert(
+    linkedSplitSearchResponse.payload.some((row) => String(row.id) === linkedSplitRef),
+    "Searching an original PO ref must keep returning its active split child."
+  );
+
   const staleReconciliationHoldResponse = await requestJson(
     baseUrl,
     `/api/dispatch/scm/purchase-orders?search=${encodeURIComponent(staleReconciliationHoldRef)}`,
@@ -529,6 +610,31 @@ try {
   assert.equal(completedRow.scm?.status, "Completed",
     "Completed reconciliation must remain terminal despite a newer manual Queued status.");
 
+  await insertPoSplitSearchWindowFixtures();
+  const cappedPoSplitResponse = await requestJson(
+    baseUrl,
+    "/api/dispatch/scm/purchase-orders",
+    { token: tokens.scm }
+  );
+  assert.equal(cappedPoSplitResponse.response.status, 200,
+    "The default SCM PO Split request should succeed.");
+  assert.equal(
+    cappedPoSplitResponse.payload.some((row) => String(row.id) === searchWindowTargetRef),
+    false,
+    "The regression target must be outside the default 500-order PO Split window."
+  );
+  const searchedPoSplitResponse = await requestJson(
+    baseUrl,
+    `/api/dispatch/scm/purchase-orders?search=${encodeURIComponent(searchWindowTargetRef)}`,
+    { token: tokens.scm }
+  );
+  assert.equal(searchedPoSplitResponse.response.status, 200,
+    "A targeted SCM PO Split search should succeed.");
+  assert(
+    searchedPoSplitResponse.payload.some((row) => String(row.id) === searchWindowTargetRef),
+    "A targeted PO Split search must query the database instead of filtering only the default 500-order window."
+  );
+
   console.log("SCM restricted-order DB/API integration harness passed.");
 } finally {
   if (server) {
@@ -547,6 +653,14 @@ try {
   await query("DELETE FROM transfer_orders WHERE netsuite_id = ANY($1::bigint[])", [transferIds]).catch(() => null);
   await query("DELETE FROM purchase_order_lines WHERE purchase_order_id = ANY($1::bigint[])", [purchaseIds]).catch(() => null);
   await query("DELETE FROM purchase_orders WHERE netsuite_id = ANY($1::bigint[])", [purchaseIds]).catch(() => null);
+  await query(
+    `DELETE FROM purchase_order_lines
+      WHERE purchase_order_id IN (
+        SELECT netsuite_id FROM purchase_orders WHERE tranid LIKE $1
+      )`,
+    [`%${searchWindowPrefix}%`]
+  ).catch(() => null);
+  await query("DELETE FROM purchase_orders WHERE tranid LIKE $1", [`%${searchWindowPrefix}%`]).catch(() => null);
 
   const operatorIds = operatorAccounts.map((account) => account.id);
   const usernames = operatorAccounts.map((account) => account.username);

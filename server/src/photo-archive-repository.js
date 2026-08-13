@@ -25,7 +25,8 @@ const PHOTO_REFERENCE_TARGETS = [
   { table: "driver_day_records", column: "post_dvir_photo_data_urls", kind: "jsonb" },
   { table: "driver_job_records", column: "photo_data_urls", kind: "jsonb" },
   { table: "return_drafts", column: "payload", kind: "jsonb_deep" },
-  { table: "return_photos", column: "photo_reference", kind: "text" }
+  { table: "return_photos", column: "photo_reference", kind: "text" },
+  { table: "sales_order_delivery_instruction_media", column: "object_reference", kind: "text" }
 ];
 
 let activeArchiveRun = null;

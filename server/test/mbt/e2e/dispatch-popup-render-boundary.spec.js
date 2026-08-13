@@ -161,6 +161,182 @@ test("DP-15 browser: group and split popups preserve the planner root, focus, sc
   expect(requestsAfterInitialLoad).not.toContain("GET /api/dispatch/plans/current");
 });
 
+test("DP-13/DP-14 browser: unchanged polling keeps the preview and changed execution keeps its map and stop scroll", async ({ page, request }) => {
+  const stableOrder = {
+    id: "DP-STABLE-A",
+    type: "SO",
+    customer: "Stable Preview",
+    address: "88 Stable Preview Road",
+    sourceYard: "3445",
+    pickupLocations: ["3445"],
+    items: [{ sku: "STABLE-A", pallets: 2 }],
+    pallets: 2,
+    weight: 4000,
+    status: "open",
+    sourceTable: "sales_orders"
+  };
+  const stablePlan = {
+    id: "778",
+    planId: "778",
+    planDate,
+    revision: 3,
+    digest: "dp-stable-preview-digest",
+    status: "draft",
+    summary: { driverLaneOrder: ["stable-driver"] },
+    assignedOrderSnapshots: [stableOrder],
+    trucks: [{
+      id: "DP-STABLE-TRUCK",
+      plate: "DP-STABLE-TRUCK",
+      driver: "Stable Driver",
+      driverLogin: "stable-driver",
+      base: "3445",
+      loads: [{
+        id: "dp-stable-load",
+        name: "Stable Load",
+        driverName: "Stable Driver",
+        driverLogin: "stable-driver",
+        truckId: "DP-STABLE-TRUCK",
+        truckPlate: "DP-STABLE-TRUCK",
+        startMode: "fixed",
+        start: "08:00",
+        stops: [
+          { id: "dp-stable-pick", loadId: "dp-stable-load", type: "pick", orderId: stableOrder.id, location: "3445" },
+          { id: "dp-stable-drop", loadId: "dp-stable-load", type: "drop", orderId: stableOrder.id, location: stableOrder.address }
+        ]
+      }]
+    }]
+  };
+  let emitChangedStatus = false;
+  let statusReads = 0;
+  let forecastReads = 0;
+  await page.addInitScript(() => {
+    const nativeSetInterval = globalThis.setInterval.bind(globalThis);
+    globalThis.setInterval = (callback, delay, ...args) => {
+      if (Number(delay) === 15000) {
+        globalThis.__dispatchForecastTick = () => callback(...args);
+        return 15000;
+      }
+      return nativeSetInterval(callback, delay, ...args);
+    };
+  });
+  await page.route("**/api/dispatch/**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === "/api/dispatch/v2/bootstrap") {
+      return json(route, { exists: true, plan: stablePlan });
+    }
+    if (path === "/api/dispatch/config") {
+      return json(route, { googleMapsApiKey: "", driverOrientedPlanning: true });
+    }
+    if (path === "/api/dispatch/setup") {
+      return json(route, {
+        drivers: [{ name: "Stable Driver", login: "stable-driver", license: "AZ" }],
+        trucks: [{ plate: "DP-STABLE-TRUCK", capacityLbs: 48_000, baseYard: "3445" }],
+        ownYards: [{ code: "3445", name: "3445", address: "3445 Kennedy Road, Toronto, ON" }],
+        planning: {}
+      });
+    }
+    if (path === "/api/dispatch/orders") {
+      return json(route, [stableOrder]);
+    }
+    if (path === "/api/dispatch/plans/778/revision") {
+      return json(route, { revision: 3, savedAt: "2038-11-14T10:00:00.000Z" });
+    }
+    if (path === "/api/dispatch/driver-job-statuses") {
+      statusReads += 1;
+      return json(route, emitChangedStatus ? [{
+        job_id: "dp-stable-complete",
+        load_id: "dp-stable-load",
+        stop_id: "dp-stable-drop",
+        stop_type: "dropoff",
+        status: "complete",
+        order_refs: [stableOrder.id]
+      }] : []);
+    }
+    if (path === "/api/dispatch/driver-truck-switches/attention") {
+      return json(route, []);
+    }
+    if (path === "/api/dispatch/forecast") {
+      forecastReads += 1;
+      return json(route, {
+        planId: "778",
+        planRevision: 3,
+        planDate,
+        generatedAt: `2038-11-14T10:00:${String(forecastReads).padStart(2, "0")}.000Z`,
+        loads: [],
+        stops: [],
+        travelLegs: [],
+        timelineEvents: []
+      });
+    }
+    if (path === "/api/dispatch/plan-edit-lease") {
+      return json(route, { lease: null });
+    }
+    if (path === "/api/dispatch/plans") {
+      return json(route, []);
+    }
+    return json(route, dispatchFixture(path));
+  });
+  await page.route("**/api/mbt/status", (route) => json(route, { capabilities: { binDispatch: { enabled: false } } }));
+
+  const token = await loginToken(request);
+  await page.goto("/");
+  await page.evaluate(({ token: value, date }) => {
+    globalThis.localStorage.setItem("mbbs.staff.token", value);
+    globalThis.localStorage.setItem("mbbs.staff.role", "dispatcher");
+    globalThis.localStorage.setItem("mbbs.staff.roles", JSON.stringify(["dispatcher"]));
+    globalThis.localStorage.setItem("mbbs.dispatch.token", value);
+    globalThis.localStorage.setItem("mbbs.dispatch.planDate", date);
+  }, { token, date: planDate });
+  await page.goto("/dispatch/planning");
+  const loadTitle = page.locator('[data-action="select-load"][data-load="dp-stable-load"]');
+  await loadTitle.focus();
+  await expect(loadTitle).toBeFocused();
+  await loadTitle.press("Enter");
+
+  const mapCanvas = page.locator("#googleMapPreview");
+  const stopList = page.locator('.preview-stop-list[data-load="dp-stable-load"]');
+  await expect(mapCanvas).toBeVisible();
+  await expect(stopList).toBeVisible();
+  const mapHandle = await mapCanvas.elementHandle();
+  await page.addStyleTag({
+    content: `
+      .preview-stop-list[data-load="dp-stable-load"] {
+        height: 120px !important;
+        max-height: 120px !important;
+        overflow-y: auto !important;
+      }
+      .preview-stop-list[data-load="dp-stable-load"] > * {
+        min-height: 400px !important;
+      }
+    `
+  });
+  await stopList.evaluate((element) => {
+    element.scrollTop = 160;
+  });
+  await expect(stopList).toHaveJSProperty("scrollTop", 160);
+
+  const runExecutionTick = async () => {
+    const priorStatusReads = statusReads;
+    const priorForecastReads = forecastReads;
+    await page.evaluate(() => globalThis.__dispatchForecastTick());
+    await expect.poll(() => statusReads).toBeGreaterThan(priorStatusReads);
+    await expect.poll(() => forecastReads).toBeGreaterThan(priorForecastReads);
+    await page.evaluate(() => new Promise((resolve) => {
+      globalThis.requestAnimationFrame(() => globalThis.requestAnimationFrame(resolve));
+    }));
+  };
+
+  await runExecutionTick();
+  expect(await mapHandle.evaluate((element) => element === globalThis.document.querySelector("#googleMapPreview"))).toBe(true);
+  await expect(stopList).toHaveJSProperty("scrollTop", 160);
+
+  emitChangedStatus = true;
+  await runExecutionTick();
+  expect(await mapHandle.evaluate((element) => element === globalThis.document.querySelector("#googleMapPreview"))).toBe(true);
+  await expect(page.locator('.preview-stop-list[data-load="dp-stable-load"]')).toHaveJSProperty("scrollTop", 160);
+  await expect(page.locator('[data-load-card="dp-stable-load"]')).toHaveClass(/driver-active/u);
+});
+
 test("DP-17/DP-19 browser: compact Custom Order startup keeps completed travel styling through a failed save", async ({ page, request }) => {
   const compactOrder = {
     id: "DP-UI-CUSTOM",

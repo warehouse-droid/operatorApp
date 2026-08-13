@@ -9,6 +9,7 @@
   let offlineReviewCountTimer = null;
   let offlineReviewRefreshTimer = null;
   let offlineReviewEventSource = null;
+  let sidebarOperator = null;
   if (!path.startsWith("/admin") && !path.startsWith("/control") && !path.startsWith("/dispatch") && !path.startsWith("/scm") && !path.startsWith("/sales") && !path.startsWith("/mbt")) return;
 
   function t(key, fallback) {
@@ -47,14 +48,13 @@
   }
 
   const mainItems = [
-    { label: "Admin", href: "/admin", icon: "AD" },
-    { label: "Control", href: "/control", icon: "CT" },
-    { label: "Dispatch", href: "/dispatch", icon: "DP" },
-    { label: "SCM", href: "/scm", icon: "SC" },
-    { label: "Sales", href: "/sales", icon: "SA" },
-    { label: "MBT", href: "/mbt", icon: "MB" },
-    { label: "Operator", href: "/operator", icon: "OP" },
-    { label: "Driver", href: "/driver", icon: "DR" }
+    { label: "Admin", href: "/admin", icon: "AD", authorities: ["admin"] },
+    { label: "Control", href: "/control", icon: "CT", authorities: ["admin", "yard_manager"] },
+    { label: "Dispatch", href: "/dispatch", icon: "DP", authorities: ["admin", "dispatcher"] },
+    { label: "SCM", href: "/scm", icon: "SC", authorities: ["admin", "dispatcher", "scm", "scm_staff", "yard_manager"] },
+    { label: "Sales", href: "/sales", icon: "SA", authorities: ["admin", "sales"] },
+    { label: "MBT", href: "/mbt", icon: "MB", authorities: ["admin", "dispatcher", "mbt_frontdesk", "mbt_billing"] },
+    { label: "Operator", href: "/operator", icon: "OP", authorities: ["admin", "operator", "yard_manager"] }
   ];
 
   const dispatchItems = [
@@ -73,20 +73,23 @@
   ];
 
   const scmItems = [
-    { label: "SCM Menu", href: "/scm", icon: "SM" },
-    { label: "Smart SCM", href: "/scm/smart", icon: "AI" },
-    { label: "NetSuite PO history", href: "/scm/netsuite-po", icon: "PO", scmWriteOnly: true },
-    { label: "Local Vendors", href: "/scm/vendors", icon: "LV" },
-    { label: "Auto Transfer", href: "/scm/transfer-dependencies", icon: "AT" },
-    { label: "PO Split", href: "/scm/POsplit", icon: "PS" },
-    { label: "PO/TO Schedule", href: "/scm/POTOschedule", icon: "PT" },
-    { label: "Schedule Formatting", href: "/scm/schedule-formatting", icon: "CF" },
-    { label: "VRMA", href: "/scm/VRMA", icon: "VR" },
-    { label: "PO Route Rules", href: "/scm/route-rules", icon: "RT" }
+    { label: "SCM Menu", href: "/scm", icon: "SM", authorities: ["admin", "dispatcher", "scm", "scm_staff", "yard_manager"] },
+    { label: "Stock Requests", href: "/scm/stock-requests", icon: "SR", scmWriteOnly: true, authorities: ["admin", "scm", "scm_staff"] },
+    { label: "Smart SCM", href: "/scm/smart", icon: "AI", authorities: ["admin", "dispatcher", "scm", "scm_staff", "yard_manager"] },
+    { label: "NetSuite PO history", href: "/scm/netsuite-po", icon: "PO", scmWriteOnly: true, authorities: ["admin", "scm", "scm_staff"] },
+    { label: "Local Vendors", href: "/scm/vendors", icon: "LV", authorities: ["admin", "dispatcher", "scm", "scm_staff", "yard_manager"] },
+    { label: "Auto Transfer", href: "/scm/transfer-dependencies", icon: "AT", authorities: ["admin", "scm", "scm_staff"] },
+    { label: "PO Split", href: "/scm/POsplit", icon: "PS", authorities: ["admin", "dispatcher", "scm", "scm_staff"] },
+    { label: "PO/TO Schedule", href: "/scm/POTOschedule", icon: "PT", authorities: ["admin", "dispatcher", "scm", "scm_staff", "yard_manager"] },
+    { label: "Schedule Formatting", href: "/scm/schedule-formatting", icon: "CF", authorities: ["admin", "scm", "scm_staff"] },
+    { label: "VRMA", href: "/scm/VRMA", icon: "VR", authorities: ["admin", "scm", "scm_staff"] },
+    { label: "PO Route Rules", href: "/scm/route-rules", icon: "RT", authorities: ["admin", "dispatcher", "scm", "scm_staff", "yard_manager"] }
   ];
 
   const salesItems = [
     { label: "Sales Menu", href: "/sales", icon: "SM" },
+    { label: "Delivery Instructions", href: "/sales/delivery-instructions", icon: "DI", staffOnly: true },
+    { label: "Request Stock", href: "/sales/stock-requests", icon: "RS", staffOnly: true },
     { label: "Return Records", href: "/sales/returns", icon: "RR", staffOnly: true },
     { label: "Planning View", href: "/sales/planning", icon: "PL" },
     { label: "PO/TO Schedule", href: "/sales/schedule", icon: "PT" },
@@ -129,6 +132,14 @@
 
   function staffRoleSet() {
     const normalizeRole = (value) => String(value || "").trim().toLowerCase().replaceAll("-", "_").replaceAll(" ", "_");
+    const liveOperator = window.MBBS_DISPATCH_OPERATOR || sidebarOperator;
+    if (liveOperator) {
+      if (liveOperator.publicSales) return new Set(["sales"]);
+      return new Set([
+        ...(Array.isArray(liveOperator.roles) ? liveOperator.roles : []),
+        liveOperator.role
+      ].map(normalizeRole).filter(Boolean));
+    }
     let savedRoles = [];
     try {
       const parsed = JSON.parse(localStorage.getItem("mbbs.staff.roles") || "[]");
@@ -138,10 +149,12 @@
     }
     return new Set([
       ...savedRoles,
-      localStorage.getItem("mbbs.staff.role"),
-      ...(Array.isArray(window.MBBS_DISPATCH_OPERATOR?.roles) ? window.MBBS_DISPATCH_OPERATOR.roles : []),
-      window.MBBS_DISPATCH_OPERATOR?.role
+      localStorage.getItem("mbbs.staff.role")
     ].map(normalizeRole).filter(Boolean));
+  }
+
+  function itemAllowedByAuthority(item, roles = staffRoleSet()) {
+    return !Array.isArray(item.authorities) || item.authorities.some((role) => roles.has(role));
   }
 
   function canManageScmPurchaseOrders() {
@@ -150,18 +163,8 @@
   }
 
   function visibleMainItems() {
-    if (path.startsWith("/mbt")) return visibleMbtItems();
-    if (path.startsWith("/sales")) return mainItems.filter((item) => item.href === "/sales");
     const roles = staffRoleSet();
-    if (roles.has("admin")) return mainItems.filter((item) => item.href !== "/driver");
-    const visiblePaths = new Set();
-    if (roles.has("yard_manager")) ["/control", "/operator"].forEach((href) => visiblePaths.add(href));
-    if (roles.has("dispatcher")) ["/dispatch", "/scm", "/mbt"].forEach((href) => visiblePaths.add(href));
-    if (roles.has("scm") || roles.has("scm_staff")) visiblePaths.add("/scm");
-    if (roles.has("sales")) visiblePaths.add("/sales");
-    if (roles.has("operator")) visiblePaths.add("/operator");
-    if (visiblePaths.size) return mainItems.filter((item) => visiblePaths.has(item.href));
-    return mainItems;
+    return mainItems.filter((item) => itemAllowedByAuthority(item, roles));
   }
 
   function visibleMbtItems() {
@@ -180,10 +183,12 @@
     if (path.startsWith("/dispatch")) return { title: "Dispatch", items: dispatchItems };
     if (path.startsWith("/scm")) return {
       title: "SCM",
-      items: scmItems.filter((item) => !item.scmWriteOnly || canManageScmPurchaseOrders())
+      items: scmItems
+        .filter((item) => itemAllowedByAuthority(item))
+        .filter((item) => !item.scmWriteOnly || canManageScmPurchaseOrders())
     };
     if (path.startsWith("/sales")) {
-      const operator = window.MBBS_DISPATCH_OPERATOR;
+      const operator = window.MBBS_DISPATCH_OPERATOR || sidebarOperator;
       return {
         title: "Sales",
         items: salesItems.filter((item) => !item.staffOnly || (operator && !operator.publicSales))
@@ -606,12 +611,10 @@
         <button class="app-sidebar-toggle" data-sidebar-toggle type="button" title="${collapsed ? "Expand" : "Collapse"}">${collapsed ? ">" : "<"}</button>
       </div>
       <div class="app-sidebar-scroll">
-        ${path.startsWith("/mbt") ? "" : `
-          <nav class="app-sidebar-section" aria-label="Main modules">
-            <div class="app-sidebar-section-title">Modules</div>
-            ${visibleMainItems().map(linkHtml).join("")}
-          </nav>
-        `}
+        <nav class="app-sidebar-section" aria-label="Main modules">
+          <div class="app-sidebar-section-title">Modules</div>
+          ${visibleMainItems().map(linkHtml).join("")}
+        </nav>
         <nav class="app-sidebar-section" aria-label="${escapeHtml(scoped.title)} pages">
           <div class="app-sidebar-section-title">${escapeHtml(scoped.title)}</div>
           ${scoped.items.map(linkHtml).join("")}
@@ -643,9 +646,36 @@
     localStorage.setItem(sectionStorageKey, link.dataset.controlSection || "dashboard");
   }
 
+  async function refreshSidebarAuthority() {
+    const token = localStorage.getItem("mbbs.staff.token")
+      || localStorage.getItem("mbbs.control.token")
+      || localStorage.getItem("mbbs.operator.token")
+      || localStorage.getItem("mbbs.dispatch.token")
+      || "";
+    if (!token) return;
+    try {
+      const response = await fetch("/api/auth/me", {
+        headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+        cache: "no-store"
+      });
+      if (!response.ok) return;
+      const payload = await response.json();
+      sidebarOperator = payload.operator || null;
+      render();
+    } catch {
+      // Retain the stored authority view while the live session check is temporarily unavailable.
+    }
+  }
+
+  function handleSidebarAuthChange(event) {
+    sidebarOperator = event.detail?.operator || null;
+    render();
+  }
+
   function init() {
     installStyle();
     render();
+    void refreshSidebarAuthority();
     document.addEventListener("click", (event) => {
       if (event.target.closest?.("[data-sidebar-toggle]")) {
         const currentlyCollapsed = document.body.classList.contains("app-sidebar-collapsed");
@@ -657,7 +687,7 @@
       handleControlSection(event);
     });
     window.addEventListener("mbbs-language-changed", render);
-    window.addEventListener("mbbs-auth-operator-changed", render);
+    window.addEventListener("mbbs-auth-operator-changed", handleSidebarAuthChange);
     window.addEventListener("mbbs-auth-operator-changed", handleOfflineReviewAuthChange);
     window.addEventListener("mbbs-offline-review-count-changed", refreshOfflineReviewCount);
     window.addEventListener("mbbs-sidebar-route-changed", () => {
@@ -674,6 +704,7 @@
     startOfflineReviewCountTimer();
     window.addEventListener("pageshow", () => {
       startOfflineReviewCountTimer();
+      void refreshSidebarAuthority();
       refreshOfflineReviewCount();
       connectOfflineReviewEvents();
     });

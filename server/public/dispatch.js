@@ -436,6 +436,18 @@ let orderSearchError = "";
 let modalType = "";
 let modalOrderId = "";
 let modalLoadId = "";
+let deliveryInstructionEditorState = {
+  orderId: "",
+  targetOrderId: "",
+  targets: [],
+  details: [],
+  detail: null,
+  loading: false,
+  saving: false,
+  error: "",
+  notice: "",
+  generation: 0
+};
 let splitParts = 2;
 let splitDraft = { orderId: "", parts: 0, items: {} };
 let poAllocationOptions = null;
@@ -478,6 +490,7 @@ let persistedRouteEstimateCache = loadPersistedRouteEstimateCache();
 let persistedRouteEstimateSaveTimer = null;
 let backgroundRouteTimer = null;
 let backgroundRoutesRunning = false;
+let backgroundRouteRunPromise = null;
 let backgroundRouteRenderQueued = false;
 let backgroundRouteInFlight = new Set();
 let geocodeCache = {};
@@ -505,6 +518,7 @@ let lastSavedPlanHash = "";
 let planPollInFlight = false;
 let eventSource = null;
 let remoteRefreshTimer = null;
+let orderPoolRefreshTimer = null;
 let orderClickTimer = null;
 let undoStack = [];
 let redoStack = [];
@@ -677,7 +691,7 @@ async function enterDispatchEditMode() {
   if (!currentPlan?.id) await createPlanForDate(currentPlanDate);
   if (isDispatchHistoryEditMode()) await loadDispatchOrders();
   routeNotice = isDispatchHistoryEditMode()
-    ? "History Edit Mode enabled. Reconciliation-complete orders are available; Driver PWA-completed orders remain locked."
+    ? "History Edit Mode enabled. Search to find reconciliation-complete orders; Driver PWA-completed orders remain locked."
     : "Edit Mode enabled. Changes save automatically.";
   render({ save: false });
 }
@@ -2742,6 +2756,29 @@ function splitParentOrderId(order = {}) {
   return /-S\d+$/i.test(orderId) ? orderId.replace(/-S\d+$/i, "") : "";
 }
 
+function deliveryInstructionOrderTargets(order = {}) {
+  const members = Array.isArray(order.childOrders) && order.childOrders.length
+    ? flattenDispatchGroupMembers(order).childOrderDetails
+    : [order];
+  const targetsById = new Map();
+  for (const member of members) {
+    const memberId = String(member?.id || "").trim();
+    if (canonicalDispatchOrderType(member?.type || order.type, memberId) !== "SO") continue;
+    const targetOrderId = splitParentOrderId(member) || memberId;
+    if (!targetOrderId) continue;
+    const key = targetOrderId.toUpperCase();
+    const current = targetsById.get(key) || {
+      id: targetOrderId,
+      customer: String(member?.customer || "").trim(),
+      memberRefs: []
+    };
+    if (memberId && !current.memberRefs.includes(memberId)) current.memberRefs.push(memberId);
+    if (!current.customer && member?.customer) current.customer = String(member.customer).trim();
+    targetsById.set(key, current);
+  }
+  return [...targetsById.values()];
+}
+
 function normalizePoDropoffs(order = {}, type = "", items = []) {
   if (type !== "PO") return [];
   const source = Array.isArray(order.dropoffs) && order.dropoffs.length
@@ -2849,11 +2886,13 @@ function normalizeOrder(order) {
       || dependencyChildren.some((child) => child.dependencyWaitingForTransfer)
       || orderDependencies?.some((dependency) =>
         dependency.mode === "yard_replenishment"
-        && !["delivered", "received_local"].includes(String(dependency.status || "").toLowerCase())
+        && !replenishmentDependencyComplete(dependency)
       )),
     dependencyAttention: Boolean(order.dependencyAttention
       || dependencyChildren.some((child) => child.dependencyAttention)
-      || orderDependencies?.some((dependency) => dependency.status === "attention")),
+      || orderDependencies?.some((dependency) =>
+        dependency.status === "attention" && !replenishmentDependencyComplete(dependency)
+      )),
     dependencyUncovered: Boolean(order.dependencyUncovered
       || dependencyChildren.some((child) => child.dependencyUncovered)),
     dependencyUncoveredQuantity: dependencyChildren.length
@@ -2889,9 +2928,24 @@ function transitBlockMessage(order) {
 
 function replenishmentDependencyComplete(dependency = {}, transferOrder = {}) {
   const dependencyStatus = String(dependency.status || "").toLowerCase();
-  const receivingStatus = String(transferOrder.receivingStatus || transferOrder.raw?.receiving_status || "").toLowerCase();
-  return ["delivered", "received_local"].includes(dependencyStatus)
-    || ["received", "completed", "shipped"].includes(receivingStatus);
+  const dependencyReconciliationStatus = String(dependency.reconciliationStatus || "").toLowerCase();
+  const receivingStatus = String(
+    transferOrder.receivingStatus
+      || transferOrder.raw?.receiving_status
+      || dependency.transferReceivingStatus
+      || ""
+  ).toLowerCase();
+  const statusText = String(
+    transferOrder.statusText
+      || transferOrder.raw?.status_text
+      || dependency.transferStatusText
+      || ""
+  ).trim();
+  return Boolean(dependency.transferReceived)
+    || ["delivered", "received_local"].includes(dependencyStatus)
+    || dependencyReconciliationStatus === "reconciled"
+    || ["received", "completed", "shipped"].includes(receivingStatus)
+    || /^transfer\s+order\s*:\s*received$/i.test(statusText);
 }
 
 function replenishmentDependencyTargetRefs(dependency = {}, transferOrder = {}) {
@@ -3044,15 +3098,25 @@ function replenishmentPlacementBlockMessage(order, targetTruck, targetLoad, inse
     dependency.mode === "yard_replenishment" && dependency.status !== "cancelled"
   );
   for (const dependency of dependencies) {
+    const transferOrder = orderById(dependency.transferOrderRef);
+    if (replenishmentDependencyComplete(dependency, transferOrder)) continue;
     if (String(dependency.status || "").toLowerCase() === "attention") {
       return `${order.id}: ${dependency.attentionReason || `${dependency.transferOrderRef} requires attention`}.`;
     }
-    const transferOrder = orderById(dependency.transferOrderRef);
-    if (replenishmentDependencyComplete(dependency, transferOrder)) continue;
     const assignment = orderAssignment(dependency.transferOrderRef);
     if (!assignment.load) {
-      const transferDate = String(transferOrder?.dispatchPlanDate || "").slice(0, 10);
-      if (transferOrder?.dispatchPlanned && transferDate && comparePlanDate(transferDate, currentPlanDate) < 0) continue;
+      const transferPlanned = Boolean(
+        transferOrder?.dispatchPlanned
+        || dependency.transferDispatchPlanned
+        || dependency.plannedPlanId
+      );
+      const transferDate = String(
+        transferOrder?.dispatchPlanDate
+        || dependency.transferDispatchPlanDate
+        || dependency.plannedDate
+        || ""
+      ).slice(0, 10);
+      if (transferPlanned && transferDate && comparePlanDate(transferDate, currentPlanDate) < 0) continue;
       return `${order.id} requires ${dependency.transferOrderRef} to be planned before this delivery.`;
     }
     if (String(assignment.load.id || "") === String(targetLoad?.id || "")) {
@@ -3495,12 +3559,21 @@ function renderDispatchOrderPoolPatch() {
   const active = document.activeElement;
   const restoreSearchFocus = active?.id === "orderSearch";
   const selectionStart = restoreSearchFocus ? active.selectionStart : null;
+  const selectionEnd = restoreSearchFocus ? active.selectionEnd : null;
+  const previousScrollTop = current.querySelector(".order-list")?.scrollTop ?? orderListScrollTop;
   current.outerHTML = renderOrderPool();
+  const nextList = app.querySelector("[data-dispatch-order-pool] .order-list");
+  orderListScrollTop = previousScrollTop;
+  if (nextList) nextList.scrollTop = previousScrollTop;
   if (restoreSearchFocus) {
     const next = document.getElementById("orderSearch");
     next?.focus({ preventScroll: true });
-    if (selectionStart !== null) next?.setSelectionRange(selectionStart, selectionStart);
+    if (selectionStart !== null) next?.setSelectionRange(selectionStart, selectionEnd ?? selectionStart);
   }
+  window.requestAnimationFrame(() => {
+    const settledList = app.querySelector("[data-dispatch-order-pool] .order-list");
+    if (settledList) settledList.scrollTop = previousScrollTop;
+  });
 }
 
 async function applyTargetedDispatchOrderUpdate(orderId) {
@@ -4259,8 +4332,11 @@ function travelLegForVisitPair(load, previousVisit, nextVisit, pairIndex = -1) {
 }
 
 async function refreshDriverExecutionAndForecast({ renderAfter = true } = {}) {
+  const previousSignature = dispatchExecutionRenderSignature();
   await Promise.all([loadDriverJobStatuses(), loadDispatchForecast()]);
-  if (renderAfter && !dispatchBackgroundRenderBlocked()) render({ save: false });
+  const changed = dispatchExecutionRenderSignature() !== previousSignature;
+  if (renderAfter && changed && !dispatchBackgroundRenderBlocked()) renderDispatchExecutionPatch();
+  return changed;
 }
 
 function scheduleDispatchForecastPolling() {
@@ -4733,9 +4809,11 @@ function trucksWithTimingMetadata() {
       const assignment = assignLoadFields(truck, savedLoad);
       const startMode = resolvedLoadStartMode(load);
       const effectiveTruck = effectiveTruckForLoad(truck, assignment);
+      const savedRouteEstimate = serializableRouteEstimateForLoad(effectiveTruck, load);
       const rowsByStopId = new Map((stats.rows || []).filter(Boolean).map((row) => [String(row.stop?.id || ""), row]));
       return {
         ...assignment,
+        ...(savedRouteEstimate ? { routeEstimate: savedRouteEstimate } : {}),
         startMode,
         start: startMode === "auto"
           ? ""
@@ -4799,6 +4877,23 @@ function compactStringFingerprint(value = "") {
     second = Math.imul(second ^ code, 3266489909);
   }
   return `${text.length.toString(36)}:${(first >>> 0).toString(36)}:${(second >>> 0).toString(36)}`;
+}
+
+function dispatchForecastRenderEvidence(forecast = dispatchForecast) {
+  if (!forecast) return null;
+  const evidence = { ...forecast };
+  delete evidence.generatedAt;
+  return evidence;
+}
+
+function dispatchExecutionRenderSignature() {
+  return compactStringFingerprint(JSON.stringify({
+    planId: String(currentPlan?.id || ""),
+    planRevision: Number(currentPlan?.revision || 0),
+    driverJobStatuses: driverJobStatuses || [],
+    driverTruckSwitchAttention: driverTruckSwitchAttention || [],
+    forecast: dispatchForecastRenderEvidence()
+  }));
 }
 
 function stablePlanHashPayload(payload = {}) {
@@ -5599,6 +5694,14 @@ async function flushPlanSaveQueue() {
     try {
       while (saveQueued) {
         saveQueued = false;
+        try {
+          await ensureGoogleRouteEstimatesBeforeSave();
+        } catch (error) {
+          routeNotice = `Plan not saved: ${error.message}`;
+          finalResult = { blocked: true, code: error.code || "DISPATCH_GOOGLE_ROUTE_PENDING", error };
+          render({ save: false });
+          break;
+        }
         const savedAt = new Date();
         const payload = planPayload(savedAt);
         const payloadHash = stablePlanHashPayload(payload);
@@ -5901,6 +6004,7 @@ async function confirmCurrentPlanAtomic() {
   if (!ensureDispatchPlanEditor()) throw new Error(dispatchEditModeMessage());
   if (!currentPlan?.id) throw new Error("Dispatch plan is not loaded.");
   clearTimeout(saveTimer);
+  await ensureGoogleRouteEstimatesBeforeSave("confirm");
   const saveResult = await saveCurrentPlanNow();
   if (saveResult?.recoverySaved) {
     const error = new Error(routeNotice || "The latest draft was backed up but not applied. Fix it before confirming.");
@@ -6084,6 +6188,7 @@ function resetPlanningBoard() {
 async function resetDispatchAfterOrderDataClear() {
   clearTimeout(saveTimer);
   clearTimeout(remoteRefreshTimer);
+  clearTimeout(orderPoolRefreshTimer);
   dispatchStorageRemove(DISPATCH_PLAN_KEY);
   currentPlan = null;
   lastSavedAt = "";
@@ -6270,25 +6375,22 @@ async function pollServerPlan() {
   }
 }
 
-function queueRemoteRefresh(reason = "Plan updated from another screen.", { reloadOrders = true } = {}) {
-  window.clearTimeout(remoteRefreshTimer);
-  remoteRefreshTimer = window.setTimeout(async () => {
+function queueDispatchOrderPoolRefresh(reason = "Order data updated.") {
+  window.clearTimeout(orderPoolRefreshTimer);
+  orderPoolRefreshTimer = window.setTimeout(async () => {
     try {
-      if (reloadOrders) await loadDispatchOrders();
-      const applied = await restoreServerPlan();
-      await loadDriverJobStatuses();
-      if (!reloadOrders) await refreshPlannedAssignments();
+      if (!await loadDispatchOrders()) throw new Error("the order feed request failed");
       if (reason) routeNotice = reason;
-      render({ save: false });
-      if (reloadOrders && modalType === "to-link") {
+      renderDispatchNoticePatch();
+      renderDispatchOrderPoolPatch();
+      if (modalType === "to-link") {
         loadOrderDependencyOptions(orderById(modalOrderId)).catch(() => null);
-      } else if (reloadOrders && modalType === "po-link") {
+      } else if (modalType === "po-link") {
         loadPoAllocationOptions(modalOrderId).catch(() => null);
       }
-      if (applied && reason) routeNotice = reason;
     } catch (error) {
-      routeNotice = `Auto refresh failed: ${error.message}`;
-      render({ save: false });
+      routeNotice = `Order-pool refresh failed: ${error.message}`;
+      renderDispatchNoticePatch();
     }
   }, 350);
 }
@@ -6395,7 +6497,11 @@ function connectEvents() {
       "dispatch.co.updated",
       "receiving.order.received"
     ].includes(event.type)) {
-      queueRemoteRefresh(event.type === "delivery.order.unpacked" ? "Operator unpacked an order. Split can continue." : "Order data updated.");
+      queueDispatchOrderPoolRefresh(
+        event.type === "delivery.order.unpacked"
+          ? "Operator unpacked an order. Split can continue."
+          : "Order data updated."
+      );
     }
   });
   eventSource.onerror = () => {
@@ -6763,6 +6869,45 @@ function estimateForLoad(load) {
   return normalizeRouteEstimateForLoad(load, estimate);
 }
 
+function routeEstimateMatchesMeta(estimate, meta) {
+  if (!estimate || !meta) return false;
+  if (estimate.routeSignature) return String(estimate.routeSignature) === String(meta.signature);
+  return Boolean(estimate.routeEstimateId)
+    && String(estimate.routeEstimateId) === String(meta.id);
+}
+
+function routeEstimateHasCompleteGoogleLegs(stops = [], estimate = null) {
+  if (!Array.isArray(estimate?.legMinutes) || estimate.legMinutes.length !== stops.length - 1) return false;
+  return !estimate.legMinutes.some((minutes, index) => {
+    const value = Number(minutes);
+    return samePhysicalRouteStop(stops[index], stops[index + 1])
+      ? !Number.isFinite(value) || value !== 0
+      : !Number.isFinite(value) || value <= 0;
+  });
+}
+
+function serializableRouteEstimateForLoad(truck, load) {
+  const estimate = estimateForLoad(load);
+  if (!estimate || !load?.id) return null;
+  const stops = mapStopsForLoad(load, truck);
+  if (stops.length <= 1) return null;
+  const meta = routeEstimateMeta(truck, load, stops);
+  if (!routeEstimateMatchesMeta(estimate, meta) || !routeEstimateHasCompleteGoogleLegs(stops, estimate)) return null;
+  return {
+    rawDriveMinutes: Math.max(0, Number(estimate.rawDriveMinutes || 0)),
+    driveMinutes: Math.max(0, Number(estimate.driveMinutes || 0)),
+    stayMinutes: Math.max(0, Number(estimate.stayMinutes || 0)),
+    totalMinutes: Math.max(0, Number(estimate.totalMinutes || 0)),
+    legMinutes: Array.isArray(estimate.legMinutes) ? estimate.legMinutes.map(Number) : [],
+    rawLegMinutes: Array.isArray(estimate.rawLegMinutes) ? estimate.rawLegMinutes.map(Number) : [],
+    allowTolls: Boolean(estimate.allowTolls),
+    travelTimePercent: Number(estimate.travelTimePercent || 0),
+    routeEstimateId: meta.id,
+    routeSignature: meta.signature,
+    source: "google"
+  };
+}
+
 function discardRouteEstimateForLoad(load) {
   if (!load?.id) return;
   delete routeCache[load.id];
@@ -6806,21 +6951,34 @@ function routeStopIsOwnYard(stop = {}) {
 }
 
 function routePendingForLoad(truck, load) {
-  if (!dispatchConfig.googleMapsApiKey || estimateForLoad(load)) return false;
+  if (!dispatchConfig.googleMapsApiKey) return false;
   const stops = mapStopsForLoad(load, effectiveTruckForLoad(truck, load));
   if (stops.length <= 1) return false;
-  return stops.some((stop) => !routeStopIsOwnYard(stop));
+  const hasPhysicalTravel = stops.slice(1).some((stop, index) =>
+    !samePhysicalRouteStop(stops[index], stop)
+  );
+  if (!hasPhysicalTravel) return false;
+  const estimate = estimateForLoad(load);
+  const meta = routeEstimateMeta(truck, load, stops);
+  return !estimate
+    || !routeEstimateMatchesMeta(estimate, meta)
+    || !routeEstimateHasCompleteGoogleLegs(stops, estimate);
 }
 
 function loadFinishText(truck, load, stats = loadStats(truck, load)) {
+  if (routePendingForLoad(truck, load)) return "Route pending";
   const forecast = forecastLoadRecord(load);
   if (forecast?.forecastFinish) return actualTimeText(forecast.forecastFinish);
-  return routePendingForLoad(truck, load) ? "Route pending" : timeText(stats.finish);
+  return timeText(stats.finish);
 }
 
 function loadFinishLabel(load, finishText) {
   if (finishText === "Route pending") return finishText;
   return `Finish ${finishText}`;
+}
+
+function googleRoutePendingTimeHtml() {
+  return `<div class="time-compare route-pending"><span class="time-label">Google</span><span>Route pending</span></div>`;
 }
 
 function fallbackTravelMinutesBetweenStops(truck, previousStop, currentStop, previousOrder, currentOrder) {
@@ -8566,7 +8724,9 @@ function cacheRouteEstimate(truck, load, stops, estimate) {
       rawLegMinutes: Array.isArray(estimate.rawLegMinutes) ? estimate.rawLegMinutes.map(Number) : [],
       allowTolls: Boolean(estimate.allowTolls),
       travelTimePercent: Number(estimate.travelTimePercent || 0),
-      routeEstimateId: meta.id
+      routeEstimateId: meta.id,
+      routeSignature: meta.signature,
+      source: "google"
     }
   };
   persistedRouteEstimateCache[meta.id] = cached;
@@ -8575,11 +8735,23 @@ function cacheRouteEstimate(truck, load, stops, estimate) {
 }
 
 function applyCachedRouteEstimate(truck, load, stops = mapStopsForLoad(load, truck)) {
-  if (!load?.id || estimateForLoad(load)) return false;
+  if (!load?.id) return false;
   const meta = routeEstimateMeta(truck, load, stops);
+  const currentEstimate = estimateForLoad(load);
+  if (routeEstimateMatchesMeta(currentEstimate, meta) && routeEstimateHasCompleteGoogleLegs(stops, currentEstimate)) return false;
   const cached = persistedRouteEstimateCache[meta.id];
-  if (!cached?.estimate || cached.signature !== meta.signature) return false;
-  const estimate = { ...cached.estimate, routeEstimateId: meta.id, fromPersistentCache: true };
+  if (
+    !cached?.estimate
+    || cached.signature !== meta.signature
+    || !routeEstimateHasCompleteGoogleLegs(stops, cached.estimate)
+  ) return false;
+  const estimate = {
+    ...cached.estimate,
+    routeEstimateId: meta.id,
+    routeSignature: meta.signature,
+    source: "google",
+    fromPersistentCache: true
+  };
   routeEstimates[load.id] = estimate;
   return true;
 }
@@ -8596,13 +8768,22 @@ function hydrateCachedRouteEstimates() {
   return changed;
 }
 
-function plannedDepartureDate(startMinutes) {
-  const departure = new Date();
-  departure.setHours(Math.floor(startMinutes / 60), startMinutes % 60, 0, 0);
-  if (departure.getTime() < Date.now() + 5 * 60 * 1000) {
-    departure.setDate(departure.getDate() + 1);
+function plannedDepartureDate(startMinutes, planDate = currentPlanDate, now = new Date()) {
+  const current = now instanceof Date ? new Date(now.getTime()) : new Date(now);
+  const departure = new Date(current.getTime());
+  const dateMatch = String(planDate || "").slice(0, 10).match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (dateMatch) {
+    departure.setFullYear(Number(dateMatch[1]), Number(dateMatch[2]) - 1, Number(dateMatch[3]));
   }
-  return departure;
+  const minute = Number.isFinite(Number(startMinutes)) ? Math.round(Number(startMinutes)) : 0;
+  departure.setHours(Math.floor(minute / 60), minute % 60, 0, 0);
+  const earliestTrafficDeparture = new Date(current.getTime() + (5 * 60 * 1000));
+  // Google does not accept a historic traffic departure. For a same-day leg
+  // that is already due (for example an in-progress empty reposition), use
+  // current traffic instead of silently asking for the same clock time tomorrow.
+  return departure.getTime() < earliestTrafficDeparture.getTime()
+    ? earliestTrafficDeparture
+    : departure;
 }
 
 function mapMarkerIcon(stop) {
@@ -8733,7 +8914,71 @@ async function geocodeMarkerStops(markerStops = []) {
   }));
 }
 
+function mapMarkerLogicalStops(load, markerStop = {}) {
+  const sourceStops = markerStop.sourceStops?.length ? markerStop.sourceStops : [markerStop];
+  const sourceStopIds = new Set(sourceStops.flatMap((sourceStop) =>
+    sourceStop.sourceStopIds?.length
+      ? sourceStop.sourceStopIds.map(String)
+      : sourceStop.stopId ? [String(sourceStop.stopId)] : []
+  ));
+  if (sourceStopIds.size) {
+    return (load?.stops || []).filter((stop) => sourceStopIds.has(String(stop.id || "")));
+  }
+  const orderIds = new Set(sourceStops.flatMap((sourceStop) =>
+    sourceStop.orderIds?.length
+      ? sourceStop.orderIds.map(String)
+      : sourceStop.orderId ? [String(sourceStop.orderId)] : []
+  ));
+  return (load?.stops || []).filter((stop) => orderIds.has(String(stop.orderId || "")));
+}
+
+function mapMarkerOrderEntries(load, markerStop = {}) {
+  const entries = [];
+  const seen = new Set();
+  for (const logicalStop of mapMarkerLogicalStops(load, markerStop)) {
+    const pickupLocation = logicalStop.type === "pick" ? logicalStop.location : "";
+    const markerOrders = pickupLocation
+      ? pickupOrdersForStop(load, logicalStop)
+      : [stopOrder(logicalStop)].filter(Boolean);
+    for (const order of markerOrders) {
+      const key = `${logicalStop.type}:${logicalStop.id || ""}:${order.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      entries.push({ order, stop: logicalStop, pickupLocation });
+    }
+  }
+  return entries;
+}
+
+function mapMarkerInfoWindowHtml(load, markerStop = {}) {
+  const entries = mapMarkerOrderEntries(load, markerStop);
+  const orderRefs = [...new Set(entries.map((entry) => entry.order.id).filter(Boolean))];
+  const details = entries.map((entry) => tooltipItemRowsForOrder(entry.order, {
+    pickupLocation: entry.pickupLocation,
+    stop: entry.pickupLocation ? null : entry.stop,
+    includeOrderHeader: true
+  })).join("");
+  return `
+    <strong>${escapeHtml(markerStop.title)}</strong><br>
+    ${markerStop.type === "pick" ? "Pickup" : "Drop off"}
+    ${orderRefs.length ? `<br>${orderRefs.length} order${orderRefs.length === 1 ? "" : "s"}: ${escapeHtml(orderRefs.join(" + "))}` : ""}
+    <br>Stay ${Number(markerStop.stayMinutes || 0)} min
+    ${details ? `<div class="tooltip-items">${details}</div>` : ""}
+  `;
+}
+
+function googleLegDurationSeconds(leg) {
+  return Number((leg?.duration_in_traffic || leg?.duration)?.value);
+}
+
+function googleLegsResolvePhysicalRoute(stops = [], legs = []) {
+  if (legs.length !== Math.max(0, stops.length - 1)) return false;
+  return legs.every((leg, index) => samePhysicalRouteStop(stops[index], stops[index + 1])
+    || (Number.isFinite(googleLegDurationSeconds(leg)) && googleLegDurationSeconds(leg) > 0));
+}
+
 function routeEstimateFromGoogleLegs(load, stops, legs = [], truck = {}) {
+  if (!googleLegsResolvePhysicalRoute(stops, legs)) return null;
   truck = effectiveTruckForLoad(findLoad(load?.id).truck || truck, load);
   const rawLegMinutes = legs.map((leg, index) => {
     const from = stops[index];
@@ -8756,6 +9001,10 @@ function routeEstimateFromGoogleLegs(load, stops, legs = [], truck = {}) {
     allowTolls: Boolean(load?.allowTolls),
     travelTimePercent: truckTravelTimePercent(truck)
   };
+  const meta = routeEstimateMeta(truck, load, stops);
+  estimate.routeEstimateId = meta.id;
+  estimate.routeSignature = meta.signature;
+  estimate.source = "google";
   routeEstimates[load.id] = estimate;
   cacheRouteEstimate(truck, load, stops, estimate);
   return estimate;
@@ -8770,10 +9019,58 @@ function directionsRequestForLoad(truck, load, stops, meta = routeEstimateMeta(t
     avoidTolls: !meta.allowTolls,
     optimizeWaypoints: false,
     drivingOptions: {
-      departureTime: plannedDepartureDate(meta.loadStart),
+      departureTime: plannedDepartureDate(meta.loadStart + Number(stops[0]?.stayMinutes || 0)),
       trafficModel: google.maps.TrafficModel.BEST_GUESS
     }
   };
+}
+
+function directionsRequestForLeg(load, from, to, departureTime) {
+  return {
+    origin: stopRouteLocation(from),
+    destination: stopRouteLocation(to),
+    travelMode: google.maps.TravelMode.DRIVING,
+    avoidTolls: !Boolean(load?.allowTolls),
+    optimizeWaypoints: false,
+    drivingOptions: {
+      departureTime,
+      trafficModel: google.maps.TrafficModel.BEST_GUESS
+    }
+  };
+}
+
+function requestGoogleDirections(request) {
+  const directionsService = new google.maps.DirectionsService();
+  return new Promise((resolve) => {
+    directionsService.route(request, (result, status) => resolve({ result, status }));
+  });
+}
+
+async function trafficAwareGoogleLegs(load, stops, fullLegs = [], meta = routeEstimateMeta(findLoad(load?.id).truck, load, stops)) {
+  const physicalLegIndexes = stops.slice(0, -1)
+    .map((from, index) => ({ from, to: stops[index + 1], index }))
+    .filter(({ from, to }) => !samePhysicalRouteStop(from, to));
+  const needsSeparateLegs = fullLegs.length !== stops.length - 1
+    || physicalLegIndexes.some(({ index }) => !fullLegs[index]?.duration_in_traffic?.value);
+  if (!needsSeparateLegs) return fullLegs;
+
+  const trafficLegs = [];
+  let departureTime = plannedDepartureDate(meta.loadStart + Number(stops[0]?.stayMinutes || 0));
+  for (let index = 0; index < stops.length - 1; index += 1) {
+    const from = stops[index];
+    const to = stops[index + 1];
+    let leg = fullLegs[index];
+    if (!samePhysicalRouteStop(from, to)) {
+      const response = await requestGoogleDirections(directionsRequestForLeg(load, from, to, departureTime));
+      leg = response.status === "OK" && response.result?.routes?.[0]?.legs?.[0]
+        ? response.result.routes[0].legs[0]
+        : leg;
+    }
+    trafficLegs.push(leg || null);
+    const seconds = Math.max(0, Number(googleLegDurationSeconds(leg) || 0));
+    departureTime = new Date(departureTime.getTime() + (seconds * 1000) + (Number(to?.stayMinutes || 0) * 60000));
+  }
+  return trafficLegs;
 }
 
 function googleRouteForLoad(truck, load) {
@@ -8785,29 +9082,42 @@ function googleRouteForLoad(truck, load) {
   const meta = routeEstimateMeta(truck, load, stops);
   const cached = routeCache[load.id];
   if (cached?.signature === meta.signature && cached.result) {
-    const legs = cached.result.routes?.[0]?.legs || [];
-    const estimate = routeEstimateFromGoogleLegs(load, stops, legs, truck);
-    return Promise.resolve({ source: "memory-cache", stops, result: cached.result, markerStops: cached.markerStops || stops, estimate });
+    const legs = cached.trafficLegs || cached.result.routes?.[0]?.legs || [];
+    if (googleLegsResolvePhysicalRoute(stops, legs)) {
+      const estimate = routeEstimateFromGoogleLegs(load, stops, legs, truck);
+      return Promise.resolve({ source: "memory-cache", stops, result: cached.result, markerStops: cached.markerStops || stops, estimate });
+    }
+    discardRouteEstimateForLoad(load);
   }
   if (backgroundRouteInFlight.has(meta.id)) return Promise.resolve(null);
   backgroundRouteInFlight.add(meta.id);
-  const directionsService = new google.maps.DirectionsService();
   return new Promise((resolve) => {
-    directionsService.route(directionsRequestForLoad(truck, load, stops, meta), (result, status) => {
-      backgroundRouteInFlight.delete(meta.id);
-      if (status !== "OK" || !result) return resolve({ source: "google-error", status, stops });
-      const legs = result.routes?.[0]?.legs || [];
+    requestGoogleDirections(directionsRequestForLoad(truck, load, stops, meta)).then(async ({ result, status }) => {
+      if (status !== "OK" || !result) {
+        const separateLegs = await trafficAwareGoogleLegs(load, stops, [], meta);
+        if (!googleLegsResolvePhysicalRoute(stops, separateLegs)) {
+          return resolve({ source: "google-error", status, stops });
+        }
+        const estimate = routeEstimateFromGoogleLegs(load, stops, separateLegs, truck);
+        return resolve({ source: "google-per-leg", status, stops, estimate });
+      }
+      const fullLegs = result.routes?.[0]?.legs || [];
+      const legs = await trafficAwareGoogleLegs(load, stops, fullLegs, meta);
+      if (!googleLegsResolvePhysicalRoute(stops, legs)) {
+        return resolve({ source: "google-error", status: "INCOMPLETE_GOOGLE_LEGS", stops });
+      }
       const routeMarkerStops = stops.map((stop, index) => {
         if (typeof stop.routeLocation !== "string") return stop;
         const routePoint = index === 0
-          ? legs[0]?.start_location
-          : legs[index - 1]?.end_location;
+          ? fullLegs[0]?.start_location
+          : fullLegs[index - 1]?.end_location;
         return routePoint ? { ...stop, lat: routePoint.lat(), lng: routePoint.lng() } : stop;
       });
       const estimate = routeEstimateFromGoogleLegs(load, stops, legs, truck);
-      routeCache[load.id] = { signature: meta.signature, result, markerStops: routeMarkerStops };
+      routeCache[load.id] = { signature: meta.signature, result, trafficLegs: legs, markerStops: routeMarkerStops };
       resolve({ source: "google", status, stops, result, markerStops: routeMarkerStops, estimate });
-    });
+    }).catch((error) => resolve({ source: "google-error", status: error?.message || "ERROR", stops }))
+      .finally(() => backgroundRouteInFlight.delete(meta.id));
   });
 }
 
@@ -8832,16 +9142,20 @@ function routeEstimateChangesVisibleTiming(previousEstimate, estimate) {
 async function renderGoogleMapPreview() {
   const canvas = document.getElementById("googleMapPreview");
   if (!canvas) return;
+  const selected = selectedLoad();
+  const load = selected.load;
+  if (!load) return;
+  const truck = effectiveTruckForLoad(selected.truck, load);
+  const stops = mapStopsForLoad(load, truck);
+  const meta = routeEstimateMeta(truck, load, stops);
+  canvas.dataset.dispatchLoadId = String(load.id || "");
+  canvas.dataset.dispatchRouteSignature = meta.signature;
   const available = await loadGoogleMaps();
+  if (canvas !== document.getElementById("googleMapPreview")) return;
   if (!available || !window.google?.maps) {
     canvas.innerHTML = dispatchConfig.googleMapsApiKey ? "Google Maps could not load." : "Add GOOGLE_MAPS_API_KEY to enable Google Maps.";
     return;
   }
-  const selected = selectedLoad();
-  const load = selected.load;
-  const truck = effectiveTruckForLoad(selected.truck, load);
-  const stops = mapStopsForLoad(load, truck);
-  const meta = routeEstimateMeta(truck, load, stops);
   const allowTolls = meta.allowTolls;
   const map = new google.maps.Map(canvas, {
     center: stops[0] || MAP_CENTER,
@@ -8861,7 +9175,7 @@ async function renderGoogleMapPreview() {
         title: stop.title
       });
       const info = new google.maps.InfoWindow({
-        content: `<strong>${escapeHtml(stop.title)}</strong><br>${stop.type === "pick" ? "Pickup" : "Drop off"}${stop.orderIds?.length > 1 ? `<br>${stop.orderIds.length} orders at one physical stop` : ""}<br>Stay ${Number(stop.stayMinutes || 0)} min`
+        content: mapMarkerInfoWindowHtml(load, stop)
       });
       marker.addListener("click", () => info.open({ anchor: marker, map }));
       marker.addListener("mouseover", () => info.open({ anchor: marker, map }));
@@ -8883,58 +9197,78 @@ async function renderGoogleMapPreview() {
     });
     const cached = routeCache[load.id];
     if (cached?.signature === meta.signature && cached.result) {
-      directionsRenderer.setDirections(cached.result);
-      drawStopMarkers(cached.markerStops || stops);
-      const legs = cached.result.routes?.[0]?.legs || [];
-      const previousEstimate = routeEstimates[load.id];
-      const estimate = routeEstimateFromGoogleLegs(load, stops, legs, truck);
-      if (routeSummary) {
-        routeSummary.innerHTML = routeEstimateSummaryHtml(estimate, truck, " | cached route");
+      const legs = cached.trafficLegs || cached.result.routes?.[0]?.legs || [];
+      if (googleLegsResolvePhysicalRoute(stops, legs)) {
+        directionsRenderer.setDirections(cached.result);
+        drawStopMarkers(cached.markerStops || stops);
+        const previousEstimate = routeEstimates[load.id];
+        const estimate = routeEstimateFromGoogleLegs(load, stops, legs, truck);
+        if (routeSummary) {
+          routeSummary.innerHTML = routeEstimateSummaryHtml(estimate, truck, " | cached route");
+        }
+        if (
+          selectedLoadId === load.id
+          && routeEstimateChangesVisibleTiming(previousEstimate, estimate)
+        ) {
+          setTimeout(() => render({ save: false }), 0);
+        }
+        return;
       }
-      if (
-        selectedLoadId === load.id
-        && routeEstimateChangesVisibleTiming(previousEstimate, estimate)
-      ) {
-        setTimeout(() => render({ save: false }), 0);
-      }
-      return;
+      discardRouteEstimateForLoad(load);
     }
-    const directionsService = new google.maps.DirectionsService();
-    directionsService.route(directionsRequestForLoad(truck, load, stops, meta), (result, status) => {
+    requestGoogleDirections(directionsRequestForLoad(truck, load, stops, meta)).then(async ({ result, status }) => {
       if (status !== "OK" || !result) {
-        if (routeSummary) routeSummary.textContent = `Google route unavailable (${status}).`;
-        geocodeMarkerStops(stops).then((markerStops) => {
-          drawStopMarkers(markerStops);
-          new google.maps.Polyline({
-            path: markerStops.map((stop) => ({ lat: stop.lat, lng: stop.lng })),
-            geodesic: true,
-            strokeColor: "#006f6b",
-            strokeOpacity: 0.55,
-            strokeWeight: 4,
-            map
-          });
+        const separateLegs = await trafficAwareGoogleLegs(load, stops, [], meta);
+        const resolved = googleLegsResolvePhysicalRoute(stops, separateLegs);
+        const previousEstimate = routeEstimates[load.id];
+        const estimate = resolved ? routeEstimateFromGoogleLegs(load, stops, separateLegs, truck) : null;
+        if (routeSummary) {
+          routeSummary.innerHTML = estimate
+            ? routeEstimateSummaryHtml(estimate, truck, " | separate Google legs")
+            : `Google route unavailable (${escapeHtml(status)}). Plan timing remains pending.`;
+        }
+        const markerStops = await geocodeMarkerStops(stops);
+        drawStopMarkers(markerStops);
+        new google.maps.Polyline({
+          path: markerStops.map((stop) => ({ lat: stop.lat, lng: stop.lng })),
+          geodesic: true,
+          strokeColor: "#006f6b",
+          strokeOpacity: 0.55,
+          strokeWeight: 4,
+          map
         });
+        if (estimate && selectedLoadId === load.id && routeEstimateChangesVisibleTiming(previousEstimate, estimate)) {
+          setTimeout(() => render({ save: false }), 0);
+        }
         return;
       }
       directionsRenderer.setDirections(result);
-      const legs = result.routes?.[0]?.legs || [];
+      const fullLegs = result.routes?.[0]?.legs || [];
+      const legs = await trafficAwareGoogleLegs(load, stops, fullLegs, meta);
+      if (!googleLegsResolvePhysicalRoute(stops, legs)) {
+        if (routeSummary) routeSummary.textContent = "Google route incomplete. Plan timing remains pending.";
+        drawStopMarkers(await geocodeMarkerStops(stops));
+        return;
+      }
       const routeMarkerStops = stops.map((stop, index) => {
         if (typeof stop.routeLocation !== "string") return stop;
         const routePoint = index === 0
-          ? legs[0]?.start_location
-          : legs[index - 1]?.end_location;
+          ? fullLegs[0]?.start_location
+          : fullLegs[index - 1]?.end_location;
         return routePoint ? { ...stop, lat: routePoint.lat(), lng: routePoint.lng() } : stop;
       });
       drawStopMarkers(routeMarkerStops);
       const previousEstimate = routeEstimates[load.id];
       const estimate = routeEstimateFromGoogleLegs(load, stops, legs, truck);
-      routeCache[load.id] = { signature: meta.signature, result, markerStops: routeMarkerStops };
+      routeCache[load.id] = { signature: meta.signature, result, trafficLegs: legs, markerStops: routeMarkerStops };
       if (routeSummary) {
         routeSummary.innerHTML = routeEstimateSummaryHtml(estimate, truck);
       }
       if (selectedLoadId === load.id && routeEstimateChangesVisibleTiming(previousEstimate, estimate)) {
         setTimeout(() => render({ save: false }), 0);
       }
+    }).catch((error) => {
+      if (routeSummary) routeSummary.textContent = `Google route unavailable (${error?.message || "ERROR"}).`;
     });
   } else if (stops.length > 1) {
     const markerStops = await geocodeMarkerStops(stops);
@@ -8976,29 +9310,58 @@ function scheduleBackgroundRouteEstimates() {
 }
 
 async function runBackgroundRouteEstimates() {
-  if (backgroundRoutesRunning || !dispatchConfig.googleMapsApiKey) return;
+  if (backgroundRoutesRunning) return backgroundRouteRunPromise;
+  if (!dispatchConfig.googleMapsApiKey) return null;
   const candidates = routeLoadsNeedingEstimate();
-  if (!candidates.length) return;
+  if (!candidates.length) return { attempted: 0, failed: [] };
   backgroundRoutesRunning = true;
-  try {
-    const available = await loadGoogleMaps();
-    if (!available || !window.google?.maps?.DirectionsService) return;
-    for (const candidate of candidates) {
-      const latest = findLoad(candidate.load.id);
-      if (!latest.truck || !latest.load) continue;
-      const previousEstimate = estimateForLoad(latest.load);
-      const result = await googleRouteForLoad(latest.truck, latest.load);
-      if (routeEstimateChangesVisibleTiming(previousEstimate, result?.estimate)) {
-        backgroundRouteRenderQueued = true;
+  backgroundRouteRunPromise = (async () => {
+    const failed = [];
+    try {
+      const available = await loadGoogleMaps();
+      if (!available || !window.google?.maps?.DirectionsService) {
+        return { attempted: 0, failed: candidates.map((candidate) => ({ loadId: candidate.load.id, status: "MAPS_UNAVAILABLE" })) };
+      }
+      for (const candidate of candidates) {
+        const latest = findLoad(candidate.load.id);
+        if (!latest.truck || !latest.load) continue;
+        // An earlier load can change this load's inherited departure while the
+        // queue is running. Re-check the exact route identity before calling
+        // Google so a now-valid downstream estimate is not replaced needlessly.
+        if (!routePendingForLoad(latest.truck, latest.load)) continue;
+        const previousEstimate = estimateForLoad(latest.load);
+        const result = await googleRouteForLoad(latest.truck, latest.load);
+        if (!result?.estimate) failed.push({ loadId: latest.load.id, status: result?.status || "NO_RESULT" });
+        if (routeEstimateChangesVisibleTiming(previousEstimate, result?.estimate)) {
+          backgroundRouteRenderQueued = true;
+        }
+      }
+      return { attempted: candidates.length, failed };
+    } finally {
+      backgroundRoutesRunning = false;
+      backgroundRouteRunPromise = null;
+      if (backgroundRouteRenderQueued) {
+        backgroundRouteRenderQueued = false;
+        render({ save: false });
       }
     }
-  } finally {
-    backgroundRoutesRunning = false;
-    if (backgroundRouteRenderQueued) {
-      backgroundRouteRenderQueued = false;
-      render({ save: false });
-    }
-  }
+  })();
+  return backgroundRouteRunPromise;
+}
+
+async function ensureGoogleRouteEstimatesBeforeSave(action = "save") {
+  if (!dispatchConfig.googleMapsApiKey) return;
+  await runBackgroundRouteEstimates();
+  const unresolved = routeLoadsNeedingEstimate();
+  if (!unresolved.length) return;
+  const labels = unresolved.slice(0, 4).map(({ truck, load }) =>
+    `${loadTruckPlate(truck, load) || truck?.plate || "Truck"} ${load.name || load.id}`
+  );
+  const suffix = unresolved.length > labels.length ? ` and ${unresolved.length - labels.length} more` : "";
+  const retryAction = action === "confirm" ? "confirm" : "save";
+  const error = new Error(`Google travel time is still unavailable for ${labels.join(", ")}${suffix}. Wait for routing to finish, then ${retryAction} again.`);
+  error.code = "DISPATCH_GOOGLE_ROUTE_PENDING";
+  throw error;
 }
 
 function planBadgeText() {
@@ -9035,8 +9398,8 @@ function historicalDispatchModeNoticeHtml() {
     <div class="dispatch-history-mode-notice ${isDispatchHistoryEditMode() ? "active" : ""}">
       <strong>${isDispatchHistoryEditMode() ? "History Edit Mode" : "Historical plan"}</strong>
       <span>${isDispatchHistoryEditMode()
-        ? "Reconciliation-complete PO/TO orders can be added to this past date. Orders completed in Driver PWA cannot be replanned."
-        : "Enter History Edit to add reconciliation-complete PO/TO orders. Driver PWA-completed orders remain locked."}</span>
+        ? "Search to add reconciliation-complete orders to this past date. Orders completed in Driver PWA cannot be replanned."
+        : "Enter History Edit, then search for reconciliation-complete orders. Driver PWA-completed orders remain locked."}</span>
     </div>
   `;
 }
@@ -9052,6 +9415,18 @@ function cssAttr(value) {
 function selectorForElement(element) {
   if (!element || !app.contains(element)) return "";
   if (element.id) return `#${cssAttr(element.id)}`;
+  if (element.closest("[data-dispatch-load-preview-layer]")) {
+    if (element.classList.contains("load-preview-panel")) {
+      return "[data-dispatch-load-preview-layer] .load-preview-panel";
+    }
+    if (element.classList.contains("load-preview-body")) {
+      return "[data-dispatch-load-preview-layer] .load-preview-body";
+    }
+    if (element.classList.contains("preview-stop-list")) {
+      const loadId = String(element.dataset.load || "");
+      return `[data-dispatch-load-preview-layer] .preview-stop-list${loadId ? `[data-load="${cssAttr(loadId)}"]` : ""}`;
+    }
+  }
   const tag = element.tagName.toLowerCase();
   const attrs = [
     "data-action",
@@ -9093,7 +9468,7 @@ function captureRenderUiState() {
     activeValue: activeEditable && "value" in activeEditable ? activeEditable.value : null,
     activeChecked: activeEditable && "checked" in activeEditable ? Boolean(activeEditable.checked) : null,
     activeText: activeEditable?.isContentEditable ? activeEditable.textContent : null,
-    scrolls: [...app.querySelectorAll(".order-list, .truck-board, .truck-timeline, .date-truck-yard-list, .load-preview-body, .preview-stop-list, .stop-list, .modal-body, .po-link-lines, .order-dependency-match-lines, [data-po-match-scroll]")]
+    scrolls: [...app.querySelectorAll(".order-list, .truck-board, .truck-timeline, .date-truck-yard-list, .load-preview-panel, .load-preview-body, .preview-stop-list, .stop-list, .modal-body, .po-link-lines, .order-dependency-match-lines, [data-po-match-scroll]")]
       .map((element) => ({
         selector: selectorForElement(element) || `.${[...element.classList].join(".")}`,
         top: element.scrollTop,
@@ -9161,9 +9536,57 @@ function renderDispatchRouteNotice() {
     : "";
 }
 
+function renderDriverTruckSwitchAttentionPanel() {
+  if (!driverTruckSwitchAttention.length) return "";
+  return `<div class="truck-switch-attention-panel">
+    ${driverTruckSwitchAttention.map((item) => `<div><span><strong>${escapeHtml(item.driver_login || "Driver")}</strong>: ${escapeHtml(item.from_truck_plate || "previous truck")} to ${escapeHtml(item.to_truck_plate || "new truck")} failed in Samsara. ${escapeHtml(item.samsara_error || "")}</span><button data-action="override-truck-switch" data-job-id="${escapeHtml(item.job_id)}" type="button">Override</button></div>`).join("")}
+  </div>`;
+}
+
+function renderDriverTruckSwitchAttentionPatch() {
+  const region = app.querySelector("[data-dispatch-truck-switch-attention]");
+  if (region) region.innerHTML = renderDriverTruckSwitchAttentionPanel();
+}
+
 function renderDispatchNoticePatch() {
   const region = app.querySelector("[data-dispatch-route-notice]");
   if (region) region.innerHTML = renderDispatchRouteNotice();
+}
+
+function selectedGoogleMapRouteIdentity() {
+  const selected = selectedLoad();
+  if (!selected.load) return { loadId: "", signature: "" };
+  const truck = effectiveTruckForLoad(selected.truck, selected.load);
+  const stops = mapStopsForLoad(selected.load, truck);
+  return {
+    loadId: String(selected.load.id || ""),
+    signature: routeEstimateMeta(truck, selected.load, stops).signature
+  };
+}
+
+function captureGoogleMapPreviewState() {
+  const canvas = document.getElementById("googleMapPreview");
+  if (!canvas) return null;
+  return {
+    canvas,
+    loadId: String(canvas.dataset.dispatchLoadId || ""),
+    signature: String(canvas.dataset.dispatchRouteSignature || "")
+  };
+}
+
+function restoreGoogleMapPreviewState(state) {
+  if (!state?.canvas || !state.loadId || !state.signature) return false;
+  const replacement = app.querySelector("[data-dispatch-load-preview-layer] #googleMapPreview");
+  if (!replacement) return false;
+  let current;
+  try {
+    current = selectedGoogleMapRouteIdentity();
+  } catch {
+    return false;
+  }
+  if (current.loadId !== state.loadId || current.signature !== state.signature) return false;
+  replacement.replaceWith(state.canvas);
+  return true;
 }
 
 function finishTargetedDispatchPopupMutation(payload) {
@@ -9197,6 +9620,7 @@ function renderDispatchSaveStatePatch() {
 function renderDispatchPlannerPatch() {
   const uiSequence = ++renderUiSequence;
   const uiState = captureRenderUiState();
+  const mapState = captureGoogleMapPreviewState();
   const kpi = app.querySelector(".kpi-strip");
   if (kpi) kpi.outerHTML = renderDispatchKpiStrip();
   const board = app.querySelector(".truck-board");
@@ -9205,16 +9629,23 @@ function renderDispatchPlannerPatch() {
     : trucks.map(renderTruck).join("");
   const preview = app.querySelector("[data-dispatch-load-preview-layer]");
   if (preview) preview.innerHTML = renderLoadPreview();
+  const mapPreserved = restoreGoogleMapPreviewState(mapState);
   restoreRenderUiState(uiState, uiSequence);
   renderDispatchSaveStatePatch();
-  renderGoogleMapPreview();
+  if (!mapPreserved) renderGoogleMapPreview();
   scheduleBackgroundRouteEstimates();
+}
+
+function renderDispatchExecutionPatch() {
+  renderDriverTruckSwitchAttentionPatch();
+  renderDispatchPlannerPatch();
 }
 
 function render(options = {}) {
   const { save = false } = options;
   const uiSequence = ++renderUiSequence;
   const uiState = captureRenderUiState();
+  const mapState = captureGoogleMapPreviewState();
   orderListScrollTop = app.querySelector(".order-list")?.scrollTop ?? orderListScrollTop;
   if (save) normalizePlanBeforeSave();
   const planChanged = (!historyReady || save) ? captureUndoPointIfNeeded(save) : false;
@@ -9249,9 +9680,7 @@ function render(options = {}) {
         </div>
       </header>
       <div data-dispatch-route-notice>${renderDispatchRouteNotice()}</div>
-      ${driverTruckSwitchAttention.length ? `<div class="truck-switch-attention-panel">
-        ${driverTruckSwitchAttention.map((item) => `<div><span><strong>${escapeHtml(item.driver_login || "Driver")}</strong>: ${escapeHtml(item.from_truck_plate || "previous truck")} to ${escapeHtml(item.to_truck_plate || "new truck")} failed in Samsara. ${escapeHtml(item.samsara_error || "")}</span><button data-action="override-truck-switch" data-job-id="${escapeHtml(item.job_id)}" type="button">Override</button></div>`).join("")}
-      </div>` : ""}
+      <div data-dispatch-truck-switch-attention>${renderDriverTruckSwitchAttentionPanel()}</div>
       <div class="dispatch-grid">
         ${historicalDispatchModeNoticeHtml()}
         ${renderOrderPool()}
@@ -9269,8 +9698,9 @@ function render(options = {}) {
   renderDispatchModalInPlace();
   const orderList = app.querySelector(".order-list");
   if (orderList) orderList.scrollTop = orderListScrollTop;
+  const mapPreserved = restoreGoogleMapPreviewState(mapState);
   restoreRenderUiState(uiState, uiSequence);
-  renderGoogleMapPreview();
+  if (!mapPreserved) renderGoogleMapPreview();
   scheduleBackgroundRouteEstimates();
 }
 
@@ -9281,7 +9711,7 @@ function orderPoolSubtitle() {
     return "Current ready contract legs; later legs stay locked in the contract timeline.";
   }
   if (isDispatchHistoryEditMode() && !searchText.trim()) {
-    return "Historical order list includes reconciliation-complete PO/TO orders; Driver PWA-completed orders stay locked.";
+    return "Search to find reconciliation-complete historical orders; Driver PWA-completed orders stay locked.";
   }
   if (!searchText.trim()) return activeOrderType === "TO" ? "Transfer and Custom Order list" : orderTypeLabel(activeOrderType) + " list";
   if (orderSearchLoading) return "Searching all valid SO, PO, TO, Custom, and CO orders...";
@@ -9814,7 +10244,7 @@ function renderSwitchApproachTravelStop(truck, load, stats) {
         <strong>Travel ${escapeHtml(travel.from)} to ${escapeHtml(travel.to)}</strong>
         <span>Reposition to the truck switch yard</span>
       </div>
-      <div class="stop-time">${timingSummaryHtml({
+      <div class="stop-time">${routePendingForLoad(truck, load) ? googleRoutePendingTimeHtml() : timingSummaryHtml({
         status: executionStatus,
         startLabel: "LV",
         endLabel: "Arr",
@@ -9900,7 +10330,7 @@ function renderStartTravelStop(truck, load, startTravel, start) {
         <strong>Travel ${escapeHtml(startTravel.from)} to ${escapeHtml(startTravel.to)}</strong>
         <span>Empty truck reposition</span>
       </div>
-      <div class="stop-time">${timingSummaryHtml({
+      <div class="stop-time">${routePendingForLoad(truck, load) ? googleRoutePendingTimeHtml() : timingSummaryHtml({
         status: executionStatus,
         startLabel: "LV",
         endLabel: "Arr",
@@ -10007,13 +10437,15 @@ function renderInterStopTravelCard(load, previousVisit, nextVisit, pairIndex, { 
   const from = leg?.from || previousVisit.address || previousEntry.order.id;
   const to = leg?.to || nextVisit.address || nextEntry.order.id;
   const className = preview ? "preview-stop" : "stop-card compact";
+  const found = findLoad(load.id);
+  const googlePending = found.load ? routePendingForLoad(found.truck, found.load) : false;
   return `
     <article class="${className} travel travel-stop inter-stop-travel status-${escapeHtml(status)}" draggable="false" data-travel-leg="${escapeHtml(leg?.legId || `${load.id}-inter-${pairIndex}`)}" data-execution-status="${escapeHtml(status)}">
       <div class="stop-main">
         <strong>${escapeHtml(titlePrefix)} | ${escapeHtml(from)} to ${escapeHtml(to)}</strong>
         <span>Inter-stop travel</span>
       </div>
-      <div class="stop-time">${timingSummaryHtml({
+      <div class="stop-time">${googlePending ? googleRoutePendingTimeHtml() : timingSummaryHtml({
         status,
         startLabel: "LV",
         endLabel: "Arr",
@@ -10500,7 +10932,7 @@ function renderPreviewSwitchApproachTravelStop(truck, load, stats, displayOffset
         <strong>${displayOffset + 1}. Travel | ${escapeHtml(travel.from)} to ${escapeHtml(travel.to)}</strong>
         <span>Reposition to the truck switch yard</span>
       </div>
-      <div class="stop-time">${timingSummaryHtml({
+      <div class="stop-time">${routePendingForLoad(truck, load) ? googleRoutePendingTimeHtml() : timingSummaryHtml({
         status: executionStatus,
         startLabel: "LV",
         endLabel: "Arr",
@@ -10528,7 +10960,7 @@ function renderPreviewStartTravelStop(truck, load, startTravel, start, displayOf
         <strong>${displayOffset + 1}. Travel | ${escapeHtml(startTravel.from)} to ${escapeHtml(startTravel.to)}</strong>
         <span>Empty truck reposition</span>
       </div>
-      <div class="stop-time">${timingSummaryHtml({
+      <div class="stop-time">${routePendingForLoad(truck, load) ? googleRoutePendingTimeHtml() : timingSummaryHtml({
         status: executionStatus,
         startLabel: "LV",
         endLabel: "Arr",
@@ -11057,6 +11489,332 @@ function renderPoLinkModal(order) {
   `;
 }
 
+function dispatchDeliveryInstructionContentUrl(media) {
+  const base = String(media?.contentUrl || `/api/delivery-instruction-media/${encodeURIComponent(media?.id || "")}/content`);
+  return dispatchAuthToken
+    ? `${base}${base.includes("?") ? "&" : "?"}token=${encodeURIComponent(dispatchAuthToken)}`
+    : base;
+}
+
+function renderDispatchDeliveryInstructionMedia(media, editable) {
+  const url = dispatchDeliveryInstructionContentUrl(media);
+  const preview = media.mediaKind === "video"
+    ? `<video controls preload="metadata" referrerpolicy="no-referrer" src="${escapeHtml(url)}"></video>`
+    : `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer"><img loading="lazy" referrerpolicy="no-referrer" src="${escapeHtml(url)}" alt="${escapeHtml(media.fileName || "Instruction image")}" /></a>`;
+  return `<article class="delivery-instruction-media">
+    ${preview}
+    <small title="${escapeHtml(media.fileName || "")}">${escapeHtml(media.fileName || "Instruction file")}</small>
+    <small>${Number(media.byteSize || 0) >= 1024 * 1024 ? `${(Number(media.byteSize) / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(Number(media.byteSize || 0) / 1024))} KB`}${media.onlineOnly ? " · Online video" : ""}</small>
+    ${editable ? `<div class="delivery-instruction-actions">
+      <button data-action="replace-delivery-instruction-media" data-media-id="${escapeHtml(media.id)}" type="button">Replace</button>
+      <button class="danger" data-action="delete-delivery-instruction-media" data-media-id="${escapeHtml(media.id)}" type="button">Delete</button>
+    </div>` : ""}
+  </article>`;
+}
+
+function renderDispatchDeliveryInstructionEditor(order) {
+  const availableTargets = deliveryInstructionOrderTargets(order);
+  if (!availableTargets.length) return "";
+  const stateMatches = deliveryInstructionEditorState.orderId === String(order.id);
+  const detail = stateMatches ? deliveryInstructionEditorState.detail : null;
+  if (!stateMatches || deliveryInstructionEditorState.loading) {
+    return `<section class="dispatch-delivery-instruction-editor" data-delivery-instruction-editor><div class="delivery-instruction-empty">Loading delivery instructions…</div></section>`;
+  }
+  if (!detail) {
+    return `<section class="dispatch-delivery-instruction-editor" data-delivery-instruction-editor>
+      <div class="delivery-instruction-notice error">${escapeHtml(deliveryInstructionEditorState.error || "Delivery instructions could not be loaded.")}</div>
+      <div class="delivery-instruction-actions"><button data-action="reload-delivery-instructions" type="button">Retry</button></div>
+    </section>`;
+  }
+  const editable = detail.editable && !deliveryInstructionEditorState.saving;
+  const phones = Array.isArray(detail.automatic?.phones) ? detail.automatic.phones : [];
+  const media = Array.isArray(detail.media) ? detail.media : [];
+  const mediaUploadEnabled = editable && media.length < 5;
+  const loadedDetails = Array.isArray(deliveryInstructionEditorState.details) ? deliveryInstructionEditorState.details : [];
+  const selectedTarget = deliveryInstructionEditorState.targets.find((target) =>
+    String(target.orderRef || target.id).toUpperCase() === deliveryInstructionEditorState.targetOrderId.toUpperCase()
+  );
+  const groupedOrSplit = availableTargets.length > 1
+    || availableTargets.some((target) => target.memberRefs.some((memberRef) => memberRef !== target.id));
+  return `<section class="dispatch-delivery-instruction-editor" data-delivery-instruction-editor>
+    <div class="delivery-instruction-editor-grid">
+      <div class="delivery-instruction-heading-line"><div><p class="delivery-instruction-muted">Driver PWA · Drop-off only</p><h3>Delivery Instructions</h3></div><span class="delivery-instruction-pill">Revision ${Number(detail.revision || 0)}</span></div>
+      ${deliveryInstructionEditorState.error ? `<div class="delivery-instruction-notice error">${escapeHtml(deliveryInstructionEditorState.error)}</div>` : ""}
+      ${deliveryInstructionEditorState.notice ? `<div class="delivery-instruction-notice">${escapeHtml(deliveryInstructionEditorState.notice)}</div>` : ""}
+      ${loadedDetails.length > 1 ? `<label class="delivery-instruction-order-target">
+        <span>Sales Order instruction</span>
+        <select data-delivery-instruction-order ${deliveryInstructionEditorState.saving ? "disabled" : ""}>
+          ${loadedDetails.map((candidate) => `<option value="${escapeHtml(candidate.orderRef)}" ${candidate.orderRef === deliveryInstructionEditorState.targetOrderId ? "selected" : ""}>${escapeHtml(candidate.orderRef)}${candidate.customer ? ` · ${escapeHtml(candidate.customer)}` : ""}</option>`).join("")}
+        </select>
+      </label>` : ""}
+      ${groupedOrSplit ? `<div class="delivery-instruction-notice">${availableTargets.length > 1
+        ? `This dispatch group contains ${availableTargets.length} Sales Orders.${loadedDetails.length > 1 ? " Choose the SO above;" : ""} Each instruction remains with its original SO through grouping, ungrouping, splitting, and unsplitting.`
+        : `This split dispatch card uses the instruction for original Sales Order ${escapeHtml(selectedTarget?.id || detail.orderRef)}. It remains available before and after splitting.`}</div>` : ""}
+      ${detail.editable ? "" : `<div class="delivery-instruction-notice">${escapeHtml(detail.lockReason || "This completed order is read-only.")}</div>`}
+      <section class="delivery-instruction-section">
+        <h3>NetSuite memo instruction</h3>
+        <p class="delivery-instruction-muted">Read-only. Planned address and date/time are omitted when confidently identified.</p>
+        <p class="delivery-instruction-automatic">${escapeHtml(detail.automatic?.text || "No memo delivery instruction.")}</p>
+        ${phones.length ? `<div class="delivery-instruction-phone-list">${phones.map((phone) => `<a href="tel:${escapeHtml(phone.href)}">☎ ${escapeHtml(phone.display)}</a>`).join("")}</div>` : ""}
+      </section>
+      <section class="delivery-instruction-section">
+        <h3>Additional delivery text</h3>
+        <textarea id="dispatchDeliveryInstructionText" maxlength="5000" ${editable ? "" : "disabled"} placeholder="Add call-ahead, gate, placement, access, or other driver instructions">${escapeHtml(detail.additionalText || "")}</textarea>
+        <div class="delivery-instruction-actions"><button class="primary" data-action="save-delivery-instruction" type="button" ${editable ? "" : "disabled"}>${deliveryInstructionEditorState.saving ? "Saving…" : "Save instruction text"}</button></div>
+      </section>
+      <section class="delivery-instruction-section">
+        <div class="delivery-instruction-heading-line"><h3>Images and videos</h3><span class="delivery-instruction-pill">${media.length}/5</span></div>
+        <p class="delivery-instruction-muted">Images are validated and compressed to a maximum 720p JPEG; videos remain original. Up to 25 MB per source file.</p>
+        <div class="delivery-instruction-gallery">${media.map((item) => renderDispatchDeliveryInstructionMedia(item, editable)).join("") || `<p class="delivery-instruction-muted">No instruction media uploaded.</p>`}</div>
+        <div class="delivery-instruction-upload-zone ${mediaUploadEnabled ? "" : "disabled"}" data-delivery-instruction-drop-zone data-disabled="${mediaUploadEnabled ? "false" : "true"}">
+          <div><strong>Drop images or videos here</strong><span>Images become smaller 720p JPEG files before upload.</span></div>
+          <label class="delivery-instruction-file-button primary ${mediaUploadEnabled ? "" : "disabled"}">Browse files
+            <input id="dispatchDeliveryInstructionFiles" type="file" multiple accept="image/jpeg,image/png,image/webp,image/heic,image/heif,video/mp4,video/quicktime,video/webm,.jpg,.jpeg,.png,.webp,.heic,.heif,.mp4,.mov,.webm" ${mediaUploadEnabled ? "" : "disabled"} />
+          </label>
+        </div>
+      </section>
+    </div>
+  </section>`;
+}
+
+function patchDeliveryInstructionEditor() {
+  if (modalType !== "edit-order") return;
+  const order = orderById(modalOrderId);
+  const current = app.querySelector("[data-delivery-instruction-editor]");
+  if (!order || !current) return;
+  current.outerHTML = renderDispatchDeliveryInstructionEditor(order);
+}
+
+function resetDeliveryInstructionEditor() {
+  deliveryInstructionEditorState = {
+    orderId: "",
+    targetOrderId: "",
+    targets: [],
+    details: [],
+    detail: null,
+    loading: false,
+    saving: false,
+    error: "",
+    notice: "",
+    generation: deliveryInstructionEditorState.generation + 1
+  };
+}
+
+async function loadDeliveryInstructionEditor(order = orderById(modalOrderId)) {
+  if (!order) return;
+  const targets = deliveryInstructionOrderTargets(order);
+  if (!targets.length) return;
+  const previousTargetOrderId = deliveryInstructionEditorState.orderId === String(order.id)
+    ? deliveryInstructionEditorState.targetOrderId
+    : "";
+  const generation = ++deliveryInstructionEditorState.generation;
+  deliveryInstructionEditorState = {
+    ...deliveryInstructionEditorState,
+    orderId: String(order.id),
+    targetOrderId: previousTargetOrderId,
+    targets,
+    details: [],
+    detail: null,
+    loading: true,
+    saving: false,
+    error: "",
+    notice: "",
+    generation
+  };
+  patchDeliveryInstructionEditor();
+  try {
+    const results = await Promise.all(targets.map(async (target) => {
+      try {
+        const response = await fetch(`/api/dispatch/orders/${encodeURIComponent(target.id)}/delivery-instructions`, { cache: "no-store" });
+        if (!response.ok) throw new Error(await dispatchErrorMessage(response));
+        return { target, detail: await response.json(), error: "" };
+      } catch (error) {
+        return { target, detail: null, error: error.message };
+      }
+    }));
+    if (generation !== deliveryInstructionEditorState.generation || modalType !== "edit-order" || String(modalOrderId) !== String(order.id)) return;
+    const loaded = results.filter((result) => result.detail);
+    const failed = results.filter((result) => !result.detail);
+    if (!loaded.length) throw new Error(failed[0]?.error || "Delivery instructions could not be loaded.");
+    const selected = loaded.find((result) =>
+      [result.target.id, result.detail.orderRef].some((value) => String(value || "").toUpperCase() === previousTargetOrderId.toUpperCase())
+    ) || loaded[0];
+    deliveryInstructionEditorState.targets = results.map((result) => ({
+      ...result.target,
+      orderRef: result.detail?.orderRef || result.target.id
+    }));
+    deliveryInstructionEditorState.details = loaded.map((result) => result.detail);
+    deliveryInstructionEditorState.targetOrderId = String(selected.detail.orderRef || selected.target.id);
+    deliveryInstructionEditorState.detail = selected.detail;
+    if (failed.length) {
+      deliveryInstructionEditorState.error = `Could not load ${failed.map((result) => result.target.id).join(", ")}. Retry to refresh all Sales Orders.`;
+    }
+  } catch (error) {
+    if (generation === deliveryInstructionEditorState.generation) deliveryInstructionEditorState.error = error.message;
+  } finally {
+    if (generation === deliveryInstructionEditorState.generation) {
+      deliveryInstructionEditorState.loading = false;
+      patchDeliveryInstructionEditor();
+    }
+  }
+}
+
+function deliveryInstructionEditorTargetOrderId(state = deliveryInstructionEditorState) {
+  return String(state.targetOrderId || state.detail?.orderRef || "").trim();
+}
+
+function setDeliveryInstructionEditorDetail(detail) {
+  const state = deliveryInstructionEditorState;
+  const targetOrderId = deliveryInstructionEditorTargetOrderId(state);
+  const targetKey = targetOrderId.toUpperCase();
+  state.detail = detail;
+  state.details = (state.details || []).map((candidate) =>
+    [candidate?.orderRef, candidate?.orderId].some((value) => String(value || "").toUpperCase() === targetKey) ? detail : candidate
+  );
+}
+
+async function saveDeliveryInstructionEditor() {
+  const state = deliveryInstructionEditorState;
+  const detail = state.detail;
+  const targetOrderId = deliveryInstructionEditorTargetOrderId(state);
+  const text = app.querySelector("#dispatchDeliveryInstructionText")?.value || "";
+  if (!detail?.editable || !targetOrderId || state.saving) return;
+  state.saving = true;
+  state.error = "";
+  state.notice = "";
+  patchDeliveryInstructionEditor();
+  try {
+    const response = await fetch(`/api/dispatch/orders/${encodeURIComponent(targetOrderId)}/delivery-instructions`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedRevision: detail.revision, additionalText: text })
+    });
+    if (!response.ok) throw new Error(await dispatchErrorMessage(response));
+    setDeliveryInstructionEditorDetail(await response.json());
+    state.notice = "Delivery instruction saved. Driver content will refresh without changing this dispatch plan.";
+  } catch (error) {
+    state.error = error.message;
+    if (/changed in another session|read-only|completed/i.test(error.message)) {
+      state.saving = false;
+      await loadDeliveryInstructionEditor(orderById(state.orderId));
+      return;
+    }
+  } finally {
+    state.saving = false;
+    patchDeliveryInstructionEditor();
+  }
+}
+
+async function uploadDeliveryInstructionEditorFiles(fileList, { replaceMediaId = "" } = {}) {
+  const state = deliveryInstructionEditorState;
+  const targetOrderId = deliveryInstructionEditorTargetOrderId(state);
+  const sourceFiles = [...(fileList || [])];
+  if (!state.detail?.editable || !targetOrderId || state.saving || !sourceFiles.length) return;
+  const replacing = String(replaceMediaId || "");
+  const remaining = 5 - (state.detail.media?.length || 0) + (replacing ? 1 : 0);
+  if ((replacing && sourceFiles.length !== 1) || sourceFiles.length > remaining) {
+    state.error = "A Sales Order can contain no more than five instruction files.";
+    patchDeliveryInstructionEditor();
+    return;
+  }
+  state.saving = true;
+  state.error = "";
+  state.notice = "Validating and compressing images…";
+  patchDeliveryInstructionEditor();
+  try {
+    if (!window.DeliveryInstructionUpload) throw new Error("The image preparation tool did not load. Refresh this page and try again.");
+    const files = await window.DeliveryInstructionUpload.prepareFiles(sourceFiles);
+    let current = state.detail;
+    for (const file of files) {
+      const ticketResponse = await fetch(`/api/dispatch/orders/${encodeURIComponent(targetOrderId)}/delivery-instructions/media-ticket`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          expectedRevision: current.revision,
+          mimeType: file.type,
+          byteSize: file.size,
+          fileName: file.name,
+          ...(replacing ? { replaceMediaId: replacing } : {})
+        })
+      });
+      if (!ticketResponse.ok) throw new Error(await dispatchErrorMessage(ticketResponse));
+      const ticket = await ticketResponse.json();
+      const formData = new FormData();
+      formData.append("file", file, file.name);
+      const uploadResponse = await fetch(ticket.upload.uploadUrl, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${ticket.upload.token}` },
+        body: formData
+      });
+      const uploadText = await uploadResponse.text();
+      let uploadPayload = null;
+      try { uploadPayload = uploadText ? JSON.parse(uploadText) : null; } catch { uploadPayload = null; }
+      if (!uploadResponse.ok || !uploadPayload?.key) throw new Error(uploadPayload?.error || uploadText || "Instruction media upload failed.");
+      const registerResponse = await fetch(`/api/dispatch/orders/${encodeURIComponent(targetOrderId)}/delivery-instructions/media`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          uploadId: ticket.uploadId,
+          objectReference: `r2://${uploadPayload.key}`,
+          mimeType: file.type,
+          byteSize: file.size,
+          fileName: file.name,
+          expectedRevision: current.revision
+        })
+      });
+      if (!registerResponse.ok) throw new Error(await dispatchErrorMessage(registerResponse));
+      current = await registerResponse.json();
+    }
+    setDeliveryInstructionEditorDetail(current);
+    state.notice = replacing
+      ? "Instruction media replaced. The dispatch plan was not changed."
+      : "Instruction media uploaded. Images were compressed to 720p JPEG. The dispatch plan was not changed.";
+  } catch (error) {
+    state.error = error.message;
+  } finally {
+    state.saving = false;
+    patchDeliveryInstructionEditor();
+  }
+}
+
+function chooseDeliveryInstructionEditorReplacement(mediaId) {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = "image/jpeg,image/png,image/webp,image/heic,image/heif,video/mp4,video/quicktime,video/webm,.jpg,.jpeg,.png,.webp,.heic,.heif,.mp4,.mov,.webm";
+  input.hidden = true;
+  input.addEventListener("change", () => {
+    const files = input.files;
+    input.remove();
+    if (files?.length) uploadDeliveryInstructionEditorFiles(files, { replaceMediaId: mediaId });
+  }, { once: true });
+  document.body.append(input);
+  input.click();
+}
+
+async function deleteDeliveryInstructionEditorMedia(mediaId) {
+  const state = deliveryInstructionEditorState;
+  const targetOrderId = deliveryInstructionEditorTargetOrderId(state);
+  if (!state.detail?.editable || !targetOrderId || state.saving || !window.confirm("Delete this instruction file?")) return;
+  state.saving = true;
+  state.error = "";
+  patchDeliveryInstructionEditor();
+  try {
+    const response = await fetch(`/api/dispatch/orders/${encodeURIComponent(targetOrderId)}/delivery-instructions/media/${encodeURIComponent(mediaId)}`, {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedRevision: state.detail.revision })
+    });
+    if (!response.ok) throw new Error(await dispatchErrorMessage(response));
+    setDeliveryInstructionEditorDetail(await response.json());
+    state.notice = "Instruction media deleted.";
+  } catch (error) {
+    state.error = error.message;
+  } finally {
+    state.saving = false;
+    patchDeliveryInstructionEditor();
+  }
+}
+
 function renderModal() {
   if (!modalType) return "";
   if (modalType === "plan-history") {
@@ -11092,9 +11850,10 @@ function renderModal() {
   const order = orderById(modalOrderId) || selectedOrder();
   if (!order) return "";
   if (modalType === "edit-order") {
+    const deliveryInstructionEditor = renderDispatchDeliveryInstructionEditor(order);
     return `
       <div class="modal-backdrop show">
-        <section class="dispatch-modal wide-modal">
+        <section class="dispatch-modal edit-order-modal">
           <div class="modal-header">
             <div>
               <h2>Edit Dispatch Info</h2>
@@ -11102,35 +11861,38 @@ function renderModal() {
             </div>
             <button data-action="close-modal" type="button">Close</button>
           </div>
-          <form class="modal-body" data-form="edit-order-details">
-            <label class="split-field">
-              <span>Expected date</span>
-              <input name="expectedDeliveryDate" type="date" value="${escapeHtml(order.expectedDeliveryDate || "")}" />
-            </label>
-            <label class="split-field">
-              <span>Delivery address</span>
-              <input name="address" value="${escapeHtml(order.address || "")}" placeholder="Address" required />
-            </label>
-            <label class="split-field">
-              <span>Pickup address override <small>(optional)</small></span>
-              <input name="pickupAddress" value="${escapeHtml(order.pickupAddressOverride || "")}" placeholder="Leave blank to use the mapped pickup location" />
-            </label>
-            <div class="split-row">
+          <form class="modal-body edit-order-workspace ${deliveryInstructionEditor ? "has-delivery-instructions" : ""}" data-form="edit-order-details">
+            <section class="edit-order-planning-pane" aria-label="Dispatch planning details">
               <label class="split-field">
-                <span>Start time</span>
-                <input name="windowStart" value="${escapeHtml(modalTimeValue(order.windowStart))}" placeholder="0700" inputmode="numeric" maxlength="4" />
+                <span>Expected date</span>
+                <input name="expectedDeliveryDate" type="date" value="${escapeHtml(order.expectedDeliveryDate || "")}" />
               </label>
               <label class="split-field">
-                <span>End time</span>
-                <input name="windowEnd" value="${escapeHtml(modalTimeValue(order.windowEnd))}" placeholder="1900" inputmode="numeric" maxlength="4" />
+                <span>Delivery address</span>
+                <input name="address" value="${escapeHtml(order.address || "")}" placeholder="Address" required />
               </label>
-            </div>
-            ${supportsTransitCoForOrder(order) ? renderTransitCoEditor(order) : ""}
-            <div class="modal-status" data-edit-status></div>
-            <div class="modal-footer">
-              <button data-action="close-modal" type="button">Cancel</button>
-              <button class="primary" type="submit">Save Dispatch Info</button>
-            </div>
+              <label class="split-field">
+                <span>Pickup address override <small>(optional)</small></span>
+                <input name="pickupAddress" value="${escapeHtml(order.pickupAddressOverride || "")}" placeholder="Leave blank to use the mapped pickup location" />
+              </label>
+              <div class="split-row edit-order-time-row">
+                <label class="split-field">
+                  <span>Start time</span>
+                  <input name="windowStart" value="${escapeHtml(modalTimeValue(order.windowStart))}" placeholder="0700" inputmode="numeric" maxlength="4" />
+                </label>
+                <label class="split-field">
+                  <span>End time</span>
+                  <input name="windowEnd" value="${escapeHtml(modalTimeValue(order.windowEnd))}" placeholder="1900" inputmode="numeric" maxlength="4" />
+                </label>
+              </div>
+              ${supportsTransitCoForOrder(order) ? renderTransitCoEditor(order) : ""}
+              <div class="modal-status" data-edit-status></div>
+              <div class="modal-footer">
+                <button data-action="close-modal" type="button">Cancel</button>
+                <button class="primary" type="submit">Save Dispatch Info</button>
+              </div>
+            </section>
+            ${deliveryInstructionEditor ? `<aside class="edit-order-instruction-pane" aria-label="Sales Order delivery instructions">${deliveryInstructionEditor}</aside>` : ""}
           </form>
         </section>
       </div>
@@ -11427,16 +12189,30 @@ function renderRegistrationForm() {
   `;
 }
 
+function googleMapsLocationForStop(stop = {}) {
+  const routeLocation = stop.routeLocation || stop.address || null;
+  if (typeof routeLocation === "string" && routeLocation.trim()) return routeLocation.trim();
+  const lat = Number(routeLocation?.lat ?? stop.lat);
+  const lng = Number(routeLocation?.lng ?? stop.lng);
+  return Number.isFinite(lat) && Number.isFinite(lng) ? `${lat},${lng}` : "";
+}
+
 function googleMapsUrl() {
-  const { load } = selectedLoad();
-  const stops = (load?.stops || []).map(stopOrder).filter(Boolean);
-  const destination = stops[stops.length - 1]?.address || "3445 Mavis Rd, Mississauga";
-  const waypoints = stops.slice(0, -1).map((order) => order.address).join("|");
+  const { truck, load } = selectedLoad();
+  const locations = load && truck
+    ? mapStopsForLoad(load, truck).map(googleMapsLocationForStop).filter(Boolean)
+    : [];
+  if (!locations.length) return "https://www.google.com/maps";
+  if (locations.length === 1) {
+    return `https://www.google.com/maps/search/?${new URLSearchParams({ api: "1", query: locations[0] }).toString()}`;
+  }
   const params = new URLSearchParams({
     api: "1",
-    origin: "3445 Mavis Rd, Mississauga",
-    destination
+    origin: locations[0],
+    destination: locations.at(-1),
+    travelmode: "driving"
   });
+  const waypoints = locations.slice(1, -1).join("|");
   if (waypoints) params.set("waypoints", waypoints);
   return `https://www.google.com/maps/dir/?${params.toString()}`;
 }
@@ -12720,6 +13496,15 @@ window.addEventListener("keydown", (event) => {
 });
 
 app.addEventListener("dragover", (event) => {
+  const instructionZone = event.target.closest("[data-delivery-instruction-drop-zone]");
+  if (instructionZone && window.DeliveryInstructionUpload?.isFileDrag(event)) {
+    event.preventDefault();
+    if (instructionZone.dataset.disabled !== "true") {
+      event.dataTransfer.dropEffect = "copy";
+      instructionZone.classList.add("drag-over");
+    }
+    return;
+  }
   if (dragged?.type === "mbt-front-leg") {
     const targetLoad = event.target.closest("[data-load-card]");
     if (!targetLoad) return;
@@ -12764,6 +13549,8 @@ app.addEventListener("dragover", (event) => {
 });
 
 app.addEventListener("dragleave", (event) => {
+  const instructionZone = event.target.closest("[data-delivery-instruction-drop-zone]");
+  if (instructionZone && !instructionZone.contains(event.relatedTarget)) instructionZone.classList.remove("drag-over");
   event.target.closest("[data-load-card]")?.classList.remove("mbt-bin-drag-over");
   event.target.closest("[data-po-map-po]")?.classList.remove("drag-over");
   event.target.closest(".stop-list, .preview-stop-list")?.classList.remove("drag-over");
@@ -12774,6 +13561,13 @@ app.addEventListener("dragleave", (event) => {
 });
 
 app.addEventListener("drop", (event) => {
+  const instructionZone = event.target.closest("[data-delivery-instruction-drop-zone]");
+  if (instructionZone && window.DeliveryInstructionUpload?.isFileDrag(event)) {
+    event.preventDefault();
+    instructionZone.classList.remove("drag-over");
+    if (instructionZone.dataset.disabled !== "true") uploadDeliveryInstructionEditorFiles(event.dataTransfer.files);
+    return;
+  }
   if (!ensureDispatchPlanEditor()) {
     event.preventDefault();
     return;
@@ -12981,6 +13775,7 @@ app.addEventListener("click", (event) => {
     orderDependencyOptions = null;
     orderDependencyLoading = false;
     orderDependencyError = "";
+    resetDeliveryInstructionEditor();
     renderDispatchModalInPlace();
     return;
   }
@@ -13019,6 +13814,22 @@ app.addEventListener("click", (event) => {
   if (!button) return;
   const action = button.dataset.action;
   if (!action) return;
+  if (action === "reload-delivery-instructions") {
+    loadDeliveryInstructionEditor(orderById(modalOrderId));
+    return;
+  }
+  if (action === "save-delivery-instruction") {
+    saveDeliveryInstructionEditor();
+    return;
+  }
+  if (action === "replace-delivery-instruction-media") {
+    chooseDeliveryInstructionEditorReplacement(button.dataset.mediaId);
+    return;
+  }
+  if (action === "delete-delivery-instruction-media") {
+    deleteDeliveryInstructionEditorMedia(button.dataset.mediaId);
+    return;
+  }
   if (action === "assign-mbt-bin-front-leg") {
     const visitId = String(button.dataset.mbtAssignVisitId || "");
     const card = mbtBinFrontLeg(visitId);
@@ -13804,7 +14615,9 @@ app.addEventListener("dblclick", (event) => {
   modalType = "edit-order";
   modalOrderId = order.id;
   orderDependencyOptions = null;
+  resetDeliveryInstructionEditor();
   render({ save: false });
+  loadDeliveryInstructionEditor(order).catch(() => null);
 });
 
 app.addEventListener("input", (event) => {
@@ -13902,6 +14715,21 @@ app.addEventListener("keydown", (event) => {
 });
 
 app.addEventListener("change", (event) => {
+  if (event.target?.dataset?.deliveryInstructionOrder !== undefined) {
+    if (deliveryInstructionEditorState.saving) return;
+    const targetOrderId = String(event.target.value || "").trim();
+    const detail = deliveryInstructionEditorState.details.find((candidate) => String(candidate?.orderRef || "") === targetOrderId);
+    if (!detail) return;
+    deliveryInstructionEditorState.targetOrderId = targetOrderId;
+    deliveryInstructionEditorState.detail = detail;
+    deliveryInstructionEditorState.notice = "";
+    patchDeliveryInstructionEditor();
+    return;
+  }
+  if (event.target?.id === "dispatchDeliveryInstructionFiles") {
+    uploadDeliveryInstructionEditorFiles(event.target.files);
+    return;
+  }
   if (event.target?.dataset?.mbtLoadChoice !== undefined) {
     const visitId = String(event.target.dataset.mbtLoadChoice || "");
     const selectedLoadId = String(event.target.value || "");
@@ -14275,6 +15103,7 @@ function showOrderTooltip(event) {
   const isDropStop = stop?.type === "drop";
   const dropItems = isDropStop ? dropItemsForStop(order, stop).filter(itemHasQuantity) : [];
   const pickupOrders = pickupLocation && foundStop?.load ? pickupOrdersForStop(foundStop.load, stop) : [];
+  let visitEntries = [];
   let timingHtml = "";
   if (foundStop?.truck && foundStop?.load && stop) {
     const stats = loadStats(foundStop.truck, foundStop.load);
@@ -14282,6 +15111,7 @@ function showOrderTooltip(event) {
     const entries = visit?.entries?.length
       ? visit.entries
       : [{ stop, order, row: stats.rows[foundStop.index] || null, index: foundStop.index }];
+    visitEntries = entries;
     const firstEntry = entries[0];
     const lastEntry = entries[entries.length - 1];
     const timing = previewVisitTiming({ entries });
@@ -14316,24 +15146,51 @@ function showOrderTooltip(event) {
       })}
     `;
   }
+  const consolidatedDropEntries = isDropStop
+    ? (visitEntries.length ? visitEntries : [{ stop, order }]).filter((entry) => entry.order && entry.stop)
+    : [];
+  const consolidatedDropRefs = [...new Set(consolidatedDropEntries.map((entry) => entry.order.id).filter(Boolean))];
+  const isConsolidatedDrop = consolidatedDropEntries.length > 1;
   const itemRows = pickupOrders.length
     ? pickupOrders.map((pickupOrder) => tooltipItemRowsForOrder(pickupOrder, { pickupLocation, includeOrderHeader: true })).join("")
-    : tooltipItemRowsForOrder(order, { pickupLocation, stop });
+    : isConsolidatedDrop
+      ? consolidatedDropEntries.map((entry) => tooltipItemRowsForOrder(entry.order, {
+          stop: entry.stop,
+          includeOrderHeader: true
+        })).join("")
+      : tooltipItemRowsForOrder(order, { pickupLocation, stop });
   const poPickupAddress = !pickupLocation && !isDropStop && order.type === "PO" && order.sourceAddress
     ? `<span>Pickup address: ${escapeHtml(order.sourceAddress)}</span>`
     : "";
   const tooltipTitle = pickupLocation
     ? `Pickup | ${escapeHtml(pickupStopLabel(stop, pickupOrders[0] || order))}`
     : isDropStop
-      ? `${escapeHtml(dropStopLabel(stop, order))} | ${escapeHtml(order.customer)}`
+      ? isConsolidatedDrop
+        ? `${escapeHtml(dropStopLabel(stop, order))} | ${escapeHtml(consolidatedDropRefs.join(" + "))}`
+        : `${escapeHtml(dropStopLabel(stop, order))} | ${escapeHtml(order.customer)}`
       : `${escapeHtml(order.id)} | ${escapeHtml(order.customer)}`;
   const tooltipAddress = pickupLocation
     ? stopAddress(stop, pickupOrders[0] || order)
     : isDropStop
       ? stopAddress(stop, order)
       : order.address;
+  const consolidatedDropLineCount = consolidatedDropEntries.reduce(
+    (sum, entry) => sum + dropItemsForStop(entry.order, entry.stop).filter(itemHasQuantity).length,
+    0
+  );
   const dropSummary = isDropStop
-    ? `${order.expectedDeliveryDate ? `${displayDate(order.expectedDeliveryDate)} | ` : ""}${dropItems.length} line${dropItems.length === 1 ? "" : "s"} | ${dropUnitText(order, stop)} | ${dropFootprintPallets(order, stop)} pos | ${formatLbs(dropWeightLbs(order, stop))} | ${order.windowStart || "--"}-${order.windowEnd || "--"}`
+    ? isConsolidatedDrop
+      ? `${consolidatedDropRefs.length} orders | ${consolidatedDropLineCount} lines | ${consolidatedDropEntries.reduce((sum, entry) => sum + dropFootprintPallets(entry.order, entry.stop), 0)} pos | ${formatLbs(consolidatedDropEntries.reduce((sum, entry) => sum + dropWeightLbs(entry.order, entry.stop), 0))}`
+      : `${order.expectedDeliveryDate ? `${displayDate(order.expectedDeliveryDate)} | ` : ""}${dropItems.length} line${dropItems.length === 1 ? "" : "s"} | ${dropUnitText(order, stop)} | ${dropFootprintPallets(order, stop)} pos | ${formatLbs(dropWeightLbs(order, stop))} | ${order.windowStart || "--"}-${order.windowEnd || "--"}`
+    : "";
+  const consolidatedDropDetails = isConsolidatedDrop
+    ? consolidatedDropEntries.map((entry) => `
+        <div>
+          <b>${escapeHtml(entry.order.id)} | ${escapeHtml(entry.order.customer || movementText(entry.order) || "")}</b>
+          <span>${entry.order.expectedDeliveryDate ? `${displayDate(entry.order.expectedDeliveryDate)} | ` : ""}${escapeHtml(dropUnitText(entry.order, entry.stop))} | ${entry.order.windowStart || "--"}-${entry.order.windowEnd || "--"}</span>
+          ${entry.order.notes ? `<span>${escapeHtml(entry.order.notes)}</span>` : ""}
+        </div>
+      `).join("")
     : "";
   tooltip.innerHTML = `
     <strong>${tooltipTitle}</strong>
@@ -14346,8 +15203,9 @@ function showOrderTooltip(event) {
     ${!pickupLocation && order.consolidation ? `<span>Consolidate ${order.consolidation.shortageQty} from ${order.consolidation.sourceYard} to ${order.consolidation.targetYard}</span>` : ""}
     ${!pickupLocation && order.transitCo ? `<span>Requires ${order.transitCo.id}: ${order.transitCo.fromYard} to ${order.transitCo.toYard}</span>` : ""}
     ${!pickupLocation && order.type === "CO" ? `<span>Local CO for ${escapeHtml(order.sourceOrderId || order.relatedSoId || "")}</span>` : ""}
-    ${!pickupLocation ? `<span>${escapeHtml(order.notes)}</span>` : ""}
+    ${!pickupLocation && !isConsolidatedDrop ? `<span>${escapeHtml(order.notes)}</span>` : ""}
     ${timingHtml}
+    ${consolidatedDropDetails ? `<div class="tooltip-items">${consolidatedDropDetails}</div>` : ""}
     ${itemRows ? `<div class="tooltip-items">${itemRows}</div>` : ""}
   `;
 }

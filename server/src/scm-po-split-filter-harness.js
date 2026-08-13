@@ -114,7 +114,7 @@ assert.match(page, /dispatch-scm\.js\?v=20260723-po-type-filters-v1/);
 assert.match(repository, /FROM dispatch_scm_po_splits s[\s\S]*?WHERE s\.status = 'active'/);
 assert.match(repository, /const splitByRef = new Map\(splitRows\.rows\.map/);
 assert.match(repository, /isScmSplit: true/);
-assert.match(repository, /orders = orders\.filter\(\(order\) => scmPurchaseOrderListKind\(order\) !== "vrma"\)/);
+assert.match(repository, /let orders = listedOrders\.filter\(\(order\) => scmPurchaseOrderListKind\(order\) !== "vrma"\)/);
 
 console.log(JSON.stringify({
   ok: true,

@@ -1,0 +1,12 @@
+services:
+  app:
+    image: ${DOS_SOAK_RUNTIME_IMAGE:?Set DOS_SOAK_RUNTIME_IMAGE to an immutable repository@sha256 reference}
+  e2e:
+    image: ${DOS_SOAK_E2E_IMAGE:?Set DOS_SOAK_E2E_IMAGE to an immutable repository@sha256 reference}
+    command: ["npm", "run", "test:driver-offline-stress:soak"]
+    environment:
+      DOS_SOAK_RUN_ID: ${DOS_SOAK_RUN_ID:?Set DOS_SOAK_RUN_ID for the release soak}
+      DOS_SOAK_SEGMENT_MINUTES: ${DOS_SOAK_SEGMENT_MINUTES:-90}
+      DOS_SOAK_RUNTIME_IMAGE: ${DOS_SOAK_RUNTIME_IMAGE:?Set DOS_SOAK_RUNTIME_IMAGE to an immutable repository@sha256 reference}
+      DOS_SOAK_E2E_IMAGE: ${DOS_SOAK_E2E_IMAGE:?Set DOS_SOAK_E2E_IMAGE to an immutable repository@sha256 reference}
+    restart: "no"

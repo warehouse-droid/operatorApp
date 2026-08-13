@@ -107,6 +107,6 @@ assert.match(smart, /returnPolicyOverride:\s*null,[\s\S]+expectedReturnPolicyRev
 assert.match(smartCss, /\.smart-return-policy-cell/);
 assert.match(smartCss, /\.smart-return-effective\.approval_required/);
 assert.match(smartHtml, /scm-smart\.css\?v=20260801-blanket-ui-v2/);
-assert.match(smartHtml, /scm-smart\.js\?v=20260801-focus-preservation-v1/);
+assert.match(smartHtml, /scm-smart\.js\?v=20260811-blanket-filters-v1/);
 
 console.log("Return portal UI harness passed.");

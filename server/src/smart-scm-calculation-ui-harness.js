@@ -30,6 +30,7 @@ const proposalContext = vm.createContext({
   smartEscape,
   smartPill: () => "",
   smartCoverageEvidence: () => "",
+  smartProposalManualPriority: () => 1,
   smartScmApp: { addEventListener() {} },
   smartApi: async () => ({}),
   smartWork: async (_label, action) => action(),

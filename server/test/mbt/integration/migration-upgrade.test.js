@@ -339,6 +339,18 @@ test("F06/F16: schema-101 upgrade preserves representative legacy records and is
     assert.match(firstRunner.stdout, /Applied 143_mbt_item_charge_bases_and_aggregate\.sql/);
     assert.match(firstRunner.stdout, /Applied 144_mbt_mbbs_billing_address_overrides\.sql/);
     assert.match(firstRunner.stdout, /Applied 145_scm_po_split_active_ref_uniqueness\.sql/);
+    assert.match(firstRunner.stdout, /Applied 146_smart_scm_blanket_load_merge\.sql/);
+    assert.match(firstRunner.stdout, /Applied 147_scm_po_vendor_reference_backfill\.sql/);
+    assert.match(firstRunner.stdout, /Applied 148_scm_po_history_line_financial_backfill\.sql/);
+    assert.match(firstRunner.stdout, /Applied 149_sales_stock_requests\.sql/);
+    assert.match(firstRunner.stdout, /Applied 150_stock_request_closed_status\.sql/);
+    assert.match(firstRunner.stdout, /Applied 151_stock_request_remarks\.sql/);
+    assert.match(firstRunner.stdout, /Applied 152_sales_stock_request_over_availability_gate\.sql/);
+    assert.match(firstRunner.stdout, /Applied 153_driver_camera_device_copy_gate\.sql/);
+    assert.match(firstRunner.stdout, /Applied 154_sales_order_delivery_instructions\.sql/);
+    assert.match(firstRunner.stdout, /Applied 155_delivery_instruction_media_replacement\.sql/);
+    assert.match(firstRunner.stdout, /Applied 156_scm_vendor_item_price\.sql/);
+    assert.match(firstRunner.stdout, /Applied 157_yard_movement_history_indexes\.sql/);
 
     const after = await captureLegacyState(client, ids);
     assert.deepEqual(after, before, "Migrations 102-109 must not rewrite representative schema-101 records.");
@@ -385,10 +397,83 @@ test("F06/F16: schema-101 upgrade preserves representative legacy records and is
          FROM schema_migrations
         ORDER BY filename`
     );
-    assert.equal(receiptsBeforeNoOp.rowCount, 145);
+    const blanketMergeColumns = await client.query(
+      `SELECT column_name
+         FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'scm_smart_proposals'
+          AND column_name = ANY($1::text[])
+        ORDER BY column_name`,
+      [["merged_at", "merged_by", "merged_into_proposal_id"]]
+    );
+    assert.deepEqual(blanketMergeColumns.rows.map((row) => row.column_name), [
+      "merged_at",
+      "merged_by",
+      "merged_into_proposal_id"
+    ]);
+    const deliveryInstructionTables = await client.query(
+      `SELECT table_name
+         FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name = ANY($1::text[])
+        ORDER BY table_name`,
+      [[
+        "sales_order_delivery_instruction_media",
+        "sales_order_delivery_instruction_upload_tickets",
+        "sales_order_delivery_instructions"
+      ]]
+    );
+    assert.deepEqual(deliveryInstructionTables.rows.map((row) => row.table_name), [
+      "sales_order_delivery_instruction_media",
+      "sales_order_delivery_instruction_upload_tickets",
+      "sales_order_delivery_instructions"
+    ]);
+    const replacementColumn = await client.query(
+      `SELECT column_name
+         FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'sales_order_delivery_instruction_upload_tickets'
+          AND column_name = 'replacement_media_id'`
+    );
+    assert.equal(replacementColumn.rowCount, 1);
+
+    const vendorPriceColumns = await client.query(
+      `SELECT column_name
+         FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'scm_netsuite_vendor_item_codes'
+          AND column_name IN ('vendor_price', 'vendor_price_synced_at')
+        ORDER BY column_name`
+    );
+    assert.deepEqual(vendorPriceColumns.rows.map((row) => row.column_name), [
+      "vendor_price",
+      "vendor_price_synced_at"
+    ]);
+
+    const yardMovementIndexes = await client.query(
+      `SELECT indexname
+         FROM pg_indexes
+        WHERE schemaname = 'public'
+          AND indexname = ANY($1::text[])
+        ORDER BY indexname`,
+      [[
+        "idx_driver_job_records_movement_activity",
+        "idx_local_co_receipt_records_movement_activity",
+        "idx_operator_load_records_movement_activity",
+        "idx_receiving_receipt_records_movement_activity"
+      ]]
+    );
+    assert.deepEqual(yardMovementIndexes.rows.map((row) => row.indexname), [
+      "idx_driver_job_records_movement_activity",
+      "idx_local_co_receipt_records_movement_activity",
+      "idx_operator_load_records_movement_activity",
+      "idx_receiving_receipt_records_movement_activity"
+    ]);
+
+    assert.equal(receiptsBeforeNoOp.rowCount, 157);
     assert.equal(
       receiptsBeforeNoOp.rows.at(-1)?.filename,
-      "145_scm_po_split_active_ref_uniqueness.sql"
+      "157_yard_movement_history_indexes.sql"
     );
     assert.deepEqual(
       receiptsBeforeNoOp.rows

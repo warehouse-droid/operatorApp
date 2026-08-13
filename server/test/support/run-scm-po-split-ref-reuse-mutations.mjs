@@ -31,10 +31,12 @@ const MUTANTS = Object.freeze([
   }
 ]);
 
+/** @param {string} value */
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
+/** @param {string} source @param {string} needle */
 function occurrenceCount(source, needle) {
   return source.split(needle).length - 1;
 }

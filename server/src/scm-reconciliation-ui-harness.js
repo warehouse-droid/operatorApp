@@ -23,6 +23,9 @@ includesAll(schedule, [
 
 includesAll(schedule, [
   "scmScheduleNeedsReconciliationReview",
+  "scmScheduleEffectiveStatus",
+  "calculatedStatus",
+  "reconciliationApplicationStatus",
   "scm-reconcile-badge review",
   "scm-reconcile-reason",
   "toggle-review-filter",
@@ -123,7 +126,7 @@ includesAll(css, [
 ], "reconciliation schedule styling");
 
 assert.ok(html.includes("/dispatch.css?v=20260730-column-header-filters-v1"), "Reconciliation CSS cache bust is missing.");
-assert.ok(html.includes("/scm-schedule.js?v=20260801-conjunctive-filters-v1"), "Reconciliation client cache bust is missing.");
+assert.ok(html.includes("/scm-schedule.js?v=20260812-calculated-status-v1"), "Reconciliation client cache bust is missing.");
 
 const payloadStart = schedule.indexOf("function normalizeScmSchedulePayload");
 const payloadEnd = schedule.indexOf("function loadScmSchedulePresetsOnce", payloadStart);
@@ -160,6 +163,7 @@ vm.runInNewContext(
     needsReview: scmScheduleNeedsReconciliationReview(scmScheduleRows[1]),
     reason: scmScheduleReconciliationReason(scmScheduleRows[1]),
     reviewCount: scmScheduleReviewCount(),
+    effectiveStatus: scmScheduleEffectiveStatus({ status: "In Transit", calculatedStatus: "Completed" }),
     history: scmScheduleDisplayRows().map((row) => row.orderRef)
   };`,
   helperContext
@@ -167,6 +171,7 @@ vm.runInNewContext(
 assert.equal(helperContext.result.needsReview, true);
 assert.equal(helperContext.result.reason, "Destination receipt was deleted.");
 assert.equal(helperContext.result.reviewCount, 1);
+assert.equal(helperContext.result.effectiveStatus, "Completed");
 assert.deepEqual([...helperContext.result.history], ["PO-NEW", "PO-OLD", "TO-REVIEW"]);
 
 const reductionStart = schedule.indexOf("function scmSchedulePoSplitRequiresBaselineReduction");

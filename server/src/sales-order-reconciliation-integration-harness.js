@@ -52,13 +52,16 @@ try {
     await query(
       `INSERT INTO sales_order_lines (
          sales_order_id, line_id, item_id, item_name, item_type, quantity, unit,
-         packed_sales_qty, pack_quantity_source, netsuite_active, synced_at
-       ) VALUES ($1, 7001, 25, 'MBBS-Special', 'Assembly', 1088, 'PCs', 12,
+         pallet_qty, layer_qty, packed_sales_qty, pack_quantity_source,
+         netsuite_active, synced_at
+       ) VALUES ($1, 7001, 25, 'MBBS-Special', 'Assembly', 1088, 'PCs', 12, 2, 12,
+                 'netsuite_manual', true, now()),
+                ($1, 7002, 26, 'Delivery Charge', 'Service', 1, 'Each', 0, 0, 0,
                  'sales_only', true, now()),
-                ($1, 7002, 26, 'Delivery Charge', 'Service', 1, 'Each', 0,
-                 'sales_only', true, now()),
-                ($2, 7101, 25, 'MBBS-Special', 'Assembly', 1088, 'PCs', 0,
-                 'sales_only', true, now())`,
+                ($1, 7003, 27, 'Valid Inventory With Sparse Type', 'InvtPart', 5, 'EA', 1, 0, 0,
+                 'netsuite_manual', true, now()),
+                ($2, 7101, 25, 'MBBS-Special', 'Assembly', 1088, 'PCs', 12, 2, 0,
+                 'netsuite_manual', true, now())`,
       [sourceId, splitId]
     );
 
@@ -207,8 +210,10 @@ try {
           unit: "PCs",
           locationId: 15,
           location: "12441",
-          palletQty: 34,
-          toPlt: 32
+          palletQty: 12,
+          layerQty: 2,
+          toPlt: 102.3,
+          toLyr: 12.79
         },
         {
           sourceLineKey: "7002",
@@ -220,6 +225,19 @@ try {
           unit: "Each",
           locationId: 15,
           location: "12441"
+        },
+        {
+          sourceLineKey: "7003",
+          itemId: 27,
+          itemName: "Valid Inventory With Sparse Type",
+          itemType: "",
+          itemTypeText: "",
+          quantity: 5,
+          cumulativeProgressQuantity: 0,
+          unit: "EA",
+          locationId: 15,
+          location: "12441",
+          palletQty: 1
         }
       ]
     };
@@ -254,6 +272,26 @@ try {
         cumulativeProgressQuantity: 0
       }))
     };
+    await assert.rejects(
+      reconcileSalesOrderFromNetSuite({
+        order: { ...queuedAuthoritative, lines: [] },
+        source: "manual",
+        dryRun: false
+      }),
+      /complete authoritative order with item lines/,
+      "An incomplete NetSuite response must fail closed before deactivating source lines."
+    );
+    const afterIncompleteSource = await query(
+      `SELECT count(*) FILTER (WHERE netsuite_active)::int AS active_lines,
+              max(pallet_qty) FILTER (WHERE line_id = 7001) AS pallet_qty,
+              max(layer_qty) FILTER (WHERE line_id = 7001) AS layer_qty
+         FROM sales_order_lines
+        WHERE sales_order_id = $1`,
+      [sourceId]
+    );
+    assert.equal(afterIncompleteSource.rows[0].active_lines, 3);
+    assert.equal(Number(afterIncompleteSource.rows[0].pallet_qty), 12);
+    assert.equal(Number(afterIncompleteSource.rows[0].layer_qty), 2);
     const queued = await reconcileSalesOrderFromNetSuite({
       order: queuedAuthoritative,
       source: "manual",
@@ -278,22 +316,95 @@ try {
       "An exact fully fulfilled SO header must override stale zero line progress.");
     assert.equal(fulfilledHeaderProposal.quantities.remaining, 0);
     const queuedLines = await query(
-      `SELECT line_id, quantity, unit, pallet_qty, pack_quantity_source, netsuite_active
+      `SELECT line_id, quantity, unit, pallet_qty, layer_qty,
+              pack_quantity_source, netsuite_active
          FROM sales_order_lines
         WHERE sales_order_id = $1
         ORDER BY line_id`,
       [sourceId]
     );
-    assert.equal(queuedLines.rows.length, 2);
+    assert.equal(queuedLines.rows.length, 3);
     assert.deepEqual(
       queuedLines.rows.map((line) => [Number(line.line_id), line.netsuite_active]),
-      [[7001, true], [7002, false]],
-      "Delivery Charge must be excluded while the physical SO line remains active."
+      [[7001, true], [7002, true], [7003, true]],
+      "Calculation filtering must never deactivate an authoritative source line, including a valid inventory line with sparse type metadata."
     );
     assert.equal(Number(queuedLines.rows[0].quantity), 1088);
     assert.equal(queuedLines.rows[0].unit, "PCs");
-    assert.equal(Number(queuedLines.rows[0].pallet_qty), 0);
-    assert.equal(queuedLines.rows[0].pack_quantity_source, "sales_only");
+    assert.equal(Number(queuedLines.rows[0].pallet_qty), 12,
+      "SO reconciliation must preserve the authoritative 12 PLT value.");
+    assert.equal(Number(queuedLines.rows[0].layer_qty), 2,
+      "SO reconciliation must preserve the authoritative 2 LYR value.");
+    assert.equal(queuedLines.rows[0].pack_quantity_source, "netsuite_manual");
+    const queuedCalculation = await query(
+      `SELECT state.application_status,
+              state.reconciliation_status,
+              state.ordered_qty,
+              state.fulfilled_qty,
+              state.remaining_qty,
+              count(line.*) FILTER (WHERE line.netsuite_active = true) AS calculated_line_count
+         FROM scm_reconciliation_order_state state
+         LEFT JOIN scm_reconciliation_order_line_state line
+           ON line.order_state_id = state.id
+        WHERE state.order_kind = 'SO'
+          AND state.source_order_netsuite_id = $1
+        GROUP BY state.id`,
+      [sourceId]
+    );
+    assert.equal(queuedCalculation.rows[0].application_status, "Queued");
+    assert.equal(queuedCalculation.rows[0].reconciliation_status, "current");
+    assert.equal(Number(queuedCalculation.rows[0].ordered_qty), 1088);
+    assert.equal(Number(queuedCalculation.rows[0].fulfilled_qty), 0);
+    assert.equal(Number(queuedCalculation.rows[0].remaining_qty), 1088);
+    assert.equal(Number(queuedCalculation.rows[0].calculated_line_count), 1,
+      "Only lines accepted by the calculation policy belong in the separate SO calculation projection.");
+
+    const calculationOnlyCompleted = await reconcileSalesOrderFromNetSuite({
+      order: authoritative,
+      source: "manual",
+      dryRun: false
+    });
+    assert.equal(calculationOnlyCompleted.calculatedApplicationStatus, "Completed");
+    const canonicalAfterCalculation = await query(
+      `SELECT status, status_text, fulfillment_status, operator_status,
+              local_yard_order_status, netsuite_active
+         FROM sales_orders
+        WHERE netsuite_id = $1`,
+      [sourceId]
+    );
+    assert.deepEqual(canonicalAfterCalculation.rows[0], {
+      status: "B",
+      status_text: "Sales Order : Pending Fulfillment",
+      fulfillment_status: "not_fulfilled",
+      operator_status: "open",
+      local_yard_order_status: "Open",
+      netsuite_active: true
+    }, "SO calculation must not write any canonical header field.");
+    const canonicalLinesAfterCalculation = await query(
+      `SELECT line_id, pallet_qty, layer_qty, netsuite_active
+         FROM sales_order_lines
+        WHERE sales_order_id = $1
+        ORDER BY line_id`,
+      [sourceId]
+    );
+    assert.deepEqual(
+      canonicalLinesAfterCalculation.rows.map((line) => [
+        Number(line.line_id), Number(line.pallet_qty), Number(line.layer_qty), line.netsuite_active
+      ]),
+      [[7001, 12, 2, true], [7002, 0, 0, true], [7003, 1, 0, true]],
+      "SO calculation must not rewrite or deactivate canonical source lines."
+    );
+
+    // Model the independent normal NetSuite source-sync phase. Reconciliation
+    // may consume this Billed header, but it must not be the writer that sets it.
+    await query(
+      `UPDATE sales_orders
+          SET status = 'G',
+              status_text = 'Sales Order : Billed',
+              synced_at = now()
+        WHERE netsuite_id = $1`,
+      [sourceId]
+    );
 
     await query(
       `INSERT INTO dispatch_trucks (plate, active)
@@ -386,19 +497,40 @@ try {
     assert.equal(postDriverCleanup.changedPlans.length, 1);
 
     const headers = await query(
-      `SELECT netsuite_id, status, status_text, netsuite_active, fulfillment_status
+      `SELECT netsuite_id, status, status_text, netsuite_active,
+              fulfillment_status, operator_status, local_yard_order_status
          FROM sales_orders
         WHERE netsuite_id = ANY($1::bigint[])
         ORDER BY netsuite_id`,
       [[sourceId, splitId]]
     );
     assert.equal(headers.rows.length, 2);
-    for (const header of headers.rows) {
-      assert.equal(header.status, "G");
-      assert.equal(header.status_text, "Sales Order : Billed");
-      assert.equal(header.netsuite_active, false);
-      assert.equal(header.fulfillment_status, "fulfilled");
-    }
+    const splitHeader = headers.rows.find((header) => Number(header.netsuite_id) === splitId);
+    const sourceHeader = headers.rows.find((header) => Number(header.netsuite_id) === sourceId);
+    assert.equal(sourceHeader.status, "G",
+      "The separate normal source-sync phase must own the NetSuite header.");
+    assert.equal(sourceHeader.status_text, "Sales Order : Billed");
+    assert.equal(sourceHeader.netsuite_active, true);
+    assert.equal(sourceHeader.fulfillment_status, "not_fulfilled",
+      "Calculated fulfillment belongs in reconciliation state, not the canonical source field.");
+    assert.equal(sourceHeader.operator_status, "open");
+    assert.equal(sourceHeader.local_yard_order_status, "Open");
+    assert.equal(splitHeader.status, "B",
+      "A calculation must not rewrite a local split header as if NetSuite returned it.");
+    assert.equal(splitHeader.status_text, "Sales Order : Pending Fulfillment");
+    assert.equal(splitHeader.netsuite_active, true);
+    assert.equal(splitHeader.fulfillment_status, "not_fulfilled");
+    const completedCalculation = await query(
+      `SELECT application_status, ordered_qty, fulfilled_qty, remaining_qty
+         FROM scm_reconciliation_order_state
+        WHERE order_kind = 'SO'
+          AND source_order_netsuite_id = $1`,
+      [sourceId]
+    );
+    assert.equal(completedCalculation.rows[0].application_status, "Completed");
+    assert.equal(Number(completedCalculation.rows[0].ordered_qty), 1088);
+    assert.equal(Number(completedCalculation.rows[0].fulfilled_qty), 1088);
+    assert.equal(Number(completedCalculation.rows[0].remaining_qty), 0);
     assert.equal(await isBilledSalesOrderIdentifier(sourceId), true);
     assert.equal(await isBilledSalesOrderIdentifier(splitRef), true);
     const dispatchOrders = await listDispatchOrders({ type: "SO", search: sourceRef });
@@ -418,21 +550,26 @@ try {
       "Billed SO families must be absent from the operator pool."
     );
     const lines = await query(
-      `SELECT line_id, quantity, unit, pallet_qty, pack_quantity_source, netsuite_active
+      `SELECT line_id, quantity, unit, pallet_qty, layer_qty,
+              pack_quantity_source, netsuite_active
          FROM sales_order_lines
         WHERE sales_order_id = $1
         ORDER BY line_id`,
       [sourceId]
     );
-    assert.equal(lines.rows.length, 2);
+    assert.equal(lines.rows.length, 3);
     const inventoryLine = lines.rows.find((line) => Number(line.line_id) === 7001);
     const deliveryChargeLine = lines.rows.find((line) => Number(line.line_id) === 7002);
+    const sparseInventoryLine = lines.rows.find((line) => Number(line.line_id) === 7003);
     assert.equal(Number(inventoryLine.quantity), 1088);
     assert.equal(inventoryLine.unit, "PCs");
-    assert.equal(Number(inventoryLine.pallet_qty), 0);
-    assert.equal(inventoryLine.pack_quantity_source, "sales_only");
-    assert.equal(inventoryLine.netsuite_active, false);
-    assert.equal(deliveryChargeLine.netsuite_active, false);
+    assert.equal(Number(inventoryLine.pallet_qty), 12);
+    assert.equal(Number(inventoryLine.layer_qty), 2);
+    assert.equal(inventoryLine.pack_quantity_source, "netsuite_manual");
+    assert.equal(inventoryLine.netsuite_active, true);
+    assert.equal(deliveryChargeLine.netsuite_active, true);
+    assert.equal(sparseInventoryLine.netsuite_active, true,
+      "A valid inventory source line excluded from calculation must remain active.");
 
     const currentPlan = await query(
       `SELECT orders, trucks FROM dispatch_plan_snapshots WHERE plan_id = $1`,

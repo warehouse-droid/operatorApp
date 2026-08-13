@@ -847,7 +847,8 @@ function groupedSalesOrderChildRefs(plan = {}) {
 async function groupedSalesOrderChildSnapshots(plan = {}, {
   targetRefs = [],
   reconciliationStatus = "",
-  reconciliationReason = ""
+  reconciliationReason = "",
+  reconciliationApplicationStatus = ""
 } = {}) {
   const refs = groupedSalesOrderChildRefs(plan);
   if (!refs.length) return new Map();
@@ -855,6 +856,9 @@ async function groupedSalesOrderChildSnapshots(plan = {}, {
     `SELECT netsuite_id, tranid, status, status_text, fulfillment_status,
             netsuite_active, operator_status, local_yard_order_status,
             preparing_operator_id,
+            reconciliation_state.application_status AS reconciliation_application_status,
+            reconciliation_state.reconciliation_status AS calculation_reconciliation_status,
+            reconciliation_state.reconciliation_reason AS calculation_reconciliation_reason,
             EXISTS (
               SELECT 1
                 FROM sales_order_lines line
@@ -869,6 +873,9 @@ async function groupedSalesOrderChildSnapshots(plan = {}, {
                  )
             ) AS has_unsubmitted_line_progress
        FROM sales_orders sales_order
+       LEFT JOIN scm_reconciliation_order_state reconciliation_state
+         ON reconciliation_state.order_kind = 'SO'
+        AND reconciliation_state.source_order_netsuite_id = sales_order.netsuite_id
       WHERE upper(tranid) = ANY($1::text[])`,
     [refs]
   );
@@ -877,6 +884,12 @@ async function groupedSalesOrderChildSnapshots(plan = {}, {
     const fulfillmentStatus = String(row.fulfillment_status || "not_fulfilled").trim().toLowerCase();
     const localStatus = String(row.local_yard_order_status || "Open").trim().toLowerCase();
     const operatorStatus = String(row.operator_status || "").trim().toLowerCase();
+    const calculationReconciliationStatus = String(
+      row.calculation_reconciliation_status || ""
+    ).trim().toLowerCase();
+    const calculationReview = ["review", "missing", "error"].includes(
+      calculationReconciliationStatus
+    );
     const activeDraft = !["loaded", "shipped", "fulfilled"].includes(localStatus)
       && fulfillmentStatus !== "fulfilled"
       && (
@@ -895,12 +908,18 @@ async function groupedSalesOrderChildSnapshots(plan = {}, {
       netsuiteActive: row.netsuite_active !== false,
       operatorStatus: row.operator_status || "",
       localYardOrderStatus: row.local_yard_order_status || "Open",
-      reconciliationApplicationStatus: activeDraft ? "Reconcile Review" : "",
-      reconciliationStatus: activeDraft ? "review" : "current",
-      reconciliationBlocked: activeDraft,
+      reconciliationApplicationStatus: activeDraft || calculationReview
+        ? "Reconcile Review"
+        : row.reconciliation_application_status || "",
+      reconciliationStatus: activeDraft || calculationReview
+        ? "review"
+        : calculationReconciliationStatus || "current",
+      reconciliationBlocked: activeDraft || calculationReview,
       reconciliationReason: activeDraft
         ? `Sales Order family reconciliation is blocked by an active operator packing draft on ${row.tranid || ref}.`
-        : "",
+        : calculationReview
+          ? row.calculation_reconciliation_reason || ""
+          : "",
       raw: {
         status: row.status || "",
         status_text: row.status_text || "",
@@ -911,6 +930,7 @@ async function groupedSalesOrderChildSnapshots(plan = {}, {
   }));
   const groupRefs = new Set(refs);
   const normalizedReconciliationStatus = String(reconciliationStatus || "").trim().toLowerCase();
+  const normalizedApplicationStatus = String(reconciliationApplicationStatus || "").trim();
   for (const targetRef of targetRefs) {
     const ref = String(targetRef || "").trim().toUpperCase();
     if (!ref || !groupRefs.has(ref)) continue;
@@ -918,7 +938,9 @@ async function groupedSalesOrderChildSnapshots(plan = {}, {
     const review = ["review", "missing", "error"].includes(normalizedReconciliationStatus);
     snapshots.set(ref, {
       ...snapshot,
-      reconciliationApplicationStatus: review ? "Reconcile Review" : "",
+      reconciliationApplicationStatus: review
+        ? "Reconcile Review"
+        : normalizedApplicationStatus || snapshot.reconciliationApplicationStatus || "",
       reconciliationStatus: normalizedReconciliationStatus || "current",
       reconciliationBlocked: review,
       reconciliationReason: review ? String(reconciliationReason || "").trim() : ""
@@ -933,6 +955,7 @@ export async function reconcileSalesOrderFamilyInDispatchPlans({
   billed = false,
   reconciliationStatus = "current",
   reconciliationReason = "",
+  reconciliationApplicationStatus = "",
   actor = "scm-reconciliation"
 } = {}) {
   const refs = uniqueTextValues([canonicalRef, ...(familyRefs || [])]).map((ref) => ref.toUpperCase());
@@ -995,7 +1018,8 @@ export async function reconcileSalesOrderFamilyInDispatchPlans({
         childSnapshots: await groupedSalesOrderChildSnapshots(originalPlan, {
           targetRefs: refs,
           reconciliationStatus,
-          reconciliationReason
+          reconciliationReason,
+          reconciliationApplicationStatus
         }),
         targetRefs: refs
       });

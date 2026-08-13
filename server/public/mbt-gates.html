@@ -19,8 +19,8 @@
         <span class="mbt-app-mode">Deployment ceiling enforced</span>
       </header>
       <p class="mbt-lead">
-        Control Driver offline operation and local MBT testing modules. Deployment
-        ceilings still apply to MBT capabilities; Driver offline mode is directly Admin-controlled.
+        Control Driver operation, Sales stock-request policy, and local MBT testing modules. Deployment
+        ceilings still apply to MBT capabilities; independent operational gates are directly Admin-controlled.
       </p>
 
       <section class="mbt-status" aria-live="polite" aria-busy="true" data-tone="safe">
@@ -47,7 +47,7 @@
           ></textarea>
         </label>
         <p class="mbt-gate-help">
-          Turning Driver offline mode off requires a live connection for new Driver actions. Previously saved evidence is retained and can still synchronize. Devices already disconnected learn the change when they reconnect. Live customer synchronization and NetSuite posting remain locked.
+          Turning Driver offline mode off requires a live connection for new Driver actions. The Sales over-availability gate affects Sales submission; SCM can intentionally convert full requested demand and the shortage remains visible as a Transfer Order backorder. Live customer synchronization and NetSuite posting remain locked.
         </p>
 
         <div id="gateList" class="mbt-gate-list" aria-live="polite"></div>

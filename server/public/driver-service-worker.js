@@ -1,33 +1,34 @@
 /* global DriverOfflineSync */
 "use strict";
 
-importScripts("/driver-offline-db.js?v=20260808-yard-dependency-v1");
-importScripts("/driver-photo-hash.js?v=20260808-yard-dependency-v1");
-importScripts("/driver-offline-sync.js?v=20260808-yard-dependency-v1");
+importScripts("/driver-offline-db.js?v=20260812-driver-pwa-v3");
+importScripts("/driver-photo-hash.js?v=20260812-driver-pwa-v3");
+importScripts("/driver-offline-sync.js?v=20260812-driver-pwa-v3");
 
-const DRIVER_PWA_CLIENT_VERSION = "2026.08.08.1";
+const DRIVER_PWA_CLIENT_VERSION = "2026.08.12.3";
 const DRIVER_CACHE_PREFIX = "mbbs-driver-shell-";
-const DRIVER_CACHE_NAME = `${DRIVER_CACHE_PREFIX}v20`;
-const DRIVER_REFRESH_CACHE_NAME = `${DRIVER_CACHE_PREFIX}refresh-v20`;
+const DRIVER_CACHE_NAME = `${DRIVER_CACHE_PREFIX}v27`;
+const DRIVER_REFRESH_CACHE_NAME = `${DRIVER_CACHE_PREFIX}refresh-v27`;
 const DRIVER_OFFLINE_MODE_REQUEST = "/__mbbs_driver_offline_mode__";
 const DRIVER_SHELL = [
   "/driver",
   "/driver.html",
-  "/driver.css?v=20260808-yard-dependency-v1",
-  "/i18n.css?v=20260701-i18n-v2",
-  "/i18n.js?v=20260803-bin-pwa-v1",
-  "/driver-offline-db.js?v=20260808-yard-dependency-v1",
-  "/driver-photo-hash.js?v=20260808-yard-dependency-v1",
-  "/driver-offline-photos.js?v=20260808-yard-dependency-v1",
-  "/driver-offline-sync.js?v=20260808-yard-dependency-v1",
-  "/driver-bin-ui.js?v=20260803-bin-pwa-v1",
-  "/driver.js?v=20260808-yard-dependency-v1",
+  "/driver.css?v=20260812-driver-pwa-v3",
+  "/i18n.css?v=20260812-driver-pwa-v3",
+  "/i18n.js?v=20260812-driver-pwa-v3",
+  "/driver-offline-db.js?v=20260812-driver-pwa-v3",
+  "/driver-photo-hash.js?v=20260812-driver-pwa-v3",
+  "/driver-offline-photos.js?v=20260812-driver-pwa-v3",
+  "/driver-offline-sync.js?v=20260812-driver-pwa-v3",
+  "/driver-bin-ui.js?v=20260812-driver-pwa-v3",
+  "/driver.js?v=20260812-driver-pwa-v3",
   "/driver-manifest.webmanifest",
   "/icons/mbbs-yard-192.png",
   "/icons/mbbs-yard-512.png",
   "/icons/mbbs-yard.svg"
 ];
 const DRIVER_SHELL_URLS = new Set(DRIVER_SHELL.map((value) => new URL(value, self.location.origin).href));
+let driverShellRepairPromise = null;
 
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(DRIVER_CACHE_NAME).then(async (cache) => {
@@ -50,6 +51,90 @@ async function saveDriverOfflineMode(enabled) {
   await cache.put(DRIVER_OFFLINE_MODE_REQUEST, new Response(String(enabled === true), {
     headers: { "content-type": "text/plain", "cache-control": "no-store" }
   }));
+}
+
+async function snapshotDriverCache(cache) {
+  const snapshot = [];
+  for (const request of await cache.keys()) {
+    const response = await cache.match(request);
+    if (response) snapshot.push([request, response]);
+  }
+  return snapshot;
+}
+
+async function restoreDriverCache(cache, snapshot) {
+  for (const request of await cache.keys()) await cache.delete(request);
+  for (const [request, response] of snapshot) await cache.put(request, response);
+}
+
+async function repairDriverShellCache() {
+  const offlineModeEnabled = await driverOfflineModeEnabled();
+  await caches.delete(DRIVER_REFRESH_CACHE_NAME);
+  try {
+    const staging = await caches.open(DRIVER_REFRESH_CACHE_NAME);
+    await staging.addAll(DRIVER_SHELL.map((url) => new Request(
+      new URL(url, self.location.origin),
+      { cache: "reload" }
+    )));
+
+    const stagedEntries = [];
+    for (const url of DRIVER_SHELL) {
+      const request = new Request(new URL(url, self.location.origin));
+      const response = await staging.match(request);
+      if (!response || !response.ok) {
+        throw new Error(`Driver shell staging incomplete: ${request.url}`);
+      }
+      stagedEntries.push([request, response]);
+    }
+
+    const active = await caches.open(DRIVER_CACHE_NAME);
+    const previousEntries = await snapshotDriverCache(active);
+    try {
+      for (const [request, response] of stagedEntries) await active.put(request, response);
+      const retainedUrls = new Set([
+        ...DRIVER_SHELL_URLS,
+        new URL(DRIVER_OFFLINE_MODE_REQUEST, self.location.origin).href
+      ]);
+      for (const request of await active.keys()) {
+        if (!retainedUrls.has(request.url)) await active.delete(request);
+      }
+      await saveDriverOfflineMode(offlineModeEnabled);
+    } catch (error) {
+      await restoreDriverCache(active, previousEntries);
+      throw error;
+    }
+
+    const names = await caches.keys();
+    await Promise.all(names
+      .filter((name) => name.startsWith(DRIVER_CACHE_PREFIX) && name !== DRIVER_CACHE_NAME)
+      .map((name) => caches.delete(name)));
+    return {
+      cacheName: DRIVER_CACHE_NAME,
+      refreshedAssetCount: stagedEntries.length
+    };
+  } finally {
+    await caches.delete(DRIVER_REFRESH_CACHE_NAME);
+  }
+}
+
+function currentDriverShellRepair() {
+  if (driverShellRepairPromise) return driverShellRepairPromise;
+  const operation = repairDriverShellCache();
+  driverShellRepairPromise = operation;
+  void operation.then(
+    () => {
+      if (driverShellRepairPromise === operation) driverShellRepairPromise = null;
+    },
+    () => {
+      if (driverShellRepairPromise === operation) driverShellRepairPromise = null;
+    }
+  );
+  return operation;
+}
+
+function replyToDriverMessage(event, payload) {
+  if (event.ports?.[0]) event.ports[0].postMessage(payload);
+  else event.source?.postMessage(payload);
 }
 
 self.addEventListener("activate", (event) => {
@@ -81,29 +166,32 @@ self.addEventListener("message", (event) => {
     DriverOfflineSync.cancelPartition(event.data.partitionKey);
   }
   if (event.data?.type === "DRIVER_REFRESH_SHELL") {
-    event.waitUntil((async () => {
-      await caches.delete(DRIVER_REFRESH_CACHE_NAME);
-      const cache = await caches.open(DRIVER_REFRESH_CACHE_NAME);
-      await cache.addAll(DRIVER_SHELL.map((url) => new Request(
-        new URL(url, self.location.origin),
-        { cache: "reload" }
-      )));
-      const active = await caches.open(DRIVER_CACHE_NAME);
-      for (const request of await cache.keys()) {
-        const response = await cache.match(request);
-        if (response) await active.put(request, response);
-      }
-      await caches.delete(DRIVER_REFRESH_CACHE_NAME);
-      const names = await caches.keys();
-      await Promise.all(names
-        .filter((name) => name.startsWith(DRIVER_CACHE_PREFIX) && name !== DRIVER_CACHE_NAME)
-        .map((name) => caches.delete(name)));
-    })());
+    event.waitUntil(currentDriverShellRepair());
+  }
+  if (event.data?.type === "DRIVER_REPAIR_SHELL") {
+    const requestId = String(event.data.requestId || "");
+    event.waitUntil(currentDriverShellRepair()
+      .then((result) => replyToDriverMessage(event, {
+        type: "DRIVER_REPAIR_SHELL_RESULT",
+        requestId,
+        ok: true,
+        version: DRIVER_PWA_CLIENT_VERSION,
+        ...result
+      }))
+      .catch((error) => replyToDriverMessage(event, {
+        type: "DRIVER_REPAIR_SHELL_RESULT",
+        requestId,
+        ok: false,
+        version: DRIVER_PWA_CLIENT_VERSION,
+        error: String(error?.message || error || "Driver shell repair failed.")
+      })));
   }
 });
 
 self.addEventListener("sync", (event) => {
-  if (event.tag === "driver-offline-sync") event.waitUntil(DriverOfflineSync.syncAll());
+  if (event.tag === "driver-offline-sync") {
+    event.waitUntil(DriverOfflineSync.syncAll());
+  }
 });
 
 self.addEventListener("fetch", (event) => {

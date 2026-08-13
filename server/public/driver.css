@@ -1391,6 +1391,10 @@ body.driver-pwa-update-active {
   grid-column: 1 / -1;
 }
 
+.offline-status-actions .offline-repair-button {
+  grid-column: 1 / -1;
+}
+
 .offline-route-warning {
   border: 1px solid #e3a85d;
   border-radius: 9px;
@@ -1532,6 +1536,171 @@ body.driver-sync-input-locked #driverToast {
     border-color: #cde8e6;
     border-top-color: var(--accent);
   }
+}
+
+.stop-detail-page,
+.driver-delivery-instruction-page {
+  display: grid;
+  gap: 12px;
+}
+
+.driver-instruction-heading,
+.driver-instruction-order-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.driver-instruction-heading {
+  border: 1px solid #74b8b2;
+  border-radius: 14px;
+  background: #eaf8f6;
+  padding: 13px 14px;
+}
+
+.driver-instruction-heading > div {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.driver-instruction-heading span,
+.driver-instruction-order-head span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.driver-instruction-heading h3 {
+  margin: 0;
+  font-size: 21px;
+}
+
+.driver-instruction-order {
+  min-width: 0;
+  display: grid;
+  gap: 10px;
+  border: 1px solid #bfd8d6;
+  border-radius: 14px;
+  background: #fff;
+  padding: 13px;
+  box-shadow: 0 5px 16px rgba(12, 55, 58, 0.07);
+}
+
+.driver-instruction-order-head strong,
+.driver-instruction-order-head span {
+  overflow-wrap: anywhere;
+}
+
+.driver-instruction-order-head strong {
+  font-size: 17px;
+}
+
+.driver-delivery-instruction-text {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 16px;
+  font-weight: 750;
+  line-height: 1.5;
+}
+
+.driver-instruction-phones {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.driver-instruction-phones a {
+  border-radius: 999px;
+  background: #dff1ff;
+  color: #0e527e;
+  padding: 8px 11px;
+  font-size: 14px;
+  font-weight: 900;
+  text-decoration: none;
+}
+
+.driver-additional-instruction {
+  display: grid;
+  gap: 5px;
+  border-left: 4px solid #d48900;
+  border-radius: 8px;
+  background: #fff8df;
+  padding: 10px 11px;
+}
+
+.driver-additional-instruction > strong {
+  color: #785000;
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.driver-instruction-gallery {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+}
+
+.driver-instruction-media {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+  align-content: start;
+  border: 1px solid #c7dcda;
+  border-radius: 10px;
+  background: #f4f9f9;
+  padding: 7px;
+}
+
+.driver-instruction-media img,
+.driver-instruction-media video {
+  display: block;
+  width: 100%;
+  max-height: 280px;
+  border-radius: 7px;
+  background: #102d32;
+  object-fit: contain;
+}
+
+.driver-instruction-media span {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.driver-instruction-media.loading,
+.driver-instruction-media.unavailable {
+  min-height: 90px;
+  place-content: center;
+  text-align: center;
+}
+
+.driver-instruction-media.loading {
+  background: #edf7ff;
+  color: #175c86;
+}
+
+.driver-instruction-media.unavailable {
+  background: #f2f2f2;
+  color: #596568;
+}
+
+.driver-no-instructions {
+  margin: 0;
+  border: 1px dashed #a8c2bf;
+  border-radius: 12px;
+  background: #f7fbfa;
+  padding: 18px 13px;
+  color: var(--muted);
+  text-align: center;
+  font-weight: 850;
+}
+
+.stop-detail-pager {
+  margin-top: 2px;
 }
 
 .driver-bin-work-order {
@@ -1708,6 +1877,10 @@ body.driver-sync-input-locked #driverToast {
 }
 
 @media (max-width: 520px) {
+  .driver-instruction-gallery {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .driver-bin-frozen-grid,
   .driver-bin-assets,
   .driver-bin-field-grid,

@@ -1,6 +1,6 @@
 export const DRIVER_PWA_VERSION_HEADER = "X-MBBS-Driver-Version";
-export const DRIVER_PWA_CURRENT_VERSION = "2026.08.08.1";
-export const DRIVER_PWA_MINIMUM_VERSION = "2026.08.08.1";
+export const DRIVER_PWA_CURRENT_VERSION = "2026.08.12.3";
+export const DRIVER_PWA_MINIMUM_VERSION = "2026.08.12.3";
 
 const VERSION_EXEMPT_PATHS = new Set([
   "/client-version",

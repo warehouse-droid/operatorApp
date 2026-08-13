@@ -259,6 +259,36 @@ function sanitizeOrder(order = {}) {
   });
 }
 
+function sanitizeDeliveryInstructions(value = {}) {
+  return compactObject({
+    revision: Number.isSafeInteger(Number(value.revision)) ? Number(value.revision) : 0,
+    orders: Array.isArray(value.orders) ? value.orders.slice(0, 500).map((order) => compactObject({
+      orderId: normalizeScalar(order?.orderId),
+      orderRef: optionalText(order?.orderRef, { maxLength: 180 }),
+      customer: optionalText(order?.customer, { maxLength: 300 }),
+      automaticText: optionalText(order?.automaticText, { maxLength: 20000 }),
+      fallbackUsed: order?.fallbackUsed === true ? true : undefined,
+      phones: Array.isArray(order?.phones) ? order.phones.slice(0, 30).map((phone) => compactObject({
+        display: optionalText(phone?.display, { maxLength: 80 }),
+        href: optionalText(phone?.href, { maxLength: 100 })
+      })) : [],
+      additionalText: optionalText(order?.additionalText, { maxLength: 5000 }),
+      media: Array.isArray(order?.media) ? order.media.slice(0, 5).map((media) => compactObject({
+        id: optionalText(media?.id, { maxLength: 80 }),
+        mediaKind: optionalText(media?.mediaKind, { maxLength: 20 }),
+        mimeType: optionalText(media?.mimeType, { maxLength: 120 }),
+        fileName: optionalText(media?.fileName, { maxLength: 255 }),
+        byteSize: Number.isSafeInteger(Number(media?.byteSize)) ? Number(media.byteSize) : 0,
+        position: Number.isSafeInteger(Number(media?.position)) ? Number(media.position) : 0,
+        revision: Number.isSafeInteger(Number(media?.revision)) ? Number(media.revision) : 0,
+        updatedAt: optionalText(media?.updatedAt, { maxLength: 80 }),
+        contentUrl: optionalText(media?.contentUrl, { maxLength: 500 }),
+        onlineOnly: media?.onlineOnly === true ? true : undefined
+      })) : []
+    })) : []
+  });
+}
+
 function stripEmptyMbtValues(value) {
   if (Array.isArray(value)) return value.map(stripEmptyMbtValues);
   if (!value || typeof value !== "object") return value;
@@ -456,9 +486,13 @@ export function sanitizeDriverOfflineJob(job = {}) {
     "toPickupLocation",
     "destinationLocationId",
     "lineRowIds",
+    "physicalVisitJobIds",
+    "physicalVisitStopIds",
+    "consolidatedPhysicalVisit",
     "windowStart",
     "windowEnd",
     "instructions",
+    "deliveryInstructions",
     "orderRefs",
     "orderTypes",
     "dependencyPickupManifests",
@@ -482,6 +516,17 @@ export function sanitizeDriverOfflineJob(job = {}) {
   sanitized.lineRowIds = Array.isArray(sanitized.lineRowIds)
     ? sanitized.lineRowIds.slice(0, 1000).map((value) => optionalText(value, { maxLength: 180 })).filter(Boolean)
     : [];
+  sanitized.physicalVisitJobIds = Array.isArray(sanitized.physicalVisitJobIds)
+    ? sanitized.physicalVisitJobIds.slice(0, 500).map((value) => optionalText(value, { maxLength: 1000 })).filter(Boolean)
+    : [sanitized.jobId];
+  if (!sanitized.physicalVisitJobIds.includes(sanitized.jobId)) {
+    sanitized.physicalVisitJobIds.push(sanitized.jobId);
+  }
+  sanitized.physicalVisitStopIds = Array.isArray(sanitized.physicalVisitStopIds)
+    ? sanitized.physicalVisitStopIds.slice(0, 500).map((value) => optionalText(value, { maxLength: 180 })).filter(Boolean)
+    : [sanitized.stopId].filter(Boolean);
+  sanitized.consolidatedPhysicalVisit = sanitized.consolidatedPhysicalVisit === true
+    && sanitized.physicalVisitJobIds.length > 1;
   sanitized.dependencyPickupManifests = Array.isArray(sanitized.dependencyPickupManifests)
     ? sanitized.dependencyPickupManifests.slice(0, 500).map((entry) => compactObject({
         transferOrderRef: optionalText(entry?.transferOrderRef, { maxLength: 180 }),
@@ -502,6 +547,9 @@ export function sanitizeDriverOfflineJob(job = {}) {
       : undefined
   });
   sanitized.orders = Array.isArray(job.orders) ? job.orders.slice(0, 500).map(sanitizeOrder) : [];
+  if (job.deliveryInstructions && typeof job.deliveryInstructions === "object") {
+    sanitized.deliveryInstructions = sanitizeDeliveryInstructions(job.deliveryInstructions);
+  }
   sanitized.requiredPhotos = Math.max(0, Math.min(100, Number(sanitized.requiredPhotos) || 0));
   if (job.mbt !== undefined && job.mbt !== null) sanitized.mbt = sanitizeMbtDriverJob(job.mbt);
   return sanitized;
@@ -547,6 +595,8 @@ export function canonicalDriverOfflineJobIdentity(job = {}) {
     switchYard: normalizeScalar(snapshot.switchYard),
     orderRefs: snapshot.orderRefs.map(normalizeScalar),
     lineRowIds: snapshot.lineRowIds.map(normalizeScalar),
+    physicalVisitJobIds: snapshot.physicalVisitJobIds.map(normalizeScalar),
+    physicalVisitStopIds: snapshot.physicalVisitStopIds.map(normalizeScalar),
     pickupLocation: normalizeScalar(snapshot.pickupLocation),
     dropLocation: normalizeScalar(snapshot.dropLocation),
     fromLocation: normalizeScalar(snapshot.fromJobLocation || snapshot.fromLocation),

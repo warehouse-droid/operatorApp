@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
-const [server, page, client, control, sidebar, menu, sales, repository, yardQuantity, i18n] = await Promise.all([
+const [server, page, client, control, sidebar, menu, sales, repository, yardQuantity, i18n, dispatchCss, controlCss] = await Promise.all([
   "server.js",
   "../public/dispatch-loaded-export.html",
   "../public/dispatch-loaded-export.js",
@@ -11,7 +11,9 @@ const [server, page, client, control, sidebar, menu, sales, repository, yardQuan
   "../public/sales.js",
   "yard-movement-repository.js",
   "yard-quantity.js",
-  "../public/i18n.js"
+  "../public/i18n.js",
+  "../public/dispatch.css",
+  "../public/control.css"
 ].map((file) => readFile(new URL(file, import.meta.url), "utf8")));
 
 function includesAll(source, values, label) {
@@ -22,6 +24,7 @@ includesAll(server, [
   'app.get(["/dispatch/loaded-export", "/dispatch/in-outbound-record"]',
   'app.get("/api/dispatch/loaded-orders"',
   'app.get("/api/dispatch/loaded-orders/detail"',
+  'app.get("/api/dispatch/loaded-orders/drivers"',
   'app.get("/api/dispatch/loaded-orders/export.csv"',
   '"/control/in-outbound-record",',
   "sendLoadedOrdersCsv(req, res)"
@@ -31,6 +34,7 @@ includesAll(server, [
   'app.get("/sales/in-outbound-record"',
   '"/api/sales/in-outbound-records"',
   '"/api/sales/in-outbound-records/detail"',
+  '"/api/sales/in-outbound-records/drivers"',
   '"/api/sales/in-outbound-records/export.csv"',
   "operatorSalesYardLocationIds(req.operator)",
   "allowedSalesStoreLocationIds"
@@ -41,6 +45,7 @@ includesAll(server, [
   "getYardMovementDetail",
   "listYardMovementCsvRows",
   "itemSearch: req.query.itemSearch",
+  "driver: req.query.driver",
   "yardMixedUnits",
   '"direction", "type", "order", "yard processed at", "last activity", "delivered at"',
   '"driver record only", "driver", "truck", "yard photos", "driver photos"',
@@ -62,10 +67,11 @@ includesAll(client, [
   "`${loadedApiBase}/detail?",
   "`${loadedApiBase}/export.csv?",
   "in-outbound-record-",
-  "/api/photo-upload/preview?ref=",
+  "/api/photo-upload/preview?",
   'data-action="open-loaded-photo"',
   'id="dispatchLoadedSearch"',
   'id="dispatchLoadedItemSearch"',
+  'id="dispatchLoadedDriver"',
   'data-action="yard-direction"',
   'data-action="yard-type"',
   "itemSearch",
@@ -84,12 +90,16 @@ includesAll(client, [
   "driver_only",
   "renderDriverRecords",
   "Driver delivery photos",
+  'variant", "thumbnail"',
+  'loading="lazy" decoding="async"',
+  "const loadedDefaultDate = loadedToday()",
   "In/Outbound Record"
 ], "Dispatch loaded client");
 
 includesAll(control, [
   'id="loadedSearch"',
   'id="loadedItemSearch"',
+  'id="loadedDriver"',
   'data-action="yard-direction"',
   'data-action="yard-type"',
   "movementMixedUnits",
@@ -101,6 +111,8 @@ includesAll(control, [
   "delivery_at",
   "driver_only",
   "Driver delivery photos",
+  'data-secure-photo-variant="thumbnail"',
+  "const loadedDefaultDate = todayKey()",
   "In/Outbound Record"
 ], "Control Yard movement client");
 
@@ -114,6 +126,8 @@ assert.ok(
 );
 assert.ok(!client.includes("Search is global:"), "Dispatch should not render the global-search description");
 assert.ok(!control.includes("Search is global:"), "Control should not render the global-search description");
+assert.ok(!client.includes('from: localStorage.getItem("mbbs.dispatch.loaded.from")'), "Dispatch dates must reset to today on page load");
+assert.ok(!control.includes('from: localStorage.getItem("mbbs.control.loaded.from")'), "Control dates must reset to today on page load");
 assert.ok(client.includes('title="${loadedEscape(movementTypeLabel(orderType))}" type="button">${movementTypeCode(orderType)}</button>'),
   "Dispatch type tabs should display only their short codes");
 assert.ok(control.includes('title="${escapeHtml(movementTypeLabel(orderType))}" type="button">${movementTypeCode(orderType)}</button>'),
@@ -142,6 +156,8 @@ includesAll(repository, [
   "co_order",
   "vrma_order",
   "itemSearch",
+  "driverLogin",
+  "movement.driver_login",
   "movement_lines",
   "jsonb_array_elements_text",
   "processed_pallet_qty",
@@ -157,11 +173,21 @@ includesAll(repository, [
   "allowedSalesStoreLocationIds"
 ], "Unified Yard movement repository");
 
+assert.match(repository, /if \(!hasActiveTransaction\(\)\) return Promise\.all\(reads\.map\(\(read\) => read\(\)\)\);/,
+  "Movement detail queries should run concurrently outside transactions");
+assert.match(repository, /runIndependentReads\(\[\s*readLines,\s*readPhotos,\s*readDriverRecords,\s*readDriverPhotos,/,
+  "Movement detail should fan out its independent reads after authorization");
+assert.match(dispatchCss, /\.dispatch-loaded-order\s*\{[^}]*max-width:\s*100%;[^}]*overflow:\s*hidden;/s,
+  "Dispatch order cards must contain long content");
+assert.match(controlCss, /\.loaded-order-card\s*\{[^}]*max-width:\s*100%;[^}]*overflow:\s*hidden;/s,
+  "Control order cards must contain long content");
+
 includesAll(i18n, [
   '"yard.driverOnly"',
   '"yard.deliveryTime"',
   '"yard.driverActivities"',
-  '"yard.driverDeliveryPhotos"'
+  '"yard.driverDeliveryPhotos"',
+  '"yard.allDrivers"'
 ], "In/Outbound Record translations");
 
 includesAll(yardQuantity, [

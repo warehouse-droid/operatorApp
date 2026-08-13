@@ -157,6 +157,9 @@ function canonicalLines(snapshot) {
     to_lyr: line.toLyr,
     to_sec: line.toSec,
     to_pcs: line.toPcs,
+    rate: line.rate,
+    amount: line.amount,
+    netsuite_closed: line.closed,
     raw: line
   }));
 }

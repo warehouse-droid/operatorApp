@@ -1,4 +1,5 @@
 const poApp = document.getElementById("smartNetSuitePoApp");
+let poPdfRequestSequence = 0;
 
 const poState = {
   operator: null,
@@ -32,6 +33,7 @@ function num(value, places = 2) {
 }
 
 function money(value) {
+  if (value === null || value === undefined || value === "") return "—";
   const number = Number(value);
   return Number.isFinite(number) ? new Intl.NumberFormat("en-CA", { style: "currency", currency: "CAD" }).format(number) : "—";
 }
@@ -84,6 +86,63 @@ function recordCanWrite(record) {
     && !(record.current.lines || []).some((line) => line.closed || Number(line.receivedQuantity || 0) > 0);
 }
 
+function releasePdfDocument() {
+  if (poState.pdf?.url) URL.revokeObjectURL(poState.pdf.url);
+}
+
+function closePdf() {
+  poPdfRequestSequence += 1;
+  releasePdfDocument();
+  poState.pdf = null;
+}
+
+async function loadPdf(record) {
+  releasePdfDocument();
+  const requestSequence = ++poPdfRequestSequence;
+  poState.pdf = {
+    label: record.purchaseOrderRef,
+    status: "loading",
+    url: "",
+    error: ""
+  };
+  render();
+  try {
+    const response = await fetch(`/api/scm/netsuite-po-history/${record.id}/pdf`, {
+      headers: dispatchAuthHeaders({ Accept: "application/pdf" })
+    });
+    if (!response.ok) {
+      const contentType = response.headers.get("content-type") || "";
+      const payload = contentType.includes("application/json")
+        ? await response.json().catch(() => null)
+        : await response.text().catch(() => "");
+      throw new Error(payload?.error || payload || `Purchase order preview failed (${response.status}).`);
+    }
+    const contentType = response.headers.get("content-type") || "";
+    if (!contentType.toLowerCase().includes("application/pdf")) {
+      throw new Error("NetSuite did not return a PDF document for this purchase order.");
+    }
+    const blob = await response.blob();
+    if (!blob.size) throw new Error("The purchase order PDF is empty.");
+    if (requestSequence !== poPdfRequestSequence || !poState.pdf) return;
+    const url = URL.createObjectURL(blob);
+    if (requestSequence !== poPdfRequestSequence || !poState.pdf) {
+      URL.revokeObjectURL(url);
+      return;
+    }
+    poState.pdf = { ...poState.pdf, status: "ready", url, error: "" };
+    render();
+  } catch (error) {
+    if (requestSequence !== poPdfRequestSequence || !poState.pdf) return;
+    poState.pdf = {
+      ...poState.pdf,
+      status: "error",
+      url: "",
+      error: error?.message || "The purchase order PDF could not be loaded."
+    };
+    render();
+  }
+}
+
 async function api(url, options = {}) {
   const headers = { ...(options.headers || {}) };
   if (options.body && typeof options.body === "object") {
@@ -129,7 +188,7 @@ function lineRow(record, line) {
   const nativeQuantity = Object.prototype.hasOwnProperty.call(draft, "palletQuantity") && Number(line.unitsPerPallet) > 0
     ? Number(draft.palletQuantity) * Number(line.unitsPerPallet)
     : line.nativeQuantity ?? line.quantity;
-  const rate = Object.prototype.hasOwnProperty.call(draft, "rate") ? draft.rate : line.rate ?? 0;
+  const rate = Object.prototype.hasOwnProperty.call(draft, "rate") ? draft.rate : line.rate ?? "";
   const destinationLocationId = Object.prototype.hasOwnProperty.call(draft, "destinationLocationId") ? draft.destinationLocationId : line.destinationLocationId;
   const destinations = poState.options.destinations.some((row) => Number(row.id) === Number(line.destinationLocationId))
     ? poState.options.destinations
@@ -172,7 +231,14 @@ function card(record) {
     <div class="po-meta-grid">
       <label>Transaction date<input data-head-field="transactionDate" type="date" value="${esc(headValue("transactionDate", dateInput(current.transactionDate)))}" ${writable ? "" : "disabled"}></label>
       <label>Expected date<input data-head-field="expectedDeliveryDate" type="date" value="${esc(headValue("expectedDeliveryDate", dateInput(current.expectedDeliveryDate)))}" ${writable ? "" : "disabled"}></label>
-      <label>Vendor reference<input data-head-field="vendorReference" value="${esc(headValue("vendorReference", current.vendorReference || ""))}" maxlength="300" ${writable ? "" : "disabled"}></label>
+      <div class="po-vendor-reference">
+        <label for="poVendorReference-${record.id}">Vendor reference</label>
+        <div class="po-vendor-reference-row">
+          <input id="poVendorReference-${record.id}" data-head-field="vendorReference" value="${esc(headValue("vendorReference", current.vendorReference || ""))}" maxlength="300" ${writable ? "" : "disabled"}>
+          ${writable ? `<button class="smart-button primary" data-action="save-vendor-reference" type="button">Save reference</button>` : ""}
+        </div>
+        <small>Updates Packing Slip / Ref in Dispatch, PO Split, and PO/TO Schedule.</small>
+      </div>
       <label class="po-memo">Memo<textarea data-head-field="memo" maxlength="4000" ${writable ? "" : "disabled"}>${esc(headValue("memo", current.memo || ""))}</textarea></label>
     </div>
     <div class="smart-table-wrap"><table class="smart-table po-lines"><thead><tr><th>Item</th><th>PLT (editable)</th><th>Native quantity (read only)</th><th>Rate</th><th>Amount</th><th>Destination</th><th>Received</th></tr></thead><tbody>${(current.lines || []).map((line) => lineRow(record, line)).join("") || `<tr><td colspan="7">No current NetSuite lines were mirrored.</td></tr>`}</tbody></table></div>
@@ -199,7 +265,7 @@ function render() {
       <div class="po-history-list">${poState.records.map(card).join("") || `<div class="smart-empty">No archived application-created PO matches these filters.</div>`}</div>
       <nav class="po-pagination"><button class="smart-button" data-action="previous" ${poState.page <= 1 ? "disabled" : ""}>Previous</button><span>Page ${poState.page} of ${poState.totalPages}</span><button class="smart-button" data-action="next" ${poState.page >= poState.totalPages ? "disabled" : ""}>Next</button></nav>
     </section>
-  </div>${poState.pdf ? `<div class="po-modal" role="dialog" aria-modal="true"><div class="po-modal-card"><header><strong>${esc(poState.pdf.label)}</strong><button data-action="close-pdf" aria-label="Close">×</button></header><iframe src="${esc(poState.pdf.url)}" title="NetSuite PO PDF"></iframe></div></div>` : ""}`;
+  </div>${poState.pdf ? `<div class="po-modal" role="dialog" aria-modal="true"><div class="po-modal-card"><header><div><strong>${esc(poState.pdf.label)}</strong><small>NetSuite PDF preview</small></div><button data-action="close-pdf" aria-label="Close">×</button></header>${poState.pdf.status === "error" ? `<div class="smart-notice error"><strong>Preview could not be loaded</strong><div>${esc(poState.pdf.error)}</div></div>` : poState.pdf.url ? `<iframe src="${esc(poState.pdf.url)}" title="NetSuite PO PDF"></iframe>` : `<div class="smart-notice">Loading purchase order PDF…</div>`}</div></div>` : ""}`;
 }
 
 function readFilters() {
@@ -283,6 +349,21 @@ function changesForCard(cardElement, record) {
   return { header, lines };
 }
 
+function clearHeaderDraftField(id, field) {
+  const draft = poState.drafts.get(id);
+  if (!draft) return;
+  const header = { ...(draft.header || {}) };
+  delete header[field];
+  const next = { header, lines: [...(draft.lines || [])] };
+  if (Object.keys(next.header).length || next.lines.length) {
+    poState.drafts.set(id, next);
+    poState.dirtyIds.add(id);
+  } else {
+    poState.drafts.delete(id);
+    poState.dirtyIds.delete(id);
+  }
+}
+
 function syncNativeQuantityPreview(input) {
   if (!input?.matches('[data-line-field="palletQuantity"]')) return;
   const row = input.closest("[data-po-line]");
@@ -316,7 +397,7 @@ async function reconcileFromNetSuite() {
 async function act(button) {
   const action = button.dataset.action;
   if (poState.filtersDirty && !["filter", "clear"].includes(action)) readFilters();
-  if (action === "close-pdf") { poState.pdf = null; render(); return; }
+  if (action === "close-pdf") { closePdf(); render(); return; }
   if (["filter", "clear", "previous", "next"].includes(action) && poState.dirtyIds.size && !confirm("Discard unsaved PO edits and continue?")) return;
   if (["filter", "clear", "previous", "next"].includes(action)) { poState.dirtyIds.clear(); poState.drafts.clear(); }
   if (action === "filter") { readFilters(); poState.page = 1; await load(); return; }
@@ -326,9 +407,17 @@ async function act(button) {
   if (!cardElement) return;
   const id = Number(cardElement.dataset.historyId);
   const record = poState.records.find((row) => row.id === id);
-  if (action === "pdf") { poState.pdf = { label: record.purchaseOrderRef, url: `/api/scm/netsuite-po-history/${id}/pdf` }; render(); return; }
+  if (action === "pdf") { await loadPdf(record); return; }
   if (action === "unarchive" && !confirm(`${record.purchaseOrderRef} will return to Vendor Replies and disappear from this history. Continue?`)) return;
-  const changes = action === "save" ? changesForCard(cardElement, record) : null;
+  const savingVendorReference = action === "save-vendor-reference";
+  const vendorReference = savingVendorReference
+    ? String(cardElement.querySelector('[data-head-field="vendorReference"]')?.value || "").trim()
+    : "";
+  const changes = action === "save"
+    ? changesForCard(cardElement, record)
+    : savingVendorReference
+      ? { header: { vendorReference }, lines: [] }
+      : null;
   if (action === "save" && !Object.keys(changes.header).length && !changes.lines.length) {
     poState.notice = `${record.purchaseOrderRef} has no unsaved changes.`;
     poState.dirtyIds.delete(id);
@@ -336,18 +425,33 @@ async function act(button) {
     render();
     return;
   }
+  if (savingVendorReference && vendorReference === String(record.current.vendorReference || "").trim()) {
+    poState.notice = `${record.purchaseOrderRef} has no Vendor reference change to save.`;
+    clearHeaderDraftField(id, "vendorReference");
+    render();
+    return;
+  }
   poState.error = "";
   poState.notice = "";
-  poState.busy = action === "save" ? "Saving changes to NetSuite" : action === "refresh" ? "Refreshing from NetSuite" : "Returning PO to Vendor Replies";
+  poState.busy = savingVendorReference
+    ? "Saving Vendor reference to NetSuite"
+    : action === "save" ? "Saving changes to NetSuite" : action === "refresh" ? "Refreshing from NetSuite" : "Returning PO to Vendor Replies";
   render();
   try {
-    if (action === "save") {
+    if (action === "save" || savingVendorReference) {
       const saved = await api(`/api/scm/netsuite-po-history/${id}`, { method: "PATCH", body: { expectedLastModifiedAt: cardElement.dataset.version, ...changes } });
-      poState.dirtyIds.delete(id);
-      poState.drafts.delete(id);
+      if (savingVendorReference) clearHeaderDraftField(id, "vendorReference");
+      else {
+        poState.dirtyIds.delete(id);
+        poState.drafts.delete(id);
+      }
       poState.notice = saved.readbackPending
-        ? `${record.purchaseOrderRef} was accepted by NetSuite. Readback is still pending and will reconcile automatically.`
-        : `${record.purchaseOrderRef} was updated in NetSuite and read back successfully.`;
+        ? savingVendorReference
+          ? `${record.purchaseOrderRef} Vendor reference was accepted by NetSuite. Packing Slip / Ref will synchronize after readback.`
+          : `${record.purchaseOrderRef} was accepted by NetSuite. Readback is still pending and will reconcile automatically.`
+        : savingVendorReference
+          ? `${record.purchaseOrderRef} Vendor reference and Packing Slip / Ref were saved.`
+          : `${record.purchaseOrderRef} was updated in NetSuite and read back successfully.`;
     } else if (action === "refresh") {
       await api(`/api/scm/netsuite-po-history/${id}/refresh`, { method: "POST", body: {} });
       poState.notice = `${record.purchaseOrderRef} refreshed from NetSuite.`;
@@ -435,7 +539,10 @@ document.addEventListener("visibilitychange", () => {
     load({ quiet: true }).then(() => reconcileFromNetSuite());
   }
 });
-window.addEventListener("beforeunload", () => poState.events?.close());
+window.addEventListener("beforeunload", () => {
+  releasePdfDocument();
+  poState.events?.close();
+});
 
 requireDispatchLogin({
   mount: poApp,

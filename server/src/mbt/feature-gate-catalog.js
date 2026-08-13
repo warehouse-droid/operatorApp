@@ -24,6 +24,15 @@ export const MBT_ADMIN_GATE_DEFINITIONS = Object.freeze([
     lockReason: null
   }),
   Object.freeze({
+    flagKey: "sales_stock_request_over_availability",
+    label: "Sales stock request over availability",
+    description: "Allow Sales to request more than the selected source yard's current availability for SCM review. SCM can intentionally convert the full demand; any shortage is shown and retained as a Transfer Order backorder.",
+    environmentProperty: null,
+    independent: true,
+    locked: false,
+    lockReason: null
+  }),
+  Object.freeze({
     flagKey: "mbt_enabled",
     label: "MBT local modules",
     description: "Global database gate for every MBT local workflow.",

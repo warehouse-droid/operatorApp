@@ -234,6 +234,22 @@ async function verifyDriverDeliveryRecords() {
       `${fixtureDate}T14:00:00.000Z`,
       "The driver dropoff must expose its explicit delivery timestamp"
     );
+    const matchingDriverRows = await listYardMovements({
+      ...fixtureFilters,
+      driver: "driver-record-harness"
+    });
+    assert.ok(
+      matchingDriverRows.some((row) => String(row.order_id) === String(orderId)),
+      "The Driver filter must retain records completed by the selected driver"
+    );
+    const otherDriverRows = await listYardMovements({
+      ...fixtureFilters,
+      driver: "another-driver"
+    });
+    assert.ok(
+      !otherDriverRows.some((row) => String(row.order_id) === String(orderId)),
+      "The Driver filter must exclude records with no activity from the selected driver"
+    );
     const wrongYardRows = await listYardMovements({
       ...fixtureFilters,
       allowedYardLocationIds: [1]

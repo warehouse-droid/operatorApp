@@ -26,6 +26,44 @@ function buildPhotoStorageHarness() {
   )();
 }
 
+function buildAdmissionHarness() {
+  const source = sourceSection(
+    DB_SOURCE,
+    "function nonNegativeInteger(",
+    "function photoHasLocalBytes("
+  );
+  return new Function(
+    "MAX_EVIDENCE_BYTES",
+    "MAX_UNSYNCED_PHOTOS",
+    "EVIDENCE_RESERVE_RATIO",
+    "PRESSURE_CAPTURE_TARGET_BYTES",
+    `${source}\nreturn photoAdmissionForHealth;`
+  )(250 * 1024 * 1024, 192, 0.1, 750 * 1024);
+}
+
+test("route admission retains p99 photos, three-stop margin, and a ten-percent byte reserve", () => {
+  assert.match(DB_SOURCE, /const P99_ROUTE_PHOTOS = 21 \* 8;/u);
+  assert.match(DB_SOURCE, /const PHOTO_SAFETY_MARGIN = 3 \* 8;/u);
+  assert.match(DB_SOURCE, /const MAX_UNSYNCED_PHOTOS = P99_ROUTE_PHOTOS \+ PHOTO_SAFETY_MARGIN;/u);
+  const admission = buildAdmissionHarness();
+  const decision = admission({ evidenceBytes: 0, unsyncedPhotoCount: 167 }, 750 * 1024, {
+    remainingPhotoCount: 24,
+    expectedBytesPerPhoto: 750 * 1024,
+    browserStorageEstimate: { usage: 0, quota: 250 * 1024 * 1024 }
+  });
+  assert.equal(decision.allowed, true);
+  assert.equal(decision.projectedRoutePhotoCount, 192);
+  assert.equal(decision.reserveBytes, 25 * 1024 * 1024);
+
+  const noQuota = admission({ evidenceBytes: 100 * 1024 * 1024, unsyncedPhotoCount: 96 }, 1024, {
+    remainingPhotoCount: 72,
+    expectedBytesPerPhoto: 750 * 1024,
+    browserStorageEstimate: { usage: 1, quota: 1 }
+  });
+  assert.equal(noQuota.allowed, false);
+  assert.match(noQuota.reason, /headroom/iu);
+});
+
 test("WebKit-safe photo persistence stores exact ArrayBuffer bytes and no Blob/File value", async () => {
   const { photoHasLocalBytes, photoRecordForStorage, photoRecordForRuntime } = buildPhotoStorageHarness();
   const originalBytes = Uint8Array.from([0xff, 0xd8, 0x10, 0x20, 0xff, 0xd9]);

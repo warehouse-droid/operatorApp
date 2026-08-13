@@ -1,0 +1,59 @@
+{
+  "schemaVersion": 1,
+  "sanitization": "Aggregate-only deterministic clone. Driver, device, job, customer, address, and object identifiers were not copied.",
+  "window": {
+    "from": "2026-07-30",
+    "to": "2026-08-11",
+    "manifestCount": 425
+  },
+  "manifestJobCountDistribution": [
+    { "jobCount": 1, "count": 100 },
+    { "jobCount": 2, "count": 150 },
+    { "jobCount": 3, "count": 50 },
+    { "jobCount": 5, "count": 40 },
+    { "jobCount": 8, "count": 30 },
+    { "jobCount": 12, "count": 25 },
+    { "jobCount": 14, "count": 9 },
+    { "jobCount": 18, "count": 10 },
+    { "jobCount": 21, "count": 7 },
+    { "jobCount": 22, "count": 4 }
+  ],
+  "observedPercentiles": { "medianJobs": 2, "p95Jobs": 14, "p99Jobs": 21, "maxJobs": 22 },
+  "stopEvidence": [
+    { "stopType": "dropoff", "requiredPhotos": 2, "count": 722 },
+    { "stopType": "pickup", "requiredPhotos": 2, "count": 426 },
+    { "stopType": "travel", "requiredPhotos": 0, "count": 274 },
+    { "stopType": "truck_switch", "requiredPhotos": 3, "count": 3 }
+  ],
+  "commonShapes": [
+    { "shape": "dropoff:2 > travel:0", "count": 107 },
+    { "shape": "pickup:2 > dropoff:2", "count": 71 },
+    { "shape": "dropoff:2 > dropoff:2", "count": 59 },
+    { "shape": "other", "count": 188 }
+  ],
+  "photoStates": [
+    { "status": "durably_received", "count": 86 },
+    { "status": "uploaded_unverified", "count": 16 },
+    { "status": "registered", "count": 15 }
+  ],
+  "photoBytePercentiles": {
+    "minimum": 151795,
+    "p10": 211641,
+    "p25": 525240,
+    "p50": 959427,
+    "p75": 1121732,
+    "p90": 1244283,
+    "p95": 1324236,
+    "maximum": 1918533
+  },
+  "knownErrors": [
+    {
+      "occurredOn": "2026-08-05",
+      "name": "UnknownError",
+      "code": "driver_indexeddb_unknownerror",
+      "message": "Updating offline storage failed (UnknownError): Error preparing Blob/File data to be stored in object store",
+      "runtimeFamily": "iOS 18.7 WebKit / CriOS 150",
+      "count": 1
+    }
+  ]
+}

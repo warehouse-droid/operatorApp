@@ -31,10 +31,12 @@ export default {
   projects: [
     {
       name: "chromium-desktop",
+      testIgnore: /driver-pwa-cache-repair\.spec\.js/u,
       use: { ...devices["Desktop Chrome"] }
     },
     {
       name: "chromium-mobile",
+      testIgnore: /driver-pwa-cache-repair\.spec\.js/u,
       use: { ...devices["Pixel 7"] }
     },
     {

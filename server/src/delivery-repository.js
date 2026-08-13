@@ -1807,7 +1807,7 @@ export async function listDeliveryOrders({ locationId = null, status = "active",
          FROM delivery_line_source l
         GROUP BY l.order_id
      ),
-     delivery_line_summary AS (
+     delivery_line_summary AS MATERIALIZED (
        SELECT line_rollup.*,
               line_rollup.open_line_count > 0 AS has_remaining_qty,
               CASE WHEN line_rollup.has_progress_qty THEN line_rollup.open_line_count ELSE 0 END AS underpack_count

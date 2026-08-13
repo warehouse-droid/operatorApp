@@ -551,7 +551,8 @@ smartFilteredProposals = function smartFilteredProposalsV2() {
   const secondary = smartState.planSort === "source"
     ? (proposal) => smartProposalStops(proposal).map((stop) => stop.name).join("|")
     : (proposal) => proposal.sourceName || proposal.vendor || "";
-  return proposals.sort((left, right) => smartUrgencyRank(smartProposalUrgencyLevel(right)) - smartUrgencyRank(smartProposalUrgencyLevel(left))
+  return proposals.sort((left, right) => smartProposalManualPriority(left) - smartProposalManualPriority(right)
+    || smartUrgencyRank(smartProposalUrgencyLevel(right)) - smartUrgencyRank(smartProposalUrgencyLevel(left))
     || smartProposalDestinationPriority(left) - smartProposalDestinationPriority(right)
     || smartProposalUrgencyScore(right) - smartProposalUrgencyScore(left)
     || primary(left).localeCompare(primary(right), undefined, { numeric: true })

@@ -14,14 +14,14 @@ try {
     await query(
       `INSERT INTO scm_netsuite_vendor_item_codes (
          item_id, vendor_id, subsidiary_id, vendor_code, source,
-         preferred_vendor, synced_at, updated_at
+         preferred_vendor, vendor_price, vendor_price_synced_at, synced_at, updated_at
        ) VALUES
-         ($1, $4, 1, '0555CEL125105-0', 'item_vendor', true, now(), now()),
-         ($2, $4, 0, 'GLOBAL-FALLBACK', 'single_vendor_fallback', true, now(), now()),
-         ($2, $4, 1, 'SUBSIDIARY-1', 'item_vendor', false, now(), now()),
-         ($2, $4, 2, 'SUBSIDIARY-2', 'item_vendor', true, now(), now()),
-         ($3, $4, 0, 'GLOBAL-ITEM-VENDOR', 'item_vendor', true, now(), now()),
-         ($3, $4, 1, 'EXACT-SUBSIDIARY', 'item_vendor', false, now(), now())`,
+         ($1, $4, 1, '0555CEL125105-0', 'item_vendor', true, 12.6, now(), now(), now()),
+         ($2, $4, 0, 'GLOBAL-FALLBACK', 'single_vendor_fallback', true, NULL, now(), now(), now()),
+         ($2, $4, 1, 'SUBSIDIARY-1', 'item_vendor', false, 10.5, now(), now(), now()),
+         ($2, $4, 2, 'SUBSIDIARY-2', 'item_vendor', true, 11.5, now(), now(), now()),
+         ($3, $4, 0, 'GLOBAL-ITEM-VENDOR', 'item_vendor', true, 8.5, now(), now(), now()),
+         ($3, $4, 1, 'EXACT-SUBSIDIARY', 'item_vendor', false, 9.5, now(), now(), now())`,
       [rootCaseItemId, rankedItemId, exactItemId, vendorId]
     );
 
@@ -30,10 +30,15 @@ try {
     assert.equal(rootCase[0].vendorCode, "0555CEL125105-0",
       "An unspecified subsidiary must still return a code stored against a real NetSuite subsidiary.");
     assert.equal(rootCase[0].subsidiaryId, 1);
+    assert.equal(rootCase[0].vendorPrice, 12.6,
+      "The vendor-specific NetSuite price must travel with its selected Item Vendor code.");
+    assert(rootCase[0].vendorPriceSyncedAt,
+      "A checked vendor price needs a timestamp so an empty/zero price does not trigger endless refreshes.");
 
     const unspecified = await getSmartScmVendorItemCodes({ vendorId, itemIds: [rankedItemId] });
     assert.equal(unspecified[0].vendorCode, "SUBSIDIARY-2",
       "Without a requested subsidiary, an authoritative preferred Item Vendor code must win deterministically.");
+    assert.equal(unspecified[0].vendorPrice, 11.5);
 
     const requested = await getSmartScmVendorItemCodes({
       vendorId,

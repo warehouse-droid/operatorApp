@@ -35,7 +35,10 @@ assert.throws(
   /not valid/
 );
 
-assert.match(sidebar, /\{ label: "Local Vendors", href: "\/scm\/vendors", icon: "LV" \}/);
+assert.match(
+  sidebar,
+  /\{ label: "Local Vendors", href: "\/scm\/vendors", icon: "LV", authorities: \["admin", "dispatcher", "scm", "scm_staff", "yard_manager"\] \}/
+);
 assert.match(menu, /location\.href='\/scm\/vendors'[\s\S]*?<strong>Local Vendors<\/strong>/);
 assert.ok(html.includes("/scm-vendors.js") && html.includes("/scm-vendors.css"));
 assert.ok(page.includes('roles: ["admin", "scm", "scm_staff", "dispatcher", "yard_manager"]'));

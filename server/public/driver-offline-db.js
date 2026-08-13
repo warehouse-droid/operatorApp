@@ -2,17 +2,172 @@
   "use strict";
 
   const DB_NAME = "mbbs-driver-offline";
-  const DB_VERSION = 2;
+  const DB_VERSION = 3;
   const ACTIVE_PARTITION_KEY = "activePartition";
   const DEVICE_ID_KEY = "deviceId";
   const MAX_EVIDENCE_BYTES = 250 * 1024 * 1024;
-  const MAX_UNSYNCED_PHOTOS = 100;
+  const MAX_INSTRUCTION_MEDIA_BYTES = 250 * 1024 * 1024;
+  const MAX_INSTRUCTION_MEDIA_FILE_BYTES = 25 * 1024 * 1024;
+  // Historical routes are p99 21 stops x 8 photos. Retain three additional
+  // stops so route admission never strands a driver at the old 100-photo cap.
+  const P99_ROUTE_PHOTOS = 21 * 8;
+  const PHOTO_SAFETY_MARGIN = 3 * 8;
+  const MAX_UNSYNCED_PHOTOS = P99_ROUTE_PHOTOS + PHOTO_SAFETY_MARGIN;
+  const EVIDENCE_RESERVE_RATIO = 0.1;
+  const PRESSURE_CAPTURE_TARGET_BYTES = 750 * 1024;
   const SYNCED_RETENTION_MS = 48 * 60 * 60 * 1000;
   const TERMINAL_EVENT_STATUSES = new Set(["applied", "evidence_only", "resolved", "cancelled", "rejected"]);
   const JOB_BOUND_EVENT_TYPES = new Set(["job_started", "job_completed", "truck_switched_physical"]);
   const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
   let openPromise = null;
   let openConnection = null;
+
+  function instructionMediaBinaryBuffer(value) {
+    if (value instanceof ArrayBuffer) return value;
+    if (ArrayBuffer.isView(value)) {
+      return value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+    }
+    return null;
+  }
+
+  function instructionMediaByteSize(record) {
+    return Math.max(0, Number(
+      record?.byteSize
+      || record?.blob?.size
+      || instructionMediaBinaryBuffer(record?.blobBytes)?.byteLength
+      || 0
+    ));
+  }
+
+  async function instructionMediaRecordForStorage(record) {
+    if (!record) return record;
+    const { blob, objectUrl: _objectUrl, ...stored } = record;
+    const blobBytes = instructionMediaBinaryBuffer(stored.blobBytes)
+      || (blob instanceof Blob ? await blob.arrayBuffer() : null);
+    return {
+      ...stored,
+      blobBytes,
+      byteSize: Math.max(0, Number(stored.byteSize || blobBytes?.byteLength || blob?.size || 0))
+    };
+  }
+
+  function instructionMediaRecordForRuntime(record) {
+    if (!record || record.blob instanceof Blob) return record;
+    const blobBytes = instructionMediaBinaryBuffer(record.blobBytes);
+    if (!blobBytes?.byteLength) return record;
+    return {
+      ...record,
+      blob: new Blob([blobBytes], { type: record.mimeType || "application/octet-stream" })
+    };
+  }
+
+  function instructionMediaEvictionOrder(left, right, protectedIds = new Set()) {
+    const leftProtected = protectedIds.has(String(left?.mediaId || "")) ? 1 : 0;
+    const rightProtected = protectedIds.has(String(right?.mediaId || "")) ? 1 : 0;
+    return leftProtected - rightProtected
+      || Number(left?.priority || 0) - Number(right?.priority || 0)
+      || String(left?.lastAccessedAt || left?.updatedAt || "")
+        .localeCompare(String(right?.lastAccessedAt || right?.updatedAt || ""))
+      || String(left?.mediaId || "").localeCompare(String(right?.mediaId || ""));
+  }
+
+  function selectInstructionMediaEvictions(
+    records,
+    maxBytes = MAX_INSTRUCTION_MEDIA_BYTES,
+    protectedMediaIds = []
+  ) {
+    const limit = Math.max(0, Number(maxBytes || 0));
+    const protectedIds = new Set((protectedMediaIds || []).map((value) => String(value || "")));
+    const ordered = [...(records || [])]
+      .filter((record) => record?.mediaId)
+      .sort((left, right) => instructionMediaEvictionOrder(left, right, protectedIds));
+    let retainedBytes = ordered.reduce((total, record) => total + instructionMediaByteSize(record), 0);
+    const evictedMediaIds = [];
+    for (const record of ordered) {
+      if (retainedBytes <= limit) break;
+      evictedMediaIds.push(String(record.mediaId));
+      retainedBytes -= instructionMediaByteSize(record);
+    }
+    return {
+      evictedMediaIds,
+      retainedBytes: Math.max(0, retainedBytes),
+      limitBytes: limit
+    };
+  }
+
+  function nonNegativeInteger(value, fallback = 0) {
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 ? Math.floor(number) : fallback;
+  }
+
+  function photoAdmissionForHealth(health, byteSize, options = {}) {
+    const candidateBytes = nonNegativeInteger(byteSize);
+    const retainedEvidenceBytes = nonNegativeInteger(health?.evidenceBytes);
+    const retainedPhotoCount = nonNegativeInteger(health?.unsyncedPhotoCount);
+    const routeAware = Object.prototype.hasOwnProperty.call(options, "remainingPhotoCount");
+    const remainingPhotoCount = routeAware
+      ? nonNegativeInteger(options.remainingPhotoCount)
+      : 0;
+    const expectedBytesPerPhoto = routeAware
+      ? Math.max(1, nonNegativeInteger(
+        options.expectedBytesPerPhoto,
+        PRESSURE_CAPTURE_TARGET_BYTES
+      ))
+      : 0;
+    const optionalCacheBytes = nonNegativeInteger(options.optionalCacheBytes);
+    const estimate = options.browserStorageEstimate || {};
+    const browserUsageBytes = nonNegativeInteger(estimate.usage);
+    const browserQuotaBytes = nonNegativeInteger(estimate.quota);
+    const browserFreeBytes = browserQuotaBytes > 0
+      ? Math.max(0, browserQuotaBytes - browserUsageBytes)
+      : MAX_EVIDENCE_BYTES;
+    const browserEvidenceCapacity = browserQuotaBytes > 0
+      ? retainedEvidenceBytes + browserFreeBytes + optionalCacheBytes
+      : MAX_EVIDENCE_BYTES;
+    const availableBudgetBytes = Math.min(
+      MAX_EVIDENCE_BYTES,
+      Math.max(0, browserEvidenceCapacity)
+    );
+    const reserveBytes = routeAware
+      ? Math.ceil(availableBudgetBytes * EVIDENCE_RESERVE_RATIO)
+      : 0;
+    const requiredRouteBytes = remainingPhotoCount * expectedBytesPerPhoto;
+    const nextBytes = retainedEvidenceBytes + candidateBytes;
+    const nextCount = retainedPhotoCount + 1;
+    const projectedRouteBytes = nextBytes + requiredRouteBytes + reserveBytes;
+    const projectedRoutePhotoCount = nextCount + remainingPhotoCount;
+    const allowed = nextBytes <= MAX_EVIDENCE_BYTES
+      && nextCount <= MAX_UNSYNCED_PHOTOS
+      && projectedRoutePhotoCount <= MAX_UNSYNCED_PHOTOS
+      && projectedRouteBytes <= availableBudgetBytes;
+    let reason = "";
+    if (nextBytes > MAX_EVIDENCE_BYTES) {
+      reason = "Offline photo storage has reached 250 MB. Synchronize before taking more required photos.";
+    } else if (nextCount > MAX_UNSYNCED_PHOTOS) {
+      reason = "There are already 192 unsynchronized photos. Synchronize before taking more required photos.";
+    } else if (projectedRoutePhotoCount > MAX_UNSYNCED_PHOTOS) {
+      reason = "There is not enough protected photo headroom for the remaining route. Synchronize before taking this required photo.";
+    } else if (projectedRouteBytes > availableBudgetBytes) {
+      reason = "There is not enough protected device storage headroom for the remaining required route photos. Synchronize or reconnect before taking this photo.";
+    }
+    return {
+      ...health,
+      allowed,
+      reason,
+      nextBytes,
+      nextCount,
+      remainingPhotoCount,
+      expectedBytesPerPhoto,
+      requiredRouteBytes,
+      reserveBytes,
+      projectedRouteBytes,
+      projectedRoutePhotoCount,
+      availableBudgetBytes,
+      browserUsageBytes,
+      browserQuotaBytes,
+      optionalCacheBytes
+    };
+  }
 
   function photoHasLocalBytes(photo) {
     return Boolean(
@@ -223,7 +378,16 @@
   }
 
   function assertSchema(db) {
-    const requiredStores = ["meta", "profiles", "manifests", "jobs", "events", "photos", "leases"];
+    const requiredStores = [
+      "meta",
+      "profiles",
+      "manifests",
+      "jobs",
+      "events",
+      "photos",
+      "instructionMedia",
+      "leases"
+    ];
     const missingStores = requiredStores.filter((name) => !db.objectStoreNames.contains(name));
     if (missingStores.length) {
       throw new Error(`Offline storage upgrade is incomplete (missing ${missingStores.join(", ")}). Close other Driver tabs and reload.`);
@@ -277,6 +441,11 @@
         ensureIndex(photos, "byPartition", "partitionKey", { unique: false });
         ensureIndex(photos, "byEvent", "eventId", { unique: false });
         ensureIndex(photos, "byDraft", ["partitionKey", "draftKey"], { unique: false });
+        const instructionMedia = db.objectStoreNames.contains("instructionMedia")
+          ? upgrade.objectStore("instructionMedia")
+          : db.createObjectStore("instructionMedia", { keyPath: "key" });
+        ensureIndex(instructionMedia, "byPartition", "partitionKey", { unique: false });
+        ensureIndex(instructionMedia, "byPartitionPriority", ["partitionKey", "priority"], { unique: false });
         if (!db.objectStoreNames.contains("leases")) db.createObjectStore("leases", { keyPath: "partitionKey" });
       };
       request.onsuccess = () => {
@@ -740,7 +909,8 @@
     };
   }
 
-  async function saveDraftPhoto(partitionKey, draftKey, photo, { replacePhotoId = "" } = {}) {
+  async function saveDraftPhoto(partitionKey, draftKey, photo, options = {}) {
+    const { replacePhotoId = "" } = options;
     const record = await photoRecordForStorage({
       ...photo,
       photoId: photo.photoId || createUuid(),
@@ -795,16 +965,19 @@
       && photoHasLocalBytes(candidate)
       && candidate.status !== "durably_received"
     );
-    const nextBytes = unsyncedPhotos.reduce(
+    const evidenceBytes = unsyncedPhotos.reduce(
       (sum, candidate) => sum + photoByteSize(candidate),
       0
-    ) + photoByteSize(record);
-    const nextCount = unsyncedPhotos.length + 1;
-    if (nextBytes > MAX_EVIDENCE_BYTES || nextCount > MAX_UNSYNCED_PHOTOS) {
+    );
+    const admission = photoAdmissionForHealth({
+      evidenceBytes,
+      unsyncedPhotoCount: unsyncedPhotos.length,
+      maxEvidenceBytes: MAX_EVIDENCE_BYTES,
+      maxUnsyncedPhotos: MAX_UNSYNCED_PHOTOS
+    }, photoByteSize(record), options);
+    if (!admission.allowed) {
       await transactionDone(transaction);
-      throw new Error(nextBytes > MAX_EVIDENCE_BYTES
-        ? "Offline photo storage has reached 250 MB. Synchronize before taking more required photos."
-        : "There are already 100 unsynchronized photos. Synchronize before taking more required photos.");
+      throw new Error(admission.reason);
     }
     await putPhotoRecord(store, record);
     for (const replacementId of replacementIds) {
@@ -949,13 +1122,13 @@
         0
       );
       if (
-        evidenceBytes >= MAX_EVIDENCE_BYTES
-        || unsyncedPhotos.length >= MAX_UNSYNCED_PHOTOS
+        evidenceBytes > MAX_EVIDENCE_BYTES
+        || unsyncedPhotos.length > MAX_UNSYNCED_PHOTOS
       ) {
         await completion;
-        throw new Error(evidenceBytes >= MAX_EVIDENCE_BYTES
+        throw new Error(evidenceBytes > MAX_EVIDENCE_BYTES
           ? "Offline photo storage has reached 250 MB. Synchronize before completing another photo-required action."
-          : "There are already 100 unsynchronized photos. Synchronize before completing another photo-required action.");
+          : "There are already 192 unsynchronized photos. Synchronize before completing another photo-required action.");
       }
     }
     // Resolve and validate the complete evidence set before changing ownership.
@@ -1849,20 +2022,189 @@
     };
   }
 
-  async function canStorePhoto(partitionKey, byteSize) {
+  async function canStorePhoto(partitionKey, byteSize, options = {}) {
     const health = await getStorageHealth(partitionKey);
-    const nextBytes = health.evidenceBytes + Math.max(0, Number(byteSize || 0));
-    const nextCount = health.unsyncedPhotoCount + 1;
+    return photoAdmissionForHealth(health, byteSize, options);
+  }
+
+  function makeInstructionMediaKey(partitionKey, mediaId) {
+    return `${String(partitionKey || "")}::${String(mediaId || "").trim().toLowerCase()}`;
+  }
+
+  async function cacheInstructionMedia(partitionKey, media = {}) {
+    const normalizedPartition = String(partitionKey || "");
+    const mediaId = String(media.mediaId || media.id || "").trim().toLowerCase();
+    if (!normalizedPartition || !mediaId) {
+      throw new Error("A Driver partition and delivery-instruction media ID are required.");
+    }
+    if (String(media.mediaKind || "image").toLowerCase() !== "image") {
+      throw new Error("Only delivery-instruction images can be saved for offline viewing.");
+    }
+    const persisted = await instructionMediaRecordForStorage(media);
+    const blobBytes = instructionMediaBinaryBuffer(persisted?.blobBytes);
+    const actualByteSize = blobBytes?.byteLength || 0;
+    const declaredByteSize = Number(media.byteSize || actualByteSize);
+    if (
+      actualByteSize < 1
+      || actualByteSize > MAX_INSTRUCTION_MEDIA_FILE_BYTES
+      || !Number.isSafeInteger(declaredByteSize)
+      || declaredByteSize !== actualByteSize
+    ) {
+      throw new Error("The delivery-instruction image bytes do not match the approved file size.");
+    }
+    const now = new Date().toISOString();
+    const priority = Math.min(2, Math.max(0, Number(media.priority || 0)));
+    const record = {
+      ...persisted,
+      key: makeInstructionMediaKey(normalizedPartition, mediaId),
+      partitionKey: normalizedPartition,
+      mediaId,
+      jobId: String(media.jobId || ""),
+      mediaKind: "image",
+      mimeType: String(media.mimeType || "application/octet-stream").toLowerCase(),
+      fileName: String(media.fileName || "Delivery instruction image").slice(0, 255),
+      byteSize: actualByteSize,
+      priority,
+      createdAt: persisted.createdAt || now,
+      updatedAt: now,
+      lastAccessedAt: now
+    };
+
+    const db = await open();
+    const transaction = db.transaction(["profiles", "instructionMedia"], "readwrite");
+    const completion = transactionDone(transaction);
+    const profile = await requestResult(transaction.objectStore("profiles").get(normalizedPartition));
+    if (!profile || profile.locked) {
+      transaction.abort();
+      await completion.catch(() => {});
+      throw new Error("The Driver offline cache is locked for this session.");
+    }
+    const store = transaction.objectStore("instructionMedia");
+    const existing = await getAll(store.index("byPartition"), normalizedPartition);
+    const candidates = existing.filter((entry) => entry.key !== record.key).concat(record);
+    const eviction = selectInstructionMediaEvictions(
+      candidates,
+      MAX_INSTRUCTION_MEDIA_BYTES,
+      [mediaId]
+    );
+    const evicted = new Set(eviction.evictedMediaIds);
+    store.put(record);
+    for (const entry of candidates) {
+      if (evicted.has(String(entry.mediaId))) store.delete(entry.key);
+    }
+    await completion;
     return {
-      allowed: nextBytes <= MAX_EVIDENCE_BYTES && nextCount <= MAX_UNSYNCED_PHOTOS,
-      reason: nextBytes > MAX_EVIDENCE_BYTES
-        ? "Offline photo storage has reached 250 MB. Synchronize before taking more required photos."
-        : nextCount > MAX_UNSYNCED_PHOTOS
-          ? "There are already 100 unsynchronized photos. Synchronize before taking more required photos."
-          : "",
-      ...health,
-      nextBytes,
-      nextCount
+      ...instructionMediaRecordForRuntime(record),
+      evictedMediaIds: eviction.evictedMediaIds,
+      retainedBytes: eviction.retainedBytes
+    };
+  }
+
+  async function getCachedInstructionMedia(partitionKey, mediaId) {
+    const key = makeInstructionMediaKey(partitionKey, mediaId);
+    if (!String(partitionKey || "") || !String(mediaId || "")) return null;
+    const db = await open();
+    const transaction = db.transaction("instructionMedia", "readwrite");
+    const completion = transactionDone(transaction);
+    const store = transaction.objectStore("instructionMedia");
+    const record = await requestResult(store.get(key));
+    if (record) {
+      store.put({ ...record, lastAccessedAt: new Date().toISOString() });
+    }
+    await completion;
+    return record ? instructionMediaRecordForRuntime(record) : null;
+  }
+
+  async function setInstructionMediaPriorities(
+    partitionKey,
+    { currentMediaIds = [], nextMediaIds = [] } = {}
+  ) {
+    const normalizedPartition = String(partitionKey || "");
+    if (!normalizedPartition) return 0;
+    const current = new Set(currentMediaIds.map((value) => String(value || "").toLowerCase()));
+    const next = new Set(nextMediaIds.map((value) => String(value || "").toLowerCase()));
+    const db = await open();
+    const transaction = db.transaction("instructionMedia", "readwrite");
+    const completion = transactionDone(transaction);
+    const store = transaction.objectStore("instructionMedia");
+    const records = await getAll(store.index("byPartition"), normalizedPartition);
+    const now = new Date().toISOString();
+    for (const record of records) {
+      const priority = current.has(String(record.mediaId))
+        ? 2
+        : next.has(String(record.mediaId))
+          ? 1
+          : 0;
+      if (Number(record.priority || 0) !== priority) {
+        store.put({ ...record, priority, updatedAt: now });
+      }
+    }
+    await completion;
+    return records.length;
+  }
+
+  async function getInstructionMediaCacheStats(partitionKey) {
+    const normalizedPartition = String(partitionKey || "");
+    if (!normalizedPartition) {
+      return { count: 0, bytes: 0, maxBytes: MAX_INSTRUCTION_MEDIA_BYTES };
+    }
+    const db = await open();
+    const transaction = db.transaction("instructionMedia", "readonly");
+    const completion = transactionDone(transaction);
+    const records = await getAll(
+      transaction.objectStore("instructionMedia").index("byPartition"),
+      normalizedPartition
+    );
+    await completion;
+    return {
+      count: records.length,
+      bytes: records.reduce((total, record) => total + instructionMediaByteSize(record), 0),
+      maxBytes: MAX_INSTRUCTION_MEDIA_BYTES
+    };
+  }
+
+  async function evictInstructionMediaForEvidence(
+    partitionKey,
+    { bytesToFree = Number.MAX_SAFE_INTEGER } = {}
+  ) {
+    const normalizedPartition = String(partitionKey || "");
+    if (!normalizedPartition) {
+      throw new Error("A Driver partition is required before freeing optional offline media.");
+    }
+    const targetBytes = Math.max(0, nonNegativeInteger(bytesToFree));
+    const db = await open();
+    const transaction = db.transaction(["profiles", "instructionMedia"], "readwrite");
+    const completion = transactionDone(transaction);
+    const profile = await requestResult(
+      transaction.objectStore("profiles").get(normalizedPartition)
+    );
+    if (!profile || profile.locked) {
+      transaction.abort();
+      await completion.catch(() => {});
+      throw new Error("The Driver offline cache is locked for this session.");
+    }
+    const store = transaction.objectStore("instructionMedia");
+    const records = await getAll(store.index("byPartition"), normalizedPartition);
+    const ordered = [...records].sort((left, right) => (
+      instructionMediaEvictionOrder(left, right)
+    ));
+    const evictedMediaIds = [];
+    let evictedBytes = 0;
+    for (const record of ordered) {
+      if (evictedBytes >= targetBytes) break;
+      store.delete(record.key);
+      evictedMediaIds.push(String(record.mediaId));
+      evictedBytes += instructionMediaByteSize(record);
+    }
+    await completion;
+    const totalBytes = records.reduce(
+      (sum, record) => sum + instructionMediaByteSize(record),
+      0
+    );
+    return {
+      evictedMediaIds,
+      evictedBytes,
+      remainingBytes: Math.max(0, totalBytes - evictedBytes)
     };
   }
 
@@ -1966,6 +2308,7 @@
     DB_NAME,
     DB_VERSION,
     MAX_EVIDENCE_BYTES,
+    MAX_INSTRUCTION_MEDIA_BYTES,
     MAX_UNSYNCED_PHOTOS,
     normalizeDriverLogin,
     makePartitionKey,
@@ -2016,6 +2359,11 @@
     getSyncState,
     getStorageHealth,
     canStorePhoto,
+    cacheInstructionMedia,
+    getCachedInstructionMedia,
+    setInstructionMediaPriorities,
+    getInstructionMediaCacheStats,
+    evictInstructionMediaForEvidence,
     acquireLease,
     getLease,
     releaseLease,

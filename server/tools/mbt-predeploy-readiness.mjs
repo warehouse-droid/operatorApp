@@ -88,7 +88,20 @@ export const REQUIRED_MBT_P3_MIGRATIONS = Object.freeze([
   "141_transfer_dependency_revision_reprint.sql",
   "142_mbt_frontdesk_customer_charge_requests.sql",
   "143_mbt_item_charge_bases_and_aggregate.sql",
-  "144_mbt_mbbs_billing_address_overrides.sql"
+  "144_mbt_mbbs_billing_address_overrides.sql",
+  "145_scm_po_split_active_ref_uniqueness.sql",
+  "146_smart_scm_blanket_load_merge.sql",
+  "147_scm_po_vendor_reference_backfill.sql",
+  "148_scm_po_history_line_financial_backfill.sql",
+  "149_sales_stock_requests.sql",
+  "150_stock_request_closed_status.sql",
+  "151_stock_request_remarks.sql",
+  "152_sales_stock_request_over_availability_gate.sql",
+  "153_driver_camera_device_copy_gate.sql",
+  "154_sales_order_delivery_instructions.sql",
+  "155_delivery_instruction_media_replacement.sql",
+  "156_scm_vendor_item_price.sql",
+  "157_yard_movement_history_indexes.sql"
 ]);
 
 export const REQUIRED_MBT_P3_FLAGS = Object.freeze([

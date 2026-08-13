@@ -848,7 +848,9 @@ async function itemPolicy(itemId, destinationLocationId, { allowExcluded = false
               NULLIF(BTRIM(item.vendor), ''),
               NULLIF(BTRIM(policy.vendor), '')
             ) AS vendor_yard,
+            policy.vendor_yard AS configured_vendor_yard,
             policy.plant,
+            policy.plant AS configured_plant,
             COALESCE(item.to_plt, policy.to_plt) AS to_plt,
             COALESCE(item.to_lyr, policy.to_lyr) AS to_lyr,
             COALESCE(item.to_sec, policy.to_sec) AS to_sec,

@@ -1,4 +1,6 @@
 const smartBlanketSearchTimers = new Map();
+const smartBlanketSourceItemSearchSequences = new Map();
+const smartBlanketSelectedProposalIds = new Set();
 let smartBlanketWorkspaceRequestSequence = 0;
 
 function smartBlanketNumber(value, places = 2) {
@@ -104,6 +106,57 @@ function smartBlanketPhysicalPalletLine(proposal = {}, line = {}, editable = fal
   </tr>`;
 }
 
+function smartBlanketProposalEditable(proposal = {}) {
+  const allocations = proposal.blanketAllocations || [];
+  return smartCanWrite() && String(proposal.status) === "held"
+    && allocations.length > 0 && allocations.every((row) => row.status === "planned");
+}
+
+function smartBlanketProposalSourceItemResults(proposalId, items = []) {
+  if (!items.length) {
+    return `<div class="smart-empty smart-empty-compact">No addable item from this source PO matches. Items already in this yard line and fully planned source balances are excluded.</div>`;
+  }
+  return items.map((item) => `<div class="smart-proposal-item-result" data-smart-blanket-source-item="${smartEscape(item.sourceLineId)}">
+    <div><strong>${smartEscape(item.itemName || item.itemId)}</strong><div class="smart-help">ID ${smartEscape(item.itemId)} · source line ${smartEscape(item.lineId || item.sourceLineId)} · ${smartEscape(item.description || item.unit || "")} · ${smartBlanketNumber(item.availableForPlanningPallets, 0)} PLT available to add</div></div>
+    <label><span>PLT</span><input data-smart-blanket-add-pallets data-smart-focus-key="blanket-proposal:${smartEscape(proposalId)}:add-source-line:${smartEscape(item.sourceLineId)}:pallets" type="number" min="1" max="${smartEscape(item.availableForPlanningPallets)}" step="1" value="1" /></label>
+    <button class="smart-button primary" data-smart-action="add-blanket-source-item" data-proposal-id="${smartEscape(proposalId)}" data-item-id="${smartEscape(item.itemId)}" data-source-line-id="${smartEscape(item.sourceLineId)}" type="button">Add</button>
+  </div>`).join("");
+}
+
+function smartBlanketProposalSourceItemEditor(proposal = {}, editable = false) {
+  if (!editable) return "";
+  return `<div class="smart-proposal-line-editor" data-smart-blanket-line-editor="${smartEscape(proposal.id)}">
+    <div class="smart-proposal-line-editor-controls">
+      <strong>Add item from ${smartEscape(smartBlanketProposalSourceRef(proposal) || "source PO")}</strong>
+      <label class="smart-proposal-line-destination"><span>To</span><select data-smart-blanket-add-destination data-smart-focus-key="blanket-proposal:${smartEscape(proposal.id)}:add-source-item:destination" aria-label="Destination yard for source PO item">${smartBlanketYardOptions(proposal.destinationLocationId)}</select></label>
+      <input data-smart-blanket-source-item-search="${smartEscape(proposal.id)}" data-smart-focus-key="blanket-proposal:${smartEscape(proposal.id)}:add-source-item:search" type="search" placeholder="Search item ID, name, or description" aria-label="Search this source PO for an item to add" autocomplete="off" />
+      <button class="smart-button" data-smart-action="search-blanket-source-items" data-proposal-id="${smartEscape(proposal.id)}" type="button">Show source items</button>
+    </div>
+    <div class="smart-proposal-item-results" data-smart-blanket-source-item-results="${smartEscape(proposal.id)}" aria-live="polite"></div>
+  </div>`;
+}
+
+async function smartSearchBlanketProposalSourceItems(proposalId, search = "") {
+  const key = String(proposalId);
+  const requestId = Number(smartBlanketSourceItemSearchSequences.get(key) || 0) + 1;
+  smartBlanketSourceItemSearchSequences.set(key, requestId);
+  const editor = document.querySelector(`[data-smart-blanket-line-editor="${proposalId}"]`);
+  const destinationLocationId = editor?.querySelector("[data-smart-blanket-add-destination]")?.value || "";
+  const target = editor?.querySelector(`[data-smart-blanket-source-item-results="${proposalId}"]`);
+  const params = new URLSearchParams({ search, destinationLocationId, limit: "20" });
+  if (target) target.innerHTML = `<span class="smart-help">Checking available items on this source PO…</span>`;
+  try {
+    const items = await smartApi(`/api/scm/smart/blanket-proposals/${proposalId}/source-items?${params}`);
+    if (Number(smartBlanketSourceItemSearchSequences.get(key)) !== requestId) return;
+    const current = document.querySelector(`[data-smart-blanket-line-editor="${proposalId}"] [data-smart-blanket-source-item-results="${proposalId}"]`);
+    if (current) current.innerHTML = smartBlanketProposalSourceItemResults(proposalId, items);
+  } catch (error) {
+    if (Number(smartBlanketSourceItemSearchSequences.get(key)) !== requestId) return;
+    const current = document.querySelector(`[data-smart-blanket-line-editor="${proposalId}"] [data-smart-blanket-source-item-results="${proposalId}"]`);
+    if (current) current.innerHTML = `<div class="smart-notice error">${smartEscape(error.message)}</div>`;
+  }
+}
+
 function smartBlanketProposalCard(proposal = {}, sourceOrdersByRef = new Map(), allProposals = []) {
   const sourceRef = proposal.blanketSourcePoRef || proposal.blanket_source_po_ref || proposal.sourcePoRef || proposal.source_po_ref || proposal.sourceRef || "—";
   const sourceOrder = sourceOrdersByRef.get(String(sourceRef).toLowerCase()) || {};
@@ -114,23 +167,23 @@ function smartBlanketProposalCard(proposal = {}, sourceOrdersByRef = new Map(), 
     ? smartUrgencyLabel(urgencyLevel)
     : urgencyLevel.replaceAll("_", " ");
   const overCapacity = Number(proposal.utilization) > 1.000001;
-  const allocations = proposal.blanketAllocations || [];
-  const editable = smartCanWrite() && String(proposal.status) === "held"
-    && allocations.length > 0 && allocations.every((row) => row.status === "planned");
+  const editable = smartBlanketProposalEditable(proposal);
   const reservable = editable;
+  const selected = smartBlanketSelectedProposalIds.has(Number(proposal.id));
   const route = typeof smartProposalRoute === "function"
     ? smartProposalRoute(proposal)
     : [proposal.vendor || proposal.sourceName || "Vendor", proposal.destinationName].filter(Boolean).join(" → ");
-  return `<article class="smart-proposal smart-blanket-proposal" data-blanket-proposal="${smartEscape(proposal.id)}" data-smart-urgency="${smartEscape(urgencyLevel)}">
+  return `<article class="smart-proposal smart-blanket-proposal ${selected ? "selected" : ""}" data-blanket-proposal="${smartEscape(proposal.id)}" data-smart-urgency="${smartEscape(urgencyLevel)}">
     <div class="smart-proposal-head">
-      <div class="smart-proposal-identity"><strong class="smart-proposal-type">BLANKET</strong><div class="smart-proposal-badges">${smartPill(proposal.status || "held")}${urgencyLevel !== "normal" ? smartPill("attention", urgencyLabel) : ""}${overCapacity ? smartPill("attention", "Over capacity · manual") : ""}</div></div>
-      <div class="smart-proposal-route"><strong>${smartEscape(route || sourceRef)}</strong><span>#${smartEscape(proposal.id)} · exact oldest-source allocation</span></div>
+      <div class="smart-proposal-identity">${editable ? `<label class="smart-proposal-select"><input data-smart-blanket-proposal-select="${smartEscape(proposal.id)}" data-smart-focus-key="blanket-proposal:${smartEscape(proposal.id)}:merge-selected" type="checkbox" ${selected ? "checked" : ""} /><span>Merge</span></label>` : ""}<strong class="smart-proposal-type">BLANKET</strong><div class="smart-proposal-badges">${smartPill(proposal.status || "held")}${urgencyLevel !== "normal" ? smartPill("attention", urgencyLabel) : ""}${overCapacity ? smartPill("attention", "Over capacity · manual") : ""}</div></div>
+      <div class="smart-proposal-route"><strong>${smartEscape(route || sourceRef)}</strong><span>#${smartEscape(proposal.id)} · exact oldest-source allocation${proposal.manuallyGrouped ? " · manually merged" : ""}</span></div>
       <div class="smart-proposal-metric"><strong>${smartBlanketNumber(proposal.totalPallets, 0)} PLT</strong><span>Pallets</span></div>
       <div class="smart-proposal-metric"><strong>${smartBlanketNumber(proposal.totalWeightLbs, 0)} lb</strong><span>${smartPercent(proposal.utilization, 0)} truck</span></div>
       <div class="smart-proposal-metric"><strong>${smartEscape(sourceRef)}</strong><span>Source PO</span></div>
       <div class="smart-actions">${reservable ? `<button class="smart-button primary" data-smart-action="confirm-blanket-proposal" data-proposal-id="${smartEscape(proposal.id)}" type="button">Confirm release</button>` : ""}</div>
     </div>
     <div class="smart-proposal-lines smart-table-wrap smart-proposal-lines-compact smart-blanket-proposal-lines"><table class="smart-table"><thead><tr><th>Item</th><th>Destination</th><th class="numeric">Required</th><th>Proposed</th><th class="numeric">Sales qty</th><th class="numeric">Weight</th><th>Availability</th></tr></thead><tbody>${(proposal.lines || []).map((line) => smartBlanketProposalLine(proposal, line, smartBlanketProposalLineSourceRemaining(proposal, line, sourceOrder, allProposals), editable)).join("")}${(proposal.physicalPalletLines || []).map((line) => smartBlanketPhysicalPalletLine(proposal, line, editable)).join("")}</tbody></table></div>
+    ${smartBlanketProposalSourceItemEditor(proposal, editable)}
   </article>`;
 }
 
@@ -160,8 +213,75 @@ function smartBlanketSortedProposals(proposals = []) {
     if (!names.length) names.push(String(proposal.destinationName || ""));
     return Math.min(...names.map((name) => yardOrder.get(name) ?? yardOrder.size));
   };
-  return [...proposals].sort((left, right) => (urgencyOrder.get(level(right)) || 0) - (urgencyOrder.get(level(left)) || 0)
+  return [...proposals].sort((left, right) => smartProposalManualPriority(left) - smartProposalManualPriority(right)
+    || (urgencyOrder.get(level(right)) || 0) - (urgencyOrder.get(level(left)) || 0)
     || destinationRank(left) - destinationRank(right)
+    || Number(left.id) - Number(right.id));
+}
+
+function smartBlanketProposalSourceRef(proposal = {}) {
+  return String(proposal.blanketSourcePoRef || proposal.blanket_source_po_ref
+    || proposal.sourcePoRef || proposal.source_po_ref || proposal.sourceRef || "").trim();
+}
+
+function smartBlanketFilteredProposals(proposals = []) {
+  const search = String(smartState.blanketPlanSearch || "").trim().toLowerCase();
+  const filtered = proposals.filter((proposal) => {
+    const vendor = typeof smartProposalVendor === "function"
+      ? smartProposalVendor(proposal)
+      : String(proposal.vendor || proposal.sourceName || "").trim();
+    const normalizedVendor = typeof smartNormalizedVendor === "function"
+      ? smartNormalizedVendor(vendor)
+      : vendor.toLowerCase();
+    const stops = typeof smartProposalStops === "function"
+      ? smartProposalStops(proposal)
+      : proposal.routeStops || [{ name: proposal.destinationName }];
+    if (smartState.blanketPlanStatus && proposal.status !== smartState.blanketPlanStatus) return false;
+    if (smartState.blanketPlanVendor && normalizedVendor !== smartState.blanketPlanVendor) return false;
+    if (smartState.blanketPlanSource && smartBlanketProposalSourceRef(proposal) !== smartState.blanketPlanSource) return false;
+    if (smartState.blanketPlanDestination
+      && !stops.some((stop) => String(stop.name || stop.destinationName || "") === smartState.blanketPlanDestination)) return false;
+    if (!search) return true;
+    const route = typeof smartProposalRoute === "function"
+      ? smartProposalRoute(proposal)
+      : [vendor, ...stops.map((stop) => stop.name || stop.destinationName)].filter(Boolean).join(" → ");
+    return [
+      proposal.id,
+      route,
+      vendor,
+      smartBlanketProposalSourceRef(proposal),
+      proposal.plant,
+      proposal.memo,
+      ...(proposal.lines || []).flatMap((line) => [
+        line.itemId,
+        line.itemName,
+        line.itemDescription,
+        line.destinationName
+      ])
+    ].some((value) => String(value || "").toLowerCase().includes(search));
+  });
+  const stopsKey = (proposal) => (typeof smartProposalStops === "function"
+    ? smartProposalStops(proposal)
+    : proposal.routeStops || [{ name: proposal.destinationName }])
+    .map((stop) => stop.name || stop.destinationName || "").join("|");
+  const sourceKey = (proposal) => `${smartBlanketProposalSourceRef(proposal)}|${proposal.vendor || proposal.sourceName || ""}`;
+  const primary = smartState.blanketPlanSort === "source" ? sourceKey : stopsKey;
+  const secondary = smartState.blanketPlanSort === "source" ? stopsKey : sourceKey;
+  const urgencyRank = (proposal) => typeof smartUrgencyRank === "function" && typeof smartProposalUrgencyLevel === "function"
+    ? smartUrgencyRank(smartProposalUrgencyLevel(proposal))
+    : 0;
+  const destinationPriority = (proposal) => typeof smartProposalDestinationPriority === "function"
+    ? smartProposalDestinationPriority(proposal)
+    : 0;
+  const urgencyScore = (proposal) => typeof smartProposalUrgencyScore === "function"
+    ? smartProposalUrgencyScore(proposal)
+    : 0;
+  return filtered.sort((left, right) => smartProposalManualPriority(left) - smartProposalManualPriority(right)
+    || urgencyRank(right) - urgencyRank(left)
+    || destinationPriority(left) - destinationPriority(right)
+    || urgencyScore(right) - urgencyScore(left)
+    || primary(left).localeCompare(primary(right), undefined, { numeric: true })
+    || secondary(left).localeCompare(secondary(right), undefined, { numeric: true })
     || Number(left.id) - Number(right.id));
 }
 
@@ -176,15 +296,53 @@ function smartBlanketSidebarTabButton({ tab, label, count, panelId }) {
   return `<button id="${tabId}" class="${selected ? "active" : ""}" data-smart-action="set-blanket-sidebar-tab" data-smart-blanket-sidebar-tab="${tab}" type="button" role="tab" aria-selected="${selected ? "true" : "false"}" aria-controls="${panelId}" aria-label="${smartEscape(`${label}, ${countLabel}`)}" tabindex="${selected ? "0" : "-1"}"><span>${smartEscape(label)}</span><strong aria-hidden="true">${smartEscape(count)}</strong></button>`;
 }
 
+function smartBlanketMergeSelection(proposals = []) {
+  const byId = new Map(proposals.map((proposal) => [Number(proposal.id), proposal]));
+  for (const proposalId of [...smartBlanketSelectedProposalIds]) {
+    if (!smartBlanketProposalEditable(byId.get(proposalId))) smartBlanketSelectedProposalIds.delete(proposalId);
+  }
+  const selected = [...smartBlanketSelectedProposalIds].map((proposalId) => byId.get(proposalId)).filter(Boolean);
+  if (selected.length < 2) {
+    return { selected, compatible: false, help: "Select at least two held loads from the same source Blanket PO." };
+  }
+  const first = selected[0];
+  const sameRun = selected.every((proposal) => Number(proposal.runId) === Number(first.runId));
+  const sameSource = selected.every((proposal) => Number(proposal.blanketSourcePoId) === Number(first.blanketSourcePoId));
+  if (!sameRun || !sameSource) {
+    return { selected, compatible: false, help: "Selected loads must come from the same planning run and source Blanket PO." };
+  }
+  return { selected, compatible: true, help: "Quantities above one-truck capacity will be deferred as whole pallets." };
+}
+
 function smartBlanketOrders() {
   const workspace = smartState.blanketWorkspace || {};
   const sources = smartBlanketRows(workspace, "blanketOrders");
   const candidates = smartBlanketRows(workspace, "candidates");
-  const proposals = smartBlanketSortedProposals(smartBlanketRows(workspace, "proposals"));
+  const allProposals = smartBlanketSortedProposals(smartBlanketRows(workspace, "proposals"));
+  const proposals = smartBlanketFilteredProposals(allProposals);
   const releases = smartBlanketRows(workspace, "releases");
   const latestRun = workspace.latestRun || workspace.plan || null;
+  const mergeSelection = smartBlanketMergeSelection(allProposals);
   const sidebarTab = smartBlanketSidebarTab();
   const sourceOrdersByRef = new Map(sources.map((source) => [smartBlanketRef(source).toLowerCase(), source]));
+  const statuses = [...new Set(allProposals.map((proposal) => proposal.status).filter(Boolean))]
+    .sort((left, right) => left.localeCompare(right));
+  const vendorsByKey = new Map();
+  allProposals.forEach((proposal) => {
+    const vendor = typeof smartProposalVendor === "function"
+      ? smartProposalVendor(proposal)
+      : String(proposal.vendor || proposal.sourceName || "").trim();
+    const key = typeof smartNormalizedVendor === "function" ? smartNormalizedVendor(vendor) : vendor.toLowerCase();
+    if (key && !vendorsByKey.has(key)) vendorsByKey.set(key, vendor);
+  });
+  const vendors = [...vendorsByKey.entries()].sort((left, right) => left[1].localeCompare(right[1], undefined, { numeric: true }));
+  const sourceRefs = [...new Set(allProposals.map(smartBlanketProposalSourceRef).filter(Boolean))]
+    .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
+  const destinations = [...new Set(allProposals.flatMap((proposal) => (typeof smartProposalStops === "function"
+    ? smartProposalStops(proposal)
+    : proposal.routeStops || [{ name: proposal.destinationName }])
+    .map((stop) => stop.name || stop.destinationName)).filter(Boolean))]
+    .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
   return `<section class="smart-section smart-blanket-section">
     <div class="smart-section-head"><div><h2>Blanket orders</h2><p>Reserve current Smart SCM demand from open blanket balances. Sources are consumed oldest first; regular vendor PO proposals remain paused while blanket quantity is available, but TO planning remains active.</p></div><div class="smart-actions">${smartCanWrite() ? `<button class="smart-button primary" data-smart-action="build-blanket-plan" type="button">Calculate releases</button>` : ""}<button class="smart-button" data-smart-action="refresh-blanket-workspace" type="button">Refresh</button></div></div>
     <div class="smart-blanket-workspace">
@@ -204,10 +362,19 @@ function smartBlanketOrders() {
         </section>
       </aside>
       <div class="smart-blanket-results">
-        <div class="smart-blanket-results-head"><div><strong>Pooled release proposals</strong><span>${latestRun ? `Run #${smartEscape(latestRun.id)} · ${smartDate(latestRun.completedAt || latestRun.createdAt, true)}` : "Calculate after flagging source POs"}</span></div><div><strong>${proposals.length}</strong><span>load${proposals.length === 1 ? "" : "s"}</span></div></div>
+        <div class="smart-blanket-results-head"><div><strong>Pooled release proposals</strong><span>${latestRun ? `Run #${smartEscape(latestRun.id)} · ${smartDate(latestRun.completedAt || latestRun.createdAt, true)}` : "Calculate after flagging source POs"}</span></div><div class="smart-actions"><span class="smart-help" title="${smartEscape(mergeSelection.help)}">${smartEscape(mergeSelection.help)}</span>${smartCanWrite() ? `<button class="smart-button" data-smart-action="merge-blanket-proposals" type="button" ${mergeSelection.compatible ? "" : "disabled"}>Merge selected (${mergeSelection.selected.length})</button>` : ""}<div><strong>${proposals.length}</strong><span>of ${allProposals.length} load${allProposals.length === 1 ? "" : "s"}</span></div></div></div>
+        <div class="smart-toolbar smart-plan-toolbar">
+          <input id="smartBlanketPlanSearch" type="search" value="${smartEscape(smartState.blanketPlanSearch)}" placeholder="Item, vendor, source PO, yard, or memo" />
+          <select id="smartBlanketPlanStatus"><option value="">All statuses</option>${statuses.map((status) => `<option value="${smartEscape(status)}" ${smartState.blanketPlanStatus === status ? "selected" : ""}>${smartEscape(status.replaceAll("_", " "))}</option>`).join("")}</select>
+          <select id="smartBlanketPlanVendor"><option value="">All vendors</option>${vendors.map(([key, vendor]) => `<option value="${smartEscape(key)}" ${smartState.blanketPlanVendor === key ? "selected" : ""}>${smartEscape(vendor)}</option>`).join("")}</select>
+          <select id="smartBlanketPlanSource"><option value="">All source POs</option>${sourceRefs.map((sourceRef) => `<option value="${smartEscape(sourceRef)}" ${smartState.blanketPlanSource === sourceRef ? "selected" : ""}>${smartEscape(sourceRef)}</option>`).join("")}</select>
+          <select id="smartBlanketPlanDestination"><option value="">All destination yards</option>${destinations.map((destination) => `<option value="${smartEscape(destination)}" ${smartState.blanketPlanDestination === destination ? "selected" : ""}>${smartEscape(destination)}</option>`).join("")}</select>
+          <select id="smartBlanketPlanSort"><option value="destination" ${smartState.blanketPlanSort === "destination" ? "selected" : ""}>Tie-break: destination route</option><option value="source" ${smartState.blanketPlanSort === "source" ? "selected" : ""}>Tie-break: source PO / vendor</option></select>
+          <button class="smart-button" data-smart-action="filter-blanket-plan" type="button">Apply</button>
+        </div>
         ${typeof smartUrgencyLegend === "function" ? smartUrgencyLegend() : ""}
         ${workspace.warning ? `<div class="smart-notice warn">${smartEscape(workspace.warning)}</div>` : ""}
-        <div class="smart-blanket-proposals">${proposals.map((proposal) => smartBlanketProposalCard(proposal, sourceOrdersByRef, proposals)).join("") || `<div class="smart-empty">No blanket release is currently required. Refresh inventory or calculate again after demand changes.</div>`}</div>
+        <div class="smart-blanket-proposals">${proposals.map((proposal) => smartBlanketProposalCard(proposal, sourceOrdersByRef, allProposals)).join("") || `<div class="smart-empty">${allProposals.length ? "No Blanket proposal matches this filter." : "No blanket release is currently required. Refresh inventory or calculate again after demand changes."}</div>`}</div>
         <section class="smart-blanket-history"><div class="smart-blanket-results-head"><div><strong>Blanket release history</strong><span>Reservations, finalized local splits, holds, and cancellations</span></div><strong>${releases.length}</strong></div><div class="smart-table-wrap"><table class="smart-table"><thead><tr><th>Split / reservation</th><th>Status</th><th>Vendor</th><th>Destinations</th><th class="numeric">PLT</th><th>Updated</th></tr></thead><tbody>${releases.map((release) => smartBlanketReleaseRow(release, sourceOrdersByRef)).join("") || `<tr><td colspan="6" class="smart-empty">No blanket release history yet.</td></tr>`}</tbody></table></div></section>
       </div>
     </div>
@@ -239,7 +406,7 @@ smartScmApp.addEventListener("click", async (event) => {
   const button = event.target.closest("[data-smart-action]");
   if (!button || smartState.busy) return;
   const action = button.dataset.smartAction;
-  if (!["set-blanket-sidebar-tab", "refresh-blanket-workspace", "build-blanket-plan", "flag-blanket-po", "unflag-blanket-po", "save-blanket-proposal-line", "split-blanket-proposal-line", "remove-blanket-proposal-line", "save-blanket-pallet-line", "reset-blanket-pallet-line", "confirm-blanket-proposal"].includes(action)) return;
+  if (!["set-blanket-sidebar-tab", "filter-blanket-plan", "refresh-blanket-workspace", "build-blanket-plan", "merge-blanket-proposals", "flag-blanket-po", "unflag-blanket-po", "save-blanket-proposal-line", "split-blanket-proposal-line", "remove-blanket-proposal-line", "search-blanket-source-items", "add-blanket-source-item", "save-blanket-pallet-line", "reset-blanket-pallet-line", "confirm-blanket-proposal"].includes(action)) return;
   try {
     if (action === "set-blanket-sidebar-tab") {
       const selectedTab = button.dataset.smartBlanketSidebarTab;
@@ -247,6 +414,16 @@ smartScmApp.addEventListener("click", async (event) => {
       smartState.blanketSidebarTab = selectedTab;
       smartRender();
       requestAnimationFrame(() => document.querySelector(`[data-smart-blanket-sidebar-tab="${selectedTab}"]`)?.focus());
+      return;
+    }
+    if (action === "filter-blanket-plan") {
+      smartState.blanketPlanSearch = document.getElementById("smartBlanketPlanSearch")?.value || "";
+      smartState.blanketPlanStatus = document.getElementById("smartBlanketPlanStatus")?.value || "";
+      smartState.blanketPlanVendor = document.getElementById("smartBlanketPlanVendor")?.value || "";
+      smartState.blanketPlanSource = document.getElementById("smartBlanketPlanSource")?.value || "";
+      smartState.blanketPlanDestination = document.getElementById("smartBlanketPlanDestination")?.value || "";
+      smartState.blanketPlanSort = document.getElementById("smartBlanketPlanSort")?.value || "destination";
+      smartRender();
       return;
     }
     if (action === "refresh-blanket-workspace") {
@@ -260,11 +437,53 @@ smartScmApp.addEventListener("click", async (event) => {
       if (typeof smartRefreshPlanningExclusions === "function") await smartRefreshPlanningExclusions();
       return;
     }
+    if (action === "merge-blanket-proposals") {
+      const proposals = smartBlanketRows(smartState.blanketWorkspace, "proposals");
+      const selection = smartBlanketMergeSelection(proposals);
+      if (!selection.compatible) throw new Error(selection.help);
+      const proposalIds = selection.selected.map((proposal) => Number(proposal.id));
+      if (!confirm(`Merge ${proposalIds.length} selected Blanket loads into one truck? They must use the same source PO. Quantities above capacity will be reduced proportionally to whole pallets and returned to the unreserved pool.`)) return;
+      const result = await smartWork("Merging selected Blanket loads", () => smartApi("/api/scm/smart/blanket-proposals/merge", {
+        method: "POST",
+        body: { proposalIds }
+      }), "Blanket loads merged with exact source allocation");
+      smartBlanketSelectedProposalIds.clear();
+      smartState.blanketWorkspace = result.workspace;
+      smartRender();
+      if (typeof smartRefreshPlanningExclusions === "function") await smartRefreshPlanningExclusions();
+      return;
+    }
     if (["flag-blanket-po", "unflag-blanket-po"].includes(action)) {
       const poRef = button.dataset.poRef;
       const isBlanket = action === "flag-blanket-po";
       if (!isBlanket && !confirm(`Remove ${poRef} from the blanket pool? This is allowed only when it has no pending or active release.`)) return;
       await smartWork(isBlanket ? "Adding blanket source" : "Removing blanket source", () => smartApi(`/api/scm/purchase-orders/${encodeURIComponent(poRef)}/blanket`, { method: "PUT", body: { isBlanket } }), isBlanket ? `${poRef} added to the blanket pool` : `${poRef} removed from the blanket pool`);
+      await smartLoadBlanketWorkspace({ quiet: true });
+      if (typeof smartRefreshPlanningExclusions === "function") await smartRefreshPlanningExclusions();
+      return;
+    }
+    if (action === "search-blanket-source-items") {
+      const proposalId = Number(button.dataset.proposalId);
+      const editor = button.closest("[data-smart-blanket-line-editor]");
+      const search = editor?.querySelector("[data-smart-blanket-source-item-search]")?.value || "";
+      await smartSearchBlanketProposalSourceItems(proposalId, search);
+      return;
+    }
+    if (action === "add-blanket-source-item") {
+      const proposalId = Number(button.dataset.proposalId);
+      const itemId = Number(button.dataset.itemId);
+      const sourceLineId = Number(button.dataset.sourceLineId);
+      const result = button.closest("[data-smart-blanket-source-item]");
+      const editor = button.closest("[data-smart-blanket-line-editor]");
+      const proposedPallets = Number(result?.querySelector("[data-smart-blanket-add-pallets]")?.value);
+      const destinationLocationId = Number(editor?.querySelector("[data-smart-blanket-add-destination]")?.value);
+      if (!Number.isInteger(proposedPallets) || proposedPallets <= 0) {
+        throw new Error("Blanket source item quantity must be a positive whole number of pallets.");
+      }
+      await smartWork("Adding source PO item", () => smartApi(`/api/scm/smart/blanket-proposals/${proposalId}/lines`, {
+        method: "POST",
+        body: { sourceLineId, itemId, proposedPallets, destinationLocationId }
+      }), "Source PO item added with exact available quantity");
       await smartLoadBlanketWorkspace({ quiet: true });
       if (typeof smartRefreshPlanningExclusions === "function") await smartRefreshPlanningExclusions();
       return;
@@ -343,6 +562,23 @@ smartScmApp.addEventListener("click", async (event) => {
   }
 });
 
+smartScmApp.addEventListener("change", (event) => {
+  if (event.target.matches("[data-smart-blanket-add-destination]")) {
+    const editor = event.target.closest("[data-smart-blanket-line-editor]");
+    const proposalId = editor?.dataset.smartBlanketLineEditor;
+    const search = editor?.querySelector("[data-smart-blanket-source-item-search]")?.value || "";
+    if (proposalId && (search || editor?.querySelector("[data-smart-blanket-source-item-results]")?.textContent)) {
+      smartSearchBlanketProposalSourceItems(proposalId, search);
+    }
+    return;
+  }
+  const proposalId = Number(event.target.dataset.smartBlanketProposalSelect);
+  if (!Number.isInteger(proposalId) || proposalId <= 0) return;
+  if (event.target.checked) smartBlanketSelectedProposalIds.add(proposalId);
+  else smartBlanketSelectedProposalIds.delete(proposalId);
+  smartRender();
+});
+
 smartScmApp.addEventListener("keydown", (event) => {
   const currentTab = event.target.closest("[data-smart-blanket-sidebar-tab]");
   if (!currentTab || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
@@ -358,6 +594,14 @@ smartScmApp.addEventListener("keydown", (event) => {
 });
 
 smartScmApp.addEventListener("input", (event) => {
+  const sourceItemProposalId = event.target.dataset.smartBlanketSourceItemSearch;
+  if (sourceItemProposalId) {
+    clearTimeout(smartBlanketSearchTimers.get(`source-item:${sourceItemProposalId}`));
+    smartBlanketSearchTimers.set(`source-item:${sourceItemProposalId}`, setTimeout(() => {
+      smartSearchBlanketProposalSourceItems(sourceItemProposalId, event.target.value);
+    }, 300));
+    return;
+  }
   if (event.target.id !== "smartBlanketSearch") return;
   smartState.blanketSearch = event.target.value;
   clearTimeout(smartBlanketSearchTimers.get("source"));

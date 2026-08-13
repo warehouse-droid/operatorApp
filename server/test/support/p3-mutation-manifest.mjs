@@ -15,12 +15,28 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
     ])
   }),
   Object.freeze({
+    runner: "run-delivery-instruction-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "public/driver-offline-db.js",
+      "public/driver.js",
+      "src/delivery-instruction-domain.js",
+      "src/delivery-instruction-repository.js",
+      "src/driver-offline-repository.js"
+    ])
+  }),
+  Object.freeze({
     runner: "run-dispatch-active-load-mutations.mjs",
     adminUrlEnvironment: null,
     sourcePaths: Object.freeze([
       "src/dispatch-load-assignment.js",
       "public/dispatch.js"
     ])
+  }),
+  Object.freeze({
+    runner: "run-dispatch-driver-completion-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze(["src/dispatch-history-mode.js"])
   }),
   Object.freeze({
     runner: "run-dispatch-performance-mutations.mjs",
@@ -36,6 +52,11 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
       "src/dispatch-planner-v2-repository.js",
       "src/server.js"
     ])
+  }),
+  Object.freeze({
+    runner: "run-driver-offline-stress-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze(["test/support/driver-offline-stress-model.mjs"])
   }),
   Object.freeze({
     runner: "run-frontdesk-mutations.mjs",
@@ -108,6 +129,66 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
     sourcePaths: Object.freeze([
       "src/mbt/asset-service.js",
       "src/mbt/bin-dispatch-service.js"
+    ])
+  }),
+  Object.freeze({
+    runner: "run-scm-po-split-ref-reuse-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze(["src/dispatch-repository.js"])
+  }),
+  Object.freeze({
+    runner: "run-smart-scm-blanket-merge-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze(["src/smart-scm-blanket-repository.js"])
+  }),
+  Object.freeze({
+    runner: "run-smart-scm-manual-controls-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "public/scm-smart.js",
+      "public/scm-smart-proposals.js",
+      "public/scm-smart-blanket.js",
+      "public/scm-smart-vendor.js",
+      "src/smart-scm-planning-repository.js",
+      "src/smart-scm-blanket-repository.js"
+    ])
+  }),
+  Object.freeze({
+    runner: "run-smart-scm-po-oauth-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "migrations/148_scm_po_history_line_financial_backfill.sql",
+      "public/scm-netsuite-po.js",
+      "public/scm-smart-blanket.js",
+      "public/scm-smart-vendor.js",
+      "src/order-sync-repository.js",
+      "src/scm-netsuite-po-history-repository.js",
+      "src/scm-po-vendor-reference.js",
+      "src/smart-scm-purchase-netsuite.js",
+      "src/smart-scm-vendor-financials.js"
+    ])
+  }),
+  Object.freeze({
+    runner: "run-smart-scm-vendor-unit-price-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "public/scm-smart-vendor.js",
+      "src/smart-scm-blanket-repository.js",
+      "src/smart-scm-vendor-repository.js",
+      "src/smart-scm-vendor-unit-price-repository.js",
+      "src/smart-scm-vendor-unit-price.js"
+    ])
+  }),
+  Object.freeze({
+    runner: "run-stock-request-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "public/sales-stock-requests.js",
+      "src/mbt/feature-gate-catalog.js",
+      "src/stock-request-domain.js",
+      "src/stock-request-policy.js",
+      "src/stock-request-repository.js",
+      "src/stock-request-service.js"
     ])
   }),
   Object.freeze({

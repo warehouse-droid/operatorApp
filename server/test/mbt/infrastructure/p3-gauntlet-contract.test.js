@@ -13,9 +13,12 @@ const CHECKOUT_SHA = "11d5960a326750d5838078e36cf38b85af677262";
 const UPLOAD_ARTIFACT_SHA = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
 const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
   "run-customer-charge-mutations.mjs",
+  "run-delivery-instruction-mutations.mjs",
   "run-dispatch-active-load-mutations.mjs",
+  "run-dispatch-driver-completion-mutations.mjs",
   "run-dispatch-performance-mutations.mjs",
   "run-dispatch-save-recovery-mutations.mjs",
+  "run-driver-offline-stress-mutations.mjs",
   "run-frontdesk-mutations.mjs",
   "run-p310-adversarial-mutations.mjs",
   "run-p310-reconciliation-mutations.mjs",
@@ -26,6 +29,12 @@ const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
   "run-p39-client-mutations.mjs",
   "run-p39-mutations.mjs",
   "run-p39-reservation-mutations.mjs",
+  "run-scm-po-split-ref-reuse-mutations.mjs",
+  "run-smart-scm-blanket-merge-mutations.mjs",
+  "run-smart-scm-manual-controls-mutations.mjs",
+  "run-smart-scm-po-oauth-mutations.mjs",
+  "run-smart-scm-vendor-unit-price-mutations.mjs",
+  "run-stock-request-mutations.mjs",
   "run-test-database-isolation-mutations.mjs"
 ]);
 const P3_BASE_MUTANT_NAMES = Object.freeze([
@@ -60,7 +69,9 @@ const P3_BASE_MUTANT_NAMES = Object.freeze([
 const P3_ADVERSARIAL_TESTS = Object.freeze([
   "p311-completed-load-snapshot-integrity.test.js",
   "shadow-billing-adversarial.test.js",
-  "shadow-billing-snapshot-boundary-adversarial.test.js"
+  "shadow-billing-snapshot-boundary-adversarial.test.js",
+  "stock-request-adversarial.test.js",
+  "stock-request-repository-adversarial.test.js"
 ]);
 const P3_BROWSER_SKIP_ALLOWLIST = Object.freeze([]);
 const NODE_TEST_GROUPS = Object.freeze([

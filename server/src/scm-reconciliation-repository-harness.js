@@ -94,6 +94,16 @@ assert.equal(scmScheduleEffectiveReconciliationStatus({
   blockingReview: true
 }), "Reconcile Review", "A blocking review must take precedence over pending and schedule statuses.");
 
+assert.equal(scmScheduleEffectiveReconciliationStatus({
+  scheduleStatus: "Reconcile Review",
+  scheduleId: 107,
+  scheduleUpdatedAt: newerScheduleAt,
+  reconciliationStatus: "review",
+  reconciliationReconciledAt: newerReconciliationAt,
+  reconciliationApplicationStatus: "Completed",
+  blockingReview: true
+}), "Reconcile Review", "A blocking review must remain visible even when received quantities calculate as Completed.");
+
 const rollback = await beginRollbackContext();
 const seed = Number(String(Date.now()).slice(-8));
 const operatorId = `reconcile-harness-${seed}`;
@@ -676,6 +686,15 @@ try {
         identityStatus: "exact"
       })]
     );
+    await query(
+      `INSERT INTO scm_transport_schedule (
+         order_kind, source_table, source_id, order_ref, status,
+         created_by, updated_by
+       ) VALUES (
+         'PO', 'purchase_orders', $1, $2, 'Planned', $3, $3
+       )`,
+      [terminalPoId, terminalPoRef, operatorId]
+    );
     const terminalPoResult = await reconcileScmOrderFamily({
       kind: "PO",
       sourceOrderId: terminalPoId,
@@ -685,10 +704,50 @@ try {
     assert.equal(terminalPoResult.targets[terminalPoRef].received, 10,
       "A terminal PO header must apply full receipt quantity to its target, not only its family rollup.");
     const terminalPoLocal = await query(
-      "SELECT receipt_status FROM purchase_orders WHERE netsuite_id = $1",
-      [terminalPoId]
+      `SELECT po.receipt_status,
+              schedule.status AS operational_status,
+              state.application_status AS calculated_status,
+              state.ordered_qty,
+              state.received_qty
+         FROM purchase_orders po
+         JOIN scm_transport_schedule schedule
+           ON schedule.order_kind = 'PO'
+          AND schedule.order_ref = $2
+         JOIN scm_reconciliation_order_state state
+           ON state.order_kind = 'PO'
+          AND state.source_order_netsuite_id = po.netsuite_id
+        WHERE po.netsuite_id = $1`,
+      [terminalPoId, terminalPoRef]
     );
-    assert.equal(terminalPoLocal.rows[0].receipt_status, "received");
+    assert.equal(terminalPoLocal.rows[0].receipt_status, "not_received",
+      "PO calculation must not overwrite the canonical receipt field.");
+    assert.equal(terminalPoLocal.rows[0].operational_status, "Planned",
+      "PO calculation must not overwrite an existing schedule status.");
+    assert.equal(terminalPoLocal.rows[0].calculated_status, "Completed");
+    assert.equal(Number(terminalPoLocal.rows[0].ordered_qty), 10);
+    assert.equal(Number(terminalPoLocal.rows[0].received_qty), 10);
+    const terminalPoCompletedRows = await listScmSchedule({
+      kind: "PO",
+      exactRef: terminalPoRef,
+      view: "completed"
+    });
+    assert.equal(terminalPoCompletedRows.length, 1,
+      "A received PO must be selected into completed history by its calculated reconciliation status.");
+    assert.equal(terminalPoCompletedRows[0].status, "Planned",
+      "PO schedule reads must preserve the independently managed operational status.");
+    const [terminalPoCompleted] = await enrichScmScheduleWithReconciliation(
+      terminalPoCompletedRows,
+      { view: "completed" }
+    );
+    assert.equal(terminalPoCompleted.calculatedStatus, "Completed");
+    assert.equal(terminalPoCompleted.reconciliationApplicationStatus, "Completed");
+    const terminalPoCompletedFilterRows = await listScmSchedule({
+      kind: "PO",
+      exactRef: terminalPoRef,
+      status: "Completed"
+    });
+    assert.equal(terminalPoCompletedFilterRows.length, 1,
+      "The PO Completed status filter must use the calculated reconciliation status.");
     const firstReceipt = linkedTransaction({
       sourceOrderId: poId,
       sourceOrderRef: poRef,
@@ -841,8 +900,8 @@ try {
     const reloadedTo = await loadLocalScmReconciliationOrder("TO", toId);
     assert.equal(
       reloadedTo.localStatus,
-      "In Transit",
-      "A valid reconciliation schedule status must replace the default Queued status."
+      "Queued",
+      "A calculated reconciliation status must not replace the operational schedule status."
     );
     await query(
       `INSERT INTO transfer_orders (
@@ -875,6 +934,15 @@ try {
           10, 'EA', 1, 'Destination Yard', 0, 0, true, $3::jsonb)`,
       [terminalToId, terminalToLineKey, terminalToRaw]
     );
+    await query(
+      `INSERT INTO scm_transport_schedule (
+         order_kind, source_table, source_id, order_ref, status,
+         created_by, updated_by
+       ) VALUES (
+         'TO', 'transfer_orders', $1, $2, 'In Transit', $3, $3
+       )`,
+      [terminalToId, terminalToRef, operatorId]
+    );
     const terminalToResult = await reconcileScmOrderFamily({
       kind: "TO",
       sourceOrderId: terminalToId,
@@ -885,13 +953,53 @@ try {
     assert.equal(terminalToResult.targets[terminalToRef].received, 10,
       "A received TO header must apply full destination receipt quantity to its target.");
     const terminalToLocal = await query(
-      `SELECT fulfillment_status, receiving_status
-         FROM transfer_orders
-        WHERE netsuite_id = $1`,
-      [terminalToId]
+      `SELECT transfer.fulfillment_status,
+              transfer.receiving_status,
+              schedule.status AS operational_status,
+              state.application_status AS calculated_status,
+              state.fulfilled_qty,
+              state.received_qty
+         FROM transfer_orders transfer
+         JOIN scm_transport_schedule schedule
+           ON schedule.order_kind = 'TO'
+          AND schedule.order_ref = $2
+         JOIN scm_reconciliation_order_state state
+           ON state.order_kind = 'TO'
+          AND state.source_order_netsuite_id = transfer.netsuite_id
+        WHERE transfer.netsuite_id = $1`,
+      [terminalToId, terminalToRef]
     );
-    assert.equal(terminalToLocal.rows[0].fulfillment_status, "fulfilled");
-    assert.equal(terminalToLocal.rows[0].receiving_status, "received");
+    assert.equal(terminalToLocal.rows[0].fulfillment_status, "not_fulfilled",
+      "TO calculation must not overwrite canonical fulfillment.");
+    assert.equal(terminalToLocal.rows[0].receiving_status, "not_received",
+      "TO calculation must not overwrite canonical receiving.");
+    assert.equal(terminalToLocal.rows[0].operational_status, "In Transit");
+    assert.equal(terminalToLocal.rows[0].calculated_status, "Completed");
+    assert.equal(Number(terminalToLocal.rows[0].fulfilled_qty), 10);
+    assert.equal(Number(terminalToLocal.rows[0].received_qty), 10);
+
+    const terminalToCompletedRows = await listScmSchedule({
+      kind: "TO",
+      exactRef: terminalToRef,
+      view: "completed"
+    });
+    assert.equal(terminalToCompletedRows.length, 1,
+      "A received TO must be selected into completed history by its calculated reconciliation status.");
+    assert.equal(terminalToCompletedRows[0].status, "In Transit",
+      "Schedule reads must preserve the independently managed operational status.");
+    const [terminalToCompleted] = await enrichScmScheduleWithReconciliation(
+      terminalToCompletedRows,
+      { view: "completed" }
+    );
+    assert.equal(terminalToCompleted.calculatedStatus, "Completed");
+    assert.equal(terminalToCompleted.reconciliationApplicationStatus, "Completed");
+    const terminalToCompletedFilterRows = await listScmSchedule({
+      kind: "TO",
+      exactRef: terminalToRef,
+      status: "Completed"
+    });
+    assert.equal(terminalToCompletedFilterRows.length, 1,
+      "The Completed status filter must use the calculated reconciliation status.");
 
     await query(
       `INSERT INTO transfer_orders (
@@ -1004,7 +1112,7 @@ try {
       });
     }
     let inheritedSchedules = await query(
-      `SELECT order_ref, status
+      `SELECT id, order_ref, status, updated_at
          FROM scm_transport_schedule
         WHERE order_kind = 'TO'
           AND order_ref = ANY($1::text[])
@@ -1013,8 +1121,21 @@ try {
     );
     assert.equal(inheritedSchedules.rowCount, 3);
     assert.ok(
-      inheritedSchedules.rows.every((row) => row.status === "Completed"),
-      "A fully received source TO must complete every active header-only split."
+      inheritedSchedules.rows.every((row) => row.status === "Queued"),
+      "A fully received source TO must not overwrite operational statuses for header-only splits."
+    );
+    const inheritedCalculated = await enrichScmScheduleWithReconciliation(
+      inheritedSchedules.rows.map((row) => ({
+        orderKind: "TO",
+        orderRef: row.order_ref,
+        status: row.status,
+        scheduleId: row.id,
+        updatedAt: row.updated_at
+      }))
+    );
+    assert.ok(
+      inheritedCalculated.every((row) => row.reconciliationApplicationStatus === "Completed"),
+      "A fully received source TO must calculate completion for every active header-only split."
     );
     await reconcileScmOrderFamily({
       kind: "TO",
@@ -1046,7 +1167,7 @@ try {
     );
     assert.equal(incompleteSplitResult.targets[incompleteSplitChildRef].hidden, false);
     const incompleteSchedules = await query(
-      `SELECT order_ref, status
+      `SELECT id, order_ref, status, reconciliation_blocked, updated_at
          FROM scm_transport_schedule
         WHERE order_kind = 'TO'
           AND order_ref = ANY($1::text[])
@@ -1054,7 +1175,20 @@ try {
       [[incompleteSplitToRef, incompleteSplitChildRef]]
     );
     assert.equal(incompleteSchedules.rowCount, 2);
-    assert.ok(incompleteSchedules.rows.every((row) => row.status === "Reconcile Review"));
+    assert.ok(incompleteSchedules.rows.every((row) => row.status === "Queued"));
+    assert.ok(incompleteSchedules.rows.every((row) => row.reconciliation_blocked === true));
+    const incompleteCalculated = await enrichScmScheduleWithReconciliation(
+      incompleteSchedules.rows.map((row) => ({
+        orderKind: "TO",
+        orderRef: row.order_ref,
+        status: row.status,
+        scheduleId: row.id,
+        updatedAt: row.updated_at
+      }))
+    );
+    assert.ok(incompleteCalculated.every((row) =>
+      row.reconciliationApplicationStatus === "Reconcile Review"
+    ));
 
     await query(
       `INSERT INTO transfer_orders (
@@ -1638,9 +1772,10 @@ try {
     ], { includeDetails: true });
     assert.equal(enriched.length, 2);
     assert.equal(enriched[0].reconciliation.quantities.received, 6);
-    assert.equal(enriched[1].status, "In Transit");
-    assert.ok(enriched.every((row) => row.reconciliationApplicationStatus === row.status),
-      "Schedule and reconciliation application statuses must expose the same effective status.");
+    assert.ok(enriched.every((row) => row.status === "Queued"),
+      "The schedule API must preserve the operational status field.");
+    assert.equal(enriched[0].reconciliationApplicationStatus, "Partially Done");
+    assert.equal(enriched[1].reconciliationApplicationStatus, "In Transit");
     assert.ok(enriched.every((row) => Array.isArray(row.reconciliation.lines)));
     assert.ok(enriched.every((row) => Array.isArray(row.reconciliation.allocationTargets)));
 

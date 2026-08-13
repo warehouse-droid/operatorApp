@@ -257,6 +257,44 @@ try {
     assert.equal(rowFor(normalRows, transferRef)?.status, "Queued",
       "TO schedule defaults must remain unchanged.");
 
+    const blanketReviewState = await query(
+      `INSERT INTO scm_reconciliation_order_state (
+         order_kind, source_order_netsuite_id, source_order_ref,
+         netsuite_terminal_state, application_status, reconciliation_status,
+         reconciliation_reason, ordered_qty, received_qty, remaining_qty,
+         destination_remaining_qty, exact_allocation, reconciled_at, completed_at
+       ) VALUES (
+         'PO', $1, $2, 'open', 'Completed', 'review',
+         'Blanket reconciliation visibility harness', 10, 10, 0, 0, false, now(), now()
+       )
+       RETURNING id`,
+      [existingSyncId, existingSyncRef]
+    );
+    await query(
+      `INSERT INTO scm_transport_schedule (
+         order_kind, order_ref, status, reconciliation_order_state_id,
+         reconciliation_blocked, last_reconciled_at, method, created_by, updated_by
+       ) VALUES ('PO', $1, 'Reconcile Review', $2, true, now(), 'MBT', $3, $3)`,
+      [existingSyncRef, blanketReviewState.rows[0].id, actor]
+    );
+    const visibleBlanketReview = await listScmSchedule({
+      search: existingSyncRef,
+      status: "Reconcile Review",
+      view: "scm working"
+    });
+    assert(hasRef(visibleBlanketReview, existingSyncRef),
+      "A blocking Blanket PO review must surface in SCM Working and its review filter.");
+    assert.equal(rowFor(visibleBlanketReview, existingSyncRef)?.status, "Reconcile Review",
+      "Completed quantities must not hide a blocking Blanket PO review behind Completed.");
+    await query(
+      "DELETE FROM scm_transport_schedule WHERE order_kind = 'PO' AND order_ref = $1",
+      [existingSyncRef]
+    );
+    await query(
+      "DELETE FROM scm_reconciliation_order_state WHERE id = $1",
+      [blanketReviewState.rows[0].id]
+    );
+
     const normalParentDispatch = await listDispatchOrders({
       type: "PO", search: parentRef, includeHiddenScm: false
     });

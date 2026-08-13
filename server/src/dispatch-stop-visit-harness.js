@@ -175,6 +175,42 @@ assert.match(tooltipSource, /previewVisitTiming/);
 assert.match(tooltipSource, /<b>Stop time<\/b>/);
 assert.match(tooltipSource, /combinedRefs\.join\(" \+ "\)/);
 assert.match(tooltipSource, /stopTimingBasisText/);
+assert.match(tooltipSource, /consolidatedDropEntries\.map[\s\S]*tooltipItemRowsForOrder/,
+  "A consolidated Dispatch hover must render item details for every logical order at the physical drop.");
+assert.match(tooltipSource, /includeOrderHeader:\s*true/,
+  "Every consolidated hover item section must identify the order it belongs to.");
+
+const mapOrderEntrySource = sourceSlice(
+  "function mapMarkerLogicalStops",
+  "function mapMarkerInfoWindowHtml"
+);
+const makeMapOrderEntryHelpers = Function(
+  "pickupOrdersForStop",
+  "stopOrder",
+  `"use strict"; ${mapOrderEntrySource}; return { mapMarkerLogicalStops, mapMarkerOrderEntries };`
+);
+const mapOrderEntryHelpers = makeMapOrderEntryHelpers(() => [], stopOrder);
+const sharedMapLoad = {
+  stops: [
+    { id: "map-drop-a", type: "drop", orderId: "CUSTOM-1" },
+    { id: "map-drop-b", type: "drop", orderId: "SOB-1" },
+    { id: "map-drop-c", type: "drop", orderId: "SOB-3" }
+  ]
+};
+assert.deepEqual(
+  mapOrderEntryHelpers.mapMarkerOrderEntries(sharedMapLoad, {
+    type: "drop",
+    sourceStopIds: ["map-drop-a", "map-drop-b"]
+  }).map((entry) => entry.order.id),
+  ["CUSTOM-1", "SOB-1"],
+  "A Google-map hover must resolve every logical order represented by the consolidated marker."
+);
+const mapInfoSource = sourceSlice("function mapMarkerInfoWindowHtml", "function routeEstimateFromGoogleLegs");
+assert.match(mapInfoSource, /mapMarkerOrderEntries/);
+assert.match(mapInfoSource, /tooltipItemRowsForOrder/);
+assert.match(mapInfoSource, /includeOrderHeader:\s*true/);
+assert.match(source, /content:\s*mapMarkerInfoWindowHtml\(load, stop\)/,
+  "Google InfoWindows must use the all-order consolidated detail renderer.");
 
 const dropIndexSource = sourceSlice("function insertIndexFromDrop", "function ensureSplitDraft");
 assert.match(dropIndexSource, /dataset\.startIndex/);

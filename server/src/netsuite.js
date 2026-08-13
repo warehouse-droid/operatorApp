@@ -1882,7 +1882,7 @@ async function fetchScmReconciliationOrdersBatch(options = {}) {
       t.lastmodifieddate,
       t.entity AS entity_id,
       BUILTIN.DF(t.entity) AS entity,
-      t.memo,
+      CASE WHEN t.type = 'SalesOrd' THEN t.custbody7 ELSE t.memo END AS memo,
       t.foreigntotal,
       t.custbody4 AS expected_delivery_date,
       t.location AS order_location_id,
@@ -1922,6 +1922,8 @@ async function fetchScmReconciliationOrdersBatch(options = {}) {
       ABS(NVL(tl.quantity, 0)) AS ordered_quantity,
       tl.quantityshiprecv AS cumulative_progress_raw,
       ABS(NVL(tl.quantityshiprecv, 0)) AS cumulative_progress_quantity,
+      tl.quantitycommitted AS netsuite_committed_qty,
+      tl.quantitybackordered AS netsuite_backordered_qty,
       BUILTIN.DF(tl.units) AS unit,
       tl.location AS line_location_id,
       BUILTIN.DF(tl.location) AS line_location,
@@ -1995,6 +1997,16 @@ async function fetchScmReconciliationOrdersBatch(options = {}) {
       cumulativeProgressObserved: row.cumulative_progress_raw !== null
         && row.cumulative_progress_raw !== undefined
         && row.cumulative_progress_raw !== "",
+      netsuiteCommittedQty: row.netsuite_committed_qty === null
+        || row.netsuite_committed_qty === undefined
+        || row.netsuite_committed_qty === ""
+        ? null
+        : toNumber(row.netsuite_committed_qty),
+      netsuiteBackorderedQty: row.netsuite_backordered_qty === null
+        || row.netsuite_backordered_qty === undefined
+        || row.netsuite_backordered_qty === ""
+        ? null
+        : toNumber(row.netsuite_backordered_qty),
       unit: row.unit || "",
       locationId: Number(row.line_location_id) || null,
       location: row.line_location || "",
@@ -2545,7 +2557,7 @@ export async function fetchPurchaseOrderDetailsFromNetSuite(orderId, locationId 
   return (result.items || []).map(normalizeOpenDeliveryLine);
 }
 
-function purchaseOrderHistorySnapshotFromRows(rows) {
+export function purchaseOrderHistorySnapshotFromRows(rows) {
   if (!rows.length) return null;
   const first = rows[0];
   return {
@@ -2663,6 +2675,12 @@ export async function fetchPurchaseOrderHistorySnapshotFromNetSuite(orderId) {
   return snapshots[0] || null;
 }
 
+function netSuiteVendorPrice(value) {
+  if (value === null || value === undefined || String(value).trim() === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 export async function fetchVendorItemCodesFromNetSuite({ vendorId, itemIds = [], subsidiaryId = null } = {}) {
   const vendor = Number(vendorId);
   if (!Number.isInteger(vendor) || vendor <= 0) throw new Error("A valid numeric NetSuite vendor ID is required.");
@@ -2679,6 +2697,7 @@ export async function fetchVendorItemCodesFromNetSuite({ vendorId, itemIds = [],
         iv.vendor AS vendor_id,
         iv.subsidiary AS subsidiary_id,
         iv.vendorcode AS vendor_code,
+        iv.purchaseprice AS vendor_price,
         iv.preferredvendor AS preferred_vendor
       FROM itemvendor iv
       WHERE iv.vendor = ${vendor}
@@ -2690,34 +2709,40 @@ export async function fetchVendorItemCodesFromNetSuite({ vendorId, itemIds = [],
     for (const row of rows) {
       const itemId = Number(row.item_id);
       const vendorCode = String(row.vendor_code || "").trim();
-      if (!vendorCode || found.has(itemId)) continue;
+      if (found.has(itemId)) continue;
       found.set(itemId, {
         itemId,
         vendorId: vendor,
         subsidiaryId: Number(row.subsidiary_id) || 0,
         vendorCode,
+        vendorPrice: netSuiteVendorPrice(row.vendor_price),
+        vendorPriceChecked: true,
         preferredVendor: /^(t|true|yes|1)$/i.test(String(row.preferred_vendor || "")),
         source: "item_vendor"
       });
     }
-    if (found.size === items.length) return [...found.values()];
-    const missing = items.filter((itemId) => !found.has(itemId));
-    const fallback = await suiteqlAll(`
+    const missingCodes = items.filter((itemId) => !String(found.get(itemId)?.vendorCode || "").trim());
+    const fallback = missingCodes.length ? await suiteqlAll(`
       SELECT i.id AS item_id, i.vendorname AS vendor_code, i.vendor AS vendor_id
         FROM item i
-       WHERE i.id IN (${missing.join(",")})
+       WHERE i.id IN (${missingCodes.join(",")})
          AND i.vendor = ${vendor}
-    `);
+    `) : [];
     for (const row of fallback) {
       const vendorCode = String(row.vendor_code || "").trim();
       if (!vendorCode) continue;
-      found.set(Number(row.item_id), {
-        itemId: Number(row.item_id),
+      const itemId = Number(row.item_id);
+      const itemVendor = found.get(itemId);
+      found.set(itemId, {
+        ...itemVendor,
+        itemId,
         vendorId: vendor,
-        subsidiaryId: 0,
+        subsidiaryId: Number(itemVendor?.subsidiaryId) || 0,
         vendorCode,
-        preferredVendor: true,
-        source: "single_vendor_fallback"
+        vendorPrice: itemVendor?.vendorPrice ?? null,
+        vendorPriceChecked: true,
+        preferredVendor: itemVendor?.preferredVendor ?? true,
+        source: itemVendor ? "item_vendor" : "single_vendor_fallback"
       });
     }
     return [...found.values()];
@@ -2733,6 +2758,8 @@ export async function fetchVendorItemCodesFromNetSuite({ vendorId, itemIds = [],
       vendorId: vendor,
       subsidiaryId: 0,
       vendorCode: String(row.vendor_code || "").trim(),
+      vendorPrice: null,
+      vendorPriceChecked: false,
       preferredVendor: true,
       source: "single_vendor_fallback",
       itemVendorLookupError: itemVendorError.message
@@ -3111,6 +3138,53 @@ export async function findTransferOrdersBySmartScmMarkerFromNetSuite({
     throw new Error("Valid NetSuite transfer locations are required to recover a Smart SCM Transfer Order.");
   }
   const marker = `MBBS-SCM:${proposal}`.toUpperCase();
+  const result = await suiteql(`
+    SELECT DISTINCT
+      t.id,
+      t.tranid,
+      t.trandate,
+      t.status,
+      BUILTIN.DF(t.status) AS status_text,
+      t.memo,
+      source_tl.location AS source_location_id,
+      BUILTIN.DF(source_tl.location) AS source_location,
+      t.transferlocation AS destination_location_id,
+      BUILTIN.DF(t.transferlocation) AS destination_location
+    FROM transaction t
+    INNER JOIN transactionline source_tl
+      ON source_tl.transaction = t.id
+     AND source_tl.item IS NOT NULL
+     AND source_tl.quantity < 0
+     AND source_tl.location = ${source}
+     AND source_tl.mainline = 'F'
+     AND source_tl.taxline = 'F'
+    WHERE t.type = 'TrnfrOrd'
+      AND t.transferlocation = ${destination}
+      AND (
+        UPPER(COALESCE(t.memo, '')) LIKE '%${marker} |%'
+        OR UPPER(COALESCE(t.memo, '')) LIKE '%${marker}'
+      )
+    ORDER BY t.id DESC
+    FETCH FIRST 10 ROWS ONLY
+  `);
+  return result.items || [];
+}
+
+export async function findTransferOrdersByStockRequestMarkerFromNetSuite({
+  transferId,
+  sourceLocationId,
+  destinationLocationId
+} = {}) {
+  const transfer = Number(transferId);
+  const source = Number(sourceLocationId);
+  const destination = Number(destinationLocationId);
+  if (!Number.isInteger(transfer) || transfer <= 0) {
+    throw new Error("A valid local stock transfer ID is required.");
+  }
+  if (!Number.isInteger(source) || source <= 0 || !Number.isInteger(destination) || destination <= 0) {
+    throw new Error("Valid NetSuite transfer locations are required to recover a Sales stock-request TO.");
+  }
+  const marker = `MBBS-STOCK-REQUEST-TO:${transfer}`.toUpperCase();
   const result = await suiteql(`
     SELECT DISTINCT
       t.id,

@@ -35,6 +35,7 @@ const LOCAL_ITEMS = Object.freeze([
     displayName: "Delivery Charge - MBT",
     description: "Calculated locally for SO, TO, PO, and VRMA cross-charges.",
     itemType: "delivery_fee",
+    chargeBasis: "distance",
     rentalPeriodDays: null,
     category: "cross_charge",
     priceMode: "rate_card",
@@ -53,6 +54,7 @@ const LOCAL_ITEMS = Object.freeze([
     displayName: `${itemCode.slice(0, -2)} yard bin charge`,
     description: "Fixed 14-day rental and extension price come from the approved local rate card.",
     itemType: "bin",
+    chargeBasis: "rental_period",
     rentalPeriodDays: 14,
     category: "bin_charge",
     priceMode: "rental_item",
@@ -71,6 +73,7 @@ const LOCAL_ITEMS = Object.freeze([
     displayName: "Dump",
     description: "Customer dump charge is configured per tonne.",
     itemType: "dump",
+    chargeBasis: "per_tonne",
     rentalPeriodDays: null,
     category: "dump",
     priceMode: "rate_card",
@@ -338,7 +341,7 @@ test("LC08/LC09: local items render first without requesting NetSuite readiness"
   await expect(panel).toBeVisible();
   await expect(panel.getByRole("row")).toHaveCount(6);
   await expect(panel.getByText("Delivery Charge - MBT", { exact: true })).toBeVisible();
-  await expect(panel.getByText("Price per tonne", { exact: true })).toBeVisible();
+  await expect(panel.getByRole("cell", { name: "Price per tonne", exact: true })).toBeVisible();
   await expect(panel.getByText("30YD", { exact: true })).toHaveCount(0);
   expect(netSuiteRequests).toEqual([]);
   expect(calls).toEqual([]);
@@ -368,6 +371,7 @@ test("LC05/LC08: local editor retains input focus and sends one bounded command"
       displayName: "Local custom dump",
       description: "Custom price remains on the local order.",
       active: true,
+      chargeBasis: "per_tonne",
       expectedRevision: 1,
       reason: "Clarify local dump behavior"
     }

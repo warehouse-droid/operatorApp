@@ -10,6 +10,15 @@ const DEFAULT_ALLOWED_TYPES = [
   "application/pdf"
 ];
 
+const SUPPORTED_UPLOAD_TYPES = [
+  ...DEFAULT_ALLOWED_TYPES,
+  "video/mp4",
+  "video/quicktime",
+  "video/webm"
+];
+
+const ABSOLUTE_MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+
 const RECORD_TYPES = new Set([
   "operator-load-photo",
   "operator-receiving-photo",
@@ -21,6 +30,7 @@ const RECORD_TYPES = new Set([
   "driver-stop-photo",
   "driver-pickup-photo",
   "driver-dropoff-photo",
+  "sales-delivery-instruction-media",
   "test-upload"
 ]);
 
@@ -53,11 +63,13 @@ export function createPhotoUploadToken({ actor, source, recordType, metadata = {
   const ttlMinutes = saneNumber(options.ttlMinutes || settings.tokenTtlMinutes, settings.tokenTtlMinutes, 1, 60);
   const now = Math.floor(Date.now() / 1000);
   const expiresAt = now + ttlMinutes * 60;
-  const maxBytes = Math.min(settings.maxBytes, saneNumber(options.maxBytes || settings.maxBytes, settings.maxBytes, 1, settings.maxBytes));
+  const maxBytes = options.maxBytes === undefined
+    ? settings.maxBytes
+    : saneNumber(options.maxBytes, settings.maxBytes, 1, ABSOLUTE_MAX_UPLOAD_BYTES);
   const allowedTypes = Array.isArray(options.allowedTypes)
     ? [...new Set(options.allowedTypes
         .map((value) => cleanValue(value, 120).toLowerCase())
-        .filter((value) => settings.allowedTypes.includes(value)))]
+        .filter((value) => SUPPORTED_UPLOAD_TYPES.includes(value)))]
     : settings.allowedTypes;
   if (!allowedTypes.length) throw httpError(400, "At least one supported upload MIME type is required.");
 

@@ -2201,6 +2201,112 @@ try {
       { afterSplitGroupSync: afterSplitGroupSync.rows[0] }
     );
 
+    await query(
+      `UPDATE transfer_orders
+          SET receiving_status = 'open', dispatch_planned = true,
+              dispatch_plan_date = DATE '2097-07-12'
+        WHERE netsuite_id = $1`,
+      [dependency.transferOrderId]
+    );
+    await query(
+      `INSERT INTO scm_reconciliation_order_state (
+         order_kind, source_order_netsuite_id, source_order_ref,
+         netsuite_terminal_state, application_status, reconciliation_status,
+         ordered_qty, fulfilled_qty, received_qty, remaining_qty,
+         destination_remaining_qty, exact_allocation, reconciled_at, completed_at
+       )
+       SELECT 'TO', $1, $2, 'open', 'Completed', 'ok',
+              total_qty, total_qty, total_qty, 0, 0, true, now(), now()
+         FROM (
+           SELECT COALESCE(SUM(allocated_quantity), 0) AS total_qty
+             FROM order_dependency_lines
+            WHERE dependency_id = $3
+         ) totals
+       ON CONFLICT (order_kind, source_order_netsuite_id) DO UPDATE
+         SET application_status = EXCLUDED.application_status,
+             reconciliation_status = EXCLUDED.reconciliation_status,
+             ordered_qty = EXCLUDED.ordered_qty,
+             fulfilled_qty = EXCLUDED.fulfilled_qty,
+             received_qty = EXCLUDED.received_qty,
+             remaining_qty = 0,
+             destination_remaining_qty = 0,
+             reconciled_at = now(), completed_at = now()`,
+      [dependency.transferOrderId, dependency.transferOrderRef, dependency.id]
+    );
+    const authoritativeCompletedDependency = (await listOrderDependencies({ salesOrderRef }))[0];
+    check(
+      authoritativeCompletedDependency.transferReceived === true
+      && authoritativeCompletedDependency.transferDispatchPlanned === true
+      && authoritativeCompletedDependency.transferDispatchPlanDate === "2097-07-12",
+      "Completed reconciliation and the prior TO plan were not serialized to Dispatch.",
+      { authoritativeCompletedDependency }
+    );
+    check(await getSalesOrderDependencyExecutionBlock([salesOrderRef]) === null,
+      "Authoritative Completed reconciliation did not release SO driver execution.");
+    const authoritativeEnriched = await enrichDispatchOrdersWithDependencies([{
+      id: salesOrderRef,
+      tranid: salesOrderRef,
+      pickupLocations: ["12441"]
+    }]);
+    check(authoritativeEnriched[0]?.dependencyWaitingForTransfer === false,
+      "A reconciliation-complete TO still displayed Waiting for transfer.", { authoritativeEnriched });
+    const authoritativePlanConflicts = await validateDispatchPlanDependencies({
+      id: 0,
+      planDate: "2097-07-13",
+      orders: [{ id: salesOrderRef, pickupLocations: ["12441"] }],
+      trucks: [{
+        plate: "DEP-TRUCK",
+        loads: [{
+          id: "DEP-AUTH-COMPLETE",
+          stops: [
+            { id: "auth-so-pick", type: "pick", orderId: salesOrderRef, location: "12441" },
+            { id: "auth-so-drop", type: "drop", orderId: salesOrderRef, location: "Customer" }
+          ]
+        }]
+      }]
+    });
+    check(authoritativePlanConflicts.length === 0,
+      "A reconciliation-complete TO was incorrectly required in the new Sales Order plan.",
+      { authoritativePlanConflicts });
+    await query(
+      "DELETE FROM scm_reconciliation_order_state WHERE order_kind = 'TO' AND source_order_netsuite_id = $1",
+      [dependency.transferOrderId]
+    );
+    await query(
+      `UPDATE transfer_orders
+          SET dispatch_planned = false, dispatch_plan_date = null
+        WHERE netsuite_id = $1`,
+      [dependency.transferOrderId]
+    );
+
+    await query(
+      `UPDATE transfer_order_lines
+          SET netsuite_received_qty = quantity
+        WHERE transfer_order_id = $1
+          AND line_stage = 'receiving'`,
+      [dependency.transferOrderId]
+    );
+    await syncOrderDependenciesForTransferOrder(dependency.transferOrderId);
+    const reconciledReplenishment = (await listOrderDependencies({ salesOrderRef }))[0];
+    check(
+      reconciledReplenishment.status === "delivered"
+      && reconciledReplenishment.reconciliationStatus === "reconciled"
+      && reconciledReplenishment.transferReceived === true,
+      "Exact NetSuite receipt quantities did not complete the yard dependency while canonical Receiving lagged.",
+      { reconciledReplenishment }
+    );
+    await query(
+      `UPDATE transfer_order_lines
+          SET netsuite_received_qty = 0
+        WHERE transfer_order_id = $1
+          AND line_stage = 'receiving'`,
+      [dependency.transferOrderId]
+    );
+    await query(
+      "UPDATE order_dependencies SET status = 'active', reconciliation_status = 'pending' WHERE id = $1",
+      [dependency.id]
+    );
+
     await query("UPDATE transfer_orders SET receiving_status = 'received' WHERE netsuite_id = $1", [dependency.transferOrderId]);
     await syncOrderDependenciesForTransferOrder(dependency.transferOrderId);
     const completedReplenishment = (await listOrderDependencies({ salesOrderRef }))[0];
@@ -2748,8 +2854,8 @@ try {
     await query("UPDATE order_dependency_lines SET loaded_quantity = 0 WHERE dependency_id = $1", [dependency.id]);
 
     const unloadedPickupBlock = await getDirectPickupDependencyExecutionBlock([dependency.transferOrderRef]);
-    check(unloadedPickupBlock?.transferOrderRef === dependency.transferOrderRef,
-      "Direct pickup must wait for the source-yard operator load.", { unloadedPickupBlock });
+    check(unloadedPickupBlock === null,
+      "An assigned direct pickup must not wait for a separate source-yard operator load.", { unloadedPickupBlock });
 
     const receiving = await listReceivingOrders({ orderType: "transfer_order", destinationLocationId: 15 });
     check(!receiving.some((order) => order.tranid === dependency.transferOrderRef), "Direct TO must not appear in destination Receiving.", { receiving });
@@ -2935,7 +3041,35 @@ try {
     check(loadedProgress[0]?.status === "loaded", "Source-yard operator load must advance the direct dependency to loaded.", { loadedProgress });
     const readyPickupBlock = await getDirectPickupDependencyExecutionBlock([dependency.transferOrderRef]);
     check(readyPickupBlock === null, "Loaded direct dependency must allow the driver pickup to start.", { readyPickupBlock });
-    await markDirectDependencyPickupCompleted({ transferOrderRefs: [dependency.transferOrderRef], driverJobId: `dep-pick-${suffix}` });
+    await query(
+      `INSERT INTO driver_job_records (
+         job_id, plan_id, plan_date, driver_login, truck_id, truck_plate,
+         load_id, load_name, stop_id, stop_type, order_refs, photo_data_urls,
+         status, started_at, completed_at, job_details
+       ) VALUES ($1, $2, DATE '2097-07-13', 'dependency-driver', 'DEP-TRUCK', 'DEP-TRUCK',
+                 $3, 'Load 1', 'dep-pick', 'pickup', $4::jsonb, $5::jsonb,
+                 'complete', now() - interval '1 minute', now(), $6::jsonb)`,
+      [
+        `dep-pick-${suffix}`,
+        planId,
+        loadId,
+        JSON.stringify([dependency.transferOrderRef]),
+        JSON.stringify(["r2://dependency/pick-1.jpg", "r2://dependency/pick-2.jpg"]),
+        JSON.stringify({
+          requiredPhotos: 2,
+          orders: [{ orderRef: dependency.transferOrderRef, source: "direct_dependency" }]
+        })
+      ]
+    );
+    await markDirectDependencyPickupCompleted({
+      transferOrderRefs: [dependency.transferOrderRef],
+      driverJobId: `dep-pick-${suffix}`,
+      driverLogin: "dependency-driver",
+      planId,
+      planDate: "2097-07-13",
+      truckPlate: "DEP-TRUCK",
+      loadId
+    });
     await query(
       `INSERT INTO driver_job_records (
          job_id, plan_id, plan_date, driver_login, truck_id, truck_plate,

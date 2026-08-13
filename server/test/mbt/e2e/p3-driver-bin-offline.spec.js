@@ -130,9 +130,9 @@ async function mockDriver(page, context, {
       }
     }
     if (url.pathname === "/api/driver/client-version") {
-      return json({ currentVersion: "2026.08.08.1", minimumVersion: "2026.08.08.1", isCurrent: true, offlineEnabled, offlineModeRevision: 1 }, 200, {
-        "X-MBBS-Driver-Current-Version": "2026.08.08.1",
-        "X-MBBS-Driver-Minimum-Version": "2026.08.08.1"
+      return json({ currentVersion: "2026.08.12.3", minimumVersion: "2026.08.12.3", isCurrent: true, offlineEnabled, offlineModeRevision: 1 }, 200, {
+        "X-MBBS-Driver-Current-Version": "2026.08.12.3",
+        "X-MBBS-Driver-Minimum-Version": "2026.08.12.3"
       });
     }
     if (url.pathname === "/api/driver/me") {

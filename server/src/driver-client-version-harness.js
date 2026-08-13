@@ -12,15 +12,15 @@ import {
 } from "./driver-client-version.js";
 
 assert.equal(DRIVER_PWA_VERSION_HEADER, "X-MBBS-Driver-Version");
-assert.equal(DRIVER_PWA_CURRENT_VERSION, "2026.08.08.1");
+assert.equal(DRIVER_PWA_CURRENT_VERSION, "2026.08.12.3");
 assert.equal(DRIVER_PWA_MINIMUM_VERSION, DRIVER_PWA_CURRENT_VERSION);
-assert.equal(compareDriverPwaVersions("2026.08.08.1", "2026.08.08.1"), 0);
-assert.equal(compareDriverPwaVersions("2026.08.08.2", "2026.08.08.1"), 1);
-assert.equal(compareDriverPwaVersions("2026.08.05.3", "2026.08.08.1"), -1);
-assert.equal(compareDriverPwaVersions("not-a-version", "2026.08.08.1"), null);
-assert.equal(compareDriverPwaVersions("999999999999999999999.1", "2026.08.08.1"), null);
+assert.equal(compareDriverPwaVersions("2026.08.12.3", "2026.08.12.3"), 0);
+assert.equal(compareDriverPwaVersions("2026.08.12.4", "2026.08.12.3"), 1);
+assert.equal(compareDriverPwaVersions("2026.08.12.2", "2026.08.12.3"), -1);
+assert.equal(compareDriverPwaVersions("not-a-version", "2026.08.12.3"), null);
+assert.equal(compareDriverPwaVersions("999999999999999999999.1", "2026.08.12.3"), null);
 assert.equal(driverPwaVersionIsSupported(DRIVER_PWA_CURRENT_VERSION), true);
-assert.equal(driverPwaVersionIsSupported("2026.08.08.1"), true);
+assert.equal(driverPwaVersionIsSupported("2026.08.11.4"), false);
 assert.equal(driverPwaVersionIsSupported("2026.08.03.1"), false);
 assert.equal(driverPwaVersionIsSupported(""), false);
 assert.deepEqual(driverPwaVersionDetails(""), {
@@ -86,6 +86,7 @@ for (const path of [
   "/day-state",
   "/history",
   "/next-job",
+  "/jobs/job-1/delivery-instructions",
   "/dvir",
   "/rest/start",
   "/jobs/job-1/start",
@@ -133,7 +134,7 @@ const driverHtml = fs.readFileSync(new URL("../public/driver.html", import.meta.
 const driverCss = fs.readFileSync(new URL("../public/driver.css", import.meta.url), "utf8");
 
 for (const source of [driverSource, offlineSyncSource, workerSource]) {
-  assert.match(source, /DRIVER_PWA_CLIENT_VERSION\s*=\s*"2026\.08\.08\.1"/);
+  assert.match(source, /DRIVER_PWA_CLIENT_VERSION\s*=\s*"2026\.08\.12\.3"/);
 }
 assert.match(driverSource, /DRIVER_PWA_VERSION_HEADER\s*=\s*"X-MBBS-Driver-Version"/);
 assert.match(
@@ -159,19 +160,34 @@ assert.match(driverSource, /navigator\.serviceWorker\.addEventListener\("control
 assert.match(driverSource, /updateViaCache: "none"/);
 assert.match(driverSource, /String\(savedJob\.fingerprint\) !== currentFingerprint/);
 assert.match(offlineSyncSource, /\[DRIVER_PWA_VERSION_HEADER\]: DRIVER_PWA_CLIENT_VERSION/);
-assert.match(workerSource, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v20`/);
+assert.match(workerSource, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v27`/);
+assert.match(workerSource, /DRIVER_REFRESH_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}refresh-v27`/);
 assert.match(workerSource, /DRIVER_VERSION_REQUEST/);
 assert.match(workerSource, /type: "DRIVER_VERSION", version: DRIVER_PWA_CLIENT_VERSION/);
-assert.match(workerSource, /driver-photo-hash\.js\?v=20260808-yard-dependency-v1/);
-assert.match(workerSource, /driver-offline-sync\.js\?v=20260808-yard-dependency-v1/);
-assert.match(workerSource, /driver-bin-ui\.js\?v=20260803-bin-pwa-v1/);
-assert.match(workerSource, /driver\.js\?v=20260808-yard-dependency-v1/);
-assert.match(driverHtml, /driver\.css\?v=20260808-yard-dependency-v1/);
-assert.match(driverHtml, /i18n\.js\?v=20260803-bin-pwa-v1/);
-assert.match(driverHtml, /driver-photo-hash\.js\?v=20260808-yard-dependency-v1/);
-assert.match(driverHtml, /driver-offline-sync\.js\?v=20260808-yard-dependency-v1/);
-assert.match(driverHtml, /driver-bin-ui\.js\?v=20260803-bin-pwa-v1/);
-assert.match(driverHtml, /driver\.js\?v=20260808-yard-dependency-v1/);
+for (const asset of [
+  "driver.css",
+  "i18n.css",
+  "i18n.js",
+  "driver-offline-db.js",
+  "driver-photo-hash.js",
+  "driver-offline-photos.js",
+  "driver-offline-sync.js",
+  "driver-bin-ui.js",
+  "driver.js"
+]) {
+  assert.ok(
+    workerSource.includes(`/${asset}?v=20260812-driver-pwa-v3`),
+    `${asset} must use the atomic v3 token in the worker shell.`
+  );
+  assert.ok(
+    driverHtml.includes(`/${asset}?v=20260812-driver-pwa-v3`),
+    `${asset} must use the atomic v3 token in the Driver page.`
+  );
+}
+assert.match(
+  driverSource,
+  /serviceWorker\.register\("\/driver-service-worker\.js\?v=20260812-driver-pwa-v3"/
+);
 assert.match(driverCss, /\.driver-pwa-update-screen[\s\S]*\.driver-pwa-update-card/);
 
 const mountedApp = express();

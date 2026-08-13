@@ -429,7 +429,7 @@ assert.doesNotMatch(
 );
 assert.match(
   operatorWorker,
-  /url\.pathname === "\/driver"[\s\S]*url\.pathname\.startsWith\("\/driver-offline-"\)[\s\S]*driverAsset\) return;/,
+  /url\.pathname === "\/driver"[\s\S]*url\.pathname\.startsWith\("\/driver-"\)[\s\S]*driverAsset\) return;/,
   "The operator worker must not intercept driver shell requests."
 );
 
@@ -475,8 +475,8 @@ assert.ok(
   saveDraftSource.indexOf('db.transaction("photos", "readwrite")')
     < saveDraftSource.indexOf("const photos = await getAll(store)")
     && saveDraftSource.indexOf("const photos = await getAll(store)")
-      < saveDraftSource.indexOf("nextBytes > MAX_EVIDENCE_BYTES")
-    && saveDraftSource.indexOf("nextBytes > MAX_EVIDENCE_BYTES")
+      < saveDraftSource.indexOf("const admission = photoAdmissionForHealth")
+    && saveDraftSource.indexOf("if (!admission.allowed)")
       < saveDraftSource.indexOf("putPhotoRecord(store, record)"),
   "The evidence cap must be checked and written atomically in one IndexedDB transaction."
 );
@@ -497,7 +497,7 @@ assert.match(
 );
 assert.match(
   offlineDbSource,
-  /input\.enforcePhotoCompletionLimit[\s\S]{0,800}evidenceBytes >= MAX_EVIDENCE_BYTES[\s\S]{0,300}unsyncedPhotos\.length >= MAX_UNSYNCED_PHOTOS/,
+  /input\.enforcePhotoCompletionLimit[\s\S]{0,800}evidenceBytes > MAX_EVIDENCE_BYTES[\s\S]{0,300}unsyncedPhotos\.length > MAX_UNSYNCED_PHOTOS/,
   "Photo-required event completion must recheck both hard limits inside its local transaction."
 );
 const queueDbStart = offlineDbSource.indexOf("async function queueEvent");
@@ -506,8 +506,8 @@ const queueDbSource = offlineDbSource.slice(queueDbStart, queueDbEnd);
 assert.ok(queueDbStart >= 0 && queueDbEnd > queueDbStart, "Could not isolate IndexedDB event commit.");
 assert.match(
   offlineDbSource,
-  /const DB_VERSION = 2;[\s\S]*onupgradeneeded[\s\S]*upgrade\.objectStore\("events"\)[\s\S]*ensureIndex\(events, "byPartitionSequence"/,
-  "IndexedDB v2 must add missing indexes to an existing Driver database without deleting its evidence stores."
+  /const DB_VERSION = 3;[\s\S]*onupgradeneeded[\s\S]*upgrade\.objectStore\("events"\)[\s\S]*ensureIndex\(events, "byPartitionSequence"[\s\S]*createObjectStore\("instructionMedia", \{ keyPath: "key" \}\)/,
+  "IndexedDB v3 must preserve existing evidence stores and add both missing event indexes and the separate instruction-media cache."
 );
 assert.match(
   offlineDbSource,
@@ -548,6 +548,16 @@ assert.ok(
   photoChangeSource.indexOf("await prepareOfflineRecord()")
     < photoChangeSource.indexOf("captureAndStore"),
   "An expired or unavailable route must be rejected before a new photo Blob is stored."
+);
+assert.ok(
+  photoChangeSource.indexOf("await prepareOfflinePhotoCapture")
+    < photoChangeSource.indexOf("captureAndStore"),
+  "Route capacity and browser quota must be admitted before a selected photo is persisted."
+);
+assert.match(
+  photoChangeSource,
+  /capturePolicy: offlineCapture\.capturePolicy,[\s\S]*admission: offlineCapture\.admission/,
+  "Compression pressure and the exact route reserve must cross the same atomic photo-save boundary."
 );
 assert.match(
   photoChangeSource,
@@ -592,12 +602,23 @@ for (const [section, label] of [
   [takeDvirPhotoSource, "DVIR camera"],
   [galleryDvirPhotoSource, "DVIR gallery"]
 ]) {
-  assert.ok(
-    section.indexOf("beginPhotoCapture()") >= 0
-      && section.indexOf("beginPhotoCapture()") < section.indexOf("input.click()"),
-    `${label} must mark capture active before opening the native camera.`
-  );
+  assert.match(section, /launchPhotoPicker\(input\)/, `${label} must use the shared native picker guard.`);
 }
+const launchPhotoPickerSource = sourceSection(
+  driverSource,
+  "function launchPhotoPicker(",
+  "async function requestPersistentStorage("
+);
+assert.ok(
+  launchPhotoPickerSource.indexOf("beginPhotoCapture()")
+    < launchPhotoPickerSource.indexOf("input.click()"),
+  "The shared picker must mark capture active before opening the native camera."
+);
+assert.doesNotMatch(
+  launchPhotoPickerSource,
+  /\bawait\b/,
+  "Mobile Safari's file picker must remain in the original synchronous user activation."
+);
 assert.match(galleryPhotoSource, /data-photo-source="gallery"/);
 assert.match(galleryDvirPhotoSource, /data-photo-source="gallery"/);
 assert.match(
@@ -827,8 +848,20 @@ assert.match(
 );
 assert.match(
   driverSource,
-  /function isQuietSyncEcho[\s\S]*payload\?\.source !== "offline_sync"[\s\S]*if \(isQuietSyncEcho\(event\)\) return;[\s\S]{0,350}if \(quietSyncActive\(\)\)/,
-  "Delayed SSE echoes for the locally synchronized batch must not replay route screens."
+  /function isQuietSyncEcho[\s\S]*payload\?\.source !== "offline_sync"/,
+  "Only events emitted by offline synchronization may be treated as quiet-sync echoes."
+);
+const connectEventsSource = sourceSection(driverSource, "function connectEvents()", "function disconnectEvents()");
+const quietEchoGuardIndex = connectEventsSource.indexOf("if (isQuietSyncEcho(event)) return;");
+const instructionRefreshIndex = connectEventsSource.indexOf('if (event.type === "delivery.instructions.updated")');
+const quietSyncGuardIndex = connectEventsSource.indexOf("if (quietSyncActive())");
+const routeRefreshIndex = connectEventsSource.indexOf("queueLiveRefresh();");
+assert.ok(
+  quietEchoGuardIndex >= 0
+    && quietEchoGuardIndex < instructionRefreshIndex
+    && instructionRefreshIndex < quietSyncGuardIndex
+    && quietSyncGuardIndex < routeRefreshIndex,
+  "Delayed SSE echoes must be rejected before either the narrow instruction refresh or a route-screen refresh."
 );
 assert.match(
   driverSource,
@@ -1258,19 +1291,26 @@ assert.match(
   driverSource,
   /lastError \? t\("driver\.retrySync", "Retry sync"\) : t\("driver\.syncNow", "Sync now"\)/
 );
-assert.match(driverHtml, /driver-offline-db\.js\?v=20260808-yard-dependency-v1/);
-assert.match(driverHtml, /driver-photo-hash\.js\?v=20260808-yard-dependency-v1/);
-assert.match(driverHtml, /driver-offline-photos\.js\?v=20260808-yard-dependency-v1/);
-assert.match(driverHtml, /driver-offline-sync\.js\?v=20260808-yard-dependency-v1/);
-assert.match(driverHtml, /driver-bin-ui\.js\?v=20260803-bin-pwa-v1/);
-assert.match(driverHtml, /driver\.js\?v=20260808-yard-dependency-v1/);
-assert.match(driverWorker, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v20`/);
-assert.match(driverWorker, /driver-offline-db\.js\?v=20260808-yard-dependency-v1/);
-assert.match(driverWorker, /driver-photo-hash\.js\?v=20260808-yard-dependency-v1/);
-assert.match(driverWorker, /driver-offline-photos\.js\?v=20260808-yard-dependency-v1/);
-assert.match(driverWorker, /driver-offline-sync\.js\?v=20260808-yard-dependency-v1/);
-assert.match(driverWorker, /driver-bin-ui\.js\?v=20260803-bin-pwa-v1/);
-assert.match(driverWorker, /driver\.js\?v=20260808-yard-dependency-v1/);
+for (const asset of [
+  "driver.css",
+  "i18n.css",
+  "i18n.js",
+  "driver-offline-db.js",
+  "driver-photo-hash.js",
+  "driver-offline-photos.js",
+  "driver-offline-sync.js",
+  "driver-bin-ui.js",
+  "driver.js"
+]) {
+  assert.ok(driverHtml.includes(`/${asset}?v=20260812-driver-pwa-v3`));
+  assert.ok(driverWorker.includes(`/${asset}?v=20260812-driver-pwa-v3`));
+}
+assert.match(driverWorker, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v27`/);
+assert.match(driverWorker, /DRIVER_REFRESH_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}refresh-v27`/);
+assert.match(
+  driverSource,
+  /serviceWorker\.register\("\/driver-service-worker\.js\?v=20260812-driver-pwa-v3"/
+);
 assert.match(
   offlineSyncSource,
   /if \(!response\.ok\)[\s\S]*error\.status = response\.status;[\s\S]*error\.code = String\(payload\.code \|\| ""\)/,
@@ -1456,10 +1496,29 @@ assert.match(
   /app\.post\("\/api\/dispatch\/offline-review\/:eventId\/resolve", requireDispatcher[\s\S]{0,1500}confirmed:\s*req\.body\?\.confirmed\s*===\s*true/,
   "The Dispatcher resolution route must forward explicit evidence-only confirmation to the guarded repository boundary."
 );
+const driverShellRepairSource = sourceSection(
+  driverWorker,
+  "async function repairDriverShellCache()",
+  "function currentDriverShellRepair()"
+);
+assert.ok(
+  driverShellRepairSource.indexOf("await staging.addAll")
+    < driverShellRepairSource.indexOf("if (!response || !response.ok)")
+    && driverShellRepairSource.indexOf("if (!response || !response.ok)")
+      < driverShellRepairSource.indexOf("const previousEntries = await snapshotDriverCache(active)")
+    && driverShellRepairSource.indexOf("const previousEntries = await snapshotDriverCache(active)")
+      < driverShellRepairSource.indexOf("await active.put(request, response)"),
+  "Driver shell repair must stage and verify a complete replacement before touching the active offline shell."
+);
+assert.match(
+  driverShellRepairSource,
+  /catch \(error\) \{[\s\S]*await restoreDriverCache\(active, previousEntries\)[\s\S]*finally \{[\s\S]*caches\.delete\(DRIVER_REFRESH_CACHE_NAME\)/,
+  "A failed active-cache replacement must restore the prior shell and remove the staging cache."
+);
 assert.match(
   driverWorker,
-  /DRIVER_REFRESH_SHELL[\s\S]*DRIVER_REFRESH_CACHE_NAME[\s\S]*cache\.addAll[\s\S]*active\.put[\s\S]*caches\.delete\(DRIVER_REFRESH_CACHE_NAME\)/,
-  "Driver shell refresh must stage a complete replacement before touching the active offline shell."
+  /DRIVER_REFRESH_SHELL"\) \{[\s\S]{0,150}event\.waitUntil\(currentDriverShellRepair\(\)\)[\s\S]*DRIVER_REPAIR_SHELL/,
+  "Automatic refresh and user-initiated repair must share the single safe shell-replacement operation."
 );
 assert.match(
   driverWorker,
@@ -1467,7 +1526,7 @@ assert.match(
   "Driver shell cleanup must remain scoped to obsolete Driver caches."
 );
 assert.doesNotMatch(
-  driverWorker.slice(driverWorker.indexOf('event.data?.type === "DRIVER_REFRESH_SHELL"')),
+  driverShellRepairSource,
   /caches\.delete\([^)]*(?:operator|yard-operator)/,
   "Manual Driver shell refresh must remain inside the Driver cache namespace."
 );

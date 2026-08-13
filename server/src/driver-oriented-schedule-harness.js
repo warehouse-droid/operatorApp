@@ -218,6 +218,67 @@ assert.deepEqual(multiDropJobs.map((job) => ({
   { location: "2967", address: "2967 Address", destinationLocationId: 28, lineRowIds: ["201", "202"] }
 ]);
 
+const consolidatedManifestPlan = structuredClone(plan);
+consolidatedManifestPlan.trucks = [consolidatedManifestPlan.trucks[0]];
+consolidatedManifestPlan.orders = [
+  { id: "CONSOLIDATED-A", type: "SO", sourceYard: "12441", address: "55 Shared Road, Toronto", items: [{ lineRowId: "A-1", sku: "ITEM-A", pieces: 4 }] },
+  { id: "CONSOLIDATED-B", type: "SO", sourceYard: "12441", address: "55 Shared Road Toronto", items: [{ lineRowId: "B-1", sku: "ITEM-B", pallets: 2 }] },
+  { id: "SEPARATE-C", type: "SO", sourceYard: "12441", address: "99 Separate Road, Toronto", items: [{ lineRowId: "C-1", sku: "ITEM-C", layers: 3 }] }
+];
+consolidatedManifestPlan.trucks[0].loads = [{
+  id: "CONSOLIDATED-MANIFEST-LOAD",
+  name: "Consolidated manifest",
+  driverLogin: "alex",
+  driverName: "Alex",
+  truckId: "T1",
+  truckPlate: "AA100",
+  plannedStartMinute: 420,
+  plannedFinishMinute: 520,
+  stops: [
+    stop("CONSOLIDATED-PICK", "pick", "CONSOLIDATED-A", "12441"),
+    { ...stop("CONSOLIDATED-DROP-A", "drop", "CONSOLIDATED-A"), dropAddress: "55 Shared Road, Toronto", lineRowIds: ["A-1"] },
+    { ...stop("CONSOLIDATED-DROP-B", "drop", "CONSOLIDATED-B"), dropAddress: "55 Shared Road Toronto", lineRowIds: ["B-1"] },
+    { ...stop("SEPARATE-DROP-C", "drop", "SEPARATE-C"), dropAddress: "99 Separate Road, Toronto", lineRowIds: ["C-1"] }
+  ]
+}];
+const consolidatedManifestJobs = planJobsForDriver(consolidatedManifestPlan, "alex");
+const consolidatedPickup = consolidatedManifestJobs.find((job) => job.stopId === "CONSOLIDATED-PICK");
+assert.deepEqual(
+  consolidatedPickup.orderRefs,
+  ["CONSOLIDATED-A", "CONSOLIDATED-B", "SEPARATE-C"],
+  "A shared pickup manifest must include every order loaded at that pickup."
+);
+const consolidatedDrops = consolidatedManifestJobs.filter((job) => job.stopType === "dropoff");
+assert.deepEqual(consolidatedDrops[0].orderRefs, ["CONSOLIDATED-A"],
+  "A logical Driver completion must remain scoped to its own order.");
+assert.deepEqual(consolidatedDrops[0].detailOrderRefs, ["CONSOLIDATED-A", "CONSOLIDATED-B"],
+  "The first logical drop at a consolidated physical visit must display all involved orders.");
+assert.deepEqual(consolidatedDrops[1].detailOrderRefs, ["CONSOLIDATED-A", "CONSOLIDATED-B"],
+  "Every child of a consolidated physical visit must display the same complete manifest.");
+assert.deepEqual(
+  consolidatedDrops[0].physicalVisitJobIds,
+  consolidatedDrops.slice(0, 2).map((job) => job.jobId),
+  "The first consolidated drop must declare every logical job completed by its one-click physical visit action."
+);
+assert.deepEqual(
+  consolidatedDrops[1].physicalVisitJobIds,
+  consolidatedDrops.slice(0, 2).map((job) => job.jobId),
+  "Every logical member must share the same physical-visit execution boundary."
+);
+assert.equal(consolidatedDrops[0].consolidatedPhysicalVisit, true);
+assert.deepEqual(consolidatedDrops[0].detailOrderScopes.map((scope) => ({
+  orderRef: scope.orderRef,
+  lineRowIds: scope.lineRowIds
+})), [
+  { orderRef: "CONSOLIDATED-A", lineRowIds: ["A-1"] },
+  { orderRef: "CONSOLIDATED-B", lineRowIds: ["B-1"] }
+], "Consolidated display details must retain each order's exact item-line scope.");
+assert.deepEqual(consolidatedDrops[2].detailOrderRefs, ["SEPARATE-C"],
+  "A different physical address must not leak into the consolidated manifest.");
+assert.deepEqual(consolidatedDrops[2].physicalVisitJobIds, [consolidatedDrops[2].jobId],
+  "A different address must remain a separate one-click completion.");
+assert.equal(consolidatedDrops[2].consolidatedPhysicalVisit, false);
+
 const pickupOverridePlan = {
   id: 5634,
   planDate: "2026-07-24",
@@ -401,4 +462,4 @@ assert.equal(
   "6000:T1:S2:TRAVEL:12441:3445:TRUCK_SWITCH_APPROACH"
 );
 
-console.log(JSON.stringify({ ok: true, tests: 50, jobTypes: jobs.map((job) => job.stopType), approachJobTypes: approachJobs.map((job) => job.stopType) }));
+console.log(JSON.stringify({ ok: true, tests: 56, jobTypes: jobs.map((job) => job.stopType), approachJobTypes: approachJobs.map((job) => job.stopType) }));

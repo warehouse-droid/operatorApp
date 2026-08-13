@@ -87,6 +87,15 @@ async function assertPurchaseOrder(orderId, expected) {
   check(number(line.section_qty) === expected.section_qty, "Purchase line SEC mapped incorrectly.", { line });
   check(number(line.piece_qty) === expected.piece_qty, "Purchase line PCS mapped incorrectly.", { line });
   check(number(line.netsuite_received_qty) === expected.netsuite_received_qty, "Purchase received sales quantity mapped incorrectly.", { line });
+  if (expected.rate !== undefined) {
+    check(number(line.rate) === expected.rate, "Purchase unit price was dropped from the NetSuite webhook.", { line });
+  }
+  if (expected.amount !== undefined) {
+    check(number(line.amount) === expected.amount, "Purchase amount was dropped from the NetSuite webhook.", { line });
+  }
+  if (expected.netsuite_closed !== undefined) {
+    check(Boolean(line.netsuite_closed) === expected.netsuite_closed, "Purchase closed state was dropped from the NetSuite webhook.", { line });
+  }
   if (expected.netsuite_received_baseline_qty !== undefined) {
     check(number(line.netsuite_received_baseline_qty) === expected.netsuite_received_baseline_qty, "Purchase received baseline quantity mapped incorrectly.", { line });
   }
@@ -787,6 +796,9 @@ async function runWebhookSimulation(checks) {
       itemDescription: "Webhook simulated PO line",
       quantity: 210,
       quantityReceived: 10,
+      rate: 12.6,
+      amount: 2646,
+      closed: false,
       unitText: "EA",
       itemWeight: 1.5,
       locationId: 28,
@@ -808,9 +820,12 @@ async function runWebhookSimulation(checks) {
     section_qty: 0,
     piece_qty: 0,
     netsuite_received_qty: 10,
+    rate: 12.6,
+    amount: 2646,
+    netsuite_closed: false,
     item_weight: 1.5
   });
-  checks.push("webhook purchaseorder payload -> canonical purchase views");
+  checks.push("webhook purchaseorder price/amount payload -> canonical purchase views");
 
   await processNetSuiteOrderWebhook({
     recordType: "transferorder",

@@ -998,6 +998,7 @@ pre {
   max-height: 680px;
   overflow: auto;
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   align-content: start;
   gap: 8px;
 }
@@ -1016,13 +1017,21 @@ pre {
 
 .loaded-order-card {
   width: 100%;
+  min-width: 0;
+  max-width: 100%;
   min-height: 94px;
   padding: 10px;
   display: grid;
   gap: 4px;
   text-align: left;
   align-content: center;
+  overflow: hidden;
   background: white;
+}
+
+.loaded-order-card > * {
+  min-width: 0;
+  max-width: 100%;
 }
 
 .loaded-order-card.active {
@@ -1038,14 +1047,25 @@ pre {
   font-size: 12px;
   font-style: normal;
   font-weight: 800;
+  overflow-wrap: anywhere;
 }
 
 .movement-card-head,
 .movement-detail-title {
+  min-width: 0;
   display: flex;
   justify-content: space-between;
   align-items: center;
   gap: 10px;
+}
+
+.movement-card-head {
+  flex-wrap: wrap;
+}
+
+.movement-card-head > strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .movement-detail-title {
@@ -1059,7 +1079,10 @@ pre {
 .movement-badges {
   display: flex;
   gap: 4px;
+  max-width: 100%;
   flex: 0 0 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .loaded-order-card .movement-badge,

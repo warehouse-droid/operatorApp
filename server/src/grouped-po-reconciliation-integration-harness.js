@@ -147,9 +147,21 @@ try {
         WHERE order_kind = 'PO' AND order_ref = $1`,
       [groupRef]
     )).rows[0];
-    assert.equal(parent.status, "Partially Done",
-      "One completed grouped PO child must roll the parent to Partially Done.");
+    assert.equal(parent.status, "In Transit",
+      "A grouped PO calculation must not overwrite its operational status.");
     assert.equal(parent.reconciliation_blocked, false);
+    const partialProjection = await enrichScmScheduleWithReconciliation([{
+      orderKind: "PO",
+      orderRef: groupRef,
+      sourceRef: groupRef,
+      sourceId: null,
+      status: parent.status,
+      scheduleId: 9_999_998,
+      updatedAt: "2099-12-31T23:59:58.000Z"
+    }]);
+    assert.equal(partialProjection[0].status, "In Transit");
+    assert.equal(partialProjection[0].reconciliationApplicationStatus, "Partially Done",
+      "One completed child must roll up only in the separate calculation field.");
 
     await reconcileScmOrderFamily({
       kind: "PO",
@@ -169,8 +181,8 @@ try {
         WHERE order_kind = 'PO' AND order_ref = $1`,
       [groupRef]
     )).rows[0];
-    assert.equal(parent.status, "Completed",
-      "Every active grouped PO child completed must roll the parent to Completed.");
+    assert.equal(parent.status, "In Transit",
+      "Completing every grouped PO child must preserve the operational status.");
     assert.equal(parent.reconciliation_blocked, false);
 
     const completedProjection = await enrichScmScheduleWithReconciliation([{
@@ -182,8 +194,10 @@ try {
       scheduleId: 9_999_999,
       updatedAt: "2099-12-31T23:59:59.000Z"
     }]);
-    assert.equal(completedProjection[0].status, "Completed",
-      "The reconciliation projection must derive a grouped PO from its children, not its stale row status.");
+    assert.equal(completedProjection[0].status, "In Transit",
+      "The reconciliation projection must preserve the grouped PO operational status.");
+    assert.equal(completedProjection[0].reconciliationApplicationStatus, "Completed",
+      "The reconciliation projection must derive completion in its separate calculation field.");
 
     await reconcileScmOrderFamily({
       kind: "PO",
@@ -204,8 +218,8 @@ try {
         WHERE order_kind = 'PO' AND order_ref = $1`,
       [groupRef]
     )).rows[0];
-    assert.equal(parent.status, "Reconcile Review",
-      "A blocking child review must take precedence over completed grouped PO children.");
+    assert.equal(parent.status, "In Transit",
+      "A blocking child review must not overwrite the grouped PO operational status.");
     assert.equal(parent.reconciliation_blocked, true);
 
     await reconcileScmOrderFamily({
@@ -226,8 +240,8 @@ try {
         WHERE order_kind = 'PO' AND order_ref = $1`,
       [groupRef]
     )).rows[0];
-    assert.equal(parent.status, "Completed",
-      "Resolving the child review must return an all-completed grouped PO to Completed.");
+    assert.equal(parent.status, "In Transit",
+      "Resolving the child review must preserve the grouped PO operational status.");
     assert.equal(parent.reconciliation_blocked, false);
 
     const stableParentVersion = parent.row_version;

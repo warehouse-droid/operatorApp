@@ -131,8 +131,10 @@ includesAll(driver, [
 includesAll(sidebar, [
   'path.startsWith("/admin")',
   'localStorage.getItem("mbbs.staff.roles")',
-  'if (roles.has("admin")) return mainItems.filter((item) => item.href !== "/driver");',
-  'if (roles.has("yard_manager")) ["/control", "/operator"].forEach((href) => visiblePaths.add(href));',
+  '{ label: "Admin", href: "/admin", icon: "AD", authorities: ["admin"] }',
+  '{ label: "MBT", href: "/mbt", icon: "MB", authorities: ["admin", "dispatcher", "mbt_frontdesk", "mbt_billing"] }',
+  'return mainItems.filter((item) => itemAllowedByAuthority(item, roles));',
+  'fetch("/api/auth/me"',
   '{ label: "Order Locks", href: "/control/order-locks"',
   '{ label: "Item Classification", href: "/control/item-classification"',
   '{ label: "Vendor Mapping", href: "/control/vendor-mapping"',

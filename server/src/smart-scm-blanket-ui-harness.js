@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import vm from "node:vm";
 
 const publicUrl = new URL("../public/", import.meta.url);
 const readPublic = (name) => fs.readFileSync(new URL(name, publicUrl), "utf8");
@@ -33,8 +34,97 @@ assert.match(blanket, /smartState\.blanketSidebarTab = selectedTab/);
 assert.match(blanket, /\["ArrowLeft", "ArrowRight", "Home", "End"\]/,
   "The sidebar tabs must support standard keyboard navigation.");
 assert.match(blanket, /Find an open source PO/);
+for (const stateField of [
+  "blanketPlanSearch",
+  "blanketPlanStatus",
+  "blanketPlanVendor",
+  "blanketPlanSource",
+  "blanketPlanDestination",
+  "blanketPlanSort"
+]) {
+  assert.match(core, new RegExp(`${stateField}:`),
+    `Blanket proposal filters need independent ${stateField} state so PO/TO proposal filters are not changed.`);
+}
+for (const controlId of [
+  "smartBlanketPlanSearch",
+  "smartBlanketPlanStatus",
+  "smartBlanketPlanVendor",
+  "smartBlanketPlanSource",
+  "smartBlanketPlanDestination",
+  "smartBlanketPlanSort"
+]) assert.match(blanket, new RegExp(`id="${controlId}"`));
+assert.match(blanket, /function smartBlanketFilteredProposals/,
+  "Blanket pooled loads must have the same searchable/filterable review behavior as PO/TO proposals.");
+assert.match(blanket, /data-smart-action="filter-blanket-plan"/);
+assert.match(blanket, /No Blanket proposal matches this filter\./);
+
+const filterContext = vm.createContext({
+  smartState: {
+    planSearch: "PO / TO filter must remain untouched",
+    blanketPlanSearch: "",
+    blanketPlanStatus: "",
+    blanketPlanVendor: "",
+    blanketPlanSource: "",
+    blanketPlanDestination: "",
+    blanketPlanSort: "destination"
+  },
+  smartProposalManualPriority: (proposal) => String(proposal.proposalKey || "").startsWith("blanket-merge:") ? 0 : 1,
+  smartProposalVendor: (proposal) => proposal.vendor || "",
+  smartNormalizedVendor: (value) => String(value || "").trim().toLowerCase(),
+  smartProposalStops: (proposal) => proposal.routeStops || [],
+  smartProposalRoute: (proposal) => [proposal.vendor, ...(proposal.routeStops || []).map((stop) => stop.name)].join(" → "),
+  smartUrgencyRank: () => 0,
+  smartProposalUrgencyLevel: () => "normal",
+  smartProposalDestinationPriority: () => 0,
+  smartProposalUrgencyScore: () => 0
+});
+const filterStart = blanket.indexOf("function smartBlanketProposalSourceRef(");
+const filterEnd = blanket.indexOf("function smartBlanketSidebarTab(");
+assert(filterStart >= 0 && filterEnd > filterStart, "Blanket filter executable source must be extractable.");
+vm.runInContext(blanket.slice(filterStart, filterEnd), filterContext);
+filterContext.proposals = [{
+  id: 2,
+  proposalKey: "automatic:2",
+  status: "held",
+  vendor: "Alpha Supply",
+  blanketSourcePoRef: "PO-AUTO",
+  routeStops: [{ name: "12441" }],
+  lines: [{ itemId: 101, itemName: "Ordinary board", destinationName: "12441" }]
+}, {
+  id: 9,
+  proposalKey: "blanket-merge:9",
+  status: "held",
+  vendor: "Glacier Creek",
+  blanketSourcePoRef: "POB03688",
+  routeStops: [{ name: "150" }],
+  lines: [{ itemId: 202, itemName: "Needle panel", destinationName: "150" }]
+}];
+assert.deepEqual(
+  vm.runInContext("smartBlanketFilteredProposals(proposals).map((proposal) => proposal.id)", filterContext),
+  [9, 2],
+  "Manually merged or added Blanket loads must remain first after filtering and sorting."
+);
+filterContext.smartState.blanketPlanSearch = "needle";
+filterContext.smartState.blanketPlanVendor = "glacier creek";
+filterContext.smartState.blanketPlanSource = "POB03688";
+filterContext.smartState.blanketPlanDestination = "150";
+assert.deepEqual(
+  vm.runInContext("smartBlanketFilteredProposals(proposals).map((proposal) => proposal.id)", filterContext),
+  [9],
+  "Blanket search, vendor, source PO, and destination filters must combine on the local proposal pool."
+);
+assert.equal(filterContext.smartState.planSearch, "PO / TO filter must remain untouched",
+  "Blanket filtering must not alter the current PO / TO proposal filter state.");
 assert.match(blanket, /flag-blanket-po/);
 assert.match(blanket, /data-smart-action="confirm-blanket-proposal"/);
+assert.match(blanket, /data-smart-blanket-proposal-select=/,
+  "Editable Blanket proposal cards must be selectable for merging.");
+assert.match(blanket, /data-smart-action="merge-blanket-proposals"/);
+assert.match(blanket, /\/api\/scm\/smart\/blanket-proposals\/merge/);
+assert.match(blanket, /same planning run and source Blanket PO/,
+  "The merge affordance must explain its compatibility boundary.");
+assert.match(server, /app\.post\("\/api\/scm\/smart\/blanket-proposals\/merge"/);
+assert.match(server, /source: "blanket-proposals-merged"/);
 assert.match(blanket, /Source available/);
 assert.match(blanket, /smartBlanketProposalLineSourceRemaining/,
   "Proposal rows must resolve their source-line balance from Blanket allocations.");
@@ -99,6 +189,22 @@ assert.match(blanketRepository, /UPDATE scm_smart_proposal_lines/,
   "Blanket line edits must update both proposal data and exact source allocations transactionally.");
 assert.match(blanketRepository, /export async function splitSmartScmBlanketProposalLine/);
 assert.match(blanketRepository, /export async function removeSmartScmBlanketProposalLine/);
+assert.match(blanketRepository, /export async function searchSmartScmBlanketProposalSourceItems/);
+assert.match(blanketRepository, /export async function addSmartScmBlanketProposalSourceLine/);
+assert.match(blanketRepository, /Number\(source\.purchase_order_id\) === Number\(proposal\.blanket_source_po_id\)/,
+  "A manually added Blanket item must retain the proposal's exact source-PO identity.");
+assert.match(blanketRepository, /physicalOpenPallets - plannedPallets/,
+  "The source-item editor must subtract same-run planned quantity from the physical source balance.");
+assert.match(blanketRepository, /export async function mergeSmartScmBlanketProposals/);
+assert.match(blanketRepository, /status = 'superseded'[\s\S]*merged_into_proposal_id/,
+  "Merged source loads must retain audit lineage while leaving the active workspace.");
+assert.match(blanket, /data-smart-blanket-source-item-search=/);
+assert.match(blanket, /data-smart-action="add-blanket-source-item"/);
+assert.match(blanket, /availableForPlanningPallets/);
+assert.match(blanket, /smartBlanketSourceItemSearchSequences/,
+  "Source-item search responses must not replace newer results or force a full render while typing.");
+assert.match(server, /app\.get\("\/api\/scm\/smart\/blanket-proposals\/:id\/source-items"/);
+assert.match(server, /app\.post\("\/api\/scm\/smart\/blanket-proposals\/:id\/lines"/);
 
 assert.match(vendor, /data-vendor-kind="\$\{isBlanket \? "blanket_po" : "regular_po"\}"/);
 assert.match(vendor, /Show source balance/);
@@ -124,15 +230,15 @@ assert.match(sidebar, /!item\.scmWriteOnly \|\| canManageScmPurchaseOrders\(\)/)
 
 for (const version of [
   "scm-smart.css?v=20260801-blanket-ui-v2",
-  "scm-smart-vendor.css?v=20260807-blanket-source-po-v1",
+  "scm-smart-vendor.css?v=20260812-vendor-price-source-v1",
   "scm-smart-blanket.css?v=20260807-blanket-editor-v1",
   "scm-smart-exclusions.css?v=20260801-planning-pauses-v3",
   "app-sidebar.js?v=20260801-netsuite-po-role-v1",
-  "scm-smart.js?v=20260801-focus-preservation-v1",
-  "scm-smart-blanket.js?v=20260807-blanket-editor-v1",
-  "scm-smart-proposals.js?v=20260801-manual-over-capacity-v1",
+  "scm-smart.js?v=20260811-blanket-filters-v1",
+  "scm-smart-blanket.js?v=20260812-blanket-source-items-v1",
+  "scm-smart-proposals.js?v=20260810-manual-priority-v1",
   "scm-smart-exclusions.js?v=20260801-po-only-pauses-v1",
-  "scm-smart-vendor.js?v=20260807-blanket-source-po-v1"
+  "scm-smart-vendor.js?v=20260812-vendor-price-source-v1"
 ]) assert.equal(html.includes(version), true, `Smart SCM must load cache-busted asset ${version}.`);
 
 console.log(JSON.stringify({
@@ -141,6 +247,7 @@ console.log(JSON.stringify({
   staleSearchProtection: true,
   automaticBlanketPauses: true,
   compactEditableBlanketProposals: true,
+  blanketLoadMerge: true,
   tallerBlanketSidebar: true,
   vendorHandoff: true,
   partialHoldSafety: true,

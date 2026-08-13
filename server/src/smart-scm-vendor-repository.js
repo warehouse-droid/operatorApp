@@ -17,6 +17,9 @@ import {
   refreshSmartScmProposalDerived
 } from "./smart-scm-proposal-editor.js";
 import { getSmartScmRouteRule } from "./smart-scm-route-repository.js";
+import { resolveSmartScmVendorItemCodes } from "./smart-scm-vendor-code-service.js";
+import { smartScmVendorUnitPriceEdit } from "./smart-scm-vendor-unit-price.js";
+import { applySmartScmVendorPalletUnitPrice } from "./smart-scm-vendor-unit-price-repository.js";
 
 const EPSILON = 0.000001;
 const VENDOR_REPLY_LOAD_STATUSES = Object.freeze(["order_requested", "vendor_replied"]);
@@ -292,6 +295,101 @@ async function vendorIdentityForProposal(proposalId, { confirmedOnly = false } =
   };
 }
 
+function usableVendorUnitPrice(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > EPSILON ? parsed : null;
+}
+
+async function resolveVendorReplyUnitPrices(proposalId) {
+  const itemResult = await query(
+    `SELECT DISTINCT item_id
+       FROM (
+         SELECT item_id
+           FROM scm_smart_proposal_lines
+          WHERE proposal_id = $1
+            AND item_id IS NOT NULL
+         UNION ALL
+         SELECT COALESCE(proposal.pallet_item_id, pallet.item_id)
+           FROM scm_smart_proposals proposal
+           LEFT JOIN LATERAL (
+             SELECT item_id
+               FROM inventory_items
+              WHERE UPPER(BTRIM(COALESCE(item_name, ''))) = 'PALLET'
+              ORDER BY item_id
+              LIMIT 1
+           ) pallet ON true
+          WHERE proposal.id = $1
+       ) requested
+      WHERE item_id IS NOT NULL`,
+    [Number(proposalId)]
+  );
+  const itemIds = itemResult.rows.map((row) => Number(row.item_id))
+    .filter((itemId) => Number.isInteger(itemId) && itemId > 0);
+  if (!itemIds.length) return [];
+  try {
+    const { vendorId } = await vendorIdentityForProposal(proposalId);
+    return await resolveSmartScmVendorItemCodes({ vendorId, itemIds });
+  } catch {
+    // NetSuite vendor pricing is preferred but must not prevent the documented
+    // Item Master Last Purchase Price fallback.
+    return [];
+  }
+}
+
+async function snapshotVendorReplyUnitPrices(proposalId, lineIds = [], vendorItems = []) {
+  const ids = [...new Set(lineIds.map(Number).filter((id) => Number.isInteger(id) && id > 0))];
+  if (!ids.length) return;
+  const rows = await query(
+    `SELECT line.id, line.item_id, line.last_purchase_price,
+            line.last_purchase_price_synced_at, line.purchase_unit, line.reason,
+            item.purchase_unit AS item_purchase_unit,
+            item.last_purchase_price AS item_last_purchase_price,
+            item.synced_at AS item_last_purchase_price_synced_at
+       FROM scm_smart_proposal_lines line
+       LEFT JOIN inventory_items item ON item.item_id = line.item_id
+      WHERE line.proposal_id = $1
+        AND line.id = ANY($2::bigint[])
+      ORDER BY line.id`,
+    [Number(proposalId), ids]
+  );
+  const vendorByItem = new Map(vendorItems.map((item) => [Number(item.itemId), item]));
+  for (const row of rows.rows) {
+    const savedPrice = usableVendorUnitPrice(row.last_purchase_price);
+    const vendorItem = vendorByItem.get(Number(row.item_id));
+    const vendorPrice = usableVendorUnitPrice(vendorItem?.vendorPrice);
+    const lastPurchasePrice = usableVendorUnitPrice(row.item_last_purchase_price);
+    const unitPrice = savedPrice ?? vendorPrice ?? lastPurchasePrice;
+    if (unitPrice === null) continue;
+    const source = savedPrice !== null
+      ? "saved_load"
+      : vendorPrice !== null
+        ? "vendor_price"
+        : "last_purchase_price";
+    const syncedAt = source === "saved_load"
+      ? row.last_purchase_price_synced_at
+      : source === "vendor_price"
+        ? vendorItem?.vendorPriceSyncedAt
+        : row.item_last_purchase_price_synced_at;
+    const evidence = {
+      source,
+      unitPrice,
+      vendorId: Number(vendorItem?.vendorId) || null,
+      checkedAt: syncedAt || null
+    };
+    await query(
+      `UPDATE scm_smart_proposal_lines
+          SET last_purchase_price = $3,
+              last_purchase_price_synced_at = $4,
+              purchase_unit = COALESCE(purchase_unit, $5),
+              reason = jsonb_set(COALESCE(reason, '{}'::jsonb), '{vendorReplyPriceSnapshot}', $6::jsonb, true),
+              updated_at = now()
+        WHERE id = $1 AND proposal_id = $2`,
+      [Number(row.id), Number(proposalId), unitPrice, syncedAt || null,
+        row.purchase_unit || row.item_purchase_unit || null, JSON.stringify(evidence)]
+    );
+  }
+}
+
 async function resolvedProposalTotalWeight(proposalId, { confirmed = false } = {}) {
   const result = await query(
     `SELECT p.destination_location_id, p.destination_name, p.pallet_quantity_overrides,
@@ -434,6 +532,8 @@ async function createVendorResolutionChild(source, { kind, status, label, operat
        vendor_response_status, vendor_ready_date, vendor_reference, vendor_packing_number,
        vendor_credit_status, vendor_remarks, vendor_response_source,
        pallet_quantity_overrides,
+       pallet_item_id, pallet_item_name, pallet_unit, pallet_purchase_unit,
+       pallet_last_purchase_price, pallet_price_synced_at,
        parent_proposal_id, vendor_resolution_kind, price_snapshot_at, confirmed_at, confirmed_by
      )
      SELECT run_id, $2, proposal_type, phase, source_kind, source_location_id, source_vendor_yard_id, source_name,
@@ -442,6 +542,12 @@ async function createVendorResolutionChild(source, { kind, status, label, operat
             $4, vendor_ready_date, vendor_reference, vendor_packing_number,
             vendor_credit_status, vendor_remarks, vendor_response_source,
             CASE WHEN $5 = 'netsuite_po_review' THEN pallet_quantity_overrides ELSE '{}'::jsonb END,
+            CASE WHEN $5 = 'netsuite_po_review' THEN pallet_item_id ELSE NULL END,
+            CASE WHEN $5 = 'netsuite_po_review' THEN pallet_item_name ELSE NULL END,
+            CASE WHEN $5 = 'netsuite_po_review' THEN pallet_unit ELSE NULL END,
+            CASE WHEN $5 = 'netsuite_po_review' THEN pallet_purchase_unit ELSE NULL END,
+            CASE WHEN $5 = 'netsuite_po_review' THEN pallet_last_purchase_price ELSE NULL END,
+            CASE WHEN $5 = 'netsuite_po_review' THEN pallet_price_synced_at ELSE NULL END,
             id, $5, CASE WHEN $5 = 'netsuite_po_review' THEN now() ELSE NULL END,
             CASE WHEN $5 = 'netsuite_po_review' THEN now() ELSE NULL END,
             CASE WHEN $5 = 'netsuite_po_review' THEN $6 ELSE NULL END
@@ -462,6 +568,8 @@ async function createVendorHeldLineChild(source, line) {
        order_requested_at, order_requested_by, vendor_replied_at, vendor_replied_by,
        vendor_response_status, vendor_ready_date, vendor_reference, vendor_packing_number,
        vendor_credit_status, vendor_remarks, vendor_response_source,
+       pallet_item_id, pallet_item_name, pallet_unit, pallet_purchase_unit,
+       pallet_last_purchase_price, pallet_price_synced_at,
        parent_proposal_id, vendor_resolution_kind, po_execution_status
      )
      SELECT run_id, $2, proposal_type, phase, source_kind, source_location_id, source_vendor_yard_id, source_name,
@@ -472,6 +580,8 @@ async function createVendorHeldLineChild(source, line) {
             order_requested_at, order_requested_by, vendor_replied_at, vendor_replied_by,
             'awaiting', vendor_ready_date, vendor_reference, vendor_packing_number,
             vendor_credit_status, vendor_remarks, vendor_response_source,
+            pallet_item_id, pallet_item_name, pallet_unit, pallet_purchase_unit,
+            pallet_last_purchase_price, pallet_price_synced_at,
             id, NULL, 'idle'
        FROM scm_smart_proposals WHERE id = $1
      RETURNING id`,
@@ -589,7 +699,15 @@ async function splitHeldVendorLine({ source, line, decision, cancelledProposalId
   };
 }
 
-async function snapshotReviewPalletItem(reviewProposalId) {
+async function snapshotReviewPalletItem(reviewProposalId, sourceProposalId, vendorItems = []) {
+  const sourceResult = await query(
+    `SELECT pallet_item_id, pallet_item_name, pallet_unit, pallet_purchase_unit,
+            pallet_last_purchase_price, pallet_price_synced_at
+       FROM scm_smart_proposals
+      WHERE id = $1`,
+    [Number(sourceProposalId)]
+  );
+  const source = sourceResult.rows[0] || {};
   const result = await query(
     `SELECT item_id, item_name, stock_unit, purchase_unit, last_purchase_price, synced_at
        FROM inventory_items
@@ -597,6 +715,20 @@ async function snapshotReviewPalletItem(reviewProposalId) {
       ORDER BY item_id`
   );
   const pallet = result.rowCount === 1 ? result.rows[0] : null;
+  const overriddenPrice = usableVendorUnitPrice(source.pallet_last_purchase_price);
+  const palletItemId = Number(overriddenPrice !== null ? source.pallet_item_id : pallet?.item_id) || null;
+  const vendorItem = vendorItems.find((item) => Number(item.itemId) === palletItemId);
+  const vendorPrice = usableVendorUnitPrice(vendorItem?.vendorPrice);
+  const lastPurchasePrice = usableVendorUnitPrice(pallet?.last_purchase_price);
+  const unitPrice = overriddenPrice ?? vendorPrice ?? lastPurchasePrice;
+  const priceSyncedAt = overriddenPrice !== null
+    ? source.pallet_price_synced_at
+    : vendorPrice !== null
+      ? vendorItem?.vendorPriceSyncedAt
+      : lastPurchasePrice !== null
+        ? pallet?.synced_at
+        : null;
+  const overridden = overriddenPrice !== null;
   await query(
     `UPDATE scm_smart_proposals
         SET pallet_item_id = $2,
@@ -607,8 +739,13 @@ async function snapshotReviewPalletItem(reviewProposalId) {
             pallet_price_synced_at = $7,
             updated_at = now()
       WHERE id = $1`,
-    [reviewProposalId, pallet?.item_id || null, pallet?.item_name || null, pallet?.stock_unit || null,
-      pallet?.purchase_unit || null, pallet?.last_purchase_price || null, pallet?.synced_at || null]
+    [reviewProposalId,
+      overridden ? source.pallet_item_id : pallet?.item_id || null,
+      overridden ? source.pallet_item_name : pallet?.item_name || null,
+      overridden ? source.pallet_unit : pallet?.stock_unit || null,
+      overridden ? source.pallet_purchase_unit : pallet?.purchase_unit || null,
+      unitPrice,
+      priceSyncedAt || null]
   );
 }
 
@@ -621,13 +758,13 @@ function smartScmPoReviewBlockers(proposal) {
         code: "missing_last_purchase_price",
         itemId: line.itemId,
         itemName: line.itemName,
-        message: `${line.itemName} does not have a positive NetSuite Last Purchase Price.`
+        message: `${line.itemName} does not have a positive NetSuite vendor price or Last Purchase Price.`
       });
     }
     if (!text(line.purchaseUnit)) {
       blockers.push({ code: "missing_purchase_unit", itemId: line.itemId, itemName: line.itemName, message: `${line.itemName} does not have a NetSuite purchase unit snapshot.` });
     } else if (hasPurchaseUnitMismatch(line.unit, line.purchaseUnit)) {
-      blockers.push({ code: "purchase_unit_mismatch", itemId: line.itemId, itemName: line.itemName, stockUnit: line.unit, purchaseUnit: line.purchaseUnit, message: `${line.itemName} uses stock unit ${line.unit} but NetSuite Last Purchase Price uses purchase unit ${line.purchaseUnit}.` });
+      blockers.push({ code: "purchase_unit_mismatch", itemId: line.itemId, itemName: line.itemName, stockUnit: line.unit, purchaseUnit: line.purchaseUnit, message: `${line.itemName} uses stock unit ${line.unit} but its selected NetSuite unit price uses purchase unit ${line.purchaseUnit}.` });
     }
   }
   const needsPalletItem = !Array.isArray(proposal.palletLines)
@@ -636,12 +773,12 @@ function smartScmPoReviewBlockers(proposal) {
     if (!Number.isInteger(Number(proposal.palletItemId)) || Number(proposal.palletItemId) <= 0) {
       blockers.push({ code: "missing_pallet_item", message: "The active NetSuite PALLET item is not available in Item Master." });
     } else if (positive(proposal.palletLastPurchasePrice) <= EPSILON) {
-      blockers.push({ code: "missing_pallet_last_purchase_price", itemId: Number(proposal.palletItemId), itemName: proposal.palletItemName || "PALLET", message: "PALLET does not have a positive NetSuite Last Purchase Price." });
+      blockers.push({ code: "missing_pallet_last_purchase_price", itemId: Number(proposal.palletItemId), itemName: proposal.palletItemName || "PALLET", message: "PALLET does not have a positive NetSuite vendor price or Last Purchase Price." });
     }
     if (!text(proposal.palletPurchaseUnit)) {
       blockers.push({ code: "missing_pallet_purchase_unit", itemId: Number(proposal.palletItemId) || null, itemName: proposal.palletItemName || "PALLET", message: "PALLET does not have a NetSuite purchase unit snapshot." });
     } else if (hasPurchaseUnitMismatch(proposal.palletUnit, proposal.palletPurchaseUnit)) {
-      blockers.push({ code: "pallet_purchase_unit_mismatch", itemId: Number(proposal.palletItemId), itemName: proposal.palletItemName || "PALLET", stockUnit: proposal.palletUnit, purchaseUnit: proposal.palletPurchaseUnit, message: `PALLET uses stock unit ${proposal.palletUnit} but NetSuite Last Purchase Price uses purchase unit ${proposal.palletPurchaseUnit}.` });
+      blockers.push({ code: "pallet_purchase_unit_mismatch", itemId: Number(proposal.palletItemId), itemName: proposal.palletItemName || "PALLET", stockUnit: proposal.palletUnit, purchaseUnit: proposal.palletPurchaseUnit, message: `PALLET uses stock unit ${proposal.palletUnit} but its selected NetSuite unit price uses purchase unit ${proposal.palletPurchaseUnit}.` });
     }
   }
   return blockers;
@@ -1446,6 +1583,7 @@ export async function saveSmartScmVendorReplyLoad(proposalId, values = {}, opera
     await query("SELECT id FROM scm_smart_proposals WHERE id = $1 FOR UPDATE", [id]);
   const proposal = await getSmartScmProposal(id);
   ensureEditableVendorLoad(proposal);
+  const palletPriceEdit = await applySmartScmVendorPalletUnitPrice(id, values);
   const palletPatch = palletQuantityOverridePatch(values);
   if (palletPatch !== null) {
     for (const [destinationLocationId, quantity] of palletPatch) {
@@ -1478,19 +1616,38 @@ export async function saveSmartScmVendorReplyLoad(proposalId, values = {}, opera
     throw Object.assign(new Error("A production ETA reply requires a ready date."), { status: 400 });
   }
   await recordSmartScmVendorResponses(responses, operatorId);
+  const unitPriceUpdatedAt = new Date().toISOString();
+  const priceEdits = [];
   for (const response of responses) {
+    const input = inputByLine.get(Number(response.proposalLineId)) || {};
+    const sourceLine = proposal.lines.find((line) => Number(line.id) === Number(response.proposalLineId));
+    const priceEdit = smartScmVendorUnitPriceEdit(
+      sourceLine?.reason?.vendorReplyDraft || {},
+      input,
+      { updatedAt: unitPriceUpdatedAt, updatedBy: operatorId }
+    );
     const vendorReplyDraft = {
+      ...priceEdit.draft,
       decision: response.decision,
       decisionPallets: response.decisionPallets
     };
     await query(
       `UPDATE scm_smart_proposal_lines
           SET vendor_decision = $2,
+              last_purchase_price = CASE WHEN $5::boolean THEN $6::numeric ELSE last_purchase_price END,
+              last_purchase_price_synced_at = CASE WHEN $5::boolean THEN NULL ELSE last_purchase_price_synced_at END,
+              purchase_unit = CASE
+                WHEN $5::boolean AND $6::numeric IS NULL THEN NULL
+                WHEN $5::boolean THEN (SELECT i.purchase_unit FROM inventory_items i WHERE i.item_id = scm_smart_proposal_lines.item_id)
+                ELSE purchase_unit
+              END,
               reason = jsonb_set(COALESCE(reason, '{}'::jsonb), '{vendorReplyDraft}', $4::jsonb, true),
               updated_at = now()
         WHERE id = $1 AND proposal_id = $3`,
-      [response.proposalLineId, response.decision, id, JSON.stringify(vendorReplyDraft)]
+      [response.proposalLineId, response.decision, id, JSON.stringify(vendorReplyDraft),
+        priceEdit.provided, priceEdit.unitPrice]
     );
+    if (priceEdit.provided) priceEdits.push({ proposalLineId: Number(response.proposalLineId), unitPrice: priceEdit.unitPrice });
   }
   const loadStatus = aggregateReplyStatus(responses);
   await query(
@@ -1523,6 +1680,8 @@ export async function saveSmartScmVendorReplyLoad(proposalId, values = {}, opera
       palletQuantityOverrides: palletPatch === null
         ? smartScmNormalizePalletQuantityOverrides(proposal.palletQuantityOverrides)
         : Object.fromEntries(palletPatch),
+      unitPriceEdits: priceEdits,
+      palletUnitPrice: palletPriceEdit.provided ? palletPriceEdit.unitPrice : undefined,
       decisions: responses.map((response) => ({
         proposalLineId: Number(response.proposalLineId),
         decision: response.decision,
@@ -1547,6 +1706,7 @@ export async function saveSmartScmVendorReplyLoad(proposalId, values = {}, opera
 
 export async function stageSmartScmVendorReplyLoad(proposalId, values = {}, operatorId = null) {
   const id = Number(proposalId);
+  const vendorItems = await resolveVendorReplyUnitPrices(id);
   const staged = await withTransaction(async () => {
     await query("SELECT id FROM scm_smart_proposals WHERE id = $1 FOR UPDATE", [id]);
     const source = await getSmartScmProposal(id);
@@ -1585,6 +1745,7 @@ export async function stageSmartScmVendorReplyLoad(proposalId, values = {}, oper
     const heldSplits = [];
 
     if (confirmedLineIds.length) {
+      await snapshotVendorReplyUnitPrices(id, confirmedLineIds, vendorItems);
       reviewProposalId = await createVendorResolutionChild(source, {
         kind: "netsuite_po_review",
         status: "confirmed",
@@ -1598,14 +1759,12 @@ export async function stageSmartScmVendorReplyLoad(proposalId, values = {}, oper
                 sales_quantity = confirmed_pallets * to_plt,
                 line_weight_lbs = confirmed_pallets * pallet_weight_lbs,
                 residual_pallets = GREATEST(proposed_pallets - confirmed_pallets, 0),
-                last_purchase_price = (SELECT i.last_purchase_price FROM inventory_items i WHERE i.item_id = l.item_id),
-                last_purchase_price_synced_at = (SELECT i.synced_at FROM inventory_items i WHERE i.item_id = l.item_id),
-                purchase_unit = (SELECT i.purchase_unit FROM inventory_items i WHERE i.item_id = l.item_id),
+                purchase_unit = COALESCE(l.purchase_unit, (SELECT i.purchase_unit FROM inventory_items i WHERE i.item_id = l.item_id)),
                 updated_at = now()
           WHERE l.proposal_id = $2 AND l.id = ANY($3::bigint[])`,
         [reviewProposalId, id, confirmedLineIds]
       );
-      await snapshotReviewPalletItem(reviewProposalId);
+      await snapshotReviewPalletItem(reviewProposalId, id, vendorItems);
       await refreshVendorResolutionProposal(reviewProposalId, { confirmed: true });
     }
 
@@ -1763,9 +1922,9 @@ export async function prepareSmartScmPurchaseExecution(proposalId, operatorId = 
       confirmedPallets: positive(line.confirmed_pallets),
       salesQuantity: round(positive(line.confirmed_pallets) * positive(line.to_plt)),
       palletQty: positive(line.confirmed_pallets),
-      layerQty: 0,
-      sectionQty: 0,
-      pieceQty: 0
+      layerQty: null,
+      sectionQty: null,
+      pieceQty: null
     }));
     const palletItemId = proposal.pallet_item_id === null ? null : Number(proposal.pallet_item_id);
     const palletItem = {

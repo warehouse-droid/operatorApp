@@ -94,6 +94,55 @@ function terminalTransferOrderStatus(row = {}) {
   return "";
 }
 
+function transferOrderReceiptEvidenceComplete(row = {}) {
+  const receivingStatus = text(
+    row.transfer_receiving_status ?? row.receiving_status ?? row.transferReceivingStatus
+  ).toLowerCase();
+  if (["received", "completed", "shipped"].includes(receivingStatus)) return true;
+
+  const statusText = text(
+    row.transfer_status_text ?? row.status_text ?? row.transferStatusText
+  );
+  if (/^transfer\s+order\s*:\s*received$/i.test(statusText)) return true;
+
+  const applicationStatus = text(
+    row.transfer_application_status ?? row.application_status ?? row.transferApplicationStatus
+  ).toLowerCase();
+  const reconciliationStatus = text(
+    row.transfer_reconciliation_status ?? row.transferReconciliationStatus
+  ).toLowerCase();
+  if (applicationStatus !== "completed" || !["ok", "current"].includes(reconciliationStatus)) {
+    return false;
+  }
+  const orderedQuantity = nullableNumber(
+    row.transfer_ordered_qty ?? row.ordered_qty ?? row.transferOrderedQuantity
+  );
+  const receivedQuantity = nullableNumber(
+    row.transfer_received_qty ?? row.received_qty ?? row.transferReceivedQuantity
+  );
+  const remainingQuantity = nullableNumber(
+    row.transfer_remaining_qty ?? row.remaining_qty ?? row.transferRemainingQuantity
+  );
+  const destinationRemainingQuantity = nullableNumber(
+    row.transfer_destination_remaining_qty
+      ?? row.destination_remaining_qty
+      ?? row.transferDestinationRemainingQuantity
+  );
+  return (orderedQuantity === null || receivedQuantity === null || receivedQuantity + EPSILON >= orderedQuantity)
+    && (remainingQuantity === null || remainingQuantity <= EPSILON)
+    && (destinationRemainingQuantity === null || destinationRemainingQuantity <= EPSILON);
+}
+
+function transferDependencyReceiptComplete(row = {}) {
+  const dependencyStatus = text(row.status ?? row.dependencyStatus).toLowerCase();
+  const dependencyReconciliationStatus = text(
+    row.reconciliation_status ?? row.reconciliationStatus
+  ).toLowerCase();
+  return ["delivered", "received_local"].includes(dependencyStatus)
+    || dependencyReconciliationStatus === "reconciled"
+    || transferOrderReceiptEvidenceComplete(row);
+}
+
 function isMaterialLine(line = {}) {
   const name = `${line.item_name || ""} ${line.sku || ""}`.trim().toLowerCase();
   const type = `${line.item_type || ""} ${line.item_type_text || ""}`.toLowerCase();
@@ -368,6 +417,14 @@ function serializeDependency(row = {}, lines = []) {
     reconciliationStatus: row.reconciliation_status,
     reconciledAt: row.reconciled_at,
     attentionReason: row.attention_reason,
+    transferReceivingStatus: row.transfer_receiving_status,
+    transferStatus: row.transfer_status,
+    transferStatusText: row.transfer_status_text,
+    transferDispatchPlanned: Boolean(row.transfer_dispatch_planned),
+    transferDispatchPlanDate: dateText(row.transfer_dispatch_plan_date),
+    transferApplicationStatus: row.transfer_application_status,
+    transferReconciliationStatus: row.transfer_reconciliation_status,
+    transferReceived: transferDependencyReceiptComplete(row),
     lines
   };
 }
@@ -385,8 +442,23 @@ async function loadDependencies({ salesOrderRef = "", transferOrderRef = "", inc
   }
   if (!includeCancelled) clauses.push("d.status <> 'cancelled'");
   const rows = await query(
-    `SELECT d.*
+    `SELECT d.*,
+            t.receiving_status AS transfer_receiving_status,
+            t.status AS transfer_status,
+            t.status_text AS transfer_status_text,
+            t.dispatch_planned AS transfer_dispatch_planned,
+            t.dispatch_plan_date AS transfer_dispatch_plan_date,
+            state.application_status AS transfer_application_status,
+            state.reconciliation_status AS transfer_reconciliation_status,
+            state.ordered_qty AS transfer_ordered_qty,
+            state.received_qty AS transfer_received_qty,
+            state.remaining_qty AS transfer_remaining_qty,
+            state.destination_remaining_qty AS transfer_destination_remaining_qty
        FROM order_dependencies d
+       LEFT JOIN transfer_orders t ON t.netsuite_id = d.transfer_order_id
+       LEFT JOIN scm_reconciliation_order_state state
+         ON state.order_kind = 'TO'
+        AND state.source_order_netsuite_id = d.transfer_order_id
       ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
       ORDER BY d.created_at DESC, d.id DESC`,
     params
@@ -477,10 +549,21 @@ export async function getSalesOrderDependencyExecutionBlock(orderRefs = []) {
         WHERE split.status = 'active'
      )
      SELECT COALESCE(d.dispatch_target_ref, d.sales_order_ref) AS dispatch_target_ref,
-            d.sales_order_ref, d.transfer_order_ref, d.status,
-            t.receiving_status, t.received_at, t.netsuite_active
+            d.sales_order_ref, d.transfer_order_ref, d.status, d.reconciliation_status,
+            t.receiving_status AS transfer_receiving_status,
+            t.status AS transfer_status, t.status_text AS transfer_status_text,
+            t.received_at, t.netsuite_active,
+            state.application_status AS transfer_application_status,
+            state.reconciliation_status AS transfer_reconciliation_status,
+            state.ordered_qty AS transfer_ordered_qty,
+            state.received_qty AS transfer_received_qty,
+            state.remaining_qty AS transfer_remaining_qty,
+            state.destination_remaining_qty AS transfer_destination_remaining_qty
        FROM order_dependencies d
        JOIN transfer_orders t ON t.netsuite_id = d.transfer_order_id
+       LEFT JOIN scm_reconciliation_order_state state
+         ON state.order_kind = 'TO'
+        AND state.source_order_netsuite_id = d.transfer_order_id
       WHERE EXISTS (
               SELECT 1
                 FROM effective_refs candidate
@@ -489,16 +572,11 @@ export async function getSalesOrderDependencyExecutionBlock(orderRefs = []) {
             )
         AND d.dependency_mode = 'yard_replenishment'
         AND d.status <> 'cancelled'
-        AND NOT (
-          d.status IN ('delivered', 'received_local')
-          OR LOWER(COALESCE(t.receiving_status, '')) IN ('received', 'completed', 'shipped')
-        )
-      ORDER BY d.dispatch_target_ref, d.transfer_order_ref
-      LIMIT 1`,
+      ORDER BY d.dispatch_target_ref, d.transfer_order_ref`,
     [refs]
   );
-  if (!result.rowCount) return null;
-  const row = result.rows[0];
+  const row = result.rows.find((candidate) => !transferDependencyReceiptComplete(candidate));
+  if (!row) return null;
   return {
     code: "DEPENDENT_TRANSFER_NOT_RECEIVED",
     salesOrderRef: row.dispatch_target_ref || row.sales_order_ref,
@@ -625,9 +703,18 @@ export async function completeYardDependenciesForTransferDrop({
     const dependencies = await query(
       `SELECT d.*, t.receiving_status AS transfer_receiving_status,
               t.netsuite_active AS transfer_active,
-              t.status AS transfer_status, t.status_text AS transfer_status_text
+              t.status AS transfer_status, t.status_text AS transfer_status_text,
+              state.application_status AS transfer_application_status,
+              state.reconciliation_status AS transfer_reconciliation_status,
+              state.ordered_qty AS transfer_ordered_qty,
+              state.received_qty AS transfer_received_qty,
+              state.remaining_qty AS transfer_remaining_qty,
+              state.destination_remaining_qty AS transfer_destination_remaining_qty
          FROM order_dependencies d
          JOIN transfer_orders t ON t.netsuite_id = d.transfer_order_id
+         LEFT JOIN scm_reconciliation_order_state state
+           ON state.order_kind = 'TO'
+          AND state.source_order_netsuite_id = d.transfer_order_id
         WHERE d.transfer_order_ref = ANY($1::text[])
           AND d.dependency_mode = 'yard_replenishment'
           AND d.status <> 'cancelled'
@@ -676,9 +763,7 @@ export async function completeYardDependenciesForTransferDrop({
         });
         continue;
       }
-      const formalReceiptComplete = ["received", "completed", "shipped"].includes(
-        text(dependency.transfer_receiving_status).toLowerCase()
-      );
+      const formalReceiptComplete = transferDependencyReceiptComplete(dependency);
       if (dependency.status === "attention") {
         skipped.push({
           dependencyId: dependency.id,
@@ -948,36 +1033,89 @@ export async function reconcileCompletedYardTransfersForSalesOrderStart({
   return aggregate;
 }
 
-export async function getDirectPickupDependencyExecutionBlock(transferOrderRefs = []) {
+function directPickupRouteMismatches(row = {}, execution = {}) {
+  const mismatches = [];
+  if (
+    row.planned_plan_id !== null
+    && row.planned_plan_id !== undefined
+    && execution.planId !== null
+    && execution.planId !== undefined
+    && execution.planId !== ""
+    && text(row.planned_plan_id) !== text(execution.planId)
+  ) mismatches.push("plan");
+  if (
+    row.planned_date
+    && execution.planDate
+    && dateText(row.planned_date) !== dateText(execution.planDate)
+  ) mismatches.push("plan_date");
+  if (
+    row.planned_truck_plate
+    && execution.truckPlate
+    && normalizedToken(row.planned_truck_plate) !== normalizedToken(execution.truckPlate)
+  ) mismatches.push("truck");
+  if (
+    row.planned_load_id
+    && execution.loadId
+    && text(row.planned_load_id) !== text(execution.loadId)
+  ) mismatches.push("load");
+  return mismatches;
+}
+
+export async function getDirectPickupDependencyExecutionBlock(
+  transferOrderRefs = [],
+  execution = {}
+) {
   const refs = [...new Set((transferOrderRefs || []).map(text).filter(Boolean))];
   if (!refs.length) return null;
   const result = await query(
-    `SELECT d.transfer_order_ref, COALESCE(d.dispatch_target_ref, d.sales_order_ref) AS dispatch_target_ref,
-            d.sales_order_ref, d.status
+    `SELECT d.id, d.transfer_order_ref,
+            COALESCE(d.dispatch_target_ref, d.sales_order_ref) AS dispatch_target_ref,
+            d.sales_order_ref, d.status, d.attention_reason,
+            d.planned_plan_id, d.planned_date, d.planned_truck_plate,
+            d.planned_load_id, d.planned_load_name
        FROM order_dependencies d
       WHERE d.transfer_order_ref = ANY($1::text[])
         AND d.dependency_mode = 'direct_to_customer'
-        AND d.status <> 'cancelled'
-        AND (
-          d.status NOT IN ('loaded', 'in_transit', 'delivered', 'received_local')
-          OR EXISTS (
-            SELECT 1 FROM order_dependency_lines dl
-             WHERE dl.dependency_id = d.id
-               AND dl.loaded_quantity + $2::numeric < dl.allocated_quantity
-          )
-        )
-      ORDER BY d.transfer_order_ref
-      LIMIT 1`,
-    [refs, EPSILON]
+      ORDER BY d.transfer_order_ref,
+               CASE WHEN d.status = 'cancelled' THEN 1 ELSE 0 END,
+               d.id DESC`,
+    [refs]
   );
-  if (!result.rowCount) return null;
-  const row = result.rows[0];
-  return {
-    code: "DIRECT_TRANSFER_NOT_LOADED",
-    salesOrderRef: row.dispatch_target_ref || row.sales_order_ref,
-    transferOrderRef: row.transfer_order_ref,
-    message: `${row.transfer_order_ref} must be loaded by its source-yard operator before this pickup can start.`
-  };
+  const byRef = new Map();
+  for (const row of result.rows) {
+    if (!byRef.has(text(row.transfer_order_ref))) byRef.set(text(row.transfer_order_ref), row);
+  }
+  for (const ref of refs) {
+    const row = byRef.get(ref);
+    if (!row || row.status === "cancelled") {
+      return {
+        code: "DIRECT_TRANSFER_DEPENDENCY_UNAVAILABLE",
+        salesOrderRef: row?.dispatch_target_ref || row?.sales_order_ref || "",
+        transferOrderRef: ref,
+        message: `${ref} is no longer an active direct pickup on this route. Refresh the Driver route before continuing.`
+      };
+    }
+    if (row.status === "attention") {
+      return {
+        code: "DIRECT_TRANSFER_REVIEW_REQUIRED",
+        salesOrderRef: row.dispatch_target_ref || row.sales_order_ref,
+        transferOrderRef: ref,
+        message: `${ref} requires Dispatch review before this direct pickup can continue.`,
+        reason: text(row.attention_reason)
+      };
+    }
+    const mismatches = directPickupRouteMismatches(row, execution);
+    if (mismatches.length) {
+      return {
+        code: "DIRECT_TRANSFER_ROUTE_MISMATCH",
+        salesOrderRef: row.dispatch_target_ref || row.sales_order_ref,
+        transferOrderRef: ref,
+        mismatches,
+        message: `${ref} belongs to another confirmed plan, truck, or load. Refresh the Driver route before continuing.`
+      };
+    }
+  }
+  return null;
 }
 
 export async function syncDirectDependencyOperatorProgress(transferOrderId) {
@@ -4056,6 +4194,7 @@ export async function enrichDispatchOrdersWithDependencies(orders = []) {
     if (salesDependencies.length || uncoveredQuantity > EPSILON) {
       const direct = salesDependencies.filter((dependency) => dependency.mode === "direct_to_customer" && dependency.status !== "cancelled");
       const replenishment = salesDependencies.filter((dependency) => dependency.mode === "yard_replenishment" && dependency.status !== "cancelled");
+      const waitingReplenishment = replenishment.filter((dependency) => !dependency.transferReceived);
       const directPickupManifest = direct.map((dependency) => ({
         dependencyId: dependency.id,
         salesOrderRef: dependency.salesOrderRef,
@@ -4072,15 +4211,17 @@ export async function enrichDispatchOrdersWithDependencies(orders = []) {
         ]),
         orderDependencies: salesDependencies,
         dependencyDirectPickup: direct.length > 0,
-        dependencyWaitingForTransfer: replenishment.some((dependency) => !["received_local", "delivered"].includes(dependency.status)),
-        dependencyAttention: salesDependencies.some((dependency) => dependency.status === "attention"),
+        dependencyWaitingForTransfer: waitingReplenishment.length > 0,
+        dependencyAttention: salesDependencies.some((dependency) =>
+          dependency.status === "attention" && !dependency.transferReceived
+        ),
         dependencyUncovered: uncoveredQuantity > EPSILON,
         dependencyUncoveredQuantity: uncoveredQuantity,
         directPickupManifest,
         dependencyLabels: [...new Set([
           ...salesDependencies.map((dependency) => `Requires ${dependency.transferOrderRef}`),
           ...(direct.length ? ["Direct pickup"] : []),
-          ...(replenishment.length ? ["Waiting for transfer"] : []),
+          ...(waitingReplenishment.length ? ["Waiting for transfer"] : []),
           ...(uncoveredQuantity > EPSILON ? [`Uncovered shortage ${uncoveredQuantity}`] : []),
           ...(salesDependencies.some((dependency) => dependency.reconciliationStatus === "required") ? ["NetSuite reconciliation required"] : [])
         ])]
@@ -4356,6 +4497,7 @@ export async function validateDispatchPlanDependencies(plan = {}) {
     const plannedSalesRef = current.has(dispatchTargetRef) ? dispatchTargetRef : canonicalRef;
     const salesAssignments = assignmentsByRef.get(plannedSalesRef) || [];
     const salesAssignment = current.get(plannedSalesRef);
+    if (dependency.mode === "yard_replenishment" && dependency.transferReceived) continue;
     if (dependency.status === "attention") {
       if (salesAssignments.length) conflicts.push(`${plannedSalesRef}: ${dependency.attentionReason || `${dependency.transferOrderRef} requires attention`}.`);
       continue;
@@ -4400,8 +4542,8 @@ export async function validateDispatchPlanDependencies(plan = {}) {
     }
     const transferAssignment = current.get(dependency.transferOrderRef);
     const transferRow = transferById.get(String(dependency.transferOrderId)) || {};
-    const complete = ["received", "completed", "shipped"].includes(String(transferRow.receiving_status || "").toLowerCase())
-      || ["delivered", "received_local"].includes(dependency.status);
+    const complete = dependency.transferReceived
+      || transferOrderReceiptEvidenceComplete(transferRow);
     if (complete) continue;
     if (priorTransferRefs.has(dependency.transferOrderRef)) continue;
     if (everySalesAssignmentFollowsTransfer(
@@ -4777,22 +4919,116 @@ export async function completeDirectDependenciesForSalesOrderDrop({
   });
 }
 
-export async function markDirectDependencyPickupCompleted({ transferOrderRefs = [], driverJobId = "" } = {}) {
+export async function markDirectDependencyPickupCompleted({
+  transferOrderRefs = [],
+  driverJobId = "",
+  driverLogin = "",
+  planId = null,
+  planDate = "",
+  truckPlate = "",
+  loadId = ""
+} = {}) {
   const refs = [...new Set((transferOrderRefs || []).map(text).filter(Boolean))];
   if (!refs.length) return [];
+  const jobId = text(driverJobId);
+  if (!jobId) throw new Error("Direct pickup completion requires completed Driver pickup evidence.");
   return withTransaction(async () => {
+    const completedJobResult = await query(
+      `SELECT job_id, plan_id, plan_date, driver_login, truck_plate, load_id,
+              stop_type, order_refs, photo_data_urls, status, completed_at, job_details
+         FROM driver_job_records
+        WHERE job_id = $1
+        LIMIT 1
+        FOR UPDATE`,
+      [jobId]
+    );
+    const completedJob = completedJobResult.rows[0];
+    if (
+      !completedJob
+      || completedJob.status !== "complete"
+      || completedJob.stop_type !== "pickup"
+      || !completedJob.completed_at
+    ) {
+      throw new Error("Direct pickup completion requires completed Driver pickup evidence.");
+    }
+    if (
+      driverLogin
+      && text(completedJob.driver_login).toLowerCase() !== text(driverLogin).toLowerCase()
+    ) throw new Error("The completed Driver pickup belongs to another driver.");
+    if (
+      planId !== null
+      && planId !== undefined
+      && planId !== ""
+      && text(completedJob.plan_id) !== text(planId)
+    ) throw new Error("The completed Driver pickup belongs to another dispatch plan.");
+    if (planDate && dateText(completedJob.plan_date) !== dateText(planDate)) {
+      throw new Error("The completed Driver pickup belongs to another plan date.");
+    }
+    if (
+      truckPlate
+      && normalizedToken(completedJob.truck_plate) !== normalizedToken(truckPlate)
+    ) throw new Error("The completed Driver pickup belongs to another truck.");
+    if (loadId && text(completedJob.load_id) !== text(loadId)) {
+      throw new Error("The completed Driver pickup belongs to another load.");
+    }
+
+    const completedRefs = new Set((completedJob.order_refs || []).map(text).filter(Boolean));
+    const directEvidenceRefs = new Set(
+      (Array.isArray(completedJob.job_details?.orders) ? completedJob.job_details.orders : [])
+        .filter((order) => text(order?.source) === "direct_dependency")
+        .map((order) => text(order?.orderRef))
+        .filter(Boolean)
+    );
+    const unprovenRefs = refs.filter((ref) => !completedRefs.has(ref) || !directEvidenceRefs.has(ref));
+    if (unprovenRefs.length) {
+      throw new Error(`The completed Driver pickup does not contain direct-route evidence for ${unprovenRefs.join(", ")}.`);
+    }
+    const requiredPhotos = Math.max(0, Number(completedJob.job_details?.requiredPhotos || 0));
+    const photoCount = Array.isArray(completedJob.photo_data_urls)
+      ? completedJob.photo_data_urls.length
+      : 0;
+    if (photoCount < requiredPhotos) {
+      throw new Error(`The completed Driver pickup is missing ${requiredPhotos - photoCount} required photo${requiredPhotos - photoCount === 1 ? "" : "s"}.`);
+    }
+
     const rows = await query(
-      `SELECT id, transfer_order_ref, status
+      `SELECT id, transfer_order_ref, status, attention_reason,
+              planned_plan_id, planned_date, planned_truck_plate,
+              planned_load_id, planned_load_name
          FROM order_dependencies
         WHERE transfer_order_ref = ANY($1::text[])
           AND dependency_mode = 'direct_to_customer'
-          AND status IN ('active', 'packed', 'loaded', 'attention')
+          AND status <> 'cancelled'
         FOR UPDATE`,
       [refs]
     );
+    const byRef = new Map(rows.rows.map((row) => [text(row.transfer_order_ref), row]));
+    const missingRefs = refs.filter((ref) => !byRef.has(ref));
+    if (missingRefs.length) {
+      throw new Error(`The direct pickup dependency is unavailable for ${missingRefs.join(", ")}.`);
+    }
+    const updates = [];
     for (const row of rows.rows) {
-      if (!["loaded", "in_transit", "delivered", "received_local"].includes(row.status)) {
-        throw new Error(`${row.transfer_order_ref} has not been loaded by its source-yard operator.`);
+      if (row.status === "attention") {
+        throw new Error(`${row.transfer_order_ref} requires Dispatch review before Driver pickup completion.`);
+      }
+      const mismatches = directPickupRouteMismatches(row, {
+        planId: completedJob.plan_id,
+        planDate: completedJob.plan_date,
+        truckPlate: completedJob.truck_plate,
+        loadId: completedJob.load_id
+      });
+      if (mismatches.length) {
+        throw new Error(`${row.transfer_order_ref} does not belong to this completed Driver plan, truck, and load.`);
+      }
+      if (["in_transit", "delivered", "received_local"].includes(row.status)) {
+        updates.push({
+          dependencyId: row.id,
+          transferOrderRef: row.transfer_order_ref,
+          status: row.status,
+          alreadyCompleted: true
+        });
+        continue;
       }
       await query(
         `UPDATE order_dependency_lines
@@ -4802,8 +5038,7 @@ export async function markDirectDependencyPickupCompleted({ transferOrderRefs = 
       );
       await query(
         `UPDATE order_dependencies
-            SET status = 'in_transit', updated_at = now(),
-                attention_reason = CASE WHEN status = 'attention' THEN attention_reason ELSE null END
+            SET status = 'in_transit', updated_at = now(), attention_reason = null
           WHERE id = $1`,
         [row.id]
       );
@@ -4813,10 +5048,23 @@ export async function markDirectDependencyPickupCompleted({ transferOrderRefs = 
         entityType: "order_dependency",
         entityId: String(row.id),
         orderId: row.transfer_order_ref,
-        details: { driverJobId: text(driverJobId) }
+        details: {
+          driverJobId: jobId,
+          driverLogin: text(completedJob.driver_login),
+          planId: completedJob.plan_id,
+          planDate: dateText(completedJob.plan_date),
+          truckPlate: text(completedJob.truck_plate),
+          loadId: text(completedJob.load_id)
+        }
+      });
+      updates.push({
+        dependencyId: row.id,
+        transferOrderRef: row.transfer_order_ref,
+        status: "in_transit",
+        alreadyCompleted: false
       });
     }
-    return rows.rows.map((row) => ({ dependencyId: row.id, transferOrderRef: row.transfer_order_ref, status: "in_transit" }));
+    return updates;
   });
 }
 
@@ -4852,9 +5100,18 @@ export async function syncOrderDependenciesForTransferOrder(transferOrderId) {
   return withTransaction(async () => {
     const dependencies = await query(
       `SELECT d.*, t.status AS transfer_status, t.status_text AS transfer_status_text,
-              t.netsuite_active AS transfer_active, t.receiving_status AS transfer_receiving_status
+              t.netsuite_active AS transfer_active, t.receiving_status AS transfer_receiving_status,
+              state.application_status AS transfer_application_status,
+              state.reconciliation_status AS transfer_reconciliation_status,
+              state.ordered_qty AS transfer_ordered_qty,
+              state.received_qty AS transfer_received_qty,
+              state.remaining_qty AS transfer_remaining_qty,
+              state.destination_remaining_qty AS transfer_destination_remaining_qty
          FROM order_dependencies d
          JOIN transfer_orders t ON t.netsuite_id = d.transfer_order_id
+         LEFT JOIN scm_reconciliation_order_state state
+           ON state.order_kind = 'TO'
+          AND state.source_order_netsuite_id = d.transfer_order_id
         WHERE d.transfer_order_id = $1 AND d.status <> 'cancelled'
         FOR UPDATE OF d`,
       [id]
@@ -4936,7 +5193,7 @@ export async function syncOrderDependenciesForTransferOrder(transferOrderId) {
       const beforeDelivery = !["delivered", "received_local"].includes(dependency.status);
       const attention = beforeDelivery && (unavailable || reduced);
       const replenishmentComplete = dependency.dependency_mode === "yard_replenishment"
-        && ["received", "completed", "shipped"].includes(String(dependency.transfer_receiving_status || "").toLowerCase());
+        && (reconciled || transferOrderReceiptEvidenceComplete(dependency));
       const attentionReason = terminalStatus
         ? `${dependency.transfer_order_ref} is ${terminalStatus} in NetSuite and has already started or has execution progress that requires review.`
         : dependency.transfer_active === false

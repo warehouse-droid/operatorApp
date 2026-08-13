@@ -3,7 +3,10 @@ import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
-import { buildPurchaseOrderHistoryRestPayload } from "./netsuite.js";
+import {
+  buildPurchaseOrderHistoryRestPayload,
+  purchaseOrderHistorySnapshotFromRows
+} from "./netsuite.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const read = (file) => fs.readFileSync(path.join(root, file), "utf8");
@@ -16,6 +19,7 @@ const worker = read("netsuite-order-webhook-scheduled.js");
 const directWebhook = read("netsuite-order-webhook-user-event-direct.js");
 const restlet = read("netsuite-smart-scm-picking-ticket-restlet.js");
 const ui = read("public/scm-netsuite-po.js");
+const html = read("public/scm-netsuite-po.html");
 const server = read("src/server.js");
 
 assert.match(migration, /CREATE TABLE IF NOT EXISTS scm_netsuite_po_history/);
@@ -52,6 +56,27 @@ const restUpdatePayload = buildPurchaseOrderHistoryRestPayload({
     locationId: 1
   }]
 });
+const oauthFinancialSnapshot = purchaseOrderHistorySnapshotFromRows([{
+  id: "946001",
+  tranid: "POB03688",
+  foreigntotal: "-6425.09",
+  line_id: "4761230",
+  rest_line_id: "1",
+  item_id: "9740",
+  item_name: "TH-COV60T-3030-BEI",
+  quantity: "570",
+  received_quantity: "0",
+  rate: "1.64",
+  amount: "934.8",
+  line_closed: "F",
+  unit: "EACH",
+  location_id: "1",
+  location: "3445"
+}]);
+assert.equal(oauthFinancialSnapshot.lines[0].rate, 1.64,
+  "OAuth SuiteQL Rate must remain numeric through PO History normalization.");
+assert.equal(oauthFinancialSnapshot.lines[0].amount, 934.8,
+  "OAuth SuiteQL Amount must remain numeric through PO History normalization.");
 assert.deepEqual(restUpdatePayload, {
   tranDate: "2026-08-07",
   custbody4: "2026-08-12",
@@ -86,6 +111,16 @@ assert.doesNotMatch(updateTransportSource, /configuredRestletJson|action:\s*"upd
   "PO history edits must not depend on optional picking-ticket RESTlet actions.");
 assert.match(netsuite, /tl\.id AS rest_line_id/,
   "SuiteQL history snapshots must retain the REST sublist line key.");
+const pdfTransportSource = netsuite.slice(
+  netsuite.indexOf("async function configuredRestletJson"),
+  netsuite.indexOf("export function buildPurchaseOrderHistoryRestPayload")
+);
+assert.match(pdfTransportSource, /const accessToken = await getAccessToken\(\)/,
+  "The backend NetSuite PDF request must use the connected OAuth 2.0 token lifecycle.");
+assert.match(pdfTransportSource, /"Authorization": `Bearer \$\{accessToken\}`/);
+assert.match(pdfTransportSource, /action: "purchaseOrderPdf"/);
+assert.match(service, /fetchPurchaseOrderPdfFromNetSuite\(history\.purchaseOrderId/,
+  "PO preview must be a backend-to-NetSuite request; OAuth credentials must never be sent to the browser.");
 
 assert.match(vendorCodes, /export async function resolveSmartScmVendorItemCodes/);
 assert.match(netsuite, /FROM itemvendor iv/);
@@ -189,8 +224,20 @@ assert.match(ui, /Archived application-created POs/);
 assert.match(ui, /setInterval\(\(\) => \{[\s\S]*60000\)/);
 assert.match(ui, /new EventSource\("\/api\/events\?client=scm-netsuite-po-history"\)/);
 assert.match(ui, /Preview PDF/);
+assert.match(html, /scm-netsuite-po\.js\?v=20260811-oauth-reference-v2/,
+  "PO History must cache-bust the authenticated preview implementation.");
 assert.match(ui, /Return to Vendor Replies/);
 assert.match(ui, /expectedLastModifiedAt/);
+assert.match(ui, /data-action="save-vendor-reference"/,
+  "Vendor reference must have its own explicit save action.");
+assert.match(ui, /Updates Packing Slip \/ Ref in Dispatch, PO Split, and PO\/TO Schedule/,
+  "The focused save action must explain which shared operational reference it updates.");
+assert.match(repository, /scm_transport_schedule/,
+  "Persisting the NetSuite Vendor reference must synchronize the SCM schedule mirror.");
+assert.match(repository, /packing_slip_ref/,
+  "The shared operational reference must use the schedule Packing Slip / Ref field.");
+assert.match(server, /source: "netsuite-po-vendor-reference"/,
+  "Saving Vendor reference must notify open Dispatch and schedule screens.");
 assert.match(ui, /data-line-field="palletQuantity"/,
   "PO history must expose PLT as the editable quantity.");
 assert.match(ui, /data-line-native-quantity/,
@@ -220,7 +267,7 @@ assert.match(server, /lifecycle: req\.query\.lifecycle/,
 assert.match(repository, /filters\.lifecycle/,
   "PO history lifecycle filtering must be enforced server-side before pagination.");
 
-function renderPoHistoryCard(lifecycle) {
+function renderPoHistoryCard(lifecycle, lines = []) {
   const mount = {
     addEventListener() {},
     contains() { return false; },
@@ -247,7 +294,7 @@ function renderPoHistoryCard(lifecycle) {
     creationSnapshot: {},
     current: {
       active: lifecycle !== "missing",
-      lines: [],
+      lines,
       status: lifecycle === "missing" ? "" : "B",
       statusText: lifecycle === "missing" ? "" : "Purchase Order : Pending Receipt",
       tranid: "PO-RENDER-TEST"
@@ -258,14 +305,41 @@ function renderPoHistoryCard(lifecycle) {
 }
 
 const missingCard = renderPoHistoryCard("missing");
-assert.doesNotMatch(missingCard, /data-action="(?:pdf|refresh|save)"/,
+assert.doesNotMatch(missingCard, /data-action="(?:pdf|refresh|save|save-vendor-reference)"/,
   "A deleted PO card must render no button that calls NetSuite.");
 assert.match(missingCard, /NetSuite actions unavailable/);
 const activeCard = renderPoHistoryCard("active");
-for (const action of ["pdf", "refresh", "save"]) {
+for (const action of ["pdf", "refresh", "save", "save-vendor-reference"]) {
   assert.match(activeCard, new RegExp(`data-action="${action}"`),
     `An editable active PO must retain its ${action} action.`);
 }
+const financialCard = renderPoHistoryCard("active", [{
+  lineId: 4761230,
+  itemId: 9740,
+  itemName: "TH-COV60T-3030-BEI",
+  quantity: 570,
+  nativeQuantity: 570,
+  unit: "EACH",
+  nativeUnit: "EACH",
+  rate: 1.64,
+  amount: 934.8,
+  destinationLocationId: 1,
+  destination: "3445",
+  receivedQuantity: 0,
+  editable: true
+}]);
+assert.match(financialCard, /data-line-field="rate"[^>]*value="1\.64"/,
+  "PO History must render the live NetSuite line Rate.");
+assert.match(financialCard, /\$934\.80/,
+  "PO History must render the live NetSuite line Amount.");
+const missingFinancialCard = renderPoHistoryCard("active", [{
+  lineId: 1, itemId: 1, itemName: "No financial", quantity: 1,
+  rate: null, amount: null, receivedQuantity: 0, editable: true
+}]);
+assert.match(missingFinancialCard, /data-line-field="rate"[^>]*value=""/,
+  "A genuinely missing Rate must remain blank rather than becoming a misleading zero.");
+assert.doesNotMatch(missingFinancialCard, /\$0\.00/,
+  "A genuinely missing Amount must not be rendered as zero dollars.");
 
 const loadSource = ui.slice(
   ui.indexOf("async function load("),

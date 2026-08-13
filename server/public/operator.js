@@ -8,6 +8,7 @@ const LOCATIONS = [
 const ORDER_PAGE_SIZE = 4;
 const DELIVERY_ORDER_PAGE_SIZE = 3;
 const LINE_PAGE_SIZE = 3;
+const CYCLE_OPTION_PAGE_SIZE = 6;
 const COMPACT_LINE_PAGE_SIZE = 6;
 const HISTORY_PAGE_SIZE = 5;
 const PICKABLE_ITEM_TYPES = new Set(["InvtPart", "NonInvtPart"]);
@@ -146,6 +147,8 @@ let compactLineMode = localStorage.getItem("mbbs.operator.compactLineList") === 
 let orders = [];
 let deliveryOrderBuckets = { active: null, packed: null };
 let packedDeliveryPrefetch = null;
+let deliveryNotificationsRequest = null;
+let deliveryOrdersLoadingCount = 0;
 let deliveryNotifications = { total: 0, salesOrder: { dueToday: 0 }, transferOrder: { dueToday: 0 }, items: [] };
 let urgentDeliveryAlert = null;
 let operatorRequests = [];
@@ -806,14 +809,41 @@ async function uploadOperatorPhoto(photo, context = {}) {
 }
 
 async function uploadOperatorPhotos(photos, context = {}) {
-  const uploaded = [];
-  for (let index = 0; index < photos.length; index += 1) {
-    uploaded.push(await uploadOperatorPhoto(photos[index], {
+  return mapWithConcurrency(photos, 2, (photo, index) => (
+    uploadOperatorPhoto(photo, {
       ...context,
       filename: `${context.recordType || "operator-photo"}-${index + 1}.jpg`
-    }));
-  }
-  return uploaded;
+    })
+  ));
+}
+
+async function mapWithConcurrency(items, concurrency, mapper) {
+  const values = Array.from(items || []);
+  if (!values.length) return [];
+  const results = new Array(values.length);
+  let nextIndex = 0;
+  let failure = null;
+  const worker = async () => {
+    while (!failure && nextIndex < values.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      try {
+        results[index] = await mapper(values[index], index);
+      } catch (error) {
+        failure ||= error;
+      }
+    }
+  };
+  const workerCount = Math.min(values.length, Math.max(1, Number(concurrency) || 1));
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  if (failure) throw failure;
+  return results;
+}
+
+function updateUploadElapsed(selector, startedAt) {
+  const elapsed = app.querySelector(selector);
+  if (!elapsed || !startedAt) return;
+  elapsed.textContent = ` (${Math.max(1, Math.round((Date.now() - startedAt) / 1000))}s)`;
 }
 
 async function publicApi(path, options = {}) {
@@ -3789,16 +3819,30 @@ function currentCycleOptions() {
 function renderCycleMain() {
   if (cycleSearch.trim() || cycleStep === "sku") return renderInventorySkuList();
   const options = currentCycleOptions();
+  const count = pageCount(options, CYCLE_OPTION_PAGE_SIZE);
+  cyclePage = Math.min(cyclePage, count - 1);
+  const visible = pageItems(options, cyclePage, CYCLE_OPTION_PAGE_SIZE);
   return `
     <div class="cycle-option-grid">
-      ${options.map((option) => `
+      ${visible.map((option) => `
         <button class="module-tile compact" data-action="cycle-select" data-value="${option.value}" type="button">
           <strong>${option.value || t("operator.unassigned", "Unassigned")}</strong>
           <span>${option.count} SKU</span>
         </button>
       `).join("") || `<div class="empty-state small"><strong>${t("operator.noOptions", "No options")}</strong><span>${t("operator.syncInventoryFirst", "Sync inventory first.")}</span></div>`}
     </div>
+    <div class="pagination-row cycle-option-pagination">
+      <button class="secondary-button" data-action="cycle-prev" ${cyclePage === 0 ? "disabled" : ""} type="button">${t("common.previous", "Previous")}</button>
+      <strong>${cyclePage + 1} / ${count}</strong>
+      <button class="secondary-button" data-action="cycle-next" ${cyclePage >= count - 1 ? "disabled" : ""} type="button">${t("common.next", "Next")}</button>
+    </div>
   `;
+}
+
+function currentCyclePageCount() {
+  return cycleSearch.trim() || cycleStep === "sku"
+    ? pageCount(inventoryItems, LINE_PAGE_SIZE)
+    : pageCount(currentCycleOptions(), CYCLE_OPTION_PAGE_SIZE);
 }
 
 function renderInventorySkuList() {
@@ -4277,7 +4321,7 @@ function renderFulfillmentScreen() {
         </div>
       </div>
       <div class="selected-actions">
-        ${fulfillmentSubmitting ? `<div class="sync-alert"><strong>${localizeMessage(fulfillmentJobStage || t("operator.savingLoadProof", "Saving load proof"))}</strong><span>${localizeMessage(fulfillmentStatusText || t("operator.savingLocalYardStatus", "Saving local yard status..."))}${fulfillmentStartedAt ? ` (${Math.max(1, Math.round((Date.now() - fulfillmentStartedAt) / 1000))}s)` : ""}</span></div>` : ""}
+        ${fulfillmentSubmitting ? `<div class="sync-alert"><strong>${localizeMessage(fulfillmentJobStage || t("operator.savingLoadProof", "Saving load proof"))}</strong><span>${localizeMessage(fulfillmentStatusText || t("operator.savingLocalYardStatus", "Saving local yard status..."))}<span data-fulfillment-upload-elapsed>${fulfillmentStartedAt ? ` (${Math.max(1, Math.round((Date.now() - fulfillmentStartedAt) / 1000))}s)` : ""}</span></span></div>` : ""}
         ${!fulfillmentSubmitting && fulfillmentJobStage === "Load failed" ? `<div class="sync-alert danger"><strong>${t("operator.loadFailed", "Load failed")}</strong><span>${escapeHtml(localizeMessage(fulfillmentStatusText))}</span></div>` : ""}
         ${renderLoadValidation(fulfillmentValidation)}
         <button class="primary-button" data-action="confirm-fulfill" ${fulfillmentPhotoCount >= 2 && !fulfillmentSubmitting ? "" : "disabled"} type="button">${fulfillmentSubmitting ? t("operator.loading", "Loading...") : t("common.load", "Load")}</button>
@@ -4384,6 +4428,22 @@ function renderStepper(unit, label, value) {
 
 function deliveryOrderKey(order) {
   return String(order?.netsuite_id || order?.id || "");
+}
+
+function removeDeliveryOrderFromLocalState(order) {
+  const key = deliveryOrderKey(order);
+  if (!key) return;
+  const withoutOrder = (list) => Array.isArray(list)
+    ? list.filter((item) => deliveryOrderKey(item) !== key)
+    : list;
+  orders = withoutOrder(orders);
+  deliveryOrderBuckets.active = withoutOrder(deliveryOrderBuckets.active);
+  deliveryOrderBuckets.packed = withoutOrder(deliveryOrderBuckets.packed);
+  selectedId = filteredDeliveryOrders()[0]?.netsuite_id || null;
+  selectedOrder = null;
+  selectedLineId = null;
+  orderPage = Math.min(orderPage, pageCount(filteredDeliveryOrders(), DELIVERY_ORDER_PAGE_SIZE) - 1);
+  linePage = 0;
 }
 
 function combineDeliveryOrderTypes(source = {}) {
@@ -4529,6 +4589,15 @@ async function activateCachedDeliveryBatch(nextFilter) {
 }
 
 async function loadOrders(options = {}) {
+  deliveryOrdersLoadingCount += 1;
+  try {
+    return await loadOrdersRequest(options);
+  } finally {
+    deliveryOrdersLoadingCount = Math.max(0, deliveryOrdersLoadingCount - 1);
+  }
+}
+
+async function loadOrdersRequest(options = {}) {
   const status = viewMode === "packed" ? "packed" : "active";
   const canBootstrap = ["standard", "saved"].includes(deliveryPrepMode) && status === "active";
   const previousSelectedOrder = selectedOrder;
@@ -5166,10 +5235,18 @@ async function loadDeliveryNotifications(options = {}) {
     deliveryNotifications = { total: 0, salesOrder: { dueToday: 0 }, transferOrder: { dueToday: 0 }, items: [] };
     return deliveryNotifications;
   }
+  const requestLocationId = String(locationId);
   const previous = deliveryNotifications;
-  const nextNotifications = await api(`/api/delivery/notifications?locationId=${locationId}`).catch(() => (
-    previous || { total: 0, salesOrder: { dueToday: 0 }, transferOrder: { dueToday: 0 }, items: [] }
-  ));
+  if (!deliveryNotificationsRequest || deliveryNotificationsRequest.locationId !== requestLocationId) {
+    const promise = api(`/api/delivery/notifications?locationId=${requestLocationId}`)
+      .catch(() => previous || { total: 0, salesOrder: { dueToday: 0 }, transferOrder: { dueToday: 0 }, items: [] })
+      .finally(() => {
+        if (deliveryNotificationsRequest?.promise === promise) deliveryNotificationsRequest = null;
+      });
+    deliveryNotificationsRequest = { locationId: requestLocationId, promise };
+  }
+  const nextNotifications = await deliveryNotificationsRequest.promise;
+  if (String(locationId) !== requestLocationId) return deliveryNotifications;
   return applyDeliveryNotifications(nextNotifications, options);
 }
 
@@ -5962,7 +6039,7 @@ async function confirmFulfillment() {
   fulfillmentValidation = null;
   window.clearInterval(fulfillmentProgressTimer);
   fulfillmentProgressTimer = window.setInterval(() => {
-    if (fulfillmentSubmitting) render();
+    if (fulfillmentSubmitting) updateUploadElapsed("[data-fulfillment-upload-elapsed]", fulfillmentStartedAt);
   }, 1000);
   render();
   try {
@@ -6020,6 +6097,7 @@ async function finishFulfillment() {
   stopFulfillmentCamera();
   const wasPickup = fulfillmentOrder && currentModule === "customer-pickup-load";
   const returnModule = fulfillmentReturnModule || "delivery";
+  const completedOrder = fulfillmentOrder;
   currentModule = wasPickup ? "customer-pickup-scan" : returnModule;
   fulfillmentOrder = null;
   fulfillmentPhotoDataUrls = [];
@@ -6038,6 +6116,8 @@ async function finishFulfillment() {
     customerPickupScan = "";
     return render();
   }
+  removeDeliveryOrderFromLocalState(completedOrder);
+  render();
   await reloadDeliveryScreen();
 }
 
@@ -6106,7 +6186,7 @@ function renderReceiptScreen() {
         </div>
       </div>
       <div class="selected-actions">
-        ${receiptSubmitting ? `<div class="sync-alert"><strong>${localizeMessage(receiptJobStage || t("operator.recordingLocally", "Recording locally"))}</strong><span>${localizeMessage(receiptStatusText || t("operator.savingReceivingRecord", "Saving receiving record..."))}${receiptStartedAt ? ` (${Math.max(1, Math.round((Date.now() - receiptStartedAt) / 1000))}s)` : ""}</span></div>` : ""}
+        ${receiptSubmitting ? `<div class="sync-alert"><strong>${localizeMessage(receiptJobStage || t("operator.recordingLocally", "Recording locally"))}</strong><span>${localizeMessage(receiptStatusText || t("operator.savingReceivingRecord", "Saving receiving record..."))}<span data-receipt-upload-elapsed>${receiptStartedAt ? ` (${Math.max(1, Math.round((Date.now() - receiptStartedAt) / 1000))}s)` : ""}</span></span></div>` : ""}
         ${!receiptSubmitting && receiptJobStage === "Receiving failed" ? `<div class="sync-alert danger"><strong>${t("operator.receivingFailed", "Receiving failed")}</strong><span>${escapeHtml(localizeMessage(receiptStatusText))}</span></div>` : ""}
         <button class="primary-button" data-action="confirm-receive" ${receiptPhotoDataUrls.filter(Boolean).length >= 2 && !receiptSubmitting ? "" : "disabled"} type="button">${receiptSubmitting ? t("operator.receivingProgress", "Receiving...") : t("operator.receive", "Receive")}</button>
       </div>
@@ -6220,7 +6300,7 @@ async function confirmReceipt() {
   receiptStatusText = "Uploading receiving proof to server...";
   window.clearInterval(receiptProgressTimer);
   receiptProgressTimer = window.setInterval(() => {
-    if (receiptSubmitting) render();
+    if (receiptSubmitting) updateUploadElapsed("[data-receipt-upload-elapsed]", receiptStartedAt);
   }, 1000);
   render();
   try {
@@ -7273,19 +7353,15 @@ function validateReturnForReview({ requireVehiclePlate = true, requirePhotos = t
 }
 
 async function uploadReturnPhotoList(photos, recordType, suffix = "") {
-  const uploaded = [];
-  for (let index = 0; index < photos.length; index += 1) {
-    const photo = photos[index];
-    if (!photo) continue;
-    uploaded.push(await uploadOperatorPhoto(photo, {
+  return mapWithConcurrency(photos.filter(Boolean), 2, (photo, index) => (
+    uploadOperatorPhoto(photo, {
       recordType,
       orderType: "customer_return",
       orderId: returnOrderId() || returnCustomerId(),
       orderRef: returnOrderRef() || returnCustomerCode(),
       filename: `${recordType}${suffix ? `-${suffix}` : ""}-${index + 1}.jpg`
-    }));
-  }
-  return uploaded;
+    })
+  ));
 }
 
 async function uploadReturnEvidence() {
@@ -8068,7 +8144,7 @@ app.addEventListener("click", async (event) => {
       return render();
     }
     if (button.dataset.action === "cycle-next") {
-      cyclePage = Math.min(pageCount(inventoryItems, LINE_PAGE_SIZE) - 1, cyclePage + 1);
+      cyclePage = Math.min(currentCyclePageCount() - 1, cyclePage + 1);
       return render();
     }
     if (button.dataset.action === "confirm-cycle-line") return confirmCycleLine();
@@ -8556,6 +8632,7 @@ async function boot() {
 boot();
 setInterval(() => {
   if (!operator || !locationId) return;
+  if (deliveryOrdersLoadingCount || fulfillmentSubmitting || receiptSubmitting || returnBusy) return;
   if (currentModule === "delivery") {
     loadOrders({ keepSelection: true }).catch((error) => showToast(error.message));
   } else {
@@ -8569,6 +8646,7 @@ setInterval(() => {
 
 setInterval(() => {
   if (!operator || !locationId) return;
+  if (deliveryOrdersLoadingCount || fulfillmentSubmitting || receiptSubmitting || returnBusy) return;
   loadDeliveryNotifications().catch(() => {});
 }, 10000);
 

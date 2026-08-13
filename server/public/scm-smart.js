@@ -22,6 +22,12 @@ const smartState = {
   blanketWorkspace: null,
   blanketSearch: "",
   blanketSidebarTab: "blanket",
+  blanketPlanSearch: "",
+  blanketPlanStatus: "",
+  blanketPlanVendor: "",
+  blanketPlanSource: "",
+  blanketPlanDestination: "",
+  blanketPlanSort: "destination",
   forecastSearch: "",
   forecastYard: "",
   itemData: null,
@@ -45,6 +51,8 @@ let smartCompositionDepth = 0;
 let smartDeferredRender = false;
 let smartCompositionFlushTimer = null;
 let smartRenderedTab = smartState.tab;
+let smartEventSource = null;
+let smartVendorEventRefreshTimer = null;
 
 function smartEscape(value) {
   return String(value ?? "")
@@ -53,6 +61,23 @@ function smartEscape(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
+}
+
+function smartProposalManualPriority(proposal = {}) {
+  const proposalKey = String(proposal.proposalKey ?? proposal.proposal_key ?? "").trim().toLowerCase();
+  const manualKey = ["manual-load:", "blanket-split:", "blanket-merge:"]
+    .some((prefix) => proposalKey.startsWith(prefix));
+  const manualLine = (Array.isArray(proposal.lines) ? proposal.lines : []).some((line) => {
+    const reason = line?.reason;
+    return reason && typeof reason === "object" && !Array.isArray(reason)
+      && (reason.manualLoad === true
+        || reason.manuallyAdded === true
+        || reason.manuallyAdjusted === true
+        || reason.manuallySplit === true
+        || reason.blanketManuallyAdjusted === true
+        || reason.blanketMerge === true);
+  });
+  return manualKey || manualLine || proposal.manuallyGrouped === true || proposal.manually_grouped === true ? 0 : 1;
 }
 
 function smartNumber(value, places = 1) {
@@ -144,6 +169,31 @@ async function smartLoadBootstrap({ quiet = false } = {}) {
   smartState.vendorReplyLoads = data.vendorReplyLoads || [];
   smartState.busy = "";
   smartRender();
+}
+
+function smartConnectEvents() {
+  smartEventSource?.close();
+  smartEventSource = new EventSource("/api/events?client=scm-smart");
+  smartEventSource.addEventListener("app-event", (message) => {
+    let event = null;
+    try {
+      event = JSON.parse(message.data || "null");
+    } catch {
+      return;
+    }
+    if (event?.type !== "scm.smart.updated" || smartState.tab !== "vendors") return;
+    clearTimeout(smartVendorEventRefreshTimer);
+    smartVendorEventRefreshTimer = setTimeout(async () => {
+      smartVendorEventRefreshTimer = null;
+      try {
+        await smartReloadVendorLoads();
+        smartRender();
+      } catch (error) {
+        smartState.error = error.message;
+        smartRender();
+      }
+    }, 250);
+  });
 }
 
 async function smartLoadItems({ reset = false, quiet = false } = {}) {
@@ -1344,6 +1394,10 @@ smartScmApp.addEventListener("submit", async (event) => {
 });
 
 window.addEventListener("mbbs-language-changed", smartRender);
+window.addEventListener("beforeunload", () => {
+  clearTimeout(smartVendorEventRefreshTimer);
+  smartEventSource?.close();
+});
 
 requireDispatchLogin({
   mount: smartScmApp,
@@ -1351,6 +1405,7 @@ requireDispatchLogin({
   async onReady(operator) {
     smartState.operator = operator;
     smartRender();
+    smartConnectEvents();
     try {
       await smartLoadBootstrap();
     } catch (error) {

@@ -1,10 +1,5 @@
 import crypto from "node:crypto";
 import { query, withTransaction } from "./db.js";
-import {
-  markMissingOutboundOrderLines,
-  upsertSalesOrderLines,
-  upsertSalesOrders
-} from "./order-sync-repository.js";
 import { reconcileSalesOrderFamilyInDispatchPlans } from "./dispatch-plan-repository.js";
 import {
   isNetSuiteSalesOrderBilled,
@@ -27,6 +22,12 @@ function quantity(value) {
   return Number.isFinite(result) ? Math.abs(result) : 0;
 }
 
+function optionalQuantity(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const result = Number(String(value).replaceAll(",", ""));
+  return Number.isFinite(result) ? Math.abs(result) : null;
+}
+
 function exactBilledSql(alias = "sales_order") {
   return `(
     UPPER(BTRIM(COALESCE(${alias}.status, ''))) = 'G'
@@ -38,7 +39,7 @@ function exactBilledSql(alias = "sales_order") {
   )`;
 }
 
-function mappedSalesOrderHeader(order = {}) {
+export function mappedSalesOrderHeader(order = {}) {
   const firstLineLocation = (order.lines || []).find((line) => positiveId(line.locationId));
   const outboundLocationId = positiveId(order.sourceLocationId)
     || positiveId(firstLineLocation?.locationId)
@@ -56,13 +57,52 @@ function mappedSalesOrderHeader(order = {}) {
     status_text: text(order.statusText),
     expected_delivery_date: order.expectedDeliveryDate || null,
     foreigntotal: order.foreignTotal,
-    order_location_id: positiveId(order.orderLocationId) || outboundLocationId,
-    order_location: text(order.orderLocation) || outboundLocation,
+    order_location_id: positiveId(order.orderLocationId),
+    order_location: text(order.orderLocation),
     outbound_location_id: outboundLocationId,
     outbound_location: outboundLocation,
     delivery_method_id: positiveId(order.deliveryMethodId),
     delivery_method: text(order.deliveryMethod),
     memo: text(order.memo)
+  };
+}
+
+export function mappedAuthoritativeSalesOrderLine(line = {}) {
+  const mapped = mapNetSuiteSalesOrderLine(line);
+  const palletQty = optionalQuantity(line.palletQty ?? line.pallet_qty);
+  const layerQty = optionalQuantity(line.layerQty ?? line.layer_qty);
+  const sectionQty = optionalQuantity(line.sectionQty ?? line.section_qty);
+  const pieceQty = optionalQuantity(line.pieceQty ?? line.piece_qty);
+  const toPlt = optionalQuantity(line.toPlt ?? line.to_plt);
+  const toLyr = optionalQuantity(line.toLyr ?? line.to_lyr);
+  const toSec = optionalQuantity(line.toSec ?? line.to_sec);
+  const toPcs = optionalQuantity(line.toPcs ?? line.to_pcs);
+  return {
+    ...mapped,
+    pallet_qty: palletQty,
+    layer_qty: layerQty,
+    section_qty: sectionQty,
+    piece_qty: pieceQty,
+    to_plt: toPlt,
+    to_lyr: toLyr,
+    to_sec: toSec,
+    to_pcs: toPcs,
+    netsuite_committed_qty: optionalQuantity(
+      line.netsuiteCommittedQty ?? line.netsuite_committed_qty
+    ),
+    netsuite_backordered_qty: optionalQuantity(
+      line.netsuiteBackorderedQty ?? line.netsuite_backordered_qty
+    ),
+    pack_quantity_source: [palletQty, layerQty, sectionQty, pieceQty]
+      .some((value) => Number(value || 0) > 0)
+      ? "netsuite_manual"
+      : [toPlt, toLyr, toSec, toPcs].some((value) => Number(value || 0) > 0)
+        ? "item_conversion"
+        : "sales_only",
+    raw: {
+      ...(mapped.raw || {}),
+      authoritativeSourceSync: true
+    }
   };
 }
 
@@ -284,6 +324,267 @@ function salesOrderProgress(lines = [], { forceComplete = false } = {}) {
   };
 }
 
+function salesOrderCalculatedApplicationStatus({ billed = false, progress = {} } = {}) {
+  if (billed || progress.complete) return "Completed";
+  if (progress.hasProgress) return "Partially Done";
+  return "Queued";
+}
+
+function reconciliationSource(value) {
+  const normalized = text(value).toLowerCase();
+  return ["webhook", "nightly", "manual", "backfill", "system"].includes(normalized)
+    ? normalized
+    : "system";
+}
+
+function salesOrderCalculationLines(lines = [], { forceComplete = false } = {}) {
+  return (lines || []).map((line) => {
+    const mapped = mapNetSuiteSalesOrderLine(line);
+    const ordered = quantity(line.quantity);
+    const fulfilled = Math.min(
+      forceComplete ? ordered : quantity(line.cumulativeProgressQuantity),
+      ordered
+    );
+    return {
+      source: line,
+      mapped,
+      ordered,
+      fulfilled,
+      remaining: Math.max(ordered - fulfilled, 0),
+      lineStatus: ordered > 0 && fulfilled + 0.000001 >= ordered
+        ? "completed"
+        : fulfilled > 0
+          ? "partial"
+          : "open"
+    };
+  });
+}
+
+async function persistSalesOrderCalculation({
+  order,
+  proposal,
+  inventoryLines,
+  runId,
+  source,
+  dryRun
+}) {
+  const calculatedStatus = proposal.calculatedApplicationStatus;
+  const normalizedSource = reconciliationSource(source);
+  const terminalState = proposal.fulfilledByHeader ? "closed" : "open";
+  const familyQuantities = {
+    ordered: proposal.quantities.ordered,
+    fulfilled: proposal.quantities.fulfilled,
+    received: 0,
+    abandoned: 0,
+    remaining: proposal.quantities.remaining,
+    destinationRemaining: 0
+  };
+  const quantitySummary = {
+    family: familyQuantities,
+    targets: {
+      [proposal.sourceOrderRef]: {
+        orderRef: proposal.sourceOrderRef,
+        applicationStatus: calculatedStatus,
+        ...familyQuantities
+      }
+    }
+  };
+  const params = [
+    order.id,
+    proposal.sourceOrderRef,
+    text(order.status),
+    text(order.statusText),
+    terminalState,
+    calculatedStatus,
+    proposal.reconciliationStatus,
+    proposal.reason,
+    normalizedSource,
+    positiveId(order.sourceLocationId),
+    text(order.sourceLocation),
+    proposal.quantities.ordered,
+    proposal.quantities.fulfilled,
+    proposal.quantities.remaining,
+    order.lastModifiedAt || null,
+    positiveId(runId),
+    JSON.stringify(quantitySummary),
+    JSON.stringify(order),
+    JSON.stringify(proposal)
+  ];
+  const dryRunParams = [
+    order.id,
+    proposal.sourceOrderRef,
+    text(order.status),
+    text(order.statusText),
+    terminalState,
+    normalizedSource,
+    positiveId(order.sourceLocationId),
+    text(order.sourceLocation),
+    order.lastModifiedAt || null,
+    positiveId(runId),
+    JSON.stringify(order),
+    JSON.stringify(proposal)
+  ];
+  const state = dryRun
+    ? await query(
+      `INSERT INTO scm_reconciliation_order_state (
+         order_kind, source_order_netsuite_id, source_order_ref,
+         netsuite_status_code, netsuite_status_text, netsuite_terminal_state,
+         application_status, reconciliation_status, reconciliation_source,
+         source_location_id, source_location, exact_allocation,
+         last_netsuite_modified_at, last_run_id, order_snapshot,
+         proposed_state, created_at, updated_at
+       ) VALUES (
+         'SO', $1, $2, NULLIF($3, ''), NULLIF($4, ''), $5,
+         'Queued', 'pending', $6,
+         $7, NULLIF($8, ''), true,
+         $9, $10, $11::jsonb, $12::jsonb, now(), now()
+       )
+       ON CONFLICT (order_kind, source_order_netsuite_id) DO UPDATE SET
+         source_order_ref = EXCLUDED.source_order_ref,
+         netsuite_status_code = EXCLUDED.netsuite_status_code,
+         netsuite_status_text = EXCLUDED.netsuite_status_text,
+         netsuite_terminal_state = EXCLUDED.netsuite_terminal_state,
+         reconciliation_source = EXCLUDED.reconciliation_source,
+         source_location_id = EXCLUDED.source_location_id,
+         source_location = EXCLUDED.source_location,
+         last_netsuite_modified_at = EXCLUDED.last_netsuite_modified_at,
+         last_run_id = COALESCE(EXCLUDED.last_run_id, scm_reconciliation_order_state.last_run_id),
+         order_snapshot = EXCLUDED.order_snapshot,
+         proposed_state = EXCLUDED.proposed_state,
+         updated_at = now()
+       RETURNING *`,
+      dryRunParams
+    )
+    : await query(
+      `INSERT INTO scm_reconciliation_order_state (
+         order_kind, source_order_netsuite_id, source_order_ref,
+         netsuite_status_code, netsuite_status_text, netsuite_terminal_state,
+         application_status, reconciliation_status, reconciliation_reason,
+         reconciliation_source, source_location_id, source_location,
+         ordered_qty, fulfilled_qty, received_qty, abandoned_qty,
+         remaining_qty, destination_remaining_qty, exact_allocation,
+         last_netsuite_modified_at, last_run_id, quantity_summary,
+         order_snapshot, proposed_state, reconciled_at, completed_at,
+         status_changed_at, created_at, updated_at
+       ) VALUES (
+         'SO', $1, $2, NULLIF($3, ''), NULLIF($4, ''), $5,
+         $6, $7, NULLIF($8, ''), $9, $10, NULLIF($11, ''),
+         $12, $13, 0, 0, $14, 0, true,
+         $15, $16, $17::jsonb, $18::jsonb, $19::jsonb, now(),
+         CASE WHEN $6 = 'Completed' THEN now() ELSE NULL END,
+         now(), now(), now()
+       )
+       ON CONFLICT (order_kind, source_order_netsuite_id) DO UPDATE SET
+         source_order_ref = EXCLUDED.source_order_ref,
+         netsuite_status_code = EXCLUDED.netsuite_status_code,
+         netsuite_status_text = EXCLUDED.netsuite_status_text,
+         netsuite_terminal_state = EXCLUDED.netsuite_terminal_state,
+         application_status = EXCLUDED.application_status,
+         reconciliation_status = EXCLUDED.reconciliation_status,
+         reconciliation_reason = EXCLUDED.reconciliation_reason,
+         reconciliation_source = EXCLUDED.reconciliation_source,
+         source_location_id = EXCLUDED.source_location_id,
+         source_location = EXCLUDED.source_location,
+         ordered_qty = EXCLUDED.ordered_qty,
+         fulfilled_qty = EXCLUDED.fulfilled_qty,
+         received_qty = 0,
+         abandoned_qty = 0,
+         remaining_qty = EXCLUDED.remaining_qty,
+         destination_remaining_qty = 0,
+         exact_allocation = true,
+         last_netsuite_modified_at = EXCLUDED.last_netsuite_modified_at,
+         last_run_id = COALESCE(EXCLUDED.last_run_id, scm_reconciliation_order_state.last_run_id),
+         quantity_summary = EXCLUDED.quantity_summary,
+         order_snapshot = EXCLUDED.order_snapshot,
+         proposed_state = EXCLUDED.proposed_state,
+         reconciled_at = now(),
+         completed_at = CASE
+           WHEN EXCLUDED.application_status = 'Completed'
+           THEN COALESCE(scm_reconciliation_order_state.completed_at, now())
+           ELSE NULL
+         END,
+         cancelled_at = NULL,
+         status_changed_at = CASE
+           WHEN scm_reconciliation_order_state.application_status IS DISTINCT FROM EXCLUDED.application_status
+           THEN now()
+           ELSE scm_reconciliation_order_state.status_changed_at
+         END,
+         updated_at = now()
+       RETURNING *`,
+      params
+    );
+  const stateRow = state.rows[0];
+  if (dryRun) return stateRow;
+
+  const calculatedLines = salesOrderCalculationLines(inventoryLines, {
+    forceComplete: proposal.fulfilledByHeader
+  });
+  for (const line of calculatedLines) {
+    await query(
+      `INSERT INTO scm_reconciliation_order_line_state (
+         order_state_id, netsuite_line_key, local_line_id, local_line_stage,
+         item_id, item_name, sku, unit, source_location_id,
+         current_ordered_qty, fulfilled_qty, received_qty, abandoned_qty,
+         remaining_qty, line_status, identity_status, allocation_quality,
+         netsuite_active, last_run_id, line_snapshot, created_at, updated_at
+       ) VALUES (
+         $1, $2, $3, 'outbound', $4, NULLIF($5, ''), NULLIF($6, ''),
+         NULLIF($7, ''), $8, $9, $10, 0, 0, $11, $12,
+         'exact', 'exact', true, $13, $14::jsonb, now(), now()
+       )
+       ON CONFLICT (order_state_id, netsuite_line_key) DO UPDATE SET
+         local_line_id = EXCLUDED.local_line_id,
+         local_line_stage = EXCLUDED.local_line_stage,
+         item_id = EXCLUDED.item_id,
+         item_name = EXCLUDED.item_name,
+         sku = EXCLUDED.sku,
+         unit = EXCLUDED.unit,
+         source_location_id = EXCLUDED.source_location_id,
+         current_ordered_qty = EXCLUDED.current_ordered_qty,
+         fulfilled_qty = EXCLUDED.fulfilled_qty,
+         received_qty = 0,
+         abandoned_qty = 0,
+         remaining_qty = EXCLUDED.remaining_qty,
+         line_status = EXCLUDED.line_status,
+         identity_status = 'exact',
+         allocation_quality = 'exact',
+         netsuite_active = true,
+         last_run_id = COALESCE(EXCLUDED.last_run_id, scm_reconciliation_order_line_state.last_run_id),
+         line_snapshot = EXCLUDED.line_snapshot,
+         updated_at = now()`,
+      [
+        stateRow.id,
+        String(line.mapped.line_id),
+        Number(line.mapped.line_id),
+        line.mapped.item_id,
+        line.mapped.item_name,
+        line.mapped.sku,
+        line.mapped.unit,
+        positiveId(order.sourceLocationId),
+        line.ordered,
+        line.fulfilled,
+        line.remaining,
+        line.lineStatus,
+        positiveId(runId),
+        JSON.stringify({
+          ...line.source,
+          includedInCalculation: true
+        })
+      ]
+    );
+  }
+  await query(
+    `UPDATE scm_reconciliation_order_line_state
+        SET netsuite_active = false,
+            updated_at = now()
+      WHERE order_state_id = $1
+        AND netsuite_active = true
+        AND netsuite_line_key <> ALL($2::text[])`,
+    [stateRow.id, calculatedLines.map((line) => String(line.mapped.line_id))]
+  );
+  return stateRow;
+}
+
 async function recordSalesOrderReconciliationAudit({ order, runId, source, dryRun, result }) {
   await query(
     `INSERT INTO scm_reconciliation_audit_events (
@@ -329,12 +630,26 @@ export async function reconcileSalesOrderFromNetSuite({
   }
   const draft = await activeSalesOrderFamilyDraft(family);
   const sourceLines = Array.isArray(order.lines) ? order.lines : [];
+  if (!sourceLines.length) {
+    throw new Error("Sales Order calculation requires a complete authoritative order with item lines.");
+  }
+  const sourceLineIds = sourceLines.map((line) => positiveId(mapNetSuiteSalesOrderLine(line).line_id));
+  if (
+    sourceLineIds.some((lineId) => !lineId)
+    || new Set(sourceLineIds).size !== sourceLineIds.length
+  ) {
+    throw new Error("Sales Order calculation requires unique positive NetSuite line identities.");
+  }
   const inventoryLines = sourceLines.filter(isSalesOrderInventoryLine);
   const excludedLines = sourceLines.filter((line) => !isSalesOrderInventoryLine(line));
   const billed = isNetSuiteSalesOrderBilled(order);
   const fulfilledByHeader = isNetSuiteSalesOrderFulfilled(order);
   const progress = salesOrderProgress(inventoryLines, {
     forceComplete: fulfilledByHeader
+  });
+  const calculatedApplicationStatus = salesOrderCalculatedApplicationStatus({
+    billed,
+    progress
   });
   const proposal = {
     orderKind: "SO",
@@ -345,7 +660,8 @@ export async function reconcileSalesOrderFromNetSuite({
     billed,
     fulfilledByHeader,
     reconciliationStatus: draft.blocked ? "review" : "current",
-    applicationStatus: billed ? "Billed" : progress.complete ? "Completed" : "Queued",
+    applicationStatus: billed ? "Billed" : calculatedApplicationStatus,
+    calculatedApplicationStatus,
     reason: draft.blocked
       ? `Sales Order family reconciliation is blocked by an active operator packing draft on ${draft.orderRef || orderRef}.`
       : "",
@@ -361,21 +677,32 @@ export async function reconcileSalesOrderFromNetSuite({
     }))
   };
   if (draft.blocked || dryRun) {
-    await recordSalesOrderReconciliationAudit({ order, runId, source, dryRun: true, result: proposal });
-    if (!dryRun && draft.blocked) {
-      return {
-        ...proposal,
-        planCleanup: await reconcileSalesOrderFamilyInDispatchPlans({
-          canonicalRef: family.sourceOrderRef || orderRef,
-          familyRefs: family.familyRefs,
+    return withTransaction(async () => {
+      await persistSalesOrderCalculation({
+        order,
+        proposal,
+        inventoryLines,
+        runId,
+        source,
+        dryRun: true
+      });
+      await recordSalesOrderReconciliationAudit({ order, runId, source, dryRun: true, result: proposal });
+      if (!dryRun && draft.blocked) {
+        return {
+          ...proposal,
+          planCleanup: await reconcileSalesOrderFamilyInDispatchPlans({
+            canonicalRef: family.sourceOrderRef || orderRef,
+            familyRefs: family.familyRefs,
           billed: false,
           reconciliationStatus: "review",
           reconciliationReason: proposal.reason,
+          reconciliationApplicationStatus: "Reconcile Review",
           actor: source
-        })
-      };
-    }
-    return proposal;
+          })
+        };
+      }
+      return proposal;
+    });
   }
 
   return withTransaction(async () => {
@@ -408,56 +735,18 @@ export async function reconcileSalesOrderFromNetSuite({
           billed: false,
           reconciliationStatus: "review",
           reconciliationReason: blocked.reason,
+          reconciliationApplicationStatus: "Reconcile Review",
           actor: source
         })
       };
     }
 
-    const mappedLines = inventoryLines.map(mapNetSuiteSalesOrderLine);
-    await upsertSalesOrders([mappedSalesOrderHeader(order)]);
-    await upsertSalesOrderLines(orderId, mappedLines);
-    await markMissingOutboundOrderLines(orderId, mappedLines.map((line) => Number(line.line_id)));
-    await query(
-      `UPDATE sales_orders
-          SET fulfillment_status = $2,
-              synced_at = now()
-        WHERE netsuite_id = $1`,
-      [orderId, progress.fulfillmentStatus]
-    );
+    // Reconciliation consumes the authoritative snapshot but never mutates
+    // canonical Sales Order headers or lines. Normal NetSuite order sync owns
+    // those tables; this path writes only the separate calculation state.
 
     let planCleanup = { changedPlans: [], deferred: false, familyRefs: family.familyRefs };
     if (fulfilledByHeader) {
-      await query(
-        `UPDATE sales_orders
-            SET status = CASE WHEN $3::boolean THEN 'G' ELSE status END,
-                status_text = CASE
-                  WHEN $3::boolean THEN 'Sales Order : Billed'
-                  ELSE status_text
-                END,
-                netsuite_active = false,
-                fulfillment_status = 'fulfilled',
-                operator_status = 'fulfilled',
-                local_yard_order_status = 'Shipped',
-                dispatch_planned = false,
-                dispatch_plan_date = NULL,
-                dispatch_truck_plate = NULL,
-                dispatch_load_name = NULL,
-                dispatch_parking_spot = NULL,
-                preparing_operator_id = NULL,
-                preparing_started_at = NULL,
-                status_updated_at = now(),
-                synced_at = now()
-          WHERE netsuite_id = ANY($1::bigint[])
-             OR upper(tranid) = ANY($2::text[])`,
-        [family.familyIds, family.familyRefs, billed]
-      );
-      await query(
-        `UPDATE sales_order_lines
-            SET netsuite_active = false,
-                synced_at = now()
-          WHERE sales_order_id = ANY($1::bigint[])`,
-        [family.familyIds]
-      );
       await query(
         `DELETE FROM operator_saved_delivery_orders saved
           WHERE upper(saved.order_ref) = ANY($1::text[])
@@ -475,6 +764,7 @@ export async function reconcileSalesOrderFromNetSuite({
       billed,
       reconciliationStatus: "current",
       reconciliationReason: "",
+      reconciliationApplicationStatus: proposal.calculatedApplicationStatus,
       actor: source
     });
     const result = {
@@ -486,6 +776,14 @@ export async function reconcileSalesOrderFromNetSuite({
         ? "Completed order is hidden from planning; dispatch-plan cleanup is deferred until the in-progress driver job finishes."
         : ""
     };
+    await persistSalesOrderCalculation({
+      order,
+      proposal: result,
+      inventoryLines,
+      runId,
+      source,
+      dryRun: false
+    });
     await recordSalesOrderReconciliationAudit({ order, runId, source, dryRun: false, result });
     return result;
   });

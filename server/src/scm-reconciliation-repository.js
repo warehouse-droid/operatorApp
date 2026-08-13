@@ -13,7 +13,6 @@ import {
   filterDbBackedSalesOrderReconciliationCandidates,
   normalizeSalesOrderReconciliationType
 } from "./sales-order-reconciliation.js";
-import { syncOrderDependenciesForTransferOrder } from "./order-dependency-repository.js";
 
 const EPSILON = 0.000001;
 const RECONCILIATION_SCHEMA_VERSION = "mbbs.ifir.reconciliation.v1";
@@ -90,10 +89,10 @@ export function scmScheduleEffectiveReconciliationStatus({
   const currentScheduleStatus = text(scheduleStatus) || "Queued";
   const currentReconciliationStatus = text(reconciliationStatus).toLowerCase();
   const currentReconciliationApplicationStatus = text(reconciliationApplicationStatus);
+  if (blockingReview || currentReconciliationStatus === "review") return "Reconcile Review";
   if (["complete", "completed"].includes(currentReconciliationApplicationStatus.toLowerCase())) {
     return "Completed";
   }
-  if (blockingReview || currentReconciliationStatus === "review") return "Reconcile Review";
   if (currentReconciliationStatus === "pending") return currentScheduleStatus;
 
   const scheduleUpdatedTimestamp = timestampValue(scheduleUpdatedAt);
@@ -3067,18 +3066,12 @@ async function applyAffectedScheduleGroupRollups(orderKind, memberRefs = []) {
     );
     await query(
       `UPDATE scm_transport_schedule
-          SET status = $2,
-              reconciliation_blocked = $3,
-              last_reconciled_at = now(),
-              updated_by = 'reconciliation',
-              updated_at = now()
+          SET reconciliation_blocked = $2,
+              last_reconciled_at = now()
         WHERE order_kind = 'PO'
           AND lower(order_ref) = lower($1)
-          AND (
-            status IS DISTINCT FROM $2
-            OR reconciliation_blocked IS DISTINCT FROM $3
-          )`,
-      [group.group_ref, applicationStatus, reconciliationBlocked]
+          AND reconciliation_blocked IS DISTINCT FROM $2`,
+      [group.group_ref, reconciliationBlocked]
     );
     results.push({
       groupRef: group.group_ref,
@@ -3092,6 +3085,11 @@ async function applyAffectedScheduleGroupRollups(orderKind, memberRefs = []) {
 async function applyTargetScheduleStates(order, orderStateId, targetStates, blocked) {
   for (const state of Object.values(targetStates)) {
     if (!state.orderRef) continue;
+    const isSourceTarget = text(state.orderRef).toLowerCase()
+      === text(order.scheduleRef || order.tranid).toLowerCase();
+    const operationalStatus = isSourceTarget
+      ? text(order.localStatus) || (order.kind === "PO" ? "Hold" : "Queued")
+      : "Queued";
     await query(
       `INSERT INTO scm_transport_schedule (
          order_kind, order_ref, status, reconciliation_order_state_id,
@@ -3102,73 +3100,15 @@ async function applyTargetScheduleStates(order, orderStateId, targetStates, bloc
          now(), now()
        )
        ON CONFLICT (order_kind, order_ref) DO UPDATE SET
-         status = EXCLUDED.status,
          reconciliation_order_state_id = EXCLUDED.reconciliation_order_state_id,
          reconciliation_blocked = EXCLUDED.reconciliation_blocked,
-         last_reconciled_at = now(),
-         updated_by = 'reconciliation',
-         updated_at = now()`,
-      [order.kind, state.orderRef, state.applicationStatus, orderStateId, blocked]
+         last_reconciled_at = now()`,
+      [order.kind, state.orderRef, operationalStatus, orderStateId, blocked]
     );
   }
   await applyAffectedScheduleGroupRollups(order.kind, Object.values(targetStates)
     .map((state) => state.orderRef)
     .filter(Boolean));
-  const family = Object.values(targetStates).reduce((sum, state) => ({
-    ordered: sum.ordered + reconciliationQuantity(state.ordered),
-    fulfilled: sum.fulfilled + reconciliationQuantity(state.fulfilled),
-    received: sum.received + reconciliationQuantity(state.received),
-    abandoned: sum.abandoned + reconciliationQuantity(state.abandoned)
-  }), { ordered: 0, fulfilled: 0, received: 0, abandoned: 0 });
-  if (order.kind === "PO") {
-    await query(
-      `UPDATE purchase_orders
-          SET receipt_status = CASE
-                WHEN $2::numeric > 0
-                 AND $3::numeric > 0
-                 AND $3::numeric + $4::numeric + $5::numeric >= $2::numeric
-                THEN 'received'
-                WHEN $3::numeric > 0 THEN 'partial_received'
-                ELSE 'not_received'
-              END,
-              received_at = CASE WHEN $3::numeric > 0 THEN COALESCE(received_at, now()) ELSE received_at END,
-              status_updated_at = now()
-        WHERE netsuite_id = $1`,
-      [
-        order.id,
-        family.ordered,
-        family.received,
-        family.abandoned,
-        EPSILON
-      ]
-    );
-  } else {
-    await query(
-      `UPDATE transfer_orders
-          SET fulfillment_status = CASE
-                WHEN $2::numeric > 0 AND $3::numeric + $5::numeric >= $2::numeric THEN 'fulfilled'
-                WHEN $3::numeric > 0 THEN 'partial_fulfilled'
-                ELSE 'not_fulfilled'
-              END,
-              receiving_status = CASE
-                WHEN $2::numeric > 0 AND $4::numeric + $5::numeric >= $2::numeric THEN 'received'
-                WHEN $4::numeric > 0 THEN 'partial_received'
-                ELSE 'not_received'
-              END,
-              fulfilled_at = CASE WHEN $3::numeric > 0 THEN COALESCE(fulfilled_at, now()) ELSE fulfilled_at END,
-              received_at = CASE WHEN $4::numeric > 0 THEN COALESCE(received_at, now()) ELSE received_at END,
-              status_updated_at = now()
-        WHERE netsuite_id = $1`,
-      [
-        order.id,
-        family.ordered,
-        family.fulfilled,
-        family.received,
-        family.abandoned
-      ]
-    );
-    await syncOrderDependenciesForTransferOrder(order.id);
-  }
 }
 
 function plainTargetState(target) {
@@ -4209,13 +4149,37 @@ export async function listScmReconciliationLinkedEvidenceSensitiveSourceKeys(ord
 
 export async function listScmReconciliationBroadExcludedSources({ kind = "" } = {}) {
   const cleanKind = text(kind).toUpperCase();
-  if (cleanKind === "SO") return [];
   const result = await query(
     `WITH local_source AS (
+       SELECT 'SO'::text AS order_kind,
+              sales_order.netsuite_id,
+              sales_order.tranid,
+              sales_order.tranid AS schedule_ref,
+              GREATEST(
+                sales_order.synced_at,
+                (
+                  SELECT max(line.synced_at)
+                    FROM sales_order_lines line
+                   WHERE line.sales_order_id = sales_order.netsuite_id
+                )
+              ) AS source_synced_at
+         FROM sales_orders sales_order
+        WHERE sales_order.netsuite_id > 0
+          AND COALESCE(sales_order.is_test_fixture, false) = false
+          AND ($1 = '' OR $1 = 'SO')
+       UNION ALL
        SELECT 'PO'::text AS order_kind,
               po.netsuite_id,
               po.tranid,
-              COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid) AS schedule_ref
+              COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid) AS schedule_ref,
+              GREATEST(
+                po.synced_at,
+                (
+                  SELECT max(line.synced_at)
+                    FROM purchase_order_lines line
+                   WHERE line.purchase_order_id = po.netsuite_id
+                )
+              ) AS source_synced_at
          FROM purchase_orders po
         WHERE po.netsuite_id > 0
           AND ($1 = '' OR $1 = 'PO')
@@ -4223,7 +4187,15 @@ export async function listScmReconciliationBroadExcludedSources({ kind = "" } = 
        SELECT 'TO'::text AS order_kind,
               transfer.netsuite_id,
               transfer.tranid,
-              transfer.tranid AS schedule_ref
+              transfer.tranid AS schedule_ref,
+              GREATEST(
+                transfer.synced_at,
+                (
+                  SELECT max(line.synced_at)
+                    FROM transfer_order_lines line
+                   WHERE line.transfer_order_id = transfer.netsuite_id
+                )
+              ) AS source_synced_at
          FROM transfer_orders transfer
         WHERE transfer.netsuite_id > 0
           AND ($1 = '' OR $1 = 'TO')
@@ -4231,10 +4203,17 @@ export async function listScmReconciliationBroadExcludedSources({ kind = "" } = 
        SELECT state.order_kind,
               state.source_order_netsuite_id AS netsuite_id,
               state.source_order_ref AS tranid,
-              state.source_order_ref AS schedule_ref
+              state.source_order_ref AS schedule_ref,
+              NULL::timestamptz AS source_synced_at
          FROM scm_reconciliation_order_state state
         WHERE state.source_order_netsuite_id > 0
           AND ($1 = '' OR $1 = state.order_kind)
+          AND NOT EXISTS (
+            SELECT 1
+              FROM sales_orders sales_order
+             WHERE state.order_kind = 'SO'
+               AND sales_order.netsuite_id = state.source_order_netsuite_id
+          )
           AND NOT EXISTS (
             SELECT 1
               FROM purchase_orders po
@@ -4310,10 +4289,21 @@ export async function listScmReconciliationBroadExcludedSources({ kind = "" } = 
           LIMIT 1
        ) schedule ON true
       WHERE state.broad_reconciliation_skipped = true
-         OR state.application_status IN ('Completed', 'Cancelled', 'Hold')
-         OR schedule.status IN ('Completed', 'Cancelled', 'Hold')
+         OR state.application_status IN ('Cancelled', 'Hold')
+         OR schedule.status IN ('Cancelled', 'Hold')
+         OR (
+           (
+             state.application_status = 'Completed'
+             OR schedule.status = 'Completed'
+           )
+           AND NOT (
+             state.application_status = 'Completed'
+             AND state.reconciled_at IS NOT NULL
+             AND source.source_synced_at > state.reconciled_at
+           )
+         )
       ORDER BY source.order_kind, source.netsuite_id`,
-    [["PO", "TO"].includes(cleanKind) ? cleanKind : ""]
+    [["SO", "PO", "TO"].includes(cleanKind) ? cleanKind : ""]
   );
   return result.rows.map((row) => ({
     kind: row.order_kind,
@@ -6062,13 +6052,15 @@ export async function enrichScmScheduleWithReconciliation(rows = [], {
       : "";
     enriched.push({
       ...row,
-      status: effectiveStatus,
+      status: row.status,
+      calculatedStatus: effectiveStatus,
       reconciliationApplicationStatus: effectiveStatus,
       reconciliationStatus: isReview ? "review" : isPending ? "unreconciled" : "ok",
       reconciliationReason: isPending ? "" : displayedReason,
       lastReconciledAt: state.reconciled_at,
       reconciliation: includeDetails ? {
         status: isReview ? "review" : isPending ? "unreconciled" : "ok",
+        applicationStatus: effectiveStatus,
         reason: isPending ? "" : displayedReason,
         source: state.reconciliation_source || "",
         lastReconciledAt: state.reconciled_at,

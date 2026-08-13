@@ -79,6 +79,66 @@ test("DP-11: CO updates are targeted and do not fetch, merge, or render the whol
   assert.match(targeted, /renderDispatchOrderPoolPatch|patchDispatchOrderPool/u);
 });
 
+test("DP-12: ordinary order events patch only the pool and preserve its scroll position", () => {
+  const queuedRefresh = functionBody("queueDispatchOrderPoolRefresh");
+  assert.match(queuedRefresh, /loadDispatchOrders\(/u);
+  assert.match(queuedRefresh, /renderDispatchOrderPoolPatch\(/u);
+  assert.match(queuedRefresh, /renderDispatchNoticePatch\(/u);
+  assert.doesNotMatch(queuedRefresh, /restoreServerPlan|loadDriverJobStatuses|refreshPlannedAssignments/u);
+  assert.doesNotMatch(queuedRefresh, /renderDispatchPlannerPatch|renderGoogleMapPreview/u);
+  assert.doesNotMatch(queuedRefresh, /\brender\(\{\s*save:/u);
+
+  const events = functionBody("connectEvents");
+  assert.match(events, /dispatch\.orders\.updated[\s\S]*queueDispatchOrderPoolRefresh/u);
+  assert.doesNotMatch(events, /queueRemoteRefresh/u);
+
+  const poolPatch = functionBody("renderDispatchOrderPoolPatch");
+  assert.match(poolPatch, /previousScrollTop/u);
+  assert.match(poolPatch, /nextList\.scrollTop\s*=\s*previousScrollTop/u);
+  assert.match(poolPatch, /requestAnimationFrame/u,
+    "The browser must restore the pool offset again after layout settles.");
+  assert.match(poolPatch, /selectionEnd/u,
+    "An order update must retain the complete search selection, not collapse it.");
+});
+
+test("DP-13: unchanged execution polling cannot rebuild the planner, preview, or map", () => {
+  const refresh = functionBody("refreshDriverExecutionAndForecast");
+  assert.match(refresh, /previousSignature\s*=\s*dispatchExecutionRenderSignature\(\)/u);
+  assert.match(refresh, /changed\s*=\s*dispatchExecutionRenderSignature\(\)\s*!==\s*previousSignature/u);
+  assert.match(refresh, /renderAfter\s*&&\s*changed/u);
+  assert.match(refresh, /renderDispatchExecutionPatch\(\)/u);
+  assert.doesNotMatch(refresh, /\brender\(\{\s*save:\s*false\s*\}\)/u,
+    "The periodic execution poll must not replace the complete planner root.");
+
+  const forecastEvidence = Function(`"use strict"; return (${functionBody("dispatchForecastRenderEvidence")});`)();
+  assert.deepEqual(
+    forecastEvidence({ generatedAt: "volatile", planRevision: 7, stops: [{ id: "A" }] }),
+    { planRevision: 7, stops: [{ id: "A" }] },
+    "A newly generated timestamp alone must not make an unchanged forecast rerender."
+  );
+
+  const plannerPatch = functionBody("renderDispatchPlannerPatch");
+  assert.match(plannerPatch, /captureGoogleMapPreviewState\(\)/u);
+  assert.match(plannerPatch, /restoreGoogleMapPreviewState\(mapState\)/u);
+  assert.match(plannerPatch, /if\s*\(!mapPreserved\)\s*renderGoogleMapPreview\(\)/u,
+    "An unchanged route must retain its existing Google Map DOM node.");
+});
+
+test("DP-14: stop-sequence scroll restoration targets the preview-owned load list", () => {
+  const selector = functionBody("selectorForElement");
+  assert.match(selector, /closest\(["']\[data-dispatch-load-preview-layer\]["']\)/u);
+  assert.match(selector, /\.preview-stop-list/u);
+  assert.match(selector, /\[data-dispatch-load-preview-layer\]\s+\.preview-stop-list/u);
+  assert.match(selector, /data-load/u,
+    "The selected load identity must disambiguate its preview stop list from board load elements.");
+
+  const capture = functionBody("captureRenderUiState");
+  assert.match(capture, /\.load-preview-panel/u);
+  assert.match(capture, /\.load-preview-body/u);
+  assert.match(capture, /\.preview-stop-list/u);
+  assert.match(capture, /scrollTop/u);
+});
+
 test("DP-15: CO, group, and split modal updates are isolated from the planner root", () => {
   assert.match(dispatchSource, /data-dispatch-planner-root/u);
   assert.match(dispatchSource, /data-dispatch-modal-layer/u);
@@ -153,7 +213,7 @@ test("history edit mode scopes reconciliation-complete feeds to a leased past da
     "use strict";
     let historyEditMode = false;
     let currentPlanDate = "2026-08-09";
-    let planEditLeaseToken = "history-lease";
+    let planEditLeaseToken = "test-history-lease";
     function isDispatchHistoryEditMode() { return historyEditMode; }
     ${requestSource}
     return {
@@ -165,16 +225,22 @@ test("history edit mode scopes reconciliation-complete feeds to a leased past da
     "Current/view-mode requests must retain the ordinary Dispatch feed contract.");
   assert.deepEqual(harness.request({ sync: true }), { url: "/api/dispatch/sync", headers: {} });
   harness.enable();
+  const historicalEmpty = harness.request();
+  const historicalEmptyUrl = new URL(historicalEmpty.url, "http://dispatch.test");
+  assert.equal(historicalEmptyUrl.searchParams.has("search"), false,
+    "Entering History Edit Mode must not fabricate a broad completed-order search.");
+  assert.equal(historicalEmptyUrl.searchParams.get("historyPlanDate"), "2026-08-09");
   const historical = harness.request({ search: "PO-HISTORY" });
   assert.match(historical.url, /^\/api\/dispatch\/orders\?/u);
   const historicalUrl = new URL(historical.url, "http://dispatch.test");
   assert.equal(historicalUrl.searchParams.get("search"), "PO-HISTORY");
   assert.equal(historicalUrl.searchParams.get("historyPlanDate"), "2026-08-09");
-  assert.equal(historical.headers["x-dispatch-edit-lease"], "history-lease");
+  assert.equal(historical.headers["x-dispatch-edit-lease"], "test-history-lease");
 
   assert.match(functionBody("enterDispatchEditMode"), /isDispatchHistoryEditMode\(\)[\s\S]*await\s+loadDispatchOrders\(/u);
   assert.match(functionBody("releaseDispatchEditMode"), /leavingHistoryEditMode[\s\S]*await\s+loadDispatchOrders\(/u);
   assert.match(dispatchSource, /History Edit Mode[\s\S]*Driver PWA-completed orders/u);
+  assert.match(dispatchSource, /Search to find reconciliation-complete historical orders/u);
   assert.match(dispatchSource, /historicalReconciliationComplete/u);
 });
 

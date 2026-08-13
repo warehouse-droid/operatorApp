@@ -3,7 +3,10 @@ import crypto from "node:crypto";
 import { query, withTransaction } from "./db.js";
 import { syncDispatchDeliveryGroupsFromPlan } from "./dispatch-delivery-group-repository.js";
 import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
-import { assertNoDriverPwaCompletedDispatchRefs } from "./dispatch-history-mode.js";
+import {
+  assertHistoricalInactiveSalesOrdersReconciled,
+  assertNoDriverPwaCompletedDispatchRefs
+} from "./dispatch-history-mode.js";
 import {
   applyDispatchPlanCommand,
   buildCompactDispatchSnapshot,
@@ -326,6 +329,11 @@ async function assertAssignmentDateAvailable(plan, command) {
   }
   const uniqueRefs = [...new Set(refs)];
   await assertNoDriverPwaCompletedDispatchRefs(uniqueRefs, "add these orders to Dispatch");
+  await assertHistoricalInactiveSalesOrdersReconciled({
+    planDate: plan.planDate,
+    orderRefs: uniqueRefs,
+    action: "add these orders to Dispatch"
+  });
   for (const ref of uniqueRefs) {
     const conflict = await otherDateAssignment(plan, ref);
     if (!conflict) {continue;}

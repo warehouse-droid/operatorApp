@@ -53,10 +53,11 @@ const fixtures = {
   completed: { id: baseId + 2, ref: `PO-SCOPE-COMPLETED-${suffix}` },
   hold: { id: baseId + 3, ref: `PO-SCOPE-HOLD-${suffix}` },
   skipped: { id: baseId + 4, ref: `PO-SCOPE-SKIP-${suffix}` },
-  closed: { id: baseId + 5, ref: `PO-SCOPE-CLOSED-${suffix}` }
+  closed: { id: baseId + 5, ref: `PO-SCOPE-CLOSED-${suffix}` },
+  staleCompleted: { id: baseId + 6, ref: `PO-SCOPE-STALE-COMPLETED-${suffix}` }
 };
 const orphanSkipped = {
-  id: baseId + 6,
+  id: baseId + 7,
   ref: `PO-SCOPE-ORPHAN-SKIP-${suffix}`
 };
 
@@ -117,6 +118,7 @@ try {
     for (const [fixture, applicationStatus, savedSkip] of [
       [fixtures.active, "Queued", false],
       [fixtures.completed, "Completed", false],
+      [fixtures.staleCompleted, "Completed", false],
       [fixtures.skipped, "Queued", true]
     ]) {
       await query(
@@ -126,16 +128,42 @@ try {
            broad_reconciliation_skipped,
            broad_reconciliation_skipped_at,
            broad_reconciliation_skipped_by,
-           broad_reconciliation_skip_note
+           broad_reconciliation_skip_note,
+           reconciled_at
          ) VALUES (
            'PO', $1, $2, $3, 'current', $4,
            CASE WHEN $4 THEN now() ELSE NULL END,
            CASE WHEN $4 THEN $5 ELSE NULL END,
-           CASE WHEN $4 THEN 'Harness saved Skip decision' ELSE NULL END
+           CASE WHEN $4 THEN 'Harness saved Skip decision' ELSE NULL END,
+           now()
          )`,
         [fixture.id, fixture.ref, applicationStatus, savedSkip, actor]
       );
     }
+    await query(
+      `UPDATE purchase_orders
+          SET synced_at = now() - interval '2 hours'
+        WHERE netsuite_id = $1`,
+      [fixtures.staleCompleted.id]
+    );
+    await query(
+      `UPDATE scm_reconciliation_order_state
+          SET reconciled_at = now() - interval '1 hour'
+        WHERE order_kind = 'PO'
+          AND source_order_netsuite_id = $1`,
+      [fixtures.staleCompleted.id]
+    );
+    await query(
+      `INSERT INTO purchase_order_lines (
+         purchase_order_id, line_id, item_id, item_name, sku, quantity,
+         netsuite_received_qty, unit, location_id, location, netsuite_active,
+         raw, synced_at
+       ) VALUES (
+         $1, $2, 5002, 'Stale completed source line', 'STALE-COMPLETED', 3,
+         0, 'EA', 1, 'Scope Harness Yard', true, '{}'::jsonb, now()
+       )`,
+      [fixtures.staleCompleted.id, fixtures.staleCompleted.id + 1000]
+    );
     await query(
       `INSERT INTO scm_reconciliation_order_state (
          order_kind, source_order_netsuite_id, source_order_ref,
@@ -181,6 +209,11 @@ try {
         .map((source) => [source.id, source.reason])
     );
     assert.equal(fixtureExclusions.get(fixtures.completed.id), "completed");
+    assert.equal(
+      fixtureExclusions.has(fixtures.staleCompleted.id),
+      false,
+      "A completed calculation must re-enter broad reconciliation when a source line was synced later."
+    );
     assert.equal(fixtureExclusions.get(fixtures.hold.id), "hold");
     assert.equal(fixtureExclusions.get(fixtures.skipped.id), "saved_skip");
     assert.equal(fixtureExclusions.get(fixtures.closed.id), "closed");
@@ -199,8 +232,8 @@ try {
     );
     assert.deepEqual(
       effectiveFixtureSources.map((source) => source.id),
-      [fixtures.active.id],
-      "Default broad reconciliation must retain active orders while excluding terminal, Hold, and saved-Skip orders."
+      [fixtures.active.id, fixtures.staleCompleted.id],
+      "Default broad reconciliation must retain active and stale-completed orders while excluding unchanged terminal, Hold, and saved-Skip orders."
     );
 
     const queued = await createScmReconciliationRun({

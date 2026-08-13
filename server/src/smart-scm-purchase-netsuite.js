@@ -5,6 +5,12 @@ function quantity(value) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+function optionalQuantity(value) {
+  if (value === null || value === undefined || value === "") return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
 function normalizedUnit(value) {
   return String(value || "").trim().toUpperCase().replace(/\s+/g, " ");
 }
@@ -95,16 +101,20 @@ export function buildSmartScmPurchaseOrderRestPayload({ proposal, locations = []
       const rate = quantity(line.lastPurchasePrice);
       if (rate <= 0) throw new Error((line.itemName || line.itemId) + " needs a positive Last Purchase Price before PO payload creation.");
       assertPurchaseUnit(line.itemName || line.itemId, line.unit, line.purchaseUnit);
-      return {
+      const payloadLine = {
         item: { id: String(line.itemId) },
         quantity: quantity(line.salesQuantity),
         location: { id: String(lineLocation.netsuiteLocationId) },
         rate,
-        custcol_plt: quantity(line.palletQty),
-        custcol_lyr: quantity(line.layerQty),
-        custcol_sec: quantity(line.sectionQty),
-        custcol_pcs: quantity(line.pieceQty)
+        custcol_plt: quantity(line.palletQty)
       };
+      const layerQty = optionalQuantity(line.layerQty);
+      const sectionQty = optionalQuantity(line.sectionQty);
+      const pieceQty = optionalQuantity(line.pieceQty);
+      if (layerQty !== undefined) payloadLine.custcol_lyr = layerQty;
+      if (sectionQty !== undefined) payloadLine.custcol_sec = sectionQty;
+      if (pieceQty !== undefined) payloadLine.custcol_pcs = pieceQty;
+      return payloadLine;
     });
   const palletsByDestination = new Map();
   for (const line of materialLines) {
@@ -147,9 +157,6 @@ export function buildSmartScmPurchaseOrderRestPayload({ proposal, locations = []
       quantity: palletQuantity,
       location: { id: String(lineLocation.netsuiteLocationId) },
       rate: palletRate,
-      custcol_plt: 0,
-      custcol_lyr: 0,
-      custcol_sec: 0,
       custcol_pcs: palletQuantity
     });
   }

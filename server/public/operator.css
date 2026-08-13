@@ -678,6 +678,10 @@ label span {
   overflow: hidden;
 }
 
+.cycle-option-pagination {
+  padding: 0 10px 10px;
+}
+
 .inventory-list {
   padding: 10px;
 }

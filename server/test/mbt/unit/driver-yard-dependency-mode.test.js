@@ -113,7 +113,7 @@ test("ordinary TO-drop dependency review blocks completion in Hard mode and warn
   assert.match(softened.warnings[0].message, /Soft testing mode/u);
 });
 
-test("the audited Admin setting exists while Dispatch and direct-linked Driver rules remain hard", () => {
+test("the audited Admin setting exists while Dispatch and direct-linked Driver route guards remain hard", () => {
   assert.equal(fs.existsSync(migrationUrl), true, "The default-Hard setting migration is missing.");
   const migrationSource = fs.readFileSync(migrationUrl, "utf8");
   assert.match(migrationSource, /'driver_yard_dependency_soft_mode'\s*,\s*false/u);
@@ -134,6 +134,18 @@ test("the audited Admin setting exists while Dispatch and direct-linked Driver r
   assert.match(offlineStart, /getDirectPickupDependencyExecutionBlock/u);
   assert.match(onlineStart, /getDirectPickupDependencyExecutionBlock/u);
 
+  const directPickupGuard = dependencySource.slice(
+    dependencySource.indexOf("export async function getDirectPickupDependencyExecutionBlock"),
+    dependencySource.indexOf("export async function syncDirectDependencyOperatorProgress")
+  );
+  assert.doesNotMatch(
+    directPickupGuard,
+    /loaded_quantity|source-yard operator/u,
+    "Driver route authorization must not depend on a separate operator load workflow."
+  );
+  assert.match(directPickupGuard, /DIRECT_TRANSFER_ROUTE_MISMATCH/u);
+  assert.match(directPickupGuard, /DIRECT_TRANSFER_REVIEW_REQUIRED/u);
+
   const completionEffects = serverSource.slice(
     serverSource.indexOf("async function completeDriverJobOperationalEffects"),
     serverSource.indexOf("async function authorizedDriverDayJobs")
@@ -152,7 +164,7 @@ test("the audited Admin setting exists while Dispatch and direct-linked Driver r
   assert.match(driverSource, /dependencyWarnings/u);
 });
 
-test("automatic next-stop start applies the same yard policy and keeps direct pickup hard", () => {
+test("automatic next-stop start applies the same yard policy and keeps the direct route guard", () => {
   const completionRoute = serverSource.match(
     /app\.post\("\/api\/driver\/jobs\/:jobId\/photos"[\s\S]*?\n\}\);/u
   )?.[0] || "";
@@ -165,12 +177,12 @@ test("automatic next-stop start applies the same yard policy and keeps direct pi
   assert.match(autoStartBranch, /getDirectPickupDependencyExecutionBlock/u);
   assert.ok(
     autoStartBranch.indexOf("evaluateDriverYardDependencyStart")
-      < autoStartBranch.indexOf("startDriverJob"),
+      < autoStartBranch.indexOf("startDriverPhysicalVisitJobs"),
     "Dependency policy must run before the automatic start."
   );
   assert.ok(
     autoStartBranch.indexOf("getDirectPickupDependencyExecutionBlock")
-      < autoStartBranch.indexOf("startDriverJob"),
+      < autoStartBranch.indexOf("startDriverPhysicalVisitJobs"),
     "Direct pickup must be checked before the automatic start."
   );
 });

@@ -17,14 +17,17 @@ function loadedToday() {
   return new Date(date.getTime() - (date.getTimezoneOffset() * 60000)).toISOString().slice(0, 10);
 }
 
+const loadedDefaultDate = loadedToday();
+
 const loadedState = {
   operator: null,
+  drivers: [],
   orders: [],
   searchResults: [],
   detail: null,
   selectedKey: "",
-  search: localStorage.getItem("mbbs.dispatch.loaded.search") || "",
-  itemSearch: localStorage.getItem("mbbs.dispatch.loaded.itemSearch") || "",
+  search: "",
+  itemSearch: "",
   direction: localStorage.getItem("mbbs.dispatch.loaded.direction") === "inbound" ? "inbound" : "outbound",
   typeByDirection: {
     inbound: ["purchase_order", "transfer_order", "co_order"].includes(localStorage.getItem("mbbs.dispatch.loaded.inboundType"))
@@ -35,9 +38,10 @@ const loadedState = {
       : "sales_order"
   },
   filters: {
-    from: localStorage.getItem("mbbs.dispatch.loaded.from") || loadedToday(),
-    to: localStorage.getItem("mbbs.dispatch.loaded.to") || loadedToday(),
-    yard: localStorage.getItem("mbbs.dispatch.loaded.yard") || "all"
+    from: loadedDefaultDate,
+    to: loadedDefaultDate,
+    yard: localStorage.getItem("mbbs.dispatch.loaded.yard") || "all",
+    driver: localStorage.getItem("mbbs.dispatch.loaded.driver") || "all"
   },
   searchLoading: false,
   searchSeq: 0,
@@ -196,6 +200,7 @@ function loadedFilterQuery() {
     from: loadedState.filters.from || loadedToday(),
     to: loadedState.filters.to || loadedState.filters.from || loadedToday(),
     yard: loadedState.filters.yard || "all",
+    driver: loadedState.filters.driver || "all",
     direction: loadedState.direction,
     orderType: selectedMovementType()
   });
@@ -205,7 +210,8 @@ function loadedSearchQuery() {
   const params = new URLSearchParams({
     from: "2000-01-01",
     to: "2099-12-31",
-    yard: "all"
+    yard: "all",
+    driver: "all"
   });
   if (loadedState.search.trim()) params.set("search", loadedState.search.trim());
   if (loadedState.itemSearch.trim()) params.set("itemSearch", loadedState.itemSearch.trim());
@@ -253,11 +259,23 @@ async function loadSelectedDetail() {
   loadedState.detail = await loadedRequest(`${loadedApiBase}/detail?${params.toString()}`);
 }
 
+async function loadLoadedDrivers() {
+  const drivers = await loadedRequest(`${loadedApiBase}/drivers`);
+  loadedState.drivers = Array.isArray(drivers) ? drivers : [];
+  const available = new Set(loadedState.drivers.map((driver) => String(driver.login || "")));
+  if (loadedState.filters.driver !== "all" && !available.has(String(loadedState.filters.driver))) {
+    loadedState.filters.driver = "all";
+    localStorage.setItem("mbbs.dispatch.loaded.driver", "all");
+  }
+}
+
 async function loadLoadedOrders({ keepSelection = false } = {}) {
   loadedState.orders = await loadedRequest(`${loadedApiBase}?${loadedFilterQuery().toString()}`);
   if (!keepSelection || !loadedState.orders.some((order) => loadedOrderKey(order) === loadedState.selectedKey)) {
     loadedState.selectedKey = loadedState.orders[0] ? loadedOrderKey(loadedState.orders[0]) : "";
   }
+  loadedState.detail = null;
+  updateLoadedPanels();
   await loadSelectedDetail();
 }
 
@@ -283,13 +301,20 @@ async function loadLoadedSearch() {
   if (!results.some((order) => loadedOrderKey(order) === loadedState.selectedKey)) {
     loadedState.selectedKey = results[0] ? loadedOrderKey(results[0]) : "";
   }
+  loadedState.detail = null;
+  updateLoadedPanels();
   await loadSelectedDetail();
 }
 
-function loadedPhotoSrc(value) {
+function loadedPhotoSrc(value, { thumbnail = false } = {}) {
   const ref = String(value || "");
   if (!ref.startsWith("r2://")) return ref;
-  return `/api/photo-upload/preview?ref=${encodeURIComponent(ref)}&token=${encodeURIComponent(dispatchAuthToken || "")}`;
+  const params = new URLSearchParams({
+    ref,
+    token: dispatchAuthToken || ""
+  });
+  if (thumbnail) params.set("variant", "thumbnail");
+  return `/api/photo-upload/preview?${params.toString()}`;
 }
 
 function openLoadedPhoto(photoRef, label) {
@@ -437,7 +462,7 @@ function renderLoadedPhotoSection(title, photos = [], source = "yard") {
         : loadedT("yard.yardActivityPhoto", "Yard activity");
       const photoLabel = `${sourceLabel} ${loadedField(photo, "id") || ""}`.trim();
       return `<figure>
-        <button class="dispatch-loaded-photo" data-action="open-loaded-photo" data-photo-ref="${loadedEscape(photoRef)}" data-photo-label="${loadedEscape(photoLabel)}" type="button"><img src="${loadedEscape(loadedPhotoSrc(photoRef))}" alt="${loadedEscape(photoLabel)}" /></button>
+        <button class="dispatch-loaded-photo" data-action="open-loaded-photo" data-photo-ref="${loadedEscape(photoRef)}" data-photo-label="${loadedEscape(photoLabel)}" type="button"><img src="${loadedEscape(loadedPhotoSrc(photoRef, { thumbnail: true }))}" loading="lazy" decoding="async" alt="${loadedEscape(photoLabel)}" /></button>
         <figcaption>${loadedEscape(sourceLabel)}${truckPlate ? ` · ${loadedT("yard.truck", "Truck")} ${loadedEscape(truckPlate)}` : ""}${createdAt ? `<br>${loadedFormatDate(createdAt)}` : ""}</figcaption>
       </figure>`;
     }).join("") || `<div class="dispatch-loaded-notice">${loadedT("common.noPhoto", "No photo")}</div>`}
@@ -483,6 +508,7 @@ function renderDispatchLoaded() {
   const operator = loadedState.operator || {};
   const typeTabs = DISPATCH_YARD_TYPES[loadedState.direction] || [];
   const yardOptions = loadedAllowedYards();
+  const driverOptions = loadedState.drivers;
   const homeLabel = loadedSalesHost ? loadedT("sales.menu", "Sales Menu") : loadedT("dispatch.menu", "Dispatch Menu");
   dispatchLoadedApp.innerHTML = `
     <header class="dispatch-topbar"><div><p>${loadedSalesHost ? "MBBS Operation" : "MBBS Transportation"}</p><h1>${loadedT("control.loadedExportTitle", "In/Outbound Record")}</h1></div><div class="topbar-language">${window.MBBS_I18N?.toggleHtml() || ""}</div><div class="topbar-actions"><span class="dispatch-user">${loadedEscape(operator.display_name || operator.username || "")}</span><button onclick="location.href='${loadedHome}'" type="button">${homeLabel}</button><button onclick="dispatchLogout()" type="button">${loadedT("common.logout", "Logout")}</button></div></header>
@@ -501,6 +527,7 @@ function renderDispatchLoaded() {
           <label><span>${loadedT("common.from", "From")}</span><input id="dispatchLoadedFrom" type="date" value="${loadedEscape(loadedState.filters.from)}" /></label>
           <label><span>${loadedT("common.to", "To")}</span><input id="dispatchLoadedTo" type="date" value="${loadedEscape(loadedState.filters.to)}" /></label>
           <label><span>${loadedT("common.yard", "Yard")}</span><select id="dispatchLoadedYard"><option value="all" ${loadedState.filters.yard === "all" ? "selected" : ""}>${loadedT("common.all", "All")}</option>${yardOptions.map((yard) => `<option value="${yard.locationId}" ${loadedState.filters.yard === String(yard.locationId) ? "selected" : ""}>${loadedEscape(yard.yardCode)}</option>`).join("")}</select></label>
+          <label><span>${loadedT("yard.driver", "Driver")}</span><select id="dispatchLoadedDriver"><option value="all" ${loadedState.filters.driver === "all" ? "selected" : ""}>${loadedT("yard.allDrivers", "All drivers")}</option>${driverOptions.map((driver) => `<option value="${loadedEscape(driver.login)}" ${loadedState.filters.driver === String(driver.login) ? "selected" : ""}>${loadedEscape(driver.name || driver.login)}${driver.active === false ? ` · ${loadedT("common.inactive", "Inactive")}` : ""}</option>`).join("")}</select></label>
           <button class="primary" data-action="apply-loaded-filters" type="button">${loadedT("common.apply", "Apply")}</button>
           <button data-action="refresh-loaded-orders" type="button">${loadedT("common.refresh", "Refresh")}</button>
           <button data-action="export-loaded-csv" type="button" ${loadedState.orders.length ? "" : "disabled"}>${loadedT("common.exportCsv", "Export CSV")}</button>
@@ -596,7 +623,8 @@ dispatchLoadedApp.addEventListener("click", async (event) => {
     loadedState.filters = {
       from: document.getElementById("dispatchLoadedFrom")?.value || loadedToday(),
       to: document.getElementById("dispatchLoadedTo")?.value || document.getElementById("dispatchLoadedFrom")?.value || loadedToday(),
-      yard: document.getElementById("dispatchLoadedYard")?.value || "all"
+      yard: document.getElementById("dispatchLoadedYard")?.value || "all",
+      driver: document.getElementById("dispatchLoadedDriver")?.value || "all"
     };
     for (const [key, value] of Object.entries(loadedState.filters)) localStorage.setItem(`mbbs.dispatch.loaded.${key}`, value);
     loadedState.selectedKey = "";
@@ -629,6 +657,7 @@ requireDispatchLogin({
       localStorage.setItem("mbbs.dispatch.loaded.yard", "all");
     }
     await runLoadedAction(loadedT("common.loading", "Loading..."), async () => {
+      await loadLoadedDrivers();
       await loadLoadedOrders();
       if (loadedSearchActive()) await loadLoadedSearch();
     });

@@ -7,7 +7,7 @@ const STAFF_TOKEN_KEY = "mbbs.staff.token";
 const STAFF_ROLE_KEY = "mbbs.staff.role";
 const STAFF_ROLES_KEY = "mbbs.staff.roles";
 const CAMERA_FACING_KEY = "mbbs.camera.facingMode";
-const DRIVER_PWA_CLIENT_VERSION = "2026.08.08.1";
+const DRIVER_PWA_CLIENT_VERSION = "2026.08.12.3";
 const DRIVER_PWA_VERSION_HEADER = "X-MBBS-Driver-Version";
 const DRIVER_PWA_UPDATE_MARKER_KEY = "mbbs.driver.requiredPwaVersion";
 const DRIVER_PWA_VERIFIED_VERSION_KEY = "mbbs.driver.verifiedPwaVersion";
@@ -16,6 +16,7 @@ const DRIVER_OFFLINE_MODE_KEY = "mbbs.driver.offlineModeEnabled";
 const DRIVER_DEVICE_ID_KEY = "mbbs.driver.deviceId";
 const DRIVER_PWA_VERSION_CHECK_MS = 60000;
 const DRIVER_OFFLINE_RECOVERY_CHECK_MS = 2000;
+const DRIVER_PWA_REPAIR_TIMEOUT_MS = 45000;
 const t = (key, fallback) => window.MBBS_I18N?.t(key, fallback) || fallback;
 const tf = (key, fallback, variables = {}) => window.MBBS_I18N?.format(key, fallback, variables) || fallback;
 const localizeMessage = (message) => window.MBBS_I18N?.message(message) || String(message || "");
@@ -33,6 +34,11 @@ let binDraftSavePromise = Promise.resolve();
 let dvirPhotos = [];
 let dvirMode = "";
 let orderPages = {};
+const instructionMediaObjectUrls = new Map();
+const instructionMediaOnlineFallbackIds = new Set();
+const instructionMediaRetryNonces = new Map();
+let instructionMediaPreparationKey = "";
+let instructionMediaPreparationGeneration = 0;
 let photoPromptOpen = false;
 let eventSource = null;
 let locationCheck = null;
@@ -88,6 +94,7 @@ let onlineRouteRevalidationQueued = false;
 let onlineRouteLastValidatedAt = 0;
 let onlineRouteUpdatePending = false;
 let savedRouteClearRunning = false;
+let driverShellRepairRunning = false;
 let pendingDvirEvent = null;
 let pendingDvirPhotos = [];
 let pendingDutyEvents = [];
@@ -109,6 +116,7 @@ const QUIET_SYNC_LEASE_POLL_MS = 250;
 const QUIET_SYNC_EVENT_TTL_MS = 10 * 60 * 1000;
 const QUIET_SYNC_EVENT_LIMIT = 1000;
 const PHOTO_CAPTURE_TIMEOUT_MS = 60000;
+const DELIVERY_INSTRUCTION_IMAGE_TIMEOUT_MS = 15000;
 const DRIVER_REMARK_MAX_LENGTH = 1000;
 const ONLINE_ROUTE_REVALIDATE_MS = 45000;
 const DRIVER_INTERACTION_ACTIONS = new Set([
@@ -318,6 +326,8 @@ function renderDriverPwaUpdateRequired() {
           <span>${t("driver.pwaLatestVersion", "Latest version")}</span><b>${escapeHtml(currentVersion)}</b>
         </div>
         <button class="primary" data-action="reload-driver-pwa" type="button">${t("driver.pwaReloadLatest", "Reload latest PWA")}</button>
+        <button class="secondary" data-action="repair-driver-pwa" ${driverShellRepairRunning ? "disabled" : ""} type="button">${driverShellRepairRunning ? t("driver.pwaRepairingCache", "Repairing Driver app cache…") : t("driver.pwaRepairCache", "Repair Driver app cache")}</button>
+        <small>${t("driver.pwaRepairPreservesData", "Repairs only MBBS Driver app files. Saved routes, photos, pending submissions, login state, and other MBBS app data are preserved.")}</small>
         <small>${t("driver.pwaIphoneReopenHelp", "On iPhone or an installed PWA, close every MBBS Driver window and open it again if this message remains after reloading.")}</small>
       </div>
     </section>
@@ -427,6 +437,146 @@ async function reloadLatestDriverPwa(button = null) {
       "Could not load the update. Check internet, then close and reopen the PWA. {detail}",
       { detail: localizeMessage(error.message || "") }
     ));
+  }
+}
+
+function waitForDriverWorkerActivation(worker, timeoutMs = DRIVER_PWA_REPAIR_TIMEOUT_MS) {
+  if (!worker || worker.state === "activated") return Promise.resolve(worker);
+  return new Promise((resolve, reject) => {
+    const timeout = window.setTimeout(() => {
+      worker.removeEventListener?.("statechange", onStateChange);
+      reject(new Error(t("driver.pwaRepairWorkerTimeout", "The updated Driver app did not become ready in time.")));
+    }, timeoutMs);
+    function finish(callback, value) {
+      window.clearTimeout(timeout);
+      worker.removeEventListener?.("statechange", onStateChange);
+      callback(value);
+    }
+    function onStateChange() {
+      if (worker.state === "activated") finish(resolve, worker);
+      else if (worker.state === "redundant") {
+        finish(reject, new Error(t("driver.pwaRepairWorkerRejected", "The Driver app update was replaced before it became ready.")));
+      }
+    }
+    worker.addEventListener("statechange", onStateChange);
+    onStateChange();
+  });
+}
+
+function requestDriverShellRepair(worker) {
+  if (typeof MessageChannel !== "function") {
+    return Promise.reject(new Error(t("driver.pwaRepairUnsupported", "This browser cannot safely repair the Driver app cache.")));
+  }
+  const requestId = globalThis.crypto?.randomUUID?.()
+    || `driver-cache-repair-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return new Promise((resolve, reject) => {
+    const channel = new MessageChannel();
+    const timeout = window.setTimeout(() => {
+      channel.port1.close?.();
+      reject(new Error(t("driver.pwaRepairResponseTimeout", "The Driver app cache repair timed out. Your saved data was not cleared.")));
+    }, DRIVER_PWA_REPAIR_TIMEOUT_MS);
+    channel.port1.onmessage = (event) => {
+      const response = event.data || {};
+      if (response.type !== "DRIVER_REPAIR_SHELL_RESULT" || response.requestId !== requestId) return;
+      window.clearTimeout(timeout);
+      channel.port1.close?.();
+      if (!response.ok) {
+        reject(new Error(response.error || t("driver.pwaRepairFailed", "The Driver app cache could not be repaired.")));
+        return;
+      }
+      if (response.version !== DRIVER_PWA_CLIENT_VERSION) {
+        reject(new Error(t("driver.pwaRepairStaleWorker", "The old Driver app is still active. Close every Driver window, reopen it while online, and retry.")));
+        return;
+      }
+      resolve(response);
+    };
+    channel.port1.start?.();
+    try {
+      worker.postMessage({ type: "DRIVER_REPAIR_SHELL", requestId }, [channel.port2]);
+    } catch (error) {
+      window.clearTimeout(timeout);
+      channel.port1.close?.();
+      reject(error);
+    }
+  });
+}
+
+async function repairDriverAppCache(button = null) {
+  if (driverShellRepairRunning) return false;
+  if (
+    activeRest
+    || photoInteractionActive()
+    || activeForegroundEventIds.size
+    || activeDriverMutationToken
+    || offlineSyncing
+    || savedRouteClearRunning
+  ) {
+    showToast(t("driver.pwaRepairFinishAction", "Finish the active rest, photo, stop action, synchronization, or route refresh before repairing the app cache."));
+    return false;
+  }
+  driverShellRepairRunning = true;
+  if (button?.isConnected) {
+    button.disabled = true;
+    button.textContent = t("driver.pwaRepairingCache", "Repairing Driver app cache…");
+  }
+  if (driverPwaUpdateRequired) renderDriverPwaUpdateRequired();
+  else renderOfflineStatus();
+  try {
+    const networkResponse = await fetch(`/api/driver/network-health?cacheRepair=${encodeURIComponent(Date.now())}`, {
+      method: "GET",
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { "Cache-Control": "no-store" }
+    }).catch(() => null);
+    if (!networkResponse?.ok) {
+      showToast(t("driver.pwaRepairConnectFirst", "Connect to the internet before repairing the Driver app cache."));
+      return false;
+    }
+    const confirmed = window.confirm(t(
+      "driver.pwaRepairConfirm",
+      "Repair only the MBBS Driver app cache? Your saved route, photos, pending submissions, and login state will be preserved. Other MBBS app caches will not be changed."
+    ));
+    if (!confirmed) return false;
+    if (!("serviceWorker" in navigator)) {
+      throw new Error(t("driver.pwaRepairUnsupported", "This browser cannot safely repair the Driver app cache."));
+    }
+    const registration = driverServiceWorkerRegistration
+      || await navigator.serviceWorker.getRegistration("/driver");
+    if (!registration) {
+      throw new Error(t("driver.pwaRepairWorkerMissing", "The Driver app worker is not installed. Reload while online, then retry."));
+    }
+    await registration.update();
+    const pendingWorker = registration.installing || registration.waiting;
+    if (registration.waiting) registration.waiting.postMessage({ type: "SKIP_WAITING" });
+    if (pendingWorker) await waitForDriverWorkerActivation(pendingWorker);
+    const readyRegistration = await Promise.race([
+      navigator.serviceWorker.ready,
+      new Promise((_, reject) => window.setTimeout(
+        () => reject(new Error(t("driver.pwaRepairWorkerTimeout", "The updated Driver app did not become ready in time."))),
+        DRIVER_PWA_REPAIR_TIMEOUT_MS
+      ))
+    ]);
+    const worker = registration.active
+      || readyRegistration?.active
+      || navigator.serviceWorker.controller;
+    if (!worker) {
+      throw new Error(t("driver.pwaRepairWorkerMissing", "The Driver app worker is not installed. Reload while online, then retry."));
+    }
+    await requestDriverShellRepair(worker);
+    showToast(t("driver.pwaRepairComplete", "Driver app cache repaired. Reloading…"));
+    window.location.replace(`/driver?cache-repair=${encodeURIComponent(Date.now())}`);
+    return true;
+  } catch (error) {
+    showToast(tf(
+      "driver.pwaRepairFailedDetail",
+      "Driver app cache repair failed. Your offline data was not cleared. {detail}",
+      { detail: localizeMessage(error.message || "") }
+    ));
+    return false;
+  } finally {
+    driverShellRepairRunning = false;
+    if (driverPwaUpdateRequired) renderDriverPwaUpdateRequired();
+    else renderOfflineStatus();
   }
 }
 
@@ -802,12 +952,16 @@ function comparableJobDetails(job = {}) {
     toPickupLocation: job.toPickupLocation || "",
     destinationLocationId: job.destinationLocationId ?? null,
     lineRowIds: job.lineRowIds || [],
+    physicalVisitJobIds: job.physicalVisitJobIds || [],
+    physicalVisitStopIds: job.physicalVisitStopIds || [],
+    consolidatedPhysicalVisit: job.consolidatedPhysicalVisit === true,
     windowStart: job.windowStart || "",
     windowEnd: job.windowEnd || "",
     instructions: job.instructions || "",
     orderRefs: job.orderRefs || [],
     orderTypes: job.orderTypes || [],
     dependencyPickupManifests: job.dependencyPickupManifests || [],
+    deliveryInstructions: job.deliveryInstructions || { revision: 0, orders: [] },
     orders: job.orders || [],
     requiredPhotos: Number(job.requiredPhotos || 0),
     sequence: job.sequence || null
@@ -897,6 +1051,33 @@ function localCompletionReconciliationStatus(event) {
   return "";
 }
 
+function driverPhysicalVisitJobIds(job = {}) {
+  const currentJobId = String(job?.jobId || "");
+  const seen = new Set();
+  const result = [];
+  for (const value of job?.physicalVisitJobIds || []) {
+    const jobId = String(value || "");
+    if (!jobId || seen.has(jobId)) continue;
+    seen.add(jobId);
+    result.push(jobId);
+  }
+  if (currentJobId && !seen.has(currentJobId)) result.push(currentJobId);
+  return result.length ? result : currentJobId ? [currentJobId] : [];
+}
+
+function driverEventPhysicalVisitJobIds(event, manifest = offlineManifest) {
+  const eventJobId = String(event?.effectiveJobId || event?.jobId || "");
+  const manifestJob = manifestJobFor(eventJobId, manifest);
+  const declared = Array.isArray(event?.details?.physicalVisitJobIds)
+    ? event.details.physicalVisitJobIds
+    : [];
+  return driverPhysicalVisitJobIds({
+    ...(manifestJob || {}),
+    jobId: eventJobId || manifestJob?.jobId || "",
+    physicalVisitJobIds: declared.length ? declared : manifestJob?.physicalVisitJobIds
+  });
+}
+
 function localCompletionBridge(previousJob, authoritativeJob, manifest, events = []) {
   const previousJobId = String(previousJob?.jobId || "");
   const authoritativeJobId = String(authoritativeJob?.jobId || "");
@@ -910,10 +1091,10 @@ function localCompletionBridge(previousJob, authoritativeJob, manifest, events =
   for (const event of events || []) {
     const reconciliation = localCompletionReconciliationStatus(event);
     if (!reconciliation) continue;
-    const eventJobId = String(event.effectiveJobId || event.jobId || "");
-    if (!eventJobId) continue;
-    if (!completionsByJobId.has(eventJobId)) completionsByJobId.set(eventJobId, []);
-    completionsByJobId.get(eventJobId).push(reconciliation);
+    for (const eventJobId of driverEventPhysicalVisitJobIds(event, manifest)) {
+      if (!completionsByJobId.has(eventJobId)) completionsByJobId.set(eventJobId, []);
+      completionsByJobId.get(eventJobId).push(reconciliation);
+    }
   }
 
   const authoritativeCompletionStatuses = completionsByJobId.get(authoritativeJobId) || [];
@@ -1403,6 +1584,10 @@ function renderOfflineStatus() {
         <div class="offline-status-actions">
           <button class="primary" data-offline-action="sync" ${offlineSyncing || !navigator.onLine ? "disabled" : ""} type="button">${t("driver.syncNow", "Sync now")}</button>
         </div>` : ""}
+        <div class="offline-status-actions">
+          <button class="secondary offline-repair-button" data-offline-action="repair-cache" ${driverShellRepairRunning || offlineSyncing || savedRouteClearRunning ? "disabled" : ""} type="button">${driverShellRepairRunning ? t("driver.pwaRepairingCache", "Repairing Driver app cache…") : t("driver.pwaRepairCache", "Repair Driver app cache")}</button>
+        </div>
+        <small>${t("driver.pwaRepairPreservesData", "Repairs only MBBS Driver app files. Saved routes, photos, pending submissions, login state, and other MBBS app data are preserved.")}</small>
       </section>
     `;
     applyDriverActionProtectionGate();
@@ -1481,8 +1666,10 @@ function renderOfflineStatus() {
       <div class="offline-status-actions">
         <button class="primary" data-offline-action="sync" ${offlineSyncing ? "disabled" : ""} type="button">${lastError ? t("driver.retrySync", "Retry sync") : t("driver.syncNow", "Sync now")}</button>
         <button class="secondary" data-offline-action="persist" type="button">${t("driver.protectStorage", "Protect storage")}</button>
+        <button class="secondary offline-repair-button" data-offline-action="repair-cache" ${driverShellRepairRunning || offlineSyncing || savedRouteClearRunning ? "disabled" : ""} type="button">${driverShellRepairRunning ? t("driver.pwaRepairingCache", "Repairing Driver app cache…") : t("driver.pwaRepairCache", "Repair Driver app cache")}</button>
         <button class="secondary danger-button offline-clear-button" data-offline-action="clear" ${offlineSyncing || savedRouteClearRunning || !navigator.onLine ? "disabled" : ""} type="button">${t("driver.clearSavedRoute", "Clear saved route")}</button>
       </div>
+      <small>${t("driver.pwaRepairPreservesData", "Repairs only MBBS Driver app files. Saved routes, photos, pending submissions, login state, and other MBBS app data are preserved.")}</small>
     </section>
   `;
   applyDriverActionProtectionGate();
@@ -1510,6 +1697,132 @@ async function refreshOfflineHealth() {
     offlineStatus.dataset.lastError = error.message;
   }
   renderOfflineStatus();
+}
+
+function remainingRequiredPhotosAfterCandidate({ isDvir = false, index = 0 } = {}) {
+  const currentJobId = String(currentJob?.jobId || "");
+  const capturedJobPhotos = photos.filter(Boolean).length
+    + (!isDvir && !photos[index] ? 1 : 0);
+  let remaining = (offlineManifest?.jobs || []).reduce((total, job) => {
+    if (jobIsComplete(job)) return total;
+    const required = Math.max(0, Math.floor(Number(job?.requiredPhotos || 0)));
+    if (!required) return total;
+    if (String(job?.jobId || "") !== currentJobId) return total + required;
+    return total + Math.max(0, required - Math.min(required, capturedJobPhotos));
+  }, 0);
+  if (isDvir) {
+    const capturedDvirPhotos = dvirPhotos.filter(Boolean).length + (!dvirPhotos[index] ? 1 : 0);
+    remaining += Math.max(0, 4 - Math.min(4, capturedDvirPhotos));
+  }
+  return remaining;
+}
+
+async function currentBrowserStorageEstimate() {
+  let estimate = offlineStorageEstimate || {};
+  if (navigator.storage?.estimate) {
+    try {
+      estimate = await navigator.storage.estimate();
+      offlineStorageEstimate = estimate;
+    } catch {
+      // IndexedDB's independent 250 MB ledger remains authoritative when the
+      // browser does not expose a usable origin estimate.
+    }
+  }
+  return {
+    usage: Math.max(0, Number(estimate?.usage || 0)),
+    quota: Math.max(0, Number(estimate?.quota || 0))
+  };
+}
+
+function selectOfflineCapturePolicy({ health, estimate, cacheStats, remainingPhotoCount, existingPhoto }) {
+  return window.DriverOfflinePhotos.capturePolicyForPressure({
+    retainedEvidenceBytes: Math.max(
+      0,
+      Number(health?.evidenceBytes || 0) - Number(existingPhoto?.byteSize || 0)
+    ),
+    remainingPhotoCount: remainingPhotoCount + 1,
+    optionalCacheBytes: Number(cacheStats?.bytes || 0),
+    browserUsageBytes: Number(estimate?.usage || 0),
+    browserQuotaBytes: Number(estimate?.quota || 0),
+    evidenceBudgetBytes: Number(health?.maxEvidenceBytes || 0)
+      || window.DriverOfflineDB.MAX_EVIDENCE_BYTES
+  });
+}
+
+async function prepareOfflinePhotoCapture({
+  isDvir = false,
+  index = 0,
+  existingPhoto = null,
+  evictOptional = true
+} = {}) {
+  const partitionKey = String(offlinePartition?.partitionKey || "");
+  if (!driverOfflineModeEnabled || !offlineStorageAvailable || !partitionKey) {
+    return { capturePolicy: {}, admission: {} };
+  }
+  const remainingPhotoCount = remainingRequiredPhotosAfterCandidate({ isDvir, index });
+  let health = await window.DriverOfflineDB.getStorageHealth(partitionKey);
+  let estimate = await currentBrowserStorageEstimate();
+  let cacheStats = await window.DriverOfflineDB.getInstructionMediaCacheStats(partitionKey);
+  let capturePolicy = selectOfflineCapturePolicy({
+    health,
+    estimate,
+    cacheStats,
+    remainingPhotoCount,
+    existingPhoto
+  });
+
+  while (
+    evictOptional
+    && capturePolicy.optionalCacheEvictionBytes > 0
+    && Number(cacheStats.bytes || 0) > 0
+  ) {
+    const eviction = await window.DriverOfflineDB.evictInstructionMediaForEvidence(
+      partitionKey,
+      { bytesToFree: capturePolicy.optionalCacheEvictionBytes }
+    );
+    if (!eviction.evictedBytes) break;
+    [health, estimate, cacheStats] = await Promise.all([
+      window.DriverOfflineDB.getStorageHealth(partitionKey),
+      currentBrowserStorageEstimate(),
+      window.DriverOfflineDB.getInstructionMediaCacheStats(partitionKey)
+    ]);
+    capturePolicy = selectOfflineCapturePolicy({
+      health,
+      estimate,
+      cacheStats,
+      remainingPhotoCount,
+      existingPhoto
+    });
+  }
+
+  if (!capturePolicy.allowed) {
+    throw new Error(t(
+      "driver.routePhotoHeadroomUnavailable",
+      "There is not enough protected device storage for this photo and the remaining required route photos. Synchronize or reconnect before continuing."
+    ));
+  }
+  const admission = {
+    remainingPhotoCount,
+    expectedBytesPerPhoto: capturePolicy.targetBytes,
+    browserStorageEstimate: estimate,
+    optionalCacheBytes: evictOptional ? 0 : Number(cacheStats.bytes || 0)
+  };
+  const decision = await window.DriverOfflineDB.canStorePhoto(
+    partitionKey,
+    capturePolicy.targetBytes,
+    admission
+  );
+  if (!decision.allowed) throw new Error(decision.reason);
+  return { capturePolicy, admission };
+}
+
+function launchPhotoPicker(input) {
+  if (!input) return;
+  // Keep this synchronous: mobile Safari requires the native file/camera
+  // picker to open within the original user activation. Strict admission runs
+  // after selection and before any evidence is persisted.
+  beginPhotoCapture();
+  input.click();
 }
 
 async function requestPersistentStorage({ userInitiated = false } = {}) {
@@ -2054,6 +2367,10 @@ function renderLogin(message = "") {
 
 function clearDriverSessionMemory() {
   const partitionKey = offlinePartition?.partitionKey || "";
+  instructionMediaPreparationGeneration += 1;
+  instructionMediaPreparationKey = "";
+  instructionMediaOnlineFallbackIds.clear();
+  releaseInstructionMediaObjectUrls();
   activeDriverMutationToken = null;
   markDriverInteraction();
   finishPhotoCapture();
@@ -2186,6 +2503,7 @@ function renderNoJob() {
     </section>
     ${activeRest ? renderRestModal() : ""}
   `);
+  void prepareDeliveryInstructionMedia(job);
 }
 
 function renderDvir(type = "pre", message = "") {
@@ -2295,6 +2613,287 @@ function renderOrders(job) {
     </section>
   `;
   }).join("");
+}
+
+function deliveryInstructionImageEntries(job) {
+  if (job?.stopType !== "dropoff") return [];
+  const entries = [];
+  const seen = new Set();
+  for (const order of job?.deliveryInstructions?.orders || []) {
+    for (const media of order?.media || []) {
+      const mediaId = String(media?.id || "").trim().toLowerCase();
+      if (!mediaId || seen.has(mediaId) || media?.mediaKind !== "image") continue;
+      seen.add(mediaId);
+      entries.push({ ...media, id: mediaId });
+    }
+  }
+  return entries;
+}
+
+function nextDeliveryInstructionJob(job) {
+  const jobs = Array.isArray(offlineManifest?.jobs) ? offlineManifest.jobs : [];
+  if (!jobs.length || !job) return null;
+  const currentIds = new Set([
+    String(job.jobId || ""),
+    ...(job.physicalVisitJobIds || []).map((value) => String(value || ""))
+  ].filter(Boolean));
+  let currentIndex = -1;
+  jobs.forEach((candidate, index) => {
+    if (currentIds.has(String(candidate?.jobId || ""))) currentIndex = Math.max(currentIndex, index);
+  });
+  return jobs.slice(currentIndex + 1).find((candidate) =>
+    candidate?.stopType === "dropoff"
+    && !jobIsComplete(candidate)
+    && deliveryInstructionImageEntries(candidate).length
+  ) || null;
+}
+
+function releaseInstructionMediaObjectUrls(retainedMediaIds = new Set()) {
+  for (const [mediaId, cached] of instructionMediaObjectUrls) {
+    if (retainedMediaIds.has(mediaId)) continue;
+    if (cached?.url) URL.revokeObjectURL(cached.url);
+    instructionMediaObjectUrls.delete(mediaId);
+  }
+}
+
+function rememberInstructionMediaObjectUrl(media, blob, jobId) {
+  const mediaId = String(media?.id || "").toLowerCase();
+  if (!mediaId || !(blob instanceof Blob) || !blob.size) return "";
+  const previous = instructionMediaObjectUrls.get(mediaId);
+  if (previous?.url) URL.revokeObjectURL(previous.url);
+  const url = URL.createObjectURL(blob);
+  instructionMediaObjectUrls.set(mediaId, { url, jobId: String(jobId || "") });
+  instructionMediaOnlineFallbackIds.delete(mediaId);
+  return url;
+}
+
+function patchDriverInstructionMedia(media) {
+  const mediaId = String(media?.id || "").toLowerCase();
+  if (!mediaId) return;
+  app.querySelectorAll("[data-instruction-media-id]").forEach((node) => {
+    if (String(node.dataset.instructionMediaId || "").toLowerCase() === mediaId) {
+      node.outerHTML = renderDeliveryInstructionMedia(media);
+    }
+  });
+}
+
+function instructionMediaContentPath(media) {
+  return `/api/delivery-instruction-media/${encodeURIComponent(String(media?.id || ""))}/content`;
+}
+
+async function fetchDeliveryInstructionImage(media) {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), DELIVERY_INSTRUCTION_IMAGE_TIMEOUT_MS);
+  try {
+    const response = await fetch(instructionMediaContentPath(media), {
+      method: "GET",
+      cache: "no-store",
+      credentials: "same-origin",
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${authToken}`,
+        [DRIVER_PWA_VERSION_HEADER]: DRIVER_PWA_CLIENT_VERSION
+      }
+    });
+    if (!response.ok) throw new Error(`Delivery-instruction image request failed (${response.status}).`);
+    const mimeType = String(response.headers.get("content-type") || media?.mimeType || "").split(";")[0].trim().toLowerCase();
+    if (!mimeType.startsWith("image/")) throw new Error("The delivery-instruction image response has an invalid media type.");
+    const blob = await response.blob();
+    const expectedSize = Number(media?.byteSize || 0);
+    if (!blob.size || blob.size > 25 * 1024 * 1024 || (expectedSize > 0 && blob.size !== expectedSize)) {
+      throw new Error("The delivery-instruction image response has an invalid size.");
+    }
+    return blob.type === mimeType ? blob : new Blob([blob], { type: mimeType });
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error("Delivery-instruction image request timed out.");
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
+async function prepareDeliveryInstructionMedia(job, { force = false } = {}) {
+  const partitionKey = String(offlinePartition?.partitionKey || "");
+  const currentImages = deliveryInstructionImageEntries(job);
+  const currentIds = new Set(currentImages.map((media) => String(media.id)));
+  releaseInstructionMediaObjectUrls(currentIds);
+  if (!partitionKey || !offlineStorageAvailable || !window.DriverOfflineDB || job?.stopType !== "dropoff") {
+    instructionMediaPreparationKey = "";
+    return;
+  }
+  const nextJob = nextDeliveryInstructionJob(job);
+  const nextImages = deliveryInstructionImageEntries(nextJob);
+  const preparationKey = JSON.stringify({
+    partitionKey,
+    online: navigator.onLine,
+    currentJobId: job?.jobId || "",
+    current: currentImages.map((media) => media.id),
+    nextJobId: nextJob?.jobId || "",
+    next: nextImages.map((media) => media.id)
+  });
+  if (!force && preparationKey === instructionMediaPreparationKey) return;
+  instructionMediaPreparationKey = preparationKey;
+  const generation = ++instructionMediaPreparationGeneration;
+  await window.DriverOfflineDB.setInstructionMediaPriorities(partitionKey, {
+    currentMediaIds: currentImages.map((media) => media.id),
+    nextMediaIds: nextImages.map((media) => media.id)
+  }).catch(() => {});
+
+  const targets = [
+    ...currentImages.map((media) => ({ media, targetJob: job, priority: 2, visible: true })),
+    ...nextImages.map((media) => ({ media, targetJob: nextJob, priority: 1, visible: false }))
+  ];
+  for (const target of targets) {
+    if (generation !== instructionMediaPreparationGeneration || partitionKey !== offlinePartition?.partitionKey) return;
+    const mediaId = String(target.media.id);
+    let cached = await window.DriverOfflineDB.getCachedInstructionMedia(partitionKey, mediaId).catch(() => null);
+    if (cached?.blob instanceof Blob && cached.blob.size === Number(target.media.byteSize || cached.blob.size)) {
+      if (target.visible && String(currentJob?.jobId || "") === String(job?.jobId || "")) {
+        rememberInstructionMediaObjectUrl(target.media, cached.blob, job.jobId);
+        patchDriverInstructionMedia(target.media);
+      }
+      continue;
+    }
+    if (!navigator.onLine || !authToken) continue;
+    try {
+      const blob = await fetchDeliveryInstructionImage(target.media);
+      if (generation !== instructionMediaPreparationGeneration || partitionKey !== offlinePartition?.partitionKey) return;
+      cached = await window.DriverOfflineDB.cacheInstructionMedia(partitionKey, {
+        ...target.media,
+        mediaId,
+        jobId: target.targetJob?.jobId || "",
+        priority: target.priority,
+        byteSize: blob.size,
+        blob
+      }).catch(() => null);
+      const visibleBlob = cached?.blob instanceof Blob ? cached.blob : blob;
+      if (target.visible && String(currentJob?.jobId || "") === String(job?.jobId || "")) {
+        rememberInstructionMediaObjectUrl(target.media, visibleBlob, job.jobId);
+        patchDriverInstructionMedia(target.media);
+      }
+    } catch {
+      if (target.visible && navigator.onLine && String(currentJob?.jobId || "") === String(job?.jobId || "")) {
+        instructionMediaOnlineFallbackIds.add(mediaId);
+        patchDriverInstructionMedia(target.media);
+      }
+    }
+  }
+}
+
+function driverDeliveryInstructionMediaUrl(media) {
+  const mediaId = String(media?.id || "").toLowerCase();
+  const cached = instructionMediaObjectUrls.get(mediaId);
+  if (cached?.url) return cached.url;
+  if (!navigator.onLine) return "";
+  const base = instructionMediaContentPath(media);
+  const retryNonce = instructionMediaRetryNonces.get(mediaId);
+  const query = `token=${encodeURIComponent(authToken || "")}${retryNonce ? `&retry=${encodeURIComponent(retryNonce)}` : ""}`;
+  return `${base}${base.includes("?") ? "&" : "?"}${query}`;
+}
+
+function currentDeliveryInstructionMedia(mediaId) {
+  const targetId = String(mediaId || "").toLowerCase();
+  for (const order of currentJob?.deliveryInstructions?.orders || []) {
+    const media = (order?.media || []).find((item) => String(item?.id || "").toLowerCase() === targetId);
+    if (media) return media;
+  }
+  return null;
+}
+
+function renderDeliveryInstructionImageError(media) {
+  const mediaId = escapeHtml(String(media?.id || ""));
+  return `<article class="driver-instruction-media unavailable" data-instruction-media-id="${mediaId}"><strong>${t("driver.instructionImageFailed", "Image could not load")}</strong><span>${escapeHtml(media?.fileName || "")}</span><button class="secondary compact" data-action="retry-instruction-image" data-media-id="${mediaId}" type="button">${t("common.retry", "Retry")}</button></article>`;
+}
+
+function renderDeliveryInstructionMedia(media) {
+  const url = driverDeliveryInstructionMediaUrl(media);
+  const mediaId = escapeHtml(String(media?.id || ""));
+  if (media.mediaKind === "video") {
+    return navigator.onLine && url
+      ? `<article class="driver-instruction-media" data-instruction-media-id="${mediaId}"><video controls preload="metadata" referrerpolicy="no-referrer" src="${escapeHtml(url)}"></video><span>${escapeHtml(media.fileName || t("driver.deliveryVideo", "Delivery video"))}</span></article>`
+      : `<article class="driver-instruction-media unavailable" data-instruction-media-id="${mediaId}"><strong>${t("driver.instructionVideoOnline", "Video requires an internet connection")}</strong><span>${escapeHtml(media.fileName || "")}</span></article>`;
+  }
+  return url
+    ? `<article class="driver-instruction-media" data-instruction-media-id="${mediaId}"><a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer"><img data-instruction-media-image loading="eager" src="${escapeHtml(url)}" alt="${escapeHtml(media.fileName || t("driver.deliveryImage", "Delivery instruction image"))}" /></a><span>${escapeHtml(media.fileName || "")}</span></article>`
+    : navigator.onLine
+      ? `<article class="driver-instruction-media loading" data-instruction-media-id="${mediaId}"><strong>${t("driver.instructionImageLoading", "Loading instruction image...")}</strong><span>${escapeHtml(media.fileName || "")}</span></article>`
+      : `<article class="driver-instruction-media unavailable" data-instruction-media-id="${mediaId}"><strong>${t("driver.instructionImageUnavailable", "This image requires an internet connection")}</strong><span>${escapeHtml(media.fileName || "")}</span></article>`;
+}
+
+app.addEventListener("error", (event) => {
+  const image = event.target?.closest?.("[data-instruction-media-image]");
+  const card = image?.closest?.("[data-instruction-media-id]");
+  if (!card) return;
+  const media = currentDeliveryInstructionMedia(card.dataset.instructionMediaId);
+  if (media) card.outerHTML = renderDeliveryInstructionImageError(media);
+}, true);
+
+function renderDeliveryInstructionPage(job) {
+  if (job.stopType !== "dropoff") return "";
+  const instructions = job.deliveryInstructions || { revision: 0, orders: [] };
+  const orders = Array.isArray(instructions.orders) ? instructions.orders : [];
+  const hasContent = orders.some((order) =>
+    String(order?.automaticText || "").trim()
+    || String(order?.additionalText || "").trim()
+    || (order?.media || []).length
+  );
+  return `<section class="driver-delivery-instruction-page">
+    <div class="driver-instruction-heading"><div><span>${t("driver.dropoff", "Drop Off")}</span><h3>${t("driver.deliveryInstructions", "Delivery Instructions")}</h3></div><span>${orders.length} SO</span></div>
+    ${hasContent ? orders.map((order) => {
+      const media = Array.isArray(order.media) ? order.media : [];
+      const phones = Array.isArray(order.phones) ? order.phones : [];
+      const orderHasContent = String(order.automaticText || "").trim() || String(order.additionalText || "").trim() || media.length;
+      return `<article class="driver-instruction-order">
+        <div class="driver-instruction-order-head"><strong>${escapeHtml(order.orderRef || "Sales Order")}</strong>${order.customer ? `<span>${escapeHtml(order.customer)}</span>` : ""}</div>
+        ${orderHasContent ? `
+          ${order.automaticText ? `<p class="driver-delivery-instruction-text">${escapeHtml(order.automaticText)}</p>` : ""}
+          ${phones.length ? `<div class="driver-instruction-phones">${phones.map((phone) => `<a href="tel:${escapeHtml(phone.href)}">☎ ${escapeHtml(phone.display)}</a>`).join("")}</div>` : ""}
+          ${order.additionalText ? `<div class="driver-additional-instruction"><strong>${t("driver.additionalDeliveryText", "Additional instruction")}</strong><p class="driver-delivery-instruction-text">${escapeHtml(order.additionalText)}</p></div>` : ""}
+          ${media.length ? `<div class="driver-instruction-gallery">${media.map(renderDeliveryInstructionMedia).join("")}</div>` : ""}
+        ` : `<p class="driver-no-instructions">${t("driver.noDeliveryInstructions", "No delivery instructions")}</p>`}
+      </article>`;
+    }).join("") : `<div class="driver-no-instructions"><strong>${t("driver.noDeliveryInstructions", "No delivery instructions")}</strong></div>`}
+  </section>`;
+}
+
+function driverStopItemPages(job) {
+  return (job.orders || []).flatMap((order, orderIndex) => {
+    const items = Array.isArray(order.items) ? order.items : [];
+    const chunks = [];
+    if (!items.length) chunks.push([]);
+    for (let index = 0; index < items.length; index += ITEMS_PER_PAGE) chunks.push(items.slice(index, index + ITEMS_PER_PAGE));
+    return chunks.map((pageItems, chunkIndex) => ({ order, orderIndex, chunkIndex, pageItems }));
+  });
+}
+
+function renderDriverStopItemPage(page) {
+  const order = page.order || {};
+  return `<section class="order-card">
+    <div><h3>${escapeHtml(order.orderRef || t("driver.salesOrder", "Sales Order"))}</h3></div>
+    <div class="item-list">
+      ${page.pageItems.map((item) => `<div class="item-row">
+        <div class="item-main-row"><strong>${escapeHtml(item.itemName || item.sku || t("driver.item", "Item"))}</strong><div class="unit-row">${unitPills(item.units)}</div></div>
+        ${item.description ? `<span class="item-description">${escapeHtml(item.description)}</span>` : ""}
+      </div>`).join("") || `<div class="item-row"><strong>${t("driver.noItemDetail", "No item detail found in local DB")}</strong></div>`}
+    </div>
+  </section>`;
+}
+
+function renderStopDetails(job) {
+  if (job.stopType !== "dropoff") return renderOrders(job);
+  const itemPages = driverStopItemPages(job);
+  const totalPages = 1 + itemPages.length;
+  const key = `stop-detail:${job.jobId || job.stopId || "dropoff"}`;
+  const page = Math.min(Math.max(Number(orderPages[key] || 0), 0), totalPages - 1);
+  orderPages[key] = page;
+  return `<div class="stop-detail-page">
+    ${page === 0 ? renderDeliveryInstructionPage(job) : renderDriverStopItemPage(itemPages[page - 1])}
+    <div class="order-pager stop-detail-pager">
+      <button data-action="stop-detail-page" data-order-key="${escapeHtml(key)}" data-page="${page - 1}" ${page <= 0 ? "disabled" : ""} type="button">${t("common.previous", "Previous")}</button>
+      <span>${page + 1} / ${totalPages}</span>
+      <button data-action="stop-detail-page" data-order-key="${escapeHtml(key)}" data-page="${page + 1}" ${page >= totalPages - 1 ? "disabled" : ""} type="button">${t("common.next", "Next")}</button>
+    </div>
+  </div>`;
 }
 
 function renderLocationCheck(job) {
@@ -2652,7 +3251,7 @@ function renderJob() {
         <div><span>${t("driver.nextTruck", "Next truck")}</span><strong>${escapeHtml(job.nextTruckPlate || job.truckPlate || "-")}</strong></div>
         <p>${escapeHtml(job.instructions || t("driver.switchInstruction", "Park the current truck and confirm after entering the next truck."))}</p>
       </section>` : renderLocationCheck(job)}
-      ${isTravel || isTruckSwitch ? "" : isBin ? renderDriverBinSummary(job) : renderOrders(job)}
+      ${isTravel || isTruckSwitch ? "" : isBin ? renderDriverBinSummary(job) : renderStopDetails(job)}
       <div class="job-actions ${isTruckSwitch ? "truck-switch-job-actions" : ""}">
         ${isTruckSwitch
           ? `<div class="truck-switch-action-set">
@@ -2756,14 +3355,21 @@ function projectOfflineRoute(manifest, events) {
       && manifestGeneratedAt >= appliedAt
     ) continue;
     const job = jobsById.get(String(event.effectiveJobId || event.jobId || ""));
-    if (event.eventType === "job_started" && job) {
-      job.status = "in_progress";
-      job.startedAt = event.occurredAt;
+    const physicalVisitJobs = driverEventPhysicalVisitJobIds(event, manifest)
+      .map((jobId) => jobsById.get(jobId))
+      .filter(Boolean);
+    if (event.eventType === "job_started" && physicalVisitJobs.length) {
+      for (const visitJob of physicalVisitJobs) {
+        visitJob.status = "in_progress";
+        visitJob.startedAt = event.occurredAt;
+      }
       if (dutyEventNeedsReconciliation(event)) projectedPendingDuty.push(event);
     }
-    if (event.eventType === "job_completed" && job) {
-      job.status = "completed";
-      job.completedAt = event.occurredAt;
+    if (event.eventType === "job_completed" && physicalVisitJobs.length) {
+      for (const visitJob of physicalVisitJobs) {
+        visitJob.status = "completed";
+        visitJob.completedAt = event.occurredAt;
+      }
     }
     if (event.eventType === "truck_switched_physical" && job) {
       job.status = "completed";
@@ -3031,6 +3637,7 @@ async function saveDriverDayPlanPayload(payload, { activate: requestedActivation
     offlineManifestUpdateDeferred = true;
   }
   applyDriverActionProtectionGate();
+  if (activate && currentJob) void prepareDeliveryInstructionMedia(currentJob, { force: true });
   return { saved, activate };
 }
 
@@ -3686,6 +4293,9 @@ async function queueDriverEvent(eventType, {
         || (eventType === "job_completed" && Number(job?.requiredPhotos || 0) > 0),
       details: {
         ...details,
+        ...(["job_started", "job_completed"].includes(eventType)
+          ? { physicalVisitJobIds: driverPhysicalVisitJobIds(manifestJob || job) }
+          : {}),
         ...(locationVerificationId ? { locationVerificationId } : {})
       },
       photos: eventPhotos.filter(Boolean)
@@ -4195,6 +4805,38 @@ function eventTargetsCurrentDriver(event = {}) {
   return eventDriver === String(driver?.login || "").trim().toLowerCase();
 }
 
+function eventTargetsCurrentDeliveryInstruction(event = {}) {
+  if (event.type !== "delivery.instructions.updated" || currentJob?.stopType !== "dropoff") return false;
+  const orderRef = String(event.payload?.orderRef || "").trim().toLowerCase();
+  const orderId = String(event.payload?.orderId || "").trim();
+  return (currentJob.deliveryInstructions?.orders || []).some((order) =>
+    (orderRef && String(order?.orderRef || "").trim().toLowerCase() === orderRef)
+    || (orderId && String(order?.orderId || "") === orderId)
+  );
+}
+
+async function refreshCurrentDeliveryInstructions(event) {
+  if (!eventTargetsCurrentDeliveryInstruction(event) || !navigator.onLine) return false;
+  const jobId = String(currentJob?.jobId || "");
+  const result = await request(`/api/driver/jobs/${encodeURIComponent(jobId)}/delivery-instructions`);
+  if (!currentJob || String(currentJob.jobId || "") !== jobId) return false;
+  currentJob = {
+    ...currentJob,
+    deliveryInstructions: result.deliveryInstructions || { revision: 0, orders: [] }
+  };
+  const scrollContainer = app.querySelector(".driver-content");
+  const scrollTop = Number(scrollContainer?.scrollTop || 0);
+  const details = app.querySelector(".stop-detail-page");
+  if (details && !photoInteractionActive()) details.outerHTML = renderStopDetails(currentJob);
+  if (scrollContainer) scrollContainer.scrollTop = scrollTop;
+  void prepareDeliveryInstructionMedia(currentJob, { force: true });
+  if (driverOfflineModeEnabled && currentJob?.planDate) {
+    void downloadDayPlan(currentJob.planDate, { forceRefresh: true });
+  }
+  showToast(t("driver.deliveryInstructionsUpdated", "Delivery instructions updated"));
+  return true;
+}
+
 async function runLiveRefresh() {
   if (quietSyncActive()) {
     quietSyncRefreshQueued = true;
@@ -4290,11 +4932,20 @@ function connectEvents() {
       "dispatch.setup.updated",
       "driver.rest.started",
       "driver.rest.ended",
-      "delivery.order.loaded"
+      "delivery.order.loaded",
+      "delivery.instructions.updated"
     ].includes(event.type);
     if (!relevant || !driver) return;
     if (!eventTargetsCurrentDriver(event)) return;
     if (isQuietSyncEcho(event)) return;
+    if (event.type === "delivery.instructions.updated") {
+      try {
+        await refreshCurrentDeliveryInstructions(event);
+      } catch (error) {
+        if (eventTargetsCurrentDeliveryInstruction(event)) showToast(error.message);
+      }
+      return;
+    }
     if (event.type === "driver.offline.review.resolved") {
       void triggerOfflineSync();
       return;
@@ -4334,6 +4985,22 @@ app.addEventListener("click", async (event) => {
   const action = button.dataset.action;
   if (action === "reload-driver-pwa") {
     await reloadLatestDriverPwa(button);
+    return;
+  }
+  if (action === "repair-driver-pwa") {
+    await repairDriverAppCache(button);
+    return;
+  }
+  if (action === "retry-instruction-image") {
+    const mediaId = String(button.dataset.mediaId || "").toLowerCase();
+    const media = currentDeliveryInstructionMedia(mediaId);
+    if (!media || !navigator.onLine) return;
+    const cached = instructionMediaObjectUrls.get(mediaId);
+    if (cached?.url) URL.revokeObjectURL(cached.url);
+    instructionMediaObjectUrls.delete(mediaId);
+    instructionMediaRetryNonces.set(mediaId, String(Date.now()));
+    patchDriverInstructionMedia(media);
+    if (currentJob) void prepareDeliveryInstructionMedia(currentJob, { force: true });
     return;
   }
   if (driverPwaUpdateRequired) {
@@ -4421,6 +5088,10 @@ app.addEventListener("click", async (event) => {
     return;
   }
   if (action === "order-page") {
+    orderPages[button.dataset.orderKey] = Number(button.dataset.page || 0);
+    return renderJob();
+  }
+  if (action === "stop-detail-page") {
     orderPages[button.dataset.orderKey] = Number(button.dataset.page || 0);
     return renderJob();
   }
@@ -4535,31 +5206,19 @@ app.addEventListener("click", async (event) => {
   }
   if (action === "take-photo") {
     const input = app.querySelector(`input[data-photo-index="${button.dataset.photoIndex}"][data-photo-source="camera"]`);
-    if (input) {
-      beginPhotoCapture();
-      input.click();
-    }
+    launchPhotoPicker(input);
   }
   if (action === "choose-gallery-photo") {
     const input = app.querySelector(`input[data-photo-index="${button.dataset.photoIndex}"][data-photo-source="gallery"]`);
-    if (input) {
-      beginPhotoCapture();
-      input.click();
-    }
+    launchPhotoPicker(input);
   }
   if (action === "take-dvir-photo") {
     const input = app.querySelector(`input[data-dvir-photo-index="${button.dataset.dvirPhotoIndex}"][data-photo-source="camera"]`);
-    if (input) {
-      beginPhotoCapture();
-      input.click();
-    }
+    launchPhotoPicker(input);
   }
   if (action === "choose-dvir-gallery-photo") {
     const input = app.querySelector(`input[data-dvir-photo-index="${button.dataset.dvirPhotoIndex}"][data-photo-source="gallery"]`);
-    if (input) {
-      beginPhotoCapture();
-      input.click();
-    }
+    launchPhotoPicker(input);
   }
   if (action === "add-job-photo") {
     photos.push("");
@@ -5194,26 +5853,29 @@ app.addEventListener("change", async (event) => {
   beginPhotoCapture();
   try {
     if (!file) return;
-    if (!(await prepareOfflineRecord())) return;
     const isDvir = Boolean(dvirInput);
     const index = Number((isDvir ? dvirInput.dataset.dvirPhotoIndex : input.dataset.photoIndex) || 0);
+    const captureDvirMode = dvirMode || "pre";
+    if (!(await prepareOfflineRecord())) return;
     const capturePartitionKey = driverOfflineModeEnabled
       ? (offlinePartition?.partitionKey || "")
       : "";
     const captureJobId = String(currentJob?.jobId || "");
-    const captureDvirMode = dvirMode || "pre";
     const captureDraftKey = currentPhotoDraftKey(
       isDvir ? "dvir" : "job",
       isDvir ? captureDvirMode : ""
     );
     const existingPhoto = (isDvir ? dvirPhotos : photos)[index];
+    const offlineCapture = driverOfflineModeEnabled && offlineStorageAvailable && capturePartitionKey
+      ? await prepareOfflinePhotoCapture({ isDvir, index, existingPhoto, evictOptional: true })
+      : { capturePolicy: {}, admission: {} };
     const recordType = isDvir
       ? (captureDvirMode === "post" ? "driver-dvir-post-photo" : "driver-dvir-pre-photo")
       : currentJob?.stopType === "pickup"
         ? "driver-pickup-photo"
         : currentJob?.stopType === "dropoff"
-          ? "driver-dropoff-photo"
-          : "driver-stop-photo";
+        ? "driver-dropoff-photo"
+        : "driver-stop-photo";
     app.classList.add("photo-processing");
     let captured;
     if (driverOfflineModeEnabled && offlineStorageAvailable && capturePartitionKey) {
@@ -5223,7 +5885,9 @@ app.addEventListener("change", async (event) => {
         draftKey: captureDraftKey,
         ordinal: index,
         recordType,
-        existingPhoto
+        existingPhoto,
+        capturePolicy: offlineCapture.capturePolicy,
+        admission: offlineCapture.admission
       });
     } else {
       const compressed = await window.DriverOfflinePhotos.compress(file);
@@ -5505,6 +6169,7 @@ offlineStatus?.addEventListener("click", async (event) => {
   }
   if (button.dataset.offlineAction === "sync") return triggerOfflineSync({ userInitiated: true });
   if (button.dataset.offlineAction === "persist") return requestPersistentStorage({ userInitiated: true });
+  if (button.dataset.offlineAction === "repair-cache") return repairDriverAppCache(button);
   if (button.dataset.offlineAction === "clear") return clearSavedRouteCache();
 });
 
@@ -5621,7 +6286,7 @@ if ("serviceWorker" in navigator) {
     window.setTimeout(requestDriverWorkerVersion, 0);
     window.setTimeout(publishDriverOfflineMode, 0);
   });
-  navigator.serviceWorker.register("/driver-service-worker.js", {
+  navigator.serviceWorker.register("/driver-service-worker.js?v=20260812-driver-pwa-v3", {
     scope: "/driver",
     updateViaCache: "none"
   })
@@ -5645,8 +6310,8 @@ if ("serviceWorker" in navigator) {
       registration.addEventListener("updatefound", () => {
         observeInstallingWorker(registration.installing);
       });
-      requestDriverWorkerVersion();
-      publishDriverOfflineMode();
+          requestDriverWorkerVersion();
+          publishDriverOfflineMode();
       void registration.update().catch(() => {});
       renderOfflineStatus();
       applyDriverActionProtectionGate();

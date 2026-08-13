@@ -8,8 +8,10 @@ const read = (path) => fs.readFileSync(new URL(path, root), "utf8");
 
 const migration = read("migrations/098_smart_scm_vendor_workflows.sql");
 const emailRecipientMigration = read("migrations/100_smart_scm_vendor_email_recipient.sql");
+const vendorPriceMigration = read("migrations/156_scm_vendor_item_price.sql");
 const repository = read("src/smart-scm-vendor-workflow-repository.js");
 const vendorCodeService = read("src/smart-scm-vendor-code-service.js");
+const netsuite = read("src/netsuite.js");
 const server = read("src/server.js");
 const ui = read("public/scm-smart-vendor.js");
 const css = read("public/scm-smart-vendor.css");
@@ -36,6 +38,14 @@ assert.match(vendorCodeService, /\$3::bigint = 0 OR subsidiary_id IN \(0, \$3\)/
   "An omitted subsidiary must read authoritative codes stored for real NetSuite subsidiaries.");
 assert.match(vendorCodeService, /WHEN \$3 > 0 AND subsidiary_id = \$3 THEN 0[\s\S]*source = 'item_vendor'[\s\S]*preferred_vendor DESC/,
   "Vendor codes must prefer an exact requested subsidiary, then authoritative and preferred Item Vendor rows.");
+assert.match(vendorPriceMigration, /ADD COLUMN IF NOT EXISTS vendor_price numeric/i);
+assert.match(vendorPriceMigration, /ADD COLUMN IF NOT EXISTS vendor_price_synced_at timestamptz/i);
+assert.match(netsuite, /iv\.purchaseprice AS vendor_price/,
+  "Vendor Replies must read the exact Item Vendor purchase price alongside the vendor code.");
+assert.match(vendorCodeService, /vendor_price_synced_at/,
+  "Cached Item Vendor prices must distinguish an unchecked legacy row from a checked empty price.");
+assert.match(repository, /vendorPrice: code\.vendorPrice/,
+  "The selected Item Vendor price must reach Vendor Replies financial metadata.");
 
 const grouped = groupSmartScmVendorEmailRows([
   { id: 1, itemId: 24023, itemName: "TH-COV60T-3045-BEI", itemDescription: "Beige coping", proposedPallets: 3, destinationLocationId: 1 },

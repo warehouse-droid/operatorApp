@@ -3,8 +3,10 @@ import { readFile } from "node:fs/promises";
 
 const moduleUrl = new URL("./sales-order-reconciliation.js", import.meta.url);
 const scmModuleUrl = new URL("./scm-reconciliation.js", import.meta.url);
+const repositoryModuleUrl = new URL("./sales-order-reconciliation-repository.js", import.meta.url);
 const original = await readFile(moduleUrl, "utf8");
 const scmOriginal = await readFile(scmModuleUrl, "utf8");
+const repositoryOriginal = await readFile(repositoryModuleUrl, "utf8");
 const relativeScmImport = 'from "./scm-reconciliation.js";';
 
 function importSalesOrderMutant(source, name) {
@@ -208,8 +210,68 @@ for (const mutation of groupedSalesOrderMutations) {
 assert.equal(killedGroupedSalesOrderMutations, groupedSalesOrderMutations.length,
   "Every grouped SO reconciliation mutant must be killed.");
 
+function repositorySourceIsolationContract(source) {
+  const mappingStart = source.indexOf("export function mappedAuthoritativeSalesOrderLine");
+  const mappingEnd = source.indexOf("export async function salesOrderFamilyIdentity", mappingStart);
+  const reconcileStart = source.indexOf("export async function reconcileSalesOrderFromNetSuite");
+  if (mappingStart < 0 || mappingEnd <= mappingStart || reconcileStart < 0) {
+    return false;
+  }
+  const mapping = source.slice(mappingStart, mappingEnd);
+  const reconcile = source.slice(reconcileStart);
+  return reconcile.includes("const sourceLines = Array.isArray(order.lines) ? order.lines : [];")
+    && reconcile.includes("if (!sourceLines.length)")
+    && reconcile.includes("new Set(sourceLineIds).size !== sourceLineIds.length")
+    && mapping.includes("pallet_qty: palletQty,")
+    && mapping.includes("layer_qty: layerQty,")
+    && mapping.includes("pack_quantity_source:")
+    && reconcile.includes("await persistSalesOrderCalculation({")
+    && !reconcile.includes("syncAuthoritativeSalesOrderSource")
+    && !reconcile.includes("upsertSalesOrder")
+    && !reconcile.includes("markMissingOutboundOrderLines")
+    && !reconcile.includes("SET fulfillment_status =");
+}
+
+assert.equal(repositorySourceIsolationContract(repositoryOriginal), true,
+  "The repository must keep source synchronization isolated from calculation writes.");
+const repositoryIsolationMutations = [
+  {
+    name: "source-sync canonical Sales Order rows from the calculation path",
+    from: "let planCleanup = { changedPlans: [], deferred: false, familyRefs: family.familyRefs };",
+    to: "await upsertSalesOrders([mappedSalesOrderHeader(order)]);\n    let planCleanup = { changedPlans: [], deferred: false, familyRefs: family.familyRefs };"
+  },
+  {
+    name: "deactivate canonical lines from the calculation subset",
+    from: "let planCleanup = { changedPlans: [], deferred: false, familyRefs: family.familyRefs };",
+    to: "await markMissingOutboundOrderLines(orderId, inventoryLines.map((line) => line.sourceLineKey));\n    let planCleanup = { changedPlans: [], deferred: false, familyRefs: family.familyRefs };"
+  },
+  {
+    name: "allow an incomplete authoritative response to deactivate every source line",
+    from: "if (!sourceLines.length)",
+    to: "if (sourceLines.length < 0)"
+  },
+  {
+    name: "discard authoritative pallet quantities",
+    from: "pallet_qty: palletQty,",
+    to: "pallet_qty: mapped.pallet_qty,"
+  },
+  {
+    name: "write calculated fulfillment into the canonical Sales Order field",
+    from: "let planCleanup = { changedPlans: [], deferred: false, familyRefs: family.familyRefs };",
+    to: "await query(`UPDATE sales_orders SET fulfillment_status = 'fulfilled' WHERE netsuite_id = $1`, [orderId]);\n    let planCleanup = { changedPlans: [], deferred: false, familyRefs: family.familyRefs };"
+  }
+];
+let killedRepositoryIsolationMutations = 0;
+for (const mutation of repositoryIsolationMutations) {
+  const source = repositoryOriginal.replace(mutation.from, mutation.to);
+  assert.notEqual(source, repositoryOriginal, `Mutation target is missing: ${mutation.name}.`);
+  if (!repositorySourceIsolationContract(source)) killedRepositoryIsolationMutations += 1;
+}
+assert.equal(killedRepositoryIsolationMutations, repositoryIsolationMutations.length,
+  "Every Sales Order source-isolation mutant must be killed.");
+
 console.log(
   "Sales-order reconciliation mutation harness passed; "
-  + `${policyMutations.length + groupedScmMutations.length + groupedSalesOrderMutations.length + 1}`
-  + `/${policyMutations.length + groupedScmMutations.length + groupedSalesOrderMutations.length + 1} mutants killed.`
+  + `${policyMutations.length + groupedScmMutations.length + groupedSalesOrderMutations.length + repositoryIsolationMutations.length + 1}`
+  + `/${policyMutations.length + groupedScmMutations.length + groupedSalesOrderMutations.length + repositoryIsolationMutations.length + 1} mutants killed.`
 );

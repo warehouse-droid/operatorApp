@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { pool, query } from "./db.js";
 import { config } from "./config.js";
+import { deriveMemoDeliveryInstruction } from "./delivery-instruction-domain.js";
 
 const YARD_ADDRESSES = {
   "3445": "3445 Kennedy Road, Toronto, ON",
@@ -1274,6 +1275,8 @@ async function parsePurchaseYardWithOllama({ vendor, memo, candidates, sourceRef
 
 export async function enrichSalesOrderDispatch(order) {
   const memo = order.memo || order.note || order.notes || "";
+  const automaticInstruction = deriveMemoDeliveryInstruction(memo);
+  const instructionParsedAt = new Date().toISOString();
   const parserRules = await parserConfig();
   const labeled = extractLabeledDispatchFields(memo, parserRules);
   const relativeDate = parseRelativeDeliveryDate(memo, order.trandate || order.datecreated || order.createddate);
@@ -1283,9 +1286,12 @@ export async function enrichSalesOrderDispatch(order) {
     expected_delivery_date: labeled.deliveryDate || relativeDate || "",
     dispatch_window_start: labeled.windowStart || "",
     dispatch_window_end: labeled.windowEnd || "",
-    dispatch_instructions: labeled.instructions || memo,
+    dispatch_instructions: automaticInstruction.text,
     dispatch_parse_source: fallbackAddress || labeled.deliveryDate || relativeDate || labeled.windowStart || labeled.instructions ? "label-parser" : "ollama-unparsed",
-    dispatch_note_hash: hashText(memo)
+    dispatch_note_hash: hashText(memo),
+    dispatch_instruction_details: automaticInstruction,
+    dispatch_instruction_parse_version: 2,
+    dispatch_instruction_parsed_at: instructionParsedAt
   };
   if (labeled.deliveryAddress || labeled.deliveryDate || labeled.windowStart || labeled.windowEnd) return fallback;
   const parsed = await parseSalesOrderWithOllama(memo, { sourceRef: order.tranid || order.id || "" });
@@ -1296,9 +1302,12 @@ export async function enrichSalesOrderDispatch(order) {
     expected_delivery_date: fallback.expected_delivery_date || parsedDate,
     dispatch_window_start: parsed.windowStart || fallback.dispatch_window_start,
     dispatch_window_end: parsed.windowEnd || fallback.dispatch_window_end,
-    dispatch_instructions: parsed.instructions || fallback.dispatch_instructions,
+    dispatch_instructions: automaticInstruction.text,
     dispatch_parse_source: `ollama:${config.ollama.model}`,
-    dispatch_note_hash: fallback.dispatch_note_hash
+    dispatch_note_hash: fallback.dispatch_note_hash,
+    dispatch_instruction_details: automaticInstruction,
+    dispatch_instruction_parse_version: 2,
+    dispatch_instruction_parsed_at: instructionParsedAt
   };
 }
 

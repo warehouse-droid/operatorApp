@@ -1,0 +1,101 @@
+name: Driver PWA Offline Stress
+
+on:
+  pull_request:
+    branches: [main, dockerVer]
+    paths:
+      - "server/public/driver*.js"
+      - "server/public/driver*.html"
+      - "server/src/driver-offline-*.js"
+      - "server/test/driver-offline-stress/**"
+      - "server/test/support/*driver-offline-stress*"
+      - "server/tools/driver-offline-stress-*"
+      - "server/Dockerfile.test"
+      - "server/eslint.driver-offline-stress.config.js"
+      - "server/package*.json"
+      - "docker-compose.mbt-test.yml"
+      - ".github/workflows/driver-offline-stress.yml"
+  schedule:
+    - cron: "17 4 * * *"
+    - cron: "23 1 * * 0"
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "Stress gate to run"
+        required: true
+        default: full
+        type: choice
+        options: [smoke, full, soak]
+
+permissions:
+  contents: read
+
+jobs:
+  selection:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      suite: ${{ steps.selection.outputs.suite }}
+    steps:
+      - name: Select PR, nightly, or manual gate
+        id: selection
+        shell: bash
+        env:
+          REQUESTED_SUITE: ${{ inputs.suite }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          set -Eeuo pipefail
+          case "${GITHUB_EVENT_NAME}" in
+            pull_request) suite=smoke ;;
+            schedule)
+              if [[ "${EVENT_SCHEDULE}" == "23 1 * * 0" ]]; then
+                suite=soak
+              else
+                suite=full
+              fi
+              ;;
+            workflow_dispatch) suite="${REQUESTED_SUITE}" ;;
+            *) exit 64 ;;
+          esac
+          case "${suite}" in smoke|full|soak) ;; *) exit 64 ;; esac
+          echo "suite=${suite}" >> "${GITHUB_OUTPUT}"
+
+  campaign:
+    needs: selection
+    if: ${{ needs.selection.outputs.suite != 'soak' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false # secret-scan: allow
+      - name: Execute isolated Driver offline campaign
+        run: bash server/tools/driver-offline-stress-gauntlet.sh "${{ needs.selection.outputs.suite }}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: ${{ always() }}
+        with:
+          name: driver-offline-stress-${{ needs.selection.outputs.suite }}-${{ github.run_id }}
+          path: server/test-artifacts/driver-offline-stress/
+          if-no-files-found: error
+          retention-days: 30
+
+  soak:
+    needs: selection
+    if: ${{ needs.selection.outputs.suite == 'soak' }}
+    runs-on: [self-hosted, linux, x64, driver-offline-soak]
+    timeout-minutes: 600
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false # secret-scan: allow
+      - name: Execute continuous 8-hour soak and 30-minute stable drain
+        run: bash server/tools/driver-offline-stress-gauntlet.sh soak
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: ${{ always() }}
+        with:
+          name: driver-offline-stress-soak-${{ github.run_id }}
+          path: server/test-artifacts/driver-offline-stress/
+          if-no-files-found: error
+          retention-days: 30

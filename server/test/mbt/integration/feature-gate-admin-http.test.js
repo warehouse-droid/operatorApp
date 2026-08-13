@@ -4,8 +4,13 @@ import test, { after, before } from "node:test";
 
 import { createOperator } from "../../../src/auth-repository.js";
 import { closeDb, query } from "../../../src/db.js";
+import {
+  DRIVER_PWA_CURRENT_VERSION,
+  DRIVER_PWA_VERSION_HEADER
+} from "../../../src/driver-client-version.js";
 import { getDriverYardDependencyMode } from "../../../src/driver-yard-dependency-mode.js";
 import { app } from "../../../src/server.js";
+import { getSalesStockRequestAvailabilityPolicy } from "../../../src/stock-request-policy.js";
 
 const RUN_ID = crypto.randomUUID().replaceAll("-", "");
 const LOGIN_PHRASE = "mbt-gate-admin-http";
@@ -16,6 +21,7 @@ const USERS = Object.freeze({
 const EXPECTED_FLAGS = Object.freeze([
   "driver_offline_mode",
   "driver_yard_dependency_soft_mode",
+  "sales_stock_request_over_availability",
   "mbt_enabled",
   "mbt_master_data",
   "mbt_asset_management",
@@ -205,11 +211,26 @@ test("P3-F29 Admin gate commands are audited, revision-guarded, idempotent, and 
 });
 
 test("Admin independently controls the Driver PWA offline mode advertised to devices", async () => {
+  const currentClientHeaders = {
+    [DRIVER_PWA_VERSION_HEADER]: DRIVER_PWA_CURRENT_VERSION
+  };
   const initial = await request("/api/mbt/config/gates", { token: tokens.get("admin") });
   assert.equal(initial.response.status, 200, JSON.stringify(initial.payload));
   const original = gate(initial.payload, "driver_offline_mode");
   assert.equal(original.configured, false);
   assert.equal(original.effective, false);
+
+  const advertisedInitial = await request("/api/driver/client-version", {
+    headers: currentClientHeaders
+  });
+  assert.equal(advertisedInitial.response.status, 200, JSON.stringify(advertisedInitial.payload));
+  assert.equal(advertisedInitial.payload.currentVersion, DRIVER_PWA_CURRENT_VERSION);
+  assert.equal(advertisedInitial.payload.minimumVersion, DRIVER_PWA_CURRENT_VERSION);
+  assert.equal(advertisedInitial.payload.isCurrent, true);
+  assert.equal(advertisedInitial.payload.updateRequired, false);
+  assert.equal(advertisedInitial.payload.reopenRequired, false);
+  assert.equal(advertisedInitial.payload.offlineEnabled, false);
+  assert.equal(advertisedInitial.payload.offlineModeRevision, original.revision);
 
   const enabled = await request("/api/mbt/config/gates/driver_offline_mode", {
     token: tokens.get("admin"),
@@ -224,8 +245,15 @@ test("Admin independently controls the Driver PWA offline mode advertised to dev
   assert.equal(enabled.response.status, 200, JSON.stringify(enabled.payload));
   assert.equal(enabled.payload.flag.enabled, true);
 
-  const advertisedEnabled = await request("/api/driver/client-version");
+  const advertisedEnabled = await request("/api/driver/client-version", {
+    headers: currentClientHeaders
+  });
   assert.equal(advertisedEnabled.response.status, 200, JSON.stringify(advertisedEnabled.payload));
+  assert.equal(advertisedEnabled.payload.currentVersion, DRIVER_PWA_CURRENT_VERSION);
+  assert.equal(advertisedEnabled.payload.minimumVersion, DRIVER_PWA_CURRENT_VERSION);
+  assert.equal(advertisedEnabled.payload.isCurrent, true);
+  assert.equal(advertisedEnabled.payload.updateRequired, false);
+  assert.equal(advertisedEnabled.payload.reopenRequired, false);
   assert.equal(advertisedEnabled.payload.offlineEnabled, true);
   assert.equal(advertisedEnabled.payload.offlineModeRevision, enabled.payload.flag.revision);
 
@@ -242,8 +270,15 @@ test("Admin independently controls the Driver PWA offline mode advertised to dev
   assert.equal(disabled.response.status, 200, JSON.stringify(disabled.payload));
   assert.equal(disabled.payload.flag.enabled, false);
 
-  const advertisedDisabled = await request("/api/driver/client-version");
+  const advertisedDisabled = await request("/api/driver/client-version", {
+    headers: currentClientHeaders
+  });
   assert.equal(advertisedDisabled.response.status, 200, JSON.stringify(advertisedDisabled.payload));
+  assert.equal(advertisedDisabled.payload.currentVersion, DRIVER_PWA_CURRENT_VERSION);
+  assert.equal(advertisedDisabled.payload.minimumVersion, DRIVER_PWA_CURRENT_VERSION);
+  assert.equal(advertisedDisabled.payload.isCurrent, true);
+  assert.equal(advertisedDisabled.payload.updateRequired, false);
+  assert.equal(advertisedDisabled.payload.reopenRequired, false);
   assert.equal(advertisedDisabled.payload.offlineEnabled, false);
   assert.equal(advertisedDisabled.payload.offlineModeRevision, disabled.payload.flag.revision);
 });
@@ -314,6 +349,44 @@ test("Admin persists and audits the Driver yard-dependency Soft mode independent
     [[onKey, offKey]]
   );
   assert.deepEqual(evidence.rows[0], { audits: 2, receipts: 2 });
+});
+
+test("Admin independently controls Sales stock requests above yard availability", async () => {
+  const initial = await request("/api/mbt/config/gates", { token: tokens.get("admin") });
+  assert.equal(initial.response.status, 200, JSON.stringify(initial.payload));
+  const original = gate(initial.payload, "sales_stock_request_over_availability");
+  assert.equal(original.configured, false);
+  assert.equal((await getSalesStockRequestAvailabilityPolicy()).allowOverAvailability, false);
+
+  const enabled = await request("/api/mbt/config/gates/sales_stock_request_over_availability", {
+    token: tokens.get("admin"),
+    method: "PUT",
+    headers: { "idempotency-key": `sales-stock-over-availability-on-${RUN_ID}` },
+    body: {
+      enabled: true,
+      expectedRevision: original.revision,
+      reason: "Exercise Sales demand requests above current yard availability"
+    }
+  });
+  assert.equal(enabled.response.status, 200, JSON.stringify(enabled.payload));
+  assert.equal(enabled.payload.flag.enabled, true);
+  const enabledPolicy = await getSalesStockRequestAvailabilityPolicy();
+  assert.equal(enabledPolicy.allowOverAvailability, true);
+  assert.equal(enabledPolicy.revision, enabled.payload.flag.revision);
+  assert.match(enabledPolicy.updatedAt, /^\d{4}-\d{2}-\d{2}T/u);
+
+  const disabled = await request("/api/mbt/config/gates/sales_stock_request_over_availability", {
+    token: tokens.get("admin"),
+    method: "PUT",
+    headers: { "idempotency-key": `sales-stock-over-availability-off-${RUN_ID}` },
+    body: {
+      enabled: false,
+      expectedRevision: enabled.payload.flag.revision,
+      reason: "Restore bounded Sales stock requests after the isolated test"
+    }
+  });
+  assert.equal(disabled.response.status, 200, JSON.stringify(disabled.payload));
+  assert.equal((await getSalesStockRequestAvailabilityPolicy()).allowOverAvailability, false);
 });
 
 test("P3-F29 live customer sync and NetSuite posting cannot be enabled through Admin", async () => {

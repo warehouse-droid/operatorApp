@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
-const { monitorPlannedOrders } = await import("./server.js");
+const { monitorLoadForTruck, monitorPlannedOrders } = await import("./server.js");
 const { closeDb } = await import("./db.js");
 
 const plan = {
@@ -149,6 +149,36 @@ try {
   };
   assert.equal(monitorPlannedOrders(plan, [pickupComplete])[0].status, "in_progress");
 
+  const activeLoad = monitorLoadForTruck(plan, { plate: "SWITCH456" }, [pickupComplete]);
+  assert.ok(activeLoad, "A picked-up, undelivered load must be active on the assigned truck.");
+  assert.deepEqual(activeLoad.carryingOrderIds, ["SOA00001"]);
+  assert.deepEqual(
+    activeLoad.orders[0].items.map((item) => [item.lineId, item.itemName, item.quantity, item.unit]),
+    [["2", "Included line", 25.5, "SQFT"]],
+    "The onboard manifest must respect the drop's scoped item lines."
+  );
+  assert.deepEqual(activeLoad.nextStop, {
+    id: "D1",
+    sequence: 2,
+    type: "drop",
+    orderId: "SOA00001",
+    status: "pending",
+    location: "1 Customer Road",
+    routeDestination: "1 Customer Road"
+  });
+
+  const travelComplete = {
+    truck_plate: "SWITCH456",
+    load_id: "L1",
+    stop_id: "TRAVEL-L1",
+    stop_type: "travel",
+    status: "complete"
+  };
+  const beforePickup = monitorLoadForTruck(plan, { plate: "SWITCH456" }, [travelComplete]);
+  assert.ok(beforePickup, "A load can be active while travelling to its pickup.");
+  assert.deepEqual(beforePickup.carryingOrderIds, [], "Future pickup orders must not be described as currently onboard.");
+  assert.equal(beforePickup.nextStop.id, "P1");
+
   const dropComplete = {
     truck_plate: "SWITCH456",
     load_id: "L1",
@@ -162,6 +192,24 @@ try {
   assert.equal(completed.status, "complete");
   assert.equal(completed.actualStart, dropComplete.started_at);
   assert.equal(completed.actualEnd, dropComplete.completed_at);
+  assert.equal(monitorLoadForTruck(plan, { plate: "SWITCH456" }, [pickupComplete, dropComplete]), null);
+
+  const monitorCssSource = await readFile(new URL("../public/dispatch.css", import.meta.url), "utf8");
+  const monitorHtmlSource = await readFile(new URL("../public/dispatch-monitor.html", import.meta.url), "utf8");
+  assert.match(monitorClientSource, /function sortedMonitorTrucks\(\)/, "Active trucks need a stable active-first list ordering.");
+  assert.match(monitorClientSource, /function monitorCarryingManifestHtml\(load/, "Truck hover and map bubbles need the full onboard manifest.");
+  assert.match(monitorClientSource, /function showMonitorTruckTooltip\(card, event\)/, "Truck cards need a manifest hover window.");
+  assert.match(monitorClientSource, /new google\.maps\.DirectionsService\(\)/, "ETA should use the already configured Google Maps client.");
+  assert.match(monitorClientSource, /duration_in_traffic/, "ETA should prefer traffic-aware duration when Google returns it.");
+  assert.match(monitorClientSource, /ETA_CACHE_MS\s*=\s*2\s*\*\s*60\s*\*\s*1000/, "ETA routes must be throttled across the ten-second monitor refresh.");
+  assert.match(monitorCssSource, /\.monitor-grid\s*\{[\s\S]*grid-template-columns:\s*minmax\(360px,\s*\.8fr\)\s+minmax\(380px,\s*460px\)/, "The truck column should be wider while the map gives up width.");
+  assert.match(monitorCssSource, /\.monitor-info\s*\{[\s\S]*max-width:\s*420px/, "The map bubble must be wide enough for order lines.");
+  assert.match(monitorClientSource, /monitorInfoWindow\.setContent\(content\);[\s\S]*monitorInfoWindow\.open\(\{[\s\S]*anchor: marker,[\s\S]*map: monitorMap,[\s\S]*shouldFocus: false/, "Map bubbles must set their content before opening; content is not an InfoWindowOpenOptions field.");
+  assert.doesNotMatch(monitorClientSource, /monitorInfoWindow(?:\?\.)?\.open\(\{[\s\S]{0,180}content:/, "Map bubbles must never depend on an ignored content field passed to InfoWindow.open.");
+  assert.match(monitorClientSource, /let monitorInfoWindowPlate = "";/, "The open map bubble needs its own stable truck identity.");
+  assert.match(monitorClientSource, /if \(monitorInfoWindowPlate && monitorInfoWindow\)/, "An ETA refresh must update the actually open truck bubble, not a previously selected truck.");
+  assert.match(monitorClientSource, /const renderGeneration = \+\+monitorMapRenderGeneration;/, "Overlapping map refreshes must discard stale marker renders.");
+  assert.match(monitorHtmlSource, /dispatch-monitor\.js\?v=20260812-truck-bubble-v2/, "The truck-bubble repair must not be hidden by an old browser cache.");
 
   console.log("Dispatch monitor planned-order checks passed.");
 } finally {

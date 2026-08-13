@@ -3,9 +3,106 @@
 
   const MAX_EDGE = 2048;
   const SOFT_TARGET_BYTES = 1024 * 1024;
+  const PRESSURE_MAX_EDGE = 1600;
+  const PRESSURE_SOFT_TARGET_BYTES = 750 * 1024;
   const MAX_BYTES = 2 * 1024 * 1024;
-  const QUALITY_STEPS = [0.86, 0.78, 0.7, 0.62, 0.54, 0.45];
+  const MINIMUM_QUALITY = 0.6;
+  const EVIDENCE_RESERVE_RATIO = 0.1;
+  const BROWSER_PRESSURE_RATIO = 0.8;
+  const BROWSER_PRESSURE_RELIEF_RATIO = 0.75;
+  const BROWSER_MIN_FREE_BYTES = 64 * 1024 * 1024;
+  const QUALITY_STEPS = [0.86, 0.78, 0.7, 0.62, MINIMUM_QUALITY];
   const activeObjectUrls = new Map();
+
+  function nonNegativeInteger(value, fallback = 0) {
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 ? Math.floor(number) : fallback;
+  }
+
+  function capturePolicyForPressure({
+    retainedEvidenceBytes = 0,
+    remainingPhotoCount = 0,
+    optionalCacheBytes = 0,
+    browserUsageBytes = 0,
+    browserQuotaBytes = 0,
+    evidenceBudgetBytes = global.DriverOfflineDB?.MAX_EVIDENCE_BYTES || 250 * 1024 * 1024
+  } = {}) {
+    const retainedBytes = nonNegativeInteger(retainedEvidenceBytes);
+    const remainingCount = nonNegativeInteger(remainingPhotoCount);
+    const optionalBytes = nonNegativeInteger(optionalCacheBytes);
+    const usageBytes = nonNegativeInteger(browserUsageBytes);
+    const quotaBytes = nonNegativeInteger(browserQuotaBytes);
+    const evidenceBudget = Math.max(1, nonNegativeInteger(
+      evidenceBudgetBytes,
+      250 * 1024 * 1024
+    ));
+    const browserFreeBytes = quotaBytes > 0
+      ? Math.max(0, quotaBytes - usageBytes)
+      : evidenceBudget;
+    const availableWithoutEvictionBytes = Math.min(
+      evidenceBudget,
+      retainedBytes + browserFreeBytes
+    );
+    const availableBudgetBytes = Math.min(
+      evidenceBudget,
+      availableWithoutEvictionBytes + optionalBytes
+    );
+    const reserveBytes = Math.ceil(availableBudgetBytes * EVIDENCE_RESERVE_RATIO);
+    const normalRequiredBytes = retainedBytes + (remainingCount * SOFT_TARGET_BYTES) + reserveBytes;
+    const browserPressure = quotaBytes > 0
+      && (
+        usageBytes / quotaBytes >= BROWSER_PRESSURE_RATIO
+        || browserFreeBytes < BROWSER_MIN_FREE_BYTES
+      );
+    const pressure = browserPressure || normalRequiredBytes > availableBudgetBytes;
+    const maxEdge = pressure ? PRESSURE_MAX_EDGE : MAX_EDGE;
+    const targetBytes = pressure ? PRESSURE_SOFT_TARGET_BYTES : SOFT_TARGET_BYTES;
+    const requiredBytes = retainedBytes + (remainingCount * targetBytes) + reserveBytes;
+    const browserPressureReliefBytes = browserPressure
+      ? Math.max(
+        0,
+        usageBytes - Math.floor(quotaBytes * BROWSER_PRESSURE_RELIEF_RATIO),
+        BROWSER_MIN_FREE_BYTES - browserFreeBytes
+      )
+      : 0;
+    const optionalCacheEvictionBytes = Math.min(
+      optionalBytes,
+      Math.max(
+        browserPressureReliefBytes,
+        Math.max(0, requiredBytes - availableWithoutEvictionBytes)
+      )
+    );
+    return {
+      pressure,
+      maxEdge,
+      targetBytes,
+      minimumQuality: MINIMUM_QUALITY,
+      appliesTo: "new-captures-only",
+      allowed: requiredBytes <= availableBudgetBytes,
+      retainedEvidenceBytes: retainedBytes,
+      remainingPhotoCount: remainingCount,
+      optionalCacheBytes: optionalBytes,
+      optionalCacheEvictionBytes,
+      reserveBytes,
+      requiredBytes,
+      availableBudgetBytes,
+      availableWithoutEvictionBytes,
+      browserUsageBytes: usageBytes,
+      browserQuotaBytes: quotaBytes,
+      browserPressure
+    };
+  }
+
+  function normalizedCapturePolicy(policy = {}) {
+    const pressure = policy?.pressure === true;
+    return {
+      pressure,
+      maxEdge: pressure ? PRESSURE_MAX_EDGE : MAX_EDGE,
+      targetBytes: pressure ? PRESSURE_SOFT_TARGET_BYTES : SOFT_TARGET_BYTES,
+      minimumQuality: MINIMUM_QUALITY,
+      appliesTo: "new-captures-only"
+    };
+  }
 
   function binaryBuffer(value) {
     if (value instanceof ArrayBuffer) return value;
@@ -169,10 +266,10 @@
     return null;
   }
 
-  async function retainSmallJpeg(blobBytes, mimeType) {
+  async function retainSmallJpeg(blobBytes, mimeType, policy) {
     if (!/^image\/jpe?g$/iu.test(String(mimeType || "")) || blobBytes.byteLength > MAX_BYTES) return null;
     const dimensions = jpegDimensions(blobBytes);
-    if (!dimensions || Math.max(dimensions.width, dimensions.height) > MAX_EDGE) return null;
+    if (!dimensions || Math.max(dimensions.width, dimensions.height) > policy.maxEdge) return null;
     const blob = new Blob([blobBytes], { type: "image/jpeg" });
     return {
       blob,
@@ -199,25 +296,27 @@
     };
   }
 
-  async function compress(file) {
+  async function compress(file, requestedPolicy = {}) {
     if (!(file instanceof Blob) || !file.size) throw new Error("Choose a valid photo.");
+    const policy = normalizedCapturePolicy(requestedPolicy);
     const inputBytes = await readPhotoBytes(file);
     const mimeType = String(file.type || "image/jpeg");
     let decoded;
     try {
       decoded = await decodeImage(inputBytes, mimeType);
     } catch (error) {
-      const retained = await retainSmallJpeg(inputBytes, mimeType);
+      const retained = await retainSmallJpeg(inputBytes, mimeType, policy);
       if (retained) return retained;
       throw error;
     }
     try {
       if (!decoded.width || !decoded.height) throw new Error("This photo has invalid dimensions.");
-      let scale = Math.min(1, MAX_EDGE / Math.max(decoded.width, decoded.height));
+      let scale = Math.min(1, policy.maxEdge / Math.max(decoded.width, decoded.height));
       let width = Math.max(1, Math.round(decoded.width * scale));
       let height = Math.max(1, Math.round(decoded.height * scale));
       let hardLimitFallback = null;
-      for (let resizeAttempt = 0; resizeAttempt < 9; resizeAttempt += 1) {
+      const resizeAttempts = policy.pressure ? 1 : 9;
+      for (let resizeAttempt = 0; resizeAttempt < resizeAttempts; resizeAttempt += 1) {
         const canvas = document.createElement("canvas");
         canvas.width = width;
         canvas.height = height;
@@ -226,10 +325,10 @@
         context.fillStyle = "#fff";
         context.fillRect(0, 0, width, height);
         decoded.draw(context, width, height);
-        for (const quality of QUALITY_STEPS) {
+        for (const quality of QUALITY_STEPS.filter((value) => value >= policy.minimumQuality)) {
           const blob = await canvasToBlob(canvas, quality);
           const candidate = await compressedCandidate(blob, width, height, quality);
-          if (candidate.byteSize <= SOFT_TARGET_BYTES) {
+          if (candidate.byteSize <= policy.targetBytes) {
             return {
               ...candidate,
               sha256: await global.DriverPhotoHash.sha256(candidate.blobBytes)
@@ -280,15 +379,25 @@
     return { ...record, objectUrl };
   }
 
-  async function captureAndStore({ file, partitionKey, draftKey, ordinal, recordType, existingPhoto = null }) {
-    const compressed = await compress(file);
+  async function captureAndStore({
+    file,
+    partitionKey,
+    draftKey,
+    ordinal,
+    recordType,
+    existingPhoto = null,
+    capturePolicy = {},
+    admission = {}
+  }) {
+    const compressed = await compress(file, capturePolicy);
     const saved = await global.DriverOfflineDB.saveDraftPhoto(partitionKey, draftKey, {
       photoId: global.DriverOfflineDB.createUuid(),
       ordinal: Number(ordinal || 0),
       recordType,
       ...compressed
     }, {
-      replacePhotoId: existingPhoto?.photoId || ""
+      replacePhotoId: existingPhoto?.photoId || "",
+      ...admission
     });
     if (existingPhoto?.photoId && existingPhoto.photoId !== saved.photoId) revokePhoto(existingPhoto);
     return hydrate(saved);
@@ -315,7 +424,11 @@
   global.DriverOfflinePhotos = {
     MAX_EDGE,
     SOFT_TARGET_BYTES,
+    PRESSURE_MAX_EDGE,
+    PRESSURE_SOFT_TARGET_BYTES,
     MAX_BYTES,
+    MINIMUM_QUALITY,
+    capturePolicyForPressure,
     compress,
     captureAndStore,
     hydrate,

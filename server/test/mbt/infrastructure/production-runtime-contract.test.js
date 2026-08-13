@@ -13,7 +13,8 @@ const FROZEN_PRODUCTION_ROOTS = Object.freeze({
   exceljs: "^4.4.0",
   express: "^4.19.2",
   pg: "^8.11.5",
-  "qr-scanner": "^1.4.2"
+  "qr-scanner": "^1.4.2",
+  sharp: "0.35.3"
 });
 
 test("quality non-regression: production roots stay frozen and security patches are explicit", async () => {

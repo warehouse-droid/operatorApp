@@ -1,4 +1,4 @@
-import { query } from "./db.js";
+import { hasActiveTransaction, query } from "./db.js";
 import { salesStoreLocationIdSql } from "./sales-store.js";
 import { getActiveReloadCycleForOrder, listSalesOrderLoadAttempts } from "./sales-order-reload-repository.js";
 
@@ -33,6 +33,13 @@ function attemptsWithinDates(attempts, fromDate, toDate) {
     const key = dateKey(attempt.processedAt);
     return key && key >= fromDate && key <= toDate;
   });
+}
+
+async function runIndependentReads(reads) {
+  if (!hasActiveTransaction()) return Promise.all(reads.map((read) => read()));
+  const results = [];
+  for (const read of reads) results.push(await read());
+  return results;
 }
 
 function photoCountSql(arrayExpression, fallbackExpression = "''") {
@@ -84,7 +91,14 @@ function receivedSalesSql(alias, { hasSalesColumn = true } = {}) {
   END`;
 }
 
-function movementRecordsSql() {
+function activityWindowSql(expression, fromParam, toParam) {
+  if (!fromParam || !toParam) return "";
+  return `AND ${expression} >= $${fromParam}::date
+       AND ${expression} < ($${toParam}::date + interval '1 day')`;
+}
+
+function movementRecordsSql({ fromParam = null, toParam = null } = {}) {
+  const recordWindow = (alias) => activityWindowSql(`${alias}.created_at`, fromParam, toParam);
   return `
     SELECT 'outbound'::text AS direction,
            'sales_order'::text AS order_type,
@@ -103,6 +117,7 @@ function movementRecordsSql() {
       JOIN sales_orders o ON o.netsuite_id = r.order_id
      WHERE r.order_family = 'sales_order'
        AND r.load_type IN ('sales_order_delivery_load', 'customer_pickup_load')
+       ${recordWindow("r")}
     UNION ALL
     SELECT 'outbound', 'transfer_order', o.netsuite_id, o.tranid,
            CONCAT_WS(' → ', NULLIF(o.from_location, ''), NULLIF(o.to_location, '')),
@@ -114,6 +129,7 @@ function movementRecordsSql() {
       JOIN transfer_orders o ON o.netsuite_id = r.order_id
      WHERE r.order_family = 'transfer_order'
        AND r.load_type = 'transfer_order_load'
+       ${recordWindow("r")}
     UNION ALL
     SELECT 'outbound', 'vrma_order', o.id, o.vrma_ref,
            COALESCE(NULLIF(o.local_vendor, ''), o.vendor),
@@ -126,6 +142,7 @@ function movementRecordsSql() {
       JOIN scm_vrma_orders o ON o.id = r.order_id
      WHERE r.order_family = 'vrma_order'
        AND r.load_type = 'vrma_local_load'
+       ${recordWindow("r")}
     UNION ALL
     SELECT 'outbound', 'co_order', o.id, o.co_ref, o.source_order_ref,
            o.from_location_id, o.from_location, o.from_location, o.to_location,
@@ -137,6 +154,7 @@ function movementRecordsSql() {
         ON o.id = r.source_record_id
        AND r.source_table = 'local_co_orders'
      WHERE r.load_type = 'local_co_load'
+       ${recordWindow("r")}
     UNION ALL
     SELECT 'inbound', 'purchase_order', o.netsuite_id,
            COALESCE(NULLIF(o.dispatch_ref, ''), o.tranid), o.vendor,
@@ -148,6 +166,7 @@ function movementRecordsSql() {
       FROM receiving_receipt_records r
       JOIN purchase_orders o ON o.netsuite_id = r.order_id
      WHERE r.receipt_status <> 'failed'
+       ${recordWindow("r")}
     UNION ALL
     SELECT 'inbound', 'transfer_order', o.netsuite_id, o.tranid,
            CONCAT_WS(' → ', NULLIF(o.from_location, ''), NULLIF(o.to_location, '')),
@@ -158,6 +177,7 @@ function movementRecordsSql() {
       FROM receiving_receipt_records r
       JOIN transfer_orders o ON o.netsuite_id = r.order_id
      WHERE r.receipt_status <> 'failed'
+       ${recordWindow("r")}
     UNION ALL
     SELECT 'inbound', 'co_order', o.id, o.co_ref, o.source_order_ref,
            o.to_location_id, o.to_location, o.from_location, o.to_location,
@@ -166,11 +186,18 @@ function movementRecordsSql() {
            ${photoCountSql("r.photo_data_urls")}::int
       FROM local_co_receipt_records r
       JOIN local_co_orders o ON o.id = r.co_id
+     WHERE 1 = 1
+       ${recordWindow("r")}
   `;
 }
 
-function driverOrderCtes() {
+function driverOrderCtes({ fromParam = null, toParam = null } = {}) {
   const driverPhotoCount = photoCountSql("r.photo_data_urls");
+  const driverActivityAt = `CASE
+    WHEN r.status = 'complete' THEN COALESCE(r.completed_at, r.started_at, r.created_at)
+    ELSE COALESCE(r.started_at, r.created_at)
+  END`;
+  const driverWindow = activityWindowSql(driverActivityAt, fromParam, toParam);
   return [
     `driver_record_refs AS (
       SELECT r.id AS driver_record_id,
@@ -208,6 +235,7 @@ function driverOrderCtes() {
        WHERE r.stop_type IN ('pickup', 'dropoff')
          AND r.status IN ('in_progress', 'complete')
          AND BTRIM(ref.order_ref) <> ''
+         ${driverWindow}
     )`,
     `driver_order_matches AS (
       SELECT refs.*,
@@ -504,10 +532,16 @@ function movementPhotosSql() {
   `;
 }
 
-function movementCtes({ lines = true, photos = false, events = true } = {}) {
+function movementCtes({
+  lines = true,
+  photos = false,
+  events = true,
+  fromParam = null,
+  toParam = null
+} = {}) {
   const ctes = [
-    `movement_records AS (${movementRecordsSql()})`,
-    ...driverOrderCtes()
+    `movement_records AS (${movementRecordsSql({ fromParam, toParam })})`,
+    ...driverOrderCtes({ fromParam, toParam })
   ];
   if (events) ctes.push(`record_events AS (${recordEventsSql()})`);
   if (lines) ctes.push(`movement_lines AS (${movementLinesSql()})`);
@@ -521,6 +555,7 @@ function movementFilterParams({
   yard = "all",
   search = "",
   itemSearch = "",
+  driver = "all",
   direction = "",
   orderType = "",
   allowedYardLocationIds,
@@ -600,6 +635,11 @@ function movementFilterParams({
          )
     )`);
   }
+  const driverLogin = String(driver || "").trim();
+  if (driverLogin && driverLogin.toLowerCase() !== "all") {
+    params.push(driverLogin);
+    clauses.push(`LOWER(BTRIM(COALESCE(movement.driver_login, ''))) = LOWER(BTRIM($${params.length}))`);
+  }
   return { params, where: clauses.join("\n       AND "), fromDate, toDate };
 }
 
@@ -648,7 +688,7 @@ function movementSummaryColumns(alias = "movement") {
 export async function listYardMovements(filters = {}) {
   const { params, where } = movementFilterParams(filters);
   const result = await query(
-    `${movementCtes()},
+    `${movementCtes({ fromParam: 1, toParam: 2 })},
      matching_orders AS (
        SELECT DISTINCT movement.direction, movement.order_type, movement.order_id
          FROM record_events movement
@@ -706,7 +746,7 @@ export async function getYardMovementDetail({
     }
   }
   const orderResult = await query(
-    `${movementCtes({ lines: false })},
+    `${movementCtes({ lines: false, fromParam: 4, toParam: 5 })},
      matching_order AS (
        SELECT DISTINCT movement.direction, movement.order_type, movement.order_id
          FROM record_events movement
@@ -728,8 +768,9 @@ export async function getYardMovementDetail({
   );
   if (!orderResult.rowCount) return null;
 
-  const detailParams = [normalizedDirection, normalizedType, String(orderId || "")];
-  const lineResult = await query(
+  const identityParams = [normalizedDirection, normalizedType, String(orderId || "")];
+  const detailParams = [...identityParams, fromDate, toDate];
+  const readLines = () => query(
     `WITH movement_lines AS (${movementLinesSql()})
        SELECT *
          FROM movement_lines
@@ -737,20 +778,22 @@ export async function getYardMovementDetail({
           AND order_type = $2
           AND order_id::text = $3
         ORDER BY line_id NULLS LAST, id`,
-    detailParams
+    identityParams
   );
-  const photoResult = await query(
+  const readPhotos = () => query(
     `WITH movement_photos AS (${movementPhotosSql()})
        SELECT id, created_at, photo_data_url, response, source
          FROM movement_photos
         WHERE direction = $1
           AND order_type = $2
           AND order_id::text = $3
+          AND created_at >= $4::date
+          AND created_at < ($5::date + interval '1 day')
         ORDER BY created_at DESC, id DESC`,
     detailParams
   );
-  const driverResult = await query(
-    `${movementCtes({ lines: false, events: false })}
+  const readDriverRecords = () => query(
+    `${movementCtes({ lines: false, events: false, fromParam: 4, toParam: 5 })}
        SELECT event.driver_record_id AS id,
               event.job_id,
               event.plan_id,
@@ -789,8 +832,8 @@ export async function getYardMovementDetail({
                  event.driver_record_id DESC`,
     detailParams
   );
-  const driverPhotoResult = await query(
-    `${movementCtes({ lines: false, events: false })}
+  const readDriverPhotos = () => query(
+    `${movementCtes({ lines: false, events: false, fromParam: 4, toParam: 5 })}
        SELECT CONCAT(event.driver_record_id, ':', photo.photo_index) AS id,
               event.driver_record_id,
               COALESCE(event.completed_at, event.started_at, event.created_at) AS created_at,
@@ -819,12 +862,15 @@ export async function getYardMovementDetail({
   const isSalesOrderLoad = normalizedDirection === "outbound"
     && normalizedType === "sales_order"
     && /^\d+$/.test(String(orderId || ""));
-  const loadAttempts = isSalesOrderLoad
-    ? attemptsWithinDates(await listSalesOrderLoadAttempts(Number(orderId)), fromDate, toDate)
-    : [];
-  const activeReloadCycle = isSalesOrderLoad
-    ? await getActiveReloadCycleForOrder(Number(orderId))
-    : null;
+  const [lineResult, photoResult, driverResult, driverPhotoResult, allLoadAttempts, activeReloadCycle] = await runIndependentReads([
+    readLines,
+    readPhotos,
+    readDriverRecords,
+    readDriverPhotos,
+    () => (isSalesOrderLoad ? listSalesOrderLoadAttempts(Number(orderId)) : Promise.resolve([])),
+    () => (isSalesOrderLoad ? getActiveReloadCycleForOrder(Number(orderId)) : Promise.resolve(null))
+  ]);
+  const loadAttempts = attemptsWithinDates(allLoadAttempts, fromDate, toDate);
   return {
     order: orderResult.rows[0],
     lines: lineResult.rows,

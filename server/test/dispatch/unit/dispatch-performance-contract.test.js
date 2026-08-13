@@ -175,6 +175,52 @@ test("DP-29 a cancelled local CO cannot be resurrected by a grouped snapshot-der
   assert.deepEqual(active.pickupLocations, grouped.pickupLocations);
 });
 
+test("DP-29 cancelled CO cleanup preserves sparse legacy aliases and child-only reconciliation", () => {
+  const mapResult = clearCancelledTransitCoMetadata({
+    id: "SO-SPARSE-MAP",
+    transitCo: { id: "CO-SPARSE-MAP" },
+    pickupLocations: [],
+    poPickupManifest: [],
+    sourceYard: "legacy-source",
+    notes: null
+  }, new Map([["co-sparse-map", { fromYard: ":", toYard: "" }]]));
+
+  assert.equal(mapResult.transitCo, null);
+  assert.deepEqual(mapResult.pickupLocations, [":"]);
+  assert.equal(mapResult.sourceYard, ":");
+  assert.equal(mapResult.notes, "");
+  assert.equal(Object.hasOwn(mapResult, "childOrderDetails"), false);
+
+  const aliasResult = clearCancelledTransitCoMetadata({
+    id: "SO-ALIAS",
+    transitCo: { id: "CO-ALIAS", fromYard: "2967: source", toYard: "12441: destination" },
+    pickupLocations: ["12441: destination", "2967: source", "2967: duplicate"],
+    poPickupManifest: [{ location: "Vendor Yard" }, { location: "" }, null],
+    notes: "Transit via 12441. keep this note"
+  }, [{
+    co_ref: "CO-ALIAS",
+    from_location: "2967: fallback",
+    to_location: "12441: fallback"
+  }]);
+
+  assert.deepEqual(aliasResult.pickupLocations, ["2967: source", "Vendor Yard"]);
+  assert.equal(aliasResult.sourceYard, "2967: source");
+  assert.equal(aliasResult.notes, "keep this note");
+
+  const childOnly = clearCancelledTransitCoMetadata({
+    id: "GROUP-CHILD-ONLY",
+    childOrderDetails: [{
+      id: "SO-CHILD",
+      transitCo: { id: "CO-CHILD", fromYard: "3445", toYard: "150" },
+      pickupLocations: ["150"]
+    }]
+  }, [{ coRef: "CO-CHILD", fromYard: "3445", toYard: "150" }]);
+
+  assert.equal(childOnly.transitCo, undefined);
+  assert.equal(childOnly.childOrderDetails[0].transitCo, null);
+  assert.deepEqual(childOnly.childOrderDetails[0].pickupLocations, ["3445"]);
+});
+
 test("DP-06 exact command retries return the stored acknowledgement without a second revision or side effect", () => {
   const initial = planWithOrders(
     [order("A"), order("B"), order("C")],

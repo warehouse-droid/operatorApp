@@ -190,7 +190,7 @@ async function salesHydrateSecurePhotoImage(image) {
     const response = await fetch(`/api/photo-upload/preview?ref=${encodeURIComponent(ref)}`, {
       headers: dispatchAuthToken ? { Authorization: `Bearer ${dispatchAuthToken}` } : {},
       cache: "no-store",
-      credentials: "same-origin",
+      credentials: "same-origin", // secret-scan: allow - Fetch cookie mode, not credential material.
       signal: controller.signal
     });
     if (!response.ok) throw new Error(`Photo preview failed (${response.status})`);
@@ -301,6 +301,12 @@ function renderSalesMenu() {
       ${yards.length ? "" : `<div class="route-notice"><span>No Sales yards are assigned to this account. Ask an administrator to update Account Management.</span></div>`}
       <div class="dispatch-menu-grid">
         ${operator.publicSales ? "" : `
+          <button class="dispatch-menu-card primary-card" onclick="location.href='/sales/delivery-instructions'" type="button">
+            <strong>${salesT("deliveryInstruction.title", "Delivery Instructions")}</strong><span>${salesT("deliveryInstruction.menuHelp", "Add driver call-ahead, placement, image, and video instructions to retained Delivery Sales Orders.")}</span>
+          </button>
+          <button class="dispatch-menu-card primary-card" onclick="location.href='/sales/stock-requests'" type="button">
+            <strong>Request Stock</strong><span>Request regular stock from another yard, follow SCM decisions, Transfer Orders, dispatch, driver, and receiving progress.</span>
+          </button>
           <button class="dispatch-menu-card primary-card" onclick="location.href='/sales/returns'" type="button">
             <strong>Return Records</strong><span>Review your store's submitted stock and PALLET returns, photos, approval status, and estimated or actual credits.</span>
           </button>

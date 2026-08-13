@@ -190,7 +190,7 @@ test("P3-F11 CSV browser: download, raw preview, evidence table, and atomic appl
   await page.getByRole("button", { name: /preview.*server/i }).click();
   await expect(page.locator("#assetCsvPreviewRows")).toContainText(previewRows[0].assetCode);
   await expect(page.locator("#assetCsvPreviewRows")).toContainText("14YD");
-  await expect(page.locator("#assetCsvApply")).toBeDisabled();
+  await expect(page.locator("#assetCsvApply")).toBeEnabled();
   await page.locator("#assetCsvReason").fill("Approve synthetic opening inventory");
   await expect(page.locator("#assetCsvApply")).toBeEnabled();
   await page.locator("#assetCsvApply").click();

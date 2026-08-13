@@ -2,6 +2,8 @@ import { query, withTransaction } from "./db.js";
 import { writeAudit } from "./auth-repository.js";
 import { getSmartScmProposal } from "./smart-scm-planning-repository.js";
 import { resolveSmartScmVendorItemCodes } from "./smart-scm-vendor-code-service.js";
+import { smartScmVendorFinancialLine } from "./smart-scm-vendor-financials.js";
+import { overlaySmartScmVendorPoFinancials } from "./smart-scm-vendor-po-financials.js";
 
 const WORKFLOW_KINDS = new Set(["regular_po", "blanket_po"]);
 const EMAIL_TO_LIMIT = 1000;
@@ -352,7 +354,11 @@ async function itemMetadataForLines(lines = [], { vendorId = null } = {}) {
   const result = await query(
     `SELECT requested.item_id,
             COALESCE(item.item_name, policy.item_name) AS item_name,
-            COALESCE(item.item_description, policy.item_description) AS item_description
+            COALESCE(item.item_description, policy.item_description) AS item_description,
+            item.stock_unit,
+            item.purchase_unit,
+            item.last_purchase_price,
+            item.synced_at AS last_purchase_price_synced_at
        FROM unnest($1::bigint[]) AS requested(item_id)
        LEFT JOIN inventory_items item ON item.item_id = requested.item_id
        LEFT JOIN scm_smart_item_policies policy ON policy.item_id = requested.item_id`,
@@ -361,8 +367,16 @@ async function itemMetadataForLines(lines = [], { vendorId = null } = {}) {
   const metadata = new Map(result.rows.map((row) => [Number(row.item_id), {
     itemName: row.item_name,
     description: row.item_description,
+    stockUnit: row.stock_unit || null,
+    purchaseUnit: row.purchase_unit || null,
+    lastPurchasePrice: row.last_purchase_price === null || row.last_purchase_price === undefined
+      ? null
+      : Number(row.last_purchase_price),
+    lastPurchasePriceSyncedAt: row.last_purchase_price_synced_at || null,
     vendorCode: "",
-    vendorCodeSource: ""
+    vendorCodeSource: "",
+    vendorPrice: null,
+    vendorPriceSyncedAt: null
   }]));
   let lookupError = "";
   if (Number.isInteger(Number(vendorId)) && Number(vendorId) > 0) {
@@ -373,9 +387,15 @@ async function itemMetadataForLines(lines = [], { vendorId = null } = {}) {
         metadata.set(Number(code.itemId), {
           ...current,
           vendorCode: code.vendorCode || "",
-          vendorCodeSource: code.source || "item_vendor"
+          vendorCodeSource: code.source || "item_vendor",
+          vendorPrice: code.vendorPrice === null || code.vendorPrice === undefined
+            ? null
+            : Number(code.vendorPrice),
+          vendorPriceSyncedAt: code.vendorPriceSyncedAt || null
         });
       }
+      const refreshError = codes.find((code) => code.refreshError)?.refreshError;
+      if (refreshError) lookupError = text(refreshError);
     } catch (error) {
       lookupError = text(error?.message || error);
     }
@@ -383,6 +403,31 @@ async function itemMetadataForLines(lines = [], { vendorId = null } = {}) {
     lookupError = "The load does not resolve to one NetSuite vendor; vendor codes can be entered manually.";
   }
   return { metadata, lookupError };
+}
+
+async function purchaseOrderFinancialLinesByOrderIds(orderIds = []) {
+  const ids = [...new Set((orderIds || []).map(Number)
+    .filter((id) => Number.isInteger(id) && id > 0))];
+  const byOrderId = new Map(ids.map((id) => [id, []]));
+  if (!ids.length) return byOrderId;
+  const result = await query(
+    `SELECT purchase_order_id AS "purchaseOrderId",
+            id, line_id AS "lineId", item_id AS "itemId",
+            location_id AS "locationId", quantity, unit, rate, amount,
+            netsuite_active AS "netsuiteActive",
+            netsuite_closed AS "netsuiteClosed", synced_at AS "syncedAt"
+       FROM purchase_order_lines
+      WHERE purchase_order_id = ANY($1::bigint[])
+        AND netsuite_active IS DISTINCT FROM false
+      ORDER BY purchase_order_id, line_id, id`,
+    [ids]
+  );
+  for (const line of result.rows) {
+    const orderId = Number(line.purchaseOrderId);
+    if (!byOrderId.has(orderId)) byOrderId.set(orderId, []);
+    byOrderId.get(orderId).push(line);
+  }
+  return byOrderId;
 }
 
 function defaultEmailDraft(source, workflow) {
@@ -399,7 +444,7 @@ function defaultEmailDraft(source, workflow) {
   };
 }
 
-async function enrichWorkflow(row) {
+async function enrichWorkflow(row, { purchaseOrderFinancialsByOrderId = null } = {}) {
   const workflow = publicWorkflowRow(row);
   const [source, review] = await Promise.all([
     getSmartScmProposal(workflow.sourceProposalId),
@@ -407,10 +452,47 @@ async function enrichWorkflow(row) {
   ]);
   if (!source) throw Object.assign(new Error("The source Vendor Replies proposal no longer exists."), { status: 409 });
   const display = review || source;
-  const vendorId = await vendorIdentityForWorkflow(workflow, display.lines || source.lines || []);
-  const { metadata, lookupError } = await itemMetadataForLines(display.lines || source.lines || [], { vendorId });
+  const displayLines = display.lines?.length ? display.lines : source.lines || [];
+  const physicalPalletLines = Array.isArray(display.physicalPalletLines) ? display.physicalPalletLines : [];
+  const vendorId = await vendorIdentityForWorkflow(workflow, displayLines);
+  const immutableReview = Boolean(review);
+  const { metadata, lookupError } = immutableReview
+    ? { metadata: new Map(), lookupError: "" }
+    : await itemMetadataForLines(
+      [...displayLines, ...physicalPalletLines],
+      { vendorId }
+    );
+  const snapshotFinancialLines = displayLines.map((line) => smartScmVendorFinancialLine({
+    line,
+    metadata: metadata.get(Number(line.itemId)) || {}
+  }));
+  const snapshotFinancialPalletLines = physicalPalletLines.map((line) => smartScmVendorFinancialLine({
+    line,
+    metadata: metadata.get(Number(line.itemId)) || {}
+  }));
+  const linkedPurchaseOrderId = Number(workflow.netsuitePurchaseOrderId || display.netsuitePurchaseOrderId);
+  const hasLinkedPurchaseOrder = workflow.workflowKind === "regular_po"
+    && Number.isInteger(linkedPurchaseOrderId)
+    && linkedPurchaseOrderId > 0;
+  const purchaseOrderFinancials = hasLinkedPurchaseOrder
+    ? purchaseOrderFinancialsByOrderId instanceof Map
+      ? purchaseOrderFinancialsByOrderId.get(linkedPurchaseOrderId) || []
+      : (await purchaseOrderFinancialLinesByOrderIds([linkedPurchaseOrderId])).get(linkedPurchaseOrderId) || []
+    : [];
+  const financialLines = hasLinkedPurchaseOrder
+    ? overlaySmartScmVendorPoFinancials({
+        lines: snapshotFinancialLines,
+        purchaseOrderLines: purchaseOrderFinancials
+      })
+    : snapshotFinancialLines;
+  const financialPalletLines = hasLinkedPurchaseOrder
+    ? overlaySmartScmVendorPoFinancials({
+        lines: snapshotFinancialPalletLines,
+        purchaseOrderLines: purchaseOrderFinancials
+      })
+    : snapshotFinancialPalletLines;
   const emailRows = groupSmartScmVendorEmailRows(
-    display.lines?.length ? display.lines : source.lines,
+    financialLines,
     metadata,
     workflow.vendorCodeOverrides
   );
@@ -420,6 +502,8 @@ async function enrichWorkflow(row) {
     && ["order_requested", "vendor_replied"].includes(source.status);
   return {
     ...display,
+    lines: financialLines,
+    physicalPalletLines: financialPalletLines,
     id: workflow.sourceProposalId,
     displayProposalId: display.id,
     sourceProposalId: workflow.sourceProposalId,
@@ -538,8 +622,13 @@ export async function listSmartScmVendorWorkflowLoads({ search = "", limit = 500
       LIMIT $2`,
     [text(search), Math.min(1000, Math.max(1, Number(limit) || 500))]
   );
+  const purchaseOrderFinancialsByOrderId = await purchaseOrderFinancialLinesByOrderIds(
+    result.rows.map((row) => row.netsuite_purchase_order_id)
+  );
   const loads = [];
-  for (const row of result.rows) loads.push(await enrichWorkflow(row));
+  for (const row of result.rows) {
+    loads.push(await enrichWorkflow(row, { purchaseOrderFinancialsByOrderId }));
+  }
   return loads;
 }
 

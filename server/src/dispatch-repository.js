@@ -334,12 +334,26 @@ function yardAddressSql(field) {
 }
 
 export async function listDispatchOrders({
-  type = null, includeHiddenScm = false, search = "", perTypeLimit = DEFAULT_DISPATCH_ORDERS_PER_TYPE
+  type = null,
+  includeHiddenScm = false,
+  includeInactiveSalesOrderSearchCandidates = false,
+  includeScmLinkedSearchRefs = false,
+  search = "",
+  perTypeLimit = DEFAULT_DISPATCH_ORDERS_PER_TYPE
 } = {}) {
   const searchTerm = String(search || "").trim().slice(0, 120);
   const cleanPerTypeLimit = Math.min(Math.max(Number(perTypeLimit) || DEFAULT_DISPATCH_ORDERS_PER_TYPE, 1), MAX_DISPATCH_ORDERS_PER_TYPE);
   const normalizedType = String(type || "").trim().toUpperCase();
-  const params = [Boolean(includeHiddenScm), isNetSuiteSandboxEnvironment(), searchTerm, cleanPerTypeLimit, normalizedType];
+  const includeInactiveSalesOrders = Boolean(includeInactiveSalesOrderSearchCandidates && searchTerm);
+  const params = [
+    Boolean(includeHiddenScm),
+    isNetSuiteSandboxEnvironment(),
+    searchTerm,
+    cleanPerTypeLimit,
+    normalizedType,
+    includeInactiveSalesOrders,
+    Boolean(includeScmLinkedSearchRefs && searchTerm)
+  ];
   const result = await query(
     `
     WITH so_alloc AS (
@@ -465,7 +479,10 @@ export async function listDispatchOrders({
         to_lyr,
         to_sec,
         to_pcs,
-        CASE WHEN $2::boolean AND COALESCE(o.is_test_fixture, false) THEN true ELSE l.netsuite_active END AS netsuite_active
+        CASE
+          WHEN ($2::boolean AND COALESCE(o.is_test_fixture, false)) OR $6::boolean THEN true
+          ELSE l.netsuite_active
+        END AS netsuite_active
       FROM sales_order_lines l
       JOIN sales_orders o ON o.netsuite_id = l.sales_order_id
       UNION ALL
@@ -716,7 +733,11 @@ export async function listDispatchOrders({
          LIMIT 1
       ) co ON true
       LEFT JOIN so_alloc_pickups ap ON ap.sales_order_id = o.netsuite_id
-      WHERE (o.netsuite_active = true OR co.co_ref IS NOT NULL)
+      WHERE (
+        o.netsuite_active = true
+        OR co.co_ref IS NOT NULL
+        OR ($6::boolean AND o.order_type = 'sales_order')
+      )
         AND (
           o.dispatch_planned = true
           OR COALESCE(o.local_yard_order_status, 'Open') IN ('Loaded', 'loaded', 'Shipped', 'shipped', 'Packed', 'packed')
@@ -1110,6 +1131,42 @@ export async function listDispatchOrders({
            OR COALESCE(destination_location, '') ILIKE '%' || $3 || '%'
            OR COALESCE(dispatch_instructions, '') ILIKE '%' || $3 || '%'
            OR COALESCE(items, '[]'::jsonb)::text ILIKE '%' || $3 || '%'
+           OR (
+             $7::boolean
+             AND dispatch_type = 'PO'
+             AND EXISTS (
+               SELECT 1
+                 FROM dispatch_scm_po_splits linked_split
+                WHERE linked_split.status = 'active'
+                  AND linked_split.split_po_id = eligible_orders.netsuite_id
+                  AND (
+                    linked_split.source_po_ref ILIKE '%' || $3 || '%'
+                    OR linked_split.split_po_ref ILIKE '%' || $3 || '%'
+                  )
+             )
+           )
+           OR (
+             $7::boolean
+             AND dispatch_type = 'PO'
+             AND EXISTS (
+               SELECT 1
+                 FROM scm_schedule_groups linked_group
+                 JOIN scm_schedule_group_members linked_member
+                   ON linked_member.group_id = linked_group.id
+                WHERE linked_group.status = 'active'
+                  AND lower(linked_group.group_ref) = lower(COALESCE(NULLIF(eligible_orders.dispatch_ref, ''), eligible_orders.tranid))
+                  AND (
+                    linked_member.order_ref ILIKE '%' || $3 || '%'
+                    OR EXISTS (
+                      SELECT 1
+                        FROM dispatch_scm_po_splits member_split
+                       WHERE member_split.status = 'active'
+                         AND lower(member_split.split_po_ref) = lower(linked_member.order_ref)
+                         AND member_split.source_po_ref ILIKE '%' || $3 || '%'
+                    )
+                  )
+             )
+           )
          )
     )
     SELECT orders.*,
@@ -1231,9 +1288,10 @@ export async function refreshDispatchEnrichment({ force = false, delivery: inclu
               outbound_location_id, outbound_location,
               NULL::bigint AS destination_location_id, NULL::text AS destination_location,
               NULL::bigint AS source_location_id, NULL::text AS source_location
-         FROM sales_orders
+        FROM sales_orders
         WHERE netsuite_active = true
-          AND ($1::boolean OR dispatch_note_hash IS NULL OR dispatch_parse_source IS NULL)
+          AND ($1::boolean OR dispatch_note_hash IS NULL OR dispatch_parse_source IS NULL
+               OR dispatch_instruction_parse_version < 2)
        UNION ALL
        SELECT netsuite_id, 'transfer_order'::text AS order_type, memo,
               expected_delivery_date,
@@ -1247,11 +1305,12 @@ export async function refreshDispatchEnrichment({ force = false, delivery: inclu
       [force]
     );
     for (const row of delivery.rows) {
-      const dispatch = row.order_type === "transfer_order"
+      const isTransferOrder = row.order_type === "transfer_order";
+      const dispatch = isTransferOrder
         ? enrichTransferDispatch(row)
         : await enrichSalesOrderDispatch(row);
       await query(
-        `UPDATE ${row.order_type === "transfer_order" ? "transfer_orders" : "sales_orders"}
+        `UPDATE ${isTransferOrder ? "transfer_orders" : "sales_orders"}
             SET dispatch_address = $2,
                 dispatch_window_start = $3,
                 dispatch_window_end = $4,
@@ -1264,6 +1323,10 @@ export async function refreshDispatchEnrichment({ force = false, delivery: inclu
                   ELSE $8::date
                 END,
                 dispatch_parsed_at = now()
+                ${isTransferOrder ? "" : `,
+                dispatch_instruction_details = $9::jsonb,
+                dispatch_instruction_parse_version = $10,
+                dispatch_instruction_parsed_at = $11::timestamptz`}
           WHERE netsuite_id = $1`,
         [
           row.netsuite_id,
@@ -1273,7 +1336,12 @@ export async function refreshDispatchEnrichment({ force = false, delivery: inclu
           dispatch.dispatch_instructions,
           dispatch.dispatch_parse_source,
           dispatch.dispatch_note_hash,
-          dispatch.expected_delivery_date || null
+          dispatch.expected_delivery_date || null,
+          ...(isTransferOrder ? [] : [
+            JSON.stringify(dispatch.dispatch_instruction_details || {}),
+            dispatch.dispatch_instruction_parse_version || 0,
+            dispatch.dispatch_instruction_parsed_at || null
+          ])
         ]
       );
       deliveryCount += 1;
@@ -1425,7 +1493,10 @@ export async function reparseMissingSalesOrderDispatch({ limit = 200, dryRun = f
                     WHEN $8::date IS NULL THEN expected_delivery_date
                     ELSE $8::date
                   END,
-                  dispatch_parsed_at = now()
+                  dispatch_parsed_at = now(),
+                  dispatch_instruction_details = $9::jsonb,
+                  dispatch_instruction_parse_version = $10,
+                  dispatch_instruction_parsed_at = $11::timestamptz
             WHERE netsuite_id = $1`,
           [
             row.netsuite_id,
@@ -1435,7 +1506,10 @@ export async function reparseMissingSalesOrderDispatch({ limit = 200, dryRun = f
             dispatch.dispatch_instructions,
             dispatch.dispatch_parse_source,
             dispatch.dispatch_note_hash,
-            dispatch.expected_delivery_date || null
+            dispatch.expected_delivery_date || null,
+            JSON.stringify(dispatch.dispatch_instruction_details || {}),
+            dispatch.dispatch_instruction_parse_version || 0,
+            dispatch.dispatch_instruction_parsed_at || null
           ]
         );
         updated += 1;
@@ -1819,8 +1893,12 @@ export async function listScmPurchaseOrders({
   search = "", poType = "", dropoff = "", vendor = "", pickupPoint = ""
 } = {}) {
   const needle = String(search || "").trim().toLowerCase();
-  let orders = await listDispatchOrders({ type: "PO", includeHiddenScm: true });
-  orders = orders.filter((order) => scmPurchaseOrderListKind(order) !== "vrma");
+  const listedOrders = await listDispatchOrders({
+    type: "PO",
+    includeHiddenScm: true,
+    includeScmLinkedSearchRefs: Boolean(needle),
+    search: needle
+  });
   const splitRows = await query(
     `SELECT s.id, s.source_po_ref, s.split_po_ref, s.created_at, s.created_by,
             COUNT(l.id) AS line_count,
@@ -1831,6 +1909,7 @@ export async function listScmPurchaseOrders({
       GROUP BY s.id
       ORDER BY s.created_at DESC`
   );
+  let orders = listedOrders.filter((order) => scmPurchaseOrderListKind(order) !== "vrma");
   const splitByRef = new Map(splitRows.rows.map((row) => [String(row.split_po_ref || ""), row]));
   orders = orders.map((order) => {
     const split = splitByRef.get(String(order.id || ""));
@@ -2672,6 +2751,47 @@ export async function listScmSchedule({
         AND COALESCE(load.value->>'returnOnly', 'false') <> 'true'
       ORDER BY plan_order.order_kind, plan_order.order_ref, p.plan_date DESC,
                stop_schedule.eta_time DESC
+    ),
+    reconciliation_target_projection AS MATERIALIZED (
+      SELECT state.id AS state_id,
+             state.order_kind,
+             target.order_ref,
+             state.application_status AS family_application_status,
+             state.reconciliation_status,
+             state.reconciled_at,
+             target.application_status AS target_application_status
+        FROM scm_reconciliation_order_state state
+       CROSS JOIN LATERAL (
+         SELECT entry.key AS order_ref,
+                entry.value->>'applicationStatus' AS application_status
+           FROM jsonb_each(
+             CASE
+               WHEN jsonb_typeof(state.quantity_summary->'targets') = 'object'
+                 THEN state.quantity_summary->'targets'
+               ELSE '{}'::jsonb
+             END
+           ) entry
+       ) target
+      UNION ALL
+      SELECT state.id,
+             state.order_kind,
+             state.source_order_ref,
+             state.application_status,
+             state.reconciliation_status,
+             state.reconciled_at,
+             NULL::text
+        FROM scm_reconciliation_order_state state
+       WHERE NOT EXISTS (
+         SELECT 1
+           FROM jsonb_each(
+             CASE
+               WHEN jsonb_typeof(state.quantity_summary->'targets') = 'object'
+                 THEN state.quantity_summary->'targets'
+               ELSE '{}'::jsonb
+             END
+           ) entry
+          WHERE lower(entry.key) = lower(state.source_order_ref)
+       )
     )
     SELECT
       COALESCE(s.id, 0) AS schedule_id,
@@ -2701,14 +2821,7 @@ export async function listScmSchedule({
       COALESCE(NULLIF(s.weight_lbs, 0), b.weight_lbs, 0) AS weight_lbs,
       COALESCE(NULLIF(s.packing_slip_ref, ''), b.dispatch_ref, '') AS packing_slip_ref,
       COALESCE(s.group_ref, '') AS group_ref,
-      CASE
-        WHEN COALESCE(s.status, b.initial_scm_status, '') IN (
-          'Completed', 'Cancelled', 'Hold', 'In Transit',
-          'Partially Done', 'Reconcile Review'
-        ) THEN COALESCE(s.status, b.initial_scm_status)
-        WHEN planned.order_ref IS NOT NULL THEN 'Planned'
-        ELSE COALESCE(s.status, b.initial_scm_status, 'Queued')
-      END AS status,
+      operational_status.status AS status,
       COALESCE(s.created_at, b.queued_at) AS queued_at,
       COALESCE(s.eta_date, planned.eta_date, b.expected_delivery_date) AS eta_date,
       COALESCE(NULLIF(s.eta_time, ''), planned.eta_time, '') AS eta_time,
@@ -2727,28 +2840,78 @@ export async function listScmSchedule({
     LEFT JOIN planned
       ON planned.order_kind = b.order_kind
      AND lower(planned.order_ref) = lower(b.order_ref)
+    LEFT JOIN reconciliation_target_projection reconciliation_projection
+      ON reconciliation_projection.state_id = s.reconciliation_order_state_id
+     AND reconciliation_projection.order_kind = b.order_kind
+     AND lower(reconciliation_projection.order_ref) = lower(b.order_ref)
+    CROSS JOIN LATERAL (
+      SELECT CASE
+        WHEN COALESCE(s.status, b.initial_scm_status, '') IN (
+          'Completed', 'Cancelled', 'Hold', 'In Transit',
+          'Partially Done', 'Reconcile Review'
+        ) THEN COALESCE(s.status, b.initial_scm_status)
+        WHEN planned.order_ref IS NOT NULL THEN 'Planned'
+        ELSE COALESCE(s.status, b.initial_scm_status, 'Queued')
+      END AS status
+    ) operational_status
+    CROSS JOIN LATERAL (
+      SELECT CASE
+        WHEN COALESCE(s.reconciliation_blocked, false)
+          OR reconciliation_projection.reconciliation_status = 'review'
+          THEN 'Reconcile Review'
+        WHEN lower(COALESCE(
+          NULLIF(
+            CASE
+              WHEN reconciliation_projection.target_application_status = 'Reconcile Review'
+                THEN reconciliation_projection.family_application_status
+              ELSE reconciliation_projection.target_application_status
+            END,
+            ''
+          ),
+          reconciliation_projection.family_application_status,
+          ''
+        )) IN ('complete', 'completed') THEN 'Completed'
+        WHEN reconciliation_projection.reconciliation_status = 'pending'
+          THEN operational_status.status
+        WHEN s.id IS NOT NULL
+          AND s.updated_at IS NOT NULL
+          AND (
+            reconciliation_projection.reconciled_at IS NULL
+            OR s.updated_at > reconciliation_projection.reconciled_at
+          )
+          THEN operational_status.status
+        ELSE COALESCE(
+          NULLIF(
+            CASE
+              WHEN reconciliation_projection.target_application_status = 'Reconcile Review'
+                THEN reconciliation_projection.family_application_status
+              ELSE reconciliation_projection.target_application_status
+            END,
+            ''
+          ),
+          NULLIF(reconciliation_projection.family_application_status, ''),
+          operational_status.status
+        )
+      END AS status
+    ) effective_status
     WHERE ($1 = '' OR lower(concat_ws(' ', b.order_ref, b.source_ref, b.dispatch_ref, b.party, b.pickup_point, b.dropoff_point, b.brand, b.content, s.packing_slip_ref, s.group_ref)) LIKE '%' || $1 || '%')
-      AND ($9 = 'blanket' OR NOT COALESCE(b.is_blanket_po, false))
+      AND (
+        $9 = 'blanket'
+        OR NOT COALESCE(b.is_blanket_po, false)
+        OR COALESCE(s.reconciliation_blocked, false)
+        OR reconciliation_projection.reconciliation_status = 'review'
+      )
       AND ($9 <> 'blanket' OR b.order_kind = 'PO')
       AND (
         $11::boolean
         OR (
           NOT COALESCE(b.is_blanket_po, false)
-          AND LOWER(BTRIM(COALESCE(s.status, b.initial_scm_status, 'Queued'))) NOT IN (
+          AND LOWER(BTRIM(effective_status.status)) NOT IN (
             'hold', 'complete', 'completed', 'cancelled', 'canceled'
           )
         )
       )
-      AND (cardinality($2::text[]) = 0 OR (
-        CASE
-          WHEN COALESCE(s.status, b.initial_scm_status, '') IN (
-            'Completed', 'Cancelled', 'Hold', 'In Transit',
-            'Partially Done', 'Reconcile Review'
-          ) THEN COALESCE(s.status, b.initial_scm_status)
-          WHEN planned.order_ref IS NOT NULL THEN 'Planned'
-          ELSE COALESCE(s.status, b.initial_scm_status, 'Queued')
-        END
-      ) = ANY($2::text[]))
+      AND (cardinality($2::text[]) = 0 OR effective_status.status = ANY($2::text[]))
       AND ($3 = '' OR COALESCE(s.method, 'MBT') = $3)
       AND (
         $4 = ''
@@ -2766,34 +2929,17 @@ export async function listScmSchedule({
       AND (
         $9 = ''
         OR $9 <> 'dispatch'
-        OR (COALESCE(s.method, 'MBT') = 'MBT' AND (
-          CASE
-            WHEN COALESCE(s.status, b.initial_scm_status, '') IN (
-              'Completed', 'Cancelled', 'Hold', 'In Transit',
-              'Partially Done', 'Reconcile Review'
-            ) THEN COALESCE(s.status, b.initial_scm_status)
-            WHEN planned.order_ref IS NOT NULL THEN 'Planned'
-            ELSE COALESCE(s.status, b.initial_scm_status, 'Queued')
-          END
-        ) NOT IN ('Cancelled', 'Hold'))
+        OR (COALESCE(s.method, 'MBT') = 'MBT'
+          AND effective_status.status NOT IN ('Cancelled', 'Hold'))
       )
       AND (
         $9 = ''
         OR $9 <> 'completed'
-        OR COALESCE(s.status, b.initial_scm_status, 'Queued') IN ('Completed', 'Cancelled')
+        OR effective_status.status IN ('Completed', 'Cancelled')
       )
     ORDER BY
       CASE WHEN $9 = 'completed' THEN 0 ELSE
-        CASE (
-          CASE
-            WHEN COALESCE(s.status, b.initial_scm_status, '') IN (
-              'Completed', 'Cancelled', 'Hold', 'In Transit',
-              'Partially Done', 'Reconcile Review'
-            ) THEN COALESCE(s.status, b.initial_scm_status)
-            WHEN planned.order_ref IS NOT NULL THEN 'Planned'
-            ELSE COALESCE(s.status, b.initial_scm_status, 'Queued')
-          END
-        )
+        CASE effective_status.status
           WHEN 'Urgent' THEN 0
           WHEN 'Priority' THEN 1
           WHEN 'Queued' THEN 2
@@ -2809,7 +2955,7 @@ export async function listScmSchedule({
         END
       END,
       CASE
-        WHEN COALESCE(s.status, b.initial_scm_status, '') IN ('Completed', 'Cancelled')
+        WHEN effective_status.status IN ('Completed', 'Cancelled')
         THEN COALESCE(s.last_reconciled_at, s.updated_at, b.queued_at)
       END DESC NULLS LAST,
       COALESCE(s.eta_date, planned.eta_date, b.expected_delivery_date) NULLS LAST,

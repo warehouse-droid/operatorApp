@@ -104,6 +104,24 @@ try {
         `Blanket Vendor Yard ${seed}`, candidatePoId, candidatePoRef]
     );
     await query(
+      `INSERT INTO dispatch_local_vendors (name, active, updated_by)
+       VALUES ($1, true, $2)`,
+      [`Blanket Harness Vendor ${seed}`, actor]
+    );
+    await query(
+      `INSERT INTO dispatch_vendor_mappings (
+         netsuite_vendor_id, netsuite_vendor_name, local_vendor, active,
+         last_po_ref, updated_by
+       ) VALUES ($1,$2,$2,true,$3,$4)`,
+      [String(baseId + 100), `Blanket Harness Vendor ${seed}`, sourcePoRef, actor]
+    );
+    await query(
+      `INSERT INTO dispatch_vendor_yards (
+         vendor, yard, day_label, window_start, window_end, active
+       ) VALUES ($1,$2,'Mon-Fri','08:00','17:00',true)`,
+      [`Blanket Harness Vendor ${seed}`, `Blanket Vendor Yard ${seed}`]
+    );
+    await query(
       `INSERT INTO purchase_order_lines (
          id, purchase_order_id, line_id, item_id, item_name, sku, item_description,
          quantity, unit, location_id, location, pallet_qty, layer_qty, section_qty,
@@ -305,8 +323,8 @@ try {
         proposedPallets: 20,
         destinationLocationId: 28
       }, actor),
-      /Only 8 whole PLT remain available/i,
-      "A Blanket edit must subtract quantities planned for the other load lines."
+      /Only 10 whole PLT remain open/i,
+      "A Blanket edit may rebalance sibling proposals but must never exceed the source PO's physical open quantity."
     );
     const afterRejectedEdit = await query(
       `SELECT line.proposed_pallets, line.destination_location_id,
@@ -557,8 +575,8 @@ try {
       readyDate: "2026-08-15",
       vendorReference: splitPoRef,
       lines: [
-        { proposalLineId: firstLineId, confirmedPallets: 1, heldPallets: 1, cancelledPallets: 0 },
-        { proposalLineId: secondLineId, confirmedPallets: 1, heldPallets: 1, cancelledPallets: 0 }
+        { proposalLineId: firstLineId, confirmedPallets: 1, heldPallets: 1, cancelledPallets: 0, unitPrice: 7.25 },
+        { proposalLineId: secondLineId, confirmedPallets: 1, heldPallets: 1, cancelledPallets: 0, unitPrice: 8.5 }
       ]
     };
     await assert.rejects(
@@ -576,6 +594,12 @@ try {
     );
     assert.equal(rejectedSplitCount.rows[0].count, 0,
       "A rejected same-reference split must roll back without creating a partial local PO.");
+    const rejectedPrices = await query(
+      "SELECT last_purchase_price FROM scm_smart_proposal_lines WHERE proposal_id = $1 ORDER BY id",
+      [proposalId]
+    );
+    assert(rejectedPrices.rows.every((line) => line.last_purchase_price === null),
+      "A failed Blanket split must roll back unit-price edits with the split transaction.");
     const finalized = await finalizeSmartScmBlanketVendorWorkflow(proposalId, finalizePayload, actor);
     assert.equal(finalized.release.status, "partially_released");
     assert.equal(finalized.release.splitPoRef, splitPoRef);
@@ -585,6 +609,8 @@ try {
     assert(finalized.proposal.lines.every((line) => line.reason?.vendorReplyDraft?.decision === "hold"));
     assert(finalized.proposal.lines.every((line) => Number(line.reason?.vendorReplyDraft?.decisionPallets) === 1),
       "Partial finalization must replace stale drafts with the exact held balance.");
+    assert.deepEqual(finalized.proposal.lines.map((line) => line.lastPurchasePrice), [7.25, 8.5],
+      "Creating a Blanket split directly must persist the currently edited line prices.");
 
     const localSplitIdentity = await query(
       `SELECT source_po_id, source_po_ref, split_po_id, split_po_ref

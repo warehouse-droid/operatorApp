@@ -16,6 +16,10 @@ export async function query(text, params = []) {
   return pool.query(text, params);
 }
 
+export function hasActiveTransaction() {
+  return Boolean(transactionStorage.getStore()?.client);
+}
+
 export function afterTransactionCommit(callback) {
   if (typeof callback !== "function") throw new TypeError("A post-commit callback is required.");
   const transaction = transactionStorage.getStore();

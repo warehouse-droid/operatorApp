@@ -241,8 +241,13 @@ includesAll(repository, [
   "bool(includeTerminalOrders)",
   "export async function listScmReconciliationBroadExcludedSources",
   "state.broad_reconciliation_skipped = true",
-  "state.application_status IN ('Completed', 'Cancelled', 'Hold')",
-  "schedule.status IN ('Completed', 'Cancelled', 'Hold')",
+  "state.application_status IN ('Cancelled', 'Hold')",
+  "schedule.status IN ('Cancelled', 'Hold')",
+  "state.application_status = 'Completed'",
+  "source.source_synced_at > state.reconciled_at",
+  "status: row.status",
+  "calculatedStatus: effectiveStatus",
+  "reconciliationApplicationStatus: effectiveStatus",
   "export async function cancelScmReconciliationRun",
   "cancel_requested_at",
   "stopRequested: !queued",
@@ -360,7 +365,7 @@ assert.equal(
   "NetSuite reconciliation review must not block dispatch-plan confirmation."
 );
 assert.ok(
-  confirmRoute.includes('assertNoRestrictedScmDispatchOrders(placedScmRefs, "confirm this plan")'),
+  confirmRoute.includes('assertNoRestrictedScmDispatchOrders(placedScmRefs, "confirm this plan", {'),
   "Dispatch confirmation must still reject Blanket, Hold, Complete, or Cancelled SCM orders."
 );
 const saveRouteStart = server.indexOf('app.put("/api/dispatch/plans/:id"');

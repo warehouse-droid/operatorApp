@@ -1,6 +1,9 @@
 import { writeAudit } from "./auth-repository.js";
 import { query, withTransaction } from "./db.js";
+import { resolveScmVendorReference } from "./scm-po-vendor-reference.js";
 import { describePurchaseOrderLinePallets } from "./scm-netsuite-po-unit-conversion.js";
+
+export { resolveScmVendorReference } from "./scm-po-vendor-reference.js";
 
 function positiveInt(value, fallback = null) {
   const number = Number(value);
@@ -21,6 +24,78 @@ function sameTimestamp(left, right) {
   const a = new Date(left || 0).getTime();
   const b = new Date(right || 0).getTime();
   return Number.isFinite(a) && Number.isFinite(b) && Math.abs(a - b) < 1000;
+}
+
+async function syncScmPackingSlipFromVendorReference(purchaseOrderId, vendorReference, operatorId = null) {
+  const reference = text(vendorReference).slice(0, 300);
+  const updatedBy = text(operatorId) || "netsuite-po-history";
+  const existing = await query(
+    `SELECT schedule.id
+       FROM purchase_orders po
+       JOIN LATERAL (
+         SELECT candidate.id
+           FROM scm_transport_schedule candidate
+          WHERE candidate.order_kind = 'PO'
+            AND (
+              lower(candidate.order_ref) = lower(COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid))
+              OR (
+                candidate.source_table = 'purchase_orders'
+                AND candidate.source_id = po.netsuite_id
+              )
+            )
+          ORDER BY
+            CASE
+              WHEN lower(candidate.order_ref) = lower(COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid)) THEN 0
+              ELSE 1
+            END,
+            candidate.id
+          LIMIT 1
+          FOR UPDATE
+       ) schedule ON true
+      WHERE po.netsuite_id = $1`,
+    [purchaseOrderId]
+  );
+  if (existing.rowCount) {
+    await query(
+      `UPDATE scm_transport_schedule
+          SET source_table = 'purchase_orders',
+              source_id = $2,
+              packing_slip_ref = NULLIF($3, ''),
+              updated_by = $4,
+              updated_at = now()
+        WHERE id = $1`,
+      [existing.rows[0].id, purchaseOrderId, reference, updatedBy]
+    );
+    return;
+  }
+  if (!reference) return;
+  await query(
+    `INSERT INTO scm_transport_schedule (
+       order_kind, source_table, source_id, order_ref, display_ref,
+       method, pickup_point, dropoff_point, brand, packing_slip_ref,
+       status, created_by, updated_by
+     )
+     SELECT
+       'PO', 'purchase_orders', po.netsuite_id,
+       COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid),
+       COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid),
+       'MBT',
+       NULLIF(COALESCE(po.dispatch_vendor_yard, po.source_location, ''), ''),
+       NULLIF(COALESCE(po.destination_location, ''), ''),
+       NULLIF(COALESCE(po.vendor, ''), ''),
+       $2,
+       po.initial_scm_status,
+       $3, $3
+       FROM purchase_orders po
+      WHERE po.netsuite_id = $1
+     ON CONFLICT (order_kind, order_ref) DO UPDATE SET
+       source_table = 'purchase_orders',
+       source_id = EXCLUDED.source_id,
+       packing_slip_ref = EXCLUDED.packing_slip_ref,
+       updated_by = EXCLUDED.updated_by,
+       updated_at = now()`,
+    [purchaseOrderId, reference, updatedBy]
+  );
 }
 
 function historyRow(row, lines = []) {
@@ -49,7 +124,9 @@ function historyRow(row, lines = []) {
       statusText: row.status_text,
       total: row.foreign_total === null ? null : Number(row.foreign_total),
       vendorYard: row.dispatch_vendor_yard || row.source_location,
-      vendorReference: row.vendor_reference || "",
+      vendorReference: row.vendor_reference === null || row.vendor_reference === undefined
+        ? (row.has_split_record ? "" : text(row.legacy_dispatch_ref))
+        : text(row.vendor_reference),
       expectedDeliveryDate: row.expected_delivery_date,
       memo: row.memo || "",
       active: row.netsuite_active !== false,
@@ -63,6 +140,8 @@ function historyRow(row, lines = []) {
 function lineRow(row) {
   const received = Number(row.netsuite_received_qty || 0);
   const closed = row.netsuite_closed === true;
+  const rawRate = row.raw?.rate;
+  const rawAmount = row.raw?.amount;
   const conversion = describePurchaseOrderLinePallets({
     itemId: row.item_id,
     itemName: row.item_name,
@@ -79,8 +158,12 @@ function lineRow(row) {
     quantity: Number(row.quantity || 0),
     receivedQuantity: received,
     unit: row.unit || "",
-    rate: row.rate === null ? null : Number(row.rate),
-    amount: row.amount === null ? null : Number(row.amount),
+    rate: row.rate === null || row.rate === undefined
+      ? rawRate === null || rawRate === undefined || rawRate === "" ? null : Number(rawRate)
+      : Number(row.rate),
+    amount: row.amount === null || row.amount === undefined
+      ? rawAmount === null || rawAmount === undefined || rawAmount === "" ? null : Number(rawAmount)
+      : Number(row.amount),
     destinationLocationId: row.location_id === null ? null : Number(row.location_id),
     destination: row.location || "",
     closed,
@@ -115,6 +198,12 @@ const SELECT_HEADER = `
          po.tranid AS current_tranid, po.trandate, po.netsuite_created_at,
          po.vendor_id, po.vendor, po.status, po.status_text, po.foreign_total,
          po.dispatch_vendor_yard, po.source_location, po.vendor_reference,
+         po.dispatch_ref AS legacy_dispatch_ref,
+         EXISTS (
+           SELECT 1
+             FROM dispatch_scm_po_splits split_record
+            WHERE split_record.split_po_id = po.netsuite_id
+         ) AS has_split_record,
          po.expected_delivery_date, po.memo, po.netsuite_active,
          po.receipt_status, po.netsuite_missing_at,
          po.synced_at AS canonical_synced_at,
@@ -158,6 +247,7 @@ export async function listScmNetSuitePoHistory(filters = {}) {
   if (text(filters.search)) {
     const p = bind(`%${text(filters.search)}%`);
     clauses.push(`(h.netsuite_purchase_order_ref ILIKE ${p} OR po.vendor ILIKE ${p} OR po.memo ILIKE ${p}
+      OR po.vendor_reference ILIKE ${p} OR po.dispatch_ref ILIKE ${p}
       OR EXISTS (SELECT 1 FROM purchase_order_lines pol WHERE pol.purchase_order_id = h.netsuite_purchase_order_id AND pol.netsuite_active IS DISTINCT FROM false AND (pol.item_name ILIKE ${p} OR pol.location ILIKE ${p})))`);
   }
   if (text(filters.createdFrom)) clauses.push(`h.app_created_at >= ${bind(text(filters.createdFrom))}::date`);
@@ -291,13 +381,39 @@ export async function persistScmNetSuitePoSnapshot(historyId, snapshot, { source
   return withTransaction(async () => {
     const current = await getScmNetSuitePoHistory(historyId, { forUpdate: true });
     const remote = iso(snapshot.lastModifiedAt);
+    const vendorReference = resolveScmVendorReference({
+      snapshotVendorReference: snapshot.vendorReference,
+      currentVendorReference: current.current?.vendorReference,
+      source: allowedSource,
+      requestedChanges
+    });
+    for (const line of snapshot.lines || []) {
+      await query(
+        `UPDATE purchase_order_lines
+            SET rate = $3, amount = $4, netsuite_closed = $5,
+                raw = COALESCE(raw, '{}'::jsonb) || $6::jsonb, synced_at = now()
+          WHERE purchase_order_id = $1 AND line_id = $2`,
+        [current.purchaseOrderId, positiveInt(line.lineId), line.rate ?? null, line.amount ?? null, line.closed === true, JSON.stringify({ rate: line.rate ?? null, amount: line.amount ?? null, closed: line.closed === true })]
+      );
+    }
     const isReconciliationHeartbeat = allowedSource === "reconciliation"
       && remote
       && current.remoteLastModifiedAt
       && sameTimestamp(remote, current.remoteLastModifiedAt)
       && (!requestedChanges || Object.keys(requestedChanges).length === 0);
     if (isReconciliationHeartbeat) {
-      await query(`UPDATE purchase_orders SET synced_at = now() WHERE netsuite_id = $1`, [current.purchaseOrderId]);
+      await query(
+        `UPDATE purchase_orders
+            SET vendor_reference = $2,
+                synced_at = now()
+          WHERE netsuite_id = $1`,
+        [current.purchaseOrderId, vendorReference]
+      );
+      await syncScmPackingSlipFromVendorReference(
+        current.purchaseOrderId,
+        vendorReference,
+        operatorId
+      );
       await query(
         `UPDATE scm_netsuite_po_history
             SET last_synced_at = now(), last_sync_error = NULL, updated_at = now()
@@ -313,16 +429,13 @@ export async function persistScmNetSuitePoSnapshot(historyId, snapshot, { source
               vendor_reference = $4,
               synced_at = now()
         WHERE netsuite_id = $1`,
-      [current.purchaseOrderId, iso(snapshot.createdAt), remote, text(snapshot.vendorReference)]
+      [current.purchaseOrderId, iso(snapshot.createdAt), remote, vendorReference]
     );
-    for (const line of snapshot.lines || []) {
-      await query(
-        `UPDATE purchase_order_lines
-            SET rate = $3, amount = $4, netsuite_closed = $5, raw = COALESCE(raw, '{}'::jsonb) || $6::jsonb, synced_at = now()
-          WHERE purchase_order_id = $1 AND line_id = $2`,
-        [current.purchaseOrderId, positiveInt(line.lineId), line.rate ?? null, line.amount ?? null, line.closed === true, JSON.stringify({ rate: line.rate ?? null, amount: line.amount ?? null, closed: line.closed === true })]
-      );
-    }
+    await syncScmPackingSlipFromVendorReference(
+      current.purchaseOrderId,
+      vendorReference,
+      operatorId
+    );
     await query(
       `UPDATE scm_netsuite_po_history SET last_synced_at = now(), last_sync_error = NULL,
               remote_last_modified_at = COALESCE($2, remote_last_modified_at), updated_at = now()

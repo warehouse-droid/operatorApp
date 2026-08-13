@@ -13,12 +13,12 @@ const purchaseOrderRoles = 'roles: ["admin", "scm", "scm_staff"]';
 
 assert.match(
   sidebar,
-  /\{ label: "NetSuite PO history", href: "\/scm\/netsuite-po", icon: "PO", scmWriteOnly: true \}/,
+  /\{ label: "NetSuite PO history", href: "\/scm\/netsuite-po", icon: "PO", scmWriteOnly: true, authorities: \["admin", "scm", "scm_staff"\] \}/,
   "The SCM sidebar must expose the role-gated NetSuite PO history page."
 );
 assert.match(
   sidebar,
-  /\{ label: "Schedule Formatting", href: "\/scm\/schedule-formatting", icon: "CF" \}/,
+  /\{ label: "Schedule Formatting", href: "\/scm\/schedule-formatting", icon: "CF", authorities: \["admin", "scm", "scm_staff"\] \}/,
   "The SCM sidebar must expose PO/TO Schedule formatting."
 );
 assert.match(

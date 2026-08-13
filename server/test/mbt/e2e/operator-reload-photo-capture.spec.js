@@ -71,50 +71,82 @@ async function installReloadAssets(page) {
   }));
 }
 
-async function installReloadApi(page) {
-  await page.route("**/api/**", async (route) => {
-    const request = route.request();
-    const url = new URL(request.url());
-    const json = (value) => route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify(value)
-    });
-
-    if (url.pathname === "/api/auth/me") {
-      return json({
-        operator: {
-          id: "reload-test-operator",
-          username: "reload-test",
-          display_name: "Reload Test Operator",
-          role: "operator",
-          roles: ["operator"]
+function reloadApiFixture(pathname) {
+  switch (pathname) {
+    case "/api/auth/me":
+      return {
+        matched: true,
+        value: {
+          operator: {
+            id: "reload-test-operator",
+            username: "reload-test",
+            display_name: "Reload Test Operator",
+            role: "operator",
+            roles: ["operator"]
+          }
         }
-      });
-    }
-    if (url.pathname === "/api/delivery/notifications") {
-      return json({ total: 0, salesOrder: { dueToday: 0 }, transferOrder: { dueToday: 0 }, items: [] });
-    }
-    if (url.pathname === "/api/delivery/current-draft") {
-      return json(null);
-    }
-    if (url.pathname === "/api/delivery/saved-order-keys") {
-      return json([]);
-    }
-    if (url.pathname === "/api/operator/requests") {
-      return json([]);
-    }
-    if (url.pathname === "/api/delivery/load-trucks") {
-      return json([{ truck_plate: "BD98773", load_count: 1, order_count: 1, first_load_name: "Load 1" }]);
-    }
-    if (url.pathname === "/api/delivery/load-orders") {
-      return json([reloadOrder]);
-    }
-    if (url.pathname === "/api/delivery/orders/928827") {
-      return json(reloadOrder);
-    }
-    return route.fulfill({ status: 404, contentType: "application/json", body: JSON.stringify({ error: `Unhandled ${url.pathname}` }) });
+      };
+    case "/api/operator/photo-upload-token":
+      return { matched: true, value: { uploadUrl: "/api/test-r2-upload", token: "reload-photo-token" } };
+    case "/api/delivery/notifications":
+      return { matched: true, value: { total: 0, salesOrder: { dueToday: 0 }, transferOrder: { dueToday: 0 }, items: [] } };
+    case "/api/delivery/current-draft":
+      return { matched: true, value: null };
+    case "/api/delivery/saved-order-keys":
+    case "/api/operator/requests":
+      return { matched: true, value: [] };
+    case "/api/delivery/load-trucks":
+      return { matched: true, value: [{ truck_plate: "BD98773", load_count: 1, order_count: 1, first_load_name: "Load 1" }] };
+    case "/api/delivery/orders/928827":
+      return { matched: true, value: reloadOrder };
+    default:
+      return { matched: false, value: null };
+  }
+}
+
+function fulfillReloadJson(route, value, status = 200) {
+  return route.fulfill({
+    status,
+    contentType: "application/json",
+    body: JSON.stringify(value)
   });
+}
+
+async function handleReloadApiRoute(route, state, delayedRefreshMs) {
+  const request = route.request();
+  const url = new URL(request.url());
+  const fixture = reloadApiFixture(url.pathname);
+  if (fixture.matched) {
+    return fulfillReloadJson(route, fixture.value);
+  }
+  if (url.pathname === "/api/test-r2-upload") {
+    state.uploadedPhotos += 1;
+    return fulfillReloadJson(route, { key: `operator-load-photo/reload-${state.uploadedPhotos}.jpg` });
+  }
+  if (url.pathname === "/api/delivery/load-orders") {
+    state.loadOrderRequests += 1;
+    if (state.loadOrderRequests > 1 && delayedRefreshMs > 0) {
+      state.delayedRefreshStarted = true;
+      await new Promise((resolve) => setTimeout(resolve, delayedRefreshMs));
+      state.delayedRefreshResolved = true;
+    }
+    return fulfillReloadJson(route, [reloadOrder]);
+  }
+  if (url.pathname === "/api/delivery/orders/928827/load" && request.method() === "POST") {
+    return fulfillReloadJson(route, { completed: true, reloadOnly: true, localYardOrderStatus: "Reload Complete" });
+  }
+  return fulfillReloadJson(route, { error: `Unhandled ${url.pathname}` }, 404);
+}
+
+async function installReloadApi(page, { delayedRefreshMs = 0 } = {}) {
+  const state = {
+    loadOrderRequests: 0,
+    delayedRefreshStarted: false,
+    delayedRefreshResolved: false,
+    uploadedPhotos: 0
+  };
+  await page.route("**/api/**", (route) => handleReloadApiRoute(route, state, delayedRefreshMs));
+  return state;
 }
 
 async function installVirtualRearCamera(page) {
@@ -265,4 +297,25 @@ test("packed reload load screen opens the camera and captures two photos", async
   await page.getByRole("button", { name: "Capture photo 2" }).click();
   await expect(page.locator('[data-action="select-fulfillment-photo-slot"]').nth(1)).toContainText("Ready");
   await expect(page.getByRole("button", { name: "Load", exact: true })).toBeEnabled();
+});
+
+test("completed photo upload returns to Delivery Prep before its refresh finishes", async ({ page }) => {
+  if (process.env.MBT_TEST_USE_LIVE_ASSETS !== "1") {
+    await installReloadAssets(page);
+  }
+  const apiState = await installReloadApi(page, { delayedRefreshMs: 2000 });
+  await installVirtualRearCamera(page);
+
+  await page.goto("/operator");
+  await page.getByRole("button", { name: "Take Photos & Re-load" }).first().click();
+  await page.getByRole("button", { name: "Capture photo 1" }).click();
+  await page.getByRole("button", { name: "Capture photo 2" }).click();
+  await page.getByRole("button", { name: "Load", exact: true }).click();
+
+  await expect(page.locator(".fulfillment-card.success")).toBeVisible();
+  await page.getByRole("button", { name: "Back to Delivery" }).first().click();
+  await expect.poll(() => apiState.delayedRefreshStarted, { timeout: 1000 }).toBe(true);
+  await expect(page.locator(".delivery-grid")).toBeVisible({ timeout: 500 });
+  expect(apiState.delayedRefreshResolved).toBe(false);
+  expect(apiState.uploadedPhotos).toBe(2);
 });

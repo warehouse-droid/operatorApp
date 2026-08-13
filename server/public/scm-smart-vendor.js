@@ -4,6 +4,7 @@ let smartVendorLoadRequestSequence = 0;
 let smartVendorEmailModalWorkflowId = null;
 let smartVendorEmailModalDraft = null;
 let smartVendorPoPreview = null;
+let smartVendorPoPreviewRequestSequence = 0;
 
 function smartVendorWorkflowId(proposal = {}) {
   return Number(proposal.workflowId || proposal.id);
@@ -205,15 +206,81 @@ async function smartVendorWriteClipboard({ html = "", plain = "" } = {}) {
 
 function smartVendorPoPreviewModal() {
   if (!smartVendorPoPreview) return "";
-  const workflowId = Number(smartVendorPoPreview.workflowId);
   const label = smartVendorPoPreview.label || "NetSuite purchase order";
+  const documentUrl = smartVendorPoPreview.documentUrl || "";
+  const body = smartVendorPoPreview.status === "error"
+    ? `<div class="smart-vendor-pdf-state error" role="alert"><strong>Preview could not be loaded</strong><span>${smartEscape(smartVendorPoPreview.error || "The PDF request failed.")}</span><button class="smart-button" data-smart-action="retry-vendor-po-preview" type="button">Try again</button></div>`
+    : documentUrl
+      ? `<iframe src="${smartEscape(documentUrl)}" title="${smartEscape(label)} PDF"></iframe>`
+      : `<div class="smart-vendor-pdf-state" role="status"><span class="smart-vendor-pdf-spinner" aria-hidden="true"></span><strong>Loading purchase order PDF…</strong></div>`;
   return `<div class="smart-vendor-pdf-modal" role="presentation">
     <button class="smart-vendor-pdf-backdrop" data-smart-action="close-vendor-po-preview" type="button" aria-label="Close purchase order preview"></button>
     <section class="smart-vendor-pdf-dialog" role="dialog" aria-modal="true" aria-labelledby="smartVendorPdfTitle">
-      <header><div><strong id="smartVendorPdfTitle">${smartEscape(label)}</strong><span>NetSuite PDF preview</span></div><button class="smart-button" data-smart-action="close-vendor-po-preview" type="button" aria-label="Close purchase order preview">Close</button></header>
-      <iframe src="/api/scm/smart/vendor-workflows/${workflowId}/purchase-order.pdf" title="${smartEscape(label)} PDF"></iframe>
+      <header><div><strong id="smartVendorPdfTitle">${smartEscape(label)}</strong><span>NetSuite PDF preview</span></div><div class="smart-vendor-pdf-actions">${documentUrl ? `<a class="smart-button" href="${smartEscape(documentUrl)}" target="_blank" rel="noopener">Open PDF</a>` : ""}<button class="smart-button" data-smart-action="close-vendor-po-preview" type="button" aria-label="Close purchase order preview">Close</button></div></header>
+      ${body}
     </section>
   </div>`;
+}
+
+function smartVendorReleasePoPreviewDocument() {
+  const documentUrl = smartVendorPoPreview?.documentUrl;
+  if (documentUrl) URL.revokeObjectURL(documentUrl);
+}
+
+function smartVendorClosePoPreview() {
+  smartVendorPoPreviewRequestSequence += 1;
+  smartVendorReleasePoPreviewDocument();
+  smartVendorPoPreview = null;
+}
+
+async function smartVendorLoadPoPreview({ workflowId, label }) {
+  const id = Number(workflowId);
+  if (!Number.isInteger(id) || id <= 0) throw new Error("Select a valid purchase order workflow to preview.");
+  smartVendorReleasePoPreviewDocument();
+  const requestSequence = ++smartVendorPoPreviewRequestSequence;
+  smartVendorPoPreview = {
+    workflowId: id,
+    label: label || "NetSuite purchase order",
+    status: "loading",
+    documentUrl: "",
+    error: ""
+  };
+  smartRender();
+  try {
+    const response = await fetch(`/api/scm/smart/vendor-workflows/${id}/purchase-order.pdf`, {
+      headers: dispatchAuthHeaders({ Accept: "application/pdf" })
+    });
+    if (!response.ok) {
+      const contentType = response.headers.get("content-type") || "";
+      const payload = contentType.includes("application/json")
+        ? await response.json().catch(() => null)
+        : await response.text().catch(() => "");
+      throw new Error(payload?.error || payload || `Purchase order preview failed (${response.status}).`);
+    }
+    const contentType = response.headers.get("content-type") || "";
+    if (!contentType.toLowerCase().includes("application/pdf")) {
+      throw new Error("NetSuite did not return a PDF document for this purchase order.");
+    }
+    const documentBlob = await response.blob();
+    if (!documentBlob.size) throw new Error("The purchase order PDF is empty.");
+    if (requestSequence !== smartVendorPoPreviewRequestSequence || !smartVendorPoPreview) return;
+    const documentUrl = URL.createObjectURL(documentBlob);
+    if (requestSequence !== smartVendorPoPreviewRequestSequence || !smartVendorPoPreview) {
+      URL.revokeObjectURL(documentUrl);
+      return;
+    }
+    smartVendorPoPreview = { ...smartVendorPoPreview, status: "ready", documentUrl, error: "" };
+    smartRender();
+  } catch (error) {
+    if (requestSequence !== smartVendorPoPreviewRequestSequence || !smartVendorPoPreview) return;
+    smartVendorPoPreview = {
+      ...smartVendorPoPreview,
+      status: "error",
+      documentUrl: "",
+      error: error?.message || "The purchase order PDF could not be loaded."
+    };
+    smartRender();
+  }
 }
 
 function smartVendorReplyDecision(line, proposal = null) {
@@ -272,12 +339,65 @@ function smartVendorLineSalesQuantity(line, confirmedPallets) {
   return Number(confirmedPallets || 0) * Number(line.toPlt || 0);
 }
 
+function smartVendorMoney(value) {
+  if (value === null || value === undefined || value === "") return "—";
+  const amount = Number(value);
+  return Number.isFinite(amount)
+    ? new Intl.NumberFormat("en-CA", { style: "currency", currency: "CAD" }).format(amount)
+    : "—";
+}
+
+function smartVendorLinePurchaseAmount(line = {}, salesQuantity = 0) {
+  if (line.purchaseUnitMismatch === true) return null;
+  if (line.unitPriceSource === "netsuite_po_rate"
+    && line.purchaseAmount !== null
+    && line.purchaseAmount !== undefined
+    && Number.isFinite(Number(line.purchaseAmount))) {
+    return Number(line.purchaseAmount);
+  }
+  const price = line.lastPurchasePrice;
+  if (price === null || price === undefined || price === "" || !Number.isFinite(Number(price))) return null;
+  return Math.round((Number(salesQuantity || 0) * Number(price) + Number.EPSILON) * 100) / 100;
+}
+
+function smartVendorUnitPriceSource(line = {}) {
+  if (line.unitPriceSource === "netsuite_po_rate") return "Current NetSuite PO rate";
+  if (line.unitPriceSource === "vendor_price") return "NetSuite vendor price";
+  if (line.unitPriceSource === "last_purchase_price") return "Last Purchase Price";
+  if (line.unitPriceOverridden === true || line.unitPriceSource === "saved_load") return "Saved for this load";
+  if (Number.isFinite(Number(line.lastPurchasePrice)) && Number(line.lastPurchasePrice) > 0) return "Last Purchase Price";
+  return "Price unavailable";
+}
+
+function smartVendorPriceMarkup(line = {}, {
+  editable = false,
+  pallet = false,
+  focusKey = ""
+} = {}) {
+  const unit = line.purchaseUnit || line.unit || "UOM";
+  const source = smartVendorUnitPriceSource(line);
+  if (editable) {
+    const attribute = pallet ? "data-vendor-pallet-unit-price-input" : "data-vendor-unit-price-input";
+    return `<input ${attribute} type="number" min="0.000001" max="999999999" step="0.000001" value="${smartEscape(line.lastPurchasePrice ?? "")}" data-vendor-unit-price-override="${line.unitPriceOverridden === true}" data-smart-focus-key="${smartEscape(focusKey)}" aria-label="Unit price for ${smartEscape(line.itemName || "item")}" /><div class="smart-help">per ${smartEscape(unit)} · ${source}; clear to reset</div>${line.purchaseUnitMismatch === true ? `<div class="smart-help">Unit mismatch: ${smartEscape(line.unit || "stock unit")} vs ${smartEscape(unit)}</div>` : ""}`;
+  }
+  if (line.purchaseUnitMismatch === true) {
+    return `<span class="smart-help">Unit mismatch: ${smartEscape(line.unit || "stock unit")} vs ${smartEscape(unit)}</span>`;
+  }
+  const confirmed = line.priceChangedSinceVendorReply === true
+    && Number.isFinite(Number(line.vendorReplyConfirmedUnitPrice))
+    ? `<div class="smart-help">Vendor Reply confirmed at ${smartVendorMoney(line.vendorReplyConfirmedUnitPrice)}</div>`
+    : "";
+  return `${smartVendorMoney(line.lastPurchasePrice)}<div class="smart-help">per ${smartEscape(unit)} · ${source}</div>${confirmed}`;
+}
+
 function smartVendorEvidenceNumber(value, digits = 2) {
   const number = Number(value);
   return Number.isFinite(number) ? smartNumber(number, digits) : "—";
 }
 
-function smartVendorPhysicalPalletRows(proposal, editable) {
+function smartVendorPhysicalPalletRows(proposal, options = {}) {
+  const quantityEditable = typeof options === "boolean" ? options : options.quantityEditable === true;
+  const priceEditable = typeof options === "boolean" ? options : options.priceEditable === true;
   const workflowId = smartVendorWorkflowId(proposal);
   return (proposal.physicalPalletLines || []).map((line) => {
     const quantity = Number(line.quantity ?? line.salesQuantity ?? 0);
@@ -285,9 +405,10 @@ function smartVendorPhysicalPalletRows(proposal, editable) {
     const overridden = line.overridden === true || line.overrideQuantity !== null && line.overrideQuantity !== undefined;
     const itemWeight = Number(line.itemWeightLbs || 0);
     const lineWeight = Number(line.lineWeightLbs || 0);
-    const inputDisabled = !editable || !overridden ? "disabled" : "";
-    const toggleDisabled = editable ? "" : "disabled";
-    return `<tr class="smart-physical-pallet-line" data-vendor-physical-pallet-line="${smartEscape(line.id)}" data-vendor-pallet-destination="${smartEscape(line.destinationLocationId)}" data-vendor-pallet-automatic="${smartEscape(automaticQuantity)}"><td><strong>${smartEscape(line.itemName || "PALLET")}</strong> ${smartPill("reviewed", "Official PALLET")}<div class="smart-help">${line.itemId ? `ID ${smartEscape(line.itemId)} · ` : ""}Official ancillary item · ${itemWeight > 0 ? `${smartNumber(itemWeight, 0)} lb / ${smartEscape(line.unit || "EACH")}` : "NetSuite weight unavailable"}</div></td><td><strong>${smartEscape(line.destinationName || proposal.destinationName || "—")}</strong></td><td><strong>${overridden ? "Manual override" : "Automatic"}</strong><div class="smart-help">${overridden ? "Saved quantity is protected from automatic regeneration." : "Defaults to the material PLT for this destination."}</div></td><td class="numeric">${smartNumber(automaticQuantity, 2)} ${smartEscape(line.unit || "EACH")}</td><td><input data-vendor-pallet-quantity data-smart-focus-key="vendor-workflow:${workflowId}:pallet-line:${smartEscape(line.id)}:destination:${smartEscape(line.destinationLocationId)}:quantity" type="number" min="0" step="0.01" value="${smartEscape(quantity)}" ${inputDisabled} aria-label="Official PALLET quantity for ${smartEscape(line.destinationName || proposal.destinationName)}" /></td><td class="numeric" data-vendor-pallet-effective>${smartNumber(quantity, 2)} ${smartEscape(line.unit || "EACH")}</td><td class="numeric">${itemWeight > 0 ? `${smartNumber(lineWeight, 0)} lb` : "—"}</td><td><label class="smart-pallet-override-toggle"><input data-vendor-pallet-override-toggle data-smart-focus-key="vendor-workflow:${workflowId}:pallet-line:${smartEscape(line.id)}:destination:${smartEscape(line.destinationLocationId)}:override" type="checkbox" ${overridden ? "checked" : ""} ${toggleDisabled} /> Override</label></td></tr>`;
+    const purchaseAmount = smartVendorLinePurchaseAmount(line, quantity);
+    const inputDisabled = !quantityEditable || !overridden ? "disabled" : "";
+    const toggleDisabled = quantityEditable ? "" : "disabled";
+    return `<tr class="smart-physical-pallet-line" data-vendor-physical-pallet-line="${smartEscape(line.id)}" data-vendor-pallet-destination="${smartEscape(line.destinationLocationId)}" data-vendor-pallet-automatic="${smartEscape(automaticQuantity)}" data-vendor-pallet-unit="${smartEscape(line.unit || "EACH")}" data-vendor-pallet-price="${smartEscape(line.lastPurchasePrice ?? "")}" data-vendor-pallet-unit-mismatch="${line.purchaseUnitMismatch === true}"><td><strong>${smartEscape(line.itemName || "PALLET")}</strong> ${smartPill("reviewed", "Official PALLET")}<div class="smart-help">${line.itemId ? `ID ${smartEscape(line.itemId)} · ` : ""}Official ancillary item · ${itemWeight > 0 ? `${smartNumber(itemWeight, 0)} lb / ${smartEscape(line.unit || "EACH")}` : "NetSuite weight unavailable"}</div></td><td><strong>${smartEscape(line.destinationName || proposal.destinationName || "—")}</strong></td><td><strong>${overridden ? "Manual override" : "Automatic"}</strong><div class="smart-help">${overridden ? "Saved quantity is protected from automatic regeneration." : "Defaults to the material PLT for this destination."}</div></td><td class="numeric">${smartNumber(automaticQuantity, 2)} ${smartEscape(line.unit || "EACH")}</td><td><input data-vendor-pallet-quantity data-smart-focus-key="vendor-workflow:${workflowId}:pallet-line:${smartEscape(line.id)}:destination:${smartEscape(line.destinationLocationId)}:quantity" type="number" min="0" step="0.01" value="${smartEscape(quantity)}" ${inputDisabled} aria-label="Official PALLET quantity for ${smartEscape(line.destinationName || proposal.destinationName)}" /></td><td class="numeric" data-vendor-pallet-effective>${smartNumber(quantity, 2)} ${smartEscape(line.unit || "EACH")}</td><td class="numeric">${smartVendorPriceMarkup(line, { editable: priceEditable, pallet: true, focusKey: `vendor-workflow:${workflowId}:pallet-unit-price` })}</td><td class="numeric" data-vendor-pallet-amount>${smartVendorMoney(purchaseAmount)}</td><td class="numeric">${itemWeight > 0 ? `${smartNumber(lineWeight, 0)} lb` : "—"}</td><td><label class="smart-pallet-override-toggle"><input data-vendor-pallet-override-toggle data-smart-focus-key="vendor-workflow:${workflowId}:pallet-line:${smartEscape(line.id)}:destination:${smartEscape(line.destinationLocationId)}:override" type="checkbox" ${overridden ? "checked" : ""} ${toggleDisabled} /> Override</label></td></tr>`;
   }).join("");
 }
 
@@ -356,7 +477,7 @@ function smartVendorLoadCard(proposal) {
       <label class="smart-field smart-vendor-remarks"><span>Load remarks</span><input data-vendor-load-field="remarks" data-smart-focus-key="vendor-workflow:${workflowId}:load:remarks" value="${smartEscape(proposal.vendorRemarks || "")}" ${disabled} /></label>
       ${isBlanket ? `<label class="smart-field"><span>Split PO reference</span><input data-vendor-load-field="splitPoRef" data-smart-focus-key="vendor-workflow:${workflowId}:load:split-po-ref" value="${smartEscape(proposal.splitPurchaseOrderRef || "")}" placeholder="Enter after vendor reply" ${editable ? "" : "disabled"} /></label>` : ""}
     </div>
-    <div class="smart-proposal-lines smart-table-wrap"><table class="smart-table smart-vendor-lines"><thead><tr><th>Item</th><th>Location</th><th>Decision</th><th class="numeric">Requested</th><th class="numeric">Decision qty</th><th class="numeric">Decision sales qty</th><th class="numeric">Requested weight</th><th></th></tr></thead><tbody>
+    <div class="smart-proposal-lines smart-table-wrap"><table class="smart-table smart-vendor-lines"><thead><tr><th>Item</th><th>Location</th><th>Decision</th><th class="numeric">Requested</th><th class="numeric">Decision qty</th><th class="numeric">Decision sales qty</th><th class="numeric">Unit price</th><th class="numeric">Decision amount</th><th class="numeric">Requested weight</th><th></th></tr></thead><tbody>
       ${(proposal.lines || []).map((line) => {
         const decision = smartVendorReplyDecision(line, proposal);
         const requestedPallets = smartVendorPendingPallets(line, proposal);
@@ -367,9 +488,11 @@ function smartVendorLoadCard(proposal) {
         const quantityDisabled = !editable || decision === "cancel" ? "disabled" : "";
         const destinationLocationId = line.destinationLocationId || proposal.destinationLocationId || "";
         const destinationName = line.destinationName || proposal.destinationName || "—";
-        return `<tr data-vendor-reply-line="${line.id}" data-destination-location-id="${smartEscape(destinationLocationId)}" data-saved-destination-location-id="${smartEscape(destinationLocationId)}" data-requested-pallets="${requestedPallets}" data-to-plt="${Number(line.toPlt || 0)}" data-sales-unit="${smartEscape(line.unit || "UOM")}"><td><strong>${smartEscape(line.itemName)}</strong>${line.isAlternative ? ` ${smartPill("reviewed", "Alternative")}` : ""}<div class="smart-help">ID ${line.itemId} · ${smartEscape(line.itemDescription || line.unit || "")}${line.alternativeForLineId ? ` · replaces line ${line.alternativeForLineId}` : ""}</div></td><td>${editable ? `<select class="smart-line-destination-select" data-vendor-line-destination data-smart-focus-key="vendor-workflow:${workflowId}:line:${smartEscape(line.id)}:destination" aria-label="Destination yard for ${smartEscape(line.itemName)}">${smartVendorDestinationOptions(destinationLocationId, destinationName)}</select>` : `<strong>${smartEscape(destinationName)}</strong>`}</td><td><select data-vendor-line-field="decision" data-vendor-decision data-smart-focus-key="vendor-workflow:${workflowId}:line:${smartEscape(line.id)}:decision" ${disabled}>${smartVendorReplyOptions(decision)}</select></td><td class="numeric">${smartNumber(requestedPallets, 2)} PLT</td><td><input data-vendor-line-field="decisionPallets" data-vendor-decision-input data-vendor-confirmed-input data-smart-focus-key="vendor-workflow:${workflowId}:line:${smartEscape(line.id)}:decision-pallets" type="number" min="0.01" max="${requestedPallets}" step="0.01" value="${smartEscape(decisionPallets)}" ${quantityDisabled} /></td><td class="numeric" data-vendor-sales-quantity>${smartNumber(smartVendorLineSalesQuantity(line, decisionPallets), 3)} ${smartEscape(line.unit || "UOM")}</td><td class="numeric">${smartNumber(requestedWeight, 0)} lb</td><td>${editable && line.isAlternative ? `<button class="smart-button danger" data-smart-action="remove-vendor-alternative" data-proposal-id="${proposal.id}" data-line-id="${line.id}" type="button">Remove</button>` : ""}</td></tr>`;
+        const salesQuantity = smartVendorLineSalesQuantity(line, decisionPallets);
+        const purchaseAmount = smartVendorLinePurchaseAmount(line, salesQuantity);
+        return `<tr data-vendor-reply-line="${line.id}" data-destination-location-id="${smartEscape(destinationLocationId)}" data-saved-destination-location-id="${smartEscape(destinationLocationId)}" data-requested-pallets="${requestedPallets}" data-to-plt="${Number(line.toPlt || 0)}" data-sales-unit="${smartEscape(line.unit || "UOM")}" data-last-purchase-price="${smartEscape(line.lastPurchasePrice ?? "")}" data-purchase-unit-mismatch="${line.purchaseUnitMismatch === true}"><td><strong>${smartEscape(line.itemName)}</strong>${line.isAlternative ? ` ${smartPill("reviewed", "Alternative")}` : ""}<div class="smart-help">ID ${line.itemId} · ${smartEscape(line.itemDescription || line.unit || "")}${line.alternativeForLineId ? ` · replaces line ${line.alternativeForLineId}` : ""}</div></td><td>${editable ? `<select class="smart-line-destination-select" data-vendor-line-destination data-smart-focus-key="vendor-workflow:${workflowId}:line:${smartEscape(line.id)}:destination" aria-label="Destination yard for ${smartEscape(line.itemName)}">${smartVendorDestinationOptions(destinationLocationId, destinationName)}</select>` : `<strong>${smartEscape(destinationName)}</strong>`}</td><td><select data-vendor-line-field="decision" data-vendor-decision data-smart-focus-key="vendor-workflow:${workflowId}:line:${smartEscape(line.id)}:decision" ${disabled}>${smartVendorReplyOptions(decision)}</select></td><td class="numeric">${smartNumber(requestedPallets, 2)} PLT</td><td><input data-vendor-line-field="decisionPallets" data-vendor-decision-input data-vendor-confirmed-input data-smart-focus-key="vendor-workflow:${workflowId}:line:${smartEscape(line.id)}:decision-pallets" type="number" min="0.01" max="${requestedPallets}" step="0.01" value="${smartEscape(decisionPallets)}" ${quantityDisabled} /></td><td class="numeric" data-vendor-sales-quantity>${smartNumber(salesQuantity, 3)} ${smartEscape(line.unit || "UOM")}</td><td class="numeric">${smartVendorPriceMarkup(line, { editable, focusKey: `vendor-workflow:${workflowId}:line:${line.id}:unit-price` })}</td><td class="numeric" data-vendor-sales-amount>${smartVendorMoney(purchaseAmount)}</td><td class="numeric">${smartNumber(requestedWeight, 0)} lb</td><td>${editable && line.isAlternative ? `<button class="smart-button danger" data-smart-action="remove-vendor-alternative" data-proposal-id="${proposal.id}" data-line-id="${line.id}" type="button">Remove</button>` : ""}</td></tr>`;
       }).join("")}
-      ${smartVendorPhysicalPalletRows(proposal, editable && !isBlanket)}
+      ${smartVendorPhysicalPalletRows(proposal, { quantityEditable: editable && !isBlanket, priceEditable: editable })}
     </tbody></table></div>
     ${editable ? `<div class="smart-vendor-alternative">
       <div><strong>Add alternative item</strong><div class="smart-help">${isBlanket ? "Blanket alternatives must come from the same source PO and its remaining quantity." : "Candidates must be planning enabled for this destination yard and use the same NetSuite vendor, pallet conversion, and weight. Suggestions are ranked by yard need and demand."}</div></div>
@@ -408,6 +531,13 @@ function smartVendorLoadPayload(card) {
     row.querySelectorAll("[data-vendor-line-field]").forEach((input) => {
       line[input.dataset.vendorLineField] = input.dataset.vendorLineField === "decisionPallets" ? Number(input.value || 0) : input.value;
     });
+    const unitPriceInput = row.querySelector("[data-vendor-unit-price-input]");
+    if (unitPriceInput && (unitPriceInput.dataset.vendorUnitPriceDirty === "true"
+      || unitPriceInput.dataset.vendorUnitPriceOverride === "true")) {
+      line.unitPrice = String(unitPriceInput.value || "").trim() === ""
+        ? null
+        : Number(unitPriceInput.value);
+    }
     payload.lines.push(line);
   });
   if (card.dataset.vendorKind !== "blanket_po") card.querySelectorAll("[data-vendor-pallet-destination]").forEach((row) => {
@@ -418,6 +548,14 @@ function smartVendorLoadPayload(card) {
       ? rawQuantity.trim() === "" ? Number.NaN : Number(rawQuantity)
       : null;
   });
+  const palletPriceInputs = [...card.querySelectorAll("[data-vendor-pallet-unit-price-input]")];
+  const palletPriceInput = palletPriceInputs.find((input) => input.dataset.vendorUnitPriceDirty === "true")
+    || palletPriceInputs.find((input) => input.dataset.vendorUnitPriceOverride === "true");
+  if (palletPriceInput) {
+    payload.palletUnitPrice = String(palletPriceInput.value || "").trim() === ""
+      ? null
+      : Number(palletPriceInput.value);
+  }
   return payload;
 }
 
@@ -428,6 +566,25 @@ function smartUpdateVendorReplyLine(row) {
   const salesQuantity = decisionPallets * Number(row.dataset.toPlt || 0);
   const salesTarget = row.querySelector("[data-vendor-sales-quantity]");
   if (salesTarget) salesTarget.textContent = `${smartNumber(salesQuantity, 3)} ${row.dataset.salesUnit || "UOM"}`;
+  const amountTarget = row.querySelector("[data-vendor-sales-amount]");
+  const priceInput = row.querySelector("[data-vendor-unit-price-input]");
+  if (amountTarget) amountTarget.textContent = smartVendorMoney(smartVendorLinePurchaseAmount({
+    lastPurchasePrice: priceInput ? priceInput.value : row.dataset.lastPurchasePrice,
+    purchaseUnitMismatch: row.dataset.purchaseUnitMismatch === "true"
+  }, salesQuantity));
+}
+
+function smartUpdateVendorPalletLine(row) {
+  const input = row?.querySelector("[data-vendor-pallet-quantity]");
+  const quantity = Math.max(Number(input?.value || 0), 0);
+  const effectiveTarget = row?.querySelector("[data-vendor-pallet-effective]");
+  if (effectiveTarget) effectiveTarget.textContent = `${smartNumber(quantity, 2)} ${row.dataset.vendorPalletUnit || "EACH"}`;
+  const amountTarget = row?.querySelector("[data-vendor-pallet-amount]");
+  const priceInput = row?.querySelector("[data-vendor-pallet-unit-price-input]");
+  if (amountTarget) amountTarget.textContent = smartVendorMoney(smartVendorLinePurchaseAmount({
+    lastPurchasePrice: priceInput ? priceInput.value : row.dataset.vendorPalletPrice,
+    purchaseUnitMismatch: row.dataset.vendorPalletUnitMismatch === "true"
+  }, quantity));
 }
 
 function smartUpdateVendorConfirmedTotal(card) {
@@ -440,6 +597,13 @@ function smartUpdateVendorConfirmedTotal(card) {
 }
 
 function smartValidateVendorLoadPayload(payload) {
+  const validateUnitPrice = (value, label) => {
+    if (value === null || value === undefined) return;
+    if (!Number.isFinite(Number(value))) throw new Error(`${label} must be a valid number.`);
+    if (!(Number(value) > 0)) throw new Error(`${label} must be greater than zero.`);
+    if (Number(value) > 999999999) throw new Error(`${label} must be below 1,000,000,000.`);
+  };
+  if (Object.hasOwn(payload, "palletUnitPrice")) validateUnitPrice(payload.palletUnitPrice, "PALLET unit price");
   for (const quantity of Object.values(payload.palletQuantityOverrides || {})) {
     if (quantity === null) continue;
     if (!Number.isFinite(Number(quantity)) || Number(quantity) < 0) {
@@ -447,6 +611,7 @@ function smartValidateVendorLoadPayload(payload) {
     }
   }
   for (const line of payload.lines || []) {
+    if (Object.hasOwn(line, "unitPrice")) validateUnitPrice(line.unitPrice, "Unit price");
     if (!Number.isInteger(Number(line.destinationLocationId)) || Number(line.destinationLocationId) <= 0) {
       throw new Error("Every vendor reply line needs a valid destination yard.");
     }
@@ -518,16 +683,18 @@ smartScmApp.addEventListener("click", async (event) => {
   const button = event.target.closest("[data-smart-action]");
   if (!button || smartState.busy) return;
   const action = button.dataset.smartAction;
-  if (!["open-vendor-load", "refresh-vendor-loads", "save-vendor-load", "confirm-vendor-load", "remove-vendor-load", "suggest-vendor-alternatives", "add-vendor-alternative", "remove-vendor-alternative", "toggle-vendor-email", "close-vendor-email", "save-vendor-email", "copy-vendor-email-rich", "copy-vendor-email-plain", "open-vendor-gmail", "create-vendor-po", "create-blanket-split", "archive-vendor-workflow", "preview-vendor-po", "close-vendor-po-preview"].includes(action)) return;
+  if (!["open-vendor-load", "refresh-vendor-loads", "save-vendor-load", "confirm-vendor-load", "remove-vendor-load", "suggest-vendor-alternatives", "add-vendor-alternative", "remove-vendor-alternative", "toggle-vendor-email", "close-vendor-email", "save-vendor-email", "copy-vendor-email-rich", "copy-vendor-email-plain", "open-vendor-gmail", "create-vendor-po", "create-blanket-split", "archive-vendor-workflow", "preview-vendor-po", "retry-vendor-po-preview", "close-vendor-po-preview"].includes(action)) return;
   try {
     if (action === "close-vendor-po-preview") {
-      smartVendorPoPreview = null;
+      smartVendorClosePoPreview();
       smartRender();
+    } else if (action === "retry-vendor-po-preview") {
+      await smartVendorLoadPoPreview(smartVendorPoPreview || {});
     } else if (action === "toggle-vendor-email") {
       const workflowId = Number(button.dataset.workflowId);
       const proposal = (smartState.vendorReplyLoads || []).find((load) => smartVendorWorkflowId(load) === workflowId);
       if (!proposal) throw new Error("This Vendor Replies workflow is no longer available. Refresh the list and try again.");
-      smartVendorPoPreview = null;
+      smartVendorClosePoPreview();
       smartVendorEmailModalWorkflowId = workflowId;
       smartVendorStartEmailDraft(proposal);
       smartRender();
@@ -619,11 +786,10 @@ smartScmApp.addEventListener("click", async (event) => {
       const card = button.closest("[data-vendor-load]");
       smartVendorEmailModalWorkflowId = null;
       smartVendorEmailModalDraft = null;
-      smartVendorPoPreview = {
+      await smartVendorLoadPoPreview({
         workflowId: Number(button.dataset.workflowId),
         label: card?.querySelector(".smart-vendor-card-facts span:last-child")?.textContent?.trim() || "NetSuite purchase order"
-      };
-      smartRender();
+      });
     } else if (action === "open-vendor-load") {
       smartState.tab = "vendors";
       smartState.vendorSearch = "";
@@ -738,6 +904,7 @@ smartScmApp.addEventListener("change", (event) => {
       if (!palletToggle.checked) input.value = row.dataset.vendorPalletAutomatic || "0";
       else input.focus();
     }
+    smartUpdateVendorPalletLine(row);
     return;
   }
   const decisionSelect = event.target.closest("[data-vendor-decision]");
@@ -768,11 +935,30 @@ smartScmApp.addEventListener("input", (event) => {
     }
     return;
   }
+  if (event.target.matches("[data-vendor-unit-price-input]")) {
+    event.target.dataset.vendorUnitPriceDirty = "true";
+    const row = event.target.closest("[data-vendor-reply-line]");
+    if (row) smartUpdateVendorReplyLine(row);
+    return;
+  }
+  if (event.target.matches("[data-vendor-pallet-unit-price-input]")) {
+    const card = event.target.closest("[data-vendor-load]");
+    card?.querySelectorAll("[data-vendor-pallet-unit-price-input]").forEach((input) => {
+      input.value = event.target.value;
+      input.dataset.vendorUnitPriceDirty = "true";
+    });
+    card?.querySelectorAll("[data-vendor-pallet-destination]").forEach(smartUpdateVendorPalletLine);
+    return;
+  }
   if (event.target.matches("[data-vendor-decision-input]")) {
     const row = event.target.closest("[data-vendor-reply-line]");
     const card = event.target.closest("[data-vendor-load]");
     if (row) smartUpdateVendorReplyLine(row);
     if (card) smartUpdateVendorConfirmedTotal(card);
+    return;
+  }
+  if (event.target.matches("[data-vendor-pallet-quantity]")) {
+    smartUpdateVendorPalletLine(event.target.closest("[data-vendor-pallet-destination]"));
     return;
   }
   if (event.target.id === "smartVendorLoadSearch") {
@@ -806,7 +992,9 @@ window.addEventListener("keydown", (event) => {
     return;
   }
   if (smartVendorPoPreview) {
-    smartVendorPoPreview = null;
+    smartVendorClosePoPreview();
     smartRender();
   }
 });
+
+window.addEventListener("beforeunload", () => smartVendorReleasePoPreviewDocument());

@@ -7,13 +7,20 @@ import {
   DRIVER_PWA_MINIMUM_VERSION
 } from "./driver-client-version.js";
 import { createSamsaraDriverVehicleAssignment, createSamsaraMechanicDvir, findSamsaraDvirForVehicle, setSamsaraDriverDutyStatus } from "./samsara.js";
-import { dispatchLoadAssignment, dispatchOwnYardCodes, flattenDispatchPlanLoads, normalizeDispatchPlanLoadAssignments } from "./dispatch-load-assignment.js";
+import {
+  dispatchLoadAssignment,
+  dispatchOwnYardCodes,
+  dispatchPhysicalStopVisits,
+  flattenDispatchPlanLoads,
+  normalizeDispatchPlanLoadAssignments
+} from "./dispatch-load-assignment.js";
 import {
   dispatchLocationKey,
   dispatchLocationRoot,
   dispatchLocationsShareYard,
   uniqueDispatchLocations
 } from "./dispatch-location.js";
+import { getDeliveryInstructionsForDriverOrderIds } from "./delivery-instruction-repository.js";
 
 const YARD_ADDRESSES = {
   "3445": "3445 Kennedy Road, Toronto, ON",
@@ -282,6 +289,44 @@ function expandOrderRefs(plan, refs) {
     append(ref);
   });
   return expanded;
+}
+
+function driverDetailOrderScopesForVisit(plan, visit = null, fallbackStop = null) {
+  const entries = visit?.entries?.length ? visit.entries : fallbackStop ? [{ stop: fallbackStop }] : [];
+  const scopes = new Map();
+  for (const entry of entries) {
+    const stop = entry.stop || {};
+    const lineRowIds = [...new Set((stop.lineRowIds || []).map(String).filter(Boolean))];
+    for (const orderRef of expandOrderRefs(plan, [stop.orderId])) {
+      const existing = scopes.get(orderRef);
+      if (!existing) {
+        scopes.set(orderRef, {
+          orderRef,
+          lineRowIds,
+          dropLocation: dropLocationForStop(stop, orderByRef(plan, orderRef) || entry.order || {}),
+          destinationLocationId: stop.destinationLocationId ?? null,
+          unscoped: lineRowIds.length === 0
+        });
+        continue;
+      }
+      existing.unscoped = existing.unscoped || lineRowIds.length === 0;
+      existing.lineRowIds = existing.unscoped
+        ? []
+        : [...new Set([...existing.lineRowIds, ...lineRowIds])];
+    }
+  }
+  return [...scopes.values()].map(({ unscoped, ...scope }) => scope);
+}
+
+function driverPhysicalVisitByStopId(plan, truck, load) {
+  const byStopId = new Map();
+  for (const visit of dispatchPhysicalStopVisits(plan, truck, load)) {
+    for (const entry of visit.entries || []) {
+      const stopId = String(entry.stop?.id || "");
+      if (stopId) byStopId.set(stopId, visit);
+    }
+  }
+  return byStopId;
 }
 
 function yardAddress(value) {
@@ -783,7 +828,7 @@ function buildTruckSwitchJob(plan, previousAssignment, nextAssignment, sequenceI
   };
 }
 
-function buildJob(plan, truck, load, stop, truckIndex, loadIndex, stopIndex) {
+function buildJob(plan, truck, load, stop, truckIndex, loadIndex, stopIndex, physicalVisit = null) {
   const isPickup = stop.type === "pick";
   const relatedStops = isPickup ? dropStopsForPickup(plan, load, stop.location) : [stop];
   const stopOrderRefs = [...new Set(relatedStops.map((item) => String(item.orderId || "")).filter(Boolean))];
@@ -811,6 +856,12 @@ function buildJob(plan, truck, load, stop, truckIndex, loadIndex, stopIndex) {
   const physicalPickupLocation = isPickup ? stopLocationLabel(plan, stop) : "";
   const dropLocation = isPickup ? "" : dropLocationForStop(stop, firstOrder);
   const dropAddress = isPickup ? "" : dropAddressForStop(stop, firstOrder);
+  const detailOrderScopes = isPickup ? [] : driverDetailOrderScopesForVisit(plan, physicalVisit, stop);
+  const physicalVisitStops = isPickup
+    ? [stop]
+    : (physicalVisit?.entries?.length ? physicalVisit.entries.map((entry) => entry.stop) : [stop]);
+  const physicalVisitJobIds = physicalVisitStops.map((visitStop) => jobId(plan, truck, load, visitStop));
+  const physicalVisitStopIds = physicalVisitStops.map((visitStop) => String(visitStop?.id || "")).filter(Boolean);
   return {
     jobId: jobId(plan, truck, load, stop),
     planId: plan.id,
@@ -837,6 +888,11 @@ function buildJob(plan, truck, load, stop, truckIndex, loadIndex, stopIndex) {
     windowEnd: isPickup ? "" : (firstOrder.windowEnd || ""),
     instructions: firstOrder.notes || firstOrder.dispatchInstructions || "",
     orderRefs,
+    detailOrderRefs: detailOrderScopes.map((scope) => scope.orderRef),
+    detailOrderScopes,
+    physicalVisitJobIds,
+    physicalVisitStopIds,
+    consolidatedPhysicalVisit: physicalVisitJobIds.length > 1,
     orderTypes: [...new Set(orderRefs.map((ref) => directTransferRefs.includes(ref) ? "TO" : orderByRef(plan, ref)?.type).filter(Boolean))],
     dependencyPickupManifests,
     requiredPhotos: 2,
@@ -926,6 +982,22 @@ async function confirmedPlans({ startDate = "" } = {}) {
   return overlayLiveVrmaRouteDetails(sortedPlans(result.rows));
 }
 
+export async function driverCanViewDeliverySalesOrder(driverLogin, orderRef) {
+  const login = driverKey(driverLogin);
+  const requestedRef = String(orderRef || "").trim().toLowerCase();
+  if (!login || !requestedRef) return false;
+  for (const plan of await confirmedPlans({ startDate: todayLocalDate() })) {
+    if (!driverLoadAssignments(plan, login).length) continue;
+    const matchingOrder = orderByRef(plan, orderRef);
+    if (matchingOrder && String(matchingOrder.type || "").trim().toUpperCase() !== "SO") continue;
+    if (planJobsForDriver(plan, login, { allowBin: true }).some((job) =>
+      job.stopType === "dropoff"
+      && (job.orderRefs || []).some((ref) => String(ref || "").trim().toLowerCase() === requestedRef)
+    )) return true;
+  }
+  return false;
+}
+
 function planJobsForTruck(plan, truck, truckIndex) {
   const jobs = [];
   (truck.loads || []).forEach((load, loadIndex) => {
@@ -937,6 +1009,7 @@ function planJobsForTruck(plan, truck, truckIndex) {
     const travelJob = buildTravelJob(plan, truck, load, truckIndex, loadIndex);
     if (travelJob) jobs.push(travelJob);
     const requireInterStopTravel = loadHasDirectDependency(plan, load);
+    const physicalVisitByStopId = driverPhysicalVisitByStopId(plan, truck, load);
     let previousRoutedStop = null;
     (load.stops || []).forEach((stop, stopIndex) => {
       if (!["pick", "drop"].includes(stop.type)) return;
@@ -944,7 +1017,16 @@ function planJobsForTruck(plan, truck, truckIndex) {
         const legJob = buildInterStopTravelJob(plan, truck, load, previousRoutedStop, stop, truckIndex, loadIndex, stopIndex);
         if (legJob) jobs.push(legJob);
       }
-      jobs.push(buildJob(plan, truck, load, stop, truckIndex, loadIndex, stopIndex));
+      jobs.push(buildJob(
+        plan,
+        truck,
+        load,
+        stop,
+        truckIndex,
+        loadIndex,
+        stopIndex,
+        physicalVisitByStopId.get(String(stop.id || "")) || null
+      ));
       previousRoutedStop = stop;
     });
   });
@@ -995,6 +1077,7 @@ function materializePlanJobsForDriver(plan, driverLogin, { allowBin = false } = 
     const travelJob = buildTravelJob(plan, truck, load, truckIndex, assignmentIndex, previousAssignment);
     if (travelJob) jobs.push(travelJob);
     const requireInterStopTravel = loadHasDirectDependency(plan, load);
+    const physicalVisitByStopId = driverPhysicalVisitByStopId(plan, truck, load);
     let previousRoutedStop = null;
     (load.stops || []).forEach((stop, stopIndex) => {
       if (allowBin && stop?.mbt) {
@@ -1007,7 +1090,16 @@ function materializePlanJobsForDriver(plan, driverLogin, { allowBin = false } = 
         const legJob = buildInterStopTravelJob(plan, truck, load, previousRoutedStop, stop, truckIndex, assignmentIndex, stopIndex);
         if (legJob) jobs.push(legJob);
       }
-      jobs.push(buildJob(plan, truck, load, stop, truckIndex, assignmentIndex, stopIndex));
+      jobs.push(buildJob(
+        plan,
+        truck,
+        load,
+        stop,
+        truckIndex,
+        assignmentIndex,
+        stopIndex,
+        physicalVisitByStopId.get(String(stop.id || "")) || null
+      ));
       previousRoutedStop = stop;
     });
   });
@@ -1897,6 +1989,8 @@ function orderDetailsFromPlan(orderRef, planOrder = null, context = {}) {
     .map((item) => planItemForPickup(item, { ...context, orderType: planOrder?.type || context.orderType }))
     .filter(planItemHasQuantity);
   return {
+    orderId: Number(planOrder?.netsuiteId || planOrder?.netsuite_id || 0) || null,
+    orderType: String(planOrder?.type || context.orderType || "").trim().toUpperCase(),
     orderRef,
     party: planOrder?.customer || planOrder?.vendor || planOrder?.party || "",
     source: "dispatch_plan",
@@ -1929,6 +2023,8 @@ async function orderDetails(orderRef, typeHint = "", planOrder = null, context =
   }));
   if (!items.length && planOrder?.items?.length) return orderDetailsFromPlan(orderRef, planOrder, context);
   return {
+    orderId: Number(detail.netsuite_id || detail.id || 0) || null,
+    orderType: String(detail.order_type || typeHint || "").trim().toUpperCase(),
     orderRef,
     party: detail.party || "",
     source: detail.source,
@@ -1936,7 +2032,61 @@ async function orderDetails(orderRef, typeHint = "", planOrder = null, context =
   };
 }
 
-async function materializeDriverJob(plan, job, status = null) {
+function materializedDriverSalesOrders(materialized) {
+  return (materialized?.orders || []).filter((order) =>
+    String(order?.orderType || "").trim().toUpperCase() === "SO"
+    || String(order?.orderType || "").trim().toLowerCase() === "sales_order"
+  );
+}
+
+async function attachDriverDeliveryInstructions(materialized, preloadedInstructionByOrderId = null) {
+  materialized.deliveryInstructions = { revision: 0, orders: [] };
+  if (materialized.stopType !== "dropoff") return materialized;
+  const salesOrders = materializedDriverSalesOrders(materialized);
+  const instructionByOrderId = preloadedInstructionByOrderId
+    || await getDeliveryInstructionsForDriverOrderIds(
+      salesOrders.map((order) => order.orderId).filter(Boolean)
+    );
+  const instructionOrders = [];
+  const seenInstructionOrders = new Set();
+  for (const order of salesOrders) {
+    const instruction = instructionByOrderId[order.orderId] || {
+      orderId: order.orderId,
+      orderRef: order.orderRef,
+      customer: order.party || "",
+      revision: 0,
+      automatic: { text: "", phones: [], fallbackUsed: false, source: "empty" },
+      additionalText: "",
+      media: []
+    };
+    const instructionIdentity = String(
+      instruction.instructionOrderId || instruction.instructionOrderRef || instruction.orderId || instruction.orderRef || ""
+    ).trim().toUpperCase();
+    if (instructionIdentity && seenInstructionOrders.has(instructionIdentity)) continue;
+    if (instructionIdentity) seenInstructionOrders.add(instructionIdentity);
+    instructionOrders.push({
+      ...instruction,
+      orderId: instruction.instructionOrderId || instruction.orderId,
+      orderRef: instruction.instructionOrderRef || instruction.orderRef
+    });
+  }
+  materialized.deliveryInstructions = {
+    revision: Math.max(0, ...instructionOrders.map((instruction) => Number(instruction.revision || 0))),
+    orders: instructionOrders.map((instruction) => ({
+      orderId: instruction.orderId,
+      orderRef: instruction.orderRef,
+      customer: instruction.customer || "",
+      automaticText: instruction.automatic?.text || "",
+      fallbackUsed: instruction.automatic?.fallbackUsed === true,
+      phones: Array.isArray(instruction.automatic?.phones) ? instruction.automatic.phones : [],
+      additionalText: instruction.additionalText || "",
+      media: Array.isArray(instruction.media) ? instruction.media : []
+    }))
+  };
+  return materialized;
+}
+
+async function materializeDriverJob(plan, job, status = null, { deferDeliveryInstructions = false } = {}) {
   const materialized = {
     ...job,
     status: status?.status || "pending",
@@ -1949,7 +2099,16 @@ async function materializeDriverJob(plan, job, status = null) {
   } else if (materialized.stopType === "pickup") {
     materialized.address = await locationAddress(materialized.address || materialized.location);
   }
-  materialized.orders = await Promise.all(materialized.orderRefs.map((ref) => {
+  const displayScopes = materialized.stopType === "dropoff" && materialized.detailOrderScopes?.length
+    ? materialized.detailOrderScopes
+    : (materialized.orderRefs || []).map((orderRef) => ({
+        orderRef,
+        lineRowIds: materialized.stopType === "dropoff" ? materialized.lineRowIds || [] : [],
+        dropLocation: materialized.dropLocation || materialized.location || "",
+        destinationLocationId: materialized.destinationLocationId ?? null
+      }));
+  materialized.orders = await Promise.all(displayScopes.map((scope) => {
+    const ref = scope.orderRef;
     const dependencyManifest = (materialized.dependencyPickupManifests || [])
       .find((entry) => String(entry.transferOrderRef || "") === String(ref));
     if (dependencyManifest) {
@@ -1973,7 +2132,7 @@ async function materializeDriverJob(plan, job, status = null) {
       };
     }
     const hint = orderByRef(plan, ref)?.type
-      || (materialized.orderTypes.length === 1 ? materialized.orderTypes[0] : "");
+      || ((materialized.orderTypes || []).length === 1 ? materialized.orderTypes[0] : "");
     return orderDetails(ref, hint, orderByRef(plan, ref), {
       plan,
       stopType: materialized.stopType,
@@ -1981,12 +2140,14 @@ async function materializeDriverJob(plan, job, status = null) {
         ? materialized.pickupLocation || materialized.location
         : "",
       dropLocation: materialized.stopType === "dropoff"
-        ? materialized.dropLocation || materialized.location
+        ? scope.dropLocation || materialized.dropLocation || materialized.location
         : "",
-      destinationLocationId: materialized.destinationLocationId ?? null,
-      lineRowIds: materialized.stopType === "dropoff" ? materialized.lineRowIds || [] : []
+      destinationLocationId: scope.destinationLocationId ?? materialized.destinationLocationId ?? null,
+      lineRowIds: materialized.stopType === "dropoff" ? scope.lineRowIds || [] : []
     });
   }));
+  if (deferDeliveryInstructions) materialized.deliveryInstructions = { revision: 0, orders: [] };
+  else await attachDriverDeliveryInstructions(materialized);
   return materialized;
 }
 
@@ -2024,15 +2185,26 @@ export async function getDriverDayJobs(driverLogin, {
   }
   const jobs = planJobsForDriver(plan, login, { allowBin });
   const statuses = await jobStatusMap(jobs.map((job) => job.jobId));
+  const materializedJobs = await Promise.all(jobs.map(async (job) => materializeDriverJob(
+    plan,
+    await enrichMbtDriverJob(job, { allowBin, clientVersion, minimumClientVersion }),
+    statuses.get(job.jobId),
+    { deferDeliveryInstructions: true }
+  )));
+  const instructionByOrderId = await getDeliveryInstructionsForDriverOrderIds(
+    materializedJobs
+      .flatMap(materializedDriverSalesOrders)
+      .map((order) => order.orderId)
+      .filter(Boolean)
+  );
+  await Promise.all(materializedJobs.map((job) =>
+    attachDriverDeliveryInstructions(job, instructionByOrderId)
+  ));
   return {
     planId: plan.id,
     planDate: plan.planDate,
     revision: Number(plan.revision || 0),
-    jobs: await Promise.all(jobs.map(async (job) => materializeDriverJob(
-      plan,
-      await enrichMbtDriverJob(job, { allowBin, clientVersion, minimumClientVersion }),
-      statuses.get(job.jobId)
-    )))
+    jobs: materializedJobs
   };
 }
 
@@ -2110,12 +2282,39 @@ function driverJobRecordDetails(job = {}, { driverRemark } = {}) {
     dropAddress: job.dropAddress || "",
     destinationLocationId: job.destinationLocationId ?? null,
     lineRowIds: Array.isArray(job.lineRowIds) ? job.lineRowIds.map(String) : [],
+    physicalVisitJobIds: Array.isArray(job.physicalVisitJobIds) ? job.physicalVisitJobIds.map(String) : [],
+    physicalVisitStopIds: Array.isArray(job.physicalVisitStopIds) ? job.physicalVisitStopIds.map(String) : [],
+    consolidatedPhysicalVisit: job.consolidatedPhysicalVisit === true,
     windowStart: job.windowStart || "",
     windowEnd: job.windowEnd || "",
     instructions: job.instructions || "",
     orderTypes: Array.isArray(job.orderTypes) ? job.orderTypes : [],
     requiredPhotos: Math.max(0, Number(job.requiredPhotos || 0)),
+    deliveryInstructions: {
+      revision: Number(job.deliveryInstructions?.revision || 0),
+      orders: (Array.isArray(job.deliveryInstructions?.orders) ? job.deliveryInstructions.orders : []).map((instruction) => ({
+        orderId: instruction?.orderId || null,
+        orderRef: instruction?.orderRef || "",
+        customer: instruction?.customer || "",
+        automaticText: instruction?.automaticText || "",
+        fallbackUsed: instruction?.fallbackUsed === true,
+        phones: Array.isArray(instruction?.phones) ? instruction.phones : [],
+        additionalText: instruction?.additionalText || "",
+        media: (Array.isArray(instruction?.media) ? instruction.media : []).map((media) => ({
+          id: media?.id || "",
+          mediaKind: media?.mediaKind || "",
+          mimeType: media?.mimeType || "",
+          fileName: media?.fileName || "",
+          byteSize: Number(media?.byteSize || 0),
+          position: Number(media?.position || 0),
+          contentUrl: media?.contentUrl || "",
+          onlineOnly: media?.onlineOnly === true
+        }))
+      }))
+    },
     orders: (Array.isArray(job.orders) ? job.orders : []).map((order) => ({
+      orderId: order?.orderId || null,
+      orderType: order?.orderType || "",
       orderRef: order?.orderRef || "",
       party: order?.party || "",
       source: order?.source || "",

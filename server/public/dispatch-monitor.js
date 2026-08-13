@@ -5,6 +5,10 @@ const displayDate = (value) => window.MBBS_I18N?.displayDate(value) || "";
 const SALES_MONITOR_HOST = window.location.pathname.startsWith("/sales/");
 const MAP_CENTER = { lat: 43.82, lng: -79.45 };
 const LAST_KNOWN_FALLBACK_MS = 10 * 60 * 1000;
+const ETA_CACHE_MS = 2 * 60 * 1000;
+const ETA_MIN_REFRESH_MS = 45 * 1000;
+const ETA_REUSE_DISTANCE_METERS = 2000;
+const ETA_LOCATION_MAX_AGE_MS = 15 * 60 * 1000;
 const TRUCK_COLORS = [
   "#155eef", "#0f8f4f", "#b42318", "#7a2ea8", "#b54708",
   "#027a8f", "#c11574", "#475467", "#d92d20", "#039855",
@@ -20,6 +24,7 @@ let monitorLoading = false;
 let monitorTimer = null;
 let monitorMap = null;
 let monitorInfoWindow = null;
+let monitorInfoWindowPlate = "";
 let monitorMarkers = [];
 let monitorTrailLines = [];
 let monitorTruckMarkers = new Map();
@@ -29,8 +34,14 @@ let monitorLastTruckLocations = readLastTruckLocations();
 let selectedTruckPlate = "";
 let selectedMonitorOrderKey = "";
 let monitorOrderSearch = "";
-let monitorTooltipOrderKey = "";
+let monitorTooltipIdentity = "";
+let monitorEtaByPlate = new Map();
+let monitorEtaRequests = new Map();
+let monitorDirectionsService = null;
+let monitorEtaRoutingAvailable = null;
 let mapHasFitBounds = false;
+let monitorMapRenderGeneration = 0;
+let monitorLoadGeneration = 0;
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({
@@ -121,6 +132,91 @@ function monitorItemQuantity(item = {}) {
 function formatKmh(value) {
   const speed = Number(value);
   return Number.isFinite(speed) ? `${Math.round(speed)} km/h` : "-- km/h";
+}
+
+function formatEtaArrival(value) {
+  const date = value ? new Date(value) : null;
+  if (!date || Number.isNaN(date.getTime())) return "—";
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function monitorDistanceMeters(left = {}, right = {}) {
+  const leftLat = Number(left.latitude ?? left.lat);
+  const leftLng = Number(left.longitude ?? left.lng);
+  const rightLat = Number(right.latitude ?? right.lat);
+  const rightLng = Number(right.longitude ?? right.lng);
+  if (![leftLat, leftLng, rightLat, rightLng].every(Number.isFinite)) return Number.POSITIVE_INFINITY;
+  const radians = (degrees) => degrees * Math.PI / 180;
+  const deltaLat = radians(rightLat - leftLat);
+  const deltaLng = radians(rightLng - leftLng);
+  const a = Math.sin(deltaLat / 2) ** 2
+    + Math.cos(radians(leftLat)) * Math.cos(radians(rightLat)) * Math.sin(deltaLng / 2) ** 2;
+  return 6371000 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function sortedMonitorTrucks() {
+  return [...(monitorData.trucks || [])].sort((left, right) =>
+    Number(Boolean(right.activeLoad)) - Number(Boolean(left.activeLoad))
+      || String(left.plate || "").localeCompare(String(right.plate || ""), undefined, { numeric: true, sensitivity: "base" })
+  );
+}
+
+function monitorTruckByPlate(plate) {
+  return (monitorData.trucks || []).find((truck) => normalizedPlate(truck.plate) === normalizedPlate(plate)) || null;
+}
+
+function monitorEtaDestination(truck = {}) {
+  const raw = String(truck.activeLoad?.nextStop?.routeDestination || truck.activeLoad?.nextStop?.location || "").trim();
+  if (!raw) return null;
+  const normalized = normalizedAddress(raw);
+  const yard = (monitorData.yards || []).find((candidate) => [
+    candidate.id,
+    candidate.code,
+    candidate.name,
+    candidate.yard,
+    candidate.address
+  ].some((value) => normalizedAddress(value) === normalized));
+  if (isCanadaPoint(yard)) return { lat: Number(yard.lat), lng: Number(yard.lng) };
+  return String(yard?.address || raw);
+}
+
+function monitorEtaDestinationKey(destination) {
+  if (destination && typeof destination === "object") {
+    return `${Number(destination.lat).toFixed(5)},${Number(destination.lng).toFixed(5)}`;
+  }
+  return normalizedAddress(destination);
+}
+
+function monitorEtaForTruck(truck = {}) {
+  const plate = normalizedPlate(truck.plate);
+  const cached = monitorEtaByPlate.get(plate);
+  const destination = monitorEtaDestination(truck);
+  if (!cached || !destination || cached.destinationKey !== monitorEtaDestinationKey(destination)) return null;
+  return cached;
+}
+
+function monitorTruckLocationFresh(truck = {}) {
+  if (truck.locationStale || !isCanadaPoint(truck)) return false;
+  const locationEpoch = new Date(truck.locationTime || "").getTime();
+  return !Number.isFinite(locationEpoch) || (Date.now() - locationEpoch) <= ETA_LOCATION_MAX_AGE_MS;
+}
+
+function monitorEtaText(truck = {}) {
+  if (!truck.activeLoad?.nextStop) return "";
+  if (monitorEtaRoutingAvailable === false || !monitorTruckLocationFresh(truck) || !monitorEtaDestination(truck)) return "ETA unavailable";
+  const eta = monitorEtaForTruck(truck);
+  if (!eta) return "Calculating ETA…";
+  if (eta.unavailable) return "ETA unavailable";
+  const details = [
+    `${Math.max(1, Math.round(Number(eta.durationSeconds || 0) / 60))} min`,
+    eta.distanceText || ""
+  ].filter(Boolean).join(" · ");
+  return `ETA ${formatEtaArrival(eta.arrivalAt)}${details ? ` (${details})` : ""}`;
+}
+
+function monitorEtaHtml(truck = {}) {
+  const text = monitorEtaText(truck);
+  return text ? `<span>${escapeHtml(text)}</span>` : "";
 }
 
 function normalizedAddress(value) {
@@ -321,12 +417,39 @@ function truckIcon(truck) {
   `, 74, 50, 37, 39);
 }
 
+function monitorCarryingManifestHtml(load, { emptyText = "No picked-up orders are currently recorded on this truck." } = {}) {
+  const orders = Array.isArray(load?.orders) ? load.orders : [];
+  if (!orders.length) return `<div class="monitor-manifest-empty">${escapeHtml(emptyText)}</div>`;
+  return `
+    <div class="monitor-manifest">
+      ${orders.map((order) => {
+        const itemRows = (order.items || []).map((item) => `
+          <div><span>${escapeHtml(item.itemName || "Item")}</span><strong>${escapeHtml(monitorItemQuantity(item))}</strong></div>
+        `).join("") || `<div><span>No order-line details</span><strong>—</strong></div>`;
+        return `
+          <div class="monitor-manifest-order">
+            <div class="monitor-manifest-head"><b>${escapeHtml(order.id || "Order")}</b><span>${escapeHtml(order.customer || order.type || "")}</span></div>
+            ${order.address ? `<small class="monitor-manifest-address">${escapeHtml(order.address)}</small>` : ""}
+            <div class="monitor-manifest-items">${itemRows}</div>
+          </div>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
+function monitorNextStopHtml(load = {}) {
+  const next = load.nextStop;
+  if (!next) return "";
+  const type = next.type === "pick" ? "Pickup" : next.type === "drop" ? "Drop-off" : "Stop";
+  return `<div class="monitor-next-stop"><b>Next ${escapeHtml(type)}</b><span>${escapeHtml(next.location || next.orderId || "—")}</span>${next.orderId ? `<small>${escapeHtml(next.orderId)}</small>` : ""}</div>`;
+}
+
 function markerInfoForTruck(truck) {
   const load = truck.activeLoad;
   const direction = truckDirection(truck);
-  const orders = load?.orderIds?.length ? load.orderIds.join(", ") : "No active load";
   const stops = load?.stops?.length
-    ? load.stops.map((stop) => `${stop.sequence}. ${stop.type.toUpperCase()} ${stop.location || stop.orderId || ""} (${stop.status})`).join("<br>")
+    ? load.stops.map((stop) => `${escapeHtml(stop.sequence)}. ${escapeHtml(String(stop.type || "stop").toUpperCase())} ${escapeHtml(stop.location || stop.orderId || "")} (${escapeHtml(stop.status)})`).join("<br>")
     : "";
   return `
     <div class="monitor-info">
@@ -336,17 +459,60 @@ function markerInfoForTruck(truck) {
       <span>Speed ${escapeHtml(formatKmh(truck.estimatedKmh))}</span>
       ${truck.truckSwitchAttention ? `<span class="warning">Samsara assignment warning: ${escapeHtml(truck.truckSwitchAttention.samsara_error || "Truck switch requires attention")}</span>` : ""}
       ${direction ? `<span>Direction ${Math.round(direction.degrees)}° (${escapeHtml(direction.source)})</span>` : ""}
-      ${load ? `<hr><b>${escapeHtml(load.loadName || "Load")}</b><span>${escapeHtml(orders)}</span><small>${stops}</small>` : ""}
+      ${load ? `
+        <hr>
+        <b>${escapeHtml(load.loadName || "Load")}</b>
+        <div class="monitor-eta" data-monitor-eta-plate="${escapeHtml(truck.plate || "")}">${monitorEtaHtml(truck)}</div>
+        ${monitorNextStopHtml(load)}
+        <strong class="monitor-manifest-title">Currently carrying ${load.orders?.length || 0} order${load.orders?.length === 1 ? "" : "s"}</strong>
+        ${monitorCarryingManifestHtml(load)}
+        <details class="monitor-stop-details"><summary>${load.completedStops}/${load.stopCount} stops completed</summary><small>${stops}</small></details>
+      ` : ""}
     </div>
   `;
 }
 
 function clearMarkers() {
+  monitorInfoWindow?.close();
+  monitorInfoWindowPlate = "";
   monitorMarkers.forEach((marker) => marker.setMap(null));
   monitorMarkers = [];
   monitorTrailLines.forEach((line) => line.setMap(null));
   monitorTrailLines = [];
   monitorTruckMarkers = new Map();
+}
+
+function updateSelectedTruckCardUi() {
+  document.querySelectorAll("[data-truck-plate]").forEach((card) => {
+    card.classList.toggle(
+      "selected",
+      normalizedPlate(card.dataset.truckPlate) === normalizedPlate(selectedTruckPlate)
+    );
+  });
+}
+
+function openMonitorInfoWindow(marker, content, { truckPlate = "" } = {}) {
+  if (!monitorMap || !monitorInfoWindow || !marker) return false;
+  monitorInfoWindowPlate = normalizedPlate(truckPlate);
+  // InfoWindowOpenOptions does not accept content. Set it before opening so a
+  // marker never inherits a blank or another marker's content.
+  monitorInfoWindow.setContent(content);
+  monitorInfoWindow.open({
+    anchor: marker,
+    map: monitorMap,
+    shouldFocus: false
+  });
+  return true;
+}
+
+function openMonitorTruckInfo(plate, marker = null) {
+  const key = normalizedPlate(plate);
+  const truck = monitorTruckByPlate(key);
+  const currentMarker = marker || monitorTruckMarkers.get(key);
+  if (!truck || !currentMarker) return false;
+  selectedTruckPlate = truck.plate || plate;
+  updateSelectedTruckCardUi();
+  return openMonitorInfoWindow(currentMarker, markerInfoForTruck(truck), { truckPlate: key });
 }
 
 function trailForTruck(plate) {
@@ -358,11 +524,15 @@ function trailForTruck(plate) {
 }
 
 async function renderMap() {
+  const renderGeneration = ++monitorMapRenderGeneration;
   const canvas = document.getElementById("monitorMap");
   if (!canvas) return;
   const available = await loadGoogleMaps();
+  if (renderGeneration !== monitorMapRenderGeneration || !canvas.isConnected) return;
+  monitorEtaRoutingAvailable = Boolean(available && window.google?.maps);
   if (!available || !window.google?.maps) {
     canvas.innerHTML = monitorConfig.googleMapsApiKey ? "Google Maps could not load." : "Add GOOGLE_MAPS_API_KEY to enable the monitor map.";
+    updateMonitorEtaUi();
     return;
   }
   if (!monitorMap) {
@@ -374,10 +544,14 @@ async function renderMap() {
       fullscreenControl: true
     });
     monitorInfoWindow = new google.maps.InfoWindow();
+    monitorInfoWindow.addListener("closeclick", () => {
+      monitorInfoWindowPlate = "";
+    });
   }
-  clearMarkers();
   const bounds = new google.maps.LatLngBounds();
   const yardPoints = await Promise.all((monitorData.yards || []).map(geocodeYard));
+  if (renderGeneration !== monitorMapRenderGeneration || !canvas.isConnected) return;
+  clearMarkers();
   yardPoints.filter((yard) => isCanadaPoint(yard)).forEach((yard) => {
     const marker = new google.maps.Marker({
       position: { lat: Number(yard.lat), lng: Number(yard.lng) },
@@ -385,11 +559,10 @@ async function renderMap() {
       icon: yardIcon(yard.type),
       title: yard.name || yard.vendor || yard.address
     });
-    marker.addListener("click", () => monitorInfoWindow.open({
-      anchor: marker,
-      map: monitorMap,
-      content: `<strong>${escapeHtml(yard.type === "own" ? `Yard ${yard.name || yard.code}` : yard.name || yard.vendor)}</strong><br>${escapeHtml(yard.address || "")}`
-    }));
+    marker.addListener("click", () => openMonitorInfoWindow(
+      marker,
+      `<strong>${escapeHtml(yard.type === "own" ? `Yard ${yard.name || yard.code}` : yard.name || yard.vendor)}</strong><br>${escapeHtml(yard.address || "")}`
+    ));
     monitorMarkers.push(marker);
     bounds.extend(marker.getPosition());
   });
@@ -415,11 +588,7 @@ async function renderMap() {
       icon: truckIcon(truck),
       title: truck.plate || "Truck"
     });
-    marker.addListener("click", () => monitorInfoWindow.open({
-      anchor: marker,
-      map: monitorMap,
-      content: markerInfoForTruck(truck)
-    }));
+    marker.addListener("click", () => openMonitorTruckInfo(key, marker));
     monitorMarkers.push(marker);
     if (key) monitorTruckMarkers.set(key, marker);
     bounds.extend(marker.getPosition());
@@ -429,23 +598,116 @@ async function renderMap() {
     mapHasFitBounds = true;
   }
   if (selectedTruckPlate) focusTruckOnMap(selectedTruckPlate);
+  void refreshTruckEtas();
 }
 
 function focusTruckOnMap(plate) {
   selectedTruckPlate = plate || selectedTruckPlate;
-  const truck = (monitorData.trucks || []).find((item) => normalizedPlate(item.plate) === normalizedPlate(selectedTruckPlate));
   const marker = monitorTruckMarkers.get(normalizedPlate(selectedTruckPlate));
-  if (!monitorMap || !truck || !marker) return;
+  if (!monitorMap || !marker) return;
   monitorMap.panTo(marker.getPosition());
   if (monitorMap.getZoom() < 13) monitorMap.setZoom(13);
-  monitorInfoWindow?.open({
-    anchor: marker,
-    map: monitorMap,
-    content: markerInfoForTruck(truck)
+  openMonitorTruckInfo(selectedTruckPlate, marker);
+}
+
+function monitorEtaCacheReusable(cached = {}, truck = {}, destinationKey = "") {
+  if (!cached.fetchedAt || cached.destinationKey !== destinationKey) return false;
+  const age = Date.now() - Number(cached.fetchedAt || 0);
+  if (age < ETA_MIN_REFRESH_MS) return true;
+  return age < ETA_CACHE_MS
+    && monitorDistanceMeters(cached.origin || {}, truck) < ETA_REUSE_DISTANCE_METERS;
+}
+
+function updateMonitorEtaUi() {
+  document.querySelectorAll("[data-monitor-eta-plate]").forEach((host) => {
+    const truck = monitorTruckByPlate(host.dataset.monitorEtaPlate);
+    if (truck) host.innerHTML = monitorEtaHtml(truck);
   });
+  if (monitorTooltipIdentity.startsWith("truck:")) {
+    const truck = monitorTruckByPlate(monitorTooltipIdentity.slice("truck:".length));
+    const tooltip = document.getElementById("monitorOrderTooltip");
+    if (truck && tooltip && !tooltip.hidden) tooltip.innerHTML = monitorTruckTooltipHtml(truck);
+  }
+  if (monitorInfoWindowPlate && monitorInfoWindow) {
+    const truck = monitorTruckByPlate(monitorInfoWindowPlate);
+    const marker = monitorTruckMarkers.get(monitorInfoWindowPlate);
+    if (truck && marker) monitorInfoWindow.setContent(markerInfoForTruck(truck));
+    else {
+      monitorInfoWindow.close();
+      monitorInfoWindowPlate = "";
+    }
+  }
+}
+
+function requestTruckEta(truck = {}) {
+  if (!truck.activeLoad?.nextStop || !monitorTruckLocationFresh(truck) || !window.google?.maps?.DirectionsService) {
+    return Promise.resolve(false);
+  }
+  const destination = monitorEtaDestination(truck);
+  if (!destination) return Promise.resolve(false);
+  const plate = normalizedPlate(truck.plate);
+  const destinationKey = monitorEtaDestinationKey(destination);
+  const cached = monitorEtaByPlate.get(plate);
+  if (monitorEtaCacheReusable(cached, truck, destinationKey)) return Promise.resolve(false);
+  const requestKey = `${plate}|${destinationKey}`;
+  const pending = monitorEtaRequests.get(plate);
+  if (pending?.key === requestKey) return pending.promise;
+  monitorDirectionsService ||= new google.maps.DirectionsService();
+  const origin = { lat: Number(truck.latitude), lng: Number(truck.longitude) };
+  const promise = new Promise((resolve) => {
+    try {
+      monitorDirectionsService.route({
+        origin,
+        destination,
+        travelMode: google.maps.TravelMode.DRIVING,
+        drivingOptions: {
+          departureTime: new Date(),
+          trafficModel: google.maps.TrafficModel.BEST_GUESS
+        }
+      }, (result, status) => {
+        const leg = result?.routes?.[0]?.legs?.[0];
+        const duration = leg?.duration_in_traffic || leg?.duration;
+        const durationSeconds = Number(duration?.value);
+        const record = {
+          destinationKey,
+          fetchedAt: Date.now(),
+          origin,
+          unavailable: status !== "OK" || !Number.isFinite(durationSeconds),
+          durationSeconds: Number.isFinite(durationSeconds) ? durationSeconds : null,
+          durationText: duration?.text || "",
+          distanceText: leg?.distance?.text || "",
+          arrivalAt: Number.isFinite(durationSeconds) ? new Date(Date.now() + (durationSeconds * 1000)).toISOString() : ""
+        };
+        monitorEtaByPlate.set(plate, record);
+        resolve(true);
+      });
+    } catch {
+      monitorEtaByPlate.set(plate, {
+        destinationKey,
+        fetchedAt: Date.now(),
+        origin,
+        unavailable: true
+      });
+      resolve(true);
+    }
+  }).finally(() => {
+    if (monitorEtaRequests.get(plate)?.key === requestKey) monitorEtaRequests.delete(plate);
+  });
+  monitorEtaRequests.set(plate, { key: requestKey, promise });
+  return promise;
+}
+
+async function refreshTruckEtas() {
+  if (!monitorEtaRoutingAvailable) {
+    updateMonitorEtaUi();
+    return;
+  }
+  const results = await Promise.all(sortedMonitorTrucks().filter((truck) => truck.activeLoad).map(requestTruckEta));
+  if (results.some(Boolean)) updateMonitorEtaUi();
 }
 
 async function loadMonitor({ silent = false } = {}) {
+  const loadGeneration = ++monitorLoadGeneration;
   monitorError = "";
   if (!silent) {
     monitorLoading = true;
@@ -453,11 +715,14 @@ async function loadMonitor({ silent = false } = {}) {
   }
   try {
     const nextData = await api("/api/dispatch/monitor");
+    if (loadGeneration !== monitorLoadGeneration) return;
     rememberFreshTruckLocations(nextData.trucks || []);
     monitorData = applyLastKnownLocations(nextData);
   } catch (error) {
+    if (loadGeneration !== monitorLoadGeneration) return;
     monitorError = error.message;
   } finally {
+    if (loadGeneration !== monitorLoadGeneration) return;
     monitorLoading = false;
     if (silent) {
       updateMonitorUi();
@@ -480,7 +745,7 @@ function renderTruckList() {
   if (monitorLoading) return `<div class="monitor-empty">Loading truck locations...</div>`;
   if (monitorError) return `<div class="monitor-empty warning">${escapeHtml(monitorError)}</div>`;
   if (!monitorData.trucks?.length) return `<div class="monitor-empty">No trucks configured.</div>`;
-  return monitorData.trucks.map((truck) => {
+  return sortedMonitorTrucks().map((truck) => {
     const load = truck.activeLoad;
     const direction = truckDirection(truck);
     const estimatedSpeed = formatKmh(truck.estimatedKmh);
@@ -500,9 +765,11 @@ function renderTruckList() {
         ${load ? `
           <div class="monitor-load-blob">
             <b>${escapeHtml(load.loadName || "Load")}</b>
-            <span>${escapeHtml((load.orderIds || []).join(", ") || "-")}</span>
+            <span>Carrying: ${escapeHtml((load.carryingOrderIds || []).join(", ") || "No picked-up orders")}</span>
             <small>${load.completedStops}/${load.stopCount} stops | ${escapeHtml(estimatedSpeed)}</small>
           </div>
+          ${monitorNextStopHtml(load)}
+          <div class="monitor-truck-eta monitor-eta" data-monitor-eta-plate="${escapeHtml(truck.plate || "")}">${monitorEtaHtml(truck)}</div>
         ` : ""}
       </article>
     `;
@@ -583,13 +850,13 @@ function monitorOrderByKey(key) {
 function hideMonitorOrderTooltip() {
   const tooltip = document.getElementById("monitorOrderTooltip");
   if (tooltip) tooltip.hidden = true;
-  monitorTooltipOrderKey = "";
+  monitorTooltipIdentity = "";
 }
 
 function positionMonitorOrderTooltip(event) {
   const tooltip = document.getElementById("monitorOrderTooltip");
   if (!tooltip || tooltip.hidden) return;
-  const width = Math.min(390, window.innerWidth - 24);
+  const width = Math.min(520, window.innerWidth - 24);
   const left = event.clientX > window.innerWidth * 0.65
     ? Math.max(12, event.clientX - width - 16)
     : Math.min(window.innerWidth - width - 12, event.clientX + 16);
@@ -602,7 +869,7 @@ function showMonitorOrderTooltip(card, event) {
   const order = monitorOrderByKey(card?.dataset.monitorOrderKey);
   const tooltip = document.getElementById("monitorOrderTooltip");
   if (!order || !tooltip) return;
-  monitorTooltipOrderKey = String(order.key || "");
+  monitorTooltipIdentity = `order:${String(order.key || "")}`;
   const itemRows = (order.items || []).map((item) => `
     <div><span>${escapeHtml(item.itemName || "Item")}</span><strong>${escapeHtml(monitorItemQuantity(item))}</strong></div>
   `).join("") || `<div><span>No order-line details</span><strong>—</strong></div>`;
@@ -611,6 +878,30 @@ function showMonitorOrderTooltip(card, event) {
     <p>${escapeHtml(order.fromLocation || "—")} → ${escapeHtml(order.destination || "—")}</p>
     <section>${itemRows}</section>
   `;
+  tooltip.hidden = false;
+  positionMonitorOrderTooltip(event);
+}
+
+function monitorTruckTooltipHtml(truck = {}) {
+  const load = truck.activeLoad;
+  return `
+    <header><strong>${escapeHtml(truck.plate || "Truck")}</strong><span>${load ? escapeHtml(load.loadName || "Load") : "No active load"}</span></header>
+    <p>${escapeHtml(truck.formattedLocation || "No Samsara location returned.")}</p>
+    ${load ? `
+      <div class="monitor-eta" data-monitor-eta-plate="${escapeHtml(truck.plate || "")}">${monitorEtaHtml(truck)}</div>
+      ${monitorNextStopHtml(load)}
+      <strong class="monitor-manifest-title">Currently carrying ${load.orders?.length || 0} order${load.orders?.length === 1 ? "" : "s"}</strong>
+      ${monitorCarryingManifestHtml(load)}
+    ` : `<div class="monitor-manifest-empty">This truck has no active load.</div>`}
+  `;
+}
+
+function showMonitorTruckTooltip(card, event) {
+  const truck = monitorTruckByPlate(card?.dataset.truckPlate);
+  const tooltip = document.getElementById("monitorOrderTooltip");
+  if (!truck || !tooltip) return;
+  monitorTooltipIdentity = `truck:${normalizedPlate(truck.plate)}`;
+  tooltip.innerHTML = monitorTruckTooltipHtml(truck);
   tooltip.hidden = false;
   positionMonitorOrderTooltip(event);
 }
@@ -640,6 +931,7 @@ function updateMonitorUi() {
 }
 
 function renderMonitorApp() {
+  monitorMapRenderGeneration += 1;
   clearMarkers();
   monitorMap = null;
   monitorInfoWindow = null;
@@ -737,18 +1029,19 @@ monitorApp.addEventListener("input", (event) => {
 });
 
 monitorApp.addEventListener("pointerover", (event) => {
-  const card = event.target.closest("[data-monitor-order-key]");
+  const card = event.target.closest("[data-monitor-order-key], [data-truck-plate]");
   if (!card || card.contains(event.relatedTarget)) return;
-  showMonitorOrderTooltip(card, event);
+  if (card.matches("[data-monitor-order-key]")) showMonitorOrderTooltip(card, event);
+  else showMonitorTruckTooltip(card, event);
 });
 
 monitorApp.addEventListener("pointermove", (event) => {
-  if (!monitorTooltipOrderKey || !event.target.closest("[data-monitor-order-key]")) return;
+  if (!monitorTooltipIdentity || !event.target.closest("[data-monitor-order-key], [data-truck-plate]")) return;
   positionMonitorOrderTooltip(event);
 });
 
 monitorApp.addEventListener("pointerout", (event) => {
-  const card = event.target.closest("[data-monitor-order-key]");
+  const card = event.target.closest("[data-monitor-order-key], [data-truck-plate]");
   if (!card || card.contains(event.relatedTarget)) return;
   hideMonitorOrderTooltip();
 });

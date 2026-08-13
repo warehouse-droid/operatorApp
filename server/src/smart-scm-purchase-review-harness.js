@@ -105,9 +105,9 @@ try {
       lastPurchasePrice: 4.25
     },
     lines: [
-      { itemId: 601, itemName: "A", unit: "Each", purchaseUnit: "Each", lastPurchasePrice: 11.5, destinationLocationId: 15, destinationName: "12441", salesQuantity: 40, confirmedPallets: 1, palletQty: 1, layerQty: 0, sectionQty: 0, pieceQty: 0 },
-      { itemId: 602, itemName: "B", unit: "Each", purchaseUnit: "Each", lastPurchasePrice: 3.75, destinationLocationId: 15, destinationName: "12441", salesQuantity: 80, confirmedPallets: 2, palletQty: 2, layerQty: 0, sectionQty: 0, pieceQty: 0 },
-      { itemId: 603, itemName: "C", unit: "Each", purchaseUnit: "Each", lastPurchasePrice: 9, destinationLocationId: 26, destinationName: "150", salesQuantity: 12, confirmedPallets: 0.5, palletQty: 0.5, layerQty: 0, sectionQty: 0, pieceQty: 0 },
+      { itemId: 601, itemName: "A", unit: "Each", purchaseUnit: "Each", lastPurchasePrice: 11.5, destinationLocationId: 15, destinationName: "12441", salesQuantity: 40, confirmedPallets: 1, palletQty: 1, layerQty: null, sectionQty: undefined, pieceQty: "" },
+      { itemId: 602, itemName: "B", unit: "Each", purchaseUnit: "Each", lastPurchasePrice: 3.75, destinationLocationId: 15, destinationName: "12441", salesQuantity: 80, confirmedPallets: 2, palletQty: 2 },
+      { itemId: 603, itemName: "C", unit: "Each", purchaseUnit: "Each", lastPurchasePrice: 9, destinationLocationId: 26, destinationName: "150", salesQuantity: 12, confirmedPallets: 0.5, palletQty: 0.5 },
       { itemId: 999, itemName: "PALLET", unit: "Each", purchaseUnit: "Each", lastPurchasePrice: 4.25, destinationLocationId: 15, salesQuantity: 3.5, confirmedPallets: 3.5, ancillaryPallet: true }
     ]
   };
@@ -123,12 +123,24 @@ try {
   assert.match(payload.memo, /Load #401/);
   assert.equal(payload.item.items.length, 5);
   assert.deepEqual(payload.item.items.slice(0, 3).map((line) => line.rate), [11.5, 3.75, 9]);
+  for (const materialLine of payload.item.items.slice(0, 3)) {
+    assert.equal(Object.hasOwn(materialLine, "custcol_lyr"), false,
+      "An empty LYR value must be omitted from the NetSuite request, not converted to 0.");
+    assert.equal(Object.hasOwn(materialLine, "custcol_sec"), false,
+      "An empty SEC value must be omitted from the NetSuite request, not converted to 0.");
+    assert.equal(Object.hasOwn(materialLine, "custcol_pcs"), false,
+      "An empty PCS value must be omitted from the NetSuite request, not converted to 0.");
+  }
   const palletLines = payload.item.items.filter((line) => line.item.id === "999");
   assert.equal(palletLines.length, 2);
   assert.deepEqual(palletLines.map((line) => [line.location.id, line.quantity, line.custcol_pcs, line.rate]), [
     ["115", 3, 3, 4.25],
     ["126", 0.5, 0.5, 4.25]
   ]);
+  assert(palletLines.every((line) => !Object.hasOwn(line, "custcol_plt")
+    && !Object.hasOwn(line, "custcol_lyr")
+    && !Object.hasOwn(line, "custcol_sec")),
+  "Official PALLET rows must leave unrelated PLT/LYR/SEC fields blank while retaining their meaningful PCS quantity.");
 
   const overridden = structuredClone(proposal);
   overridden.palletLines = [

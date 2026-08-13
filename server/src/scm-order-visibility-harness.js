@@ -19,10 +19,15 @@ function sourceSection(source, startMarker, endMarker, label) {
 
 function assertLateVisibilityGate(section, label, {
   requiresRoleGate = false,
-  requiresUnprivilegedGate = false
+  requiresUnprivilegedGate = false,
+  allowsHistoricalGate = false
 } = {}) {
   const enrichmentAt = section.indexOf("enrichScmScheduleWithReconciliation");
-  const filterAt = section.lastIndexOf("filterRestrictedScmOrders");
+  const restrictedFilterAt = section.lastIndexOf("filterRestrictedScmOrders");
+  const historicalFilterAt = allowsHistoricalGate
+    ? section.lastIndexOf("filterDispatchPlanningVisibleOrders")
+    : -1;
+  const filterAt = Math.max(restrictedFilterAt, historicalFilterAt);
   assert(enrichmentAt >= 0, `${label} must perform reconciliation enrichment.`);
   assert(
     filterAt > enrichmentAt,
@@ -35,11 +40,19 @@ function assertLateVisibilityGate(section, label, {
     );
   }
   if (requiresUnprivilegedGate) {
-    assert.match(
-      section,
-      /filterRestrictedScmOrders\([\s\S]*?includeRestricted:\s*false/,
-      `${label} must not expose a query-controlled restricted-order override.`
-    );
+    if (historicalFilterAt > enrichmentAt) {
+      assert.match(
+        serverSource,
+        /function filterDispatchPlanningVisibleOrders\(orders = \[\]\) \{[\s\S]*?historicalReconciliationComplete === true \|\| !isRestrictedScmOrder\(order\)/,
+        `${label} historical visibility must allow only explicitly reconciled history rows through the restricted-order gate.`
+      );
+    } else {
+      assert.match(
+        section,
+        /filterRestrictedScmOrders\([\s\S]*?includeRestricted:\s*false/,
+        `${label} must not expose a query-controlled restricted-order override.`
+      );
+    }
   }
 }
 
@@ -233,7 +246,8 @@ const dispatchResponse = sourceSection(
   "Dispatch order response"
 );
 assertLateVisibilityGate(dispatchResponse, "Dispatch order response", {
-  requiresUnprivilegedGate: true
+  requiresUnprivilegedGate: true,
+  allowsHistoricalGate: true
 });
 
 const purchaseOrderResponse = sourceSection(

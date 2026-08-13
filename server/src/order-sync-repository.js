@@ -34,6 +34,12 @@ function normalizeQuantity(value) {
   return number === null ? null : Math.abs(number);
 }
 
+function normalizeOptionalBoolean(value) {
+  if (value === null || value === undefined || value === "") return null;
+  if (typeof value === "boolean") return value;
+  return /^(?:t|true|yes|1)$/i.test(String(value).trim());
+}
+
 function comparable(value) {
   if (value instanceof Date) return value.toISOString().slice(0, 10);
   if (value === null || value === undefined || value === "") return "";
@@ -128,6 +134,9 @@ function normalizeLine(line) {
     to_lyr: normalizeNumber(line.to_lyr),
     to_sec: normalizeNumber(line.to_sec),
     to_pcs: normalizeNumber(line.to_pcs),
+    rate: normalizeNumber(line.rate),
+    amount: normalizeNumber(line.amount),
+    netsuite_closed: normalizeOptionalBoolean(line.netsuite_closed ?? line.closed),
     pack_quantity_source: explicitSource || (
       normalizeQuantity(line.pallet_qty) > 0
         || normalizeQuantity(line.layer_qty) > 0
@@ -504,13 +513,16 @@ export async function upsertSalesOrders(orders = []) {
          netsuite_sales_order_type, memo,
          expected_delivery_date, dispatch_address, dispatch_window_start,
          dispatch_window_end, dispatch_instructions, dispatch_parse_source,
-         dispatch_note_hash, dispatch_parsed_at, operator_status,
+         dispatch_note_hash, dispatch_instruction_details,
+         dispatch_instruction_parse_version, dispatch_instruction_parsed_at,
+         dispatch_parsed_at, operator_status,
          local_yard_order_status, netsuite_active, netsuite_missing_at,
          synced_at, fulfillment_status, dispatch_planned, status_updated_at
        ) VALUES (
          $1, $2, $3, $4, $5, $6, $7,
          $8, $9, $10, $11, $12, $13, $14, $14, $15,
-         $16, $17, $18, $19, $20, $21, $22, now(),
+         $16, $17, $18, $19, $20, $21, $22,
+         $23::jsonb, $24, $25::timestamptz, now(),
          'open', 'Open', true, null, now(), 'not_fulfilled', false, now()
        )
        ON CONFLICT (netsuite_id) DO UPDATE SET
@@ -545,6 +557,9 @@ export async function upsertSalesOrders(orders = []) {
          dispatch_instructions = EXCLUDED.dispatch_instructions,
          dispatch_parse_source = EXCLUDED.dispatch_parse_source,
          dispatch_note_hash = EXCLUDED.dispatch_note_hash,
+         dispatch_instruction_details = EXCLUDED.dispatch_instruction_details,
+         dispatch_instruction_parse_version = EXCLUDED.dispatch_instruction_parse_version,
+         dispatch_instruction_parsed_at = EXCLUDED.dispatch_instruction_parsed_at,
          dispatch_parsed_at = CASE
            WHEN sales_orders.dispatch_note_hash IS DISTINCT FROM EXCLUDED.dispatch_note_hash THEN now()
            ELSE sales_orders.dispatch_parsed_at
@@ -574,7 +589,10 @@ export async function upsertSalesOrders(orders = []) {
         normalized.dispatch_window_end,
         normalized.dispatch_instructions,
         normalized.dispatch_parse_source,
-        normalized.dispatch_note_hash
+        normalized.dispatch_note_hash,
+        JSON.stringify(normalized.dispatch_instruction_details || {}),
+        normalized.dispatch_instruction_parse_version || 0,
+        normalized.dispatch_instruction_parsed_at || null
       ]
     );
 
@@ -588,7 +606,9 @@ export async function upsertSalesOrders(orders = []) {
         "expected_delivery_date", "foreign_total", "order_location_id", "order_location",
         "outbound_location_id", "outbound_location", "delivery_method_id", "delivery_method",
         "memo", "dispatch_address", "dispatch_window_start", "dispatch_window_end",
-        "dispatch_instructions", "dispatch_parse_source", "dispatch_note_hash"
+        "dispatch_instructions", "dispatch_parse_source", "dispatch_note_hash",
+        "dispatch_instruction_details", "dispatch_instruction_parse_version",
+        "dispatch_instruction_parsed_at"
       ],
       detailsKey: "order"
     });
@@ -1281,12 +1301,14 @@ export async function upsertPurchaseOrderLines(orderId, lines = []) {
          item_type_text, item_description, sku, quantity,
          netsuite_received_qty, netsuite_received_baseline_qty, unit, item_weight, location_id, location,
          pallet_qty, layer_qty, piece_qty, section_qty, to_plt, to_lyr,
-         to_sec, to_pcs, netsuite_active, sync_exception, pack_quantity_source,
+         to_sec, to_pcs, rate, amount, netsuite_closed,
+         netsuite_active, sync_exception, pack_quantity_source,
          sync_exception_at, raw, synced_at
        ) VALUES (
          $1, $2, $3, $4, $5, $6, $7, $8,
          $9, COALESCE($10::numeric, 0), COALESCE($10::numeric, 0), $11, $12, $13, $14, $15,
-         $16, $17, $18, $19, $20, $21, $22, true, $24, $25,
+         $16, $17, $18, $19, $20, $21, $22, $26, $27, COALESCE($28::boolean, false),
+         true, $24, $25,
          CASE WHEN $24::text IS NULL THEN null ELSE now() END, $23::jsonb, now()
        )
        ON CONFLICT (purchase_order_id, line_id) WHERE line_id IS NOT NULL DO UPDATE SET
@@ -1310,6 +1332,12 @@ export async function upsertPurchaseOrderLines(orderId, lines = []) {
          to_lyr = EXCLUDED.to_lyr,
          to_sec = EXCLUDED.to_sec,
          to_pcs = EXCLUDED.to_pcs,
+         rate = COALESCE(EXCLUDED.rate, purchase_order_lines.rate),
+         amount = COALESCE(EXCLUDED.amount, purchase_order_lines.amount),
+         netsuite_closed = CASE
+           WHEN $28::boolean IS NULL THEN purchase_order_lines.netsuite_closed
+           ELSE EXCLUDED.netsuite_closed
+         END,
          netsuite_active = true,
          sync_exception = EXCLUDED.sync_exception,
          pack_quantity_source = EXCLUDED.pack_quantity_source,
@@ -1341,7 +1369,10 @@ export async function upsertPurchaseOrderLines(orderId, lines = []) {
         normalized.to_pcs,
         JSON.stringify(normalized.raw || {}),
         normalized.sync_exception,
-        normalized.pack_quantity_source
+        normalized.pack_quantity_source,
+        normalized.rate,
+        normalized.amount,
+        normalized.netsuite_closed
       ]
     );
     await upsertInventoryItemFromLine(normalized);
@@ -1357,6 +1388,7 @@ export async function upsertPurchaseOrderLines(orderId, lines = []) {
         "item_description", "sku", "quantity", "netsuite_received_qty", "unit",
         "item_weight", "location_id", "location", "pallet_qty", "layer_qty",
         "piece_qty", "section_qty", "to_plt", "to_lyr", "to_sec", "to_pcs",
+        "rate", "amount", "netsuite_closed",
         "pack_quantity_source", "sync_exception"
       ],
       detailsKey: "line"

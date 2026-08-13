@@ -142,8 +142,10 @@ try {
     assert.equal(snapshot.orders[0].reconciliationApplicationStatus, "Partially Done",
       "One completed grouped SO child must roll the parent to Partially Done.");
     assert.equal(snapshot.orders[0].fulfillmentStatus, "partial_fulfilled");
-    assert.equal(snapshot.orders[0].childOrderDetails[0].fulfillmentStatus, "fulfilled",
-      "Reconciliation must refresh the completed child evidence in the group snapshot.");
+    assert.equal(snapshot.orders[0].childOrderDetails[0].fulfillmentStatus, "not_fulfilled",
+      "Reconciliation must preserve the child operational fulfillment field.");
+    assert.equal(snapshot.orders[0].childOrderDetails[0].reconciliationApplicationStatus, "Completed",
+      "Reconciliation must publish completed child evidence in its separate calculation field.");
 
     await query(
       `UPDATE sales_orders
@@ -281,6 +283,14 @@ try {
                  'GROUPED-SO-STOP', 'dropoff', $3::jsonb, 'in_progress', now())`,
       [activeJobId, plan.rows[0].id, JSON.stringify([soRefs[0], soRefs[1]])]
     );
+    await query(
+      `UPDATE sales_orders
+          SET status = 'G',
+              status_text = 'Sales Order : Billed',
+              synced_at = now()
+        WHERE netsuite_id = $1`,
+      [soIds[0]]
+    );
     const deferred = await reconcileSalesOrderFromNetSuite({
       order: authoritativeSalesOrder({
         id: soIds[0], ref: soRefs[0], lineKey: lineKeys[0], billed: true
@@ -331,6 +341,14 @@ try {
     assert.equal(exactRetry.planCleanup.changedPlans.length, 0,
       "An exact billed retry must not rewrite the already repaired plan again.");
 
+    await query(
+      `UPDATE sales_orders
+          SET status = 'G',
+              status_text = 'Sales Order : Billed',
+              synced_at = now()
+        WHERE netsuite_id = $1`,
+      [soIds[1]]
+    );
     await reconcileSalesOrderFromNetSuite({
       order: authoritativeSalesOrder({
         id: soIds[1], ref: soRefs[1], lineKey: lineKeys[1], billed: true

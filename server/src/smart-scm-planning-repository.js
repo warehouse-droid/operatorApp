@@ -243,6 +243,7 @@ export function smartScmConfirmationSourceTransferLimit({
   availablePallets = 0,
   safetyStockPallets = 0,
   reorderPointPallets = 0,
+  requestedPallets = 0,
   manualOverride = false
 } = {}) {
   const policyLimit = smartScmSourceTransferLimit({
@@ -250,13 +251,22 @@ export function smartScmConfirmationSourceTransferLimit({
     safetyStockPallets,
     reorderPointPallets
   });
+  const manual = manualOverride === true;
+  const requested = positive(requestedPallets);
   return {
     ...policyLimit,
-    manualOverride: manualOverride === true,
-    maximumTransferablePallets: manualOverride === true
+    manualOverride: manual,
+    allowBackorder: manual,
+    backorderPallets: manual ? round(Math.max(0, requested - policyLimit.availablePallets)) : 0,
+    maximumTransferablePallets: manual
       ? Math.floor(policyLimit.availablePallets + EPSILON)
       : policyLimit.maximumTransferablePallets
   };
+}
+
+export function smartScmConfirmationSourceTransferBlocked({ requestedPallets = 0, limit = {} } = {}) {
+  return limit?.allowBackorder !== true
+    && positive(requestedPallets) > positive(limit?.maximumTransferablePallets) + EPSILON;
 }
 
 function text(value) {
@@ -428,6 +438,8 @@ export async function loadSmartScmPlanningPolicies({ includeTemporarilyExcluded 
               NULLIF(BTRIM(i.vendor), ''),
               NULLIF(BTRIM(p.vendor), '')
             ) AS plant,
+            p.vendor_yard AS configured_vendor_yard,
+            p.plant AS configured_plant,
             CASE WHEN COALESCE(i.item_weight, 0) > 0 AND COALESCE(i.to_plt, 0) > 0
                  THEN i.item_weight * i.to_plt ELSE p.pallet_weight_lbs END AS pallet_weight_lbs,
             COALESCE((
@@ -1650,6 +1662,7 @@ async function insertDrafts(runId, drafts = []) {
 }
 
 function publicProposalLine(row) {
+  const reason = row.reason || {};
   return {
     id: Number(row.id),
     proposalId: Number(row.proposal_id),
@@ -1670,6 +1683,11 @@ function publicProposalLine(row) {
     toLyr: positive(row.to_lyr),
     toSec: positive(row.to_sec),
     toPcs: positive(row.to_pcs),
+    purchaseUnit: row.purchase_unit || null,
+    lastPurchasePrice: row.last_purchase_price === null || row.last_purchase_price === undefined
+      ? null
+      : Number(row.last_purchase_price),
+    lastPurchasePriceSyncedAt: row.last_purchase_price_synced_at || null,
     manualPlanningRequired: Boolean(row.manual_planning_required),
     urgent: Boolean(row.urgent),
     urgencyLevel: smartScmUrgencyLevel(row.urgency_level, row.urgent),
@@ -1679,7 +1697,9 @@ function publicProposalLine(row) {
     alternativeForLineId: row.alternative_for_line_id === null ? null : Number(row.alternative_for_line_id),
     addedSource: row.added_source || "planning",
     addedBy: row.added_by || null,
-    reason: row.reason || {},
+    reason,
+    unitPriceOverridden: reason.vendorReplyDraft?.unitPriceOverride === true
+      || row.last_purchase_price !== null && row.last_purchase_price !== undefined,
     vendorResponses: row.vendor_responses || []
   };
 }
@@ -1689,6 +1709,16 @@ export function smartScmPhysicalPalletLines(proposal = {}, palletItem = null) {
   const palletItemId = Number(palletItem?.itemId ?? palletItem?.item_id);
   const palletName = text(palletItem?.itemName ?? palletItem?.item_name) || "PALLET";
   const palletUnit = text(palletItem?.unit ?? palletItem?.stock_unit) || "EACH";
+  const palletPurchaseUnit = text(palletItem?.purchaseUnit ?? palletItem?.purchase_unit) || null;
+  const rawPalletLastPurchasePrice = palletItem?.lastPurchasePrice ?? palletItem?.last_purchase_price;
+  const palletLastPurchasePrice = rawPalletLastPurchasePrice === null
+    || rawPalletLastPurchasePrice === undefined
+    ? null
+    : Number(rawPalletLastPurchasePrice);
+  const palletPriceSyncedAt = palletItem?.lastPurchasePriceSyncedAt
+    ?? palletItem?.last_purchase_price_synced_at
+    ?? palletItem?.synced_at
+    ?? null;
   const palletItemWeightLbs = positive(palletItem?.itemWeightLbs ?? palletItem?.item_weight);
   const useConfirmedPallets = proposal.useConfirmedPallets === true;
   const overrides = smartScmNormalizePalletQuantityOverrides(
@@ -1731,10 +1761,18 @@ export function smartScmPhysicalPalletLines(proposal = {}, palletItem = null) {
     itemName: palletName,
     itemDescription: "Official PALLET item derived from material PLT",
     unit: palletUnit,
+    purchaseUnit: palletPurchaseUnit,
+    lastPurchasePrice: Number.isFinite(palletLastPurchasePrice) ? palletLastPurchasePrice : null,
+    lastPurchasePriceSyncedAt: palletPriceSyncedAt,
+    unitPriceOverridden: palletItem?.unitPriceOverridden === true,
     destinationLocationId: row.destinationLocationId,
     destinationName: row.destinationName,
     quantity,
     salesQuantity: quantity,
+    purchaseQuantity: quantity,
+    purchaseAmount: Number.isFinite(palletLastPurchasePrice)
+      ? round(quantity * palletLastPurchasePrice, 2)
+      : null,
     automaticQuantity: row.quantity,
     overrideQuantity,
     overridden,
@@ -1877,9 +1915,16 @@ async function proposalRows({ proposalId = null, runId = null, status = "", stat
             planning_run.settings_snapshot AS planning_run_settings,
             (
               SELECT jsonb_build_object(
-                'itemId', pallet.item_id,
-                'itemName', pallet.item_name,
-                'unit', pallet.stock_unit,
+                'itemId', COALESCE(p.pallet_item_id, pallet.item_id),
+                'itemName', COALESCE(p.pallet_item_name, pallet.item_name),
+                'unit', COALESCE(p.pallet_unit, pallet.stock_unit),
+                'purchaseUnit', COALESCE(p.pallet_purchase_unit, pallet.purchase_unit),
+                'lastPurchasePrice', COALESCE(p.pallet_last_purchase_price, pallet.last_purchase_price),
+                'lastPurchasePriceSyncedAt', CASE
+                  WHEN p.pallet_last_purchase_price IS NOT NULL THEN p.pallet_price_synced_at
+                  ELSE pallet.synced_at
+                END,
+                'unitPriceOverridden', p.vendor_resolution_kind IS NULL AND p.pallet_last_purchase_price IS NOT NULL,
                 'itemWeightLbs', pallet.item_weight
               )
                 FROM inventory_items pallet
@@ -2601,6 +2646,7 @@ export async function prepareSmartScmTransferExecution(proposalId, operatorId = 
         const state = calculatePolicyState(policy, forecastMap.get(`${policy.item_id}:${policy.location_id}`), inventory, minimumOrders.get(`${policy.item_id}:${policy.location_id}`), settings);
         return [String(policy.item_id), state];
       }));
+    const sourceBackorders = new Map();
     for (const line of [...proposal.lines].sort((left, right) => Number(left.item_id) - Number(right.item_id))) {
       const balance = await query(
         `SELECT quantity_available AS available
@@ -2626,14 +2672,18 @@ export async function prepareSmartScmTransferExecution(proposalId, operatorId = 
         availablePallets,
         safetyStockPallets: sourceState.safety,
         reorderPointPallets: sourceState.rop,
+        requestedPallets: positive(line.proposed_pallets),
         manualOverride: manualSourceFloorOverride
       });
       const { protectedFloorPallets: protectedFloor, maximumTransferablePallets: maximumTransferable } = limit;
-      if (positive(line.proposed_pallets) > maximumTransferable + EPSILON) {
-        const message = manualSourceFloorOverride
-          ? `${line.item_name} has only ${round(availablePallets, 2)} unreserved PLT available at ${proposal.source_name}; the user-entered quantity can transfer at most ${maximumTransferable} whole PLT. Refresh inventory or reduce the quantity.`
-          : `${line.item_name} can transfer at most ${maximumTransferable} PLT from ${proposal.source_name}: ${round(availablePallets, 2)} available and ${round(protectedFloor, 2)} protected (safety stock / reorder point). Refresh and replan.`;
-        throw Object.assign(new Error(message), { status: 409 });
+      sourceBackorders.set(Number(line.id), positive(limit.backorderPallets));
+      if (smartScmConfirmationSourceTransferBlocked({
+        requestedPallets: line.proposed_pallets,
+        limit
+      })) {
+        throw Object.assign(new Error(
+          `${line.item_name} can transfer at most ${maximumTransferable} PLT from ${proposal.source_name}: ${round(availablePallets, 2)} available and ${round(protectedFloor, 2)} protected (safety stock / reorder point). Refresh and replan.`
+        ), { status: 409 });
       }
     }
     await query(
@@ -2678,6 +2728,7 @@ export async function prepareSmartScmTransferExecution(proposalId, operatorId = 
         itemName: line.item_name,
         proposedQuantity: positive(line.sales_quantity),
         palletQty: positive(line.proposed_pallets),
+        sourceBackorderPallets: positive(sourceBackorders.get(Number(line.id))),
         layerQty: 0,
         sectionQty: 0,
         pieceQty: 0,

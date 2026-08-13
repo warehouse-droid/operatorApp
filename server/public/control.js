@@ -242,6 +242,7 @@ let orderLocks = [];
 let loadedOrders = [];
 let loadedSearchResults = [];
 let loadedOrderDetail = null;
+let loadedDriverOptions = [];
 let selectedLoadedOrderKey = "";
 let syncSettings = { mode: "manual", running: false, lastStatus: "idle" };
 let targetedSyncOrderRef = "";
@@ -331,13 +332,16 @@ function todayKey() {
   ].join("-");
 }
 
+const loadedDefaultDate = todayKey();
+
 let loadedFilters = {
-  from: localStorage.getItem("mbbs.control.loaded.from") || todayKey(),
-  to: localStorage.getItem("mbbs.control.loaded.to") || todayKey(),
-  yard: localStorage.getItem("mbbs.control.loaded.yard") || "all"
+  from: loadedDefaultDate,
+  to: loadedDefaultDate,
+  yard: localStorage.getItem("mbbs.control.loaded.yard") || "all",
+  driver: localStorage.getItem("mbbs.control.loaded.driver") || "all"
 };
-let loadedSearchTerm = localStorage.getItem("mbbs.control.loaded.search") || "";
-let loadedItemSearchTerm = localStorage.getItem("mbbs.control.loaded.itemSearch") || "";
+let loadedSearchTerm = "";
+let loadedItemSearchTerm = "";
 let loadedDirection = localStorage.getItem("mbbs.control.loaded.direction") === "inbound" ? "inbound" : "outbound";
 const loadedTypeByDirection = {
   inbound: ["purchase_order", "transfer_order", "co_order"].includes(localStorage.getItem("mbbs.control.loaded.inboundType"))
@@ -414,10 +418,11 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
-function photoImgAttributes(value) {
+function photoImgAttributes(value, { thumbnail = false, lazy = false } = {}) {
   const text = String(value || "");
-  if (!text.startsWith("r2://")) return `src="${escapeHtml(text)}"`;
-  return `data-secure-photo-ref="${escapeHtml(text)}"`;
+  const loadingAttributes = lazy ? ' loading="lazy" decoding="async"' : "";
+  if (!text.startsWith("r2://")) return `src="${escapeHtml(text)}"${loadingAttributes}`;
+  return `data-secure-photo-ref="${escapeHtml(text)}"${thumbnail ? ' data-secure-photo-variant="thumbnail"' : ""}${loadingAttributes}`;
 }
 
 function releaseSecurePhotoImage(image) {
@@ -444,7 +449,9 @@ async function hydrateSecurePhotoImage(image) {
   image._securePhotoController = controller;
   image.dataset.securePhotoState = "loading";
   try {
-    const response = await fetch(`/api/photo-upload/preview?ref=${encodeURIComponent(ref)}`, {
+    const params = new URLSearchParams({ ref });
+    if (image.dataset.securePhotoVariant === "thumbnail") params.set("variant", "thumbnail");
+    const response = await fetch(`/api/photo-upload/preview?${params.toString()}`, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
       cache: "no-store",
       credentials: "same-origin",
@@ -2276,6 +2283,7 @@ function loadedOrdersQuery() {
   params.set("from", loadedFilters.from || todayKey());
   params.set("to", loadedFilters.to || loadedFilters.from || todayKey());
   params.set("yard", loadedFilters.yard || "all");
+  params.set("driver", loadedFilters.driver || "all");
   params.set("direction", loadedDirection);
   params.set("orderType", selectedLoadedOrderType());
   return params;
@@ -2286,6 +2294,7 @@ function loadedSearchQuery() {
   params.set("from", "2000-01-01");
   params.set("to", "2099-12-31");
   params.set("yard", "all");
+  params.set("driver", "all");
   if (loadedSearchTerm.trim()) params.set("search", loadedSearchTerm.trim());
   if (loadedItemSearchTerm.trim()) params.set("itemSearch", loadedItemSearchTerm.trim());
   return params;
@@ -2295,6 +2304,7 @@ function saveLoadedFilters() {
   localStorage.setItem("mbbs.control.loaded.from", loadedFilters.from || "");
   localStorage.setItem("mbbs.control.loaded.to", loadedFilters.to || "");
   localStorage.setItem("mbbs.control.loaded.yard", loadedFilters.yard || "all");
+  localStorage.setItem("mbbs.control.loaded.driver", loadedFilters.driver || "all");
 }
 
 function saveLoadedSearch() {
@@ -2327,12 +2337,24 @@ async function loadLoadedOrderDetailForSelection() {
   loadedOrderDetail = await request(`/api/control/loaded-orders/detail?${detailParams.toString()}`);
 }
 
+async function loadLoadedDriverOptions() {
+  const drivers = await request("/api/control/loaded-orders/drivers");
+  loadedDriverOptions = Array.isArray(drivers) ? drivers : [];
+  const available = new Set(loadedDriverOptions.map((driver) => String(driver.login || "")));
+  if (loadedFilters.driver !== "all" && !available.has(String(loadedFilters.driver))) {
+    loadedFilters.driver = "all";
+    localStorage.setItem("mbbs.control.loaded.driver", "all");
+  }
+}
+
 async function loadLoadedOrders(options = {}) {
   const params = loadedOrdersQuery();
   loadedOrders = await request(`/api/control/loaded-orders?${params.toString()}`);
   if (!options.keepSelection || !loadedOrders.some((order) => loadedOrderKey(order) === selectedLoadedOrderKey)) {
     selectedLoadedOrderKey = loadedOrders[0] ? loadedOrderKey(loadedOrders[0]) : "";
   }
+  loadedOrderDetail = null;
+  refreshLoadedPanels();
   await loadLoadedOrderDetailForSelection();
 }
 
@@ -2357,6 +2379,8 @@ async function loadLoadedSearchResults() {
   if (!loadedSearchResults.some((order) => loadedOrderKey(order) === selectedLoadedOrderKey)) {
     selectedLoadedOrderKey = loadedSearchResults[0] ? loadedOrderKey(loadedSearchResults[0]) : "";
   }
+  loadedOrderDetail = null;
+  refreshLoadedPanels();
   await loadLoadedOrderDetailForSelection();
 }
 
@@ -2459,6 +2483,13 @@ function renderLoadedExportSection() {
                   <option value="28" ${loadedFilters.yard === "28" ? "selected" : ""}>2967</option>
                   <option value="15" ${loadedFilters.yard === "15" ? "selected" : ""}>12441</option>
                   <option value="26" ${loadedFilters.yard === "26" ? "selected" : ""}>150</option>
+                </select>
+              </label>
+              <label>
+                <span>${t("yard.driver", "Driver")}</span>
+                <select id="loadedDriver">
+                  <option value="all" ${loadedFilters.driver === "all" ? "selected" : ""}>${t("yard.allDrivers", "All drivers")}</option>
+                  ${loadedDriverOptions.map((driver) => `<option value="${escapeHtml(driver.login)}" ${loadedFilters.driver === String(driver.login) ? "selected" : ""}>${escapeHtml(driver.name || driver.login)}${driver.active === false ? ` · ${t("common.inactive", "Inactive")}` : ""}</option>`).join("")}
                 </select>
               </label>
               <div class="loaded-filter-actions">
@@ -2581,7 +2612,7 @@ function renderLoadedOrderDetail() {
         ${photos.filter((photo) => photo.photo_data_url).map((photo) => `
           <figure>
             <button class="photo-thumb-button" data-action="open-photo-lightbox" data-photo-ref="${escapeHtml(photo.photo_data_url)}" data-photo-label="${t("yard.activityPhoto", "Activity photo")} ${escapeHtml(photo.id)}" type="button">
-              <img ${photoImgAttributes(photo.photo_data_url)} alt="${t("yard.activityPhoto", "Activity photo")} ${escapeHtml(photo.id)}" />
+              <img ${photoImgAttributes(photo.photo_data_url, { thumbnail: true, lazy: true })} alt="${t("yard.activityPhoto", "Activity photo")} ${escapeHtml(photo.id)}" />
             </button>
             <figcaption>${formatDate(photo.created_at)}</figcaption>
           </figure>
@@ -2595,7 +2626,7 @@ function renderLoadedOrderDetail() {
           ${driverPhotos.filter((photo) => photo.photo_data_url).map((photo) => `
             <figure>
               <button class="photo-thumb-button" data-action="open-photo-lightbox" data-photo-ref="${escapeHtml(photo.photo_data_url)}" data-photo-label="${escapeHtml(photo.driver_name || photo.driver_login || t("yard.driver", "Driver"))} ${escapeHtml(photo.id)}" type="button">
-                <img ${photoImgAttributes(photo.photo_data_url)} alt="${escapeHtml(photo.driver_name || photo.driver_login || t("yard.driver", "Driver"))} ${escapeHtml(photo.id)}" />
+                <img ${photoImgAttributes(photo.photo_data_url, { thumbnail: true, lazy: true })} alt="${escapeHtml(photo.driver_name || photo.driver_login || t("yard.driver", "Driver"))} ${escapeHtml(photo.id)}" />
               </button>
               <figcaption>${escapeHtml([photo.driver_name || photo.driver_login, photo.truck_plate, photo.stop_type].filter(Boolean).join(" · "))}<br>${formatDate(photo.created_at)}</figcaption>
             </figure>
@@ -4207,6 +4238,7 @@ async function loadControlData() {
     recordWarnings = await request("/api/control/record-warnings?limit=100");
     orderLocks = await request("/api/control/order-locks");
     vendorMappings = await request("/api/control/vendor-mappings");
+    await loadLoadedDriverOptions();
     await loadLoadedOrders({ keepSelection: true });
     if (isLoadedSearchActive()) await loadLoadedSearchResults();
     await Promise.all([
@@ -4692,7 +4724,8 @@ app.addEventListener("click", async (event) => {
       loadedFilters = {
         from: document.getElementById("loadedFrom")?.value || todayKey(),
         to: document.getElementById("loadedTo")?.value || document.getElementById("loadedFrom")?.value || todayKey(),
-        yard: document.getElementById("loadedYard")?.value || "all"
+        yard: document.getElementById("loadedYard")?.value || "all",
+        driver: document.getElementById("loadedDriver")?.value || "all"
       };
       saveLoadedFilters();
       selectedLoadedOrderKey = "";

@@ -542,7 +542,7 @@ function scmScheduleCanViewRestrictedOrders() {
 
 function scmScheduleIsRestrictedOrder(row = {}) {
   if (row.isBlanket === true) return true;
-  return SCM_RESTRICTED_STATUS_KEYS.has(String(row.status || "").trim().toLowerCase());
+  return SCM_RESTRICTED_STATUS_KEYS.has(scmScheduleEffectiveStatus(row).toLowerCase());
 }
 
 function scmScheduleReconciliationPreferenceKey() {
@@ -841,12 +841,32 @@ function scmScheduleReconciliation(row = {}) {
   return row.reconciliation && typeof row.reconciliation === "object" ? row.reconciliation : {};
 }
 
+function scmScheduleEffectiveStatus(row = {}) {
+  const reconciliation = scmScheduleReconciliation(row);
+  return String(
+    scmScheduleFirstValue(row, [
+      "calculatedStatus",
+      "reconciliationApplicationStatus",
+      "calculated_status",
+      "reconciliation_application_status"
+    ])
+      ?? scmScheduleFirstValue(reconciliation, [
+        "applicationStatus",
+        "calculatedStatus",
+        "application_status",
+        "calculated_status"
+      ])
+      ?? row.status
+      ?? "Queued"
+  ).trim() || "Queued";
+}
+
 function scmScheduleReconciliationStatus(row = {}) {
   const reconciliation = scmScheduleReconciliation(row);
   const status = scmScheduleFirstValue(row, ["reconciliationStatus", "reconcileStatus", "reconciliation_status"])
     ?? scmScheduleFirstValue(reconciliation, ["status", "reconciliationStatus", "reconcileStatus"]);
   const normalized = String(status || "").trim().toLowerCase().replaceAll("_", " ").replaceAll("-", " ");
-  if (normalized === "review" || normalized === "reconcile review" || String(row.status || "").trim().toLowerCase() === "reconcile review") return "review";
+  if (normalized === "review" || normalized === "reconcile review" || scmScheduleEffectiveStatus(row).toLowerCase() === "reconcile review") return "review";
   if (["unreconciled", "pending", "missing", "error"].includes(normalized)) return "unreconciled";
   return normalized || "ok";
 }
@@ -904,6 +924,7 @@ function scmScheduleDisplayRows() {
 
 function scmScheduleRowMatchesCurrentFilters(row = {}) {
   if (!scmScheduleCanViewRestrictedOrders() && scmScheduleIsRestrictedOrder(row)) return false;
+  const effectiveStatus = scmScheduleEffectiveStatus(row);
   const search = String(scmScheduleFilters.search || "").trim().toLowerCase();
   if (search) {
     const searchable = [
@@ -922,7 +943,7 @@ function scmScheduleRowMatchesCurrentFilters(row = {}) {
     if (!searchable.includes(search)) return false;
   }
   const statuses = scmScheduleFilterValues(scmScheduleFilters.status);
-  if (statuses.length && !statuses.includes(String(row.status || ""))) return false;
+  if (statuses.length && !statuses.includes(effectiveStatus)) return false;
   if (scmScheduleFilters.method && row.method !== scmScheduleFilters.method) return false;
   if (scmScheduleFilters.kind === "Sp.O" && !(row.orderKind === "PO" && row.isSpecialOrder)) return false;
   if (scmScheduleFilters.kind && scmScheduleFilters.kind !== "Sp.O" && row.orderKind !== scmScheduleFilters.kind) return false;
@@ -944,8 +965,8 @@ function scmScheduleRowMatchesCurrentFilters(row = {}) {
   if (view !== "blanket" && row.isBlanket) return false;
   if (view === "blanket" && (row.orderKind !== "PO" || !row.isBlanket)) return false;
   if (view === "dispatch"
-    && (row.method !== "MBT" || ["Cancelled", "Hold"].includes(String(row.status || "")))) return false;
-  if (view === "completed" && !["Completed", "Cancelled"].includes(String(row.status || ""))) return false;
+    && (row.method !== "MBT" || ["Cancelled", "Hold"].includes(effectiveStatus))) return false;
+  if (view === "completed" && !["Completed", "Cancelled"].includes(effectiveStatus)) return false;
   if (scmScheduleReviewOnly && !scmScheduleNeedsReconciliationReview(row)) return false;
   return true;
 }
@@ -1445,8 +1466,9 @@ function scmScheduleTableRowHtml(row, { pickupOptions = [], dropoffOptions = OWN
     const editable = canEditScmSchedule();
     const scmWorkingView = editable;
     const reconciliationReview = scmScheduleNeedsReconciliationReview(row);
+    const displayStatus = scmScheduleEffectiveStatus(row);
     const rowEditable = editable && !reconciliationReview;
-    const statusEditable = rowEditable && !SCM_SYSTEM_STATUSES.has(String(row.status || ""));
+    const statusEditable = rowEditable && !SCM_SYSTEM_STATUSES.has(displayStatus);
     const selectable = rowEditable && row.orderKind === "PO" && !row.groupRef && !String(row.orderRef || "").toUpperCase().startsWith("PGOB-");
     const displayType = scmScheduleDisplayType(row, { scmWorkingView });
     const eta = [row.etaDate, row.etaTime].filter(Boolean).join(" ") || "--";
@@ -1462,13 +1484,13 @@ function scmScheduleTableRowHtml(row, { pickupOptions = [], dropoffOptions = OWN
     const canCompleteVrma = editable
       && scmScheduleCanCompleteVrma()
       && row.orderKind === "VRMA"
-      && !["Completed", "Cancelled", "Hold"].includes(String(row.status || ""));
-    const rowFormatting = scmScheduleRowFormatting(row.status);
+      && !["Completed", "Cancelled", "Hold"].includes(displayStatus);
+    const rowFormatting = scmScheduleRowFormatting(displayStatus);
     const typeFormatting = scmScheduleCellFormatting("type", row.isSpecialOrder ? "Sp.O" : row.orderKind);
     const dropoffFormatting = scmScheduleCellFormatting("dropoffPoint", row.dropoffPoint);
-    const statusFormatting = scmScheduleCellFormatting("status", row.status);
+    const statusFormatting = scmScheduleCellFormatting("status", displayStatus);
     return `
-      <div class="scm-sheet-row status-${scmScheduleEscape(String(row.status || "").toLowerCase().replaceAll(" ", "-"))} ${isGroupOrder ? "group-order" : ""} ${reconciliationReview ? "reconcile-review" : ""}${rowFormatting.className}" data-schedule-row="${scmScheduleEscape(rowId)}" data-row-ref="${scmScheduleEscape(row.orderRef)}"${rowFormatting.style}>
+      <div class="scm-sheet-row status-${scmScheduleEscape(displayStatus.toLowerCase().replaceAll(" ", "-"))} ${isGroupOrder ? "group-order" : ""} ${reconciliationReview ? "reconcile-review" : ""}${rowFormatting.className}" data-schedule-row="${scmScheduleEscape(rowId)}" data-row-ref="${scmScheduleEscape(row.orderRef)}"${rowFormatting.style}>
         ${editable ? `<div class="scm-sheet-cell scm-select-cell">${selectable ? `<input data-action="select-row" data-row="${scmScheduleEscape(rowId)}" type="checkbox" ${scmScheduleSelectedRows.has(rowId) ? "checked" : ""} aria-label="Select ${scmScheduleEscape(row.orderRef)}" />` : ""}</div>` : ""}
         <div class="scm-sheet-cell readonly">${readOnlyCell(scheduleDateText(row))}</div>
         <div class="scm-sheet-cell readonly scm-type-cell${typeFormatting.className}"${typeFormatting.style}>
@@ -1495,7 +1517,7 @@ function scmScheduleTableRowHtml(row, { pickupOptions = [], dropoffOptions = OWN
         <div class="scm-sheet-cell readonly">${readOnlyCell(eta)}</div>
         <div class="scm-sheet-cell readonly">${readOnlyCell(row.driver)}</div>
         <div class="scm-sheet-cell scm-reconcile-status-cell ${statusEditable ? "" : "readonly"}${statusFormatting.className}"${statusFormatting.style}>
-          ${statusEditable ? selectHtml({ rowId, field: "status", value: row.status, options: SCM_MANUAL_STATUSES }) : readOnlyCell(row.status)}
+          ${statusEditable ? selectHtml({ rowId, field: "status", value: displayStatus, options: SCM_MANUAL_STATUSES }) : readOnlyCell(displayStatus)}
           ${scmScheduleReconciliationBadge(row)}
         </div>
         <div class="scm-sheet-cell readonly">${readOnlyCell(row.sla)}</div>
