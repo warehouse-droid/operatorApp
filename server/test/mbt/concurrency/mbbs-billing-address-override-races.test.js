@@ -93,7 +93,8 @@ test("concurrent billing-only address corrections produce one revision winner an
     (item) => item.references[0]?.rootReference === fixture.tranid
   );
   assert.ok(candidate);
-  assert.equal(candidate.chargeable, false);
+  assert.equal(candidate.chargeable, true);
+  assert.match(candidate.automaticRateWarning || "", /dispatch address/iu);
 
   const attempts = Array.from({ length: 8 }, (_, index) => (
     setMbbsBillingCandidateAddressOverride({

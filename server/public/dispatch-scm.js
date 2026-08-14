@@ -181,6 +181,14 @@ function ensureScmDestinationLocation(order = scmSelectedOrder()) {
   return scmDestinationLocationId;
 }
 
+function scmLiveSplitDestinationLocationId(order = scmSelectedOrder()) {
+  const fallback = ensureScmDestinationLocation(order);
+  const selected = String(scmApp.querySelector('[data-action="split-destination-yard"]')?.value || "").trim();
+  const matched = SCM_DESTINATION_YARDS.find((yard) => yard.id === selected);
+  scmDestinationLocationId = matched?.id || fallback;
+  return scmDestinationLocationId;
+}
+
 function scmVendorYardOptions(order = scmSelectedOrder()) {
   const options = Array.isArray(order?.vendorYardOptions) ? order.vendorYardOptions : [];
   const seen = new Set();
@@ -204,6 +212,16 @@ function scmDefaultPickupPoint(order = scmSelectedOrder()) {
 
 function ensureScmPickupPoint(order = scmSelectedOrder()) {
   if (!scmPickupPoint) scmPickupPoint = scmDefaultPickupPoint(order);
+  return scmPickupPoint;
+}
+
+function scmLiveSplitPickupPoint(order = scmSelectedOrder()) {
+  const fallback = ensureScmPickupPoint(order);
+  const selected = String(scmApp.querySelector('[data-action="split-pickup-yard"]')?.value || "").trim();
+  const matched = scmVendorYardOptions(order).find((option) =>
+    String(option.yard).trim().toLowerCase() === selected.toLowerCase()
+  );
+  scmPickupPoint = matched?.yard || fallback;
   return scmPickupPoint;
 }
 
@@ -550,8 +568,8 @@ function renderScmScheduleMiniPanel(order = {}) {
                ${SCM_DESTINATION_YARDS.map((yard) => `<option value="${yard.id}" ${yard.id === selectedDestination ? "selected" : ""}>${yard.text}</option>`).join("")}
              </select></label>`
           : `<label><span>Packing Slip / Ref</span><input data-scm-field="packingSlipRef" value="${escapeHtml(scm.packingSlipRef || order.dispatchRef || "")}" /></label>`}
-        <button data-action="save-scm-schedule" data-kind="${escapeHtml(orderKind)}" type="button">Save Schedule</button>
-        ${isSplit ? `<button data-action="update-split" type="button">${t("common.update", "Update")}</button><button class="danger-button" data-action="unsplit-order" type="button">${t("dispatch.unsplit", "Unsplit")}</button>` : ""}
+        <button data-action="save-scm-schedule" data-kind="${escapeHtml(orderKind)}" type="button" ${scmLoading ? "disabled" : ""}>${scmLoading ? "Saving..." : "Save Schedule"}</button>
+        ${isSplit ? `<button class="danger-button" data-action="unsplit-order" type="button">${t("dispatch.unsplit", "Unsplit")}</button>` : ""}
       </div>
       ${currentGroup ? `<div class="scm-group-tools compact"><strong>${escapeHtml(currentGroup)}</strong><button class="danger-button" data-action="cancel-scm-group" data-group="${escapeHtml(currentGroup)}" type="button">Ungroup</button></div>` : ""}
     </section>
@@ -658,8 +676,8 @@ async function createScmSplit() {
     lineRowId: item.lineRowId,
     ...quantities
   }));
-  const destinationLocationId = ensureScmDestinationLocation(order);
-  const pickupPoint = scmVendorYardOptions(order).length ? ensureScmPickupPoint(order) : "";
+  const destinationLocationId = scmLiveSplitDestinationLocationId(order);
+  const pickupPoint = scmVendorYardOptions(order).length ? scmLiveSplitPickupPoint(order) : "";
   if (!scmRef.trim()) {
     scmNotice = "New PO ref number is required.";
     renderScm();
@@ -870,7 +888,10 @@ async function unsplitScmOrder() {
 }
 
 function collectScmSchedulePatch(order = scmSelectedOrder()) {
-  const patch = { orderKind: order?.type === "TO" ? "TO" : "PO" };
+  const patch = {
+    orderKind: order?.type === "TO" ? "TO" : "PO",
+    expectedUpdatedAt: order?.scm?.updatedAt || null
+  };
   scmApp.querySelectorAll("[data-scm-field]").forEach((field) => {
     patch[field.dataset.scmField] = field.type === "checkbox" ? field.checked : field.value;
   });
@@ -879,11 +900,16 @@ function collectScmSchedulePatch(order = scmSelectedOrder()) {
 
 async function saveScmScheduleForSelected() {
   const order = scmSelectedOrder();
-  if (!order) return;
+  if (!order || scmLoading) return;
   const patch = collectScmSchedulePatch(order);
+  order.scm ||= {};
+  for (const [key, value] of Object.entries(patch)) {
+    if (!["orderKind", "expectedUpdatedAt"].includes(key)) order.scm[key] = value;
+  }
   scmLoading = true;
   scmNotice = "Saving SCM schedule...";
   renderScm();
+  scmApp.querySelectorAll("[data-scm-field]").forEach((field) => { field.disabled = true; });
   try {
     await scmApi(`/api/scm/schedule/${encodeURIComponent(order.id)}`, {
       method: "PUT",

@@ -10,7 +10,7 @@ test("delivery-instruction source uploads allow image/video files up to 25 MiB w
     config.photoUpload = {
       ...original,
       workerUrl: "https://uploads.example.test",
-      tokenSecret: "delivery-instruction-test-secret",
+      tokenSecret: "delivery-instruction-test-secret", // secret-scan: allow non-secret test fixture
       maxMb: 10
     };
     const defaultTicket = createPhotoUploadToken({

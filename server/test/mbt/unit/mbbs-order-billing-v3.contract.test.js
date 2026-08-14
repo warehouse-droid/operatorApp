@@ -45,6 +45,40 @@ test("S7: billing UI converts a recalculated batch through one idempotent durabl
   assert.match(router, /idempotency-key/u);
 });
 
+test("calculation rows expose auditable relationship evidence and exactly two synchronized money edits", () => {
+  assert.match(html, /Select for billing/u);
+  assert.match(html, /Load \/ leg/u);
+  assert.match(html, /Origin/u);
+  assert.match(html, /Destination/u);
+  assert.match(html, /Relationship and calculation/u);
+  assert.match(html, /Adjustment \(CAD\)/u);
+  assert.match(html, /Final charge \(CAD\)/u);
+  assert.match(script, /data-mbbs-adjustment/u);
+  assert.match(script, /data-mbbs-final-charge/u);
+  assert.match(script, /manualAmountEdits/u);
+  assert.match(script, /calculatedAmountMinor/u);
+  assert.match(script, /adjustmentMinor/u);
+  assert.match(script, /finalAmountMinor/u);
+  assert.match(script, /data-mbbs-result-candidate-id/u);
+  assert.match(script, /selectedMbbsBatchResultIds/u);
+  assert.match(script, /manual_required/u);
+  assert.match(script, /formatDistanceKm/u);
+  assert.match(script, /\.format\(metres \/ 1000\)\} km/u);
+  assert.doesNotMatch(script, /toLocaleString\(["']en-CA["']\)\}\s*m/u);
+});
+
+test("conversion sends only checked calculated or manual-rate rows and keeps grouped children visible", () => {
+  assert.match(html, /Select all calculated results for billing/u);
+  assert.match(script, /conversionCandidateIds/u);
+  assert.match(script, /toggleBatchResult/u);
+  assert.match(script, /memberReferences/u);
+  assert.match(script, /children:/u);
+  assert.match(script, /candidateIds:\s*conversionIds/u);
+  assert.match(script, /manualAmountEdits:\s*conversionIds\.map/u);
+  assert.match(script, /usableBatchResult\(result\)\s*\n\s*&& state\.selectedMbbsBatchResultIds\.has\(result\.candidateId\)/u);
+  assert.match(script, /\.filter\(\(entry\) => entry\.status === "calculated"\)\s*\n\s*\.map\(\(entry\) => entry\.candidateId\)/u);
+});
+
 test("S5: CUSTOM is a first-class deterministic local cross-charge source", () => {
   const result = calculateMbbsCrossCharges({
     currency: "CAD",

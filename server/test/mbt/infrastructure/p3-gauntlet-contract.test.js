@@ -17,6 +17,7 @@ const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
   "run-dispatch-active-load-mutations.mjs",
   "run-dispatch-co-lifecycle-mutations.mjs",
   "run-dispatch-driver-completion-mutations.mjs",
+  "run-dispatch-order-completion-mutations.mjs",
   "run-dispatch-performance-mutations.mjs",
   "run-dispatch-save-recovery-mutations.mjs",
   "run-dispatch-v2-summary-marker-mutations.mjs",
@@ -32,6 +33,8 @@ const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
   "run-p39-mutations.mjs",
   "run-p39-reservation-mutations.mjs",
   "run-scm-po-split-ref-reuse-mutations.mjs",
+  "run-scm-po-split-ui-mutations.mjs",
+  "run-scm-schedule-status-mutations.mjs",
   "run-smart-scm-blanket-merge-mutations.mjs",
   "run-smart-scm-manual-controls-mutations.mjs",
   "run-smart-scm-po-oauth-mutations.mjs",
@@ -62,6 +65,17 @@ const P3_BASE_MUTANT_NAMES = Object.freeze([
   "P3 rate-card CSV ignores the aggregate byte ceiling",
   "P3 rate-card CSV apply ignores preview ownership",
   "P3 rate-card CSV apply skips the transactional rollback hook",
+  "P3 MBBS PO billing regresses from business-route grouping to per-reference grouping",
+  "P3 MBBS PO billing charges the first drop twice",
+  "P3 MBBS direct TO incorrectly includes a full route charge",
+  "P3 MBBS manual final charge no longer has to match calculation plus adjustment",
+  "P3 MBBS explicit Sales Order group is charged per child",
+  "P3 MBBS explicit Purchase Order group is charged per child",
+  "P3 MBBS selected historical candidate falls back to the latest page",
+  "P3 MBBS unavailable automatic route rejects manual billing",
+  "P3 MBBS conversion ignores unchecked calculation rows",
+  "P3 MBBS manual-rate rows are selected without operator consent",
+  "P3 MBBS UI labels metres as kilometres without conversion",
   "P3 MBBS candidate list regresses to a 200-order ceiling",
   "P3 MBBS batch accepts a 101st order",
   "P3 MBBS batch starts unbounded distance work",
@@ -72,6 +86,7 @@ const P3_BASE_MUTANT_NAMES = Object.freeze([
   "P3 MBBS address override ignores optimistic revision"
 ]);
 const P3_ADVERSARIAL_TESTS = Object.freeze([
+  "dispatch-completion-repository-adversarial.test.js",
   "p311-completed-load-snapshot-integrity.test.js",
   "shadow-billing-adversarial.test.js",
   "shadow-billing-snapshot-boundary-adversarial.test.js",
@@ -306,7 +321,7 @@ test("P3.1: mutation selection contains a distinct nonempty P3 set instead of P1
   );
   assert.match(mutations, /mutationScope\s*===\s*"MBBS_BILLING"/u);
   assert.match(mutations, /scope\s*===\s*"mbbs_billing"/u);
-  assert.match(mutations, /scopedP3Mutants\.length\s*!==\s*8/u);
+  assert.match(mutations, /scopedP3Mutants\.length\s*!==\s*19/u);
 });
 
 test("P3.11: every unmutated Node test category is owned by main, coverage, and shuffle", async () => {

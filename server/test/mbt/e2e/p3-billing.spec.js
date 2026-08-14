@@ -293,26 +293,41 @@ async function installBillingApi(page, { commandsEnabled }) {
         requestedCount: 2,
         successCount: 2,
         failureCount: 0,
+        manualRequiredCount: 1,
         results: [CANDIDATE_ID, CANDIDATE_ID_2].map((candidateId, index) => ({
           candidateId,
-          status: "calculated",
+          status: index === 0 ? "calculated" : "manual_required",
           candidate: {
-            references: [{ sourceType: "SO", rootReference: index === 0 ? "SOA01234" : "SOA05678" }]
+            references: [{ sourceType: "SO", rootReference: index === 0 ? "SOA01234" : "SOA05678" }],
+            billingRule: "so_order",
+            billingLegId: `SO-LEG-${index + 1}`,
+            billingLegNumber: index + 1,
+            driverLoadNumbers: [index === 0 ? "Load 1" : "Load 2"],
+            originLabel: "2967 Kennedy Road",
+            destinationLabel: index === 0 ? "100 Queen Street West" : "200 King Street West",
+            relationship: { summary: "Sales Order charged independently, once for the order." }
           },
           rateCardVersionId: RATE_VERSION_ID,
           rateCardVersionNumber: 1,
-          distanceMetres: index === 0 ? 31_000 : 42_000,
-          selectedBand: {
+          distanceMetres: index === 0 ? 31_000 : 0,
+          distanceAvailable: index === 0,
+          automaticRate: index === 0
+            ? { available: true, code: null, message: null }
+            : { available: false, code: "MBT_MBBS_DISTANCE_LOOKUP_FAILED", message: "No supported driving route was found." },
+          selectedBand: index === 0 ? {
             minimumMetres: 30_000,
             maximumMetres: 50_000,
             pricingBasis: "flat"
-          },
+          } : null,
           charge: {
             itemCode: "DELIVERY_CHARGE_MBBS",
-            amountMinor: 25_000,
+            calculatedAmountMinor: index === 0 ? 25_000 : 0,
+            adjustmentMinor: 0,
+            finalAmountMinor: index === 0 ? 25_000 : 0,
+            amountMinor: index === 0 ? 25_000 : 0,
             currency: "CAD",
             estimatedTaxMinor: 0,
-            totalMinor: 25_000
+            totalMinor: index === 0 ? 25_000 : 0
           }
         }))
       });
@@ -322,8 +337,8 @@ async function installBillingApi(page, { commandsEnabled }) {
       await fulfillJson(route, 201, {
         schemaVersion: "mbbs-billing-candidate-batch-create-v1",
         generationId: "00000000-0000-4000-8000-000000000261",
-        requestedCandidateCount: 2,
-        durableCaseCount: 2,
+        requestedCandidateCount: 1,
+        durableCaseCount: 1,
         postingMode: "local_only",
         externalWork: null,
         cases: []
@@ -430,12 +445,22 @@ test("billing browser batches selected monthly candidates and switches to billin
   await page.getByRole("button", { name: "Calculate selected orders" }).click();
   await expect(page.locator("#mbbsBatchResultRows")).toContainText("SO SOA01234");
   await expect(page.locator("#mbbsBatchResultRows")).toContainText("$250.00");
+  await expect(page.locator("#mbbsBatchResultRows")).toContainText("31 km");
+  await expect(page.locator("#mbbsBatchResultRows")).toContainText("No automatic rate");
+  await page.getByLabel("Signed adjustment for SO SOA01234").fill("-10.00");
+  await expect(page.getByLabel("Final charge for SO SOA01234")).toHaveValue("240.00");
+  await page.getByLabel("Final charge for SO SOA05678").fill("260.00");
+  await expect(page.getByLabel("Signed adjustment for SO SOA05678")).toHaveValue("260.00");
+  await expect(page.getByLabel("Convert SO SOA01234 to billing")).toBeChecked();
+  await expect(page.getByLabel("Convert SO SOA05678 to billing")).not.toBeChecked();
+  await page.getByLabel("Convert SO SOA05678 to billing").check();
+  await page.getByLabel("Convert SO SOA01234 to billing").uncheck();
   await page.getByLabel("Find canonical billing customer").fill("Synthetic");
   await page.getByRole("button", { name: "Search customers" }).click();
   await expect(page.getByLabel("Selected billing customer")).toHaveValue(BILLING_CUSTOMER_ID);
   await page.getByLabel("Conversion audit reason").fill("Create verified local MBBS billing cases");
   await page.getByRole("button", { name: "Create local billing cases" }).click();
-  await expect(page.locator("#mbbsCandidateMessage")).toContainText("2 local billing case(s) created");
+  await expect(page.locator("#mbbsCandidateMessage")).toContainText("1 local billing case(s) created");
 
   await page.getByRole("tab", { name: "Billing cases" }).click();
   await expect(page.getByRole("cell", { name: "MBT contract" })).toBeVisible();
@@ -466,11 +491,17 @@ test("billing browser batches selected monthly candidates and switches to billin
     rateCardVersionId: RATE_VERSION_ID
   });
   expect(calls[1].body).toEqual({
-    candidateIds: [CANDIDATE_ID, CANDIDATE_ID_2],
+    candidateIds: [CANDIDATE_ID_2],
     completedMonth: "2038-08",
     completedDate: "2038-08-03",
     rateCardVersionId: RATE_VERSION_ID,
     customerNetsuiteId: BILLING_CUSTOMER_ID,
+    manualAmountEdits: [{
+      candidateId: CANDIDATE_ID_2,
+      calculatedAmountMinor: 0,
+      adjustmentMinor: 26_000,
+      finalAmountMinor: 26_000
+    }],
     reason: "Create verified local MBBS billing cases"
   });
   expect(calls[1].idempotencyKey).toMatch(/^mbt-billing-batch-create:/u);

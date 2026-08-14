@@ -517,3 +517,325 @@ test("S9/S10: a mid-batch persistence failure rolls snapshots, cases, lines, rec
     assert.deepEqual(retained.rows[0], { snapshots: 0, cases: 0, receipts: 0, audits: 0 });
   });
 });
+
+test("manual adjustment and final charge are server-recalculated, tamper-checked, and frozen in every durable layer", async () => {
+  await inRollback(async () => {
+    const { rateCardVersionId } = await installRateGraph();
+    const suffix = crypto.randomUUID().replaceAll("-", "").toUpperCase();
+    const base = 9_960_000_000 + (crypto.randomInt(10_000) * 10);
+    const customerId = base + 9;
+    const reference = `SO-V3-EDIT-${suffix}`;
+    await insertCustomer({ id: customerId, suffix });
+    await insertSalesOrder({
+      id: base + 1,
+      reference,
+      completedAt: "2039-10-10T15:00:00.000Z",
+      method: "Delivery",
+      address: `${reference} destination`
+    });
+    const listed = await candidates.listMbbsBillingCandidates({
+      actor: ACTOR,
+      completedDate: "2039-10-10",
+      search: reference,
+      limit: 100
+    });
+    const candidate = listed.items.find((item) => item.references[0]?.rootReference === reference);
+    assert.ok(candidate);
+    const distance = async () => ({
+      provider: "mbbs-v3-edit-test",
+      providerMetres: 12_000,
+      routeHash: "e".repeat(64)
+    });
+    const preview = await candidates.previewMbbsBillingCandidatesBatch({
+      actor: ACTOR,
+      candidateIds: [candidate.candidateId],
+      completedMonth: "2039-10",
+      completedDate: "2039-10-10",
+      rateCardVersionId
+    }, { resolveDistance: distance });
+    assert.equal(preview.results[0].charge.calculatedAmountMinor, 20_000);
+    assert.equal(preview.results[0].charge.adjustmentMinor, 0);
+    assert.equal(preview.results[0].charge.finalAmountMinor, 20_000);
+
+    const command = {
+      actor: ACTOR,
+      candidateIds: [candidate.candidateId],
+      completedMonth: "2039-10",
+      completedDate: "2039-10-10",
+      rateCardVersionId,
+      customerNetsuiteId: String(customerId),
+      reason: "Staff-verified reduction with retained route evidence",
+      correlationId: `mbbs-v3-edit-correlation-${suffix}`,
+      requestId: `mbbs-v3-edit-request-${suffix}`
+    };
+    await assert.rejects(
+      candidates.createMbbsBillingCasesFromCandidates({
+        ...command,
+        idempotencyKey: `mbbs-v3-edit-stale-${suffix}`,
+        manualAmountEdits: [{
+          candidateId: candidate.candidateId,
+          calculatedAmountMinor: 19_999,
+          adjustmentMinor: -2_500,
+          finalAmountMinor: 17_499
+        }]
+      }, { resolveDistance: distance }),
+      (error) => error?.code === "MBT_BILLING_MANUAL_AMOUNT_STALE"
+    );
+    const created = await candidates.createMbbsBillingCasesFromCandidates({
+      ...command,
+      idempotencyKey: `mbbs-v3-edit-create-${suffix}`,
+      manualAmountEdits: [{
+        candidateId: candidate.candidateId,
+        calculatedAmountMinor: 20_000,
+        adjustmentMinor: -2_500,
+        finalAmountMinor: 17_500
+      }]
+    }, { resolveDistance: distance });
+    assert.deepEqual(created.body.manualAmountEdits, [{
+      candidateId: candidate.candidateId,
+      calculatedAmountMinor: 20_000,
+      adjustmentMinor: -2_500,
+      finalAmountMinor: 17_500,
+      edited: true,
+      editorId: ACTOR.operatorId
+    }]);
+    const durable = await query(
+      `SELECT charge.base_amount_minor::int,
+              charge.allocated_amount_minor::int,
+              line.net_amount_minor::int,
+              charge.source_snapshot->'billingEvidence' AS source_billing,
+              charge.calculation_snapshot->'billingEvidence' AS calculation_billing,
+              line.calculation_detail->'billingEvidence' AS line_billing
+         FROM mbt_cross_charge_cases charge
+         JOIN mbt_billing_cases billing_case USING (cross_charge_case_id)
+         JOIN mbt_billing_versions version USING (billing_case_id)
+         JOIN mbt_billing_lines line USING (billing_version_id)
+        WHERE charge.root_reference = $1`,
+      [reference]
+    );
+    assert.equal(durable.rowCount, 1);
+    assert.equal(durable.rows[0].base_amount_minor, 20_000);
+    assert.equal(durable.rows[0].allocated_amount_minor, 17_500);
+    assert.equal(durable.rows[0].net_amount_minor, 17_500);
+    for (const evidence of [
+      durable.rows[0].source_billing,
+      durable.rows[0].calculation_billing,
+      durable.rows[0].line_billing
+    ]) {
+      assert.equal(evidence.calculatedAmountMinor, 20_000);
+      assert.equal(evidence.adjustmentMinor, -2_500);
+      assert.equal(evidence.finalAmountMinor, 17_500);
+      assert.equal(evidence.editorId, ACTOR.operatorId);
+    }
+  });
+});
+
+test("an inactive historical SO group matching its dispatch date is one candidate with every child retained", async () => {
+  await inRollback(async () => {
+    const { rateCardVersionId } = await installRateGraph();
+    const suffix = crypto.randomUUID().replaceAll("-", "").toUpperCase();
+    const base = 9_970_000_000 + (crypto.randomInt(10_000) * 10);
+    const planDate = "2039-11-07";
+    const groupRef = `GOA-${suffix.slice(0, 6)}-${suffix.slice(6, 12)}`;
+    const references = [`SOA${suffix.slice(0, 8)}`, `SOA${suffix.slice(8, 16)}`];
+    for (const [index, reference] of references.entries()) {
+      await insertSalesOrder({
+        id: base + index,
+        reference,
+        completedAt: `2039-11-0${8 + index}T15:00:00.000Z`,
+        method: "Delivery",
+        address: "37 Sunmount Road, Scarborough, ON"
+      });
+      await query(
+        "UPDATE sales_orders SET dispatch_plan_date = $2::date WHERE netsuite_id = $1",
+        [base + index, planDate]
+      );
+    }
+    const plan = await query(
+      `INSERT INTO dispatch_plans (plan_date, status, note)
+       VALUES ($1::date, 'confirmed', $2)
+       RETURNING id::text`,
+      [planDate, `Historical group ${suffix}`]
+    );
+    await query(
+      `INSERT INTO dispatch_delivery_groups (
+         group_ref, plan_id, plan_date, order_type, active, updated_at
+       ) VALUES ($1, $2::bigint, $3::date, 'sales_order', false, now())`,
+      [groupRef, plan.rows[0].id, planDate]
+    );
+    for (const [position, reference] of references.entries()) {
+      await query(
+        `INSERT INTO dispatch_delivery_group_members (group_ref, member_order_ref, position)
+         VALUES ($1, $2, $3)`,
+        [groupRef, reference, position]
+      );
+    }
+
+    const listed = await candidates.listMbbsBillingCandidates({
+      actor: ACTOR,
+      completedMonth: "2039-11",
+      search: references[0],
+      limit: 100
+    });
+    const grouped = listed.items.find((item) => item.references[0]?.rootReference === groupRef);
+    assert.ok(grouped);
+    assert.equal(grouped.billingRule, "so_group");
+    assert.deepEqual(grouped.memberReferences, references.map((rootReference) => ({ sourceType: "SO", rootReference })));
+    assert.equal(listed.items.some((item) => references.includes(item.references[0]?.rootReference)), false);
+    const preview = await candidates.previewMbbsBillingCandidatesBatch({
+      actor: ACTOR,
+      candidateIds: [grouped.candidateId],
+      completedMonth: "2039-11",
+      rateCardVersionId
+    }, {
+      async resolveDistance() {
+        return { provider: "historical-group-test", providerMetres: 12_000 };
+      }
+    });
+    assert.equal(preview.results[0].status, "calculated");
+    assert.equal(preview.results[0].candidate.references[0].rootReference, groupRef);
+  });
+});
+
+test("a searched candidate older than the source-page limit still previews and converts by opaque identity", async () => {
+  await inRollback(async () => {
+    const { rateCardVersionId } = await installRateGraph();
+    const suffix = crypto.randomUUID().replaceAll("-", "").toUpperCase();
+    const base = 9_980_000_000 + (crypto.randomInt(1_000) * 10_000);
+    const reference = `SO-OLDER-${suffix}`;
+    const customerId = base + 9_999;
+    await insertCustomer({ id: customerId, suffix });
+    await insertSalesOrder({
+      id: base,
+      reference,
+      completedAt: "2041-02-01T15:00:00.000Z",
+      method: "Delivery",
+      address: "1 Older Candidate Road, Toronto, ON"
+    });
+    await query(
+      `INSERT INTO sales_orders (
+         netsuite_id, tranid, fulfillment_status, fulfilled_at,
+         outbound_location, sales_order_type, dispatch_address,
+         netsuite_active, synced_at
+       )
+       SELECT $1::bigint + series,
+              $2 || series::text,
+              'fulfilled',
+              ('2041-02-02T12:00:00.000Z'::timestamptz + (series * interval '1 second')),
+              '2967', 'Delivery', '2 Newer Candidate Road, Toronto, ON', true,
+              ('2041-02-02T12:00:00.000Z'::timestamptz + (series * interval '1 second'))
+         FROM generate_series(1, 1005) series`,
+      [base, `SO-NEWER-${suffix}-`]
+    );
+    const searched = await candidates.listMbbsBillingCandidates({
+      actor: ACTOR,
+      completedMonth: "2041-02",
+      search: reference,
+      limit: 100
+    });
+    const selected = searched.items.find((item) => item.references[0]?.rootReference === reference);
+    assert.ok(selected);
+    const distance = async () => ({ provider: "targeted-identity-test", providerMetres: 12_000 });
+    const preview = await candidates.previewMbbsBillingCandidatesBatch({
+      actor: ACTOR,
+      candidateIds: [selected.candidateId],
+      completedMonth: "2041-02",
+      rateCardVersionId
+    }, { resolveDistance: distance });
+    assert.equal(preview.results[0].status, "calculated");
+    const created = await candidates.createMbbsBillingCasesFromCandidates({
+      actor: ACTOR,
+      candidateIds: [selected.candidateId],
+      completedMonth: "2041-02",
+      rateCardVersionId,
+      customerNetsuiteId: String(customerId),
+      reason: "Convert the explicitly searched older completed order",
+      idempotencyKey: `older-${suffix}`,
+      correlationId: `older-correlation-${suffix}`,
+      requestId: `older-request-${suffix}`
+    }, { resolveDistance: distance });
+    assert.equal(created.body.durableCaseCount, 1);
+    assert.equal(created.body.cases[0].rootReference, reference);
+  });
+});
+
+test("an unavailable automatic route keeps zero-base manual amounts editable and freezes a manual-rate case", async () => {
+  await inRollback(async () => {
+    const { rateCardVersionId } = await installRateGraph();
+    const suffix = crypto.randomUUID().replaceAll("-", "").toUpperCase();
+    const base = 9_990_000_000 + (crypto.randomInt(10_000) * 10);
+    const customerId = base + 9;
+    const reference = `SO-MANUAL-RATE-${suffix}`;
+    await insertCustomer({ id: customerId, suffix });
+    await insertSalesOrder({
+      id: base + 1,
+      reference,
+      completedAt: "2041-03-10T15:00:00.000Z",
+      method: "Delivery",
+      address: "Unroutable but retained address"
+    });
+    const listed = await candidates.listMbbsBillingCandidates({
+      actor: ACTOR,
+      completedMonth: "2041-03",
+      search: reference,
+      limit: 100
+    });
+    const selected = listed.items.find((item) => item.references[0]?.rootReference === reference);
+    assert.ok(selected);
+    const unavailableDistance = async () => {
+      throw Object.assign(new Error("No supported driving route was found for these addresses."), {
+        code: "MBT_MBBS_DISTANCE_LOOKUP_FAILED"
+      });
+    };
+    const preview = await candidates.previewMbbsBillingCandidatesBatch({
+      actor: ACTOR,
+      candidateIds: [selected.candidateId],
+      completedMonth: "2041-03",
+      rateCardVersionId
+    }, { resolveDistance: unavailableDistance });
+    assert.equal(preview.results[0].status, "manual_required");
+    assert.equal(preview.results[0].charge.calculatedAmountMinor, 0);
+    assert.equal(preview.results[0].charge.finalAmountMinor, 0);
+    assert.equal(preview.results[0].automaticRate.available, false);
+    assert.equal(preview.manualRequiredCount, 1);
+
+    const created = await candidates.createMbbsBillingCasesFromCandidates({
+      actor: ACTOR,
+      candidateIds: [selected.candidateId],
+      completedMonth: "2041-03",
+      rateCardVersionId,
+      customerNetsuiteId: String(customerId),
+      manualAmountEdits: [{
+        candidateId: selected.candidateId,
+        calculatedAmountMinor: 0,
+        adjustmentMinor: 12_345,
+        finalAmountMinor: 12_345
+      }],
+      reason: "Manual route charge supplied because no automatic driving route exists",
+      idempotencyKey: `manual-rate-${suffix}`,
+      correlationId: `manual-rate-correlation-${suffix}`,
+      requestId: `manual-rate-request-${suffix}`
+    }, { resolveDistance: unavailableDistance });
+    assert.equal(created.body.durableCaseCount, 1);
+    assert.equal(created.body.cases[0].allocatedAmountMinor, 12_345);
+    assert.equal(created.body.cases[0].rateDistanceBandId, null);
+    const durable = await query(
+      `SELECT rate_distance_band_id, calculated_metres::int,
+              allocated_amount_minor::int,
+              source_snapshot->'billingEvidence'->'automaticRate' AS automatic_rate
+         FROM mbt_cross_charge_cases
+        WHERE root_reference = $1`,
+      [reference]
+    );
+    assert.deepEqual(durable.rows[0], {
+      rate_distance_band_id: null,
+      calculated_metres: 0,
+      allocated_amount_minor: 12_345,
+      automatic_rate: {
+        available: false,
+        code: "MBT_MBBS_DISTANCE_LOOKUP_FAILED",
+        message: "No supported driving route was found for these addresses."
+      }
+    });
+  });
+});

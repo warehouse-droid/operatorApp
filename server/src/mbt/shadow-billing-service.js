@@ -8,6 +8,10 @@ import { executeMbtCommand } from "./command-repository.js";
 import { calculateDistanceBandChargeMinor } from "./distance-band-pricing.js";
 import { MbtError } from "./errors.js";
 import {
+  calculateBillingUnitAmount,
+  resolveManualBillingAmount
+} from "./mbbs-driver-billing-planner.js";
+import {
   calculateTorontoRentalExtensionDays,
   calculateMbbsCrossCharges,
   calculateMbtLocalBilling
@@ -1134,6 +1138,9 @@ function crossChargeEvidence(calculatedCase, source) {
     calculatedMetres: calculatedCase.calculatedMetres,
     sourceType: calculatedCase.sourceType,
     rootReference: calculatedCase.rootReference,
+    ...(calculatedCase.billingEvidence === undefined
+      ? {}
+      : { billingEvidence: calculatedCase.billingEvidence }),
     rateCardVersionId: source.rateCardVersionId,
     rateDistanceBandId: source.rateDistanceBandId,
     currency: source.currency,
@@ -1149,6 +1156,9 @@ function crossChargeEvidence(calculatedCase, source) {
     allocationKey: calculatedCase.allocationKey,
     sharedTotalMinor: calculatedCase.sharedTotalMinor,
     allocatedAmountMinor: calculatedCase.allocatedAmountMinor,
+    ...(calculatedCase.billingEvidence === undefined
+      ? {}
+      : { billingEvidence: calculatedCase.billingEvidence }),
     currency: source.currency
   });
   const lineDetail = canonicalize({
@@ -1157,6 +1167,9 @@ function crossChargeEvidence(calculatedCase, source) {
     physicalLoadId: calculatedCase.physicalLoadId,
     sourceType: calculatedCase.sourceType,
     rootReference: calculatedCase.rootReference,
+    ...(calculatedCase.billingEvidence === undefined
+      ? {}
+      : { billingEvidence: calculatedCase.billingEvidence }),
     rateCardVersionId: source.rateCardVersionId,
     rateDistanceBandId: source.rateDistanceBandId,
     localItemRevision: source.localItemRevision
@@ -1166,6 +1179,8 @@ function crossChargeEvidence(calculatedCase, source) {
 
 /** @param {Record<string, any>} row @param {Record<string, any>} calculatedCase @param {Record<string, any>} source @param {ReturnType<typeof crossChargeEvidence>} evidence @param {Record<string, string>} ids */
 function assertExistingCrossCharge(row, calculatedCase, source, evidence, ids) {
+  /** @param {unknown} value */
+  const nullableText = (value) => value === null || value === undefined ? null : String(value);
   const identityPairs = [
     [String(row.cross_charge_case_id), ids.crossChargeCaseId],
     [String(row.billing_case_id), ids.billingCaseId],
@@ -1173,7 +1188,7 @@ function assertExistingCrossCharge(row, calculatedCase, source, evidence, ids) {
     [String(row.billing_line_id), ids.billingLineId],
     [String(row.customer_netsuite_id), source.customerNetsuiteId],
     [String(row.rate_card_version_id), source.rateCardVersionId],
-    [String(row.rate_distance_band_id), source.rateDistanceBandId],
+    [nullableText(row.rate_distance_band_id), nullableText(source.rateDistanceBandId)],
     [String(row.currency), source.currency],
     [String(row.line_currency), source.currency],
     [String(row.local_item_code), source.localItemCode],
@@ -1264,7 +1279,7 @@ async function insertOrVerifyCrossCharge(calculatedCase, source) {
       source.rateCardVersionId,
       source.rateDistanceBandId,
       calculatedCase.calculatedMetres,
-      calculatedCase.sharedTotalMinor,
+      Number(calculatedCase.billingEvidence?.calculatedAmountMinor ?? calculatedCase.sharedTotalMinor),
       calculatedCase.allocatedAmountMinor,
       source.currency,
       JSON.stringify(evidence.sourceSnapshot),
@@ -1506,25 +1521,99 @@ async function selectedCandidateLocalItem() {
 }
 
 /** @param {Record<string, any>} entry @param {Map<string, Array<Record<string, any>>>} graphs */
+// eslint-disable-next-line complexity
 function candidateBillingLoad(entry, graphs) {
   const candidate = object(entry.candidate, "Calculated candidate identity");
   const graph = graphs.get(String(entry.rateCardVersionId));
   const distanceMetres = nonnegativeInteger(entry.distanceMetres, "Cross-charge distance");
+  const automaticRate = entry.automaticRate && typeof entry.automaticRate === "object"
+    ? object(entry.automaticRate, "Automatic rate evidence")
+    : { available: true };
+  const charge = object(entry.charge, "Calculated charge");
+  if (automaticRate.available === false) {
+    const firstBand = graph?.[0];
+    if (!firstBand
+        || entry.selectedBand !== null
+        || entry.distanceAvailable !== false
+        || Number(charge.calculatedAmountMinor) !== 0
+        || String(charge.itemCode) !== "DELIVERY_CHARGE_MBBS"
+        || cad(charge.currency) !== firstBand.currency) {
+      throw failure(409, "MBT_MBBS_CALCULATION_STALE", "A manual MBBS charge no longer matches its retained no-rate evidence.");
+    }
+    const manualAmount = resolveManualBillingAmount({
+      calculatedAmountMinor: 0,
+      adjustmentMinor: charge.adjustmentMinor,
+      finalAmountMinor: charge.finalAmountMinor
+    });
+    const manualEvidence = object(entry.manualAmount, "Manual amount evidence");
+    return {
+      physicalLoadId: requiredText(candidate.physicalLoadId, "Physical-load ID"),
+      completedAt: requiredText(candidate.completedAt, "Completed-load time"),
+      planDate: requiredText(candidate.planDate || String(candidate.completedAt).slice(0, 10), "Plan date"),
+      truckId: null,
+      driverId: null,
+      calculatedMetres: distanceMetres,
+      sharedTotalMinor: nonnegativeInteger(manualAmount.finalAmountMinor, "Shared cross-charge total"),
+      references: candidate.references,
+      billingEvidence: canonicalize({
+        schemaVersion: "mbbs-billing-manual-amount-v1",
+        billingRule: requiredText(candidate.billingRule, "Candidate billing rule"),
+        billingLegId: requiredText(candidate.billingLegId, "Candidate billing-leg ID"),
+        driverLoadIds: Array.isArray(candidate.driverLoadIds) ? candidate.driverLoadIds : [],
+        driverLoadNumbers: Array.isArray(candidate.driverLoadNumbers) ? candidate.driverLoadNumbers : [],
+        memberReferences: Array.isArray(candidate.memberReferences) ? candidate.memberReferences : [],
+        relationship: candidate.relationship || null,
+        routeStops: Array.isArray(candidate.routeStops) ? candidate.routeStops : [],
+        calculationSteps: Array.isArray(entry.calculationSteps) ? entry.calculationSteps : [],
+        distanceAvailable: false,
+        automaticRate,
+        distanceBandAmountMinor: 0,
+        additionalDropCount: 0,
+        additionalDropFeeMinor: 0,
+        ...manualAmount,
+        edited: true,
+        editorId: requiredText(manualEvidence.editorId, "Manual-rate editor ID")
+      }),
+      _rate: {
+        rateCardVersionId: String(entry.rateCardVersionId),
+        rateDistanceBandId: null,
+        currency: firstBand.currency
+      }
+    };
+  }
   const selected = graph
     ? /** @type {(Record<string, any> & {amountMinor: unknown}) | undefined} */ (
       selectRateBand(graph, distanceMetres)
     )
     : null;
   const selectedBand = object(entry.selectedBand, "Selected rate band");
-  const charge = object(entry.charge, "Calculated charge");
   const chargeCurrency = cad(charge.currency);
+  const rateAmountMinor = selected
+    ? calculateDistanceBandChargeMinor(selected, distanceMetres)
+    : null;
+  const policyAmount = selected
+    ? calculateBillingUnitAmount({
+        billingRule: requiredText(candidate.billingRule, "Candidate billing rule"),
+        distanceBandAmountMinor: rateAmountMinor,
+        dropCount: nonnegativeInteger(candidate.dropCount, "Candidate drop count")
+      })
+    : null;
+  const manualAmount = policyAmount
+    ? resolveManualBillingAmount({
+        calculatedAmountMinor: policyAmount.calculatedAmountMinor,
+        adjustmentMinor: charge.adjustmentMinor,
+        finalAmountMinor: charge.finalAmountMinor
+      })
+    : null;
   const matches = selected && [
     [selected.rateDistanceBandId, String(selectedBand.rateDistanceBandId)],
     [selected.itemCode, String(charge.itemCode)],
-    [calculateDistanceBandChargeMinor(selected, distanceMetres), Number(charge.amountMinor)],
+    [policyAmount?.calculatedAmountMinor, Number(charge.calculatedAmountMinor)],
+    [manualAmount?.finalAmountMinor, Number(charge.amountMinor)],
+    [manualAmount?.finalAmountMinor, Number(charge.totalMinor)],
     [chargeCurrency, selected.currency]
   ].every(([actual, expected]) => actual === expected);
-  if (!matches || !selected) {
+  if (!matches || !selected || !policyAmount || !manualAmount) {
     throw failure(409, "MBT_MBBS_CALCULATION_STALE", "A selected MBBS calculation no longer matches the active rate graph.");
   }
   return {
@@ -1534,8 +1623,25 @@ function candidateBillingLoad(entry, graphs) {
     truckId: null,
     driverId: null,
     calculatedMetres: distanceMetres,
-    sharedTotalMinor: nonnegativeInteger(charge.amountMinor, "Shared cross-charge total"),
+    sharedTotalMinor: nonnegativeInteger(manualAmount.finalAmountMinor, "Shared cross-charge total"),
     references: candidate.references,
+    billingEvidence: canonicalize({
+      schemaVersion: "mbbs-billing-manual-amount-v1",
+      billingRule: requiredText(candidate.billingRule, "Candidate billing rule"),
+      billingLegId: requiredText(candidate.billingLegId, "Candidate billing-leg ID"),
+      driverLoadIds: Array.isArray(candidate.driverLoadIds) ? candidate.driverLoadIds : [],
+      driverLoadNumbers: Array.isArray(candidate.driverLoadNumbers) ? candidate.driverLoadNumbers : [],
+      memberReferences: Array.isArray(candidate.memberReferences) ? candidate.memberReferences : [],
+      relationship: candidate.relationship || null,
+      routeStops: Array.isArray(candidate.routeStops) ? candidate.routeStops : [],
+      calculationSteps: Array.isArray(entry.calculationSteps) ? entry.calculationSteps : [],
+      distanceBandAmountMinor: policyAmount.distanceBandAmountMinor,
+      additionalDropCount: policyAmount.additionalDropCount,
+      additionalDropFeeMinor: policyAmount.additionalDropFeeMinor,
+      ...manualAmount,
+      edited: manualAmount.adjustmentMinor !== 0,
+      editorId: String(object(entry.manualAmount, "Manual amount evidence").editorId || "")
+    }),
     _rate: {
       rateCardVersionId: String(entry.rateCardVersionId),
       rateDistanceBandId: selected.rateDistanceBandId,

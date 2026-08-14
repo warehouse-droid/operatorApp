@@ -1707,11 +1707,20 @@ function updateScmScheduleGroupButton() {
 
 function collectRowPatch(rowId) {
   const row = scmScheduleRows.find((item) => scheduleRowId(item) === rowId);
-  const patch = { orderKind: row?.orderKind || "PO" };
+  const patch = {
+    orderKind: row?.orderKind || "PO",
+    expectedUpdatedAt: row?.updatedAt || null
+  };
   scmScheduleApp.querySelectorAll(`[data-row="${CSS.escape(rowId)}"][data-field]`).forEach((field) => {
     patch[field.dataset.field] = field.type === "checkbox" ? field.checked : field.value;
   });
   return patch;
+}
+
+function setScmScheduleRowControlsDisabled(rowId, disabled) {
+  scmScheduleApp.querySelectorAll(
+    `[data-row="${CSS.escape(rowId)}"][data-field], button[data-action="save-row"][data-row="${CSS.escape(rowId)}"]`
+  ).forEach((field) => { field.disabled = disabled; });
 }
 
 function collectScmScheduleReconciliationAllocations(rowId) {
@@ -2258,6 +2267,7 @@ scmScheduleApp.addEventListener("click", async (event) => {
     const patch = collectRowPatch(rowId);
     scmScheduleSavingRef = rowId;
     updateScmScheduleNotice("");
+    setScmScheduleRowControlsDisabled(rowId, true);
     target.disabled = true;
     target.textContent = "Saving";
     try {
@@ -2284,6 +2294,7 @@ scmScheduleApp.addEventListener("click", async (event) => {
       }
     } finally {
       scmScheduleSavingRef = "";
+      setScmScheduleRowControlsDisabled(rowId, false);
       if (target.isConnected) {
         target.disabled = false;
         target.textContent = "Save";

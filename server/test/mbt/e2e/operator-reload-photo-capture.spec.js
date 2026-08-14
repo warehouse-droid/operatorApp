@@ -87,7 +87,7 @@ function reloadApiFixture(pathname) {
         }
       };
     case "/api/operator/photo-upload-token":
-      return { matched: true, value: { uploadUrl: "/api/test-r2-upload", token: "reload-photo-token" } };
+      return { matched: true, value: { uploadUrl: "/api/test-r2-upload", token: "reload-photo-token" } }; // secret-scan: allow non-secret test fixture
     case "/api/delivery/notifications":
       return { matched: true, value: { total: 0, salesOrder: { dueToday: 0 }, transferOrder: { dueToday: 0 }, items: [] } };
     case "/api/delivery/current-draft":

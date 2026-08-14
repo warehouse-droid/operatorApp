@@ -2821,6 +2821,7 @@ export function createMbtRouter(dependencies = {}) {
           completedDate: body.completedDate,
           rateCardVersionId: body.rateCardVersionId,
           customerNetsuiteId: body.customerNetsuiteId,
+          manualAmountEdits: body.manualAmountEdits,
           reason: body.reason,
           idempotencyKey: requiredRequestText(
             req.get("idempotency-key"),

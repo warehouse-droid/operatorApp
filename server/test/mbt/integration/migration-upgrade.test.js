@@ -352,6 +352,7 @@ test("F06/F16: schema-101 upgrade preserves representative legacy records and is
     assert.match(firstRunner.stdout, /Applied 156_scm_vendor_item_price\.sql/);
     assert.match(firstRunner.stdout, /Applied 157_yard_movement_history_indexes\.sql/);
     assert.match(firstRunner.stdout, /Applied 158_mbt_mbbs_candidate_billing\.sql/);
+    assert.match(firstRunner.stdout, /Applied 159_dispatch_order_completion_status\.sql/);
 
     const after = await captureLegacyState(client, ids);
     assert.deepEqual(after, before, "Migrations 102-109 must not rewrite representative schema-101 records.");
@@ -471,10 +472,10 @@ test("F06/F16: schema-101 upgrade preserves representative legacy records and is
       "idx_receiving_receipt_records_movement_activity"
     ]);
 
-    assert.equal(receiptsBeforeNoOp.rowCount, 158);
+    assert.equal(receiptsBeforeNoOp.rowCount, 159);
     assert.equal(
       receiptsBeforeNoOp.rows.at(-1)?.filename,
-      "158_mbt_mbbs_candidate_billing.sql"
+      "159_dispatch_order_completion_status.sql"
     );
     assert.deepEqual(
       receiptsBeforeNoOp.rows

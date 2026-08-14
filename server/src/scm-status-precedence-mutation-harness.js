@@ -70,6 +70,21 @@ const mutations = [
         2
       );
     }
+  },
+  {
+    name: "discard the calculated terminal status in the PO Split response",
+    file: serverPath,
+    test: "src/scm-order-visibility-integration-harness.js",
+    expectedFailure: /Completed reconciliation must remain terminal despite a newer manual Queued status/i,
+    mutate(source) {
+      return replaceOccurrence(
+        source,
+        'status: row.calculatedStatus || row.reconciliationApplicationStatus || row.status || order.scm?.status || "",',
+        'status: row.status || order.scm?.status || "",',
+        1,
+        2
+      );
+    }
   }
 ];
 

@@ -287,7 +287,7 @@ function rowToDispatchOrder(row) {
           : "Queued"
       ),
       scheduleId: Number(row.scm_schedule_id) || null,
-      updatedAt: row.scm_updated_at || null,
+      updatedAt: row.scm_concurrency_updated_at || row.scm_updated_at || null,
       isSpecialOrder: Boolean(row.scm_is_special_order),
       groupRef: row.scm_group_ref || "",
       packingSlipRef: row.scm_packing_slip_ref || "",
@@ -679,6 +679,7 @@ export async function listDispatchOrders({
         'Queued'::text AS scm_status,
         NULL::bigint AS scm_schedule_id,
         NULL::timestamptz AS scm_updated_at,
+        NULL::text AS scm_concurrency_updated_at,
         false AS scm_is_special_order,
         NULL::text AS scm_group_ref,
         NULL::text AS scm_packing_slip_ref,
@@ -817,6 +818,7 @@ export async function listDispatchOrders({
         COALESCE(scm.status, o.initial_scm_status, 'Hold') AS scm_status,
         scm.id AS scm_schedule_id,
         scm.updated_at AS scm_updated_at,
+        to_char(scm.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS scm_concurrency_updated_at,
         COALESCE(scm.is_special_order, false) AS scm_is_special_order,
         scm.group_ref AS scm_group_ref,
         scm.packing_slip_ref AS scm_packing_slip_ref,
@@ -969,6 +971,7 @@ export async function listDispatchOrders({
         'Queued'::text AS scm_status,
         NULL::bigint AS scm_schedule_id,
         NULL::timestamptz AS scm_updated_at,
+        NULL::text AS scm_concurrency_updated_at,
         false AS scm_is_special_order,
         NULL::text AS scm_group_ref,
         NULL::text AS scm_packing_slip_ref,
@@ -1042,6 +1045,7 @@ export async function listDispatchOrders({
         COALESCE(scm.status, v.status, 'Queued') AS scm_status,
         scm.id AS scm_schedule_id,
         scm.updated_at AS scm_updated_at,
+        to_char(scm.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS scm_concurrency_updated_at,
         false AS scm_is_special_order,
         scm.group_ref AS scm_group_ref,
         scm.packing_slip_ref AS scm_packing_slip_ref,
@@ -2474,6 +2478,7 @@ export async function listScmSchedule({
         COALESCE(active_split.source_po_ref, po.tranid) AS source_ref,
         COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid) AS order_ref,
         po.dispatch_ref,
+        active_split.split_po_ref AS split_ref,
         po.vendor AS party,
         COALESCE(NULLIF(po.dispatch_vendor_yard, ''), NULLIF(po.source_location, ''), po.vendor) AS pickup_point,
         po.destination_location AS dropoff_point,
@@ -2538,7 +2543,7 @@ export async function listScmSchedule({
           active_group.id IS NULL
           OR lower(COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid)) = lower(active_group.group_ref)
         )
-      GROUP BY po.netsuite_id, active_split.source_po_ref
+      GROUP BY po.netsuite_id, active_split.source_po_ref, active_split.split_po_ref
     ),
     unique_to_line_locations AS MATERIALIZED (
       SELECT line.transfer_order_id,
@@ -2566,6 +2571,7 @@ export async function listScmSchedule({
         t.tranid AS source_ref,
         t.tranid AS order_ref,
         NULL::text AS dispatch_ref,
+        NULL::text AS split_ref,
         COALESCE(
           NULLIF(BTRIM(t.from_location), ''),
           NULLIF(BTRIM(outbound_location.location), ''),
@@ -2646,6 +2652,7 @@ export async function listScmSchedule({
         v.vrma_ref AS source_ref,
         v.vrma_ref AS order_ref,
         NULL::text AS dispatch_ref,
+        NULL::text AS split_ref,
         COALESCE(v.local_vendor, v.vendor, 'Vendor Return') AS party,
         v.pickup_location AS pickup_point,
         v.dropoff_location AS dropoff_point,
@@ -2820,7 +2827,12 @@ export async function listScmSchedule({
       COALESCE(NULLIF(s.content, ''), b.content, '') AS content,
       COALESCE(b.total_pallet_qty, 0) AS total_pallet_qty,
       COALESCE(NULLIF(s.weight_lbs, 0), b.weight_lbs, 0) AS weight_lbs,
-      COALESCE(NULLIF(s.packing_slip_ref, ''), b.dispatch_ref, '') AS packing_slip_ref,
+      COALESCE(
+        NULLIF(s.packing_slip_ref, ''),
+        NULLIF(b.dispatch_ref, ''),
+        NULLIF(b.split_ref, ''),
+        ''
+      ) AS packing_slip_ref,
       COALESCE(s.group_ref, '') AS group_ref,
       operational_status.status AS status,
       COALESCE(s.created_at, b.queued_at) AS queued_at,
@@ -2833,6 +2845,7 @@ export async function listScmSchedule({
       END AS sla_days,
       COALESCE(NULLIF(s.notes, ''), NULLIF(s.dispatch_assignment_note, ''), planned.notes, '') AS notes,
       s.updated_at,
+      to_char(s.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS concurrency_updated_at,
       s.updated_by
     FROM base b
     LEFT JOIN scm_transport_schedule s
@@ -3059,7 +3072,7 @@ export async function listScmSchedule({
       sla: row.sla_days === null || row.sla_days === undefined ? "" : `${Number(row.sla_days)} day${Number(row.sla_days) === 1 ? "" : "s"}`,
       slaDays: row.sla_days === null || row.sla_days === undefined ? null : Number(row.sla_days),
       notes: row.notes || "",
-      updatedAt: row.updated_at,
+      updatedAt: row.concurrency_updated_at || row.updated_at,
       updatedBy: row.updated_by || ""
     };
   }));
@@ -3070,11 +3083,25 @@ export async function updateScmScheduleEntry({
   orderKind = "PO",
   orderRef = "",
   patch = {},
-  updatedBy = ""
+  updatedBy = "",
+  expectedUpdatedAt = undefined
 } = {}) {
   const kind = normalizeScmOrderKind(orderKind);
   const ref = String(orderRef || "").trim();
   if (!ref) throw new Error("SCM order ref is required.");
+  const revisionSupplied = expectedUpdatedAt !== undefined;
+  const expectedRevision = expectedUpdatedAt === null || expectedUpdatedAt === ""
+    ? null
+    : expectedUpdatedAt;
+  const parsedRevision = expectedRevision === null ? null : new Date(expectedRevision);
+  if (revisionSupplied && parsedRevision && Number.isNaN(parsedRevision.getTime())) {
+    throw Object.assign(new Error("This schedule row changed after it was opened. Refresh and try again."), {
+      status: 409,
+      code: "SCM_SCHEDULE_STALE"
+    });
+  }
+  const exactRevision = typeof expectedRevision === "string"
+    && /\.\d{4,}(?:Z|[+-]\d{2}:?\d{2})$/i.test(expectedRevision);
   const existing = await query(
     `SELECT *
        FROM scm_transport_schedule
@@ -3163,7 +3190,19 @@ export async function updateScmScheduleEntry({
        sla = EXCLUDED.sla,
        notes = EXCLUDED.notes,
        updated_by = EXCLUDED.updated_by,
-       updated_at = now()
+       updated_at = GREATEST(clock_timestamp(), scm_transport_schedule.updated_at + interval '1 microsecond')
+     WHERE NOT $20::boolean
+        OR (
+          $21::timestamptz IS NOT NULL
+          AND (
+            ($22::boolean AND scm_transport_schedule.updated_at = $21::timestamptz)
+            OR (
+              NOT $22::boolean
+              AND date_trunc('milliseconds', scm_transport_schedule.updated_at)
+                = date_trunc('milliseconds', $21::timestamptz)
+            )
+          )
+        )
      RETURNING *`,
     [
       kind,
@@ -3184,9 +3223,18 @@ export async function updateScmScheduleEntry({
       next.driver,
       next.sla,
       next.notes,
-      updatedBy || null
+      updatedBy || null,
+      revisionSupplied,
+      expectedRevision,
+      exactRevision
     ]
   );
+  if (!result.rowCount) {
+    throw Object.assign(new Error("This schedule row changed after it was opened. Refresh and try again."), {
+      status: 409,
+      code: "SCM_SCHEDULE_STALE"
+    });
+  }
   if (kind === "PO" && has("packingSlipRef", "packing_slip_ref")) {
     await updatePurchaseOrderDispatchRef({
       poRef: ref,
@@ -5326,11 +5374,12 @@ export async function createScmPurchaseOrderSplit({
     if (splitPickupPoint) {
       await query(
         `INSERT INTO scm_transport_schedule (
-           order_kind, order_ref, pickup_point, brand, updated_by, created_by
-         ) VALUES ('PO', $1, $2, NULLIF($3, ''), $4, $4)
+           order_kind, order_ref, pickup_point, brand, packing_slip_ref, updated_by, created_by
+         ) VALUES ('PO', $1, $2, NULLIF($3, ''), $1, $4, $4)
          ON CONFLICT (order_kind, order_ref) DO UPDATE SET
            pickup_point = EXCLUDED.pickup_point,
            brand = COALESCE(scm_transport_schedule.brand, EXCLUDED.brand),
+           packing_slip_ref = COALESCE(NULLIF(scm_transport_schedule.packing_slip_ref, ''), EXCLUDED.packing_slip_ref),
            updated_by = EXCLUDED.updated_by,
            updated_at = now()`,
         [splitRef, splitPickupPoint, selectedPickupYard?.vendor || "", createdBy || null]

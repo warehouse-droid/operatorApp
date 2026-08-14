@@ -409,6 +409,12 @@ test("MBBS candidate HTTP searches canonical customers and converts one server-o
       completedDate: "2038-08-10",
       rateCardVersionId: VERSION_ID,
       customerNetsuiteId: "123",
+      manualAmountEdits: [{
+        candidateId: CANDIDATE_ID,
+        calculatedAmountMinor: 25_000,
+        adjustmentMinor: -1_000,
+        finalAmountMinor: 24_000
+      }],
       reason: "Convert a verified batch"
     }
   });
@@ -421,6 +427,12 @@ test("MBBS candidate HTTP searches canonical customers and converts one server-o
   assert.equal(calls[0].input.idempotencyKey, "p3-billing-http-candidate-create");
   assert.equal(calls[0].input.completedDate, "2038-08-10");
   assert.equal(calls[0].input.customerNetsuiteId, "123");
+  assert.deepEqual(calls[0].input.manualAmountEdits, [{
+    candidateId: CANDIDATE_ID,
+    calculatedAmountMinor: 25_000,
+    adjustmentMinor: -1_000,
+    finalAmountMinor: 24_000
+  }]);
   assert.equal(typeof calls[0].dependencies.resolveDistance, "function");
 });
 

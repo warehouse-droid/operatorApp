@@ -107,13 +107,13 @@
           <h3 id="mbbsBatchResultsTitle">Batch calculation results</h3>
           <div class="mbt-table-wrap" tabindex="0" aria-label="Scrollable MBBS batch calculation results">
             <table>
-              <thead><tr><th scope="col">Order</th><th scope="col">Result</th><th scope="col">Distance</th><th scope="col">Rate</th><th scope="col">Charge</th></tr></thead>
+              <thead><tr><th scope="col"><input id="selectAllMbbsBatchResults" type="checkbox" aria-label="Select all calculated results for billing" /> Select for billing</th><th scope="col">Order</th><th scope="col">Load / leg</th><th scope="col">Origin</th><th scope="col">Destination</th><th scope="col">Relationship and calculation</th><th scope="col">Result</th><th scope="col">Distance (km)</th><th scope="col">Rate</th><th scope="col">Calculated charge</th><th scope="col">Adjustment (CAD)</th><th scope="col">Final charge (CAD)</th></tr></thead>
               <tbody id="mbbsBatchResultRows"></tbody>
             </table>
           </div>
           <section class="mbt-batch-conversion" aria-labelledby="mbbsBatchConversionTitle">
             <h4 id="mbbsBatchConversionTitle">Create real local billing cases</h4>
-            <p>The server recalculates every selected route and rate, freezes immutable evidence, and creates the complete batch atomically. This still creates no outbox or NetSuite work.</p>
+            <p>Only checked calculation rows are recalculated and converted. The server freezes immutable evidence and creates that selected batch atomically. This still creates no outbox or NetSuite work.</p>
             <div class="mbt-form-row" role="search" aria-label="Canonical billing customer search">
               <label>Find canonical billing customer
                 <input id="mbbsBillingCustomerSearch" type="search" minlength="2" maxlength="120" autocomplete="off" />

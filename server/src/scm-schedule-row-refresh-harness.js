@@ -25,8 +25,12 @@ for (const expected of [
 
 const predicateStart = client.indexOf("function scmScheduleRowMatchesCurrentFilters");
 const predicateEnd = client.indexOf("function moveScmScheduleMapEntry", predicateStart);
+const statusHelperStart = client.indexOf("function scmScheduleFirstValue");
+const statusHelperEnd = client.indexOf("function scmScheduleReconciliationStatus", statusHelperStart);
 assert(predicateStart >= 0 && predicateEnd > predicateStart,
   "The targeted row filter predicate could not be isolated.");
+assert(statusHelperStart >= 0 && statusHelperEnd > statusHelperStart,
+  "The effective-status helper dependency could not be isolated.");
 const predicateContext = {
   scmScheduleFilters: {
     view: "scm working",
@@ -45,7 +49,8 @@ const predicateContext = {
   scmScheduleFilterValues: (value) => Array.isArray(value) ? value : [value].filter(Boolean),
   scmScheduleNeedsReconciliationReview: () => false
 };
-vm.runInNewContext(`${client.slice(predicateStart, predicateEnd)}
+vm.runInNewContext(`${client.slice(statusHelperStart, statusHelperEnd)}
+  ${client.slice(predicateStart, predicateEnd)}
   const matching = {
     orderRef: "PO-NEEDLE", party: "Acme Vendor", content: "Needle item",
     status: "Hold", method: "Vendor", orderKind: "PO", dropoffPoint: "3445 + 12441",

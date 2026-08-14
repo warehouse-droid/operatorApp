@@ -52,7 +52,7 @@ for (const expected of [
 ]) {
   assert(server.includes(expected), `Schedule preference routes are missing ${expected}.`);
 }
-assert(html.includes("/scm-schedule.js?v=20260812-calculated-status-v1"),
+assert(html.includes("/scm-schedule.js?v=20260813-status-concurrency-v2"),
   "Schedule preference client cache bust is missing.");
 assert(migration.includes("PRIMARY KEY (operator_id, surface)"), "Schedule preferences are not isolated by user and surface.");
 assert(migration.includes("REFERENCES operators(id) ON DELETE CASCADE"), "Deleted staff accounts retain schedule preferences.");

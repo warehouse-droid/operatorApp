@@ -8,7 +8,10 @@ const state = {
   mbbsRateOptions: [],
   selectedMbbsCandidateId: null,
   selectedMbbsCandidateIds: new Set(),
+  selectedMbbsBatchResultIds: new Set(),
   mbbsBatchResults: [],
+  manualAmountEdits: new Map(),
+  invalidManualAmountCandidates: new Set(),
   mbbsBatchPreviewContext: null,
   mbbsOrderSearchResults: [],
   mbbsCustomerResults: [],
@@ -70,6 +73,15 @@ function money(value, currency = "CAD") {
   return new Intl.NumberFormat("en-CA", { style: "currency", currency }).format(Number(value) / 100);
 }
 
+function formatDistanceKm(value, available = true) {
+  const metres = Number(value);
+  if (!available || !Number.isSafeInteger(metres) || metres < 0) return "—";
+  return `${new Intl.NumberFormat("en-CA", {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 2
+  }).format(metres / 1000)} km`;
+}
+
 function cadMinorInput(id, label) {
   const value = inputValue(id);
   if (!value) return null;
@@ -82,6 +94,33 @@ function cadMinorInput(id, label) {
     throw new Error(`${label} is outside the supported CAD range.`);
   }
   return amountMinor;
+}
+
+function cadInputMinor(value, { label, signed = false } = {}) {
+  const normalized = String(value ?? "").trim();
+  const pattern = signed
+    ? /^[+-]?(?:0|[1-9]\d*)(?:\.\d{1,2})?$/
+    : /^(?:0|[1-9]\d*)(?:\.\d{1,2})?$/;
+  if (!pattern.test(normalized)) {
+    throw new Error(`${label || "Amount"} must be exact CAD with at most two decimal places.`);
+  }
+  const negative = normalized.startsWith("-");
+  const unsigned = normalized.replace(/^[+-]/, "");
+  const [whole, fraction = ""] = unsigned.split(".");
+  const absoluteMinor = (Number(whole) * 100) + Number(fraction.padEnd(2, "0"));
+  const amountMinor = negative ? -absoluteMinor : absoluteMinor;
+  if (!Number.isSafeInteger(amountMinor)) {
+    throw new Error(`${label || "Amount"} is outside the supported CAD range.`);
+  }
+  return amountMinor;
+}
+
+function minorToCadInput(value) {
+  const amountMinor = Number(value);
+  if (!Number.isSafeInteger(amountMinor)) return "";
+  const sign = amountMinor < 0 ? "-" : "";
+  const absolute = Math.abs(amountMinor);
+  return `${sign}${Math.floor(absolute / 100)}.${String(absolute % 100).padStart(2, "0")}`;
 }
 
 function textCell(value) {
@@ -130,16 +169,32 @@ function syncCommandButtons() {
   if (create && state.commandsEnabled) {
     const reason = inputValue("mbbsBatchConversionReason");
     const contextMatches = batchContextsMatch(state.mbbsBatchPreviewContext, currentMbbsBatchContext());
-    const allCalculated = state.mbbsBatchResults.length > 0
-      && state.mbbsBatchResults.every((result) => result.status === "calculated");
+    const conversionIds = conversionCandidateIds();
+    const selectedResults = conversionIds.map((candidateId) =>
+      state.mbbsBatchResults.find((result) => result.candidateId === candidateId)
+    );
+    const allSelectedUsable = conversionIds.length > 0
+      && selectedResults.every((result) => result && ["calculated", "manual_required"].includes(result.status));
+    const manualEditsValid = allSelectedUsable
+      && conversionIds.every((candidateId) => !state.invalidManualAmountCandidates.has(candidateId))
+      && selectedResults.every((result) => {
+        const edit = state.manualAmountEdits.get(result.candidateId);
+        return edit
+          && Number.isSafeInteger(edit.calculatedAmountMinor)
+          && Number.isSafeInteger(edit.adjustmentMinor)
+          && Number.isSafeInteger(edit.finalAmountMinor)
+          && edit.finalAmountMinor >= 0
+          && edit.calculatedAmountMinor + edit.adjustmentMinor === edit.finalAmountMinor;
+      });
     create.disabled = !contextMatches
-      || !allCalculated
+      || !allSelectedUsable
+      || !manualEditsValid
       || !inputValue("mbbsBillingCustomerId")
       || reason.length < 3
       || reason.length > 2000;
     create.title = create.disabled
-      ? "Calculate the unchanged batch successfully, choose a customer, and enter an audit reason."
-      : "Recalculate and create this complete local billing batch atomically.";
+      ? "Check at least one usable result, choose a customer, and enter an audit reason."
+      : `Recalculate and create ${conversionIds.length} checked local billing case(s) atomically.`;
   }
 }
 
@@ -164,6 +219,9 @@ function invalidateMbbsBatchPreview({ clearResults = true } = {}) {
   state.mbbsBatchPreviewContext = null;
   if (clearResults) {
     state.mbbsBatchResults = [];
+    state.selectedMbbsBatchResultIds.clear();
+    state.manualAmountEdits.clear();
+    state.invalidManualAmountCandidates.clear();
     renderBatchResults();
   }
   syncCommandButtons();
@@ -202,9 +260,13 @@ function tabKeydown(event) {
 }
 
 function mbbsReferenceText(candidate) {
-  return (candidate.references || [])
+  const root = (candidate.references || [])
     .map((reference) => `${reference.sourceType} ${reference.rootReference}`)
     .join(", ") || "No retained order reference";
+  const children = (candidate.memberReferences || [])
+    .map((reference) => `${reference.sourceType} ${reference.rootReference}`)
+    .join(", ");
+  return children ? `${root} (children: ${children})` : root;
 }
 
 function mbbsCompletionTime(value) {
@@ -265,8 +327,17 @@ function renderMbbsCandidateDetail() {
   facts?.replaceChildren();
   if (facts) {
     appendFact(facts, "Completed", mbbsCompletionTime(candidate.completedAt));
+    appendFact(
+      facts,
+      "Driver load evidence",
+      Array.isArray(candidate.driverLoadNumbers) && candidate.driverLoadNumbers.length
+        ? candidate.driverLoadNumbers.join(" + ")
+        : candidate.loadNumber
+    );
+    appendFact(facts, "Billing leg", candidate.billingLegId || candidate.physicalLoadId);
     appendFact(facts, "Origin", candidate.originLabel);
     appendFact(facts, "Destination", candidate.destinationLabel || "Missing");
+    appendFact(facts, "Relationship", candidate.relationship?.summary || candidate.billingRule);
     appendFact(facts, "Readiness", candidate.chargeable ? "Ready to calculate" : candidate.reason);
     appendFact(
       facts,
@@ -546,6 +617,169 @@ function selectedRateLabel(rateCardVersionId) {
   return option ? `${option.rateCardCode} v${option.versionNumber}` : rateCardVersionId;
 }
 
+function usableBatchResult(result) {
+  return ["calculated", "manual_required"].includes(result?.status);
+}
+
+function conversionCandidateIds() {
+  return state.mbbsBatchResults
+    .filter((result) => usableBatchResult(result)
+      && state.selectedMbbsBatchResultIds.has(result.candidateId))
+    .map((result) => result.candidateId);
+}
+
+function syncBatchResultSelectAll() {
+  const selectAll = element("selectAllMbbsBatchResults");
+  if (!selectAll) return;
+  const usable = state.mbbsBatchResults.filter(usableBatchResult);
+  const selected = usable.filter((result) => state.selectedMbbsBatchResultIds.has(result.candidateId));
+  selectAll.disabled = usable.length === 0;
+  selectAll.checked = usable.length > 0 && selected.length === usable.length;
+  selectAll.indeterminate = selected.length > 0 && selected.length < usable.length;
+}
+
+function toggleBatchResult(candidateId, checked) {
+  if (checked) state.selectedMbbsBatchResultIds.add(candidateId);
+  else state.selectedMbbsBatchResultIds.delete(candidateId);
+  syncBatchResultSelectAll();
+  syncCommandButtons();
+}
+
+function toggleAllBatchResults(checked) {
+  state.selectedMbbsBatchResultIds.clear();
+  if (checked) {
+    for (const result of state.mbbsBatchResults.filter(usableBatchResult)) {
+      state.selectedMbbsBatchResultIds.add(result.candidateId);
+    }
+  }
+  renderBatchResults();
+  syncCommandButtons();
+}
+
+function batchResultCandidate(result) {
+  return result.candidate
+    || state.mbbsCandidates.find((item) => item.candidateId === result.candidateId)
+    || {};
+}
+
+function calculationEvidenceCell(result, candidate) {
+  const cell = document.createElement("td");
+  const relationship = document.createElement("p");
+  relationship.className = "mbt-calculation-relationship";
+  relationship.textContent = candidate.relationship?.summary || candidate.billingRule || "Retained order route";
+  cell.append(relationship);
+  const steps = Array.isArray(result.calculationSteps) ? result.calculationSteps : [];
+  if (steps.length) {
+    const list = document.createElement("ol");
+    list.className = "mbt-calculation-steps";
+    for (const step of steps) {
+      const item = document.createElement("li");
+      const amount = step.amountMinor === null || step.amountMinor === undefined
+        ? ""
+        : ` · ${money(step.amountMinor, result.charge?.currency || "CAD")}`;
+      item.textContent = `${step.description || step.code}${amount}`;
+      list.append(item);
+    }
+    cell.append(list);
+  }
+  const manualSummary = document.createElement("p");
+  manualSummary.className = "mbt-manual-amount-summary";
+  manualSummary.dataset.mbbsManualSummary = result.candidateId;
+  cell.append(manualSummary);
+  return cell;
+}
+
+function amountInputCell(result, candidate, field) {
+  const edit = state.manualAmountEdits.get(result.candidateId);
+  const cell = document.createElement("td");
+  const input = document.createElement("input");
+  input.type = "number";
+  input.step = "0.01";
+  input.inputMode = "decimal";
+  input.className = "mbt-billing-money-input";
+  const adjustment = field === "adjustment";
+  if (!adjustment) input.min = "0";
+  if (adjustment) {
+    input.setAttribute("data-mbbs-adjustment", result.candidateId);
+    input.value = minorToCadInput(edit?.adjustmentMinor ?? 0);
+  } else {
+    input.setAttribute("data-mbbs-final-charge", result.candidateId);
+    input.value = minorToCadInput(edit?.finalAmountMinor ?? result.charge?.amountMinor);
+  }
+  input.setAttribute(
+    "aria-label",
+    `${adjustment ? "Signed adjustment" : "Final charge"} for ${mbbsReferenceText(candidate)}`
+  );
+  input.addEventListener("input", () => updateManualAmountEdit(result.candidateId, field, input));
+  cell.append(input);
+  return cell;
+}
+
+function matchingMoneyInput(attribute, candidateId) {
+  return [...document.querySelectorAll(`[${attribute}]`)]
+    .find((input) => input.getAttribute(attribute) === candidateId);
+}
+
+function updateManualAmountSummary(candidateId) {
+  const edit = state.manualAmountEdits.get(candidateId);
+  const result = state.mbbsBatchResults.find((entry) => entry.candidateId === candidateId);
+  const candidate = result ? batchResultCandidate(result) : {};
+  const summary = [...document.querySelectorAll("[data-mbbs-manual-summary]")]
+    .find((item) => item.dataset.mbbsManualSummary === candidateId);
+  if (!summary || !edit) return;
+  const references = Array.isArray(candidate.references) ? [...candidate.references] : [];
+  references.sort((left, right) => String(left.sourceType).localeCompare(String(right.sourceType))
+    || String(left.rootReference).localeCompare(String(right.rootReference)));
+  const allocation = candidate.billingRule === "po_shared_leg" && references.length
+    ? references.map((reference, index) => {
+        const base = Math.floor(edit.finalAmountMinor / references.length);
+        const remainder = edit.finalAmountMinor - (base * references.length);
+        const amount = index === references.length - 1 ? base + remainder : base;
+        return `${reference.sourceType} ${reference.rootReference} ${money(amount)}`;
+      }).join("; ")
+    : "";
+  summary.textContent = `${money(edit.calculatedAmountMinor)} ${edit.adjustmentMinor < 0 ? "−" : "+"} ${money(Math.abs(edit.adjustmentMinor))} = ${money(edit.finalAmountMinor)} final${allocation ? ` · final allocation: ${allocation}` : ""}`;
+}
+
+function updateManualAmountEdit(candidateId, field, input) {
+  const current = state.manualAmountEdits.get(candidateId);
+  if (!current) return;
+  try {
+    const enteredMinor = cadInputMinor(input.value, {
+      label: field === "adjustment" ? "Adjustment" : "Final charge",
+      signed: field === "adjustment"
+    });
+    const adjustmentMinor = field === "adjustment"
+      ? enteredMinor
+      : enteredMinor - current.calculatedAmountMinor;
+    const finalAmountMinor = field === "final"
+      ? enteredMinor
+      : current.calculatedAmountMinor + enteredMinor;
+    if (!Number.isSafeInteger(adjustmentMinor)
+        || !Number.isSafeInteger(finalAmountMinor)
+        || finalAmountMinor < 0) {
+      throw new Error("Final charge cannot be negative or outside the supported CAD range.");
+    }
+    state.manualAmountEdits.set(candidateId, {
+      calculatedAmountMinor: current.calculatedAmountMinor,
+      adjustmentMinor,
+      finalAmountMinor
+    });
+    const adjustmentInput = matchingMoneyInput("data-mbbs-adjustment", candidateId);
+    const finalInput = matchingMoneyInput("data-mbbs-final-charge", candidateId);
+    if (field !== "adjustment" && adjustmentInput) adjustmentInput.value = minorToCadInput(adjustmentMinor);
+    if (field !== "final" && finalInput) finalInput.value = minorToCadInput(finalAmountMinor);
+    adjustmentInput?.setCustomValidity("");
+    finalInput?.setCustomValidity("");
+    state.invalidManualAmountCandidates.delete(candidateId);
+    updateManualAmountSummary(candidateId);
+  } catch (error) {
+    input.setCustomValidity(error.message);
+    state.invalidManualAmountCandidates.add(candidateId);
+  }
+  syncCommandButtons();
+}
+
 function renderBatchResults() {
   const rows = element("mbbsBatchResultRows");
   if (!rows) return;
@@ -553,25 +787,53 @@ function renderBatchResults() {
   if (!state.mbbsBatchResults.length) {
     const row = document.createElement("tr");
     const cell = textCell("No batch has been calculated yet.");
-    cell.colSpan = 5;
+    cell.colSpan = 12;
     row.append(cell);
     rows.append(row);
+    syncBatchResultSelectAll();
     return;
   }
   for (const result of state.mbbsBatchResults) {
-    const candidate = result.candidate
-      || state.mbbsCandidates.find((item) => item.candidateId === result.candidateId)
-      || {};
+    const candidate = batchResultCandidate(result);
     const row = document.createElement("tr");
+    const calculated = usableBatchResult(result);
+    const selectionCell = document.createElement("td");
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.setAttribute("data-mbbs-result-candidate-id", result.candidateId);
+    checkbox.setAttribute("aria-label", `Convert ${mbbsReferenceText(candidate)} to billing`);
+    checkbox.checked = state.selectedMbbsBatchResultIds.has(result.candidateId);
+    checkbox.disabled = !calculated;
+    checkbox.addEventListener("change", () => toggleBatchResult(result.candidateId, checkbox.checked));
+    selectionCell.append(checkbox);
+    const loadNumbers = Array.isArray(candidate.driverLoadNumbers) && candidate.driverLoadNumbers.length
+      ? candidate.driverLoadNumbers.join(" + ")
+      : candidate.loadNumber || candidate.physicalLoadId || "—";
+    const legLabel = candidate.billingLegNumber
+      ? `${loadNumbers} · Leg ${candidate.billingLegNumber}`
+      : loadNumbers;
     row.append(
+      selectionCell,
       textCell(mbbsReferenceText(candidate)),
-      textCell(result.status === "calculated" ? "Calculated" : result.error?.message || "Failed"),
-      textCell(result.status === "calculated" ? `${Number(result.distanceMetres).toLocaleString("en-CA")} m` : "—"),
-      textCell(result.status === "calculated" ? selectedRateLabel(result.rateCardVersionId) : "—"),
-      textCell(result.status === "calculated" ? money(result.charge.amountMinor, result.charge.currency) : "—")
+      textCell(legLabel),
+      textCell(candidate.originLabel),
+      textCell(candidate.destinationLabel),
+      calculated ? calculationEvidenceCell(result, candidate) : textCell(candidate.relationship?.summary || "—"),
+      textCell(result.status === "manual_required"
+        ? "Manual charge required (no automatic rate)"
+        : calculated ? "Calculated" : result.error?.message || "Failed"),
+      textCell(calculated ? formatDistanceKm(result.distanceMetres, result.distanceAvailable !== false) : "—"),
+      textCell(result.status === "manual_required"
+        ? "No automatic rate"
+        : calculated ? selectedRateLabel(result.rateCardVersionId) : "—"),
+      textCell(calculated ? money(result.charge.calculatedAmountMinor ?? result.charge.amountMinor, result.charge.currency) : "—"),
+      calculated ? amountInputCell(result, candidate, "adjustment") : textCell("—"),
+      calculated ? amountInputCell(result, candidate, "final") : textCell("—")
     );
     rows.append(row);
+    if (calculated) updateManualAmountSummary(result.candidateId);
   }
+  syncBatchResultSelectAll();
 }
 
 async function calculateSelectedMbbsCandidates() {
@@ -594,13 +856,28 @@ async function calculateSelectedMbbsCandidates() {
       throw new Error("The server did not preserve the local-only MBBS preview boundary.");
     }
     state.mbbsBatchResults = Array.isArray(result.results) ? result.results : [];
+    state.selectedMbbsBatchResultIds = new Set(state.mbbsBatchResults
+      .filter((entry) => entry.status === "calculated")
+      .map((entry) => entry.candidateId));
+    state.manualAmountEdits.clear();
+    state.invalidManualAmountCandidates.clear();
+    for (const calculation of state.mbbsBatchResults.filter(usableBatchResult)) {
+      const calculatedAmountMinor = Number(
+        calculation.charge?.calculatedAmountMinor ?? calculation.charge?.amountMinor
+      );
+      state.manualAmountEdits.set(calculation.candidateId, {
+        calculatedAmountMinor,
+        adjustmentMinor: 0,
+        finalAmountMinor: calculatedAmountMinor
+      });
+    }
     state.mbbsBatchPreviewContext = requestContext;
     renderBatchResults();
     syncCommandButtons();
     message(
       "mbbsCandidateMessage",
-      `${result.successCount} order(s) calculated; ${result.failureCount} failed. No billing, Dispatch, Driver PWA, outbox, or NetSuite rows were created.`,
-      result.failureCount ? "attention" : "safe"
+      `${result.successCount} usable result(s): ${result.manualRequiredCount || 0} require a manual charge; ${result.failureCount} failed. No billing, Dispatch, Driver PWA, outbox, or NetSuite rows were created.`,
+      result.failureCount || result.manualRequiredCount ? "attention" : "safe"
     );
   } catch (error) {
     message("mbbsCandidateMessage", error.message, "attention");
@@ -648,23 +925,33 @@ async function searchMbbsBillingCustomers() {
 
 async function createMbbsBillingCases() {
   const context = currentMbbsBatchContext();
+  const conversionIds = conversionCandidateIds();
+  const conversionResults = conversionIds.map((candidateId) =>
+    state.mbbsBatchResults.find((result) => result.candidateId === candidateId)
+  );
   if (!batchContextsMatch(state.mbbsBatchPreviewContext, context)
-      || state.mbbsBatchResults.length === 0
-      || state.mbbsBatchResults.some((result) => result.status !== "calculated")) {
-    message("mbbsCandidateMessage", "Recalculate the unchanged selected batch successfully before creating billing cases.", "attention");
+      || conversionIds.length === 0
+      || conversionResults.some((result) => !usableBatchResult(result))
+      || conversionIds.some((candidateId) => state.invalidManualAmountCandidates.has(candidateId))
+      || conversionIds.some((candidateId) => !state.manualAmountEdits.has(candidateId))) {
+    message("mbbsCandidateMessage", "Check at least one usable result and keep its two amount fields valid before creating billing cases.", "attention");
     return;
   }
-  message("mbbsCandidateMessage", `Creating one atomic local billing batch for ${context.candidateIds.length} selected order(s)…`);
+  message("mbbsCandidateMessage", `Creating one atomic local billing batch for ${conversionIds.length} checked result(s)…`);
   try {
     const result = await api("/api/mbt/billing/mbbs/candidates/batch-create", {
       method: "POST",
       idempotencyKey: commandIdentity("mbt-billing-batch-create"),
       body: {
-        candidateIds: context.candidateIds,
+        candidateIds: conversionIds,
         completedMonth: context.completedMonth,
         completedDate: context.completedDate,
         rateCardVersionId: context.rateCardVersionId,
         customerNetsuiteId: inputValue("mbbsBillingCustomerId"),
+        manualAmountEdits: conversionIds.map((candidateId) => ({
+          candidateId,
+          ...state.manualAmountEdits.get(candidateId)
+        })),
         reason: inputValue("mbbsBatchConversionReason")
       }
     });
@@ -672,6 +959,11 @@ async function createMbbsBillingCases() {
       throw new Error("The server did not preserve the local-only MBBS billing boundary.");
     }
     state.mbbsBatchPreviewContext = null;
+    state.selectedMbbsBatchResultIds.clear();
+    state.mbbsBatchResults = [];
+    state.manualAmountEdits.clear();
+    state.invalidManualAmountCandidates.clear();
+    renderBatchResults();
     setInputValue("mbbsBatchConversionReason", "");
     syncCommandButtons();
     await loadBillingCases();
@@ -983,6 +1275,7 @@ function bind() {
     }
   });
   element("selectAllMbbsCandidates")?.addEventListener("change", (event) => toggleAllCandidates(event.target.checked));
+  element("selectAllMbbsBatchResults")?.addEventListener("change", (event) => toggleAllBatchResults(event.target.checked));
   element("calculateSelectedMbbsCandidates")?.addEventListener("click", calculateSelectedMbbsCandidates);
   element("searchMbbsBillingCustomers")?.addEventListener("click", searchMbbsBillingCustomers);
   element("mbbsBillingCustomerSearch")?.addEventListener("keydown", (event) => {

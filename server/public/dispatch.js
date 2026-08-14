@@ -9870,6 +9870,55 @@ function refreshOrderPoolForSearch() {
   }
 }
 
+function dispatchCompletionOrderKind(order = {}) {
+  if (order.sourceTable === "scm_vrma_orders") return "VRMA";
+  const kind = String(order.type || "").trim().toUpperCase();
+  return ["SO", "TO", "PO", "VRMA", "CUSTOM"].includes(kind) ? kind : "";
+}
+
+async function manuallyCompleteSelectedOrder(order, button) {
+  const orderKind = dispatchCompletionOrderKind(order);
+  if (!orderKind || !order?.id) throw new Error("This order type does not support manual completion.");
+  const reason = window.prompt(
+    "Why did the Driver completion need manual recovery? For example: Driver forgot to submit the completed stop.",
+    ""
+  );
+  if (reason === null) return;
+  if (!String(reason).trim()) throw new Error("A manual completion reason is required.");
+  const completedAt = window.prompt(
+    "Actual completion time (ISO date/time with timezone):",
+    new Date().toISOString()
+  );
+  if (completedAt === null) return;
+  if (!window.confirm(
+    `Confirm ${orderKind} ${order.id} was physically completed by the Driver at ${completedAt || "the current server time"}?`
+  )) return;
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Recording...";
+  }
+  const response = await fetch("/api/dispatch/order-completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      orderKind,
+      orderRef: order.id,
+      completedAt: String(completedAt || "").trim() || undefined,
+      reason: String(reason).trim(),
+      confirm: true,
+      sessionId: dispatchSessionId,
+      audit: { sessionId: dispatchSessionId }
+    })
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.error || "Manual Dispatch completion failed.");
+  routeNotice = `${orderKind} ${order.id} marked completed with audited manual evidence.`;
+  await loadDispatchOrders();
+  selectedOrderId = orders.find((candidate) => candidate.id === selectedOrderId)?.id || orders[0]?.id || "";
+  selectedOrderIds = new Set(selectedOrderId ? [selectedOrderId] : []);
+  render({ save: false });
+}
+
 function renderSelectedOrderActions() {
   if (activeOrderType === "BIN") return "";
   const order = selectedOrder();
@@ -9881,9 +9930,11 @@ function renderSelectedOrderActions() {
   const reviewOnly = selected.some((item) => isReviewOnlyOrder(item));
   const reconciliationBlocked = selected.some((item) => isScmReconciliationBlocked(item));
   const blockedUngroup = groupedCount && groupedOrderTransitCoId(order);
+  const dispatchCompleted = order.dispatchCompletionStatus === "completed";
   return `
     <div class="selected-order-actions">
       <span>${escapeHtml(label)}</span>
+      ${dispatchCompleted ? `<span class="chip">Dispatch completed ${escapeHtml(displayDateTime(order.dispatchCompletedAt || ""))}</span>` : ""}
       ${reviewOnly ? `<span>Loaded/shipped history</span>` : ""}
       ${reconciliationBlocked ? `<span class="chip warn">${escapeHtml(scmReconciliationBlockText(selected.find(isScmReconciliationBlocked)))}</span>` : ""}
       ${reconciliationBlocked ? "" : groupedCount ? `<button data-action="ungroup-order" data-order-ref="${escapeHtml(order.id)}" ${blockedUngroup ? `disabled title="Cancel ${escapeHtml(blockedUngroup)} before ungrouping"` : ""} type="button">Ungroup</button>` : selected.length > 1 && !includesCustomOrder ? `<button data-action="open-group-modal" data-order-ref="${escapeHtml(order.id)}" type="button">Group</button>` : ""}
@@ -9895,6 +9946,7 @@ function renderSelectedOrderActions() {
       ${!reviewOnly && !reconciliationBlocked && !["CO", "CUSTOM"].includes(order.type) && order.sourceTable !== "scm_vrma_orders" && !order.originalOrderId ? `<button data-action="open-split-modal" data-order-ref="${escapeHtml(order.id)}" type="button">Split</button>` : ""}
       ${!reviewOnly && !reconciliationBlocked && order.type !== "CUSTOM" && order.originalOrderId ? `<button data-action="unsplit-order" data-order-ref="${escapeHtml(order.id)}" type="button">Unsplit</button>` : ""}
       ${!reviewOnly && canConsolidatePick(order) ? `<button data-action="open-consolidate-modal" data-order-ref="${escapeHtml(order.id)}" type="button">Consolidate Pick</button>` : ""}
+      ${!SALES_PLANNING_HOST && !dispatchCompleted && !reviewOnly && !reconciliationBlocked && !groupedCount && selected.length === 1 && dispatchCompletionOrderKind(order) ? `<button data-action="manual-complete-order" data-order-ref="${escapeHtml(order.id)}" type="button" title="Use only when the Driver physically completed this order but forgot to submit the PWA stop">Mark completed</button>` : ""}
     </div>
   `;
 }
@@ -13850,6 +13902,14 @@ app.addEventListener("click", async (event) => {
     location.href = customOrderId
       ? `/dispatch/custom-orders?edit=${encodeURIComponent(customOrderId)}`
       : "/dispatch/custom-orders";
+    return;
+  }
+  if (action === "manual-complete-order") {
+    const order = orderById(button.dataset.orderRef || selectedOrderId);
+    manuallyCompleteSelectedOrder(order, button).catch((error) => {
+      routeNotice = `Manual completion failed: ${error.message}`;
+      render({ save: false });
+    });
     return;
   }
   if (action === "enter-edit-mode") {

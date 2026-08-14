@@ -528,6 +528,9 @@ function normalizedLoad(load) {
     driverId: load.driverId ?? null,
     calculatedMetres: nonnegativeInteger(load.calculatedMetres ?? 0, "Cross-charge distance"),
     sharedTotalMinor: nonnegativeInteger(load.sharedTotalMinor, "Shared cross-charge total"),
+    ...(load.billingEvidence === undefined
+      ? {}
+      : { billingEvidence: object(load.billingEvidence, "Candidate billing evidence") }),
     references: load.references.map((reference) => {
       const row = object(reference, "Cross-charge reference");
       const sourceType = requiredText(row.sourceType, "Cross-charge source type").toUpperCase();

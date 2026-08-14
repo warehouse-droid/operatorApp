@@ -86,6 +86,10 @@ import { listOperatorHistory, listRecordWarnings, reportOperatorRecordError, res
 import { listDispatchOrders, enrichDispatchOrdersWithPoTargetAllocations, listScmPurchaseOrders, listScmSchedule, updateScmScheduleEntry, createScmScheduleGroup, cancelScmScheduleGroup, listScmViewPresets, upsertScmViewPreset, completeScmVrmaOrderOverride, createScmVrmaOrder, getScmVrmaOrder, getScmVrmaOptions, removeScmVrmaOrder, searchScmVrmaItems, syncScmScheduleFromDispatchPlan, createScmPurchaseOrderSplit, updateScmPurchaseOrderSplitRef, updateScmPurchaseOrderSplitDestination, updateScmPurchaseOrderSplitPickupYard, updatePurchaseOrderDispatchRef, cancelScmPurchaseOrderSplit, refreshDispatchEnrichment, reparseMissingSalesOrderDispatch, searchSalesOrderMethodOverrides, setPurchaseOrderVendorYard, updateDispatchOrderDetails, updateSalesOrderLocalMethod, getSalesOrderPoAllocationOptions, createSalesOrderPoAllocation, createSalesOrderPoAllocations, cancelSalesOrderPoAllocation, createDispatchOperatorRequest, upsertLocalCoOrder, cancelLocalCoOrder, listDispatchOperatorRequests, resolveDispatchOperatorRequestsForOrder } from "./dispatch-repository.js";
 import { setPurchaseOrderBlanketFlag } from "./dispatch-repository.js";
 import { cancelDispatchCustomOrder, canonicalizeDispatchCustomOrdersInPlan, completeDispatchCustomOrders, createDispatchCustomOrder, dispatchOrderFromCustomOrder, getDispatchCustomOrderForUpdate, listDispatchCustomOrders, updateDispatchCustomOrder } from "./dispatch-custom-order-repository.js";
+import {
+  listDispatchOrderCompletionStatuses,
+  manuallyCompleteDispatchOrder
+} from "./dispatch-completion-repository.js";
 import { DISPATCH_VENDOR_WEEK_DAYS, listDispatchVendorYards, listDispatchLocalVendors, saveDispatchVendorYardSchedule, updateDispatchVendorYard, upsertDispatchVendorYard, listDispatchParserRules, updateDispatchParserRule, listOllamaAudit, listDispatchVendorMappings, discoverDispatchVendorMappingsFromPurchaseOrders, updateDispatchVendorMapping, createDispatchLocalVendor, updateDispatchLocalVendor } from "./dispatch-enrichment.js";
 import { listDispatchAudit, writeDispatchAudit } from "./dispatch-audit-repository.js";
 import { runWithAuditContext } from "./audit-context.js";
@@ -1278,6 +1282,36 @@ function dispatchOrderLogicalRefs(order = {}) {
     .filter(Boolean);
 }
 
+function dispatchCompletionKindForOrder(order = {}) {
+  if (String(order.sourceTable || "").trim() === "scm_vrma_orders") return "VRMA";
+  const kind = String(order.type || "").trim().toUpperCase();
+  return ["SO", "TO", "PO", "VRMA", "CUSTOM"].includes(kind) ? kind : "";
+}
+
+async function enrichDispatchOrdersWithCompletionStatus(orders = []) {
+  const requests = orders.map((order) => ({
+    orderKind: dispatchCompletionKindForOrder(order),
+    orderRef: order.id
+  }));
+  const completions = await listDispatchOrderCompletionStatuses(requests);
+  const byKey = new Map(completions.map((completion) => [
+    `${completion.orderKind}|${String(completion.orderRef || "").trim().toUpperCase()}`,
+    completion
+  ]));
+  return orders.map((order) => {
+    const kind = dispatchCompletionKindForOrder(order);
+    const completion = byKey.get(`${kind}|${String(order.id || "").trim().toUpperCase()}`);
+    return completion ? {
+      ...order,
+      dispatchCompletionStatus: completion.dispatchCompletionStatus,
+      dispatchCompletedAt: completion.dispatchCompletedAt,
+      completionEvidenceType: completion.completionEvidenceType,
+      completionEvidenceId: completion.completionEvidenceId,
+      completionEventId: completion.completionEventId
+    } : order;
+  });
+}
+
 function snapshotDerivedGroupBelongsToPlan(order = {}, plan = {}) {
   if (!Array.isArray(order?.childOrders) || !order.childOrders.length) return true;
   const ownerPlanId = String(order.groupPlanId || "").trim();
@@ -1569,7 +1603,7 @@ async function listDispatchOrdersForResponse({ type = null, search = "", history
       reconciliationBlocked: String(row.reconciliationStatus || "").toLowerCase() === "review",
       scm: {
         ...(order.scm || {}),
-        status: row.status || order.scm?.status || "",
+        status: row.calculatedStatus || row.reconciliationApplicationStatus || row.status || order.scm?.status || "",
         reconciliationApplicationStatus: row.reconciliationApplicationStatus || "",
         reconciliationStatus: row.reconciliationStatus || "",
         reconciliationReason: row.reconciliationReason || ""
@@ -1582,9 +1616,10 @@ async function listDispatchOrdersForResponse({ type = null, search = "", history
     if (!["PO", "TO", "VRMA"].includes(String(order?.type || "").trim().toUpperCase())) return true;
     return !dispatchOrderLogicalRefs(order).some((ref) => restrictedScmRefs.has(ref));
   });
-  return searchTerm
+  const searchedOrders = searchTerm
     ? visibleOrders.filter((order) => dispatchOrderMatchesSearch(order, searchTerm))
     : visibleOrders;
+  return enrichDispatchOrdersWithCompletionStatus(searchedOrders);
 }
 
 async function targetedDispatchMutationOrders(orderRefs = []) {
@@ -1641,7 +1676,7 @@ async function listScmPurchaseOrdersForResponse(filters = {}, operator = null) {
       lastReconciledAt: row.lastReconciledAt || null,
       scm: {
         ...(order.scm || {}),
-        status: row.status || order.scm?.status || "",
+        status: row.calculatedStatus || row.reconciliationApplicationStatus || row.status || order.scm?.status || "",
         reconciliationApplicationStatus: row.reconciliationApplicationStatus || "",
         reconciliationStatus: row.reconciliationStatus || "",
         reconciliationReason: row.reconciliationReason || ""
@@ -9283,6 +9318,52 @@ app.get("/api/sales/public-access", async (_req, res, next) => {
 
 app.use("/api/scm", requireOperator, requireScmAccess);
 app.use("/api/dispatch", requireOperatorOrPublicSalesRead, requireDispatchAccess);
+
+app.post("/api/dispatch/order-completions", requireDispatcher, async (req, res, next) => {
+  try {
+    const completion = await manuallyCompleteDispatchOrder({
+      actor: {
+        operatorId: req.operator?.id,
+        role: req.operator?.role,
+        roles: req.operator?.roles
+      },
+      orderKind: req.body?.orderKind,
+      orderRef: req.body?.orderRef,
+      completedAt: req.body?.completedAt,
+      reason: req.body?.reason,
+      confirm: req.body?.confirm
+    });
+    await writeDispatchAudit({
+      action: "dispatch.order.manual_completion",
+      entityType: "dispatch_order_completion",
+      entityId: completion.completionEventId,
+      orderId: completion.orderRef,
+      operatorId: req.operator?.id,
+      operatorName: req.operator?.display_name || req.operator?.username,
+      sessionId: req.body?.sessionId || req.body?.audit?.sessionId,
+      source: "dispatch",
+      after: completion,
+      details: {
+        orderKind: completion.orderKind,
+        reason: completion.reason,
+        dispatchCompletedAt: completion.dispatchCompletedAt,
+        completionEvidenceType: completion.completionEvidenceType
+      }
+    }).catch(() => null);
+    emitAppEvent("dispatch.orders.updated", {
+      source: "manual-dispatch-completion",
+      orderId: completion.orderRef,
+      orderKind: completion.orderKind,
+      refreshOrderPool: true
+    });
+    res.json({
+      schemaVersion: "dispatch-order-completion-v1",
+      completion
+    });
+  } catch (error) {
+    next(error);
+  }
+});
 app.use("/api/sales", requireSalesOperator, requireSalesAccess);
 app.use("/api/mbt", requireOperator, createMbtRouter({
   frontdeskPricing: createFrontdeskPricingAdapter({ apiKey: config.googleMapsApiKey })
@@ -13440,6 +13521,15 @@ async function refreshedScmScheduleRow(updated = {}, operator = null) {
   return visibleRows[0] || null;
 }
 
+function requiredScmScheduleRevision(body = {}) {
+  if (Object.prototype.hasOwnProperty.call(body, "expectedUpdatedAt")) return body.expectedUpdatedAt;
+  if (Object.prototype.hasOwnProperty.call(body, "expected_updated_at")) return body.expected_updated_at;
+  throw Object.assign(new Error("Refresh this schedule row before saving it."), {
+    status: 409,
+    code: "SCM_SCHEDULE_STALE"
+  });
+}
+
 app.post("/api/scm/schedule", async (req, res, next) => {
   try {
     const operator = await getOperatorByToken(bearerToken(req)).catch(() => null);
@@ -13451,7 +13541,8 @@ app.post("/api/scm/schedule", async (req, res, next) => {
       orderKind: req.body?.orderKind || req.body?.order_kind,
       orderRef: req.body?.orderRef || req.body?.order_ref,
       patch: req.body || {},
-      updatedBy: operator?.id || req.body?.audit?.sessionId || ""
+      updatedBy: operator?.id || req.body?.audit?.sessionId || "",
+      expectedUpdatedAt: requiredScmScheduleRevision(req.body || {})
     });
     await writeDispatchAudit({
       action: "scm.schedule.updated",
@@ -13488,7 +13579,8 @@ app.put("/api/scm/schedule/:id", async (req, res, next) => {
       orderKind: req.body?.orderKind || req.body?.order_kind,
       orderRef: req.params.id,
       patch: req.body || {},
-      updatedBy: operator?.id || req.body?.audit?.sessionId || ""
+      updatedBy: operator?.id || req.body?.audit?.sessionId || "",
+      expectedUpdatedAt: requiredScmScheduleRevision(req.body || {})
     });
     await writeDispatchAudit({
       action: "scm.schedule.updated",

@@ -171,7 +171,9 @@ test("completed Driver PWA loads preview the active DELIVERY_CHARGE_MBBS band wi
       );
       const before = await localIsolationCounts();
       const listed = await listMbbsBillingCandidates({ actor: ACTOR, limit: 200 });
-      const candidate = listed.items.find((item) => item.physicalLoadId === loadId);
+      const candidate = listed.items.find((item) => (
+        item.sourceSystem === "driver_pwa" && item.driverLoadIds.includes(loadId)
+      ));
       assert.ok(
         candidate,
         "a ready Driver PWA candidate must not be starved by newer incomplete Sales Orders"
@@ -179,9 +181,14 @@ test("completed Driver PWA loads preview the active DELIVERY_CHARGE_MBBS band wi
       assert.equal(candidate?.sourceSystem, "driver_pwa");
       assert.equal(candidate?.chargeable, true);
       assert.deepEqual(candidate?.references, [{ sourceType: "SO", rootReference: orderRef }]);
-      const salesOrderCandidate = listed.items.find((item) => item.sourceSystem === "sales_order");
-      assert.equal(salesOrderCandidate?.sourceSystem, "sales_order");
-      assert.equal(salesOrderCandidate?.references[0]?.sourceType, "SO");
+      assert.deepEqual(candidate?.driverLoadNumbers, ["Candidate load"]);
+      assert.equal(candidate?.billingRule, "so_order");
+      assert.match(candidate?.relationship.summary, /charged independently/i);
+      const duplicateSalesOrderCandidate = listed.items.find((item) => (
+        item.sourceSystem === "sales_order"
+        && item.references.some((reference) => reference.rootReference === orderRef)
+      ));
+      assert.equal(duplicateSalesOrderCandidate, undefined);
 
       const calls = [];
       const preview = await previewMbbsBillingCandidate({
@@ -414,6 +421,7 @@ test("completed-month filtering uses Toronto boundaries and exposes every eligib
 test("a missing destination can be fixed by an audited billing-only override without changing operational evidence", async () => {
   const rollback = await beginRollbackContext();
   try {
+    // eslint-disable-next-line complexity
     await rollback.run(async () => {
       const rateCardVersionId = await installRealMbbsRates({ displayName: "Address override MBBS delivery" });
       const suffix = crypto.randomUUID().replaceAll("-", "").toUpperCase();
@@ -431,8 +439,9 @@ test("a missing destination can be fixed by an audited billing-only override wit
         limit: 200
       });
       const candidate = initial.items.find((item) => item.references[0]?.rootReference === tranid);
-      assert.equal(candidate?.chargeable, false);
+      assert.equal(candidate?.chargeable, true);
       assert.match(candidate?.reason || "", /dispatch address/iu);
+      assert.match(candidate?.automaticRateWarning || "", /dispatch address/iu);
       assert.equal(candidate?.addressOverride, null);
 
       const command = {
@@ -461,6 +470,7 @@ test("a missing destination can be fixed by an audited billing-only override wit
       });
       const corrected = listed.items.find((item) => item.candidateId === candidate.candidateId);
       assert.equal(corrected?.chargeable, true);
+      assert.equal(corrected?.automaticRateWarning, null);
       assert.equal(corrected?.destinationLabel, command.destinationAddressText);
       assert.deepEqual(corrected?.addressOverride, {
         destinationAddressText: command.destinationAddressText,
@@ -528,7 +538,7 @@ test("a missing destination can be fixed by an audited billing-only override wit
   }
 });
 
-test("a selected rate calculates 100 completed orders as one bounded read-only batch with per-row failures", async () => {
+test("a selected rate calculates 100 completed orders and retains an unroutable row for manual billing", async () => {
   const rollback = await beginRollbackContext();
   try {
     await rollback.run(async () => {
@@ -602,12 +612,13 @@ test("a selected rate calculates 100 completed orders as one bounded read-only b
       assert.equal(batch.completedMonth, "2039-07");
       assert.equal(batch.rateCardVersionId, batchVersionId);
       assert.equal(batch.requestedCount, 100);
-      assert.equal(batch.successCount, 99);
-      assert.equal(batch.failureCount, 1);
+      assert.equal(batch.successCount, 100);
+      assert.equal(batch.manualRequiredCount, 1);
+      assert.equal(batch.failureCount, 0);
       assert.deepEqual(batch.results.map((result) => result.candidateId), candidateIds);
       assert.equal(batch.results.filter((result) => result.status === "calculated").length, 99);
-      assert.equal(batch.results.filter((result) => result.status === "failed").length, 1);
-      assert.equal(batch.results.find((result) => result.status === "failed")?.error.code, "MBT_MBBS_DISTANCE_LOOKUP_FAILED");
+      assert.equal(batch.results.filter((result) => result.status === "manual_required").length, 1);
+      assert.equal(batch.results.find((result) => result.status === "manual_required")?.automaticRate.code, "MBT_MBBS_DISTANCE_LOOKUP_FAILED");
       assert.deepEqual(
         [...new Set(batch.results
           .filter((result) => result.status === "calculated")
@@ -646,6 +657,272 @@ test("a selected rate calculates 100 completed orders as one bounded read-only b
         }, { async resolveDistance() { return { providerMetres: 1 }; } }),
         (error) => error?.code === "MBT_BILLING_CANDIDATE_BATCH_INVALID"
       );
+    });
+  } finally {
+    await rollback.rollback();
+  }
+});
+
+test("an authoritative historical SO group is one charge with child evidence and never routes through its placeholder", async () => {
+  const rollback = await beginRollbackContext();
+  try {
+    await rollback.run(async () => {
+      const rateCardVersionId = await installRealMbbsRates();
+      const suffix = crypto.randomUUID().replaceAll("-", "").toUpperCase();
+      const base = 9_850_000_000 + (crypto.randomInt(10_000) * 10);
+      const salesRefs = [`SOA${suffix.slice(0, 7)}`, `SOM${suffix.slice(7, 14)}`];
+      const groupRef = `GOA-${suffix.slice(0, 7)}-${suffix.slice(7, 14)}`;
+      const transferRef = `TOB${suffix.slice(14, 21)}`;
+      const purchaseRefs = [`#${suffix.slice(21, 27)}A`, `#${suffix.slice(21, 27)}B`];
+      const loadId = `MIXED-${suffix}`;
+      const splitLoadId = `MIXED-SPLIT-${suffix}`;
+      await query(
+        `INSERT INTO sales_orders (
+           netsuite_id, tranid, fulfillment_status, outbound_location,
+           sales_order_type, dispatch_address, netsuite_active, synced_at
+         ) VALUES
+           ($1, $2, 'not_fulfilled', '12441', 'Delivery', $3, true, now()),
+           ($4, $5, 'not_fulfilled', '12441', 'Delivery', $6, true, now())`,
+        [base + 1, salesRefs[0], "1 Alpha Street, Toronto, ON", base + 2, salesRefs[1], "2 Bravo Street, Toronto, ON"]
+      );
+      const plan = await query(
+        `INSERT INTO dispatch_plans (plan_date, status, note)
+         VALUES ('2038-11-10', 'confirmed', $1)
+         RETURNING id::text`,
+        [`MBBS grouped billing ${suffix}`]
+      );
+      await query(
+        `INSERT INTO dispatch_delivery_groups (
+           group_ref, plan_id, plan_date, order_type, truck_plate, load_name, active
+         ) VALUES ($1, $2::bigint, '2038-11-10', 'sales_order', 'TEST', 'Load 3', true)`,
+        [groupRef, plan.rows[0].id]
+      );
+      for (const [position, reference] of salesRefs.entries()) {
+        await query(
+          `INSERT INTO dispatch_delivery_group_members (group_ref, member_order_ref, position)
+           VALUES ($1, $2, $3)`,
+          [groupRef, reference, position]
+        );
+      }
+      await query(
+        `INSERT INTO transfer_orders (
+           netsuite_id, tranid, from_location_id, from_location,
+           to_location_id, to_location, fulfillment_status, netsuite_active, synced_at
+         ) VALUES ($1, $2, 15, '12441', 5, '150', 'fulfilled', true, now())`,
+        [base + 3, transferRef]
+      );
+      const vendorYard = `Mixed Vendor ${suffix}`;
+      const vendorAddress = "1273 North Service Rd E, Oakville, ON";
+      await query(
+        `INSERT INTO dispatch_vendor_yards (vendor, yard, aliases, address, active)
+         VALUES ($1, $1, '', $2, true)`,
+        [vendorYard, vendorAddress]
+      );
+      await query(
+        `INSERT INTO purchase_orders (
+           netsuite_id, tranid, dispatch_ref, vendor, dispatch_vendor_yard,
+           destination_location_id, destination_location, receipt_status,
+           netsuite_active, synced_at
+         ) VALUES
+           ($1, $2, $3, $7, $7, 1, '3445', 'received', true, now()),
+           ($4, $5, $6, $7, $7, 1, '3445', 'received', true, now())`,
+        [
+          base + 4,
+          `POB${suffix.slice(0, 7)}A`,
+          purchaseRefs[0],
+          base + 5,
+          `POB${suffix.slice(0, 7)}B`,
+          purchaseRefs[1],
+          vendorYard
+        ]
+      );
+      const order = (orderRef, orderType, source = "delivery") => ({ orderRef, orderType, source });
+      const records = [
+        [loadId, "Load 3", "yard-pick", "pickup", [...salesRefs, transferRef], "12441 Woodbine Avenue", [
+          order(salesRefs[0], "SALES_ORDER"),
+          order(salesRefs[1], "SALES_ORDER"),
+          order(transferRef, "TRANSFER_ORDER")
+        ]],
+        [loadId, "Load 3", "grouped-so", "dropoff", salesRefs, groupRef, [
+          order(salesRefs[0], "SALES_ORDER"), order(salesRefs[1], "SALES_ORDER")
+        ]],
+        [loadId, "Load 3", "to-drop", "dropoff", [transferRef], "150 Clark Boulevard", [order(transferRef, "TRANSFER_ORDER")]],
+        [loadId, "Load 3", "vendor-pick-a", "pickup", [purchaseRefs[0]], vendorAddress, [order(purchaseRefs[0], "PURCHASE_ORDER", "receiving")]],
+        [loadId, "Load 3", "po-drop-a", "dropoff", [purchaseRefs[0]], "3445 Kennedy Road", [order(purchaseRefs[0], "PURCHASE_ORDER", "receiving")]],
+        [splitLoadId, "Load 4", "vendor-pick-b", "pickup", [purchaseRefs[1]], vendorAddress, [order(purchaseRefs[1], "PURCHASE_ORDER", "receiving")]],
+        [splitLoadId, "Load 4", "po-drop-b", "dropoff", [purchaseRefs[1]], "3445 Kennedy Road", [order(purchaseRefs[1], "PURCHASE_ORDER", "receiving")]]
+      ];
+      for (const [index, [recordLoadId, loadName, stopId, stopType, orderRefs, address, orders]] of records.entries()) {
+        await query(
+          `INSERT INTO driver_job_records (
+             job_id, plan_id, plan_date, driver_login, truck_id, load_id, load_name,
+             stop_id, stop_type, order_refs, status, started_at, completed_at, job_details
+           ) VALUES ($1, $2::bigint, '2038-11-10', 'mixed-driver', '101', $3, $4,
+                     $5, $6, $7::jsonb, 'complete',
+                     ('2038-11-10T10:00:00Z'::timestamptz + ($8 * interval '10 minutes')),
+                     ('2038-11-10T10:05:00Z'::timestamptz + ($8 * interval '10 minutes')),
+                     $9::jsonb)`,
+          [
+            `JOB-${suffix}-${index}`,
+            plan.rows[0].id,
+            recordLoadId,
+            loadName,
+            stopId,
+            stopType,
+            JSON.stringify(orderRefs),
+            index,
+            JSON.stringify({ address, orders, physicalVisitStopIds: [stopId] })
+          ]
+        );
+      }
+      const listed = await listMbbsBillingCandidates({
+        actor: ACTOR,
+        completedDate: "2038-11-10",
+        search: suffix.slice(0, 7),
+        limit: 100
+      });
+      const driverCandidates = listed.items.filter((candidate) => candidate.driverLoadIds?.includes(loadId));
+      assert.equal(driverCandidates.length, 3);
+      assert.deepEqual(
+        driverCandidates.map((candidate) => candidate.billingRule).sort(),
+        ["po_shared_leg", "so_group", "to_replenishment"].sort()
+      );
+      assert.ok(driverCandidates.filter((candidate) => candidate.billingRule !== "po_shared_leg")
+        .every((candidate) => candidate.references.length === 1));
+      const poCandidate = driverCandidates.find((candidate) => candidate.billingRule === "po_shared_leg");
+      assert.deepEqual(poCandidate?.references.map((reference) => reference.rootReference).sort(), [...purchaseRefs].sort());
+      assert.deepEqual(poCandidate?.driverLoadIds.sort(), [loadId, splitLoadId].sort());
+      assert.deepEqual(poCandidate?.driverLoadNumbers, ["Load 3", "Load 4"]);
+      assert.match(poCandidate?.relationship.summary || "", /load splits do not change the charge/iu);
+      const groupedSales = driverCandidates.find((candidate) => candidate.billingRule === "so_group");
+      assert.deepEqual(groupedSales?.references, [{ sourceType: "SO", rootReference: groupRef }]);
+      assert.deepEqual(groupedSales?.memberReferences, salesRefs.map((rootReference) => ({ sourceType: "SO", rootReference })));
+      assert.equal(groupedSales?.destinationLabel, "1 Alpha Street, Toronto, ON");
+      assert.ok(driverCandidates.every((candidate) => !candidate.routeStops.some((stop) => stop.addressText === groupRef)));
+      const routeInputs = [];
+      const preview = await previewMbbsBillingCandidatesBatch({
+        actor: ACTOR,
+        candidateIds: driverCandidates.map((candidate) => candidate.candidateId),
+        completedMonth: "2038-11",
+        completedDate: "2038-11-10",
+        rateCardVersionId
+      }, {
+        async resolveDistance(input) {
+          routeInputs.push(input);
+          assert.doesNotMatch(JSON.stringify(input), /PLACEHOLDER/u);
+          return { provider: "mixed-load-test", providerMetres: 12_000 };
+        }
+      });
+      assert.equal(preview.successCount, 3);
+      assert.equal(preview.failureCount, 0);
+      assert.equal(routeInputs.length, 3);
+    });
+  } finally {
+    await rollback.rollback();
+  }
+});
+
+test("an active SCM PO group becomes one Driver billing order with all child POs retained", async () => {
+  const rollback = await beginRollbackContext();
+  try {
+    await rollback.run(async () => {
+      const rateCardVersionId = await installRealMbbsRates();
+      const suffix = crypto.randomUUID().replaceAll("-", "").toUpperCase();
+      const base = 9_860_000_000 + (crypto.randomInt(10_000) * 10);
+      const references = [`30${suffix.slice(0, 8)}`, `30${suffix.slice(8, 16)}`];
+      const groupRef = `PGOB-${references.join("-")}`;
+      const vendorYard = `PO Group Vendor ${suffix}`;
+      const vendorAddress = "2977 Cedar Creek Road, Ayr, ON N0B 1E0";
+      await query(
+        `INSERT INTO dispatch_vendor_yards (vendor, yard, aliases, address, active)
+         VALUES ($1, $1, '', $2, true)`,
+        [vendorYard, vendorAddress]
+      );
+      for (const [index, reference] of references.entries()) {
+        await query(
+          `INSERT INTO purchase_orders (
+             netsuite_id, tranid, dispatch_ref, vendor, dispatch_vendor_yard,
+             destination_location_id, destination_location, receipt_status,
+             netsuite_active, synced_at
+           ) VALUES ($1, $2, $2, $3, $3, 1, '3445', 'received', true, now())`,
+          [base + index, reference, vendorYard]
+        );
+      }
+      const group = await query(
+        `INSERT INTO scm_schedule_groups (group_ref, status, created_by, details)
+         VALUES ($1, 'active', $2, $3::jsonb)
+         RETURNING id::text`,
+        [groupRef, ACTOR.operatorId, JSON.stringify({ memberRefs: references })]
+      );
+      for (const reference of references) {
+        await query(
+          `INSERT INTO scm_schedule_group_members (group_id, order_kind, order_ref)
+           VALUES ($1::bigint, 'PO', $2)`,
+          [group.rows[0].id, reference]
+        );
+      }
+      for (const [index, reference] of references.entries()) {
+        const loadId = `PO-GROUP-${suffix}-${index}`;
+        const order = [{ orderRef: reference, orderType: "PURCHASE_ORDER", source: "receiving" }];
+        await query(
+          `INSERT INTO driver_job_records (
+             job_id, plan_date, driver_login, truck_id, load_id, load_name,
+             stop_id, stop_type, order_refs, status, started_at, completed_at, job_details
+           ) VALUES
+             ($1, '2038-12-10', 'po-group-driver', '101', $3, $4,
+              $5, 'pickup', $7::jsonb, 'complete', $8::timestamptz, $9::timestamptz, $10::jsonb),
+             ($2, '2038-12-10', 'po-group-driver', '101', $3, $4,
+              $6, 'dropoff', $7::jsonb, 'complete', $9::timestamptz, $11::timestamptz, $12::jsonb)`,
+          [
+            `JOB-PO-GROUP-PICK-${suffix}-${index}`,
+            `JOB-PO-GROUP-DROP-${suffix}-${index}`,
+            loadId,
+            `Load ${index + 1}`,
+            `PICK-${index}`,
+            `DROP-${index}`,
+            JSON.stringify([reference]),
+            `2038-12-10T1${index}:00:00.000Z`,
+            `2038-12-10T1${index}:10:00.000Z`,
+            JSON.stringify({ address: vendorAddress, orders: order }),
+            `2038-12-10T1${index}:30:00.000Z`,
+            JSON.stringify({ address: "3445 Kennedy Road, Toronto, ON", orders: order })
+          ]
+        );
+      }
+
+      const listed = await listMbbsBillingCandidates({
+        actor: ACTOR,
+        completedDate: "2038-12-10",
+        search: suffix,
+        limit: 100
+      });
+      const grouped = listed.items.find((candidate) =>
+        candidate.sourceSystem === "driver_pwa"
+        && candidate.references[0]?.rootReference === groupRef
+      );
+      assert.ok(grouped);
+      assert.equal(grouped.billingRule, "po_group");
+      assert.deepEqual(
+        grouped.memberReferences.map((reference) => reference.rootReference).sort(),
+        [...references].sort()
+      );
+      assert.deepEqual(grouped.driverLoadNumbers, ["Load 1", "Load 2"]);
+      assert.equal(listed.items.some((candidate) => candidate.references.some((reference) =>
+        references.includes(reference.rootReference)
+      )), false);
+      const preview = await previewMbbsBillingCandidatesBatch({
+        actor: ACTOR,
+        candidateIds: [grouped.candidateId],
+        completedMonth: "2038-12",
+        completedDate: "2038-12-10",
+        rateCardVersionId
+      }, {
+        async resolveDistance() {
+          return { provider: "po-group-test", providerMetres: 12_000 };
+        }
+      });
+      assert.equal(preview.results[0].status, "calculated");
+      assert.equal(preview.results[0].charge.amountMinor, 20_000);
     });
   } finally {
     await rollback.rollback();
