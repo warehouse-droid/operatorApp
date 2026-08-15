@@ -55,7 +55,10 @@ assert.ok(!operator.includes('id="receiptPhoto"'), "Receiving must not expose a 
 assert.ok(!operator.includes('type="file"'), "Operator PWA must not expose file/gallery upload inputs.");
 assert.ok(!operator.includes("nativeCamera.click()"), "Operator PWA must not invoke a native file picker.");
 assert.ok(!operator.includes('event.target?.id !== "fulfillmentPhoto"'), "Legacy photo upload change handler must be removed.");
-assert.ok(/fulfillmentPhotoDataUrls\.filter\(Boolean\)\.length < 2/.test(operator), "Fulfillment must keep the two-photo minimum.");
+assert.ok(
+  /function fulfillmentRequiredPhotoCount\(\)[\s\S]*?if \(currentModule === "customer-pickup-load"\) return customerPickupRequiredPhotoCount\(\);[\s\S]*?return 2;/.test(operator),
+  "Ordinary Delivery and re-load fulfillment must keep the two-photo minimum."
+);
 assert.ok(/receiptPhotoDataUrls\.filter\(Boolean\)\.length < 2/.test(operator), "Receiving must keep the two-photo minimum.");
 assert.ok(!/captureFulfillmentPhoto\(\)[\s\S]{0,700}stopFulfillmentCamera\(\);\s+render\(\);/.test(operator), "Fulfillment capture should keep the stream open for the next photo.");
 assert.ok(!/captureReceiptPhoto\(\)[\s\S]{0,700}stopReceiptCamera\(\);\s+render\(\);/.test(operator), "Receiving capture should keep the stream open for the next photo.");
@@ -71,9 +74,9 @@ includesAll(i18n, [
 includesAll(operatorHtml, [
   "/operator.css?v=20260810-operator-performance-v1",
   "/vendor/quagga2/quagga.min.js?v=1.12.1",
-  "/operator.js?v=20260813-toronto-timestamps-v1"
+  "/operator.js?v=20260815-customer-pickup-photo-gate-v1"
 ], "Operator camera cache busting");
-assert.ok(serviceWorker.includes("mbbs-yard-operator-v139-request-scheme-v1"), "Operator service-worker cache must advance.");
+assert.ok(serviceWorker.includes("mbbs-yard-operator-v140-customer-pickup-photo-gate-v1"), "Operator service-worker cache must advance.");
 assert.ok(serviceWorker.includes("/vendor/quagga2/quagga.min.js?v=1.12.1"), "The offline PWA shell must cache the 1D scanner.");
 assert.match(serviceWorker, /cache\.addAll\(APP_SHELL\.map\(\(url\) => new Request\([\s\S]*?cache: "reload"/, "A fresh Operator shell must bypass stale iPhone HTTP cache entries.");
 assert.ok(server.includes('app.use("/vendor/quagga2", express.static(quaggaScannerDir))'), "Server must expose the installed 1D scanner bundle.");
@@ -90,9 +93,9 @@ assert.equal(barcodeHelpers.normalizedPickupCameraCode("[object Object]"), "");
 const quaggaHelpers = Function(`${operator.slice(barcodeHelperStart, barcodeHelperEnd)}; return { pickupQuaggaOrderCode };`)();
 assert.equal(quaggaHelpers.pickupQuaggaOrderCode([{ codeResult: { code: "SOB115348" } }]), "SOB115348");
 includesAll(serviceWorker, [
-  "mbbs-yard-operator-v139-request-scheme-v1",
-  "/i18n.js?v=20260813-toronto-timestamps-v1",
-  "/operator.js?v=20260813-toronto-timestamps-v1",
+  "mbbs-yard-operator-v140-customer-pickup-photo-gate-v1",
+  "/i18n.js?v=20260815-customer-pickup-photo-gate-v1",
+  "/operator.js?v=20260815-customer-pickup-photo-gate-v1",
   'url.pathname === "/driver"',
   'url.pathname.startsWith("/driver-")'
 ], "Isolated Operator service-worker cache");

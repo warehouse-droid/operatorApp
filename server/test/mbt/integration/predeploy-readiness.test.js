@@ -36,7 +36,8 @@ test("F14/F16: predeployment evaluation fails closed for migration, flag, and le
     appliedMigrations: REQUIRED_MIGRATIONS.slice(0, -1),
     flags: [
       { flag_key: "mbt_enabled", enabled: true },
-      { flag_key: "mbt_bin_dispatch", enabled: false }
+      { flag_key: "mbt_bin_dispatch", enabled: false },
+      { flag_key: "operator_customer_pickup_photo_required", enabled: true }
     ],
     snapshotRows: [
       {

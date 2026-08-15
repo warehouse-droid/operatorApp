@@ -24,6 +24,15 @@ export const MBT_ADMIN_GATE_DEFINITIONS = Object.freeze([
     lockReason: null
   }),
   Object.freeze({
+    flagKey: "operator_customer_pickup_photo_required",
+    label: "Operator Customer Pickup photo requirement",
+    description: "Require one photo before Operator completes a Customer Pickup load. When off, Customer Pickup can be completed without photo evidence; optional photos are still saved.",
+    environmentProperty: null,
+    independent: true,
+    locked: false,
+    lockReason: null
+  }),
+  Object.freeze({
     flagKey: "sales_stock_request_over_availability",
     label: "Sales stock request over availability",
     description: "Allow Sales to request more than the selected source yard's current availability for SCM review. SCM can intentionally convert the full demand; any shortage is shown and retained as a Transfer Order backorder.",

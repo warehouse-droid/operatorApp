@@ -1790,7 +1790,9 @@ test("P2-F04: mapping, preflight, and signoff leave operational tables, flags, a
     const afterSnapshot = await snapshot();
     assert.deepEqual(afterSnapshot, before);
     assert.ok(
-      afterSnapshot.flags.every(({ enabled }) => enabled === false),
+      afterSnapshot.flags.every(({ flagKey, enabled }) => (
+        enabled === (flagKey === "operator_customer_pickup_photo_required")
+      )),
       JSON.stringify(afterSnapshot.flags)
     );
   });

@@ -357,9 +357,11 @@ test("F06/F16: schema-101 upgrade preserves representative legacy records and is
     assert.match(firstRunner.stdout, /Applied 161_mbt_rate_card_version_cutover\.sql/);
     assert.match(firstRunner.stdout, /Applied 162_dispatch_po_delivery_address_override\.sql/);
     assert.match(firstRunner.stdout, /Applied 163_dispatch_scm_unplan_state\.sql/);
+    assert.match(firstRunner.stdout, /Applied 164_sales_order_partial_reattempt\.sql/);
+    assert.match(firstRunner.stdout, /Applied 165_operator_customer_pickup_photo_gate\.sql/);
 
     const after = await captureLegacyState(client, ids);
-    assert.deepEqual(after, before, "Migrations 102-164 must not rewrite representative schema-101 field values.");
+    assert.deepEqual(after, before, "Migrations 102-165 must not rewrite representative schema-101 field values.");
 
     const truckCapability = await client.query(
       `SELECT bin_service_enabled, bin_slot_capacity
@@ -476,10 +478,10 @@ test("F06/F16: schema-101 upgrade preserves representative legacy records and is
       "idx_receiving_receipt_records_movement_activity"
     ]);
 
-    assert.equal(receiptsBeforeNoOp.rowCount, 164);
+    assert.equal(receiptsBeforeNoOp.rowCount, 165);
     assert.equal(
       receiptsBeforeNoOp.rows.at(-1)?.filename,
-      "164_sales_order_partial_reattempt.sql"
+      "165_operator_customer_pickup_photo_gate.sql"
     );
     assert.deepEqual(
       receiptsBeforeNoOp.rows

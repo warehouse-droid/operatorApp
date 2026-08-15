@@ -8,6 +8,7 @@ import { remapDispatchLinksToMaterializedSplit } from "./dispatch-order-target-r
 import { isNetSuiteSalesOrderBilled } from "./sales-order-reconciliation.js";
 import { netSuiteClosedOrderFamilySql, operationalPlanOrderRefs } from "./netsuite-closed-order-policy.js";
 import { assertNoClosedNetSuiteOrders, listClosedNetSuiteOrders } from "./netsuite-closed-order-repository.js";
+import { getOperatorCustomerPickupPhotoRequirement } from "./operator-customer-pickup-photo-policy.js";
 import {
   ACTIVE_RELOAD_STATUSES,
   getActiveReloadCycleForOrder,
@@ -44,7 +45,10 @@ function photoReferences(values = []) {
 
 function requirePhotoReferences(values = [], minimum = 2) {
   const photos = photoReferences(values);
-  if (photos.length < minimum) throw new Error(`At least ${minimum} photos are required.`);
+  if (photos.length < minimum) {
+    const error = new Error(`At least ${minimum} ${minimum === 1 ? "photo is" : "photos are"} required.`);
+    throw error;
+  }
   return photos;
 }
 
@@ -3953,7 +3957,21 @@ export async function recordDeliveryLoad(orderId, operatorId, { photoDataUrls, r
 
 export async function recordCustomerPickupLoad(orderId, operatorId, { photoDataUrls }) {
   await assertNoClosedNetSuiteOrders([orderId], "be loaded as Customer Pick-Up");
-  const photos = requirePhotoReferences(photoDataUrls);
+  const photoRequirement = await getOperatorCustomerPickupPhotoRequirement();
+  let photos;
+  try {
+    photos = requirePhotoReferences(photoDataUrls, photoRequirement.requiredPhotoCount);
+  } catch (error) {
+    error.status = 400;
+    error.code = "CUSTOMER_PICKUP_PHOTO_REQUIRED";
+    throw error;
+  }
+  const photoEvidence = {
+    photoRequirementEnabled: photoRequirement.required,
+    requiredPhotoCount: photoRequirement.requiredPhotoCount,
+    photoRequirementRevision: photoRequirement.revision,
+    photoEvidenceCount: photos.length
+  };
   const order = await getDeliveryOrder(orderId);
   if (!order || !isPickupOrder(order)) throw new Error("Customer pickup sales order not found.");
   const confirmedLines = (order.lines || []).filter((line) => {
@@ -4052,14 +4070,27 @@ export async function recordCustomerPickupLoad(orderId, operatorId, { photoDataU
     sourceTable: null,
     sourceRecordId: null,
     lineSnapshot: operatorLoadLineSnapshot(refreshed.lines || []),
-    response: { pickupStatus, tranid: order.tranid, loadedQty: aggregateLoadedQty, loadedUom }
+    response: {
+      pickupStatus,
+      tranid: order.tranid,
+      loadedQty: aggregateLoadedQty,
+      loadedUom,
+      ...photoEvidence
+    }
   });
 
   await writeAudit({
     actorOperatorId: operatorId,
     action: "customer_pickup.order.load",
     orderId,
-    details: { pickupStatus, totals, loadedQty: aggregateLoadedQty, loadedUom, remainingLines: remainingLines.length }
+    details: {
+      pickupStatus,
+      totals,
+      loadedQty: aggregateLoadedQty,
+      loadedUom,
+      remainingLines: remainingLines.length,
+      ...photoEvidence
+    }
   });
 
   return {
@@ -4067,7 +4098,8 @@ export async function recordCustomerPickupLoad(orderId, operatorId, { photoDataU
     pickupStatus,
     localYardOrderStatus: pickupStatus,
     loaded: { ...totals, salesQuantity: aggregateLoadedQty, uom: loadedUom },
-    remainingLines: remainingLines.length
+    remainingLines: remainingLines.length,
+    ...photoEvidence
   };
 }
 

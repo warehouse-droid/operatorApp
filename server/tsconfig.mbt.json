@@ -19,6 +19,7 @@
   },
   "include": [
     "src/mbt/**/*.js",
+    "src/operator-customer-pickup-photo-policy.js",
     "test/support/**/*.mjs",
     "tools/**/*.mjs"
   ]

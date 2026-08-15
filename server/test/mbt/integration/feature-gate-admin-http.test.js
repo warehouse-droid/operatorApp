@@ -9,6 +9,7 @@ import {
   DRIVER_PWA_VERSION_HEADER
 } from "../../../src/driver-client-version.js";
 import { getDriverYardDependencyMode } from "../../../src/driver-yard-dependency-mode.js";
+import { getOperatorCustomerPickupPhotoRequirement } from "../../../src/operator-customer-pickup-photo-policy.js";
 import { app } from "../../../src/server.js";
 import { getSalesStockRequestAvailabilityPolicy } from "../../../src/stock-request-policy.js";
 
@@ -21,6 +22,7 @@ const USERS = Object.freeze({
 const EXPECTED_FLAGS = Object.freeze([
   "driver_offline_mode",
   "driver_yard_dependency_soft_mode",
+  "operator_customer_pickup_photo_required",
   "sales_stock_request_over_availability",
   "mbt_enabled",
   "mbt_master_data",
@@ -112,6 +114,7 @@ test("P3-F29 Admin gate inventory is private, complete, and keeps live integrati
   assert.equal(allowed.payload.schemaVersion, "mbt-admin-gates-v1");
   assert.deepEqual(allowed.payload.gates.map(({ flagKey }) => flagKey), EXPECTED_FLAGS);
   assert.equal(gate(allowed.payload, "driver_offline_mode").environmentAllowed, true);
+  assert.equal(gate(allowed.payload, "operator_customer_pickup_photo_required").environmentAllowed, true);
   assert.equal(gate(allowed.payload, "mbt_enabled").environmentAllowed, true);
   assert.equal(gate(allowed.payload, "mbt_master_data").environmentAllowed, false);
   assert.equal(gate(allowed.payload, "mbt_customer_sync").locked, true);
@@ -347,6 +350,82 @@ test("Admin persists and audits the Driver yard-dependency Soft mode independent
            AND entity_id = 'driver_yard_dependency_soft_mode'
            AND idempotency_key = ANY($1::text[])) AS receipts`,
     [[onKey, offKey]]
+  );
+  assert.deepEqual(evidence.rows[0], { audits: 2, receipts: 2 });
+});
+
+test("S6: Admin independently controls the live Operator Customer Pickup photo requirement", async () => {
+  const initial = await request("/api/mbt/config/gates", { token: tokens.get("admin") });
+  assert.equal(initial.response.status, 200, JSON.stringify(initial.payload));
+  const original = gate(initial.payload, "operator_customer_pickup_photo_required");
+  assert.equal(original.configured, true);
+  assert.equal(original.effective, true);
+  assert.equal((await getOperatorCustomerPickupPhotoRequirement()).requiredPhotoCount, 1);
+
+  const advertisedInitial = await request("/api/customer-pickup/config", {
+    token: tokens.get("admin")
+  });
+  assert.equal(advertisedInitial.response.status, 200, JSON.stringify(advertisedInitial.payload));
+  assert.equal(advertisedInitial.response.headers.get("cache-control"), "no-store");
+  assert.equal(advertisedInitial.payload.required, true);
+  assert.equal(advertisedInitial.payload.requiredPhotoCount, 1);
+  assert.equal(advertisedInitial.payload.revision, original.revision);
+
+  const offKey = `operator-customer-pickup-photo-off-${RUN_ID}`;
+  const disabled = await request(
+    "/api/mbt/config/gates/operator_customer_pickup_photo_required",
+    {
+      token: tokens.get("admin"),
+      method: "PUT",
+      headers: { "idempotency-key": offKey },
+      body: {
+        enabled: false,
+        expectedRevision: original.revision,
+        reason: "Exercise photo-optional Customer Pickup completion"
+      }
+    }
+  );
+  assert.equal(disabled.response.status, 200, JSON.stringify(disabled.payload));
+  assert.equal(disabled.payload.flag.enabled, false);
+  const advertisedDisabled = await request("/api/customer-pickup/config", {
+    token: tokens.get("admin")
+  });
+  assert.equal(advertisedDisabled.response.status, 200, JSON.stringify(advertisedDisabled.payload));
+  assert.equal(advertisedDisabled.payload.required, false);
+  assert.equal(advertisedDisabled.payload.requiredPhotoCount, 0);
+  assert.equal(advertisedDisabled.payload.revision, disabled.payload.flag.revision);
+
+  const onKey = `operator-customer-pickup-photo-on-${RUN_ID}`;
+  const restored = await request(
+    "/api/mbt/config/gates/operator_customer_pickup_photo_required",
+    {
+      token: tokens.get("admin"),
+      method: "PUT",
+      headers: { "idempotency-key": onKey },
+      body: {
+        enabled: true,
+        expectedRevision: disabled.payload.flag.revision,
+        reason: "Restore required Customer Pickup photo evidence after the isolated test"
+      }
+    }
+  );
+  assert.equal(restored.response.status, 200, JSON.stringify(restored.payload));
+  assert.equal(restored.payload.flag.enabled, true);
+  assert.equal((await getOperatorCustomerPickupPhotoRequirement()).requiredPhotoCount, 1);
+
+  const evidence = await query(
+    `SELECT
+       (SELECT count(*)::int
+          FROM mbt_audit_events
+         WHERE action = 'mbt.feature_flag.state_updated'
+           AND entity_id = 'operator_customer_pickup_photo_required'
+           AND idempotency_key = ANY($1::text[])) AS audits,
+       (SELECT count(*)::int
+          FROM mbt_command_receipts
+         WHERE command_name = 'mbt.feature_flag.state_updated'
+           AND entity_id = 'operator_customer_pickup_photo_required'
+           AND idempotency_key = ANY($1::text[])) AS receipts`,
+    [[offKey, onKey]]
   );
   assert.deepEqual(evidence.rows[0], { audits: 2, receipts: 2 });
 });

@@ -208,6 +208,6 @@ test("Sales Request Stock has complete Simplified Chinese UI and validation cove
   assert.equal(i18n.message("Select an item on every request line."), "请为每个申请行选择物品。");
   assert.equal(i18n.message("Select a source yard for ABC."), "请为 ABC 选择来源堆场。");
   assert.equal(i18n.message("Requested quantity 20 exceeds requestable availability 10."), "申请数量 20 超过可申请库存 10。");
-  assert.match(html, /i18n\.js\?v=20260813-toronto-timestamps-v1/);
+  assert.match(html, /i18n\.js\?v=20260815-customer-pickup-photo-gate-v1/);
   assert.match(html, /sales-stock-requests\.js\?v=20260812-stock-request-backorder-v1/);
 });

@@ -102,6 +102,17 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
     sourcePaths: Object.freeze(["src/mbt/frontdesk-service.js"])
   }),
   Object.freeze({
+    runner: "run-operator-customer-pickup-photo-gate-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "migrations/165_operator_customer_pickup_photo_gate.sql",
+      "public/operator.js",
+      "src/delivery-repository.js",
+      "src/operator-customer-pickup-photo-policy.js",
+      "src/server.js"
+    ])
+  }),
+  Object.freeze({
     runner: "run-p310-adversarial-mutations.mjs",
     adminUrlEnvironment: "MBT_P310_MUTATION_ADMIN_URL",
     sourcePaths: Object.freeze([

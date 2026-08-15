@@ -20,7 +20,7 @@ const sharedGlobals = {
 
 export default [
   {
-    files: ["src/mbt/**/*.js", "test/mbt/**/*.{js,mjs}", "test/support/**/*.mjs", "tools/**/*.mjs"],
+    files: ["src/mbt/**/*.js", "src/operator-customer-pickup-photo-policy.js", "test/mbt/**/*.{js,mjs}", "test/support/**/*.mjs", "tools/**/*.mjs"],
     languageOptions: {
       ecmaVersion: "latest",
       sourceType: "module",

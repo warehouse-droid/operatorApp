@@ -79,6 +79,7 @@ import { listDeliveryOrders, listVrmaDeliveryPrepOrders, getDeliveryOrder, getFu
 import { getYardMovementDetail, listYardMovementCsvRows, listYardMovements } from "./yard-movement-repository.js";
 import { yardMixedUnits } from "./yard-quantity.js";
 import { clearCustomerPickupDraft, confirmCustomerPickupLine, findCustomerPickupOrder, isPendingApprovalStatus, isPickupDeliveryMethod, recordCustomerPickupLoad } from "./customer-pickup-repository.js";
+import { getOperatorCustomerPickupPhotoRequirement } from "./operator-customer-pickup-photo-policy.js";
 import { createOperator, getOperatorByToken, hasOperators, listAudit, listAuditOptions, listOperators, loginOperator, logoutToken, operatorHomeRoute, setOperatorActive, updateOperatorPassword, updateOperatorRoles, writeAudit } from "./auth-repository.js";
 import { applyInventoryClassificationRules, confirmCycleCountLine, getCycleCountDraft, listCycleCountRecords, listInventoryClassifications, listInventoryFacets, listInventoryItems, submitCycleCount, updateInventoryClassification, upsertInventoryBalances } from "./inventory-repository.js";
 import { listReceivingVendors, listReceivingSources, listReceivingOrders, getReceivingOrder, searchReceivingItems, confirmReceivingLine, unconfirmReceivingLine, getReceivableReceivingOrder, buildItemReceiptPayload, recordReceivingReceipt, recordReceivingReceiptFailure, listReceivingReceipts, listLocalCoSources, listLocalCoReceivingOrders, searchLocalCoItems, getLocalCoReceivingOrder, confirmLocalCoReceivingLine, unconfirmLocalCoReceivingLine, receiveLocalCoOrder } from "./receiving-repository.js";
@@ -19150,6 +19151,19 @@ app.use("/api/customer-pickup/orders/:id", async (req, res, next) => {
   }
 });
 
+app.get("/api/customer-pickup/config", async (_req, res, next) => {
+  try {
+    const photoRequirement = await getOperatorCustomerPickupPhotoRequirement();
+    res.setHeader("Cache-Control", "no-store");
+    res.json({
+      schemaVersion: "operator-customer-pickup-photo-requirement-v1",
+      ...photoRequirement
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/customer-pickup/lookup", async (req, res, next) => {
   try {
     const code = String(req.body?.code || "").trim();
@@ -19210,7 +19224,7 @@ app.post("/api/customer-pickup/orders/:id/clear-draft", async (req, res, next) =
 
 app.post("/api/customer-pickup/orders/:id/load", async (req, res, next) => {
   try {
-    const photoDataUrls = requiredPhotoDataUrls(req.body?.photoDataUrls);
+    const photoDataUrls = requiredPhotoDataUrls(req.body?.photoDataUrls, 0);
     const result = await recordCustomerPickupLoad(req.params.id, operatorId(req), {
       photoDataUrls
     });

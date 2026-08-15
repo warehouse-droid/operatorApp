@@ -74,8 +74,9 @@ test("Operator wires the re-load action to the existing two-photo live-camera sc
   assert.match(startSource, /isPackedReloadReady/u);
   assert.match(startSource, /if \(order\.reload_authorized\) await startFulfillmentCamera\(\)/u);
   assert.match(fulfillmentSource, /data-action="start-camera"/u);
-  assert.match(fulfillmentSource, /Math\.max\(2, fulfillmentPhotoDataUrls\.length\)/u);
-  assert.match(fulfillmentSource, /fulfillmentPhotoCount >= 2/u);
+  assert.match(operatorSource, /function fulfillmentRequiredPhotoCount\(\)[\s\S]*?return 2;/u);
+  assert.match(fulfillmentSource, /const requiredPhotoCount = isPickupLoad[\s\S]*?: fulfillmentRequiredPhotoCount\(\)/u);
+  assert.match(fulfillmentSource, /fulfillmentPhotoCount >= requiredPhotoCount/u);
 });
 
 test("packed re-load replaces the invalid quantity update with an explicit edit transition", () => {

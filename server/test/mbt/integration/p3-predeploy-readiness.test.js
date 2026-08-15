@@ -140,7 +140,8 @@ test("P3.12: deployment readiness requires every Phase 3 migration and exactly n
     "161_mbt_rate_card_version_cutover.sql",
     "162_dispatch_po_delivery_address_override.sql",
     "163_dispatch_scm_unplan_state.sql",
-    "164_sales_order_partial_reattempt.sql"
+    "164_sales_order_partial_reattempt.sql",
+    "165_operator_customer_pickup_photo_gate.sql"
   ]);
   assert.deepEqual(REQUIRED_MBT_P3_FLAGS, EXPECTED_FLAGS);
   const rows = EXPECTED_FLAGS.map((flag_key) => ({ flag_key, enabled: false }));

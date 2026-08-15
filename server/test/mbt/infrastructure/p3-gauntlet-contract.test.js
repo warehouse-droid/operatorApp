@@ -24,6 +24,7 @@ const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
   "run-dispatch-v2-summary-marker-mutations.mjs",
   "run-driver-offline-stress-mutations.mjs",
   "run-frontdesk-mutations.mjs",
+  "run-operator-customer-pickup-photo-gate-mutations.mjs",
   "run-p310-adversarial-mutations.mjs",
   "run-p310-reconciliation-mutations.mjs",
   "run-p311-mutations.mjs",

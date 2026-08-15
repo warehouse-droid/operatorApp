@@ -108,7 +108,8 @@ export const REQUIRED_MBT_P3_MIGRATIONS = Object.freeze([
   "161_mbt_rate_card_version_cutover.sql",
   "162_dispatch_po_delivery_address_override.sql",
   "163_dispatch_scm_unplan_state.sql",
-  "164_sales_order_partial_reattempt.sql"
+  "164_sales_order_partial_reattempt.sql",
+  "165_operator_customer_pickup_photo_gate.sql"
 ]);
 
 export const REQUIRED_MBT_P3_FLAGS = Object.freeze([
@@ -142,7 +143,8 @@ const P2_OPERATIONAL_STATE_SQL = `SELECT
   (SELECT count(*)::int FROM mbt_netsuite_outbox) AS outbox,
   (SELECT COALESCE(jsonb_agg(flag_key ORDER BY flag_key), '[]'::jsonb)
      FROM mbt_feature_flags
-    WHERE enabled) AS enabled_flags`;
+    WHERE enabled
+      AND flag_key LIKE 'mbt_%') AS enabled_flags`;
 
 const P3_RUNTIME_STATUS_ENDPOINT = "http://127.0.0.1:3000/api/mbt/status";
 const P3_RUNTIME_BLOCKED_ENDPOINT = "http://127.0.0.1:3000/api/mbt/bin-assets/00000000-0000-4000-8000-000000000014/reservations";
@@ -176,7 +178,8 @@ const P3_OPERATIONAL_STATE_SQL = `SELECT
   (SELECT COALESCE(
      jsonb_agg(jsonb_build_object('flagKey', flag_key, 'enabled', enabled) ORDER BY flag_key),
      '[]'::jsonb
-   ) FROM mbt_feature_flags) AS feature_flags`;
+   ) FROM mbt_feature_flags
+      WHERE flag_key LIKE 'mbt_%') AS feature_flags`;
 
 /** @param {unknown} value */
 function text(value) {
@@ -280,7 +283,7 @@ function evaluateDeploymentReadiness({
   ));
   const missingMigrations = requiredMigrations.filter((filename) => !applied.has(filename));
   const enabledFlags = flags
-    .filter((flag) => flag?.enabled === true)
+    .filter((flag) => flag?.enabled === true && text(flag?.flag_key).startsWith("mbt_"))
     .map((flag) => text(flag.flag_key))
     .filter(Boolean)
     .sort();
@@ -334,7 +337,7 @@ export function evaluateMbtP3DeploymentReadiness(input) {
   });
   const actualFlags = (Array.isArray(input.flags) ? input.flags : [])
     .map((flag) => text(flag?.flag_key))
-    .filter(Boolean)
+    .filter((flagKey) => flagKey.startsWith("mbt_"))
     .sort();
   const actualSet = new Set(actualFlags);
   const requiredSet = new Set(REQUIRED_MBT_P3_FLAGS);

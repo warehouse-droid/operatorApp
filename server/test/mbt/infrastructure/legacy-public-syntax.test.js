@@ -10,6 +10,7 @@ const serverRoot = path.resolve(testDirectory, "../../..");
 const EXPECTED_FILES = Object.freeze([
   "public/login.js",
   "public/control.js",
+  "public/operator.js",
   "public/app-sidebar.js",
   "public/dispatch-setup.js",
   "public/dispatch.js",

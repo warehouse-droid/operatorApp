@@ -10,6 +10,7 @@ const serverRoot = path.resolve(supportDirectory, "../..");
 export const LEGACY_PUBLIC_FILES = Object.freeze([
   "public/login.js",
   "public/control.js",
+  "public/operator.js",
   "public/app-sidebar.js",
   "public/dispatch-setup.js",
   "public/dispatch.js",

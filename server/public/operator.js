@@ -174,6 +174,14 @@ let fulfillmentProgressTimer = null;
 let fulfillmentValidation = null;
 let fulfillmentReturnModule = "delivery";
 let fulfillmentLoadRequestId = "";
+const DEFAULT_CUSTOMER_PICKUP_PHOTO_REQUIREMENT = Object.freeze({
+  schemaVersion: "operator-customer-pickup-photo-requirement-v1",
+  required: true,
+  requiredPhotoCount: 1,
+  revision: null,
+  updatedAt: null
+});
+let customerPickupPhotoRequirement = { ...DEFAULT_CUSTOMER_PICKUP_PHOTO_REQUIREMENT };
 let customerPickupScan = ["string", "number"].includes(typeof initialOperatorState.customerPickupScan)
   ? String(initialOperatorState.customerPickupScan)
   : "";
@@ -1453,6 +1461,46 @@ function itemCountUnits(item) {
 
 function isCustomerPickupMode() {
   return currentModule === "customer-pickup" || currentModule === "customer-pickup-load";
+}
+
+function normalizeCustomerPickupPhotoRequirement(value) {
+  const revision = Number(value?.revision);
+  const compatible = value?.schemaVersion === DEFAULT_CUSTOMER_PICKUP_PHOTO_REQUIREMENT.schemaVersion
+    && value?.flagKey === "operator_customer_pickup_photo_required"
+    && Number.isSafeInteger(revision)
+    && revision > 0;
+  const disabled = compatible && value?.required === false && value?.requiredPhotoCount === 0;
+  return {
+    schemaVersion: DEFAULT_CUSTOMER_PICKUP_PHOTO_REQUIREMENT.schemaVersion,
+    required: !disabled,
+    requiredPhotoCount: disabled ? 0 : 1,
+    revision: compatible ? revision : null,
+    updatedAt: typeof value?.updatedAt === "string" ? value.updatedAt : null
+  };
+}
+
+async function refreshCustomerPickupPhotoRequirement() {
+  try {
+    const value = await api("/api/customer-pickup/config");
+    customerPickupPhotoRequirement = normalizeCustomerPickupPhotoRequirement(value);
+    return customerPickupPhotoRequirement;
+  } catch (error) {
+    customerPickupPhotoRequirement = { ...DEFAULT_CUSTOMER_PICKUP_PHOTO_REQUIREMENT };
+    throw error;
+  }
+}
+
+function customerPickupRequiredPhotoCount() {
+  return customerPickupPhotoRequirement.required === false ? 0 : 1;
+}
+
+function fulfillmentRequiredPhotoCount() {
+  if (currentModule === "customer-pickup-load") return customerPickupRequiredPhotoCount();
+  return 2;
+}
+
+function fulfillmentPhotoSlotFloor() {
+  return Math.max(1, fulfillmentRequiredPhotoCount());
 }
 
 function lineHasConversion(line) {
@@ -4261,17 +4309,20 @@ function renderFulfillmentScreen() {
     return render();
   }
   const packedLines = visibleLines(order).filter((line) => hasPackedQty(line));
-  const fulfillmentPhotoSlots = Math.max(2, fulfillmentPhotoDataUrls.length);
+  const isPickupLoad = currentModule === "customer-pickup-load";
+  const requiredPhotoCount = isPickupLoad ? customerPickupRequiredPhotoCount() : fulfillmentRequiredPhotoCount();
+  const fulfillmentPhotoSlots = Math.max(fulfillmentPhotoSlotFloor(), fulfillmentPhotoDataUrls.length);
   const fulfillmentPhotoCount = fulfillmentPhotoDataUrls.filter(Boolean).length;
   const isReloadLoad = Boolean(order.reload_authorized);
   if (fulfillmentResult) {
-    const isPickupLoad = currentModule === "customer-pickup-load";
     return shell(t("operator.loadComplete", "Load Complete"), `${t("common.order", "Order")} ${order.tranid}`, `
       <section class="fulfillment-screen">
         <div class="fulfillment-card success">
           <span>${isPickupLoad ? t("operator.pickupStatus", "Pickup Status") : t("operator.localYardStatus", "Local Yard Status")}</span>
           <strong>${isPickupLoad ? (fulfillmentResult.pickupStatus === "partial_loaded" ? t("operator.partialLoaded", "Partial Loaded") : t("common.loaded", "Loaded")) : isReloadLoad ? (fulfillmentResult.completed ? "Re-load Complete" : "Re-load Partially Loaded") : (fulfillmentResult.localYardOrderStatus || t("common.loaded", "Loaded"))}</strong>
-          <p>${isPickupLoad ? tf("operator.photoSavedRemaining", "Photo proof saved. Remaining line count: {count}.", { count: fulfillmentResult.remainingLines || 0 }) : isReloadLoad ? "This re-load attempt was saved locally. NetSuite fulfillment and Dispatch were not changed." : t("operator.photoSavedHidden", "Photo proof saved. This order is hidden from the operator list.")}</p>
+          <p>${isPickupLoad ? (fulfillmentResult.photoEvidenceCount > 0
+            ? tf("operator.photoSavedRemaining", "Photo proof saved. Remaining line count: {count}.", { count: fulfillmentResult.remainingLines || 0 })
+            : tf("operator.pickupSavedNoPhotoRemaining", "Customer Pickup load saved without photo evidence. Remaining line count: {count}.", { count: fulfillmentResult.remainingLines || 0 })) : isReloadLoad ? "This re-load attempt was saved locally. NetSuite fulfillment and Dispatch were not changed." : t("operator.photoSavedHidden", "Photo proof saved. This order is hidden from the operator list.")}</p>
         </div>
         <div class="selected-actions">
           <button class="primary-button" data-action="finish-fulfill" type="button">${isPickupLoad ? t("operator.backToScan", "Back to Scan") : t("operator.backToDelivery", "Back to Delivery")}</button>
@@ -4283,7 +4334,11 @@ function renderFulfillmentScreen() {
     <section class="fulfillment-screen ${isReloadLoad ? "reload-fulfillment-screen" : ""}">
       ${isReloadLoad ? `<div class="sync-alert reload-notice"><strong>Local-only re-load</strong><span>${escapeHtml(order.reload_reason || order.reload_cycle?.reason || "")}</span></div>` : ""}
       <div class="fulfillment-card">
-        <span>${t("operator.photoProof", "Photo proof")}</span>
+        <span>${isPickupLoad && requiredPhotoCount === 0
+          ? t("operator.customerPickupPhotoOptional", "Customer Pickup photo proof (optional)")
+          : isPickupLoad
+            ? t("operator.customerPickupPhotoRequired", "Customer Pickup photo proof (required)")
+            : t("operator.photoProof", "Photo proof")}</span>
         <strong>${t("operator.loadedOnTruck", "Loaded on truck")}</strong>
         <div class="camera-actions">
           ${fulfillmentCameraActive
@@ -4295,18 +4350,22 @@ function renderFulfillmentScreen() {
           ${Array.from({ length: fulfillmentPhotoSlots }, (_, slot) => `
             <button class="${fulfillmentActivePhotoSlot === slot ? "active" : ""}" data-action="select-fulfillment-photo-slot" data-slot="${slot}" type="button">
               <strong>${t("common.photos", "Photo")} ${slot + 1}</strong>
-              <span>${fulfillmentPhotoDataUrls[slot] ? t("common.ready", "Ready") : slot < 2 ? t("common.needed", "Needed") : t("common.optional", "Optional")}</span>
+              <span>${fulfillmentPhotoDataUrls[slot] ? t("common.ready", "Ready") : slot < requiredPhotoCount ? t("common.needed", "Needed") : t("common.optional", "Optional")}</span>
             </button>
           `).join("")}
         </div>
         <div class="photo-list-actions">
           <button class="secondary-button" data-action="add-fulfillment-photo" type="button">${t("common.addAnotherPhoto", "Add another photo")}</button>
-          ${fulfillmentPhotoSlots > 2 ? `<button class="secondary-button danger-button" data-action="remove-fulfillment-photo" data-slot="${fulfillmentActivePhotoSlot}" ${fulfillmentActivePhotoSlot < 2 ? "disabled" : ""} type="button">${t("common.removeSelected", "Remove selected")}</button>` : ""}
+          ${fulfillmentPhotoDataUrls.length > requiredPhotoCount ? `<button class="secondary-button danger-button" data-action="remove-fulfillment-photo" data-slot="${fulfillmentActivePhotoSlot}" ${fulfillmentActivePhotoSlot < requiredPhotoCount ? "disabled" : ""} type="button">${t("common.removeSelected", "Remove selected")}</button>` : ""}
         </div>
         ${fulfillmentCameraActive ? `
           <video class="camera-preview ${cameraCaptureMode() === "user" ? "mirrored" : ""}" id="fulfillmentCamera" autoplay muted playsinline></video>
           <button class="primary-button" data-action="capture-photo" type="button">${t("operator.capturePhoto", "Capture photo")} ${fulfillmentActivePhotoSlot + 1}</button>
-        ` : fulfillmentPhotoDataUrls[fulfillmentActivePhotoSlot] ? `<img class="photo-preview" src="${fulfillmentPhotoDataUrls[fulfillmentActivePhotoSlot]}" alt="${t("operator.photoProof", "Truck loading proof")} ${fulfillmentActivePhotoSlot + 1}" />` : `<div class="photo-placeholder">${t("operator.takeTwoLoadPhotos", "Take at least 2 photos before confirming load. You can add more photos if needed.")}</div>`}
+        ` : fulfillmentPhotoDataUrls[fulfillmentActivePhotoSlot] ? `<img class="photo-preview" src="${fulfillmentPhotoDataUrls[fulfillmentActivePhotoSlot]}" alt="${t("operator.photoProof", "Truck loading proof")} ${fulfillmentActivePhotoSlot + 1}" />` : `<div class="photo-placeholder">${isPickupLoad && requiredPhotoCount === 0
+          ? t("operator.pickupPhotoOptionalHelp", "Photo evidence is off. You can complete this Customer Pickup load without taking a photo.")
+          : isPickupLoad
+            ? t("operator.takeOnePickupPhoto", "Take at least 1 Customer Pickup photo before confirming load. You can add more photos if needed.")
+            : t("operator.takeTwoLoadPhotos", "Take at least 2 photos before confirming load. You can add more photos if needed.")}</div>`}
       </div>
       <div class="fulfillment-card">
         <span>${t("operator.packedQtyToLoad", "Packed qty to load")}</span>
@@ -4324,7 +4383,7 @@ function renderFulfillmentScreen() {
         ${fulfillmentSubmitting ? `<div class="sync-alert"><strong>${localizeMessage(fulfillmentJobStage || t("operator.savingLoadProof", "Saving load proof"))}</strong><span>${localizeMessage(fulfillmentStatusText || t("operator.savingLocalYardStatus", "Saving local yard status..."))}<span data-fulfillment-upload-elapsed>${fulfillmentStartedAt ? ` (${Math.max(1, Math.round((Date.now() - fulfillmentStartedAt) / 1000))}s)` : ""}</span></span></div>` : ""}
         ${!fulfillmentSubmitting && fulfillmentJobStage === "Load failed" ? `<div class="sync-alert danger"><strong>${t("operator.loadFailed", "Load failed")}</strong><span>${escapeHtml(localizeMessage(fulfillmentStatusText))}</span></div>` : ""}
         ${renderLoadValidation(fulfillmentValidation)}
-        <button class="primary-button" data-action="confirm-fulfill" ${fulfillmentPhotoCount >= 2 && !fulfillmentSubmitting ? "" : "disabled"} type="button">${fulfillmentSubmitting ? t("operator.loading", "Loading...") : t("common.load", "Load")}</button>
+        <button class="primary-button" data-action="confirm-fulfill" ${(isPickupLoad || fulfillmentPhotoCount >= requiredPhotoCount) && !fulfillmentSubmitting ? "" : "disabled"} type="button">${fulfillmentSubmitting ? t("operator.loading", "Loading...") : t("common.load", "Load")}</button>
       </div>
     </section>
   `, `
@@ -5900,6 +5959,14 @@ async function startFulfillment() {
     }
     order = refreshed;
   }
+  const customerPickupLoad = isCustomerPickupMode();
+  if (customerPickupLoad) {
+    try {
+      await refreshCustomerPickupPhotoRequirement();
+    } catch {
+      showToast(t("operator.pickupPhotoPolicyUnavailable", "Could not verify the Customer Pickup photo setting. One photo remains required."));
+    }
+  }
   fulfillmentOrder = order;
   fulfillmentReturnModule = currentModule;
   fulfillmentPhotoDataUrls = [];
@@ -5912,7 +5979,7 @@ async function startFulfillment() {
   fulfillmentValidation = null;
   fulfillmentLoadRequestId = createOperatorUuid();
   selectRearCamera();
-  currentModule = isCustomerPickupMode() ? "customer-pickup-load" : "delivery-fulfill";
+  currentModule = customerPickupLoad ? "customer-pickup-load" : "delivery-fulfill";
   render();
   if (order.reload_authorized) await startFulfillmentCamera();
 }
@@ -6013,7 +6080,7 @@ async function captureFulfillmentPhoto() {
   }
   try {
     fulfillmentPhotoDataUrls[fulfillmentActivePhotoSlot] = await captureCameraPhotoDataUrl(fulfillmentCameraStream, video);
-    fulfillmentActivePhotoSlot = nextPhotoSlot(fulfillmentPhotoDataUrls, fulfillmentActivePhotoSlot, 2);
+    fulfillmentActivePhotoSlot = nextPhotoSlot(fulfillmentPhotoDataUrls, fulfillmentActivePhotoSlot, fulfillmentPhotoSlotFloor());
     render();
   } catch (error) {
     showToast(error.message || t("operator.photoCaptureFailed", "Photo capture failed."));
@@ -6030,12 +6097,30 @@ function readPhotoFile(file) {
 }
 
 async function confirmFulfillment() {
-  if (!fulfillmentOrder || fulfillmentPhotoDataUrls.filter(Boolean).length < 2 || fulfillmentSubmitting) return;
-  stopFulfillmentCamera();
+  if (!fulfillmentOrder || fulfillmentSubmitting) return;
   fulfillmentSubmitting = true;
+  const isPickupLoad = currentModule === "customer-pickup-load";
+  if (isPickupLoad) {
+    try {
+      await refreshCustomerPickupPhotoRequirement();
+    } catch {
+      showToast(t("operator.pickupPhotoPolicyUnavailable", "Could not verify the Customer Pickup photo setting. One photo remains required."));
+    }
+  }
+  const photos = fulfillmentPhotoDataUrls.filter(Boolean);
+  const requiredPhotoCount = fulfillmentRequiredPhotoCount();
+  if (photos.length < requiredPhotoCount) {
+    fulfillmentSubmitting = false;
+    showToast(tf("operator.customerPickupPhotoNeeded", "Take at least {count} Customer Pickup photo before loading.", { count: requiredPhotoCount }));
+    render();
+    return;
+  }
+  stopFulfillmentCamera();
   fulfillmentStartedAt = Date.now();
-  fulfillmentJobStage = "Saving proof";
-  fulfillmentStatusText = "Saving photo proof and local loaded status...";
+  fulfillmentJobStage = photos.length ? "Saving proof" : "Saving load";
+  fulfillmentStatusText = photos.length
+    ? "Saving photo proof and local loaded status..."
+    : "Saving local loaded status...";
   fulfillmentValidation = null;
   window.clearInterval(fulfillmentProgressTimer);
   fulfillmentProgressTimer = window.setInterval(() => {
@@ -6043,14 +6128,16 @@ async function confirmFulfillment() {
   }, 1000);
   render();
   try {
-    fulfillmentStatusText = "Uploading photo proof to R2...";
+    fulfillmentStatusText = photos.length ? "Uploading photo proof to R2..." : "Saving local loaded status...";
     render();
-    const uploadedPhotoRefs = await uploadOperatorPhotos(fulfillmentPhotoDataUrls.filter(Boolean), {
-      recordType: currentModule === "customer-pickup-load" ? "operator-customer-pickup-photo" : "operator-load-photo",
-      orderType: fulfillmentOrder.order_type || deliveryOrderType,
-      orderId: fulfillmentOrder.netsuite_id,
-      orderRef: fulfillmentOrder.tranid
-    });
+    const uploadedPhotoRefs = photos.length
+      ? await uploadOperatorPhotos(photos, {
+          recordType: isPickupLoad ? "operator-customer-pickup-photo" : "operator-load-photo",
+          orderType: fulfillmentOrder.order_type || deliveryOrderType,
+          orderId: fulfillmentOrder.netsuite_id,
+          orderRef: fulfillmentOrder.tranid
+        })
+      : [];
     const path = currentModule === "customer-pickup-load"
       ? `/api/customer-pickup/orders/${fulfillmentOrder.netsuite_id}/load`
       : `/api/delivery/orders/${fulfillmentOrder.netsuite_id}/load`;
@@ -8312,15 +8399,16 @@ app.addEventListener("click", async (event) => {
       return render();
     }
     if (button.dataset.action === "add-fulfillment-photo") {
-      while (fulfillmentPhotoDataUrls.length < 2) fulfillmentPhotoDataUrls.push("");
+      while (fulfillmentPhotoDataUrls.length < fulfillmentPhotoSlotFloor()) fulfillmentPhotoDataUrls.push("");
       fulfillmentPhotoDataUrls.push("");
       fulfillmentActivePhotoSlot = fulfillmentPhotoDataUrls.length - 1;
       return render();
     }
     if (button.dataset.action === "remove-fulfillment-photo") {
       const slot = Number(button.dataset.slot);
-      if (slot >= 2 && slot < fulfillmentPhotoDataUrls.length) fulfillmentPhotoDataUrls.splice(slot, 1);
-      fulfillmentActivePhotoSlot = Math.min(fulfillmentActivePhotoSlot, Math.max(1, fulfillmentPhotoDataUrls.length - 1));
+      const requiredPhotoCount = fulfillmentRequiredPhotoCount();
+      if (slot >= requiredPhotoCount && slot < fulfillmentPhotoDataUrls.length) fulfillmentPhotoDataUrls.splice(slot, 1);
+      fulfillmentActivePhotoSlot = Math.min(fulfillmentActivePhotoSlot, Math.max(0, fulfillmentPhotoDataUrls.length - 1));
       return render();
     }
     if (button.dataset.action === "select-history") {
