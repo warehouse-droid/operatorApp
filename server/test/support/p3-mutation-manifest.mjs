@@ -66,6 +66,14 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
     sourcePaths: Object.freeze(["src/dispatch-planner-performance.js"])
   }),
   Object.freeze({
+    runner: "run-dispatch-runtime-resilience-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "public/dispatch.js",
+      "public/service-worker.js"
+    ])
+  }),
+  Object.freeze({
     runner: "run-dispatch-save-recovery-mutations.mjs",
     adminUrlEnvironment: null,
     sourcePaths: Object.freeze([

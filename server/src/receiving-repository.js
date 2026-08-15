@@ -1,5 +1,7 @@
 import { query } from "./db.js";
 import { writeAudit } from "./auth-repository.js";
+import { netSuiteClosedOrderFamilySql } from "./netsuite-closed-order-policy.js";
+import { assertNoClosedNetSuiteOrders, listClosedNetSuiteOrders } from "./netsuite-closed-order-repository.js";
 
 function normalizeNumber(value) {
   if (value === null || value === undefined || value === "") return null;
@@ -247,8 +249,9 @@ export async function listReceivingVendors({ destinationLocationId = null } = {}
   }
   const result = await query(
     `SELECT vendor_id, vendor, COUNT(*)::int AS order_count
-     FROM purchase_orders
-     WHERE netsuite_active = true
+	     FROM purchase_orders
+	     WHERE netsuite_active = true
+	       AND NOT ${netSuiteClosedOrderFamilySql("purchase_orders", "PO")}
        AND (status_text ILIKE '%Pending Receipt%' OR status_text ILIKE '%Partially Received%')
        ${destinationClause}
      GROUP BY vendor_id, vendor
@@ -274,8 +277,9 @@ export async function listReceivingSources({ destinationLocationId = null } = {}
               to_location_id AS destination_location_id,
               status_text,
               netsuite_active
-       FROM transfer_orders t
-       WHERE t.to_location_id IS NOT NULL
+	       FROM transfer_orders t
+	       WHERE t.to_location_id IS NOT NULL
+	         AND NOT ${netSuiteClosedOrderFamilySql("t", "TO")}
          AND NOT EXISTS (
            SELECT 1 FROM order_dependencies d
             WHERE d.transfer_order_id = t.netsuite_id
@@ -333,8 +337,9 @@ export async function listReceivingOrders({ orderType, vendor = null, sourceLoca
               netsuite_active, synced_at, receipt_status, memo, expected_delivery_date,
               dispatch_vendor_yard, dispatch_address, dispatch_window_start,
               dispatch_window_end, dispatch_instructions
-       FROM purchase_orders
-       UNION ALL
+	       FROM purchase_orders
+	       WHERE NOT ${netSuiteClosedOrderFamilySql("purchase_orders", "PO")}
+	       UNION ALL
        SELECT netsuite_id, 'transfer_order'::text AS order_type,
               tranid,
               tranid AS original_tranid,
@@ -346,8 +351,9 @@ export async function listReceivingOrders({ orderType, vendor = null, sourceLoca
               netsuite_active, synced_at, receiving_status AS receipt_status, memo, expected_delivery_date,
               NULL::text AS dispatch_vendor_yard, dispatch_address, dispatch_window_start,
               dispatch_window_end, dispatch_instructions
-       FROM transfer_orders t
-       WHERE t.to_location_id IS NOT NULL
+	       FROM transfer_orders t
+	       WHERE t.to_location_id IS NOT NULL
+	         AND NOT ${netSuiteClosedOrderFamilySql("t", "TO")}
          AND NOT EXISTS (
            SELECT 1 FROM order_dependencies d
             WHERE d.transfer_order_id = t.netsuite_id
@@ -387,8 +393,9 @@ export async function getReceivingOrder(orderId) {
               netsuite_active, synced_at, receipt_status, memo, expected_delivery_date,
               dispatch_vendor_yard, dispatch_address, dispatch_window_start,
               dispatch_window_end, dispatch_instructions
-       FROM purchase_orders
-       UNION ALL
+	       FROM purchase_orders
+	       WHERE NOT ${netSuiteClosedOrderFamilySql("purchase_orders", "PO")}
+	       UNION ALL
        SELECT netsuite_id, 'transfer_order'::text AS order_type,
               tranid,
               tranid AS original_tranid,
@@ -400,8 +407,9 @@ export async function getReceivingOrder(orderId) {
               netsuite_active, synced_at, receiving_status AS receipt_status, memo, expected_delivery_date,
               NULL::text AS dispatch_vendor_yard, dispatch_address, dispatch_window_start,
               dispatch_window_end, dispatch_instructions
-       FROM transfer_orders t
-       WHERE t.to_location_id IS NOT NULL
+	       FROM transfer_orders t
+	       WHERE t.to_location_id IS NOT NULL
+	         AND NOT ${netSuiteClosedOrderFamilySql("t", "TO")}
          AND NOT EXISTS (
            SELECT 1 FROM order_dependencies d
             WHERE d.transfer_order_id = t.netsuite_id
@@ -463,6 +471,7 @@ export async function getReceivingOrder(orderId) {
 }
 
 export async function confirmReceivingLine(orderId, lineRowId, values, operatorId) {
+  await assertNoClosedNetSuiteOrders([orderId], "confirm a Receiving line");
   const line = await query(
     `WITH alloc AS (
        SELECT po_line_id,
@@ -559,6 +568,7 @@ export async function confirmReceivingLine(orderId, lineRowId, values, operatorI
 }
 
 export async function unconfirmReceivingLine(orderId, lineRowId, operatorId) {
+  await assertNoClosedNetSuiteOrders([orderId], "unconfirm a Receiving line");
   const line = await query(
     `WITH receiving_line_source AS (
        SELECT purchase_order_id AS order_id,
@@ -712,18 +722,49 @@ function locationTextFromId(value) {
   return text;
 }
 
+function openLocalCoSourceSql(coAlias = "co") {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(coAlias)) {
+    throw new TypeError("A safe local CO SQL alias is required.");
+  }
+  return `NOT EXISTS (
+      SELECT 1
+        FROM sales_orders closed_source_so
+       WHERE upper(BTRIM(closed_source_so.tranid)) = upper(BTRIM(${coAlias}.source_order_ref))
+         AND ${netSuiteClosedOrderFamilySql("closed_source_so", "SO")}
+    )
+    AND NOT EXISTS (
+      SELECT 1
+        FROM transfer_orders closed_source_to
+       WHERE upper(BTRIM(closed_source_to.tranid)) = upper(BTRIM(${coAlias}.source_order_ref))
+         AND ${netSuiteClosedOrderFamilySql("closed_source_to", "TO")}
+    )`;
+}
+
+async function assertLocalCoReceivingSourceEditable(coRefOrId, action) {
+  const result = await query(
+    `SELECT source_order_ref
+       FROM co_orders
+      WHERE co_ref = $1 OR delivery_order_id::text = $1 OR id::text = $1
+      LIMIT 1`,
+    [String(coRefOrId)]
+  );
+  if (result.rows[0]?.source_order_ref) {
+    await assertNoClosedNetSuiteOrders([result.rows[0].source_order_ref], action);
+  }
+}
+
 export async function listLocalCoSources({ destinationLocationId = null } = {}) {
   const params = [];
-  const clauses = ["status = 'planned'"];
+  const clauses = ["co.status = 'planned'", openLocalCoSourceSql("co")];
   if (destinationLocationId) {
     params.push(destinationLocationId);
-    clauses.push(`to_location_id = $${params.length}`);
+    clauses.push(`co.to_location_id = $${params.length}`);
   }
   const result = await query(
     `SELECT from_location_id AS source_location_id,
             from_location AS source_location,
             COUNT(*)::int AS order_count
-       FROM co_orders
+       FROM co_orders co
       WHERE ${clauses.join(" AND ")}
       GROUP BY from_location_id, from_location
       ORDER BY from_location`,
@@ -734,7 +775,7 @@ export async function listLocalCoSources({ destinationLocationId = null } = {}) 
 
 export async function listLocalCoReceivingOrders({ sourceLocationId = null, destinationLocationId = null, search = null, itemSearch = null } = {}) {
   const params = [];
-  const clauses = ["co.status = 'planned'"];
+  const clauses = ["co.status = 'planned'", openLocalCoSourceSql("co")];
   if (sourceLocationId) {
     params.push(sourceLocationId);
     clauses.push(`co.from_location_id = $${params.length}`);
@@ -779,7 +820,10 @@ export async function listLocalCoReceivingOrders({ sourceLocationId = null, dest
       LIMIT 200`,
     params
   );
-  return result.rows;
+  const closedRefs = new Set((await listClosedNetSuiteOrders(
+    result.rows.map((row) => row.source_order_ref)
+  )).map((entry) => entry.requestedRef));
+  return result.rows.filter((row) => !closedRefs.has(String(row.source_order_ref || "").trim().toUpperCase()));
 }
 
 export async function searchLocalCoItems({ sourceLocationId = null, destinationLocationId = null, search = "" } = {}) {
@@ -788,6 +832,7 @@ export async function searchLocalCoItems({ sourceLocationId = null, destinationL
   const params = [`%${term}%`];
   const clauses = [
     "co.status = 'planned'",
+    openLocalCoSourceSql("co"),
     "(line.item_name ILIKE $1 OR line.item_description ILIKE $1)"
   ];
   if (sourceLocationId) {
@@ -833,6 +878,7 @@ export async function getLocalCoReceivingOrder(coRefOrId) {
     [String(coRefOrId)]
   );
   if (!order.rowCount) return null;
+  if ((await listClosedNetSuiteOrders([order.rows[0].source_order_ref])).length) return null;
   const lines = await query(
     `SELECT line.*,
             line.co_id AS order_id,
@@ -849,6 +895,7 @@ export async function getLocalCoReceivingOrder(coRefOrId) {
 }
 
 export async function confirmLocalCoReceivingLine(coRefOrId, lineRowId, values, operatorId) {
+  await assertLocalCoReceivingSourceEditable(coRefOrId, "confirm a local CO Receiving line");
   const line = await query(
     `SELECT line.*
        FROM co_order_lines line
@@ -892,6 +939,7 @@ export async function confirmLocalCoReceivingLine(coRefOrId, lineRowId, values, 
 }
 
 export async function unconfirmLocalCoReceivingLine(coRefOrId, lineRowId, operatorId) {
+  await assertLocalCoReceivingSourceEditable(coRefOrId, "unconfirm a local CO Receiving line");
   const line = await query(
     `SELECT line.*
        FROM co_order_lines line
@@ -1217,6 +1265,7 @@ export async function receiveLocalCoOrder(coRefOrId, operatorId, { photoDataUrls
 }
 
 export async function recordReceivingReceipt(orderId, operatorId, { photoDataUrls, payload, response, itemReceiptId, itemReceiptTranid }) {
+  await assertNoClosedNetSuiteOrders([orderId], "be received");
   const photos = Array.isArray(photoDataUrls) ? photoDataUrls.filter(isPhotoReference) : [];
   if (photos.length < 2) throw new Error("Two receiving photos are required.");
   const order = await getReceivingOrder(orderId);
@@ -1285,6 +1334,7 @@ export async function recordReceivingReceipt(orderId, operatorId, { photoDataUrl
 export async function recordReceivingReceiptFailure(orderId, operatorId, { photoDataUrls, payload, error, stage }) {
   const message = error?.message || String(error || "Unknown receiving error");
   try {
+    await assertNoClosedNetSuiteOrders([orderId], "record a Receiving event");
     await query(
       `INSERT INTO receiving_receipt_records (
          order_id, operator_id, receipt_status, photo_data_urls, payload, response
@@ -1372,13 +1422,15 @@ export async function searchReceivingItems({ orderType, vendor = null, sourceLoc
        SELECT netsuite_id, 'purchase_order'::text AS order_type, vendor,
               NULL::bigint AS source_location_id, destination_location_id,
               status_text, netsuite_active
-       FROM purchase_orders
-       UNION ALL
+	       FROM purchase_orders
+	       WHERE NOT ${netSuiteClosedOrderFamilySql("purchase_orders", "PO")}
+	       UNION ALL
        SELECT netsuite_id, 'transfer_order'::text AS order_type, NULL::text AS vendor,
               from_location_id AS source_location_id, to_location_id AS destination_location_id,
               status_text, netsuite_active
-       FROM transfer_orders t
-       WHERE t.to_location_id IS NOT NULL
+	       FROM transfer_orders t
+	       WHERE t.to_location_id IS NOT NULL
+	         AND NOT ${netSuiteClosedOrderFamilySql("t", "TO")}
          AND NOT EXISTS (
            SELECT 1 FROM order_dependencies d
             WHERE d.transfer_order_id = t.netsuite_id

@@ -60,14 +60,14 @@ export function responseBytes(payload) {
  * Create a per-file isolated HTTP fixture. The normal test runner clones the
  * disposable mbt_test database before this module executes.
  */
-export async function createDispatchV2Fixture() {
+export async function createDispatchV2Fixture({ role = "dispatcher" } = {}) {
   const suffix = crypto.randomUUID().replaceAll("-", "");
-  const username = `dispatch-v2-${suffix.slice(0, 20)}`;
+  const username = `dispatch-v2-${role}-${suffix.slice(0, 14)}`;
   const operator = await createOperator({
     username,
-    displayName: "Dispatch V2 Isolated Tester",
+    displayName: `Dispatch V2 ${role} Isolated Tester`,
     password: PASSWORD,
-    role: "dispatcher"
+    role
   });
   const session = await loginOperator(username, PASSWORD);
   let server = await new Promise((resolve) => {

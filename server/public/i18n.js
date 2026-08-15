@@ -170,6 +170,7 @@
 
     "common.menu": "菜单",
     "common.refresh": "刷新",
+    "common.retry": "重试",
     "common.refreshOrders": "刷新订单",
     "common.logout": "登出",
     "common.login": "登录",
@@ -1333,6 +1334,7 @@
     "driver.additionalDeliveryText": "附加指示",
     "driver.instructionImageUnavailable": "此图片需要联网查看",
     "driver.instructionImageLoading": "正在载入指示图片…",
+    "driver.instructionImageFailed": "图片无法载入",
     "driver.instructionVideoOnline": "视频需要联网播放",
     "driver.deliveryImage": "送货指示图片",
     "driver.deliveryVideo": "送货指示视频",

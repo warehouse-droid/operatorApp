@@ -29,6 +29,38 @@ const line = {
   piece_qty: 10
 };
 
+function reattemptPreview(candidate) {
+  return candidate.buildSalesOrderReattemptPreview({
+    sourceLoadRecordId: 42,
+    historicalLines: [{
+      lineId: "7001",
+      itemId: "8001",
+      itemName: "HISTORICAL-SKU",
+      loadedQty: 20,
+      loadedUom: "EA"
+    }],
+    currentLines: [{
+      id: 9001,
+      line_id: 7001,
+      item_id: 8002,
+      item_name: "CURRENT-SKU",
+      sku: "CURRENT-SKU",
+      quantity: 20,
+      unit: "EA",
+      piece_qty: 20,
+      to_pcs: 1,
+      netsuite_active: true
+    }],
+    itemCatalog: [{
+      item_id: 8001,
+      item_name: "HISTORICAL-SKU",
+      stock_unit: "EA",
+      to_pcs: 1,
+      item_weight: 1
+    }]
+  });
+}
+
 function snapshot(overrides = {}) {
   return {
     order: {
@@ -81,8 +113,8 @@ const mutations = [
   },
   {
     name: "ignore completed driver drop-off",
-    from: "if (snapshot.completedDropoff) {",
-    to: "if (false && snapshot.completedDropoff) {",
+    from: "if (snapshot.completedDropoff && !allowCompletedDropoff) {",
+    to: "if (false && snapshot.completedDropoff && !allowCompletedDropoff) {",
     async killed(candidate) {
       assert.throws(() => candidate.assertSalesOrderReloadEligibility(snapshot({ completedDropoff: true })));
     }
@@ -142,6 +174,76 @@ const mutations = [
         lockCycle: async () => ({ id: 9, salesOrderId: 456789, status: "in_progress", activityStartedAt: new Date() }),
         cancelCycle: async () => ({ id: 9, status: "cancelled" }),
         writeAudit: async () => {}
+      }));
+    }
+  },
+  {
+    name: "allow a re-attempt above immutable historical quantity",
+    from: "if (target > number(historical) + QUANTITY_TOLERANCE) {",
+    to: "if (false && target > number(historical) + QUANTITY_TOLERANCE) {",
+    async killed(candidate) {
+      const preview = reattemptPreview(candidate);
+      // Isolate the physical-unit ceiling from the independent sales-quantity
+      // ceiling so this mutant cannot be killed accidentally by the latter.
+      preview.lines[0].historicalPieceQty = 20;
+      preview.lines[0].historicalLoadedSalesQty = 100;
+      assert.throws(() => candidate.buildSalesOrderReattemptTargets({
+        preview,
+        selections: [{ lineKey: preview.lines[0].lineKey, pieceQty: 21, reason: "Retry" }]
+      }));
+    }
+  },
+  {
+    name: "allow selection of an unmapped historical line",
+    from: "if (selectedForReattempt && !line.selectable) {",
+    to: "if (false && selectedForReattempt && !line.selectable) {",
+    async killed(candidate) {
+      const preview = candidate.buildSalesOrderReattemptPreview({
+        sourceLoadRecordId: 43,
+        historicalLines: [{ lineId: "1", itemId: "2", itemName: "OLD", loadedQty: 1, loadedUom: "EA" }],
+        currentLines: [],
+        itemCatalog: [{ item_id: 2, item_name: "OLD", stock_unit: "EA", to_pcs: 1 }]
+      });
+      assert.throws(() => candidate.buildSalesOrderReattemptTargets({
+        preview,
+        selections: [{ lineKey: preview.lines[0].lineKey, pieceQty: 1, reason: "Retry" }]
+      }));
+    }
+  },
+  {
+    name: "allow a selected re-attempt line without its mandatory reason",
+    from: "selectionReason = normalizeReloadReason(selection.reason);",
+    to: 'selectionReason = "mutant";',
+    async killed(candidate) {
+      const preview = reattemptPreview(candidate);
+      assert.throws(() => candidate.buildSalesOrderReattemptTargets({
+        preview,
+        selections: [{ lineKey: preview.lines[0].lineKey, pieceQty: 1, reason: "" }]
+      }));
+    }
+  },
+  {
+    name: "replace historical freight identity with current NetSuite SKU",
+    from: "sku: line.historicalSku,",
+    to: "sku: line.currentSku,",
+    async killed(candidate) {
+      const preview = reattemptPreview(candidate);
+      const [target] = candidate.buildSalesOrderReattemptTargets({
+        preview,
+        selections: [{ lineKey: preview.lines[0].lineKey, pieceQty: 1, reason: "Retry" }]
+      });
+      assert.equal(target.sku, "HISTORICAL-SKU");
+    }
+  },
+  {
+    name: "allow authorization with no selected re-attempt freight",
+    from: "if (!selectedCount) {",
+    to: "if (false && !selectedCount) {",
+    async killed(candidate) {
+      const preview = reattemptPreview(candidate);
+      assert.throws(() => candidate.buildSalesOrderReattemptTargets({
+        preview,
+        selections: [{ lineKey: preview.lines[0].lineKey, pieceQty: 0, reason: "" }]
       }));
     }
   }

@@ -13,6 +13,11 @@ import {
   assertNoDriverPwaCompletedDispatchRefs
 } from "./dispatch-history-mode.js";
 import {
+  assertNoClosedNetSuiteOrders,
+  scrubClosedNetSuiteOrdersFromOperationalPlan
+} from "./netsuite-closed-order-repository.js";
+import { operationalPlanOrderRefs } from "./netsuite-closed-order-policy.js";
+import {
   applyDispatchPlanCommand,
   buildCompactDispatchSnapshot,
   createDispatchCommandReceiptStore,
@@ -110,7 +115,8 @@ function rowPlan(row = {}) {
 function slimAssignedOrder(order = {}) {
   const keys = [
     "id", "orderId", "orderRef", "tranid", "refNumber", "type", "status", "statusText",
-    "customOrderId", "customOrder", "localDispatchStatus",
+    "customOrderId", "customOrder", "localDispatchStatus", "orderKind", "systemManaged",
+    "salesOrderReattempt", "parentSalesOrderId", "parentOrderRef", "reloadCycleId", "billingDisposition",
     "customer", "customerName", "address", "pickupAddress", "pickupAddressOverride",
     "sourceAddress", "defaultSourceAddress", "dropoffLocation", "pickupLocation",
     "pickupLocations", "sourceYard", "destinationYard", "destinationAddress", "destinationLocationId",
@@ -184,7 +190,9 @@ async function selectPlan({ planId = "", date = "", lock = false } = {}) {
       ${lock ? "FOR UPDATE OF p" : ""}`,
     params
   );
-  return result.rows[0] ? reconcileCancelledLocalCos(rowPlan(result.rows[0])) : null;
+  if (!result.rows[0]) return null;
+  const reconciled = await reconcileCancelledLocalCos(rowPlan(result.rows[0]));
+  return (await scrubClosedNetSuiteOrdersFromOperationalPlan(reconciled)).plan;
 }
 
 export async function getDispatchV2Bootstrap({ planId = "", date = "" } = {}) {
@@ -436,6 +444,29 @@ async function assertAssignmentDateAvailable(plan, command) {
   }
 }
 
+function commandOrderRefs(command = {}) {
+  const commandType = text(command.commandType || command.type);
+  const payload = command.payload && typeof command.payload === "object" ? command.payload : {};
+  const refs = [
+    payload.orderRef,
+    payload.sourceOrderRef,
+    payload.targetOrderRef,
+    ...(Array.isArray(payload.orderRefs) ? payload.orderRefs : []),
+    ...(Array.isArray(payload.affectedOrderRefs) ? payload.affectedOrderRefs : []),
+    ...(Array.isArray(payload.operatorAlertRefs) ? payload.operatorAlertRefs : [])
+  ];
+  if (payload.co && typeof payload.co === "object") {
+    refs.push(...operationalPlanOrderRefs({ orders: [payload.co] }));
+  }
+  if (commandType === "replace_plan") {
+    refs.push(...operationalPlanOrderRefs({
+      orders: Array.isArray(payload.orders) ? payload.orders : [],
+      trucks: Array.isArray(payload.trucks) ? payload.trucks : []
+    }));
+  }
+  return [...new Set(refs.map(text).filter(Boolean))];
+}
+
 async function activityForPlan(planId) {
   const result = await query(
     `SELECT status, load_id, stop_id, stop_type, order_refs
@@ -471,6 +502,7 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
     if (!plan) {throw commandError("Dispatch plan not found.", "DISPATCH_PLAN_NOT_FOUND", 404);}
     const replay = await existingReceipt(commandId, hash);
     if (replay) {return { payload: replay, replay: true };}
+    await assertNoClosedNetSuiteOrders(commandOrderRefs({ ...command, commandType }), "be changed in Dispatch");
     await assertAssignmentDateAvailable(plan, { ...command, commandType });
     const result = applyDispatchPlanCommand({
       plan,
@@ -645,7 +677,8 @@ export async function getDispatchV2Checkpoint({ planId, checkpointId } = {}) {
     [planId, checkpointId]
   );
   if (!result.rows[0]) {return null;}
-  return publicPlan(rowPlan({ ...result.rows[0], id: result.rows[0].plan_id }));
+  const plan = rowPlan({ ...result.rows[0], id: result.rows[0].plan_id });
+  return publicPlan((await scrubClosedNetSuiteOrdersFromOperationalPlan(plan)).plan);
 }
 
 export async function pruneExpiredDispatchV2Checkpoints({ retentionDays = 7, batchSize = 500 } = {}) {

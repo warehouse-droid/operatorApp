@@ -19,6 +19,7 @@ const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
   "run-dispatch-driver-completion-mutations.mjs",
   "run-dispatch-order-completion-mutations.mjs",
   "run-dispatch-performance-mutations.mjs",
+  "run-dispatch-runtime-resilience-mutations.mjs",
   "run-dispatch-save-recovery-mutations.mjs",
   "run-dispatch-v2-summary-marker-mutations.mjs",
   "run-driver-offline-stress-mutations.mjs",
@@ -68,6 +69,13 @@ const P3_BASE_MUTANT_NAMES = Object.freeze([
   "P3 MBBS PO billing regresses from business-route grouping to per-reference grouping",
   "P3 MBBS PO billing charges the first drop twice",
   "P3 MBBS direct TO incorrectly includes a full route charge",
+  "P3 MBBS direct TO uses the PO additional-drop price",
+  "P3 MBBS PO additional drops use the direct-TO price",
+  "P3 MBBS policy accepts a negative unit price",
+  "P3 MBBS policy accepts a changed hidden charging rule",
+  "P3 MBBS missing policy loses its fail-closed error boundary",
+  "P3 MBBS rate-card detail hides an existing version policy",
+  "P3 MBBS durable billing evidence drops the selected version policy",
   "P3 MBBS manual final charge no longer has to match calculation plus adjustment",
   "P3 MBBS explicit Sales Order group is charged per child",
   "P3 MBBS explicit Purchase Order group is charged per child",
@@ -321,7 +329,7 @@ test("P3.1: mutation selection contains a distinct nonempty P3 set instead of P1
   );
   assert.match(mutations, /mutationScope\s*===\s*"MBBS_BILLING"/u);
   assert.match(mutations, /scope\s*===\s*"mbbs_billing"/u);
-  assert.match(mutations, /scopedP3Mutants\.length\s*!==\s*19/u);
+  assert.match(mutations, /scopedP3Mutants\.length\s*!==\s*26/u);
 });
 
 test("P3.11: every unmutated Node test category is owned by main, coverage, and shuffle", async () => {

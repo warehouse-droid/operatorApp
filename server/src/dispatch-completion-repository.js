@@ -1,6 +1,7 @@
 // @ts-check
 
 import { query, withTransaction } from "./db.js";
+import { assertNoClosedNetSuiteOrders } from "./netsuite-closed-order-repository.js";
 
 const ORDER_KINDS = new Set(["SO", "TO", "PO", "VRMA", "CUSTOM"]);
 
@@ -241,6 +242,7 @@ export async function manuallyCompleteDispatchOrder(rawInput) {
   const reference = orderReference(input.orderRef);
   const reason = completionReason(input.reason);
   const completedAt = completionTimestamp(input.completedAt);
+  await assertNoClosedNetSuiteOrders([reference], "be manually completed in Dispatch");
 
   return withTransaction(async () => {
     await assertOrderExists(kind, reference);

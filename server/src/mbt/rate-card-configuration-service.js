@@ -11,6 +11,10 @@ import {
   DISTANCE_BOUNDARY_RULES,
   DISTANCE_PRICING_BASES
 } from "./distance-band-pricing.js";
+import {
+  isMbbsCrossChargeGraph,
+  normalizeMbbsRateCardPolicy
+} from "./mbbs-rate-card-policy.js";
 
 /** @typedef {import("./audit-repository.js").MbtActor} MbtActor */
 
@@ -465,7 +469,10 @@ export function normalizeLocalRateCardGraph(value, { sourceKind } = {}) {
     return invalidInput("A manual or CSV rate-card source is required.");
   }
   const graph = inputRecord(value, "Rate-card graph");
-  allowedFields(graph, ["rateCard", "version", "distanceBands", "components", "dumpTariffs", "depositRules"]);
+  allowedFields(graph, [
+    "rateCard", "version", "distanceBands", "components", "dumpTariffs",
+    "depositRules", "mbbsChargingPolicy"
+  ]);
   const rateCard = inputRecord(graph.rateCard, "Rate-card header");
   const version = inputRecord(graph.version, "Rate-card version");
   if (![graph.distanceBands, graph.components, graph.dumpTariffs, graph.depositRules]
@@ -484,7 +491,13 @@ export function normalizeLocalRateCardGraph(value, { sourceKind } = {}) {
   for (const rule of graph.depositRules) {
     validateDepositRule(inputRecord(rule, "Deposit rule"));
   }
-  return structuredClone(graph);
+  const normalized = structuredClone(graph);
+  if (isMbbsCrossChargeGraph(graph)) {
+    normalized.mbbsChargingPolicy = normalizeMbbsRateCardPolicy(graph.mbbsChargingPolicy);
+  } else if (graph.mbbsChargingPolicy !== null && graph.mbbsChargingPolicy !== undefined) {
+    return invalidInput("An MBBS charging policy requires DELIVERY_CHARGE_MBBS cross-charge bands.");
+  }
+  return normalized;
 }
 
 /** @param {MbtActor} actor */
@@ -718,6 +731,7 @@ async function insertGraph(graph, actor, references) {
       actor.operatorId
     ]
   );
+  await replaceMbbsChargingPolicy(rateCardVersionId, graph.mbbsChargingPolicy, actor);
   await insertDistanceBands(rateCardVersionId, graph.distanceBands, references);
   await insertComponents(rateCardVersionId, graph.components, references);
   await insertDumpTariffs(rateCardVersionId, graph.dumpTariffs, references);
@@ -808,6 +822,49 @@ async function insertDepositRules(versionId, rows, references) {
       ]
     );
   }
+}
+
+/** @param {string} versionId @param {Record<string, any> | null | undefined} policy @param {MbtActor} actor */
+async function replaceMbbsChargingPolicy(versionId, policy, actor) {
+  if (!policy) {
+    await query(
+      "DELETE FROM mbt_mbbs_rate_card_policies WHERE rate_card_version_id = $1",
+      [versionId]
+    );
+    return;
+  }
+  await query(
+    `INSERT INTO mbt_mbbs_rate_card_policies (
+       rate_card_version_id, schema_version, currency,
+       direct_pickup_unit_amount_minor, po_additional_drop_unit_amount_minor,
+       so_charge_basis, to_replenishment_charge_basis,
+       to_direct_pickup_charge_basis, po_charge_basis,
+       po_additional_drop_basis, dispatch_load_split_basis,
+       revision, created_by, updated_by
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 1, $12, $12)
+     ON CONFLICT (rate_card_version_id) DO UPDATE
+       SET schema_version = EXCLUDED.schema_version,
+           currency = EXCLUDED.currency,
+           direct_pickup_unit_amount_minor = EXCLUDED.direct_pickup_unit_amount_minor,
+           po_additional_drop_unit_amount_minor = EXCLUDED.po_additional_drop_unit_amount_minor,
+           so_charge_basis = EXCLUDED.so_charge_basis,
+           to_replenishment_charge_basis = EXCLUDED.to_replenishment_charge_basis,
+           to_direct_pickup_charge_basis = EXCLUDED.to_direct_pickup_charge_basis,
+           po_charge_basis = EXCLUDED.po_charge_basis,
+           po_additional_drop_basis = EXCLUDED.po_additional_drop_basis,
+           dispatch_load_split_basis = EXCLUDED.dispatch_load_split_basis,
+           revision = mbt_mbbs_rate_card_policies.revision + 1,
+           updated_by = EXCLUDED.updated_by,
+           updated_at = now()`,
+    [
+      versionId, policy.schemaVersion, policy.currency,
+      policy.directPickupUnitAmountMinor, policy.poAdditionalDropUnitAmountMinor,
+      policy.soChargeBasis, policy.toReplenishmentChargeBasis,
+      policy.toDirectPickupChargeBasis, policy.poChargeBasis,
+      policy.poAdditionalDropBasis, policy.dispatchLoadSplitBasis,
+      actor.operatorId
+    ]
+  );
 }
 
 /**
@@ -901,6 +958,7 @@ export async function replaceLocalRateCardDraft(input) {
       for (const table of ["mbt_deposit_rules", "mbt_dump_tariffs", "mbt_rate_components", "mbt_rate_distance_bands"]) {
         await query(`DELETE FROM ${table} WHERE rate_card_version_id = $1`, [input.rateCardVersionId]);
       }
+      await replaceMbbsChargingPolicy(input.rateCardVersionId, graph.mbbsChargingPolicy, input.actor);
       await insertDistanceBands(input.rateCardVersionId, graph.distanceBands, references);
       await insertComponents(input.rateCardVersionId, graph.components, references);
       await insertDumpTariffs(input.rateCardVersionId, graph.dumpTariffs, references);
@@ -953,7 +1011,7 @@ async function lockedVersion(rateCardVersionId) {
 /** @param {string} rateCardVersionId */
 // eslint-disable-next-line complexity -- Each item type has a distinct complete pricing mechanism to validate.
 async function storedBandValidation(rateCardVersionId) {
-  const [rows, components, tariffs, itemTypes] = await Promise.all([query(
+  const rows = await query(
     `SELECT item_code, service_code, bin_type_id::text, sequence_number,
             minimum_metres::int, maximum_metres::int, boundary_rule,
             origin_yard_codes
@@ -962,17 +1020,20 @@ async function storedBandValidation(rateCardVersionId) {
       ORDER BY item_code NULLS FIRST, service_code, bin_type_id NULLS FIRST,
                origin_yard_codes, minimum_metres, sequence_number`,
     [rateCardVersionId]
-  ), query(
+  );
+  const components = await query(
     `SELECT item_code, component_kind
        FROM mbt_rate_components
       WHERE rate_card_version_id = $1 AND active`,
     [rateCardVersionId]
-  ), query(
+  );
+  const tariffs = await query(
     `SELECT item_code
        FROM mbt_dump_tariffs
       WHERE rate_card_version_id = $1 AND active`,
     [rateCardVersionId]
-  ), query(
+  );
+  const itemTypes = await query(
     `SELECT item.item_code, item.item_type
        FROM mbt_local_item_settings item
       WHERE item.item_code IN (
@@ -986,7 +1047,20 @@ async function storedBandValidation(rateCardVersionId) {
          WHERE tariff.rate_card_version_id = $1 AND tariff.item_code IS NOT NULL
       )`,
     [rateCardVersionId]
-  )]);
+  );
+  const mbbsPolicy = await query(
+    `SELECT EXISTS (
+              SELECT 1 FROM mbt_rate_distance_bands band
+               WHERE band.rate_card_version_id = $1
+                 AND band.item_code = 'DELIVERY_CHARGE_MBBS'
+                 AND band.service_code = 'mbbs_cross_charge'
+            ) AS has_mbbs_bands,
+            EXISTS (
+              SELECT 1 FROM mbt_mbbs_rate_card_policies policy
+               WHERE policy.rate_card_version_id = $1
+            ) AS has_mbbs_policy`,
+    [rateCardVersionId]
+  );
   /** @type {Map<string, Record<string, any>[]>} */
   const groups = new Map();
   for (const row of rows.rows) {
@@ -1016,6 +1090,9 @@ async function storedBandValidation(rateCardVersionId) {
     } else if (item.item_type === "delivery_fee") {
       valid &&= [...groups.keys()].some((key) => key.startsWith(`${item.item_code}\u0000`));
     }
+  }
+  if (mbbsPolicy.rows[0]?.has_mbbs_bands === true) {
+    valid &&= mbbsPolicy.rows[0]?.has_mbbs_policy === true;
   }
   return {
     valid,
@@ -1101,43 +1178,92 @@ export async function validateLocalRateCardVersion(input) {
   });
 }
 
-/** @param {Record<string, any>} before @param {number} revision @param {MbtActor} actor */
-async function activateVersion(before, revision, actor) {
+/**
+ * @param {Record<string, any>} before
+ * @param {number} revision
+ * @param {MbtActor} actor
+ * @param {string | null} replacesRateCardVersionId
+ */
+async function activateVersion(before, revision, actor, replacesRateCardVersionId) {
+  if (before.status !== "draft" || before.first_used_at || before.validation_snapshot?.valid !== true) {
+    return fail("MBT_RATE_CARD_INVALID", "Only a validated, unused draft rate-card version can be activated.");
+  }
   await query("SELECT rate_card_id FROM mbt_rate_cards WHERE rate_card_id = $1 FOR UPDATE", [before.rate_card_id]);
   const active = await query(
     `SELECT rate_card_version_id::text
        FROM mbt_rate_card_versions
-      WHERE rate_card_id = $1 AND status = 'active' AND rate_card_version_id <> $2`,
+      WHERE rate_card_id = $1 AND status = 'active' AND rate_card_version_id <> $2
+      FOR UPDATE`,
     [before.rate_card_id, before.rate_card_version_id]
   );
-  if (active.rowCount) {
+  const activeVersionId = active.rowCount
+    ? String(active.rows[0].rate_card_version_id)
+    : null;
+  if (activeVersionId !== replacesRateCardVersionId) {
     throw new MbtError({
       status: 409,
       code: "MBT_RATE_ACTIVE_CONFLICT",
-      message: "Another rate-card version is already active."
+      message: "The active rate-card version changed. Refresh before activating this version."
     });
   }
-  if (before.status !== "draft" || before.validation_snapshot?.valid !== true) {
-    return fail("MBT_RATE_CARD_INVALID", "Only a validated draft rate-card version can be activated.");
+  const cutover = await query("SELECT transaction_timestamp() AS cutover_at");
+  const cutoverAt = cutover.rows[0].cutover_at;
+  if (activeVersionId) {
+    const retired = await query(
+      `UPDATE mbt_rate_card_versions
+          SET status = 'retired',
+              effective_to = CASE
+                WHEN effective_from IS NULL OR effective_from >= $2 THEN effective_to
+                WHEN effective_to IS NULL OR effective_to > $2 THEN $2
+                ELSE effective_to
+              END,
+              retired_at = $2,
+              revision = revision + 1,
+              updated_by = $3,
+              updated_at = $2
+        WHERE rate_card_version_id = $1 AND status = 'active'
+        RETURNING revision::int`,
+      [activeVersionId, cutoverAt, actor.operatorId]
+    );
+    if (!retired.rowCount) {
+      throw new MbtError({
+        status: 409,
+        code: "MBT_RATE_ACTIVE_CONFLICT",
+        message: "The active rate-card version changed. Refresh before activating this version."
+      });
+    }
   }
+  await query(
+    `UPDATE mbt_rate_cards
+        SET active = true,
+            revision = revision + 1,
+            updated_by = $2,
+            updated_at = $3
+      WHERE rate_card_id = $1 AND active = false`,
+    [before.rate_card_id, actor.operatorId, cutoverAt]
+  );
   const updated = await query(
     `UPDATE mbt_rate_card_versions
-        SET status = 'active', activated_at = now(), revision = revision + 1,
-            updated_by = $3, updated_at = now()
+        SET status = 'active', activated_at = $4, revision = revision + 1,
+            updated_by = $3, updated_at = $4
       WHERE rate_card_version_id = $1 AND revision = $2 AND status = 'draft'
       RETURNING revision::int`,
-    [before.rate_card_version_id, revision, actor.operatorId]
+    [before.rate_card_version_id, revision, actor.operatorId, cutoverAt]
   );
   if (!updated.rowCount) {
     throw new MbtError({ status: 409, code: "MBT_STALE_REVISION", message: "Rate-card activation lost an optimistic race." });
   }
-  return Number(updated.rows[0].revision);
+  return {
+    revision: Number(updated.rows[0].revision),
+    replacedRateCardVersionId: activeVersionId
+  };
 }
 
 /**
  * @param {object} input
  * @param {MbtActor} input.actor
  * @param {string} input.rateCardVersionId
+ * @param {unknown} [input.replacesRateCardVersionId]
  * @param {number} input.expectedRevision
  * @param {string} input.reason
  * @param {string} input.idempotencyKey
@@ -1145,6 +1271,11 @@ async function activateVersion(before, revision, actor) {
  * @param {string} input.requestId
  */
 export async function activateLocalRateCardVersion(input) {
+  const rateCardVersionId = normalizeRateCardVersionId(input.rateCardVersionId);
+  const replacesRateCardVersionId = optionalRateCardVersionId(input.replacesRateCardVersionId);
+  if (rateCardVersionId === replacesRateCardVersionId) {
+    return invalidInput("A rate-card version cannot replace itself.");
+  }
   const revision = expectedRevision(input.expectedRevision);
   const reason = auditReason(input.reason);
   await assertMasterDataCommand(input.actor);
@@ -1152,26 +1283,42 @@ export async function activateLocalRateCardVersion(input) {
     actor: input.actor,
     commandName: "mbt.rate_card.activate",
     idempotencyKey: input.idempotencyKey,
-    payload: { rateCardVersionId: input.rateCardVersionId, expectedRevision: revision, reason },
+    payload: { rateCardVersionId, replacesRateCardVersionId, expectedRevision: revision, reason },
     correlationId: input.correlationId,
     requestId: input.requestId,
     mutation: async () => {
-      const before = await lockedVersion(input.rateCardVersionId);
+      const before = await lockedVersion(rateCardVersionId);
       assertRevision(Number(before.revision), revision);
-      const nextRevision = await activateVersion(before, revision, input.actor);
-      const version = await publicVersion(input.rateCardVersionId);
+      const activated = await activateVersion(
+        before,
+        revision,
+        input.actor,
+        replacesRateCardVersionId
+      );
+      const version = await publicVersion(rateCardVersionId);
       return {
         status: 200,
-        body: { schemaVersion: "mbt-rate-card-v1", version },
+        body: {
+          schemaVersion: "mbt-rate-card-v1",
+          version,
+          replacedRateCardVersionId: activated.replacedRateCardVersionId
+        },
         audit: {
           action: "mbt.rate_card.activated",
           entityType: "mbt_rate_card_version",
-          entityId: input.rateCardVersionId,
-          beforeState: { status: before.status, revision },
-          afterState: { version },
+          entityId: rateCardVersionId,
+          beforeState: {
+            status: before.status,
+            revision,
+            replacesRateCardVersionId
+          },
+          afterState: {
+            version,
+            replacedRateCardVersionId: activated.replacedRateCardVersionId
+          },
           reason,
           revisionBefore: revision,
-          revisionAfter: nextRevision,
+          revisionAfter: activated.revision,
           source: "local"
         }
       };
@@ -1195,8 +1342,27 @@ async function insertCloneVersion(source, cloneId, versionNumber, actor) {
   );
 }
 
-/** @param {string} sourceId @param {string} cloneId */
-async function cloneChildren(sourceId, cloneId) {
+/** @param {string} sourceId @param {string} cloneId @param {MbtActor} actor */
+async function cloneChildren(sourceId, cloneId, actor) {
+  await query(
+    `INSERT INTO mbt_mbbs_rate_card_policies (
+       rate_card_version_id, schema_version, currency,
+       direct_pickup_unit_amount_minor, po_additional_drop_unit_amount_minor,
+       so_charge_basis, to_replenishment_charge_basis,
+       to_direct_pickup_charge_basis, po_charge_basis,
+       po_additional_drop_basis, dispatch_load_split_basis,
+       revision, created_by, updated_by
+     )
+     SELECT $2, schema_version, currency,
+            direct_pickup_unit_amount_minor, po_additional_drop_unit_amount_minor,
+            so_charge_basis, to_replenishment_charge_basis,
+            to_direct_pickup_charge_basis, po_charge_basis,
+            po_additional_drop_basis, dispatch_load_split_basis,
+            1, $3, $3
+       FROM mbt_mbbs_rate_card_policies
+      WHERE rate_card_version_id = $1`,
+    [sourceId, cloneId, actor.operatorId]
+  );
   const tables = [
     {
       table: "mbt_rate_distance_bands",
@@ -1261,7 +1427,7 @@ export async function cloneLocalRateCardVersion(input) {
       );
       const cloneId = crypto.randomUUID();
       await insertCloneVersion(source, cloneId, Number(next.rows[0].version_number), input.actor);
-      await cloneChildren(input.sourceRateCardVersionId, cloneId);
+      await cloneChildren(input.sourceRateCardVersionId, cloneId, input.actor);
       const version = await publicVersion(cloneId);
       return {
         status: 201,
@@ -1362,6 +1528,14 @@ function normalizeRateCardVersionId(value) {
   return id;
 }
 
+/** @param {unknown} value */
+function optionalRateCardVersionId(value) {
+  if (value === undefined || value === null || String(value).trim() === "") {
+    return null;
+  }
+  return normalizeRateCardVersionId(value);
+}
+
 /**
  * Named detail read model for the business-unit editor. It exposes only local
  * rate configuration, never customer financial history or external mappings.
@@ -1382,17 +1556,29 @@ export async function getLocalRateCardGraph(rawVersionId) {
             card.item_code AS "itemCode", card.active AS "cardActive",
             card.revision::int AS "cardRevision",
             card.description, card.customer_netsuite_id AS "customerNetSuiteId",
-            card.subsidiary_netsuite_id AS "subsidiaryNetSuiteId", card.currency
+            card.subsidiary_netsuite_id AS "subsidiaryNetSuiteId", card.currency,
+            policy.schema_version AS "policySchemaVersion",
+            policy.currency AS "policyCurrency",
+            policy.direct_pickup_unit_amount_minor AS "directPickupUnitAmountMinor",
+            policy.po_additional_drop_unit_amount_minor AS "poAdditionalDropUnitAmountMinor",
+            policy.so_charge_basis AS "soChargeBasis",
+            policy.to_replenishment_charge_basis AS "toReplenishmentChargeBasis",
+            policy.to_direct_pickup_charge_basis AS "toDirectPickupChargeBasis",
+            policy.po_charge_basis AS "poChargeBasis",
+            policy.po_additional_drop_basis AS "poAdditionalDropBasis",
+            policy.dispatch_load_split_basis AS "dispatchLoadSplitBasis"
        FROM mbt_rate_card_versions version
        JOIN mbt_rate_cards card USING (rate_card_id)
+       LEFT JOIN mbt_mbbs_rate_card_policies policy USING (rate_card_version_id)
       WHERE version.rate_card_version_id = $1`,
     [versionId]
   );
   if (!header.rowCount) {
     throw new MbtError({ status: 404, code: "MBT_RATE_CARD_NOT_FOUND", message: "Rate-card version not found." });
   }
-  const [bands, components, tariffs] = await Promise.all([
-    query(
+  // Transaction-scoped reads share one pg client. Keep them sequential so pg
+  // never receives overlapping client.query calls (which pg 9 will reject).
+  const bands = await query(
       `SELECT band.item_code AS "itemCode", band.service_code AS "serviceCode", bin.type_code AS "binTypeCode",
               band.sequence_number AS "sequenceNumber", band.minimum_metres AS "minimumMetres",
               band.maximum_metres AS "maximumMetres", band.amount_minor AS "amountMinor",
@@ -1403,8 +1589,8 @@ export async function getLocalRateCardGraph(rawVersionId) {
          LEFT JOIN mbt_bin_types bin ON bin.bin_type_id = band.bin_type_id
         WHERE band.rate_card_version_id = $1
         ORDER BY band.item_code NULLS FIRST, band.service_code, bin.type_code NULLS FIRST, band.sequence_number`, [versionId]
-    ),
-    query(
+  );
+  const components = await query(
       `SELECT component.item_code AS "itemCode", component.component_code AS "componentCode", component.component_kind AS "componentKind",
               component.service_code AS "serviceCode", bin.type_code AS "binTypeCode",
               component.rate_basis AS "rateBasis", component.amount_minor AS "amountMinor",
@@ -1415,8 +1601,8 @@ export async function getLocalRateCardGraph(rawVersionId) {
          LEFT JOIN mbt_bin_types bin ON bin.bin_type_id = component.bin_type_id
         WHERE component.rate_card_version_id = $1
         ORDER BY component.component_code`, [versionId]
-    ),
-    query(
+  );
+  const tariffs = await query(
       `SELECT tariff.item_code AS "itemCode", site.dump_site_code AS "dumpSiteCode",
               material.material_code AS "materialCode",
               tariff.tariff_code AS "tariffCode", tariff.pricing_basis AS "pricingBasis",
@@ -1427,8 +1613,7 @@ export async function getLocalRateCardGraph(rawVersionId) {
          LEFT JOIN mbt_materials material ON material.material_id = tariff.material_id
         WHERE tariff.rate_card_version_id = $1
         ORDER BY tariff.item_code NULLS FIRST, material.material_code NULLS FIRST, tariff.tariff_code`, [versionId]
-    )
-  ]);
+  );
   return {
     schemaVersion: "mbt-rate-card-detail-v1",
     version: header.rows[0],
@@ -1458,7 +1643,21 @@ export async function getLocalRateCardGraph(rawVersionId) {
       })),
       components: (/** @type {Array<Record<string, any>>} */ (components.rows)).map((row) => ({ ...row, amountMinor: row.amountMinor === null ? null : Number(row.amountMinor), percentageBasisPoints: row.percentageBasisPoints === null ? null : Number(row.percentageBasisPoints), defaultQuantity: Number(row.defaultQuantity) })),
       dumpTariffs: (/** @type {Array<Record<string, any>>} */ (tariffs.rows)).map((row) => ({ ...row, amountMinor: Number(row.amountMinor), minimumAmountMinor: Number(row.minimumAmountMinor) })),
-      depositRules: []
+      depositRules: [],
+      mbbsChargingPolicy: header.rows[0].policySchemaVersion === null
+        ? null
+        : normalizeMbbsRateCardPolicy({
+            schemaVersion: Number(header.rows[0].policySchemaVersion),
+            currency: String(header.rows[0].policyCurrency),
+            directPickupUnitAmountMinor: Number(header.rows[0].directPickupUnitAmountMinor),
+            poAdditionalDropUnitAmountMinor: Number(header.rows[0].poAdditionalDropUnitAmountMinor),
+            soChargeBasis: String(header.rows[0].soChargeBasis),
+            toReplenishmentChargeBasis: String(header.rows[0].toReplenishmentChargeBasis),
+            toDirectPickupChargeBasis: String(header.rows[0].toDirectPickupChargeBasis),
+            poChargeBasis: String(header.rows[0].poChargeBasis),
+            poAdditionalDropBasis: String(header.rows[0].poAdditionalDropBasis),
+            dispatchLoadSplitBasis: String(header.rows[0].dispatchLoadSplitBasis)
+          })
     }
   };
 }
@@ -1601,6 +1800,10 @@ export async function deleteLocalRateCard(input) {
         }
         const versionIds = versions.rows.map(
           (/** @type {Record<string, any>} */ row) => String(row.rate_card_version_id)
+        );
+        await query(
+          "DELETE FROM mbt_mbbs_rate_card_policies WHERE rate_card_version_id = ANY($1::uuid[])",
+          [versionIds]
         );
         for (const table of [
           "mbt_deposit_rules", "mbt_dump_tariffs", "mbt_rate_components", "mbt_rate_distance_bands"

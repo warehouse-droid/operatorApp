@@ -200,8 +200,11 @@ test("DP-05/DP-16 frontend: normal autosave uses the guarded fast acknowledgemen
 
 test("DP-16 startup: the compact plan is on the critical path but the full order feed and history are background work", () => {
   const init = functionBody("initDispatch");
-  assert.match(init, /const\s+orderFeedPromise\s*=\s*loadDispatchOrders\(/u);
   assert.match(init, /await\s+loadPlanForDate\(/u);
+  assert.ok(
+    init.indexOf("loadDispatchOrders(") > init.indexOf("await loadPlanForDate("),
+    "The global feed must begin only after the compact plan has rendered, so its expensive query cannot delay bootstrap."
+  );
   const criticalWait = /await\s+Promise\.all\(\[([\s\S]*?)\]\)/u.exec(init)?.[1] || "";
   assert.doesNotMatch(criticalWait, /loadDispatchOrders|loadPlanHistory/u);
   assert.match(init, /renderDispatchOrderPoolPatch\(|renderDispatchPlannerPatch\(/u);

@@ -1204,6 +1204,36 @@ body[data-mbt-surface="gates"] .mbt-shell {
   padding: 0 6px;
 }
 
+.mbt-charging-policy {
+  border-color: #7fa88c;
+  background: #f4faf6;
+}
+
+.mbt-policy-rules {
+  display: grid;
+  gap: 8px;
+  margin: 16px 0 0;
+}
+
+.mbt-policy-rules > div {
+  display: grid;
+  grid-template-columns: minmax(9rem, 0.35fr) minmax(0, 1fr);
+  gap: 12px;
+  border-top: 1px solid #cfdfd3;
+  padding-top: 8px;
+}
+
+.mbt-policy-rules dt {
+  color: #294c39;
+  font-weight: 800;
+}
+
+.mbt-policy-rules dd {
+  margin: 0;
+  color: #40564a;
+  line-height: 1.45;
+}
+
 .mbt-rate-band-list {
   display: grid;
   gap: 10px;

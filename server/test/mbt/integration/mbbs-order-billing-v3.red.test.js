@@ -20,7 +20,11 @@ async function inRollback(operation) {
   }
 }
 
-async function installRateGraph({ originYardCodes = ["2967"] } = {}) {
+async function installRateGraph({
+  originYardCodes = ["2967"],
+  directPickupUnitAmountMinor = 10_000,
+  poAdditionalDropUnitAmountMinor = 10_000
+} = {}) {
   const suffix = crypto.randomUUID().replaceAll("-", "");
   const rateCardId = crypto.randomUUID();
   const rateCardVersionId = crypto.randomUUID();
@@ -64,6 +68,15 @@ async function installRateGraph({ originYardCodes = ["2967"] } = {}) {
     [bandIds[0], bandIds[1], rateCardVersionId, originYardCodes]
   );
   await query(
+    `UPDATE mbt_mbbs_rate_card_policies
+        SET direct_pickup_unit_amount_minor = $2,
+            po_additional_drop_unit_amount_minor = $3,
+            updated_by = 'mbbs-v3-test', updated_at = now(),
+            revision = revision + 1
+      WHERE rate_card_version_id = $1`,
+    [rateCardVersionId, directPickupUnitAmountMinor, poAdditionalDropUnitAmountMinor]
+  );
+  await query(
     `UPDATE mbt_rate_card_versions
         SET status = 'active', effective_from = now(), activated_at = now(),
             revision = revision + 1, updated_at = now()
@@ -93,6 +106,200 @@ async function insertCustomer({ id, suffix }) {
     [id, `V3-${suffix}`, `V3 billing customer ${suffix}`, `v3-${suffix}`, "a".repeat(64)]
   );
 }
+
+test("version-selected direct-TO and PO-drop prices survive preview and conversion as durable evidence", async () => {
+  await inRollback(async () => {
+    const directPrice = 12_345;
+    const poDropPrice = 4_567;
+    const { rateCardVersionId } = await installRateGraph({
+      originYardCodes: ["2967", "3445"],
+      directPickupUnitAmountMinor: directPrice,
+      poAdditionalDropUnitAmountMinor: poDropPrice
+    });
+    const suffix = crypto.randomUUID().replaceAll("-", "").toUpperCase();
+    const base = 9_905_000_000 + (crypto.randomInt(10_000) * 10);
+    const customerId = base + 9;
+    const transferRef = `TO-V3-POLICY-${suffix}`;
+    const purchaseRef = `PO-V3-POLICY-${suffix}`;
+    const vendorYard = `Policy Vendor ${suffix}`;
+    const vendorAddress = "2977 Cedar Creek Road, Ayr, ON N0B 1E0";
+    await insertCustomer({ id: customerId, suffix });
+    await query(
+      `INSERT INTO transfer_orders (
+         netsuite_id, tranid, from_location_id, from_location,
+         to_location_id, to_location, dispatch_address,
+         fulfillment_status, netsuite_active, synced_at
+       ) VALUES ($1, $2, 1, '2967', 5, '150', $3, 'fulfilled', true, now())`,
+      [base + 1, transferRef, "150 Clark Boulevard, Brampton, ON"]
+    );
+    await query(
+      `INSERT INTO dispatch_vendor_yards (vendor, yard, aliases, address, active)
+       VALUES ($1, $1, '', $2, true)`,
+      [vendorYard, vendorAddress]
+    );
+    await query(
+      `INSERT INTO purchase_orders (
+         netsuite_id, tranid, dispatch_ref, vendor, dispatch_vendor_yard,
+         destination_location_id, destination_location, receipt_status,
+         netsuite_active, synced_at
+       ) VALUES ($1, $2, $2, $3, $3, 15, '12441', 'received', true, now())`,
+      [base + 2, purchaseRef, vendorYard]
+    );
+
+    const records = [
+      {
+        jobId: `DIRECT-PICK-${suffix}`,
+        loadId: `DIRECT-LOAD-${suffix}`,
+        stopId: "DIRECT-PICK",
+        stopType: "pickup",
+        refs: [transferRef],
+        address: "2967 Kennedy Road, Toronto, ON",
+        orders: [{ orderRef: transferRef, orderType: "TRANSFER_ORDER", source: "direct_dependency" }],
+        minute: 0
+      },
+      {
+        jobId: `DIRECT-DROP-${suffix}`,
+        loadId: `DIRECT-LOAD-${suffix}`,
+        stopId: "DIRECT-DROP",
+        stopType: "dropoff",
+        refs: [transferRef],
+        address: "150 Clark Boulevard, Brampton, ON",
+        orders: [{ orderRef: transferRef, orderType: "TRANSFER_ORDER", source: "direct_dependency" }],
+        minute: 10
+      },
+      {
+        jobId: `PO-PICK-${suffix}`,
+        loadId: `PO-LOAD-${suffix}`,
+        stopId: "PO-PICK",
+        stopType: "pickup",
+        refs: [purchaseRef],
+        address: vendorAddress,
+        orders: [{ orderRef: purchaseRef, orderType: "PURCHASE_ORDER", source: "receiving" }],
+        minute: 20
+      },
+      {
+        jobId: `PO-DROP-1-${suffix}`,
+        loadId: `PO-LOAD-${suffix}`,
+        stopId: "PO-DROP-1",
+        stopType: "dropoff",
+        refs: [purchaseRef],
+        address: "150 Clark Boulevard, Brampton, ON",
+        orders: [{ orderRef: purchaseRef, orderType: "PURCHASE_ORDER", source: "receiving" }],
+        minute: 30
+      },
+      {
+        jobId: `PO-DROP-2-${suffix}`,
+        loadId: `PO-LOAD-${suffix}`,
+        stopId: "PO-DROP-2",
+        stopType: "dropoff",
+        refs: [purchaseRef],
+        address: "12441 Woodbine Avenue, Gormley, ON",
+        orders: [{ orderRef: purchaseRef, orderType: "PURCHASE_ORDER", source: "receiving" }],
+        minute: 40
+      }
+    ];
+    for (const row of records) {
+      await query(
+        `INSERT INTO driver_job_records (
+           job_id, plan_date, driver_login, truck_id, load_id, load_name,
+           stop_id, stop_type, order_refs, status, started_at, completed_at, job_details
+         ) VALUES (
+           $1, '2039-05-10', 'policy-driver', '101', $2, 'Policy load',
+           $3, $4, $5::jsonb, 'complete',
+           ('2039-05-10T14:00:00Z'::timestamptz + ($6 * interval '1 minute')),
+           ('2039-05-10T14:05:00Z'::timestamptz + ($6 * interval '1 minute')),
+           $7::jsonb
+         )`,
+        [
+          row.jobId,
+          row.loadId,
+          row.stopId,
+          row.stopType,
+          JSON.stringify(row.refs),
+          row.minute,
+          JSON.stringify({ address: row.address, orders: row.orders, physicalVisitStopIds: [row.stopId] })
+        ]
+      );
+    }
+
+    const listed = await candidates.listMbbsBillingCandidates({
+      actor: ACTOR,
+      completedDate: "2039-05-10",
+      search: suffix,
+      limit: 100
+    });
+    const direct = listed.items.find((item) => item.references[0]?.rootReference === transferRef);
+    const purchase = listed.items.find((item) => item.references[0]?.rootReference === purchaseRef);
+    assert.ok(direct);
+    assert.ok(purchase);
+    assert.equal(direct.billingRule, "to_direct_additional_drop");
+    assert.equal(purchase.billingRule, "po_shared_leg");
+    assert.equal(purchase.dropCount, 2);
+
+    const dependencies = {
+      async resolveDistance(input) {
+        return {
+          provider: "mbbs-policy-test",
+          providerMetres: 12_000,
+          routeHash: crypto.createHash("sha256").update(JSON.stringify(input)).digest("hex"),
+          originSnapshot: { address: input.originAddressText || input.originYardCode },
+          destinationSnapshot: { address: input.destinationAddressText },
+          routeSnapshot: { policyTest: true }
+        };
+      }
+    };
+    const preview = await candidates.previewMbbsBillingCandidatesBatch({
+      actor: ACTOR,
+      candidateIds: [direct.candidateId, purchase.candidateId],
+      completedMonth: "2039-05",
+      completedDate: "2039-05-10",
+      rateCardVersionId
+    }, dependencies);
+    const directPreview = preview.results.find((entry) =>
+      entry.candidate?.references[0]?.rootReference === transferRef
+    );
+    const poPreview = preview.results.find((entry) =>
+      entry.candidate?.references[0]?.rootReference === purchaseRef
+    );
+    assert.equal(directPreview?.status, "calculated");
+    assert.equal(directPreview?.charge.amountMinor, directPrice);
+    assert.equal(directPreview?.calculationBreakdown.distanceBandAmountMinor, 0);
+    assert.equal(directPreview?.calculationBreakdown.additionalDropUnitAmountMinor, directPrice);
+    assert.equal(poPreview?.status, "calculated");
+    assert.equal(poPreview?.charge.amountMinor, 20_000 + poDropPrice);
+    assert.equal(poPreview?.calculationBreakdown.additionalDropCount, 1);
+    assert.equal(poPreview?.calculationBreakdown.additionalDropUnitAmountMinor, poDropPrice);
+
+    const created = await candidates.createMbbsBillingCasesFromCandidates({
+      actor: ACTOR,
+      candidateIds: [direct.candidateId, purchase.candidateId],
+      completedMonth: "2039-05",
+      completedDate: "2039-05-10",
+      rateCardVersionId,
+      customerNetsuiteId: String(customerId),
+      reason: "Persist version-selected policy prices",
+      idempotencyKey: `mbbs-policy-create-${suffix}`,
+      correlationId: `mbbs-policy-correlation-${suffix}`,
+      requestId: `mbbs-policy-request-${suffix}`
+    }, dependencies);
+    assert.equal(created.body.durableCaseCount, 2);
+    const durable = await query(
+      `SELECT root_reference, allocated_amount_minor::int AS amount,
+              source_snapshot->'billingEvidence' AS evidence
+         FROM mbt_cross_charge_cases
+        WHERE root_reference = ANY($1::text[])
+        ORDER BY root_reference`,
+      [[transferRef, purchaseRef]]
+    );
+    const byReference = new Map(durable.rows.map((row) => [row.root_reference, row]));
+    assert.equal(byReference.get(transferRef).amount, directPrice);
+    assert.equal(byReference.get(transferRef).evidence.additionalDropUnitAmountMinor, directPrice);
+    assert.equal(byReference.get(transferRef).evidence.mbbsChargingPolicy.directPickupUnitAmountMinor, directPrice);
+    assert.equal(byReference.get(purchaseRef).amount, 20_000 + poDropPrice);
+    assert.equal(byReference.get(purchaseRef).evidence.additionalDropUnitAmountMinor, poDropPrice);
+    assert.equal(byReference.get(purchaseRef).evidence.mbbsChargingPolicy.poAdditionalDropUnitAmountMinor, poDropPrice);
+  });
+});
 
 test("S2/S3: a completed PO calculates vendor-to-MBBS from two retained addresses without origin-scope rejection", async () => {
   await inRollback(async () => {

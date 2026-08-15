@@ -69,7 +69,19 @@ try {
   assert.match(monitorClientSource, /function monitorOrderPlanTime\(order = \{\}\)/, "The monitor should render one moving plan range.");
   assert.match(monitorClientSource, /<b>Plan<\/b>/, "The moving target should be labelled Plan.");
   assert.doesNotMatch(monitorClientSource, /<b>Forecast<\/b>/, "Forecast must not render as a second target.");
-  assert.match(monitorClientSource, /actualTime === "--" \? ""/, "Untouched orders must not render an empty Actual value.");
+  assert.match(monitorClientSource, /function monitorOrderActualTime\(order = \{\}\)/, "The order card must own explicit actual-time rules.");
+  assert.match(monitorClientSource, /if \(order\.status !== "complete"\) return "";/, "In-progress and untouched orders must not render Actual time.");
+  assert.match(monitorClientSource, /formatActualTime\(order\.actualEnd\)/, "A completed order must render only its completion time.");
+  assert.doesNotMatch(monitorClientSource, /monitorTimeRange\(order\.actualStart/, "The order card must not render an actual start-to-end range.");
+  const actualTimeFunctionSource = monitorClientSource.match(/function monitorOrderActualTime\(order = \{\}\) \{[\s\S]*?\n\}/)?.[0];
+  assert.ok(actualTimeFunctionSource, "The actual-time formatter must be executable in the frontend contract.");
+  const actualTimeFor = Function(
+    "formatActualTime",
+    `"use strict"; ${actualTimeFunctionSource}; return monitorOrderActualTime;`
+  )((value) => value ? "10:57" : "--");
+  assert.equal(actualTimeFor({ status: "in_progress", actualEnd: "completed-at" }), "", "An in-progress card must suppress Actual even if stale completion data is present.");
+  assert.equal(actualTimeFor({ status: "complete", actualStart: "started-at", actualEnd: "completed-at" }), "10:57", "A completed card must show only the ending time.");
+  assert.equal(actualTimeFor({ status: "complete", actualEnd: "" }), "", "A completed card without completion evidence must not show a placeholder Actual time.");
 
   const staleLinePlan = structuredClone(plan);
   staleLinePlan.trucks[0].loads[0].stops[1].lineRowIds = [999999];
@@ -209,7 +221,7 @@ try {
   assert.match(monitorClientSource, /let monitorInfoWindowPlate = "";/, "The open map bubble needs its own stable truck identity.");
   assert.match(monitorClientSource, /if \(monitorInfoWindowPlate && monitorInfoWindow\)/, "An ETA refresh must update the actually open truck bubble, not a previously selected truck.");
   assert.match(monitorClientSource, /const renderGeneration = \+\+monitorMapRenderGeneration;/, "Overlapping map refreshes must discard stale marker renders.");
-  assert.match(monitorHtmlSource, /dispatch-monitor\.js\?v=20260812-truck-bubble-v2/, "The truck-bubble repair must not be hidden by an old browser cache.");
+  assert.match(monitorHtmlSource, /dispatch-monitor\.js\?v=20260814-order-actual-v3/, "The order actual-time repair must not be hidden by an old browser cache.");
 
   console.log("Dispatch monitor planned-order checks passed.");
 } finally {

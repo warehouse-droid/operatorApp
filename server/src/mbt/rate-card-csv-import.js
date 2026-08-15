@@ -6,6 +6,10 @@ import { parseBoundedCsv } from "./bounded-csv.js";
 import { canonicalSha256 } from "./canonical-json.js";
 import { MbtError } from "./errors.js";
 import { normalizeLocalRateCardGraph } from "./rate-card-configuration-service.js";
+import {
+  DEFAULT_MBBS_RATE_CARD_POLICY,
+  isMbbsCrossChargeGraph
+} from "./mbbs-rate-card-policy.js";
 
 /** @typedef {"rate_cards" | "distance_bands" | "components" | "dump_tariffs" | "deposit_rules"} RateCardFileKey */
 
@@ -368,7 +372,7 @@ export async function parseRateCardCsvBundle(filesValue, options = {}) {
     parsed.rate_cards.rows[0]
   );
   const header = cardRow(headerSource);
-  const graph = normalizeLocalRateCardGraph({
+  const rawGraph = /** @type {Record<string, any>} */ ({
     ...header,
     distanceBands: sortRows(parsed.distance_bands.rows.map(bandRow), (row) => (
       `${row.serviceCode}\u0000${row.binTypeCode || ""}\u0000${String(row.minimumMetres).padStart(16, "0")}\u0000${String(row.sequenceNumber).padStart(16, "0")}`
@@ -378,7 +382,11 @@ export async function parseRateCardCsvBundle(filesValue, options = {}) {
       `${row.dumpSiteCode}\u0000${row.materialCode || ""}\u0000${row.tariffCode}`
     )),
     depositRules: sortRows(parsed.deposit_rules.rows.map(depositRow), (row) => row.ruleCode)
-  }, { sourceKind: "csv" });
+  });
+  if (isMbbsCrossChargeGraph(rawGraph)) {
+    rawGraph.mbbsChargingPolicy = { ...DEFAULT_MBBS_RATE_CARD_POLICY };
+  }
+  const graph = normalizeLocalRateCardGraph(rawGraph, { sourceKind: "csv" });
   const fileEvidence = FILE_ORDER.map((key) => ({
     key,
     fileName: FILE_NAMES[key],

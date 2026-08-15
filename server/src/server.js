@@ -49,6 +49,8 @@ import {
   listBilledSalesOrderFamilyRefs
 } from "./sales-order-reconciliation-repository.js";
 import { isNetSuiteSalesOrderBilled } from "./sales-order-reconciliation.js";
+import { assertNoClosedNetSuiteOrders } from "./netsuite-closed-order-repository.js";
+import { operationalPlanOrderRefs } from "./netsuite-closed-order-policy.js";
 import { isNetSuiteOperationalWorkActive } from "./netsuite-operational-work.js";
 import { getScmSchedulePreference, normalizeScmSchedulePreferenceSurface, updateScmSchedulePreference } from "./scm-schedule-preference-repository.js";
 import { getScmScheduleFormatting, updateScmScheduleFormatting } from "./scm-schedule-formatting-repository.js";
@@ -69,6 +71,7 @@ import {
   createReloadCycle,
   findLocalSalesOrderIdentity,
   findReloadCycleByRequestId,
+  getSalesOrderReattemptAuthorizationPreview,
   lockReloadAuthorizationSnapshot,
   lockReloadCycle
 } from "./sales-order-reload-repository.js";
@@ -604,6 +607,10 @@ async function assertNewHistoricalInactiveSalesOrdersReconciled(previousPlan = {
 }
 
 async function assertNewDispatchOrdersCanBePlanned(previousPlan = {}, nextPlan = {}, action = "plan these orders") {
+  await assertNoClosedNetSuiteOrders(
+    operationalPlanOrderRefs(nextPlan),
+    `remain in Dispatch when you ${action}`
+  );
   await assertNoNewDriverPwaCompletedDispatchOrders(previousPlan, nextPlan, action);
   return assertNewHistoricalInactiveSalesOrdersReconciled(previousPlan, nextPlan, action);
 }
@@ -1041,7 +1048,7 @@ async function dispatchCustomOrdersForManagement({ includeCancelled = true, sear
     const activity = activityByRef.get(String(order.refNumber || "").trim().toLowerCase()) || null;
     const completed = order.status === "completed" || Boolean(activity?.completed_dropoff);
     const planned = Boolean(assignment);
-    const locked = order.status !== "open" || planned || Boolean(activity?.has_activity);
+    const locked = order.systemManaged || order.status !== "open" || planned || Boolean(activity?.has_activity);
     const status = order.status === "cancelled"
       ? "cancelled"
       : completed
@@ -1049,7 +1056,9 @@ async function dispatchCustomOrdersForManagement({ includeCancelled = true, sear
         : planned || activity?.has_activity
           ? "planned"
           : "open";
-    const lockedReason = order.status === "cancelled"
+    const lockedReason = order.systemManaged
+      ? "Sales Order re-attempt children are system-managed through Control and cannot be edited as Custom Orders."
+      : order.status === "cancelled"
       ? "Cancelled Custom Orders are read-only."
       : completed
         ? "This Custom Order has been delivered and is read-only."
@@ -1081,6 +1090,11 @@ async function dispatchCustomOrdersForManagement({ includeCancelled = true, sear
 
 async function assertDispatchCustomOrderMutable(order) {
   if (!order) return;
+  if (order.systemManaged || order.orderKind === "sales_order_reattempt") {
+    throw Object.assign(new Error(
+      "Sales Order re-attempt children are system-managed through Control and cannot be edited as Custom Orders."
+    ), { status: 409, code: "DISPATCH_CUSTOM_ORDER_SYSTEM_MANAGED" });
+  }
   if (order.status !== "open") {
     throw Object.assign(new Error(
       order.status === "completed"
@@ -3704,6 +3718,10 @@ async function startDriverPhysicalVisitJobs(driverLogin, job, routeJobs = [], {
   occurredAt = null,
   offlineTrace = null
 } = {}) {
+  await assertNoClosedNetSuiteOrders(
+    driverPhysicalVisitOrderRefs(job, routeJobs),
+    "start Driver work"
+  );
   const jobs = driverPhysicalVisitExecutionJobs(job, routeJobs);
   const records = await withTransaction(async () => {
     const completedResult = await query(
@@ -3775,6 +3793,10 @@ async function completeDriverJobOperationalEffects({
   driverRemark = undefined
 } = {}) {
   if (!job?.jobId) throw new Error("Driver job is no longer available.");
+  await assertNoClosedNetSuiteOrders(
+    driverPhysicalVisitOrderRefs(job, routeJobs),
+    "be completed by Driver"
+  );
   const physicalVisitJobs = driverPhysicalVisitExecutionJobs(job, routeJobs);
   const yardDependencyMode = await getDriverYardDependencyMode();
   const completion = await withTransaction(async () => {
@@ -11025,7 +11047,7 @@ function dispatchPrivateNoStore(res) {
   res.setHeader("Pragma", "no-cache");
 }
 
-app.get("/api/dispatch/v2/bootstrap", requireOperator, requireDispatcher, async (req, res, next) => {
+app.get("/api/dispatch/v2/bootstrap", async (req, res, next) => {
   try {
     dispatchPrivateNoStore(res);
     res.json(await getDispatchV2Bootstrap({
@@ -11037,7 +11059,7 @@ app.get("/api/dispatch/v2/bootstrap", requireOperator, requireDispatcher, async 
   }
 });
 
-app.get("/api/dispatch/v2/order-feed/:id", requireOperator, requireDispatcher, async (req, res, next) => {
+app.get("/api/dispatch/v2/order-feed/:id", async (req, res, next) => {
   try {
     dispatchPrivateNoStore(res);
     const order = (await targetedDispatchMutationOrders([req.params.id]))[0] || null;
@@ -11098,6 +11120,7 @@ async function prepareDispatchV2ReplaceCommand(previousPlan = {}, command = {}) 
     trucks: cleanTrucks
   };
 
+  await assertNewDispatchOrdersCanBePlanned(previousPlan, candidate, "save this plan");
   const changedScmRefs = changedDispatchScmRefs(previousPlan, candidate);
   await assertScmReconciliationOrderEditable({ orderRefs: changedScmRefs });
   await assertNoRestrictedScmDispatchOrders(
@@ -11204,6 +11227,12 @@ app.post("/api/dispatch/v2/plans/:id/commands", requireOperator, requireDispatch
       return res.json(stored.payload);
     }
     const submittedCommandType = String(submittedCommand.commandType || submittedCommand.type || "");
+    await assertNoClosedNetSuiteOrders([
+      submittedCommand.payload?.orderRef,
+      submittedCommand.payload?.sourceOrderRef,
+      ...(Array.isArray(submittedCommand.payload?.orderRefs) ? submittedCommand.payload.orderRefs : []),
+      ...(Array.isArray(submittedCommand.payload?.stop?.orderRefs) ? submittedCommand.payload.stop.orderRefs : [])
+    ], "be changed in Dispatch");
     if (submittedCommandType === "assign_order") {
       await assertNoRestrictedScmDispatchOrders(
         [submittedCommand.payload?.orderRef],
@@ -16697,7 +16726,8 @@ app.get("/api/dispatch/driver-job-statuses", async (req, res, next) => {
   try {
     res.json(await listDriverJobStatuses({
       planId: req.query.planId || null,
-      planDate: req.query.planDate || null
+      planDate: req.query.planDate || null,
+      includeClosed: false
     }));
   } catch (error) {
     next(error);
@@ -18321,12 +18351,26 @@ app.post("/api/control/order-locks/release", requireOperator, requireControlAcce
   }
 });
 
+app.get("/api/control/sales-orders/:orderId/reload-preview", requireOperator, requireControlAccess, async (req, res, next) => {
+  try {
+    const identity = await findLocalSalesOrderIdentity(req.params.orderId);
+    if (!identity) return res.status(404).json({ error: "Sales Order was not found locally." });
+    assertSalesOrderReloadControlYard(req.operator, identity.outboundLocationId);
+    await refreshSalesOrderForReload({ orderRef: identity.tranid, actor: req.operator });
+    res.json({ preview: await getSalesOrderReattemptAuthorizationPreview(req.params.orderId) });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/control/sales-orders/:orderId/reload-cycles", requireOperator, requireControlAccess, async (req, res, next) => {
   try {
     const cycle = await authorizeSalesOrderReload({
       orderId: req.params.orderId,
       requestId: req.body?.requestId,
       reason: req.body?.reason,
+      sourceLoadRecordId: req.body?.sourceLoadRecordId,
+      lineSelections: req.body?.lineSelections,
       actor: req.operator
     }, salesOrderReloadAuthorizationDependencies);
     emitAppEvent("delivery.order.updated", {
@@ -18339,6 +18383,15 @@ app.post("/api/control/sales-orders/:orderId/reload-cycles", requireOperator, re
       reloadCycleId: cycle.id,
       source: "control-reload-authorized"
     });
+    if (cycle.workflowKind === "sales_order_reattempt") {
+      emitAppEvent("dispatch.orders.updated", {
+        source: "sales-order-reattempt",
+        change: "sales_order_reattempt_created",
+        orderId: cycle.reattemptOrderRef,
+        parentOrderId: cycle.orderRef,
+        refreshOrderPool: true
+      });
+    }
     res.json({ cycle });
   } catch (error) {
     next(error);
@@ -18366,6 +18419,15 @@ app.post("/api/control/sales-orders/:orderId/reload-cycles/:cycleId/cancel", req
       reloadCycleId: cycle.id,
       source: "control-reload-cancelled"
     });
+    if (cycle.workflowKind === "sales_order_reattempt") {
+      emitAppEvent("dispatch.orders.updated", {
+        source: "sales-order-reattempt",
+        change: "sales_order_reattempt_cancelled",
+        orderId: cycle.reattemptOrderRef,
+        parentOrderId: cycle.orderRef,
+        refreshOrderPool: true
+      });
+    }
     res.json({ cycle });
   } catch (error) {
     next(error);

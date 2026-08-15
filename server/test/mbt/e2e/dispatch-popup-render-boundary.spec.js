@@ -537,9 +537,17 @@ test("DP-17/DP-19 browser: compact Custom Order startup keeps completed travel s
   const root = page.locator("[data-dispatch-planner-root]");
   const rootHandle = await root.elementHandle();
   const pickupTiming = page.locator('[data-stop="dp-travel-pick"] .stop-time');
-  const pickupTimingText = () => pickupTiming.evaluate((element) => element.innerText.replace(/\s+/g, " ").trim());
-  const pickupTimingBeforeMutation = await pickupTimingText();
-  expect(pickupTimingBeforeMutation).toContain("Actual");
+  // Compare the timing grid by semantic cells. Browser innerText inserts a
+  // separator between CSS-grid cells only after the stylesheet settles, even
+  // though the four cell values and visible layout are unchanged.
+  const pickupTimingCellLocator = pickupTiming.locator(".time-compare > span");
+  const pickupTimingCells = () => pickupTimingCellLocator.evaluateAll((elements) =>
+    elements.map((element) => element.textContent.replace(/\s+/g, " ").trim())
+  );
+  await expect(pickupTimingCellLocator).toHaveCount(4);
+  await expect(pickupTimingCellLocator.first()).toHaveText("Actual");
+  const pickupTimingBeforeMutation = await pickupTimingCells();
+  expect(pickupTimingBeforeMutation.join(" ")).toContain("Actual");
   const travel = page.locator('[data-travel-leg="dp-travel-pick-to-dp-travel-drop"]');
   await expect(travel).toHaveClass(/inter-stop-travel.*status-complete/);
   const style = await travel.evaluate((element) => {
@@ -565,7 +573,7 @@ test("DP-17/DP-19 browser: compact Custom Order startup keeps completed travel s
     .flatMap((truck) => truck.loads || [])
     .find((load) => load.id === "dp-nested-load");
   expect(nestedSavedLoad.stops.find((stop) => stop.id === "dp-nested-pick")?.orderId).toBe(nestedChild.id);
-  await expect.poll(pickupTimingText).toBe(pickupTimingBeforeMutation);
+  await expect.poll(pickupTimingCells).toEqual(pickupTimingBeforeMutation);
   await expect(travel).toHaveClass(/inter-stop-travel.*status-complete/);
   expect(await rootHandle.evaluate((element) => element === globalThis.document.querySelector("[data-dispatch-planner-root]"))).toBe(true);
 });

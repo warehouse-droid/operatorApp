@@ -801,12 +801,10 @@ function monitorOrderStatusLabel(status) {
   return "Planned";
 }
 
-function monitorTimeRange(start, end, formatter) {
-  const startText = formatter(start);
-  const endText = formatter(end);
-  if (startText === "--" && endText === "--") return "--";
-  if (endText === "--" || startText === endText) return startText;
-  return `${startText}–${endText}`;
+function monitorOrderActualTime(order = {}) {
+  if (order.status !== "complete") return "";
+  const completedTime = formatActualTime(order.actualEnd);
+  return completedTime === "--" ? "" : completedTime;
 }
 
 function monitorOrderPlanTime(order = {}) {
@@ -827,8 +825,8 @@ function renderMonitorOrderList() {
   if (!visible.length) return `<div class="monitor-empty">${monitorOrderSearch.trim() ? "No planned orders match this search." : "No orders are assigned to today's trucks."}</div>`;
   return visible.map((order) => {
     const planTime = monitorOrderPlanTime(order);
-    const actualTime = monitorTimeRange(order.actualStart, order.actualEnd, formatActualTime);
-    const actualTimeMarkup = actualTime === "--" ? "" : `<span><b>Actual</b> ${escapeHtml(actualTime)}</span>`;
+    const actualTime = monitorOrderActualTime(order);
+    const actualTimeMarkup = actualTime ? `<span><b>Actual</b> ${escapeHtml(actualTime)}</span>` : "";
     return `
       <article class="monitor-order-card status-${escapeHtml(order.status || "pending")} ${String(order.key) === String(selectedMonitorOrderKey) ? "selected" : ""}" role="button" tabindex="0" data-monitor-order-key="${escapeHtml(order.key)}" data-monitor-order-truck="${escapeHtml(order.truckPlate || order.vehiclePlate || "")}">
         <div class="monitor-order-head">

@@ -12,6 +12,7 @@ import {
   planDriverBillingUnits,
   resolveManualBillingAmount
 } from "./mbbs-driver-billing-planner.js";
+import { requireMbbsRateCardPolicy } from "./mbbs-rate-card-policy.js";
 import { persistCalculatedMbbsCandidateBatch } from "./shadow-billing-service.js";
 import { selectRateBand } from "./rate-bands.js";
 
@@ -921,10 +922,18 @@ async function activeMbbsRateGraphs() {
             band.item_code, band.service_code, band.sequence_number::int,
             band.minimum_metres::int, band.maximum_metres::int,
             band.amount_minor::int, band.pricing_basis, band.boundary_rule,
-            band.origin_yard_codes
+            band.origin_yard_codes,
+            policy.schema_version AS policy_schema_version,
+            policy.currency AS policy_currency,
+            policy.direct_pickup_unit_amount_minor,
+            policy.po_additional_drop_unit_amount_minor,
+            policy.so_charge_basis, policy.to_replenishment_charge_basis,
+            policy.to_direct_pickup_charge_basis, policy.po_charge_basis,
+            policy.po_additional_drop_basis, policy.dispatch_load_split_basis
        FROM mbt_rate_cards card
        JOIN mbt_rate_card_versions version USING (rate_card_id)
        JOIN mbt_rate_distance_bands band USING (rate_card_version_id)
+       JOIN mbt_mbbs_rate_card_policies policy USING (rate_card_version_id)
       WHERE card.active
         AND version.status = 'active'
         AND version.effective_from <= now()
@@ -966,6 +975,18 @@ async function activeMbbsRateGraphs() {
     })));
     // selectRateBand performs complete contiguous/open-band validation.
     selectRateBand(bands, 0);
+    const mbbsChargingPolicy = requireMbbsRateCardPolicy({
+      schemaVersion: Number(first.policy_schema_version),
+      currency: text(first.policy_currency),
+      directPickupUnitAmountMinor: Number(first.direct_pickup_unit_amount_minor),
+      poAdditionalDropUnitAmountMinor: Number(first.po_additional_drop_unit_amount_minor),
+      soChargeBasis: text(first.so_charge_basis),
+      toReplenishmentChargeBasis: text(first.to_replenishment_charge_basis),
+      toDirectPickupChargeBasis: text(first.to_direct_pickup_charge_basis),
+      poChargeBasis: text(first.po_charge_basis),
+      poAdditionalDropBasis: text(first.po_additional_drop_basis),
+      dispatchLoadSplitBasis: text(first.dispatch_load_split_basis)
+    });
     return {
       rateCardId: text(first.rate_card_id),
       rateCardCode: text(first.rate_card_code),
@@ -979,6 +1000,7 @@ async function activeMbbsRateGraphs() {
       effectiveTo: first.effective_to === null ? null : new Date(first.effective_to).toISOString(),
       currency,
       bands,
+      mbbsChargingPolicy,
       originYardCodes: new Set(bands.flatMap((band) => band.originYardCodes))
     };
   });
@@ -995,7 +1017,8 @@ function rateOptions(graphs) {
     versionNumber: graph.versionNumber,
     effectiveFrom: graph.effectiveFrom,
     effectiveTo: graph.effectiveTo,
-    currency: graph.currency
+    currency: graph.currency,
+    mbbsChargingPolicy: graph.mbbsChargingPolicy
   }));
 }
 
@@ -1922,9 +1945,11 @@ async function completedCustomOrderRows(limit, completedMonthValue, completedDat
   const result = await query(
     `SELECT id::text, ref_number, pickup_location, dropoff_location,
             order_details, completed_at
-       FROM dispatch_custom_orders
+      FROM dispatch_custom_orders
       WHERE status = 'completed'
         AND completed_at IS NOT NULL
+        AND order_kind <> 'sales_order_reattempt'
+        AND billing_disposition <> 'linked_parent_no_charge'
         AND ($2::text IS NULL OR (
           (completed_at AT TIME ZONE '${TORONTO_TIME_ZONE}') >= (($2 || '-01')::date)::timestamp
           AND (completed_at AT TIME ZONE '${TORONTO_TIME_ZONE}') < ((($2 || '-01')::date + interval '1 month')::timestamp)
@@ -1939,6 +1964,32 @@ async function completedCustomOrderRows(limit, completedMonthValue, completedDat
     [limit, completedMonthValue, completedDateValue, searchValue, recordIds]
   );
   return result.rows;
+}
+
+/**
+ * A completed Sales Order re-attempt remains Dispatch completion evidence, but
+ * its transport charge belongs to the original parent order. Keep one durable
+ * exclusion set in front of every candidate source (Driver, universal
+ * completion, and Custom Order) so a source-classification difference cannot
+ * accidentally create a second bill.
+ */
+async function linkedSalesOrderReattemptReferences() {
+  const result = await query(
+    `SELECT upper(btrim(ref_number)) AS ref_number
+       FROM dispatch_custom_orders
+      WHERE order_kind = 'sales_order_reattempt'
+         OR billing_disposition = 'linked_parent_no_charge'`
+  );
+  return new Set(result.rows
+    .map((/** @type {Record<string, any>} */ row) => text(row.ref_number).toUpperCase())
+    .filter(Boolean));
+}
+
+/** @param {Record<string, any>} candidate @param {Set<string>} excludedReferences */
+function isLinkedSalesOrderReattemptCandidate(candidate, excludedReferences) {
+  return [...array(candidate.references), ...array(candidate.memberReferences)]
+    .map((reference) => text(object(reference).rootReference).toUpperCase())
+    .some((reference) => excludedReferences.has(reference));
 }
 
 /** @param {string[]} candidateIds */
@@ -2240,6 +2291,7 @@ async function internalCandidates(
     searchValue,
     selection.customOrder
   );
+  const excludedReattemptReferences = await linkedSalesOrderReattemptReferences();
   const plannedDriverCandidates = await driverCandidates(driver, yards);
   const plannedDirectDependencyCandidates = directDependencies.map((/** @type {Record<string, any>} */ row) =>
     directDependencyCandidate(row, yards)
@@ -2303,8 +2355,16 @@ async function internalCandidates(
       );
     })
   );
-  let items = [...specificItems, ...uncoveredUniversalItems];
+  let items = [...specificItems, ...uncoveredUniversalItems].filter((candidate) => (
+    !isLinkedSalesOrderReattemptCandidate(candidate, excludedReattemptReferences)
+  ));
   items = await canonicallyCompletedCandidates(items);
+  // Defence in depth: the universal completion projection is intentionally
+  // retained for operational reporting, so enforce the no-charge disposition
+  // again after canonical completion admission.
+  items = items.filter((candidate) => (
+    !isLinkedSalesOrderReattemptCandidate(candidate, excludedReattemptReferences)
+  ));
   items = await retainedCandidatesWithOverrides(items, includeOverrides);
   items.sort((left, right) => Number(
     right.chargeable === true && !text(right.automaticRateWarning)
@@ -2508,7 +2568,8 @@ async function calculateCandidate(candidate, graph, resolveDistance) {
   const amount = calculateBillingUnitAmount({
     billingRule: text(candidate.billingRule) || "reconciliation",
     distanceBandAmountMinor: rateAmountMinor,
-    dropCount: Number(candidate.dropCount || stops.filter((stop) => text(stop.stopType) === "dropoff").length)
+    dropCount: Number(candidate.dropCount || stops.filter((stop) => text(stop.stopType) === "dropoff").length),
+    mbbsChargingPolicy: graph.mbbsChargingPolicy
   });
   const allocationPreview = text(candidate.billingRule) === "po_shared_leg"
     ? equalAllocationPreview(array(candidate.references).map(object), amount.calculatedAmountMinor)
@@ -2533,7 +2594,7 @@ async function calculateCandidate(candidate, graph, resolveDistance) {
     },
     ...(amount.additionalDropCount > 0 ? [{
       code: "additional_drop",
-      description: `${amount.additionalDropCount} additional drop(s) × CAD 100.00`,
+      description: `${amount.additionalDropCount} additional drop(s) × CAD ${(amount.additionalDropUnitAmountMinor / 100).toFixed(2)}`,
       distanceMetres: null,
       amountMinor: amount.additionalDropFeeMinor
     }] : []),
@@ -2560,6 +2621,7 @@ async function calculateCandidate(candidate, graph, resolveDistance) {
     candidate: publicCandidate(candidate),
     rateCardVersionId: graph.rateCardVersionId,
     rateCardVersionNumber: graph.versionNumber,
+    mbbsChargingPolicy: graph.mbbsChargingPolicy,
     distanceMetres,
     routeEvidence,
     selectedBand: {
@@ -2572,8 +2634,10 @@ async function calculateCandidate(candidate, graph, resolveDistance) {
     },
     calculationBreakdown: {
       billingRule: text(candidate.billingRule),
+      mbbsChargingPolicy: graph.mbbsChargingPolicy,
       distanceBandAmountMinor: amount.distanceBandAmountMinor,
       additionalDropCount: amount.additionalDropCount,
+      additionalDropUnitAmountMinor: amount.additionalDropUnitAmountMinor,
       additionalDropFeeMinor: amount.additionalDropFeeMinor,
       calculatedAmountMinor: amount.calculatedAmountMinor,
       allocationPreview
@@ -2663,6 +2727,7 @@ function manualRateCalculation(candidate, graph, automaticRate) {
     candidate: publicCandidate(candidate),
     rateCardVersionId: graph.rateCardVersionId,
     rateCardVersionNumber: graph.versionNumber,
+    mbbsChargingPolicy: graph.mbbsChargingPolicy,
     distanceMetres: 0,
     distanceAvailable: false,
     routeEvidence: [],
@@ -2670,8 +2735,10 @@ function manualRateCalculation(candidate, graph, automaticRate) {
     automaticRate,
     calculationBreakdown: {
       billingRule: text(candidate.billingRule),
+      mbbsChargingPolicy: graph.mbbsChargingPolicy,
       distanceBandAmountMinor: 0,
       additionalDropCount: 0,
+      additionalDropUnitAmountMinor: 0,
       additionalDropFeeMinor: 0,
       calculatedAmountMinor: 0,
       allocationPreview,

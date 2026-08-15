@@ -11,6 +11,7 @@ import {
   calculateBillingUnitAmount,
   resolveManualBillingAmount
 } from "./mbbs-driver-billing-planner.js";
+import { requireMbbsRateCardPolicy } from "./mbbs-rate-card-policy.js";
 import {
   calculateTorontoRentalExtensionDays,
   calculateMbbsCrossCharges,
@@ -1421,10 +1422,18 @@ async function validatedCandidateRateGraphs(calculations, customerNetsuiteId) {
             band.currency AS band_currency, band.rate_distance_band_id::text,
             band.item_code, band.service_code, band.sequence_number::int,
             band.minimum_metres::int, band.maximum_metres::int,
-            band.amount_minor::int, band.pricing_basis, band.boundary_rule
+            band.amount_minor::int, band.pricing_basis, band.boundary_rule,
+            policy.schema_version AS policy_schema_version,
+            policy.currency AS policy_currency,
+            policy.direct_pickup_unit_amount_minor,
+            policy.po_additional_drop_unit_amount_minor,
+            policy.so_charge_basis, policy.to_replenishment_charge_basis,
+            policy.to_direct_pickup_charge_basis, policy.po_charge_basis,
+            policy.po_additional_drop_basis, policy.dispatch_load_split_basis
        FROM mbt_rate_card_versions version
        JOIN mbt_rate_cards card USING (rate_card_id)
        JOIN mbt_rate_distance_bands band USING (rate_card_version_id)
+       JOIN mbt_mbbs_rate_card_policies policy USING (rate_card_version_id)
       WHERE version.rate_card_version_id = ANY($1::uuid[])
         AND version.status = 'active'
         AND card.active
@@ -1452,6 +1461,18 @@ async function validatedCandidateRateGraphs(calculations, customerNetsuiteId) {
       boundaryRule: String(row.boundary_rule),
       currency: cad(row.currency),
       bandCurrency: cad(row.band_currency),
+      mbbsChargingPolicy: requireMbbsRateCardPolicy({
+        schemaVersion: Number(row.policy_schema_version),
+        currency: String(row.policy_currency),
+        directPickupUnitAmountMinor: Number(row.direct_pickup_unit_amount_minor),
+        poAdditionalDropUnitAmountMinor: Number(row.po_additional_drop_unit_amount_minor),
+        soChargeBasis: String(row.so_charge_basis),
+        toReplenishmentChargeBasis: String(row.to_replenishment_charge_basis),
+        toDirectPickupChargeBasis: String(row.to_direct_pickup_charge_basis),
+        poChargeBasis: String(row.po_charge_basis),
+        poAdditionalDropBasis: String(row.po_additional_drop_basis),
+        dispatchLoadSplitBasis: String(row.dispatch_load_split_basis)
+      }),
       rateCustomerNetsuiteId: row.rate_customer_netsuite_id === null
         ? null
         : String(row.rate_customer_netsuite_id)
@@ -1567,8 +1588,10 @@ function candidateBillingLoad(entry, graphs) {
         calculationSteps: Array.isArray(entry.calculationSteps) ? entry.calculationSteps : [],
         distanceAvailable: false,
         automaticRate,
+        mbbsChargingPolicy: firstBand.mbbsChargingPolicy,
         distanceBandAmountMinor: 0,
         additionalDropCount: 0,
+        additionalDropUnitAmountMinor: 0,
         additionalDropFeeMinor: 0,
         ...manualAmount,
         edited: true,
@@ -1595,7 +1618,8 @@ function candidateBillingLoad(entry, graphs) {
     ? calculateBillingUnitAmount({
         billingRule: requiredText(candidate.billingRule, "Candidate billing rule"),
         distanceBandAmountMinor: rateAmountMinor,
-        dropCount: nonnegativeInteger(candidate.dropCount, "Candidate drop count")
+        dropCount: nonnegativeInteger(candidate.dropCount, "Candidate drop count"),
+        mbbsChargingPolicy: selected.mbbsChargingPolicy
       })
     : null;
   const manualAmount = policyAmount
@@ -1635,8 +1659,10 @@ function candidateBillingLoad(entry, graphs) {
       relationship: candidate.relationship || null,
       routeStops: Array.isArray(candidate.routeStops) ? candidate.routeStops : [],
       calculationSteps: Array.isArray(entry.calculationSteps) ? entry.calculationSteps : [],
+      mbbsChargingPolicy: selected.mbbsChargingPolicy,
       distanceBandAmountMinor: policyAmount.distanceBandAmountMinor,
       additionalDropCount: policyAmount.additionalDropCount,
+      additionalDropUnitAmountMinor: policyAmount.additionalDropUnitAmountMinor,
       additionalDropFeeMinor: policyAmount.additionalDropFeeMinor,
       ...manualAmount,
       edited: manualAmount.adjustmentMinor !== 0,

@@ -128,7 +128,7 @@ test("operator cache assets advance with the cycle-count pagination release", ()
     assert.ok(operatorHtml.includes(asset));
     assert.ok(serviceWorker.includes(asset));
   }
-  assert.ok(serviceWorker.includes("mbbs-yard-operator-v138-toronto-timestamps-v1"));
+  assert.ok(serviceWorker.includes("mbbs-yard-operator-v139-request-scheme-v1"));
 });
 
 test("Dispatch and SCM card menus scroll within the fixed-height application shell", () => {

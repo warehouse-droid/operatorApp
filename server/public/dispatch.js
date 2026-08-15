@@ -58,6 +58,26 @@ function dispatchStorageRemove(key) {
 dispatchStorageRemove(DISPATCH_PLAN_CACHE_KEY);
 
 const DISPATCH_SESSION_KEY = "mbbs.dispatch.sessionId";
+const DISPATCH_EDIT_LEASE_SESSION_KEY = "mbbs.dispatch.editLease.v1";
+
+function parseStoredDispatchEditLease(rawValue, { planDate = "", sessionId = "" } = {}) {
+  try {
+    const parsed = typeof rawValue === "string" ? JSON.parse(rawValue) : rawValue;
+    if (!parsed || typeof parsed !== "object") return null;
+    const stored = {
+      planDate: String(parsed.planDate || "").slice(0, 10),
+      sessionId: String(parsed.sessionId || ""),
+      editLeaseToken: String(parsed.editLeaseToken || ""),
+      expiresAt: String(parsed.expiresAt || "")
+    };
+    if (!stored.planDate || !stored.sessionId || !stored.editLeaseToken) return null;
+    if (planDate && stored.planDate !== String(planDate).slice(0, 10)) return null;
+    if (sessionId && stored.sessionId !== String(sessionId)) return null;
+    return stored;
+  } catch {
+    return null;
+  }
+}
 
 function createDispatchSessionId() {
   const generated = `dispatch-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -72,6 +92,47 @@ function createDispatchSessionId() {
 }
 
 const dispatchSessionId = createDispatchSessionId();
+
+function readStoredDispatchEditLease(planDate = currentPlanDate) {
+  try {
+    return parseStoredDispatchEditLease(
+      window.sessionStorage?.getItem(DISPATCH_EDIT_LEASE_SESSION_KEY),
+      { planDate, sessionId: dispatchSessionId }
+    );
+  } catch {
+    return null;
+  }
+}
+
+function persistStoredDispatchEditLease({
+  planDate = currentPlanDate,
+  editLeaseToken = planEditLeaseToken,
+  lease = planEditLease
+} = {}) {
+  const record = parseStoredDispatchEditLease({
+    planDate,
+    sessionId: dispatchSessionId,
+    editLeaseToken,
+    expiresAt: lease?.expiresAt || ""
+  }, { planDate, sessionId: dispatchSessionId });
+  if (!record) return false;
+  try {
+    window.sessionStorage?.setItem(DISPATCH_EDIT_LEASE_SESSION_KEY, JSON.stringify(record));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function clearStoredDispatchEditLease() {
+  try {
+    window.sessionStorage?.removeItem(DISPATCH_EDIT_LEASE_SESSION_KEY);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 const DEFAULT_FIRST_LOAD_START = "07:00";
 
 const HUBS = {
@@ -554,8 +615,28 @@ function dispatchEditModeMessage() {
     : "Enter Edit Mode before changing this dispatch plan.";
 }
 
+function dispatchEditLeaseIsLocallyActive(lease = planEditLease) {
+  if (!lease?.active) return false;
+  const expiresAt = Date.parse(String(lease.expiresAt || ""));
+  return !Number.isFinite(expiresAt) || expiresAt > Date.now();
+}
+
+function hasDispatchEditLeaseCredentials(planDate = currentPlanDate) {
+  const leaseDate = String(planEditLease?.planDate || planDate || "").slice(0, 10);
+  return Boolean(
+    planEditLeaseToken
+    && planEditLease?.active
+    && planEditLease?.sessionId === dispatchSessionId
+    && leaseDate === String(planDate || "").slice(0, 10)
+  );
+}
+
 function isDispatchPlanEditor() {
-  return Boolean(planEditMode && planEditLeaseToken && planEditLease?.active && planEditLease?.sessionId === dispatchSessionId);
+  return Boolean(
+    planEditMode
+    && hasDispatchEditLeaseCredentials()
+    && dispatchEditLeaseIsLocallyActive()
+  );
 }
 
 function canMutateDispatchPlan() {
@@ -624,11 +705,87 @@ function clearPlanEditHeartbeat() {
   planEditHeartbeatInFlight = false;
 }
 
-function leaveDispatchEditMode({ clearLease = false } = {}) {
+function leaveDispatchEditMode({ clearLease = false, clearStoredLease = true } = {}) {
   clearPlanEditHeartbeat();
   planEditMode = false;
   planEditLeaseToken = "";
+  if (clearStoredLease) clearStoredDispatchEditLease();
   if (clearLease) planEditLease = null;
+}
+
+function isAuthoritativeDispatchLeaseFailure(error = {}) {
+  const status = Number(error?.status || 0);
+  return status >= 400 && status < 500;
+}
+
+async function dispatchLeaseResponseError(response) {
+  const error = new Error(await dispatchErrorMessage(response));
+  error.status = Number(response?.status || 0);
+  return error;
+}
+
+async function renewDispatchEditLease({
+  planDate = currentPlanDate,
+  editLeaseToken = planEditLeaseToken
+} = {}) {
+  const response = await fetch("/api/dispatch/plan-edit-lease/heartbeat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      planDate,
+      sessionId: dispatchSessionId,
+      editLeaseToken
+    })
+  });
+  if (!response.ok) throw await dispatchLeaseResponseError(response);
+  const payload = await response.json();
+  return payload.lease
+    ? {
+        ...payload.lease,
+        planDate: payload.lease.planDate || planDate,
+        sessionId: payload.lease.sessionId || dispatchSessionId
+      }
+    : null;
+}
+
+async function resumeStoredDispatchEditLease(planDate = currentPlanDate, serverLease = planEditLease) {
+  const stored = readStoredDispatchEditLease(planDate);
+  const sameServerLease = Boolean(
+    stored
+    && serverLease?.active
+    && serverLease.sessionId === dispatchSessionId
+    && String(serverLease.planDate || planDate).slice(0, 10) === String(planDate).slice(0, 10)
+  );
+  if (!sameServerLease) {
+    if (stored) clearStoredDispatchEditLease();
+    return false;
+  }
+  planEditLease = serverLease;
+  planEditLeaseToken = stored.editLeaseToken;
+  planEditMode = false;
+  try {
+    const renewed = await renewDispatchEditLease({
+      planDate,
+      editLeaseToken: stored.editLeaseToken
+    });
+    if (!renewed?.active) throw Object.assign(new Error("The server did not renew the saved edit lease."), { status: 409 });
+    planEditLease = renewed;
+    planEditMode = true;
+    persistStoredDispatchEditLease();
+    startDispatchEditHeartbeat();
+    routeNotice = "Edit Mode resumed after reload.";
+    return true;
+  } catch (error) {
+    if (isAuthoritativeDispatchLeaseFailure(error)) {
+      leaveDispatchEditMode();
+      return false;
+    }
+    // Keep the tab-scoped credentials for a retry, but do not restore editing
+    // until the server has positively validated the token.
+    startDispatchEditHeartbeat();
+    routeNotice = `Edit Mode reconnection pending: ${error.message}`;
+    return false;
+  }
 }
 
 async function refreshDispatchPlanEditLease(planDate = currentPlanDate) {
@@ -637,30 +794,48 @@ async function refreshDispatchPlanEditLease(planDate = currentPlanDate) {
     return null;
   }
   const response = await fetch(`/api/dispatch/plan-edit-lease?planDate=${encodeURIComponent(planDate)}`);
-  if (!response.ok) throw new Error(await dispatchErrorMessage(response));
+  if (!response.ok) throw await dispatchLeaseResponseError(response);
   const payload = await response.json();
   planEditLease = payload.lease || null;
-  if (!planEditLease?.active || planEditLease.sessionId !== dispatchSessionId) {
-    if (planEditMode) leaveDispatchEditMode();
+  const sameSession = Boolean(
+    planEditLease?.active
+    && planEditLease.sessionId === dispatchSessionId
+    && String(planEditLease.planDate || planDate).slice(0, 10) === String(planDate).slice(0, 10)
+  );
+  if (!sameSession) {
+    leaveDispatchEditMode();
+    return planEditLease;
   }
+  if (hasDispatchEditLeaseCredentials(planDate) && planEditMode) {
+    persistStoredDispatchEditLease({ planDate });
+    startDispatchEditHeartbeat();
+    return planEditLease;
+  }
+  await resumeStoredDispatchEditLease(planDate, planEditLease);
   return planEditLease;
 }
 
 async function heartbeatDispatchEditLease() {
-  if (!isDispatchPlanEditor() || planEditHeartbeatInFlight) return;
+  if (!hasDispatchEditLeaseCredentials() || planEditHeartbeatInFlight) return;
   planEditHeartbeatInFlight = true;
   try {
-    const response = await fetch("/api/dispatch/plan-edit-lease/heartbeat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(dispatchLeaseRequestPayload())
-    });
-    if (!response.ok) throw new Error(await dispatchErrorMessage(response));
-    const payload = await response.json();
-    planEditLease = payload.lease || planEditLease;
+    const recovering = !planEditMode;
+    const renewed = await renewDispatchEditLease();
+    if (!renewed?.active) throw Object.assign(new Error("The server did not renew the edit lease."), { status: 409 });
+    planEditLease = renewed;
+    planEditMode = true;
+    persistStoredDispatchEditLease();
+    if (recovering) routeNotice = "Edit Mode connection restored.";
+    if (recovering) render({ save: false });
   } catch (error) {
-    leaveDispatchEditMode();
-    routeNotice = `Edit Mode ended: ${error.message}`;
+    if (isAuthoritativeDispatchLeaseFailure(error)) {
+      leaveDispatchEditMode();
+      routeNotice = `Edit Mode ended: ${error.message}`;
+    } else {
+      routeNotice = dispatchEditLeaseIsLocallyActive()
+        ? `Edit Mode connection interrupted; retrying: ${error.message}`
+        : `Edit Mode lease could not be renewed; editing is locked while retrying: ${error.message}`;
+    }
     render({ save: false });
   } finally {
     planEditHeartbeatInFlight = false;
@@ -683,10 +858,17 @@ async function enterDispatchEditMode() {
   });
   if (!response.ok) throw new Error(await dispatchErrorMessage(response));
   const payload = await response.json();
-  planEditLease = payload.lease || null;
+  planEditLease = payload.lease
+    ? {
+        ...payload.lease,
+        planDate: payload.lease.planDate || currentPlanDate,
+        sessionId: payload.lease.sessionId || dispatchSessionId
+      }
+    : null;
   planEditLeaseToken = payload.editLeaseToken || "";
-  planEditMode = Boolean(planEditLeaseToken && planEditLease?.active);
+  planEditMode = Boolean(hasDispatchEditLeaseCredentials());
   if (!planEditMode) throw new Error("The server did not grant an edit lease.");
+  persistStoredDispatchEditLease();
   startDispatchEditHeartbeat();
   if (!currentPlan?.id) await createPlanForDate(currentPlanDate);
   if (isDispatchHistoryEditMode()) await loadDispatchOrders();
@@ -697,7 +879,8 @@ async function enterDispatchEditMode() {
 }
 
 async function releaseDispatchEditMode() {
-  if (!isDispatchPlanEditor()) {
+  if (!hasDispatchEditLeaseCredentials()) {
+    clearStoredDispatchEditLease();
     leaveDispatchEditMode();
     return;
   }
@@ -707,8 +890,16 @@ async function releaseDispatchEditMode() {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(dispatchLeaseRequestPayload())
   });
-  if (!response.ok) throw new Error(await dispatchErrorMessage(response));
-  leaveDispatchEditMode({ clearLease: true });
+  if (!response.ok) {
+    const error = await dispatchLeaseResponseError(response);
+    if (isAuthoritativeDispatchLeaseFailure(error)) {
+      clearStoredDispatchEditLease();
+      leaveDispatchEditMode({ clearLease: true });
+    }
+    throw error;
+  }
+  clearStoredDispatchEditLease();
+  leaveDispatchEditMode({ clearLease: true, clearStoredLease: false });
   if (leavingHistoryEditMode) await loadDispatchOrders();
   routeNotice = leavingHistoryEditMode ? "History View Mode enabled." : "View Mode enabled.";
   render({ save: false });
@@ -1121,7 +1312,10 @@ function ensureDriverLaneOrder(preferred = driverLaneOrder) {
   const preferredOrder = normalizedDriverLaneOrder(preferred);
   const defaultOrder = normalizedDriverLaneOrder(defaultDriverLaneOrder());
   const historicalOrder = normalizedDriverLaneOrder(plannedHistoricalDriverLaneOrder());
-  const valid = new Set([...defaultOrder, ...historicalOrder, ...preferredOrder]);
+  // A preferred lane is only ordering metadata. Retain it when the driver is
+  // active or still owns saved planning content; otherwise stale snapshot
+  // names become empty "historical" duplicates forever.
+  const valid = new Set([...defaultOrder, ...historicalOrder]);
   const next = [];
   for (const login of preferredOrder) {
     if (valid.has(login) && !next.includes(login)) next.push(login);
@@ -1213,7 +1407,7 @@ function driverLanes() {
       driver: historicalDriver,
       driverName: historicalDriver.name || login,
       displayOrder: index,
-      historical: true,
+      historical: dispatchSetupLoaded,
       entries: []
     });
   }
@@ -1234,7 +1428,7 @@ function driverLanes() {
         driver: entry.driver || historicalDriverForLane(login),
         driverName: entry.driver?.name || entry.load.driverName || (login ? login : "Unassigned"),
         displayOrder: login ? 100000 : 200000,
-        historical: Boolean(login && !entry.driver),
+        historical: Boolean(dispatchSetupLoaded && login && !entry.driver),
         entries: []
       });
     }
@@ -1519,13 +1713,13 @@ function orderWeightLbs(order) {
 }
 
 function dropoffForStop(order = {}, stop = {}) {
-  const dropoffs = Array.isArray(order.dropoffs) ? order.dropoffs : [];
-  const key = String(stop.dropoffKey || "");
+  const dropoffs = Array.isArray(order?.dropoffs) ? order.dropoffs : [];
+  const key = String(stop?.dropoffKey || "");
   if (key) {
     const exact = dropoffs.find((dropoff) => String(dropoff.key || "") === key);
     if (exact) return exact;
   }
-  const yard = String(stop.dropLocation || "");
+  const yard = String(stop?.dropLocation || "");
   if (yard) {
     const exact = dropoffs.find((dropoff) => sameDispatchLocation(dropoff.destinationYard, yard));
     if (exact) return exact;
@@ -1534,30 +1728,30 @@ function dropoffForStop(order = {}, stop = {}) {
 }
 
 function dropItemsForStop(order = {}, stop = {}) {
-  const stopLineRowIds = Array.isArray(stop.lineRowIds) ? stop.lineRowIds.filter((value) => value !== null && value !== undefined && String(value) !== "") : [];
+  const stopLineRowIds = Array.isArray(stop?.lineRowIds) ? stop.lineRowIds.filter((value) => value !== null && value !== undefined && String(value) !== "") : [];
   const dropoffLineRowIds = dropoffForStop(order, stop)?.lineRowIds || [];
   const lineRowIds = new Set((stopLineRowIds.length ? stopLineRowIds : dropoffLineRowIds).map(String));
-  if (!lineRowIds.size) return (order.dropoffs || []).length > 1 ? [] : order.items || [];
-  return (order.items || []).filter((item) => lineRowIds.has(String(item.lineRowId)));
+  if (!lineRowIds.size) return (order?.dropoffs || []).length > 1 ? [] : order?.items || [];
+  return (order?.items || []).filter((item) => lineRowIds.has(String(item.lineRowId)));
 }
 
 function dropWeightLbs(order = {}, stop = {}) {
-  const explicit = stop.dropWeight ?? dropoffForStop(order, stop)?.weight;
+  const explicit = stop?.dropWeight ?? dropoffForStop(order, stop)?.weight;
   if (explicit !== undefined && explicit !== null && Number.isFinite(Number(explicit))) return Math.max(0, Math.round(Number(explicit)));
   const itemWeight = dropItemsForStop(order, stop).reduce((sum, item) => {
     const lineWeight = Number(item.lineWeight || 0);
     return sum + (lineWeight || (Number(item.quantity || item.salesQty || 0) * Number(item.itemWeight || 0)));
   }, 0);
   if (itemWeight > 0) return Math.round(itemWeight);
-  return (order.dropoffs || []).length > 1 ? 0 : orderWeightLbs(order);
+  return (order?.dropoffs || []).length > 1 ? 0 : orderWeightLbs(order);
 }
 
 function dropPallets(order = {}, stop = {}) {
-  const explicit = stop.dropPallets ?? dropoffForStop(order, stop)?.pallets;
+  const explicit = stop?.dropPallets ?? dropoffForStop(order, stop)?.pallets;
   if (explicit !== undefined && explicit !== null && Number.isFinite(Number(explicit))) return Math.max(0, Number(explicit));
   const itemPallets = dropItemsForStop(order, stop).reduce((sum, item) => sum + Number(item.pallets || 0), 0);
   if (itemPallets > 0) return itemPallets;
-  return (order.dropoffs || []).length > 1 ? 0 : Number(order.pallets || 0);
+  return (order?.dropoffs || []).length > 1 ? 0 : Number(order?.pallets || 0);
 }
 
 function dropUnitText(order = {}, stop = {}) {
@@ -2297,6 +2491,11 @@ function scmReconciliationBlockText(order = {}) {
 
 function orderTypeLabel(type) {
   return ({ SO: "Sales Order", PO: "Purchase Order", TO: "Transfer Order", CO: "Transit Depot Order", CUSTOM: "Custom Order" })[type] || "Order";
+}
+
+function isSalesOrderReattempt(order = {}) {
+  return order.salesOrderReattempt === true
+    || String(order.orderKind || order.raw?.order_kind || "").trim().toLowerCase() === "sales_order_reattempt";
 }
 
 function splitBlockReason(order) {
@@ -3279,23 +3478,35 @@ async function loadDispatchVendorYards() {
   }
 }
 
-async function loadDispatchSetup() {
-  try {
-    const response = await fetch("/api/dispatch/setup");
-    if (!response.ok) return;
-    const setup = await response.json();
-    dispatchSetupLoaded = true;
-    if (Array.isArray(setup.drivers)) drivers = setup.drivers;
-    ensureDriverLaneOrder();
-    if (Array.isArray(setup.ownYards)) applyOwnYards(setup.ownYards);
-    if (setup.planning) dispatchPlanningSettings = { ...dispatchPlanningSettings, ...setup.planning };
-    if (Array.isArray(setup.trucks)) {
-      fleet = setup.trucks;
-      trucks = fleet.map((vehicle, index) => makeTruckFromFleet(vehicle, index));
+async function loadDispatchSetup({ attempts = 3 } = {}) {
+  const setupWasLoaded = dispatchSetupLoaded;
+  const maxAttempts = Math.max(1, Number(attempts) || 1);
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      const response = await fetch("/api/dispatch/setup", { cache: "no-store" });
+      if (!response.ok) throw new Error(`setup request returned HTTP ${response.status}`);
+      const setup = await response.json();
+      if (!setup || typeof setup !== "object") throw new Error("setup response was invalid");
+      if (Array.isArray(setup.drivers)) drivers = setup.drivers;
+      dispatchSetupLoaded = true;
+      ensureDriverLaneOrder();
+      if (Array.isArray(setup.ownYards)) applyOwnYards(setup.ownYards);
+      if (setup.planning) dispatchPlanningSettings = { ...dispatchPlanningSettings, ...setup.planning };
+      if (Array.isArray(setup.trucks)) {
+        fleet = setup.trucks;
+        trucks = fleet.map((vehicle, index) => makeTruckFromFleet(vehicle, index));
+      }
+      return true;
+    } catch {
+      if (attempt + 1 < maxAttempts) {
+        await new Promise((resolve) => window.setTimeout(resolve, 200 * (attempt + 1)));
+      }
     }
-  } catch {
-    // Keep built-in setup if the server setup file is unavailable.
   }
+  // Preserve the last known-good setup. During first load, an unavailable
+  // endpoint must remain "unknown" instead of classifying saved drivers as disabled.
+  dispatchSetupLoaded = setupWasLoaded;
+  return false;
 }
 
 function activePhysicalOrderEvidence(truckList = trucks, planId = currentPlan?.id) {
@@ -3458,7 +3669,8 @@ function applyDispatchOrderFeed(feed) {
     .filter(([, order]) => orderMatchesActivityRefs(order, activityEvidence.all))
     .map(([, order]) => [String(order.id || "").trim().toLowerCase(), order]));
   const localOrders = orders.filter((order) =>
-    shouldPreserveDuringFeedRefresh(order)
+    isOrderAssignedInCurrentPlan(order.id)
+    || shouldPreserveDuringFeedRefresh(order)
     || orderMatchesActivityRefs(order, activityEvidence.all)
   );
   const nextIds = new Set(orderCatalog.map((order) => order.id));
@@ -6262,7 +6474,6 @@ async function loadPlanForDate(planDate = currentPlanDate, { createIfMissing = t
     try {
       await refreshDispatchPlanEditLease(currentPlanDate);
     } catch (error) {
-      leaveDispatchEditMode({ clearLease: true });
       routeNotice = `Edit Mode status is temporarily unavailable: ${error.message}`;
     }
     resetUndoHistory();
@@ -6293,7 +6504,6 @@ async function loadPlanById(planId) {
   try {
     await refreshDispatchPlanEditLease(currentPlanDate);
   } catch (error) {
-    leaveDispatchEditMode({ clearLease: true });
     routeNotice = `Edit Mode status is temporarily unavailable: ${error.message}`;
   }
   await loadDriverJobStatuses();
@@ -6404,7 +6614,7 @@ function queueDispatchSetupRefresh(delay = 350) {
     }
     try {
       const savedTrucks = trucks;
-      await loadDispatchSetup();
+      if (!await loadDispatchSetup()) throw new Error("the setup request failed after retry");
       trucks = trucksFromFleetAndSavedPlan(savedTrucks);
       normalizeLoadAssignments();
       clearActiveRouteEstimates();
@@ -6615,8 +6825,10 @@ function openOrders() {
     return term
       ? true
       : activeOrderType === "TO"
-        ? ["TO", "CUSTOM"].includes(order.type)
-        : order.type === activeOrderType;
+        ? ["TO", "CUSTOM"].includes(order.type) && !isSalesOrderReattempt(order)
+        : activeOrderType === "SO"
+          ? order.type === "SO" || isSalesOrderReattempt(order)
+          : order.type === activeOrderType;
   });
 }
 
@@ -9939,7 +10151,7 @@ function renderSelectedOrderActions() {
       ${reconciliationBlocked ? `<span class="chip warn">${escapeHtml(scmReconciliationBlockText(selected.find(isScmReconciliationBlocked)))}</span>` : ""}
       ${reconciliationBlocked ? "" : groupedCount ? `<button data-action="ungroup-order" data-order-ref="${escapeHtml(order.id)}" ${blockedUngroup ? `disabled title="Cancel ${escapeHtml(blockedUngroup)} before ungrouping"` : ""} type="button">Ungroup</button>` : selected.length > 1 && !includesCustomOrder ? `<button data-action="open-group-modal" data-order-ref="${escapeHtml(order.id)}" type="button">Group</button>` : ""}
       ${blockedUngroup ? `<span>Cancel ${escapeHtml(blockedUngroup)} before ungrouping</span>` : ""}
-      ${order.type === "CUSTOM" ? `<button data-action="edit-custom-order" data-custom-order-id="${escapeHtml(order.customOrderId || "")}" type="button">Open Custom Order</button>` : ""}
+      ${isSalesOrderReattempt(order) ? `<span class="chip">System-managed Sales Order re-attempt for ${escapeHtml(order.parentOrderRef || "linked parent")}</span>` : order.type === "CUSTOM" ? `<button data-action="edit-custom-order" data-custom-order-id="${escapeHtml(order.customOrderId || "")}" type="button">Open Custom Order</button>` : ""}
       ${!reviewOnly && !reconciliationBlocked && order.type === "PO" && order.sourceTable !== "scm_vrma_orders" ? `<button data-action="open-po-yard-modal" data-order-ref="${escapeHtml(order.id)}" type="button">Set Yard</button>` : ""}
       ${!reviewOnly && order.type === "SO" ? `<button data-action="open-po-link-modal" data-order-ref="${escapeHtml(order.id)}" type="button">Link PO</button>` : ""}
       ${!reviewOnly && order.type === "SO" ? `<button data-action="open-to-link-modal" data-order-ref="${escapeHtml(order.id)}" type="button">Link TO</button>` : ""}
@@ -9982,8 +10194,9 @@ function renderOrderCard(order) {
       <span class="order-compact-line">Pickup ${escapeHtml(orderPickupText(order))} | ${dateText}${order.windowStart || "--"}-${order.windowEnd || "--"}</span>
       <span class="order-compact-line">${orderUnitText(order)} | ${orderFootprintPallets(order)} pos | ${formatLbs(orderWeightLbs(order))}${packedText ? ` | Packed ${escapeHtml(packedText)}` : ""}</span>
       ${groupedCount ? `<span>Includes ${order.childOrders.join(", ")}</span>` : ""}
+      ${isSalesOrderReattempt(order) ? `<span>Linked to original Sales Order ${escapeHtml(order.parentOrderRef || "")}; this transport child is excluded from duplicate billing.</span>` : ""}
       <div class="chip-row">
-        <span class="chip">${order.type === "CUSTOM" ? "Custom" : order.type}</span>
+        <span class="chip">${isSalesOrderReattempt(order) ? "Sales Order re-attempt" : order.type === "CUSTOM" ? "Custom" : order.type}</span>
         ${order.sourceTable === "scm_vrma_orders" ? `<span class="chip">Local VRMA</span>` : ""}
         ${order.historicalReconciliationComplete ? `<span class="chip history-chip">Reconciliation history</span>` : ""}
         ${executionStatus === "complete" ? `<span class="chip complete-chip">Completed</span>` : executionStatus === "in_progress" ? `<span class="chip progress-chip">In progress</span>` : ""}
@@ -11908,6 +12121,13 @@ function renderModal() {
   const order = orderById(modalOrderId) || selectedOrder();
   if (!order) return "";
   if (modalType === "edit-order") {
+    const isPurchaseOrderDeliveryOverride = order.type === "PO" && order.sourceTable === "purchase_orders";
+    const deliveryAddressValue = isPurchaseOrderDeliveryOverride
+      ? order.deliveryAddressOverride || ""
+      : order.address || "";
+    const deliveryAddressPlaceholder = isPurchaseOrderDeliveryOverride
+      ? order.defaultDestinationAddress || "Leave blank to use the mapped destination yard"
+      : "Address";
     const deliveryInstructionEditor = renderDispatchDeliveryInstructionEditor(order);
     return `
       <div class="modal-backdrop show">
@@ -11926,8 +12146,8 @@ function renderModal() {
                 <input name="expectedDeliveryDate" type="date" value="${escapeHtml(order.expectedDeliveryDate || "")}" />
               </label>
               <label class="split-field">
-                <span>Delivery address</span>
-                <input name="address" value="${escapeHtml(order.address || "")}" placeholder="Address" required />
+                <span>${isPurchaseOrderDeliveryOverride ? "Delivery address override <small>(optional)</small>" : "Delivery address"}</span>
+                <input name="address" value="${escapeHtml(deliveryAddressValue)}" placeholder="${escapeHtml(deliveryAddressPlaceholder)}" ${isPurchaseOrderDeliveryOverride ? "" : "required"} />
               </label>
               <label class="split-field">
                 <span>Pickup address override <small>(optional)</small></span>
@@ -14684,10 +14904,17 @@ app.addEventListener("dblclick", (event) => {
   if (!orderCard) return;
   const order = orderById(orderCard.dataset.order);
   if (!order) return;
-  if (order.type === "CUSTOM") {
+  if (order.type === "CUSTOM" && !isSalesOrderReattempt(order)) {
     location.href = order.customOrderId
       ? `/dispatch/custom-orders?edit=${encodeURIComponent(order.customOrderId)}`
       : "/dispatch/custom-orders";
+    return;
+  }
+  if (isSalesOrderReattempt(order)) {
+    routeNotice = `${order.id} is a system-managed Sales Order re-attempt linked to ${order.parentOrderRef || "its original order"}.`;
+    selectedOrderId = order.id;
+    selectedOrderIds = new Set([order.id]);
+    render({ save: false });
     return;
   }
   if (!ensureDispatchPlanEditor()) return;
@@ -15493,6 +15720,7 @@ app.addEventListener("submit", (event) => {
   if (form.dataset.form === "edit-order-details") {
     const order = orderById(modalOrderId);
     if (!order) return;
+    const isPurchaseOrderDeliveryOverride = order.type === "PO" && order.sourceTable === "purchase_orders";
     const windowStart = modalTimeValue(data.windowStart);
     const windowEnd = modalTimeValue(data.windowEnd);
     const validation = timeValidationMessage(windowStart, windowEnd);
@@ -15514,9 +15742,12 @@ app.addEventListener("submit", (event) => {
       submitButton.textContent = "Saving...";
     }
     setEditFormStatus(form, "Saving dispatch info...", "info");
+    const detailsEndpoint = isPurchaseOrderDeliveryOverride
+      ? `/api/dispatch/orders/${encodeURIComponent(order.id)}/details?response=targeted`
+      : `/api/dispatch/orders/${encodeURIComponent(order.id)}/details?response=ack`;
     const saveDetails = isLocalDispatchOrder(order)
       ? Promise.resolve({ orders: null })
-          : fetch(`/api/dispatch/orders/${encodeURIComponent(order.id)}/details?response=ack`, {
+      : fetch(detailsEndpoint, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(dispatchLeaseRequestPayload({
@@ -15538,32 +15769,33 @@ app.addEventListener("submit", (event) => {
         });
     saveDetails.then((payload) => {
       const pickupAddress = String(data.pickupAddress || "").trim();
-      order.address = data.address;
+      if (!isPurchaseOrderDeliveryOverride) order.address = data.address;
       order.pickupAddressOverride = pickupAddress;
       order.sourceAddress = pickupAddress || order.defaultSourceAddress || "";
       order.expectedDeliveryDate = data.expectedDeliveryDate || "";
       order.windowStart = windowStart;
       order.windowEnd = windowEnd;
       mergeTargetedDispatchMutationOrders(payload);
+      const savedOrder = orderById(order.id) || order;
       let coOrder = null;
       if (wantsTransitCo) {
-        coOrder = upsertTransitCoForOrder(order.id, transitFromYard, transitToYard);
+        coOrder = upsertTransitCoForOrder(savedOrder.id, transitFromYard, transitToYard);
         if (coOrder) activeOrderType = "CO";
       }
       if (coOrder) requestTargetedOrderPoolRefresh([
-        order.id,
+        savedOrder.id,
         coOrder?.id
       ]);
       if (coOrder) {
         persistTransitCoInBackground(
-          saveTransitCoToServer(order, coOrder),
+          saveTransitCoToServer(savedOrder, coOrder),
           `${coOrder.id} saved to local DB.`
         );
       }
       modalType = "";
       modalOrderId = "";
       routeNotice = coOrder
-        ? `${coOrder.id} initiated. Plan this CO before dropping ${order.id}.`
+        ? `${coOrder.id} initiated. Plan this CO before dropping ${savedOrder.id}.`
         : "Dispatch info updated.";
       clearActiveRouteEstimates();
       commitPlanMutation("dispatch_order_details_updated");
@@ -15605,8 +15837,6 @@ async function initDispatch() {
   orders = [];
   orderCatalog = [];
   render({ save: false });
-  const orderFeedPromise = loadDispatchOrders();
-  const planHistoryPromise = loadPlanHistory();
   try {
     await Promise.all([
       loadDispatchConfig(),
@@ -15620,11 +15850,18 @@ async function initDispatch() {
   }
   render({ save: false });
   connectEvents();
-  Promise.allSettled([orderFeedPromise, planHistoryPromise]).then(() => {
-    if (dispatchPlannerSnapshotState !== "ready") return;
-    renderDispatchOrderPoolPatch();
-    renderDispatchPlannerPatch();
-  });
+  // Let the authoritative compact snapshot render before starting the large
+  // cross-date order feed. On production history that feed can take tens of
+  // seconds and must not contend with or overwrite the saved plan bootstrap.
+  window.setTimeout(() => {
+    const orderFeedPromise = loadDispatchOrders();
+    const planHistoryPromise = loadPlanHistory();
+    Promise.allSettled([orderFeedPromise, planHistoryPromise]).then(() => {
+      if (dispatchPlannerSnapshotState !== "ready") return;
+      renderDispatchOrderPoolPatch();
+      renderDispatchPlannerPatch();
+    });
+  }, 0);
   loadMbtBinDispatchCapability().then(async (enabled) => {
     if (!enabled) return;
     await loadMbtBinFrontLegs();
@@ -15639,11 +15876,17 @@ window.addEventListener("mbbs-language-changed", () => {
 });
 
 window.addEventListener("focus", () => {
+  if (!dispatchSetupLoaded) queueDispatchSetupRefresh(0);
   refreshDriverExecutionAndForecast({ renderAfter: true }).catch(() => null);
+});
+
+window.addEventListener("online", () => {
+  if (!dispatchSetupLoaded) queueDispatchSetupRefresh(0);
 });
 
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") {
+    if (!dispatchSetupLoaded) queueDispatchSetupRefresh(0);
     refreshDriverExecutionAndForecast({ renderAfter: true }).catch(() => null);
   }
 });
@@ -15651,13 +15894,9 @@ document.addEventListener("visibilitychange", () => {
 window.addEventListener("pagehide", () => {
   window.clearInterval(dispatchForecastPollTimer);
   flushPersistedRouteEstimateCache();
-  if (!isDispatchPlanEditor()) return;
-  fetch("/api/dispatch/plan-edit-lease/release", {
-    method: "POST",
-    keepalive: true,
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(dispatchLeaseRequestPayload())
-  }).catch(() => {});
+  // Reload and tab close are indistinguishable here. Preserve the tab-scoped
+  // token so a reload can validate and resume; an abandoned lease expires on
+  // the server, while the explicit View Mode action releases immediately.
 });
 
 requireDispatchLogin({

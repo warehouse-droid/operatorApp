@@ -265,8 +265,8 @@ async function captureLegacyState(client, ids) {
   );
   const schedule = await captureExactRow(
     client,
-    `SELECT to_jsonb(selected) AS snapshot,
-            md5(to_jsonb(selected)::text) AS checksum
+    `SELECT to_jsonb(selected) - ARRAY['dispatch_plan_id', 'dispatch_previous_state']::text[] AS snapshot,
+            md5((to_jsonb(selected) - ARRAY['dispatch_plan_id', 'dispatch_previous_state']::text[])::text) AS checksum
        FROM (
          SELECT *
            FROM scm_transport_schedule
@@ -353,9 +353,13 @@ test("F06/F16: schema-101 upgrade preserves representative legacy records and is
     assert.match(firstRunner.stdout, /Applied 157_yard_movement_history_indexes\.sql/);
     assert.match(firstRunner.stdout, /Applied 158_mbt_mbbs_candidate_billing\.sql/);
     assert.match(firstRunner.stdout, /Applied 159_dispatch_order_completion_status\.sql/);
+    assert.match(firstRunner.stdout, /Applied 160_mbt_mbbs_rate_card_charging_policy\.sql/);
+    assert.match(firstRunner.stdout, /Applied 161_mbt_rate_card_version_cutover\.sql/);
+    assert.match(firstRunner.stdout, /Applied 162_dispatch_po_delivery_address_override\.sql/);
+    assert.match(firstRunner.stdout, /Applied 163_dispatch_scm_unplan_state\.sql/);
 
     const after = await captureLegacyState(client, ids);
-    assert.deepEqual(after, before, "Migrations 102-109 must not rewrite representative schema-101 records.");
+    assert.deepEqual(after, before, "Migrations 102-164 must not rewrite representative schema-101 field values.");
 
     const truckCapability = await client.query(
       `SELECT bin_service_enabled, bin_slot_capacity
@@ -472,10 +476,10 @@ test("F06/F16: schema-101 upgrade preserves representative legacy records and is
       "idx_receiving_receipt_records_movement_activity"
     ]);
 
-    assert.equal(receiptsBeforeNoOp.rowCount, 159);
+    assert.equal(receiptsBeforeNoOp.rowCount, 164);
     assert.equal(
       receiptsBeforeNoOp.rows.at(-1)?.filename,
-      "159_dispatch_order_completion_status.sql"
+      "164_sales_order_partial_reattempt.sql"
     );
     assert.deepEqual(
       receiptsBeforeNoOp.rows

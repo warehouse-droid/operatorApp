@@ -2,7 +2,9 @@ import crypto from "node:crypto";
 import { query, withTransaction } from "./db.js";
 import { reconcileSalesOrderFamilyInDispatchPlans } from "./dispatch-plan-repository.js";
 import {
+  deriveSalesOrderReconciliationState,
   isNetSuiteSalesOrderBilled,
+  isNetSuiteSalesOrderClosed,
   isNetSuiteSalesOrderFulfilled,
   isSalesOrderInventoryLine,
   mapNetSuiteSalesOrderLine
@@ -324,12 +326,6 @@ function salesOrderProgress(lines = [], { forceComplete = false } = {}) {
   };
 }
 
-function salesOrderCalculatedApplicationStatus({ billed = false, progress = {} } = {}) {
-  if (billed || progress.complete) return "Completed";
-  if (progress.hasProgress) return "Partially Done";
-  return "Queued";
-}
-
 function reconciliationSource(value) {
   const normalized = text(value).toLowerCase();
   return ["webhook", "nightly", "manual", "backfill", "system"].includes(normalized)
@@ -337,7 +333,7 @@ function reconciliationSource(value) {
     : "system";
 }
 
-function salesOrderCalculationLines(lines = [], { forceComplete = false } = {}) {
+function salesOrderCalculationLines(lines = [], { forceComplete = false, closed = false } = {}) {
   return (lines || []).map((line) => {
     const mapped = mapNetSuiteSalesOrderLine(line);
     const ordered = quantity(line.quantity);
@@ -350,8 +346,11 @@ function salesOrderCalculationLines(lines = [], { forceComplete = false } = {}) 
       mapped,
       ordered,
       fulfilled,
-      remaining: Math.max(ordered - fulfilled, 0),
-      lineStatus: ordered > 0 && fulfilled + 0.000001 >= ordered
+      abandoned: closed ? Math.max(ordered - fulfilled, 0) : 0,
+      remaining: closed ? 0 : Math.max(ordered - fulfilled, 0),
+      lineStatus: closed
+        ? fulfilled > 0 ? "completed" : "cancelled"
+        : ordered > 0 && fulfilled + 0.000001 >= ordered
         ? "completed"
         : fulfilled > 0
           ? "partial"
@@ -370,12 +369,12 @@ async function persistSalesOrderCalculation({
 }) {
   const calculatedStatus = proposal.calculatedApplicationStatus;
   const normalizedSource = reconciliationSource(source);
-  const terminalState = proposal.fulfilledByHeader ? "closed" : "open";
+  const terminalState = proposal.closed || proposal.fulfilledByHeader ? "closed" : "open";
   const familyQuantities = {
     ordered: proposal.quantities.ordered,
     fulfilled: proposal.quantities.fulfilled,
     received: 0,
-    abandoned: 0,
+    abandoned: proposal.quantities.abandoned,
     remaining: proposal.quantities.remaining,
     destinationRemaining: 0
   };
@@ -403,6 +402,7 @@ async function persistSalesOrderCalculation({
     text(order.sourceLocation),
     proposal.quantities.ordered,
     proposal.quantities.fulfilled,
+    proposal.quantities.abandoned,
     proposal.quantities.remaining,
     order.lastModifiedAt || null,
     positiveId(runId),
@@ -465,13 +465,14 @@ async function persistSalesOrderCalculation({
          remaining_qty, destination_remaining_qty, exact_allocation,
          last_netsuite_modified_at, last_run_id, quantity_summary,
          order_snapshot, proposed_state, reconciled_at, completed_at,
-         status_changed_at, created_at, updated_at
+         cancelled_at, status_changed_at, created_at, updated_at
        ) VALUES (
          'SO', $1, $2, NULLIF($3, ''), NULLIF($4, ''), $5,
          $6, $7, NULLIF($8, ''), $9, $10, NULLIF($11, ''),
-         $12, $13, 0, 0, $14, 0, true,
-         $15, $16, $17::jsonb, $18::jsonb, $19::jsonb, now(),
+         $12, $13, 0, $14, $15, 0, true,
+         $16, $17, $18::jsonb, $19::jsonb, $20::jsonb, now(),
          CASE WHEN $6 = 'Completed' THEN now() ELSE NULL END,
+         CASE WHEN $6 = 'Cancelled' THEN now() ELSE NULL END,
          now(), now(), now()
        )
        ON CONFLICT (order_kind, source_order_netsuite_id) DO UPDATE SET
@@ -488,7 +489,7 @@ async function persistSalesOrderCalculation({
          ordered_qty = EXCLUDED.ordered_qty,
          fulfilled_qty = EXCLUDED.fulfilled_qty,
          received_qty = 0,
-         abandoned_qty = 0,
+         abandoned_qty = EXCLUDED.abandoned_qty,
          remaining_qty = EXCLUDED.remaining_qty,
          destination_remaining_qty = 0,
          exact_allocation = true,
@@ -503,7 +504,11 @@ async function persistSalesOrderCalculation({
            THEN COALESCE(scm_reconciliation_order_state.completed_at, now())
            ELSE NULL
          END,
-         cancelled_at = NULL,
+         cancelled_at = CASE
+           WHEN EXCLUDED.application_status = 'Cancelled'
+           THEN COALESCE(scm_reconciliation_order_state.cancelled_at, now())
+           ELSE NULL
+         END,
          status_changed_at = CASE
            WHEN scm_reconciliation_order_state.application_status IS DISTINCT FROM EXCLUDED.application_status
            THEN now()
@@ -517,7 +522,8 @@ async function persistSalesOrderCalculation({
   if (dryRun) return stateRow;
 
   const calculatedLines = salesOrderCalculationLines(inventoryLines, {
-    forceComplete: proposal.fulfilledByHeader
+    forceComplete: proposal.fulfilledByHeader,
+    closed: proposal.closed
   });
   for (const line of calculatedLines) {
     await query(
@@ -529,8 +535,8 @@ async function persistSalesOrderCalculation({
          netsuite_active, last_run_id, line_snapshot, created_at, updated_at
        ) VALUES (
          $1, $2, $3, 'outbound', $4, NULLIF($5, ''), NULLIF($6, ''),
-         NULLIF($7, ''), $8, $9, $10, 0, 0, $11, $12,
-         'exact', 'exact', true, $13, $14::jsonb, now(), now()
+         NULLIF($7, ''), $8, $9, $10, 0, $11, $12, $13,
+         'exact', 'exact', true, $14, $15::jsonb, now(), now()
        )
        ON CONFLICT (order_state_id, netsuite_line_key) DO UPDATE SET
          local_line_id = EXCLUDED.local_line_id,
@@ -543,7 +549,7 @@ async function persistSalesOrderCalculation({
          current_ordered_qty = EXCLUDED.current_ordered_qty,
          fulfilled_qty = EXCLUDED.fulfilled_qty,
          received_qty = 0,
-         abandoned_qty = 0,
+         abandoned_qty = EXCLUDED.abandoned_qty,
          remaining_qty = EXCLUDED.remaining_qty,
          line_status = EXCLUDED.line_status,
          identity_status = 'exact',
@@ -563,6 +569,7 @@ async function persistSalesOrderCalculation({
         positiveId(order.sourceLocationId),
         line.ordered,
         line.fulfilled,
+        line.abandoned,
         line.remaining,
         line.lineStatus,
         positiveId(runId),
@@ -643,14 +650,24 @@ export async function reconcileSalesOrderFromNetSuite({
   const inventoryLines = sourceLines.filter(isSalesOrderInventoryLine);
   const excludedLines = sourceLines.filter((line) => !isSalesOrderInventoryLine(line));
   const billed = isNetSuiteSalesOrderBilled(order);
+  const closed = isNetSuiteSalesOrderClosed(order);
   const fulfilledByHeader = isNetSuiteSalesOrderFulfilled(order);
-  const progress = salesOrderProgress(inventoryLines, {
+  const progressMetadata = salesOrderProgress(inventoryLines, {
     forceComplete: fulfilledByHeader
   });
-  const calculatedApplicationStatus = salesOrderCalculatedApplicationStatus({
+  const derivedState = deriveSalesOrderReconciliationState({
+    lines: inventoryLines,
     billed,
-    progress
+    fulfilledByHeader,
+    closed
   });
+  const progress = {
+    ...progressMetadata,
+    ...derivedState.quantities,
+    fulfillmentStatus: derivedState.fulfillmentStatus
+  };
+  const calculatedApplicationStatus = derivedState.applicationStatus;
+  const draftBlocked = draft.blocked && !closed;
   const proposal = {
     orderKind: "SO",
     sourceOrderId: orderId,
@@ -658,14 +675,15 @@ export async function reconcileSalesOrderFromNetSuite({
     familyOrderRefs: family.familyRefs,
     dryRun: Boolean(dryRun),
     billed,
+    closed,
     fulfilledByHeader,
-    reconciliationStatus: draft.blocked ? "review" : "current",
+    reconciliationStatus: draftBlocked ? "review" : "current",
     applicationStatus: billed ? "Billed" : calculatedApplicationStatus,
     calculatedApplicationStatus,
-    reason: draft.blocked
+    reason: draftBlocked
       ? `Sales Order family reconciliation is blocked by an active operator packing draft on ${draft.orderRef || orderRef}.`
       : "",
-    blockedByActiveDraft: draft.blocked,
+    blockedByActiveDraft: draftBlocked,
     draft,
     quantities: progress,
     inventoryLineCount: inventoryLines.length,
@@ -676,7 +694,7 @@ export async function reconcileSalesOrderFromNetSuite({
       itemType: text(line.itemType)
     }))
   };
-  if (draft.blocked || dryRun) {
+  if (draftBlocked || dryRun) {
     return withTransaction(async () => {
       await persistSalesOrderCalculation({
         order,
@@ -687,7 +705,7 @@ export async function reconcileSalesOrderFromNetSuite({
         dryRun: true
       });
       await recordSalesOrderReconciliationAudit({ order, runId, source, dryRun: true, result: proposal });
-      if (!dryRun && draft.blocked) {
+      if (!dryRun && draftBlocked) {
         return {
           ...proposal,
           planCleanup: await reconcileSalesOrderFamilyInDispatchPlans({
@@ -718,7 +736,7 @@ export async function reconcileSalesOrderFromNetSuite({
     );
     void lockedFamilyRows;
     const liveDraft = await activeSalesOrderFamilyDraft(family);
-    if (liveDraft.blocked) {
+    if (liveDraft.blocked && !closed) {
       const blocked = {
         ...proposal,
         reconciliationStatus: "review",
@@ -746,7 +764,7 @@ export async function reconcileSalesOrderFromNetSuite({
     // those tables; this path writes only the separate calculation state.
 
     let planCleanup = { changedPlans: [], deferred: false, familyRefs: family.familyRefs };
-    if (fulfilledByHeader) {
+    if (fulfilledByHeader || closed) {
       await query(
         `DELETE FROM operator_saved_delivery_orders saved
           WHERE upper(saved.order_ref) = ANY($1::text[])
@@ -762,6 +780,7 @@ export async function reconcileSalesOrderFromNetSuite({
       // so the group can roll up to Partially Done/Completed; only an actual
       // Billed header uses the destructive dispatch-plan scrub.
       billed,
+      closed,
       reconciliationStatus: "current",
       reconciliationReason: "",
       reconciliationApplicationStatus: proposal.calculatedApplicationStatus,

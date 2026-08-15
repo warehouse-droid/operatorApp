@@ -515,6 +515,7 @@ const makeBlockedSaveQueueFixture = Function(
   let localPlanGeneration = 1;
   let lastSavedAt = "";
   let isApplyingRemotePlan = false;
+  let routeNotice = "";
   let firstSaveStartedResolve;
   let firstSaveResponseResolve;
   const firstSaveStarted = new Promise((resolve) => { firstSaveStartedResolve = resolve; });
@@ -523,6 +524,8 @@ const makeBlockedSaveQueueFixture = Function(
   const clearedGenerations = [];
   function isDispatchPlanEditor() { return true; }
   function autosaveDebug() {}
+  function render() {}
+  async function ensureGoogleRouteEstimatesBeforeSave() {}
   function shortHash(value) { return String(value || ""); }
   function planPayload(savedAt) {
     return { generation: localPlanGeneration, savedAt: savedAt.toISOString(), baseRevision: localPlanGeneration };

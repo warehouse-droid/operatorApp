@@ -251,6 +251,58 @@ try {
     assert.equal(blocked.blockedByActiveDraft, true);
     assert.equal((await query("SELECT status FROM sales_orders WHERE netsuite_id = $1", [sourceId])).rows[0].status, "B");
 
+    const closedWhileDraft = await reconcileSalesOrderFromNetSuite({
+      order: {
+        ...authoritative,
+        status: "H",
+        statusText: "Sales Order : Closed",
+        lines: authoritative.lines.map((line) => ({
+          ...line,
+          cumulativeProgressQuantity: line.sourceLineKey === "7001" ? 400 : 0
+        }))
+      },
+      source: "manual",
+      dryRun: false
+    });
+    assert.equal(closedWhileDraft.closed, true);
+    assert.equal(closedWhileDraft.blockedByActiveDraft, false,
+      "A terminal NetSuite Closed header must override an unfinished local packing draft.");
+    assert.equal(closedWhileDraft.applicationStatus, "Completed");
+    assert.deepEqual({
+      ordered: closedWhileDraft.quantities.ordered,
+      fulfilled: closedWhileDraft.quantities.fulfilled,
+      abandoned: closedWhileDraft.quantities.abandoned,
+      remaining: closedWhileDraft.quantities.remaining
+    }, {
+      ordered: 1088,
+      fulfilled: 400,
+      abandoned: 688,
+      remaining: 0
+    });
+    const closedCalculation = await query(
+      `SELECT netsuite_terminal_state, application_status, ordered_qty,
+              fulfilled_qty, abandoned_qty, remaining_qty
+         FROM scm_reconciliation_order_state
+        WHERE order_kind = 'SO'
+          AND source_order_netsuite_id = $1`,
+      [sourceId]
+    );
+    assert.deepEqual({
+      terminalState: closedCalculation.rows[0].netsuite_terminal_state,
+      applicationStatus: closedCalculation.rows[0].application_status,
+      ordered: Number(closedCalculation.rows[0].ordered_qty),
+      fulfilled: Number(closedCalculation.rows[0].fulfilled_qty),
+      abandoned: Number(closedCalculation.rows[0].abandoned_qty),
+      remaining: Number(closedCalculation.rows[0].remaining_qty)
+    }, {
+      terminalState: "closed",
+      applicationStatus: "Completed",
+      ordered: 1088,
+      fulfilled: 400,
+      abandoned: 688,
+      remaining: 0
+    });
+
     await query(
       `UPDATE sales_orders
           SET operator_status = 'open', preparing_operator_id = NULL

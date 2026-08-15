@@ -68,6 +68,17 @@ const rateCardState = {
   yardOptions: []
 };
 
+const MBBS_CHARGING_POLICY_RULES = Object.freeze({
+  schemaVersion: 1,
+  currency: "CAD",
+  soChargeBasis: "per_order_group_as_one",
+  toReplenishmentChargeBasis: "full_route_once",
+  toDirectPickupChargeBasis: "fixed_unit_once",
+  poChargeBasis: "shared_leg_equal_split",
+  poAdditionalDropBasis: "each_distinct_drop_after_first",
+  dispatchLoadSplitBasis: "ignored_for_charge"
+});
+
 const customerChargeConfigurationState = {
   configuration: null,
   loadedRateCardVersionId: "",
@@ -1089,7 +1100,9 @@ function renderRateCardRows() {
     const stateButton = document.createElement("button");
     stateButton.type = "button";
     stateButton.className = "mbt-button-secondary";
-    stateButton.textContent = item.cardActive === false ? "Activate" : "Inactivate";
+    stateButton.textContent = item.cardActive === false
+      ? "Enable named card (all versions)"
+      : "Disable named card (all versions)";
     stateButton.addEventListener("click", () => setRateCardActive(item, item.cardActive === false));
     const deleteButton = document.createElement("button");
     deleteButton.type = "button";
@@ -1101,7 +1114,7 @@ function renderRateCardRows() {
     row.append(
       identity,
       textCell(`v${item.versionNumber || 1}`),
-      textCell(`${item.status || "draft"}${item.cardActive === false ? " · card inactive" : ""}`),
+      textCell(`${item.status || "draft"}${item.cardActive === false ? " · named card disabled" : ""}`),
       textCell(effective),
       actionCell
     );
@@ -1124,7 +1137,10 @@ async function setRateCardActive(item, active) {
       body: { active, expectedRevision: Number(item.cardRevision) }
     });
     await loadRateCards();
-    setConfigMessage("rateCardsMessage", `${item.displayName || item.rateCardCode} is now ${active ? "active" : "inactive"}.`);
+    setConfigMessage(
+      "rateCardsMessage",
+      `${item.displayName || item.rateCardCode} is now ${active ? "enabled" : "disabled"}. This state is shared by all versions of the named card.`
+    );
   } catch (error) {
     setConfigMessage("rateCardsMessage", error.message, "attention");
   }
@@ -1266,7 +1282,11 @@ function initializeItemPricingState() {
   ]));
 }
 
-function appendItemDistanceBandRow(container, values = {}) {
+function appendItemDistanceBandRow(
+  container,
+  values = {},
+  itemCode = rateCardState.activePricingItemCode
+) {
   if (!container) return;
   const row = document.createElement("div");
   row.className = "mbt-form-grid mbt-rate-band-row";
@@ -1275,14 +1295,17 @@ function appendItemDistanceBandRow(container, values = {}) {
   purposeLabel.textContent = "Pricing purpose";
   const purpose = document.createElement("select");
   purpose.dataset.rateField = "serviceCode";
-  for (const [value, label] of [
-    ["delivery", "BIN delivery"],
-    ["aggregate_delivery", "Aggregate delivery"],
-    ["mbbs_cross_charge", "MBBS cross charge"]
-  ]) {
+  const purposes = itemCode === "DELIVERY_CHARGE_MBBS"
+    ? [["mbbs_cross_charge", "MBBS cross charge"]]
+    : [
+        ["delivery", "BIN delivery"],
+        ["aggregate_delivery", "Aggregate delivery"],
+        ["mbbs_cross_charge", "MBBS cross charge"]
+      ];
+  for (const [value, label] of purposes) {
     const option = document.createElement("option"); option.value = value; option.textContent = label; purpose.append(option);
   }
-  purpose.value = values.serviceCode || "delivery";
+  purpose.value = values.serviceCode || (itemCode === "DELIVERY_CHARGE_MBBS" ? "mbbs_cross_charge" : "delivery");
   purposeLabel.append(purpose);
   const binLabel = document.createElement("label");
   binLabel.textContent = "BIN size";
@@ -1496,9 +1519,9 @@ function renderRateItemEditor(itemCode) {
       const help = document.createElement("p"); help.className = "mbt-field-help";
       help.textContent = "Create one or more yard-specific price series. Quoted upper limits are inclusive: exactly 30 km stays in Within 30; the next band starts above 30. The final band has no maximum.";
       const list = document.createElement("div"); list.className = "mbt-rate-band-list";
-      for (const band of values.bands || []) appendItemDistanceBandRow(list, band);
+      for (const band of values.bands || []) appendItemDistanceBandRow(list, band, item.itemCode);
       const add = document.createElement("button"); add.type = "button"; add.className = "mbt-button-secondary"; add.textContent = "Add distance band";
-      add.addEventListener("click", () => appendItemDistanceBandRow(list));
+      add.addEventListener("click", () => appendItemDistanceBandRow(list, {}, item.itemCode));
       editor.append(help, list, add);
       break;
     }
@@ -1513,6 +1536,7 @@ function activateRatePricingItem(itemCode, { captureCurrent = true } = {}) {
   rateCardState.activePricingItemCode = itemCode;
   renderRatePricingItemOptions(itemCode);
   renderRateItemEditor(itemCode);
+  syncMbbsChargingPolicyVisibility();
 }
 
 function kmToMetres(value, label, { nullable = false } = {}) {
@@ -1563,13 +1587,49 @@ function assertNonOverlappingDistanceBands(bands, label) {
 }
 
 function cadMinorFromValue(value, label) {
-  const amount = Number(value);
-  if (!Number.isFinite(amount) || amount < 0 || Math.round(amount * 100) !== amount * 100) throw new Error(`${label} must be valid CAD.`);
-  return Math.round(amount * 100);
+  const match = /^(\d+)(?:\.(\d{1,2}))?$/u.exec(String(value ?? "").trim());
+  if (!match) {
+    throw new Error(`${label} must be valid CAD.`);
+  }
+  const minor = BigInt(match[1]) * 100n + BigInt(String(match[2] || "").padEnd(2, "0") || "0");
+  if (minor > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error(`${label} must be valid CAD.`);
+  }
+  return Number(minor);
 }
 
 function cadInputValue(minor) {
   return (Number(minor || 0) / 100).toFixed(2);
+}
+
+function syncMbbsChargingPolicyVisibility({ forceVisible = false } = {}) {
+  const section = readinessElement("mbbsChargingPolicy");
+  if (!section) return;
+  section.hidden = !(forceVisible
+    || rateCardState.activePricingItemCode === "DELIVERY_CHARGE_MBBS"
+    || rateItemConfigured("DELIVERY_CHARGE_MBBS"));
+}
+
+function populateMbbsChargingPolicy(policy) {
+  const direct = readinessElement("mbbsDirectPickupUnitPrice");
+  const poDrop = readinessElement("mbbsPoAdditionalDropUnitPrice");
+  if (direct) direct.value = cadInputValue(policy?.directPickupUnitAmountMinor ?? 10_000);
+  if (poDrop) poDrop.value = cadInputValue(policy?.poAdditionalDropUnitAmountMinor ?? 10_000);
+  syncMbbsChargingPolicyVisibility({ forceVisible: Boolean(policy) });
+}
+
+function mbbsChargingPolicyGraph() {
+  return {
+    ...MBBS_CHARGING_POLICY_RULES,
+    directPickupUnitAmountMinor: cadMinorFromValue(
+      inputValue("mbbsDirectPickupUnitPrice"),
+      "Direct-pickup TO unit price"
+    ),
+    poAdditionalDropUnitAmountMinor: cadMinorFromValue(
+      inputValue("mbbsPoAdditionalDropUnitPrice"),
+      "PO additional-drop unit price"
+    )
+  };
 }
 
 function populateSimplifiedRateEditor(detail) {
@@ -1584,6 +1644,7 @@ function populateSimplifiedRateEditor(detail) {
   set("rateCardCode", header.rateCardCode);
   set("rateCardDisplayName", header.displayName);
   set("rateCardNotes", version.calculationNotes);
+  populateMbbsChargingPolicy(graph.mbbsChargingPolicy);
   if (version.effectiveFrom) set("rateCardEffectiveFrom", new Date(version.effectiveFrom).toISOString().slice(0, 16));
   initializeItemPricingState();
   for (const component of graph.components || []) {
@@ -1674,6 +1735,7 @@ function newRateCardEditor() {
     const field = readinessElement(id); if (field) { field.value = ""; field.readOnly = false; }
   }
   initializeItemPricingState();
+  populateMbbsChargingPolicy(null);
   const submit = readinessElement("rateCardForm")?.querySelector("button[type='submit']");
   if (submit) submit.textContent = "Save draft";
   activateRatePricingItem(firstAvailableRateItemCode(), {
@@ -1752,6 +1814,9 @@ function simplifiedRateCardGraph() {
     }
   }
   if (distanceBands.length) assertNonOverlappingDistanceBands(distanceBands, "Distance");
+  const hasMbbsCrossCharge = distanceBands.some((band) => (
+    band.itemCode === "DELIVERY_CHARGE_MBBS" && band.serviceCode === "mbbs_cross_charge"
+  ));
   return {
     rateCard: {
       rateCardCode: inputValue("rateCardCode").toUpperCase(),
@@ -1774,7 +1839,8 @@ function simplifiedRateCardGraph() {
     distanceBands,
     components,
     dumpTariffs,
-    depositRules: []
+    depositRules: [],
+    mbbsChargingPolicy: hasMbbsCrossCharge ? mbbsChargingPolicyGraph() : null
   };
 }
 
@@ -1835,6 +1901,14 @@ async function runRateCardLifecycle(action) {
     setConfigMessage("rateCardsMessage", "Select a rate-card version and positive revision.", "attention");
     return;
   }
+  const selected = rateCardState.items.find((item) => item.rateCardVersionId === versionId);
+  const activeVersion = action === "activate" && selected
+    ? rateCardState.items.find((item) => (
+      item.rateCardId === selected.rateCardId
+        && item.rateCardVersionId !== versionId
+        && item.status === "active"
+    ))
+    : null;
   setConfigMessage("rateCardsMessage", `${action === "clone" ? "Cloning" : `${action}ing`} rate-card version…`);
   try {
     const result = await api(
@@ -1844,14 +1918,20 @@ async function runRateCardLifecycle(action) {
         idempotencyKey: commandIdentity(`mbt-rate-card-${action}`),
         body: {
           expectedRevision,
-          reason: inputValue("rateCardLifecycleReason")
+          reason: inputValue("rateCardLifecycleReason"),
+          ...(action === "activate" && activeVersion
+            ? { replacesRateCardVersionId: activeVersion.rateCardVersionId }
+            : {})
         }
       }
     );
     updateRateLifecycle(result.version);
     await loadRateCards();
     await loadRateCardForEdit(String(result.version?.rateCardVersionId || versionId));
-    setConfigMessage("rateCardsMessage", `Rate-card ${action} completed locally.`);
+    const cutoverMessage = action === "activate" && result.replacedRateCardVersionId
+      ? ` Previous v${activeVersion?.versionNumber || "?"} was retired atomically.`
+      : "";
+    setConfigMessage("rateCardsMessage", `Rate-card ${action} completed locally.${cutoverMessage}`);
   } catch (error) {
     setConfigMessage("rateCardsMessage", error.message, "attention");
   }

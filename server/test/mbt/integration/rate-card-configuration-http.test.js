@@ -7,6 +7,7 @@ import { MbtError } from "../../../src/mbt/errors.js";
 import { createMbtRouter } from "../../../src/mbt/router.js";
 
 const VERSION_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const REPLACED_VERSION_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 const ACTORS = Object.freeze({
   admin: Object.freeze({
     id: "p3-rate-http-admin",
@@ -349,6 +350,7 @@ test("P3-F12 HTTP: create, validate, and activate bind the server actor and requ
   const commandBody = {
     actor: { operatorId: "browser-forgery", roles: ["admin"] },
     expectedRevision: 1,
+    replacesRateCardVersionId: REPLACED_VERSION_ID,
     reason: "Approve synthetic rate graph"
   };
   const validated = await request(`/api/mbt/config/rate-cards/${VERSION_ID}/validate`, {
@@ -384,6 +386,7 @@ test("P3-F12 HTTP: create, validate, and activate bind the server actor and requ
   assert.equal(calls[1].input.expectedRevision, 1);
   assert.equal(calls[1].input.idempotencyKey, "p3-rate-http-validate");
   assert.equal(calls[2].input.rateCardVersionId, VERSION_ID);
+  assert.equal(calls[2].input.replacesRateCardVersionId, REPLACED_VERSION_ID);
   assert.equal(calls[2].input.idempotencyKey, "p3-rate-http-activate");
   assert.equal(netSuiteTransportCalls, 0);
 });

@@ -1,4 +1,5 @@
 import { rollupReconciliationGroup } from "./scm-reconciliation.js";
+import { isNetSuiteOrderClosed } from "./netsuite-closed-order-policy.js";
 
 const EXACT_BILLED_STATUS_CODE = "G";
 const INVENTORY_ITEM_TYPES = new Set([
@@ -88,6 +89,57 @@ export function isNetSuiteSalesOrderFulfilled(order = {}) {
     "pending billing",
     "sales order:pending billing"
   ].includes(label);
+}
+
+export function isNetSuiteSalesOrderClosed(order = {}) {
+  return isNetSuiteOrderClosed(order);
+}
+
+export function deriveSalesOrderReconciliationState({
+  lines = [],
+  billed = false,
+  fulfilledByHeader = false,
+  closed = false
+} = {}) {
+  const progress = (Array.isArray(lines) ? lines : []).map((line) => {
+    const ordered = number(line?.quantity);
+    const fulfilled = Math.min(
+      fulfilledByHeader ? ordered : number(
+        line?.cumulativeProgressQuantity
+          ?? line?.netsuite_received_qty
+          ?? line?.quantityshiprecv
+      ),
+      ordered
+    );
+    return { ordered, fulfilled };
+  });
+  const ordered = progress.reduce((sum, line) => sum + line.ordered, 0);
+  const fulfilled = progress.reduce((sum, line) => sum + line.fulfilled, 0);
+  const hasProgress = progress.some((line) => line.fulfilled > 0.000001);
+  const complete = progress.length > 0
+    && progress.every((line) => line.fulfilled + 0.000001 >= line.ordered);
+  const fulfillmentStatus = complete
+    ? "fulfilled"
+    : hasProgress
+      ? "partial_fulfilled"
+      : "not_fulfilled";
+  const applicationStatus = closed
+    ? hasProgress ? "Completed" : "Cancelled"
+    : billed || complete
+      ? "Completed"
+      : hasProgress
+        ? "Partially Done"
+        : "Queued";
+  return {
+    applicationStatus,
+    fulfillmentStatus,
+    quantities: {
+      ordered,
+      fulfilled,
+      abandoned: closed ? Math.max(ordered - fulfilled, 0) : 0,
+      remaining: closed ? 0 : Math.max(ordered - fulfilled, 0)
+    }
+  };
 }
 
 export function isSalesOrderInventoryLine(line = {}) {

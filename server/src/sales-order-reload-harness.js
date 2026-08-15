@@ -520,9 +520,9 @@ await expectRejectCode(() => authorizeSalesOrderReload({
       reason: "damaged wrap",
       actor: { id: "manager-1", yardLocationIds: [15] }
     }, fixture.dependencies),
-    (error) => error.code === "RELOAD_DRIVER_COMPLETE" && error.status === 409
+    (error) => error.code === "REATTEMPT_EVIDENCE_STALE" && error.status === 400
   );
-  assert.equal(fixture.audits.length, 0, "Failed authorization must not claim a success audit.");
+  assert.equal(fixture.audits.length, 0, "A completed drop-off without explicit immutable evidence must not claim a success audit.");
 }
 
 {

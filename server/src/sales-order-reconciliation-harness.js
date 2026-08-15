@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import {
   filterDbBackedSalesOrderReconciliationCandidates,
+  deriveSalesOrderReconciliationState,
   isNetSuiteSalesOrderBilled,
+  isNetSuiteSalesOrderClosed,
   isNetSuiteSalesOrderFulfilled,
   isSalesOrderInventoryLine,
   mapNetSuiteSalesOrderLine,
@@ -62,6 +64,64 @@ assert.equal(isNetSuiteSalesOrderBilled({ status_text: " Sales Order:  Billed " 
 assert.equal(isNetSuiteSalesOrderBilled({ statusText: "Sales   Order :  Billed" }), true);
 assert.equal(isNetSuiteSalesOrderBilled({ netsuiteStatusText: "Billed" }), true);
 assert.equal(isNetSuiteSalesOrderBilled(), false);
+
+for (const order of [
+  { status: "H" },
+  { statusText: "Closed" },
+  { status_text: "Sales Order : Closed" },
+  { netsuiteStatusText: " sales order:  closed " }
+]) {
+  assert.equal(isNetSuiteSalesOrderClosed(order), true, JSON.stringify(order));
+}
+for (const order of [
+  {},
+  { status: "G", statusText: "Sales Order : Billed" },
+  { statusText: "Pending Fulfillment" },
+  { statusText: "Not Closed Yet" }
+]) {
+  assert.equal(isNetSuiteSalesOrderClosed(order), false, JSON.stringify(order));
+}
+
+assert.deepEqual(deriveSalesOrderReconciliationState({
+  closed: true,
+  lines: [{ quantity: 100, cumulativeProgressQuantity: 40 }]
+}), {
+  applicationStatus: "Completed",
+  fulfillmentStatus: "partial_fulfilled",
+  quantities: {
+    ordered: 100,
+    fulfilled: 40,
+    abandoned: 60,
+    remaining: 0
+  }
+});
+
+assert.deepEqual(deriveSalesOrderReconciliationState({
+  closed: true,
+  lines: [{ quantity: 100, cumulativeProgressQuantity: 0 }]
+}), {
+  applicationStatus: "Cancelled",
+  fulfillmentStatus: "not_fulfilled",
+  quantities: {
+    ordered: 100,
+    fulfilled: 0,
+    abandoned: 100,
+    remaining: 0
+  }
+});
+
+assert.deepEqual(deriveSalesOrderReconciliationState({
+  lines: [{ quantity: 100, cumulativeProgressQuantity: 40 }]
+}), {
+  applicationStatus: "Partially Done",
+  fulfillmentStatus: "partial_fulfilled",
+  quantities: {
+    ordered: 100,
+    fulfilled: 40,
+    abandoned: 0,
+    remaining: 60
+  }
+});
 
 for (const statusText of [
   "Fulfilled",

@@ -18,7 +18,7 @@ function normalizedStatusText(value) {
     .toLowerCase();
 }
 
-export function classifyNetSuiteLifecycle(statusText = "") {
+export function classifyNetSuiteLifecycle(statusText = "", statusCode = "") {
   const text = normalizedStatusText(statusText);
   const partiallyReceived = /\bpartially received\b/.test(text);
   const partiallyFulfilled = /\bpartially fulfilled\b/.test(text);
@@ -26,7 +26,9 @@ export function classifyNetSuiteLifecycle(statusText = "") {
   return {
     text,
     cancelled: /\b(cancelled|canceled|voided|void)\b/.test(text),
-    closed: /\bclosed\b/.test(text) || /\bfully billed\b/.test(text),
+    closed: String(statusCode || "").trim().toUpperCase() === "H"
+      || exactLeaf("closed")
+      || exactLeaf("fully billed"),
     partiallyReceived,
     partiallyFulfilled,
     pendingReceipt: /\bpending receipt\b/.test(text),
@@ -94,6 +96,7 @@ function preservedQueueStatus(status = "Queued") {
 export function derivePoToReconciliationState({
   kind,
   statusText = "",
+  statusCode = "",
   orderedQty = 0,
   fulfilledQty = 0,
   receivedQty = 0,
@@ -112,7 +115,7 @@ export function derivePoToReconciliationState({
   let fulfilled = orderKind === "TO" ? roundReconciliationQuantity(fulfilledQty) : 0;
   let received = roundReconciliationQuantity(receivedQty);
   const previousReceived = roundReconciliationQuantity(previousReceivedQty);
-  const lifecycle = classifyNetSuiteLifecycle(statusText);
+  const lifecycle = classifyNetSuiteLifecycle(statusText, statusCode);
   const headerReceiptComplete = netSuiteHeaderCompletesReceipt(orderKind, lifecycle);
   if (headerReceiptComplete) {
     received = ordered;
@@ -128,8 +131,11 @@ export function derivePoToReconciliationState({
   const destinationRemaining = lifecycle.closed || lifecycle.cancelled
     ? 0
     : Math.max(ordered - received, 0);
+  const terminalProgress = orderKind === "TO"
+    ? Math.max(fulfilled, received)
+    : received;
   const abandoned = lifecycle.closed
-    ? Math.max(ordered - received, 0)
+    ? Math.max(ordered - terminalProgress, 0)
     : 0;
 
   let applicationStatus = preservedQueueStatus(previousStatus);
@@ -169,11 +175,7 @@ export function derivePoToReconciliationState({
       applicationStatus = "Cancelled";
     }
   } else if (lifecycle.closed) {
-    if (orderKind === "TO" && fulfilled > EPSILON && received <= EPSILON) {
-      applicationStatus = "Reconcile Review";
-      reconciliationStatus = "review";
-      reason = "The closed transfer has source fulfillment but no destination receipt.";
-    } else if (received > EPSILON || fullyReceived) {
+    if (terminalProgress > EPSILON || fullyReceived) {
       applicationStatus = "Completed";
     } else {
       applicationStatus = "Cancelled";

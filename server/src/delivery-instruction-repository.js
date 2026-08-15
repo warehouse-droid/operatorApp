@@ -10,6 +10,7 @@ import {
   normalizeDeliveryInstructionText
 } from "./delivery-instruction-domain.js";
 import { salesStoreLocationIdSql } from "./sales-store.js";
+import { netSuiteClosedOrderFamilySql } from "./netsuite-closed-order-policy.js";
 
 const EFFECTIVE_ORDERING_LOCATION_SQL = `COALESCE(
   so.order_location_id,
@@ -182,6 +183,7 @@ export async function listDeliveryInstructionOrders({
        LEFT JOIN sales_order_delivery_instructions instruction
          ON instruction.sales_order_id = so.netsuite_id
       WHERE lower(btrim(COALESCE(so.sales_order_type, ''))) = 'delivery'
+        AND NOT ${netSuiteClosedOrderFamilySql("so", "SO")}
         AND NOT EXISTS (
           SELECT 1
             FROM dispatch_scm_so_splits split
@@ -220,6 +222,7 @@ async function findOrderRow(identifier) {
          LEFT JOIN dispatch_scm_so_splits split
            ON split.split_so_id = requested.netsuite_id
         WHERE lower(btrim(COALESCE(requested.sales_order_type, ''))) = 'delivery'
+          AND NOT ${netSuiteClosedOrderFamilySql("requested", "SO")}
           AND (($1::bigint IS NOT NULL AND requested.netsuite_id = $1::bigint)
                OR upper(btrim(COALESCE(requested.tranid, ''))) = upper($2))
         ORDER BY CASE WHEN $1::bigint IS NOT NULL AND requested.netsuite_id = $1::bigint THEN 0 ELSE 1 END
@@ -548,7 +551,9 @@ export async function getDeliveryInstructionMedia(mediaId) {
             ${EFFECTIVE_ORDERING_LOCATION_SQL} AS ordering_location_id
        FROM sales_order_delivery_instruction_media media
        JOIN sales_orders so ON so.netsuite_id = media.sales_order_id
-      WHERE media.id = $1::uuid AND media.deleted_at IS NULL`,
+      WHERE media.id = $1::uuid
+        AND media.deleted_at IS NULL
+        AND NOT ${netSuiteClosedOrderFamilySql("so", "SO")}`,
     [String(mediaId || "").trim()]
   ).catch(() => ({ rows: [], rowCount: 0 }));
   if (!result.rowCount) throw repositoryError("Delivery-instruction media was not found.", 404, "DELIVERY_INSTRUCTION_MEDIA_NOT_FOUND");
@@ -576,6 +581,7 @@ export async function getDeliveryInstructionsForDriverOrderIds(orderIds = []) {
          LEFT JOIN dispatch_scm_so_splits split
            ON split.split_so_id = requested.netsuite_id
         WHERE lower(btrim(COALESCE(requested.sales_order_type, ''))) = 'delivery'
+          AND NOT ${netSuiteClosedOrderFamilySql("requested", "SO")}
      )
      SELECT requested.requested_order_id,
             requested.requested_order_ref,

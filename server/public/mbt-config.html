@@ -336,6 +336,37 @@
             <section id="rateItemEditor" class="mbt-rate-section" aria-live="polite">
               <p>Select an item to configure its price.</p>
             </section>
+            <section
+              id="mbbsChargingPolicy"
+              class="mbt-rate-section mbt-charging-policy"
+              aria-labelledby="mbbsChargingPolicyTitle"
+              hidden
+            >
+              <div class="mbt-section-heading">
+                <div>
+                  <h4 id="mbbsChargingPolicyTitle">MBBS Charging Policy</h4>
+                  <p>These rules belong to this effective-dated rate-card version. Clone an active version before changing either unit price.</p>
+                </div>
+                <span class="mbt-local-badge">CAD · versioned</span>
+              </div>
+              <div class="mbt-form-grid">
+                <label>
+                  Direct-pickup TO unit price (CAD)
+                  <input id="mbbsDirectPickupUnitPrice" type="number" min="0" step="0.01" inputmode="decimal" value="100.00" required />
+                </label>
+                <label>
+                  PO additional-drop unit price (CAD)
+                  <input id="mbbsPoAdditionalDropUnitPrice" type="number" min="0" step="0.01" inputmode="decimal" value="100.00" required />
+                </label>
+              </div>
+              <dl class="mbt-policy-rules">
+                <div><dt>Sales Order</dt><dd>Charge the full distance-band price once per SO. An explicit SO group is one charge and retains every child order.</dd></div>
+                <div><dt>Transfer Order</dt><dd>Charge a replenishment TO once at the full route distance-band price. Charge a direct-pickup/drop-ship TO once at the direct-pickup unit price.</dd></div>
+                <div><dt>Purchase Order</dt><dd>PO split references sharing one business leg create one distance-band charge, allocated evenly in exact cents.</dd></div>
+                <div><dt>PO additional drops</dt><dd>Add the configured PO unit price for each distinct drop after the first.</dd></div>
+                <div><dt>Groups and loads</dt><dd>An explicit group remains one charge with child references retained. Dispatch load splits do not change any SO, TO, or PO charge.</dd></div>
+              </dl>
+            </section>
             <div class="mbt-form-grid">
               <label id="rateCardReasonField" class="mbt-form-wide" hidden>Update note<textarea id="rateCardReason" maxlength="2000" rows="2" placeholder="Required when updating an existing draft"></textarea></label>
             </div>

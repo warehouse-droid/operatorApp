@@ -17,6 +17,18 @@ const LOCAL_ITEMS = Object.freeze([
     revision: 1
   },
   {
+    itemCode: "DELIVERY_CHARGE_MBBS",
+    displayName: "Delivery Charge MBBS",
+    itemType: "delivery_fee",
+    chargeBasis: "distance",
+    rentalPeriodDays: null,
+    priceMode: "rate_card",
+    binTypeCode: null,
+    localReady: true,
+    active: true,
+    revision: 1
+  },
+  {
     itemCode: "14YD",
     displayName: "14 yard bin",
     itemType: "bin",
@@ -117,12 +129,28 @@ function rateDetail(currentVersion = version()) {
         {
           itemCode: "DELIVERY_CROSS_CHARGE", serviceCode: "delivery", binTypeCode: "14YD",
           minimumMetres: 0, maximumMetres: null, amountMinor: 15000
+        },
+        {
+          itemCode: "DELIVERY_CHARGE_MBBS", serviceCode: "mbbs_cross_charge", binTypeCode: null,
+          minimumMetres: 0, maximumMetres: null, amountMinor: 20000
         }
       ],
       dumpTariffs: [{
         itemCode: "CLEAN_FILL", materialCode: null, amountMinor: 17500, minimumAmountMinor: 0
       }],
-      depositRules: []
+      depositRules: [],
+      mbbsChargingPolicy: {
+        schemaVersion: 1,
+        currency: "CAD",
+        directPickupUnitAmountMinor: 12345,
+        poAdditionalDropUnitAmountMinor: 4567,
+        soChargeBasis: "per_order_group_as_one",
+        toReplenishmentChargeBasis: "full_route_once",
+        toDirectPickupChargeBasis: "fixed_unit_once",
+        poChargeBasis: "shared_leg_equal_split",
+        poAdditionalDropBasis: "each_distinct_drop_after_first",
+        dispatchLoadSplitBasis: "ignored_for_charge"
+      }
     }
   };
 }
@@ -413,6 +441,7 @@ test("P4 browser: dump sites and item-owned pricing use only the charging fields
     "Select a local item",
     "Delivery Charge - MBT · Delivery fee",
     "14 yard bin · Bin · 14 cubic yards",
+    "Delivery Charge MBBS · Delivery fee",
     "Clean fill · Dump",
     "Concrete · Dump",
     "HPB · Aggregate",
@@ -442,6 +471,21 @@ test("P4 browser: dump sites and item-owned pricing use only the charging fields
   await pricingItem.selectOption("OVERTIME_SURCHARGE");
   await expect(page.locator("#rateItemEditor")).toContainText("added manually");
   await expect(page.locator("#rateItemEditor input")).toHaveCount(0);
+
+  await pricingItem.selectOption("DELIVERY_CHARGE_MBBS");
+  await expect(page.locator("#mbbsChargingPolicy")).toBeVisible();
+  await expect(page.locator("#mbbsChargingPolicy")).toContainText("Sales Order");
+  await expect(page.locator("#mbbsChargingPolicy")).toContainText("Transfer Order");
+  await expect(page.locator("#mbbsChargingPolicy")).toContainText("Purchase Order");
+  await page.locator("#mbbsDirectPickupUnitPrice").fill("123.45");
+  await page.locator("#mbbsPoAdditionalDropUnitPrice").fill("45.67");
+  await page.getByRole("button", { name: "Add distance band" }).click();
+  const mbbsRow = page.locator("#rateItemEditor [data-rate-kind='item_distance']");
+  await expect(mbbsRow).toHaveCount(1);
+  await expect(mbbsRow.locator('[data-rate-field="serviceCode"]')).toHaveValue("mbbs_cross_charge");
+  await expect(mbbsRow.locator('[data-rate-field="serviceCode"] option')).toHaveText(["MBBS cross charge"]);
+  await mbbsRow.locator('[data-rate-field="minimumKm"]').fill("0");
+  await mbbsRow.locator('[data-rate-field="amountCad"]').fill("200.00");
 
   await pricingItem.selectOption("DELIVERY_CROSS_CHARGE");
   await page.getByRole("button", { name: "Add distance band" }).click();
@@ -518,14 +562,27 @@ test("P4 browser: dump sites and item-owned pricing use only the charging fields
   expect(creates[0].body.graph.dumpTariffs).toHaveLength(3);
   expect(creates[0].body.graph.distanceBands).toEqual(expect.arrayContaining([
     expect.objectContaining({ itemCode: "DELIVERY_CROSS_CHARGE", minimumMetres: 0, maximumMetres: 10000 }),
-    expect.objectContaining({ itemCode: "DELIVERY_CROSS_CHARGE", minimumMetres: 10000, maximumMetres: null })
+    expect.objectContaining({ itemCode: "DELIVERY_CROSS_CHARGE", minimumMetres: 10000, maximumMetres: null }),
+    expect.objectContaining({ itemCode: "DELIVERY_CHARGE_MBBS", minimumMetres: 0, maximumMetres: null })
   ]));
-  expect(creates[0].body.graph.distanceBands).toHaveLength(2);
+  expect(creates[0].body.graph.distanceBands).toHaveLength(3);
+  expect(creates[0].body.graph.mbbsChargingPolicy).toEqual(expect.objectContaining({
+    directPickupUnitAmountMinor: 12345,
+    poAdditionalDropUnitAmountMinor: 4567,
+    soChargeBasis: "per_order_group_as_one",
+    toDirectPickupChargeBasis: "fixed_unit_once",
+    poAdditionalDropBasis: "each_distinct_drop_after_first",
+    dispatchLoadSplitBasis: "ignored_for_charge"
+  }));
   const updates = calls.filter((call) => call.path === `/api/mbt/config/rate-cards/${VERSION_ID}`);
   expect(updates.at(-1).body.graph.rateCard.itemCode).toBeNull();
   expect(updates.at(-1).body.graph.components).toEqual(expect.arrayContaining([
     expect.objectContaining({ itemCode: "14YD", componentKind: "rental", amountMinor: 12000 })
   ]));
+  expect(updates.at(-1).body.graph.mbbsChargingPolicy).toEqual(expect.objectContaining({
+    directPickupUnitAmountMinor: 12345,
+    poAdditionalDropUnitAmountMinor: 4567
+  }));
   expect(calls.some((call) => call.path.endsWith("/clone"))).toBe(true);
   const overflow = await page.evaluate(() => (
     globalThis.document.documentElement.scrollWidth - globalThis.document.documentElement.clientWidth

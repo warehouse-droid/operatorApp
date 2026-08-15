@@ -63,3 +63,12 @@ test("P3-F12 browser contract: the client is no-store, local-only, and preserves
   assert.match(client, /setSelectionRange\s*\(/);
   assert.match(client, /rateCardsPanel|rateCardEditor/);
 });
+
+test("P3-F12 browser contract: version activation performs an explicit cutover and names shared card state", () => {
+  assert.match(client, /replacesRateCardVersionId:\s*activeVersion\.rateCardVersionId/u);
+  assert.match(client, /item\.rateCardId === selected\.rateCardId/u);
+  assert.match(client, /Previous v.*retired atomically/u);
+  assert.match(client, /Enable named card \(all versions\)/u);
+  assert.match(client, /Disable named card \(all versions\)/u);
+  assert.match(client, /state is shared by all versions/u);
+});

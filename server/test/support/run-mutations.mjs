@@ -58,8 +58,11 @@ const P3_RATE_CSV_SERVICE_TARGET_TESTS = Object.freeze([
 
 const P3_MBBS_BILLING_CANDIDATE_TARGET_TESTS = Object.freeze([
   "test/mbt/unit/mbbs-driver-billing-planner.red.test.js",
+  "test/mbt/unit/mbbs-rate-card-charging-policy.red.test.js",
   "test/mbt/unit/mbbs-order-billing-v3.contract.test.js",
+  "test/mbt/property/mbbs-rate-card-charging-policy.property.test.js",
   "test/mbt/integration/mbbs-billing-candidates.test.js",
+  "test/mbt/integration/mbbs-rate-card-charging-policy.test.js",
   "test/mbt/concurrency/mbbs-billing-address-override-races.test.js",
   "test/mbt/integration/mbbs-order-billing-v3.red.test.js"
 ]);
@@ -629,6 +632,62 @@ const P3_MUTANTS = Object.freeze([
     to: "  const distanceBandAmountMinor = rateAmount;"
   },
   {
+    name: "P3 MBBS direct TO uses the PO additional-drop price",
+    scope: "mbbs_billing",
+    file: "mbbs-driver-billing-planner.js",
+    targetTests: P3_MBBS_BILLING_CANDIDATE_TARGET_TESTS,
+    from: "    ? policy.directPickupUnitAmountMinor",
+    to: "    ? policy.poAdditionalDropUnitAmountMinor"
+  },
+  {
+    name: "P3 MBBS PO additional drops use the direct-TO price",
+    scope: "mbbs_billing",
+    file: "mbbs-driver-billing-planner.js",
+    targetTests: P3_MBBS_BILLING_CANDIDATE_TARGET_TESTS,
+    from: "      ? policy.poAdditionalDropUnitAmountMinor",
+    to: "      ? policy.directPickupUnitAmountMinor"
+  },
+  {
+    name: "P3 MBBS policy accepts a negative unit price",
+    scope: "mbbs_billing",
+    file: "mbbs-rate-card-policy.js",
+    targetTests: P3_MBBS_BILLING_CANDIDATE_TARGET_TESTS,
+    from: "  if (typeof value !== \"number\" || !Number.isSafeInteger(value) || value < 0) {",
+    to: "  if (typeof value !== \"number\" || !Number.isSafeInteger(value)) {"
+  },
+  {
+    name: "P3 MBBS policy accepts a changed hidden charging rule",
+    scope: "mbbs_billing",
+    file: "mbbs-rate-card-policy.js",
+    targetTests: P3_MBBS_BILLING_CANDIDATE_TARGET_TESTS,
+    from: "    if (input[field] !== expected) {",
+    to: "    if (false && input[field] !== expected) {"
+  },
+  {
+    name: "P3 MBBS missing policy loses its fail-closed error boundary",
+    scope: "mbbs_billing",
+    file: "mbbs-rate-card-policy.js",
+    targetTests: P3_MBBS_BILLING_CANDIDATE_TARGET_TESTS,
+    from: "  if (value === null || value === undefined) {",
+    to: "  if (false && (value === null || value === undefined)) {"
+  },
+  {
+    name: "P3 MBBS rate-card detail hides an existing version policy",
+    scope: "mbbs_billing",
+    file: "rate-card-configuration-service.js",
+    targetTests: P3_MBBS_BILLING_CANDIDATE_TARGET_TESTS,
+    from: "      mbbsChargingPolicy: header.rows[0].policySchemaVersion === null",
+    to: "      mbbsChargingPolicy: header.rows[0].policySchemaVersion !== null"
+  },
+  {
+    name: "P3 MBBS durable billing evidence drops the selected version policy",
+    scope: "mbbs_billing",
+    file: "shadow-billing-service.js",
+    targetTests: P3_MBBS_BILLING_CANDIDATE_TARGET_TESTS,
+    from: "      mbbsChargingPolicy: selected.mbbsChargingPolicy,",
+    to: "      mbbsChargingPolicy: null,"
+  },
+  {
     name: "P3 MBBS manual final charge no longer has to match calculation plus adjustment",
     scope: "mbbs_billing",
     file: "mbbs-driver-billing-planner.js",
@@ -806,8 +865,8 @@ if (LOCAL_ITEM_MUTANTS.length !== 7) {
 if (BILLING_APPROVAL_MUTANTS.length !== 4) {
   throw new Error(`The frozen billing-approval mutation set must contain exactly 4 mutants, found ${BILLING_APPROVAL_MUTANTS.length}.`);
 }
-if (P3_MUTANTS.length !== 41) {
-  throw new Error(`The frozen Phase 3 mutation set must contain exactly 41 mutants, found ${P3_MUTANTS.length}.`);
+if (P3_MUTANTS.length !== 48) {
+  throw new Error(`The frozen Phase 3 mutation set must contain exactly 48 mutants, found ${P3_MUTANTS.length}.`);
 }
 const mutationPhase = String(process.env.MBT_MUTATION_PHASE || "P1").toUpperCase();
 if (mutationPhase !== "P1" && mutationPhase !== "P2" && mutationPhase !== "P3") {
@@ -823,8 +882,8 @@ if (mutationScope && mutationPhase !== "P3") {
 const scopedP3Mutants = P3_MUTANTS.filter((mutant) => (
   "scope" in mutant && mutant.scope === "mbbs_billing"
 ));
-if (scopedP3Mutants.length !== 19) {
-  throw new Error(`The MBBS Billing mutation scope must contain exactly 19 mutants, found ${scopedP3Mutants.length}.`);
+if (scopedP3Mutants.length !== 26) {
+  throw new Error(`The MBBS Billing mutation scope must contain exactly 26 mutants, found ${scopedP3Mutants.length}.`);
 }
 const MUTANTS = mutationScope === "MBBS_BILLING"
   ? Object.freeze([...scopedP3Mutants])

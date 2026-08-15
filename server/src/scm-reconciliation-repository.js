@@ -13,6 +13,7 @@ import {
   filterDbBackedSalesOrderReconciliationCandidates,
   normalizeSalesOrderReconciliationType
 } from "./sales-order-reconciliation.js";
+import { assertNoClosedNetSuiteOrders } from "./netsuite-closed-order-repository.js";
 
 const EPSILON = 0.000001;
 const RECONCILIATION_SCHEMA_VERSION = "mbbs.ifir.reconciliation.v1";
@@ -2496,8 +2497,8 @@ export function scmReconciliationLineIdentityIssues(lines = []) {
     );
 }
 
-function currentLifecycleTerminal(statusText) {
-  const lifecycle = classifyNetSuiteLifecycle(statusText);
+function currentLifecycleTerminal(statusText, statusCode = "") {
+  const lifecycle = classifyNetSuiteLifecycle(statusText, statusCode);
   if (lifecycle.cancelled) return lifecycle.text.includes("void") ? "voided" : "cancelled";
   if (lifecycle.closed) return "closed";
   return "open";
@@ -2632,7 +2633,7 @@ async function upsertOrderState({
       order.tranid,
       order.status,
       order.statusText,
-      currentLifecycleTerminal(order.statusText),
+      currentLifecycleTerminal(order.statusText, order.status),
       derived.applicationStatus,
       reconciliationReason ? "review" : derived.reconciliationStatus,
       reconciliationReason || derived.reason,
@@ -2675,11 +2676,16 @@ async function upsertOrderLineState({
 }) {
   const ordered = roundReconciliationQuantity(line.quantity);
   const progress = order.kind === "TO" ? fulfilledQty : receivedQty;
-  const lifecycle = classifyNetSuiteLifecycle(order.statusText);
-  const abandoned = lifecycle.closed ? Math.max(ordered - receivedQty, 0) : 0;
+  const lifecycle = classifyNetSuiteLifecycle(order.statusText, order.status);
+  const terminalProgress = order.kind === "TO"
+    ? Math.max(fulfilledQty, receivedQty)
+    : receivedQty;
+  const abandoned = lifecycle.closed ? Math.max(ordered - terminalProgress, 0) : 0;
   const remaining = lifecycle.closed || lifecycle.cancelled ? 0 : Math.max(ordered - progress, 0);
   const lineStatus = ["ambiguous", "missing"].includes(text(identityStatus).toLowerCase())
     ? "review"
+    : lifecycle.closed
+      ? terminalProgress > EPSILON ? "completed" : "cancelled"
     : lifecycle.cancelled && progress <= EPSILON
       ? "cancelled"
       : receivedQty + EPSILON >= ordered && ordered > EPSILON
@@ -3748,6 +3754,7 @@ export async function reconcileScmOrderFamily({
   const familyDerived = derivePoToReconciliationState({
     kind: order.kind,
     statusText: order.statusText,
+    statusCode: order.status,
     orderedQty: orderedTotal,
     fulfilledQty: fulfilledTotal,
     receivedQty: receivedTotal,
@@ -3829,6 +3836,7 @@ export async function reconcileScmOrderFamily({
     const derived = derivePoToReconciliationState({
       kind: order.kind,
       statusText: order.statusText,
+      statusCode: order.status,
       orderedQty: target.ordered,
       fulfilledQty: target.fulfilled,
       receivedQty: target.received,
@@ -3990,7 +3998,7 @@ export async function reconcileScmOrderFamily({
     evidence: {
       statusCode: order.status,
       statusText: order.statusText,
-      lifecycle: currentLifecycleTerminal(order.statusText),
+      lifecycle: currentLifecycleTerminal(order.statusText, order.status),
       lastModifiedAt: order.lastModifiedAt || null,
       sourceLocationId: order.sourceLocationId || null,
       destinationLocationId: order.destinationLocationId || null,
@@ -6087,6 +6095,7 @@ export async function assertScmReconciliationOrderEditable({
     .filter(Boolean)
     .map((value) => value.toLowerCase()))];
   if (!refs.length) return true;
+  await assertNoClosedNetSuiteOrders(refs, "be changed in SCM");
   const cleanKind = text(kind).toUpperCase();
   const result = await query(
     `WITH blocked_schedule AS (
@@ -7023,6 +7032,7 @@ export async function resolveScmReconciliationReview({
         const derived = derivePoToReconciliationState({
           kind: source.kind,
           statusText: state.netsuite_status_text,
+          statusCode: state.netsuite_status_code,
           orderedQty: ordered,
           fulfilledQty: fulfilled,
           receivedQty: received,

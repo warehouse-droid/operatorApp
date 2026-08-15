@@ -66,7 +66,7 @@ assert.doesNotMatch(
 );
 assert.match(control, /Company-wide/);
 assert.match(control, /returnPhotoRef[\s\S]+photoReference/);
-assert.match(control, /fetch\(`\/api\/photo-upload\/preview\?ref=\$\{encodeURIComponent\(ref\)\}`[\s\S]+Authorization:\s*`Bearer \$\{token\}`/);
+assert.match(control, /new URLSearchParams\(\{ ref \}\)[\s\S]+fetch\(`\/api\/photo-upload\/preview\?\$\{params\.toString\(\)\}`[\s\S]+Authorization:\s*`Bearer \$\{token\}`/);
 assert.match(control, /URL\.createObjectURL/);
 assert.match(control, /URL\.revokeObjectURL/);
 assert.doesNotMatch(control, /photo-upload\/preview\?ref=[^\n]+token=/, "Control photo URLs must not embed the staff bearer token.");
@@ -107,6 +107,6 @@ assert.match(smart, /returnPolicyOverride:\s*null,[\s\S]+expectedReturnPolicyRev
 assert.match(smartCss, /\.smart-return-policy-cell/);
 assert.match(smartCss, /\.smart-return-effective\.approval_required/);
 assert.match(smartHtml, /scm-smart\.css\?v=20260801-blanket-ui-v2/);
-assert.match(smartHtml, /scm-smart\.js\?v=20260811-blanket-filters-v1/);
+assert.match(smartHtml, /scm-smart\.js\?v=20260812-vendor-po-price-sync-v1/);
 
 console.log("Return portal UI harness passed.");

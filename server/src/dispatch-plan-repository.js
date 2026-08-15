@@ -18,6 +18,7 @@ import {
   refreshGroupedSalesOrderReconciliationInPlan,
   scrubBilledSalesOrderFamilyFromPlan
 } from "./sales-order-reconciliation.js";
+import { scrubClosedNetSuiteOrdersFromOperationalPlan } from "./netsuite-closed-order-repository.js";
 import { buildCompactDispatchSnapshot, digestDispatchPlan, dispatchPlanBoard } from "./dispatch-planner-performance.js";
 
 const CUSTOMER_PICKUP_DELIVERY_METHOD = "Pick-Up";
@@ -712,8 +713,9 @@ async function enrichDispatchPlanWeights(plan) {
 async function sanitizeDispatchPlan(plan) {
   if (!plan) return null;
   const normalizedPlan = normalizeDispatchPlanLoadAssignments(plan);
-  const pickupRefs = await pickupSalesOrderRefs(normalizedPlan);
-  const enrichedPlan = await enrichDispatchPlanWeights(normalizedPlan);
+  const closedSanitizedPlan = (await scrubClosedNetSuiteOrdersFromOperationalPlan(normalizedPlan)).plan;
+  const pickupRefs = await pickupSalesOrderRefs(closedSanitizedPlan);
+  const enrichedPlan = await enrichDispatchPlanWeights(closedSanitizedPlan);
   const pickupSanitizedPlan = !pickupRefs.size ? enrichedPlan : {
     ...enrichedPlan,
     orders: (enrichedPlan.orders || []).filter((order) => !pickupRefs.has(String(order?.id || ""))),
@@ -738,6 +740,33 @@ async function sanitizeDispatchPlan(plan) {
     childSnapshots: await groupedSalesOrderChildSnapshots(billedSanitizedPlan),
     targetRefs: groupedRefs
   }).plan;
+}
+
+async function sanitizedSnapshotDetail(row, { current = false } = {}) {
+  const rawTrucks = normalizedSnapshotTrucks(row);
+  const sanitized = await sanitizeDispatchPlan({
+    id: String(row.plan_id || row.id || ""),
+    planDate: row.plan_date,
+    status: row.status || "",
+    revision: Number(row.revision || 0),
+    orders: Array.isArray(row.orders) ? row.orders : [],
+    trucks: rawTrucks,
+    summary: row.summary || {}
+  });
+  const orders = sanitized?.orders || [];
+  const trucks = sanitized?.trucks || [];
+  return {
+    ...snapshotSummary(row, { current }),
+    orderCount: orders.length,
+    truckCount: trucks.length,
+    loadCount: countPlanLoads(trucks),
+    loadOrderCount: countPlanLoadOrders(trucks),
+    stopCount: countPlanStops(trucks),
+    summary: sanitized?.summary || row.summary || {},
+    trucks: truckSnapshotSummary(trucks),
+    orders,
+    rawTrucks: trucks
+  };
 }
 
 export async function listDispatchPlans({ limit = 80 } = {}) {
@@ -960,6 +989,7 @@ export async function reconcileSalesOrderFamilyInDispatchPlans({
   canonicalRef = "",
   familyRefs = [],
   billed = false,
+  closed = false,
   reconciliationStatus = "current",
   reconciliationReason = "",
   reconciliationApplicationStatus = "",
@@ -969,7 +999,7 @@ export async function reconcileSalesOrderFamilyInDispatchPlans({
   if (!refs.length) return { changedPlans: [], deferred: false, familyRefs: [] };
   return withTransaction(async () => {
     await lockDispatchFleetPlanning();
-    const activeJobs = billed ? await activeDriverJobsForSalesOrderFamily(refs) : [];
+    const activeJobs = billed && !closed ? await activeDriverJobsForSalesOrderFamily(refs) : [];
     if (billed && activeJobs.length) {
       return {
         changedPlans: [],
@@ -1030,7 +1060,7 @@ export async function reconcileSalesOrderFamilyInDispatchPlans({
         }),
         targetRefs: refs
       });
-      const scrubbed = billed
+      const scrubbed = billed || closed
         ? scrubBilledSalesOrderFamilyFromPlan(refreshed.plan, {
             canonicalRef,
             familyRefs: refs
@@ -1057,7 +1087,9 @@ export async function reconcileSalesOrderFamilyInDispatchPlans({
           JSON.stringify(row.trucks || []),
           JSON.stringify(row.summary || {}),
           row.saved_at,
-          billed ? "before_billed_so_reconciliation" : "before_grouped_so_reconciliation",
+          closed
+            ? "before_closed_so_reconciliation"
+            : billed ? "before_billed_so_reconciliation" : "before_grouped_so_reconciliation",
           String(actor || "scm-reconciliation")
         ]
       );
@@ -1206,7 +1238,7 @@ export async function getDispatchPlanSnapshot(snapshotId) {
     );
     const row = result.rows[0];
     if (!row) return null;
-    return { ...snapshotSummary(row, { current: true }), orders: row.orders || [], rawTrucks: normalizedSnapshotTrucks(row) };
+    return sanitizedSnapshotDetail(row, { current: true });
   }
   const result = await query(
     `SELECT h.id, h.plan_id, h.plan_date::text AS plan_date, p.status, h.revision,
@@ -1220,7 +1252,7 @@ export async function getDispatchPlanSnapshot(snapshotId) {
   );
   const row = result.rows[0];
   if (!row) return null;
-  return { ...snapshotSummary(row), orders: row.orders || [], rawTrucks: normalizedSnapshotTrucks(row) };
+  return sanitizedSnapshotDetail(row);
 }
 
 export async function saveDispatchPlanRecoveryDraft(planId, {

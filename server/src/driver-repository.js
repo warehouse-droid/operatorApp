@@ -21,6 +21,8 @@ import {
   uniqueDispatchLocations
 } from "./dispatch-location.js";
 import { getDeliveryInstructionsForDriverOrderIds } from "./delivery-instruction-repository.js";
+import { assertNoClosedNetSuiteOrders, listClosedNetSuiteOrders } from "./netsuite-closed-order-repository.js";
+import { operationalPlanOrderRefs, scrubOrderRefsFromOperationalPlan } from "./netsuite-closed-order-policy.js";
 
 const YARD_ADDRESSES = {
   "3445": "3445 Kennedy Road, Toronto, ON",
@@ -979,7 +981,13 @@ async function confirmedPlans({ startDate = "" } = {}) {
       ORDER BY p.plan_date ASC, p.updated_at ASC`,
     [String(startDate || "").trim()]
   );
-  return overlayLiveVrmaRouteDetails(sortedPlans(result.rows));
+  const plans = sortedPlans(result.rows);
+  const closed = await listClosedNetSuiteOrders(plans.flatMap(operationalPlanOrderRefs));
+  const closedRefs = closed.map((conflict) => conflict.requestedRef);
+  const sanitizedPlans = closedRefs.length
+    ? plans.map((plan) => scrubOrderRefsFromOperationalPlan(plan, { orderRefs: closedRefs }).plan)
+    : plans;
+  return overlayLiveVrmaRouteDetails(sanitizedPlans);
 }
 
 export async function driverCanViewDeliverySalesOrder(driverLogin, orderRef) {
@@ -2338,6 +2346,7 @@ export async function startDriverJob(driverLogin, jobIdValue, {
   offlineTrace = null
 } = {}) {
   if (!job) throw new Error("Driver job is no longer available.");
+  await assertNoClosedNetSuiteOrders(job.orderRefs || [], "start Driver work");
   const result = await query(
     `INSERT INTO driver_job_records (
        job_id, plan_id, plan_date, driver_login, truck_id, truck_plate, load_id, load_name,
@@ -2578,6 +2587,7 @@ export async function recordDriverJobPhotos(driverLogin, jobIdValue, {
   offlineTrace = null,
   driverRemark = undefined
 } = {}) {
+  await assertNoClosedNetSuiteOrders(job?.orderRefs || [], "be completed by Driver");
   const photos = Array.isArray(photoDataUrls) ? photoDataUrls.filter(isPhotoReference) : [];
   const requiredPhotos = job?.mbt?.schemaVersion
     ? Math.max(0, Number(job.requiredPhotos || 0))
@@ -3129,7 +3139,7 @@ export async function listDriverTruckSwitchAttention({ planId = null } = {}) {
   return result.rows;
 }
 
-export async function listDriverJobStatuses({ planId = null, planDate = null } = {}) {
+export async function listDriverJobStatuses({ planId = null, planDate = null, includeClosed = true } = {}) {
   const params = [];
   const clauses = [];
   if (planId) {
@@ -3150,7 +3160,21 @@ export async function listDriverJobStatuses({ planId = null, planDate = null } =
       LIMIT 1000`,
     params
   );
-  return result.rows;
+  if (includeClosed) return result.rows;
+  const closed = await listClosedNetSuiteOrders(result.rows.flatMap((row) => (
+    Array.isArray(row.order_refs) ? row.order_refs : []
+  )));
+  const closedRefs = new Set(closed.map((entry) => entry.requestedRef));
+  return result.rows
+    .map((row) => {
+      const originalRefs = Array.isArray(row.order_refs) ? row.order_refs : [];
+      if (!originalRefs.length) return row;
+      const orderRefs = originalRefs
+        .filter((ref) => !closedRefs.has(String(ref || "").trim().toUpperCase()));
+      if (!orderRefs.length) return null;
+      return { ...row, order_refs: orderRefs };
+    })
+    .filter(Boolean);
 }
 
 export async function listDriverHistory(driverLogin, { date = "", limit = 100 } = {}) {
@@ -3238,13 +3262,21 @@ export async function listDriverHistory(driverLogin, { date = "", limit = 100 } 
       LIMIT ${safeLimit}`,
     jobParams
   );
+  const closedJobs = await listClosedNetSuiteOrders(jobResult.rows.flatMap((row) => (
+    Array.isArray(row.order_refs) ? row.order_refs : []
+  )));
+  const closedJobRefs = new Set(closedJobs.map((entry) => entry.requestedRef));
   for (const row of jobResult.rows) {
+    const originalOrderRefs = Array.isArray(row.order_refs) ? row.order_refs : [];
+    const visibleOrderRefs = originalOrderRefs
+      .filter((ref) => !closedJobRefs.has(String(ref || "").trim().toUpperCase()));
+    if (originalOrderRefs.length && !visibleOrderRefs.length) continue;
     const photos = Array.isArray(row.photos) ? row.photos.filter(Boolean) : [];
     records.push({
       id: `job-${row.id}`,
       type: "stop",
       title: row.stop_type === "pickup" ? "Pickup Stop" : row.stop_type === "dropoff" ? "Drop Off Stop" : "Travel Stop",
-      reference: Array.isArray(row.order_refs) ? row.order_refs.join(", ") : "",
+      reference: visibleOrderRefs.join(", "),
       planDate: row.plan_date || "",
       truckPlate: row.truck_plate || "",
       status: row.status || "",
@@ -3255,7 +3287,7 @@ export async function listDriverHistory(driverLogin, { date = "", limit = 100 } 
         planId: row.plan_id,
         loadName: row.load_name,
         stopType: row.stop_type,
-        orderRefs: row.order_refs || [],
+        orderRefs: visibleOrderRefs,
         driverRemark: row.job_details?.driverRemark || "",
         startedAt: row.started_at,
         completedAt: row.completed_at

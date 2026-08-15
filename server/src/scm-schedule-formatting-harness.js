@@ -83,7 +83,7 @@ for (const expected of [
   "scmScheduleRowFormatting",
   'row.isSpecialOrder ? "Sp.O" : row.orderKind',
   'scmScheduleCellFormatting("dropoffPoint", row.dropoffPoint)',
-  'scmScheduleCellFormatting("status", row.status)',
+  'scmScheduleCellFormatting("status", displayStatus)',
   "scmScheduleTableRowHtml"
 ]) {
   assert(client.includes(expected), `Schedule formatting renderer is missing ${expected}.`);

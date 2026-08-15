@@ -1,8 +1,8 @@
 // @ts-check
 
 import { MbtError } from "./errors.js";
+import { requireMbbsRateCardPolicy } from "./mbbs-rate-card-policy.js";
 
-const ADDITIONAL_DROP_FEE_MINOR = 10_000;
 const SOURCE_ORDER = Object.freeze({ SO: 10, TO: 20, PO: 30, VRMA: 40, CUSTOM: 50 });
 
 /** @param {unknown} value */
@@ -120,6 +120,19 @@ function safeSum(values) {
   return total;
 }
 
+/** @param {number} value @param {number} quantity */
+function safeProduct(value, quantity) {
+  const total = value * quantity;
+  if (!Number.isSafeInteger(total)) {
+    throw new MbtError({
+      status: 422,
+      code: "MBT_BILLING_MANUAL_AMOUNT_INVALID",
+      message: "The billing amount exceeds the supported cent range."
+    });
+  }
+  return total;
+}
+
 /**
  * Resolve the two editable fields without trusting browser arithmetic.
  * Either field may be omitted, but when both are supplied they must agree.
@@ -168,6 +181,7 @@ export function resolveManualBillingAmount(rawInput) {
  */
 export function calculateBillingUnitAmount(rawInput) {
   const input = object(rawInput);
+  const policy = requireMbbsRateCardPolicy(input.mbbsChargingPolicy);
   const billingRule = text(input.billingRule);
   if (!["so_order", "so_group", "to_replenishment", "to_direct_additional_drop", "po_shared_leg", "po_group", "custom_order", "reconciliation"].includes(billingRule)) {
     throw new MbtError({
@@ -185,23 +199,23 @@ export function calculateBillingUnitAmount(rawInput) {
   if (dropCount < 1) {
     throw new MbtError({ status: 422, code: "MBT_BILLING_ROUTE_INVALID", message: "At least one drop is required." });
   }
-  const configuredFee = input.additionalDropFeeMinor === undefined
-    ? ADDITIONAL_DROP_FEE_MINOR
-    : nonnegativeMoney(input.additionalDropFeeMinor, "Additional-drop fee");
   const directTransfer = billingRule === "to_direct_additional_drop";
   const additionalDropCount = directTransfer
     ? 1
     : ["po_shared_leg", "po_group"].includes(billingRule)
       ? Math.max(0, dropCount - 1)
       : 0;
+  const additionalDropUnitAmountMinor = directTransfer
+    ? policy.directPickupUnitAmountMinor
+    : ["po_shared_leg", "po_group"].includes(billingRule)
+      ? policy.poAdditionalDropUnitAmountMinor
+      : 0;
   const distanceBandAmountMinor = directTransfer ? 0 : rateAmount;
-  const additionalDropFeeMinor = safeSum(Array.from(
-    { length: additionalDropCount },
-    () => configuredFee
-  ));
+  const additionalDropFeeMinor = safeProduct(additionalDropUnitAmountMinor, additionalDropCount);
   return {
     distanceBandAmountMinor,
     additionalDropCount,
+    additionalDropUnitAmountMinor,
     additionalDropFeeMinor,
     calculatedAmountMinor: safeSum([distanceBandAmountMinor, additionalDropFeeMinor])
   };

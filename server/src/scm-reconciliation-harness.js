@@ -9,6 +9,8 @@ import {
 assert.equal(classifyNetSuiteLifecycle("Partially Received").closed, false);
 assert.equal(classifyNetSuiteLifecycle("Partially Received").partiallyReceived, true);
 assert.equal(classifyNetSuiteLifecycle("Closed").closed, true);
+assert.equal(classifyNetSuiteLifecycle("Not Closed Yet").closed, false);
+assert.equal(classifyNetSuiteLifecycle("Pending Receipt", "H").closed, true);
 
 assert.equal(derivePoToReconciliationState({
   kind: "PO",
@@ -53,13 +55,52 @@ assert.equal(derivePoToReconciliationState({
   receivedQty: 0
 }).applicationStatus, "In Transit");
 
-assert.equal(derivePoToReconciliationState({
+const partiallyFulfilledClosedTransfer = derivePoToReconciliationState({
   kind: "TO",
   statusText: "Closed",
   orderedQty: 100,
-  fulfilledQty: 100,
+  fulfilledQty: 40,
   receivedQty: 0
-}).reconciliationStatus, "review");
+});
+assert.equal(
+  partiallyFulfilledClosedTransfer.applicationStatus,
+  "Completed",
+  "A Closed TO must retain actual fulfillment and terminate instead of entering operational review."
+);
+assert.equal(partiallyFulfilledClosedTransfer.reconciliationStatus, "ok");
+assert.deepEqual(partiallyFulfilledClosedTransfer.quantities, {
+  ordered: 100,
+  fulfilled: 40,
+  received: 0,
+  abandoned: 60,
+  remaining: 0,
+  destinationRemaining: 0
+});
+
+assert.deepEqual(derivePoToReconciliationState({
+  kind: "TO",
+  statusText: "Transfer Order : Closed",
+  orderedQty: 100,
+  fulfilledQty: 40,
+  receivedQty: 20
+}).quantities, {
+  ordered: 100,
+  fulfilled: 40,
+  received: 20,
+  abandoned: 60,
+  remaining: 0,
+  destinationRemaining: 0
+});
+
+const untouchedClosedTransfer = derivePoToReconciliationState({
+  kind: "TO",
+  statusText: "Transfer Order : Closed",
+  orderedQty: 100,
+  fulfilledQty: 0,
+  receivedQty: 0
+});
+assert.equal(untouchedClosedTransfer.applicationStatus, "Cancelled");
+assert.equal(untouchedClosedTransfer.quantities.abandoned, 100);
 
 assert.equal(derivePoToReconciliationState({
   kind: "TO",

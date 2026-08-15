@@ -6,6 +6,8 @@ import { writeAudit } from "./auth-repository.js";
 import { getDispatchDeliveryGroup, listDispatchDeliveryGroups } from "./dispatch-delivery-group-repository.js";
 import { remapDispatchLinksToMaterializedSplit } from "./dispatch-order-target-repository.js";
 import { isNetSuiteSalesOrderBilled } from "./sales-order-reconciliation.js";
+import { netSuiteClosedOrderFamilySql, operationalPlanOrderRefs } from "./netsuite-closed-order-policy.js";
+import { assertNoClosedNetSuiteOrders, listClosedNetSuiteOrders } from "./netsuite-closed-order-repository.js";
 import {
   ACTIVE_RELOAD_STATUSES,
   getActiveReloadCycleForOrder,
@@ -66,7 +68,7 @@ function reloadYardStatus(cycle = {}) {
 function decorateSalesOrderReload(order, cycle) {
   if (!order || !cycle) return order;
   const canonicalLines = new Map((order.lines || []).map((line) => [String(line.id), line]));
-  const lines = (cycle.lines || []).map((reloadLine) => {
+  const lines = (cycle.lines || []).filter((reloadLine) => reloadLine.selectedForReattempt !== false).map((reloadLine) => {
     const canonical = canonicalLines.get(String(reloadLine.salesOrderLineId)) || {};
     const packedTotal = positiveQuantity(reloadLine.packedPalletQty)
       + positiveQuantity(reloadLine.packedLayerQty)
@@ -108,7 +110,14 @@ function decorateSalesOrderReload(order, cycle) {
       reload_cycle_id: cycle.id,
       reload_cycle_number: cycle.cycleNumber,
       reload_target_sales_qty: reloadLine.targetSalesQty,
-      reload_remaining_sales_qty: reloadLine.remainingSalesQty
+      reload_remaining_sales_qty: reloadLine.remainingSalesQty,
+      historical_sku: reloadLine.historicalSku || reloadLine.sku,
+      current_sku: reloadLine.currentSku || canonical.sku || "",
+      sku_mismatch: Boolean(reloadLine.skuMismatch),
+      item_mismatch: Boolean(reloadLine.itemMismatch),
+      already_delivered_sales_qty: reloadLine.alreadyDeliveredSalesQty,
+      already_delivered_pallet_qty: reloadLine.alreadyDeliveredPalletQty,
+      reattempt_reason: reloadLine.selectionReason || cycle.reason
     };
   });
   const hasOpen = lines.some((line) => positiveQuantity(line.reload_remaining_sales_qty) > 0.000001);
@@ -116,6 +125,14 @@ function decorateSalesOrderReload(order, cycle) {
   const hasLoaded = lines.some((line) => positiveQuantity(line.loaded_qty) > 0);
   return {
     ...order,
+    tranid: cycle.workflowKind === "sales_order_reattempt" ? cycle.reattemptOrderRef : order.tranid,
+    original_order_ref: cycle.workflowKind === "sales_order_reattempt" ? cycle.orderRef : (order.original_order_ref || order.tranid),
+    dispatch_planned: cycle.workflowKind === "sales_order_reattempt" ? Boolean(cycle.dispatchPlanId) : order.dispatch_planned,
+    dispatch_plan_date: cycle.workflowKind === "sales_order_reattempt" ? cycle.dispatchPlanDate : order.dispatch_plan_date,
+    dispatch_truck_plate: cycle.workflowKind === "sales_order_reattempt" ? cycle.dispatchTruckPlate : order.dispatch_truck_plate,
+    dispatch_load_name: cycle.workflowKind === "sales_order_reattempt" ? cycle.dispatchLoadName : order.dispatch_load_name,
+    dispatch_parking_spot: cycle.workflowKind === "sales_order_reattempt" ? cycle.dispatchParkingSpot : order.dispatch_parking_spot,
+    sales_order_reattempt: cycle.workflowKind === "sales_order_reattempt",
     operator_status: reloadOperatorStatus(cycle),
     local_yard_order_status: reloadYardStatus(cycle),
     preparing_operator_id: cycle.preparingOperatorId,
@@ -899,9 +916,10 @@ async function loadDispatchGroupChildOrders(groups = []) {
                 NULL::numeric AS foreign_total,
                 NULL::bigint AS delivery_method_id,
                 NULL::text AS delivery_method
-           FROM transfer_orders o
-          WHERE o.tranid = ANY($1::text[])
-          ORDER BY o.tranid`
+	           FROM transfer_orders o
+	          WHERE o.tranid = ANY($1::text[])
+	            AND NOT ${netSuiteClosedOrderFamilySql("o", "TO")}
+	          ORDER BY o.tranid`
       : `SELECT o.*,
                 CASE WHEN ${sandboxSql} AND COALESCE(o.is_test_fixture, false) THEN true ELSE o.netsuite_active END AS netsuite_active,
                 o.sales_order_type AS delivery_method,
@@ -910,9 +928,10 @@ async function loadDispatchGroupChildOrders(groups = []) {
                 NULL::text AS source_location,
                 NULL::bigint AS destination_location_id,
                 NULL::text AS destination_location
-           FROM sales_orders o
-           WHERE o.tranid = ANY($1::text[])
-             AND (COALESCE(o.is_test_fixture, false) = false OR ${sandboxSql})
+	           FROM sales_orders o
+	           WHERE o.tranid = ANY($1::text[])
+	             AND NOT ${netSuiteClosedOrderFamilySql("o", "SO")}
+	             AND (COALESCE(o.is_test_fixture, false) = false OR ${sandboxSql})
            ORDER BY o.tranid`,
     [childRefs]
   );
@@ -972,7 +991,15 @@ async function loadDispatchGroupChildOrders(groups = []) {
       ...order,
       lines: (linesByOrder.get(String(order.netsuite_id)) || []).filter(hasDeliveryDisplayQuantity)
     };
-    ordersByRef.set(String(order.tranid), isTransfer ? base : await decorateActiveSalesOrderReload(base));
+    if (isTransfer) {
+      ordersByRef.set(String(order.tranid), base);
+    } else {
+      const decorated = await decorateActiveSalesOrderReload(base);
+      ordersByRef.set(
+        String(order.tranid),
+        decorated?.reload_cycle?.workflowKind === "sales_order_reattempt" ? base : decorated
+      );
+    }
   }
   return new Map(groups.map((group) => [
     group.id,
@@ -1021,6 +1048,7 @@ function buildDispatchGroupDeliveryOrder(group, childOrders = []) {
 function buildDispatchGroupDeliveryListOrder(group, orders = []) {
   if (!orders.length) return null;
   const childIds = orders.map((order) => order.netsuite_id);
+  const childRefs = orders.map((order) => order.tranid).filter(Boolean);
   const lines = orders.flatMap((order) => order.lines || []);
   const pickable = lines.filter(isDeliveryPickableLine);
   const hasPacked = pickable.some(lineHasPackedQuantity);
@@ -1033,10 +1061,10 @@ function buildDispatchGroupDeliveryListOrder(group, orders = []) {
   return {
     ...base,
     netsuite_id: group.id,
-    tranid: group.childRefs.join("+") || orders.map((order) => order.tranid).join("+") || group.id,
+    tranid: childRefs.join("+") || group.id,
     dispatch_group_id: group.id,
     is_dispatch_group: true,
-    child_order_refs: group.childRefs,
+    child_order_refs: childRefs,
     child_order_ids: childIds,
     reload_authorized: reloadChildren.length > 0,
     reload_child_order_refs: reloadChildren.map((order) => order.tranid),
@@ -1109,8 +1137,9 @@ export async function getDeliveryOrdersBatch(ids = []) {
                 NULL::text AS source_location,
                 NULL::bigint AS destination_location_id,
                 NULL::text AS destination_location
-           FROM sales_orders o
+          FROM sales_orders o
           WHERE o.netsuite_id = ANY($1::bigint[])
+            AND NOT ${netSuiteClosedOrderFamilySql("o", "SO")}
             AND (COALESCE(o.is_test_fixture, false) = false OR ${sandboxSql})`,
         [regularIds]
       );
@@ -1378,6 +1407,7 @@ async function getLocalCoDeliveryOrder(coRefOrId) {
   );
   if (!order.rowCount) return null;
   const co = order.rows[0];
+  if ((await listClosedNetSuiteOrders([co.source_order_ref])).length) return null;
   const lines = await query(
     `SELECT line.*,
             co.delivery_order_id AS delivery_order_id,
@@ -1422,7 +1452,12 @@ async function listLocalCoDeliveryOrders({ locationId = null, status = "active",
                co.co_ref`,
     params
   );
-  return result.rows.map((row) => mapLocalCoOrderForDelivery(row, []));
+  const closedRefs = new Set((await listClosedNetSuiteOrders(
+    result.rows.map((row) => row.source_order_ref)
+  )).map((entry) => entry.requestedRef));
+  return result.rows
+    .filter((row) => !closedRefs.has(String(row.source_order_ref || "").trim().toUpperCase()))
+    .map((row) => mapLocalCoOrderForDelivery(row, []));
 }
 
 const VRMA_OPERATOR_YARD_BY_LOCATION = new Map([
@@ -1715,10 +1750,11 @@ export async function listDeliveryOrders({ locationId = null, status = "active",
               dispatch_instructions, memo, 'sales_order'::text AS order_type,
               NULL::bigint AS source_location_id, NULL::text AS source_location,
               NULL::bigint AS destination_location_id, NULL::text AS destination_location
-       FROM sales_orders
-       WHERE sales_order_type <> '${CUSTOMER_PICKUP_DELIVERY_METHOD.replaceAll("'", "''")}'
-         AND NOT ${billedSalesOrderFamilySql("sales_orders")}
-         AND (COALESCE(is_test_fixture, false) = false OR ${sandboxSql})
+	       FROM sales_orders
+	       WHERE sales_order_type <> '${CUSTOMER_PICKUP_DELIVERY_METHOD.replaceAll("'", "''")}'
+	         AND NOT ${billedSalesOrderFamilySql("sales_orders")}
+	         AND NOT ${netSuiteClosedOrderFamilySql("sales_orders", "SO")}
+	         AND (COALESCE(is_test_fixture, false) = false OR ${sandboxSql})
        UNION ALL
        SELECT netsuite_id, tranid, trandate, NULL::bigint AS customer_id, NULL::text AS customer,
               status, status_text, NULL::numeric AS foreign_total, NULL::bigint AS order_location_id,
@@ -1733,8 +1769,9 @@ export async function listDeliveryOrders({ locationId = null, status = "active",
               dispatch_instructions, memo, 'transfer_order'::text AS order_type,
               from_location_id AS source_location_id, from_location AS source_location,
               to_location_id AS destination_location_id, to_location AS destination_location
-       FROM transfer_orders
-       WHERE from_location_id IS NOT NULL
+	       FROM transfer_orders
+	       WHERE from_location_id IS NOT NULL
+	         AND NOT ${netSuiteClosedOrderFamilySql("transfer_orders", "TO")}
      ),
      active_sales_line_allocations AS (
        SELECT allocation.sales_line_id,
@@ -1920,25 +1957,28 @@ export async function listDeliveryLoadTrucks({ locationId = null, planDate = nul
               local_yard_order_status, 'sales_order'::text AS order_type,
               EXISTS (
                 SELECT 1
-                  FROM operator_reload_cycles reload_cycle
+                 FROM operator_reload_cycles reload_cycle
                  WHERE reload_cycle.sales_order_id = sales_orders.netsuite_id
                    AND reload_cycle.status = ANY($2::text[])
+                   AND reload_cycle.workflow_kind <> 'sales_order_reattempt'
               ) AS reload_authorized
          FROM sales_orders
-         WHERE dispatch_plan_date = $1
-           AND COALESCE(dispatch_truck_plate, '') <> ''
-           AND sales_order_type <> '${CUSTOMER_PICKUP_DELIVERY_METHOD.replaceAll("'", "''")}'
-            AND (COALESCE(is_test_fixture, false) = false OR ${sandboxSql})
+	         WHERE dispatch_plan_date = $1
+	           AND COALESCE(dispatch_truck_plate, '') <> ''
+	           AND sales_order_type <> '${CUSTOMER_PICKUP_DELIVERY_METHOD.replaceAll("'", "''")}'
+	           AND NOT ${netSuiteClosedOrderFamilySql("sales_orders", "SO")}
+	            AND (COALESCE(is_test_fixture, false) = false OR ${sandboxSql})
            AND (netsuite_active = true OR (${sandboxSql} AND COALESCE(is_test_fixture, false)))
        UNION ALL
        SELECT dispatch_truck_plate, dispatch_load_name, from_location_id AS outbound_location_id,
               outbound_operator_status AS operator_status, local_yard_order_status,
               'transfer_order'::text AS order_type, false AS reload_authorized
          FROM transfer_orders
-        WHERE dispatch_plan_date = $1
-          AND COALESCE(dispatch_truck_plate, '') <> ''
-          AND from_location_id IS NOT NULL
-          AND netsuite_active = true
+	        WHERE dispatch_plan_date = $1
+	          AND COALESCE(dispatch_truck_plate, '') <> ''
+	          AND from_location_id IS NOT NULL
+	          AND NOT ${netSuiteClosedOrderFamilySql("transfer_orders", "TO")}
+	          AND netsuite_active = true
      )
      SELECT dispatch_truck_plate AS truck_plate,
             COUNT(DISTINCT dispatch_load_name) AS load_count,
@@ -1951,7 +1991,43 @@ export async function listDeliveryLoadTrucks({ locationId = null, planDate = nul
       ORDER BY dispatch_truck_plate`,
     params
   );
-  return result.rows;
+  const byTruck = new Map(result.rows.map((row) => [String(row.truck_plate || ""), {
+    ...row,
+    load_count: Number(row.load_count || 0),
+    order_count: Number(row.order_count || 0)
+  }]));
+  const reattempts = await listActiveReloadOrders({ locationId });
+  for (const order of reattempts.filter((row) => (
+    row.reload_cycle?.workflowKind === "sales_order_reattempt"
+    && dateOnly(row.dispatch_plan_date) === date
+    && String(row.dispatch_truck_plate || "")
+  ))) {
+    const plate = String(order.dispatch_truck_plate);
+    const existing = byTruck.get(plate) || {
+      truck_plate: plate,
+      load_count: 0,
+      order_count: 0,
+      first_load_name: order.dispatch_load_name || ""
+    };
+    const reattemptLoadNames = new Set(String(existing._reattempt_load_names || "").split("\u0000").filter(Boolean));
+    const loadName = String(order.dispatch_load_name || "");
+    const newLoad = Boolean(
+      loadName
+      && loadName !== String(existing.first_load_name || "")
+      && !reattemptLoadNames.has(loadName)
+    );
+    if (loadName) reattemptLoadNames.add(loadName);
+    byTruck.set(plate, {
+      ...existing,
+      load_count: Number(existing.load_count || 0) + (newLoad || Number(existing.load_count || 0) === 0 ? 1 : 0),
+      order_count: Number(existing.order_count || 0) + 1,
+      first_load_name: existing.first_load_name || loadName,
+      _reattempt_load_names: [...reattemptLoadNames].join("\u0000")
+    });
+  }
+  return [...byTruck.values()]
+    .map(({ _reattempt_load_names, ...row }) => row)
+    .sort((left, right) => String(left.truck_plate || "").localeCompare(String(right.truck_plate || "")));
 }
 
 export async function listDeliveryLoadOrders({ locationId = null, status = "active", planDate = null, truckPlate = null } = {}) {
@@ -2046,16 +2122,36 @@ export async function listSavedDeliveryOrderKeysForOperator(operatorId, { locati
        FROM operator_saved_delivery_orders saved
       WHERE saved.operator_id = $1
         AND saved.location_id = $2
-        AND NOT EXISTS (
-          SELECT 1
-            FROM sales_orders sales_order
+	        AND NOT EXISTS (
+	          SELECT 1
+	            FROM sales_orders sales_order
            WHERE saved.order_type = 'sales_order'
              AND (
                sales_order.netsuite_id::text = saved.order_key
                OR upper(sales_order.tranid) = upper(saved.order_ref)
              )
-             AND ${billedSalesOrderFamilySql("sales_order")}
-        )
+	             AND ${billedSalesOrderFamilySql("sales_order")}
+	        )
+	        AND NOT EXISTS (
+	          SELECT 1
+	            FROM sales_orders sales_order
+	           WHERE saved.order_type = 'sales_order'
+	             AND (
+	               sales_order.netsuite_id::text = saved.order_key
+	               OR upper(sales_order.tranid) = upper(saved.order_ref)
+	             )
+	             AND ${netSuiteClosedOrderFamilySql("sales_order", "SO")}
+	        )
+	        AND NOT EXISTS (
+	          SELECT 1
+	            FROM transfer_orders transfer_order
+	           WHERE saved.order_type = 'transfer_order'
+	             AND (
+	               transfer_order.netsuite_id::text = saved.order_key
+	               OR upper(transfer_order.tranid) = upper(saved.order_ref)
+	             )
+	             AND ${netSuiteClosedOrderFamilySql("transfer_order", "TO")}
+	        )
       ORDER BY saved.created_at DESC`,
     [operatorId, locationId]
   );
@@ -2204,8 +2300,9 @@ export async function getDeliveryOrder(id) {
               dispatch_instructions, memo, 'sales_order'::text AS order_type,
               NULL::bigint AS source_location_id, NULL::text AS source_location,
               NULL::bigint AS destination_location_id, NULL::text AS destination_location
-       FROM sales_orders
-       WHERE COALESCE(is_test_fixture, false) = false OR ${sandboxSql}
+	       FROM sales_orders
+	       WHERE (COALESCE(is_test_fixture, false) = false OR ${sandboxSql})
+	         AND NOT ${netSuiteClosedOrderFamilySql("sales_orders", "SO")}
        UNION ALL
        SELECT netsuite_id, tranid, trandate, NULL::bigint AS customer_id, NULL::text AS customer,
               status, status_text, NULL::numeric AS foreign_total, NULL::bigint AS order_location_id,
@@ -2220,8 +2317,9 @@ export async function getDeliveryOrder(id) {
               dispatch_instructions, memo, 'transfer_order'::text AS order_type,
               from_location_id AS source_location_id, from_location AS source_location,
               to_location_id AS destination_location_id, to_location AS destination_location
-       FROM transfer_orders
-       WHERE from_location_id IS NOT NULL
+	       FROM transfer_orders
+	       WHERE from_location_id IS NOT NULL
+	         AND NOT ${netSuiteClosedOrderFamilySql("transfer_orders", "TO")}
      ),
      delivery_line_source AS (
        SELECT sales_order_id AS order_id, id, line_id, item_id, item_name, sku,
@@ -2388,9 +2486,10 @@ export async function findCustomerPickupOrder(code, { locationId = null } = {}) 
       WHERE (UPPER(tranid) = $1 OR netsuite_id::text = $1)
         ${locationClause}
         AND sales_order_type = $${params.length + 1}
-        AND NOT (status = 'A' OR status_text ILIKE '%Pending Approval%')
-        AND NOT ${billedSalesOrderFamilySql("sales_orders")}
-        AND LOWER(COALESCE(local_yard_order_status, 'Open')) IN ('open', 'partial_loaded', 'partially loaded', 'loaded')
+	        AND NOT (status = 'A' OR status_text ILIKE '%Pending Approval%')
+	        AND NOT ${billedSalesOrderFamilySql("sales_orders")}
+	        AND NOT ${netSuiteClosedOrderFamilySql("sales_orders", "SO")}
+	        AND LOWER(COALESCE(local_yard_order_status, 'Open')) IN ('open', 'partial_loaded', 'partially loaded', 'loaded')
          AND netsuite_active = true
          AND COALESCE(is_test_fixture, false) = false
       LIMIT 1`,
@@ -2996,6 +3095,7 @@ async function materializeDispatchSplitOrders(plan) {
 
 export async function applyConfirmedDispatchPlanToDelivery(plan, { forceOrderRefs = [] } = {}) {
   if (!plan?.planDate || !Array.isArray(plan.trucks)) return { planned: 0 };
+  await assertNoClosedNetSuiteOrders(operationalPlanOrderRefs(plan), "be applied to Operator Delivery");
   const materializedSplits = await materializeDispatchSplitOrders(plan);
   const splitParentRefs = new Set(materializedSplits.splitParentRefs || []);
   const forceRefs = new Set((forceOrderRefs || []).map((ref) => String(ref || "").trim()).filter(Boolean));
@@ -3383,6 +3483,7 @@ function fulfillmentLineQuantity(line) {
 }
 
 export async function recordDeliveryFulfillment(orderId, operatorId, { photoDataUrls, payload, response, itemFulfillmentId, itemFulfillmentTranid }) {
+  await assertNoClosedNetSuiteOrders([orderId], "be fulfilled by Operator");
   const photos = requirePhotoReferences(photoDataUrls);
   const order = await getDeliveryOrder(orderId);
   if (!order) throw new Error("Delivery order not found.");
@@ -3706,6 +3807,7 @@ async function recordVrmaDeliveryLoad(order, operatorId, { photoDataUrls }) {
 }
 
 export async function recordDeliveryLoad(orderId, operatorId, { photoDataUrls, requestId } = {}) {
+  await assertNoClosedNetSuiteOrders([orderId], "be loaded by Operator");
   const photos = requirePhotoReferences(photoDataUrls);
   if (isDispatchGroupOrderId(orderId)) {
     return recordGroupedDeliveryLoad(orderId, operatorId, { photoDataUrls: photos, requestId });
@@ -3850,6 +3952,7 @@ export async function recordDeliveryLoad(orderId, operatorId, { photoDataUrls, r
 }
 
 export async function recordCustomerPickupLoad(orderId, operatorId, { photoDataUrls }) {
+  await assertNoClosedNetSuiteOrders([orderId], "be loaded as Customer Pick-Up");
   const photos = requirePhotoReferences(photoDataUrls);
   const order = await getDeliveryOrder(orderId);
   if (!order || !isPickupOrder(order)) throw new Error("Customer pickup sales order not found.");
@@ -3972,6 +4075,7 @@ export async function recordDeliveryFulfillmentFailure(orderId, operatorId, { ph
   const message = error?.message || String(error || "Unknown fulfillment error");
   const photos = photoReferences(photoDataUrls);
   try {
+    await assertNoClosedNetSuiteOrders([orderId], "record a Delivery event");
     await query(
       `INSERT INTO delivery_fulfillment_records (
          order_id, operator_id, fulfillment_status, photo_data_url, photo_data_urls, payload, response
@@ -5047,9 +5151,10 @@ export async function getCurrentOperatorDeliveryDraft(operatorId, { locationId =
                 )::int AS draft_line_count
            FROM sales_orders o
            LEFT JOIN sales_order_lines l ON l.sales_order_id = o.netsuite_id
-          WHERE o.preparing_operator_id::text = $1
-            AND COALESCE(o.sales_order_type, '') <> '${CUSTOMER_PICKUP_DELIVERY_METHOD.replaceAll("'", "''")}'
-            AND NOT ${billedSalesOrderFamilySql("o")}
+	          WHERE o.preparing_operator_id::text = $1
+	            AND COALESCE(o.sales_order_type, '') <> '${CUSTOMER_PICKUP_DELIVERY_METHOD.replaceAll("'", "''")}'
+	            AND NOT ${billedSalesOrderFamilySql("o")}
+	            AND NOT ${netSuiteClosedOrderFamilySql("o", "SO")}
             AND NOT EXISTS (
               SELECT 1
                 FROM operator_consolidation_claims consolidation_claim
@@ -5085,7 +5190,8 @@ export async function getCurrentOperatorDeliveryDraft(operatorId, { locationId =
            LEFT JOIN transfer_order_lines l
              ON l.transfer_order_id = o.netsuite_id
             AND l.line_stage = 'outbound'
-         WHERE o.preparing_operator_id::text = $1
+	         WHERE o.preparing_operator_id::text = $1
+	            AND NOT ${netSuiteClosedOrderFamilySql("o", "TO")}
             ${transferLocationClause}
           GROUP BY o.netsuite_id
          UNION ALL
@@ -5163,8 +5269,9 @@ export async function getCurrentOperatorDeliveryDraft(operatorId, { locationId =
            FROM operator_reload_cycles cycle
            JOIN sales_orders o ON o.netsuite_id = cycle.sales_order_id
            LEFT JOIN operator_reload_cycle_lines line ON line.cycle_id = cycle.id
-          WHERE cycle.preparing_operator_id::text = $1
-            AND cycle.status = 'preparing'
+	          WHERE cycle.preparing_operator_id::text = $1
+	            AND cycle.status = 'preparing'
+	            AND NOT ${netSuiteClosedOrderFamilySql("o", "SO")}
             ${salesLocationClause}
           GROUP BY cycle.id, o.outbound_location
        ) draft
@@ -5343,6 +5450,7 @@ export async function releaseCurrentDeliveryDraft(orderId, operatorId) {
 }
 
 export async function confirmDeliveryLine(orderId, lineId, values, operatorId) {
+  await assertNoClosedNetSuiteOrders([orderId], "confirm a Delivery line");
   if (!operatorId) throw new Error("Operator ID is required.");
   if (isDispatchGroupOrderId(orderId)) {
     await applyGroupedLinePackedQuantity(orderId, lineId, values, operatorId);
@@ -5417,6 +5525,7 @@ export async function confirmDeliveryLine(orderId, lineId, values, operatorId) {
 }
 
 export async function confirmDeliveryLines(orderId, lines = [], operatorId) {
+  await assertNoClosedNetSuiteOrders([orderId], "confirm Delivery lines");
   if (!operatorId) throw new Error("Operator ID is required.");
   const requestedLines = Array.isArray(lines) ? lines : [];
   if (!requestedLines.length) return { confirmed: 0, failures: [] };
@@ -5462,6 +5571,7 @@ export async function confirmDeliveryLines(orderId, lines = [], operatorId) {
 }
 
 export async function confirmCustomerPickupLine(orderId, lineId, values, operatorId) {
+  await assertNoClosedNetSuiteOrders([orderId], "confirm a Customer Pick-Up line");
   if (!operatorId) throw new Error("Operator ID is required.");
   const order = await getDeliveryOrder(orderId);
   if (!order || !isPickupOrder(order)) throw new Error("Customer pickup sales order not found.");
@@ -5517,6 +5627,7 @@ export async function confirmCustomerPickupLine(orderId, lineId, values, operato
 }
 
 export async function clearCustomerPickupDraft(orderId, operatorId) {
+  await assertNoClosedNetSuiteOrders([orderId], "clear a Customer Pick-Up draft");
   const order = await getDeliveryOrder(orderId);
   if (!order || !isPickupOrder(order)) throw new Error("Customer pickup sales order not found.");
   await query(
@@ -5547,6 +5658,7 @@ export async function clearCustomerPickupDraft(orderId, operatorId) {
 }
 
 export async function setDeliveryLinePackedQuantity(orderId, lineId, values, operatorId, { allowConsolidation = false } = {}) {
+  await assertNoClosedNetSuiteOrders([orderId], "change a Delivery packed quantity");
   if (!operatorId) throw new Error("Operator ID is required.");
   if (isDispatchGroupOrderId(orderId)) {
     await applyGroupedLinePackedQuantity(orderId, lineId, values, operatorId, { absolute: true });
@@ -5621,6 +5733,7 @@ export async function setDeliveryLinePackedQuantity(orderId, lineId, values, ope
 }
 
 export async function unpackDeliveryLine(orderId, lineId, values, operatorId) {
+  await assertNoClosedNetSuiteOrders([orderId], "unpack a Delivery line");
   if (!operatorId) throw new Error("Operator ID is required.");
   if (isDispatchGroupOrderId(orderId)) {
     const groupOrder = await getDispatchGroupDeliveryOrder(orderId);
@@ -5782,6 +5895,7 @@ export async function unpackDeliveryLine(orderId, lineId, values, operatorId) {
 }
 
 export async function unpackDeliveryOrder(orderId, operatorId) {
+  await assertNoClosedNetSuiteOrders([orderId], "unpack a Delivery order");
   if (!operatorId) throw new Error("Operator ID is required.");
   if (isDispatchGroupOrderId(orderId)) {
     const groupOrder = await getDispatchGroupDeliveryOrder(orderId);
@@ -5890,6 +6004,7 @@ export async function unpackDeliveryOrder(orderId, operatorId) {
 }
 
 export async function updateDeliveryStatus(id, status, operatorId) {
+  await assertNoClosedNetSuiteOrders([id], "change Operator Delivery status");
   if (!operatorId) throw new Error("Operator ID is required.");
   const allowed = new Set(["open", "preparing", "packed"]);
   if (!allowed.has(status)) throw new Error("Invalid delivery status.");
@@ -6124,6 +6239,7 @@ export async function releaseConsolidationDeliveryOrder(id, operatorId) {
 }
 
 export async function markDeliveryPrepared(id, { operatorName, photoPath, notes }) {
+  await assertNoClosedNetSuiteOrders([id], "be marked prepared");
   const order = await getDeliveryOrder(id);
   if (!order) throw new Error("Delivery order not found.");
   await setCanonicalDeliveryStatus(order, "packed", { clearPreparing: true });

@@ -1150,6 +1150,9 @@ export function createMbtRouter(dependencies = {}) {
           ),
           expectedRevision: Number(body.expectedRevision),
           reason: String(body.reason || ""),
+          ...(action === "activate"
+            ? { replacesRateCardVersionId: body.replacesRateCardVersionId }
+            : {}),
           idempotencyKey,
           correlationId: correlationId(req),
           requestId: requestId(req)

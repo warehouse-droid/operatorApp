@@ -1,4 +1,4 @@
-const CACHE_NAME = "mbbs-yard-operator-v138-toronto-timestamps-v1";
+const CACHE_NAME = "mbbs-yard-operator-v139-request-scheme-v1";
 const OPERATOR_CACHE_PREFIX = "mbbs-yard-operator-";
 const APP_SHELL = [
   "/operator",
@@ -64,6 +64,7 @@ self.addEventListener("notificationclick", (event) => {
 
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
+  if (url.protocol !== "http:" && url.protocol !== "https:") return;
   const driverAsset = url.pathname === "/driver"
     || url.pathname === "/driver.html"
     || url.pathname === "/driver.css"
@@ -77,7 +78,7 @@ self.addEventListener("fetch", (event) => {
     fetch(event.request)
       .then((response) => {
         const copy = response.clone();
-        caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
+        caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy)).catch(() => undefined);
         return response;
       })
       .catch(() => caches.match(event.request).then((cached) => cached || caches.match("/operator")))

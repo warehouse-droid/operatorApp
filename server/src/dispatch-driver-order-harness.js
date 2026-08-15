@@ -57,6 +57,7 @@ vm.runInContext(`
   let drivers = [];
   let trucks = [];
   let driverLaneOrder = [];
+  let dispatchSetupLoaded = true;
   let currentPlan = { id: 77 };
   let currentPlanDate = "2026-07-22";
   const audit = [];
@@ -92,9 +93,24 @@ vm.runInContext(`
   ensureDriverLaneOrder(["old", "alpha"]);
   const historicalOrder = [...driverLaneOrder];
   const historicalLane = driverLanes().find((lane) => lane.driverLogin === "old");
+  dispatchSetupLoaded = false;
+  drivers = [];
+  trucks = [{
+    driverLogin: "cheng", driver: "Cheng Driver", license: "AZ",
+    loads: [{ id: "cheng-load", driverLogin: "cheng", driverName: "Cheng Driver", stops: [{ id: "drop-2" }] }]
+  }];
+  ensureDriverLaneOrder(["cheng"]);
+  const setupUnavailableLane = driverLanes().find((lane) => lane.driverLogin === "cheng");
+  dispatchSetupLoaded = true;
+  drivers = [{ login: "alpha", name: "Alpha", displayOrder: 1 }];
   trucks = [];
   const resetOrder = [...ensureDriverLaneOrder(defaultDriverLaneOrder())];
-  globalThis.result = { freshOrder, moved, movedOrder, historicalOrder, historicalLane, resetOrder, audit };
+  driverLaneOrder = ["retired-cheng", "alpha"];
+  const staleEmptyHistoricalOrder = [...ensureDriverLaneOrder(driverLaneOrder)];
+  globalThis.result = {
+    freshOrder, moved, movedOrder, historicalOrder, historicalLane,
+    setupUnavailableLane, resetOrder, staleEmptyHistoricalOrder, audit
+  };
 `, plannerContext);
 const plannerResult = JSON.parse(JSON.stringify(plannerContext.result));
 assert.deepEqual(plannerResult.freshOrder, ["zulu", "alpha"], "New plan ignored persisted non-alphabetical driver order.");
@@ -103,7 +119,17 @@ assert.deepEqual(plannerResult.movedOrder, ["alpha", "zulu"], "Marker drop inser
 assert.deepEqual(plannerResult.historicalOrder, ["old", "alpha"], "Saved disabled-driver lane order was filtered by the active setup list.");
 assert.equal(plannerResult.historicalLane?.historical, true, "Disabled saved driver was not rendered as a historical lane.");
 assert.equal(plannerResult.historicalLane?.driverName, "Old Driver", "Historical lane lost its saved driver name.");
+assert.equal(
+  plannerResult.setupUnavailableLane?.historical,
+  false,
+  "A transient setup-load failure must not relabel an active saved driver as Historical retained."
+);
 assert.deepEqual(plannerResult.resetOrder, ["alpha"], "A disabled historical driver leaked into fresh plan initialization.");
+assert.deepEqual(
+  plannerResult.staleEmptyHistoricalOrder,
+  ["alpha"],
+  "A stale saved lane with no loads must not render as a second zero-load historical driver."
+);
 assert.equal(plannerResult.audit.length, 1, "Marker reorder did not create exactly one lane-order audit record.");
 
 const renumberDriverLoadsSource = sourceRange(
@@ -1025,7 +1051,7 @@ assert.equal((initDispatchSource.match(/loadDriverJobStatuses\(/g) || []).length
 assert(repository.includes("displayOrder: numberValue(row.display_order, 0)"), "Setup API does not expose persisted display order.");
 assert(repository.includes("cleanDriver(driver, index)"), "Driver request order is not explicitly persisted as display_order.");
 assert(setupHtml.includes("20260803-mbt-bin-trucks-v1"), "Dispatch Setup browser asset version was not bumped.");
-assert(plannerHtml.includes('/dispatch.js?v=20260813-delivery-to-dependency-v1'), "Dispatch planner browser asset version was not bumped.");
+assert(plannerHtml.includes('/dispatch.js?v=20260814-plan-resume-v1'), "Dispatch planner browser asset version was not bumped.");
 
 const activityPositionSource = sourceRange(
   plannerUi,

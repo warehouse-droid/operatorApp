@@ -11,6 +11,8 @@ import {
 } from "./dispatch-enrichment.js";
 import { resolveDispatchSalesTarget } from "./dispatch-order-target-repository.js";
 import { cancelDispatchCoGlobally } from "./dispatch-co-lifecycle.js";
+import { netSuiteClosedOrderFamilySql } from "./netsuite-closed-order-policy.js";
+import { assertNoClosedNetSuiteOrders, listClosedNetSuiteOrders } from "./netsuite-closed-order-repository.js";
 import {
   dispatchLocationsShareYard,
   uniqueDispatchLocations
@@ -115,8 +117,18 @@ function dispatchItemHasQuantity(item = {}) {
 function purchaseOrderDropoffs(items = [], {
   destinationLocationId = null,
   destinationYard = "",
-  destinationAddress = ""
+  destinationAddress = "",
+  destinationAddressOverride = ""
 } = {}) {
+  const headerLocationId = normalizeScmDestinationLocationId(destinationLocationId);
+  const headerYard = locationTextFromId(headerLocationId)
+    || String(destinationYard || "").trim();
+  const cleanAddressOverride = String(destinationAddressOverride || "").trim();
+  const matchesHeaderDestination = (locationId, yard) => {
+    if (headerLocationId && locationId) return Number(headerLocationId) === Number(locationId);
+    if (!headerYard || !yard) return false;
+    return String(headerYard).trim().toLowerCase() === String(yard).trim().toLowerCase();
+  };
   const groups = new Map();
   for (const item of items.filter(dispatchItemHasQuantity)) {
     const locationId = normalizeScmDestinationLocationId(item.destinationLocationId)
@@ -125,13 +137,17 @@ function purchaseOrderDropoffs(items = [], {
       || String(item.destinationYard || destinationYard || "").trim();
     const key = locationId ? `location:${locationId}` : `yard:${yard.toLowerCase()}`;
     if (!groups.has(key)) {
+      const defaultAddress = SCM_VRMA_OWN_YARDS.find((candidate) => candidate.code === yard)?.address
+        || destinationAddress
+        || yard;
       groups.set(key, {
         key,
         destinationLocationId: locationId || null,
         destinationYard: yard,
-        address: SCM_VRMA_OWN_YARDS.find((candidate) => candidate.code === yard)?.address
-          || destinationAddress
-          || yard,
+        defaultAddress,
+        address: cleanAddressOverride && matchesHeaderDestination(locationId, yard)
+          ? cleanAddressOverride
+          : defaultAddress,
         lineRowIds: [],
         pallets: 0,
         layers: 0,
@@ -155,11 +171,15 @@ function purchaseOrderDropoffs(items = [], {
       || normalizeScmDestinationLocationId(destinationYard);
     const yard = locationTextFromId(locationId) || String(destinationYard || "").trim();
     const key = locationId ? `location:${locationId}` : `yard:${yard.toLowerCase()}`;
+    const defaultAddress = destinationAddress
+      || SCM_VRMA_OWN_YARDS.find((candidate) => candidate.code === yard)?.address
+      || yard;
     groups.set(key, {
       key,
       destinationLocationId: locationId || null,
       destinationYard: yard,
-      address: destinationAddress || SCM_VRMA_OWN_YARDS.find((candidate) => candidate.code === yard)?.address || yard,
+      defaultAddress,
+      address: cleanAddressOverride || defaultAddress,
       lineRowIds: [],
       pallets: 0,
       layers: 0,
@@ -168,6 +188,10 @@ function purchaseOrderDropoffs(items = [], {
       salesQty: 0,
       weight: 0
     });
+  }
+  if (groups.size === 1 && !headerLocationId && !headerYard && cleanAddressOverride) {
+    const [soleDropoff] = groups.values();
+    soleDropoff.address = cleanAddressOverride;
   }
   return [...groups.values()].map((dropoff) => ({
     ...dropoff,
@@ -216,12 +240,13 @@ function rowToDispatchOrder(row) {
     source: "local-db"
   } : null;
   const destinationYard = row.destination_location || "";
-  const destinationAddress = row.drop_address || row.dispatch_address || "";
+  const destinationAddress = row.default_drop_address || row.drop_address || row.dispatch_address || "";
   const dropoffs = row.dispatch_type === "PO"
     ? purchaseOrderDropoffs(items, {
         destinationLocationId: row.destination_location_id,
         destinationYard,
-        destinationAddress
+        destinationAddress,
+        destinationAddressOverride: row.delivery_address_override
       })
     : [];
   return {
@@ -238,6 +263,8 @@ function rowToDispatchOrder(row) {
     defaultSourceAddress: row.source_address || "",
     pickupAddressOverride: row.pickup_address_override || "",
     destinationAddress: row.drop_address || "",
+    defaultDestinationAddress: row.default_drop_address || row.drop_address || "",
+    deliveryAddressOverride: row.delivery_address_override || "",
     destinationLocationId: row.destination_location_id || null,
     expectedDeliveryDate: dateOnly(row.expected_delivery_date),
     windowStart: row.dispatch_window_start || "",
@@ -422,6 +449,7 @@ export async function listDispatchOrders({
       FROM sales_orders
       WHERE sales_order_type <> '${CUSTOMER_PICKUP_DELIVERY_METHOD.replaceAll("'", "''")}'
         AND NOT ${billedSalesOrderFamilySql("sales_orders")}
+        AND NOT ${netSuiteClosedOrderFamilySql("sales_orders", "SO")}
         AND (COALESCE(is_test_fixture, false) = false OR $2::boolean)
       UNION ALL
       SELECT
@@ -453,6 +481,7 @@ export async function listDispatchOrders({
         netsuite_active
       FROM transfer_orders
       WHERE from_location_id IS NOT NULL
+        AND NOT ${netSuiteClosedOrderFamilySql("transfer_orders", "TO")}
     ),
     delivery_line_source AS (
       SELECT
@@ -529,6 +558,7 @@ export async function listDispatchOrders({
         expected_delivery_date,
         dispatch_vendor_yard,
         dispatch_address,
+        dispatch_delivery_address,
         dispatch_pickup_address,
         dispatch_window_start,
         dispatch_window_end,
@@ -543,6 +573,7 @@ export async function listDispatchOrders({
         is_blanket_po,
         netsuite_active
       FROM purchase_orders
+      WHERE NOT ${netSuiteClosedOrderFamilySql("purchase_orders", "PO")}
       UNION ALL
       SELECT
         netsuite_id,
@@ -556,6 +587,7 @@ export async function listDispatchOrders({
         expected_delivery_date,
         NULL::text AS dispatch_vendor_yard,
         dispatch_address,
+        ''::text AS dispatch_delivery_address,
         dispatch_pickup_address,
         dispatch_window_start,
         dispatch_window_end,
@@ -571,6 +603,7 @@ export async function listDispatchOrders({
         netsuite_active
       FROM transfer_orders
       WHERE to_location_id IS NOT NULL
+        AND NOT ${netSuiteClosedOrderFamilySql("transfer_orders", "TO")}
     ),
     receiving_line_source AS (
       SELECT
@@ -650,6 +683,11 @@ export async function listDispatchOrders({
         NULL::text AS source_address,
         o.destination_location,
         o.destination_location_id,
+        CASE
+          WHEN o.order_type = 'transfer_order' THEN ${yardAddressSql("o.destination_location")}
+          ELSE o.dispatch_address
+        END AS default_drop_address,
+        ''::text AS delivery_address_override,
         CASE
           WHEN o.order_type = 'transfer_order' THEN ${yardAddressSql("o.destination_location")}
           ELSE o.dispatch_address
@@ -789,7 +827,12 @@ export async function listDispatchOrders({
           WHEN COALESCE(NULLIF(scm.dropoff_point, ''), o.destination_location) = '150' THEN 26
           ELSE o.destination_location_id
         END AS destination_location_id,
-        ${yardAddressSql("COALESCE(NULLIF(scm.dropoff_point, ''), o.destination_location)")} AS drop_address,
+        ${yardAddressSql("COALESCE(NULLIF(scm.dropoff_point, ''), o.destination_location)")} AS default_drop_address,
+        o.dispatch_delivery_address AS delivery_address_override,
+        COALESCE(
+          NULLIF(o.dispatch_delivery_address, ''),
+          ${yardAddressSql("COALESCE(NULLIF(scm.dropoff_point, ''), o.destination_location)")}
+        ) AS drop_address,
         o.dispatch_address,
         COALESCE(NULLIF(schedule_pickup_yard.window_start, ''), o.dispatch_window_start) AS dispatch_window_start,
         COALESCE(NULLIF(schedule_pickup_yard.window_end, ''), o.dispatch_window_end) AS dispatch_window_end,
@@ -918,7 +961,7 @@ export async function listDispatchOrders({
       GROUP BY o.netsuite_id, o.tranid, o.order_type, o.vendor, o.source_location,
                 o.dispatch_ref,
                 o.destination_location, o.destination_location_id, o.expected_delivery_date, o.dispatch_vendor_yard,
-               o.dispatch_address, o.dispatch_pickup_address, o.dispatch_window_start, o.dispatch_window_end,
+               o.dispatch_address, o.dispatch_delivery_address, o.dispatch_pickup_address, o.dispatch_window_start, o.dispatch_window_end,
                o.dispatch_instructions, o.dispatch_parse_source, o.dispatch_plan_date,
                o.dispatch_truck_plate, o.dispatch_load_name, o.dispatch_parking_spot,
                o.status_text, o.initial_scm_status, o.is_blanket_po, o.netsuite_active,
@@ -945,6 +988,8 @@ export async function listDispatchOrders({
         ${yardAddressSql("co.from_location")} AS source_address,
         co.to_location AS destination_location,
         co.to_location_id AS destination_location_id,
+        ${yardAddressSql("co.to_location")} AS default_drop_address,
+        ''::text AS delivery_address_override,
         ${yardAddressSql("co.to_location")} AS drop_address,
         ${yardAddressSql("co.to_location")} AS dispatch_address,
         ''::text AS dispatch_window_start,
@@ -1019,6 +1064,8 @@ export async function listDispatchOrders({
         ${yardAddressSql("v.pickup_location")} AS source_address,
         v.dropoff_location AS destination_location,
         NULL::bigint AS destination_location_id,
+        COALESCE(vrma_yard.address, '') AS default_drop_address,
+        ''::text AS delivery_address_override,
         COALESCE(vrma_yard.address, '') AS drop_address,
         COALESCE(vrma_yard.address, '') AS dispatch_address,
         COALESCE(vrma_yard.window_start, '') AS dispatch_window_start,
@@ -1246,6 +1293,7 @@ export async function searchSalesOrderMethodOverrides({ search = "", limit = 30 
 export async function updateSalesOrderLocalMethod(tranid, { method = "", updatedBy = "" } = {}) {
   const orderRef = String(tranid || "").trim();
   if (!orderRef) throw new Error("Sales order number is required.");
+  await assertNoClosedNetSuiteOrders([orderRef], "change delivery method in Dispatch");
   const normalizedMethod = String(method || "").trim();
   const allowed = new Set(["Delivery", CUSTOMER_PICKUP_DELIVERY_METHOD]);
   if (!allowed.has(normalizedMethod)) throw new Error("Local method must be Delivery or Pick-Up.");
@@ -1554,6 +1602,7 @@ export async function reparseMissingSalesOrderDispatch({ limit = 200, dryRun = f
 }
 
 export async function setPurchaseOrderVendorYard(orderRef, vendorYardId) {
+  await assertNoClosedNetSuiteOrders([orderRef], "change vendor yard in Dispatch");
   const yard = await query(
     `SELECT id, vendor, yard, day_label, window_start, window_end, instructions, address
        FROM dispatch_vendor_yards
@@ -1587,6 +1636,7 @@ export async function setPurchaseOrderVendorYard(orderRef, vendorYardId) {
 }
 
 export async function updateDispatchOrderDetails(orderRef, patch = {}) {
+  await assertNoClosedNetSuiteOrders([orderRef], "change Dispatch details");
   const address = String(patch.address || "").trim();
   const pickupAddressProvided = patch.pickupAddress !== undefined
     || patch.pickup_address !== undefined;
@@ -1612,9 +1662,15 @@ export async function updateDispatchOrderDetails(orderRef, patch = {}) {
           ];
 
   for (const { table, orderType } of attempts) {
+    const deliveryAddressColumn = table === "purchase_orders"
+      ? "dispatch_delivery_address"
+      : "dispatch_address";
+    const returnedDeliveryAddress = table === "purchase_orders"
+      ? "dispatch_delivery_address"
+      : "NULL::text";
     const result = await query(
       `UPDATE ${table}
-          SET dispatch_address = $2,
+          SET ${deliveryAddressColumn} = $2,
               dispatch_window_start = $3,
               dispatch_window_end = $4,
               expected_delivery_date = $5::date,
@@ -1622,7 +1678,8 @@ export async function updateDispatchOrderDetails(orderRef, patch = {}) {
               dispatch_parse_source = 'manual-dispatch-details',
               dispatch_parsed_at = now()
         WHERE (tranid = $1 OR netsuite_id::text = $1)
-        RETURNING netsuite_id, tranid, dispatch_address, dispatch_window_start,
+        RETURNING netsuite_id, tranid, ${deliveryAddressColumn} AS dispatch_address,
+                  ${returnedDeliveryAddress} AS dispatch_delivery_address, dispatch_window_start,
                   dispatch_window_end, expected_delivery_date, dispatch_pickup_address,
                   '${table}'::text AS source_table`,
       [orderRef, address, windowStart, windowEnd, expectedDate, pickupAddressProvided, pickupAddress]
@@ -1994,6 +2051,7 @@ export async function setPurchaseOrderBlanketFlag(orderRef, {
   if (!ref) throw Object.assign(new Error("Purchase order reference is required."), { status: 400 });
   const flagged = isBlanket === true;
   return withTransaction(async () => {
+    await assertNoClosedNetSuiteOrders([ref], "change Blanket status in SCM");
     const sourceResult = await query(
       `SELECT *
          FROM purchase_orders
@@ -2533,7 +2591,8 @@ export async function listScmSchedule({
         ON active_group.status = 'active'
        AND lower(active_group.group_ref) = lower(COALESCE(member_schedule.group_ref, ''))
       LEFT JOIN purchase_order_lines l ON l.purchase_order_id = po.netsuite_id AND l.netsuite_active = true
-      WHERE (po.netsuite_active = true OR $9 = 'completed')
+	      WHERE (po.netsuite_active = true OR $9 = 'completed')
+	        AND NOT ${netSuiteClosedOrderFamilySql("po", "PO")}
         AND (
           $10 = ''
           OR lower(po.tranid) = lower($10)
@@ -2636,7 +2695,8 @@ export async function listScmSchedule({
       LEFT JOIN unique_to_line_locations receiving_location
         ON receiving_location.transfer_order_id = t.netsuite_id
        AND receiving_location.line_stage = 'receiving'
-      WHERE (t.netsuite_active = true OR $9 = 'completed')
+	      WHERE (t.netsuite_active = true OR $9 = 'completed')
+	        AND NOT ${netSuiteClosedOrderFamilySql("t", "TO")}
         AND COALESCE(t.to_location_id, receiving_location.location_id) IS NOT NULL
         AND ($10 = '' OR lower(t.tranid) = lower($10))
       GROUP BY t.netsuite_id,
@@ -2753,8 +2813,9 @@ export async function listScmSchedule({
       ) stop_schedule
       JOIN plan_order_types plan_order
         ON plan_order.plan_id = snap.plan_id
-       AND plan_order.order_ref = stop.value->>'orderId'
-      WHERE stop.value->>'type' = 'drop'
+       AND lower(plan_order.order_ref) = lower(stop.value->>'orderId')
+      WHERE p.status <> 'cancelled'
+        AND stop.value->>'type' IN ('drop', 'dropoff')
         AND COALESCE(stop.value->>'orderId', '') <> ''
         AND COALESCE(load.value->>'returnOnly', 'false') <> 'true'
       ORDER BY plan_order.order_kind, plan_order.order_ref, p.plan_date DESC,
@@ -4498,14 +4559,14 @@ function dispatchScheduleEtaTime(stop = {}) {
 }
 
 export async function syncScmScheduleFromDispatchPlan(plan, { updatedBy = "dispatch-plan" } = {}) {
-  if (!plan?.planDate || !Array.isArray(plan.trucks)) return { planned: 0 };
+  if (!plan?.planDate || !Array.isArray(plan.trucks)) return { planned: 0, unplanned: 0 };
   const plannedRows = [];
   for (const truck of plan.trucks || []) {
     for (const load of truck.loads || []) {
       if (load.returnOnly) continue;
       const assignment = dispatchLoadAssignment(truck, load);
       for (const stop of load.stops || []) {
-        if (stop.type !== "drop" || !stop.orderId) continue;
+        if (!["drop", "dropoff"].includes(String(stop.type || "").toLowerCase()) || !stop.orderId) continue;
         const order = (plan.orders || []).find((item) => item.id === stop.orderId);
         if (order?.type !== "PO" && order?.type !== "TO" && order?.sourceTable !== "scm_vrma_orders") continue;
         plannedRows.push({
@@ -4544,10 +4605,29 @@ export async function syncScmScheduleFromDispatchPlan(plan, { updatedBy = "dispa
   for (const row of plannedRows) {
     await query(
       `INSERT INTO scm_transport_schedule (
-         order_kind, order_ref, method, status, eta_date, eta_time, driver, dispatch_assignment_note, updated_by, created_by
+         order_kind, order_ref, method, status, eta_date, eta_time, driver,
+         dispatch_assignment_note, updated_by, created_by,
+         dispatch_plan_id, dispatch_previous_state
        )
-       VALUES ($1, $2, 'MBT', 'Planned', $3::date, NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''), $7, $7)
+       VALUES (
+         $1, $2, 'MBT', 'Planned', $3::date, NULLIF($4, ''), NULLIF($5, ''),
+         NULLIF($6, ''), $7, $7, $8::bigint, jsonb_build_object('status', 'Queued')
+       )
        ON CONFLICT (order_kind, order_ref) DO UPDATE SET
+         dispatch_previous_state = CASE
+           WHEN scm_transport_schedule.dispatch_previous_state IS NOT NULL
+             THEN scm_transport_schedule.dispatch_previous_state
+           WHEN scm_transport_schedule.status = 'Planned'
+             THEN jsonb_build_object('status', 'Queued')
+           ELSE jsonb_build_object(
+             'status', scm_transport_schedule.status,
+             'etaDate', scm_transport_schedule.eta_date,
+             'etaTime', scm_transport_schedule.eta_time,
+             'driver', scm_transport_schedule.driver,
+             'dispatchAssignmentNote', scm_transport_schedule.dispatch_assignment_note
+           )
+         END,
+         dispatch_plan_id = EXCLUDED.dispatch_plan_id,
          method = CASE WHEN scm_transport_schedule.method IS NULL THEN 'MBT' ELSE scm_transport_schedule.method END,
          status = CASE
            WHEN scm_transport_schedule.reconciliation_blocked = true THEN 'Reconcile Review'
@@ -4570,11 +4650,49 @@ export async function syncScmScheduleFromDispatchPlan(plan, { updatedBy = "dispa
         row.etaTime,
         row.driver,
         `${row.truckPlate} ${row.loadName}${row.parkingSpot ? ` Parking ${row.parkingSpot}` : ""}`.trim(),
-        updatedBy || null
+        updatedBy || null,
+        plan.id || null
       ]
     );
   }
-  return { planned: plannedRows.length };
+  let unplanned = 0;
+  if (plan.id) {
+    const activeScheduleKeys = [...new Set(plannedRows
+      .filter((row) => ["PO", "TO"].includes(row.orderKind))
+      .map((row) => `${row.orderKind}:${row.orderRef}`.toLowerCase()))];
+    const reverted = await query(
+      `UPDATE scm_transport_schedule schedule
+          SET status = COALESCE(
+                NULLIF(schedule.dispatch_previous_state->>'status', ''),
+                CASE
+                  WHEN schedule.order_kind = 'PO' THEN (
+                    SELECT NULLIF(po.initial_scm_status, '')
+                      FROM purchase_orders po
+                     WHERE lower(COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid)) = lower(schedule.order_ref)
+                     ORDER BY po.netsuite_active DESC, po.synced_at DESC NULLS LAST
+                     LIMIT 1
+                  )
+                END,
+                'Queued'
+              ),
+              eta_date = NULLIF(schedule.dispatch_previous_state->>'etaDate', '')::date,
+              eta_time = NULLIF(schedule.dispatch_previous_state->>'etaTime', ''),
+              driver = NULLIF(schedule.dispatch_previous_state->>'driver', ''),
+              dispatch_assignment_note = NULLIF(schedule.dispatch_previous_state->>'dispatchAssignmentNote', ''),
+              dispatch_plan_id = NULL,
+              dispatch_previous_state = NULL,
+              updated_by = $3,
+              updated_at = now()
+        WHERE schedule.dispatch_plan_id = $1::bigint
+          AND schedule.order_kind IN ('PO', 'TO')
+          AND schedule.status = 'Planned'
+          AND NOT (lower(schedule.order_kind || ':' || schedule.order_ref) = ANY($2::text[]))
+        RETURNING schedule.id`,
+      [plan.id, activeScheduleKeys, updatedBy || null]
+    );
+    unplanned = reverted.rowCount || 0;
+  }
+  return { planned: plannedRows.length, unplanned };
 }
 
 export async function updateScmPurchaseOrderSplitRef({
@@ -5810,6 +5928,10 @@ function targetLineAsAllocationRow(line = {}) {
 
 export async function getSalesOrderPoAllocationOptions(orderRef, { planDate = "" } = {}) {
   const resolved = await resolveDispatchSalesTarget({ dispatchTargetRef: orderRef, planDate });
+  await assertNoClosedNetSuiteOrders(
+    [resolved.target.ref, ...(resolved.target.memberRefs || [])],
+    "be viewed in Dispatch PO links"
+  );
   const operationalTargetLines = resolved.lines.filter(isDispatchOperationalLine);
   const salesLines = operationalTargetLines.map(targetLineAsAllocationRow);
   const itemIds = [...new Set(salesLines.map((line) => line.item_id).filter(Boolean))];
@@ -5969,6 +6091,10 @@ async function createSalesOrderPoAllocationWithExecutor(executor, {
     dispatchTargetRef: dispatchTargetRef || salesOrderRef,
     planDate
   });
+  await assertNoClosedNetSuiteOrders(
+    [resolved.target.ref, ...(resolved.target.memberRefs || [])],
+    "be linked to a PO in Dispatch"
+  );
   if (targetSignature && targetSignature !== resolved.signature) {
     const error = new Error(`${resolved.target.ref} changed while the link window was open. Refresh before linking the PO.`);
     error.status = 409;
@@ -6032,6 +6158,7 @@ async function createSalesOrderPoAllocationWithExecutor(executor, {
   );
   const poLine = po.rows[0];
   if (!poLine) throw new Error("Purchase order line not found.");
+  await assertNoClosedNetSuiteOrders([poLine.po_order_ref], "be linked to an SO in Dispatch");
   const requestedPoRef = String(poRef || "").trim().toLowerCase();
   if (requestedPoRef && requestedPoRef !== String(poLine.po_order_ref || "").trim().toLowerCase()
     && requestedPoRef !== String(poLine.purchase_order_id || "").trim().toLowerCase()) {
@@ -6189,18 +6316,34 @@ export async function createSalesOrderPoAllocations({
 }
 
 export async function cancelSalesOrderPoAllocation(allocationId, { cancelledBy = "" } = {}) {
-  const result = await query(
-    `UPDATE dispatch_so_po_allocations
-        SET status = 'cancelled',
-            cancelled_by = $2,
-            cancelled_at = now(),
-            updated_at = now()
-      WHERE id = $1
-        AND status = 'active'
-      RETURNING *`,
-    [allocationId, cancelledBy || null]
-  );
-  return result.rows[0] ? normalizeAllocationRow(result.rows[0]) : null;
+  return withTransaction(async () => {
+    const current = await query(
+      `SELECT sales_order_ref, po_order_ref, dispatch_target_ref
+         FROM dispatch_so_po_allocations
+        WHERE id = $1
+          AND status = 'active'
+        FOR UPDATE`,
+      [allocationId]
+    );
+    if (!current.rows[0]) return null;
+    await assertNoClosedNetSuiteOrders([
+      current.rows[0].sales_order_ref,
+      current.rows[0].po_order_ref,
+      current.rows[0].dispatch_target_ref
+    ], "change a Dispatch PO link");
+    const result = await query(
+      `UPDATE dispatch_so_po_allocations
+          SET status = 'cancelled',
+              cancelled_by = $2,
+              cancelled_at = now(),
+              updated_at = now()
+        WHERE id = $1
+          AND status = 'active'
+        RETURNING *`,
+      [allocationId, cancelledBy || null]
+    );
+    return result.rows[0] ? normalizeAllocationRow(result.rows[0]) : null;
+  });
 }
 
 function localCoChildSourceYards(child = {}) {
@@ -6260,6 +6403,10 @@ export async function upsertLocalCoOrder({ sourceOrderRef, fromYard, toYard, ord
   const fromText = locationTextFromId(fromYard || order.sourceYard || order.pickupLocations?.[0]);
   const toText = locationTextFromId(toYard || "12441");
   if (!sourceRef) throw new Error("Source order is required for CO.");
+  await assertNoClosedNetSuiteOrders([
+    sourceRef,
+    ...(Array.isArray(order.childOrders) ? order.childOrders : [])
+  ], "create or change a local CO in Dispatch");
   if (!fromText || !toText || dispatchLocationsShareYard(fromText, toText)) {
     throw new Error("CO source and destination yard must be different.");
   }
@@ -6427,6 +6574,7 @@ export async function getLocalCoOrder(coRefOrId) {
 
 export async function createDispatchOperatorRequest({ requestType, orderRef, sourceOrderType, requestedBy = "", details = {} } = {}) {
   if (!requestType || !orderRef) throw new Error("Request type and order reference are required.");
+  await assertNoClosedNetSuiteOrders([orderRef], "create an Operator request");
   const result = await query(
     `INSERT INTO dispatch_operator_requests (
        request_type, order_ref, source_order_type, requested_by, details
@@ -6508,7 +6656,9 @@ export async function listDispatchOperatorRequests({ status = "open", locationId
       LIMIT 100`,
     params
   );
-  return result.rows;
+  const closed = await listClosedNetSuiteOrders(result.rows.map((row) => row.order_ref));
+  const closedRefs = new Set(closed.map((entry) => entry.requestedRef));
+  return result.rows.filter((row) => !closedRefs.has(String(row.order_ref || "").trim().toUpperCase()));
 }
 
 export async function resolveDispatchOperatorRequestsForOrder(orderRef, operatorId = "") {

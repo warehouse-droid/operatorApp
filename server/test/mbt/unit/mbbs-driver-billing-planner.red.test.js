@@ -8,8 +8,16 @@ import {
   planDriverBillingUnits,
   resolveManualBillingAmount
 } from "../../../src/mbt/mbbs-driver-billing-planner.js";
+import { DEFAULT_MBBS_RATE_CARD_POLICY } from "../../../src/mbt/mbbs-rate-card-policy.js";
 
 const COMPLETED_AT = "2039-08-12T18:00:00.000Z";
+
+function calculateBillingUnitAmountWithPolicy(input) {
+  return calculateBillingUnitAmount({
+    ...input,
+    mbbsChargingPolicy: input.mbbsChargingPolicy ?? DEFAULT_MBBS_RATE_CARD_POLICY
+  });
+}
 
 function record({
   id,
@@ -272,8 +280,8 @@ test("splitting an authoritative SO group across Driver loads does not change it
   assert.deepEqual(oneLoad[0].driverLoadNumbers, ["Load 1"]);
   assert.deepEqual(twoLoads[0].driverLoadNumbers, ["Load 1", "Load 2"]);
   assert.deepEqual(
-    calculateBillingUnitAmount({ billingRule: twoLoads[0].billingRule, distanceBandAmountMinor: 25_000, dropCount: 1 }),
-    calculateBillingUnitAmount({ billingRule: oneLoad[0].billingRule, distanceBandAmountMinor: 25_000, dropCount: 1 })
+    calculateBillingUnitAmountWithPolicy({ billingRule: twoLoads[0].billingRule, distanceBandAmountMinor: 25_000, dropCount: 1 }),
+    calculateBillingUnitAmountWithPolicy({ billingRule: oneLoad[0].billingRule, distanceBandAmountMinor: 25_000, dropCount: 1 })
   );
 });
 
@@ -351,13 +359,14 @@ test("an authoritative PO group is one order while retaining every child PO as e
   assert.deepEqual(units[0].routeStops.map((stop) => stop.addressText), [origin, ...destinations]);
   assert.deepEqual(units[0].driverLoadNumbers, ["Load 1", "Load 2"]);
   assert.match(units[0].relationship.summary, /charged once as one Purchase Order group/iu);
-  assert.deepEqual(calculateBillingUnitAmount({
+  assert.deepEqual(calculateBillingUnitAmountWithPolicy({
     billingRule: units[0].billingRule,
     distanceBandAmountMinor: 25_000,
     dropCount: units[0].dropCount
   }), {
     distanceBandAmountMinor: 25_000,
     additionalDropCount: 1,
+    additionalDropUnitAmountMinor: 10_000,
     additionalDropFeeMinor: 10_000,
     calculatedAmountMinor: 35_000
   });
@@ -461,12 +470,12 @@ test("billing identities and totals do not change when Dispatch splits the same 
   assert.deepEqual(oneLoad[0].driverLoadNumbers, ["Load 1"]);
   assert.deepEqual(twoLoads[0].driverLoadNumbers, ["Load 1", "Load 2"]);
 
-  const oneLoadAmount = calculateBillingUnitAmount({
+  const oneLoadAmount = calculateBillingUnitAmountWithPolicy({
     billingRule: oneLoad[0].billingRule,
     distanceBandAmountMinor: 25_000,
     dropCount: oneLoad[0].dropCount
   });
-  const twoLoadAmount = calculateBillingUnitAmount({
+  const twoLoadAmount = calculateBillingUnitAmountWithPolicy({
     billingRule: twoLoads[0].billingRule,
     distanceBandAmountMinor: 25_000,
     dropCount: twoLoads[0].dropCount
@@ -510,33 +519,36 @@ test("direct-dependency TO is an additional drop while its linked SO remains an 
 });
 
 test("billing unit arithmetic applies the full, multi-drop, and direct-TO policies in integer cents", () => {
-  assert.deepEqual(calculateBillingUnitAmount({
+  assert.deepEqual(calculateBillingUnitAmountWithPolicy({
     billingRule: "so_order",
     distanceBandAmountMinor: 20_000,
     dropCount: 1
   }), {
     distanceBandAmountMinor: 20_000,
     additionalDropCount: 0,
+    additionalDropUnitAmountMinor: 0,
     additionalDropFeeMinor: 0,
     calculatedAmountMinor: 20_000
   });
-  assert.deepEqual(calculateBillingUnitAmount({
+  assert.deepEqual(calculateBillingUnitAmountWithPolicy({
     billingRule: "po_shared_leg",
     distanceBandAmountMinor: 25_000,
     dropCount: 3
   }), {
     distanceBandAmountMinor: 25_000,
     additionalDropCount: 2,
+    additionalDropUnitAmountMinor: 10_000,
     additionalDropFeeMinor: 20_000,
     calculatedAmountMinor: 45_000
   });
-  assert.deepEqual(calculateBillingUnitAmount({
+  assert.deepEqual(calculateBillingUnitAmountWithPolicy({
     billingRule: "to_direct_additional_drop",
     distanceBandAmountMinor: 35_000,
     dropCount: 1
   }), {
     distanceBandAmountMinor: 0,
     additionalDropCount: 1,
+    additionalDropUnitAmountMinor: 10_000,
     additionalDropFeeMinor: 10_000,
     calculatedAmountMinor: 10_000
   });
@@ -595,31 +607,35 @@ test("money policy rejects malformed, negative, missing-route, and overflowing i
       billingRule: "po_shared_leg",
       distanceBandAmountMinor: 1,
       dropCount: 2,
-      additionalDropFeeMinor: -1
-    }, "MBT_BILLING_FINAL_AMOUNT_INVALID"],
+      mbbsChargingPolicy: {
+        ...DEFAULT_MBBS_RATE_CARD_POLICY,
+        poAdditionalDropUnitAmountMinor: -1
+      }
+    }, "MBT_RATE_CARD_POLICY_INVALID"],
     [{
       billingRule: "po_shared_leg",
       distanceBandAmountMinor: Number.MAX_SAFE_INTEGER,
       dropCount: 2,
-      additionalDropFeeMinor: 1
+      mbbsChargingPolicy: {
+        ...DEFAULT_MBBS_RATE_CARD_POLICY,
+        poAdditionalDropUnitAmountMinor: 1
+      }
     }, "MBT_BILLING_MANUAL_AMOUNT_INVALID"]
   ]) {
-    assert.throws(() => calculateBillingUnitAmount(input), (error) => error?.code === code);
+    assert.throws(() => calculateBillingUnitAmountWithPolicy(input), (error) => error?.code === code);
   }
 
   for (const billingRule of ["to_replenishment", "custom_order", "reconciliation"]) {
-    assert.equal(calculateBillingUnitAmount({
+    assert.equal(calculateBillingUnitAmountWithPolicy({
       billingRule,
       distanceBandAmountMinor: 123,
-      dropCount: 1,
-      additionalDropFeeMinor: 77
+      dropCount: 1
     }).calculatedAmountMinor, 123);
   }
-  assert.equal(calculateBillingUnitAmount({
+  assert.equal(calculateBillingUnitAmountWithPolicy({
     billingRule: "po_shared_leg",
     distanceBandAmountMinor: 123,
-    dropCount: 1,
-    additionalDropFeeMinor: 77
+    dropCount: 1
   }).calculatedAmountMinor, 123);
 });
 

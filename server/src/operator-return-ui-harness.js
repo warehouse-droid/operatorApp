@@ -300,7 +300,7 @@ for (const asset of [
   assert.ok(serviceWorker.includes(asset), `service worker shell is missing ${asset}`);
 }
 assert.ok(
-  serviceWorker.includes("mbbs-yard-operator-v138-toronto-timestamps-v1"),
+  serviceWorker.includes("mbbs-yard-operator-v139-request-scheme-v1"),
   "service worker cache name must retain the current driver-cache isolation version"
 );
 

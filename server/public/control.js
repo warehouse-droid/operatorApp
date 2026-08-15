@@ -544,10 +544,67 @@ function closeSalesOrderReloadDialog() {
   document.querySelector(".sales-order-reload-modal")?.remove();
 }
 
-function openSalesOrderReloadDialog(order, { cancel = false, cycle = null } = {}) {
+function reattemptQuantityFields(line = {}) {
+  const definitions = [
+    ["palletQty", "Pallet", Number(line.historicalPalletQty || 0)],
+    ["layerQty", "Layer", Number(line.historicalLayerQty || 0)],
+    ["sectionQty", "Section", Number(line.historicalSectionQty || 0)],
+    ["pieceQty", "Piece", Number(line.historicalPieceQty || 0)]
+  ].filter(([, , maximum]) => maximum > 0);
+  if (!definitions.length) {
+    definitions.push(["salesQty", line.historicalSalesUom || "Sales unit", Number(line.historicalLoadedSalesQty || 0)]);
+  }
+  return definitions;
+}
+
+function renderSalesOrderReattemptLine(line = {}) {
+  const disabled = line.selectable ? "" : "disabled";
+  const quantities = reattemptQuantityFields(line);
+  return `
+    <article class="sales-order-reattempt-line" data-reattempt-line data-line-key="${escapeHtml(line.lineKey || "")}">
+      <div class="sales-order-reattempt-identities">
+        <div><small>Original loaded SKU</small><strong>${escapeHtml(line.historicalSku || line.historicalItemName || "Unknown")}</strong><span>${movementQuantity(line.historicalLoadedSalesQty || 0)} ${escapeHtml(line.historicalSalesUom || "")}</span></div>
+        <div><small>Current Sales Order SKU</small><strong>${escapeHtml(line.currentSku || "No current match")}</strong><span>${movementQuantity(line.currentSalesQty || 0)} ${escapeHtml(line.currentSalesUom || "")}</span></div>
+      </div>
+      ${line.skuMismatch || line.itemMismatch
+        ? `<div class="notice warning"><strong>Historical/current item mismatch</strong><span>${escapeHtml(line.mismatchWarning || "The loaded item differs from the current Sales Order line. The re-attempt keeps the historical freight identity.")}</span></div>`
+        : ""}
+      ${!line.selectable ? `<div class="notice warning"><strong>Selection unavailable</strong><span>This historical line has no authoritative current Sales Order mapping.</span></div>` : ""}
+      <div class="sales-order-reattempt-quantities">
+        ${quantities.map(([key, label, maximum]) => `
+          <label>
+            <span>Re-attempt quantity · ${escapeHtml(label)}</span>
+            <input type="number" min="0" max="${maximum}" step="any" value="0" data-reattempt-quantity="${key}" ${disabled} />
+          </label>
+          <div class="sales-order-reattempt-delivered">
+            <span>Already delivered · ${escapeHtml(label)}</span>
+            <output data-already-delivered="${key}" data-maximum="${maximum}">${movementQuantity(maximum)}</output>
+          </div>
+        `).join("")}
+      </div>
+      <label>
+        <span>Mandatory reason for this selected line</span>
+        <textarea data-line-reason name="lineReason" maxlength="500" rows="2" ${disabled} placeholder="Why must this exact line and quantity be delivered again?"></textarea>
+      </label>
+    </article>
+  `;
+}
+
+async function openSalesOrderReloadDialog(order, { cancel = false, cycle = null } = {}) {
   if (!order?.order_id) return;
   closeSalesOrderReloadDialog();
   const requestId = cancel ? "" : crypto.randomUUID();
+  let preview = null;
+  if (!cancel) {
+    try {
+      const response = await request(`/api/control/sales-orders/${encodeURIComponent(order.order_id)}/reload-preview`);
+      preview = response.preview || null;
+    } catch (error) {
+      alert(error.message);
+      return;
+    }
+  }
+  const partialReattempt = preview?.completedDropoff === true;
   const modal = document.createElement("div");
   modal.className = "photo-lightbox sales-order-reload-modal";
   modal.innerHTML = `
@@ -557,11 +614,23 @@ function openSalesOrderReloadDialog(order, { cancel = false, cycle = null } = {}
       <p><strong>${escapeHtml(order.tranid || order.order_id)}</strong> · ${escapeHtml(order.yard_location || "")}</p>
       <p class="muted">${cancel
         ? "Cancellation is allowed only before any Operator packing activity. Existing load records remain unchanged."
-        : "Exactly the currently loaded local quantities will be offered again. This is local-only: it does not create a NetSuite fulfillment or change Dispatch."}</p>
-      <label>
-        <span>Re-load reason</span>
-        <textarea name="reason" maxlength="500" rows="4" required placeholder="Describe why this order must be packed and loaded again"></textarea>
-      </label>
+        : partialReattempt
+          ? "The original completed stop stays immutable. Select only the freight that must be attempted again; authorization creates a linked, no-duplicate-billing Sales Order re-attempt for Dispatch."
+          : "Exactly the currently loaded local quantities will be offered again. This is local-only: it does not create a NetSuite fulfillment or change Dispatch."}</p>
+      ${partialReattempt ? `
+        <div class="sales-order-reattempt-summary">
+          <strong>Original load evidence #${escapeHtml(preview.sourceLoadRecordId)}</strong>
+          <span>${formatDate(preview.sourceLoadProcessedAt)}</span>
+        </div>
+        <div class="sales-order-reattempt-lines">
+          ${(preview.lines || []).map(renderSalesOrderReattemptLine).join("")}
+        </div>
+      ` : `
+        <label>
+          <span>Re-load reason</span>
+          <textarea name="reason" maxlength="500" rows="4" required placeholder="Describe why this order must be packed and loaded again"></textarea>
+        </label>
+      `}
       <div class="loaded-filter-actions">
         <button data-action="close-sales-order-reload" type="button">${t("common.cancel", "Cancel")}</button>
         <button class="primary" type="submit">${cancel ? "Cancel Re-load" : "Authorize Re-load"}</button>
@@ -573,18 +642,66 @@ function openSalesOrderReloadDialog(order, { cancel = false, cycle = null } = {}
       closeSalesOrderReloadDialog();
     }
   });
+  modal.addEventListener("input", (event) => {
+    const input = event.target.closest?.("[data-reattempt-quantity]");
+    if (!input) return;
+    const line = input.closest("[data-reattempt-line]");
+    const output = line?.querySelector(`[data-already-delivered="${input.dataset.reattemptQuantity}"]`);
+    if (!output) return;
+    const maximum = Number(output.dataset.maximum || 0);
+    const selected = Number(input.value || 0);
+    output.textContent = movementQuantity(Math.max(0, maximum - (Number.isFinite(selected) ? selected : 0)));
+  });
   modal.querySelector("form")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = event.currentTarget;
     const reason = String(new FormData(form).get("reason") || "").trim();
-    if (!reason) return;
+    let lineSelections = [];
+    if (partialReattempt && !cancel) {
+      lineSelections = [...form.querySelectorAll("[data-reattempt-line]")].map((line) => {
+        const selection = {
+          lineKey: line.dataset.lineKey || "",
+          reason: String(line.querySelector("[data-line-reason]")?.value || "").trim()
+        };
+        for (const input of line.querySelectorAll("[data-reattempt-quantity]")) {
+          selection[input.dataset.reattemptQuantity] = Number(input.value || 0);
+        }
+        return selection;
+      });
+      const selected = lineSelections.filter((selection) => [
+        selection.palletQty,
+        selection.layerQty,
+        selection.sectionQty,
+        selection.pieceQty,
+        selection.salesQty
+      ].some((value) => Number(value || 0) > 0));
+      if (!selected.length) {
+        alert("Select at least one positive re-attempt quantity.");
+        return;
+      }
+      if (selected.some((selection) => !selection.reason)) {
+        alert("Enter a mandatory reason for every selected line.");
+        return;
+      }
+    } else if (!reason) {
+      return;
+    }
     const submit = form.querySelector("button[type='submit']");
     if (submit) submit.disabled = true;
     try {
       const base = `/api/control/sales-orders/${encodeURIComponent(order.order_id)}/reload-cycles`;
       await request(cancel ? `${base}/${encodeURIComponent(cycle?.id)}/cancel` : base, {
         method: "POST",
-        body: JSON.stringify(cancel ? { reason } : { reason, requestId })
+        body: JSON.stringify(cancel
+          ? { reason }
+          : partialReattempt
+            ? {
+                requestId,
+                sourceLoadRecordId: preview.sourceLoadRecordId,
+                lineSelections,
+                reason: lineSelections.find((selection) => selection.reason)?.reason || ""
+              }
+            : { reason, requestId })
       });
       closeSalesOrderReloadDialog();
       await loadLoadedOrders({ keepSelection: true });
@@ -596,7 +713,7 @@ function openSalesOrderReloadDialog(order, { cancel = false, cycle = null } = {}
     }
   });
   document.body.appendChild(modal);
-  modal.querySelector("textarea")?.focus();
+  modal.querySelector("input:not([disabled]), textarea:not([disabled])")?.focus();
 }
 
 function envFileLabel(file) {
@@ -4736,12 +4853,12 @@ app.addEventListener("click", async (event) => {
     }
     if (button.dataset.action === "authorize-sales-order-reload") {
       if (!loadedOrderDetail?.order) return;
-      openSalesOrderReloadDialog(loadedOrderDetail.order);
+      await openSalesOrderReloadDialog(loadedOrderDetail.order);
       return;
     }
     if (button.dataset.action === "cancel-sales-order-reload") {
       if (!loadedOrderDetail?.order || !loadedOrderDetail.activeReloadCycle) return;
-      openSalesOrderReloadDialog(loadedOrderDetail.order, {
+      await openSalesOrderReloadDialog(loadedOrderDetail.order, {
         cancel: true,
         cycle: loadedOrderDetail.activeReloadCycle
       });

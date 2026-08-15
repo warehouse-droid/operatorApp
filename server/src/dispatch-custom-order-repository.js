@@ -5,6 +5,7 @@ const MAX_LOCATION_LENGTH = 500;
 const MAX_DETAILS_LENGTH = 5000;
 const MAX_WEIGHT_LBS = 1000000;
 const MAX_STOP_MINUTES = 1440;
+const SALES_ORDER_REATTEMPT_BILLING_DISPOSITION = "linked_parent_no_charge";
 const UNSAFE_TEXT_CONTROL_CHARACTERS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const SAFE_REFERENCE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/#+-]*$/;
 
@@ -93,7 +94,25 @@ function rowToCustomOrder(row = {}) {
     createdAt: row.created_at || null,
     updatedAt: row.updated_at || null,
     completedAt: row.completed_at || null,
-    cancelledAt: row.cancelled_at || null
+    cancelledAt: row.cancelled_at || null,
+    orderKind: row.order_kind || "custom",
+    systemManaged: Boolean(row.system_managed),
+    parentSalesOrderId: row.parent_sales_order_id === null || row.parent_sales_order_id === undefined
+      ? null
+      : Number(row.parent_sales_order_id),
+    parentOrderRef: row.parent_order_ref || "",
+    reloadCycleId: row.reload_cycle_id === null || row.reload_cycle_id === undefined
+      ? null
+      : Number(row.reload_cycle_id),
+    lineSnapshot: Array.isArray(row.line_snapshot) ? row.line_snapshot : [],
+    palletQty: Number(row.pallet_qty || 0),
+    layerQty: Number(row.layer_qty || 0),
+    sectionQty: Number(row.section_qty || 0),
+    pieceQty: Number(row.piece_qty || 0),
+    salesQty: Number(row.sales_qty || 0),
+    billingDisposition: row.order_kind === "sales_order_reattempt"
+      ? SALES_ORDER_REATTEMPT_BILLING_DISPOSITION
+      : row.billing_disposition || "standard"
   };
 }
 
@@ -225,6 +244,12 @@ export async function createDispatchCustomOrder(input = {}, actor = "") {
 export async function updateDispatchCustomOrder(id, input = {}, actor = "") {
   const current = await getDispatchCustomOrder(id);
   if (!current) return null;
+  if (current.systemManaged || current.orderKind === "sales_order_reattempt") {
+    throw conflictError(
+      "Sales Order re-attempt children are system-managed. Change them through the linked re-attempt workflow.",
+      "DISPATCH_CUSTOM_ORDER_SYSTEM_MANAGED"
+    );
+  }
   if (current.status !== "open") {
     throw conflictError("Only open Custom Orders can be edited.", "DISPATCH_CUSTOM_ORDER_NOT_EDITABLE");
   }
@@ -274,6 +299,12 @@ export async function updateDispatchCustomOrder(id, input = {}, actor = "") {
 export async function cancelDispatchCustomOrder(id, actor = "") {
   const current = await getDispatchCustomOrder(id);
   if (!current) return null;
+  if (current.systemManaged || current.orderKind === "sales_order_reattempt") {
+    throw conflictError(
+      "Sales Order re-attempt children are system-managed. Cancel them from the linked re-attempt workflow.",
+      "DISPATCH_CUSTOM_ORDER_SYSTEM_MANAGED"
+    );
+  }
   if (current.status === "cancelled") return current;
   const result = await query(
     `UPDATE dispatch_custom_orders
@@ -312,7 +343,8 @@ export async function completeDispatchCustomOrders(refNumbers = [], actor = "") 
 export function dispatchOrderFromCustomOrder(customOrder = {}) {
   const pickupLocation = String(customOrder.pickupLocation || "").trim();
   const ownYardPickup = ["3445", "2967", "12441", "150"].includes(pickupLocation);
-  const item = {
+  const salesOrderReattempt = customOrder.orderKind === "sales_order_reattempt";
+  const genericItem = {
     lineRowId: `custom:${customOrder.id}`,
     lineId: 1,
     itemId: null,
@@ -329,15 +361,53 @@ export function dispatchOrderFromCustomOrder(customOrder = {}) {
     itemWeight: Number(customOrder.weightLbs || 0),
     lineWeight: Number(customOrder.weightLbs || 0)
   };
+  const items = salesOrderReattempt && Array.isArray(customOrder.lineSnapshot)
+    ? customOrder.lineSnapshot.map((line, index) => ({
+        lineRowId: line.lineRowId || `reattempt:${customOrder.id}:${index}`,
+        lineId: line.lineId ?? index + 1,
+        itemId: line.itemId ?? null,
+        sku: line.sku || line.itemName || "",
+        itemName: line.itemName || line.sku || "",
+        description: line.description || "",
+        pallets: Number(line.pallets || 0),
+        layers: Number(line.layers || 0),
+        sections: Number(line.sections || 0),
+        pieces: Number(line.pieces || 0),
+        quantity: Number(line.quantity ?? line.salesQty ?? 0),
+        salesQty: Number(line.salesQty ?? line.quantity ?? 0),
+        unit: line.unit || "",
+        itemWeight: Number(line.itemWeight || 0),
+        lineWeight: Number(line.lineWeight || 0),
+        reason: line.reason || "",
+        historicalSku: line.historicalSku || line.sku || "",
+        currentSku: line.currentSku || "",
+        skuMismatch: Boolean(line.skuMismatch),
+        itemMismatch: Boolean(line.itemMismatch)
+      }))
+    : [genericItem];
+  const salesQuantities = [...items.reduce((totals, item) => {
+    const unit = String(item.unit || "LOAD");
+    totals.set(unit, Number(totals.get(unit) || 0) + Number(item.salesQty || 0));
+    return totals;
+  }, new Map()).entries()].map(([unit, quantity]) => ({ unit, quantity }));
   return {
     id: customOrder.refNumber,
     customOrderId: String(customOrder.id || ""),
     customOrder: true,
+    orderKind: customOrder.orderKind || "custom",
+    salesOrderReattempt,
+    parentSalesOrderId: customOrder.parentSalesOrderId || null,
+    parentOrderRef: customOrder.parentOrderRef || "",
+    reloadCycleId: customOrder.reloadCycleId || null,
+    billingDisposition: customOrder.billingDisposition || "standard",
+    systemManaged: Boolean(customOrder.systemManaged),
     netsuiteId: null,
     type: "CUSTOM",
     sourceTable: "dispatch_custom_orders",
     dispatchRef: customOrder.refNumber,
-    customer: "Custom Order",
+    customer: salesOrderReattempt
+      ? `Sales Order re-attempt · ${customOrder.parentOrderRef || "linked parent"}`
+      : "Custom Order",
     address: customOrder.dropoffLocation,
     sourceYard: pickupLocation,
     sourceAddress: pickupLocation,
@@ -355,17 +425,25 @@ export function dispatchOrderFromCustomOrder(customOrder = {}) {
       : Number(customOrder.stopMinutes),
     pickupLocations: [pickupLocation],
     dropoffs: [],
-    pallets: 0,
-    layers: 0,
-    salesQty: 1,
-    salesQuantities: [{ unit: "LOAD", quantity: 1 }],
+    pallets: salesOrderReattempt ? Number(customOrder.palletQty || 0) : 0,
+    layers: salesOrderReattempt ? Number(customOrder.layerQty || 0) : 0,
+    sections: salesOrderReattempt ? Number(customOrder.sectionQty || 0) : 0,
+    pieces: salesOrderReattempt ? Number(customOrder.pieceQty || 0) : 0,
+    salesQty: salesOrderReattempt ? Number(customOrder.salesQty || 0) : 1,
+    salesQuantities: salesOrderReattempt ? salesQuantities : [{ unit: "LOAD", quantity: 1 }],
     packed: { pallets: 0, layers: 0, sections: 0, pieces: 0 },
     weight: Number(customOrder.weightLbs || 0),
-    items: [item],
+    items,
     raw: {
       custom_order_id: String(customOrder.id || ""),
       ref_number: customOrder.refNumber,
       status: customOrder.status,
+      order_kind: customOrder.orderKind || "custom",
+      parent_sales_order_id: customOrder.parentSalesOrderId || null,
+      parent_order_ref: customOrder.parentOrderRef || "",
+      reload_cycle_id: customOrder.reloadCycleId || null,
+      billing_disposition: customOrder.billingDisposition || "standard",
+      line_snapshot: customOrder.lineSnapshot || [],
       stop_minutes: customOrder.stopMinutes === null || customOrder.stopMinutes === undefined
         ? null
         : Number(customOrder.stopMinutes),
@@ -373,7 +451,7 @@ export function dispatchOrderFromCustomOrder(customOrder = {}) {
       updated_at: customOrder.updatedAt
     },
     netsuiteStatus: customOrder.status,
-    netsuiteStatusText: "Custom Order",
+    netsuiteStatusText: salesOrderReattempt ? "Sales Order re-attempt" : "Custom Order",
     fulfillmentStatus: "",
     netsuiteActive: true,
     operatorStatus: "",
