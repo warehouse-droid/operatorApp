@@ -23,7 +23,9 @@ async function inRollback(operation) {
 async function installRateGraph({
   originYardCodes = ["2967"],
   directPickupUnitAmountMinor = 10_000,
-  poAdditionalDropUnitAmountMinor = 10_000
+  poAdditionalDropUnitAmountMinor = 10_000,
+  policySchemaVersion = 1,
+  toReplenishmentAdditionalDropUnitAmountMinor = 10_000
 } = {}) {
   const suffix = crypto.randomUUID().replaceAll("-", "");
   const rateCardId = crypto.randomUUID();
@@ -67,15 +69,41 @@ async function installRateGraph({
         25000, 'CAD', 'Long route', 'flat', 'upper_inclusive', $4::text[])`,
     [bandIds[0], bandIds[1], rateCardVersionId, originYardCodes]
   );
-  await query(
-    `UPDATE mbt_mbbs_rate_card_policies
-        SET direct_pickup_unit_amount_minor = $2,
-            po_additional_drop_unit_amount_minor = $3,
-            updated_by = 'mbbs-v3-test', updated_at = now(),
-            revision = revision + 1
-      WHERE rate_card_version_id = $1`,
-    [rateCardVersionId, directPickupUnitAmountMinor, poAdditionalDropUnitAmountMinor]
-  );
+  if (policySchemaVersion === 3) {
+    await query(
+      `UPDATE mbt_mbbs_rate_card_policies
+          SET schema_version = 3,
+              direct_pickup_unit_amount_minor = $2,
+              po_additional_drop_unit_amount_minor = $3,
+              po_vrma_additional_stop_unit_amount_minor = $3,
+              po_vrma_base_charge_basis = 'vendor_yard_pair_then_distance_band',
+              vrma_direction_basis = 'same_pair_reverse',
+              po_vrma_additional_stop_basis = 'each_distinct_stop_after_base_pair',
+              endpoint_override_basis = 'flat_default_user_may_choose_distance',
+              to_replenishment_additional_drop_unit_amount_minor = $4,
+              to_replenishment_multi_drop_basis =
+                'longest_origin_drop_plus_each_distinct_drop_after_first',
+              updated_by = 'mbbs-v3-test', updated_at = now(),
+              revision = revision + 1
+        WHERE rate_card_version_id = $1`,
+      [
+        rateCardVersionId,
+        directPickupUnitAmountMinor,
+        poAdditionalDropUnitAmountMinor,
+        toReplenishmentAdditionalDropUnitAmountMinor
+      ]
+    );
+  } else {
+    await query(
+      `UPDATE mbt_mbbs_rate_card_policies
+          SET direct_pickup_unit_amount_minor = $2,
+              po_additional_drop_unit_amount_minor = $3,
+              updated_by = 'mbbs-v3-test', updated_at = now(),
+              revision = revision + 1
+        WHERE rate_card_version_id = $1`,
+      [rateCardVersionId, directPickupUnitAmountMinor, poAdditionalDropUnitAmountMinor]
+    );
+  }
   await query(
     `UPDATE mbt_rate_card_versions
         SET status = 'active', effective_from = now(), activated_at = now(),
@@ -298,6 +326,181 @@ test("version-selected direct-TO and PO-drop prices survive preview and conversi
     assert.equal(byReference.get(purchaseRef).amount, 20_000 + poDropPrice);
     assert.equal(byReference.get(purchaseRef).evidence.additionalDropUnitAmountMinor, poDropPrice);
     assert.equal(byReference.get(purchaseRef).evidence.mbbsChargingPolicy.poAdditionalDropUnitAmountMinor, poDropPrice);
+  });
+});
+
+test("same Driver load and pickup charges three replenishment TO drops once and converts without duplication", async () => {
+  await inRollback(async () => {
+    const additionalDropMinor = 10_000;
+    const { rateCardVersionId } = await installRateGraph({
+      policySchemaVersion: 3,
+      toReplenishmentAdditionalDropUnitAmountMinor: additionalDropMinor
+    });
+    const suffix = crypto.randomUUID().replaceAll("-", "").toUpperCase();
+    const references = [
+      `TOB00888-S1-${suffix}`,
+      `TOB00907-${suffix}`,
+      `TOB00903-${suffix}`
+    ];
+    const destinations = [
+      "2967 Kennedy Road, Toronto, ON",
+      "3445 Kennedy Road, Scarborough, ON",
+      "12441 Woodbine Avenue, Whitchurch-Stouffville, ON"
+    ];
+    const base = 9_906_000_000 + (crypto.randomInt(10_000) * 10);
+    const customerId = base + 9;
+    const loadId = `T3-L1787064784054-${suffix}`;
+    await insertCustomer({ id: customerId, suffix });
+    for (const [index, reference] of references.entries()) {
+      await query(
+        `INSERT INTO transfer_orders (
+           netsuite_id, tranid, from_location_id, from_location,
+           to_location_id, to_location, dispatch_pickup_address,
+           dispatch_address, fulfillment_status, netsuite_active, synced_at
+         ) VALUES ($1, $2, 4, '150', $3, $4, $5, $6,
+                   'fulfilled', true, now())`,
+        [
+          base + index,
+          reference,
+          15 + index,
+          ["2967", "3445", "12441"][index],
+          "150 Clark Boulevard, Brampton, ON",
+          destinations[index]
+        ]
+      );
+    }
+    const visits = [
+      {
+        jobId: `TO-MULTI-PICK-${suffix}`,
+        stopId: "pickup-150",
+        stopType: "pickup",
+        refs: references,
+        address: "150 Clark Boulevard, Brampton, ON",
+        minute: 0
+      },
+      ...references.map((reference, index) => ({
+        jobId: `TO-MULTI-DROP-${index}-${suffix}`,
+        stopId: `drop-${index}`,
+        stopType: "dropoff",
+        refs: [reference],
+        address: destinations[index],
+        minute: 10 + index
+      }))
+    ];
+    for (const visit of visits) {
+      await query(
+        `INSERT INTO driver_job_records (
+           job_id, plan_date, driver_login, truck_id, load_id, load_name,
+           stop_id, stop_type, order_refs, status, started_at, completed_at,
+           job_details
+         ) VALUES (
+           $1, '2026-08-18', 'dao', 'BC71838', $2, 'Load 3',
+           $3, $4, $5::jsonb, 'complete',
+           ('2026-08-18T22:00:00Z'::timestamptz + ($6 * interval '1 minute')),
+           ('2026-08-18T22:05:00Z'::timestamptz + ($6 * interval '1 minute')),
+           $7::jsonb
+         )`,
+        [
+          visit.jobId,
+          loadId,
+          visit.stopId,
+          visit.stopType,
+          JSON.stringify(visit.refs),
+          visit.minute,
+          JSON.stringify({
+            address: visit.address,
+            orders: visit.refs.map((orderRef) => ({
+              orderRef,
+              orderType: "TRANSFER_ORDER",
+              source: "delivery"
+            })),
+            physicalVisitStopIds: [visit.stopId]
+          })
+        ]
+      );
+    }
+
+    const listed = await candidates.listMbbsBillingCandidates({
+      actor: ACTOR,
+      completedDate: "2026-08-18",
+      search: suffix,
+      limit: 100
+    });
+    const retained = listed.items.filter((item) => (
+      item.references.some((reference) => references.includes(reference.rootReference))
+    ));
+    assert.equal(retained.length, 1);
+    const candidate = retained[0];
+    assert.equal(candidate.billingRule, "to_replenishment_multi_drop");
+    assert.equal(candidate.dropCount, 3);
+    assert.equal(candidate.originLabel, "150 Clark Boulevard, Brampton, ON");
+    assert.deepEqual(candidate.references.map((reference) => reference.rootReference), references);
+
+    const routed = [];
+    const dependencies = {
+      async resolveDistance(input) {
+        routed.push(input);
+        const destinationIndex = destinations.indexOf(input.destinationAddressText);
+        return {
+          provider: "multi-drop-integration",
+          providerMetres: [20_000, 25_000, 40_000][destinationIndex],
+          routeHash: crypto.createHash("sha256").update(JSON.stringify(input)).digest("hex"),
+          originSnapshot: { address: input.originAddressText },
+          destinationSnapshot: { address: input.destinationAddressText },
+          routeSnapshot: { destinationIndex }
+        };
+      }
+    };
+    const preview = await candidates.previewMbbsBillingCandidate({
+      actor: ACTOR,
+      candidateId: candidate.candidateId,
+      completedMonth: "2026-08",
+      completedDate: "2026-08-18",
+      rateCardVersionId
+    }, dependencies);
+    assert.equal(routed.length, 3);
+    assert.ok(routed.every((input) => (
+      input.originAddressText === "150 Clark Boulevard, Brampton, ON"
+      || input.originYardCode === "150"
+    )), JSON.stringify(routed));
+    assert.equal(preview.distanceMetres, 40_000);
+    assert.equal(preview.calculationBreakdown.distanceBandAmountMinor, 25_000);
+    assert.equal(preview.calculationBreakdown.additionalDropCount, 2);
+    assert.equal(preview.calculationBreakdown.additionalDropFeeMinor, 20_000);
+    assert.equal(preview.charge.finalAmountMinor, 45_000);
+    assert.equal(preview.routeEvidence.filter((entry) => entry.selectedForBaseCharge).length, 1);
+    assert.equal(
+      preview.calculationBreakdown.allocationPreview.reduce((sum, entry) => sum + entry.amountMinor, 0),
+      45_000
+    );
+
+    const created = await candidates.createMbbsBillingCasesFromCandidates({
+      actor: ACTOR,
+      candidateIds: [candidate.candidateId],
+      completedMonth: "2026-08",
+      completedDate: "2026-08-18",
+      rateCardVersionId,
+      customerNetsuiteId: String(customerId),
+      reason: "Verify one longest-drop TO charge with two additional drops",
+      idempotencyKey: `mbbs-to-multi-${suffix}`,
+      correlationId: `mbbs-to-multi-correlation-${suffix}`,
+      requestId: `mbbs-to-multi-request-${suffix}`
+    }, dependencies);
+    assert.equal(created.body.requestedCandidateCount, 1);
+    assert.equal(created.body.durableCaseCount, 3);
+    const durable = await query(
+      `SELECT root_reference, allocated_amount_minor::int AS amount,
+              allocation_group_id::text,
+              source_snapshot->'billingEvidence'->>'billingRule' AS billing_rule
+         FROM mbt_cross_charge_cases
+        WHERE root_reference = ANY($1::text[])
+        ORDER BY root_reference`,
+      [references]
+    );
+    assert.equal(durable.rowCount, 3);
+    assert.equal(durable.rows.reduce((sum, row) => sum + row.amount, 0), 45_000);
+    assert.equal(new Set(durable.rows.map((row) => row.allocation_group_id)).size, 1);
+    assert.ok(durable.rows.every((row) => row.billing_rule === "to_replenishment_multi_drop"));
   });
 });
 

@@ -13,6 +13,11 @@ import {
   resolveManualBillingAmount
 } from "./mbbs-driver-billing-planner.js";
 import { requireMbbsRateCardPolicy } from "./mbbs-rate-card-policy.js";
+import {
+  calculateMbbsPurchaseRouteAmount,
+  normalizeMbbsVendorRouteRates,
+  selectMbbsVendorRouteRate
+} from "./mbbs-vendor-route-rates.js";
 import { persistCalculatedMbbsCandidateBatch } from "./shadow-billing-service.js";
 import { selectRateBand } from "./rate-bands.js";
 
@@ -32,6 +37,8 @@ const TORONTO_TIME_ZONE = "America/Toronto";
  *   amountMinor: number,
  *   pricingBasis: string,
  *   boundaryRule: string,
+ *   baseAmountMinor: number | null,
+ *   includedMetres: number | null,
  *   originYardCodes: string[]
  * }} MbbsRateBand
  */
@@ -238,6 +245,30 @@ function batchManualAmountEdits(value, selectedIds) {
   }).sort((left, right) => left.candidateId.localeCompare(right.candidateId));
 }
 
+/** @param {unknown} value @param {string[]} selectedIds */
+function batchPricingSelections(value, selectedIds) {
+  if (value === undefined || value === null) {
+    return [];
+  }
+  if (!Array.isArray(value) || value.length > selectedIds.length) {
+    throw failure(400, "MBT_VENDOR_ROUTE_PRICING_SELECTION_INVALID", "Pricing selections must match selected billing candidates.");
+  }
+  const selected = new Set(selectedIds);
+  const found = new Set();
+  return value.map((rawSelection) => {
+    const selection = object(rawSelection);
+    const identity = decodedCandidateId(selection.candidateId);
+    const id = candidateId(identity);
+    const pricingMethod = text(selection.pricingMethod);
+    if (!selected.has(id) || id !== text(selection.candidateId) || found.has(id)
+        || !["vendor_yard_flat", "distance_band"].includes(pricingMethod)) {
+      throw failure(400, "MBT_VENDOR_ROUTE_PRICING_SELECTION_INVALID", "Each pricing selection must identify one selected candidate and a supported method exactly once.");
+    }
+    found.add(id);
+    return { candidateId: id, pricingMethod };
+  }).sort((left, right) => left.candidateId.localeCompare(right.candidateId));
+}
+
 /** @param {unknown} value */
 function normalizedLocation(value) {
   return text(value).toLowerCase().replaceAll(/[^a-z0-9]+/gu, " ").trim();
@@ -386,6 +417,7 @@ function driverCandidateFromUnit(unit, yards) {
     routeStops: stops,
     routeStopCount: stops.length,
     dropCount: Number(unit.dropCount),
+    distanceStrategy: text(unit.distanceStrategy) || "sequential_route",
     billingRule: text(unit.billingRule),
     relationship: object(unit.relationship),
     chargeable: unit.chargeable === true,
@@ -408,11 +440,19 @@ function reconciliationCandidate(row, yards, purchaseGroup = null) {
   const destinationLabel = text(row.header_destination_address)
     || text(row.destination_location)
     || text(snapshot.destinationLocation);
-  const sourceYard = findYard(yards, [row.source_location_id, sourceLabel]);
-  const destinationYard = findYard(yards, [row.destination_location_id, destinationLabel]);
+  const sourceYard = findYard(yards, row.source_address_overridden === true
+    ? [sourceLabel]
+    : [row.source_location_id, sourceLabel]);
+  const destinationYard = findYard(yards, row.destination_address_overridden === true
+    ? [destinationLabel]
+    : [row.destination_location_id, destinationLabel]);
   const originYard = sourceYard;
-  const originAddress = sourceYard?.addressText || sourceLabel;
-  const destinationAddress = destinationYard?.addressText || destinationLabel;
+  const originAddress = row.source_address_overridden === true
+    ? sourceLabel
+    : sourceYard?.addressText || sourceLabel;
+  const destinationAddress = row.destination_address_overridden === true
+    ? destinationLabel
+    : destinationYard?.addressText || destinationLabel;
   const reason = !reference
     ? "The reconciliation row has no order reference."
     : !originAddress || !destinationAddress
@@ -513,9 +553,12 @@ async function reconciliationCandidates(rows, yards) {
 /** @param {Record<string, any>} row @param {Array<Record<string, any>>} yards */
 // eslint-disable-next-line complexity
 function salesOrderCandidate(row, yards) {
-  const originYard = findYard(yards, [row.outbound_location_id, row.outbound_location]);
-  const origin = originYard?.addressText
-    || retainedRouteLabel(row.dispatch_pickup_address)
+  const originOverride = retainedRouteLabel(row.dispatch_pickup_address);
+  const originYard = findYard(yards, originOverride
+    ? [originOverride]
+    : [row.outbound_location_id, row.outbound_location]);
+  const origin = originOverride
+    || originYard?.addressText
     || retainedRouteLabel(row.outbound_location);
   const destination = retainedRouteLabel(row.dispatch_address);
   const reason = !text(row.tranid)
@@ -599,9 +642,12 @@ function salesOrderGroupCandidate(group, rows, yards) {
     text(row.tranid).toUpperCase() === text(object(member).rootReference).toUpperCase()
   ));
   const first = object(orderedRows.find(Boolean));
-  const originYard = findYard(yards, [first.outbound_location_id, first.outbound_location]);
-  const origin = originYard?.addressText
-    || retainedRouteLabel(first.dispatch_pickup_address)
+  const originOverride = retainedRouteLabel(first.dispatch_pickup_address);
+  const originYard = findYard(yards, originOverride
+    ? [originOverride]
+    : [first.outbound_location_id, first.outbound_location]);
+  const origin = originOverride
+    || originYard?.addressText
     || retainedRouteLabel(first.outbound_location);
   const destination = retainedRouteLabel(first.dispatch_address);
   const missingMembers = array(group.members).filter((member) => !rows.some((row) =>
@@ -712,16 +758,24 @@ function customOrderCandidate(row) {
 function directDependencyCandidate(row, yards) {
   const transferReference = text(row.transfer_order_ref);
   const salesReference = text(row.sales_order_ref);
-  const originYard = findYard(yards, [
-    row.source_location_id,
-    row.source_location,
-    row.from_location_id,
-    row.from_location
-  ]);
-  const origin = originYard?.addressText
+  const originOverride = retainedRouteLabel(row.transfer_dispatch_pickup_address);
+  const originYard = findYard(yards, originOverride
+    ? [originOverride]
+    : [
+        row.source_location_id,
+        row.source_location,
+        row.from_location_id,
+        row.from_location
+      ]);
+  const origin = originOverride
+    || originYard?.addressText
     || retainedRouteLabel(row.source_location)
     || retainedRouteLabel(row.from_location);
-  const destination = retainedRouteLabel(row.sales_dispatch_address)
+  const transferDeliveryOverride = text(row.transfer_dispatch_parse_source) === "manual-dispatch-details"
+    ? retainedRouteLabel(row.transfer_dispatch_address)
+    : "";
+  const destination = transferDeliveryOverride
+    || retainedRouteLabel(row.sales_dispatch_address)
     || retainedRouteLabel(row.receipt_drop_address)
     || retainedRouteLabel(row.receipt_address);
   const reason = !transferReference
@@ -787,19 +841,25 @@ function dispatchCompletionCandidate(row, yards) {
   let origin = "";
   let destination = "";
   if (type === "SO") {
-    originYard = findYard(yards, [row.so_outbound_location_id, row.so_outbound_location]);
-    origin = originYard?.addressText
-      || retainedRouteLabel(row.so_dispatch_pickup_address)
+    const originOverride = retainedRouteLabel(row.so_dispatch_pickup_address);
+    originYard = findYard(yards, originOverride
+      ? [originOverride]
+      : [row.so_outbound_location_id, row.so_outbound_location]);
+    origin = originOverride
+      || originYard?.addressText
       || retainedRouteLabel(row.so_outbound_location);
     destination = retainedRouteLabel(row.so_dispatch_address);
   } else if (type === "TO") {
-    originYard = findYard(yards, [row.to_from_location_id, row.to_from_location]);
+    const originOverride = retainedRouteLabel(row.to_dispatch_pickup_address);
+    originYard = findYard(yards, originOverride
+      ? [originOverride]
+      : [row.to_from_location_id, row.to_from_location]);
     const destinationYard = findYard(yards, [row.to_to_location_id, row.to_to_location]);
-    origin = originYard?.addressText
-      || retainedRouteLabel(row.to_dispatch_pickup_address)
+    origin = originOverride
+      || originYard?.addressText
       || retainedRouteLabel(row.to_from_location);
-    destination = destinationYard?.addressText
-      || retainedRouteLabel(row.to_dispatch_address)
+    destination = retainedRouteLabel(row.to_dispatch_address)
+      || destinationYard?.addressText
       || retainedRouteLabel(row.to_to_location);
   } else if (type === "PO") {
     const destinationYard = findYard(yards, [row.po_destination_location_id, row.po_destination_location]);
@@ -807,7 +867,9 @@ function dispatchCompletionCandidate(row, yards) {
       || retainedRouteLabel(row.po_vendor_address)
       || retainedRouteLabel(row.po_dispatch_address)
       || retainedRouteLabel(row.po_source_location);
-    destination = destinationYard?.addressText || retainedRouteLabel(row.po_destination_location);
+    destination = retainedRouteLabel(row.po_dispatch_delivery_address)
+      || destinationYard?.addressText
+      || retainedRouteLabel(row.po_destination_location);
   } else if (type === "VRMA") {
     originYard = findYard(yards, [row.vrma_pickup_location]);
     origin = originYard?.addressText || retainedRouteLabel(row.vrma_pickup_location);
@@ -922,14 +984,20 @@ async function activeMbbsRateGraphs() {
             band.item_code, band.service_code, band.sequence_number::int,
             band.minimum_metres::int, band.maximum_metres::int,
             band.amount_minor::int, band.pricing_basis, band.boundary_rule,
+            band.base_amount_minor::int, band.included_metres::int,
             band.origin_yard_codes,
             policy.schema_version AS policy_schema_version,
             policy.currency AS policy_currency,
             policy.direct_pickup_unit_amount_minor,
             policy.po_additional_drop_unit_amount_minor,
+            policy.po_vrma_additional_stop_unit_amount_minor,
             policy.so_charge_basis, policy.to_replenishment_charge_basis,
             policy.to_direct_pickup_charge_basis, policy.po_charge_basis,
-            policy.po_additional_drop_basis, policy.dispatch_load_split_basis
+            policy.po_additional_drop_basis, policy.dispatch_load_split_basis,
+            policy.po_vrma_base_charge_basis, policy.vrma_direction_basis,
+            policy.po_vrma_additional_stop_basis, policy.endpoint_override_basis,
+            policy.to_replenishment_additional_drop_unit_amount_minor,
+            policy.to_replenishment_multi_drop_basis
        FROM mbt_rate_cards card
        JOIN mbt_rate_card_versions version USING (rate_card_id)
        JOIN mbt_rate_distance_bands band USING (rate_card_version_id)
@@ -955,6 +1023,46 @@ async function activeMbbsRateGraphs() {
       grouped.set(versionId, [row]);
     }
   }
+  const versionIds = [...grouped.keys()];
+  const routeRates = versionIds.length
+    ? await query(
+      `SELECT route_rate.rate_card_version_id::text,
+              route_rate.rate_name AS "rateName",
+              route_rate.display_name AS "displayName",
+              route_rate.local_vendor_id::int AS "localVendorId",
+              vendor.name AS "localVendorName",
+              route_rate.vendor_yard_name AS "vendorYardName",
+              route_rate.vendor_yard_address AS "vendorYardAddress",
+              yard.yard_code AS "destinationYardCode",
+              route_rate.base_amount_minor::text AS "baseAmountMinor",
+              route_rate.currency
+         FROM mbt_mbbs_vendor_route_rates route_rate
+         JOIN dispatch_local_vendors vendor ON vendor.id = route_rate.local_vendor_id
+         JOIN mbt_yards yard ON yard.yard_id = route_rate.destination_yard_id
+        WHERE route_rate.rate_card_version_id = ANY($1::uuid[])
+        ORDER BY route_rate.rate_card_version_id, lower(vendor.name),
+                 lower(route_rate.vendor_yard_name), yard.yard_code`,
+      [versionIds]
+    )
+    : { rows: [] };
+  const routeRatesByVersion = new Map();
+  for (const rawRate of routeRates.rows) {
+    const rate = object(rawRate);
+    const versionId = text(rate.rate_card_version_id);
+    const retained = routeRatesByVersion.get(versionId) || [];
+    retained.push({
+      rateName: text(rate.rateName),
+      displayName: text(rate.displayName),
+      localVendorId: Number(rate.localVendorId),
+      localVendorName: text(rate.localVendorName),
+      vendorYardName: text(rate.vendorYardName),
+      vendorYardAddress: text(rate.vendorYardAddress),
+      destinationYardCode: text(rate.destinationYardCode),
+      baseAmountMinor: Number(rate.baseAmountMinor),
+      currency: text(rate.currency)
+    });
+    routeRatesByVersion.set(versionId, retained);
+  }
   return [...grouped.values()].map((rows) => {
     const first = /** @type {Record<string, any>} */ (rows[0]);
     const currency = text(first.currency);
@@ -971,22 +1079,62 @@ async function activeMbbsRateGraphs() {
       amountMinor: Number(row.amount_minor),
       pricingBasis: text(row.pricing_basis),
       boundaryRule: text(row.boundary_rule),
+      baseAmountMinor: row.base_amount_minor === null ? null : Number(row.base_amount_minor),
+      includedMetres: row.included_metres === null ? null : Number(row.included_metres),
       originYardCodes: array(row.origin_yard_codes).map(text).filter(Boolean)
     })));
     // selectRateBand performs complete contiguous/open-band validation.
     selectRateBand(bands, 0);
-    const mbbsChargingPolicy = requireMbbsRateCardPolicy({
-      schemaVersion: Number(first.policy_schema_version),
-      currency: text(first.policy_currency),
-      directPickupUnitAmountMinor: Number(first.direct_pickup_unit_amount_minor),
-      poAdditionalDropUnitAmountMinor: Number(first.po_additional_drop_unit_amount_minor),
-      soChargeBasis: text(first.so_charge_basis),
-      toReplenishmentChargeBasis: text(first.to_replenishment_charge_basis),
-      toDirectPickupChargeBasis: text(first.to_direct_pickup_charge_basis),
-      poChargeBasis: text(first.po_charge_basis),
-      poAdditionalDropBasis: text(first.po_additional_drop_basis),
-      dispatchLoadSplitBasis: text(first.dispatch_load_split_basis)
-    });
+    const policySchemaVersion = Number(first.policy_schema_version);
+    const mbbsChargingPolicy = requireMbbsRateCardPolicy(policySchemaVersion === 3
+      ? {
+          schemaVersion: 3,
+          currency: text(first.policy_currency),
+          directPickupUnitAmountMinor: Number(first.direct_pickup_unit_amount_minor),
+          poVrmaAdditionalStopUnitAmountMinor: Number(first.po_vrma_additional_stop_unit_amount_minor),
+          toReplenishmentAdditionalDropUnitAmountMinor: Number(first.to_replenishment_additional_drop_unit_amount_minor),
+          soChargeBasis: text(first.so_charge_basis),
+          toReplenishmentChargeBasis: text(first.to_replenishment_charge_basis),
+          toDirectPickupChargeBasis: text(first.to_direct_pickup_charge_basis),
+          poChargeBasis: text(first.po_charge_basis),
+          dispatchLoadSplitBasis: text(first.dispatch_load_split_basis),
+          poVrmaBaseChargeBasis: text(first.po_vrma_base_charge_basis),
+          vrmaDirectionBasis: text(first.vrma_direction_basis),
+          poVrmaAdditionalStopBasis: text(first.po_vrma_additional_stop_basis),
+          endpointOverrideBasis: text(first.endpoint_override_basis),
+          toReplenishmentMultiDropBasis: text(first.to_replenishment_multi_drop_basis)
+        }
+      : policySchemaVersion === 2
+        ? {
+          schemaVersion: 2,
+          currency: text(first.policy_currency),
+          directPickupUnitAmountMinor: Number(first.direct_pickup_unit_amount_minor),
+          poVrmaAdditionalStopUnitAmountMinor: Number(first.po_vrma_additional_stop_unit_amount_minor),
+          soChargeBasis: text(first.so_charge_basis),
+          toReplenishmentChargeBasis: text(first.to_replenishment_charge_basis),
+          toDirectPickupChargeBasis: text(first.to_direct_pickup_charge_basis),
+          poChargeBasis: text(first.po_charge_basis),
+          dispatchLoadSplitBasis: text(first.dispatch_load_split_basis),
+          poVrmaBaseChargeBasis: text(first.po_vrma_base_charge_basis),
+          vrmaDirectionBasis: text(first.vrma_direction_basis),
+          poVrmaAdditionalStopBasis: text(first.po_vrma_additional_stop_basis),
+          endpointOverrideBasis: text(first.endpoint_override_basis)
+          }
+        : {
+          schemaVersion: 1,
+          currency: text(first.policy_currency),
+          directPickupUnitAmountMinor: Number(first.direct_pickup_unit_amount_minor),
+          poAdditionalDropUnitAmountMinor: Number(first.po_additional_drop_unit_amount_minor),
+          soChargeBasis: text(first.so_charge_basis),
+          toReplenishmentChargeBasis: text(first.to_replenishment_charge_basis),
+          toDirectPickupChargeBasis: text(first.to_direct_pickup_charge_basis),
+          poChargeBasis: text(first.po_charge_basis),
+          poAdditionalDropBasis: text(first.po_additional_drop_basis),
+          dispatchLoadSplitBasis: text(first.dispatch_load_split_basis)
+        });
+    const mbbsVendorRouteRates = normalizeMbbsVendorRouteRates(
+      routeRatesByVersion.get(text(first.rate_card_version_id)) || []
+    );
     return {
       rateCardId: text(first.rate_card_id),
       rateCardCode: text(first.rate_card_code),
@@ -1001,6 +1149,7 @@ async function activeMbbsRateGraphs() {
       currency,
       bands,
       mbbsChargingPolicy,
+      mbbsVendorRouteRates,
       originYardCodes: new Set(bands.flatMap((band) => band.originYardCodes))
     };
   });
@@ -1018,7 +1167,8 @@ function rateOptions(graphs) {
     effectiveFrom: graph.effectiveFrom,
     effectiveTo: graph.effectiveTo,
     currency: graph.currency,
-    mbbsChargingPolicy: graph.mbbsChargingPolicy
+    mbbsChargingPolicy: graph.mbbsChargingPolicy,
+    mbbsVendorRouteRateCount: array(graph.mbbsVendorRouteRates).length
   }));
 }
 
@@ -1290,14 +1440,16 @@ async function canonicalDriverOrders(units, yards) {
   ].filter(Boolean))];
   const sales = await query(
     `SELECT netsuite_id::text, tranid, outbound_location_id::text,
-            outbound_location, dispatch_pickup_address, dispatch_address
+            outbound_location, dispatch_pickup_address, dispatch_address,
+            dispatch_parse_source
        FROM sales_orders
       WHERE upper(btrim(tranid)) = ANY($1::text[])`,
     [references]
   );
   const transfers = await query(
     `SELECT netsuite_id::text, tranid, from_location_id::text, from_location,
-            to_location_id::text, to_location, dispatch_address
+            to_location_id::text, to_location,
+            dispatch_pickup_address, dispatch_address, dispatch_parse_source
        FROM transfer_orders
       WHERE upper(btrim(tranid)) = ANY($1::text[])`,
     [references]
@@ -1307,6 +1459,8 @@ async function canonicalDriverOrders(units, yards) {
             purchase.vendor_reference,
             purchase.source_location_id::text, purchase.source_location,
             purchase.destination_location_id::text, purchase.destination_location,
+            purchase.dispatch_pickup_address,
+            purchase.dispatch_delivery_address,
             COALESCE(
               NULLIF(purchase.dispatch_pickup_address, ''),
               NULLIF(vendor_yard.address, ''),
@@ -1370,13 +1524,19 @@ async function canonicalDriverOrders(units, yards) {
       || units.find((unit) => text(unit.planDate))
       || {};
     const group = selectedSalesOrderGroup(salesGroups, retainedReference, context);
+    const originOverride = retainedRouteLabel(row.dispatch_pickup_address);
+    const destinationOverride = text(row.dispatch_parse_source) === "manual-dispatch-details"
+      ? retainedRouteLabel(row.dispatch_address)
+      : "";
     const retained = {
       sourceType: "SO",
       rootReference: retainedReference,
-      originAddress: originYard?.addressText
-        || retainedRouteLabel(row.dispatch_pickup_address)
+      originAddress: originOverride
+        || originYard?.addressText
         || retainedRouteLabel(row.outbound_location),
       destinationAddress: retainedRouteLabel(row.dispatch_address),
+      originAddressOverride: originOverride,
+      destinationAddressOverride: destinationOverride,
       ...(group ? {
         orderGroupKey: `SO_GROUP:${group.groupReference.toUpperCase()}`,
         orderGroupReference: group.groupReference,
@@ -1414,13 +1574,22 @@ async function canonicalDriverOrders(units, yards) {
     const row = object(rawRow);
     const originYard = findYard(yards, [row.from_location_id, row.from_location]);
     const destinationYard = findYard(yards, [row.to_location_id, row.to_location]);
+    const originOverride = retainedRouteLabel(row.dispatch_pickup_address);
+    const destinationOverride = text(row.dispatch_parse_source) === "manual-dispatch-details"
+      ? retainedRouteLabel(row.dispatch_address)
+      : "";
     canonical.push({
       sourceType: "TO",
       rootReference: text(row.tranid),
-      originAddress: originYard?.addressText || retainedRouteLabel(row.from_location),
-      destinationAddress: destinationYard?.addressText
+      originAddress: originOverride
+        || originYard?.addressText
+        || retainedRouteLabel(row.from_location),
+      destinationAddress: destinationOverride
         || retainedRouteLabel(row.dispatch_address)
-        || retainedRouteLabel(row.to_location)
+        || destinationYard?.addressText
+        || retainedRouteLabel(row.to_location),
+      originAddressOverride: originOverride,
+      destinationAddressOverride: destinationOverride
     });
   }
   const purchaseUnits = units.flatMap((unit) => array(unit.references))
@@ -1441,6 +1610,8 @@ async function canonicalDriverOrders(units, yards) {
     }
     const row = object(rawRow);
     const destinationYard = findYard(yards, [row.destination_location_id, row.destination_location]);
+    const originOverride = retainedRouteLabel(row.dispatch_pickup_address);
+    const destinationOverride = retainedRouteLabel(row.dispatch_delivery_address);
     const splitReference = text(row.split_po_ref).toUpperCase() === requestedUpper
       ? text(row.split_po_ref)
       : "";
@@ -1453,7 +1624,11 @@ async function canonicalDriverOrders(units, yards) {
         ? `PO_SOURCE:${text(row.split_source_po_id)}`
         : "",
       originAddress: retainedRouteLabel(row.origin_address),
-      destinationAddress: destinationYard?.addressText || retainedRouteLabel(row.destination_location),
+      destinationAddress: destinationOverride
+        || destinationYard?.addressText
+        || retainedRouteLabel(row.destination_location),
+      originAddressOverride: originOverride,
+      destinationAddressOverride: destinationOverride,
       ...(purchaseGroup ? {
         orderGroupKey: `PO_GROUP:${purchaseGroup.groupReference.toUpperCase()}`,
         orderGroupReference: purchaseGroup.groupReference,
@@ -1506,6 +1681,9 @@ async function directDependencyRows(
             dependency.planned_load_name,
             transfer.from_location_id::text,
             transfer.from_location,
+            transfer.dispatch_pickup_address AS transfer_dispatch_pickup_address,
+            transfer.dispatch_address AS transfer_dispatch_address,
+            transfer.dispatch_parse_source AS transfer_dispatch_parse_source,
             sales.dispatch_address AS sales_dispatch_address,
             receipt.job_details->>'dropAddress' AS receipt_drop_address,
             receipt.job_details->>'address' AS receipt_address,
@@ -1549,6 +1727,7 @@ async function directDependencyRows(
           ' ', dependency.sales_order_ref, dependency.transfer_order_ref,
           dependency.source_location, dependency.planned_load_id,
           dependency.planned_load_name, transfer.from_location,
+          transfer.dispatch_pickup_address, transfer.dispatch_address,
           sales.dispatch_address, receipt.job_details::text
         ) ILIKE '%' || $4 || '%')
         AND ($5::bigint[] IS NULL OR dependency.id = ANY($5::bigint[]))
@@ -1595,6 +1774,7 @@ async function dispatchCompletionRows(
             sales.outbound_location AS so_outbound_location,
             sales.dispatch_pickup_address AS so_dispatch_pickup_address,
             sales.dispatch_address AS so_dispatch_address,
+            sales.dispatch_parse_source AS so_dispatch_parse_source,
             sales.sales_order_type AS so_sales_order_type,
             transfer.from_location_id::text AS to_from_location_id,
             transfer.from_location AS to_from_location,
@@ -1602,10 +1782,12 @@ async function dispatchCompletionRows(
             transfer.to_location AS to_to_location,
             transfer.dispatch_pickup_address AS to_dispatch_pickup_address,
             transfer.dispatch_address AS to_dispatch_address,
+            transfer.dispatch_parse_source AS to_dispatch_parse_source,
             purchase.destination_location_id::text AS po_destination_location_id,
             purchase.destination_location AS po_destination_location,
             purchase.source_location AS po_source_location,
             purchase.dispatch_pickup_address AS po_dispatch_pickup_address,
+            purchase.dispatch_delivery_address AS po_dispatch_delivery_address,
             purchase.vendor_address AS po_vendor_address,
             purchase.dispatch_address AS po_dispatch_address,
             vrma.pickup_location AS vrma_pickup_location,
@@ -1745,9 +1927,27 @@ async function reconciliationRows(limit, completedMonthValue, completedDateValue
                    NULLIF(purchase.source_location, ''),
                    state.source_location
                  )
-                 ELSE transfer.from_location END AS header_source_address,
-            CASE WHEN state.order_kind = 'PO' THEN purchase.destination_location
-                 ELSE transfer.to_location END AS header_destination_address
+                 ELSE COALESCE(
+                   NULLIF(transfer.dispatch_pickup_address, ''),
+                   transfer.from_location
+                 ) END AS header_source_address,
+            CASE WHEN state.order_kind = 'PO' THEN COALESCE(
+                   NULLIF(purchase.dispatch_delivery_address, ''),
+                   purchase.destination_location
+                 )
+                 ELSE COALESCE(
+                   NULLIF(transfer.dispatch_address, ''),
+                   transfer.to_location
+                 ) END AS header_destination_address,
+            CASE WHEN state.order_kind = 'PO'
+                   THEN NULLIF(BTRIM(purchase.dispatch_pickup_address), '') IS NOT NULL
+                 ELSE NULLIF(BTRIM(transfer.dispatch_pickup_address), '') IS NOT NULL
+             END AS source_address_overridden,
+            CASE WHEN state.order_kind = 'PO'
+                   THEN NULLIF(BTRIM(purchase.dispatch_delivery_address), '') IS NOT NULL
+                 ELSE transfer.dispatch_parse_source = 'manual-dispatch-details'
+                      AND NULLIF(BTRIM(transfer.dispatch_address), '') IS NOT NULL
+             END AS destination_address_overridden
        FROM scm_reconciliation_order_state state
        LEFT JOIN purchase_orders purchase
          ON state.order_kind = 'PO'
@@ -1782,7 +1982,9 @@ async function reconciliationRows(limit, completedMonthValue, completedDateValue
         AND ($4::text IS NULL OR concat_ws(
           ' ', state.source_order_ref, state.order_kind, state.source_location,
           state.destination_location, purchase.vendor, purchase.dispatch_vendor_yard,
-          purchase.dispatch_address, transfer.from_location, transfer.to_location
+          purchase.dispatch_pickup_address, purchase.dispatch_delivery_address,
+          purchase.dispatch_address, transfer.dispatch_pickup_address,
+          transfer.dispatch_address, transfer.from_location, transfer.to_location
         ) ILIKE '%' || $4 || '%')
         AND ($5::bigint[] IS NULL OR state.id = ANY($5::bigint[]))
       ORDER BY COALESCE(state.completed_at, state.reconciled_at, state.updated_at) DESC, state.id DESC
@@ -1999,7 +2201,8 @@ async function storedAddressOverrides(candidateIds) {
   }
   const result = await query(
     `SELECT candidate_id, source_system, source_record_id,
-            destination_address_text, revision::int, updated_by, updated_at
+            origin_address_text, destination_address_text,
+            revision::int, updated_by, updated_at
        FROM mbt_mbbs_billing_address_overrides
       WHERE candidate_id = ANY($1::text[])`,
     [candidateIds]
@@ -2009,6 +2212,7 @@ async function storedAddressOverrides(candidateIds) {
     return [text(row.candidate_id), {
       sourceSystem: text(row.source_system),
       sourceRecordId: text(row.source_record_id),
+      originAddressText: text(row.origin_address_text),
       destinationAddressText: text(row.destination_address_text),
       revision: Number(row.revision),
       updatedBy: text(row.updated_by),
@@ -2018,6 +2222,7 @@ async function storedAddressOverrides(candidateIds) {
 }
 
 /** @param {Record<string, any>} candidate @param {Record<string, any> | undefined} override */
+// eslint-disable-next-line complexity -- Legacy destination-only rows and explicit endpoint pairs share one fail-closed compatibility boundary.
 function applyAddressOverride(candidate, override) {
   if (!override) {
     return { ...candidate, addressOverride: null };
@@ -2026,30 +2231,40 @@ function applyAddressOverride(candidate, override) {
     throw failure(409, "MBT_BILLING_ADDRESS_OVERRIDE_INVALID", "A retained billing address override no longer matches its completed order identity.");
   }
   const publicOverride = {
+    originAddressText: override.originAddressText || candidate.originLabel,
     destinationAddressText: override.destinationAddressText,
     revision: override.revision,
     updatedBy: override.updatedBy,
     updatedAt: override.updatedAt
   };
-  if (!candidate.originLabel || array(candidate.references).length === 0) {
+  const billingOrigin = override.originAddressText || text(candidate.originLabel);
+  const billingDestination = override.destinationAddressText || text(candidate.destinationLabel);
+  if (!billingOrigin || !billingDestination || array(candidate.references).length === 0) {
     return { ...candidate, addressOverride: publicOverride };
   }
+  const retainedDropCount = Math.max(1, Number(candidate.dropCount || 0));
+  const retainedRouteStopCount = Math.max(2, Number(candidate.routeStopCount || 0));
   return {
     ...candidate,
-    destinationLabel: override.destinationAddressText,
-    routeStopCount: 2,
-    dropCount: 1,
+    sourceOriginLabel: candidate.sourceOriginLabel || candidate.originLabel,
+    sourceDestinationLabel: candidate.sourceDestinationLabel || candidate.destinationLabel,
+    originYardCode: null,
+    originLabel: billingOrigin,
+    destinationLabel: billingDestination,
+    routeStopCount: retainedRouteStopCount,
+    dropCount: retainedDropCount,
+    distanceStrategy: "billing_endpoint_override",
     chargeable: true,
     reason: null,
     automaticRateWarning: null,
     addressOverride: publicOverride,
     routeStops: [
-      { sequenceNumber: 1, addressText: candidate.originLabel, stopType: "pickup" },
-      { sequenceNumber: 2, addressText: override.destinationAddressText, stopType: "dropoff" }
+      { sequenceNumber: 1, addressText: billingOrigin, stopType: "pickup" },
+      { sequenceNumber: 2, addressText: billingDestination, stopType: "dropoff" }
     ],
     _routeStops: [
-      { sequenceNumber: 1, addressText: candidate.originLabel, stopType: "pickup" },
-      { sequenceNumber: 2, addressText: override.destinationAddressText, stopType: "dropoff" }
+      { sequenceNumber: 1, addressText: billingOrigin, stopType: "pickup" },
+      { sequenceNumber: 2, addressText: billingDestination, stopType: "dropoff" }
     ]
   };
 }
@@ -2223,6 +2438,263 @@ async function retainedCandidatesWithOverrides(items, includeOverrides) {
   return items.map((item) => applyAddressOverride(item, overrides.get(item.candidateId)));
 }
 
+/** @param {unknown} value */
+function exactKey(value) {
+  return text(value).toLowerCase().replaceAll(/[^a-z0-9]+/gu, " ").trim();
+}
+
+/** @param {unknown} value */
+function exactAliases(value) {
+  return text(value).split(",").map(exactKey).filter(Boolean);
+}
+
+/** @param {Record<string, any>} candidate */
+function purchaseRouteReferences(candidate) {
+  const members = array(candidate.memberReferences).map(object)
+    .filter((reference) => ["PO", "VRMA"].includes(text(reference.sourceType).toUpperCase()));
+  const retained = members.length
+    ? members
+    : array(candidate.references).map(object)
+      .filter((reference) => ["PO", "VRMA"].includes(text(reference.sourceType).toUpperCase()));
+  const found = new Map();
+  for (const reference of retained) {
+    const type = text(reference.sourceType).toUpperCase();
+    const root = text(reference.rootReference);
+    if (root) {
+      found.set(`${type}|${root.toUpperCase()}`, { sourceType: type, rootReference: root });
+    }
+  }
+  return [...found.values()];
+}
+
+/**
+ * Resolve pricing identity only from exact local master-data keys. Operational
+ * address heuristics remain useful for displaying a route, but they must never
+ * choose a monetary vendor-pair rate.
+ *
+ * @param {Array<Record<string, any>>} items
+ * @param {Array<Record<string, any>>} yards
+ */
+async function enrichPurchaseVendorRouteIdentities(items, yards) {
+  const requested = [...new Set(items.flatMap(purchaseRouteReferences)
+    .map((reference) => text(reference.rootReference).toUpperCase())
+    .filter(Boolean))];
+  if (requested.length === 0) {
+    return items;
+  }
+  const purchases = await query(
+    `SELECT purchase.netsuite_id::text, purchase.tranid, purchase.dispatch_ref,
+            purchase.vendor_reference, purchase.vendor_id::text, purchase.vendor,
+            purchase.vendor_address, purchase.dispatch_vendor_yard,
+            purchase.dispatch_pickup_address, purchase.dispatch_address,
+            purchase.source_location_id::text, purchase.source_location,
+            purchase.destination_location_id::text, purchase.destination_location,
+            split.source_po_ref, split.split_po_ref
+       FROM purchase_orders purchase
+       LEFT JOIN dispatch_scm_po_splits split
+         ON split.status = 'active'
+        AND (split.source_po_id = purchase.netsuite_id OR split.split_po_id = purchase.netsuite_id)
+      WHERE upper(btrim(COALESCE(purchase.tranid, ''))) = ANY($1::text[])
+         OR upper(btrim(COALESCE(purchase.dispatch_ref, ''))) = ANY($1::text[])
+         OR upper(btrim(COALESCE(purchase.vendor_reference, ''))) = ANY($1::text[])
+         OR upper(btrim(COALESCE(split.source_po_ref, ''))) = ANY($1::text[])
+         OR upper(btrim(COALESCE(split.split_po_ref, ''))) = ANY($1::text[])
+      ORDER BY purchase.netsuite_id, split.id DESC NULLS LAST`,
+    [requested]
+  );
+  const vrmas = await query(
+    `SELECT id::text, vrma_ref, vendor, local_vendor,
+            pickup_location, dropoff_location
+       FROM scm_vrma_orders
+      WHERE upper(btrim(vrma_ref)) = ANY($1::text[])
+      ORDER BY id DESC`,
+    [requested]
+  );
+  const vendorMasters = await query(
+    `SELECT vendor.id::int AS local_vendor_id, vendor.name AS local_vendor_name,
+            yard.yard AS vendor_yard_name, yard.address AS vendor_yard_address,
+            string_agg(DISTINCT yard.aliases, ',') AS vendor_yard_aliases
+       FROM dispatch_local_vendors vendor
+       LEFT JOIN dispatch_vendor_yards yard
+         ON yard.active
+        AND lower(btrim(yard.vendor)) = lower(btrim(vendor.name))
+      WHERE vendor.active
+      GROUP BY vendor.id, vendor.name, yard.yard, yard.address
+      ORDER BY vendor.id, lower(yard.yard), lower(yard.address)`,
+    []
+  );
+  const mappings = await query(
+    `SELECT netsuite_vendor_id, netsuite_vendor_name, local_vendor
+       FROM dispatch_vendor_mappings
+      WHERE active AND NULLIF(btrim(local_vendor), '') IS NOT NULL
+      ORDER BY id`,
+    []
+  );
+  /** @type {Array<Record<string, any>>} */
+  const masters = /** @type {Array<Record<string, any>>} */ (vendorMasters.rows).map((rawRow) => {
+    const row = object(rawRow);
+    return {
+      localVendorId: Number(row.local_vendor_id),
+      localVendorName: text(row.local_vendor_name),
+      vendorYardName: text(row.vendor_yard_name),
+      vendorYardAddress: text(row.vendor_yard_address),
+      vendorYardAliases: exactAliases(row.vendor_yard_aliases)
+    };
+  });
+  /** @type {Array<Record<string, any>>} */
+  const activeVendors = [...new Map(masters.map((master) => [master.localVendorId, {
+    localVendorId: master.localVendorId,
+    localVendorName: master.localVendorName
+  }])).values()];
+  /** @param {unknown[]} names */
+  const exactVendor = (names) => {
+    const keys = new Set(names.map(exactKey).filter(Boolean));
+    const matches = activeVendors.filter((vendor) => keys.has(exactKey(vendor.localVendorName)));
+    return matches.length === 1 ? matches[0] : null;
+  };
+  /** @param {unknown} vendorId @param {unknown} vendorName */
+  const mappedVendorNames = (vendorId, vendorName) => [...new Set(/** @type {Array<Record<string, any>>} */ (mappings.rows)
+    .filter((rawMapping) => {
+      const mapping = object(rawMapping);
+      return (text(vendorId) && text(mapping.netsuite_vendor_id) === text(vendorId))
+        || (exactKey(vendorName) && exactKey(mapping.netsuite_vendor_name) === exactKey(vendorName));
+    })
+    .map((mapping) => text(object(mapping).local_vendor))
+    .filter(Boolean))];
+  /** @type {Map<string, Record<string, any>>} */
+  const sourceByReference = new Map();
+  for (const rawRow of purchases.rows) {
+    const row = object(rawRow);
+    for (const alias of [row.tranid, row.dispatch_ref, row.vendor_reference, row.source_po_ref, row.split_po_ref]) {
+      const key = text(alias).toUpperCase();
+      if (key && requested.includes(key) && !sourceByReference.has(`PO|${key}`)) {
+        sourceByReference.set(`PO|${key}`, { sourceType: "PO", row });
+      }
+    }
+  }
+  for (const rawRow of vrmas.rows) {
+    const row = object(rawRow);
+    const key = text(row.vrma_ref).toUpperCase();
+    if (key && !sourceByReference.has(`VRMA|${key}`)) {
+      sourceByReference.set(`VRMA|${key}`, { sourceType: "VRMA", row });
+    }
+  }
+  /** @param {unknown[]} values */
+  const exactMbbsYard = (values) => {
+    const keys = new Set(values.map(exactKey).filter(Boolean));
+    const matches = yards.filter((yard) => [
+      yard.yardCode, yard.dispatchLocationId, yard.displayName, yard.addressText
+    ].some((value) => keys.has(exactKey(value))));
+    return matches.length === 1 ? matches[0] : null;
+  };
+  // eslint-disable-next-line complexity -- Fail-closed PO/VRMA identity resolution has explicit master-data precedence.
+  const sourceIdentity = (/** @type {Record<string, any>} */ source) => {
+    const row = object(source.row);
+    const type = text(source.sourceType);
+    const mappedNames = mappedVendorNames(type === "PO" ? row.vendor_id : null, row.vendor);
+    const localVendor = type === "VRMA"
+      ? exactVendor([row.local_vendor]) || exactVendor(mappedNames) || exactVendor([row.vendor])
+      : exactVendor(mappedNames) || exactVendor([row.vendor]);
+    if (!localVendor) {
+      return null;
+    }
+    const vendorYards = masters.filter((master) => (
+      master.localVendorId === localVendor.localVendorId && master.vendorYardName
+    ));
+    const explicitNames = type === "VRMA"
+      ? [row.dropoff_location]
+      : [row.dispatch_vendor_yard, row.source_location];
+    const explicitKeys = new Set(explicitNames.map(exactKey).filter(Boolean));
+    let yardMatches = vendorYards.filter((yard) => (
+      explicitKeys.has(exactKey(yard.vendorYardName))
+        || yard.vendorYardAliases.some((/** @type {unknown} */ alias) => explicitKeys.has(text(alias)))
+    ));
+    if (yardMatches.length !== 1) {
+      const addressKeys = new Set((type === "VRMA"
+        ? [row.dropoff_location]
+        : [row.dispatch_pickup_address, row.vendor_address, row.dispatch_address]
+      ).map(exactKey).filter(Boolean));
+      yardMatches = vendorYards.filter((yard) => addressKeys.has(exactKey(yard.vendorYardAddress)));
+    }
+    if (yardMatches.length !== 1 && vendorYards.length === 1) {
+      yardMatches = vendorYards;
+    }
+    if (yardMatches.length !== 1) {
+      return null;
+    }
+    const mbbsYard = type === "VRMA"
+      ? exactMbbsYard([row.pickup_location])
+      : exactMbbsYard([row.destination_location_id, row.destination_location]);
+    if (!mbbsYard) {
+      return null;
+    }
+    const retainedYard = yardMatches[0];
+    if (!retainedYard) {
+      return null;
+    }
+    return {
+      sourceType: type,
+      localVendorId: localVendor.localVendorId,
+      localVendorName: localVendor.localVendorName,
+      vendorYardName: retainedYard.vendorYardName,
+      vendorYardAliases: retainedYard.vendorYardAliases,
+      vendorYardAddress: retainedYard.vendorYardAddress,
+      mbbsYardCode: text(mbbsYard.yardCode),
+      mbbsYardAddress: text(mbbsYard.addressText)
+    };
+  };
+  return items.map((candidate) => {
+    const references = purchaseRouteReferences(candidate);
+    if (references.length === 0) {
+      return candidate;
+    }
+    const identities = references.map((reference) => {
+      const source = sourceByReference.get(`${reference.sourceType}|${reference.rootReference.toUpperCase()}`);
+      return source ? sourceIdentity(source) : null;
+    });
+    if (identities.some((identity) => !identity)) {
+      return candidate;
+    }
+    const retained = /** @type {Array<Record<string, any>>} */ (identities);
+    const first = retained[0];
+    if (!first) {
+      return candidate;
+    }
+    const samePair = retained.every((identity) => (
+      identity.localVendorId === first.localVendorId
+        && exactKey(identity.vendorYardName) === exactKey(first.vendorYardName)
+        && text(identity.mbbsYardCode).toUpperCase() === text(first.mbbsYardCode).toUpperCase()
+    ));
+    if (!samePair) {
+      return candidate;
+    }
+    const routeAddressKeys = new Set(array(candidate._routeStops)
+      .map((stop) => exactKey(object(stop).addressText)).filter(Boolean));
+    const endpointOverride = !routeAddressKeys.has(exactKey(first.vendorYardAddress))
+      || !routeAddressKeys.has(exactKey(first.mbbsYardAddress));
+    const identity = /** @type {Record<string, any>} */ ({
+      ...first,
+      sourceType: references.some((reference) => reference.sourceType === "PO") ? "PO" : "VRMA",
+      endpointOverride,
+      matchedReferences: references
+    });
+    return {
+      ...candidate,
+      vendorRouteEvidence: {
+        localVendorId: identity.localVendorId,
+        localVendorName: identity.localVendorName,
+        vendorYardName: identity.vendorYardName,
+        vendorYardAddress: identity.vendorYardAddress,
+        mbbsYardCode: identity.mbbsYardCode,
+        mbbsYardAddress: identity.mbbsYardAddress,
+        endpointOverride,
+        matchedReferences: references
+      },
+      _vendorRouteIdentity: identity
+    };
+  });
+}
+
 /**
  * @param {number} limit
  * @param {string | null} completedMonthValue
@@ -2366,6 +2838,7 @@ async function internalCandidates(
     !isLinkedSalesOrderReattemptCandidate(candidate, excludedReattemptReferences)
   ));
   items = await retainedCandidatesWithOverrides(items, includeOverrides);
+  items = await enrichPurchaseVendorRouteIdentities(items, yards);
   items.sort((left, right) => Number(
     right.chargeable === true && !text(right.automaticRateWarning)
   ) - Number(left.chargeable === true && !text(left.automaticRateWarning))
@@ -2381,7 +2854,7 @@ async function internalCandidates(
 
 /** @param {Record<string, any>} candidate */
 function publicCandidate(candidate) {
-  const { _routeStops, _identity, ...result } = candidate;
+  const { _routeStops, _identity, _vendorRouteIdentity, ...result } = candidate;
   return { ...result, addressOverride: result.addressOverride || null };
 }
 
@@ -2512,38 +2985,75 @@ function equalAllocationPreview(references, totalMinor) {
   }));
 }
 
-/** @param {Record<string, any>} candidate @param {Record<string, any>} graph @param {Function} resolveDistance */
-// eslint-disable-next-line complexity
-async function calculateCandidate(candidate, graph, resolveDistance) {
-  if (!candidate.chargeable) {
-    throw failure(422, "MBT_BILLING_CANDIDATE_INCOMPLETE", candidate.reason || "The completed MBBS candidate is incomplete.");
+/** @param {Record<string, any>} candidate */
+function usesSharedAllocation(candidate) {
+  return ["po_shared_leg", "to_replenishment_multi_drop"].includes(text(candidate.billingRule));
+}
+
+/** @param {Record<string, any>} candidate @param {Array<Record<string, any>>} references @param {number} totalMinor */
+function billingAllocationPreview(candidate, references, totalMinor) {
+  if (text(candidate.billingRule) !== "to_replenishment_multi_drop") {
+    return usesSharedAllocation(candidate)
+      ? equalAllocationPreview(references, totalMinor)
+      : references.map((reference) => ({
+          sourceType: text(reference.sourceType),
+          rootReference: text(reference.rootReference),
+          amountMinor: totalMinor,
+          remainderMinor: 0
+        }));
   }
-  const stops = array(candidate._routeStops).map(object);
-  if (stops.length < 2
-      || stops.some((stop) => !text(stop.addressText))
-      || !stops.some((stop) => text(stop.stopType).toLowerCase() === "dropoff")) {
-    throw failure(
-      422,
-      "MBT_MBBS_DISTANCE_UNAVAILABLE",
-      candidate.reason || "The completed order has no complete retained route for automatic pricing."
-    );
+  const ordered = [...references].sort((left, right) =>
+    text(left.sourceType).localeCompare(text(right.sourceType))
+      || text(left.rootReference).localeCompare(text(right.rootReference))
+  );
+  if (ordered.length === 0) {
+    return [];
   }
+  const base = Math.floor(totalMinor / ordered.length);
+  const remainder = totalMinor - (base * ordered.length);
+  return ordered.map((reference, index) => {
+    const remainderMinor = index >= ordered.length - remainder ? 1 : 0;
+    return {
+      sourceType: text(reference.sourceType),
+      rootReference: text(reference.rootReference),
+      amountMinor: base + remainderMinor,
+      remainderMinor
+    };
+  });
+}
+
+/** @param {Array<Record<string, any>>} stops @param {Record<string, any>} candidate @param {Function} resolveDistance */
+// eslint-disable-next-line complexity -- Sequential routes and longest-drop comparisons retain distinct audited resolver evidence in one boundary.
+async function resolveCandidateRoute(stops, candidate, resolveDistance) {
+  const longestDrop = text(candidate.distanceStrategy) === "longest_origin_to_drop";
   let distanceMetres = 0;
+  /** @type {Array<Record<string, any>>} */
   const routeEvidence = [];
-  for (let index = 1; index < stops.length; index += 1) {
-    const origin = stops[index - 1];
-    const destination = stops[index];
+  const pairs = longestDrop
+    ? stops.slice(1)
+      .filter((stop) => text(stop.stopType).toLowerCase() === "dropoff")
+      .map((destination) => ({ origin: stops[0], destination }))
+    : stops.slice(1).map((destination, index) => ({
+        origin: stops[index],
+        destination
+      }));
+  for (const [pairIndex, pair] of pairs.entries()) {
+    const index = pairIndex + 1;
+    const origin = pair.origin;
+    const destination = pair.destination;
     if (!origin || !destination) {
       throw failure(422, "MBT_BILLING_CANDIDATE_INCOMPLETE", "The completed route has a missing stop.");
     }
-    const raw = object(await resolveDistance(index === 1 && candidate.originYardCode
+    const raw = object(await resolveDistance((longestDrop || index === 1) && candidate.originYardCode
       ? { originYardCode: candidate.originYardCode, destinationAddressText: destination.addressText }
       : { originAddressText: origin.addressText, destinationAddressText: destination.addressText }));
     const segmentMetres = Number(raw.providerMetres);
     if (!Number.isSafeInteger(segmentMetres) || segmentMetres < 0) {
       throw failure(422, "MBT_FRONTDESK_DISTANCE_INVALID", "The server distance resolver returned an invalid route segment.");
     }
-    const nextDistance = distanceMetres + segmentMetres;
+    const nextDistance = longestDrop
+      ? Math.max(distanceMetres, segmentMetres)
+      : distanceMetres + segmentMetres;
     if (!Number.isSafeInteger(nextDistance)) {
       throw failure(422, "MBT_FRONTDESK_DISTANCE_INVALID", "The completed route distance exceeds the supported range.");
     }
@@ -2560,35 +3070,276 @@ async function calculateCandidate(candidate, graph, resolveDistance) {
       routeSnapshot: object(raw.routeSnapshot)
     });
   }
-  const selected = /** @type {MbbsRateBand | undefined} */ (selectRateBand(graph.bands, distanceMetres));
-  if (!selected) {
+  if (longestDrop) {
+    const maximum = Math.max(...routeEvidence.map((segment) => Number(segment.providerMetres)));
+    const selectedEvidenceIndex = routeEvidence.findIndex((segment) => Number(segment.providerMetres) === maximum);
+    routeEvidence.forEach((segment, index) => {
+      segment.selectedForBaseCharge = index === selectedEvidenceIndex;
+    });
+  }
+  const selectedBand = /** @type {MbbsRateBand | undefined} */ (selectRateBand(candidate._rateBands, distanceMetres));
+  if (!selectedBand) {
     throw failure(409, "MBT_MBBS_RATE_UNAVAILABLE", "The active MBBS rate graph does not cover this completed route.");
   }
-  const rateAmountMinor = calculateDistanceBandChargeMinor(selected, distanceMetres);
+  return {
+    distanceMetres,
+    routeEvidence,
+    selectedBand,
+    distanceBandAmountMinor: calculateDistanceBandChargeMinor(selectedBand, distanceMetres)
+  };
+}
+
+/** @param {number} metres */
+function kilometres(metres) {
+  return `${(metres / 1000).toFixed(1)} km`;
+}
+
+/**
+ * Schema-v2 PO and reverse-VRMA pricing. Exact vendor-pair money is independent
+ * of the routing provider; distance is mandatory only for a fallback or a
+ * staff-selected endpoint-override comparison.
+ *
+ * @param {Record<string, any>} candidate
+ * @param {Record<string, any>} graph
+ * @param {Function} resolveDistance
+ * @param {unknown} rawPricingMethod
+ */
+// eslint-disable-next-line complexity -- Each pricing branch emits distinct auditable evidence and fail-closed errors.
+async function calculateVendorRouteCandidate(candidate, graph, resolveDistance, rawPricingMethod) {
+  const identity = object(candidate._vendorRouteIdentity);
+  const vendorRate = selectMbbsVendorRouteRate(graph.mbbsVendorRouteRates, identity);
+  const requestedMethod = text(rawPricingMethod);
+  if (requestedMethod && !["vendor_yard_flat", "distance_band"].includes(requestedMethod)) {
+    throw failure(400, "MBT_VENDOR_ROUTE_PRICING_METHOD_INVALID", "Choose a supported PO/VRMA pricing method.");
+  }
+  if (requestedMethod === "vendor_yard_flat" && !vendorRate) {
+    throw failure(409, "MBT_VENDOR_ROUTE_PRICING_SELECTION_UNAVAILABLE", "The selected vendor-yard flat rate is no longer available.");
+  }
+  if (requestedMethod === "distance_band" && vendorRate && identity.endpointOverride !== true) {
+    throw failure(409, "MBT_VENDOR_ROUTE_PRICING_SELECTION_UNAVAILABLE", "Distance pricing may be selected only when a retained route endpoint overrides the configured pair.");
+  }
+  const pricingMethod = requestedMethod || (vendorRate ? "vendor_yard_flat" : "distance_band");
+  const stops = array(candidate._routeStops).map(object);
+  if (stops.length < 2
+      || stops.some((stop) => !text(stop.addressText))
+      || !stops.some((stop) => text(stop.stopType).toLowerCase() === "dropoff")) {
+    throw failure(
+      422,
+      "MBT_MBBS_DISTANCE_UNAVAILABLE",
+      candidate.reason || "The completed order has no complete retained route for automatic pricing."
+    );
+  }
+  let route = null;
+  let routeFailure = null;
+  const shouldResolveDistance = pricingMethod === "distance_band"
+    || (Boolean(vendorRate) && identity.endpointOverride === true);
+  if (shouldResolveDistance) {
+    try {
+      route = await resolveCandidateRoute(stops, { ...candidate, _rateBands: graph.bands }, resolveDistance);
+    } catch (error) {
+      routeFailure = error;
+      if (pricingMethod === "distance_band") {
+        throw error;
+      }
+    }
+  }
+  const routeStopCount = Math.max(2, Number(candidate.routeStopCount || stops.length));
+  const flatAmount = vendorRate
+    ? calculateMbbsPurchaseRouteAmount({
+        pricingMethod: "vendor_yard_flat",
+        vendorRouteAmountMinor: vendorRate.baseAmountMinor,
+        distanceBandAmountMinor: 0,
+        routeStopCount,
+        mbbsChargingPolicy: graph.mbbsChargingPolicy
+      })
+    : null;
+  const distanceAmount = route
+    ? calculateMbbsPurchaseRouteAmount({
+        pricingMethod: "distance_band",
+        vendorRouteAmountMinor: 0,
+        distanceBandAmountMinor: route.distanceBandAmountMinor,
+        routeStopCount,
+        mbbsChargingPolicy: graph.mbbsChargingPolicy
+      })
+    : null;
+  const amount = pricingMethod === "vendor_yard_flat" ? flatAmount : distanceAmount;
+  if (!amount) {
+    throw failure(409, "MBT_VENDOR_ROUTE_PRICING_SELECTION_UNAVAILABLE", "The selected PO/VRMA pricing method is unavailable.");
+  }
+  const references = array(candidate.references).map(object);
+  const allocationPreview = billingAllocationPreview(candidate, references, amount.calculatedAmountMinor);
+  const routeEvidence = array(route?.routeEvidence).map(object);
+  const calculationSteps = [
+    ...(pricingMethod === "vendor_yard_flat" ? [{
+      code: "vendor_yard_flat_rate",
+      description: `${vendorRate?.displayName || "Configured vendor-yard flat rate"}: configured ${identity.localVendorName} / ${identity.vendorYardName} ↔ MBBS ${identity.mbbsYardCode} pair`,
+      distanceMetres: null,
+      amountMinor: amount.vendorRouteAmountMinor
+    }] : [
+      ...routeEvidence.map((segment) => ({
+        code: "route_segment",
+        description: `${segment.originAddressText} → ${segment.destinationAddressText}: ${kilometres(Number(segment.providerMetres))}`,
+        distanceMetres: Number(segment.providerMetres),
+        amountMinor: null
+      })),
+      {
+        code: "distance_rate",
+        description: `Distance-band charge for ${kilometres(Number(route?.distanceMetres || 0))}`,
+        distanceMetres: Number(route?.distanceMetres || 0),
+        amountMinor: amount.distanceBandAmountMinor
+      }
+    ]),
+    ...(amount.additionalStopCount > 0 ? [{
+      code: "additional_stop",
+      description: `${amount.additionalStopCount} additional distinct stop(s) × CAD ${(amount.additionalStopUnitAmountMinor / 100).toFixed(2)}`,
+      distanceMetres: null,
+      amountMinor: amount.additionalStopFeeMinor
+    }] : []),
+    {
+      code: "billing_policy",
+      description: text(object(candidate.relationship).summary) || text(candidate.billingRule),
+      distanceMetres: null,
+      amountMinor: amount.calculatedAmountMinor
+    },
+    ...allocationPreview.map((allocation) => ({
+      code: "allocation",
+      description: `${allocation.sourceType} ${allocation.rootReference}: exact-cent allocation`,
+      distanceMetres: null,
+      amountMinor: allocation.amountMinor
+    })),
+    {
+      code: "final_charge",
+      description: "Calculated charge + adjustment = final charge",
+      distanceMetres: null,
+      amountMinor: amount.calculatedAmountMinor
+    }
+  ].map((step, index) => ({ stepNumber: index + 1, ...step }));
+  const pricingOptions = [
+    ...(flatAmount ? [{
+      pricingMethod: "vendor_yard_flat",
+      label: "Configured vendor-yard flat rate",
+      available: true,
+      calculatedAmountMinor: flatAmount.calculatedAmountMinor,
+      baseAmountMinor: flatAmount.baseAmountMinor,
+      additionalStopFeeMinor: flatAmount.additionalStopFeeMinor
+    }] : []),
+    ...((!vendorRate || identity.endpointOverride === true) ? [{
+      pricingMethod: "distance_band",
+      label: "Normal distance-band rate",
+      available: Boolean(distanceAmount),
+      calculatedAmountMinor: distanceAmount?.calculatedAmountMinor ?? null,
+      baseAmountMinor: distanceAmount?.baseAmountMinor ?? null,
+      additionalStopFeeMinor: distanceAmount?.additionalStopFeeMinor ?? null,
+      unavailableReason: distanceAmount ? null : text(object(routeFailure).message) || "No supported driving route was found."
+    }] : [])
+  ];
+  const selectedBand = route?.selectedBand;
+  return {
+    candidate: publicCandidate(candidate),
+    rateCardVersionId: graph.rateCardVersionId,
+    rateCardVersionNumber: graph.versionNumber,
+    mbbsChargingPolicy: graph.mbbsChargingPolicy,
+    pricingMethod,
+    pricingSource: pricingMethod,
+    pricingOptions,
+    selectedVendorRouteRate: vendorRate ? {
+      rateName: vendorRate.rateName,
+      displayName: vendorRate.displayName,
+      localVendorId: vendorRate.localVendorId,
+      localVendorName: vendorRate.localVendorName,
+      vendorYardName: vendorRate.vendorYardName,
+      vendorYardAddress: vendorRate.vendorYardAddress,
+      destinationYardCode: vendorRate.destinationYardCode,
+      baseAmountMinor: vendorRate.baseAmountMinor,
+      currency: vendorRate.currency
+    } : null,
+    distanceMetres: Number(route?.distanceMetres || 0),
+    distanceAvailable: Boolean(route),
+    routeEvidence,
+    selectedBand: pricingMethod === "distance_band" && selectedBand ? {
+      rateDistanceBandId: selectedBand.rateDistanceBandId,
+      minimumMetres: selectedBand.minimumMetres,
+      maximumMetres: selectedBand.maximumMetres,
+      pricingBasis: selectedBand.pricingBasis,
+      boundaryRule: selectedBand.boundaryRule,
+      baseAmountMinor: selectedBand.baseAmountMinor,
+      includedMetres: selectedBand.includedMetres,
+      unitAmountMinor: selectedBand.amountMinor
+    } : null,
+    calculationBreakdown: {
+      billingRule: text(candidate.billingRule),
+      mbbsChargingPolicy: graph.mbbsChargingPolicy,
+      pricingMethod,
+      pricingSource: pricingMethod,
+      vendorRouteRate: vendorRate || null,
+      endpointOverride: identity.endpointOverride === true,
+      baseAmountMinor: amount.baseAmountMinor,
+      distanceBandAmountMinor: amount.distanceBandAmountMinor,
+      vendorRouteAmountMinor: amount.vendorRouteAmountMinor,
+      additionalStopCount: amount.additionalStopCount,
+      additionalStopUnitAmountMinor: amount.additionalStopUnitAmountMinor,
+      additionalStopFeeMinor: amount.additionalStopFeeMinor,
+      calculatedAmountMinor: amount.calculatedAmountMinor,
+      allocationPreview
+    },
+    calculationSteps,
+    charge: {
+      itemCode: "DELIVERY_CHARGE_MBBS",
+      calculatedAmountMinor: amount.calculatedAmountMinor,
+      adjustmentMinor: 0,
+      finalAmountMinor: amount.calculatedAmountMinor,
+      amountMinor: amount.calculatedAmountMinor,
+      currency: graph.currency,
+      estimatedTaxMinor: 0,
+      totalMinor: amount.calculatedAmountMinor
+    }
+  };
+}
+
+/** @param {Record<string, any>} candidate @param {Record<string, any>} graph @param {Function} resolveDistance @param {unknown} [pricingMethod] */
+// eslint-disable-next-line complexity
+async function calculateCandidate(candidate, graph, resolveDistance, pricingMethod) {
+  if (!candidate.chargeable) {
+    throw failure(422, "MBT_BILLING_CANDIDATE_INCOMPLETE", candidate.reason || "The completed MBBS candidate is incomplete.");
+  }
+  if (Number(object(graph.mbbsChargingPolicy).schemaVersion) >= 2
+      && ["po_shared_leg", "po_group"].includes(text(candidate.billingRule))) {
+    return calculateVendorRouteCandidate(candidate, graph, resolveDistance, pricingMethod);
+  }
+  const stops = array(candidate._routeStops).map(object);
+  if (stops.length < 2
+      || stops.some((stop) => !text(stop.addressText))
+      || !stops.some((stop) => text(stop.stopType).toLowerCase() === "dropoff")) {
+    throw failure(
+      422,
+      "MBT_MBBS_DISTANCE_UNAVAILABLE",
+      candidate.reason || "The completed order has no complete retained route for automatic pricing."
+    );
+  }
+  const route = await resolveCandidateRoute(stops, { ...candidate, _rateBands: graph.bands }, resolveDistance);
+  const { distanceMetres, routeEvidence, selectedBand: selected, distanceBandAmountMinor: rateAmountMinor } = route;
   const amount = calculateBillingUnitAmount({
     billingRule: text(candidate.billingRule) || "reconciliation",
     distanceBandAmountMinor: rateAmountMinor,
     dropCount: Number(candidate.dropCount || stops.filter((stop) => text(stop.stopType) === "dropoff").length),
     mbbsChargingPolicy: graph.mbbsChargingPolicy
   });
-  const allocationPreview = text(candidate.billingRule) === "po_shared_leg"
-    ? equalAllocationPreview(array(candidate.references).map(object), amount.calculatedAmountMinor)
-    : array(candidate.references).map((reference) => ({
-        sourceType: text(object(reference).sourceType),
-        rootReference: text(object(reference).rootReference),
-        amountMinor: amount.calculatedAmountMinor,
-        remainderMinor: 0
-      }));
+  const allocationPreview = billingAllocationPreview(
+    candidate,
+    array(candidate.references).map(object),
+    amount.calculatedAmountMinor
+  );
   const calculationSteps = [
     ...routeEvidence.map((segment) => ({
-      code: "route_segment",
-      description: `${segment.originAddressText} → ${segment.destinationAddressText}: ${segment.providerMetres} m`,
+      code: text(candidate.distanceStrategy) === "longest_origin_to_drop" ? "route_comparison" : "route_segment",
+      description: `${segment.originAddressText} → ${segment.destinationAddressText}: ${kilometres(segment.providerMetres)}`
+        + (segment.selectedForBaseCharge === true ? " (longest route selected for the base charge)" : ""),
       distanceMetres: segment.providerMetres,
       amountMinor: null
     })),
     {
       code: "distance_rate",
-      description: `Distance-band charge for ${distanceMetres} m`,
+      description: `Distance-band charge for ${kilometres(distanceMetres)}`,
       distanceMetres,
       amountMinor: amount.distanceBandAmountMinor
     },
@@ -2630,6 +3381,8 @@ async function calculateCandidate(candidate, graph, resolveDistance) {
       maximumMetres: selected.maximumMetres,
       pricingBasis: selected.pricingBasis,
       boundaryRule: selected.boundaryRule,
+      baseAmountMinor: selected.baseAmountMinor,
+      includedMetres: selected.includedMetres,
       unitAmountMinor: selected.amountMinor
     },
     calculationBreakdown: {
@@ -2689,14 +3442,7 @@ function manualRateFailure(error) {
 
 /** @param {Record<string, any>} candidate @param {Record<string, any>} graph @param {Record<string, any>} automaticRate */
 function manualRateCalculation(candidate, graph, automaticRate) {
-  const allocationPreview = text(candidate.billingRule) === "po_shared_leg"
-    ? equalAllocationPreview(array(candidate.references).map(object), 0)
-    : array(candidate.references).map((reference) => ({
-        sourceType: text(object(reference).sourceType),
-        rootReference: text(object(reference).rootReference),
-        amountMinor: 0,
-        remainderMinor: 0
-      }));
+  const allocationPreview = billingAllocationPreview(candidate, array(candidate.references).map(object), 0);
   const calculationSteps = [
     {
       code: "automatic_rate_unavailable",
@@ -2758,13 +3504,12 @@ function manualRateCalculation(candidate, graph, automaticRate) {
   };
 }
 
-/** @param {Record<string, any>} candidate @param {Record<string, any>} graph @param {Function} resolveDistance */
-async function calculateCandidateWithManualRate(candidate, graph, resolveDistance) {
+/** @param {Record<string, any>} candidate @param {Record<string, any>} graph @param {Function} resolveDistance @param {unknown} [pricingMethod] */
+async function calculateCandidateWithManualRate(candidate, graph, resolveDistance, pricingMethod) {
   try {
     return {
-      ...await calculateCandidate(candidate, graph, resolveDistance),
-      automaticRate: { available: true, code: null, message: null },
-      distanceAvailable: true
+      ...await calculateCandidate(candidate, graph, resolveDistance, pricingMethod),
+      automaticRate: { available: true, code: null, message: null }
     };
   } catch (error) {
     const automaticRate = manualRateFailure(error);
@@ -2812,14 +3557,11 @@ function applyManualAmountEdit(calculation, edit, editorId) {
     });
   }
   const candidate = object(calculation.candidate);
-  const finalAllocations = text(candidate.billingRule) === "po_shared_leg"
-    ? equalAllocationPreview(array(candidate.references).map(object), manualAmount.finalAmountMinor)
-    : array(candidate.references).map((reference) => ({
-        sourceType: text(object(reference).sourceType),
-        rootReference: text(object(reference).rootReference),
-        amountMinor: manualAmount.finalAmountMinor,
-        remainderMinor: 0
-      }));
+  const finalAllocations = billingAllocationPreview(
+    candidate,
+    array(candidate.references).map(object),
+    manualAmount.finalAmountMinor
+  );
   for (const allocation of finalAllocations) {
     steps.push({
       code: "allocation",
@@ -2886,7 +3628,12 @@ export async function previewMbbsBillingCandidate(rawInput, dependencies) {
     schemaVersion: "mbbs-billing-candidate-preview-v1",
     postingMode: "local_only_preview",
     externalWork: null,
-    ...await calculateCandidateWithManualRate(/** @type {Record<string, any>} */ (candidate), graph, resolveDistance)
+    ...await calculateCandidateWithManualRate(
+      /** @type {Record<string, any>} */ (candidate),
+      graph,
+      resolveDistance,
+      input.pricingMethod
+    )
   };
 }
 
@@ -2931,6 +3678,10 @@ export async function previewMbbsBillingCandidatesBatch(rawInput, dependencies) 
   const input = object(rawInput);
   billingActor(input.actor);
   const ids = batchCandidateIds(input.candidateIds);
+  const pricingSelections = batchPricingSelections(input.pricingSelections, ids);
+  const pricingSelectionByCandidate = new Map(
+    pricingSelections.map((selection) => [selection.candidateId, selection.pricingMethod])
+  );
   const month = completedMonth(input.completedMonth, { required: true });
   const day = completedDay(input.completedDate);
   assertCompatibleCompletionFilters(month, day);
@@ -2950,7 +3701,12 @@ export async function previewMbbsBillingCandidatesBatch(rawInput, dependencies) 
       }
       return {
         candidateId: id,
-        ...await calculateCandidateWithManualRate(/** @type {Record<string, any>} */ (candidate), graph, resolveDistance)
+        ...await calculateCandidateWithManualRate(
+          /** @type {Record<string, any>} */ (candidate),
+          graph,
+          resolveDistance,
+          pricingSelectionByCandidate.get(id)
+        )
       };
     } catch (error) {
       return { candidateId: id, status: "failed", error: batchFailure(error) };
@@ -2970,6 +3726,7 @@ export async function previewMbbsBillingCandidatesBatch(rawInput, dependencies) 
     completedMonth: month,
     completedDate: day,
     rateCardVersionId: graph.rateCardVersionId,
+    pricingSelections,
     requestedCount: ids.length,
     successCount,
     manualRequiredCount,
@@ -3092,6 +3849,10 @@ function candidateSnapshotEvidence(calculation) {
     rateCardVersionId: text(calculation.rateCardVersionId),
     selectedBand: object(calculation.selectedBand),
     automaticRate: object(calculation.automaticRate),
+    pricingMethod: text(calculation.pricingMethod) || null,
+    pricingSource: text(calculation.pricingSource) || null,
+    pricingOptions: array(calculation.pricingOptions),
+    selectedVendorRouteRate: calculation.selectedVendorRouteRate || null,
     charge: {
       itemCode: text(charge.itemCode),
       calculatedAmountMinor: nonnegativeSafeInteger(charge.calculatedAmountMinor, "Calculated MBBS charge"),
@@ -3207,6 +3968,10 @@ export async function createMbbsBillingCasesFromCandidates(rawInput, dependencie
   const manualAmountEditByCandidate = new Map(
     manualAmountEdits.map((edit) => [edit.candidateId, edit])
   );
+  const pricingSelections = batchPricingSelections(input.pricingSelections, ids);
+  const pricingSelectionByCandidate = new Map(
+    pricingSelections.map((selection) => [selection.candidateId, selection.pricingMethod])
+  );
   const reason = requiredBoundedText(
     input.reason,
     "MBT_BILLING_CONVERSION_REASON_INVALID",
@@ -3223,6 +3988,7 @@ export async function createMbbsBillingCasesFromCandidates(rawInput, dependencie
     rateCardVersionId: selectedVersionId,
     customerNetsuiteId: selectedCustomerId,
     manualAmountEdits,
+    pricingSelections,
     reason
   };
   return executeMbtCommand({
@@ -3256,7 +4022,12 @@ export async function createMbbsBillingCasesFromCandidates(rawInput, dependencie
         }
         // The command owns one transaction client. Sequential resolution keeps
         // any database-backed distance adapter from issuing overlapping queries.
-        const calculated = await calculateCandidateWithManualRate(candidate, graph, resolveDistance);
+        const calculated = await calculateCandidateWithManualRate(
+          candidate,
+          graph,
+          resolveDistance,
+          pricingSelectionByCandidate.get(id)
+        );
         calculations.push(applyManualAmountEdit(
           calculated,
           manualAmountEditByCandidate.get(id),
@@ -3298,6 +4069,12 @@ export async function createMbbsBillingCasesFromCandidates(rawInput, dependencie
           candidateId: text(object(calculation.candidate).candidateId),
           ...object(calculation.manualAmount)
         })),
+        pricingSelections: calculations
+          .filter((calculation) => text(calculation.pricingMethod))
+          .map((calculation) => ({
+            candidateId: text(object(calculation.candidate).candidateId),
+            pricingMethod: text(calculation.pricingMethod)
+          })),
         cases: durable.cases,
         allocationGroups: durable.allocationGroups,
         postingMode: "local_only",
@@ -3317,6 +4094,12 @@ export async function createMbbsBillingCasesFromCandidates(rawInput, dependencie
           afterState: {
             candidateIds: ids,
             manualAmountEdits: calculations.map((calculation) => object(calculation.manualAmount)),
+            pricingSelections: calculations
+              .filter((calculation) => text(calculation.pricingMethod))
+              .map((calculation) => ({
+                candidateId: text(object(calculation.candidate).candidateId),
+                pricingMethod: text(calculation.pricingMethod)
+              })),
             completedLoadSnapshotIds,
             durableCaseCount: durable.cases.length,
             postingMode: "local_only"
@@ -3331,21 +4114,15 @@ export async function createMbbsBillingCasesFromCandidates(rawInput, dependencie
   });
 }
 
-/** @param {Record<string, any>} candidate @param {Record<string, any> | null} existing */
-function assertAddressOverrideAllowed(candidate, existing) {
-  if (existing) {
-    return;
-  }
-  if (array(candidate.references).length === 0 || !candidate.originLabel) {
-    throw failure(422, "MBT_BILLING_ADDRESS_OVERRIDE_INSUFFICIENT", "A destination address alone cannot complete this order's retained billing route.");
-  }
-  if (candidate.routeStopCount >= 2 && candidate.destinationLabel) {
-    throw failure(409, "MBT_BILLING_ADDRESS_OVERRIDE_NOT_ALLOWED", "This completed order already has a retained destination address.");
+/** @param {Record<string, any>} candidate */
+function assertAddressOverrideAllowed(candidate) {
+  if (array(candidate.references).length === 0) {
+    throw failure(422, "MBT_BILLING_ADDRESS_OVERRIDE_INSUFFICIENT", "A billing endpoint override requires at least one retained order reference.");
   }
 }
 
 /**
- * Retain one billing-only destination override under the standard atomic
+ * Retain one billing-only endpoint override under the standard atomic
  * command receipt and append-only audit boundary. Operational source rows are
  * intentionally never changed.
  *
@@ -3360,6 +4137,10 @@ export async function setMbbsBillingCandidateAddressOverride(rawInput) {
     throw failure(400, "MBT_BILLING_CANDIDATE_ID_INVALID", "The MBBS billing candidate ID is invalid.");
   }
   const month = completedMonth(input.completedMonth, { required: true });
+  const suppliedOriginAddressText = text(input.originAddressText);
+  if (suppliedOriginAddressText && (suppliedOriginAddressText.length < 5 || suppliedOriginAddressText.length > 1000)) {
+    throw failure(400, "MBT_BILLING_ADDRESS_OVERRIDE_INVALID", "Enter one complete billing origin address of at most 1,000 characters.");
+  }
   const destinationAddressText = requiredBoundedText(
     input.destinationAddressText,
     "MBT_BILLING_ADDRESS_OVERRIDE_INVALID",
@@ -3378,6 +4159,7 @@ export async function setMbbsBillingCandidateAddressOverride(rawInput) {
   const payload = {
     candidateId: encoded,
     completedMonth: month,
+    originAddressText: suppliedOriginAddressText || null,
     destinationAddressText,
     expectedRevision,
     reason
@@ -3389,6 +4171,7 @@ export async function setMbbsBillingCandidateAddressOverride(rawInput) {
     payload,
     correlationId: input.correlationId,
     requestId: input.requestId,
+    // eslint-disable-next-line complexity -- The atomic override command validates identity, revision, compatibility, audit, and receipt evidence together.
     mutation: async () => {
       await query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`mbt-billing-address:${encoded}`]);
       const graphs = await activeMbbsRateGraphs();
@@ -3402,7 +4185,8 @@ export async function setMbbsBillingCandidateAddressOverride(rawInput) {
       }
       const current = await query(
         `SELECT address_override_id::text, source_system, source_record_id,
-                destination_address_text, revision::text, updated_by, updated_at
+                origin_address_text, destination_address_text,
+                revision::text, updated_by, updated_at
            FROM mbt_mbbs_billing_address_overrides
           WHERE candidate_id = $1
           FOR UPDATE`,
@@ -3415,7 +4199,13 @@ export async function setMbbsBillingCandidateAddressOverride(rawInput) {
       )) {
         throw failure(409, "MBT_BILLING_ADDRESS_OVERRIDE_INVALID", "The retained override no longer matches its completed order identity.");
       }
-      assertAddressOverrideAllowed(candidate, existing);
+      assertAddressOverrideAllowed(candidate);
+      const originAddressText = suppliedOriginAddressText
+        || text(existing?.origin_address_text)
+        || text(candidate.originLabel);
+      if (originAddressText.length < 5 || originAddressText.length > 1000) {
+        throw failure(422, "MBT_BILLING_ADDRESS_OVERRIDE_INSUFFICIENT", "Enter one complete billing origin address before saving the billing endpoints.");
+      }
       const currentRevision = existing ? Number(existing.revision) : 0;
       if (currentRevision !== expectedRevision) {
         throw failure(409, "MBT_BILLING_ADDRESS_OVERRIDE_REVISION_CONFLICT", "The billing address changed after it was loaded. Refresh the candidate and try again.");
@@ -3424,26 +4214,29 @@ export async function setMbbsBillingCandidateAddressOverride(rawInput) {
       const saved = await query(
         `INSERT INTO mbt_mbbs_billing_address_overrides (
            address_override_id, candidate_id, source_system, source_record_id,
-           destination_address_text, revision, created_by, updated_by
-         ) VALUES ($1, $2, $3, $4, $5, 1, $6, $6)
+           origin_address_text, destination_address_text,
+           revision, created_by, updated_by
+         ) VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $7)
          ON CONFLICT (candidate_id) DO UPDATE
-           SET destination_address_text = EXCLUDED.destination_address_text,
+           SET origin_address_text = EXCLUDED.origin_address_text,
+               destination_address_text = EXCLUDED.destination_address_text,
                revision = mbt_mbbs_billing_address_overrides.revision + 1,
                updated_by = EXCLUDED.updated_by,
                updated_at = now()
-         RETURNING address_override_id::text, destination_address_text,
+         RETURNING address_override_id::text, origin_address_text, destination_address_text,
                    revision::text, updated_by, updated_at`,
         [
           crypto.randomUUID(), encoded, candidate.sourceSystem, candidate.sourceRecordId,
-          destinationAddressText, actor.operatorId
+          originAddressText, destinationAddressText, actor.operatorId
         ]
       );
       const row = object(saved.rows[0]);
       const revision = Number(row.revision);
       const body = {
-        schemaVersion: "mbbs-billing-address-override-v1",
+        schemaVersion: "mbbs-billing-address-override-v2",
         postingMode: "local_only",
         candidateId: encoded,
+        originAddressText: text(row.origin_address_text),
         destinationAddressText: text(row.destination_address_text),
         revision,
         updatedBy: text(row.updated_by),
@@ -3458,6 +4251,7 @@ export async function setMbbsBillingCandidateAddressOverride(rawInput) {
           entityId: encoded,
           beforeState: existing ? {
             exists: true,
+            originAddressText: text(existing.origin_address_text) || text(candidate.originLabel),
             destinationAddressText: text(existing.destination_address_text),
             revision: beforeRevision
           } : { exists: false, candidateId: encoded },

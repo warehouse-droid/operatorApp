@@ -41,7 +41,7 @@ test("Driver shell has no copy, folder picker, download, or original-backup path
 test("a fresh Driver shell version evicts older copy-enabled cached assets", () => {
   assert.match(driver, /const DRIVER_PWA_CLIENT_VERSION = "2026\.08\.12\.3";/u);
   assert.match(worker, /const DRIVER_PWA_CLIENT_VERSION = "2026\.08\.12\.3";/u);
-  assert.match(worker, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v28`/u);
-  assert.match(driverHtml, /driver\.js\?v=20260812-driver-pwa-v3/u);
-  assert.match(worker, /driver\.js\?v=20260812-driver-pwa-v3/u);
+  assert.match(worker, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v37`/u);
+  assert.match(driverHtml, /driver\.js\?v=20260819-driver-route-readiness-v1/u);
+  assert.match(worker, /driver\.js\?v=20260819-driver-route-readiness-v1/u);
 });

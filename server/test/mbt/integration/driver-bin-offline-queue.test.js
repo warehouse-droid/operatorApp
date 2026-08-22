@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import test, { after } from "node:test";
 
 import { closeDb, query, withTransaction } from "../../../src/db.js";
+import { driverCompanyDate } from "../../../src/driver-plan-date-policy.js";
 import { getDriverDayJobs } from "../../../src/driver-repository.js";
 import {
   markDriverOfflinePhotoDurable,
@@ -24,11 +25,12 @@ import {
 after(closeDb);
 
 test("P3-F19: the established manifest/event queue applies a BIN start and completion once with device occurrence time", async () => {
-  const fixture = await createAssignedDriverBinFixture("offline-queue");
-  // The synthetic Dispatch fixture schedules work many years ahead to avoid
-  // collisions. Normalize only its current-state clock before issuing this
-  // real-time offline manifest; production reservations are created before a
-  // Driver downloads the route and therefore already satisfy this invariant.
+  const fixture = await createAssignedDriverBinFixture("offline-queue", {
+    planDate: driverCompanyDate()
+  });
+  // Normalize the synthetic current-state clock before issuing this real-time
+  // offline manifest. Production reservations are created before a Driver
+  // downloads the route and therefore already satisfy this invariant.
   await withTransaction(() => recordAssetMovement({ query, ambientTransaction: true }, {
     assetId: fixture.assetId,
     movementType: "synthetic_offline_manifest_clock_baseline",

@@ -1,6 +1,6 @@
 const app = document.getElementById("controlApp");
-const TOKEN_KEY = "mbbs.control.token";
-const STAFF_TOKEN_KEY = "mbbs.staff.token";
+const TOKEN_KEY = "mbbs.control.token"; // secret-scan: allow non-secret browser storage key
+const STAFF_TOKEN_KEY = "mbbs.staff.token"; // secret-scan: allow non-secret browser storage key
 const STAFF_ROLE_KEY = "mbbs.staff.role";
 const STAFF_ROLES_KEY = "mbbs.staff.roles";
 const ACCOUNT_ROLE_OPTIONS = [
@@ -245,6 +245,14 @@ let loadedOrderDetail = null;
 let loadedDriverOptions = [];
 let selectedLoadedOrderKey = "";
 let syncSettings = { mode: "manual", running: false, lastStatus: "idle" };
+let netsuiteM2mStatus = {
+  configured: false,
+  authMode: "authorization_code",
+  active: null,
+  staged: null,
+  prerequisites: {},
+  pendingApprovalReconciliationRunning: false
+};
 let targetedSyncOrderRef = "";
 let targetedSyncBusy = false;
 let targetedSyncResult = null;
@@ -388,6 +396,36 @@ async function request(path, options = {}) {
   return response.json();
 }
 
+function downloadTextFile(filename, contents, contentType = "application/octet-stream") {
+  const blob = new Blob([String(contents || "")], { type: contentType });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+async function downloadAuthenticatedFile(path, filename) {
+  const response = await fetch(path, {
+    cache: "no-store",
+    headers: token ? { Authorization: `Bearer ${token}` } : {}
+  });
+  if (response.status === 401) {
+    clearStaffSession();
+    operator = null;
+    renderLogin("Please login again.");
+    throw new Error("Login required");
+  }
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.error || "Download failed");
+  }
+  downloadTextFile(filename, await response.text(), response.headers.get("content-type") || "application/octet-stream");
+}
+
 function formatDate(value) {
   if (!value) return "";
   return window.MBBS_I18N?.displayDateTime(value) || "";
@@ -449,7 +487,7 @@ async function hydrateSecurePhotoImage(image) {
     const response = await fetch(`/api/photo-upload/preview?${params.toString()}`, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
       cache: "no-store",
-      credentials: "same-origin",
+      credentials: "same-origin", // secret-scan: allow Fetch credentials mode, not credential material
       signal: controller.signal
     });
     if (!response.ok) throw new Error(`Photo preview failed (${response.status})`);
@@ -2496,11 +2534,17 @@ async function loadLoadedSearchResults() {
   await loadLoadedOrderDetailForSelection();
 }
 
+function replaceSecurePhotoHtml(element, html) {
+  releaseSecurePhotoImages(element);
+  element.innerHTML = html;
+  hydrateSecurePhotoImages(element);
+}
+
 function refreshLoadedPanels() {
   const list = document.getElementById("loadedOrderList");
-  if (list) list.innerHTML = renderLoadedOrderList();
+  if (list) replaceSecurePhotoHtml(list, renderLoadedOrderList());
   const detail = document.getElementById("loadedDetailPanel");
-  if (detail) detail.innerHTML = renderLoadedOrderDetail();
+  if (detail) replaceSecurePhotoHtml(detail, renderLoadedOrderDetail());
 }
 
 async function downloadLoadedCsv() {
@@ -3585,15 +3629,111 @@ function refreshScmReconciliationRunForm(form) {
   }
 }
 
+function renderM2mCertificateSummary(label, slot) {
+  if (!slot) return `<div><span>${label}</span><strong>Not configured</strong></div>`;
+  return `
+    <div>
+      <span>${label}</span>
+      <strong>${escapeHtml(slot.fingerprint256 || "Fingerprint unavailable")}</strong>
+      <small class="muted">Expires ${formatDate(slot.notAfter)}</small>
+    </div>
+  `;
+}
+
+function renderNetSuiteM2mPanel() {
+  const status = netsuiteM2mStatus || {};
+  const machineActive = status.authMode === "client_credentials" && Boolean(status.active);
+  const prerequisites = status.prerequisites || {};
+  const ready = prerequisites.directAccessEnabled && prerequisites.tokenUrlReady && prerequisites.restBaseUrlReady;
+  const downloadableSlot = status.staged ? "staged" : status.active ? "active" : "";
+  const busy = Boolean(status.pendingApprovalReconciliationRunning || syncSettings.running);
+  return `
+    <section class="panel netsuite-m2m-panel">
+      <div class="section-heading">
+        <div>
+          <h2>NetSuite Machine-to-Machine Authentication</h2>
+          <p class="muted">M2M keeps NetSuite access live without a seven-day browser refresh token. Access tokens are renewed automatically before expiry; the existing webhook remains the automatic order-status trigger.</p>
+        </div>
+        <button data-action="refresh" type="button">Refresh</button>
+      </div>
+      <div class="sync-status-grid">
+        <div><span>Authentication mode</span><strong>${machineActive ? "Machine-to-machine" : "Browser OAuth fallback"}</strong></div>
+        <div><span>Activation prerequisites</span><strong>${ready ? "Ready" : "Incomplete"}</strong></div>
+        ${renderM2mCertificateSummary("Active certificate", status.active)}
+        ${renderM2mCertificateSummary("Staged certificate", status.staged)}
+        <div><span>Client ID</span><strong>${escapeHtml(status.active?.clientIdMasked || "Not activated")}</strong></div>
+        <div><span>Certificate ID</span><strong>${escapeHtml(status.active?.certificateIdMasked || "Not activated")}</strong></div>
+      </div>
+      ${ready ? "" : `
+        <div class="notice sync-error">
+          <strong>Server configuration required</strong>
+          <span>Direct access: ${prerequisites.directAccessEnabled ? "ready" : "disabled"}; token URL: ${prerequisites.tokenUrlReady ? "ready" : "missing"}; REST base URL: ${prerequisites.restBaseUrlReady ? "ready" : "missing"}.</span>
+        </div>
+      `}
+      <div class="m2m-setup-grid">
+        <div class="notice">
+          <strong>1. Generate staged certificate</strong>
+          <span>Choose a recovery passphrase of at least 16 characters. The browser immediately downloads one encrypted private-key recovery backup. Then use Download public certificate for the file uploaded to NetSuite. The passphrase and recovery file cannot be retrieved later.</span>
+          <label>
+            <span>Certificate common name</span>
+            <input data-field="m2m-common-name" maxlength="64" value="MBBS NetSuite M2M" autocomplete="off">
+          </label>
+          <label>
+            <span>Recovery passphrase</span>
+            <input data-field="m2m-recovery-passphrase" type="password" minlength="16" maxlength="256" autocomplete="new-password">
+          </label>
+          <label>
+            <span>Confirm recovery passphrase</span>
+            <input data-field="m2m-recovery-passphrase-confirm" type="password" minlength="16" maxlength="256" autocomplete="new-password">
+          </label>
+          <div class="actions">
+            <button class="primary" data-action="generate-m2m-certificate" type="button">Generate staged certificate</button>
+            <button data-action="download-m2m-public" data-slot="${downloadableSlot}" type="button" ${downloadableSlot ? "" : "disabled"}>Download public certificate</button>
+          </div>
+        </div>
+        <div class="notice">
+          <strong>2. Map certificate in NetSuite</strong>
+          <span>In NetSuite, enable OAuth 2.0 and REST Web Services, enable Client Credentials (M2M) on the integration record, then create an OAuth 2.0 Client Credentials mapping for that integration, an entity, a least-privilege role, and the uploaded public certificate. Copy the integration Client ID and the resulting Certificate ID here. The private key stays encrypted on this server.</span>
+          <label>
+            <span>Client ID</span>
+            <input data-field="m2m-client-id" maxlength="512" autocomplete="off" spellcheck="false">
+          </label>
+          <label>
+            <span>Certificate ID</span>
+            <input data-field="m2m-certificate-id" maxlength="512" autocomplete="off" spellcheck="false">
+          </label>
+          <label>
+            <span>Scopes</span>
+            <input data-field="m2m-scopes" value="rest_webservices,restlets" autocomplete="off" spellcheck="false">
+          </label>
+          <div class="actions">
+            <button class="primary" data-action="activate-m2m" type="button" ${status.staged && ready ? "" : "disabled"}>Test and activate M2M</button>
+            ${status.active && !machineActive ? `<button data-action="reactivate-m2m" type="button" ${ready ? "" : "disabled"}>Test and reactivate existing M2M</button>` : ""}
+            <button data-action="m2m-browser-fallback" type="button" ${machineActive ? "" : "disabled"}>Use browser OAuth fallback</button>
+          </div>
+        </div>
+      </div>
+      <div class="notice">
+        <strong>Pending Approval recovery only</strong>
+        <span>The webhook remains automatic. This recovery action reads and updates only local SO/PO/TO rows that are still Pending Approval; it does not sync quantities, lines, loads, routes, or plans.</span>
+        <div class="actions">
+          <button data-action="reconcile-pending-approval" type="button" ${busy ? "disabled" : ""}>${status.pendingApprovalReconciliationRunning ? "Reconciling…" : "Reconcile Pending Approval now"}</button>
+        </div>
+      </div>
+    </section>
+  `;
+}
+
 function renderSyncSection() {
   const isAuto = syncSettings.mode === "auto";
   const savedMaxRunMinutes = Math.max(1, Math.round(Number(syncSettings.maxRunSeconds || 900) / 60));
   const maxRunMinutes = syncMaxRunMinutesDraft ?? savedMaxRunMinutes;
   const mirrorPanel = renderNetSuiteMirrorPanel();
+  const m2mPanel = renderNetSuiteM2mPanel();
   const reconciliationLink = renderScmReconciliationSyncLink();
-  if (mirrorStatus.role === "consumer") return `${mirrorPanel}${reconciliationLink}`;
+  if (mirrorStatus.role === "consumer") return `${m2mPanel}${mirrorPanel}${reconciliationLink}`;
   const targetedOrderPanel = renderTargetedOrderSyncPanel();
-  return `${mirrorPanel}${reconciliationLink}${targetedOrderPanel}
+  return `${m2mPanel}${mirrorPanel}${reconciliationLink}${targetedOrderPanel}
     <section class="panel">
       <div class="section-heading">
         <div>
@@ -4321,11 +4461,12 @@ async function loadAdminReturnSettings() {
 
 async function loadControlData() {
   if (IS_ADMIN_PAGE) {
-    const [nextOperators, nextAuditOptions, nextAudit, nextSyncSettings, nextEnvSettings, nextPhotoArchiveSettings, nextMirrorStatus, nextPublicSalesSettings] = await Promise.all([
+    const [nextOperators, nextAuditOptions, nextAudit, nextSyncSettings, nextM2mStatus, nextEnvSettings, nextPhotoArchiveSettings, nextMirrorStatus, nextPublicSalesSettings] = await Promise.all([
       request("/api/operators"),
       request(auditOptionsQueryString()),
       request(auditQueryString()),
       request("/api/control/sync-settings"),
+      request("/api/admin/netsuite-m2m"),
       request("/api/control/env-settings"),
       request("/api/admin/photo-archive"),
       request("/api/admin/netsuite-mirror"),
@@ -4335,6 +4476,7 @@ async function loadControlData() {
     auditOptions = nextAuditOptions;
     audit = nextAudit;
     syncSettings = nextSyncSettings;
+    netsuiteM2mStatus = nextM2mStatus;
     envSettings = nextEnvSettings;
     photoArchiveSettings = nextPhotoArchiveSettings;
     mirrorStatus = nextMirrorStatus;
@@ -4901,6 +5043,108 @@ app.addEventListener("click", async (event) => {
         body: JSON.stringify({ locationIds: [1, 28, 15, 26] })
       });
       return loadControlData();
+    }
+    if (button.dataset.action === "generate-m2m-certificate") {
+      const passphraseInput = app.querySelector('[data-field="m2m-recovery-passphrase"]');
+      const confirmationInput = app.querySelector('[data-field="m2m-recovery-passphrase-confirm"]');
+      const passphrase = String(passphraseInput?.value || "");
+      const confirmation = String(confirmationInput?.value || "");
+      if (passphrase.length < 16) return alert("Use a recovery passphrase with at least 16 characters.");
+      if (passphrase !== confirmation) return alert("The recovery passphrases do not match.");
+      if (!confirm("Generate a new staged certificate? Any previous staged certificate will be replaced. The encrypted recovery file is delivered only once.")) return;
+      button.disabled = true;
+      button.textContent = "Generating…";
+      try {
+        const result = await request("/api/admin/netsuite-m2m/certificates", {
+          method: "POST",
+          body: JSON.stringify({
+            recoveryPassphrase: passphrase,
+            commonName: app.querySelector('[data-field="m2m-common-name"]')?.value || "MBBS NetSuite M2M"
+          })
+        });
+        const date = new Date().toISOString().slice(0, 10);
+        downloadTextFile(`mbbs-netsuite-m2m-encrypted-private-recovery-${date}.pem`, result.recoveryPrivateKeyPem, "application/x-pem-file");
+        if (passphraseInput) passphraseInput.value = "";
+        if (confirmationInput) confirmationInput.value = "";
+        await loadControlData();
+        alert("The one-time encrypted recovery backup was downloaded. Store it and its passphrase separately, then click Download public certificate and upload that public file to NetSuite.");
+      } finally {
+        button.disabled = false;
+        button.textContent = "Generate staged certificate";
+      }
+      return;
+    }
+    if (button.dataset.action === "download-m2m-public") {
+      const slot = String(button.dataset.slot || "");
+      if (!slot) return alert("Generate or activate a certificate first.");
+      await downloadAuthenticatedFile(
+        `/api/admin/netsuite-m2m/certificates/${encodeURIComponent(slot)}/public`,
+        `mbbs-netsuite-m2m-${slot}-public.pem`
+      );
+      return;
+    }
+    if (button.dataset.action === "activate-m2m") {
+      const clientId = String(app.querySelector('[data-field="m2m-client-id"]')?.value || "").trim();
+      const certificateId = String(app.querySelector('[data-field="m2m-certificate-id"]')?.value || "").trim();
+      const scopes = String(app.querySelector('[data-field="m2m-scopes"]')?.value || "")
+        .split(",")
+        .map((scope) => scope.trim())
+        .filter(Boolean);
+      if (!clientId || !certificateId) return alert("Enter the NetSuite Client ID and Certificate ID.");
+      if (!confirm("Run a live read-only NetSuite probe and activate M2M only if it succeeds?")) return;
+      button.disabled = true;
+      button.textContent = "Testing…";
+      try {
+        await request("/api/admin/netsuite-m2m/activate", {
+          method: "POST",
+          body: JSON.stringify({ clientId, certificateId, scopes })
+        });
+        await loadControlData();
+        alert("M2M authentication is active. NetSuite access tokens will now renew automatically on demand.");
+      } finally {
+        button.disabled = false;
+        button.textContent = "Test and activate M2M";
+      }
+      return;
+    }
+    if (button.dataset.action === "reactivate-m2m") {
+      if (!confirm("Test the existing M2M mapping and switch back from browser OAuth only if the read-only probe succeeds?")) return;
+      button.disabled = true;
+      button.textContent = "Testing…";
+      try {
+        await request("/api/admin/netsuite-m2m/activate", {
+          method: "POST",
+          body: JSON.stringify({ reuseActive: true })
+        });
+        await loadControlData();
+        alert("The existing M2M mapping is active again.");
+      } finally {
+        button.disabled = false;
+        button.textContent = "Test and reactivate M2M";
+      }
+      return;
+    }
+    if (button.dataset.action === "m2m-browser-fallback") {
+      if (!confirm("Switch NetSuite requests back to browser OAuth? The M2M mapping will be retained and can be tested/reactivated later.")) return;
+      await request("/api/admin/netsuite-m2m/fallback", { method: "POST", body: "{}" });
+      await loadControlData();
+      alert("Browser OAuth fallback is active. The M2M certificate mapping was retained.");
+      return;
+    }
+    if (button.dataset.action === "reconcile-pending-approval") {
+      if (!confirm("Check only local SO/PO/TO records still marked Pending Approval? Quantities, lines, loads, routes, and plans will not be changed.")) return;
+      button.disabled = true;
+      button.textContent = "Reconciling…";
+      try {
+        const result = await request("/api/admin/pending-approval-reconcile", { method: "POST", body: "{}" });
+        await loadControlData();
+        const totals = result.totals || {};
+        alert(`Pending Approval reconciliation complete: ${Number(totals.transitioned || 0)} transitioned, ${Number(totals.unchanged || 0)} unchanged, ${Number(totals.missing || 0)} missing, ${Number(totals.concurrentSkipped || 0)} concurrent changes preserved.`);
+      } finally {
+        button.disabled = false;
+        button.textContent = "Reconcile Pending Approval now";
+      }
+      return;
     }
     if (button.dataset.action === "refresh-photo-archive") {
       photoArchiveSettings = await request("/api/admin/photo-archive");

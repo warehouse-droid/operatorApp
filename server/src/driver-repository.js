@@ -23,6 +23,7 @@ import {
 import { getDeliveryInstructionsForDriverOrderIds } from "./delivery-instruction-repository.js";
 import { assertNoClosedNetSuiteOrders, listClosedNetSuiteOrders } from "./netsuite-closed-order-repository.js";
 import { operationalPlanOrderRefs, scrubOrderRefsFromOperationalPlan } from "./netsuite-closed-order-policy.js";
+import { assertDriverPlanExecutionDate } from "./driver-plan-date-policy.js";
 
 const YARD_ADDRESSES = {
   "3445": "3445 Kennedy Road, Toronto, ON",
@@ -971,15 +972,16 @@ async function jobStatusMap(jobIds) {
   return new Map(result.rows.map((row) => [row.job_id, row]));
 }
 
-async function confirmedPlans({ startDate = "" } = {}) {
+async function confirmedPlans({ startDate = "", exactDate = "" } = {}) {
   const result = await query(
     `SELECT p.id, p.plan_date, p.status, p.revision, s.orders, s.trucks, s.summary
        FROM dispatch_plans p
        INNER JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
       WHERE p.status = 'confirmed'
         AND ($1 = '' OR p.plan_date >= $1::date)
+        AND ($2 = '' OR p.plan_date = $2::date)
       ORDER BY p.plan_date ASC, p.updated_at ASC`,
-    [String(startDate || "").trim()]
+    [String(startDate || "").trim(), String(exactDate || "").trim()]
   );
   const plans = sortedPlans(result.rows);
   const closed = await listClosedNetSuiteOrders(plans.flatMap(operationalPlanOrderRefs));
@@ -1135,6 +1137,69 @@ export function planJobsForDrivers(plan, driverLogins = [], { allowBin = false }
     driverLogin,
     materializePlanJobsForDriver(plan, driverLogin, { allowBin })
   ]));
+}
+
+export async function getDriverPlanRoutesForDate(planDateValue) {
+  const requestedDate = planDateValue instanceof Date
+    ? planDateValue.toISOString().slice(0, 10)
+    : String(planDateValue || "").trim();
+  const plans = await confirmedPlans({ exactDate: requestedDate });
+  const plan = plans.find((candidate) => candidate.planDate === requestedDate) || null;
+  if (!plan) {
+    return {
+      planId: null,
+      planDate: requestedDate,
+      revision: 0,
+      routes: []
+    };
+  }
+  const assignments = flattenDispatchPlanLoads(plan);
+  const driverLogins = [...new Set(assignments.map((assignment) => driverKey(assignment.driverLogin)).filter(Boolean))];
+  const baseRoutes = planJobsForDrivers(plan, driverLogins, { allowBin: true });
+  const ordinaryJobIds = [...baseRoutes.values()]
+    .flat()
+    .filter((job) => !job?.mbt?.schemaVersion)
+    .map((job) => job.jobId);
+  const statuses = await jobStatusMap(ordinaryJobIds);
+  const materializedRoutes = new Map();
+  for (const driverLogin of driverLogins) {
+    const jobs = [];
+    for (const job of baseRoutes.get(driverLogin) || []) {
+      if (job?.mbt?.schemaVersion) {
+        jobs.push(job);
+        continue;
+      }
+      jobs.push(await materializeDriverJob(plan, job, statuses.get(job.jobId), {
+        deferDeliveryInstructions: true
+      }));
+    }
+    materializedRoutes.set(driverLogin, jobs);
+  }
+  const instructionByOrderId = await getDeliveryInstructionsForDriverOrderIds(
+    [...materializedRoutes.values()]
+      .flat()
+      .flatMap(materializedDriverSalesOrders)
+      .map((order) => order.orderId)
+      .filter(Boolean)
+  );
+  for (const jobs of materializedRoutes.values()) {
+    for (const job of jobs) {
+      await attachDriverDeliveryInstructions(job, instructionByOrderId);
+    }
+  }
+  return {
+    planId: plan.id,
+    planDate: plan.planDate,
+    revision: Number(plan.revision || 0),
+    routes: driverLogins.map((driverLogin) => {
+      const jobs = materializedRoutes.get(driverLogin) || [];
+      return {
+        driverLogin,
+        driverName: jobs.find((job) => job.driverName)?.driverName || driverLogin,
+        jobs
+      };
+    })
+  };
 }
 
 async function activeDriverAssignment(driverLogin, date = "") {
@@ -2275,7 +2340,7 @@ function driverRemarkValue(value) {
   return remark;
 }
 
-function driverJobRecordDetails(job = {}, { driverRemark } = {}) {
+function driverJobRecordDetails(job = {}, { driverRemark, completionContext = null } = {}) {
   const details = {
     schemaVersion: 1,
     driverName: job.driverName || "",
@@ -2337,6 +2402,15 @@ function driverJobRecordDetails(job = {}, { driverRemark } = {}) {
   };
   const normalizedRemark = driverRemarkValue(driverRemark);
   if (normalizedRemark !== undefined) details.driverRemark = normalizedRemark;
+  if (completionContext?.source === "dispatch_historical_assist") {
+    details.completionSource = "dispatch_historical_assist";
+    details.completionActorType = "operator";
+    details.completionActorId = String(completionContext.actorId || "").trim().slice(0, 240);
+    details.completionActorName = String(completionContext.actorName || "").trim().slice(0, 240);
+    details.completionReason = String(completionContext.reason || "").trim().slice(0, 2000);
+    details.completionRequestId = String(completionContext.requestId || "").trim().slice(0, 64);
+    details.completionAssistEventId = String(completionContext.assistEventId || "").trim().slice(0, 64);
+  }
   return details;
 }
 
@@ -2346,6 +2420,7 @@ export async function startDriverJob(driverLogin, jobIdValue, {
   offlineTrace = null
 } = {}) {
   if (!job) throw new Error("Driver job is no longer available.");
+  assertDriverPlanExecutionDate(job.planDate);
   await assertNoClosedNetSuiteOrders(job.orderRefs || [], "start Driver work");
   const result = await query(
     `INSERT INTO driver_job_records (
@@ -2585,7 +2660,8 @@ export async function recordDriverJobPhotos(driverLogin, jobIdValue, {
   job = null,
   occurredAt = null,
   offlineTrace = null,
-  driverRemark = undefined
+  driverRemark = undefined,
+  completionContext = null
 } = {}) {
   await assertNoClosedNetSuiteOrders(job?.orderRefs || [], "be completed by Driver");
   const photos = Array.isArray(photoDataUrls) ? photoDataUrls.filter(isPhotoReference) : [];
@@ -2606,11 +2682,17 @@ export async function recordDriverJobPhotos(driverLogin, jobIdValue, {
        COALESCE($14::timestamptz, now()), $15::jsonb
      )
      ON CONFLICT (job_id) DO UPDATE SET
-       photo_data_urls = EXCLUDED.photo_data_urls,
+       photo_data_urls = CASE
+         WHEN driver_job_records.status = 'complete' THEN driver_job_records.photo_data_urls
+         ELSE EXCLUDED.photo_data_urls
+       END,
        status = 'complete',
        started_at = COALESCE(driver_job_records.started_at, EXCLUDED.started_at, now()),
        completed_at = COALESCE(driver_job_records.completed_at, EXCLUDED.completed_at, now()),
-       job_details = COALESCE(driver_job_records.job_details, '{}'::jsonb) || EXCLUDED.job_details
+       job_details = CASE
+         WHEN driver_job_records.status = 'complete' THEN driver_job_records.job_details
+         ELSE COALESCE(driver_job_records.job_details, '{}'::jsonb) || EXCLUDED.job_details
+       END
      RETURNING *`,
     [
       jobIdValue,
@@ -2627,7 +2709,7 @@ export async function recordDriverJobPhotos(driverLogin, jobIdValue, {
       JSON.stringify(photos),
       job?.startedAt || null,
       occurredAt || null,
-      JSON.stringify(driverJobRecordDetails(job || {}, { driverRemark }))
+      JSON.stringify(driverJobRecordDetails(job || {}, { driverRemark, completionContext }))
     ]
   );
   if (offlineTrace?.eventId) {
@@ -3144,19 +3226,31 @@ export async function listDriverJobStatuses({ planId = null, planDate = null, in
   const clauses = [];
   if (planId) {
     params.push(planId);
-    clauses.push(`plan_id = $${params.length}`);
+    clauses.push(`record.plan_id = $${params.length}`);
   }
   if (planDate) {
     params.push(planDate);
-    clauses.push(`plan_date = $${params.length}::date`);
+    clauses.push(`record.plan_date = $${params.length}::date`);
   }
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
   const result = await query(
-    `SELECT job_id, plan_id, plan_date, driver_login, truck_id, truck_plate, load_id, load_name,
-            stop_id, stop_type, order_refs, status, started_at, completed_at, job_details
-       FROM driver_job_records
+    `SELECT record.job_id, record.plan_id, record.plan_date, record.driver_login,
+            record.truck_id, record.truck_plate, record.load_id, record.load_name,
+            record.stop_id, record.stop_type, record.order_refs, record.status,
+            record.started_at, record.completed_at, record.job_details,
+            arrival.actual_arrival_at,
+            arrival.source AS actual_arrival_source,
+            arrival.confidence AS actual_arrival_confidence,
+            arrival.algorithm_version AS actual_arrival_algorithm_version,
+            arrival.applied_run_id AS actual_arrival_run_id
+       FROM driver_job_records record
+       LEFT JOIN dispatch_actual_stop_arrivals arrival
+         ON arrival.driver_job_record_id = record.id
       ${where}
-      ORDER BY plan_date DESC NULLS LAST, started_at DESC NULLS LAST, completed_at DESC NULLS LAST, id DESC
+      ORDER BY record.plan_date DESC NULLS LAST,
+               record.started_at DESC NULLS LAST,
+               record.completed_at DESC NULLS LAST,
+               record.id DESC
       LIMIT 1000`,
     params
   );

@@ -11,6 +11,7 @@ const state = {
   selectedMbbsBatchResultIds: new Set(),
   mbbsBatchResults: [],
   manualAmountEdits: new Map(),
+  pricingSelections: new Map(),
   invalidManualAmountCandidates: new Set(),
   mbbsBatchPreviewContext: null,
   mbbsOrderSearchResults: [],
@@ -221,6 +222,7 @@ function invalidateMbbsBatchPreview({ clearResults = true } = {}) {
     state.mbbsBatchResults = [];
     state.selectedMbbsBatchResultIds.clear();
     state.manualAmountEdits.clear();
+    state.pricingSelections.clear();
     state.invalidManualAmountCandidates.clear();
     renderBatchResults();
   }
@@ -343,21 +345,23 @@ function renderMbbsCandidateDetail() {
       facts,
       "Billing override",
       candidate.addressOverride
-        ? `Revision ${candidate.addressOverride.revision} · ${candidate.addressOverride.destinationAddressText}`
+        ? `Revision ${candidate.addressOverride.revision} · ${candidate.addressOverride.originAddressText} → ${candidate.addressOverride.destinationAddressText}`
         : "None"
     );
   }
-  const canEditAddress = Boolean(
-    candidate.addressOverride
-    || ((candidate.references || []).length > 0
-      && candidate.originLabel
-      && (!candidate.destinationLabel || candidate.routeStopCount < 2))
-  );
+  const canEditAddress = Boolean((candidate.references || []).length > 0);
   if (form) {
     form.hidden = !canEditAddress;
     form.dataset.candidateId = candidate.candidateId;
   }
-  setInputValue("mbbsAddressOverrideText", candidate.addressOverride?.destinationAddressText || "");
+  setInputValue(
+    "mbbsBillingOriginText",
+    candidate.addressOverride?.originAddressText || candidate.originLabel || ""
+  );
+  setInputValue(
+    "mbbsBillingDestinationText",
+    candidate.addressOverride?.destinationAddressText || candidate.destinationLabel || ""
+  );
   setInputValue("mbbsAddressOverrideReason", "");
   syncCommandButtons();
 }
@@ -668,6 +672,15 @@ function calculationEvidenceCell(result, candidate) {
   relationship.className = "mbt-calculation-relationship";
   relationship.textContent = candidate.relationship?.summary || candidate.billingRule || "Retained order route";
   cell.append(relationship);
+  if (result.pricingMethod) {
+    const pricing = document.createElement("p");
+    pricing.className = "mbt-calculation-relationship";
+    const retainedRate = result.selectedVendorRouteRate;
+    pricing.textContent = result.pricingMethod === "vendor_yard_flat"
+      ? `Pricing source: ${retainedRate?.displayName || "configured vendor-yard flat rate"} · ${retainedRate?.vendorYardName || candidate.vendorRouteEvidence?.vendorYardName || "vendor yard"} ↔ MBBS ${retainedRate?.destinationYardCode || candidate.vendorRouteEvidence?.mbbsYardCode || "yard"}`
+      : "Pricing source: normal MBBS distance band";
+    cell.append(pricing);
+  }
   const steps = Array.isArray(result.calculationSteps) ? result.calculationSteps : [];
   if (steps.length) {
     const list = document.createElement("ol");
@@ -687,6 +700,77 @@ function calculationEvidenceCell(result, candidate) {
   manualSummary.dataset.mbbsManualSummary = result.candidateId;
   cell.append(manualSummary);
   return cell;
+}
+
+function pricingMethodLabel(method) {
+  return method === "vendor_yard_flat"
+    ? "Configured vendor-yard flat rate"
+    : method === "distance_band"
+      ? "Normal distance-band rate"
+      : "Not applicable";
+}
+
+function pricingMethodCell(result, candidate) {
+  const cell = document.createElement("td");
+  const options = Array.isArray(result.pricingOptions) ? result.pricingOptions : [];
+  if (options.length < 2) {
+    cell.textContent = pricingMethodLabel(result.pricingMethod);
+    return cell;
+  }
+  const select = document.createElement("select");
+  select.setAttribute("data-mbbs-pricing-method", result.candidateId);
+  select.setAttribute("aria-label", `Pricing method for ${mbbsReferenceText(candidate)}`);
+  for (const pricingOption of options) {
+    const option = new Option(
+      `${pricingOption.label || pricingMethodLabel(pricingOption.pricingMethod)}${pricingOption.available === false ? " · unavailable" : ""}`,
+      String(pricingOption.pricingMethod || "")
+    );
+    option.disabled = pricingOption.available === false;
+    option.selected = option.value === result.pricingMethod;
+    select.append(option);
+  }
+  select.addEventListener("change", () => {
+    void changeCandidatePricingMethod(result.candidateId, select.value);
+  });
+  cell.append(select);
+  return cell;
+}
+
+async function changeCandidatePricingMethod(candidateId, pricingMethod) {
+  const context = currentMbbsBatchContext();
+  message("mbbsCandidateMessage", "Recalculating the selected endpoint pricing method…");
+  try {
+    const result = await api(`/api/mbt/billing/mbbs/candidates/${encodeURIComponent(candidateId)}/preview`, {
+      method: "POST",
+      body: {
+        completedMonth: context.completedMonth,
+        completedDate: context.completedDate,
+        rateCardVersionId: context.rateCardVersionId,
+        pricingMethod
+      }
+    });
+    const index = state.mbbsBatchResults.findIndex((entry) => entry.candidateId === candidateId);
+    if (index < 0) throw new Error("The selected calculation is no longer in this batch.");
+    state.mbbsBatchResults.splice(index, 1, {
+      ...result,
+      candidateId,
+      status: result.automaticRate?.available === false ? "manual_required" : "calculated"
+    });
+    state.pricingSelections.set(candidateId, pricingMethod);
+    const calculatedAmountMinor = Number(result.charge?.calculatedAmountMinor ?? result.charge?.amountMinor);
+    state.manualAmountEdits.set(candidateId, {
+      calculatedAmountMinor,
+      adjustmentMinor: 0,
+      finalAmountMinor: calculatedAmountMinor
+    });
+    state.invalidManualAmountCandidates.delete(candidateId);
+    renderBatchResults();
+    syncCommandButtons();
+    message("mbbsCandidateMessage", `${pricingMethodLabel(pricingMethod)} selected and recalculated from the active rate version.`);
+  } catch (error) {
+    renderBatchResults();
+    message("mbbsCandidateMessage", error.message, "attention");
+  }
 }
 
 function amountInputCell(result, candidate, field) {
@@ -787,7 +871,7 @@ function renderBatchResults() {
   if (!state.mbbsBatchResults.length) {
     const row = document.createElement("tr");
     const cell = textCell("No batch has been calculated yet.");
-    cell.colSpan = 12;
+    cell.colSpan = 13;
     row.append(cell);
     rows.append(row);
     syncBatchResultSelectAll();
@@ -823,9 +907,12 @@ function renderBatchResults() {
         ? "Manual charge required (no automatic rate)"
         : calculated ? "Calculated" : result.error?.message || "Failed"),
       textCell(calculated ? formatDistanceKm(result.distanceMetres, result.distanceAvailable !== false) : "—"),
+      calculated ? pricingMethodCell(result, candidate) : textCell("—"),
       textCell(result.status === "manual_required"
         ? "No automatic rate"
-        : calculated ? selectedRateLabel(result.rateCardVersionId) : "—"),
+        : calculated
+          ? result.selectedVendorRouteRate?.displayName || selectedRateLabel(result.rateCardVersionId)
+          : "—"),
       textCell(calculated ? money(result.charge.calculatedAmountMinor ?? result.charge.amountMinor, result.charge.currency) : "—"),
       calculated ? amountInputCell(result, candidate, "adjustment") : textCell("—"),
       calculated ? amountInputCell(result, candidate, "final") : textCell("—")
@@ -860,6 +947,7 @@ async function calculateSelectedMbbsCandidates() {
       .filter((entry) => entry.status === "calculated")
       .map((entry) => entry.candidateId));
     state.manualAmountEdits.clear();
+    state.pricingSelections.clear();
     state.invalidManualAmountCandidates.clear();
     for (const calculation of state.mbbsBatchResults.filter(usableBatchResult)) {
       const calculatedAmountMinor = Number(
@@ -870,6 +958,9 @@ async function calculateSelectedMbbsCandidates() {
         adjustmentMinor: 0,
         finalAmountMinor: calculatedAmountMinor
       });
+      if (calculation.pricingMethod) {
+        state.pricingSelections.set(calculation.candidateId, calculation.pricingMethod);
+      }
     }
     state.mbbsBatchPreviewContext = requestContext;
     renderBatchResults();
@@ -952,6 +1043,16 @@ async function createMbbsBillingCases() {
           candidateId,
           ...state.manualAmountEdits.get(candidateId)
         })),
+        ...(conversionIds.some((candidateId) => state.pricingSelections.has(candidateId))
+          ? {
+              pricingSelections: conversionIds
+                .filter((candidateId) => state.pricingSelections.has(candidateId))
+                .map((candidateId) => ({
+                  candidateId,
+                  pricingMethod: state.pricingSelections.get(candidateId)
+                }))
+            }
+          : {}),
         reason: inputValue("mbbsBatchConversionReason")
       }
     });
@@ -962,6 +1063,7 @@ async function createMbbsBillingCases() {
     state.selectedMbbsBatchResultIds.clear();
     state.mbbsBatchResults = [];
     state.manualAmountEdits.clear();
+    state.pricingSelections.clear();
     state.invalidManualAmountCandidates.clear();
     renderBatchResults();
     setInputValue("mbbsBatchConversionReason", "");
@@ -1004,21 +1106,22 @@ async function saveMbbsAddressOverride(event) {
   const candidateId = String(form?.dataset.candidateId || "");
   const candidate = state.mbbsCandidates.find((item) => item.candidateId === candidateId);
   const completedMonth = inputValue("mbbsCompletedMonth") || mbbsCompletionMonth(candidate?.completedAt);
-  message("mbbsCandidateMessage", "Saving the audited billing-only destination…");
+  message("mbbsCandidateMessage", "Saving the audited billing-only endpoints…");
   try {
     await api(`/api/mbt/billing/mbbs/candidates/${encodeURIComponent(candidateId)}/address-override`, {
       method: "PUT",
       idempotencyKey: commandIdentity("mbt-billing-address-override"),
       body: {
         completedMonth,
-        destinationAddressText: inputValue("mbbsAddressOverrideText"),
+        originAddressText: inputValue("mbbsBillingOriginText"),
+        destinationAddressText: inputValue("mbbsBillingDestinationText"),
         expectedRevision: candidate?.addressOverride?.revision || 0,
         reason: inputValue("mbbsAddressOverrideReason")
       }
     });
     state.selectedMbbsCandidateId = candidateId;
     await loadMbbsCandidates();
-    message("mbbsCandidateMessage", "Billing-only address saved. Operational order and Driver PWA evidence was not changed.");
+    message("mbbsCandidateMessage", "Billing-only endpoints saved. Operational order and Driver PWA evidence was not changed.");
   } catch (error) {
     message("mbbsCandidateMessage", error.message, "attention");
   }

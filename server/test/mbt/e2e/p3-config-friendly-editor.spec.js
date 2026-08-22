@@ -2,6 +2,17 @@ import { expect, test } from "./mbt-e2e-test.js";
 
 const VERSION_ID = "00000000-0000-4000-8000-000000000361";
 const CLONE_ID = "00000000-0000-4000-8000-000000000362";
+const VENDOR_YARD = Object.freeze({
+  localVendorId: 6,
+  localVendorName: "BWS",
+  vendorYardName: "BWS Uxbridge",
+  vendorYardAddress: "65 Anderson Blvd, Uxbridge, ON L9P 0C7"
+});
+const MBBS_YARD = Object.freeze({
+  yardCode: "12441",
+  displayName: "12441 Woodbine",
+  addressText: "12441 Woodbine Ave, Gormley, ON"
+});
 
 const LOCAL_ITEMS = Object.freeze([
   {
@@ -140,17 +151,28 @@ function rateDetail(currentVersion = version()) {
       }],
       depositRules: [],
       mbbsChargingPolicy: {
-        schemaVersion: 1,
+        schemaVersion: 2,
         currency: "CAD",
         directPickupUnitAmountMinor: 12345,
-        poAdditionalDropUnitAmountMinor: 4567,
+        poVrmaAdditionalStopUnitAmountMinor: 4567,
         soChargeBasis: "per_order_group_as_one",
         toReplenishmentChargeBasis: "full_route_once",
         toDirectPickupChargeBasis: "fixed_unit_once",
         poChargeBasis: "shared_leg_equal_split",
-        poAdditionalDropBasis: "each_distinct_drop_after_first",
-        dispatchLoadSplitBasis: "ignored_for_charge"
-      }
+        dispatchLoadSplitBasis: "ignored_for_charge",
+        poVrmaBaseChargeBasis: "vendor_yard_pair_then_distance_band",
+        vrmaDirectionBasis: "same_pair_reverse",
+        poVrmaAdditionalStopBasis: "each_distinct_stop_after_base_pair",
+        endpointOverrideBasis: "flat_default_user_may_choose_distance"
+      },
+      mbbsVendorRouteRates: [{
+        rateName: "Bestway Stone - Uxbridge to 12441",
+        displayName: "Bestway Stone - Uxbridge to 12441",
+        ...VENDOR_YARD,
+        destinationYardCode: MBBS_YARD.yardCode,
+        baseAmountMinor: 20000,
+        currency: "CAD"
+      }]
     }
   };
 }
@@ -257,7 +279,11 @@ async function handleMasterDataWrites(route, request, path, calls, state) {
 
 async function handleRateCardRequests(route, request, path, calls, state) {
   if (path === "/api/mbt/config/rate-cards" && request.method() === "GET") {
-    await json(route, { items: [state.currentVersion] });
+    await json(route, {
+      items: [state.currentVersion],
+      yardOptions: [MBBS_YARD],
+      vendorYardOptions: [VENDOR_YARD]
+    });
     return true;
   }
   if (path === "/api/mbt/config/rate-cards" && request.method() === "POST") {
@@ -477,8 +503,16 @@ test("P4 browser: dump sites and item-owned pricing use only the charging fields
   await expect(page.locator("#mbbsChargingPolicy")).toContainText("Sales Order");
   await expect(page.locator("#mbbsChargingPolicy")).toContainText("Transfer Order");
   await expect(page.locator("#mbbsChargingPolicy")).toContainText("Purchase Order");
+  await expect(page.locator("#mbbsChargingPolicy")).toContainText("reverse VRMA uses the same pair price");
   await page.locator("#mbbsDirectPickupUnitPrice").fill("123.45");
   await page.locator("#mbbsPoAdditionalDropUnitPrice").fill("45.67");
+  await page.getByRole("button", { name: "Add vendor-yard price" }).click();
+  const vendorRateRow = page.locator("[data-mbbs-vendor-route-rate]");
+  await vendorRateRow.locator("[data-mbbs-vendor-route-name]").fill("Bestway Stone - Uxbridge to 12441");
+  await vendorRateRow.locator("[data-mbbs-vendor-route-display]").fill("Bestway Stone - Uxbridge to 12441");
+  await vendorRateRow.locator("[data-mbbs-vendor-yard]").selectOption("0");
+  await vendorRateRow.locator("[data-mbbs-destination-yard]").selectOption("12441");
+  await vendorRateRow.locator("[data-mbbs-vendor-route-amount]").fill("200.00");
   await page.getByRole("button", { name: "Add distance band" }).click();
   const mbbsRow = page.locator("#rateItemEditor [data-rate-kind='item_distance']");
   await expect(mbbsRow).toHaveCount(1);
@@ -567,13 +601,25 @@ test("P4 browser: dump sites and item-owned pricing use only the charging fields
   ]));
   expect(creates[0].body.graph.distanceBands).toHaveLength(3);
   expect(creates[0].body.graph.mbbsChargingPolicy).toEqual(expect.objectContaining({
+    schemaVersion: 2,
     directPickupUnitAmountMinor: 12345,
-    poAdditionalDropUnitAmountMinor: 4567,
+    poVrmaAdditionalStopUnitAmountMinor: 4567,
     soChargeBasis: "per_order_group_as_one",
     toDirectPickupChargeBasis: "fixed_unit_once",
-    poAdditionalDropBasis: "each_distinct_drop_after_first",
+    poVrmaBaseChargeBasis: "vendor_yard_pair_then_distance_band",
+    vrmaDirectionBasis: "same_pair_reverse",
+    poVrmaAdditionalStopBasis: "each_distinct_stop_after_base_pair",
+    endpointOverrideBasis: "flat_default_user_may_choose_distance",
     dispatchLoadSplitBasis: "ignored_for_charge"
   }));
+  expect(creates[0].body.graph.mbbsVendorRouteRates).toEqual([{
+    rateName: "Bestway Stone - Uxbridge to 12441",
+    displayName: "Bestway Stone - Uxbridge to 12441",
+    ...VENDOR_YARD,
+    destinationYardCode: "12441",
+    baseAmountMinor: 20000,
+    currency: "CAD"
+  }]);
   const updates = calls.filter((call) => call.path === `/api/mbt/config/rate-cards/${VERSION_ID}`);
   expect(updates.at(-1).body.graph.rateCard.itemCode).toBeNull();
   expect(updates.at(-1).body.graph.components).toEqual(expect.arrayContaining([
@@ -581,8 +627,11 @@ test("P4 browser: dump sites and item-owned pricing use only the charging fields
   ]));
   expect(updates.at(-1).body.graph.mbbsChargingPolicy).toEqual(expect.objectContaining({
     directPickupUnitAmountMinor: 12345,
-    poAdditionalDropUnitAmountMinor: 4567
+    poVrmaAdditionalStopUnitAmountMinor: 4567
   }));
+  expect(updates.at(-1).body.graph.mbbsVendorRouteRates).toEqual(expect.arrayContaining([
+    expect.objectContaining({ vendorYardName: "BWS Uxbridge", destinationYardCode: "12441", baseAmountMinor: 20000 })
+  ]));
   expect(calls.some((call) => call.path.endsWith("/clone"))).toBe(true);
   const overflow = await page.evaluate(() => (
     globalThis.document.documentElement.scrollWidth - globalThis.document.documentElement.clientWidth

@@ -10,7 +10,7 @@
   <body>
     <main class="dispatch-shell dispatch-menu-shell" id="scmMenuApp"></main>
     <script src="/i18n.js?v=20260716-yard-movements-v1"></script>
-    <script src="/app-sidebar.js?v=20260801-netsuite-po-role-v1"></script>
+    <script src="/app-sidebar.js?v=20260819-dependency-manager-v1"></script>
     <script src="/dispatch-auth.js?v=20260716-multi-role-v1"></script>
     <script>
       const scmMenuApp = document.getElementById("scmMenuApp");
@@ -29,6 +29,10 @@
       }
       function scmIsYardManager() {
         return scmMenuRoles().has("yard_manager");
+      }
+      function scmCanViewDependencyManagement() {
+        const roles = scmMenuRoles();
+        return ["admin", "dispatcher", "scm", "scm_staff"].some((role) => roles.has(role));
       }
       function renderScmMenu() {
         const operator = scmMenuOperator || {};
@@ -50,12 +54,20 @@
           <section class="dispatch-menu-page">
             <div class="dispatch-menu-heading">
               <h2>SCM Menu</h2>
-              <p>Manage PO split/ref, local VRMA, and the transportation schedule shared with dispatch.</p>
+              <p>Manage Custom Orders, PO split/ref, local VRMA, and the transportation schedule shared with dispatch.</p>
             </div>
             <div class="dispatch-menu-grid">
               ${canEdit ? `<button class="dispatch-menu-card primary-card" onclick="location.href='/scm/stock-requests'" type="button">
                 <strong>Stock Requests from Sales</strong>
                 <span>Review regular stock requests, adjust source and quantity, convert local pending TOs, then confirm and print real NetSuite TOs.</span>
+              </button>` : ""}
+              ${canEdit ? `<button class="dispatch-menu-card primary-card" onclick="location.href='/scm/to-printing'" type="button">
+                <strong>Transfer Order Printing</strong>
+                <span>Preview and print current NetSuite TO picking tickets, then review shared print history from every SCM workflow.</span>
+              </button>` : ""}
+              ${canEdit ? `<button class="dispatch-menu-card primary-card" onclick="location.href='/scm/custom-orders'" type="button">
+                <strong>Custom Orders</strong>
+                <span>Create and maintain local transportation orders that are not available in NetSuite.</span>
               </button>` : ""}
               <button class="dispatch-menu-card primary-card" onclick="location.href='/scm/smart'" type="button">
                 <strong>Smart SCM</strong>
@@ -69,6 +81,10 @@
               ${canEdit ? `<button class="dispatch-menu-card primary-card" onclick="location.href='/scm/vendors'" type="button">
                 <strong>Local Vendors</strong>
                 <span>Add or rename local vendors and yards, then maintain each yard's opening days and hours.</span>
+              </button>` : ""}
+              ${scmCanViewDependencyManagement() ? `<button class="dispatch-menu-card primary-card" onclick="location.href='/scm/dependency-management'" type="button">
+                <strong>Dependency Manager</strong>
+                <span>Inspect and preview current SO, group, and split relationships. SCM can apply safe TO/PO changes; Dispatch has read-only visibility.</span>
               </button>` : ""}
               ${canEdit ? `<button class="dispatch-menu-card primary-card" onclick="location.href='/scm/transfer-dependencies'" type="button">
                 <strong>Auto Transfer</strong>

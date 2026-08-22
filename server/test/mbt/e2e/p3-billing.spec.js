@@ -167,6 +167,104 @@ function batch(browserState) {
   };
 }
 
+function batchPreviewResults() {
+  return [{
+    candidateId: CANDIDATE_ID,
+    status: "calculated",
+    candidate: {
+      references: [{ sourceType: "PO", rootReference: "PO55174" }],
+      billingRule: "po_shared_leg",
+      billingLegId: "PO-LEG-1",
+      billingLegNumber: 1,
+      driverLoadNumbers: ["Load 1"],
+      originLabel: "2967 Kennedy Road",
+      destinationLabel: "100 Queen Street West",
+      relationship: { summary: "One Purchase Order uses one retained business leg." },
+      vendorRouteEvidence: {
+        localVendorName: "BWS",
+        vendorYardName: "BWS Uxbridge",
+        mbbsYardCode: "12441",
+        endpointOverride: true
+      }
+    },
+    rateCardVersionId: RATE_VERSION_ID,
+    rateCardVersionNumber: 1,
+    distanceMetres: 31_000,
+    distanceAvailable: true,
+    automaticRate: { available: true, code: null, message: null },
+    selectedBand: {
+      minimumMetres: 30_000,
+      maximumMetres: 50_000,
+      pricingBasis: "flat"
+    },
+    pricingMethod: "vendor_yard_flat",
+    pricingOptions: [{
+      pricingMethod: "vendor_yard_flat",
+      label: "Configured vendor-yard flat rate",
+      available: true
+    }, {
+      pricingMethod: "distance_band",
+      label: "Normal distance-band rate",
+      available: true
+    }],
+    selectedVendorRouteRate: {
+      displayName: "Bestway Stone - Uxbridge to 12441",
+      vendorYardName: "BWS Uxbridge",
+      destinationYardCode: "12441",
+      baseAmountMinor: 25_000
+    },
+    calculationSteps: [{
+      stepNumber: 1,
+      code: "vendor_yard_flat_rate",
+      description: "Bestway Stone - Uxbridge to 12441 configured pair",
+      amountMinor: 25_000
+    }],
+    charge: {
+      itemCode: "DELIVERY_CHARGE_MBBS",
+      calculatedAmountMinor: 25_000,
+      adjustmentMinor: 0,
+      finalAmountMinor: 25_000,
+      amountMinor: 25_000,
+      currency: "CAD",
+      estimatedTaxMinor: 0,
+      totalMinor: 25_000
+    }
+  }, {
+    candidateId: CANDIDATE_ID_2,
+    status: "manual_required",
+    candidate: {
+      references: [{ sourceType: "SO", rootReference: "SOA05678" }],
+      billingRule: "so_order",
+      billingLegId: "SO-LEG-2",
+      billingLegNumber: 2,
+      driverLoadNumbers: ["Load 2"],
+      originLabel: "2967 Kennedy Road",
+      destinationLabel: "200 King Street West",
+      relationship: { summary: "Sales Order charged independently, once for the order." }
+    },
+    rateCardVersionId: RATE_VERSION_ID,
+    rateCardVersionNumber: 1,
+    distanceMetres: 0,
+    distanceAvailable: false,
+    automaticRate: {
+      available: false,
+      code: "MBT_MBBS_DISTANCE_LOOKUP_FAILED",
+      message: "No supported driving route was found."
+    },
+    selectedBand: null,
+    charge: {
+      itemCode: "DELIVERY_CHARGE_MBBS",
+      calculatedAmountMinor: 0,
+      adjustmentMinor: 0,
+      finalAmountMinor: 0,
+      amountMinor: 0,
+      currency: "CAD",
+      estimatedTaxMinor: 0,
+      totalMinor: 0
+    }
+  }];
+}
+
 async function installBillingApi(page, { commandsEnabled }) {
   const calls = [];
   const browserState = {
@@ -227,7 +325,7 @@ async function installBillingApi(page, { commandsEnabled }) {
         physicalLoadId: "LOAD-1",
         planDate: "2038-08-03",
         completedAt: "2038-08-03T12:00:00.000Z",
-        references: [{ sourceType: "SO", rootReference: "SOA01234" }],
+        references: [{ sourceType: "PO", rootReference: "PO55174" }],
         originYardCode: "2967",
         originLabel: "2967 Kennedy Road",
         destinationLabel: "100 Queen Street West",
@@ -267,7 +365,41 @@ async function installBillingApi(page, { commandsEnabled }) {
         schemaVersion: "mbbs-billing-candidate-preview-v1",
         postingMode: "local_only_preview",
         externalWork: null,
+        candidate: {
+          references: [{ sourceType: "PO", rootReference: "PO55174" }],
+          billingRule: "po_shared_leg",
+          billingLegId: "PO-LEG-1",
+          billingLegNumber: 1,
+          driverLoadNumbers: ["Load 1"],
+          originLabel: "65 Anderson Blvd, Uxbridge, ON",
+          destinationLabel: "12441 Woodbine Avenue",
+          relationship: { summary: "One Purchase Order uses one retained business leg." },
+          vendorRouteEvidence: {
+            localVendorName: "BWS",
+            vendorYardName: "BWS Uxbridge",
+            mbbsYardCode: "12441",
+            endpointOverride: true
+          }
+        },
         distanceMetres: 31_000,
+        distanceAvailable: true,
+        automaticRate: { available: true, code: null, message: null },
+        pricingMethod: "distance_band",
+        pricingOptions: [{
+          pricingMethod: "vendor_yard_flat",
+          label: "Configured vendor-yard flat rate",
+          available: true
+        }, {
+          pricingMethod: "distance_band",
+          label: "Normal distance-band rate",
+          available: true
+        }],
+        selectedVendorRouteRate: {
+          displayName: "Bestway Stone - Uxbridge to 12441",
+          vendorYardName: "BWS Uxbridge",
+          destinationYardCode: "12441",
+          baseAmountMinor: 25_000
+        },
         selectedBand: {
           minimumMetres: 30_000,
           maximumMetres: 50_000,
@@ -275,11 +407,20 @@ async function installBillingApi(page, { commandsEnabled }) {
         },
         charge: {
           itemCode: "DELIVERY_CHARGE_MBBS",
-          amountMinor: 25_000,
+          calculatedAmountMinor: 20_000,
+          adjustmentMinor: 0,
+          finalAmountMinor: 20_000,
+          amountMinor: 20_000,
           currency: "CAD",
           estimatedTaxMinor: 0,
-          totalMinor: 25_000
-        }
+          totalMinor: 20_000
+        },
+        calculationSteps: [{
+          stepNumber: 1,
+          code: "distance_rate",
+          description: "Distance-band charge for 31.0 km",
+          amountMinor: 20_000
+        }]
       });
     }],
     ["POST /api/mbt/billing/mbbs/candidates/batch-preview", async (route) => {
@@ -294,42 +435,7 @@ async function installBillingApi(page, { commandsEnabled }) {
         successCount: 2,
         failureCount: 0,
         manualRequiredCount: 1,
-        results: [CANDIDATE_ID, CANDIDATE_ID_2].map((candidateId, index) => ({
-          candidateId,
-          status: index === 0 ? "calculated" : "manual_required",
-          candidate: {
-            references: [{ sourceType: "SO", rootReference: index === 0 ? "SOA01234" : "SOA05678" }],
-            billingRule: "so_order",
-            billingLegId: `SO-LEG-${index + 1}`,
-            billingLegNumber: index + 1,
-            driverLoadNumbers: [index === 0 ? "Load 1" : "Load 2"],
-            originLabel: "2967 Kennedy Road",
-            destinationLabel: index === 0 ? "100 Queen Street West" : "200 King Street West",
-            relationship: { summary: "Sales Order charged independently, once for the order." }
-          },
-          rateCardVersionId: RATE_VERSION_ID,
-          rateCardVersionNumber: 1,
-          distanceMetres: index === 0 ? 31_000 : 0,
-          distanceAvailable: index === 0,
-          automaticRate: index === 0
-            ? { available: true, code: null, message: null }
-            : { available: false, code: "MBT_MBBS_DISTANCE_LOOKUP_FAILED", message: "No supported driving route was found." },
-          selectedBand: index === 0 ? {
-            minimumMetres: 30_000,
-            maximumMetres: 50_000,
-            pricingBasis: "flat"
-          } : null,
-          charge: {
-            itemCode: "DELIVERY_CHARGE_MBBS",
-            calculatedAmountMinor: index === 0 ? 25_000 : 0,
-            adjustmentMinor: 0,
-            finalAmountMinor: index === 0 ? 25_000 : 0,
-            amountMinor: index === 0 ? 25_000 : 0,
-            currency: "CAD",
-            estimatedTaxMinor: 0,
-            totalMinor: index === 0 ? 25_000 : 0
-          }
-        }))
+        results: batchPreviewResults()
       });
     }],
     ["POST /api/mbt/billing/mbbs/candidates/batch-create", async (route) => {
@@ -436,25 +542,27 @@ test("billing browser batches selected monthly candidates and switches to billin
   await openBilling(page, request);
   await expect(page.getByRole("heading", { name: "MBT Billing" })).toBeVisible();
   await expect(page.getByText("No outbox or NetSuite transport")).toBeVisible();
-  await expect(page.getByRole("cell", { name: "SO SOA01234", exact: true })).toBeVisible();
+  await expect(page.getByRole("cell", { name: "PO PO55174", exact: true })).toBeVisible();
   await page.getByLabel("Completed date (Toronto, optional)").fill("2038-08-03");
   await page.getByLabel("Completed date (Toronto, optional)").press("Tab");
   await expect(page.getByLabel("Completed month (Toronto)")).toHaveValue("2038-08");
   await page.getByLabel("Choose MBBS rate card").selectOption(RATE_VERSION_ID);
   await page.getByLabel("Select all ready MBBS candidates").check();
   await page.getByRole("button", { name: "Calculate selected orders" }).click();
-  await expect(page.locator("#mbbsBatchResultRows")).toContainText("SO SOA01234");
+  await expect(page.locator("#mbbsBatchResultRows")).toContainText("PO PO55174");
   await expect(page.locator("#mbbsBatchResultRows")).toContainText("$250.00");
   await expect(page.locator("#mbbsBatchResultRows")).toContainText("31 km");
+  await expect(page.locator("#mbbsBatchResultRows")).toContainText("Bestway Stone - Uxbridge to 12441");
   await expect(page.locator("#mbbsBatchResultRows")).toContainText("No automatic rate");
-  await page.getByLabel("Signed adjustment for SO SOA01234").fill("-10.00");
-  await expect(page.getByLabel("Final charge for SO SOA01234")).toHaveValue("240.00");
+  await page.getByLabel("Pricing method for PO PO55174").selectOption("distance_band");
+  await expect(page.locator("#mbbsCandidateMessage")).toContainText("Normal distance-band rate selected");
+  await page.getByLabel("Signed adjustment for PO PO55174").fill("-10.00");
+  await expect(page.getByLabel("Final charge for PO PO55174")).toHaveValue("190.00");
   await page.getByLabel("Final charge for SO SOA05678").fill("260.00");
   await expect(page.getByLabel("Signed adjustment for SO SOA05678")).toHaveValue("260.00");
-  await expect(page.getByLabel("Convert SO SOA01234 to billing")).toBeChecked();
+  await expect(page.getByLabel("Convert PO PO55174 to billing")).toBeChecked();
   await expect(page.getByLabel("Convert SO SOA05678 to billing")).not.toBeChecked();
   await page.getByLabel("Convert SO SOA05678 to billing").check();
-  await page.getByLabel("Convert SO SOA01234 to billing").uncheck();
   await page.getByLabel("Find canonical billing customer").fill("Synthetic");
   await page.getByRole("button", { name: "Search customers" }).click();
   await expect(page.getByLabel("Selected billing customer")).toHaveValue(BILLING_CUSTOMER_ID);
@@ -480,6 +588,7 @@ test("billing browser batches selected monthly candidates and switches to billin
 
   expect(calls.map(({ path }) => path)).toEqual([
     "/api/mbt/billing/mbbs/candidates/batch-preview",
+    `/api/mbt/billing/mbbs/candidates/${CANDIDATE_ID}/preview`,
     "/api/mbt/billing/mbbs/candidates/batch-create",
     `/api/mbt/billing/cases/${CASE_ID}/calculate`,
     `/api/mbt/billing/cases/${CASE_ID}/approve-local`
@@ -491,21 +600,36 @@ test("billing browser batches selected monthly candidates and switches to billin
     rateCardVersionId: RATE_VERSION_ID
   });
   expect(calls[1].body).toEqual({
-    candidateIds: [CANDIDATE_ID_2],
+    completedMonth: "2038-08",
+    completedDate: "2038-08-03",
+    rateCardVersionId: RATE_VERSION_ID,
+    pricingMethod: "distance_band"
+  });
+  expect(calls[2].body).toEqual({
+    candidateIds: [CANDIDATE_ID, CANDIDATE_ID_2],
     completedMonth: "2038-08",
     completedDate: "2038-08-03",
     rateCardVersionId: RATE_VERSION_ID,
     customerNetsuiteId: BILLING_CUSTOMER_ID,
     manualAmountEdits: [{
+      candidateId: CANDIDATE_ID,
+      calculatedAmountMinor: 20_000,
+      adjustmentMinor: -1_000,
+      finalAmountMinor: 19_000
+    }, {
       candidateId: CANDIDATE_ID_2,
       calculatedAmountMinor: 0,
       adjustmentMinor: 26_000,
       finalAmountMinor: 26_000
     }],
+    pricingSelections: [{
+      candidateId: CANDIDATE_ID,
+      pricingMethod: "distance_band"
+    }],
     reason: "Create verified local MBBS billing cases"
   });
-  expect(calls[1].idempotencyKey).toMatch(/^mbt-billing-batch-create:/u);
-  expect(calls[2].body).toEqual({
+  expect(calls[2].idempotencyKey).toMatch(/^mbt-billing-batch-create:/u);
+  expect(calls[3].body).toEqual({
     serviceVisitId: VISIT_ID,
     distanceSnapshotId: DISTANCE_ID,
     expectedRevision: 1,
@@ -519,7 +643,7 @@ test("billing browser batches selected monthly candidates and switches to billin
     },
     reason: "Calculate selected completed visit"
   });
-  expect(calls[3].body).toEqual({
+  expect(calls[4].body).toEqual({
     billingVersionId: VERSION_ID,
     expectedRevision: 2,
     reason: "Billing evidence reviewed"

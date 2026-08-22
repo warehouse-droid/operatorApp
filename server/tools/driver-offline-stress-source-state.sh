@@ -10,6 +10,7 @@ files=(
   package.json
   eslint.driver-offline-stress.config.js
   public/driver.html
+  public/driver-reset.html
   public/driver-service-worker.js
   public/driver.css
   public/i18n.css
@@ -20,6 +21,7 @@ files=(
   public/driver-offline-sync.js
   public/driver-bin-ui.js
   public/driver.js
+  src/server.js
   src/driver-client-version.js
   src/driver-client-version-harness.js
   src/driver-offline-client-harness.js
@@ -35,7 +37,9 @@ files=(
   test/fixtures/driver-offline-stress-history.json
   test/mbt/property/driver-offline-stress-contract.test.js
   test/mbt/e2e/driver-pwa-cache-repair.spec.js
+  test/mbt/integration/driver-pwa-site-reset-http.test.js
   test/mbt/unit/driver-pwa-cache-repair.test.js
+  test/mbt/unit/driver-pwa-site-reset.test.js
   test/mbt/unit/driver-pwa-recovery-assets.test.js
   test/mbt/unit/driver-camera-ordinary-upload.test.js
   test/support/driver-offline-stress-artifacts.mjs

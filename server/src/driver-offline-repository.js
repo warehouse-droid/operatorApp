@@ -1145,6 +1145,9 @@ function mapManifest(row, jobs = []) {
     dayState: row.day_state || {},
     samsaraWorkflowEnabled: row.samsara_workflow_enabled === true,
     complete: row.complete === true,
+    supersededAt: row.superseded_at || null,
+    supersededByRequestId: row.superseded_by_request_id || null,
+    supersededReason: row.superseded_reason || "",
     jobs
   };
 }
@@ -1580,6 +1583,7 @@ export async function authenticateDriverOfflineGrant(token, {
         AND g.revoked_at IS NULL
         AND g.expires_at > now()
         AND m.expires_at > now()
+        AND m.superseded_at IS NULL
       LIMIT 1`,
     [hashToken(token), id, normalizedDevice]
   );
@@ -1998,6 +2002,11 @@ export async function registerDriverOfflineEvents({
           ? Number(manifestJob?.required_photo_count || 0)
           : 0;
       const reviewReasons = [];
+      if (manifest.superseded_at) {
+        reviewReasons.push(
+          "Route superseded by an approved Dispatch or SCM change. The event was retained for Dispatch review and its operational effects are blocked."
+        );
+      }
       if (!event.occurrenceTimeValid) {
         reviewReasons.push("The device occurrence timestamp is invalid or implausibly far in the future and requires Dispatch review.");
       } else if (occurredAfterManifestExpiry) {

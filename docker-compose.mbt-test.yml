@@ -20,6 +20,9 @@ x-test-environment: &test-environment
   NETSUITE_ACCOUNT_ID: ""
   NETSUITE_CLIENT_ID: ""
   NETSUITE_CLIENT_SECRET: ""
+  NETSUITE_M2M_STORAGE_SECRET: ""
+  NETSUITE_M2M_SETTINGS_PATH: /app/data/netsuite-m2m-settings.json
+  NETSUITE_M2M_MASTER_KEY_PATH: /app/data/.netsuite-m2m-master-key
   NETSUITE_DIRECT_ACCESS_ENABLED: "false"
   NETSUITE_MIRROR_ROLE: disabled
   NETSUITE_MIRROR_SHARED_SECRET: ""
@@ -32,6 +35,8 @@ x-test-environment: &test-environment
   PHOTO_UPLOAD_TOKEN_SECRET: ""
   PHOTO_UPLOAD_WORKER_URL: ""
   SALES_PUBLIC_ACCESS_ENABLED: "false"
+  DISPATCH_PLANNER_ORDER_POOL_MODE: "off"
+  DISPATCH_PLANNER_COMMAND_MODE: "off"
   OLLAMA_BASE_URL: http://127.0.0.1:9
 
 x-test-service: &test-service

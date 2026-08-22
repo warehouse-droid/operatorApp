@@ -2,6 +2,11 @@ import crypto from "node:crypto";
 import { config, requireConfig } from "./config.js";
 import { query } from "./db.js";
 import { assertSandboxNetSuiteEnvironment } from "./mbt/netsuite-readonly-adapter.js";
+import {
+  getNetSuiteM2mAccessToken,
+  invalidateNetSuiteM2mAccessToken,
+  isNetSuiteM2mActive
+} from "./netsuite-m2m-runtime.js";
 import { normalizeSalesOrderReconciliationType } from "./sales-order-reconciliation.js";
 import { buildTransferDependencyUpdateRequest } from "./transfer-dependency-netsuite.js";
 
@@ -86,6 +91,7 @@ function mbtNetSuiteReadTarget(path) {
 }
 
 async function getUnexpiredMbtNetSuiteAccessToken() {
+  if (await isNetSuiteM2mActive()) return getNetSuiteM2mAccessToken();
   const result = await query(
     "SELECT access_token, expires_at FROM netsuite_tokens WHERE id = 1"
   );
@@ -574,6 +580,7 @@ async function refreshAccessToken(refreshToken) {
 }
 
 async function getAccessToken() {
+  if (await isNetSuiteM2mActive()) return getNetSuiteM2mAccessToken();
   const result = await query("SELECT * FROM netsuite_tokens WHERE id = 1");
   const token = result.rows[0];
   if (!token) throw new Error("NetSuite is not connected. Open /api/auth/netsuite/start first.");
@@ -612,6 +619,7 @@ function basicAuth() {
 async function netsuiteRest(path, { method = "GET", body = null, headers = {} } = {}) {
   requireConfig(["netsuite.restBaseUrl"]);
   let lastError;
+  let m2mAuthRetry = false;
   for (let attempt = 0; attempt < 4; attempt += 1) {
     const accessToken = await getAccessToken();
     const response = await netsuiteFetch(`${config.netsuite.restBaseUrl}${path}`, {
@@ -634,6 +642,11 @@ async function netsuiteRest(path, { method = "GET", body = null, headers = {} } 
       lastError = new Error(`NetSuite REST failed: ${response.status} ${typeof data === "string" ? data : JSON.stringify(data)}`);
       lastError.status = response.status;
       lastError.netsuiteResponseReceived = true;
+      if (response.status === 401 && !m2mAuthRetry && await isNetSuiteM2mActive()) {
+        invalidateNetSuiteM2mAccessToken();
+        m2mAuthRetry = true;
+        continue;
+      }
       if (isConcurrencyLimit(response.status, text) && attempt < 3) {
         await delay(2000 * (attempt + 1));
         continue;
@@ -731,6 +744,30 @@ export async function updateTransferOrderInNetSuite(orderId, payload, { intercom
 
 export async function createPurchaseOrderInNetSuite(payload) {
   const run = () => netsuiteRest("/record/v1/purchaseOrder", {
+    method: "POST",
+    body: payload
+  });
+  const result = restMutationQueue.then(run, run);
+  restMutationQueue = result.catch(() => {});
+  return result;
+}
+
+export async function createSalesOrderInNetSuite(payload) {
+  const run = () => netsuiteRest("/record/v1/salesOrder", {
+    method: "POST",
+    body: payload
+  });
+  const result = restMutationQueue.then(run, run);
+  restMutationQueue = result.catch(() => {});
+  return result;
+}
+
+export async function transformEstimateToSalesOrderInNetSuite(estimateId, payload) {
+  const id = Number(estimateId);
+  if (!Number.isSafeInteger(id) || id <= 0) {
+    throw new Error("A valid numeric NetSuite estimate ID is required.");
+  }
+  const run = () => netsuiteRest(`/record/v1/estimate/${id}/!transform/salesOrder?replace=item`, {
     method: "POST",
     body: payload
   });
@@ -1167,13 +1204,14 @@ export async function suiteql(q, params = [], options = {}) {
 
 async function runSuiteql(q, params = [], options = {}) {
   requireConfig(["netsuite.restBaseUrl"]);
-  const accessToken = await getAccessToken();
   const body = params.length ? { q, params } : { q };
   const url = new URL(`${config.netsuite.restBaseUrl}/query/v1/suiteql`);
   if (options.limit) url.searchParams.set("limit", String(options.limit));
   if (options.offset) url.searchParams.set("offset", String(options.offset));
   let response;
+  let m2mAuthRetry = false;
   for (let attempt = 0; attempt < 4; attempt += 1) {
+    const accessToken = await getAccessToken();
     response = await netsuiteFetch(url, {
       method: "POST",
       headers: {
@@ -1183,6 +1221,11 @@ async function runSuiteql(q, params = [], options = {}) {
       },
       body: JSON.stringify(body)
     });
+    if (response.status === 401 && !m2mAuthRetry && await isNetSuiteM2mActive()) {
+      invalidateNetSuiteM2mAccessToken();
+      m2mAuthRetry = true;
+      continue;
+    }
     if (response.status !== 429) break;
     const retryAfter = Number(response.headers.get("retry-after") || 0);
     await new Promise((resolve) => setTimeout(resolve, retryAfter ? retryAfter * 1000 : 2000 * (attempt + 1)));
@@ -1429,6 +1472,53 @@ export async function fetchTransactionStatusFromNetSuite(orderId, recordType = "
       AND t.type = '${type}'
   `);
   return result.items?.[0] || null;
+}
+
+function normalizedTransactionStatusIds(values) {
+  if (!Array.isArray(values) || !values.length) {
+    throw new Error("At least one numeric NetSuite transaction ID is required.");
+  }
+  const ids = values.map((value) => {
+    if ((typeof value !== "number" && typeof value !== "string")
+        || !/^\d+$/.test(String(value))) {
+      throw new Error("Every NetSuite transaction ID must be numeric.");
+    }
+    const id = Number(value);
+    if (!Number.isSafeInteger(id) || id <= 0) {
+      throw new Error("Every NetSuite transaction ID must be a positive safe numeric value.");
+    }
+    return id;
+  });
+  return [...new Set(ids)].sort((left, right) => left - right);
+}
+
+export function buildTransactionStatusBatchQuery(orderIds, recordType) {
+  const allowedTypes = new Set(["SalesOrd", "PurchOrd", "TrnfrOrd"]);
+  if (!allowedTypes.has(recordType)) throw new Error("A valid NetSuite transaction record type is required.");
+  const ids = normalizedTransactionStatusIds(orderIds);
+  if (ids.length > 500) throw new Error("A NetSuite transaction status batch cannot exceed 500 IDs.");
+  return `
+    SELECT DISTINCT
+      t.id,
+      t.tranid,
+      t.status,
+      BUILTIN.DF(t.status) AS status_text,
+      t.lastmodifieddate
+    FROM transaction t
+    WHERE t.id IN (${ids.join(",")})
+      AND t.type = '${recordType}'
+    ORDER BY t.id
+  `;
+}
+
+export async function fetchTransactionStatusesFromNetSuite(orderIds, recordType) {
+  const ids = normalizedTransactionStatusIds(orderIds);
+  const rows = [];
+  for (let offset = 0; offset < ids.length; offset += 500) {
+    const result = await suiteql(buildTransactionStatusBatchQuery(ids.slice(offset, offset + 500), recordType));
+    rows.push(...(result.items || []));
+  }
+  return rows;
 }
 
 export async function fetchTransactionProgressFromNetSuite(orderId, recordType = "SalesOrd") {
@@ -3241,6 +3331,48 @@ export async function findPurchaseOrdersBySmartScmMarkerFromNetSuite({ proposalI
          OR UPPER(COALESCE(t.memo, '')) LIKE '%${marker}'
        )
        ${vendorFilter}
+     ORDER BY t.id DESC
+     FETCH FIRST 10 ROWS ONLY
+  `);
+  return result.items || [];
+}
+
+export async function findSpecialStockOrdersByMarkerFromNetSuite({
+  caseId,
+  orderKind,
+  entityId = null
+} = {}) {
+  const requestId = Number(caseId);
+  const entity = Number(entityId);
+  if (!Number.isSafeInteger(requestId) || requestId <= 0) {
+    throw new Error("A valid Special Item case ID is required.");
+  }
+  const type = orderKind === "sales_order"
+    ? "SalesOrd"
+    : orderKind === "purchase_order"
+      ? "PurchOrd"
+      : null;
+  if (!type) throw new Error("Select sales_order or purchase_order marker recovery.");
+  const marker = `MBBS-SPECIAL-${orderKind === "sales_order" ? "SO" : "PO"}:${requestId}`.toUpperCase();
+  const entityFilter = Number.isSafeInteger(entity) && entity > 0 ? `AND t.entity = ${entity}` : "";
+  const result = await suiteql(`
+    SELECT t.id,
+           t.tranid,
+           t.trandate,
+           t.entity AS entity_id,
+           BUILTIN.DF(t.entity) AS entity_name,
+           t.status,
+           BUILTIN.DF(t.status) AS status_text,
+           t.location AS location_id,
+           BUILTIN.DF(t.location) AS location,
+           t.memo
+      FROM transaction t
+     WHERE t.type = '${type}'
+       AND (
+         UPPER(COALESCE(t.memo, '')) LIKE '%${marker} |%'
+         OR UPPER(COALESCE(t.memo, '')) LIKE '%${marker}'
+       )
+       ${entityFilter}
      ORDER BY t.id DESC
      FETCH FIRST 10 ROWS ONLY
   `);

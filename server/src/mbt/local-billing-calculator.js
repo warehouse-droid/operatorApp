@@ -594,21 +594,60 @@ export function calculateMbbsCrossCharges(value) {
         currency: crossChargeCurrency
       });
     }
-    for (const reference of references.filter(({ sourceType }) => sourceType === "TO")) {
-      if (globalToRoots.has(reference.rootReference)) {
-        continue;
-      }
-      globalToRoots.add(reference.rootReference);
-      cases.push({
-        ...load,
-        references: undefined,
-        sourceType: "TO",
-        rootReference: reference.rootReference,
-        deduplicationKey: `TO|${reference.rootReference}`,
-        allocatedAmountMinor: load.sharedTotalMinor,
-        allocationKey: null,
-        currency: crossChargeCurrency
+    const toReferences = references.filter(({ sourceType }) => sourceType === "TO")
+      .filter(({ rootReference }) => !globalToRoots.has(rootReference));
+    const sharedMultiDropTo = String(load.billingEvidence?.billingRule || "")
+      === "to_replenishment_multi_drop";
+    if (sharedMultiDropTo && toReferences.length > 0) {
+      const allocationKey = `TO_MULTI_DROP|${load.physicalLoadId}`;
+      const base = Math.floor(load.sharedTotalMinor / toReferences.length);
+      const remainder = load.sharedTotalMinor - (base * toReferences.length);
+      const allocations = toReferences.map((reference, index) => {
+        globalToRoots.add(reference.rootReference);
+        const remainderMinor = index >= toReferences.length - remainder ? 1 : 0;
+        const allocatedAmountMinor = base + remainderMinor;
+        const allocation = {
+          sourceType: reference.sourceType,
+          rootReference: reference.rootReference,
+          sortedOrdinal: index,
+          eligibleReferenceCount: toReferences.length,
+          sharedTotalMinor: load.sharedTotalMinor,
+          allocatedAmountMinor,
+          remainderMinor
+        };
+        cases.push({
+          ...load,
+          references: undefined,
+          sourceType: "TO",
+          rootReference: reference.rootReference,
+          deduplicationKey: `TO|${reference.rootReference}`,
+          allocatedAmountMinor,
+          allocationKey,
+          currency: crossChargeCurrency
+        });
+        return allocation;
       });
+      allocationGroups.push({
+        allocationKey,
+        physicalLoadId: load.physicalLoadId,
+        sharedTotalMinor: load.sharedTotalMinor,
+        currency: crossChargeCurrency,
+        allocations
+      });
+    } else {
+      for (const reference of toReferences) {
+        globalToRoots.add(reference.rootReference);
+        cases.push({
+          ...load,
+          references: undefined,
+          sourceType: "TO",
+          rootReference: reference.rootReference,
+          deduplicationKey: `TO|${reference.rootReference}`,
+          allocatedAmountMinor: load.sharedTotalMinor,
+          allocationKey: null,
+          currency: crossChargeCurrency
+        });
+      }
     }
     for (const reference of references.filter(({ sourceType }) => sourceType === "CUSTOM")) {
       cases.push({
@@ -670,6 +709,7 @@ export function calculateMbbsCrossCharges(value) {
     calculationExplanation: {
       soDeduplication: "root_and_physical_load",
       toDeduplication: "root_globally_first_stable_load",
+      toMultiDropAllocation: "one_shared_longest_drop_charge_sorted_balanced_integer_cents",
       poVrmaDeduplication: "type_root_and_physical_load",
       allocation: "sorted_equal_integer_cents_final_root_receives_remainder"
     }

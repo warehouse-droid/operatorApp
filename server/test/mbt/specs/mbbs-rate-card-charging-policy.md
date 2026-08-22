@@ -103,6 +103,17 @@ draft policy.
 Schema version 1 makes these rules visible and auditable; this task authorizes
 editing the two unit prices, not changing the rule identifiers.
 
+## Append-only PO leg-identity clarification — 2026-08-16
+
+The earlier phrase “Dispatch load splits do not alter charges” applies to
+explicit SO/PO groups and to references co-carried on one retained physical
+leg. It must not collapse separate ordinary PO/VRMA trips. For an ordinary
+PO/VRMA candidate, each distinct immutable Driver `load_id` is a distinct leg;
+the non-unique display text (`Load 1`, `Load 2`, and so on) is never an
+identity. Multiple PO/VRMA references within that same immutable load may
+share and evenly allocate one leg charge. Explicit groups retain their
+approved group-as-one behavior.
+
 ## Invariants
 
 - All money remains exact CAD integer minor units.

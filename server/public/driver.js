@@ -1,9 +1,10 @@
 const app = document.getElementById("driverApp");
 const toast = document.getElementById("driverToast");
 const offlineStatus = document.getElementById("driverOfflineStatus");
+const routeChangeStatus = document.getElementById("driverRouteChangeStatus");
 const syncHold = document.getElementById("driverSyncHold");
-const TOKEN_KEY = "mbbs.driver.token";
-const STAFF_TOKEN_KEY = "mbbs.staff.token";
+const TOKEN_KEY = "mbbs.driver.token"; // secret-scan: allow -- localStorage key name, not a token.
+const STAFF_TOKEN_KEY = "mbbs.staff.token"; // secret-scan: allow -- localStorage key name, not a token.
 const STAFF_ROLE_KEY = "mbbs.staff.role";
 const STAFF_ROLES_KEY = "mbbs.staff.roles";
 const CAMERA_FACING_KEY = "mbbs.camera.facingMode";
@@ -16,6 +17,7 @@ const DRIVER_OFFLINE_MODE_KEY = "mbbs.driver.offlineModeEnabled";
 const DRIVER_DEVICE_ID_KEY = "mbbs.driver.deviceId";
 const DRIVER_PWA_VERSION_CHECK_MS = 60000;
 const DRIVER_OFFLINE_RECOVERY_CHECK_MS = 2000;
+const DRIVER_ROUTE_PRESENCE_INTERVAL_MS = 10_000;
 const DRIVER_PWA_REPAIR_TIMEOUT_MS = 45000;
 const t = (key, fallback) => window.MBBS_I18N?.t(key, fallback) || fallback;
 const tf = (key, fallback, variables = {}) => window.MBBS_I18N?.format(key, fallback, variables) || fallback;
@@ -33,20 +35,23 @@ let binDraft = null;
 let binDraftSavePromise = Promise.resolve();
 let dvirPhotos = [];
 let dvirMode = "";
-let orderPages = {};
 const instructionMediaObjectUrls = new Map();
 const instructionMediaOnlineFallbackIds = new Set();
 const instructionMediaRetryNonces = new Map();
 let instructionMediaPreparationKey = "";
 let instructionMediaPreparationGeneration = 0;
+let instructionTranslationPromise = null;
+let instructionTranslationPromiseKey = "";
+const instructionTranslationCache = new Map();
 let photoPromptOpen = false;
 let eventSource = null;
 let locationCheck = null;
-let locationOverrideAccepted = false;
+const locationOverrideApproval = window.DriverLocationOverridePolicy.create();
 let countdownTimer = null;
 let activeRest = null;
 let restSummary = null;
 let restTimer = null;
+let endedRestMarker = null;
 let activeView = "job";
 let driverHistory = [];
 let selectedHistoryId = "";
@@ -107,9 +112,11 @@ let driverPwaUpdateRequired = null;
 let driverPwaVersionCheckComplete = false;
 let driverPwaVersionCheckPromise = null;
 let driverServiceWorkerRegistration = null;
+let driverRouteChangeRequests = [];
+let driverRoutePresenceRunning = false;
+let driverRoutePushAvailable = null;
 const activeForegroundEventIds = new Set();
 const onlineBinEventAttempts = new Map();
-const ITEMS_PER_PAGE = 5;
 const COMPLETE_DELAY_MS = 10000;
 const LIVE_REFRESH_DEBOUNCE_MS = 180;
 const QUIET_SYNC_LEASE_POLL_MS = 250;
@@ -320,7 +327,7 @@ function renderDriverPwaUpdateRequired() {
         <p>${t("app.driver", "MBBS Driver")}</p>
         <h1>${t("driver.pwaUpdateTitle", "Driver PWA update required")}</h1>
         <strong>${t("driver.pwaUpdateCloseReopen", "Close and reopen the Driver PWA while connected to the internet before continuing.")}</strong>
-        <p>${t("driver.pwaUpdateEvidenceProtected", "Your saved route, photos, and unsynchronized evidence remain protected on this device. Do not clear browser or site data.")}</p>
+        <p>${t("driver.pwaUpdateEvidenceProtected", "Reload and Repair preserve saved evidence. Use the hard reset only while online when that local evidence may be permanently discarded.")}</p>
         <div class="driver-pwa-version-detail">
           <span>${t("driver.pwaOpenVersion", "Open version")}</span><b>${escapeHtml(DRIVER_PWA_CLIENT_VERSION)}</b>
           <span>${t("driver.pwaLatestVersion", "Latest version")}</span><b>${escapeHtml(currentVersion)}</b>
@@ -328,6 +335,8 @@ function renderDriverPwaUpdateRequired() {
         <button class="primary" data-action="reload-driver-pwa" type="button">${t("driver.pwaReloadLatest", "Reload latest PWA")}</button>
         <button class="secondary" data-action="repair-driver-pwa" ${driverShellRepairRunning ? "disabled" : ""} type="button">${driverShellRepairRunning ? t("driver.pwaRepairingCache", "Repairing Driver app cache…") : t("driver.pwaRepairCache", "Repair Driver app cache")}</button>
         <small>${t("driver.pwaRepairPreservesData", "Repairs only MBBS Driver app files. Saved routes, photos, pending submissions, login state, and other MBBS app data are preserved.")}</small>
+        <a class="driver-site-reset-link" href="/reset-driver">${t("driver.pwaHardReset", "Hard reset this Driver site")}</a>
+        <small class="driver-site-reset-warning">${t("driver.pwaHardResetWarning", "Emergency online recovery only. This signs out and permanently deletes all MBBS site storage, caches, saved routes, pending actions, and photos from this browser.")}</small>
         <small>${t("driver.pwaIphoneReopenHelp", "On iPhone or an installed PWA, close every MBBS Driver window and open it again if this message remains after reloading.")}</small>
       </div>
     </section>
@@ -365,7 +374,7 @@ async function checkDriverPwaVersion({ force = false, reason = "periodic" } = {}
       const response = await fetch(`/api/driver/client-version?nonce=${encodeURIComponent(Date.now())}`, {
         method: "GET",
         cache: "no-store",
-        credentials: "same-origin",
+        credentials: "same-origin", // secret-scan: allow -- Fetch credential mode, not a credential value.
         headers: {
           "Cache-Control": "no-store",
           [DRIVER_PWA_VERSION_HEADER]: DRIVER_PWA_CLIENT_VERSION
@@ -525,7 +534,7 @@ async function repairDriverAppCache(button = null) {
     const networkResponse = await fetch(`/api/driver/network-health?cacheRepair=${encodeURIComponent(Date.now())}`, {
       method: "GET",
       cache: "no-store",
-      credentials: "same-origin",
+      credentials: "same-origin", // secret-scan: allow -- Fetch credential mode, not a credential value.
       headers: { "Cache-Control": "no-store" }
     }).catch(() => null);
     if (!networkResponse?.ok) {
@@ -719,6 +728,14 @@ function driverActionProtectionState() {
     return {
       ready: false,
       message: t("driver.actionGateUpdateRequired", "Close and reopen the Driver PWA to load the required update before recording another action.")
+    };
+  }
+  const planExecution = driverPlanExecutionDecision(currentJob?.planDate || dayState?.planDate);
+  if ((currentJob || dvirMode) && !planExecution.allowed) {
+    return {
+      ready: false,
+      code: planExecution.code,
+      message: planExecution.message
     };
   }
   if (navigator.onLine && !driverPwaVersionCheckComplete) {
@@ -1953,6 +1970,45 @@ function planDateText(value) {
   return window.MBBS_I18N?.displayDate(text) || t("driver.planDateNotSet", "Plan date not set");
 }
 
+function driverCompanyDate(now = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Toronto",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(now);
+  const byType = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${byType.year}-${byType.month}-${byType.day}`;
+}
+
+function driverPlanExecutionDecision(planDateValue, now = new Date()) {
+  const planDate = String(planDateValue || "").slice(0, 10);
+  const parsedPlanDate = /^\d{4}-\d{2}-\d{2}$/.test(planDate)
+    ? new Date(`${planDate}T00:00:00.000Z`)
+    : null;
+  const valid = Number.isFinite(parsedPlanDate?.getTime())
+    && parsedPlanDate.toISOString().slice(0, 10) === planDate;
+  if (!valid) {
+    return {
+      allowed: false,
+      code: "DRIVER_PLAN_DATE_INVALID",
+      message: t("driver.planDateInvalid", "This route has no valid plan date. Refresh or contact Dispatch before recording work.")
+    };
+  }
+  if (planDate > driverCompanyDate(now)) {
+    return {
+      allowed: false,
+      code: "DRIVER_PLAN_NOT_STARTED",
+      message: tf(
+        "driver.planDateNotStarted",
+        "This route is scheduled for {date}. You can review it now, but work cannot start before that date in Toronto.",
+        { date: planDateText(planDate) }
+      )
+    };
+  }
+  return { allowed: true, code: "", message: "" };
+}
+
 function dateTimeText(value) {
   return window.MBBS_I18N?.displayDateTime(value) || "";
 }
@@ -1983,12 +2039,11 @@ function driverUsesSamsaraWorkflow() {
 function locationCheckApproved() {
   return locationCheck?.status === "ok"
     || locationCheck?.status === "not_checked_offline"
-    || locationOverrideAccepted;
+    || locationOverrideApproval.isAccepted(currentJob);
 }
 
 function locationCheckBlocksConfirmation() {
-  return locationCheck?.status === "checking"
-    || (["warning", "unavailable"].includes(locationCheck?.status) && !locationOverrideAccepted);
+  return !locationCheckApproved();
 }
 
 function canBeginJobConfirmation(job) {
@@ -2007,6 +2062,34 @@ function clearCountdownTimer() {
 function clearRestTimer() {
   clearTimeout(restTimer);
   restTimer = null;
+}
+
+function driverRestMarker(rest) {
+  if (!rest) return null;
+  const restId = String(rest.restId || rest.id || "").trim();
+  const startedAt = String(rest.startedAt || "").trim();
+  return restId || startedAt ? { restId, startedAt } : null;
+}
+
+function sameDriverRest(left, right) {
+  if (!left || !right) return false;
+  if (left.restId && right.restId) return left.restId === right.restId;
+  return Boolean(left.startedAt && right.startedAt && left.startedAt === right.startedAt);
+}
+
+function acceptDriverRestCandidate(rest) {
+  const candidate = rest || null;
+  if (!candidate) return null;
+  const marker = driverRestMarker(candidate);
+  if (sameDriverRest(marker, endedRestMarker)) return null;
+  if (marker && endedRestMarker) endedRestMarker = null;
+  return candidate;
+}
+
+function markDriverRestEnded(rest) {
+  endedRestMarker = driverRestMarker(rest) || endedRestMarker;
+  activeRest = null;
+  clearRestTimer();
 }
 
 function elapsedSeconds(startedAt) {
@@ -2069,6 +2152,7 @@ function scheduleRestRender() {
 
 async function checkCurrentJobLocation({ render = true } = {}) {
   if (!currentJob?.jobId) return null;
+  locationOverrideApproval.clear();
   const usingSavedOfflineBinRoute = isDriverBinJob(currentJob) && offlineCachedView;
   // An offline browser must never attempt a GPS/Samsara request. This guard is
   // deliberately independent of IndexedDB readiness: storage preparation and
@@ -2080,12 +2164,10 @@ async function checkCurrentJobLocation({ render = true } = {}) {
       locationStatus: "not_checked_offline",
       message: t("driver.locationOfflineMessage", "Location was not checked while offline.")
     };
-    locationOverrideAccepted = false;
     if (render) renderJob();
     return locationCheck;
   }
   locationCheck = { status: "checking", message: t("driver.checkingGps", "Checking Samsara truck GPS against expected stop...") };
-  locationOverrideAccepted = false;
   if (render) renderJob();
   try {
     locationCheck = await request(`/api/driver/jobs/${encodeURIComponent(currentJob.jobId)}/location-check`, {
@@ -2112,7 +2194,7 @@ async function checkCurrentJobLocation({ render = true } = {}) {
 
 async function ensureLocationApprovalBeforeConfirmation() {
   if (!currentJob || completeWaitSeconds(currentJob) > 0) return false;
-  if (!locationCheck) await checkCurrentJobLocation();
+  if (!locationCheck && !locationOverrideApproval.isAccepted(currentJob)) await checkCurrentJobLocation();
   if (locationCheckApproved()) return true;
   showToast(t("driver.verifyLocationBeforePhotos", "Verify the Samsara GPS location or confirm override before adding photos."));
   renderJob();
@@ -2173,6 +2255,213 @@ async function request(path, options = {}) {
   return data;
 }
 
+function driverRoutePresenceSnapshot() {
+  const health = offlineHealth || {};
+  const pendingEventCount = Math.max(0, Number(health.pendingEventCount || 0))
+    + Math.max(0, Number(health.reviewRequiredCount || 0));
+  const pendingPhotoCount = Math.max(0, Number(
+    health.partitionUnsyncedPhotoCount ?? health.unsyncedPhotoCount ?? 0
+  ));
+  const activeJobId = activeRest
+    ? `rest:${String(activeRest.restId || activeRest.id || "active")}`
+    : currentJob?.status === "in_progress" || photoInteractionActive() || activeDriverMutationToken
+      ? String(currentJob?.jobId || "driver-action-active")
+      : "";
+  const syncState = Number(health.reviewRequiredCount || 0) > 0
+    ? "review"
+    : pendingEventCount > 0 || pendingPhotoCount > 0 || offlineSyncing
+      ? "pending"
+      : offlineManifest?.complete
+        ? "clean"
+        : "unknown";
+  return {
+    visible: document.visibilityState === "visible",
+    manifestId: offlineManifest?.manifestId || null,
+    syncState,
+    pendingEventCount,
+    pendingPhotoCount,
+    activeJobId
+  };
+}
+
+function driverRouteChangeLocalReadiness(routeRequest = {}) {
+  if (!navigator.onLine) return { ready: false, message: "Reconnect before confirming route readiness." };
+  if (document.visibilityState !== "visible") return { ready: false, message: "Keep this Driver screen open and visible." };
+  const snapshot = driverRoutePresenceSnapshot();
+  if (!offlineManifest?.manifestId || routeRequest.manifestId !== offlineManifest.manifestId) {
+    return { ready: false, message: "Download the current saved route before confirming." };
+  }
+  if (snapshot.syncState !== "clean" || snapshot.pendingEventCount || snapshot.pendingPhotoCount) {
+    return { ready: false, message: "Finish synchronizing all events and photos first." };
+  }
+  if (snapshot.activeJobId) return { ready: false, message: "Finish the active stop, rest, or photo action first." };
+  return { ready: true, message: "This device is synchronized and idle." };
+}
+
+function driverRoutePushCanBeEnabled() {
+  return driverRoutePushAvailable !== false
+    && "serviceWorker" in navigator
+    && "PushManager" in window
+    && typeof Notification !== "undefined"
+    && Notification.permission !== "denied"
+    && Notification.permission !== "granted";
+}
+
+function renderDriverRouteChangeStatus() {
+  if (!routeChangeStatus) return;
+  if (!driver || !authToken || driverRouteChangeRequests.length === 0) {
+    routeChangeStatus.hidden = true;
+    routeChangeStatus.innerHTML = "";
+    return;
+  }
+  const requestCards = driverRouteChangeRequests.map((routeRequest) => {
+    const readiness = driverRouteChangeLocalReadiness(routeRequest);
+    const readyUntil = Date.parse(routeRequest.readyExpiresAt || "");
+    const alreadyReady = routeRequest.deviceState === "ready"
+      && Number.isFinite(readyUntil)
+      && readyUntil > Date.now();
+    return `
+      <section class="driver-route-change-request">
+        <p><strong>${escapeHtml(planDateText(routeRequest.planDate))}</strong> · Route update pending</p>
+        <p>No route has changed yet. SCM must re-preview and explicitly apply it after every affected Driver device is ready.</p>
+        <p class="driver-route-change-reason">${escapeHtml(alreadyReady
+          ? `Readiness recorded until ${dateTimeText(routeRequest.readyExpiresAt)}. Keep this screen visible while SCM applies.`
+          : readiness.message)}</p>
+        <div class="driver-route-change-actions">
+          <button
+            class="primary"
+            data-action="acknowledge-driver-route-change"
+            data-route-request-id="${escapeHtml(routeRequest.requestId)}"
+            ${alreadyReady || !readiness.ready ? "disabled" : ""}
+            type="button"
+          >${alreadyReady ? "Ready recorded" : "I am ready for route update"}</button>
+          <button data-action="refresh-driver-route-change" type="button">Refresh status</button>
+        </div>
+      </section>
+    `;
+  }).join("");
+  routeChangeStatus.innerHTML = `
+    <h2>Route update needs attention</h2>
+    <p>Do not close this Driver screen until SCM confirms the update is applied.</p>
+    ${requestCards}
+    ${driverRoutePushCanBeEnabled() ? `
+      <button data-action="enable-driver-route-alerts" type="button">Enable route alerts</button>
+    ` : ""}
+  `;
+  routeChangeStatus.hidden = false;
+}
+
+async function sendDriverRoutePresence({ visible = document.visibilityState === "visible", keepalive = false } = {}) {
+  if (!driver || !authToken || !offlineDeviceId || !navigator.onLine) return false;
+  const payload = { ...driverRoutePresenceSnapshot(), visible: visible === true };
+  try {
+    const response = await fetch("/api/driver/route-presence", {
+      method: "POST",
+      cache: "no-store",
+      keepalive,
+      headers: {
+        "Content-Type": "application/json",
+        [DRIVER_PWA_VERSION_HEADER]: DRIVER_PWA_CLIENT_VERSION,
+        Authorization: `Bearer ${authToken}`,
+        "X-MBBS-Driver-Device": offlineDeviceId
+      },
+      body: JSON.stringify(payload)
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function loadDriverRouteChangeRequests() {
+  if (!driver || !authToken || !navigator.onLine) return driverRouteChangeRequests;
+  try {
+    const result = await request("/api/driver/route-change-requests");
+    driverRouteChangeRequests = Array.isArray(result.requests) ? result.requests : [];
+  } catch (error) {
+    if (![401, 426].includes(Number(error.status || 0))) return driverRouteChangeRequests;
+    driverRouteChangeRequests = [];
+  }
+  renderDriverRouteChangeStatus();
+  return driverRouteChangeRequests;
+}
+
+async function refreshDriverRouteChangeState({ visible = document.visibilityState === "visible", keepalive = false } = {}) {
+  if (driverRoutePresenceRunning || !driver || !authToken || !navigator.onLine) return false;
+  driverRoutePresenceRunning = true;
+  try {
+    await sendDriverRoutePresence({ visible, keepalive });
+    if (visible) await loadDriverRouteChangeRequests();
+    return true;
+  } finally {
+    driverRoutePresenceRunning = false;
+  }
+}
+
+function urlBase64Bytes(value) {
+  const padding = "=".repeat((4 - String(value || "").length % 4) % 4);
+  const base64 = `${String(value || "").replaceAll("-", "+").replaceAll("_", "/")}${padding}`;
+  const decoded = atob(base64);
+  return Uint8Array.from(decoded, (character) => character.charCodeAt(0));
+}
+
+async function enableDriverRouteAlerts(button) {
+  if (!("serviceWorker" in navigator) || !("PushManager" in window) || typeof Notification === "undefined") {
+    driverRoutePushAvailable = false;
+    renderDriverRouteChangeStatus();
+    return showToast("Route alerts are not supported on this device.");
+  }
+  button.disabled = true;
+  try {
+    const settings = await request("/api/driver/route-push/public-key");
+    driverRoutePushAvailable = settings.enabled === true;
+    if (!settings.enabled || !settings.publicKey) throw new Error("Route alerts are not configured on the server.");
+    const permission = await Notification.requestPermission();
+    if (permission !== "granted") throw new Error("Route alert permission was not granted.");
+    const registration = driverServiceWorkerRegistration || await navigator.serviceWorker.ready;
+    const subscription = await registration.pushManager.getSubscription()
+      || await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64Bytes(settings.publicKey)
+      });
+    await request("/api/driver/route-push/subscription", {
+      method: "POST",
+      body: JSON.stringify({ subscription: subscription.toJSON() })
+    });
+    showToast("Route alerts enabled.");
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    renderDriverRouteChangeStatus();
+  }
+}
+
+async function acknowledgeDriverRouteChangeRequest(requestId, button) {
+  const routeRequest = driverRouteChangeRequests.find((entry) => entry.requestId === requestId);
+  const readiness = driverRouteChangeLocalReadiness(routeRequest || {});
+  if (!routeRequest || !readiness.ready) {
+    renderDriverRouteChangeStatus();
+    return showToast(readiness.message || "This route request is no longer available.");
+  }
+  button.disabled = true;
+  try {
+    if (!(await sendDriverRoutePresence({ visible: true }))) {
+      throw new Error("The server could not verify this visible Driver screen.");
+    }
+    const result = await request(
+      `/api/driver/route-change-requests/${encodeURIComponent(requestId)}/ready`,
+      { method: "POST", body: "{}" }
+    );
+    showToast(result.message || "Readiness recorded. SCM must re-preview and apply the change.");
+    await loadDriverRouteChangeRequests();
+  } catch (error) {
+    showToast(error.message);
+    await loadDriverRouteChangeRequests().catch(() => {});
+  } finally {
+    renderDriverRouteChangeStatus();
+  }
+}
+
 async function isGenuineNetworkFailure(error) {
   if (!navigator.onLine) return true;
   if (!error?.isNetworkError) return false;
@@ -2180,7 +2469,7 @@ async function isGenuineNetworkFailure(error) {
     await fetch(`/api/driver/network-health?nonce=${encodeURIComponent(Date.now())}`, {
       method: "GET",
       cache: "no-store",
-      credentials: "same-origin",
+      credentials: "same-origin", // secret-scan: allow -- Fetch credential mode, not a credential value.
       headers: {
         "Cache-Control": "no-store",
         [DRIVER_PWA_VERSION_HEADER]: DRIVER_PWA_CLIENT_VERSION
@@ -2338,6 +2627,7 @@ function renderLogin(message = "") {
   if (renderDriverPwaUpdateRequired()) return;
   document.body.classList.remove("driver-pwa-update-active");
   if (offlineStatus) offlineStatus.hidden = true;
+  if (routeChangeStatus) routeChangeStatus.hidden = true;
   app.innerHTML = `
     <section class="driver-shell">
       <div class="driver-language">${languageToggle()}</div>
@@ -2368,6 +2658,9 @@ function clearDriverSessionMemory() {
   instructionMediaPreparationGeneration += 1;
   instructionMediaPreparationKey = "";
   instructionMediaOnlineFallbackIds.clear();
+  instructionTranslationPromise = null;
+  instructionTranslationPromiseKey = "";
+  instructionTranslationCache.clear();
   releaseInstructionMediaObjectUrls();
   activeDriverMutationToken = null;
   markDriverInteraction();
@@ -2396,12 +2689,12 @@ function clearDriverSessionMemory() {
   binDraft = null;
   dvirPhotos = [];
   dvirMode = "";
-  orderPages = {};
   photoPromptOpen = false;
   locationCheck = null;
-  locationOverrideAccepted = false;
+  locationOverrideApproval.clear();
   activeRest = null;
   restSummary = null;
+  endedRestMarker = null;
   offlinePartition = null;
   offlineManifest = null;
   offlineDeferredManifest = null;
@@ -2418,6 +2711,12 @@ function clearDriverSessionMemory() {
   pendingDvirEvent = null;
   pendingDvirPhotos = [];
   pendingDutyEvents = [];
+  driverRouteChangeRequests = [];
+  driverRoutePresenceRunning = false;
+  if (routeChangeStatus) {
+    routeChangeStatus.hidden = true;
+    routeChangeStatus.innerHTML = "";
+  }
   activeForegroundEventIds.clear();
   driverSessionInvalidated = true;
   driverIdentityValidated = false;
@@ -2462,6 +2761,7 @@ function shell(content) {
   const switchWarning = driverUsesSamsaraWorkflow() ? dayState?.truckSwitchAttention?.[0] : null;
   app.innerHTML = `
     <section class="driver-shell">
+      <div class="driver-top-chrome" aria-hidden="true"></div>
       <button class="driver-logout-button" data-action="logout" type="button">${t("common.logout", "Logout")}</button>
       <div class="driver-language">${languageToggle()}</div>
       <div class="driver-content">
@@ -2476,6 +2776,7 @@ function shell(content) {
         ${content}
       </div>
     </section>
+    <div class="driver-bottom-chrome" aria-hidden="true"></div>
   `;
   renderOfflineStatus();
   applyDriverActionProtectionGate();
@@ -2501,7 +2802,6 @@ function renderNoJob() {
     </section>
     ${activeRest ? renderRestModal() : ""}
   `);
-  void prepareDeliveryInstructionMedia(job);
 }
 
 function renderDvir(type = "pre", message = "") {
@@ -2573,25 +2873,16 @@ function unitPills(units = []) {
   }).join("");
 }
 
-function orderKey(order, index) {
-  return `${order.orderRef || "order"}-${index}`;
-}
-
 function renderOrders(job) {
-  return (job.orders || []).map((order, orderIndex) => {
+  return (job.orders || []).map((order) => {
     const items = order.items || [];
-    const key = orderKey(order, orderIndex);
-    const pageCount = Math.max(1, Math.ceil(items.length / ITEMS_PER_PAGE));
-    const page = Math.min(Math.max(Number(orderPages[key] || 0), 0), pageCount - 1);
-    orderPages[key] = page;
-    const pageItems = items.slice(page * ITEMS_PER_PAGE, page * ITEMS_PER_PAGE + ITEMS_PER_PAGE);
     return `
     <section class="order-card">
       <div>
         <h3>${escapeHtml(order.orderRef)}</h3>
       </div>
       <div class="item-list">
-        ${pageItems.map((item) => `
+        ${items.map((item) => `
           <div class="item-row">
             <div class="item-main-row">
               <strong>${escapeHtml(item.itemName || item.sku || t("driver.item", "Item"))}</strong>
@@ -2601,13 +2892,6 @@ function renderOrders(job) {
           </div>
         `).join("") || `<div class="item-row"><strong>${t("driver.noItemDetail", "No item detail found in local DB")}</strong></div>`}
       </div>
-      ${items.length > ITEMS_PER_PAGE ? `
-        <div class="order-pager">
-          <button data-action="order-page" data-order-key="${escapeHtml(key)}" data-page="${page - 1}" ${page <= 0 ? "disabled" : ""} type="button">${t("common.previous", "Previous")}</button>
-          <span>${page + 1} / ${pageCount}</span>
-          <button data-action="order-page" data-order-key="${escapeHtml(key)}" data-page="${page + 1}" ${page >= pageCount - 1 ? "disabled" : ""} type="button">${t("common.next", "Next")}</button>
-        </div>
-      ` : ""}
     </section>
   `;
   }).join("");
@@ -2686,7 +2970,7 @@ async function fetchDeliveryInstructionImage(media) {
     const response = await fetch(instructionMediaContentPath(media), {
       method: "GET",
       cache: "no-store",
-      credentials: "same-origin",
+      credentials: "same-origin", // secret-scan: allow -- Fetch credential mode, not a credential value.
       signal: controller.signal,
       headers: {
         Authorization: `Bearer ${authToken}`,
@@ -2826,6 +3110,105 @@ app.addEventListener("error", (event) => {
   if (media) card.outerHTML = renderDeliveryInstructionImageError(media);
 }, true);
 
+function driverInstructionLanguage() {
+  return window.MBBS_I18N?.language?.() === "zh-CN" ? "zh-CN" : "en";
+}
+
+function localizedDeliveryInstructionText(order, field) {
+  const sourceText = String(order?.[field] || "");
+  const language = driverInstructionLanguage();
+  const localizedText = order?.localized?.language === language
+    ? String(order.localized?.[field] || "")
+    : "";
+  return localizedText || sourceText;
+}
+
+function deliveryInstructionLocalizationKey(job, language = driverInstructionLanguage()) {
+  if (!job?.jobId || job.stopType !== "dropoff") return "";
+  const instructions = job.deliveryInstructions || { revision: 0, orders: [] };
+  const content = (instructions.orders || []).map((order) => [
+    order?.orderId || order?.orderRef || "",
+    order?.automaticText || "",
+    order?.additionalText || ""
+  ]);
+  return JSON.stringify([job.jobId, Number(instructions.revision || 0), language, content]);
+}
+
+function deliveryInstructionTranslationUnavailable(instructions = {}) {
+  return (instructions.orders || []).some((order) =>
+    [order?.localized?.automaticStatus, order?.localized?.additionalStatus].includes("unavailable")
+  );
+}
+
+function applyCurrentDeliveryInstructionLocalization(jobId, instructions) {
+  if (!currentJob || String(currentJob.jobId || "") !== String(jobId || "")) return false;
+  currentJob = { ...currentJob, deliveryInstructions: instructions };
+  const scrollContainer = app.querySelector(".driver-content");
+  const scrollTop = Number(scrollContainer?.scrollTop || 0);
+  const details = app.querySelector(".stop-detail-page");
+  if (details && !photoInteractionActive()) details.outerHTML = renderStopDetails(currentJob);
+  if (scrollContainer) scrollContainer.scrollTop = scrollTop;
+  return true;
+}
+
+async function prepareCurrentDeliveryInstructionLanguage({ force = false, announce = false } = {}) {
+  const language = driverInstructionLanguage();
+  const jobId = String(currentJob?.jobId || "");
+  const key = deliveryInstructionLocalizationKey(currentJob, language);
+  if (!key || !navigator.onLine || !authToken) return false;
+  if (
+    !force
+    && (currentJob.deliveryInstructions?.orders || []).every((order) => order?.localized?.language === language)
+  ) return true;
+
+  const cached = instructionTranslationCache.get(key);
+  if (cached) {
+    const applied = applyCurrentDeliveryInstructionLocalization(jobId, cached);
+    if (applied && announce) showToast(t("driver.instructionTranslationReady", "Delivery instructions translated"));
+    return applied;
+  }
+  if (instructionTranslationPromise && instructionTranslationPromiseKey === key) {
+    return instructionTranslationPromise;
+  }
+
+  if (announce) showToast(t("driver.translatingInstructions", "Translating delivery instructions..."));
+  const task = (async () => {
+    try {
+      const path = new URL(`/api/driver/jobs/${encodeURIComponent(jobId)}/delivery-instructions`, window.location.origin);
+      path.searchParams.set("language", language);
+      const result = await request(`${path.pathname}${path.search}`);
+      if (deliveryInstructionLocalizationKey(currentJob, language) !== key) return false;
+      const instructions = result.deliveryInstructions || { revision: 0, orders: [] };
+      instructionTranslationCache.set(key, instructions);
+      while (instructionTranslationCache.size > 50) {
+        instructionTranslationCache.delete(instructionTranslationCache.keys().next().value);
+      }
+      if (!applyCurrentDeliveryInstructionLocalization(jobId, instructions)) return false;
+      if (announce) {
+        showToast(deliveryInstructionTranslationUnavailable(instructions)
+          ? t("driver.instructionTranslationUnavailable", "Translation is unavailable; showing the original instructions.")
+          : t("driver.instructionTranslationReady", "Delivery instructions translated"));
+      }
+      return true;
+    } catch (error) {
+      if (announce && String(currentJob?.jobId || "") === jobId) {
+        showToast(t("driver.instructionTranslationUnavailable", "Translation is unavailable; showing the original instructions."));
+      }
+      return false;
+    }
+  })();
+  instructionTranslationPromise = task;
+  instructionTranslationPromiseKey = key;
+  try {
+    return await task;
+  } finally {
+    if (instructionTranslationPromise === task) {
+      instructionTranslationPromise = null;
+      instructionTranslationPromiseKey = "";
+    }
+  }
+}
+
 function renderDeliveryInstructionPage(job) {
   if (job.stopType !== "dropoff") return "";
   const instructions = job.deliveryInstructions || { revision: 0, orders: [] };
@@ -2840,13 +3223,15 @@ function renderDeliveryInstructionPage(job) {
     ${hasContent ? orders.map((order) => {
       const media = Array.isArray(order.media) ? order.media : [];
       const phones = Array.isArray(order.phones) ? order.phones : [];
-      const orderHasContent = String(order.automaticText || "").trim() || String(order.additionalText || "").trim() || media.length;
+      const automaticText = localizedDeliveryInstructionText(order, "automaticText");
+      const additionalText = localizedDeliveryInstructionText(order, "additionalText");
+      const orderHasContent = automaticText.trim() || additionalText.trim() || media.length;
       return `<article class="driver-instruction-order">
         <div class="driver-instruction-order-head"><strong>${escapeHtml(order.orderRef || "Sales Order")}</strong>${order.customer ? `<span>${escapeHtml(order.customer)}</span>` : ""}</div>
         ${orderHasContent ? `
-          ${order.automaticText ? `<p class="driver-delivery-instruction-text">${escapeHtml(order.automaticText)}</p>` : ""}
+          ${automaticText ? `<p class="driver-delivery-instruction-text">${escapeHtml(automaticText)}</p>` : ""}
           ${phones.length ? `<div class="driver-instruction-phones">${phones.map((phone) => `<a href="tel:${escapeHtml(phone.href)}">☎ ${escapeHtml(phone.display)}</a>`).join("")}</div>` : ""}
-          ${order.additionalText ? `<div class="driver-additional-instruction"><strong>${t("driver.additionalDeliveryText", "Additional instruction")}</strong><p class="driver-delivery-instruction-text">${escapeHtml(order.additionalText)}</p></div>` : ""}
+          ${additionalText ? `<div class="driver-additional-instruction"><strong>${t("driver.additionalDeliveryText", "Additional instruction")}</strong><p class="driver-delivery-instruction-text">${escapeHtml(additionalText)}</p></div>` : ""}
           ${media.length ? `<div class="driver-instruction-gallery">${media.map(renderDeliveryInstructionMedia).join("")}</div>` : ""}
         ` : `<p class="driver-no-instructions">${t("driver.noDeliveryInstructions", "No delivery instructions")}</p>`}
       </article>`;
@@ -2854,50 +3239,21 @@ function renderDeliveryInstructionPage(job) {
   </section>`;
 }
 
-function driverStopItemPages(job) {
-  return (job.orders || []).flatMap((order, orderIndex) => {
-    const items = Array.isArray(order.items) ? order.items : [];
-    const chunks = [];
-    if (!items.length) chunks.push([]);
-    for (let index = 0; index < items.length; index += ITEMS_PER_PAGE) chunks.push(items.slice(index, index + ITEMS_PER_PAGE));
-    return chunks.map((pageItems, chunkIndex) => ({ order, orderIndex, chunkIndex, pageItems }));
-  });
-}
-
-function renderDriverStopItemPage(page) {
-  const order = page.order || {};
-  return `<section class="order-card">
-    <div><h3>${escapeHtml(order.orderRef || t("driver.salesOrder", "Sales Order"))}</h3></div>
-    <div class="item-list">
-      ${page.pageItems.map((item) => `<div class="item-row">
-        <div class="item-main-row"><strong>${escapeHtml(item.itemName || item.sku || t("driver.item", "Item"))}</strong><div class="unit-row">${unitPills(item.units)}</div></div>
-        ${item.description ? `<span class="item-description">${escapeHtml(item.description)}</span>` : ""}
-      </div>`).join("") || `<div class="item-row"><strong>${t("driver.noItemDetail", "No item detail found in local DB")}</strong></div>`}
-    </div>
-  </section>`;
-}
-
 function renderStopDetails(job) {
   if (job.stopType !== "dropoff") return renderOrders(job);
-  const itemPages = driverStopItemPages(job);
-  const totalPages = 1 + itemPages.length;
-  const key = `stop-detail:${job.jobId || job.stopId || "dropoff"}`;
-  const page = Math.min(Math.max(Number(orderPages[key] || 0), 0), totalPages - 1);
-  orderPages[key] = page;
   return `<div class="stop-detail-page">
-    ${page === 0 ? renderDeliveryInstructionPage(job) : renderDriverStopItemPage(itemPages[page - 1])}
-    <div class="order-pager stop-detail-pager">
-      <button data-action="stop-detail-page" data-order-key="${escapeHtml(key)}" data-page="${page - 1}" ${page <= 0 ? "disabled" : ""} type="button">${t("common.previous", "Previous")}</button>
-      <span>${page + 1} / ${totalPages}</span>
-      <button data-action="stop-detail-page" data-order-key="${escapeHtml(key)}" data-page="${page + 1}" ${page >= totalPages - 1 ? "disabled" : ""} type="button">${t("common.next", "Next")}</button>
-    </div>
+    ${renderDeliveryInstructionPage(job)}
+    ${renderOrders(job)}
   </div>`;
 }
 
 function renderLocationCheck(job) {
   if (!job || job.status !== "in_progress") return "";
-  const status = locationCheck?.status || "unavailable";
-  const text = localizeMessage(locationCheck?.message || t("driver.gpsNotRun", "Samsara truck GPS check has not run yet."));
+  const overridden = locationOverrideApproval.isAccepted(job);
+  const status = overridden ? "warning_overridden" : locationCheck?.status || "unavailable";
+  const text = overridden
+    ? t("driver.locationOverrideAccepted", "Location override accepted for this stop")
+    : localizeMessage(locationCheck?.message || t("driver.gpsNotRun", "Samsara truck GPS check has not run yet."));
   const detail = locationCheck?.expectedAddress
     ? `<small>${t("driver.expected", "Expected")}: ${escapeHtml(locationCheck.expectedAddress)}</small>`
     : "";
@@ -2907,14 +3263,14 @@ function renderLocationCheck(job) {
   return `
     <section class="location-check ${escapeHtml(status)}">
       <div>
-        <strong>${status === "ok" ? t("driver.locationVerified", "Location verified") : status === "not_checked_offline" ? t("driver.locationNotCheckedOffline", "Location not checked offline") : status === "warning" ? t("driver.locationWarning", "Location warning") : status === "checking" ? t("driver.checkingLocation", "Checking location") : t("driver.locationNotVerified", "Location not verified")}</strong>
+        <strong>${status === "ok" ? t("driver.locationVerified", "Location verified") : status === "warning_overridden" ? t("driver.locationOverrideAccepted", "Location override accepted for this stop") : status === "not_checked_offline" ? t("driver.locationNotCheckedOffline", "Location not checked offline") : status === "warning" ? t("driver.locationWarning", "Location warning") : status === "checking" ? t("driver.checkingLocation", "Checking location") : t("driver.locationNotVerified", "Location not verified")}</strong>
         <span>${escapeHtml(text)}</span>
         ${detail}
         ${truckDetail}
       </div>
       <div class="location-actions">
         ${status === "not_checked_offline" ? "" : `<button class="secondary compact" data-action="recheck-location" ${status === "checking" ? "disabled" : ""} type="button">${t("driver.recheck", "Recheck")}</button>`}
-        ${["warning", "unavailable"].includes(status) && !locationOverrideAccepted ? `<button class="secondary compact danger-button" data-action="override-location" type="button">${t("driver.override", "Override")}</button>` : ""}
+        ${["warning", "unavailable"].includes(status) && !overridden ? `<button class="primary compact location-override-button" data-action="override-location" type="button">${t("driver.overrideContinue", "Override & Continue")}</button>` : ""}
       </div>
     </section>
   `;
@@ -3138,6 +3494,21 @@ function renderPhotoSlots(job) {
   }
   const minimumPhotos = Math.max(2, Number(job.requiredPhotos || 0));
   while (photos.length < minimumPhotos) photos.push("");
+  const completionBlockers = [];
+  if (!locationCheckApproved()) {
+    completionBlockers.push(t(
+      "driver.locationRequiredBeforeComplete",
+      "Recheck location or choose Override & Continue before completing."
+    ));
+  }
+  const remainingPhotos = Math.max(0, minimumPhotos - photos.filter(Boolean).length);
+  if (remainingPhotos > 0) {
+    completionBlockers.push(tf(
+      "driver.requiredPhotosRemaining",
+      "Add {count} more required photo(s).",
+      { count: remainingPhotos }
+    ));
+  }
   return `
     <div class="photo-modal" role="dialog" aria-modal="true" aria-label="${tf("driver.photosRequired", "At least {count} photos required", { count: minimumPhotos })}">
       <section class="photo-panel">
@@ -3147,6 +3518,7 @@ function renderPhotoSlots(job) {
           ${renderCameraSwitchButton()}
           <button class="icon-button" data-action="close-photo" aria-label="${t("driver.closePhoto", "Close photo")}" title="${t("driver.closePhoto", "Close photo")}" type="button">X</button>
         </div>
+        ${renderLocationCheck(job)}
         <div class="photo-grid">
           ${photos.map((photo, index) => `
             <div class="photo-slot">
@@ -3168,7 +3540,8 @@ function renderPhotoSlots(job) {
           <span>${t("driver.photoRemark", "Driver remark")} <small>${t("common.optional", "Optional")}</small></span>
           <textarea data-driver-photo-remark ${routeProtectedControlAttributes()} maxlength="${DRIVER_REMARK_MAX_LENGTH}" placeholder="${t("driver.photoRemarkPlaceholder", "Add a note about this stop or the photos")}">${escapeHtml(driverRemark)}</textarea>
         </label>
-        <button class="primary" data-action="complete-job" data-job-confirm data-gps-gate="complete" ${routeProtectedControlAttributes()} data-photo-required="true" data-ready-label="${t("driver.completeStop", "Complete Stop")}" ${photos.filter(Boolean).length >= minimumPhotos && canCompleteCurrentJob(job) ? "" : "disabled"} type="button">${completeWaitSeconds(job) > 0 ? tf("driver.waitSeconds", "Wait {seconds}s", { seconds: completeWaitSeconds(job) }) : t("driver.completeStop", "Complete Stop")}</button>
+        ${completionBlockers.length ? `<div class="photo-completion-blockers" id="driverPhotoCompletionBlockers" role="status">${completionBlockers.map((message) => `<span>${escapeHtml(message)}</span>`).join("")}</div>` : ""}
+        <button class="primary" data-action="complete-job" data-job-confirm data-gps-gate="complete" ${routeProtectedControlAttributes()} data-photo-required="true" data-ready-label="${t("driver.completeStop", "Complete Stop")}" ${completionBlockers.length || !canCompleteCurrentJob(job) ? "disabled" : ""} ${completionBlockers.length ? `aria-describedby="driverPhotoCompletionBlockers"` : ""} type="button">${completeWaitSeconds(job) > 0 ? tf("driver.waitSeconds", "Wait {seconds}s", { seconds: completeWaitSeconds(job) }) : t("driver.completeStop", "Complete Stop")}</button>
       </section>
     </div>
   `;
@@ -3268,6 +3641,7 @@ function renderJob() {
     </section>
     ${activeRest ? renderRestModal() : ""}
   `);
+  if (job.stopType === "dropoff") void prepareCurrentDeliveryInstructionLanguage();
 }
 
 function renderRestModal() {
@@ -3479,7 +3853,7 @@ async function renderOfflineProjection(manifest = offlineManifest) {
   offlineManifest = manifest;
   dayState = projection.dayState;
   currentJob = projection.currentJob;
-  activeRest = projection.rest;
+  activeRest = acceptDriverRestCandidate(projection.rest);
   restSummary = projection.restSummary;
   pendingDvirEvent = projection.pendingDvirEvent || null;
   pendingDutyEvents = projection.pendingDutyEvents || [];
@@ -3488,10 +3862,9 @@ async function renderOfflineProjection(manifest = offlineManifest) {
   driverRemark = "";
   binDraft = null;
   dvirPhotos = [];
-  orderPages = {};
   photoPromptOpen = false;
   locationCheck = null;
-  locationOverrideAccepted = false;
+  locationOverrideApproval.reconcile(currentJob);
 
   const preStatus = String(dayState?.preDvirStatus || "").toLowerCase();
   const samsaraPending = !dayState?.samsaraOnDutyConfirmed || !dayState?.samsaraPreDvirConfirmed;
@@ -4267,6 +4640,7 @@ async function queueDriverEvent(eventType, {
   }
   const offlineLocation = locationCheck?.status === "not_checked_offline" || !navigator.onLine;
   const locationVerificationId = locationCheck?.verificationId || locationCheck?.locationVerificationId || locationCheck?.id || null;
+  const locationWasOverridden = locationOverrideApproval.isAccepted(job);
   let event;
   try {
     event = await window.DriverOfflineDB.queueEvent(offlinePartition.partitionKey, {
@@ -4278,13 +4652,13 @@ async function queueDriverEvent(eventType, {
       occurredAt: new Date().toISOString(),
       locationStatus: locationStatus || (offlineLocation
         ? "not_checked_offline"
-        : locationOverrideAccepted
+        : locationWasOverridden
           ? "warning_overridden"
           : locationCheck?.status === "ok"
             ? "verified"
             : "not_required"),
       locationVerificationId,
-      locationOverride: locationOverrideAccepted,
+      locationOverride: locationWasOverridden,
       initialStatus: deferSync ? "foreground_pending" : "pending",
       requiredPhotoCount,
       enforcePhotoCompletionLimit: eventType === "dvir_captured"
@@ -4382,7 +4756,7 @@ async function runForegroundTruckSwitch({ samsaraSkipped = false } = {}) {
     dayState = result.state || dayState;
     currentJob = withManifestJobIdentity(result.job);
     locationCheck = null;
-    locationOverrideAccepted = false;
+    locationOverrideApproval.reconcile(currentJob);
     renderJob();
     showToast(samsaraSkipped
       ? t("driver.samsaraSkipped", "Truck switch confirmed in MBBS. Samsara was skipped.")
@@ -4622,16 +4996,18 @@ function renderDriverHistory() {
   const previousScrollTop = historyWasVisible ? Number(app.querySelector(".driver-content")?.scrollTop || 0) : 0;
   shell(`
     <section class="history-panel">
-      <div class="history-head">
-        <div>
-          <p>${escapeHtml(driver?.name || t("stats.driver", "Driver"))}</p>
-          <h2>${t("driver.personalHistory", "Personal History")}</h2>
+      <div class="history-controls">
+        <div class="history-head">
+          <div>
+            <p>${escapeHtml(driver?.name || t("stats.driver", "Driver"))}</p>
+            <h2>${t("driver.personalHistory", "Personal History")}</h2>
+          </div>
+          <button class="secondary compact history-back-button" data-action="back-job" type="button">${t("common.back", "Back")}</button>
         </div>
-        <button class="secondary compact" data-action="back-job" type="button">${t("common.back", "Back")}</button>
-      </div>
-      <div class="history-filter">
-        <input id="driverHistoryDate" type="date" value="${escapeHtml(historyDate)}" />
-        <button class="secondary compact" data-action="refresh-history" type="button">${t("common.refresh", "Refresh")}</button>
+        <div class="history-filter">
+          <input id="driverHistoryDate" type="date" value="${escapeHtml(historyDate)}" />
+          <button class="secondary compact" data-action="refresh-history" type="button">${t("common.refresh", "Refresh")}</button>
+        </div>
       </div>
       <div class="history-list">
         ${driverHistory.map((record) => {
@@ -4668,6 +5044,12 @@ function renderDriverHistory() {
   `);
   const historyScroller = app.querySelector(".driver-content");
   if (historyScroller) historyScroller.scrollTop = previousScrollTop;
+}
+
+function renderCachedDriverWorkView() {
+  activeView = "job";
+  if (!currentJob && ["pre", "post"].includes(dvirMode)) return renderDvir(dvirMode);
+  return renderJob();
 }
 
 async function loadNextJob() {
@@ -4728,17 +5110,16 @@ async function loadNextJob() {
     }
     if (routeRefreshWasSuperseded(loadEpoch)) return;
     currentJob = withManifestJobIdentity(result.job, result.routeBootstrap);
-    activeRest = result.rest || null;
+    activeRest = acceptDriverRestCandidate(result.rest);
     restSummary = result.restSummary || null;
     photos = [];
     driverRemark = "";
     binDraft = null;
     dvirMode = "";
     dvirPhotos = [];
-    orderPages = {};
     photoPromptOpen = false;
     locationCheck = null;
-    locationOverrideAccepted = false;
+    locationOverrideApproval.reconcile(currentJob);
     if (driverUsesSamsaraWorkflow() && dayState?.truckPlate && (dayState.preDvirStatus !== "complete" || !dayState.samsaraOnDutyConfirmed || !dayState.samsaraPreDvirConfirmed)) {
       currentJob = null;
       const message = dayState.preDvirStatus === "complete" && (!dayState.samsaraOnDutyConfirmed || !dayState.samsaraPreDvirConfirmed)
@@ -4816,7 +5197,9 @@ function eventTargetsCurrentDeliveryInstruction(event = {}) {
 async function refreshCurrentDeliveryInstructions(event) {
   if (!eventTargetsCurrentDeliveryInstruction(event) || !navigator.onLine) return false;
   const jobId = String(currentJob?.jobId || "");
-  const result = await request(`/api/driver/jobs/${encodeURIComponent(jobId)}/delivery-instructions`);
+  const path = new URL(`/api/driver/jobs/${encodeURIComponent(jobId)}/delivery-instructions`, window.location.origin);
+  path.searchParams.set("language", driverInstructionLanguage());
+  const result = await request(`${path.pathname}${path.search}`);
   if (!currentJob || String(currentJob.jobId || "") !== jobId) return false;
   currentJob = {
     ...currentJob,
@@ -5062,11 +5445,9 @@ app.addEventListener("click", async (event) => {
     }
   }
   if (action === "back-job") {
-    try {
-      await loadNextJob();
-    } catch (error) {
-      showToast(error.message);
-    }
+    renderCachedDriverWorkView();
+    void loadNextJob().catch((error) => showToast(error.message));
+    return;
   }
   if (action === "refresh-history") {
     historyDate = document.getElementById("driverHistoryDate")?.value || historyDate;
@@ -5085,14 +5466,6 @@ app.addEventListener("click", async (event) => {
     openPhotoLightbox(button.dataset.photoRef, button.dataset.photoLabel || t("driver.historyPhoto", "History photo"));
     return;
   }
-  if (action === "order-page") {
-    orderPages[button.dataset.orderKey] = Number(button.dataset.page || 0);
-    return renderJob();
-  }
-  if (action === "stop-detail-page") {
-    orderPages[button.dataset.orderKey] = Number(button.dataset.page || 0);
-    return renderJob();
-  }
   if (action === "show-photo") {
     const photoJob = currentJob;
     if (!(await ensureAuthoritativeJobBeforeAction(photoJob))) return;
@@ -5110,7 +5483,10 @@ app.addEventListener("click", async (event) => {
     return;
   }
   if (action === "override-location") {
-    locationOverrideAccepted = true;
+    const overrideJob = currentJob;
+    if (!(await ensureAuthoritativeJobBeforeAction(overrideJob))) return;
+    if (!currentJob || String(currentJob.jobId || "") !== String(overrideJob?.jobId || "")) return renderJob();
+    locationOverrideApproval.accept(currentJob);
     showToast(t("driver.locationOverrideAccepted", "Location override accepted for this stop"));
     return renderJob();
   }
@@ -5140,7 +5516,7 @@ app.addEventListener("click", async (event) => {
         method: "POST",
         body: JSON.stringify({})
       });
-      activeRest = result.rest;
+      activeRest = acceptDriverRestCandidate(result.rest);
       restSummary = result.restSummary || restSummary;
       currentJob = withManifestJobIdentity(result.job) || currentJob;
       showToast(t("driver.restStarted", "Rest started"));
@@ -5151,6 +5527,7 @@ app.addEventListener("click", async (event) => {
     }
   }
   if (action === "end-rest") {
+    const endingRest = activeRest;
     button.disabled = true;
     button.textContent = t("driver.endingRest", "Ending rest...");
     if (!(await prepareOfflineRecord())) return renderRest();
@@ -5163,6 +5540,7 @@ app.addEventListener("click", async (event) => {
             startedAt: activeRest?.startedAt || null
           }
         });
+        markDriverRestEnded(endingRest);
         showToast(t("driver.restEnded", "Rest ended"));
         void flushDeferredLiveRefresh();
         void flushQueuedOnlineRouteRevalidation();
@@ -5177,7 +5555,7 @@ app.addEventListener("click", async (event) => {
         method: "POST",
         body: JSON.stringify({})
       });
-      activeRest = null;
+      markDriverRestEnded(result.rest || endingRest);
       restSummary = result.restSummary || restSummary;
       currentJob = withManifestJobIdentity(result.job) || currentJob;
       showToast(t("driver.restEnded", "Rest ended"));
@@ -5399,6 +5777,11 @@ app.addEventListener("click", async (event) => {
     }
   }
   if (action === "start-job" && currentJob) {
+    const planExecution = driverPlanExecutionDecision(currentJob.planDate);
+    if (!planExecution.allowed) {
+      showToast(planExecution.message);
+      return renderJob();
+    }
     if (activeRest) {
       showToast(t("driver.endRestBeforeStart", "End rest time before starting the next job."));
       return renderRest();
@@ -5420,7 +5803,7 @@ app.addEventListener("click", async (event) => {
             deferSync: false
           });
           locationCheck = null;
-          locationOverrideAccepted = false;
+          locationOverrideApproval.clear();
           renderJob();
           showToast(t("driver.binJobStarted", "BIN stop saved on this device"));
           if (navigator.onLine) checkCurrentJobLocation().catch((error) => showToast(error.message));
@@ -5449,7 +5832,7 @@ app.addEventListener("click", async (event) => {
           currentJob = withManifestJobIdentity(result.job) || currentJob;
         }
         locationCheck = null;
-        locationOverrideAccepted = false;
+        locationOverrideApproval.clear();
         renderJob();
         showToast(
           currentJob?.dependencyWarnings?.[0]?.message
@@ -5505,7 +5888,7 @@ app.addEventListener("click", async (event) => {
         dayState = result.state || dayState;
         currentJob = withManifestJobIdentity(result.job) || currentJob;
         locationCheck = null;
-        locationOverrideAccepted = false;
+        locationOverrideApproval.clear();
         renderJob();
         showToast(t("driver.binJobStartedOnline", "BIN stop started online"));
         checkCurrentJobLocation().catch((error) => showToast(error.message));
@@ -5522,13 +5905,13 @@ app.addEventListener("click", async (event) => {
       });
       currentJob = withManifestJobIdentity(result.job);
       locationCheck = null;
-      locationOverrideAccepted = false;
+      locationOverrideApproval.clear();
       renderJob();
       showToast(result.dependencyWarnings?.[0]?.message || t("driver.jobStarted", "Job started"));
       checkCurrentJobLocation().catch((error) => showToast(error.message));
     } catch (error) {
       if (error.data?.rest) {
-        activeRest = error.data.rest;
+        activeRest = acceptDriverRestCandidate(error.data.rest);
         showToast(error.message);
         return renderRest();
       }
@@ -5566,7 +5949,7 @@ app.addEventListener("click", async (event) => {
       dayState = result.state || dayState;
       currentJob = withManifestJobIdentity(result.job);
       locationCheck = null;
-      locationOverrideAccepted = false;
+      locationOverrideApproval.clear();
       renderJob();
       showToast(t("driver.switchConfirmed", "Truck switch confirmed"));
     } catch (error) {
@@ -5615,7 +5998,7 @@ app.addEventListener("click", async (event) => {
       dayState = result.state || dayState;
       currentJob = withManifestJobIdentity(result.job);
       locationCheck = null;
-      locationOverrideAccepted = false;
+      locationOverrideApproval.clear();
       renderJob();
       showToast(t("driver.samsaraSkipped", "Truck switch confirmed in MBBS. Samsara was skipped."));
     } catch (error) {
@@ -5679,10 +6062,9 @@ app.addEventListener("click", async (event) => {
         binDraft = null;
         void clearDriverRemarkDraft(submittedRemarkDraftKey).catch(() => {});
         void clearDriverBinDraft(submittedBinDraftKey).catch(() => {});
-        orderPages = {};
         photoPromptOpen = false;
         locationCheck = null;
-        locationOverrideAccepted = false;
+        locationOverrideApproval.clear();
         renderJob();
         showToast(t("driver.stopSaved", "Stop saved"));
         return;
@@ -5729,10 +6111,9 @@ app.addEventListener("click", async (event) => {
         photos = [];
         driverRemark = "";
         binDraft = null;
-        orderPages = {};
         photoPromptOpen = false;
         locationCheck = null;
-        locationOverrideAccepted = false;
+        locationOverrideApproval.clear();
         renderJob();
         showToast(t("driver.binStopCompletedOnline", "BIN stop completed online"));
       } catch (error) {
@@ -5762,22 +6143,21 @@ app.addEventListener("click", async (event) => {
         body: JSON.stringify({
           photoDataUrls: uploadedPhotos,
           driverRemark: submittedDriverRemark,
-          locationOverride: locationOverrideAccepted,
+          locationOverride: locationOverrideApproval.isAccepted(completedJob),
           autoStartNext: true
         })
       });
       await clearLegacyDraftPhotos(submittedJobPhotos);
       currentJob = withManifestJobIdentity(result.nextJob);
-      activeRest = result.rest || null;
+      activeRest = acceptDriverRestCandidate(result.rest);
       restSummary = result.restSummary || restSummary;
       photos = [];
       driverRemark = "";
       void clearDriverRemarkDraft(submittedRemarkDraftKey).catch(() => {});
-      orderPages = {};
       photoPromptOpen = false;
       const shouldCheckNext = currentJob?.status === "in_progress";
       locationCheck = null;
-      locationOverrideAccepted = false;
+      locationOverrideApproval.clear();
       if (activeRest) {
         showToast(t("driver.restStarted", "Rest started"));
         return renderRest();
@@ -5987,6 +6367,7 @@ app.addEventListener("submit", async (event) => {
       await loadNextJob();
     }
     scheduleOnlineRouteRevalidation(1000);
+    void refreshDriverRouteChangeState({ visible: true });
     if (initialSyncResult?.error) showToast(initialSyncResult.error.message);
     else if (initialSyncResult?.retainedError) showToast(initialSyncResult.retainedError.message);
     else if (initialSyncResult?.reviewRequired) showToast(t("driver.syncReviewRequired", "Synchronization needs Dispatch review."));
@@ -6121,6 +6502,7 @@ async function init() {
     }
     preparedSyncToken = null;
     scheduleOnlineRouteRevalidation(1000);
+    void refreshDriverRouteChangeState({ visible: true });
   } catch (error) {
     if (driverPwaUpdateRequired || error.code === "DRIVER_PWA_UPDATE_REQUIRED" || error.status === 426) {
       endQuietSync(preparedSyncToken);
@@ -6154,7 +6536,8 @@ window.addEventListener("mbbs-language-changed", () => {
   if (activeView === "history") return renderDriverHistory();
   if (dvirMode) return renderDvir(dvirMode);
   if (activeRest) return renderRest();
-  return renderJob();
+  renderJob();
+  void prepareCurrentDeliveryInstructionLanguage({ force: true, announce: true });
 });
 
 offlineStatus?.addEventListener("click", async (event) => {
@@ -6169,6 +6552,23 @@ offlineStatus?.addEventListener("click", async (event) => {
   if (button.dataset.offlineAction === "persist") return requestPersistentStorage({ userInitiated: true });
   if (button.dataset.offlineAction === "repair-cache") return repairDriverAppCache(button);
   if (button.dataset.offlineAction === "clear") return clearSavedRouteCache();
+});
+
+routeChangeStatus?.addEventListener("click", async (event) => {
+  const button = event.target.closest("button");
+  if (!button || button.disabled) return;
+  if (button.dataset.action === "refresh-driver-route-change") {
+    button.disabled = true;
+    await refreshDriverRouteChangeState({ visible: true });
+    return;
+  }
+  if (button.dataset.action === "enable-driver-route-alerts") {
+    await enableDriverRouteAlerts(button);
+    return;
+  }
+  if (button.dataset.action === "acknowledge-driver-route-change") {
+    await acknowledgeDriverRouteChangeRequest(button.dataset.routeRequestId || "", button);
+  }
 });
 
 async function resumeOnlineDriver(source, { synchronizeProtectedScreen = false } = {}) {
@@ -6190,7 +6590,8 @@ async function resumeOnlineDriver(source, { synchronizeProtectedScreen = false }
 }
 
 window.addEventListener("online", () => {
-  void resumeOnlineDriver("online", { synchronizeProtectedScreen: true });
+  void resumeOnlineDriver("online", { synchronizeProtectedScreen: true })
+    .then(() => refreshDriverRouteChangeState({ visible: document.visibilityState === "visible" }));
 });
 
 window.addEventListener("offline", () => {
@@ -6199,10 +6600,12 @@ window.addEventListener("offline", () => {
   renderOfflineStatus();
   applyDriverActionProtectionGate();
   void refreshOfflineHealth();
+  renderDriverRouteChangeStatus();
 });
 
 window.addEventListener("pagehide", () => {
   if (!navigator.onLine) markDriverBrowserOffline();
+  else void sendDriverRoutePresence({ visible: false, keepalive: true });
 });
 
 window.addEventListener("storage", (event) => {
@@ -6229,9 +6632,27 @@ window.addEventListener("pageshow", () => {
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") {
     void recoverStaleForegroundEvents();
-    if (navigator.onLine) void resumeOnlineDriver("visibility");
+    if (navigator.onLine) {
+      void resumeOnlineDriver("visibility")
+        .then(() => refreshDriverRouteChangeState({ visible: true }));
+    }
+  } else if (navigator.onLine) {
+    void sendDriverRoutePresence({ visible: false, keepalive: true });
   }
+  renderDriverRouteChangeStatus();
 });
+
+window.setInterval(() => {
+  if (
+    navigator.onLine
+    && document.visibilityState === "visible"
+    && driver
+    && authToken
+    && !driverPwaUpdateRequired
+  ) {
+    void refreshDriverRouteChangeState({ visible: true });
+  }
+}, DRIVER_ROUTE_PRESENCE_INTERVAL_MS);
 
 window.setInterval(() => {
   void recoverStaleForegroundEvents();
@@ -6284,7 +6705,7 @@ if ("serviceWorker" in navigator) {
     window.setTimeout(requestDriverWorkerVersion, 0);
     window.setTimeout(publishDriverOfflineMode, 0);
   });
-  navigator.serviceWorker.register("/driver-service-worker.js?v=20260812-driver-pwa-v3", {
+  navigator.serviceWorker.register("/driver-service-worker.js?v=20260819-driver-route-readiness-v1", {
     scope: "/driver",
     updateViaCache: "none"
   })

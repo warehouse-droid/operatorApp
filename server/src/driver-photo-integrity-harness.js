@@ -165,7 +165,7 @@ const abcBlob = new Blob([new TextEncoder().encode("abc")], { type: "image/jpeg"
   );
 }
 
-const recoveryAssetVersion = "20260812-driver-pwa-v3";
+const recoveryAssetVersion = "20260819-driver-route-readiness-v1";
 const htmlHashIndex = driverHtml.indexOf(`/driver-photo-hash.js?v=${recoveryAssetVersion}`);
 const htmlPhotosIndex = driverHtml.indexOf(`/driver-offline-photos.js?v=${recoveryAssetVersion}`);
 const htmlSyncIndex = driverHtml.indexOf(`/driver-offline-sync.js?v=${recoveryAssetVersion}`);
@@ -175,12 +175,12 @@ assert.ok(
 );
 assert.match(
   driverWorker,
-  /importScripts\("\/driver-photo-hash\.js\?v=20260812-driver-pwa-v3"\);[\s\S]*importScripts\("\/driver-offline-sync\.js\?v=20260812-driver-pwa-v3"\);/,
+  /importScripts\("\/driver-photo-hash\.js\?v=20260819-driver-route-readiness-v1"\);[\s\S]*importScripts\("\/driver-offline-sync\.js\?v=20260819-driver-route-readiness-v1"\);/,
   "Background sync must import the shared hasher before sync code."
 );
 assert.match(
   driverWorker,
-  /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v28`/,
+  /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v37`/,
   "The recovery shell must use a new cache generation."
 );
 for (const asset of ["driver-photo-hash.js", "driver-offline-photos.js", "driver-offline-sync.js"]) {

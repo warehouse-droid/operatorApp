@@ -610,6 +610,70 @@ function renderInventoryMatrix() {
   `;
 }
 
+function depIsPalletItem(item = {}) {
+  return [item.sku, item.itemName, item.item_name]
+    .some((value) => String(value || "").trim().toUpperCase() === "PALLET");
+}
+
+function depProposalSourceAvailability(proposal = {}) {
+  const requestedByItem = new Map();
+  const addRequested = (itemId, itemName, quantity) => {
+    const key = String(itemId || "");
+    const requested = depNumber(quantity);
+    if (!key || requested <= 0) return;
+    const current = requestedByItem.get(key) || { itemId, itemName: itemName || key, requestedQuantity: 0 };
+    current.requestedQuantity += requested;
+    requestedByItem.set(key, current);
+  };
+  for (const line of proposal.lines || []) {
+    if (depIsPalletItem(line)) continue;
+    addRequested(line.itemId, line.itemName || line.sku, line.proposedQuantity);
+  }
+  if (depNumber(proposal.palletTransferQuantity) > 0) {
+    addRequested(proposal.palletItemId, proposal.palletItemName || "PALLET", proposal.palletTransferQuantity);
+  }
+  const inventoryByItem = new Map((dependencyState.inventory?.items || [])
+    .map((item) => [String(item.itemId), item]));
+  return [...requestedByItem.values()].map((request) => {
+    const inventory = inventoryByItem.get(String(request.itemId));
+    const balance = (inventory?.balances || []).find((entry) =>
+      String(entry.locationId) === String(proposal.fromLocationId));
+    const availableQuantity = balance
+      ? depNumber(balance.effectiveAvailable ?? balance.quantityAvailable)
+      : null;
+    return {
+      ...request,
+      availableQuantity,
+      backorderQuantity: availableQuantity === null
+        ? null
+        : Math.max(0, request.requestedQuantity - availableQuantity)
+    };
+  });
+}
+
+function renderProposalSourceBackorder(proposal, { editable = false } = {}) {
+  const availability = depProposalSourceAvailability(proposal);
+  const shortages = availability.filter((entry) => depNumber(entry.backorderQuantity) > 0);
+  const unresolved = availability.filter((entry) => entry.availableQuantity === null);
+  const enabled = proposal.allowSourceBackorder === true;
+  const shortageText = shortages.map((entry) =>
+    `${depEscape(entry.itemName)}: ${depQty(entry.requestedQuantity)} requested − ${depQty(entry.availableQuantity)} available = ${depQty(entry.backorderQuantity)} backorder`
+  ).join("; ");
+  const detail = shortageText
+    ? `${enabled ? "Authorized current source shortfall" : "Current source shortfall blocks creation"}: ${shortageText}.`
+    : unresolved.length
+      ? `Current availability is not loaded for ${unresolved.map((entry) => depEscape(entry.itemName)).join(", ")}; creation will perform the authoritative check.`
+      : enabled
+        ? "Current quantities fit source Available; the authorization remains effective if availability drops before creation."
+        : "Creation remains protected by current NetSuite Available quantity.";
+  return `
+    <label class="scm-dependency-source-backorder ${enabled ? "enabled" : ""}">
+      <input data-proposal-field="allowSourceBackorder" type="checkbox" ${enabled ? "checked" : ""}
+        ${editable ? "" : "disabled"} />
+      <span><strong>Allow source stock backorder</strong><small>${detail}</small></span>
+    </label>`;
+}
+
 function renderProposal(proposal) {
   const mergeSelectable = proposal.creationStatus === "draft";
   const mergeSelected = dependencyState.selectedProposalIds.has(Number(proposal.id));
@@ -654,6 +718,7 @@ function renderProposal(proposal) {
         <div><span>Route score</span><strong>${proposal.routeScore === null ? "Fallback" : `${depQty(proposal.routeScore)} min`}</strong></div>
       </div>
       <label class="scm-dependency-memo"><span>Memo</span><input data-proposal-field="memo" value="${depEscape(proposal.memo || "")}" ${draftEditable && !controlsBusy ? "" : "disabled"} /></label>
+      ${renderProposalSourceBackorder(proposal, { editable: draftEditable && !controlsBusy })}
       <div class="scm-dependency-proposal-lines">
         ${proposal.lines.map((line, lineIndex) => {
           const conversions = depProposalConversions(line);
@@ -855,7 +920,8 @@ async function loadDependencyCandidates({ preserveSelection = true, refreshInven
     && String(previousSelected.salesOrderId) === String(nextSelected.salesOrderId)
     && previousSelected.shortageSignature
     && nextSelected.shortageSignature
-    && previousSelected.shortageSignature !== nextSelected.shortageSignature;
+    && previousSelected.shortageSignature !== nextSelected.shortageSignature
+    && nextSelected.completionType !== "reviewed_no_transfer";
   if (shortageChanged) {
     clearDependencyProposalSelection();
     dependencyState.batch = null;
@@ -923,6 +989,7 @@ function collectDependencyProposalPayload(card) {
     fromLocationId: Number(card.querySelector('[data-proposal-field="fromLocationId"]')?.value),
     toLocationId: Number(card.querySelector('[data-proposal-field="toLocationId"]')?.value),
     memo: card.querySelector('[data-proposal-field="memo"]')?.value,
+    allowSourceBackorder: card.querySelector('[data-proposal-field="allowSourceBackorder"]')?.checked === true,
     palletTransferQuantity: (() => {
       if (card.dataset.palletOverridden !== "true") return undefined;
       const value = card.querySelector('[data-proposal-field="palletTransferQuantity"]')?.value;

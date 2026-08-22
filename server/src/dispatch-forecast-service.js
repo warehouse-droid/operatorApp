@@ -108,6 +108,11 @@ function recordStartedEpoch(record = {}) {
   return epochValue(recordValue(record, "started_at", "startedAt"));
 }
 
+function recordActualArrivalEpoch(record = {}) {
+  return epochValue(recordValue(record, "actual_arrival_at", "actualArrivalAt"))
+    ?? recordStartedEpoch(record);
+}
+
 function recordCompletedEpoch(record = {}) {
   return epochValue(recordValue(record, "completed_at", "completedAt"));
 }
@@ -210,12 +215,22 @@ function recordForStop(records = [], assignment = {}, load = {}, stop = {}) {
 function physicalVisitActuals(visit = {}, records = [], assignment = {}, load = {}) {
   const matched = visit.entries.map((entry) => recordForStop(records, assignment, load, entry.stop));
   const active = matched.filter((record) => ["in_progress", "complete"].includes(recordStatus(record)));
-  const starts = active.map(recordStartedEpoch).filter(Number.isFinite);
+  const starts = active.map(recordActualArrivalEpoch).filter(Number.isFinite);
   const allComplete = matched.length > 0 && matched.every((record) => recordStatus(record) === "complete");
   const completions = allComplete ? matched.map(recordCompletedEpoch).filter(Number.isFinite) : [];
+  const derived = active.find((record) => recordValue(record, "actual_arrival_at", "actualArrivalAt"));
   return {
     actualStart: starts.length ? Math.min(...starts) : null,
     actualEnd: allComplete && completions.length === matched.length ? Math.max(...completions) : null,
+    actualArrivalSource: derived
+      ? text(recordValue(derived, "actual_arrival_source", "actualArrivalSource")) || "derived"
+      : active.length ? "pwa_started_at" : "",
+    actualArrivalConfidence: derived
+      ? text(recordValue(derived, "actual_arrival_confidence", "actualArrivalConfidence"))
+      : active.length ? "explicit" : "",
+    actualArrivalAlgorithmVersion: derived
+      ? text(recordValue(derived, "actual_arrival_algorithm_version", "actualArrivalAlgorithmVersion"))
+      : "",
     status: allComplete && completions.length === matched.length
       ? "complete"
       : active.length ? "in_progress" : "pending"
@@ -358,11 +373,16 @@ function travelInterval({
   ordinal = 0
 }) {
   const actualStart = explicitRecord ? recordStartedEpoch(explicitRecord) : inferredStart;
-  const actualEnd = explicitRecord ? recordCompletedEpoch(explicitRecord) : inferredEnd;
+  const destinationArrivalApplied = Number.isFinite(inferredEnd);
+  const actualEnd = destinationArrivalApplied
+    ? inferredEnd
+    : explicitRecord ? recordCompletedEpoch(explicitRecord) : inferredEnd;
   const explicitStatus = explicitRecord ? recordStatus(explicitRecord) : "";
-  const status = explicitRecord
-    ? (explicitStatus || (actualEnd ? "complete" : actualStart ? "in_progress" : "pending"))
-    : actualEnd ? "complete" : actualStart ? "in_progress" : "pending";
+  const status = destinationArrivalApplied
+    ? "complete"
+    : explicitRecord
+      ? (explicitStatus || (actualEnd ? "complete" : actualStart ? "in_progress" : "pending"))
+      : actualEnd ? "complete" : actualStart ? "in_progress" : "pending";
   const jobId = expectedJob?.jobId || null;
   return {
     internalId: `travel:${jobId || `${loadId}:${kind}:${ordinal}`}`,
@@ -378,7 +398,9 @@ function travelInterval({
     status,
     expectedJob,
     jobId,
-    source: explicitRecord ? "explicit" : "inferred"
+    source: destinationArrivalApplied
+      ? "destination_stop_arrival"
+      : explicitRecord ? "explicit" : "inferred"
   };
 }
 
@@ -461,6 +483,7 @@ function buildLaneTravelRows(plan, laneEntries, visits, records, laneKey) {
           plannedEndMinute: (firstVisit.plannedStart - dispatchTorontoMinuteEpoch(plan.planDate, 0)) / MINUTE_MS,
           expectedJob: job,
           explicitRecord: explicitRecordForJob(records, job),
+          inferredEnd: firstVisit.actualStart,
           ordinal: ordinal++
         }));
       }
@@ -728,6 +751,9 @@ function publicStop(row) {
     forecastLeave: isoValue(row.forecastEnd),
     actualArrival: isoValue(row.actualStart),
     actualLeave: isoValue(row.actualEnd),
+    actualArrivalSource: row.actualArrivalSource || "",
+    actualArrivalConfidence: row.actualArrivalConfidence || "",
+    actualArrivalAlgorithmVersion: row.actualArrivalAlgorithmVersion || "",
     status: row.status,
     basis: row.basis
   };

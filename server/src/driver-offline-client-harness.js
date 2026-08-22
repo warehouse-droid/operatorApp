@@ -392,7 +392,7 @@ assert.match(
   /isGenuineNetworkFailure\(error\) && await loadCachedRoute\(\)/,
   "A genuine outage must retain the authenticated Driver session and fall back to its cached route."
 );
-const unitPillsSource = actionSection("function unitPills", "function orderKey");
+const unitPillsSource = actionSection("function unitPills", "function renderOrders");
 assert.match(
   unitPillsSource,
   /unit\?\.unit \|\| unit\?\.label \|\| unit\?\.uom \|\| t\("driver\.uom", "UOM"\)/,
@@ -1300,16 +1300,17 @@ for (const asset of [
   "driver-offline-photos.js",
   "driver-offline-sync.js",
   "driver-bin-ui.js",
+  "driver-location-override.js",
   "driver.js"
 ]) {
-  assert.ok(driverHtml.includes(`/${asset}?v=20260812-driver-pwa-v3`));
-  assert.ok(driverWorker.includes(`/${asset}?v=20260812-driver-pwa-v3`));
+  assert.ok(driverHtml.includes(`/${asset}?v=20260819-driver-route-readiness-v1`));
+  assert.ok(driverWorker.includes(`/${asset}?v=20260819-driver-route-readiness-v1`));
 }
-assert.match(driverWorker, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v28`/);
-assert.match(driverWorker, /DRIVER_REFRESH_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}refresh-v28`/);
+assert.match(driverWorker, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v37`/);
+assert.match(driverWorker, /DRIVER_REFRESH_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}refresh-v37`/);
 assert.match(
   driverSource,
-  /serviceWorker\.register\("\/driver-service-worker\.js\?v=20260812-driver-pwa-v3"/
+  /serviceWorker\.register\("\/driver-service-worker\.js\?v=20260819-driver-route-readiness-v1"/
 );
 assert.match(
   offlineSyncSource,

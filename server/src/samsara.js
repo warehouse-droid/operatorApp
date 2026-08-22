@@ -3,6 +3,7 @@ import { config } from "./config.js";
 
 const SAMSARA_BASE_URL = "https://api.samsara.com";
 const SAMSARA_GET_TIMEOUT_MS = 5_000;
+const SAMSARA_HISTORY_BUDGET_MS = 10_000;
 const SAMSARA_LOCATION_VEHICLE_CACHE_TTL_MS = 60_000;
 
 const locationVehicleRosterCache = {
@@ -21,7 +22,12 @@ function requireSamsaraToken() {
   return token;
 }
 
-async function samsaraRequest(path, { method = "GET", body = null, includeMeta = false } = {}) {
+async function samsaraRequest(path, {
+  method = "GET",
+  body = null,
+  includeMeta = false,
+  timeoutMs = SAMSARA_GET_TIMEOUT_MS
+} = {}) {
   const normalizedMethod = String(method || "GET").toUpperCase();
   if (normalizedMethod !== "GET" && !config.samsara?.writesEnabled) {
     const error = new Error("Samsara writes are disabled on this application.");
@@ -29,9 +35,13 @@ async function samsaraRequest(path, { method = "GET", body = null, includeMeta =
     throw error;
   }
   const token = requireSamsaraToken();
+  const effectiveTimeoutMs = Math.min(
+    SAMSARA_GET_TIMEOUT_MS,
+    Math.max(50, Number(timeoutMs) || SAMSARA_GET_TIMEOUT_MS)
+  );
   const timeoutController = normalizedMethod === "GET" ? new AbortController() : null;
   const timeoutId = timeoutController
-    ? setTimeout(() => timeoutController.abort(), SAMSARA_GET_TIMEOUT_MS)
+    ? setTimeout(() => timeoutController.abort(), effectiveTimeoutMs)
     : null;
   timeoutId?.unref?.();
   let response;
@@ -50,10 +60,10 @@ async function samsaraRequest(path, { method = "GET", body = null, includeMeta =
   } catch (error) {
     if (timeoutController?.signal.aborted) {
       const timeoutError = new Error(
-        `Samsara GET request timed out after ${Math.round(SAMSARA_GET_TIMEOUT_MS / 1000)} seconds.`
+        `Samsara GET request timed out after ${Math.ceil(effectiveTimeoutMs / 1000)} seconds.`
       );
       timeoutError.code = "SAMSARA_REQUEST_TIMEOUT";
-      timeoutError.timeoutMs = SAMSARA_GET_TIMEOUT_MS;
+      timeoutError.timeoutMs = effectiveTimeoutMs;
       timeoutError.cause = error;
       throw timeoutError;
     }
@@ -120,8 +130,103 @@ async function listSamsaraLocationVehicles() {
 export async function findSamsaraVehicleByPlate(plate) {
   const needle = String(plate || "").replace(/\s+/g, "").toUpperCase();
   if (!needle) throw new Error("Truck plate is required.");
-  const vehicles = await listSamsaraVehicles();
+  const vehicles = await listSamsaraLocationVehicles();
   return vehicles.find((vehicle) => String(vehicle.licensePlate || "").replace(/\s+/g, "").toUpperCase() === needle) || null;
+}
+
+function historyGpsPoints(payload = {}, vehicleId = "") {
+  const rows = Array.isArray(payload?.data) ? payload.data : [];
+  const points = [];
+  for (const row of rows) {
+    const rowVehicleId = String(row?.id || row?.vehicle?.id || vehicleId || "");
+    const gps = Array.isArray(row?.gps)
+      ? row.gps
+      : Array.isArray(row?.data?.gps)
+        ? row.data.gps
+        : [];
+    for (const item of gps) {
+      points.push({
+        ...item,
+        vehicleId: rowVehicleId,
+        vehicleName: row?.name || row?.vehicle?.name || ""
+      });
+    }
+  }
+  return points;
+}
+
+/**
+ * Read bounded vehicle GPS history. Every underlying request retains the
+ * module's five-second timeout, allowing the arrival resolver to cap a
+ * two-window lookup at ten seconds.
+ */
+export async function listSamsaraVehicleGpsHistory({
+  vehicleId,
+  startTime,
+  endTime,
+  deadlineAt = Date.now() + SAMSARA_HISTORY_BUDGET_MS
+} = {}) {
+  if (!vehicleId) throw new Error("Samsara vehicle ID is required for GPS history.");
+  if (!startTime || !endTime) throw new Error("GPS history start and end times are required.");
+  const deadline = Number(deadlineAt);
+  if (!Number.isFinite(deadline)) throw new Error("A valid GPS history deadline is required.");
+  const points = [];
+  let after = "";
+  let requestCount = 0;
+  let truncated = false;
+  const startedAt = Date.now();
+  do {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 50) {
+      truncated = true;
+      break;
+    }
+    const params = new URLSearchParams({
+      vehicleIds: String(vehicleId),
+      types: "gps",
+      startTime: new Date(startTime).toISOString(),
+      endTime: new Date(endTime).toISOString()
+    });
+    if (after) params.set("after", after);
+    const payload = await samsaraRequest(`/fleet/vehicles/stats/history?${params.toString()}`, {
+      timeoutMs: Math.min(SAMSARA_GET_TIMEOUT_MS, remainingMs)
+    });
+    requestCount += 1;
+    points.push(...historyGpsPoints(payload, String(vehicleId)));
+    after = payload.pagination?.hasNextPage ? payload.pagination?.endCursor || "" : "";
+  } while (after);
+  return {
+    points,
+    requestCount,
+    durationMs: Date.now() - startedAt,
+    truncated
+  };
+}
+
+/** Legacy trips are only a compact search hint; GPS remains authoritative. */
+export async function listSamsaraVehicleTrips({ vehicleId, startTime, endTime } = {}) {
+  if (!vehicleId) throw new Error("Samsara vehicle ID is required for trip history.");
+  const startMs = new Date(startTime).getTime();
+  const endMs = new Date(endTime).getTime();
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
+    throw new Error("A valid trip-history time window is required.");
+  }
+  const params = new URLSearchParams({
+    vehicleId: String(vehicleId),
+    startMs: String(Math.round(startMs)),
+    endMs: String(Math.round(endMs))
+  });
+  const startedAt = Date.now();
+  const payload = await samsaraRequest(`/v1/fleet/trips?${params.toString()}`);
+  return {
+    trips: Array.isArray(payload?.trips)
+      ? payload.trips
+      : Array.isArray(payload?.data)
+        ? payload.data
+        : [],
+    requestCount: 1,
+    durationMs: Date.now() - startedAt
+  };
 }
 
 function normalizedPlate(value) {

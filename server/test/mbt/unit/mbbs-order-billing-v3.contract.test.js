@@ -51,6 +51,7 @@ test("calculation rows expose auditable relationship evidence and exactly two sy
   assert.match(html, /Origin/u);
   assert.match(html, /Destination/u);
   assert.match(html, /Relationship and calculation/u);
+  assert.match(html, /Pricing method/u);
   assert.match(html, /Adjustment \(CAD\)/u);
   assert.match(html, /Final charge \(CAD\)/u);
   assert.match(script, /data-mbbs-adjustment/u);
@@ -63,6 +64,12 @@ test("calculation rows expose auditable relationship evidence and exactly two sy
   assert.match(script, /selectedMbbsBatchResultIds/u);
   assert.match(script, /manual_required/u);
   assert.match(script, /formatDistanceKm/u);
+  assert.match(script, /data-mbbs-pricing-method/u);
+  assert.match(script, /pricingSelections/u);
+  assert.match(script, /pricingMethod:\s*state\.pricingSelections\.get\(candidateId\)/u);
+  assert.match(script, /vendor_yard_flat/u);
+  assert.match(script, /distance_band/u);
+  assert.match(script, /selectedVendorRouteRate/u);
   assert.match(script, /\.format\(metres \/ 1000\)\} km/u);
   assert.doesNotMatch(script, /toLocaleString\(["']en-CA["']\)\}\s*m/u);
 });

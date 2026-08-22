@@ -148,9 +148,12 @@ async function ensureFrontdeskItemPricing() {
  * fixture never creates a quote, contract, visit, billing case, outbox row, or
  * record in an established SCM/Dispatch/Driver/Operator domain.
  *
- * @param {{label?: string}} [options]
+ * @param {{label?: string, rateEffectiveFrom?: string | Date | null}} [options]
  */
-export async function createFrontdeskPrerequisites({ label = "fixture" } = {}) {
+export async function createFrontdeskPrerequisites({
+  label = "fixture",
+  rateEffectiveFrom = null
+} = {}) {
   await ensureFrontdeskItemPricing();
   const runId = crypto.randomUUID();
   const suffix = compact(runId);
@@ -334,10 +337,10 @@ export async function createFrontdeskPrerequisites({ label = "fixture" } = {}) {
   );
   await query(
     `UPDATE mbt_rate_card_versions
-        SET status = 'active', effective_from = now(), activated_at = now(),
+        SET status = 'active', effective_from = COALESCE($2::timestamptz, now()), activated_at = now(),
             revision = revision + 1, updated_by = 'p3-frontdesk-test'
       WHERE rate_card_version_id = $1`,
-    [rateCardVersionId]
+    [rateCardVersionId, rateEffectiveFrom]
   );
 
   return {

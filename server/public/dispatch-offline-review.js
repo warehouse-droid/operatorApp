@@ -3,6 +3,7 @@ const offlineReviewT = (key, fallback) => window.MBBS_I18N?.t?.(key, fallback) |
 const OFFLINE_REVIEW_COUNT_ENDPOINT = "/api/dispatch/offline-review/count";
 const OFFLINE_REVIEW_LIST_ENDPOINT = "/api/dispatch/offline-review";
 const DRIVER_PWA_STOPS_ENDPOINT = "/api/dispatch/driver-pwa/stops";
+const HISTORICAL_ASSIST_ENDPOINT = "/api/dispatch/driver-pwa/historical-assist";
 const DRIVER_OFFLINE_OPEN_STATUSES = new Set([
   "registered",
   "waiting_photos",
@@ -23,6 +24,13 @@ let driverPwaStopsLoading = false;
 let driverPwaReopening = false;
 let driverPwaStopsError = "";
 let driverPwaStopsRequest = 0;
+let historicalAssistDate = driverPwaPastTorontoDate();
+let historicalAssistPayload = { routes: [], count: 0 };
+let historicalAssistLoading = false;
+let historicalAssistSubmittingJobId = "";
+let historicalAssistPhotoBusyJobId = "";
+let historicalAssistError = "";
+let historicalAssistRequest = 0;
 let offlineReviewFilter = "open";
 let offlineReviewCases = [];
 let offlineReviewClientSyncIssues = [];
@@ -47,6 +55,7 @@ const offlineReviewRetryAttempts = new Map();
 const offlineReviewDeviceDismissDrafts = new Map();
 const driverPwaReopenDrafts = new Map();
 const driverPwaReopenAttempts = new Map();
+const historicalAssistDrafts = new Map();
 
 function driverPwaTorontoDate() {
   try {
@@ -64,6 +73,13 @@ function driverPwaTorontoDate() {
   const local = new Date();
   const offset = local.getTimezoneOffset() * 60000;
   return new Date(local.getTime() - offset).toISOString().slice(0, 10);
+}
+
+function driverPwaPastTorontoDate() {
+  const today = driverPwaTorontoDate();
+  const date = new Date(`${today}T12:00:00.000Z`);
+  date.setUTCDate(date.getUTCDate() - 1);
+  return date.toISOString().slice(0, 10);
 }
 
 function offlineReviewEscape(value) {
@@ -413,6 +429,314 @@ async function offlineReviewApi(path, options = {}) {
     throw error;
   }
   return payload;
+}
+
+function historicalAssistRoutes() {
+  return offlineReviewArray(offlineReviewObject(historicalAssistPayload).routes);
+}
+
+function historicalAssistVisits() {
+  return historicalAssistRoutes().flatMap((route) => offlineReviewArray(route.visits));
+}
+
+function historicalAssistVisit(jobId) {
+  return historicalAssistVisits().find((visit) => String(visit.jobId || "") === String(jobId || "")) || null;
+}
+
+function historicalAssistNewUuid() {
+  if (window.crypto?.randomUUID) return window.crypto.randomUUID();
+  const bytes = new Uint8Array(16);
+  window.crypto?.getRandomValues?.(bytes);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = [...bytes].map((value) => value.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function historicalAssistDraft(jobId) {
+  const key = String(jobId || "");
+  if (!historicalAssistDrafts.has(key)) {
+    historicalAssistDrafts.set(key, {
+      requestId: historicalAssistNewUuid(),
+      arrivalTime: "",
+      arrivalOffset: "",
+      completionTime: "",
+      completionOffset: "",
+      reason: "",
+      confirmed: false,
+      photos: []
+    });
+  }
+  return historicalAssistDrafts.get(key);
+}
+
+function historicalAssistCaptureDraft(form) {
+  if (!form) return;
+  const jobId = String(form.dataset.jobId || "");
+  if (!jobId) return;
+  const draft = historicalAssistDraft(jobId);
+  draft.arrivalTime = String(form.elements.arrivalTime?.value || draft.arrivalTime || "");
+  draft.arrivalOffset = String(form.elements.arrivalOffset?.value || draft.arrivalOffset || "");
+  draft.completionTime = String(form.elements.completionTime?.value || draft.completionTime || "");
+  draft.completionOffset = String(form.elements.completionOffset?.value || draft.completionOffset || "");
+  draft.reason = String(form.elements.reason?.value || "");
+  draft.confirmed = Boolean(form.elements.confirmCompletion?.checked);
+}
+
+function historicalAssistCaptureVisibleDrafts() {
+  offlineReviewApp.querySelectorAll("[data-form='historical-assist-complete']")
+    .forEach((form) => historicalAssistCaptureDraft(form));
+}
+
+function historicalAssistTorontoTimeChoices(localTimeValue) {
+  const match = String(localTimeValue || "").match(/^(\d{2}):(\d{2})(?::(\d{2}))?$/);
+  if (!match || !/^\d{4}-\d{2}-\d{2}$/.test(historicalAssistDate)) return [];
+  const localTime = `${match[1]}:${match[2]}:${match[3] || "00"}`;
+  const [year, month, day] = historicalAssistDate.split("-").map(Number);
+  const [hour, minute, second] = localTime.split(":").map(Number);
+  const localEpoch = Date.UTC(year, month - 1, day, hour, minute, second);
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Toronto",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+    timeZoneName: "short"
+  });
+  return [-240, -300].map((offsetMinutes) => {
+    const instant = new Date(localEpoch - offsetMinutes * 60_000);
+    const parts = Object.fromEntries(formatter.formatToParts(instant).map((part) => [part.type, part.value]));
+    const date = `${parts.year}-${parts.month}-${parts.day}`;
+    const time = `${parts.hour}:${parts.minute}:${parts.second}`;
+    return date === historicalAssistDate && time === localTime
+      ? {
+          offset: offsetMinutes === -240 ? "-04:00" : "-05:00",
+          abbreviation: String(parts.timeZoneName || (offsetMinutes === -240 ? "EDT" : "EST"))
+        }
+      : null;
+  }).filter(Boolean);
+}
+
+function historicalAssistTimePayload(localTime, selectedOffset, label) {
+  const choices = historicalAssistTorontoTimeChoices(localTime);
+  if (!choices.length) throw new Error(`${label} does not exist in Toronto on this plan date.`);
+  if (choices.length > 1 && !choices.some((choice) => choice.offset === selectedOffset)) {
+    throw new Error(`Choose EDT or EST for the repeated ${label.toLowerCase()}.`);
+  }
+  return { localTime, offset: selectedOffset || choices[0].offset };
+}
+
+function historicalAssistReleaseDraft(jobId) {
+  const draft = historicalAssistDrafts.get(String(jobId || ""));
+  for (const photo of draft?.photos || []) {
+    if (String(photo.objectUrl || "").startsWith("blob:")) URL.revokeObjectURL(photo.objectUrl);
+  }
+  historicalAssistDrafts.delete(String(jobId || ""));
+}
+
+async function historicalAssistLoad({ quiet = false } = {}) {
+  const requestId = ++historicalAssistRequest;
+  historicalAssistLoading = true;
+  historicalAssistError = "";
+  if (!quiet) offlineReviewRender();
+  try {
+    const query = new URLSearchParams({ planDate: historicalAssistDate });
+    const payload = await offlineReviewApi(`${HISTORICAL_ASSIST_ENDPOINT}?${query}`);
+    if (requestId !== historicalAssistRequest) return;
+    historicalAssistPayload = payload;
+  } catch (error) {
+    if (requestId !== historicalAssistRequest) return;
+    historicalAssistError = error.message;
+    historicalAssistPayload = { routes: [], count: 0 };
+  } finally {
+    if (requestId !== historicalAssistRequest) return;
+    historicalAssistLoading = false;
+    offlineReviewRender();
+  }
+}
+
+async function historicalAssistAddPhotos(input) {
+  const form = input.closest("[data-form='historical-assist-complete']");
+  const jobId = String(form?.dataset.jobId || "");
+  const draft = historicalAssistDraft(jobId);
+  const files = [...(input.files || [])];
+  input.value = "";
+  if (!jobId || !files.length) return;
+  if (draft.photos.length + files.length > 20) {
+    offlineReviewNotice = { message: "A historical stop can contain at most 20 photos.", tone: "error" };
+    offlineReviewRender();
+    return;
+  }
+  historicalAssistCaptureDraft(form);
+  historicalAssistPhotoBusyJobId = jobId;
+  offlineReviewNotice = { message: `Preparing ${files.length} photo${files.length === 1 ? "" : "s"}…`, tone: "" };
+  offlineReviewRender();
+  try {
+    for (const file of files) {
+      const compressed = await window.DriverOfflinePhotos.compress(file);
+      draft.photos.push({
+        photoId: historicalAssistNewUuid(),
+        ordinal: draft.photos.length + 1,
+        mimeType: "image/jpeg",
+        byteSize: compressed.byteSize,
+        sha256: compressed.sha256,
+        blob: compressed.blob,
+        objectUrl: URL.createObjectURL(compressed.blob),
+        objectReference: ""
+      });
+    }
+    offlineReviewNotice = { message: "Photos are prepared in memory. They will upload only after confirmation.", tone: "success" };
+  } catch (error) {
+    offlineReviewNotice = { message: `Photo preparation failed: ${error.message}`, tone: "error" };
+  } finally {
+    historicalAssistPhotoBusyJobId = "";
+    offlineReviewRender();
+  }
+}
+
+async function historicalAssistMapConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  async function run() {
+    while (cursor < items.length) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await worker(items[index], index);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, run));
+  return results;
+}
+
+async function historicalAssistUploadPhoto(photo, ticket) {
+  const formData = new FormData();
+  formData.append("file", new File([photo.blob], `historical-stop-${photo.ordinal}.jpg`, {
+    type: "image/jpeg"
+  }));
+  const response = await fetch(ticket.upload.uploadUrl, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${ticket.upload.token}` },
+    body: formData
+  });
+  const text = await response.text();
+  let payload = null;
+  try {
+    payload = text ? JSON.parse(text) : null;
+  } catch {
+    payload = null;
+  }
+  if (!response.ok) throw new Error(payload?.error || text || "Photo upload failed.");
+  if (!payload?.key) throw new Error("Photo upload did not return an object key.");
+  photo.objectReference = `r2://${payload.key}`;
+  return photo.objectReference;
+}
+
+async function historicalAssistSubmit(form) {
+  historicalAssistCaptureDraft(form);
+  const jobId = String(form.dataset.jobId || "");
+  const visit = historicalAssistVisit(jobId);
+  const draft = historicalAssistDraft(jobId);
+  if (!visit?.actionable) {
+    offlineReviewNotice = { message: "This stop is no longer actionable. Refresh the historical route.", tone: "error" };
+    offlineReviewRender();
+    return;
+  }
+  if (!String(draft.reason || "").trim()) {
+    offlineReviewNotice = { message: "Enter the mandatory completion reason.", tone: "error" };
+    offlineReviewRender();
+    offlineReviewApp.querySelector(`[data-job-id="${CSS.escape(jobId)}"] textarea[name="reason"]`)?.focus();
+    return;
+  }
+  if (!draft.confirmed) {
+    offlineReviewNotice = { message: "Confirm the stop, times, and evidence before completing it.", tone: "error" };
+    offlineReviewRender();
+    return;
+  }
+  if (draft.photos.length < Number(visit.requiredPhotos || 0)) {
+    offlineReviewNotice = { message: `${visit.requiredPhotos} photo${visit.requiredPhotos === 1 ? " is" : "s are"} required.`, tone: "error" };
+    offlineReviewRender();
+    return;
+  }
+
+  let arrival = null;
+  let completion;
+  try {
+    if (!visit.startedAt) arrival = historicalAssistTimePayload(draft.arrivalTime, draft.arrivalOffset, "Arrival time");
+    completion = historicalAssistTimePayload(draft.completionTime, draft.completionOffset, "Completion time");
+  } catch (error) {
+    offlineReviewNotice = { message: error.message, tone: "error" };
+    offlineReviewRender();
+    return;
+  }
+
+  historicalAssistSubmittingJobId = jobId;
+  offlineReviewNotice = { message: "Uploading evidence with two concurrent transfers…", tone: "" };
+  offlineReviewRender();
+  try {
+    const pending = draft.photos.filter((photo) => !photo.objectReference);
+    if (pending.length) {
+      const ticketPayload = await offlineReviewApi(`${HISTORICAL_ASSIST_ENDPOINT}/${encodeURIComponent(jobId)}/photo-tickets`, {
+        method: "POST",
+        body: JSON.stringify({
+          planDate: historicalAssistDate,
+          expectedStateHash: visit.stateHash,
+          requestId: draft.requestId,
+          photos: pending.map((photo) => ({
+            photoId: photo.photoId,
+            ordinal: photo.ordinal,
+            byteSize: photo.byteSize,
+            sha256: photo.sha256,
+            mimeType: photo.mimeType
+          }))
+        })
+      });
+      const ticketById = new Map(offlineReviewArray(ticketPayload.tickets).map((ticket) => [ticket.photoId, ticket]));
+      await historicalAssistMapConcurrency(pending, 2, (photo) => {
+        const ticket = ticketById.get(photo.photoId);
+        if (!ticket) throw new Error("The server did not issue every requested photo ticket.");
+        return historicalAssistUploadPhoto(photo, ticket);
+      });
+    }
+    offlineReviewNotice = { message: "Evidence uploaded. Revalidating the confirmed plan and completing operational effects…", tone: "" };
+    offlineReviewRender();
+    const result = await offlineReviewApi(`${HISTORICAL_ASSIST_ENDPOINT}/${encodeURIComponent(jobId)}/complete`, {
+      method: "POST",
+      body: JSON.stringify({
+        planDate: historicalAssistDate,
+        expectedStateHash: visit.stateHash,
+        requestId: draft.requestId,
+        reason: String(draft.reason).trim(),
+        arrival,
+        completion,
+        photos: draft.photos.map((photo) => ({
+          photoId: photo.photoId,
+          ordinal: photo.ordinal,
+          byteSize: photo.byteSize,
+          sha256: photo.sha256,
+          mimeType: photo.mimeType,
+          objectReference: photo.objectReference
+        }))
+      })
+    });
+    historicalAssistReleaseDraft(jobId);
+    offlineReviewNotice = {
+      message: `Completed ${offlineReviewDisplayValue(visit.orderRefs)} for ${visit.driverName || visit.driverLogin}. ${result.exactReplay ? "The prior result was returned safely." : "The next physical visit is now eligible."}`,
+      tone: "success"
+    };
+    await historicalAssistLoad({ quiet: true });
+  } catch (error) {
+    offlineReviewNotice = {
+      message: `${error.status === 409 ? "The route or evidence changed" : "Historical completion failed"}: ${error.message}. Prepared photos remain on this screen for retry.`,
+      tone: "error"
+    };
+    if (error.status === 409) await historicalAssistLoad({ quiet: true });
+  } finally {
+    historicalAssistSubmittingJobId = "";
+    offlineReviewRender();
+  }
 }
 
 function offlineReviewExtractCases(payload) {
@@ -1468,6 +1792,178 @@ function offlineReviewRenderSyncSurface() {
   `;
 }
 
+function historicalAssistOffsetField(name, localTime, selectedOffset) {
+  const choices = historicalAssistTorontoTimeChoices(localTime);
+  if (choices.length <= 1) {
+    return `<input type="hidden" name="${offlineReviewEscape(name)}" value="${offlineReviewEscape(choices[0]?.offset || "")}" />`;
+  }
+  return `
+    <label class="offline-review-field historical-assist-offset">
+      <span>Repeated time</span>
+      <select name="${offlineReviewEscape(name)}" required>
+        <option value="">Choose EDT or EST</option>
+        ${choices.map((choice) => `<option value="${offlineReviewEscape(choice.offset)}" ${choice.offset === selectedOffset ? "selected" : ""}>${offlineReviewEscape(choice.abbreviation)} (${offlineReviewEscape(choice.offset)})</option>`).join("")}
+      </select>
+    </label>
+  `;
+}
+
+function historicalAssistPhotoGrid(jobId, draft) {
+  if (!draft.photos.length) return `<p class="historical-assist-photo-empty">No photos prepared.</p>`;
+  return `
+    <div class="historical-assist-photo-grid" aria-label="Prepared completion photos">
+      ${draft.photos.map((photo, index) => `
+        <figure>
+          <img src="${offlineReviewEscape(photo.objectUrl)}" alt="Prepared stop evidence ${index + 1}" />
+          <figcaption>
+            <span>${offlineReviewEscape(offlineReviewFormatBytes(photo.byteSize))}${photo.objectReference ? " · uploaded" : " · in memory"}</span>
+            <button data-action="remove-historical-photo" data-job-id="${offlineReviewEscape(jobId)}" data-photo-id="${offlineReviewEscape(photo.photoId)}" type="button" ${historicalAssistSubmittingJobId === jobId ? "disabled" : ""}>Remove</button>
+          </figcaption>
+        </figure>
+      `).join("")}
+    </div>
+  `;
+}
+
+function historicalAssistCompletionForm(visit) {
+  const jobId = String(visit.jobId || "");
+  const draft = historicalAssistDraft(jobId);
+  const busy = historicalAssistSubmittingJobId === jobId || historicalAssistPhotoBusyJobId === jobId;
+  return `
+    <form class="historical-assist-form" data-form="historical-assist-complete" data-job-id="${offlineReviewEscape(jobId)}">
+      <div class="historical-assist-time-grid">
+        ${visit.startedAt ? `
+          <div class="offline-review-field historical-assist-stored-time">
+            <span>Recorded arrival (preserved)</span>
+            <strong>${offlineReviewEscape(offlineReviewFormatDateTime(visit.startedAt))}</strong>
+          </div>
+        ` : `
+          <label class="offline-review-field">
+            <span>Arrival time · Toronto</span>
+            <input name="arrivalTime" type="time" step="1" value="${offlineReviewEscape(draft.arrivalTime)}" required />
+          </label>
+          ${historicalAssistOffsetField("arrivalOffset", draft.arrivalTime, draft.arrivalOffset)}
+        `}
+        <label class="offline-review-field">
+          <span>Completion time · Toronto</span>
+          <input name="completionTime" type="time" step="1" value="${offlineReviewEscape(draft.completionTime)}" required />
+        </label>
+        ${historicalAssistOffsetField("completionOffset", draft.completionTime, draft.completionOffset)}
+      </div>
+      <div class="historical-assist-chronology">
+        <span>Previous completed: ${offlineReviewEscape(offlineReviewFormatDateTime(visit.previousCompletedAt))}</span>
+        <span>Next completed begins: ${offlineReviewEscape(offlineReviewFormatDateTime(visit.nextStartedAt || visit.nextCompletedAt))}</span>
+        <span>Minimum visit duration: 10 seconds</span>
+      </div>
+      <label class="offline-review-field historical-assist-reason">
+        <span>Mandatory reason</span>
+        <textarea name="reason" maxlength="2000" required placeholder="Explain why Dispatch is completing this historical Driver stop.">${offlineReviewEscape(draft.reason)}</textarea>
+      </label>
+      <section class="historical-assist-photos">
+        <div class="historical-assist-section-head">
+          <div>
+            <strong>Photo evidence</strong>
+            <span>${visit.requiredPhotos} required · ${draft.photos.length}/20 prepared · uploads run two at a time</span>
+          </div>
+          <label class="historical-assist-photo-picker">
+            <span>${historicalAssistPhotoBusyJobId === jobId ? "Preparing…" : "Add camera/gallery photos"}</span>
+            <input data-action="historical-assist-photos" type="file" accept="image/*" capture="environment" multiple ${busy ? "disabled" : ""} />
+          </label>
+        </div>
+        ${historicalAssistPhotoGrid(jobId, draft)}
+      </section>
+      <label class="offline-review-evidence-confirm">
+        <input name="confirmCompletion" type="checkbox" required ${draft.confirmed ? "checked" : ""} />
+        <span>I verified the assigned driver, physical stop, order references, Toronto times, and retained evidence.</span>
+      </label>
+      <div class="offline-review-resolution-actions">
+        <span class="offline-review-resolution-help">No GPS check, Samsara action, rest, DVIR, truck switch, or automatic next-stop start will be performed.</span>
+        <button class="historical-assist-submit" type="submit" ${busy ? "disabled" : ""}>${historicalAssistSubmittingJobId === jobId ? "Completing…" : "Complete physical visit"}</button>
+      </div>
+    </form>
+  `;
+}
+
+function historicalAssistVisitCard(visit, index) {
+  const blockers = offlineReviewArray(visit.blockers);
+  const warnings = offlineReviewArray(visit.warnings);
+  return `
+    <article class="historical-assist-visit ${visit.actionable ? "actionable" : "blocked"}">
+      <header>
+        <div>
+          <span class="historical-assist-sequence">Physical visit ${index + 1}</span>
+          <h3>${offlineReviewEscape(offlineReviewEventLabel(visit.stopType))} · ${offlineReviewEscape(offlineReviewDisplayValue(visit.location || visit.address))}</h3>
+          <p>${offlineReviewEscape(offlineReviewDisplayValue(visit.orderRefs))}</p>
+        </div>
+        <span class="offline-review-pill ${visit.actionable ? "resolved" : "blocked"}">${visit.actionable ? "Next eligible" : "Blocked"}</span>
+      </header>
+      <div class="offline-review-summary-grid">
+        ${offlineReviewSummaryItem("Load", visit.loadName || visit.loadId)}
+        ${offlineReviewSummaryItem("Truck", visit.truckPlate)}
+        ${offlineReviewSummaryItem("Status", visit.status === "in_progress" ? "Started" : "Never started")}
+        ${offlineReviewSummaryItem("Photos required", visit.requiredPhotos)}
+        ${offlineReviewSummaryItem("Physical job IDs", visit.jobIds)}
+        ${offlineReviewSummaryItem("Consolidated visit", visit.consolidatedPhysicalVisit ? "Yes" : "No")}
+      </div>
+      ${blockers.length ? `
+        <div class="historical-assist-blockers" role="alert">
+          ${blockers.map((blocker) => `<p><strong>${offlineReviewEscape(blocker.code || "Blocked")}</strong> · ${offlineReviewEscape(blocker.message || blocker)}</p>`).join("")}
+        </div>
+      ` : ""}
+      ${warnings.length ? `<div class="historical-assist-warnings">${warnings.map((warning) => `<p>${offlineReviewEscape(warning)}</p>`).join("")}</div>` : ""}
+      ${visit.actionable ? historicalAssistCompletionForm(visit) : ""}
+    </article>
+  `;
+}
+
+function historicalAssistRenderPanel() {
+  if (historicalAssistLoading && !historicalAssistRoutes().length) {
+    return `<div class="offline-review-empty">Loading the confirmed historical routes…</div>`;
+  }
+  if (historicalAssistError) {
+    return `<div class="offline-review-empty error" role="alert">${offlineReviewEscape(historicalAssistError)}</div>`;
+  }
+  if (!historicalAssistRoutes().length) {
+    return `<div class="offline-review-empty">No incomplete physical visits were found in the current confirmed plan for ${offlineReviewEscape(offlineReviewFormatPlanDate(historicalAssistDate))}.</div>`;
+  }
+  return historicalAssistRoutes().map((route) => `
+    <section class="historical-assist-route">
+      <div class="historical-assist-route-head">
+        <div>
+          <h2>${offlineReviewEscape(route.driverName || route.driverLogin)}</h2>
+          <p>${offlineReviewEscape(route.driverLogin)} · ${offlineReviewArray(route.visits).length} incomplete physical visit${offlineReviewArray(route.visits).length === 1 ? "" : "s"}</p>
+        </div>
+      </div>
+      <div class="historical-assist-visits">
+        ${offlineReviewArray(route.visits).map(historicalAssistVisitCard).join("")}
+      </div>
+    </section>
+  `).join("");
+}
+
+function historicalAssistRenderSurface() {
+  const yesterday = driverPwaPastTorontoDate();
+  return `
+    <div class="offline-review-toolbar historical-assist-toolbar">
+      <label class="driver-pwa-date-filter" for="historicalAssistDate">
+        <span>Past plan date</span>
+        <input id="historicalAssistDate" data-action="historical-assist-date" type="date" max="${offlineReviewEscape(yesterday)}" value="${offlineReviewEscape(historicalAssistDate)}" />
+      </label>
+      <div class="offline-review-notice ${offlineReviewEscape(offlineReviewNotice.tone)}" aria-live="polite">${offlineReviewEscape(offlineReviewNotice.message)}</div>
+      <div class="offline-review-toolbar-actions">
+        <button data-action="refresh-historical-assist" type="button" ${historicalAssistLoading ? "disabled" : ""}>${historicalAssistLoading ? "Refreshing…" : "Refresh routes"}</button>
+      </div>
+    </div>
+    <section id="historicalAssistPanel" class="historical-assist-panel" aria-label="Historical Driver stop completion">
+      <div class="historical-assist-safety" role="note">
+        <strong>Past confirmed routes only</strong>
+        <span>Only the earliest incomplete physical visit for each driver can be completed. Sync conflicts must be resolved in Sync Review first.</span>
+      </div>
+      ${historicalAssistRenderPanel()}
+    </section>
+  `;
+}
+
 function offlineReviewRender() {
   if (!offlineReviewOperator) return;
   const operatorName = offlineReviewOperator.display_name || offlineReviewOperator.username || "";
@@ -1488,8 +1984,13 @@ function offlineReviewRender() {
       <div class="driver-pwa-tabs" role="tablist" aria-label="Driver PWA tools">
         <button class="driver-pwa-tab ${driverPwaSurface === "stops" ? "active" : ""}" data-action="set-surface" data-surface="stops" role="tab" aria-selected="${driverPwaSurface === "stops" ? "true" : "false"}" type="button">Driver stops</button>
         <button class="driver-pwa-tab ${driverPwaSurface === "sync-review" ? "active" : ""}" data-action="set-surface" data-surface="sync-review" role="tab" aria-selected="${driverPwaSurface === "sync-review" ? "true" : "false"}" type="button">Sync review</button>
+        <button class="driver-pwa-tab ${driverPwaSurface === "historical-assist" ? "active" : ""}" data-action="set-surface" data-surface="historical-assist" data-driver-pwa-surface="historical-assist" role="tab" aria-selected="${driverPwaSurface === "historical-assist" ? "true" : "false"}" type="button">Historical completion</button>
       </div>
-      ${driverPwaSurface === "stops" ? driverPwaRenderStopsSurface() : offlineReviewRenderSyncSurface()}
+      ${driverPwaSurface === "stops"
+        ? driverPwaRenderStopsSurface()
+        : driverPwaSurface === "historical-assist"
+          ? historicalAssistRenderSurface()
+          : offlineReviewRenderSyncSurface()}
     </section>
   `;
 }
@@ -1933,7 +2434,9 @@ function offlineReviewConnectEvents() {
     offlineReviewEventTimer = window.setTimeout(() => {
       const refresh = driverPwaSurface === "stops"
         ? driverPwaLoadStops({ keepSelection: true, quiet: true })
-        : offlineReviewLoadList({ keepSelection: true, quiet: true });
+        : driverPwaSurface === "historical-assist"
+          ? historicalAssistLoad({ quiet: true })
+          : offlineReviewLoadList({ keepSelection: true, quiet: true });
       refresh.catch(() => {});
     }, 400);
   });
@@ -1953,17 +2456,37 @@ offlineReviewApp.addEventListener("click", (event) => {
   }
   if (action === "set-surface") {
     const surface = String(button.dataset.surface || "");
-    if (!['stops', 'sync-review'].includes(surface) || surface === driverPwaSurface) return;
+    if (!["stops", "sync-review", "historical-assist"].includes(surface) || surface === driverPwaSurface) return;
     driverPwaCaptureStopDraft();
     offlineReviewCaptureDraft();
+    historicalAssistCaptureVisibleDrafts();
     driverPwaSurface = surface;
     offlineReviewNotice = { message: "", tone: "" };
     offlineReviewRender();
     if (surface === "stops") {
       driverPwaLoadStops({ keepSelection: true });
+    } else if (surface === "historical-assist") {
+      historicalAssistLoad();
     } else {
       offlineReviewLoadList({ keepSelection: true });
     }
+    return;
+  }
+  if (action === "refresh-historical-assist") {
+    historicalAssistCaptureVisibleDrafts();
+    historicalAssistLoad({ quiet: false });
+    return;
+  }
+  if (action === "remove-historical-photo") {
+    const jobId = String(button.dataset.jobId || "");
+    const photoId = String(button.dataset.photoId || "");
+    const draft = historicalAssistDraft(jobId);
+    const photo = draft.photos.find((candidate) => candidate.photoId === photoId);
+    if (String(photo?.objectUrl || "").startsWith("blob:")) URL.revokeObjectURL(photo.objectUrl);
+    draft.photos = draft.photos.filter((candidate) => candidate.photoId !== photoId)
+      .map((candidate, index) => ({ ...candidate, ordinal: index + 1 }));
+    offlineReviewNotice = { message: "Prepared photo removed.", tone: "" };
+    offlineReviewRender();
     return;
   }
   if (action === "refresh-stops") {
@@ -2047,6 +2570,27 @@ offlineReviewApp.addEventListener("click", (event) => {
 });
 
 offlineReviewApp.addEventListener("change", (event) => {
+  if (event.target.matches("input[data-action='historical-assist-date']")) {
+    const date = String(event.target.value || "");
+    const maximum = driverPwaPastTorontoDate();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || date > maximum || date === historicalAssistDate) return;
+    historicalAssistCaptureVisibleDrafts();
+    historicalAssistDate = date;
+    historicalAssistPayload = { routes: [], count: 0 };
+    offlineReviewNotice = { message: "", tone: "" };
+    historicalAssistLoad();
+    return;
+  }
+  if (event.target.matches("input[data-action='historical-assist-photos']")) {
+    historicalAssistAddPhotos(event.target);
+    return;
+  }
+  if (event.target.closest("[data-form='historical-assist-complete']")) {
+    const form = event.target.closest("[data-form='historical-assist-complete']");
+    historicalAssistCaptureDraft(form);
+    if (["arrivalTime", "completionTime"].includes(event.target.name)) offlineReviewRender();
+    return;
+  }
   if (event.target.matches("input[data-action='stops-date']")) {
     const date = String(event.target.value || "");
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || date === driverPwaStopsDate) return;
@@ -2077,6 +2621,10 @@ offlineReviewApp.addEventListener("change", (event) => {
 });
 
 offlineReviewApp.addEventListener("input", (event) => {
+  if (event.target.closest("[data-form='historical-assist-complete']")) {
+    historicalAssistCaptureDraft(event.target.closest("[data-form='historical-assist-complete']"));
+    return;
+  }
   if (event.target.closest("[data-form='driver-pwa-reopen']")) {
     driverPwaCaptureStopDraft();
     return;
@@ -2090,6 +2638,14 @@ offlineReviewApp.addEventListener("input", (event) => {
 });
 
 offlineReviewApp.addEventListener("submit", (event) => {
+  if (event.target.matches("[data-form='historical-assist-complete']")) {
+    event.preventDefault();
+    const jobId = String(event.target.dataset.jobId || "");
+    if (!historicalAssistSubmittingJobId && historicalAssistPhotoBusyJobId !== jobId) {
+      historicalAssistSubmit(event.target);
+    }
+    return;
+  }
   if (event.target.matches("[data-form='device-sync-dismiss']")) {
     event.preventDefault();
     if (!offlineReviewDismissingDeviceSessionId) offlineReviewDismissDeviceIssue(event.target);
@@ -2119,6 +2675,7 @@ window.addEventListener("keydown", (event) => {
 window.addEventListener("mbbs-language-changed", () => {
   driverPwaCaptureStopDraft();
   offlineReviewCaptureDraft();
+  historicalAssistCaptureVisibleDrafts();
   offlineReviewRender();
 });
 
@@ -2126,6 +2683,7 @@ window.addEventListener("beforeunload", () => {
   offlineReviewEventSource?.close();
   offlineReviewClosePhoto();
   window.clearTimeout(offlineReviewEventTimer);
+  for (const jobId of historicalAssistDrafts.keys()) historicalAssistReleaseDraft(jobId);
 });
 
 requireDispatchLogin({

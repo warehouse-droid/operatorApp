@@ -317,7 +317,7 @@ function renderScmStockRequests() {
     <section class="stock-request-page">
       <div class="stock-request-tabs" role="tablist" aria-label="Stock request type">
         <button aria-selected="true" type="button">Regular</button>
-        <button disabled title="Special purchasing will be added later" type="button">Special — Coming soon</button>
+        <button data-scm-stock-action="special" type="button">Special</button>
       </div>
       <div class="stock-request-toolbar">
         <div class="stock-request-tabs" role="tablist" aria-label="Regular stock request queue">
@@ -517,6 +517,7 @@ scmStockRequestApp.addEventListener("click", async (event) => {
   if (!button || scmStockState.busy) return;
   const action = button.dataset.scmStockAction;
   try {
+    if (action === "special") return window.MBBSSCMSpecialStock?.open({ operator: scmStockState.operator });
     if (action === "queue") {
       scmStockState.queue = button.dataset.queue;
       localStorage.setItem("mbbs.scm.stockRequests.queue", scmStockState.queue);

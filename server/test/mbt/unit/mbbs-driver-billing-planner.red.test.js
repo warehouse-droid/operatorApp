@@ -414,7 +414,69 @@ test("one consolidated physical visit is collapsed and split PO refs retain one 
   assert.equal(units[0].dropCount, 1);
 });
 
-test("billing identities and totals do not change when Dispatch splits the same work across loads", () => {
+test("M10 distinct immutable Driver loads remain four PO legs when labels and endpoints repeat", () => {
+  const origin = "2977 Cedar Creek Rd RR#1, Ayr, ON N0B 1E0";
+  const destination = "12441 Woodbine Avenue, Whitchurch-Stouffville, ON";
+  const fixtures = [
+    { loadId: "T6-L1786569400789-713ae3bd4d7ac", loadName: "Load 1", reference: "SN1398117" },
+    { loadId: "T7-L1786569390888-ac035c0dfc2d9", loadName: "Load 1", reference: "SN1397703" },
+    { loadId: "T6-L1786569407485-66778aa62a759", loadName: "Load 3", reference: "SN1397953" },
+    { loadId: "T7-L1786636494104-6f3fc19d18064", loadName: "Load 3", reference: "SN1397952" }
+  ];
+  const units = planDriverBillingUnits({
+    planId: "233",
+    planDate: "2026-08-13",
+    loads: fixtures.map((fixture) => ({
+      loadId: fixture.loadId,
+      loadName: fixture.loadName,
+      completedAt: COMPLETED_AT,
+      records: [
+        record({
+          id: `${fixture.loadId}-pickup`,
+          stopType: "pickup",
+          address: origin,
+          orderRefs: [fixture.reference],
+          orders: [order(fixture.reference, "PURCHASE_ORDER", "receiving")]
+        }),
+        record({
+          id: `${fixture.loadId}-dropoff`,
+          stopType: "dropoff",
+          address: destination,
+          orderRefs: [fixture.reference],
+          orders: [order(fixture.reference, "PURCHASE_ORDER", "receiving")]
+        })
+      ]
+    })),
+    canonicalOrders: fixtures.map((fixture) => canonical(
+      "PO",
+      fixture.reference,
+      origin,
+      destination
+    ))
+  });
+
+  assert.equal(units.length, 4);
+  const byReference = new Map(units.map((unit) => [unit.references[0]?.rootReference, unit]));
+  let totalMinor = 0;
+  for (const fixture of fixtures) {
+    const unit = byReference.get(fixture.reference);
+    assert.ok(unit);
+    assert.equal(unit.billingRule, "po_shared_leg");
+    assert.deepEqual(unit.driverLoadIds, [fixture.loadId]);
+    assert.deepEqual(unit.driverLoadNumbers, [fixture.loadName]);
+    assert.deepEqual(unit.routeStops.map((stop) => stop.addressText), [origin, destination]);
+    const amountMinor = calculateBillingUnitAmountWithPolicy({
+      billingRule: unit.billingRule,
+      distanceBandAmountMinor: 55_000,
+      dropCount: unit.dropCount
+    }).calculatedAmountMinor;
+    assert.equal(amountMinor, 55_000);
+    totalMinor += amountMinor;
+  }
+  assert.equal(totalMinor, 220_000);
+});
+
+test("ordinary PO references on two immutable Driver loads are two billable legs", () => {
   const pickupOrders = [order("PO-REF-A", "PURCHASE_ORDER"), order("PO-REF-B", "PURCHASE_ORDER")];
   const canonicalOrders = [
     canonical("PO", "PO-REF-A", "Common Vendor Yard", "MBBS Yard"),
@@ -459,28 +521,68 @@ test("billing identities and totals do not change when Dispatch splits the same 
     ],
     canonicalOrders
   });
-  const billableShape = (units) => units.map((unit) => ({
-    unitKey: unit.unitKey,
-    billingRule: unit.billingRule,
-    references: unit.references,
-    routeStops: unit.routeStops,
-    dropCount: unit.dropCount
-  }));
-  assert.deepEqual(billableShape(twoLoads), billableShape(oneLoad));
+  assert.equal(oneLoad.length, 1);
+  assert.equal(twoLoads.length, 2);
   assert.deepEqual(oneLoad[0].driverLoadNumbers, ["Load 1"]);
-  assert.deepEqual(twoLoads[0].driverLoadNumbers, ["Load 1", "Load 2"]);
+  assert.deepEqual(
+    twoLoads.map((unit) => unit.driverLoadIds[0]).sort(),
+    ["SPLIT-A", "SPLIT-B"]
+  );
+  assert.deepEqual(
+    twoLoads.flatMap((unit) => unit.references.map((reference) => reference.rootReference)).sort(),
+    ["PO-REF-A", "PO-REF-B"]
+  );
+  assert.equal(new Set(twoLoads.map((unit) => unit.unitKey)).size, 2);
 
   const oneLoadAmount = calculateBillingUnitAmountWithPolicy({
     billingRule: oneLoad[0].billingRule,
     distanceBandAmountMinor: 25_000,
     dropCount: oneLoad[0].dropCount
   });
-  const twoLoadAmount = calculateBillingUnitAmountWithPolicy({
-    billingRule: twoLoads[0].billingRule,
+  const twoLoadTotal = twoLoads.reduce((total, unit) => total + calculateBillingUnitAmountWithPolicy({
+    billingRule: unit.billingRule,
     distanceBandAmountMinor: 25_000,
-    dropCount: twoLoads[0].dropCount
+    dropCount: unit.dropCount
+  }).calculatedAmountMinor, 0);
+  assert.equal(oneLoadAmount.calculatedAmountMinor, 25_000);
+  assert.equal(twoLoadTotal, 50_000);
+});
+
+test("the same PO reference on two immutable Driver loads remains two physical legs", () => {
+  const reference = "PO-SAME-REF";
+  const origin = "Common Vendor Yard";
+  const destination = "MBBS Yard";
+  const units = planDriverBillingUnits({
+    planId: "304",
+    planDate: "2039-08-13",
+    loads: ["PHYSICAL-A", "PHYSICAL-B"].map((loadId, index) => ({
+      loadId,
+      loadName: `Load ${index + 1}`,
+      completedAt: COMPLETED_AT,
+      records: [
+        record({
+          id: `${loadId}-pick`,
+          stopType: "pickup",
+          address: origin,
+          orderRefs: [reference],
+          orders: [order(reference, "PURCHASE_ORDER")]
+        }),
+        record({
+          id: `${loadId}-drop`,
+          stopType: "dropoff",
+          address: destination,
+          orderRefs: [reference],
+          orders: [order(reference, "PURCHASE_ORDER")]
+        })
+      ]
+    })),
+    canonicalOrders: [canonical("PO", reference, origin, destination)]
   });
-  assert.deepEqual(twoLoadAmount, oneLoadAmount);
+
+  assert.equal(units.length, 2);
+  assert.deepEqual(units.map((unit) => unit.driverLoadIds[0]).sort(), ["PHYSICAL-A", "PHYSICAL-B"]);
+  assert.equal(new Set(units.map((unit) => unit.unitKey)).size, 2);
+  assert.ok(units.every((unit) => unit.references[0]?.rootReference === reference));
 });
 
 test("direct-dependency TO is an additional drop while its linked SO remains an order charge", () => {

@@ -31,6 +31,7 @@ const RECORD_TYPES = new Set([
   "driver-pickup-photo",
   "driver-dropoff-photo",
   "sales-delivery-instruction-media",
+  "sales-special-stock-request-media",
   "test-upload"
 ]);
 

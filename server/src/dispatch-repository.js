@@ -211,6 +211,19 @@ function dateOnly(value) {
   return text.includes("T") ? text.slice(0, 10) : text;
 }
 
+function uniqueDispatchRefs(values = []) {
+  const refs = [];
+  const seen = new Set();
+  for (const value of Array.isArray(values) ? values : []) {
+    const ref = String(value || "").trim();
+    const key = ref.toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    refs.push(ref);
+  }
+  return refs;
+}
+
 function rowToDispatchOrder(row) {
   const totalPallets = toNumber(row.total_pallet_qty);
   const totalLayers = toNumber(row.total_layer_qty);
@@ -249,6 +262,12 @@ function rowToDispatchOrder(row) {
         destinationAddressOverride: row.delivery_address_override
       })
     : [];
+  const sourcePoRefs = Array.isArray(row.scm_source_po_refs)
+    ? uniqueDispatchRefs(row.scm_source_po_refs)
+    : [];
+  const correspondingPoRefs = Array.isArray(row.scm_corresponding_po_refs)
+    ? uniqueDispatchRefs(row.scm_corresponding_po_refs)
+    : [];
   return {
     id: visibleRef,
     netsuiteId: row.netsuite_id,
@@ -256,6 +275,9 @@ function rowToDispatchOrder(row) {
     sourceTable: row.source_table,
     originalPoRef: row.dispatch_type === "PO" ? row.tranid : "",
     dispatchRef: row.dispatch_ref || "",
+    sourcePoRef: sourcePoRefs[0] || "",
+    sourcePoRefs,
+    correspondingPoRefs,
     customer: row.party || "",
     address,
     sourceYard: row.pickup_location || "",
@@ -384,7 +406,39 @@ export async function listDispatchOrders({
   ];
   const result = await query(
     `
-    WITH so_alloc AS (
+    WITH active_po_split_lookup AS (
+      SELECT relation.po_id,
+             jsonb_agg(DISTINCT relation.source_po_ref ORDER BY relation.source_po_ref) AS source_po_refs,
+             jsonb_agg(DISTINCT relation.split_po_ref ORDER BY relation.split_po_ref) AS corresponding_po_refs
+        FROM (
+          SELECT split.source_po_id AS po_id, split.source_po_ref, split.split_po_ref
+            FROM dispatch_scm_po_splits split
+           WHERE split.status = 'active'
+          UNION ALL
+          SELECT split.split_po_id AS po_id, split.source_po_ref, split.split_po_ref
+            FROM dispatch_scm_po_splits split
+           WHERE split.status = 'active'
+       ) relation
+       GROUP BY relation.po_id
+    ),
+    active_group_po_ref_lookup AS (
+      SELECT lower(linked_group.group_ref) AS group_ref_key,
+             jsonb_agg(DISTINCT COALESCE(linked_split.source_po_ref, member_po.tranid)
+                       ORDER BY COALESCE(linked_split.source_po_ref, member_po.tranid)) AS source_po_refs,
+             jsonb_agg(DISTINCT linked_member.order_ref ORDER BY linked_member.order_ref) AS corresponding_po_refs
+        FROM scm_schedule_groups linked_group
+        JOIN scm_schedule_group_members linked_member
+          ON linked_member.group_id = linked_group.id
+        JOIN purchase_orders member_po
+          ON lower(COALESCE(NULLIF(member_po.dispatch_ref, ''), member_po.tranid)) = lower(linked_member.order_ref)
+        LEFT JOIN dispatch_scm_po_splits linked_split
+          ON linked_split.split_po_id = member_po.netsuite_id
+         AND linked_split.status = 'active'
+       WHERE linked_group.status = 'active'
+         AND lower(COALESCE(linked_split.source_po_ref, member_po.tranid)) <> lower(linked_member.order_ref)
+       GROUP BY lower(linked_group.group_ref)
+    ),
+    so_alloc AS (
       SELECT sales_line_id,
              SUM(allocated_pallet_qty) AS allocated_pallet_qty,
              SUM(allocated_layer_qty) AS allocated_layer_qty,
@@ -422,6 +476,7 @@ export async function listDispatchOrders({
       SELECT
         netsuite_id,
         tranid,
+        trandate AS source_order_date,
         'sales_order'::text AS order_type,
         customer,
         NULL::text AS destination_location,
@@ -455,6 +510,7 @@ export async function listDispatchOrders({
       SELECT
         netsuite_id,
         tranid,
+        trandate AS source_order_date,
         'transfer_order'::text AS order_type,
         NULL::text AS customer,
         to_location AS destination_location,
@@ -550,6 +606,7 @@ export async function listDispatchOrders({
         netsuite_id,
         tranid,
         dispatch_ref,
+        trandate AS source_order_date,
         'purchase_order'::text AS order_type,
         vendor,
         source_location,
@@ -579,6 +636,7 @@ export async function listDispatchOrders({
         netsuite_id,
         tranid,
         NULL::text AS dispatch_ref,
+        trandate AS source_order_date,
         'transfer_order'::text AS order_type,
         NULL::text AS vendor,
         from_location AS source_location,
@@ -674,6 +732,7 @@ export async function listDispatchOrders({
         o.netsuite_id,
         o.tranid,
         NULL::text AS dispatch_ref,
+        o.source_order_date,
         CASE WHEN o.order_type = 'transfer_order' THEN 'TO' ELSE 'SO' END AS dispatch_type,
         CASE WHEN o.order_type = 'transfer_order' THEN 'transfer_orders' ELSE 'sales_orders' END AS source_table,
         COALESCE(o.customer, o.destination_location, '') AS party,
@@ -798,7 +857,7 @@ export async function listDispatchOrders({
             OR o.status_text ILIKE '%Received%'
           ))
         )
-      GROUP BY o.netsuite_id, o.tranid, o.order_type, o.customer, o.destination_location, o.destination_location_id,
+      GROUP BY o.netsuite_id, o.tranid, o.source_order_date, o.order_type, o.customer, o.destination_location, o.destination_location_id,
                o.expected_delivery_date, o.outbound_location, o.dispatch_address, o.dispatch_pickup_address,
                o.dispatch_window_start, o.dispatch_window_end, o.dispatch_instructions,
                o.dispatch_parse_source, o.operator_status, o.local_yard_order_status,
@@ -812,6 +871,7 @@ export async function listDispatchOrders({
         o.netsuite_id,
         o.tranid,
         o.dispatch_ref,
+        o.source_order_date,
         CASE WHEN o.order_type = 'transfer_order' THEN 'TO' ELSE 'PO' END AS dispatch_type,
         CASE WHEN o.order_type = 'transfer_order' THEN 'transfer_orders' ELSE 'purchase_orders' END AS source_table,
         COALESCE(o.vendor, o.source_location, '') AS party,
@@ -869,15 +929,17 @@ export async function listDispatchOrders({
         scm.eta_time AS scm_eta_time,
         scm.driver AS scm_driver,
         scm.notes AS scm_notes,
-        COALESCE(SUM(GREATEST(COALESCE(l.pallet_qty, 0) - COALESCE(pa.allocated_pallet_qty, 0) - COALESCE(spa.split_pallet_qty, 0), 0)), 0) AS total_pallet_qty,
-        COALESCE(SUM(GREATEST(COALESCE(l.layer_qty, 0) - COALESCE(pa.allocated_layer_qty, 0) - COALESCE(spa.split_layer_qty, 0), 0)), 0) AS total_layer_qty,
-        COALESCE(SUM(GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0) - COALESCE(pa.allocated_sales_qty, 0) - COALESCE(spa.split_sales_qty, 0), 0)), 0) AS total_quantity,
+        -- Dispatch SO-to-PO links describe pickup routing. Only receipts and
+        -- active SCM splits move quantity out of the source PO balance.
+        COALESCE(SUM(GREATEST(COALESCE(l.pallet_qty, 0) - COALESCE(spa.split_pallet_qty, 0), 0)), 0) AS total_pallet_qty,
+        COALESCE(SUM(GREATEST(COALESCE(l.layer_qty, 0) - COALESCE(spa.split_layer_qty, 0), 0)), 0) AS total_layer_qty,
+        COALESCE(SUM(GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0) - COALESCE(spa.split_sales_qty, 0), 0)), 0) AS total_quantity,
         0::numeric AS total_packed_pallet_qty,
         0::numeric AS total_packed_layer_qty,
         0::numeric AS total_packed_section_qty,
         0::numeric AS total_packed_piece_qty,
         COALESCE(SUM(
-          GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0) - COALESCE(pa.allocated_sales_qty, 0) - COALESCE(spa.split_sales_qty, 0), 0)
+          GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0) - COALESCE(spa.split_sales_qty, 0), 0)
           * COALESCE(l.item_weight, 0)
         ), 0) AS total_weight_lbs,
         jsonb_agg(jsonb_build_object(
@@ -889,14 +951,14 @@ export async function listDispatchOrders({
           'sku', COALESCE(l.sku, l.item_name),
           'itemName', l.item_name,
           'description', l.item_description,
-          'pallets', GREATEST(COALESCE(l.pallet_qty, 0) - COALESCE(pa.allocated_pallet_qty, 0) - COALESCE(spa.split_pallet_qty, 0), 0),
-          'layers', GREATEST(COALESCE(l.layer_qty, 0) - COALESCE(pa.allocated_layer_qty, 0) - COALESCE(spa.split_layer_qty, 0), 0),
-          'sections', GREATEST(COALESCE(l.section_qty, 0) - COALESCE(pa.allocated_section_qty, 0) - COALESCE(spa.split_section_qty, 0), 0),
-          'pieces', GREATEST(COALESCE(l.piece_qty, 0) - COALESCE(pa.allocated_piece_qty, 0) - COALESCE(spa.split_piece_qty, 0), 0),
-          'quantity', GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0) - COALESCE(pa.allocated_sales_qty, 0) - COALESCE(spa.split_sales_qty, 0), 0),
+          'pallets', GREATEST(COALESCE(l.pallet_qty, 0) - COALESCE(spa.split_pallet_qty, 0), 0),
+          'layers', GREATEST(COALESCE(l.layer_qty, 0) - COALESCE(spa.split_layer_qty, 0), 0),
+          'sections', GREATEST(COALESCE(l.section_qty, 0) - COALESCE(spa.split_section_qty, 0), 0),
+          'pieces', GREATEST(COALESCE(l.piece_qty, 0) - COALESCE(spa.split_piece_qty, 0), 0),
+          'quantity', GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0) - COALESCE(spa.split_sales_qty, 0), 0),
           'unit', l.unit,
           'itemWeight', COALESCE(l.item_weight, 0),
-          'lineWeight', GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0) - COALESCE(pa.allocated_sales_qty, 0) - COALESCE(spa.split_sales_qty, 0), 0) * COALESCE(l.item_weight, 0),
+          'lineWeight', GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0) - COALESCE(spa.split_sales_qty, 0), 0) * COALESCE(l.item_weight, 0),
           'netsuiteReceivedQty', COALESCE(l.netsuite_received_qty, 0),
           'netsuiteReceivedBaselineQty', COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0),
           'poAllocatedPallets', COALESCE(pa.allocated_pallet_qty, 0),
@@ -948,7 +1010,10 @@ export async function listDispatchOrders({
           o.status_text ILIKE '%Pending Receipt%'
           OR o.status_text ILIKE '%Partially Received%'
           OR o.status_text ILIKE '%Received%'
-          OR o.status_text ILIKE '%Pending Billing%'
+          -- NetSuite emits both "Pending Bill" and "Pending Billing". The
+          -- remaining-quantity filters below still remove genuinely completed
+          -- receipt lines while retaining locally corrected baselines.
+          OR o.status_text ILIKE '%Pending Bill%'
           OR o.status_text ILIKE '%Billed%'
         )
         AND NOT EXISTS (
@@ -958,7 +1023,7 @@ export async function listDispatchOrders({
             AND d.netsuite_active = true
             AND d.fulfillment_status <> 'fulfilled'
         )
-      GROUP BY o.netsuite_id, o.tranid, o.order_type, o.vendor, o.source_location,
+      GROUP BY o.netsuite_id, o.tranid, o.source_order_date, o.order_type, o.vendor, o.source_location,
                 o.dispatch_ref,
                 o.destination_location, o.destination_location_id, o.expected_delivery_date, o.dispatch_vendor_yard,
                o.dispatch_address, o.dispatch_delivery_address, o.dispatch_pickup_address, o.dispatch_window_start, o.dispatch_window_end,
@@ -972,13 +1037,14 @@ export async function listDispatchOrders({
                schedule_pickup_yard.instructions, schedule_pickup_yard.day_label
       HAVING $1::boolean
           OR o.dispatch_plan_date IS NOT NULL
-          OR COALESCE(SUM(GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0) - COALESCE(pa.allocated_sales_qty, 0) - COALESCE(spa.split_sales_qty, 0), 0)), 0) > 0.000001
+          OR COALESCE(SUM(GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0) - COALESCE(spa.split_sales_qty, 0), 0)), 0) > 0.000001
     ),
     local_co AS (
       SELECT
         co.delivery_order_id AS netsuite_id,
         co.co_ref AS tranid,
         NULL::text AS dispatch_ref,
+        co.created_at::date AS source_order_date,
         'CO' AS dispatch_type,
         'local_co_orders' AS source_table,
         COALESCE(co.details->>'customer', 'Transit Depot') AS party,
@@ -1055,6 +1121,7 @@ export async function listDispatchOrders({
         -v.id AS netsuite_id,
         v.vrma_ref AS tranid,
         NULL::text AS dispatch_ref,
+        v.created_at::date AS source_order_date,
         'PO' AS dispatch_type,
         'scm_vrma_orders' AS source_table,
         COALESCE(v.local_vendor, v.vendor, 'Vendor Return') AS party,
@@ -1169,7 +1236,7 @@ export async function listDispatchOrders({
              ROW_NUMBER() OVER (
                PARTITION BY dispatch_type
                ORDER BY CASE WHEN $2::boolean AND tranid LIKE 'TSTDEP-SO-%' THEN 0 ELSE 1 END,
-                        dispatch_window_start NULLS LAST, tranid DESC
+                        source_order_date DESC NULLS LAST, netsuite_id DESC, tranid DESC
              ) AS dispatch_type_rank
         FROM eligible_orders
        WHERE ($5::text = '' OR dispatch_type = $5)
@@ -1211,6 +1278,12 @@ export async function listDispatchOrders({
                     linked_member.order_ref ILIKE '%' || $3 || '%'
                     OR EXISTS (
                       SELECT 1
+                        FROM purchase_orders member_po
+                       WHERE lower(COALESCE(NULLIF(member_po.dispatch_ref, ''), member_po.tranid)) = lower(linked_member.order_ref)
+                         AND member_po.tranid ILIKE '%' || $3 || '%'
+                    )
+                    OR EXISTS (
+                      SELECT 1
                         FROM dispatch_scm_po_splits member_split
                        WHERE member_split.status = 'active'
                          AND lower(member_split.split_po_ref) = lower(linked_member.order_ref)
@@ -1222,6 +1295,10 @@ export async function listDispatchOrders({
          )
     )
     SELECT orders.*,
+           COALESCE(split_lookup.source_po_refs, '[]'::jsonb)
+             || COALESCE(group_ref_lookup.source_po_refs, '[]'::jsonb) AS scm_source_po_refs,
+           COALESCE(split_lookup.corresponding_po_refs, '[]'::jsonb)
+             || COALESCE(group_ref_lookup.corresponding_po_refs, '[]'::jsonb) AS scm_corresponding_po_refs,
            COALESCE((
              SELECT jsonb_agg(m.order_ref ORDER BY m.order_ref)
                FROM scm_schedule_groups g
@@ -1231,11 +1308,17 @@ export async function listDispatchOrders({
                 AND lower(g.group_ref) = lower(COALESCE(NULLIF(orders.dispatch_ref, ''), orders.tranid))
            ), '[]'::jsonb) AS scm_child_orders
     FROM ranked_orders orders
+    LEFT JOIN active_po_split_lookup split_lookup
+      ON orders.dispatch_type = 'PO'
+     AND split_lookup.po_id = orders.netsuite_id
+    LEFT JOIN active_group_po_ref_lookup group_ref_lookup
+      ON orders.dispatch_type = 'PO'
+     AND group_ref_lookup.group_ref_key = lower(COALESCE(NULLIF(orders.dispatch_ref, ''), orders.tranid))
     WHERE $3::text <> ''
        OR orders.dispatch_type_rank <= $4
        OR orders.dispatch_planned = true
     ORDER BY CASE WHEN $2::boolean AND tranid LIKE 'TSTDEP-SO-%' THEN 0 ELSE 1 END,
-             dispatch_window_start NULLS LAST, tranid DESC
+             source_order_date DESC NULLS LAST, netsuite_id DESC, tranid DESC
     LIMIT CASE WHEN $3::text <> '' THEN 200 ELSE NULL END
     `,
     params
@@ -2528,7 +2611,20 @@ export async function listScmSchedule({
   ];
   const result = await query(
     `
-    WITH base_po AS (
+    WITH active_po_split_alloc AS MATERIALIZED (
+      SELECT split_line.source_line_id,
+             SUM(COALESCE(split_line.pallet_qty, 0)) AS pallet_qty,
+             SUM(COALESCE(split_line.layer_qty, 0)) AS layer_qty,
+             SUM(COALESCE(split_line.section_qty, 0)) AS section_qty,
+             SUM(COALESCE(split_line.piece_qty, 0)) AS piece_qty,
+             SUM(COALESCE(split_line.sales_qty, 0)) AS sales_qty
+        FROM dispatch_scm_po_split_lines split_line
+        JOIN dispatch_scm_po_splits split_header
+          ON split_header.id = split_line.split_id
+         AND split_header.status = 'active'
+       GROUP BY split_line.source_line_id
+    ),
+    base_po AS (
       SELECT
         'PO'::text AS order_kind,
         'purchase_orders'::text AS source_table,
@@ -2547,16 +2643,16 @@ export async function listScmSchedule({
               trim(concat_ws(' ',
                 COALESCE(NULLIF(l.sku, ''), NULLIF(l.item_name, ''), 'Item'),
                 NULLIF(trim(concat_ws(' ',
-                  CASE WHEN GREATEST(COALESCE(l.pallet_qty, 0) - COALESCE(l.received_pallet_qty, 0), 0) > 0 THEN trim(to_char(GREATEST(COALESCE(l.pallet_qty, 0) - COALESCE(l.received_pallet_qty, 0), 0), 'FM999999999990.##')) || ' PLT' END,
-                  CASE WHEN GREATEST(COALESCE(l.layer_qty, 0) - COALESCE(l.received_layer_qty, 0), 0) > 0 THEN trim(to_char(GREATEST(COALESCE(l.layer_qty, 0) - COALESCE(l.received_layer_qty, 0), 0), 'FM999999999990.##')) || ' LYR' END,
-                  CASE WHEN GREATEST(COALESCE(l.section_qty, 0) - COALESCE(l.received_section_qty, 0), 0) > 0 THEN trim(to_char(GREATEST(COALESCE(l.section_qty, 0) - COALESCE(l.received_section_qty, 0), 0), 'FM999999999990.##')) || ' SEC' END,
-                  CASE WHEN GREATEST(COALESCE(l.piece_qty, 0) - COALESCE(l.received_piece_qty, 0), 0) > 0 THEN trim(to_char(GREATEST(COALESCE(l.piece_qty, 0) - COALESCE(l.received_piece_qty, 0), 0), 'FM999999999990.##')) || ' PCS' END
+                  CASE WHEN GREATEST(COALESCE(l.pallet_qty, 0) - COALESCE(l.received_pallet_qty, 0) - COALESCE(split_alloc.pallet_qty, 0), 0) > 0 THEN trim(to_char(GREATEST(COALESCE(l.pallet_qty, 0) - COALESCE(l.received_pallet_qty, 0) - COALESCE(split_alloc.pallet_qty, 0), 0), 'FM999999999990.##')) || ' PLT' END,
+                  CASE WHEN GREATEST(COALESCE(l.layer_qty, 0) - COALESCE(l.received_layer_qty, 0) - COALESCE(split_alloc.layer_qty, 0), 0) > 0 THEN trim(to_char(GREATEST(COALESCE(l.layer_qty, 0) - COALESCE(l.received_layer_qty, 0) - COALESCE(split_alloc.layer_qty, 0), 0), 'FM999999999990.##')) || ' LYR' END,
+                  CASE WHEN GREATEST(COALESCE(l.section_qty, 0) - COALESCE(l.received_section_qty, 0) - COALESCE(split_alloc.section_qty, 0), 0) > 0 THEN trim(to_char(GREATEST(COALESCE(l.section_qty, 0) - COALESCE(l.received_section_qty, 0) - COALESCE(split_alloc.section_qty, 0), 0), 'FM999999999990.##')) || ' SEC' END,
+                  CASE WHEN GREATEST(COALESCE(l.piece_qty, 0) - COALESCE(l.received_piece_qty, 0) - COALESCE(split_alloc.piece_qty, 0), 0) > 0 THEN trim(to_char(GREATEST(COALESCE(l.piece_qty, 0) - COALESCE(l.received_piece_qty, 0) - COALESCE(split_alloc.piece_qty, 0), 0), 'FM999999999990.##')) || ' PCS' END
                 )), '')
               ))
             ELSE
               trim(concat_ws(' ',
                 COALESCE(NULLIF(l.sku, ''), NULLIF(l.item_name, ''), 'Item'),
-                trim(to_char(GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0), 0), 'FM999999999990.######')),
+                trim(to_char(GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0) - COALESCE(split_alloc.sales_qty, 0), 0), 'FM999999999990.######')),
                 NULLIF(l.unit, '')
               ))
           END,
@@ -2566,18 +2662,18 @@ export async function listScmSchedule({
             AND (
               CASE
                 WHEN COALESCE(l.to_plt, 0) <> 0 OR COALESCE(l.to_lyr, 0) <> 0 OR COALESCE(l.to_sec, 0) <> 0 OR COALESCE(l.to_pcs, 0) <> 0 THEN
-                  GREATEST(COALESCE(l.pallet_qty, 0) - COALESCE(l.received_pallet_qty, 0), 0)
-                  + GREATEST(COALESCE(l.layer_qty, 0) - COALESCE(l.received_layer_qty, 0), 0)
-                  + GREATEST(COALESCE(l.section_qty, 0) - COALESCE(l.received_section_qty, 0), 0)
-                  + GREATEST(COALESCE(l.piece_qty, 0) - COALESCE(l.received_piece_qty, 0), 0)
-                ELSE GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0), 0)
+                  GREATEST(COALESCE(l.pallet_qty, 0) - COALESCE(l.received_pallet_qty, 0) - COALESCE(split_alloc.pallet_qty, 0), 0)
+                  + GREATEST(COALESCE(l.layer_qty, 0) - COALESCE(l.received_layer_qty, 0) - COALESCE(split_alloc.layer_qty, 0), 0)
+                  + GREATEST(COALESCE(l.section_qty, 0) - COALESCE(l.received_section_qty, 0) - COALESCE(split_alloc.section_qty, 0), 0)
+                  + GREATEST(COALESCE(l.piece_qty, 0) - COALESCE(l.received_piece_qty, 0) - COALESCE(split_alloc.piece_qty, 0), 0)
+                ELSE GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0) - COALESCE(split_alloc.sales_qty, 0), 0)
               END
             ) > 0
         ) AS content,
         po.expected_delivery_date,
         COALESCE(po.synced_at, po.status_updated_at, now()) AS queued_at,
-        COALESCE(SUM(GREATEST(COALESCE(l.pallet_qty, 0) - COALESCE(l.received_pallet_qty, 0), 0)), 0) AS total_pallet_qty,
-        COALESCE(SUM(GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0), 0) * COALESCE(l.item_weight, 0)), 0) AS weight_lbs,
+        COALESCE(SUM(GREATEST(COALESCE(l.pallet_qty, 0) - COALESCE(l.received_pallet_qty, 0) - COALESCE(split_alloc.pallet_qty, 0), 0)), 0) AS total_pallet_qty,
+        COALESCE(SUM(GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0) - COALESCE(split_alloc.sales_qty, 0), 0) * COALESCE(l.item_weight, 0)), 0) AS weight_lbs,
         po.initial_scm_status,
         po.is_blanket_po
       FROM purchase_orders po
@@ -2591,8 +2687,9 @@ export async function listScmSchedule({
         ON active_group.status = 'active'
        AND lower(active_group.group_ref) = lower(COALESCE(member_schedule.group_ref, ''))
       LEFT JOIN purchase_order_lines l ON l.purchase_order_id = po.netsuite_id AND l.netsuite_active = true
-	      WHERE (po.netsuite_active = true OR $9 = 'completed')
-	        AND NOT ${netSuiteClosedOrderFamilySql("po", "PO")}
+      LEFT JOIN active_po_split_alloc split_alloc ON split_alloc.source_line_id = l.id
+      WHERE (po.netsuite_active = true OR $9 = 'completed')
+        AND NOT ${netSuiteClosedOrderFamilySql("po", "PO")}
         AND (
           $10 = ''
           OR lower(po.tranid) = lower($10)
@@ -5314,18 +5411,7 @@ export async function createScmPurchaseOrderSplit({
 
     const lineIds = requestedLines.map((line) => line.lineRowId);
     const sourceLines = await query(
-      `WITH po_alloc AS (
-         SELECT po_line_id,
-                SUM(allocated_pallet_qty) AS allocated_pallet_qty,
-                SUM(allocated_layer_qty) AS allocated_layer_qty,
-                SUM(allocated_section_qty) AS allocated_section_qty,
-                SUM(allocated_piece_qty) AS allocated_piece_qty,
-                SUM(allocated_sales_qty) AS allocated_sales_qty
-           FROM dispatch_so_po_allocations
-          WHERE status = 'active'
-          GROUP BY po_line_id
-       ),
-       scm_alloc AS (
+      `WITH scm_alloc AS (
          SELECT sl.source_line_id,
                 SUM(sl.pallet_qty) AS split_pallet_qty,
                 SUM(sl.layer_qty) AS split_layer_qty,
@@ -5346,13 +5432,12 @@ export async function createScmPurchaseOrderSplit({
           GROUP BY allocation.source_line_id
        )
        SELECT l.*,
-              COALESCE(pa.allocated_pallet_qty, 0) + COALESCE(sa.split_pallet_qty, 0) + COALESCE(ba.blanket_pallet_qty, 0) AS allocated_pallet_qty,
-              COALESCE(pa.allocated_layer_qty, 0) + COALESCE(sa.split_layer_qty, 0) AS allocated_layer_qty,
-              COALESCE(pa.allocated_section_qty, 0) + COALESCE(sa.split_section_qty, 0) AS allocated_section_qty,
-              COALESCE(pa.allocated_piece_qty, 0) + COALESCE(sa.split_piece_qty, 0) AS allocated_piece_qty,
-              COALESCE(pa.allocated_sales_qty, 0) + COALESCE(sa.split_sales_qty, 0) + COALESCE(ba.blanket_sales_qty, 0) AS allocated_sales_qty
+              COALESCE(sa.split_pallet_qty, 0) + COALESCE(ba.blanket_pallet_qty, 0) AS allocated_pallet_qty,
+              COALESCE(sa.split_layer_qty, 0) AS allocated_layer_qty,
+              COALESCE(sa.split_section_qty, 0) AS allocated_section_qty,
+              COALESCE(sa.split_piece_qty, 0) AS allocated_piece_qty,
+              COALESCE(sa.split_sales_qty, 0) + COALESCE(ba.blanket_sales_qty, 0) AS allocated_sales_qty
          FROM purchase_order_lines l
-         LEFT JOIN po_alloc pa ON pa.po_line_id = l.id
          LEFT JOIN scm_alloc sa ON sa.source_line_id = l.id
          LEFT JOIN blanket_alloc ba ON ba.source_line_id = l.id
         WHERE l.purchase_order_id = $1
@@ -5966,6 +6051,14 @@ export async function getSalesOrderPoAllocationOptions(orderRef, { planDate = ""
       WHERE o.netsuite_active = true
         AND (o.status_text ILIKE '%Pending Receipt%' OR o.status_text ILIKE '%Partially Received%')
         AND l.netsuite_active = true
+        AND NOT EXISTS (
+          SELECT 1
+            FROM dispatch_scm_po_split_lines split_line
+            JOIN dispatch_scm_po_splits split_header
+              ON split_header.id = split_line.split_id
+             AND split_header.status = 'active'
+           WHERE split_line.source_line_id = l.id
+        )
         AND COALESCE(l.item_type, '') IN ('InvtPart', 'NonInvtPart')
         AND (
           (array_length($1::bigint[], 1) IS NOT NULL AND l.item_id = ANY($1::bigint[]))
@@ -6158,6 +6251,29 @@ async function createSalesOrderPoAllocationWithExecutor(executor, {
   );
   const poLine = po.rows[0];
   if (!poLine) throw new Error("Purchase order line not found.");
+  const activeSplitChildren = await executor.query(
+    `SELECT DISTINCT split_header.split_po_ref
+       FROM dispatch_scm_po_split_lines split_line
+       JOIN dispatch_scm_po_splits split_header
+         ON split_header.id = split_line.split_id
+        AND split_header.status = 'active'
+      WHERE split_line.source_line_id = $1
+      ORDER BY split_header.split_po_ref`,
+    [poLine.id]
+  );
+  if (activeSplitChildren.rowCount) {
+    const splitPoRefs = activeSplitChildren.rows.map((row) => row.split_po_ref).filter(Boolean);
+    throw Object.assign(
+      new Error(
+        `${poLine.po_order_ref} has active split ${splitPoRefs.join(", ")}. Link the SO to the exact split PO instead of its source PO.`
+      ),
+      {
+        status: 409,
+        code: "DISPATCH_PO_SPLIT_SOURCE_REQUIRES_CHILD",
+        splitPoRefs
+      }
+    );
+  }
   await assertNoClosedNetSuiteOrders([poLine.po_order_ref], "be linked to an SO in Dispatch");
   const requestedPoRef = String(poRef || "").trim().toLowerCase();
   if (requestedPoRef && requestedPoRef !== String(poLine.po_order_ref || "").trim().toLowerCase()

@@ -1,27 +1,28 @@
 /* global DriverOfflineSync */
 "use strict";
 
-importScripts("/driver-offline-db.js?v=20260812-driver-pwa-v3");
-importScripts("/driver-photo-hash.js?v=20260812-driver-pwa-v3");
-importScripts("/driver-offline-sync.js?v=20260812-driver-pwa-v3");
+importScripts("/driver-offline-db.js?v=20260819-driver-route-readiness-v1");
+importScripts("/driver-photo-hash.js?v=20260819-driver-route-readiness-v1");
+importScripts("/driver-offline-sync.js?v=20260819-driver-route-readiness-v1");
 
 const DRIVER_PWA_CLIENT_VERSION = "2026.08.12.3";
 const DRIVER_CACHE_PREFIX = "mbbs-driver-shell-";
-const DRIVER_CACHE_NAME = `${DRIVER_CACHE_PREFIX}v28`;
-const DRIVER_REFRESH_CACHE_NAME = `${DRIVER_CACHE_PREFIX}refresh-v28`;
+const DRIVER_CACHE_NAME = `${DRIVER_CACHE_PREFIX}v37`;
+const DRIVER_REFRESH_CACHE_NAME = `${DRIVER_CACHE_PREFIX}refresh-v37`;
 const DRIVER_OFFLINE_MODE_REQUEST = "/__mbbs_driver_offline_mode__";
 const DRIVER_SHELL = [
   "/driver",
   "/driver.html",
-  "/driver.css?v=20260812-driver-pwa-v3",
-  "/i18n.css?v=20260812-driver-pwa-v3",
-  "/i18n.js?v=20260812-driver-pwa-v3",
-  "/driver-offline-db.js?v=20260812-driver-pwa-v3",
-  "/driver-photo-hash.js?v=20260812-driver-pwa-v3",
-  "/driver-offline-photos.js?v=20260812-driver-pwa-v3",
-  "/driver-offline-sync.js?v=20260812-driver-pwa-v3",
-  "/driver-bin-ui.js?v=20260812-driver-pwa-v3",
-  "/driver.js?v=20260812-driver-pwa-v3",
+  "/driver.css?v=20260819-driver-route-readiness-v1",
+  "/i18n.css?v=20260819-driver-route-readiness-v1",
+  "/i18n.js?v=20260819-driver-route-readiness-v1",
+  "/driver-offline-db.js?v=20260819-driver-route-readiness-v1",
+  "/driver-photo-hash.js?v=20260819-driver-route-readiness-v1",
+  "/driver-offline-photos.js?v=20260819-driver-route-readiness-v1",
+  "/driver-offline-sync.js?v=20260819-driver-route-readiness-v1",
+  "/driver-bin-ui.js?v=20260819-driver-route-readiness-v1",
+  "/driver-location-override.js?v=20260819-driver-route-readiness-v1",
+  "/driver.js?v=20260819-driver-route-readiness-v1",
   "/driver-manifest.webmanifest",
   "/icons/mbbs-yard-192.png",
   "/icons/mbbs-yard-512.png",
@@ -195,6 +196,42 @@ self.addEventListener("sync", (event) => {
   if (event.tag === "driver-offline-sync") {
     event.waitUntil(DriverOfflineSync.syncAll());
   }
+});
+
+self.addEventListener("push", (event) => {
+  let requestId = "";
+  try {
+    const payload = event.data?.json?.() || {};
+    if (/^[0-9a-f-]{36}$/iu.test(String(payload.requestId || ""))) {
+      requestId = String(payload.requestId);
+    }
+  } catch {
+    requestId = "";
+  }
+  const routeUrl = `/driver?route-change=${encodeURIComponent(requestId)}`;
+  event.waitUntil(self.registration.showNotification("Route update needs your attention", {
+    body: "Open MBBS Driver and confirm readiness.",
+    tag: requestId ? `driver-route-${requestId}` : "driver-route-update",
+    renotify: true,
+    requireInteraction: true,
+    icon: "/icons/mbbs-yard-192.png",
+    badge: "/icons/mbbs-yard-192.png",
+    data: { routeUrl }
+  }));
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const routeUrl = String(event.notification.data?.routeUrl || "/driver");
+  event.waitUntil((async () => {
+    const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+    const existing = windows.find((client) => new URL(client.url).pathname.startsWith("/driver"));
+    if (existing) {
+      await existing.navigate(routeUrl);
+      return existing.focus();
+    }
+    return self.clients.openWindow(routeUrl);
+  })());
 });
 
 self.addEventListener("fetch", (event) => {

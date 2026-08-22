@@ -79,7 +79,12 @@ test("billing-case actions stay inside the selected detail and do not require co
 });
 
 test("missing candidate addresses are edited only through the audited billing override endpoint", () => {
-  for (const id of ["mbbsAddressOverrideForm", "mbbsAddressOverrideText", "mbbsAddressOverrideReason"]) {
+  for (const id of [
+    "mbbsAddressOverrideForm",
+    "mbbsBillingOriginText",
+    "mbbsBillingDestinationText",
+    "mbbsAddressOverrideReason"
+  ]) {
     assert.match(html, new RegExp(`id=["']${id}["']`, "u"), `${id} must be rendered.`);
   }
   assert.match(script, /\/address-override/u);

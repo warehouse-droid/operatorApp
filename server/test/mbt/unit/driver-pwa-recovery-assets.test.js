@@ -7,8 +7,8 @@ import { fileURLToPath } from "node:url";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.resolve(HERE, "../../../public");
 const read = (name) => fs.readFileSync(path.join(PUBLIC, name), "utf8");
-const DRIVER_RECOVERY_VERSION = "20260812-driver-pwa-v3";
-const DISPATCH_REVIEW_VERSION = "20260805-online-mode-v3";
+const DRIVER_RECOVERY_VERSION = "20260819-driver-route-readiness-v1";
+const DISPATCH_REVIEW_VERSION = "20260820-historical-assist-v2";
 
 test("the installed Driver shell cannot mix old DB/route code with photo recovery code", () => {
   const html = read("driver.html");
@@ -22,6 +22,7 @@ test("the installed Driver shell cannot mix old DB/route code with photo recover
     "driver-offline-photos.js",
     "driver-offline-sync.js",
     "driver-bin-ui.js",
+    "driver-location-override.js",
     "driver.js"
   ];
 
@@ -30,10 +31,10 @@ test("the installed Driver shell cannot mix old DB/route code with photo recover
     assert.ok(html.includes(versionedPath), `${asset} must be versioned in driver.html.`);
     assert.ok(worker.includes(versionedPath), `${asset} must be versioned in the shell cache.`);
   }
-  assert.match(worker, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v28`/u);
-  assert.match(worker, /DRIVER_REFRESH_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}refresh-v28`/u);
+  assert.match(worker, /DRIVER_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}v37`/u);
+  assert.match(worker, /DRIVER_REFRESH_CACHE_NAME = `\$\{DRIVER_CACHE_PREFIX\}refresh-v37`/u);
   assert.match(worker, /cache\.addAll\(DRIVER_SHELL\.map\(\(url\) => new Request\([\s\S]*?cache: "reload"/u);
-  assert.match(read("driver.js"), /serviceWorker\.register\("\/driver-service-worker\.js\?v=20260812-driver-pwa-v3"/u);
+  assert.match(read("driver.js"), /serviceWorker\.register\("\/driver-service-worker\.js\?v=20260819-driver-route-readiness-v1"/u);
   assert.match(read("service-worker.js"), /url\.pathname\.startsWith\("\/driver-"\)/u);
 });
 

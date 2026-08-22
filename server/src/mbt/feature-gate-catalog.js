@@ -42,6 +42,15 @@ export const MBT_ADMIN_GATE_DEFINITIONS = Object.freeze([
     lockReason: null
   }),
   Object.freeze({
+    flagKey: "special_stock_request_workflow",
+    label: "Special Item stock requests",
+    description: "Enable the guarded multi-line Sales, SCM, and Dispatch workflow, including explicit NetSuite Sales Order and Purchase Order actions.",
+    environmentProperty: null,
+    independent: true,
+    locked: false,
+    lockReason: null
+  }),
+  Object.freeze({
     flagKey: "mbt_enabled",
     label: "MBT local modules",
     description: "Global database gate for every MBT local workflow.",

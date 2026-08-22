@@ -36,12 +36,13 @@ function gate(gates, flagKey) {
   return selected;
 }
 
-test("P3-F29 Admin catalog exposes four independent operational controls, seven writable MBT gates, and two locked integration gates", () => {
+test("P3-F29 Admin catalog exposes five independent operational controls, seven writable MBT gates, and two locked integration gates", () => {
   assert.deepEqual(MBT_ADMIN_GATE_KEYS, [
     "driver_offline_mode",
     "driver_yard_dependency_soft_mode",
     "operator_customer_pickup_photo_required",
     "sales_stock_request_over_availability",
+    "special_stock_request_workflow",
     "mbt_enabled",
     "mbt_master_data",
     "mbt_asset_management",
@@ -52,7 +53,7 @@ test("P3-F29 Admin catalog exposes four independent operational controls, seven 
     "mbt_customer_sync",
     "mbt_netsuite_writes"
   ]);
-  assert.deepEqual(MBT_ADMIN_WRITABLE_GATE_KEYS, MBT_ADMIN_GATE_KEYS.slice(0, 11));
+  assert.deepEqual(MBT_ADMIN_WRITABLE_GATE_KEYS, MBT_ADMIN_GATE_KEYS.slice(0, 12));
 });
 
 test("P3-F29 effective state requires both deployment and database root/specific gates", () => {
@@ -84,6 +85,8 @@ test("P3-F29 effective state requires both deployment and database root/specific
   assert.equal(gate(environmentRootClosed, "operator_customer_pickup_photo_required").environmentAllowed, true);
   assert.equal(gate(environmentRootClosed, "sales_stock_request_over_availability").effective, true);
   assert.equal(gate(environmentRootClosed, "sales_stock_request_over_availability").environmentAllowed, true);
+  assert.equal(gate(environmentRootClosed, "special_stock_request_workflow").effective, true);
+  assert.equal(gate(environmentRootClosed, "special_stock_request_workflow").environmentAllowed, true);
   assert.ok(environmentRootClosed
     .filter((candidate) => candidate.independent !== true)
     .every((candidate) => candidate.effective === false));

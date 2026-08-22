@@ -7,9 +7,12 @@ const sharedGlobals = {
   crypto: "readonly",
   fetch: "readonly",
   FormData: "readonly",
+  Headers: "readonly",
   process: "readonly",
+  Response: "readonly",
   structuredClone: "readonly",
   setInterval: "readonly",
+  setImmediate: "readonly",
   setTimeout: "readonly",
   clearInterval: "readonly",
   clearTimeout: "readonly",
@@ -20,7 +23,17 @@ const sharedGlobals = {
 
 export default [
   {
-    files: ["src/mbt/**/*.js", "src/operator-customer-pickup-photo-policy.js", "test/mbt/**/*.{js,mjs}", "test/support/**/*.mjs", "tools/**/*.mjs"],
+    files: [
+      "src/mbt/**/*.js",
+      "src/operator-customer-pickup-photo-policy.js",
+      "src/driver-historical-assist-*.js",
+      "src/netsuite-m2m-*.js",
+      "src/netsuite-delayed-status-refresh-*.js",
+      "src/pending-approval-reconciliation*.js",
+      "test/mbt/**/*.{js,mjs}",
+      "test/support/**/*.mjs",
+      "tools/**/*.mjs"
+    ],
     languageOptions: {
       ecmaVersion: "latest",
       sourceType: "module",
@@ -51,7 +64,13 @@ export default [
     }
   },
   {
-    files: ["src/dispatch-planner-*.js", "test/dispatch/**/*.js"],
+    files: [
+      "src/dispatch-planner-*.js",
+      "src/dispatch-actual-arrival-*.js",
+      "src/scm-dependency-*.js",
+      "src/driver-route-*.js",
+      "test/dispatch/**/*.js"
+    ],
     languageOptions: {
       ecmaVersion: "latest",
       sourceType: "module",

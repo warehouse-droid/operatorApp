@@ -13,6 +13,11 @@ import {
 } from "./mbbs-driver-billing-planner.js";
 import { requireMbbsRateCardPolicy } from "./mbbs-rate-card-policy.js";
 import {
+  calculateMbbsPurchaseRouteAmount,
+  normalizeMbbsVendorRouteRates,
+  selectMbbsVendorRouteRate
+} from "./mbbs-vendor-route-rates.js";
+import {
   calculateTorontoRentalExtensionDays,
   calculateMbbsCrossCharges,
   calculateMbtLocalBilling
@@ -1411,6 +1416,7 @@ async function insertOrVerifyCrossCharge(calculatedCase, source) {
 }
 
 /** @param {Array<Record<string, any>>} calculations @param {string} customerNetsuiteId */
+// eslint-disable-next-line complexity -- Conversion independently validates every active graph edge and policy invariant.
 async function validatedCandidateRateGraphs(calculations, customerNetsuiteId) {
   const versionIds = [...new Set(calculations.map((entry) => uuid(
     entry.rateCardVersionId,
@@ -1423,13 +1429,19 @@ async function validatedCandidateRateGraphs(calculations, customerNetsuiteId) {
             band.item_code, band.service_code, band.sequence_number::int,
             band.minimum_metres::int, band.maximum_metres::int,
             band.amount_minor::int, band.pricing_basis, band.boundary_rule,
+            band.base_amount_minor::int, band.included_metres::int,
             policy.schema_version AS policy_schema_version,
             policy.currency AS policy_currency,
             policy.direct_pickup_unit_amount_minor,
             policy.po_additional_drop_unit_amount_minor,
+            policy.po_vrma_additional_stop_unit_amount_minor,
             policy.so_charge_basis, policy.to_replenishment_charge_basis,
             policy.to_direct_pickup_charge_basis, policy.po_charge_basis,
-            policy.po_additional_drop_basis, policy.dispatch_load_split_basis
+            policy.po_additional_drop_basis, policy.dispatch_load_split_basis,
+            policy.po_vrma_base_charge_basis, policy.vrma_direction_basis,
+            policy.po_vrma_additional_stop_basis, policy.endpoint_override_basis,
+            policy.to_replenishment_additional_drop_unit_amount_minor,
+            policy.to_replenishment_multi_drop_basis
        FROM mbt_rate_card_versions version
        JOIN mbt_rate_cards card USING (rate_card_id)
        JOIN mbt_rate_distance_bands band USING (rate_card_version_id)
@@ -1444,6 +1456,42 @@ async function validatedCandidateRateGraphs(calculations, customerNetsuiteId) {
       ORDER BY version.rate_card_version_id, band.sequence_number, band.minimum_metres`,
     [versionIds]
   );
+  const routeRateRows = await query(
+    `SELECT route_rate.rate_card_version_id::text,
+            route_rate.rate_name AS "rateName",
+            route_rate.display_name AS "displayName",
+            route_rate.local_vendor_id::int AS "localVendorId",
+            vendor.name AS "localVendorName",
+            route_rate.vendor_yard_name AS "vendorYardName",
+            route_rate.vendor_yard_address AS "vendorYardAddress",
+            yard.yard_code AS "destinationYardCode",
+            route_rate.base_amount_minor::text AS "baseAmountMinor",
+            route_rate.currency
+       FROM mbt_mbbs_vendor_route_rates route_rate
+       JOIN dispatch_local_vendors vendor ON vendor.id = route_rate.local_vendor_id
+       JOIN mbt_yards yard ON yard.yard_id = route_rate.destination_yard_id
+      WHERE route_rate.rate_card_version_id = ANY($1::uuid[])
+      ORDER BY route_rate.rate_card_version_id, lower(vendor.name),
+               lower(route_rate.vendor_yard_name), yard.yard_code`,
+    [versionIds]
+  );
+  const routeRatesByVersion = new Map();
+  for (const rawRate of routeRateRows.rows) {
+    const versionId = String(rawRate.rate_card_version_id);
+    const rows = routeRatesByVersion.get(versionId) || [];
+    rows.push({
+      rateName: String(rawRate.rateName),
+      displayName: String(rawRate.displayName),
+      localVendorId: Number(rawRate.localVendorId),
+      localVendorName: String(rawRate.localVendorName),
+      vendorYardName: String(rawRate.vendorYardName),
+      vendorYardAddress: String(rawRate.vendorYardAddress),
+      destinationYardCode: String(rawRate.destinationYardCode),
+      baseAmountMinor: Number(rawRate.baseAmountMinor),
+      currency: String(rawRate.currency)
+    });
+    routeRatesByVersion.set(versionId, rows);
+  }
   /** @type {Map<string, Array<Record<string, any>>>} */
   const graphs = new Map();
   for (const row of selected.rows) {
@@ -1459,20 +1507,57 @@ async function validatedCandidateRateGraphs(calculations, customerNetsuiteId) {
       amountMinor: Number(row.amount_minor),
       pricingBasis: String(row.pricing_basis),
       boundaryRule: String(row.boundary_rule),
+      baseAmountMinor: row.base_amount_minor === null ? null : Number(row.base_amount_minor),
+      includedMetres: row.included_metres === null ? null : Number(row.included_metres),
       currency: cad(row.currency),
       bandCurrency: cad(row.band_currency),
-      mbbsChargingPolicy: requireMbbsRateCardPolicy({
-        schemaVersion: Number(row.policy_schema_version),
-        currency: String(row.policy_currency),
-        directPickupUnitAmountMinor: Number(row.direct_pickup_unit_amount_minor),
-        poAdditionalDropUnitAmountMinor: Number(row.po_additional_drop_unit_amount_minor),
-        soChargeBasis: String(row.so_charge_basis),
-        toReplenishmentChargeBasis: String(row.to_replenishment_charge_basis),
-        toDirectPickupChargeBasis: String(row.to_direct_pickup_charge_basis),
-        poChargeBasis: String(row.po_charge_basis),
-        poAdditionalDropBasis: String(row.po_additional_drop_basis),
-        dispatchLoadSplitBasis: String(row.dispatch_load_split_basis)
-      }),
+      mbbsChargingPolicy: requireMbbsRateCardPolicy(Number(row.policy_schema_version) === 3
+        ? {
+            schemaVersion: 3,
+            currency: String(row.policy_currency),
+            directPickupUnitAmountMinor: Number(row.direct_pickup_unit_amount_minor),
+            poVrmaAdditionalStopUnitAmountMinor: Number(row.po_vrma_additional_stop_unit_amount_minor),
+            toReplenishmentAdditionalDropUnitAmountMinor: Number(row.to_replenishment_additional_drop_unit_amount_minor),
+            soChargeBasis: String(row.so_charge_basis),
+            toReplenishmentChargeBasis: String(row.to_replenishment_charge_basis),
+            toDirectPickupChargeBasis: String(row.to_direct_pickup_charge_basis),
+            poChargeBasis: String(row.po_charge_basis),
+            dispatchLoadSplitBasis: String(row.dispatch_load_split_basis),
+            poVrmaBaseChargeBasis: String(row.po_vrma_base_charge_basis),
+            vrmaDirectionBasis: String(row.vrma_direction_basis),
+            poVrmaAdditionalStopBasis: String(row.po_vrma_additional_stop_basis),
+            endpointOverrideBasis: String(row.endpoint_override_basis),
+            toReplenishmentMultiDropBasis: String(row.to_replenishment_multi_drop_basis)
+          }
+        : Number(row.policy_schema_version) === 2
+          ? {
+            schemaVersion: 2,
+            currency: String(row.policy_currency),
+            directPickupUnitAmountMinor: Number(row.direct_pickup_unit_amount_minor),
+            poVrmaAdditionalStopUnitAmountMinor: Number(row.po_vrma_additional_stop_unit_amount_minor),
+            soChargeBasis: String(row.so_charge_basis),
+            toReplenishmentChargeBasis: String(row.to_replenishment_charge_basis),
+            toDirectPickupChargeBasis: String(row.to_direct_pickup_charge_basis),
+            poChargeBasis: String(row.po_charge_basis),
+            dispatchLoadSplitBasis: String(row.dispatch_load_split_basis),
+            poVrmaBaseChargeBasis: String(row.po_vrma_base_charge_basis),
+            vrmaDirectionBasis: String(row.vrma_direction_basis),
+            poVrmaAdditionalStopBasis: String(row.po_vrma_additional_stop_basis),
+            endpointOverrideBasis: String(row.endpoint_override_basis)
+            }
+          : {
+            schemaVersion: 1,
+            currency: String(row.policy_currency),
+            directPickupUnitAmountMinor: Number(row.direct_pickup_unit_amount_minor),
+            poAdditionalDropUnitAmountMinor: Number(row.po_additional_drop_unit_amount_minor),
+            soChargeBasis: String(row.so_charge_basis),
+            toReplenishmentChargeBasis: String(row.to_replenishment_charge_basis),
+            toDirectPickupChargeBasis: String(row.to_direct_pickup_charge_basis),
+            poChargeBasis: String(row.po_charge_basis),
+            poAdditionalDropBasis: String(row.po_additional_drop_basis),
+            dispatchLoadSplitBasis: String(row.dispatch_load_split_basis)
+          }),
+      mbbsVendorRouteRates: normalizeMbbsVendorRouteRates(routeRatesByVersion.get(versionId) || []),
       rateCustomerNetsuiteId: row.rate_customer_netsuite_id === null
         ? null
         : String(row.rate_customer_netsuite_id)
@@ -1541,6 +1626,145 @@ async function selectedCandidateLocalItem() {
   return selected.rows[0];
 }
 
+/** @param {Record<string, any> | null} actual @param {unknown} retained */
+function sameVendorRouteRate(actual, retained) {
+  if (!actual) {
+    return retained === null || retained === undefined;
+  }
+  if (!retained || typeof retained !== "object" || Array.isArray(retained)) {
+    return false;
+  }
+  const supplied = /** @type {Record<string, any>} */ (retained);
+  return [
+    [actual.rateName, supplied.rateName],
+    [actual.displayName, supplied.displayName],
+    [actual.localVendorId, Number(supplied.localVendorId)],
+    [actual.localVendorName, supplied.localVendorName],
+    [actual.vendorYardName, supplied.vendorYardName],
+    [actual.vendorYardAddress, supplied.vendorYardAddress],
+    [actual.destinationYardCode, supplied.destinationYardCode],
+    [actual.baseAmountMinor, Number(supplied.baseAmountMinor)],
+    [actual.currency, supplied.currency]
+  ].every(([left, right]) => left === right);
+}
+
+/**
+ * Independently recompute a schema-v2 PO/VRMA amount from the active graph.
+ * Browser-supplied money and the earlier preview are evidence only.
+ *
+ * @param {Record<string, any>} entry
+ * @param {Record<string, any>} candidate
+ * @param {Array<Record<string, any>>} graph
+ * @param {number} distanceMetres
+ * @param {Record<string, any>} charge
+ */
+// eslint-disable-next-line complexity -- Fail-closed shadow pricing verifies every retained PO/VRMA evidence branch.
+function candidateVendorRouteBillingLoad(entry, candidate, graph, distanceMetres, charge) {
+  const firstBand = graph[0];
+  if (!firstBand) {
+    throw failure(409, "MBT_MBBS_CALCULATION_STALE", "The active MBBS rate graph is unavailable.");
+  }
+  const policy = firstBand.mbbsChargingPolicy;
+  const pricingMethod = requiredText(entry.pricingMethod, "PO/VRMA pricing method");
+  if (!["vendor_yard_flat", "distance_band"].includes(pricingMethod)) {
+    throw failure(409, "MBT_MBBS_CALCULATION_STALE", "The retained PO/VRMA pricing method is invalid.");
+  }
+  const identity = object(candidate.vendorRouteEvidence, "Vendor-route identity evidence");
+  const vendorRate = selectMbbsVendorRouteRate(firstBand.mbbsVendorRouteRates, {
+    sourceType: Array.isArray(candidate.references)
+      ? candidate.references.map((reference) => String(reference.sourceType)).find((type) => ["PO", "VRMA"].includes(type))
+      : null,
+    localVendorId: Number(identity.localVendorId),
+    vendorYardName: String(identity.vendorYardName || ""),
+    vendorYardAliases: [],
+    mbbsYardCode: String(identity.mbbsYardCode || "")
+  });
+  if (!sameVendorRouteRate(vendorRate, entry.selectedVendorRouteRate)) {
+    throw failure(409, "MBT_MBBS_CALCULATION_STALE", "The retained vendor-yard rate no longer matches the active rate graph.");
+  }
+  if (pricingMethod === "vendor_yard_flat" && !vendorRate) {
+    throw failure(409, "MBT_MBBS_CALCULATION_STALE", "The selected vendor-yard flat rate is no longer active.");
+  }
+  if (pricingMethod === "distance_band" && vendorRate && identity.endpointOverride !== true) {
+    throw failure(409, "MBT_MBBS_CALCULATION_STALE", "Distance pricing is not allowed without retained endpoint-override evidence.");
+  }
+  const selected = pricingMethod === "distance_band"
+    ? /** @type {(Record<string, any> & {amountMinor: unknown}) | undefined} */ (selectRateBand(graph, distanceMetres))
+    : null;
+  const retainedBand = entry.selectedBand;
+  if (pricingMethod === "vendor_yard_flat" && retainedBand !== null) {
+    throw failure(409, "MBT_MBBS_CALCULATION_STALE", "A flat vendor-yard charge cannot retain a selected distance band.");
+  }
+  if (pricingMethod === "distance_band") {
+    const suppliedBand = object(retainedBand, "Selected rate band");
+    if (!selected || String(selected.rateDistanceBandId) !== String(suppliedBand.rateDistanceBandId)) {
+      throw failure(409, "MBT_MBBS_CALCULATION_STALE", "The selected distance band changed before conversion.");
+    }
+  }
+  const amount = calculateMbbsPurchaseRouteAmount({
+    pricingMethod,
+    vendorRouteAmountMinor: vendorRate?.baseAmountMinor ?? 0,
+    distanceBandAmountMinor: selected
+      ? calculateDistanceBandChargeMinor(selected, distanceMetres)
+      : 0,
+    routeStopCount: nonnegativeInteger(candidate.routeStopCount, "Candidate route-stop count"),
+    mbbsChargingPolicy: policy
+  });
+  const manualAmount = resolveManualBillingAmount({
+    calculatedAmountMinor: amount.calculatedAmountMinor,
+    adjustmentMinor: charge.adjustmentMinor,
+    finalAmountMinor: charge.finalAmountMinor
+  });
+  if (String(charge.itemCode) !== "DELIVERY_CHARGE_MBBS"
+      || cad(charge.currency) !== firstBand.currency
+      || Number(charge.calculatedAmountMinor) !== amount.calculatedAmountMinor
+      || Number(charge.amountMinor) !== manualAmount.finalAmountMinor
+      || Number(charge.totalMinor) !== manualAmount.finalAmountMinor) {
+    throw failure(409, "MBT_MBBS_CALCULATION_STALE", "The PO/VRMA amount no longer matches the active rate graph.");
+  }
+  return {
+    physicalLoadId: requiredText(candidate.physicalLoadId, "Physical-load ID"),
+    completedAt: requiredText(candidate.completedAt, "Completed-load time"),
+    planDate: requiredText(candidate.planDate || String(candidate.completedAt).slice(0, 10), "Plan date"),
+    truckId: null,
+    driverId: null,
+    calculatedMetres: distanceMetres,
+    sharedTotalMinor: nonnegativeInteger(manualAmount.finalAmountMinor, "Shared cross-charge total"),
+    references: candidate.references,
+    billingEvidence: canonicalize({
+      schemaVersion: "mbbs-billing-manual-amount-v2",
+      billingRule: requiredText(candidate.billingRule, "Candidate billing rule"),
+      billingLegId: requiredText(candidate.billingLegId, "Candidate billing-leg ID"),
+      driverLoadIds: Array.isArray(candidate.driverLoadIds) ? candidate.driverLoadIds : [],
+      driverLoadNumbers: Array.isArray(candidate.driverLoadNumbers) ? candidate.driverLoadNumbers : [],
+      memberReferences: Array.isArray(candidate.memberReferences) ? candidate.memberReferences : [],
+      relationship: candidate.relationship || null,
+      routeStops: Array.isArray(candidate.routeStops) ? candidate.routeStops : [],
+      calculationSteps: Array.isArray(entry.calculationSteps) ? entry.calculationSteps : [],
+      distanceAvailable: entry.distanceAvailable === true,
+      pricingMethod,
+      pricingSource: pricingMethod,
+      vendorRouteEvidence: identity,
+      selectedVendorRouteRate: vendorRate,
+      mbbsChargingPolicy: policy,
+      baseAmountMinor: amount.baseAmountMinor,
+      distanceBandAmountMinor: amount.distanceBandAmountMinor,
+      vendorRouteAmountMinor: amount.vendorRouteAmountMinor,
+      additionalDropCount: amount.additionalStopCount,
+      additionalDropUnitAmountMinor: amount.additionalStopUnitAmountMinor,
+      additionalDropFeeMinor: amount.additionalStopFeeMinor,
+      ...manualAmount,
+      edited: manualAmount.adjustmentMinor !== 0,
+      editorId: String(object(entry.manualAmount, "Manual amount evidence").editorId || "")
+    }),
+    _rate: {
+      rateCardVersionId: String(entry.rateCardVersionId),
+      rateDistanceBandId: selected ? String(selected.rateDistanceBandId) : null,
+      currency: firstBand.currency
+    }
+  };
+}
+
 /** @param {Record<string, any>} entry @param {Map<string, Array<Record<string, any>>>} graphs */
 // eslint-disable-next-line complexity
 function candidateBillingLoad(entry, graphs) {
@@ -1551,6 +1775,11 @@ function candidateBillingLoad(entry, graphs) {
     ? object(entry.automaticRate, "Automatic rate evidence")
     : { available: true };
   const charge = object(entry.charge, "Calculated charge");
+  if (automaticRate.available !== false
+      && Number(graph?.[0]?.mbbsChargingPolicy?.schemaVersion) >= 2
+      && ["po_shared_leg", "po_group"].includes(String(candidate.billingRule))) {
+    return candidateVendorRouteBillingLoad(entry, candidate, /** @type {Array<Record<string, any>>} */ (graph), distanceMetres, charge);
+  }
   if (automaticRate.available === false) {
     const firstBand = graph?.[0];
     if (!firstBand

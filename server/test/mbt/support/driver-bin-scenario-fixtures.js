@@ -6,13 +6,12 @@ import {
   BIN_DISPATCH_YARD_CODE,
   BIN_DISPATCH_YARD_ID,
   binAssignmentCommand,
-  binDispatchPlanDate,
   createBinDispatchFixture,
   enabledBinDispatchBoundary
 } from "./bin-dispatch-fixtures.js";
+import { availableDriverExecutionPlanDate } from "./driver-bin-fixtures.js";
 
 const binDispatch = await import("../../../src/mbt/bin-dispatch-service.js");
-let nextScenarioDateOffset = 8_000 + crypto.randomInt(0, 2_000);
 
 /** @param {string} value */
 function compact(value) {
@@ -131,7 +130,8 @@ async function moveFixtureAssetToCustomer(fixture) {
 export async function createLoadedDumpDriverBinFixture() {
   let fixture = await createBinDispatchFixture({
     label: "driver-loaded-dump",
-    planDate: binDispatchPlanDate(nextScenarioDateOffset++)
+    planDate: await availableDriverExecutionPlanDate(),
+    pilotExpiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1_000)
   });
   fixture = await moveFixtureAssetToCustomer(fixture);
   const dumpSiteId = crypto.randomUUID();
@@ -255,7 +255,8 @@ export async function createLoadedDumpDriverBinFixture() {
 export async function createExchangeDriverBinFixture() {
   const fixture = await createBinDispatchFixture({
     label: "driver-exchange",
-    planDate: binDispatchPlanDate(nextScenarioDateOffset++)
+    planDate: await availableDriverExecutionPlanDate(),
+    pilotExpiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1_000)
   });
   const incomingAssetId = crypto.randomUUID();
   const incomingMovementId = crypto.randomUUID();

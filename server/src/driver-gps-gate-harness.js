@@ -16,6 +16,10 @@ assert(
   !/function locationCheckApproved\(\)[\s\S]{0,160}driverUsesSamsaraWorkflow\(\)/.test(driverSource),
   "The per-driver Samsara write-workflow setting must not bypass the frontend GPS gate."
 );
+assert(
+  /function locationCheckBlocksConfirmation\(\) \{[\s\S]{0,100}return !locationCheckApproved\(\)/.test(driverSource),
+  "An in-progress stop reopened without a current GPS result must keep Confirm disabled."
+);
 
 const showPhotoHandler = driverSource.match(/if \(action === "show-photo"\) \{([\s\S]*?)\n  \}/)?.[1] || "";
 assert(showPhotoHandler, "Show-photo handler must exist.");
@@ -25,10 +29,39 @@ assert(
   "GPS approval must run before the photo popup opens."
 );
 
+const overrideHandlerStart = driverSource.indexOf('if (action === "override-location")');
+const overrideHandlerEnd = driverSource.indexOf('if (action === "start-rest")', overrideHandlerStart);
+const overrideHandler = driverSource.slice(overrideHandlerStart, overrideHandlerEnd);
+assert(overrideHandlerStart >= 0 && overrideHandlerEnd > overrideHandlerStart, "Location override handler must exist.");
+assert(
+  overrideHandler.indexOf("ensureAuthoritativeJobBeforeAction(overrideJob)")
+    < overrideHandler.indexOf("locationOverrideAccepted = true"),
+  "Location override must revalidate the live job before accepting the explicit bypass."
+);
+assert(
+  overrideHandler.indexOf("locationOverrideAccepted = true")
+    < overrideHandler.indexOf('photoPromptOpen = true'),
+  "The explicit location override must be accepted before the photo screen opens."
+);
+assert(
+  driverSource.includes('data-action="override-location"')
+    && driverSource.includes('t("driver.overrideContinue", "Override & Continue")'),
+  "A GPS warning must expose an unmistakable Override & Continue action."
+);
+
 assert(
   driverSource.includes('data-action="complete-job" data-job-confirm data-gps-gate="complete"')
     && driverSource.includes("canCompleteCurrentJob(job)"),
   "The photo popup completion button must retain the GPS approval gate."
+);
+const photoModalStart = driverSource.indexOf("function renderPhotoSlots(job)");
+const photoModalEnd = driverSource.indexOf("function renderDriverDependencyWarnings(job)", photoModalStart);
+const photoModalSource = driverSource.slice(photoModalStart, photoModalEnd);
+assert(
+  photoModalSource.includes("renderLocationCheck(job)")
+    && photoModalSource.includes("driver.locationRequiredBeforeComplete")
+    && photoModalSource.includes("driver.requiredPhotosRemaining"),
+  "The photo modal must show the GPS actions and every reason Complete Stop is disabled."
 );
 
 const completeHandler = driverSource.match(/if \(action === "complete-job" && currentJob\) \{([\s\S]*?)\r?\n  \}\r?\n\}\);/)?.[1] || "";

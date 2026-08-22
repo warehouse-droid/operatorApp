@@ -409,6 +409,17 @@ export async function processDriverOfflineQueue({
       }
       const manifest = manifestCache.get(event.manifestId);
       if (!manifest) return null;
+      if (manifest.supersededAt) {
+        return markDriverOfflineEventReviewRequired(event.eventId, {
+          reason: "Route superseded by an approved Dispatch or SCM change. The event was retained for Dispatch review and its operational effects are blocked.",
+          result: {
+            code: "DRIVER_ROUTE_SUPERSEDED",
+            supersededAt: manifest.supersededAt,
+            supersededByRequestId: manifest.supersededByRequestId || null,
+            disposition: "review_required"
+          }
+        });
+      }
       const correction = await supersedingDriverPwaCorrection(event, manifest);
       if (!correction) return null;
       return markDriverOfflineEventEvidenceOnly(event.eventId, {

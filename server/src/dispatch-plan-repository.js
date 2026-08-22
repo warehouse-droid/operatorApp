@@ -19,7 +19,12 @@ import {
   scrubBilledSalesOrderFamilyFromPlan
 } from "./sales-order-reconciliation.js";
 import { scrubClosedNetSuiteOrdersFromOperationalPlan } from "./netsuite-closed-order-repository.js";
-import { buildCompactDispatchSnapshot, digestDispatchPlan, dispatchPlanBoard } from "./dispatch-planner-performance.js";
+import {
+  buildCompactDispatchSnapshot,
+  digestDispatchPlan,
+  dispatchPlanBoard,
+  evaluateExecutedPrefixPolicy
+} from "./dispatch-planner-performance.js";
 
 const CUSTOMER_PICKUP_DELIVERY_METHOD = "Pick-Up";
 const DISPATCH_PLAN_V2_VERSION = 2;
@@ -39,6 +44,14 @@ export class DisabledDispatchFleetAssignmentError extends Error {
 
 async function lockDispatchFleetPlanning() {
   await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
+}
+
+async function syncDispatchPlannerReadProjections(plan = {}) {
+  // Dynamic import avoids a module-initialization cycle: the v2 repository
+  // already imports this repository for canonical assignment semantics.
+  const projections = await import("./dispatch-planner-v2-repository.js");
+  await projections.syncDispatchPlanOrderAssignments(plan);
+  await projections.syncDispatchPlanRelationEdges(plan);
 }
 
 async function assertActiveDispatchFleetAssignments(plan = {}, { previousPlan = null } = {}) {
@@ -479,6 +492,50 @@ async function assertCustomOrderPlanDateExclusivity(plan = {}, { previousPlan = 
     status: row.status || ""
   }));
   if (conflicts.length) throw new DispatchCustomOrderDateConflictError(conflicts);
+}
+
+async function assertSpecialStockHandoffPlanning(plan = {}, { previousPlan = null } = {}) {
+  const previousRefs = previousPlan ? dispatchPlannedOrderRefs(previousPlan) : new Set();
+  const refs = [...dispatchPlannedOrderRefs(plan)].filter((ref) => !previousRefs.has(ref));
+  if (!refs.length) return;
+  const result = await query(
+    `SELECT special.request_id, special.sales_order_ref, special.purchase_order_ref,
+            special.post_po_change_pending, special.attention,
+            handoff.route, handoff.status,
+            purchase.status AS purchase_status,
+            purchase.status_text AS purchase_status_text,
+            purchase.receipt_status,
+            purchase.received_at
+       FROM sales_special_stock_cases special
+       LEFT JOIN sales_special_stock_handoffs handoff ON handoff.request_id = special.request_id
+       LEFT JOIN purchase_orders purchase ON purchase.netsuite_id = special.purchase_order_netsuite_id
+      WHERE lower(btrim(special.sales_order_ref)) = ANY($1::text[])`,
+    [refs.map((ref) => ref.trim().toLowerCase())]
+  );
+  for (const row of result.rows) {
+    if (row.attention === true || row.post_po_change_pending === true) {
+      throw Object.assign(new Error(`${row.sales_order_ref} has an unresolved Special Item Attention state.`), {
+        status: 409,
+        code: "SPECIAL_PLAN_ATTENTION"
+      });
+    }
+    if (!row.route || !["ready", "planned", "in_progress", "completed"].includes(row.status)) {
+      throw Object.assign(new Error(`${row.sales_order_ref} needs a Special Item Direct or Via Yard route before planning.`), {
+        status: 409,
+        code: "SPECIAL_PLAN_ROUTE_REQUIRED"
+      });
+    }
+    if (row.route === "via_yard") {
+      const purchaseState = `${row.purchase_status || ""} ${row.purchase_status_text || ""} ${row.receipt_status || ""}`;
+      const received = Boolean(row.received_at) || /\b(?:received|fully received|closed|fully billed)\b/i.test(purchaseState);
+      if (!received) {
+        throw Object.assign(new Error(`${row.sales_order_ref} must wait until ${row.purchase_order_ref} is received at the selected yard.`), {
+          status: 409,
+          code: "SPECIAL_PLAN_PO_RECEIPT_REQUIRED"
+        });
+      }
+    }
+  }
 }
 
 function collectPlanOrderRefs(plan) {
@@ -1335,14 +1392,16 @@ export async function saveDispatchPlanRecoveryDraft(planId, {
     }
 
     const inserted = await query(
-      `INSERT INTO dispatch_plan_snapshot_history (
+       `INSERT INTO dispatch_plan_snapshot_history (
          plan_id, plan_date, revision, orders, trucks, summary,
          original_saved_at, archive_reason, session_id,
-         schema_version, plan_digest, order_count, truck_count, load_count, stop_count
+         schema_version, plan_digest, order_count, truck_count, load_count, stop_count,
+         checkpoint_kind, retention_until
        ) VALUES (
          $1, $2::date, $3, $4::jsonb, $5::jsonb, $6::jsonb,
          $7, 'save_recovery', $8,
-         2, $9, $10, $11, $12, $13
+         2, $9, $10, $11, $12, $13,
+         'recovery', NULL
        )
        RETURNING id::text, archived_at`,
       [
@@ -1420,6 +1479,9 @@ export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [
       lockRows: true
     });
     await assertCustomOrderPlanDateExclusivity(canonicalPlan, {
+      previousPlan
+    });
+    await assertSpecialStockHandoffPlanning(canonicalPlan, {
       previousPlan
     });
     await assertActiveDispatchFleetAssignments({
@@ -1550,6 +1612,12 @@ export async function saveDispatchPlanSnapshot(planId, { orders = [], trucks = [
       orders: storedPlan.orders,
       trucks: storedPlan.trucks
     });
+    await syncDispatchPlannerReadProjections({
+      ...storedPlan,
+      id: planId,
+      planDate: expectedPlanDate,
+      revision: cleanPlan.revision
+    });
     await syncDispatchPlanLoadAssignments({
       ...storedPlan,
       id: planId,
@@ -1599,10 +1667,12 @@ export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" }
       await query(
         `INSERT INTO dispatch_plan_snapshot_history (
            plan_id, plan_date, revision, orders, trucks, summary,
-           original_saved_at, archive_reason, session_id
+           original_saved_at, archive_reason, session_id,
+           checkpoint_kind, checkpoint_key, retention_until
          )
          VALUES ($1, $2::date, $3, COALESCE($4::jsonb, '[]'::jsonb), COALESCE($5::jsonb, '[]'::jsonb),
-                 COALESCE($6::jsonb, '{}'::jsonb), $7, 'before_restore', $8)`,
+                 COALESCE($6::jsonb, '{}'::jsonb), $7, 'before_restore', $8,
+                 'lifecycle', $9, now() + interval '90 days')`,
         [
           current.id,
           currentDate,
@@ -1611,7 +1681,8 @@ export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" }
           JSON.stringify(current.trucks || []),
           JSON.stringify(current.summary || {}),
           current.saved_at,
-          sessionId || ""
+          sessionId || "",
+          `restore:${snapshotId}:${current.revision}`
         ]
       );
     }
@@ -1657,6 +1728,14 @@ export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" }
         trucks: current.trucks || []
       }
     });
+    await assertSpecialStockHandoffPlanning(canonicalPlan, {
+      previousPlan: {
+        id: current.id,
+        planDate: currentDate,
+        orders: current.orders || [],
+        trucks: current.trucks || []
+      }
+    });
     const cleanPlan = {
       ...canonicalPlan,
       summary: dispatchPlanV2Summary(canonicalPlan.summary || {}, {
@@ -1666,6 +1745,39 @@ export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" }
           : DISPATCH_PLAN_V2_BACKFILL_SOURCE
       })
     };
+    const activity = await query(
+      `SELECT status, load_id, stop_id, stop_type, order_refs
+         FROM driver_job_records
+        WHERE plan_id = $1
+          AND status IN ('in_progress', 'complete')
+        ORDER BY id`,
+      [current.id]
+    );
+    const executionPolicy = evaluateExecutedPrefixPolicy({
+      previousPlan: {
+        id: String(current.id),
+        planDate: currentDate,
+        orders: current.orders || [],
+        trucks: current.trucks || []
+      },
+      nextPlan: {
+        ...cleanPlan,
+        id: String(current.id),
+        planDate: currentDate
+      },
+      activity: activity.rows
+    });
+    if (!executionPolicy.allowed) {
+      const first = executionPolicy.conflicts[0] || {};
+      throw Object.assign(
+        new Error(first.message || "Driver activity protects the executed physical prefix."),
+        {
+          code: first.code || "DISPATCH_ACTIVE_LOAD_LOCKED",
+          status: 409,
+          conflicts: executionPolicy.conflicts
+        }
+      );
+    }
     await assertActiveDispatchFleetAssignments({
       ...cleanPlan,
       planDate: currentDate
@@ -1697,6 +1809,12 @@ export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" }
       planDate: currentDate,
       orders: cleanPlan.orders,
       trucks: cleanPlan.trucks
+    });
+    await syncDispatchPlannerReadProjections({
+      ...cleanPlan,
+      id: source.plan_id,
+      planDate: currentDate,
+      revision: Number(current.revision || 0) + 1
     });
     await syncDispatchPlanLoadAssignments({
       ...cleanPlan,
@@ -1764,6 +1882,7 @@ async function confirmDispatchPlanTransaction(planId, { note = "", binBoundary =
       lockRows: true
     });
     await assertCustomOrderPlanDateExclusivity(canonicalPlan, { previousPlan: currentPlan });
+    await assertSpecialStockHandoffPlanning(canonicalPlan);
     const sanitizedPlan = await sanitizeDispatchPlan(canonicalPlan);
     await assertActiveDispatchFleetAssignments(sanitizedPlan, { previousPlan: currentPlan });
     await assertActiveDispatchCosForPlan({

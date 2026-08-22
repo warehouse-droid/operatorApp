@@ -276,6 +276,7 @@ test("stress source identity covers the deployable Driver PWA generation", () =>
   );
   for (const file of [
     "public/driver.html",
+    "public/driver-reset.html",
     "public/driver-service-worker.js",
     "public/driver.css",
     "public/i18n.css",
@@ -286,8 +287,11 @@ test("stress source identity covers the deployable Driver PWA generation", () =>
     "src/driver-client-version-harness.js",
     "src/driver-offline-client-harness.js",
     "src/driver-photo-integrity-harness.js",
+    "src/server.js",
     "test/mbt/e2e/driver-pwa-cache-repair.spec.js",
+    "test/mbt/integration/driver-pwa-site-reset-http.test.js",
     "test/mbt/unit/driver-pwa-cache-repair.test.js",
+    "test/mbt/unit/driver-pwa-site-reset.test.js",
     "test/mbt/unit/driver-pwa-recovery-assets.test.js",
     "test/mbt/unit/driver-camera-ordinary-upload.test.js",
     "test/driver-offline-soak.compose.yml",

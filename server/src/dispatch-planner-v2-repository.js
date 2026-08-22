@@ -7,7 +7,16 @@ import {
   reconcileDispatchPlanLocalCos
 } from "./dispatch-co-lifecycle.js";
 import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
-import { dispatchPlanV2Summary } from "./dispatch-plan-repository.js";
+import {
+  dispatchPlannedAssignmentMap,
+  dispatchPlanV2Summary
+} from "./dispatch-plan-repository.js";
+import {
+  applyDispatchPlanDelta,
+  dispatchCheckpointDecision,
+  dispatchCheckpointRetention,
+  extractDispatchOrderRelationEdges
+} from "./dispatch-planner-optimization.js";
 import {
   assertHistoricalInactiveSalesOrdersReconciled,
   assertNoDriverPwaCompletedDispatchRefs
@@ -123,7 +132,8 @@ function slimAssignedOrder(order = {}) {
     "expectedDeliveryDate", "windowStart", "windowEnd", "items", "pallets", "layers",
     "salesQty", "salesQuantities", "committedQty", "packed", "weight", "totalWeightLbs",
     "unloadMinutes", "travelMinutes", "stopMinutes", "instructions", "notes",
-    "originalOrderId", "sourceOrderId", "relatedSoId", "originalPoRef", "childOrders",
+    "originalOrderId", "sourceOrderId", "relatedSoId", "originalPoRef", "sourcePoRef",
+    "sourcePoRefs", "correspondingPoRefs", "childOrders",
     "childOrderDetails", "groupAliases", "transitCo", "transitOriginalPickupLocations",
     "transitOriginalSourceYard", "poPickupManifest", "orderDependencies", "dependencyLabels",
     "dependencyDirectPickup", "dependencyWaitingForTransfer", "dependencyAttention",
@@ -190,7 +200,7 @@ async function selectPlan({ planId = "", date = "", lock = false } = {}) {
       ${lock ? "FOR UPDATE OF p" : ""}`,
     params
   );
-  if (!result.rows[0]) return null;
+  if (!result.rows[0]) {return null;}
   const reconciled = await reconcileCancelledLocalCos(rowPlan(result.rows[0]));
   return (await scrubClosedNetSuiteOrdersFromOperationalPlan(reconciled)).plan;
 }
@@ -325,12 +335,16 @@ export async function getDispatchV2CommandReplay({ command = {} } = {}) {
   const commandId = text(command.commandId);
   if (!commandId) {return null;}
   const payload = await existingReceipt(commandId, requestHash(command));
-  return payload ? { payload, replay: true } : null;
+  if (!payload) {return null;}
+  if (payload.receipt?.compact === true && !payload.plan) {
+    const plan = await selectPlan({ planId: payload.receipt.planId });
+    if (plan) {return { payload: { ...payload, plan: publicPlan(plan) }, replay: true };}
+  }
+  return { payload, replay: true };
 }
 
-function plannedRows(plan = {}) {
-  const rows = [];
-  const seen = new Set();
+function assignmentLocations(plan = {}) {
+  const locations = new Map();
   for (const truck of plan.trucks || []) {
     for (const load of truck?.loads || []) {
       for (const stop of load?.stops || []) {
@@ -340,39 +354,221 @@ function plannedRows(plan = {}) {
           stop.orderRef,
           ...(Array.isArray(stop.orderRefs) ? stop.orderRefs : [])
         ].map(text).filter(Boolean))];
-        for (const ref of refs) {
-          const key = ref.toLowerCase();
-          if (seen.has(key)) {continue;}
-          seen.add(key);
-          rows.push({ orderRef: ref, loadId: text(load.id), stopId: text(stop.id) });
-        }
+        for (const ref of refs) {if (!locations.has(ref.toLowerCase())) {locations.set(ref.toLowerCase(), {
+          loadId: text(load.id),
+          stopId: text(stop.id),
+          truckId: text(truck.id),
+          truckPlate: text(truck.plate || truck.truckPlate),
+          loadName: text(load.name)
+        });}}
       }
     }
+  }
+  return locations;
+}
+
+function nestedOrderMap(plan = {}) {
+  const orders = new Map();
+  const visit = (order) => {
+    const ref = text(order?.id || order?.orderId || order?.orderRef || order?.tranid || order?.refNumber);
+    if (!ref || orders.has(ref.toLowerCase())) {return;}
+    orders.set(ref.toLowerCase(), order);
+    for (const child of Array.isArray(order?.childOrderDetails) ? order.childOrderDetails : []) {visit(child);}
+  };
+  for (const order of Array.isArray(plan.orders) ? plan.orders : []) {visit(order);}
+  return orders;
+}
+
+function splitParentRef(order = {}, orderReference = "") {
+  const explicitParent = text(order?.originalOrderId || order?.parentOrderRef);
+  if (explicitParent) {return explicitParent;}
+  if (
+    text(order?.type).toUpperCase() === "CUSTOM"
+    || order?.customOrder === true
+    || text(order?.sourceTable).toLowerCase() === "dispatch_custom_orders"
+  ) {return "";}
+  const ref = text(orderReference || order?.id || order?.orderId || order?.orderRef);
+  return /-S\d+$/iu.test(ref) ? ref.replace(/-S\d+$/iu, "") : "";
+}
+
+export function dispatchPlanAssignmentRows(plan = {}) {
+  const locations = assignmentLocations(plan);
+  const orders = nestedOrderMap(plan);
+  const rows = [];
+  const seen = new Set();
+  const add = ({ orderRef, plannedOrderRef, assignmentKind, details }) => {
+    const ref = text(orderRef);
+    const plannedRef = text(plannedOrderRef) || ref;
+    const key = ref.toLowerCase();
+    if (!ref || seen.has(key)) {return;}
+    seen.add(key);
+    const location = locations.get(plannedRef.toLowerCase()) || locations.get(key) || {};
+    rows.push({
+      orderRef: ref,
+      plannedOrderRef: plannedRef,
+      assignmentKind,
+      loadId: text(location.loadId),
+      stopId: text(location.stopId),
+      assignment: {
+        ...details,
+        plannedOrderRef: plannedRef,
+        dispatchTruckId: text(location.truckId),
+        dispatchTruckPlate: text(details?.dispatchTruckPlate || location.truckPlate),
+        dispatchLoadName: text(details?.dispatchLoadName || location.loadName),
+        dispatchLoadId: text(location.loadId),
+        dispatchStopId: text(location.stopId)
+      }
+    });
+  };
+  for (const [ref, assignment] of dispatchPlannedAssignmentMap(plan)) {
+    const details = { ...(assignment || {}) };
+    const plannedRef = text(details.plannedOrderRef) || ref;
+    add({
+      orderRef: ref,
+      plannedOrderRef: plannedRef,
+      assignmentKind: ref.toLowerCase() === plannedRef.toLowerCase() ? "direct" : "group_member",
+      details
+    });
+  }
+  for (const row of [...rows]) {
+    const assignedOrder = orders.get(row.orderRef.toLowerCase());
+    const parentRef = splitParentRef(assignedOrder, row.orderRef);
+    if (parentRef && parentRef.toLowerCase() !== row.orderRef.toLowerCase()) {add({
+      orderRef: parentRef,
+      plannedOrderRef: row.plannedOrderRef,
+      assignmentKind: "split_parent_alias",
+      details: { ...row.assignment, splitChildOrderRef: row.orderRef }
+    });}
   }
   return rows;
 }
 
-async function syncOrderAssignments(plan = {}) {
-  const rows = plannedRows(plan);
+export async function listDispatchPlanOrderAssignmentsProjection({
+  orderRefs = [],
+  excludePlanId = "",
+  excludePlanDate = ""
+} = {}) {
+  const refs = [...new Set(
+    (orderRefs || []).map((ref) => text(ref).toLowerCase()).filter(Boolean)
+  )];
+  const result = await query(
+    `SELECT assignment.plan_id::text AS plan_id,
+            assignment.plan_date::text AS plan_date,
+            plan.status,
+            assignment.order_ref,
+            assignment.planned_order_ref,
+            assignment.assignment_kind,
+            assignment.load_id,
+            assignment.stop_id,
+            assignment.assignment
+       FROM dispatch_plan_order_assignments assignment
+       JOIN dispatch_plans plan ON plan.id = assignment.plan_id
+      WHERE plan.status <> 'cancelled'
+        AND (NULLIF($1, '') IS NULL OR assignment.plan_id <> NULLIF($1, '')::bigint)
+        AND ($2 = '' OR assignment.plan_date <> $2::date)
+        AND (
+          cardinality($3::text[]) = 0
+          OR lower(assignment.order_ref) = ANY($3::text[])
+        )
+      ORDER BY assignment.plan_date DESC, plan.updated_at DESC,
+               assignment.plan_id DESC, lower(assignment.order_ref)`,
+    [text(excludePlanId), text(excludePlanDate).slice(0, 10), refs]
+  );
+  return result.rows.map((row) => ({
+    planId: text(row.plan_id),
+    planDate: text(row.plan_date).slice(0, 10),
+    status: text(row.status),
+    orderRef: text(row.order_ref),
+    plannedOrderRef: text(row.planned_order_ref),
+    assignmentKind: text(row.assignment_kind),
+    loadId: text(row.load_id),
+    stopId: text(row.stop_id),
+    assignment: row.assignment && typeof row.assignment === "object" ? row.assignment : {}
+  }));
+}
+
+export async function syncDispatchPlanOrderAssignments(plan = {}) {
+  const rows = dispatchPlanAssignmentRows(plan);
   await query("DELETE FROM dispatch_plan_order_assignments WHERE plan_id = $1", [plan.id]);
   if (!rows.length) {return;}
   await query(
     `INSERT INTO dispatch_plan_order_assignments (
-       plan_id, plan_date, order_ref, load_id, stop_id, updated_at
+       plan_id, plan_date, order_ref, planned_order_ref, assignment_kind,
+       load_id, stop_id, assignment, updated_at
      )
-     SELECT $1, $2::date, source.order_ref, source.load_id, source.stop_id, now()
-       FROM jsonb_to_recordset($3::jsonb) AS source(order_ref text, load_id text, stop_id text)
+     SELECT $1, $2::date, source.order_ref, source.planned_order_ref,
+            source.assignment_kind, source.load_id, source.stop_id,
+            source.assignment, now()
+       FROM jsonb_to_recordset($3::jsonb) AS source(
+         order_ref text, planned_order_ref text, assignment_kind text,
+         load_id text, stop_id text, assignment jsonb
+       )
      ON CONFLICT (plan_id, order_ref) DO UPDATE
        SET plan_date = EXCLUDED.plan_date,
+           planned_order_ref = EXCLUDED.planned_order_ref,
+           assignment_kind = EXCLUDED.assignment_kind,
            load_id = EXCLUDED.load_id,
            stop_id = EXCLUDED.stop_id,
+           assignment = EXCLUDED.assignment,
            updated_at = now()`,
     [plan.id, plan.planDate, JSON.stringify(rows.map((row) => ({
       order_ref: row.orderRef,
+      planned_order_ref: row.plannedOrderRef,
+      assignment_kind: row.assignmentKind,
       load_id: row.loadId,
-      stop_id: row.stopId
+      stop_id: row.stopId,
+      assignment: row.assignment
     })))]
   );
+}
+
+export async function syncDispatchPlanRelationEdges(plan = {}) {
+  const edges = extractDispatchOrderRelationEdges(plan);
+  await query("DELETE FROM dispatch_order_relation_edges WHERE plan_id = $1", [plan.id]);
+  if (!edges.length) {return;}
+  await query(
+    `INSERT INTO dispatch_order_relation_edges (
+       plan_id, relation_type, owner_ref, member_ref, metadata, source_revision, updated_at
+     )
+     SELECT $1, source.relation_type, source.owner_ref, source.member_ref,
+            source.metadata, $2, now()
+       FROM jsonb_to_recordset($3::jsonb) AS source(
+         relation_type text, owner_ref text, member_ref text, metadata jsonb
+       )`,
+    [plan.id, Number(plan.revision || 0), JSON.stringify(edges.map((edge) => ({
+      relation_type: edge.relationType,
+      owner_ref: edge.ownerRef,
+      member_ref: edge.memberRef,
+      metadata: edge.metadata
+    })))]
+  );
+}
+
+export async function backfillDispatchPlanProjections() {
+  const active = await query(
+    `SELECT p.id, p.plan_date::text AS plan_date, p.status, p.note, p.revision,
+            p.created_at, p.updated_at, s.saved_at, s.orders, s.trucks, s.summary,
+            s.schema_version
+       FROM dispatch_plans p
+       JOIN dispatch_plan_snapshots s ON s.plan_id = p.id
+      WHERE p.status <> 'cancelled'
+      ORDER BY p.plan_date, p.id`
+  );
+  let projected = 0;
+  for (const row of active.rows) {
+    const plan = rowPlan(row);
+    await withTransaction(async () => {
+      await syncDispatchPlanOrderAssignments(plan);
+      await syncDispatchPlanRelationEdges(plan);
+    });
+    projected += 1;
+  }
+  await query(
+    `UPDATE dispatch_order_catalog_state
+        SET assignments_ready = true, updated_at = now()
+      WHERE singleton = true`
+  );
+  return { projected };
 }
 
 async function otherDateAssignment(plan, orderReference) {
@@ -422,9 +618,15 @@ async function assertAssignmentDateAvailable(plan, command) {
   let refs = [];
   if (commandType === "assign_order") {
     refs = [text(command.payload?.orderRef)].filter(Boolean);
-  } else if (commandType === "replace_plan") {
+  } else if (
+    commandType === "replace_plan"
+    || (command.payload?.planDelta && typeof command.payload.planDelta === "object")
+  ) {
+    const candidate = commandType === "replace_plan"
+      ? { trucks: command.payload?.trucks || [] }
+      : applyDispatchPlanDelta(plan, command.payload.planDelta);
     const previousRefs = new Set(dispatchPlanBoard(plan).orderRefs.map((ref) => text(ref).toLowerCase()));
-    refs = dispatchPlanBoard({ trucks: command.payload?.trucks || [] }).orderRefs
+    refs = dispatchPlanBoard(candidate).orderRefs
       .map(text)
       .filter((ref) => ref && !previousRefs.has(ref.toLowerCase()));
   }
@@ -444,7 +646,7 @@ async function assertAssignmentDateAvailable(plan, command) {
   }
 }
 
-function commandOrderRefs(command = {}) {
+function commandOrderRefs(command = {}, plan = {}) {
   const commandType = text(command.commandType || command.type);
   const payload = command.payload && typeof command.payload === "object" ? command.payload : {};
   const refs = [
@@ -463,6 +665,8 @@ function commandOrderRefs(command = {}) {
       orders: Array.isArray(payload.orders) ? payload.orders : [],
       trucks: Array.isArray(payload.trucks) ? payload.trucks : []
     }));
+  } else if (payload.planDelta && typeof payload.planDelta === "object" && !Array.isArray(payload.planDelta)) {
+    refs.push(...operationalPlanOrderRefs(applyDispatchPlanDelta(plan, payload.planDelta)));
   }
   return [...new Set(refs.map(text).filter(Boolean))];
 }
@@ -489,6 +693,40 @@ function snapshotCounts(plan = {}) {
   };
 }
 
+async function recordDispatchCommandCheckpointState(previousPlan = {}, nextPlan = {}) {
+  await query(
+    `INSERT INTO dispatch_plan_checkpoint_state (
+       plan_id, last_checkpoint_revision, last_checkpoint_at,
+       commands_since_checkpoint, checkpoint_due, due_trigger, updated_at
+     ) VALUES ($1, $2, COALESCE($3::timestamptz, now()), 0, false, '', now())
+     ON CONFLICT (plan_id) DO NOTHING`,
+    [nextPlan.id, Number(previousPlan.revision || 0), previousPlan.savedAt || null]
+  );
+  const current = await query(
+    `SELECT last_checkpoint_revision, last_checkpoint_at, commands_since_checkpoint
+       FROM dispatch_plan_checkpoint_state
+      WHERE plan_id = $1
+      FOR UPDATE`,
+    [nextPlan.id]
+  );
+  const state = current.rows[0] || {};
+  const commandsSinceCheckpoint = Number(state.commands_since_checkpoint || 0) + 1;
+  const decision = dispatchCheckpointDecision({
+    commandsSinceCheckpoint,
+    lastCheckpointAt: state.last_checkpoint_at,
+    now: nextPlan.savedAt || new Date()
+  });
+  await query(
+    `UPDATE dispatch_plan_checkpoint_state
+        SET commands_since_checkpoint = $2,
+            checkpoint_due = $3,
+            due_trigger = $4,
+            updated_at = now()
+      WHERE plan_id = $1`,
+    [nextPlan.id, commandsSinceCheckpoint, decision.due, decision.trigger]
+  );
+}
+
 export async function applyDispatchV2Command({ planId, command = {}, actorId = null } = {}) {
   const commandId = text(command.commandId);
   const commandType = text(command.commandType || command.type);
@@ -501,8 +739,15 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
     const plan = await selectPlan({ planId, lock: true });
     if (!plan) {throw commandError("Dispatch plan not found.", "DISPATCH_PLAN_NOT_FOUND", 404);}
     const replay = await existingReceipt(commandId, hash);
-    if (replay) {return { payload: replay, replay: true };}
-    await assertNoClosedNetSuiteOrders(commandOrderRefs({ ...command, commandType }), "be changed in Dispatch");
+    if (replay) {
+      return {
+        payload: replay.receipt?.compact === true && !replay.plan
+          ? { ...replay, plan: publicPlan(plan) }
+          : replay,
+        replay: true
+      };
+    }
+    await assertNoClosedNetSuiteOrders(commandOrderRefs({ ...command, commandType }, plan), "be changed in Dispatch");
     await assertAssignmentDateAvailable(plan, { ...command, commandType });
     const result = applyDispatchPlanCommand({
       plan,
@@ -522,7 +767,7 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
       throw commandError(policy.conflicts[0].message, policy.conflicts[0].code, 409, { conflicts: policy.conflicts });
     }
     await assertActiveDispatchCosForPlan(result.plan);
-    if (plan.savedAt) {
+    if (plan.savedAt && command.compactReceipt !== true) {
       const previousCounts = snapshotCounts(plan);
       await query(
         `INSERT INTO dispatch_plan_snapshot_history (
@@ -594,7 +839,9 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
         counts.stopCount
       ]
     );
-    await syncOrderAssignments(result.plan);
+    await syncDispatchPlanOrderAssignments(result.plan);
+    await syncDispatchPlanRelationEdges(result.plan);
+    if (command.compactReceipt === true) {await recordDispatchCommandCheckpointState(plan, result.plan);}
     // Operator reads this projection instead of the plan JSON. Keep it in the
     // command transaction so a refresh cannot resurrect a just-ungrouped order.
     await syncDispatchDeliveryGroupsFromPlan(result.plan);
@@ -603,6 +850,19 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
       patch: result.patch,
       acknowledgement: { ...result.acknowledgement, revision: result.plan.revision, digest }
     };
+    const storedPayload = command.compactReceipt === true
+      ? {
+          patch: payload.patch,
+          acknowledgement: payload.acknowledgement,
+          receipt: {
+            compact: true,
+            planId: plan.id,
+            planDate: plan.planDate,
+            appliedRevision: result.plan.revision,
+            digest
+          }
+        }
+      : payload;
     await query(
       `INSERT INTO dispatch_plan_commands (
          command_id, plan_id, plan_date, command_type, request_hash,
@@ -618,7 +878,7 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
         result.plan.revision,
         text(command.sessionId),
         actorId || null,
-        JSON.stringify(payload)
+        JSON.stringify(storedPayload)
       ]
     );
     await query(
@@ -631,6 +891,148 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
   });
 }
 
+function checkpointResult(row = {}) {
+  return {
+    id: text(row.id),
+    planId: text(row.plan_id),
+    planDate: planDate(row.plan_date),
+    revision: Number(row.revision || 0),
+    archivedAt: row.archived_at || null,
+    archiveReason: row.archive_reason || "",
+    checkpointKind: row.checkpoint_kind || "legacy",
+    checkpointKey: row.checkpoint_key || "",
+    retentionUntil: row.retention_until || null,
+    digest: row.plan_digest || "",
+    orderCount: Number(row.order_count || 0),
+    truckCount: Number(row.truck_count || 0),
+    loadCount: Number(row.load_count || 0),
+    stopCount: Number(row.stop_count || 0)
+  };
+}
+
+export async function createDispatchV2Checkpoint({
+  planId,
+  kind = "manual",
+  reason = "",
+  sessionId = "",
+  checkpointKey = "",
+  expectedRevision = null,
+  expectedDigest = ""
+} = {}) {
+  const checkpointKind = text(kind).toLowerCase();
+  if (!["periodic", "manual", "lifecycle"].includes(checkpointKind)) {
+    throw commandError("Unsupported Dispatch checkpoint kind.", "DISPATCH_CHECKPOINT_KIND_INVALID", 400);
+  }
+  const cleanKey = text(checkpointKey).slice(0, 240);
+  const cleanReason = text(reason).replace(/[^a-z0-9_-]+/giu, "_").slice(0, 80) || checkpointKind;
+  return withTransaction(async () => {
+    await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
+    if (cleanKey) {
+      const existing = await query(
+        `SELECT id::text, plan_id::text, plan_date::text, revision, archived_at,
+                archive_reason, checkpoint_kind, checkpoint_key, retention_until,
+                plan_digest, order_count, truck_count, load_count, stop_count
+           FROM dispatch_plan_snapshot_history
+          WHERE plan_id = $1
+            AND checkpoint_kind = $2
+            AND checkpoint_key = $3
+          LIMIT 1`,
+        [planId, checkpointKind, cleanKey]
+      );
+      if (existing.rows[0]) {return { ...checkpointResult(existing.rows[0]), replay: true };}
+    }
+    const plan = await selectPlan({ planId, lock: true });
+    if (!plan) {throw commandError("Dispatch plan not found.", "DISPATCH_PLAN_NOT_FOUND", 404);}
+    const revision = Number(plan.revision || 0);
+    const digest = digestDispatchPlan(plan);
+    if (expectedRevision !== null && expectedRevision !== undefined && Number(expectedRevision) !== revision) {
+      throw commandError("Dispatch plan changed before the checkpoint was created.", "STALE_DISPATCH_PLAN", 409, {
+        expectedRevision: Number(expectedRevision), currentRevision: revision
+      });
+    }
+    if (text(expectedDigest) && text(expectedDigest) !== digest) {
+      throw commandError("Dispatch plan content changed before the checkpoint was created.", "STALE_DISPATCH_PLAN", 409, {
+        expectedDigest: text(expectedDigest), currentDigest: digest
+      });
+    }
+    const counts = snapshotCounts(plan);
+    const retentionDays = dispatchCheckpointRetention({ kind: checkpointKind });
+    const inserted = await query(
+      `INSERT INTO dispatch_plan_snapshot_history (
+         plan_id, plan_date, revision, orders, trucks, summary,
+         original_saved_at, archive_reason, session_id,
+         schema_version, plan_digest, order_count, truck_count, load_count, stop_count,
+         checkpoint_kind, checkpoint_key, retention_until
+       ) VALUES (
+         $1, $2::date, $3, $4::jsonb, $5::jsonb, $6::jsonb,
+         $7, $8, $9,
+         $10, $11, $12, $13, $14, $15,
+         $16, $17, now() + ($18::text || ' days')::interval
+       )
+       RETURNING id::text, plan_id::text, plan_date::text, revision, archived_at,
+                 archive_reason, checkpoint_kind, checkpoint_key, retention_until,
+                 plan_digest, order_count, truck_count, load_count, stop_count`,
+      [
+        plan.id, plan.planDate, revision,
+        JSON.stringify(plan.orders || []), JSON.stringify(plan.trucks || []), JSON.stringify(plan.summary || {}),
+        plan.savedAt || null, `checkpoint_${checkpointKind}_${cleanReason}`, text(sessionId),
+        SNAPSHOT_SCHEMA_VERSION, digest, counts.orderCount, counts.truckCount, counts.loadCount, counts.stopCount,
+        checkpointKind, cleanKey, retentionDays
+      ]
+    );
+    await query(
+      `INSERT INTO dispatch_plan_checkpoint_state (
+         plan_id, last_checkpoint_revision, last_checkpoint_at,
+         commands_since_checkpoint, checkpoint_due, due_trigger, updated_at
+       ) VALUES ($1, $2, now(), 0, false, '', now())
+       ON CONFLICT (plan_id) DO UPDATE
+         SET last_checkpoint_revision = EXCLUDED.last_checkpoint_revision,
+             last_checkpoint_at = EXCLUDED.last_checkpoint_at,
+             commands_since_checkpoint = 0,
+             checkpoint_due = false,
+             due_trigger = '',
+             updated_at = now()`,
+      [plan.id, revision]
+    );
+    return { ...checkpointResult(inserted.rows[0]), replay: false };
+  });
+}
+
+export async function createDueDispatchV2Checkpoints({ limit = 25 } = {}) {
+  const safeLimit = Math.min(Math.max(Number(limit) || 25, 1), 100);
+  const due = await query(
+    `SELECT state.plan_id::text, plan.revision::int
+       FROM dispatch_plan_checkpoint_state state
+       JOIN dispatch_plans plan ON plan.id = state.plan_id
+      WHERE plan.status <> 'cancelled'
+        AND state.commands_since_checkpoint > 0
+        AND (
+          state.checkpoint_due = true
+          OR state.commands_since_checkpoint >= 25
+          OR state.last_checkpoint_at <= now() - interval '5 minutes'
+        )
+      ORDER BY state.last_checkpoint_at, state.plan_id
+      LIMIT $1`,
+    [safeLimit]
+  );
+  const checkpoints = [];
+  for (const row of due.rows) {
+    try {
+      checkpoints.push(await createDispatchV2Checkpoint({
+        planId: row.plan_id,
+        kind: "periodic",
+        reason: "cadence",
+        checkpointKey: `periodic:${row.revision}`,
+        expectedRevision: Number(row.revision),
+        sessionId: "dispatch-v2-checkpoint-worker"
+      }));
+    } catch (error) {
+      if (error?.code !== "STALE_DISPATCH_PLAN") {throw error;}
+    }
+  }
+  return { created: checkpoints.length, checkpoints };
+}
+
 export async function listDispatchV2Checkpoints({ planId, date = "" } = {}) {
   const params = [planId];
   const dateClause = date ? "AND h.plan_date = $2::date" : "";
@@ -639,6 +1041,7 @@ export async function listDispatchV2Checkpoints({ planId, date = "" } = {}) {
     `SELECT h.id::text AS id, h.plan_id::text AS plan_id, h.plan_date::text AS plan_date,
             h.revision::int AS revision, h.original_saved_at, h.archived_at,
             h.archive_reason, h.session_id, h.schema_version, h.plan_digest,
+            h.checkpoint_kind, h.checkpoint_key, h.retention_until, h.resolved_at,
             h.order_count, h.truck_count, h.load_count, h.stop_count
        FROM dispatch_plan_snapshot_history h
       WHERE h.plan_id = $1
@@ -655,6 +1058,10 @@ export async function listDispatchV2Checkpoints({ planId, date = "" } = {}) {
     originalSavedAt: row.original_saved_at,
     archivedAt: row.archived_at,
     archiveReason: row.archive_reason || "",
+    checkpointKind: row.checkpoint_kind || "legacy",
+    checkpointKey: row.checkpoint_key || "",
+    retentionUntil: row.retention_until || null,
+    resolvedAt: row.resolved_at || null,
     sessionId: row.session_id || "",
     schemaVersion: Number(row.schema_version || 1),
     digest: row.plan_digest || "",
@@ -688,8 +1095,15 @@ export async function pruneExpiredDispatchV2Checkpoints({ retentionDays = 7, bat
     `WITH expired AS (
        SELECT id
          FROM dispatch_plan_snapshot_history
-        WHERE archived_at < now() - ($1::text || ' days')::interval
+        WHERE (
+          retention_until IS NOT NULL
+          AND retention_until < now()
+        ) OR (
+          retention_until IS NULL
+          AND checkpoint_kind NOT IN ('recovery', 'manual', 'lifecycle')
           AND archive_reason <> 'save_recovery'
+          AND archived_at < now() - ($1::text || ' days')::interval
+        )
         ORDER BY archived_at, id
         LIMIT $2
      )

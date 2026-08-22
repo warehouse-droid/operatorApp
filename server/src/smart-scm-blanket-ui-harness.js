@@ -233,7 +233,7 @@ for (const version of [
   "scm-smart-vendor.css?v=20260812-vendor-price-source-v1",
   "scm-smart-blanket.css?v=20260807-blanket-editor-v1",
   "scm-smart-exclusions.css?v=20260801-planning-pauses-v3",
-  "app-sidebar.js?v=20260801-netsuite-po-role-v1",
+  "app-sidebar.js?v=20260819-scm-custom-orders-v1",
   "scm-smart.js?v=20260812-vendor-po-price-sync-v1",
   "scm-smart-blanket.js?v=20260812-blanket-source-items-v1",
   "scm-smart-proposals.js?v=20260810-manual-priority-v1",

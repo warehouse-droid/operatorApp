@@ -179,11 +179,12 @@ export function resolveManualBillingAmount(rawInput) {
  *
  * @param {unknown} rawInput
  */
+// eslint-disable-next-line complexity -- The allowlisted SO/TO/PO billing rules deliberately converge at one exact-cent policy boundary.
 export function calculateBillingUnitAmount(rawInput) {
   const input = object(rawInput);
   const policy = requireMbbsRateCardPolicy(input.mbbsChargingPolicy);
   const billingRule = text(input.billingRule);
-  if (!["so_order", "so_group", "to_replenishment", "to_direct_additional_drop", "po_shared_leg", "po_group", "custom_order", "reconciliation"].includes(billingRule)) {
+  if (!["so_order", "so_group", "to_replenishment", "to_replenishment_multi_drop", "to_direct_additional_drop", "po_shared_leg", "po_group", "custom_order", "reconciliation"].includes(billingRule)) {
     throw new MbtError({
       status: 422,
       code: "MBT_BILLING_RULE_INVALID",
@@ -202,14 +203,28 @@ export function calculateBillingUnitAmount(rawInput) {
   const directTransfer = billingRule === "to_direct_additional_drop";
   const additionalDropCount = directTransfer
     ? 1
+    : billingRule === "to_replenishment_multi_drop"
+      ? Math.max(0, dropCount - 1)
     : ["po_shared_leg", "po_group"].includes(billingRule)
       ? Math.max(0, dropCount - 1)
       : 0;
-  const additionalDropUnitAmountMinor = directTransfer
+  const configuredAdditionalDropUnitAmountMinor = directTransfer
     ? policy.directPickupUnitAmountMinor
+    : billingRule === "to_replenishment_multi_drop"
+      ? "toReplenishmentAdditionalDropUnitAmountMinor" in policy
+        ? policy.toReplenishmentAdditionalDropUnitAmountMinor
+        : "poVrmaAdditionalStopUnitAmountMinor" in policy
+          ? policy.poVrmaAdditionalStopUnitAmountMinor
+          : policy.poAdditionalDropUnitAmountMinor
     : ["po_shared_leg", "po_group"].includes(billingRule)
-      ? policy.poAdditionalDropUnitAmountMinor
+      ? "poVrmaAdditionalStopUnitAmountMinor" in policy
+        ? policy.poVrmaAdditionalStopUnitAmountMinor
+        : policy.poAdditionalDropUnitAmountMinor
       : 0;
+  const additionalDropUnitAmountMinor = nonnegativeMoney(
+    configuredAdditionalDropUnitAmountMinor,
+    "Additional-drop unit price"
+  );
   const distanceBandAmountMinor = directTransfer ? 0 : rateAmount;
   const additionalDropFeeMinor = safeProduct(additionalDropUnitAmountMinor, additionalDropCount);
   return {
@@ -370,6 +385,8 @@ function canonicalMap(value) {
       rootReference: rootReference(type, reference),
       originAddress: text(order.originAddress),
       destinationAddress: text(order.destinationAddress),
+      originAddressOverride: text(order.originAddressOverride),
+      destinationAddressOverride: text(order.destinationAddressOverride),
       billingGroupKey: text(order.billingGroupKey),
       billingReference: text(order.billingReference) || rootReference(type, reference),
       orderGroupKey: text(order.orderGroupKey),
@@ -389,13 +406,18 @@ function occurrences(visits) {
   const result = new Map();
   for (const visit of visits) {
     for (const reference of visit.references.values()) {
-      const key = `${reference.sourceType}|${reference.rootReference.toUpperCase()}`;
+      const baseKey = `${reference.sourceType}|${reference.rootReference.toUpperCase()}`;
+      const retainedLoadId = text(visit.driverLoadId);
+      const key = ["PO", "VRMA"].includes(reference.sourceType) && retainedLoadId
+        ? `${baseKey}|DRIVER_LOAD|${retainedLoadId}`
+        : baseKey;
       const current = result.get(key) || {
         sourceType: reference.sourceType,
         rootReference: reference.rootReference,
         pickups: [],
         drops: [],
-        directDependency: false
+        directDependency: false,
+        driverLoadId: retainedLoadId
       };
       current[visit.stopType === "pickup" ? "pickups" : "drops"].push(visit);
       current.directDependency ||= reference.directDependency === true;
@@ -443,8 +465,16 @@ function uniqueVisitAddresses(visits) {
 function orderRoute(occurrence, canonical) {
   const pickupAddresses = uniqueVisitAddresses(occurrence.pickups);
   const dropAddresses = uniqueVisitAddresses(occurrence.drops);
-  const origin = text(canonical.originAddress) || pickupAddresses[0] || "";
-  const destination = text(canonical.destinationAddress) || dropAddresses.at(-1) || "";
+  // Explicit Dispatch endpoint edits are billing instructions. When blank,
+  // retain the historical evidence precedence for each order type.
+  const origin = text(canonical.originAddressOverride)
+    || pickupAddresses[0]
+    || text(canonical.originAddress)
+    || "";
+  const destination = text(canonical.destinationAddressOverride)
+    || (occurrence.sourceType === "TO"
+      ? dropAddresses.at(-1) || text(canonical.destinationAddress) || ""
+      : text(canonical.destinationAddress) || dropAddresses.at(-1) || "");
   return origin && destination
     ? [{ addressText: origin, stopType: "pickup" }, { addressText: destination, stopType: "dropoff" }]
     : [];
@@ -536,10 +566,12 @@ function groupedSalesRoute(group) {
     Number(left.canonicalOrder.orderGroupPosition) - Number(right.canonicalOrder.orderGroupPosition)
       || left.occurrence.rootReference.localeCompare(right.occurrence.rootReference)
   );
-  const origin = entries.map((entry) => text(entry.canonicalOrder.originAddress)).find(Boolean)
+  const origin = entries.map((entry) => text(entry.canonicalOrder.originAddressOverride)).find(Boolean)
     || uniqueVisitAddresses(group.visits.filter((/** @type {Record<string, any>} */ visit) => visit.stopType === "pickup"))[0]
+    || entries.map((entry) => text(entry.canonicalOrder.originAddress)).find(Boolean)
     || "";
-  const destination = entries.map((entry) => text(entry.canonicalOrder.destinationAddress)).find(Boolean)
+  const destination = entries.map((entry) => text(entry.canonicalOrder.destinationAddressOverride)).find(Boolean)
+    || entries.map((entry) => text(entry.canonicalOrder.destinationAddress)).find(Boolean)
     || uniqueVisitAddresses(group.visits.filter((/** @type {Record<string, any>} */ visit) => visit.stopType === "dropoff"))[0]
     || "";
   return origin && destination
@@ -555,8 +587,9 @@ function unitSortKey(unit) {
 }
 
 /**
- * Convert Driver evidence into business billing units. Dispatch load IDs are
- * retained for audit display but are excluded from unit identity and money.
+ * Convert Driver evidence into business billing units. An immutable Driver
+ * load scopes an ordinary PO/VRMA physical leg; non-unique display labels do
+ * not. Explicit groups retain their separately authorized group identity.
  *
  * @param {unknown} rawInput
  */
@@ -572,6 +605,8 @@ export function planDriverBillingUnits(rawInput) {
 
   /** @type {Map<string, Record<string, any>>} */
   const explicitSalesGroups = new Map();
+  /** @type {Map<string, Record<string, any>>} */
+  const replenishmentTransferGroups = new Map();
 
   for (const occurrence of byReference.values()) {
     if (!["SO", "TO"].includes(occurrence.sourceType)) {
@@ -579,6 +614,31 @@ export function planDriverBillingUnits(rawInput) {
     }
     const canonicalOrder = canonical.get(`${occurrence.sourceType}|${occurrence.rootReference.toUpperCase()}`) || {};
     if (occurrence.sourceType === "SO" && retainExplicitGroup(explicitSalesGroups, occurrence, canonicalOrder)) {
+      continue;
+    }
+    if (occurrence.sourceType === "TO" && occurrence.directDependency !== true) {
+      const retainedReference = text(canonicalOrder.billingReference) || occurrence.rootReference;
+      const physicalPickups = [...new Map(occurrence.pickups.map(
+        (/** @type {Record<string, any>} */ visit) => [visit.key, visit]
+      )).values()];
+      const sharedPickup = physicalPickups.length === 1 ? physicalPickups[0] : null;
+      const driverLoadId = text(sharedPickup?.driverLoadId);
+      const groupKey = sharedPickup && driverLoadId
+        ? `DRIVER_LOAD|${driverLoadId}|PICKUP|${text(sharedPickup.key)}`
+        : `TO|${retainedReference.toUpperCase()}`;
+      const group = replenishmentTransferGroups.get(groupKey) || {
+        groupKey,
+        references: new Map(),
+        entries: [],
+        visits: []
+      };
+      group.references.set(`TO|${retainedReference.toUpperCase()}`, {
+        sourceType: "TO",
+        rootReference: retainedReference
+      });
+      group.entries.push({ occurrence, canonicalOrder });
+      group.visits.push(...occurrence.pickups, ...occurrence.drops);
+      replenishmentTransferGroups.set(groupKey, group);
       continue;
     }
     const routeStops = orderRoute(occurrence, canonicalOrder);
@@ -609,6 +669,69 @@ export function planDriverBillingUnits(rawInput) {
           : directTransfer
             ? "Direct-pickup Transfer Order counted as one additional drop."
             : "Replenishment Transfer Order charged in full, once for the order."
+      }
+    });
+  }
+
+  for (const group of replenishmentTransferGroups.values()) {
+    const references = [...group.references.values()];
+    const pickupVisits = group.entries.flatMap(
+      (/** @type {Record<string, any>} */ entry) => entry.occurrence.pickups
+    );
+    const origin = group.entries.map(
+      (/** @type {Record<string, any>} */ entry) => text(entry.canonicalOrder.originAddressOverride)
+    ).find(Boolean)
+      || uniqueVisitAddresses(pickupVisits)[0]
+      || group.entries.map(
+        (/** @type {Record<string, any>} */ entry) => text(entry.canonicalOrder.originAddress)
+      ).find(Boolean)
+      || "";
+    /** @type {string[]} */
+    const destinations = [];
+    for (const entry of group.entries) {
+      const override = text(entry.canonicalOrder.destinationAddressOverride);
+      const actual = uniqueVisitAddresses(entry.occurrence.drops);
+      const retained = override
+        ? [override]
+        : actual.length
+          ? actual
+          : [text(entry.canonicalOrder.destinationAddress)].filter(Boolean);
+      for (const destination of retained) {
+        if (!destinations.some((current) => normalizedAddress(current) === normalizedAddress(destination))) {
+          destinations.push(destination);
+        }
+      }
+    }
+    const routeStops = origin
+      ? [
+          { addressText: origin, stopType: "pickup" },
+          ...destinations.map((addressText) => ({ addressText, stopType: "dropoff" }))
+        ]
+      : [];
+    const loadsEvidence = evidenceLoads(group.visits);
+    const multiOrderOrDrop = references.length > 1 || destinations.length > 1;
+    const billingRule = multiOrderOrDrop
+      ? "to_replenishment_multi_drop"
+      : "to_replenishment";
+    units.push({
+      unitKey: `TO_LEG|${group.groupKey}|${references.map((reference) => reference.rootReference.toUpperCase()).join("+")}`,
+      billingRule,
+      references,
+      routeStops,
+      originLabel: origin,
+      destinationLabel: destinations.join(" → "),
+      dropCount: destinations.length,
+      completedAt: lastCompletion(group.visits),
+      ...loadsEvidence,
+      loadNumber: loadsEvidence.driverLoadNumbers.join(" + "),
+      ...(billingRule === "to_replenishment_multi_drop"
+        ? { distanceStrategy: "longest_origin_to_drop" }
+        : {}),
+      relationship: {
+        code: billingRule,
+        summary: billingRule === "to_replenishment_multi_drop"
+          ? `${references.length} replenishment Transfer Order reference(s) share one immutable Driver load and physical pickup; charge the longest origin-to-drop distance once plus each additional distinct drop.`
+          : "Replenishment Transfer Order charged in full, once for the order."
       }
     });
   }
@@ -650,17 +773,29 @@ export function planDriverBillingUnits(rawInput) {
     }
     const pickupAddresses = uniqueVisitAddresses(occurrence.pickups);
     const actualDrops = uniqueVisitAddresses(occurrence.drops);
-    const origin = text(canonicalOrder.originAddress) || pickupAddresses[0] || "";
-    const destinations = actualDrops.length
-      ? actualDrops
-      : text(canonicalOrder.destinationAddress)
-        ? [text(canonicalOrder.destinationAddress)]
-        : [];
+    const origin = text(canonicalOrder.originAddressOverride)
+      || text(canonicalOrder.originAddress)
+      || pickupAddresses[0]
+      || "";
+    const destinationOverride = text(canonicalOrder.destinationAddressOverride);
+    const destinations = destinationOverride
+      ? [destinationOverride]
+      : actualDrops.length
+        ? actualDrops
+        : text(canonicalOrder.destinationAddress)
+          ? [text(canonicalOrder.destinationAddress)]
+          : [];
     const routeKey = `${normalizedAddress(origin)}>${destinations.map(normalizedAddress).join(">")}`;
-    const groupKey = text(canonicalOrder.billingGroupKey) || routeKey;
+    const driverLoadId = text(occurrence.driverLoadId);
+    const normalizedOrigin = normalizedAddress(origin);
+    const missingOriginScope = `${occurrence.sourceType}|${occurrence.rootReference.toUpperCase()}`;
+    const groupKey = driverLoadId
+      ? `DRIVER_LOAD|${driverLoadId}|ORIGIN|${normalizedOrigin || missingOriginScope}`
+      : `LEGACY|${text(canonicalOrder.billingGroupKey) || routeKey || missingOriginScope}`;
     const retainedReference = text(canonicalOrder.billingReference) || occurrence.rootReference;
     const group = poGroups.get(groupKey) || {
       groupKey,
+      driverLoadId,
       references: new Map(),
       origin,
       destinations: new Map(),
@@ -692,8 +827,11 @@ export function planDriverBillingUnits(rawInput) {
       : [];
     const loadsEvidence = evidenceLoads(group.visits);
     const referenceKey = references.map((reference) => `${reference.sourceType}|${reference.rootReference.toUpperCase()}`).join("+");
+    const retainedLoadIdentity = group.driverLoadId
+      ? `DRIVER_LOAD|${group.driverLoadId}`
+      : "LEGACY_LOAD";
     units.push({
-      unitKey: `PO_LEG|${referenceKey}|${normalizedAddress(group.origin)}|${destinations.map(normalizedAddress).join(">")}`,
+      unitKey: `PO_LEG|${retainedLoadIdentity}|${referenceKey}|${normalizedAddress(group.origin)}|${destinations.map(normalizedAddress).join(">")}`,
       billingRule: "po_shared_leg",
       references,
       routeStops,
@@ -705,7 +843,9 @@ export function planDriverBillingUnits(rawInput) {
       loadNumber: loadsEvidence.driverLoadNumbers.join(" + "),
       relationship: {
         code: "po_shared_leg",
-        summary: `${references.length} Purchase Order reference(s) share one business leg; the leg total is allocated evenly. Dispatch load splits do not change the charge.`
+        summary: group.driverLoadId
+          ? `${references.length} Purchase Order/VRMA reference(s) share immutable Driver load ${group.driverLoadId}; this specific physical leg is charged once and allocated evenly.`
+          : `${references.length} legacy Purchase Order/VRMA reference(s) share one retained business leg; the leg total is allocated evenly.`
       }
     });
   }
@@ -714,17 +854,23 @@ export function planDriverBillingUnits(rawInput) {
       Number(left.canonicalOrder.orderGroupPosition) - Number(right.canonicalOrder.orderGroupPosition)
         || left.occurrence.rootReference.localeCompare(right.occurrence.rootReference)
     );
-    const origin = entries.map((entry) => text(entry.canonicalOrder.originAddress)).find(Boolean)
+    const origin = entries.map((entry) => text(entry.canonicalOrder.originAddressOverride)).find(Boolean)
+      || entries.map((entry) => text(entry.canonicalOrder.originAddress)).find(Boolean)
       || uniqueVisitAddresses(group.visits.filter((/** @type {Record<string, any>} */ visit) => visit.stopType === "pickup"))[0]
       || "";
     const destinations = new Map();
-    const actualDestinations = uniqueVisitAddresses(group.visits.filter((/** @type {Record<string, any>} */ visit) => visit.stopType === "dropoff"));
-    const retainedRouteDestinations = actualDestinations.length
-      ? actualDestinations
-      : entries.map((entry) => text(entry.canonicalOrder.destinationAddress)).filter(Boolean);
-    for (const destination of retainedRouteDestinations) {
-      if (!destinations.has(normalizedAddress(destination))) {
-        destinations.set(normalizedAddress(destination), destination);
+    for (const entry of entries) {
+      const override = text(entry.canonicalOrder.destinationAddressOverride);
+      const actual = uniqueVisitAddresses(entry.occurrence.drops);
+      const retained = override
+        ? [override]
+        : actual.length
+          ? actual
+          : [text(entry.canonicalOrder.destinationAddress)].filter(Boolean);
+      for (const destination of retained) {
+        if (!destinations.has(normalizedAddress(destination))) {
+          destinations.set(normalizedAddress(destination), destination);
+        }
       }
     }
     const retainedDestinations = [...destinations.values()];

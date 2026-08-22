@@ -181,11 +181,15 @@ test("DP-16 frontend: pure 2,000-order command reduction is benchmarked and reta
   assert.ok(result.p95Ms < 50, `2,000-order reducer P95 was ${result.p95Ms}ms`);
 });
 
-test("DP-05/DP-16 frontend: normal autosave uses the guarded fast acknowledgement path", () => {
+test("DP-05/DP-16 frontend: normal autosave uses guarded semantic deltas with a legacy fallback", () => {
   assert.match(dispatchSource, /function\s+dispatchIncrementalSaveRequest\(/u);
   const request = functionBody("dispatchIncrementalSaveRequest");
   assert.match(request, /\/api\/dispatch\/v2\/plans\/\$\{encodeURIComponent\(targetPlanId\)\}\/commands/u);
-  assert.match(request, /commandType:\s*["']replace_plan["']/u);
+  assert.match(request, /plannerCommandMode\s*===\s*["']on["']/u);
+  assert.match(request, /dispatchSemanticCommandType/u);
+  assert.match(request, /planDelta:\s*buildDispatchPlanWireDelta/u);
+  assert.match(request, /:\s*["']replace_plan["']/u,
+    "Turning compact commands off must retain the existing full-board command contract.");
   assert.match(request, /baseDigest:\s*currentPlan\?\.digest/u);
 
   const saveStart = dispatchSource.indexOf("function savePlanToServer(");
@@ -196,6 +200,108 @@ test("DP-05/DP-16 frontend: normal autosave uses the guarded fast acknowledgemen
   assert.match(save, /forceSave|truck_sequence/u, "Force and truck-sequence compatibility saves must remain explicit.");
   assert.match(save, /renderDispatchSaveStatePatch\(/u);
   assert.doesNotMatch(save, /incrementalSave[\s\S]{0,500}plannerRoot\.innerHTML/u);
+});
+
+test("DPO-10 frontend: indexed search is bounded, cancellable, paged, and hydrated before mutation", () => {
+  const search = functionBody("loadDispatchOrderSearch");
+  assert.match(search, /plannerOrderPoolMode\s*===\s*["']on["']/u);
+  assert.match(search, /AbortController/u);
+  assert.match(search, /\/api\/dispatch\/v2\/order-pool/u);
+  const schedule = functionBody("scheduleDispatchOrderSearch");
+  assert.match(schedule, /225/u);
+  const load = functionBody("loadDispatchOrders");
+  assert.match(load, /limit:\s*["']50["']/u);
+  assert.match(load, /nextCursor|cursor/u);
+  const hydrate = functionBody("hydrateDispatchOrder");
+  assert.match(hydrate, /dispatchOrderHydrationPromises/u);
+  assert.match(hydrate, /applyTargetedDispatchOrderUpdate/u);
+  assert.match(dispatchSource, /catalogHydrated\s*===\s*false[\s\S]{0,500}event\.preventDefault\(\)[\s\S]{0,500}hydrateDispatchOrder/u);
+  assert.match(dispatchSource, /data-action=["']jump-planned-order["']/u);
+
+  const fallbackStart = serverSource.indexOf("async function legacyDispatchOrderPool(");
+  assert.notEqual(fallbackStart, -1, "Expected a legacy warming/failure fallback.");
+  const fallback = serverSource.slice(fallbackStart, fallbackStart + 900);
+  assert.doesNotMatch(fallback, /visible\.slice\(/u,
+    "A warming catalog has no legacy cursor, so truncating it would make valid orders unreachable.");
+});
+
+test("DPO-10b: Planning searches split POs by source and displays each corresponding ref", () => {
+  const sourcePoMatch = Function(`"use strict"; let searchText = "POB03748"; return (${functionBody("matchesSearch")});`)();
+  assert.equal(sourcePoMatch({
+    id: "SN1398667",
+    type: "PO",
+    originalPoRef: "POB03748",
+    dispatchRef: "SN1398667",
+    items: []
+  }), true, "a normal PO dispatch ref must remain visible when its source PO matched the server search");
+  assert.equal(sourcePoMatch({
+    id: "SN1398449",
+    type: "PO",
+    sourcePoRef: "POB03748",
+    sourcePoRefs: ["POB03748"],
+    correspondingPoRefs: ["SN1398449"],
+    items: []
+  }), true, "an SCM split ref must remain visible when its source PO matched the server search");
+
+  const label = Function(`"use strict"; return (${functionBody("poSourceReferenceText")});`)();
+  assert.equal(label({
+    id: "SN1398449",
+    type: "PO",
+    originalPoRef: "SN1398449",
+    sourcePoRef: "POB03321",
+    sourcePoRefs: ["POB03321"],
+    correspondingPoRefs: ["SN1398449"]
+  }), "Source PO POB03321 → Ref SN1398449");
+  assert.equal(label({
+    id: "POB03321",
+    type: "PO",
+    originalPoRef: "POB03321",
+    sourcePoRefs: ["POB03321"],
+    correspondingPoRefs: ["SN1398449", "SN1398450"]
+  }), "Source PO POB03321 → Refs SN1398449, SN1398450");
+  assert.equal(label({
+    id: "PGOB-17",
+    type: "PO",
+    sourcePoRefs: ["POB03321", "POB03322"],
+    correspondingPoRefs: ["SN1398449", "SN1398450"]
+  }), "Source PO POB03321, POB03322 → Refs SN1398449, SN1398450");
+  assert.equal(label({ id: "POB100", type: "PO", originalPoRef: "POB100" }), "");
+
+  const card = functionBody("renderOrderCard");
+  assert.match(card, /poSourceReferenceText\(order\)/u);
+  assert.match(card, /po-source-reference/u);
+  assert.match(serverSource, /includeScmLinkedSearchRefs:\s*Boolean\(searchTerm\)/u);
+});
+
+test("DPO-11 frontend: route estimates cannot block compact autosave, while confirm remains strict", () => {
+  const flush = functionBody("flushPlanSaveQueue");
+  assert.match(flush, /plannerCommandMode\s*!==\s*["']on["'][\s\S]*ensureGoogleRouteEstimatesBeforeSave/u);
+  const confirm = functionBody("confirmCurrentPlanAtomic");
+  assert.match(confirm, /await\s+ensureGoogleRouteEstimatesBeforeSave\(["']confirm["']\)/u);
+});
+
+test("DPO-12 frontend: Save Now drains autosave then creates an idempotent manual checkpoint", () => {
+  const saveNow = functionBody("forceSaveCurrentPlan");
+  assert.match(saveNow, /await\s+saveCurrentPlanNow/u);
+  assert.match(saveNow, /plannerCommandMode\s*===\s*["']on["']/u);
+  assert.match(saveNow, /createDispatchPlanCheckpoint\(["']manual["'],\s*["']save_now["']\)/u);
+  const checkpoint = functionBody("createDispatchPlanCheckpoint");
+  assert.match(checkpoint, /\/api\/dispatch\/v2\/plans\/\$\{encodeURIComponent\(currentPlan\.id\)\}\/checkpoints/u);
+  assert.match(checkpoint, /idempotencyKey/u);
+  assert.match(checkpoint, /expectedRevision/u);
+  assert.match(checkpoint, /expectedDigest/u);
+});
+
+test("DPO-11 backend: restore always protects executed Driver evidence", () => {
+  const routeStart = serverSource.indexOf('app.post("/api/dispatch/plan-snapshots/:snapshotId/restore"');
+  assert.notEqual(routeStart, -1, "Expected the Dispatch snapshot restore endpoint.");
+  const route = serverSource.slice(routeStart, routeStart + 9_000);
+  assert.match(route, /evaluateExecutedPrefixPolicy\(\{[\s\S]{0,400}listDriverJobStatuses/u);
+  assert.match(route, /restoreExecutionPolicy\.allowed/u);
+  assert.ok(
+    route.indexOf("restoreExecutionPolicy") < route.indexOf("restoreDispatchPlanSnapshot"),
+    "Executed Driver evidence must be checked before planner-owned state changes."
+  );
 });
 
 test("DP-16 startup: the compact plan is on the critical path but the full order feed and history are background work", () => {

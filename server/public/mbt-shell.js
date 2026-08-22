@@ -65,18 +65,24 @@ const rateCardState = {
   selectedVersion: null,
   activePricingItemCode: "",
   itemPricing: new Map(),
-  yardOptions: []
+  yardOptions: [],
+  vendorYardOptions: [],
+  mbbsVendorRouteRates: []
 };
 
 const MBBS_CHARGING_POLICY_RULES = Object.freeze({
-  schemaVersion: 1,
+  schemaVersion: 3,
   currency: "CAD",
   soChargeBasis: "per_order_group_as_one",
   toReplenishmentChargeBasis: "full_route_once",
   toDirectPickupChargeBasis: "fixed_unit_once",
   poChargeBasis: "shared_leg_equal_split",
-  poAdditionalDropBasis: "each_distinct_drop_after_first",
-  dispatchLoadSplitBasis: "ignored_for_charge"
+  dispatchLoadSplitBasis: "ignored_for_charge",
+  poVrmaBaseChargeBasis: "vendor_yard_pair_then_distance_band",
+  vrmaDirectionBasis: "same_pair_reverse",
+  poVrmaAdditionalStopBasis: "each_distinct_stop_after_base_pair",
+  endpointOverrideBasis: "flat_default_user_may_choose_distance",
+  toReplenishmentMultiDropBasis: "longest_origin_drop_plus_each_distinct_drop_after_first"
 });
 
 const customerChargeConfigurationState = {
@@ -799,6 +805,7 @@ async function loadRateCards() {
     const result = await api("/api/mbt/config/rate-cards");
     rateCardState.items = Array.isArray(result.items) ? result.items : [];
     rateCardState.yardOptions = Array.isArray(result.yardOptions) ? result.yardOptions : [];
+    rateCardState.vendorYardOptions = Array.isArray(result.vendorYardOptions) ? result.vendorYardOptions : [];
     renderRateCards();
     renderRatePricingItemOptions(rateCardState.activePricingItemCode);
     phase3ConfigState.rateCardsLoaded = true;
@@ -1374,12 +1381,28 @@ function appendItemDistanceBandRow(
     pricingBasis.value === "per_km" ? "CAD per kilometre" : "Flat CAD amount",
     { value: values.amountCad || "", inputType: "number", min: 0, step: "0.01" }
   );
+  const baseAmountField = rateRowInput(
+    "item_distance",
+    "baseAmountCad",
+    "Base CAD included before excess kilometres (optional)",
+    { value: values.baseAmountCad || "", inputType: "number", min: 0, step: "0.01", required: false }
+  );
+  const includedKmField = rateRowInput(
+    "item_distance",
+    "includedKm",
+    "Kilometres included in base (optional)",
+    { value: values.includedKm || "", inputType: "number", min: 0, step: "0.001", required: false }
+  );
   const syncAmountLabel = () => {
-    amountField.firstChild.textContent = pricingBasis.value === "per_km"
+    const perKm = pricingBasis.value === "per_km";
+    amountField.firstChild.textContent = perKm
       ? "CAD per kilometre"
       : "Flat CAD amount";
+    baseAmountField.hidden = !perKm;
+    includedKmField.hidden = !perKm;
   };
   pricingBasis.addEventListener("change", syncAmountLabel);
+  syncAmountLabel();
   row.append(
     purposeLabel,
     binLabel,
@@ -1388,6 +1411,8 @@ function appendItemDistanceBandRow(
     rateRowInput("item_distance", "maximumKm", "To kilometres (inclusive; blank = open)", { value: values.maximumKm || "", inputType: "number", min: 0, step: "0.001", required: false }),
     basisLabel,
     amountField,
+    baseAmountField,
+    includedKmField,
     boundaryRule
   );
   const remove = document.createElement("button");
@@ -1422,6 +1447,8 @@ function captureActiveRatePricingItem() {
         minimumKm: valueFromRow(row, "minimumKm"),
         maximumKm: valueFromRow(row, "maximumKm"),
         amountCad: valueFromRow(row, "amountCad"),
+        baseAmountCad: valueFromRow(row, "baseAmountCad"),
+        includedKm: valueFromRow(row, "includedKm"),
         pricingBasis: valueFromRow(row, "pricingBasis"),
         boundaryRule: valueFromRow(row, "boundaryRule"),
         originYardCodes: originYardCodesFromRow(row)
@@ -1610,11 +1637,139 @@ function syncMbbsChargingPolicyVisibility({ forceVisible = false } = {}) {
     || rateItemConfigured("DELIVERY_CHARGE_MBBS"));
 }
 
+function appendMbbsVendorRouteRateRow(rate = {}) {
+  const rows = readinessElement("mbbsVendorRouteRateRows");
+  if (!rows) return;
+  if (!rows.querySelector("[data-mbbs-vendor-route-rate]")) rows.replaceChildren();
+  const row = document.createElement("tr");
+  row.setAttribute("data-mbbs-vendor-route-rate", "");
+  const inputCell = (attribute, value, label) => {
+    const cell = document.createElement("td");
+    const input = document.createElement("input");
+    input.setAttribute(attribute, "");
+    input.value = String(value || "");
+    input.required = true;
+    input.maxLength = 240;
+    input.setAttribute("aria-label", label);
+    cell.append(input);
+    return cell;
+  };
+  const vendorCell = document.createElement("td");
+  const vendor = document.createElement("select");
+  vendor.setAttribute("data-mbbs-vendor-yard", "");
+  vendor.setAttribute("aria-label", `Vendor yard for ${rate.displayName || "vendor route"}`);
+  vendor.required = true;
+  vendor.append(new Option("Choose an exact local vendor yard", ""));
+  for (const [index, option] of rateCardState.vendorYardOptions.entries()) {
+    const retained = new Option(
+      `${option.localVendorName} · ${option.vendorYardName} · ${option.vendorYardAddress}`,
+      String(index)
+    );
+    if (Number(rate.localVendorId) === Number(option.localVendorId)
+        && String(rate.vendorYardName || "") === String(option.vendorYardName || "")) {
+      retained.selected = true;
+    }
+    vendor.append(retained);
+  }
+  vendorCell.append(vendor);
+  const destinationCell = document.createElement("td");
+  const destination = document.createElement("select");
+  destination.setAttribute("data-mbbs-destination-yard", "");
+  destination.setAttribute("aria-label", `MBBS destination for ${rate.displayName || "vendor route"}`);
+  destination.required = true;
+  destination.append(new Option("Choose MBBS yard", ""));
+  for (const yard of rateCardState.yardOptions) {
+    const option = new Option(`${yard.yardCode} · ${yard.displayName}`, String(yard.yardCode || ""));
+    option.selected = String(rate.destinationYardCode || "") === option.value;
+    destination.append(option);
+  }
+  destinationCell.append(destination);
+  const amountCell = document.createElement("td");
+  const amount = document.createElement("input");
+  amount.type = "number";
+  amount.min = "0";
+  amount.step = "0.01";
+  amount.inputMode = "decimal";
+  amount.required = true;
+  amount.setAttribute("data-mbbs-vendor-route-amount", "");
+  amount.setAttribute("aria-label", `Base CAD for ${rate.displayName || "vendor route"}`);
+  amount.value = cadInputValue(rate.baseAmountMinor ?? 0);
+  amountCell.append(amount);
+  const actionCell = document.createElement("td");
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "mbt-button-secondary";
+  remove.textContent = "Remove";
+  remove.addEventListener("click", () => {
+    row.remove();
+    if (!rows.querySelector("[data-mbbs-vendor-route-rate]")) renderMbbsVendorRouteRates([]);
+  });
+  actionCell.append(remove);
+  row.append(
+    inputCell("data-mbbs-vendor-route-name", rate.rateName, "Vendor-route rate name"),
+    inputCell("data-mbbs-vendor-route-display", rate.displayName, "Vendor-route display name"),
+    vendorCell,
+    destinationCell,
+    amountCell,
+    actionCell
+  );
+  rows.append(row);
+}
+
+function renderMbbsVendorRouteRates(rates = rateCardState.mbbsVendorRouteRates) {
+  const rows = readinessElement("mbbsVendorRouteRateRows");
+  if (!rows) return;
+  rows.replaceChildren();
+  if (!Array.isArray(rates) || rates.length === 0) {
+    const row = document.createElement("tr");
+    const cell = textCell("No exact pair prices. PO and VRMA use distance bands.");
+    cell.colSpan = 6;
+    row.append(cell);
+    rows.append(row);
+    return;
+  }
+  for (const rate of rates) appendMbbsVendorRouteRateRow(rate);
+}
+
+function mbbsVendorRouteRatesGraph() {
+  const rows = [...document.querySelectorAll("[data-mbbs-vendor-route-rate]")];
+  return rows.map((row) => {
+    const vendorValue = String(row.querySelector("[data-mbbs-vendor-yard]")?.value || "");
+    const vendor = vendorValue === "" ? null : rateCardState.vendorYardOptions[Number(vendorValue)];
+    const destinationYardCode = String(row.querySelector("[data-mbbs-destination-yard]")?.value || "");
+    if (!vendor || !destinationYardCode) {
+      throw new Error("Choose an exact active vendor yard and MBBS destination for every pair price.");
+    }
+    return {
+      rateName: String(row.querySelector("[data-mbbs-vendor-route-name]")?.value || "").trim(),
+      displayName: String(row.querySelector("[data-mbbs-vendor-route-display]")?.value || "").trim(),
+      localVendorId: Number(vendor.localVendorId),
+      localVendorName: String(vendor.localVendorName),
+      vendorYardName: String(vendor.vendorYardName),
+      vendorYardAddress: String(vendor.vendorYardAddress),
+      destinationYardCode,
+      baseAmountMinor: cadMinorFromValue(
+        row.querySelector("[data-mbbs-vendor-route-amount]")?.value,
+        "Vendor-route base price"
+      ),
+      currency: "CAD"
+    };
+  });
+}
+
 function populateMbbsChargingPolicy(policy) {
   const direct = readinessElement("mbbsDirectPickupUnitPrice");
   const poDrop = readinessElement("mbbsPoAdditionalDropUnitPrice");
+  const toDrop = readinessElement("mbbsToAdditionalDropUnitPrice");
   if (direct) direct.value = cadInputValue(policy?.directPickupUnitAmountMinor ?? 10_000);
-  if (poDrop) poDrop.value = cadInputValue(policy?.poAdditionalDropUnitAmountMinor ?? 10_000);
+  if (poDrop) poDrop.value = cadInputValue(
+    policy?.poVrmaAdditionalStopUnitAmountMinor
+      ?? policy?.poAdditionalDropUnitAmountMinor
+      ?? 10_000
+  );
+  if (toDrop) toDrop.value = cadInputValue(
+    policy?.toReplenishmentAdditionalDropUnitAmountMinor ?? 10_000
+  );
   syncMbbsChargingPolicyVisibility({ forceVisible: Boolean(policy) });
 }
 
@@ -1625,9 +1780,13 @@ function mbbsChargingPolicyGraph() {
       inputValue("mbbsDirectPickupUnitPrice"),
       "Direct-pickup TO unit price"
     ),
-    poAdditionalDropUnitAmountMinor: cadMinorFromValue(
+    poVrmaAdditionalStopUnitAmountMinor: cadMinorFromValue(
       inputValue("mbbsPoAdditionalDropUnitPrice"),
-      "PO additional-drop unit price"
+      "PO/VRMA additional-stop unit price"
+    ),
+    toReplenishmentAdditionalDropUnitAmountMinor: cadMinorFromValue(
+      inputValue("mbbsToAdditionalDropUnitPrice"),
+      "Replenishment TO additional-drop unit price"
     )
   };
 }
@@ -1645,6 +1804,10 @@ function populateSimplifiedRateEditor(detail) {
   set("rateCardDisplayName", header.displayName);
   set("rateCardNotes", version.calculationNotes);
   populateMbbsChargingPolicy(graph.mbbsChargingPolicy);
+  rateCardState.mbbsVendorRouteRates = Array.isArray(graph.mbbsVendorRouteRates)
+    ? graph.mbbsVendorRouteRates.map((rate) => ({ ...rate }))
+    : [];
+  renderMbbsVendorRouteRates();
   if (version.effectiveFrom) set("rateCardEffectiveFrom", new Date(version.effectiveFrom).toISOString().slice(0, 16));
   initializeItemPricingState();
   for (const component of graph.components || []) {
@@ -1669,6 +1832,10 @@ function populateSimplifiedRateEditor(detail) {
       minimumKm: (Number(band.minimumMetres) / 1000).toFixed(3),
       maximumKm: band.maximumMetres === null ? "" : (Number(band.maximumMetres) / 1000).toFixed(3),
       amountCad: cadInputValue(band.amountMinor),
+      baseAmountCad: band.baseAmountMinor === null || band.baseAmountMinor === undefined
+        ? "" : cadInputValue(band.baseAmountMinor),
+      includedKm: band.includedMetres === null || band.includedMetres === undefined
+        ? "" : (Number(band.includedMetres) / 1000).toFixed(3),
       pricingBasis: band.pricingBasis || "flat",
       boundaryRule: band.boundaryRule || "lower_inclusive",
       originYardCodes: Array.isArray(band.originYardCodes) ? band.originYardCodes : []
@@ -1736,6 +1903,8 @@ function newRateCardEditor() {
   }
   initializeItemPricingState();
   populateMbbsChargingPolicy(null);
+  rateCardState.mbbsVendorRouteRates = [];
+  renderMbbsVendorRouteRates();
   const submit = readinessElement("rateCardForm")?.querySelector("button[type='submit']");
   if (submit) submit.textContent = "Save draft";
   activateRatePricingItem(firstAvailableRateItemCode(), {
@@ -1781,6 +1950,12 @@ function simplifiedRateCardGraph() {
           minimumMetres: kmToMetres(band.minimumKm, `${item.itemCode} band start`),
           maximumMetres: kmToMetres(band.maximumKm, `${item.itemCode} band end`, { nullable: true }),
           amountMinor: cadMinorFromValue(band.amountCad, `${item.itemCode} band amount`),
+          baseAmountMinor: band.baseAmountCad
+            ? cadMinorFromValue(band.baseAmountCad, `${item.itemCode} band base amount`)
+            : null,
+          includedMetres: band.includedKm
+            ? kmToMetres(band.includedKm, `${item.itemCode} band included distance`)
+            : null,
           pricingBasis: band.pricingBasis || "flat",
           boundaryRule: band.boundaryRule || "upper_inclusive",
           originYardCodes: [...new Set(band.originYardCodes || [])].sort(),
@@ -1840,7 +2015,8 @@ function simplifiedRateCardGraph() {
     components,
     dumpTariffs,
     depositRules: [],
-    mbbsChargingPolicy: hasMbbsCrossCharge ? mbbsChargingPolicyGraph() : null
+    mbbsChargingPolicy: hasMbbsCrossCharge ? mbbsChargingPolicyGraph() : null,
+    mbbsVendorRouteRates: hasMbbsCrossCharge ? mbbsVendorRouteRatesGraph() : []
   };
 }
 
@@ -2898,6 +3074,9 @@ function bindPhase3ConfigurationControls() {
   readinessElement("validateRateCardButton")?.addEventListener("click", () => runRateCardLifecycle("validate"));
   readinessElement("activateRateCardButton")?.addEventListener("click", () => runRateCardLifecycle("activate"));
   readinessElement("cloneRateCardButton")?.addEventListener("click", () => runRateCardLifecycle("clone"));
+  readinessElement("addMbbsVendorRouteRate")?.addEventListener("click", () => {
+    appendMbbsVendorRouteRateRow({ baseAmountMinor: 0 });
+  });
   readinessElement("previewRateCardCsvButton")?.addEventListener("click", previewRateCardCsv);
   readinessElement("applyRateCardCsvButton")?.addEventListener("click", applyRateCardCsv);
   document.querySelectorAll("[data-mbt-template-download]").forEach((link) => {

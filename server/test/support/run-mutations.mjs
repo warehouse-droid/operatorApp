@@ -608,12 +608,12 @@ const P3_MUTANTS = Object.freeze([
     to: "      if (false) await input.hooks?.afterDraftApply?.();"
   },
   {
-    name: "P3 MBBS PO billing regresses from business-route grouping to per-reference grouping",
+    name: "P3 MBBS PO billing collapses distinct immutable Driver loads",
     scope: "mbbs_billing",
     file: "mbbs-driver-billing-planner.js",
     targetTests: P3_MBBS_BILLING_CANDIDATE_TARGET_TESTS,
-    from: "    const groupKey = text(canonicalOrder.billingGroupKey) || routeKey;",
-    to: "    const groupKey = text(canonicalOrder.billingGroupKey) || `${routeKey}|${occurrence.rootReference}`;"
+    from: "      const key = [\"PO\", \"VRMA\"].includes(reference.sourceType) && retainedLoadId\n        ? `${baseKey}|DRIVER_LOAD|${retainedLoadId}`\n        : baseKey;",
+    to: "      const key = baseKey;"
   },
   {
     name: "P3 MBBS PO billing charges the first drop twice",

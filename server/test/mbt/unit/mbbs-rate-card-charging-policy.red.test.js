@@ -133,7 +133,9 @@ test("P1/P2: Rate Cards UI visibly explains all charging rules and exposes both 
   for (const id of [
     "mbbsChargingPolicy",
     "mbbsDirectPickupUnitPrice",
-    "mbbsPoAdditionalDropUnitPrice"
+    "mbbsPoAdditionalDropUnitPrice",
+    "mbbsVendorRouteRateRows",
+    "addMbbsVendorRouteRate"
   ]) {
     assert.match(html, new RegExp(`id=["']${id}["']`, "u"));
   }
@@ -143,14 +145,20 @@ test("P1/P2: Rate Cards UI visibly explains all charging rules and exposes both 
     /Transfer Order/iu,
     /Purchase Order/iu,
     /group.*one charge/iu,
-    /load splits do not change/iu,
+    /different Driver load ID is a different leg/iu,
+    /immutable Driver load ID.*repeated display label.*physical leg/iu,
     /allocated evenly/iu,
-    /each distinct drop after the first/iu
+    /exact configured vendor-yard\/MBBS-yard flat price/iu,
+    /reverse VRMA uses the same pair price/iu,
+    /each distinct pickup or drop after the base two-stop pair/iu,
+    /fall back to the distance bands/iu
   ]) {
     assert.match(html, phrase);
   }
   assert.match(client, /directPickupUnitAmountMinor/u);
-  assert.match(client, /poAdditionalDropUnitAmountMinor/u);
+  assert.match(client, /poVrmaAdditionalStopUnitAmountMinor/u);
+  assert.match(client, /mbbsVendorRouteRatesGraph/u);
+  assert.match(client, /vendorYardOptions/u);
   assert.match(client, /mbbsChargingPolicy/u);
   assert.match(client, /inputValue\("mbbsDirectPickupUnitPrice"\)/u);
   assert.match(client, /inputValue\("mbbsPoAdditionalDropUnitPrice"\)/u);

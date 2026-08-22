@@ -16,6 +16,7 @@ import {
   transferDependencyReservationOverrideSet,
   transferDependencyReservationOverridesFromSnapshot
 } from "./transfer-dependency-reservation.js";
+import { transferDependencySourceBackorderDecision } from "./transfer-dependency-source-backorder.js";
 import {
   dependencyBlocksDispatchStructureChange,
   dispatchDependencyOrderRefs as dispatchOrderRefs,
@@ -31,6 +32,8 @@ export const DEPENDENCY_YARDS = Object.freeze([
 
 const YARD_BY_ID = new Map(DEPENDENCY_YARDS.map((yard) => [String(yard.locationId), yard]));
 const EPSILON = 0.000001;
+
+export { transferDependencySourceBackorderDecision };
 
 function number(value) {
   const parsed = Number(String(value ?? 0).replaceAll(",", ""));
@@ -1329,6 +1332,12 @@ async function salesOrderShortageRows(salesOrderId = null) {
             o.outbound_location_id,
             o.outbound_location,
             o.is_test_fixture,
+            EXISTS (
+              SELECT 1
+                FROM dispatch_order_completion_events completion
+               WHERE completion.order_kind = 'SO'
+                 AND lower(btrim(completion.order_ref)) = lower(btrim(o.tranid))
+            ) AS dispatch_completed,
             GREATEST(
               COALESCE(o.status_updated_at, '-infinity'::timestamptz),
               COALESCE(o.synced_at, '-infinity'::timestamptz),
@@ -1435,8 +1444,23 @@ async function applyTransferDependencyReviews(orders = [], reviewStatus = "open"
   for (const order of orders) {
     const signature = transferDependencyShortageSignature(order);
     const review = reviews.get(String(order.salesOrderId));
-    let activeReview = review?.status === "reviewed" && review.shortage_signature === signature;
-    if (review?.status === "reviewed" && !activeReview) {
+    const batch = batches.get(String(order.salesOrderId));
+    const transferCreated = batch?.has_created_transfer === true;
+    const systemReopenedNoTransfer = review?.status === "stale"
+      && text(review.reopened_by).toLowerCase() === "system"
+      && !transferCreated;
+    const explicitlyReopened = review?.status === "stale"
+      && Boolean(text(review.reopened_by))
+      && text(review.reopened_by).toLowerCase() !== "system";
+    let activeReview = review?.status === "reviewed" || systemReopenedNoTransfer;
+    const signatureChanged = Boolean(review?.shortage_signature)
+      && review.shortage_signature !== signature;
+    // Reviewed - No Transfer is a durable user decision. NetSuite allocation,
+    // IR, or partial-fulfillment changes may update its displayed shortage but
+    // cannot silently undo the review. Existing system-stale rows are treated
+    // as reviewed so orders reopened by the former policy recover immediately.
+    // A manually reviewed created TO keeps its existing change/review behavior.
+    if (review?.status === "reviewed" && signatureChanged && transferCreated) {
       const reopened = await query(
         `UPDATE scm_transfer_dependency_reviews
             SET status = 'stale', reopened_by = 'system', reopened_at = now(), updated_at = now()
@@ -1460,8 +1484,6 @@ async function applyTransferDependencyReviews(orders = [], reviewStatus = "open"
       }
       activeReview = false;
     }
-    const batch = batches.get(String(order.salesOrderId));
-    const transferCreated = batch?.has_created_transfer === true;
     const transferCompleted = transferCreated
       && batch?.all_created_transfers_printed === true
       && number(order.uncoveredQuantity) <= EPSILON;
@@ -1479,6 +1501,7 @@ async function applyTransferDependencyReviews(orders = [], reviewStatus = "open"
       reviewed: activeReview,
       reviewedAt: activeReview ? review.reviewed_at : null,
       reviewedBy: activeReview ? review.reviewed_by : null,
+      explicitlyReopened,
       completed: Boolean(completionType),
       completionType,
       completedAt: activeReview ? review.reviewed_at : transferCompleted ? batch.last_printed_at || batch.updated_at : null,
@@ -1507,9 +1530,12 @@ async function applyTransferDependencyReviews(orders = [], reviewStatus = "open"
       enriched.filter((order) => order.workflowStage === "created")
     );
   }
-  if (normalizedStatus === "all") return sortTransferDependencyCandidatesByLatestActivity(enriched);
+  const visible = enriched.filter((order) => order.workflowStage !== "open"
+    || order.dispatchCompleted !== true
+    || order.explicitlyReopened === true);
+  if (normalizedStatus === "all") return sortTransferDependencyCandidatesByLatestActivity(visible);
   return sortTransferDependencyCandidatesByLatestActivity(
-    enriched.filter((order) => order.workflowStage === "open" && number(order.uncoveredQuantity) > EPSILON)
+    visible.filter((order) => order.workflowStage === "open" && number(order.uncoveredQuantity) > EPSILON)
   );
 }
 
@@ -1575,6 +1601,7 @@ export async function listTransferDependencyCandidates({ search = "", salesOrder
         outboundLocation: row.outbound_location,
         customerAddress: row.dispatch_address,
         testFixture: row.is_test_fixture === true,
+        dispatchCompleted: row.dispatch_completed === true,
         latestActivityAt: row.latest_activity_at || null,
         uncoveredQuantity: 0,
         lines: []
@@ -1683,7 +1710,11 @@ export async function reopenTransferDependencyCandidate({ salesOrderId, operator
   const result = await query(
     `UPDATE scm_transfer_dependency_reviews
         SET status = 'stale', reopened_by = $2, reopened_at = now(), updated_at = now()
-      WHERE sales_order_id = $1 AND status = 'reviewed'
+      WHERE sales_order_id = $1
+        AND (
+          status = 'reviewed'
+          OR (status = 'stale' AND lower(COALESCE(reopened_by, '')) = 'system')
+        )
       RETURNING sales_order_id`,
     [Number(salesOrderId), operatorId]
   );
@@ -2268,6 +2299,7 @@ export async function getTransferDependencyBatch(batchId) {
       palletTransferQuantity: number(proposal.pallet_transfer_qty),
       palletCalculationComplete: proposal.pallet_calculation_complete !== false,
       palletQuantityOverridden: proposal.pallet_qty_overridden === true,
+      allowSourceBackorder: proposal.allow_source_backorder === true,
       palletItemId: proposal.pallet_item_id,
       palletItemName: proposal.pallet_item_name || "PALLET",
       mergedFromProposalIds: (proposal.merged_from_proposal_ids || []).map(Number),
@@ -2490,19 +2522,57 @@ export async function updateTransferDependencyBatch(batchId, input = {}, operato
     if (!current.rowCount) throw new Error("Dependency batch not found.");
     if (["creating", "created"].includes(current.rows[0].status)) throw new Error("Created dependency proposals cannot be edited.");
     const proposals = Array.isArray(input.proposals) ? input.proposals : [];
+    const currentProposalSettings = proposals.length ? await query(
+      `SELECT id, creation_status, allow_source_backorder
+         FROM scm_transfer_dependency_proposals
+        WHERE batch_id = $1 AND id = ANY($2::bigint[])
+        ORDER BY id
+        FOR UPDATE`,
+      [Number(batchId), proposals.map((proposal) => Number(proposal.id)).filter(Number.isInteger)]
+    ) : { rows: [] };
+    const sourceBackorderByProposal = new Map(currentProposalSettings.rows.map((proposal) => [
+      Number(proposal.id),
+      {
+        enabled: proposal.allow_source_backorder === true,
+        creationStatus: proposal.creation_status
+      }
+    ]));
+    const sourceBackorderChanges = [];
     for (const proposal of proposals) {
       const fromYard = YARD_BY_ID.get(String(proposal.fromLocationId));
       const toYard = YARD_BY_ID.get(String(proposal.toLocationId));
       if (!fromYard || !toYard) throw new Error("Select configured From and To yards.");
       if (fromYard.locationId === toYard.locationId) throw new Error("Transfer source and destination cannot be the same yard.");
+      const requestedSourceBackorder = typeof proposal.allowSourceBackorder === "boolean"
+        ? proposal.allowSourceBackorder
+        : null;
       await query(
         `UPDATE scm_transfer_dependency_proposals
             SET dependency_mode = $3, from_location_id = $4, from_location = $5,
-                to_location_id = $6, to_location = $7, memo = $8, updated_at = now()
+                to_location_id = $6, to_location = $7, memo = $8,
+                allow_source_backorder = CASE
+                  WHEN creation_status IN ('draft', 'failed')
+                    THEN COALESCE($9::boolean, allow_source_backorder)
+                  ELSE allow_source_backorder
+                END,
+                updated_at = now()
           WHERE id = $1 AND batch_id = $2 AND creation_status <> 'created'`,
         [Number(proposal.id), Number(batchId), normalizeMode(proposal.mode), fromYard.locationId,
-          fromYard.code, toYard.locationId, toYard.code, text(proposal.memo)]
+          fromYard.code, toYard.locationId, toYard.code, text(proposal.memo), requestedSourceBackorder]
       );
+      const previousSourceBackorder = sourceBackorderByProposal.get(Number(proposal.id));
+      if (requestedSourceBackorder !== null
+        && previousSourceBackorder !== undefined
+        && ["draft", "failed"].includes(previousSourceBackorder.creationStatus)
+        && previousSourceBackorder.enabled !== requestedSourceBackorder) {
+        sourceBackorderChanges.push({
+          proposalId: Number(proposal.id),
+          fromLocationId: fromYard.locationId,
+          fromLocation: fromYard.code,
+          before: previousSourceBackorder.enabled,
+          after: requestedSourceBackorder
+        });
+      }
       if (Array.isArray(proposal.lines)) {
         for (const line of proposal.lines) {
           const proposalLineId = Number(line.proposalLineId);
@@ -2583,6 +2653,19 @@ export async function updateTransferDependencyBatch(batchId, input = {}, operato
         WHERE id = $1`,
       [Number(batchId), uncovered, input.allowIncompleteCoverage === undefined ? null : input.allowIncompleteCoverage === true, operatorId]
     );
+    if (sourceBackorderChanges.length) {
+      await writeDispatchAudit({
+        action: "scm.transfer_dependency.source_backorder_updated",
+        source: "scm",
+        entityType: "dependency_batch",
+        entityId: String(batchId),
+        orderId: current.rows[0].sales_order_ref,
+        operatorId,
+        before: { proposals: sourceBackorderChanges.map(({ proposalId, before }) => ({ proposalId, allowSourceBackorder: before })) },
+        after: { proposals: sourceBackorderChanges.map(({ proposalId, after }) => ({ proposalId, allowSourceBackorder: after })) },
+        details: { changes: sourceBackorderChanges }
+      });
+    }
     return getTransferDependencyBatch(batchId);
   });
 }
@@ -3314,6 +3397,7 @@ export async function mergeTransferDependencyProposals(batchId, input = {}, oper
     const finalPalletQuantity = hasManualPalletOverride
       ? priorFinalPalletQuantity
       : pallet.recommendedQuantity;
+    const allowSourceBackorder = selected.every((proposal) => proposal.allow_source_backorder === true);
 
     const replacement = await query(
       `INSERT INTO scm_transfer_dependency_proposals (
@@ -3321,14 +3405,14 @@ export async function mergeTransferDependencyProposals(batchId, input = {}, oper
          to_location_id, to_location, memo, route_minutes,
          priority_penalty_minutes, route_score, calculated_pallet_qty,
          pallet_transfer_qty, pallet_calculation_complete, pallet_qty_overridden,
-         pallet_item_id, pallet_item_name
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+         pallet_item_id, pallet_item_name, allow_source_backorder
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
        RETURNING id`,
       [resolvedBatchId, replacementKey, template.dependency_mode,
         template.from_location_id, template.from_location, template.to_location_id, template.to_location,
         template.memo, template.route_minutes, template.priority_penalty_minutes, template.route_score,
         pallet.calculatedQuantity, finalPalletQuantity, pallet.complete, hasManualPalletOverride,
-        palletItemId, palletItemName]
+        palletItemId, palletItemName, allowSourceBackorder]
     );
     const mergedProposalId = Number(replacement.rows[0].id);
     for (const line of combinedLines) {
@@ -3540,30 +3624,79 @@ export async function validateTransferDependencyBatchForCreation(batch, { propos
     ];
   }));
   const requestedBySource = new Map();
+  const addRequestedSourceQuantity = ({ proposal, itemId, itemName, quantity }) => {
+    const normalizedItemId = Number(itemId);
+    const normalizedLocationId = Number(proposal.fromLocationId);
+    if (!Number.isInteger(normalizedItemId) || !Number.isInteger(normalizedLocationId)) return;
+    const requested = number(quantity);
+    if (requested <= EPSILON) return;
+    const key = `${normalizedItemId}:${normalizedLocationId}`;
+    const entry = requestedBySource.get(key) || {
+      itemId: normalizedItemId,
+      itemName: text(itemName) || String(normalizedItemId),
+      locationId: normalizedLocationId,
+      requestedQuantity: 0,
+      backorderEligibleQuantity: 0,
+      proposalIds: new Set(),
+      backorderProposalIds: new Set()
+    };
+    entry.requestedQuantity += requested;
+    entry.proposalIds.add(Number(proposal.id));
+    if (proposal.allowSourceBackorder === true) {
+      entry.backorderEligibleQuantity += requested;
+      entry.backorderProposalIds.add(Number(proposal.id));
+    }
+    requestedBySource.set(key, entry);
+  };
   for (const proposal of pendingProposals) {
     for (const line of proposal.lines || []) {
       if (isPalletItem(line)) continue;
-      const key = `${line.itemId}:${proposal.fromLocationId}`;
-      requestedBySource.set(key, number(requestedBySource.get(key)) + number(line.proposedQuantity));
+      addRequestedSourceQuantity({
+        proposal,
+        itemId: line.itemId,
+        itemName: line.itemName,
+        quantity: line.proposedQuantity
+      });
     }
     const palletItemId = Number(proposal.palletItemId);
     if (Number.isInteger(palletItemId) && number(proposal.palletTransferQuantity) > EPSILON) {
-      const key = `${palletItemId}:${proposal.fromLocationId}`;
-      requestedBySource.set(key, number(requestedBySource.get(key)) + number(proposal.palletTransferQuantity));
+      addRequestedSourceQuantity({
+        proposal,
+        itemId: palletItemId,
+        itemName: proposal.palletItemName || "PALLET",
+        quantity: proposal.palletTransferQuantity
+      });
     }
   }
-  for (const [key, requested] of requestedBySource) {
+  const sourceBackorders = [];
+  for (const [key, request] of requestedBySource) {
     const sourceAvailability = availableBySource.get(key) || {};
-    const available = number(sourceAvailability.available);
-    if (requested > available + EPSILON) {
-      const [itemId, locationId] = key.split(":");
-      const yard = YARD_BY_ID.get(String(locationId));
-      const item = pendingProposals.flatMap((proposal) => proposal.lines || []).find((line) => String(line.itemId) === itemId);
-      const palletProposal = pendingProposals.find((proposal) => String(proposal.palletItemId) === itemId);
+    const decision = transferDependencySourceBackorderDecision({
+      requestedQuantity: request.requestedQuantity,
+      backorderEligibleQuantity: request.backorderEligibleQuantity,
+      availableQuantity: sourceAvailability.available
+    });
+    const yard = YARD_BY_ID.get(String(request.locationId));
+    if (!decision.allowed) {
       const policy = sourceAvailability.overridden
         ? " after applying the selected full NetSuite Available override"
         : "";
-      throw new Error(`${yard?.code || locationId} has ${available} available${policy} for ${item?.itemName || palletProposal?.palletItemName || itemId}, below the proposed ${requested}.`);
+      const protectedText = decision.backorderEligibleQuantity > EPSILON
+        ? `protected proposed ${decision.protectedQuantity}`
+        : `proposed ${decision.requestedQuantity}`;
+      throw new Error(`${yard?.code || request.locationId} has ${decision.availableQuantity} available${policy} for ${request.itemName}, below the ${protectedText}.`);
+    }
+    if (decision.backorderQuantity > EPSILON) {
+      sourceBackorders.push({
+        itemId: request.itemId,
+        itemName: request.itemName,
+        locationId: request.locationId,
+        location: yard?.code || String(request.locationId),
+        requestedQuantity: decision.requestedQuantity,
+        availableQuantity: decision.availableQuantity,
+        backorderQuantity: decision.backorderQuantity,
+        proposalIds: [...request.backorderProposalIds].filter(Number.isInteger).sort((left, right) => left - right)
+      });
     }
   }
   const currentShortage = shortageRows.reduce((total, row) => total + number(row.unresolved_quantity), 0);
@@ -3572,7 +3705,11 @@ export async function validateTransferDependencyBatchForCreation(batch, { propos
     .flatMap((proposal) => proposal.lines || [])
     .filter((line) => line.lineSource !== "manual")
     .reduce((total, line) => total + number(line.proposedQuantity), 0);
-  return { uncovered: Math.max(0, currentShortage - destinationCoverage), pendingProposals };
+  return {
+    uncovered: Math.max(0, currentShortage - destinationCoverage),
+    pendingProposals,
+    sourceBackorders
+  };
 }
 
 async function transferLinesForOrder(transferOrderId) {
@@ -3813,6 +3950,7 @@ export async function confirmTransferDependencyBatch(batchId, {
       failed,
       attention,
       results,
+      sourceBackorders: validation.sourceBackorders,
       reservationOverrideCount: (batch.reservationOverrides || []).length,
       reservationOverrides: (batch.reservationOverrides || []).map((entry) => ({
         itemId: entry.itemId,
@@ -3825,7 +3963,11 @@ export async function confirmTransferDependencyBatch(batchId, {
       }))
     }
   });
-  return { batch: await getTransferDependencyBatch(batchId), results };
+  return {
+    batch: await getTransferDependencyBatch(batchId),
+    results,
+    sourceBackorders: validation.sourceBackorders
+  };
 }
 
 export async function retryTransferDependencyBatch(batchId, options = {}) {
@@ -3845,8 +3987,15 @@ export async function createOrderDependency({
   const normalizedMode = normalizeMode(mode);
   return withTransaction(async () => {
     const targetRef = text(dispatchTargetRef || salesOrderRef);
+    await query(
+      "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+      [`order-dependency:${targetRef.toLowerCase()}`]
+    );
     const resolved = await resolveDispatchSalesTarget({ dispatchTargetRef: targetRef, planDate });
-    const transfer = await query("SELECT * FROM transfer_orders WHERE tranid = $1", [text(transferOrderRef)]);
+    const transfer = await query(
+      "SELECT * FROM transfer_orders WHERE tranid = $1 FOR UPDATE",
+      [text(transferOrderRef)]
+    );
     if (targetSignature && targetSignature !== resolved.signature) {
       const error = new Error(`${targetRef} changed while the link window was open. Refresh the matched lines before linking.`);
       error.status = 409;
@@ -3862,13 +4011,60 @@ export async function createOrderDependency({
       throw new Error(`${transferOrderRef} has the same source and destination yard.`);
     }
     const active = await query(
-      `SELECT COALESCE(dispatch_target_ref, sales_order_ref) AS dispatch_target_ref
+      `SELECT id, status, dependency_mode,
+              COALESCE(dispatch_target_ref, sales_order_ref) AS dispatch_target_ref
          FROM order_dependencies
         WHERE transfer_order_id = $1 AND status <> 'cancelled'
         FOR UPDATE`,
       [transfer.rows[0].netsuite_id]
     );
-    if (active.rowCount) throw new Error(`${transferOrderRef} is already linked to ${active.rows[0].dispatch_target_ref}.`);
+    const existingDependency = active.rows[0] || null;
+    if (existingDependency && existingDependency.dispatch_target_ref !== resolved.target.ref) {
+      throw Object.assign(
+        new Error(`${transferOrderRef} is already linked to ${existingDependency.dispatch_target_ref}.`),
+        {
+          status: 409,
+          code: "TO_ALREADY_LINKED_ELSEWHERE",
+          linkedTargetRef: existingDependency.dispatch_target_ref
+        }
+      );
+    }
+    if (existingDependency && existingDependency.dependency_mode !== normalizedMode) {
+      throw Object.assign(
+        new Error(
+          `${transferOrderRef} is already linked to ${resolved.target.ref} as ${existingDependency.dependency_mode}. Change its mode separately before adding quantity.`
+        ),
+        {
+          status: 409,
+          code: "DEPENDENCY_MODE_MISMATCH",
+          currentMode: existingDependency.dependency_mode,
+          requestedMode: normalizedMode
+        }
+      );
+    }
+    if (existingDependency && existingDependency.status !== "active") {
+      throw Object.assign(
+        new Error(`${transferOrderRef} is ${existingDependency.status} and cannot accept more linked quantity.`),
+        { status: 409, code: "DEPENDENCY_NOT_EXTENDABLE" }
+      );
+    }
+    const existingLines = existingDependency ? await query(
+      `SELECT *
+         FROM order_dependency_lines
+        WHERE dependency_id = $1
+        FOR UPDATE`,
+      [existingDependency.id]
+    ) : { rows: [] };
+    if (existingLines.rows.some((line) => (
+      number(line.loaded_quantity) > EPSILON
+      || number(line.delivered_quantity) > EPSILON
+      || number(line.locally_received_quantity) > EPSILON
+    ))) {
+      throw Object.assign(
+        new Error("This dependency has already started and cannot accept more linked quantity."),
+        { status: 409, code: "DEPENDENCY_EXECUTION_STARTED" }
+      );
+    }
     if (normalizedMode === "direct_to_customer" && transfer.rows[0].dispatch_planned) {
       throw new Error(`${transferOrderRef} is already planned. Unplan it before linking as a direct pickup.`);
     }
@@ -3891,6 +4087,7 @@ export async function createOrderDependency({
     }
     const normalized = [];
     const requestedByItem = new Map();
+    const requestedByTargetLine = new Map();
     for (const allocation of requested) {
       const requestedSalesLineId = Number(allocation.salesLineId);
       const targetLine = targetLinesByKey.get(text(allocation.targetLineKey))
@@ -3904,9 +4101,11 @@ export async function createOrderDependency({
       const requestedQuantity = allocationSalesQuantity(allocation, targetLine);
       const qty = requestedQuantity.quantity;
       if (qty <= EPSILON) throw new Error(`Enter a valid allocation for ${targetLine.itemName || itemId}.`);
-      if (qty > availableShortage + EPSILON) {
-        throw new Error(`${targetLine.itemName || itemId} allocation ${qty} exceeds ${targetRef} remaining quantity ${availableShortage}.`);
+      const requestedForTargetLine = number(requestedByTargetLine.get(targetLine.targetLineKey)) + qty;
+      if (requestedForTargetLine > availableShortage + EPSILON) {
+        throw new Error(`${targetLine.itemName || itemId} allocation ${requestedForTargetLine} exceeds ${targetRef} remaining quantity ${availableShortage}.`);
       }
+      requestedByTargetLine.set(targetLine.targetLineKey, requestedForTargetLine);
       requestedByItem.set(String(itemId), number(requestedByItem.get(String(itemId))) + qty);
       normalized.push({
         targetLine,
@@ -3916,15 +4115,23 @@ export async function createOrderDependency({
         display: requestedQuantity.display
       });
     }
+    const existingAllocatedByItem = new Map();
+    for (const line of existingLines.rows.filter((entry) => entry.line_role === "sales_allocation")) {
+      const key = String(line.item_id);
+      existingAllocatedByItem.set(key, number(existingAllocatedByItem.get(key)) + number(line.allocated_quantity));
+    }
     for (const [itemId, requestedQuantity] of requestedByItem) {
-      const available = number(outboundByItem.get(itemId)?.quantity);
+      const available = Math.max(
+        0,
+        number(outboundByItem.get(itemId)?.quantity) - number(existingAllocatedByItem.get(itemId))
+      );
       if (requestedQuantity > available + EPSILON) {
         const itemName = normalized.find((entry) => String(entry.targetLine.itemId) === itemId)?.targetLine.itemName || itemId;
         throw new Error(`${itemName} allocation ${requestedQuantity} exceeds ${transferOrderRef} quantity ${available}.`);
       }
     }
     const anchor = normalized[0].targetLine;
-    const inserted = await query(
+    const dependencyId = existingDependency?.id || (await query(
       `INSERT INTO order_dependencies (
          sales_order_id, sales_order_ref, dispatch_target_ref, dispatch_target_kind,
          transfer_order_id, transfer_order_ref,
@@ -3937,24 +4144,53 @@ export async function createOrderDependency({
         transfer.rows[0].netsuite_id, transfer.rows[0].tranid,
         normalizedMode, normalizedMode === "direct_to_customer", transfer.rows[0].from_location_id,
         transfer.rows[0].from_location, transfer.rows[0].to_location_id, transfer.rows[0].to_location, operatorId]
-    );
+    )).rows[0].id;
     for (const entry of normalized) {
+      const existingLine = existingLines.rows.find((line) => (
+        line.line_role === "sales_allocation"
+        && line.dispatch_target_line_key === entry.targetLine.targetLineKey
+      ));
+      if (existingLine) {
+        await query(
+          `UPDATE order_dependency_lines
+              SET allocated_quantity = allocated_quantity + $2,
+                  pallet_qty = pallet_qty + $3,
+                  layer_qty = layer_qty + $4,
+                  section_qty = section_qty + $5,
+                  piece_qty = piece_qty + $6,
+                  updated_at = now()
+            WHERE id = $1`,
+          [existingLine.id, entry.qty, entry.display.palletQty, entry.display.layerQty,
+            entry.display.sectionQty, entry.display.pieceQty]
+        );
+      } else {
+        await query(
+          `INSERT INTO order_dependency_lines (
+             dependency_id, sales_line_id, transfer_outbound_line_id, transfer_receiving_line_id,
+             item_id, item_name, unit, allocated_quantity, pallet_qty, layer_qty, section_qty, piece_qty,
+             line_role, dispatch_target_line_key
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'sales_allocation', $13)`,
+          [dependencyId, entry.targetLine.salesLineId, entry.outbound.id, entry.receiving?.id || null,
+            entry.targetLine.itemId, entry.targetLine.itemName, entry.targetLine.unit, entry.qty,
+            entry.display.palletQty, entry.display.layerQty, entry.display.sectionQty, entry.display.pieceQty,
+            entry.targetLine.targetLineKey]
+        );
+      }
+    }
+    if (existingDependency) {
       await query(
-        `INSERT INTO order_dependency_lines (
-           dependency_id, sales_line_id, transfer_outbound_line_id, transfer_receiving_line_id,
-           item_id, item_name, unit, allocated_quantity, pallet_qty, layer_qty, section_qty, piece_qty,
-           line_role, dispatch_target_line_key
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'sales_allocation', $13)`,
-        [inserted.rows[0].id, entry.targetLine.salesLineId, entry.outbound.id, entry.receiving?.id || null,
-          entry.targetLine.itemId, entry.targetLine.itemName, entry.targetLine.unit, entry.qty,
-          entry.display.palletQty, entry.display.layerQty, entry.display.sectionQty, entry.display.pieceQty,
-          entry.targetLine.targetLineKey]
+        `UPDATE order_dependencies
+            SET updated_by = $2, updated_at = now()
+          WHERE id = $1`,
+        [dependencyId, operatorId]
       );
     }
     await writeDispatchAudit({
-      action: "dispatch.order_dependency.linked",
+      action: existingDependency
+        ? "dispatch.order_dependency.extended"
+        : "dispatch.order_dependency.linked",
       entityType: "order_dependency",
-      entityId: String(inserted.rows[0].id),
+      entityId: String(dependencyId),
       orderId: resolved.target.ref,
       planId: resolved.target.planId || null,
       planDate: resolved.target.planDate || planDate || null,
@@ -3967,7 +4203,12 @@ export async function createOrderDependency({
         memberRefs: resolved.target.memberRefs
       }
     });
-    return (await loadDependencies({ salesOrderRef: resolved.target.ref })).find((row) => String(row.id) === String(inserted.rows[0].id));
+    const saved = (await loadDependencies({ salesOrderRef: resolved.target.ref }))
+      .find((row) => String(row.id) === String(dependencyId));
+    return {
+      ...saved,
+      effectiveAction: existingDependency ? "extend_to" : "link_to"
+    };
   });
 }
 

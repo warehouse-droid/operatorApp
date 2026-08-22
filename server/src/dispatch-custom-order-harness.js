@@ -145,8 +145,8 @@ function assertStaticIntegration() {
   );
   assert.match(
     customOrdersHtmlSource,
-    /dispatch-custom-orders\.js\?v=20260730-stop-time-v1/,
-    "The Custom Order editor must cache-bust the stop-time UI."
+    /dispatch-custom-orders\.js\?v=20260819-scm-menu-v1/,
+    "The shared Dispatch and SCM Custom Order editor must use the current cache-busted UI."
   );
   assert.match(
     planningSource,

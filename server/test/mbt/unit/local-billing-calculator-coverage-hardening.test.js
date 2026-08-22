@@ -445,6 +445,7 @@ test("P3 billing coverage: load defaults, explicit operational identity, empty p
     calculationExplanation: {
       soDeduplication: "root_and_physical_load",
       toDeduplication: "root_globally_first_stable_load",
+      toMultiDropAllocation: "one_shared_longest_drop_charge_sorted_balanced_integer_cents",
       poVrmaDeduplication: "type_root_and_physical_load",
       allocation: "sorted_equal_integer_cents_final_root_receives_remainder"
     }

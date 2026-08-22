@@ -293,7 +293,8 @@ export function dispatchStatisticStopFromRow(row, { driverProfile = null } = {})
   const plannedMinutes = physicalVisit?.plannedMinutes
     ?? customDropMinutes
     ?? plannedStopMinutes(currentClass, planningProfile, pallets);
-  const grossSeconds = row.status === "complete" ? secondsBetween(row.started_at, row.completed_at) : 0;
+  const effectiveStartedAt = row.actual_arrival_at || row.started_at;
+  const grossSeconds = row.status === "complete" ? secondsBetween(effectiveStartedAt, row.completed_at) : 0;
   const restSeconds = row.status === "complete"
     ? Math.min(grossSeconds, Math.max(0, numberValue(row.rest_seconds)))
     : 0;
@@ -313,7 +314,11 @@ export function dispatchStatisticStopFromRow(row, { driverProfile = null } = {})
     stopClass: currentClass,
     stopClassLabel: classLabel(currentClass),
     status: row.status || "",
-    startedAt: row.started_at,
+    startedAt: effectiveStartedAt,
+    pwaStartedAt: row.started_at,
+    actualArrivalAt: row.actual_arrival_at || null,
+    actualArrivalSource: row.actual_arrival_source || (row.started_at ? "pwa_started_at" : ""),
+    actualArrivalConfidence: row.actual_arrival_confidence || (row.started_at ? "explicit" : ""),
     completedAt: row.completed_at,
     actualMinutes,
     grossMinutes,
@@ -378,16 +383,29 @@ export function dispatchStatisticStopsFromRows(rows = [], { driverProfiles = [] 
     const complete = expectedStopIds.length > 0
       && expectedStopIds.every((stopId) => recordedStopIds.has(String(stopId)))
       && members.every((member) => member.status === "complete");
-    const actualMinutes = members.reduce((sum, member) => sum + numberValue(member.actualMinutes), 0);
-    const grossMinutes = members.reduce((sum, member) => sum + numberValue(member.grossMinutes), 0);
-    const restMinutes = members.reduce((sum, member) => sum + numberValue(member.restMinutes), 0);
+    const startedAt = firstDateValue(members.map((member) => member.startedAt));
+    const completedAt = complete ? lastDateValue(members.map((member) => member.completedAt)) : null;
+    const sharesDerivedArrival = members.some((member) => Boolean(member.actualArrivalAt));
+    const grossMinutes = sharesDerivedArrival && complete
+      ? Math.max(0, Math.round(secondsBetween(startedAt, completedAt) / 60))
+      : members.reduce((sum, member) => sum + numberValue(member.grossMinutes), 0);
+    // Each logical row sees the same rest overlap after a shared physical
+    // arrival. The latest member therefore contains the full visit overlap;
+    // summing those rows would count the same rest more than once.
+    const restMinutes = sharesDerivedArrival
+      ? members.reduce((maximum, member) => Math.max(maximum, numberValue(member.restMinutes)), 0)
+      : members.reduce((sum, member) => sum + numberValue(member.restMinutes), 0);
+    const actualMinutes = sharesDerivedArrival
+      ? Math.max(0, round(grossMinutes - restMinutes))
+      : members.reduce((sum, member) => sum + numberValue(member.actualMinutes), 0);
     const plannedMinutes = numberValue(representative.physicalVisitPlannedMinutes ?? representative.plannedMinutes);
     const pallets = members.reduce((sum, member) => sum + numberValue(member.pallets), 0);
     return {
       ...representative,
       status: complete ? "complete" : "in_progress",
-      startedAt: firstDateValue(members.map((member) => member.startedAt)),
-      completedAt: complete ? lastDateValue(members.map((member) => member.completedAt)) : null,
+      startedAt,
+      pwaStartedAt: firstDateValue(members.map((member) => member.pwaStartedAt)),
+      completedAt,
       actualMinutes,
       grossMinutes,
       restMinutes,
@@ -461,21 +479,26 @@ export async function getDispatchStatistics({ from = "", to = "", driver = "" } 
             r.stop_id, r.stop_type, COALESCE(r.order_refs, '[]'::jsonb) AS order_refs,
             COALESCE(r.photo_data_urls, '[]'::jsonb) AS photo_data_urls,
             r.status, r.started_at, r.completed_at,
+            arrival.actual_arrival_at,
+            arrival.source AS actual_arrival_source,
+            arrival.confidence AS actual_arrival_confidence,
             COALESCE((
               SELECT SUM(EXTRACT(EPOCH FROM (
                 LEAST(COALESCE(rr.ended_at, now()), r.completed_at)
-                - GREATEST(rr.started_at, r.started_at)
+                - GREATEST(rr.started_at, COALESCE(arrival.actual_arrival_at, r.started_at))
               )))
                 FROM driver_rest_records rr
                WHERE rr.driver_login = r.driver_login
                  AND r.completed_at IS NOT NULL
                  AND rr.started_at < r.completed_at
-                 AND COALESCE(rr.ended_at, now()) > r.started_at
+                 AND COALESCE(rr.ended_at, now()) > COALESCE(arrival.actual_arrival_at, r.started_at)
             ), 0) AS rest_seconds,
             COALESCE(s.orders, '[]'::jsonb) AS orders,
             COALESCE(s.trucks, '[]'::jsonb) AS trucks,
             COALESCE(s.summary, '{}'::jsonb) AS summary
        FROM driver_job_records r
+       LEFT JOIN dispatch_actual_stop_arrivals arrival
+         ON arrival.driver_job_record_id = r.id
        LEFT JOIN LATERAL (
          SELECT candidate.orders, candidate.trucks, candidate.summary
            FROM (

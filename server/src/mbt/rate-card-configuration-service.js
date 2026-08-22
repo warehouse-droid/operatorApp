@@ -15,6 +15,7 @@ import {
   isMbbsCrossChargeGraph,
   normalizeMbbsRateCardPolicy
 } from "./mbbs-rate-card-policy.js";
+import { normalizeMbbsVendorRouteRates } from "./mbbs-vendor-route-rates.js";
 
 /** @typedef {import("./audit-repository.js").MbtActor} MbtActor */
 
@@ -161,11 +162,13 @@ function validateVersion(version) {
 }
 
 /** @param {Record<string, any>} band */
+// eslint-disable-next-line complexity -- Full graph validation deliberately rejects every incomplete legacy/flat/per-km/base-excess shape before persistence.
 function validateBand(band) {
   allowedFields(band, [
     "itemCode", "serviceCode", "binTypeCode", "sequenceNumber", "minimumMetres",
     "maximumMetres", "amountMinor", "downtownSurchargeMinor", "currency",
-    "description", "pricingBasis", "boundaryRule", "originYardCodes"
+    "description", "pricingBasis", "boundaryRule", "originYardCodes",
+    "baseAmountMinor", "includedMetres"
   ]);
   nullableCode(band.itemCode ?? null, "Band item code");
   requiredText(band.serviceCode, "Band service code", 64);
@@ -178,6 +181,18 @@ function validateBand(band) {
   if (band.pricingBasis !== undefined
       && !Object.values(DISTANCE_PRICING_BASES).includes(band.pricingBasis)) {
     return invalidInput("Band pricing basis must be flat or per_km.");
+  }
+  const hasBaseAmount = band.baseAmountMinor !== undefined && band.baseAmountMinor !== null;
+  const hasIncludedMetres = band.includedMetres !== undefined && band.includedMetres !== null;
+  if (hasBaseAmount !== hasIncludedMetres) {
+    return invalidInput("Band base amount and included metres must be configured together.");
+  }
+  if (hasBaseAmount) {
+    safeInteger(band.baseAmountMinor, "Band base amount cents");
+    safeInteger(band.includedMetres, "Band included metres");
+    if ((band.pricingBasis || DISTANCE_PRICING_BASES.FLAT) !== DISTANCE_PRICING_BASES.PER_KM) {
+      return invalidInput("Band base amount and included metres require per_km pricing.");
+    }
   }
   if (band.boundaryRule !== undefined
       && !Object.values(DISTANCE_BOUNDARY_RULES).includes(band.boundaryRule)) {
@@ -464,6 +479,7 @@ function validateDepositRule(rule) {
  * @param {unknown} value
  * @param {{sourceKind?: unknown}} [options]
  */
+// eslint-disable-next-line complexity -- The complete persisted graph is one atomic, allowlisted contract.
 export function normalizeLocalRateCardGraph(value, { sourceKind } = {}) {
   if (!new Set(["manual", "csv"]).has(String(sourceKind || ""))) {
     return invalidInput("A manual or CSV rate-card source is required.");
@@ -471,7 +487,7 @@ export function normalizeLocalRateCardGraph(value, { sourceKind } = {}) {
   const graph = inputRecord(value, "Rate-card graph");
   allowedFields(graph, [
     "rateCard", "version", "distanceBands", "components", "dumpTariffs",
-    "depositRules", "mbbsChargingPolicy"
+    "depositRules", "mbbsChargingPolicy", "mbbsVendorRouteRates"
   ]);
   const rateCard = inputRecord(graph.rateCard, "Rate-card header");
   const version = inputRecord(graph.version, "Rate-card version");
@@ -492,10 +508,23 @@ export function normalizeLocalRateCardGraph(value, { sourceKind } = {}) {
     validateDepositRule(inputRecord(rule, "Deposit rule"));
   }
   const normalized = structuredClone(graph);
+  const vendorRouteRates = graph.mbbsVendorRouteRates === undefined
+    ? []
+    : graph.mbbsVendorRouteRates;
+  if (!Array.isArray(vendorRouteRates)) {
+    return invalidInput("MBBS vendor-route rates must be a list.");
+  }
   if (isMbbsCrossChargeGraph(graph)) {
     normalized.mbbsChargingPolicy = normalizeMbbsRateCardPolicy(graph.mbbsChargingPolicy);
+    normalized.mbbsVendorRouteRates = normalizeMbbsVendorRouteRates(vendorRouteRates);
+    if (normalized.mbbsVendorRouteRates.length > 0
+        && normalized.mbbsChargingPolicy.schemaVersion !== 2) {
+      return invalidInput("MBBS vendor-route rates require charging policy schema version 2.");
+    }
   } else if (graph.mbbsChargingPolicy !== null && graph.mbbsChargingPolicy !== undefined) {
     return invalidInput("An MBBS charging policy requires DELIVERY_CHARGE_MBBS cross-charge bands.");
+  } else if (vendorRouteRates.length > 0) {
+    return invalidInput("MBBS vendor-route rates require DELIVERY_CHARGE_MBBS cross-charge bands.");
   }
   return normalized;
 }
@@ -732,11 +761,73 @@ async function insertGraph(graph, actor, references) {
     ]
   );
   await replaceMbbsChargingPolicy(rateCardVersionId, graph.mbbsChargingPolicy, actor);
+  await insertMbbsVendorRouteRates(rateCardVersionId, graph.mbbsVendorRouteRates || [], actor);
   await insertDistanceBands(rateCardVersionId, graph.distanceBands, references);
   await insertComponents(rateCardVersionId, graph.components, references);
   await insertDumpTariffs(rateCardVersionId, graph.dumpTariffs, references);
   await insertDepositRules(rateCardVersionId, graph.depositRules, references);
   return { rateCardId, rateCardVersionId };
+}
+
+/** @param {string} versionId @param {Record<string, any>[]} rows @param {MbtActor} actor */
+async function insertMbbsVendorRouteRates(versionId, rows, actor) {
+  for (const row of rows) {
+    const physicalYard = await query(
+      `SELECT vendor.id::int AS local_vendor_id, vendor.name AS local_vendor_name,
+              retained.yard, retained.address
+         FROM dispatch_local_vendors vendor
+         JOIN LATERAL (
+           SELECT yard.yard, yard.address
+             FROM dispatch_vendor_yards yard
+            WHERE lower(btrim(yard.vendor)) = lower(btrim(vendor.name))
+              AND lower(btrim(yard.yard)) = lower(btrim($2))
+            GROUP BY yard.yard, yard.address
+            HAVING bool_or(yard.active)
+            ORDER BY yard.yard, yard.address
+         ) retained ON true
+        WHERE vendor.id = $1
+          AND vendor.active`,
+      [row.localVendorId, row.vendorYardName]
+    );
+    if (physicalYard.rowCount !== 1) {
+      return fail(
+        "MBT_VENDOR_ROUTE_YARD_INVALID",
+        "Choose one unambiguous active physical vendor yard from current local master data."
+      );
+    }
+    const retainedYard = physicalYard.rows[0];
+    if (String(retainedYard.local_vendor_name) !== row.localVendorName
+        || String(retainedYard.yard) !== row.vendorYardName
+        || String(retainedYard.address) !== row.vendorYardAddress) {
+      return fail(
+        "MBT_VENDOR_ROUTE_YARD_STALE",
+        "The selected vendor-yard name or address changed. Refresh the rate card before saving."
+      );
+    }
+    const destination = await query(
+      `SELECT yard_id
+         FROM mbt_yards
+        WHERE upper(btrim(yard_code)) = upper(btrim($1))
+          AND active`,
+      [row.destinationYardCode]
+    );
+    if (destination.rowCount !== 1) {
+      return fail("MBT_VENDOR_ROUTE_DESTINATION_INVALID", "Choose one active MBBS destination yard.");
+    }
+    await query(
+      `INSERT INTO mbt_mbbs_vendor_route_rates (
+         vendor_route_rate_id, rate_card_version_id, rate_name, display_name,
+         local_vendor_id, vendor_yard_name, vendor_yard_address,
+         destination_yard_id, base_amount_minor, currency,
+         revision, created_by, updated_by
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'CAD', 1, $10, $10)`,
+      [
+        crypto.randomUUID(), versionId, row.rateName, row.displayName,
+        row.localVendorId, row.vendorYardName, row.vendorYardAddress,
+        destination.rows[0].yard_id, row.baseAmountMinor, actor.operatorId
+      ]
+    );
+  }
 }
 
 /** @param {string} versionId @param {Record<string, any>[]} rows @param {Record<string, any>} references */
@@ -745,10 +836,11 @@ async function insertDistanceBands(versionId, rows, references) {
     await query(
       `INSERT INTO mbt_rate_distance_bands (
          rate_distance_band_id, rate_card_version_id, item_code, service_code, bin_type_id,
-         sequence_number, minimum_metres, maximum_metres, amount_minor,
-         pricing_basis, boundary_rule, origin_yard_codes,
-         currency, downtown_surcharge_minor, description
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::text[], $13, $14, $15)`,
+       sequence_number, minimum_metres, maximum_metres, amount_minor,
+       pricing_basis, boundary_rule, origin_yard_codes,
+       currency, downtown_surcharge_minor, description,
+       base_amount_minor, included_metres
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::text[], $13, $14, $15, $16, $17)`,
       [
         crypto.randomUUID(), versionId, row.itemCode || null, row.serviceCode,
         row.binTypeCode ? references.binTypes.get(row.binTypeCode) : null,
@@ -756,7 +848,8 @@ async function insertDistanceBands(versionId, rows, references) {
         row.pricingBasis || DISTANCE_PRICING_BASES.FLAT,
         row.boundaryRule || DISTANCE_BOUNDARY_RULES.LEGACY_LOWER_INCLUSIVE,
         row.originYardCodes || [],
-        row.currency, row.downtownSurchargeMinor, row.description
+        row.currency, row.downtownSurchargeMinor, row.description,
+        row.baseAmountMinor ?? null, row.includedMetres ?? null
       ]
     );
   }
@@ -833,6 +926,11 @@ async function replaceMbbsChargingPolicy(versionId, policy, actor) {
     );
     return;
   }
+  const schemaV2OrV3 = policy.schemaVersion === 2 || policy.schemaVersion === 3;
+  const schemaV3 = policy.schemaVersion === 3;
+  const retainedAdditionalAmount = schemaV2OrV3
+    ? policy.poVrmaAdditionalStopUnitAmountMinor
+    : policy.poAdditionalDropUnitAmountMinor;
   await query(
     `INSERT INTO mbt_mbbs_rate_card_policies (
        rate_card_version_id, schema_version, currency,
@@ -840,8 +938,16 @@ async function replaceMbbsChargingPolicy(versionId, policy, actor) {
        so_charge_basis, to_replenishment_charge_basis,
        to_direct_pickup_charge_basis, po_charge_basis,
        po_additional_drop_basis, dispatch_load_split_basis,
+       po_vrma_additional_stop_unit_amount_minor,
+       po_vrma_base_charge_basis, vrma_direction_basis,
+       po_vrma_additional_stop_basis, endpoint_override_basis,
+       to_replenishment_additional_drop_unit_amount_minor,
+       to_replenishment_multi_drop_basis,
        revision, created_by, updated_by
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 1, $12, $12)
+     ) VALUES (
+       $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+       $12, $13, $14, $15, $16, $17, $18, 1, $19, $19
+     )
      ON CONFLICT (rate_card_version_id) DO UPDATE
        SET schema_version = EXCLUDED.schema_version,
            currency = EXCLUDED.currency,
@@ -853,15 +959,30 @@ async function replaceMbbsChargingPolicy(versionId, policy, actor) {
            po_charge_basis = EXCLUDED.po_charge_basis,
            po_additional_drop_basis = EXCLUDED.po_additional_drop_basis,
            dispatch_load_split_basis = EXCLUDED.dispatch_load_split_basis,
+           po_vrma_additional_stop_unit_amount_minor = EXCLUDED.po_vrma_additional_stop_unit_amount_minor,
+           po_vrma_base_charge_basis = EXCLUDED.po_vrma_base_charge_basis,
+           vrma_direction_basis = EXCLUDED.vrma_direction_basis,
+           po_vrma_additional_stop_basis = EXCLUDED.po_vrma_additional_stop_basis,
+           endpoint_override_basis = EXCLUDED.endpoint_override_basis,
+           to_replenishment_additional_drop_unit_amount_minor = EXCLUDED.to_replenishment_additional_drop_unit_amount_minor,
+           to_replenishment_multi_drop_basis = EXCLUDED.to_replenishment_multi_drop_basis,
            revision = mbt_mbbs_rate_card_policies.revision + 1,
            updated_by = EXCLUDED.updated_by,
            updated_at = now()`,
     [
       versionId, policy.schemaVersion, policy.currency,
-      policy.directPickupUnitAmountMinor, policy.poAdditionalDropUnitAmountMinor,
+      policy.directPickupUnitAmountMinor, retainedAdditionalAmount,
       policy.soChargeBasis, policy.toReplenishmentChargeBasis,
       policy.toDirectPickupChargeBasis, policy.poChargeBasis,
-      policy.poAdditionalDropBasis, policy.dispatchLoadSplitBasis,
+      schemaV2OrV3 ? "each_distinct_drop_after_first" : policy.poAdditionalDropBasis,
+      policy.dispatchLoadSplitBasis,
+      schemaV2OrV3 ? policy.poVrmaAdditionalStopUnitAmountMinor : null,
+      schemaV2OrV3 ? policy.poVrmaBaseChargeBasis : null,
+      schemaV2OrV3 ? policy.vrmaDirectionBasis : null,
+      schemaV2OrV3 ? policy.poVrmaAdditionalStopBasis : null,
+      schemaV2OrV3 ? policy.endpointOverrideBasis : null,
+      schemaV3 ? policy.toReplenishmentAdditionalDropUnitAmountMinor : null,
+      schemaV3 ? policy.toReplenishmentMultiDropBasis : null,
       actor.operatorId
     ]
   );
@@ -955,10 +1076,18 @@ export async function replaceLocalRateCardDraft(input) {
         return fail("MBT_RATE_CARD_IDENTITY_IMMUTABLE", "Rate-card code and name are immutable after draft creation; create a new rate card for a new identity.");
       }
       const references = await resolveGraphReferences(graph);
-      for (const table of ["mbt_deposit_rules", "mbt_dump_tariffs", "mbt_rate_components", "mbt_rate_distance_bands"]) {
+      for (const table of [
+        "mbt_mbbs_vendor_route_rates", "mbt_deposit_rules", "mbt_dump_tariffs",
+        "mbt_rate_components", "mbt_rate_distance_bands"
+      ]) {
         await query(`DELETE FROM ${table} WHERE rate_card_version_id = $1`, [input.rateCardVersionId]);
       }
       await replaceMbbsChargingPolicy(input.rateCardVersionId, graph.mbbsChargingPolicy, input.actor);
+      await insertMbbsVendorRouteRates(
+        input.rateCardVersionId,
+        graph.mbbsVendorRouteRates || [],
+        input.actor
+      );
       await insertDistanceBands(input.rateCardVersionId, graph.distanceBands, references);
       await insertComponents(input.rateCardVersionId, graph.components, references);
       await insertDumpTariffs(input.rateCardVersionId, graph.dumpTariffs, references);
@@ -1351,6 +1480,11 @@ async function cloneChildren(sourceId, cloneId, actor) {
        so_charge_basis, to_replenishment_charge_basis,
        to_direct_pickup_charge_basis, po_charge_basis,
        po_additional_drop_basis, dispatch_load_split_basis,
+       po_vrma_additional_stop_unit_amount_minor,
+       po_vrma_base_charge_basis, vrma_direction_basis,
+       po_vrma_additional_stop_basis, endpoint_override_basis,
+       to_replenishment_additional_drop_unit_amount_minor,
+       to_replenishment_multi_drop_basis,
        revision, created_by, updated_by
      )
      SELECT $2, schema_version, currency,
@@ -1358,8 +1492,28 @@ async function cloneChildren(sourceId, cloneId, actor) {
             so_charge_basis, to_replenishment_charge_basis,
             to_direct_pickup_charge_basis, po_charge_basis,
             po_additional_drop_basis, dispatch_load_split_basis,
+            po_vrma_additional_stop_unit_amount_minor,
+            po_vrma_base_charge_basis, vrma_direction_basis,
+            po_vrma_additional_stop_basis, endpoint_override_basis,
+            to_replenishment_additional_drop_unit_amount_minor,
+            to_replenishment_multi_drop_basis,
             1, $3, $3
        FROM mbt_mbbs_rate_card_policies
+      WHERE rate_card_version_id = $1`,
+    [sourceId, cloneId, actor.operatorId]
+  );
+  await query(
+    `INSERT INTO mbt_mbbs_vendor_route_rates (
+       vendor_route_rate_id, rate_card_version_id, rate_name, display_name,
+       local_vendor_id, vendor_yard_name, vendor_yard_address,
+       destination_yard_id, base_amount_minor, currency,
+       revision, created_by, updated_by
+     )
+     SELECT gen_random_uuid(), $2, rate_name, display_name,
+            local_vendor_id, vendor_yard_name, vendor_yard_address,
+            destination_yard_id, base_amount_minor, currency,
+            1, $3, $3
+       FROM mbt_mbbs_vendor_route_rates
       WHERE rate_card_version_id = $1`,
     [sourceId, cloneId, actor.operatorId]
   );
@@ -1367,7 +1521,7 @@ async function cloneChildren(sourceId, cloneId, actor) {
     {
       table: "mbt_rate_distance_bands",
       id: "rate_distance_band_id",
-      columns: "item_code, service_code, bin_type_id, sequence_number, minimum_metres, maximum_metres, amount_minor, pricing_basis, boundary_rule, origin_yard_codes, currency, downtown_surcharge_minor, description"
+      columns: "item_code, service_code, bin_type_id, sequence_number, minimum_metres, maximum_metres, amount_minor, pricing_basis, boundary_rule, origin_yard_codes, currency, downtown_surcharge_minor, description, base_amount_minor, included_metres"
     },
     {
       table: "mbt_rate_components",
@@ -1468,7 +1622,7 @@ function listFilters(input) {
 /** @param {{query?: unknown, status?: unknown, limit?: unknown, cursor?: unknown}} [input] */
 export async function listLocalRateCards(input = {}) {
   const { search, status, limit, cursor } = listFilters(input);
-  const [result, yards] = await Promise.all([query(
+  const [result, yards, vendorYards] = await Promise.all([query(
       `SELECT version.rate_card_version_id::text AS "rateCardVersionId",
             version.rate_card_id::text AS "rateCardId",
             card.rate_card_code AS "rateCardCode", card.display_name AS "displayName",
@@ -1509,12 +1663,30 @@ export async function listLocalRateCards(input = {}) {
       WHERE active
       ORDER BY CASE yard_code WHEN '3445' THEN 1 WHEN '2967' THEN 2 WHEN '150' THEN 3 WHEN '12441' THEN 4 ELSE 5 END,
                yard_code`
+  ), query(
+    `SELECT vendor.id::int AS "localVendorId",
+            vendor.name AS "localVendorName",
+            retained.yard AS "vendorYardName",
+            retained.address AS "vendorYardAddress",
+            retained.aliases AS "vendorYardAliases"
+       FROM dispatch_local_vendors vendor
+       JOIN LATERAL (
+         SELECT yard.yard, yard.address,
+                string_agg(DISTINCT yard.aliases, ',') AS aliases
+           FROM dispatch_vendor_yards yard
+          WHERE yard.active
+            AND lower(btrim(yard.vendor)) = lower(btrim(vendor.name))
+          GROUP BY yard.yard, yard.address
+       ) retained ON true
+      WHERE vendor.active
+      ORDER BY lower(vendor.name), lower(retained.yard), lower(retained.address)`
   )]);
   const items = result.rows.slice(0, limit);
   return {
     schemaVersion: "mbt-rate-cards-v1",
     items,
     yardOptions: yards.rows,
+    vendorYardOptions: vendorYards.rows,
     nextCursor: result.rows.length > limit ? items.at(-1)?.rateCardVersionId || null : null
   };
 }
@@ -1542,6 +1714,7 @@ function optionalRateCardVersionId(value) {
  *
  * @param {unknown} rawVersionId
  */
+// eslint-disable-next-line complexity -- The editor read model reconstructs versioned v1/v2/v3 policy and all optional graph children without hidden defaults.
 export async function getLocalRateCardGraph(rawVersionId) {
   const versionId = normalizeRateCardVersionId(rawVersionId);
   const header = await query(
@@ -1561,12 +1734,19 @@ export async function getLocalRateCardGraph(rawVersionId) {
             policy.currency AS "policyCurrency",
             policy.direct_pickup_unit_amount_minor AS "directPickupUnitAmountMinor",
             policy.po_additional_drop_unit_amount_minor AS "poAdditionalDropUnitAmountMinor",
+            policy.po_vrma_additional_stop_unit_amount_minor AS "poVrmaAdditionalStopUnitAmountMinor",
             policy.so_charge_basis AS "soChargeBasis",
             policy.to_replenishment_charge_basis AS "toReplenishmentChargeBasis",
             policy.to_direct_pickup_charge_basis AS "toDirectPickupChargeBasis",
             policy.po_charge_basis AS "poChargeBasis",
             policy.po_additional_drop_basis AS "poAdditionalDropBasis",
-            policy.dispatch_load_split_basis AS "dispatchLoadSplitBasis"
+            policy.dispatch_load_split_basis AS "dispatchLoadSplitBasis",
+            policy.po_vrma_base_charge_basis AS "poVrmaBaseChargeBasis",
+            policy.vrma_direction_basis AS "vrmaDirectionBasis",
+            policy.po_vrma_additional_stop_basis AS "poVrmaAdditionalStopBasis",
+            policy.endpoint_override_basis AS "endpointOverrideBasis",
+            policy.to_replenishment_additional_drop_unit_amount_minor AS "toReplenishmentAdditionalDropUnitAmountMinor",
+            policy.to_replenishment_multi_drop_basis AS "toReplenishmentMultiDropBasis"
        FROM mbt_rate_card_versions version
        JOIN mbt_rate_cards card USING (rate_card_id)
        LEFT JOIN mbt_mbbs_rate_card_policies policy USING (rate_card_version_id)
@@ -1583,6 +1763,7 @@ export async function getLocalRateCardGraph(rawVersionId) {
               band.sequence_number AS "sequenceNumber", band.minimum_metres AS "minimumMetres",
               band.maximum_metres AS "maximumMetres", band.amount_minor AS "amountMinor",
               band.pricing_basis AS "pricingBasis", band.boundary_rule AS "boundaryRule",
+              band.base_amount_minor AS "baseAmountMinor", band.included_metres AS "includedMetres",
               band.origin_yard_codes AS "originYardCodes",
               band.downtown_surcharge_minor AS "downtownSurchargeMinor", band.currency, band.description
          FROM mbt_rate_distance_bands band
@@ -1614,6 +1795,75 @@ export async function getLocalRateCardGraph(rawVersionId) {
         WHERE tariff.rate_card_version_id = $1
         ORDER BY tariff.item_code NULLS FIRST, material.material_code NULLS FIRST, tariff.tariff_code`, [versionId]
   );
+  const vendorRouteRates = await query(
+    `SELECT route_rate.rate_name AS "rateName",
+            route_rate.display_name AS "displayName",
+            route_rate.local_vendor_id::int AS "localVendorId",
+            vendor.name AS "localVendorName",
+            route_rate.vendor_yard_name AS "vendorYardName",
+            route_rate.vendor_yard_address AS "vendorYardAddress",
+            yard.yard_code AS "destinationYardCode",
+            route_rate.base_amount_minor::text AS "baseAmountMinor",
+            route_rate.currency
+       FROM mbt_mbbs_vendor_route_rates route_rate
+       JOIN dispatch_local_vendors vendor ON vendor.id = route_rate.local_vendor_id
+       JOIN mbt_yards yard ON yard.yard_id = route_rate.destination_yard_id
+      WHERE route_rate.rate_card_version_id = $1
+      ORDER BY lower(vendor.name), lower(route_rate.vendor_yard_name),
+               yard.yard_code, lower(route_rate.rate_name)`,
+    [versionId]
+  );
+  const policySchemaVersion = header.rows[0].policySchemaVersion === null
+    ? null
+    : Number(header.rows[0].policySchemaVersion);
+  const policyInput = policySchemaVersion === 3
+    ? {
+        schemaVersion: 3,
+        currency: String(header.rows[0].policyCurrency),
+        directPickupUnitAmountMinor: Number(header.rows[0].directPickupUnitAmountMinor),
+        poVrmaAdditionalStopUnitAmountMinor: Number(header.rows[0].poVrmaAdditionalStopUnitAmountMinor),
+        toReplenishmentAdditionalDropUnitAmountMinor: Number(header.rows[0].toReplenishmentAdditionalDropUnitAmountMinor),
+        soChargeBasis: String(header.rows[0].soChargeBasis),
+        toReplenishmentChargeBasis: String(header.rows[0].toReplenishmentChargeBasis),
+        toDirectPickupChargeBasis: String(header.rows[0].toDirectPickupChargeBasis),
+        poChargeBasis: String(header.rows[0].poChargeBasis),
+        dispatchLoadSplitBasis: String(header.rows[0].dispatchLoadSplitBasis),
+        poVrmaBaseChargeBasis: String(header.rows[0].poVrmaBaseChargeBasis),
+        vrmaDirectionBasis: String(header.rows[0].vrmaDirectionBasis),
+        poVrmaAdditionalStopBasis: String(header.rows[0].poVrmaAdditionalStopBasis),
+        endpointOverrideBasis: String(header.rows[0].endpointOverrideBasis),
+        toReplenishmentMultiDropBasis: String(header.rows[0].toReplenishmentMultiDropBasis)
+      }
+    : policySchemaVersion === 2
+    ? {
+        schemaVersion: 2,
+        currency: String(header.rows[0].policyCurrency),
+        directPickupUnitAmountMinor: Number(header.rows[0].directPickupUnitAmountMinor),
+        poVrmaAdditionalStopUnitAmountMinor: Number(header.rows[0].poVrmaAdditionalStopUnitAmountMinor),
+        soChargeBasis: String(header.rows[0].soChargeBasis),
+        toReplenishmentChargeBasis: String(header.rows[0].toReplenishmentChargeBasis),
+        toDirectPickupChargeBasis: String(header.rows[0].toDirectPickupChargeBasis),
+        poChargeBasis: String(header.rows[0].poChargeBasis),
+        dispatchLoadSplitBasis: String(header.rows[0].dispatchLoadSplitBasis),
+        poVrmaBaseChargeBasis: String(header.rows[0].poVrmaBaseChargeBasis),
+        vrmaDirectionBasis: String(header.rows[0].vrmaDirectionBasis),
+        poVrmaAdditionalStopBasis: String(header.rows[0].poVrmaAdditionalStopBasis),
+        endpointOverrideBasis: String(header.rows[0].endpointOverrideBasis)
+      }
+    : policySchemaVersion === 1
+      ? {
+          schemaVersion: 1,
+          currency: String(header.rows[0].policyCurrency),
+          directPickupUnitAmountMinor: Number(header.rows[0].directPickupUnitAmountMinor),
+          poAdditionalDropUnitAmountMinor: Number(header.rows[0].poAdditionalDropUnitAmountMinor),
+          soChargeBasis: String(header.rows[0].soChargeBasis),
+          toReplenishmentChargeBasis: String(header.rows[0].toReplenishmentChargeBasis),
+          toDirectPickupChargeBasis: String(header.rows[0].toDirectPickupChargeBasis),
+          poChargeBasis: String(header.rows[0].poChargeBasis),
+          poAdditionalDropBasis: String(header.rows[0].poAdditionalDropBasis),
+          dispatchLoadSplitBasis: String(header.rows[0].dispatchLoadSplitBasis)
+        }
+      : null;
   return {
     schemaVersion: "mbt-rate-card-detail-v1",
     version: header.rows[0],
@@ -1638,26 +1888,21 @@ export async function getLocalRateCardGraph(rawVersionId) {
         minimumMetres: Number(row.minimumMetres),
         maximumMetres: row.maximumMetres === null ? null : Number(row.maximumMetres),
         amountMinor: Number(row.amountMinor),
+        baseAmountMinor: row.baseAmountMinor === null ? null : Number(row.baseAmountMinor),
+        includedMetres: row.includedMetres === null ? null : Number(row.includedMetres),
         downtownSurchargeMinor: Number(row.downtownSurchargeMinor),
         originYardCodes: Array.isArray(row.originYardCodes) ? row.originYardCodes.map(String) : []
       })),
       components: (/** @type {Array<Record<string, any>>} */ (components.rows)).map((row) => ({ ...row, amountMinor: row.amountMinor === null ? null : Number(row.amountMinor), percentageBasisPoints: row.percentageBasisPoints === null ? null : Number(row.percentageBasisPoints), defaultQuantity: Number(row.defaultQuantity) })),
       dumpTariffs: (/** @type {Array<Record<string, any>>} */ (tariffs.rows)).map((row) => ({ ...row, amountMinor: Number(row.amountMinor), minimumAmountMinor: Number(row.minimumAmountMinor) })),
       depositRules: [],
-      mbbsChargingPolicy: header.rows[0].policySchemaVersion === null
-        ? null
-        : normalizeMbbsRateCardPolicy({
-            schemaVersion: Number(header.rows[0].policySchemaVersion),
-            currency: String(header.rows[0].policyCurrency),
-            directPickupUnitAmountMinor: Number(header.rows[0].directPickupUnitAmountMinor),
-            poAdditionalDropUnitAmountMinor: Number(header.rows[0].poAdditionalDropUnitAmountMinor),
-            soChargeBasis: String(header.rows[0].soChargeBasis),
-            toReplenishmentChargeBasis: String(header.rows[0].toReplenishmentChargeBasis),
-            toDirectPickupChargeBasis: String(header.rows[0].toDirectPickupChargeBasis),
-            poChargeBasis: String(header.rows[0].poChargeBasis),
-            poAdditionalDropBasis: String(header.rows[0].poAdditionalDropBasis),
-            dispatchLoadSplitBasis: String(header.rows[0].dispatchLoadSplitBasis)
-          })
+      mbbsChargingPolicy: policyInput === null ? null : normalizeMbbsRateCardPolicy(policyInput),
+      mbbsVendorRouteRates: normalizeMbbsVendorRouteRates(
+        (/** @type {Array<Record<string, any>>} */ (vendorRouteRates.rows)).map((row) => ({
+          ...row,
+          baseAmountMinor: Number(row.baseAmountMinor)
+        }))
+      )
     }
   };
 }

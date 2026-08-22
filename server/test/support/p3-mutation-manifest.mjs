@@ -50,6 +50,11 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
     sourcePaths: Object.freeze(["src/dispatch-history-mode.js"])
   }),
   Object.freeze({
+    runner: "run-dispatch-load-reorder-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze(["public/dispatch.js"])
+  }),
+  Object.freeze({
     runner: "run-dispatch-order-completion-mutations.mjs",
     adminUrlEnvironment: null,
     sourcePaths: Object.freeze([
@@ -64,6 +69,14 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
     runner: "run-dispatch-performance-mutations.mjs",
     adminUrlEnvironment: null,
     sourcePaths: Object.freeze(["src/dispatch-planner-performance.js"])
+  }),
+  Object.freeze({
+    runner: "run-dispatch-planner-optimization-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "src/dispatch-planner-optimization.js",
+      "src/dispatch-planner-replay.js"
+    ])
   }),
   Object.freeze({
     runner: "run-dispatch-runtime-resilience-mutations.mjs",
@@ -97,9 +110,75 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
     sourcePaths: Object.freeze(["test/support/driver-offline-stress-model.mjs"])
   }),
   Object.freeze({
+    runner: "run-driver-plan-date-execution-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "public/driver.js",
+      "src/driver-plan-date-policy.js",
+      "src/driver-repository.js",
+      "src/server.js"
+    ])
+  }),
+  Object.freeze({
+    runner: "run-driver-pwa-historical-assist-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "src/driver-historical-assist-evidence.js",
+      "src/driver-historical-assist-policy.js"
+    ])
+  }),
+  Object.freeze({
+    runner: "run-driver-pwa-site-reset-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "public/driver-reset.html",
+      "public/driver.js",
+      "src/server.js"
+    ])
+  }),
+  Object.freeze({
     runner: "run-frontdesk-mutations.mjs",
     adminUrlEnvironment: null,
     sourcePaths: Object.freeze(["src/mbt/frontdesk-service.js"])
+  }),
+  Object.freeze({
+    runner: "run-mbbs-cross-charge-v4-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "src/mbt/distance-band-pricing.js",
+      "src/mbt/local-billing-calculator.js",
+      "src/mbt/mbbs-billing-candidate-service.js",
+      "src/mbt/mbbs-driver-billing-planner.js",
+      "src/mbt/mbbs-rate-card-policy.js"
+    ])
+  }),
+  Object.freeze({
+    runner: "run-mbbs-vendor-route-rate-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "public/mbt-billing.js",
+      "src/mbt/mbbs-billing-candidate-service.js",
+      "src/mbt/mbbs-vendor-route-rates.js",
+      "src/mbt/shadow-billing-service.js"
+    ])
+  }),
+  Object.freeze({
+    runner: "run-netsuite-delayed-status-refresh-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "src/netsuite-delayed-status-refresh-policy.js",
+      "src/netsuite-delayed-status-refresh-service.js"
+    ])
+  }),
+  Object.freeze({
+    runner: "run-netsuite-m2m-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "src/netsuite-m2m-auth.js",
+      "src/netsuite-m2m-settings.js",
+      "src/pending-approval-reconciliation-repository.js",
+      "src/pending-approval-reconciliation.js"
+    ])
   }),
   Object.freeze({
     runner: "run-operator-customer-pickup-photo-gate-mutations.mjs",
@@ -181,6 +260,17 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
     ])
   }),
   Object.freeze({
+    runner: "run-scm-dependency-management-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "src/driver-offline-repository.js",
+      "src/driver-offline-service.js",
+      "src/scm-dependency-command-service.js",
+      "src/scm-dependency-management-policy.js",
+      "src/scm-dependency-plan-reconciler.js"
+    ])
+  }),
+  Object.freeze({
     runner: "run-scm-po-split-ref-reuse-mutations.mjs",
     adminUrlEnvironment: null,
     sourcePaths: Object.freeze(["src/dispatch-repository.js"])
@@ -247,6 +337,16 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
     ])
   }),
   Object.freeze({
+    runner: "run-special-stock-request-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "src/special-stock-request-domain.js",
+      "src/special-stock-request-netsuite.js",
+      "src/special-stock-request-policy.js",
+      "src/special-stock-request-repository.js"
+    ])
+  }),
+  Object.freeze({
     runner: "run-stock-request-mutations.mjs",
     adminUrlEnvironment: null,
     sourcePaths: Object.freeze([
@@ -262,5 +362,15 @@ export const P3_DEDICATED_MUTATION_RUNNERS = Object.freeze([
     runner: "run-test-database-isolation-mutations.mjs",
     adminUrlEnvironment: null,
     sourcePaths: Object.freeze(["test/support/test-database-isolation.mjs"])
+  }),
+  Object.freeze({
+    runner: "run-transfer-dependency-source-backorder-mutations.mjs",
+    adminUrlEnvironment: null,
+    sourcePaths: Object.freeze([
+      "migrations/170_transfer_dependency_source_backorder.sql",
+      "public/scm-transfer-dependencies.js",
+      "src/order-dependency-repository.js",
+      "src/transfer-dependency-source-backorder.js"
+    ])
   })
 ]);

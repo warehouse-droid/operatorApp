@@ -12,11 +12,14 @@ import {
   cloneLocalRateCardVersion,
   deleteLocalRateCard,
   getLocalRateCardGraph,
+  listLocalRateCards,
   replaceLocalRateCardDraft,
   validateLocalRateCardVersion
 } from "../../../src/mbt/rate-card-configuration-service.js";
 import {
   DEFAULT_MBBS_RATE_CARD_POLICY,
+  DEFAULT_MBBS_RATE_CARD_POLICY_V2,
+  DEFAULT_MBBS_RATE_CARD_POLICY_V3,
   MBBS_RATE_CARD_POLICY_RULES
 } from "../../../src/mbt/mbbs-rate-card-policy.js";
 
@@ -254,6 +257,145 @@ test("versioned MBBS prices can change on a draft and survive clone while active
         ),
         (error) => error?.code === "55000"
       );
+    }));
+  } finally {
+    await rollback.rollback();
+  }
+});
+
+test("M1 schema-v2 vendor-route rates persist, validate, activate immutably, and clone with exact CAD evidence", async () => {
+  const rollback = await beginRollbackContext();
+  try {
+    await rollback.run(() => withMasterDataEnabled(async () => {
+      await ensureMbbsItem();
+      const localVendor = await query(
+        `INSERT INTO dispatch_local_vendors (name, active, updated_by)
+         VALUES ($1, true, $2)
+         RETURNING id::int`,
+        [`Vendor Matrix ${RUN_ID}`, ACTOR.operatorId]
+      );
+      const localVendorId = Number(localVendor.rows[0].id);
+      const vendorYardName = `Matrix Yard ${RUN_ID}`;
+      const vendorYardAddress = "65 Anderson Blvd, Uxbridge, ON L9P 0C7";
+      for (const day of ["Monday", "Tuesday"]) {
+        await query(
+          `INSERT INTO dispatch_vendor_yards (
+             vendor, yard, aliases, day_label, address, active
+           ) VALUES ($1, $2, $3, $4, $5, true)`,
+          [`Vendor Matrix ${RUN_ID}`, vendorYardName, "matrix yard", day, vendorYardAddress]
+        );
+      }
+      const listedMasters = await listLocalRateCards({ limit: 100 });
+      const vendorOption = listedMasters.vendorYardOptions.find((option) => (
+        Number(option.localVendorId) === localVendorId
+          && option.vendorYardName === vendorYardName
+      ));
+      assert.ok(vendorOption);
+      assert.equal(vendorOption.vendorYardAddress, vendorYardAddress);
+
+      const v2Graph = graph({ suffix: "VENDOR_MATRIX" });
+      v2Graph.mbbsChargingPolicy = {
+        ...DEFAULT_MBBS_RATE_CARD_POLICY_V2,
+        poVrmaAdditionalStopUnitAmountMinor: 12_345
+      };
+      v2Graph.mbbsVendorRouteRates = [{
+        rateName: "Matrix Uxbridge to 12441",
+        displayName: "Matrix Uxbridge to 12441",
+        localVendorId,
+        localVendorName: `Vendor Matrix ${RUN_ID}`,
+        vendorYardName,
+        vendorYardAddress,
+        destinationYardCode: "12441",
+        baseAmountMinor: 20_001,
+        currency: "CAD"
+      }];
+      const created = await applyLocalRateCardDraft(command("create vendor matrix", {
+        sourceKind: "manual",
+        graph: v2Graph
+      }));
+      const versionId = created.body.version.rateCardVersionId;
+      const detail = await getLocalRateCardGraph(versionId);
+      assert.deepEqual(detail.graph.mbbsChargingPolicy, v2Graph.mbbsChargingPolicy);
+      assert.deepEqual(detail.graph.mbbsVendorRouteRates, v2Graph.mbbsVendorRouteRates);
+
+      const validated = await validateLocalRateCardVersion(command("validate vendor matrix", {
+        rateCardVersionId: versionId,
+        expectedRevision: created.body.version.revision
+      }));
+      const activated = await activateLocalRateCardVersion(command("activate vendor matrix", {
+        rateCardVersionId: versionId,
+        expectedRevision: validated.body.version.revision
+      }));
+
+      const cloned = await cloneLocalRateCardVersion(command("clone vendor matrix", {
+        sourceRateCardVersionId: versionId,
+        expectedRevision: activated.body.version.revision
+      }));
+      const cloneDetail = await getLocalRateCardGraph(cloned.body.version.rateCardVersionId);
+      assert.equal(cloneDetail.version.editable, true);
+      assert.deepEqual(cloneDetail.graph.mbbsVendorRouteRates, v2Graph.mbbsVendorRouteRates);
+
+      // Keep the expected PostgreSQL trigger error last: a failed statement marks
+      // this rollback-only transaction as aborted until the harness rolls it back.
+      await assert.rejects(
+        query(
+          `UPDATE mbt_mbbs_vendor_route_rates
+              SET base_amount_minor = base_amount_minor + 1
+            WHERE rate_card_version_id = $1`,
+          [versionId]
+        ),
+        (error) => error?.code === "55000"
+      );
+    }));
+  } finally {
+    await rollback.rollback();
+  }
+});
+
+test("schema-v3 TO pricing and base-plus-excess bands survive activation and clone", async () => {
+  const rollback = await beginRollbackContext();
+  try {
+    await rollback.run(() => withMasterDataEnabled(async () => {
+      await ensureMbbsItem();
+      const v3Graph = graph({ suffix: "TO_LONGEST_DROP" });
+      v3Graph.mbbsChargingPolicy = {
+        ...DEFAULT_MBBS_RATE_CARD_POLICY_V3,
+        toReplenishmentAdditionalDropUnitAmountMinor: 12_345
+      };
+      v3Graph.distanceBands[0] = {
+        ...v3Graph.distanceBands[0],
+        amountMinor: 700,
+        pricingBasis: "per_km",
+        baseAmountMinor: 38_500,
+        includedMetres: 75_000,
+        description: "CAD 385 includes 75 km, then CAD 7 per excess kilometre"
+      };
+      const created = await applyLocalRateCardDraft(command("create TO longest-drop policy", {
+        sourceKind: "manual",
+        graph: v3Graph
+      }));
+      const versionId = created.body.version.rateCardVersionId;
+      const detail = await getLocalRateCardGraph(versionId);
+      assert.deepEqual(detail.graph.mbbsChargingPolicy, v3Graph.mbbsChargingPolicy);
+      assert.equal(detail.graph.distanceBands[0].baseAmountMinor, 38_500);
+      assert.equal(detail.graph.distanceBands[0].includedMetres, 75_000);
+
+      const validated = await validateLocalRateCardVersion(command("validate TO longest-drop policy", {
+        rateCardVersionId: versionId,
+        expectedRevision: created.body.version.revision
+      }));
+      const activated = await activateLocalRateCardVersion(command("activate TO longest-drop policy", {
+        rateCardVersionId: versionId,
+        expectedRevision: validated.body.version.revision
+      }));
+      const cloned = await cloneLocalRateCardVersion(command("clone TO longest-drop policy", {
+        sourceRateCardVersionId: versionId,
+        expectedRevision: activated.body.version.revision
+      }));
+      const clone = await getLocalRateCardGraph(cloned.body.version.rateCardVersionId);
+      assert.deepEqual(clone.graph.mbbsChargingPolicy, v3Graph.mbbsChargingPolicy);
+      assert.equal(clone.graph.distanceBands[0].baseAmountMinor, 38_500);
+      assert.equal(clone.graph.distanceBands[0].includedMetres, 75_000);
     }));
   } finally {
     await rollback.rollback();

@@ -567,6 +567,52 @@ export async function confirmReceivingLine(orderId, lineRowId, values, operatorI
   return getReceivingOrder(orderId);
 }
 
+function uniquePurchaseOrderReceivingLineRequests(lines = []) {
+  const seen = new Set();
+  const unique = [];
+  for (const item of Array.isArray(lines) ? lines : []) {
+    const lineId = item?.lineId || item?.id;
+    const key = String(lineId || "").trim();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    unique.push({ lineId, values: item?.values || item });
+  }
+  return unique;
+}
+
+export async function confirmPurchaseOrderReceivingLines(orderId, lines = [], operatorId) {
+  await assertNoClosedNetSuiteOrders([orderId], "confirm Purchase Order Receiving lines");
+  if (!operatorId) throw new Error("Operator ID is required.");
+  const order = await getReceivingOrder(orderId);
+  if (!order || order.order_type !== "purchase_order") {
+    throw Object.assign(new Error("Confirm page is available for Purchase Order Receiving only."), { status: 409 });
+  }
+
+  const requestedLines = uniquePurchaseOrderReceivingLineRequests(lines);
+  let confirmed = 0;
+  const failures = [];
+  for (const item of requestedLines) {
+    try {
+      await confirmReceivingLine(orderId, item.lineId, item.values, operatorId);
+      confirmed += 1;
+    } catch (error) {
+      failures.push({ lineId: item.lineId, error: error.message });
+    }
+  }
+  await writeAudit({
+    actorOperatorId: operatorId,
+    source: "receiving",
+    action: "receiving.purchase_order.page.confirm",
+    details: {
+      receivingOrderId: orderId,
+      requested: requestedLines.length,
+      confirmed,
+      failures
+    }
+  });
+  return { confirmed, failures };
+}
+
 export async function unconfirmReceivingLine(orderId, lineRowId, operatorId) {
   await assertNoClosedNetSuiteOrders([orderId], "unconfirm a Receiving line");
   const line = await query(
@@ -651,11 +697,15 @@ export async function getReceivableReceivingOrder(orderId) {
   if (!order) throw new Error("Receiving order not found.");
   const receivableLines = (order.lines || []).filter((line) => {
     if (remainingSalesQuantity(line) <= 0) return false;
-    const total = positiveQuantity(line.received_pallet_qty)
+    const physicalTotal = positiveQuantity(line.received_pallet_qty)
       + positiveQuantity(line.received_layer_qty)
       + positiveQuantity(line.received_section_qty)
       + positiveQuantity(line.received_piece_qty);
-    return line.netsuite_active && !line.sync_exception && ["InvtPart", "NonInvtPart"].includes(line.item_type || "") && total > 0;
+    const confirmedSalesQuantity = receivedSalesQuantity(line);
+    return line.netsuite_active
+      && !line.sync_exception
+      && ["InvtPart", "NonInvtPart"].includes(line.item_type || "")
+      && (physicalTotal > 0 || confirmedSalesQuantity > 0);
   });
   if (!receivableLines.length) throw new Error("No confirmed lines to receive.");
   return { ...order, receivableLines };

@@ -17,6 +17,10 @@ import { closeDb, query } from "../../../src/db.js";
 const testDirectory = path.dirname(fileURLToPath(import.meta.url));
 const serverRoot = path.resolve(testDirectory, "../../..");
 const configSourcePath = path.join(serverRoot, "src/config.js");
+const dispatchPlannerOptimizationSourcePath = path.join(
+  serverRoot,
+  "src/dispatch-planner-optimization.js"
+);
 const nodeModulesPath = path.join(serverRoot, "node_modules");
 
 const PHASE3_CAPABILITIES = Object.freeze({
@@ -134,6 +138,10 @@ async function withIsolatedConfig(envFiles, activeEnvFile, operation) {
     await writeFile(
       path.join(fixtureRoot, "src/config.js"),
       await readFile(configSourcePath, "utf8")
+    );
+    await writeFile(
+      path.join(fixtureRoot, "src/dispatch-planner-optimization.js"),
+      await readFile(dispatchPlannerOptimizationSourcePath, "utf8")
     );
     await symlink(nodeModulesPath, path.join(fixtureRoot, "node_modules"), "dir");
     for (const [filename, contents] of Object.entries(envFiles)) {

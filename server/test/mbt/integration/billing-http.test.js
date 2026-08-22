@@ -131,8 +131,9 @@ const candidateService = Object.freeze({
       status: 200,
       replayed: false,
       body: {
-        schemaVersion: "mbbs-billing-address-override-v1",
+        schemaVersion: "mbbs-billing-address-override-v2",
         candidateId: input.candidateId,
+        originAddressText: input.originAddressText,
         destinationAddressText: input.destinationAddressText,
         revision: 1,
         postingMode: "local_only"
@@ -372,6 +373,7 @@ test("MBBS candidate HTTP lists retained completions and previews the exact acti
       actor: { operatorId: "forged", roles: ["admin"] },
       candidateId: "forged",
       completedMonth: "2038-08",
+      originAddressText: "150 Clark Boulevard, Brampton, ON",
       destinationAddressText: "200 King Street West, Toronto, ON",
       expectedRevision: 0,
       reason: "Verified with the customer"
@@ -382,6 +384,7 @@ test("MBBS candidate HTTP lists retained completions and previews the exact acti
   assert.equal(calls[0].operation, "set_mbbs_candidate_address_override");
   assert.equal(calls[0].input.candidateId, CANDIDATE_ID);
   assert.equal(calls[0].input.completedMonth, "2038-08");
+  assert.equal(calls[0].input.originAddressText, "150 Clark Boulevard, Brampton, ON");
   assert.equal(calls[0].input.destinationAddressText, "200 King Street West, Toronto, ON");
   assert.equal(calls[0].input.expectedRevision, 0);
   assert.equal(calls[0].input.reason, "Verified with the customer");

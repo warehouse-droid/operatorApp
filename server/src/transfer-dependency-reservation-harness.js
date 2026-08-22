@@ -5,6 +5,7 @@ import {
   generateTransferDependencySuggestion,
   getDependencyInventoryMatrix,
   getTransferDependencyBatch,
+  updateTransferDependencyBatch,
   validateTransferDependencyBatchForCreation
 } from "./order-dependency-repository.js";
 import { searchTransferDependencyProposalItems } from "./transfer-dependency-manual-items.js";
@@ -15,6 +16,7 @@ const salesOrderId = 9881000000 + suffix;
 const competingSalesOrderId = salesOrderId + 1;
 const itemId = 9882000000 + suffix;
 const manualItemId = itemId + 1;
+const palletItemId = itemId + 2;
 const salesLineKey = 9883000000 + suffix;
 const competingSalesLineKey = salesLineKey + 1;
 const competingManualSalesLineKey = salesLineKey + 2;
@@ -49,6 +51,16 @@ try {
       [manualItemId]
     );
     await query(
+      `INSERT INTO inventory_items (
+         item_id, item_name, display_name, item_type, item_type_text,
+         stock_unit, to_plt, to_lyr, to_sec, to_pcs, item_weight
+       ) VALUES (
+         $1, 'PALLET', 'PALLET', 'InvtPart', 'Inventory Item',
+         'EACH', 0, 0, 0, 1, 50
+       )`,
+      [palletItemId]
+    );
+    await query(
       `INSERT INTO inventory_balances (
          item_id, location_id, location, quantity_on_hand, quantity_available
        ) VALUES
@@ -67,6 +79,16 @@ try {
          ($1, 15, '12441', 0, 0),
          ($1, 26, '150', 0, 0)`,
       [manualItemId]
+    );
+    await query(
+      `INSERT INTO inventory_balances (
+         item_id, location_id, location, quantity_on_hand, quantity_available
+       ) VALUES
+         ($1, 1, '3445', 100, 0),
+         ($1, 28, '2967', 0, 0),
+         ($1, 15, '12441', 0, 0),
+         ($1, 26, '150', 0, 0)`,
+      [palletItemId]
     );
     await query(
       `INSERT INTO sales_orders (
@@ -313,6 +335,118 @@ try {
     const validation = await validateTransferDependencyBatchForCreation(overrideBatch);
     assert.equal(validation.pendingProposals.length, 1);
     assert.equal(Number(validation.uncovered), 0);
+
+    overrideBatch = await updateTransferDependencyBatch(overrideBatch.id, {
+      proposals: [{
+        id: overrideBatch.proposals[0].id,
+        mode: overrideBatch.proposals[0].mode,
+        fromLocationId: overrideBatch.proposals[0].fromLocationId,
+        toLocationId: overrideBatch.proposals[0].toLocationId,
+        memo: overrideBatch.proposals[0].memo,
+        allowSourceBackorder: true
+      }]
+    }, operatorId);
+    assert.equal(overrideBatch.proposals[0].allowSourceBackorder, true,
+      "The explicit source-backorder setting must survive a repository reload.");
+    const settingAudit = await query(
+      `SELECT operator_id, before_state, after_state, details
+         FROM dispatch_audit_log
+        WHERE action = 'scm.transfer_dependency.source_backorder_updated'
+          AND entity_id = $1
+        ORDER BY id DESC
+        LIMIT 1`,
+      [String(overrideBatch.id)]
+    );
+    assert.equal(settingAudit.rowCount, 1);
+    assert.equal(settingAudit.rows[0].operator_id, operatorId);
+    assert.equal(settingAudit.rows[0].before_state?.proposals?.[0]?.allowSourceBackorder, false);
+    assert.equal(settingAudit.rows[0].after_state?.proposals?.[0]?.allowSourceBackorder, true);
+    assert.equal(settingAudit.rows[0].details?.changes?.[0]?.proposalId, Number(overrideBatch.proposals[0].id));
+
+    const sourceProposal = overrideBatch.proposals[0];
+    const palletBlockedBatch = {
+      ...overrideBatch,
+      proposals: [{
+        ...sourceProposal,
+        allowSourceBackorder: false,
+        palletItemId,
+        palletItemName: "PALLET",
+        palletTransferQuantity: 1,
+        calculatedPalletQuantity: 1,
+        palletCalculationComplete: true
+      }]
+    };
+    await assert.rejects(
+      validateTransferDependencyBatchForCreation(palletBlockedBatch),
+      /3445 has 0 available for PALLET, below the proposed 1/i,
+      "SOB118191-shaped automatic PALLET shortage must remain blocked without an explicit opt-in."
+    );
+    const palletAllowed = await validateTransferDependencyBatchForCreation({
+      ...palletBlockedBatch,
+      proposals: palletBlockedBatch.proposals.map((proposal) => ({
+        ...proposal,
+        allowSourceBackorder: true
+      }))
+    });
+    assert.deepEqual(palletAllowed.sourceBackorders, [{
+      itemId: palletItemId,
+      itemName: "PALLET",
+      locationId: 1,
+      location: "3445",
+      requestedQuantity: 1,
+      availableQuantity: 0,
+      backorderQuantity: 1,
+      proposalIds: [Number(sourceProposal.id)]
+    }]);
+
+    const materialLine = sourceProposal.lines[0];
+    const mixedBase = {
+      ...sourceProposal,
+      palletTransferQuantity: 0,
+      calculatedPalletQuantity: 0,
+      palletCalculationComplete: true,
+      palletQuantityOverridden: true
+    };
+    const mixedAllowed = await validateTransferDependencyBatchForCreation({
+      ...overrideBatch,
+      proposals: [
+        {
+          ...mixedBase,
+          id: 70001,
+          allowSourceBackorder: false,
+          lines: [{ ...materialLine, proposedQuantity: 8 }]
+        },
+        {
+          ...mixedBase,
+          id: 70002,
+          allowSourceBackorder: true,
+          lines: [{ ...materialLine, proposedQuantity: 4 }]
+        }
+      ]
+    });
+    assert.equal(Number(mixedAllowed.sourceBackorders[0]?.backorderQuantity), 2,
+      "Only the opted-in quantity may extend the aggregate request above Available.");
+    await assert.rejects(
+      validateTransferDependencyBatchForCreation({
+        ...overrideBatch,
+        proposals: [
+          {
+            ...mixedBase,
+            id: 70003,
+            allowSourceBackorder: false,
+            lines: [{ ...materialLine, proposedQuantity: 11 }]
+          },
+          {
+            ...mixedBase,
+            id: 70004,
+            allowSourceBackorder: true,
+            lines: [{ ...materialLine, proposedQuantity: 1 }]
+          }
+        ]
+      }),
+      /has 10 available.*below the protected proposed 11/i,
+      "An opted-in sibling must never weaken a protected proposal sharing the same stock."
+    );
 
     const audit = await query(
       `SELECT details

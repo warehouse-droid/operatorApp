@@ -60,6 +60,10 @@
                   <strong>${mt("dispatch.customOrders", "Custom Orders")}</strong>
                   <span>${mt("dispatch.customOrdersDesc", "Create transportation orders that are not available in NetSuite, including their route, details, and weight.")}</span>
                 </button>
+                <button class="dispatch-menu-card" onclick="location.href='/dispatch/special-stock'" type="button">
+                  <strong>Special Item Handoffs</strong>
+                  <span>Choose Direct or Via Yard after the exclusive SO and PO are ready, then open the order in Planning.</span>
+                </button>
                 <button class="dispatch-menu-card" onclick="location.href='/dispatch/po-to-schedule'" type="button">
                   <strong>${mt("dispatch.poToSchedule", "PO / TO Schedule")}</strong>
                   <span>${mt("dispatch.poToScheduleDesc", "Review purchase and transfer order transport schedules, status, yards, and ETA.")}</span>

@@ -75,9 +75,12 @@
   const scmItems = [
     { label: "SCM Menu", href: "/scm", icon: "SM", authorities: ["admin", "dispatcher", "scm", "scm_staff", "yard_manager"] },
     { label: "Stock Requests", href: "/scm/stock-requests", icon: "SR", scmWriteOnly: true, authorities: ["admin", "scm", "scm_staff"] },
+    { label: "TO Printing", href: "/scm/to-printing", icon: "TP", scmWriteOnly: true, authorities: ["admin", "scm", "scm_staff"] },
+    { label: "Custom Orders", href: "/scm/custom-orders", icon: "CU", scmWriteOnly: true, authorities: ["admin", "scm", "scm_staff"] },
     { label: "Smart SCM", href: "/scm/smart", icon: "AI", authorities: ["admin", "dispatcher", "scm", "scm_staff", "yard_manager"] },
     { label: "NetSuite PO history", href: "/scm/netsuite-po", icon: "PO", scmWriteOnly: true, authorities: ["admin", "scm", "scm_staff"] },
     { label: "Local Vendors", href: "/scm/vendors", icon: "LV", authorities: ["admin", "dispatcher", "scm", "scm_staff", "yard_manager"] },
+    { label: "Dependency Manager", href: "/scm/dependency-management", icon: "DM", authorities: ["admin", "dispatcher", "scm", "scm_staff"] },
     { label: "Auto Transfer", href: "/scm/transfer-dependencies", icon: "AT", authorities: ["admin", "scm", "scm_staff"] },
     { label: "PO Split", href: "/scm/POsplit", icon: "PS", authorities: ["admin", "dispatcher", "scm", "scm_staff"] },
     { label: "PO/TO Schedule", href: "/scm/POTOschedule", icon: "PT", authorities: ["admin", "dispatcher", "scm", "scm_staff", "yard_manager"] },
@@ -588,7 +591,7 @@
     const storedCollapsed = localStorage.getItem(STORAGE_KEY);
     const collapsed = storedCollapsed === "true"
       || (storedCollapsed === null
-        && path.startsWith("/mbt")
+        && (path.startsWith("/mbt") || path === "/dispatch/driver-pwa")
         && window.matchMedia("(max-width: 760px)").matches);
     document.body.classList.toggle("app-sidebar-collapsed", collapsed);
     document.body.classList.add("has-app-sidebar");

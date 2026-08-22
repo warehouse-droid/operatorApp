@@ -1263,6 +1263,7 @@ async function quotePhysicalBinRate(input) {
       `SELECT item.item_code, item.display_name, card.rate_card_id::text,
               version.rate_card_version_id::text, band.rate_distance_band_id::text,
               band.amount_minor, band.pricing_basis, band.boundary_rule,
+              band.base_amount_minor, band.included_metres,
               band.origin_yard_codes, band.currency, band.description
          FROM mbt_local_item_settings item
          JOIN mbt_rate_distance_bands band
@@ -1352,7 +1353,9 @@ async function quotePhysicalBinRate(input) {
   });
   const deliveryAmountMinor = calculateDistanceBandChargeMinor({
     amountMinor: safeNonnegativeInteger(delivery.amount_minor, "One-way delivery unit amount"),
-    pricingBasis: delivery.pricing_basis
+    pricingBasis: delivery.pricing_basis,
+    baseAmountMinor: delivery.base_amount_minor === null ? null : Number(delivery.base_amount_minor),
+    includedMetres: delivery.included_metres === null ? null : Number(delivery.included_metres)
   }, input.providerMetres);
   const lines = [
     physicalRentalPriceLine(rental),

@@ -91,15 +91,18 @@
             <p id="selectedMbbsCandidate">Select an order to review its retained route.</p>
             <dl id="mbbsCandidateFacts" class="mbt-detail-list"></dl>
             <form id="mbbsAddressOverrideForm" class="mbt-form-stack" hidden>
-              <h4>Complete missing billing address</h4>
-              <p>This local override is used only for billing. Sales Order, reconciliation, Dispatch, and Driver PWA evidence remains unchanged.</p>
+              <h4>Billing route endpoints</h4>
+              <p>Edit either endpoint when retained Dispatch or NetSuite addresses are not correct for charging. This local override is used only for billing; operational evidence remains unchanged.</p>
+              <label>Billing origin address
+                <textarea id="mbbsBillingOriginText" rows="3" minlength="5" maxlength="1000" required></textarea>
+              </label>
               <label>Billing destination address
-                <textarea id="mbbsAddressOverrideText" rows="3" minlength="5" maxlength="1000" required></textarea>
+                <textarea id="mbbsBillingDestinationText" rows="3" minlength="5" maxlength="1000" required></textarea>
               </label>
               <label>Audit reason
                 <textarea id="mbbsAddressOverrideReason" rows="2" minlength="3" maxlength="2000" required></textarea>
               </label>
-              <button class="mbt-command" type="submit">Save billing-only address</button>
+              <button class="mbt-command" type="submit">Save billing-only endpoints</button>
             </form>
           </section>
         </div>
@@ -107,7 +110,7 @@
           <h3 id="mbbsBatchResultsTitle">Batch calculation results</h3>
           <div class="mbt-table-wrap" tabindex="0" aria-label="Scrollable MBBS batch calculation results">
             <table>
-              <thead><tr><th scope="col"><input id="selectAllMbbsBatchResults" type="checkbox" aria-label="Select all calculated results for billing" /> Select for billing</th><th scope="col">Order</th><th scope="col">Load / leg</th><th scope="col">Origin</th><th scope="col">Destination</th><th scope="col">Relationship and calculation</th><th scope="col">Result</th><th scope="col">Distance (km)</th><th scope="col">Rate</th><th scope="col">Calculated charge</th><th scope="col">Adjustment (CAD)</th><th scope="col">Final charge (CAD)</th></tr></thead>
+              <thead><tr><th scope="col"><input id="selectAllMbbsBatchResults" type="checkbox" aria-label="Select all calculated results for billing" /> Select for billing</th><th scope="col">Order</th><th scope="col">Load / leg</th><th scope="col">Origin</th><th scope="col">Destination</th><th scope="col">Relationship and calculation</th><th scope="col">Result</th><th scope="col">Distance (km)</th><th scope="col">Pricing method</th><th scope="col">Rate</th><th scope="col">Calculated charge</th><th scope="col">Adjustment (CAD)</th><th scope="col">Final charge (CAD)</th></tr></thead>
               <tbody id="mbbsBatchResultRows"></tbody>
             </table>
           </div>

@@ -32,6 +32,7 @@ function compact(value) {
  * @param {string} [options.successorStatus]
  * @param {number} [options.binLoadCount]
  * @param {boolean} [options.includePilotScope]
+ * @param {string | Date | null} [options.pilotExpiresAt]
  */
 export async function createBinDispatchFixture({
   label,
@@ -39,7 +40,8 @@ export async function createBinDispatchFixture({
   frontStatus = "ready",
   successorStatus = "tentative",
   binLoadCount = 3,
-  includePilotScope = true
+  includePilotScope = true,
+  pilotExpiresAt = null
 }) {
   const fixtureId = crypto.randomUUID();
   const suffix = compact(fixtureId);
@@ -279,8 +281,15 @@ export async function createBinDispatchFixture({
   );
 
   if (includePilotScope) {
-    const pilotExpiresAt = new Date(`${planDate}T12:00:00.000Z`);
-    pilotExpiresAt.setUTCDate(pilotExpiresAt.getUTCDate() + 2);
+    const resolvedPilotExpiry = pilotExpiresAt
+      ? new Date(pilotExpiresAt)
+      : new Date(`${planDate}T12:00:00.000Z`);
+    if (!pilotExpiresAt) {
+      resolvedPilotExpiry.setUTCDate(resolvedPilotExpiry.getUTCDate() + 2);
+    }
+    if (!Number.isFinite(resolvedPilotExpiry.getTime())) {
+      throw new TypeError("Synthetic BIN pilot expiry must be a valid timestamp.");
+    }
     await query(
       `INSERT INTO mbt_driver_pilot_scope (
          pilot_scope_id, plan_date, driver_login, truck_id, contract_id,
@@ -294,7 +303,7 @@ export async function createBinDispatchFixture({
         fleet.binTruckId,
         contractId,
         frontVisitId,
-        pilotExpiresAt.toISOString()
+        resolvedPilotExpiry.toISOString()
       ]
     );
   }

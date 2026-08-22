@@ -64,9 +64,14 @@ export function distanceBandContains(band, distanceMetres) {
  * Return exact cents for a selected distance band. Per-kilometre prices use
  * the unrounded integer metre distance and round once to the nearest cent.
  *
- * @param {{amountMinor: unknown, pricingBasis?: unknown}} band
+ * A per-kilometre band may additionally own an exact base amount and included
+ * metre threshold. Both fields are required together so an incomplete rate
+ * graph can never silently fall back to charging the full distance.
+ *
+ * @param {{amountMinor: unknown, pricingBasis?: unknown, baseAmountMinor?: unknown, includedMetres?: unknown}} band
  * @param {number} rawDistanceMetres
  */
+// eslint-disable-next-line complexity -- Fail-closed validation keeps legacy, flat, per-km, and paired base/excess evidence in one money boundary.
 export function calculateDistanceBandChargeMinor(band, rawDistanceMetres) {
   if (!Number.isSafeInteger(rawDistanceMetres) || rawDistanceMetres < 0) {
     throw new MbtError({
@@ -84,9 +89,41 @@ export function calculateDistanceBandChargeMinor(band, rawDistanceMetres) {
   }
   const unitAmountMinor = Number(band.amountMinor);
   if (normalizedDistancePricingBasis(band.pricingBasis) === DISTANCE_PRICING_BASES.FLAT) {
+    if ((band.baseAmountMinor !== undefined && band.baseAmountMinor !== null)
+        || (band.includedMetres !== undefined && band.includedMetres !== null)) {
+      throw new MbtError({
+        status: 400,
+        code: "MBT_RATE_EXCESS_CONFIGURATION_INVALID",
+        message: "Base-plus-excess fields may only be used with per-kilometre pricing."
+      });
+    }
     return unitAmountMinor;
   }
-  const rounded = ((BigInt(rawDistanceMetres) * BigInt(unitAmountMinor)) + 500n) / 1000n;
+  const hasBase = band.baseAmountMinor !== undefined && band.baseAmountMinor !== null;
+  const hasIncluded = band.includedMetres !== undefined && band.includedMetres !== null;
+  if (hasBase !== hasIncluded) {
+    throw new MbtError({
+      status: 400,
+      code: "MBT_RATE_EXCESS_CONFIGURATION_INVALID",
+      message: "Base amount and included metres must be configured together."
+    });
+  }
+  let baseAmountMinor = 0;
+  let chargeableMetres = rawDistanceMetres;
+  if (hasBase && hasIncluded) {
+    if (!Number.isSafeInteger(band.baseAmountMinor) || Number(band.baseAmountMinor) < 0
+        || !Number.isSafeInteger(band.includedMetres) || Number(band.includedMetres) < 0) {
+      throw new MbtError({
+        status: 400,
+        code: "MBT_RATE_EXCESS_CONFIGURATION_INVALID",
+        message: "Base amount and included metres must be non-negative safe integers."
+      });
+    }
+    baseAmountMinor = Number(band.baseAmountMinor);
+    chargeableMetres = Math.max(0, rawDistanceMetres - Number(band.includedMetres));
+  }
+  const excessAmount = ((BigInt(chargeableMetres) * BigInt(unitAmountMinor)) + 500n) / 1000n;
+  const rounded = BigInt(baseAmountMinor) + excessAmount;
   if (rounded > BigInt(Number.MAX_SAFE_INTEGER)) {
     throw new MbtError({
       status: 400,

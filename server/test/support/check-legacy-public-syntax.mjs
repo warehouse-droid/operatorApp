@@ -13,10 +13,12 @@ export const LEGACY_PUBLIC_FILES = Object.freeze([
   "public/operator.js",
   "public/app-sidebar.js",
   "public/dispatch-setup.js",
+  "public/dispatch-special-stock.js",
   "public/dispatch.js",
   "public/driver-offline-photos.js",
   "public/driver-offline-sync.js",
   "public/driver-service-worker.js",
+  "public/driver-location-override.js",
   "public/driver.js",
   "public/driver-bin-ui.js",
   "public/i18n.js",
@@ -25,7 +27,9 @@ export const LEGACY_PUBLIC_FILES = Object.freeze([
   "public/mbt-frontdesk.js",
   "public/mbt-gates.js",
   "public/mbt-home.js",
-  "public/mbt-shell.js"
+  "public/mbt-shell.js",
+  "public/sales-special-stock-requests.js",
+  "public/scm-special-stock-requests.js"
 ]);
 
 /**

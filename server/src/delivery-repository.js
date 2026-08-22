@@ -5658,6 +5658,49 @@ export async function confirmCustomerPickupLine(orderId, lineId, values, operato
   });
 }
 
+function uniqueCustomerPickupLineRequests(lines = []) {
+  const seen = new Set();
+  const unique = [];
+  for (const item of Array.isArray(lines) ? lines : []) {
+    const lineId = item?.lineId || item?.id;
+    const key = String(lineId || "").trim();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    unique.push({ lineId, values: item?.values || item });
+  }
+  return unique;
+}
+
+export async function confirmCustomerPickupLines(orderId, lines = [], operatorId) {
+  await assertNoClosedNetSuiteOrders([orderId], "confirm Customer Pick-Up lines");
+  if (!operatorId) throw new Error("Operator ID is required.");
+  const order = await getDeliveryOrder(orderId);
+  if (!order || !isPickupOrder(order)) throw new Error("Customer pickup sales order not found.");
+
+  const requestedLines = uniqueCustomerPickupLineRequests(lines);
+  let confirmed = 0;
+  const failures = [];
+  for (const item of requestedLines) {
+    try {
+      await confirmCustomerPickupLine(orderId, item.lineId, item.values, operatorId);
+      confirmed += 1;
+    } catch (error) {
+      failures.push({ lineId: item.lineId, error: error.message });
+    }
+  }
+  await writeAudit({
+    actorOperatorId: operatorId,
+    action: "customer_pickup.page.confirm",
+    orderId,
+    details: {
+      requested: requestedLines.length,
+      confirmed,
+      failures
+    }
+  });
+  return { confirmed, failures };
+}
+
 export async function clearCustomerPickupDraft(orderId, operatorId) {
   await assertNoClosedNetSuiteOrders([orderId], "clear a Customer Pick-Up draft");
   const order = await getDeliveryOrder(orderId);

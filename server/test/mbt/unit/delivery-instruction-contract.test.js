@@ -99,7 +99,7 @@ test("Dispatch edit popup keeps planning and CO controls left and SO instruction
   assert.match(dispatchSource, /data-delivery-instruction-order/);
   assert.match(dispatchCss, /\.edit-order-workspace\.has-delivery-instructions\s*\{[\s\S]*grid-template-columns:/);
   assert.match(dispatchCss, /@media \(max-width: 900px\)[\s\S]*\.edit-order-workspace\.has-delivery-instructions[\s\S]*grid-template-columns:\s*minmax\(0, 1fr\)/);
-  assert.match(dispatchHtml, /dispatch\.js\?v=20260814-plan-resume-v1/);
+  assert.match(dispatchHtml, /dispatch\.js\?v=20260822-load-reorder-v1/);
 });
 
 test("Sales and Dispatch compress instruction images to 720p and accept file drops", () => {
@@ -166,12 +166,13 @@ test("Driver deduplicates split siblings onto one original-SO instruction page",
   assert.equal(materialized.deliveryInstructions.orders[0].additionalText, "Use the gate");
 });
 
-test("Driver renders a combined instruction-first pager and excludes non-drop-off types", () => {
+test("Driver renders instruction-first continuous stop details and excludes non-drop-off types", () => {
   assert.match(driverSource, /renderDeliveryInstructionPage/);
   assert.match(driverSource, /deliveryInstructions/);
   assert.match(driverSource, /stop-detail-page/);
   assert.match(driverSource, /stopType\s*!==\s*["']dropoff["']/);
   assert.match(driverSource, /No delivery instructions/);
+  assert.doesNotMatch(driverSource, /data-action=["']stop-detail-page["']/);
 });
 
 test("online Driver images use the authenticated content URL immediately and expose retry", () => {

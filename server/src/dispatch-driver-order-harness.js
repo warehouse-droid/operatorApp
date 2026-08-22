@@ -881,7 +881,11 @@ assert(plannerUi.includes('${isHistorical ? "" : `data-driver-lane-drop="'), "Hi
 assert(plannerUi.includes("Disabled (historical plan)"), "Historical disabled lanes are not identified to the dispatcher.");
 assert(plannerUi.includes("normalizeReplenishmentTransferInsertIndex(order, load, insertIndex)"), "TO insertion does not use the replenishment pickup anchor.");
 assert(plannerUi.includes("normalizeReplenishmentDependentInsertIndex(order, load, transferNormalizedInsertIndex)"), "Dependent SO insertion does not use the prerequisite TO completion boundary.");
-assert(plannerUi.includes("reflowDriverLaneEntries(targetLogin, targetEntries, timingByLoad, found.load.id);\n  if (driverOrientedPlanningEnabled()) renumberDriverLoads();"), "A whole-load driver-lane drag does not renumber the affected lane.");
+assert(
+  plannerUi.includes("const positionMetadata = sourceLogin === targetLogin")
+    && plannerUi.includes("reflowDriverLaneEntries(targetLogin, targetEntries, timingByLoad, found.load.id, positionMetadata);\n  if (driverOrientedPlanningEnabled()) renumberDriverLoads();"),
+  "A same-lane whole-load drag does not preserve positional timing before renumbering the affected lane."
+);
 assert(plannerUi.includes("if (driverOrientedPlanningEnabled()) renumberDriverLoads();\n}\n\nfunction driverLoadEntries"), "Restoring a saved plan does not repair stale driver load labels.");
 assert(plannerUi.includes("replenishmentLoadPrecedence(assignment.truck, assignment.load, targetTruck, targetLoad) === false"), "The frontend replenishment guard does not use canonical load precedence.");
 assert(plannerUi.includes("commitPlanMutation:dependencyRejected"), "Plan mutations do not block a locally invalid replenishment stop sequence.");
@@ -1050,8 +1054,8 @@ assert.equal((initDispatchSource.match(/loadDriverJobStatuses\(/g) || []).length
   "Dispatch initialization repeats the status request already owned by plan loading.");
 assert(repository.includes("displayOrder: numberValue(row.display_order, 0)"), "Setup API does not expose persisted display order.");
 assert(repository.includes("cleanDriver(driver, index)"), "Driver request order is not explicitly persisted as display_order.");
-assert(setupHtml.includes("20260803-mbt-bin-trucks-v1"), "Dispatch Setup browser asset version was not bumped.");
-assert(plannerHtml.includes('/dispatch.js?v=20260814-plan-resume-v1'), "Dispatch planner browser asset version was not bumped.");
+assert(setupHtml.includes("20260818-actual-stop-arrival-v1"), "Dispatch Setup browser asset version was not bumped.");
+assert(plannerHtml.includes('/dispatch.js?v=20260822-load-reorder-v1'), "Dispatch planner browser asset version was not bumped.");
 
 const activityPositionSource = sourceRange(
   plannerUi,

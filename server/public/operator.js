@@ -158,6 +158,7 @@ let selectedOrder = null;
 let selectedLineId = initialOperatorState.selectedLineId || null;
 let orderPage = Number(initialOperatorState.orderPage || 0);
 let linePage = Number(initialOperatorState.linePage || 0);
+let pageConfirming = false;
 let installPromptEvent = null;
 let appInstalled = window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true;
 let fulfillmentOrder = null;
@@ -3771,8 +3772,14 @@ function receivingConfirmedValue(line, unit) {
 
 function renderReceivingSelectedLinePanel(line) {
   const units = receivingLineUnits(line);
+  const orderType = receivingSelectedOrder?.order_type || receivingOrderType;
   return `
     <aside class="selected-panel" data-receiving-selected-line="${line.id}">
+      ${orderType === "purchase_order" ? `
+        <div class="selected-page-actions">
+          <button class="secondary-button confirm-page-button" data-action="confirm-receiving-page" ${pageConfirming ? "disabled" : ""} type="button">${pageConfirming ? t("operator.confirming", "Confirming...") : t("operator.confirmPage", "Confirm page")}</button>
+        </div>
+      ` : ""}
       <div class="selected-header">
         <span>${t("operator.selectedItem", "Selected item")}</span>
         <strong>${line.sku || line.item_name}</strong>
@@ -3793,7 +3800,7 @@ function renderReceivingSelectedLinePanel(line) {
       ${units.map((unit) => renderStepper(unit.key, tf("operator.receiveUnit", "Receive {unit}", { unit: unit.label }), receivingPanelValue(line, unit.key))).join("")}
       <div class="selected-actions">
         ${hasReceivedQty(line) ? `<button class="secondary-button danger-button" data-action="unconfirm-receiving-line" data-line="${line.id}" type="button">${t("operator.unconfirmLine", "Unconfirm line")}</button>` : ""}
-        <button class="primary-button" data-action="confirm-receiving-line" data-line="${line.id}" type="button">${t("operator.confirmLine", "Confirm line")}</button>
+        <button class="primary-button" data-action="confirm-receiving-line" data-line="${line.id}" ${pageConfirming ? "disabled" : ""} type="button">${t("operator.confirmLine", "Confirm line")}</button>
       </div>
     </aside>
   `;
@@ -4440,7 +4447,7 @@ function renderSelectedLinePanel(line) {
   const notice = exceptionText(line);
   const loadAction = deliveryLoadAction(selectedOrder, viewMode);
   const packedReview = viewMode === "packed" || loadAction.reloadReady;
-  const showConfirmPage = currentModule === "delivery" && !packedReview;
+  const showConfirmPage = (currentModule === "delivery" || currentModule === "customer-pickup") && !packedReview;
   const packedActions = loadAction.allowPackedQuantityEdit
     ? notice
       ? `<button class="secondary-button danger-button" data-action="unpack-line" data-line="${line.id}" type="button">${t("operator.unpackPackedQty", "Unpack packed qty")}</button>`
@@ -4452,7 +4459,7 @@ function renderSelectedLinePanel(line) {
     <aside class="selected-panel" data-selected-line="${line.id}">
       ${showConfirmPage ? `
         <div class="selected-page-actions">
-          <button class="secondary-button confirm-page-button" data-action="confirm-page" type="button">${t("operator.confirmPage", "Confirm page")}</button>
+          <button class="secondary-button confirm-page-button" data-action="confirm-page" ${pageConfirming ? "disabled" : ""} type="button">${pageConfirming ? t("operator.confirming", "Confirming...") : t("operator.confirmPage", "Confirm page")}</button>
         </div>
       ` : ""}
       <div class="selected-header">
@@ -4467,7 +4474,7 @@ function renderSelectedLinePanel(line) {
       ${notice || !loadAction.allowPackedQuantityEdit ? "" : units.map((unit) => renderStepper(unit.key, `${packedReview ? t("operator.packed", "Packed") : t("operator.pack", "Pack")} ${unit.label}`, panelValue(line, unit.key))).join("")}
       ${packedReview
         ? `<div class="selected-actions">${packedActions}</div>`
-        : `<div class="selected-actions"><button class="primary-button" data-action="confirm-line" data-line="${line.id}" type="button">${t("operator.confirmLine", "Confirm line")}</button></div>`}
+        : `<div class="selected-actions"><button class="primary-button" data-action="confirm-line" data-line="${line.id}" ${pageConfirming ? "disabled" : ""} type="button">${t("operator.confirmLine", "Confirm line")}</button></div>`}
     </aside>
   `;
 }
@@ -5719,7 +5726,9 @@ async function setOrderStatus(status) {
 }
 
 async function confirmLine(lineId) {
+  if (pageConfirming) return;
   const row = app.querySelector(`[data-selected-line="${lineId}"]`);
+  if (!row) return;
   const line = selectedOrder?.lines?.find((item) => String(item.id) === String(lineId));
   const pallets = row.querySelector('[data-pack="pallets"]')?.value || 0;
   const layers = row.querySelector('[data-pack="layers"]')?.value || 0;
@@ -5774,8 +5783,24 @@ function confirmPayloadHasQty(body) {
   return qty(body.pallets) > 0 || qty(body.layers) > 0 || qty(body.pieces) > 0 || qty(body.sections) > 0 || qty(body.salesQty) > 0;
 }
 
+function updatePageConfirmControls() {
+  const pageActions = new Set(["confirm-page", "confirm-receiving-page"]);
+  for (const button of app.querySelectorAll('[data-action="confirm-page"], [data-action="confirm-receiving-page"], [data-action="confirm-line"], [data-action="confirm-receiving-line"]')) {
+    if (pageConfirming) button.setAttribute("disabled", "");
+    else button.removeAttribute("disabled");
+    if (pageActions.has(button.getAttribute("data-action") || "")) {
+      button.textContent = pageConfirming
+        ? t("operator.confirming", "Confirming...")
+        : t("operator.confirmPage", "Confirm page");
+    }
+  }
+}
+
 async function confirmPage() {
-  if (!selectedOrder || currentModule !== "delivery" || viewMode === "packed") return;
+  if (pageConfirming) return;
+  const customerPickupPage = currentModule === "customer-pickup";
+  const deliveryPage = currentModule === "delivery" && viewMode !== "packed";
+  if (!selectedOrder || (!customerPickupPage && !deliveryPage)) return;
   if (!selectedId) return showToast("Select an order before confirming the page.");
   const pageLines = currentDetailPageLines(selectedOrder).filter((line) => !exceptionText(line));
   const lines = [];
@@ -5788,14 +5813,19 @@ async function confirmPage() {
     else lines.push(payload);
   }
   const mutationOrderId = selectedId;
-  markLocalDeliveryMutation(mutationOrderId);
+  if (!customerPickupPage) markLocalDeliveryMutation(mutationOrderId);
   let confirmedCount = 0;
   const failures = [];
   let refreshedOrder = null;
+  pageConfirming = true;
+  updatePageConfirmControls();
   try {
     if (lines.length) {
       try {
-        const result = await api(`/api/delivery/orders/${encodeURIComponent(selectedId)}/lines/confirm-page`, {
+        const path = customerPickupPage
+          ? `/api/customer-pickup/orders/${encodeURIComponent(selectedId)}/lines/confirm-page`
+          : `/api/delivery/orders/${encodeURIComponent(selectedId)}/lines/confirm-page`;
+        const result = await api(path, {
           method: "POST",
           body: JSON.stringify({ lines })
         });
@@ -5823,9 +5853,12 @@ async function confirmPage() {
     } else {
       showToast(confirmedCount ? `${confirmedCount} line confirmed` : "No visible line quantity to confirm");
     }
-    if (!acceptRefreshedDeliveryOrder(refreshedOrder)) await loadDetail(selectedId);
+    if (!acceptRefreshedDeliveryOrder(refreshedOrder)) await loadDetail(selectedId, { silentRender: customerPickupPage });
   } finally {
-    finishLocalDeliveryMutation(mutationOrderId);
+    if (!customerPickupPage) finishLocalDeliveryMutation(mutationOrderId);
+    pageConfirming = false;
+    if (customerPickupPage && currentModule === "customer-pickup") render();
+    else updatePageConfirmControls();
   }
 }
 
@@ -6284,7 +6317,59 @@ function renderReceiptScreen() {
   `);
 }
 
+function receivingConfirmPayloadForLine(line) {
+  const row = app.querySelector(`[data-receiving-selected-line="${line.id}"]`);
+  const fieldValue = (unit) => row?.querySelector(`[data-pack="${unit}"]`)?.value;
+  const value = (unit) => fieldValue(unit) ?? receivingPanelValue(line, unit);
+  const pieces = fieldValue("pieces") ?? receivingPanelValue(line, "pieces");
+  const salesQty = fieldValue("sales") ?? (isIndependentManualLine(line) || shouldUseSalesQuantity(line) ? receivingPanelValue(line, "sales") : 0);
+  return {
+    pallets: value("pallets") || 0,
+    layers: value("layers") || 0,
+    pieces: isIndependentManualLine(line) ? pieces || 0 : salesQty || pieces || 0,
+    salesQty: salesQty || 0,
+    sections: value("sections") || 0
+  };
+}
+
+async function confirmReceivingPage() {
+  if (pageConfirming) return;
+  if (!receivingSelectedOrder || !receivingSelectedId) {
+    return showToast("Select a Purchase Order before confirming the page.");
+  }
+  const orderType = receivingSelectedOrder.order_type || receivingOrderType;
+  if (orderType !== "purchase_order") return;
+  const lines = (receivingSelectedOrder.lines || []).filter((line) => isPickableLine(line) && hasReceivingRemainingQty(line));
+  const pageLines = pageItems(lines, receivingLinePage, activeLinePageSize());
+  const requests = pageLines.map((line) => ({
+    lineId: line.id,
+    values: receivingConfirmPayloadForLine(line)
+  })).filter((line) => confirmPayloadHasQty(line.values));
+  if (!requests.length) return showToast("No visible line quantity to confirm");
+
+  pageConfirming = true;
+  updatePageConfirmControls();
+  try {
+    const result = await api(`/api/receiving/orders/${encodeURIComponent(receivingSelectedId)}/lines/confirm-page`, {
+      method: "POST",
+      body: JSON.stringify({ orderType: "purchase_order", lines: requests })
+    });
+    receivingSelectedOrder = result.order || receivingSelectedOrder;
+    const failures = result.failures || [];
+    const confirmedCount = Number(result.confirmed || 0);
+    if (failures.length) {
+      showToast(confirmedCount ? `${confirmedCount} confirmed, ${failures.length} failed` : failures[0]?.error || "Page confirmation failed");
+    } else {
+      showToast(confirmedCount ? `${confirmedCount} line confirmed` : "No visible line quantity to confirm");
+    }
+  } finally {
+    pageConfirming = false;
+    render();
+  }
+}
+
 async function confirmReceivingLine(lineId) {
+  if (pageConfirming) return;
   const row = app.querySelector(`[data-receiving-selected-line="${lineId}"]`);
   if (!row || !receivingSelectedId) return;
   const line = receivingSelectedOrder?.lines?.find((item) => String(item.id) === String(lineId));
@@ -8170,6 +8255,7 @@ app.addEventListener("click", async (event) => {
       receivingSelectedLineId = button.dataset.line;
       return render();
     }
+    if (button.dataset.action === "confirm-receiving-page") return confirmReceivingPage();
     if (button.dataset.action === "confirm-receiving-line") return confirmReceivingLine(button.dataset.line);
     if (button.dataset.action === "unconfirm-receiving-line") return unconfirmReceivingLine(button.dataset.line);
     if (button.dataset.action === "start-receive") return startReceipt();

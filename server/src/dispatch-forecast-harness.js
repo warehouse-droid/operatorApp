@@ -169,9 +169,32 @@ try {
     record("D3", "in_progress", 660)
   ], { now: at(661) }).travelLegs.find((leg) => leg.kind === "inter_stop" && leg.to.includes("200 Main"));
   assert.ok(inferred, "The non-co-located physical visits need an inter-stop travel leg.");
-  assert.equal(inferred.source, "inferred");
+  assert.equal(inferred.source, "destination_stop_arrival");
   assert.equal(inferred.actualLeave, at(623));
   assert.equal(inferred.actualArrival, at(660));
+
+  const derivedArrivalRecords = [
+    record("D1", "complete", 600, 612),
+    record("D2", "complete", 612, 623),
+    {
+      ...record("D3", "complete", 660, 680),
+      actual_arrival_at: at(654),
+      actual_arrival_source: "samsara_gps_history",
+      actual_arrival_confidence: "high",
+      actual_arrival_algorithm_version: "terminal-cluster-v1"
+    }
+  ];
+  const derivedArrivalForecast = buildDispatchForecast(plan, derivedArrivalRecords, { now: at(681) });
+  const derivedStop = derivedArrivalForecast.stops.find((stop) => stop.stopId === "D3");
+  const derivedTravel = derivedArrivalForecast.travelLegs.find((leg) =>
+    leg.kind === "inter_stop" && leg.to.includes("200 Main")
+  );
+  assert.equal(derivedStop.actualArrival, at(654), "The canonical arrival must replace the auto-start PWA timestamp in forecast output.");
+  assert.equal(derivedStop.actualArrivalSource, "samsara_gps_history");
+  assert.equal(derivedStop.actualArrivalConfidence, "high");
+  assert.equal(derivedTravel.actualArrival, at(654), "The preceding travel leg must end at the same canonical stop arrival.");
+  assert.equal(derivedTravel.source, "destination_stop_arrival");
+  assert.equal(derivedArrivalRecords[2].started_at, at(660), "Forecasting must never rewrite immutable PWA evidence.");
 
   const expectedStart = planJobsForDriver(plan, "alex").find((job) => job.stopType === "travel" && job.loadId === "L1" && Number(job.sequence?.stopIndex) < 0);
   assert.ok(expectedStart, "Fixture must produce a Driver PWA start-travel job.");

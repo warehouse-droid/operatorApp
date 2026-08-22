@@ -2242,6 +2242,47 @@ label span {
   .reload-fulfillment-screen > .selected-actions {
     grid-column: 1;
   }
+
+  .receiving-shell {
+    padding: 8px;
+    overflow-y: auto;
+  }
+
+  .receiving-toolbar {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: stretch;
+  }
+
+  .receiving-toolbar .receiving-search,
+  .receiving-toolbar > [data-action="refresh-receiving"] {
+    grid-column: 1 / -1;
+  }
+
+  .receiving-grid {
+    flex: 0 0 auto;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto auto;
+    overflow: visible;
+  }
+
+  .receiving-grid > .order-panel {
+    min-height: 520px;
+  }
+
+  .receiving-grid > .detail-panel {
+    min-height: 760px;
+    overflow: visible;
+  }
+
+  .receiving-detail-grid {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(300px, 1fr) auto;
+    overflow: visible;
+  }
+
+  .receiving-detail-grid .receiving-lines {
+    min-height: 300px;
+  }
 }
 
 .fulfillment-card {

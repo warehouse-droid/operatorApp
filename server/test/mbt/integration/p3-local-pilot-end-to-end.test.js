@@ -5,6 +5,7 @@ import crypto from "node:crypto";
 import test, { after } from "node:test";
 
 import { closeDb, pool, query, withTransaction } from "../../../src/db.js";
+import { driverCompanyDate } from "../../../src/driver-plan-date-policy.js";
 import { getDriverDayJobs } from "../../../src/driver-repository.js";
 import {
   markDriverOfflinePhotoDurable,
@@ -85,14 +86,13 @@ function futureDate(days) {
   return value.toISOString().slice(0, 10);
 }
 
-/** @param {number} preferredDays */
-async function availableFuturePlanDate(preferredDays) {
-  for (let offset = 0; offset < 120; offset += 1) {
-    const candidate = futureDate(preferredDays + offset);
-    const existing = await query("SELECT 1 FROM dispatch_plans WHERE plan_date = $1::date", [candidate]);
-    if (!existing.rowCount) {return candidate;}
+async function availableExecutablePlanDate() {
+  const companyDate = driverCompanyDate();
+  const existing = await query("SELECT 1 FROM dispatch_plans WHERE plan_date = $1::date", [companyDate]);
+  if (existing.rowCount) {
+    throw new Error("P3.11 requires an isolated database with today's synthetic Dispatch date available.");
   }
-  throw new Error("P3.11 could not reserve an unused synthetic Dispatch plan date.");
+  return companyDate;
 }
 
 /** @param {string} date @param {number} hour */
@@ -171,9 +171,13 @@ async function importSyntheticCustomer() {
   return { preview, applied, replay };
 }
 
-async function createServiceReadyImportedCustomer() {
+/** @param {string} planDate */
+async function createServiceReadyImportedCustomer(planDate) {
   const imported = await importSyntheticCustomer();
-  const configured = await createFrontdeskPrerequisites({ label: `p311-${RUN_ID}` });
+  const configured = await createFrontdeskPrerequisites({
+    label: `p311-${RUN_ID}`,
+    rateEffectiveFrom: atHour(planDate, 0)
+  });
   const addressId = crypto.randomUUID();
   const siteProfileId = crypto.randomUUID();
   const payloadHash = crypto.createHash("sha256").update(`p311-address-${RUN_ID}`).digest("hex");
@@ -244,12 +248,12 @@ async function convertImportedCustomer(fixture, planDate) {
   await issueFrontdeskQuote(frontdeskCommand("issue", FRONTDESK, {
     quoteId,
     expectedRevision: 1,
-    validUntil: atHour(planDate, 23)
+    validUntil: atHour(futureDate(1), 23)
   }));
   await acceptFrontdeskQuote(frontdeskCommand("accept", FRONTDESK, {
     quoteId,
     expectedRevision: 2,
-    acceptedAt: atHour(planDate, 10)
+    acceptedAt: new Date().toISOString()
   }));
   const converted = await convertFrontdeskQuote(frontdeskCommand("convert", FRONTDESK, {
     quoteId,
@@ -363,8 +367,7 @@ async function prepareDispatch(customer, contract, planDate) {
       JSON.stringify({ dispatchPlanFormat: { version: 2, source: "p311-local-pilot" }, ownYardCodes: [BIN_DISPATCH_YARD_CODE] })
     ]
   );
-  const pilotExpiresAt = new Date(`${planDate}T12:00:00.000Z`);
-  pilotExpiresAt.setUTCDate(pilotExpiresAt.getUTCDate() + 2);
+  const pilotExpiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1_000);
   await query(
     `INSERT INTO mbt_driver_pilot_scope (
        pilot_scope_id, plan_date, driver_login, truck_id, contract_id,
@@ -615,9 +618,9 @@ test("P3.11 E2E-A: imported customer -> Front Desk -> BIN Dispatch -> offline Dr
   assert.equal(gatesBefore.every(({ enabled }) => enabled === false), true);
   assert.equal(gatesBefore.find(({ flag_key: key }) => key === "mbt_netsuite_writes")?.enabled, false);
   const isolatedBefore = await isolationSnapshot();
-  const planDate = await availableFuturePlanDate(30 + (Number.parseInt(RUN_ID.slice(0, 4), 16) % 15));
+  const planDate = await availableExecutablePlanDate();
 
-  const customer = await createServiceReadyImportedCustomer();
+  const customer = await createServiceReadyImportedCustomer(planDate);
   assert.deepEqual(customer.imported.preview.summary, {
     totalRows: 1,
     validRows: 1,

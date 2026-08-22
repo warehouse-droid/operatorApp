@@ -20,6 +20,8 @@
   "include": [
     "src/mbt/**/*.js",
     "src/operator-customer-pickup-photo-policy.js",
+    "src/driver-historical-assist-*.js",
+    "src/netsuite-delayed-status-refresh-*.js",
     "test/support/**/*.mjs",
     "tools/**/*.mjs"
   ]

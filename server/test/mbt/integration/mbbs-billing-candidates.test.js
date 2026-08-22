@@ -448,6 +448,7 @@ test("a missing destination can be fixed by an audited billing-only override wit
         actor: ACTOR,
         candidateId: candidate.candidateId,
         completedMonth: "2038-06",
+        originAddressText: "150 Clark Boulevard, Brampton, ON L6T 4A8",
         destinationAddressText: "200 King Street West, Toronto, ON M5H 3T4",
         expectedRevision: 0,
         reason: "Customer confirmed the billing route destination",
@@ -459,6 +460,7 @@ test("a missing destination can be fixed by an audited billing-only override wit
       assert.equal(saved.status, 200);
       assert.equal(saved.replayed, false);
       assert.equal(saved.body.candidateId, candidate.candidateId);
+      assert.equal(saved.body.originAddressText, command.originAddressText);
       assert.equal(saved.body.destinationAddressText, command.destinationAddressText);
       assert.equal(saved.body.revision, 1);
       assert.equal(saved.body.postingMode, "local_only");
@@ -471,8 +473,10 @@ test("a missing destination can be fixed by an audited billing-only override wit
       const corrected = listed.items.find((item) => item.candidateId === candidate.candidateId);
       assert.equal(corrected?.chargeable, true);
       assert.equal(corrected?.automaticRateWarning, null);
+      assert.equal(corrected?.originLabel, command.originAddressText);
       assert.equal(corrected?.destinationLabel, command.destinationAddressText);
       assert.deepEqual(corrected?.addressOverride, {
+        originAddressText: command.originAddressText,
         destinationAddressText: command.destinationAddressText,
         revision: 1,
         updatedBy: ACTOR.operatorId,
@@ -492,6 +496,7 @@ test("a missing destination can be fixed by an audited billing-only override wit
           return { providerMetres: 30_001 };
         }
       });
+      assert.equal(resolvedInput.originAddressText, command.originAddressText);
       assert.equal(resolvedInput.destinationAddressText, command.destinationAddressText);
       assert.equal(preview.charge.amountMinor, 25_000);
 
@@ -781,19 +786,23 @@ test("an authoritative historical SO group is one charge with child evidence and
         search: suffix.slice(0, 7),
         limit: 100
       });
-      const driverCandidates = listed.items.filter((candidate) => candidate.driverLoadIds?.includes(loadId));
-      assert.equal(driverCandidates.length, 3);
+      const retainedLoadIds = new Set([loadId, splitLoadId]);
+      const driverCandidates = listed.items.filter((candidate) => candidate.driverLoadIds?.some((id) => retainedLoadIds.has(id)));
+      assert.equal(driverCandidates.length, 4);
       assert.deepEqual(
         driverCandidates.map((candidate) => candidate.billingRule).sort(),
-        ["po_shared_leg", "so_group", "to_replenishment"].sort()
+        ["po_shared_leg", "po_shared_leg", "so_group", "to_replenishment"].sort()
       );
       assert.ok(driverCandidates.filter((candidate) => candidate.billingRule !== "po_shared_leg")
         .every((candidate) => candidate.references.length === 1));
-      const poCandidate = driverCandidates.find((candidate) => candidate.billingRule === "po_shared_leg");
-      assert.deepEqual(poCandidate?.references.map((reference) => reference.rootReference).sort(), [...purchaseRefs].sort());
-      assert.deepEqual(poCandidate?.driverLoadIds.sort(), [loadId, splitLoadId].sort());
-      assert.deepEqual(poCandidate?.driverLoadNumbers, ["Load 3", "Load 4"]);
-      assert.match(poCandidate?.relationship.summary || "", /load splits do not change the charge/iu);
+      const poCandidates = driverCandidates.filter((candidate) => candidate.billingRule === "po_shared_leg");
+      assert.deepEqual(
+        poCandidates.flatMap((candidate) => candidate.references.map((reference) => reference.rootReference)).sort(),
+        [...purchaseRefs].sort()
+      );
+      assert.deepEqual(poCandidates.map((candidate) => candidate.driverLoadIds).sort(), [[loadId], [splitLoadId]].sort());
+      assert.deepEqual(poCandidates.map((candidate) => candidate.driverLoadNumbers[0]).sort(), ["Load 3", "Load 4"]);
+      assert.ok(poCandidates.every((candidate) => /immutable Driver load/iu.test(candidate.relationship.summary || "")));
       const groupedSales = driverCandidates.find((candidate) => candidate.billingRule === "so_group");
       assert.deepEqual(groupedSales?.references, [{ sourceType: "SO", rootReference: groupRef }]);
       assert.deepEqual(groupedSales?.memberReferences, salesRefs.map((rootReference) => ({ sourceType: "SO", rootReference })));
@@ -813,9 +822,9 @@ test("an authoritative historical SO group is one charge with child evidence and
           return { provider: "mixed-load-test", providerMetres: 12_000 };
         }
       });
-      assert.equal(preview.successCount, 3);
+      assert.equal(preview.successCount, 4);
       assert.equal(preview.failureCount, 0);
-      assert.equal(routeInputs.length, 3);
+      assert.equal(routeInputs.length, 4);
     });
   } finally {
     await rollback.rollback();
@@ -923,6 +932,155 @@ test("an active SCM PO group becomes one Driver billing order with all child POs
       });
       assert.equal(preview.results[0].status, "calculated");
       assert.equal(preview.results[0].charge.amountMinor, 20_000);
+    });
+  } finally {
+    await rollback.rollback();
+  }
+});
+
+test("Dispatch pickup and delivery overrides both become Driver-backed billing endpoints", async () => {
+  const rollback = await beginRollbackContext();
+  try {
+    await rollback.run(async () => {
+      const rateCardVersionId = await installRealMbbsRates();
+      const suffix = crypto.randomUUID().replaceAll("-", "").toUpperCase();
+      const base = 9_880_000_000 + (crypto.randomInt(10_000) * 10);
+      const completedDate = "2041-01-15";
+      const orders = [
+        {
+          type: "SO",
+          reference: `SO-${suffix}`,
+          loadId: `SO-OVERRIDE-${suffix}`,
+          origin: "11 Dispatch SO Pickup Road, Toronto, ON",
+          destination: "12 Dispatch SO Delivery Road, Toronto, ON",
+          staleOrigin: "11 Old SO Pickup Road, Toronto, ON",
+          staleDestination: "12 Old SO Delivery Road, Toronto, ON"
+        },
+        {
+          type: "TO",
+          reference: `TO-${suffix}`,
+          loadId: `TO-OVERRIDE-${suffix}`,
+          origin: "21 Dispatch TO Pickup Road, Toronto, ON",
+          destination: "22 Dispatch TO Delivery Road, Toronto, ON",
+          staleOrigin: "21 Old TO Pickup Road, Toronto, ON",
+          staleDestination: "22 Old TO Delivery Road, Toronto, ON"
+        },
+        {
+          type: "PO",
+          reference: `PO-${suffix}`,
+          loadId: `PO-OVERRIDE-${suffix}`,
+          origin: "31 Dispatch PO Pickup Road, Toronto, ON",
+          destination: "32 Dispatch PO Delivery Road, Toronto, ON",
+          staleOrigin: "31 Old PO Pickup Road, Toronto, ON",
+          staleDestination: "32 Old PO Delivery Road, Toronto, ON"
+        }
+      ];
+      await query(
+        `INSERT INTO sales_orders (
+           netsuite_id, tranid, fulfillment_status, fulfilled_at,
+           outbound_location, sales_order_type, dispatch_pickup_address,
+           dispatch_address, dispatch_parse_source, netsuite_active, synced_at
+         ) VALUES ($1, $2, 'fulfilled', $3::timestamptz, '2967', 'Delivery',
+                   $4, $5, 'manual-dispatch-details', true, $3::timestamptz)`,
+        [base + 1, orders[0].reference, `${completedDate}T15:00:00.000Z`, orders[0].origin, orders[0].destination]
+      );
+      await query(
+        `INSERT INTO transfer_orders (
+           netsuite_id, tranid, from_location_id, from_location,
+           to_location_id, to_location, dispatch_pickup_address,
+           dispatch_address, dispatch_parse_source, fulfillment_status,
+           netsuite_active, synced_at
+         ) VALUES ($1, $2, 4, '150', 5, '2967', $3, $4,
+                   'manual-dispatch-details', 'fulfilled', true, now())`,
+        [base + 2, orders[1].reference, orders[1].origin, orders[1].destination]
+      );
+      await query(
+        `INSERT INTO purchase_orders (
+           netsuite_id, tranid, vendor, source_location,
+           destination_location_id, destination_location, dispatch_pickup_address,
+           dispatch_delivery_address, dispatch_address, receipt_status,
+           dispatch_parse_source, netsuite_active, synced_at
+         ) VALUES ($1, $2, $3, 'Vendor source', 1, '3445', $4, $5,
+                   'Vendor default address', 'received', 'manual-dispatch-details',
+                   true, now())`,
+        [base + 3, orders[2].reference, `Override vendor ${suffix}`, orders[2].origin, orders[2].destination]
+      );
+      const orderType = {
+        SO: "SALES_ORDER",
+        TO: "TRANSFER_ORDER",
+        PO: "PURCHASE_ORDER"
+      };
+      for (const [index, order] of orders.entries()) {
+        const details = (address) => JSON.stringify({
+          address,
+          orders: [{
+            orderRef: order.reference,
+            orderType: orderType[order.type],
+            source: order.type === "PO" ? "receiving" : "delivery"
+          }]
+        });
+        await query(
+          `INSERT INTO driver_job_records (
+             job_id, plan_date, driver_login, truck_id, load_id, load_name,
+             stop_id, stop_type, order_refs, status, started_at, completed_at,
+             job_details
+           ) VALUES
+             ($1, $3::date, 'override-driver', '101', $4, $5, $6, 'pickup',
+              $8::jsonb, 'complete', $9::timestamptz, $10::timestamptz, $11::jsonb),
+             ($2, $3::date, 'override-driver', '101', $4, $5, $7, 'dropoff',
+              $8::jsonb, 'complete', $10::timestamptz, $12::timestamptz, $13::jsonb)`,
+          [
+            `JOB-${order.type}-OVERRIDE-PICK-${suffix}`,
+            `JOB-${order.type}-OVERRIDE-DROP-${suffix}`,
+            completedDate,
+            order.loadId,
+            `${order.type} override load`,
+            `${order.type}-PICK`,
+            `${order.type}-DROP`,
+            JSON.stringify([order.reference]),
+            `${completedDate}T${10 + index}:00:00.000Z`,
+            `${completedDate}T${10 + index}:10:00.000Z`,
+            details(order.staleOrigin),
+            `${completedDate}T${10 + index}:30:00.000Z`,
+            details(order.staleDestination)
+          ]
+        );
+      }
+
+      const listed = await listMbbsBillingCandidates({
+        actor: ACTOR,
+        completedDate,
+        search: suffix,
+        limit: 100
+      });
+      const retained = orders.map((order) => listed.items.find((candidate) => (
+        candidate.sourceSystem === "driver_pwa"
+        && candidate.driverLoadIds.includes(order.loadId)
+      )));
+      assert.ok(retained.every(Boolean));
+      for (const [index, candidate] of retained.entries()) {
+        assert.equal(candidate.originLabel, orders[index].origin);
+        assert.equal(candidate.destinationLabel, orders[index].destination);
+      }
+
+      const routed = [];
+      const preview = await previewMbbsBillingCandidatesBatch({
+        actor: ACTOR,
+        candidateIds: retained.map((candidate) => candidate.candidateId),
+        completedMonth: "2041-01",
+        completedDate,
+        rateCardVersionId
+      }, {
+        async resolveDistance(input) {
+          routed.push(input);
+          return { provider: "dispatch-override-test", providerMetres: 12_000 };
+        }
+      });
+      assert.equal(preview.successCount, 3);
+      assert.deepEqual(
+        new Set(routed.map((input) => `${input.originAddressText} -> ${input.destinationAddressText}`)),
+        new Set(orders.map((order) => `${order.origin} -> ${order.destination}`))
+      );
     });
   } finally {
     await rollback.rollback();

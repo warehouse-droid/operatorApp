@@ -22,6 +22,11 @@ assert.match(
   "The SCM sidebar must expose PO/TO Schedule formatting."
 );
 assert.match(
+  sidebar,
+  /\{ label: "TO Printing", href: "\/scm\/to-printing", icon: "TP", scmWriteOnly: true, authorities: \["admin", "scm", "scm_staff"\] \}/,
+  "The SCM sidebar must expose the role-gated Transfer Order printing page."
+);
+assert.match(
   menu,
   /<button class="dispatch-menu-card primary-card" onclick="location\.href='\/scm\/netsuite-po'" type="button">[\s\S]*?<strong>NetSuite PO history<\/strong>/,
   "The visible SCM menu card grid must expose the NetSuite PO history page."
@@ -49,6 +54,16 @@ assert.ok(
     && server.includes('res.sendFile(path.join(publicDir, "scm-schedule-formatting.html"));'),
   "The Schedule Formatting menu target must have a server route."
 );
+assert.ok(
+  menu.includes("Transfer Order Printing")
+    && menu.includes("location.href='/scm/to-printing'"),
+  "The SCM menu must expose the Transfer Order printing page."
+);
+assert.ok(
+  server.includes('app.get("/scm/to-printing", (req, res) => {')
+    && server.includes('res.sendFile(path.join(publicDir, "scm-to-printing.html"));'),
+  "The Transfer Order printing menu target must have a server route."
+);
 
 console.log(JSON.stringify({
   ok: true,
@@ -56,5 +71,6 @@ console.log(JSON.stringify({
   scmMenuCard: true,
   authorizedRolesAligned: true,
   routePresent: true,
-  scheduleFormatting: true
+  scheduleFormatting: true,
+  transferOrderPrinting: true
 }));

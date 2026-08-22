@@ -2799,7 +2799,8 @@ export function createMbtRouter(dependencies = {}) {
           candidateIds: body.candidateIds,
           completedMonth: body.completedMonth,
           completedDate: body.completedDate,
-          rateCardVersionId: body.rateCardVersionId
+          rateCardVersionId: body.rateCardVersionId,
+          pricingSelections: body.pricingSelections
         }, { resolveDistance: frontdeskPricing.resolveDistance });
         noStore(res);
         res.json(result);
@@ -2825,6 +2826,7 @@ export function createMbtRouter(dependencies = {}) {
           rateCardVersionId: body.rateCardVersionId,
           customerNetsuiteId: body.customerNetsuiteId,
           manualAmountEdits: body.manualAmountEdits,
+          pricingSelections: body.pricingSelections,
           reason: body.reason,
           idempotencyKey: requiredRequestText(
             req.get("idempotency-key"),
@@ -2859,6 +2861,7 @@ export function createMbtRouter(dependencies = {}) {
             "An MBBS billing candidate ID is required."
           ),
           completedMonth: body.completedMonth,
+          originAddressText: body.originAddressText,
           destinationAddressText: body.destinationAddressText,
           expectedRevision: body.expectedRevision,
           reason: body.reason,
@@ -2896,7 +2899,8 @@ export function createMbtRouter(dependencies = {}) {
           ),
           completedMonth: body.completedMonth,
           completedDate: body.completedDate,
-          rateCardVersionId: body.rateCardVersionId
+          rateCardVersionId: body.rateCardVersionId,
+          pricingMethod: body.pricingMethod
         }, { resolveDistance: frontdeskPricing.resolveDistance });
         noStore(res);
         res.json(result);

@@ -28,8 +28,24 @@ let dispatchAudit = [];
 let parserReparseResult = null;
 let setupNotice = "";
 let samsaraTestResult = null;
-let samsaraSettings = { dvirAuthorId: "1868723" };
+let samsaraSettings = { dvirAuthorId: "1868723", actualStopArrivalEnabled: false };
 let planningSettings = { truckSwitchMinutes: 10 };
+const torontoToday = () => {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Toronto",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(new Date()).map((part) => [part.type, part.value]));
+  return `${parts.year}-${parts.month}-${parts.day}`;
+};
+let actualArrivalHistoryDate = torontoToday();
+let actualArrivalDrivers = [];
+let actualArrivalDriverLogin = "";
+let actualArrivalDriversLoading = false;
+let actualArrivalRun = null;
+let actualArrivalPollTimer = null;
+let actualArrivalApplying = false;
 let selectedVendor = "";
 let selectedYard = "";
 let vendorAddMode = false;
@@ -83,6 +99,71 @@ async function loadDispatchSetup() {
     if (setup.planning) planningSettings = { ...planningSettings, ...setup.planning };
   } catch (error) {
     setupNotice = `Dispatch setup failed to load: ${error.message}`;
+  }
+}
+
+async function loadActualArrivalDrivers({ render = false } = {}) {
+  actualArrivalDriversLoading = true;
+  if (render) renderSetup();
+  try {
+    const result = await api(`/api/dispatch/actual-arrivals/drivers?date=${encodeURIComponent(actualArrivalHistoryDate)}`);
+    actualArrivalDrivers = Array.isArray(result.drivers) ? result.drivers : [];
+    if (!actualArrivalDrivers.some((driver) => driver.driverLogin === actualArrivalDriverLogin)) {
+      actualArrivalDriverLogin = actualArrivalDrivers[0]?.driverLogin || "";
+    }
+  } catch (error) {
+    actualArrivalDrivers = [];
+    actualArrivalDriverLogin = "";
+    setupNotice = `Historical route drivers failed to load: ${error.message}`;
+  } finally {
+    actualArrivalDriversLoading = false;
+    if (render) renderSetup();
+  }
+}
+
+function actualArrivalRunTerminal(status = "") {
+  return ["preview_ready", "applied", "failed", "needs_review", "suppressed_gate_off", "stale"].includes(status);
+}
+
+function scheduleActualArrivalRunPoll() {
+  window.clearTimeout(actualArrivalPollTimer);
+  if (!actualArrivalRun?.runId || actualArrivalRunTerminal(actualArrivalRun.status)) return;
+  actualArrivalPollTimer = window.setTimeout(async () => {
+    try {
+      actualArrivalRun = await api(`/api/dispatch/actual-arrivals/runs/${encodeURIComponent(actualArrivalRun.runId)}`);
+    } catch (error) {
+      setupNotice = `Arrival calculation status failed: ${error.message}`;
+    }
+    renderSetup();
+    scheduleActualArrivalRunPoll();
+  }, 1000);
+}
+
+async function startActualArrivalCalculation() {
+  if (!samsaraSettings.actualStopArrivalEnabled || !actualArrivalDriverLogin) return;
+  actualArrivalRun = {
+    runId: "",
+    status: "queued",
+    planDate: actualArrivalHistoryDate,
+    driverLogin: actualArrivalDriverLogin,
+    results: []
+  };
+  renderSetup();
+  try {
+    actualArrivalRun = await api("/api/dispatch/actual-arrivals/runs", {
+      method: "POST",
+      body: JSON.stringify({
+        planDate: actualArrivalHistoryDate,
+        driverLogin: actualArrivalDriverLogin
+      })
+    });
+    setupNotice = "Historical route calculation queued. Dispatch Planning and Driver PWA remain independent.";
+    renderSetup();
+    scheduleActualArrivalRunPoll();
+  } catch (error) {
+    actualArrivalRun = null;
+    setupNotice = `Arrival calculation failed to start: ${error.message}`;
+    renderSetup();
   }
 }
 
@@ -578,23 +659,127 @@ function renderOwnYards() {
   `;
 }
 
-function renderSamsaraSettings() {
+function actualArrivalStatusLabel(status = "") {
+  return ({
+    queued: "Queued",
+    running: "Calculating",
+    retry_wait: "Retry scheduled",
+    preview_ready: "Preview ready",
+    applied: "Applied",
+    failed: "Failed",
+    needs_review: "Needs review",
+    suppressed_gate_off: "Stopped by gate",
+    stale: "Stale — recalculate"
+  })[status] || status || "Not started";
+}
+
+function actualArrivalResultLabel(result = {}) {
+  if (result.resolutionStatus === "first_stop") return "First stop unchanged";
+  if (result.resolutionStatus === "same_site") return "Same-site arrival";
+  if (result.resolutionStatus === "resolved") return "Resolved";
+  return `Unresolved${result.error ? `: ${result.error.replaceAll("_", " ")}` : ""}`;
+}
+
+function renderActualArrivalPreview() {
+  if (!actualArrivalRun) return "";
+  const results = Array.isArray(actualArrivalRun.results) ? actualArrivalRun.results : [];
   return `
-    <form class="registration-form setup-form" data-form="samsara-settings">
-      <h3>Samsara DVIR</h3>
-      <div class="form-action-row">
-        <button data-action="test-samsara-api" type="button">Test Samsara API</button>
+    <section class="actual-arrival-preview">
+      <div class="actual-arrival-run-summary">
+        <div>
+          <strong>${escapeHtml(actualArrivalStatusLabel(actualArrivalRun.status))}</strong>
+          <span>${escapeHtml(actualArrivalRun.driverLogin || "")} · ${escapeHtml(displayDate(actualArrivalRun.planDate) || actualArrivalRun.planDate || "")}</span>
+        </div>
+        <div class="actual-arrival-counts">
+          <span>${Number(actualArrivalRun.totalStops || 0)} stop(s)</span>
+          <span>${Number(actualArrivalRun.resolvedStops || 0)} resolved</span>
+          <span>${Number(actualArrivalRun.unresolvedStops || 0)} unresolved</span>
+          <span>${Number(actualArrivalRun.skippedStops || 0)} unchanged</span>
+        </div>
       </div>
-      <label>
-        <span>DVIR author user ID</span>
-        <input name="dvirAuthorId" value="${escapeHtml(samsaraSettings.dvirAuthorId || "")}" placeholder="1868723" required />
-      </label>
-      <label>
-        <span>Author</span>
-        <input value="warehouse MBBS | warehouse@mrbininc.com" disabled />
-      </label>
-      <button class="primary" type="submit">Save Samsara Settings</button>
-    </form>
+      ${actualArrivalRun.error ? `<div class="setup-notice actual-arrival-error">${escapeHtml(actualArrivalRun.error)}</div>` : ""}
+      ${results.length ? `
+        <div class="actual-arrival-table-wrap">
+          <table class="actual-arrival-table">
+            <thead><tr>
+              <th>Stop</th><th>Orders / load</th><th>Destination</th><th>Previous stop ended</th>
+              <th>PWA start / old leg end</th><th>Calculated arrival / new leg end</th><th>Result</th><th>Evidence</th>
+            </tr></thead>
+            <tbody>
+              ${results.map((result) => {
+                const calculationMs = Number(result.evidence?.calculationMs);
+                const requests = Array.isArray(result.evidence?.requests) ? result.evidence.requests : [];
+                const requestMs = requests.reduce((sum, request) => sum + Number(request.durationMs || 0), 0);
+                return `<tr class="actual-arrival-result-${escapeHtml(result.resolutionStatus || "unknown")}">
+                  <td><strong>${Number(result.sequence || 0) + 1}</strong><small>${escapeHtml((result.stopIds || []).join(" + ") || "-")}</small></td>
+                  <td><strong>${escapeHtml((result.orderRefs || []).join(" + ") || "No order ref")}</strong><small>${escapeHtml(result.loadName || result.loadId || "-")}</small></td>
+                  <td>${escapeHtml(result.destinationAddress || "Coordinates unavailable")}</td>
+                  <td>${escapeHtml(displayDateTime(result.previousCompletedAt) || "First stop")}</td>
+                  <td>${escapeHtml(displayDateTime(result.pwaStartedAt) || "-")}</td>
+                  <td><strong>${escapeHtml(displayDateTime(result.proposedArrivalAt) || "Unchanged")}</strong><small>${result.proposedArrivalAt && result.pwaStartedAt ? `${Math.round((new Date(result.proposedArrivalAt).getTime() - new Date(result.pwaStartedAt).getTime()) / 60000)} min vs PWA` : ""}</small></td>
+                  <td><strong>${escapeHtml(actualArrivalResultLabel(result))}</strong><small>${escapeHtml([result.source, result.confidence].filter(Boolean).join(" · "))}</small></td>
+                  <td><span>${Number(result.evidence?.pointCount || result.evidence?.localPointCount || 0)} point(s)</span><small>${Number.isFinite(calculationMs) ? `${calculationMs.toFixed(3)} ms calculation` : ""}${requestMs ? ` · ${requestMs} ms API` : ""}</small></td>
+                </tr>`;
+              }).join("")}
+            </tbody>
+          </table>
+        </div>
+      ` : `<div class="empty-state">${actualArrivalRunTerminal(actualArrivalRun.status) ? "No route results were retained." : "The server worker is calculating this route without blocking Dispatch Planning."}</div>`}
+      <div class="inline-footer actual-arrival-actions">
+        <button data-action="recalculate-actual-arrivals" type="button" ${actualArrivalRun.status === "running" || actualArrivalRun.status === "queued" ? "disabled" : ""}>Recalculate</button>
+        <button class="primary" data-action="apply-actual-arrivals" type="button" ${actualArrivalRun.status === "preview_ready" && Number(actualArrivalRun.resolvedStops || 0) > 0 && !actualArrivalApplying ? "" : "disabled"}>${actualArrivalApplying ? "Applying..." : "Apply resolved arrivals"}</button>
+      </div>
+    </section>
+  `;
+}
+
+function renderSamsaraSettings() {
+  const enabled = samsaraSettings.actualStopArrivalEnabled === true;
+  return `
+    <div class="samsara-settings-stack">
+      <form class="registration-form setup-form" data-form="samsara-settings">
+        <h3>Samsara and Actual Stop Arrival</h3>
+        <div class="form-action-row">
+          <button data-action="test-samsara-api" type="button">Test Samsara API</button>
+        </div>
+        <label>
+          <span>DVIR author user ID</span>
+          <input name="dvirAuthorId" value="${escapeHtml(samsaraSettings.dvirAuthorId || "")}" placeholder="1868723" required />
+        </label>
+        <label>
+          <span>Author</span>
+          <input value="warehouse MBBS | warehouse@mrbininc.com" disabled />
+        </label>
+        <label class="setup-samsara-toggle actual-arrival-gate">
+          <input name="actualStopArrivalEnabled" type="checkbox" ${enabled ? "checked" : ""} />
+          <span>
+            <strong>Actual stop arrival calculation</strong>
+            <small>When on, completed stops are resolved in a server background worker and historical date/driver previews are available. The Samsara token needs Read Vehicle Statistics; Read Vehicle Trips is optional and used only as a hint. Turning it off stops new calculations without changing Driver PWA evidence or previously applied arrivals.</small>
+          </span>
+        </label>
+        <button class="primary" type="submit">Save Samsara Settings</button>
+      </form>
+      <section class="setup-panel actual-arrival-history-panel">
+        <div class="section-heading-row">
+          <div>
+            <h3>Historical Route Arrival Calculation</h3>
+            <p class="muted">The first physical stop keeps its PWA start. Every later stop uses its own final on-site GPS cluster, and the preceding travel leg ends at that arrival.</p>
+          </div>
+        </div>
+        <div class="actual-arrival-selector-row">
+          <label><span>Plan date</span><input id="actualArrivalHistoryDate" type="date" max="${torontoToday()}" value="${escapeHtml(actualArrivalHistoryDate)}" ${enabled ? "" : "disabled"} /></label>
+          <label><span>Driver</span><select id="actualArrivalHistoryDriver" ${enabled && !actualArrivalDriversLoading ? "" : "disabled"}>
+            ${actualArrivalDriversLoading
+              ? `<option>Loading drivers...</option>`
+              : actualArrivalDrivers.length
+                ? actualArrivalDrivers.map((driver) => `<option value="${escapeHtml(driver.driverLogin)}" ${driver.driverLogin === actualArrivalDriverLogin ? "selected" : ""}>${escapeHtml(driver.driverName || driver.driverLogin)} · ${Number(driver.completedRecordCount || 0)} record(s)</option>`).join("")
+                : `<option value="">No completed routes on this date</option>`}
+          </select></label>
+          <button class="primary" data-action="calculate-actual-arrivals" type="button" ${enabled && actualArrivalDriverLogin && !actualArrivalDriversLoading ? "" : "disabled"}>Calculate Preview</button>
+        </div>
+        ${enabled ? renderActualArrivalPreview() : `<div class="empty-state">Enable and save the feature gate to calculate a historical route.</div>`}
+      </section>
+    </div>
   `;
 }
 
@@ -919,7 +1104,11 @@ setupApp.addEventListener("click", (event) => {
     selectedSetupIndex = null;
     if (setupTab !== "vendors") vendorAddMode = false;
     setupNotice = "";
-    return renderSetup();
+    renderSetup();
+    if (setupTab === "samsara" && samsaraSettings.actualStopArrivalEnabled === true) {
+      loadActualArrivalDrivers({ render: true });
+    }
+    return;
   }
   if (event.target?.id === "vendorSelect") return;
   const selectButton = event.target.closest("[data-action='select-setup-record']");
@@ -1089,6 +1278,33 @@ setupApp.addEventListener("click", (event) => {
     });
     return;
   }
+  const calculateActualArrivalButton = event.target.closest("[data-action='calculate-actual-arrivals'], [data-action='recalculate-actual-arrivals']");
+  if (calculateActualArrivalButton) {
+    startActualArrivalCalculation();
+    return;
+  }
+  const applyActualArrivalButton = event.target.closest("[data-action='apply-actual-arrivals']");
+  if (applyActualArrivalButton) {
+    if (!actualArrivalRun?.runId || actualArrivalRun.status !== "preview_ready") return;
+    const resolved = Number(actualArrivalRun.resolvedStops || 0);
+    const unresolved = Number(actualArrivalRun.unresolvedStops || 0);
+    if (!window.confirm(`Apply ${resolved} resolved stop arrival(s)? ${unresolved} unresolved stop(s) will remain unchanged. Original PWA evidence will not be edited.`)) return;
+    actualArrivalApplying = true;
+    renderSetup();
+    api(`/api/dispatch/actual-arrivals/runs/${encodeURIComponent(actualArrivalRun.runId)}/apply`, {
+      method: "POST",
+      body: JSON.stringify({ expectedResultVersion: actualArrivalRun.resultVersion })
+    }).then((result) => {
+      actualArrivalRun = result;
+      setupNotice = `${Number(result.resolvedStops || 0)} actual stop arrival(s) applied. Their preceding travel legs now end at the same arrival times.`;
+    }).catch((error) => {
+      setupNotice = `Arrival apply failed: ${error.message}`;
+    }).finally(() => {
+      actualArrivalApplying = false;
+      renderSetup();
+    });
+    return;
+  }
   if (!tabButton) return;
   renderSetup();
 });
@@ -1154,10 +1370,18 @@ setupApp.addEventListener("submit", (event) => {
   if (form.dataset.form === "samsara-settings") {
     samsaraSettings = {
       ...samsaraSettings,
-      dvirAuthorId: String(data.dvirAuthorId || "").trim()
+      dvirAuthorId: String(data.dvirAuthorId || "").trim(),
+      actualStopArrivalEnabled: data.actualStopArrivalEnabled === "on"
     };
-    saveDispatchSetup().then(() => {
+    saveDispatchSetup().then(async () => {
       setupNotice = "Samsara settings saved.";
+      if (samsaraSettings.actualStopArrivalEnabled === true) {
+        await loadActualArrivalDrivers();
+      } else {
+        actualArrivalDrivers = [];
+        actualArrivalDriverLogin = "";
+        window.clearTimeout(actualArrivalPollTimer);
+      }
       renderSetup();
     }).catch((error) => {
       setupNotice = `Samsara settings save failed: ${error.message}`;
@@ -1314,6 +1538,21 @@ setupApp.addEventListener("submit", (event) => {
 });
 
 setupApp.addEventListener("change", (event) => {
+  if (event.target?.id === "actualArrivalHistoryDate") {
+    actualArrivalHistoryDate = event.target.value || torontoToday();
+    actualArrivalDriverLogin = "";
+    actualArrivalRun = null;
+    window.clearTimeout(actualArrivalPollTimer);
+    loadActualArrivalDrivers({ render: true });
+    return;
+  }
+  if (event.target?.id === "actualArrivalHistoryDriver") {
+    actualArrivalDriverLogin = event.target.value || "";
+    actualArrivalRun = null;
+    window.clearTimeout(actualArrivalPollTimer);
+    renderSetup();
+    return;
+  }
   if (event.target?.name === "truckType") {
     const form = event.target.closest("form[data-form='truck']");
     const isBin = event.target.value === "bin";

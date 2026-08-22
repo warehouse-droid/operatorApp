@@ -1220,6 +1220,7 @@ async function binRateEvidence(input, rateCardVersionId, distanceMetres) {
   }
   let delivery = await query(
       `SELECT band.amount_minor, band.pricing_basis, band.currency,
+              band.base_amount_minor, band.included_metres,
               band.rate_distance_band_id::text,
               band.minimum_metres::int, band.maximum_metres::int,
               version.rate_card_version_id::text
@@ -1263,6 +1264,7 @@ async function binRateEvidence(input, rateCardVersionId, distanceMetres) {
   if (!delivery.rowCount) {
     delivery = await query(
       `SELECT amount_minor, pricing_basis, currency,
+              base_amount_minor, included_metres,
               rate_distance_band_id::text,
               minimum_metres::int, maximum_metres::int,
               rate_card_version_id::text
@@ -1313,7 +1315,11 @@ async function binRateEvidence(input, rateCardVersionId, distanceMetres) {
   }
   const deliveryAmountMinor = calculateDistanceBandChargeMinor({
     amountMinor: nonnegativeInteger(Number(delivery.rows[0].amount_minor), "Delivery unit amount"),
-    pricingBasis: String(delivery.rows[0].pricing_basis)
+    pricingBasis: String(delivery.rows[0].pricing_basis),
+    baseAmountMinor: delivery.rows[0].base_amount_minor === null
+      ? null : Number(delivery.rows[0].base_amount_minor),
+    includedMetres: delivery.rows[0].included_metres === null
+      ? null : Number(delivery.rows[0].included_metres)
   }, distanceMetres);
   const { outgoingContentCode, outgoingBinSizeYards } = outgoingBinEvidence(input.kind, bin);
   const depositRow = deposit.rows[0] || null;

@@ -165,6 +165,7 @@ function scopedComponents(input, currency) {
  *
  * @param {unknown} value
  */
+// eslint-disable-next-line complexity -- One deterministic calculator validates each optional rate component before composing exact-cent lines.
 export function calculateLocalRate(value) {
   const input = requiredObject(value, "A local-rate calculation");
   const rawDistanceMetres = safeNonnegativeInteger(
@@ -185,19 +186,28 @@ export function calculateLocalRate(value) {
     "Transport amount"
   );
   const pricingBasis = normalizedDistancePricingBasis(selectedBand.pricingBasis);
+  const basePlusExcess = pricingBasis === DISTANCE_PRICING_BASES.PER_KM
+    && selectedBand.baseAmountMinor !== null
+    && selectedBand.baseAmountMinor !== undefined
+    && selectedBand.includedMetres !== null
+    && selectedBand.includedMetres !== undefined;
   const amountMinor = calculateDistanceBandChargeMinor({
     amountMinor: selectedBand.amountMinor,
-    pricingBasis: selectedBand.pricingBasis
+    pricingBasis: selectedBand.pricingBasis,
+    baseAmountMinor: selectedBand.baseAmountMinor,
+    includedMetres: selectedBand.includedMetres
   }, rawDistanceMetres);
   /** @type {Array<Record<string, any>>} */
   const lines = [{
     lineCode: "transport",
     lineType: "transport",
-    quantity: pricingBasis === DISTANCE_PRICING_BASES.PER_KM
-      ? rawDistanceMetres / 1000
+    quantity: basePlusExcess
+      ? 1
+      : pricingBasis === DISTANCE_PRICING_BASES.PER_KM
+      ? Math.max(0, rawDistanceMetres - Number(selectedBand.includedMetres || 0)) / 1000
       : 1,
-    unitOfMeasure: pricingBasis === DISTANCE_PRICING_BASES.PER_KM ? "KM" : "TRIP",
-    unitAmountMinor,
+    unitOfMeasure: pricingBasis === DISTANCE_PRICING_BASES.PER_KM && !basePlusExcess ? "KM" : "TRIP",
+    unitAmountMinor: basePlusExcess ? amountMinor : unitAmountMinor,
     netAmountMinor: amountMinor,
     currency,
     source: { type: "distance_band", id: String(selectedBand.rateDistanceBandId) }

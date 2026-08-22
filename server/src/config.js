@@ -3,6 +3,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { normalizeDispatchPlannerMode } from "./dispatch-planner-optimization.js";
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 const serverRoot = path.resolve(dirname, "..");
@@ -65,7 +66,14 @@ function buildConfig(env) {
       billingOperationsEnabled: booleanValue(env.MBT_BILLING_OPERATIONS_ENABLED, false)
     },
     dispatch: {
-      driverOrientedPlanning: ["1", "true", "yes", "on"].includes(String(env.DISPATCH_DRIVER_ORIENTED_PLANNING ?? "false").trim().toLowerCase())
+      driverOrientedPlanning: ["1", "true", "yes", "on"].includes(String(env.DISPATCH_DRIVER_ORIENTED_PLANNING ?? "false").trim().toLowerCase()),
+      plannerOrderPoolMode: normalizeDispatchPlannerMode(env.DISPATCH_PLANNER_ORDER_POOL_MODE),
+      plannerCommandMode: normalizeDispatchPlannerMode(env.DISPATCH_PLANNER_COMMAND_MODE)
+    },
+    driverRoutePush: {
+      vapidPublicKey: String(env.DRIVER_ROUTE_PUSH_VAPID_PUBLIC_KEY || "").trim(),
+      vapidPrivateKey: String(env.DRIVER_ROUTE_PUSH_VAPID_PRIVATE_KEY || "").trim(),
+      vapidSubject: String(env.DRIVER_ROUTE_PUSH_VAPID_SUBJECT || "").trim()
     },
     sales: {
       publicAccessEnabled: booleanValue(env.SALES_PUBLIC_ACCESS_ENABLED, false)
@@ -74,6 +82,11 @@ function buildConfig(env) {
       westYardPenaltyMinutes: Number(env.TRANSFER_DEPENDENCY_150_PENALTY_MINUTES || 60),
       employeeId: String(env.TRANSFER_DEPENDENCY_EMPLOYEE_ID || "8721"),
       deliveryMethodId: String(env.TRANSFER_DEPENDENCY_DELIVERY_METHOD_ID || "2")
+    },
+    specialStock: {
+      deliveryMethodId: String(env.SPECIAL_STOCK_DELIVERY_METHOD_ID || "2").trim(),
+      pickupMethodId: String(env.SPECIAL_STOCK_PICKUP_METHOD_ID || "").trim(),
+      subsidiaryId: String(env.SPECIAL_STOCK_SUBSIDIARY_ID || env.NETSUITE_SUBSIDIARY_ID || "").trim()
     },
     smartScm: {
       inputDir: path.resolve(env.SMART_SCM_INPUT_DIR || path.join(dataDir, "scm-inputs")),
@@ -110,6 +123,9 @@ function buildConfig(env) {
       tokenUrl: env.NETSUITE_TOKEN_URL,
       restBaseUrl: env.NETSUITE_REST_BASE_URL,
       scopes: env.NETSUITE_SCOPES || "rest_webservices",
+      m2mSettingsPath: path.resolve(env.NETSUITE_M2M_SETTINGS_PATH || path.join(dataDir, "netsuite-m2m-settings.json")),
+      m2mMasterKeyPath: path.resolve(env.NETSUITE_M2M_MASTER_KEY_PATH || path.join(dataDir, ".netsuite-m2m-master-key")),
+      m2mStorageSecret: env.NETSUITE_M2M_STORAGE_SECRET || "",
       requestTimeoutMs: Number(env.NETSUITE_REQUEST_TIMEOUT_MS || 120000),
       subsidiaryId: env.NETSUITE_SUBSIDIARY_ID || "",
       webhookSecret: env.NETSUITE_WEBHOOK_SECRET || "",
@@ -153,6 +169,7 @@ function replaceConfig(target, next) {
   target.mbt = { ...next.mbt };
   target.mbtPhase3 = { ...next.mbtPhase3 };
   target.dispatch = { ...next.dispatch };
+  target.driverRoutePush = { ...next.driverRoutePush };
   target.sales = { ...next.sales };
   target.transferDependency = { ...next.transferDependency };
   target.smartScm = { ...next.smartScm };

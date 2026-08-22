@@ -1,5 +1,9 @@
 const customOrdersApp = document.getElementById("customOrdersApp");
 const customOrdersT = (key, fallback) => window.MBBS_I18N?.t?.(key, fallback) || fallback;
+const customOrdersScmMode = window.location.pathname.startsWith("/scm/");
+const customOrdersApiBase = customOrdersScmMode
+  ? "/api/scm/custom-orders"
+  : "/api/dispatch/custom-orders";
 
 const customOrdersState = {
   operator: null,
@@ -218,7 +222,7 @@ async function loadCustomOrders() {
   customOrdersState.loading = true;
   renderCustomOrderResults();
   try {
-    const payload = await customOrdersApi("/api/dispatch/custom-orders?includeCancelled=true");
+    const payload = await customOrdersApi(`${customOrdersApiBase}?includeCancelled=true`);
     customOrdersState.orders = customOrdersPayloadRows(payload)
       .map(normalizeCustomOrder)
       .sort((left, right) => {
@@ -467,7 +471,7 @@ function renderCustomOrders() {
       </div>
       <div class="topbar-language">${window.MBBS_I18N?.toggleHtml?.() || ""}</div>
       <div class="topbar-actions">
-        <button data-action="go-planning" type="button">Dispatch Planning</button>
+        ${customOrdersScmMode ? "" : `<button data-action="go-planning" type="button">Dispatch Planning</button>`}
         <button data-action="go-menu" type="button">${customOrdersT("common.menu", "Menu")}</button>
         <span class="dispatch-user">${customOrdersEscape(operator.display_name || operator.username || "")}</span>
         <button data-action="logout" type="button">${customOrdersT("common.logout", "Logout")}</button>
@@ -577,8 +581,8 @@ async function submitCustomOrder() {
   try {
     await customOrdersApi(
       editingId
-        ? `/api/dispatch/custom-orders/${encodeURIComponent(editingId)}`
-        : "/api/dispatch/custom-orders",
+        ? `${customOrdersApiBase}/${encodeURIComponent(editingId)}`
+        : customOrdersApiBase,
       {
         method: editingId ? "PUT" : "POST",
         body: JSON.stringify(payload)
@@ -663,7 +667,7 @@ async function cancelCustomOrder(id) {
   customOrdersState.notice = null;
   renderCustomOrderResults();
   try {
-    await customOrdersApi(`/api/dispatch/custom-orders/${encodeURIComponent(order.id)}`, { method: "DELETE" });
+    await customOrdersApi(`${customOrdersApiBase}/${encodeURIComponent(order.id)}`, { method: "DELETE" });
     if (customOrdersState.editingId === order.id) {
       updateCustomOrderEditUrl();
       customOrdersState.editingId = "";
@@ -711,7 +715,7 @@ customOrdersApp.addEventListener("click", (event) => {
   } else if (action === "go-planning") {
     location.href = "/dispatch/planning";
   } else if (action === "go-menu") {
-    location.href = "/dispatch";
+    location.href = customOrdersScmMode ? "/scm" : "/dispatch";
   } else if (action === "logout") {
     dispatchLogout();
   } else if (action === "clear-form" || action === "discard-edit") {
@@ -734,6 +738,7 @@ window.addEventListener("mbbs-language-changed", renderCustomOrders);
 requireDispatchLogin({
   mount: customOrdersApp,
   allowPublicSales: false,
+  roles: customOrdersScmMode ? ["admin", "scm", "scm_staff"] : ["dispatcher", "admin"],
   onReady(operator) {
     customOrdersState.operator = operator;
     renderCustomOrders();

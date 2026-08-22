@@ -297,3 +297,44 @@ Driver shell cache from v27 to v28. Initial v28 shell installation must fetch
 every shell asset with `cache: "reload"`, preserve IndexedDB and the offline-mode
 sentinel, and delete only older `mbbs-driver-shell-` caches. The v27 soak evidence
 remains historical; v28 requires a new complete stress run before deployment.
+
+## Continuous Driver order details — 2026-08-17
+
+Driver pickup and drop-off details must render every item for every order in
+one continuous vertical view. A long first order must not hide later items
+behind an order-specific page while subsequent orders remain visible. Drop-off
+delivery instructions remain first, followed by all order cards and items in
+route order. The Driver content area supplies the only scrolling behavior; no
+item-page state, previous/next controls, or stop-detail pager remains.
+
+This display-only change keeps the Driver client/server protocol version at
+`2026.08.12.3`, advances the atomic shell asset token to
+`20260817-driver-continuous-orders-v1`, and advances the scoped Driver shell
+cache from v28 to v29. The v28 stress evidence remains historical and does not
+validate v29. Deployment remains explicitly out of scope until the required
+release verification is selected and completed.
+
+## Future plan execution boundary — 2026-08-18
+
+A future confirmed route may be displayed and protected for offline preview,
+but no Driver Start may be recorded before its plan date in
+`America/Toronto`. The server enforces the boundary before ordinary offline
+application and ordinary online side effects, and the shared persistence
+boundary also protects BIN and any internal caller. Current-day execution and
+delayed past-day offline replay remain available.
+
+The Driver client blocks route-recording controls and refuses to enqueue a
+future `job_started` event. This change keeps the Driver client/server protocol
+version at `2026.08.12.3`, advances the atomic asset token to
+`20260818-driver-plan-date-v1`, and advances the scoped Driver shell from v29
+to v30. Existing v29 evidence remains historical; the focused v30 policy,
+cache, offline-client, client-version, and photo-integrity gauntlets are the
+release evidence for this boundary. Deployment remains a separate operation.
+
+The origin-scoped iOS Chrome emergency reset keeps the Driver protocol version
+at `2026.08.12.3`, advances the atomic asset token to
+`20260818-driver-site-reset-v2`, and advances the scoped Driver shell from v31
+to v32. `/reset-driver` remains outside the `/driver` service-worker scope so a
+stale worker cannot prevent the destructive online recovery page from loading.
+The PWA advertises that recovery page only from its version-update-required
+screen; login and ordinary status/repair UI do not render the reset control.

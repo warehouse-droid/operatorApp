@@ -24,6 +24,7 @@ const EXPECTED_FLAGS = Object.freeze([
   "driver_yard_dependency_soft_mode",
   "operator_customer_pickup_photo_required",
   "sales_stock_request_over_availability",
+  "special_stock_request_workflow",
   "mbt_enabled",
   "mbt_master_data",
   "mbt_asset_management",
@@ -115,6 +116,7 @@ test("P3-F29 Admin gate inventory is private, complete, and keeps live integrati
   assert.deepEqual(allowed.payload.gates.map(({ flagKey }) => flagKey), EXPECTED_FLAGS);
   assert.equal(gate(allowed.payload, "driver_offline_mode").environmentAllowed, true);
   assert.equal(gate(allowed.payload, "operator_customer_pickup_photo_required").environmentAllowed, true);
+  assert.equal(gate(allowed.payload, "special_stock_request_workflow").environmentAllowed, true);
   assert.equal(gate(allowed.payload, "mbt_enabled").environmentAllowed, true);
   assert.equal(gate(allowed.payload, "mbt_master_data").environmentAllowed, false);
   assert.equal(gate(allowed.payload, "mbt_customer_sync").locked, true);

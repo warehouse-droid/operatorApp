@@ -1,6 +1,7 @@
 export {
   clearCustomerPickupDraft,
   confirmCustomerPickupLine,
+  confirmCustomerPickupLines,
   findCustomerPickupOrder,
   isPendingApprovalStatus,
   isPickupDeliveryMethod,

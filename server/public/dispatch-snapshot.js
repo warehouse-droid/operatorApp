@@ -224,12 +224,15 @@ async function restoreSelectedSnapshot() {
   snapshotLoading = true;
   renderSnapshotApp();
   try {
+    const current = snapshots.find((snapshot) => snapshot.current) || {};
     const restored = await snapshotApi(`/api/dispatch/plan-snapshots/${encodeURIComponent(selectedSnapshot.id)}/restore`, {
       method: "POST",
       body: JSON.stringify({
         planDate: selectedSnapshot.planDate,
         sessionId: snapshotSessionId,
         editLeaseToken: snapshotLeaseToken,
+        expectedRevision: current.revision,
+        expectedDigest: current.digest || "",
         audit: { sessionId: snapshotSessionId }
       })
     });

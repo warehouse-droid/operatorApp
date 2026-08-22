@@ -431,16 +431,89 @@ try {
     check(JSON.stringify(lifecycleBeforeReview.rows[0]) === JSON.stringify(lifecycleAfterReview.rows[0]),
       "SCM review must not change Sales Order planning or operator lifecycle fields.",
       { before: lifecycleBeforeReview.rows[0], after: lifecycleAfterReview.rows[0] });
-    await reopenTransferDependencyCandidate({ salesOrderId, operatorId: "dependency-harness" });
-    check((await listTransferDependencyCandidates({ salesOrderId, reviewStatus: "open" })).length === 1,
-      "Undo Review should return the shortage to the Open queue.");
-
-    await reviewTransferDependencyCandidate({ salesOrderId, operatorId: "dependency-harness" });
+    await query("UPDATE sales_orders SET fulfillment_status = 'partial_fulfilled' WHERE netsuite_id = $1", [salesOrderId]);
     await query("UPDATE sales_order_lines SET netsuite_backordered_qty = 9 WHERE id = $1", [line.rows[0].id]);
-    const reopenedAfterChange = await listTransferDependencyCandidates({ salesOrderId, reviewStatus: "open" });
-    check(reopenedAfterChange.length === 1 && reopenedAfterChange[0].reviewed === false,
-      "A material shortage-signature change must automatically reopen a reviewed order.",
-      { reopenedAfterChange });
+    const openAfterPartialFulfillment = await listTransferDependencyCandidates({ salesOrderId, reviewStatus: "open" });
+    const completedAfterPartialFulfillment = await listTransferDependencyCandidates({ salesOrderId, reviewStatus: "completed" });
+    const durableReview = await query(
+      `SELECT status, reopened_by, reopened_at
+         FROM scm_transfer_dependency_reviews
+        WHERE sales_order_id = $1`,
+      [salesOrderId]
+    );
+    check(openAfterPartialFulfillment.length === 0
+      && completedAfterPartialFulfillment.length === 1
+      && completedAfterPartialFulfillment[0].completionType === "reviewed_no_transfer"
+      && durableReview.rows[0]?.status === "reviewed"
+      && durableReview.rows[0]?.reopened_by === null
+      && durableReview.rows[0]?.reopened_at === null,
+    "Partial fulfillment and a changed NetSuite shortage must not automatically reopen Reviewed - No Transfer.", {
+      openAfterPartialFulfillment,
+      completedAfterPartialFulfillment,
+      durableReview: durableReview.rows[0]
+    });
+
+    await query(
+      `UPDATE scm_transfer_dependency_reviews
+          SET status = 'stale', reopened_by = 'system', reopened_at = now(), updated_at = now()
+        WHERE sales_order_id = $1`,
+      [salesOrderId]
+    );
+    const recoveredLegacyReview = await listTransferDependencyCandidates({ salesOrderId, reviewStatus: "completed" });
+    check(recoveredLegacyReview.length === 1
+      && recoveredLegacyReview[0].reviewed === true
+      && recoveredLegacyReview[0].completionType === "reviewed_no_transfer",
+    "A legacy No Transfer review automatically reopened by the old system policy must recover into Completed.",
+    { recoveredLegacyReview });
+
+    await query(
+      `INSERT INTO dispatch_order_completion_events (
+         order_kind, order_ref, dispatch_completed_at,
+         completion_evidence_type, completion_evidence_id,
+         actor_type, actor_id
+       ) VALUES ('SO', $1, now(), 'driver_job', $2, 'driver', 'dependency-harness')`,
+      [salesOrderRef, `dependency-harness-completion-${suffix}`]
+    );
+    const completedReviewHistory = await listTransferDependencyCandidates({ salesOrderId, reviewStatus: "completed" });
+    check(completedReviewHistory.length === 1
+      && completedReviewHistory[0].dispatchCompleted === true
+      && completedReviewHistory[0].completionType === "reviewed_no_transfer",
+    "Dispatch completion must suppress Open work without erasing No Transfer review history.",
+    { completedReviewHistory });
+
+    await query(
+      `UPDATE scm_transfer_dependency_reviews
+          SET status = 'stale', reopened_by = NULL, reopened_at = now(), updated_at = now()
+        WHERE sales_order_id = $1`,
+      [salesOrderId]
+    );
+    check((await listTransferDependencyCandidates({ salesOrderId, reviewStatus: "all" })).length === 0,
+      "An unreviewed Dispatch-completed shortage must remain suppressed from Auto Transfer Open and search.");
+    await query(
+      `UPDATE scm_transfer_dependency_reviews
+          SET reopened_by = 'system', updated_at = now()
+        WHERE sales_order_id = $1`,
+      [salesOrderId]
+    );
+
+    await reopenTransferDependencyCandidate({ salesOrderId, operatorId: "dependency-harness" });
+    const explicitlyReopened = await listTransferDependencyCandidates({ salesOrderId, reviewStatus: "open" });
+    const explicitReviewState = await query(
+      `SELECT status, reopened_by
+         FROM scm_transfer_dependency_reviews
+        WHERE sales_order_id = $1`,
+      [salesOrderId]
+    );
+    check(explicitlyReopened.length === 1
+      && explicitlyReopened[0].reviewed === false
+      && explicitlyReopened[0].explicitlyReopened === true
+      && explicitReviewState.rows[0]?.status === "stale"
+      && explicitReviewState.rows[0]?.reopened_by === "dependency-harness",
+    "Only an explicit user Reopen action may return Reviewed - No Transfer to Open.", {
+      explicitlyReopened,
+      explicitReviewState: explicitReviewState.rows[0]
+    });
+    await query("UPDATE sales_orders SET fulfillment_status = 'open' WHERE netsuite_id = $1", [salesOrderId]);
     await query("UPDATE sales_order_lines SET netsuite_backordered_qty = 10 WHERE id = $1", [line.rows[0].id]);
 
     const savedNetSuiteConfig = { ...config.netsuite };
@@ -2707,6 +2780,14 @@ try {
               receiving_status = 'open', received_at = null
         WHERE netsuite_id = $1`,
       [dependency.transferOrderId]
+    );
+    await query(
+      `UPDATE dispatch_actual_arrival_runs
+          SET trigger_job_record_id = NULL
+        WHERE trigger_job_record_id IN (
+          SELECT id FROM driver_job_records WHERE job_id = $1
+        )`,
+      [yardDropJobId]
     );
     await query("DELETE FROM driver_job_records WHERE job_id = $1", [yardDropJobId]);
     await query(

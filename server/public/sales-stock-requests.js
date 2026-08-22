@@ -24,6 +24,8 @@ const salesStockState = {
   error: "",
   eventSource: null,
   refreshTimer: null,
+  refreshPending: false,
+  dataSignature: "",
   loadGeneration: 0
 };
 
@@ -279,11 +281,14 @@ function salesStockNewLine(overrides = {}) {
     salesQty: "",
     availability: null,
     loadingAvailability: false,
+    availabilityGeneration: 0,
+    searchGeneration: 0,
     ...overrides
   };
 }
 
 function salesStockStartNew() {
+  if (salesStockState.loading || !salesStockState.yards.length) return;
   salesStockState.composer = {
     requestId: null,
     expectedRevision: null,
@@ -294,6 +299,25 @@ function salesStockStartNew() {
   };
   salesStockState.error = "";
   renderSalesStockRequests();
+}
+
+function salesStockSupportedDestinationLocationId(value) {
+  const locationId = Number(value);
+  return Number.isInteger(locationId)
+    && salesStockState.yards.some((yard) => Number(yard.locationId) === locationId)
+    ? locationId
+    : null;
+}
+
+function salesStockReconcileNewComposerDestination() {
+  const composer = salesStockState.composer;
+  if (!composer || composer.requestId || salesStockSupportedDestinationLocationId(composer.destinationLocationId)) return;
+  const destinationLocationId = salesStockSupportedDestinationLocationId(salesStockState.yards[0]?.locationId);
+  if (!destinationLocationId) return;
+  composer.destinationLocationId = String(destinationLocationId);
+  for (const line of composer.lines || []) {
+    if (Number(line.sourceLocationId) === destinationLocationId) line.sourceLocationId = "";
+  }
 }
 
 function salesStockStartEdit() {
@@ -376,10 +400,11 @@ function salesStockComposerLine(line, index) {
 function salesStockComposer() {
   const composer = salesStockState.composer;
   const singleYard = salesStockState.yards.length === 1;
+  const supportedDestinationLocationId = salesStockSupportedDestinationLocationId(composer.destinationLocationId);
   return `<div class="stock-request-heading"><div><h2>${composer.requestId ? salesStockT("salesStock.editTitle", "Edit stock request") : salesStockT("salesStock.newTitle", "New regular stock request")}</h2><p>${composer.partial ? salesStockT("salesStock.returnedOnly", "Only lines returned by SCM are unlocked.") : salesStockT("salesStock.multiLineHint", "One request can contain multiple independently sourced items.")}</p></div><button data-sales-stock-action="close-composer" type="button">${salesStockT("salesStock.close", "Close")}</button></div>
     <form class="stock-request-form" data-sales-stock-form>
       <div class="stock-request-form-head">
-        <label><span>${salesStockT("salesStock.yourDestination", "Your destination yard")}</span><select data-sales-stock-destination ${singleYard || composer.partial ? "disabled" : ""}>${salesStockState.yards.map((yard) => `<option value="${Number(yard.locationId)}" ${String(composer.destinationLocationId) === String(yard.locationId) ? "selected" : ""}>${salesStockEscape(yard.yardCode)}</option>`).join("")}</select></label>
+        <label><span>${salesStockT("salesStock.yourDestination", "Your destination yard")}</span><select data-sales-stock-destination ${singleYard || composer.partial ? "disabled" : ""}>${supportedDestinationLocationId ? "" : `<option value="" selected>${salesStockT("salesStock.selectDestinationYard", "Select destination yard")}</option>`}${salesStockState.yards.map((yard) => `<option value="${Number(yard.locationId)}" ${supportedDestinationLocationId === Number(yard.locationId) ? "selected" : ""}>${salesStockEscape(yard.yardCode)}</option>`).join("")}</select></label>
         <div class="stock-request-notice">${salesStockT("salesStock.availabilityNotice", "Availability is refreshed from NetSuite through the backend when an item is selected. Submitting does not reserve inventory; SCM conversion does.")}</div>
         ${salesStockState.allowOverAvailability ? `<div class="stock-request-notice stock-request-availability-override"><strong>${salesStockT("salesStock.overAvailabilityEnabled", "Admin override enabled:")}</strong> ${salesStockT("salesStock.overAvailabilityHelp", "You may request more than this yard currently has. SCM can convert the full requested quantity; the shortage will remain visible as a Transfer Order backorder.")}</div>` : ""}
       </div>
@@ -394,17 +419,53 @@ function salesStockComposer() {
 
 function salesStockFocusSnapshot() {
   const active = document.activeElement;
-  if (!active || !salesStockRequestApp.contains(active) || !active.matches("[data-sales-stock-search]")) return null;
-  return { selectionStart: active.selectionStart, selectionEnd: active.selectionEnd };
+  if (!active || !salesStockRequestApp.contains(active)) return null;
+  let selector = "";
+  if (active.matches("[data-sales-stock-search]")) {
+    selector = "[data-sales-stock-search]";
+  } else if (active.matches("[data-sales-stock-remarks]")) {
+    selector = "[data-sales-stock-remarks]";
+  } else if (active.matches("[data-sales-stock-destination]")) {
+    selector = "[data-sales-stock-destination]";
+  } else if (active.matches("[data-sales-stock-field]")) {
+    const line = active.closest("[data-sales-stock-line]");
+    if (line) {
+      selector = `[data-sales-stock-line="${CSS.escape(line.dataset.salesStockLine)}"] [data-sales-stock-field="${CSS.escape(active.dataset.salesStockField)}"]`;
+    }
+  }
+  if (!selector) return null;
+  return {
+    selector,
+    selectionStart: active.selectionStart,
+    selectionEnd: active.selectionEnd
+  };
 }
 
 function salesStockRestoreFocus(snapshot) {
   if (!snapshot) return;
-  const input = salesStockRequestApp.querySelector("[data-sales-stock-search]");
+  const input = salesStockRequestApp.querySelector(snapshot.selector);
   input?.focus();
-  if (typeof input?.setSelectionRange === "function") {
-    input.setSelectionRange(snapshot.selectionStart ?? input.value.length, snapshot.selectionEnd ?? input.value.length);
+  if (Number.isInteger(snapshot.selectionStart) && typeof input?.setSelectionRange === "function") {
+    input.setSelectionRange(
+      snapshot.selectionStart,
+      Number.isInteger(snapshot.selectionEnd) ? snapshot.selectionEnd : snapshot.selectionStart
+    );
   }
+}
+
+function salesStockScrollSnapshot() {
+  return {
+    list: salesStockRequestApp.querySelector(".stock-request-list")?.scrollTop || 0,
+    detail: salesStockRequestApp.querySelector(".stock-request-detail")?.scrollTop || 0
+  };
+}
+
+function salesStockRestoreScroll(snapshot) {
+  if (!snapshot) return;
+  const list = salesStockRequestApp.querySelector(".stock-request-list");
+  const detail = salesStockRequestApp.querySelector(".stock-request-detail");
+  if (list) list.scrollTop = snapshot.list;
+  if (detail) detail.scrollTop = snapshot.detail;
 }
 
 function salesStockYardFilterOptions() {
@@ -417,23 +478,25 @@ function salesStockVendorFilterOptions() {
 
 function renderSalesStockRequests() {
   const focusSnapshot = salesStockFocusSnapshot();
+  const scrollSnapshot = salesStockScrollSnapshot();
+  const navigationDisabled = salesStockState.composer ? "disabled" : "";
   document.title = salesStockT("salesStock.title", "MBBS Sales Request Stock");
   salesStockRequestApp.innerHTML = `${salesStockHeader()}
     <section class="stock-request-page">
       <div class="stock-request-tabs" role="tablist" aria-label="${salesStockT("salesStock.requestType", "Stock request type")}">
         <button aria-selected="true" type="button">${salesStockT("salesStock.regular", "Regular")}</button>
-        <button disabled title="${salesStockT("salesStock.specialLater", "Special purchasing will be added in a later phase")}" type="button">${salesStockT("salesStock.specialSoon", "Special — Coming soon")}</button>
+        <button data-sales-stock-action="special" type="button" ${navigationDisabled}>${salesStockT("salesStock.special", "Special")}</button>
       </div>
       <div class="stock-request-toolbar">
         <div class="stock-request-tabs" role="tablist" aria-label="${salesStockT("salesStock.regularStatus", "Regular request status")}">
-          ${["pending", "accepted", "completed"].map((bucket) => `<button data-sales-stock-action="bucket" data-bucket="${bucket}" aria-selected="${salesStockState.bucket === bucket}" type="button">${salesStockStatusLabel(bucket)}</button>`).join("")}
+          ${["pending", "accepted", "completed"].map((bucket) => `<button data-sales-stock-action="bucket" data-bucket="${bucket}" aria-selected="${salesStockState.bucket === bucket}" type="button" ${navigationDisabled}>${salesStockStatusLabel(bucket)}</button>`).join("")}
         </div>
-        <div class="stock-request-actions"><input class="stock-request-search" data-sales-stock-search type="search" value="${salesStockEscape(salesStockState.search)}" placeholder="${salesStockT("salesStock.searchPlaceholder", "Search request or item")}" /><button class="primary" data-sales-stock-action="new" type="button">${salesStockT("salesStock.newRequest", "New request")}</button><button data-sales-stock-action="refresh" type="button">${salesStockT("salesStock.refresh", "Refresh")}</button></div>
+        <div class="stock-request-actions"><input class="stock-request-search" data-sales-stock-search type="search" value="${salesStockEscape(salesStockState.search)}" placeholder="${salesStockT("salesStock.searchPlaceholder", "Search request or item")}" ${navigationDisabled} /><button class="primary" data-sales-stock-action="new" type="button" ${salesStockState.loading || !salesStockState.yards.length || salesStockState.composer ? "disabled" : ""}>${salesStockT("salesStock.newRequest", "New request")}</button><button data-sales-stock-action="refresh" type="button" ${navigationDisabled}>${salesStockT("salesStock.refresh", "Refresh")}</button></div>
         <div class="stock-request-filters">
-          <label><span>${salesStockT("salesStock.itemVendor", "Item vendor")}</span><select name="vendor" data-sales-stock-filter="vendorFilter"><option value="">${salesStockT("salesStock.allVendors", "All vendors")}</option>${salesStockVendorFilterOptions()}</select></label>
-          <label><span>${salesStockT("salesStock.requestDate", "Request date")}</span><input name="requestDate" data-sales-stock-filter="requestDateFilter" type="date" value="${salesStockEscape(salesStockState.requestDateFilter)}" /></label>
-          <label><span>${salesStockT("salesStock.fromYard", "From yard")}</span><select name="sourceLocationId" data-sales-stock-filter="sourceLocationFilter"><option value="">${salesStockT("salesStock.allSourceYards", "All source yards")}</option>${salesStockYardFilterOptions()}</select></label>
-          <button data-sales-stock-action="clear-filters" type="button">${salesStockT("salesStock.clearFilters", "Clear filters")}</button>
+          <label><span>${salesStockT("salesStock.itemVendor", "Item vendor")}</span><select name="vendor" data-sales-stock-filter="vendorFilter" ${navigationDisabled}><option value="">${salesStockT("salesStock.allVendors", "All vendors")}</option>${salesStockVendorFilterOptions()}</select></label>
+          <label><span>${salesStockT("salesStock.requestDate", "Request date")}</span><input name="requestDate" data-sales-stock-filter="requestDateFilter" type="date" value="${salesStockEscape(salesStockState.requestDateFilter)}" ${navigationDisabled} /></label>
+          <label><span>${salesStockT("salesStock.fromYard", "From yard")}</span><select name="sourceLocationId" data-sales-stock-filter="sourceLocationFilter" ${navigationDisabled}><option value="">${salesStockT("salesStock.allSourceYards", "All source yards")}</option>${salesStockYardFilterOptions()}</select></label>
+          <button data-sales-stock-action="clear-filters" type="button" ${navigationDisabled}>${salesStockT("salesStock.clearFilters", "Clear filters")}</button>
         </div>
       </div>
       <div class="stock-request-feedback">
@@ -445,6 +508,7 @@ function renderSalesStockRequests() {
       </div>
     </section>`;
   salesStockRestoreFocus(focusSnapshot);
+  salesStockRestoreScroll(scrollSnapshot);
 }
 
 async function salesStockLoadDetail(id) {
@@ -458,10 +522,16 @@ async function salesStockLoadDetail(id) {
   salesStockState.detail = detail;
 }
 
-async function salesStockLoad({ preserveSelection = true } = {}) {
+async function salesStockLoad({ preserveSelection = true, background = false } = {}) {
+  if (salesStockState.composer) {
+    salesStockState.refreshPending = true;
+    return false;
+  }
   const generation = ++salesStockState.loadGeneration;
-  salesStockState.loading = true;
-  renderSalesStockRequests();
+  if (!background) {
+    salesStockState.loading = true;
+    renderSalesStockRequests();
+  }
   const params = new URLSearchParams({ bucket: salesStockState.bucket, limit: "100" });
   if (salesStockState.search.trim()) params.set("search", salesStockState.search.trim());
   if (salesStockState.vendorFilter) params.set("vendor", salesStockState.vendorFilter);
@@ -478,19 +548,58 @@ async function salesStockLoad({ preserveSelection = true } = {}) {
     ? await salesStockApi(`/api/sales/stock-requests/${encodeURIComponent(selectedId)}`)
     : null;
   if (generation !== salesStockState.loadGeneration) return;
-  salesStockState.yards = payload.yards || [];
-  salesStockState.filterOptions = payload.filterOptions || { vendors: [], sourceYards: [] };
-  salesStockState.allowOverAvailability = payload.allowOverAvailability === true;
-  salesStockState.availabilityGateRevision = payload.revision === null || payload.revision === undefined
+  const filterOptions = payload.filterOptions || { vendors: [], sourceYards: [] };
+  const allowOverAvailability = payload.allowOverAvailability === true;
+  const availabilityGateRevision = payload.revision === null || payload.revision === undefined
     ? null
     : Number(payload.revision);
+  const dataSignature = JSON.stringify({
+    yards: payload.yards || [],
+    filterOptions,
+    allowOverAvailability,
+    availabilityGateRevision,
+    requests,
+    selectedId,
+    detail
+  });
+  if (salesStockState.composer) {
+    const destinationBeforeYardRefresh = salesStockSupportedDestinationLocationId(
+      salesStockState.composer.destinationLocationId
+    );
+    salesStockState.yards = payload.yards || [];
+    salesStockState.filterOptions = filterOptions;
+    salesStockState.allowOverAvailability = allowOverAvailability;
+    salesStockState.availabilityGateRevision = availabilityGateRevision;
+    salesStockState.requests = requests;
+    salesStockState.selectedId = selectedId;
+    salesStockState.detail = detail;
+    salesStockState.dataSignature = dataSignature;
+    if (selectedId) localStorage.setItem("mbbs.sales.stockRequests.selected", String(selectedId));
+    salesStockReconcileNewComposerDestination();
+    const destinationAfterYardRefresh = salesStockSupportedDestinationLocationId(
+      salesStockState.composer.destinationLocationId
+    );
+    salesStockState.loading = false;
+    salesStockState.refreshPending = true;
+    if (destinationBeforeYardRefresh !== destinationAfterYardRefresh) renderSalesStockRequests();
+    return false;
+  }
+  const dataChanged = dataSignature !== salesStockState.dataSignature;
+  salesStockState.yards = payload.yards || [];
+  salesStockReconcileNewComposerDestination();
+  salesStockState.filterOptions = filterOptions;
+  salesStockState.allowOverAvailability = allowOverAvailability;
+  salesStockState.availabilityGateRevision = availabilityGateRevision;
   salesStockState.requests = requests;
   salesStockState.selectedId = selectedId;
   salesStockState.detail = detail;
+  salesStockState.dataSignature = dataSignature;
+  salesStockState.refreshPending = false;
   if (selectedId) localStorage.setItem("mbbs.sales.stockRequests.selected", String(selectedId));
   salesStockState.loading = false;
   salesStockState.error = "";
-  renderSalesStockRequests();
+  if (!background || dataChanged) renderSalesStockRequests();
+  return dataChanged;
 }
 
 function salesStockComposerLineElement(target) {
@@ -499,20 +608,22 @@ function salesStockComposerLineElement(target) {
   return salesStockState.composer.lines.find((line) => line.key === element.dataset.salesStockLine) || null;
 }
 
-async function salesStockSearchItems(line) {
+async function salesStockSearchItems(line, generation = line.searchGeneration) {
   const term = String(line.itemSearch || "").trim();
   if (term.length < 2) {
-    salesStockState.suggestions.delete(line.key);
-    return renderSalesStockRequests();
+    if (generation !== line.searchGeneration) return;
+    if (salesStockState.suggestions.delete(line.key)) renderSalesStockRequests();
+    return;
   }
   try {
     const payload = await salesStockApi(`/api/sales/stock-request-items?search=${encodeURIComponent(term)}&limit=20`);
+    if (generation !== line.searchGeneration
+        || String(line.itemSearch || "").trim() !== term
+        || !salesStockState.composer?.lines.includes(line)) return;
     salesStockState.suggestions.set(line.key, payload.items || []);
     renderSalesStockRequests();
-    const input = salesStockRequestApp.querySelector(`[data-sales-stock-line="${CSS.escape(line.key)}"] [data-sales-stock-field="itemSearch"]`);
-    input?.focus();
-    input?.setSelectionRange(input.value.length, input.value.length);
   } catch (error) {
+    if (generation !== line.searchGeneration || !salesStockState.composer?.lines.includes(line)) return;
     salesStockState.error = error.message;
     renderSalesStockRequests();
   }
@@ -521,13 +632,22 @@ async function salesStockSearchItems(line) {
 async function salesStockChooseItem(line, itemId) {
   const item = (salesStockState.suggestions.get(line.key) || []).find((candidate) => Number(candidate.itemId) === Number(itemId));
   if (!item) return;
+  const composer = salesStockState.composer;
+  const availabilityGeneration = Number(line.availabilityGeneration || 0) + 1;
+  line.availabilityGeneration = availabilityGeneration;
+  const isCurrentSelection = () => salesStockState.composer === composer
+    && composer?.lines.includes(line)
+    && line.availabilityGeneration === availabilityGeneration;
   line.item = item;
   line.itemSearch = item.itemCode;
+  line.searchGeneration = Number(line.searchGeneration || 0) + 1;
+  window.clearTimeout(line.searchTimer);
   line.loadingAvailability = true;
   salesStockState.suggestions.delete(line.key);
   renderSalesStockRequests();
   try {
     const availability = await salesStockApi(`/api/sales/stock-request-items/${Number(item.itemId)}/availability/refresh`, { method: "POST" });
+    if (!isCurrentSelection()) return;
     line.item = availability.item;
     line.itemSearch = availability.item.itemCode;
     line.availability = availability;
@@ -536,11 +656,14 @@ async function salesStockChooseItem(line, itemId) {
       line.sourceLocationId = String(candidates.sort((left, right) => Number(right.requestableAvailable) - Number(left.requestableAvailable))[0]?.locationId || "");
     }
   } catch (error) {
+    if (!isCurrentSelection()) return;
     salesStockState.error = error.message;
     line.availability = null;
   } finally {
-    line.loadingAvailability = false;
-    renderSalesStockRequests();
+    if (isCurrentSelection()) {
+      line.loadingAvailability = false;
+      renderSalesStockRequests();
+    }
   }
 }
 
@@ -565,11 +688,16 @@ function salesStockLinePayload(line) {
 
 async function salesStockSaveComposer() {
   const composer = salesStockState.composer;
+  const visibleDestinationLocationId = salesStockRequestApp.querySelector("[data-sales-stock-destination]")?.value;
+  if (visibleDestinationLocationId !== undefined) composer.destinationLocationId = visibleDestinationLocationId;
+  salesStockState.error = "";
   salesStockState.saving = true;
   renderSalesStockRequests();
   try {
+    const destinationLocationId = salesStockSupportedDestinationLocationId(composer.destinationLocationId);
+    if (!destinationLocationId) throw new Error("Select a valid supported destination yard.");
     const body = {
-      destinationLocationId: Number(composer.destinationLocationId),
+      destinationLocationId,
       remarks: composer.remarks,
       lines: composer.lines.map(salesStockLinePayload),
       ...(composer.requestId ? { expectedRevision: composer.expectedRevision } : {})
@@ -579,12 +707,21 @@ async function salesStockSaveComposer() {
       : await salesStockApi("/api/sales/stock-requests", { method: "POST", body: JSON.stringify(body) });
     salesStockState.selectedId = saved.id;
     salesStockState.composer = null;
+    salesStockState.suggestions.clear();
+    salesStockState.refreshPending = false;
+    window.clearTimeout(salesStockState.refreshTimer);
     await salesStockLoad({ preserveSelection: true });
   } catch (error) {
+    salesStockState.loading = false;
     salesStockState.error = error.message;
   } finally {
     salesStockState.saving = false;
-    renderSalesStockRequests();
+    if (salesStockState.composer || salesStockState.error) {
+      renderSalesStockRequests();
+    } else if (salesStockState.refreshPending) {
+      salesStockState.refreshPending = false;
+      await salesStockLoad({ preserveSelection: true, background: true });
+    }
   }
 }
 
@@ -609,12 +746,16 @@ salesStockRequestApp.addEventListener("input", (event) => {
   line[field] = event.target.value;
   if (field === "itemSearch") {
     if (line.item && line.item.itemCode !== line.itemSearch) {
+      line.availabilityGeneration = Number(line.availabilityGeneration || 0) + 1;
+      line.loadingAvailability = false;
       line.item = null;
       line.availability = null;
       line.sourceLocationId = "";
     }
     window.clearTimeout(line.searchTimer);
-    line.searchTimer = window.setTimeout(() => salesStockSearchItems(line), 250);
+    line.searchGeneration = Number(line.searchGeneration || 0) + 1;
+    const searchGeneration = line.searchGeneration;
+    line.searchTimer = window.setTimeout(() => salesStockSearchItems(line, searchGeneration), 250);
   }
 });
 
@@ -651,11 +792,19 @@ salesStockRequestApp.addEventListener("click", async (event) => {
   if (!button) return;
   const action = button.dataset.salesStockAction;
   try {
+    if (action === "special") return window.MBBSSalesSpecialStock?.open({
+      operator: salesStockState.operator,
+      yards: salesStockState.yards
+    });
     if (action === "new") return salesStockStartNew();
     if (action === "close-composer") {
+      const refreshPending = salesStockState.refreshPending;
       salesStockState.composer = null;
       salesStockState.suggestions.clear();
-      return renderSalesStockRequests();
+      salesStockState.refreshPending = false;
+      renderSalesStockRequests();
+      if (refreshPending) await salesStockLoad({ preserveSelection: true, background: true });
+      return;
     }
     if (action === "add-line") {
       salesStockState.composer.lines.push(salesStockNewLine());
@@ -718,8 +867,15 @@ function salesStockConnectEvents() {
     let event;
     try { event = JSON.parse(message.data || "{}"); } catch { return; }
     if (event.type !== "stock-request.updated" && event.type !== "dispatch.orders.updated" && event.type !== "driver.job.completed") return;
+    if (salesStockState.composer || salesStockState.saving) {
+      salesStockState.refreshPending = true;
+      return;
+    }
     window.clearTimeout(salesStockState.refreshTimer);
-    salesStockState.refreshTimer = window.setTimeout(() => salesStockLoad({ preserveSelection: true }).catch(() => {}), 400);
+    salesStockState.refreshTimer = window.setTimeout(() => salesStockLoad({
+      preserveSelection: true,
+      background: true
+    }).catch(() => {}), 400);
   });
 }
 

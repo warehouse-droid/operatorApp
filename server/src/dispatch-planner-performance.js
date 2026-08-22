@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { applyDispatchPlanDelta } from "./dispatch-planner-optimization.js";
 
 const PLAN_OWNED_TYPES = new Set(["CO", "CUSTOM", "GROUP", "SPLIT"]);
 const PHYSICAL_STOP_TYPES = new Set([
@@ -557,6 +558,23 @@ function replacePlan(plan, payload = {}) {
 
 function commandPatch(plan, command = {}) {
   const payload = command.payload || {};
+  if (payload.planDelta && typeof payload.planDelta === "object" && !Array.isArray(payload.planDelta)) {
+    const patched = applyDispatchPlanDelta(plan, payload.planDelta);
+    plan.orders = patched.orders || [];
+    plan.trucks = patched.trucks || [];
+    plan.summary = patched.summary || {};
+    for (const [key, value] of Object.entries(patched)) {
+      if (!["orders", "trucks", "summary", "revision"].includes(key)) {plan[key] = value;}
+    }
+    return {
+      deltaApplied: true,
+      actionName: text(payload.actionName || command.type || command.commandType) || "dispatch_plan_mutation",
+      affectedOrderRefs: [...new Set((payload.affectedOrderRefs || []).map(text).filter(Boolean))],
+      operatorAlertRefs: [...new Set((payload.operatorAlertRefs || []).map(text).filter(Boolean))],
+      refreshOrderPool: payload.refreshOrderPool === true,
+      safeUngroupTargets: clone(Array.isArray(payload.safeUngroupTargets) ? payload.safeUngroupTargets : [])
+    };
+  }
   switch (text(command.type || command.commandType)) {
     case "remove_order": {
       const ref = text(payload.orderRef);

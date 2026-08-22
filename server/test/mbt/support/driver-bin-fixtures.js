@@ -3,13 +3,38 @@ import crypto from "node:crypto";
 import { query } from "../../../src/db.js";
 import {
   binAssignmentCommand,
-  binDispatchPlanDate,
   createBinDispatchFixture,
   enabledBinDispatchBoundary
 } from "./bin-dispatch-fixtures.js";
 
 const binDispatch = await import("../../../src/mbt/bin-dispatch-service.js");
-let nextPlanDateOffset = 2_000 + crypto.randomInt(0, 2_000);
+
+/**
+ * Driver execution tests must use a plan date that the production early-start
+ * guard permits. Keep the dates old and database-selected so the unique
+ * Dispatch-plan date constraint remains deterministic across isolated files.
+ */
+export async function availableDriverExecutionPlanDate() {
+  const result = await query(
+    `SELECT candidate::date::text AS plan_date
+       FROM generate_series(
+         DATE '2000-01-01',
+         (now() AT TIME ZONE 'America/Toronto')::date - 1,
+         INTERVAL '1 day'
+       ) AS candidate
+      WHERE NOT EXISTS (
+        SELECT 1
+          FROM dispatch_plans plan
+         WHERE plan.plan_date = candidate::date
+      )
+      ORDER BY candidate
+      LIMIT 1`
+  );
+  if (!result.rowCount) {
+    throw new Error("No unused executable Dispatch plan date is available for the Driver fixture.");
+  }
+  return String(result.rows[0].plan_date);
+}
 
 /**
  * Create one assigned, confirmed, entirely synthetic initial-delivery leg and
@@ -18,13 +43,17 @@ let nextPlanDateOffset = 2_000 + crypto.randomInt(0, 2_000);
  * not copy that state into its expectations.
  *
  * @param {string} label
- * @param {{includePilotScope?: boolean}} [options]
+ * @param {{includePilotScope?: boolean, planDate?: string | null}} [options]
  */
-export async function createAssignedDriverBinFixture(label, { includePilotScope = true } = {}) {
+export async function createAssignedDriverBinFixture(label, {
+  includePilotScope = true,
+  planDate = null
+} = {}) {
   const fixture = await createBinDispatchFixture({
     label: `driver-${label}`,
-    planDate: binDispatchPlanDate(nextPlanDateOffset++),
-    includePilotScope
+    planDate: planDate || await availableDriverExecutionPlanDate(),
+    includePilotScope,
+    pilotExpiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1_000)
   });
   const assignment = await binDispatch.assignMbtBinFrontLeg(
     binAssignmentCommand(fixture, `driver-${label}`),

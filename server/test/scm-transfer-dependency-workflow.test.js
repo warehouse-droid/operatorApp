@@ -333,3 +333,90 @@ test("created and printed cards remain quantity-editable and expose reprint", ()
   const lineInput = markup.match(/<input[^>]*data-proposal-unit="pallets"[^>]*>/)?.[0] || "";
   assert(lineInput && !/\bdisabled\b/.test(lineInput), "created material quantities must remain editable before execution starts");
 });
+
+test("draft proposals expose an explicit source-stock backorder control that defaults off", () => {
+  const ui = loadDependencyUi();
+  const base = {
+    id: 937,
+    mode: "yard_replenishment",
+    fromLocationId: 15,
+    fromLocation: "12441",
+    toLocationId: 1,
+    toLocation: "3445",
+    creationStatus: "draft",
+    palletCalculationComplete: true,
+    palletQuantityOverridden: false,
+    palletTransferQuantity: 1,
+    calculatedPalletQuantity: 1,
+    palletItemId: 1784,
+    palletItemName: "PALLET",
+    lines: [{
+      id: 1117,
+      salesLineId: 272392,
+      itemId: 1363,
+      itemName: "UNI-UCARA-ST-STDB",
+      sku: "UNI-UCARA-ST-STDB",
+      unit: "PC",
+      proposedQuantity: 108,
+      quantities: { pallets: 1, layers: 0, sections: 0, pieces: 0, salesQty: 0 },
+      conversions: { pallets: 108, layers: 0, sections: 0, pieces: 1 }
+    }]
+  };
+  const protectedMarkup = ui.renderProposal({ ...base, allowSourceBackorder: false });
+  const protectedInput = protectedMarkup.match(/<input[^>]*data-proposal-field="allowSourceBackorder"[^>]*>/u)?.[0] || "";
+  assert(protectedInput, "every editable draft needs the explicit source-backorder control");
+  assert.doesNotMatch(protectedInput, /\bchecked\b/u, "new proposals must remain protected by default");
+
+  const allowedMarkup = ui.renderProposal({ ...base, allowSourceBackorder: true });
+  const allowedInput = allowedMarkup.match(/<input[^>]*data-proposal-field="allowSourceBackorder"[^>]*>/u)?.[0] || "";
+  assert.match(allowedInput, /\bchecked\b/u);
+  assert.match(allowedMarkup, /source stock backorder/i);
+  ui.dependencyState.inventory = {
+    items: [
+      { itemId: 1363, balances: [{ locationId: 15, quantityAvailable: 171, effectiveAvailable: 171 }] },
+      { itemId: 1784, balances: [{ locationId: 15, quantityAvailable: 0, effectiveAvailable: 0 }] }
+    ]
+  };
+  const shortageMarkup = ui.renderProposal({ ...base, allowSourceBackorder: true });
+  assert.match(shortageMarkup, /PALLET:\s*1 requested[^;]*0 available[^;]*1 backorder/iu,
+    "the enabled proposal must disclose its current automatic PALLET shortfall");
+  assert.match(publicSource, /allowSourceBackorder:\s*card\.querySelector/u,
+    "Save Draft and Confirm must send the explicit setting to the server");
+});
+
+test("source-stock backorder persistence is migration-backed and audited", () => {
+  const migration = fs.readFileSync(
+    new URL("../migrations/170_transfer_dependency_source_backorder.sql", import.meta.url),
+    "utf8"
+  );
+  const repository = fs.readFileSync(
+    new URL("../src/order-dependency-repository.js", import.meta.url),
+    "utf8"
+  );
+  assert.match(migration, /allow_source_backorder\s+boolean\s+NOT NULL\s+DEFAULT false/iu);
+  assert.match(repository, /allowSourceBackorder:\s*proposal\.allow_source_backorder\s*===\s*true/u);
+  assert.match(repository, /scm\.transfer_dependency\.source_backorder_updated/u);
+  const creationAudit = repository.slice(
+    repository.indexOf('action: "scm.transfer_dependency.created"'),
+    repository.indexOf("return {", repository.indexOf('action: "scm.transfer_dependency.created"'))
+  );
+  assert.match(creationAudit, /sourceBackorders:\s*validation\.sourceBackorders/u,
+    "the immutable creation audit must retain the exact authorized source shortfall");
+});
+
+test("source-stock backorder validation keeps one bulk inventory query", () => {
+  const repository = fs.readFileSync(
+    new URL("../src/order-dependency-repository.js", import.meta.url),
+    "utf8"
+  );
+  const validation = repository.slice(
+    repository.indexOf("export async function validateTransferDependencyBatchForCreation"),
+    repository.indexOf("async function transferLinesForOrder")
+  );
+  assert(validation, "the creation validator must remain present");
+  assert.equal(
+    validation.match(/await query\(/gu)?.length || 0,
+    1,
+    "source-backorder checks must reuse one set-based inventory query, never query once per item or proposal"
+  );
+});

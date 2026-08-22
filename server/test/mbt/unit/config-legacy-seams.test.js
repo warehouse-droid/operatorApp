@@ -8,6 +8,10 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const testDirectory = path.dirname(fileURLToPath(import.meta.url));
 const serverRoot = path.resolve(testDirectory, "../../..");
 const configSourcePath = path.join(serverRoot, "src/config.js");
+const dispatchPlannerOptimizationSourcePath = path.join(
+  serverRoot,
+  "src/dispatch-planner-optimization.js"
+);
 const nodeModulesPath = path.join(serverRoot, "node_modules");
 const MANAGED_ENV_KEYS = Object.freeze([
   "MBBS_ENV_FILE",
@@ -49,6 +53,10 @@ async function withIsolatedConfig(envFiles, activeEnvFile, operation) {
     await writeFile(
       path.join(fixtureRoot, "src/config.js"),
       await readFile(configSourcePath, "utf8")
+    );
+    await writeFile(
+      path.join(fixtureRoot, "src/dispatch-planner-optimization.js"),
+      await readFile(dispatchPlannerOptimizationSourcePath, "utf8")
     );
     await symlink(nodeModulesPath, path.join(fixtureRoot, "node_modules"), "dir");
     for (const [file, contents] of Object.entries(envFiles)) {

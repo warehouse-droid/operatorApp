@@ -72,11 +72,11 @@ includesAll(i18n, [
   '"operator.cameraPreviewNotReady"'
 ], "Bilingual camera strings");
 includesAll(operatorHtml, [
-  "/operator.css?v=20260810-operator-performance-v1",
+  "/operator.css?v=20260815-page-confirm-v1",
   "/vendor/quagga2/quagga.min.js?v=1.12.1",
-  "/operator.js?v=20260815-customer-pickup-photo-gate-v1"
+  "/operator.js?v=20260815-operator-page-confirm-v1"
 ], "Operator camera cache busting");
-assert.ok(serviceWorker.includes("mbbs-yard-operator-v140-customer-pickup-photo-gate-v1"), "Operator service-worker cache must advance.");
+assert.ok(serviceWorker.includes("mbbs-yard-operator-v141-page-confirm-v1"), "Operator service-worker cache must advance.");
 assert.ok(serviceWorker.includes("/vendor/quagga2/quagga.min.js?v=1.12.1"), "The offline PWA shell must cache the 1D scanner.");
 assert.match(serviceWorker, /cache\.addAll\(APP_SHELL\.map\(\(url\) => new Request\([\s\S]*?cache: "reload"/, "A fresh Operator shell must bypass stale iPhone HTTP cache entries.");
 assert.ok(server.includes('app.use("/vendor/quagga2", express.static(quaggaScannerDir))'), "Server must expose the installed 1D scanner bundle.");
@@ -93,9 +93,9 @@ assert.equal(barcodeHelpers.normalizedPickupCameraCode("[object Object]"), "");
 const quaggaHelpers = Function(`${operator.slice(barcodeHelperStart, barcodeHelperEnd)}; return { pickupQuaggaOrderCode };`)();
 assert.equal(quaggaHelpers.pickupQuaggaOrderCode([{ codeResult: { code: "SOB115348" } }]), "SOB115348");
 includesAll(serviceWorker, [
-  "mbbs-yard-operator-v140-customer-pickup-photo-gate-v1",
+  "mbbs-yard-operator-v141-page-confirm-v1",
   "/i18n.js?v=20260815-customer-pickup-photo-gate-v1",
-  "/operator.js?v=20260815-customer-pickup-photo-gate-v1",
+  "/operator.js?v=20260815-operator-page-confirm-v1",
   'url.pathname === "/driver"',
   'url.pathname.startsWith("/driver-")'
 ], "Isolated Operator service-worker cache");

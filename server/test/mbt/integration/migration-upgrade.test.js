@@ -359,9 +359,13 @@ test("F06/F16: schema-101 upgrade preserves representative legacy records and is
     assert.match(firstRunner.stdout, /Applied 163_dispatch_scm_unplan_state\.sql/);
     assert.match(firstRunner.stdout, /Applied 164_sales_order_partial_reattempt\.sql/);
     assert.match(firstRunner.stdout, /Applied 165_operator_customer_pickup_photo_gate\.sql/);
+    assert.match(firstRunner.stdout, /Applied 166_mbt_mbbs_po_vrma_vendor_route_rates\.sql/);
+    assert.match(firstRunner.stdout, /Applied 171_netsuite_delayed_status_refresh_outbox\.sql/);
+    assert.match(firstRunner.stdout, /Applied 176_special_stock_request_workflow\.sql/);
+    assert.match(firstRunner.stdout, /Applied 177_special_stock_request_two_stage_handoff\.sql/);
 
     const after = await captureLegacyState(client, ids);
-    assert.deepEqual(after, before, "Migrations 102-165 must not rewrite representative schema-101 field values.");
+    assert.deepEqual(after, before, "Migrations 102-177 must not rewrite representative schema-101 field values.");
 
     const truckCapability = await client.query(
       `SELECT bin_service_enabled, bin_slot_capacity
@@ -478,10 +482,86 @@ test("F06/F16: schema-101 upgrade preserves representative legacy records and is
       "idx_receiving_receipt_records_movement_activity"
     ]);
 
-    assert.equal(receiptsBeforeNoOp.rowCount, 165);
+    const delayedRefreshTables = await client.query(
+      `SELECT table_name
+         FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name = ANY($1::text[])
+        ORDER BY table_name`,
+      [[
+        "netsuite_delayed_status_refresh_attempts",
+        "netsuite_delayed_status_refresh_jobs"
+      ]]
+    );
+    assert.deepEqual(delayedRefreshTables.rows.map((row) => row.table_name), [
+      "netsuite_delayed_status_refresh_attempts",
+      "netsuite_delayed_status_refresh_jobs"
+    ]);
+
+    const dependencyManagementTables = await client.query(
+      `SELECT table_name
+         FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name = ANY($1::text[])
+        ORDER BY table_name`,
+      [[
+        "driver_push_subscriptions",
+        "driver_route_device_presence",
+        "scm_dependency_action_receipts",
+        "scm_dependency_change_request_devices",
+        "scm_dependency_change_requests"
+      ]]
+    );
+    assert.deepEqual(dependencyManagementTables.rows.map((row) => row.table_name), [
+      "driver_push_subscriptions",
+      "driver_route_device_presence",
+      "scm_dependency_action_receipts",
+      "scm_dependency_change_request_devices",
+      "scm_dependency_change_requests"
+    ]);
+
+    const manifestSupersedeColumns = await client.query(
+      `SELECT column_name
+         FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'driver_offline_manifests'
+          AND column_name = ANY($1::text[])
+        ORDER BY column_name`,
+      [["superseded_by_request_id", "superseded_reason"]]
+    );
+    assert.deepEqual(manifestSupersedeColumns.rows.map((row) => row.column_name), [
+      "superseded_by_request_id",
+      "superseded_reason"
+    ]);
+
+    const specialStockRequestTables = await client.query(
+      `SELECT table_name
+         FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name = ANY($1::text[])
+        ORDER BY table_name`,
+      [[
+        "sales_special_stock_cases",
+        "sales_special_stock_events",
+        "sales_special_stock_handoffs",
+        "sales_special_stock_lines",
+        "sales_special_stock_media",
+        "sales_special_stock_order_lines"
+      ]]
+    );
+    assert.deepEqual(specialStockRequestTables.rows.map((row) => row.table_name), [
+      "sales_special_stock_cases",
+      "sales_special_stock_events",
+      "sales_special_stock_handoffs",
+      "sales_special_stock_lines",
+      "sales_special_stock_media",
+      "sales_special_stock_order_lines"
+    ]);
+
+    assert.equal(receiptsBeforeNoOp.rowCount, 177);
     assert.equal(
       receiptsBeforeNoOp.rows.at(-1)?.filename,
-      "165_operator_customer_pickup_photo_gate.sql"
+      "177_special_stock_request_two_stage_handoff.sql"
     );
     assert.deepEqual(
       receiptsBeforeNoOp.rows

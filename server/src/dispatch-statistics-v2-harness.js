@@ -235,6 +235,25 @@ try {
   assert.equal(groupedStops[0].overrunMinutes, 5);
   assert.equal(groupedStops[0].pallets, 5);
   assert.deepEqual(groupedStops[0].orderRefs, ["GROUPED-SO", "GROUPED-CUSTOM"]);
+  const groupedWithDerivedArrival = dispatchStatisticStopsFromRows([
+    groupedRow({
+      actual_arrival_at: "2026-07-22T12:05:00.000Z",
+      actual_arrival_source: "samsara_gps_history",
+      actual_arrival_confidence: "high"
+    }),
+    groupedRow({
+      job_id: "JOB-V2-B-DERIVED",
+      stop_id: "GROUPED-DROP-B",
+      order_refs: ["GROUPED-CUSTOM"],
+      started_at: "2026-07-22T12:20:00.000Z",
+      completed_at: "2026-07-22T12:50:00.000Z",
+      actual_arrival_at: "2026-07-22T12:05:00.000Z",
+      actual_arrival_source: "samsara_gps_history",
+      actual_arrival_confidence: "high"
+    })
+  ]);
+  assert.equal(groupedWithDerivedArrival[0].actualMinutes, 45, "A shared derived arrival must measure one physical visit instead of summing overlapping logical rows.");
+  assert.equal(groupedWithDerivedArrival[0].pwaStartedAt, "2026-07-22T12:00:00.000Z");
   const partiallyRecordedVisit = dispatchStatisticStopsFromRows([groupedRow()]);
   assert.equal(partiallyRecordedVisit[0].status, "in_progress", "A physical visit remains in progress until every logical job is complete.");
   assert.equal(partiallyRecordedVisit[0].plannedMinutes, 45);

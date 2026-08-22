@@ -355,17 +355,37 @@
                   <input id="mbbsDirectPickupUnitPrice" type="number" min="0" step="0.01" inputmode="decimal" value="100.00" required />
                 </label>
                 <label>
-                  PO additional-drop unit price (CAD)
+                  PO/VRMA additional-stop unit price (CAD)
                   <input id="mbbsPoAdditionalDropUnitPrice" type="number" min="0" step="0.01" inputmode="decimal" value="100.00" required />
+                </label>
+                <label>
+                  Replenishment TO additional-drop unit price (CAD)
+                  <input id="mbbsToAdditionalDropUnitPrice" type="number" min="0" step="0.01" inputmode="decimal" value="100.00" required />
                 </label>
               </div>
               <dl class="mbt-policy-rules">
                 <div><dt>Sales Order</dt><dd>Charge the full distance-band price once per SO. An explicit SO group is one charge and retains every child order.</dd></div>
-                <div><dt>Transfer Order</dt><dd>Charge a replenishment TO once at the full route distance-band price. Charge a direct-pickup/drop-ship TO once at the direct-pickup unit price.</dd></div>
-                <div><dt>Purchase Order</dt><dd>PO split references sharing one business leg create one distance-band charge, allocated evenly in exact cents.</dd></div>
-                <div><dt>PO additional drops</dt><dd>Add the configured PO unit price for each distinct drop after the first.</dd></div>
-                <div><dt>Groups and loads</dt><dd>An explicit group remains one charge with child references retained. Dispatch load splits do not change any SO, TO, or PO charge.</dd></div>
+                <div><dt>Transfer Order</dt><dd>Charge a replenishment TO once at the full route distance-band price. When multiple replenishment TOs share one immutable Driver load and physical pickup, use the longest origin-to-drop distance once and add the configured price for every other distinct drop. Charge a direct-pickup/drop-ship TO once at the direct-pickup unit price.</dd></div>
+                <div><dt>Purchase Order / Vendor Return</dt><dd>Use the exact configured vendor-yard/MBBS-yard flat price. A reverse VRMA uses the same pair price. PO split references carried on the same immutable Driver load and route are allocated evenly in exact cents. A different Driver load ID is a different leg even when both display as “Load 1”. If no exact row exists, use the normal distance band.</dd></div>
+                <div><dt>Endpoint override</dt><dd>The configured flat price remains the default. When the retained route overrides an endpoint, Billing may explicitly choose the distance-band result.</dd></div>
+                <div><dt>Additional stops</dt><dd>Add the configured unit price for each distinct pickup or drop after the base two-stop pair.</dd></div>
+                <div><dt>Groups and loads</dt><dd>An explicit group remains one charge with child references retained. For ordinary PO/VRMA work, the immutable Driver load ID—not the repeated display label—defines the physical leg.</dd></div>
               </dl>
+              <section class="mbt-rate-section" aria-labelledby="mbbsVendorRouteRatesTitle">
+                <div class="mbt-section-heading">
+                  <div>
+                    <h5 id="mbbsVendorRouteRatesTitle">PO / VRMA vendor-yard prices</h5>
+                    <p>Exact local master-data pairs only. Missing pairs safely fall back to the distance bands above.</p>
+                  </div>
+                  <button id="addMbbsVendorRouteRate" type="button" class="mbt-button-secondary">Add vendor-yard price</button>
+                </div>
+                <div class="mbt-table-wrap" tabindex="0">
+                  <table aria-label="MBBS PO and VRMA vendor-yard rates">
+                    <thead><tr><th>Rate name</th><th>Display name</th><th>Vendor yard</th><th>MBBS yard</th><th>Base CAD</th><th>Action</th></tr></thead>
+                    <tbody id="mbbsVendorRouteRateRows"><tr><td colspan="6">No exact pair prices. PO and VRMA use distance bands.</td></tr></tbody>
+                  </table>
+                </div>
+              </section>
             </section>
             <div class="mbt-form-grid">
               <label id="rateCardReasonField" class="mbt-form-wide" hidden>Update note<textarea id="rateCardReason" maxlength="2000" rows="2" placeholder="Required when updating an existing draft"></textarea></label>

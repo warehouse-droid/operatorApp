@@ -292,15 +292,15 @@ for (const key of [
 }
 
 for (const asset of [
-  "/operator.css?v=20260810-operator-performance-v1",
+  "/operator.css?v=20260815-page-confirm-v1",
   "/i18n.js?v=20260815-customer-pickup-photo-gate-v1",
-  "/operator.js?v=20260815-customer-pickup-photo-gate-v1"
+  "/operator.js?v=20260815-operator-page-confirm-v1"
 ]) {
   assert.ok(html.includes(asset), `operator HTML cachebuster is missing ${asset}`);
   assert.ok(serviceWorker.includes(asset), `service worker shell is missing ${asset}`);
 }
 assert.ok(
-  serviceWorker.includes("mbbs-yard-operator-v140-customer-pickup-photo-gate-v1"),
+  serviceWorker.includes("mbbs-yard-operator-v141-page-confirm-v1"),
   "service worker cache name must retain the current driver-cache isolation version"
 );
 

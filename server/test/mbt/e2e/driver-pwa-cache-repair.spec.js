@@ -1,10 +1,33 @@
-/* global caches, indexedDB, localStorage, navigator, Response */
+/* global caches, document, indexedDB, localStorage, navigator, Response, sessionStorage */
 import { expect, test } from "./mbt-e2e-test.js";
 
-const ACTIVE_CACHE = "mbbs-driver-shell-v28";
+const ACTIVE_CACHE = "mbbs-driver-shell-v37";
 const OLD_DRIVER_CACHE = "mbbs-driver-shell-v26";
 const OPERATOR_CACHE = "mbbs-yard-operator-cache-repair-probe";
 const PROBE_DB = "mbbs-driver-cache-repair-probe";
+const HARD_RESET_CACHE = "mbbs-driver-hard-reset-cache-probe";
+const HARD_RESET_DB = "mbbs-driver-hard-reset-db-probe";
+
+test("iPhone Driver advertises hard reset only on the version-update-required screen", async ({ page }) => {
+  await page.goto("/driver");
+  const resetLink = page.locator('a[href="/reset-driver"]');
+  await expect(page.getByRole("heading", { name: "Driver Login" })).toBeVisible();
+  await expect(resetLink).toHaveCount(0);
+
+  await page.evaluate(() => {
+    localStorage.setItem("mbbs.driver.requiredPwaVersion", JSON.stringify({
+      currentVersion: "2026.08.12.99",
+      minimumVersion: "2026.08.12.99",
+      reason: "reset-discovery-e2e"
+    }));
+  });
+  await page.reload();
+
+  await expect(page.getByRole("heading", { name: "Driver PWA update required" })).toBeVisible();
+  await expect(resetLink).toHaveCount(1);
+  await expect(resetLink).toBeVisible();
+  await expect(resetLink).toHaveText("Hard reset this Driver site");
+});
 
 test("iPhone Driver cache repair preserves IndexedDB/login data and other MBBS caches", async ({ page }) => {
   test.setTimeout(90_000);
@@ -105,4 +128,75 @@ test("iPhone Driver cache repair preserves IndexedDB/login data and other MBBS c
   expect(preserved.operatorShell).toBe("preserve-operator-shell");
   expect(preserved.loginToken).toBe("cache-repair-login-probe");
   expect(preserved.probeRecord).toEqual({ value: "preserved-offline-evidence" });
+});
+
+test("iPhone Driver hard reset clears origin storage and returns to a fresh online login", async ({ page }) => {
+  test.setTimeout(90_000);
+
+  await page.goto("/driver");
+  await page.evaluate(async () => {
+    await navigator.serviceWorker.ready;
+  });
+  await page.goto("/reset-driver");
+
+  await page.evaluate(async ({ cacheName, databaseName }) => {
+    localStorage.setItem("mbbs.driver.hardResetProbe", "remove-local");
+    sessionStorage.setItem("mbbs.driver.hardResetProbe", "remove-session");
+    document.cookie = "mbbs_driver_hard_reset_probe=remove-cookie; path=/; SameSite=Lax";
+    await (await caches.open(cacheName)).put("/hard-reset-probe", new Response("remove-cache"));
+    await new Promise((resolve, reject) => {
+      const request = indexedDB.open(databaseName, 1);
+      request.onerror = () => reject(request.error);
+      request.onupgradeneeded = () => request.result.createObjectStore("records");
+      request.onsuccess = () => {
+        const database = request.result;
+        const transaction = database.transaction("records", "readwrite");
+        transaction.objectStore("records").put("remove-database", "probe");
+        transaction.oncomplete = () => {
+          database.close();
+          resolve();
+        };
+        transaction.onerror = () => reject(transaction.error);
+      };
+    });
+  }, { cacheName: HARD_RESET_CACHE, databaseName: HARD_RESET_DB });
+
+  const resetButton = page.getByRole("button", { name: "Erase site data and open fresh login" });
+  await expect(resetButton).toBeDisabled();
+  await page.getByLabel(/I confirm this device is online/u).check();
+  await expect(resetButton).toBeEnabled();
+  await Promise.all([
+    page.waitForURL(/\/driver\?site-reset=/u),
+    resetButton.click()
+  ]);
+  await expect(page.getByRole("heading", { name: "Driver Login" })).toBeVisible();
+  await page.waitForFunction(async () => {
+    const registration = await navigator.serviceWorker.getRegistration("/driver");
+    return Boolean(registration?.active || registration?.installing || registration?.waiting);
+  });
+
+  const cleared = await page.evaluate(async ({ cacheName, databaseName }) => {
+    const databases = typeof indexedDB.databases === "function"
+      ? await indexedDB.databases()
+      : [];
+    const registration = await navigator.serviceWorker.getRegistration("/driver");
+    return {
+      localProbe: localStorage.getItem("mbbs.driver.hardResetProbe"),
+      sessionProbe: sessionStorage.getItem("mbbs.driver.hardResetProbe"),
+      cookie: document.cookie,
+      staleCachePresent: (await caches.keys()).includes(cacheName),
+      staleDatabasePresent: databases.some((database) => database.name === databaseName),
+      workerScriptUrl: registration?.active?.scriptURL
+        || registration?.installing?.scriptURL
+        || registration?.waiting?.scriptURL
+        || ""
+    };
+  }, { cacheName: HARD_RESET_CACHE, databaseName: HARD_RESET_DB });
+
+  expect(cleared.localProbe).toBeNull();
+  expect(cleared.sessionProbe).toBeNull();
+  expect(cleared.cookie).not.toContain("mbbs_driver_hard_reset_probe");
+  expect(cleared.staleCachePresent).toBe(false);
+  expect(cleared.staleDatabasePresent).toBe(false);
+  expect(cleared.workerScriptUrl).toContain("20260819-driver-route-readiness-v1");
 });

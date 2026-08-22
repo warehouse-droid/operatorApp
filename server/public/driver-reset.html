@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>Reset MBBS Driver</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #073c3a;
+        color: #172328;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        min-height: 100dvh;
+        margin: 0;
+        display: grid;
+        place-items: center;
+        padding:
+          max(24px, env(safe-area-inset-top))
+          max(18px, env(safe-area-inset-right))
+          max(24px, env(safe-area-inset-bottom))
+          max(18px, env(safe-area-inset-left));
+        background: linear-gradient(160deg, #006f6b, #073c3a 72%);
+      }
+
+      main {
+        width: min(100%, 440px);
+        display: grid;
+        gap: 16px;
+        border-radius: 20px;
+        padding: 26px 22px;
+        background: #fff;
+        box-shadow: 0 24px 70px rgba(0, 0, 0, 0.36);
+      }
+
+      h1, p { margin: 0; }
+      h1 { font-size: clamp(26px, 7vw, 34px); line-height: 1.08; }
+      p { line-height: 1.48; }
+
+      .warning {
+        display: grid;
+        gap: 8px;
+        border: 2px solid #b4232d;
+        border-radius: 12px;
+        padding: 13px;
+        background: #fff0f1;
+        color: #7c1820;
+      }
+
+      .warning strong { font-size: 17px; }
+
+      label {
+        display: grid;
+        grid-template-columns: auto minmax(0, 1fr);
+        align-items: start;
+        gap: 10px;
+        border-radius: 10px;
+        padding: 12px;
+        background: #eef5f4;
+        font-weight: 750;
+        line-height: 1.4;
+      }
+
+      input { width: 22px; height: 22px; margin: 0; }
+
+      button, a {
+        min-height: 48px;
+        border-radius: 10px;
+        padding: 12px 16px;
+        font: inherit;
+        font-weight: 850;
+        text-align: center;
+      }
+
+      button {
+        border: 1px solid #b4232d;
+        background: #b4232d;
+        color: #fff;
+      }
+
+      button:disabled { opacity: 0.48; }
+
+      a {
+        display: grid;
+        place-items: center;
+        border: 1px solid #a8b7b9;
+        color: #284145;
+        text-decoration: none;
+      }
+
+      #resetStatus {
+        min-height: 24px;
+        color: #36555a;
+        font-weight: 750;
+      }
+
+      #resetStatus[data-state="error"] { color: #9c2029; }
+      small { color: #536b70; line-height: 1.4; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <p>MBBS Driver recovery</p>
+      <h1>Hard reset this Driver site</h1>
+      <div class="warning">
+        <strong>This permanently deletes this browser's MBBS site data.</strong>
+        <span>Saved routes, unsynchronized actions, photos, login sessions, IndexedDB, service workers, and all MBBS caches on this site will be removed. Other MBBS modules opened in this browser will also be signed out.</span>
+      </div>
+      <p>Use this only while connected to the internet, after Reload and Repair have failed, and only when no offline evidence needs recovery.</p>
+      <label>
+        <input id="resetConfirmation" type="checkbox" />
+        <span>I confirm this device is online and any unsynchronized Driver work may be permanently discarded.</span>
+      </label>
+      <button id="resetDriverSite" type="button" disabled>Erase site data and open fresh login</button>
+      <a href="/driver">Cancel and return to Driver</a>
+      <p id="resetStatus" role="status" aria-live="assertive"></p>
+      <small>A website cannot erase Chrome's browsing-history list. This reset removes the site storage and caches that affect Driver login and application versions, and replaces this recovery page in the current tab.</small>
+    </main>
+    <script>
+      (() => {
+        "use strict";
+
+        const confirmation = document.getElementById("resetConfirmation");
+        const resetButton = document.getElementById("resetDriverSite");
+        const status = document.getElementById("resetStatus");
+        const KNOWN_DRIVER_DATABASES = ["mbbs-driver-offline"];
+        const DATABASE_DELETE_TIMEOUT_MS = 3500;
+
+        function setStatus(message, state = "working") {
+          status.textContent = message;
+          status.dataset.state = state;
+        }
+
+        function deleteDatabase(name) {
+          return new Promise((resolve) => {
+            let settled = false;
+            const finish = (deleted, reason = "") => {
+              if (settled) return;
+              settled = true;
+              window.clearTimeout(timeout);
+              resolve({ name, deleted, reason });
+            };
+            const timeout = window.setTimeout(
+              () => finish(false, "blocked_or_timed_out"),
+              DATABASE_DELETE_TIMEOUT_MS
+            );
+            try {
+              const request = indexedDB.deleteDatabase(name);
+              request.onsuccess = () => finish(true);
+              request.onerror = () => finish(false, request.error?.message || "delete_failed");
+              request.onblocked = () => setStatus("Waiting for another MBBS Driver window to release its saved data…");
+            } catch (error) {
+              finish(false, error?.message || "delete_failed");
+            }
+          });
+        }
+
+        async function indexedDatabaseNames() {
+          const names = new Set(KNOWN_DRIVER_DATABASES);
+          if (typeof globalThis.indexedDB?.databases !== "function") return [...names];
+          try {
+            for (const database of await globalThis.indexedDB.databases()) {
+              if (database?.name) names.add(database.name);
+            }
+          } catch {
+            // Older iOS WebKit does not expose database enumeration. The known
+            // Driver database remains covered, and Clear-Site-Data is primary.
+          }
+          return [...names];
+        }
+
+        function clearReadableCookies() {
+          const names = document.cookie
+            .split(";")
+            .map((cookie) => cookie.split("=")[0].trim())
+            .filter(Boolean);
+          const paths = ["/", "/driver", "/api"];
+          const domains = ["", location.hostname, `.${location.hostname}`];
+          for (const name of names) {
+            for (const path of paths) {
+              for (const domain of domains) {
+                document.cookie = `${name}=; Max-Age=0; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=${path}${domain ? `; domain=${domain}` : ""}; SameSite=Lax`;
+              }
+            }
+          }
+        }
+
+        async function clearOriginFallbacks() {
+          setStatus("Removing service workers and caches…");
+          if (navigator.serviceWorker?.getRegistrations) {
+            const registrations = await navigator.serviceWorker.getRegistrations().catch(() => []);
+            await Promise.allSettled(registrations.map((registration) => registration.unregister()));
+          }
+          if (globalThis.caches?.keys) {
+            const cacheNames = await caches.keys().catch(() => []);
+            await Promise.allSettled(cacheNames.map((name) => caches.delete(name)));
+          }
+
+          setStatus("Removing IndexedDB and saved Driver evidence…");
+          const databaseResults = "indexedDB" in globalThis
+            ? await Promise.all((await indexedDatabaseNames()).map(deleteDatabase))
+            : [];
+
+          try { localStorage.clear(); } catch {}
+          try { sessionStorage.clear(); } catch {}
+          clearReadableCookies();
+
+          return databaseResults.filter((result) => !result.deleted);
+        }
+
+        confirmation.addEventListener("change", () => {
+          resetButton.disabled = !confirmation.checked;
+        });
+
+        resetButton.addEventListener("click", async () => {
+          if (!confirmation.checked || resetButton.disabled) return;
+          resetButton.disabled = true;
+          confirmation.disabled = true;
+          const token = (() => {
+            try { return localStorage.getItem("mbbs.driver.token") || ""; } catch { return ""; }
+          })();
+          const deviceId = (() => {
+            try { return localStorage.getItem("mbbs.driver.deviceId") || ""; } catch { return ""; }
+          })();
+          try {
+            setStatus("Confirming the online reset with MBBS…");
+            const response = await fetch("/api/driver/site-reset", {
+              method: "POST",
+              cache: "no-store",
+              credentials: "same-origin", // secret-scan: allow -- Fetch credential mode, not a credential value.
+              headers: {
+                "Cache-Control": "no-store",
+                "X-MBBS-Driver-Site-Reset": "confirm",
+                ...(token ? { Authorization: `Bearer ${token}` } : {}),
+                ...(deviceId ? { "X-MBBS-Driver-Device": deviceId } : {})
+              }
+            });
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(payload.error || `Reset request failed (${response.status}).`);
+
+            const blockedDatabases = await clearOriginFallbacks();
+            if (blockedDatabases.length) {
+              throw new Error("Another MBBS window is holding saved Driver data. Close every MBBS tab and installed PWA window, reopen /reset-driver, and run the reset again.");
+            }
+            setStatus("Site data removed. Opening a fresh Driver login…");
+            const redirect = String(payload.redirect || `/driver?site-reset=${encodeURIComponent(Date.now())}`);
+            history.replaceState(null, "", `/reset-driver?complete=${encodeURIComponent(Date.now())}`);
+            window.location.replace(redirect);
+          } catch (error) {
+            setStatus(error?.message || "The Driver site could not be reset.", "error");
+            confirmation.disabled = false;
+            resetButton.disabled = !confirmation.checked;
+          }
+        });
+      })();
+    </script>
+  </body>
+</html>
